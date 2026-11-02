@@ -3840,11 +3840,13 @@ fun bootstrapCompileEffectRecordRead(index: int): void {
 
 // Whether a method declared on `owner` can be what a call on another type
 // `receiver` reaches: a type parameter, an interface or an alias can stand for
-// it, and `array<T>` for any array. A class or builtin owner is only itself.
+// it, `array<T>` for any array and `Map<K, V>` for any map. A class or builtin
+// owner is only itself.
 fun bootstrapEffectOwnerAdmits(map: BootstrapEffectTypeMap, owner: string, receiver: string): bool {
     if (owner.size > 6 && owner.slice(0, 6) == "array<") {
         return receiver.size > 6 && receiver.slice(0, 6) == "array<"
     }
+    if (owner.startsWith("Map<")) return receiver.startsWith("Map<")
     if (bootstrapEffectTypeMapGet(map, "type:$owner") == "class") return false
     !bootstrapEffectPreciseType(map, owner)
 }
@@ -4090,7 +4092,8 @@ fun bootstrapEffectPreciseType(map: BootstrapEffectTypeMap, type: string): bool 
         type == "i8" || type == "i16" || type == "i32" || type == "i64" ||
         type == "u8" || type == "u16" || type == "u32" || type == "u64" ||
         type == "f32" || type == "f64" || bootstrapIsMachineValueType(type) ||
-        (type.size > 6 && type.slice(0, 6) == "array<")
+        (type.size > 6 && type.slice(0, 6) == "array<") ||
+        (type.startsWith("Map<") && bootstrapEffectTypeMapGet(map, "type:Map") == "")
 }
 
 fun bootstrapEffectScopeType(names: array<string>, types: array<string>, name: string): string {
@@ -5057,7 +5060,25 @@ fun bootstrapEffectDeclarationReached(
     false
 }
 
-/** `declarations` without the methods and extensions of the classes `expression` can't make. */
+/** Marks in `made` each vector type `type` names (`i8x16`, the `u8x16` of `array<u8x16>`). */
+fun bootstrapEffectMarkVectorTypes(type: string, var made: Map<string, bool>): void {
+    var begin = 0
+    while (begin < type.size) {
+        var end = begin
+        while (end < type.size && ((type[end] >= 48 && type[end] <= 57) ||
+            (type[end] >= 65 && type[end] <= 90) || (type[end] >= 97 && type[end] <= 122) ||
+            type[end] == 95)) end = end + 1
+        if (end == begin) end = begin + 1
+        else {
+            val name = type.slice(begin, end)
+            if (bootstrapIsVectorType(name)) made.set(name, true)
+        }
+        begin = end
+    }
+    return
+}
+
+/** `declarations` without the methods and extensions of the classes (and vectors) `expression` can't make. */
 fun bootstrapEffectDeclarationsMadeBy(
     expression: BootstrapExpression,
     declarations: array<BootstrapDeclaration>
@@ -5078,16 +5099,21 @@ fun bootstrapEffectDeclarationsMadeBy(
         var index = 0
         while (index < declarations.size) {
             val declaration = declarations[index]
-            // An extension of a class runs on an instance: none, until it's made.
+            // An extension of a class runs on an instance: none, until it's made. So does one of
+            // a vector (abla/simd's `i8x16.get`), whose values only what returns one makes: a
+            // `Map`'s `get` doesn't reach it.
             val owner = bootstrapEffectNormalizeType(declaration.extensionOwner)
-            if (!reached[index] && (owner == "" || !classes.has(owner) || made.has(owner)) &&
+            if (!reached[index] && (owner == "" ||
+                (!classes.has(owner) && !bootstrapIsVectorType(owner)) || made.has(owner)) &&
                 bootstrapEffectDeclarationReached(declaration, names, methods)) {
                 reached[index] = true
                 grew = true
                 if (declaration.kind == "class") made.set(bootstrapEffectNormalizeType(declaration.name), true)
+                bootstrapEffectMarkVectorTypes(declaration.resultType, made)
                 bootstrapEffectCollectNames(declaration.expression, names, methods)
                 for (argument in declaration.parameterDefaults) bootstrapEffectCollectNames(argument, names, methods)
                 for (method in declaration.methods) {
+                    bootstrapEffectMarkVectorTypes(method.resultType, made)
                     bootstrapEffectCollectNames(method.expression, names, methods)
                     for (argument in method.parameterDefaults) bootstrapEffectCollectNames(argument, names, methods)
                 }
@@ -12881,23 +12907,24 @@ fun bootstrapInferCompile(
         analyzer.compileEffectGrants
     )
     val denied = bootstrapCompileEffectName(deniedEffects)
-    if (denied != "" && bootstrapDeniedCompileEffects(
-        analyzer.expressionCompileEffects(
-            expression.children[0],
-            bootstrapBuildCompileEffectSummary(
-                bootstrapEffectDeclarationsMadeBy(expression.children[0], analyzer.declarations)
-            )
-        ),
-        analyzer.compileEffectGrants
-    ) != 0) {
-        val path = bootstrapCompileEffectPath(
-            expression.children[0],
-            analyzer.declarations,
-            analyzer.compileEffects,
-            bootstrapFirstCompileEffect(deniedEffects),
-            0
+    if (denied != "") {
+        // Looked at again without what it can't make; the path is the one left there.
+        val made = bootstrapEffectDeclarationsMadeBy(expression.children[0], analyzer.declarations)
+        val summary = bootstrapBuildCompileEffectSummary(made)
+        val madeDenied = bootstrapDeniedCompileEffects(
+            analyzer.expressionCompileEffects(expression.children[0], summary),
+            analyzer.compileEffectGrants
         )
-        analyzer.fail("compile.effect-denied:$denied:$path")
+        if (madeDenied != 0) {
+            val path = bootstrapCompileEffectPath(
+                expression.children[0],
+                made,
+                summary,
+                bootstrapFirstCompileEffect(madeDenied),
+                0
+            )
+            analyzer.fail("compile.effect-denied:${bootstrapCompileEffectName(madeDenied)}:$path")
+        }
     }
     // A top-level compile action's result is discarded; any other one
     // becomes a program value (ct_lift.ab).

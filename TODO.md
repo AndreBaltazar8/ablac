@@ -25,16 +25,6 @@
   import edge recorded for a subpath doesn't match the module's snapshot path in `bootstrapStrictPassedOn` (src/module.ab).
   Repro: in a package with `visibility = "imports"`, a module `import github("AndreBaltazar8/abla-xml/xsd")` and
   `fun main: int { val r = xsdLoad("<x/>"); 0 }`. Worked around in abla-saft by a flat package of its own for the XSD part.
-- [ ] **A program that imports `abla/simd` anywhere needs `trusted.native` for any `#` that calls a `.get(...)`.** v0.2.30, seen
-  2026-11-02. `bootstrapEffectDeclarationsMadeBy` (src/sema.ab) reaches an extension by its method name alone when its owner isn't a
-  class, so `m.get("a")` on a `Map` reaches every `i8x16.get` ... `f64x4.get`, whose intrinsics count as native. Repro:
-  `import "abla/simd"`, `fun lookup(): int { val m: Map<string, int> = Map(); m.set("a", 7); m.get("a") ?? 0 }`,
-  `val t = #lookup()` gives `compile.effect-denied:trusted.native:lookup->i8x16.get->ablaSimd_get_i8x16`; without the import it
-  builds and prints 7. `abla/crypto/aes` imports `abla/simd`, so every abla-soap client (WS-Security) is such a program, and
-  generating its clients from a WSDL under `#` (`wsdlGenerateFrom`, through abla-xml's reader) is denied. Granted
-  `trusted.native`, it runs and gives the same bytes as `tools/wsdl2abla`. The error's path is also wrong there: it names
-  `xmlReader->XmlChunkDecoder.next->XmlChunkDecoder.pull->XmlFileSource.read->...`, a class nothing in it makes, instead of the
-  `get` that was reached; with `xmlChunkedReader` it names `LinuxCommand.start`.
 - [ ] **Xtensa `llc` aborts on frames of 128 to 255 bytes that take a stack address.** `LLVM ERROR: Error
   while trying to spill A6 from class AR: Cannot scavenge register without an emergency spill slot!`, seen
   2026-11-01 on `esp32RecoveredZN3nvs7Storage9writeItem...` from abla-embedded's `tools/build-example
