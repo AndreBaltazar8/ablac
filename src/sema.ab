@@ -1,3 +1,4 @@
+import "abla/unsafe/memory/raw"
 import "ct_native_effects.ab"
 import "simd_types.ab"
 import "ir.ab"
@@ -489,6 +490,7 @@ fun bootstrapExclusiveSlot(names: array<string>, slots: array<int>, name: string
 }
 
 fun bootstrapExclusiveAdd(var names: array<string>, var masks: array<int>, var slots: array<int>, name: string, mask: int): void {
+    if (mask == 0) return
     val slot = bootstrapExclusiveSlot(names, slots, name)
     if (slots[slot] >= 0) {
         masks[slots[slot]] = masks[slots[slot]] | mask
@@ -724,7 +726,7 @@ fun bootstrapBuildMutableReceiverSummary(
     // (BootstrapBodySchedule).
     val declarationOf: array<int> = []
     val methodOf: array<int> = []
-    val callers = bootstrapCallersOf(declarations, declarationOf, methodOf)
+    val callers = bootstrapCallersOf(declarations, declarationOf, methodOf, true)
     var schedule = bootstrapBodySchedule(declarationOf.size)
     var round = true
     while (round) {
@@ -5440,15 +5442,20 @@ fun bootstrapCallers(): BootstrapCallers =
 fun bootstrapCallersOf(
     declarations: array<BootstrapDeclaration>,
     var declarationOf: array<int>,
-    var methodOf: array<int>
+    var methodOf: array<int>,
+    receiversOnly: bool = false
 ): BootstrapCallers {
     val callers = bootstrapCallers()
     var declarationIndex = 0
     while (declarationIndex < declarations.size) {
         val declaration = declarations[declarationIndex]
-        callers.collect(declaration.expression, declarationOf.size)
-        declarationOf.append(declarationIndex)
-        methodOf.append(-1)
+        // Only extension bodies can mutate a receiver; ordinary functions and
+        // class initializers never join that summary or need its dependencies.
+        if (!receiversOnly || declaration.extensionOwner != "") {
+            callers.collect(declaration.expression, declarationOf.size)
+            declarationOf.append(declarationIndex)
+            methodOf.append(-1)
+        }
         var method = 0
         while (method < declaration.methods.size) {
             callers.collect(declaration.methods[method].expression, declarationOf.size)
@@ -5625,6 +5632,7 @@ fun bootstrapRegionExpressionRetainsParameters(
     declarations: array<BootstrapDeclaration>,
     var summary: BootstrapRegionCallSummary
 ): bool {
+    if (parameters.size == 0) return false
     var changed = false
     if (expression.kind == "member.assign") {
         val root = bootstrapPlaceRootName(expression.children[0])
@@ -5878,7 +5886,27 @@ fun bootstrapRegionExpressionCallsUnsafe(
     unsafe
 }
 
+// A body with no escaping function-valued parameter cannot call one. Check
+// its signature once rather than walking every expression to discover that.
 fun bootstrapRegionExpressionCallsFunctionParameter(
+    expression: BootstrapExpression,
+    parameters: array<string>,
+    parameterTypes: array<string>
+): bool {
+    var parameter = 0
+    while (parameter < parameters.size && parameter < parameterTypes.size) {
+        val type = bootstrapNormalizeType(parameterTypes[parameter])
+        if (bootstrapIsFunctionType(type) && !bootstrapIsNoEscapeFunctionType(type)) {
+            return bootstrapRegionExpressionCallsFunctionParameterIn(
+                expression, parameters, parameterTypes
+            )
+        }
+        parameter = parameter + 1
+    }
+    false
+}
+
+fun bootstrapRegionExpressionCallsFunctionParameterIn(
     expression: BootstrapExpression,
     parameters: array<string>,
     parameterTypes: array<string>
@@ -5898,7 +5926,7 @@ fun bootstrapRegionExpressionCallsFunctionParameter(
     }
     var child = 0
     while (!unsafe && child < expression.children.size) {
-        unsafe = bootstrapRegionExpressionCallsFunctionParameter(
+        unsafe = bootstrapRegionExpressionCallsFunctionParameterIn(
             expression.children[child],
             parameters,
             parameterTypes
@@ -6269,11 +6297,13 @@ class BootstrapFunctionDeclarationIndex(
 // A name's slot hash for the compiler's tables (bootstrapIrLookupHash too):
 // 64-bit FNV-1a, one xor and one wrapping multiply a byte, made non-negative
 // for the callers' `slot % size`. Only slots depend on it, never an output.
-fun bootstrapFunctionDeclarationHash(name: string): int {
+trusted fun bootstrapFunctionDeclarationHash(name: string): int {
     var hash = -3750763034362895579
+    val nameSize = name.size
+    val nameBytes = ablaUnsafeStringAddress(name)
     var index = 0
-    while (index < name.size) {
-        hash = (hash ^ name[index]) * 1099511628211
+    while (index < nameSize) {
+        hash = (hash ^ ablaUnsafeLoadU8(nativePointerFromAddress(nameBytes + index))) * 1099511628211
         index = index + 1
     }
     hash & 9223372036854775807
@@ -6281,17 +6311,21 @@ fun bootstrapFunctionDeclarationHash(name: string): int {
 
 // The hash of `owner` and `name` taken together (a method's), without making
 // the string of them: the owner's bytes, its length, then the name's.
-fun bootstrapMethodDeclarationHash(owner: string, name: string): int {
+trusted fun bootstrapMethodDeclarationHash(owner: string, name: string): int {
     var hash = -3750763034362895579
+    val ownerSize = owner.size
+    val ownerBytes = ablaUnsafeStringAddress(owner)
     var index = 0
-    while (index < owner.size) {
-        hash = (hash ^ owner[index]) * 1099511628211
+    while (index < ownerSize) {
+        hash = (hash ^ ablaUnsafeLoadU8(nativePointerFromAddress(ownerBytes + index))) * 1099511628211
         index = index + 1
     }
-    hash = (hash ^ owner.size) * 1099511628211
+    hash = (hash ^ ownerSize) * 1099511628211
+    val nameSize = name.size
+    val nameBytes = ablaUnsafeStringAddress(name)
     index = 0
-    while (index < name.size) {
-        hash = (hash ^ name[index]) * 1099511628211
+    while (index < nameSize) {
+        hash = (hash ^ ablaUnsafeLoadU8(nativePointerFromAddress(nameBytes + index))) * 1099511628211
         index = index + 1
     }
     hash & 9223372036854775807
@@ -8636,7 +8670,13 @@ class BootstrapAnalyzer(
             }
         }
         if (this.privateExtensionsKnown == 0) return ""
-        for (declaration in this.declarations) {
+        // Declarations with this spelling retain their source order in the
+        // index, including extensions from multiple modules.
+        var node = this.declarationNames.first(name)
+        while (node >= 0) {
+            val declaration = this.declarations[
+                this.declarationNames.nodeDeclarations[node]
+            ]
             if (declaration.isPrivate && declaration.name == name &&
                 declaration.extensionOwner != "" &&
                 bootstrapNormalizeType(declaration.extensionOwner) == owner &&
@@ -8644,6 +8684,7 @@ class BootstrapAnalyzer(
                     bootstrapGenericSourceFile(this.currentSourceIdentity)) {
                 return bootstrapGenericSourceFile(declaration.sourceIdentity)
             }
+            node = this.declarationNames.nodeNexts[node]
         }
         ""
     }
@@ -10259,9 +10300,10 @@ class BootstrapAnalyzer(
     ): void {
         if (this.typedRequestBegins.size == 0) return
         val request = this.typedRequestIndex(expression)
+        if (request < 0) return
         var already = false
         var existing = 0
-        while (existing < this.typedCalls.size) {
+        while (!already && existing < this.typedCalls.size) {
             val candidate = this.typedCalls[existing]
             if (request >= 0 &&
                 candidate.sourceIdentity == this.currentSourceIdentity &&
@@ -10311,9 +10353,10 @@ class BootstrapAnalyzer(
     ): void {
         if (this.typedRequestBegins.size == 0) return
         val request = this.typedRequestIndex(expression)
+        if (request < 0) return
         var already = false
         var existing = 0
-        while (existing < this.typedCalls.size) {
+        while (!already && existing < this.typedCalls.size) {
             val candidate = this.typedCalls[existing]
             if (request >= 0 &&
                 candidate.sourceIdentity == this.currentSourceIdentity &&
@@ -11725,11 +11768,15 @@ class BootstrapAnalyzer(
             bootstrapIsFloatLiteralExpression(literal)
 
     fun infer(expression: BootstrapExpression): string {
-        if (expression.kind == "call" &&
+        val kind = expression.kind
+        // Reject kinds with another initial byte before the general string
+        // comparison; the expression and its kind stay immutable throughout.
+        val kindHead = if (kind.size > 0) kind[0] else -1
+        if ((kindHead == 99 && kind == "call") &&
             bootstrapInitEntersStaticTable(this.initEdges, expression.text)) {
             return bootstrapInferStaticTable(this, expression)
         }
-        if (expression.kind == "call" && this.initEdges.inStaticTable &&
+        if ((kindHead == 99 && kind == "call") && this.initEdges.inStaticTable &&
             expression.text == "nativeFunctionAddress" && this.initEdges.owner >= 0) {
             return bootstrapInferStaticTableAddress(this, expression)
         }
@@ -11745,37 +11792,37 @@ class BootstrapAnalyzer(
         // nested N deep holds N frames of this dispatch rather than of every
         // case's locals.
         var result = "unknown"
-        if (expression.kind == "integer") result = "i64"
-        if (expression.kind == "float") {
+        if ((kindHead == 105 && kind == "integer")) result = "i64"
+        else if ((kindHead == 102 && kind == "float")) {
             result = "f64"
             if (this.contextualLiterals.begins.size > 0 && this.contextualLiterals.find(
                 this.currentSourceIdentity, expression.begin, expression.end
             ) == "f32") result = this.inferF32Literal(expression)
         }
-        if (expression.kind == "float32") result = this.inferF32Literal(expression)
-        if (expression.kind == "true" || expression.kind == "false") result = "bool"
-        if (expression.kind == "null") result = "null"
-        if (expression.kind == "string") result = "string"
-        if (expression.kind == "declaration.block") {
+        else if ((kindHead == 102 && kind == "float32")) result = this.inferF32Literal(expression)
+        else if ((kindHead == 116 && kind == "true") || (kindHead == 102 && kind == "false")) result = "bool"
+        else if ((kindHead == 110 && kind == "null")) result = "null"
+        else if ((kindHead == 115 && kind == "string")) result = "string"
+        else if ((kindHead == 100 && kind == "declaration.block")) {
             result = bootstrapInferDeclarationBlock(this, expression, result)
         }
-        if (expression.kind == "string.template") {
+        else if ((kindHead == 115 && kind == "string.template")) {
             result = bootstrapInferStringTemplate(this, expression, result)
         }
-        if (expression.kind == "compile") {
+        else if ((kindHead == 99 && kind == "compile")) {
             result = bootstrapInferCompile(this, expression, result)
         }
-        if (expression.kind == "region") {
+        else if ((kindHead == 114 && kind == "region")) {
             result = bootstrapInferRegion(this, expression, result)
         }
-        if (expression.kind == "array") {
+        else if ((kindHead == 97 && kind == "array")) {
             result = bootstrapInferArray(this, expression, result)
         }
-        if (expression.kind == "range.closed" ||
-            expression.kind == "range.until") {
+        else if ((kindHead == 114 && kind == "range.closed") ||
+            (kindHead == 114 && kind == "range.until")) {
             result = bootstrapInferRange(this, expression, result)
         }
-        if (expression.kind == "identifier") {
+        else if ((kindHead == 105 && kind == "identifier")) {
             // A generic function is called, not passed as a value (generics.ab).
             if (this.generics.probing && this.generics.findFree(expression.text) >= 0 &&
                 !this.generics.isClass(expression.text) && !this.hasVisibleLocal(expression.text)) {
@@ -11784,32 +11831,32 @@ class BootstrapAnalyzer(
             }
             result = bootstrapInferIdentifier(this, expression, result)
         }
-        if (expression.kind == "lambda" ||
-            expression.kind == "lambda.move" ||
-            expression.kind == "lambda.generator") {
+        else if ((kindHead == 108 && kind == "lambda") ||
+            (kindHead == 108 && kind == "lambda.move") ||
+            (kindHead == 108 && kind == "lambda.generator")) {
             result = bootstrapInferLambda(this, expression, result)
         }
-        if (expression.kind == "call" && expression.text == "move") {
+        else if ((kindHead == 99 && kind == "call") && expression.text == "move") {
             result = bootstrapInferCallMove(this, expression, result)
         }
-        if (expression.kind == "call" && expression.text == "Shared") {
+        else if ((kindHead == 99 && kind == "call") && expression.text == "Shared") {
             result = bootstrapInferCallShared(this, expression, result)
         }
-        if (expression.kind == "call" && expression.text == "Mutex") {
+        else if ((kindHead == 99 && kind == "call") && expression.text == "Mutex") {
             result = bootstrapInferCallMutex(this, expression, result)
         }
         // `Map()` is an empty map whose type comes from where it is stored
         // (a declared local, field, parameter or result).
-        if (expression.kind == "call" && expression.text == "Map") {
+        else if ((kindHead == 99 && kind == "call") && expression.text == "Map") {
             result = bootstrapInferCallMap(this, expression, result)
         }
-        if (expression.kind == "call" && expression.text == "Cell") {
+        else if ((kindHead == 99 && kind == "call") && expression.text == "Cell") {
             result = bootstrapInferCallCell(this, expression, result)
         }
-        if (expression.kind == "call" && expression.text == "filledArray") {
+        else if ((kindHead == 99 && kind == "call") && expression.text == "filledArray") {
             result = bootstrapInferCallFilledArray(this, expression, result)
         }
-        if (expression.kind == "call" && expression.text != "move" &&
+        else if ((kindHead == 99 && kind == "call") && expression.text != "move" &&
             expression.text != "Shared" && expression.text != "Mutex" &&
             expression.text != "Cell" && expression.text != "filledArray" &&
             expression.text != "Map") {
@@ -11823,19 +11870,19 @@ class BootstrapAnalyzer(
             }
             result = bootstrapInferCall(this, expression, result)
         }
-        if (expression.kind == "call.value") {
+        else if ((kindHead == 99 && kind == "call.value")) {
             result = bootstrapInferCallValue(this, expression, result)
         }
-        if (expression.kind == "member") {
+        else if ((kindHead == 109 && kind == "member")) {
             result = bootstrapInferMember(this, expression, result)
         }
-        if (expression.kind == "index") {
+        else if ((kindHead == 105 && kind == "index")) {
             result = bootstrapInferIndex(this, expression, result)
         }
-        if (expression.kind == "index.assign") {
+        else if ((kindHead == 105 && kind == "index.assign")) {
             result = bootstrapInferIndexAssign(this, expression, result)
         }
-        if (expression.kind == "member.call") {
+        else if ((kindHead == 109 && kind == "member.call")) {
             val rawReceiver = this.infer(expression.children[0])
             val receiver = bootstrapBorrowElementType(rawReceiver)
             if (this.overloads.keys.size > 0) {
@@ -11850,60 +11897,60 @@ class BootstrapAnalyzer(
                 this, expression, rawReceiver, receiver, result
             )
         }
-        if (expression.kind == "member.assign") {
+        else if ((kindHead == 109 && kind == "member.assign")) {
             result = bootstrapInferMemberAssign(this, expression, result)
         }
-        if (expression.kind == "block") {
+        else if ((kindHead == 98 && kind == "block")) {
             result = bootstrapInferBlock(this, expression, result)
         }
-        if (expression.kind == "defer") {
+        else if ((kindHead == 100 && kind == "defer")) {
             result = bootstrapInferDefer(this, expression, result)
         }
-        if (expression.kind == "generator") {
+        else if ((kindHead == 103 && kind == "generator")) {
             result = bootstrapInferGenerator(this, expression, result)
         }
         // A `$name` no registered subparser expanded: nothing imported registers it.
-        if (expression.kind == "subparser.placeholder") {
+        else if ((kindHead == 115 && kind == "subparser.placeholder")) {
             this.fail("subparser.unknown:${expression.text}@${expression.begin}")
             result = "unknown"
         }
-        if (expression.kind == "yield") {
+        else if ((kindHead == 121 && kind == "yield")) {
             result = bootstrapInferYield(this, expression, result)
         }
-        if (expression.kind == "task" || expression.kind == "thread") {
+        else if ((kindHead == 116 && kind == "task") || (kindHead == 116 && kind == "thread")) {
             result = bootstrapInferTask(this, expression, result)
         }
-        if (expression.kind == "await") {
+        else if ((kindHead == 97 && kind == "await")) {
             result = bootstrapInferAwait(this, expression, result)
         }
-        if (expression.kind == "as?") result = this.inferInterfaceCast(expression)
-        if (expression.kind == "return") {
+        else if ((kindHead == 97 && kind == "as?")) result = this.inferInterfaceCast(expression)
+        else if ((kindHead == 114 && kind == "return")) {
             result = bootstrapInferReturn(this, expression, result)
         }
-        if (
-            expression.kind == "local.val" ||
-            expression.kind == "local.var"
+        else if (
+            (kindHead == 108 && kind == "local.val") ||
+            (kindHead == 108 && kind == "local.var")
         ) {
             result = bootstrapInferLocal(this, expression, result)
         }
-        if (expression.kind == "assign") {
+        else if ((kindHead == 97 && kind == "assign")) {
             result = bootstrapInferAssign(this, expression, result)
         }
-        if (expression.kind == "delegate.project") {
+        else if ((kindHead == 100 && kind == "delegate.project")) {
             result = bootstrapInferDelegateProject(this, expression, result)
         }
-        if (expression.kind == "atomic") {
+        else if ((kindHead == 97 && kind == "atomic")) {
             result = bootstrapInferAtomic(this, expression, result)
         }
-        if (expression.kind == "stm.orElse") {
+        else if ((kindHead == 115 && kind == "stm.orElse")) {
             result = bootstrapInferOrElse(this, expression, result)
         }
-        if (expression.kind == "delegate.assign") {
+        else if ((kindHead == 100 && kind == "delegate.assign")) {
             result = bootstrapInferDelegateAssign(this, expression, result)
         }
-        if (
-            expression.kind == "unary-" ||
-            expression.kind == "unary+"
+        else if (
+            (kindHead == 117 && kind == "unary-") ||
+            (kindHead == 117 && kind == "unary+")
         ) {
             val operand = this.infer(expression.children[0])
             if (this.overloads.keys.size > 0) {
@@ -11912,43 +11959,43 @@ class BootstrapAnalyzer(
             }
             result = bootstrapInferNegate(this, expression, operand, result)
         }
-        if (expression.kind == "unary!") {
+        else if ((kindHead == 117 && kind == "unary!")) {
             result = this.infer(expression.children[0])
             if (result != "bool") this.fail("unary.boolean")
             result = "bool"
         }
-        if (expression.kind == "unary~") {
+        else if ((kindHead == 117 && kind == "unary~")) {
             if (this.overloads.keys.size > 0) {
                 val operated = this.inferOperatorCall(expression, [this.infer(expression.children[0])])
                 if (operated != "") return operated
             }
             result = bootstrapInferComplement(this, expression, result)
         }
-        if (expression.kind == "&&" || expression.kind == "||") {
+        else if ((kindHead == 38 && kind == "&&") || (kindHead == 124 && kind == "||")) {
             result = this.inferLogicalExpression(expression)
         }
-        if (expression.kind == "if") {
+        else if ((kindHead == 105 && kind == "if")) {
             result = bootstrapInferIf(this, expression, result)
         }
-        if (expression.kind == "while") {
+        else if ((kindHead == 119 && kind == "while")) {
             result = bootstrapInferWhile(this, expression, result)
         }
-        if (expression.kind == "do.while") {
+        else if ((kindHead == 100 && kind == "do.while")) {
             result = bootstrapInferDoWhile(this, expression, result)
         }
-        if (expression.kind == "for") {
+        else if ((kindHead == 102 && kind == "for")) {
             result = bootstrapInferFor(this, expression, result)
         }
-        if (expression.kind == "break" || expression.kind == "continue") {
+        else if ((kindHead == 98 && kind == "break") || (kindHead == 99 && kind == "continue")) {
             result = bootstrapInferBreak(this, expression, result)
         }
-        if (expression.kind == "when") {
+        else if ((kindHead == 119 && kind == "when")) {
             result = bootstrapInferWhen(this, expression, result)
         }
-        if (
-            expression.kind == "==" || expression.kind == "!=" ||
-            expression.kind == "<" || expression.kind == "<=" ||
-            expression.kind == ">" || expression.kind == ">="
+        else if (
+            (kindHead == 61 && kind == "==") || (kindHead == 33 && kind == "!=") ||
+            (kindHead == 60 && kind == "<") || (kindHead == 60 && kind == "<=") ||
+            (kindHead == 62 && kind == ">") || (kindHead == 62 && kind == ">=")
         ) {
             result = bootstrapInferComparison(this, expression, result)
         }
