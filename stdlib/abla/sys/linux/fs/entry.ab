@@ -138,24 +138,12 @@ fun Path.exists(): bool = this.info().exists()
 fun Path.readText(): string {
     val info = this.info()
     var result = ""
-    if (info.isFile() && info.size >= 0) {
+    if (info.isFile()) {
         val descriptor = linuxOpen(this.text)
         if (descriptor.descriptor >= 0) {
-            val buffer = nativeByteBuffer(info.size + 1)
-            var measured = 0
-            var reading = true
-            while (reading && measured < info.size) {
-                val amount = linuxSyscall3(
-                    0,
-                    descriptor.descriptor,
-                    nativePointerAddress(buffer.pointerAt(measured)),
-                    info.size - measured
-                )
-                if (amount > 0) measured = measured + amount
-                if (amount <= 0) reading = false
-            }
+            val read = linuxReadDescriptorText(descriptor.descriptor, info.size)
             descriptor.close()
-            result = buffer.adoptString(measured)
+            if (read.succeeded) result = read.text
         }
     }
     result
@@ -178,33 +166,44 @@ fun Path.readTextResult(): FileReadResult {
     val info = this.info()
     var result = FileReadResult("", false, 21)
     if (!info.isDirectory()) {
-        val size = if (info.size > 0) info.size else 0
-        val buffer = nativeByteBuffer(size + 1)
-        var measured = 0
-        var errorCode = 0
-        var reading = true
-        while (reading && measured < size) {
-            val amount = linuxSyscall3(
-                0,
-                descriptor.descriptor,
-                nativePointerAddress(buffer.pointerAt(measured)),
-                size - measured
-            )
-            if (amount > 0) measured = measured + amount
-            if (amount == 0) reading = false
-            if (amount < 0 && amount != -4) {
-                errorCode = -amount
-                reading = false
-            }
-        }
-        result = if (errorCode == 0) FileReadResult(buffer.adoptString(measured), true, 0)
-        else {
-            buffer.close()
-            FileReadResult("", false, errorCode)
-        }
+        result = linuxReadDescriptorText(descriptor.descriptor, info.size)
     }
     descriptor.close()
     result
+}
+
+// Reads a descriptor to its end. The stat size `expected` fits the first
+// allocation with a byte to spare, so a regular file ends with one more read
+// and no copy; what has more than its stat size (a /proc file says 0, a file
+// can grow) is read on into a doubled allocation.
+private trusted fun linuxReadDescriptorText(descriptor: int, expected: int): FileReadResult {
+    var capacity = if (expected > 0) expected + 1 else 4096
+    var address = ablaUnsafePointerAddress(ablaUnsafeAllocate(capacity + 1))
+    var measured = 0
+    var errorCode = 0
+    var reading = true
+    while (reading) {
+        if (measured == capacity) {
+            val grown = capacity * 2
+            val replacement = ablaUnsafePointerAddress(ablaUnsafeAllocate(grown + 1))
+            ablaUnsafeCopyMemory(replacement, address, measured)
+            ablaUnsafeFree(nativePointerFromAddress(address))
+            address = replacement
+            capacity = grown
+        }
+        val amount = linuxSyscall3(0, descriptor, address + measured, capacity - measured)
+        if (amount > 0) measured = measured + amount
+        else if (amount == 0) reading = false
+        else if (amount != -4) {
+            errorCode = -amount
+            reading = false
+        }
+    }
+    if (errorCode == 0) FileReadResult(adoptNativeString(address, measured), true, 0)
+    else {
+        ablaUnsafeFree(nativePointerFromAddress(address))
+        FileReadResult("", false, errorCode)
+    }
 }
 
 fun linuxWriteAll(descriptor: int, contents: string): bool {
