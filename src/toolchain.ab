@@ -57,11 +57,24 @@ fun bootstrapParseHostModuleWithRuntime(
     sourcePath: string
 ): BootstrapParseResult = bootstrapLoadHostModuleGraph(sourcePath).parse()
 
+// Without the runtime nothing links, and the linker would only name a symbol it missed.
+fun bootstrapRequireStandardLibrary(): void {
+    val standardLibrary = Path(bootstrapStandardLibraryRoot())
+    if (!standardLibrary.child("abla/runtime/self/entry.ab").exists()) {
+        linuxPrintStandardError(
+            "error[E_TOOLCHAIN_ROOT]: no standard library at ${standardLibrary.text}: set ABLA_SYSROOT to the toolchain's directory, or start the `ablac` launcher\n"
+        )
+        linuxSyscall1(60, 2)
+    }
+    return
+}
+
 // The module graph of `sourcePath` with the host runtime, loaded (not yet parsed).
 fun bootstrapLoadHostModuleGraph(sourcePath: string): BootstrapModuleGraph {
     val state = bootstrapModuleState()
     val graph = BootstrapModuleGraph([], 0, state, [], [], "", [], bootstrapModuleGraphIndex())
     val standardLibrary = Path(bootstrapStandardLibraryRoot())
+    bootstrapRequireStandardLibrary()
     // (The runtime loads first: its imports are remapped as the program's.)
     graph.useRootManifest(bootstrapNormalizeModulePath(sourcePath))
     graph.load(standardLibrary.child("abla/runtime/self/entry.ab").text)
@@ -2007,6 +2020,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         (!target.hosted && bootstrapLlvmTargetUses32BitPointers(target.llvmTriple))
     val libcPlatform = !linearPlatform && (target.hosted || !target.libcFree)
     val compilerRuntime = libcPlatform || linearPlatform
+    if (compilerRuntime) bootstrapRequireStandardLibrary()
     val selfHostedRuntime = if (compilerRuntime) {
         Path(bootstrapStandardLibraryRoot()).child(
             "abla/runtime/self/entry.ab"
@@ -3216,6 +3230,7 @@ fun bootstrapServeWithEmitter(
     cacheProfile: string
 ): int {
     var child = LinuxChildProcess(-1)
+    var running = false
     var generation = 0
     var started = 0
     bootstrapServeRemoveAbandoned()
@@ -3251,10 +3266,11 @@ fun bootstrapServeWithEmitter(
             generation = generation + 1
             if (accepted) {
                 if (child.process >= 0) {
-                    child.stop()
+                    if (running) child.stop()
                     bootstrapServeRemoveGeneration(linuxProcessId(), started)
                 }
                 child = linuxCommand(outputPath).start()
+                running = true
                 started = generation - 1
                 linuxPrintStandardError(
                     "reloaded generation $generation; modules: ${build.refreshedModules} refreshed, ${build.reusedModules} reused; parsed: ${build.refreshedParsedModules} refreshed, ${build.reusedParsedModules} reused; lowered: ${build.refreshedLoweredFunctions} refreshed, ${build.reusedLoweredFunctions} reused; objects: ${build.refreshedNativePartitions} refreshed, ${build.reusedNativePartitions} reused\n"
@@ -3267,6 +3283,8 @@ fun bootstrapServeWithEmitter(
             rebuild = false
         }
         linuxSleep(200)
+        // A program that ended is waited for now, not when the next generation replaces it.
+        if (running && linuxWaitProcess(child.process, true).output != "pending") running = false
         if (watcher.changed()) rebuild = true
     }
     0

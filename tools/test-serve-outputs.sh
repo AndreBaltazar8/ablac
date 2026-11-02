@@ -44,6 +44,14 @@ for name in one two; do
 done
 wait_for "$test_directory/one/stdout.txt" 'one-a'
 wait_for "$test_directory/two/stdout.txt" 'two-a'
+# What a generation ran is waited for when it ends, not when the next replaces it.
+sleep 1
+for server in "${servers[@]}"; do
+    if ps --no-headers -o stat= -s "$server" 2>/dev/null | grep -q Z; then
+        echo 'serve outputs: a finished program stays a zombie' >&2
+        exit 1
+    fi
+done
 outputs() { find build -maxdepth 1 -name '.abla-serve-*' ! -name '*.o*' ! -name '*.ll' ! -name '*.json' -type f -printf '%f\n' | sort; }
 [[ $(outputs | wc -l) -eq 2 && $(outputs | grep -c -- '-0$') -eq 2 ]] ||
     { echo 'serve outputs: expected one first generation for each' >&2; outputs >&2; exit 1; }
