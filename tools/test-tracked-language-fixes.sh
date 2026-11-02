@@ -39,6 +39,7 @@ expect_error invalid-import-alias-export-unknown E_IMPORT_ALIAS_MEMBER_UNKNOWN
 expect_error invalid-import-alias-export-private E_IMPORT_ALIAS_MEMBER_UNKNOWN
 expect_exit named-implicit-this 42
 expect_exit named-default-scope 42
+expect_exit constructor-array-interface 42
 expect_error invalid-named-default-hidden-generic E_NAMED_ARGUMENT_HIDDEN
 expect_exit named-default-hidden-value 42
 expect_error invalid-call-not-function call.not-function:double

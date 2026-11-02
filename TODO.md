@@ -23,9 +23,6 @@
   `compile.effect-denied:trusted.native:xmlParse->XmlChunkDecoder.next->...->XmlFileSource.read`, as the check follows an interface
   call to an implementer the call can't reach. Either stops generating typed SOAP clients with `#`, which NovaKind's TODO wanted;
   abla-soap has a tool instead. Also, one error's frames should be bounded.
-- [ ] **A constructor doesn't convert an array literal to `array<Interface>`.** Seen 2026-11-02 on 0.2.29: with `class O(val hs:
-  array<S> = [])` and `T : S`, `O([T()])` and `O(hs = [T()])` give `constructor.argument:O`, pointing at another parameter. A function's
-  parameter takes the same literal. Worked around by building the array first.
 - [ ] **A `null` for a field of type `array<T>?` is `ownership.stored-reference-provenance`.** Seen 2026-11-02 on 0.2.29 passing `null`
   (or `if (c) array else null`) to `class B(val parts: array<string>?, ...)` from a method. abla-soap's model has a bool beside the array.
 
