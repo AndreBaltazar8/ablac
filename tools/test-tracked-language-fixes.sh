@@ -63,6 +63,27 @@ if ! grep -aq used-function-text "$output/address-taken-unreachable" ||
     echo 'a function only unreachable code takes the value of is in the program' >&2
     exit 1
 fi
+# A compiler started with no runtime in reach says so, and a failed thread creation does.
+if [[ -x $compiler.bin ]]; then
+    empty=$(mktemp -d "$output/no-sysroot.XXXXXX")
+    printf 'fun main: int = 7\n' > "$empty/m.ab"
+    status=0
+    (cd "$empty" && env -u ABLA_SYSROOT -u ABLA_STDLIB "$compiler.bin" build m.ab -o m --no-cache) >"$empty/log" 2>&1 || status=$?
+    if [[ $status -eq 0 ]] || ! grep -q E_TOOLCHAIN_ROOT "$empty/log"; then
+        echo 'a compiler with no runtime in reach did not say so' >&2
+        cat "$empty/log" >&2
+        exit 1
+    fi
+fi
+"$compiler" build "$cases/concurrency.ab" -o "$output/concurrency-limited"
+status=0
+(ulimit -s 131072; ABLA_MAX_MEMORY_MB=128 "$project_root/tools/run-limited.sh" "$output/concurrency-limited") \
+    >"$output/concurrency-limited.log" 2>&1 || status=$?
+if [[ $status -ne 101 ]] || ! grep -q "a thread couldn't start" "$output/concurrency-limited.log"; then
+    printf 'a thread that cannot start: status %d\n' "$status" >&2
+    cat "$output/concurrency-limited.log" >&2
+    exit 1
+fi
 expect_exit transform-implicit-this 42
 expect_exit compile-effect-unmade-implementer 42
 expect_error invalid-compile-effect-made-implementer compile.effect-denied:

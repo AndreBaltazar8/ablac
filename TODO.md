@@ -17,15 +17,6 @@
 
 ## Bugs seen
 
-- [ ] **Threaded native programs die with SIGILL when the stack limit doesn't fit their memory limit.** Seen
-  2026-11-01 running `make test-full` under `ulimit -s 131072`: `tools/test-self-hosted.sh` fails
-  native-linux-net, native-websocket-live, native-concurrency and native-network-advanced with
-  `expected 42, got 132`. By hand, `tests/cases/modules/concurrency.ab` under
-  `ABLA_MAX_MEMORY_MB=128 tools/run-limited.sh` gives 132 at `-s 131072` and 42 at `-s 8192`, and 42 at
-  `-s 131072` with 4096 MB; v0.2.28 does the same. Probably each thread's default stack follows
-  RLIMIT_STACK, so one thread's 128 MiB doesn't fit the address-space limit (inferred from those runs, not
-  traced). The suite passes at the default limit. If thread creation is what fails, it should say so
-  instead of trapping.
 - [ ] **Xtensa `llc` aborts on frames of 128 to 255 bytes that take a stack address.** `LLVM ERROR: Error
   while trying to spill A6 from class AR: Cannot scavenge register without an emergency spill slot!`, seen
   2026-11-01 on `esp32RecoveredZN3nvs7Storage9writeItem...` from abla-embedded's `tools/build-example
@@ -49,8 +40,6 @@
       and `suite-package-providers` failed to resolve a local git dependency, with neither recurring
       in the next runs. Suspected: the Nix profile changing mid-run. Not confirmed, but during a `home-manager switch`
       on 2026-11-01, `~/.nix-profile/bin/git` was missing for a moment.
-- [ ] A finished `ablac serve` child stays a zombie until the next generation replaces it: nothing reaps it while `serve` sleeps
-      (`[.abla-serve-<pid>] <defunct>`, seen 2026-11-01).
 - [ ] `kill -- -$session` doesn't reach a compiler started through `build/ablac`: `tools/run-limited.sh`'s `timeout` makes it a process
       group of its own. SIGTERM is forwarded; SIGKILL to the group leaves `ablac` running until its limit (2026-11-01).
 - [ ] `E_NAMED_ARGUMENT_HIDDEN` remains for one case: a default calling a constructor or foreign function the caller hides, whose type
@@ -59,9 +48,6 @@
       Passing `b` or renaming the local avoids it.
 - [ ] macOS: nobody has compared a local rebuild with the published binary, and
       `tools/test-reproducible-elsewhere.sh` skips it (2026-11-01).
-- [ ] `ablac.bin` run without `ABLA_SYSROOT` from outside the repository finds no runtime and doesn't say
-      so: `fun main: int = 7` fails at link with `ld.lld: undefined symbol: abla_i64`, from
-      `env -u ABLA_SYSROOT .../ablac.bin build m.ab -o m --no-cache`. Seen 2026-11-01.
 - [ ] `tools/test-simd.sh`, `test-ct.sh` and `test-crypto-pure.sh` fail on Xtensa when given an
       installed `ablac`: their `llc` shim for `-relocation-model=static` goes first on `PATH`, and the
       install's wrapper puts its own LLVM ahead of it, so llc aborts on PIC. They pass with the
@@ -81,10 +67,6 @@
 - [ ] There is no YAML library: NovaKind's `provision-mail` edits `~/.config/icy/mail.yaml` by its lines and refuses anything else
       under `accounts:`.
 - [ ] `abla-s3` has no list-objects, create-bucket or head-bucket; a tool goes through `bucketRequest` and `sendOnce`, and parses the XML.
-- [ ] `ablac package vendor --project .` wrote an untracked `vendor/` as well as `.abla/packages`, in a project whose build reads only
-      the second. Noticed in `git status` after running it.
-- [ ] `sha256Stream`, `Command.environment` and the rest went in with `tools/test-linux-process.sh`, but the compiler's fixed point
-      wasn't run on that commit, though the compiler uses `LinuxCommand`: its constructor gained defaulted fields.
 
 ## Compiler and stdlib
 
@@ -345,4 +327,4 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   `assume` would turn any producer missed later (extension fields with defaults,
   generics) into undefined behaviour instead of a trap, so it isn't worth carrying.
 
-- `adoptNativeString` tests `address > 0`, but real ARM64 Android's `malloc` returns tagged pointers (`0xb400...`), which are negative as `int`. It then returns the `""` literal, and `ByteBuffer.stageReserve` writes into read-only memory: SIGSEGV at the first append. Emulators don't tag, so they pass. Should be `address != 0`; other address comparisons in the runtime need the same check (`__ablaRuntimeHostCollection*` tables shift addresses arithmetically). abla-mobile's manifest now sets `allowNativeHeapPointerTagging="false"`, which hides this on Android. Found 2026-11-01 on a Galaxy S25 Ultra.
+- `adoptNativeString` now tests `address != 0` for ARM64 Android's tagged pointers (`0xb400...`), not run on one. Other address comparisons in the runtime need the same check (`__ablaRuntimeHostCollection*` tables shift addresses arithmetically). abla-mobile's manifest now sets `allowNativeHeapPointerTagging="false"`, which hides this on Android. Found 2026-11-01 on a Galaxy S25 Ultra.
