@@ -243,7 +243,7 @@ under `build/`.
   parser, resolver, type checker, ownership checker, and IR verifier.
 - Make filesystem, environment, network, clock, and native access explicit
   capabilities rather than invisible compiler privileges.
-- Keep builds deterministic, bounded, transactional, and reproducible.
+- Keep builds deterministic, bounded, and reproducible, with every output file whole.
 - Keep the compiler readable, self-hosted, and fixed-point tested before
   promotion.
 - Keep hosted facilities optional and maintain a libc-free production target.

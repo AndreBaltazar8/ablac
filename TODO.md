@@ -125,6 +125,9 @@
 
 ## Toolchain and project
 
+- [ ] **Drop the clean-up of old build transactions** (`bootstrapRemoveOldBuildTransactions` in `src/toolchain.ab`,
+  its call in `src/orc_main.ab`, docs/programmable-builds.md) once no compiler up to 0.2.32, which made
+  `build/.abla-build-transaction-<pid>`, is in use.
 - [ ] **Released toolchains can't target Xtensa.** CI's Nix shell has the patched LLVM
   ([llvm-xtensa.md](docs/llvm-xtensa.md)), but `abla-toolchain-x86_64-linux` bundles
   apt.llvm.org's LLVM from an Ubuntu 22.04 image and the macOS jobs use Homebrew's, neither

@@ -64,8 +64,6 @@ fun bootstrapRequireStandardLibrary(): void {
         linuxPrintStandardError(
             "error[E_TOOLCHAIN_ROOT]: no standard library at ${standardLibrary.text}: set ABLA_SYSROOT to the toolchain's directory, or start the `ablac` launcher\n"
         )
-        // The process ends here, so a build puts its earlier outputs back first.
-        if (bootstrapBuildTransactionActive) bootstrapRollbackBuildTransaction()
         linuxSyscall1(60, 2)
     }
     return
@@ -980,6 +978,104 @@ fun bootstrapPublishCacheFile(source: string, destination: string): int {
     status
 }
 
+// Whether no process has id `process` (kill(process, 0): ESRCH).
+fun bootstrapProcessGone(process: int): bool = linuxSyscall2(62, process, 0) == -3
+
+// The process id in a temporary's name, from `start` on: the digits after the
+// first `.tmp.` or `.publish.`, up to the end of the name or a dot; else -1.
+fun bootstrapTemporaryOwner(name: string, start: int): int {
+    var index = start
+    while (index < name.size) {
+        var digits = -1
+        if (name.size >= index + 5 && name.slice(index, index + 5) == ".tmp.") digits = index + 5
+        if (name.size >= index + 9 && name.slice(index, index + 9) == ".publish.") digits = index + 9
+        if (digits > 0) {
+            var end = digits
+            var owner = 0
+            while (end < name.size && end - digits < 9 && name[end] >= 48 && name[end] <= 57) {
+                owner = owner * 10 + name[end] - 48
+                end = end + 1
+            }
+            if (end > digits && (end == name.size || name[end] == 46)) return owner
+        }
+        index = index + 1
+    }
+    -1
+}
+
+// Removes what builds of `outputPath` left beside it on their way to publishing
+// it: files and directories named after it with `.tmp.<pid>` or `.publish.<pid>`
+// in their name, this process's, and those of processes that have gone (a build
+// that was stopped).
+fun bootstrapRemoveBuildTemporaries(outputPath: string): void {
+    val output = Path(outputPath)
+    val stem = "${output.name()}."
+    val self = linuxProcessId()
+    for (entry in output.parent().entries()) {
+        val name = entry.name()
+        if (name.size > stem.size && name.slice(0, stem.size) == stem) {
+            val owner = bootstrapTemporaryOwner(name, stem.size - 1)
+            if (owner > 0 && (owner == self || bootstrapProcessGone(owner))) entry.removeTree()
+        }
+    }
+    return
+}
+
+// The process id that ends `name` after `prefix` (with `serial`, digits then
+// `-` may follow), else -1.
+fun bootstrapScratchOwner(name: string, prefix: string, serial: bool): int {
+    if (name.size <= prefix.size || name.slice(0, prefix.size) != prefix) return -1
+    var end = prefix.size
+    var owner = 0
+    while (end < name.size && end - prefix.size < 9 && name[end] >= 48 && name[end] <= 57) {
+        owner = owner * 10 + name[end] - 48
+        end = end + 1
+    }
+    var matched = end > prefix.size
+    if (matched && end < name.size) matched = serial && name[end] == 45
+    if (matched) owner else -1
+}
+
+// What builds that were stopped left in build/ of the working directory: each
+// process's scratch directories, removed once it has gone.
+fun bootstrapRemoveAbandonedBuildScratch(): void {
+    val scratch = [
+        ".abla-compile-outputs-", ".abla-compile-globals-",
+        ".abla-program-requests-", ".abla-defined-targets-",
+        ".abla-export-requests-", ".abla-artifact-root-requests-",
+        ".abla-function-body-replacements-",
+        ".abla-function-annotation-additions-",
+        ".abla-driver-diagnostics-", ".abla-generated-module-requests-"
+    ]
+    val self = linuxProcessId()
+    for (entry in Path("build").entries()) {
+        val name = entry.name()
+        var owner = -1
+        var kind = 0
+        while (owner < 0 && kind < scratch.size) {
+            owner = bootstrapScratchOwner(name, scratch[kind], false)
+            kind = kind + 1
+        }
+        if (owner > 0 && owner != self && bootstrapProcessGone(owner)) entry.removeTree()
+    }
+    return
+}
+
+// Clean-up of old build transactions. Compilers up to 0.2.32 moved a build's
+// earlier outputs into build/.abla-build-transaction-<pid> (-<pid>-<n> for a few
+// builds of master) to put them back if it failed, and a build that was stopped
+// left that behind. They go once their process has gone, with nothing put back:
+// builds since have made those outputs again. This step goes once no compiler
+// that makes them is in use (TODO.md).
+fun bootstrapRemoveOldBuildTransactions(): void {
+    val self = linuxProcessId()
+    for (entry in Path("build").entries()) {
+        val owner = bootstrapScratchOwner(entry.name(), ".abla-build-transaction-", true)
+        if (owner > 0 && owner != self && bootstrapProcessGone(owner)) entry.removeTree()
+    }
+    return
+}
+
 // An external tool as a cache key sees it: the file a command name runs (found on
 // PATH as an exec finds it), its size and modification time. A tool replaced in
 // place, or another one ahead of it on PATH, is another identity.
@@ -1280,9 +1376,11 @@ trusted fun bootstrapInternalizeLlvmUserFunctionWrapperBitcode(
 // by tools/test-reproducible-elsewhere.sh.
 val BOOTSTRAP_NATIVE_PARTS = 8
 
+// Writes `outputPath`; its parts are named after `objectPath`.
 fun bootstrapEmitParallelObject(
     llvmPath: string,
-    objectPath: string
+    objectPath: string,
+    outputPath: string
 ): int {
     val jobs = bootstrapNativeParallelism()
     val partCount = BOOTSTRAP_NATIVE_PARTS
@@ -1355,7 +1453,7 @@ fun bootstrapEmitParallelObject(
             part = part + 1
         }
         combine.argument("-o")
-        combine.argument(objectPath)
+        combine.argument(outputPath)
         status = combine.run()
     }
     var cleanup = 0
@@ -1601,9 +1699,12 @@ fun bootstrapLlvmNameByte(byte: int): bool =
     (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) ||
     byte == 95 || byte == 46 || byte == 36 || byte == 45
 
+// Writes `outputPath`; its partitions are named after `objectPath` (their text,
+// which names its file, keys the partition cache).
 fun bootstrapEmitPartitionedObject(
     llvmPath: string,
     objectPath: string,
+    outputPath: string,
     emitObject: (string, string) -> int,
     cacheProfile: string,
     cacheNamespace: string,
@@ -1616,7 +1717,7 @@ fun bootstrapEmitPartitionedObject(
     var reused = 0
     var refreshed = 0
     if (status == 0 && symbols.size <= 1) {
-        status = emitObject(preparedPath, objectPath)
+        status = emitObject(preparedPath, outputPath)
     }
     if (symbols.size > 1) {
         var bucketCount = (symbols.size + 31) / 32
@@ -1738,7 +1839,7 @@ fun bootstrapEmitPartitionedObject(
                 part = part + 1
             }
             combine.argument("-o")
-            combine.argument(objectPath)
+            combine.argument(outputPath)
             status = combine.run()
         }
     }
@@ -2210,6 +2311,9 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     val publishPath = if (privatePublish)
         "$publishDirectory/${Path(outputPath).name()}"
     else "$outputPath.tmp.${linuxProcessId()}"
+    // Each file the build publishes is written beside its name and renamed over it,
+    // so a stopped build leaves whole files, and temporaries the next one removes.
+    bootstrapRemoveBuildTemporaries(outputPath)
     if (privatePublish) Path(publishDirectory).createDirectories()
     val optimizedWasmPath = "$outputPath.wasm-opt.tmp.${linuxProcessId()}"
     val manifestPath = rootManifestPath
@@ -2366,20 +2470,18 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     Path(combinedObjectPath).remove()
     Path(publishPath).remove()
     Path(optimizedWasmPath).remove()
-    // (No stale object beside a module that emits none, or a declined sidecar: the
-    // build's transaction would otherwise put an earlier build's back.)
-    if (wasmObjectUnused || sidecarDeclined) {
-        Path(objectPath).remove()
-        bootstrapDropBuildTransactionPath(objectPath)
-    }
+    val emittedObjectPath = "$objectPath.tmp.${linuxProcessId()}"
+    // Earlier files that no longer describe this build's artifact go once it is
+    // published: a failed build leaves the earlier ones as they were.
+    var staleLlvm = false
     if (cached) {
         linkLlvm = Path(cacheLinkLlvmPath).readText() == "1"
         linkHost = Path(cacheLinkHostPath).readText() == "1"
         abiManifest = Path(cacheAbiPath).readText()
         status = if (wasmObjectUnused || (sidecarDeclined && !linkLlvm)) 0
-            else bootstrapCopyNativeObject(cacheObjectPath, objectPath)
+            else bootstrapPublishCacheFile(cacheObjectPath, objectPath)
         if (status == 0 && ltoEligible) status =
-            bootstrapCopyNativeObject(cacheLlvmPath, llvmPath)
+            bootstrapPublishCacheFile(cacheLlvmPath, llvmPath)
         if (status != 0) failureKind = "io"
     }
     if (!cached) {
@@ -2443,9 +2545,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             } else {
                 if (bitcodeHandoff || nativeHeld) {
                     // A text of an earlier build would no longer match the module.
-                    Path(llvmPath).remove()
-                    // (Nor may the build's transaction put it back.)
-                    bootstrapDropBuildTransactionPath(llvmPath)
+                    staleLlvm = true
                     status = 0
                 } else {
                     val live = if (linkLlvm && target.hosted && target.objectFormat == "elf" &&
@@ -2484,6 +2584,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                 val partitioned = bootstrapEmitPartitionedObject(
                     llvmPath,
                     objectPath,
+                    emittedObjectPath,
                     emitObject,
                     cacheProfile,
                     partitionCacheNamespace,
@@ -2498,7 +2599,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                     cacheProfile == "inprocess-o2" && target.hosted &&
                     llvmInfo.isFile() && llvmInfo.size > 8388608) {
                     status = bootstrapEmitParallelObject(
-                        llvmPath, objectPath
+                        llvmPath, objectPath, emittedObjectPath
                     )
                 } else if (inProcessCodegen || nativeHeld) {
                     // Code generation units (codegen_units.ab) and their cache, on for
@@ -2509,12 +2610,17 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                         "${compilerImage.size}-$compilerFirstHash-$compilerSecondHash-${llvmLibraryVersion()}"
                     )
                     status = if (inProcessCodegen)
-                        bootstrapEmitHeldWasmObject(target.llvmTriple, objectPath, places)
-                        else bootstrapEmitHeldNativeObject(objectPath, nativeUnits, places)
+                        bootstrapEmitHeldWasmObject(target.llvmTriple, emittedObjectPath, places)
+                        else bootstrapEmitHeldNativeObject(emittedObjectPath, nativeUnits, places)
                 } else if (bitcodeHandoff) {
-                    status = emitObject(bitcodePath, objectPath)
+                    status = emitObject(bitcodePath, emittedObjectPath)
                     Path(bitcodePath).remove()
-                } else status = emitObject(llvmPath, objectPath)
+                } else status = emitObject(llvmPath, emittedObjectPath)
+            }
+            if (status == 0 && !objectSkipped &&
+                !Path(emittedObjectPath).moveTo(Path(objectPath))) {
+                status = 145
+                failureKind = "io"
             }
             bootstrapDisposeHeldModule()
             if (status == 0 && cacheEnabled && compileInputsCacheable &&
@@ -2693,7 +2799,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         if (adapterCache != "") {
             val adapterCacheInfo = Path(adapterCache).info()
             adapterReused = adapterCacheInfo.isFile() && adapterCacheInfo.size > 0 &&
-                bootstrapCopyNativeObject(adapterCache, hostPath) == 0
+                bootstrapPublishCacheFile(adapterCache, hostPath) == 0
         }
         if (!adapterReused) {
             val compileAdapter = linuxCommand(macClang)
@@ -3073,6 +3179,9 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             failureKind = "io"
         }
     }
+    // (No stale object beside a module that emits none, or a declined sidecar.)
+    if (status == 0 && (wasmObjectUnused || sidecarDeclined)) Path(objectPath).remove()
+    if (status == 0 && staleLlvm) Path(llvmPath).remove()
     if (status == 0 && !bootstrapCommitCompileOutputs()) {
         status = 144
         failureKind = "io"
@@ -3084,6 +3193,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     if (status != 0) Path(combinedObjectPath).remove()
     if (status != 0) Path(ltoObjectPath).remove()
     if (status != 0) Path(ltoPreparedPath).remove()
+    bootstrapRemoveBuildTemporaries(outputPath)
     if (status != 0 && failureKind == "io") {
         linuxPrintStandardError(
             "error[E_BUILD_IO]: native build could not publish an intermediate or output artifact (status $status)\n"

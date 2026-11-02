@@ -563,25 +563,6 @@ fun bootstrapAppendDefinedTargets(
     status
 }
 
-fun bootstrapRecordNativeOutputSet(output: string): bool {
-    var recorded = bootstrapRecordBuildTransactionPath(output)
-    if (recorded) recorded = bootstrapRecordBuildTransactionPath(
-        "$output.abi.json"
-    )
-    if (recorded) recorded = bootstrapRecordBuildTransactionPath("$output.ll")
-    if (recorded) recorded = bootstrapRecordBuildTransactionPath("$output.o")
-    if (recorded) recorded = bootstrapRecordBuildTransactionPath(
-        "$output.host.o"
-    )
-    if (recorded) recorded = bootstrapRecordBuildTransactionPath(
-        "$output.raw-runtime.o"
-    )
-    if (recorded) recorded = bootstrapRecordBuildTransactionPath(
-        "$output.o.bc"
-    )
-    recorded
-}
-
 fun bootstrapArtifactSliceSourcePath(sourcePath: string): string {
     var result = sourcePath
     if (sourcePath.size > 0 && sourcePath[0] != 47) {
@@ -653,7 +634,6 @@ fun bootstrapAppendArtifactSlices(
             source = "${source}    return\n}\n#compiler.transform(__abla_export_slice)\n"
             val entry = "${request.output}.abla-slice.ab"
             var valid = Path(entry).parent().createDirectories()
-            if (valid) valid = bootstrapRecordBuildTransactionPath(entry)
             if (valid) valid = Path(entry).writeTextAtomic(source)
             if (!valid) {
                 linuxPrintStandardError(
@@ -681,7 +661,9 @@ fun bootstrapAppendArtifactSlices(
 
 // Compile one root normally, then drain any program nodes registered by its
 // compile-time build definition. Child compilations may register more nodes;
-// the bounded queue makes that recursion explicit and cycle diagnosable.
+// the bounded queue makes that recursion explicit and cycle diagnosable. Each
+// node publishes its own outputs when it builds: a failed one leaves its
+// earlier outputs (or none), and the nodes built before it keep theirs.
 fun bootstrapOrcBuild(
     sourcePath: string,
     outputPath: string,
@@ -694,22 +676,16 @@ fun bootstrapOrcBuild(
     bootstrapTakeCompileProgramRequests()
     bootstrapTakeDefinedTargets()
     bootstrapTakeArtifactRootRequests()
-    bootstrapBeginBuildTransaction()
-    var status = 0
-    if (!bootstrapRecordNativeOutputSet(outputPath)) {
-        linuxPrintStandardError(
-            "error[E_BUILD_GRAPH_TRANSACTION]: cannot journal root build outputs within bounded transaction limits\n"
-        )
-        status = 156
-    }
-    if (status == 0) status = bootstrapOrcBuildSingle(
-            sourcePath,
-            outputPath,
-            fast,
-            useCache,
-            target,
-            artifact
-        )
+    bootstrapRemoveAbandonedBuildScratch()
+    bootstrapRemoveOldBuildTransactions()
+    var status = bootstrapOrcBuildSingle(
+        sourcePath,
+        outputPath,
+        fast,
+        useCache,
+        target,
+        artifact
+    )
     val queued = bootstrapTakeCompileProgramRequests()
     val artifactRoots = bootstrapTakeArtifactRootRequests()
     val sliceEntries: array<string> = []
@@ -777,12 +753,6 @@ fun bootstrapOrcBuild(
             )
             status = 149
         }
-        if (status == 0 && !bootstrapRecordNativeOutputSet(request.output)) {
-            linuxPrintStandardError(
-                "error[E_BUILD_GRAPH_TRANSACTION]: cannot journal outputs for program '${request.name}' within bounded transaction limits\n"
-            )
-            status = 156
-        }
         if (status == 0) {
             names.append(request.name)
             outputs.append(request.output)
@@ -837,14 +807,6 @@ fun bootstrapOrcBuild(
             "error[E_BUILD_GRAPH_LIMIT]: programmable build exceeds 64 program nodes\n"
         )
         status = 150
-    }
-    if (status == 0) {
-        bootstrapCommitBuildTransaction()
-    } else if (!bootstrapRollbackBuildTransaction()) {
-        linuxPrintStandardError(
-            "error[E_BUILD_GRAPH_ROLLBACK]: failed to restore one or more outputs after graph failure\n"
-        )
-        status = 157
     }
     status
 }

@@ -64,7 +64,7 @@ compile fun buildClient(): void {
 `compiler.reference(handle)` is the no-relookup form for a reflected function.
 Generated adapters can be added through `declareGenerated(builder)` and
 selected with `export(generatedName, foreignName)`. Both paths use the same
-checked child compilation and graph-wide transactional publication; no
+checked child compilation and the same per-file publication; no
 extension-authored entry file is involved.
 
 The declaration block is syntax, not source text passed by the application.
@@ -89,25 +89,36 @@ compile fun configureClient(): void {
 ```
 
 Repeated contributions to `browser` aggregate into one target-correct child
-compilation. The generated entry, module, object/LLVM/ABI sidecars, native root,
-and any prior versions share the graph rollback journal. This generic mechanism
+compilation, published like any other node (below). This generic mechanism
 does not assign meaning to annotations such as `@client`; the selecting
 extension checks annotation policy through compiler reflection.
 
-The call adds a node to the current compilation transaction. After validating
+The call adds a node to the current build. After validating
 the root program, the driver drains those nodes in deterministic declaration
 order. A child program may register more programs, enabling an extension-owned
 `build.ab` to construct its graph dynamically. Names and output paths must be
 unique, paths are project-relative, each evaluation may submit at most 32
 nodes, and the complete recursively expanded graph is capped at 64 nodes.
-Publication is graph-transactional across the root, every recursively
-discovered artifact, ABI/LLVM/object sidecars, and compile-time generated
-file. Before a path is changed, an existing file is atomically renamed into a
-private bounded journal; a later node failure restores prior files and removes
-new ones in reverse order. A successful graph discards the journal. At most 4096
-distinct output paths may participate, and exceeding that bound fails with
-`E_BUILD_GRAPH_TRANSACTION` before the unjournaled path is modified. A
-rollback failure is reported separately as `E_BUILD_GRAPH_ROLLBACK`.
+Each file a build publishes (an artifact, its ABI/LLVM/object sidecars, a
+compile-time generated file) is written beside its name, as
+`<name>.tmp.<pid>` (or under its final name in `<artifact>.publish.<pid>/` where
+the linker records the name), and renamed over it, so every file is always
+whole: the earlier build's or the new one's. Each node publishes when it builds.
+A node that fails leaves its earlier artifact and ABI manifest, or none, and
+the nodes built before it keep their new outputs; the build fails and says
+which node. Files a successful build drops (a stale object or LLVM text beside
+an artifact that no longer has one) go only once its artifact is published.
+A build that is stopped (killed, or by a panic) leaves only temporaries: the
+next build of that artifact removes those named after it whose process has
+gone, and every build removes per-process scratch directories in `build/` of
+processes that have gone.
+
+Clean-up of old build transactions: compilers up to 0.2.32 instead moved a
+build's earlier outputs into `build/.abla-build-transaction-<pid>`, to put them
+back if the graph failed, and a stopped build left that directory behind. Every
+build now removes those in `build/` of its working directory once their process
+has gone, putting nothing back (builds since have made those outputs again).
+This step goes once no compiler that makes them is in use.
 `compilerWriteFile` can stage generated source consumed by a requested node;
 its ordinary `filesystem.write` authorization and output bounds still apply.
 Until build-plan manifests can be restored independently, any module graph
@@ -148,7 +159,7 @@ extension-generated JavaScript loader. Its proof module exports only the stable
 across repeated cached builds. The compiler contains WebAssembly object/linker
 support, but no fetch, JavaScript, browser, DOM, rendering, or MVC policy. LLD
 name/debug metadata is stripped from the deployable module because its
-transactional temporary filename is nondeterministic; explicit debug sidecars
+temporary filename is nondeterministic; explicit debug sidecars
 remain roadmap work. Linking uses one worker so artifact construction stays
 within the same bounded process budget on high-core-count hosts.
 
@@ -183,7 +194,7 @@ the adapter accepts null only for an empty slice, copies the exact bytes into
 tracked Abla-owned storage, and adds its own terminator before calling user
 code. C conformance covers embedded NUL/non-UTF-8 bytes and the empty-null
 case. Every native artifact publishes a sibling `.abi.json` after
-successful linking through the staged-output transaction. Schema `abla.abi.v1`
+successful linking, with the build's staged outputs. Schema `abla.abi.v1`
 records the selected target,
 artifact container, foreign symbol, source declaration, parameter list, ABI
 result representation, ownership/nullability, and failure containment status.
@@ -219,7 +230,7 @@ The compiler foundation now provides generated source, recursively requested
 program nodes, extension-defined target descriptors, executable/library/module
 artifacts, explicit foreign exports, versioned ABI and ownership metadata,
 content-addressed leaf caching, bounded effects and graph expansion, structured
-extension diagnostics, and graph-wide transactional publication. These are
+extension diagnostics, and whole-file publication. These are
 generic compiler mechanisms; none encodes a mobile, browser, UI, packaging, or
 framework policy.
 

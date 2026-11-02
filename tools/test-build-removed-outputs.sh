@@ -6,7 +6,7 @@ set -euo pipefail
 # release executable built without its sidecar (the default, or --no-sidecar) after
 # one built with it (--sidecar; the executable is the same). A development build
 # that hands its module on without LLVM text leaves no earlier text beside it. A
-# build that fails still puts every earlier output back.
+# build that fails leaves every earlier output as it was.
 
 compiler=${1:-build/ablac.bin}
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)

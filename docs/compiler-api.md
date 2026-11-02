@@ -714,7 +714,7 @@ static-library, and shared-library artifacts. Extension-defined WebAssembly
 targets additionally use the generic `module` artifact; stable exported
 adapters remain separate from those containers. See
 `docs/programmable-builds.md` for the ABI, target-description, and
-transactional build-graph roadmap.
+build-graph roadmap.
 
 `compiler.contributeArtifactRoot(name, target, artifact, output, function,
 exportName, fast, cache)` adds an exact resolved top-level scalar root to a
@@ -723,7 +723,7 @@ aggregated into one generated entry and one child compilation. The bounded rung
 accepts value `bool`/`int` parameters and `void`/`bool`/`int` results, requires
 an unambiguous top-level identity, and publishes only the requested explicit
 foreign symbols. Each child is independently optimized, target-lowered,
-verified, linked, manifested, and committed in the parent build transaction.
+verified, linked, manifested, and published as a node of the parent build.
 For libc-free Wasm, uncontained panic paths lower to target-neutral
 `unreachable`; the ABI manifest records `panic: not-contained`.
 
@@ -740,12 +740,10 @@ archive, or no-entry module through `wasm-ld`. Platform packages such as
 `abla/android/build` and `abla/wasm/build` own concrete triples and integration
 policy.
 
-The root and recursively registered program nodes share one bounded output
-transaction. Artifacts, generated source, and compiler-owned sidecars journal
-their prior filesystem entry before replacement. If any later node fails, old
-files are restored and newly created paths are removed; only a completely
-successful graph commits. The journal accepts at most 4096 distinct paths and
-reports transaction and rollback failures with stable build diagnostic codes.
+The root and each recursively registered program node publish their own
+outputs when they build, each file written beside its name and renamed over
+it. A failing node leaves its earlier artifact (or none) and fails the build;
+nodes built before it keep their new outputs (`docs/programmable-builds.md`).
 
 `@export("name")` is the source-level form for marking one resolved top-level
 function for a stable foreign adapter. `@exportChecked("name")` selects the

@@ -23,10 +23,10 @@ require libc; hosted facilities are optional capabilities.
   cross-builds, and WASM/MVC modules.
 - Compile-time code has bounded effect grants and can inspect resolved types,
   generate validated modules/files, register targets, request recursive program
-  nodes, and publish outputs transactionally.
+  nodes, and publish each output file whole (written aside, then renamed).
 - Program graphs produce executables, object files, static/shared libraries,
-  and WebAssembly modules. Failed graphs restore prior artifacts and remove new
-  generated files.
+  and WebAssembly modules. A failed node keeps its earlier artifact; nodes
+  built before it keep their new outputs.
 - Foreign exports have a versioned ABI manifest, value-safe scalar and copied
   byte inputs, owned byte results, call-scoped callbacks, and an opt-in checked
   boundary on supported hosted targets.
