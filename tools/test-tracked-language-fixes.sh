@@ -57,6 +57,12 @@ expect_error invalid-reserved-generator '`generator` is a reserved word'
 expect_error invalid-reserved-generator '`task` is a reserved word'
 expect_error invalid-reserved-generator '`thread` is a reserved word'
 expect_exit transform-method-effects 42
+expect_exit address-taken-unreachable 0
+if ! grep -aq used-function-text "$output/address-taken-unreachable" ||
+    grep -aq dead-function-text "$output/address-taken-unreachable"; then
+    echo 'a function only unreachable code takes the value of is in the program' >&2
+    exit 1
+fi
 expect_exit transform-implicit-this 42
 expect_exit compile-effect-unmade-implementer 42
 expect_error invalid-compile-effect-made-implementer compile.effect-denied:

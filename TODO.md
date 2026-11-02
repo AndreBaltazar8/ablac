@@ -35,9 +35,12 @@
   `llvm-xtensa-lea-scavenging` has it, pinned to the published `llvm-23.1.3-xtensa-2` (2026-11-01): both examples build with it
   and its `llc` output matches the patches' source build. It's held back from master with `mcu-gc-inline`, until the PaperMono
   hardware test; merging it is what closes this.
-- [ ] **abla-one's limits on 0.2.29.** (a) A class's methods are all compiled, used or not, so what only one method reaches stays in
-  every program with the class. (b) `bootstrapLlvmAddressTaken` counts a function's value taken in an unreachable function, so it's in
-  `abla_llvm_call_indirect`'s table and linked.
+- [ ] **A class's methods are all compiled, used or not** (abla-one, 0.2.29), so what only one method reaches stays in every program
+  with the class: `val table = build()` read only by an uncalled method still runs at startup and links `build` (why abla-one's
+  `Style.wrap` is an extension). The uncalled method is dropped by LLVM, its global's initializer isn't. Looked at 2026-11-02, not changed:
+  `bootstrapSourceReachableDeclarations` walks every method of a reached class, and the lowering loop lowers them all, by declaration.
+  It needs method-level demand in both, by called name, with what lowering inserts by itself (operators, iterators, delegates, drops)
+  counted. Weigh against what removing dead functions before opt did to inlining ("`make test` under 2 minutes", below).
 - [ ] A lambda that returns its parameter checks as a plain function type: `val keep: (Row) -> Row = { c: Row -> c }` compiles, where
   `fun id(c: Row): Row = c` is `ownership.borrow-escape`, so a call of such a value counts as making a new value. Seen 2026-11-02.
 - [ ] A lambda with no declared result, passed for `(int) -> string?`, doesn't take that type from an unconditional `null`:
