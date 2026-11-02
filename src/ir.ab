@@ -3183,14 +3183,27 @@ fun bootstrapFinalizeIrFunction(
         }
         if (!nakedValid || assemblyCount != 1) errors = errors + 1
     }
+    // Checked as written, then emitted without what nothing reads.
+    val trimmed = if (errors == 0 && !naked)
+        bootstrapIrWithoutDeadValues(reachableInstructions, result) else []
+    val trim = trimmed.size > 0
+    val trimmedBlocks = if (trim) bootstrapBuildIrBlocks(trimmed) else []
+    val trimmedLocals = if (trim) bootstrapBuildIrLocals(trimmed, trimmedBlocks, parameters) else []
+    val trimmedLocalTypes: array<string> = []
+    for (kept in trimmedLocals) {
+        declared = lastDeclared.find(kept.name, -1)
+        trimmedLocalTypes.append(if (declared >= 0) bootstrapNormalizeType(
+            declaredLocalTypes[declared]
+        ) else "unknown")
+    }
     BootstrapIrFunction(
         name,
         parameters,
-        reachableInstructions,
+        if (trim) trimmed else reachableInstructions,
         result,
-        blocks,
-        locals,
-        localTypes,
+        if (trim) trimmedBlocks else blocks,
+        if (trim) trimmedLocals else locals,
+        if (trim) trimmedLocalTypes else localTypes,
         parameterTypes,
         bootstrapNormalizeType(resultType),
         inlineHint,
@@ -3202,6 +3215,107 @@ fun bootstrapFinalizeIrFunction(
         label,
         position
     )
+}
+
+// A join's temporary (bootstrapLowerIf and its kin): set on each path, read once after.
+fun bootstrapIrJoinTemporary(name: string): bool =
+    bootstrapIrNamePrefix(name, "if_result_") || bootstrapIrNamePrefix(name, "when_result_") ||
+    bootstrapIrNamePrefix(name, "logical_result_") || bootstrapIrNamePrefix(name, "cast_result_") ||
+    bootstrapIrNamePrefix(name, "dispatch_result_")
+
+fun bootstrapIrNamePrefix(name: string, prefix: string): bool =
+    name.size > prefix.size && name.slice(0, prefix.size) == prefix
+
+// `instructions` without the constants and local loads whose values nothing uses, and
+// without the join temporaries nothing then reads: an `if` without `else` as a statement
+// kept its value, a local set on both paths and read after into a value nothing read.
+// LLVM removed them all again, after carrying them through most of its passes (a fifth
+// of json-readers' value slots). Empty when nothing goes.
+fun bootstrapIrWithoutDeadValues(
+    instructions: array<BootstrapInstruction>,
+    result: int
+): array<BootstrapInstruction> {
+    var maximumValue = result
+    for (instruction in instructions) {
+        if (instruction.result > maximumValue) maximumValue = instruction.result
+        if (instruction.left > maximumValue) maximumValue = instruction.left
+        if (instruction.right > maximumValue && instruction.opcode != "parameter.default") {
+            maximumValue = instruction.right
+        }
+        for (operand in instruction.operands) {
+            if (operand > maximumValue) maximumValue = operand
+        }
+    }
+    val uses = filledArray(maximumValue + 1, 0)
+    for (instruction in instructions) bootstrapIrCountUses(uses, instruction, 1)
+    if (result >= 0) uses[result] = uses[result] + 1
+    val removed = filledArray(instructions.size, false)
+    var count = 0
+    var changed = true
+    while (changed) {
+        changed = false
+        var index = instructions.size - 1
+        while (index >= 0) {
+            val instruction = instructions[index]
+            if (!removed[index] && instruction.result >= 0 && uses[instruction.result] == 0 &&
+                (instruction.opcode == "local.load" || instruction.opcode == "parameter.load" ||
+                 bootstrapIrNamePrefix(instruction.opcode, "const."))) {
+                removed[index] = true
+                count = count + 1
+                bootstrapIrCountUses(uses, instruction, -1)
+                changed = true
+            }
+            index = index - 1
+        }
+        // A join temporary nothing reads any more: its zero and its sets go.
+        val read: Map<string, bool> = Map()
+        index = 0
+        while (index < instructions.size) {
+            val instruction = instructions[index]
+            if (!removed[index] && bootstrapIrJoinTemporary(instruction.text) &&
+                instruction.opcode != "local.set" &&
+                !bootstrapIrNamePrefix(instruction.opcode, "local.zero")) {
+                read.set(instruction.text, true)
+            }
+            index = index + 1
+        }
+        index = 0
+        while (index < instructions.size) {
+            val instruction = instructions[index]
+            if (!removed[index] && bootstrapIrJoinTemporary(instruction.text) &&
+                read.get(instruction.text) == null &&
+                (instruction.opcode == "local.set" ||
+                 bootstrapIrNamePrefix(instruction.opcode, "local.zero"))) {
+                removed[index] = true
+                count = count + 1
+                bootstrapIrCountUses(uses, instruction, -1)
+                changed = true
+            }
+            index = index + 1
+        }
+    }
+    val kept: array<BootstrapInstruction> = []
+    if (count == 0) return kept
+    var index = 0
+    while (index < instructions.size) {
+        if (!removed[index]) kept.append(instructions[index])
+        index = index + 1
+    }
+    kept
+}
+
+// Adds `delta` to the use count of every value `instruction` reads (operands, or its
+// left and right: either may name a value, so both count; a parameter default's right
+// is not a value).
+fun bootstrapIrCountUses(var uses: array<int>, instruction: BootstrapInstruction, delta: int): void {
+    if (instruction.left >= 0) uses[instruction.left] = uses[instruction.left] + delta
+    if (instruction.right >= 0 && instruction.opcode != "parameter.default") {
+        uses[instruction.right] = uses[instruction.right] + delta
+    }
+    for (operand in instruction.operands) {
+        if (operand >= 0) uses[operand] = uses[operand] + delta
+    }
+    return
 }
 
 fun bootstrapDropFunctionName(type: string): string {
@@ -4608,6 +4722,12 @@ fun bootstrapCollectLoweredInstructionTargets(
         bootstrapMarkSourceDeclaration(
             reachable, pending, targets.find(candidate.text)
         )
+    }
+    // The body the backend gives __ablaPanicContain (a checked export's, a compile-time
+    // slice's) reads the message's bytes and length.
+    if (candidate.opcode == "call" && candidate.text == "__ablaPanicContain") {
+        bootstrapMarkIrRuntimeDeclaration("__ablaRuntimeStringData", targets, reachable, pending)
+        bootstrapMarkIrRuntimeDeclaration("__ablaRuntimeStringLengthI64", targets, reachable, pending)
     }
     if (candidate.opcode == "extern.c" ||
         candidate.opcode == "extern.host" ||
@@ -9137,6 +9257,7 @@ fun bootstrapLowerStringTemplate(
 ): int {
     var result = initial
     result = lowerer.emit("const.string", -1, -1, "")
+    val texts: array<int> = []
     var part = 0
     while (part < expression.children.size) {
         val child = expression.children[part]
@@ -9181,8 +9302,29 @@ fun bootstrapLowerStringTemplate(
         } else if (childType == "string") {
             lowerer.lowerExpression(child)
         } else lowerer.emit("to.string", lowerer.lowerExpression(child), -1, "")
-        result = lowerer.emit("string.concat", result, text, "")
+        texts.append(text)
         part = part + 1
+    }
+    // Three parts or more are joined four at a time, each four written once
+    // (__ablaRuntimeStringConcat4), where concatenating one at a time allocates and
+    // copies the text so far for each: a template of four parts allocated thrice. The
+    // runtime's own templates (its panic messages) join one at a time, so a program
+    // without such a template has no __ablaRuntimeStringConcat4 (a kilobyte).
+    if (texts.size < 3 || bootstrapIrNamePrefix(bootstrapIrSourceLabel, "__ablaRuntime")) {
+        for (text in texts) result = lowerer.emit("string.concat", result, text, "")
+    } else {
+        val empty = result
+        var next = 0
+        while (next < texts.size) {
+            val operands: array<int> = []
+            if (next > 0) operands.append(result)
+            while (operands.size < 4 && next < texts.size) {
+                operands.append(texts[next])
+                next = next + 1
+            }
+            while (operands.size < 4) operands.append(empty)
+            result = lowerer.emitMany("call", operands, "__ablaRuntimeStringConcat4")
+        }
     }
     result
 }

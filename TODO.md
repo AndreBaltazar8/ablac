@@ -197,6 +197,19 @@ Package-side work (not changed from ablac):
 - [ ] **Run times of non-Linux hosted targets aren't measured with the new allocator and root frames.** macOS keeps
   its LTO link (`wholeProgram` is ELF only) and has not been built or run with these changes; Wasm passes the suite,
   its size and speed not compared. An earlier try at size lists on Darwin gained no cycles and raised peak memory.
+- [ ] **The strict-imports check scans every standard-library module on every build.** The
+  standard library is strict, so each build re-checks each of its modules (identifiers against
+  every module's declarations) with the same result; LBR sampling put it near 7% of
+  json-readers' frontend (2026-11-02). It now shares the build's tokens. Its cost wasn't
+  measured cleanly: a `--fast` compiler's numbers moved 25% between runs of the same binary.
+- [ ] **`abla-compare`'s server builds only a few percent faster than on v0.2.31** (3.9 to 3.8 s,
+  2026-11-02): its frontend is about 1.7 s of it and its O2 1.8 s, and neither shrank much.
+- [ ] **A map is built on boxed generic arrays.** maps spends 21% in `__ablaRuntimeMapEntry`, 12% in
+  `abla_map_set`, 17% appending to and setting its parts' arrays (2026-11-02). Since string
+  concatenation allocates out of line, maps runs 1.3% more instructions.
+- [ ] **A call through a function value calls its wrapper directly only for a capture-free lambda kept
+  in a `val`** (`bootstrapLlvmKnownFunctionValue`). A parameter that a caller's inlining makes
+  constant still goes through `abla_llvm_call_indirect`'s copy and switch.
 - [ ] **A benchmark's cycles can move 20% with the code unchanged.** `fib` at 2026-11-01 is byte-identical machine
   code at another address and takes 20% more cycles. `tools/bench-compare.py` reports instructions for that reason.
 

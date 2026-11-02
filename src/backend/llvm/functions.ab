@@ -245,6 +245,12 @@ fun bootstrapLlvmDeclareDirectFunction(
     if (!function.naked && mcuTarget) {
         bootstrapLlvmAddFunctionAttribute(backend, declared, "optsize")
         bootstrapLlvmAddFunctionAttribute(backend, declared, "minsize")
+    } else if (!function.naked &&
+        bootstrapLlvmRuntimeOptimizedForSize(backend.targetTriple, function.name)) {
+        bootstrapLlvmAddFunctionAttribute(backend, declared, "optsize")
+    }
+    if (!function.naked && bootstrapLlvmRuntimeColdPath(backend.targetTriple, function.name)) {
+        bootstrapLlvmAddFunctionAttribute(backend, declared, "cold")
     }
     val simdFeatures = bootstrapLlvmSimdTargetFeatures(backend.targetTriple, function.targetFeatures)
     if (simdFeatures != "") {
@@ -349,6 +355,42 @@ fun bootstrapLlvmValueCount(function: BootstrapIrFunction): int {
 // optimizer and instruction selection then spend seconds on. `table` marks such
 // array.create instructions; `elided` the constants used by nothing else, which
 // then get no slot and no boxing at all.
+// The function a call through `value` can only reach, by name: a function value made
+// without captures (`closure.create`), as made or through a local that nothing but its
+// declaration sets. "" otherwise.
+fun bootstrapLlvmKnownFunctionValue(function: BootstrapIrFunction, value: int): string {
+    var made = bootstrapLlvmProducerOf(function, value)
+    if (made >= 0 && function.instructions[made].opcode == "local.load") {
+        val local = function.instructions[made].text
+        var declared = -1
+        var index = 0
+        while (index < function.instructions.size) {
+            val other = function.instructions[index]
+            if (other.text == local && other.opcode != "local.load") {
+                if (other.opcode != "local.declare" || declared >= 0) return ""
+                declared = index
+            }
+            index = index + 1
+        }
+        made = if (declared >= 0)
+            bootstrapLlvmProducerOf(function, function.instructions[declared].left) else -1
+    }
+    if (made >= 0 && function.instructions[made].opcode == "closure.create" &&
+        function.instructions[made].operands.size == 0) function.instructions[made].text
+    else ""
+}
+
+// The instruction that makes `value`, or -1.
+fun bootstrapLlvmProducerOf(function: BootstrapIrFunction, value: int): int {
+    if (value < 0) return -1
+    var index = 0
+    while (index < function.instructions.size) {
+        if (function.instructions[index].result == value) return index
+        index = index + 1
+    }
+    -1
+}
+
 class BootstrapLlvmConstantTables(
     val table: array<bool>,
     val elided: array<bool>,
@@ -2763,6 +2805,7 @@ fun bootstrapLlvmEmitInlineAssembly(
         operand = operand + 1
     }
     if (supported) {
+        bootstrapLlvmInlineAssembly.append(assembly)
         val type = bootstrapLlvmFunctionType(
             backend, resultType, parameterTypes
         )
@@ -8474,7 +8517,24 @@ fun bootstrapLlvmEmitFunction(
                     backend, storage, instructionIndex,
                     instruction.operands, 1
                 )
-                bootstrapLlvmCallNamed(
+                // A value that can only be one function without captures calls that
+                // function's wrapper, as the dispatcher's case would, and LLVM inlines it:
+                // the dispatcher copies, switches and boxes for a lambda kept in a `val`.
+                val known = bootstrapLlvmKnownFunctionValue(function, instruction.operands[0])
+                val knownIndex = if (known != "") functionIndex.find(known) else -1
+                val knownWrapper = if (knownIndex >= 0) LLVMGetNamedFunction(
+                    backend.module, identities.symbols[knownIndex]
+                ) else nativeNullPointer()
+                if (!pointerIsNull(knownWrapper)) {
+                    bootstrapLlvmCall(
+                        backend, knownWrapper,
+                        [storage.values[instruction.result], arguments,
+                         LLVMConstInt(
+                             backend.i64Type, instruction.operands.size - 1, 0
+                         )],
+                        "", true, [false, false, false]
+                    )
+                } else bootstrapLlvmCallNamed(
                     backend, "abla_llvm_call_indirect",
                     [storage.values[instruction.result],
                      storage.values[instruction.operands[0]], arguments,

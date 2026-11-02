@@ -150,7 +150,7 @@ trusted fun __ablaRuntimeStringStatic(data: int, length: int): any {
 
 // A boxed vector: a string of its bytes, which the backend writes (docs/simd.md).
 trusted fun __ablaRuntimeVectorBox(size: int): any {
-    val data = __ablaRuntimeAllocateLayout(size + 1, 1)
+    val data = __ablaRuntimeAllocateOutOfLine(size + 1, 1)
     ablaRuntimeStoreU8(data + size, 0)
     __ablaRuntimeStringStatic(data, size)
 }
@@ -1730,6 +1730,9 @@ trusted fun __ablaRuntimeStringLengthValue(value: any): int {
     length
 }
 
+// Out of line, as its caller StringDataSlow: a rope's walk is the slow path of reading a
+// string, and inlined it grew each place that reads one.
+@noinline
 trusted fun __ablaRuntimeCopyString(
     value: any,
     destination: int,
@@ -1737,7 +1740,7 @@ trusted fun __ablaRuntimeCopyString(
 ): int {
     var written: int = offset
     var capacity: int = 16
-    var stack = __ablaRuntimeAllocateLayout(capacity * 16, 0)
+    var stack = __ablaRuntimeAllocateOutOfLine(capacity * 16, 0)
     var count: int = 1
     ablaRuntimeStoreI64(stack, __ablaRuntimeWord0(value))
     ablaRuntimeStoreI64(stack + 8, __ablaRuntimeWord1(value))
@@ -1767,7 +1770,7 @@ trusted fun __ablaRuntimeCopyString(
         } else if (storage != 0) {
             if (count + 2 > capacity) {
                 val nextCapacity = capacity * 2
-                val replacement = __ablaRuntimeAllocateLayout(
+                val replacement = __ablaRuntimeAllocateOutOfLine(
                     nextCapacity * 16, 0
                 )
                 var index: int = 0
@@ -1830,12 +1833,13 @@ trusted fun __ablaRuntimeRopeChildrenCleared(rope: int): int =
         __ablaRuntimeRopeFlat(rope)
     } else 0
 
+@noinline
 trusted fun __ablaRuntimeStringDataSlow(value: any, rope: int): int {
     val cached = __ablaRuntimeRopeFlat(rope)
     if (cached != 0) cached
     else {
         val length = ablaRuntimeLoadI64(rope)
-        val allocated = __ablaRuntimeAllocateLayout(length + 1, 1)
+        val allocated = __ablaRuntimeAllocateOutOfLine(length + 1, 1)
         __ablaRuntimeCopyString(value, allocated, 0)
         ablaRuntimeStoreU8(allocated + length, 0)
         // The copy stands for the whole tree now: drop the children so the
@@ -1975,7 +1979,7 @@ trusted fun __ablaRuntimeOwnedBytesRelease(handle: int): void {
 
 trusted fun __ablaRuntimeAsCString(value: any): int {
     val length = __ablaRuntimeStringLengthValue(value)
-    val result = __ablaRuntimeAllocateLayout(length + 1, 1)
+    val result = __ablaRuntimeAllocateOutOfLine(length + 1, 1)
     val source = if (length == 0) 0 else __ablaRuntimeStringData(value)
     var index: int = 0
     while (index < length) {
@@ -2030,7 +2034,9 @@ trusted fun __ablaRuntimeToString(value: any): any {
 trusted fun __ablaRuntimeStringFlatLimit(): int = 64
 
 // Copies a string's bytes to `destination`: a flat string directly, a rope
-// through CopyString.
+// through CopyString. Out of line: its (vectorized) loop is a kilobyte where
+// __ablaRuntimeStringConcat and __ablaRuntimeStringConcat4 inlined it twice and four times.
+@noinline
 trusted fun __ablaRuntimeCopyStringBytes(value: any, destination: int): void {
     val data = __ablaRuntimeWord0(value)
     if (data != 0) {
@@ -2046,6 +2052,15 @@ trusted fun __ablaRuntimeCopyStringBytes(value: any, destination: int): void {
     return
 }
 
+// An allocation outside the hot paths that inline the allocator (objects, array literals,
+// number text, closures, cells): concatenation's flat bytes and terminator (layout 1) or
+// rope (6), a rope's flat copy and the stack that walks it (0), a C string, an array's
+// growth and boxing, Base64, joined chunks. Out of line: inlined, the allocator is most
+// of a kilobyte in each of those functions.
+@noinline
+trusted fun __ablaRuntimeAllocateOutOfLine(size: int, layout: int): int =
+    __ablaRuntimeAllocateLayout(size, layout)
+
 trusted fun __ablaRuntimeStringConcat(left: any, right: any): any {
     val leftLength = __ablaRuntimeStringLengthValue(left)
     val rightLength = __ablaRuntimeStringLengthValue(right)
@@ -2053,13 +2068,13 @@ trusted fun __ablaRuntimeStringConcat(left: any, right: any): any {
     else if (rightLength == 0) left
     else if (leftLength + rightLength <= __ablaRuntimeStringFlatLimit()) {
         val length = leftLength + rightLength
-        val data = __ablaRuntimeAllocateLayout(length + 1, 1)
+        val data = __ablaRuntimeAllocateOutOfLine(length + 1, 1)
         __ablaRuntimeCopyStringBytes(left, data)
         __ablaRuntimeCopyStringBytes(right, data + leftLength)
         ablaRuntimeStoreU8(data + length, 0)
         __ablaRuntimeStringStatic(data, length)
     } else {
-        val rope = __ablaRuntimeAllocateLayout(48, 6)
+        val rope = __ablaRuntimeAllocateOutOfLine(48, 6)
         ablaRuntimeStoreI64(rope, leftLength + rightLength)
         ablaRuntimeStoreI64(rope + 8, __ablaRuntimeWord0(left))
         ablaRuntimeStoreI64(rope + 16, __ablaRuntimeWord1(left))
@@ -2067,6 +2082,38 @@ trusted fun __ablaRuntimeStringConcat(left: any, right: any): any {
         ablaRuntimeStoreI64(rope + 32, __ablaRuntimeWord1(right))
         ablaRuntimeStoreI64(rope + 40, 0)
         ablaRuntimeMakeValue(4, 0, 0, rope)
+    }
+}
+
+// Four parts of a string template at once (bootstrapLowerStringTemplate): their flat
+// result is allocated and written once, where a chain of __ablaRuntimeStringConcat
+// allocates and copies the text so far at each part. A longer result, or one with at
+// most one part not empty, is that chain's. Out of line: inlined, its four copies made
+// every template site (the runtime's panic messages included) larger.
+@noinline
+trusted fun __ablaRuntimeStringConcat4(first: any, second: any, third: any, fourth: any): any {
+    val firstLength = __ablaRuntimeStringLengthValue(first)
+    val secondLength = __ablaRuntimeStringLengthValue(second)
+    val thirdLength = __ablaRuntimeStringLengthValue(third)
+    val fourthLength = __ablaRuntimeStringLengthValue(fourth)
+    val length = firstLength + secondLength + thirdLength + fourthLength
+    var parts = 0
+    if (firstLength != 0) parts = parts + 1
+    if (secondLength != 0) parts = parts + 1
+    if (thirdLength != 0) parts = parts + 1
+    if (fourthLength != 0) parts = parts + 1
+    if (parts < 2 || length > __ablaRuntimeStringFlatLimit()) {
+        __ablaRuntimeStringConcat(
+            __ablaRuntimeStringConcat(__ablaRuntimeStringConcat(first, second), third), fourth
+        )
+    } else {
+        val data = __ablaRuntimeAllocateOutOfLine(length + 1, 1)
+        __ablaRuntimeCopyStringBytes(first, data)
+        __ablaRuntimeCopyStringBytes(second, data + firstLength)
+        __ablaRuntimeCopyStringBytes(third, data + firstLength + secondLength)
+        __ablaRuntimeCopyStringBytes(fourth, data + length - fourthLength)
+        ablaRuntimeStoreU8(data + length, 0)
+        __ablaRuntimeStringStatic(data, length)
     }
 }
 
@@ -2141,7 +2188,7 @@ trusted fun __ablaRuntimeBase64Encode(value: string): any {
     val length: int = __ablaRuntimeStringLengthValue(value)
     if (length == 0) return ""
     val outputLength: int = ((length + 2) / 3) * 4
-    val output: int = __ablaRuntimeAllocateLayout(outputLength + 1, 1)
+    val output: int = __ablaRuntimeAllocateOutOfLine(outputLength + 1, 1)
     val input: int = __ablaRuntimeStringData(value)
     var source: int = 0
     var destination: int = 0
@@ -2200,7 +2247,7 @@ trusted fun __ablaRuntimeBase64Decode(value: string): any {
     val padded3: bool = ablaRuntimeLoadU8(input + length - 1) == 61
     val outputLength: int = (length / 4) * 3 -
         (if (padded3) 1 else 0) - (if (padded2) 1 else 0)
-    val output: int = __ablaRuntimeAllocateLayout(outputLength + 1, 1)
+    val output: int = __ablaRuntimeAllocateOutOfLine(outputLength + 1, 1)
     var source: int = 0
     var destination: int = 0
     var valid: bool = true
@@ -2262,7 +2309,7 @@ trusted fun __ablaRuntimeByteChunksJoin(
         return ""
     }
     if (byteCount == 0) return ""
-    val output: int = __ablaRuntimeAllocateLayout(byteCount + 1, 1)
+    val output: int = __ablaRuntimeAllocateOutOfLine(byteCount + 1, 1)
     var destination: int = 0
     var index: int = 0
     while (index < chunks.size) {
@@ -2412,7 +2459,7 @@ trusted fun __ablaRuntimeArrayFilled(countValue: any, element: any): any {
     val source = ablaRuntimeValueAddress(element)
     val kind = if (count == 0) 0 else __ablaRuntimeDenseKind(source)
     val width = if (kind == 0) 24 else 8
-    val array = __ablaRuntimeAllocateLayout(24 + count * width, 4)
+    val array = __ablaRuntimeAllocateOutOfLine(24 + count * width, 4)
     val values = if (count == 0) 0 else array + 24
     ablaRuntimeStoreI64(array, count)
     __ablaRuntimeArraySetCapacity(array, kind, count)
@@ -2457,7 +2504,7 @@ trusted fun __ablaRuntimeArrayBox(array: int): void {
         val capacity = __ablaRuntimeArrayCapacity(array)
         val values = ablaRuntimeLoadI64(array + 16)
         val boxed = if (capacity == 0) 0
-            else __ablaRuntimeAllocateLayout(capacity * 24, 2)
+            else __ablaRuntimeAllocateOutOfLine(capacity * 24, 2)
         var index: int = 0
         while (index < length) {
             ablaRuntimeStoreI32(boxed + index * 24, kind + 1)
@@ -2513,7 +2560,7 @@ trusted fun __ablaRuntimeArrayAppendGrowing(array: int, element: any): void {
     var values: int = ablaRuntimeLoadI64(array + 16)
     if (length == capacity) {
         val next = if (capacity == 0) 4 else capacity * 2
-        val replacement = __ablaRuntimeAllocateLayout(
+        val replacement = __ablaRuntimeAllocateOutOfLine(
             next * width, if (kind == 0) 2 else 1
         )
         var offset: int = 0
@@ -2847,7 +2894,7 @@ trusted fun __ablaRuntimeOverflowAdd(object: int, symbol: int, fieldValue: any):
     val threads = __ablaRuntimePlatformThreadsEnabled()
     if (used == room) {
         val next: int = if (room == 0) 2 else room * 2
-        val grown: int = __ablaRuntimeAllocateLayout((next + 1) * 32, 3)
+        val grown: int = __ablaRuntimeAllocateOutOfLine((next + 1) * 32, 3)
         var at: int = 0
         while (at < (next + 1) * 4) {
             ablaRuntimeStoreI64(grown + at * 8, 0)

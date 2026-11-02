@@ -1,5 +1,6 @@
 import "backend/llvm/backend.ab"
 import "module.ab"
+import "lexer.ab"
 import "sourcemap.ab"
 import "abla/sys/linux/fs"
 import "abla/bytes"
@@ -1259,23 +1260,144 @@ fun bootstrapOptimizeWholeProgram(
     optimize.argument("-o")
     optimize.argument(optimizedPath)
     var status = optimize.run()
-    if (status == 0) {
-        val emitObject = linuxCommand(bootstrapHostLlvmTool("llc"))
-        emitObject.argument("-filetype=obj")
-        emitObject.argument("-relocation-model=pic")
-        emitObject.argument("-O2")
-        emitObject.argument("--function-sections")
-        emitObject.argument("--data-sections")
-        // Where a hot loop falls within a 32-byte fetch line otherwise decides its speed:
-        // fib's code ran 11% slower at another address. Costs about 2% of size.
-        emitObject.argument("--align-loops=32")
-        if (!bootstrapLlvmToolsVerify()) emitObject.argument("--disable-verify")
-        emitObject.argument(optimizedPath)
-        emitObject.argument("-o")
-        emitObject.argument(objectPath)
-        status = emitObject.run()
-    }
+    if (status == 0) status = bootstrapEmitWholeProgramObject(optimizedPath, objectPath)
     status
+}
+
+// The optimized whole program's object, by llc: its loop alignment and sections are code
+// generation flags that the C API can't set, so this one stays a tool.
+fun bootstrapEmitWholeProgramObject(optimizedPath: string, objectPath: string): int {
+    val emitObject = linuxCommand(bootstrapHostLlvmTool("llc"))
+    emitObject.argument("-filetype=obj")
+    emitObject.argument("-relocation-model=pic")
+    emitObject.argument("-O2")
+    emitObject.argument("--function-sections")
+    emitObject.argument("--data-sections")
+    // Where a hot loop falls within a 32-byte fetch line otherwise decides its speed:
+    // fib's code ran 11% slower at another address. Costs about 2% of size.
+    emitObject.argument("--align-loops=32")
+    if (!bootstrapLlvmToolsVerify()) emitObject.argument("--disable-verify")
+    emitObject.argument(optimizedPath)
+    emitObject.argument("-o")
+    emitObject.argument(objectPath)
+    emitObject.run()
+}
+
+noescape extern:"c" fun LLVMPassBuilderOptionsSetLoopInterleaving(options: i64*, enabled: i32): void
+noescape extern:"c" fun LLVMPassBuilderOptionsSetLoopVectorization(options: i64*, enabled: i32): void
+noescape extern:"c" fun LLVMPassBuilderOptionsSetSLPVectorization(options: i64*, enabled: i32): void
+noescape extern:"c" fun LLVMPassBuilderOptionsSetLoopUnrolling(options: i64*, enabled: i32): void
+
+// bootstrapOptimizeWholeProgram's opt on the module the backend kept (bootstrapLlvmHoldModule),
+// in this process: nothing renders its text for opt to parse again, which was a sixth of a
+// mid-sized program's build. The same internalize (by hand: its public list is a process-wide
+// option), nounwind, data layout, vectorizers and O2; then the same llc on its bitcode. The
+// object differs from opt's only where the order of a value's uses steers code generation:
+// json-readers' text by 7 of 143,405 bytes. The module is disposed either way.
+trusted fun bootstrapOptimizeHeldWholeProgram(
+    llvmTriple: string,
+    optimizedPath: string,
+    objectPath: string,
+    abiManifest: string
+): int {
+    val nullPointer = nativeNullPointer()
+    val module = bootstrapLlvmHeldModule
+    var status = if (pointerIsNull(module)) 165 else 0
+    if (status == 0 && llvmInitializeNativeTarget() != 0) status = 166
+    val visible: Map<string, bool> = Map()
+    for (symbol in bootstrapNativeAbiExportSymbols(abiManifest)) visible.set(symbol, true)
+    visible.set("main", true)
+    val assembled: array<string> = []
+    for (assembly in bootstrapLlvmInlineAssembly) {
+        bootstrapLlvmAssemblyNamesIn(assembly, 0, assembly.size, assembled)
+    }
+    for (name in assembled) visible.set(name, true)
+    if (status == 0) {
+        val nounwind = LLVMCreateEnumAttribute(
+            bootstrapLlvmHeldContext, bootstrapLlvmAttributeKind("nounwind"), 0
+        )
+        var function = LLVMGetFirstFunction(module)
+        while (!pointerIsNull(function)) {
+            // (-1: LLVMAttributeFunctionIndex.)
+            if (!bootstrapLlvmDebugInfo) LLVMAddAttributeAtIndex(function, -1, nounwind)
+            bootstrapInternalizeHeldValue(function, visible)
+            function = LLVMGetNextFunction(function)
+        }
+        var global = LLVMGetFirstGlobal(module)
+        while (!pointerIsNull(global)) {
+            bootstrapInternalizeHeldValue(global, visible)
+            global = LLVMGetNextGlobal(global)
+        }
+    }
+    val triple = LLVMNormalizeTargetTriple(llvmTriple)
+    val target = nativePointerCell(nullPointer)
+    val message = nativePointerCell(nullPointer)
+    if (status == 0 && LLVMGetTargetFromTriple(triple, target.address, message.address) != 0) {
+        status = 166
+    }
+    var machine = nullPointer
+    var layout = nullPointer
+    var options = nullPointer
+    if (status == 0) {
+        // opt's: no CPU, PIC, the default code generation level.
+        machine = LLVMCreateTargetMachine(target.load(), triple, "", "", 2, 2, 0)
+        if (pointerIsNull(machine)) status = 166
+    }
+    if (status == 0) {
+        layout = LLVMCreateTargetDataLayout(machine)
+        LLVMSetModuleDataLayout(module, layout)
+        options = LLVMCreatePassBuilderOptions()
+        LLVMPassBuilderOptionsSetLoopInterleaving(options, 1)
+        LLVMPassBuilderOptionsSetLoopVectorization(options, 1)
+        LLVMPassBuilderOptionsSetSLPVectorization(options, 1)
+        LLVMPassBuilderOptionsSetLoopUnrolling(options, 1)
+        status = llvmConsumeError(
+            LLVMRunPasses(module, "default<O2>,globaldce", machine, options), 167
+        )
+    }
+    if (status == 0 && LLVMWriteBitcodeToFile(module, optimizedPath) != 0) status = 164
+    if (!pointerIsNull(options)) LLVMDisposePassBuilderOptions(options)
+    if (!pointerIsNull(layout)) LLVMDisposeTargetData(layout)
+    if (!pointerIsNull(machine)) LLVMDisposeTargetMachine(machine)
+    if (!pointerIsNull(message.load())) LLVMDisposeMessage(message.load())
+    LLVMDisposeMessage(triple)
+    target.close()
+    message.close()
+    bootstrapDisposeHeldModule()
+    if (status == 0) status = bootstrapEmitWholeProgramObject(optimizedPath, objectPath)
+    status
+}
+
+// What the internalize pass does to a definition outside the public list: an external one
+// becomes internal (and loses its visibility). Local, appending (`llvm.*` arrays) and
+// available-externally ones stay.
+fun bootstrapInternalizeHeldValue(value: i64*, visible: Map<string, bool>): void {
+    val linkage = LLVMGetLinkage(value)
+    if (LLVMIsDeclaration(value) == 0 && linkage != llvmInternalLinkage() &&
+        linkage != llvmPrivateLinkage() && linkage != llvmAppendingLinkage() && linkage != 1 &&
+        visible.get(bootstrapLlvmDebugValueName(value)) == null) {
+        LLVMSetLinkage(value, llvmInternalLinkage())
+        LLVMSetVisibility(value, 0)
+    }
+    return
+}
+
+// Whether the held module can be optimized in process: one with `llvm.used` or
+// `llvm.compiler.used` (none is emitted now) goes through opt, which keeps what they name.
+fun bootstrapHeldModuleInternalizable(): bool =
+    pointerIsNull(LLVMGetNamedGlobal(bootstrapLlvmHeldModule, "llvm.used")) &&
+    pointerIsNull(LLVMGetNamedGlobal(bootstrapLlvmHeldModule, "llvm.compiler.used")) &&
+    pointerIsNull(LLVMGetFirstGlobalAlias(bootstrapLlvmHeldModule))
+
+// The held module's text, for a build that goes through the tools after all.
+trusted fun bootstrapRenderHeldModule(): string {
+    var result = ""
+    val printed = LLVMPrintModuleToString(bootstrapLlvmHeldModule)
+    if (!pointerIsNull(printed)) {
+        result = nativeCString(printed)
+        LLVMDisposeMessage(printed)
+    }
+    result
 }
 
 // Appends the generated names in the module's inline assembly, which opt doesn't read.
@@ -1284,17 +1406,23 @@ fun bootstrapLlvmAssemblyNames(llvm: string, var names: array<string>): void {
     while (found >= 0) {
         val lineEnd = llvm.indexOf("\n", found)
         val end = if (lineEnd < 0) llvm.size else lineEnd
-        var offset = found
-        while (offset < end) {
-            if (llvm[offset] == 97 && offset + 5 <= end && llvm.slice(offset, offset + 5) == "abla_" &&
-                !bootstrapLlvmNameByte(llvm[offset - 1])) {
-                var last = offset
-                while (last < end && bootstrapLlvmNameByte(llvm[last])) last = last + 1
-                names.append(llvm.slice(offset, last))
-                offset = last
-            } else offset = offset + 1
-        }
+        bootstrapLlvmAssemblyNamesIn(llvm, found, end, names)
         found = llvm.indexOf(" asm \"", end)
+    }
+    return
+}
+
+// Appends the generated names (`abla_...`) in `text` from `begin` to `end`.
+fun bootstrapLlvmAssemblyNamesIn(text: string, begin: int, end: int, var names: array<string>): void {
+    var offset = begin
+    while (offset < end) {
+        if (text[offset] == 97 && offset + 5 <= end && text.slice(offset, offset + 5) == "abla_" &&
+            (offset == 0 || !bootstrapLlvmNameByte(text[offset - 1]))) {
+            var last = offset
+            while (last < end && bootstrapLlvmNameByte(text[last])) last = last + 1
+            names.append(text.slice(offset, last))
+            offset = last
+        } else offset = offset + 1
     }
     return
 }
@@ -2396,6 +2524,16 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     val nativeHeld = target.hosted && target.objectFormat == "macho" && !ltoEligible &&
         cacheProfile == "inprocess-fast" && !bootstrapKeepLlvmText() &&
         !bootstrapLlvmOutOfProcess()
+    // A Linux release executable keeps its module too, optimized in process
+    // (bootstrapOptimizeHeldWholeProgram): its text is written only for the cache, or for
+    // a program that links LLVM, which is built from the text in parts. A requested
+    // sidecar object is made from the text as well. ABLA_KEEP_LLVM_TEXT=1 and
+    // ABLA_LLVM_OUT_OF_PROCESS=1 keep the text and opt.
+    val wholeProgramHeld = sidecarDeclined && cacheProfile == "inprocess-o2" &&
+        target.objectFormat == "elf" && !ablaHostIsMacOS() && !bootstrapKeepLlvmText() &&
+        !bootstrapLlvmOutOfProcess()
+    // Set once the build has the held module to optimize.
+    var optimizeHeld = false
     // Reading and hashing about 10 MB is a sixth of a small build, so only what keys
     // on the image does it: the cache, and code generation units (on for every build).
     val compilerImageUsed = allowCache || inProcessCodegen || nativeHeld
@@ -2475,6 +2613,8 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     // published: a failed build leaves the earlier ones as they were.
     var staleLlvm = false
     if (cached) {
+        // (A hit parses nothing: the tokens its graph's loading kept go now.)
+        bootstrapLexMemoEnd()
         linkLlvm = Path(cacheLinkLlvmPath).readText() == "1"
         linkHost = Path(cacheLinkHostPath).readText() == "1"
         abiManifest = Path(cacheAbiPath).readText()
@@ -2495,6 +2635,9 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         val enclosingHoldModule = bootstrapLlvmHoldModule
         val enclosingInitializerChunk = bootstrapLlvmInitializerChunk
         val enclosingStackGuard = bootstrapLlvmStackGuard
+        val enclosingStoreBoxes = bootstrapLlvmStoreBoxes
+        bootstrapLlvmStoreBoxes = cacheProfile == "inprocess-fast" ||
+            cacheProfile == "raw-inprocess-fast"
         // A hosted executable reports a stack overflow (debug.ab).
         bootstrapLlvmStackGuard = target.hosted && artifact == "executable" &&
             target.objectFormat != "wasm"
@@ -2503,7 +2646,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         bootstrapLlvmBitcodePath = if (inProcessCodegen) "" else bitcodePath
         bootstrapLlvmFastInlineThreshold =
             if (fastCross) bootstrapFastInlineThreshold() else 0
-        bootstrapLlvmHoldModule = inProcessCodegen || nativeHeld
+        bootstrapLlvmHoldModule = inProcessCodegen || nativeHeld || wholeProgramHeld
         val compilation = bootstrapCompileLlvmParsedCached(
             parsedGraph,
             irCache,
@@ -2516,6 +2659,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         bootstrapLlvmHoldModule = enclosingHoldModule
         bootstrapLlvmInitializerChunk = enclosingInitializerChunk
         bootstrapLlvmStackGuard = enclosingStackGuard
+        bootstrapLlvmStoreBoxes = enclosingStoreBoxes
         linkLlvm = compilation.linkLlvm
         linkHost = compilation.linkHost
         abiManifest = bootstrapNativeAbiManifest(
@@ -2543,20 +2687,36 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                 status = 154
                 failureKind = "reported"
             } else {
-                if (bitcodeHandoff || nativeHeld) {
+                // A held module that the tools build after all goes on as its text.
+                var heldText = ""
+                if (wholeProgramHeld && (linkLlvm || !bootstrapHeldModuleInternalizable())) {
+                    heldText = bootstrapRenderHeldModule()
+                    bootstrapDisposeHeldModule()
+                }
+                optimizeHeld = wholeProgramHeld && !pointerIsNull(bootstrapLlvmHeldModule)
+                val cachedText = cacheEnabled && compileInputsCacheable
+                if (bitcodeHandoff || nativeHeld || (optimizeHeld && !cachedText)) {
                     // A text of an earlier build would no longer match the module.
                     staleLlvm = true
                     status = 0
+                } else if (optimizeHeld) {
+                    // The cache keeps the text, for a build that finds it without its object.
+                    if (bootstrapWriteBuildFile(Path(llvmPath), bootstrapRenderHeldModule())) status = 0
+                    else {
+                        status = 145
+                        failureKind = "io"
+                    }
                 } else {
+                    val text = if (heldText != "") heldText else compilation.output
                     val live = if (linkLlvm && target.hosted && target.objectFormat == "elf" &&
                         artifact == "executable") {
-                        bootstrapLlvmWithoutDeadFunctions(compilation.output)
-                    } else compilation.output
+                        bootstrapLlvmWithoutDeadFunctions(text)
+                    } else text
                     val emitted = if (target.objectFormat == "elf" &&
                         live.size <= 4194304 && !(sidecarDeclined && !linkLlvm)) {
                         bootstrapAddLlvmElfFunctionSections(live)
                     } else live
-                    if (Path(llvmPath).writeTextAtomic(emitted)) status = 0
+                    if (bootstrapWriteBuildFile(Path(llvmPath), emitted)) status = 0
                     else {
                         status = 145
                         failureKind = "io"
@@ -2622,7 +2782,8 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                 status = 145
                 failureKind = "io"
             }
-            bootstrapDisposeHeldModule()
+            // (One to optimize as a whole program stays for that.)
+            if (!optimizeHeld) bootstrapDisposeHeldModule()
             if (status == 0 && cacheEnabled && compileInputsCacheable &&
                 Path(cacheDirectory).createDirectories()) {
                 // The source identity is the commit marker. Remove it before
@@ -2838,11 +2999,15 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     // program needs no linker: see bootstrapOptimizeWholeProgram.
     val wholeProgram = ltoEligible && !linkLlvm && target.objectFormat == "elf"
     if (status == 0 && wholeProgram && !ltoReused) {
-        status = bootstrapOptimizeWholeProgram(llvmPath, ltoPreparedPath, ltoObjectPath, abiManifest)
+        status = if (optimizeHeld) bootstrapOptimizeHeldWholeProgram(
+            target.llvmTriple, ltoPreparedPath, ltoObjectPath, abiManifest
+        ) else bootstrapOptimizeWholeProgram(llvmPath, ltoPreparedPath, ltoObjectPath, abiManifest)
         if (status == 0 && ltoCache != "" && Path(cacheDirectory).createDirectories()) {
             bootstrapPublishCacheFile(ltoObjectPath, ltoCache)
         }
     }
+    // (A build that failed before using it.)
+    bootstrapDisposeHeldModule()
     if (status == 0 && ltoEligible && !linkLlvm && !wholeProgram && !ltoReused) {
         status = bootstrapPrepareLtoLlvm(llvmPath, ltoPreparedPath)
         // Preparing read and rewrote the module's text (well over 100 MB for a large
@@ -3367,7 +3532,7 @@ fun bootstrapPrepareRun(sourcePath: string, hold: bool = false): BootstrapRunIr 
     }
     if (compilation.errors == 0 && requestedPrograms.size == 0 &&
         definedTargets.size == 0 && artifactRoots.size == 0 &&
-        (hold || Path(llvmPath).writeTextAtomic(compilation.output))) {
+        (hold || bootstrapWriteBuildFile(Path(llvmPath), compilation.output))) {
         status = 0
     }
     if (status == 0 && !bootstrapCommitCompileOutputs()) status = 144

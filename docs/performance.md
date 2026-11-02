@@ -19,6 +19,86 @@ object emission, and linking.
 Compare two compilers with `tools/bench-compare.py` (compile instructions, stripped size,
 run cycles and instructions, on `tests/benchmarks`).
 
+## Builds without text, smaller runtime paths, cold slow paths (2026-11-02)
+
+Against the v0.2.31 compiler (master at `e66208b4`, before this work and before the build
+transaction's removal), `tools/bench-compare.py`'s 13 programs and the same programs timed by
+wall clock, all changes below measured together:
+
+| Metric (geometric mean) | Change |
+|---|---:|
+| Release build, wall clock (median of 5, alternating) | -26.3% (-10% to -40% each); -15.6% against 58596b4d, which had removed the build transaction's fsyncs |
+| Release build, instructions | -18.4% |
+| Release build, cycles | -14.1% |
+| Stripped size | -11.4% |
+| Run instructions (11 programs) | -16.1% |
+| Run cycles (same, median of 7 turns) | -16.0% |
+| Run time (same) | -14.3% |
+| `abla-compare` server, user instructions per request (9 workloads) | -2.1% |
+| `abla-compare` server, user cycles per request (same, median of 3) | -3.0%, json-nested +0.1% |
+| `abla-compare` server, stripped size | -1.6% |
+| `ablac test` of abla-qr (9 files, `--no-cache`) | -33.5% (226 s to 150 s) |
+| `ablac test` of abla-pdf (8 files, `--no-cache`) | -32.4% (248 s to 167 s) |
+
+What changed:
+
+- **A Linux release executable is optimized in the compiler.** The module the backend built is
+  internalized, made `nounwind` and run through `default<O2>,globaldce` in process
+  (`bootstrapOptimizeHeldWholeProgram`), then written as bitcode for `llc`. Before, it was
+  rendered as text, written, and parsed again by `opt`: 7% of `opt`'s instructions and about a
+  sixth of a mid-sized build with its startup. The text is still written for the cache, or with
+  `ABLA_KEEP_LLVM_TEXT=1`. The object differs from `opt`'s only where the order of a value's
+  uses steers code generation (json-readers: 7 of 143,405 bytes of text). `llc` stays a tool:
+  its `--align-loops` and section flags are code generation options the C API can't set.
+- **A build's own files are written and renamed without `fsync`.** A release build without the
+  cache did 19 fsyncs (111 ms of json-readers' 2.1 s, a quarter of an empty program's build);
+  now none. The cache's entries keep theirs.
+- **A source is lexed once per build.** The discovery parse, the strict-imports check (twice) and
+  the staged parse each lexed every module; they now share the tokens (`bootstrapLexShared`),
+  from a graph's first load to the end of its parse: 3.5% of a frontend.
+- **Lowering drops what nothing reads** (`bootstrapIrWithoutDeadValues`, after verification):
+  unused constants and local loads, and the join temporaries of an `if` without `else` used
+  as a statement. A fifth of json-readers' value slots were written and never read; LLVM
+  removed them again after carrying them through most of its passes.
+- **A string template of three parts or more is written once** (`__ablaRuntimeStringConcat4`,
+  four parts at a time) where each part allocated and copied the text so far: strings runs 42%
+  fewer instructions, json-megabyte 12%. The runtime's own templates (its panic messages) keep
+  the old chain, so a program without such a template has no extra kilobyte.
+- **The runtime's rare paths stay small.** Rope flattening, string copying, an array's growth and
+  boxing, Base64 and joined chunks allocate through one out-of-line allocator
+  (`__ablaRuntimeAllocateOutOfLine`) instead of each inlining it (most of a kilobyte each);
+  `StringDataSlow` and `CopyString` are `@noinline`; the collector is compiled `optsize`
+  (`bootstrapLlvmRuntimeOptimizedForSize`, 2% smaller, trees 0.3% fewer instructions); the
+  collector's two environment lookups read the literal's own bytes.
+- **An array's slow paths are cold** (`bootstrapLlvmRuntimeColdPath`). A loop's call to one
+  ended its fast path, and as an ordinary call it made LLVM keep the loop's values in memory
+  for the whole loop: nbody 20.5% fewer instructions, matrix 18%.
+- **A call through a value that can only be one function without captures** (a lambda in a
+  `val`) calls that function's wrapper, which LLVM inlines, instead of the dispatcher's copy,
+  switch and box: dispatch runs 52% fewer instructions and is 20% smaller.
+- **A native development build writes a boxed int or bool in place** of calling `abla_i64` and
+  `abla_bool`, two calls each in a build that inlines nothing (39% of an integer-heavy test's
+  run). A release build keeps the calls: there the stores cost `opt` 3% more for nothing.
+
+Small programs gain most in size (fib 19%, the HTTP servers 2 to 3%): what shrank is mostly the
+runtime every program carries. The `abla-compare` server builds only a few percent faster: its
+frontend is most of its build. sieve and websocket-codec run the same instructions and showed
++10% time in one run; their cycles move that much with where the code lands (see the TODO item).
+
+Tried and dropped on 2026-11-02:
+
+- Whole-program O2 for the compiler itself: its frontend ran 3% more instructions, no faster.
+- Stripping lifetime markers: `opt` 2% cheaper, `llc` 3% dearer, 3.7% larger.
+- `llvm.memcpy` for value copies: `opt` 13% cheaper, but dispatch ran 15% more instructions
+  and programs grew 0.9%. `llvm.memset` for zeroed slots: no cheaper, larger.
+- Local-exec TLS for an executable's root frames: neutral (0.2% smaller, 0.4% fewer
+  instructions, cycles within noise).
+- `minsize` for the collector: 0.4% smaller than `optsize`, trees 1.2% more instructions.
+  `optsize` or `cold` for more runtime paths (allocation, collection, ropes, panics): up to
+  2.8% larger, json-megabyte 10% slower with `optsize` rope paths.
+- Hashing a new map key once instead of twice: maps 0.1% fewer instructions, 1.7% larger.
+- Boxed values written in place in release builds too: `opt` 3% dearer, 0.4% larger.
+
 ## One optimization pass for a Linux executable (2026-11-01)
 
 A release Linux executable now goes through one `opt` (`internalize`, `forceattrs`, O2 at
