@@ -23,8 +23,6 @@
   `compile.effect-denied:trusted.native:xmlParse->XmlChunkDecoder.next->...->XmlFileSource.read`, as the check follows an interface
   call to an implementer the call can't reach. Either stops generating typed SOAP clients with `#`, which NovaKind's TODO wanted;
   abla-soap has a tool instead. Also, one error's frames should be bounded.
-- [ ] **A `null` for a field of type `array<T>?` is `ownership.stored-reference-provenance`.** Seen 2026-11-02 on 0.2.29 passing `null`
-  (or `if (c) array else null`) to `class B(val parts: array<string>?, ...)` from a method. abla-soap's model has a bool beside the array.
 
 - [ ] **`E_IR_EMISSION` with no detail on a class with two defaulted closure fields, given one.** Seen 2026-11-02 on released
   0.2.29 from abla-soap. This fails with `LLVM IR emission or module verification failed`; passing both closures, or having
