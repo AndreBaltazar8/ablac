@@ -50,6 +50,9 @@
       25 of 25 alone. Not looked into.
 - [ ] macOS: nobody has compared a local rebuild with the published binary, and
       `tools/test-reproducible-elsewhere.sh` skips it (2026-11-01).
+- [ ] ARM64 Android tagged pointers: `adoptNativeString` now tests `address != 0`, not `> 0`, but the fix has not been
+      run on the affected device. Other runtime address comparisons need the same check (`__ablaRuntimeHostCollection*`
+      tables shift addresses arithmetically). abla-mobile's `allowNativeHeapPointerTagging="false"` masks this for its apps.
 - [ ] `tools/test-simd.sh`, `test-ct.sh` and `test-crypto-pure.sh` fail on Xtensa when given an
       installed `ablac`: their `llc` shim for `-relocation-model=static` goes first on `PATH`, and the
       install's wrapper puts its own LLVM ahead of it, so llc aborts on PIC. They pass with the
@@ -72,10 +75,8 @@
 
 ## Compiler and stdlib
 
-- [ ] **abla-saft's move onto `abla/crypto/rsa` waits for a release.** Its branch `pure-rsa` (32ecb51) passes
-  its tests and `make signatures` against this tree, but its CI pins a release with no such module, so it
-  isn't on its main. Merge it after the next release, and bump its CI there. abla-pdf still carries its own
-  unblinded RSA for its own signing: it could move the same way.
+- [ ] **abla-pdf still carries its own unblinded RSA for signing.** It could move to the released
+  `abla/crypto/rsa`, as abla-saft has done.
 - [ ] **`abla/crypto/rsa` has no decryption** (OAEP, PKCS#1 v1.5), so `tests/vectors/crypto/rsa.txt`'s `decrypt-`
   lines aren't run on it. Manger and Marvin are why it isn't a short addition: padding has to be checked
   with masks and the failure made implicit. Nor does it read encrypted PEM or PKCS#12.
@@ -92,7 +93,7 @@
 - [ ] The rest of integers up to 256 bits: `uint256` is in (`abla/uint256`, docs/stdlib/uint256.md), with big-endian
       bytes. Left: signed 256, 128 both ways, and little-endian bytes, when something needs them.
 - [ ] Remove the older object layout's bootstrap step, which nothing needs now that the pin
-  (v0.2.25) makes typed instances: `tools/bootstrap-untyped-objects.patch`,
+  (v0.2.32) makes typed instances: `tools/bootstrap-untyped-objects.patch`,
   `tools/bootstrap-typed-instances.ab`, `tools/test-bootstrap-untyped-objects.sh`, their stage
   in `tools/build-self-hosted-current.sh` and their lines in the `Makefile`.
 
@@ -139,7 +140,7 @@
   `tools/run-tests.sh` clears it when the compiler changes). The cold run is the one left: this machine's
   8 fast cores and the rest (30 threads) do about 23.5 CPU-seconds a second however they're scheduled
   (JOBS=40, 48, 60: 158 to 162 s, on a quiet machine), so under 2 minutes needs about 2,800 CPU-seconds:
-  less work per build. Starting test-self-hosted.sh late so it reuses builds saved 190 CPU-seconds and no wall time. A script that sets a compile-affecting `ABLA_*`
+  less work per build. These measurements predate v0.2.31 and master 753d1d10's faster Linux builds; remeasure the full cold suite before using them as a current baseline. Starting test-self-hosted.sh late so it reuses builds saved 190 CPU-seconds and no wall time. A script that sets a compile-affecting `ABLA_*`
   variable or uses compile grants keeps `--no-cache`: the cache key ignores those variables, so a hit
   would pass without testing that mode. Over a whole run: LLVM 45% (`opt` 18% of all CPU), the frontend
   29%, libc 12%. Tried and dropped: glibc malloc tunables (no change); 
@@ -189,11 +190,12 @@ Package-side work (not changed from ablac):
 
 ## Compile time and memory
 
-- [ ] **The small-block lists never go back to the system or to another size.** Blocks up to 512 bytes
-  (`__ablaRuntimeHostSmallLists`) stay on their list once freed, and `malloc_trim` can't reach them. Measured
-  2026-11-01, peak RSS against malloc for each: trees, strings and maps 7 to 19% lower, json-readers 33% higher
-  (137 to 182 MB), json-megabyte varying between runs (190 to 319 MB against 243 to 308). A program whose sizes
-  shift over time keeps the old sizes' memory. Empty chunks could be returned at a collection.
+- [ ] **Cached small blocks cannot be reused for another size.** Since v0.2.31 the free lists
+  (`__ablaRuntimeHostSmallLists`) retain about 32 MiB at most; later frees return to the system, but retained blocks
+  remain on their size's list and `malloc_trim` can't reach them. A program whose allocation sizes shift may retain
+  the old sizes' memory. Empty chunks could be returned at a collection. Before the cap, measurements on 2026-11-01
+  showed peak RSS against malloc for each: trees, strings and maps 7 to 19% lower, json-readers 33% higher
+  (137 to 182 MB), json-megabyte varying between runs (190 to 319 MB against 243 to 308); remeasure with the cap.
 - [ ] **Run times of non-Linux hosted targets aren't measured with the new allocator and root frames.** macOS keeps
   its LTO link (`wholeProgram` is ELF only) and has not been built or run with these changes; Wasm passes the suite,
   its size and speed not compared. An earlier try at size lists on Darwin gained no cycles and raised peak memory.
@@ -357,5 +359,3 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   field-slot alias tags (native 42/42 us a tick with mobs, WebAssembly within 1%). An
   `assume` would turn any producer missed later (extension fields with defaults,
   generics) into undefined behaviour instead of a trap, so it isn't worth carrying.
-
-- `adoptNativeString` now tests `address != 0` for ARM64 Android's tagged pointers (`0xb400...`), not run on one. Other address comparisons in the runtime need the same check (`__ablaRuntimeHostCollection*` tables shift addresses arithmetically). abla-mobile's manifest now sets `allowNativeHeapPointerTagging="false"`, which hides this on Android. Found 2026-11-01 on a Galaxy S25 Ultra.
