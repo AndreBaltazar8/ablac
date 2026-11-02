@@ -24,21 +24,6 @@
   call to an implementer the call can't reach. Either stops generating typed SOAP clients with `#`, which NovaKind's TODO wanted;
   abla-soap has a tool instead. Also, one error's frames should be bounded.
 
-- [ ] **`E_IR_EMISSION` with no detail on a class with two defaulted closure fields, given one.** Seen 2026-11-02 on released
-  0.2.29 from abla-soap. This fails with `LLVM IR emission or module verification failed`; passing both closures, or having
-  one such field, builds. Worked around in abla-soap's tests by passing both.
-  ```abla
-  class T(val r: (int) -> string = { c: int -> "k" }, val now: () -> int = { 2 }) {
-      fun go(): int = r(1).size + now()
-  }
-  fun make(): T = T()
-  fun main: int {
-      val a = make()
-      val b = T({ c: int -> "" })
-      a.go() + b.go()
-  }
-  ```
-
 - [ ] **Threaded native programs die with SIGILL when the stack limit doesn't fit their memory limit.** Seen
   2026-11-01 running `make test-full` under `ulimit -s 131072`: `tools/test-self-hosted.sh` fails
   native-linux-net, native-websocket-live, native-concurrency and native-network-advanced with
