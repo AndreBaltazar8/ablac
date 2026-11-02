@@ -17,6 +17,33 @@
 
 ## Bugs seen
 
+- [ ] **abla-xml's reader doesn't finish under compile-time evaluation, with millions of error lines.** Seen 2026-11-02 on 0.2.29
+  from abla-soap. A `compile fun` run by `#compiler.transform` calling `xmlParse("<a/>")` from abla-xml hits `E_EVAL_STEP_LIMIT`, and
+  prints a `compile-time evaluation failed` frame per call (2.2 million lines, about 60 s). Separately `#xmlParse(...)` is
+  `compile.effect-denied:trusted.native:xmlParse->XmlChunkDecoder.next->...->XmlFileSource.read`, as the check follows an interface
+  call to an implementer the call can't reach. Either stops generating typed SOAP clients with `#`, which NovaKind's TODO wanted;
+  abla-soap has a tool instead. Also, one error's frames should be bounded.
+- [ ] **A constructor doesn't convert an array literal to `array<Interface>`.** Seen 2026-11-02 on 0.2.29: with `class O(val hs:
+  array<S> = [])` and `T : S`, `O([T()])` and `O(hs = [T()])` give `constructor.argument:O`, pointing at another parameter. A function's
+  parameter takes the same literal. Worked around by building the array first.
+- [ ] **A `null` for a field of type `array<T>?` is `ownership.stored-reference-provenance`.** Seen 2026-11-02 on 0.2.29 passing `null`
+  (or `if (c) array else null`) to `class B(val parts: array<string>?, ...)` from a method. abla-soap's model has a bool beside the array.
+
+- [ ] **`E_IR_EMISSION` with no detail on a class with two defaulted closure fields, given one.** Seen 2026-11-02 on released
+  0.2.29 from abla-soap. This fails with `LLVM IR emission or module verification failed`; passing both closures, or having
+  one such field, builds. Worked around in abla-soap's tests by passing both.
+  ```abla
+  class T(val r: (int) -> string = { c: int -> "k" }, val now: () -> int = { 2 }) {
+      fun go(): int = r(1).size + now()
+  }
+  fun make(): T = T()
+  fun main: int {
+      val a = make()
+      val b = T({ c: int -> "" })
+      a.go() + b.go()
+  }
+  ```
+
 - [ ] **Threaded native programs die with SIGILL when the stack limit doesn't fit their memory limit.** Seen
   2026-11-01 running `make test-full` under `ulimit -s 131072`: `tools/test-self-hosted.sh` fails
   native-linux-net, native-websocket-live, native-concurrency and native-network-advanced with
@@ -35,6 +62,11 @@
   `llvm-xtensa-lea-scavenging` has it, pinned to the published `llvm-23.1.3-xtensa-2` (2026-11-01): both examples build with it
   and its `llc` output matches the patches' source build. It's held back from master with `mcu-gc-inline`, until the PaperMono
   hardware test; merging it is what closes this.
+- [ ] **abla-one's limits on 0.2.29.** (a) A class's methods are all compiled, used or not, so what only one method reaches stays in
+  every program with the class. (b) `bootstrapLlvmAddressTaken` counts a function's value taken in an unreachable function, so it's in
+  `abla_llvm_call_indirect`'s table and linked. (c) A function value's or interface method's managed result can't be returned as it is
+  (`ownership.managed-return-borrow-contract:return:nonfresh`) when the call takes parameters; a nullable function type can't be called
+  after a null check (`call.target`) or assigned a function (`assignment.type`).
 - [ ] Once during `make test` (2026-11-01), `tools/test-ct.sh` saw `python3: No such file or directory`
       and `suite-package-providers` failed to resolve a local git dependency, with neither recurring
       in the next runs. Suspected: the Nix profile changing mid-run. Not confirmed, but during a `home-manager switch`
