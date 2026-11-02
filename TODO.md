@@ -17,6 +17,13 @@
 
 ## Bugs seen
 
+- [ ] **A cross build peaks 650 MB higher since the opt + llc / size-list change, past `build/ablac`'s 4 GB.**
+  abla-embedded's `tools/check-source` builds `tests/package-import.ab` for `xtensa-esp-unknown-elf`
+  (`--emit object --no-cache`) through the launcher, and it panics "out of memory: the system refused an
+  allocation". Seen 2026-11-02: under `prlimit --as=4294967296` with `ABLA_MAX_MEMORY_MB=4096` and
+  abla-embedded's `esp-llvm-bin` on PATH, origin/master 6b9364ef peaks at 3.04 GB RSS and passes (48 s), and
+  with the "Linux executable builds 42% faster" commit it peaks at 3.69 GB and fails (24 s). Without the limit
+  it finishes at 3.77 GB. Blocks v0.2.31.
 - [ ] **Xtensa `llc` aborts on frames of 128 to 255 bytes that take a stack address.** `LLVM ERROR: Error
   while trying to spill A6 from class AR: Cannot scavenge register without an emergency spill slot!`, seen
   2026-11-01 on `esp32RecoveredZN3nvs7Storage9writeItem...` from abla-embedded's `tools/build-example
