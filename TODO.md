@@ -17,6 +17,14 @@
 
 ## Bugs seen
 
+- [ ] **A strict module (`visibility = "imports"`) sees nothing of a provider subpath it imports.** v0.2.30, seen 2026-11-02 in
+  abla-saft. `import github("AndreBaltazar8/abla-xml/xsd")` in a module of a strict package, then any name the subpath module
+  declares (or passes on with `export import`) is `E_NAME_NOT_IMPORTED: ... declared in .abla/packages/abla-xml/source/src/xsd/entry.ab,
+  which this module doesn't import`, whose `help:` suggests importing the vendored file by path. The same import of the package
+  entry (`github("AndreBaltazar8/abla-xml")`) passes its names on, and a flat program sees the subpath's names. Likely the
+  import edge recorded for a subpath doesn't match the module's snapshot path in `bootstrapStrictPassedOn` (src/module.ab).
+  Repro: in a package with `visibility = "imports"`, a module `import github("AndreBaltazar8/abla-xml/xsd")` and
+  `fun main: int { val r = xsdLoad("<x/>"); 0 }`. Worked around in abla-saft by a flat package of its own for the XSD part.
 - [ ] **A program that imports `abla/simd` anywhere needs `trusted.native` for any `#` that calls a `.get(...)`.** v0.2.30, seen
   2026-11-02. `bootstrapEffectDeclarationsMadeBy` (src/sema.ab) reaches an extension by its method name alone when its owner isn't a
   class, so `m.get("a")` on a `Map` reaches every `i8x16.get` ... `f64x4.get`, whose intrinsics count as native. Repro:
