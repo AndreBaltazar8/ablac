@@ -34,6 +34,26 @@ report() { # name rc
         status=1
     fi
 }
+# Every peer ends with its client (peer.ab): none may outlive the run.
+check_peers() {
+    local left=() attempt process
+    for attempt in $(seq 1 50); do
+        left=()
+        for process in /proc/[0-9]*; do
+            case $(readlink "$process/exe" 2>/dev/null) in
+                "$output_directory"/faults | "$output_directory"/timeouts | "$output_directory"/deadlines)
+                    left+=("${process#/proc/}") ;;
+            esac
+        done
+        [[ ${#left[@]} -eq 0 ]] && break
+        sleep 0.1
+    done
+    if [[ ${#left[@]} -gt 0 ]]; then
+        echo "FAIL a peer outlived its client: ${left[*]}"
+        kill -9 "${left[@]}" 2>/dev/null
+        status=1
+    fi
+}
 status=0
 stages=(mask
     https-reset-read https-reset-write https-stall-read https-stall-write
@@ -52,7 +72,10 @@ for index in "${!stages[@]}"; do
     wait "${pids[$index]}" || rc=$?
     report "${stages[$index]}" "$rc"
 done
-[[ -n ${TLS_FAULTS_FAULTS_ONLY:-} ]] && exit "$status"
+if [[ -n ${TLS_FAULTS_FAULTS_ONLY:-} ]]; then
+    check_peers
+    exit "$status"
+fi
 
 "$compiler" build tests/cases/tls-faults/timeouts.ab -o "$output_directory/timeouts" --fast || exit 2
 "$compiler" build tests/cases/tls-faults/deadlines.ab -o "$output_directory/deadlines" --fast || exit 2
@@ -69,5 +92,6 @@ report timeouts "$rc"
 rc=0
 wait "$deadlines" || rc=$?
 report deadlines "$rc"
+check_peers
 [[ $status -eq 0 ]] && echo 'TLS faults: passed'
 exit "$status"
