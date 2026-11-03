@@ -144,6 +144,29 @@
 
 ## Toolchain and project
 
+- [ ] **Reduce serial compiler release preparation without slowing its output.** Keep the
+  selected loop-MSSA/MemCpyOpt pipeline. On 2026-11-03 (LLVM23, frozen b6cda513 + alias fix),
+  compact cleanup saved more build work but exceeded the <=0.3% produced-compiler slowdown
+  limit. Importing small internal callees as `available_externally` into their calling
+  parts, at thresholds16/32/64/128/256/512/1024 IR instructions, did not recover it:
+
+  | Pipeline/import limit | Serial+plan+max worker G instructions | Readers emit | Fib build | Own emit | Stripped size |
+  |---|---:|---:|---:|---:|---:|
+  | selected control |220.43|−0.22%|0.00%|0.00%|+0.12%|
+  | compact, no imports |193.03|+1.97%|+1.32%|+1.46%|−0.78%|
+  | compact,64 |192.56|+1.60%|+1.24%|+1.23%|−0.35%|
+  | compact,128 |193.16|+1.44%|+1.18%|+1.41%|+0.005%|
+  | compact,1024 |198.65|+1.54%|+1.21%|+1.37%|+0.005%|
+
+  Single sequential screening samples against the same stock stage2, not wall-time or final
+  paired-median claims; fib includes matched first-link discovery. Frontend IR and fib ELF
+  stayed identical. More imports raised total worker work495.35 ->587.85G (128 ->1024)
+  without recovering compiler speed; size stayed within +1%. Moving late cleanup after the
+  serial inlining CGSCC cost190.11G versus174.28G selected, with different bitcode; its
+  produced compiler was not measured. Imports are dropped, not committed. A new approach
+  should test cleanup's effect on serial CGSCC inline costs and decisions. Call-graph
+  clustering and other reorderings remain unmeasured after this timebox, rather than disproved.
+
 - [ ] **Drop the clean-up of old build transactions** (`bootstrapRemoveOldBuildTransactions` in `src/toolchain.ab`,
   its call in `src/orc_main.ab`, docs/programmable-builds.md) once no compiler up to 0.2.32, which made
   `build/.abla-build-transaction-<pid>`, is in use.
