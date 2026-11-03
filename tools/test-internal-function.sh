@@ -65,4 +65,14 @@ nm "$required_native" | rg -q ' t _?abla_test_late_runtime_helper$' || exit 1
 if rg -q 'abla_test_late_runtime_helper' "$required_native.abi.json"; then
     exit 1
 fi
+# Inline assembly in many functions builds and runs: each function's template is gathered
+# for the module before its functions are emitted. Gathered during emission, where each
+# function's allocations are freed after it, the list's storage was freed under it and the
+# compiler crashed. x86-64 assembly, so only built and run on that host.
+if [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]]; then
+    assembly_functions=$project_root/build/inline-assembly-functions
+    "$compiler" build "$project_root/tests/cases/inline-assembly-functions.ab" \
+        -o "$assembly_functions" --no-cache || exit 1
+    "$assembly_functions" || exit 1
+fi
 echo 'Internal function link symbol lowering passed'
