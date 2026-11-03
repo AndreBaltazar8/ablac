@@ -406,6 +406,16 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
 
 ## Tried, not pursued
 
+- **Remaining native `--fast` boolean FastISel fallbacks** (2026-11-03,
+  after `c7f021de`): a scratch post-fast pass widened all 386 boolean selects
+  to i8 and added zeroext to 188 known i1-returning definitions and 1,989
+  direct calls, without changing signatures. It removed the intended misses
+  (629 to 112 body blocks; 616 argument fallbacks unchanged), but three
+  alternating cold NovaKind tool builds used 20.436 to 20.300 G instructions
+  (-0.67%, below the 2% bar), peak +0.02%, fast size +0.69%. No production
+  legalization or ABI change retained. Raw hook, counters and replay checks:
+  `worktrees/ablac-fast-nova-profile/build/fast-bool-lab/`.
+
 - **Telling LLVM a class-typed field holds an object.** A read of a
   field whose type is a class that is neither optional nor affine was followed by
   `llvm.assume(address != 0)`, so what reads the object next could drop its null check
