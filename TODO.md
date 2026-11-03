@@ -17,6 +17,24 @@
 
 ## Bugs seen
 
+- [ ] Report a readable unsupported interpolation panic on WebAssembly when
+  the module already imports the host write path, without adding imports to
+  hostless modules; these currently trap without a message.
+
+- [ ] Floats erased to `any` interpolate as integer bit patterns: native
+  `text(1.5)` through `fun text(value: any): string = "$value"` prints
+  `4609434218613702656`; f32 2.25 prints `1074790400`, while compile-time
+  evaluation prints `1.5`. Boxed floats and integers share tag 2 and auxiliary
+  0. A complete fix must preserve float identity at every typed-to-any boundary
+  (calls, locals, fields, collections, returns and closures), through generic
+  storage, on native and Wasm; keep dense typed arrays and integer/GC ABI
+  behavior; and check NaN, infinity, negative zero, formatting, bootstrap and
+  size/performance. An isolated probe used the auxiliary word as a float tag
+  and imported `abla/float/text` into the runtime: it formatted a manually
+  tagged value but grew an int-only executable from 14,600 to 40,408 bytes
+  (2026-11-03). Find a demand-driven formatter and test all erasure paths
+  before changing the representation; no fix has been committed.
+
 - [ ] **Xtensa `llc` aborts on frames of 128 to 255 bytes that take a stack address.** `LLVM ERROR: Error
   while trying to spill A6 from class AR: Cannot scavenge register without an emergency spill slot!`, seen
   2026-11-01 on `esp32RecoveredZN3nvs7Storage9writeItem...` from abla-embedded's `tools/build-example

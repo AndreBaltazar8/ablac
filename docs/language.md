@@ -187,6 +187,12 @@ that unconditionally interpolates its `any` parameter, the call is rejected.
 Such helpers accept nullable printable values, writing `null` for null. In
 `$mvcview`, use `{node value}` for an `MvcHtml` child.
 
+When an unsupported value has already been erased to `any`, native interpolation
+panics with its runtime tag; WebAssembly traps without a message. A known
+limitation is that `f32` and `f64`
+currently lose their float type when erased to `any`; interpolation then
+prints their bit pattern as an integer. Keep floats typed for interpolation.
+
 ## Values and variables
 
 `val` declares a binding that is assigned once; `var` one that can be
