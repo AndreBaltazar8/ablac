@@ -7227,6 +7227,9 @@ class BootstrapAnalyzer(
     // function's tail), its own locals by name and type, newest last.
     val tailLocalNames: array<string> = [],
     val tailLocalTypes: array<string> = [],
+    // Block locals whose results are handed out during an ownership check.
+    val transferLocalNames: array<string> = [],
+    var transferLocalStart: int = 0,
     // The span of the top-level declaration being analyzed, which each
     // overload resolution records.
     var overloadBodyBegin: int = -1,
@@ -9645,8 +9648,7 @@ class BootstrapAnalyzer(
         val mark = this.tailLocalNames.size
         for (statement in block.children) {
             if ((statement.kind == "local.val" || statement.kind == "local.var") &&
-                statement.children.size > 0 &&
-                !this.hasVisibleLocal(statement.text)) {
+                statement.children.size > 0) {
                 val declared = if (statement.children.size > 1 &&
                     statement.children[1].kind == "type" &&
                     statement.children[1].text != "inferred")
@@ -9706,7 +9708,13 @@ class BootstrapAnalyzer(
             expression.kind == "lambda" ||
             expression.kind == "lambda.move" ||
             (expression.kind == "call" && expression.text == "filledArray")
-        if (!fresh && allowVisibleLocals &&
+        var tailLocal = false
+        if (expression.kind == "identifier") {
+            for (name in this.tailLocalNames) {
+                if (name == expression.text) tailLocal = true
+            }
+        }
+        if (!fresh && allowVisibleLocals && !tailLocal &&
             expression.kind == "identifier" &&
             this.hasVisibleLocal(expression.text)) {
             var local = this.locals.size - 1
@@ -9836,16 +9844,15 @@ class BootstrapAnalyzer(
         var result = "unknown"
         if (expression.kind == "identifier") {
             result = this.findType(expression.text)
-            // A local of a block judged after its scope closed.
-            if (!this.hasVisibleLocal(expression.text)) {
-                var local = this.tailLocalNames.size - 1
-                while (local >= 0) {
-                    if (this.tailLocalNames[local] == expression.text) {
-                        result = this.tailLocalTypes[local]
-                        local = 0
-                    }
-                    local = local - 1
+            // A local of a block judged after its scope closed still shadows
+            // a visible local of the same name in an enclosing block.
+            var local = this.tailLocalNames.size - 1
+            while (local >= 0) {
+                if (this.tailLocalNames[local] == expression.text) {
+                    result = this.tailLocalTypes[local]
+                    local = 0
                 }
+                local = local - 1
             }
         }
         // `items[0]`: the array's element.
@@ -10095,6 +10102,13 @@ class BootstrapAnalyzer(
         context: string
     ): void {
         if (this.typeIsAffine(expected)) {
+            if (expression.kind == "identifier") {
+                var local = this.transferLocalNames.size - 1
+                while (local >= this.transferLocalStart) {
+                    if (this.transferLocalNames[local] == expression.text) return
+                    local = local - 1
+                }
+            }
             val returning = context == "return" ||
                 (context.size >= 9 && context.slice(0, 9) == "function.") ||
                 (context.size >= 7 && context.slice(0, 7) == "method.")
@@ -10138,17 +10152,29 @@ class BootstrapAnalyzer(
                 }
             }
             if (expression.kind == "block" && expression.children.size > 0) {
+                val mark = this.transferLocalNames.size
+                var statement = 0
+                while (statement + 1 < expression.children.size) {
+                    if (bootstrapStatementDeclaresLocal(expression.children[statement]))
+                        this.transferLocalNames.append(expression.children[statement].text)
+                    statement = statement + 1
+                }
                 this.validateOwnershipTransfer(
                     expected,
                     expression.children[expression.children.size - 1],
                     context
                 )
+                this.transferLocalNames.truncate(mark)
             }
             if (bootstrapIsArrayType(bootstrapNormalizeType(expected)) &&
                 expression.kind == "array") {
                 val elementType = bootstrapArrayElementType(
                     bootstrapNormalizeType(expected)
                 )
+                // An enclosing block does not hand its locals into an array
+                // literal; its elements still require an explicit move.
+                val previousStart = this.transferLocalStart
+                this.transferLocalStart = this.transferLocalNames.size
                 var element = 0
                 while (element < expression.children.size) {
                     this.validateOwnershipTransfer(
@@ -10158,6 +10184,7 @@ class BootstrapAnalyzer(
                     )
                     element = element + 1
                 }
+                this.transferLocalStart = previousStart
             }
         }
     }

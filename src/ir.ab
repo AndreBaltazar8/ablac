@@ -5207,6 +5207,27 @@ class BootstrapIrLocalNames(
         val key = this.slots[this.slotOf(name)]
         if (key >= 0) this.lastIndex[key] else -1
     }
+
+    // A type query may temporarily bind block locals. Remove their index
+    // entries before truncating the lowerer's local arrays.
+    fun rewind(locals: array<string>, size: int): void {
+        while (this.indexed > size) {
+            val index = this.indexed - 1
+            val key = this.slots[this.slotOf(locals[index])]
+            this.lastIndex[key] = this.previous[index]
+            this.previous.truncate(index)
+            this.indexed = index
+        }
+        return
+    }
+}
+
+// Names whose bindings can affect a type query. Over-collecting names in
+// nested scopes is safe; omitting a local callable's name would not be.
+fun bootstrapTypeQueryReads(expression: BootstrapExpression, var names: BootstrapStringSet): void {
+    if (expression.kind == "identifier" || expression.kind == "call") names.add(expression.text)
+    for (child in expression.children) bootstrapTypeQueryReads(child, names)
+    return
 }
 
 fun bootstrapIrLocalNames(): BootstrapIrLocalNames =
@@ -6396,19 +6417,60 @@ class BootstrapLowerer(
         }
         if (expression.kind == "block" && expression.children.size > 0) {
             val tail = expression.children[expression.children.size - 1]
-            result = this.lowerExpressionType(tail)
-            // A local of the block, out of scope once the block is lowered:
-            // its declared type, or its initializer's.
-            if (result == "unknown" && tail.kind == "identifier") {
-                for (statement in expression.children) {
-                    if (bootstrapStatementDeclaresLocal(statement) &&
-                        statement.text == tail.text && statement.children.size > 1) {
-                        result = if (statement.children[1].text != "inferred")
-                            bootstrapNormalizeType(statement.children[1].text)
-                        else this.lowerExpressionType(statement.children[0])
-                    }
+            if (expression.children.size == 1) return this.lowerExpressionType(tail)
+            val previousScope = this.currentScope
+            val previousLocals = this.locals.size
+            val previousTypes = this.localTypes.size
+            val previousStorage = this.localStorage.size
+            val previousScopes = this.localScopes.size
+            val previousBorrowSources = this.localBorrowSources.size
+            val needed = bootstrapStringSet()
+            bootstrapTypeQueryReads(tail, needed)
+            val selected: array<bool> = []
+            for (statement in expression.children) selected.append(false)
+            var pending = expression.children.size - 1
+            while (pending > 0) {
+                pending = pending - 1
+                val statement = expression.children[pending]
+                if (bootstrapStatementDeclaresLocal(statement) && statement.children.size > 1 &&
+                    needed.contains(statement.text)) {
+                    selected[pending] = true
+                    bootstrapTypeQueryReads(statement.children[0], needed)
                 }
             }
+            var statementIndex = 0
+            while (statementIndex + 1 < expression.children.size) {
+                val statement = expression.children[statementIndex]
+                if (selected[statementIndex]) {
+                    val initializer = statement.children[0]
+                    val delegated = initializer.kind == "delegate.initializer" && initializer.children.size > 1
+                    val value = if (delegated) initializer.children[0] else initializer
+                    var localType = this.lowerExpressionType(value)
+                    if (delegated) {
+                        var exposed = this.lowerMethodResultType(localType, "getValue")
+                        if (initializer.children[1].text != "inferred")
+                            exposed = bootstrapNormalizeType(initializer.children[1].text)
+                        localType = bootstrapDelegatedType(statement.kind == "local.var", localType, exposed)
+                    }
+                    val managedAlias = !delegated && this.isManagedAlias(statement)
+                    if (managedAlias && !bootstrapIsBorrowType(localType)) localType = "borrow:$localType"
+                    if (!delegated && statement.children[1].text != "inferred") {
+                        val declared = bootstrapNormalizeType(statement.children[1].text)
+                        if (!managedAlias || (declared != bootstrapBorrowElementType(localType) &&
+                            declared != localType)) localType = declared
+                    }
+                    // Each binding gets a fresh scope: queries in an initializer
+                    // and after the declaration cannot share a cached type.
+                    this.enterLocalScope()
+                    this.locals.append(statement.text)
+                    this.localTypes.append(localType)
+                    this.localStorage.append("__abla_type_query_${this.locals.size}")
+                    this.localScopes.append(this.currentScope)
+                    this.localBorrowSources.append("")
+                }
+                statementIndex = statementIndex + 1
+            }
+            result = this.lowerExpressionType(tail)
             // `subject ?? absent` (parser.ab, nullGuard): its local, out of
             // scope here, holds the subject, which the `if` hands on where it
             // isn't null; `absent` may leave instead (return, break, continue,
@@ -6427,6 +6489,13 @@ class BootstrapLowerer(
                     this.declarations, this.typeDeclarations
                 )
             }
+            this.leaveLocalScope(previousScope)
+            this.localNames.rewind(this.locals, previousLocals)
+            this.locals.truncate(previousLocals)
+            this.localTypes.truncate(previousTypes)
+            this.localStorage.truncate(previousStorage)
+            this.localScopes.truncate(previousScopes)
+            this.localBorrowSources.truncate(previousBorrowSources)
         }
         if (expression.kind == "when") {
             var branchType = "unknown"

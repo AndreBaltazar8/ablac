@@ -147,6 +147,7 @@ test-serial: ablac
 	tools/test-main-void.sh $(COMPILER)
 	tools/test-generators-tasks.sh $(COMPILER)
 	tools/test-resource-scope-drops.sh $(COMPILER)
+	tools/test-shadowed-branch-types.sh $(COMPILER)
 	tools/test-run-built.sh $(COMPILER)
 	tools/test-jit-host-selection.sh $(COMPILER)
 	tools/test-jit-object-cache.sh $(COMPILER)
