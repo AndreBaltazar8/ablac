@@ -197,6 +197,7 @@ test-serial: ablac
 	tools/test-doc-examples.sh $(COMPILER)
 	tools/test-runtime-memory.sh $(COMPILER)
 	tools/test-native-object-cache.sh $(COMPILER)
+	tools/test-event-shutdown.sh $(COMPILER)
 	tools/test-cache-dir.sh $(COMPILER)
 	tools/test-ablac-test-bundle.sh $(COMPILER)
 	tools/test-build-cache-build-program.sh $(COMPILER)
