@@ -46,13 +46,15 @@ What changed (the frontend, the runtime's string paths and its startup are the n
 sections, by the agents who did them):
 
 - **A trimmed O2 pipeline.** A Linux release executable's module goes through LLVM 23's
-  `default<O2>,globaldce` as `opt -print-pipeline-passes` writes it, without 21 passes
+  `default<O2>,globaldce` as `opt -print-pipeline-passes` writes it, without 20 passes
   (`BOOTSTRAP_HOST_RELEASE_PASSES`): each pass was dropped in turn over the benchmarks'
   kept IR, twice over, then each dropped one put back in turn over the server's. opt and
-  llc do 14.4% less work; programs are 0.3% smaller and run 0.4% fewer instructions, the
+  llc do 14.2% less work; programs are 0.3% smaller and run 0.1% fewer instructions, the
   server 1.6% fewer a request. Constraint elimination looked free on the benchmarks and
-  cost the server's byte loops 13% (body-16k): a pipeline change needs a server beside the
-  benchmarks. An LLVM that can't parse the list gets `default<O2>,globaldce`.
+  cost the server's byte loops 13% (body-16k); the first tailcallelim cost no instruction
+  but shaped fib's recursion into a loop of 15% more cycles: a pipeline change needs a
+  server and cycles beside the benchmarks' instructions. An LLVM that can't parse the list
+  gets `default<O2>,globaldce`.
 - **A large module's code generation runs in parallel.** Past 20,000 instructions after
   O2, the module is cut into four parts (as a development build's units are) and llc runs
   on them at once, then `ld.lld -r` joins them: json-megabyte's llc 2.7 s to 1.6 s, 64
@@ -91,8 +93,8 @@ programs larger and slower); llc tail-duplication, branch-folding and jump-table
 equality (freestanding AArch64 programs have no `bcmp`); limits on the free lists by
 block size; reading a map's slots directly (0.4%: maps waits on cache misses, not
 instructions); "PIC/PIE Level" module flags (0.1% smaller); `minsize` on the C `main`
-wrapper as it was: the program's main is inlined into it, and dispatch's loop divided by
-7 with `idiv` (10% more cycles), so the wrapper now calls main without inlining it.
+wrapper: the program's main is inlined into it, and dispatch's loop divided by 7 with
+`idiv` (10% more cycles); calling main without inlining it instead cost fib 15% cycles.
 
 ## Smaller native startup and collector (2026-11-03)
 
