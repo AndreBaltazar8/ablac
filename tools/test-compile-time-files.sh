@@ -46,6 +46,23 @@ for mode in interp jit; do
     [[ $(cat build/compile-time-files/publish/moved.txt) == old ]]
     [[ ! -e build/compile-time-files/publish/gone.txt ]]
 
+    # Both a supplied mode and the omitted default survive evaluation and
+    # publication, for every new component, under the process umask.
+    rm -rf build/compile-time-files/modes
+    (umask 027; ABLA_COMPILE_EVAL_TRACE=1 "$compiler" build modes.ab -o modes --no-cache 2> modes.trace)
+    ./modes && status=0 || status=$?
+    [[ $status -eq 2 ]] || { echo "compile-time files ($mode): mode fixture returned $status"; exit 1; }
+    mode_of() { if [[ $(uname -s) == Darwin ]]; then stat -f '%Lp' "$1"; else stat -c '%a' "$1"; fi; }
+    for directory in private private/inner; do
+        [[ $(mode_of "build/compile-time-files/modes/$directory") == 700 ]] || { echo "wrong explicit mode: $directory"; exit 1; }
+    done
+    for directory in default default/inner; do
+        [[ $(mode_of "build/compile-time-files/modes/$directory") == 750 ]] || { echo "wrong default mode: $directory"; exit 1; }
+    done
+    if [[ $mode == jit ]] && { ! grep -q 'native at' modes.trace || grep -q 'interpreted at' modes.trace; }; then
+        echo 'compile-time files: mode fixture did not run natively'; cat modes.trace; exit 1
+    fi
+
     # A build failing in analysis, and one failing after its staging ran.
     for failing in publish-failed late-fail; do
         printf 'kept' > build/compile-time-files/failed/old.txt
