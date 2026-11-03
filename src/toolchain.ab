@@ -3150,6 +3150,12 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                     "--version"
                 ).captureText()}"
         }
+        if (cacheProfile == "inprocess-o2") {
+            // LLVM-linked release clients still use external opt, and a
+            // textual fallback can use llc. A missing/different tool must
+            // not share the object cache of the pinned native toolchain.
+            backendIdentity = "$backendIdentity\nopt:${bootstrapToolIdentity(bootstrapHostLlvmTool("opt"))}\nllc:${bootstrapToolIdentity(bootstrapHostLlvmTool("llc"))}"
+        }
     }
     val compilerImageSize = imageBytes + 1 + backendIdentity.size
     val compilerSuffix = bootstrapRunningImageSuffix(
@@ -3198,6 +3204,17 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             bootstrapValidateCompileInputs(
                 Path(cacheInputsPath).readText()
             )
+    }
+    if (cached && wholeProgramHeld && Path(cacheLinkLlvmPath).readText() == "0") {
+        // A frontend record alone would rebuild through textual opt instead
+        // of the original held-module optimizer. Require its compiled LTO
+        // member; a failed/interrupted build or a missing member starts over.
+        val compiled = bootstrapToolObjectCachePath(
+            "$cacheStem.lto-v2",
+            "${target.llvmTriple}\n${bootstrapToolIdentity(bootstrapHostLlvmTool("opt"))}\n${bootstrapToolIdentity(bootstrapHostLlvmTool("llc"))}\n${bootstrapToolIdentity(if (macTarget) macClang else "clang")}\n$macSdkRoot"
+        )
+        val compiledInfo = Path(compiled).info()
+        if (!compiledInfo.isFile() || compiledInfo.size <= 0) cached = false
     }
     var status = 1
     // Empty means an external compiler, linker, or archiver owns the status.
@@ -3263,14 +3280,14 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         bootstrapLlvmFastInlineThreshold =
             if (fastCross) bootstrapFastInlineThreshold()
             else if (balancedProfile) llvmBalancedAotInlineThreshold() else 0
-        bootstrapLlvmHoldModule = inProcessCodegen || nativeHeld || wholeProgramHeld ||
-            compilerBitcodeCandidate
+        bootstrapLlvmHoldModule = inProcessCodegen || nativeHeld || wholeProgramHeld
         val compilation = bootstrapCompileLlvmParsedCached(
             parsedGraph,
             irCache,
             target.llvmTriple,
             true,
-            target.hosted && artifact == "executable"
+            target.hosted && artifact == "executable",
+            holdLlvmClient = compilerBitcodeCandidate
         )
         bootstrapLlvmBitcodePath = enclosingBitcodePath
         bootstrapLlvmFastInlineThreshold = enclosingInlineThreshold
@@ -3331,7 +3348,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                     bootstrapDisposeHeldModule()
                 } else if ((wholeProgramHeld &&
                     (linkLlvm || !bootstrapHeldModuleInternalizable())) ||
-                    (compilerBitcodeCandidate && !wholeProgramHeld)) {
+                    (compilerBitcodeCandidate && linkLlvm && !wholeProgramHeld)) {
                     heldText = bootstrapRenderHeldModule()
                     bootstrapDisposeHeldModule()
                 }
@@ -4012,6 +4029,9 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         failureKind = "io"
     }
     if (status != 0) bootstrapDiscardCompileOutputs()
+    // The source marker commits the complete native entry. A downstream
+    // tool/link failure must not leave a hit from its earlier frontend phase.
+    if (status != 0 && cacheEnabled && compileInputsCacheable) Path(cacheSourcePath).remove()
     if (status != 0) Path(publishPath).remove()
     if (privatePublish) Path(publishDirectory).remove()
     Path(optimizedWasmPath).remove()
