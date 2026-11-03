@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# The ABI checks below inspect the generated LLVM, including fast libraries.
+export ABLA_KEEP_LLVM_TEXT=1
 
 compiler=${1:-build/ablac.bin}
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)

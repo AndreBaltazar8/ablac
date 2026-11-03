@@ -6,6 +6,8 @@
 set -euo pipefail
 # (These checks read the default cache, build/.abla-cache under the working directory.)
 unset ABLA_CACHE_DIR
+# This exercises the text partition fallback; held native builds cache units.
+export ABLA_KEEP_LLVM_TEXT=1
 
 compiler=${1:-build/ablac.bin}
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)

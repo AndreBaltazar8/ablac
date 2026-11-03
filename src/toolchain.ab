@@ -836,12 +836,26 @@ trusted fun bootstrapRebuildHeldModule(): int {
     status
 }
 
-// Writes the Mach-O object of the module the backend kept (bootstrapLlvmHoldModule) for a
-// development build, as llvmAotEmitObjectFileFast does from the module's text: the
-// default triple, a generic CPU, PIC, the fast passes and FastISel. The module moves to a
-// fresh context first (bootstrapRebuildHeldModule), and is disposed either way. With
-// `unitsAllowed` (an executable's), a large module is generated as code generation
-// units at `places`, and the object is an archive of them (codegen_units.ab).
+// Mirrors bootstrapAddLlvmElfFunctionSections on the text path: boxed ELF
+// functions need separate sections so the linker can discard unused wrappers.
+// Keep the function selection in these two paths in sync.
+trusted fun bootstrapHeldElfFunctionSections(module: i64*): void {
+    var function = LLVMGetFirstFunction(module)
+    while (!pointerIsNull(function)) {
+        if (LLVMIsDeclaration(function) == 0 && LLVMGetVisibility(function) == 1 &&
+            LLVMGetTypeKind(LLVMGetReturnType(LLVMGlobalGetValueType(function))) == 0) {
+            val name = bootstrapLlvmDebugValueName(function)
+            if (name.startsWith("abla_fn_")) LLVMSetSection(function, ".text.$name")
+        }
+        function = LLVMGetNextFunction(function)
+    }
+    return
+}
+
+// Writes the native object of the held development module: generic CPU, PIC,
+// the fast passes and FastISel, as the text emitter does. A fresh context drops
+// frontend LLVM allocation history. An executable may use codegen units; the
+// caller loads their archive whole, with the host format's linker arguments.
 trusted fun bootstrapEmitHeldNativeObject(
     objectPath: string,
     unitsAllowed: bool,
@@ -850,6 +864,9 @@ trusted fun bootstrapEmitHeldNativeObject(
     val nullPointer = nativeNullPointer()
     var status = if (pointerIsNull(bootstrapLlvmHeldModule)) 165 else 0
     if (status == 0 && llvmInitializeNativeTarget() != 0) status = 166
+    if (status == 0 && !ablaHostIsMacOS()) {
+        bootstrapHeldElfFunctionSections(bootstrapLlvmHeldModule)
+    }
     if (status == 0) status = bootstrapRebuildHeldModule()
     val module = bootstrapLlvmHeldModule
     val target = nativePointerCell(nullPointer)
@@ -881,7 +898,8 @@ trusted fun bootstrapEmitHeldNativeObject(
         val counts = bootstrapWriteCodegenUnits(module, objectPath)
         bootstrapDisposeHeldModule()
         status = if (counts.size == 0) 145 else bootstrapRunCodegenUnits(
-            "native", nativeCString(triple), objectPath, places, counts
+            if (ablaHostIsMacOS()) "native" else "native-elf",
+            nativeCString(triple), objectPath, places, counts
         )
     } else if (status == 0 && LLVMTargetMachineEmitToFile(
         machine, module, objectPath, 1, message.address
@@ -936,7 +954,7 @@ trusted fun bootstrapEmitCodegenUnit(
     val target = nativePointerCell(nullPointer)
     val context = LLVMContextCreate()
     LLVMContextSetDiscardValueNames(context, 1)
-    val wasm = kind != "native"
+    val wasm = kind == "wasm" || kind == "wasm-eh"
     val exceptions = kind == "wasm-eh"
     val plan = bootstrapReadCodegenUnitPlan(planPath)
     var status = if (index >= 0) 0 else 2
@@ -2860,12 +2878,13 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     // would let every such compiler share entries: that build runs uncached.
     // The image does not contain a shared LLVM library, nor the external opt
     // and llc that emit cross-target objects, so their versions join it.
-    // A Mach-O development build keeps its module in process for code generation too:
-    // nothing reads the text it would render (about 100 MB for a large program), which
-    // the object emitter only parsed back. (ELF goes through the text: its partition
-    // cache reads it, and a small module's function sections are added to it.)
+    // Native development builds keep the module for code generation: rendering
+    // then parsing its text costs hundreds of MB for a large program. Codegen
+    // units can cache their bitcode inputs without that textual handoff.
     // ABLA_KEEP_LLVM_TEXT=1 and ABLA_LLVM_OUT_OF_PROCESS=1 keep the text.
-    val nativeHeld = target.hosted && target.objectFormat == "macho" && !ltoEligible &&
+    val nativeHeld = target.hosted &&
+        (target.objectFormat == "macho" ||
+         (target.objectFormat == "elf" && !ablaHostIsMacOS())) && !ltoEligible &&
         cacheProfile == "inprocess-fast" && !bootstrapKeepLlvmText() &&
         !bootstrapLlvmOutOfProcess()
     // A Linux release executable keeps its module too, optimized in process
@@ -2914,7 +2933,14 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     val partitionCacheNamespace =
         "$cacheDirectory/native-partition-${target.name}-llvm21-v3-$cacheProfile${if (bootstrapLlvmDebugInfo) "-g" else ""}-${compilerImage.size}-$compilerFirstHash-$compilerSecondHash"
     // A program that built flat may not build with --strict-imports.
-    val cacheStem = "$cacheDirectory/native-${target.name}-llvm21-v14-$cacheProfile${if (bootstrapStrictImportsRequested) "-strict" else ""}${if (nativeUnits) "-units" else ""}-${compilerImage.size}-$compilerFirstHash-$compilerSecondHash-${sourceIdentity.size}-$firstHash-$secondHash"
+    // A held object and the text fallback can have different section layouts.
+    // Unit count/threshold also select one object versus an archive and its
+    // layout, so changing either must not reuse the other configuration.
+    val nativeMode = if (nativeHeld) {
+        if (nativeUnits) "-held-units${bootstrapCodegenUnitCount()}-min${bootstrapCodegenUnitMinimum()}"
+        else "-held-single"
+    } else ""
+    val cacheStem = "$cacheDirectory/native-${target.name}-llvm21-v14-$cacheProfile${if (bootstrapStrictImportsRequested) "-strict" else ""}$nativeMode-${compilerImage.size}-$compilerFirstHash-$compilerSecondHash-${sourceIdentity.size}-$firstHash-$secondHash"
     val cacheObjectPath = "$cacheStem.o"
     val cacheLlvmPath = "$cacheStem.ll"
     val cacheSourcePath = "$cacheStem.source"
@@ -3087,7 +3113,8 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             // Each partition parses the whole module again, so past a small one even
             // a rebuild that reuses them loses to emitting it whole: an 86 MB module takes
             // 197 s against 17 s, and 10 MB 5.6 s against 1.5 s (--fast, 2026-11-01).
-            if (status == 0 && !objectSkipped && cacheEnabled && compileInputsCacheable &&
+            if (status == 0 && !objectSkipped && !nativeHeld &&
+                cacheEnabled && compileInputsCacheable &&
                 target.hosted && target.objectFormat == "elf" &&
                 Path(llvmPath).info().size <= 2097152 &&
                 Path(cacheDirectory).createDirectories()) {
@@ -3463,7 +3490,12 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         // (An archive of code generation units is loaded whole; ld64 loads an object
         // so named as it loads it plainly.)
         val linkedObject = if (ltoEligible && !linkLlvm) ltoObjectPath else objectPath
-        if (nativeUnits) link.argument("-Wl,-force_load,$objectPath")
+        if (nativeUnits && macTarget) link.argument("-Wl,-force_load,$objectPath")
+        else if (nativeUnits) {
+            link.argument("-Wl,--whole-archive")
+            link.argument(objectPath)
+            link.argument("-Wl,--no-whole-archive")
+        }
         else link.argument(linkedObject)
         if (macTarget) link.argument(hostPath)
         // OpenSSL is not on Darwin's default library path, whether the graph
@@ -3491,7 +3523,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         if (!macTarget) link.argument("-lm")
         link.argument("-o")
         link.argument(publishPath)
-        status = if (macTarget || nativeUnits) link.run()
+        status = if (macTarget) link.run()
             else bootstrapRunHostLink(link, linkedObject, publishPath)
     }
     // The Abla runtime is part of the program LLVM unit, so its ordinary

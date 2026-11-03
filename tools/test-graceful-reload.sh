@@ -86,7 +86,10 @@ request=$!
 wait_for_log 'request-start-v1'
 
 cp "$project_root/tests/cases/bootstrap/graceful-http-v2.ab" \
-    "$test_directory/app.ab"
+    "$test_directory/app.next.ab"
+# The drain check needs a complete valid edit, not a transient empty source
+# between cp's truncate and write (which can consume a rejected generation).
+mv "$test_directory/app.next.ab" "$test_directory/app.ab"
 wait_for_log 'reloaded generation 2'
 wait "$request"
 request=0

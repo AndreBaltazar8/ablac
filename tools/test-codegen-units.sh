@@ -24,11 +24,9 @@ units() { ABLA_CODEGEN_UNITS=8 ABLA_CODEGEN_UNITS_MINIMUM=0 ABLA_CODEGEN_UNITS_T
 # A program's defined external symbols, without the names units give locals.
 symbols() { llvm-nm -g --defined-only "$1" | awk '{print $NF}' | grep -v '__abla_unit\.' | sort; }
 
-# Native units are only for a Mach-O executable's object, built from the
-# module held in process (toolchain.ab nativeUnits); elsewhere a native build
-# is one object, so only WebAssembly is cut.
+# Native units use the module held in process for Linux and Mach-O executables.
 native_cases=()
-if [[ $(uname) == Darwin ]]; then
+if [[ $(uname) == Darwin || $(uname) == Linux ]]; then
     native_cases=(closure-captures collections classes defer strings-runtime global-init-template-call)
 fi
 for case in "${native_cases[@]}"; do
@@ -97,7 +95,7 @@ wasm_build() { # $1 = one or units, $2 = where to keep the modules
 wasm_build one wasm-one
 wasm_build units wasm-units
 wasm_build units wasm-again
-[[ $(grep -c '^codegen units: 8 units' "$output_directory/wasm-units.trace") == 2 ]] ||
+[[ $(grep -cE '^codegen units: 8 units.*\(wasm(-eh)?\)' "$output_directory/wasm-units.trace") == 2 ]] ||
     fail "the WebAssembly modules were not cut into units"
 for module in unwinding plain; do
     cmp -s "$output_directory/wasm-units/$module.wasm" "$output_directory/wasm-again/$module.wasm" ||

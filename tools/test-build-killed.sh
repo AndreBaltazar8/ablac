@@ -23,7 +23,7 @@ fail() {
 build() { # source output
     "$compiler" build "$cases/$1.ab" -o "out/$2" --fast --no-cache
 }
-outputs=(app app.abi.json app.ll app.o)
+outputs=(app app.abi.json app.o)
 save_set() { # name
     mkdir -p "sets/$1"
     for output in "${outputs[@]}"; do cp "out/$output" "sets/$1/$output"; done
@@ -51,14 +51,16 @@ abandoned() {
 }
 
 build two app
+# Intermediate text is optional on the held-module path.
+if [[ -f out/app.ll ]]; then outputs+=(app.ll); fi
 save_set two
 build one app
 save_set one
 
 # Kill points: just started, the new LLVM text written, the object on its way,
 # the object written, the executable written (the build may also end first).
-kill_points=(started app.ll app.o.tmp app.o app)
-signals=(KILL TERM KILL TERM KILL)
+kill_points=(started app.o.tmp app.o app)
+if [[ -f out/app.ll ]]; then kill_points=(started app.ll app.o.tmp app.o app); fi
 reached() { # point
     case $1 in
         started) (($(date +%s%N) - started_at > 50000000)) ;;
@@ -69,7 +71,8 @@ reached() { # point
 index=0
 left_temporaries=0
 for point in "${kill_points[@]}"; do
-    signal=${signals[$index]}
+    signal=KILL
+    if [[ $point == app.ll || $point == app.o ]]; then signal=TERM; fi
     touch stamp
     started_at=$(date +%s%N)
     setsid "$compiler" build "$cases/two.ab" -o out/app --fast --no-cache \

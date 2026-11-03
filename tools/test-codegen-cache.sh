@@ -24,12 +24,10 @@ units() {
 }
 reused() { sed -n 's/^codegen units: .* \([0-9]*\) reused$/\1/p' "$1"; }
 
-# Native units are only for a Mach-O executable's object, built from the
-# module held in process (toolchain.ab nativeUnits); elsewhere a native build
-# is one object and only WebAssembly is cut.
+# Native units use the module held in process for Linux and Mach-O executables.
 edit_reused=0
 units_run=0
-if [[ $(uname) == Darwin ]]; then
+if [[ $(uname) == Darwin || $(uname) == Linux ]]; then
     source="$output_directory/program.ab"
     cp tests/cases/modules/collections.ab "$source"
     units "$source" -o "$output_directory/program" 2> "$output_directory/cold.trace" ||
@@ -66,6 +64,25 @@ if [[ $(uname) == Darwin ]]; then
         "$compiler" build "$source" -o "$output_directory/program" --fast --no-cache 2> /dev/null
     cmp -s "$output_directory/program.o" "$output_directory/edit.o" ||
         fail "the edited program's object differs from the build without the cache"
+
+    # The whole-object cache must distinguish a single object, units, and the
+    # text fallback, including a threshold change that stops cutting units.
+    outer="$output_directory/outer-cache"
+    outer_build() {
+        "$compiler" build "$source" -o "$output_directory/configured" \
+            --fast --cache-dir "$outer"
+    }
+    ABLA_CODEGEN_UNITS=1 outer_build
+    cp "$output_directory/configured.o" "$output_directory/single.o"
+    ABLA_CODEGEN_UNITS=8 ABLA_CODEGEN_UNITS_MINIMUM=0 outer_build
+    llvm-ar t "$output_directory/configured.o" > "$output_directory/members" ||
+        fail "changing the unit count reused the single object"
+    grep -q '^unit0.o$' "$output_directory/members" || fail "the units have no data object"
+    ABLA_CODEGEN_UNITS=8 ABLA_CODEGEN_UNITS_MINIMUM=999999999 outer_build
+    cmp -s "$output_directory/configured.o" "$output_directory/single.o" ||
+        fail "changing the threshold reused the archive"
+    ABLA_KEEP_LLVM_TEXT=1 outer_build
+    [[ -s $output_directory/configured.ll ]] || fail "the text fallback reused a held object"
 fi
 
 # WebAssembly, with exception handling: a second build reuses every unit and
@@ -82,7 +99,7 @@ wasm_build() { # $1 = where to keep the modules
 }
 wasm_build wasm-cold
 wasm_build wasm-warm
-[[ $(grep -cE ' ([0-9]+) with code, .* \1 reused$' "$output_directory/wasm-warm.trace") == 2 ]] ||
+[[ $(grep -cE ' ([0-9]+) with code, .*\(wasm(-eh)?\), \1 reused$' "$output_directory/wasm-warm.trace") == 2 ]] ||
     fail "a warm WebAssembly build did not reuse every unit"
 for module in unwinding plain; do
     cmp -s "$output_directory/wasm-cold/$module.wasm" "$output_directory/wasm-warm/$module.wasm" ||
