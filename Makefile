@@ -233,6 +233,7 @@ test-serial: ablac
 	tools/test-mutex.sh $(COMPILER)
 	tools/test-affine-move.sh $(COMPILER)
 	tools/test-affine-default.sh $(COMPILER)
+	tools/test-generic-default.sh $(COMPILER)
 	tools/test-field-places.sh $(COMPILER)
 	tools/test-compile-time-cell-capture.sh $(COMPILER)
 	tools/test-hosted-network.sh $(COMPILER)
