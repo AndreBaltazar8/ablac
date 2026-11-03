@@ -93,7 +93,7 @@ fun main {
 | `p.readTextResult()` | a `FileReadResult`: `text`, `succeeded`, `errorCode` |
 | `p.writeText(text)`, `p.appendText(text)` | write or append; `bool` success |
 | `p.writeTextAtomic(text)` | write a temporary file and rename it over `p`, so readers never see a partial file |
-| `p.createDirectories()`, `p.createParentDirectories()` | `mkdir -p` |
+| `p.createDirectories(mode = 511)`, `p.createParentDirectories()` | `mkdir -p`; `mode` applies to each new directory and is filtered by the process umask |
 | `p.entries()` | the entries of a directory, as `Path`s |
 | `p.copyTo(destination)`, `p.copyTreeTo(destination)`, `p.moveTo(destination)` | copy a file, copy a tree (returns the number of files), move |
 | `p.remove()`, `p.removeTree()` | delete a file or empty directory, or a whole tree |
@@ -102,6 +102,8 @@ fun main {
 Write operations return `false` on failure instead of stopping the program.
 `homePath()` does not consult NSS, so an LDAP/SSSD-only account without `HOME`
 does not have a fallback. On macOS it uses only `HOME`.
+Directory modes are integers: for example, `448` is octal `0700` and the
+default `511` is octal `0777`. Existing directories keep their permissions.
 `readText()` returns `""` for a file that doesn't exist or can't be read, the
 same as for an empty file, so check `exists()` (or `info().isFile()`) first
 when the difference matters, or use `readTextResult()`. A missing file's
