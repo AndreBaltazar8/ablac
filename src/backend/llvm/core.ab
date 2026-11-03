@@ -36,7 +36,11 @@ class BootstrapLlvmBackend(
     // The TBAA access tags (bootstrapLlvmTagAccess), made with the context.
     val aliasKind: i32,
     val aliasSlot: i64*,
-    val aliasRaw: i64*
+    val aliasRaw: i64*,
+    // Static executable TLS can use the initial-exec model. Object/shared
+    // outputs and externally named TLS keep their general-dynamic model.
+    var executableTls: bool = false,
+    var noPanicRecovery: bool = false
 )
 
 fun bootstrapLlvmBackend(targetTriple: string): BootstrapLlvmBackend {
@@ -390,6 +394,45 @@ fun bootstrapLlvmCallTyped(
     )
     values.drop()
     call
+}
+
+// Reuse libc's syscall entry on the Linux x86-64 fatal paths. The typed call
+// accepts only the kernel arguments the operation uses, even when ordinary
+// Linux intrinsics declared the same C symbol with seven integer parameters.
+// Other targets and debug reporting keep their established libc wrappers.
+fun bootstrapLlvmCompactLinuxRuntime(backend: BootstrapLlvmBackend): bool =
+    !backend.macOS && !bootstrapLlvmDebugHostedRuntime(backend) &&
+    bootstrapTextContains(backend.targetTriple, "x86_64") &&
+    bootstrapTextContains(backend.targetTriple, "linux") &&
+    !bootstrapTextContains(backend.targetTriple, "gnux32")
+
+fun bootstrapLlvmLinuxX64Syscall(
+    backend: BootstrapLlvmBackend,
+    number: int,
+    arguments: array<i64*>
+): i64* {
+    val types: array<i64*> = [backend.i64Type]
+    val values: array<i64*> = [LLVMConstInt(backend.i64Type, number, 0)]
+    for (argument in arguments) {
+        types.append(backend.i64Type)
+        val type = LLVMTypeOf(argument)
+        values.append(if (type == backend.pointerType) {
+            LLVMBuildPtrToInt(backend.builder, argument, backend.i64Type, "syscall.pointer")
+        } else if (type == backend.i64Type) argument
+        else if (LLVMGetIntTypeWidth(type) < 64) {
+            LLVMBuildZExt(backend.builder, argument, backend.i64Type, "syscall.integer")
+        } else LLVMBuildTrunc(backend.builder, argument, backend.i64Type, "syscall.integer"))
+    }
+    var function = LLVMGetNamedFunction(backend.module, "syscall")
+    if (pointerIsNull(function)) function = bootstrapLlvmDeclare(
+        backend, "syscall", backend.i64Type,
+        [backend.i64Type, backend.i64Type, backend.i64Type, backend.i64Type,
+         backend.i64Type, backend.i64Type, backend.i64Type], false, []
+    )
+    bootstrapLlvmCallTyped(
+        backend, bootstrapLlvmFunctionType(backend, backend.i64Type, types),
+        function, values, "linux.runtime.syscall"
+    )
 }
 
 fun bootstrapLlvmCallNamed(

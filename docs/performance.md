@@ -19,6 +19,72 @@ object emission, and linking.
 Compare two compilers with `tools/bench-compare.py` (compile instructions, stripped size,
 run cycles and instructions, on `tests/benchmarks`).
 
+## Smaller native startup and collector (2026-11-03)
+
+The size work on top of `compiler-perf-3` (`ec2fca9b`, plus the global-root
+initialization fix `0601faee`) reaches the 10% stripped-size target:
+
+| Metric (geometric mean) | Against master `753d1d10` | Against `compiler-perf-3` |
+|---|---:|---:|
+| Release build instructions, 13 programs | -20.2% | -0.4% |
+| Stripped executable size, 13 programs | -11.1% | -4.8% |
+| Run instructions, 11 programs | -13.1% | -2.3% |
+| Server instructions per request, 9 workloads | -4.12% | — |
+
+These are `tools/bench-compare.py` results with one build and two run rounds.
+The incremental control is `/home/andre/perfbase/ablac-c9.bin` with an archived
+parent sysroot. All eleven run benchmarks use fewer instructions or remain
+unchanged against master. Incrementally, strings uses 0.6% more instructions
+and maps 0.5% more; both remain below master (5.7% and 1.8%, respectively).
+Dispatch uses 19.6% fewer instructions than the parent. Cycles on the loaded
+machine do not establish a timing improvement.
+
+Fib falls from 14,392 to 12,240 stripped bytes, trees from 16,968 to 14,560,
+and strings from 20,456 to 17,408. The `abla-compare` server falls from 290,000
+to 259,016 bytes (-10.7%). Its request measurement uses 40,000 requests per
+round, three rounds per workload, a pinned server and a fresh master control;
+all nine workloads use fewer instructions per request (2.8% to 6.1%).
+
+The collector shares `MarkValue`'s tagged-value dispatch between its root and
+layout walkers, and shares the heap-sort sift between construction and
+extraction. Explicit `@noinline` boundaries remove repeated code without
+changing tracing or sorting. The large-range stress fixture retains sixteen
+interior views into allocations above 32 KiB, drops their rope parents and
+collects after every append. Using libc `qsort` was rejected: it was slightly
+smaller but added an unavailable symbol to the freestanding AArch64 fixtures.
+An alternative sift that moves children instead of swapping did not improve
+size, so the existing algorithm remains.
+
+Internal anonymous TLS in Linux executables uses initial-exec; externally
+named TLS and library/object outputs retain general-dynamic. On release
+Linux x86-64, fatal runtime writes and process exits reuse libc's existing
+`syscall` import. The stack handler likewise uses `prlimit64` and re-raises
+on its own thread with `getpid`/`gettid`/`tgkill`. It retains libc `sigaction`
+for signal dispositions and its restorer. Debug reporting and other targets
+retain their existing wrappers. Fib's libc imports fall from eighteen to ten.
+
+An executable without exports or a reference to a recovery setter has no
+recovery frame to enter. Its `HostRecover` becomes a zero result, removing the
+unused error-buffer copy and `_longjmp` path. Checked exports, library/object
+outputs and explicit recovery calls or address references retain recovery.
+Finally, only the generated C entry wrapper and stack-fault handler use
+`minsize` as well as `optsize`; the Abla main body keeps its ordinary policy.
+This saves fixed startup code without applying minimum-size optimization to
+the program's hot functions. Applying `minsize` to pressure collection instead
+saved only 64 bytes and increased trees' instructions by 0.4%, so was dropped.
+
+`make test` passes all 256 commands in 190 seconds (16 jobs, restricted to
+P-core logical CPUs `0-11,14,15`). This includes `ablac test` and bundled
+tests, native/debug/JIT runtime failures, checked exports, TLS faults,
+freestanding cross-targets and collection stress. Two compiler stages build
+successfully and emit byte-identical json-readers LLVM IR. An earlier
+mixed-core suite passed 255 commands but failed the frontend CPU-time ratio
+at 4.51/1.45 seconds; the same binary on CPU 8 passed at 2.65/1.16 seconds,
+and the final full pinned suite passes that check too. Preserve an 8 MiB soft
+stack for the runtime test parent; the compiler launcher raises its own stack.
+The separate full compiler-under-GC-stress self-build remains pending with
+the global-root fix's author; passing collection tests is not that result.
+
 ## A string slice needs no collection safe point (2026-11-02)
 
 `string.slice` returns a view. Like reading a character or comparing strings,

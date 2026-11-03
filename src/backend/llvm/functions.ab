@@ -2496,7 +2496,8 @@ fun bootstrapLlvmEmitNativeCall(
     program: BootstrapIrProgram,
     nativeIndex: BootstrapLlvmNameIndex,
     var storage: BootstrapLlvmFunctionStorage,
-    instruction: BootstrapInstruction
+    instruction: BootstrapInstruction,
+    runtime: bool
 ): bool {
     var supported = true
     val arguments: array<i64*> = []
@@ -2527,32 +2528,41 @@ fun bootstrapLlvmEmitNativeCall(
         supported = false
     }
     if (supported) {
-        val native = bootstrapLlvmDeclare(
-            backend, instruction.text, backend.type(nativeResultType),
-            parameterTypes, false, byval
-        )
-        // wasm-ld reads these attributes on an undefined function to pick
-        // the import module and field instead of "env" and the symbol.
-        if (bootstrapTextContains(backend.targetTriple, "wasm")) {
-            val wasmImport = bootstrapLlvmNativeWasmImport(
-                program, nativeIndex, instruction.text
+        var result: i64* = nativeNullPointer()
+        val compact = runtime && (instruction.text == "write" || instruction.text == "_exit") &&
+            bootstrapLlvmCompactLinuxRuntime(backend)
+        if (compact) {
+            result = bootstrapLlvmLinuxX64Syscall(
+                backend, if (instruction.text == "write") 1 else 231, arguments
             )
-            if (wasmImport[0] != "") {
-                bootstrapLlvmAddStringFunctionAttribute(
-                    backend, native, "wasm-import-module", wasmImport[0]
+        } else {
+            val native = bootstrapLlvmDeclare(
+                backend, instruction.text, backend.type(nativeResultType),
+                parameterTypes, false, byval
+            )
+            // wasm-ld reads these attributes on an undefined function to pick
+            // the import module and field instead of "env" and the symbol.
+            if (bootstrapTextContains(backend.targetTriple, "wasm")) {
+                val wasmImport = bootstrapLlvmNativeWasmImport(
+                    program, nativeIndex, instruction.text
                 )
-                bootstrapLlvmAddStringFunctionAttribute(
-                    backend, native, "wasm-import-name",
-                    if (wasmImport[1] != "") wasmImport[1]
-                    else instruction.text
-                )
+                if (wasmImport[0] != "") {
+                    bootstrapLlvmAddStringFunctionAttribute(
+                        backend, native, "wasm-import-module", wasmImport[0]
+                    )
+                    bootstrapLlvmAddStringFunctionAttribute(
+                        backend, native, "wasm-import-name",
+                        if (wasmImport[1] != "") wasmImport[1]
+                        else instruction.text
+                    )
+                }
             }
+            result = bootstrapLlvmCall(
+                backend, native, arguments,
+                if (resultType == "void") "" else "native.result",
+                false, byval
+            )
         }
-        val result = bootstrapLlvmCall(
-            backend, native, arguments,
-            if (resultType == "void") "" else "native.result",
-            false, byval
-        )
         if (instruction.result >= 0 &&
             instruction.result < storage.valueTypes.size &&
             storage.valueTypes[instruction.result] != "") {
@@ -4485,9 +4495,10 @@ fun bootstrapLlvmEmitCoreIntrinsic(
             LLVMSetAlignment(global, 8)
             LLVMSetLinkage(global, llvmInternalLinkage())
             LLVMSetThreadLocal(global, 1)
-            // General-dynamic TLS remains valid in shared libraries while
-            // still providing one independently initialized value per thread.
-            LLVMSetThreadLocalMode(global, 1)
+            // Internal TLS is allocated when an executable starts: initial-exec
+            // needs no __tls_get_addr import. Shared/object outputs retain the
+            // general-dynamic model so they can be loaded later.
+            LLVMSetThreadLocalMode(global, if (backend.executableTls) 3 else 1)
             // Through llvm.threadlocal.address, not the bare global: the
             // intrinsic is an instruction LLVM can share across a function
             // (a function runs on one thread), where each use of the bare
@@ -7464,6 +7475,10 @@ fun bootstrapLlvmEmitFunction(
     )
     LLVMPositionBuilderAtEnd(backend.builder, entry)
     bootstrapLlvmDebugLocate(debug, backend, functionId, -1)
+    if (backend.noPanicRecovery && function.name == "__ablaRuntimeHostRecover") {
+        LLVMBuildRet(backend.builder, LLVMConstInt(backend.i64Type, 0, 0))
+        return 0
+    }
     if ((function.name == "__ablaDebugPrintStack" ||
          function.name == "__ablaRuntimePrintStack") &&
         bootstrapLlvmDebugHostedRuntime(backend)) {
@@ -8492,7 +8507,8 @@ fun bootstrapLlvmEmitFunction(
         if (reachable && instruction.opcode == "extern.c") {
             matched = true
             supported = bootstrapLlvmEmitNativeCall(
-                backend, program, nativeIndex, storage, instruction
+                backend, program, nativeIndex, storage, instruction,
+                bootstrapLlvmRuntimeImplementation(function.name)
             )
         }
         if (reachable && instruction.opcode == "inline.assembly") {

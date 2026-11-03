@@ -769,6 +769,10 @@ fun bootstrapLlvmInstallStackGuard(backend: BootstrapLlvmBackend): void {
         false, []
     )
     LLVMSetLinkage(handler, llvmInternalLinkage())
+    if (bootstrapLlvmCompactLinuxRuntime(backend)) {
+        bootstrapLlvmAddFunctionAttribute(backend, handler, "optsize")
+        bootstrapLlvmAddFunctionAttribute(backend, handler, "minsize")
+    }
     LLVMBuildStore(backend.builder, handler, action)
     LLVMBuildStore(
         backend.builder,
@@ -833,11 +837,20 @@ fun bootstrapLlvmEmitStackGuardHandler(backend: BootstrapLlvmBackend): void {
         // ones) counts as 64 GiB.
         val limitType = LLVMArrayType2(backend.i8Type, 16)
         val limit = LLVMBuildAlloca(backend.builder, limitType, "stack.limit")
-        bootstrapLlvmStackGuardCall(
-            backend, "getrlimit", backend.i32Type,
-            [backend.i32Type, backend.pointerType],
-            [LLVMConstInt(backend.i32Type, 3, 0), limit]
-        )
+        if (bootstrapLlvmCompactLinuxRuntime(backend)) {
+            // prlimit64(0, RLIMIT_STACK, NULL, &limit), the operation libc's
+            // getrlimit uses on modern Linux; its two limits are 64-bit.
+            bootstrapLlvmLinuxX64Syscall(backend, 302, [
+                LLVMConstInt(i64, 0, 0), LLVMConstInt(i64, 3, 0),
+                LLVMConstInt(i64, 0, 0), limit
+            ])
+        } else {
+            bootstrapLlvmStackGuardCall(
+                backend, "getrlimit", backend.i32Type,
+                [backend.i32Type, backend.pointerType],
+                [LLVMConstInt(backend.i32Type, 3, 0), limit]
+            )
+        }
         val current = LLVMBuildLoad2(backend.builder, i64, limit, "")
         val size = LLVMBuildSelect(
             backend.builder,
@@ -879,21 +892,31 @@ fun bootstrapLlvmEmitStackGuardHandler(backend: BootstrapLlvmBackend): void {
     LLVMBuildCondBr(backend.builder, overflow, overflowed, other)
     LLVMPositionBuilderAtEnd(backend.builder, overflowed)
     val message = "panic: stack overflow\n"
-    bootstrapLlvmStackGuardCall(
-        backend, "write", i64, [i64, backend.pointerType, i64],
-        [LLVMConstInt(i64, 2, 0),
-         bootstrapLlvmGlobalStringPointer(backend, message, "abla.stack.overflow"),
-         LLVMConstInt(i64, message.size, 0)]
-    )
+    val messageArguments = [LLVMConstInt(i64, 2, 0),
+        bootstrapLlvmGlobalStringPointer(backend, message, "abla.stack.overflow"),
+        LLVMConstInt(i64, message.size, 0)]
+    if (bootstrapLlvmCompactLinuxRuntime(backend)) {
+        bootstrapLlvmLinuxX64Syscall(backend, 1, messageArguments)
+    } else {
+        bootstrapLlvmStackGuardCall(
+            backend, "write", i64, [i64, backend.pointerType, i64], messageArguments
+        )
+    }
     if (bootstrapLlvmDebugHostedRuntime(backend)) {
         bootstrapLlvmStackGuardCall(
             backend, "abla_runtime_print_stack", backend.voidType, [], []
         )
     }
-    bootstrapLlvmStackGuardCall(
-        backend, "_exit", backend.voidType, [backend.i64Type],
-        [LLVMConstInt(backend.i64Type, 101, 0)]
-    )
+    if (bootstrapLlvmCompactLinuxRuntime(backend)) {
+        // exit_group, as libc _exit: terminate the entire process, not just
+        // the thread handling the fault.
+        bootstrapLlvmLinuxX64Syscall(backend, 231, [LLVMConstInt(i64, 101, 0)])
+    } else {
+        bootstrapLlvmStackGuardCall(
+            backend, "_exit", backend.voidType, [backend.i64Type],
+            [LLVMConstInt(backend.i64Type, 101, 0)]
+        )
+    }
     LLVMBuildUnreachable(backend.builder)
     LLVMPositionBuilderAtEnd(backend.builder, other)
     val signal = LLVMBuildZExt(
@@ -906,6 +929,17 @@ fun bootstrapLlvmEmitStackGuardHandler(backend: BootstrapLlvmBackend): void {
         )
         LLVMSetLinkage(fault, llvmInternalLinkage())
         bootstrapLlvmCall(backend, fault, [signal], "", false, [])
+    } else if (bootstrapLlvmCompactLinuxRuntime(backend)) {
+        // Keep libc sigaction (its restorer matters when this handler returns),
+        // but reuse that existing import to restore SIG_DFL.
+        val actionType = LLVMArrayType2(backend.i8Type, 160)
+        val action = LLVMBuildAlloca(backend.builder, actionType, "signal.default")
+        LLVMBuildStore(backend.builder, LLVMConstNull(actionType), action)
+        bootstrapLlvmStackGuardCall(
+            backend, "sigaction", backend.i32Type,
+            [backend.i32Type, backend.pointerType, backend.pointerType],
+            [LLVMGetParam(handler, 0), action, LLVMConstNull(backend.pointerType)]
+        )
     } else {
         bootstrapLlvmStackGuardCall(
             backend, "signal", backend.pointerType,
@@ -916,10 +950,16 @@ fun bootstrapLlvmEmitStackGuardHandler(backend: BootstrapLlvmBackend): void {
     // Back to the default action: the signal raised again (delivered once
     // the handler returns) or the faulting instruction run again ends the
     // process as before.
-    bootstrapLlvmStackGuardCall(
-        backend, "raise", backend.i32Type, [backend.i32Type],
-        [LLVMGetParam(handler, 0)]
-    )
+    if (bootstrapLlvmCompactLinuxRuntime(backend)) {
+        val process = bootstrapLlvmLinuxX64Syscall(backend, 39, [])
+        val threadId = bootstrapLlvmLinuxX64Syscall(backend, 186, [])
+        bootstrapLlvmLinuxX64Syscall(backend, 234, [process, threadId, signal])
+    } else {
+        bootstrapLlvmStackGuardCall(
+            backend, "raise", backend.i32Type, [backend.i32Type],
+            [LLVMGetParam(handler, 0)]
+        )
+    }
     LLVMBuildRetVoid(backend.builder)
     return
 }

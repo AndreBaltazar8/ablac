@@ -55,10 +55,12 @@ build "$output_directory/loop-roots.ab" loop-roots
 build "$project_root/tests/cases/gc-stress/callbacks.ab" callbacks
 build "$project_root/tests/cases/gc-stress/process-arguments.ab" process-arguments
 build "$project_root/tests/cases/gc-stress/string-slices.ab" string-slices
+build "$project_root/tests/cases/gc-stress/large-ranges.ab" large-ranges
 
 stress=ABLA_GC_STRESS=1
 expect callbacks 42 "" $stress
 expect string-slices 42 "" $stress
+expect large-ranges 42 "" $stress
 expect process-arguments 42 "" $stress
 expect generator-nested 0 114 $stress
 expect generator-lazy 0 $'produce 0\ngot 0\nproduce 1\ngot 1\nproduce 2\ngot 2\ntotal 5050\nstart\nv 1\nclosed\n--\nstart\nv 1\nafter 1\nv 2\nafter 2\nclosed\n--\ndropping\na\nbb\nb!\nb!\nc\nu0\nu1\nu2\nc1\nc2\nzero\none\none!\nmany\no 10\nclose a\nclose r\nfirst 1\nlevel 0\nlevel 2\nlevel 4\nlevel 5\nend' $stress
