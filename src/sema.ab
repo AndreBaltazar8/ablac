@@ -7100,6 +7100,8 @@ class BootstrapAnalyzer(
     var usedAssignments: array<int> = [],
     // Array literals typed from a store's inferred receiver (expected_types.ab).
     val contextualLiterals: BootstrapContextualLiterals = bootstrapNoContextualLiterals(),
+    // A lambda's nullable result context, keyed by its source span.
+    val contextualLambdaResults: Map<string, string> = Map(),
     // The member expressions a mutation goes through (`n.items` in
     // `n.items.append(x)`): an extension field the object doesn't have takes
     // its default there, stored, so the mutation stays (bootstrapLowerer).
@@ -11585,6 +11587,21 @@ class BootstrapAnalyzer(
         expression: BootstrapExpression,
         expected: string
     ): void {
+        val expectedFunction = if (bootstrapIsNullableType(expected))
+            bootstrapNullableElementType(expected) else expected
+        if (bootstrapIsFunctionType(expectedFunction) &&
+            expression.kind == "block" && expression.children.size > 0) {
+            this.contextualizeLambdaParameters(
+                expression.children[expression.children.size - 1], expected
+            )
+            return
+        }
+        if (bootstrapIsFunctionType(expectedFunction) &&
+            expression.kind == "if" && expression.children.size == 3) {
+            this.contextualizeLambdaParameters(expression.children[1], expected)
+            this.contextualizeLambdaParameters(expression.children[2], expected)
+            return
+        }
         // A nullable function type gives its function's parameters.
         if (bootstrapIsNullableType(expected)) {
             this.contextualizeLambdaParameters(
@@ -11598,6 +11615,12 @@ class BootstrapAnalyzer(
             for (item in expression.children) {
                 this.contextualizeLambdaParameters(item, element)
             }
+        }
+        if ((expression.kind == "lambda" || expression.kind == "lambda.move") &&
+            !bootstrapIsFunctionType(expected)) {
+            this.contextualLambdaResults.remove(
+                "${this.currentSourceIdentity}:${expression.begin}:${expression.end}"
+            )
         }
         if ((expression.kind == "lambda" ||
              expression.kind == "lambda.move") &&
@@ -11645,6 +11668,9 @@ class BootstrapAnalyzer(
             // One where a result is expected hands its last expression out:
             // an assignment there is used (ownership.assignment-value).
             val result = bootstrapFunctionResultType(expected)
+            val lambdaKey = "${this.currentSourceIdentity}:${expression.begin}:${expression.end}"
+            if (bootstrapIsNullableType(result)) this.contextualLambdaResults.set(lambdaKey, result)
+            else this.contextualLambdaResults.remove(lambdaKey)
             if (result != "void" && result != "unknown") {
                 bootstrapCollectUsedAssignments(body, true, this.usedAssignments)
             }
@@ -12720,6 +12746,7 @@ class BootstrapAnalyzer(
                     this.usedAssignments
                 )
                 bootstrapGenericExpect(this, this.currentResultType, declaration.expression)
+                this.contextualizeLambdaParameters(declaration.expression, this.currentResultType)
                 val actual = this.infer(declaration.expression)
                 bootstrapRecordBodyResult(this, declaration, index, actual)
                 this.validateBorrowReturn(
@@ -12901,6 +12928,7 @@ class BootstrapAnalyzer(
                     this.usedAssignments
                 )
                 bootstrapGenericExpect(this, this.currentResultType, method.expression)
+                this.contextualizeLambdaParameters(method.expression, this.currentResultType)
                 val actual = this.infer(method.expression)
                 bootstrapRecordBodyResult(
                     this, method, this.selectedMethodHandle(owner.name, method.name), actual
@@ -13359,6 +13387,12 @@ fun bootstrapInferLambda(
         if (analyzer.returnedType != "unknown") {
             bodyType = bootstrapJoinTypes(bodyType, analyzer.returnedType)
         } else bodyType = bodyType
+    }
+    if (bodyType == "null") {
+        val contextual = analyzer.contextualLambdaResults.get(
+            "${analyzer.currentSourceIdentity}:${expression.begin}:${expression.end}"
+        )
+        if (contextual != null && bootstrapIsNullableType(contextual)) bodyType = contextual
     }
     analyzer.currentResultType = previousResultType
     analyzer.currentBody = previousBody

@@ -58,8 +58,6 @@
   `bootstrapSourceReachableDeclarations` walks every method of a reached class, and the lowering loop lowers them all, by declaration.
   It needs method-level demand in both, by called name, with what lowering inserts by itself (operators, iterators, delegates, drops)
   counted. Weigh against what removing dead functions before opt did to inlining ("`make test` under 2 minutes", below).
-- [ ] A lambda with no declared result, passed for `(int) -> string?`, doesn't take that type from an unconditional `null`:
-  `w({ x: int -> null })` is `function.argument:...:function:(i64)->null`. Seen 2026-11-02.
 - [ ] Once during `make test` (2026-11-01), `tools/test-ct.sh` saw `python3: No such file or directory`
       and `suite-package-providers` failed to resolve a local git dependency, with neither recurring
       in the next runs. Suspected: the Nix profile changing mid-run. Not confirmed, but during a `home-manager switch`
