@@ -84,8 +84,7 @@
 
 - [ ] No pipeline: a `Command`'s standard output can go to a file or to this program, not to another command, so
       `git archive | tar` goes through a temporary file. `capture` doesn't take standard error either (only `errors(file)`).
-- [ ] Missing and written by hand in every tool: parsing an int from text (`abla-postgres` `pgInt`, `abla-s3` `s3ParseInt`,
-      `oneParseInt`, NovaKind's `toolInteger`), `array<string>.join`, `array.removeLast`, a UUID, multi-line string literals (`"""`
+- [ ] Missing and written by hand in every tool: `array<string>.join`, `array.removeLast`, a UUID, multi-line string literals (`"""`
       doesn't parse), `Path.home`, a `createDirectories` with a mode (`Path.writeText` is always 0666 less umask).
 - [ ] `abla/crypto/hosted` can use an RSA key but not generate one, so a throwaway test key still calls `openssl genrsa`.
 - [ ] There is no YAML library: NovaKind's `provision-mail` edits `~/.config/icy/mail.yaml` by its lines and refuses anything else

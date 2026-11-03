@@ -8,7 +8,7 @@
 | `abla/float` | conversions between integers and floats, and float bit patterns |
 | `abla/float/text` | float formatting and parsing ([text.md](text.md#ablafloattext-floats-as-text)) |
 | `abla/bits` | named bit operations (`bitAnd`, `bitShiftLeft`, ...) |
-| `abla/integer` | `u32.countLeadingZeros()` |
+| `abla/integer` | `u32.countLeadingZeros()`, `string.parseInt()` |
 | [`abla/uint256`](uint256.md) | unsigned 256-bit integers |
 | `abla/random` | cryptographically secure random bytes |
 
@@ -16,6 +16,19 @@ Integer arithmetic, widths and conversions are part of the language
 ([integers](../language.md#integers)). Everything here except
 `abla/random` is pure arithmetic: it works on every target and gives the
 same results at compile time.
+
+## `abla/integer`
+
+`text.parseInt()` returns an `int?`. It accepts an optional ASCII `+` or `-`
+followed by one or more ASCII decimal digits, including leading zeros. It
+returns `null` for empty text, whitespace, other characters, and values
+outside the signed 64-bit `int` range. Trim explicitly first when desired:
+`text.trim().parseInt()` (with `abla/text` imported for `trim`).
+
+```abla
+import "abla/integer"
+val count: int? = "-42".parseInt()
+```
 
 ## `abla/math`
 
