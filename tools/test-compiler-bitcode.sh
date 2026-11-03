@@ -5,7 +5,9 @@ project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 cd "$project_root"
 output="$project_root/build/compiler-bitcode"
 mkdir -p "$output"
-"$compiler" build tests/cases/compiler-bitcode/prune.ab -o "$output/prune" --no-cache
+# This program exercises the prune API; its own optimized code is not the
+# subject of the byte-identical normalized output comparison below.
+"$compiler" build tests/cases/compiler-bitcode/prune.ab -o "$output/prune" --fast --no-cache
 "$output/prune" tests/cases/compiler-bitcode/prune.ll "$output/text.ll" "$output/direct.bc"
 llvm-as "$output/text.ll" -o "$output/text.bc"
 # ModuleID is a display-only input filename assigned by llvm-dis.
