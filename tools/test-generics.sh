@@ -102,11 +102,25 @@ done
 
 # A class's generic method keeps its class's name in debug information (and
 # so in traces): `<module>.Sack.remap`, not the extension it is made into.
-"$compiler" build "$cases/methods-label.ab" -o "$output_directory/methods-label.o" \
+# LLVM's line-tables-only DWARF has an abstract subprogram for the inlined
+# release method, but may omit subprogram DIEs for non-inlined fast methods.
+ABLA_TEST_FAST_BUILDS=0 "$compiler" build "$cases/methods-label.ab" -o "$output_directory/methods-label.o" \
     --emit object -g --no-cache
 llvm-dwarfdump --debug-info "$output_directory/methods-label.o" > "$output_directory/methods-label.dwarf"
 grep -Fq '"methods-label.Sack.remap"' "$output_directory/methods-label.dwarf" ||
     { echo "generics: a generic method's instance isn't named Sack.remap in debug information" >&2; exit 1; }
+
+# Fast code keeps the method out of line: symbolization must report its class
+# and its declaration line even when LLVM emits no DW_TAG_subprogram for it.
+"$compiler" build "$cases/methods-label.ab" -o "$output_directory/methods-label-fast.o" \
+    --emit object --fast -g --no-cache
+method_address=$(llvm-nm --defined-only "$output_directory/methods-label-fast.o" |
+    awk '$3 == "methods-label.Sack.remap" || $3 == "_methods-label.Sack.remap" { print "0x" $1; exit }')
+[[ -n $method_address ]] || { echo 'generics: fast generic method symbol is missing' >&2; exit 1; }
+llvm-symbolizer --obj="$output_directory/methods-label-fast.o" --functions=linkage "$method_address" > "$output_directory/methods-label-fast.symbolized"
+grep -Exq '_?methods-label\.Sack\.remap' "$output_directory/methods-label-fast.symbolized" &&
+    grep -Eq 'methods-label\.ab:3(:[0-9]+)?$' "$output_directory/methods-label-fast.symbolized" ||
+    { echo 'generics: fast generic method did not symbolize to its declaration' >&2; cat "$output_directory/methods-label-fast.symbolized" >&2; exit 1; }
 
 # The incremental case, built with the build cache before and after the edit.
 work=$output_directory/incremental
