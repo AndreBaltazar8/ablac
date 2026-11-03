@@ -47,6 +47,7 @@ const abla_host = {
 const { exports } = new WebAssembly.Instance(module, { abla_host });
 memory = exports.memory;
 
+if (exports.startupRoots() !== 42n) fail("globals collected during initialization");
 exports.greet();
 if (written[1] !== "hello from the module\n") fail(`stdout ${JSON.stringify(written[1])}`);
 if (written[2] !== "and its standard error\n") fail(`stderr ${JSON.stringify(written[2])}`);

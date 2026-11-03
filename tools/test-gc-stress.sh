@@ -37,6 +37,12 @@ build "$project_root/tests/cases/gc-stress/collects.ab" collects
 expect collects 1 ""
 expect collects 42 "" ABLA_GC_STRESS=1
 
+# Earlier globals stay rooted while a later initializer collects, both with
+# explicit collection alone and with a collection at every safe point.
+build "$project_root/tests/cases/gc-stress/global-initializer.ab" global-initializer
+expect global-initializer 42 ""
+expect global-initializer 42 "" ABLA_GC_STRESS=1
+
 modules="$project_root/tests/cases/modules"
 for name in generator-nested generator-lazy generator-affine task-array-move \
     generator-task-capture string-retention; do

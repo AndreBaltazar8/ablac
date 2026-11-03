@@ -1309,8 +1309,9 @@ fun bootstrapLlvmReturnExportValue(
 // A program entered through its exports (a Wasm module, a compile-time slice
 // (bootstrapLlvmExportsAreEntries), a native library loaded by a host) may never
 // run `main`, which is what publishes globals as collector roots, so the lazy
-// export initializer does it once globals exist: a static frame whose constant
-// array points at every non-scalar global. The frame is never popped; the
+// export initializer publishes their zero-initialized slots before constructing
+// their values: a static frame whose constant array points at every non-scalar
+// global. The frame is never popped; the
 // runtimes unlink outer frames from beneath it when they pop, and a slice's
 // exports initialize first, before any frame of theirs is pushed.
 fun bootstrapLlvmEmitStaticGlobalRoots(
@@ -1406,6 +1407,9 @@ fun bootstrapLlvmEmitExportInitializer(
         val result = LLVMBuildAlloca(
             backend.builder, backend.valueType, "global.result"
         )
+        // Export-only entry needs its globals rooted during initialization too.
+        // The initialized flag above prevents recursive publication of this frame.
+        bootstrapLlvmEmitStaticGlobalRoots(backend, program)
         bootstrapLlvmCall(
             backend,
             LLVMGetNamedFunction(
@@ -1415,12 +1419,6 @@ fun bootstrapLlvmEmitExportInitializer(
              LLVMConstInt(backend.i64Type, 0, 0)],
             "", true, [false, false, false]
         )
-        // Exports can be the program's only entry: a Wasm module, a
-        // compile-time slice, or a native library a host loads without ever
-        // running `main` (an Android application library). Their globals
-        // must be collector roots from the first initialization; a program
-        // whose main also runs simply roots them twice.
-        bootstrapLlvmEmitStaticGlobalRoots(backend, program)
         LLVMBuildBr(backend.builder, done)
         LLVMPositionBuilderAtEnd(backend.builder, done)
         LLVMBuildRetVoid(backend.builder)
@@ -1846,6 +1844,23 @@ fun bootstrapLlvmEmitMain(
                 global = global + 1
             }
         }
+        // Publish the zero-initialized global slots before their initializers:
+        // a helper called during initialization can reach a collecting safe
+        // point or memoryCollect() while earlier globals already own heap data.
+        if (globalRootCount > 0) {
+            val rootsPointer = bootstrapLlvmArrayElement(
+                backend, globalRootsType, globalRoots, 0,
+                "global.gc.roots.pointer"
+            )
+            bootstrapLlvmCallNamed(
+                backend, "abla_runtime_roots_push",
+                [globalFrame, rootsPointer,
+                 LLVMConstInt(
+                    backend.i64Type, globalRootCount, 0
+                 )],
+                "", false, [false, false, false]
+            )
+        }
         val runtimeGlobals = bootstrapLlvmHasRuntimeGlobals(backend, program)
         if (globalsId >= 0 && exports.size == 0 && runtimeGlobals) {
             val globalResult = LLVMBuildAlloca(
@@ -1869,24 +1884,6 @@ fun bootstrapLlvmEmitMain(
                 "",
                 false,
                 []
-            )
-        }
-        // Global initialization may initialize the Abla-authored collector's
-        // own root-frame head. Publish global roots only after that bootstrap
-        // has completed; collection is deliberately suppressed inside the
-        // bootstrap function itself.
-        if (globalRootCount > 0) {
-            val rootsPointer = bootstrapLlvmArrayElement(
-                backend, globalRootsType, globalRoots, 0,
-                "global.gc.roots.pointer"
-            )
-            bootstrapLlvmCallNamed(
-                backend, "abla_runtime_roots_push",
-                [globalFrame, rootsPointer,
-                 LLVMConstInt(
-                    backend.i64Type, globalRootCount, 0
-                 )],
-                "", false, [false, false, false]
             )
         }
         val mainResult = LLVMBuildAlloca(
