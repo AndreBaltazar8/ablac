@@ -15,7 +15,7 @@ expected=$'inner 3\ndrop File 3\nwork 2 4\ndrop Files 4\ndrop Doc 2\ndrop A 1\nd
 [[ $output == "$expected" ]] || { echo "unexpected output:"; echo "$output"; exit 1; }
 echo "resource scope drops: every local's drop runs, short type names too"
 
-for fixture in discarded-if unchanged-if; do
+for fixture in discarded-if unchanged-if discarded-joins; do
     for profile in release fast; do
         flags=()
         [[ $profile != fast ]] || flags=(--fast)
@@ -47,4 +47,20 @@ for match in re.finditer(r'^define [^\n]+ #(\d+)[^\n]*\{\n.*?^\}', text, re.M | 
 else:
     raise AssertionError('missing scalar fixture')
 PY
+
+"$compiler" --emit-llvm "$project_root/tests/cases/bootstrap/discarded-joins.ab" \
+    > "$output_directory/discarded-joins.ll"
+python3 - "$output_directory/discarded-joins.ll" <<'PYGUARD'
+import re, sys
+text = open(sys.argv[1]).read()
+attrs = dict(re.findall(r'attributes #(\d+) = .*?"abla.source"="([^"]+)"', text))
+expected = {'discardedJoinIf', 'discardedJoinWhen'}
+for match in re.finditer(r'^define [^\n]+ #(\d+)[^\n]*\{\n.*?^\}', text, re.M | re.S):
+    name = attrs.get(match[1])
+    if name in expected:
+        assert len(re.findall(r'alloca %AblaValue\b', match[0])) <= 1, name
+        expected.remove(name)
+assert not expected, expected
+PYGUARD
+
 echo "discarded if: arm drops, loop control, refinements and affine joins are preserved"

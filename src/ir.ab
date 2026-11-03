@@ -5482,6 +5482,61 @@ class BootstrapLowerer(
         }
     }
 
+    // A discarded join can disappear only when every arm is known to return
+    // a plain value. A mismatched join can itself have type void, so inspect
+    // its arms rather than using that joined type as an ownership check.
+    fun discardedValueIsPlain(expression: BootstrapExpression): bool {
+        val kind = expression.kind
+        if (kind == "block") {
+            // This check runs before the arm's locals have been bound. Do not
+            // mistake a shadowed outer scalar for an inner resource value.
+            for (statement in expression.children) {
+                if (bootstrapStatementDeclaresLocal(statement)) return false
+            }
+            return expression.children.size == 0 || this.discardedValueIsPlain(
+                expression.children[expression.children.size - 1]
+            )
+        }
+        if (kind == "if") {
+            return this.discardedValueIsPlain(expression.children[1]) &&
+                (expression.children[2].kind == "missing" ||
+                 this.discardedValueIsPlain(expression.children[2]))
+        }
+        if (kind == "when") {
+            var branch = 2
+            while (branch < expression.children.size) {
+                // The tested type is installed only while lowering this arm.
+                if (expression.children[branch - 1].kind == "is") return false
+                if (!this.discardedValueIsPlain(expression.children[branch])) return false
+                branch = branch + 2
+            }
+            return true
+        }
+        if (kind == "assign" || kind == "local.val" || kind == "local.var") {
+            return expression.children.size == 1 &&
+                this.discardedValueIsPlain(expression.children[0])
+        }
+        if (kind == "member.assign" || kind == "delegate.assign") {
+            return expression.children.size == 2 &&
+                this.discardedValueIsPlain(expression.children[1])
+        }
+        if (kind == "index.assign") {
+            return expression.children.size == 3 &&
+                this.discardedValueIsPlain(expression.children[2])
+        }
+        if (kind == "compile" || kind == "region" || kind == "named.transfer" ||
+            kind == "delegate.initializer") {
+            return expression.children.size == 1 &&
+                this.discardedValueIsPlain(expression.children[0])
+        }
+        if (this.callHandsOnAssignment(expression)) return false
+        val type = this.lowerExpressionType(expression)
+        if (this.lowerTypeIsAffine(type)) return false
+        val runtime = this.lowerRuntimeType(type)
+        runtime == "void" || runtime == "never" || runtime == "string" ||
+            runtime == "null" || bootstrapScalarTypeUnderlyingValid(runtime)
+    }
+
     /** A call of a function without a result type whose body ends in an
      *  assignment: its value is the assigned place's, which keeps it. */
     fun callHandsOnAssignment(expression: BootstrapExpression): bool {
@@ -8287,7 +8342,7 @@ class BootstrapLowerer(
             result = this.emit("const.void", -1, -1, "")
         }
         if ((kindHead == 119 && kind == "when")) {
-            result = bootstrapLowerWhen(this, expression, result)
+            result = bootstrapLowerWhen(this, expression, result, valueRequired)
         }
         // Do not recompute the type of every lowered node here. Type lookup is
         // intentionally simple during bootstrap and scans declaration tables;
@@ -10097,6 +10152,10 @@ fun bootstrapLowerBlock(
         statement = statement + 1
     }
     if (result < 0) result = lowerer.emit("const.void", -1, -1, "")
+    if (!valueRequired && expression.children.size > 0 &&
+        lowerer.discardedValueIsPlain(expression.children[expression.children.size - 1])) {
+        result = lowerer.emit("const.void", -1, -1, "")
+    }
     lowerer.emitScopeDrops(lowerer.currentScope)
     lowerer.leaveLocalScope(previousScope)
     lowerer.implicitResults.truncate(handedOn)
@@ -11339,9 +11398,7 @@ fun bootstrapLowerIf(
     valueRequired: bool
 ): int {
     var result = initial
-    // Only statement-position conditionals with no else may omit the join.
-    // Their arm is still lowered and discarded exactly as before.
-    val joinValue = valueRequired || expression.children[2].kind != "missing"
+    val hasElse = expression.children[2].kind != "missing"
     // Reserve the result name before lowering the condition. The
     // condition may itself contain an if expression; deriving both
     // names from the unchanged nextLabel created duplicate locals and
@@ -11351,6 +11408,11 @@ fun bootstrapLowerIf(
     val zeroOpcode = bootstrapIrLocalZeroOpcode(lowerer.lowerRuntimeType(
         lowerer.lowerExpressionType(expression)
     ))
+    // Missing-else arms keep their existing discard/drop path. Explicit-else
+    // arms may omit their join only when neither arm can hand on a resource.
+    val joinValue = valueRequired || (hasElse &&
+        (!lowerer.discardedValueIsPlain(expression.children[1]) ||
+         !lowerer.discardedValueIsPlain(expression.children[2])))
     if (joinValue) lowerer.emitControl(zeroOpcode, -1, -1, -1, temporary)
     val condition = lowerer.lowerExpression(expression.children[0])
     val thenLabel = lowerer.allocateLabel()
@@ -11360,7 +11422,7 @@ fun bootstrapLowerIf(
     lowerer.emitControl("label", -1, thenLabel, -1, "")
     val previousThenScope = lowerer.enterLocalScope()
     lowerer.addNullableRefinements(expression.children[0], true)
-    val thenValue = lowerer.lowerExpression(expression.children[1])
+    val thenValue = lowerer.lowerExpression(expression.children[1], joinValue || !hasElse)
     // Without `else`, the branch's value is discarded.
     if (expression.children[2].kind == "missing") {
         lowerer.dropDiscarded(thenValue, expression.children[1])
@@ -11375,7 +11437,7 @@ fun bootstrapLowerIf(
     } else {
         val previousElseScope = lowerer.enterLocalScope()
         lowerer.addNullableRefinements(expression.children[0], false)
-        elseValue = lowerer.lowerExpression(expression.children[2])
+        elseValue = lowerer.lowerExpression(expression.children[2], joinValue)
         lowerer.leaveLocalScope(previousElseScope)
     }
     if (joinValue) lowerer.emitControl("local.set", elseValue, -1, -1, temporary)
@@ -11724,17 +11786,17 @@ fun bootstrapLowerFor(
 fun bootstrapLowerWhen(
     var lowerer: BootstrapLowerer,
     expression: BootstrapExpression,
-    initial: int
+    initial: int,
+    valueRequired: bool
 ): int {
     var result = initial
     val temporaryId = lowerer.allocateLabel()
     val temporary = "when_result_$temporaryId"
-    lowerer.emitControl(
-        bootstrapIrLocalZeroOpcode(lowerer.lowerRuntimeType(
-            lowerer.lowerExpressionType(expression)
-        )),
-        -1, -1, -1, temporary
-    )
+    val zeroOpcode = bootstrapIrLocalZeroOpcode(lowerer.lowerRuntimeType(
+        lowerer.lowerExpressionType(expression)
+    ))
+    val joinValue = valueRequired || !lowerer.discardedValueIsPlain(expression)
+    if (joinValue) lowerer.emitControl(zeroOpcode, -1, -1, -1, temporary)
     val subject = lowerer.lowerExpression(expression.children[0])
     val mergeLabel = lowerer.allocateLabel()
     // The arms after the one matching `null` see the subject not null.
@@ -11753,8 +11815,8 @@ fun bootstrapLowerWhen(
         val body = expression.children[branch + 1]
         if (match.kind == "missing") {
             hasElse = true
-            val bodyValue = lowerer.lowerExpression(body)
-            lowerer.emitControl(
+            val bodyValue = lowerer.lowerExpression(body, joinValue)
+            if (joinValue) lowerer.emitControl(
                 "local.set",
                 bodyValue,
                 -1,
@@ -11803,9 +11865,9 @@ fun bootstrapLowerWhen(
                     bootstrapNormalizeType(expression.children[firstMatch].text)
                 )
             }
-            val bodyValue = lowerer.lowerExpression(body)
+            val bodyValue = lowerer.lowerExpression(body, joinValue)
             if (tested) lowerer.leaveLocalScope(previousScope)
-            lowerer.emitControl(
+            if (joinValue) lowerer.emitControl(
                 "local.set",
                 bodyValue,
                 -1,
@@ -11822,7 +11884,8 @@ fun bootstrapLowerWhen(
         lowerer.emitControl("unreachable", -1, -1, -1, "")
     }
     lowerer.emitControl("label", -1, mergeLabel, -1, "")
-    result = lowerer.emit("local.load", -1, -1, temporary)
+    result = if (joinValue) lowerer.emit("local.load", -1, -1, temporary)
+        else lowerer.emit("const.void", -1, -1, "")
     result
 }
 
