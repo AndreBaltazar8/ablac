@@ -7022,6 +7022,31 @@ class BootstrapLocalIndex(
 
 fun bootstrapLocalIndex(): BootstrapLocalIndex = BootstrapLocalIndex(Map(), [], 0)
 
+// Named calls evaluate their arguments in a generated block. After that
+// scope has closed, trace its temporary places back to their initializers for
+// borrow provenance only; the actual call still evaluates each argument once.
+fun bootstrapNamedBorrowOriginal(
+    expression: BootstrapExpression,
+    statements: array<BootstrapExpression>,
+    limit: int
+): BootstrapExpression {
+    if (expression.kind == "identifier" && expression.text.startsWith("__abla_named_")) {
+        var index = limit - 1
+        while (index >= 0) {
+            val statement = statements[index]
+            if (statement.kind == "local.val" && statement.text == expression.text &&
+                statement.children.size > 0) {
+                return bootstrapNamedBorrowOriginal(statement.children[0], statements, index)
+            }
+            index = index - 1
+        }
+    }
+    val children: array<BootstrapExpression> = []
+    for (child in expression.children)
+        children.append(bootstrapNamedBorrowOriginal(child, statements, limit))
+    BootstrapExpression(expression.kind, expression.text, expression.begin, expression.end, children)
+}
+
 class BootstrapAnalyzer(
     val symbols: array<BootstrapSymbol>,
     var symbolSlots: array<int>,
@@ -10923,9 +10948,15 @@ class BootstrapAnalyzer(
             source = this.borrowExpressionSource(expression.children[0])
         }
         if (expression.kind == "block" && expression.children.size > 0) {
-            source = this.borrowExpressionSource(
-                expression.children[expression.children.size - 1]
-            )
+            val last = expression.children[expression.children.size - 1]
+            source = this.borrowExpressionSource(last)
+            if (source == "" && expression.children.size > 1 &&
+                expression.children[0].kind == "local.val" &&
+                expression.children[0].text.startsWith("__abla_named_") &&
+                (last.kind == "call" || last.kind == "member.call")) {
+                val original = bootstrapNamedBorrowOriginal(last, expression.children, expression.children.size - 1)
+                source = this.borrowExpressionSource(original)
+            }
         }
         if (expression.kind == "if" && expression.children.size > 2 &&
             expression.children[2].kind != "missing") {
