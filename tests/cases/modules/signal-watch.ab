@@ -1,0 +1,81 @@
+import "abla/process"
+import "abla/io"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+import "abla/sys/linux"
+
+var failures = 0
+fun check(ok: bool, label: string): void {
+    if (!ok) { eprintln("FAIL $label"); failures = failures + 1 }
+}
+fun changeMask(how: int, mask: int): void {
+    val value = nativeByteBuffer(8)
+    value.storeI64(0, mask)
+    linuxSyscall4(14, how, nativePointerAddress(value.address), 0, 8)
+    value.close()
+    return
+}
+fun currentMask(): int {
+    val value = nativeByteBuffer(8)
+    linuxSyscall4(14, 0, 0, nativePointerAddress(value.address), 8)
+    val result = value.loadI64(0)
+    value.close()
+    result
+}
+resource class Gate(var step: int)
+fun markReady(var gate: Gate): int { gate.step = 1; gate.step }
+fun markDone(var gate: Gate): int { gate.step = 2; gate.step }
+fun getStep(var gate: Gate): int = gate.step
+fun waitStep(gate: Mutex<Gate>, expected: int): bool {
+    var tries = 0
+    while (tries < 100000 && gate.with(getStep) < expected) {
+        linuxSyscall0(24) // sched_yield
+        tries = tries + 1
+    }
+    gate.with(getStep) >= expected
+}
+fun otherThread(gate: Mutex<Gate>, bit: int): int {
+    val before = currentMask()
+    val watch = watchSignals([signalTerminate])
+    gate.with(markReady)
+    val signalled = waitStep(gate, 2)
+    watch.close()
+    if (watch.started && signalled && (before & bit) != 0 && currentMask() == before) 1 else 0
+}
+fun main: int {
+    val interrupt = 1 << (signalInterrupt - 1)
+    val terminate = 1 << (signalTerminate - 1)
+    val hangup = 1 << (signalHangup - 1)
+    val original = currentMask()
+    changeMask(0, interrupt)
+    changeMask(1, terminate | hangup)
+    val baseline = currentMask()
+    val first = watchSignals([signalInterrupt, signalTerminate])
+    val second = watchSignals([signalInterrupt, signalHangup])
+    val third = watchSignals([signalTerminate])
+    check(first.started && second.started && third.started, "three watches started")
+    check((currentMask() & (interrupt | terminate | hangup)) == (interrupt | terminate | hangup), "all watched signals blocked")
+    first.close()
+    check((currentMask() & (interrupt | terminate | hangup)) == (interrupt | terminate | hangup), "out-of-order close retains overlaps")
+    first.close()
+    check((currentMask() & (interrupt | terminate | hangup)) == (interrupt | terminate | hangup), "close is idempotent")
+    third.close()
+    check((currentMask() & terminate) == 0, "last terminate watch restores its bit")
+    check((currentMask() & (interrupt | hangup)) == (interrupt | hangup), "other watch remains blocked")
+    val child = command("sh").argument("-c").argument("kill -HUP \$\$; exit 7").run()
+    check(child == 129, "child unblocks remaining watched signals")
+    second.close()
+    check(currentMask() == baseline, "final close preserves preblocked SIGINT")
+    val parentWatch = watchSignals([signalTerminate])
+    val gate = Mutex(Gate(0))
+    val childGate = gate.clone()
+    val worker = thread { otherThread(childGate, 1 << 14) }
+    val ready = waitStep(gate, 1)
+    parentWatch.close()
+    check(ready && currentMask() == baseline, "other thread's watch does not hold this thread's mask")
+    gate.with(markDone)
+    val workerOk = await worker
+    check(workerOk == 1, "worker restores its inherited signal mask")
+    changeMask(2, original)
+    if (failures == 0) 42 else 1
+}

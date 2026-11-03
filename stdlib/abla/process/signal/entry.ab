@@ -11,24 +11,50 @@ val signalHangup = 1
 val signalInterrupt = 2
 val signalTerminate = 15
 
-class SignalWatch(val descriptor: int, val started: bool)
+// A signal's first watch records its caller's bit; overlapping watches keep
+// it blocked until the last one closes, even if they close out of order.
+class SignalWatch(val descriptor: int, val started: bool, val mask: int = 0, var closed: bool = false)
 
 /** From here on these signals don't end the program: `received` says when one came. Children started after this get them as usual. */
 fun watchSignals(signals: array<int>): SignalWatch {
     var mask = 0
     for (signal in signals) mask = mask | (1 << (signal - 1))
-    linuxWatchedSignals.storeI64(0, mask)
-    linuxWatchingSignals = true
-    val address = nativePointerAddress(linuxWatchedSignals.address)
-    // rt_sigprocmask(SIG_BLOCK, ...), then signalfd4(-1, ..., SFD_CLOEXEC | SFD_NONBLOCK).
-    if (linuxSyscall4(14, 0, address, 0, 8) != 0) return SignalWatch(-1, false)
+    val requested = nativeByteBuffer(16)
+    requested.storeI64(0, mask)
+    val address = nativePointerAddress(requested.address)
+    // Block and save the prior mask before creating signalfd.
+    if (linuxSyscall4(14, 0, address, address + 8, 8) != 0) {
+        requested.close()
+        return SignalWatch(-1, false)
+    }
+    val previous = requested.loadI64(8)
     val descriptor = linuxSyscall4(289, -1, address, 8, 526336)
-    SignalWatch(descriptor, descriptor >= 0)
+    if (descriptor < 0) {
+        requested.storeI64(0, mask & ~previous)
+        linuxSyscall4(14, 1, address, 0, 8)
+        requested.close()
+        return SignalWatch(-1, false)
+    }
+    val active = linuxSignalWatchGet(0)
+    val first = mask & ~active
+    val original = linuxSignalWatchGet(8)
+    linuxSignalWatchSet(8, (original & ~first) | (previous & first))
+    var index = 0
+    while (index < 64) {
+        if ((mask & (1 << index)) != 0) {
+            val offset = 16 + index * 8
+            linuxSignalWatchSet(offset, linuxSignalWatchGet(offset) + 1)
+        }
+        index = index + 1
+    }
+    linuxSignalWatchSet(0, active | mask)
+    requested.close()
+    SignalWatch(descriptor, true, mask)
 }
 
 /** The next signal that came, waiting up to `timeoutMilliseconds` (-1: as long as it takes), or 0 if none did. */
 fun SignalWatch.received(timeoutMilliseconds: int = 0): int {
-    if (!this.started) return 0
+    if (!this.started || this.closed) return 0
     val poll = nativeByteBuffer(8)
     // A struct pollfd: the descriptor, then events = POLLIN.
     poll.storeI64(0, this.descriptor | (1 << 32))
@@ -61,8 +87,31 @@ fun Command.runWatching(watch: SignalWatch, graceMilliseconds: int = 5000): int 
 
 /** Back to how signals were: any still pending take effect as this returns. */
 fun SignalWatch.close(): void {
-    if (this.started) linuxSyscall1(3, this.descriptor)
-    linuxSyscall4(14, 1, nativePointerAddress(linuxWatchedSignals.address), 0, 8)
-    linuxWatchingSignals = false
+    if (!this.started || this.closed) return
+    this.closed = true
+    linuxSyscall1(3, this.descriptor)
+    var ended = 0
+    var index = 0
+    while (index < 64) {
+        val bit = 1 << index
+        if ((this.mask & bit) != 0) {
+            val offset = 16 + index * 8
+            val count = linuxSignalWatchGet(offset) - 1
+            linuxSignalWatchSet(offset, count)
+            if (count == 0) ended = ended | bit
+        }
+        index = index + 1
+    }
+    val active = linuxSignalWatchGet(0) & ~ended
+    linuxSignalWatchSet(0, active)
+    val restore = nativeByteBuffer(8)
+    val address = nativePointerAddress(restore.address)
+    val original = linuxSignalWatchGet(8)
+    restore.storeI64(0, ended & original)
+    linuxSyscall4(14, 0, address, 0, 8)
+    restore.storeI64(0, ended & ~original)
+    linuxSignalWatchSet(8, original & ~ended)
+    linuxSyscall4(14, 1, address, 0, 8)
+    restore.close()
     return
 }

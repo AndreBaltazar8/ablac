@@ -34,3 +34,20 @@ status=$?
 set -e
 [[ $status -eq 42 ]] || exit 1
 printf '%s\n' 'tools: command environment, directory, redirects; exclusive files, links, locks'
+
+for fixture in signal-watch signal-watch-failure; do
+    "$compiler" build "$project_root/tests/cases/modules/$fixture.ab" \
+        -o "$directory/$fixture"
+    set +e
+    if [[ $fixture == signal-watch-failure ]]; then
+        (ulimit -n 32; ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=15 \
+            "$project_root/tools/run-limited.sh" "$directory/$fixture")
+    else
+        ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=15 \
+            "$project_root/tools/run-limited.sh" "$directory/$fixture"
+    fi
+    status=$?
+    set -e
+    [[ $status -eq 42 ]] || exit 1
+done
+printf '%s\n' 'signal watches: restore preblocked masks and overlapping watches'

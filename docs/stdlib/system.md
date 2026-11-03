@@ -209,6 +209,9 @@ fun main: int {
 
 `received(timeoutMilliseconds)` gives the next signal or 0; -1 waits as long as it takes. It uses `signalfd`, so it is
 Linux only: elsewhere the watch's `started` is false and nothing is blocked.
+Closing a watch restores the calling thread's previously blocked signals. Overlapping watches may close in any order;
+each signal stays blocked until its last watch closes. Start and close each watch on the same thread. Watches for the
+same signal compete to receive it.
 
 ## Time: `abla/process/time`
 

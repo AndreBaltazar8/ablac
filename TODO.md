@@ -64,8 +64,6 @@
       on 2026-11-01, `~/.nix-profile/bin/git` was missing for a moment.
 - [ ] `kill -- -$session` doesn't reach a compiler started through `build/ablac`: `tools/run-limited.sh`'s `timeout` makes it a process
       group of its own. SIGTERM is forwarded; SIGKILL to the group leaves `ablac` running until its limit (2026-11-01).
-- [ ] `SignalWatch.close()` unblocks watched signals that were already blocked before `watchSignals()`, instead of restoring the
-      original mask. For example, start `tools/test-linux-process.sh`'s tool-support binary with SIGINT blocked in its parent.
 - [ ] `E_NAMED_ARGUMENT_HIDDEN` remains when a generic constructor also has a delegated property and an omitted default calls a
       constructor hidden by the caller, with no earlier argument giving the type. For example, with
       `class Tagged<T>(val n: int)`, `class Slot<T>(var value: T) { fun getValue(): T = value }`, and
