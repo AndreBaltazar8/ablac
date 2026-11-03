@@ -74,3 +74,16 @@ cmp -s "$hosted" "$output_directory/hosted.with-sidecar" ||
     fail "a failing build did not restore the executable"
 cmp -s "$hosted.o" "$output_directory/hosted.o.with-sidecar" ||
     fail "a failing build without the sidecar did not restore it"
+
+# An output in a directory that doesn't exist yet: the build makes it, with or
+# without the cache, before anything is written beside the output (a release
+# executable's optimized bitcode goes there before llc runs).
+case_number=0
+for flags in "--no-cache" "--no-cache --fast" ""; do
+    case_number=$((case_number + 1))
+    nested="$output_directory/missing-$case_number/nested/hosted"
+    # shellcheck disable=SC2086
+    "$compiler" build "$cases/hosted.ab" -o "$nested" $flags ||
+        fail "a build into a missing directory failed (${flags:-cached})"
+    [ -x "$nested" ] || fail "a build into a missing directory wrote no executable (${flags:-cached})"
+done

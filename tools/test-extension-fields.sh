@@ -8,6 +8,8 @@ compiler=${1:-build/ablac.bin}
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cases="$project_root/tests/cases/extension-fields"
 output_directory="$project_root/build/extension-fields"
+# Fresh, so `modules/main` below makes its own directory.
+rm -rf "$output_directory"
 mkdir -p "$output_directory"
 
 runs() { # $1 = case, $2 = expected output; $3 = ABLA_COMPILE_EVAL (optional)
