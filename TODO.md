@@ -27,7 +27,12 @@
 
 - [ ] Report a readable unsupported interpolation panic on WebAssembly when
   the module already imports the host write path, without adding imports to
-  hostless modules; these currently trap without a message.
+  hostless modules; these currently trap without a message. On 2026-11-03,
+  a writer-slot probe set from the generic syscall shim added `abla_host.write`
+  to clock-only modules. Setting it from the standard output writer instead
+  preserved clock-only and unused-output modules, but added `write` for a
+  reachable empty write where baseline has no imports, in both fast and
+  release builds. Neither was kept; preserve final import sets when revisiting.
 
 - [ ] Floats erased to `any` interpolate as integer bit patterns: native
   `text(1.5)` through `fun text(value: any): string = "$value"` prints
@@ -238,11 +243,14 @@ Package-side work (not changed from ablac):
 - [ ] **Run times of non-Linux hosted targets aren't measured with the new allocator and root frames.** macOS keeps
   its LTO link (`wholeProgram` is ELF only) and has not been built or run with these changes; Wasm passes the suite,
   its size and speed not compared. An earlier try at size lists on Darwin gained no cycles and raised peak memory.
-- [ ] **The strict-imports check scans every standard-library module on every build.** The
-  standard library is strict, so each build re-checks each of its modules (identifiers against
-  every module's declarations) with the same result; LBR sampling put it near 7% of
-  json-readers' frontend (2026-11-02). It now shares the build's tokens. Its cost wasn't
-  measured cleanly: a `--fast` compiler's numbers moved 25% between runs of the same binary.
+- [ ] **Strict-imports rechecks loaded standard-library modules on every build.** On 2026-11-03,
+  the entire validation cost 41.46M instructions (2.27% of a fib `--fast` build) and
+  104.59M (0.56% of a NovaKind tool build); the library-only saving is smaller. Not pursued.
+  Narrowing the scan can change diagnostics: it uses all loaded declarations, class members,
+  visibility and module order. A safe cache must account for compiler/checker version, all
+  ordered module contents, aliases and import/export edges, manifests, target and report mode;
+  alternatively cache immutable per-module summaries and recompute against the complete graph.
+  Test diagnostics and visibility reports across edits, collisions, alias and target changes.
 - [ ] **`abla-compare`'s server builds only a few percent faster than on v0.2.31** (3.9 to 3.8 s,
   2026-11-02): its frontend is about 1.7 s of it and its O2 1.8 s, and neither shrank much.
   On 2026-11-03 its build ran 15% fewer instructions (frontend 6 to 10%, opt and llc 14%).
