@@ -1252,3 +1252,43 @@ stress, checked exports, TLS and the new function-identity regressions. The
 first cold-worktree run passed 256 commands and hit the existing TODO's
 `fs-read 1` fixture: compiling creates `build/` after its directory snapshot.
 The focused retry and the complete warm-directory rerun pass unchanged.
+
+## ASCII comparisons in request handling (2026-11-03)
+
+On master 9c82c5d5, abla-compare's `parameters` profile spends 5% of its user
+cycles in case-insensitive header comparisons. The comparison fetched both
+string-data pointers before checking lengths. It now rejects different lengths
+and accepts two empty strings first. Identical bytes match directly; unequal
+bytes match only when their XOR is 32 and the lowercased byte is `a` through `z`.
+This preserves exact-byte matching for punctuation and non-ASCII bytes while
+avoiding two uppercase-range tests per byte. Tail-first mismatch rejection stays.
+
+Two independent nine-workload comparisons, alternating release servers on CPU8:
+
+| Workload | Instructions/request, first | Instructions/request, repeat |
+|---|---:|---:|
+| plaintext | -6.34% | -5.79% |
+| parameters | -4.92% | -3.61% |
+| context | -3.36% | -4.10% |
+| body-16k | -0.03% | -0.03% |
+| headers-32 | -10.84% | -11.21% |
+| route-fanout-1024 | -4.01% | -3.85% |
+| query-32-named | -2.06% | -1.52% |
+| json-nested | -1.38% | -1.73% |
+| json-items-128 | -0.23% | -0.24% |
+| geomean | -3.74% | -3.62% |
+
+Cycle geomeans are -5.36% and -3.37%, with individual workloads moving under
+machine load. The higher-request repeat's resident peaks stay within 1% of the
+baseline. All eleven standalone run benchmarks are instruction-neutral, with
+unchanged JSON peak memory; thirteen stripped sizes move -0.009% geomean.
+The regression checks all 65,536 byte pairs against ASCII A-Z folding, plus
+embedded-byte and punctuation cases. Text and buffer fixtures pass GC stress.
+
+Other screens from these profiles were dropped or held. Packed two/four-byte
+sequence comparisons increased parameters instructions 1.8%; an aligned
+word-at-a-time first-byte search gave back the header savings on short lines.
+Separating ByteBuffer's stage-reservation success path from growth helped JSON
+and websocket-codec, but changed inlining elsewhere: its combined server gain
+was 3.52%, below the selected comparison change's 3.74%. Its prototype and raw
+profiles remain in worktrees/ablac-server-runtime/build/server-lab.
