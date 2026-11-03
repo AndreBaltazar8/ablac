@@ -1200,3 +1200,44 @@ raw columns measured the same in release builds and 5-7% faster per tick in
 development builds; its server's instances (8% of its heap under load) shrink
 about 3.4 times; a compiled program's class descriptors add about 60 bytes of
 constant data per class.
+
+## Share failed-allocation reporting (2026-11-03)
+
+On top of `compiler-perf-3` `1492df3f` (including the correction that prevents
+inlining Abla main into the minimum-size C wrapper), `HostOutOfMemory` is
+explicitly `@noinline`. Its diagnostic and recursive-failure guard are shared
+between the allocator's checks. They execute only after a system allocation
+fails. No new `optsize` or `minsize` policy applies to normal execution.
+
+Across all thirteen programs this removes 432 to 672 bytes each: 1.90% smaller
+than the parent, and **11.35% smaller than master `753d1d10`**. Fib is 12,016
+bytes, matrix 38,488 and json-megabyte 211,816. The full master comparison
+(one build, three interleaved run rounds, pinned CPU 8) gives 21.1% fewer build
+instructions, 11.3% fewer run instructions, 9.1% fewer minimum run cycles and
+5.1% fewer median run cycles. Every run benchmark remains at or below master
+in instructions.
+
+A separate seven-round comparison used identical source and sysroot paths.
+The normalized hot-function assembly for sieve, nbody, matrix and dispatch is
+unchanged. Their minimum-cycle changes are -1.9%, +0.8%, -1.2% and -2.1%;
+medians are +1.1%, +0.1%, -0.6% and +2.6%. An earlier matrix cycle penalty did
+not repeat. The server shrinks by 960 bytes (259,016 to 258,056). An initial
+blocked comparison flagged body-16k +10.6% cycles; alternating the two servers
+on CPU 8 instead gives -0.8%. Repeated paired context and route-fanout runs
+(100,000 requests, five rounds) give -0.5% and -2.4% cycles, respectively.
+Incremental request instructions move by a few tenths of a percent.
+
+A fresh master server built from the same project gives all nine workloads
+lower instructions per request: geometric mean -3.47% (20,000 requests,
+three rounds), and -7.19% cycles overall. Body-16k's blocked master comparison
+is +1.6% cycles; the paired parent comparison above is -0.8%, so that single
+cycle delta is not evidence of a changed byte loop. Master strips to 290,000
+bytes versus 258,056 for the candidate (-11.0%).
+
+A compiler built from this worktree passes all **257 `make test` commands**
+in 334 seconds (16 jobs, P-core affinity, runtime parent soft stack 8 MiB).
+This includes `ablac test`, its bundled mode, runtime/debug failures, GC
+stress, checked exports, TLS and the new function-identity regressions. The
+first cold-worktree run passed 256 commands and hit the existing TODO's
+`fs-read 1` fixture: compiling creates `build/` after its directory snapshot.
+The focused retry and the complete warm-directory rerun pass unchanged.
