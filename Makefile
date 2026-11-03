@@ -133,6 +133,7 @@ test-serial: ablac
 	tools/test-array-filled.sh $(COMPILER)
 	tools/test-inferred-command.sh $(COMPILER)
 	tools/test-borrow-chain-scaling.sh $(COMPILER)
+	tools/test-builder-chain.sh $(COMPILER)
 	tools/test-memory-checkpoint.sh $(COMPILER)
 	tools/test-memory-drop-root.sh $(COMPILER)
 	tools/test-collection-modes.sh $(COMPILER)

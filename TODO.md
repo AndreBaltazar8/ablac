@@ -84,9 +84,6 @@
 
 - [ ] No pipeline: a `Command`'s standard output can go to a file or to this program, not to another command, so
       `git archive | tar` goes through a temporary file. `capture` doesn't take standard error either (only `errors(file)`).
-- [ ] A builder can't be chained on a named value: with `val run = command("x")`, `run.environment("A", "1").environment("B", "2")`
-      is `ownership.borrow-exclusive:Command.environment`, though the same chain straight off `command("x")` compiles. Any method
-      returning `this` has this, and a function taking one needs `var run: Command`. Each call has to be its own statement.
 - [ ] Missing and written by hand in every tool: parsing an int from text (`abla-postgres` `pgInt`, `abla-s3` `s3ParseInt`,
       `oneParseInt`, NovaKind's `toolInteger`), `array<string>.join`, `array.removeLast`, a UUID, multi-line string literals (`"""`
       doesn't parse), `Path.home`, a `createDirectories` with a mode (`Path.writeText` is always 0666 less umask).

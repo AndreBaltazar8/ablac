@@ -9933,6 +9933,16 @@ class BootstrapAnalyzer(
         returnsReceiver
     }
 
+    fun explicitReturnsAreReceiver(expression: BootstrapExpression): bool {
+        if (expression.kind == "lambda" || expression.kind == "lambda.move") return true
+        if (expression.kind == "return") return this.expressionReturnsReceiver(expression)
+        var valid = true
+        for (child in expression.children) {
+            if (!this.explicitReturnsAreReceiver(child)) valid = false
+        }
+        valid
+    }
+
     fun validateMutableBorrowArgument(
         expression: BootstrapExpression,
         expected: string,
@@ -9965,6 +9975,10 @@ class BootstrapAnalyzer(
             )) {
             valid = true
         }
+        if (!valid && this.isExclusiveReceiverChain(expression)) {
+            this.validateMutableBorrowArgument(expression.children[0], expected, context)
+            valid = true
+        }
         if (!valid && expression.kind == "member.call" &&
             this.memberCallProducesFreshManagedReference(
                 expression,
@@ -9972,6 +9986,24 @@ class BootstrapAnalyzer(
             )) valid = true
         if (!this.typeIsBorrowTracked(expected)) valid = false
         if (!valid) this.fail("ownership.mutable-borrow:$context")
+    }
+
+    // A mutable call returning its receiver lends the same exclusive place to
+    // the immediately enclosing call. A saved borrow is not such a temporary.
+    fun isExclusiveReceiverChain(expression: BootstrapExpression): bool {
+        if (expression.kind != "member.call" || expression.children.size == 0) return false
+        val receiver = bootstrapBorrowElementType(this.ownershipExpressionType(expression.children[0]))
+        val entry = this.methodDeclarations.find(receiver, expression.text)
+        entry >= 0 && this.methodReceiverKind(receiver, expression.text) == "var" &&
+            this.borrowCallResultSource(receiver, expression.text) == "this" &&
+            this.expressionReturnsReceiver(this.methodDeclarations.declarations[entry].expression) &&
+            this.explicitReturnsAreReceiver(this.methodDeclarations.declarations[entry].expression)
+    }
+
+    fun exclusiveChainSource(expression: BootstrapExpression): string {
+        if (this.isExclusiveReceiverChain(expression))
+            this.exclusiveChainSource(expression.children[0])
+        else this.borrowArgumentSource(expression)
     }
 
     /** Whether the local `name` is a loop element of a shared parameter. */
@@ -10443,13 +10475,17 @@ class BootstrapAnalyzer(
                         val borrowSource = this.borrowExpressionSource(
                             arguments[borrowed]
                         )
-                        val exclusivePlace = bootstrapOwnershipPlaceKey(
+                        var exclusivePlace = bootstrapOwnershipPlaceKey(
                             arguments[exclusive]
                         )
+                        if (exclusivePlace == "" && this.isExclusiveReceiverChain(arguments[exclusive]))
+                            exclusivePlace = this.exclusiveChainSource(arguments[exclusive])
+                        val borrowedPlace = bootstrapOwnershipPlaceKey(arguments[borrowed])
                         if (bootstrapOwnershipPlaceKeysConflict(
                             borrowSource,
                             exclusivePlace
                         )) aliases = true
+                        if (bootstrapOwnershipPlaceKeysConflict(borrowedPlace, exclusivePlace)) aliases = true
                     }
                     if (aliases) {
                         if (owning) {
@@ -14464,7 +14500,8 @@ fun bootstrapInferMemberCall(
             expression.text
         )
         if (receiverKind == "var") {
-            if (bootstrapIsBorrowType(rawReceiver)) {
+            if (bootstrapIsBorrowType(rawReceiver) &&
+                !analyzer.isExclusiveReceiverChain(expression.children[0])) {
                 analyzer.fail(
                     "ownership.borrow-exclusive:${receiver}.${expression.text}"
                 )
