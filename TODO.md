@@ -17,6 +17,14 @@
 
 ## Bugs seen
 
+- [ ] Additional `--fast` ELF sections: LLVM's in-process C API ignores
+  `--function-sections`/`--data-sections` set through its command-line parser.
+  A manual section screen moved relocated constants out of RELRO and is unsafe.
+  Paired one-core builds changed fib 128,696 to 98,984 bytes (2.277 to 2.286
+  billion instructions), JSON readers 494,952 to 467,536 (7.451 to 7.485
+  billion), and NovaKind's tool 2,674,576 to 2,824,680 (31.794 to 32.779
+  billion). Revisit only with LLVM-correct relocation and section rules.
+
 - [ ] Report a readable unsupported interpolation panic on WebAssembly when
   the module already imports the host write path, without adding imports to
   hostless modules; these currently trap without a message.

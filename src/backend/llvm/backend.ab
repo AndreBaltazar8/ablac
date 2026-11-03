@@ -343,18 +343,8 @@ fun bootstrapEmitLlvmProgram(
     bootstrapLlvmTraceMemory("functions.end:errors=$errors")
     bootstrapLlvmStackClosureSitesAll = []
     bootstrapLlvmStackClosureFlags = bootstrapLlvmNoStackClosures
-    index = 0
-    while (index < program.functions.size) {
-        if (emittedFunctions[index]) {
-            bootstrapLlvmEmitGeneratedWrapper(
-                backend, program.functions[index], identities.symbols[index]
-            )
-        }
-        index = index + 1
-    }
     bootstrapLlvmEmitGeneratorSteps(backend, program, identities, emittedFunctions)
     bootstrapLlvmDefineStmInvoke(backend)
-    bootstrapLlvmTraceMemory("wrappers.end")
     index = 0
     while (index < program.functions.size) {
         if (index < interruptHandlerRoots.size &&
@@ -423,6 +413,11 @@ fun bootstrapEmitLlvmProgram(
     // an instruction that could not be lowered has no value, so passes over
     // its users (and the verifier) would read a null operand. Skip them.
     if (errors == 0) {
+        bootstrapLlvmMaterializeUsedWrappers(
+            backend, program, identities, emittedFunctions,
+            bootstrapLlvmInlineAssembly.size > 0
+        )
+        bootstrapLlvmTraceMemory("wrappers.end")
         bootstrapLlvmBridgeValuesByPointer(backend, program)
         bootstrapLlvmEmitStackGuardHandler(backend)
         bootstrapLlvmEmitDebugRuntime(backend)
@@ -460,6 +455,59 @@ fun bootstrapEmitLlvmProgram(
     BootstrapLlvmEmission(
         output, errors, bootstrapLlvmExportAbi(exports)
     )
+}
+
+// Function declarations are placeholders requested by address-taking code,
+// dispatchers, globals and exports. Materialize their boxed entry points only
+// after all those users have been emitted. A wrapper can itself refer to
+// another wrapper, so keep looking until no new use appears. LLVM cannot see
+// symbol references inside inline assembly; conservatively keep all in that
+// case. Delete unused placeholders only after reaching the fixed point.
+fun bootstrapLlvmMaterializeUsedWrappers(
+    backend: BootstrapLlvmBackend,
+    program: BootstrapIrProgram,
+    identities: BootstrapLlvmFunctionIdentities,
+    emitted: array<bool>,
+    retainAssembly: bool
+): void {
+    val materialized: array<bool> = []
+    var index = 0
+    while (index < program.functions.size) {
+        materialized.append(false)
+        index = index + 1
+    }
+    var changed = true
+    while (changed) {
+        changed = false
+        index = 0
+        while (index < program.functions.size) {
+            if (emitted[index] && !materialized[index]) {
+                val wrapper = LLVMGetNamedFunction(
+                    backend.module, identities.symbols[index]
+                )
+                if (!pointerIsNull(wrapper) &&
+                    (retainAssembly || !pointerIsNull(LLVMGetFirstUse(wrapper)))) {
+                    materialized[index] = true
+                    bootstrapLlvmEmitGeneratedWrapper(
+                        backend, program.functions[index], identities.symbols[index]
+                    )
+                    changed = true
+                }
+            }
+            index = index + 1
+        }
+    }
+    index = 0
+    while (index < program.functions.size) {
+        if (emitted[index] && !materialized[index]) {
+            val wrapper = LLVMGetNamedFunction(
+                backend.module, identities.symbols[index]
+            )
+            if (!pointerIsNull(wrapper)) LLVMDeleteFunction(wrapper)
+        }
+        index = index + 1
+    }
+    return
 }
 
 /** The rewrites between the parse and the analysis, in order: receiver
