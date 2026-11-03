@@ -40,7 +40,9 @@ $(COMPILER_PAYLOAD): $(COMPILER_SOURCES) tools/build-self-hosted-release.sh \
 	@if test ! -x $@; then tools/bootstrap-compiler.sh $@; fi
 	$(install_launcher)
 	tools/build-self-hosted-current.sh $@ $(BUILD_DIR)/.ablac-next $(COMPILER_ENTRY)
-	mv -f $(BUILD_DIR)/.ablac-next.ll $(BUILD_DIR)/ablac.ll
+	@if test -s $(BUILD_DIR)/.ablac-next.ll; then \
+		mv -f $(BUILD_DIR)/.ablac-next.ll $(BUILD_DIR)/ablac.ll; \
+	else rm -f $(BUILD_DIR)/ablac.ll; fi
 	mv -f $(BUILD_DIR)/.ablac-next $@
 
 $(COMPILER): $(COMPILER_PAYLOAD) tools/run-limited-compiler.sh
@@ -339,6 +341,7 @@ test-serial: ablac
 	tools/test-bootstrap-untyped-objects.sh $(COMPILER)
 	tools/test-codegen-units.sh $(COMPILER)
 	tools/test-codegen-cache.sh $(COMPILER)
+	tools/test-compiler-bitcode.sh $(COMPILER)
 
 check: test-full self-rebuild
 

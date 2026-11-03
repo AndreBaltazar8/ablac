@@ -19,7 +19,6 @@ ABLA_FINAL_SELFHOST_EMIT_MEMORY_MB=$final_emit_memory_mb \
     "$compiler" "$output" "$entry" || exit 1
 
 [[ -s $output ]] || exit 1
-[[ -s $output.ll ]] || exit 1
 # Runtime code is emitted from Abla source into the compiler module itself.
 # `defines <file> <symbol>`: the file defines the text symbol (with or without
 # Mach-O's leading underscore; ELF lists a hidden one as local).
@@ -53,14 +52,20 @@ fi
 # directly instead of redundantly emitting the complete compiler graph twice.
 # Installed/bootstrap compilers may not retain their module, so keep one
 # bounded generation-one emission as a fallback.
-if [[ -s $compiler_ir ]]; then
+if [[ -s $compiler_ir && -s $output.ll ]]; then
     cp -- "$compiler_ir" "$reference_ir" || exit 1
+    cp -- "$output.ll" "$self_ir" || exit 1
 else
+    # A release build can hand bitcode straight to opt. Explicit emission is
+    # unpruned diagnostic IR: emit both generations so the comparison uses
+    # the same representation even if only one build kept its text.
     ABLA_MAX_MEMORY_MB=$final_emit_memory_mb ABLA_MAX_SECONDS=300 \
         "$project_root/tools/run-limited.sh" \
         "$compiler" --emit-llvm "$entry" > "$reference_ir" || exit 1
+    ABLA_MAX_MEMORY_MB=$final_emit_memory_mb ABLA_MAX_SECONDS=300 \
+        "$project_root/tools/run-limited.sh" \
+        "$output" --emit-llvm "$entry" > "$self_ir" || exit 1
 fi
-cp -- "$output.ll" "$self_ir" || exit 1
 cmp "$reference_ir" "$self_ir" || exit 1
 
 if [[ $(uname -s) == Darwin ]]; then

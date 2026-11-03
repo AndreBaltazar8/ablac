@@ -33,4 +33,4 @@ ABLA_COMPILER_PAYLOAD=$compiler \
     ABLA_MAX_MEMORY_MB=$build_memory_mb ABLA_MAX_SECONDS=$build_seconds \
     "$project_root/tools/run-limited-compiler.sh" build "$entry" -o "$output" --no-cache
 
-[[ -x $output && -s $output.ll ]] || exit 1
+[[ -x $output ]] || exit 1
