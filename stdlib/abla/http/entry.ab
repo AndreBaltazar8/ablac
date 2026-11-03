@@ -28,7 +28,9 @@ class HttpResponse(
 // the same callback without changing request, response, or client code.
 class HttpTransportResult(
     val bytes: string,
-    val succeeded: bool
+    val succeeded: bool,
+    // A custom transport returns a complete exchange unless it says otherwise.
+    val eof: bool = true
 )
 
 class HttpClientResult(
@@ -603,7 +605,9 @@ fun HttpResponse.header(name: string): string {
 
 fun httpParseResponseBounded(
     input: string,
-    maximumBodyBytes: int
+    maximumBodyBytes: int,
+    responseToHead: bool = false,
+    eof: bool = true
 ): HttpClientResult {
     val statusLineEnd = httpLineEnd(input, 0)
     val firstSpace = httpFindByte(input, 32, 0, statusLineEnd)
@@ -648,21 +652,23 @@ fun httpParseResponseBounded(
     if (bodyBegin <= input.size) body = input.slice(bodyBegin, input.size)
     val provisional = HttpResponse(status, headers, body)
     val encodedLength = provisional.header("Content-Length")
-    val chunked = httpCoreHeaderTokenContains(
-        provisional.header("Transfer-Encoding"), "chunked"
-    )
+    val transferEncoding = provisional.header("Transfer-Encoding")
+    val chunked = httpCoreHeaderTokenContains(transferEncoding, "chunked")
     var complete = status >= 100 && bodyBegin <= input.size
-    if (chunked) {
+    val noBody = responseToHead || (status >= 100 && status < 200) ||
+        status == 204 || status == 304
+    if (noBody) body = ""
+    else if (chunked) {
         val decoded = httpCoreDecodeChunked(body, maximumBodyBytes)
         complete = complete && decoded.complete && decoded.valid
         body = decoded.body
-    } else if (encodedLength != "") {
+    } else if (transferEncoding == "" && encodedLength != "") {
         val expected = httpDecimalLength(encodedLength, maximumBodyBytes)
         complete = complete && expected >= 0 && body.size >= expected
         if (expected >= 0 && body.size > expected) {
             body = body.slice(0, expected)
         }
-    }
+    } else complete = complete && eof && body.size <= maximumBodyBytes
     HttpClientResult(
         HttpResponse(status, headers, body),
         status >= 100,
@@ -672,6 +678,10 @@ fun httpParseResponseBounded(
 
 fun httpParseResponse(input: string): HttpClientResult =
     httpParseResponseBounded(input, 1048576)
+
+// The transport receives a rendered request; HEAD responses end at headers.
+fun httpRequestIsHead(request: string): bool =
+    request.size >= 5 && request.slice(0, 5) == "HEAD "
 
 fun httpClient(
     authority: string,
@@ -730,22 +740,27 @@ private fun httpExchangeIpv4(
     }
     var response = ""
     var reading = succeeded
-    while (reading && response.size < maximumResponseBytes) {
+    var eof = false
+    while (reading && response.size <= maximumResponseBytes) {
         val remaining = maximumResponseBytes - response.size
-        val readMaximum = if (remaining < 65536) remaining else 65536
+        // At the limit, one byte distinguishes EOF from an oversized response.
+        val readMaximum = if (remaining == 0) 1 else if (remaining < 65536) remaining else 65536
         val wait = httpExchangeWait(deadline, timeoutMilliseconds)
         succeeded = wait > 0 && (deadline == 0 || connection.setTimeouts(wait, wait))
         reading = succeeded
         if (reading) {
-            val chunk = connection.read(readMaximum)
-            if (chunk.size > 0) response = "$response$chunk"
-            if (chunk.size == 0) reading = false
+            val read = connection.readResult(readMaximum)
+            if (read.status == "error") { succeeded = false; reading = false }
+            else if (read.status == "eof") { eof = true; reading = false }
+            else if (read.bytes.size > remaining) { succeeded = false; reading = false }
+            else response = "$response${read.bytes}"
             // A peer that keeps the connection open has finished at its own framing.
-            if (httpParseResponse(response).complete) reading = false
+            if (httpParseResponseBounded(response, maximumResponseBytes,
+                httpRequestIsHead(request), false).complete) reading = false
         }
     }
     if (connection.descriptor >= 0) connection.close()
-    HttpTransportResult(response, succeeded)
+    HttpTransportResult(response, succeeded, eof)
 }
 
 fun httpIpv4Client(
@@ -775,7 +790,7 @@ fun HttpClient.send(request: HttpRequest): HttpClientResult {
     )
     var result = HttpClientResult(HttpResponse(0, [], ""), false, false)
     if (exchanged.succeeded) result = httpParseResponseBounded(
-        exchanged.bytes, this.maximumResponseBytes
+        exchanged.bytes, this.maximumResponseBytes, request.method == "HEAD", exchanged.eof
     )
     result
 }

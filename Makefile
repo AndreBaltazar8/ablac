@@ -254,6 +254,7 @@ test-serial: ablac
 	tools/test-global-array-mutation.sh $(COMPILER)
 	tools/test-global-init-order.sh $(COMPILER)
 	tools/test-http-client.sh $(COMPILER)
+	tools/test-http-close-delimited.sh $(COMPILER)
 	tools/test-tls-faults.sh $(COMPILER)
 	tools/test-crypto.sh $(COMPILER)
 	tools/test-crypto-pure.sh $(COMPILER)
