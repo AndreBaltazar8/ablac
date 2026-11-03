@@ -1889,15 +1889,25 @@ trusted fun bootstrapWriteReleaseParts(module: i64*, optimizedPath: string, part
 
 // Runs llc on each part at once (at most a core each), then joins their objects into
 // `objectPath` (`ld.lld -r`) for the link and the cache, which keep one object.
-fun bootstrapEmitReleaseParts(optimizedPath: string, parts: int, objectPath: string): int {
-    val jobs = bootstrapCodegenJobs(parts + 1)
+fun bootstrapEmitReleaseParts(optimizedPath: string, parts: int, objectPath: string, compilerParts: bool = false): int {
+    var jobs = if (compilerParts) bootstrapNativeParallelism() else bootstrapCodegenJobs(parts + 1)
+    if (compilerParts) {
+        // Bound resident LLVM contexts even when ABLA_NATIVE_JOBS asks for
+        // more. nproc honors the process's CPU affinity; macOS uses sysctl.
+        val cores = bootstrapCodegenHostCores()
+        if (jobs > cores) jobs = cores
+        if (jobs > parts) jobs = parts
+        if (jobs < 1) jobs = 1
+    }
     var status = 0
     val running: array<int> = []
     var next = 0
     var active = 0
     while (next <= parts || active > 0) {
         while (status == 0 && next <= parts && active < jobs) {
-            val process = bootstrapStartPartObject("$optimizedPath.$next", "$objectPath.$next")
+            val process = if (compilerParts)
+                bootstrapStartCompilerPart(optimizedPath, "$objectPath.$next", next)
+                else bootstrapStartPartObject("$optimizedPath.$next", "$objectPath.$next")
             if (process <= 0) status = 127
             else {
                 running.append(process)
@@ -1925,6 +1935,7 @@ fun bootstrapEmitReleaseParts(optimizedPath: string, parts: int, objectPath: str
     if (status == 0) {
         val join = linuxCommand("ld.lld")
         join.argument("-r")
+        if (compilerParts) join.argument("--threads=1")
         join.argument("-o")
         join.argument(objectPath)
         for (unit in 0..parts) join.argument("$objectPath.$unit")
@@ -1934,7 +1945,98 @@ fun bootstrapEmitReleaseParts(optimizedPath: string, parts: int, objectPath: str
         Path("$optimizedPath.$unit").remove()
         Path("$objectPath.$unit").remove()
     }
+    if (compilerParts) {
+        Path(optimizedPath).remove()
+        Path("$optimizedPath.plan").remove()
+    }
     status
+}
+
+noescape extern:"c" fun LLVMParseBitcodeInContext2(context: i64*, buffer: i64*, module: i64*): i32
+
+// External O1 still prepares the compiler in a fresh process. Read its bitcode
+// once to balance functions by instruction count. The shared bitcode stays
+// unchanged: each worker promotes the same local names before stripping, so
+// planning needs neither serial clones nor another whole-module bitcode write.
+trusted fun bootstrapPrepareCompilerParts(inputPath: string, parts: int): int {
+    if (parts <= 0 || parts > 256) return 2
+    val buffer = nativePointerCell(nativeNullPointer())
+    val message = nativePointerCell(nativeNullPointer())
+    val module = nativePointerCell(nativeNullPointer())
+    val context = LLVMContextCreate()
+    LLVMContextSetDiscardValueNames(context, 1)
+    var status = 0
+    if (LLVMCreateMemoryBufferWithContentsOfFile(inputPath, buffer.address, message.address) != 0) status = 145
+    if (status == 0 && LLVMParseBitcodeInContext2(context, buffer.load(), module.address) != 0) status = 145
+    if (status == 0) {
+        val plan = byteBuffer()
+        for (unit in bootstrapReleasePartPlan(module.load(), parts)) {
+            plan.appendInt(unit)
+            plan.appendText("\n")
+        }
+        if (!Path("$inputPath.plan").writeText(plan.toText())) status = 164
+    }
+    if (!pointerIsNull(module.load())) LLVMDisposeModule(module.load())
+    if (!pointerIsNull(buffer.load())) LLVMDisposeMemoryBuffer(buffer.load())
+    LLVMContextDispose(context)
+    if (!pointerIsNull(message.load())) LLVMDisposeMessage(message.load())
+    buffer.close()
+    message.close()
+    module.close()
+    bootstrapCollectAndRelease()
+    status
+}
+
+// The shared bitcode is lazy: declaring other units' functions does not
+// materialize their bodies. Link the kept unit into a fresh module, write its
+// small bitcode, then use the existing O2 plus native codegen entry point.
+trusted fun bootstrapEmitCompilerPart(
+    inputPath: string, outputPath: string, planPath: string, index: int
+): int {
+    val buffer = nativePointerCell(nativeNullPointer())
+    val message = nativePointerCell(nativeNullPointer())
+    val lazy = nativePointerCell(nativeNullPointer())
+    val context = LLVMContextCreate()
+    LLVMContextSetDiscardValueNames(context, 1)
+    var status = if (index < 0) 2 else 0
+    if (status == 0 && LLVMCreateMemoryBufferWithContentsOfFile(inputPath, buffer.address, message.address) != 0) status = 145
+    if (status == 0 && LLVMGetBitcodeModuleInContext2(context, buffer.load(), lazy.address) != 0) {
+        LLVMDisposeMemoryBuffer(buffer.load())
+        status = 145
+    }
+    var module = nativeNullPointer()
+    if (status == 0) bootstrapCodegenUnitPromote(lazy.load(), false)
+    if (status == 0 && !bootstrapCodegenUnitStrip(lazy.load(), bootstrapReadCodegenUnitPlan(planPath), index)) {
+        LLVMDisposeModule(lazy.load())
+        status = 2
+    }
+    if (status == 0) {
+        module = LLVMModuleCreateWithNameInContext("unit", context)
+        if (LLVMLinkModules2(module, lazy.load()) != 0) status = 145
+    }
+    val partPath = "$outputPath.bc"
+    if (status == 0 && LLVMWriteBitcodeToFile(module, partPath) != 0) status = 164
+    if (!pointerIsNull(module)) LLVMDisposeModule(module)
+    LLVMContextDispose(context)
+    if (!pointerIsNull(message.load())) LLVMDisposeMessage(message.load())
+    buffer.close()
+    message.close()
+    lazy.close()
+    bootstrapCollectAndRelease()
+    if (status == 0) status = llvmAotEmitObjectFile(partPath, outputPath)
+    Path(partPath).remove()
+    status
+}
+
+// The LLVM-linked compiler's existing O2 plus codegen child.
+fun bootstrapStartCompilerPart(inputPath: string, outputPath: string, index: int): int {
+    val child = linuxCommand("/proc/self/exe")
+    child.argument("--aot-object")
+    child.argument(inputPath)
+    child.argument(outputPath)
+    child.argument("$inputPath.plan")
+    child.argument("$index")
+    child.start().process
 }
 
 // Starts bootstrapEmitWholeProgramObject's llc on one part: its process, or 0.
@@ -2073,11 +2175,11 @@ trusted fun bootstrapInternalizeLlvmUserFunctionWrapperBitcode(
     status
 }
 
-// Parts llvm-split cuts a large release module into. What is inlined and placed across a cut
+// Balanced function parts of a large release module. What is inlined and placed across a cut
 // changes the code, so this count is part of what the build produces and must not follow the
 // machine: bootstrapNativeParallelism only says how many parts are generated at once. Checked
 // by tools/test-reproducible-elsewhere.sh.
-val BOOTSTRAP_NATIVE_PARTS = 8
+val BOOTSTRAP_NATIVE_PARTS = 20
 
 // Writes `outputPath`; its parts are named after `objectPath`.
 fun bootstrapEmitParallelObject(
@@ -2085,87 +2187,20 @@ fun bootstrapEmitParallelObject(
     objectPath: string,
     outputPath: string
 ): int {
-    val jobs = bootstrapNativeParallelism()
-    val partCount = BOOTSTRAP_NATIVE_PARTS
-    val prefix = "$objectPath.parallel."
     val preparedPath = "$objectPath.prepartition.bc"
     var status = bootstrapPrepareSplitLlvm(llvmPath, preparedPath)
-    val split = linuxCommand("llvm-split")
-    split.argument("-j")
-    split.argument("$partCount")
-    split.argument("-o")
-    split.argument(prefix)
-    split.argument(preparedPath)
-    if (status == 0) status = split.run()
-    var next = 0
-    val children: array<int> = []
-    while (status == 0 && next < jobs && next < partCount) {
-        val child = linuxCommand("/proc/self/exe")
-        child.argument("--aot-object")
-        child.argument("$prefix$next")
-        child.argument("$prefix$next.o")
-        val process = child.start().process
-        if (process <= 0) status = 127
-        children.append(process)
-        next = next + 1
-    }
-    var completed = 0
-    while (status == 0 && completed < partCount) {
-        var progressed = false
-        var slot = 0
-        while (slot < children.size) {
-            var observed = LinuxProcessResult(-1, "pending")
-            if (children[slot] > 0) {
-                observed = linuxWaitProcess(children[slot], true)
-            }
-            if (children[slot] > 0 && observed.output != "pending") {
-                progressed = true
-                completed = completed + 1
-                if (observed.status != 0) status = observed.status
-                if (status == 0 && next < partCount) {
-                    val child = linuxCommand("/proc/self/exe")
-                    child.argument("--aot-object")
-                    child.argument("$prefix$next")
-                    child.argument("$prefix$next.o")
-                    val process = child.start().process
-                    if (process <= 0) status = 127
-                    children[slot] = process
-                    next = next + 1
-                } else children[slot] = -1
-            }
-            slot = slot + 1
-        }
-        if (status == 0 && !progressed) {
-            linuxSleepMillisecondsChecked(1)
-        }
-    }
-    if (status != 0) {
-        var slot = 0
-        while (slot < children.size) {
-            if (children[slot] > 0) linuxWaitProcess(children[slot])
-            slot = slot + 1
-        }
-    }
     if (status == 0) {
-        val combine = linuxCommand("ld.lld")
-        combine.argument("--threads=1")
-        combine.argument("-r")
-        var part = 0
-        while (part < partCount) {
-            combine.argument("$prefix$part.o")
-            part = part + 1
-        }
-        combine.argument("-o")
-        combine.argument(outputPath)
-        status = combine.run()
+        val plan = linuxCommand("/proc/self/exe")
+        plan.argument("--aot-plan")
+        plan.argument(preparedPath)
+        plan.argument("$BOOTSTRAP_NATIVE_PARTS")
+        status = plan.run()
     }
-    var cleanup = 0
-    while (cleanup < partCount) {
-        Path("$prefix$cleanup").remove()
-        Path("$prefix$cleanup.o").remove()
-        cleanup = cleanup + 1
-    }
+    if (status == 0) status = bootstrapEmitReleaseParts(
+        preparedPath, BOOTSTRAP_NATIVE_PARTS, outputPath, true
+    )
     Path(preparedPath).remove()
+    Path("$preparedPath.plan").remove()
     status
 }
 

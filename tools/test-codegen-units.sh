@@ -68,6 +68,50 @@ for case in "${native_cases[@]}"; do
     fi
 done
 
+# The release compiler workers read one shared bitcode lazily, retain their
+# planned functions, then run O2 on that small module. Exercise the data-only
+# part, a cross-part call, deterministic objects and rejection of a short plan.
+if [[ $(uname) == Linux ]]; then
+    release="$output_directory/release"
+    mkdir -p "$release/again"
+    native_triple=$(llvm-config --host-target)
+    cat > "$release/input.ll" <<EOF
+target triple = "$native_triple"
+@answer = internal global i64 40
+define internal i64 @left() {
+  %value = load i64, ptr @answer
+  %next = add i64 %value, 1
+  ret i64 %next
+}
+define i32 @main() {
+  %value = call i64 @left()
+  %next = add i64 %value, 1
+  %result = trunc i64 %next to i32
+  ret i32 %result
+}
+EOF
+    llvm-as "$release/input.ll" -o "$release/input.bc"
+    "$compiler" --aot-plan "$release/input.bc" 2
+    cmp <(printf '1\n2\n') "$release/input.bc.plan" || fail "the release plan differs"
+    for part in 0 1 2; do
+        "$compiler" --aot-object "$release/input.bc" "$release/$part.o" "$release/input.bc.plan" "$part"
+        "$compiler" --aot-object "$release/input.bc" "$release/again/$part.o" "$release/input.bc.plan" "$part"
+        cmp "$release/$part.o" "$release/again/$part.o" || fail "release part $part differs"
+    done
+    ld.lld --threads=1 -r "$release/0.o" "$release/1.o" "$release/2.o" -o "$release/combined.o"
+    clang "$release/combined.o" -o "$release/program"
+    set +e
+    "$release/program"
+    status=$?
+    set -e
+    [[ $status == 42 ]] || fail "the release parts returned $status, not 42"
+    printf '1\n' > "$release/short-plan"
+    if "$compiler" --aot-object "$release/input.bc" "$release/bad.o" "$release/short-plan" 1; then
+        fail "the release worker accepted a short plan"
+    fi
+    [[ ! -e $release/bad.o ]] || fail "the failed release worker left an object"
+fi
+
 # Each link stays on one thread: a thread per CPU, with the launcher's stack each,
 # runs a many-core machine out of the 4 GiB address space ("Resource temporarily
 # unavailable"), and how many start depends on the machine's load.
@@ -110,4 +154,4 @@ done
 [[ $("$wasm_runner" tests/cases/stm/run.mjs "$output_directory/wasm-units/unwinding.wasm") == 0 ]] ||
     fail "unwinding.wasm in units: checks failed"
 [[ ! -e $linkers/unbounded ]] || fail "$(cat "$linkers/unbounded")"
-echo "codegen units: ${native_cases[*]:+native and }WebAssembly (exception handling too) as one unit and as eight: same results, symbols and interface; reproducible"
+echo "codegen units: ${native_cases[*]:+native and }WebAssembly (exception handling too) as one unit and as eight: same results, symbols and interface; reproducible; release workers plan, share data and call across parts"

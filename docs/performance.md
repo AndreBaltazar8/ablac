@@ -1292,3 +1292,59 @@ Separating ByteBuffer's stage-reservation success path from growth helped JSON
 and websocket-codec, but changed inlining elsewhere: its combined server gain
 was 3.52%, below the selected comparison change's 3.74%. Its prototype and raw
 profiles remain in worktrees/ablac-server-runtime/build/server-lab.
+
+## Compiler release parts share one bitcode file (2026-11-03)
+
+Large ELF release modules keep external O1 preparation. Its bitcode is read once
+by `--aot-plan` to assign functions to 20 fixed parts by instruction count. A
+separate unit holds the data. Each worker reads the shared bitcode lazily,
+promotes local names consistently, strips other functions, then writes its
+small module for the existing O2 and native-code generation helper. The plan
+needs no clones or whole-module rewrite. The job queue starts at most the
+minimum of 20, available CPUs and `ABLA_NATIVE_JOBS`; `nproc` honors affinity.
+Changing the worker count changes scheduling, with identical objects.
+
+Matched optimized compiler bitcode after the frontend handoff, LLVM 23.1.3,
+user instructions (billions):
+
+| Stage | Previous eight parts | Twenty function parts + data |
+|---|---:|---:|
+| Serial splitting / planning | 20.848 | 6.694 |
+| All workers | 447.347 | 462.900 |
+| Largest worker | 76.024 | 41.477 |
+
+Total post-O1 work is nearly unchanged (+0.30%); the serial stage and largest
+worker are smaller. Earlier screens of 12/16/20 ordered parts had largest
+workers of 51.51/47.18/41.64 G. Largest-first assignment at 16/20 reached
+41.00/36.87 G, but the existing ordered planner at 20 gave flat compiler
+throughput without adding sorting.
+
+Three alternating full-build pairs before the frontend bitcode integration
+were 68.52 ->53.32 s, 70.25 ->74.53 s and 75.20 ->77.81 s. The paired geomean is
+-5.11%, with all runs retained; this does not establish a 10% wall-time gain.
+Identical external O1 work varied substantially with load. The frontend and
+opt ran on CPU8; workers used the full 30-CPU allocation. The harness widens
+the parent's affinity after opt starts, before the queue detects its CPUs.
+
+Before that integration, GNU time's maximum RSS stayed about 1872 MiB.
+Summed process RSS moved 2959 ->3486 MiB, including duplicated shared mappings;
+sampled summed PSS moved 2877 ->2924 MiB. A genuine four-CPU run, even with
+`ABLA_NATIVE_JOBS=32`, had at most four workers, maximum RSS 1871 MiB and
+summed PSS 2928 MiB. Its executable and object matched the full-concurrency
+build. The combined frontend-bitcode build subsequently peaked at 1353 MiB
+per process and 2195 MiB summed PSS.
+
+The final 20-part union contains all 8553 function/global definitions exactly
+once, unchanged after normalizing local names and module-local metadata IDs;
+module assembly is identical. Two-stage builds and the pure self-rebuild have
+identical IR, combined objects and executables. The suite passed 260/260.
+A matched-bitcode old-partition control versus the new compiler used -0.182%
+reader-emission instructions and -0.002% for a fib build, with identical emitted
+reader IR. Reader process counters varied by about 0.2% across repeated
+baseline/control runs. Raw trials, the capture/union check and resource samples
+are in `worktrees/ablac-release-held/build/held-lab`.
+
+The earlier in-process O1 prototype was dropped: optimized textual IR matched
+external O1, but the held optimization took more CPU time despite fewer
+instructions. Its locality/IPC gap was not resolved. External O1 keeps that
+work in a fresh process.
