@@ -17,11 +17,6 @@
 
 ## Bugs seen
 
-- [ ] `tools/test-build-killed.sh` sometimes fails under a loaded parallel suite with
-  `no kill landed while a temporary was on its way` (2026-11-03, master b1abbb25 and
-  perf-free-growth, JOBS=10). No partial output was observed; the kill-point polling
-  missed all temporary windows. Recheck alone before treating it as a build regression.
-
 - [ ] Fresh-worktree `tools/test-compile-native.sh` fails at `fs-read 1` (2026-11-03): its fixture compares `#path(".").entries().size` with runtime entries, but compilation creates `build/` after the snapshot. Instrumented cold copies fail check 8 with both the unpatched compiler and fix-absolute-source; the suite passes alone once `build/` exists. Use a stable fixture directory for the listing comparison.
 
 - [ ] **Xtensa `llc` aborts on frames of 128 to 255 bytes that take a stack address.** `LLVM ERROR: Error

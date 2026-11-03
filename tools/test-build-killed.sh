@@ -57,13 +57,43 @@ save_set two
 build one app
 save_set one
 
+# Hold one real executable publication at the tool boundary. A fast held-module
+# build can create and rename every temporary between two polls, especially when
+# the watcher is descheduled. The clang wrapper lets the real link finish, then
+# stops before returning to the compiler: its temporary cannot be published yet.
+# Only this checkpoint uses the clang fallback; the others retain the normal link.
+real_clang=$(command -v clang)
+if [[ $(uname -s) == Darwin && -n ${ABLA_MACOS_CLANG:-} ]]; then
+    real_clang=$ABLA_MACOS_CLANG
+fi
+mkdir -p shims
+cat >shims/clang <<'CLANG'
+#!/usr/bin/env bash
+set -euo pipefail
+"$ABLA_KILL_TEST_CLANG" "$@"
+output=""
+while (($#)); do
+    if [[ $1 == -o && $# -gt 1 ]]; then output=$2; break; fi
+    shift
+done
+case $output in
+    out/app.tmp.*|out/app.publish.*/app)
+        [[ -f $output ]] || exit 1
+        printf '%s\n' "$output" >"$ABLA_KILL_TEST_READY"
+        kill -STOP "$$"
+        ;;
+esac
+CLANG
+chmod +x shims/clang
+
 # Kill points: just started, the new LLVM text written, the object on its way,
 # the object written, the executable written (the build may also end first).
-kill_points=(started app.o.tmp app.o app)
-if [[ -f out/app.ll ]]; then kill_points=(started app.ll app.o.tmp app.o app); fi
+kill_points=(started app.o.tmp app.o app app.tmp)
+if [[ -f out/app.ll ]]; then kill_points=(started app.ll app.o.tmp app.o app app.tmp); fi
 reached() { # point
     case $1 in
         started) (($(date +%s%N) - started_at > 50000000)) ;;
+        app.tmp) [[ -f link-ready ]] && [[ -f $(cat link-ready) ]] ;;
         app.o.tmp) compgen -G "out/app.o.tmp.*" > /dev/null ;;
         *) [[ out/$1 -nt stamp ]] ;;
     esac
@@ -75,21 +105,48 @@ for point in "${kill_points[@]}"; do
     if [[ $point == app.ll || $point == app.o ]]; then signal=TERM; fi
     touch stamp
     started_at=$(date +%s%N)
-    setsid "$compiler" build "$cases/two.ab" -o out/app --fast --no-cache \
-        > "kill-$index.log" 2>&1 &
+    command=("$compiler" build "$cases/two.ab" -o out/app --fast --no-cache)
+    if [[ $point == app.tmp ]]; then
+        rm -f link-ready
+        command=(env "PATH=$work/shims:$PATH" ABLA_LINK_DIRECT=0
+            "ABLA_KILL_TEST_CLANG=$real_clang" "ABLA_KILL_TEST_READY=$work/link-ready"
+            "ABLA_MACOS_CLANG=$work/shims/clang" "${command[@]}")
+    fi
+    setsid "${command[@]}" > "kill-$index.log" 2>&1 &
     pid=$!
     deadline=$((SECONDS + 120))
     while kill -0 "$pid" 2>/dev/null && ! reached "$point" && ((SECONDS < deadline)); do
         sleep 0.002
     done
+    held=false
+    if [[ $point == app.tmp ]] && reached "$point"; then held=true; fi
     pkill "-$signal" -s "$pid" || true
     { wait "$pid"; } 2>/dev/null || true
+    # Waiting for the launcher alone need not reap its killed compiler/tool
+    # descendants. Cleanup deliberately keeps a live owner's scratch, so do
+    # not start the recovery build until the entire killed session has gone.
+    deadline=$((SECONDS + 10))
+    while pgrep -s "$pid" > /dev/null && ((SECONDS < deadline)); do
+        sleep 0.002
+    done
+    if pgrep -s "$pid" > /dev/null; then
+        fail "processes survived the build killed at $point ($signal)"
+    fi
+    if [[ $point == app.tmp && $held != true ]]; then
+        fail "the linker did not hold a real executable temporary: $(cat "kill-$index.log")"
+    fi
+    if [[ $point == app.tmp ]]; then
+        cmp -s sets/one/app out/app || fail "the held link published its executable before returning"
+    fi
     whole || fail "a build killed at $point ($signal) left an output that is neither build's: $(ls out)"
     set +e
     out/app
     status=$?
     set -e
     [[ $status -eq 1 || $status -eq 2 ]] || fail "after a kill at $point the program exited $status"
+    if [[ $point == app.tmp && -z $(temporaries) ]]; then
+        fail "the held link left no temporary after its build was killed"
+    fi
     [[ -z $(temporaries) ]] || left_temporaries=$((left_temporaries + 1))
     # The next build of the output removes what the killed one left.
     build one app
