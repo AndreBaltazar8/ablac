@@ -42,6 +42,8 @@ stressed=$(ABLA_GC_STRESS=1 "$output_directory/background" 3)
 wait "$inline_pid"
 [[ $stressed == "$(<"$output_directory/inline-stressed.out")" ]] ||
     fail "under ABLA_GC_STRESS=1 the outputs differ"
+# Both implementations must actually honor the requested three rounds.
+[[ $stressed == "790718635 6 true" ]] || fail "the stressed run did not do three rounds: '$stressed'"
 # The linked programs (--emit-llvm writes the unpruned runtime, threads and all).
 nm -u "$output_directory/inline" > "$output_directory/inline.symbols"
 ! grep -q "pthread_create" "$output_directory/inline.symbols" ||
