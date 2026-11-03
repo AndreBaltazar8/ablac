@@ -413,8 +413,8 @@ digits themselves, not the nearest `f32` to the nearest `f64`, and a literal
 past the largest `f32` is `float.f32-range`. One too small for any `f32` is
 zero. Nothing else converts: an `f64` variable where an `f32` is wanted stays an
 error (`local.initializer`, `arithmetic.type`, `array.element-type`), and so
-does `a * 2` with an integer. The cases of a `when` over an `f32` take no width
-from it (`when.match`); compare with `==` instead.
+does `a * 2` with an integer. Literal cases of a `when` over an `f32` take
+their width from the subject, as operands of `==` do.
 
 Both operands of float arithmetic must have the same width. In a template an
 `f32` is written as the `f64` of the same value, so `0.1` as an `f32` reads
