@@ -7,6 +7,7 @@ import "abla/llvm/orc"
 import "../../sema.ab"
 import "debug.ab"
 import "abla/unsafe/memory/raw"
+import "abla/unsafe/memory"
 
 // The direct backend owns one LLVM context and constructs every declaration,
 // global, block, and instruction through LLVM's C API. Text is produced only
@@ -37,6 +38,10 @@ class BootstrapLlvmBackend(
     val aliasKind: i32,
     val aliasSlot: i64*,
     val aliasRaw: i64*,
+    // Immutable, context-owned attributes shared by declarations and calls.
+    val sretAttribute: i64*,
+    val byvalAttribute: i64*,
+    val pointerScratch: i64*,
     // Static executable TLS can use the initial-exec model. Object/shared
     // outputs and externally named TLS keep their general-dynamic model.
     var executableTls: bool = false,
@@ -92,7 +97,10 @@ fun bootstrapLlvmBackend(targetTriple: string): BootstrapLlvmBackend {
         i64Type, f32Type, f64Type, pointerType, payloadType, valueType,
         rootFrameType, LLVMGetMDKindIDInContext(context, "tbaa", i32(4)),
         bootstrapLlvmAliasTag(context, i64Type, "abla field slot"),
-        bootstrapLlvmAliasTag(context, i64Type, "abla raw memory")
+        bootstrapLlvmAliasTag(context, i64Type, "abla raw memory"),
+        LLVMCreateTypeAttribute(context, bootstrapLlvmAttributeKind("sret"), valueType),
+        LLVMCreateTypeAttribute(context, bootstrapLlvmAttributeKind("byval"), valueType),
+        bootstrapLlvmCreatePointerScratch()
     )
 }
 
@@ -179,21 +187,48 @@ fun BootstrapLlvmBackend.type(code: string): i64* {
     result
 }
 
+// LLVM copies operand/type arrays before returning (the previous vectors
+// were freed immediately). Emission is sequential within a backend. Keep a
+// small native buffer across calls; larger signatures get a temporary one.
+val BOOTSTRAP_LLVM_POINTER_SCRATCH = 16
+
+trusted fun bootstrapLlvmCreatePointerScratch(): i64* =
+    ablaUnsafeAllocate(BOOTSTRAP_LLVM_POINTER_SCRATCH * 8)
+
+trusted fun bootstrapLlvmDropPointerScratch(backend: BootstrapLlvmBackend): void {
+    ablaUnsafeFree(backend.pointerScratch)
+    return
+}
+
+trusted fun bootstrapLlvmPointerArguments(
+    backend: BootstrapLlvmBackend, arguments: array<i64*>
+): i64* {
+    val count = arguments.size
+    val values = if (count <= BOOTSTRAP_LLVM_POINTER_SCRATCH) backend.pointerScratch
+        else ablaUnsafeAllocate(count * 8)
+    var index = 0
+    while (index < count) {
+        ablaUnsafeStorePointer(ablaUnsafePointerOffset(values, index * 8), arguments[index])
+        index = index + 1
+    }
+    values
+}
+
+trusted fun bootstrapLlvmDropPointerArguments(
+    backend: BootstrapLlvmBackend, values: i64*
+): void {
+    if (values != backend.pointerScratch) ablaUnsafeFree(values)
+    return
+}
+
 fun bootstrapLlvmFunctionType(
     backend: BootstrapLlvmBackend,
     result: i64*,
     parameters: array<i64*>
 ): i64* {
-    val types = llvmPointerVector(parameters.size)
-    var index = 0
-    while (index < parameters.size) {
-        types.set(index, parameters[index])
-        index = index + 1
-    }
-    val resultType = LLVMFunctionType(
-        result, types.pointer(), i32(parameters.size), 0
-    )
-    types.drop()
+    val types = bootstrapLlvmPointerArguments(backend, parameters)
+    val resultType = LLVMFunctionType(result, types, i32(parameters.size), 0)
+    bootstrapLlvmDropPointerArguments(backend, types)
     resultType
 }
 
@@ -287,13 +322,8 @@ fun bootstrapLlvmAddSret(
     value: i64*,
     callSite: bool
 ): void {
-    val attribute = LLVMCreateTypeAttribute(
-        backend.context,
-        bootstrapLlvmAttributeKind("sret"),
-        backend.valueType
-    )
-    if (callSite) LLVMAddCallSiteAttribute(value, 1, attribute)
-    else LLVMAddAttributeAtIndex(value, 1, attribute)
+    if (callSite) LLVMAddCallSiteAttribute(value, 1, backend.sretAttribute)
+    else LLVMAddAttributeAtIndex(value, 1, backend.sretAttribute)
 }
 
 fun bootstrapLlvmAddByval(
@@ -303,14 +333,9 @@ fun bootstrapLlvmAddByval(
     callSite: bool
 ): void {
     if (!backend.valueArgumentsIndirect) {
-        val attribute = LLVMCreateTypeAttribute(
-            backend.context,
-            bootstrapLlvmAttributeKind("byval"),
-            backend.valueType
-        )
         if (callSite) {
-            LLVMAddCallSiteAttribute(value, i32(parameter + 1), attribute)
-        } else LLVMAddAttributeAtIndex(value, i32(parameter + 1), attribute)
+            LLVMAddCallSiteAttribute(value, i32(parameter + 1), backend.byvalAttribute)
+        } else LLVMAddAttributeAtIndex(value, i32(parameter + 1), backend.byvalAttribute)
     }
 }
 
@@ -351,23 +376,18 @@ fun bootstrapLlvmCall(
     sret: bool,
     byval: array<bool>
 ): i64* {
-    val values = llvmPointerVector(arguments.size)
-    var index = 0
-    while (index < arguments.size) {
-        values.set(index, arguments[index])
-        index = index + 1
-    }
+    val values = bootstrapLlvmPointerArguments(backend, arguments)
     val call = LLVMBuildCall2(
         backend.builder,
         LLVMGlobalGetValueType(function),
         function,
-        values.pointer(),
+        values,
         i32(arguments.size),
         name
     )
-    values.drop()
+    bootstrapLlvmDropPointerArguments(backend, values)
     if (sret) bootstrapLlvmAddSret(backend, call, true)
-    index = 0
+    var index = 0
     while (index < byval.size) {
         if (byval[index]) bootstrapLlvmAddByval(backend, call, index, true)
         index = index + 1
@@ -382,17 +402,12 @@ fun bootstrapLlvmCallTyped(
     arguments: array<i64*>,
     name: string
 ): i64* {
-    val values = llvmPointerVector(arguments.size)
-    var index = 0
-    while (index < arguments.size) {
-        values.set(index, arguments[index])
-        index = index + 1
-    }
+    val values = bootstrapLlvmPointerArguments(backend, arguments)
     val call = LLVMBuildCall2(
-        backend.builder, type, function, values.pointer(),
+        backend.builder, type, function, values,
         i32(arguments.size), name
     )
-    values.drop()
+    bootstrapLlvmDropPointerArguments(backend, values)
     call
 }
 
@@ -835,18 +850,15 @@ fun bootstrapLlvmStringNeedsExplicitLength(value: string): bool {
     found
 }
 
-fun bootstrapLlvmValueElement(
+trusted fun bootstrapLlvmValueElement(
     backend: BootstrapLlvmBackend,
     storage: i64*,
     index: int,
     name: string
 ): i64* {
-    val indices = llvmPointerVector(1)
-    indices.set(0, LLVMConstInt(backend.i64Type, index, 0))
-    val result = LLVMBuildGEP2(
+    ablaUnsafeStorePointer(backend.pointerScratch, LLVMConstInt(backend.i64Type, index, 0))
+    LLVMBuildGEP2(
         backend.builder, backend.valueType, storage,
-        indices.pointer(), 1, name
+        backend.pointerScratch, 1, name
     )
-    indices.drop()
-    result
 }
