@@ -44,6 +44,8 @@ if [[ $(uname -s) == Darwin ]]; then
 else
     [[ ! -e $output.host.o ]] || exit 1
     defines "$output" abla_runtime_set_arguments || exit 1
+    # A program that links LLVM links its ordinary object, so the build keeps it.
+    defines "$output.o" abla_runtime_set_arguments || exit 1
 fi
 
 # The input compiler's production module is generation one; the module emitted
