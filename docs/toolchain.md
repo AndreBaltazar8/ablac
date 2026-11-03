@@ -42,7 +42,10 @@ the environment.
 files in it, so runs at once in one directory don't share a build (several files
 as few programs as possible, each test still run in its own process), runs them,
 prints `PASS <file>` or `FAIL <file> (exit <status>)` and a summary, and
-exits with 1 when any failed; see [stdlib/testing.md](stdlib/testing.md).
+exits with 1 when any failed; see [stdlib/testing.md](stdlib/testing.md). Test programs
+are built with the `--o1` profile, as `ablac run`'s: a suite's time is mostly its tests
+running. `--fast` builds them with the development profile instead, for tests that
+run for less time than their build takes.
 
 Built-in hosted targets are `x86_64-linux`, `x86_64-macos`, and
 `arm64-macos`. Cross-linking Mach-O on Linux requires `ABLA_MACOS_SDK`; optional

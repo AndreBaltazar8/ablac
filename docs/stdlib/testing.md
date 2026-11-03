@@ -43,7 +43,10 @@ FAIL tests/text.ab (exit 1)
 `PASS <file>` or `FAIL <file> (exit <status>)`, and ends with a summary. Its
 exit status is 1 when any program failed. It accepts `--no-cache` and
 `--cache-dir <dir>` like `ablac build`. A directory names its files ending in
-`test.ab`.
+`test.ab`. Test programs are built with the `--o1` profile (inlining and local
+cleanup), since a suite's time is mostly its tests running; `--fast` builds them
+with the development profile, for tests that run for less time than their build
+takes.
 
 Several files build as few programs as possible, so the modules they share
 are compiled once rather than once per test. A generated program imports each
