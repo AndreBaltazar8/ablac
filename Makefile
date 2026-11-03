@@ -208,6 +208,7 @@ test-serial: ablac
 	tools/test-build-cache-build-program.sh $(COMPILER)
 	tools/test-native-partition-cache.sh $(COMPILER)
 	tools/test-lowered-ir-cache.sh $(COMPILER)
+	tools/test-ir-finalization.sh $(COMPILER)
 	tools/test-determinism.sh $(COMPILER)
 	tools/test-compile-effects.sh $(COMPILER)
 	tools/test-subparser-generated-adapter.sh $(COMPILER)
