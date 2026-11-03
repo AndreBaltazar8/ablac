@@ -64,6 +64,8 @@
       on 2026-11-01, `~/.nix-profile/bin/git` was missing for a moment.
 - [ ] `kill -- -$session` doesn't reach a compiler started through `build/ablac`: `tools/run-limited.sh`'s `timeout` makes it a process
       group of its own. SIGTERM is forwarded; SIGKILL to the group leaves `ablac` running until its limit (2026-11-01).
+- [ ] `SignalWatch.close()` unblocks watched signals that were already blocked before `watchSignals()`, instead of restoring the
+      original mask. For example, start `tools/test-linux-process.sh`'s tool-support binary with SIGINT blocked in its parent.
 - [ ] `E_NAMED_ARGUMENT_HIDDEN` remains when a generic constructor also has a delegated property and an omitted default calls a
       constructor hidden by the caller, with no earlier argument giving the type. For example, with
       `class Tagged<T>(val n: int)`, `class Slot<T>(var value: T) { fun getValue(): T = value }`, and
@@ -71,8 +73,6 @@
       `Tagged` hides the constructor in `Box<string>(n = 1)`. Generic probing precedes delegated-property rewriting, so the
       generated wrapper cannot yet safely pass that delegate. Pass `tag` explicitly; renaming the local alone still gives
       `constructor.argument:Box<string>` for this example.
-- [ ] `tools/test-linux-process.sh` failed once under `make test-full` ("close unblocks them", 1 of 4 runs on 2026-11-02), then passed
-      25 of 25 alone. Not looked into.
 - [ ] macOS: nobody has compared a local rebuild with the published binary, and
       `tools/test-reproducible-elsewhere.sh` skips it (2026-11-01).
 - [ ] ARM64 Android tagged pointers: `adoptNativeString` now tests `address != 0`, not `> 0`, but the fix has not been
