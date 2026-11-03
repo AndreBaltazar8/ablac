@@ -7,8 +7,8 @@
 # under what engines compile (V8: 7,654,321 bytes), the module instantiates, and its
 # checksum over every field is the native build's.
 set -euo pipefail
-# This test reads the module's LLVM text, which a development build keeps only when asked.
-export ABLA_KEEP_LLVM_TEXT=1
+# Only the Wasm checks below read LLVM text. The native development build
+# keeps its module in process instead of rendering and reparsing it.
 
 compiler=${1:-build/ablac.bin}
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -36,7 +36,7 @@ val built = #wasmBuildModule(
 
 fun main: int = if (built) 0 else 1
 DRIVER
-(cd "$project_root" && "$compiler" build "$output_directory/build.ab" \
+(cd "$project_root" && ABLA_KEEP_LLVM_TEXT=1 "$compiler" build "$output_directory/build.ab" \
     -o "$output_directory/build-driver" --no-cache)
 "$output_directory/build-driver" || fail "the module did not build"
 
