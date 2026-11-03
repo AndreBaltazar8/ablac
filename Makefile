@@ -229,6 +229,7 @@ test-serial: ablac
 	tools/test-compile-time-scalars.sh $(COMPILER)
 	tools/test-integer-narrowing.sh $(COMPILER)
 	tools/test-parse-int.sh $(COMPILER)
+	tools/test-string-join.sh $(COMPILER)
 	tools/test-resource-drop-link.sh $(COMPILER)
 	tools/test-runtime-checks.sh $(COMPILER)
 	tools/test-float-integer-saturation.sh $(COMPILER)

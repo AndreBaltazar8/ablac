@@ -47,6 +47,7 @@ fun main {
 | `s.indexOf(needle, from = 0)`, `s.lastIndexOf(needle)` | byte position, or `-1` |
 | `s.split(separator)` | the pieces between separators: `n` separators give `n + 1` pieces, empty ones included; an empty separator gives the whole string |
 | `textJoin(parts, separator = "")` | the parts with the separator between them |
+| `parts.join(separator = "")` | the same operation as an `array<string>` method |
 | `s.trim()`, `s.trimStart()`, `s.trimEnd()` | without ASCII whitespace at the ends |
 | `s.replace(old, replacement)` | every occurrence replaced, left to right; an empty `old` replaces nothing |
 | `s.uppercase()`, `s.lowercase()` | ASCII letters mapped; other bytes unchanged |
