@@ -3,10 +3,12 @@
 // helper threads are repaired in the child before its pre-exec allocations.
 
 import "abla/sys/linux"
+import "abla/bytes"
 import "abla/unsafe/memory/raw"
 import "abla/unsafe/memory"
 
 private noescape extern:"c" fun fork(): i32
+private noescape extern:"c" fun signal(number: int, handler: i64*): i64*
 
 noescape extern:"intrinsic" fun ablaLinuxArgumentCount(): int
 
@@ -791,4 +793,294 @@ fun linuxRandomInteger(maxExclusive: int): int {
         bytes.close()
     }
     result
+}
+
+// A close-on-exec pipe used for data, the start barrier and exec failure reports.
+class LinuxPipelinePipe(val input: int, val output: int)
+
+private fun linuxPipelineSafeDescriptor(descriptor: int): int {
+    if (descriptor >= 3) return descriptor
+    val replacement = linuxSyscall3(72, descriptor, 0, 3) // F_DUPFD
+    linuxSyscall1(3, descriptor)
+    if (replacement < 0) return -1
+    if (linuxSyscall3(72, replacement, 2, 1) < 0) { // F_SETFD, FD_CLOEXEC
+        linuxSyscall1(3, replacement)
+        return -1
+    }
+    replacement
+}
+
+private fun linuxPipelinePipe(): LinuxPipelinePipe {
+    val descriptors = nativeByteBuffer(8)
+    val status = linuxSyscall2(293, nativePointerAddress(descriptors.address), 524288)
+    var input = -1
+    var output = -1
+    if (status == 0) {
+        input = descriptors.load(0) + descriptors.load(1) * 256 +
+            descriptors.load(2) * 65536 + descriptors.load(3) * 16777216
+        output = descriptors.load(4) + descriptors.load(5) * 256 +
+            descriptors.load(6) * 65536 + descriptors.load(7) * 16777216
+        input = linuxPipelineSafeDescriptor(input)
+        output = linuxPipelineSafeDescriptor(output)
+        if (input < 0 || output < 0) {
+            if (input >= 0) linuxSyscall1(3, input)
+            if (output >= 0) linuxSyscall1(3, output)
+            input = -1
+            output = -1
+        }
+    }
+    descriptors.close()
+    LinuxPipelinePipe(input, output)
+}
+
+private fun linuxPipelineClose(descriptor: int): void {
+    if (descriptor >= 0) linuxSyscall1(3, descriptor)
+}
+
+private fun linuxPipelineRead(descriptor: int, maximum: int): string {
+    val buffer = nativeByteBuffer(maximum + 1)
+    var amount = linuxSyscall3(0, descriptor, nativePointerAddress(buffer.address), maximum)
+    while (amount == -4) amount = linuxSyscall3(0, descriptor, nativePointerAddress(buffer.address), maximum)
+    if (amount < 0) {
+        buffer.close()
+        return ""
+    }
+    buffer.adoptString(amount)
+}
+
+private fun linuxPipelineWait(process: int): int {
+    val status = nativeByteBuffer(8)
+    status.storeI64(0, 0)
+    var waited = linuxSyscall4(61, process, nativePointerAddress(status.address), 0, 0)
+    while (waited == -4) waited = linuxSyscall4(61, process, nativePointerAddress(status.address), 0, 0)
+    val result = if (waited == process) linuxDecodeWaitStatus(status.loadI64(0)) else -1
+    status.close()
+    result
+}
+
+/** A private copy prevents later mutations to a Command changing a pipeline. */
+fun LinuxCommand.snapshot(): LinuxCommand {
+    val arguments: array<string> = []
+    val overrides: array<string> = []
+    val removed: array<string> = []
+    for (value in this.arguments) arguments.append(value)
+    for (value in this.overrides) overrides.append(value)
+    for (value in this.removed) removed.append(value)
+    LinuxCommand(arguments, overrides, this.workingDirectory, this.inputPath,
+        this.outputPath, this.errorPath, removed)
+}
+
+class LinuxPipelineResult(
+    val statuses: array<int>,
+    val output: string,
+    val errors: string,
+    val launchError: string,
+    val status: int
+) {
+    fun allSucceeded(): bool {
+        if (this.launchError != "" || this.statuses.size == 0) return false
+        for (status in this.statuses) if (status != 0) return false
+        true
+    }
+}
+
+class LinuxRunningPipeline(
+    val processes: array<int>,
+    val group: int,
+    val outputDescriptor: int,
+    val errorDescriptor: int,
+    val launchError: string,
+    var result: LinuxPipelineResult? = null
+)
+
+// Restore SIGPIPE for programs, even when the caller ignores or blocks it.
+private fun linuxPipelineResetSigpipe(): void {
+    signal(13, nativeNullPointer())
+    val set = nativeByteBuffer(8)
+    set.storeI64(0, 4096)
+    linuxSyscall4(14, 1, nativePointerAddress(set.address), 0, 8)
+    set.close()
+    return
+}
+
+private fun linuxPipelineConflict(commands: array<LinuxCommand>, capture: bool, errors: bool): string {
+    if (commands.size == 0) return "empty pipeline"
+    var index = 0
+    while (index < commands.size) {
+        val command = commands[index]
+        if (index > 0 && command.inputPath != "") return "pipeline input conflicts with redirect"
+        if (index + 1 < commands.size && command.outputPath != "") return "pipeline output conflicts with redirect"
+        if (capture && index + 1 == commands.size && command.outputPath != "") return "capture output conflicts with redirect"
+        if (errors && command.errorPath != "") return "capture stderr conflicts with redirect"
+        index = index + 1
+    }
+    ""
+}
+
+// The parent and each child close every unused pipe end. The barrier keeps the
+// first child alive until all stages have joined its process group.
+fun linuxPipelineStart(commands: array<LinuxCommand>, grouped: bool, capture: bool, captureErrors: bool): LinuxRunningPipeline {
+    val processes: array<int> = []
+    val pipes: array<LinuxPipelinePipe> = []
+    val reports: array<LinuxPipelinePipe> = []
+    var problem = linuxPipelineConflict(commands, capture, captureErrors)
+    var index = 1
+    while (problem == "" && index < commands.size) {
+        val pipe = linuxPipelinePipe()
+        if (pipe.input < 0) problem = "pipe failed" else pipes.append(pipe)
+        index = index + 1
+    }
+    val stdout = if (problem == "" && capture) linuxPipelinePipe() else LinuxPipelinePipe(-1, -1)
+    if (capture && stdout.input < 0 && problem == "") problem = "stdout pipe failed"
+    val stderr = if (problem == "" && captureErrors) linuxPipelinePipe() else LinuxPipelinePipe(-1, -1)
+    if (captureErrors && stderr.input < 0 && problem == "") problem = "stderr pipe failed"
+    val barrier = if (problem == "" && grouped) linuxPipelinePipe() else LinuxPipelinePipe(-1, -1)
+    if (grouped && barrier.input < 0 && problem == "") problem = "barrier pipe failed"
+    index = 0
+    while (problem == "" && index < commands.size) {
+        val report = linuxPipelinePipe()
+        if (report.input < 0) problem = "exec report pipe failed" else reports.append(report)
+        index = index + 1
+    }
+    var group = -1
+    index = 0
+    while (problem == "" && index < commands.size) {
+        val command = commands[index]
+        val executable = if (command.arguments.size > 0) linuxExecutablePath(command.arguments[0]) else ""
+        val vector = linuxArgumentVector(command.arguments)
+        val environment = command.environmentVector()
+        val process = int(fork())
+        if (process == 0) {
+            var ready = true
+            if (grouped) ready = linuxSyscall2(109, 0, if (group < 0) 0 else group) == 0
+            if (index > 0 && linuxSyscall2(33, pipes[index - 1].input, 0) < 0) ready = false
+            if (index + 1 < commands.size) {
+                if (linuxSyscall2(33, pipes[index].output, 1) < 0) ready = false
+            } else if (capture && linuxSyscall2(33, stdout.output, 1) < 0) ready = false
+            if (captureErrors && linuxSyscall2(33, stderr.output, 2) < 0) ready = false
+            for (pipe in pipes) { linuxPipelineClose(pipe.input); linuxPipelineClose(pipe.output) }
+            linuxPipelineClose(stdout.input)
+            linuxPipelineClose(stdout.output)
+            linuxPipelineClose(stderr.input)
+            linuxPipelineClose(stderr.output)
+            var reportIndex = 0
+            while (reportIndex < reports.size) {
+                linuxPipelineClose(reports[reportIndex].input)
+                if (reportIndex != index) linuxPipelineClose(reports[reportIndex].output)
+                reportIndex = reportIndex + 1
+            }
+            if (grouped) {
+                linuxPipelineClose(barrier.output)
+                linuxPipelineRead(barrier.input, 1)
+                linuxPipelineClose(barrier.input)
+            }
+            linuxPipelineResetSigpipe()
+            if (ready && executable != "") command.execPrepared(executable, vector, environment)
+            linuxWrite(reports[index].output, "x")
+            linuxSyscall1(60, 127)
+        }
+        environment.close()
+        vector.close()
+        if (process < 0) problem = "fork failed"
+        else {
+            processes.append(process)
+            if (grouped) {
+                if (group < 0) group = process
+                linuxSyscall2(109, process, group)
+            }
+        }
+        index = index + 1
+    }
+    for (pipe in pipes) { linuxPipelineClose(pipe.input); linuxPipelineClose(pipe.output) }
+    linuxPipelineClose(stdout.output)
+    linuxPipelineClose(stderr.output)
+    linuxPipelineClose(barrier.input)
+    linuxPipelineClose(barrier.output)
+    for (report in reports) linuxPipelineClose(report.output)
+    if (problem != "") {
+        for (process in processes) linuxSyscall2(62, process, 9)
+        for (process in processes) linuxPipelineWait(process)
+        for (report in reports) linuxPipelineClose(report.input)
+        linuxPipelineClose(stdout.input)
+        linuxPipelineClose(stderr.input)
+        return LinuxRunningPipeline([], -1, -1, -1, problem)
+    }
+    val failedStages: array<int> = []
+    index = 0
+    while (index < reports.size) {
+        val report = linuxPipelineRead(reports[index].input, 1)
+        linuxPipelineClose(reports[index].input)
+        if (report != "") {
+            failedStages.append(index)
+            if (problem == "") problem = "stage $index failed to start"
+        }
+        index = index + 1
+    }
+    if (problem != "") {
+        var stage = 0
+        while (stage < processes.size) {
+            var failed = false
+            for (item in failedStages) if (item == stage) failed = true
+            if (!failed) linuxSyscall2(62, processes[stage], 9)
+            stage = stage + 1
+        }
+    }
+    LinuxRunningPipeline(processes, group, stdout.input, stderr.input, problem)
+}
+
+// Drain both streams concurrently. A child can fill either pipe before the
+// other, so reading one to EOF first can deadlock.
+private fun linuxPipelineDrain(output: int, errors: int): array<string> {
+    val text = byteBuffer()
+    val errorText = byteBuffer()
+    val poll = nativeByteBuffer(16)
+    var first = output
+    var second = errors
+    while (first >= 0 || second >= 0) {
+        poll.storeI64(0, first + 4294967296)
+        poll.storeI64(8, second + 4294967296)
+        val ready = linuxSyscall3(7, nativePointerAddress(poll.address), 2, -1)
+        if (ready < 0 && ready != -4) {
+            linuxPipelineClose(first)
+            linuxPipelineClose(second)
+            first = -1
+            second = -1
+        } else if (ready > 0) {
+            if (first >= 0 && (poll.load(6) != 0 || poll.load(7) != 0)) {
+                val chunk = linuxPipelineRead(first, 65536)
+                if (chunk == "") { linuxPipelineClose(first); first = -1 }
+                else text.appendText(chunk)
+            }
+            if (second >= 0 && (poll.load(14) != 0 || poll.load(15) != 0)) {
+                val chunk = linuxPipelineRead(second, 65536)
+                if (chunk == "") { linuxPipelineClose(second); second = -1 }
+                else errorText.appendText(chunk)
+            }
+        }
+    }
+    poll.close()
+    [text.toText(), errorText.toText()]
+}
+
+fun LinuxRunningPipeline.wait(): LinuxPipelineResult {
+    val previous = this.result
+    if (previous != null) return previous
+    val captured = linuxPipelineDrain(this.outputDescriptor, this.errorDescriptor)
+    val statuses: array<int> = []
+    for (process in this.processes) statuses.append(linuxPipelineWait(process))
+    val status = if (statuses.size == 0) -1 else statuses[statuses.size - 1]
+    val result = LinuxPipelineResult(statuses, captured[0], captured[1], this.launchError, status)
+    this.result = result
+    result
+}
+
+fun LinuxRunningPipeline.stop(graceMilliseconds: int = 5000): LinuxPipelineResult {
+    val previous = this.result
+    if (previous != null) return previous
+    if (this.group > 0) {
+        linuxSyscall2(62, 0 - this.group, 15)
+        linuxSleepMillisecondsChecked(graceMilliseconds)
+        linuxSyscall2(62, 0 - this.group, 9)
+    }
+    this.wait()
 }

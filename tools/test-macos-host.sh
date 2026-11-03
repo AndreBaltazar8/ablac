@@ -59,6 +59,13 @@ HOME='/tmp/abla test home' ABLA_EXPECT_HOME='/tmp/abla test home' "$output_direc
 env -u HOME ABLA_EXPECT_HOME='<none>' "$output_directory/path-home"
 HOME='' ABLA_EXPECT_HOME='<none>' "$output_directory/path-home"
 
+"$compiler" build "$project_root/tests/cases/process-pipeline/main.ab" \
+    --fast -o "$output_directory/pipeline"
+"$output_directory/pipeline"
+"$compiler" build "$project_root/tests/cases/process-pipeline/groups.ab" \
+    --fast -o "$output_directory/pipeline-groups"
+ABLA_GROUP_TEST_FILE="$output_directory/pipeline-group.txt" "$output_directory/pipeline-groups"
+
 "$compiler" build "$project_root/tests/cases/modules/process-capture.ab" \
     --fast -o "$output_directory/process-capture"
 expect_status_42 "$output_directory/process-capture"

@@ -233,6 +233,7 @@ test-serial: ablac
 	tools/test-array-remove-last.sh $(COMPILER)
 	tools/test-path-home.sh $(COMPILER)
 	tools/test-path-directory-mode.sh $(COMPILER)
+	tools/test-process-pipeline.sh $(COMPILER)
 	tools/test-resource-drop-link.sh $(COMPILER)
 	tools/test-runtime-checks.sh $(COMPILER)
 	tools/test-float-integer-saturation.sh $(COMPILER)

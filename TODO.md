@@ -82,8 +82,6 @@
 
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
-- [ ] No pipeline: a `Command`'s standard output can go to a file or to this program, not to another command, so
-      `git archive | tar` goes through a temporary file. `capture` doesn't take standard error either (only `errors(file)`).
 - [ ] `abla/array`'s `removeLast()` rejects resource elements: moving one out
       without dropping it needs an array move-out intrinsic and ownership tracking.
 - [ ] Ownership errors in a generic stdlib instantiation point to the helper, not the caller (e.g. `removeLast()` on `array<Resource>`).

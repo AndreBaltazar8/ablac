@@ -149,6 +149,8 @@ fun main {
 | `command(executable)` | a `Command`, found on `PATH`; `.argument(value)` adds an argument and returns the command |
 | `cmd.run()` | run it and wait; its exit status |
 | `cmd.captureText()` | run it and wait; its standard output |
+| `cmd.captureBoth()` | run it and capture standard output and standard error separately |
+| `cmd.pipe(next)` | a pipeline made from snapshots of the two commands |
 | `cmd.start()` | start it; a `ChildProcess`, with `stop(graceMilliseconds = 5000)` |
 | `exit(code)` | end the program now (from `abla/process/exit`) |
 | `panic(message)` | print the message and a stack trace, and exit with status 101 |
@@ -158,6 +160,31 @@ fun main {
 
 A command's environment is this process's, with `environment(name, value)` set on it and
 `removeEnvironment(name)` taken out of it.
+
+`a.pipe(b).pipe(c)` creates a reusable `Pipeline`, connecting each stage's
+standard output to the next stage's standard input. The pipeline snapshots its
+commands, so later edits to a command do not change it. `pipeline.run()` waits;
+`capture()` also collects the last stage's standard output; `captureBoth()`
+collects that output and the combined standard error of all stages. The order
+in which separate stages' error bytes arrive is unspecified. Capture buffers
+the complete streams in memory.
+
+These operations return a result with `statuses` in stage order, `status` for
+the last stage, `output`, `errors`, and `launchError` (empty on successful
+launch). `allSucceeded()` requires successful launch and a zero status for
+every stage. A failed exec has status 127 and a nonempty `launchError`; a
+program that itself exits 127 has an empty `launchError`. Signal exits use
+128 plus the signal number. For example, an upstream writer terminated by
+SIGPIPE after a consumer exits has status 141.
+
+Blocking operations leave the pipeline in the caller's process group so it
+can use the controlling terminal. `pipeline.start()` instead returns a
+`RunningPipeline` in its own process group; `wait()` reaps its stages and
+`stop(graceMilliseconds = 5000)` sends the group TERM then KILL after the
+grace period. Call one of them after `start()`. Asynchronous pipelines do not
+capture streams. A pipe conflicts with an explicit redirect on its connected
+output or input; capturing conflicts with a redirect of that stream. Such a
+conflict is reported in `launchError` before starting any stage.
 
 ### Signals: `abla/process/signal`
 
