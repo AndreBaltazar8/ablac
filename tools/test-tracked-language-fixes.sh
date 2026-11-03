@@ -46,7 +46,7 @@ expect_exit function-value-result-return 42
 expect_error invalid-closure-argument-fnmut 'declare the parameter `var g: FnMut() -> int`'
 expect_exit closure-capture-shadowed 42
 expect_exit default-closure-two-callers 42
-expect_error invalid-named-default-hidden-generic E_NAMED_ARGUMENT_HIDDEN
+expect_error invalid-named-default-hidden-generic generic.cannot-infer:f:T
 expect_exit named-default-hidden-value 42
 expect_error invalid-call-not-function call.not-function:double
 expect_error invalid-call-not-function-field call.not-function:scale

@@ -225,6 +225,96 @@ class BootstrapNamedArgumentNormalizer(
         true
     }
 
+    // Keep generic defaults in the declaration's scope until the wrapper is
+    // instantiated. Its supplied arguments have already been evaluated in
+    // the caller, in source order; defaults run afterwards, in parameter order.
+    fun genericDefaultWrapper(
+        declaration: BootstrapDeclaration,
+        supplied: array<bool>,
+        at: BootstrapExpression,
+        method: bool,
+        owner: int,
+        existingName: string = ""
+    ): string {
+        val parameters: array<string> = []
+        val types: array<string> = []
+        val kinds: array<string> = []
+        val statements: array<BootstrapExpression> = []
+        val arguments: array<BootstrapExpression> = []
+        val replacementNames: array<string> = []
+        var index = 0
+        while (index < declaration.parameters.size) {
+            replacementNames.append("__abla_default_arg_$index")
+            index = index + 1
+        }
+        val classTypes: array<string> = if (method && owner >= 0) this.declarations[owner].typeParameters else []
+        val typeParameters: array<string> = []
+        for (name in classTypes) typeParameters.append(name)
+        for (name in declaration.typeParameters) typeParameters.append(name)
+        val receiver = BootstrapExpression("identifier", "this", at.begin, at.end, [])
+        if (method) arguments.append(receiver)
+        index = 0
+        while (index < declaration.parameters.size) {
+            val name = replacementNames[index]
+            val declaredKind = if (index < declaration.parameterKinds.size) declaration.parameterKinds[index] else ""
+            val kind = if (declaration.kind == "class" && (declaredKind == "val" || declaredKind == "var"))
+                "own" else declaredKind
+            if (supplied[index]) {
+                parameters.append(name)
+                types.append(declaration.parameterTypes[index])
+                kinds.append(kind)
+            } else {
+                var value = this.replaceParameterReferences(
+                    declaration.parameterDefaults[index], declaration.parameters, replacementNames
+                )
+                if (method) value = this.qualifyReceiver(value, receiver, owner)
+                statements.append(this.local(name, value))
+            }
+            var value = BootstrapExpression("identifier", name, at.begin, at.end, [])
+            if (kind == "own") value = BootstrapExpression("named.transfer", "", at.begin, at.end, [value])
+            arguments.append(value)
+            index = index + 1
+        }
+        val names = bootstrapGenericParameterNames(declaration)
+        val target = if (names.size == 0) declaration.name
+            else "${declaration.name}<${bootstrapNamedTypeList(names)}>"
+        statements.append(BootstrapExpression(if (method) "member.call" else "call", target, at.begin, at.end, arguments))
+        val body = BootstrapExpression("block", "", at.begin, at.end, statements)
+        var serial = 0
+        var name = "__abla_named_defaults_${declaration.name}_$serial"
+        if (existingName != "") name = existingName
+        else {
+            while (this.target(name) != -1 || this.hasAccessor(name)) {
+                serial = serial + 1
+                name = "__abla_named_defaults_${declaration.name}_$serial"
+            }
+        }
+        val classNames: array<string> = []
+        for (parameter in classTypes) classNames.append(bootstrapGenericParameterName(parameter))
+        val extensionOwner = if (!method) "" else if (owner < 0) declaration.extensionOwner
+            else if (classNames.size == 0) this.declarations[owner].name
+            else "${this.declarations[owner].name}<${bootstrapNamedTypeList(classNames)}>"
+        var resultType = if (declaration.kind == "class")
+            "${declaration.name}<${bootstrapNamedTypeList(names)}>" else declaration.resultType
+        if (bootstrapIsBorrowResultContract(resultType)) {
+            val source = bootstrapBorrowResultSource(resultType)
+            var replacement = source
+            var parameter = 0
+            while (parameter < declaration.parameters.size) {
+                if (declaration.parameters[parameter] == source) replacement = replacementNames[parameter]
+                parameter = parameter + 1
+            }
+            resultType = "borrow($replacement) ${bootstrapBorrowResultElementType(resultType)}"
+        }
+        this.accessors.append(BootstrapDeclaration(
+            if (declaration.kind == "compile.fun") "compile.fun" else "fun", name, at.begin, at.end, body, parameters, types,
+            resultType,
+            [], [], "", kinds, extensionOwner, false, false, false, "", 0, 0, [], [], [], [],
+            declaration.sourceIdentity, [], false, false, typeParameters
+        ))
+        name
+    }
+
     // Whether `expression` (a default) calls a constructor, function value or
     // foreign function of a name the caller hides.
     fun callsHiddenUncopiable(expression: BootstrapExpression, own: array<string>): bool {
@@ -649,7 +739,7 @@ class BootstrapNamedArgumentNormalizer(
                 BootstrapExpression("identifier", "this", result.begin, result.begin, [])
             ]
             for (argument in result.children) arguments.append(argument)
-            val own = this.methodTargets(result.text, arguments, this.receiver)
+            val own = this.methodTargets(bootstrapNamedCallBase(result.text), arguments, this.receiver)
             if (own.owners.size > 0) {
                 result = BootstrapExpression(
                     "member.call", result.text, result.begin, result.end, arguments
@@ -660,7 +750,7 @@ class BootstrapNamedArgumentNormalizer(
         if (result.kind == "call") selectedTarget = this.target(bootstrapNamedCallBase(result.text))
         if (result.kind == "member.call" && hasNamed) {
             if (memberTargets.owners.size == 0) {
-                memberTargets = this.methodTargets(result.text, result.children)
+                memberTargets = this.methodTargets(bootstrapNamedCallBase(result.text), result.children)
             }
             selectedTarget = if (memberTargets.owners.size == 0) -1
                 else if (this.sameParameters(memberTargets)) 0
@@ -801,9 +891,81 @@ class BootstrapNamedArgumentNormalizer(
                     }
                     argument = argument + 1
                 }
+                val supplied: array<bool> = []
+                var wrapGenericDefaults = false
+                val wrapperOwner = if (method) this.methodClass(memberTargets, 0) else -1
+                val wrapperParameters: array<string> = []
+                if (method && wrapperOwner >= 0) {
+                    for (typeParameter in this.declarations[wrapperOwner].typeParameters)
+                        wrapperParameters.append(bootstrapGenericParameterName(typeParameter))
+                }
+                for (typeParameter in bootstrapGenericParameterNames(declaration)) wrapperParameters.append(typeParameter)
+                var canWrap = (declaration.kind == "fun" || declaration.kind == "compile.fun" || declaration.kind == "class") &&
+                    wrapperParameters.size > 0 && !bootstrapHasAnyDelegatedProperty(declaration)
                 parameter = 0
                 while (parameter < declaration.parameters.size) {
-                    if (temporaryNames[parameter] == "") {
+                    val present = temporaryNames[parameter] != ""
+                    supplied.append(present)
+                    if (!present) {
+                        if (parameter >= declaration.parameterDefaults.size ||
+                            declaration.parameterDefaults[parameter].kind == "missing") canWrap = false
+                        else {
+                            if (method) {
+                                var other = 1
+                                while (other < memberTargets.owners.size) {
+                                    val alternative = this.methodDeclaration(memberTargets, other)
+                                    if (parameter >= alternative.parameterDefaults.size ||
+                                        !bootstrapSameExpression(alternative.parameterDefaults[parameter], declaration.parameterDefaults[parameter])) canWrap = false
+                                    other = other + 1
+                                }
+                            }
+                            for (typeParameter in wrapperParameters) {
+                                if (bootstrapNamedTypeMentions(declaration.parameterTypes[parameter], typeParameter) ||
+                                    bootstrapGenericDefaultMentions(declaration.parameterDefaults[parameter], typeParameter))
+                                    wrapGenericDefaults = true
+                            }
+                        }
+                    }
+                    parameter = parameter + 1
+                }
+                wrapGenericDefaults = wrapGenericDefaults && canWrap
+                val wrapper = if (wrapGenericDefaults) this.genericDefaultWrapper(declaration, supplied, result, method, wrapperOwner) else ""
+                if (wrapGenericDefaults && method) {
+                    var other = 1
+                    while (other < memberTargets.owners.size) {
+                        this.genericDefaultWrapper(
+                            this.methodDeclaration(memberTargets, other), supplied, result, true,
+                            this.methodClass(memberTargets, other), wrapper
+                        )
+                        other = other + 1
+                    }
+                    // An interface-typed receiver dispatches through the
+                    // interface, not any one implementing class. Give that
+                    // receiver an extension when it declares the same defaults.
+                    var owner = 0
+                    while (owner < this.declarations.size) {
+                        val candidate = this.declarations[owner]
+                        if (candidate.kind == "interface") {
+                            for (found in candidate.methods) {
+                                if (found.name == declaration.name && found.parameters.size == declaration.parameters.size) {
+                                    var matches = true
+                                    var item = 0
+                                    while (item < declaration.parameters.size) {
+                                        if (found.parameters[item] != declaration.parameters[item]) matches = false
+                                        if (!supplied[item] && (item >= found.parameterDefaults.size ||
+                                            !bootstrapSameExpression(found.parameterDefaults[item], declaration.parameterDefaults[item]))) matches = false
+                                        item = item + 1
+                                    }
+                                    if (matches) this.genericDefaultWrapper(found, supplied, result, true, owner, wrapper)
+                                }
+                            }
+                        }
+                        owner = owner + 1
+                    }
+                }
+                parameter = 0
+                while (parameter < declaration.parameters.size) {
+                    if (temporaryNames[parameter] == "" && !wrapGenericDefaults) {
                         var defaultValue = BootstrapExpression(
                             "missing", "", result.begin, result.begin, []
                         )
@@ -931,7 +1093,7 @@ class BootstrapNamedArgumentNormalizer(
                         // that inferred type is affine.
                         value = BootstrapExpression("named.transfer", "", value.begin, value.end, [value])
                     }
-                    normalizedValues.append(value)
+                    if (!wrapGenericDefaults || supplied[parameter]) normalizedValues.append(value)
                     parameter = parameter + 1
                 }
                 // Its names chose the top-level target, which positional
@@ -939,7 +1101,9 @@ class BootstrapNamedArgumentNormalizer(
                 statements.append(BootstrapExpression(
                     if (!method && hasNamed && this.inReceiverBody) "call.top-level"
                     else result.kind,
-                    result.text,
+                    if (wrapGenericDefaults)
+                        "$wrapper${result.text.slice(bootstrapNamedCallBase(result.text).size, result.text.size)}"
+                    else result.text,
                     result.begin,
                     result.end,
                     normalizedValues

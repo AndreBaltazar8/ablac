@@ -64,10 +64,16 @@
       on 2026-11-01, `~/.nix-profile/bin/git` was missing for a moment.
 - [ ] `kill -- -$session` doesn't reach a compiler started through `build/ablac`: `tools/run-limited.sh`'s `timeout` makes it a process
       group of its own. SIGTERM is forwarded; SIGKILL to the group leaves `ablac` running until its limit (2026-11-01).
-- [ ] `E_NAMED_ARGUMENT_HIDDEN` remains for one case: a default calling a constructor or foreign function the caller hides, whose type
-      has a type parameter no earlier parameter gives (`fun <T> f(a: int, b: Box<T> = Box<T>(1))`, `val Box = ...` in the caller, `f(a = 1)`).
-      A generated function couldn't be told `T`, and a named call has no type arguments (`f<string>(a = 1)` is `E_NAMED_ARGUMENT_TARGET`).
-      Passing `b` or renaming the local avoids it.
+- [ ] `E_NAMED_ARGUMENT_HIDDEN` remains when a generic constructor also has a delegated property and an omitted default calls a
+      constructor hidden by the caller, with no earlier argument giving the type. For example, with
+      `class Tagged<T>(val n: int)`, `class Slot<T>(var value: T) { fun getValue(): T = value }`, and
+      `class Box<T>(val n: int, val tag: Tagged<T> = Tagged<T>(2), val saved: int by Slot(1))`, a local function named
+      `Tagged` hides the constructor in `Box<string>(n = 1)`. Generic probing precedes delegated-property rewriting, so the
+      generated wrapper cannot yet safely pass that delegate. Pass `tag` explicitly; renaming the local alone still gives
+      `constructor.argument:Box<string>` for this example.
+- [ ] A borrowed result saved from a named call can fail `ownership.borrow-source`: `val result = view(item = item)` where
+      `view(item: Item): borrow(item) Item` returns its argument. The generated temporary's scope obscures the original source;
+      generic named defaults have the same limitation. A direct use of the returned view works.
 - [ ] `tools/test-linux-process.sh` failed once under `make test-full` ("close unblocks them", 1 of 4 runs on 2026-11-02), then passed
       25 of 25 alone. Not looked into.
 - [ ] macOS: nobody has compared a local rebuild with the published binary, and

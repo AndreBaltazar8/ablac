@@ -323,6 +323,7 @@ test-serial: ablac
 	tools/test-generics.sh $(COMPILER)
 	tools/test-lazy-defaults.sh $(COMPILER)
 	tools/test-named-generic-guard.sh $(COMPILER)
+	tools/test-named-generic-default.sh $(COMPILER)
 	tools/test-transform-reuse.sh $(COMPILER)
 	tools/test-serve-outputs.sh $(COMPILER)
 	tools/test-shell-environment.sh $(COMPILER)
