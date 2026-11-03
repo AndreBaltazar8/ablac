@@ -6,12 +6,10 @@ set -euo pipefail
 
 compiler=${1:-build/ablac.bin}
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-program="$project_root/build/conformance-ir-cache-test"
+program=$("$project_root/tools/compiler-api-test-program.py" "$compiler")
 
-"$compiler" build "$project_root/tests/cases/modules/conformance-ir-cache.ab" \
-    -o "$program" --fast --no-cache
 set +e
-ABLA_MAX_MEMORY_MB=2048 ABLA_MAX_SECONDS=120 \
+ABLA_COMPILER_API_CASE=conformance ABLA_MAX_MEMORY_MB=2048 ABLA_MAX_SECONDS=120 \
     "$project_root/tools/run-limited.sh" "$program"
 status=$?
 set -e
