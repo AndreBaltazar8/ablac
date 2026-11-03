@@ -1166,6 +1166,50 @@ fun bootstrapNativeCacheHash(
     hash
 }
 
+// /proc/self/exe names this process's running image, including after its path
+// is replaced. Keep only integer fingerprints: a nested build may run inside
+// a memory checkpoint, so retaining its allocated image text would be unsafe.
+var bootstrapRunningImageSize: int = -1
+var bootstrapRunningImageFirst: int = 41
+var bootstrapRunningImageSecond: int = 101
+var bootstrapRunningImageTail: int = 0
+
+fun bootstrapReadRunningImageIdentity(): void {
+    if (bootstrapRunningImageSize >= 0) return
+    val image = Path("/proc/self/exe").readText()
+    // A failed read is retried, and still disables this build's object cache.
+    if (image.size == 0) return
+    val aligned = image.size - image.size % 4
+    val prefix = image.slice(0, aligned)
+    bootstrapRunningImageFirst = bootstrapNativeCacheHash(prefix, 41, 269, 1000000007)
+    bootstrapRunningImageSecond = bootstrapNativeCacheHash(prefix, 101, 271, 1000000009)
+    var tail = 0
+    var index = aligned
+    while (index < image.size) {
+        tail = tail | (image[index] << ((index - aligned) * 8))
+        index = index + 1
+    }
+    bootstrapRunningImageTail = tail
+    bootstrapRunningImageSize = image.size
+    return
+}
+
+// Preserve bootstrapNativeCacheHash's four-byte grouping across the image /
+// backend boundary, even for an executable with one to three trailing bytes.
+fun bootstrapRunningImageSuffix(backend: string, tail: int, count: int): string {
+    if (count == 0) return "\n$backend"
+    val bytes = byteBuffer()
+    var remainder = tail
+    var index = 0
+    while (index < count) {
+        bytes.appendByteValue(remainder & 255)
+        remainder = remainder / 256
+        index = index + 1
+    }
+    bytes.appendText("\n$backend")
+    bytes.toText()
+}
+
 fun bootstrapCopyNativeObject(source: string, destination: string): int {
     val copy = linuxCommand("cp")
     copy.argument("--")
@@ -2900,8 +2944,10 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     // Reading and hashing about 10 MB is a sixth of a small build, so only what keys
     // on the image does it: the cache, and code generation units (on for every build).
     val compilerImageUsed = allowCache || inProcessCodegen || nativeHeld
-    val compilerImageRead = if (compilerImageUsed) Path("/proc/self/exe").readText() else ""
-    val cacheEnabled = allowCache && compilerImageRead.size > 0
+    if (compilerImageUsed) bootstrapReadRunningImageIdentity()
+    val imageBytes = if (compilerImageUsed && bootstrapRunningImageSize > 0)
+        bootstrapRunningImageSize else 0
+    val cacheEnabled = allowCache && imageBytes > 0
     // An executable's held module may be generated as code generation units, whose
     // object is an archive of them (codegen_units.ab) that the link loads whole: only an
     // executable's, as an object or library artifact is that object itself. (Its cache
@@ -2922,16 +2968,22 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                 ).captureText()}"
         }
     }
-    val compilerImage = "$compilerImageRead\n$backendIdentity"
+    val compilerImageSize = imageBytes + 1 + backendIdentity.size
+    val compilerSuffix = bootstrapRunningImageSuffix(
+        backendIdentity, if (imageBytes > 0) bootstrapRunningImageTail else 0,
+        imageBytes % 4
+    )
     val compilerFirstHash = if (compilerImageUsed) bootstrapNativeCacheHash(
-        compilerImage, 41, 269, 1000000007
+        compilerSuffix, if (imageBytes > 0) bootstrapRunningImageFirst else 41,
+        269, 1000000007
     ) else 0
     val compilerSecondHash = if (compilerImageUsed) bootstrapNativeCacheHash(
-        compilerImage, 101, 271, 1000000009
+        compilerSuffix, if (imageBytes > 0) bootstrapRunningImageSecond else 101,
+        271, 1000000009
     ) else 0
     val cacheDirectory = bootstrapCacheDirectory()
     val partitionCacheNamespace =
-        "$cacheDirectory/native-partition-${target.name}-llvm21-v3-$cacheProfile${if (bootstrapLlvmDebugInfo) "-g" else ""}-${compilerImage.size}-$compilerFirstHash-$compilerSecondHash"
+        "$cacheDirectory/native-partition-${target.name}-llvm21-v3-$cacheProfile${if (bootstrapLlvmDebugInfo) "-g" else ""}-$compilerImageSize-$compilerFirstHash-$compilerSecondHash"
     // A program that built flat may not build with --strict-imports.
     // A held object and the text fallback can have different section layouts.
     // Unit count/threshold also select one object versus an archive and its
@@ -2940,7 +2992,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         if (nativeUnits) "-held-units${bootstrapCodegenUnitCount()}-min${bootstrapCodegenUnitMinimum()}"
         else "-held-single"
     } else ""
-    val cacheStem = "$cacheDirectory/native-${target.name}-llvm21-v14-$cacheProfile${if (bootstrapStrictImportsRequested) "-strict" else ""}$nativeMode-${compilerImage.size}-$compilerFirstHash-$compilerSecondHash-${sourceIdentity.size}-$firstHash-$secondHash"
+    val cacheStem = "$cacheDirectory/native-${target.name}-llvm21-v14-$cacheProfile${if (bootstrapStrictImportsRequested) "-strict" else ""}$nativeMode-$compilerImageSize-$compilerFirstHash-$compilerSecondHash-${sourceIdentity.size}-$firstHash-$secondHash"
     val cacheObjectPath = "$cacheStem.o"
     val cacheLlvmPath = "$cacheStem.ll"
     val cacheSourcePath = "$cacheStem.source"
@@ -3144,7 +3196,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                     // so nothing there is stale.
                     val places = BootstrapCodegenUnitPlaces(
                         bootstrapCodegenCacheDirectory(cacheDirectory),
-                        "${compilerImage.size}-$compilerFirstHash-$compilerSecondHash-${llvmLibraryVersion()}"
+                        "$compilerImageSize-$compilerFirstHash-$compilerSecondHash-${llvmLibraryVersion()}"
                     )
                     status = if (inProcessCodegen)
                         bootstrapEmitHeldWasmObject(target.llvmTriple, emittedObjectPath, places)
