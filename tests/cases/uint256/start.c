@@ -9,6 +9,7 @@ static char heap[1 << 28] __attribute__((aligned(16)));
 static size_t used;
 static char tls[4096] __attribute__((aligned(16)));
 static int errno_word;
+void *__tls_get_addr(size_t *entry);
 
 static void leave(long code) {
 #if defined(__aarch64__)
@@ -32,6 +33,10 @@ void begin(void) {
     __asm__ volatile("msr tpidr_el0, %0" : : "r"(tls));
 #elif defined(__riscv)
     __asm__ volatile("mv tp, %0" : : "r"(tls));
+    // A descriptor for the first TLS byte must resolve inside the fixture's
+    // TLS buffer, regardless of what happens to lie before it in the image.
+    size_t probe[] = {1, (size_t)-0x800};
+    if (__tls_get_addr(probe) != tls) leave(97);
 #endif
     leave((long)uint256_checks());
 }
@@ -90,7 +95,14 @@ size_t strlen(const char *text) {
     return size;
 }
 int *__errno_location(void) { return &errno_word; }
-void *__tls_get_addr(size_t *entry) { return tls + entry[1]; }
+void *__tls_get_addr(size_t *entry) {
+#if defined(__riscv)
+    // RISC-V DTP-relative offsets are biased by 0x800.
+    return tls + (entry[1] + 0x800);
+#else
+    return tls + entry[1];
+#endif
+}
 char *getenv(const char *name) { (void)name; return 0; }
 int pthread_mutex_lock(void *m) { (void)m; return 0; }
 int pthread_mutex_unlock(void *m) { (void)m; return 0; }

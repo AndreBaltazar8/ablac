@@ -35,8 +35,8 @@ fi
 # reproducible artifacts only.
 find "$cache_directory" -mindepth 1 -maxdepth 1 -type f -delete || exit 1
 
-# Every function is reachable (unreachable ones are pruned before emission)
-# and takes a parameter, so none folds into its caller.
+# Take each function's address so its boxed wrapper is actually demanded.
+# Direct-only calls no longer produce wrappers to populate partitions.
 write_source() {
     {
         printf 'fun partitionFunction0(value: int): int = value + %s\n' "$1"
@@ -44,9 +44,10 @@ write_source() {
             printf 'fun partitionFunction%s(value: int): int = value * %s\n' \
                 "$index" "$index"
         done
+        printf 'fun partitionApply(f: (int) -> int, value: int): int = f(value)\n'
         printf 'fun partitionSum(value: int): int = 0'
         for index in $(seq 1 95); do
-            printf ' +\n    partitionFunction%s(value)' "$index"
+            printf ' +\n    partitionApply(partitionFunction%s, value)' "$index"
         done
         printf '\nfun partitionCaller(value: int): int = partitionFunction0(value) + 40\n'
         printf 'fun main: int = if (partitionSum(1) == 4560) partitionCaller(2 - %s) else 0\n' "$1"
@@ -64,14 +65,14 @@ before=$(partition_count)
     ${target_flags[@]+"${target_flags[@]}"} || exit 1
 after_first=$(partition_count)
 first_added=$((after_first - before))
-[[ $first_added -ge 4 ]] || exit 1
+[[ $first_added -ge 4 ]] || { echo "expected at least four cached partitions, got $first_added" >&2; exit 1; }
 
 write_source 2 || exit 1
 "$compiler" build "$source_file" -o "$program" --fast \
     ${target_flags[@]+"${target_flags[@]}"} || exit 1
 after_second=$(partition_count)
 second_added=$((after_second - after_first))
-[[ $second_added -lt $first_added ]] || exit 1
+[[ $second_added -lt $first_added ]] || { echo "no partitions reused after edit: first=$first_added refreshed=$second_added" >&2; exit 1; }
 
 if [[ $native_host -eq 1 ]]; then
     set +e

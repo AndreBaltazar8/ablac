@@ -73,7 +73,9 @@ fi
 export ABLA_SYSROOT=${ABLA_SYSROOT:-$project_root}
 # Each function's own arithmetic keeps LLVM from folding them into one another.
 generate() {
-    local count=1200 index
+    # Unused boxed wrappers are omitted; keep enough live bodies for the
+    # release module to exceed the parallel-codegen threshold.
+    local count=1400 index
     for ((index = 0; index < count; index++)); do
         printf 'fun step%d(value: int, names: array<string>): int {\n' "$index"
         printf '    var total = value + %d\n' "$index"
