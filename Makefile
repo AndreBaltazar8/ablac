@@ -107,6 +107,7 @@ test-serial: ablac
 	tools/test-host-llvm-tools.sh $(COMPILER)
 	tools/test-compiler-memory-peak.sh $(COMPILER)
 	tools/test-borrow-lifetimes.sh $(COMPILER)
+	tools/test-lambda-borrow-return.sh $(COMPILER)
 	tools/test-narrowing-and-branches.sh $(COMPILER)
 	tools/test-line-continuation.sh $(COMPILER)
 	tools/test-ownership-shadows-and-globals.sh $(COMPILER)
