@@ -52,6 +52,7 @@ noescape extern:"c" fun LLVMSetFunctionCallConv(function: i64*, convention: i32)
 noescape extern:"c" fun LLVMGetAttributesAtIndex(function: i64*, index: i32, attributes: i64*): void
 noescape extern:"c" fun LLVMIsStringAttribute(attribute: i64*): i32
 noescape extern:"c" fun LLVMIsAGlobalValue(value: i64*): i64*
+noescape extern:"c" fun LLVMIsAGlobalAlias(value: i64*): i64*
 noescape extern:"c" fun LLVMGetModuleContext(module: i64*): i64*
 noescape extern:"c" fun LLVMGetBitcodeModuleInContext2(context: i64*, buffer: i64*, module: i64*): i32
 noescape extern:"c" fun LLVMLinkModules2(destination: i64*, source: i64*): i32
@@ -295,7 +296,7 @@ trusted fun bootstrapCodegenNameConstants(module: i64*): void {
     return
 }
 
-/** Gives every function and global variable with local linkage (internal or
+/** Gives every function, global variable and alias with local linkage (internal or
  *  private) a hidden external name, `__abla_unit.<name>`, so a unit can name
  *  what another defines. Hidden symbols stay inside the one image the units
  *  are linked into. */
@@ -315,6 +316,11 @@ trusted fun bootstrapCodegenUnitPromote(module: i64*, stableConstants: bool = tr
             anonymous = bootstrapCodegenPromoteValue(global, anonymous)
         }
         global = LLVMGetNextGlobal(global)
+    }
+    var alias = LLVMGetFirstGlobalAlias(module)
+    while (!pointerIsNull(alias)) {
+        anonymous = bootstrapCodegenPromoteValue(alias, anonymous)
+        alias = LLVMGetNextGlobalAlias(alias)
     }
     return
 }
@@ -422,7 +428,12 @@ trusted fun bootstrapCodegenUnitStrip(module: i64*, plan: array<int>, index: int
     var stub = nativeNullPointer()
     var alias = LLVMGetFirstGlobalAlias(module)
     while (!pointerIsNull(alias)) {
-        val aliasee = LLVMAliasGetAliasee(alias)
+        var aliasee = LLVMAliasGetAliasee(alias)
+        // An alias chain belongs to the unit defining its final target,
+        // regardless of the order the aliases occur in the module.
+        while (!pointerIsNull(LLVMIsAGlobalAlias(aliasee))) {
+            aliasee = LLVMAliasGetAliasee(aliasee)
+        }
         val target = LLVMIsAGlobalValue(aliasee)
         val kept = if (pointerIsNull(target)) index == 0
             else LLVMIsDeclaration(target) == i32(0)
@@ -434,6 +445,11 @@ trusted fun bootstrapCodegenUnitStrip(module: i64*, plan: array<int>, index: int
                 LLVMAddFunction(module, name, type)
                 else LLVMAddGlobal(module, type, name)
             LLVMSetVisibility(declaration, LLVMGetVisibility(alias))
+            // An ordinary declaration is a distinct global to LLVM, which
+            // can fold alias == aliasee to false after the relation is lost.
+            // A weak reference keeps the address comparison unresolved; the
+            // owning unit still supplies the original alias definition.
+            LLVMSetLinkage(declaration, i32(12))
             LLVMReplaceAllUsesWith(alias, declaration)
             if (pointerIsNull(stub)) stub = bootstrapCodegenAliasStub(module)
             LLVMAliasSetAliasee(alias, stub)

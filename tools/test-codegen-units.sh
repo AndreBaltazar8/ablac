@@ -110,6 +110,37 @@ EOF
         fail "the release worker accepted a short plan"
     fi
     [[ ! -e $release/bad.o ]] || fail "the failed release worker left an object"
+
+    # Function/data aliases must keep their identity when their definitions
+    # and address comparisons land in different workers, including addresses
+    # stored in the data-only unit. Compare with the unsplit LLVM build.
+    aliases="$release/aliases"
+    mkdir -p "$aliases/again"
+    {
+        printf 'target triple = "%s"\n' "$native_triple"
+        cat tests/cases/codegen-units/alias-address.ll
+    } > "$aliases/input.ll"
+    llvm-as "$aliases/input.ll" -o "$aliases/input.bc"
+    "$compiler" --aot-object "$aliases/input.bc" "$aliases/whole.o"
+    clang "$aliases/whole.o" -o "$aliases/whole"
+    "$aliases/whole" || fail "the whole-module alias address fixture failed"
+    "$compiler" --aot-plan "$aliases/input.bc" 4
+    for part in 0 1 2 3 4; do
+        "$compiler" --aot-object "$aliases/input.bc" "$aliases/$part.o" "$aliases/input.bc.plan" "$part"
+        "$compiler" --aot-object "$aliases/input.bc" "$aliases/again/$part.o" "$aliases/input.bc.plan" "$part"
+        cmp "$aliases/$part.o" "$aliases/again/$part.o" || fail "alias part $part differs"
+    done
+    ld.lld --threads=1 -r "$aliases/0.o" "$aliases/1.o" "$aliases/2.o" \
+        "$aliases/3.o" "$aliases/4.o" -o "$aliases/combined.o"
+    clang "$aliases/combined.o" -o "$aliases/program"
+    "$aliases/program" || fail "alias addresses differ after splitting"
+    # Native development units are force-loaded from an archive. A foreign
+    # weak reference must still resolve to the owning member's strong alias.
+    llvm-ar rcsD "$aliases/units.a" "$aliases/0.o" "$aliases/1.o" \
+        "$aliases/2.o" "$aliases/3.o" "$aliases/4.o"
+    clang -Wl,--whole-archive "$aliases/units.a" -Wl,--no-whole-archive \
+        -o "$aliases/archived"
+    "$aliases/archived" || fail "alias addresses differ through the units archive"
 fi
 
 # Each link stays on one thread: a thread per CPU, with the launcher's stack each,
