@@ -115,6 +115,9 @@ grep -q 'compile.effect-denied:filesystem.write:record->ablaHostWriteFileAtomic'
 }
 
 # abla/fs under a filesystem.read grant; println to the compiler's output.
+# Keep this case cold: compilation creates build/ after its # reads. The
+# directory-listing fixture must stay independent of that generated directory.
+rm -rf "$cases/fs-read/build"
 (cd "$cases/fs-read" && "$compiler" build main.ab -o "$output_directory/fs-read" --no-cache) \
     > "$output_directory/fs-read.compile.out"
 grep -q 'compile time read 19 bytes' "$output_directory/fs-read.compile.out"
