@@ -114,11 +114,6 @@
       socket's file permissions would say who may connect.
 - [ ] The rest of integers up to 256 bits: `uint256` is in (`abla/uint256`, docs/stdlib/uint256.md), with big-endian
       bytes. Left: signed 256, 128 both ways, and little-endian bytes, when something needs them.
-- [ ] Remove the older object layout's bootstrap step, which nothing needs now that the pin
-  (v0.2.32) makes typed instances: `tools/bootstrap-untyped-objects.patch`,
-  `tools/bootstrap-typed-instances.ab`, `tools/test-bootstrap-untyped-objects.sh`, their stage
-  in `tools/build-self-hosted-current.sh` and their lines in the `Makefile`.
-
 - [ ] **`ablac run` becomes a live JIT.** The direction for `run` is a live in-process JIT: a
   running program loads code and redefines its own functions while it runs. Done: the JIT
   module gets the `--o1` IR pipeline (`--fast`: the fast one), which made `run` the in-process

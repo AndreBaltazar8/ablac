@@ -138,11 +138,6 @@ and tag, bit 48 set) where it used to pass its index, and a class's descriptor
 (for a stage-1 compiler whose seed still made the older calls) was the bridge;
 this runtime makes typed instances only. A compiler from before typed
 instances (v0.2.22 is one) can't build a compiler that
-runs on it: its code would pass field counts, on which the runtime traps. So
-`tools/build-self-hosted-current.sh` first builds and runs
-`tools/bootstrap-typed-instances.ab` with the compiler it starts from; when
-that doesn't exit 42, the compiler builds the sources once against a copy of
-the standard library whose runtime also keeps the older layout
-(`tools/bootstrap-untyped-objects.patch`), and the compiler that comes out of
-it builds the result. The v0.2.37 bootstrap release makes typed instances, so
-a clean build passes the probe and skips that step.
+runs on it: its code would pass field counts, on which the runtime traps.
+The pinned v0.2.37 compiler makes typed instances and builds the current
+runtime directly. Earlier compilers need a historical bridge compiler.
