@@ -7944,7 +7944,7 @@ class BootstrapLowerer(
 
     // Lowers an expression with the source position at it, so the
     // instructions it emits map back to it (debug information).
-    fun lowerExpression(expression: BootstrapExpression): int {
+    fun lowerExpression(expression: BootstrapExpression, valueRequired: bool = true): int {
         val savedPosition = bootstrapIrSourcePosition
         if (bootstrapIrSourceFile >= 0 && expression.begin >= 0 &&
             expression.end > expression.begin) {
@@ -7952,12 +7952,12 @@ class BootstrapLowerer(
                 bootstrapIrSourceFile, expression.begin
             )
         }
-        val result = this.lowerExpressionAt(expression)
+        val result = this.lowerExpressionAt(expression, valueRequired)
         bootstrapIrSourcePosition = savedPosition
         result
     }
 
-    fun lowerExpressionAt(expression: BootstrapExpression): int {
+    fun lowerExpressionAt(expression: BootstrapExpression, valueRequired: bool): int {
         val kind = expression.kind
         // Reject kinds with another initial byte before the general string
         // comparison; the expression and its kind stay immutable throughout.
@@ -8049,7 +8049,7 @@ class BootstrapLowerer(
             result = bootstrapLowerLambda(this, expression, result)
         }
         if ((kindHead == 98 && kind == "block")) {
-            result = bootstrapLowerBlock(this, expression, result)
+            result = bootstrapLowerBlock(this, expression, result, valueRequired)
         }
         if ((kindHead == 100 && kind == "defer")) {
             result = bootstrapLowerDefer(this, expression, result)
@@ -8248,7 +8248,7 @@ class BootstrapLowerer(
             result = this.lowerLogicalExpression(expression)
         }
         if ((kindHead == 105 && kind == "if")) {
-            result = bootstrapLowerIf(this, expression, result)
+            result = bootstrapLowerIf(this, expression, result, valueRequired)
         }
         if ((kindHead == 119 && kind == "while")) {
             result = bootstrapLowerWhile(this, expression, result)
@@ -10036,7 +10036,8 @@ fun bootstrapLowerLambdaFunction(
 fun bootstrapLowerBlock(
     var lowerer: BootstrapLowerer,
     expression: BootstrapExpression,
-    initial: int
+    initial: int,
+    valueRequired: bool
 ): int {
     var result = initial
     val previousScope = lowerer.enterLocalScope()
@@ -10065,7 +10066,9 @@ fun bootstrapLowerBlock(
     var statement = 0
     while (statement < expression.children.size) {
         val lowered = expression.children[statement]
-        result = lowerer.lowerExpression(lowered)
+        result = lowerer.lowerExpression(
+            lowered, valueRequired && statement + 1 == expression.children.size
+        )
         if (statement + 1 < expression.children.size) lowerer.dropDiscarded(result, lowered)
         // (A branch ending in a call of type `never` leaves, as the
         // analyzer found: bootstrapInferIf.)
@@ -11332,21 +11335,23 @@ fun bootstrapLowerArithmetic(
 fun bootstrapLowerIf(
     var lowerer: BootstrapLowerer,
     expression: BootstrapExpression,
-    initial: int
+    initial: int,
+    valueRequired: bool
 ): int {
     var result = initial
+    // Only statement-position conditionals with no else may omit the join.
+    // Their arm is still lowered and discarded exactly as before.
+    val joinValue = valueRequired || expression.children[2].kind != "missing"
     // Reserve the result name before lowering the condition. The
     // condition may itself contain an if expression; deriving both
     // names from the unchanged nextLabel created duplicate locals and
     // made otherwise valid nested conditionals fail IR verification.
     val temporaryId = lowerer.allocateLabel()
     val temporary = "if_result_$temporaryId"
-    lowerer.emitControl(
-        bootstrapIrLocalZeroOpcode(lowerer.lowerRuntimeType(
-            lowerer.lowerExpressionType(expression)
-        )),
-        -1, -1, -1, temporary
-    )
+    val zeroOpcode = bootstrapIrLocalZeroOpcode(lowerer.lowerRuntimeType(
+        lowerer.lowerExpressionType(expression)
+    ))
+    if (joinValue) lowerer.emitControl(zeroOpcode, -1, -1, -1, temporary)
     val condition = lowerer.lowerExpression(expression.children[0])
     val thenLabel = lowerer.allocateLabel()
     val elseLabel = lowerer.allocateLabel()
@@ -11361,22 +11366,23 @@ fun bootstrapLowerIf(
         lowerer.dropDiscarded(thenValue, expression.children[1])
     }
     lowerer.leaveLocalScope(previousThenScope)
-    lowerer.emitControl("local.set", thenValue, -1, -1, temporary)
+    if (joinValue) lowerer.emitControl("local.set", thenValue, -1, -1, temporary)
     lowerer.emitControl("jump", -1, mergeLabel, -1, "")
     lowerer.emitControl("label", -1, elseLabel, -1, "")
     var elseValue = -1
     if (expression.children[2].kind == "missing") {
-        elseValue = lowerer.emit("const.i64", -1, -1, "0")
+        if (joinValue) elseValue = lowerer.emit("const.i64", -1, -1, "0")
     } else {
         val previousElseScope = lowerer.enterLocalScope()
         lowerer.addNullableRefinements(expression.children[0], false)
         elseValue = lowerer.lowerExpression(expression.children[2])
         lowerer.leaveLocalScope(previousElseScope)
     }
-    lowerer.emitControl("local.set", elseValue, -1, -1, temporary)
+    if (joinValue) lowerer.emitControl("local.set", elseValue, -1, -1, temporary)
     lowerer.emitControl("jump", -1, mergeLabel, -1, "")
     lowerer.emitControl("label", -1, mergeLabel, -1, "")
-    result = lowerer.emit("local.load", -1, -1, temporary)
+    result = if (joinValue) lowerer.emit("local.load", -1, -1, temporary)
+        else lowerer.emit("const.void", -1, -1, "")
     result
 }
 
@@ -11506,7 +11512,7 @@ fun bootstrapLowerWhile(
         lowerer, expression, mergeLabel, conditionLabel, lowerer.currentScope
     )
     lowerer.dropDiscarded(
-        lowerer.lowerExpression(expression.children[1]), expression.children[1]
+        lowerer.lowerExpression(expression.children[1], false), expression.children[1]
     )
     bootstrapLeaveLoopTarget(lowerer, labeled)
     lowerer.emitControl("jump", -1, conditionLabel, -1, "")
@@ -11543,7 +11549,7 @@ fun bootstrapLowerDoWhile(
         lowerer, expression, mergeLabel, conditionLabel, lowerer.currentScope
     )
     lowerer.dropDiscarded(
-        lowerer.lowerExpression(expression.children[0]), expression.children[0]
+        lowerer.lowerExpression(expression.children[0], false), expression.children[0]
     )
     bootstrapLeaveLoopTarget(lowerer, labeled)
     lowerer.emitControl("jump", -1, conditionLabel, -1, "")
@@ -11681,7 +11687,7 @@ fun bootstrapLowerFor(
         lowerer, expression, mergeLabel, incrementLabel, loopScope
     )
     lowerer.dropDiscarded(
-        lowerer.lowerExpression(expression.children[1]), expression.children[1]
+        lowerer.lowerExpression(expression.children[1], false), expression.children[1]
     )
     bootstrapLeaveLoopTarget(lowerer, labeled)
     lowerer.emitControl("jump", -1, incrementLabel, -1, "")
