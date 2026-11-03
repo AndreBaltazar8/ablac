@@ -19,7 +19,8 @@ def alive(pid):
     try:
         status = pathlib.Path(f"/proc/{pid}/stat").read_text()
         return status[status.rfind(")") + 2] != "Z"
-    except FileNotFoundError:
+    # A process exiting between open and read raises ESRCH, not ENOENT.
+    except (FileNotFoundError, ProcessLookupError):
         return False
 
 
@@ -27,7 +28,8 @@ def stopped(pid):
     try:
         status = pathlib.Path(f"/proc/{pid}/stat").read_text()
         return status[status.rfind(")") + 2] == "T"
-    except FileNotFoundError:
+    # A process exiting between open and read raises ESRCH, not ENOENT.
+    except (FileNotFoundError, ProcessLookupError):
         return False
 
 
