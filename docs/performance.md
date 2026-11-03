@@ -76,8 +76,14 @@ sections, by the agents who did them):
 - **The free lists keep what they serve.** They hold up to 128 MB (the compiler 32 MB,
   `memorySetFreeBlockLimit`), but between collections only a quarter more than they served
   in the last cycle, at least 32 MB: trees runs 35% fewer instructions, json-megabyte 6%,
-  at the same peak (json-megabyte 206 to 212 MB; a fixed 128 MB took it to 322 MB). Limits
-  by block size did worse.
+  at the same peak (json-megabyte 206 to 212 MB; a fixed 128 MB took it to 322 MB). If at
+  least 32 MiB was served and less than 1/64 as much remains idle, the next budget is twice
+  what was served, still capped: strings runs another 12.3% fewer instructions,
+  trees 9.0%, with json-megabyte unchanged at 214 MiB in the 2026-11-03 screen. This
+  collection-time check needs no extra allocation or free counters; the compiler's
+  32 MiB cap is unchanged. Unconditional doubling peaked at 361 MiB on json-megabyte;
+  releasing blocks untouched across collections reduced that to 226 MiB but cost cycles.
+  Limits by block size did worse.
 - **Smaller fixed costs.** A root frame's pop that finds another frame on top (an
   export's global roots) is out of line and cold instead of inlined at every return;
   `ByteBuffer.appendByteValue` writes its byte into the stage (websocket-codec 22% fewer

@@ -17,6 +17,11 @@
 
 ## Bugs seen
 
+- [ ] `tools/test-build-killed.sh` sometimes fails under a loaded parallel suite with
+  `no kill landed while a temporary was on its way` (2026-11-03, master b1abbb25 and
+  perf-free-growth, JOBS=10). No partial output was observed; the kill-point polling
+  missed all temporary windows. Recheck alone before treating it as a build regression.
+
 - [ ] Fresh-worktree `tools/test-compile-native.sh` fails at `fs-read 1` (2026-11-03): its fixture compares `#path(".").entries().size` with runtime entries, but compilation creates `build/` after the snapshot. Instrumented cold copies fail check 8 with both the unpatched compiler and fix-absolute-source; the suite passes alone once `build/` exists. Use a stable fixture directory for the listing comparison.
 
 - [ ] **Xtensa `llc` aborts on frames of 128 to 255 bytes that take a stack address.** `LLVM ERROR: Error
@@ -215,10 +220,6 @@ Package-side work (not changed from ablac):
   (two 32-bit slots a word, old tables retired at once; worktree ablac-map-dense, report in
   its build/map-lab/report.json) ran maps 30% fewer cycles, but json-megabyte peaked 7.7%
   higher: a smaller live heap moves its collections later, so the peak grows.
-- [ ] **The free lists grow slowly for programs of many block sizes** (2026-11-03): they keep a
-  quarter more than they served, so strings, whose sizes vary, gets 5% of the 27% a fixed 128 MB
-  gave it (trees, one size, all of it). Doubling the growth took json-megabyte's peak from 212 to
-  318 MB; limits by size did worse for both.
 - [ ] **`ablac test --o1` costs short suites build time** (2026-11-03): a bundle's build is about
   65% dearer than `--fast`'s (abla-qr: 28 G instructions against 17 G) for tests that run 10x
   faster; a suite of tests that each run in milliseconds is slower than before. `--fast` keeps
