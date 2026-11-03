@@ -129,6 +129,7 @@ test-serial: ablac
 	tools/test-uint256.sh $(COMPILER)
 	tools/test-array-truncate.sh $(COMPILER)
 	tools/test-array-filled.sh $(COMPILER)
+	tools/test-inferred-command.sh $(COMPILER)
 	tools/test-memory-checkpoint.sh $(COMPILER)
 	tools/test-memory-drop-root.sh $(COMPILER)
 	tools/test-collection-modes.sh $(COMPILER)
