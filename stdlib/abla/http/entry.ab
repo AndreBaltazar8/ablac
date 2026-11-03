@@ -4,6 +4,9 @@
 import "abla/net"
 import "abla/sys/linux/process"
 import "abla/text"
+import "abla/bytes"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
 
 class HttpHeader(val name: string, val value: string)
 
@@ -130,38 +133,7 @@ fun HttpRequest.parameter(name: string): string {
             found = true
         }
     }
-    var searchBegin = 0
-    while (!found && name.size > 0 && searchBegin < this.query.size) {
-        val candidate = textFindSequence(
-            this.query, name, searchBegin, this.query.size
-        )
-        if (candidate < 0) searchBegin = this.query.size
-        else {
-            val valueBegin = candidate + name.size + 1
-            val boundary = candidate == 0 || this.query[candidate - 1] == 38
-            if (boundary && valueBegin <= this.query.size &&
-                this.query[valueBegin - 1] == 61) {
-                var fieldEnd = textFindByte(
-                    this.query, 38, valueBegin, this.query.size
-                )
-                if (fieldEnd < 0) fieldEnd = this.query.size
-                result = this.query.slice(valueBegin, fieldEnd)
-                found = result != ""
-            }
-            searchBegin = candidate + 1
-        }
-    }
-    var fieldBegin = 0
-    while (!found && name.size == 0 && fieldBegin <= this.query.size) {
-        var fieldEnd = textFindByte(this.query, 38, fieldBegin, this.query.size)
-        if (fieldEnd < 0) fieldEnd = this.query.size
-        val equals = textFindByte(this.query, 61, fieldBegin, fieldEnd)
-        if (equals == fieldBegin) {
-            result = this.query.slice(equals + 1, fieldEnd)
-            found = result != ""
-        }
-        fieldBegin = fieldEnd + 1
-    }
+    if (!found) result = httpQueryParameter(this.query, name)
     result
 }
 
@@ -185,42 +157,71 @@ fun HttpRequest.routeParameter(name: string): string {
 
 // Query-only lookup for applications that do not need the combined
 // route-precedence convenience of parameter().
-fun HttpRequest.queryParameter(name: string): string {
-    var result = ""
-    var found = false
-    var searchBegin = 0
-    while (!found && name.size > 0 && searchBegin < this.query.size) {
-        val candidate = textFindSequence(
-            this.query, name, searchBegin, this.query.size
-        )
-        if (candidate < 0) searchBegin = this.query.size
-        else {
-            val valueBegin = candidate + name.size + 1
-            val boundary = candidate == 0 || this.query[candidate - 1] == 38
-            if (boundary && valueBegin <= this.query.size &&
-                this.query[valueBegin - 1] == 61) {
-                var fieldEnd = textFindByte(
-                    this.query, 38, valueBegin, this.query.size
-                )
-                if (fieldEnd < 0) fieldEnd = this.query.size
-                result = this.query.slice(valueBegin, fieldEnd)
-                found = result != ""
-            }
-            searchBegin = candidate + 1
-        }
-    }
+fun HttpRequest.queryParameter(name: string): string =
+    httpQueryParameter(this.query, name)
+
+private trusted fun httpQueryParameter(query: string, name: string): string {
+    if (ablaAtCompileTime()) return httpQueryParameterChecked(query, name)
+    val size = query.size
+    val nameSize = name.size
+    if (nameSize >= size) return ""
+    // Keep both strings alive until the bounded scan finishes. No call in
+    // the scan allocates; only the returned value is sliced afterward.
+    val data = ablaUnsafeStringAddress(query)
+    val key = ablaUnsafeStringAddress(name)
     var fieldBegin = 0
-    while (!found && name.size == 0 && fieldBegin <= this.query.size) {
-        var fieldEnd = textFindByte(this.query, 38, fieldBegin, this.query.size)
-        if (fieldEnd < 0) fieldEnd = this.query.size
-        val equals = textFindByte(this.query, 61, fieldBegin, fieldEnd)
-        if (equals == fieldBegin) {
-            result = this.query.slice(equals + 1, fieldEnd)
-            found = result != ""
+    while (fieldBegin < size) {
+        val nameEnd = fieldBegin + nameSize
+        if (nameEnd < size &&
+            ablaUnsafeLoadU8(nativePointerFromAddress(data + nameEnd)) == 61 &&
+            (nameSize == 0 ||
+                ablaUnsafeLoadU8(nativePointerFromAddress(data + nameEnd - 1)) ==
+                    ablaUnsafeLoadU8(nativePointerFromAddress(key + nameSize - 1)))) {
+            var equal = true
+            var offset = 0
+            while (equal && offset < nameSize) {
+                equal = ablaUnsafeLoadU8(nativePointerFromAddress(data + fieldBegin + offset)) ==
+                    ablaUnsafeLoadU8(nativePointerFromAddress(key + offset))
+                offset = offset + 1
+            }
+            if (equal) {
+                val valueBegin = nameEnd + 1
+                var fieldEnd = valueBegin
+                while (fieldEnd < size &&
+                    ablaUnsafeLoadU8(nativePointerFromAddress(data + fieldEnd)) != 38) {
+                    fieldEnd = fieldEnd + 1
+                }
+                if (fieldEnd > valueBegin) return query.slice(valueBegin, fieldEnd)
+            }
         }
-        fieldBegin = fieldEnd + 1
+        while (fieldBegin < size &&
+            ablaUnsafeLoadU8(nativePointerFromAddress(data + fieldBegin)) != 38) {
+            fieldBegin = fieldBegin + 1
+        }
+        fieldBegin = fieldBegin + 1
     }
-    result
+    ""
+}
+
+private fun httpQueryParameterChecked(query: string, name: string): string {
+    var fieldBegin = 0
+    while (fieldBegin < query.size) {
+        // Only field starts can match. Check the delimiter and final byte
+        // before comparing the shared prefixes common in numbered keys.
+        val nameEnd = fieldBegin + name.size
+        if (nameEnd < query.size && query[nameEnd] == 61 &&
+            (name.size == 0 || query[nameEnd - 1] == name[name.size - 1]) &&
+            httpCoreRangeEqual(query, fieldBegin, nameEnd, name, 0, name.size)) {
+            var fieldEnd = textFindByte(query, 38, nameEnd + 1, query.size)
+            if (fieldEnd < 0) fieldEnd = query.size
+            val result = query.slice(nameEnd + 1, fieldEnd)
+            if (result != "") return result
+        }
+        val next = textFindByte(query, 38, fieldBegin, query.size)
+        if (next < 0) return ""
+        fieldBegin = next + 1
+    }
+    ""
 }
 
 private fun httpCoreRangeEqual(
