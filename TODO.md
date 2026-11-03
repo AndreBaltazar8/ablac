@@ -71,8 +71,6 @@
       `Tagged` hides the constructor in `Box<string>(n = 1)`. Generic probing precedes delegated-property rewriting, so the
       generated wrapper cannot yet safely pass that delegate. Pass `tag` explicitly; renaming the local alone still gives
       `constructor.argument:Box<string>` for this example.
-- [ ] Named calls cannot borrow an affine argument place: with `fun view(owner: Shared<Ticket>): borrow(owner) Ticket = owner.get()`,
-      `view(owner = owner)` fails `ownership.move-required` for the generated temporary, while positional `view(owner)` works.
 - [ ] `tools/test-linux-process.sh` failed once under `make test-full` ("close unblocks them", 1 of 4 runs on 2026-11-02), then passed
       25 of 25 alone. Not looked into.
 - [ ] macOS: nobody has compared a local rebuild with the published binary, and
