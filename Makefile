@@ -258,6 +258,7 @@ test-serial: ablac
 	tools/test-portable-buffered-io.sh $(COMPILER)
 	tools/test-portable-io.sh $(COMPILER)
 	tools/test-stable-native-symbols.sh $(COMPILER)
+	tools/test-function-identities.sh $(COMPILER)
 	tools/test-structured-type-reflection.sh $(COMPILER)
 	tools/test-target-descriptors.sh $(COMPILER)
 	tools/test-text-unicode.sh $(COMPILER)

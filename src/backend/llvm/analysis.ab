@@ -1,10 +1,13 @@
 import "../../ir.ab"
 import "../../eval.ab"
+import "../../eval_checks.ab"
 import "debug.ab"
 import "../../sema.ab"
 import "core.ab"
 import "../../simd_types.ab"
 import "abla/unsafe/memory/raw"
+import "abla/sys/linux/process"
+import "abla/sys/linux"
 import "bindings.ab"
 import "functions.ab"
 import "../../module_paths.ab"
@@ -3696,30 +3699,58 @@ fun bootstrapLlvmFunctionIdentities(
 ): BootstrapLlvmFunctionIdentities {
     val symbols: array<string> = []
     val runtimeIds: array<int> = []
-    // Each function collides with every earlier one sharing its symbol or its runtime id:
-    // counted as those sharing the symbol, plus those sharing the id, less those sharing both.
+    // Symbols must be unique. Runtime ids are compact handles, not linkage
+    // names: a hash collision there is resolved within this program's table.
     val bySymbol = bootstrapIrNameTable(program.functions.size)
     val byId = bootstrapIrNameTable(program.functions.size)
-    val byBoth = bootstrapIrNameTable(program.functions.size)
     var collisions = 0
     var function = 0
     while (function < program.functions.size) {
         val symbol = bootstrapLlvmFunctionSymbol(program.functions[function])
-        val runtimeId = bootstrapLlvmFunctionRuntimeId(
-            program.functions[function]
-        )
-        val id = "$runtimeId"
-        val both = "$symbol\n$runtimeId"
+        val runtimeId = bootstrapLlvmFunctionRuntimeId(program.functions[function])
         val sameSymbol = bySymbol.find(symbol, 0)
-        val sameId = byId.find(id, 0)
-        val sameBoth = byBoth.find(both, 0)
-        collisions = collisions + sameSymbol + sameId - sameBoth
+        collisions = collisions + sameSymbol
         bySymbol.put(symbol, sameSymbol + 1)
-        byId.put(id, sameId + 1)
-        byBoth.put(both, sameBoth + 1)
         symbols.append(symbol)
         runtimeIds.append(runtimeId)
+        val owner = byId.find("$runtimeId", -1)
+        // Reserve every original id before assigning replacements, preserving
+        // all non-colliding ids. Symbol order picks the same keeper even if
+        // declarations are reordered.
+        if (owner < 0 || bootstrapEvalStringOrder(symbol, symbols[owner]) < 0) {
+            byId.put("$runtimeId", function)
+        }
         function = function + 1
+    }
+    val displaced: array<int> = []
+    function = 0
+    while (function < program.functions.size) {
+        if (byId.find("${runtimeIds[function]}", -1) != function) {
+            displaced.append(function)
+            var at = displaced.size - 1
+            while (at > 0 && bootstrapEvalStringOrder(
+                symbols[function], symbols[displaced[at - 1]]
+            ) < 0) {
+                displaced[at] = displaced[at - 1]
+                at = at - 1
+            }
+            displaced[at] = function
+        }
+        function = function + 1
+    }
+    val trace = linuxEnvironment("ABLA_FUNCTION_ID_TRACE")
+    for (index in displaced) {
+        var id = runtimeIds[index]
+        if (trace.found && trace.value == "1") {
+            val owner = byId.find("$id", -1)
+            linuxWriteStandardError("function-id collision $id: `${program.functions[owner].name}` / `${program.functions[index].name}`\n")
+        }
+        while (byId.find("$id", -1) >= 0) {
+            id = id + 1
+            if (id == 1000000007) id = 0
+        }
+        byId.put("$id", index)
+        runtimeIds[index] = id
     }
     BootstrapLlvmFunctionIdentities(symbols, runtimeIds, collisions)
 }

@@ -17,6 +17,8 @@
 
 ## Bugs seen
 
+- [ ] Fresh-worktree `tools/test-compile-native.sh` fails at `fs-read 1` (2026-11-03): its fixture compares `#path(".").entries().size` with runtime entries, but compilation creates `build/` after the snapshot. Instrumented cold copies fail check 8 with both the unpatched compiler and fix-absolute-source; the suite passes alone once `build/` exists. Use a stable fixture directory for the listing comparison.
+
 - [ ] **Xtensa `llc` aborts on frames of 128 to 255 bytes that take a stack address.** `LLVM ERROR: Error
   while trying to spill A6 from class AR: Cannot scavenge register without an emergency spill slot!`, seen
   2026-11-01 on `esp32RecoveredZN3nvs7Storage9writeItem...` from abla-embedded's `tools/build-example
