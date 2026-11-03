@@ -1011,6 +1011,24 @@ fun bootstrapGenericFailure(
  *  type arguments, the receiver's type `receiver` of an extension's call,
  *  then the arguments' types (from child `firstArgument`). The instance's
  *  name, or "" (a failure recorded) when a parameter stays unbound. */
+// The default's explicit types belong to the callee's generic scope. A
+// spelling copied into a nongeneric caller is not a binding, even if that
+// caller also has a concrete type with the same name.
+fun bootstrapGenericDefaultMentions(expression: BootstrapExpression, parameter: string): bool {
+    var text = ""
+    if (expression.kind == "type" || expression.kind == "array" ||
+        expression.kind == "is" || expression.kind == "as?") text = expression.text
+    else if (expression.kind == "call" || expression.kind == "member.call") {
+        val head = bootstrapGenericCalleeName(expression.text)
+        if (head.size < expression.text.size) text = expression.text.slice(head.size, expression.text.size)
+    }
+    if (text != "" && bootstrapGenericSubstituteWords(text, [parameter], ["__abla_unbound_type"]) != text) return true
+    for (child in expression.children) {
+        if (bootstrapGenericDefaultMentions(child, parameter)) return true
+    }
+    false
+}
+
 fun bootstrapGenericBind(
     var analyzer: BootstrapAnalyzer,
     expression: BootstrapExpression,
@@ -1048,7 +1066,8 @@ fun bootstrapGenericBind(
     }
     val requests: array<string> = []
     val bindings: array<string> = []
-    for (parameter in parameters) bindings.append("")
+    val defaultBindings: array<bool> = []
+    for (parameter in parameters) { bindings.append(""); defaultBindings.append(false) }
     val explicit = bootstrapGenericCalleeArguments(expression.text)
     // An extension's explicit type arguments may name only the parameters its
     // receiver's type doesn't fix (`bag.remap<string>(…)`: `U`, not `T`).
@@ -1120,10 +1139,27 @@ fun bootstrapGenericBind(
         } else {
             val type = analyzer.infer(value)
             if (parameter >= 0 && parameter < patterns.size) {
+                val before: array<string> = []
+                val copiedDefault = value.kind == "identifier" && value.text.startsWith("__abla_named_") &&
+                    bootstrapGenericFind(value.text, "_default_", 0) >= 0 &&
+                    parameter < analyzer.generics.declarations[template].parameterDefaults.size
+                if (copiedDefault) for (binding in bindings) before.append(binding)
                 bootstrapGenericUnifyConforming(
                     analyzer.declarations, analyzer.generics,
                     patterns[parameter], bootstrapGenericParse(type), parameters, bindings
                 )
+                if (copiedDefault) {
+                    val written = analyzer.generics.declarations[template].parameterDefaults[parameter]
+                    var item = 0
+                    while (item < parameters.size) {
+                        if (before[item] == "" && bindings[item] != "" &&
+                            bootstrapGenericDefaultMentions(written, parameters[item]) &&
+                            bootstrapGenericMentions(bootstrapGenericParse(bindings[item]), [parameters[item]])) {
+                            defaultBindings[item] = true
+                        }
+                        item = item + 1
+                    }
+                }
             }
         }
         child = child + 1
@@ -1161,7 +1197,20 @@ fun bootstrapGenericBind(
     if (failed) return BootstrapGenericInstanceCall("", parameters, bindings)
     var index = 0
     while (index < parameters.size) {
-        if (bindings[index] == "") {
+        // A copied default can refer to the template's own `T` before its
+        // caller has bound it. It is not a concrete type merely because the
+        // spelling reached unification. Real classes of that name are valid.
+        var unresolved = bindings[index] == "" || defaultBindings[index]
+        if (!unresolved) {
+            for (parameter in parameters) {
+                if (analyzer.findKind(parameter) != "class" &&
+                    analyzer.findKind(parameter) != "interface" &&
+                    bootstrapGenericMentions(bootstrapGenericParse(bindings[index]), [parameter])) {
+                    unresolved = true
+                }
+            }
+        }
+        if (unresolved) {
             bootstrapGenericFailure(analyzer, expression, "generic.cannot-infer:$visible:${parameters[index]}")
             return BootstrapGenericInstanceCall("", parameters, bindings)
         }
