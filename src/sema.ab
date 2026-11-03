@@ -13061,6 +13061,28 @@ fun bootstrapInferStringTemplate(
     result
 }
 
+// A helper that unconditionally inserts an `any` parameter into text has
+// the same printable-type requirement at its call site as a direct template.
+// Don't infer this contract through branches or closures: those may guard it.
+fun bootstrapUnconditionalParameterInterpolation(
+    expression: BootstrapExpression, parameter: string
+): bool {
+    if (expression.kind == "block" || expression.kind == "if" || expression.kind == "when" ||
+        expression.kind == "&&" || expression.kind == "||" ||
+        expression.kind == "while" || expression.kind == "do.while" ||
+        expression.kind == "for" || expression.kind == "lambda" ||
+        expression.kind == "lambda.move") return false
+    if (expression.kind == "string.template") {
+        for (part in expression.children) {
+            if (part.kind == "identifier" && part.text == parameter) return true
+        }
+    }
+    for (child in expression.children) {
+        if (bootstrapUnconditionalParameterInterpolation(child, parameter)) return true
+    }
+    false
+}
+
 @noinline
 fun bootstrapInferCompile(
     var analyzer: BootstrapAnalyzer,
@@ -13818,6 +13840,35 @@ fun bootstrapInferCall(
                     functionType,
                     argument
                 )
+            }
+            // Preserve erased `any` values, but reject a known unsupported
+            // type before a text helper can turn it into a runtime trap.
+            if (!localCallable && expected == "any") {
+                val raw = bootstrapBorrowElementType(actual)
+                // Dynamic text helpers already accept null and their
+                // printable element types, including nullable inputs.
+                val element = if (bootstrapIsNullableType(raw))
+                    bootstrapNullableElementType(raw) else raw
+                val underlying = analyzer.scalarTypeUnderlying(element)
+                val printable = if (underlying == "") element else underlying
+                if (printable != "any" && printable != "unknown" &&
+                    printable != "string" && printable != "bool" && printable != "null" &&
+                    printable != "f32" && printable != "f64" &&
+                    !bootstrapIsIntegerScalarType(printable) && !bootstrapIsUint256Type(printable)) {
+                    val declaration = analyzer.functionDeclarations.find(expression.text)
+                    if (declaration >= 0 && argument < analyzer.declarations[declaration].parameters.size &&
+                        bootstrapUnconditionalParameterInterpolation(
+                            analyzer.declarations[declaration].expression,
+                            analyzer.declarations[declaration].parameters[argument]
+                        )) {
+                        analyzer.inferBegin = expression.children[argument].begin
+                        analyzer.inferSource = analyzer.currentSourceIdentity
+                        analyzer.fail("string.interpolation:$printable")
+                        if (expression.text == "mvcHtmlDynamic" && printable == "MvcHtml") {
+                            analyzer.diagnostics = "${analyzer.diagnostics}help: use `{node ...}` to compose an MvcHtml child\n"
+                        }
+                    }
+                }
             }
             if (bootstrapImplicitIntegerNarrowing(
                 expected, analyzer.scalarValueType(actual),

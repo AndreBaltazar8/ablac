@@ -182,6 +182,11 @@ A nullable value must be checked for `null` first
 and top-level `val`s holding such strings is folded into one constant at
 compile time.
 
+When a known non-printable value is passed to an expression-bodied helper
+that unconditionally interpolates its `any` parameter, the call is rejected.
+Such helpers accept nullable printable values, writing `null` for null. In
+`$mvcview`, use `{node value}` for an `MvcHtml` child.
+
 ## Values and variables
 
 `val` declares a binding that is assigned once; `var` one that can be

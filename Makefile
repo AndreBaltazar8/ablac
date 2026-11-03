@@ -154,6 +154,7 @@ test-serial: ablac
 	tools/test-proc-self-exe.sh $(COMPILER)
 	tools/test-date.sh $(COMPILER)
 	tools/test-interpolate-fixed-width.sh $(COMPILER)
+	tools/test-any-text-validation.sh $(COMPILER)
 	tools/test-contextual-keywords.sh $(COMPILER)
 	tools/test-lambda-void-assignment.sh $(COMPILER)
 	tools/test-process-environment.sh $(COMPILER)
