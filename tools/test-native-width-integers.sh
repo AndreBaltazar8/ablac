@@ -35,4 +35,25 @@ if [[ $status -ne 42 ]]; then
     exit 1
 fi
 
-printf '%s\n' 'native-width integer arithmetic and direct scalar exports passed'
+# Narrow and unsigned array reads must retain width/sign, including through
+# generic functions, iteration, mutation and reboxing. The checked word getter
+# must still panic for both negative and past-the-end indices.
+for mode in "" --o1 --fast; do
+    "$compiler" build "$project_root/tests/cases/modules/narrow-array-getters.ab" \
+        -o "$output_directory/arrays" $mode
+    "$compiler" build "$project_root/tests/cases/modules/narrow-array-trap.ab" \
+        -o "$output_directory/array-trap" $mode
+    set +e
+    "$output_directory/arrays"
+    array_status=$?
+    "$output_directory/array-trap" 2>"$output_directory/array-past.err"
+    past_status=$?
+    "$output_directory/array-trap" negative 2>"$output_directory/array-negative.err"
+    negative_status=$?
+    set -e
+    [[ $array_status -eq 42 && $past_status -eq 101 && $negative_status -eq 101 ]]
+    grep -qx 'panic: index 2 out of bounds for array of size 2' "$output_directory/array-past.err"
+    grep -qx 'panic: index -1 out of bounds for array of size 2' "$output_directory/array-negative.err"
+done
+
+printf '%s\n' 'native-width integer arithmetic, scalar exports and checked integer arrays passed'

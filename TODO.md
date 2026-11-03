@@ -17,6 +17,12 @@
 
 ## Bugs seen
 
+- [ ] Compound stores into `array<char>` do not wrap to the element width.
+  Repro: `val xs: array<char> = [char(255)]; xs[0] += char(1)` stores
+  the integer 256, although `char(255) + char(1)` is 0. Confirmed on
+  e8a19f2c; scalar char getters correctly canonicalize the loaded value,
+  but the store must also wrap before boxing. Fix the setter separately.
+
 - [ ] Additional `--fast` ELF sections: LLVM's in-process C API ignores
   `--function-sections`/`--data-sections` set through its command-line parser.
   A manual section screen moved relocated constants out of RELRO and is unsafe.
