@@ -101,7 +101,7 @@ else
     # Leave one CPU second between SIGXCPU and the hard SIGKILL fallback so
     # the normal exit status identifies the CPU limit (152).
     set +e
-    bounded timeout \
+    limited=(timeout \
         --signal=TERM \
         --kill-after="${kill_grace_seconds}s" \
         "${wall_seconds}s" \
@@ -110,7 +110,23 @@ else
             --cpu="${cpu_seconds}:$((cpu_seconds + 1))" \
             --core=0:0 \
             -- \
-            "$@"
+            "$@")
+    if command -v setpriv >/dev/null 2>&1; then
+        # The timeout owns a separate process group. If this shell dies, ask
+        # timeout to forward TERM to that group and apply its KILL grace. The
+        # PPID check closes the race where the shell dies before setpriv arms
+        # the parent-death signal, so no payload starts after reparenting.
+        limited=(setpriv --pdeathsig TERM bash -c '
+            expected_parent=$1
+            shift
+            [[ $PPID == "$expected_parent" ]] || exit 125
+            exec "$@"
+        ' _ "$$" "${limited[@]}")
+    fi
+    # Minimal Linux installations without setpriv keep the previous timeout
+    # behavior; their bounded process group cannot follow an uncatchable kill
+    # of this shell.
+    bounded "${limited[@]}"
     set -e
 fi
 

@@ -71,4 +71,8 @@ set -e
 [[ $status -eq 2 ]] || exit 1
 [[ $invalid_output == *'must be a positive integer'* ]] || exit 1
 
+if [[ $(uname -s) == Linux ]]; then
+    python3 "$root/tests/cases/run-limited/parent-death.py" "$runner"
+fi
+
 printf '%s\n' 'limited runner tests passed'

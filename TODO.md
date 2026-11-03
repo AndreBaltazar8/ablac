@@ -62,8 +62,9 @@
       and `suite-package-providers` failed to resolve a local git dependency, with neither recurring
       in the next runs. Suspected: the Nix profile changing mid-run. Not confirmed, but during a `home-manager switch`
       on 2026-11-01, `~/.nix-profile/bin/git` was missing for a moment.
-- [ ] `kill -- -$session` doesn't reach a compiler started through `build/ablac`: `tools/run-limited.sh`'s `timeout` makes it a process
-      group of its own. SIGTERM is forwarded; SIGKILL to the group leaves `ablac` running until its limit (2026-11-01).
+- [ ] macOS: `tools/run-limited.sh` starts its payload in a separate process group; SIGKILL of the caller's group can leave that
+      payload running. The Linux runner handles its supervisor's parent death when `setpriv` is available. The macOS case has not
+      been tested on a Mac.
 - [ ] `E_NAMED_ARGUMENT_HIDDEN` remains when a generic constructor also has a delegated property and an omitted default calls a
       constructor hidden by the caller, with no earlier argument giving the type. For example, with
       `class Tagged<T>(val n: int)`, `class Slot<T>(var value: T) { fun getValue(): T = value }`, and
