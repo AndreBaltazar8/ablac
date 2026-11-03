@@ -729,7 +729,18 @@ fun HttpAsyncClient.writeReady(slot: int): void {
 // Inspects buffered response bytes; completes the request when the message
 // is whole. Returns true when the response finished.
 fun HttpAsyncClient.parseResponse(slot: int, eof: bool): bool {
-    val input = this.connectionInputs[slot]
+    var input = this.connectionInputs[slot]
+    val finalOffset = httpFinalResponseOffset(input)
+    if (finalOffset > 0) {
+        // Receiving an interim response proves the peer handled the request.
+        // Dropping those bytes must not make EOF look like a stale idle socket
+        // on which it would be safe to automatically resend the request.
+        val request = this.connectionRequests[slot]
+        if (request >= 0) this.requestRetried[request] = true
+        input = input.slice(finalOffset, input.size)
+        this.connectionInputs[slot] = input
+        this.connectionHeaderEnds[slot] = -1
+    }
     if (this.connectionHeaderEnds[slot] < 0) {
         this.connectionHeaderEnds[slot] = httpHeaderEnd(input)
         if (this.connectionHeaderEnds[slot] < 0) {
@@ -750,6 +761,7 @@ fun HttpAsyncClient.parseResponse(slot: int, eof: bool): bool {
     var body = ""
     var keepAlive = !httpCoreHeaderTokenContains(response.header("Connection"), "close") &&
         textFindSequence(input, "HTTP/1.1", 0, 8) == 0
+    if (response.status == 101) keepAlive = false
     val requestSlot = this.connectionRequests[slot]
     val headRequest = requestSlot >= 0 && httpRequestIsHead(this.requestPayloads[requestSlot])
     if (headRequest || (response.status >= 100 && response.status < 200) ||
