@@ -19,6 +19,81 @@ object emission, and linking.
 Compare two compilers with `tools/bench-compare.py` (compile instructions, stripped size,
 run cycles and instructions, on `tests/benchmarks`).
 
+## Faster builds, smaller and faster programs, ten times faster tests (2026-11-03)
+
+Against master `753d1d10` (v0.2.32 plus the previous round), everything below and in the
+next two sections measured together, `tools/bench-compare.py` (13 programs, rounds of 5)
+on a machine loaded by other builds (load average around 40):
+
+| Metric (geometric mean) | Change |
+|---|---:|
+| Release build, instructions | -21.0% |
+| Release build, cycles (all processes) | -23.3% |
+| Release build, wall clock (median of 5, alternating; before the last three runtime changes) | -21.7% (-12% to -31% each) |
+| Stripped size | -9.6% (fib -13.5%, json-megabyte -8.9%) |
+| Run instructions (11 programs) | -11.3% (trees -37%, websocket-codec -24%, matrix -15%, nbody -13%) |
+| Run cycles (same, median of 5) | -5.8% |
+| `abla-compare` server, user instructions per request (9 workloads) | -3.4%, every workload lower |
+| `abla-compare` server, stripped size | -9.7% (290,000 to 261,760 bytes) |
+| `ablac test` of abla-qr (9 files, `--no-cache`) | 316 s to 51 s; 7.06 T to 0.50 T instructions |
+| `ablac test` of abla-pdf (8 files, `--no-cache`) | 323 s to 67 s; 7.12 T to 0.83 T instructions |
+| abla-embedded's Xtensa `tests/package-import.ab`, compiler peak | 3.15 GB (v0.2.32) to 2.94 GB |
+
+Cycles and times move by up to 20% with where code lands and with the load: fib runs the
+same instructions and showed +5 to +9% cycles in these runs; instructions are the measure.
+
+What changed (the frontend, the runtime's string paths and its startup are the next
+sections, by the agents who did them):
+
+- **A trimmed O2 pipeline.** A Linux release executable's module goes through LLVM 23's
+  `default<O2>,globaldce` as `opt -print-pipeline-passes` writes it, without 21 passes
+  (`BOOTSTRAP_HOST_RELEASE_PASSES`): each pass was dropped in turn over the benchmarks'
+  kept IR, twice over, then each dropped one put back in turn over the server's. opt and
+  llc do 14.4% less work; programs are 0.3% smaller and run 0.4% fewer instructions, the
+  server 1.6% fewer a request. Constraint elimination looked free on the benchmarks and
+  cost the server's byte loops 13% (body-16k): a pipeline change needs a server beside the
+  benchmarks. An LLVM that can't parse the list gets `default<O2>,globaldce`.
+- **A large module's code generation runs in parallel.** Past 20,000 instructions after
+  O2, the module is cut into four parts (as a development build's units are) and llc runs
+  on them at once, then `ld.lld -r` joins them: json-megabyte's llc 2.7 s to 1.6 s, 64
+  bytes larger. The count is fixed so the executable is the same on every machine.
+- **The link runs ld.lld without clang.** The first link asks clang (`-###`) for its
+  command and keeps it in the cache directory under its arguments and the environment
+  clang and its Nix wrapper read; later links run ld.lld directly (60 ms of a small
+  program's 330 ms was the wrapper's shell script and clang's start). The kept command
+  leaves out crti, crtn, crtbegin and crtend, which an Abla program doesn't use: fib went
+  from 15,096 to 13,920 bytes. A failing direct link, or `ABLA_LINK_DIRECT=0`, goes
+  through clang.
+- **An array's slow paths only read memory.** `ArrayGetWordOther` and `ArrayGetOther`
+  carry LLVM's `memory(read, …)`: they read and return, or trap or panic and never
+  return. LLVM then keeps a loop's invariant loads out of it: nbody 13% fewer
+  instructions, matrix 15%, dispatch 7%.
+- **The free lists keep what they serve.** They hold up to 128 MB (the compiler 32 MB,
+  `memorySetFreeBlockLimit`), but between collections only a quarter more than they served
+  in the last cycle, at least 32 MB: trees runs 35% fewer instructions, json-megabyte 6%,
+  at the same peak (json-megabyte 206 to 212 MB; a fixed 128 MB took it to 322 MB). Limits
+  by block size did worse.
+- **Smaller fixed costs.** A root frame's pop that finds another frame on top (an
+  export's global roots) is out of line and cold instead of inlined at every return;
+  `ByteBuffer.appendByteValue` writes its byte into the stage (websocket-codec 22% fewer
+  instructions); the compiler's first collection waits for 128 MB, as
+  `memorySetCollectionGrowth` now also moves the first threshold (it had collected at
+  32 MB in the middle of a small build); small builds skip the collection after
+  emission.
+- **`ablac test` builds with `--o1`.** Test programs were `--fast` builds (no inlining,
+  O0 code generation), and a suite's time is its tests running: abla-qr's slowest test ran
+  2,975 G instructions, 276 G at `--o1`, for 17 G more to build. `--fast` keeps the old
+  profile.
+
+Measured and dropped: O3 (no faster, 3% dearer); lower inline thresholds (150 to 200:
+programs larger and slower); llc tail-duplication, branch-folding and jump-table flags
+(fib 21% slower); no loop alignment (1.3% smaller, kept for speed); `memcmp` for string
+equality (freestanding AArch64 programs have no `bcmp`); limits on the free lists by
+block size; reading a map's slots directly (0.4%: maps waits on cache misses, not
+instructions); "PIC/PIE Level" module flags (0.1% smaller); `minsize` on the C `main`
+wrapper as it was: the program's main is inlined into it, and dispatch's loop divided by
+7 with `idiv` (10% more cycles), so the wrapper now calls main without inlining it.
+
 ## Smaller native startup and collector (2026-11-03)
 
 The size work on top of `compiler-perf-3` (`ec2fca9b`, plus the global-root
@@ -123,12 +198,12 @@ would otherwise test the wrong case. With that fixture and checksum corrected,
 A compiler self-build succeeds, and its json-readers LLVM text is byte-identical
 to that emitted by the previous stage of the compiler.
 
-The separate compiler-GC-stress check does **not** pass: both master and the
-candidate crash in `__ablaRuntimeArrayGetOther` called by
-`bootstrapRewriteModuleSource`. GDB shows the same instruction offset (+65)
-and invalid address (`0x736c61626f`, `SEGV_MAPERR`) in the untouched baseline
-compiler/sysroot and the rebuilt candidate. This is a pre-existing correctness
-issue, distinct from the passing program-level GC stress and regular suite.
+The separate compiler-GC-stress check did not pass at the time: master and the
+candidate crashed alike in `__ablaRuntimeArrayGetOther` called by
+`bootstrapRewriteModuleSource` (`0x736c61626f`, `SEGV_MAPERR`). It was a
+pre-existing bug, since fixed ("Globals are collector roots before their
+initializers run"): a module global was registered as a root only after the
+initializers, and a collection inside one freed a global's array.
 
 ## String readers pass words into shared paths (2026-11-02)
 

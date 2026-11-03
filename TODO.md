@@ -208,6 +208,18 @@ Package-side work (not changed from ablac):
   measured cleanly: a `--fast` compiler's numbers moved 25% between runs of the same binary.
 - [ ] **`abla-compare`'s server builds only a few percent faster than on v0.2.31** (3.9 to 3.8 s,
   2026-11-02): its frontend is about 1.7 s of it and its O2 1.8 s, and neither shrank much.
+  On 2026-11-03 its build ran 15% fewer instructions (frontend 6 to 10%, opt and llc 14%).
+- [ ] **A map lookup waits on a cache miss** (2026-11-03): 83% of `__ablaRuntimeMapEntry`'s cycles in
+  maps are the load of its slot from a 4 MB slot array; fewer instructions in the probe saved
+  0.4%. A denser table (32-bit slots, keys' hashes beside them) would miss less.
+- [ ] **The free lists grow slowly for programs of many block sizes** (2026-11-03): they keep a
+  quarter more than they served, so strings, whose sizes vary, gets 5% of the 27% a fixed 128 MB
+  gave it (trees, one size, all of it). Doubling the growth took json-megabyte's peak from 212 to
+  318 MB; limits by size did worse for both.
+- [ ] **`ablac test --o1` costs short suites build time** (2026-11-03): a bundle's build is about
+  65% dearer than `--fast`'s (abla-qr: 28 G instructions against 17 G) for tests that run 10x
+  faster; a suite of tests that each run in milliseconds is slower than before. `--fast` keeps
+  the old profile; the `--o1` pipeline itself hasn't been trimmed as the release one was.
 - [ ] **A map is built on boxed generic arrays.** maps spends 21% in `__ablaRuntimeMapEntry`, 12% in
   `abla_map_set`, 17% appending to and setting its parts' arrays (2026-11-02). Since string
   concatenation allocates out of line, maps runs 1.3% more instructions.
