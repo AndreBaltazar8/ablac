@@ -53,6 +53,12 @@ cmp "$output_directory/portable-io.expected" \
     --fast -o "$output_directory/filesystem"
 expect_status_42 "$output_directory/filesystem"
 
+"$compiler" build "$project_root/tests/cases/path-home/main.ab" \
+    --fast -o "$output_directory/path-home"
+HOME='/tmp/abla test home' ABLA_EXPECT_HOME='/tmp/abla test home' "$output_directory/path-home"
+env -u HOME ABLA_EXPECT_HOME='<none>' "$output_directory/path-home"
+HOME='' ABLA_EXPECT_HOME='<none>' "$output_directory/path-home"
+
 "$compiler" build "$project_root/tests/cases/modules/process-capture.ab" \
     --fast -o "$output_directory/process-capture"
 expect_status_42 "$output_directory/process-capture"

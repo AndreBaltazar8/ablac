@@ -86,6 +86,7 @@ fun main {
 | Function | Result |
 |---|---|
 | `path(text)`, `Path(text)`, `currentDirectory()` | a `Path` |
+| `homePath()` | a `Path?`: nonempty `HOME`, then on Linux the effective uid's home in `/etc/passwd`, or `null` |
 | `p.child(name)`, `p.parent()`, `p.name()`, `p.extension()`, `p.text` | path arithmetic |
 | `p.exists()`, `p.info()`, `p.revision()`, `p.isSymbolicLink()` | metadata. `FileInfo` has `size`, `kind`, `revision`, `exists()`, `isFile()`, `isDirectory()`, `modifiedMilliseconds()` |
 | `p.readText()` | the whole file as a string ("" when it can't be read) |
@@ -99,6 +100,8 @@ fun main {
 | `watchFile(p)`, `watchFiles(paths)` | a `FileWatch`; `changed()` reports a change since the last `refresh()` |
 
 Write operations return `false` on failure instead of stopping the program.
+`homePath()` does not consult NSS, so an LDAP/SSSD-only account without `HOME`
+does not have a fallback. On macOS it uses only `HOME`.
 `readText()` returns `""` for a file that doesn't exist or can't be read, the
 same as for an empty file, so check `exists()` (or `info().isFile()`) first
 when the difference matters, or use `readTextResult()`. A missing file's

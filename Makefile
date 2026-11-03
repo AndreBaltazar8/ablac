@@ -231,6 +231,7 @@ test-serial: ablac
 	tools/test-parse-int.sh $(COMPILER)
 	tools/test-string-join.sh $(COMPILER)
 	tools/test-array-remove-last.sh $(COMPILER)
+	tools/test-path-home.sh $(COMPILER)
 	tools/test-resource-drop-link.sh $(COMPILER)
 	tools/test-runtime-checks.sh $(COMPILER)
 	tools/test-float-integer-saturation.sh $(COMPILER)

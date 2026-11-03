@@ -3,9 +3,12 @@
 // small raw-kernel binary is preferred.
 
 import "abla/sys/linux"
+import "abla/sys/linux/process"
 import "abla/bytes"
 import "abla/unsafe/memory"
 import "abla/unsafe/memory/raw"
+
+private noescape extern:"intrinsic" fun ablaHostIsMacOS(): bool
 
 class Path(val text: string)
 
@@ -75,6 +78,57 @@ fun currentDirectory(): Path {
     }
     if (measured <= 0 || measured > buffer.capacity) buffer.close()
     Path(result)
+}
+
+// The uid and home fields of /etc/passwd are fields 3 and 6 respectively.
+private fun linuxPasswdHome(contents: string, uid: int): string? {
+    var begin = 0
+    while (begin < contents.size) {
+        var end = begin
+        while (end < contents.size && contents[end] != 10) end = end + 1
+        var field = 0
+        var start = begin
+        var position = begin
+        var parsedUid = -1
+        var home = ""
+        while (position <= end) {
+            if (position == end || contents[position] == 58) {
+                if (field == 2 && position > start) {
+                    var value = 0
+                    var valid = true
+                    var digitAt = start
+                    while (digitAt < position && valid) {
+                        val digit = contents[digitAt] - 48
+                        if (digit < 0 || digit > 9 || value > 429496729) valid = false
+                        else {
+                            value = value * 10 + digit
+                            if (value > 4294967295) valid = false
+                        }
+                        digitAt = digitAt + 1
+                    }
+                    if (valid) parsedUid = value
+                }
+                if (field == 5) home = contents.slice(start, position)
+                field = field + 1
+                start = position + 1
+            }
+            position = position + 1
+        }
+        if (parsedUid == uid && home != "") return home
+        begin = end + 1
+    }
+    null
+}
+
+/** HOME if set and nonempty, otherwise the effective uid's /etc/passwd home. */
+fun homePath(): Path? {
+    val environment = linuxEnvironment("HOME")
+    if (environment.found && environment.value != "") return Path(environment.value)
+    if (ablaHostIsMacOS()) return null
+    val passwd = Path("/etc/passwd").readTextResult()
+    if (!passwd.succeeded) return null
+    val home = linuxPasswdHome(passwd.text, linuxSyscall0(107))
+    if (home == null) null else Path(home)
 }
 
 fun Path.child(name: string): Path {
