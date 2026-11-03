@@ -10,6 +10,7 @@ carry them.
 | Page | Modules |
 |---|---|
 | [Text, bytes and number formatting](stdlib/text.md) | `abla/text`, `abla/bytes`, `abla/float/text` |
+| [Arrays](stdlib/arrays.md) | `abla/array` |
 | [Console, files, processes and time](stdlib/system.md) | `abla/io`, `abla/fs`, `abla/process/*` |
 | [Numbers, bits and randomness](stdlib/numbers.md) | `abla/core`, `abla/math`, `abla/math/v8`, `abla/math/fast`, `abla/float`, `abla/bits`, `abla/integer`, `abla/random` |
 | [Vectors](stdlib/simd.md) | `abla/simd`, `abla/simd/target` |
