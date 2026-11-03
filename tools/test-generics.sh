@@ -115,7 +115,7 @@ grep -Fq '"methods-label.Sack.remap"' "$output_directory/methods-label.dwarf" ||
 "$compiler" build "$cases/methods-label.ab" -o "$output_directory/methods-label-fast.o" \
     --emit object --fast -g --no-cache
 method_address=$(llvm-nm --defined-only "$output_directory/methods-label-fast.o" |
-    awk '$3 == "methods-label.Sack.remap" || $3 == "_methods-label.Sack.remap" { print "0x" $1; exit }')
+    awk '!found && ($3 == "methods-label.Sack.remap" || $3 == "_methods-label.Sack.remap") { print "0x" $1; found = 1 }')
 [[ -n $method_address ]] || { echo 'generics: fast generic method symbol is missing' >&2; exit 1; }
 llvm-symbolizer --obj="$output_directory/methods-label-fast.o" --functions=linkage "$method_address" > "$output_directory/methods-label-fast.symbolized"
 grep -Exq '_?methods-label\.Sack\.remap' "$output_directory/methods-label-fast.symbolized" &&
