@@ -5242,12 +5242,38 @@ fun bootstrapDeniedCompileEffects(effects: int, grants: int): int {
     denied
 }
 
+// Compiler lookup names can share storage. Compare aligned words when possible,
+// with bounded byte loads for the tail and for unaligned strings.
+@inline
+trusted fun bootstrapNameEquals(left: string, right: string): bool {
+    if (left.size != right.size) return false
+    val size = left.size
+    if (size == 0) return true
+    val leftBytes = ablaUnsafeStringAddress(left)
+    val rightBytes = ablaUnsafeStringAddress(right)
+    if (leftBytes == rightBytes) return true
+    var index = 0
+    if (((leftBytes | rightBytes) & 7) == 0) {
+        while (index + 8 <= size) {
+            if (ablaUnsafeLoadI64(nativePointerFromAddress(leftBytes + index)) !=
+                ablaUnsafeLoadI64(nativePointerFromAddress(rightBytes + index))) return false
+            index = index + 8
+        }
+    }
+    while (index < size) {
+        if (ablaUnsafeLoadU8(nativePointerFromAddress(leftBytes + index)) !=
+            ablaUnsafeLoadU8(nativePointerFromAddress(rightBytes + index))) return false
+        index = index + 1
+    }
+    true
+}
+
 // A set of strings, open-addressed (keys in insertion order, slots hold their indices).
 class BootstrapStringSet(val keys: array<string>, var slots: array<int>) {
     fun slotOf(key: string): int {
         var slot = bootstrapFunctionDeclarationHash(key)
         slot = slot - slot / this.slots.size * this.slots.size
-        while (this.slots[slot] >= 0 && this.keys[this.slots[slot]] != key) {
+        while (this.slots[slot] >= 0 && !bootstrapNameEquals(this.keys[this.slots[slot]], key)) {
             slot = slot + 1
             if (slot == this.slots.size) slot = 0
         }
@@ -6281,7 +6307,7 @@ class BootstrapFunctionDeclarationIndex(
             while (result < 0 && probes < this.slots.size &&
                    this.slots[slot] >= 0) {
                 val entry = this.slots[slot]
-                if (this.names[entry] == name) {
+                if (bootstrapNameEquals(this.names[entry], name)) {
                     result = this.declarationIndices[entry]
                 } else {
                     slot = slot + 1
@@ -6294,42 +6320,40 @@ class BootstrapFunctionDeclarationIndex(
     }
 }
 
-// A name's slot hash for the compiler's tables (bootstrapIrLookupHash too):
-// 64-bit FNV-1a, one xor and one wrapping multiply a byte, made non-negative
-// for the callers' `slot % size`. Only slots depend on it, never an output.
-trusted fun bootstrapFunctionDeclarationHash(name: string): int {
-    var hash = -3750763034362895579
-    val nameSize = name.size
-    val nameBytes = ablaUnsafeStringAddress(name)
+// Hash every byte in eight-byte chunks. Slots are private lookup metadata;
+// callers still compare complete names and retain declaration insertion order.
+// Byte loads keep this safe for strings at any address on every target.
+trusted fun bootstrapHashNameBytes(seed: int, name: string): int {
+    var hash = seed ^ name.size
+    val bytes = ablaUnsafeStringAddress(name)
     var index = 0
-    while (index < nameSize) {
-        hash = (hash ^ ablaUnsafeLoadU8(nativePointerFromAddress(nameBytes + index))) * 1099511628211
+    while (index + 8 <= name.size) {
+        val word = ablaUnsafeLoadU8(nativePointerFromAddress(bytes + index)) |
+            (ablaUnsafeLoadU8(nativePointerFromAddress(bytes + index + 1)) << 8) |
+            (ablaUnsafeLoadU8(nativePointerFromAddress(bytes + index + 2)) << 16) |
+            (ablaUnsafeLoadU8(nativePointerFromAddress(bytes + index + 3)) << 24) |
+            (ablaUnsafeLoadU8(nativePointerFromAddress(bytes + index + 4)) << 32) |
+            (ablaUnsafeLoadU8(nativePointerFromAddress(bytes + index + 5)) << 40) |
+            (ablaUnsafeLoadU8(nativePointerFromAddress(bytes + index + 6)) << 48) |
+            (ablaUnsafeLoadU8(nativePointerFromAddress(bytes + index + 7)) << 56)
+        hash = (hash ^ word) * 1099511628211
+        index = index + 8
+    }
+    while (index < name.size) {
+        hash = (hash ^ ablaUnsafeLoadU8(nativePointerFromAddress(bytes + index))) * 1099511628211
         index = index + 1
     }
-    hash & 9223372036854775807
+    hash = (hash ^ (hash >> 32)) * -49064778989728563
+    hash ^ (hash >> 32)
 }
 
-// The hash of `owner` and `name` taken together (a method's), without making
-// the string of them: the owner's bytes, its length, then the name's.
-trusted fun bootstrapMethodDeclarationHash(owner: string, name: string): int {
-    var hash = -3750763034362895579
-    val ownerSize = owner.size
-    val ownerBytes = ablaUnsafeStringAddress(owner)
-    var index = 0
-    while (index < ownerSize) {
-        hash = (hash ^ ablaUnsafeLoadU8(nativePointerFromAddress(ownerBytes + index))) * 1099511628211
-        index = index + 1
-    }
-    hash = (hash ^ ownerSize) * 1099511628211
-    val nameSize = name.size
-    val nameBytes = ablaUnsafeStringAddress(name)
-    index = 0
-    while (index < nameSize) {
-        hash = (hash ^ ablaUnsafeLoadU8(nativePointerFromAddress(nameBytes + index))) * 1099511628211
-        index = index + 1
-    }
-    hash & 9223372036854775807
-}
+fun bootstrapFunctionDeclarationHash(name: string): int =
+    bootstrapHashNameBytes(-3750763034362895579, name) & 9223372036854775807
+
+fun bootstrapMethodDeclarationHash(owner: string, name: string): int =
+    bootstrapHashNameBytes(
+        bootstrapHashNameBytes(-3750763034362895579, owner), name
+    ) & 9223372036854775807
 
 // Every declaration's index by name, in declaration order. A lookup walks a name's
 // list where it scanned every declaration (the evaluator's globals, the borrow
@@ -6353,7 +6377,7 @@ class BootstrapDeclarationNameIndex(
             while (result < 0 && probes < this.slots.size &&
                    this.slots[slot] >= 0) {
                 val entry = this.slots[slot]
-                if (this.names[entry] == name) {
+                if (bootstrapNameEquals(this.names[entry], name)) {
                     result = this.firsts[entry]
                 } else {
                     slot = slot + 1
@@ -6430,7 +6454,7 @@ class BootstrapTopLevelNameIndex(
             while (result < 0 && probes < this.slots.size &&
                    this.slots[slot] >= 0) {
                 val entry = this.slots[slot]
-                if (this.names[entry] == name) {
+                if (bootstrapNameEquals(this.names[entry], name)) {
                     result = entry
                 } else {
                     slot = slot + 1

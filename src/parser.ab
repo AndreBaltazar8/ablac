@@ -3,23 +3,27 @@ import "abla/bytes"
 import "abla/unsafe/memory"
 import "abla/unsafe/memory/raw"
 
-// Most checks are of one-byte kinds against another one-byte kind (`)` against `|`): their
-// first bytes settle them without the string comparison's call.
+// Token checks compare integer tags; names are only needed at AST/diagnostic boundaries.
 @inline
-fun BootstrapParser.at(kind: string): bool {
-    val current = this.tokens[this.position].kind
-    current.size == kind.size && (kind.size == 0 || current[0] == kind[0]) && current == kind
+fun BootstrapParser.at(kind: int): bool {
+    // A graph never changes its lexed token arrays. Speculative position changes
+    // invalidate this scalar cache lazily, including a restored earlier position.
+    if (this.kindPosition != this.position) {
+        this.currentKind = this.tokens[this.position].kind
+        this.kindPosition = this.position
+    }
+    this.currentKind == kind
 }
 
 @inline
 fun BootstrapParser.atWord(word: string): bool {
-    if (!this.at("identifier")) return false
+    if (!this.at(BOOTSTRAP_TOKEN_IDENTIFIER)) return false
     val token = this.tokens[this.position]
     bootstrapRegionEquals(this.source, token.begin, token.end, word)
 }
 
 @inline
-fun BootstrapParser.consume(kind: string): bool {
+fun BootstrapParser.consume(kind: int): bool {
     val matched = this.at(kind)
     if (matched) this.position = this.position + 1
     matched
@@ -33,16 +37,16 @@ fun BootstrapParser.consumeWord(word: string): bool {
 }
 
 @inline
-fun BootstrapParser.expect(kind: string) {
+fun BootstrapParser.expect(kind: int) {
     if (!this.consume(kind)) {
         val found = this.tokens[this.position].kind
         this.fail(
             "EXPECTED_TOKEN",
-            if (kind == "identifier" && bootstrapReservedSuspendingWord(found))
-                "`$found` is a reserved word and can't be a name"
-            else "expected token `$kind`, found `$found`"
+            if (kind == BOOTSTRAP_TOKEN_IDENTIFIER && bootstrapReservedSuspendingWord(found))
+                "`${bootstrapTokenKindName(found)}` is a reserved word and can't be a name"
+            else "expected token `${bootstrapTokenKindName(kind)}`, found `${bootstrapTokenKindName(found)}`"
         )
-        if (!this.at("end")) this.position = this.position + 1
+        if (!this.at(BOOTSTRAP_TOKEN_END)) this.position = this.position + 1
     }
 }
 
@@ -491,7 +495,9 @@ class BootstrapParser(
     // bindingFloor belong to an enclosing declaration and are not seen.
     val bindingNames: array<string>,
     val bindingStable: array<bool>,
-    var bindingFloor: int
+    var bindingFloor: int,
+    var kindPosition: int,
+    var currentKind: int
 ) {
     fun declareBinding(name: string, stable: bool) {
         this.bindingNames.append(name)
@@ -516,7 +522,7 @@ class BootstrapParser(
 
     // A contextual keyword (`own`, `region`) is an ordinary identifier unless
     // the next token is of kind `next`.
-    fun atContextualKeyword(word: string, next: string): bool =
+    fun atContextualKeyword(word: string, next: int): bool =
         this.atWord(word) && this.position + 1 < this.tokens.size &&
         this.tokens[this.position + 1].kind == next
 
@@ -555,10 +561,10 @@ class BootstrapParser(
     }
 
     fun skipSeparators() {
-        var more = this.at("newline") || this.at(";")
+        var more = this.at(BOOTSTRAP_TOKEN_NEWLINE) || this.at(BOOTSTRAP_TOKEN_SEMICOLON)
         while (more) {
             this.position = this.position + 1
-            more = this.at("newline") || this.at(";")
+            more = this.at(BOOTSTRAP_TOKEN_NEWLINE) || this.at(BOOTSTRAP_TOKEN_SEMICOLON)
         }
     }
 
@@ -570,8 +576,8 @@ class BootstrapParser(
     // `if (found) return i` it is the function's result, not `i - 1`.
     fun continueAdditiveExpression(): bool {
         val before = this.position
-        while (this.at("newline")) this.position = this.position + 1
-        var continued = this.at("+") || this.at("-")
+        while (this.at(BOOTSTRAP_TOKEN_NEWLINE)) this.position = this.position + 1
+        var continued = this.at(BOOTSTRAP_TOKEN_PLUS) || this.at(BOOTSTRAP_TOKEN_MINUS)
         if (continued && this.position > before &&
             this.position + 1 < this.tokens.size &&
             this.tokens[this.position + 1].begin ==
@@ -584,8 +590,8 @@ class BootstrapParser(
     // `val b = B([]).add("a")` then `    .add("b")`.
     fun continueMemberChain(): bool {
         val before = this.position
-        while (this.at("newline")) this.position = this.position + 1
-        val continued = this.at(".")
+        while (this.at(BOOTSTRAP_TOKEN_NEWLINE)) this.position = this.position + 1
+        val continued = this.at(BOOTSTRAP_TOKEN_DOT)
         if (!continued) this.position = before
         continued
     }
@@ -593,10 +599,10 @@ class BootstrapParser(
     // `?.` continues a chain as `.` does, from the next line too.
     fun continueSafeCall(): bool {
         val before = this.position
-        while (this.at("newline")) this.position = this.position + 1
-        val continued = this.at("?") &&
+        while (this.at(BOOTSTRAP_TOKEN_NEWLINE)) this.position = this.position + 1
+        val continued = this.at(BOOTSTRAP_TOKEN_QUESTION) &&
             this.position + 1 < this.tokens.size &&
-            this.tokens[this.position + 1].kind == "."
+            this.tokens[this.position + 1].kind == BOOTSTRAP_TOKEN_DOT
         if (!continued) this.position = before
         continued
     }
@@ -604,26 +610,26 @@ class BootstrapParser(
     // `??` (or Kotlin's `?:`, reported and read as `??`), from the next line too.
     fun continueNullDefault(): bool {
         val before = this.position
-        while (this.at("newline")) this.position = this.position + 1
-        val continued = this.at("?") &&
+        while (this.at(BOOTSTRAP_TOKEN_NEWLINE)) this.position = this.position + 1
+        val continued = this.at(BOOTSTRAP_TOKEN_QUESTION) &&
             this.position + 1 < this.tokens.size &&
-            (this.tokens[this.position + 1].kind == "?" ||
-             this.tokens[this.position + 1].kind == ":")
+            (this.tokens[this.position + 1].kind == BOOTSTRAP_TOKEN_QUESTION ||
+             this.tokens[this.position + 1].kind == BOOTSTRAP_TOKEN_COLON)
         if (!continued) this.position = before
         continued
     }
 
-    fun skipBalanced(open: string, close: string) {
+    fun skipBalanced(open: int, close: int) {
         this.expect(open)
         var depth = 1
-        while (depth > 0 && !this.at("end")) {
+        while (depth > 0 && !this.at(BOOTSTRAP_TOKEN_END)) {
             if (this.at(open)) depth = depth + 1
             if (this.at(close)) depth = depth - 1
             this.position = this.position + 1
         }
         if (depth != 0) this.fail(
             "UNCLOSED_DELIMITER",
-            "expected closing delimiter `$close`"
+            "expected closing delimiter `${bootstrapTokenKindName(close)}`"
         )
     }
 
@@ -631,16 +637,16 @@ class BootstrapParser(
         var parentheses = 0
         var brackets = 0
         var finished = false
-        while (!finished && !this.at("end")) {
+        while (!finished && !this.at(BOOTSTRAP_TOKEN_END)) {
             if (parentheses == 0 && brackets == 0 &&
-                (this.at("newline") || this.at(";") || this.at("}"))) {
+                (this.at(BOOTSTRAP_TOKEN_NEWLINE) || this.at(BOOTSTRAP_TOKEN_SEMICOLON) || this.at(BOOTSTRAP_TOKEN_RBRACE))) {
                 finished = true
                 this.position = this.position
             } else {
-                if (this.at("(")) parentheses = parentheses + 1
-                if (this.at(")")) parentheses = parentheses - 1
-                if (this.at("[")) brackets = brackets + 1
-                if (this.at("]")) brackets = brackets - 1
+                if (this.at(BOOTSTRAP_TOKEN_LPAREN)) parentheses = parentheses + 1
+                if (this.at(BOOTSTRAP_TOKEN_RPAREN)) parentheses = parentheses - 1
+                if (this.at(BOOTSTRAP_TOKEN_LBRACKET)) brackets = brackets + 1
+                if (this.at(BOOTSTRAP_TOKEN_RBRACKET)) brackets = brackets - 1
                 this.position = this.position + 1
             }
         }
@@ -651,25 +657,25 @@ class BootstrapParser(
         var angles = 0
         var parentheses = 0
         var finished = false
-        while (!finished && !this.at("end")) {
+        while (!finished && !this.at(BOOTSTRAP_TOKEN_END)) {
             if (angles == 0 && parentheses == 0 &&
-                (this.at("=") || this.atWord("by") || this.at("{") ||
+                (this.at(BOOTSTRAP_TOKEN_EQUAL) || this.atWord("by") || this.at(BOOTSTRAP_TOKEN_LBRACE) ||
                  // `interface Shape { fun area(): int }`: the body's end.
-                 this.at("}") ||
-                 this.at("newline") || this.at(";") ||
+                 this.at(BOOTSTRAP_TOKEN_RBRACE) ||
+                 this.at(BOOTSTRAP_TOKEN_NEWLINE) || this.at(BOOTSTRAP_TOKEN_SEMICOLON) ||
                  // `fun f(): T where …`: a reserved generic constraint.
                  (type != "" && this.atWord("where")))) {
                 finished = true
             } else if (angles == 0 && parentheses == 0 &&
-                (this.at(",") || (stopOnRightParen && this.at(")")))) {
+                (this.at(BOOTSTRAP_TOKEN_COMMA) || (stopOnRightParen && this.at(BOOTSTRAP_TOKEN_RPAREN)))) {
                 finished = true
             } else {
-                if (this.at("<")) angles = angles + 1
-                if (this.at(">")) angles = angles - 1
-                if (this.at(">>")) angles = angles - 2
-                if (this.at(">>>")) angles = angles - 3
-                if (this.at("(")) parentheses = parentheses + 1
-                if (this.at(")")) parentheses = parentheses - 1
+                if (this.at(BOOTSTRAP_TOKEN_LESS)) angles = angles + 1
+                if (this.at(BOOTSTRAP_TOKEN_GREATER)) angles = angles - 1
+                if (this.at(BOOTSTRAP_TOKEN_SHIFT_RIGHT)) angles = angles - 2
+                if (this.at(BOOTSTRAP_TOKEN_SHIFT_UNSIGNED)) angles = angles - 3
+                if (this.at(BOOTSTRAP_TOKEN_LPAREN)) parentheses = parentheses + 1
+                if (this.at(BOOTSTRAP_TOKEN_RPAREN)) parentheses = parentheses - 1
                 type = "$type${bootstrapTokenText(this.source, this.tokens[this.position])}"
                 this.position = this.position + 1
                 finished = finished
@@ -683,24 +689,24 @@ class BootstrapParser(
         val types: array<string> = []
         val defaults: array<BootstrapExpression> = []
         val kinds: array<string> = []
-        this.expect("(")
+        this.expect(BOOTSTRAP_TOKEN_LPAREN)
         this.skipSeparators()
-        while (!this.at(")") && !this.at("end")) {
+        while (!this.at(BOOTSTRAP_TOKEN_RPAREN) && !this.at(BOOTSTRAP_TOKEN_END)) {
             var parameterKind = "parameter"
-            if (this.at("val") || this.at("var")) {
-                parameterKind = this.tokens[this.position].kind
+            if (this.at(BOOTSTRAP_TOKEN_VAL) || this.at(BOOTSTRAP_TOKEN_VAR)) {
+                parameterKind = bootstrapTokenKindName(this.tokens[this.position].kind)
                 this.position = this.position + 1
-            } else if (this.atContextualKeyword("own", "identifier")) {
+            } else if (this.atContextualKeyword("own", BOOTSTRAP_TOKEN_IDENTIFIER)) {
                 // `own` is a keyword only before a parameter's name.
                 parameterKind = "own"
                 this.position = this.position + 1
             }
             kinds.append(parameterKind)
             val name = this.tokens[this.position]
-            this.expect("identifier")
+            this.expect(BOOTSTRAP_TOKEN_IDENTIFIER)
             parameters.append(bootstrapTokenText(this.source, name))
             var declaredType = "inferred"
-            if (this.consume(":")) {
+            if (this.consume(BOOTSTRAP_TOKEN_COLON)) {
                 declaredType = this.parseType(true)
                 types.append(declaredType)
             } else types.append("unknown")
@@ -730,7 +736,7 @@ class BootstrapParser(
                         )
                     ]
                 ))
-            } else if (this.consume("=")) {
+            } else if (this.consume(BOOTSTRAP_TOKEN_EQUAL)) {
                 this.skipSeparators()
                 defaults.append(this.parseExpression())
             } else defaults.append(BootstrapExpression(
@@ -741,13 +747,13 @@ class BootstrapParser(
                 []
             ))
             this.skipSeparators()
-            if (!this.consume(",") && !this.at(")")) this.fail(
+            if (!this.consume(BOOTSTRAP_TOKEN_COMMA) && !this.at(BOOTSTRAP_TOKEN_RPAREN)) this.fail(
                 "PARAMETER_SEPARATOR",
                 "expected `,` or `)` after parameter"
             )
             this.skipSeparators()
         }
-        this.expect(")")
+        this.expect(BOOTSTRAP_TOKEN_RPAREN)
         BootstrapParameters(parameters, types, defaults, kinds)
     }
 
@@ -756,17 +762,17 @@ class BootstrapParser(
         var angles = 0
         var parentheses = 0
         var finished = false
-        while (!finished && !this.at("end")) {
+        while (!finished && !this.at(BOOTSTRAP_TOKEN_END)) {
             if (angles == 0 && parentheses == 0 &&
-                (this.at(",") || this.at("->"))) {
+                (this.at(BOOTSTRAP_TOKEN_COMMA) || this.at(BOOTSTRAP_TOKEN_ARROW))) {
                 finished = true
             } else {
-                if (this.at("<")) angles = angles + 1
-                if (this.at(">")) angles = angles - 1
-                if (this.at(">>")) angles = angles - 2
-                if (this.at(">>>")) angles = angles - 3
-                if (this.at("(")) parentheses = parentheses + 1
-                if (this.at(")")) parentheses = parentheses - 1
+                if (this.at(BOOTSTRAP_TOKEN_LESS)) angles = angles + 1
+                if (this.at(BOOTSTRAP_TOKEN_GREATER)) angles = angles - 1
+                if (this.at(BOOTSTRAP_TOKEN_SHIFT_RIGHT)) angles = angles - 2
+                if (this.at(BOOTSTRAP_TOKEN_SHIFT_UNSIGNED)) angles = angles - 3
+                if (this.at(BOOTSTRAP_TOKEN_LPAREN)) parentheses = parentheses + 1
+                if (this.at(BOOTSTRAP_TOKEN_RPAREN)) parentheses = parentheses - 1
                 type = "$type${bootstrapTokenText(
                     this.source,
                     this.tokens[this.position]
@@ -780,13 +786,13 @@ class BootstrapParser(
 
     fun parseLambda(): BootstrapExpression {
         val start = this.tokens[this.position]
-        this.expect("{")
+        this.expect(BOOTSTRAP_TOKEN_LBRACE)
         this.skipSeparators()
-        if (this.at("fun") || this.at("class") ||
-            this.at("interface") || this.at("@") ||
-            this.at("trusted") || this.at("noescape") ||
-            this.at("resource") || this.at("extern") ||
-            this.at("compile")) {
+        if (this.at(BOOTSTRAP_TOKEN_FUN) || this.at(BOOTSTRAP_TOKEN_CLASS) ||
+            this.at(BOOTSTRAP_TOKEN_INTERFACE) || this.at(BOOTSTRAP_TOKEN_AT) ||
+            this.at(BOOTSTRAP_TOKEN_TRUSTED) || this.at(BOOTSTRAP_TOKEN_NOESCAPE) ||
+            this.at(BOOTSTRAP_TOKEN_RESOURCE) || this.at(BOOTSTRAP_TOKEN_EXTERN) ||
+            this.at(BOOTSTRAP_TOKEN_COMPILE)) {
             return this.parseDeclarationBlock(start)
         }
         val children: array<BootstrapExpression> = []
@@ -794,15 +800,15 @@ class BootstrapParser(
         val parameters: array<BootstrapExpression> = []
         var hasArrow = false
 
-        if (this.consume("->")) {
+        if (this.consume(BOOTSTRAP_TOKEN_ARROW)) {
             hasArrow = true
-        } else if (this.at("identifier")) {
+        } else if (this.at(BOOTSTRAP_TOKEN_IDENTIFIER)) {
             var parsingParameters = true
             while (parsingParameters) {
                 val name = this.tokens[this.position]
-                this.expect("identifier")
+                this.expect(BOOTSTRAP_TOKEN_IDENTIFIER)
                 var type = "unknown"
-                if (this.consume(":")) type = this.parseLambdaType()
+                if (this.consume(BOOTSTRAP_TOKEN_COLON)) type = this.parseLambdaType()
                 parameters.append(BootstrapExpression(
                     "lambda.parameter",
                     bootstrapTokenText(this.source, name),
@@ -816,12 +822,12 @@ class BootstrapParser(
                         []
                     )]
                 ))
-                if (this.consume(",")) {
+                if (this.consume(BOOTSTRAP_TOKEN_COMMA)) {
                     this.skipSeparators()
                     parsingParameters = parsingParameters
                 } else parsingParameters = false
             }
-            if (this.consume("->")) hasArrow = true
+            if (this.consume(BOOTSTRAP_TOKEN_ARROW)) hasArrow = true
             else {
                 this.position = parameterStart
                 hasArrow = hasArrow
@@ -840,23 +846,23 @@ class BootstrapParser(
         }
 
         val statements: array<BootstrapExpression> = []
-        while (!this.at("}") && !this.at("end")) {
+        while (!this.at(BOOTSTRAP_TOKEN_RBRACE) && !this.at(BOOTSTRAP_TOKEN_END)) {
             val before = this.position
-            if (this.at("val") || this.at("var")) {
+            if (this.at(BOOTSTRAP_TOKEN_VAL) || this.at(BOOTSTRAP_TOKEN_VAR)) {
                 statements.append(this.parseLocal())
-            } else if (this.at("while")) {
+            } else if (this.at(BOOTSTRAP_TOKEN_WHILE)) {
                 statements.append(this.parseWhile())
-            } else if (this.at("do")) {
+            } else if (this.at(BOOTSTRAP_TOKEN_DO)) {
                 statements.append(this.parseDoWhile())
-            } else if (this.at("for")) {
+            } else if (this.at(BOOTSTRAP_TOKEN_FOR)) {
                 statements.append(this.parseFor())
-            } else if (this.at("return")) {
+            } else if (this.at(BOOTSTRAP_TOKEN_RETURN)) {
                 statements.append(this.parseReturn())
-            } else if (this.at("defer")) {
+            } else if (this.at(BOOTSTRAP_TOKEN_DEFER)) {
                 statements.append(this.parseDefer())
             } else if (this.atLoopLabel()) {
                 statements.append(this.parseLabeledLoop())
-            } else if (this.at("break") || this.at("continue")) {
+            } else if (this.at(BOOTSTRAP_TOKEN_BREAK) || this.at(BOOTSTRAP_TOKEN_CONTINUE)) {
                 statements.append(this.parseLoopControl())
             } else statements.append(this.parseExpression())
             if (this.position == before) {
@@ -866,8 +872,8 @@ class BootstrapParser(
                 )
                 this.position = this.position + 1
             }
-            if (!this.at("}") && !this.at("newline") &&
-                !this.at(";") && !this.at("end")) {
+            if (!this.at(BOOTSTRAP_TOKEN_RBRACE) && !this.at(BOOTSTRAP_TOKEN_NEWLINE) &&
+                !this.at(BOOTSTRAP_TOKEN_SEMICOLON) && !this.at(BOOTSTRAP_TOKEN_END)) {
                 this.fail(
                     "STATEMENT_SEPARATOR",
                     "expected a newline, `;`, or `}` after statement"
@@ -877,7 +883,7 @@ class BootstrapParser(
             this.skipSeparators()
         }
         val end = this.tokens[this.position]
-        this.expect("}")
+        this.expect(BOOTSTRAP_TOKEN_RBRACE)
         this.leaveBindings(bindings)
         children.append(BootstrapExpression(
             "block",
@@ -896,29 +902,29 @@ class BootstrapParser(
     fun parseDeclarationBlock(start: BootstrapToken): BootstrapExpression {
         val contentBegin = start.end
         var declarations = 0
-        while (!this.at("}") && !this.at("end")) {
+        while (!this.at(BOOTSTRAP_TOKEN_RBRACE) && !this.at(BOOTSTRAP_TOKEN_END)) {
             val before = this.position
-            if (this.at("#")) {
+            if (this.at(BOOTSTRAP_TOKEN_HASH)) {
                 this.parseExpression()
-            } else if (this.at("@")) {
+            } else if (this.at(BOOTSTRAP_TOKEN_AT)) {
                 this.parseAnnotatedDeclaration()
             } else if (this.atOperatorDeclaration()) {
                 this.parseOperatorDeclaration()
-            } else if (this.at("trusted")) {
+            } else if (this.at(BOOTSTRAP_TOKEN_TRUSTED)) {
                 this.parseTrustedDeclaration()
-            } else if (this.at("noescape")) {
+            } else if (this.at(BOOTSTRAP_TOKEN_NOESCAPE)) {
                 this.parseNoEscapeDeclaration()
-            } else if (this.at("resource")) {
+            } else if (this.at(BOOTSTRAP_TOKEN_RESOURCE)) {
                 this.parseResourceDeclaration()
-            } else if (this.at("extern") ||
-                (this.at("compile") &&
-                 this.tokens[this.position + 1].kind == "extern")) {
+            } else if (this.at(BOOTSTRAP_TOKEN_EXTERN) ||
+                (this.at(BOOTSTRAP_TOKEN_COMPILE) &&
+                 this.tokens[this.position + 1].kind == BOOTSTRAP_TOKEN_EXTERN)) {
                 this.parseExternal()
-            } else if (this.at("compile")) {
+            } else if (this.at(BOOTSTRAP_TOKEN_COMPILE)) {
                 this.parseCompileDeclaration()
-            } else if (this.at("fun") || this.at("class") ||
-                       this.at("interface") || this.at("val") ||
-                       this.at("var")) {
+            } else if (this.at(BOOTSTRAP_TOKEN_FUN) || this.at(BOOTSTRAP_TOKEN_CLASS) ||
+                       this.at(BOOTSTRAP_TOKEN_INTERFACE) || this.at(BOOTSTRAP_TOKEN_VAL) ||
+                       this.at(BOOTSTRAP_TOKEN_VAR)) {
                 this.parseDeclaration()
             } else {
                 this.fail(
@@ -938,7 +944,7 @@ class BootstrapParser(
             this.skipSeparators()
         }
         val end = this.tokens[this.position]
-        this.expect("}")
+        this.expect(BOOTSTRAP_TOKEN_RBRACE)
         if (declarations == 0) this.failAt(
             "DECLARATION_BLOCK_EMPTY",
             "declaration block requires at least one declaration",
@@ -962,12 +968,12 @@ class BootstrapParser(
 
     fun parseLocal(): BootstrapExpression {
         val start = this.tokens[this.position]
-        val localKind = this.tokens[this.position].kind
+        val localKind = bootstrapTokenKindName(this.tokens[this.position].kind)
         this.position = this.position + 1
         val name = this.tokens[this.position]
-        this.expect("identifier")
+        this.expect(BOOTSTRAP_TOKEN_IDENTIFIER)
         var declaredType = "inferred"
-        if (this.consume(":")) {
+        if (this.consume(BOOTSTRAP_TOKEN_COLON)) {
             declaredType = this.parseType(false)
         }
         var initializer = BootstrapExpression(
@@ -997,7 +1003,7 @@ class BootstrapParser(
                     )
                 ]
             )
-        } else if (this.consume("=")) {
+        } else if (this.consume(BOOTSTRAP_TOKEN_EQUAL)) {
             this.skipSeparators()
             initializer = this.parseExpression()
         }
@@ -1026,26 +1032,26 @@ class BootstrapParser(
     fun parseBlock(): BootstrapExpression {
         val start = this.tokens[this.position]
         val bindings = this.bindingNames.size
-        this.expect("{")
+        this.expect(BOOTSTRAP_TOKEN_LBRACE)
         val statements: array<BootstrapExpression> = []
         this.skipSeparators()
-        while (!this.at("}") && !this.at("end")) {
+        while (!this.at(BOOTSTRAP_TOKEN_RBRACE) && !this.at(BOOTSTRAP_TOKEN_END)) {
             val before = this.position
-            if (this.at("val") || this.at("var")) {
+            if (this.at(BOOTSTRAP_TOKEN_VAL) || this.at(BOOTSTRAP_TOKEN_VAR)) {
                 statements.append(this.parseLocal())
-            } else if (this.at("while")) {
+            } else if (this.at(BOOTSTRAP_TOKEN_WHILE)) {
                 statements.append(this.parseWhile())
-            } else if (this.at("do")) {
+            } else if (this.at(BOOTSTRAP_TOKEN_DO)) {
                 statements.append(this.parseDoWhile())
-            } else if (this.at("for")) {
+            } else if (this.at(BOOTSTRAP_TOKEN_FOR)) {
                 statements.append(this.parseFor())
-            } else if (this.at("return")) {
+            } else if (this.at(BOOTSTRAP_TOKEN_RETURN)) {
                 statements.append(this.parseReturn())
-            } else if (this.at("defer")) {
+            } else if (this.at(BOOTSTRAP_TOKEN_DEFER)) {
                 statements.append(this.parseDefer())
             } else if (this.atLoopLabel()) {
                 statements.append(this.parseLabeledLoop())
-            } else if (this.at("break") || this.at("continue")) {
+            } else if (this.at(BOOTSTRAP_TOKEN_BREAK) || this.at(BOOTSTRAP_TOKEN_CONTINUE)) {
                 statements.append(this.parseLoopControl())
             } else statements.append(this.parseExpression())
             if (this.position == before) {
@@ -1056,8 +1062,8 @@ class BootstrapParser(
                 this.position = this.position + 1
             }
             if (
-                !this.at("}") && !this.at("newline") &&
-                !this.at(";") && !this.at("end")
+                !this.at(BOOTSTRAP_TOKEN_RBRACE) && !this.at(BOOTSTRAP_TOKEN_NEWLINE) &&
+                !this.at(BOOTSTRAP_TOKEN_SEMICOLON) && !this.at(BOOTSTRAP_TOKEN_END)
             ) {
                 this.fail(
                     "STATEMENT_SEPARATOR",
@@ -1068,27 +1074,27 @@ class BootstrapParser(
             this.skipSeparators()
         }
         val end = this.tokens[this.position]
-        this.expect("}")
+        this.expect(BOOTSTRAP_TOKEN_RBRACE)
         this.leaveBindings(bindings)
         BootstrapExpression("block", "", start.begin, end.end, statements)
     }
 
     fun parseControlBody(): BootstrapExpression {
-        if (this.at("return")) this.parseReturn()
-        else if (this.at("break") || this.at("continue")) {
+        if (this.at(BOOTSTRAP_TOKEN_RETURN)) this.parseReturn()
+        else if (this.at(BOOTSTRAP_TOKEN_BREAK) || this.at(BOOTSTRAP_TOKEN_CONTINUE)) {
             this.parseLoopControl()
         }
-        else if (this.at("for")) this.parseFor()
+        else if (this.at(BOOTSTRAP_TOKEN_FOR)) this.parseFor()
         else if (this.atLoopLabel()) this.parseLabeledLoop()
-        else if (this.at("{")) this.parseBlock()
+        else if (this.at(BOOTSTRAP_TOKEN_LBRACE)) this.parseBlock()
         else this.parseExpression()
     }
 
     fun parseDefer(): BootstrapExpression {
         val start = this.tokens[this.position]
-        this.expect("defer")
+        this.expect(BOOTSTRAP_TOKEN_DEFER)
         this.skipSeparators()
-        if (!this.at("{")) {
+        if (!this.at(BOOTSTRAP_TOKEN_LBRACE)) {
             this.fail("DEFER_BODY", "expected a block after `defer`")
             BootstrapExpression("defer", "", start.begin, start.end, [
                 BootstrapExpression("missing", "defer", start.end, start.end, [])
@@ -1113,10 +1119,10 @@ class BootstrapParser(
 
     fun parseSuspendingBlock(): BootstrapExpression {
         val start = this.tokens[this.position]
-        val kind = start.kind
+        val kind = bootstrapTokenKindName(start.kind)
         this.position = this.position + 1
         this.skipSeparators()
-        if (!this.at("{")) {
+        if (!this.at(BOOTSTRAP_TOKEN_LBRACE)) {
             this.fail(
                 "SUSPENDING_BODY",
                 "expected a block after `$kind`, a reserved word that can't be a name"
@@ -1135,13 +1141,13 @@ class BootstrapParser(
     // the innermost loop).
     fun parseLoopControl(): BootstrapExpression {
         val token = this.tokens[this.position]
-        val kind = token.kind
+        val kind = bootstrapTokenKindName(token.kind)
         this.position = this.position + 1
         val mark = this.tokens[this.position]
-        if (mark.kind == "@" && mark.begin == token.end &&
+        if (mark.kind == BOOTSTRAP_TOKEN_AT && mark.begin == token.end &&
             this.position + 1 < this.tokens.size) {
             val name = this.tokens[this.position + 1]
-            if (name.kind == "identifier" && name.begin == mark.end) {
+            if (name.kind == BOOTSTRAP_TOKEN_IDENTIFIER && name.begin == mark.end) {
                 this.position = this.position + 2
                 return BootstrapExpression(
                     kind, bootstrapTokenText(this.source, name),
@@ -1163,12 +1169,12 @@ class BootstrapParser(
     // right after it (no space), before a loop keyword. (An annotation is
     // `@name`, before a declaration.)
     fun atLoopLabel(): bool {
-        if (!this.at("identifier") || this.position + 2 >= this.tokens.size) return false
+        if (!this.at(BOOTSTRAP_TOKEN_IDENTIFIER) || this.position + 2 >= this.tokens.size) return false
         val name = this.tokens[this.position]
         val mark = this.tokens[this.position + 1]
         val loop = this.tokens[this.position + 2].kind
-        mark.kind == "@" && mark.begin == name.end &&
-            (loop == "while" || loop == "do" || loop == "for")
+        mark.kind == BOOTSTRAP_TOKEN_AT && mark.begin == name.end &&
+            (loop == BOOTSTRAP_TOKEN_WHILE || loop == BOOTSTRAP_TOKEN_DO || loop == BOOTSTRAP_TOKEN_FOR)
     }
 
     // A labeled loop: the loop's node, beginning at its label. A `while` or
@@ -1179,8 +1185,8 @@ class BootstrapParser(
         val label = bootstrapTokenText(this.source, name)
         this.position = this.position + 2
         val loop =
-            if (this.at("while")) this.parseWhile()
-            else if (this.at("do")) this.parseDoWhile()
+            if (this.at(BOOTSTRAP_TOKEN_WHILE)) this.parseWhile()
+            else if (this.at(BOOTSTRAP_TOKEN_DO)) this.parseDoWhile()
             else this.parseFor()
         val text = if (loop.kind == "for") "${loop.text}@$label" else label
         BootstrapExpression(loop.kind, text, name.begin, loop.end, loop.children)
@@ -1188,7 +1194,7 @@ class BootstrapParser(
 
     fun parseReturn(): BootstrapExpression {
         val start = this.tokens[this.position]
-        this.expect("return")
+        this.expect(BOOTSTRAP_TOKEN_RETURN)
         var value = BootstrapExpression(
             "missing",
             "return",
@@ -1197,9 +1203,9 @@ class BootstrapParser(
             []
         )
         // A closer or `,` ends a bare `return` too: `f(x ?? return, y)`.
-        if (!this.at("newline") && !this.at(";") &&
-            !this.at("}") && !this.at("end") && !this.at(")") &&
-            !this.at("]") && !this.at(",")) {
+        if (!this.at(BOOTSTRAP_TOKEN_NEWLINE) && !this.at(BOOTSTRAP_TOKEN_SEMICOLON) &&
+            !this.at(BOOTSTRAP_TOKEN_RBRACE) && !this.at(BOOTSTRAP_TOKEN_END) && !this.at(BOOTSTRAP_TOKEN_RPAREN) &&
+            !this.at(BOOTSTRAP_TOKEN_RBRACKET) && !this.at(BOOTSTRAP_TOKEN_COMMA)) {
             value = this.parseExpression()
         }
         BootstrapExpression(
@@ -1213,12 +1219,12 @@ class BootstrapParser(
 
     fun parseIf(): BootstrapExpression {
         val start = this.tokens[this.position]
-        this.expect("if")
-        this.expect("(")
+        this.expect(BOOTSTRAP_TOKEN_IF)
+        this.expect(BOOTSTRAP_TOKEN_LPAREN)
         this.skipSeparators()
         val condition = this.parseExpression()
         this.skipSeparators()
-        this.expect(")")
+        this.expect(BOOTSTRAP_TOKEN_RPAREN)
         this.skipSeparators()
         val thenBranch = this.parseControlBody()
         val beforeElseSeparators = this.position
@@ -1230,7 +1236,7 @@ class BootstrapParser(
             thenBranch.end,
             []
         )
-        if (this.consume("else")) {
+        if (this.consume(BOOTSTRAP_TOKEN_ELSE)) {
             this.skipSeparators()
             elseBranch = this.parseControlBody()
             this.position = this.position
@@ -1246,12 +1252,12 @@ class BootstrapParser(
 
     fun parseWhile(): BootstrapExpression {
         val start = this.tokens[this.position]
-        this.expect("while")
-        this.expect("(")
+        this.expect(BOOTSTRAP_TOKEN_WHILE)
+        this.expect(BOOTSTRAP_TOKEN_LPAREN)
         this.skipSeparators()
         val condition = this.parseExpression()
         this.skipSeparators()
-        this.expect(")")
+        this.expect(BOOTSTRAP_TOKEN_RPAREN)
         this.skipSeparators()
         val body = this.parseControlBody()
         BootstrapExpression(
@@ -1265,17 +1271,17 @@ class BootstrapParser(
 
     fun parseDoWhile(): BootstrapExpression {
         val start = this.tokens[this.position]
-        this.expect("do")
+        this.expect(BOOTSTRAP_TOKEN_DO)
         this.skipSeparators()
         val body = this.parseControlBody()
         this.skipSeparators()
-        this.expect("while")
-        this.expect("(")
+        this.expect(BOOTSTRAP_TOKEN_WHILE)
+        this.expect(BOOTSTRAP_TOKEN_LPAREN)
         this.skipSeparators()
         val condition = this.parseExpression()
         this.skipSeparators()
         val end = this.tokens[this.position]
-        this.expect(")")
+        this.expect(BOOTSTRAP_TOKEN_RPAREN)
         BootstrapExpression(
             "do.while",
             "",
@@ -1287,16 +1293,16 @@ class BootstrapParser(
 
     fun parseFor(): BootstrapExpression {
         val start = this.tokens[this.position]
-        this.expect("for")
-        this.expect("(")
+        this.expect(BOOTSTRAP_TOKEN_FOR)
+        this.expect(BOOTSTRAP_TOKEN_LPAREN)
         this.skipSeparators()
         val name = this.tokens[this.position]
-        this.expect("identifier")
-        this.expect("in")
+        this.expect(BOOTSTRAP_TOKEN_IDENTIFIER)
+        this.expect(BOOTSTRAP_TOKEN_IN)
         this.skipSeparators()
         val source = this.parseExpression()
         this.skipSeparators()
-        this.expect(")")
+        this.expect(BOOTSTRAP_TOKEN_RPAREN)
         this.skipSeparators()
         val bindings = this.bindingNames.size
         this.declareBinding(bootstrapTokenText(this.source, name), true)
@@ -1313,19 +1319,19 @@ class BootstrapParser(
 
     fun parseWhen(): BootstrapExpression {
         val start = this.tokens[this.position]
-        this.expect("when")
-        this.expect("(")
+        this.expect(BOOTSTRAP_TOKEN_WHEN)
+        this.expect(BOOTSTRAP_TOKEN_LPAREN)
         this.skipSeparators()
         val subject = this.parseExpression()
         this.skipSeparators()
-        this.expect(")")
+        this.expect(BOOTSTRAP_TOKEN_RPAREN)
         this.skipSeparators()
-        this.expect("{")
+        this.expect(BOOTSTRAP_TOKEN_LBRACE)
         val children: array<BootstrapExpression> = [subject]
         this.skipSeparators()
-        while (!this.at("}") && !this.at("end")) {
+        while (!this.at(BOOTSTRAP_TOKEN_RBRACE) && !this.at(BOOTSTRAP_TOKEN_END)) {
             val matches: array<BootstrapExpression> = []
-            if (this.consume("else")) {
+            if (this.consume(BOOTSTRAP_TOKEN_ELSE)) {
                 matches.append(BootstrapExpression(
                     "missing",
                     "else",
@@ -1335,13 +1341,13 @@ class BootstrapParser(
                 ))
             } else {
                 matches.append(this.parseWhenMatch())
-                while (this.consume(",")) {
+                while (this.consume(BOOTSTRAP_TOKEN_COMMA)) {
                     this.skipSeparators()
                     matches.append(this.parseWhenMatch())
                 }
             }
             this.skipSeparators()
-            this.expect("->")
+            this.expect(BOOTSTRAP_TOKEN_ARROW)
             this.skipSeparators()
             val body = this.parseControlBody()
             var match = 0
@@ -1353,14 +1359,14 @@ class BootstrapParser(
             this.skipSeparators()
         }
         val end = this.tokens[this.position]
-        this.expect("}")
+        this.expect(BOOTSTRAP_TOKEN_RBRACE)
         BootstrapExpression("when", "", start.begin, end.end, children)
     }
 
     /** A `when` arm's match: a value, or `is Type` (the subject is an
      *  instance of the class, or of a class conforming to the interface). */
     fun parseWhenMatch(): BootstrapExpression {
-        if (!this.atContextualKeyword("is", "identifier")) return this.parseExpression()
+        if (!this.atContextualKeyword("is", BOOTSTRAP_TOKEN_IDENTIFIER)) return this.parseExpression()
         val begin = this.tokens[this.position].begin
         this.position = this.position + 1
         val type = this.parseCastType()
@@ -1380,8 +1386,8 @@ class BootstrapParser(
         while (more) {
             // `orElse` on the same line as the `}`, or at the start of the next.
             val before = this.position
-            while (this.at("newline")) this.position = this.position + 1
-            if (this.atContextualKeyword("orElse", "{")) {
+            while (this.at(BOOTSTRAP_TOKEN_NEWLINE)) this.position = this.position + 1
+            if (this.atContextualKeyword("orElse", BOOTSTRAP_TOKEN_LBRACE)) {
                 this.position = this.position + 1
                 val alternative = this.parseBlock()
                 val choice = BootstrapExpression(
@@ -1407,7 +1413,7 @@ class BootstrapParser(
         val start = this.tokens[this.position]
         this.position = this.position + 1
         this.skipSeparators()
-        if (!this.at("{")) {
+        if (!this.at(BOOTSTRAP_TOKEN_LBRACE)) {
             this.fail("REGION_BODY", "expected a block after `region`")
             BootstrapExpression(
                 "region",
@@ -1442,10 +1448,10 @@ class BootstrapParser(
     // so this placeholder neither interprets nor authorizes target syntax.
     fun parseDeferredSubparserPlaceholder(): BootstrapExpression {
         val start = this.tokens[this.position]
-        this.expect("$")
+        this.expect(BOOTSTRAP_TOKEN_DOLLAR)
         var name = ""
         var end = start.end
-        if (this.at("identifier")) {
+        if (this.at(BOOTSTRAP_TOKEN_IDENTIFIER)) {
             name = bootstrapTokenText(
                 this.source, this.tokens[this.position]
             )
@@ -1453,16 +1459,16 @@ class BootstrapParser(
             this.position = this.position + 1
         }
         var finished = false
-        while (!finished && !this.at("end")) {
-            if (this.at("(") || this.at("[") || this.at("{")) {
+        while (!finished && !this.at(BOOTSTRAP_TOKEN_END)) {
+            if (this.at(BOOTSTRAP_TOKEN_LPAREN) || this.at(BOOTSTRAP_TOKEN_LBRACKET) || this.at(BOOTSTRAP_TOKEN_LBRACE)) {
                 val open = this.tokens[this.position].kind
-                val close = if (open == "(") ")" else
-                    if (open == "[") "]" else "}"
+                val close = if (open == BOOTSTRAP_TOKEN_LPAREN) BOOTSTRAP_TOKEN_RPAREN else
+                    if (open == BOOTSTRAP_TOKEN_LBRACKET) BOOTSTRAP_TOKEN_RBRACKET else BOOTSTRAP_TOKEN_RBRACE
                 this.skipBalanced(open, close)
                 end = this.tokens[this.position - 1].end
-            } else if (this.at("newline") || this.at(";") ||
-                       this.at(")") || this.at("]") ||
-                       this.at("}") || this.at(",")) {
+            } else if (this.at(BOOTSTRAP_TOKEN_NEWLINE) || this.at(BOOTSTRAP_TOKEN_SEMICOLON) ||
+                       this.at(BOOTSTRAP_TOKEN_RPAREN) || this.at(BOOTSTRAP_TOKEN_RBRACKET) ||
+                       this.at(BOOTSTRAP_TOKEN_RBRACE) || this.at(BOOTSTRAP_TOKEN_COMMA)) {
                 finished = true
             } else {
                 end = this.tokens[this.position].end
@@ -1486,19 +1492,19 @@ class BootstrapParser(
         var parentheses = 0
         while (index < this.tokens.size) {
             val kind = this.tokens[index].kind
-            if (kind == "<") angles = angles + 1
-            else if (kind == ">") angles = angles - 1
-            else if (kind == ">>") angles = angles - 2
-            else if (kind == ">>>") angles = angles - 3
-            else if (kind == "(") parentheses = parentheses + 1
-            else if (kind == ")") parentheses = parentheses - 1
-            else if (kind != "identifier" && kind != "," && kind != "?" &&
-                     kind != "->" && kind != ".") return -1
+            if (kind == BOOTSTRAP_TOKEN_LESS) angles = angles + 1
+            else if (kind == BOOTSTRAP_TOKEN_GREATER) angles = angles - 1
+            else if (kind == BOOTSTRAP_TOKEN_SHIFT_RIGHT) angles = angles - 2
+            else if (kind == BOOTSTRAP_TOKEN_SHIFT_UNSIGNED) angles = angles - 3
+            else if (kind == BOOTSTRAP_TOKEN_LPAREN) parentheses = parentheses + 1
+            else if (kind == BOOTSTRAP_TOKEN_RPAREN) parentheses = parentheses - 1
+            else if (kind != BOOTSTRAP_TOKEN_IDENTIFIER && kind != BOOTSTRAP_TOKEN_COMMA && kind != BOOTSTRAP_TOKEN_QUESTION &&
+                     kind != BOOTSTRAP_TOKEN_ARROW && kind != BOOTSTRAP_TOKEN_DOT) return -1
             if (angles < 0 || parentheses < 0) return -1
             if (angles == 0) {
                 if (parentheses != 0 || index + 1 >= this.tokens.size) return -1
                 val next = this.tokens[index + 1].kind
-                return if (next == "(" || next == "{") index else -1
+                return if (next == BOOTSTRAP_TOKEN_LPAREN || next == BOOTSTRAP_TOKEN_LBRACE) index else -1
             }
             index = index + 1
         }
@@ -1516,66 +1522,66 @@ class BootstrapParser(
             this.skipAngleGroup()
             return parameters
         }
-        this.expect("<")
+        this.expect(BOOTSTRAP_TOKEN_LESS)
         var open = true
-        while (open && !this.at("end")) {
+        while (open && !this.at(BOOTSTRAP_TOKEN_END)) {
             val name = this.tokens[this.position]
-            this.expect("identifier")
+            this.expect(BOOTSTRAP_TOKEN_IDENTIFIER)
             var parameter = bootstrapTokenText(this.source, name)
-            if (this.consume(":")) {
+            if (this.consume(BOOTSTRAP_TOKEN_COLON)) {
                 var bound = ""
                 var angles = 0
                 var reading = true
-                while (reading && !this.at("end")) {
-                    if (angles == 0 && (this.at(",") || this.at(">") || this.at(">>"))) {
+                while (reading && !this.at(BOOTSTRAP_TOKEN_END)) {
+                    if (angles == 0 && (this.at(BOOTSTRAP_TOKEN_COMMA) || this.at(BOOTSTRAP_TOKEN_GREATER) || this.at(BOOTSTRAP_TOKEN_SHIFT_RIGHT))) {
                         reading = false
-                    } else if (angles == 1 && this.at(">>")) {
+                    } else if (angles == 1 && this.at(BOOTSTRAP_TOKEN_SHIFT_RIGHT)) {
                         // `<T : Source<int>>`: the `>>` closes the bound and the list.
                         bound = "$bound>"
                         angles = 0
                         reading = false
                     } else {
-                        if (this.at("<")) angles = angles + 1
-                        if (this.at(">")) angles = angles - 1
+                        if (this.at(BOOTSTRAP_TOKEN_LESS)) angles = angles + 1
+                        if (this.at(BOOTSTRAP_TOKEN_GREATER)) angles = angles - 1
                         bound = "$bound${bootstrapTokenText(this.source, this.tokens[this.position])}"
                         this.position = this.position + 1
                     }
                 }
                 parameter = "$parameter:$bound"
-                if (this.at(">>") && bound.size > 0 && bound[bound.size - 1] == 62) {
+                if (this.at(BOOTSTRAP_TOKEN_SHIFT_RIGHT) && bound.size > 0 && bound[bound.size - 1] == 62) {
                     this.position = this.position + 1
                     parameters.append(parameter)
                     return parameters
                 }
             }
             parameters.append(parameter)
-            if (!this.consume(",")) open = false
+            if (!this.consume(BOOTSTRAP_TOKEN_COMMA)) open = false
         }
-        this.expect(">")
+        this.expect(BOOTSTRAP_TOKEN_GREATER)
         parameters
     }
 
     fun typedEmptyEnd(): int {
         if (!this.atWord("array") && !this.atWord("Map")) return -1
         var index = this.position + 1
-        if (index >= this.tokens.size || this.tokens[index].kind != "<") return -1
+        if (index >= this.tokens.size || this.tokens[index].kind != BOOTSTRAP_TOKEN_LESS) return -1
         var angles = 0
         var parentheses = 0
         while (index < this.tokens.size) {
             val kind = this.tokens[index].kind
-            if (kind == "end" || kind == "newline" || kind == ";" || kind == "=" ||
-                kind == "{" || kind == "}") return -1
-            if (kind == "<") angles = angles + 1
-            if (kind == ">") angles = angles - 1
-            if (kind == ">>") angles = angles - 2
-            if (kind == ">>>") angles = angles - 3
-            if (kind == "(") parentheses = parentheses + 1
-            if (kind == ")") parentheses = parentheses - 1
+            if (kind == BOOTSTRAP_TOKEN_END || kind == BOOTSTRAP_TOKEN_NEWLINE || kind == BOOTSTRAP_TOKEN_SEMICOLON || kind == BOOTSTRAP_TOKEN_EQUAL ||
+                kind == BOOTSTRAP_TOKEN_LBRACE || kind == BOOTSTRAP_TOKEN_RBRACE) return -1
+            if (kind == BOOTSTRAP_TOKEN_LESS) angles = angles + 1
+            if (kind == BOOTSTRAP_TOKEN_GREATER) angles = angles - 1
+            if (kind == BOOTSTRAP_TOKEN_SHIFT_RIGHT) angles = angles - 2
+            if (kind == BOOTSTRAP_TOKEN_SHIFT_UNSIGNED) angles = angles - 3
+            if (kind == BOOTSTRAP_TOKEN_LPAREN) parentheses = parentheses + 1
+            if (kind == BOOTSTRAP_TOKEN_RPAREN) parentheses = parentheses - 1
             if (angles < 0 || parentheses < 0) return -1
             if (angles == 0) {
                 if (parentheses != 0 || index + 2 >= this.tokens.size ||
-                    this.tokens[index + 1].kind != "(" ||
-                    this.tokens[index + 2].kind != ")") return -1
+                    this.tokens[index + 1].kind != BOOTSTRAP_TOKEN_LPAREN ||
+                    this.tokens[index + 2].kind != BOOTSTRAP_TOKEN_RPAREN) return -1
                 return index
             }
             index = index + 1
@@ -1594,9 +1600,9 @@ class BootstrapParser(
             this.position = this.position + 1
         }
         val typeEnd = this.tokens[close].end
-        this.expect("(")
+        this.expect(BOOTSTRAP_TOKEN_LPAREN)
         val end = this.tokens[this.position].end
-        this.expect(")")
+        this.expect(BOOTSTRAP_TOKEN_RPAREN)
         if (type.size >= 5 && type.slice(0, 5) == "array") {
             BootstrapExpression("array", type, begin, end, [])
         } else BootstrapExpression(
@@ -1611,49 +1617,49 @@ class BootstrapParser(
         if (expansion >= 0 && expansion < this.expansionEnds.size &&
             expansion < this.expansionExpressions.size) {
             val end = this.expansionEnds[expansion]
-            while (!this.at("end") &&
+            while (!this.at(BOOTSTRAP_TOKEN_END) &&
                    this.tokens[this.position].begin < end) {
                 this.position = this.position + 1
             }
             this.expansionExpressions[expansion]
-        } else if (this.at("$")) {
+        } else if (this.at(BOOTSTRAP_TOKEN_DOLLAR)) {
             this.parseDeferredSubparserPlaceholder()
-        } else if (this.at("if")) {
+        } else if (this.at(BOOTSTRAP_TOKEN_IF)) {
             this.parseIf()
-        } else if (this.at("when")) {
+        } else if (this.at(BOOTSTRAP_TOKEN_WHEN)) {
             this.parseWhen()
-        } else if (this.atContextualKeyword("region", "{")) {
+        } else if (this.atContextualKeyword("region", BOOTSTRAP_TOKEN_LBRACE)) {
             this.parseRegion()
-        } else if (this.atContextualKeyword("atomic", "{")) {
+        } else if (this.atContextualKeyword("atomic", BOOTSTRAP_TOKEN_LBRACE)) {
             this.parseAtomic()
-        } else if (this.at("generator") || this.at("task") ||
-                   this.at("thread")) {
+        } else if (this.at(BOOTSTRAP_TOKEN_GENERATOR) || this.at(BOOTSTRAP_TOKEN_TASK) ||
+                   this.at(BOOTSTRAP_TOKEN_THREAD)) {
             this.parseSuspendingBlock()
         } else if (this.typedEmptyEnd() >= 0) {
             this.parseTypedEmpty()
         } else if (
-            this.at("integer") || this.at("float") ||
-            this.at("identifier") ||
-            this.at("true") || this.at("false") || this.at("null")
+            this.at(BOOTSTRAP_TOKEN_INTEGER) || this.at(BOOTSTRAP_TOKEN_FLOAT) ||
+            this.at(BOOTSTRAP_TOKEN_IDENTIFIER) ||
+            this.at(BOOTSTRAP_TOKEN_TRUE) || this.at(BOOTSTRAP_TOKEN_FALSE) || this.at(BOOTSTRAP_TOKEN_NULL)
         ) {
             this.position = this.position + 1
             BootstrapExpression(
-                token.kind,
-                if (token.kind == "integer") bootstrapIntegerText(
+                bootstrapTokenKindName(token.kind),
+                if (token.kind == BOOTSTRAP_TOKEN_INTEGER) bootstrapIntegerText(
                     bootstrapTokenText(this.source, token)
-                ) else if (token.kind == "float") bootstrapFloatText(
+                ) else if (token.kind == BOOTSTRAP_TOKEN_FLOAT) bootstrapFloatText(
                     bootstrapTokenText(this.source, token)
                 ) else bootstrapTokenText(this.source, token),
                 token.begin,
                 token.end,
                 []
             )
-        } else if (this.consume("string-start")) {
+        } else if (this.consume(BOOTSTRAP_TOKEN_STRING_START)) {
             var text = ""
             var templated = false
             val parts: array<BootstrapExpression> = []
-            while (!this.at("string-end") && !this.at("end")) {
-                if (this.at("string-text")) {
+            while (!this.at(BOOTSTRAP_TOKEN_STRING_END) && !this.at(BOOTSTRAP_TOKEN_END)) {
+                if (this.at(BOOTSTRAP_TOKEN_STRING_TEXT)) {
                     val textToken = this.tokens[this.position]
                     val rawText = bootstrapTokenText(this.source, textToken)
                     this.checkEscapes(textToken, rawText)
@@ -1667,7 +1673,7 @@ class BootstrapParser(
                         []
                     ))
                     this.position = this.position + 1
-                } else if (this.at("interpolation-identifier")) {
+                } else if (this.at(BOOTSTRAP_TOKEN_INTERPOLATION_IDENTIFIER)) {
                     templated = true
                     val identifier = this.tokens[this.position]
                     parts.append(BootstrapExpression(
@@ -1678,10 +1684,10 @@ class BootstrapParser(
                         []
                     ))
                     this.position = this.position + 1
-                } else if (this.consume("interpolation-start")) {
+                } else if (this.consume(BOOTSTRAP_TOKEN_INTERPOLATION_START)) {
                     templated = true
                     parts.append(this.parseExpression())
-                    this.expect("interpolation-end")
+                    this.expect(BOOTSTRAP_TOKEN_INTERPOLATION_END)
                     this.position = this.position
                 } else {
                     this.fail(
@@ -1692,7 +1698,7 @@ class BootstrapParser(
                 }
             }
             val stringEnd = this.tokens[this.position]
-            this.expect("string-end")
+            this.expect(BOOTSTRAP_TOKEN_STRING_END)
             if (templated) {
                 BootstrapExpression(
                     "string.template",
@@ -1708,46 +1714,46 @@ class BootstrapParser(
                 stringEnd.end,
                 []
             )
-        } else if (this.consume("(")) {
+        } else if (this.consume(BOOTSTRAP_TOKEN_LPAREN)) {
             this.skipSeparators()
             val expression = this.parseExpression()
             this.skipSeparators()
-            this.expect(")")
+            this.expect(BOOTSTRAP_TOKEN_RPAREN)
             expression
-        } else if (this.consume("[")) {
+        } else if (this.consume(BOOTSTRAP_TOKEN_LBRACKET)) {
             val elements: array<BootstrapExpression> = []
             this.skipSeparators()
             var open = true
-            while (open && !this.at("]") && !this.at("end")) {
+            while (open && !this.at(BOOTSTRAP_TOKEN_RBRACKET) && !this.at(BOOTSTRAP_TOKEN_END)) {
                 elements.append(this.parseExpression())
                 this.skipSeparators()
-                if (!this.consume(",") && !this.at("]")) {
+                if (!this.consume(BOOTSTRAP_TOKEN_COMMA) && !this.at(BOOTSTRAP_TOKEN_RBRACKET)) {
                     this.fail(
                         "ARRAY_SEPARATOR",
                         "expected `,` or `]` after array element"
                     )
                     // Another construct's closer ends the list; anything
                     // else is skipped, so the loop always moves on.
-                    if (this.at(")") || this.at("}")) open = false
-                    else if (!this.at("end")) this.position = this.position + 1
+                    if (this.at(BOOTSTRAP_TOKEN_RPAREN) || this.at(BOOTSTRAP_TOKEN_RBRACE)) open = false
+                    else if (!this.at(BOOTSTRAP_TOKEN_END)) this.position = this.position + 1
                 }
                 this.skipSeparators()
             }
             val end = this.tokens[this.position]
-            this.expect("]")
+            this.expect(BOOTSTRAP_TOKEN_RBRACKET)
             BootstrapExpression("array", "", token.begin, end.end, elements)
-        } else if (this.at("{")) {
+        } else if (this.at(BOOTSTRAP_TOKEN_LBRACE)) {
             this.parseLambda()
         } else {
             this.fail(
                 "EXPRESSION",
-                "expected an expression, found `${token.kind}`"
+                "expected an expression, found `${bootstrapTokenKindName(token.kind)}`"
             )
             // A closing delimiter belongs to the construct around the
             // missing expression (`(1 +)`): leave it, so that one mistake is
             // one error. Callers that loop always advance through `expect`.
-            if (!this.at("end") && !this.at(")") && !this.at("]") &&
-                !this.at("}")) this.position = this.position + 1
+            if (!this.at(BOOTSTRAP_TOKEN_END) && !this.at(BOOTSTRAP_TOKEN_RPAREN) && !this.at(BOOTSTRAP_TOKEN_RBRACKET) &&
+                !this.at(BOOTSTRAP_TOKEN_RBRACE)) this.position = this.position + 1
             BootstrapExpression("invalid", "", token.begin, token.end, [])
         }
     }
@@ -1759,7 +1765,7 @@ class BootstrapParser(
         var expression = initial
         var more = true
         while (more) {
-            val typeArgumentsClose = if (this.at("<") &&
+            val typeArgumentsClose = if (this.at(BOOTSTRAP_TOKEN_LESS) &&
                 (expression.kind == "identifier" || expression.kind == "member"))
                 this.typeArgumentsEnd() else -1
             if (typeArgumentsClose >= 0) {
@@ -1778,14 +1784,14 @@ class BootstrapParser(
                     this.tokens[typeArgumentsClose].end,
                     expression.children
                 )
-            } else if (this.at("(")) {
+            } else if (this.at(BOOTSTRAP_TOKEN_LPAREN)) {
                 val arguments: array<BootstrapExpression> = []
                 this.position = this.position + 1
                 this.skipSeparators()
                 var open = true
-                while (open && !this.at(")") && !this.at("end")) {
-                    if (this.at("identifier") &&
-                        this.tokens[this.position + 1].kind == "=") {
+                while (open && !this.at(BOOTSTRAP_TOKEN_RPAREN) && !this.at(BOOTSTRAP_TOKEN_END)) {
+                    if (this.at(BOOTSTRAP_TOKEN_IDENTIFIER) &&
+                        this.tokens[this.position + 1].kind == BOOTSTRAP_TOKEN_EQUAL) {
                         val name = this.tokens[this.position]
                         this.position = this.position + 2
                         this.skipSeparators()
@@ -1799,17 +1805,17 @@ class BootstrapParser(
                         ))
                     } else arguments.append(this.parseExpression())
                     this.skipSeparators()
-                    if (!this.consume(",") && !this.at(")")) {
+                    if (!this.consume(BOOTSTRAP_TOKEN_COMMA) && !this.at(BOOTSTRAP_TOKEN_RPAREN)) {
                         this.fail(
                             "ARGUMENT_SEPARATOR",
                             "expected `,` or `)` after argument"
                         )
-                        if (this.at("]") || this.at("}")) open = false
-                        else if (!this.at("end")) this.position = this.position + 1
+                        if (this.at(BOOTSTRAP_TOKEN_RBRACKET) || this.at(BOOTSTRAP_TOKEN_RBRACE)) open = false
+                        else if (!this.at(BOOTSTRAP_TOKEN_END)) this.position = this.position + 1
                     }
                     this.skipSeparators()
                 }
-                this.expect(")")
+                this.expect(BOOTSTRAP_TOKEN_RPAREN)
                 if (expression.kind == "member") {
                     val memberArguments: array<BootstrapExpression> = []
                     memberArguments.append(expression.children[0])
@@ -1853,10 +1859,10 @@ class BootstrapParser(
             } else if (this.continueMemberChain()) {
                 this.position = this.position + 1
                 // `account.^balance`: the delegate of a delegated property.
-                val projection = this.at("^")
+                val projection = this.at(BOOTSTRAP_TOKEN_XOR)
                 if (projection) this.position = this.position + 1
                 val member = this.tokens[this.position]
-                this.expect("identifier")
+                this.expect(BOOTSTRAP_TOKEN_IDENTIFIER)
                 expression = BootstrapExpression(
                     "member",
                     bootstrapTokenText(this.source, member),
@@ -1868,12 +1874,12 @@ class BootstrapParser(
                     "delegate.project", "", expression.begin, member.end, [expression]
                 )
                 more = more
-            } else if (this.consume("[")) {
+            } else if (this.consume(BOOTSTRAP_TOKEN_LBRACKET)) {
                 this.skipSeparators()
                 val index = this.parseExpression()
                 this.skipSeparators()
                 val end = this.tokens[this.position]
-                this.expect("]")
+                this.expect(BOOTSTRAP_TOKEN_RBRACKET)
                 expression = BootstrapExpression(
                     "index",
                     "",
@@ -1882,7 +1888,7 @@ class BootstrapParser(
                     [expression, index]
                 )
                 more = more
-            } else if (this.at("{")) {
+            } else if (this.at(BOOTSTRAP_TOKEN_LBRACE)) {
                 val lambda = this.parseLambda()
                 if (expression.kind == "call.value") {
                     val valueArguments: array<BootstrapExpression> = []
@@ -1972,20 +1978,20 @@ class BootstrapParser(
 
     fun parseFactor(): BootstrapExpression {
         var expression = this.parseCast()
-        var more = this.at("*") || this.at("/") || this.at("%")
+        var more = this.at(BOOTSTRAP_TOKEN_STAR) || this.at(BOOTSTRAP_TOKEN_SLASH) || this.at(BOOTSTRAP_TOKEN_PERCENT)
         while (more) {
             val operation = this.tokens[this.position]
             this.position = this.position + 1
             this.skipSeparators()
             val right = this.parseCast()
             expression = BootstrapExpression(
-                operation.kind,
-                operation.kind,
+                bootstrapTokenKindName(operation.kind),
+                bootstrapTokenKindName(operation.kind),
                 expression.begin,
                 right.end,
                 [expression, right]
             )
-            more = this.at("*") || this.at("/") || this.at("%")
+            more = this.at(BOOTSTRAP_TOKEN_STAR) || this.at(BOOTSTRAP_TOKEN_SLASH) || this.at(BOOTSTRAP_TOKEN_PERCENT)
         }
         expression
     }
@@ -1994,7 +2000,7 @@ class BootstrapParser(
      *  instance of another (binds tighter than `*`, as in Kotlin). */
     fun parseCast(): BootstrapExpression {
         var expression = this.parseUnary()
-        while (this.atContextualKeyword("as", "?")) {
+        while (this.atContextualKeyword("as", BOOTSTRAP_TOKEN_QUESTION)) {
             this.position = this.position + 2
             val type = this.parseCastType()
             expression = BootstrapExpression(
@@ -2012,24 +2018,24 @@ class BootstrapParser(
      *  import alias or not) and its `<…>` arguments, nothing after them. */
     fun parseCastType(): string {
         var type = ""
-        if (!this.at("identifier")) {
+        if (!this.at(BOOTSTRAP_TOKEN_IDENTIFIER)) {
             this.fail("CAST_TYPE", "expected a class name after `as?`")
             return "unknown"
         }
         type = bootstrapTokenText(this.source, this.tokens[this.position])
         this.position = this.position + 1
-        while (this.at(".") && this.position + 1 < this.tokens.size &&
-               this.tokens[this.position + 1].kind == "identifier") {
+        while (this.at(BOOTSTRAP_TOKEN_DOT) && this.position + 1 < this.tokens.size &&
+               this.tokens[this.position + 1].kind == BOOTSTRAP_TOKEN_IDENTIFIER) {
             type = "$type.${bootstrapTokenText(this.source, this.tokens[this.position + 1])}"
             this.position = this.position + 2
         }
-        if (this.at("<")) {
+        if (this.at(BOOTSTRAP_TOKEN_LESS)) {
             var angles = 0
             var more = true
-            while (more && !this.at("end")) {
-                if (this.at("<")) angles = angles + 1
-                if (this.at(">")) angles = angles - 1
-                if (this.at(">>")) angles = angles - 2
+            while (more && !this.at(BOOTSTRAP_TOKEN_END)) {
+                if (this.at(BOOTSTRAP_TOKEN_LESS)) angles = angles + 1
+                if (this.at(BOOTSTRAP_TOKEN_GREATER)) angles = angles - 1
+                if (this.at(BOOTSTRAP_TOKEN_SHIFT_RIGHT)) angles = angles - 2
                 type = "$type${bootstrapTokenText(this.source, this.tokens[this.position])}"
                 this.position = this.position + 1
                 more = angles > 0
@@ -2039,23 +2045,23 @@ class BootstrapParser(
     }
 
     fun parseUnary(): BootstrapExpression {
-        if (this.at("await") || this.at("yield")) {
+        if (this.at(BOOTSTRAP_TOKEN_AWAIT) || this.at(BOOTSTRAP_TOKEN_YIELD)) {
             val operation = this.tokens[this.position]
             this.position = this.position + 1
             this.skipSeparators()
             // `await t + 1` awaits `t`; `yield k * 10` yields the whole expression, as a
             // statement-level `yield` reads (it has no value of its own to combine).
             val operand =
-                if (operation.kind == "yield") this.parseExpression()
+                if (operation.kind == BOOTSTRAP_TOKEN_YIELD) this.parseExpression()
                 else this.parseUnary()
             BootstrapExpression(
-                operation.kind,
+                bootstrapTokenKindName(operation.kind),
                 "",
                 operation.begin,
                 operand.end,
                 [operand]
             )
-        } else if (this.at("#")) {
+        } else if (this.at(BOOTSTRAP_TOKEN_HASH)) {
             val operation = this.tokens[this.position]
             this.position = this.position + 1
             val operand = this.parseUnary()
@@ -2066,12 +2072,12 @@ class BootstrapParser(
                 operand.end,
                 [operand]
             )
-        } else if (this.at("^")) {
+        } else if (this.at(BOOTSTRAP_TOKEN_XOR)) {
             val operation = this.tokens[this.position]
             this.position = this.position + 1
             // `^` projects a binding: `^volume.maximum` is the delegate's field,
             // `(^volume).maximum`, as a binding has no members of its own.
-            if (this.at("identifier")) {
+            if (this.at(BOOTSTRAP_TOKEN_IDENTIFIER)) {
                 val binding = this.parsePrimary()
                 this.parsePostfixOn(BootstrapExpression(
                     "delegate.project",
@@ -2090,14 +2096,14 @@ class BootstrapParser(
                     [operand]
                 )
             }
-        } else if (this.at("!") || this.at("~") ||
-                   this.at("-") || this.at("+")) {
+        } else if (this.at(BOOTSTRAP_TOKEN_BANG) || this.at(BOOTSTRAP_TOKEN_TILDE) ||
+                   this.at(BOOTSTRAP_TOKEN_MINUS) || this.at(BOOTSTRAP_TOKEN_PLUS)) {
             val operation = this.tokens[this.position]
             this.position = this.position + 1
             val operand = this.parseUnary()
             BootstrapExpression(
-                "unary${operation.kind}",
-                operation.kind,
+                "unary${bootstrapTokenKindName(operation.kind)}",
+                bootstrapTokenKindName(operation.kind),
                 operation.begin,
                 operand.end,
                 [operand]
@@ -2114,8 +2120,8 @@ class BootstrapParser(
             this.skipSeparators()
             val right = this.parseFactor()
             expression = BootstrapExpression(
-                operation.kind,
-                operation.kind,
+                bootstrapTokenKindName(operation.kind),
+                bootstrapTokenKindName(operation.kind),
                 expression.begin,
                 right.end,
                 [expression, right]
@@ -2127,37 +2133,37 @@ class BootstrapParser(
 
     fun parseShift(): BootstrapExpression {
         var expression = this.parseTerm()
-        var more = this.at("<<") || this.at(">>") || this.at(">>>")
+        var more = this.at(BOOTSTRAP_TOKEN_SHIFT_LEFT) || this.at(BOOTSTRAP_TOKEN_SHIFT_RIGHT) || this.at(BOOTSTRAP_TOKEN_SHIFT_UNSIGNED)
         while (more) {
             val operation = this.tokens[this.position]
             this.position = this.position + 1
             this.skipSeparators()
             val right = this.parseTerm()
             expression = BootstrapExpression(
-                operation.kind,
-                operation.kind,
+                bootstrapTokenKindName(operation.kind),
+                bootstrapTokenKindName(operation.kind),
                 expression.begin,
                 right.end,
                 [expression, right]
             )
-            more = this.at("<<") || this.at(">>") || this.at(">>>")
+            more = this.at(BOOTSTRAP_TOKEN_SHIFT_LEFT) || this.at(BOOTSTRAP_TOKEN_SHIFT_RIGHT) || this.at(BOOTSTRAP_TOKEN_SHIFT_UNSIGNED)
         }
         expression
     }
 
     fun parseRange(): BootstrapExpression {
         var expression = this.parseShift()
-        if (this.at("..") || this.at("until")) {
+        if (this.at(BOOTSTRAP_TOKEN_RANGE) || this.at(BOOTSTRAP_TOKEN_UNTIL)) {
             val operation = this.tokens[this.position]
             this.position = this.position + 1
             this.skipSeparators()
             val right = this.parseShift()
-            val kind = if (operation.kind == "..") {
+            val kind = if (operation.kind == BOOTSTRAP_TOKEN_RANGE) {
                 "range.closed"
             } else "range.until"
             expression = BootstrapExpression(
                 kind,
-                operation.kind,
+                bootstrapTokenKindName(operation.kind),
                 expression.begin,
                 right.end,
                 [expression, right]
@@ -2174,7 +2180,7 @@ class BootstrapParser(
         if (!this.continueNullDefault()) return left
         val mark = this.tokens[this.position]
         val next = this.tokens[this.position + 1]
-        if (next.kind == ":") this.failAt(
+        if (next.kind == BOOTSTRAP_TOKEN_COLON) this.failAt(
             "ELVIS",
             "Abla writes Kotlin's `?:` as `??`: `x ?? fallback`",
             mark.begin,
@@ -2183,8 +2189,8 @@ class BootstrapParser(
         this.position = this.position + 2
         this.skipSeparators()
         val right =
-            if (this.at("return")) this.parseReturn()
-            else if (this.at("break") || this.at("continue")) this.parseLoopControl()
+            if (this.at(BOOTSTRAP_TOKEN_RETURN)) this.parseReturn()
+            else if (this.at(BOOTSTRAP_TOKEN_BREAK) || this.at(BOOTSTRAP_TOKEN_CONTINUE)) this.parseLoopControl()
             else this.parseNullDefault()
         // Always through a local: `present` hands its value on (a resource
         // is moved out of it, ir.ab bootstrapIsNullDefaultResult).
@@ -2200,7 +2206,7 @@ class BootstrapParser(
         val mark = this.tokens[this.position]
         this.position = this.position + 2
         val member = this.tokens[this.position]
-        this.expect("identifier")
+        this.expect(BOOTSTRAP_TOKEN_IDENTIFIER)
         val name = this.nullSubjectName(receiver, mark)
         val rest = this.parsePostfixOn(BootstrapExpression(
             "member",
@@ -2262,50 +2268,50 @@ class BootstrapParser(
     fun parseComparison(): BootstrapExpression {
         var expression = this.parseNullDefault()
         var more =
-            this.at("<") || this.at("<=") ||
-            this.at(">") || this.at(">=")
+            this.at(BOOTSTRAP_TOKEN_LESS) || this.at(BOOTSTRAP_TOKEN_LESS_EQUAL) ||
+            this.at(BOOTSTRAP_TOKEN_GREATER) || this.at(BOOTSTRAP_TOKEN_GREATER_EQUAL)
         while (more) {
             val operation = this.tokens[this.position]
             this.position = this.position + 1
             this.skipSeparators()
             val right = this.parseNullDefault()
             expression = BootstrapExpression(
-                operation.kind,
-                operation.kind,
+                bootstrapTokenKindName(operation.kind),
+                bootstrapTokenKindName(operation.kind),
                 expression.begin,
                 right.end,
                 [expression, right]
             )
             more =
-                this.at("<") || this.at("<=") ||
-                this.at(">") || this.at(">=")
+                this.at(BOOTSTRAP_TOKEN_LESS) || this.at(BOOTSTRAP_TOKEN_LESS_EQUAL) ||
+                this.at(BOOTSTRAP_TOKEN_GREATER) || this.at(BOOTSTRAP_TOKEN_GREATER_EQUAL)
         }
         expression
     }
 
     fun parseEquality(): BootstrapExpression {
         var expression = this.parseComparison()
-        var more = this.at("==") || this.at("!=")
+        var more = this.at(BOOTSTRAP_TOKEN_EQUAL_EQUAL) || this.at(BOOTSTRAP_TOKEN_NOT_EQUAL)
         while (more) {
             val operation = this.tokens[this.position]
             this.position = this.position + 1
             this.skipSeparators()
             val right = this.parseComparison()
             expression = BootstrapExpression(
-                operation.kind,
-                operation.kind,
+                bootstrapTokenKindName(operation.kind),
+                bootstrapTokenKindName(operation.kind),
                 expression.begin,
                 right.end,
                 [expression, right]
             )
-            more = this.at("==") || this.at("!=")
+            more = this.at(BOOTSTRAP_TOKEN_EQUAL_EQUAL) || this.at(BOOTSTRAP_TOKEN_NOT_EQUAL)
         }
         expression
     }
 
     fun parseLogicalAnd(): BootstrapExpression {
         var expression = this.parseBitwiseOr()
-        while (this.consume("&&")) {
+        while (this.consume(BOOTSTRAP_TOKEN_AND_AND)) {
             this.skipSeparators()
             val right = this.parseBitwiseOr()
             expression = BootstrapExpression(
@@ -2321,7 +2327,7 @@ class BootstrapParser(
 
     fun parseBitwiseAnd(): BootstrapExpression {
         var expression = this.parseEquality()
-        while (this.consume("&")) {
+        while (this.consume(BOOTSTRAP_TOKEN_AMP)) {
             this.skipSeparators()
             val right = this.parseEquality()
             expression = BootstrapExpression(
@@ -2333,7 +2339,7 @@ class BootstrapParser(
 
     fun parseBitwiseXor(): BootstrapExpression {
         var expression = this.parseBitwiseAnd()
-        while (this.consume("^")) {
+        while (this.consume(BOOTSTRAP_TOKEN_XOR)) {
             this.skipSeparators()
             val right = this.parseBitwiseAnd()
             expression = BootstrapExpression(
@@ -2345,7 +2351,7 @@ class BootstrapParser(
 
     fun parseBitwiseOr(): BootstrapExpression {
         var expression = this.parseBitwiseXor()
-        while (this.consume("|")) {
+        while (this.consume(BOOTSTRAP_TOKEN_PIPE)) {
             this.skipSeparators()
             val right = this.parseBitwiseXor()
             expression = BootstrapExpression(
@@ -2357,7 +2363,7 @@ class BootstrapParser(
 
     fun parseLogicalOr(): BootstrapExpression {
         var expression = this.parseLogicalAnd()
-        while (this.consume("||")) {
+        while (this.consume(BOOTSTRAP_TOKEN_OR_OR)) {
             this.skipSeparators()
             val right = this.parseLogicalAnd()
             expression = BootstrapExpression(
@@ -2373,14 +2379,14 @@ class BootstrapParser(
 
     fun parseExpression(): BootstrapExpression {
         val expression = this.parseLogicalOr()
-        if (this.consume("=")) {
+        if (this.consume(BOOTSTRAP_TOKEN_EQUAL)) {
             this.skipSeparators()
             return this.assignment(expression, this.parseExpression())
         }
         // `place op= value` is `place = place op value`; the place is read
         // again, so it may not call anything.
         val kind = this.tokens[this.position].kind
-        if (kind == "+=" || kind == "-=" || kind == "*=" || kind == "/=" || kind == "%=") {
+        if (kind == BOOTSTRAP_TOKEN_PLUS_EQUAL || kind == BOOTSTRAP_TOKEN_MINUS_EQUAL || kind == BOOTSTRAP_TOKEN_STAR_EQUAL || kind == BOOTSTRAP_TOKEN_SLASH_EQUAL || kind == BOOTSTRAP_TOKEN_PERCENT_EQUAL) {
             this.position = this.position + 1
             this.skipSeparators()
             val value = this.parseExpression()
@@ -2388,11 +2394,11 @@ class BootstrapParser(
             if (!bootstrapRereadablePlace(expression) &&
                 !bootstrapIsSafeChain(expression)) this.failAt(
                 "COMPOUND_ASSIGNMENT_TARGET",
-                "the left side of `$kind` is evaluated twice, so it may not call anything",
+                "the left side of `${bootstrapTokenKindName(kind)}` is evaluated twice, so it may not call anything",
                 expression.begin,
                 expression.end
             )
-            val operation = kind.slice(0, 1)
+            val operation = bootstrapTokenKindName(kind).slice(0, 1)
             return this.assignment(expression, BootstrapExpression(
                 operation, operation, expression.begin, value.end, [expression, value]
             ))
@@ -2466,11 +2472,11 @@ class BootstrapParser(
     fun skipAngleGroup() {
         var depth = 0
         var more = true
-        while (more && !this.at("end")) {
-            if (this.at("<")) depth = depth + 1
-            if (this.at(">")) depth = depth - 1
-            if (this.at(">>")) depth = depth - 2
-            if (this.at(">>>")) depth = depth - 3
+        while (more && !this.at(BOOTSTRAP_TOKEN_END)) {
+            if (this.at(BOOTSTRAP_TOKEN_LESS)) depth = depth + 1
+            if (this.at(BOOTSTRAP_TOKEN_GREATER)) depth = depth - 1
+            if (this.at(BOOTSTRAP_TOKEN_SHIFT_RIGHT)) depth = depth - 2
+            if (this.at(BOOTSTRAP_TOKEN_SHIFT_UNSIGNED)) depth = depth - 3
             this.position = this.position + 1
             if (depth <= 0) more = false
         }
@@ -2483,40 +2489,40 @@ class BootstrapParser(
         val enclosingFloor = this.bindingFloor
         val enclosingBindings = this.bindingNames.size
         this.bindingFloor = enclosingBindings
-        var kind = this.tokens[this.position].kind
+        var kind = bootstrapTokenKindName(this.tokens[this.position].kind)
         if (this.atWord("type")) kind = "type"
         this.position = this.position + 1
         // `fun <T> first(…)`: a generic function.
         var typeParameters: array<string> = []
-        if (kind == "fun" && this.at("<")) typeParameters = this.parseTypeParameters()
+        if (kind == "fun" && this.at(BOOTSTRAP_TOKEN_LESS)) typeParameters = this.parseTypeParameters()
         var nameToken = this.tokens[this.position]
-        this.expect("identifier")
+        this.expect(BOOTSTRAP_TOKEN_IDENTIFIER)
         var declarationName = bootstrapTokenText(this.source, nameToken)
         var extensionOwner = ""
         // `fun array<int>.total()`, `fun string?.orEmpty()`: the receiver is
         // any type, read up to the `.` before the method name.
         var receiverType = declarationName
-        if (kind == "fun" && (this.at("<") || this.at("?"))) {
+        if (kind == "fun" && (this.at(BOOTSTRAP_TOKEN_LESS) || this.at(BOOTSTRAP_TOKEN_QUESTION))) {
             var angles = 0
             var more = true
-            while (more && !this.at("end")) {
-                if (angles == 0 && this.at(".")) {
+            while (more && !this.at(BOOTSTRAP_TOKEN_END)) {
+                if (angles == 0 && this.at(BOOTSTRAP_TOKEN_DOT)) {
                     more = false
-                } else if (angles == 0 && !this.at("<") && !this.at("?")) {
+                } else if (angles == 0 && !this.at(BOOTSTRAP_TOKEN_LESS) && !this.at(BOOTSTRAP_TOKEN_QUESTION)) {
                     more = false
-                } else if (angles > 0 && (this.at("newline") ||
-                           this.at("{") || this.at("=") || this.at(")"))) {
+                } else if (angles > 0 && (this.at(BOOTSTRAP_TOKEN_NEWLINE) ||
+                           this.at(BOOTSTRAP_TOKEN_LBRACE) || this.at(BOOTSTRAP_TOKEN_EQUAL) || this.at(BOOTSTRAP_TOKEN_RPAREN))) {
                     more = false
                 } else {
-                    if (this.at("<")) angles = angles + 1
-                    if (this.at(">")) angles = angles - 1
-                    if (this.at(">>")) angles = angles - 2
-                    if (this.at(">>>")) angles = angles - 3
+                    if (this.at(BOOTSTRAP_TOKEN_LESS)) angles = angles + 1
+                    if (this.at(BOOTSTRAP_TOKEN_GREATER)) angles = angles - 1
+                    if (this.at(BOOTSTRAP_TOKEN_SHIFT_RIGHT)) angles = angles - 2
+                    if (this.at(BOOTSTRAP_TOKEN_SHIFT_UNSIGNED)) angles = angles - 3
                     receiverType = "$receiverType${bootstrapTokenText(this.source, this.tokens[this.position])}"
                     this.position = this.position + 1
                 }
             }
-            if (!this.at(".")) {
+            if (!this.at(BOOTSTRAP_TOKEN_DOT)) {
                 this.fail(
                     "EXTENSION_RECEIVER",
                     "expected `.` and the method name after the extension's receiver type `$receiverType`"
@@ -2525,12 +2531,12 @@ class BootstrapParser(
                 // body), so one mistake is one error.
                 var braces = 0
                 var skipping = true
-                while (skipping && !this.at("end")) {
-                    if (braces == 0 && this.at("newline")) {
+                while (skipping && !this.at(BOOTSTRAP_TOKEN_END)) {
+                    if (braces == 0 && this.at(BOOTSTRAP_TOKEN_NEWLINE)) {
                         skipping = false
                     } else {
-                        if (this.at("{")) braces = braces + 1
-                        if (this.at("}")) {
+                        if (this.at(BOOTSTRAP_TOKEN_LBRACE)) braces = braces + 1
+                        if (this.at(BOOTSTRAP_TOKEN_RBRACE)) {
                             braces = braces - 1
                             if (braces == 0) skipping = false
                         }
@@ -2539,18 +2545,18 @@ class BootstrapParser(
                 }
             }
         }
-        if (kind == "fun" && this.consume(".")) {
+        if (kind == "fun" && this.consume(BOOTSTRAP_TOKEN_DOT)) {
             extensionOwner = receiverType
             nameToken = this.tokens[this.position]
-            this.expect("identifier")
+            this.expect(BOOTSTRAP_TOKEN_IDENTIFIER)
             declarationName = bootstrapTokenText(this.source, nameToken)
         }
         // `var Point.label: string = ""`: an extension field of the class.
-        if ((kind == "val" || kind == "var") && this.consume(".")) {
+        if ((kind == "val" || kind == "var") && this.consume(BOOTSTRAP_TOKEN_DOT)) {
             kind = "extension.$kind"
             extensionOwner = declarationName
             nameToken = this.tokens[this.position]
-            this.expect("identifier")
+            this.expect(BOOTSTRAP_TOKEN_IDENTIFIER)
             declarationName = bootstrapTokenText(this.source, nameToken)
         }
         var expression = BootstrapExpression("missing", "", begin, begin, [])
@@ -2563,7 +2569,7 @@ class BootstrapParser(
         val conformances: array<string> = []
 
         if (kind == "fun") {
-            if (this.at("(")) {
+            if (this.at(BOOTSTRAP_TOKEN_LPAREN)) {
                 val parsedParameters = this.parseParameters()
                 parameters = parsedParameters.names
                 parameterTypes = parsedParameters.types
@@ -2580,27 +2586,27 @@ class BootstrapParser(
                     )
                 }
             }
-            if (this.consume(":")) {
+            if (this.consume(BOOTSTRAP_TOKEN_COLON)) {
                 resultType = this.parseType(false)
             }
             // `where T : Shape`: a generic's constraints.
             if (this.atWord("where")) {
                 this.failReserved("a `where` clause")
-                while (!this.at("end") && !this.at("=") && !this.at("{") &&
-                       !this.at("newline")) this.position = this.position + 1
+                while (!this.at(BOOTSTRAP_TOKEN_END) && !this.at(BOOTSTRAP_TOKEN_EQUAL) && !this.at(BOOTSTRAP_TOKEN_LBRACE) &&
+                       !this.at(BOOTSTRAP_TOKEN_NEWLINE)) this.position = this.position + 1
             }
             this.declareBinding("this", true)
             for (parameter in parameters) this.declareBinding(parameter, true)
-            if (this.consume("=")) {
+            if (this.consume(BOOTSTRAP_TOKEN_EQUAL)) {
                 this.skipSeparators()
                 expression = this.parseExpression()
                 this.skipToDeclarationEnd()
             }
-            else if (this.at("{")) expression = this.parseBlock()
+            else if (this.at(BOOTSTRAP_TOKEN_LBRACE)) expression = this.parseBlock()
         } else if (kind == "class" || kind == "interface") {
             // `class Box<T>`, `interface Source<T>`: a generic class or interface.
-            if (this.at("<")) typeParameters = this.parseTypeParameters()
-            if (this.at("(")) {
+            if (this.at(BOOTSTRAP_TOKEN_LESS)) typeParameters = this.parseTypeParameters()
+            if (this.at(BOOTSTRAP_TOKEN_LPAREN)) {
                 val parsedParameters = this.parseParameters()
                 parameters = parsedParameters.names
                 parameterTypes = parsedParameters.types
@@ -2609,23 +2615,23 @@ class BootstrapParser(
             }
             // `: Shape, Named`: the interfaces a class conforms to (or an
             // interface's parents, read and refused until they are supported).
-            if (this.consume(":")) {
+            if (this.consume(BOOTSTRAP_TOKEN_COLON)) {
                 var more = true
                 while (more) {
                     conformances.append(this.parseType(false))
-                    more = this.consume(",")
+                    more = this.consume(BOOTSTRAP_TOKEN_COMMA)
                 }
             }
-            if (this.consume("{")) {
+            if (this.consume(BOOTSTRAP_TOKEN_LBRACE)) {
                 this.skipSeparators()
-                while (!this.at("}") && !this.at("end")) {
-                    if (this.at("fun")) {
+                while (!this.at(BOOTSTRAP_TOKEN_RBRACE) && !this.at(BOOTSTRAP_TOKEN_END)) {
+                    if (this.at(BOOTSTRAP_TOKEN_FUN)) {
                         methods.append(this.parseDeclaration())
                     } else if (this.atOperatorDeclaration()) {
                         methods.append(this.parseOperatorDeclaration())
-                    } else if (this.at("trusted")) {
+                    } else if (this.at(BOOTSTRAP_TOKEN_TRUSTED)) {
                         methods.append(this.parseTrustedDeclaration())
-                    } else if (this.at("noescape")) {
+                    } else if (this.at(BOOTSTRAP_TOKEN_NOESCAPE)) {
                         methods.append(this.parseNoEscapeDeclaration())
                     } else if (kind == "interface" && this.atWord("type")) {
                         // `type Item`: an interface's associated type.
@@ -2640,14 +2646,14 @@ class BootstrapParser(
                     }
                     this.skipSeparators()
                 }
-                this.expect("}")
+                this.expect(BOOTSTRAP_TOKEN_RBRACE)
             }
         } else if (kind == "type") {
-            this.expect("=")
+            this.expect(BOOTSTRAP_TOKEN_EQUAL)
             resultType = this.parseType(false)
             this.skipToDeclarationEnd()
         } else {
-            if (this.consume(":")) {
+            if (this.consume(BOOTSTRAP_TOKEN_COLON)) {
                 resultType = this.parseType(false)
             }
             if (this.consumeWord("by")) {
@@ -2670,7 +2676,7 @@ class BootstrapParser(
                         )
                     ]
                 )
-            } else if (this.consume("=")) {
+            } else if (this.consume(BOOTSTRAP_TOKEN_EQUAL)) {
                 this.skipSeparators()
                 expression = this.parseExpression()
             }
@@ -2718,11 +2724,11 @@ class BootstrapParser(
         this.position = this.position + 1
         val name = this.parseCastType()
         val conformances: array<string> = []
-        this.expect(":")
+        this.expect(BOOTSTRAP_TOKEN_COLON)
         var more = true
         while (more) {
             conformances.append(this.parseType(false))
-            more = this.consume(",")
+            more = this.consume(BOOTSTRAP_TOKEN_COMMA)
         }
         this.skipToDeclarationEnd()
         BootstrapDeclaration(
@@ -2756,19 +2762,19 @@ class BootstrapParser(
 
     fun parseExternal(): BootstrapDeclaration {
         val begin = this.tokens[this.position].begin
-        if (this.at("compile")) this.position = this.position + 1
-        this.expect("extern")
-        this.expect(":")
-        this.expect("string-start")
+        if (this.at(BOOTSTRAP_TOKEN_COMPILE)) this.position = this.position + 1
+        this.expect(BOOTSTRAP_TOKEN_EXTERN)
+        this.expect(BOOTSTRAP_TOKEN_COLON)
+        this.expect(BOOTSTRAP_TOKEN_STRING_START)
         var library = ""
-        if (this.at("string-text")) {
+        if (this.at(BOOTSTRAP_TOKEN_STRING_TEXT)) {
             val libraryToken = this.tokens[this.position]
             val rawLibrary = bootstrapTokenText(this.source, libraryToken)
             this.checkEscapes(libraryToken, rawLibrary)
             library = bootstrapDecodeString(rawLibrary)
             this.position = this.position + 1
         }
-        this.expect("string-end")
+        this.expect(BOOTSTRAP_TOKEN_STRING_END)
         val declaration = this.parseDeclaration()
         BootstrapDeclaration(
             "extern",
@@ -2804,7 +2810,7 @@ class BootstrapParser(
 
     fun parseCompileDeclaration(): BootstrapDeclaration {
         val begin = this.tokens[this.position].begin
-        this.expect("compile")
+        this.expect(BOOTSTRAP_TOKEN_COMPILE)
         val declaration = this.parseDeclaration()
         var compileKind = declaration.kind
         if (declaration.kind == "fun") compileKind = "compile.fun"
@@ -2844,10 +2850,10 @@ class BootstrapParser(
 
     fun parseTrustedDeclaration(): BootstrapDeclaration {
         val begin = this.tokens[this.position].begin
-        this.expect("trusted")
-        val declaration = if (this.at("noescape")) {
+        this.expect(BOOTSTRAP_TOKEN_TRUSTED)
+        val declaration = if (this.at(BOOTSTRAP_TOKEN_NOESCAPE)) {
             this.parseNoEscapeDeclaration()
-        } else if (this.at("extern")) {
+        } else if (this.at(BOOTSTRAP_TOKEN_EXTERN)) {
             this.parseExternal()
         } else this.parseDeclaration()
         BootstrapDeclaration(
@@ -2884,7 +2890,7 @@ class BootstrapParser(
 
     fun parseResourceDeclaration(): BootstrapDeclaration {
         val begin = this.tokens[this.position].begin
-        this.expect("resource")
+        this.expect(BOOTSTRAP_TOKEN_RESOURCE)
         val declaration = this.parseDeclaration()
         if (declaration.kind != "class" && declaration.kind != "interface") this.failAt(
             "RESOURCE_DECLARATION",
@@ -2926,10 +2932,10 @@ class BootstrapParser(
 
     fun parseNoEscapeDeclaration(): BootstrapDeclaration {
         val begin = this.tokens[this.position].begin
-        this.expect("noescape")
-        val declaration = if (this.at("trusted")) {
+        this.expect(BOOTSTRAP_TOKEN_NOESCAPE)
+        val declaration = if (this.at(BOOTSTRAP_TOKEN_TRUSTED)) {
             this.parseTrustedDeclaration()
-        } else if (this.at("extern")) {
+        } else if (this.at(BOOTSTRAP_TOKEN_EXTERN)) {
             this.parseExternal()
         } else this.parseDeclaration()
         BootstrapDeclaration(
@@ -2968,14 +2974,14 @@ class BootstrapParser(
     // contextual word.
     fun atOperatorDeclaration(): bool = this.atWord("operator") &&
         this.position + 1 < this.tokens.size &&
-        (this.tokens[this.position + 1].kind == "fun" ||
-         this.tokens[this.position + 1].kind == "@")
+        (this.tokens[this.position + 1].kind == BOOTSTRAP_TOKEN_FUN ||
+         this.tokens[this.position + 1].kind == BOOTSTRAP_TOKEN_AT)
 
     /** `operator fun …`: the declaration carries the `operator` annotation. */
     fun parseOperatorDeclaration(): BootstrapDeclaration {
         val begin = this.tokens[this.position].begin
         this.position = this.position + 1
-        val declaration = if (this.at("@")) this.parseAnnotatedDeclaration()
+        val declaration = if (this.at(BOOTSTRAP_TOKEN_AT)) this.parseAnnotatedDeclaration()
             else this.parseDeclaration()
         val annotations: array<string> = ["operator"]
         val annotationArguments: array<BootstrapExpression> = [
@@ -3028,20 +3034,20 @@ class BootstrapParser(
         val annotationBegins: array<int> = []
         val annotationEnds: array<int> = []
         val begin = this.tokens[this.position].begin
-        while (this.consume("@")) {
+        while (this.consume(BOOTSTRAP_TOKEN_AT)) {
             val annotation = this.tokens[this.position]
-            this.expect("identifier")
+            this.expect(BOOTSTRAP_TOKEN_IDENTIFIER)
             val name = bootstrapTokenText(this.source, annotation)
             var argument = BootstrapExpression(
                 "missing", "", annotation.end, annotation.end, []
             )
             var annotationEnd = annotation.end
-            if (this.consume("(")) {
+            if (this.consume(BOOTSTRAP_TOKEN_LPAREN)) {
                 this.skipSeparators()
-                if (!this.at(")")) argument = this.parseExpression()
+                if (!this.at(BOOTSTRAP_TOKEN_RPAREN)) argument = this.parseExpression()
                 this.skipSeparators()
                 val closing = this.tokens[this.position]
-                this.expect(")")
+                this.expect(BOOTSTRAP_TOKEN_RPAREN)
                 annotationEnd = closing.end
             }
             var duplicate = false
@@ -3065,21 +3071,21 @@ class BootstrapParser(
             }
             this.skipSeparators()
         }
-        var declaration = if (this.at("trusted")) {
+        var declaration = if (this.at(BOOTSTRAP_TOKEN_TRUSTED)) {
             this.parseTrustedDeclaration()
-        } else if (this.at("noescape")) {
+        } else if (this.at(BOOTSTRAP_TOKEN_NOESCAPE)) {
             this.parseNoEscapeDeclaration()
-        } else if (this.at("resource")) {
+        } else if (this.at(BOOTSTRAP_TOKEN_RESOURCE)) {
             this.parseResourceDeclaration()
-        } else if (this.at("extern") ||
-            (this.at("compile") &&
-             this.tokens[this.position + 1].kind == "extern")) {
+        } else if (this.at(BOOTSTRAP_TOKEN_EXTERN) ||
+            (this.at(BOOTSTRAP_TOKEN_COMPILE) &&
+             this.tokens[this.position + 1].kind == BOOTSTRAP_TOKEN_EXTERN)) {
             this.parseExternal()
-        } else if (this.at("compile")) {
+        } else if (this.at(BOOTSTRAP_TOKEN_COMPILE)) {
             this.parseCompileDeclaration()
         } else if (
-            this.at("fun") || this.at("class") || this.atWord("type") ||
-            this.at("interface") || this.at("val") || this.at("var")
+            this.at(BOOTSTRAP_TOKEN_FUN) || this.at(BOOTSTRAP_TOKEN_CLASS) || this.atWord("type") ||
+            this.at(BOOTSTRAP_TOKEN_INTERFACE) || this.at(BOOTSTRAP_TOKEN_VAL) || this.at(BOOTSTRAP_TOKEN_VAR)
         ) {
             this.parseDeclaration()
         } else if (this.atOperatorDeclaration()) {
@@ -3140,64 +3146,64 @@ class BootstrapParser(
         val declarations: array<BootstrapDeclaration> = []
         val actions: array<BootstrapExpression> = []
         this.skipSeparators()
-        while (!this.at("end")) {
+        while (!this.at(BOOTSTRAP_TOKEN_END)) {
             val before = this.position
             // `private …`: the next declaration is visible only in this module.
             // (`internal`, for a package, is reserved.)
             var markPrivate = false
             if (this.atWord("private") && this.position + 1 < this.tokens.size &&
-                this.tokens[this.position + 1].kind != "newline" &&
-                this.tokens[this.position + 1].kind != "=" &&
-                this.tokens[this.position + 1].kind != ":") {
+                this.tokens[this.position + 1].kind != BOOTSTRAP_TOKEN_NEWLINE &&
+                this.tokens[this.position + 1].kind != BOOTSTRAP_TOKEN_EQUAL &&
+                this.tokens[this.position + 1].kind != BOOTSTRAP_TOKEN_COLON) {
                 markPrivate = true
                 this.position = this.position + 1
             } else if (this.atWord("internal") && this.position + 1 < this.tokens.size &&
-                this.tokens[this.position + 1].kind != "newline" &&
-                this.tokens[this.position + 1].kind != "=" &&
-                this.tokens[this.position + 1].kind != ":") {
+                this.tokens[this.position + 1].kind != BOOTSTRAP_TOKEN_NEWLINE &&
+                this.tokens[this.position + 1].kind != BOOTSTRAP_TOKEN_EQUAL &&
+                this.tokens[this.position + 1].kind != BOOTSTRAP_TOKEN_COLON) {
                 this.failReserved("`internal` (visibility within a package)")
                 this.position = this.position + 1
             }
             val declaredBefore = declarations.size
-            if (this.at("import") ||
+            if (this.at(BOOTSTRAP_TOKEN_IMPORT) ||
                 (this.atWord("export") && this.position + 1 < this.tokens.size &&
-                 this.tokens[this.position + 1].kind == "import")) {
+                 this.tokens[this.position + 1].kind == BOOTSTRAP_TOKEN_IMPORT)) {
                 // (`export import`: module.ab reads it.)
                 this.skipToDeclarationEnd()
-            } else if (this.at("#")) {
+            } else if (this.at(BOOTSTRAP_TOKEN_HASH)) {
                 actions.append(this.parseExpression())
-            } else if (this.at("@")) {
+            } else if (this.at(BOOTSTRAP_TOKEN_AT)) {
                 declarations.append(this.parseAnnotatedDeclaration())
             } else if (this.atOperatorDeclaration()) {
                 declarations.append(this.parseOperatorDeclaration())
-            } else if (this.at("trusted")) {
+            } else if (this.at(BOOTSTRAP_TOKEN_TRUSTED)) {
                 declarations.append(this.parseTrustedDeclaration())
-            } else if (this.at("noescape")) {
+            } else if (this.at(BOOTSTRAP_TOKEN_NOESCAPE)) {
                 declarations.append(this.parseNoEscapeDeclaration())
-            } else if (this.at("resource")) {
+            } else if (this.at(BOOTSTRAP_TOKEN_RESOURCE)) {
                 declarations.append(this.parseResourceDeclaration())
-            } else if (this.at("extern") ||
-                (this.at("compile") &&
-                 this.tokens[this.position + 1].kind == "extern")) {
+            } else if (this.at(BOOTSTRAP_TOKEN_EXTERN) ||
+                (this.at(BOOTSTRAP_TOKEN_COMPILE) &&
+                 this.tokens[this.position + 1].kind == BOOTSTRAP_TOKEN_EXTERN)) {
                 declarations.append(this.parseExternal())
-            } else if (this.at("compile")) {
+            } else if (this.at(BOOTSTRAP_TOKEN_COMPILE)) {
                 declarations.append(this.parseCompileDeclaration())
-            } else if (this.atContextualKeyword("extend", "identifier")) {
+            } else if (this.atContextualKeyword("extend", BOOTSTRAP_TOKEN_IDENTIFIER)) {
                 declarations.append(this.parseExtend())
             } else if (this.atWord("sealed") &&
-                this.tokens[this.position + 1].kind == "interface") {
+                this.tokens[this.position + 1].kind == BOOTSTRAP_TOKEN_INTERFACE) {
                 // `sealed interface Shape`: implemented only in its module.
                 this.position = this.position + 1
                 declarations.append(bootstrapDeclarationSealed(this.parseDeclaration()))
             } else if (this.atWord("sealed") &&
-                this.tokens[this.position + 1].kind == "class") {
+                this.tokens[this.position + 1].kind == BOOTSTRAP_TOKEN_CLASS) {
                 // `sealed class`: reported, then read as the plain form.
                 this.failReserved("a `sealed class` (a `sealed interface` is supported)")
                 this.position = this.position + 1
                 declarations.append(this.parseDeclaration())
             } else if (
-                this.at("fun") || this.at("class") || this.atWord("type") ||
-                this.at("interface") || this.at("val") || this.at("var")
+                this.at(BOOTSTRAP_TOKEN_FUN) || this.at(BOOTSTRAP_TOKEN_CLASS) || this.atWord("type") ||
+                this.at(BOOTSTRAP_TOKEN_INTERFACE) || this.at(BOOTSTRAP_TOKEN_VAL) || this.at(BOOTSTRAP_TOKEN_VAR)
             ) {
                 declarations.append(this.parseDeclaration())
             } else {
@@ -3291,7 +3297,7 @@ fun bootstrapAppendExtensionFieldDefaults(var declarations: array<BootstrapDecla
 
 fun bootstrapParse(source: string): BootstrapParseResult {
     BootstrapParser(
-        "<memory>", source, bootstrapLex(source), [], [], [], 0, 0, "", [], [], 0
+        "<memory>", source, bootstrapLex(source), [], [], [], 0, 0, "", [], [], 0, -1, 0
     ).parse()
 }
 
@@ -3311,7 +3317,7 @@ fun bootstrapParseWithIdentity(
         "",
         [],
         [],
-        0
+        0, -1, 0
     ).parse()
 }
 
@@ -3439,5 +3445,5 @@ fun bootstrapRereadablePlace(expression: BootstrapExpression): bool {
 
 // The words that start a suspending block, reserved everywhere. A program that
 // uses one as a name gets no other hint that it is taken.
-fun bootstrapReservedSuspendingWord(kind: string): bool =
-    kind == "generator" || kind == "task" || kind == "thread"
+fun bootstrapReservedSuspendingWord(kind: int): bool =
+    kind == BOOTSTRAP_TOKEN_GENERATOR || kind == BOOTSTRAP_TOKEN_TASK || kind == BOOTSTRAP_TOKEN_THREAD
