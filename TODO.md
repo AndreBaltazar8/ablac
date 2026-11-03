@@ -408,6 +408,14 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
 
 ## Tried, not pursued
 
+- **Remaining QR template bounds/kind checks after scalar array getters**
+  (2026-11-03, `8111ac68`): extra post-inline LICM leaves `templateScore`'s
+  complete executable byte-identical: no cheap check recovery. Across all
+  functions it saves 2.95% reader instructions and 1.85% median cycles but
+  adds 2.43% O1 build work; geometry-only saves 2.07%, chiefly arithmetic
+  motion. Keep the checks and the current O1 pipeline. Raw scoped controls:
+  `worktrees/ablac-test-profile/build/qr-licm-lab/report.md`.
+
 - **Remaining native `--fast` boolean FastISel fallbacks** (2026-11-03,
   after `c7f021de`): a scratch post-fast pass widened all 386 boolean selects
   to i8 and added zeroext to 188 known i1-returning definitions and 1,989
