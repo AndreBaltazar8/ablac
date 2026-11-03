@@ -732,6 +732,7 @@ fun bootstrapLlvmCreateFunctionStorage(
     collecting: bool,
     rootValues: array<bool>,
     rootLocals: array<bool>,
+    localIndex: BootstrapLlvmNameIndex,
     scalarPlan: BootstrapLlvmScalarPlan,
     tables: BootstrapLlvmConstantTables
 ): BootstrapLlvmFunctionStorage {
@@ -1018,7 +1019,7 @@ fun bootstrapLlvmCreateFunctionStorage(
         values, nativeValues, scalarPlan.valueTypes,
         locals, nativeLocals, scalarPlan.localTypes,
         parameters, scratch, scratchTypes, auxiliary,
-        rootValues, rootLocals, bootstrapLlvmLocalIndex(function),
+        rootValues, rootLocals, localIndex,
         labels, blocks, gcFrame, gcRoots, gcRootsType, rootCount, rootBlock, rootBlockCount
     )
 }
@@ -7566,6 +7567,7 @@ fun bootstrapLlvmEmitFunction(
     // into pushed it yet): those collect too, for the locals live across them.
     // (Pushed at entry after all, it runs there, before any local holds a value.)
     var lazySites: array<bool> = []
+    var pushedStates: array<int> = []
     val pressureSites: array<bool> = []
     if (pressure) {
         val sites = bootstrapLlvmLazyRootSites(
@@ -7573,20 +7575,22 @@ fun bootstrapLlvmEmitFunction(
         )
         if (sites.size > 0 && !sites[0]) {
             lazySites = sites
-            val states = bootstrapLlvmPushedStates(function, sites)
+            pushedStates = bootstrapLlvmPushedStates(function, sites)
             var siteIndex = 0
             while (siteIndex < sites.size) {
-                pressureSites.append(sites[siteIndex] && states[siteIndex] == 0)
+                pressureSites.append(sites[siteIndex] && pushedStates[siteIndex] == 0)
                 siteIndex = siteIndex + 1
             }
         }
     }
+    // All three consumers resolve the same immutable instruction names.
+    val localIndex = bootstrapLlvmLocalIndex(function)
     var rootLocals: array<bool> = []
     if (collecting) rootLocals = bootstrapLlvmLocalRootPlan(
-        function, functionIndex, mayCollect, pressureSites, loopSafePoints
+        function, functionIndex, mayCollect, pressureSites, loopSafePoints, localIndex
     )
     val scalarPlan = bootstrapLlvmBuildScalarPlan(
-        program, function, functionIndex, nativeIndex
+        program, function, functionIndex, nativeIndex, localIndex
     )
     var tables = bootstrapLlvmConstantTables(
         function, bootstrapLlvmValueCount(function)
@@ -7597,7 +7601,7 @@ fun bootstrapLlvmEmitFunction(
         else bootstrapLlvmNoStackClosures
     var storage = bootstrapLlvmCreateFunctionStorage(
         backend, function, llvmFunction, collecting, rootValues,
-        rootLocals, scalarPlan, tables
+        rootLocals, localIndex, scalarPlan, tables
     )
     bootstrapLlvmInitializeParameters(
         backend, function, llvmFunction, storage
@@ -7624,9 +7628,11 @@ fun bootstrapLlvmEmitFunction(
     // pushes and entry is as good), and every site and return knows whether its
     // paths pushed: one that some reach pushed and some not (a site in a loop)
     // would need a flag tested at run time, which costs more code than the push.
-    var pushedStates: array<int> = []
     if (lazy) {
-        pushedStates = bootstrapLlvmPushedStates(function, rootSites)
+        // Pressure analysis already computed these states for the same sites.
+        if (pushedStates.size == 0) {
+            pushedStates = bootstrapLlvmPushedStates(function, rootSites)
+        }
         val end = pushedStates[function.instructions.size]
         var skips = end == 0
         var known = end != 1
