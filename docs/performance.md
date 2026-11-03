@@ -27,20 +27,23 @@ on a machine loaded by other builds (load average around 40):
 
 | Metric (geometric mean) | Change |
 |---|---:|
-| Release build, instructions | -21.0% |
-| Release build, cycles (all processes) | -23.3% |
-| Release build, wall clock (median of 5, alternating; before the last three runtime changes) | -21.7% (-12% to -31% each) |
-| Stripped size | -9.6% (fib -13.5%, json-megabyte -8.9%) |
+| Release build, instructions | -20.6% |
+| Release build, cycles (all processes) | -21.7% |
+| Release build, wall clock (median of 5, alternating) | -26.8% (-13% to -40% each) |
+| Stripped size | -11.5% (fib -16.5%, trees -15.5%, json-megabyte -9.0%) |
 | Run instructions (11 programs) | -11.3% (trees -37%, websocket-codec -24%, matrix -15%, nbody -13%) |
-| Run cycles (same, median of 5) | -5.8% |
-| `abla-compare` server, user instructions per request (9 workloads) | -3.4%, every workload lower |
-| `abla-compare` server, stripped size | -9.7% (290,000 to 261,760 bytes) |
+| Run cycles (same, fewest of 5 / median) | -11.1% / -10.2% |
+| Run time (same, least of 5 / median) | -10.8% / -8.6% |
+| `abla-compare` server, user instructions per request (9 workloads) | -3.7%, every workload lower |
+| `abla-compare` server, stripped size | -11.0% (290,000 to 258,152 bytes) |
 | `ablac test` of abla-qr (9 files, `--no-cache`) | 316 s to 51 s; 7.06 T to 0.50 T instructions |
 | `ablac test` of abla-pdf (8 files, `--no-cache`) | 323 s to 67 s; 7.12 T to 0.83 T instructions |
 | abla-embedded's Xtensa `tests/package-import.ab`, compiler peak | 3.15 GB (v0.2.32) to 2.94 GB |
 
-Cycles and times move by up to 20% with where code lands and with the load: fib runs the
-same instructions and showed +5 to +9% cycles in these runs; instructions are the measure.
+Cycles and times move with where code lands and with the load. fib's machine code is now
+the same as before, byte for byte, and takes 12% more cycles: its loop no longer starts on a
+64-byte boundary (aligned to 64, it runs as before, but the padding executes on each of its
+calls: 12% more instructions). Instructions are the measure.
 
 What changed (the frontend, the runtime's string paths and its startup are the next
 sections, by the agents who did them):
