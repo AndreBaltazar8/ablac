@@ -211,7 +211,10 @@ Package-side work (not changed from ablac):
   On 2026-11-03 its build ran 15% fewer instructions (frontend 6 to 10%, opt and llc 14%).
 - [ ] **A map lookup waits on a cache miss** (2026-11-03): 83% of `__ablaRuntimeMapEntry`'s cycles in
   maps are the load of its slot from a 4 MB slot array; fewer instructions in the probe saved
-  0.4%. A denser table (32-bit slots, keys' hashes beside them) would miss less.
+  0.4%. A denser table (32-bit slots, keys' hashes beside them) would miss less. A prototype
+  (two 32-bit slots a word, old tables retired at once; worktree ablac-map-dense, report in
+  its build/map-lab/report.json) ran maps 30% fewer cycles, but json-megabyte peaked 7.7%
+  higher: a smaller live heap moves its collections later, so the peak grows.
 - [ ] **The free lists grow slowly for programs of many block sizes** (2026-11-03): they keep a
   quarter more than they served, so strings, whose sizes vary, gets 5% of the 27% a fixed 128 MB
   gave it (trees, one size, all of it). Doubling the growth took json-megabyte's peak from 212 to
