@@ -16,6 +16,7 @@ carry them.
 | [Vectors](stdlib/simd.md) | `abla/simd`, `abla/simd/target` |
 | [Constant-time primitives](stdlib/ct.md) | `abla/ct` |
 | [256-bit integers](stdlib/uint256.md) | `abla/uint256` |
+| [UUIDs](stdlib/uuid.md) | `abla/uuid` |
 | [Hashing, encryption, encoding and dates](stdlib/security-and-dates.md) | `abla/crypto`, `abla/crypto/hosted`, `abla/date` |
 | [Testing](stdlib/testing.md) | `abla/test` and `ablac test` |
 | [JSON](json.md) | `abla/json`, `abla/http/json`, `$json` |
@@ -56,6 +57,7 @@ Built into the language rather than imported: `string`, arrays, `Map`,
 | `abla/process/supervisor` | hosted child-process launch, isolated logs, polling, process-tree termination, monotonic timing, and processor discovery |
 | `abla/process/metrics` | the process's CPU time, resident/virtual memory, open descriptors and their limit, start time and tracked heap bytes |
 | `abla/random` | bounded cryptographic entropy (`getrandom`) |
+| `abla/uuid` | random UUIDv4, time-ordered UUIDv7, bytes and strict text parsing |
 | `abla/random/hosted` | the same function under its hosted name, `hostedSecureRandomBytes` |
 | `abla/random/result` | `SecureRandomResult` |
 | `abla/memory` | heap limit, collection mode, `memoryCollect()`, live-byte statistics |
