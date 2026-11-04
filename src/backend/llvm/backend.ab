@@ -57,10 +57,79 @@ fun bootstrapLlvmSetInlineThreshold(
     }
 }
 
+// Fold the portable runtime hook without mutating the cached, target-neutral
+// IR. A bootstrap compiler that predates this policy simply keeps its false
+// body and the old scalar clear. Calls are folded before reachability/scalar
+// planning so fast and closed targets need neither a helper call nor an import.
+fun bootstrapLlvmObjectZeroPolicy(
+    program: BootstrapIrProgram,
+    targetTriple: string,
+    requireMain: bool
+): BootstrapIrProgram {
+    if (program.errors > 0) return program
+    var found = false
+    for (function in program.functions) {
+        if (function.name == "__ablaRuntimeUseBulkObjectZero") found = true
+    }
+    if (!found) return program
+    val host64 = targetTriple.startsWith("x86_64") ||
+        targetTriple.startsWith("aarch64") || targetTriple.startsWith("arm64") ||
+        targetTriple.startsWith("riscv64")
+    val enabled = bootstrapLlvmAllowBulkObjectZero && requireMain &&
+        !bootstrapLlvmStoreBoxes && host64 &&
+        (bootstrapTextContains(targetTriple, "linux") ||
+         bootstrapTextContains(targetTriple, "apple-macos") ||
+         bootstrapTextContains(targetTriple, "apple-darwin"))
+    val functions: array<BootstrapIrFunction> = []
+    for (function in program.functions) {
+        if (function.name == "__ablaRuntimeObjectBlock" ||
+            function.name == "__ablaRuntimeUseBulkObjectZero") {
+            val instructions: array<BootstrapInstruction> = []
+            for (instruction in function.instructions) {
+                val policyCall = function.name == "__ablaRuntimeObjectBlock" &&
+                    instruction.opcode == "call" &&
+                    instruction.text == "__ablaRuntimeUseBulkObjectZero"
+                val policyBody = function.name == "__ablaRuntimeUseBulkObjectZero" &&
+                    instruction.opcode == "const.bool"
+                if (policyCall || policyBody) {
+                    instructions.append(BootstrapInstruction(
+                        "const.bool", instruction.result, -1, -1,
+                        if (enabled) "true" else "false", -1, -1, [], [],
+                        instruction.position
+                    ))
+                } else instructions.append(instruction)
+            }
+            functions.append(BootstrapIrFunction(
+                function.name, function.parameters, instructions, function.result,
+                function.blocks, function.locals, function.localTypes,
+                function.parameterTypes, function.resultType, function.inlineHint,
+                function.noinlineHint, function.naked, function.section,
+                function.targetFeatures, function.verificationErrors,
+                function.label, function.position
+            ))
+        } else functions.append(function)
+    }
+    BootstrapIrProgram(
+        program.instructions, functions, program.classes, program.natives,
+        program.globalNames, program.globalTypes, program.globalKinds,
+        program.compileInputPaths, program.compileInputContents, program.errors,
+        program.lookup, program.validationFailures, program.extensionFields
+    )
+}
+
 fun bootstrapEmitLlvmProgram(
     program: BootstrapIrProgram,
     targetTriple: string,
     requireMain: bool = true
+): BootstrapLlvmEmission = bootstrapEmitLlvmProgramPrepared(
+    bootstrapLlvmObjectZeroPolicy(program, targetTriple, requireMain),
+    targetTriple, requireMain
+)
+
+fun bootstrapEmitLlvmProgramPrepared(
+    program: BootstrapIrProgram,
+    targetTriple: string,
+    requireMain: bool
 ): BootstrapLlvmEmission {
     bootstrapLlvmTraceMemory("program.begin")
     bootstrapLlvmParameterDefaultsReset()

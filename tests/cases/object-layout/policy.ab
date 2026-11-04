@@ -1,0 +1,56 @@
+import "../../../src/ir.ab"
+import "../../../src/backend/llvm/backend.ab"
+import "../../../src/backend/llvm/core.ab"
+
+private fun policyFixture(): BootstrapIrProgram {
+    val helper = "__ablaRuntimeUseBulkObjectZero"
+    val block = bootstrapFinalizeIrFunction("__ablaRuntimeObjectBlock", [], [
+        BootstrapInstruction("call", 0, -1, -1, helper, -1, -1, [], [], -1),
+        BootstrapInstruction("const.i64", 1, -1, -1, "0", -1, -1, [], [], -1),
+        BootstrapInstruction("return", -1, 1, -1, "", -1, -1, [], [], -1)
+    ], 1, resultType = "i64")
+    val fallback = bootstrapFinalizeIrFunction(helper, [], [
+        BootstrapInstruction("const.bool", 0, -1, -1, "false", -1, -1, [], [], -1),
+        BootstrapInstruction("return", -1, 0, -1, "", -1, -1, [], [], -1)
+    ], 0, resultType = "bool")
+    BootstrapIrProgram([], [block, fallback], [], [], [], [], [], [], [], 0,
+        bootstrapIrLookupOf([], []))
+}
+
+private fun policyValue(program: BootstrapIrProgram): string =
+    program.functions[0].instructions[0].text
+
+fun objectZeroPolicyFailures(): int {
+    val original = policyFixture()
+    val allow = bootstrapLlvmAllowBulkObjectZero
+    val boxes = bootstrapLlvmStoreBoxes
+    bootstrapLlvmAllowBulkObjectZero = true
+    bootstrapLlvmStoreBoxes = false
+    var failures = 0
+    val optimized = bootstrapLlvmObjectZeroPolicy(original, "x86_64-unknown-linux-gnu", true)
+    if (policyValue(optimized) != "true") failures = failures + 1
+    for (triple in ["aarch64-unknown-linux-gnu", "arm64-apple-macos14.0", "x86_64-apple-darwin"]) {
+        if (policyValue(bootstrapLlvmObjectZeroPolicy(original, triple, true)) != "true") failures = failures + 1
+    }
+    for (triple in ["wasm32-unknown-unknown", "wasm64-unknown-unknown",
+        "xtensa-esp-unknown-elf", "riscv32-unknown-elf", "x86_64-unknown-none",
+        "i386-unknown-linux-gnu", "armv7-unknown-linux-gnueabihf"]) {
+        if (policyValue(bootstrapLlvmObjectZeroPolicy(original, triple, true)) != "false") failures = failures + 1
+    }
+    if (policyValue(bootstrapLlvmObjectZeroPolicy(original, "x86_64-unknown-linux-gnu", false)) != "false") failures = failures + 1
+    // Cross --fast does not use StoreBoxes; its explicit profile flag must win.
+    bootstrapLlvmAllowBulkObjectZero = false
+    if (policyValue(bootstrapLlvmObjectZeroPolicy(original, "aarch64-unknown-linux-gnu", true)) != "false") failures = failures + 1
+    bootstrapLlvmAllowBulkObjectZero = true
+    bootstrapLlvmStoreBoxes = true
+    if (policyValue(bootstrapLlvmObjectZeroPolicy(original, "x86_64-unknown-linux-gnu", true)) != "false") failures = failures + 1
+    // Repeated target/profile queries must not mutate the cached input or
+    // the earlier optimized copy, including the hook's first-class body.
+    if (original.functions[0].instructions[0].opcode != "call" ||
+        original.functions[1].instructions[0].text != "false" ||
+        policyValue(optimized) != "true" ||
+        optimized.functions[1].instructions[0].text != "true") failures = failures + 1
+    bootstrapLlvmAllowBulkObjectZero = allow
+    bootstrapLlvmStoreBoxes = boxes
+    failures
+}
