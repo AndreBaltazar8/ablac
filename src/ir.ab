@@ -1792,6 +1792,20 @@ fun bootstrapIrArraySetScalarType(opcode: string): string {
     if (type == "i64" || type == "bool" || type == "f64" || type == "f32") type else ""
 }
 
+fun bootstrapIrIsErasedType(type: string): bool {
+    val core = bootstrapBorrowElementType(bootstrapNormalizeType(type))
+    (if (bootstrapIsNullableType(core)) bootstrapNullableElementType(core) else core) == "any"
+}
+
+// A mixed-type join may be inferred as void but still flow to an `any` use.
+// Keep float identity at its leaves while retaining ordinary typed joins.
+fun bootstrapIrUntypedJoin(expression: BootstrapExpression): bool {
+    if (expression.kind == "block" && expression.children.size > 0)
+        return bootstrapIrUntypedJoin(expression.children[expression.children.size - 1])
+    expression.kind == "when" || (expression.kind == "if" && expression.children.size > 2 &&
+        expression.children[2].kind != "missing")
+}
+
 fun bootstrapIrLocalZeroOpcode(type: string): string {
     val normalized = bootstrapNormalizeType(type)
     if (bootstrapIsIntegerScalarType(normalized)) {
@@ -5327,7 +5341,8 @@ class BootstrapLowerer(
     val typeQueryStack: array<int> = [],
     // Descriptor field places, built once for this lowering graph and shared
     // by its child lowerers. The declaration index preserves duplicate names.
-    val classFieldPlaces: Map<int, array<int>> = Map()
+    val classFieldPlaces: Map<int, array<int>> = Map(),
+    var erasedReturnType: string = "unknown"
 ) {
     /** The newest visible local named `name` (with a type, when `typed`), or -1. */
     /** Every visible local named `name`, first declared first. */
@@ -6260,10 +6275,6 @@ class BootstrapLowerer(
                      expression.children[0].kind == "type") {
                 result = bootstrapNormalizeType(expression.children[0].text)
             }
-            else if (this.isClass(expression.text) ||
-                     this.isScalarType(expression.text)) {
-                result = expression.text
-            }
             else if (this.isParameter(expression.text) && this.callsLocal(expression.text, expression.children.size)) {
                 result = bootstrapFunctionResultType(
                     this.lowerParameterType(expression.text)
@@ -6276,6 +6287,8 @@ class BootstrapLowerer(
                 result = bootstrapFunctionResultType(
                     this.lowerGlobalFunctionType(expression.text)
                 )
+            } else if (this.isClass(expression.text) || this.isScalarType(expression.text)) {
+                result = expression.text
             } else result = this.lowerFunctionResultType(expression.text)
         }
         if (expression.kind == "array") {
@@ -7491,6 +7504,18 @@ class BootstrapLowerer(
         if (underlying == normalized) normalized else underlying
     }
 
+    // Preserve float identity only at an explicit typed-to-any boundary.
+    fun lowerEraseFloat(value: int, source: string, destination: string): int {
+        if (!bootstrapIrIsErasedType(destination)) return value
+        val core = bootstrapBorrowElementType(source)
+        val nullable = bootstrapIsNullableType(core)
+        val scalar = this.lowerRuntimeType(if (nullable) bootstrapNullableElementType(core) else core)
+        if (scalar == "f32" || scalar == "f64") return this.emit(
+            if (nullable) "value.erase.nullable.float" else "value.erase.float", value, -1, scalar
+        )
+        value
+    }
+
     // The backend types an arithmetic result by its left operand, and a
     // field, an element or a call reaches it boxed: an i32 field times an
     // i32 multiplied as 64 bits and never wrapped, and a closure's f64 plus
@@ -8098,7 +8123,7 @@ class BootstrapLowerer(
 
     // Lowers an expression with the source position at it, so the
     // instructions it emits map back to it (debug information).
-    fun lowerExpression(expression: BootstrapExpression, valueRequired: bool = true): int {
+    fun lowerExpression(expression: BootstrapExpression, valueRequired: bool = true, eraseResult: bool = false): int {
         val savedPosition = bootstrapIrSourcePosition
         if (bootstrapIrSourceFile >= 0 && expression.begin >= 0 &&
             expression.end > expression.begin) {
@@ -8106,12 +8131,16 @@ class BootstrapLowerer(
                 bootstrapIrSourceFile, expression.begin
             )
         }
-        val result = this.lowerExpressionAt(expression, valueRequired)
+        var result = this.lowerExpressionAt(expression, valueRequired, eraseResult)
+        if (eraseResult && valueRequired && expression.kind != "block" &&
+            expression.kind != "if" && expression.kind != "when" && expression.kind != "return") {
+            result = this.lowerEraseFloat(result, this.lowerExpressionType(expression), "any")
+        }
         bootstrapIrSourcePosition = savedPosition
         result
     }
 
-    fun lowerExpressionAt(expression: BootstrapExpression, valueRequired: bool): int {
+    fun lowerExpressionAt(expression: BootstrapExpression, valueRequired: bool, eraseResult: bool): int {
         val kind = expression.kind
         // Reject kinds with another initial byte before the general string
         // comparison; the expression and its kind stay immutable throughout.
@@ -8203,7 +8232,7 @@ class BootstrapLowerer(
             result = bootstrapLowerLambda(this, expression, result)
         }
         if ((kindHead == 98 && kind == "block")) {
-            result = bootstrapLowerBlock(this, expression, result, valueRequired)
+            result = bootstrapLowerBlock(this, expression, result, valueRequired, eraseResult)
         }
         if ((kindHead == 100 && kind == "defer")) {
             result = bootstrapLowerDefer(this, expression, result)
@@ -8409,7 +8438,7 @@ class BootstrapLowerer(
             result = this.lowerLogicalExpression(expression)
         }
         if ((kindHead == 105 && kind == "if")) {
-            result = bootstrapLowerIf(this, expression, result, valueRequired)
+            result = bootstrapLowerIf(this, expression, result, valueRequired, eraseResult)
         }
         if ((kindHead == 119 && kind == "while")) {
             result = bootstrapLowerWhile(this, expression, result)
@@ -8448,7 +8477,7 @@ class BootstrapLowerer(
             result = this.emit("const.void", -1, -1, "")
         }
         if ((kindHead == 119 && kind == "when")) {
-            result = bootstrapLowerWhen(this, expression, result, valueRequired)
+            result = bootstrapLowerWhen(this, expression, result, valueRequired, eraseResult)
         }
         // Do not recompute the type of every lowered node here. Type lookup is
         // intentionally simple during bootstrap and scans declaration tables;
@@ -8604,6 +8633,9 @@ class BootstrapLowerer(
             this.inferredResults,
             classFieldPlaces = this.classFieldPlaces
         )
+        functionLowerer.erasedReturnType = this.declarationResultType(declaration)
+        if (declaration.resultType == "inferred" && functionLowerer.erasedReturnType == "void" &&
+            bootstrapIrUntypedJoin(declaration.expression)) functionLowerer.erasedReturnType = "any"
         var defaultIndex = 0
         while (defaultIndex < declaration.parameterDefaults.size) {
             val defaultValue = declaration.parameterDefaults[defaultIndex]
@@ -8614,7 +8646,9 @@ class BootstrapLowerer(
                 functionLowerer.emitControl("branch", missing, useDefault, ready, "")
                 functionLowerer.emitControl("label", -1, useDefault, -1, "")
                 val loweredDefault = functionLowerer.lowerExpression(
-                    defaultValue
+                    defaultValue, true,
+                    defaultIndex < declaration.parameterTypes.size &&
+                        bootstrapIrIsErasedType(declaration.parameterTypes[defaultIndex])
                 )
                 functionLowerer.emit(
                     "parameter.default",
@@ -8627,7 +8661,7 @@ class BootstrapLowerer(
             }
             defaultIndex = defaultIndex + 1
         }
-        val result = functionLowerer.lowerExpression(declaration.expression)
+        val result = functionLowerer.lowerExpression(declaration.expression, true, bootstrapIrIsErasedType(functionLowerer.erasedReturnType))
         functionLowerer.emitOwnedParameterDrops()
         var functionName = declaration.name
         if (declaration.extensionOwner != "") {
@@ -8811,6 +8845,9 @@ class BootstrapLowerer(
             this.inferredResults,
             classFieldPlaces = this.classFieldPlaces
         )
+        methodLowerer.erasedReturnType = this.declarationResultType(method)
+        if (method.resultType == "inferred" && methodLowerer.erasedReturnType == "void" &&
+            bootstrapIrUntypedJoin(method.expression)) methodLowerer.erasedReturnType = "any"
         var defaultIndex = 0
         while (defaultIndex < method.parameterDefaults.size) {
             val defaultValue = method.parameterDefaults[defaultIndex]
@@ -8821,7 +8858,9 @@ class BootstrapLowerer(
                 methodLowerer.emitControl("branch", missing, useDefault, ready, "")
                 methodLowerer.emitControl("label", -1, useDefault, -1, "")
                 val loweredDefault = methodLowerer.lowerExpression(
-                    defaultValue
+                    defaultValue, true,
+                    defaultIndex < method.parameterTypes.size &&
+                        bootstrapIrIsErasedType(method.parameterTypes[defaultIndex])
                 )
                 methodLowerer.emit(
                     "parameter.default",
@@ -8834,7 +8873,7 @@ class BootstrapLowerer(
             }
             defaultIndex = defaultIndex + 1
         }
-        val methodResult = methodLowerer.lowerExpression(method.expression)
+        val methodResult = methodLowerer.lowerExpression(method.expression, true, bootstrapIrIsErasedType(methodLowerer.erasedReturnType))
         methodLowerer.emitOwnedParameterDrops()
         val loweredMethod = bootstrapFinalizeIrFunction(
             "${owner.name}_${method.name}",
@@ -9264,7 +9303,16 @@ class BootstrapLowerer(
                 bootstrapIrLambdaOwnerEnd = declaration.end
                 bootstrapIrLambdaOwnerFunctions = this.functions.size
                 bootstrapIrGlobalInitializer = true
-                val value = this.lowerExpression(declaration.expression)
+                var erase = bootstrapIrIsErasedType(declaration.resultType)
+                if (declaration.resultType == "inferred" &&
+                    (declaration.expression.kind == "if" || declaration.expression.kind == "when")) {
+                    val inferred = this.lowerExpressionType(declaration.expression)
+                    erase = bootstrapIrIsErasedType(inferred) || (inferred == "void" &&
+                        (declaration.expression.kind == "when" ||
+                            (declaration.expression.children.size > 2 &&
+                             declaration.expression.children[2].kind != "missing")))
+                }
+                val value = this.lowerExpression(declaration.expression, true, erase)
                 bootstrapIrGlobalInitializer = false
                 this.emit("global.store", value, -1, declaration.name)
                 bootstrapIrLambdaOwner = savedLambdaOwner
@@ -10097,9 +10145,13 @@ fun bootstrapLowerLambdaFunction(
         lowerer.inferredResults,
         classFieldPlaces = lowerer.classFieldPlaces
     )
+    val lambdaType = lowerer.lowerLambdaType(lowerer.managedAliasCurrentFile(), expression)
+    lambdaLowerer.erasedReturnType = bootstrapFunctionResultType(lambdaType)
+    if (lambdaLowerer.erasedReturnType == "void" && bootstrapIrUntypedJoin(body))
+        lambdaLowerer.erasedReturnType = "any"
     val enclosingGlobalInitializer = bootstrapIrGlobalInitializer
     bootstrapIrGlobalInitializer = false
-    val lambdaResult = lambdaLowerer.lowerExpression(body)
+    val lambdaResult = lambdaLowerer.lowerExpression(body, true, bootstrapIrIsErasedType(lambdaLowerer.erasedReturnType))
     bootstrapIrGlobalInitializer = enclosingGlobalInitializer
     lambdaLowerer.emitOwnedParameterDrops()
     lowerer.errors = lambdaLowerer.errors
@@ -10198,7 +10250,8 @@ fun bootstrapLowerBlock(
     var lowerer: BootstrapLowerer,
     expression: BootstrapExpression,
     initial: int,
-    valueRequired: bool
+    valueRequired: bool,
+    eraseResult: bool
 ): int {
     var result = initial
     val previousScope = lowerer.enterLocalScope()
@@ -10228,7 +10281,8 @@ fun bootstrapLowerBlock(
     while (statement < expression.children.size) {
         val lowered = expression.children[statement]
         result = lowerer.lowerExpression(
-            lowered, valueRequired && statement + 1 == expression.children.size
+            lowered, valueRequired && statement + 1 == expression.children.size,
+            eraseResult && statement + 1 == expression.children.size
         )
         if (statement + 1 < expression.children.size) lowerer.dropDiscarded(result, lowered)
         // (A branch ending in a call of type `never` leaves, as the
@@ -10326,7 +10380,7 @@ fun bootstrapLowerReturn(
     if (expression.children[0].kind == "missing") {
         result = lowerer.emit("const.void", -1, -1, "")
     } else {
-        result = lowerer.lowerExpression(expression.children[0])
+        result = lowerer.lowerExpression(expression.children[0], true, bootstrapIrIsErasedType(lowerer.erasedReturnType))
         lowerer.emitResultMove(expression.children[0])
         result = result
     }
@@ -10354,7 +10408,15 @@ fun bootstrapLowerLocal(
     var value = -1
     var localType = "unknown"
     if (hasInitializer) {
-        value = lowerer.lowerExpression(initializer)
+        val declared = if (expression.children.size > 1) expression.children[1].text else "inferred"
+        var erase = !delegated && bootstrapIrIsErasedType(declared)
+        if (!delegated && declared == "inferred" && (initializer.kind == "if" || initializer.kind == "when")) {
+            val inferred = lowerer.lowerExpressionType(initializer)
+            erase = bootstrapIrIsErasedType(inferred) || (inferred == "void" &&
+                (initializer.kind == "when" || (initializer.children.size > 2 &&
+                    initializer.children[2].kind != "missing")))
+        }
+        value = lowerer.lowerExpression(initializer, true, erase)
         localType = lowerer.lowerExpressionType(initializer)
     }
     if (delegated) {
@@ -10449,7 +10511,12 @@ fun bootstrapLowerAssign(
     initial: int
 ): int {
     var result = initial
-    val value = lowerer.lowerExpression(expression.children[0])
+    var expected = "unknown"
+    if (lowerer.isLocal(expression.text)) expected = lowerer.lowerLocalType(expression.text)
+    else if (lowerer.isParameter(expression.text)) expected = lowerer.lowerParameterType(expression.text)
+    else if (lowerer.isField(expression.text)) expected = lowerer.lowerFieldType(lowerer.currentOwner, expression.text)
+    else if (lowerer.isGlobal(expression.text)) expected = lowerer.lowerGlobalValueType(expression.text)
+    val value = lowerer.lowerExpression(expression.children[0], true, bootstrapIrIsErasedType(expected))
     // A generator slot takes its type from its first assignment.
     if (bootstrapIsGeneratorSlotName(expression.text)) {
         bootstrapLowerLearnSlotType(
@@ -10969,23 +11036,25 @@ fun bootstrapLowerCall(
     initial: int
 ): int {
     var result = initial
+    var callableType = "unknown"
+    if (lowerer.isParameter(expression.text)) callableType = lowerer.lowerParameterType(expression.text)
+    if (lowerer.isLocal(expression.text)) callableType = lowerer.lowerLocalType(expression.text)
+    if (lowerer.isGlobal(expression.text)) callableType = lowerer.lowerGlobalFunctionType(expression.text)
+    val signature = if (bootstrapIsFunctionType(callableType)) callableType else lowerer.lowerFunctionType(expression.text)
+    // A local function value can shadow a constructor of the same name.
+    val localCallable = lowerer.callsLocal(expression.text, expression.children.size)
+    val classIndex = if (!localCallable && !lowerer.isGlobal(expression.text) && lowerer.isClass(expression.text))
+        lowerer.typeDeclarations.find(expression.text) else -1
     val arguments: array<int> = []
     var argument = 0
     while (argument < expression.children.size) {
-        arguments.append(lowerer.lowerExpression(
-            expression.children[argument]
-        ))
+        val child = expression.children[argument]
+        var expected = if (bootstrapIsFunctionType(signature)) bootstrapFunctionParameterType(signature, argument) else "unknown"
+        if (classIndex >= 0 && argument < lowerer.declarations[classIndex].parameterTypes.size)
+            expected = lowerer.declarations[classIndex].parameterTypes[argument]
+        val value = lowerer.lowerExpression(child, true, bootstrapIrIsErasedType(expected))
+        arguments.append(value)
         argument = argument + 1
-    }
-    var callableType = "unknown"
-    if (lowerer.isParameter(expression.text)) {
-        callableType = lowerer.lowerParameterType(expression.text)
-    }
-    if (lowerer.isLocal(expression.text)) {
-        callableType = lowerer.lowerLocalType(expression.text)
-    }
-    if (lowerer.isGlobal(expression.text)) {
-        callableType = lowerer.lowerGlobalFunctionType(expression.text)
     }
     argument = 0
     while (argument < expression.children.size) {
@@ -11007,7 +11076,6 @@ fun bootstrapLowerCall(
     var opcode = "call"
     // A local or parameter is called as itself, whatever class or external
     // function shares its name.
-    val localCallable = lowerer.callsLocal(expression.text, expression.children.size)
     if (!localCallable && lowerer.isClass(expression.text)) opcode = "object.create"
     if (!localCallable && lowerer.isExternal(expression.text)) {
         opcode = "extern.${lowerer.externalLibrary(expression.text)}"
@@ -11080,7 +11148,10 @@ fun bootstrapLowerCallValue(
     val operands: array<int> = [lowerer.lowerExpression(expression.children[0])]
     var argument = 1
     while (argument < expression.children.size) {
-        operands.append(lowerer.lowerExpression(expression.children[argument]))
+        val child = expression.children[argument]
+        val expected = if (bootstrapIsFunctionType(calleeType)) bootstrapFunctionParameterType(calleeType, argument - 1) else "unknown"
+        val value = lowerer.lowerExpression(child, true, bootstrapIrIsErasedType(expected))
+        operands.append(value)
         argument = argument + 1
     }
     argument = 1
@@ -11220,9 +11291,13 @@ fun bootstrapLowerMemberCall(
     val arguments: array<int> = []
     var argument = 0
     while (argument < expression.children.size) {
-        arguments.append(lowerer.lowerExpression(
-            expression.children[argument]
-        ))
+        val child = expression.children[argument]
+        val method = lowerer.methodDeclarations.find(owner, expression.text)
+        var expected = "unknown"
+        if (argument > 0 && method >= 0 && argument - 1 < lowerer.methodDeclarations.declarations[method].parameterTypes.size)
+            expected = lowerer.methodDeclarations.declarations[method].parameterTypes[argument - 1]
+        val value = lowerer.lowerExpression(child, true, bootstrapIrIsErasedType(expected))
+        arguments.append(value)
         argument = argument + 1
     }
     if (((expression.text == "append" ||
@@ -11390,12 +11465,12 @@ fun bootstrapLowerMemberAssign(
     val receiver = if (place != "") {
         lowerer.lowerPlaceProjection(expression.children[0])
     } else lowerer.lowerExpression(expression.children[0])
-    val value = lowerer.lowerExpression(expression.children[1])
     val ownerType = lowerer.lowerExpressionType(expression.children[0])
     val fieldType = lowerer.lowerFieldType(
         ownerType,
         expression.text
     )
+    val value = lowerer.lowerExpression(expression.children[1], true, bootstrapIrIsErasedType(fieldType))
     if (lowerer.lowerTypeIsAffine(fieldType)) {
         val previous = lowerer.emitFieldPrevious(
             receiver,
@@ -11508,7 +11583,8 @@ fun bootstrapLowerIf(
     var lowerer: BootstrapLowerer,
     expression: BootstrapExpression,
     initial: int,
-    valueRequired: bool
+    valueRequired: bool,
+    eraseResult: bool
 ): int {
     var result = initial
     val hasElse = expression.children[2].kind != "missing"
@@ -11518,9 +11594,9 @@ fun bootstrapLowerIf(
     // made otherwise valid nested conditionals fail IR verification.
     val temporaryId = lowerer.allocateLabel()
     val temporary = "if_result_$temporaryId"
-    val zeroOpcode = bootstrapIrLocalZeroOpcode(lowerer.lowerRuntimeType(
-        lowerer.lowerExpressionType(expression)
-    ))
+    val joinType = lowerer.lowerRuntimeType(lowerer.lowerExpressionType(expression))
+    val zeroOpcode = if (eraseResult && (joinType == "f32" || joinType == "f64"))
+        bootstrapIrLocalZeroOpcode("any") else bootstrapIrLocalZeroOpcode(joinType)
     // Missing-else arms keep their existing discard/drop path. Explicit-else
     // arms may omit their join only when neither arm can hand on a resource.
     val joinValue = valueRequired || (hasElse &&
@@ -11535,7 +11611,7 @@ fun bootstrapLowerIf(
     lowerer.emitControl("label", -1, thenLabel, -1, "")
     val previousThenScope = lowerer.enterLocalScope()
     lowerer.addNullableRefinements(expression.children[0], true)
-    val thenValue = lowerer.lowerExpression(expression.children[1], joinValue || !hasElse)
+    val thenValue = lowerer.lowerExpression(expression.children[1], joinValue || !hasElse, eraseResult && hasElse)
     // Without `else`, the branch's value is discarded.
     if (expression.children[2].kind == "missing") {
         lowerer.dropDiscarded(thenValue, expression.children[1])
@@ -11550,7 +11626,7 @@ fun bootstrapLowerIf(
     } else {
         val previousElseScope = lowerer.enterLocalScope()
         lowerer.addNullableRefinements(expression.children[0], false)
-        elseValue = lowerer.lowerExpression(expression.children[2], joinValue)
+        elseValue = lowerer.lowerExpression(expression.children[2], joinValue, eraseResult)
         lowerer.leaveLocalScope(previousElseScope)
     }
     if (joinValue) lowerer.emitControl("local.set", elseValue, -1, -1, temporary)
@@ -11900,14 +11976,15 @@ fun bootstrapLowerWhen(
     var lowerer: BootstrapLowerer,
     expression: BootstrapExpression,
     initial: int,
-    valueRequired: bool
+    valueRequired: bool,
+    eraseResult: bool
 ): int {
     var result = initial
     val temporaryId = lowerer.allocateLabel()
     val temporary = "when_result_$temporaryId"
-    val zeroOpcode = bootstrapIrLocalZeroOpcode(lowerer.lowerRuntimeType(
-        lowerer.lowerExpressionType(expression)
-    ))
+    val joinType = lowerer.lowerRuntimeType(lowerer.lowerExpressionType(expression))
+    val zeroOpcode = if (eraseResult && (joinType == "f32" || joinType == "f64"))
+        bootstrapIrLocalZeroOpcode("any") else bootstrapIrLocalZeroOpcode(joinType)
     val joinValue = valueRequired || !lowerer.discardedValueIsPlain(expression)
     if (joinValue) lowerer.emitControl(zeroOpcode, -1, -1, -1, temporary)
     val subject = lowerer.lowerExpression(expression.children[0])
@@ -11928,7 +12005,7 @@ fun bootstrapLowerWhen(
         val body = expression.children[branch + 1]
         if (match.kind == "missing") {
             hasElse = true
-            val bodyValue = lowerer.lowerExpression(body, joinValue)
+            val bodyValue = lowerer.lowerExpression(body, joinValue, eraseResult)
             if (joinValue) lowerer.emitControl(
                 "local.set",
                 bodyValue,
@@ -11978,7 +12055,7 @@ fun bootstrapLowerWhen(
                     bootstrapNormalizeType(expression.children[firstMatch].text)
                 )
             }
-            val bodyValue = lowerer.lowerExpression(body, joinValue)
+            val bodyValue = lowerer.lowerExpression(body, joinValue, eraseResult)
             if (tested) lowerer.leaveLocalScope(previousScope)
             if (joinValue) lowerer.emitControl(
                 "local.set",

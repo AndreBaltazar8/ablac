@@ -1,9 +1,11 @@
 # Type-directed float identity at erasure boundaries
 
-Status: proposal for review, 2026-11-04. This is not an implementation.
-The current native `any` representation boxes `f32` and `f64` with the same
-integer tag and auxiliary word as an `int`, so dynamic interpolation formats
-the payload bits as an integer. The interpreter retains the float kind. A
+Status: design approved; scalar-boundary phase (a) is implemented for review,
+2026-11-04. Collection boundaries, formatting and JIT lifting remain open.
+Before phase (a), native `any` boxes used the same integer tag and auxiliary
+word for floats and integers. Phase (a) preserves scalar float kinds at the
+covered boundaries; dynamic interpolation still formats their payload bits as
+integers until phase (c). The interpreter retains the float kind. A
 correct change must preserve float identity even when a value crosses an
 unknown generic, indirect or separately compiled boundary.
 
@@ -11,10 +13,12 @@ unknown generic, indirect or separately compiled boundary.
 
 Keep typed scalar operations, ABI, typed field payloads and dense typed arrays
 as they are. Give an erased boxed float a discriminator in the existing
-auxiliary word, with different values for `f32` and `f64`; integer values keep
-auxiliary zero. Preserve all float bits, including f32 payloads, signed zero
-and NaNs. The proposed tag values and all existing uses of auxiliary words
-must be audited against current master before implementation. Equality and
+auxiliary word: 1 for `f32`, 2 for `f64`; integer values keep auxiliary zero.
+These values are in the tag-2 namespace; closure function IDs use the separate
+tag-5 namespace. Box copies preserve the header, and the auxiliary contains no
+GC pointer. Preserve all float bits, including f32 payloads, signed zero
+and NaNs. The earlier auxiliary and boundary audit chose these discriminators;
+recheck the remaining uses as collection and JIT paths change. Equality and
 hashing through `any` currently ignore the auxiliary word: keep that behavior
 for this change, document it, and make a separate language-policy decision
 before altering map keys or comparison.
@@ -26,7 +30,9 @@ at that operation gets its corresponding discriminator; integer boxes and
 ordinary typed float paths retain their current code. Erased-to-erased copies
 copy the complete existing box, including the auxiliary word. A typed float
 recovered from an erased value is unboxed normally; a subsequent erasure must
-reapply its known type. Do not infer a float kind from the payload bits.
+reapply its known type. A nullable float gets the discriminator only when its
+tag indicates a present float; null retains its existing header. Do not infer
+a float kind from the payload bits.
 
 Find the boundaries in both semantic analysis and lowering: `any` locals,
 arguments and returns; fields; array and map insertions and extraction;

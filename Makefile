@@ -122,6 +122,7 @@ test-serial: ablac
 	tools/test-value-slot-addresses.sh $(COMPILER)
 	tools/test-build-same-process.sh $(COMPILER)
 	tools/test-float-interpolation.sh $(COMPILER)
+	tools/test-erased-float-boundaries.sh $(COMPILER)
 	tools/test-compile-time-branch.sh $(COMPILER)
 	tools/test-floating-point.sh $(COMPILER)
 	tools/test-f32.sh $(COMPILER)

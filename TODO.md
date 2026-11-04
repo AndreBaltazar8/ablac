@@ -17,6 +17,12 @@
 
 ## Bugs seen
 
+- [ ] A local callable shadowing a constructor can be normalized as the
+  constructor when their arities differ: `class FloatMaker(val value: int)`
+  followed by `val FloatMaker = { -> 1.5 }; FloatMaker()` reports
+  `E_NAMED_ARGUMENT_REQUIRED` instead of calling the local function. Seen on
+  master 424980cb on 2026-11-04.
+
 - [ ] Additional `--fast` ELF sections: LLVM's in-process C API ignores
   `--function-sections`/`--data-sections` set through its command-line parser.
   A manual section screen moved relocated constants out of RELRO and is unsafe.
@@ -37,8 +43,9 @@
 - [ ] Floats erased to `any` interpolate as integer bit patterns: native
   `text(1.5)` through `fun text(value: any): string = "$value"` prints
   `4609434218613702656`; f32 2.25 prints `1074790400`, while compile-time
-  evaluation prints `1.5`. Boxed floats and integers share tag 2 and auxiliary
-  0. A complete fix must preserve float identity at every typed-to-any boundary
+  evaluation prints `1.5`. Scalar typed-to-`any` boundaries now preserve float
+  identity in the auxiliary word; dynamic formatting and collection boundaries
+  still need to use it. A complete fix must preserve float identity at every typed-to-any boundary
   (calls, locals, fields, collections, returns and closures), through generic
   storage, on native and Wasm; keep dense typed arrays and integer/GC ABI
   behavior; and check NaN, infinity, negative zero, formatting, bootstrap and
@@ -57,6 +64,9 @@
   retain conservative behavior at generic, reflective and foreign boundaries.
   A demand-driven formatter and full native, compile-time and Wasm tests are
   still needed.
+  Equality and hashing through `any` currently ignore the auxiliary word, so
+  a boxed float and an integer with identical payload bits compare equal and
+  share a map key; deciding whether to change that is a separate language issue.
 
 - [ ] **Xtensa `llc` aborts on frames of 128 to 255 bytes that take a stack address.** `LLVM ERROR: Error
   while trying to spill A6 from class AR: Cannot scavenge register without an emergency spill slot!`, seen

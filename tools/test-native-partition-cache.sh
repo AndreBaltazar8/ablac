@@ -56,7 +56,7 @@ write_source() {
 
 partition_count() {
     find "$cache_directory" -maxdepth 1 -type f \
-        -name 'native-partition-x86_64-linux-llvm21-v3-*.o' | wc -l
+        -name 'native-partition-x86_64-linux-llvm21-v4-*.o' | wc -l
 }
 
 write_source 1 || exit 1
