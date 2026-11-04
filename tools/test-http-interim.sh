@@ -5,9 +5,10 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 out="$root/build/http-interim"
 mkdir -p "$out"
 rm -f "$out/ready"
-openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=localhost \
+cp "$root/tests/vectors/crypto/test-keys/tls-server.pem" "$out/key.pem"
+openssl req -x509 -new -key "$out/key.pem" -days 2 -subj /CN=localhost \
     -addext subjectAltName=DNS:localhost,IP:127.0.0.1 \
-    -keyout "$out/key.pem" -out "$out/cert.pem" 2>/dev/null
+    -out "$out/cert.pem" 2>/dev/null
 python3 - "$out/ready" "$out/cert.pem" "$out/key.pem" <<'PY' &
 import os, socket, ssl, sys, threading, time
 plain = socket.socket(); plain.bind(("127.0.0.1", 0)); plain.listen(16)

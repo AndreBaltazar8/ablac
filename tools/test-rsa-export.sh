@@ -26,7 +26,8 @@ fi
 rg -q 'name.private:rsaPrivateExportDer|E_NAME_PRIVATE' "$out/forbidden.log"
 cp "$root/tests/cases/rsa-export/main.ab" "$out/main.ab"
 "$compiler" build "$out/main.ab" -o "$out/main" --fast --no-cache
-openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$out/input.pem" 2>/dev/null
+# This independent OpenSSL-format fixture already has a 2048-bit private key.
+cp "$root/tests/vectors/crypto/rsa-implicit-key.pem" "$out/input.pem"
 openssl rsa -in "$out/input.pem" -traditional -out "$out/traditional.pem" 2>/dev/null
 for input in input traditional; do
     "$out/main" "$out/$input.pem" "$out/$input.der" "$out/$input.out.pem"

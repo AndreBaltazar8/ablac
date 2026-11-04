@@ -14,9 +14,9 @@ output_directory=$project_root/build/websocket-tls-server
 mkdir -p "$output_directory"
 cd "$project_root"
 
-openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=localhost \
+cp tests/vectors/crypto/test-keys/tls-server.pem "$output_directory/private-key.pem"
+openssl req -x509 -new -key "$output_directory/private-key.pem" -days 2 -subj /CN=localhost \
     -addext subjectAltName=DNS:localhost \
-    -keyout "$output_directory/private-key.pem" \
     -out "$output_directory/certificate.pem" 2>/dev/null
 openssl pkey -in "$output_directory/private-key.pem" -aes256 -passout pass:secret \
     -out "$output_directory/encrypted-key.pem"

@@ -5,8 +5,9 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 out="$root/build/http-tls-deadline"
 mkdir -p "$out"
 rm -f "$out/ready"
-openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=localhost \
-    -keyout "$out/key.pem" -out "$out/cert.pem" 2>/dev/null
+cp "$root/tests/vectors/crypto/test-keys/tls-server.pem" "$out/key.pem"
+openssl req -x509 -new -key "$out/key.pem" -days 2 -subj /CN=localhost \
+    -out "$out/cert.pem" 2>/dev/null
 openssl pkcs12 -export -inkey "$out/key.pem" -in "$out/cert.pem" \
     -passout pass:test -out "$out/identity.p12" 2>/dev/null
 python3 - "$out/ready" <<'PY' &

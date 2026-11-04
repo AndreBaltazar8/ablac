@@ -3,7 +3,7 @@
 # hardware and software paths, on this CPU and on one with no AES (qemu64); refusals; random inputs against
 # abla/crypto/hosted and the openssl CLI; known answers run on AArch64 under qemu and Wasm under Node, and
 # compiled for Xtensa; and that neither links OpenSSL. What's read of the code is in tools/test-ct.sh.
-# CRYPTO_ROUNDS sets the random rounds (default 30). Keys are generated here and never printed.
+# CRYPTO_ROUNDS sets random rounds (default 30). The 2048-bit key is freshly generated; weak/PSS keys are fixtures.
 set -uo pipefail
 
 compiler=${1:-build/ablac}
@@ -50,8 +50,10 @@ fi
 
 # --- Keys, refusals ------------------------------------------------------------------------
 keys=$out/keys
+"$compiler" build tests/cases/rsa-keygen/generate.ab -o "$out/generate-rsa" --fast --no-cache \
+    > "$out/generate-rsa.build.log" 2>&1 || { cat "$out/generate-rsa.build.log"; exit 2; }
 {
-    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:1024 -out "$keys/k1024.pem"
+    cp tests/vectors/crypto/test-keys/legacy-rsa-1024.pem "$keys/k1024.pem"
     openssl rsa -in "$keys/k1024.pem" -traditional -out "$keys/k1024-traditional.pem"
     openssl pkcs8 -topk8 -nocrypt -in "$keys/k1024.pem" -outform DER -out "$keys/k1024.der"
     openssl rsa -in "$keys/k1024.pem" -traditional -outform DER -out "$keys/k1024-traditional.der"
@@ -61,11 +63,11 @@ keys=$out/keys
     openssl rsa -in "$keys/k1024.pem" -RSAPublicKey_out -out "$keys/rsapublic.pem"
     openssl req -x509 -new -key "$keys/k1024.pem" -days 2 -subj /CN=test -sha256 -out "$keys/certificate.pem"
     openssl x509 -in "$keys/certificate.pem" -outform DER -out "$keys/certificate.der"
-    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$keys/k2048.pem"
+    "$out/generate-rsa" "$keys/k2048.pem" || exit 2
     openssl pkey -in "$keys/k2048.pem" -pubout -out "$keys/k2048-spki.pem"
     openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$keys/ec.pem"
     openssl pkey -in "$keys/ec.pem" -pubout -out "$keys/ec-spki.pem"
-    openssl genpkey -algorithm RSA-PSS -pkeyopt rsa_keygen_bits:2048 -out "$keys/pss.pem"
+    cp tests/vectors/crypto/test-keys/rsa-pss-2048.pem "$keys/pss.pem"
 } > "$out/keys.log" 2>&1 || { fail "generating keys"; sed 's/^/     /' "$out/keys.log"; exit 1; }
 
 if timeout 300 "$out/edge" "$keys" > "$out/edge.log" 2>&1 < /dev/null; then

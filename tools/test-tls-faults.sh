@@ -13,9 +13,10 @@ output_directory=${TLS_FAULTS_OUTPUT:-$project_root/build/tls-faults}
 mkdir -p "$output_directory"
 cd "$project_root"
 
-openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=localhost \
+cp tests/vectors/crypto/test-keys/tls-server.pem "$output_directory/key.pem"
+openssl req -x509 -new -key "$output_directory/key.pem" -days 2 -subj /CN=localhost \
     -addext subjectAltName=DNS:localhost,IP:127.0.0.1 \
-    -keyout "$output_directory/key.pem" -out "$output_directory/certificate.pem" 2>/dev/null || exit 2
+    -out "$output_directory/certificate.pem" 2>/dev/null || exit 2
 "$compiler" build tests/cases/tls-faults/faults.ab -o "$output_directory/faults" --fast || exit 2
 
 # Each stage forks its own peers on ports of its own: most of each is waiting for

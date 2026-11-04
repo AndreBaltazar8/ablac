@@ -3,7 +3,7 @@
 # (tests/vectors/crypto), refusals on keys generated here, random inputs compared
 # with the openssl CLI both ways, mutual TLS against `openssl s_server`, and that only
 # the hosted module links OpenSSL. CRYPTO_ROUNDS sets the random rounds (default 40).
-# All keys are generated for this run in the build directory and never printed.
+# The ordinary 2048-bit key is generated for this run; weak and PSS keys are public test fixtures.
 set -uo pipefail
 
 compiler=${1:-build/ablac}
@@ -30,6 +30,8 @@ for program in vectors edge tool; do
         > "$out/$program.build.log" 2>&1 || { cat "$out/$program.build.log"; exit 2; }
 done
 tool=$out/tool
+"$compiler" build tests/cases/rsa-keygen/generate.ab -o "$out/generate-rsa" --fast --no-cache \
+    > "$out/generate-rsa.build.log" 2>&1 || { cat "$out/generate-rsa.build.log"; exit 2; }
 
 # --- Vectors ---------------------------------------------------------------------
 if "$out/vectors" tests/vectors/crypto > "$out/vectors.log" 2>&1; then
@@ -41,7 +43,7 @@ fi
 # --- Keys, in every form ---------------------------------------------------------
 keys=$out/keys
 make_keys() {
-    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:1024 -out "$keys/k1024.pem"
+    cp tests/vectors/crypto/test-keys/legacy-rsa-1024.pem "$keys/k1024.pem"
     openssl rsa -in "$keys/k1024.pem" -traditional -out "$keys/k1024-traditional.pem"
     openssl pkcs8 -topk8 -nocrypt -in "$keys/k1024.pem" -outform DER -out "$keys/k1024.der"
     openssl rsa -in "$keys/k1024.pem" -traditional -outform DER -out "$keys/k1024-traditional.der"
@@ -53,13 +55,12 @@ make_keys() {
     openssl x509 -in "$keys/certificate.pem" -outform DER -out "$keys/certificate.der"
     openssl pkcs12 -export -in "$keys/certificate.pem" -inkey "$keys/k1024.pem" -passout pass:pw -out "$keys/k1024.p12"
     openssl pkcs12 -export -legacy -in "$keys/certificate.pem" -inkey "$keys/k1024.pem" -passout pass:pw -out "$keys/k1024-legacy.p12"
-    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$keys/k2048.pem"
+    "$out/generate-rsa" "$keys/k2048.pem" || return 1
     openssl pkey -in "$keys/k2048.pem" -pubout -out "$keys/k2048-spki.pem"
     openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$keys/ec.pem"
     openssl pkey -in "$keys/ec.pem" -pubout -out "$keys/ec-spki.pem"
-    openssl genpkey -algorithm RSA-PSS -pkeyopt rsa_keygen_bits:2048 -out "$keys/pss.pem"
-    # OpenSSL may refuse so small a key: edge.ab skips the check if so.
-    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:768 -out "$keys/k768.pem" || : > "$keys/k768.pem"
+    cp tests/vectors/crypto/test-keys/rsa-pss-2048.pem "$keys/pss.pem"
+    cp tests/vectors/crypto/test-keys/legacy-rsa-768.pem "$keys/k768.pem"
 }
 make_keys > "$out/keys.log" 2>&1 || { fail "generating keys"; sed 's/^/     /' "$out/keys.log"; exit 1; }
 
@@ -129,13 +130,16 @@ done
 tls=$out/keys/tls
 mkdir -p "$tls"
 make_identity() { # name, signing CA
-    openssl req -new -newkey rsa:2048 -nodes -keyout "$tls/$1.key" -subj "/CN=$1" -out "$tls/$1.csr"
+    cp "tests/vectors/crypto/test-keys/tls-$1.pem" "$tls/$1.key"
+    openssl req -new -key "$tls/$1.key" -subj "/CN=$1" -out "$tls/$1.csr"
     openssl x509 -req -in "$tls/$1.csr" -CA "$tls/$2.pem" -CAkey "$tls/$2.key" -CAcreateserial -days 2 \
         -sha256 -extfile <(printf 'subjectAltName=DNS:localhost') -out "$tls/$1.pem"
 }
 {
-    openssl req -x509 -newkey rsa:2048 -nodes -keyout "$tls/ca.key" -subj /CN=ca -days 2 -out "$tls/ca.pem"
-    openssl req -x509 -newkey rsa:2048 -nodes -keyout "$tls/other.key" -subj /CN=other -days 2 -out "$tls/other.pem"
+    cp tests/vectors/crypto/test-keys/tls-ca.pem "$tls/ca.key"
+    cp tests/vectors/crypto/test-keys/tls-other.pem "$tls/other.key"
+    openssl req -x509 -new -key "$tls/ca.key" -subj /CN=ca -days 2 -out "$tls/ca.pem"
+    openssl req -x509 -new -key "$tls/other.key" -subj /CN=other -days 2 -out "$tls/other.pem"
     make_identity server ca
     make_identity client ca
     make_identity stranger other
