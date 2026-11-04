@@ -135,6 +135,10 @@
   test (`dudect`) on real hardware, or anything at all on an ESP32-S3. The Xtensa path is compiled and read only.
 - [ ] **`--fast` builds aren't read by `tools/test-ct.sh`**: the checker stops at their calls. It could follow
   internal calls.
+- [ ] **Secret residue is not checked by `tools/test-ct.sh`.** It checks timing-related branches,
+  addresses and divisions, not unwiped copies in GC-registered stack temporaries, ordinary
+  register spills or the GC heap. AES's discarded conditional exposed such a stack copy;
+  removing unused joins does not make general secret lifetime/wiping guarantees.
 - [ ] **Not read in abla/crypto, though typed secret:** AES's key schedule and block loading, `rsaCrt`'s steps around
   the fixtures, `bnFromBytes`, `bnToBytes`, `bnResidueSquare`. Each could be a fixture.
 

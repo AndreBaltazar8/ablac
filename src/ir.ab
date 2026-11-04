@@ -5601,9 +5601,9 @@ class BootstrapLowerer(
         }
     }
 
-    // A discarded join can disappear only when every arm is known to return
-    // a plain value. A mismatched join can itself have type void, so inspect
-    // its arms rather than using that joined type as an ownership check.
+    // Whether a discarded block tail needs no ownership hand-off. A mismatched
+    // join can itself have type void, so inspect its arms rather than treating
+    // that joined type as an ownership check.
     fun discardedValueIsPlain(expression: BootstrapExpression): bool {
         val kind = expression.kind
         if (kind == "block") {
@@ -8574,7 +8574,12 @@ class BootstrapLowerer(
         if (result >= 0 && diverges) {
             this.emitControl("unreachable", -1, -1, -1, "")
         }
-        if (result < 0) {
+        // Effect-only control flow has already disposed of each arm's fresh
+        // resources. No value means the caller must not try to drop it again.
+        // Other negative results still diagnose an unsupported expression.
+        val effectOnly = !valueRequired &&
+            (kind == "if" || kind == "when" || kind == "block")
+        if (result < 0 && !effectOnly) {
             this.errors = this.errors + 1
             result = this.emit("invalid", -1, -1, kind)
         }
@@ -10381,10 +10386,10 @@ fun bootstrapLowerBlock(
         }
         statement = statement + 1
     }
-    if (result < 0) result = lowerer.emit("const.void", -1, -1, "")
+    if (result < 0 && valueRequired) result = lowerer.emit("const.void", -1, -1, "")
     if (!valueRequired && expression.children.size > 0 &&
         lowerer.discardedValueIsPlain(expression.children[expression.children.size - 1])) {
-        result = lowerer.emit("const.void", -1, -1, "")
+        result = -1
     }
     lowerer.emitScopeDrops(lowerer.currentScope)
     lowerer.leaveLocalScope(previousScope)
@@ -11680,11 +11685,9 @@ fun bootstrapLowerIf(
     val joinType = lowerer.lowerRuntimeType(lowerer.lowerExpressionType(expression))
     val zeroOpcode = if (eraseResult && (joinType == "f32" || joinType == "f64"))
         bootstrapIrLocalZeroOpcode("any") else bootstrapIrLocalZeroOpcode(joinType)
-    // Missing-else arms keep their existing discard/drop path. Explicit-else
-    // arms may omit their join only when neither arm can hand on a resource.
-    val joinValue = valueRequired || (hasElse &&
-        (!lowerer.discardedValueIsPlain(expression.children[1]) ||
-         !lowerer.discardedValueIsPlain(expression.children[2])))
+    // A statement has no result join. Dispose of fresh values in the selected
+    // arm, after its block cleanup, rather than boxing them into an unused join.
+    val joinValue = valueRequired
     if (joinValue) lowerer.emitControl(zeroOpcode, -1, -1, -1, temporary)
     val condition = lowerer.lowerExpression(expression.children[0])
     val thenLabel = lowerer.allocateLabel()
@@ -11694,9 +11697,9 @@ fun bootstrapLowerIf(
     lowerer.emitControl("label", -1, thenLabel, -1, "")
     val previousThenScope = lowerer.enterLocalScope()
     lowerer.addNullableRefinements(expression.children[0], true)
-    val thenValue = lowerer.lowerExpression(expression.children[1], joinValue || !hasElse, eraseResult && hasElse)
-    // Without `else`, the branch's value is discarded.
-    if (expression.children[2].kind == "missing") {
+    val thenValue = lowerer.lowerExpression(expression.children[1], joinValue, eraseResult && hasElse)
+    // Missing-else value expressions retain their existing discard/drop path.
+    if (!joinValue || !hasElse) {
         lowerer.dropDiscarded(thenValue, expression.children[1])
     }
     lowerer.leaveLocalScope(previousThenScope)
@@ -11710,13 +11713,13 @@ fun bootstrapLowerIf(
         val previousElseScope = lowerer.enterLocalScope()
         lowerer.addNullableRefinements(expression.children[0], false)
         elseValue = lowerer.lowerExpression(expression.children[2], joinValue, eraseResult)
+        if (!joinValue) lowerer.dropDiscarded(elseValue, expression.children[2])
         lowerer.leaveLocalScope(previousElseScope)
     }
     if (joinValue) lowerer.emitControl("local.set", elseValue, -1, -1, temporary)
     lowerer.emitControl("jump", -1, mergeLabel, -1, "")
     lowerer.emitControl("label", -1, mergeLabel, -1, "")
-    result = if (joinValue) lowerer.emit("local.load", -1, -1, temporary)
-        else lowerer.emit("const.void", -1, -1, "")
+    result = if (joinValue) lowerer.emit("local.load", -1, -1, temporary) else -1
     result
 }
 
@@ -12068,7 +12071,7 @@ fun bootstrapLowerWhen(
     val joinType = lowerer.lowerRuntimeType(lowerer.lowerExpressionType(expression))
     val zeroOpcode = if (eraseResult && (joinType == "f32" || joinType == "f64"))
         bootstrapIrLocalZeroOpcode("any") else bootstrapIrLocalZeroOpcode(joinType)
-    val joinValue = valueRequired || !lowerer.discardedValueIsPlain(expression)
+    val joinValue = valueRequired
     if (joinValue) lowerer.emitControl(zeroOpcode, -1, -1, -1, temporary)
     val subject = lowerer.lowerExpression(expression.children[0])
     val mergeLabel = lowerer.allocateLabel()
@@ -12089,6 +12092,7 @@ fun bootstrapLowerWhen(
         if (match.kind == "missing") {
             hasElse = true
             val bodyValue = lowerer.lowerExpression(body, joinValue, eraseResult)
+            if (!joinValue) lowerer.dropDiscarded(bodyValue, body)
             if (joinValue) lowerer.emitControl(
                 "local.set",
                 bodyValue,
@@ -12139,6 +12143,7 @@ fun bootstrapLowerWhen(
                 )
             }
             val bodyValue = lowerer.lowerExpression(body, joinValue, eraseResult)
+            if (!joinValue) lowerer.dropDiscarded(bodyValue, body)
             if (tested) lowerer.leaveLocalScope(previousScope)
             if (joinValue) lowerer.emitControl(
                 "local.set",
@@ -12157,8 +12162,7 @@ fun bootstrapLowerWhen(
         lowerer.emitControl("unreachable", -1, -1, -1, "")
     }
     lowerer.emitControl("label", -1, mergeLabel, -1, "")
-    result = if (joinValue) lowerer.emit("local.load", -1, -1, temporary)
-        else lowerer.emit("const.void", -1, -1, "")
+    result = if (joinValue) lowerer.emit("local.load", -1, -1, temporary) else -1
     result
 }
 
