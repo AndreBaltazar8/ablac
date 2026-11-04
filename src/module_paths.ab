@@ -4,6 +4,8 @@
 // the module graph (sema.ab is compiled alone by some tools and tests).
 import "abla/sys/linux/fs"
 import "abla/sys/linux/process"
+import "abla/unsafe/memory/raw"
+import "abla/unsafe/memory"
 
 // Compiler-owned sources must not depend on the directory from which ablac was
 // invoked. The public launcher supplies ABLA_SYSROOT automatically; the
@@ -96,10 +98,102 @@ fun bootstrapCanonicalEscapingPath(path: string): string {
     if (output == "") "." else output
 }
 
-// The prefix that keeps a module's private and rewritten names apart:
-// "__abla_module_", the hex of its path and "__" (the backend spells the
-// standard library's without its directory).
+// Resolve filesystem aliases for the entry's package root and import base.
+// Other module/cache identities keep their lexical spelling.
+noescape extern:"c" fun realpath(path: i64*, resolved: i64*): i64*
+
+fun bootstrapPhysicalModulePath(path: string): string {
+    if (path.startsWith("<")) return path
+    val absolute = bootstrapNormalizeModulePath(
+        if (path.startsWith("/")) path else "${currentDirectory().text}/$path"
+    )
+    val buffer = nativeByteBuffer(4097)
+    val resolved = realpath(nativePointerFromAddress(nativeCStringAddress(absolute)), buffer.pointerAt(0))
+    if (pointerIsNull(resolved)) {
+        buffer.close()
+        return absolute
+    }
+    var length = 0
+    while (length < 4096 && buffer.load(length) != 0) length += 1
+    buffer.adoptString(length)
+}
+
+fun bootstrapModuleEntryIdentity(path: string): string {
+    val normalized = bootstrapNormalizeModulePath(path)
+    val absolute = bootstrapNormalizeModulePath(
+        if (normalized.startsWith("/")) normalized
+        else "${currentDirectory().text}/$normalized"
+    )
+    val physical = bootstrapPhysicalModulePath(normalized)
+    if (physical == absolute) normalized else physical
+}
+
+// Scoped to graph preparation, and restored after nested compile-time builds.
+// Nothing is added to AST nodes or retained in the semantic module cache.
+var bootstrapModuleIdentityRoot = ""
+var bootstrapModuleIdentityStdlib = ""
+var bootstrapModuleIdentityPrefixes: Map<string, string> = Map()
+
+fun bootstrapModuleIdentityProjectRoot(entry: string): string {
+    if (entry.startsWith("<")) return ""
+    val start = Path(bootstrapPhysicalModulePath(entry)).parent()
+    var directory = start
+    var depth = 0
+    while (depth < 128) {
+        if (directory.child("abla.toml").exists()) return directory.text
+        val parent = directory.parent()
+        if (parent.text == directory.text) return start.text
+        directory = parent
+        depth += 1
+    }
+    start.text
+}
+
+fun bootstrapModuleRelativeIdentity(path: string, root: string): string {
+    val base = bootstrapPathSegments(root)
+    val target = bootstrapPathSegments(path)
+    var common = 0
+    while (common < base.size && common < target.size &&
+        base[common] == target[common]) common += 1
+    var result = ""
+    var index = common
+    while (index < base.size) {
+        result = "$result../"
+        index += 1
+    }
+    index = common
+    while (index < target.size) {
+        if (index > common) result = "$result/"
+        result = "$result${target[index]}"
+        index += 1
+    }
+    result
+}
+
+// Project private/alias/type identities are package-relative before rewriting,
+// so every later consumer (including LLVM hashes and runtime type strings)
+// sees the same name. Keep stdlib's established portable LLVM spelling.
 fun bootstrapModuleCanonicalPrefix(modulePath: string): string {
+    if (bootstrapModuleIdentityRoot == "" || modulePath.startsWith("<")) {
+        return bootstrapEncodeModulePrefix(modulePath)
+    }
+    val known = bootstrapModuleIdentityPrefixes.get(modulePath)
+    if (known != null) return known
+    val absolute = bootstrapNormalizeModulePath(
+        if (modulePath.startsWith("/")) modulePath
+        else "${currentDirectory().text}/$modulePath"
+    )
+    // Keep a dependency's lexical path within the project, even when a package
+    // directory is a symlink into a shared download cache outside the checkout.
+    val identity = if (absolute == bootstrapModuleIdentityStdlib ||
+        absolute.startsWith("$bootstrapModuleIdentityStdlib/")) modulePath
+        else "project/${bootstrapModuleRelativeIdentity(absolute, bootstrapModuleIdentityRoot)}"
+    val prefix = bootstrapEncodeModulePrefix(identity)
+    bootstrapModuleIdentityPrefixes.set(modulePath, prefix)
+    prefix
+}
+
+fun bootstrapEncodeModulePrefix(modulePath: string): string {
     val digits = "0123456789abcdef"
     var prefix = "__abla_module_"
     var index = 0
