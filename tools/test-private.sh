@@ -57,5 +57,8 @@ rejected use-class 'name.private:Node:'
 rejected use-alias 'E_NAME_PRIVATE' '`helper` is private to'
 rejected use-extension 'name.private:Point.secret:'
 rejected use-field 'name.private:Point.tag:'
+rejected use-field-write 'name.private:Point.tag:' 'use-field-write.ab:4:5'
+rejected use-field-write-alias 'name.private:' '.tag:' 'use-field-write-alias.ab:4:5'
+rejected use-field-write-compound 'name.private:Point.tag:'
 rejected export 'private.export:twice'
 echo "private: module-only names, no clashes, when matches, # (both tiers), generated members, subparser expansions, compiler API, diagnostics"
