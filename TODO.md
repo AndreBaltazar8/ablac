@@ -408,6 +408,28 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
 
 ## Tried, not pursued
 
+- **Interface dispatch after LLVM inlining** (2026-11-04, `fbc4effa`):
+  the dispatch benchmark runs 90 M calls in 3.512 G instructions. Its three
+  steady paths take 40/37/40 instructions (39 on average); no calls or
+  allocations remain in the hot loop. Precise-distribution sampling gives
+  `Shape.area` 22.43% self / 45.95% inclusive, matching the assembly counts
+  (22.22% / 46.15%). The earlier generic `instructions/upp` attribution of
+  40.49% / 62.62% overrepresented branches; use this CPU's
+  `inst_retired.prec_dist` for per-instruction attribution. LLVM already shares
+  the tag/null checks and descriptor loads across all three `ObjectIs` tests;
+  a class-key/switch-only change would not recover those costs again.
+  Two candidates remain: preserve exact-constructor provenance for immutable,
+  noncaptured, non-affine interface locals (`val s: Shape = Square(n)` still
+  dispatches), keeping declared type/borrow/drop metadata separate; or move
+  the receiver's four hot box stores into the cold slow-get/no-witness paths,
+  preserving GC roots (10.25% whole-benchmark instruction upper bound).
+  Concrete and `is`-refined calls already go directly to their witness; a sole
+  implementer still retains its guard/fallback, even for a sealed interface.
+  Park both ideas: the benchmark is genuinely polymorphic, other benchmark
+  sources have no interface methods, and no server gain was established.
+  Read-only probes, sampling controls and the proposal:
+  `worktrees/ablac-dispatch-report/build/dispatch-lab/report.md`.
+
 - **Remaining QR template bounds/kind checks after scalar array getters**
   (2026-11-03, `8111ac68`): extra post-inline LICM leaves `templateScore`'s
   complete executable byte-identical: no cheap check recovery. Across all
