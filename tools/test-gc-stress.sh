@@ -45,7 +45,7 @@ expect global-initializer 42 "" ABLA_GC_STRESS=1
 
 modules="$project_root/tests/cases/modules"
 for name in generator-nested generator-lazy generator-affine task-array-move \
-    generator-task-capture string-retention; do
+    generator-task-capture string-retention bytes; do
     build "$modules/$name.ab" "$name"
 done
 # Fewer rounds of the loop-roots program: each of its calls collects here.
@@ -68,5 +68,6 @@ expect generator-affine 0 $'got 7\ngot 8\ndrop 8\ndrop 7\n--\ngot 7\ngot 8\ngot 
 expect task-array-move 0 6 $stress
 expect generator-task-capture 0 $'1\n4\nfinished 4' $stress
 expect string-retention 42 "*" $stress
+expect bytes 42 "" $stress
 expect loop-roots 42 "" $stress
 echo "gc stress: every safe point collects; generators, tasks, retained strings and loop roots hold"
