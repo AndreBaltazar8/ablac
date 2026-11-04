@@ -249,6 +249,14 @@ private trusted fun tlsContextUseIdentity(
     true
 }
 
+// A nonzero deadline is an absolute monotonic millisecond time shared by
+// the caller's connect, handshake, and subsequent protocol exchange.
+private fun hostedTlsDeadlineWait(deadline: int, timeout: int): int {
+    if (deadline == 0) return timeout
+    val left = deadline - linuxMonotonicMilliseconds()
+    if (left <= 0) 0 else if (timeout < left) timeout else left
+}
+
 trusted fun tlsOpen(
     host: string,
     caPath: string,
@@ -257,7 +265,8 @@ trusted fun tlsOpen(
     readWriteTimeoutMilliseconds: int = 30000,
     identityCertificate: int = 0,
     identityKey: int = 0,
-    identityChain: array<int> = []
+    identityChain: array<int> = [],
+    deadline: int = 0
 ): int {
     var handle = -1
     var stage = "configuration"
@@ -269,19 +278,21 @@ trusted fun tlsOpen(
         tlsAvailable()
     if (ready) {
         stage = "tcp_connect"
-        val connectTimeout = tlsTcpConnectTimeout(timeoutMilliseconds)
+        val connectTimeout = hostedTlsDeadlineWait(
+            deadline, tlsTcpConnectTimeout(timeoutMilliseconds)
+        )
         // Local development certificates conventionally identify
         // `localhost`; avoid a DNS round-trip and preserve the listener's
         // IPv6 loopback choice while still verifying the original host name.
-        connection = if (host == "localhost") tcpConnectIpv6(
+        if (connectTimeout > 0) connection = if (host == "localhost") tcpConnectIpv6(
             ipv6Loopback(port), connectTimeout
-        ) else tcpConnectHost(host, port, connectTimeout)
+        ) else tcpConnectHost(host, port, connectTimeout, deadline)
         ready = connection.descriptor >= 0
     }
     if (!ready) { hostedTlsSetError(hostedTlsStageCode(stage)); return -1 }
     tlsUpgradeHandle(
         connection, host, caPath, timeoutMilliseconds, readWriteTimeoutMilliseconds,
-        identityCertificate, identityKey, identityChain
+        identityCertificate, identityKey, identityChain, deadline
     )
 }
 
@@ -296,7 +307,8 @@ trusted fun tlsUpgradeHandle(
     readWriteTimeoutMilliseconds: int = 30000,
     identityCertificate: int = 0,
     identityKey: int = 0,
-    identityChain: array<int> = []
+    identityChain: array<int> = [],
+    deadline: int = 0
 ): int {
     var handle = -1
     var stage = "configuration"
@@ -349,13 +361,43 @@ trusted fun tlsUpgradeHandle(
         )
         ERR_clear_error()
         val held = linuxBrokenPipeHold()
-        val wait = HostedTlsWait(connection.descriptor)
-        var shook = SSL_connect(session)
-        while (shook != 1 && hostedTlsInterrupted(wait, session, int(shook))) {
-            shook = SSL_connect(session)
+        if (deadline == 0) {
+            val wait = HostedTlsWait(connection.descriptor)
+            var shook = SSL_connect(session)
+            while (shook != 1 && hostedTlsInterrupted(wait, session, int(shook))) {
+                shook = SSL_connect(session)
+            }
+            hostedTlsWaitDone(wait)
+            ready = shook == 1
+        } else {
+            // Nonblocking TLS lets the absolute budget bound the entire handshake,
+            // including peers which send a partial record before each timeout.
+            ready = linuxSocketSetNonblocking(connection.descriptor, true)
+            var done = false
+            while (ready && !done) {
+                val remaining = hostedTlsDeadlineWait(deadline, timeoutMilliseconds)
+                if (remaining <= 0) ready = false
+                else {
+                    val result = SSL_connect(session)
+                    if (result == 1) done = true
+                    else {
+                        val error = SSL_get_error(session, result)
+                        if (error != 2 && error != 3) ready = false
+                        else {
+                            val wait = hostedTlsDeadlineWait(deadline, timeoutMilliseconds)
+                            if (wait <= 0) ready = false
+                            else {
+                                val polled = linuxPollSocket(connection.descriptor,
+                                    error == 2, error == 3, wait)
+                                if (polled.timedOut || polled.failed() ||
+                                    (polled.closed && !polled.readable && !polled.writable)) ready = false
+                            }
+                        }
+                    }
+                }
+            }
+            if (!linuxSocketSetNonblocking(connection.descriptor, false)) ready = false
         }
-        hostedTlsWaitDone(wait)
-        ready = shook == 1
         linuxBrokenPipeRelease(held)
     }
     if (ready) {
@@ -396,9 +438,11 @@ fun tlsConnect(
     host: string,
     port: int = 443,
     timeoutMilliseconds: int = 5000,
-    readWriteTimeoutMilliseconds: int = tlsDefaultReadWriteTimeoutMilliseconds
+    readWriteTimeoutMilliseconds: int = tlsDefaultReadWriteTimeoutMilliseconds,
+    deadline: int = 0
 ): TlsConnection = TlsConnection(
-    tlsOpen(host, "", port, timeoutMilliseconds, readWriteTimeoutMilliseconds)
+    tlsOpen(host, "", port, timeoutMilliseconds, readWriteTimeoutMilliseconds,
+        deadline = deadline)
 )
 
 fun tlsConnectWithCa(
@@ -421,7 +465,8 @@ trusted fun tlsConnectWithIdentity(
     caPath: string = "",
     port: int = 443,
     timeoutMilliseconds: int = 5000,
-    readWriteTimeoutMilliseconds: int = tlsDefaultReadWriteTimeoutMilliseconds
+    readWriteTimeoutMilliseconds: int = tlsDefaultReadWriteTimeoutMilliseconds,
+    deadline: int = 0
 ): TlsConnection {
     if (!identity.ok()) {
         hostedTlsSetError(14)
@@ -429,7 +474,7 @@ trusted fun tlsConnectWithIdentity(
     }
     TlsConnection(tlsOpen(
         host, caPath, port, timeoutMilliseconds, readWriteTimeoutMilliseconds,
-        identity.certificate, identity.key, identity.chain
+        identity.certificate, identity.key, identity.chain, deadline
     ))
 }
 

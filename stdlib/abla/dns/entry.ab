@@ -7,6 +7,7 @@ import "abla/bytes"
 import "abla/fs"
 import "abla/net"
 import "abla/random"
+import "abla/sys/linux/process"
 
 class DnsAddress(
     val family: int,
@@ -430,12 +431,22 @@ private fun dnsExchange(
     result
 }
 
+// Remaining time for a chain of DNS and connect operations. Zero deadline
+// preserves the existing per-operation timeout behavior.
+private fun dnsDeadlineWait(deadline: int, timeout: int): int {
+    if (deadline == 0) return timeout
+    val left = deadline - linuxMonotonicMilliseconds()
+    if (left <= 0) 0 else if (timeout < left) timeout else left
+}
+
 /**
  * Resolves `host` for `recordType` (1 = A, 28 = AAAA), blocking for up to
  * `timeoutMilliseconds` per name asked. A literal address is itself; the
  * hosts file answers next; then each candidate name (dnsCandidates) is asked
  * in turn, moving on after NXDOMAIN or no records of the type. Any other
  * failure (a timeout, a server error, a malformed reply) ends the search.
+ * `deadline`, when nonzero, is an absolute monotonic millisecond deadline
+ * shared across candidates and record types.
  */
 fun dnsResolveType(
     host: string,
@@ -444,7 +455,8 @@ fun dnsResolveType(
     server: string = "",
     serverPort: int = 53,
     configurationPath: string = "/etc/resolv.conf",
-    hostsPath: string = "/etc/hosts"
+    hostsPath: string = "/etc/hosts",
+    deadline: int = 0
 ): DnsResolution {
     val literal = dnsLiteral(host, recordType)
     if (literal != null) return literal
@@ -456,9 +468,9 @@ fun dnsResolveType(
     if (candidates.size == 0) return DnsResolution([], false, false, 22)
     var sawNoData = false
     for (candidate in candidates) {
-        val exchange = dnsExchange(
-            candidate, recordType, timeoutMilliseconds, nameserver, serverPort
-        )
+        val wait = dnsDeadlineWait(deadline, timeoutMilliseconds)
+        if (wait <= 0) return DnsResolution([], false, true, 0)
+        val exchange = dnsExchange(candidate, recordType, wait, nameserver, serverPort)
         val resolution = exchange.resolution
         if (resolution.succeeded && resolution.addresses.size > 0) return resolution
         if (resolution.succeeded) sawNoData = true
@@ -473,15 +485,16 @@ fun dnsResolve(
     server: string = "",
     serverPort: int = 53,
     configurationPath: string = "/etc/resolv.conf",
-    hostsPath: string = "/etc/hosts"
+    hostsPath: string = "/etc/hosts",
+    deadline: int = 0
 ): DnsResolution {
     val ipv6 = dnsResolveType(
         host, 28, timeoutMilliseconds, server, serverPort, configurationPath,
-        hostsPath
+        hostsPath, deadline
     )
     val ipv4 = dnsResolveType(
         host, 1, timeoutMilliseconds, server, serverPort, configurationPath,
-        hostsPath
+        hostsPath, deadline
     )
     val combined: array<DnsAddress> = []
     var index = 0
@@ -508,29 +521,34 @@ fun dnsResolve(
 fun tcpConnectHost(
     host: string,
     port: int,
-    timeoutMilliseconds: int = 5000
+    timeoutMilliseconds: int = 5000,
+    deadline: int = 0
 ): TcpConnection {
     var connection = TcpConnection(-1)
     val ipv4 = ipv4SocketAddress(host, port)
     val ipv6 = ipv6SocketAddress(host, port)
-    if (ipv4.isValid()) connection = tcpConnect(ipv4, timeoutMilliseconds)
+    val initialWait = dnsDeadlineWait(deadline, timeoutMilliseconds)
+    if (initialWait <= 0) return connection
+    if (ipv4.isValid()) connection = tcpConnect(ipv4, initialWait)
     else if (ipv6.isValid()) {
-        connection = tcpConnectIpv6(ipv6, timeoutMilliseconds)
+        connection = tcpConnectIpv6(ipv6, initialWait)
     } else {
-        val resolution = dnsResolve(host, timeoutMilliseconds)
+        val resolution = dnsResolve(host, timeoutMilliseconds, deadline = deadline)
         var index = 0
         while (connection.descriptor < 0 &&
             index < resolution.addresses.size) {
             val address = resolution.addresses[index]
+            val wait = dnsDeadlineWait(deadline, timeoutMilliseconds)
+            if (wait <= 0) return connection
             if (address.family == 6) {
                 connection = tcpConnectIpv6(
                     ipv6SocketAddress(address.address, port),
-                    timeoutMilliseconds
+                    wait
                 )
             } else {
                 connection = tcpConnect(
                     ipv4SocketAddress(address.address, port),
-                    timeoutMilliseconds
+                    wait
                 )
             }
             index = index + 1
