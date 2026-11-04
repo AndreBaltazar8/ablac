@@ -26,10 +26,8 @@ fun main {
 | `id.equals(other)` | compares bytes; class `==` compares object identity |
 
 Parsing checks the form, not a particular version or variant, and accepts the
-nil and max UUIDs. Use `uuidFromBytes` for checked byte construction; the
-language's public `Uuid(bytes)` constructor can also be called directly, so a
-caller must supply exactly 16 bytes. Formatting an invalid direct construction
-returns an empty string.
+nil and max UUIDs. `Uuid()` creates the nil UUID; `uuidFromBytes` is the
+checked way to construct one from bytes. The underlying bytes are private.
 
 UUIDv7 places the timestamp first, so values from different milliseconds sort
 by time when the wall clock moves forward. This implementation draws fresh

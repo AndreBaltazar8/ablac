@@ -23,6 +23,17 @@ for mode in --fast release; do
     "$out/main" || status=$?
     [[ $status -eq 42 ]]
 done
+for invalid in invalid-constructor invalid-field invalid-field-read; do
+    if "$compiler" build "$root/tests/cases/uuid/$invalid.ab" -o "$out/$invalid" --fast --no-cache > "$out/$invalid.log" 2>&1; then
+        echo "UUID: $invalid unexpectedly compiled" >&2
+        exit 1
+    fi
+    if [[ $invalid == invalid-constructor ]]; then
+        grep -q 'constructor.arity:Uuid' "$out/$invalid.log"
+    else
+        grep -Eq 'name.private:Uuid.uuidBytes|E_NAME_PRIVATE' "$out/$invalid.log"
+    fi
+done
 "$compiler" build "$root/tests/cases/uuid/build-wasm.ab" -o "$out/wasm-driver" --no-cache
 "$out/wasm-driver"
 "$compiler" build "$root/tests/cases/uuid/build-wasm-parse.ab" -o "$out/wasm-parse-driver" --no-cache
