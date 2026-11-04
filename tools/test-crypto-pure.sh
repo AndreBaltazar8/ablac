@@ -121,6 +121,8 @@ for ((round = 0; round < rounds; round++)); do
         openssl pkeyutl -decrypt -inkey "$keys/k2048.pem" "${options[@]}" -in "$work/ours" -out "$work/back" 2>/dev/null ||
             fail "openssl refused our $padding"
         compare "encrypt-$padding" "$(hex "$work/back")" "$(hex "$work/secret")"
+        openssl pkeyutl -encrypt -pubin -inkey "$keys/k2048-spki.pem" "${options[@]}" -in "$work/secret" -out "$work/theirs" 2>/dev/null || fail "openssl encryption $padding"
+        compare "decrypt-$padding" "$("$tool" "decrypt-$padding" - "$keys/k2048.pem" "$work/theirs")" "$(hex "$work/secret")"
     done
 done
 [[ $status -ne 0 ]] || echo "ok   openssl cross-check: $rounds rounds"

@@ -1,4 +1,4 @@
-// RSA with no OpenSSL: PKCS#1 v1.5 and OAEP encryption and verification, PEM, DER, PKCS#8, SPKI and X.509
+// RSA with no OpenSSL: PKCS#1 v1.5 and OAEP encryption, decryption and verification, PEM, DER, PKCS#8, SPKI and X.509
 // public keys, and PKCS#1 v1.5 signing with blinding on constant-time arithmetic (abla/crypto/bignum). The
 // names are abla/crypto/hosted's. What each protects against is in docs/stdlib/security-and-dates.md.
 
@@ -589,7 +589,7 @@ fun RsaPublicKey.encryptOaepSha1Legacy(plaintext: string): CryptoResult {
 }
 
 /** RSAES-PKCS1-v1_5, which AT's clients use for the WS-Security Nonce. Use it only where the protocol leaves
- *  no choice; the danger is in decrypting, and this module doesn't decrypt. Randomized. */
+ *  no choice; exposing decryption success can create a padding oracle. Randomized. */
 fun RsaPublicKey.encryptPkcs1Legacy(plaintext: string): CryptoResult {
     if (!this.ok()) return cryptoFailed(this.error)
     if (this.bits < rsaLegacyMinimumBits) return cryptoFailed("the key has under 1024 bits")
@@ -606,4 +606,102 @@ fun RsaPublicKey.encryptPkcs1Legacy(plaintext: string): CryptoResult {
     }
     val encrypted = rsaPublicOperation(this, "\x00\x02" + filler + "\x00" + plaintext)
     if (encrypted == "") cryptoFailed("the input is too long for this key") else CryptoResult(encrypted, true, "")
+}
+
+// The delimiter and validity remain secret until the whole block has been inspected.
+// A zero result means invalid; valid delimiters are at least byte 10.
+@inline trusted fun rsaPkcs1Delimiter(address: int, size: int): secretU32 {
+    var good = ctEq(secretU32(u32(ablaUnsafeLoadU8(bnPointer(address)))), secretU32(u32(0)))
+    good = good & ctEq(secretU32(u32(ablaUnsafeLoadU8(bnPointer(address + 1)))), secretU32(u32(2)))
+    var seen = secretU32(u32(0))
+    var delimiter = secretU32(u32(0))
+    for (i in 2 until size) {
+        val zero = ctIsZero(secretU32(u32(ablaUnsafeLoadU8(bnPointer(address + i)))))
+        delimiter = ctSelect(zero & ~seen, secretU32(u32(i)), delimiter)
+        seen = seen | zero
+    }
+    good = good & seen & ~ctLt(delimiter, secretU32(u32(10)))
+    ctSelect(good, delimiter, secretU32(u32(0)))
+}
+
+// `block` is OAEP DB; `expected` is lHash. Inspect every byte before revealing validity.
+@inline trusted fun rsaOaepDelimiter(block: int, size: int, expected: int, hashSize: int, first: u8): secretU32 {
+    var difference = secretU32(u32(first))
+    for (i in 0 until hashSize) {
+        difference = difference | (secretU32(u32(ablaUnsafeLoadU8(bnPointer(block + i)))) ^
+            secretU32(u32(ablaUnsafeLoadU8(bnPointer(expected + i)))))
+    }
+    var seen = secretU32(u32(0))
+    var bad = secretU32(u32(0))
+    var delimiter = secretU32(u32(0))
+    for (i in hashSize until size) {
+        val byte = secretU32(u32(ablaUnsafeLoadU8(bnPointer(block + i))))
+        val zero = ctIsZero(byte)
+        val one = ctEq(byte, secretU32(u32(1)))
+        bad = bad | (~seen & ~(zero | one))
+        delimiter = ctSelect(one & ~seen, secretU32(u32(i)), delimiter)
+        seen = seen | one
+    }
+    val good = ctIsZero(difference) & ctIsZero(bad) & seen
+    ctSelect(good, delimiter, secretU32(u32(0)))
+}
+
+private val RSA_DECRYPT_FAILED = "RSA decryption failed"
+
+// Ciphertext is public; reject non-canonical representatives before the private operation.
+trusted fun rsaDecryptBlock(key: RsaPrivateKey, ciphertext: string): CryptoResult {
+    val size = key.modulus.size
+    if (ciphertext.size != size) return cryptoFailed(RSA_DECRYPT_FAILED)
+    var smaller = false
+    var different = false
+    for (i in 0 until size) {
+        if (!different && ciphertext[i] != key.modulus[i]) {
+            different = true
+            smaller = int(ciphertext[i]) < int(key.modulus[i])
+        }
+    }
+    if (!smaller) return cryptoFailed(RSA_DECRYPT_FAILED)
+    rsaPrivateOperation(key, ciphertext)
+}
+
+trusted fun rsaDecryptOaep(key: RsaPrivateKey, ciphertext: string, hash: (string) -> string, hashSize: int): CryptoResult {
+    if (key.modulus.size < 2 * hashSize + 2) return cryptoFailed(RSA_DECRYPT_FAILED)
+    val decrypted = rsaDecryptBlock(key, ciphertext)
+    if (!decrypted.ok) return decrypted
+    val encoded = decrypted.bytes
+    val maskedSeed = encoded.slice(1, 1 + hashSize)
+    val maskedBlock = encoded.slice(1 + hashSize, encoded.size)
+    val seed = binaryXor(maskedSeed, rsaMgf1(maskedBlock, hashSize, hash))
+    val block = binaryXor(maskedBlock, rsaMgf1(seed, maskedBlock.size, hash))
+    val expected = hash("")
+    val delimiter = rsaOaepDelimiter(ablaUnsafeStringAddress(block), block.size,
+        ablaUnsafeStringAddress(expected), hashSize, u8(encoded[0])).declassify()
+    if (delimiter == u32(0)) return cryptoFailed(RSA_DECRYPT_FAILED)
+    CryptoResult(block.slice(int(delimiter) + 1, block.size), true, "")
+}
+
+/** RSAES-OAEP with SHA-256 and an empty label, on a key of at least 2048 bits. */
+trusted fun RsaPrivateKey.decryptOaepSha256(ciphertext: string): CryptoResult {
+    if (!this.ok()) return cryptoFailed(this.error)
+    if (this.bits < rsaMinimumBits) return cryptoFailed("the key has under 2048 bits")
+    rsaDecryptOaep(this, ciphertext, { data: string -> sha256(data) }, 32)
+}
+
+/** RSAES-OAEP with SHA-1 and an empty label, for legacy interoperability. */
+trusted fun RsaPrivateKey.decryptOaepSha1Legacy(ciphertext: string): CryptoResult {
+    if (!this.ok()) return cryptoFailed(this.error)
+    if (this.bits < rsaLegacyMinimumBits) return cryptoFailed("the key has under 1024 bits")
+    rsaDecryptOaep(this, ciphertext, { data: string -> sha1(data) }, 20)
+}
+
+/** RSAES-PKCS1-v1_5 for legacy protocols. Revealing success or plaintext length can create a padding oracle. */
+trusted fun RsaPrivateKey.decryptPkcs1Legacy(ciphertext: string): CryptoResult {
+    if (!this.ok()) return cryptoFailed(this.error)
+    if (this.bits < rsaLegacyMinimumBits) return cryptoFailed("the key has under 1024 bits")
+    val decrypted = rsaDecryptBlock(this, ciphertext)
+    if (!decrypted.ok) return decrypted
+    val encoded = decrypted.bytes
+    val delimiter = rsaPkcs1Delimiter(ablaUnsafeStringAddress(encoded), encoded.size).declassify()
+    if (delimiter == u32(0)) return cryptoFailed(RSA_DECRYPT_FAILED)
+    CryptoResult(encoded.slice(int(delimiter) + 1, encoded.size), true, "")
 }

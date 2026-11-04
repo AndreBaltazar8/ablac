@@ -113,9 +113,10 @@
 
 - [ ] **abla-pdf still carries its own unblinded RSA for signing.** It could move to the released
   `abla/crypto/rsa`, as abla-saft has done.
-- [ ] **`abla/crypto/rsa` has no decryption** (OAEP, PKCS#1 v1.5), so `tests/vectors/crypto/rsa.txt`'s `decrypt-`
-  lines aren't run on it. Manger and Marvin are why it isn't a short addition: padding has to be checked
-  with masks and the failure made implicit. Nor does it read encrypted PEM or PKCS#12.
+- [ ] **Add implicit rejection to `abla/crypto/rsa` PKCS#1 v1.5 decryption.** Its full padding scan uses
+  masks, but `decryptPkcs1Legacy` exposes padding success and plaintext length: a remote observer can use that
+  as a padding oracle. A deterministic key- and ciphertext-derived synthetic plaintext needs a separate design.
+  The pure module also does not read encrypted PEM or PKCS#12.
 - [ ] **No timing measurements of abla/crypto.** `tools/test-ct.sh` reads the assembly; nothing has run a statistical
   test (`dudect`) on real hardware, or anything at all on an ESP32-S3. The Xtensa path is compiled and read only.
 - [ ] **`--fast` builds aren't read by `tools/test-ct.sh`**: the checker stops at their calls. It could follow
@@ -247,7 +248,8 @@ Package-side work (not changed from ablac):
 - [ ] **Cached small blocks cannot be reused for another size.** Since v0.2.31 the free lists
   (`__ablaRuntimeHostSmallLists`) retain about 32 MiB at most; later frees return to the system, but retained blocks
   remain on their size's list and `malloc_trim` can't reach them. A program whose allocation sizes shift may retain
-  the old sizes' memory. Empty chunks could be returned at a collection. Before the cap, measurements on 2026-11-01
+  the old sizes' memory. Cross-class miss frequency is unmeasured; bounded next-class fallback needs physical-capacity
+  metadata. Before the cap, measurements on 2026-11-01
   showed peak RSS against malloc for each: trees, strings and maps 7 to 19% lower, json-readers 33% higher
   (137 to 182 MB), json-megabyte varying between runs (190 to 319 MB against 243 to 308); remeasure with the cap.
 - [ ] **Run times of non-Linux hosted targets aren't measured with the new allocator and root frames.** macOS keeps
