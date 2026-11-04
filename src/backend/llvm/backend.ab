@@ -1,4 +1,5 @@
 import "../../module_paths.ab"
+import "../../codegen_units.ab"
 import "simd.ab"
 import "exports.ab"
 import "../../diagnostic_positions.ab"
@@ -133,6 +134,7 @@ fun bootstrapEmitLlvmProgramPrepared(
 ): BootstrapLlvmEmission {
     bootstrapLlvmTraceMemory("program.begin")
     bootstrapLlvmParameterDefaultsReset()
+    bootstrapLlvmFloatReflectionDemand = false
     bootstrapLlvmInlineAssembly = []
     bootstrapLlvmProgramUsesSimd = bootstrapTextContains(targetTriple, "wasm32") &&
         bootstrapLlvmProgramHasSimd(program)
@@ -487,6 +489,29 @@ fun bootstrapEmitLlvmProgramPrepared(
             bootstrapLlvmInlineAssembly.size > 0
         )
         bootstrapLlvmTraceMemory("wrappers.end")
+        // The flag is module-wide: descriptors and erased arrays can cross
+        // functions and later codegen partitions. Resolve it only after late
+        // wrapper emission, before optimization or partitioning.
+        val floatReflection = LLVMGetNamedGlobal(backend.module, "abla_float_reflection_demand")
+        if (!pointerIsNull(floatReflection)) {
+            val enabled = LLVMConstInt(backend.i1Type, if (bootstrapLlvmFloatReflectionDemand) 1 else 0, 0)
+            var use = LLVMGetFirstUse(floatReflection)
+            while (!pointerIsNull(use)) {
+                val load = LLVMGetUser(use)
+                LLVMReplaceAllUsesWith(load, enabled)
+                LLVMInstructionEraseFromParent(load)
+                use = LLVMGetFirstUse(floatReflection)
+            }
+            LLVMDeleteGlobal(floatReflection)
+        }
+        val reflectionFlagIndex = functionIndex.find("ablaRuntimeFloatReflectionEnabled")
+        if (reflectionFlagIndex >= 0) {
+            val flagFunction = LLVMGetNamedFunction(backend.module,
+                bootstrapLlvmDirectFunctionSymbol(identities.symbols[reflectionFlagIndex]))
+            if (!pointerIsNull(flagFunction) && pointerIsNull(LLVMGetFirstUse(flagFunction))) {
+                LLVMDeleteFunction(flagFunction)
+            }
+        }
         bootstrapLlvmBridgeValuesByPointer(backend, program)
         bootstrapLlvmEmitStackGuardHandler(backend)
         bootstrapLlvmEmitDebugRuntime(backend)

@@ -1,7 +1,7 @@
 # Type-directed float identity at erasure boundaries
 
-Status: design approved; scalar-boundary phase (a) is implemented for review,
-2026-11-04. Collection boundaries, formatting and JIT lifting remain open.
+Status: scalar-boundary phase (a) and collection-boundary phase (b) are
+implemented for review, 2026-11-04. Formatting and JIT lifting remain open.
 Before phase (a), native `any` boxes used the same integer tag and auxiliary
 word for floats and integers. Phase (a) preserves scalar float kinds at the
 covered boundaries; dynamic interpolation still formats their payload bits as
@@ -55,6 +55,14 @@ change integer/float array kinds or add a branch to every typed array access.
 Mixed containers, resizing, generic stores, boxed fallbacks and GC tracing
 need explicit validation. If an ambiguous container cannot prove a type,
 keep each full boxed value rather than silently dropping its discriminator.
+
+Phase (b) records floating kind in otherwise unused field-descriptor bits,
+and carries the element kind and nesting depth in an erased array value's
+auxiliary word. Typed array elements and field payloads keep their layout.
+Only dynamic reads use that metadata; they enter separate helpers when an
+emitted descriptor or array-erasure operation requires them. Emission fixes
+this decision before optimization and codegen partitioning, so ordinary
+integer-only dynamic reads keep the original implementation.
 
 The proposed internal representation is not a stable external object ABI.
 Version whole-object, partition, unit and compile-time caches or protocols as
@@ -111,9 +119,7 @@ baseline/candidate pair; repeat measurements on one P-core and keep raw data.
   behavior. Use negative controls that fail against the old compiler. Check
   optimized output and self-rebuild stability in the normal integration gates.
 
-Open questions before coding: the IR representation of generic conversions,
-the metadata needed for reflective dense reads without slowing typed accesses,
-and a sound reachability boundary for unknown producers. Prototype these on
-small programs and report any lost type or budget failure before broadening
+The remaining open question is a sound formatter reachability boundary for
+unknown producers. Report any lost type or budget failure before broadening
 the change. The earlier global-flag prototype is retained separately as a
 negative result, not an implementation to ship.

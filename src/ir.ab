@@ -1199,7 +1199,8 @@ class BootstrapIrClass(
 // A field's place packs its offset (bits 0-31), kind (32-39) and tag (40-47),
 // and sets bit 48 (what tells it from a field's index, which code an older
 // compiler made passes); typed field accesses carry it (as the instruction's
-// target), so the runtime addresses the field without a lookup.
+// target), so the runtime addresses the field without a lookup. Bits 49-62
+// record the floating kind and array depth for dynamically read fields.
 val BOOTSTRAP_IR_FIELD_BOXED = 0
 val BOOTSTRAP_IR_FIELD_WORD = 1
 val BOOTSTRAP_IR_FIELD_BOOL = 2
@@ -1212,6 +1213,29 @@ fun bootstrapIrFieldPlace(offset: int, kind: int, tag: int): int =
     offset + kind * 4294967296 + tag * 1099511627776 + 281474976710656
 
 fun bootstrapIrFieldPlaceKind(place: int): int = (place / 4294967296) % 256
+
+// In a tag-7 value, 1 and 2 describe a dense f32 or f64 array. Each
+// additional two describes another array level around that dense array.
+fun bootstrapIrFloatArrayKind(
+    type: string, declarations: array<BootstrapDeclaration>,
+    typeDeclarations: BootstrapFunctionDeclarationIndex
+): int {
+    var element = type
+    var depth = 0
+    while (bootstrapIsArrayType(element)) {
+        depth = depth + 1
+        element = bootstrapArrayElementType(element)
+        if (bootstrapIsNullableType(element)) element = bootstrapNullableElementType(element)
+    }
+    val declaration = typeDeclarations.find(element)
+    if (declaration >= 0 && declarations[declaration].kind == "type") {
+        element = bootstrapNormalizeType(declarations[declaration].resultType)
+    }
+    if (depth == 0 || depth > 8191) return 0
+    if (element == "f32") return 1 + (depth - 1) * 2
+    if (element == "f64") return 2 + (depth - 1) * 2
+    0
+}
 
 fun bootstrapIrFieldKindSize(kind: int): int =
     if (kind == BOOTSTRAP_IR_FIELD_BOXED) 24
@@ -1237,25 +1261,39 @@ fun bootstrapIrReferenceTag(
     if (declaration.kind == "class" && bootstrapRuntimeValueSpec(declaration) == "") 8 else 0
 }
 
-/** How a field of `type` (normalized) is stored: kind + 256 * tag. */
+/** A field's storage: kind + 256 * tag + 65536 * dynamic float kind. */
 fun bootstrapIrFieldStorage(
     declarations: array<BootstrapDeclaration>,
     typeDeclarations: BootstrapFunctionDeclarationIndex,
     type: string
 ): int {
-    if (type == "i64" || type == "f64" || type == "f32" || bootstrapIrRawPointerType(type)) {
+    if (type == "f32") return BOOTSTRAP_IR_FIELD_WORD + 65536
+    if (type == "f64") return BOOTSTRAP_IR_FIELD_WORD + 131072
+    if (type == "i64" || bootstrapIrRawPointerType(type)) {
         return BOOTSTRAP_IR_FIELD_WORD
     }
     if (type == "bool") return BOOTSTRAP_IR_FIELD_BOOL
     if (type == "string") return BOOTSTRAP_IR_FIELD_STRING
     val nullable = bootstrapIsNullableType(type)
+    val core = if (nullable) bootstrapNullableElementType(type) else type
+    if (nullable && (core == "f32" || core == "f64")) {
+        return BOOTSTRAP_IR_FIELD_BOXED + 65536 * (if (core == "f32") 1 else 2)
+    }
+    val nominal = typeDeclarations.find(core)
+    if (nominal >= 0 && declarations[nominal].kind == "type") {
+        val underlying = bootstrapNormalizeType(declarations[nominal].resultType)
+        if (underlying == "f32" || underlying == "f64") {
+            return BOOTSTRAP_IR_FIELD_BOXED + 65536 * (if (underlying == "f32") 1 else 2)
+        }
+    }
     val tag = bootstrapIrReferenceTag(
         declarations, typeDeclarations,
-        if (nullable) bootstrapNullableElementType(type) else type
+        core
     )
+    val auxiliary = bootstrapIrFloatArrayKind(core, declarations, typeDeclarations)
     if (tag == 0) BOOTSTRAP_IR_FIELD_BOXED
     else (if (nullable) BOOTSTRAP_IR_FIELD_NULLABLE_REFERENCE else BOOTSTRAP_IR_FIELD_REFERENCE) +
-        256 * tag
+        256 * tag + 65536 * auxiliary
 }
 
 /** A raw pointer type (`i64*`), whose field reads as its address. */
@@ -1301,7 +1339,8 @@ fun bootstrapIrClassLayout(
         while (field < storages.size) {
             val kind = storages[field] % 256
             if ((kind == BOOTSTRAP_IR_FIELD_BOOL) == (round == 1)) {
-                places[field] = bootstrapIrFieldPlace(offset, kind, storages[field] / 256)
+                places[field] = bootstrapIrFieldPlace(offset, kind, (storages[field] / 256) % 256) +
+                    (storages[field] / 65536) * 562949953421312
                 offset = offset + bootstrapIrFieldKindSize(kind)
             }
             field = field + 1
@@ -7513,6 +7552,10 @@ class BootstrapLowerer(
         if (scalar == "f32" || scalar == "f64") return this.emit(
             if (nullable) "value.erase.nullable.float" else "value.erase.float", value, -1, scalar
         )
+        val arrayKind = bootstrapIrFloatArrayKind(scalar, this.declarations, this.typeDeclarations)
+        if (arrayKind != 0) {
+            return this.emit(if (nullable) "value.erase.nullable.array" else "value.erase.array", value, -1, "$arrayKind")
+        }
         value
     }
 
@@ -9666,6 +9709,8 @@ fun bootstrapLowerArray(
     val outline = bootstrapIrGlobalInitializer &&
         expression.end - expression.begin >= BOOTSTRAP_IR_OUTLINED_TABLE
     val elements: array<int> = []
+    val elementType = bootstrapArrayElementType(lowerer.lowerExpressionType(expression))
+    val eraseElements = bootstrapIrIsErasedType(elementType)
     var element = 0
     while (element < expression.children.size) {
         val child = expression.children[element]
@@ -9673,8 +9718,8 @@ fun bootstrapLowerArray(
             if (outline && child.end - child.begin >= BOOTSTRAP_IR_OUTLINED_ELEMENT &&
                 child.kind != "string" && child.kind != "integer" && child.kind != "float" &&
                 child.kind != "float32")
-                bootstrapLowerOutlinedElement(lowerer, child)
-            else lowerer.lowerExpression(child)
+                bootstrapLowerOutlinedElement(lowerer, child, eraseElements)
+            else lowerer.lowerExpression(child, true, eraseElements)
         )
         element = element + 1
     }
@@ -9687,7 +9732,8 @@ fun bootstrapLowerArray(
 // capture), and its call in the initializer.
 fun bootstrapLowerOutlinedElement(
     var lowerer: BootstrapLowerer,
-    expression: BootstrapExpression
+    expression: BootstrapExpression,
+    eraseResult: bool = false
 ): int {
     val instructions: array<BootstrapInstruction> = []
     val parameters: array<string> = []
@@ -9745,7 +9791,7 @@ fun bootstrapLowerOutlinedElement(
         lowerer.inferredResults,
         classFieldPlaces = lowerer.classFieldPlaces
     )
-    val value = elementLowerer.lowerExpression(expression)
+    val value = elementLowerer.lowerExpression(expression, true, eraseResult)
     lowerer.errors = elementLowerer.errors
     val name = "__bootstrap_globals_element_${lowerer.functions.size}"
     val function = bootstrapFinalizeIrFunction(
@@ -11246,9 +11292,10 @@ fun bootstrapLowerIndexAssign(
         lowerer.lowerPlaceProjection(expression.children[0])
     } else lowerer.lowerExpression(expression.children[0])
     val index = lowerer.lowerExpression(expression.children[1])
-    val value = lowerer.lowerExpression(expression.children[2])
     val receiverType = lowerer.lowerExpressionType(expression.children[0])
     val elementType = bootstrapArrayElementType(receiverType)
+    val storedType = bootstrapArrayElementType(bootstrapBorrowElementType(receiverType))
+    val value = lowerer.lowerExpression(expression.children[2], true, bootstrapIrIsErasedType(storedType))
     if (lowerer.lowerTypeIsAffine(elementType)) {
         val previous = lowerer.emit("array.get", receiver, index, "")
         lowerer.emitAffineValueDrop(previous, elementType)
@@ -11296,6 +11343,12 @@ fun bootstrapLowerMemberCall(
         var expected = "unknown"
         if (argument > 0 && method >= 0 && argument - 1 < lowerer.methodDeclarations.declarations[method].parameterTypes.size)
             expected = lowerer.methodDeclarations.declarations[method].parameterTypes[argument - 1]
+        if (argument == 1 && expression.text == "append" && bootstrapIsArrayType(owner))
+            expected = bootstrapArrayElementType(owner)
+        if (expression.text == "set" && bootstrapIsMapType(owner)) {
+            if (argument == 1) expected = bootstrapMapKeyType(owner)
+            if (argument == 2) expected = bootstrapMapValueType(owner)
+        }
         val value = lowerer.lowerExpression(child, true, bootstrapIrIsErasedType(expected))
         arguments.append(value)
         argument = argument + 1

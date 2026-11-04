@@ -7529,6 +7529,11 @@ fun bootstrapLlvmEmitFunction(
     )
     LLVMPositionBuilderAtEnd(backend.builder, entry)
     bootstrapLlvmDebugLocate(debug, backend, functionId, -1)
+    if (function.name == "ablaRuntimeFloatReflectionEnabled") {
+        LLVMBuildRet(backend.builder, LLVMBuildLoad2(backend.builder, backend.i1Type,
+            bootstrapLlvmFloatReflectionFlag(backend), "float.reflection.enabled"))
+        return 0
+    }
     if (backend.noPanicRecovery && function.name == "__ablaRuntimeHostRecover") {
         LLVMBuildRet(backend.builder, LLVMConstInt(backend.i64Type, 0, 0))
         return 0
@@ -7792,20 +7797,22 @@ fun bootstrapLlvmEmitFunction(
                 )
             )
         }
-        if (reachable && (opcode == "value.erase.float" || opcode == "value.erase.nullable.float")) {
+        if (reachable && (opcode == "value.erase.float" || opcode == "value.erase.nullable.float" || opcode == "value.erase.array" || opcode == "value.erase.nullable.array")) {
             matched = true
             bootstrapLlvmCopyValue(backend, storage.values[instruction.left],
                 storage.values[instruction.result], "erased.float")
             val auxiliary = LLVMBuildStructGEP2(backend.builder, backend.valueType,
                 storage.values[instruction.result], 1, "erased.float.kind")
-            val floatKind = LLVMConstInt(backend.i32Type, if (instruction.text == "f32") 1 else 2, 0)
+            val isArray = opcode == "value.erase.array" || opcode == "value.erase.nullable.array"
+            if (isArray) bootstrapLlvmFloatReflectionDemand = true
+            val floatKind = LLVMConstInt(backend.i32Type, if (isArray) bootstrapLlvmParseInteger(instruction.text) else if (instruction.text == "f32") 1 else 2, 0)
             var kind = floatKind
-            if (opcode == "value.erase.nullable.float") {
+            if (opcode == "value.erase.nullable.float" || opcode == "value.erase.nullable.array") {
                 val tagPointer = LLVMBuildStructGEP2(backend.builder, backend.valueType,
                     storage.values[instruction.result], 0, "erased.float.tag")
                 val tag = LLVMBuildLoad2(backend.builder, backend.i32Type, tagPointer, "erased.float.tag.value")
                 val present = LLVMBuildICmp(backend.builder, llvmIntEqual(), tag,
-                    LLVMConstInt(backend.i32Type, 2, 0), "erased.float.present")
+                    LLVMConstInt(backend.i32Type, if (isArray) 7 else 2, 0), "erased.float.present")
                 val original = LLVMBuildLoad2(backend.builder, backend.i32Type, auxiliary, "erased.float.original.kind")
                 kind = LLVMBuildSelect(backend.builder, present, floatKind, original, "erased.float.nullable.kind")
             }
@@ -8479,7 +8486,11 @@ fun bootstrapLlvmEmitFunction(
             matched = true
             val called = functionIndex.find(instruction.text)
             if (called < 0) supported = false
-            if (called >= 0) {
+            if (called >= 0 && instruction.text == "ablaRuntimeFloatReflectionEnabled") {
+                bootstrapLlvmSetNativeValue(backend, storage, instruction.result,
+                    LLVMBuildLoad2(backend.builder, backend.i1Type,
+                        bootstrapLlvmFloatReflectionFlag(backend), "float.reflection.enabled"))
+            } else if (called >= 0) {
                 val calledIsScalar = bootstrapLlvmDirectResultIsScalar(
                     program.functions[called]
                 )
@@ -9054,6 +9065,20 @@ fun bootstrapLlvmSoftwareRounding(
     floor
 }
 
+// Finalized after all reachable bodies and wrappers have been emitted.
+var bootstrapLlvmFloatReflectionDemand: bool = false
+
+fun bootstrapLlvmFloatReflectionFlag(backend: BootstrapLlvmBackend): i64* {
+    var flag = LLVMGetNamedGlobal(backend.module, "abla_float_reflection_demand")
+    if (pointerIsNull(flag)) {
+        flag = LLVMAddGlobal(backend.module, backend.i1Type, "abla_float_reflection_demand")
+        LLVMSetInitializer(flag, LLVMConstInt(backend.i1Type, 0, 0))
+        LLVMSetGlobalConstant(flag, 1)
+        LLVMSetLinkage(flag, llvmInternalLinkage())
+    }
+    flag
+}
+
 // Class `irClass`'s descriptor (the runtime's instance layout, self/entry.ab):
 // a private constant of this module, made on its first use.
 fun bootstrapLlvmClassDescriptor(
@@ -9068,11 +9093,12 @@ fun bootstrapLlvmClassDescriptor(
     var traced = 0
     for (field in 0 until irClass.fields.size) {
         val place = irClass.fieldPlaces[field]
+        if ((place >> 49) != 0) bootstrapLlvmFloatReflectionDemand = true
         val kind = bootstrapIrFieldPlaceKind(place)
         words.append(bootstrapLlvmStableNameId(irClass.fields[field]))
         words.append(place % 4294967296)
         words.append(kind)
-        words.append((place / 1099511627776) % 256)
+        words.append((place / 1099511627776) % 256 + (place / 562949953421312) * 512)
         if (kind == BOOTSTRAP_IR_FIELD_BOXED || kind == BOOTSTRAP_IR_FIELD_STRING ||
             kind == BOOTSTRAP_IR_FIELD_REFERENCE ||
             kind == BOOTSTRAP_IR_FIELD_NULLABLE_REFERENCE) traced = traced + 1
