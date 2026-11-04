@@ -51,6 +51,12 @@ output=$("$output_directory/static-table-address") ||
 [[ $output == $'8\ntrue' ]] ||
     { echo "init order: static-table-address output:"; echo "$output"; exit 1; }
 
+"$compiler" build "$cases/static-table-address-aliased.ab" -o "$output_directory/static-table-address-aliased"
+output=$("$output_directory/static-table-address-aliased") ||
+    { echo "init order: static-table-address-aliased exited with $?"; exit 1; }
+[[ $output == '8' ]] ||
+    { echo "init order: static-table-address-aliased output:"; echo "$output"; exit 1; }
+
 rejected() { # $1 = case, then the texts its diagnostics must contain
     local name=$1; shift
     if "$compiler" build "$cases/$name.ab" -o "$output_directory/invalid" \
