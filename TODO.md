@@ -83,6 +83,20 @@
   `bootstrapSourceReachableDeclarations` walks every method of a reached class, and the lowering loop lowers them all, by declaration.
   It needs method-level demand in both, by called name, with what lowering inserts by itself (operators, iterators, delegates, drops)
   counted. Weigh against what removing dead functions before opt did to inlining ("`make test` under 2 minutes", below).
+  Counting-only screen on `cf41f7f3` (2026-11-04): conservative called-name demand would skip 7/716 currently
+  source-reachable method bodies in the compiler, 35/134 in abla-one's gallery/web, 3/89 in the frozen NovaKind tool,
+  and none in the da5a939 firmware fixture. These are existing bodies absent from a shadow graph, not net savings:
+  conservative called-name expansion also reaches extra classes. Their raw-IR shares are only 0.060%, 2.19% and 0.189%.
+  Abla-one's three alternating baseline/instrumentation-off build pairs produced identical binaries: baseline median
+  36.945G instructions / 3.03 s / 496,760 stripped bytes. Its 2,235/102,018 removable IR lines project about 0.066 s
+  of build saving (2.19%), below the agreed 5% threshold; all 35 method symbols are already absent after O2.
+  Only abla-one loses globals: `oneMemoScope=""`, `oneMemoBuilds=0`, `oneMemoKeys=[]`, `oneMemoEntries=[]`.
+  A scratch IR replay replacing the two empty-array initializations saved 64 bytes (496,744 -> 496,680; 0.013%),
+  with exact rendered HTML/stdout, below the 2% size threshold. This is an estimate, not a lowering implementation.
+  Firmware's shadow graph conservatively keeps everything after `compiler.findFunction(sourceName)` in the
+  compile-time metadata helpers in `abla/build`; that is not evidence of arbitrary runtime method reflection.
+  Stopped without compiler changes: these inputs do not justify the reachability/drop/CT correctness risk.
+  Raw counting pass, inputs, paired measurements and report: `worktrees/ablac-method-demand/build/method-lab/`.
 - [ ] Once during `make test` (2026-11-01), `tools/test-ct.sh` saw `python3: No such file or directory`
       and `suite-package-providers` failed to resolve a local git dependency, with neither recurring
       in the next runs. Suspected: the Nix profile changing mid-run. Not confirmed, but during a `home-manager switch`
