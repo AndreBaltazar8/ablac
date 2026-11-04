@@ -26,6 +26,15 @@ status=$?
 set -e
 [[ $status -eq 42 ]] || exit 1
 
+# Literal memo hits and misses retain exact bits and contextual f32/f64 widths.
+"$compiler" build "$project_root/tests/cases/modules/compile-time-literal-words.ab" \
+    -o "$output_directory/literal-words" --fast --no-cache
+set +e
+"$output_directory/literal-words"
+status=$?
+set -e
+[[ $status -eq 42 ]] || exit 1
+
 # A 20000-entry table evaluates whole (it stopped at 100000 steps).
 "$compiler" build "$project_root/tests/cases/modules/compile-time-tables.ab" \
     -o "$output_directory/tables" --no-cache
