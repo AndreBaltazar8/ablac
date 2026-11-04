@@ -231,7 +231,9 @@ trusted fun rsaPrivateFromNumbers(
             "\x00".repeat(width - p.size) + p + "\x00".repeat(width - q.size) + q +
             "\x00".repeat(width - dp.size) + dp + "\x00".repeat(width - dq.size) + dq)
     }
-    val total = words * 5 + 8
+    // Parsed/generated keys retain d in the same wiped allocation. Number-only
+    // keys have no d, indicated by the shorter allocation.
+    val total = words * 5 + 8 + (if (privateExponent != "") words * 2 else 0)
     val memory = bnAllocate(total)
     val key = RsaPrivateKey(modulus, exponent, bits, "", memory, words, total)
     bnFromBytes(key.primeP(), words, ablaUnsafeStringAddress(p), p.size)
@@ -240,6 +242,10 @@ trusted fun rsaPrivateFromNumbers(
     bnFromBytes(key.exponentQ(), words, ablaUnsafeStringAddress(dq), dq.size)
     bnFromBytes(key.inverseQ(), words, ablaUnsafeStringAddress(qInverse), qInverse.size)
     bnFromBytes(key.rejectionKey(), 8, ablaUnsafeStringAddress(rejectionDigest), 32)
+    if (privateExponent != "") bnFromBytes(
+        memory + (words * 5 + 8) * 4, words * 2,
+        ablaUnsafeStringAddress(privateExponent), privateExponent.size
+    )
     if (!rsaPrivateIsConsistent(key)) {
         // key's drop wipes and frees its memory.
         val failed = rsaPrivateFailed(RSA_CHECK_FAILED)
@@ -305,6 +311,70 @@ trusted fun rsaPrivateKeyFromPem(pem: string): RsaPrivateKey {
     if (label == "PRIVATE KEY") return rsaPrivateFromPkcs8(der, unreadable)
     if (label == "RSA PRIVATE KEY") return rsaPrivateFromPkcs1(der, 0, der.size, unreadable)
     rsaPrivateFailed(if (label == "EC PRIVATE KEY") "not an RSA key" else unreadable)
+}
+
+// Internal until key generation exposes export. Export deliberately creates
+// ordinary strings containing private material; unlike the key allocation,
+// these strings cannot be wiped on drop.
+private fun rsaExportLength(length: int): string {
+    if (length < 128) return byteEncode(length)
+    var value = length
+    var bytes = ""
+    while (value > 0) {
+        bytes = byteEncode(value & 255) + bytes
+        value = value >> 8
+    }
+    byteEncode(128 + bytes.size) + bytes
+}
+
+private fun rsaExportItem(tag: int, contents: string): string =
+    byteEncode(tag) + rsaExportLength(contents.size) + contents
+
+private fun rsaExportInteger(raw: string): string {
+    var first = 0
+    while (first + 1 < raw.size && int(raw[first]) == 0) first = first + 1
+    val number = raw.slice(first, raw.size)
+    val positive = if (number == "") "\x00"
+        else if ((int(number[0]) & 128) != 0) "\x00" + number else number
+    rsaExportItem(2, positive)
+}
+
+private trusted fun rsaExportLimbs(address: int, words: int): string {
+    val buffer = nativeByteBuffer(words * 4 + 1)
+    bnToBytes(ablaUnsafePointerAddress(buffer.pointerAt(0)), words * 4, address)
+    buffer.adoptString(words * 4)
+}
+
+private trusted fun rsaPrivateExportDer(key: RsaPrivateKey): CryptoResult {
+    if (!key.ok()) return cryptoFailed("invalid RSA private key")
+    val words = key.primeWords
+    if (key.fieldWords == words * 5 + 8) return cryptoFailed("RSA private exponent is unavailable")
+    val d = key.memory + (words * 5 + 8) * 4
+    val pkcs1 = rsaExportItem(48, "\x02\x01\x00" +
+        rsaExportInteger(key.modulus) + rsaExportInteger(key.publicExponent) +
+        rsaExportInteger(rsaExportLimbs(d, words * 2)) +
+        rsaExportInteger(rsaExportLimbs(key.primeP(), words)) +
+        rsaExportInteger(rsaExportLimbs(key.primeQ(), words)) +
+        rsaExportInteger(rsaExportLimbs(key.exponentP(), words)) +
+        rsaExportInteger(rsaExportLimbs(key.exponentQ(), words)) +
+        rsaExportInteger(rsaExportLimbs(key.inverseQ(), words)))
+    val algorithm = rsaExportItem(48, rsaExportItem(6, OID_RSA) + "\x05\x00")
+    CryptoResult(rsaExportItem(48, "\x02\x01\x00" + algorithm +
+        rsaExportItem(4, pkcs1)), true, "")
+}
+
+private trusted fun rsaPrivateExportPem(key: RsaPrivateKey): CryptoResult {
+    val der = rsaPrivateExportDer(key)
+    if (!der.ok) return der
+    val encoded = base64Encode(der.bytes)
+    var body = ""
+    var at = 0
+    while (at < encoded.size) {
+        val end = if (at + 64 < encoded.size) at + 64 else encoded.size
+        body = body + encoded.slice(at, end) + "\n"
+        at = end
+    }
+    CryptoResult("-----BEGIN PRIVATE KEY-----\n" + body + "-----END PRIVATE KEY-----\n", true, "")
 }
 
 fun bodyHasHeaders(body: string): bool = pemFind(body, "Proc-Type:", 0) >= 0
