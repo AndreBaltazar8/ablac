@@ -143,3 +143,36 @@ for round in cold warm; do
     grep -qx '4 passed, 0 failed' "$work/mutation-$round.out" || fail "the discovery-mutation results"
 done
 echo 'test bundle: discovery is scoped before test execution, including same-size edits with restored mtime'
+
+# An unchanged generated bundle is a stable source input. Compare content,
+# not timestamps, and regenerate a file whose bytes were replaced.
+stable="$work/stable"
+mkdir -p "$stable"
+for name in one two; do
+    printf '%s\n' 'fun main: int = 0' > "$stable/$name.test.ab"
+done
+"$compiler" test -v "$stable" > "$work/stable-first.out" 2> "$work/stable-first.err" || fail 'initial stable bundle'
+stable_output=$(paths "$work/stable-first.out")
+[[ -n $stable_output && $(printf '%s\n' "$stable_output" | wc -l) -eq 1 ]] || fail 'one stable bundle'
+stable_root="$stable_output.ab"
+python3 - "$stable_root" "$work/stable-state.json" <<'PY'
+import hashlib, json, pathlib, sys
+p = pathlib.Path(sys.argv[1]); s = p.stat()
+pathlib.Path(sys.argv[2]).write_text(json.dumps([s.st_dev, s.st_ino, s.st_mtime_ns, hashlib.sha256(p.read_bytes()).hexdigest()]))
+PY
+"$compiler" test -v "$stable" > "$work/stable-again.out" 2> "$work/stable-again.err" || fail 'unchanged stable bundle'
+python3 - "$stable_root" "$work/stable-state.json" <<'PY'
+import hashlib, json, pathlib, sys
+p = pathlib.Path(sys.argv[1]); s = p.stat()
+assert [s.st_dev, s.st_ino, s.st_mtime_ns, hashlib.sha256(p.read_bytes()).hexdigest()] == json.loads(pathlib.Path(sys.argv[2]).read_text()), 'unchanged generated bundle was rewritten'
+p.write_text('invalid generated input\n')
+PY
+"$compiler" test -v "$stable" > "$work/stable-repair.out" 2> "$work/stable-repair.err" || fail 'repaired stable bundle'
+python3 - "$stable_root" "$work/stable-state.json" <<'PY'
+import hashlib, json, pathlib, sys
+assert hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest() == json.loads(pathlib.Path(sys.argv[2]).read_text())[3], 'generated bundle was not repaired'
+PY
+for run in first again repair; do
+    grep -qx '2 passed, 0 failed' "$work/stable-$run.out" || fail "stable bundle results ($run)"
+done
+echo 'test bundle: unchanged generated input keeps its inode and mtime, changed content is regenerated'
