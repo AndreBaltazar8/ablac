@@ -22,9 +22,14 @@ cp -R tests/cases/ct "$cases"
 # the generated fixture's own module, never through a public test hook.
 sed -n '/^\/\/ BEGIN RSA SECRET BIGNUM PRIMITIVES$/,/^\/\/ END RSA SECRET BIGNUM PRIMITIVES$/p' stdlib/abla/crypto/rsa/entry.ab >> "$cases/fixture.ab"
 sed -n '/^\/\/ BEGIN PBE SECRET CORES$/,/^\/\/ END PBE SECRET CORES$/p' stdlib/abla/crypto/pbe/entry.ab >> "$cases/fixture.ab"
+# Source-generated coverage for loops around the previously checked primitives.
+# No production edits or call exemptions: see generator's scope guards.
+python3 "$cases/crypto-source-fixtures.py" "$cases/crypto-generated.ab"
+cat "$cases/crypto-generated.ab" >> "$cases/fixture.ab"
 # Staged build drivers need the scratch fixture paths as well.
 sed -i 's@tests/cases/ct/@build/ct/cases/@g' "$cases/build.ab" "$cases/aarch64-build.ab"
 python3 -I tools/ct/test-check-asm.py
+python3 -I tools/ct/test-source-fixtures.py
 
 fixtures=(
     ct_fix_select_u32:0,1,2 ct_fix_select_u64:0,1,2 ct_fix_select_u8:0,1,2
@@ -47,10 +52,12 @@ for width in 1 3 128; do
     fixtures+=("ct_fix_inverse_$width:@0,@1" "ct_fix_gcd_$width:@0,@1"
                "ct_fix_divsteps_$width:@0,@1" "ct_fix_wide_$width:@0,@1")
 done
+while IFS= read -r spec; do fixtures+=("$spec"); done < "$cases/crypto-generated.good"
 # Xtensa passes later pointer parameters on the stack; its checker cannot yet
 # taint those parameters, so this separate-pointer shape is read on these ABIs.
 host_fixtures=(ct_fix_wide_separate:@0,@1,@2,@3,@5)
 leaks=(ct_leak_branch:0 ct_leak_index:0 ct_leak_compare:@0,@1 ct_leak_divide:0,1 ct_pbe_leak:@0)
+while IFS= read -r spec; do leaks+=("$spec"); done < "$cases/crypto-generated.leaks"
 
 # Hand-written spill regressions ensure the test includes the actual assembly pattern.
 llvm-mc -triple x86_64-linux-gnu -filetype=obj "$cases/pointer-spill-x86.s" -o "$out/pointer-spill-x86.o"
@@ -91,6 +98,13 @@ read_target() { # arch, object
             echo "ct: the checker missed $leak on $arch" >&2; exit 1
         fi
         grep -q '^LEAK' "$out/$arch-leak.log" || { cat "$out/$arch-leak.log" >&2; exit 1; }
+        # A rejected call/unknown instruction is not evidence that our generated
+        # twin's deliberate secret-index store was detected.
+        if grep -qF "$leak" "$cases/crypto-generated.leaks"; then
+            grep -Eq 'secret (address|memory|index)' "$out/$arch-leak.log" || {
+                cat "$out/$arch-leak.log" >&2; echo "ct: expected secret-index detection for $leak" >&2; exit 1;
+            }
+        fi
     done
     echo "ok   $arch: ${#target_fixtures[@]} fixtures clean in the assembly, ${#leaks[@]} leaks caught"
 }
