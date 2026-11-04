@@ -17,6 +17,7 @@ check="python3 -I tools/ct/check-asm.py"
 cd "$project_root"
 rm -rf "$out"
 mkdir -p "$out"
+python3 -I tools/ct/test-check-asm.py
 
 fixtures=(
     ct_fix_select_u32:0,1,2 ct_fix_select_u64:0,1,2 ct_fix_select_u8:0,1,2

@@ -36,7 +36,11 @@ def disassemble(path, name, extra=()):
         if active and line.strip():
             m = re.match(r"^\s*([0-9a-f]+):\s*(.*)$", line)
             if m:
-                lines.append((int(m.group(1), 16), m.group(2).split("#")[0].split("//")[0].strip()))
+                # AArch64 uses # for immediates, including stack offsets; only
+                # a whitespace-delimited # comment is an x86 disassembly comment.
+                instruction = m.group(2).split("//")[0]
+                instruction = re.sub(r"\s+#\s+.*$", "", instruction).strip()
+                lines.append((int(m.group(1), 16), instruction))
     if not lines:
         raise SystemExit(f"{name}: no such function in {path}")
     return lines
@@ -217,7 +221,9 @@ def check_x86(lines, secret, pointers):
             state.add("ptr:" + x86_reg(ops[1]))
             return frozenset(state)
         inputs = any(read(o) for o in ops[:-1]) if ops else False
-        if ops and X86_READWRITE.match(op):
+        # Three-operand IMUL overwrites its destination; unlike the two-operand
+        # form, it does not read the destination's previous value.
+        if ops and X86_READWRITE.match(op) and not (op.startswith("imul") and len(ops) == 3):
             inputs = inputs or read(ops[-1])
         if op.startswith(("mul", "imul")) and len(ops) == 1:
             inputs = read(ops[0]) or "rax" in state
@@ -295,6 +301,22 @@ def check_aarch64(lines, secret, pointers):
             parts.append(cur.strip())
         return parts
 
+    def stack_bytes(memory, register, op, index=0):
+        match = re.fullmatch(r"\[(sp|x29)(?:,\s*#(-?(?:0x[0-9a-f]+|[0-9]+)))?\]!?", memory)
+        if not match:
+            return None
+        offset = int(match.group(2), 0) if match.group(2) else 0
+        kind = register.strip().lower()[0]
+        size = 16 if kind == "q" else 8 if kind in ("x", "d") else 4 if kind in ("w", "s") else 2 if kind == "h" else 1
+        if op.startswith(("ldrb", "ldrsb", "ldurb", "ldursb", "strb", "sturb")):
+            size = 1
+        elif op.startswith(("ldrh", "ldrsh", "ldurh", "ldursh", "strh", "sturh")):
+            size = 2
+        elif op.startswith(("ldrsw", "ldursw")):
+            size = 4
+        offset += index * size
+        return [f"slot:{match.group(1)}:{offset + i}" for i in range(size)]
+
     def step(state, text, address):
         state = set(state)
         parts = text.split(None, 1)
@@ -321,18 +343,13 @@ def check_aarch64(lines, secret, pointers):
             if any(r in state for r in inner):
                 raise Violation(f"secret address: {text}")
             dests = ops[:ops.index(memory)]
-            stack = inner and inner[0] == "sp" or inner and inner[0] == "x29"
-            value = False
-            if stack and len(inner) == 1:
-                value = ("slot:" + memory) in state
-            elif any("ptr:" + r in state for r in inner):
-                value = True
             for i, d in enumerate(dests):
                 r = a64_reg(d)
-                slot_value = value
-                if stack and len(dests) == 2:
-                    slot_value = (f"slot:{memory}:{i}") in state
-                (state.add if slot_value else state.discard)(r)
+                slots = stack_bytes(memory, d, op, i)
+                value = any(slot in state for slot in slots) if slots is not None else any(
+                    "ptr:" + reg in state for reg in inner
+                )
+                (state.add if value else state.discard)(r)
                 state.discard("ptr:" + r)
             if "!" in memory or (len(ops) > len(dests) + 1):
                 pass
@@ -343,12 +360,11 @@ def check_aarch64(lines, secret, pointers):
             if any(r in state for r in inner):
                 raise Violation(f"secret address: {text}")
             sources = ops[:ops.index(memory)]
-            if inner and inner[0] in ("sp", "x29") and len(inner) == 1:
-                if len(sources) == 2:
-                    for i, s in enumerate(sources):
-                        (state.add if t(s) else state.discard)(f"slot:{memory}:{i}")
-                else:
-                    (state.add if t(sources[0]) else state.discard)("slot:" + memory)
+            for i, source in enumerate(sources):
+                slots = stack_bytes(memory, source, op, i)
+                if slots is not None:
+                    for slot in slots:
+                        (state.add if t(source) else state.discard)(slot)
             return frozenset(state)
         if op in ("cmp", "cmn", "tst", "fcmp", "ccmp", "ccmn"):
             value = any(t(o) for o in ops)
