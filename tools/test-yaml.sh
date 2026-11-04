@@ -31,4 +31,21 @@ const { instance } = await WebAssembly.instantiate(readFileSync(process.argv[2])
 const result = instance.exports.check();
 if (result !== 42 && result !== 42n) throw new Error(`YAML Wasm: ${result}`);
 JS
-echo 'YAML: native, GC stress, compile-time interp/JIT and Wasm passed'
+for mode in interp jit; do
+    ABLA_COMPILE_EVAL=$mode compile tests/cases/yaml/emit.ab --fast --no-cache -o "$out/emit-$mode"
+    status=0
+    "$out/emit-$mode" || status=$?
+    [[ $status == 42 ]]
+done
+status=0
+ABLA_GC_STRESS=1 "$out/emit-interp" || status=$?
+[[ $status == 42 ]]
+compile tests/cases/yaml/build-wasm-emit.ab --fast --no-cache -o "$out/build-wasm-emit"
+"$out/build-wasm-emit"
+node --input-type=module - "$out/emit.wasm" <<'JS'
+import { readFileSync } from 'node:fs';
+const { instance } = await WebAssembly.instantiate(readFileSync(process.argv[2]), {});
+const result = instance.exports.check();
+if (result !== 42 && result !== 42n) throw new Error(`YAML emit Wasm: ${result}`);
+JS
+echo 'YAML: parser/emitter native, GC stress, compile-time interp/JIT and Wasm passed'

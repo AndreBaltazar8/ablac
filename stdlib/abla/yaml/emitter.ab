@@ -1,0 +1,153 @@
+import "./value.ab"
+import "abla/bytes"
+import "abla/text"
+
+class YamlEmitOptions(val indent: int = 2, val newline: string = "\n",
+    val finalNewline: bool = true, val flow: bool = false)
+class YamlEmitResult(val text: string, val succeeded: bool, val error: YamlError)
+class YamlEmitter(val output: ByteBuffer, val limits: YamlLimits,
+    val options: YamlEmitOptions, var nodes: int, var scalarBytes: int,
+    var work: int, var code: string, var message: string)
+fun YamlEmitter.fail(code: string, message: string): void {
+    if (this.code == "") { this.code = code; this.message = message }
+}
+fun YamlEmitter.write(text: string): void {
+    if (this.code != "") return
+    if (this.output.size() + text.size > this.limits.maximumBytes) {
+        this.fail("limit.bytes", "YAML output byte limit exceeded")
+    } else this.output.appendText(text)
+}
+fun yamlHexByte(value: int): string {
+    val hex = "0123456789abcdef"
+    byteEncode(hex[value / 16]) + byteEncode(hex[value % 16])
+}
+// Always quote strings in fresh output: Core resolution and punctuation cannot
+// change their type. The lossless editor may retain an existing scalar style.
+fun yamlQuote(text: string): string {
+    val output = byteBuffer()
+    output.appendText("\"")
+    var i = 0
+    while (i < text.size) {
+        val c = text[i]
+        if (c == 34) output.appendText("\\\"")
+        else if (c == 92) output.appendText("\\\\")
+        else if (c == 10) output.appendText("\\n")
+        else if (c == 13) output.appendText("\\r")
+        else if (c == 9) output.appendText("\\t")
+        else if (c < 32 || c == 127) output.appendText("\\x" + yamlHexByte(c))
+        else if (c == 194 && i + 1 < text.size && text[i + 1] >= 128 && text[i + 1] <= 159) {
+            i += 1
+            output.appendText("\\u00" + yamlHexByte(text[i]))
+        } else if (c == 239 && i + 2 < text.size && text[i + 1] == 191 && text[i + 2] >= 190) {
+            output.appendText(if (text[i + 2] == 190) "\\ufffe" else "\\uffff")
+            i += 2
+        } else output.appendText(byteEncode(c))
+        i += 1
+    }
+    output.appendText("\"")
+    output.toText()
+}
+fun YamlEmitter.indentation(indent: int): void {
+    var i = 0
+    while (i < indent && this.code == "") { this.write(" "); i += 1 }
+}
+fun YamlEmitter.enter(value: Yaml, depth: int): bool {
+    if (this.code != "") return false
+    this.nodes += 1
+    this.work += 1
+    if (depth > this.limits.maximumDepth) this.fail("limit.depth", "YAML output depth limit exceeded")
+    if (this.nodes > this.limits.maximumNodes || this.nodes > this.limits.maximumExpandedNodes) this.fail("limit.nodes", "YAML output node limit exceeded")
+    val bytes = if (value.kind == 1) value.stringValue.size
+        else if (value.kind == 2) value.numberValue.text.size else 0
+    this.scalarBytes += bytes
+    this.work += bytes
+    if (bytes > this.limits.maximumScalarBytes) this.fail("limit.scalar", "YAML output scalar byte limit exceeded")
+    if (this.scalarBytes > this.limits.maximumExpandedScalarBytes) this.fail("limit.expansion", "YAML output expanded-byte limit exceeded")
+    if (this.work > this.limits.maximumWork) this.fail("limit.work", "YAML output work limit exceeded")
+    if (value.values.size > this.limits.maximumCollectionMembers) this.fail("limit.members", "YAML output collection member limit exceeded")
+    if (value.kind == 5 && value.keys.size != value.values.size) this.fail("value.mapping", "YAML mapping key/value counts differ")
+    if (value.kind < 0 || value.kind > 5) this.fail("value.kind", "Invalid YAML value kind")
+    this.code == ""
+}
+fun YamlEmitter.scalar(value: Yaml): void {
+    if (value.kind == 0) this.write("null")
+    else if (value.kind == 1) {
+        if (!value.stringValue.isValidUtf8()) this.fail("value.utf8", "Invalid YAML string UTF-8")
+        else this.write(yamlQuote(value.stringValue))
+    } else if (value.kind == 3) this.write(if (value.boolValue) "true" else "false")
+    else if (value.kind == 2) {
+        val number = value.numberValue
+        if (number.text.size > this.limits.maximumNumberBytes) this.fail("limit.number", "YAML output numeric text limit exceeded")
+        else {
+            val kind = yamlNumberKind(number.text)
+            if (!number.valid || kind < 0 || (kind == 1) != number.integer) this.fail("value.number", "Invalid YAML numeric text")
+            else this.write(number.text)
+        }
+    }
+}
+fun YamlEmitter.checkKey(value: Yaml, var seen: Map<string, int>): void {
+    if (value.kind >= 4) { this.fail("unsupported.key", "YAML collection keys are not supported"); return }
+    var identity = yamlScalarKey(value)
+    if (value.kind == 2) {
+        if (value.numberValue.text.size > this.limits.maximumNumberBytes) {
+            this.fail("limit.number", "YAML output numeric text limit exceeded")
+            return
+        }
+        this.work += value.numberValue.text.size * value.numberValue.text.size
+        identity = yamlScalarKey(yamlNumberText(value.numberValue.text))
+    }
+    if (seen.has(identity)) this.fail("value.duplicate", "Duplicate YAML mapping key")
+    else seen.set(identity, 1)
+}
+fun yamlNonemptyCollection(value: Yaml): bool = (value.kind == 4 || value.kind == 5) && value.values.size > 0
+fun YamlEmitter.emit(value: Yaml, depth: int, indent: int, flow: bool): void {
+    if (!this.enter(value, depth)) return
+    if (value.kind < 4) { this.scalar(value); return }
+    val mapping = value.kind == 5
+    val seen: Map<string, int> = Map()
+    if (flow || value.values.size == 0) {
+        this.write(if (mapping) "{" else "[")
+        var i = 0
+        while (i < value.values.size && this.code == "") {
+            if (i > 0) this.write(", ")
+            if (mapping) {
+                this.checkKey(value.keys[i], seen)
+                this.emit(value.keys[i], depth + 1, indent, true)
+                this.write(": ")
+            }
+            this.emit(value.values[i], depth + 1, indent, true)
+            i += 1
+        }
+        this.write(if (mapping) "}" else "]")
+    } else {
+        var i = 0
+        while (i < value.values.size && this.code == "") {
+            if (i > 0) this.write(this.options.newline)
+            this.indentation(indent)
+            if (mapping) {
+                this.checkKey(value.keys[i], seen)
+                this.emit(value.keys[i], depth + 1, indent, true)
+                this.write(":")
+            } else this.write("-")
+            val child = value.values[i]
+            if (yamlNonemptyCollection(child)) {
+                this.write(this.options.newline)
+                this.emit(child, depth + 1, indent + this.options.indent, false)
+            } else {
+                this.write(" ")
+                this.emit(child, depth + 1, indent + this.options.indent, true)
+            }
+            i += 1
+        }
+    }
+}
+fun yamlEmit(value: Yaml, options: YamlEmitOptions = YamlEmitOptions(),
+    limits: YamlLimits = yamlDefaultLimits()): YamlEmitResult {
+    val writer = YamlEmitter(byteBuffer(), limits, options, 0, 0, 0, "", "")
+    if (!yamlLimitsValid(limits)) writer.fail("limit.invalid", "Invalid YAML limits")
+    if (options.indent < 1 || options.indent > 8 || (options.newline != "\n" && options.newline != "\r\n")) writer.fail("option.invalid", "Invalid YAML emission options")
+    writer.emit(value, 1, 0, options.flow)
+    if (options.finalNewline) writer.write(options.newline)
+    val error = YamlError(writer.code, writer.message, 0, 1, 1)
+    YamlEmitResult(if (writer.code == "") writer.output.toText() else "", writer.code == "", error)
+}

@@ -91,3 +91,25 @@ sequences (8,000 strings, release build, one pinned CPU) measured median 13 ms
 per YAML parse versus 5 ms for `abla/json`, over three alternating runs of ten
 parses. Process peak RSS was about 53 MiB versus 15 MiB. These are sanity figures,
 not portable performance guarantees; YAML also tracks anchors and expansion costs.
+
+## Emission
+
+`yamlEmit(value, options = YamlEmitOptions(), limits = yamlDefaultLimits())`
+returns `YamlEmitResult(text, succeeded, error)`. Always check `succeeded`.
+Failure returns empty text, never a partial document or a substituted `null`.
+
+```abla
+val encoded = yamlEmit(yamlObject(["password", "port"], [yamlString("secret"), yamlInteger(993)]))
+```
+
+Fresh output uses deterministic block layout, two spaces, LF, insertion-order
+mapping entries, double-quoted strings and a final newline. It preserves exact
+numeric text, including non-finite numbers. It emits `[]` and `{}` for empty
+containers. This creates a fresh representation; it does not preserve input
+comments, anchors or scalar styles. Aliases are emitted as bounded ordinary values.
+
+`YamlEmitOptions(indent = 2, newline = "\n", finalNewline = true, flow = false)`
+can select 1–8 spaces, LF or CRLF, a final newline, and flow collections. Invalid
+options, malformed numeric values, invalid UTF-8, non-scalar/duplicate keys,
+mismatched key/value arrays and exceeded limits fail explicitly. Constructed
+cyclic graphs terminate at the depth limit. Do not mutate a value while emitting.

@@ -20,4 +20,8 @@ for case in cases:
         assert result.returncode == 1 and actual[0] == 'error', (case['name'], actual)
     else:
         assert result.returncode == 0 and actual == case['expected'], (case['name'], actual, case['expected'])
+        for style in ['block', 'flow']:
+            emitted = subprocess.run([probe, str(source), style], text=True, capture_output=True, timeout=5)
+            assert emitted.returncode == 0, (case['name'], style, emitted.returncode, emitted.stdout, emitted.stderr)
+            assert json.loads(emitted.stdout) == case['expected'], (case['name'], style, emitted.stdout)
 print(f'YAML: {len(cases)} offline parser vectors passed')
