@@ -156,19 +156,9 @@ llvm-objdump -d "$out/aarch64" > "$out/aarch64.s"
 grep -q aese "$out/aarch64.s" || fail "no AESE in the AArch64 program"
 if qemu-aarch64 -cpu max "$out/aarch64"; then echo "ok   aarch64 under qemu: known answers, hardware and software"; else fail "aarch64: check $?"; fi
 tools_directory="$out/xtensa-tools"
-mkdir -p "$tools_directory"
-real_llc=$(command -v llc)
-cat > "$tools_directory/llc" <<EOF
-#!/usr/bin/env bash
-arguments=()
-for argument in "\$@"; do
-    [[ \$argument == -relocation-model=pic ]] && argument=-relocation-model=static
-    arguments+=("\$argument")
-done
-exec "$real_llc" -mcpu=esp32 "\${arguments[@]}"
-EOF
-chmod +x "$tools_directory/llc"
-if PATH="$tools_directory:$PATH" "$compiler" build "$cases/object.ab" -o "$out/xtensa.o" --no-cache \
+. "$project_root/tools/xtensa-test-tools.sh"
+abla_xtensa_test_prepare "$tools_directory"
+if abla_xtensa_test_build "$compiler" "$tools_directory" build "$cases/object.ab" -o "$out/xtensa.o" --no-cache \
     --target-triple xtensa-esp-unknown-elf --object-format elf --emit object > "$out/xtensa.log" 2>&1; then
     echo "ok   xtensa: compiled, not run"
 else

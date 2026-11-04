@@ -59,19 +59,9 @@ fi
 
 # Xtensa is compiled only: nothing here runs it, as in tools/test-f32.sh.
 tools_directory="$out/xtensa-tools"
-mkdir -p "$tools_directory"
-real_llc=$(command -v llc)
-cat > "$tools_directory/llc" <<EOF
-#!/usr/bin/env bash
-arguments=()
-for argument in "\$@"; do
-    [[ \$argument == -relocation-model=pic ]] && argument=-relocation-model=static
-    arguments+=("\$argument")
-done
-exec "$real_llc" -mcpu=esp32 "\${arguments[@]}"
-EOF
-chmod +x "$tools_directory/llc"
-PATH="$tools_directory:$PATH" "$compiler" build "$cases/object.ab" -o "$out/xtensa.o" --no-cache \
+. "$project_root/tools/xtensa-test-tools.sh"
+abla_xtensa_test_prepare "$tools_directory"
+abla_xtensa_test_build "$compiler" "$tools_directory" build "$cases/object.ab" -o "$out/xtensa.o" --no-cache \
     --target-triple xtensa-esp-unknown-elf --object-format elf --emit object
 grep -q 'Machine: EM_XTENSA' <<<"$(llvm-readobj --file-headers "$out/xtensa.o")"
 echo "ok   xtensa: compiled only, not run; every vector operation is scalar code there"

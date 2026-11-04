@@ -92,10 +92,7 @@
 - [ ] ARM64 Android tagged pointers: `adoptNativeString` now tests `address != 0`, not `> 0`, but the fix has not been
       run on the affected device. Other runtime address comparisons need the same check (`__ablaRuntimeHostCollection*`
       tables shift addresses arithmetically). abla-mobile's `allowNativeHeapPointerTagging="false"` masks this for its apps.
-- [ ] `tools/test-simd.sh`, `test-ct.sh` and `test-crypto-pure.sh` fail on Xtensa when given an
-      installed `ablac`: their `llc` shim for `-relocation-model=static` goes first on `PATH`, and the
-      install's wrapper puts its own LLVM ahead of it, so llc aborts on PIC. They pass with the
-      wrapper's payload, `libexec/ablac.bin`. `test-f32.sh` has the same shim; not run this way.
+
 
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 

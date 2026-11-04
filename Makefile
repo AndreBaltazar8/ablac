@@ -125,6 +125,7 @@ test-serial: ablac
 	tools/test-compile-time-branch.sh $(COMPILER)
 	tools/test-floating-point.sh $(COMPILER)
 	tools/test-f32.sh $(COMPILER)
+	tools/test-xtensa-test-tools.sh
 	tools/test-simd.sh $(COMPILER)
 	tools/test-ct.sh $(COMPILER)
 	tools/test-bignum-secret.sh $(COMPILER)
