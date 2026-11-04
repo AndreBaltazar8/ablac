@@ -10,6 +10,6 @@ openssl req -x509 -new -key "$out/key.pem" -days 2 -subj /CN=localhost -out "$ou
 for mode in fast release; do
     options=()
     [[ $mode == release ]] || options+=(--fast)
-    "$compiler" build tests/cases/http-peer/server.ab -o "$out/server" --no-cache "${options[@]}"
+    "$compiler" build tests/cases/http-peer/server.ab -o "$out/server" --no-cache ${options[@]+"${options[@]}"}
     python3 -I tests/cases/http-peer/clients.py "$out/server" "$out/cert.pem" "$out/key.pem"
 done
