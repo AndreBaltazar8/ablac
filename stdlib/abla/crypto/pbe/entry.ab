@@ -1,0 +1,352 @@
+import "abla/ct"
+import "abla/crypto/aes"
+import "abla/crypto/der"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+import "abla/unsafe/mmio"
+export import "abla/crypto/result"
+
+// No module-initializer allocations: unencrypted RSA imports keep this dead.
+class RsaKeyReadLimits(val maximumIterations: int = 1000000,
+    val maximumKdfWork: int = 8000000, val maximumDerBytes: int = 1048576,
+    val maximumPemBytes: int = 2097152, val maximumSaltBytes: int = 1024,
+    val maximumDepth: int = 8, val maximumBags: int = 64)
+fun rsaKeyReadLimits(): RsaKeyReadLimits = RsaKeyReadLimits()
+fun rsaKeyReadLimitsValid(l: RsaKeyReadLimits): bool =
+    l.maximumIterations >= 1 && l.maximumIterations <= 1000000 &&
+    l.maximumKdfWork >= 1 && l.maximumKdfWork <= 8000000 &&
+    l.maximumDerBytes >= 1 && l.maximumDerBytes <= 1048576 &&
+    l.maximumPemBytes >= 1 && l.maximumPemBytes <= 2097152 &&
+    l.maximumSaltBytes >= 0 && l.maximumSaltBytes <= 1024 &&
+    l.maximumDepth >= 1 && l.maximumDepth <= 8 && l.maximumBags >= 1 && l.maximumBags <= 64
+
+private @noinline trusted fun pbeWipe(address: int, size: int): void {
+    for (i in 0 until size) ablaUnsafeVolatileStoreU8(address + i, 0)
+}
+resource class CryptoPassword() {
+    trusted fun drop(): void {
+        if (this.passwordMemory != 0) {
+            pbeWipe(this.passwordMemory, this.passwordSize + 1)
+            ablaUnsafeFree(aesPointer(this.passwordMemory))
+            this.passwordMemory = 0
+            this.passwordError = "password owner is closed"
+        }
+    }
+    fun ok(): bool = this.passwordMemory != 0
+    fun error(): string = this.passwordError
+}
+private var CryptoPassword.passwordMemory: int = 0
+private var CryptoPassword.passwordSize: int = 0
+private var CryptoPassword.passwordError: string = "invalid password owner"
+/** Copies at most1024 password octets. Only this owned copy can be wiped. */
+trusted fun cryptoPassword(bytes: string): CryptoPassword {
+    var result = CryptoPassword()
+    if (bytes.size > 1024) { result.passwordError = "password exceeds 1024 bytes"; return result }
+    result.passwordMemory = ablaUnsafePointerAddress(ablaUnsafeAllocate(bytes.size + 1))
+    result.passwordSize = bytes.size
+    result.passwordError = ""
+    for (i in 0 until bytes.size) {
+        val byte = secretU8(u8(bytes[i]))
+        ablaUnsafeStoreU8(aesPointer(result.passwordMemory + i), int(byte.declassify()))
+    }
+    result
+}
+private class PbeBudget(val limits: RsaKeyReadLimits, var work: int = 0, var error: string = "")
+private fun PbeBudget.spend(blocks: int): bool {
+    if (this.error != "") return false
+    if (blocks < 0 || blocks > this.limits.maximumKdfWork - this.work) {
+        this.error = "key derivation work limit exceeded"
+        return false
+    }
+    this.work += blocks
+    true
+}
+
+// BEGIN PBE SECRET CORES
+private @inline trusted fun pbeLoad(address: int): secretU32 = secretU32(u32(ablaUnsafeLoadU32(aesPointer(address))))
+private @inline trusted fun pbeStore(address: int, value: secretU32): void = ablaUnsafeStoreU32(aesPointer(address), int(value.declassify()))
+private @inline trusted fun pbeByte(address: int): secretU32 = secretU32(u32(ablaUnsafeLoadU8(aesPointer(address))))
+private @inline trusted fun pbeByteStore(address: int, value: secretU32): void = ablaUnsafeStoreU8(aesPointer(address), int((value & secretU32(u32(255))).declassify()))
+private @inline trusted fun pbeBig(address: int): secretU32 = (pbeByte(address) << 24) | (pbeByte(address + 1) << 16) | (pbeByte(address + 2) << 8) | pbeByte(address + 3)
+private @inline trusted fun pbeBigStore(address: int, value: secretU32): void {
+    pbeByteStore(address, value >> 24); pbeByteStore(address + 1, value >> 16)
+    pbeByteStore(address + 2, value >> 8); pbeByteStore(address + 3, value)
+}
+private @inline trusted fun pbeCopy(to: int, from: int, size: int): void {
+    for (i in 0 until size) pbeByteStore(to + i, pbeByte(from + i))
+}
+private @inline trusted fun pbeZero(to: int, size: int): void {
+    for (i in 0 until size) pbeByteStore(to + i, secretU32(u32(0)))
+}
+private @inline trusted fun pbeConstants(): int = nativeStaticBytes("\x42\x8a\x2f\x98\x71\x37\x44\x91\xb5\xc0\xfb\xcf\xe9\xb5\xdb\xa5\x39\x56\xc2\x5b\x59\xf1\x11\xf1\x92\x3f\x82\xa4\xab\x1c\x5e\xd5\xd8\x07\xaa\x98\x12\x83\x5b\x01\x24\x31\x85\xbe\x55\x0c\x7d\xc3\x72\xbe\x5d\x74\x80\xde\xb1\xfe\x9b\xdc\x06\xa7\xc1\x9b\xf1\x74\xe4\x9b\x69\xc1\xef\xbe\x47\x86\x0f\xc1\x9d\xc6\x24\x0c\xa1\xcc\x2d\xe9\x2c\x6f\x4a\x74\x84\xaa\x5c\xb0\xa9\xdc\x76\xf9\x88\xda\x98\x3e\x51\x52\xa8\x31\xc6\x6d\xb0\x03\x27\xc8\xbf\x59\x7f\xc7\xc6\xe0\x0b\xf3\xd5\xa7\x91\x47\x06\xca\x63\x51\x14\x29\x29\x67\x27\xb7\x0a\x85\x2e\x1b\x21\x38\x4d\x2c\x6d\xfc\x53\x38\x0d\x13\x65\x0a\x73\x54\x76\x6a\x0a\xbb\x81\xc2\xc9\x2e\x92\x72\x2c\x85\xa2\xbf\xe8\xa1\xa8\x1a\x66\x4b\xc2\x4b\x8b\x70\xc7\x6c\x51\xa3\xd1\x92\xe8\x19\xd6\x99\x06\x24\xf4\x0e\x35\x85\x10\x6a\xa0\x70\x19\xa4\xc1\x16\x1e\x37\x6c\x08\x27\x48\x77\x4c\x34\xb0\xbc\xb5\x39\x1c\x0c\xb3\x4e\xd8\xaa\x4a\x5b\x9c\xca\x4f\x68\x2e\x6f\xf3\x74\x8f\x82\xee\x78\xa5\x63\x6f\x84\xc8\x78\x14\x8c\xc7\x02\x08\x90\xbe\xff\xfa\xa4\x50\x6c\xeb\xbe\xf9\xa3\xf7\xc6\x71\x78\xf2")
+private @inline trusted fun pbeShaBlock(state: int, input: int, words: int, sha1: bool): void {
+    for (i in 0 until 16) pbeStore(words + i * 4, pbeBig(input + i * 4))
+    if (sha1) {
+        for (i in 16 until 80) pbeStore(words + i * 4,
+            (pbeLoad(words + (i - 3) * 4) ^ pbeLoad(words + (i - 8) * 4) ^
+             pbeLoad(words + (i - 14) * 4) ^ pbeLoad(words + (i - 16) * 4)).rotl(1))
+        var a = pbeLoad(state); var b = pbeLoad(state + 4); var c = pbeLoad(state + 8)
+        var d = pbeLoad(state + 12); var e = pbeLoad(state + 16)
+        for (i in 0 until 80) {
+            val choose = if (i < 20) (b & c) | (~b & d)
+                else if (i < 40 || i >= 60) b ^ c ^ d else (b & c) | (b & d) | (c & d)
+            val constant = if (i < 20) 1518500249 else if (i < 40) 1859775393 else if (i < 60) 2400959708 else 3395469782
+            val next = a.rotl(5) + choose + e + secretU32(u32(constant)) + pbeLoad(words + i * 4)
+            e = d; d = c; c = b.rotl(30); b = a; a = next
+        }
+        pbeStore(state, pbeLoad(state) + a); pbeStore(state + 4, pbeLoad(state + 4) + b)
+        pbeStore(state + 8, pbeLoad(state + 8) + c); pbeStore(state + 12, pbeLoad(state + 12) + d)
+        pbeStore(state + 16, pbeLoad(state + 16) + e)
+    } else {
+        for (i in 16 until 64) {
+            val a = pbeLoad(words + (i - 15) * 4); val b = pbeLoad(words + (i - 2) * 4)
+            val s0 = a.rotr(7) ^ a.rotr(18) ^ (a >> 3)
+            val s1 = b.rotr(17) ^ b.rotr(19) ^ (b >> 10)
+            pbeStore(words + i * 4, pbeLoad(words + (i - 16) * 4) + s0 + pbeLoad(words + (i - 7) * 4) + s1)
+        }
+        var a = pbeLoad(state); var b = pbeLoad(state + 4); var c = pbeLoad(state + 8); var d = pbeLoad(state + 12)
+        var e = pbeLoad(state + 16); var f = pbeLoad(state + 20); var g = pbeLoad(state + 24); var h = pbeLoad(state + 28)
+        val constants = pbeConstants()
+        for (i in 0 until 64) {
+            val s1 = e.rotr(6) ^ e.rotr(11) ^ e.rotr(25)
+            val t1 = h + s1 + ((e & f) ^ (~e & g)) + pbeBig(constants + i * 4) + pbeLoad(words + i * 4)
+            val s0 = a.rotr(2) ^ a.rotr(13) ^ a.rotr(22)
+            val t2 = s0 + ((a & b) ^ (a & c) ^ (b & c))
+            h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2
+        }
+        pbeStore(state, pbeLoad(state) + a); pbeStore(state + 4, pbeLoad(state + 4) + b)
+        pbeStore(state + 8, pbeLoad(state + 8) + c); pbeStore(state + 12, pbeLoad(state + 12) + d)
+        pbeStore(state + 16, pbeLoad(state + 16) + e); pbeStore(state + 20, pbeLoad(state + 20) + f)
+        pbeStore(state + 24, pbeLoad(state + 24) + g); pbeStore(state + 28, pbeLoad(state + 28) + h)
+    }
+}
+// Workspace: state0, schedule32, block352, ipad416, opad448,
+// inner digest480, U512, accumulator544, normalized key576, pad608.
+private @inline trusted fun pbeDigest(state: int, out: int, sha1: bool): void {
+    for (i in 0 until (if (sha1) 5 else 8)) pbeBigStore(out + i * 4, pbeLoad(state + i * 4))
+}
+private @inline trusted fun pbeDigestBlock(block: int, digest: int, sha1: bool): void {
+    val size = if (sha1) 20 else 32
+    pbeCopy(block, digest, size)
+    pbeZero(block + size, 64 - size)
+    pbeByteStore(block + size, secretU32(u32(128)))
+    pbeBigStore(block + 60, secretU32(u32((64 + size) * 8)))
+}
+private @inline trusted fun pbeHmacFixedBody(memory: int, sha1: bool): void {
+    pbeCopy(memory, memory + 416, 32)
+    pbeDigestBlock(memory + 352, memory + 512, sha1)
+    pbeShaBlock(memory, memory + 352, memory + 32, sha1)
+    pbeDigest(memory, memory + 480, sha1)
+    pbeCopy(memory, memory + 448, 32)
+    pbeDigestBlock(memory + 352, memory + 480, sha1)
+    pbeShaBlock(memory, memory + 352, memory + 32, sha1)
+    pbeDigest(memory, memory + 512, sha1)
+}
+private @inline trusted fun pbeAccumulate(memory: int, sha1: bool): void {
+    for (i in 0 until (if (sha1) 5 else 8)) pbeStore(memory + 544 + i * 4,
+        pbeLoad(memory + 544 + i * 4) ^ pbeLoad(memory + 512 + i * 4))
+}
+private @inline trusted fun pbePadBody(pad: int, key: int, size: int, mask: int): void {
+    for (i in 0 until 64) {
+        val byte = if (i < size) pbeByte(key + i) else secretU32(u32(0))
+        pbeByteStore(pad + i, byte ^ secretU32(u32(mask)))
+    }
+}
+// END PBE SECRET CORES
+
+private resource class PbeHash(val bytes: NativeByteBuffer, val sha1: bool, var total: int = 0, var pending: int = 0) {
+    trusted fun drop(): void { pbeWipe(ablaUnsafePointerAddress(this.bytes.address), this.bytes.capacity); this.bytes.close(); return }
+    trusted fun memory(): int = ablaUnsafePointerAddress(this.bytes.address)
+}
+private trusted fun pbeHash(sha1: bool): PbeHash {
+    val hash = PbeHash(nativeByteBuffer(704), sha1)
+    pbeZero(hash.memory(), 704)
+    hash.reset()
+    hash
+}
+private trusted fun PbeHash.reset(): void {
+    this.total = 0; this.pending = 0
+    val m = this.memory()
+    val initial = if (this.sha1) nativeStaticBytes("\x67\x45\x23\x01\xef\xcd\xab\x89\x98\xba\xdc\xfe\x10\x32\x54\x76\xc3\xd2\xe1\xf0\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
+        else nativeStaticBytes("\x6a\x09\xe6\x67\xbb\x67\xae\x85\x3c\x6e\xf3\x72\xa5\x4f\xf5\x3a\x51\x0e\x52\x7f\x9b\x05\x68\x8c\x1f\x83\xd9\xab\x5b\xe0\xcd\x19")
+    for (i in 0 until 8) pbeStore(m + i * 4, pbeBig(initial + i * 4))
+}
+private trusted fun PbeHash.process(var budget: PbeBudget): void {
+    if (budget.spend(1)) pbeShaBlock(this.memory(), this.memory() + 352, this.memory() + 32, this.sha1)
+    this.pending = 0
+}
+private trusted fun PbeHash.update(address: int, size: int, var budget: PbeBudget): void {
+    this.total += size
+    var offset = 0
+    while (offset < size && budget.error == "") {
+        val take = if (size - offset < 64 - this.pending) size - offset else 64 - this.pending
+        pbeCopy(this.memory() + 352 + this.pending, address + offset, take)
+        this.pending += take; offset += take
+        if (this.pending == 64) this.process(budget)
+    }
+}
+private trusted fun PbeHash.finish(out: int, var budget: PbeBudget): void {
+    val block = this.memory() + 352
+    pbeByteStore(block + this.pending, secretU32(u32(128)))
+    this.pending += 1
+    if (this.pending > 56) { pbeZero(block + this.pending, 64 - this.pending); this.process(budget) }
+    pbeZero(block + this.pending, 64 - this.pending)
+    pbeBigStore(block + 56, secretU32(u32((this.total * 8) >>> 32)))
+    pbeBigStore(block + 60, secretU32(u32(this.total * 8)))
+    this.process(budget)
+    pbeDigest(this.memory(), out, this.sha1)
+}
+private trusted fun PbeHash.prepareHmac(password: CryptoPassword, var budget: PbeBudget): void {
+    val m = this.memory()
+    var key = password.passwordMemory
+    var size = password.passwordSize
+    if (size > 64) {
+        this.reset(); this.update(key, size, budget); this.finish(m + 576, budget)
+        key = m + 576; size = if (this.sha1) 20 else 32
+    }
+    pbePadBody(m + 608, key, size, 54)
+    this.reset(); this.update(m + 608, 64, budget); pbeCopy(m + 416, m, 32)
+    for (i in 0 until 64) pbeByteStore(m + 608 + i, pbeByte(m + 608 + i) ^ secretU32(u32(54 ^ 92)))
+    this.reset(); this.update(m + 608, 64, budget); pbeCopy(m + 448, m, 32)
+}
+private trusted fun PbeHash.hmac(address: int, size: int, var budget: PbeBudget): void {
+    val m = this.memory()
+    pbeCopy(m, m + 416, 32); this.total = 64; this.pending = 0
+    this.update(address, size, budget); this.finish(m + 480, budget)
+    pbeCopy(m, m + 448, 32); this.total = 64; this.pending = 0
+    this.update(m + 480, if (this.sha1) 20 else 32, budget); this.finish(m + 512, budget)
+}
+private trusted fun pbeDerive(password: CryptoPassword, salt: string, iterations: int,
+    sha1: bool, var output: NativeByteBuffer, var budget: PbeBudget): bool {
+    val hash = pbeHash(sha1)
+    val message = nativeByteBuffer(salt.size + 4)
+    val input = ablaUnsafePointerAddress(message.address)
+    ablaUnsafeCopyMemory(input, ablaUnsafeStringAddress(salt), salt.size)
+    hash.prepareHmac(password, budget)
+    val m = hash.memory()
+    val digest = if (sha1) 20 else 32
+    var at = 0
+    var block = 1
+    while (at < output.capacity && budget.error == "") {
+        pbeBigStore(input + salt.size, secretU32(u32(block)))
+        hash.hmac(input, salt.size + 4, budget)
+        pbeCopy(m + 544, m + 512, digest)
+        var round = 1
+        while (round < iterations && budget.error == "") {
+            if (budget.spend(2)) { pbeHmacFixedBody(m, sha1); pbeAccumulate(m, sha1) }
+            round += 1
+        }
+        val take = if (output.capacity - at < digest) output.capacity - at else digest
+        pbeCopy(ablaUnsafePointerAddress(output.address) + at, m + 544, take)
+        at += take; block += 1
+    }
+    budget.error == ""
+}
+
+private class PbeCipher(val salt: string, val iterations: int, val sha1: bool,
+    val keyBytes: int, val iv: string, val ciphertext: string, val error: string)
+private fun pbeFailed(error: string): PbeCipher = PbeCipher("", 0, false, 0, "", "", error)
+private fun pbeOid(data: string, item: DerItem, oid: string): bool =
+    item.ok && item.tag == DER_OID && data.slice(item.start, item.end) == oid
+private fun pbeCount(data: string, item: DerItem, maximum: int): int {
+    if (!item.ok || item.tag != DER_INTEGER) return -1
+    val value = derPositiveInteger(data, item)
+    if (value.size == 0) return -1
+    if (value.size > 3) return -2
+    var result = 0
+    for (i in 0 until value.size) result = result * 256 + int(value[i])
+    if (result > maximum) -2 else result
+}
+private fun pbeAlgorithmError(oid: string): string {
+    if (oid.size == 9 && oid.slice(0, 8) == "\x2a\x86\x48\x86\xf7\x0d\x01\x05") return "unsupported PBES1 encryption (DES/RC2)"
+    if (oid.size == 10 && oid.slice(0, 9) == "\x2a\x86\x48\x86\xf7\x0d\x01\x0c\x01") return "unsupported legacy PKCS#12 encryption (RC2/DES)"
+    "unsupported password encryption scheme (only PBES2 is supported)"
+}
+private fun pbeParameters(data: string, algorithm: DerItem, ciphertext: string, limits: RsaKeyReadLimits): PbeCipher {
+    val malformed = "invalid encrypted private key parameters"
+    if (!algorithm.ok || algorithm.tag != DER_SEQUENCE) return pbeFailed(malformed)
+    val oid = derItem(data, algorithm.start, algorithm.end)
+    if (!oid.ok || oid.tag != DER_OID) return pbeFailed(malformed)
+    if (!pbeOid(data, oid, "\x2a\x86\x48\x86\xf7\x0d\x01\x05\x0d")) return pbeFailed(pbeAlgorithmError(data.slice(oid.start, oid.end)))
+    val params = derItem(data, oid.end, algorithm.end)
+    if (!params.ok || params.tag != DER_SEQUENCE || params.end != algorithm.end) return pbeFailed(malformed)
+    val kdf = derItem(data, params.start, params.end)
+    if (!kdf.ok || kdf.tag != DER_SEQUENCE) return pbeFailed(malformed)
+    val kdfOid = derItem(data, kdf.start, kdf.end)
+    if (!pbeOid(data, kdfOid, "\x2a\x86\x48\x86\xf7\x0d\x01\x05\x0c")) return pbeFailed("unsupported PBES2 KDF (only PBKDF2 is supported)")
+    val kdfParams = derItem(data, kdfOid.end, kdf.end)
+    if (!kdfParams.ok || kdfParams.tag != DER_SEQUENCE || kdfParams.end != kdf.end) return pbeFailed(malformed)
+    val saltItem = derItem(data, kdfParams.start, kdfParams.end)
+    if (!saltItem.ok || saltItem.tag != DER_OCTET_STRING) return pbeFailed("unsupported PBKDF2 salt source")
+    if (saltItem.end - saltItem.start > limits.maximumSaltBytes) return pbeFailed("PBKDF2 salt byte limit exceeded")
+    val rounds = derItem(data, saltItem.end, kdfParams.end)
+    val count = pbeCount(data, rounds, limits.maximumIterations)
+    if (count == -2) return pbeFailed("PBKDF2 iteration limit exceeded")
+    if (count <= 0) return pbeFailed("invalid PBKDF2 iteration count")
+    var at = rounds.end
+    var keyLength = 0
+    if (at < kdfParams.end && data[at] == DER_INTEGER) {
+        val lengthItem = derItem(data, at, kdfParams.end)
+        keyLength = pbeCount(data, lengthItem, 32)
+        if (keyLength <= 0) return pbeFailed("invalid PBKDF2 keyLength")
+        at = lengthItem.end
+    }
+    var sha1 = true
+    if (at < kdfParams.end) {
+        val prf = derItem(data, at, kdfParams.end)
+        if (!prf.ok || prf.tag != DER_SEQUENCE || prf.end != kdfParams.end) return pbeFailed(malformed)
+        val prfOid = derItem(data, prf.start, prf.end)
+        if (pbeOid(data, prfOid, "\x2a\x86\x48\x86\xf7\x0d\x02\x07")) sha1 = true
+        else if (pbeOid(data, prfOid, "\x2a\x86\x48\x86\xf7\x0d\x02\x09")) sha1 = false
+        else return pbeFailed("unsupported PBKDF2 PRF (only HMAC-SHA1/SHA256 are supported)")
+        if (prfOid.end != prf.end) {
+            val absent = derItem(data, prfOid.end, prf.end)
+            if (!absent.ok || absent.tag != 5 || absent.start != absent.end || absent.end != prf.end) return pbeFailed(malformed)
+        }
+    }
+    val cipher = derItem(data, kdf.end, params.end)
+    if (!cipher.ok || cipher.tag != DER_SEQUENCE || cipher.end != params.end) return pbeFailed(malformed)
+    val cipherOid = derItem(data, cipher.start, cipher.end)
+    var bytes = 0
+    if (pbeOid(data, cipherOid, "\x60\x86\x48\x01\x65\x03\x04\x01\x02")) bytes = 16
+    else if (pbeOid(data, cipherOid, "\x60\x86\x48\x01\x65\x03\x04\x01\x2a")) bytes = 32
+    else if (pbeOid(data, cipherOid, "\x2a\x86\x48\x86\xf7\x0d\x03\x02")) return pbeFailed("unsupported RC2 encryption")
+    else if (pbeOid(data, cipherOid, "\x2a\x86\x48\x86\xf7\x0d\x03\x07") || pbeOid(data, cipherOid, "\x2b\x0e\x03\x02\x07")) return pbeFailed("unsupported DES/3DES encryption")
+    else return pbeFailed("unsupported PBES2 cipher (only AES-128/256-CBC are supported)")
+    if (keyLength != 0 && keyLength != bytes) return pbeFailed("PBKDF2 keyLength does not match AES cipher")
+    val iv = derItem(data, cipherOid.end, cipher.end)
+    if (!iv.ok || iv.tag != DER_OCTET_STRING || iv.end - iv.start != 16 || iv.end != cipher.end) return pbeFailed("invalid AES-CBC IV (expected16 bytes)")
+    if (ciphertext.size == 0 || ciphertext.size % 16 != 0) return pbeFailed("invalid AES-CBC ciphertext length")
+    PbeCipher(data.slice(saltItem.start, saltItem.end), count, sha1, bytes, data.slice(iv.start, iv.end), ciphertext, "")
+}
+private fun pbeEncryptedInfo(data: string, limits: RsaKeyReadLimits): PbeCipher {
+    if (data.size > limits.maximumDerBytes) return pbeFailed("encrypted DER byte limit exceeded")
+    val outer = derItem(data, 0, data.size)
+    if (!outer.ok || outer.tag != DER_SEQUENCE || outer.end != data.size) return pbeFailed("invalid EncryptedPrivateKeyInfo")
+    val algorithm = derItem(data, outer.start, outer.end)
+    if (!algorithm.ok) return pbeFailed("invalid EncryptedPrivateKeyInfo")
+    val encrypted = derItem(data, algorithm.end, outer.end)
+    if (!encrypted.ok || encrypted.tag != DER_OCTET_STRING || encrypted.end != outer.end) return pbeFailed("invalid EncryptedPrivateKeyInfo")
+    pbeParameters(data, algorithm, data.slice(encrypted.start, encrypted.end), limits)
+}
+private trusted fun pbeDecrypt(cipher: PbeCipher, password: CryptoPassword, var budget: PbeBudget): CryptoResult {
+    val derived = nativeByteBuffer(cipher.keyBytes)
+    var result = cryptoFailed("wrong password or corrupt key")
+    if (pbeDerive(password, cipher.salt, cipher.iterations, cipher.sha1, derived, budget)) {
+        val opened = aesCbcDecryptPkcs7BufferKey(derived, cipher.iv, cipher.ciphertext)
+        if (opened.ok) result = opened
+    } else result = cryptoFailed(budget.error)
+    pbeWipe(ablaUnsafePointerAddress(derived.address), derived.capacity)
+    result
+}
+/** Checked PBES2 envelope. Plaintext is a managed DER string, as in the existing
+ * RSA parser. This is not authenticated encryption or an entire-loader CT claim. */
+trusted fun pbeOpenPkcs8(data: string, password: CryptoPassword,
+    limits: RsaKeyReadLimits = rsaKeyReadLimits()): CryptoResult {
+    if (!rsaKeyReadLimitsValid(limits)) return cryptoFailed("invalid RSA key read limits")
+    if (!password.ok()) return cryptoFailed(password.error())
+    val cipher = pbeEncryptedInfo(data, limits)
+    if (cipher.error != "") return cryptoFailed(cipher.error)
+    val budget = PbeBudget(limits)
+    pbeDecrypt(cipher, password, budget)
+}

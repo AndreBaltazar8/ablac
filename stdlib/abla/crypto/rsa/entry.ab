@@ -13,6 +13,7 @@ import "abla/text"
 import "abla/unsafe/memory"
 import "abla/unsafe/memory/raw"
 export import "abla/crypto/result"
+export import "abla/crypto/pbe"
 
 // --- Randomness: encryption and blinding need it, and refuse without it --------------------
 
@@ -298,14 +299,14 @@ trusted fun rsaPrivateKeyFromDer(der: string): RsaPrivateKey {
     else rsaPrivateFromPkcs1(der, 0, der.size, unreadable)
 }
 
-/** `PRIVATE KEY` (PKCS#8) or `RSA PRIVATE KEY` (PKCS#1). Encrypted ones are refused, as are RSA PSS keys:
- *  abla/crypto/hosted reads those. */
+/** Unencrypted `PRIVATE KEY` (PKCS#8) or `RSA PRIVATE KEY` (PKCS#1).
+ * Use the CryptoPassword overload for PBES2. RSA-PSS remains hosted-only. */
 trusted fun rsaPrivateKeyFromPem(pem: string): RsaPrivateKey {
     val unreadable = "not a readable RSA private key in PEM"
     val label = pemLabel(pem)
-    if (label == "ENCRYPTED PRIVATE KEY") return rsaPrivateFailed("an encrypted key: abla/crypto/rsa doesn't read these")
+    if (label == "ENCRYPTED PRIVATE KEY") return rsaPrivateFailed("encrypted private key requires CryptoPassword")
     val body = pemBody(pem, label)
-    if (bodyHasHeaders(body)) return rsaPrivateFailed("an encrypted key: abla/crypto/rsa doesn't read these")
+    if (bodyHasHeaders(body)) return rsaPrivateFailed("unsupported legacy PEM Proc-Type encryption")
     val der = pemBase64Decode(body)
     if (der == "") return rsaPrivateFailed(unreadable)
     if (label == "PRIVATE KEY") return rsaPrivateFromPkcs8(der, unreadable)
@@ -1470,3 +1471,59 @@ trusted fun RsaPrivateKey.toPkcs8Der(): CryptoResult = rsaPrivateExportDer(this)
 
 /** Export an unencrypted PKCS#8 PRIVATE KEY PEM. */
 trusted fun RsaPrivateKey.toPkcs8Pem(): CryptoResult = rsaPrivateExportPem(this)
+
+// Keep decrypted private integers within the existing 16384-bit RSA boundary
+// before the ordinary parser can allocate/multiply attacker-sized CRT values.
+private fun rsaEncryptedDerBounded(der: string): bool {
+    val root = derItem(der, 0, der.size)
+    if (!root.ok || root.tag != DER_SEQUENCE || root.end != der.size) return false
+    val version = derItem(der, root.start, root.end)
+    if (!version.ok || version.tag != DER_INTEGER || version.end - version.start != 1) return false
+    val algorithm = derItem(der, version.end, root.end)
+    if (!algorithm.ok) return false
+    val octets = derItem(der, algorithm.end, root.end)
+    if (!octets.ok || octets.tag != DER_OCTET_STRING) return false
+    val pkcs1 = derItem(der, octets.start, octets.end)
+    if (!pkcs1.ok || pkcs1.tag != DER_SEQUENCE || pkcs1.end != octets.end) return false
+    var at = pkcs1.start
+    var count = 0
+    while (at < pkcs1.end && count < 9) {
+        val item = derItem(der, at, pkcs1.end)
+        if (!item.ok || item.tag != DER_INTEGER || item.end - item.start > rsaMaximumBits / 8 + 1) return false
+        at = item.end
+        count += 1
+    }
+    count == 9 && at == pkcs1.end
+}
+
+/** Reads PBES2-encrypted PKCS#8 using an owned password copy. */
+trusted fun rsaPrivateKeyFromDer(der: string, password: CryptoPassword,
+    limits: RsaKeyReadLimits = rsaKeyReadLimits()): RsaPrivateKey {
+    if (!rsaKeyReadLimitsValid(limits)) return rsaPrivateFailed("invalid RSA key read limits")
+    if (der.size > limits.maximumDerBytes) return rsaPrivateFailed("encrypted DER byte limit exceeded")
+    val root = derItem(der, 0, der.size)
+    if (root.ok && root.tag == DER_SEQUENCE) {
+        val first = derItem(der, root.start, root.end)
+        if (first.ok && first.tag == DER_INTEGER) return rsaPrivateKeyFromDer(der)
+    }
+    val opened = pbeOpenPkcs8(der, password, limits)
+    if (opened.ok && rsaEncryptedDerBounded(opened.bytes)) {
+        val key = rsaPrivateFromPkcs8(opened.bytes, "wrong password or corrupt key")
+        if (key.ok()) return key
+    } else if (!opened.ok && opened.error != "wrong password or corrupt key") return rsaPrivateFailed(opened.error)
+    // Password, padding and decrypted DER failures converge here.
+    rsaPrivateFailed("wrong password or corrupt key")
+}
+trusted fun rsaPrivateKeyFromPem(pem: string, password: CryptoPassword,
+    limits: RsaKeyReadLimits = rsaKeyReadLimits()): RsaPrivateKey {
+    if (!rsaKeyReadLimitsValid(limits)) return rsaPrivateFailed("invalid RSA key read limits")
+    if (pem.size > limits.maximumPemBytes) return rsaPrivateFailed("encrypted PEM byte limit exceeded")
+    val label = pemLabel(pem)
+    if (label != "ENCRYPTED PRIVATE KEY") {
+        if (bodyHasHeaders(pemBody(pem, label))) return rsaPrivateFailed("unsupported legacy PEM Proc-Type encryption")
+        return rsaPrivateKeyFromPem(pem)
+    }
+    val der = pemBase64Decode(pemBody(pem, label))
+    if (der == "") return rsaPrivateFailed("invalid encrypted PEM base64")
+    rsaPrivateKeyFromDer(der, password, limits)
+}

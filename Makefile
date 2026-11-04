@@ -288,6 +288,7 @@ test-serial: ablac
 	tools/test-tls-unix.sh $(COMPILER)
 	tools/test-crypto.sh $(COMPILER)
 	tools/test-crypto-pure.sh $(COMPILER)
+	tools/test-crypto-encrypted-rsa.sh $(COMPILER)
 	tools/test-rsa-export.sh $(COMPILER)
 	tools/test-rsa-keygen.sh $(COMPILER)
 	tools/test-import-aliases.sh $(COMPILER)

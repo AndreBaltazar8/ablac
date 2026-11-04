@@ -8,6 +8,7 @@ import "abla/simd/target"
 import "abla/simd"
 import "abla/unsafe/memory"
 import "abla/unsafe/memory/raw"
+import "abla/unsafe/mmio"
 export import "abla/crypto/result"
 
 // --- Memory: raw words, aligned because this module allocates them --------------------------
@@ -34,7 +35,8 @@ export import "abla/crypto/result"
 }
 
 trusted fun aesWipe(address: int, size: int): void {
-    for (at in 0 until size) ablaUnsafeStoreU8(aesPointer(address + at), 0)
+    // Volatile stores retain the wipe even when it immediately precedes free.
+    for (at in 0 until size) ablaUnsafeVolatileStoreU8(address + at, 0)
 }
 
 // --- The bitsliced core -----------------------------------------------------------------
@@ -364,8 +366,11 @@ private val AES_SCRATCH_BYTES = 64
 
 @inline fun AesKey.schedule(): int = this.memory + AES_SCRATCH_BYTES
 
-@noinline trusted fun aesExpand(key: string, hardware: bool): AesKey {
-    val words = key.size / 4
+@noinline trusted fun aesExpand(key: string, hardware: bool): AesKey =
+    aesExpandBytes(0, key.size, hardware, key)
+
+private @noinline trusted fun aesExpandBytes(data: int, count: int, hardware: bool, owner: string): AesKey {
+    val words = count / 4
     val rounds = words + 6
     val total = 4 * (rounds + 1)
     // Scratch, the schedule (and the decryption keys hardware wants), and the bitsliced keys.
@@ -373,8 +378,10 @@ private val AES_SCRATCH_BYTES = 64
     val memory = ablaUnsafePointerAddress(ablaUnsafeAllocate(size))
     val result = AesKey(memory, size, rounds, hardware)
     val schedule = result.schedule()
-    val data = ablaUnsafeStringAddress(key)
-    for (i in 0 until words) aesStore(schedule + i * 4, aesLoadBytes(data + i * 4))
+    // Materialize a managed string's address after the allocations above. The
+    // owner stays rooted across them; buffer-key callers borrow native memory.
+    val source = if (owner.size > 0) ablaUnsafeStringAddress(owner) else data
+    for (i in 0 until words) aesStore(schedule + i * 4, aesLoadBytes(source + i * 4))
     var rcon = secretU32(u32(1))
     for (i in words until total) {
         var t = aesLoad(schedule + (i - 1) * 4)
@@ -579,10 +586,24 @@ trusted fun aesCbcDecryptPkcs7(key: string, iv: string, ciphertext: string): Cry
         return cryptoFailed("the ciphertext isn't a whole number of 16-byte blocks")
     }
     val expanded = aesExpand(key, aesHardwareAvailable())
+    aesCbcDecryptExpanded(expanded, iv, ciphertext)
+}
+
+/** Buffer-key adapter: borrows a checked16/24/32-byte native buffer, never
+ * copies the key into a managed string. The caller owns and wipes that buffer. */
+trusted fun aesCbcDecryptPkcs7BufferKey(key: NativeByteBuffer, iv: string, ciphertext: string): CryptoResult {
+    if (key.closed || (key.capacity != 16 && key.capacity != 24 && key.capacity != 32)) return cryptoFailed("an AES key has 16, 24 or 32 bytes")
+    if (iv.size != 16) return cryptoFailed("an AES-CBC IV has 16 bytes")
+    if (ciphertext.size == 0 || ciphertext.size % 16 != 0) return cryptoFailed("the ciphertext isn't a whole number of 16-byte blocks")
+    val expanded = aesExpandBytes(ablaUnsafePointerAddress(key.address), key.capacity, aesHardwareAvailable(), "")
+    aesCbcDecryptExpanded(expanded, iv, ciphertext)
+}
+
+private trusted fun aesCbcDecryptExpanded(key: AesKey, iv: string, ciphertext: string): CryptoResult {
     val buffer = nativeByteBuffer(ciphertext.size + 1)
     val address = ablaUnsafePointerAddress(buffer.pointerAt(0))
     val input = ablaUnsafeStringAddress(ciphertext)
-    aesBlocks(expanded, false, input, address, ciphertext.size / 16)
+    aesBlocks(key, false, input, address, ciphertext.size / 16)
     for (at in 0 until ciphertext.size) {
         val chain = if (at < 16) ablaUnsafeLoadU8(aesPointer(ablaUnsafeStringAddress(iv) + at))
             else ablaUnsafeLoadU8(aesPointer(input + at - 16))

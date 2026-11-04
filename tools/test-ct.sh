@@ -21,6 +21,7 @@ cp -R tests/cases/ct "$cases"
 # Keep the private implementation private: test the exact production source in
 # the generated fixture's own module, never through a public test hook.
 sed -n '/^\/\/ BEGIN RSA SECRET BIGNUM PRIMITIVES$/,/^\/\/ END RSA SECRET BIGNUM PRIMITIVES$/p' stdlib/abla/crypto/rsa/entry.ab >> "$cases/fixture.ab"
+sed -n '/^\/\/ BEGIN PBE SECRET CORES$/,/^\/\/ END PBE SECRET CORES$/p' stdlib/abla/crypto/pbe/entry.ab >> "$cases/fixture.ab"
 # Staged build drivers need the scratch fixture paths as well.
 sed -i 's@tests/cases/ct/@build/ct/cases/@g' "$cases/build.ab" "$cases/aarch64-build.ab"
 python3 -I tools/ct/test-check-asm.py
@@ -38,6 +39,9 @@ fixtures=(
     ct_fix_secret_division:@0,@1 ct_fix_secret_exact:@0,@1 ct_fix_secret_reduce:@0,@1 ct_fix_secret_divsteps:@0,@1 ct_fix_secret_gcd:@0,@1 ct_fix_secret_inverse:@0,@1
     ct_fix_rsa_subtract_one:@1 ct_fix_rsa_greater:@0,@1
     ct_fix_base64:0
+    ct_pbe_sha1:@0,@1,@2 ct_pbe_sha256:@0,@1,@2
+    ct_pbe_hmac1:@0 ct_pbe_hmac256:@0 ct_pbe_xor1:@0 ct_pbe_xor256:@0
+    ct_pbe_password_pad:@0,@1
 )
 for width in 1 3 128; do
     fixtures+=("ct_fix_inverse_$width:@0,@1" "ct_fix_gcd_$width:@0,@1"
@@ -46,7 +50,7 @@ done
 # Xtensa passes later pointer parameters on the stack; its checker cannot yet
 # taint those parameters, so this separate-pointer shape is read on these ABIs.
 host_fixtures=(ct_fix_wide_separate:@0,@1,@2,@3,@5)
-leaks=(ct_leak_branch:0 ct_leak_index:0 ct_leak_compare:@0,@1 ct_leak_divide:0,1)
+leaks=(ct_leak_branch:0 ct_leak_index:0 ct_leak_compare:@0,@1 ct_leak_divide:0,1 ct_pbe_leak:@0)
 
 # Hand-written spill regressions ensure the test includes the actual assembly pattern.
 llvm-mc -triple x86_64-linux-gnu -filetype=obj "$cases/pointer-spill-x86.s" -o "$out/pointer-spill-x86.o"
