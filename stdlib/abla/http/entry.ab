@@ -586,18 +586,102 @@ fun httpParseRequest(input: string): HttpRequest =
     else httpParseRequestNative(input)
 
 private trusted fun httpParseRequestNative(input: string): HttpRequest {
-    val requestLineEnd = httpLineEnd(input, 0)
-    val firstSpace = httpFindByte(input, 32, 0, requestLineEnd)
-    val secondSpace = httpFindByte(input, 32, firstSpace + 1, requestLineEnd)
+    val sourceSize = input.size
+    // No call or allocation occurs between this acquisition and the first
+    // substring below. Each byte belongs to one request-line phase.
+    val sourceData = if (sourceSize > 0) ablaUnsafeStringAddress(input) else 0
+    var requestLineEnd = sourceSize
+    var firstSpace = -1
+    var secondSpace = -1
+    var questionAt = -1
+    var scan = 0
+    // Each hot loop has a valid one-byte lookahead; handle a final lone
+    // byte separately so partial inputs keep their original semantics.
+    val last = sourceSize - 1
+    while (scan < last) {
+        val byte = ablaUnsafeLoadU8(nativePointerFromAddress(sourceData + scan))
+        if (byte == 13 &&
+            ablaUnsafeLoadU8(nativePointerFromAddress(sourceData + scan + 1)) == 10) {
+            requestLineEnd = scan
+            break
+        }
+        if (byte == 32) {
+            firstSpace = scan
+            scan = scan + 1
+            break
+        }
+        scan = scan + 1
+    }
+    if (firstSpace < 0 && requestLineEnd == sourceSize && scan < sourceSize) {
+        if (ablaUnsafeLoadU8(nativePointerFromAddress(sourceData + scan)) == 32) firstSpace = scan
+        scan = scan + 1
+    }
+    if (firstSpace >= 0) {
+        while (scan < last) {
+            val byte = ablaUnsafeLoadU8(nativePointerFromAddress(sourceData + scan))
+            if (byte == 13 &&
+                ablaUnsafeLoadU8(nativePointerFromAddress(sourceData + scan + 1)) == 10) {
+                requestLineEnd = scan
+                break
+            }
+            if (byte == 32) {
+                secondSpace = scan
+                scan = scan + 1
+                break
+            }
+            if (byte == 63) {
+                questionAt = scan
+                scan = scan + 1
+                break
+            }
+            scan = scan + 1
+        }
+    }
+    if (questionAt >= 0 && secondSpace < 0 && requestLineEnd == sourceSize) {
+        // Once '?' is found, query bytes need only the space/CRLF tests.
+        while (scan < last) {
+            val byte = ablaUnsafeLoadU8(nativePointerFromAddress(sourceData + scan))
+            if (byte == 13 &&
+                ablaUnsafeLoadU8(nativePointerFromAddress(sourceData + scan + 1)) == 10) {
+                requestLineEnd = scan
+                break
+            }
+            if (byte == 32) {
+                secondSpace = scan
+                scan = scan + 1
+                break
+            }
+            scan = scan + 1
+        }
+    }
+    if (firstSpace >= 0 && secondSpace < 0 &&
+        requestLineEnd == sourceSize && scan < sourceSize) {
+        val byte = ablaUnsafeLoadU8(nativePointerFromAddress(sourceData + scan))
+        if (byte == 32) secondSpace = scan
+        else if (byte == 63 && questionAt < 0) questionAt = scan
+        scan = scan + 1
+    }
+    if (secondSpace >= 0) {
+        // Version contents remain ignored, exactly as in the checked parser.
+        while (scan < last) {
+            if (ablaUnsafeLoadU8(nativePointerFromAddress(sourceData + scan)) == 13 &&
+                ablaUnsafeLoadU8(nativePointerFromAddress(sourceData + scan + 1)) == 10) {
+                requestLineEnd = scan
+                break
+            }
+            scan = scan + 1
+        }
+    }
     var method = ""
     var target = "/"
+    var question = -1
     if (firstSpace > 0 && secondSpace > firstSpace) {
         method = input.slice(0, firstSpace)
         target = input.slice(firstSpace + 1, secondSpace)
+        if (questionAt >= 0) question = questionAt - firstSpace - 1
     }
     var path = target
     var query = ""
-    val question = httpFindByte(target, 63, 0, target.size)
     if (question >= 0) {
         path = target.slice(0, question)
         query = target.slice(question + 1, target.size)
