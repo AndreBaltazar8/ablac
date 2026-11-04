@@ -273,6 +273,11 @@ Package-side work (not changed from ablac):
   65% dearer than `--fast`'s (abla-qr: 28 G instructions against 17 G) for tests that run 10x
   faster; a suite of tests that each run in milliseconds is slower than before. `--fast` keeps
   the old profile; the `--o1` pipeline itself hasn't been trimmed as the release one was.
+  Codegen-level screen (2026-11-04, three alternating cold pairs): keep LLVM Less. None
+  with the same optimized IR cuts PDF build+run instructions 27.6%, but QR's rise 89.7%
+  and its stripped executable grows 82%; NovaKind tool builds drop 53% (help smoke only).
+  No single default wins: do not add a program heuristic. Worktree ablac-o1-codegen,
+  build/codegen-lab/report.md has the raw build/run/size data.
 - [ ] **A map is built on boxed generic arrays.** maps spends 21% in `__ablaRuntimeMapEntry`, 12% in
   `abla_map_set`, 17% appending to and setting its parts' arrays (2026-11-02). Since string
   concatenation allocates out of line, maps runs 1.3% more instructions.
