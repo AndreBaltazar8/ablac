@@ -66,7 +66,7 @@
   still needed.
   Equality and hashing through `any` currently ignore the auxiliary word, so
   a boxed float and an integer with identical payload bits compare equal and
-  share a map key; deciding whether to change that is a separate language issue.
+  hash alike through `any`; deciding whether to change that is a separate language issue.
 
 - [ ] **Xtensa `llc` aborts on frames of 128 to 255 bytes that take a stack address.** `LLVM ERROR: Error
   while trying to spill A6 from class AR: Cannot scavenge register without an emergency spill slot!`, seen
