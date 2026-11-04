@@ -1,0 +1,304 @@
+import "parser.ab"
+import "f32_literal.ab"
+// Named-call selection uses sema's inference and lexical scopes. This cache is
+// created only for a named call the early normalizer cannot otherwise select.
+import "sema.ab"
+import "named_arguments.ab"
+import "generic_types.ab"
+import "generics.ab"
+import "ct_infer.ab"
+import "abla/text"
+import "abla/sys/linux/io"
+import "abla/sys/linux/process"
+
+class BootstrapNamedChoice(
+    val source: string, val begin: int, val end: int, val kind: string, val text: string,
+    val declaration: int, val method: int, val member: bool, val result: string
+)
+class BootstrapNamedProbe(val choices: array<BootstrapNamedChoice>) {
+    fun find(source: string, expression: BootstrapExpression): BootstrapNamedChoice? {
+        var found: BootstrapNamedChoice? = null
+        for (choice in this.choices) {
+            if (choice.source == source && choice.begin == expression.begin &&
+                choice.end == expression.end && choice.kind == expression.kind &&
+                choice.text == expression.text) {
+                val previous = found
+                if (previous != null && (previous.declaration != choice.declaration ||
+                    previous.method != choice.method)) return null
+                found = choice
+            }
+        }
+        found
+    }
+}
+fun bootstrapNamedHasArguments(expression: BootstrapExpression): bool {
+    for (child in expression.children) if (child.kind == "named.argument") return true
+    false
+}
+fun bootstrapNamedProbeBody(expression: BootstrapExpression): bool {
+    if ((expression.kind == "call" || expression.kind == "member.call") &&
+        bootstrapNamedHasArguments(expression)) return true
+    for (child in expression.children) if (bootstrapNamedProbeBody(child)) return true
+    false
+}
+fun bootstrapNamedProbeUnknown(type: string): bool = type == "unknown" || type == "any" ||
+    type == "inferred" || type == "" || type.contains("unknown") ||
+    type.contains(BOOTSTRAP_GENERIC_PARAMETER_MARK)
+
+// Raw generic bodies have not acquired their placeholder classes yet. Their
+// type parameters are unknown too; never use an uninstantiated T to reject a
+// concrete candidate (or select a competing any overload).
+fun bootstrapNamedContextParameters(analyzer: BootstrapAnalyzer): array<string> {
+    val names: array<string> = []
+    for (declaration in analyzer.declarations) {
+        if (declaration.expression == analyzer.currentBody) {
+            for (name in bootstrapGenericParameterNames(declaration)) names.append(name)
+        }
+        for (method in declaration.methods) {
+            if (method.expression == analyzer.currentBody) {
+                for (name in bootstrapGenericParameterNames(declaration)) names.append(name)
+                for (name in bootstrapGenericParameterNames(method)) names.append(name)
+            }
+        }
+    }
+    names
+}
+fun bootstrapNamedUnknownIn(type: string, parameters: array<string>): bool =
+    bootstrapNamedProbeUnknown(type) || bootstrapGenericMentions(bootstrapGenericParse(type), parameters)
+
+// Only call selection lives here. Expression typing (including locals,
+// refinements, generic calls and nested scopes) is always analyzer.infer.
+fun bootstrapInferNamedChoice(var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression): string {
+    val cache = analyzer.namedProbe
+    if (cache == null) return ""
+    val previous = cache.find(analyzer.currentSourceIdentity, expression)
+    if (previous != null) return previous.result
+    val named = bootstrapNamedHasArguments(expression)
+    val name = bootstrapNamedCallBase(expression.text)
+    val members = expression.kind == "member.call"
+    if (!members && analyzer.callsLocal(expression.text, expression.children.size)) {
+        return if (named) "unknown" else ""
+    }
+    var receiver = ""
+    var rawReceiver = ""
+    if (members) {
+        rawReceiver = analyzer.infer(expression.children[0])
+        receiver = bootstrapBorrowElementType(rawReceiver)
+    }
+    else if (analyzer.currentOwner != "") receiver = analyzer.currentOwner
+    else {
+        val local = analyzer.visibleLocalIndex("this")
+        if (local >= 0) receiver = bootstrapBorrowElementType(analyzer.locals[local].type)
+    }
+    val declarations: array<int> = []
+    val methods: array<int> = []
+    var index = 0
+    // A plain receiver method wins over a free function as in receiver_names.
+    if (receiver != "" && !bootstrapNamedProbeUnknown(receiver)) {
+        while (index < analyzer.declarations.size) {
+            val owner = analyzer.declarations[index]
+            if (owner.kind == "class" || owner.kind == "interface") {
+                if (owner.name == receiver) {
+                    var method = 0
+                    while (method < owner.methods.size) {
+                        if (owner.methods[method].name == name) {
+                            declarations.append(index); methods.append(method)
+                        }
+                        method = method + 1
+                    }
+                }
+            } else if (owner.extensionOwner != "" && owner.name == name &&
+                bootstrapNormalizeType(owner.extensionOwner) == receiver) {
+                declarations.append(index); methods.append(-1)
+            }
+            index = index + 1
+        }
+    }
+    val member = members || declarations.size > 0
+    if (!member) {
+        index = 0
+        while (index < analyzer.declarations.size) {
+            val declaration = analyzer.declarations[index]
+            if (declaration.extensionOwner == "" && declaration.name == name &&
+                (declaration.kind == "fun" || declaration.kind == "compile.fun" ||
+                 declaration.kind == "class")) {
+                declarations.append(index); methods.append(-1)
+            }
+            index = index + 1
+        }
+    }
+    if (!named && declarations.size < 2) {
+        // The receiver was already inferred above: continue through sema's
+        // ordinary member/generic-call inference without inferring it twice.
+        if (members) {
+            if (analyzer.generics.probing) {
+                val generic = bootstrapGenericInferMemberCall(analyzer, expression, receiver)
+                if (generic != "") return generic
+            }
+            return bootstrapInferMemberCall(analyzer, expression, rawReceiver, receiver, "unknown")
+        }
+        if (!member) return ""
+    }
+    // No known receiver cannot select among owners: retain the old ambiguity.
+    if (members && bootstrapNamedProbeUnknown(receiver)) return "unknown"
+    val contextParameters = bootstrapNamedContextParameters(analyzer)
+    val types: array<string> = []
+    val values: array<BootstrapExpression> = []
+    var unknown = false
+    index = if (members) 1 else 0
+    while (index < expression.children.size) {
+        val child = expression.children[index]
+        val value = if (child.kind == "named.argument" && child.children.size == 1)
+            child.children[0] else child
+        values.append(value)
+        val type = bootstrapBorrowElementType(analyzer.infer(value))
+        types.append(type)
+        if (bootstrapNamedUnknownIn(type, contextParameters)) unknown = true
+        index = index + 1
+    }
+    var best = -1
+    var bestScore = -1
+    var ties = false
+    var fitting = 0
+    var resultType = "unknown"
+    var candidate = 0
+    while (candidate < declarations.size) {
+        val owner = analyzer.declarations[declarations[candidate]]
+        val declaration = if (methods[candidate] >= 0) owner.methods[methods[candidate]] else owner
+        val supplied: array<bool> = []
+        for (parameter in declaration.parameters) supplied.append(false)
+        val mapping: array<int> = []
+        var position = 0
+        var fits = true
+        var sawNamed = false
+        index = if (members) 1 else 0
+        while (index < expression.children.size) {
+            val argument = expression.children[index]
+            var parameter = -1
+            if (argument.kind == "named.argument") {
+                sawNamed = true
+                var at = 0
+                while (at < declaration.parameters.size) {
+                    if (declaration.parameters[at] == argument.text) parameter = at
+                    at = at + 1
+                }
+            } else {
+                if (sawNamed) fits = false
+                while (position < declaration.parameters.size &&
+                    bootstrapIsAnyDelegatedProperty(declaration, position)) position = position + 1
+                parameter = position
+                position = position + 1
+            }
+            mapping.append(parameter)
+            if (parameter < 0 || parameter >= supplied.size) fits = false
+            else if (supplied[parameter]) fits = false
+            else supplied[parameter] = true
+            index = index + 1
+        }
+        var parameter = 0
+        while (parameter < supplied.size) {
+            if (!supplied[parameter] && !bootstrapIsAnyDelegatedProperty(declaration, parameter) &&
+                (parameter >= declaration.parameterDefaults.size ||
+                 declaration.parameterDefaults[parameter].kind == "missing")) fits = false
+            parameter = parameter + 1
+        }
+        val parameters = bootstrapGenericParameterNames(declaration)
+        val bindings: array<string> = []
+        for (parameterName in parameters) bindings.append("")
+        val explicit = bootstrapGenericCalleeArguments(expression.text)
+        if (explicit.size > 0 && explicit.size != parameters.size) fits = false
+        index = 0
+        while (index < explicit.size && index < bindings.size) {
+            bindings[index] = bootstrapNormalizeType(explicit[index]); index = index + 1
+        }
+        index = 0
+        while (fits && index < mapping.size) {
+            parameter = mapping[index]
+            if (parameter < declaration.parameterTypes.size && !bootstrapNamedUnknownIn(types[index], contextParameters)) {
+                bootstrapGenericUnifyConforming(analyzer.declarations, analyzer.generics,
+                    bootstrapGenericPattern(declaration.parameterTypes[parameter], analyzer.generics),
+                    bootstrapGenericParse(types[index]), parameters, bindings)
+            }
+            index = index + 1
+        }
+        var score = 0
+        index = 0
+        while (fits && index < mapping.size) {
+            parameter = mapping[index]
+            val pattern = bootstrapGenericPattern(declaration.parameterTypes[parameter], analyzer.generics)
+            val bound = bootstrapGenericSubstitute(pattern, parameters, bindings)
+            val expected = bootstrapNormalizeType(bootstrapGenericTypeString(bound))
+            val actual = types[index]
+            if (bootstrapNamedUnknownIn(actual, contextParameters) || bootstrapGenericMentions(bound, parameters)) {}
+            else if (expected == actual) score = score + 1
+            else if (expected == "f32" && actual == "f64" && bootstrapIsFloatLiteralExpression(values[index])) {}
+            else if (!analyzer.typesOrUpcast(expected, actual)) fits = false
+            index = index + 1
+        }
+        if (fits) {
+            fitting = fitting + 1
+            if (score > bestScore) {
+                best = candidate; bestScore = score; ties = false
+                val returned = bootstrapGenericSubstitute(
+                    bootstrapGenericPattern(declaration.resultType, analyzer.generics), parameters, bindings)
+                resultType = if (declaration.kind == "class") declaration.name
+                    else if (bootstrapGenericMentions(returned, parameters)) "unknown"
+                    else bootstrapNormalizeType(bootstrapGenericTypeString(returned))
+            } else if (score == bestScore) ties = true
+        }
+        candidate = candidate + 1
+    }
+    if (ties || (unknown && fitting > 1)) best = -1
+    val selected = if (best >= 0) declarations[best] else -2
+    val method = if (best >= 0) methods[best] else -1
+    if (best < 0) resultType = "unknown"
+    else if (resultType == "inferred") {
+        val owner = analyzer.declarations[selected]
+        val declaration = if (method >= 0) owner.methods[method] else owner
+        var handle = selected
+        if (method >= 0) {
+            var entry = 0
+            while (entry < analyzer.methodDeclarations.declarations.size) {
+                if (analyzer.methodDeclarations.declarations[entry] == declaration) {
+                    handle = analyzer.methodDeclarations.handles[entry]
+                }
+                entry = entry + 1
+            }
+        }
+        resultType = bootstrapResolvedResultType(analyzer, declaration, handle,
+            if (method >= 0) owner.name else "", expression.begin)
+    }
+    cache.choices.append(BootstrapNamedChoice(analyzer.currentSourceIdentity,
+        expression.begin, expression.end, expression.kind, expression.text,
+        selected, method, member, resultType))
+    resultType
+}
+
+fun bootstrapBuildNamedProbe(declarations: array<BootstrapDeclaration>): BootstrapNamedProbe {
+    val cache = BootstrapNamedProbe([])
+    var bodies = bootstrapStringSet()
+    val ids: array<string> = []
+    val names: array<string> = []
+    val owners: array<string> = []
+    val templates: array<BootstrapDeclaration> = []
+    for (declaration in declarations) {
+        if (bootstrapNamedProbeBody(declaration.expression)) bodies.add(bootstrapOverloadBodyKey(declaration))
+        for (method in declaration.methods) {
+            if (bootstrapNamedProbeBody(method.expression)) bodies.add(bootstrapOverloadBodyKey(method))
+        }
+        if (bootstrapGenericIsTemplate(declaration)) {
+            ids.append(declaration.name); names.append(declaration.name)
+            owners.append(if (declaration.extensionOwner == "") "" else bootstrapNormalizeType(declaration.extensionOwner)); templates.append(declaration)
+        }
+    }
+    val input = BootstrapParseResult(declarations, [], 0, 0, [], [], "")
+    var analyzer = bootstrapAnalyzer(input, [], [], [], [], bootstrapNoOverloads(), false, false,
+        BootstrapGenericTable(ids, names, owners, templates, true, bodies))
+    analyzer.namedProbe = cache
+    analyzer.analyze(input)
+    if (linuxEnvironment("ABLA_NAMED_PROBE_TRACE").value == "1") {
+        linuxPrintStandardError("named.probe:1 calls:${cache.choices.size}\n")
+    }
+    cache
+}

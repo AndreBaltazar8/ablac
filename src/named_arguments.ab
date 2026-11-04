@@ -1,3 +1,4 @@
+import "named_overload.ab"
 // Named arguments become positional before analysis
 // (bootstrapNormalizeNamedArguments), and compile-time code's edits are
 // committed to the raw program (bootstrapCommitEdits), which a new body's named
@@ -118,7 +119,8 @@ class BootstrapNamedArgumentNormalizer(
     var callerNames: array<string> = [],
     // Functions that read a global a caller's name hides (globalAccessor).
     val accessors: array<BootstrapDeclaration> = [],
-    val affineTypes: array<string> = []
+    val affineTypes: array<string> = [],
+    var typeProbe: BootstrapNamedProbe? = null
 ) {
     fun fail(code: string, message: string, expression: BootstrapExpression) {
         this.errors = this.errors + 1
@@ -126,6 +128,24 @@ class BootstrapNamedArgumentNormalizer(
             "${this.diagnostics}error[E_NAMED_ARGUMENT_$code]: $message\n"
         this.diagnostics =
             "${this.diagnostics}source[named-argument]:${this.sourceIdentity}:${expression.begin}:${expression.end}\n"
+    }
+
+    // Pin a selected free overload before defaults are inserted: defaults
+    // must not change the winner in the later positional overload pass.
+    fun selectedOverload(target: int): BootstrapDeclaration {
+        val declaration = this.declarations[target]
+        if (declaration.kind != "fun" && declaration.kind != "compile.fun") return declaration
+        val base = "__abla_named_selected_${declaration.name}_$target"
+        var name = base
+        var serial = 0
+        while (this.target(name) != -1) {
+            serial = serial + 1
+            name = "${base}_$serial"
+        }
+        for (accessor in this.accessors) if (accessor.name == name) return accessor
+        val copies = bootstrapNamedFunctionCopies([declaration], declaration.name, name)
+        this.accessors.append(copies[0])
+        copies[0]
     }
 
     fun target(name: string): int = this.targets.find(name)
@@ -546,6 +566,42 @@ class BootstrapNamedArgumentNormalizer(
         true
     }
 
+    fun differentOmittedDefaults(targets: BootstrapNamedMethodTargets,
+        children: array<BootstrapExpression>): bool {
+        if (targets.owners.size < 2) return false
+        val first = this.methodDeclaration(targets, 0)
+        var parameter = 0
+        while (parameter < first.parameters.size) {
+            var supplied = false
+            var positional = 0
+            var child = 1
+            while (child < children.size) {
+                val argument = children[child]
+                if (argument.kind == "named.argument") {
+                    if (argument.text == first.parameters[parameter]) supplied = true
+                } else {
+                    if (positional == parameter) supplied = true
+                    positional = positional + 1
+                }
+                child = child + 1
+            }
+            if (!supplied) {
+                var other = 1
+                while (other < targets.owners.size) {
+                    val declaration = this.methodDeclaration(targets, other)
+                    val firstHas = parameter < first.parameterDefaults.size
+                    val otherHas = parameter < declaration.parameterDefaults.size
+                    if (firstHas != otherHas) return true
+                    if (firstHas && !bootstrapSameExpression(first.parameterDefaults[parameter],
+                        declaration.parameterDefaults[parameter])) return true
+                    other = other + 1
+                }
+            }
+            parameter = parameter + 1
+        }
+        false
+    }
+
     // The class a target's defaults read the members of: a method's own
     // class, or an extension's receiver class (-1 when it is not a class).
     // The class whose members a target's default may name without `this`: a
@@ -731,6 +787,7 @@ class BootstrapNamedArgumentNormalizer(
         }
         var normalizeCall = hasNamed
         var selectedTarget = -1
+        var selectedOverload = -1
         var memberTargets = BootstrapNamedMethodTargets([], [])
         // A plain call in a method that the receiver's method takes is that
         // method's, before any top-level declaration of the name.
@@ -755,6 +812,21 @@ class BootstrapNamedArgumentNormalizer(
             selectedTarget = if (memberTargets.owners.size == 0) -1
                 else if (this.sameParameters(memberTargets)) 0
                 else -2
+        }
+        if (hasNamed && (selectedTarget == -2 ||
+            (result.kind == "member.call" && selectedTarget >= 0 &&
+             this.differentOmittedDefaults(memberTargets, result.children)))) {
+            if (this.typeProbe == null) this.typeProbe = bootstrapBuildNamedProbe(this.declarations)
+            val probe = this.typeProbe
+            val choice = if (probe != null) probe.find(this.sourceIdentity, expression) else null
+            if (choice != null && choice.declaration >= 0) {
+                selectedTarget = choice.declaration
+                if (!choice.member) selectedOverload = choice.declaration
+                if (choice.member) {
+                    memberTargets = BootstrapNamedMethodTargets([choice.declaration], [choice.method])
+                    selectedTarget = 0
+                }
+            }
         }
         if (!normalizeCall && selectedTarget >= 0 &&
             this.declarations[selectedTarget].kind == "class" &&
@@ -781,6 +853,7 @@ class BootstrapNamedArgumentNormalizer(
             }
             if (target >= 0) {
                 val declaration = if (method) this.methodDeclaration(memberTargets, 0)
+                    else if (selectedOverload >= 0) this.selectedOverload(selectedOverload)
                     else this.declarations[target]
                 val generic = declaration.typeParameters.size > 0 ||
                     (method && this.declarations[memberTargets.owners[0]].typeParameters.size > 0)
@@ -1116,6 +1189,8 @@ class BootstrapNamedArgumentNormalizer(
                     else result.kind,
                     if (wrapGenericDefaults)
                         "$wrapper${result.text.slice(bootstrapNamedCallBase(result.text).size, result.text.size)}"
+                    else if (selectedOverload >= 0)
+                        "${declaration.name}${result.text.slice(bootstrapNamedCallBase(result.text).size, result.text.size)}"
                     else result.text,
                     result.begin,
                     result.end,

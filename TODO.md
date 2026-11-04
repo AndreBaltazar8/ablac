@@ -138,7 +138,6 @@
 - [ ] **Not read in abla/crypto, though typed secret:** AES's key schedule and block loading, `rsaCrt`'s steps around
   the fixtures, `bnFromBytes`, `bnToBytes`, `bnResidueSquare`. Each could be a fixture.
 
-- [ ] Merge the explicit TLS Unix upgrade names into overloads after fixing named-call resolution: overloads differing only in their first argument type report `E_NAMED_ARGUMENT_TARGET` before argument typing. Minimal repro: `class A {}; class B {}; fun f(x: A, n: int = 0): int = n; fun f(x: B, n: int = 0): int = n; fun main: int = f(A(), n = 1)` (write declarations on separate lines). Keep the existing TCP names until this is fixed.
 - [ ] The rest of integers up to 256 bits: `uint256` is in (`abla/uint256`, docs/stdlib/uint256.md), with big-endian
       bytes. Left: signed 256, 128 both ways, and little-endian bytes, when something needs them.
 - [ ] **`ablac run` becomes a live JIT.** The direction for `run` is a live in-process JIT: a

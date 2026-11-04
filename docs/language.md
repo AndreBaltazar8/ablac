@@ -871,10 +871,13 @@ fun main {
   a default that can't move out of the caller is `E_NAMED_ARGUMENT_HIDDEN`: one
   calling a constructor or foreign function that the caller's local or field
   hides, when its type has a type parameter no earlier parameter gives. Pass the
-  argument. A named method call is resolved before types are known: every class
-  method and extension of that name with those parameter names must take the
-  same parameters (and fill an omitted one the same way), otherwise it is
-  `E_NAMED_ARGUMENT_TARGET` and the arguments go by position. Unknown, duplicate, out-of-order or
+  argument. For overloaded named calls, the compiler first types supplied
+  positional arguments in the caller's scope, then matches names and types
+  against each candidate. A known receiver selects its class's method or
+  extension, including that declaration's parameter order and defaults.
+  Selection never evaluates arguments or defaults. Equal candidates remain
+  `E_NAMED_ARGUMENT_TARGET`; if a type cannot yet be inferred before generic
+  instantiation, it does not eliminate a candidate or justify a guess. Unknown, duplicate, out-of-order or
   missing required names are errors (`E_NAMED_ARGUMENT_UNKNOWN`,
   `_DUPLICATE`, `_ORDER`, `_REQUIRED`).
 - Parameters borrow their arguments; `var` and `own` change that

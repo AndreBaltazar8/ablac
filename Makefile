@@ -247,6 +247,7 @@ test-serial: ablac
 	tools/test-runtime-checks.sh $(COMPILER)
 	tools/test-float-integer-saturation.sh $(COMPILER)
 	tools/test-named-method-arguments.sh $(COMPILER)
+	tools/test-named-overloads.sh $(COMPILER)
 	tools/test-map-resources.sh $(COMPILER)
 	tools/test-definite-assignment.sh $(COMPILER)
 	tools/test-shared-ownership.sh $(COMPILER)

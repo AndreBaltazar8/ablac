@@ -313,5 +313,4 @@ Unix upgrades support pathname sockets on Linux and Darwin, and Linux abstract
 sockets. A Unix peer has no IP `peerAddress` (`socketPeerAddress` returns null).
 Closing a TLS connection or listener does not unlink a Unix pathname: the caller
 still owns that cleanup. Existing TCP upgrade signatures and behavior are
-unchanged. Unix entry points have distinct names because the compiler currently
-reports ambiguous named calls for overloads differing only in stream type.
+unchanged. Unix entry points currently have distinct names; they share the same implementation.
