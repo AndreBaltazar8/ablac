@@ -246,6 +246,16 @@ Package-side work (not changed from ablac):
   metadata. Before the cap, measurements on 2026-11-01
   showed peak RSS against malloc for each: trees, strings and maps 7 to 19% lower, json-readers 33% higher
   (137 to 182 MB), json-megabyte varying between runs (190 to 319 MB against 243 to 308); remeasure with the cap.
+  Tried and dropped (2026-11-04): a host-only miss-path pool with4KiB pages and a
+  strict1MiB reservation, exact-size lists first and libc fallback,16-byte slot strides
+  but unchanged32-byte object headers. Fresh NovaKind icons saves11.81% instructions
+  for35 vectors and4.19% for140 (five pairs, exact SVGs). MVC instead rises3.52% health,
+  1.34% login,0.82% dashboard,0.80% query32 and0.93% invalid-login (three pairs, exact
+  bodies); body16k rises0.22%. Five endpoints fail the0.5% regression bar. Stop at that
+  gate: JSON/QR/compiler/firmware peaks and comprehensive threads/GC validation were not
+  run; no memory-success claim. The native string smoke and its GC-stress run passed.
+  Runtime source restored; prototype and raw data retained under
+  worktrees/ablac-small-pool/build/pool-lab/{report.md,prototype.patch,summary.json}.
 - [ ] **Run times of non-Linux hosted targets aren't measured with the new allocator and root frames.** macOS keeps
   its LTO link (`wholeProgram` is ELF only) and has not been built or run with these changes; Wasm passes the suite,
   its size and speed not compared. An earlier try at size lists on Darwin gained no cycles and raised peak memory.
