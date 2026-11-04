@@ -120,7 +120,6 @@
 
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
-- [ ] Ownership errors in a generic stdlib instantiation point to the helper, not the caller (e.g. `removeLast()` on `array<Resource>`).
 - [ ] `Path.writeText` is always 0666 less umask.
 - [ ] `abla/crypto/hosted` can use an RSA key but not generate one; `abla/crypto/rsa` provides pure key generation.
 - [ ] There is no YAML library: NovaKind's `provision-mail` edits `~/.config/icy/mail.yaml` by its lines and refuses anything else

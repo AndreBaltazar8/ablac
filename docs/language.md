@@ -1839,6 +1839,13 @@ fun main {
   evaluates the instance the call names. `#` code in a generic's body runs
   per instance ([below](#compile-time-code-per-instance)).
 
+Ownership errors in a concrete generic instantiation point to the first caller
+in source order. A note keeps the helper's location and the instance's type
+arguments. If that instance has several callers, the diagnostic adds
+"and N other call sites". Nested generic helpers trace back to their caller;
+errors in a generic definition itself keep the definition's location. If no
+caller can be recovered, the original helper location is retained.
+
 ### Generic methods
 
 A class's method may take type parameters of its own, besides its class's:

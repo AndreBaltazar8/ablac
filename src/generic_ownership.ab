@@ -1,0 +1,140 @@
+// Generic ownership diagnostics: reconstruct callers only on the failing path.
+import "parser.ab"
+import "sema.ab"
+import "generic_types.ab"
+
+class BootstrapGenericOwnershipSites(
+    val sources: array<string>,
+    val begins: array<int>,
+    val ends: array<int>,
+    val orders: array<int>,
+    val pending: array<string>,
+    val visited: BootstrapStringSet,
+    val keys: BootstrapStringSet
+)
+
+fun bootstrapGenericOwnershipCall(
+    expression: BootstrapExpression,
+    source: string,
+    order: int,
+    target: string,
+    var sites: BootstrapGenericOwnershipSites
+): void {
+    if ((expression.kind == "call" || expression.kind == "member.call" ||
+         expression.kind == "identifier") && expression.text == target) {
+        val owner = bootstrapGenericSourceInstance(source)
+        if (owner != "") {
+            if (!bootstrapGenericMentionsParameter(owner) && !sites.visited.contains(owner)) {
+                sites.visited.add(owner)
+                sites.pending.append(owner)
+            }
+        } else if (source != "" && expression.begin >= 0) {
+            val key = "$source\n${expression.begin}:${expression.end}"
+            if (!sites.keys.contains(key)) {
+                sites.keys.add(key)
+                sites.sources.append(source)
+                sites.begins.append(expression.begin)
+                sites.ends.append(expression.end)
+                sites.orders.append(order)
+            }
+        }
+    }
+    for (child in expression.children) {
+        bootstrapGenericOwnershipCall(child, source, order, target, sites)
+    }
+}
+
+fun bootstrapGenericOwnershipDeclaration(
+    declaration: BootstrapDeclaration,
+    order: int,
+    target: string,
+    var sites: BootstrapGenericOwnershipSites
+): void {
+    bootstrapGenericOwnershipCall(declaration.expression, declaration.sourceIdentity, order, target, sites)
+    for (value in declaration.parameterDefaults) {
+        bootstrapGenericOwnershipCall(value, declaration.sourceIdentity, order, target, sites)
+    }
+    for (method in declaration.methods) bootstrapGenericOwnershipDeclaration(method, order, target, sites)
+}
+
+fun bootstrapGenericOwnershipSites(
+    declarations: array<BootstrapDeclaration>,
+    instance: string
+): BootstrapGenericOwnershipSites {
+    val sites = BootstrapGenericOwnershipSites([], [], [], [], [instance], bootstrapStringSetOf([instance]), bootstrapStringSet())
+    var cursor = 0
+    while (cursor < sites.pending.size) {
+        val target = sites.pending[cursor]
+        cursor = cursor + 1
+        var order = 0
+        while (order < declarations.size) {
+            bootstrapGenericOwnershipDeclaration(declarations[order], order, target, sites)
+            order = order + 1
+        }
+    }
+    sites
+}
+
+fun bootstrapGenericOwnershipBlock(
+    block: string,
+    declarations: array<BootstrapDeclaration>
+): string {
+    var headerEnd = 0
+    while (headerEnd < block.size && block[headerEnd] != 10) headerEnd = headerEnd + 1
+    if (!bootstrapTextContains(block.slice(0, headerEnd), ": ownership.")) return block
+    var lineBegin = headerEnd + 1
+    while (lineBegin < block.size) {
+        var lineEnd = lineBegin
+        while (lineEnd < block.size && block[lineEnd] != 10) lineEnd = lineEnd + 1
+        val line = block.slice(lineBegin, lineEnd)
+        val prefix = "source[semantic]:"
+        if (line.size > prefix.size && line.slice(0, prefix.size) == prefix) {
+            var last = line.size - 1
+            while (last > prefix.size && line[last] != 58) last = last - 1
+            var middle = last - 1
+            while (middle > prefix.size && line[middle] != 58) middle = middle - 1
+            if (middle > prefix.size) {
+                val source = line.slice(prefix.size, middle)
+                val instance = bootstrapGenericSourceInstance(source)
+                if (instance == "" || bootstrapGenericMentionsParameter(instance)) return block
+                val sites = bootstrapGenericOwnershipSites(declarations, instance)
+                if (sites.sources.size == 0) return block
+                var first = 0
+                var site = 1
+                while (site < sites.sources.size) {
+                    if (sites.orders[site] < sites.orders[first] ||
+                        (sites.orders[site] == sites.orders[first] && sites.begins[site] < sites.begins[first])) first = site
+                    site = site + 1
+                }
+                val other = sites.sources.size - 1
+                val shared = if (other == 0) "" else "note: and $other other call ${if (other == 1) "site instantiates" else "sites instantiate"} this helper\n"
+                val replacement = "source[semantic]:${sites.sources[first]}:${sites.begins[first]}:${sites.ends[first]}\nnote: ownership error in this generic helper\nsource[generic-helper]:${line.slice(prefix.size, line.size)}\n$shared"
+                return "${block.slice(0, lineBegin)}$replacement${block.slice(if (lineEnd < block.size) lineEnd + 1 else lineEnd, block.size)}"
+            }
+        }
+        lineBegin = lineEnd + 1
+    }
+    block
+}
+
+fun bootstrapGenericOwnershipDiagnostics(
+    diagnostics: string,
+    declarations: array<BootstrapDeclaration>
+): string {
+    if (!bootstrapTextContains(diagnostics, ": ownership.") ||
+        !bootstrapTextContains(diagnostics, BOOTSTRAP_GENERIC_SOURCE_MARK)) return diagnostics
+    var output = ""
+    var blockBegin = 0
+    var lineBegin = 0
+    while (lineBegin < diagnostics.size) {
+        var lineEnd = lineBegin
+        while (lineEnd < diagnostics.size && diagnostics[lineEnd] != 10) lineEnd = lineEnd + 1
+        if (lineBegin > blockBegin && lineEnd - lineBegin > 6 &&
+            diagnostics.slice(lineBegin, lineBegin + 6) == "error[") {
+            output = "$output${bootstrapGenericOwnershipBlock(diagnostics.slice(blockBegin, lineBegin), declarations)}"
+            blockBegin = lineBegin
+        }
+        lineBegin = lineEnd + 1
+    }
+    "$output${bootstrapGenericOwnershipBlock(diagnostics.slice(blockBegin, diagnostics.size), declarations)}"
+}

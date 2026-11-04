@@ -336,6 +336,7 @@ test-serial: ablac
 	tools/test-private.sh $(COMPILER)
 	tools/test-strict-imports.sh $(COMPILER)
 	tools/test-generics.sh $(COMPILER)
+	tools/test-generic-ownership-origin.sh $(COMPILER)
 	tools/test-lazy-defaults.sh $(COMPILER)
 	tools/test-named-generic-guard.sh $(COMPILER)
 	tools/test-named-generic-default.sh $(COMPILER)
