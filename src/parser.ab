@@ -555,6 +555,68 @@ class BootstrapParser(
         )
     }
 
+    // Decode raw text blocks while retaining source offsets for indentation
+    // diagnostics. Newline handling is byte based; CRLF becomes LF.
+    fun decodeRawText(token: BootstrapToken): string {
+        val raw = bootstrapTokenText(this.source, token)
+        var first = 0
+        while (first < raw.size && raw[first] != 10) first = first + 1
+        if (first == raw.size) return raw
+        var openingEnd = first
+        if (openingEnd > 0 && raw[openingEnd - 1] == 13) openingEnd = openingEnd - 1
+        for (i in 0 until openingEnd) {
+            if (raw[i] != 32 && raw[i] != 9) {
+                this.failAt("RAW_OPEN_LINE", "a multiline raw string opener must end its line", token.begin + i, token.begin + i + 1)
+                return ""
+            }
+        }
+        var last = raw.size - 1
+        while (last >= 0 && raw[last] != 10) last = last - 1
+        val indent = raw.slice(last + 1, raw.size)
+        for (i in 0 until indent.size) {
+            if (indent[i] != 32 && indent[i] != 9) {
+                this.failAt("RAW_CLOSE_LINE", "a multiline raw string closer must start on its own line", token.begin + last + 1 + i, token.begin + last + 2 + i)
+                return ""
+            }
+        }
+        if (last == first) return ""
+        var limit = last
+        if (limit > first + 1 && raw[limit - 1] == 13) limit = limit - 1
+        val output = byteBuffer()
+        var cursor = first + 1
+        while (cursor < limit) {
+            var end = cursor
+            while (end < limit && raw[end] != 10) end = end + 1
+            var lineEnd = end
+            if (end < limit && lineEnd > cursor && raw[lineEnd - 1] == 13) lineEnd = lineEnd - 1
+            var blank = true
+            for (j in cursor until lineEnd) if (raw[j] != 32 && raw[j] != 9) blank = false
+            var matches = lineEnd - cursor >= indent.size
+            var i = 0
+            while (matches && i < indent.size) {
+                if (raw[cursor + i] != indent[i]) matches = false
+                i = i + 1
+            }
+            if (!matches && !blank) {
+                this.failAt("RAW_INDENT", "raw string line does not start with the closing indentation", token.begin + cursor, token.begin + cursor + 1)
+            } else if (matches) output.appendText(raw.slice(cursor + indent.size, lineEnd))
+            if (end < limit) output.appendText("\n")
+            cursor = end + 1
+        }
+        output.toText()
+    }
+
+    fun checkRawClose(token: BootstrapToken) {
+        var cursor = token.end
+        while (cursor < this.source.size && this.source[cursor] != 10 && this.source[cursor] != 13) {
+            if (this.source[cursor] != 32 && this.source[cursor] != 9) {
+                this.failAt("RAW_CLOSE_LINE", "a multiline raw string closer must end its line", cursor, cursor + 1)
+                return
+            }
+            cursor = cursor + 1
+        }
+    }
+
     fun fail(code: string, message: string) {
         val token = this.tokens[this.position]
         this.failAt(code, message, token.begin, token.end)
@@ -1655,6 +1717,8 @@ class BootstrapParser(
                 []
             )
         } else if (this.consume(BOOTSTRAP_TOKEN_STRING_START)) {
+            val rawLiteral = token.end - token.begin == 3
+            var rawMultiline = false
             var text = ""
             var templated = false
             val parts: array<BootstrapExpression> = []
@@ -1662,8 +1726,12 @@ class BootstrapParser(
                 if (this.at(BOOTSTRAP_TOKEN_STRING_TEXT)) {
                     val textToken = this.tokens[this.position]
                     val rawText = bootstrapTokenText(this.source, textToken)
-                    this.checkEscapes(textToken, rawText)
-                    val part = bootstrapDecodeString(rawText)
+                    if (rawLiteral) {
+                        for (i in 0 until rawText.size) if (rawText[i] == 10) rawMultiline = true
+                    } else this.checkEscapes(textToken, rawText)
+                    val unfinishedRaw = rawLiteral && this.position + 1 < this.tokens.size &&
+                        this.tokens[this.position + 1].kind == BOOTSTRAP_TOKEN_INVALID
+                    val part = if (unfinishedRaw) "" else if (rawLiteral) this.decodeRawText(textToken) else bootstrapDecodeString(rawText)
                     text = "$text$part"
                     parts.append(BootstrapExpression(
                         "string",
@@ -1686,9 +1754,15 @@ class BootstrapParser(
                     this.position = this.position + 1
                 } else if (this.consume(BOOTSTRAP_TOKEN_INTERPOLATION_START)) {
                     templated = true
+                    while (this.at(BOOTSTRAP_TOKEN_NEWLINE)) this.position = this.position + 1
                     parts.append(this.parseExpression())
+                    while (this.at(BOOTSTRAP_TOKEN_NEWLINE)) this.position = this.position + 1
                     this.expect(BOOTSTRAP_TOKEN_INTERPOLATION_END)
                     this.position = this.position
+                } else if (rawLiteral && this.at(BOOTSTRAP_TOKEN_INVALID)) {
+                    this.failAt("RAW_UNTERMINATED", "unterminated raw string", token.begin, this.tokens[this.position].end)
+                    this.position = this.position + 1
+                    break
                 } else {
                     this.fail(
                         "STRING_PART",
@@ -1698,7 +1772,10 @@ class BootstrapParser(
                 }
             }
             val stringEnd = this.tokens[this.position]
-            this.expect(BOOTSTRAP_TOKEN_STRING_END)
+            if (this.at(BOOTSTRAP_TOKEN_STRING_END)) {
+                if (rawLiteral && rawMultiline) this.checkRawClose(stringEnd)
+                this.position = this.position + 1
+            } else if (!rawLiteral) this.expect(BOOTSTRAP_TOKEN_STRING_END)
             if (templated) {
                 BootstrapExpression(
                     "string.template",
@@ -2765,16 +2842,28 @@ class BootstrapParser(
         if (this.at(BOOTSTRAP_TOKEN_COMPILE)) this.position = this.position + 1
         this.expect(BOOTSTRAP_TOKEN_EXTERN)
         this.expect(BOOTSTRAP_TOKEN_COLON)
+        val libraryStart = this.tokens[this.position]
         this.expect(BOOTSTRAP_TOKEN_STRING_START)
         var library = ""
+        var rawLibraryMultiline = false
         if (this.at(BOOTSTRAP_TOKEN_STRING_TEXT)) {
             val libraryToken = this.tokens[this.position]
             val rawLibrary = bootstrapTokenText(this.source, libraryToken)
-            this.checkEscapes(libraryToken, rawLibrary)
-            library = bootstrapDecodeString(rawLibrary)
+            if (libraryStart.end - libraryStart.begin == 3) {
+                for (i in 0 until rawLibrary.size) if (rawLibrary[i] == 10) rawLibraryMultiline = true
+                library = this.decodeRawText(libraryToken)
+            } else {
+                this.checkEscapes(libraryToken, rawLibrary)
+                library = bootstrapDecodeString(rawLibrary)
+            }
             this.position = this.position + 1
         }
+        if (rawLibraryMultiline && this.at(BOOTSTRAP_TOKEN_STRING_END)) {
+            val libraryEnd = this.tokens[this.position]
+            this.checkRawClose(libraryEnd)
+        }
         this.expect(BOOTSTRAP_TOKEN_STRING_END)
+        if (rawLibraryMultiline) this.skipSeparators()
         val declaration = this.parseDeclaration()
         BootstrapDeclaration(
             "extern",

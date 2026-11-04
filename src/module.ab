@@ -7,6 +7,7 @@ import "abla/sys/linux/fs"
 import "abla/sys/linux/process"
 import "abla/sys/linux"
 import "abla/runtime/memory"
+import "abla/text"
 import "parser.ab"
 import "lexer.ab"
 import "ct_native.ab"
@@ -126,12 +127,13 @@ fun bootstrapImportAliasValid(alias: string): bool {
     valid
 }
 
-fun bootstrapScanImports(source: string): BootstrapImportScan {
+fun bootstrapScanImports(source: string): BootstrapImportScan = bootstrapScanImportsWithIdentity(source, "")
+
+fun bootstrapScanImportsWithIdentity(source: string, sourceIdentity: string): BootstrapImportScan {
     val edges: array<BootstrapImportEdge> = []
     var errors = 0
     var diagnostics = ""
     var offset = 0
-    var sourceQuoted = false
     var lineComment = false
     var blockComment = 0
     var braces = 0
@@ -141,7 +143,33 @@ fun bootstrapScanImports(source: string): BootstrapImportScan {
         bootstrapImportWordAt(source, scanned - 6, "import"))) scanned = scanned - 1
     while (offset < scanned) {
         if (source[offset] == 10 || source[offset] == 13) lineComment = false
-        if (!sourceQuoted && !lineComment && blockComment == 0 &&
+        // A raw literal is opaque to import discovery, even when it contains
+        // quotes, braces, comments, or a line beginning with `import`.
+        if (!lineComment && blockComment == 0 &&
+            bootstrapAt(source, offset, 34) && bootstrapAt(source, offset + 1, 34) &&
+            bootstrapAt(source, offset + 2, 34)) {
+            offset = offset + 3
+            while (offset < source.size && !(bootstrapAt(source, offset, 34) &&
+                bootstrapAt(source, offset + 1, 34) && bootstrapAt(source, offset + 2, 34))) offset = offset + 1
+            if (offset < source.size) offset = offset + 3
+            continue
+        }
+        // Skip the entire ordinary string, including interpolations. A raw
+        // literal inside `${...}` can itself contain quotes and `import`.
+        if (!lineComment && blockComment == 0 && source[offset] == 34) {
+            offset = offset + 1
+            var done = false
+            while (offset < source.size && !done) {
+                if (source[offset] == 92 && offset + 1 < source.size) offset = offset + 2
+                else if (source[offset] == 34) { offset = offset + 1; done = true }
+                else if (source[offset] == 36 && bootstrapAt(source, offset + 1, 123)) {
+                    val end = bootstrapFindInterpolationEnd(source, offset + 2)
+                    offset = if (bootstrapAt(source, end, 125)) end + 1 else end
+                } else offset = offset + 1
+            }
+            continue
+        }
+        if (!lineComment && blockComment == 0 &&
             source[offset] == 47 &&
             offset + 1 < source.size && source[offset + 1] == 42) {
             blockComment = blockComment + 1
@@ -156,19 +184,15 @@ fun bootstrapScanImports(source: string): BootstrapImportScan {
             } else offset = offset + 1
             continue
         }
-        if (!sourceQuoted && !lineComment && source[offset] == 47 &&
+        if (!lineComment && source[offset] == 47 &&
             offset + 1 < source.size && source[offset + 1] == 47) {
             lineComment = true
         }
-        if (blockComment == 0 && !lineComment && source[offset] == 34 &&
-            (offset == 0 || source[offset - 1] != 92)) {
-            sourceQuoted = !sourceQuoted
-        }
-        if (!sourceQuoted && !lineComment && blockComment == 0) {
+        if (!lineComment && blockComment == 0) {
             if (source[offset] == 123) braces = braces + 1
             if (source[offset] == 125 && braces > 0) braces = braces - 1
         }
-        if (!sourceQuoted && !lineComment && blockComment == 0 &&
+        if (!lineComment && blockComment == 0 &&
             braces == 0 && bootstrapImportWordAt(source, offset, "import")) {
             val importBegin = offset
             var cursor = offset + 6
@@ -192,16 +216,42 @@ fun bootstrapScanImports(source: string): BootstrapImportScan {
             var alias = ""
             if (cursor < source.size && source[cursor] == 34) {
                 provider = false
-                cursor = cursor + 1
+                val rawImport = bootstrapAt(source, cursor + 1, 34) && bootstrapAt(source, cursor + 2, 34)
+                cursor = cursor + if (rawImport) 3 else 1
                 val valueBegin = cursor
-                while (cursor < source.size &&
-                    (source[cursor] != 34 || source[cursor - 1] == 92)) {
-                    cursor = cursor + 1
+                if (rawImport) {
+                    while (cursor < source.size && !(bootstrapAt(source, cursor, 34) &&
+                        bootstrapAt(source, cursor + 1, 34) && bootstrapAt(source, cursor + 2, 34))) cursor = cursor + 1
+                } else {
+                    while (cursor < source.size &&
+                        (source[cursor] != 34 || source[cursor - 1] == 92)) cursor = cursor + 1
                 }
                 sourceEnd = cursor
-                if (cursor < source.size) cursor = cursor + 1
+                if (cursor < source.size) cursor = cursor + if (rawImport) 3 else 1
                 end = cursor
-                val requested = source.slice(valueBegin, sourceEnd)
+                var requested = source.slice(valueBegin, sourceEnd)
+                var invalidRawImport = false
+                if (rawImport) {
+                    val decoder = BootstrapParser(if (sourceIdentity == "") "<import>" else sourceIdentity, source, [], [], [], [], 0, 0, "", [], [], 0, -1, 0)
+                    if (sourceEnd == source.size) {
+                        errors = errors + 1
+                        val location = if (sourceIdentity == "") "source[import]:$sourceBegin:$sourceEnd" else "source[parser]:$sourceIdentity:$sourceBegin:$sourceEnd"
+                        diagnostics = "${diagnostics}error[E_PARSE_RAW_UNTERMINATED]: unterminated raw string\n$location\n"
+                        invalidRawImport = true
+                    } else {
+                        requested = decoder.decodeRawText(BootstrapToken(BOOTSTRAP_TOKEN_STRING_TEXT, valueBegin, sourceEnd))
+                        var multiline = false
+                        for (i in valueBegin until sourceEnd) if (source[i] == 10) multiline = true
+                        if (multiline) decoder.checkRawClose(
+                            BootstrapToken(BOOTSTRAP_TOKEN_STRING_END, sourceEnd, end))
+                    }
+                    if (decoder.errors > 0) {
+                        errors = errors + decoder.errors
+                        diagnostics = diagnostics + (if (sourceIdentity == "")
+                            decoder.diagnostics.replace("source[parser]:<import>:", "source[import]:") else decoder.diagnostics)
+                        invalidRawImport = true
+                    }
+                }
                 while (cursor < source.size &&
                     (source[cursor] == 32 || source[cursor] == 9)) {
                     cursor = cursor + 1
@@ -220,7 +270,9 @@ fun bootstrapScanImports(source: string): BootstrapImportScan {
                     alias = source.slice(aliasBegin, cursor)
                     end = cursor
                 }
-                if (requested == "" ||
+                if (invalidRawImport) {
+                    // The decoder already reported the offending source span.
+                } else if (requested == "" ||
                     (alias != "" && !bootstrapImportAliasValid(alias))) {
                     errors = errors + 1
                     diagnostics =
@@ -824,7 +876,7 @@ class BootstrapImportProviderDiscovery(
             this.errors = this.errors + snapshot.importErrors
             if (snapshot.importErrors > 0) {
                 this.diagnostics =
-                    "${this.diagnostics}${bootstrapScanImports(snapshot.source).diagnostics}"
+                    "${this.diagnostics}${bootstrapScanImportsWithIdentity(snapshot.source, snapshot.path).diagnostics}"
             }
             var index = 0
             while (index < snapshot.importEdges.size) {
@@ -3009,7 +3061,7 @@ class BootstrapModuleGraph(
             this.errors = this.errors + snapshot.importErrors
             if (snapshot.importErrors > 0) {
                 this.diagnostics =
-                    "${this.diagnostics}${bootstrapScanImports(snapshot.source).diagnostics}"
+                    "${this.diagnostics}${bootstrapScanImportsWithIdentity(snapshot.source, snapshot.path).diagnostics}"
             }
             this.modules.append(BootstrapModule(identity, ""))
             var index = 0
@@ -3199,7 +3251,7 @@ class BootstrapModuleGraph(
             this.errors = this.errors + snapshot.importErrors
             if (snapshot.importErrors > 0) {
                 this.diagnostics =
-                    "${this.diagnostics}${bootstrapScanImports(snapshot.source).diagnostics}"
+                    "${this.diagnostics}${bootstrapScanImportsWithIdentity(snapshot.source, snapshot.path).diagnostics}"
             }
             if (!known) this.modules.append(BootstrapModule(identity, snapshot.source))
             var index = 0

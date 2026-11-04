@@ -193,6 +193,38 @@ limitation is that `f32` and `f64`
 currently lose their float type when erased to `any`; interpolation then
 prints their bit pattern as an integer. Keep floats typed for interpolation.
 
+### Raw text blocks
+
+Triple quotes write a raw string. Backslashes, `$`, braces and one or two
+quotes are literal; there are no escapes or interpolation. A triple quote
+ends the block, so concatenate another string to include three quotes or a
+computed value.
+
+```abla
+val one = """a "quote", $HOME and \n"""
+val two = """
+    first line
+      second line
+    """
+// one is: a "quote", $HOME and \n
+// two is: first line\n  second line
+```
+
+A single-line block starts and ends on the same line, without indentation
+processing. `""""""` is empty. For a multiline block, only spaces or tabs may
+follow the opener on its line. The closer sits on its own line: the exact
+spaces and tabs before it are removed from each nonblank content line. A
+nonblank line that lacks that prefix is an error at that line. A whitespace-only
+line is permitted even when shorter or differently indented; if it lacks the
+prefix, it becomes empty. If it has the prefix, extra whitespace is preserved.
+
+The newline after the opener and the newline before the closer are excluded;
+add an empty last line for a trailing newline. CRLF is normalized to LF in a
+multiline block. Other bytes are preserved, and a zero-indented closer strips
+nothing. Use ordinary strings and `+` for values, escapes, or a literal
+`"""` sequence. Raw blocks can occur inside `${...}` in ordinary strings.
+
+
 ## Values and variables
 
 `val` declares a binding that is assigned once; `var` one that can be
