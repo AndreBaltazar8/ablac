@@ -29,6 +29,7 @@ fixtures=(
     ct_fix_montgomery:@0,@1,@2,@3 ct_fix_add_multiple:0,@1,@2 ct_fix_lookup:0,@1,@2
     ct_fix_rsa_pkcs1:@0 ct_fix_rsa_oaep:@0,@2
     ct_fix_rsa_implicit_length:@0 ct_fix_rsa_implicit_select:@1,@2
+    ct_fix_secret_division:@0,@1 ct_fix_secret_exact:@0,@1 ct_fix_secret_reduce:@0,@1 ct_fix_secret_divsteps:@0,@1 ct_fix_secret_gcd:@0,@1 ct_fix_secret_inverse:@0,@1
     ct_fix_base64:0
 )
 leaks=(ct_leak_branch:0 ct_leak_index:0 ct_leak_compare:@0,@1 ct_leak_divide:0,1)

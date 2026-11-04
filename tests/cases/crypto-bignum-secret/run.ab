@@ -1,0 +1,57 @@
+import "abla/crypto"
+import "abla/crypto/bignum"
+import "abla/crypto/bignum/internal"
+import "abla/ct"
+import "abla/io"
+import "abla/text"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/unsafe/memory"
+
+trusted fun main: int {
+    val lines = linuxReadFile(processArgument(0), 16777216).split("\n")
+    for (line in lines) {
+        if (line == "") continue
+        val fields = line.split(" ")
+        val mbytes = hexDecode(fields[0])
+        val vbytes = hexDecode(fields[1])
+        val words = (mbytes.size + 3) / 4
+        val mode = processArgument(1)
+        val vwords = if (mode == "divisionwide" || mode == "exactwide" || mode == "reducewide") words * 2 else words
+        val m = bnAllocate(words)
+        val v = bnAllocate(vwords)
+        val gcd = bnAllocate(words)
+        val inverse = bnAllocate(vwords)
+        val work = bnAllocate((words + 1) * 9)
+        bnFromBytes(m, words, ablaUnsafeStringAddress(mbytes), mbytes.size)
+        bnFromBytes(v, vwords, ablaUnsafeStringAddress(vbytes), vbytes.size)
+        val valid = if (mode == "gcd") {
+            val moreWork = bnAllocate(words * 3 + (words + 1) * 9)
+            bnSecretGcdBody(gcd, m, v, words, moreWork)
+            bnRelease(moreWork, words * 3 + (words + 1) * 9)
+            u32(0)
+        } else if (mode == "inverse") {
+            val moreWork = bnAllocate(words * 13 + (words + 1) * 9)
+            val ok = bnSecretInverseBody(inverse, m, v, words, moreWork).declassify()
+            bnRelease(moreWork, words * 13 + (words + 1) * 9)
+            ok
+        } else if (mode == "division" || mode == "divisionwide") {
+            bnSecretDivModBody(inverse, gcd, v, vwords, m, words, work).declassify()
+        } else if (mode == "exactwide") {
+            bnSecretExactDivBody(inverse, v, vwords, m, words, gcd, work).declassify()
+        } else if (mode == "reducewide") {
+            bnSecretReduceBody(gcd, v, vwords, m, words, inverse, work).declassify()
+        } else bnSecretDivstepsBody(gcd, inverse, m, v, words, work).declassify()
+        val gout = nativeByteBuffer(words * 4 + 1)
+        val iout = nativeByteBuffer(vwords * 4 + 1)
+        bnToBytes(ablaUnsafePointerAddress(gout.pointerAt(0)), words * 4, gcd)
+        bnToBytes(ablaUnsafePointerAddress(iout.pointerAt(0)), vwords * 4, inverse)
+        println("${hexEncode(gout.adoptString(words * 4))} ${hexEncode(iout.adoptString(vwords * 4))} ${int(valid)}")
+        bnRelease(m, words)
+        bnRelease(v, vwords)
+        bnRelease(gcd, words)
+        bnRelease(inverse, vwords)
+        bnRelease(work, (words + 1) * 9)
+    }
+    0
+}
