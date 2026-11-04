@@ -89,18 +89,18 @@ class BootstrapTestModules(
     val claimKeys: array<array<string>>,
     val claimSignatures: array<array<string>>,
     // Whether the claim stands when the module's names carry an alias's prefix.
-    val claimsPrefixed: array<array<bool>>
+    val claimsPrefixed: array<array<bool>>,
+    val state: BootstrapModuleState = bootstrapModuleState()
 ) {
     /** The entry of the module at `path`, read and parsed on first use. */
     fun module(path: string): int {
         val known = this.index.get(path)
         if (known != null) return known
-        val text = Path(path).readText()
-        val scan = bootstrapScanImports(text)
-        val parsed = bootstrapParseWithIdentity(text, path)
+        val snapshot = this.state.acquire(path)
+        val parsed = snapshot.discovery
         val plain: array<string> = []
         val aliased: array<string> = []
-        for (edge in scan.edges) {
+        for (edge in snapshot.importEdges) {
             if (!edge.provider) {
                 val imported = bootstrapResolveImport(path, edge.source)
                 if (edge.alias == "") bootstrapTestAppendOnce(plain, imported)
@@ -109,8 +109,8 @@ class BootstrapTestModules(
         }
         var exposes = ""
         if (path.size >= 9 && path.slice(path.size - 9, path.size) == "/entry.ab" &&
-            parsed.declarations.size == 0 && scan.errors == 0 && scan.edges.size == 1 &&
-            !scan.edges[0].provider && scan.edges[0].alias == "") exposes = plain[0]
+            parsed.declarations.size == 0 && snapshot.importErrors == 0 && snapshot.importEdges.size == 1 &&
+            !snapshot.importEdges[0].provider && snapshot.importEdges[0].alias == "") exposes = plain[0]
         val keys: array<string> = []
         val signatures: array<string> = []
         val prefixed: array<bool> = []
@@ -312,7 +312,25 @@ class BootstrapTestBundleClaims(
 }
 
 /** Each source's bundle (`bundles`), and how many modules the partition read. */
-class BootstrapTestPartition(val bundles: array<int>, val modulesRead: int)
+class BootstrapTestPartition(
+    val bundles: array<int>, val modulesRead: int,
+    val preparedStates: array<BootstrapModuleState> = []
+)
+
+// Discovery may be handed to the first build only when it observed no
+// ambient inputs or staging actions. Subsequent builds always start fresh.
+fun bootstrapTestDiscoveryReusable(state: BootstrapModuleState): bool {
+    for (snapshot in state.snapshots) {
+        if (!snapshot.exists || snapshot.importErrors != 0 || snapshot.discovery.errors != 0 ||
+            snapshot.discovery.extensionErrors != 0 ||
+            snapshot.discovery.actions.size != 0 ||
+            snapshot.discovery.compileInputPaths.size != 0) return false
+        for (edge in snapshot.importEdges) {
+            if (edge.provider) return false
+        }
+    }
+    true
+}
 
 /** Each source's bundle: the first bundle where nothing the source reaches claims a
  *  name another module of the bundle claims (bootstrapTestModuleClaims), in order, so a
@@ -354,7 +372,12 @@ fun bootstrapTestBundlePartition(sources: array<string>): BootstrapTestPartition
         }
         bundles.append(chosen)
     }
-    BootstrapTestPartition(bundles, modules.paths.size)
+    val prepared: array<BootstrapModuleState> = []
+    if (bootstrapTestDiscoveryReusable(modules.state)) {
+        modules.state.discoveryPrepared = true
+        prepared.append(modules.state)
+    }
+    BootstrapTestPartition(bundles, modules.paths.size, prepared)
 }
 
 /** The name a bundle's root and program take in build/abla-test: a hash of its

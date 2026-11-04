@@ -302,7 +302,7 @@ fun bootstrapOrcTest(argumentCount: int): int {
                 index = index + 1
             }
             failed = failed + bootstrapOrcTestBundle(
-                bundle, members, useCache, target, verbose
+                bundle, members, useCache, target, verbose, partition.preparedStates
             )
             bundle = bundle + 1
         }
@@ -349,8 +349,14 @@ fun bootstrapOrcTestBundle(
     members: array<string>,
     useCache: bool,
     target: BootstrapTargetDescriptor,
-    verbose: bool
+    verbose: bool,
+    var preparedStates: array<BootstrapModuleState>
 ): int {
+    // Consume the handoff before any test body or failed-build retry can
+    // change inputs. It is never a process-global or cross-invocation cache.
+    val moduleState = if (preparedStates.size > 0) preparedStates[0]
+        else bootstrapModuleState()
+    preparedStates.clear()
     val remaining: array<string> = []
     for (member in members) remaining.append(member)
     val alone: array<string> = []
@@ -366,7 +372,10 @@ fun bootstrapOrcTestBundle(
         Path(root).writeTextAtomic(bootstrapTestBundleRoot(2, remaining))
         bootstrapBuildDiagnosticsKept = true
         bootstrapBuildDiagnostics = ""
-        val status = bootstrapOrcBuild(
+        val status = if (round == 0) bootstrapOrcBuildModuleState(
+            root, output, !bootstrapOrcBalanced, useCache, target, "executable",
+            moduleState
+        ) else bootstrapOrcBuild(
             root, output, !bootstrapOrcBalanced, useCache, target, "executable"
         )
         bootstrapBuildDiagnosticsKept = false
@@ -469,38 +478,56 @@ fun bootstrapOrcBuildSingleWith(
     target: BootstrapTargetDescriptor,
     artifact: string
 ): int {
+    val moduleState = bootstrapModuleState()
+    bootstrapOrcBuildSingleWithModuleState(
+        sourcePath, outputPath, fast, useCache, target, artifact, moduleState
+    )
+}
+
+fun bootstrapOrcBuildSingleWithModuleState(
+    sourcePath: string,
+    outputPath: string,
+    fast: bool,
+    useCache: bool,
+    target: BootstrapTargetDescriptor,
+    artifact: string,
+    var moduleState: BootstrapModuleState
+): int {
     var status = 1
     if (fast && bootstrapTargetIsHost(target)) {
-        status = bootstrapNativeArtifactBuildWithEmitter(
+        status = bootstrapNativeArtifactBuildWithEmitterModuleState(
             sourcePath,
             outputPath,
             llvmAotEmitObjectFileFast,
             "inprocess-fast",
             useCache,
             target,
-            artifact
+            artifact,
+            moduleState
         ).status
     }
     if (!fast && bootstrapOrcBalanced && bootstrapTargetIsHost(target)) {
-        status = bootstrapNativeArtifactBuildWithEmitter(
+        status = bootstrapNativeArtifactBuildWithEmitterModuleState(
             sourcePath,
             outputPath,
             llvmAotEmitObjectFileBalanced,
             "inprocess-o1",
             useCache,
             target,
-            artifact
+            artifact,
+            moduleState
         ).status
     }
     if (!fast && !bootstrapOrcBalanced && bootstrapTargetIsHost(target)) {
-        status = bootstrapNativeArtifactBuildWithEmitter(
+        status = bootstrapNativeArtifactBuildWithEmitterModuleState(
             sourcePath,
             outputPath,
             llvmAotEmitObjectFile,
             "inprocess-o2",
             useCache,
             target,
-            artifact
+            artifact,
+            moduleState
         ).status
     }
     if (!bootstrapTargetIsHost(target)) {
@@ -516,14 +543,15 @@ fun bootstrapOrcBuildSingleWith(
                 targetFast
             )
         }
-        status = bootstrapNativeArtifactBuildWithEmitter(
+        status = bootstrapNativeArtifactBuildWithEmitterModuleState(
             sourcePath,
             outputPath,
             targetEmitter,
             if (fast) "cross-fast" else "cross-o2",
             useCache,
             target,
-            artifact
+            artifact,
+            moduleState
         ).status
     }
     status
@@ -677,20 +705,35 @@ fun bootstrapOrcBuild(
     target: BootstrapTargetDescriptor,
     artifact: string
 ): int {
+    val moduleState = bootstrapModuleState()
+    bootstrapOrcBuildModuleState(
+        sourcePath, outputPath, fast, useCache, target, artifact, moduleState
+    )
+}
+
+fun bootstrapOrcBuildModuleState(
+    sourcePath: string,
+    outputPath: string,
+    fast: bool,
+    useCache: bool,
+    target: BootstrapTargetDescriptor,
+    artifact: string,
+    var moduleState: BootstrapModuleState
+): int {
     bootstrapIndependentModules = []
     bootstrapTakeCompileProgramRequests()
     bootstrapTakeDefinedTargets()
     bootstrapTakeArtifactRootRequests()
     bootstrapRemoveAbandonedBuildScratch()
     bootstrapRemoveOldBuildTransactions()
-    var status = bootstrapOrcBuildSingle(
-        sourcePath,
-        outputPath,
-        fast,
-        useCache,
-        target,
-        artifact
+    bootstrapLlvmDebugInfo = bootstrapOrcDebugInfo(fast)
+    bootstrapLlvmDebugOptimized = !fast
+    bootstrapLlvmDebugEntry = sourcePath
+    var status = bootstrapOrcBuildSingleWithModuleState(
+        sourcePath, outputPath, fast, useCache, target, artifact, moduleState
     )
+    bootstrapLlvmDebugInfo = false
+    bootstrapLlvmDebugOptimized = false
     val queued = bootstrapTakeCompileProgramRequests()
     val artifactRoots = bootstrapTakeArtifactRootRequests()
     val sliceEntries: array<string> = []

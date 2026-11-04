@@ -92,3 +92,54 @@ grep -E '^(PASS|FAIL) ' "$work/both-cases.out" | sort | diff "$work/bundled.resu
 grep -E '^(PASS|FAIL) ' "$work/both-shared.out" | sort | diff "$work/shared.results" - > "$work/both.diff" ||
     { cat "$work/both.diff" >&2; fail "the other concurrent run's results differ"; }
 echo "test bundle: bundled results match --each (duplicate names, extension clash, broken import, crash, exit status, shared-module clash, concurrent runs)"
+
+# Discovery may be shared with the first build, but a test can change input
+# for a later bundle. Preserve size and mtime to catch accidentally retaining
+# the old discovery state across those executions.
+mutation="$work/mutation"
+mkdir -p "$mutation"
+cat > "$mutation/change.py" <<'PY'
+import os, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+before = p.stat()
+p.write_text('fun secondValue(): int = 2\n')
+os.utime(p, ns=(before.st_atime_ns, before.st_mtime_ns))
+assert p.stat().st_size == before.st_size
+assert p.stat().st_mtime_ns == before.st_mtime_ns
+PY
+cat > "$mutation/first.ab" <<EOF
+import "abla/sys/linux/process"
+fun string.discoveryClash(): int = 1
+fun firstMutation(): int {
+    val command = linuxCommand("python3")
+    command.argument("$mutation/change.py")
+    command.argument("$mutation/value.ab")
+    command.run()
+}
+EOF
+cat > "$mutation/second.ab" <<'AB'
+fun string.discoveryClash(): int = 2
+AB
+for name in first first-again; do
+    cat > "$mutation/$name.test.ab" <<'AB'
+import "first.ab"
+fun main: int = firstMutation()
+AB
+done
+for name in second second-again; do
+    cat > "$mutation/$name.test.ab" <<'AB'
+import "second.ab"
+import "value.ab"
+fun main: int = if (secondValue() == 2) 0 else 1
+AB
+done
+for round in cold warm; do
+    printf '%s\n' 'fun secondValue(): int = 1' > "$mutation/value.ab"
+    "$compiler" test -v "$mutation/first.test.ab" "$mutation/first-again.test.ab" \
+        "$mutation/second.test.ab" "$mutation/second-again.test.ab" \
+        > "$work/mutation-$round.out" 2> "$work/mutation-$round.err" ||
+        { cat "$work/mutation-$round.out" "$work/mutation-$round.err" >&2; fail "discovery persisted across a test's input edit ($round)"; }
+    grep -q '^4 files, 2 bundles (' "$work/mutation-$round.out" || fail "the discovery-mutation partition"
+    grep -qx '4 passed, 0 failed' "$work/mutation-$round.out" || fail "the discovery-mutation results"
+done
+echo 'test bundle: discovery is scoped before test execution, including same-size edits with restored mtime'

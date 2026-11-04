@@ -607,10 +607,14 @@ class BootstrapModuleState(
     // build that found it: an entry.ab is read and parsed for that once per build, not
     // once per import edge that reaches it.
     val exposedTargets: Map<string, string> = Map(),
-    val exposedIn: Map<string, int> = Map()
+    val exposedIn: Map<string, int> = Map(),
+    // A one-shot test-discovery handoff continues this same source snapshot,
+    // rather than treating it as a later build and trusting file timestamps.
+    var discoveryPrepared: bool = false
 ) {
     fun beginBuild(): void {
-        this.beginCounting()
+        if (this.discoveryPrepared) this.discoveryPrepared = false
+        else this.beginCounting()
         bootstrapSemanticUnit()
     }
 
@@ -637,7 +641,17 @@ class BootstrapModuleState(
             val known = this.exposedTargets.get(target)
             if (known != null) return known
         }
-        val exposed = bootstrapImportAliasExposedTarget(target)
+        var exposed = target
+        if (target.size >= 9 && target.slice(target.size - 9, target.size) == "/entry.ab") {
+            // The import's graph load needs this same discovery snapshot.
+            // Do not read and parse a second copy merely to classify an entry.
+            val snapshot = this.acquire(target)
+            if (snapshot.discovery.declarations.size == 0 &&
+                snapshot.importErrors == 0 && snapshot.importEdges.size == 1 &&
+                !snapshot.importEdges[0].provider && snapshot.importEdges[0].alias == "") {
+                exposed = bootstrapResolveImport(target, snapshot.importEdges[0].source)
+            }
+        }
         this.exposedTargets.set(target, exposed)
         this.exposedIn.set(target, this.build)
         exposed
@@ -808,8 +822,10 @@ class BootstrapImportProviderDiscovery(
             this.paths.append(identity)
             val snapshot = this.state.acquire(identity)
             this.errors = this.errors + snapshot.importErrors
-            this.diagnostics =
-                "${this.diagnostics}${bootstrapScanImports(snapshot.source).diagnostics}"
+            if (snapshot.importErrors > 0) {
+                this.diagnostics =
+                    "${this.diagnostics}${bootstrapScanImports(snapshot.source).diagnostics}"
+            }
             var index = 0
             while (index < snapshot.importEdges.size) {
                 val edge = snapshot.importEdges[index]
@@ -2991,8 +3007,10 @@ class BootstrapModuleGraph(
             this.checkModuleManifest(identity)
             val snapshot = this.state.acquire(identity)
             this.errors = this.errors + snapshot.importErrors
-            this.diagnostics =
-                "${this.diagnostics}${bootstrapScanImports(snapshot.source).diagnostics}"
+            if (snapshot.importErrors > 0) {
+                this.diagnostics =
+                    "${this.diagnostics}${bootstrapScanImports(snapshot.source).diagnostics}"
+            }
             this.modules.append(BootstrapModule(identity, ""))
             var index = 0
             while (index < snapshot.importEdges.size) {
@@ -3179,8 +3197,10 @@ class BootstrapModuleGraph(
             val snapshot = this.state.acquire(identity)
             bootstrapFrontendTraceMemory("graph.acquire:$identity")
             this.errors = this.errors + snapshot.importErrors
-            this.diagnostics =
-                "${this.diagnostics}${bootstrapScanImports(snapshot.source).diagnostics}"
+            if (snapshot.importErrors > 0) {
+                this.diagnostics =
+                    "${this.diagnostics}${bootstrapScanImports(snapshot.source).diagnostics}"
+            }
             if (!known) this.modules.append(BootstrapModule(identity, snapshot.source))
             var index = 0
             while (index < snapshot.importEdges.size) {
