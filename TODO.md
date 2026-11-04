@@ -17,6 +17,12 @@
 
 ## Bugs seen
 
+- [ ] Qualified intrinsic calls through an import alias can link as undefined externals.
+  Repro: `import "abla/unsafe/native" as native`, define `fun probe(): i32 = i32(42)`,
+  then call `native.nativeFunctionAddress(probe)` from a trusted main. Native `--fast`
+  accepts it but links against an undefined `nativeFunctionAddress` symbol. Seen on
+  2026-11-04 with the original broad module too, before the narrow address re-export.
+
 - [ ] Additional `--fast` ELF sections: LLVM's in-process C API ignores
   `--function-sections`/`--data-sections` set through its command-line parser.
   A manual section screen moved relocated constants out of RELRO and is unsafe.
