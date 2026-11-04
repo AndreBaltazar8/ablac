@@ -132,6 +132,53 @@ def check_x86(lines, secret, pointers):
         ops = x86_split(parts[1]) if len(parts) > 1 else []
         tainted = lambda r: x86_reg(r) in state
 
+        def stack_slots(o):
+            m = mem_parts(o)
+            if not m or not m.group(2) or m.group(3):
+                return None
+            base = x86_reg(m.group(2))
+            if base != "rsp" and (base != "rbp" or "stackbase:rbp" not in state):
+                return None
+            if "ptr:" + base in state:
+                return None
+            displacement = m.group(1)
+            offset = int(displacement, 0) if displacement not in ("", "-") else 0
+            # The memory width is the source width for extending loads.
+            if re.match(r"^mov[zs]b", op):
+                size = 1
+            elif re.match(r"^mov[zs]w", op):
+                size = 2
+            elif re.match(r"^movs[lq]", op):
+                size = 4
+            elif op.endswith("b"):
+                size = 1
+            elif op.endswith("w"):
+                size = 2
+            elif op.endswith("l"):
+                size = 4
+            elif op.endswith("q"):
+                size = 8
+            elif op.startswith(("movdqu", "movdqa", "movups", "movaps")):
+                size = 16
+            else:
+                # Unknown stack widths cannot safely discard any pointer bytes.
+                size = 16
+            return [f"{base}:{offset + i}" for i in range(size)]
+
+        def stack_tagged(slots, prefix):
+            if any(prefix + slot in state for slot in slots):
+                return True
+            base = slots[0].split(":", 1)[0]
+            return any(item.startswith(prefix) and (
+                "stack-moved" in state or not item.startswith(prefix + base + ":")
+            ) for item in state)
+
+        def read_pointer(o):
+            if o.startswith("%"):
+                return "ptr:" + x86_reg(o) in state
+            slots = stack_slots(o)
+            return slots is not None and ("pushed_ptr" in state or stack_tagged(slots, "ptrslot:"))
+
         def read(o):
             if o.startswith("%"):
                 return tainted(o)
@@ -140,37 +187,40 @@ def check_x86(lines, secret, pointers):
             m = mem_parts(o)
             if m:
                 base, idx = m.group(2), m.group(3)
-                stack = base and x86_reg(base) in ("rsp", "rbp")
-                if stack and not idx:
-                    return ("slot:" + o) in state
                 if (base and tainted(base)) or (idx and tainted(idx)):
                     if not op.startswith("lea"):
                         raise Violation(f"secret address: {text}")
                     return True
                 if (base and "ptr:" + x86_reg(base) in state) or (idx and "ptr:" + x86_reg(idx) in state):
                     return True  # read through a pointer to secrets
-                return "memory" in state and False
+                slots = stack_slots(o)
+                if slots is not None:
+                    return "pushed" in state or stack_tagged(slots, "slot:")
+                # Unknown memory might alias secret storage; fail closed on its value.
+                return not op.startswith("lea")
             return False
 
-        def write(o, value):
+        def write(o, value, pointer=False):
             if o.startswith("%"):
                 r = x86_reg(o)
                 if value:
                     state.add(r)
                 else:
                     state.discard(r)
-                state.discard("ptr:" + r)
+                (state.add if pointer else state.discard)("ptr:" + r)
+                if r != "rsp":
+                    state.discard("stackbase:" + r)
             else:
                 m = mem_parts(o)
                 if m:
                     base, idx = m.group(2), m.group(3)
                     if base and tainted(base) or idx and tainted(idx):
                         raise Violation(f"secret address: {text}")
-                    if base and x86_reg(base) in ("rsp", "rbp") and not idx:
-                        if value:
-                            state.add("slot:" + o)
-                        else:
-                            state.discard("slot:" + o)
+                    slots = stack_slots(o)
+                    if slots is not None:
+                        for slot in slots:
+                            (state.add if value else state.discard)("slot:" + slot)
+                            (state.add if pointer else state.discard)("ptrslot:" + slot)
 
         if op.startswith("j") and op not in ("jmp", "jmpq"):
             if "flags" in state:
@@ -188,12 +238,21 @@ def check_x86(lines, secret, pointers):
         if re.match(r"^(i?div)[bwlq]?$", op):
             if any(read(o) for o in ops) or "rax" in state or "rdx" in state:
                 raise Violation(f"secret division: {text}")
+        # We do not assign concrete offsets across stack-pointer changes. Once
+        # a tagged slot exists, a later adjustment makes stack aliases unknown.
+        changes_sp = (op.startswith(("push", "pop")) or
+                      (ops and ops[-1] in ("%rsp", "%esp") and
+                       op.startswith(("add", "sub", "lea", "mov"))))
+        if changes_sp and any(item.startswith(("slot:", "ptrslot:")) for item in state):
+            state.add("stack-moved")
         if op.startswith("push"):
             if tainted(ops[0]):
                 state.add("pushed")
+            if read_pointer(ops[0]):
+                state.add("pushed_ptr")
             return frozenset(state)
         if op.startswith("pop"):
-            write(ops[0], "pushed" in state)
+            write(ops[0], "pushed" in state, "pushed_ptr" in state)
             return frozenset(state)
         if op.startswith(("cmp", "test", "vptest", "ptest", "bt", "ucomis", "comis")):
             if any(read(o) for o in ops):
@@ -202,12 +261,15 @@ def check_x86(lines, secret, pointers):
                 state.discard("flags")
             return frozenset(state)
         if op.startswith("lea"):
-            value = read(ops[0])
-            pointer_input = ops[0] and mem_parts(ops[0]) and mem_parts(ops[0]).group(2) and \
-                "ptr:" + x86_reg(mem_parts(ops[0]).group(2)) in state
-            write(ops[1], value and not pointer_input)
-            if pointer_input:
-                state.add("ptr:" + x86_reg(ops[1]))
+            parts = mem_parts(ops[0])
+            base = x86_reg(parts.group(2)) if parts and parts.group(2) else ""
+            index = x86_reg(parts.group(3)) if parts and parts.group(3) else ""
+            value = base in state or index in state
+            pointer_input = "ptr:" + base in state or "ptr:" + index in state
+            stack_base = base == "rsp" or "stackbase:" + base in state
+            write(ops[1], value, pointer_input)
+            if stack_base and ops[1].startswith("%"):
+                state.add("stackbase:" + x86_reg(ops[1]))
             return frozenset(state)
         # A zeroing idiom forgets what it wrote over.
         if (op.startswith(("xor", "pxor", "vpxor", "sub", "xorp")) and len(ops) >= 2 and
@@ -215,10 +277,14 @@ def check_x86(lines, secret, pointers):
             write(ops[-1], False)
             state.discard("flags")
             return frozenset(state)
-        if op.startswith("mov") and len(ops) == 2 and ops[0].startswith("%") and ops[1].startswith("%") and \
-                "ptr:" + x86_reg(ops[0]) in state:
-            write(ops[1], False)
-            state.add("ptr:" + x86_reg(ops[1]))
+        if op.startswith("mov") and len(ops) == 2:
+            pointer = read_pointer(ops[0])
+            value = read(ops[0])
+            source = x86_reg(ops[0]) if ops[0].startswith("%") else ""
+            stack_base = source == "rsp" or "stackbase:" + source in state
+            write(ops[1], value, pointer)
+            if stack_base and ops[1].startswith("%"):
+                state.add("stackbase:" + x86_reg(ops[1]))
             return frozenset(state)
         inputs = any(read(o) for o in ops[:-1]) if ops else False
         # Three-operand IMUL overwrites its destination; unlike the two-operand
@@ -335,6 +401,22 @@ def check_aarch64(lines, secret, pointers):
             return frozenset(state)
         if op in ("bl", "blr", "br"):
             raise Violation(f"call: {text}")
+        stack_change = (op in ("add", "sub", "mov") and ops and ops[0] == "sp") or (
+            op.startswith(("ldr", "ldp", "str", "stp")) and
+            any("[sp" in operand and ("!" in operand or len(ops) > ops.index(operand) + 1)
+                for operand in ops)
+        )
+        if stack_change and (any(item.startswith(("slot:", "ptrslot:")) for item in state) or
+            any("ptr:" + a64_reg(operand) in state or t(operand) for operand in ops[:2])):
+            state.add("stack-moved")
+
+        def tagged(slots, prefix):
+            if any(prefix + slot in state for slot in slots):
+                return True
+            base = slots[0].split(":", 2)[1]
+            return any(item.startswith(prefix + "slot:") and (
+                "stack-moved" in state or not item.startswith(prefix + "slot:" + base + ":")
+            ) for item in state)
         if op in ("sdiv", "udiv") and any(t(o) for o in ops[1:]):
             raise Violation(f"secret division: {text}")
         if op.startswith(("ldr", "ldur", "ldp", "ldrb", "ldrh", "ldrs", "ldx", "ldar", "ld1")):
@@ -345,12 +427,14 @@ def check_aarch64(lines, secret, pointers):
             dests = ops[:ops.index(memory)]
             for i, d in enumerate(dests):
                 r = a64_reg(d)
-                slots = stack_bytes(memory, d, op, i)
-                value = any(slot in state for slot in slots) if slots is not None else any(
-                    "ptr:" + reg in state for reg in inner
-                )
+                pointer_base = any("ptr:" + reg in state for reg in inner)
+                frame = not inner or inner[0] != "x29" or "stackbase:x29" in state
+                slots = None if pointer_base or not frame else stack_bytes(memory, d, op, i)
+                value = tagged(slots, "") if slots is not None else True
+                pointer = slots is not None and tagged(slots, "ptr")
                 (state.add if value else state.discard)(r)
-                state.discard("ptr:" + r)
+                (state.add if pointer else state.discard)("ptr:" + r)
+                state.discard("stackbase:" + r)
             if "!" in memory or (len(ops) > len(dests) + 1):
                 pass
             return frozenset(state)
@@ -361,10 +445,14 @@ def check_aarch64(lines, secret, pointers):
                 raise Violation(f"secret address: {text}")
             sources = ops[:ops.index(memory)]
             for i, source in enumerate(sources):
-                slots = stack_bytes(memory, source, op, i)
+                pointer_base = any("ptr:" + reg in state for reg in inner)
+                frame = not inner or inner[0] != "x29" or "stackbase:x29" in state
+                slots = None if pointer_base or not frame else stack_bytes(memory, source, op, i)
                 if slots is not None:
+                    pointer = "ptr:" + a64_reg(source) in state
                     for slot in slots:
                         (state.add if t(source) else state.discard)(slot)
+                        (state.add if pointer else state.discard)("ptr" + slot)
             return frozenset(state)
         if op in ("cmp", "cmn", "tst", "fcmp", "ccmp", "ccmn"):
             value = any(t(o) for o in ops)
@@ -383,15 +471,23 @@ def check_aarch64(lines, secret, pointers):
             value = value or dest in state
         # What a pointer to secrets becomes through moves and offsets stays one.
         src = a64_reg(ops[1]) if len(ops) > 1 else ""
-        if op in ("mov", "add", "sub") and "ptr:" + src in state and dest != "sp":
+        pointer_source = any("ptr:" + a64_reg(source) in state for source in ops[1:])
+        if op in ("mov", "add", "sub") and pointer_source and dest != "sp":
             state.add("ptr:" + dest)
-            state.discard(dest)
+            state.discard("stackbase:" + dest)
+            (state.add if value else state.discard)(dest)
+            return frozenset(state)
+        if op in ("mov", "add", "sub") and (src == "sp" or "stackbase:" + src in state) and dest != "sp":
+            state.add("stackbase:" + dest)
+            state.discard("ptr:" + dest)
+            (state.add if value else state.discard)(dest)
             return frozenset(state)
         # A zeroing idiom.
         if op == "eor" and len(ops) == 3 and ops[1] == ops[2]:
             value = False
         (state.add if value else state.discard)(dest)
         state.discard("ptr:" + dest)
+        state.discard("stackbase:" + dest)
         if A64_FLAGS.match(op):
             (state.add if value else state.discard)("flags")
         return frozenset(state)
@@ -451,6 +547,9 @@ def check_xtensa(lines, secret, pointers):
             return frozenset(state)
         if op.startswith(("call", "callx", "jx")):
             raise Violation(f"call: {text}")
+        if ops and ops[0] == "a1" and op in ("addi", "addi.n", "add", "add.n", "addmi", "mov", "mov.n"):
+            if any(item.startswith(("slot:", "ptrslot:")) for item in state):
+                state.add("stack-moved")
         if op in ("quos", "quou", "rems", "remu") and any(t(o) for o in ops[1:]):
             raise Violation(f"secret division: {text}")
         m = re.match(r"^(l8ui|l16ui|l16si|l32i|l32i\.n)$", op)
@@ -458,13 +557,16 @@ def check_xtensa(lines, secret, pointers):
             dest, base, offset = ops[0], ops[1], ops[2] if len(ops) > 2 else "0"
             if t(base):
                 raise Violation(f"secret address: {text}")
-            value = False
-            if base == "a1":
-                value = f"slot:{offset}" in state
-            elif "ptr:" + base in state:
-                value = True
+            size = 1 if op.startswith("l8") else 2 if op.startswith("l16") else 4
+            slots = [f"slot:{int(offset, 0) + i}" for i in range(size)] if base == "a1" else []
+            value = (any(slot in state for slot in slots) or (
+                "stack-moved" in state and any(item.startswith("slot:") for item in state)
+            )) if slots else True
+            pointer = any("ptr" + slot in state for slot in slots) or (
+                bool(slots) and "stack-moved" in state and any(item.startswith("ptrslot:") for item in state)
+            )
             (state.add if value else state.discard)(dest)
-            state.discard("ptr:" + dest)
+            (state.add if pointer else state.discard)("ptr:" + dest)
             return frozenset(state)
         m = re.match(r"^(s8i|s16i|s32i|s32i\.n)$", op)
         if m:
@@ -472,10 +574,15 @@ def check_xtensa(lines, secret, pointers):
             if t(base):
                 raise Violation(f"secret address: {text}")
             if base == "a1":
-                (state.add if t(source) else state.discard)(f"slot:{offset}")
+                size = 1 if op.startswith("s8") else 2 if op.startswith("s16") else 4
+                for i in range(size):
+                    slot = f"slot:{int(offset, 0) + i}"
+                    (state.add if t(source) else state.discard)(slot)
+                    (state.add if "ptr:" + source in state else state.discard)("ptr" + slot)
             return frozenset(state)
         if op == "l32r":
             state.discard(ops[0])
+            state.discard("ptr:" + ops[0])
             return frozenset(state)
         if not ops:
             return frozenset(state)
@@ -488,7 +595,7 @@ def check_xtensa(lines, secret, pointers):
         if op in ("addi", "addi.n", "mov", "mov.n", "or", "add", "add.n", "addmi", "addx2", "addx4", "addx8") and \
                 any("ptr:" + o in state for o in ops[1:]):
             state.add("ptr:" + dest)
-            state.discard(dest)
+            (state.add if value else state.discard)(dest)
             return frozenset(state)
         (state.add if value else state.discard)(dest)
         state.discard("ptr:" + dest)
@@ -629,13 +736,16 @@ def check_wasm(lines, secret, pointers):
             elif op == "global.get" or re.match(r"^(i32|i64|f32|f64)\.const$", op) or op == "v128.const":
                 stack.append((False, False))
             elif op == "global.set":
-                if stack:
-                    stack.pop()
+                value = stack.pop() if stack else (False, False)
+                if value[0] or value[1]:
+                    raise Violation(f"secret or secret-pointer global store: {text}")
             elif re.match(r"^(i32|i64|f32|f64|v128)\.load", op):
                 address_value = stack.pop() if stack else (False, False)
                 if address_value[0]:
                     raise Violation(f"secret address: {text}")
-                stack.append((address_value[1], False))
+                # Linear-memory aliases cannot be distinguished here; treating every
+                # load as secret also fails closed if a pointer was spilled there.
+                stack.append((True, False))
             elif re.match(r"^(i32|i64|f32|f64|v128)\.store", op):
                 _value = stack.pop() if stack else (False, False)
                 address_value = stack.pop() if stack else (False, False)

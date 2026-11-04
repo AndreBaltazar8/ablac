@@ -35,7 +35,9 @@ registers and stack slots, to a fixed point over the jumps. It fails on a condit
 condition is secret, a load or store whose address is, a division of one, any call (what it does isn't
 known), on Wasm a `select` on a secret, and code the disassembler can't read. The same script builds four
 deliberate leaks (a secret `if`, a secret table index, `memcmp` over secret memory, a division) and fails
-if any target's check doesn't catch them, which is what keeps a passing result meaningful.
+if any target's check doesn't catch them, which is what keeps a passing result meaningful. Pointers to secret
+memory remain marked through stack spills; unclassified non-stack memory loads are conservatively secret. On Wasm,
+where linear-memory aliases aren't modeled, every memory load is considered secret. These rules can reject safe code.
 
 | Target | Read | Run |
 |---|---|---|

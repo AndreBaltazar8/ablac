@@ -33,6 +33,33 @@ fixtures=(
 )
 leaks=(ct_leak_branch:0 ct_leak_index:0 ct_leak_compare:@0,@1 ct_leak_divide:0,1)
 
+# Hand-written spill regressions ensure the test includes the actual assembly pattern.
+llvm-mc -triple x86_64-linux-gnu -filetype=obj "$cases/pointer-spill-x86.s" -o "$out/pointer-spill-x86.o"
+llvm-mc -triple aarch64-linux-gnu -filetype=obj "$cases/pointer-spill-a64.s" -o "$out/pointer-spill-a64.o"
+for entry in x86_64:pointer-spill-x86 aarch64:pointer-spill-a64; do
+    arch=${entry%%:*}
+    object=${entry#*:}
+    if $check "$arch" "$out/$object.o" spill_leak:@0 > "$out/$object.log" 2>&1; then
+        echo "ct: missed $arch secret-pointer spill" >&2
+        exit 1
+    fi
+    grep -q '^LEAK' "$out/$object.log" || { cat "$out/$object.log" >&2; exit 1; }
+done
+echo "ok   x86-64 and AArch64 secret-pointer spill leaks caught"
+
+llvm-mc -triple x86_64-linux-gnu -filetype=obj "$cases/pointer-frame-x86.s" -o "$out/pointer-frame-x86.o"
+llvm-mc -triple aarch64-linux-gnu -filetype=obj "$cases/pointer-frame-a64.s" -o "$out/pointer-frame-a64.o"
+for entry in x86_64:pointer-frame-x86 aarch64:pointer-frame-a64; do
+    arch=${entry%%:*}
+    object=${entry#*:}
+    if $check "$arch" "$out/$object.o" frame_leak:@0 > "$out/$object.log" 2>&1; then
+        echo "ct: missed $arch general-purpose frame-register leak" >&2
+        exit 1
+    fi
+    grep -q '^LEAK' "$out/$object.log" || { cat "$out/$object.log" >&2; exit 1; }
+done
+echo "ok   x86-64 and AArch64 frame-register leaks caught"
+
 read_target() { # arch, object
     local arch=$1 object=$2
     $check "$arch" "$object" "${fixtures[@]}" > "$out/$arch.log" 2>&1 || {
