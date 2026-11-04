@@ -130,7 +130,7 @@
 
 - [ ] **abla-pdf still carries its own unblinded RSA for signing.** It could move to the released
   `abla/crypto/rsa`, as abla-saft has done.
-- [ ] **`abla/crypto/rsa` does not read encrypted PEM or PKCS#12.** Use the hosted module or decrypt the key first.
+- [x] **Encrypted RSA key import:** pure PBES2/PBKDF2 SHA256/SHA1 + AES128/256-CBC PKCS#8 and MAC-verified DER PKCS#12 key bags, with owned passwords and bounded work. Legacy PBES1/RC2/DES and broader PFX formats remain unsupported; see [the scope and limits](docs/stdlib/encrypted-keys.md).
 - [ ] **No timing measurements of abla/crypto.** `tools/test-ct.sh` reads the assembly; nothing has run a statistical
   test (`dudect`) on real hardware, or anything at all on an ESP32-S3. The Xtensa path is compiled and read only.
 - [ ] **`--fast` builds aren't read by `tools/test-ct.sh`**: the checker stops at their calls. It could follow

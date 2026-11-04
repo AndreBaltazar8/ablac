@@ -1,4 +1,5 @@
 import "abla/ct"
+import "abla/text"
 import "abla/crypto/aes"
 import "abla/crypto/der"
 import "abla/unsafe/memory"
@@ -31,6 +32,11 @@ resource class CryptoPassword() {
             this.passwordMemory = 0
             this.passwordError = "password owner is closed"
         }
+        if (this.passwordBmpMemory != 0) {
+            pbeWipe(this.passwordBmpMemory, this.passwordBmpCapacity)
+            ablaUnsafeFree(aesPointer(this.passwordBmpMemory))
+            this.passwordBmpMemory = 0
+        }
     }
     fun ok(): bool = this.passwordMemory != 0
     fun error(): string = this.passwordError
@@ -38,6 +44,10 @@ resource class CryptoPassword() {
 private var CryptoPassword.passwordMemory: int = 0
 private var CryptoPassword.passwordSize: int = 0
 private var CryptoPassword.passwordError: string = "invalid password owner"
+private var CryptoPassword.passwordBmpMemory: int = 0
+private var CryptoPassword.passwordBmpSize: int = 0
+private var CryptoPassword.passwordBmpCapacity: int = 0
+private var CryptoPassword.passwordBmpError: string = "invalid PKCS#12 password owner"
 /** Copies at most1024 password octets. Only this owned copy can be wiped. */
 trusted fun cryptoPassword(bytes: string): CryptoPassword {
     var result = CryptoPassword()
@@ -48,6 +58,41 @@ trusted fun cryptoPassword(bytes: string): CryptoPassword {
     for (i in 0 until bytes.size) {
         val byte = secretU8(u8(bytes[i]))
         ablaUnsafeStoreU8(aesPointer(result.passwordMemory + i), int(byte.declassify()))
+    }
+    // Text import is an explicit variable-time encoding boundary. Cryptographic
+    // loops consume only the sealed secret bytes, never decode Unicode.
+    result.passwordBmpError = "unsupported PKCS#12 password encoding (UTF-8 BMP text required)"
+    if (bytes.isValidUtf8()) {
+        result.passwordBmpCapacity = bytes.size * 2 + 2
+        result.passwordBmpMemory = ablaUnsafePointerAddress(ablaUnsafeAllocate(result.passwordBmpCapacity))
+        var index = 0
+        var offset = 0
+        var valid = true
+        while (index < bytes.size && valid) {
+            val first = int(bytes[index])
+            var point = first
+            if (first >= 240) valid = false
+            else if (first >= 224) {
+                point = ((first & 15) << 12) | ((int(bytes[index + 1]) & 63) << 6) | (int(bytes[index + 2]) & 63)
+                index += 2
+            } else if (first >= 192) {
+                point = ((first & 31) << 6) | (int(bytes[index + 1]) & 63)
+                index += 1
+            }
+            if (point == 0) { valid = false; result.passwordBmpError = "PKCS#12 password contains NUL" }
+            if (valid) {
+                pbeByteStore(result.passwordBmpMemory + offset, secretU32(u32(point >> 8)))
+                pbeByteStore(result.passwordBmpMemory + offset + 1, secretU32(u32(point & 255)))
+                offset += 2
+            }
+            index += 1
+        }
+        if (valid) {
+            pbeByteStore(result.passwordBmpMemory + offset, secretU32(u32(0)))
+            pbeByteStore(result.passwordBmpMemory + offset + 1, secretU32(u32(0)))
+            result.passwordBmpSize = offset + 2
+            result.passwordBmpError = ""
+        }
     }
     result
 }
@@ -152,6 +197,11 @@ private @inline trusted fun pbePadBody(pad: int, key: int, size: int, mask: int)
         pbeByteStore(pad + i, byte ^ secretU32(u32(mask)))
     }
 }
+private @inline trusted fun pbeMacBad(actual: int, expected: int, size: int): secretU32 {
+    var bad = secretU32(u32(0))
+    for (i in 0 until size) bad = bad | (pbeByte(actual + i) ^ pbeByte(expected + i))
+    bad
+}
 // END PBE SECRET CORES
 
 private resource class PbeHash(val bytes: NativeByteBuffer, val sha1: bool, var total: int = 0, var pending: int = 0) {
@@ -196,10 +246,12 @@ private trusted fun PbeHash.finish(out: int, var budget: PbeBudget): void {
     this.process(budget)
     pbeDigest(this.memory(), out, this.sha1)
 }
-private trusted fun PbeHash.prepareHmac(password: CryptoPassword, var budget: PbeBudget): void {
+private trusted fun PbeHash.prepareHmac(password: CryptoPassword, var budget: PbeBudget): void =
+    this.prepareHmacAddress(password.passwordMemory, password.passwordSize, budget)
+private trusted fun PbeHash.prepareHmacAddress(address: int, count: int, var budget: PbeBudget): void {
     val m = this.memory()
-    var key = password.passwordMemory
-    var size = password.passwordSize
+    var key = address
+    var size = count
     if (size > 64) {
         this.reset(); this.update(key, size, budget); this.finish(m + 576, budget)
         key = m + 576; size = if (this.sha1) 20 else 32
@@ -349,4 +401,222 @@ trusted fun pbeOpenPkcs8(data: string, password: CryptoPassword,
     if (cipher.error != "") return cryptoFailed(cipher.error)
     val budget = PbeBudget(limits)
     pbeDecrypt(cipher, password, budget)
+}
+
+// PKCS#12 Appendix B, ID3 only. The MAC key is exactly one hash output block;
+// legacy cipher/IV derivation and its multi-output carry update are not needed.
+private trusted fun pbePkcs12MacKey(password: CryptoPassword, salt: string,
+    rounds: int, sha1: bool, var output: NativeByteBuffer, var budget: PbeBudget): bool {
+    val hash = pbeHash(sha1)
+    val saltBytes = ((salt.size + 63) / 64) * 64
+    val passwordBytes = ((password.passwordBmpSize + 63) / 64) * 64
+    val input = nativeByteBuffer(64 + saltBytes + passwordBytes)
+    val address = ablaUnsafePointerAddress(input.address)
+    for (i in 0 until 64) pbeByteStore(address + i, secretU32(u32(3)))
+    for (i in 0 until saltBytes) pbeByteStore(address + 64 + i, secretU32(u32(salt[i % salt.size])))
+    for (i in 0 until passwordBytes) pbeByteStore(address + 64 + saltBytes + i,
+        pbeByte(password.passwordBmpMemory + i % password.passwordBmpSize))
+    hash.update(address, input.capacity, budget)
+    hash.finish(ablaUnsafePointerAddress(output.address), budget)
+    var round = 1
+    while (round < rounds && budget.error == "") {
+        hash.reset()
+        hash.update(ablaUnsafePointerAddress(output.address), output.capacity, budget)
+        hash.finish(ablaUnsafePointerAddress(output.address), budget)
+        round += 1
+    }
+    pbeWipe(address, input.capacity)
+    budget.error == ""
+}
+
+private trusted fun pbePkcs12CheckMac(data: string, safe: string, item: DerItem,
+    password: CryptoPassword, var budget: PbeBudget): string {
+    val malformed = "invalid PKCS#12 MacData"
+    if (!item.ok || item.tag != DER_SEQUENCE) return malformed
+    val digestInfo = derItem(data, item.start, item.end)
+    if (!digestInfo.ok || digestInfo.tag != DER_SEQUENCE) return malformed
+    val algorithm = derItem(data, digestInfo.start, digestInfo.end)
+    if (!algorithm.ok || algorithm.tag != DER_SEQUENCE) return malformed
+    val oid = derItem(data, algorithm.start, algorithm.end)
+    var sha1 = false
+    if (pbeOid(data, oid, "\x2b\x0e\x03\x02\x1a")) sha1 = true
+    else if (pbeOid(data, oid, "\x2a\x86\x48\x86\xf7\x0d\x01\x05\x0e")) return "unsupported PKCS#12 PBMAC1 MAC"
+    else if (!pbeOid(data, oid, "\x60\x86\x48\x01\x65\x03\x04\x02\x01")) return "unsupported PKCS#12 MAC (only SHA1/SHA256 are supported)"
+    if (oid.end != algorithm.end) {
+        val absent = derItem(data, oid.end, algorithm.end)
+        if (!absent.ok || absent.tag != 5 || absent.start != absent.end || absent.end != algorithm.end) return malformed
+    }
+    val tag = derItem(data, algorithm.end, digestInfo.end)
+    val digestSize = if (sha1) 20 else 32
+    if (!tag.ok || tag.tag != DER_OCTET_STRING || tag.end != digestInfo.end || tag.end - tag.start != digestSize) return malformed
+    val salt = derItem(data, digestInfo.end, item.end)
+    if (!salt.ok || salt.tag != DER_OCTET_STRING) return malformed
+    if (salt.end - salt.start > budget.limits.maximumSaltBytes) return "PKCS#12 MAC salt byte limit exceeded"
+    var rounds = 1
+    if (salt.end != item.end) {
+        val iteration = derItem(data, salt.end, item.end)
+        if (!iteration.ok || iteration.end != item.end) return malformed
+        rounds = pbeCount(data, iteration, budget.limits.maximumIterations)
+        if (rounds == -2) return "PKCS#12 MAC iteration limit exceeded"
+        if (rounds <= 0) return "invalid PKCS#12 MAC iteration count"
+    }
+    val key = nativeByteBuffer(digestSize)
+    var result = "wrong password or corrupt key"
+    if (pbePkcs12MacKey(password, data.slice(salt.start, salt.end), rounds, sha1, key, budget)) {
+        val hash = pbeHash(sha1)
+        hash.prepareHmacAddress(ablaUnsafePointerAddress(key.address), key.capacity, budget)
+        hash.hmac(ablaUnsafeStringAddress(safe), safe.size, budget)
+        if (budget.error != "") result = budget.error
+        else {
+            // All allocating work is over before borrowing this string address.
+            val expected = ablaUnsafeStringAddress(data) + tag.start
+            val bad = pbeMacBad(hash.memory() + 512, expected, digestSize)
+            if (bad.declassify() == u32(0)) result = ""
+        }
+    } else result = budget.error
+    pbeWipe(ablaUnsafePointerAddress(key.address), key.capacity)
+    result
+}
+
+private class PbeSafeWalk(val limits: RsaKeyReadLimits, var bags: int = 0,
+    var keys: int = 0, var key: string = "", var error: string = "")
+private fun PbeSafeWalk.fail(error: string): void {
+    if (this.error == "") this.error = error
+}
+// Attributes may be ignored semantically, but their DER structure stays bounded.
+private fun PbeSafeWalk.attribute(data: string, item: DerItem, depth: int): bool {
+    if (!item.ok) return false
+    if ((item.tag & 31) == 31 || item.tag == 0 || item.tag == 32) { this.fail("unsupported PKCS#12 attribute tag encoding"); return false }
+    if (depth > this.limits.maximumDepth) { this.fail("PKCS#12 nesting depth limit exceeded"); return false }
+    if ((item.tag & 32) == 0) return true
+    var at = item.start
+    while (at < item.end) {
+        val child = derItem(data, at, item.end)
+        if (!child.ok || !this.attribute(data, child, depth + 1)) return false
+        at = child.end
+    }
+    true
+}
+private trusted fun PbeSafeWalk.contents(data: string, password: CryptoPassword, var budget: PbeBudget, depth: int): void {
+    if (this.error != "") return
+    if (depth > this.limits.maximumDepth) { this.fail("PKCS#12 nesting depth limit exceeded"); return }
+    val root = derItem(data, 0, data.size)
+    if (!root.ok || root.tag != DER_SEQUENCE || root.end != data.size) { this.fail("wrong password or corrupt key"); return }
+    var at = root.start
+    while (at < root.end && this.error == "") {
+        this.bags += 1
+        if (this.bags > this.limits.maximumBags) { this.fail("PKCS#12 bag count limit exceeded"); return }
+        val bag = derItem(data, at, root.end)
+        if (!bag.ok || bag.tag != DER_SEQUENCE) { this.fail("wrong password or corrupt key"); return }
+        val oid = derItem(data, bag.start, bag.end)
+        val value = derItem(data, oid.end, bag.end)
+        if (!oid.ok || oid.tag != DER_OID || !value.ok || value.tag != 160) { this.fail("wrong password or corrupt key"); return }
+        val payload = derItem(data, value.start, value.end)
+        if (!payload.ok || payload.end != value.end) { this.fail("wrong password or corrupt key"); return }
+        if (value.end != bag.end) {
+            val attributes = derItem(data, value.end, bag.end)
+            if (!attributes.ok || attributes.tag != 49 || attributes.end != bag.end || !this.attribute(data, attributes, depth)) {
+                this.fail("wrong password or corrupt key"); return
+            }
+        }
+        val keyBag = pbeOid(data, oid, "\x2a\x86\x48\x86\xf7\x0d\x01\x0c\x0a\x01\x01")
+        val shrouded = pbeOid(data, oid, "\x2a\x86\x48\x86\xf7\x0d\x01\x0c\x0a\x01\x02")
+        if (keyBag || shrouded) {
+            this.keys += 1
+            if (this.keys > 1) { this.fail("PKCS#12 contains multiple private keys"); return }
+            if (keyBag) this.key = data.slice(value.start, value.end)
+            else {
+                val cipher = pbeEncryptedInfo(data.slice(value.start, value.end), this.limits)
+                if (cipher.error != "") { this.fail(cipher.error); return }
+                val decrypted = pbeDecrypt(cipher, password, budget)
+                if (!decrypted.ok) { this.fail(decrypted.error); return }
+                this.key = decrypted.bytes
+            }
+        } else if (pbeOid(data, oid, "\x2a\x86\x48\x86\xf7\x0d\x01\x0c\x0a\x01\x03")) {
+            // Certificate is not an identity selection or trust decision.
+            if (payload.tag != DER_SEQUENCE) { this.fail("wrong password or corrupt key"); return }
+            val kind = derItem(data, payload.start, payload.end)
+            if (!pbeOid(data, kind, "\x2a\x86\x48\x86\xf7\x0d\x01\x09\x16\x01")) { this.fail("unsupported PKCS#12 certificate bag"); return }
+            val explicit = derItem(data, kind.end, payload.end)
+            val certificate = derItem(data, explicit.start, explicit.end)
+            if (!explicit.ok || explicit.tag != 160 || explicit.end != payload.end || !certificate.ok || certificate.tag != DER_OCTET_STRING || certificate.end != explicit.end) { this.fail("wrong password or corrupt key"); return }
+        } else if (pbeOid(data, oid, "\x2a\x86\x48\x86\xf7\x0d\x01\x0c\x0a\x01\x06")) {
+            this.contents(data.slice(value.start, value.end), password, budget, depth + 1)
+        } else { this.fail("unsupported PKCS#12 bag type"); return }
+        at = bag.end
+    }
+}
+private trusted fun PbeSafeWalk.contentInfo(data: string, info: DerItem, password: CryptoPassword, var budget: PbeBudget): void {
+    if (!info.ok || info.tag != DER_SEQUENCE) { this.fail("wrong password or corrupt key"); return }
+    val oid = derItem(data, info.start, info.end)
+    val explicit = derItem(data, oid.end, info.end)
+    if (!oid.ok || !explicit.ok || explicit.tag != 160 || explicit.end != info.end) { this.fail("wrong password or corrupt key"); return }
+    if (pbeOid(data, oid, "\x2a\x86\x48\x86\xf7\x0d\x01\x07\x01")) {
+        val bytes = derItem(data, explicit.start, explicit.end)
+        if (!bytes.ok || bytes.tag != DER_OCTET_STRING || bytes.end != explicit.end) { this.fail("wrong password or corrupt key"); return }
+        this.contents(data.slice(bytes.start, bytes.end), password, budget, 1)
+    } else if (pbeOid(data, oid, "\x2a\x86\x48\x86\xf7\x0d\x01\x07\x06")) {
+        val encrypted = derItem(data, explicit.start, explicit.end)
+        if (!encrypted.ok || encrypted.tag != DER_SEQUENCE || encrypted.end != explicit.end) { this.fail("wrong password or corrupt key"); return }
+        val version = derItem(data, encrypted.start, encrypted.end)
+        if (!version.ok || version.tag != DER_INTEGER || data.slice(version.start, version.end) != "\x00") { this.fail("unsupported PKCS#12 EncryptedData version"); return }
+        val contents = derItem(data, version.end, encrypted.end)
+        if (!contents.ok || contents.tag != DER_SEQUENCE || contents.end != encrypted.end) { this.fail("wrong password or corrupt key"); return }
+        val kind = derItem(data, contents.start, contents.end)
+        if (!pbeOid(data, kind, "\x2a\x86\x48\x86\xf7\x0d\x01\x07\x01")) { this.fail("unsupported PKCS#12 encrypted content type"); return }
+        val algorithm = derItem(data, kind.end, contents.end)
+        val cipherData = derItem(data, algorithm.end, contents.end)
+        if (!algorithm.ok || !cipherData.ok || cipherData.tag != 128 || cipherData.end != contents.end) { this.fail("unsupported PKCS#12 encrypted content encoding (DER required)"); return }
+        val cipher = pbeParameters(data, algorithm, data.slice(cipherData.start, cipherData.end), this.limits)
+        if (cipher.error != "") { this.fail(cipher.error); return }
+        val decrypted = pbeDecrypt(cipher, password, budget)
+        if (!decrypted.ok) { this.fail(decrypted.error); return }
+        this.contents(decrypted.bytes, password, budget, 1)
+    } else this.fail("unsupported PKCS#12 content (data or PBES2 EncryptedData required)")
+}
+/** DER PFXv3 with a required SHA1/SHA256 MAC. Only authenticated content is
+ * traversed or decrypted; returns exactly one PKCS#8 key, not a TLS identity. */
+trusted fun pbeOpenPkcs12(data: string, password: CryptoPassword,
+    limits: RsaKeyReadLimits = rsaKeyReadLimits()): CryptoResult {
+    if (!rsaKeyReadLimitsValid(limits)) return cryptoFailed("invalid RSA key read limits")
+    if (!password.ok()) return cryptoFailed(password.error())
+    if (password.passwordBmpError != "") return cryptoFailed(password.passwordBmpError)
+    if (data.size > limits.maximumDerBytes) return cryptoFailed("PKCS#12 DER byte limit exceeded")
+    val malformed = "invalid PKCS#12 DER container"
+    val root = derItem(data, 0, data.size)
+    if (!root.ok || root.tag != DER_SEQUENCE || root.end != data.size) return cryptoFailed(malformed)
+    val version = derItem(data, root.start, root.end)
+    if (!version.ok || version.tag != DER_INTEGER || data.slice(version.start, version.end) != "\x03") return cryptoFailed("unsupported PKCS#12 version (PFXv3 required)")
+    val authSafe = derItem(data, version.end, root.end)
+    if (!authSafe.ok || authSafe.tag != DER_SEQUENCE) return cryptoFailed(malformed)
+    val oid = derItem(data, authSafe.start, authSafe.end)
+    if (!pbeOid(data, oid, "\x2a\x86\x48\x86\xf7\x0d\x01\x07\x01")) return cryptoFailed("unsupported PKCS#12 authSafe (password integrity required)")
+    val explicit = derItem(data, oid.end, authSafe.end)
+    if (!explicit.ok || explicit.tag != 160 || explicit.end != authSafe.end) return cryptoFailed(malformed)
+    val encoded = derItem(data, explicit.start, explicit.end)
+    if (!encoded.ok || encoded.tag != DER_OCTET_STRING || encoded.end != explicit.end) return cryptoFailed("unsupported PKCS#12 authSafe encoding (DER required)")
+    if (authSafe.end == root.end) return cryptoFailed("PKCS#12 MacData is required")
+    val mac = derItem(data, authSafe.end, root.end)
+    if (!mac.ok || mac.end != root.end) return cryptoFailed(malformed)
+    val safe = data.slice(encoded.start, encoded.end)
+    val budget = PbeBudget(limits)
+    val verified = pbePkcs12CheckMac(data, safe, mac, password, budget)
+    if (verified != "") return cryptoFailed(verified)
+    // No safe traversal or AES decrypt occurs before the MAC check above.
+    val sequence = derItem(safe, 0, safe.size)
+    if (!sequence.ok || sequence.tag != DER_SEQUENCE || sequence.end != safe.size) return cryptoFailed("wrong password or corrupt key")
+    val walk = PbeSafeWalk(limits)
+    var at = sequence.start
+    var count = 0
+    while (at < sequence.end && walk.error == "") {
+        count += 1
+        if (count > limits.maximumBags) return cryptoFailed("PKCS#12 content count limit exceeded")
+        val info = derItem(safe, at, sequence.end)
+        if (!info.ok) return cryptoFailed("wrong password or corrupt key")
+        walk.contentInfo(safe, info, password, budget)
+        at = info.end
+    }
+    if (walk.error != "") return cryptoFailed(walk.error)
+    if (walk.keys != 1) return cryptoFailed("PKCS#12 contains no private key")
+    CryptoResult(walk.key, true, "")
 }

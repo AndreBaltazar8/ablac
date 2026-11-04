@@ -78,6 +78,56 @@ converge on the same `wrong password or corrupt key` result. PBES2-CBC itself
 has no authentication. This key-file loader is not an authenticated encryption
 protocol, and its complete execution time is not claimed to be constant-time.
 
+## PKCS#12 key bags
+
+`rsaPrivateKeyFromPkcs12(der, password, limits)` reads DER PFXv3 using the same
+`CryptoPassword` resource and limits. It requires a SHA256 or SHA1 `MacData`
+and verifies it **before traversing or decrypting any bag**. The MAC key uses
+RFC7292 Appendix B (diversifier 3); PBES2 encryption uses PBKDF2 as above.
+The work budget is shared by MAC verification and every encrypted safe or key.
+
+```abla
+import "abla/crypto/rsa"
+import "abla/io"
+
+fun readPfx(der: string, passwordText: string): RsaPrivateKey {
+    val password = cryptoPassword(passwordText)
+    rsaPrivateKeyFromPkcs12(der, password)
+}
+
+fun main(): int {
+    val password = cryptoPassword("example-only-password")
+    val key = rsaPrivateKeyFromPkcs12("", password)
+    println(if (key.ok()) "key read" else "invalid container rejected")
+    0
+}
+// output: invalid container rejected
+```
+
+Supported contents are `data`, PBES2 `EncryptedData`, plain PKCS#8 `keyBag`,
+PBES2 `pkcs8ShroudedKeyBag`, and bounded nested `safeContentsBag`. Exactly one
+private key is required. X.509 certificate bags and attributes are structurally
+checked and ignored: this API neither selects a certificate identity nor makes
+any trust decision. `maximumBags` bounds both bags across nested contents and
+the number of outer content records. `maximumDepth` also bounds constructed
+attribute nesting. A normal OpenSSL `pkcs12 -export` is supported.
+
+PKCS#12 passwords must be valid UTF-8 text in the BMP, without embedded NUL;
+the empty password is supported. The factory also creates and wipes its own
+big-endian UTF-16 copy with its terminating zero. That text conversion is an
+explicit **variable-time import boundary**, outside the cryptographic cores.
+Invalid UTF-8, non-BMP characters and NUL are rejected for PKCS#12, while the
+same owner still permits exact-octet PKCS#8 use. Containers with separate MAC
+and encryption passwords are unsupported. The same password must protect both.
+
+Missing MACs, PBMAC1, signed/enveloped integrity, non-DER/indefinite encodings,
+unknown bag kinds and legacy PBES1/RC2/DES/3DES encryption are rejected with
+named errors. A valid MAC does not change the CBC caveat above: this is a
+bounded key-file importer, not a new authenticated-encryption protocol.
+Wrong passwords, bad padding and decrypted-key DER errors still share the
+same `wrong password or corrupt key` result. No alternate password encoding or
+legacy cipher is retried after failure.
+
 ## Timing and portability
 
 The new cryptographic cores use `secretU8`/`secretU32` for password/key bytes,
@@ -88,11 +138,12 @@ relabeled as secret APIs. ASN.1 parsing and final validity decisions remain
 outside the constant-time claim. See [the timing limits](../constant-time.md).
 
 Targeted assembly checks cover SHA schedules/rounds, HMAC digest blocks,
-password-pad construction and PBKDF2 accumulation on x86-64, AArch64, Wasm and
+password-pad construction, MAC comparison and PBKDF2 accumulation on x86-64, AArch64, Wasm and
 Xtensa, with deliberate leak controls. Primitive known answers run on native,
-AArch64 under QEMU and Wasm. This is assembly analysis, not a statistical timing
+AArch64 under QEMU and Wasm, including an end-to-end PKCS#12 key read. This is assembly analysis, not a statistical timing
 study or a promise about every CPU or Wasm engine.
 
 Fixtures in `tests/vectors/crypto/encrypted-rsa` use an already-public test key,
 explicit test-only passwords, and the recorded OpenSSL regeneration script.
-Standards: [PBKDF2 and PBES2](https://www.rfc-editor.org/rfc/rfc8018.html).
+Standards: [PBKDF2 and PBES2](https://www.rfc-editor.org/rfc/rfc8018.html),
+[PKCS#12](https://www.rfc-editor.org/rfc/rfc7292.html).

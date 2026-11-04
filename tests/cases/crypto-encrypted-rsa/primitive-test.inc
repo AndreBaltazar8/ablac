@@ -39,3 +39,16 @@ trusted fun pbeTestLeak(memory: int): int = ablaUnsafeLoadU8(aesPointer(memory +
 
 @inline @export("ct_pbe_password_pad")
 trusted fun pbeTestPasswordPad(out: int, password: int, size: int): void = pbePadBody(out, password, size, 54)
+
+trusted fun pbeTestMacKey(text: string, salt: string, count: int, sha1: bool): string {
+    val password = cryptoPassword(text)
+    val output = nativeByteBuffer(if (sha1) 20 else 32)
+    val budget = PbeBudget(RsaKeyReadLimits())
+    val ok = pbePkcs12MacKey(password, salt, count, sha1, output, budget)
+    val public = byteBuffer()
+    if (ok) for (i in 0 until output.capacity) public.appendText(byteEncode(output.load(i)))
+    pbeWipe(ablaUnsafePointerAddress(output.address), output.capacity)
+    public.toText()
+}
+@inline @export("ct_pbe_mac_compare")
+trusted fun pbeTestMacCompare(actual: int, expected: int, size: int): u32 = pbeMacBad(actual, expected, size).declassify()

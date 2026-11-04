@@ -173,7 +173,7 @@ fun main {
 |---|---|
 | `aesGcmEncrypt`, `aesGcmDecrypt`, `aesCbcEncryptPkcs7`, `aesCbcDecryptPkcs7`, `aesEcbEncryptPkcs5`, `aesEcbDecryptPkcs5` | as in [`abla/crypto/hosted`](#aes) |
 | `rsaPublicKeyFromPem`, `rsaPublicKeyFromDer`, `rsaPublicKeyFromCertificateDer` | as [there](#rsa). A certificate's chain, dates and signature aren't checked |
-| `rsaPrivateKeyFromPem(pem)`, `rsaPrivateKeyFromDer(der)` | PKCS#8 and PKCS#1, unencrypted. Password-resource overloads read PBES2/PBKDF2/AES-CBC [encrypted PKCS#8](encrypted-keys.md); PKCS#12 remains hosted-only |
+| `rsaPrivateKeyFromPem(pem)`, `rsaPrivateKeyFromDer(der)` | PKCS#8 and PKCS#1, unencrypted. Password-resource overloads read PBES2/PBKDF2/AES-CBC [encrypted PKCS#8](encrypted-keys.md); `rsaPrivateKeyFromPkcs12(der, password, limits)` reads modern MAC-verified DER key bags (see the same limits and restrictions) |
 | `private.signPkcs1Sha256`, `public.verifyPkcs1Sha256`, `private.signPkcs1Sha1Legacy`, `public.verifyPkcs1Sha1Legacy` | as there, with the same minimum sizes |
 | RSA encryption and decryption | as above, with empty-label OAEP. PKCS#1 v1.5 uses deterministic implicit rejection: invalid padding returns synthetic plaintext. Prefer OAEP, and make subsequent protocol checks indistinguishable to remote peers |
 | `rsaGeneratePrivateKey(bits = 2048)` | Generate a key with 2048, 3072 or 4096 bits and exponent 65537. Check `ok()` or `error`; generation fails without randomness. |
@@ -226,8 +226,7 @@ than that.
 
 ### Which to use
 
-- On a hosted server with OpenSSL, for keys that matter: `abla/crypto/hosted`. It has more (decryption, encrypted
-  keys, PKCS#12) and more scrutiny, and is about 14 times faster at signing. TLS stays on it.
+- On a hosted server with OpenSSL, for keys that matter: `abla/crypto/hosted`. It has broader format support and more scrutiny, and is about 14 times faster at signing. TLS stays on it.
 - For embedded and Wasm, or where linking OpenSSL isn't wanted: these. Compared on an i9-13900K with 2048-bit
   keys, 2026-11-01: signing 5.1 ms (OpenSSL 0.36 ms); GCM 476 MiB/s with instructions and 34 MiB/s without (OpenSSL
   2700 MiB/s); ECB 2700 MiB/s and 130 MiB/s.

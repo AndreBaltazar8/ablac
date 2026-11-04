@@ -41,7 +41,7 @@ fixtures=(
     ct_fix_base64:0
     ct_pbe_sha1:@0,@1,@2 ct_pbe_sha256:@0,@1,@2
     ct_pbe_hmac1:@0 ct_pbe_hmac256:@0 ct_pbe_xor1:@0 ct_pbe_xor256:@0
-    ct_pbe_password_pad:@0,@1
+    ct_pbe_password_pad:@0,@1 ct_pbe_mac_compare:@0,@1
 )
 for width in 1 3 128; do
     fixtures+=("ct_fix_inverse_$width:@0,@1" "ct_fix_gcd_$width:@0,@1"

@@ -45,7 +45,7 @@ def parse(raw,at=0):
  tag=raw[at]; size=raw[at+1];pos=at+2
  if size>=128:n=size-128;size=int.from_bytes(raw[pos:pos+n],'big');pos+=n
  end=pos+size
- if tag==48:
+ if tag&32:
   vals=[]
   while pos<end:child,pos=parse(raw,pos);vals.append(child)
   return Node(tag,vals),end
