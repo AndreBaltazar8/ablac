@@ -151,6 +151,13 @@ for mode in "" --fast; do
 done
 echo "ok   under #, as at run time; a type of its own name"
 
+# Decimal formatting has an independent oracle, including each power of ten through 10^77,
+# its neighbors, the integer edges and random widths. Exercise both # and native formatting.
+python3 tools/uint256/gen-cases.py "$seed" 64 --decimal-abla > "$out/src/decimal.ab"
+"$compiler" build "$out/src/decimal.ab" -o "$out/decimal" --no-cache --fast
+"$out/decimal" || { echo "uint256 decimal text: seed $seed" >&2; exit 1; }
+echo "ok   decimal text: compile-time and native agree with Python"
+
 for invalid in "$cases"/invalid-*.ab; do
     expected=$(sed -n '1s|^// *||p' "$invalid")
     set +e
