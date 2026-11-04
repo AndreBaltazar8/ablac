@@ -99,6 +99,11 @@ For a local HTTP daemon, `httpUnixClient("localhost", unixSocketAddress(socketPa
 returns the same `HttpClient` as the IPv4 transport, including response limits and
 an optional whole-exchange deadline.
 
+Server-side `HttpRequest.peerAddress` is the accepted socket's IP address and port,
+or null when no IP peer is available. The address has `address`, `port`, `family`
+(4 or 6), and IPv6 `scopeId` fields. `X-Forwarded-For` and `CF-Connecting-IP`
+remain untrusted headers and never populate this field.
+
 ## HTTP routing
 
 `abla/http` separates routing from transport: a router maps a method and a

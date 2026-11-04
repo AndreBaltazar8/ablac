@@ -49,7 +49,9 @@ resource class HttpEventServer(
     var drainDeadlineMilliseconds: int,
     var stopped: bool,
     // The clock when this pass of step began: a request needn't read it again.
-    var passMilliseconds: int
+    var passMilliseconds: int,
+    // One socket lookup per accepted connection, shared by persistent requests.
+    val peerAddresses: array<SocketPeerAddress?> = []
 ) {
     fun drop(): void {
         var index = 0
@@ -149,6 +151,7 @@ fun HttpEventServer.findDescriptor(descriptor: int): int {
 }
 
 fun HttpEventServer.allocateSlot(descriptor: int): int {
+    val peer = socketPeerAddress(descriptor)
     var slot = -1
     var index = 0
     while (slot < 0 && index < this.descriptors.size) {
@@ -158,6 +161,7 @@ fun HttpEventServer.allocateSlot(descriptor: int): int {
     if (slot < 0) {
         slot = this.descriptors.size
         this.descriptors.append(descriptor)
+        this.peerAddresses.append(peer)
         this.inputs.append("")
         this.outputs.append("")
         this.outputOffsets.append(0)
@@ -167,6 +171,7 @@ fun HttpEventServer.allocateSlot(descriptor: int): int {
         this.lastActivityMilliseconds.append(linuxMonotonicMilliseconds())
     } else {
         this.descriptors[slot] = descriptor
+        this.peerAddresses[slot] = peer
         this.inputs[slot] = ""
         this.outputs[slot] = ""
         this.outputOffsets[slot] = 0
@@ -191,6 +196,7 @@ fun HttpEventServer.closeSlot(slot: int): void {
         }
         linuxTcpCloseDescriptor(this.descriptors[slot])
         this.descriptors[slot] = -1
+        this.peerAddresses[slot] = null
         this.inputs[slot] = ""
         this.outputs[slot] = ""
         this.outputOffsets[slot] = 0
@@ -429,8 +435,9 @@ fun HttpEventServer.processNoEscapeInputInRegion(
         val framed = if (length < input.size) input.slice(0, length)
             else input
         val availableRequest = frame.request
-        val request = if (availableRequest != null) availableRequest
+        val parsed = if (availableRequest != null) availableRequest
             else httpEventRequest(framed, this.options.maximumBodyBytes)
+        val request = httpRequestWithAddress(parsed, this.peerAddresses[slot])
         val eventHandler = this.noEscapeHandler
         val response = eventHandler(request)
         this.requestCounts[slot] = this.requestCounts[slot] + 1
@@ -534,8 +541,9 @@ fun HttpEventServer.processSlot(slot: int): void {
                 )
             } else this.inputs[slot] = ""
             val availableRequest = frame.request
-            val request = if (availableRequest != null) availableRequest
+            val parsed = if (availableRequest != null) availableRequest
                 else httpEventRequest(framed, this.options.maximumBodyBytes)
+            val request = httpRequestWithAddress(parsed, this.peerAddresses[slot])
             var response = this.router.dispatch(request)
             if (this.useHandler) {
                 val eventHandler = this.handler

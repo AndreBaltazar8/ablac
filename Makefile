@@ -270,6 +270,7 @@ test-serial: ablac
 	tools/test-global-array-mutation.sh $(COMPILER)
 	tools/test-global-init-order.sh $(COMPILER)
 	tools/test-http-client.sh $(COMPILER)
+	tools/test-http-peer.sh $(COMPILER)
 	tools/test-http-close-delimited.sh $(COMPILER)
 	tools/test-http-interim.sh $(COMPILER)
 	tools/test-http-tls-deadline.sh $(COMPILER)

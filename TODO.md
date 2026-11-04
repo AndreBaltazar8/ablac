@@ -102,8 +102,7 @@
 - [ ] `abla/array`'s `removeLast()` rejects resource elements: moving one out
       without dropping it needs an array move-out intrinsic and ownership tracking.
 - [ ] Ownership errors in a generic stdlib instantiation point to the helper, not the caller (e.g. `removeLast()` on `array<Resource>`).
-- [ ] Missing and written by hand in every tool: multi-line string literals (`"""`
-      doesn't parse). `Path.writeText` is always 0666 less umask.
+- [ ] `Path.writeText` is always 0666 less umask.
 - [ ] `abla/crypto/hosted` can use an RSA key but not generate one; `abla/crypto/rsa` provides pure key generation.
 - [ ] There is no YAML library: NovaKind's `provision-mail` edits `~/.config/icy/mail.yaml` by its lines and refuses anything else
       under `accounts:`.

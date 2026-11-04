@@ -1,0 +1,96 @@
+import "abla/http"
+import "abla/http/event"
+import "abla/websocket/server"
+import "abla/websocket/server/tls"
+import "abla/net"
+import "abla/sys/linux/io"
+import "abla/sys/linux/process"
+import "abla/process/arguments"
+
+var handled = 0
+noescape fun peerReply(request: HttpRequest): HttpResponse {
+    handled = handled + 1
+    val peer = request.peerAddress
+    val value = if (peer == null) "null" else "${peer.family}|${peer.address}|${peer.port}|${peer.scopeId}"
+    httpText("$value|${request.header("CF-Connecting-IP")}|${request.parameter("id")}")
+}
+
+// Exercise the event engine with an IPv6 listener; its convenience factory
+// currently accepts IPv4 addresses only.
+fun eventServer6(router: HttpRouter, noEscape: bool): HttpEventServer {
+    val listener = tcpListenIpv6(ipv6Loopback(0))
+    listener.setNonblocking()
+    val poller = socketPoller()
+    if (listener.descriptor >= 0 && poller.descriptor >= 0) poller.watchDescriptor(listener.descriptor)
+    HttpEventServer(router, peerReply, peerReply, false, noEscape, move(listener), move(poller),
+        httpEventServerOptions(), [], [], [], [], [], [], [], [], [], false, 0, false, linuxMonotonicMilliseconds())
+}
+
+fun main: int {
+    val mode = processArgument(0)
+    if (socketPeerAddress(-1) != null || httpGet("/").peerAddress != null ||
+        httpParseRequest("GET / HTTP/1.1\r\nCF-Connecting-IP: 1.2.3.4\r\n\r\n").peerAddress != null) return 1
+    if (mode == "sync4" || mode == "sync6" || mode == "mapped") {
+        var listener = if (mode == "sync4") tcpListenAddress(ipv4Loopback(0))
+            else if (mode == "mapped") tcpListenIpv6(ipv6Any(0))
+            else tcpListenIpv6(ipv6Loopback(0))
+        if (listener.descriptor < 0) return 2
+        linuxPrintStandardError("${listener.localPort()}\n")
+        val router = httpRouter()
+        router.get("/item/:id", peerReply)
+        serveHttpOnce(router, listener)
+        listener.close()
+        return 0
+    }
+    if (mode == "event" || mode == "noescape" || mode == "event6" || mode == "noescape6") {
+        val router = httpRouter()
+        router.get("/item/:id", peerReply)
+        val server = if (mode == "event6" || mode == "noescape6") eventServer6(router, mode == "noescape6")
+            else if (mode == "event") httpEventServer(router, ipv4Loopback(0))
+            else httpEventServerNoEscapeHandler(peerReply, ipv4Loopback(0))
+        if (server.listener.descriptor < 0) return 3
+        linuxPrintStandardError("${server.listener.localPort()}\n")
+        var steps = 0
+        while (handled < 3 && steps < 200) { server.step(50); steps = steps + 1 }
+        server.drain()
+        return if (handled == 3) 0 else 4
+    }
+    if (mode == "unix") {
+        val address = unixSocketAddress(processArgument(1))
+        var listener = unixListen(address)
+        if (listener.descriptor < 0) return 5
+        linuxPrintStandardError("ready\n")
+        var peer = listener.accept()
+        val parsed = httpRequestWithPeer(httpParseRequest(peer.read(4096)), peer.descriptor)
+        peer.write(peerReply(parsed).render())
+        peer.close()
+        listener.close()
+        return 0
+    }
+    val tls = webSocketServerTls(processArgument(1), processArgument(2))
+    if (tls.error != "") return 6
+    val server = if (mode == "tls6" || mode == "tlsws6") webSocketServerIpv6(ipv6Loopback(0), WebSocketServerOptions(tls = tls, manualAdmission = mode == "tlsws6"))
+        else webSocketServer(ipv4Loopback(0), WebSocketServerOptions(tls = tls))
+    if (server.listener.descriptor < 0) return 7
+    linuxPrintStandardError("${server.localPort()}\n")
+    var replied = false
+    var steps = 0
+    while (!replied && steps < 200) {
+        server.step(50)
+        for (event in server.takeEvents()) {
+            if (event.isHttp() || event.isRequest()) {
+                val request = event.request
+                if (request != null) {
+                    val response = peerReply(request)
+                    replied = if (event.isRequest()) server.reject(event.id, 403, response.body)
+                        else server.respond(event.id, response)
+                }
+            }
+        }
+        server.flush()
+        steps = steps + 1
+    }
+    for (i in 0 until 5) server.step(10)
+    server.stop()
+    if (replied) 0 else 8
+}

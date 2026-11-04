@@ -7,6 +7,9 @@ import "abla/net/contracts"
 import "abla/unsafe/memory"
 import "abla/unsafe/memory/raw"
 
+// A peer IP and port; family is 4 or 6, with an IPv6 scope when present.
+class SocketPeerAddress(val address: string, val port: int, val family: int, val scopeId: int = 0)
+
 class Ipv4SocketAddress(val address: string, val port: int)
 
 class Ipv6SocketAddress(
@@ -1074,6 +1077,59 @@ fun TcpConnection.localAddressIpv6(): Ipv6SocketAddress =
 
 fun TcpConnection.peerAddressIpv6(): Ipv6SocketAddress =
     linuxSocketAddressIpv6(this.descriptor, true)
+
+// Compress the longest run of at least two zero words, choosing the first
+// on a tie. The existing IPv6 address reader retains its old spelling.
+private fun linuxPeerIpv6Text(buffer: NativeByteBuffer): string {
+    val words: array<int> = []
+    for (i in 0 until 8) words.append(buffer.load(8 + i * 2) * 256 + buffer.load(9 + i * 2))
+    var bestStart = -1
+    var bestLength = 1
+    var i = 0
+    while (i < 8) {
+        if (words[i] == 0) {
+            val start = i
+            while (i < 8 && words[i] == 0) i = i + 1
+            if (i - start > bestLength) { bestStart = start; bestLength = i - start }
+        } else i = i + 1
+    }
+    var text = ""
+    i = 0
+    while (i < 8) {
+        if (i == bestStart) {
+            text = "$text::"
+            i = i + bestLength
+        } else {
+            if (text != "" && text[text.size - 1] != 58) text = "$text:"
+            text = "$text${linuxNetHexWord(words[i])}"
+            i = i + 1
+        }
+    }
+    text
+}
+
+/** Peer address from the socket itself, or null for a non-IP socket or error. */
+fun socketPeerAddress(descriptor: int): SocketPeerAddress? {
+    if (descriptor < 0) return null
+    val address = nativeByteBuffer(128)
+    val length = nativeByteBuffer(8)
+    linuxNetStoreU32(length, 0, 128)
+    val status = linuxSyscall3(52, descriptor, nativePointerAddress(address.address), nativePointerAddress(length.address))
+    var result: SocketPeerAddress? = null
+    if (status == 0) {
+        val family = linuxNetReadNativeU16(address, 0)
+        if (family == 2 && linuxNetReadNativeU32(length, 0) >= 16) {
+            val peer = linuxNetReadIpv4Address(address)
+            result = SocketPeerAddress(peer.address, peer.port, 4)
+        } else if (family == 10 && linuxNetReadNativeU32(length, 0) >= 28) {
+            result = SocketPeerAddress(linuxPeerIpv6Text(address), linuxNetReadU16(address, 2), 6,
+                linuxNetReadNativeU32(address, 24))
+        }
+    }
+    address.close()
+    length.close()
+    result
+}
 
 fun linuxSocketSetNonblocking(descriptor: int, enabled: bool): bool {
     var succeeded = descriptor >= 0
