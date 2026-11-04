@@ -14,7 +14,7 @@ for mode in fast release; do
     options=()
     [[ $mode == release ]] || options+=(--fast)
     for source in "$root/tests/cases/text-blocks/main.ab" "$out/crlf.ab"; do
-        "$compiler" build "$source" -o "$out/main" --no-cache "${options[@]}"
+        "$compiler" build "$source" -o "$out/main" --no-cache ${options[@]+"${options[@]}"}
         status=0
         "$out/main" || status=$?
         [[ $status -eq 42 ]] || { echo "text blocks: $source $mode returned $status" >&2; exit 1; }
