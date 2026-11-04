@@ -20,7 +20,7 @@ mkdir -p "$out"
 cp -R tests/cases/ct "$cases"
 # Keep the private implementation private: test the exact production source in
 # the generated fixture's own module, never through a public test hook.
-sed '/^import /d' stdlib/abla/crypto/bignum/internal/entry.ab >> "$cases/fixture.ab"
+sed -n '/^\/\/ BEGIN RSA SECRET BIGNUM PRIMITIVES$/,/^\/\/ END RSA SECRET BIGNUM PRIMITIVES$/p' stdlib/abla/crypto/rsa/entry.ab >> "$cases/fixture.ab"
 # Staged build drivers need the scratch fixture paths as well.
 sed -i 's@tests/cases/ct/@build/ct/cases/@g' "$cases/build.ab" "$cases/aarch64-build.ab"
 python3 -I tools/ct/test-check-asm.py
@@ -36,6 +36,7 @@ fixtures=(
     ct_fix_rsa_pkcs1:@0 ct_fix_rsa_oaep:@0,@2
     ct_fix_rsa_implicit_length:@0 ct_fix_rsa_implicit_select:@1,@2
     ct_fix_secret_division:@0,@1 ct_fix_secret_exact:@0,@1 ct_fix_secret_reduce:@0,@1 ct_fix_secret_divsteps:@0,@1 ct_fix_secret_gcd:@0,@1 ct_fix_secret_inverse:@0,@1
+    ct_fix_rsa_subtract_one:@1 ct_fix_rsa_greater:@0,@1
     ct_fix_base64:0
 )
 for width in 1 3 128; do

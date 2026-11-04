@@ -10,9 +10,9 @@ mkdir -p "$out"
 # Compile the exact private production bodies in the same temporary module as
 # the oracle harness. The real internal module exports none of these functions.
 cat tests/cases/crypto-bignum-secret/run.ab > "$out/run.ab"
-sed '/^import /d' stdlib/abla/crypto/bignum/internal/entry.ab >> "$out/run.ab"
+sed -n '/^\/\/ BEGIN RSA SECRET BIGNUM PRIMITIVES$/,/^\/\/ END RSA SECRET BIGNUM PRIMITIVES$/p' stdlib/abla/crypto/rsa/entry.ab >> "$out/run.ab"
 cat tests/cases/crypto-bignum-secret/alias.ab > "$out/alias.ab"
-sed '/^import /d' stdlib/abla/crypto/bignum/internal/entry.ab >> "$out/alias.ab"
+sed -n '/^\/\/ BEGIN RSA SECRET BIGNUM PRIMITIVES$/,/^\/\/ END RSA SECRET BIGNUM PRIMITIVES$/p' stdlib/abla/crypto/rsa/entry.ab >> "$out/alias.ab"
 for case in forbidden forbidden-qualified; do
     if "$compiler" build "tests/cases/crypto-bignum-secret/$case.ab" -o "$out/forbidden" --fast --no-cache > "$out/$case.log" 2>&1; then
         echo "private bignum helper was callable: $case" >&2
@@ -33,7 +33,7 @@ done
 # Cross-target numeric oracle: Python supplies the expected integers, and the
 # static no-libc executable runs under qemu-aarch64 without a network or files.
 python3 -I tests/cases/crypto-bignum-secret/aarch64-kat.py "$out/aarch64-kat.ab"
-sed '/^import /d' stdlib/abla/crypto/bignum/internal/entry.ab >> "$out/aarch64-kat.ab"
+sed -n '/^\/\/ BEGIN RSA SECRET BIGNUM PRIMITIVES$/,/^\/\/ END RSA SECRET BIGNUM PRIMITIVES$/p' stdlib/abla/crypto/rsa/entry.ab >> "$out/aarch64-kat.ab"
 "$compiler" build tests/cases/crypto-bignum-secret/aarch64-build.ab -o "$out/aarch64-driver" --no-cache
 llvm-mc -triple aarch64-linux-gnu -filetype=obj tests/cases/simd/aarch64-start.s -o "$out/aarch64-start.o"
 ld.lld -static --no-pie -z notext "$out/aarch64.o" "$out/aarch64-start.o" -o "$out/aarch64"

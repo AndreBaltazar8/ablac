@@ -176,13 +176,24 @@ fun main {
 | `rsaPrivateKeyFromPem(pem)`, `rsaPrivateKeyFromDer(der)` | PKCS#8 and PKCS#1, unencrypted. **No** encrypted PEM, no PKCS#12: use the hosted module, or decrypt first |
 | `private.signPkcs1Sha256`, `public.verifyPkcs1Sha256`, `private.signPkcs1Sha1Legacy`, `public.verifyPkcs1Sha1Legacy` | as there, with the same minimum sizes |
 | RSA encryption and decryption | as above, with empty-label OAEP. PKCS#1 v1.5 uses deterministic implicit rejection: invalid padding returns synthetic plaintext. Prefer OAEP, and make subsequent protocol checks indistinguishable to remote peers |
-| `cryptoSetRandom(source)` | where the randomness for encryption and blinding comes from. Needed on anything but x86-64 Linux, where it's `getrandom`: a Wasm host's `crypto.getRandomValues`, an ESP32's hardware RNG. Its quality is yours to answer for. Without one, what needs it fails, and signing never goes on unblinded |
+| `rsaGeneratePrivateKey(bits = 2048)` | Generate a key with 2048, 3072 or 4096 bits and exponent 65537. Check `ok()` or `error`; generation fails without randomness. |
+| `private.toPkcs8Der()`, `private.toPkcs8Pem()` | Export unencrypted PKCS#8. A number-only key without its private exponent returns an error. |
+| `cryptoSetRandom(source)` | where the randomness for encryption, blinding and key generation comes from. Needed on anything but x86-64 Linux, where it's `getrandom`: a Wasm host's `crypto.getRandomValues`, an ESP32's hardware RNG. Its quality is yours to answer for. Without one, what needs it fails, and signing never goes on unblinded |
 
 For parsed PEM and DER keys, the synthetic PKCS#1 v1.5 result matches OpenSSL's implicit rejection for the same
 private exponent and ciphertext. `rsaPrivateFromNumbers` accepts an optional private exponent as its last argument;
 without it, rejection is derived from the CRT secrets and is deterministic but does not match OpenSSL. Do not mix
 these representations for the same key in an attacker-observable service. The derived hash and intermediate
 strings, like PEM text, cannot be wiped.
+
+Key generation uses the probable-prime bounds, separation and Miller–Rabin rounds in
+[FIPS 186-5](https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.186-5.pdf);
+this is a choice of parameters, **not** a FIPS validation claim. Prime candidate search, sieving,
+primality decisions, and its duration are variable-time. Key derivation uses fixed-width secret
+arithmetic; DER/PEM encoding is variable-time. The random source must be cryptographically secure, and its quality is the caller's
+responsibility when using `cryptoSetRandom`. Prime candidates, intermediate key strings, and
+exported PEM/DER are ordinary strings and cannot be wiped. The private key's raw allocation is
+wiped when dropped. Protect the generated unencrypted export as private key material.
 
 ### What timing protection each has, and hasn't
 
