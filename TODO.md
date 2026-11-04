@@ -122,8 +122,8 @@
 
 - [ ] After an octal-capable bootstrap is pinned, change decimal creation-mode defaults in src/ and stdlib/ to `0o666` / `0o600` (kept decimal for the v0.2.42 bootstrap).
 - [ ] `abla/crypto/hosted` can use an RSA key but not generate one; `abla/crypto/rsa` provides pure key generation.
-- [ ] There is no YAML library: NovaKind's `provision-mail` edits `~/.config/icy/mail.yaml` by its lines and refuses anything else
-      under `accounts:`.
+- [x] `abla/yaml` provides bounded Core-schema parsing, checked emission and comment/format-preserving path edits;
+      see [docs/stdlib/yaml.md](docs/stdlib/yaml.md) and the synthetic provision-mail fixture. NovaKind can adopt it after release.
 - [ ] `abla-s3` has no list-objects, create-bucket or head-bucket; a tool goes through `bucketRequest` and `sendOnce`, and parses the XML.
 
 ## Compiler and stdlib

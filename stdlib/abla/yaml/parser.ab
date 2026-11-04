@@ -7,7 +7,7 @@ import "abla/text"
 class YamlSourceEntry(val key: int, val value: int, val begin: int, val end: int,
     val colon: int = -1, var comma: int = -1)
 class YamlSourceNode(var value: Yaml, val begin: int, var contentBegin: int,
-    var end: int, var style: int, val indent: int,
+    var end: int, var style: int, var indent: int,
     val entries: array<YamlSourceEntry>, var anchor: string = "",
     var aliasTarget: int = -1, var closed: bool = false,
     var expandedNodes: int = 1, var expandedBytes: int = 0,
@@ -42,6 +42,20 @@ fun YamlParser.lineOf(offset: int): int {
 fun YamlParser.endLine(): int = this.ends[this.lineOf(this.pos)]
 fun YamlParser.column(): int = this.pos - this.starts[this.lineOf(this.pos)]
 fun YamlParser.byte(): int = if (this.pos < this.source.size) this.source[this.pos] else -1
+fun yamlRawInvalid(source: string, begin: int, end: int): int {
+    var i = begin
+    while (i < end) {
+        val c = source[i]
+        if (c == 127 || (c == 194 && i + 1 < end && source[i + 1] >= 128 && source[i + 1] <= 159 && source[i + 1] != 133) ||
+            (c == 239 && i + 2 < end && source[i + 1] == 191 && source[i + 2] >= 190)) return i
+        i += 1
+    }
+    -1
+}
+fun YamlParser.printable(begin: int, end: int): void {
+    val invalid = yamlRawInvalid(this.source, begin, end)
+    if (invalid >= 0) this.fail("syntax.control", "Non-printable YAML character must be quoted or escaped", invalid)
+}
 fun yamlSpace(c: int): bool = c == 32 || c == 9
 fun yamlBreak(c: int): bool = c == 10 || c == 13
 fun yamlSeparation(c: int): bool = c < 0 || yamlSpace(c) || yamlBreak(c)
@@ -57,6 +71,7 @@ fun YamlParser.flowSpace(): void {
         if (yamlSpace(c) || yamlBreak(c)) this.pos += 1
         else if (c == 35) {
             if (this.pos > 0 && !yamlSeparation(this.source[this.pos - 1])) this.fail("syntax.comment", "YAML comments require separation", this.pos)
+            this.printable(this.pos, this.endLine())
             this.pos = this.nexts[this.lineOf(this.pos)]
         }
         else {
@@ -71,7 +86,10 @@ fun YamlParser.blockSpace(): void {
     while (this.pos < this.source.size && this.errorCode == "") {
         val line = this.lineOf(this.pos)
         this.pos = this.starts[line] + this.indents[line]
-        if (this.pos == this.ends[line] || this.byte() == 35) {
+        var content = this.pos
+        while (content < this.ends[line] && yamlSpace(this.source[content])) content += 1
+        if (content == this.ends[line] || this.source[content] == 35) {
+            this.printable(content, this.ends[line])
             this.pos = this.nexts[line]
             this.tick(1)
         } else {
@@ -92,6 +110,7 @@ fun YamlParser.finishLine(): void {
     if (this.pos < this.source.size && this.pos < this.endLine() && this.byte() != 35) {
         this.fail("syntax.trailing", "Unexpected content after YAML value", this.pos)
     }
+    if (this.byte() == 35) this.printable(this.pos, this.endLine())
     if (this.pos < this.source.size) this.pos = this.nexts[this.lineOf(this.pos)]
 }
 fun YamlParser.newNode(begin: int, style: int, indent: int, depth: int): int {
@@ -141,6 +160,7 @@ fun YamlParser.properties(id: int): void {
     while (this.pos < this.source.size && !yamlSeparation(this.byte()) &&
         !yamlFlowEnd(this.byte()) && this.byte() != 91 && this.byte() != 123) this.pos += 1
     if (this.pos == start) this.fail("syntax.anchor", "Expected YAML anchor name", begin)
+    this.printable(start, this.pos)
     val name = this.source.slice(start, this.pos)
     this.anchorCount += 1
     if (this.anchorCount > this.limits.maximumAnchors) this.fail("limit.anchors", "YAML anchor limit exceeded", begin)
@@ -158,6 +178,7 @@ fun YamlParser.alias(id: int): int {
     val start = this.pos
     while (this.pos < this.source.size && !yamlSeparation(this.byte()) &&
         !yamlFlowEnd(this.byte()) && this.byte() != 91 && this.byte() != 123) this.pos += 1
+    this.printable(start, this.pos)
     val name = this.source.slice(start, this.pos)
     this.aliasCount += 1
     if (this.aliasCount > this.limits.maximumAliases) this.fail("limit.aliases", "YAML alias limit exceeded", begin)
@@ -198,6 +219,15 @@ fun YamlParser.quoted(quote: int, parentIndent: int): string {
             if (yamlBreak(escape)) {
                 if (escape == 13 && this.byte() == 10) this.pos += 1
                 while (yamlSpace(this.byte())) this.pos += 1
+                while (yamlBreak(this.byte()) && this.errorCode == "") {
+                    val nextBreak = this.byte()
+                    this.pos += 1
+                    if (nextBreak == 13 && this.byte() == 10) this.pos += 1
+                    output.appendText("\n")
+                    this.tick(1)
+                    while (yamlSpace(this.byte())) this.pos += 1
+                }
+                if (this.pos < this.source.size && (this.column() <= parentIndent || this.documentMarker(this.pos))) this.fail("syntax.indent", "Invalid YAML quoted continuation", this.pos)
             } else {
                 var scalar = -1
                 if (escape == 48) scalar = 0
@@ -296,6 +326,11 @@ fun YamlParser.mappingColon(start: int): int {
     }
     -1
 }
+fun YamlParser.presentationComment(line: int): bool {
+    var pos = this.starts[line] + this.indents[line]
+    while (pos < this.ends[line] && yamlSpace(this.source[pos])) pos += 1
+    pos < this.ends[line] && this.source[pos] == 35
+}
 fun YamlParser.presentationBlank(line: int): bool {
     var pos = this.starts[line] + this.indents[line]
     while (pos < this.ends[line] && yamlSpace(this.source[pos])) pos += 1
@@ -317,6 +352,7 @@ fun YamlParser.plain(flow: bool, key: bool, parentIndent: int): string {
         }
         var finish = this.pos
         while (finish > begin && yamlSpace(this.source[finish - 1])) finish -= 1
+        this.printable(begin, finish)
         output.appendText(this.source.slice(begin, finish))
         this.tick(this.pos - begin + 1)
         if ((key && !flow) || this.pos < end || end == this.source.size) done = true
@@ -325,7 +361,7 @@ fun YamlParser.plain(flow: bool, key: bool, parentIndent: int): string {
             var blanks = 0
             while (line < this.starts.size && this.presentationBlank(line)) { blanks += 1; line += 1 }
             if (line < this.starts.size && this.starts[line] < this.source.size &&
-                this.indents[line] > parentIndent && this.source[this.starts[line] + this.indents[line]] != 35 &&
+                this.indents[line] > parentIndent && !this.presentationComment(line) &&
                 !(flow && yamlFlowEnd(this.source[this.starts[line] + this.indents[line]])) &&
                 !(this.documentMarker(this.starts[line]))) {
                 this.pos = this.starts[line] + this.indents[line]
@@ -379,6 +415,7 @@ fun YamlParser.blockScalar(parentIndent: int): string {
         if (!blank && this.indents[line] < required) break
         if (leading && blank && this.indents[line] > required) this.fail("syntax.block", "YAML leading blank line exceeds scalar indentation", this.starts[line])
         val begin = if (this.indents[line] >= required) this.starts[line] + required else this.ends[line]
+        this.printable(begin, this.ends[line])
         val text = this.source.slice(begin, this.ends[line])
         texts.append(text)
         more.append(text.size > 0 && yamlSpace(text[0]))
@@ -442,7 +479,19 @@ fun YamlParser.scalar(id: int, flow: bool, key: bool, parentIndent: int): int {
         // Base conversion and exponent canonicalization have bounded quadratic work.
         this.tick(value.size * value.size)
     }
-    this.closeScalar(id, yamlResolvePlain(value), this.pos)
+    var scalarEnd = this.pos
+    while (scalarEnd > this.nodes[id].contentBegin && yamlSpace(this.source[scalarEnd - 1])) scalarEnd -= 1
+    this.closeScalar(id, yamlResolvePlain(value), scalarEnd)
+}
+fun YamlParser.implicitKey(begin: int, end: int): void {
+    var count = 0
+    var offset = begin
+    while (offset < end && this.errorCode == "") {
+        if ((this.source[offset] & 192) != 128) count += 1
+        if (count > 1024) this.fail("syntax.key", "YAML implicit key exceeds 1024 characters", begin)
+        offset += 1
+    }
+    this.tick(offset - begin)
 }
 fun YamlParser.member(id: int, key: int, value: int, begin: int, end: int, colon: int,
     var keys: array<Yaml>, var values: array<Yaml>, var seen: Map<string, int>): void {
@@ -474,7 +523,7 @@ fun YamlParser.flow(id: int, depth: int, parentIndent: int): int {
     val seen: Map<string, int> = Map()
     while (this.pos < this.source.size && this.byte() != closing && this.errorCode == "") {
         val begin = this.pos
-        if (!mapping && this.byte() == 44) { this.fail("syntax.flow", "Empty YAML flow sequence entry", this.pos); break }
+        if (this.byte() == 44) { this.fail("syntax.flow", "Empty YAML flow collection entry", this.pos); break }
         var explicit = false
         if (this.byte() == 63 && this.pos + 1 < this.source.size && yamlSeparation(this.source[this.pos + 1])) {
             explicit = true
@@ -487,7 +536,10 @@ fun YamlParser.flow(id: int, depth: int, parentIndent: int): int {
         var value = first
         var colon = -1
         if (mapping || this.byte() == 58 || explicit) {
-            if (!mapping && !explicit && this.byte() == 58 && this.lineOf(begin) != this.lineOf(this.pos)) this.fail("syntax.key", "Implicit YAML keys must stay on one line", begin)
+            if (!mapping && !explicit && this.byte() == 58) {
+                if (this.lineOf(begin) != this.lineOf(this.pos)) this.fail("syntax.key", "Implicit YAML keys must stay on one line", begin)
+                this.implicitKey(begin, this.pos)
+            }
             key = first
             if (this.byte() == 58) {
                 colon = this.pos
@@ -507,7 +559,7 @@ fun YamlParser.flow(id: int, depth: int, parentIndent: int): int {
             }
         }
         this.flowSpace()
-        this.member(id, key, value, begin, this.pos, colon, keys, values, seen)
+        this.member(id, key, value, begin, if (value >= 0) this.nodes[value].end else this.pos, colon, keys, values, seen)
         if (this.byte() == 44) {
             if (this.keepSource && this.nodes[id].entries.size > 0) this.nodes[id].entries[this.nodes[id].entries.size - 1].comma = this.pos
             this.pos += 1
@@ -547,7 +599,7 @@ fun YamlParser.afterIndicator(parentIndent: int, depth: int, compact: bool): int
         this.blockSpace()
         if (this.pos < this.source.size && (this.column() > parentIndent ||
             (!compact && this.column() == parentIndent && this.dash()))) return this.blockNode(depth, id)
-        return this.closeScalar(id, yamlNull(), begin)
+        return this.closeScalar(id, yamlNull(), this.nodes[id].contentBegin)
     }
     if (compact && (this.dash() || this.mappingColon(this.pos) >= 0 || this.explicitKey())) return this.blockNode(depth, id)
     val c = this.byte()
@@ -567,6 +619,8 @@ fun YamlParser.blockNode(depth: int, existing: int = -1): int {
     val parentIndent = if (depth == 1) -1 else indent - 1
     val id = if (existing >= 0) existing else this.newNode(this.pos, 0, indent, depth)
     if (id < 0 || this.errorCode != "") return id
+    this.nodes[id].indent = indent
+    this.nodes[id].contentBegin = this.pos
     if (this.documentMarker(this.pos)) { this.fail("unsupported.documents", "Multiple YAML documents are not supported", this.pos); return id }
     if (this.mappingColon(this.pos) < 0) this.properties(id)
     if (this.nodes[id].anchor != "" && (this.pos >= this.source.size || this.pos == this.endLine() || this.byte() == 35)) {
@@ -623,6 +677,7 @@ fun YamlParser.blockNode(depth: int, existing: int = -1): int {
                 else if (this.byte() == 58 && this.lineOf(this.pos) == this.lineOf(begin)) colon = this.pos
                 else colon = -1
             } else {
+                this.implicitKey(this.pos, colon)
                 if (this.pos == colon) key = this.emptyNode(this.pos, depth + 1)
                 else key = this.inlineNode(depth + 1, false, true, indent)
                 this.spaces()
@@ -650,11 +705,26 @@ fun YamlParser.blockNode(depth: int, existing: int = -1): int {
     this.nodes[id].end = end
     id
 }
+fun yamlErrorAt(source: string, code: string, message: string, offset: int): YamlError {
+    var line = 1
+    var column = 1
+    var i = 0
+    if (offset >= 3 && source.size >= 3 && source[0] == 239 && source[1] == 187 && source[2] == 191) i = 3
+    while (i < offset && i < source.size) {
+        if (source[i] == 13 || source[i] == 10) {
+            line += 1
+            column = 1
+            if (source[i] == 13 && i + 1 < offset && source[i + 1] == 10) i += 1
+        } else column += 1
+        i += 1
+    }
+    YamlError(code, message, offset, line, column)
+}
 fun yamlReadSource(source: string, limits: YamlLimits, keepSource: bool): YamlSourceResult {
     val p = YamlParser(source, limits, keepSource, 0, [], [], [], [], [], Map(), 0, 0, 0, -1, "", "", 0)
     if (!yamlLimitsValid(limits)) p.fail("limit.invalid", "Invalid YAML limits", 0)
     if (source.size > limits.maximumBytes) p.fail("limit.bytes", "YAML input byte limit exceeded", 0)
-    if (p.errorCode == "" && !source.isValidUtf8()) p.fail("syntax.utf8", "Invalid YAML UTF-8", 0)
+    if (p.errorCode == "" && !source.isValidUtf8()) p.fail("syntax.utf8", "Invalid YAML UTF-8", utf8Info(source).errorOffset)
     // Index lines once. Non-printable controls cannot occur literally, even in
     // quoted scalars; their escaped forms are accepted by quoted().
     var i = 0
@@ -664,9 +734,7 @@ fun yamlReadSource(source: string, limits: YamlLimits, keepSource: bool): YamlSo
         while (i < source.size && source[i] == 32) { indent += 1; i += 1 }
         while (i < source.size && !yamlBreak(source[i])) {
             val c = source[i]
-            if ((c < 32 && c != 9) || c == 127 ||
-                (c == 194 && i + 1 < source.size && source[i + 1] >= 128 && source[i + 1] <= 159 && source[i + 1] != 133) ||
-                (c == 239 && i + 2 < source.size && source[i + 1] == 191 && source[i + 2] >= 190)) p.fail("syntax.control", "Non-printable YAML character", i)
+            if (c < 32 && c != 9) p.fail("syntax.control", "Non-printable YAML character", i)
             i += 1
         }
         val end = i
@@ -683,19 +751,33 @@ fun yamlReadSource(source: string, limits: YamlLimits, keepSource: bool): YamlSo
     }
     // Keep positional error handling defined even on a rejected input.
     if (p.starts.size == 0) { p.starts.append(0); p.ends.append(0); p.nexts.append(0); p.indents.append(0) }
-    if (source.size >= 3 && source[0] == 239 && source[1] == 187 && source[2] == 191) {
+    if (p.errorCode == "" && source.size >= 3 && source[0] == 239 && source[1] == 187 && source[2] == 191) {
         p.pos = 3
         p.starts[0] = 3
     }
     p.blockSpace()
     if (p.byte() == 37 && p.errorCode == "") {
         val directive = source.slice(p.pos, p.endLine())
-        if (directive != "%YAML 1.2") {
+        var version = ""
+        if (directive.size > 5 && directive.slice(0, 5) == "%YAML" && yamlSpace(directive[5])) {
+            var start = 5
+            while (start < directive.size && yamlSpace(directive[start])) start += 1
+            var end = start
+            while (end < directive.size && !yamlSpace(directive[end])) end += 1
+            version = directive.slice(start, end)
+            while (end < directive.size && yamlSpace(directive[end])) end += 1
+            if (end < directive.size && directive[end] != 35) version = ""
+        }
+        if (version != "1.2") {
             if (directive.size >= 4 && directive.slice(0, 4) == "%TAG") p.fail("unsupported.tag", "YAML tags are not supported", p.pos)
             else p.fail("unsupported.directive", "Only the YAML 1.2 directive is supported", p.pos)
         }
         p.pos = p.nexts[p.lineOf(p.pos)]
         p.blockSpace()
+        if (p.byte() == 37) {
+            if (p.pos + 4 <= source.size && source.slice(p.pos, p.pos + 4) == "%TAG") p.fail("unsupported.tag", "YAML tags are not supported", p.pos)
+            else p.fail("unsupported.directive", "Multiple or unknown YAML directives are not supported", p.pos)
+        }
         if (p.pos + 3 > source.size || source.slice(p.pos, p.pos + 3) != "---") p.fail("syntax.directive", "YAML directive requires a document start marker", p.pos)
     }
     if (p.pos + 3 <= source.size && source.slice(p.pos, p.pos + 3) == "---" &&
@@ -707,7 +789,7 @@ fun yamlReadSource(source: string, limits: YamlLimits, keepSource: bool): YamlSo
     }
     var root = -1
     if (p.errorCode == "") {
-        if (p.pos >= source.size || (p.pos + 3 <= source.size && source.slice(p.pos, p.pos + 3) == "...")) root = p.emptyNode(p.pos, 1)
+        if (p.pos >= source.size || (p.documentMarker(p.pos) && source.slice(p.pos, p.pos + 3) == "...")) root = p.emptyNode(p.pos, 1)
         else root = p.blockNode(1)
         p.blockSpace()
         if (p.pos + 3 <= source.size && source.slice(p.pos, p.pos + 3) == "..." &&
@@ -721,8 +803,7 @@ fun yamlReadSource(source: string, limits: YamlLimits, keepSource: bool): YamlSo
             else p.fail("syntax.trailing", "Unexpected YAML content or indentation", p.pos)
         }
     }
-    val line = p.lineOf(p.errorOffset)
-    val error = YamlError(p.errorCode, p.errorMessage, p.errorOffset, line + 1, p.errorOffset - p.starts[line] + 1)
+    val error = yamlErrorAt(source, p.errorCode, p.errorMessage, p.errorOffset)
     val value = if (root >= 0 && p.errorCode == "") p.nodes[root].value else yamlNull()
     YamlSourceResult(value, p.nodes, root, p.errorCode == "", error)
 }
