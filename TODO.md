@@ -45,8 +45,18 @@
   size/performance. An isolated probe used the auxiliary word as a float tag
   and imported `abla/float/text` into the runtime: it formatted a manually
   tagged value but grew an int-only executable from 14,600 to 40,408 bytes
-  (2026-11-03). Find a demand-driven formatter and test all erasure paths
-  before changing the representation; no fix has been committed.
+  (2026-11-03). A later representation-only prototype with auxiliary float
+  kinds, dense float arrays and a module-wide demand flag kept an int-only
+  release probe byte-identical, but an O1 QR test bundle grew from 543,128 to
+  551,512 stripped bytes (+1.54%) and used 209.462 to 210.490 billion
+  instructions (+0.49%; one paired run). A module-wide flag makes shared
+  integer-array paths float-aware whenever any float exists; it is not enough
+  to meet the performance budget. The prototype remains uncommitted on
+  `fix-erased-float`. Revisit with type-directed identity added at proven
+  erasure boundaries while keeping typed float and array paths unchanged;
+  retain conservative behavior at generic, reflective and foreign boundaries.
+  A demand-driven formatter and full native, compile-time and Wasm tests are
+  still needed.
 
 - [ ] **Xtensa `llc` aborts on frames of 128 to 255 bytes that take a stack address.** `LLVM ERROR: Error
   while trying to spill A6 from class AR: Cannot scavenge register without an emergency spill slot!`, seen
