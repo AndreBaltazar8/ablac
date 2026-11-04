@@ -135,8 +135,9 @@ A sign glued to a number at the start of a line (`-1`) begins a new
 statement, so `if (found) return i` followed by `-1` on the next line returns
 `-1` from the function rather than computing `i - 1`.
 
-**Integer literals** are decimal or hexadecimal (`0x2a`), with optional `_`
-between digits (`1_000_000`). **Floating literals** need a fractional part or
+**Integer literals** are decimal, hexadecimal (`0x2a`) or octal (`0o600`),
+with optional `_` separators (`1_000_000`, `0xFF_FF`, `0o7_55`). Octal digits
+are `0` through `7`; `8`, `9`, and an empty `0o` prefix are errors. **Floating literals** need a fractional part or
 an exponent (`1.5`, `2e3`, `1.25e-2`) and have type `f64`. There are no
 character literals: `"abc"[1]` is the byte value `98`.
 
