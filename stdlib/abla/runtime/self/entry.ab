@@ -2615,6 +2615,92 @@ trusted fun __ablaRuntimeArrayTruncate(value: any, countValue: any): any {
     __ablaRuntimeVoid()
 }
 
+// Only middle removals shift. This helper never allocates or invokes a drop.
+@noinline
+trusted fun __ablaRuntimeArrayTakeShift(array: int, index: int, width: int): void {
+    val length = ablaRuntimeLoadI64(array)
+    val values = ablaRuntimeLoadI64(array + 16)
+    val end = length * width
+    var offset = (index + 1) * width
+    while (offset < end) {
+        ablaRuntimeStoreI64(values + offset - width, ablaRuntimeLoadI64(values + offset))
+        offset = offset + 8
+    }
+    offset = end - width
+    while (offset < end) {
+        ablaRuntimeStoreI64(values + offset, 0)
+        offset = offset + 8
+    }
+    ablaRuntimeStoreI64(array, length - 1)
+    return
+}
+
+// Move out a value without a drop. The checked last-slot path is O(1).
+@inline
+trusted fun __ablaRuntimeArrayTake(value: any, indexValue: any): any {
+    val array = __ablaRuntimeArrayAddress(value)
+    val index = __ablaRuntimeArrayIndex(array, __ablaRuntimeAsI64(indexValue))
+    val length = ablaRuntimeLoadI64(array)
+    val kind = __ablaRuntimeArrayKind(array)
+    val width = if (kind == 0) 24 else 8
+    val slot = ablaRuntimeLoadI64(array + 16) + index * width
+    val annotation = if (ablaRuntimeFloatReflectionEnabled())
+        ablaRuntimeLoadI32(ablaRuntimeValueAddress(value) + 4) else 0
+    val item = if (kind == 0) __ablaRuntimeValueAt(slot)
+        else ablaRuntimeMakeValue(kind + 1,
+            if (annotation > 2) annotation - 2 else annotation,
+            ablaRuntimeLoadI64(slot), 0)
+    if (index == length - 1) {
+        ablaRuntimeStoreI64(slot, 0)
+        if (kind == 0) {
+            ablaRuntimeStoreI64(slot + 8, 0)
+            ablaRuntimeStoreI64(slot + 16, 0)
+        }
+        ablaRuntimeStoreI64(array, length - 1)
+    } else __ablaRuntimeArrayTakeShift(array, index, width)
+    item
+}
+
+// Typed word moves mirror the scalar getters, avoiding a boxed result in loops.
+@inline
+trusted fun __ablaRuntimeArrayTakeWord(value: any, index: int, tag: int): int {
+    val array = __ablaRuntimeArrayAddress(value)
+    val length = ablaRuntimeLoadI64(array)
+    if (__ablaRuntimeArrayKind(array) == tag - 1 && index >= 0 && index < length) {
+        val slot = ablaRuntimeLoadI64(array + 16) + index * 8
+        val word = ablaRuntimeLoadI64(slot)
+        if (index == length - 1) {
+            ablaRuntimeStoreI64(slot, 0)
+            ablaRuntimeStoreI64(array, length - 1)
+        } else __ablaRuntimeArrayTakeShift(array, index, 8)
+        word
+    } else __ablaRuntimeArrayTakeWordOther(value, index, tag)
+}
+
+@noinline
+trusted fun __ablaRuntimeArrayTakeWordOther(value: any, index: int, tag: int): int {
+    // Validate the element's tag before changing anything.
+    val array = __ablaRuntimeArrayAddress(value)
+    val checked = __ablaRuntimeArrayIndex(array, index)
+    val kind = __ablaRuntimeArrayKind(array)
+    if (kind != 0) {
+        if (kind + 1 != tag) ablaRuntimeTrap()
+    } else {
+        val slot = ablaRuntimeLoadI64(array + 16) + checked * 24
+        if (ablaRuntimeLoadI32(slot) != tag) ablaRuntimeTrap()
+    }
+    val item = __ablaRuntimeArrayTake(value, __ablaRuntimeI64(index))
+    ablaRuntimeLoadI64(ablaRuntimeValueAddress(item) + 8)
+}
+
+@inline
+trusted fun __ablaRuntimeArrayTakeI64(value: any, index: int): int =
+    __ablaRuntimeArrayTakeWord(value, index, 2)
+
+@inline
+trusted fun __ablaRuntimeArrayTakeBool(value: any, index: int): bool =
+    __ablaRuntimeArrayTakeWord(value, index, 3) != 0
+
 // Readers: the common case (in bounds, the storage the caller expects) stays
 // small where it is inlined; the rest is one shared call.
 @inline

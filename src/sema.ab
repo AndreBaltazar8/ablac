@@ -609,7 +609,7 @@ fun bootstrapExpressionMayMutateReceiver(
             fields,
             owner
         )
-        if ((expression.text == "append" || expression.text == "truncate" ||
+        if ((expression.text == "append" || expression.text == "takeAt" || expression.text == "truncate" ||
              expression.text == "clear" ||
              (bootstrapIsMapType(receiverType) &&
               (expression.text == "set" || expression.text == "remove")) ||
@@ -5891,7 +5891,7 @@ fun bootstrapRegionExpressionCallsUnsafe(
     }
     if (expression.kind == "member.call" &&
         expression.text != "append" && expression.text != "slice" &&
-        expression.text != "truncate" && expression.text != "clear" &&
+        expression.text != "takeAt" && expression.text != "truncate" && expression.text != "clear" &&
         expression.text != "clone" && expression.text != "get" &&
         expression.text != "downgrade" &&
         expression.text != "upgrade" &&
@@ -9977,11 +9977,31 @@ class BootstrapAnalyzer(
         valid
     }
 
+    // An affine for-loop lends its element until that iteration ends. Neither
+    // a builtin mutation nor an exclusive borrow handed to a helper may detach it.
+    fun validateArrayElementLoan(receiver: BootstrapExpression, context: string): void {
+        if (this.loopDepth == 0) return
+        val root = bootstrapPlaceRootName(receiver)
+        var loan = 0
+        while (root != "" && loan < this.locals.size) {
+            val local = this.locals[loan]
+            if (local.borrowSource.size == root.size + 8 &&
+                local.borrowSource.slice(0, 8) == "element:" &&
+                this.scopeIsVisible(local.scope) &&
+                local.borrowSource.slice(8, local.borrowSource.size) == root) {
+                this.fail("ownership.borrow-mutation:$context:$root")
+                break
+            }
+            loan = loan + 1
+        }
+    }
+
     fun validateMutableBorrowArgument(
         expression: BootstrapExpression,
         expected: string,
         context: string
     ): void {
+        this.validateArrayElementLoan(expression, context)
         // Lent to be changed: inside a transaction, it must be its own.
         this.stmCheckMutation(expression, expression.begin, "")
         val kinds: array<int> = []
@@ -10088,6 +10108,7 @@ class BootstrapAnalyzer(
             this.mutationPlaceEnds.append(place.end)
         }
         val root = bootstrapPlaceRootName(receiver)
+        this.validateArrayElementLoan(receiver, context)
         if (root != "" && this.hasVisibleLocal(root) &&
             ((this.visibleLocalKind(root) == "parameter" &&
               this.typeIsBorrowTracked(this.findType(root))) ||
@@ -14512,6 +14533,21 @@ fun bootstrapInferMemberCall(
             )
         }
         result = "void"
+    } else if (expression.text == "takeAt" && bootstrapIsArrayType(receiver)) {
+        if (bootstrapIsBorrowType(rawReceiver)) {
+            analyzer.fail("ownership.borrow-mutation:takeAt")
+        }
+        analyzer.validateBorrowMutation(expression.children[0], "takeAt")
+        analyzer.stmCheckMutation(
+            expression.children[0], expression.begin,
+            "${bootstrapPlaceRootName(expression.children[0])}.takeAt()"
+        )
+        if (expression.children.size != 2) analyzer.fail("takeAt.arity")
+        else if (analyzer.infer(expression.children[1]) != "i64") {
+            analyzer.fail("takeAt.index")
+        }
+        // Unlike indexing, this detaches the slot: the result is owned.
+        result = bootstrapArrayElementType(receiver)
     } else if ((expression.text == "truncate" ||
                 expression.text == "clear") &&
                bootstrapIsArrayType(receiver)) {
