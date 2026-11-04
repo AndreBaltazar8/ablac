@@ -290,6 +290,42 @@ Package-side work (not changed from ablac):
   2.136G, +0.19%). Screen release function/loop alignment separately over all13 programs,
   including the size cost of 64-byte alignment; do not tune the string-copy change to fib.
   Evidence: worktrees/ablac-string-copy/build/copy-lab/{report.md,alignment-runs.json}.
+  Tried and dropped (2026-11-04): `--align-all-functions=6` (64 bytes) against
+  `=5` (32 bytes), both retaining `--align-loops=32`, on 0d5e56ed + string-copy
+  4132cb2a with the same frozen stage2 compiler. All16 release builds pass and their
+  LLVM-generated function symbols meet the requested alignment; the ordinary CRT-free direct link
+  is preserved. Stripped size rises **2.228% median over13 benchmarks**, or **1.919%
+  over all16 programs**, failing the 0.5% median bar. These are two forced policies,
+  not a claim that the current default aligns every function to32 bytes.
+
+  | Program | 32-byte functions (B) | 64-byte functions (B) | Change |
+  | --- | ---: | ---: | ---: |
+  | fib | 12,912 | 13,360 | +3.470% |
+  | sieve | 15,632 | 16,176 | +3.480% |
+  | nbody | 41,296 | 42,096 | +1.937% |
+  | trees | 15,024 | 15,536 | +3.408% |
+  | strings | 18,288 | 18,992 | +3.850% |
+  | maps | 22,256 | 22,896 | +2.876% |
+  | dispatch | 16,816 | 17,392 | +3.425% |
+  | matrix | 38,736 | 39,472 | +1.900% |
+  | websocket-codec | 33,040 | 33,776 | +2.228% |
+  | json-readers | 124,728 | 126,456 | +1.385% |
+  | json-megabyte | 196,968 | 199,240 | +1.153% |
+  | event-http-server | 138,624 | 140,096 | +1.062% |
+  | https-client | 126,168 | 127,800 | +1.294% |
+  | mvc | 241,984 | 243,968 | +0.820% |
+  | qr | 484,016 | 487,568 | +0.734% |
+  | icons | 1,146,768 | 1,155,728 | +0.781% |
+
+  The saved-object relink controls add32/64/96 bytes of live read-only padding before
+  text while preserving each policy's alignment. No new runtime sweep was started:
+  the size bar already fails, so no cycle/variance advantage for64 bytes is claimed.
+  The earlier default-policy fib placement control above has five samples per arm.
+  Before/after copying: medians2.085/2.458G cycles, sample CV6.64/0.40%; the two
+  fixed-placement controls: medians2.132/2.136G, sample CV4.27/7.67%. These data
+  isolate placement only, not forced32-vs64 variance. Full size records,
+  link commands/objects/controls and the prior variance calculation are in
+  worktrees/ablac-align-screen/build/align-lab/. No production setting changed.
 
 - [ ] **Temporaries spanning IR blocks never share a stack slot.** Every IR value that is
   not a scalar gets its own 24-byte slot. A value used only inside one IR block, defined by
