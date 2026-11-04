@@ -283,6 +283,7 @@ test-serial: ablac
 	tools/test-http-request-scan.sh $(COMPILER)
 	tools/test-http-tls-deadline.sh $(COMPILER)
 	tools/test-tls-faults.sh $(COMPILER)
+	tools/test-tls-unix.sh $(COMPILER)
 	tools/test-crypto.sh $(COMPILER)
 	tools/test-crypto-pure.sh $(COMPILER)
 	tools/test-rsa-export.sh $(COMPILER)

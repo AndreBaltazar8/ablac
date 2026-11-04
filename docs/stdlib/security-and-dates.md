@@ -277,3 +277,41 @@ fun main {
 
 The current time comes from `utcNow()` in `abla/process/time`
 ([system.md](system.md#time-ablaprocesstime)).
+
+## `abla/tls/hosted`: upgrading streams
+
+`tlsUpgrade(connection, host, caPath = "", timeoutMilliseconds = 5000,
+readWriteTimeoutMilliseconds = 30000)` consumes an established `TcpConnection`.
+`tlsUpgradeUnix` takes a `UnixConnection` with the same arguments and verified
+TLS behavior. `host` is the certificate hostname and SNI name, rather than the
+Unix socket pathname. `caPath` selects a CA file; the empty default uses system
+trust. Failure consumes and closes the raw connection too.
+
+For mutual TLS, use `tlsUpgradeWithIdentity(connection, host, identity,
+caPath = "", timeoutMilliseconds = 5000, readWriteTimeoutMilliseconds = 30000,
+deadline = 0)` for TCP, or `tlsUpgradeUnixWithIdentity` for Unix. The identity
+comes from `tlsClientIdentityFromPem` or `tlsClientIdentityFromPkcs12`, as with
+`tlsConnectWithIdentity`; the caller may drop it once upgrade returns. The
+nonzero `deadline` is an absolute monotonic millisecond time bounding the
+handshake. The low-level `tlsUpgradeHandle` / `tlsUpgradeUnixHandle` also accept
+this deadline and explicit identity handles; the ordinary upgrade APIs keep
+their existing timeout arguments. Already-configured socket timeouts survive
+client and server upgrades; otherwise the arguments supply handshake and
+subsequent read/write limits.
+
+`tlsServerUpgrade(connection, certificatePath, privateKeyPath,
+handshakeTimeoutMilliseconds = 5000, readWriteTimeoutMilliseconds = 30000,
+deadline = 0)` consumes an accepted TCP stream and negotiates server TLS.
+`tlsServerUpgradeUnix` does the same for an accepted Unix stream. **These load
+the certificate and private key on every call.** Use `tlsListen` when serving
+many TCP connections: it reuses its context. There is no separate public context
+handle API. A nonzero deadline bounds the entire server handshake, including
+peers that trickle a partial record. A failed upgrade closes the connection;
+a successful `TlsConnection` owns it until close/drop.
+
+Unix upgrades support pathname sockets on Linux and Darwin, and Linux abstract
+sockets. A Unix peer has no IP `peerAddress` (`socketPeerAddress` returns null).
+Closing a TLS connection or listener does not unlink a Unix pathname: the caller
+still owns that cleanup. Existing TCP upgrade signatures and behavior are
+unchanged. Unix entry points have distinct names because the compiler currently
+reports ambiguous named calls for overloads differing only in stream type.

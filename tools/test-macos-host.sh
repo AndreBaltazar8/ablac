@@ -61,6 +61,7 @@ expect_status_42 "$output_directory/unix-stream"
 expect_status_42 "$output_directory/uuid"
 
 "$project_root/tools/test-path-file-mode.sh" "$compiler"
+"$project_root/tools/test-tls-unix.sh" "$compiler"
 
 "$compiler" build "$project_root/tests/cases/modules/filesystem.ab" \
     --fast -o "$output_directory/filesystem"

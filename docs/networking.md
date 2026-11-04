@@ -549,11 +549,15 @@ line. Hosted secure random is supplied by
 | `tlsConnectWithCa(host, caPath, port, timeout, readWriteTimeout)` | the same, trusting the given CA file |
 | `tlsClientIdentityFromPem(certificatePem, keyPem, passphrase = "")`, `tlsClientIdentityFromPkcs12(der, password)` | a `TlsClientIdentity` for mutual TLS: a client certificate, any intermediates and its private key, checked against each other. `identity.ok()` and `identity.error` say how it went |
 | `tlsConnectWithIdentity(host, identity, caPath = "", port = 443, timeout, readWriteTimeout)` | as `tlsConnect`, presenting the identity, and trusting the CA file if given. Under TLS 1.3 a server's refusal of the certificate shows on the first read, since the handshake has already finished for the client |
-| `tlsUpgrade(var connection, host, caPath = "", timeoutMilliseconds = 5000, readWriteTimeoutMilliseconds = 30000)` | start TLS on an existing TCP connection; a socket that already has timeouts keeps them |
+| `tlsUpgrade(var connection, host, caPath = "", timeoutMilliseconds = 5000, readWriteTimeoutMilliseconds = 30000)`, `tlsUpgradeUnix(...)` | start verified client TLS on an existing TCP or Unix connection; existing socket timeouts survive |
+| `tlsUpgradeWithIdentity(connection, host, identity, ...)`, `tlsUpgradeUnixWithIdentity(...)` | upgrade while presenting a client identity |
+| `tlsServerUpgrade(connection, certificatePath, privateKeyPath, ...)`, `tlsServerUpgradeUnix(...)` | server TLS on an accepted stream; loads certificate/key on each call, so prefer `tlsListen` for many TCP connections |
 | `connection.setTimeouts(readMilliseconds, writeMilliseconds)` | replace the limits on an open connection (also on a `TcpConnection`); 0 waits as long as it takes |
 | `tlsListen(certificatePath, privateKeyPath, host = "::", port = 443, ...)` | a `TlsListener`, with `accept(handshakeTimeoutMilliseconds = 5000, readWriteTimeoutMilliseconds = 30000)` |
 | `webSocketServerTls(certificatePath, privateKeyPath, handshakeTimeoutMilliseconds = 5000)` | from `abla/websocket/server/tls`: a `WebSocketServerTls` for `WebSocketServerOptions(tls = ...)` ([TLS](#tls-wss-and-https)); `webSocketServerTlsPem` takes PEM text |
 | `tlsAvailable()`, `tlsLastError()` | whether OpenSSL could be loaded, and the last error |
+
+Unix upgrades and ownership/deadline details are described in the [stdlib TLS guide](stdlib/security-and-dates.md#ablatlshosted-upgrading-streams).
 
 `timeoutMilliseconds` bounds connecting and the handshake. The other limit bounds
 each `read` and each `write` of the open connection, so a peer that goes quiet

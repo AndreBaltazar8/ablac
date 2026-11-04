@@ -434,6 +434,53 @@ fun tlsUpgrade(
     connection, host, caPath, timeoutMilliseconds, readWriteTimeoutMilliseconds
 ))
 
+// Unix streams use exactly the TCP upgrade's descriptor-based TLS path. Move
+// ownership into the view before delegation, so failure also closes only once.
+trusted fun tlsUpgradeUnixHandle(
+    var connection: UnixConnection, host: string, caPath: string,
+    timeoutMilliseconds: int = 5000,
+    readWriteTimeoutMilliseconds: int = 30000,
+    identityCertificate: int = 0, identityKey: int = 0,
+    identityChain: array<int> = [], deadline: int = 0
+): int {
+    var stream = TcpConnection(connection.descriptor)
+    connection.descriptor = -1
+    tlsUpgradeHandle(stream, host, caPath, timeoutMilliseconds,
+        readWriteTimeoutMilliseconds, identityCertificate, identityKey, identityChain, deadline)
+}
+
+// host identifies the certificate/SNI, not the Unix socket pathname.
+fun tlsUpgradeUnix(var connection: UnixConnection, host: string, caPath: string = "",
+    timeoutMilliseconds: int = 5000,
+    readWriteTimeoutMilliseconds: int = tlsDefaultReadWriteTimeoutMilliseconds
+): TlsConnection = TlsConnection(tlsUpgradeUnixHandle(connection, host, caPath,
+    timeoutMilliseconds, readWriteTimeoutMilliseconds))
+
+trusted fun tlsUpgradeWithIdentity(var connection: TcpConnection, host: string,
+    identity: TlsClientIdentity, caPath: string = "", timeoutMilliseconds: int = 5000,
+    readWriteTimeoutMilliseconds: int = tlsDefaultReadWriteTimeoutMilliseconds,
+    deadline: int = 0
+): TlsConnection {
+    if (!identity.ok()) {
+        connection.close()
+        hostedTlsSetError(14)
+        return TlsConnection(-1)
+    }
+    TlsConnection(tlsUpgradeHandle(connection, host, caPath, timeoutMilliseconds,
+        readWriteTimeoutMilliseconds, identity.certificate, identity.key, identity.chain, deadline))
+}
+
+trusted fun tlsUpgradeUnixWithIdentity(var connection: UnixConnection, host: string,
+    identity: TlsClientIdentity, caPath: string = "", timeoutMilliseconds: int = 5000,
+    readWriteTimeoutMilliseconds: int = tlsDefaultReadWriteTimeoutMilliseconds,
+    deadline: int = 0
+): TlsConnection {
+    var stream = TcpConnection(connection.descriptor)
+    connection.descriptor = -1
+    tlsUpgradeWithIdentity(stream, host, identity, caPath, timeoutMilliseconds,
+        readWriteTimeoutMilliseconds, deadline)
+}
+
 fun tlsConnect(
     host: string,
     port: int = 443,
@@ -501,6 +548,46 @@ private trusted fun hostedTlsServerContext(certificatePath: string, privateKeyPa
         context = nativeNullPointer()
     }
     context
+}
+
+// Loads the certificate/key on each call. For many connections, tlsListen
+// reuses a server context. This operation consumes the stream even on failure.
+trusted fun tlsServerUpgrade(var connection: TcpConnection,
+    certificatePath: string, privateKeyPath: string,
+    handshakeTimeoutMilliseconds: int = 5000,
+    readWriteTimeoutMilliseconds: int = tlsDefaultReadWriteTimeoutMilliseconds,
+    deadline: int = 0
+): TlsConnection {
+    if (connection.descriptor < 0 || handshakeTimeoutMilliseconds <= 0 ||
+        handshakeTimeoutMilliseconds > 600000 || !tlsAvailable()) {
+        connection.close()
+        hostedTlsSetError(hostedTlsListenerFailed)
+        return TlsConnection(-1)
+    }
+    val context = hostedTlsServerContext(certificatePath, privateKeyPath)
+    if (pointerIsNull(context)) {
+        connection.close()
+        hostedTlsSetError(hostedTlsListenerFailed)
+        return TlsConnection(-1)
+    }
+    val descriptor = connection.descriptor
+    connection.descriptor = -1
+    val handle = hostedTlsServerAccept(context, descriptor,
+        handshakeTimeoutMilliseconds, readWriteTimeoutMilliseconds, deadline, true, true)
+    if (handle >= 0) hostedTlsSetError(0)
+    TlsConnection(handle)
+}
+
+trusted fun tlsServerUpgradeUnix(var connection: UnixConnection,
+    certificatePath: string, privateKeyPath: string,
+    handshakeTimeoutMilliseconds: int = 5000,
+    readWriteTimeoutMilliseconds: int = tlsDefaultReadWriteTimeoutMilliseconds,
+    deadline: int = 0
+): TlsConnection {
+    var stream = TcpConnection(connection.descriptor)
+    connection.descriptor = -1
+    tlsServerUpgrade(stream, certificatePath, privateKeyPath, handshakeTimeoutMilliseconds,
+        readWriteTimeoutMilliseconds, deadline)
 }
 
 trusted fun tlsListenHandle(
@@ -575,7 +662,8 @@ trusted fun TlsListener.accept(
 
 // Both the listener and accepted-stream APIs use this one handshake path.
 private trusted fun hostedTlsServerAccept(context: i64*, descriptor: int,
-    handshakeTimeoutMilliseconds: int, readWriteTimeoutMilliseconds: int): int {
+    handshakeTimeoutMilliseconds: int, readWriteTimeoutMilliseconds: int,
+    deadline: int = 0, ownsContext: bool = false, preserveTimeouts: bool = false): int {
     var handle = -1
     var session = nativeNullPointer()
     var ready = descriptor >= 0
@@ -584,29 +672,58 @@ private trusted fun hostedTlsServerAccept(context: i64*, descriptor: int,
         ready = !pointerIsNull(session)
     }
     if (ready) ready = SSL_set_fd(session, descriptor) == 1
+    val configured = ready && preserveTimeouts && linuxSocketHasTimeouts(descriptor)
     if (ready) {
-        linuxSocketSetTimeouts(
+        if (!configured) linuxSocketSetTimeouts(
             descriptor, handshakeTimeoutMilliseconds, handshakeTimeoutMilliseconds
         )
         ERR_clear_error()
         val held = linuxBrokenPipeHold()
-        val wait = HostedTlsWait(descriptor)
-        var shook = SSL_accept(session)
-        while (shook != 1 && hostedTlsInterrupted(wait, session, int(shook))) {
-            shook = SSL_accept(session)
+        if (deadline == 0) {
+            val wait = HostedTlsWait(descriptor)
+            var shook = SSL_accept(session)
+            while (shook != 1 && hostedTlsInterrupted(wait, session, int(shook))) {
+                shook = SSL_accept(session)
+            }
+            hostedTlsWaitDone(wait)
+            ready = shook == 1
+        } else {
+            ready = linuxSocketSetNonblocking(descriptor, true)
+            var done = false
+            while (ready && !done) {
+                val remaining = hostedTlsDeadlineWait(deadline, handshakeTimeoutMilliseconds)
+                if (remaining <= 0) ready = false
+                else {
+                    val result = SSL_accept(session)
+                    if (result == 1) done = true
+                    else {
+                        val error = SSL_get_error(session, result)
+                        if (error != 2 && error != 3) ready = false
+                        else {
+                            val wait = hostedTlsDeadlineWait(deadline, handshakeTimeoutMilliseconds)
+                            if (wait <= 0) ready = false
+                            else {
+                                val polled = linuxPollSocket(descriptor, error == 2, error == 3, wait)
+                                if (polled.timedOut || polled.failed() ||
+                                    (polled.closed && !polled.readable && !polled.writable)) ready = false
+                            }
+                        }
+                    }
+                }
+            }
+            if (!linuxSocketSetNonblocking(descriptor, false)) ready = false
         }
-        hostedTlsWaitDone(wait)
-        ready = shook == 1
         linuxBrokenPipeRelease(held)
     }
     if (ready) {
-        linuxSocketSetTimeouts(
+        if (!configured) linuxSocketSetTimeouts(
             descriptor, readWriteTimeoutMilliseconds, readWriteTimeoutMilliseconds
         )
-        handle = tlsAllocateConnection(context, session, descriptor, false)
+        handle = tlsAllocateConnection(context, session, descriptor, ownsContext)
     } else {
         if (!pointerIsNull(session)) SSL_free(session)
         if (descriptor >= 0) linuxTcpCloseDescriptor(descriptor)
+        if (ownsContext) SSL_CTX_free(context)
         hostedTlsSetError(hostedTlsServerHandshakeFailed)
     }
     handle
