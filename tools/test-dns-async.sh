@@ -26,6 +26,39 @@ for name in dns-async http-async; do
         { echo "dns async: $name exited with $status"; echo "$output"; exit 1; }
 done
 
+# Keep many port-zero sockets open together and check SO_REUSEADDR directly.
+"$compiler" build "$project_root/tests/cases/modules/udp-ephemeral.ab" \
+    -o "$output_directory/udp-ephemeral"
+status=0
+"$output_directory/udp-ephemeral" || status=$?
+[[ $status -eq 42 ]] || { echo "dns async: ephemeral socket regression failed ($status)"; exit 1; }
+
+# The original failure appeared under suite contention. Each fixture has its
+# own directory; compile once, then run eight copies together. Increase rounds
+# for an extended stress run without slowing the normal suite unnecessarily.
+rounds=${ABLA_DNS_STRESS_ROUNDS:-2}
+for ((round=1; round<=rounds; round++)); do
+    pids=()
+    for ((worker=1; worker<=8; worker++)); do
+        directory="$output_directory/stress-$worker"
+        mkdir -p "$directory"
+        (
+            status=0
+            output=$(ABLA_TEST_DIRECTORY="$directory" ABLA_MAX_MEMORY_MB=256 \
+                ABLA_MAX_SECONDS=30 ABLA_MAX_CPU_SECONDS=30 \
+                "$project_root/tools/run-limited.sh" "$output_directory/dns-async") || status=$?
+            [[ $status -eq 42 && $output == "dns async: ok" ]] || {
+                echo "dns async stress: round $round worker $worker exited $status: $output" >&2
+                exit 1
+            }
+        ) &
+        pids+=("$!")
+    done
+    failed=0
+    for pid in "${pids[@]}"; do wait "$pid" || failed=1; done
+    [[ $failed -eq 0 ]] || exit 1
+done
+
 # The resolver builds for the Linux target too.
 "$compiler" build "$project_root/tests/cases/modules/dns-async.ab" \
     --target x86_64-linux --emit object -o "$output_directory/linux.o" \

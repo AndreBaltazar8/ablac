@@ -74,6 +74,10 @@ fun main {
 }
 ```
 
+UDP binds to port 0 do not enable address reuse, including when requested
+explicitly, so an OS-selected port is not shared with another socket. Explicit
+nonzero server ports retain the requested reuse behavior.
+
 `SocketPoller` owns one epoll descriptor. `watchDescriptor`,
 `modifyDescriptor`, `unwatchDescriptor`, and `wait` expose readable, writable,
 closed, and error readiness without giving the poller ownership of watched

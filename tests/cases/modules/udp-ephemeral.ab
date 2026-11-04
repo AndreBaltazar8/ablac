@@ -1,0 +1,55 @@
+import "abla/net"
+import "abla/unsafe/memory"
+
+// Keep the descriptors live together: the OS must not assign the same port
+// to any two clients, including wildcard and loopback sockets.
+fun main: int {
+    val descriptors: array<int> = []
+    val ports: array<int> = []
+    var ok = true
+    var i = 0
+    while (i < 512) {
+        var socket = if (i % 2 == 0) udpBindPort(0) else udpBind(ipv4Loopback(0))
+        val port = socket.localPort()
+        if (socket.descriptor < 0 || port <= 0) ok = false
+        for (seen in ports) if (seen == port) ok = false
+        ports.append(port)
+        // Check the socket option directly as well, so the regression is
+        // deterministic even on a run where the old code has no collision.
+        val value = nativeByteBuffer(4)
+        val length = nativeByteBuffer(4)
+        linuxNetStoreU32(length, 0, 4)
+        val rc = linuxSyscall5(55, socket.descriptor, 1, 2,
+            nativePointerAddress(value.address), nativePointerAddress(length.address))
+        if (rc != 0 || linuxNetReadNativeU32(value, 0) != 0) ok = false
+        value.close()
+        length.close()
+        descriptors.append(socket.descriptor)
+        socket.descriptor = -1
+        i = i + 1
+    }
+    for (descriptor in descriptors) linuxSyscall1(3, descriptor)
+    // Explicitly requesting reuse still cannot share a port chosen by the OS.
+    var v6 = udpBindIpv6(ipv6Loopback(0), true, false)
+    if (v6.descriptor >= 0) {
+        val value = nativeByteBuffer(4)
+        val length = nativeByteBuffer(4)
+        linuxNetStoreU32(length, 0, 4)
+        val rc = linuxSyscall5(55, v6.descriptor, 1, 2,
+            nativePointerAddress(value.address), nativePointerAddress(length.address))
+        if (rc != 0 || linuxNetReadNativeU32(value, 0) != 0) ok = false
+        value.close()
+        length.close()
+        v6.close()
+    }
+    // Explicit server ports retain the existing reuse behavior.
+    var reserve = udpBind(ipv4Loopback(0))
+    val serverPort = reserve.localPort()
+    reserve.close()
+    var server1 = udpBind(ipv4Loopback(serverPort))
+    var server2 = udpBind(ipv4Loopback(serverPort))
+    if (serverPort <= 0 || server1.descriptor < 0 || server2.descriptor < 0) ok = false
+    server1.close()
+    server2.close()
+    if (ok) 42 else 1
+}

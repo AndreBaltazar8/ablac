@@ -61,7 +61,8 @@ fun mockServe(socket: UdpSocket, other: UdpSocket): int {
     var loops = 0
     while (loops < 400) {
         val request = socket.receiveFromWithTimeout(4096, 100)
-        if (request.received && request.bytes.size > 12) {
+        if (request.received && request.bytes.size > 12 &&
+            (dnsReadU16(request.bytes, 2) & 32768) == 0) {
             val bytes = request.bytes
             val id = dnsReadU16(bytes, 0)
             val question = dnsDecodeName(bytes, 12)
@@ -141,8 +142,8 @@ fun firstResolved(resolution: DnsResolution): string =
 
 // A query the mock answers has this long, which a loaded machine won't reach; only
 // the ones that should time out get a short deadline. "Fast" is well under it.
-val answeredDeadline = 30000
-val fastLimit = 15000
+val answeredDeadline = 10000
+val fastLimit = 9000
 
 // Steps until every query is done (or the deadline passes).
 fun settle(var dns: DnsAsyncResolver): void {
@@ -215,6 +216,11 @@ fun main: int {
     val mockChild = linuxSyscall0(57)
     if (mockChild == 0) linuxSyscall1(60, mockServe(mock, other))
     mock.close()
+    // A reply delivered to the mock must not trigger a reply-to-reply loop.
+    val stray = other.sendTo(mockReply(42, "a.test", 1, 0, [10, 1, 2, 3]),
+        ipv4Loopback(dnsPort))
+    val echoed = other.receiveFromWithTimeout(4096, 100)
+    expect("mock ignores replies", stray.succeeded() && echoed.timedOut)
     other.close()
     var probe = tcpListenAddress(ipv4Loopback(0))
     val webPort = probe.localPort()
@@ -281,7 +287,7 @@ fun main: int {
     expect("cancel", dns.pending() == 6 && dns.descriptorOf(cancelled) == -1)
     settle(dns)
     val results = dns.takeResults()
-    expect("all finished", results.size == 6 && dns.pending() == 0)
+    expect("concurrent queries: all finished", results.size == 6 && dns.pending() == 0)
     for (result in results) {
         if (result.id == a) {
             expect("A", firstAddress(result) == "10.1.2.3" &&
