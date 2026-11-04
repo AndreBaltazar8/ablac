@@ -124,6 +124,7 @@ test-serial: ablac
 	tools/test-float-interpolation.sh $(COMPILER)
 	tools/test-erased-float-boundaries.sh $(COMPILER)
 	tools/test-erased-float-containers.sh $(COMPILER)
+	tools/test-erased-float-extension.sh $(COMPILER)
 	tools/test-compile-time-branch.sh $(COMPILER)
 	tools/test-floating-point.sh $(COMPILER)
 	tools/test-f32.sh $(COMPILER)
