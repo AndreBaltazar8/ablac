@@ -362,6 +362,7 @@ test-serial: ablac
 	tools/test-gc-growth.sh $(COMPILER)
 	tools/test-object-layout.sh $(COMPILER)
 	tools/test-cache-layout-version.sh $(COMPILER)
+	python3 tools/test-held-o1.py $(COMPILER)
 	tools/test-loop-safe-point.sh $(COMPILER)
 	tools/test-codegen-units.sh $(COMPILER)
 	tools/test-codegen-cache.sh $(COMPILER)

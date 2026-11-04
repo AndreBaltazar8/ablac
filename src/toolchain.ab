@@ -815,6 +815,89 @@ trusted fun bootstrapEmitHeldWasmObject(
     status
 }
 
+// A lower bound on LLVM's printed instruction text. Names of instruction results
+// and direct operands must appear in it; other syntax and globals only add bytes.
+// This avoids rendering a large O1 module just to make the legacy 4 MiB ELF
+// section decision. Uncertain/small modules still use its exact printed size.
+noescape extern:"c" fun LLVMGetNumOperands(value: i64*): i32
+
+trusted fun bootstrapHeldTextDefinitelyLarge(module: i64*): bool {
+    val length = nativeByteBuffer(8)
+    var bytes = 0
+    var function = LLVMGetFirstFunction(module)
+    while (!pointerIsNull(function)) {
+        var block = LLVMGetFirstBasicBlock(function)
+        while (!pointerIsNull(block)) {
+            var instruction = LLVMGetFirstInstruction(block)
+            while (!pointerIsNull(instruction)) {
+                LLVMGetValueName2(instruction, length.pointerAt(0))
+                val named = length.loadI64(0)
+                bytes += 4 + if (named > 0) named + 4 else 0
+                var operand = 0
+                val operands = int(LLVMGetNumOperands(instruction))
+                while (operand < operands) {
+                    val value = LLVMGetOperand(instruction, i32(operand))
+                    if (!pointerIsNull(value)) {
+                        LLVMGetValueName2(value, length.pointerAt(0))
+                        val size = length.loadI64(0)
+                        if (size > 0) bytes += size + 1
+                    }
+                    operand += 1
+                }
+                if (bytes > 4194304) {
+                    length.close()
+                    return true
+                }
+                instruction = LLVMGetNextInstruction(instruction)
+            }
+            block = LLVMGetNextBasicBlock(block)
+        }
+        function = LLVMGetNextFunction(function)
+    }
+    length.close()
+    false
+}
+
+// Mirrors llvmAotEmitObjectFileConfigured's balanced settings, with the module
+// the frontend already owns. It is disposed here after optimization/emission.
+trusted fun bootstrapEmitHeldBalancedObject(objectPath: string): int {
+    val nullPointer = nativeNullPointer()
+    val module = bootstrapLlvmHeldModule
+    var status = if (pointerIsNull(module)) 130 else llvmInitializeNativeTarget()
+    if (status == 0 && !bootstrapHeldTextDefinitelyLarge(module)) {
+        val text = bootstrapRenderHeldModule()
+        if (text.size <= 4194304) bootstrapHeldElfFunctionSections(module)
+    }
+    val target = nativePointerCell(nullPointer)
+    val message = nativePointerCell(nullPointer)
+    val triple = LLVMGetDefaultTargetTriple()
+    if (status == 0 && LLVMGetTargetFromTriple(triple, target.address, message.address) != 0) status = 132
+    var machine = nullPointer
+    var layout = nullPointer
+    var options = nullPointer
+    if (status == 0) {
+        machine = LLVMCreateTargetMachine(target.load(), triple, "generic", "", 1, 2, 0)
+        if (pointerIsNull(machine)) status = 133
+    }
+    if (status == 0) {
+        LLVMSetTarget(module, triple)
+        layout = LLVMCreateTargetDataLayout(machine)
+        LLVMSetModuleDataLayout(module, layout)
+        options = LLVMCreatePassBuilderOptions()
+        status = llvmConsumeError(LLVMRunPasses(module, llvmPassesBalanced(), machine, options), 134)
+    }
+    if (status == 0 && LLVMTargetMachineEmitToFile(machine, module, objectPath, 1, message.address) != 0) status = 135
+    if (!pointerIsNull(options)) LLVMDisposePassBuilderOptions(options)
+    if (!pointerIsNull(layout)) LLVMDisposeTargetData(layout)
+    if (!pointerIsNull(machine)) LLVMDisposeTargetMachine(machine)
+    if (!pointerIsNull(message.load())) LLVMDisposeMessage(message.load())
+    LLVMDisposeMessage(triple)
+    target.close()
+    message.close()
+    bootstrapDisposeHeldModule()
+    status
+}
+
 // Moves the held module into a fresh context through in-memory bitcode and
 // disposes the old context (status 169 when LLVM cannot write or read it back).
 trusted fun bootstrapRebuildHeldModule(): int {
@@ -3141,11 +3224,16 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     // then parsing its text costs hundreds of MB for a large program. Codegen
     // units can cache their bitcode inputs without that textual handoff.
     // ABLA_KEEP_LLVM_TEXT=1 and ABLA_LLVM_OUT_OF_PROCESS=1 keep the text.
-    val nativeHeld = target.hosted &&
+    val nativeFastHeld = target.hosted &&
         (target.objectFormat == "macho" ||
          (target.objectFormat == "elf" && !ablaHostIsMacOS())) && !ltoEligible &&
         cacheProfile == "inprocess-fast" && !bootstrapKeepLlvmText() &&
         !bootstrapLlvmOutOfProcess()
+    val balancedHeldCandidate = target.hosted && artifact == "executable" &&
+        target.objectFormat == "elf" && !ablaHostIsMacOS() &&
+        cacheProfile == "inprocess-o1" && !bootstrapKeepLlvmText() &&
+        !bootstrapLlvmOutOfProcess()
+    var nativeHeld = nativeFastHeld || balancedHeldCandidate
     // A Linux release executable keeps its module too, optimized in process
     // (bootstrapOptimizeHeldWholeProgram): its text is written only for the cache, or for
     // a program that links LLVM, which is built from the text in parts. A requested
@@ -3167,7 +3255,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     var optimizeHeld = false
     // Reading and hashing about 10 MB is a sixth of a small build, so only what keys
     // on the image does it: the cache, and code generation units (on for every build).
-    val compilerImageUsed = allowCache || inProcessCodegen || nativeHeld
+    val compilerImageUsed = allowCache || inProcessCodegen || nativeFastHeld
     if (compilerImageUsed) bootstrapReadRunningImageIdentity()
     val imageBytes = if (compilerImageUsed && bootstrapRunningImageSize > 0)
         bootstrapRunningImageSize else 0
@@ -3176,7 +3264,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     // object is an archive of them (codegen_units.ab) that the link loads whole: only an
     // executable's, as an object or library artifact is that object itself. (Its cache
     // entries are its own for that reason.)
-    val nativeUnits = nativeHeld && artifact == "executable"
+    val nativeUnits = nativeFastHeld && artifact == "executable"
     var backendIdentity = ""
     if (cacheEnabled) {
         backendIdentity = "abla-backend\nllvm-library:${llvmLibraryVersion()}"
@@ -3218,7 +3306,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     // A held object and the text fallback can have different section layouts.
     // Unit count/threshold also select one object versus an archive and its
     // layout, so changing either must not reuse the other configuration.
-    val nativeMode = if (nativeHeld) {
+    val nativeMode = if (balancedHeldCandidate) "-held-o1-single-v1" else if (nativeHeld) {
         if (nativeUnits) "-held-units${bootstrapCodegenUnitCount()}-min${bootstrapCodegenUnitMinimum()}"
         else "-held-single"
     } else if (compilerBitcodeCandidate) "-release-bitcode" else ""
@@ -3285,6 +3373,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         // (A hit parses nothing: the tokens its graph's loading kept go now.)
         bootstrapLexMemoEnd()
         linkLlvm = Path(cacheLinkLlvmPath).readText() == "1"
+        if (balancedHeldCandidate && linkLlvm) nativeHeld = false
         linkHost = Path(cacheLinkHostPath).readText() == "1"
         abiManifest = Path(cacheAbiPath).readText()
         status = if (wasmObjectUnused || (sidecarDeclined && !linkLlvm)) 0
@@ -3337,6 +3426,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         bootstrapLlvmStackGuard = enclosingStackGuard
         bootstrapLlvmStoreBoxes = enclosingStoreBoxes
         linkLlvm = compilation.linkLlvm
+        if (balancedHeldCandidate && linkLlvm) nativeHeld = false
         linkHost = compilation.linkHost
         abiManifest = bootstrapNativeAbiManifest(
             target,
@@ -3387,7 +3477,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                         heldText = bootstrapRenderHeldModule()
                     }
                     bootstrapDisposeHeldModule()
-                } else if ((wholeProgramHeld &&
+                } else if ((balancedHeldCandidate && linkLlvm) || (wholeProgramHeld &&
                     (linkLlvm || !bootstrapHeldModuleInternalizable())) ||
                     (compilerBitcodeCandidate && linkLlvm && !wholeProgramHeld)) {
                     heldText = bootstrapRenderHeldModule()
@@ -3476,7 +3566,9 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                         bootstrapCodegenCacheDirectory(cacheDirectory),
                         "$compilerImageSize-$compilerFirstHash-$compilerSecondHash-${llvmLibraryVersion()}"
                     )
-                    status = if (inProcessCodegen)
+                    status = if (balancedHeldCandidate)
+                        bootstrapEmitHeldBalancedObject(emittedObjectPath)
+                        else if (inProcessCodegen)
                         bootstrapEmitHeldWasmObject(target.llvmTriple, emittedObjectPath, places)
                         else bootstrapEmitHeldNativeObject(emittedObjectPath, nativeUnits, places)
                 } else if (bitcodeHandoff) {
