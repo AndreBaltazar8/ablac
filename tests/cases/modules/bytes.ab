@@ -38,7 +38,68 @@ fun byteChunksCopyChecks(): bool {
     true
 }
 
+fun byteBufferSmallAppendChecks(): bool {
+    for (length in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17]) {
+        val value = "x\x00é<&>\xff0123456789abcdef".slice(1, length + 1)
+        val buffer = byteBuffer()
+        buffer.appendText("!")
+        buffer.appendText(value)
+        buffer.appendText(value)
+        if (buffer.toText() != "!" + value + value) return false
+    }
+    true
+}
+
+fun byteBufferStagedAppendChecks(): bool {
+    var pattern = ""
+    for (value in 0 until 256) pattern = pattern + byteEncode(value)
+    // Unaligned sources and destinations, including zero/high bytes; no read
+    // or write may extend outside the explicitly bounded short string.
+    for (offset in 0 until 8) {
+        for (prefix in 0 until 8) {
+            for (length in 0 until 18) {
+                val text = pattern.slice(offset, offset + length)
+                val start = pattern.slice(128, 128 + prefix)
+                val buffer = bytes(start)
+                buffer.appendText(text)
+                if (buffer.toText() != start + text) return false
+            }
+        }
+        memoryCollect()
+    }
+    // Mixed sizes cross both stage-growth boundaries and the large-chunk
+    // threshold; snapshots seal partial stages and must remain immutable.
+    val buffer = byteBuffer()
+    var expected = ""
+    var snapshot = ""
+    var snapshotExpected = ""
+    for (index in 0 until 600) {
+        val length = (index * 97) % 257
+        val text = pattern.slice(0, length)
+        buffer.appendText(text)
+        expected = expected + text
+        if (snapshot != snapshotExpected) return false
+        if (index % 97 == 0) {
+            snapshot = buffer.toText()
+            snapshotExpected = expected
+            memoryCollect()
+        }
+    }
+    if (buffer.toText() != expected || buffer.size() != expected.size) return false
+    // A view of the live stage can be the input even when reserve grows or
+    // seals that stage. The source must stay rooted across the slow reserve.
+    for (length in [1, 2, 3, 4, 5, 7, 8, 9, 31, 32, 33, 63, 64, 65, 127, 128, 255, 256]) {
+        val text = pattern.slice(0, length)
+        val aliasing = bytes(text)
+        val source = aliasing.stagedText()
+        aliasing.appendText(source)
+        if (aliasing.toText() != text + source) return false
+    }
+    byteBufferSmallAppendChecks()
+}
+
 fun main: int {
+    val compileAppend = #byteBufferSmallAppendChecks()
     val compileHash = #stableTextHash("Abla bytes")
     val buffer = bytes("Abla")
     buffer.appendText(" bytes")
@@ -82,6 +143,7 @@ fun main: int {
         growing.size() == 5066 &&
         byteBuffer().toText() == ""
     if (
+        compileAppend && byteBufferStagedAppendChecks() &&
         written && long && growthValid && byteChunksCopyChecks() &&
         appended && rejected &&
         buffer.size() == 11 &&
