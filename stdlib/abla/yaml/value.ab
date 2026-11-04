@@ -1,0 +1,271 @@
+import "abla/bytes"
+import "abla/array"
+import "abla/text"
+
+// Numeric text is exact, including integers outside int's range and .inf/.nan.
+// canonical is an exact decimal key identity, never an f64 conversion.
+class YamlNumber(val text: string, val integer: bool, val intValue: int,
+    val intAvailable: bool, val canonical: string, val valid: bool)
+
+// Kinds: 0 null, 1 string, 2 number, 3 boolean, 4 sequence, 5 mapping.
+// Values are immutable by convention, including the supplied arrays.
+class Yaml(val kind: int, val stringValue: string, val boolValue: bool,
+    val keys: array<Yaml>, val values: array<Yaml>, val numberValue: YamlNumber)
+class YamlError(val code: string, val message: string, val byteOffset: int,
+    val line: int, val column: int)
+class YamlParseResult(val value: Yaml, val succeeded: bool, val error: YamlError)
+class YamlLimits(
+    val maximumBytes: int = 1048576,
+    val maximumDepth: int = 64,
+    val maximumNodes: int = 100000,
+    val maximumScalarBytes: int = 1048576,
+    val maximumCollectionMembers: int = 10000,
+    val maximumAnchors: int = 1000,
+    val maximumAliases: int = 1000,
+    val maximumExpandedNodes: int = 100000,
+    val maximumExpandedScalarBytes: int = 8388608,
+    val maximumNumberBytes: int = 1024,
+    val maximumWork: int = 20000000
+)
+@threadShared val yamlEmptyValues: array<Yaml> = []
+@threadShared val yamlEmptyNumber = YamlNumber("", false, 0, false, "", false)
+fun yamlDefaultLimits(): YamlLimits = YamlLimits()
+fun yamlLimitsValid(l: YamlLimits): bool = l.maximumBytes > 0 && l.maximumBytes <= 67108864 &&
+    l.maximumDepth > 0 && l.maximumDepth <= 256 && l.maximumNodes > 0 &&
+    l.maximumNodes <= 1000000 && l.maximumScalarBytes > 0 &&
+    l.maximumScalarBytes <= 67108864 && l.maximumCollectionMembers > 0 &&
+    l.maximumCollectionMembers <= 1000000 && l.maximumAnchors > 0 &&
+    l.maximumAnchors <= 100000 && l.maximumAliases > 0 && l.maximumAliases <= 100000 &&
+    l.maximumExpandedNodes > 0 && l.maximumExpandedNodes <= 1000000 &&
+    l.maximumExpandedScalarBytes > 0 && l.maximumExpandedScalarBytes <= 67108864 &&
+    l.maximumNumberBytes > 0 && l.maximumNumberBytes <= 4096 &&
+    l.maximumWork > 0 && l.maximumWork <= 1000000000
+fun yamlNull(): Yaml = Yaml(0, "", false, yamlEmptyValues, yamlEmptyValues, yamlEmptyNumber)
+fun yamlString(value: string): Yaml = Yaml(1, value, false, yamlEmptyValues, yamlEmptyValues, yamlEmptyNumber)
+fun yamlBoolean(value: bool): Yaml = Yaml(3, "", value, yamlEmptyValues, yamlEmptyValues, yamlEmptyNumber)
+fun yamlSequence(values: array<Yaml>): Yaml = Yaml(4, "", false, yamlEmptyValues, values, yamlEmptyNumber)
+fun yamlMapping(keys: array<Yaml>, values: array<Yaml>): Yaml = Yaml(5, "", false, keys, values, yamlEmptyNumber)
+fun yamlObject(keys: array<string>, values: array<Yaml>): Yaml {
+    val typed: array<Yaml> = []
+    for (key in keys) typed.append(yamlString(key))
+    yamlMapping(typed, values)
+}
+fun Yaml.isNull(): bool = this.kind == 0
+fun Yaml.isString(): bool = this.kind == 1
+fun Yaml.isNumber(): bool = this.kind == 2
+fun Yaml.isBoolean(): bool = this.kind == 3
+fun Yaml.isSequence(): bool = this.kind == 4
+fun Yaml.isMapping(): bool = this.kind == 5
+fun Yaml.asString(): string = if (this.kind == 1) this.stringValue else ""
+fun Yaml.asBoolean(): bool = this.kind == 3 && this.boolValue
+fun Yaml.asInt(): int = if (this.kind == 2 && this.numberValue.intAvailable) this.numberValue.intValue else 0
+fun Yaml.intAvailable(): bool = this.kind == 2 && this.numberValue.intAvailable
+fun Yaml.asNumber(): YamlNumber = this.numberValue
+fun Yaml.size(): int = if (this.kind == 4 || this.kind == 5) this.values.size else 0
+fun Yaml.at(index: int): Yaml = this.values[index]
+fun yamlScalarKey(value: Yaml): string = if (value.kind == 0) "n"
+    else if (value.kind == 1) "s" + value.stringValue
+    else if (value.kind == 3) if (value.boolValue) "b1" else "b0"
+    else if (value.kind == 2) (if (value.numberValue.integer) "i" else "f") + value.numberValue.canonical
+    else "!"
+fun Yaml.keyIndex(key: Yaml): int {
+    val identity = yamlScalarKey(key)
+    var result = -1
+    var i = 0
+    while (this.kind == 5 && i < this.keys.size && result < 0) {
+        if (yamlScalarKey(this.keys[i]) == identity) result = i
+        i += 1
+    }
+    result
+}
+fun Yaml.hasKey(key: Yaml): bool = this.keyIndex(key) >= 0
+fun Yaml.getKey(key: Yaml): Yaml {
+    val index = this.keyIndex(key)
+    if (index >= 0 && index < this.values.size) this.values[index] else yamlNull()
+}
+fun Yaml.get(key: string): Yaml = this.getKey(yamlString(key))
+fun Yaml.has(key: string): bool = this.hasKey(yamlString(key))
+fun yamlDigit(c: int): int = if (c >= 48 && c <= 57) c - 48
+    else if (c >= 65 && c <= 70) c - 55 else if (c >= 97 && c <= 102) c - 87 else -1
+fun yamlUnsignedDecimal(text: string): string {
+    var start = 0
+    while (start < text.size - 1 && text[start] == 48) start += 1
+    if (text.size == 0) "0" else text.slice(start, text.size)
+}
+// Exact signed decimal + a small displacement (fraction/trailing-zero count).
+fun yamlExponentAdd(text: string, displacement: int): string {
+    var negative = false
+    var start = 0
+    if (text.size > 0 && (text[0] == 45 || text[0] == 43)) {
+        negative = text[0] == 45
+        start = 1
+    }
+    val canonical = yamlUnsignedDecimal(text.slice(start, text.size))
+    val digits: array<int> = []
+    var i = canonical.size
+    while (i > 0) { i -= 1; digits.append(canonical[i] - 48) }
+    var carry = if (negative) -displacement else displacement
+    i = 0
+    while (carry != 0 && i < digits.size) {
+        var value = digits[i] + carry
+        carry = 0
+        if (value < 0) { carry = -((-value + 9) / 10); value -= carry * 10 }
+        else if (value > 9) { carry = value / 10; value = value % 10 }
+        digits[i] = value
+        i += 1
+    }
+    // Negative carry means the small displacement crossed zero. At this point
+    // the original exponent was small, so the conversion below cannot overflow.
+    if (carry < 0) {
+        var original = 0
+        for (c in canonical) original = original * 10 + c - 48
+        val total = (if (negative) -original else original) + displacement
+        return "$total"
+    }
+    while (carry > 0) { digits.append(carry % 10); carry = carry / 10 }
+    while (digits.size > 1 && digits[digits.size - 1] == 0) digits.removeLast()
+    val output = byteBuffer()
+    if (negative && !(digits.size == 1 && digits[0] == 0)) output.appendText("-")
+    i = digits.size
+    while (i > 0) { i -= 1; output.appendText(byteEncode(digits[i] + 48)) }
+    output.toText()
+}
+fun yamlIntegerCanonical(text: string, start: int, radix: int, negative: bool): string {
+    val digits: array<int> = [0]
+    var offset = start
+    while (offset < text.size) {
+        var carry = yamlDigit(text[offset])
+        var i = 0
+        while (i < digits.size) {
+            val next = digits[i] * radix + carry
+            digits[i] = next % 10
+            carry = next / 10
+            i += 1
+        }
+        while (carry > 0) { digits.append(carry % 10); carry = carry / 10 }
+        offset += 1
+    }
+    val output = byteBuffer()
+    if (negative && !(digits.size == 1 && digits[0] == 0)) output.appendText("-")
+    var i = digits.size
+    while (i > 0) { i -= 1; output.appendText(byteEncode(digits[i] + 48)) }
+    output.toText()
+}
+fun yamlIntegerAvailable(text: string): bool {
+    val start = if (text.size > 0 && text[0] == 45) 1 else 0
+    val size = text.size - start
+    if (size < 19) return size > 0
+    if (size > 19) return false
+    val bound = if (start == 1) "9223372036854775808" else "9223372036854775807"
+    var i = 0
+    while (i < 19) {
+        if (text[start + i] < bound[i]) return true
+        if (text[start + i] > bound[i]) return false
+        i += 1
+    }
+    true
+}
+// 1 integer, 0 float, -1 string. YAML Core deliberately treats malformed
+// number-looking plain scalars as strings (0o9, +0xA and 1_000 included).
+fun yamlNumberKind(text: string): int {
+    if (text.size == 0) return -1
+    var i = 0
+    if (text[i] == 43 || text[i] == 45) i += 1
+    if (i == text.size) return -1
+    val rest = text.slice(i, text.size)
+    if (rest == ".inf" || rest == ".Inf" || rest == ".INF") return 0
+    if (i == 0 && (rest == ".nan" || rest == ".NaN" || rest == ".NAN")) return 0
+    var radix = 10
+    if (i == 0 && text.size > 2 && text[0] == 48 && (text[1] == 111 || text[1] == 120)) {
+        radix = if (text[1] == 111) 8 else 16
+        i = 2
+        while (i < text.size) {
+            val d = yamlDigit(text[i])
+            if (d < 0 || d >= radix) return -1
+            i += 1
+        }
+        return 1
+    }
+    var digits = 0
+    while (i < text.size && text[i] >= 48 && text[i] <= 57) { digits += 1; i += 1 }
+    var floating = false
+    if (i < text.size && text[i] == 46) {
+        floating = true
+        i += 1
+        while (i < text.size && text[i] >= 48 && text[i] <= 57) { digits += 1; i += 1 }
+    }
+    if (digits == 0) return -1
+    if (i < text.size && (text[i] == 101 || text[i] == 69)) {
+        floating = true
+        i += 1
+        if (i < text.size && (text[i] == 43 || text[i] == 45)) i += 1
+        val begin = i
+        while (i < text.size && text[i] >= 48 && text[i] <= 57) i += 1
+        if (i == begin) return -1
+    }
+    if (i != text.size) -1 else if (floating) 0 else 1
+}
+fun yamlNumberText(text: string): Yaml {
+    val kind = yamlNumberKind(text)
+    if (kind < 0 || text.size > 4096) return Yaml(2, "", false, yamlEmptyValues, yamlEmptyValues,
+        YamlNumber(text, false, 0, false, "", false))
+    val negative = text[0] == 45
+    var start = if (text[0] == 45 || text[0] == 43) 1 else 0
+    var canonical = ""
+    if (kind == 1) {
+        var radix = 10
+        if (start == 0 && text.size > 2 && text[0] == 48 && (text[1] == 111 || text[1] == 120)) {
+            radix = if (text[1] == 111) 8 else 16
+            start = 2
+        }
+        if (radix == 10) {
+            canonical = yamlUnsignedDecimal(text.slice(start, text.size))
+            if (negative && canonical != "0") canonical = "-" + canonical
+        } else canonical = yamlIntegerCanonical(text, start, radix, negative)
+    } else {
+        val rest = text.slice(start, text.size)
+        if (rest == ".inf" || rest == ".Inf" || rest == ".INF") canonical = if (negative) "-inf" else "inf"
+        else if (rest == ".nan" || rest == ".NaN" || rest == ".NAN") canonical = "nan"
+        else {
+            val coefficient = byteBuffer()
+            var fraction = 0
+            var dot = false
+            var i = start
+            while (i < text.size && text[i] != 101 && text[i] != 69) {
+                if (text[i] == 46) dot = true
+                else { coefficient.appendText(byteEncode(text[i])); if (dot) fraction += 1 }
+                i += 1
+            }
+            var exponent = "0"
+            if (i < text.size) exponent = text.slice(i + 1, text.size)
+            var digits = yamlUnsignedDecimal(coefficient.toText())
+            var trailing = 0
+            while (digits.size > 1 && digits[digits.size - 1] == 48) {
+                trailing += 1
+                digits = digits.slice(0, digits.size - 1)
+            }
+            if (digits == "0") canonical = "0e0"
+            else canonical = (if (negative) "-" else "") + digits + "e" + yamlExponentAdd(exponent, trailing - fraction)
+        }
+    }
+    val available = kind == 1 && yamlIntegerAvailable(canonical)
+    var integer = 0
+    if (available) {
+        val begin = if (canonical[0] == 45) 1 else 0
+        var i = begin
+        while (i < canonical.size) { integer = integer * 10 - (canonical[i] - 48); i += 1 }
+        if (begin == 0) integer = -integer
+    }
+    Yaml(2, "", false, yamlEmptyValues, yamlEmptyValues,
+        YamlNumber(text, kind == 1, integer, available, canonical, true))
+}
+fun yamlInteger(value: int): Yaml = yamlNumberText("$value")
+fun yamlResolvePlain(text: string): Yaml {
+    if (text == "" || text == "~" || text == "null" || text == "Null" || text == "NULL") yamlNull()
+    else if (text == "true" || text == "True" || text == "TRUE") yamlBoolean(true)
+    else if (text == "false" || text == "False" || text == "FALSE") yamlBoolean(false)
+    else if (yamlNumberKind(text) >= 0) yamlNumberText(text)
+    else yamlString(text)
+}
+
+fun yamlCopy(value: Yaml): Yaml = Yaml(value.kind, value.stringValue, value.boolValue, value.keys, value.values, value.numberValue)
