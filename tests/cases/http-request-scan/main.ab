@@ -1,0 +1,128 @@
+// Differential against the previous request parser: byte-preserving prefixes,
+// malformed headers, duplicate order, partial input and allocation boundaries.
+import "abla/http"
+import "abla/text"
+import "abla/bytes"
+
+private fun beforeParseRequest(input: string): HttpRequest {
+    val requestLineEnd = httpLineEnd(input, 0)
+    val firstSpace = textFindByte(input, 32, 0, requestLineEnd)
+    val secondSpace = textFindByte(input, 32, firstSpace + 1, requestLineEnd)
+    var method = ""
+    var target = "/"
+    if (firstSpace > 0 && secondSpace > firstSpace) {
+        method = input.slice(0, firstSpace)
+        target = input.slice(firstSpace + 1, secondSpace)
+    }
+    var path = target
+    var query = ""
+    val question = textFindByte(target, 63, 0, target.size)
+    if (question >= 0) {
+        path = target.slice(0, question)
+        query = target.slice(question + 1, target.size)
+    }
+
+    val headers: array<HttpHeader> = []
+    var cursor = requestLineEnd + 2
+    var bodyBegin = input.size
+    var more = cursor < input.size
+    while (more) {
+        val end = httpLineEnd(input, cursor)
+        if (end == cursor) {
+            bodyBegin = end + 2
+            more = false
+            cursor = cursor
+        } else {
+            val colon = textFindByte(input, 58, cursor, end)
+            if (colon > cursor) {
+                var valueBegin = colon + 1
+                while (valueBegin < end && input[valueBegin] == 32) {
+                    valueBegin = valueBegin + 1
+                }
+                headers.append(HttpHeader(
+                    input.slice(cursor, colon),
+                    input.slice(valueBegin, end)
+                ))
+            }
+            cursor = end + 2
+            if (cursor >= input.size) more = false
+            cursor = cursor
+        }
+    }
+    var body = ""
+    if (bodyBegin < input.size) body = input.slice(bodyBegin, input.size)
+    HttpRequest(method, path, query, headers, body, [], [])
+}
+
+private fun sameRequest(input: string): bool {
+    val before = beforeParseRequest(input)
+    val after = httpParseRequest(input)
+    if (before.method != after.method || before.path != after.path ||
+        before.query != after.query || before.body != after.body ||
+        before.headers.size != after.headers.size ||
+        before.parameterNames.size != after.parameterNames.size ||
+        before.parameterValues.size != after.parameterValues.size ||
+        before.peerAddress != null || after.peerAddress != null) return false
+    for (index in 0 until before.headers.size) {
+        if (before.headers[index].name != after.headers[index].name ||
+            before.headers[index].value != after.headers[index].value) return false
+    }
+    true
+}
+
+fun check(rounds: int): int {
+    val inputs = ["", "G", "GET / HTTP/1.1", "GET /?a??b HTTP/1.1\r\n",
+        "\r\n", " GET / HTTP/1.1\r\n:bad\r\n\r\nbody",
+        "GET / HTTP/1.1\r\nHost:  example\r\nx: one\r\nX: two\r\n\r\nbody",
+        "GET / HTTP/1.1\r\nx: \t value \r\nempty:   \r\nno-colon\r\n\r\n",
+        "GET / HTTP/1.1\r\nlast: partial\r", "GET / HTTP/1.1\r\n: x\r\nfoo:bar:baz",
+        "GET / HTTP/1.1\r\n\r\n\x00\xffbody"]
+    for (input in inputs) {
+        var end = 0
+        while (end <= input.size) {
+            if (!sameRequest(input.slice(0, end))) return 1
+            end = end + 1
+        }
+    }
+    val alphabet = ["\r", "\n", ":", " ", "\t", "x", "?", "\x00"]
+    for (first in alphabet) {
+        for (second in alphabet) {
+            for (third in alphabet) {
+                if (!sameRequest("GET / HTTP/1.1\r\n$first$second$third\r\n\r\nbody")) return 3
+            }
+        }
+    }
+    if (rounds > 20) {
+        val long = byteBuffer()
+        long.appendText("GET / HTTP/1.1\r\nX-β:   ")
+        for (index in 0 until 8192) long.appendByteValue(if (index % 17 == 0) 13 else 65)
+        long.appendText("\r\nlast:  \t\r\n\r\nbody")
+        if (!sameRequest(long.toText())) return 4
+        val many = byteBuffer()
+        many.appendText("GET / HTTP/1.1\r\n")
+        for (index in 0 until 96) many.appendText("X-$index:  value-$index\r\n")
+        many.appendText("\r\nbody")
+        if (!sameRequest(many.toText())) return 5
+    }
+    var state = 71
+    for (round in 0 until rounds) {
+        val bytes = byteBuffer()
+        bytes.appendText("GET /p?q=x HTTP/1.1\r\n")
+        for (offset in 0 until (round % 97)) {
+            state = (state * 251 + 17) % 65521
+            val choice = state % 12
+            bytes.appendByteValue(if (choice == 0) 13 else if (choice == 1) 10
+                else if (choice == 2) 58 else if (choice == 3) 32
+                else if (choice == 4) 9 else state % 256)
+        }
+        if (round % 3 == 0) bytes.appendText("\r\n\r\nbody")
+        if (!sameRequest(bytes.toText())) return 2
+    }
+    0
+}
+
+val staged = #check(12)
+fun main: int = if (staged == 0 && check(1000) == 0) 42 else 1
+
+@export("run")
+fun wasmCheck(): int = check(100)

@@ -278,6 +278,7 @@ test-serial: ablac
 	tools/test-http-peer.sh $(COMPILER)
 	tools/test-http-close-delimited.sh $(COMPILER)
 	tools/test-http-interim.sh $(COMPILER)
+	tools/test-http-request-scan.sh $(COMPILER)
 	tools/test-http-tls-deadline.sh $(COMPILER)
 	tools/test-tls-faults.sh $(COMPILER)
 	tools/test-crypto.sh $(COMPILER)
