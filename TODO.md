@@ -419,6 +419,43 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
 
 ## Tried, not pursued
 
+- **Further user-release O2 trimming** (2026-11-04, LLVM23, master827d288a):
+  14 configurations were screened with the actual held-module compiler on NovaKind's
+  tool, the MVC server and QR; promising ones then reached the 13 benchmarks.
+  Only the two late SROAs passed the strict runtime +0.3% / size +0.5% bars:
+  all 16 whole executables are byte-identical. Their removal is implemented;
+  O2 work falls 0.652% / 0.457% / 0.391% on NovaKind / MVC / QR, whole-build
+  instructions 0.337% / 0.199% / 0.181% in the cold screen. Keep both early SROAs.
+  Other screens, with O2 deltas in the same NovaKind / MVC / QR order:
+
+  | Removal | O2 instructions | Result |
+  |---|---|---|
+  | Final InstCombine | -2.37% / -2.41% / -2.68% | Sampled runtimes pass, but fib 12,696 -> 12,760 bytes (+0.5040958%, 64 bytes) misses the size bar; combining late SROAs does not cure it. |
+  | Post-GVN InstCombine | -3.20% / -3.87% / -3.53% | Nbody +2.3748% instructions in three alternating pairs; real-program gates alone had passed. |
+  | CGSCC EarlyCSE-MemSSA | -2.25% / -1.93% / -1.00% | QR reader +0.793%, NovaKind icon conversion +5.419% instructions. |
+  | Last JumpThreading | -1.12% / -1.07% / -1.14% | QR size +0.540% exceeds the bar. |
+  | MemCpyOpt | -1.48% / +1.38% / +0.67% | Removing it creates more downstream work on MVC and QR. |
+  | Final SROA alone | -0.24% / -0.15% / -0.20% | Exact executables on all three; included in the combined cleanup. |
+  | Late CGSCC SROA alone | -0.39% / -0.28% / -0.20% | Exact executables on all three; included in the combined cleanup. |
+  | Last VectorCombine | -0.18% / -0.15% / -0.23% | Small gross saving, changed code; not promoted. |
+  | AggressiveInstCombine | -0.47% / -0.54% / -0.25% | Small gross saving, changed code; not promoted. |
+  | Post-inline function attributes | -0.44% / +0.39% / -0.48% | Mixed small result; not promoted. |
+  | DFAJumpThreading | -0.01% / -0.02% / +0.07% | Exact executables, no useful build gain. |
+  | LoopSink | +0.03% / +0.01% / +0.13% | Exact executables, no build gain. |
+
+  Runtime coverage: the 11 standard runnable benchmarks, QR's nine cases,
+  six MVC HTTP workloads (including a 16 KiB POST), and NovaKind's help and
+  conversion of 35 real Android vector icons without DB/S3. Not every rejected
+  candidate reached every runtime gate; no unmeasured parity is claimed.
+  Known earlier GVN/indvars/SLP/first-SROA/tail-call losses were not repeated.
+  External `opt` replay is only for pass CPU attribution: bitcode use-list order
+  and local-name context change some decisions from the held C API. Candidates
+  used the actual compiler with a scratch pass override and fresh caches.
+  JSON benchmark clock/rate fields must be normalized for output comparisons;
+  keep counts, booleans and errors. Shared-load wall/cycles are not a gain claim.
+  Raw report: `worktrees/ablac-user-o2-screen/build/o2-lab/report.md`, with
+  pipeline files, payload/input provenance, per-case counters and binaries.
+
 - **Interface dispatch after LLVM inlining** (2026-11-04, `fbc4effa`):
   the dispatch benchmark runs 90 M calls in 3.512 G instructions. Its three
   steady paths take 40/37/40 instructions (39 on average); no calls or
