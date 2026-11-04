@@ -1348,3 +1348,55 @@ The earlier in-process O1 prototype was dropped: optimized textual IR matched
 external O1, but the held optimization took more CPU time despite fewer
 instructions. Its locality/IPC gap was not resolved. External O1 keeps that
 work in a fresh process.
+
+## Content-validated discovery summaries (2026-11-04)
+
+Cache-enabled native builds and test discovery keep successful raw module
+interfaces under `discovery-v1-<compiler-image>/` in the selected cache directory.
+Every lookup reads the current source, checks its complete bytes and lexical
+module identity against the record, and validates the bounded payload. Source
+hashes select a candidate file; timestamps do not validate it. The compiler's
+existing complete-image fingerprints partition the namespace and record header.
+`--no-cache` bypasses both lookup and publication.
+
+The record retains every declaration field, default, annotation and compile
+function body that `bootstrapModuleDiscovery` produces. It stores no resolved
+imports, semantic results, rewritten sources or executed staging results.
+Discovery with errors, actions, captured inputs or declaration edits stays on
+the full-parser path. Import resolution, capabilities and staged parsing still
+run normally. Unknown, corrupt, truncated, oversized or mismatched records fall
+back to a full parse; optional atomic publication certifies raw parsing only,
+not successful code generation or linking. Codec limits are cache eligibility
+limits, not language limits. The tree schema must track `BootstrapDeclaration`
+and `BootstrapExpression` when those types change.
+
+Against the exact v0.2.40-base compiler (`0d5e56ed`), two alternating pairs,
+at most four CPUs/jobs, median whole-command user instructions:
+
+| Workload | Fully cold | Discovery warm, objects cold | All build caches warm |
+|---|---:|---:|---:|
+| Tiny hello, `--fast` | +1.43% | -2.74% | -23.89% |
+| NovaKind tool, `--fast` | +0.36% | -1.15% | -39.77% |
+| QR's nine real tests, O1 | +0.016% | -0.111% | -0.137% |
+
+Fully cold includes creating discovery records. QR's unchanged test bodies
+execute about 209.377 G instructions; its warm compiler parent drops from
+551.75 M to 263.31 M (-52.28%), which barely changes the whole test command.
+NovaKind's `make tool` explicitly disables caching; these numbers use its
+cache-enabled build CLI. File I/O and the effect of not populating the lexer
+memo are included. Wall timings varied with shared-machine load and are not
+the basis of these claims.
+
+With discovery warm and objects cold, GNU time's maximum per-process RSS moves
+133.9 ->129.5 MiB for hello, 512.9 ->489.2 MiB for NovaKind, and 349.0 ->316.5 MiB
+for QR. Fully cold maxima rise by 0.66%, 1.00% and 1.06%, respectively. Sampled
+summed RSS, which includes shared mappings repeatedly, is recorded separately;
+its short hello peaks depend on process overlap and are not consistently lower.
+
+All 13 benchmark IR/executables match, including actual builds with discovery
+hits and cold object caches; NovaKind and QR executables match throughout the
+pairs. The compiler reaches a byte-identical IR/object/executable fixed point.
+The standalone codec screen round-trips all 905 current stdlib/NovaKind/QR
+source files; eligible decode costs 6.17x, 15.83x and 11.29x fewer instructions
+than raw discovery, before file I/O. Raw measurements and artifacts are in
+`worktrees/ablac-discovery-summary/build/discovery-lab`.

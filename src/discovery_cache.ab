@@ -1,0 +1,280 @@
+// Content-validated raw discovery summaries. The module graph still reads
+// current source and resolves imports; this codec stores parser data only.
+// Invalid, unknown or oversized records are misses. The caller publishes only
+// successful action/input/edit-free discovery and honors build cache policy.
+import "parser.ab"
+import "abla/bytes"
+import "abla/text"
+import "abla/sys/linux/fs"
+
+val BOOTSTRAP_DISCOVERY_CODEC_LIMIT = 33554432
+val BOOTSTRAP_DISCOVERY_CODEC_NODES = 1000000
+val BOOTSTRAP_DISCOVERY_CODEC_DEPTH = 256
+
+class BootstrapDiscoveryWriter(val out: ByteBuffer = byteBuffer(), var valid: bool = true, var nodes: int = 0)
+fun BootstrapDiscoveryWriter.room(size: int): bool {
+    if (size < 0 || size > BOOTSTRAP_DISCOVERY_CODEC_LIMIT - this.out.size()) this.valid = false
+    this.valid
+}
+fun BootstrapDiscoveryWriter.putInt(value: int): void {
+    if (!this.room(8)) return
+    var i = 0
+    while (i < 8) { this.out.appendByteValue((value >> (i * 8)) & 255); i = i + 1 }
+}
+fun BootstrapDiscoveryWriter.putCount(value: int): void {
+    if (!this.room(4) || value < 0 || value > BOOTSTRAP_DISCOVERY_CODEC_NODES) { this.valid = false; return }
+    var i = 0
+    while (i < 4) { this.out.appendByteValue((value >> (i * 8)) & 255); i = i + 1 }
+}
+fun BootstrapDiscoveryWriter.putText(value: string): void {
+    if (!this.room(4 + value.size)) return
+    // Byte lengths have a separate cap from node/element counts.
+    var i = 0
+    while (i < 4) { this.out.appendByteValue((value.size >> (i * 8)) & 255); i = i + 1 }
+    this.out.appendText(value)
+}
+fun BootstrapDiscoveryWriter.putBool(value: bool): void {
+    if (this.room(1)) this.out.appendByteValue(if (value) 1 else 0)
+}
+fun BootstrapDiscoveryWriter.putTexts(values: array<string>): void {
+    this.putCount(values.size)
+    for (value in values) this.putText(value)
+}
+fun BootstrapDiscoveryWriter.putInts(values: array<int>): void {
+    this.putCount(values.size)
+    for (value in values) this.putInt(value)
+}
+class BootstrapDiscoveryReader(val input: string, var cursor: int = 0, var valid: bool = true, var nodes: int = 0)
+fun BootstrapDiscoveryReader.room(size: int): bool {
+    if (size < 0 || size > this.input.size - this.cursor) this.valid = false
+    this.valid
+}
+fun BootstrapDiscoveryReader.getInt(): int {
+    if (!this.room(8)) return 0
+    val low = textReadU32LittleEndian(this.input, this.cursor)
+    val high = textReadU32LittleEndian(this.input, this.cursor + 4)
+    this.cursor = this.cursor + 8
+    low | (high << 32)
+}
+fun BootstrapDiscoveryReader.getCount(): int {
+    if (!this.room(4)) return 0
+    val count = textReadU32LittleEndian(this.input, this.cursor)
+    this.cursor = this.cursor + 4
+    if (count > BOOTSTRAP_DISCOVERY_CODEC_NODES || count > this.input.size - this.cursor) {
+        this.valid = false
+        return 0
+    }
+    count
+}
+fun BootstrapDiscoveryReader.getText(): string {
+    if (!this.room(4)) return ""
+    val size = textReadU32LittleEndian(this.input, this.cursor)
+    this.cursor = this.cursor + 4
+    if (!this.room(size)) return ""
+    val begin = this.cursor
+    this.cursor = begin + size
+    this.input.slice(begin, this.cursor)
+}
+fun BootstrapDiscoveryReader.getBool(): bool {
+    if (!this.room(1)) return false
+    val byte = this.input[this.cursor]
+    this.cursor = this.cursor + 1
+    if (byte > 1) this.valid = false
+    byte == 1
+}
+fun BootstrapDiscoveryReader.getTexts(): array<string> {
+    val count = this.getCount()
+    val values: array<string> = []
+    var i = 0
+    while (this.valid && i < count) { values.append(this.getText()); i = i + 1 }
+    values
+}
+fun BootstrapDiscoveryReader.getInts(): array<int> {
+    val count = this.getCount()
+    val values: array<int> = []
+    if (count > (this.input.size - this.cursor) / 8) this.valid = false
+    var i = 0
+    while (this.valid && i < count) { values.append(this.getInt()); i = i + 1 }
+    values
+}
+fun bootstrapDiscoveryEmptyExpression(): BootstrapExpression = BootstrapExpression("missing", "", 0, 0, [])
+fun bootstrapDiscoveryEmptyDeclaration(): BootstrapDeclaration = BootstrapDeclaration("", "", 0, 0, bootstrapDiscoveryEmptyExpression(), [], [], "", [], [], "", [], "", false, false, false, "", 0, 0, [], [], [], [], "", [], false, false, [])
+fun BootstrapDiscoveryWriter.putExpression(value: BootstrapExpression, depth: int): void {
+    if (!this.valid || depth > BOOTSTRAP_DISCOVERY_CODEC_DEPTH || this.nodes >= BOOTSTRAP_DISCOVERY_CODEC_NODES) { this.valid = false; return }
+    this.nodes = this.nodes + 1
+    this.putText(value.kind)
+    this.putText(value.text)
+    this.putInt(value.begin)
+    this.putInt(value.end)
+    this.putExpressions(value.children, depth + 1)
+}
+fun BootstrapDiscoveryWriter.putExpressions(values: array<BootstrapExpression>, depth: int): void {
+    this.putCount(values.size)
+    for (value in values) this.putExpression(value, depth)
+}
+fun BootstrapDiscoveryReader.getExpression(depth: int): BootstrapExpression {
+    if (!this.valid || depth > BOOTSTRAP_DISCOVERY_CODEC_DEPTH || this.nodes >= BOOTSTRAP_DISCOVERY_CODEC_NODES) { this.valid = false; return bootstrapDiscoveryEmptyExpression() }
+    this.nodes = this.nodes + 1
+    val kind = this.getText()
+    val text = this.getText()
+    val begin = this.getInt()
+    val end = this.getInt()
+    val children = this.getExpressions(depth + 1)
+    BootstrapExpression(kind, text, begin, end, children)
+}
+fun BootstrapDiscoveryReader.getExpressions(depth: int): array<BootstrapExpression> {
+    val count = this.getCount()
+    val values: array<BootstrapExpression> = []
+    var i = 0
+    while (this.valid && i < count) { values.append(this.getExpression(depth)); i = i + 1 }
+    values
+}
+fun BootstrapDiscoveryWriter.putDeclaration(value: BootstrapDeclaration, depth: int): void {
+    if (!this.valid || depth > BOOTSTRAP_DISCOVERY_CODEC_DEPTH || this.nodes >= BOOTSTRAP_DISCOVERY_CODEC_NODES) { this.valid = false; return }
+    this.nodes = this.nodes + 1
+    this.putText(value.kind)
+    this.putText(value.name)
+    this.putInt(value.begin)
+    this.putInt(value.end)
+    this.putExpression(value.expression, depth + 1)
+    this.putTexts(value.parameters)
+    this.putTexts(value.parameterTypes)
+    this.putText(value.resultType)
+    this.putDeclarations(value.methods, depth + 1)
+    this.putExpressions(value.parameterDefaults, depth + 1)
+    this.putText(value.externalLibrary)
+    this.putTexts(value.parameterKinds)
+    this.putText(value.extensionOwner)
+    this.putBool(value.isTrusted)
+    this.putBool(value.isResource)
+    this.putBool(value.isNoEscape)
+    this.putText(value.generatedNamespace)
+    this.putInt(value.generatedOriginBegin)
+    this.putInt(value.generatedOriginEnd)
+    this.putTexts(value.annotations)
+    this.putExpressions(value.annotationArguments, depth + 1)
+    this.putInts(value.annotationBegins)
+    this.putInts(value.annotationEnds)
+    this.putText(value.sourceIdentity)
+    this.putTexts(value.conformances)
+    this.putBool(value.isSealed)
+    this.putBool(value.isPrivate)
+    this.putTexts(value.typeParameters)
+}
+fun BootstrapDiscoveryWriter.putDeclarations(values: array<BootstrapDeclaration>, depth: int): void {
+    this.putCount(values.size)
+    for (value in values) this.putDeclaration(value, depth)
+}
+fun BootstrapDiscoveryReader.getDeclaration(depth: int): BootstrapDeclaration {
+    if (!this.valid || depth > BOOTSTRAP_DISCOVERY_CODEC_DEPTH || this.nodes >= BOOTSTRAP_DISCOVERY_CODEC_NODES) { this.valid = false; return bootstrapDiscoveryEmptyDeclaration() }
+    this.nodes = this.nodes + 1
+    val kind = this.getText()
+    val name = this.getText()
+    val begin = this.getInt()
+    val end = this.getInt()
+    val expression = this.getExpression(depth + 1)
+    val parameters = this.getTexts()
+    val parameterTypes = this.getTexts()
+    val resultType = this.getText()
+    val methods = this.getDeclarations(depth + 1)
+    val parameterDefaults = this.getExpressions(depth + 1)
+    val externalLibrary = this.getText()
+    val parameterKinds = this.getTexts()
+    val extensionOwner = this.getText()
+    val isTrusted = this.getBool()
+    val isResource = this.getBool()
+    val isNoEscape = this.getBool()
+    val generatedNamespace = this.getText()
+    val generatedOriginBegin = this.getInt()
+    val generatedOriginEnd = this.getInt()
+    val annotations = this.getTexts()
+    val annotationArguments = this.getExpressions(depth + 1)
+    val annotationBegins = this.getInts()
+    val annotationEnds = this.getInts()
+    val sourceIdentity = this.getText()
+    val conformances = this.getTexts()
+    val isSealed = this.getBool()
+    val isPrivate = this.getBool()
+    val typeParameters = this.getTexts()
+    BootstrapDeclaration(kind, name, begin, end, expression, parameters, parameterTypes, resultType, methods, parameterDefaults, externalLibrary, parameterKinds, extensionOwner, isTrusted, isResource, isNoEscape, generatedNamespace, generatedOriginBegin, generatedOriginEnd, annotations, annotationArguments, annotationBegins, annotationEnds, sourceIdentity, conformances, isSealed, isPrivate, typeParameters)
+}
+fun BootstrapDiscoveryReader.getDeclarations(depth: int): array<BootstrapDeclaration> {
+    val count = this.getCount()
+    val values: array<BootstrapDeclaration> = []
+    var i = 0
+    while (this.valid && i < count) { values.append(this.getDeclaration(depth)); i = i + 1 }
+    values
+}
+
+fun bootstrapDiscoveryPayload(parsed: BootstrapParseResult): string {
+    if (parsed.declarationEdits.size != 0) return ""
+    val out = BootstrapDiscoveryWriter()
+    out.putDeclarations(parsed.declarations, 0)
+    out.putExpressions(parsed.actions, 0)
+    out.putInt(parsed.errors)
+    out.putInt(parsed.extensionErrors)
+    out.putTexts(parsed.compileInputPaths)
+    out.putTexts(parsed.compileInputContents)
+    out.putText(parsed.diagnostics)
+    if (out.valid) out.out.toText() else ""
+}
+class BootstrapDiscoveryHashes(val first: int, val second: int)
+fun bootstrapDiscoveryHashes(input: string): BootstrapDiscoveryHashes {
+    var first = 41
+    var second = 101
+    var i = 0
+    while (i + 4 <= input.size) {
+        val word = textReadU32LittleEndian(input, i) + 1
+        first = first * 269 + word
+        first = first - first / 1000000007 * 1000000007
+        second = second * 271 + word
+        second = second - second / 1000000009 * 1000000009
+        i = i + 4
+    }
+    while (i < input.size) {
+        first = first * 269 + input[i] + 1
+        first = first - first / 1000000007 * 1000000007
+        second = second * 271 + input[i] + 1
+        second = second - second / 1000000009 * 1000000009
+        i = i + 1
+    }
+    BootstrapDiscoveryHashes(first, second)
+}
+fun bootstrapDiscoveryRecord(source: string, identity: string, parsed: BootstrapParseResult, compilerIdentity: string = ""): string {
+    val payload = bootstrapDiscoveryPayload(parsed)
+    if (payload == "" || source.size > 4194304) return ""
+    val hashes = bootstrapDiscoveryHashes(payload)
+    val out = BootstrapDiscoveryWriter()
+    out.putText("ABLA-DISCOVERY-1")
+    out.putText(compilerIdentity)
+    out.putText(identity)
+    out.putText(source)
+    out.putInt(hashes.first)
+    out.putInt(hashes.second)
+    out.putText(payload)
+    if (out.valid) out.out.toText() else ""
+}
+class BootstrapDiscoveryDecoded(val valid: bool, val parsed: BootstrapParseResult)
+fun bootstrapDiscoveryInvalid(): BootstrapDiscoveryDecoded = BootstrapDiscoveryDecoded(false, BootstrapParseResult([], [], 0, 0, [], [], ""))
+fun bootstrapDiscoveryDecode(source: string, identity: string, record: string, compilerIdentity: string = ""): BootstrapDiscoveryDecoded {
+    if (record.size > BOOTSTRAP_DISCOVERY_CODEC_LIMIT || source.size > 4194304) return bootstrapDiscoveryInvalid()
+    val header = BootstrapDiscoveryReader(record)
+    if (header.getText() != "ABLA-DISCOVERY-1" || header.getText() != compilerIdentity || header.getText() != identity || header.getText() != source) return bootstrapDiscoveryInvalid()
+    val first = header.getInt()
+    val second = header.getInt()
+    val payload = header.getText()
+    if (!header.valid || header.cursor != record.size) return bootstrapDiscoveryInvalid()
+    val hashes = bootstrapDiscoveryHashes(payload)
+    if (first != hashes.first || second != hashes.second) return bootstrapDiscoveryInvalid()
+    val body = BootstrapDiscoveryReader(payload)
+    val declarations = body.getDeclarations(0)
+    val actions = body.getExpressions(0)
+    val errors = body.getInt()
+    val extensionErrors = body.getInt()
+    val paths = body.getTexts()
+    val contents = body.getTexts()
+    val diagnostics = body.getText()
+    if (!body.valid || body.cursor != payload.size || errors < 0 || extensionErrors < 0 || paths.size != contents.size) return bootstrapDiscoveryInvalid()
+    BootstrapDiscoveryDecoded(true, BootstrapParseResult(declarations, actions, errors, extensionErrors, paths, contents, diagnostics))
+}
+fun bootstrapDiscoveryEligible(parsed: BootstrapParseResult): bool = parsed.errors == 0 && parsed.extensionErrors == 0 && parsed.diagnostics == "" && parsed.actions.size == 0 && parsed.compileInputPaths.size == 0 && parsed.compileInputContents.size == 0 && parsed.declarationEdits.size == 0

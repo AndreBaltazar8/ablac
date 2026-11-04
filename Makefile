@@ -210,6 +210,7 @@ test-serial: ablac
 	tools/test-runtime-memory.sh $(COMPILER)
 	tools/test-native-object-cache.sh $(COMPILER)
 	tools/test-running-image-identity.sh $(COMPILER)
+	tools/test-discovery-cache.sh $(COMPILER)
 	tools/test-event-shutdown.sh $(COMPILER)
 	tools/test-cache-dir.sh $(COMPILER)
 	tools/test-ablac-test-bundle.sh $(COMPILER)

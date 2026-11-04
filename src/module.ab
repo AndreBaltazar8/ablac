@@ -9,6 +9,7 @@ import "abla/sys/linux"
 import "abla/runtime/memory"
 import "abla/text"
 import "parser.ab"
+import "discovery_cache.ab"
 import "lexer.ab"
 import "ct_native.ab"
 import "sema.ab"
@@ -662,7 +663,10 @@ class BootstrapModuleState(
     val exposedIn: Map<string, int> = Map(),
     // A one-shot test-discovery handoff continues this same source snapshot,
     // rather than treating it as a later build and trusting file timestamps.
-    var discoveryPrepared: bool = false
+    var discoveryPrepared: bool = false,
+    // Explicit per-build policy; ordinary parser/module APIs stay cache-free.
+    var discoveryDirectory: string = "",
+    var discoveryIdentity: string = ""
 ) {
     fun beginBuild(): void {
         if (this.discoveryPrepared) this.discoveryPrepared = false
@@ -709,6 +713,38 @@ class BootstrapModuleState(
         exposed
     }
 
+    fun discover(
+        source: string, modulePath: string, importErrors: int,
+        first: int, second: int
+    ): BootstrapParseResult {
+        var recordPath = ""
+        if (this.discoveryDirectory != "" && source.size <= 4194304 && importErrors == 0) {
+            val identity = bootstrapDiscoveryHashes(modulePath)
+            recordPath = "${this.discoveryDirectory}/${source.size}-$first-$second-${identity.first}-${identity.second}.discovery"
+            val info = Path(recordPath).info()
+            if (info.isFile() && info.size > 0 && info.size <= BOOTSTRAP_DISCOVERY_CODEC_LIMIT) {
+                // Read at most the observed size plus one byte. A growing or
+                // replaced cache file must not trigger an unbounded allocation.
+                val record = linuxReadFile(recordPath, info.size + 1)
+                val decoded = bootstrapDiscoveryDecode(
+                    source, modulePath, record, this.discoveryIdentity
+                )
+                if (decoded.valid && bootstrapDiscoveryEligible(decoded.parsed)) {
+                    bootstrapFrontendTraceMemory("discovery.hit:$modulePath")
+                    return decoded.parsed
+                }
+            }
+        }
+        val parsed = bootstrapModuleDiscovery(source, modulePath)
+        if (recordPath != "" && bootstrapDiscoveryEligible(parsed)) {
+            val record = bootstrapDiscoveryRecord(
+                source, modulePath, parsed, this.discoveryIdentity
+            )
+            if (record != "") Path(recordPath).writeTextAtomic(record)
+        }
+        parsed
+    }
+
     fun acquire(modulePath: string): BootstrapModuleSnapshot {
         val existing = this.indexOf(modulePath)
         val acquiredIn = this.acquiredIn.get(modulePath)
@@ -742,6 +778,9 @@ class BootstrapModuleState(
         } else {
             val source = Path(modulePath).readText()
             val scan = bootstrapScanImports(source)
+            val first = bootstrapModuleFingerprint(source, 17, 257, 1000000007)
+            val second = bootstrapModuleFingerprint(source, 97, 263, 1000000009)
+            val discovery = this.discover(source, modulePath, scan.errors, first, second)
             result = BootstrapModuleSnapshot(
                 modulePath,
                 source,
@@ -750,13 +789,9 @@ class BootstrapModuleState(
                 info.exists(),
                 info.size,
                 info.revision,
-                bootstrapModuleFingerprint(
-                    source, 17, 257, 1000000007
-                ),
-                bootstrapModuleFingerprint(
-                    source, 97, 263, 1000000009
-                ),
-                bootstrapModuleDiscovery(source, modulePath)
+                first,
+                second,
+                discovery
             )
             if (existing >= 0) {
                 this.snapshots[existing] = result
