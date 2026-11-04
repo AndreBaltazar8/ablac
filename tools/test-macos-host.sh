@@ -49,6 +49,10 @@ printf 'Hello, world!\nportable io\n' > "$output_directory/portable-io.expected"
 cmp "$output_directory/portable-io.expected" \
     "$output_directory/portable-io.txt"
 
+"$compiler" build "$project_root/tests/cases/unix-stream/main.ab" \
+    --fast -o "$output_directory/unix-stream"
+expect_status_42 "$output_directory/unix-stream"
+
 "$compiler" build "$project_root/tests/cases/modules/filesystem.ab" \
     --fast -o "$output_directory/filesystem"
 expect_status_42 "$output_directory/filesystem"

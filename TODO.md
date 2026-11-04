@@ -121,9 +121,7 @@
 - [ ] **Not read in abla/crypto, though typed secret:** AES's key schedule and block loading, `rsaCrt`'s steps around
   the fixtures, `bnFromBytes`, `bnToBytes`, `bnResidueSquare`. Each could be a fixture.
 
-- [ ] The standard library has no Unix domain sockets: `abla/sys/linux` and `abla/net` only offer TCP, IPv4 and IPv6, and
-      `abla/http` and `abla/tls/hosted` listen and connect over those. NovaKind's signer uses loopback with a secret for it, where a
-      socket's file permissions would say who may connect.
+- [ ] `abla/tls/hosted`'s upgrade API accepts `TcpConnection` but not `UnixConnection`, so TLS over a Unix stream needs an adapter.
 - [ ] The rest of integers up to 256 bits: `uint256` is in (`abla/uint256`, docs/stdlib/uint256.md), with big-endian
       bytes. Left: signed 256, 128 both ways, and little-endian bytes, when something needs them.
 - [ ] **`ablac run` becomes a live JIT.** The direction for `run` is a live in-process JIT: a

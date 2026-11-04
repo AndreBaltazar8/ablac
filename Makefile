@@ -250,6 +250,7 @@ test-serial: ablac
 	tools/test-field-places.sh $(COMPILER)
 	tools/test-compile-time-cell-capture.sh $(COMPILER)
 	tools/test-hosted-network.sh $(COMPILER)
+	tools/test-unix-stream.sh $(COMPILER)
 	tools/test-native-platform-boundary.sh $(COMPILER)
 	tools/test-math-no-libm.sh $(COMPILER)
 	tools/test-math-fast.sh $(COMPILER)

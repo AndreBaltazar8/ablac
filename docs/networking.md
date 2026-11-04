@@ -79,6 +79,26 @@ fun main {
 closed, and error readiness without giving the poller ownership of watched
 sockets.
 
+## Unix-domain streams
+
+`unixSocketAddress(path)` selects a filesystem pathname; `unixAbstractAddress(name)`
+selects Linux's abstract namespace. `unixListen(address, backlog)` returns a
+`UnixListener`, whose `accept()` returns a `UnixConnection`; `unixConnect(address,
+timeoutMilliseconds)` returns a connection. They use the same result, polling,
+timeout, nonblocking and close operations as TCP. Negative descriptors report
+errors, and nonblocking connect reports `-11` when a Unix listener's queue is full.
+
+Paths are byte strings: filesystem paths must be nonempty, contain no NUL, and fit
+107 bytes on Linux or 103 bytes on macOS. Abstract names can contain NUL and fit
+107 bytes; macOS returns `EAFNOSUPPORT`. A listener neither removes an existing
+pathname nor unlinks its pathname on close. Once all users have finished, its owner
+can call `path(socketPath).remove()`. Abstract names disappear when their last
+socket closes.
+
+For a local HTTP daemon, `httpUnixClient("localhost", unixSocketAddress(socketPath))`
+returns the same `HttpClient` as the IPv4 transport, including response limits and
+an optional whole-exchange deadline.
+
 ## HTTP routing
 
 `abla/http` separates routing from transport: a router maps a method and a

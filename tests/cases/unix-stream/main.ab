@@ -1,0 +1,107 @@
+import "abla/net"
+import "abla/http"
+import "abla/fs"
+import "abla/sys/linux"
+import "abla/sys/linux/process"
+
+fun echoOnce(address: UnixSocketAddress): bool {
+    var listener = unixListen(address)
+    if (listener.descriptor < 0) return false
+    val child = linuxSyscall0(57)
+    if (child < 0) { listener.close(); return false }
+    if (child == 0) {
+        var client = unixConnect(address)
+        var status = 1
+        if (client.descriptor >= 0 && client.write("hello") == 5 &&
+            client.readWithTimeoutResult(32, 2000).bytes == "world") status = 0
+        if (!client.close() || !client.close()) status = 1
+        linuxSyscall1(60, status)
+    }
+    val ready = linuxPollSocket(listener.descriptor, true, false, 2000)
+    if (!ready.readable) {
+        listener.close()
+        linuxWaitProcess(child)
+        return false
+    }
+    var server = listener.accept()
+    val received = server.readNetwork(32, 2000)
+    val written = server.writeNetwork("world", 2000)
+    val closed = server.close() && server.close() && listener.close() && listener.close()
+    val result = linuxWaitProcess(child)
+    child > 0 && received.hasData() && received.bytes == "hello" &&
+        written.succeeded() && written.written == 5 && closed && result.status == 0
+}
+
+fun httpOnce(address: UnixSocketAddress): bool {
+    var listener = unixListen(address)
+    if (listener.descriptor < 0) return false
+    val child = linuxSyscall0(57)
+    if (child < 0) { listener.close(); return false }
+    if (child == 0) {
+        val ready = linuxPollSocket(listener.descriptor, true, false, 2000)
+        if (!ready.readable) linuxSyscall1(60, 1)
+        var peer = listener.accept()
+        val request = peer.read(4096)
+        val sent = peer.write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+        peer.close()
+        listener.close()
+        linuxSyscall1(60, if (request.size > 0 && sent > 0) 0 else 1)
+    }
+    val client = httpUnixClient("localhost", address, 4096, 2000, 2000)
+    val response = client.send(httpGet("/test"))
+    listener.close()
+    val result = linuxWaitProcess(child)
+    child > 0 && result.status == 0 && response.succeeded && response.complete &&
+        response.response.status == 200 && response.response.body == "ok"
+}
+
+fun main: int {
+    val name = "/tmp/abla-unix-${linuxSyscall0(39)}.sock"
+    val address = unixSocketAddress(name)
+    val over = unixSocketAddress("x".repeat(108))
+    if (over.isValid() || unixListen(over).descriptor != -22 ||
+        unixSocketAddress("bad\x00path").isValid() || unixSocketAddress("").isValid() ||
+        !unixSocketAddress("x".repeat(107)).isValid() ||
+        unixAbstractAddress("x".repeat(108)).isValid()) return 1
+    if (!echoOnce(address)) return 2
+    // Closing keeps the filesystem entry; binding over it must fail.
+    var existing = unixListen(address)
+    if (existing.descriptor >= 0) { existing.close(); return 8 }
+    if (!path(name).remove()) return 3
+    if (unixConnect(address).descriptor != -2) return 14
+    if (!httpOnce(address)) return 4
+    if (!path(name).remove()) return 5
+    val abstractAddress = unixAbstractAddress("abla-${linuxSyscall0(39)}\x00name")
+    var probe = unixListen(abstractAddress)
+    if (probe.descriptor == -97) {
+        // Linux encodes 107 path bytes; Darwin's sun_path allows only 103.
+        val longPrefix = "/tmp/abla-${linuxSyscall0(39)}-"
+        val longName = longPrefix + "x".repeat(105 - longPrefix.size)
+        val darwinLong = unixSocketAddress(longName)
+        if (!darwinLong.isValid() || unixListen(darwinLong).descriptor != -36) return 9
+        return 42
+    }
+    if (probe.descriptor < 0) return 6
+    probe.close()
+    if (!echoOnce(abstractAddress)) return 7
+    // A full nonblocking Unix listener reports EAGAIN, not false success.
+    val queueAddress = unixAbstractAddress("queue-${linuxSyscall0(39)}")
+    var queue = unixListen(queueAddress, 1)
+    var first = unixConnect(queueAddress)
+    var second = unixConnect(queueAddress)
+    var overflow = unixConnect(queueAddress)
+    val full = queue.descriptor >= 0 && first.descriptor >= 0 && second.descriptor >= 0 && overflow.descriptor == -11
+    first.close()
+    second.close()
+    overflow.close()
+    queue.close()
+    if (!full) return 13
+    val prefix = "abla-${linuxSyscall0(39)}-"
+    val longest = unixAbstractAddress(prefix + "x".repeat(107 - prefix.size))
+    if (!echoOnce(longest)) return 10
+    val linuxPrefix = "/tmp/abla-${linuxSyscall0(39)}-"
+    val linuxLong = linuxPrefix + "x".repeat(107 - linuxPrefix.size)
+    if (!echoOnce(unixSocketAddress(linuxLong))) return 11
+    if (!path(linuxLong).remove()) return 12
+    42
+}

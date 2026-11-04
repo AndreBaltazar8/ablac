@@ -18,6 +18,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +27,7 @@
 #include <sys/ioctl.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
@@ -66,6 +68,8 @@ static int linux_errno(int value) {
     return 98;
   case EAFNOSUPPORT:
     return 97;
+  case ENAMETOOLONG:
+    return 36;
   case ENETUNREACH:
     return 101;
   case ECONNRESET:
@@ -117,6 +121,8 @@ static int darwin_socket_type(int64_t type) {
 }
 
 static int darwin_socket_domain(int64_t domain) {
+  if (domain == 1)
+    return AF_UNIX;
   if (domain == 2)
     return AF_INET;
   if (domain == 10)
@@ -183,12 +189,30 @@ static void store_u16(unsigned char *output, size_t offset, uint16_t value) {
 static int darwin_sockaddr(const void *linux_address, size_t linux_length,
                            struct sockaddr_storage *output,
                            socklen_t *output_length) {
-  if (linux_address == NULL || linux_length < 8) {
+  if (linux_address == NULL || linux_length < 3) {
     errno = EINVAL;
     return -1;
   }
   const unsigned char *input = (const unsigned char *)linux_address;
   memset(output, 0, sizeof(*output));
+  if (input[0] == 1 && input[1] == 0) {
+    if (input[2] == 0) { errno = EAFNOSUPPORT; return -1; }
+    const size_t path_length = linux_length - 2;
+    if (path_length > sizeof(((struct sockaddr_un *)0)->sun_path)) {
+      errno = ENAMETOOLONG;
+      return -1;
+    }
+    if (input[linux_length - 1] != 0 || memchr(input + 2, 0, path_length - 1) != NULL) {
+      errno = EINVAL;
+      return -1;
+    }
+    struct sockaddr_un *address = (struct sockaddr_un *)output;
+    address->sun_len = (uint8_t)(offsetof(struct sockaddr_un, sun_path) + path_length);
+    address->sun_family = AF_UNIX;
+    memcpy(address->sun_path, input + 2, path_length);
+    *output_length = address->sun_len;
+    return 0;
+  }
   if (input[0] == 2 && input[1] == 0 && linux_length >= 16) {
     struct sockaddr_in *address = (struct sockaddr_in *)output;
     address->sin_len = (uint8_t)sizeof(*address);

@@ -1968,3 +1968,180 @@ fun TcpListener.acceptUntilShutdown(): TcpConnection {
     }
     connection
 }
+
+// AF_UNIX streams. Path names are bytes; abstract names are Linux-only and
+// may contain zero bytes. Closing a listener never unlinks its pathname.
+class UnixSocketAddress(val name: string, val abstract: bool) {
+    fun isValid(): bool {
+        if (this.name.size > 107 || (!this.abstract && this.name.size == 0)) return false
+        if (!this.abstract) for (i in 0 until this.name.size) if (this.name[i] == 0) return false
+        true
+    }
+}
+
+fun unixSocketAddress(path: string): UnixSocketAddress = UnixSocketAddress(path, false)
+fun unixAbstractAddress(name: string): UnixSocketAddress = UnixSocketAddress(name, true)
+
+resource class UnixListener(var descriptor: int) {
+    fun drop(): void {
+        if (this.descriptor >= 0) linuxSyscall1(3, this.descriptor)
+        this.descriptor = -1
+        return
+    }
+}
+resource class UnixConnection(var descriptor: int) {
+    fun drop(): void {
+        if (this.descriptor >= 0) linuxSyscall1(3, this.descriptor)
+        this.descriptor = -1
+        return
+    }
+}
+
+// The temporary view shares the descriptor only during a call; disarm its
+// destructor before returning so the Unix resource keeps sole ownership.
+fun UnixConnection.read(maximum: int = 65536): string {
+    var view = TcpConnection(this.descriptor)
+    val result = view.read(maximum)
+    view.descriptor = -1
+    result
+}
+fun UnixConnection.readResult(maximum: int = 65536): SocketReadResult {
+    var view = TcpConnection(this.descriptor)
+    val result = view.readResult(maximum)
+    view.descriptor = -1
+    result
+}
+fun UnixConnection.write(contents: string): int {
+    var view = TcpConnection(this.descriptor)
+    val result = view.write(contents)
+    view.descriptor = -1
+    result
+}
+fun UnixConnection.writeResult(contents: string): SocketWriteResult {
+    var view = TcpConnection(this.descriptor)
+    val result = view.writeResult(contents)
+    view.descriptor = -1
+    result
+}
+fun UnixConnection.readWithTimeout(maximum: int, timeoutMilliseconds: int): string {
+    var view = TcpConnection(this.descriptor)
+    val result = view.readWithTimeout(maximum, timeoutMilliseconds)
+    view.descriptor = -1
+    result
+}
+fun UnixConnection.readWithTimeoutResult(maximum: int, timeoutMilliseconds: int): SocketReadResult {
+    var view = TcpConnection(this.descriptor)
+    val result = view.readWithTimeoutResult(maximum, timeoutMilliseconds)
+    view.descriptor = -1
+    result
+}
+fun UnixConnection.readCompact(maximum: int = 4096): string {
+    var view = TcpConnection(this.descriptor)
+    val result = view.readCompact(maximum)
+    view.descriptor = -1
+    result
+}
+fun UnixConnection.writeCompact(contents: string, offset: int = 0): SocketWriteResult {
+    var view = TcpConnection(this.descriptor)
+    val result = view.writeCompact(contents, offset)
+    view.descriptor = -1
+    result
+}
+fun UnixConnection.readNetwork(maximum: int, timeoutMilliseconds: int,
+    cancellation: NetworkCancellation = networkCancellation(), cancellationPollMilliseconds: int = 50): NetworkReadOutcome {
+    var view = TcpConnection(this.descriptor)
+    val result = view.readNetwork(maximum, timeoutMilliseconds, cancellation, cancellationPollMilliseconds)
+    view.descriptor = -1
+    result
+}
+fun UnixConnection.writeNetwork(contents: string, timeoutMilliseconds: int,
+    cancellation: NetworkCancellation = networkCancellation(), cancellationPollMilliseconds: int = 50): NetworkWriteOutcome {
+    var view = TcpConnection(this.descriptor)
+    val result = view.writeNetwork(contents, timeoutMilliseconds, cancellation, cancellationPollMilliseconds)
+    view.descriptor = -1
+    result
+}
+fun UnixConnection.poll(timeoutMilliseconds: int, read: bool = true, write: bool = false): SocketPollResult =
+    linuxPollSocket(this.descriptor, read, write, timeoutMilliseconds)
+fun UnixConnection.setTimeouts(readMilliseconds: int, writeMilliseconds: int): bool =
+    this.descriptor >= 0 && linuxSocketSetTimeouts(this.descriptor, readMilliseconds, writeMilliseconds)
+fun UnixConnection.setNonblocking(enabled: bool = true): bool = linuxSocketSetNonblocking(this.descriptor, enabled)
+fun UnixListener.setNonblocking(enabled: bool = true): bool = linuxSocketSetNonblocking(this.descriptor, enabled)
+fun UnixConnection.close(): bool {
+    var closed = this.descriptor < 0
+    if (this.descriptor >= 0) {
+        closed = linuxTcpCloseDescriptor(this.descriptor)
+        if (closed) this.descriptor = -1
+    }
+    closed
+}
+fun UnixListener.close(): bool {
+    var closed = this.descriptor < 0
+    if (this.descriptor >= 0) {
+        closed = linuxTcpCloseDescriptor(this.descriptor)
+        if (closed) this.descriptor = -1
+    }
+    closed
+}
+fun UnixListener.accept(): UnixConnection = UnixConnection(linuxTcpAcceptDescriptor(this.descriptor))
+
+// Linux sockaddr_un: 2-byte family, then pathname plus NUL, or leading NUL
+// plus exactly the abstract name bytes. The Darwin shim translates this layout.
+private fun unixEncode(address: UnixSocketAddress): NativeByteBuffer {
+    val size = address.name.size + 3
+    val bytes = nativeByteBuffer(size)
+    linuxNetStoreU16(bytes, 0, 1)
+    val begin = if (address.abstract) 3 else 2
+    if (address.abstract) bytes.store(2, 0)
+    for (i in 0 until address.name.size) bytes.store(begin + i, int(address.name[i]))
+    if (!address.abstract) bytes.store(begin + address.name.size, 0)
+    bytes
+}
+
+fun unixListen(address: UnixSocketAddress, backlog: int = 128): UnixListener {
+    var descriptor = -22
+    if (address.isValid() && backlog > 0 && backlog <= 4096)
+        descriptor = linuxSyscall3(41, 1, 524289, 0)
+    if (descriptor >= 0) {
+        val bytes = unixEncode(address)
+        val status = linuxSyscall3(49, descriptor, nativePointerAddress(bytes.address), address.name.size + 3)
+        bytes.close()
+        if (status < 0) { linuxTcpCloseDescriptor(descriptor); descriptor = status }
+    }
+    if (descriptor >= 0) {
+        val status = linuxSyscall2(50, descriptor, backlog)
+        if (status < 0) { linuxTcpCloseDescriptor(descriptor); descriptor = status }
+    }
+    UnixListener(descriptor)
+}
+
+fun unixConnect(address: UnixSocketAddress, timeoutMilliseconds: int = 5000): UnixConnection {
+    var descriptor = -22
+    if (address.isValid() && timeoutMilliseconds > 0 && timeoutMilliseconds <= 10000)
+        descriptor = linuxSyscall3(41, 1, 526337, 0)
+    if (descriptor >= 0) {
+        val bytes = unixEncode(address)
+        val status = linuxSyscall3(42, descriptor, nativePointerAddress(bytes.address), address.name.size + 3)
+        bytes.close()
+        var error = if (status < 0) -status else 0
+        if (status == -115) {
+            val ready = linuxPollSocket(descriptor, false, true, timeoutMilliseconds)
+            error = if (ready.timedOut) 110 else if (ready.failed()) ready.errorCode else 0
+            if (error == 0) {
+                val out = nativeByteBuffer(8)
+                val length = nativeByteBuffer(8)
+                linuxNetStoreU32(length, 0, 4)
+                val inspected = linuxSyscall5(55, descriptor, 1, 4, nativePointerAddress(out.address), nativePointerAddress(length.address))
+                error = if (inspected < 0) -inspected else linuxNetReadNativeU32(out, 0)
+                if (error == 0 && !ready.writable) error = 111
+                out.close()
+                length.close()
+            }
+        }
+        if (error == 0) {
+            if (!linuxSocketSetNonblocking(descriptor, false)) error = 5
+        }
+        if (error != 0) { linuxTcpCloseDescriptor(descriptor); descriptor = -error }
+    }
+    UnixConnection(descriptor)
+}
