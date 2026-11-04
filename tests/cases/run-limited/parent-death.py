@@ -117,7 +117,9 @@ with tempfile.TemporaryDirectory(prefix="abla-limiter-test-") as tmp:
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         shim_pid = 0
         try:
-            wait_for(lambda: (case / "ready").exists(), "unarmed setpriv shim")
+            # The shell creates the file before printf writes the pid: wait for its newline.
+            wait_for(lambda: (case / "ready").exists() and (case / "ready").read_text().endswith("\n"),
+                     "unarmed setpriv shim")
             shim_pid = int((case / "ready").read_text())
             wait_for(lambda: stopped(shim_pid), "setpriv shim to stop")
             kill(proc.pid)
