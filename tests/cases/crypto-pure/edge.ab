@@ -4,6 +4,7 @@ import "abla/io"
 import "abla/crypto"
 import "abla/crypto/aes"
 import "abla/crypto/rsa"
+import "abla/crypto/der"
 import "abla/process/arguments"
 import "abla/sys/linux"
 import "abla/text"
@@ -26,6 +27,21 @@ fun refused(result: CryptoResult, why: string, what: string): void {
 fun flip(value: string, at: int): string {
     val mask = "\x00".repeat(at) + "\x01" + "\x00".repeat(value.size - at - 1)
     binaryXor(value, mask)
+}
+
+// Rebuild a key through the public number constructor, with or without its private exponent.
+trusted fun directPrivateKey(der: string, includeD: bool): RsaPrivateKey {
+    val outer = derItem(der, 0, der.size)
+    val version = derItem(der, outer.start, outer.end)
+    val numbers: array<string> = []
+    var at = version.end
+    for (i in 0 until 8) {
+        val item = derItem(der, at, outer.end)
+        numbers.append(derPositiveInteger(der, item))
+        at = item.end
+    }
+    rsaPrivateFromNumbers(numbers[0], numbers[1], numbers[3], numbers[4], numbers[5], numbers[6], numbers[7],
+        if (includeD) numbers[2] else "")
 }
 
 fun checkAes(): void {
@@ -142,6 +158,18 @@ fun checkKeys(): void {
     expect(!strongPublic.verifyPkcs1Sha1Legacy(message, signature.bytes), "sha256 signature isn't sha1's")
     expect(!strongPublic.verifyPkcs1Sha256(message + "x", signature.bytes), "2048 message tamper")
     expect(!fromSpki.verifyPkcs1Sha1Legacy(message, signature.bytes), "wrong key")
+
+    // Parsed and explicit-d keys match; old number-only callers still get deterministic rejection.
+    val directWithD = directPrivateKey(read("k1024-traditional.der"), true)
+    val directWithoutD = directPrivateKey(read("k1024-traditional.der"), false)
+    val invalidBlock = "\x00".repeat(128)
+    val parsedSynthetic = reference.decryptPkcs1Legacy(invalidBlock)
+    val explicitSynthetic = directWithD.decryptPkcs1Legacy(invalidBlock)
+    val fallbackSynthetic = directWithoutD.decryptPkcs1Legacy(invalidBlock)
+    expect(parsedSynthetic.ok && explicitSynthetic.ok && parsedSynthetic.bytes == explicitSynthetic.bytes,
+        "implicit rejection matches with explicit d")
+    expect(fallbackSynthetic.ok && directWithoutD.decryptPkcs1Legacy(invalidBlock).bytes == fallbackSynthetic.bytes,
+        "implicit rejection without d is deterministic")
 
     val secret = hexDecode("000102030405060708090a0b0c0d0e0f")
     for (kind in 0 until 3) {

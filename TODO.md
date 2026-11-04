@@ -113,10 +113,7 @@
 
 - [ ] **abla-pdf still carries its own unblinded RSA for signing.** It could move to the released
   `abla/crypto/rsa`, as abla-saft has done.
-- [ ] **Add implicit rejection to `abla/crypto/rsa` PKCS#1 v1.5 decryption.** Its full padding scan uses
-  masks, but `decryptPkcs1Legacy` exposes padding success and plaintext length: a remote observer can use that
-  as a padding oracle. A deterministic key- and ciphertext-derived synthetic plaintext needs a separate design.
-  The pure module also does not read encrypted PEM or PKCS#12.
+- [ ] **`abla/crypto/rsa` does not read encrypted PEM or PKCS#12.** Use the hosted module or decrypt the key first.
 - [ ] **No timing measurements of abla/crypto.** `tools/test-ct.sh` reads the assembly; nothing has run a statistical
   test (`dudect`) on real hardware, or anything at all on an ESP32-S3. The Xtensa path is compiled and read only.
 - [ ] **`--fast` builds aren't read by `tools/test-ct.sh`**: the checker stops at their calls. It could follow

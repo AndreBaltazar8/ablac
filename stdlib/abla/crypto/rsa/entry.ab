@@ -70,6 +70,7 @@ resource class RsaPrivateKey(
     fun exponentP(): int = this.memory + this.primeWords * 8
     fun exponentQ(): int = this.memory + this.primeWords * 12
     fun inverseQ(): int = this.memory + this.primeWords * 16
+    fun rejectionKey(): int = this.memory + this.primeWords * 20
 }
 
 trusted fun rsaPrivateFailed(error: string): RsaPrivateKey = RsaPrivateKey("", "", 0, error, 0, 0, 0)
@@ -198,13 +199,14 @@ trusted fun rsaPrivateFromPkcs1(der: string, begin: int, end: int, unreadable: s
         at = item.end
     }
     if (at != outer.end) return rsaPrivateFailed(unreadable)
-    rsaPrivateFromNumbers(numbers[0], numbers[1], numbers[3], numbers[4], numbers[5], numbers[6], numbers[7])
+    rsaPrivateFromNumbers(numbers[0], numbers[1], numbers[3], numbers[4], numbers[5], numbers[6], numbers[7], numbers[2])
 }
 
 private val RSA_CHECK_FAILED = "the RSA private key failed its consistency check"
 
 trusted fun rsaPrivateFromNumbers(
-    modulus: string, exponent: string, p: string, q: string, dp: string, dq: string, qInverse: string
+    modulus: string, exponent: string, p: string, q: string, dp: string, dq: string, qInverse: string,
+    privateExponent: string = ""
 ): RsaPrivateKey {
     val checkedPublic = rsaPublicFromNumbers(modulus, exponent, RSA_CHECK_FAILED)
     if (!checkedPublic.ok()) return rsaPrivateFailed(checkedPublic.error)
@@ -218,7 +220,18 @@ trusted fun rsaPrivateFromNumbers(
     if (qInverse.size > largest) largest = qInverse.size
     val words = (largest + 3) / 4
     if (words * 2 < (modulus.size + 3) / 4) return rsaPrivateFailed(RSA_CHECK_FAILED)
-    val total = words * 5
+    if (privateExponent.size > modulus.size) return rsaPrivateFailed(RSA_CHECK_FAILED)
+    val rejectionDigest = if (privateExponent != "") {
+        sha256("\x00".repeat(modulus.size - privateExponent.size) + privateExponent)
+    } else {
+        // Number-only keys do not contain d. Fixed-width, domain-separated secret material
+        // gives them deterministic rejection without claiming OpenSSL byte compatibility.
+        val width = words * 4
+        sha256("abla rsa implicit rejection without d\x00" +
+            "\x00".repeat(width - p.size) + p + "\x00".repeat(width - q.size) + q +
+            "\x00".repeat(width - dp.size) + dp + "\x00".repeat(width - dq.size) + dq)
+    }
+    val total = words * 5 + 8
     val memory = bnAllocate(total)
     val key = RsaPrivateKey(modulus, exponent, bits, "", memory, words, total)
     bnFromBytes(key.primeP(), words, ablaUnsafeStringAddress(p), p.size)
@@ -226,6 +239,7 @@ trusted fun rsaPrivateFromNumbers(
     bnFromBytes(key.exponentP(), words, ablaUnsafeStringAddress(dp), dp.size)
     bnFromBytes(key.exponentQ(), words, ablaUnsafeStringAddress(dq), dq.size)
     bnFromBytes(key.inverseQ(), words, ablaUnsafeStringAddress(qInverse), qInverse.size)
+    bnFromBytes(key.rejectionKey(), 8, ablaUnsafeStringAddress(rejectionDigest), 32)
     if (!rsaPrivateIsConsistent(key)) {
         // key's drop wipes and frees its memory.
         val failed = rsaPrivateFailed(RSA_CHECK_FAILED)
@@ -694,14 +708,68 @@ trusted fun RsaPrivateKey.decryptOaepSha1Legacy(ciphertext: string): CryptoResul
     rsaDecryptOaep(this, ciphertext, { data: string -> sha1(data) }, 20)
 }
 
-/** RSAES-PKCS1-v1_5 for legacy protocols. Revealing success or plaintext length can create a padding oracle. */
+// draft-irtf-cfrg-rsa-guidance-10 section 7: OpenSSL-compatible IRPRF,
+// HMAC-SHA256(KDK, uint16(counter) || label || uint16(bits)).
+fun rsaImplicitPrf(kdk: string, label: string, size: int): string {
+    val bits = size * 8
+    var output = ""
+    var counter = 0
+    while (output.size < size) {
+        val input = rsaByte(counter >> 8) + rsaByte(counter) + label + rsaByte(bits >> 8) + rsaByte(bits)
+        output = output + hmacSha256(kdk, input)
+        counter = counter + 1
+    }
+    output.slice(0, size)
+}
+
+// Choose the last of 128 in-range lengths, without revealing which one qualified.
+@inline trusted fun rsaImplicitLength(candidates: int, size: int): secretU32 {
+    val limit = size - 10
+    var mask = limit
+    mask = mask | (mask >> 1)
+    mask = mask | (mask >> 2)
+    mask = mask | (mask >> 4)
+    mask = mask | (mask >> 8)
+    var chosen = secretU32(u32(0))
+    for (i in 0 until 128) {
+        val high = secretU32(u32(ablaUnsafeLoadU8(bnPointer(candidates + i * 2))))
+        val low = secretU32(u32(ablaUnsafeLoadU8(bnPointer(candidates + i * 2 + 1))))
+        val candidate = ((high << 8) | low) & secretU32(u32(mask))
+        chosen = ctSelect(ctLt(candidate, secretU32(u32(limit))), candidate, chosen)
+    }
+    chosen
+}
+
+// Read both complete blocks and select every byte before releasing the resulting length.
+@inline trusted fun rsaImplicitSelect(out: int, encoded: int, synthetic: int, size: int,
+    syntheticLength: secretU32): secretU32 {
+    val delimiter = rsaPkcs1Delimiter(encoded, size)
+    val good = ctIsNonZero(delimiter)
+    val start = ctSelect(good, delimiter + secretU32(u32(1)), secretU32(u32(size)) - syntheticLength)
+    for (i in 0 until size) {
+        val actual = secretU32(u32(ablaUnsafeLoadU8(bnPointer(encoded + i))))
+        val fake = secretU32(u32(ablaUnsafeLoadU8(bnPointer(synthetic + i))))
+        ablaUnsafeStoreU8(bnPointer(out + i), int(ctSelect(good, actual, fake).declassify()))
+    }
+    start
+}
+
+/** RSAES-PKCS1-v1_5 with deterministic implicit rejection. Successful output still needs protocol validation. */
 trusted fun RsaPrivateKey.decryptPkcs1Legacy(ciphertext: string): CryptoResult {
     if (!this.ok()) return cryptoFailed(this.error)
     if (this.bits < rsaLegacyMinimumBits) return cryptoFailed("the key has under 1024 bits")
     val decrypted = rsaDecryptBlock(this, ciphertext)
     if (!decrypted.ok) return decrypted
-    val encoded = decrypted.bytes
-    val delimiter = rsaPkcs1Delimiter(ablaUnsafeStringAddress(encoded), encoded.size).declassify()
-    if (delimiter == u32(0)) return cryptoFailed(RSA_DECRYPT_FAILED)
-    CryptoResult(encoded.slice(int(delimiter) + 1, encoded.size), true, "")
+    val size = this.modulus.size
+    val digest = nativeByteBuffer(33)
+    bnToBytes(ablaUnsafePointerAddress(digest.pointerAt(0)), 32, this.rejectionKey())
+    val kdk = hmacSha256(digest.adoptString(32), ciphertext)
+    val synthetic = rsaImplicitPrf(kdk, "message", size)
+    val lengths = rsaImplicitPrf(kdk, "length", 256)
+    val syntheticLength = rsaImplicitLength(ablaUnsafeStringAddress(lengths), size)
+    val out = nativeByteBuffer(size + 1)
+    val start = rsaImplicitSelect(ablaUnsafePointerAddress(out.pointerAt(0)),
+        ablaUnsafeStringAddress(decrypted.bytes), ablaUnsafeStringAddress(synthetic), size, syntheticLength)
+    val output = out.adoptString(size)
+    CryptoResult(output.slice(int(start.declassify()), size), true, "")
 }

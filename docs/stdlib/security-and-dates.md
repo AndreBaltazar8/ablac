@@ -175,8 +175,14 @@ fun main {
 | `rsaPublicKeyFromPem`, `rsaPublicKeyFromDer`, `rsaPublicKeyFromCertificateDer` | as [there](#rsa). A certificate's chain, dates and signature aren't checked |
 | `rsaPrivateKeyFromPem(pem)`, `rsaPrivateKeyFromDer(der)` | PKCS#8 and PKCS#1, unencrypted. **No** encrypted PEM, no PKCS#12: use the hosted module, or decrypt first |
 | `private.signPkcs1Sha256`, `public.verifyPkcs1Sha256`, `private.signPkcs1Sha1Legacy`, `public.verifyPkcs1Sha1Legacy` | as there, with the same minimum sizes |
-| RSA encryption and decryption | as above, with empty-label OAEP. The pure `decryptPkcs1Legacy` reports invalid padding and plaintext length; exposing either to a remote peer can create a padding oracle. Prefer OAEP and do not expose this result |
+| RSA encryption and decryption | as above, with empty-label OAEP. PKCS#1 v1.5 uses deterministic implicit rejection: invalid padding returns synthetic plaintext. Prefer OAEP, and make subsequent protocol checks indistinguishable to remote peers |
 | `cryptoSetRandom(source)` | where the randomness for encryption and blinding comes from. Needed on anything but x86-64 Linux, where it's `getrandom`: a Wasm host's `crypto.getRandomValues`, an ESP32's hardware RNG. Its quality is yours to answer for. Without one, what needs it fails, and signing never goes on unblinded |
+
+For parsed PEM and DER keys, the synthetic PKCS#1 v1.5 result matches OpenSSL's implicit rejection for the same
+private exponent and ciphertext. `rsaPrivateFromNumbers` accepts an optional private exponent as its last argument;
+without it, rejection is derived from the CRT secrets and is deterministic but does not match OpenSSL. Do not mix
+these representations for the same key in an attacker-observable service. The derived hash and intermediate
+strings, like PEM text, cannot be wiped.
 
 ### What timing protection each has, and hasn't
 
@@ -194,7 +200,7 @@ variable-time instructions, Wasm engines, speculation, memory left behind) apply
 | CBC and ECB padding | checked with masks | yes | **the answer**: "bad padding" is returned. That is a padding oracle if a remote party sees it. Never let one |
 | RSA verify, encrypt | public values, so nothing to protect but the message before encryption: its bytes aren't branched on in the arithmetic | Montgomery multiplication | padding is built from `string`s with the usual operations; the plaintext's length is public |
 | RSA signing | blinded base, CRT with a 4-bit fixed window read whole, squarings and multiplications independent of the exponent, result checked with the public exponent | Montgomery multiplication, the table lookup, the conditional subtraction. **Not read**: the steps around them in `rsaCrt`, which use the same secret types and branch only on lengths | sizes of p, q and their numbers are public. No exponent blinding, which the fixed window makes unnecessary for timing but would help against power analysis. On Xtensa `mull`'s timing is unpublished: see below |
-| RSA decryption | the same blinded, checked CRT operation; OAEP and PKCS#1 padding are scanned with masks | padding scans | failure and returned plaintext length are revealed. PKCS#1 v1.5 has no implicit rejection; never expose its result to a remote party. Decrypted blocks and plaintext are strings and cannot be wiped |
+| RSA decryption | the same blinded, checked CRT operation; OAEP and PKCS#1 padding are scanned with masks. PKCS#1 v1.5 selects a deterministic synthetic message on bad padding | padding and synthetic-message selection | malformed ciphertext and operational failures are reported. Decrypted blocks and plaintext are strings and cannot be wiped |
 | Key loading | the base 64 of a PEM isn't branched on or looked up | the character step | DER tags and lengths are branched on, which are public, as is the position of line breaks. An integer's length shows through parsing. **The `string`s holding the DER and base 64 aren't wiped** |
 | Keys in memory | a private key's numbers are in raw memory, wiped on drop; AES's schedule too | | what was copied before: the PEM, its decoded `string` |
 | `hexDecode`, `base64Decode` | nothing | | not constant-time: don't feed them secrets that matter |

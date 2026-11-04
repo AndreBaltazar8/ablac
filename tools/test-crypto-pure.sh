@@ -126,6 +126,22 @@ for ((round = 0; round < rounds; round++)); do
     done
 done
 [[ $status -ne 0 ]] || echo "ok   openssl cross-check: $rounds rounds"
+# OpenSSL >= 3.2 implements deterministic implicit rejection. Use public test keys and
+# invalid representatives that remain below the modulus; compare bytes, including length.
+openssl_version=$(openssl version | awk '{print $2}')
+if [[ $(printf '%s\n' 3.2.0 "$openssl_version" | sort -V | head -1) == 3.2.0 ]]; then
+    for number in 0 1 2 3 7; do
+        python3 -Ic 'import sys;open(sys.argv[1], "wb").write(int(sys.argv[2]).to_bytes(256, "big"))' "$work/implicit" "$number"
+        openssl pkeyutl -decrypt -inkey "$keys/k2048.pem" -pkeyopt rsa_padding_mode:pkcs1 -in "$work/implicit" -out "$work/implicit-openssl" 2>/dev/null || fail "openssl implicit reject $number"
+        actual=$("$tool" decrypt-pkcs1 - "$keys/k2048.pem" "$work/implicit")
+        compare "implicit reject $number" "$actual" "$(hex "$work/implicit-openssl")"
+        compare "implicit reject stable $number" "$actual" "$("$tool" decrypt-pkcs1 - "$keys/k2048.pem" "$work/implicit")"
+    done
+    [[ $status -ne 0 ]] || echo 'ok   OpenSSL implicit rejection: five ciphertexts'
+else
+    echo "skip OpenSSL implicit rejection: $openssl_version predates 3.2"
+fi
+
 
 # --- Known answers elsewhere ---------------------------------------------------------------
 "$out/kat-native" || fail "known answers native: $?"
