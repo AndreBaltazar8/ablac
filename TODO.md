@@ -283,6 +283,13 @@ Package-side work (not changed from ablac):
   constant still goes through `abla_llvm_call_indirect`'s copy and switch.
 - [ ] **A benchmark's cycles can move 20% with the code unchanged.** `fib` at 2026-11-01 is byte-identical machine
   code at another address and takes 20% more cycles. `tools/bench-compare.py` reports instructions for that reason.
+  Reproduced 2026-11-04 with string bulk copies: the new `memcpy` import moves fib's
+  unchanged recursive body from 0x1de0 to 0x1e40 (start mod64 32 to 0, loop mod64 0 to32).
+  Cycles rise 13.3% in five pairs and 18.6% in seven more, with unchanged instructions.
+  A scratch link placing both bodies at 0x10620 restores cycles (five pairs: 2.132G vs
+  2.136G, +0.19%). Screen release function/loop alignment separately over all13 programs,
+  including the size cost of 64-byte alignment; do not tune the string-copy change to fib.
+  Evidence: worktrees/ablac-string-copy/build/copy-lab/{report.md,alignment-runs.json}.
 
 - [ ] **Temporaries spanning IR blocks never share a stack slot.** Every IR value that is
   not a scalar gets its own 24-byte slot. A value used only inside one IR block, defined by
