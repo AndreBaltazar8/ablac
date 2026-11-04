@@ -488,6 +488,21 @@ trusted fun TlsConnection.setTimeouts(
     tlsControlInt(this.handle, 16), readMilliseconds, writeMilliseconds
 )
 
+// A server context owns the loaded certificate and key. On failure no context
+// escapes; callers keep their existing error reporting and socket ownership.
+private trusted fun hostedTlsServerContext(certificatePath: string, privateKeyPath: string): i64* {
+    var context = SSL_CTX_new(TLS_server_method())
+    var ready = !pointerIsNull(context)
+    if (ready) ready = SSL_CTX_use_certificate_chain_file(context, certificatePath) == 1
+    if (ready) ready = SSL_CTX_use_PrivateKey_file(context, privateKeyPath, 1) == 1
+    if (ready) ready = SSL_CTX_check_private_key(context) == 1
+    if (!ready && !pointerIsNull(context)) {
+        SSL_CTX_free(context)
+        context = nativeNullPointer()
+    }
+    context
+}
+
 trusted fun tlsListenHandle(
     certificatePath: string,
     privateKeyPath: string,
@@ -502,16 +517,9 @@ trusted fun tlsListenHandle(
     var ready = port >= 0 && port <= 65535 && backlog > 0 &&
         backlog <= 4096 && tlsAvailable()
     if (ready) {
-        context = SSL_CTX_new(TLS_server_method())
+        context = hostedTlsServerContext(certificatePath, privateKeyPath)
         ready = !pointerIsNull(context)
     }
-    if (ready) ready = SSL_CTX_use_certificate_chain_file(
-        context, certificatePath
-    ) == 1
-    if (ready) ready = SSL_CTX_use_PrivateKey_file(
-        context, privateKeyPath, 1
-    ) == 1
-    if (ready) ready = SSL_CTX_check_private_key(context) == 1
     if (ready) {
         listener = if (linuxIpv6Words(host).size == 8)
             tcpListenIpv6(ipv6SocketAddress(host, port), backlog, dualStack)
@@ -559,40 +567,49 @@ trusted fun TlsListener.accept(
         val descriptor = linuxTcpAcceptDescriptor(
             tlsControlInt(this.handle, 8)
         )
-        var session = nativeNullPointer()
-        var ready = descriptor >= 0
-        if (ready) {
-            session = SSL_new(context)
-            ready = !pointerIsNull(session)
-        }
-        if (ready) ready = SSL_set_fd(session, descriptor) == 1
-        if (ready) {
-            linuxSocketSetTimeouts(
-                descriptor, handshakeTimeoutMilliseconds, handshakeTimeoutMilliseconds
-            )
-            ERR_clear_error()
-            val held = linuxBrokenPipeHold()
-            val wait = HostedTlsWait(descriptor)
-            var shook = SSL_accept(session)
-            while (shook != 1 && hostedTlsInterrupted(wait, session, int(shook))) {
-                shook = SSL_accept(session)
-            }
-            hostedTlsWaitDone(wait)
-            ready = shook == 1
-            linuxBrokenPipeRelease(held)
-        }
-        if (ready) {
-            linuxSocketSetTimeouts(
-                descriptor, readWriteTimeoutMilliseconds, readWriteTimeoutMilliseconds
-            )
-            handle = tlsAllocateConnection(context, session, descriptor, false)
-        } else {
-            if (!pointerIsNull(session)) SSL_free(session)
-            if (descriptor >= 0) linuxTcpCloseDescriptor(descriptor)
-            hostedTlsSetError(hostedTlsServerHandshakeFailed)
-        }
+        handle = hostedTlsServerAccept(context, descriptor,
+            handshakeTimeoutMilliseconds, readWriteTimeoutMilliseconds)
     }
     TlsConnection(handle)
+}
+
+// Both the listener and accepted-stream APIs use this one handshake path.
+private trusted fun hostedTlsServerAccept(context: i64*, descriptor: int,
+    handshakeTimeoutMilliseconds: int, readWriteTimeoutMilliseconds: int): int {
+    var handle = -1
+    var session = nativeNullPointer()
+    var ready = descriptor >= 0
+    if (ready) {
+        session = SSL_new(context)
+        ready = !pointerIsNull(session)
+    }
+    if (ready) ready = SSL_set_fd(session, descriptor) == 1
+    if (ready) {
+        linuxSocketSetTimeouts(
+            descriptor, handshakeTimeoutMilliseconds, handshakeTimeoutMilliseconds
+        )
+        ERR_clear_error()
+        val held = linuxBrokenPipeHold()
+        val wait = HostedTlsWait(descriptor)
+        var shook = SSL_accept(session)
+        while (shook != 1 && hostedTlsInterrupted(wait, session, int(shook))) {
+            shook = SSL_accept(session)
+        }
+        hostedTlsWaitDone(wait)
+        ready = shook == 1
+        linuxBrokenPipeRelease(held)
+    }
+    if (ready) {
+        linuxSocketSetTimeouts(
+            descriptor, readWriteTimeoutMilliseconds, readWriteTimeoutMilliseconds
+        )
+        handle = tlsAllocateConnection(context, session, descriptor, false)
+    } else {
+        if (!pointerIsNull(session)) SSL_free(session)
+        if (descriptor >= 0) linuxTcpCloseDescriptor(descriptor)
+        hostedTlsSetError(hostedTlsServerHandshakeFailed)
+    }
+    handle
 }
 
 // One blocking OpenSSL call on a socket with timeouts. OpenSSL reads EINTR, as from
