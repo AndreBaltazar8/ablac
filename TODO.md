@@ -120,7 +120,7 @@
 
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
-- [ ] `Path.writeText` is always 0666 less umask.
+- [ ] After an octal-capable bootstrap is pinned, change decimal creation-mode defaults in src/ and stdlib/ to `0o666` / `0o600` (kept decimal for the v0.2.42 bootstrap).
 - [ ] `abla/crypto/hosted` can use an RSA key but not generate one; `abla/crypto/rsa` provides pure key generation.
 - [ ] There is no YAML library: NovaKind's `provision-mail` edits `~/.config/icy/mail.yaml` by its lines and refuses anything else
       under `accounts:`.

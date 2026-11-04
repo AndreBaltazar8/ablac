@@ -1168,6 +1168,8 @@ fun bootstrapClearCompileOutputs(): void {
         Path("$root/$index.data").remove()
         Path("$root/$index.kind").remove()
         Path("$root/$index.revision").remove()
+        Path("$root/$index.mode").remove()
+        Path("$root/$index.exact").remove()
         index = index + 1
     }
     Path(root).remove()
@@ -1498,6 +1500,22 @@ fun bootstrapCompileOutputRevision(slot: int): int {
 fun bootstrapCompileOutputPath(slot: int): string =
     Path("${bootstrapCompileOutputRoot()}/$slot.path").readText()
 
+// Decimal defaults keep this source buildable by the pinned pre-octal compiler.
+fun bootstrapCompileOutputMode(slot: int): int {
+    val file = Path("${bootstrapCompileOutputRoot()}/$slot.mode")
+    if (file.exists()) bootstrapDecimalIndex(file.readText()) else 438
+}
+
+fun bootstrapCompileOutputExactMode(slot: int): bool =
+    Path("${bootstrapCompileOutputRoot()}/$slot.exact").exists()
+
+// Payloads, including secrets, are never spooled into public files. A stale
+// slot fails exclusive creation rather than following or truncating it.
+fun bootstrapPrepareCompileOutputRoot(): bool {
+    val root = Path(bootstrapCompileOutputRoot())
+    root.createDirectories(448) && (root.permissions() & 63) == 0
+}
+
 /** Slot `slot` now stages `kind` with `contents`, one revision later. */
 fun bootstrapRestageCompileOutput(slot: int, kind: string, contents: string): bool {
     val root = bootstrapCompileOutputRoot()
@@ -1505,17 +1523,16 @@ fun bootstrapRestageCompileOutput(slot: int, kind: string, contents: string): bo
     val previous = dataFile.readText().size
     val nextBytes = bootstrapCompileOutputBytes - previous + contents.size
     if (nextBytes > BOOTSTRAP_COMPILE_OUTPUT_BYTES) return false
-    if (!dataFile.writeText(contents)) return false
+    if (!dataFile.writeText(contents, 384)) return false
     bootstrapCompileOutputBytes = nextBytes
     val kindFile = Path("$root/$slot.kind")
-    val kept = if (kind == "file") kindFile.remove() || !kindFile.exists()
-        else kindFile.writeText(kind)
+    val kept = kindFile.writeText(kind, 384)
     kept && Path("$root/$slot.revision").writeText(
-        "${bootstrapCompileOutputRevision(slot) + 1}"
+        "${bootstrapCompileOutputRevision(slot) + 1}", 384
     )
 }
 
-/** Stages `kind` ("directory" or "removed") at `path`: true when staged. */
+/** Stages a file, directory or removal in the private output journal. */
 fun bootstrapStageCompileEntry(path: string, kind: string, contents: string = ""): bool {
     if (!bootstrapCompileOutputPathValid(path)) return false
     val slot = bootstrapCompileOutputSlot(path)
@@ -1524,10 +1541,10 @@ fun bootstrapStageCompileEntry(path: string, kind: string, contents: string = ""
     if (bootstrapCompileOutputBytes + contents.size > BOOTSTRAP_COMPILE_OUTPUT_BYTES) return false
     val root = bootstrapCompileOutputRoot()
     val index = bootstrapCompileOutputCount
-    var valid = Path(root).createDirectories() &&
-        Path("$root/$index.path").writeText(path) &&
-        Path("$root/$index.data").writeText(contents) &&
-        Path("$root/$index.kind").writeText(kind)
+    val valid = bootstrapPrepareCompileOutputRoot() &&
+        Path("$root/$index.path").createExclusive(path) &&
+        Path("$root/$index.data").createExclusive(contents) &&
+        Path("$root/$index.kind").createExclusive(kind)
     if (!valid) {
         Path("$root/$index.path").remove()
         Path("$root/$index.data").remove()
@@ -1539,32 +1556,24 @@ fun bootstrapStageCompileEntry(path: string, kind: string, contents: string = ""
     valid
 }
 
-fun bootstrapStageCompileOutput(path: string, contents: string): bool {
-    var valid = bootstrapCompileOutputPathValid(path) &&
-        contents.size <= 16777216
-    // A path written again in the same compilation: the last contents win, in its slot.
-    val slot = if (valid) bootstrapCompileOutputSlot(path) else -1
-    if (slot >= 0) return bootstrapRestageCompileOutput(slot, "file", contents)
-    val nextBytes = bootstrapCompileOutputBytes + contents.size
-    if (nextBytes > BOOTSTRAP_COMPILE_OUTPUT_BYTES) valid = false
-    if (bootstrapCompileOutputCount >= BOOTSTRAP_COMPILE_OUTPUT_LIMIT) valid = false
-    if (valid) {
-        val root = bootstrapCompileOutputRoot()
-        valid = Path(root).createDirectories()
-        val pathFile = Path("$root/$bootstrapCompileOutputCount.path")
-        val dataFile = Path("$root/$bootstrapCompileOutputCount.data")
-        valid = pathFile.writeText(path)
-        if (valid) valid = dataFile.writeText(contents)
-        if (!valid) {
-            pathFile.remove()
-            dataFile.remove()
-        }
+fun bootstrapStageCompileOutput(path: string, contents: string, mode: int = 438,
+    exactMode: bool = false, replaceMode: bool = false): bool {
+    if (mode < 0 || mode > 4095 || contents.size > 16777216) return false
+    val oldSlot = bootstrapCompileOutputSlot(path)
+    val oldKind = if (oldSlot >= 0) bootstrapCompileOutputKind(oldSlot) else ""
+    if (!bootstrapStageCompileEntry(path, "file", contents)) return false
+    val slot = bootstrapCompileOutputSlot(path)
+    // Rewriting a staged file preserves its creation mode, just like open.
+    if (oldKind == "file" && !replaceMode) {
+        return Path("${bootstrapCompileOutputRoot()}/$slot.mode").exists()
     }
-    if (valid) {
-        bootstrapCompileOutputCount = bootstrapCompileOutputCount + 1
-        bootstrapCompileOutputBytes = nextBytes
-    }
-    valid
+    val existing = if (oldKind == "removed" || replaceMode) -1 else Path(path).permissions()
+    val keptMode = if (existing >= 0) existing else mode
+    val root = bootstrapCompileOutputRoot()
+    if (!Path("$root/$slot.mode").writeText("$keptMode", 384)) return false
+    val exact = Path("$root/$slot.exact")
+    if (existing >= 0 || exactMode) exact.writeText("1", 384)
+    else exact.remove() || !exact.exists()
 }
 
 // Toolchain-owned sidecars inherit the already validated/authorized artifact
@@ -1585,8 +1594,8 @@ fun bootstrapStageToolchainOutput(path: string, contents: string): bool {
         val root = bootstrapCompileOutputRoot()
         val pathFile = Path("$root/$bootstrapCompileOutputCount.path")
         val dataFile = Path("$root/$bootstrapCompileOutputCount.data")
-        valid = pathFile.writeText(path)
-        if (valid) valid = dataFile.writeText(contents)
+        valid = bootstrapPrepareCompileOutputRoot() && pathFile.createExclusive(path)
+        if (valid) valid = dataFile.createExclusive(contents)
         if (!valid) {
             pathFile.remove()
             dataFile.remove()
@@ -1602,9 +1611,20 @@ fun bootstrapStageToolchainOutput(path: string, contents: string): bool {
 // Writes a build's file beside `path` and renames it over it, so a reader finds the earlier
 // contents or the new ones, whole. Without Path.writeTextAtomic's fsync: building makes the
 // file again, and each fsync waited about 5 ms for the disk (19 in a build before 2026-11-02).
-fun bootstrapWriteBuildFile(path: Path, contents: string): bool {
+fun bootstrapWriteBuildFile(path: Path, contents: string, mode: int = 438,
+    exactMode: bool = false, preserveExisting: bool = true): bool {
+    if (!path.createParentDirectories()) return false
     val temporary = Path("${path.text}.tmp.${linuxProcessId()}")
-    val written = temporary.writeText(contents) && temporary.moveTo(path)
+    val existing = if (preserveExisting) path.permissions() else -1
+    val keptMode = if (exactMode) mode else if (existing >= 0) existing else mode
+    // O_EXCL prevents writing through a pre-existing temporary or symlink.
+    val descriptor = linuxOpen(temporary.text, 705, keptMode).descriptor
+    if (descriptor < 0) return false
+    var written = true
+    if (exactMode || existing >= 0) written = linuxSyscall2(91, descriptor, keptMode) == 0
+    if (written) written = linuxWriteAll(descriptor, contents)
+    if (linuxSyscall1(3, descriptor) != 0) written = false
+    if (written) written = temporary.moveTo(path)
     if (!written) temporary.remove()
     written
 }
@@ -1619,7 +1639,11 @@ fun bootstrapCommitCompileOutputs(): bool {
         committed = pathFile.exists() && dataFile.exists()
         val kind = bootstrapCompileOutputKind(index)
         val target = Path(pathFile.readText())
-        if (committed && kind == "file") committed = bootstrapWriteBuildFile(target, dataFile.readText())
+        // A mode-aware file must never publish if its metadata write failed.
+        if (kind == "file" && Path("$root/$index.kind").exists() &&
+            !Path("$root/$index.mode").exists()) committed = false
+        if (committed && kind == "file") committed = bootstrapWriteBuildFile(target, dataFile.readText(),
+            bootstrapCompileOutputMode(index), bootstrapCompileOutputExactMode(index), false)
         if (committed && kind == "directory") {
             val modeText = dataFile.readText()
             val mode = if (modeText == "") 511 else bootstrapDecimalIndex(modeText)
