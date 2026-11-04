@@ -99,7 +99,16 @@ returns `YamlEmitResult(text, succeeded, error)`. Always check `succeeded`.
 Failure returns empty text, never a partial document or a substituted `null`.
 
 ```abla
-val encoded = yamlEmit(yamlObject(["password", "port"], [yamlString("secret"), yamlInteger(993)]))
+import "abla/io"
+import "abla/yaml"
+
+fun main(): void {
+    val encoded = yamlEmit(yamlObject(["password", "port"], [yamlString("secret"), yamlInteger(993)]))
+    if (encoded.succeeded) print(encoded.text)
+}
+// output:
+// "password": "secret"
+// "port": 993
 ```
 
 Fresh output uses deterministic block layout, two spaces, LF, insertion-order
@@ -123,14 +132,26 @@ Its result has `document`, `succeeded` and `error`. On success,
 The document keeps a concrete source model alongside its semantic values.
 
 ```abla
-val parsed = yamlParseDocument(source)
-// Check parsed.succeeded before starting the edit.
-val edits = parsed.document.edit()
-edits.set([
-    yamlKey("accounts"), yamlKey("mail@example.com"), yamlKey("password")
-], yamlString("new password"))
-val result = edits.finish()
-// Write result.document.toText() only if result.succeeded.
+import "abla/io"
+import "abla/yaml"
+
+fun main(): void {
+    val source = "accounts:\n  mail@example.com:\n    password: 'old'  # rotated yearly\n    port: 993\n"
+    val parsed = yamlParseDocument(source)
+    if (!parsed.succeeded) return
+    val edits = parsed.document.edit()
+    edits.set([
+        yamlKey("accounts"), yamlKey("mail@example.com"), yamlKey("password")
+    ], yamlString("new password"))
+    val result = edits.finish()
+    // Write result.document.toText() only if result.succeeded.
+    if (result.succeeded) print(result.document.toText())
+}
+// output:
+// accounts:
+//   mail@example.com:
+//     password: 'new password'  # rotated yearly
+//     port: 993
 ```
 
 Paths are arrays of typed parts: `yamlKey(string)` for a string mapping key,
