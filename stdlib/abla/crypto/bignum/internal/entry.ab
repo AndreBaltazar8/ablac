@@ -7,12 +7,49 @@
 import "abla/ct"
 import "abla/crypto/bignum"
 
+// Addresses, widths and extents are public. Check arithmetic before forming ends;
+// invalid ranges fail before any caller buffer is read or written.
+private @inline fun bnSecretRangeValid(address: int, words: int): bool =
+    address > 0 && words > 0 && words <= 4096 && address <= 9223372036854775807 - words * 4
+
+private @inline fun bnSecretDisjoint(a: int, aw: int, b: int, bw: int): bool =
+    a + aw * 4 <= b || b + bw * 4 <= a
+
+private @inline fun bnSecretDivArgs(q: int, r: int, n: int, nw: int, d: int, w: int, t: int): bool {
+    if (w < 1 || w > 128 || nw < 1 || nw > w * 2) return false
+    if (!bnSecretRangeValid(q, nw) || !bnSecretRangeValid(r, w) ||
+        !bnSecretRangeValid(n, nw) || !bnSecretRangeValid(d, w) || !bnSecretRangeValid(t, w)) return false
+    bnSecretDisjoint(q, nw, r, w) && bnSecretDisjoint(q, nw, n, nw) &&
+        bnSecretDisjoint(q, nw, d, w) && bnSecretDisjoint(q, nw, t, w) &&
+        bnSecretDisjoint(r, w, n, nw) && bnSecretDisjoint(r, w, d, w) &&
+        bnSecretDisjoint(r, w, t, w) && bnSecretDisjoint(n, nw, d, w) &&
+        bnSecretDisjoint(n, nw, t, w) && bnSecretDisjoint(d, w, t, w)
+}
+
+private @inline fun bnSecretFourArgs(a: int, b: int, c: int, w: int, work: int, workWords: int): bool {
+    if (w < 1 || w > 128) return false
+    if (!bnSecretRangeValid(a, w) || !bnSecretRangeValid(b, w) ||
+        !bnSecretRangeValid(c, w) || !bnSecretRangeValid(work, workWords)) return false
+    bnSecretDisjoint(a, w, b, w) && bnSecretDisjoint(a, w, c, w) &&
+        bnSecretDisjoint(a, w, work, workWords) && bnSecretDisjoint(b, w, c, w) &&
+        bnSecretDisjoint(b, w, work, workWords) && bnSecretDisjoint(c, w, work, workWords)
+}
+
+private @inline fun bnSecretDivstepsArgs(gcd: int, inverse: int, modulus: int, value: int,
+    words: int, work: int): bool {
+    if (!bnSecretFourArgs(gcd, modulus, value, words, work, 9 * (words + 1))) return false
+    if (!bnSecretRangeValid(inverse, words)) return false
+    bnSecretDisjoint(inverse, words, gcd, words) && bnSecretDisjoint(inverse, words, modulus, words) &&
+        bnSecretDisjoint(inverse, words, value, words) && bnSecretDisjoint(inverse, words, work, 9 * (words + 1))
+}
+
 // Divide a little-endian numerator by a little-endian divisor, in a fixed number of steps.
 // quotient has numeratorWords limbs; remainder, divisor and scratch each have words limbs.
 // Returns all ones for a nonzero divisor and zero otherwise. The quotient and remainder
 // for a zero divisor are unspecified; callers must use the returned mask.
-@inline trusted fun bnSecretDivModBody(quotient: int, remainder: int, numerator: int,
+private @inline trusted fun bnSecretDivModBody(quotient: int, remainder: int, numerator: int,
     numeratorWords: int, divisor: int, words: int, scratch: int): secretU32 {
+    if (!bnSecretDivArgs(quotient, remainder, numerator, numeratorWords, divisor, words, scratch)) return secretU32(u32(0))
     for (i in 0 until numeratorWords) bnStore(quotient + i * 4, secretU32(u32(0)))
     var nonzero = secretU32(u32(0))
     for (i in 0 until words) {
@@ -48,13 +85,14 @@ import "abla/crypto/bignum"
 }
 
 // Reduction shares division's fixed-width loop; quotient and scratch are temporary.
-@inline trusted fun bnSecretReduceBody(remainder: int, numerator: int, numeratorWords: int,
+private @inline trusted fun bnSecretReduceBody(remainder: int, numerator: int, numeratorWords: int,
     divisor: int, words: int, quotient: int, scratch: int): secretU32 =
     bnSecretDivModBody(quotient, remainder, numerator, numeratorWords, divisor, words, scratch)
 
 // Returns an all-ones mask only for nonzero divisors and a zero remainder.
-@inline trusted fun bnSecretExactDivBody(quotient: int, numerator: int, numeratorWords: int,
+private @inline trusted fun bnSecretExactDivBody(quotient: int, numerator: int, numeratorWords: int,
     divisor: int, words: int, remainder: int, scratch: int): secretU32 {
+    if (!bnSecretDivArgs(quotient, remainder, numerator, numeratorWords, divisor, words, scratch)) return secretU32(u32(0))
     val valid = bnSecretDivModBody(quotient, remainder, numerator, numeratorWords, divisor, words, scratch)
     var rest = secretU32(u32(0))
     for (i in 0 until words) rest = rest | bnLoad(remainder + i * 4)
@@ -67,8 +105,9 @@ import "abla/crypto/bignum"
 // The fixed iteration bound is Theorem 11.2 of https://gcd.cr.yp.to/safegcd-20190305.pdf.
 // Returns an all-ones mask only when modulus is odd and gcd(modulus,value) == 1.
 // gcd receives the absolute gcd; inverse receives the normalized coefficient when valid.
-@inline trusted fun bnSecretDivstepsBody(gcd: int, inverse: int, modulus: int, value: int,
+private @inline trusted fun bnSecretDivstepsBody(gcd: int, inverse: int, modulus: int, value: int,
     words: int, work: int): secretU32 {
+    if (!bnSecretDivstepsArgs(gcd, inverse, modulus, value, words, work)) return secretU32(u32(0))
     val limbs = words + 1
     val stride = limbs * 4
     val f = work
@@ -208,7 +247,8 @@ import "abla/crypto/bignum"
 // General unsigned gcd, including even and zero inputs. Strip common powers of two
 // with fixed-width masked shifts, then restore them after odd-input divsteps.
 // Work has 2*words + 9*(words+1) + words limbs; out may not alias either input.
-@inline trusted fun bnSecretGcdBody(out: int, left: int, right: int, words: int, work: int): void {
+private @inline trusted fun bnSecretGcdBody(out: int, left: int, right: int, words: int, work: int): secretU32 {
+    if (!bnSecretFourArgs(out, left, right, words, work, words * 3 + 9 * (words + 1))) return secretU32(u32(0))
     val a = work
     val b = work + words * 4
     val unusedInverse = work + words * 8
@@ -259,14 +299,15 @@ import "abla/crypto/bignum"
         }
     }
     for (i in 0 until words) bnStore(out + i * 4, bnLoad(out + i * 4) & anyInput)
-    return
+    secretU32(~u32(0))
 }
 
 // General modular inverse, including even moduli. For even M and odd a, invert
 // M modulo a with odd-modulus divsteps; t = -M^-1 mod a, then (1 + t*M)/a is
 // the inverse of a modulo M. Both paths run for every input and are mask-selected.
 // Work contains 13*words + 9*(words+1) limbs. Outputs are undefined if mask=0.
-@inline trusted fun bnSecretInverseBody(out: int, modulus: int, value: int, words: int, work: int): secretU32 {
+private @inline trusted fun bnSecretInverseBody(out: int, modulus: int, value: int, words: int, work: int): secretU32 {
+    if (!bnSecretFourArgs(out, modulus, value, words, work, words * 13 + 9 * (words + 1))) return secretU32(u32(0))
     val stride = words * 4
     val oddModulus = work
     val safeValue = work + stride

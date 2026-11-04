@@ -24,7 +24,7 @@ def run(mode, cases):
         rem, quotient, mask = int(rem, 16), int(quotient, 16), int(mask)
         assert mask in (0, 0xFFFFFFFF), (mode, index, "bad mask", mask)
         if mode == "gcd":
-            ok = rem == math.gcd(m, n)
+            ok = mask == 0xFFFFFFFF and rem == math.gcd(m, n)
         elif mode == "divsteps":
             g = math.gcd(m, n)
             ok = rem == g and bool(mask) == (g == 1)
@@ -62,6 +62,16 @@ for bits, count in counts:
         wide.append((bits, a, (b << bits) | rng.getrandbits(bits)))
         if a:
             wide.append((bits, a, a * b))  # Exact, including zero quotient and full-width products.
+
+# Dense limb-width coverage, including all small widths and 17/64/127/128 boundaries.
+for words in (*range(1, 9), 12, 16, 17, 20, 24, 28, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 127, 128):
+    bits = words * 32
+    a, b = rng.getrandbits(bits), rng.getrandbits(bits)
+    cases.append((bits, a, b))
+    odd.append((bits, a | 1, b))
+    wide.append((bits, a, (b << bits) | rng.getrandbits(bits)))
+    if a:
+        wide.append((bits, a, a * b))
 
 for mode, data in [("divsteps", odd), ("gcd", cases), ("inverse", cases),
                    ("division", cases), ("divisionwide", wide), ("reducewide", wide), ("exactwide", wide)]:

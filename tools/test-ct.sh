@@ -11,12 +11,18 @@ set -euo pipefail
 compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-cases=tests/cases/ct
+cases=build/ct/cases
 out=build/ct
 check="python3 -I tools/ct/check-asm.py"
 cd "$project_root"
 rm -rf "$out"
 mkdir -p "$out"
+cp -R tests/cases/ct "$cases"
+# Keep the private implementation private: test the exact production source in
+# the generated fixture's own module, never through a public test hook.
+sed '/^import /d' stdlib/abla/crypto/bignum/internal/entry.ab >> "$cases/fixture.ab"
+# Staged build drivers need the scratch fixture paths as well.
+sed -i 's@tests/cases/ct/@build/ct/cases/@g' "$cases/build.ab" "$cases/aarch64-build.ab"
 python3 -I tools/ct/test-check-asm.py
 
 fixtures=(
@@ -32,6 +38,13 @@ fixtures=(
     ct_fix_secret_division:@0,@1 ct_fix_secret_exact:@0,@1 ct_fix_secret_reduce:@0,@1 ct_fix_secret_divsteps:@0,@1 ct_fix_secret_gcd:@0,@1 ct_fix_secret_inverse:@0,@1
     ct_fix_base64:0
 )
+for width in 1 3 128; do
+    fixtures+=("ct_fix_inverse_$width:@0,@1" "ct_fix_gcd_$width:@0,@1"
+               "ct_fix_divsteps_$width:@0,@1" "ct_fix_wide_$width:@0,@1")
+done
+# Xtensa passes later pointer parameters on the stack; its checker cannot yet
+# taint those parameters, so this separate-pointer shape is read on these ABIs.
+host_fixtures=(ct_fix_wide_separate:@0,@1,@2,@3,@5)
 leaks=(ct_leak_branch:0 ct_leak_index:0 ct_leak_compare:@0,@1 ct_leak_divide:0,1)
 
 # Hand-written spill regressions ensure the test includes the actual assembly pattern.
@@ -63,7 +76,9 @@ echo "ok   x86-64 and AArch64 frame-register leaks caught"
 
 read_target() { # arch, object
     local arch=$1 object=$2
-    $check "$arch" "$object" "${fixtures[@]}" > "$out/$arch.log" 2>&1 || {
+    local target_fixtures=("${fixtures[@]}")
+    if [[ $arch == x86_64 || $arch == aarch64 ]]; then target_fixtures+=("${host_fixtures[@]}"); fi
+    $check "$arch" "$object" "${target_fixtures[@]}" > "$out/$arch.log" 2>&1 || {
         cat "$out/$arch.log" >&2; echo "ct: a secret reached a branch or an address on $arch" >&2; exit 1
     }
     for leak in "${leaks[@]}"; do
@@ -72,7 +87,7 @@ read_target() { # arch, object
         fi
         grep -q '^LEAK' "$out/$arch-leak.log" || { cat "$out/$arch-leak.log" >&2; exit 1; }
     done
-    echo "ok   $arch: ${#fixtures[@]} fixtures clean in the assembly, ${#leaks[@]} leaks caught"
+    echo "ok   $arch: ${#target_fixtures[@]} fixtures clean in the assembly, ${#leaks[@]} leaks caught"
 }
 
 # --- x86-64 ---------------------------------------------------------------------------
