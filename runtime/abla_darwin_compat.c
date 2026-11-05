@@ -139,15 +139,14 @@ static int linux_open_flags(int flags) {
 // selects the unlimited select entry point. Size masks for the actual fd, not
 // FD_SETSIZE, so a valid high-numbered descriptor is supported as well.
 static int darwin_poll(struct pollfd *fds, nfds_t count, int timeout) {
+  int result = poll(fds, count, timeout);
   struct stat information;
-  if (count != 1 || fds[0].fd < 0 ||
+  // Only inspect descriptors that poll rejected. In particular, sockets keep
+  // the existing single poll call without an extra fstat on every wait.
+  if (result <= 0 || count != 1 || !(fds[0].revents & POLLNVAL) || fds[0].fd < 0 ||
       (fds[0].events & ~(POLLIN | POLLOUT)) != 0 ||
       fstat(fds[0].fd, &information) != 0 || !S_ISCHR(information.st_mode))
-    return poll(fds, count, timeout);
-  if (timeout < -1) {
-    errno = EINVAL;
-    return -1;
-  }
+    return result;
   const int descriptor = fds[0].fd;
   if (descriptor == INT_MAX) {
     errno = EINVAL;
@@ -175,7 +174,7 @@ static int darwin_poll(struct pollfd *fds, nfds_t count, int timeout) {
   // select's exceptional set denotes priority data, not POLLERR. Some
   // character drivers (including /dev/null) report every select operation
   // ready. A disconnected device is diagnosed by the subsequent I/O call.
-  int result = select(descriptor + 1, (fd_set *)reads, (fd_set *)writes,
+  result = select(descriptor + 1, (fd_set *)reads, (fd_set *)writes,
                       NULL, timeout < 0 ? NULL : &duration);
   int saved_errno = errno;
   if (result >= 0) {
