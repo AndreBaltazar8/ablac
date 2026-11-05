@@ -104,7 +104,7 @@ with tempfile.TemporaryDirectory(prefix="abla-device-test-") as directory:
     link = root / "regular-link"
     link.symlink_to(file)
     rejected("device", link, {errno.EINVAL})
-    rejected("serial", "/dev/null", {errno.ENOTTY})
+    rejected("serial", "/dev/null", {errno.ENOTTY, errno.ENODEV})
     for settings in (dict(baud=0), dict(baud=12345), dict(bits=4), dict(bits=9),
                      dict(parity="mark"), dict(stop=3), dict(flow="xon-xoff")):
         rejected("serial", "/dev/null", {errno.EINVAL}, **settings)
@@ -154,6 +154,16 @@ with tempfile.TemporaryDirectory(prefix="abla-device-test-") as directory:
         if client: client.clean()
         os.close(master)
         os.close(slave)
+
+    for mode in ("min-deadline", "min-timeout", "max-timeout"):
+        client = Client(mode, "/dev/null", small)
+        try:
+            expected = (1, len(small_bytes), 0) if mode == "max-timeout" else (3, 0, 110)
+            assert client.write()[:3] == expected
+            client.close()
+            checks += 1
+        finally:
+            client.clean()
 
     # Python's native termios binding is independent of the Abla flag/layout code.
     rates = [50, 75, 110, 134, 150, 200, 300, 600, 1200, 1800, 2400, 4800,

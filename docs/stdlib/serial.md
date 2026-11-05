@@ -15,8 +15,12 @@ check applies to the descriptor actually opened.
 
 `close()` is idempotent, and dropping the connection closes it. Do not share a
 connection between concurrent writers or change its descriptor's flags through
-raw system calls. Closing does not perform an unbounded physical drain. Device
-drivers must respect nonblocking writes for the deadline to bound their waits.
+raw system calls. `close()` follows the native driver's behavior: a tty close
+can wait for the driver's closing timeout even with `O_NONBLOCK`. The deadline
+bounds `writeUntil`/`writeWithin`, not opening, configuration or closing. The
+library calls no `tcdrain`, discards no queued bytes with `tcflush`, and changes
+no global driver closing policy. Drivers must respect nonblocking writes for
+the write deadline to bound their waits.
 
 ## Deadlines and outcomes
 
