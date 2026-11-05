@@ -632,6 +632,10 @@ fun bootstrapLlvmMaterializeUsedWrappers(
 // by an exception (bootstrapWasmUnwindingParse, bootstrapLlvmDefineStmInvoke),
 // and it alone is built with exception handling (toolchain.ab).
 var bootstrapLlvmWasmUnwinding = false
+// The graph owner requests one semantic probe before running user actions.
+// Nested CT compilations leave this off and cannot consume the request.
+var bootstrapFloatBridgeProbe = false
+var bootstrapFloatBridgeAvailable = false
 
 // The WebAssembly platform's attempt, abandon and unwinding, and the versions
 // whose bodies replace them in a module that leaves attempts by an exception
@@ -778,6 +782,8 @@ fun bootstrapCompileLlvmParsedCached(
     // after lowering, without changing ordinary programs or nested CT emits.
     holdLlvmClient: bool = false
 ): BootstrapLlvmCompilation {
+    val floatProbe = bootstrapFloatBridgeProbe
+    bootstrapFloatBridgeProbe = false
     // A parse error stops the build after the parser: analysis and code
     // generation would only run over the holes it left, and their errors
     // (unknown types, invalid IR) would bury it. Named-argument mistakes are
@@ -822,7 +828,27 @@ fun bootstrapCompileLlvmParsedCached(
     val outerTargetsWasm = bootstrapSemanticTargetsWasm
     bootstrapSemanticTargetsWasm = bootstrapTextContains(targetTriple, "wasm")
     bootstrapSemanticWasmUnwinds = false
+    val outerFloatDemandActive = bootstrapFloatDemandActive
+    if (floatProbe) {
+        bootstrapFloatDemandOrigin = false
+        bootstrapFloatDemandText = false
+        bootstrapFloatDemandPrepare(parsed.declarations)
+        bootstrapFloatDemandActive = true
+    }
     val analyzed = bootstrapCtAnalyze(parsed, targetTriple)
+    bootstrapFloatDemandActive = outerFloatDemandActive
+    if (floatProbe) bootstrapFloatDemandNames = Map()
+    if (floatProbe && analyzed.errors == 0) {
+        val demanded = bootstrapFloatDemandOrigin && bootstrapFloatDemandText
+        if (demanded && !bootstrapFloatBridgeAvailable) {
+            bootstrapSemanticTargetsWasm = outerTargetsWasm
+            bootstrapSemanticWasmUnwinds = false
+            bootstrapCtFinishPass()
+            val discardedExports = bootstrapTakeExportRequests()
+            return BootstrapLlvmCompilation("", 0, 0, 0, 0, 0, "", false, false, [], [], "", true)
+        }
+        bootstrapFloatFormattingRequested = demanded
+    }
     bootstrapSemanticTargetsWasm = outerTargetsWasm
     // A WebAssembly program whose `orElse` alternatives can retry leaves them
     // by an exception; any other module is built as it always was.
@@ -918,6 +944,7 @@ fun bootstrapCompileLlvmParsedCached(
         val sofar: array<BootstrapDeclarationEdit> = []
         for (edit in committed) sofar.append(edit)
         for (edit in roundEdits) sofar.append(edit)
+        bootstrapFloatBridgeProbe = bootstrapFloatBridgeAvailable
         return bootstrapCompileLlvmParsedCached(
             bootstrapCommitEdits(written, roundEdits), cache, targetTriple,
             pruneUnused, requireMain, round + 1, sofar, globals, holdLlvmClient

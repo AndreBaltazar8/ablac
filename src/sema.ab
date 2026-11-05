@@ -2045,7 +2045,73 @@ fun bootstrapConformanceSignatureMatches(
             bootstrapNormalizeType(method.resultType)
 }
 
+var bootstrapFloatDemandOrigin: bool = false
+var bootstrapFloatDemandText: bool = false
+var bootstrapFloatDemandActive: bool = false
+var bootstrapFloatDemandNames: Map<string, int> = Map()
+
+fun bootstrapFloatDemandType(type: string): bool {
+    val borrowed = bootstrapBorrowElementType(bootstrapNormalizeType(type))
+    val core =
+        if (bootstrapIsNullableType(borrowed)) bootstrapNullableElementType(borrowed) else borrowed
+    if (core == "f32" || core == "f64" || bootstrapFloatDemandNames.has(core)) return true
+    if (bootstrapIsArrayType(core)) return bootstrapFloatDemandType(bootstrapArrayElementType(core))
+    if (bootstrapIsMapType(core)) return bootstrapFloatDemandType(bootstrapMapValueType(core))
+    false
+}
+
+// Precompute nominal scalar and class names whose stored fields may carry a
+// float. Generic instances have already been substituted by this point.
+fun bootstrapFloatDemandPrepare(declarations: array<BootstrapDeclaration>): void {
+    bootstrapFloatDemandNames = Map()
+    var changed = true
+    var hasFloatClass = false
+    while (changed) {
+        changed = false
+        for (declaration in declarations) {
+            if (bootstrapIsExtensionFieldKind(declaration.kind) &&
+                bootstrapFloatDemandType(declaration.resultType)) {
+                val owner = bootstrapNormalizeType(declaration.extensionOwner)
+                if (!bootstrapFloatDemandNames.has(owner)) {
+                    bootstrapFloatDemandNames.set(owner, 1)
+                    changed = true
+                    hasFloatClass = true
+                }
+            }
+            if (!bootstrapFloatDemandNames.has(declaration.name)) {
+                var found = declaration.kind == "type" &&
+                    bootstrapFloatDemandType(declaration.resultType)
+                if (declaration.kind == "class") {
+                    var parameter = 0
+                    while (!found && parameter < declaration.parameterTypes.size) {
+                        if (parameter < declaration.parameterKinds.size &&
+                            (declaration.parameterKinds[parameter] == "val" ||
+                                declaration.parameterKinds[parameter] == "var") &&
+                            bootstrapFloatDemandType(declaration.parameterTypes[parameter])) found =
+                            true
+                        parameter = parameter + 1
+                    }
+                    if (found) hasFloatClass = true
+                }
+                if (found) {
+                    bootstrapFloatDemandNames.set(declaration.name, 1)
+                    changed = true
+                }
+            }
+        }
+    }
+    if (hasFloatClass) {
+        for (declaration in declarations) {
+            if (declaration.kind == "interface") bootstrapFloatDemandNames.set(declaration.name, 1)
+        }
+    }
+}
+
 fun bootstrapTypesCompatible(expected: string, actual: string): bool {
+    if (bootstrapFloatDemandActive &&
+        (expected == "any" || expected == "nullable:any") && bootstrapFloatDemandType(actual)) {
+        bootstrapFloatDemandOrigin = true
+    }
     var compatible = expected == actual || expected == "unknown" ||
         actual == "unknown" || actual == "never" ||
         (expected == "any" && !bootstrapIsSecretType(actual))
@@ -3101,6 +3167,10 @@ fun bootstrapJoinTypes(left: string, right: string): string {
     // `[]` is an array of nothing yet: it takes the other branch's type.
     if (left == "array:unknown" && bootstrapIsArrayType(right)) result = right
     if (right == "array:unknown" && bootstrapIsArrayType(left)) result = left
+    if (bootstrapFloatDemandActive && result == "void" &&
+        (bootstrapFloatDemandType(left) || bootstrapFloatDemandType(right))) {
+        bootstrapFloatDemandOrigin = true
+    }
     result
 }
 
@@ -13264,6 +13334,8 @@ fun bootstrapInferStringTemplate(
         // A nominal scalar is written as the value it wraps.
         val partUnderlying = analyzer.scalarTypeUnderlying(inferredPart)
         val partType = if (partUnderlying != "") partUnderlying else inferredPart
+        if (bootstrapFloatDemandActive && (partType == "any" || partType ==
+            "nullable:any")) bootstrapFloatDemandText = true
         if (bootstrapIsVectorType(partType)) {
             analyzer.fail("simd.template:a vector has no text of its own: use .text()")
         }

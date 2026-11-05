@@ -2,6 +2,7 @@ import "xtensa_tools.ab"
 import "xtensa_assembly.ab"
 import "apple_build.ab"
 import "backend/llvm/backend.ab"
+import "backend/llvm/analysis.ab"
 import "module.ab"
 import "lexer.ab"
 import "sourcemap.ab"
@@ -60,7 +61,14 @@ class BootstrapTargetDescriptor(
 // silently relying on declarations that only the linker path injects.
 fun bootstrapParseHostModuleWithRuntime(
     sourcePath: string
-): BootstrapParseResult = bootstrapLoadHostModuleGraph(sourcePath).parse()
+): BootstrapParseResult {
+    val enclosingFloatFormatting = bootstrapFloatFormattingRequested
+    val enclosingFloatAvailable = bootstrapFloatBridgeAvailable
+    val parsed = bootstrapLoadHostModuleGraph(sourcePath).parse()
+    bootstrapFloatFormattingRequested = enclosingFloatFormatting
+    bootstrapFloatBridgeAvailable = enclosingFloatAvailable
+    parsed
+}
 
 // Without the runtime nothing links, and the linker would only name a symbol it missed.
 fun bootstrapRequireStandardLibrary(): void {
@@ -85,7 +93,64 @@ fun bootstrapLoadHostModuleGraph(sourcePath: string): BootstrapModuleGraph {
     graph.load(standardLibrary.child("abla/runtime/self/entry.ab").text)
     graph.load(standardLibrary.child("abla/runtime/platform/host.ab").text)
     graph.load(sourcePath)
+    bootstrapFloatBridgeAvailable = bootstrapFloatBridgeMustPreload(graph)
+    bootstrapFloatFormattingRequested = false
+    if (bootstrapFloatBridgeAvailable) graph.load(bootstrapFloatBridgeSource(graph, sourcePath))
     graph
+}
+
+fun bootstrapFloatBridgeSource(graph: BootstrapModuleGraph, sourcePath: string): string {
+    val root = Path(bootstrapStandardLibraryRoot())
+    val text = bootstrapNormalizeModulePath(root.child("abla/float/text/entry.ab").text)
+    var unaliased = bootstrapNormalizeModulePath(sourcePath) == text
+    for (edge in graph.aliases) {
+        if (edge.target == text && edge.alias == "") unaliased = true
+    }
+    root.child(if (unaliased) "abla/runtime/erased-float/existing.ab"
+        else "abla/runtime/erased-float/entry.ab").text
+}
+
+// Graph-time transforms can change both types and uses. Load the bridge
+// conservatively before parsing them, so the semantic probe never replays
+// a user transform to discover the formatter.
+fun bootstrapFloatBridgeMustPreload(graph: BootstrapModuleGraph): bool {
+    var compilerApi = false
+    for (snapshot in graph.orderedSnapshots) {
+        if (bootstrapTextContains(snapshot.source, "compiler") ||
+            bootstrapTextContains(snapshot.source, "abla/compiler")) compilerApi = true
+    }
+    if (!compilerApi) return false
+    for (snapshot in graph.orderedSnapshots) {
+        if (snapshot.discovery.actions.size > 0) return true
+        if (bootstrapTextContains(snapshot.source, "#")) {
+            for (token in bootstrapLexShared(snapshot.source)) {
+                if (token.kind == BOOTSTRAP_TOKEN_HASH) return true
+            }
+        }
+    }
+    false
+}
+
+fun bootstrapCompileHostEmit(sourcePath: string): BootstrapLlvmCompilation {
+    val enclosingFloatFormatting = bootstrapFloatFormattingRequested
+    val enclosingFloatProbe = bootstrapFloatBridgeProbe
+    val enclosingFloatAvailable = bootstrapFloatBridgeAvailable
+    val graph = bootstrapLoadHostModuleGraph(sourcePath)
+    var parsed = graph.parse()
+    bootstrapFloatBridgeProbe = true
+    var compilation = bootstrapCompileLlvmEmit(parsed, sourcePath)
+    bootstrapFloatBridgeProbe = false
+    if (compilation.floatBridgeNeeded) {
+        graph.load(bootstrapFloatBridgeSource(graph, sourcePath))
+        bootstrapFloatBridgeAvailable = true
+        bootstrapFloatFormattingRequested = true
+        parsed = graph.parse()
+        compilation = bootstrapCompileLlvmEmit(parsed, sourcePath)
+    }
+    bootstrapFloatFormattingRequested = enclosingFloatFormatting
+    bootstrapFloatBridgeProbe = enclosingFloatProbe
+    bootstrapFloatBridgeAvailable = enclosingFloatAvailable
+    compilation
 }
 
 // A link run so that the same inputs give the same bytes: Darwin's linkers record
@@ -3168,6 +3233,9 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     artifact: string,
     targetToolsIdentity: string = ""
 ): BootstrapNativeBuild {
+    val enclosingFloatFormatting = bootstrapFloatFormattingRequested
+    val enclosingFloatProbe = bootstrapFloatBridgeProbe
+    val enclosingFloatAvailable = bootstrapFloatBridgeAvailable
     // A libc-free target is not necessarily the built-in raw Linux process.
     // An entry symbol identifies the latter; external module formats provide
     // their own loader/runtime contract and must not receive the Linux startup.
@@ -3258,6 +3326,9 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         "frontend.graph-load.platform:${orderedSnapshots.size}"
     )
     if (selfHostedRuntime != "") graph.load(selfHostedRuntime)
+    bootstrapFloatBridgeAvailable = compilerRuntime && bootstrapFloatBridgeMustPreload(graph)
+    bootstrapFloatFormattingRequested = false
+    if (bootstrapFloatBridgeAvailable) graph.load(bootstrapFloatBridgeSource(graph, sourcePath))
     bootstrapLlvmTraceMemory(
         "frontend.graph-load.end:${orderedSnapshots.size}"
     )
@@ -3578,7 +3649,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     }
     if (!cached) {
         bootstrapLlvmTraceMemory("frontend.parse.begin")
-        val parsedGraph = graph.parse()
+        var parsedGraph = graph.parse()
         bootstrapLlvmTraceMemory(
             "frontend.parse.end:${parsedGraph.declarations.size}"
         )
@@ -3603,7 +3674,9 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             if (fastCross) bootstrapFastInlineThreshold()
             else if (balancedProfile) llvmBalancedAotInlineThreshold() else 0
         bootstrapLlvmHoldModule = inProcessCodegen || nativeHeld || wholeProgramHeld
-        val compilation = bootstrapCompileLlvmParsedCached(
+        val baseSnapshots = orderedSnapshots.size
+        bootstrapFloatBridgeProbe = compilerRuntime
+        var compilation = bootstrapCompileLlvmParsedCached(
             parsedGraph,
             irCache,
             target.llvmTriple,
@@ -3611,6 +3684,24 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             target.hosted && artifact == "executable",
             holdLlvmClient = compilerBitcodeCandidate
         )
+        bootstrapFloatBridgeProbe = false
+        if (compilation.floatBridgeNeeded) {
+            graph.load(bootstrapFloatBridgeSource(graph, sourcePath))
+            bootstrapFloatBridgeAvailable = true
+            bootstrapFloatFormattingRequested = true
+            parsedGraph = graph.parse()
+            compilation = bootstrapCompileLlvmParsedCached(
+                parsedGraph, irCache, target.llvmTriple, true,
+                target.hosted && artifact == "executable",
+                holdLlvmClient = compilerBitcodeCandidate
+            )
+            var extra = baseSnapshots
+            while (extra < orderedSnapshots.size) {
+                compilation.compileInputPaths.append(orderedSnapshots[extra].path)
+                compilation.compileInputContents.append(orderedSnapshots[extra].source)
+                extra = extra + 1
+            }
+        }
         bootstrapLlvmBitcodePath = enclosingBitcodePath
         bootstrapLlvmFastInlineThreshold = enclosingInlineThreshold
         bootstrapLlvmHoldModule = enclosingHoldModule
@@ -4380,6 +4471,9 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             "error[E_NATIVE_TOOLCHAIN]: native toolchain failed with status $status\n"
         )
     }
+    bootstrapFloatFormattingRequested = enclosingFloatFormatting
+    bootstrapFloatBridgeProbe = enclosingFloatProbe
+    bootstrapFloatBridgeAvailable = enclosingFloatAvailable
     BootstrapNativeBuild(
         status,
         paths,
@@ -4534,19 +4628,39 @@ class BootstrapRunIr(
 )
 
 fun bootstrapPrepareRun(sourcePath: string, hold: bool = false): BootstrapRunIr {
+    val enclosingFloatFormatting = bootstrapFloatFormattingRequested
+    val enclosingFloatProbe = bootstrapFloatBridgeProbe
+    val enclosingFloatAvailable = bootstrapFloatBridgeAvailable
     bootstrapBeginCompileOutputs()
     val llvmPath = "build/.abla-run-${linuxProcessId()}.ll"
     val graph = bootstrapLoadHostModuleGraph(sourcePath)
-    val parsed = graph.parse()
-    val sourcePaths: array<string> = []
-    for (snapshot in graph.orderedSnapshots) sourcePaths.append(snapshot.path)
-    sourcePaths.append(bootstrapRootManifestPath(sourcePath).text)
+    var parsed = graph.parse()
+    val baseSnapshots = graph.orderedSnapshots.size
     val enclosingHold = bootstrapLlvmHoldModule
     bootstrapLlvmHoldModule = hold
     val irCache = bootstrapIrTransientState()
-    val compilation = bootstrapCompileLlvmParsedCached(parsed, irCache, llvmDefaultTargetTriple(),
+    bootstrapFloatBridgeProbe = true
+    var compilation = bootstrapCompileLlvmParsedCached(parsed, irCache, llvmDefaultTargetTriple(),
         true)
+    bootstrapFloatBridgeProbe = false
+    if (compilation.floatBridgeNeeded) {
+        graph.load(bootstrapFloatBridgeSource(graph, sourcePath))
+        bootstrapFloatBridgeAvailable = true
+        bootstrapFloatFormattingRequested = true
+        parsed = graph.parse()
+        compilation = bootstrapCompileLlvmParsedCached(parsed, irCache, llvmDefaultTargetTriple(),
+            true)
+        var extra = baseSnapshots
+        while (extra < graph.orderedSnapshots.size) {
+            compilation.compileInputPaths.append(graph.orderedSnapshots[extra].path)
+            compilation.compileInputContents.append(graph.orderedSnapshots[extra].source)
+            extra = extra + 1
+        }
+    }
     bootstrapLlvmHoldModule = enclosingHold
+    val sourcePaths: array<string> = []
+    for (snapshot in graph.orderedSnapshots) sourcePaths.append(snapshot.path)
+    sourcePaths.append(bootstrapRootManifestPath(sourcePath).text)
     val cacheable = bootstrapGraphCompileCapabilitiesCacheable(graph) &&
         bootstrapCompileOutputCount == 0
     val requestedPrograms = bootstrapTakeCompileProgramRequests()
@@ -4577,6 +4691,9 @@ fun bootstrapPrepareRun(sourcePath: string, hold: bool = false): BootstrapRunIr 
             "LLVM compilation failed: ${compilation.parserErrors} parser, ${compilation.extensionErrors} extension, ${compilation.semanticErrors} semantic, ${compilation.irErrors} IR, ${compilation.errors} total error(s)\n"
         )
     }
+    bootstrapFloatFormattingRequested = enclosingFloatFormatting
+    bootstrapFloatBridgeProbe = enclosingFloatProbe
+    bootstrapFloatBridgeAvailable = enclosingFloatAvailable
     BootstrapRunIr(
         status, llvmPath, compilation.linkHost, sourcePaths, cacheable,
         compilation.compileInputPaths, compilation.compileInputContents
