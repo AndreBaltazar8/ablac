@@ -170,7 +170,30 @@ def queries():
  assert legacy.rpc('query/hover',params)['error']['code']=='method_not_found';legacy.close()
 
 
-for test in [simple,alias_private,generic_fields,no_eval,strict,symlinks,negative_protocol,packages,contract_surface,disk_revision,queries]:
+def projections():
+ p=fixture('projections',{'main.ab':'// café 😀\nimport "dep.ab"\nfun main: int = answer()\n','dep.ab':'fun answer: int = 42\n'})
+ s=Session(p);full=s.analyze()
+ for fields in [[],['diagnostics','symbols'],['occurrences'],['symbols','occurrences','diagnostics']]:
+  result=s.rpc('analyze',{'fields':fields})['result']
+  assert result['fields']==fields
+  assert {k:v for k,v in result.items() if k not in ['fields','documents']}=={k:v for k,v in full.items() if k!='documents'}
+  for original,projected in zip(full['documents'],result['documents'],strict=True):
+   assert projected=={k:v for k,v in original.items() if k in ['uri','version','text']+fields},(fields,projected)
+ # Projection does not poison the full internal cache or subsequent full export.
+ assert s.analyze()==full
+ main=doc(full,p/'main.ab');target=occurrence(main,'answer')[0]
+ result=s.rpc('query/definition',{'uri':(p/'main.ab').as_uri(),'offset':target['range']['start'],'revision':full['revision']})['result']
+ assert result['value']['uri']==(p/'dep.ab').as_uri(),result
+ for fields in [None,'symbols',['unknown'],['symbols','symbols'],[1]]:
+  result=s.rpc('analyze',{'fields':fields});assert result['error']['code']=='invalid_params',result
+ s.close()
+ p=fixture('projection-ct',{'main.ab':'val pending = #42\nfun main: int = pending\n'})
+ s=Session(p);a=s.analyze();b=s.rpc('analyze',{'fields':['diagnostics','symbols']})['result']
+ assert b['pending']==a['pending'] and b['complete'] is False and b['pending']
+ s.close()
+
+
+for test in [simple,alias_private,generic_fields,no_eval,strict,symlinks,negative_protocol,packages,contract_surface,disk_revision,queries,projections]:
  if os.environ.get('ANALYSIS_TEST_FILTER') and test.__name__ not in os.environ['ANALYSIS_TEST_FILTER'].split(','):continue
  test();print('ok',test.__name__,flush=True)
 print('analysis graph: protocol fixtures passed',flush=True)

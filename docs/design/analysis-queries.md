@@ -3,6 +3,8 @@
 This extends [graph-v1](analysis-graph.md), without changing default protocol-1
 requests or snapshot bytes. The separate abla-lsp project has not been updated.
 Clients opt in with `analysisMode: "graph-v1"` and check `analysis-queries-v1`.
+The [fields projection](analysis-fields.md) lets background refreshes omit
+occurrences from the reply while retaining the complete internal query index.
 
 ## Queries
 
