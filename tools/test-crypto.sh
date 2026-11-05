@@ -30,7 +30,8 @@ for program in vectors edge tool; do
         > "$out/$program.build.log" 2>&1 || { cat "$out/$program.build.log"; exit 2; }
 done
 tool=$out/tool
-"$compiler" build tests/cases/rsa-keygen/generate.ab -o "$out/generate-rsa" --fast --no-cache \
+# This helper generates interop keys; the dedicated keygen test still covers --fast.
+ABLA_TEST_FAST_BUILDS=0 "$compiler" build tests/cases/rsa-keygen/generate.ab -o "$out/generate-rsa" --o1 --no-cache \
     > "$out/generate-rsa.build.log" 2>&1 || { cat "$out/generate-rsa.build.log"; exit 2; }
 
 # --- Vectors ---------------------------------------------------------------------

@@ -50,7 +50,8 @@ fi
 
 # --- Keys, refusals ------------------------------------------------------------------------
 keys=$out/keys
-"$compiler" build tests/cases/rsa-keygen/generate.ab -o "$out/generate-rsa" --fast --no-cache \
+# This helper generates interop keys; the dedicated keygen test still covers --fast.
+ABLA_TEST_FAST_BUILDS=0 "$compiler" build tests/cases/rsa-keygen/generate.ab -o "$out/generate-rsa" --o1 --no-cache \
     > "$out/generate-rsa.build.log" 2>&1 || { cat "$out/generate-rsa.build.log"; exit 2; }
 {
     cp tests/vectors/crypto/test-keys/legacy-rsa-1024.pem "$keys/k1024.pem"
