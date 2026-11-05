@@ -59,6 +59,13 @@ export import "../evm/entry.ab"
 fun passedValue(): int = 1
 T
 ln -s /etc "$chain/src/outside"
+# The checkout's size limit counts a link as itself: neither a directory over
+# the limit outside the checkout (a sparse file, so nothing is written) nor a
+# cycle is walked.
+mkdir -p "$test_root/large"
+truncate -s 200M "$test_root/large/sparse"
+ln -s "$test_root/large" "$chain/src/large"
+ln -s . "$chain/src/cycle"
 commit "$chain"
 
 # github() goes to these two.

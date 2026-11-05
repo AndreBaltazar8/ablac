@@ -89,6 +89,7 @@ fun main {
 | `homePath()` | a `Path?`: nonempty `HOME`, then on Linux the effective uid's home in `/etc/passwd`, or `null` |
 | `p.child(name)`, `p.parent()`, `p.name()`, `p.extension()`, `p.text` | path arithmetic |
 | `p.exists()`, `p.info()`, `p.revision()`, `p.isSymbolicLink()` | metadata. `FileInfo` has `size`, `kind`, `revision`, `exists()`, `isFile()`, `isDirectory()`, `modifiedMilliseconds()` |
+| `p.linkInfo()` | `p.info()` without following a symbolic link: a link is `kind` 4, its `size` the length of its target |
 | `p.readText()` | the whole file as a string ("" when it can't be read) |
 | `p.readTextResult()` | a `FileReadResult`: `text`, `succeeded`, `errorCode` |
 | `p.writeText(text, mode = 0o666)` | write; creation permissions filtered by umask; `bool` success |
