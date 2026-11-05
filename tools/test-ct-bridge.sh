@@ -123,6 +123,33 @@ if grep -q '^ct-bridge: input ' "$output_directory/denied.err"; then
     exit 1
 fi
 
+# Retry remains control flow, not a new invalid-value diagnostic. The
+# loopback comparison above also checks this source's direct/bridge IR.
+"$compiler" build tests/cases/ct-bridge/retry-argument.ab --fast --no-cache \
+    -o "$output_directory/retry-argument"
+retry_status=0
+"$output_directory/retry-argument" || retry_status=$?
+[[ $retry_status == 42 ]]
+
+# Invalid native values have no earlier evaluator error. Each is rejected
+# once at dispatch, before its zero payload can become syntaxInteger(0).
+ABLA_CT_BRIDGE_RUN_FRAME=2 "$compiler" run \
+    tests/cases/ct-bridge/invalid-arguments.ab \
+    > "$output_directory/invalid-arguments.out" \
+    2> "$output_directory/invalid-arguments.err"
+cat > "$output_directory/invalid-arguments.expected" <<EOF
+function 1 0
+handle 1 0
+array 1 0
+EOF
+diff "$output_directory/invalid-arguments.expected" \
+    "$output_directory/invalid-arguments.out"
+grep -q '^ct-bridge: errors=3 ' "$output_directory/invalid-arguments.err"
+if grep -q 'while evaluating `bridge.value`' "$output_directory/invalid-arguments.err"; then
+    echo 'a bridge argument was counted again after its reported failure' >&2
+    exit 1
+fi
+
 # Literal-only actions: called from compile-time code, a generated module
 # joins the program from a transform handler, and every other use fails
 # loudly instead of doing nothing.
