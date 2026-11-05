@@ -1,0 +1,97 @@
+import "abla/serial"
+import "abla/fs"
+import "abla/process/time"
+import "abla/sys/linux"
+import "abla/sys/linux/process"
+import "abla/unsafe/memory"
+import "abla/io"
+import "abla/unsafe/native"
+
+private noescape extern:"intrinsic" fun ablaHostIsMacOS(): bool
+private trusted noescape extern:"c" fun signal(number: int, handler: i64*): i64*
+trusted fun ignoreSignal(number: i32): void { return }
+
+private trusted noescape extern:"c" fun fcntl(descriptor: i32, command: i32, argument: int): i32
+
+fun decimal(text: string): int {
+    var value = 0
+    for (byte in text) { value = value * 10 + byte - 48 }
+    value
+}
+
+fun commandByte(): int {
+    val byte = nativeByteBuffer(1)
+    var count = linuxSyscall3(0, 0, nativePointerAddress(byte.address), 1)
+    while (count == -4) count = linuxSyscall3(0, 0, nativePointerAddress(byte.address), 1)
+    val result = if (count == 1) byte.load(0) else -1
+    byte.close()
+    result
+}
+
+trusted fun main: int {
+    val mode = linuxArgument(0)
+    if (mode == "signals") signal(if (ablaHostIsMacOS()) 30 else 10,
+        nativePointerFromAddress(nativeFunctionAddress(ignoreSignal)))
+    if (mode == "leaks") {
+        var count = 0
+        while (count < 256) {
+            val rejected = serialOpen("/dev/null")
+            if (rejected.opened() || rejected.error.code != 25) return 1
+            val accepted = deviceOpen("/dev/null")
+            if (!accepted.opened() || !accepted.close() || !accepted.close()) return 1
+            count = count + 1
+        }
+        println("LEAKS pass")
+        return 42
+    }
+    val settings = SerialSettings(
+        decimal(linuxArgument(4)), decimal(linuxArgument(5)), linuxArgument(6),
+        decimal(linuxArgument(7)), linuxArgument(8) == "true", linuxArgument(9)
+    )
+    val device = if (mode == "serial") serialOpen(linuxArgument(1), settings,
+        linuxArgument(10) == "rw")
+        else deviceOpen(linuxArgument(1), linuxArgument(10) == "rw")
+    var nativeFlags = -1
+    var nativeFdFlags = -1
+    if (device.opened()) {
+        nativeFlags = int(fcntl(i32(device.descriptor), i32(3), 0))
+        nativeFdFlags = int(fcntl(i32(device.descriptor), i32(1), 0))
+    }
+    val terminal = linuxOpen("/dev/tty", 2 | 256 | 2048).descriptor
+    val controlling = terminal >= 0
+    if (terminal >= 0) linuxSyscall1(3, terminal)
+    println("READY ${device.opened()} ${device.error.code} $nativeFlags $nativeFdFlags $controlling")
+    if (!device.opened()) return 0
+    if (commandByte() != 71) return 1 // G: perform the write
+    if (mode == "blocking") {
+        val portableFlags = linuxSyscall3(72, device.descriptor, 3, 0)
+        linuxSyscall3(72, device.descriptor, 4, portableFlags & ~2048)
+    }
+    if (mode == "invalid-config") {
+        val invalid = device.configureSerial(SerialSettings(baud = 12345))
+        println("CONFIGURED ${invalid.code}")
+        if (commandByte() != 71) return 1
+    }
+    val contents = Path(linuxArgument(2)).readText()
+    if (mode == "signals") {
+        println("WRITING ready")
+        if (commandByte() != 71) return 1
+    }
+    val started = monotonicMilliseconds()
+    val result = device.writeUntil(contents, started + decimal(linuxArgument(3)))
+    println("RESULT ${result.state} ${result.written} ${result.error.code} ${monotonicMilliseconds() - started}")
+    val action = commandByte()
+    if (action == 82) { // R: resume exactly the not-yet-accepted tail
+        val resumed = device.writeWithin(contents.slice(result.written, contents.size), 3000)
+        println("RESUMED ${resumed.state} ${resumed.written} ${resumed.error.code}")
+        if (commandByte() != 67) return 1
+    } else if (action != 67) return 1
+    val descriptor = device.descriptor
+    val firstClose = device.close()
+    val secondClose = device.close()
+    val after = device.writeWithin("x", 100)
+    val closed = linuxSyscall3(72, descriptor, 1, 0) // F_GETFD must now be EBADF.
+    val configuredClosed = device.configureSerial(SerialSettings())
+    println("CLOSED $firstClose $secondClose ${device.opened()} ${after.state} ${after.written} ${after.error.code} $closed ${configuredClosed.code}")
+    0
+}

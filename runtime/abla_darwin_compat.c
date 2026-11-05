@@ -58,6 +58,11 @@ static int linux_errno(int value) {
   switch (value) {
   case EAGAIN:
     return 11;
+  case ENOTSUP:
+#if EOPNOTSUPP != ENOTSUP
+  case EOPNOTSUPP:
+#endif
+    return 95;
   case EINPROGRESS:
     return 115;
   case EALREADY:
@@ -102,12 +107,28 @@ static int darwin_open_flags(int64_t flags) {
     result |= O_TRUNC;
   if ((flags & 1024) != 0)
     result |= O_APPEND;
+  if ((flags & 256) != 0)
+    result |= O_NOCTTY;
   if ((flags & 2048) != 0)
     result |= O_NONBLOCK;
   if ((flags & 65536) != 0)
     result |= O_DIRECTORY;
   if ((flags & 524288) != 0)
     result |= O_CLOEXEC;
+  return result;
+}
+
+// F_GETFL returns native status bits; callers of the stable syscall surface
+// must see the Linux bits that F_SETFL/open accept.
+static int linux_open_flags(int flags) {
+  int result = flags & O_ACCMODE;
+  if (flags & O_CREAT) result |= 64;
+  if (flags & O_EXCL) result |= 128;
+  if (flags & O_NOCTTY) result |= 256;
+  if (flags & O_TRUNC) result |= 512;
+  if (flags & O_APPEND) result |= 1024;
+  if (flags & O_NONBLOCK) result |= 2048;
+  if (flags & O_DIRECTORY) result |= 65536;
   return result;
 }
 
@@ -150,7 +171,70 @@ static int darwin_message_flags(int64_t flags) {
   return (int)(flags & ~INT64_C(16384));
 }
 
+// Private abla/serial request. Keep SDK layouts and errno entirely inside
+// the native adapter; the public library sees only six integer settings.
+static long darwin_serial_configure(int descriptor, const int64_t *settings) {
+  if (settings == NULL) { errno = EINVAL; return -1; }
+  const int64_t baud = settings[0];
+  switch (baud) {
+  case 50: case 75: case 110: case 134: case 150: case 200:
+  case 300: case 600: case 1200: case 1800: case 2400: case 4800:
+  case 9600: case 19200: case 38400: case 57600: case 115200: case 230400:
+    break;
+  default: errno = EINVAL; return -1;
+  }
+  if (settings[1] < 5 || settings[1] > 8 || settings[2] < 0 || settings[2] > 2 ||
+      (settings[3] != 1 && settings[3] != 2) ||
+      (settings[4] != 0 && settings[4] != 1) ||
+      (settings[5] != 0 && settings[5] != 1)) {
+    errno = EINVAL;
+    return -1;
+  }
+  struct termios desired;
+  if (tcgetattr(descriptor, &desired) != 0) return -1;
+  const int raw = settings[4] != 0;
+  if (raw) {
+    cfmakeraw(&desired);
+    desired.c_cc[VMIN] = 1;
+    desired.c_cc[VTIME] = 0;
+  }
+  const tcflag_t flow = CRTSCTS | CDTR_IFLOW | CDSR_OFLOW | CCAR_OFLOW;
+  const tcflag_t controlled = CSIZE | CSTOPB | PARENB | PARODD | CLOCAL | CREAD | flow;
+  desired.c_cflag &= ~controlled;
+  switch (settings[1]) {
+  case 5: desired.c_cflag |= CS5; break;
+  case 6: desired.c_cflag |= CS6; break;
+  case 7: desired.c_cflag |= CS7; break;
+  case 8: desired.c_cflag |= CS8; break;
+  }
+  desired.c_cflag |= CLOCAL | CREAD;
+  if (settings[2] != 0) desired.c_cflag |= PARENB;
+  if (settings[2] == 2) desired.c_cflag |= PARODD;
+  if (settings[3] == 2) desired.c_cflag |= CSTOPB;
+  if (settings[5] != 0) desired.c_cflag |= CRTSCTS;
+  desired.c_iflag &= ~(IXON | IXOFF | IXANY);
+  if (cfsetispeed(&desired, (speed_t)baud) != 0 ||
+      cfsetospeed(&desired, (speed_t)baud) != 0 ||
+      tcsetattr(descriptor, TCSANOW, &desired) != 0) return -1;
+  struct termios actual;
+  if (tcgetattr(descriptor, &actual) != 0) return -1;
+  tcflag_t input = IXON | IXOFF | IXANY;
+  if (raw) input |= IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL;
+  if ((actual.c_cflag & controlled) != (desired.c_cflag & controlled) ||
+      cfgetispeed(&actual) != (speed_t)baud || cfgetospeed(&actual) != (speed_t)baud ||
+      (actual.c_iflag & input) != (desired.c_iflag & input) ||
+      (raw && (((actual.c_oflag ^ desired.c_oflag) & OPOST) != 0 ||
+               ((actual.c_lflag ^ desired.c_lflag) & (ECHO | ECHONL | ICANON | ISIG | IEXTEN)) != 0 ||
+               actual.c_cc[VMIN] != 1 || actual.c_cc[VTIME] != 0))) {
+    errno = ENOTSUP;
+    return -1;
+  }
+  return 0;
+}
+
 static long darwin_ioctl(int descriptor, int64_t request, void *argument) {
+  if (request == INT64_C(0x41424c53))
+    return darwin_serial_configure(descriptor, (const int64_t *)argument);
   if (request == 21505) {
     struct termios attributes;
     const int result = tcgetattr(descriptor, &attributes);
@@ -710,6 +794,19 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
   case 3:
     result = darwin_close((int)argument0);
     break;
+  case 5: {
+    struct stat information;
+    result = fstat((int)argument0, &information);
+    if (result == 0) {
+      unsigned char *output = (unsigned char *)(uintptr_t)argument1;
+      memset(output, 0, 144);
+      store_u32(output, 24, (uint32_t)information.st_mode);
+      store_i64(output, 48, (int64_t)information.st_size);
+      store_i64(output, 88, (int64_t)information.st_mtimespec.tv_sec);
+      store_i64(output, 96, (int64_t)information.st_mtimespec.tv_nsec);
+    }
+    break;
+  }
   case 7:
     result = poll((struct pollfd *)(uintptr_t)argument0, (nfds_t)argument1,
                   (int)argument2);
@@ -883,6 +980,8 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     result = fcntl((int)argument0, (int)argument1,
                    argument1 == F_SETFL ? darwin_open_flags(argument2)
                                         : (int)argument2);
+    if (result >= 0 && argument1 == F_GETFL)
+      result = linux_open_flags((int)result);
     break;
   case 73:
     result = flock((int)argument0, (int)argument1);

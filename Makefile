@@ -267,6 +267,7 @@ test-serial: ablac
 	tools/test-compile-time-cell-capture.sh $(COMPILER)
 	tools/test-hosted-network.sh $(COMPILER)
 	tools/test-unix-stream.sh $(COMPILER)
+	tools/test-device-serial.sh $(COMPILER)
 	tools/test-uuid.sh $(COMPILER)
 	tools/test-native-platform-boundary.sh $(COMPILER)
 	tools/test-math-no-libm.sh $(COMPILER)

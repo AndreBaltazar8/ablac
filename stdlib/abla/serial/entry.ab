@@ -1,0 +1,147 @@
+// Native serial configuration over the character-device stream API.
+export import "abla/device"
+import "abla/sys/linux"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+private noescape extern:"intrinsic" fun ablaHostIsMacOS(): bool
+
+class SerialSettings(
+    val baud: int = 9600,
+    val dataBits: int = 8,
+    val parity: string = "none",
+    val stopBits: int = 1,
+    val raw: bool = true,
+    val flowControl: string = "none"
+)
+
+private fun serialBaudCode(baud: int): int = when (baud) {
+    50 -> 1
+    75 -> 2
+    110 -> 3
+    134 -> 4
+    150 -> 5
+    200 -> 6
+    300 -> 7
+    600 -> 8
+    1200 -> 9
+    1800 -> 10
+    2400 -> 11
+    4800 -> 12
+    9600 -> 13
+    19200 -> 14
+    38400 -> 15
+    57600 -> 4097
+    115200 -> 4098
+    230400 -> 4099
+    else -> -1
+}
+
+fun SerialSettings.isValid(): bool = serialBaudCode(this.baud) >= 0 &&
+    this.dataBits >= 5 && this.dataBits <= 8 &&
+    (this.parity == "none" || this.parity == "even" || this.parity == "odd") &&
+    (this.stopBits == 1 || this.stopBits == 2) &&
+    (this.flowControl == "none" || this.flowControl == "rts-cts")
+
+private fun serialLoadU32(buffer: NativeByteBuffer, offset: int): int =
+    buffer.load(offset) | (buffer.load(offset + 1) << 8) |
+    (buffer.load(offset + 2) << 16) | (buffer.load(offset + 3) << 24)
+
+private fun serialStoreU32(var buffer: NativeByteBuffer, offset: int, value: int): void {
+    buffer.store(offset, value)
+    buffer.store(offset + 1, value >> 8)
+    buffer.store(offset + 2, value >> 16)
+    buffer.store(offset + 3, value >> 24)
+    return
+}
+
+private fun serialConfigureLinux(descriptor: int, settings: SerialSettings): NetworkError {
+    val attributes = nativeByteBuffer(36) // Linux kernel termios, not libc's layout.
+    var status = linuxSyscall3(16, descriptor, 21505, nativePointerAddress(attributes.address))
+    if (status == 0) {
+        var input = serialLoadU32(attributes, 0)
+        var output = serialLoadU32(attributes, 4)
+        var control = serialLoadU32(attributes, 8)
+        var local = serialLoadU32(attributes, 12)
+        if (settings.raw) {
+            input = input & ~(1 | 2 | 8 | 32 | 64 | 128 | 256)
+            output = output & ~1
+            local = local & ~(1 | 2 | 8 | 64 | 32768)
+            attributes.store(23, 1) // VMIN
+            attributes.store(22, 0) // VTIME
+        }
+        input = input & ~(1024 | 2048 | 4096) // no XON/XOFF/IXANY
+        control = control & ~(0x100f | 0x100f0000 | 48 | 64 | 256 | 512 | 0x40000000 | 0x80000000)
+        control = control | serialBaudCode(settings.baud) | ((settings.dataBits - 5) << 4) | 128 |
+            2048
+        if (settings.stopBits == 2) control = control | 64
+        if (settings.parity != "none") control = control | 256
+        if (settings.parity == "odd") control = control | 512
+        if (settings.flowControl == "rts-cts") control = control | 0x80000000
+        serialStoreU32(attributes, 0, input)
+        serialStoreU32(attributes, 4, output)
+        serialStoreU32(attributes, 8, control)
+        serialStoreU32(attributes, 12, local)
+        status = linuxSyscall3(16, descriptor, 21506, nativePointerAddress(attributes.address))
+        if (status == 0) {
+            status = linuxSyscall3(16, descriptor, 21505, nativePointerAddress(attributes.address))
+            if (status == 0) {
+                val actual = serialLoadU32(attributes, 8)
+                val controlMask = 48 | 64 | 128 | 256 | 512 | 2048 | 0x40000000 | 0x80000000
+                val inputBaud = (actual >> 16) & 0x100f
+                var inputMask = 1024 | 2048 | 4096
+                if (settings.raw) inputMask = inputMask | 1 | 2 | 8 | 32 | 64 | 128 | 256
+                var matches = (actual & controlMask) == (control & controlMask) &&
+                    (actual & 0x100f) == serialBaudCode(settings.baud) &&
+                    (inputBaud == 0 || inputBaud == serialBaudCode(settings.baud)) &&
+                    (serialLoadU32(attributes, 0) & inputMask) == (input & inputMask)
+                if (settings.raw) matches = matches && (serialLoadU32(attributes, 4) & 1) == 0 &&
+                    (serialLoadU32(attributes, 12) & (1 | 2 | 8 | 64 | 32768)) == 0 &&
+                    attributes.load(23) == 1 && attributes.load(22) == 0
+                if (!matches) status = -95 // accepted but not implemented by this tty
+            }
+        }
+    }
+    attributes.close()
+    networkError(if (status < 0) -status else 0, "configure-serial")
+}
+
+private fun serialConfigureDarwin(descriptor: int, settings: SerialSettings): NetworkError {
+    if (!ablaHostIsMacOS()) return networkError(38, "configure-serial")
+    // Private Darwin-adapter request: six i64 words, independent of the SDK's
+    // termios layout. The adapter captures errno before returning to Abla.
+    val request = nativeByteBuffer(48)
+    request.storeI64(0, settings.baud)
+    request.storeI64(8, settings.dataBits)
+    request.storeI64(16,
+        if (settings.parity == "even") 1 else if (settings.parity == "odd") 2 else 0)
+    request.storeI64(24, settings.stopBits)
+    request.storeI64(32, if (settings.raw) 1 else 0)
+    request.storeI64(40, if (settings.flowControl == "rts-cts") 1 else 0)
+    val status = linuxSyscall3(16, descriptor, 0x41424c53, nativePointerAddress(request.address))
+    request.close()
+    networkError(if (status < 0) -status else 0, "configure-serial")
+}
+
+fun DeviceConnection.configureSerial(settings: SerialSettings): NetworkError {
+    if (!this.opened()) return networkError(9, "configure-serial")
+    if (!settings.isValid()) return networkError(22, "configure-serial")
+    if (ablaHostIsMacOS()) serialConfigureDarwin(this.descriptor, settings)
+    else serialConfigureLinux(this.descriptor, settings)
+}
+
+fun serialOpen(
+    path: string,
+    settings: SerialSettings = SerialSettings(),
+    readWrite: bool = false
+): DeviceConnection {
+    if (!settings.isValid()) return DeviceConnection(-1, networkError(22, "configure-serial"))
+    val connection = deviceOpen(path, readWrite)
+    if (!connection.opened()) return connection
+    val error = connection.configureSerial(settings)
+    if (error.present()) {
+        connection.close()
+        return DeviceConnection(-1, error)
+    }
+    connection
+}

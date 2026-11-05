@@ -65,6 +65,7 @@ expect_status_42 "$output_directory/unix-stream"
     --fast -o "$output_directory/uuid"
 expect_status_42 "$output_directory/uuid"
 
+"$project_root/tools/test-device-serial.sh" "$compiler"
 "$project_root/tools/test-path-file-mode.sh" "$compiler"
 "$project_root/tools/test-tls-unix.sh" "$compiler"
 

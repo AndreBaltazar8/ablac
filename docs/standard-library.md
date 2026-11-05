@@ -63,6 +63,8 @@ Built into the language rather than imported: `string`, arrays, `Map`,
 | `abla/memory` | heap limit, collection mode, `memoryCollect()`, live-byte statistics |
 | `abla/json` | [bounded JSON parsing, deterministic serialization, and `$json` literals](json.md) |
 | `abla/html` | HTML data model and the `$html` subparser |
+| `abla/device` | [native character-device streams with deadline-bounded binary writes](stdlib/serial.md) |
+| `abla/serial` | [baud, framing, raw mode and RTS/CTS configuration](stdlib/serial.md) |
 | `abla/net` | affine dual-stack TCP/UDP sockets, structured I/O results, deadlines, and epoll readiness on raw Linux |
 | `abla/net/contracts` | transport-neutral network outcome types |
 | `abla/net/hosted` | DNS-capable dual-stack TCP/UDP plus epoll on Linux and kqueue on macOS |

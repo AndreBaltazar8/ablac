@@ -1,0 +1,116 @@
+// Native character-device streams. Linux syscalls are translated by the
+// Darwin adapter; WebAssembly, freestanding and compile-time I/O are unsupported.
+export import "abla/net/contracts"
+import "abla/sys/linux"
+import "abla/sys/linux/process"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+resource class DeviceConnection(var descriptor: int, val error: NetworkError) {
+    fun drop(): void {
+        val previous = this.descriptor
+        this.descriptor = -1
+        if (previous >= 0) linuxSyscall1(3, previous)
+        return
+    }
+}
+
+fun DeviceConnection.opened(): bool = this.descriptor >= 0
+
+// Never retry close: an interrupted close may already have released the FD.
+fun DeviceConnection.close(): bool {
+    val previous = this.descriptor
+    this.descriptor = -1
+    previous < 0 || linuxSyscall1(3, previous) == 0
+}
+
+private fun devicePathValid(path: string): bool {
+    if (path.size == 0) return false
+    for (byte in path) { if (byte == 0) return false }
+    true
+}
+
+fun deviceOpen(path: string, readWrite: bool = false): DeviceConnection {
+    if (!devicePathValid(path)) return DeviceConnection(-1, networkError(22, "open"))
+    val access = if (readWrite) 2 else 1
+    // O_NOCTTY | O_NONBLOCK | O_CLOEXEC; do not create or truncate anything.
+    var descriptor = linuxSyscall4(
+        257, -100, nativeCStringAddress(path), access | 256 | 2048 | 524288, 0
+    )
+    if (descriptor < 0) return DeviceConnection(-1, networkError(-descriptor, "open"))
+    val status = nativeByteBuffer(144)
+    val measured = linuxSyscall2(5, descriptor, nativePointerAddress(status.address))
+    val mode = if (measured == 0) status.loadI64(24) & 4294967295 else 0
+    status.close()
+    if (measured < 0 || (mode & 0xf000) != 0x2000) {
+        linuxSyscall1(3, descriptor)
+        descriptor = -1
+        return DeviceConnection(descriptor, networkError(if (measured < 0) -measured else 22,
+            "open"))
+    }
+    DeviceConnection(descriptor, networkNoError("open"))
+}
+
+// Absolute monotonic deadline. The final POLLOUT matters for usblp: a queued
+// nonblocking transfer may otherwise be cancelled by an immediate close.
+// This is readiness, not physical UART drain or proof of printing.
+fun DeviceConnection.writeUntil(
+    contents: string,
+    deadlineMilliseconds: int
+): NetworkWriteOutcome {
+    if (!this.opened()) return NetworkWriteOutcome(0, 6, networkError(9, "write"))
+    // The owned descriptor stays nonblocking. Reject externally changed flags
+    // instead of silently doing a potentially blocking write.
+    val flags = linuxSyscall3(72, this.descriptor, 3, 0) // F_GETFL
+    if (flags < 0) return NetworkWriteOutcome(0, 6, networkError(-flags, "write"))
+    if ((flags & 2048) == 0) return NetworkWriteOutcome(0, 6, networkError(22, "write"))
+    if (contents.size == 0) return NetworkWriteOutcome(0, 1, networkNoError("write"))
+    var offset = 0
+    var writing = true
+    var result = NetworkWriteOutcome(0, 3, networkError(110, "write"))
+    val readiness = nativeByteBuffer(8)
+    while (writing) {
+        var remaining = deadlineMilliseconds - linuxMonotonicMilliseconds()
+        if (remaining <= 0) writing = false
+        else {
+            if (remaining > 2147483647) remaining = 2147483647
+            readiness.storeI64(0, this.descriptor | (4 << 32)) // POLLOUT
+            val polled = linuxSyscall3(7, nativePointerAddress(readiness.address), 1, remaining)
+            if (polled < 0 && polled != -4) {
+                result = NetworkWriteOutcome(offset, 6, networkError(-polled, "poll"))
+                writing = false
+            } else if (polled > 0 && linuxMonotonicMilliseconds() < deadlineMilliseconds) {
+                val events = (readiness.loadI64(0) >> 48) & 65535
+                if ((events & (8 | 16 | 32)) != 0) {
+                    result = NetworkWriteOutcome(offset, 6,
+                        networkError(if ((events & 32) != 0) 9 else 5, "poll"))
+                    writing = false
+                } else if ((events & 4) != 0) {
+                    if (offset == contents.size) {
+                        result = NetworkWriteOutcome(offset, 1, networkNoError("write"))
+                        writing = false
+                    } else if (linuxMonotonicMilliseconds() < deadlineMilliseconds) {
+                        val amount = linuxSyscall3(
+                            1, this.descriptor, nativeStringDataAddress(contents) + offset,
+                            contents.size - offset
+                        )
+                        if (amount > 0) offset = offset + amount
+                        else if (amount == 0 || (amount < 0 && amount != -4 && amount != -11)) {
+                            result = NetworkWriteOutcome(offset, 6,
+                                networkError(if (amount == 0) 5 else -amount, "write"))
+                            writing = false
+                        }
+                    }
+                }
+            }
+            // EINTR and EAGAIN return to the absolute deadline check. No poll
+            // or write retry can restart the original timeout.
+        }
+    }
+    readiness.close()
+    if (result.timedOut()) NetworkWriteOutcome(offset, 3, result.error) else result
+}
+
+// Relative timeout convenience; writeUntil itself takes an absolute deadline.
+fun DeviceConnection.writeWithin(contents: string, timeoutMilliseconds: int): NetworkWriteOutcome =
+    this.writeUntil(contents, linuxMonotonicMilliseconds() + timeoutMilliseconds)
