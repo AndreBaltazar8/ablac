@@ -32,6 +32,19 @@ def write_json(path, value):
     Path(path).write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 
+def toolchain_stores(environment):
+    # mkShell puts its unrealized `out` in NIX_LDFLAGS. Keep that text in the
+    # provenance, but query closures of actual tool/crypto roots, not shell out.
+    stores = set()
+    for line in environment.splitlines():
+        value = line.split("=", 1)[1] if line.startswith(("llvm_tools=", "openssl=")) else line
+        if value.startswith("/nix/store/"):
+            stores.add("/".join(value.split("/")[:4]))
+    if not stores:
+        raise ValueError("missing pinned Nix toolchain paths")
+    return sorted(stores)
+
+
 def same(left, right):
     """Exact comparison, with a bounded first-difference diagnostic."""
     with Path(left).open("rb") as a, Path(right).open("rb") as b:
@@ -112,16 +125,10 @@ def route(which, repo, output):
                      "--arg", "xtensa", "true", "--run", body], source, output / (label + ".log"), env, stdout)
 
         # Capture the immutable tool paths, versions and their full Nix closures.
-        shell(root, ["bash", "-c", 'printf "llvm_tools=%s\\nopenssl=%s\\nldflags=%s\\n" "$ABLA_LLVM_TOOLS" "$ABLA_LINUX_OPENSSL_LIB" "$NIX_LDFLAGS"; for tool in opt llc ld.lld clang; do command -v "$tool"; "$tool" --version | sed -n "1p"; done'],
+        shell(root, ["bash", "-c", 'printf "llvm_tools=%s\\nopenssl=%s\\nldflags=%s\\n" "$ABLA_LLVM_TOOLS" "$ABLA_LINUX_OPENSSL_LIB" "$NIX_LDFLAGS"; for tool in opt llc ld.lld clang; do command -v "$tool"; "$tool" --version | sed -n "1,2p"; done'],
               "environment", output / "environment.txt")
         environment = (output / "environment.txt").read_text()
-        stores = set()
-        for word in environment.replace("=", " ").split():
-            if word.startswith("/nix/store/"):
-                stores.add("/".join(word.split("/")[:4]))
-        if not stores:
-            raise ValueError("missing pinned Nix toolchain paths")
-        closure = subprocess.check_output(["nix-store", "--query", "--requisites", *sorted(stores)], text=True)
+        closure = subprocess.check_output(["nix-store", "--query", "--requisites", *toolchain_stores(environment)], text=True)
         (output / "closure.txt").write_text("\n".join(sorted(set(closure.splitlines()))) + "\n")
         manifest["toolchain"] = {"environment_sha256": digest(output / "environment.txt"),
                                  "closure_sha256": digest(output / "closure.txt")}

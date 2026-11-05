@@ -15,6 +15,12 @@ spec.loader.exec_module(gate)
 
 
 class ComparisonTests(unittest.TestCase):
+    def test_shell_output_is_not_a_toolchain_closure_root(self):
+        env = ("llvm_tools=/nix/store/llvm/bin\nopenssl=/nix/store/ssl/lib\n"
+               "ldflags=-rpath /nix/store/not-realized-nix-shell/lib\n"
+               "/nix/store/lld/bin/ld.lld\nLLD 23.1.3\n")
+        self.assertEqual(gate.toolchain_stores(env), ["/nix/store/lld", "/nix/store/llvm", "/nix/store/ssl"])
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
