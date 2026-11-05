@@ -23,6 +23,7 @@ mkdir -p "$output_directory"
 # Run before compiler-dependent checks so limiter failures are reported directly.
 python3 "$project_root/tests/cases/run-limited/darwin-parent-death.py" \
     "$project_root/tools/run-limited.sh"
+"$project_root/tools/test-run-limited.sh"
 
 expect_status_42() {
     set +e

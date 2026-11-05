@@ -58,9 +58,11 @@ ready.write_text(json.dumps([os.getpid(), child, os.getppid()]))
 ready.rename(path)
 time.sleep(60)
 ''')
-    for mode in ("normal", "stubborn"):
-        marker = root / mode
-        env = dict(os.environ, ABLA_MAX_SECONDS="60", ABLA_KILL_GRACE_SECONDS="1")
+    for kind, mode in (("group", "normal"), ("group", "stubborn"),
+                       ("term", "normal"), ("timeout", "stubborn")):
+        marker = root / (kind + "-" + mode)
+        env = dict(os.environ, ABLA_MAX_SECONDS="1" if kind == "timeout" else "60",
+                   ABLA_KILL_GRACE_SECONDS="1")
         proc = subprocess.Popen([runner, sys.executable, str(worker), str(marker), mode],
                                 env=env, start_new_session=True,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -71,19 +73,67 @@ time.sleep(60)
             group = os.getpgid(payload)
             assert group != proc.pid, "payload unexpectedly shares caller's group"
             assert os.getpgid(child) == group, "descendant escaped payload group"
-            os.killpg(proc.pid, signal.SIGKILL)
-            assert proc.wait(timeout=5) == -signal.SIGKILL
+            if kind == "group":
+                os.killpg(proc.pid, signal.SIGKILL)
+            elif kind == "term":
+                proc.terminate()
+            expected = {"group": -signal.SIGKILL, "term": 143, "timeout": 124}[kind]
+            assert proc.wait(timeout=10) == expected
             try:
                 wait_for(lambda: not alive(payload) and not alive(child),
-                         mode + " payload group cleanup", seconds=5)
+                         kind + " " + mode + " payload group cleanup", seconds=5)
             except AssertionError:
-                raise AssertionError(f"{mode}: payload survived caller group SIGKILL "
+                raise AssertionError(f"{kind}/{mode}: payload survived runner termination "
                                      f"(payload={payload}, child={child}, supervisor={supervisor})")
             wait_for(lambda: not alive(supervisor), "supervisor exit", seconds=5)
-            print(f"Darwin parent death: {mode} payload and descendant stopped", flush=True)
+            print(f"Darwin runner: {kind}/{mode} payload and descendant stopped", flush=True)
         finally:
             if group: kill(group, group=True)
             for pid in (payload, child, supervisor):
                 if pid: kill(pid)
             kill(proc.pid, group=True)
             proc.wait(timeout=5)
+
+    # Stop the interpreter trampoline before it can register the parent watch.
+    # Killing only the shell leaves it alive so resuming exercises the PPID
+    # check, rather than merely killing the unarmed helper with the group.
+    private_bin = root / "bin"
+    private_bin.mkdir()
+    shim = private_bin / "python3"
+    shim.write_text('#!/bin/bash\nprintf \'%s\\n\' "$$" > "$ABLA_TEST_SHIM_READY"\nkill -STOP "$$"\nexec "$ABLA_TEST_REAL_PYTHON" "$@"\n')
+    shim.chmod(0o755)
+    ready = root / "prearm-ready"
+    ran = root / "payload-ran"
+    env = dict(os.environ, PATH=str(private_bin) + os.pathsep + os.environ["PATH"],
+               ABLA_TEST_SHIM_READY=str(ready), ABLA_TEST_REAL_PYTHON=sys.executable)
+    proc = subprocess.Popen([runner, "/bin/sh", "-c", 'echo ran > "$1"', "_", str(ran)],
+                            env=env, start_new_session=True,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    trampoline = 0
+    try:
+        wait_for(lambda: ready.exists() and ready.read_text().endswith("\n"),
+                 "unarmed interpreter")
+        trampoline = int(ready.read_text())
+        def stopped():
+            result = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(trampoline)],
+                                    stdout=subprocess.PIPE, text=True, check=False)
+            return result.stdout.lstrip().startswith("T")
+        wait_for(stopped, "interpreter trampoline stopped")
+        proc.kill()
+        assert proc.wait(timeout=5) == -signal.SIGKILL
+        os.kill(trampoline, signal.SIGCONT)
+        wait_for(lambda: not alive(trampoline), "reparented supervisor exit")
+        assert not ran.exists(), "payload started after launcher died before watch registration"
+        print("Darwin parent death: pre-registration race fails closed", flush=True)
+    finally:
+        if trampoline: kill(trampoline)
+        kill(proc.pid, group=True)
+        proc.wait(timeout=5)
+
+    missing = root / "missing-python"
+    missing.mkdir()
+    (missing / "bash").symlink_to("/bin/bash")
+    result = subprocess.run([runner, "/usr/bin/true"], env=dict(os.environ, PATH=str(missing)),
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+    assert result.returncode == 127 and "requires Python 3" in result.stderr
+    print("Darwin runner: missing Python 3 diagnosed", flush=True)

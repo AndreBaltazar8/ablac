@@ -29,12 +29,17 @@ adapter/program object and runs a newly compiled child. It exercises the
 relative/absolute compiler-entry paths that exposed the private-symbol release
 regression. The native host script covers Mach-O/IO, filesystem/home, process
 pipelines/capture, Unix sockets, HTTP peer metadata, UUID and JIT paths. This is
-a targeted macOS gate, not the full Linux suite. Intel macOS, all packaging,
+a targeted macOS gate, not the full Linux suite. The development runner requires
+Python 3 on `PATH` on macOS. Its standard-library kqueue supervisor watches the
+runner shell's lifetime and stops the detached payload group even if the caller's
+whole process group is killed. Python is not added to released compiler packages.
+The host gate tests caller-group SIGKILL with both ordinary and TERM-ignoring
+descendants. Intel macOS, all packaging,
 release publication and the broader platform matrix remain in release CI.
 
 Both jobs use SHA-pinned existing actions, read-only repository permissions and
 checkout without persisted credentials. There is no `pull_request_target`,
-manual dispatch, publishing permission, secret-dependent step or paid larger
+publishing permission, secret-dependent step or paid larger
 runner. Missing Homebrew bottles fail rather than build LLVM from source. Only
 failure logs are uploaded, retained for three days; compiler IR, binaries and
 whole build directories are excluded. No new Actions cache is allocated.

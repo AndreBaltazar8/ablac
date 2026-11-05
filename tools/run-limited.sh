@@ -62,40 +62,14 @@ started=$SECONDS
 if [[ $OSTYPE == darwin* ]]; then
     ulimit -S -c 0
     ulimit -S -t "$cpu_seconds"
+    if ! command -v python3 >/dev/null 2>&1; then
+        printf '%s\n' '[abla-limit] macOS development runner requires Python 3 (python3 on PATH)' >&2
+        exit 127
+    fi
+    runner_directory=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
     set +e
-    bounded /usr/bin/perl -e \
-        'my $seconds = shift;
-         my $pid = fork();
-         exit 127 unless defined $pid;
-         if ($pid == 0) {
-             setpgrp(0, 0);
-             exec @ARGV;
-             exit 127;
-         }
-         # Stopping the runner stops what it runs: its process group (a
-         # server it started, say) would otherwise outlive it.
-         for my $signal (["TERM", 15], ["INT", 2], ["HUP", 1]) {
-             my ($name, $number) = @$signal;
-             $SIG{$name} = sub {
-                 kill $name, -$pid;
-                 waitpid($pid, 0);
-                 exit 128 + $number;
-             };
-         }
-         $SIG{ALRM} = sub {
-             kill "TERM", -$pid;
-             select undef, undef, undef, 0.1;
-             kill "KILL", -$pid;
-             waitpid($pid, 0);
-             exit 124;
-         };
-         alarm $seconds;
-         waitpid($pid, 0);
-         alarm 0;
-         my $status = $?;
-         exit 128 + ($status & 127) if $status & 127;
-         exit $status >> 8;' \
-        "$wall_seconds" "$@"
+    bounded python3 "$runner_directory/run-limited-darwin.py" \
+        "$$" "$wall_seconds" "$kill_grace_seconds" "$@"
     set -e
 else
     # Leave one CPU second between SIGXCPU and the hard SIGKILL fallback so
