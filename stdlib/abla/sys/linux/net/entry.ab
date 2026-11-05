@@ -1492,6 +1492,26 @@ fun TcpConnection.writeResult(contents: string): SocketWriteResult {
     else SocketWriteResult(written, "error", errorCode)
 }
 
+// One send that never blocks (MSG_NOSIGNAL | MSG_DONTWAIT), whatever the
+// socket's own mode: a bounded write must not wait in the kernel past its
+// deadline for a peer that stops reading.
+// It sends from `offset` in place, without copying the unsent tail.
+private fun TcpConnection.sendWithoutBlocking(contents: string, offset: int): SocketWriteResult {
+    var errorCode = if (this.descriptor >= 0) 0 else 9
+    var written = 0
+    while (errorCode == 0 && written == 0) {
+        val amount = linuxSyscall6(
+            44, this.descriptor, nativeStringDataAddress(contents) + offset,
+            contents.size - offset, 16448, 0, 0
+        )
+        if (amount > 0) written = amount
+        else if (amount == 0) errorCode = 5
+        else if (amount != -4) errorCode = -amount
+    }
+    if (errorCode == 0) SocketWriteResult(written, "written", 0)
+    else SocketWriteResult(written, "error", errorCode)
+}
+
 fun TcpConnection.writeNetwork(
     contents: string,
     timeoutMilliseconds: int,
@@ -1528,9 +1548,7 @@ fun TcpConnection.writeNetwork(
                 )
                 writing = false
             } else if (readiness.writable) {
-                val attempt = this.writeResult(
-                    contents.slice(offset, contents.size)
-                )
+                val attempt = this.sendWithoutBlocking(contents, offset)
                 offset = offset + attempt.written
                 if (attempt.failed() && attempt.errorCode != 11) {
                     result = NetworkWriteOutcome(
@@ -1546,6 +1564,9 @@ fun TcpConnection.writeNetwork(
             }
         }
     }
+    // A deadline that expires after a partial write keeps the bytes the
+    // socket already accepted, so the caller can resume or report them.
+    if (result.timedOut()) result = NetworkWriteOutcome(offset, 3, result.error)
     result
 }
 
