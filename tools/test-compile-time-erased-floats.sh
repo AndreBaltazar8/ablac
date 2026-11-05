@@ -12,6 +12,9 @@ expect=${ERASED_FLOAT_LIFT_EXPECT:-$cases/expected.txt}
 options=()
 [[ ${ERASED_FLOAT_LIFT_PROFILE:-fast} != fast ]] || options+=(--fast)
 mkdir -p "$out"
+# The wire client needs the normal compiler graph, not the representation inspector.
+# Prepare it before ABLA_STDLIB changes so other API tests share this cold build.
+program=$("$root/tools/compiler-api-test-program.py" "$compiler")
 "$root/tools/runtime-fixture.sh" "$cases/inspect.ab" "$out" >/dev/null
 export ABLA_STDLIB="$out/stdlib"
 # Inspecting representations is runtime-only: the staged code does not call
@@ -35,7 +38,6 @@ for mode in interp jit; do
     diff -u "$prefix.expected" "$prefix.stdout"
     echo "erased float lift: $mode, all cases executed; expected outcomes match"
 done
-program=$("$root/tools/compiler-api-test-program.py" "$compiler")
 ABLA_COMPILER_API_CASE=lift-wire "$program"
 echo "erased float lift: wire versions, exact kinds, static fallback and cycles"
 cat > "$out/wasm-driver.ab" <<'WASM'
