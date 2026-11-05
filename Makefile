@@ -313,6 +313,8 @@ test-serial: ablac
 	tools/test-wrapper-demand.sh $(COMPILER)
 	tools/test-structured-type-reflection.sh $(COMPILER)
 	tools/test-target-descriptors.sh $(COMPILER)
+	tools/test-ios-target.sh $(COMPILER)
+	tools/test-ios-static-library.sh $(COMPILER)
 	tools/test-text-unicode.sh $(COMPILER)
 	tools/test-json-native-paths.sh $(COMPILER)
 	tools/test-transactional-native-output.sh $(COMPILER)

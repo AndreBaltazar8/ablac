@@ -111,7 +111,8 @@ class BootstrapDefinedTarget(
     val linkerFlavor: string,
     val linkerEmulation: string,
     val hosted: bool,
-    val libcFree: bool
+    val libcFree: bool,
+    val sdk: string = ""
 )
 
 var bootstrapCompileProgramRequestCount: int = 0
@@ -569,7 +570,9 @@ fun bootstrapStageDefinedTarget(target: BootstrapDefinedTarget): bool {
         bootstrapTargetTokenValid(target.llvmTriple) &&
         bootstrapTargetTokenValid(target.objectFormat) &&
         bootstrapTargetTokenValid(target.linkerFlavor) &&
-        bootstrapTargetTokenValid(target.linkerEmulation) &&
+        (bootstrapTargetTokenValid(target.linkerEmulation) ||
+         (target.linkerFlavor == "apple-static" &&
+          target.linkerEmulation == "")) &&
         !(target.hosted && target.libcFree)
     val root = bootstrapDefinedTargetRoot()
     var index = 0
@@ -602,6 +605,7 @@ fun bootstrapStageDefinedTarget(target: BootstrapDefinedTarget): bool {
     if (valid) valid = Path("$root/$targetIndex.libc-free").writeText(
         if (target.libcFree) "1" else "0"
     )
+    if (valid) valid = Path("$root/$targetIndex.sdk").writeText(target.sdk)
     if (valid) bootstrapDefinedTargetCount = targetIndex + 1
     if (!valid) {
         Path("$root/$targetIndex.name").remove()
@@ -611,8 +615,28 @@ fun bootstrapStageDefinedTarget(target: BootstrapDefinedTarget): bool {
         Path("$root/$targetIndex.emulation").remove()
         Path("$root/$targetIndex.hosted").remove()
         Path("$root/$targetIndex.libc-free").remove()
+        Path("$root/$targetIndex.sdk").remove()
     }
     valid
+}
+
+// SDK selection is target metadata, staged with the descriptor so replayed
+// build requests use the same SDK rather than ambient host defaults.
+fun bootstrapStageDefinedTargetSdk(name: string, sdk: string): bool {
+    if (sdk != "macosx" && sdk != "iphoneos" &&
+        sdk != "iphonesimulator") return false
+    val root = bootstrapDefinedTargetRoot()
+    var index = 0
+    while (index < bootstrapDefinedTargetCount) {
+        if (Path("$root/$index.name").readText() == name) {
+            if (Path("$root/$index.format").readText() != "macho") {
+                return false
+            }
+            return Path("$root/$index.sdk").writeText(sdk)
+        }
+        index = index + 1
+    }
+    false
 }
 
 fun bootstrapTakeDefinedTargets(): array<BootstrapDefinedTarget> {
@@ -627,7 +651,8 @@ fun bootstrapTakeDefinedTargets(): array<BootstrapDefinedTarget> {
             Path("$root/$index.linker").readText(),
             Path("$root/$index.emulation").readText(),
             Path("$root/$index.hosted").readText() == "1",
-            Path("$root/$index.libc-free").readText() == "1"
+            Path("$root/$index.libc-free").readText() == "1",
+            Path("$root/$index.sdk").readText()
         ))
         Path("$root/$index.name").remove()
         Path("$root/$index.triple").remove()
@@ -636,6 +661,7 @@ fun bootstrapTakeDefinedTargets(): array<BootstrapDefinedTarget> {
         Path("$root/$index.emulation").remove()
         Path("$root/$index.hosted").remove()
         Path("$root/$index.libc-free").remove()
+        Path("$root/$index.sdk").remove()
         index = index + 1
     }
     bootstrapDefinedTargetCount = 0
@@ -5340,6 +5366,9 @@ class BootstrapEvaluator(
             }
             if (expression.text == "buildProgram") {
                 target = "compilerBuildProgram"
+            }
+            if (expression.text == "defineTargetSdk") {
+                target = "compilerDefineTargetSdk"
             }
             if (expression.text == "defineTarget") {
                 target = "compilerDefineTarget"
@@ -11116,6 +11145,21 @@ fun bootstrapEvaluateCallCompiler(
             evaluator.errors = evaluator.errors + 1
             result = bootstrapEvalBoolean(false)
         }
+    }
+    if (targetName == "compilerDefineTargetSdk") {
+        val name = evaluator.evaluate(expression.children[0])
+        val sdk = evaluator.evaluate(expression.children[1])
+        var valid = name.kind == "string" && sdk.kind == "string"
+        if (valid && !bootstrapArtifactSliceActive) {
+            valid = bootstrapStageDefinedTargetSdk(name.text, sdk.text)
+        }
+        if (!valid) {
+            bootstrapStageDriverDiagnostic(
+                "error[E_BUILD_TARGET_SDK]: defineTargetSdk requires a registered target and macosx, iphoneos or iphonesimulator\n"
+            )
+            evaluator.errors = evaluator.errors + 1
+        }
+        result = bootstrapEvalBoolean(valid)
     }
     if (targetName == "compilerDefineTarget") {
         val name = evaluator.evaluate(expression.children[0])

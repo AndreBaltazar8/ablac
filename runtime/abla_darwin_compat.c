@@ -5,6 +5,7 @@
 // layouts, or epoll, so Mach-O programs link this deliberately small adapter.
 // It returns Linux-style negative errno values and contains no Abla runtime.
 
+#include <TargetConditionals.h>
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
@@ -1011,26 +1012,46 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     break;
   }
   case 57:
+#if TARGET_OS_IOS
+    errno = ENOTSUP;
+    result = -1;
+#else
     result = fork();
+#endif
     break;
   case 59: {
+#if TARGET_OS_IOS
+    errno = ENOTSUP;
+    result = -1;
+#else
     char executable[PATH_MAX];
     const char *path =
         darwin_linux_path((const char *)(uintptr_t)argument0, executable);
     if (path != NULL)
       result = execve(path, (char *const *)(uintptr_t)argument1,
                       (char *const *)(uintptr_t)argument2);
+#endif
     break;
   }
   case 60:
   case 231:
     _exit((int)argument0);
   case 61:
+#if TARGET_OS_IOS
+    errno = ENOTSUP;
+    result = -1;
+#else
     result =
         waitpid((pid_t)argument0, (int *)(uintptr_t)argument1, (int)argument2);
+#endif
     break;
   case 62:
+#if TARGET_OS_IOS
+    errno = ENOTSUP;
+    result = -1;
+#else
     result = kill((pid_t)argument0, (int)argument1);
+#endif
     break;
   case 72:
     result = fcntl((int)argument0, (int)argument1,

@@ -48,7 +48,8 @@ class BootstrapTargetDescriptor(
     val entrySymbol: string,
     val linkerFlavor: string,
     val linkerEmulation: string,
-    val valid: bool
+    val valid: bool,
+    val sdk: string = ""
 )
 
 // Direct host LLVM emission uses the same source runtime graph as a normal
@@ -361,6 +362,16 @@ fun bootstrapHostTargetName(): string {
 fun bootstrapTargetIsHost(target: BootstrapTargetDescriptor): bool =
     target.name == bootstrapHostTargetName()
 
+fun bootstrapAppleSdkMatchesTriple(sdk: string, triple: string): bool {
+    val ios = bootstrapTextContains(triple, "-apple-ios")
+    val simulator = triple.endsWith("-simulator")
+    if (sdk == "iphoneos") return ios && !simulator
+    if (sdk == "iphonesimulator") return ios && simulator
+    sdk == "macosx" &&
+        (bootstrapTextContains(triple, "-apple-macos") ||
+         bootstrapTextContains(triple, "-apple-darwin"))
+}
+
 fun bootstrapDefinedTargetDescriptor(
     target: BootstrapDefinedTarget
 ): BootstrapTargetDescriptor = BootstrapTargetDescriptor(
@@ -384,7 +395,12 @@ fun bootstrapDefinedTargetDescriptor(
         target.linkerFlavor == "host-clang") ||
        (!target.hosted && target.linkerFlavor == "lld-elf"))) ||
      (target.objectFormat == "wasm" && !target.hosted &&
-      target.libcFree && target.linkerFlavor == "wasm-ld"))
+      target.libcFree && target.linkerFlavor == "wasm-ld") ||
+     (target.objectFormat == "macho" && !target.hosted &&
+      !target.libcFree && target.linkerFlavor == "apple-static" &&
+      target.linkerEmulation == "" &&
+      bootstrapAppleSdkMatchesTriple(target.sdk, target.llvmTriple))),
+    target.sdk
 )
 
 fun bootstrapSupportedTargets(): string =
@@ -3072,19 +3088,26 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     // their own loader/runtime contract and must not receive the Linux startup.
     val rawTarget = target.libcFree && target.entrySymbol.size > 0
     val macTarget = target.objectFormat == "macho"
+    val appleStatic = macTarget && target.linkerFlavor == "apple-static"
+    val needsDarwinAdapter = macTarget && !target.libcFree &&
+        artifact != "object"
+    val appleSdk = if (target.sdk != "") target.sdk else "macosx"
     val configuredMacClang = linuxEnvironment("ABLA_MACOS_CLANG")
     val macClang = if (configuredMacClang.found &&
         configuredMacClang.value != "") configuredMacClang.value
         else "clang"
     var macSdkRoot = ""
-    if (macTarget && target.hosted) {
-        val configuredSdk = linuxEnvironment("ABLA_MACOS_SDK")
+    if (needsDarwinAdapter) {
+        val sdkVariable = if (appleSdk == "macosx") "ABLA_MACOS_SDK"
+            else if (appleSdk == "iphoneos") "ABLA_APPLE_SDK_IPHONEOS"
+            else "ABLA_APPLE_SDK_IPHONESIMULATOR"
+        val configuredSdk = linuxEnvironment(sdkVariable)
         if (configuredSdk.found && configuredSdk.value != "") {
             macSdkRoot = configuredSdk.value
         } else if (ablaHostIsMacOS()) {
             val discoverSdk = linuxCommand("xcrun")
             discoverSdk.argument("--sdk")
-            discoverSdk.argument("macosx")
+            discoverSdk.argument(appleSdk)
             discoverSdk.argument("--show-sdk-path")
             macSdkRoot = discoverSdk.captureText()
         }
@@ -3220,8 +3243,10 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     val optimizedWasmPath = "$outputPath.wasm-opt.tmp.${linuxProcessId()}"
     val manifestPath = rootManifestPath
     val manifest = manifestPath.readText()
-    val targetIdentity =
+    val baseTargetIdentity =
         "${target.name}:${target.llvmTriple}:${target.objectFormat}:${target.hosted}:${target.libcFree}:${target.entrySymbol}:${target.linkerFlavor}:${target.linkerEmulation}"
+    val targetIdentity = if (target.sdk == "") baseTargetIdentity
+        else "$baseTargetIdentity:sdk=${target.sdk}"
     // Cache identity needs stable content identity, not a materialized copy of
     // every imported source. Module snapshots already carry two independent
     // content fingerprints plus size and canonical path.
@@ -3818,17 +3843,19 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         status = 160
         failureKind = "reported"
     }
-    if (status == 0 && macTarget && macSdkRoot == "") {
-        linuxPrintStandardError(
+    if (status == 0 && needsDarwinAdapter && macSdkRoot == "") {
+        if (appleSdk == "macosx") linuxPrintStandardError(
             "error[E_MACOS_SDK]: set ABLA_MACOS_SDK to a macOS SDK when building Mach-O artifacts away from macOS\n"
+        ) else linuxPrintStandardError(
+            "error[E_APPLE_SDK]: no $appleSdk SDK; set ABLA_APPLE_SDK_IPHONEOS or ABLA_APPLE_SDK_IPHONESIMULATOR for iOS archives\n"
         )
         status = 159
         failureKind = "reported"
     }
-    if (status == 0 && macTarget) {
+    if (status == 0 && needsDarwinAdapter) {
         val adapterSource =
             Path(bootstrapRuntimeRoot()).child("abla_darwin_compat.c").text
-        // Every Mach-O build links the same adapter: with the cache on, its object
+        // Linked Mach-O builds use the same adapter: with the cache on, its object
         // is compiled once per adapter source, clang, SDK and target and reused.
         // (The source is part of the key, so a local adapter change is never hidden.)
         var adapterCache = ""
@@ -4047,6 +4074,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         archive.argument("rcs")
         archive.argument(publishPath)
         archive.argument(objectPath)
+        if (appleStatic) archive.argument(hostPath)
         status = archive.run()
     }
     if (status == 0 && target.hosted && artifact == "shared-library") {
