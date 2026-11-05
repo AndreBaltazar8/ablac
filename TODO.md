@@ -66,12 +66,6 @@
   lift emission, with explicit interp/JIT and hostless Wasm bit-level tests.
   A demand-driven formatter and its end-to-end native/compile-time/Wasm tests
   remain phase (c)'s work; bit preservation does not make formatting correct.
-  Separate pre-existing developer-codec issue: `ABLA_COMPILE_EVAL=jit
-  ABLA_LIFT_CODEC_CHECK=1` loses positional capture bindings when a native
-  closure is serialized through the ordinary lift codec. Repro: a staged
-  function returning `{ -> value }` after `val value: any = 1.5`; lifting the
-  result reports that `value` was not bound. Normal native closure lifting
-  works; the codec must preserve its positional mode and capture layout.
   Equality and hashing through `any` currently ignore the auxiliary word, so
   a boxed float and an integer with identical payload bits compare equal and
   hash alike through `any`; deciding whether to change that is a separate language issue.

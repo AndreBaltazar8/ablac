@@ -185,6 +185,7 @@ test-serial: ablac
 	tools/test-region-escape-operators.sh $(COMPILER)
 	tools/test-diagnostic-noise.sh $(COMPILER)
 	tools/test-compile-time-lift.sh $(COMPILER)
+	tools/test-lift-codec-closures.sh $(COMPILER)
 	tools/test-compile-time-erased-floats.sh $(COMPILER)
 	tools/test-compile-time-diagnostics.sh $(COMPILER)
 	PARITY_SET=probes PARITY_OUTPUT=$(BUILD_DIR)/compile-time-parity-probes tools/test-compile-time-parity.sh $(COMPILER)

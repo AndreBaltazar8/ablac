@@ -18,3 +18,8 @@ The staged computations do not call the inspectors.
 Run `tools/test-compile-time-erased-floats.sh <compiler>` in the Nix shell.
 `ERASED_FLOAT_LIFT_PROFILE=release` also checks optimized code generation.
 `ERASED_FLOAT_LIFT_EXPECT` overrides the expectation file for negative controls.
+
+`ABLA_LIFT_CODEC_CHECK=1` also runs the same cases through the ordinary value
+codec, including native positional captures. `tools/test-lift-codec-closures.sh`
+adds shared variables, graph aliases, recursive and consuming closures; it
+requires identical IR with the codec flag enabled and disabled in both tiers.

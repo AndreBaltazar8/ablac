@@ -114,10 +114,12 @@ Native build cache entries advance to v17 and run records to v5, and the run
 identity includes the wire version. Old or missing native wire headers are
 rejected. The ordinary evaluator/kept-value codec already has explicit float
 records and keeps its format. No formatter, equality, hash, or public ABI change
-is included in this phase. The existing developer-only
-`ABLA_LIFT_CODEC_CHECK=1` round-trip of a native positional closure loses its
-capture layout (also reproduced before phase (d)); that codec issue is recorded
-separately in TODO.md and is not included in the passing native-closure claim.
+is included in this phase. For the developer-only
+`ABLA_LIFT_CODEC_CHECK=1` round trip, native positional captures are materialized
+as named typed bindings using the existing validation-only layout probe and
+native retyper. A graph copy preserves aliases and cycles without rewriting the original
+closure; the native raw-to-typed memo retains shared identities as captures are typed. The ordinary codec format stays unchanged; normal
+unflagged lifting retains its existing path.
 
 `tools/test-compile-time-erased-floats.sh` exercises both tiers without allowing
 native JIT fallback, plus exact bits, integer lookalikes, nested/dense erased

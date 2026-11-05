@@ -113,8 +113,19 @@ fun bootstrapLiftEmitResult(
     // compile globals are stored in (and back), so the suite checks it.
     val check = linuxEnvironment("ABLA_LIFT_CODEC_CHECK")
     if (check.found && check.value == "1") {
+        val memo = evaluated.liftMemo
+        var nativeState = if (memo != null) BootstrapLiftState(
+            evaluated.syntax, [], [], [], 0,
+            BootstrapLiftRetyper(lowerer.declarations, evaluated.syntax, memo, "")
+        ) else bootstrapLiftState(evaluated.syntax, lowerer.declarations)
+        val seen: array<BootstrapEvalValue> = []
+        val copies: array<BootstrapEvalValue> = []
+        val named = bootstrapLiftCodecBindings(lowerer, nativeState, evaluated.value, seen, copies)
+        if (nativeState.retyper.problem != "") return bootstrapLiftFail(
+            lowerer, nativeState, nativeState.retyper.problem
+        )
         val encoded = bootstrapLiftEncode(
-            evaluated.value, evaluated.syntax, lowerer.declarations
+            named, evaluated.syntax, lowerer.declarations
         )
         if (encoded.problem == "") {
             val syntax: array<BootstrapExpression> = []
@@ -133,6 +144,7 @@ fun bootstrapLiftEmitResult(
             }
             return bootstrapLiftEmit(lowerer, state, decoded.value, type)
         }
+        return bootstrapLiftFail(lowerer, nativeState, "lift codec could not encode the value: ${encoded.problem}")
     }
     val memo = evaluated.liftMemo
     var state = if (memo != null) BootstrapLiftState(
@@ -538,6 +550,67 @@ fun bootstrapLiftLambdaLayoutOf(
     probe.targets.clear()
     probe.layouts.clear()
     result
+}
+
+/** The ordinary codec holds named, typed captures. Native closures defer these
+ *  until lowering knows their layout; materialize them only for the developer
+ *  round trip, using the same probe/retyper as ordinary closure emission.
+ *  Copy the value graph and reuse its raw-to-typed memo to preserve aliases. */
+fun bootstrapLiftCodecBindings(
+    var lowerer: BootstrapLowerer,
+    var state: BootstrapLiftState,
+    value: BootstrapEvalValue,
+    var seen: array<BootstrapEvalValue>,
+    var copies: array<BootstrapEvalValue>
+): BootstrapEvalValue {
+    if (bootstrapLiftIsScalar(value.kind) || value.kind == "function" ||
+        value.kind == "null" || value.kind == "void" || value.kind == "invalid") return value
+    var index = 0
+    while (index < seen.size) {
+        if (seen[index] == value) return copies[index]
+        index = index + 1
+    }
+    val positional = value.kind == "closure" && value.text == "positional"
+    var layoutIndex = -1
+    if (positional) {
+        if (value.integer < 0 || value.integer >= state.syntax.size) return bootstrapLiftRetypeFail(
+            state.retyper, "a native closure lost its lambda before the codec round trip"
+        )
+        val lambda = state.syntax[value.integer]
+        layoutIndex = bootstrapLiftLambdaLayoutOf(lowerer, state, lambda)
+        if (layoutIndex < 0) return bootstrapLiftRetypeFail(
+            state.retyper, "a native closure lost its capture layout before the codec round trip"
+        )
+        if (state.layouts[layoutIndex].captureNames.size != value.elements.size) return bootstrapLiftRetypeFail(
+            state.retyper, "a native closure has the wrong capture count before the codec round trip"
+        )
+    }
+    val copy = BootstrapEvalValue(
+        value.kind, value.integer, value.boolean, if (positional) "" else value.text,
+        [], value.owner,
+        if (positional) state.layouts[layoutIndex].captureNames else value.fieldNames
+    )
+    // Open before descending: a captured cell can point back to this closure,
+    // or share a value with another field/capture in the enclosing graph.
+    seen.append(value)
+    copies.append(copy)
+    index = 0
+    while (index < value.elements.size && state.retyper.problem == "") {
+        var element = value.elements[index]
+        if (positional) {
+            val layout = state.layouts[layoutIndex]
+            val name = layout.captureNames[index]
+            var owned = false
+            for (capture in layout.ownedCaptures) if (capture == name) owned = true
+            element = bootstrapLiftRetype(
+                state.retyper, element,
+                if (owned) layout.parameterTypes[index] else "capture:${layout.parameterTypes[index]}"
+            )
+        }
+        copy.elements.append(bootstrapLiftCodecBindings(lowerer, state, element, seen, copies))
+        index = index + 1
+    }
+    copy
 }
 
 fun bootstrapLiftSymbolPrefix(): string {
