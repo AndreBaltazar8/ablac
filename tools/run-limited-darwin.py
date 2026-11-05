@@ -15,6 +15,18 @@ def signal_group(pid, number):
         os.killpg(pid, number)
     except ProcessLookupError:
         pass
+    except PermissionError:
+        # XNU killpg1 excludes SZOMB members, then returns EPERM when none
+        # remain eligible. Keep the leader unreaped to reserve this group ID;
+        # ignore EPERM only after ps confirms there are no executing members.
+        # A real permission failure with live processes must remain visible.
+        groups = subprocess.check_output(
+            ["/bin/ps", "-axo", "pgid=,stat="], text=True, timeout=5
+        )
+        for line in groups.splitlines():
+            group, state = line.split()
+            if int(group) == pid and not state.startswith("Z"):
+                raise
 
 
 def supervise(parent, seconds, grace, command):
