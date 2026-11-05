@@ -2348,8 +2348,7 @@ fun bootstrapRelativeImportSpelling(importer: string, target: string): string {
 
 fun bootstrapValidateStrictImports(
     aliases: array<BootstrapModuleAlias>,
-    snapshots: array<BootstrapModuleSnapshot>,
-    fullModules: Map<string, int>
+    snapshots: array<BootstrapModuleSnapshot>
 ): BootstrapImportAliasValidation {
     val report = bootstrapVisibilityReportPath != ""
     val strict: array<bool> = []
@@ -2423,8 +2422,7 @@ fun bootstrapValidateStrictImports(
                 module, aliases, snapshots, asStrict
             )
             val findings = bootstrapStrictImportFindings(
-                snapshot, names, declaring, classes, classMembers, visible, typeNames,
-                !fullModules.has(snapshot.path)
+                snapshot, names, declaring, classes, classMembers, visible, typeNames
             )
             for (finding in findings) {
                 if (!suggestedKnown[finding.declaring]) {
@@ -2678,41 +2676,6 @@ class BootstrapStrictImportFinding(
     val column: int
 )
 
-// Contract loading follows only imports needed by the retained shape. Its
-// discarded implementations must not be checked against those pruned edges.
-// Discovery omits function body bounds, so reparse only contract-only modules
-// to locate their headers. Keep original tokens/offsets for exact diagnostics.
-fun bootstrapStrictContractTokens(
-    snapshot: BootstrapModuleSnapshot
-): array<BootstrapToken> {
-    val parsed = bootstrapParseWithIdentity(snapshot.source, snapshot.path)
-    val tokens = bootstrapLexShared(snapshot.source)
-    val retained: array<BootstrapToken> = []
-    var cursor = 0
-    for (declaration in parsed.declarations) {
-        // These are exactly the declaration kinds bootstrapProjectContract
-        // retains. It removes function expressions and class/extend methods.
-        if (declaration.kind == "fun" || declaration.kind == "class" ||
-            declaration.kind == "interface" || declaration.kind == "extend") {
-            var end = declaration.end
-            if (declaration.kind == "fun" &&
-                declaration.expression.kind != "missing") {
-                end = declaration.expression.begin
-            }
-            for (method in declaration.methods) {
-                if (method.begin < end) end = method.begin
-            }
-            while (cursor < tokens.size &&
-                tokens[cursor].begin < declaration.begin) cursor = cursor + 1
-            while (cursor < tokens.size && tokens[cursor].begin < end) {
-                retained.append(tokens[cursor])
-                cursor = cursor + 1
-            }
-        }
-    }
-    retained
-}
-
 /** The plain names `snapshot` uses from modules it doesn't see, each once.
  *  A name its own declarations bind (a parameter, local or field of the
  *  enclosing declaration, or a member of the class it is in or extends), a
@@ -2724,8 +2687,7 @@ fun bootstrapStrictImportFindings(
     classes: BootstrapStringSet,
     classMembers: array<array<string>>,
     visible: array<bool>,
-    typeNames: BootstrapStringSet,
-    contractOnly: bool
+    typeNames: BootstrapStringSet
 ): array<BootstrapStrictImportFinding> {
     val result: array<BootstrapStrictImportFinding> = []
     val source = snapshot.source
@@ -2734,8 +2696,7 @@ fun bootstrapStrictImportFindings(
     for (declaration in discovery.declarations) {
         if (declaration.extensionOwner == "") own.add(declaration.name)
     }
-    val tokens = if (contractOnly) bootstrapStrictContractTokens(snapshot)
-        else bootstrapLexShared(source)
+    val tokens = bootstrapLexShared(source)
     val bounds = bootstrapDeclarationBoundNamesIn(source, discovery, tokens)
     val reported = bootstrapStringSet()
     var inImport = false
@@ -2946,19 +2907,11 @@ class BootstrapModuleGraphIndex(
     // contract), and those of them loaded for their contract first.
     val fullModules: Map<string, int>,
     val upgradedModules: Map<string, int>,
-    // Ordinary shape dependencies are visited after the ordinary graph, so
-    // they cannot change its DFS entry points within import cycles.
-    val pendingShapes: array<string>,
-    val queuedShapes: Map<string, int>,
-    val lateModules: Map<string, int>,
-    var loadedShapes: int = 0,
-    var loadDepth: int = 0,
-    var flushingShapes: bool = false,
     var entryPath: string = ""
 )
 
 fun bootstrapModuleGraphIndex(): BootstrapModuleGraphIndex =
-    BootstrapModuleGraphIndex(Map(), [], [], [], Map(), Map(), 0, "", [], Map(), Map(), Map(), Map(), [], Map(), Map())
+    BootstrapModuleGraphIndex(Map(), [], [], [], Map(), Map(), 0, "", [], Map(), Map(), Map(), Map())
 
 class BootstrapModuleGraph(
     val modules: array<BootstrapModule>,
@@ -2993,8 +2946,7 @@ class BootstrapModuleGraph(
             val found = this.aliases[ownEdge]
             // A module loaded for its contract before its implementations
             // recorded this edge then: the edge now is the implementation's.
-            if (found.target == target && found.begin == edge.begin &&
-                found.end == edge.end &&
+            if (found.target == target && found.contractOnly &&
                 this.index.upgradedModules.has(importer.path)) {
                 this.aliases[ownEdge] = BootstrapModuleAlias(
                     importer.path, target, edge.alias, edge.contractOnly,
@@ -3159,114 +3111,23 @@ class BootstrapModuleGraph(
                         edge,
                         importedSnapshot.discovery
                     )) {
-                        // Only the explicitly contract-imported module is a
-                        // remote surface. Its ordinary shape libraries retain
-                        // their real code, annotations and overloads.
-                        this.recordImportEdge(snapshot, edge, exposed)
-                        if (edge.contractOnly) this.loadContract(imported)
-                        else if (!this.index.queuedShapes.has(imported)) {
-                            this.index.queuedShapes.set(imported, 1)
-                            this.index.pendingShapes.append(imported)
-                        }
+                        val contractEdge = BootstrapImportEdge(
+                            edge.source,
+                            edge.provider,
+                            edge.alias,
+                            true,
+                            edge.begin,
+                            edge.end
+                        )
+                        this.recordImportEdge(snapshot, contractEdge, exposed)
+                        this.loadContract(imported)
                     }
                 }
                 index = index + 1
             }
-            // An ordinary shape dependency can import this module back and
-            // upgrade it while it is loading. That full load already ordered it.
-            if (!this.index.fullModules.has(identity)) {
-                this.orderedSnapshots.append(snapshot)
-            }
+            this.orderedSnapshots.append(snapshot)
         }
         ""
-    }
-
-    // A normal import may already have loaded a queued shape. Otherwise load
-    // its real implementation now; that can enqueue further shapes. Advance
-    // before loading so recursive graph traversal never replays this request.
-    fun loadPendingShapes(): void {
-        if (this.index.flushingShapes) return
-        this.index.flushingShapes = true
-        while (this.index.loadedShapes < this.index.pendingShapes.size) {
-            val path = this.index.pendingShapes[this.index.loadedShapes]
-            this.index.loadedShapes = this.index.loadedShapes + 1
-            this.load(path)
-        }
-        this.index.flushingShapes = false
-        return
-    }
-
-    // Preserve the ordinary traversal exactly. Only genuinely late full loads
-    // move: place them after their ordinary dependencies, as early as possible
-    // so nested consumers can use their compile-time registrations. A contract
-    // edge never pulls an upgraded API's implementation into this traversal.
-    fun orderPendingShapes(): void {
-        if (this.index.pendingShapes.size == 0) return
-        val positions: Map<string, int> = Map()
-        val frontiers: array<int> = []
-        val late: array<bool> = []
-        var primary = 0
-        var index = 0
-        while (index < this.orderedSnapshots.size) {
-            val path = this.orderedSnapshots[index].path
-            positions.set(path, index)
-            val isLate = this.index.lateModules.has(path)
-            late.append(isLate)
-            if (!isLate) primary = primary + 1
-            frontiers.append(if (isLate) 0 else primary)
-            index = index + 1
-        }
-        // Monotone propagation also handles late ordinary-import cycles:
-        // every member waits for all primary dependencies of the cycle.
-        var changed = true
-        while (changed) {
-            changed = false
-            index = 0
-            while (index < this.orderedSnapshots.size) {
-                if (late[index]) {
-                    val slot = this.index.importers.get(
-                        this.orderedSnapshots[index].path)
-                    if (slot != null) {
-                        var edge = this.index.firstAlias[slot]
-                        while (edge >= 0) {
-                            val imported = this.aliases[edge]
-                            if (!imported.contractOnly) {
-                                val target = positions.get(imported.target)
-                                if (target != null && frontiers[target] > frontiers[index]) {
-                                    frontiers[index] = frontiers[target]
-                                    changed = true
-                                }
-                            }
-                            edge = this.index.aliasNext[edge]
-                        }
-                    }
-                }
-                index = index + 1
-            }
-        }
-        val ordered: array<BootstrapModuleSnapshot> = []
-        var frontier = 0
-        var nextPrimary = 0
-        while (frontier <= primary) {
-            // Keep the late DFS postorder stable at each frontier. No map
-            // iteration or new DFS through contract edges affects the result.
-            index = 0
-            while (index < this.orderedSnapshots.size) {
-                if (late[index] && frontiers[index] == frontier) {
-                    ordered.append(this.orderedSnapshots[index])
-                }
-                index = index + 1
-            }
-            if (frontier < primary) {
-                while (late[nextPrimary]) nextPrimary = nextPrimary + 1
-                ordered.append(this.orderedSnapshots[nextPrimary])
-                nextPrimary = nextPrimary + 1
-            }
-            frontier = frontier + 1
-        }
-        this.orderedSnapshots.truncate(0)
-        for (snapshot in ordered) this.orderedSnapshots.append(snapshot)
-        return
     }
 
     /** The abla.toml nearest above `modulePath`, or "" when there is none. */
@@ -3394,7 +3255,6 @@ class BootstrapModuleGraph(
     }
 
     fun load(modulePath: string): string {
-        this.index.loadDepth = this.index.loadDepth + 1
         bootstrapLexMemoActive = true
         val identity = bootstrapNormalizeModulePath(modulePath)
         if (this.index.remapRoot == "" &&
@@ -3417,7 +3277,6 @@ class BootstrapModuleGraph(
         var output = ""
         val known = this.contains(identity)
         if (!known || !this.index.fullModules.has(identity)) {
-            if (this.index.flushingShapes) this.index.lateModules.set(identity, 1)
             this.index.fullModules.set(identity, 1)
             if (known) this.dropContractLoad(identity)
             this.checkModuleManifest(identity)
@@ -3497,17 +3356,12 @@ class BootstrapModuleGraph(
                 }
                 index = index + 1
             }
-            // Every ordinary import has now had its original traversal. Only
-            // shape-only libraries remain; stage them before the entry itself
-            // so their compile-time registrations are available to its body.
-            if (this.index.loadDepth == 1) this.loadPendingShapes()
             this.orderedSnapshots.append(snapshot)
             // parse() consumes orderedSnapshots. Return only this requested
             // module instead of rebuilding the transitive graph as text at
             // each recursion level.
             output = snapshot.source
         }
-        this.index.loadDepth = this.index.loadDepth - 1
         output
     }
 
@@ -3542,15 +3396,11 @@ class BootstrapModuleGraph(
         )
         bootstrapModuleIdentityPrefixes = Map()
         bootstrapImportRemapEntries = this.index.remapEntries
-        // Also support graph clients that only called loadContract(). Finish
-        // their graph before recording its import bindings for staged parsing.
-        this.loadPendingShapes()
-        this.loadImplicitTransactions()
-        this.orderPendingShapes()
         bootstrapModuleImportsBegin()
         for (alias in this.aliases) {
             bootstrapModuleImportRecord(alias.target, alias.importer, alias.begin, alias.end)
         }
+        this.loadImplicitTransactions()
         bootstrapFrontendTraceMemory(
             "parse.begin:${this.orderedSnapshots.size}"
         )
@@ -3596,7 +3446,7 @@ class BootstrapModuleGraph(
         )
         bootstrapFrontendTraceMemory("parse.aliases")
         val strictValidation = bootstrapValidateStrictImports(
-            this.aliases, this.orderedSnapshots, this.index.fullModules
+            this.aliases, this.orderedSnapshots
         )
         var parseErrors = this.errors + aliasValidation.errors +
             strictValidation.errors
