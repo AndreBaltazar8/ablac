@@ -11,7 +11,9 @@ import tempfile
 import time
 
 root = Path(__file__).resolve().parent.parent
-compiler = str(Path(sys.argv[1]).resolve())
+# Absolute, not resolved: build/ablac is a symlink to a launcher that finds
+# its payload beside the name it was run as.
+compiler = os.path.abspath(sys.argv[1])
 (root / "build/codegen-cache-race").mkdir(parents=True, exist_ok=True)
 out = Path(tempfile.mkdtemp(prefix="run-", dir=root / "build/codegen-cache-race"))
 a = root / "tests/cases/codegen-cache/concurrent-a.ab"
