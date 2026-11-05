@@ -25,7 +25,9 @@ def line(proc, prefix):
     ready, _, _ = select.select([proc.stdout], [], [], 10)
     assert ready, f"timeout waiting for {prefix}"
     text = proc.stdout.readline().strip()
-    assert text.startswith(prefix + " "), f"expected {prefix}, got {text!r}"
+    assert text.startswith(prefix + " "), (
+        f"expected {prefix}, got {text!r}; exit={proc.poll()}; "
+        f"stderr={proc.stderr.read() if not text else ''}")
     return text.split()[1:]
 
 
