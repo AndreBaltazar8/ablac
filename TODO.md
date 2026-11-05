@@ -251,9 +251,12 @@
   programs importing the compiler, each compiled from scratch, which is what reuse between builds saves.
 - [ ] **Nothing runs the tests on a push.** `.github/workflows/release.yml` is the only workflow,
   and it starts by hand. Run `make test` and the fixed point on pushes to master.
-- [ ] **No formatter and no language server.** `ablac` has `analyze` and the analysis service to
-  build them on (`docs/reliability-roadmap.md` section 8: derive them from the compiler's
-  parser and type APIs so they can't drift from the language).
+- [x] **Parser-derived formatter.** `ablac fmt` preserves comments and verbatim syntax,
+  checks full AST/token parity and idempotence before atomic writes, and supports stdin,
+  `--check` diffs and one line-width setting. See `docs/formatter.md`.
+- [ ] **No language server.** `ablac` has `analyze` and the analysis service to build it on
+  (`docs/reliability-roadmap.md` section 8: derive it from the compiler's parser and type
+  APIs so it can't drift from the language).
 - [ ] **Clean-bootstrap convergence.** Tiers 4 and 5 of `docs/reliability-roadmap.md`: two
   independent bootstrap routes that reach the same canonical compiler IR on fresh builders.
 - [ ] **No target support matrix.** Publish which targets are tested and at what level

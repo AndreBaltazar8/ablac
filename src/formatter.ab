@@ -444,9 +444,278 @@ fun bootstrapFormatCommentAnchors(
     result
 }
 
+class BootstrapFormatWidths(
+    val before: Map<int, int>, val after: Map<int, int>,
+    val syntax: BootstrapFormatPlan
+)
+class BootstrapFormatPoint(
+    val left: int, val right: int, val line: int,
+    val indent: int, val priority: int
+)
+
+fun bootstrapFormatParameterParse(
+    source: string, tokens: array<BootstrapToken>, var roles: Map<int, int>
+): BootstrapParseResult {
+    val parser = BootstrapParser(
+        "<memory>", source, tokens, [], [], [], 0, 0, "", [], [], 0, -1, 0, ";"
+    )
+    val parsed = parser.parse()
+    var offset = 0
+    var priority = 0
+    var value = false
+    for (byte in parser.layoutTrace) {
+        if (byte == 58) value = true
+        else if (byte == 59) {
+            if (value) roles.set(offset, priority)
+            offset = 0
+            priority = 0
+            value = false
+        } else if (value) priority = priority * 10 + byte - 48
+        else offset = offset * 10 + byte - 48
+    }
+    parsed
+}
+
+fun bootstrapFormatWidthGap(
+    begin: int, end: int, wanted: int, priority: int,
+    var widths: BootstrapFormatWidths
+): void {
+    var i = bootstrapFormatTokenAfter(widths.syntax.tokens, begin)
+    while (i < widths.syntax.tokens.size && widths.syntax.tokens[i].begin < end) {
+        if (widths.syntax.tokens[i].kind == wanted) widths.after.set(widths.syntax.tokens[i].end, priority)
+        i = i + 1
+    }
+}
+
+fun bootstrapFormatWidthExpression(
+    expression: BootstrapExpression, var widths: BootstrapFormatWidths
+): void {
+    if (widths.syntax.opaque.has(expression.begin)) return
+    val list = expression.kind == "array" || expression.kind == "call" ||
+        expression.kind == "call.value" || expression.kind == "member.call"
+    if (list) {
+        var i = if (expression.kind == "call.value" || expression.kind == "member.call") 2 else 1
+        while (i < expression.children.size) {
+            bootstrapFormatWidthGap(expression.children[i - 1].end,
+                expression.children[i].begin, BOOTSTRAP_TOKEN_COMMA, 1, widths)
+            i = i + 1
+        }
+    }
+    if ((expression.kind == "member" || expression.kind == "member.call") && expression.children.size > 0) {
+        var i = bootstrapFormatTokenAfter(widths.syntax.tokens, expression.children[0].end)
+        val end = if (expression.kind == "member.call" && expression.children.size > 1)
+            expression.children[1].begin else expression.end
+        var found = false
+        while (i + 1 < widths.syntax.tokens.size && widths.syntax.tokens[i].begin < end && !found) {
+            val token = widths.syntax.tokens[i]
+            if (token.kind == BOOTSTRAP_TOKEN_DOT) {
+                if (i == 0 || widths.syntax.tokens[i - 1].kind != BOOTSTRAP_TOKEN_QUESTION) widths.before.set(token.begin, 3)
+                found = true
+            }
+            i = i + 1
+        }
+    }
+    if ((expression.kind == "local.val" || expression.kind == "local.var" ||
+         expression.kind == "named.argument") && expression.children.size > 0) {
+        bootstrapFormatWidthGap(expression.begin, expression.children[0].begin,
+            BOOTSTRAP_TOKEN_EQUAL, 2, widths)
+    }
+    if (expression.kind == "assign" || expression.kind == "member.assign" ||
+        expression.kind == "index.assign" || expression.kind == "delegate.assign") {
+        if (expression.children.size > 0) bootstrapFormatWidthGap(expression.begin,
+            expression.children[expression.children.size - 1].begin,
+            BOOTSTRAP_TOKEN_EQUAL, 2, widths)
+    }
+    for (child in expression.children) bootstrapFormatWidthExpression(child, widths)
+}
+
+fun bootstrapFormatWidthDeclaration(
+    declaration: BootstrapDeclaration, var widths: BootstrapFormatWidths
+): void {
+    var index = bootstrapFormatTokenAfter(widths.syntax.tokens, declaration.begin)
+    var depth = 0
+    while (index < widths.syntax.tokens.size && widths.syntax.tokens[index].begin < declaration.expression.begin) {
+        val token = widths.syntax.tokens[index]
+        if (token.kind == BOOTSTRAP_TOKEN_EQUAL && depth == 0) widths.after.set(token.end, 2)
+        if (bootstrapFormatOpening(token.kind)) depth = depth + 1
+        if (bootstrapFormatClosing(token.kind)) depth = depth - 1
+        index = index + 1
+    }
+    bootstrapFormatWidthExpression(declaration.expression, widths)
+    for (value in declaration.parameterDefaults) bootstrapFormatWidthExpression(value, widths)
+    for (value in declaration.annotationArguments) bootstrapFormatWidthExpression(value, widths)
+    for (method in declaration.methods) bootstrapFormatWidthDeclaration(method, widths)
+}
+
+fun bootstrapFormatLineStarts(source: string): array<int> {
+    val starts = [0]
+    var i = 0
+    while (i < source.size) {
+        if (source[i] == 10 || (source[i] == 13 &&
+            (i + 1 == source.size || source[i + 1] != 10))) starts.append(i + 1)
+        i = i + 1
+    }
+    starts
+}
+
+fun bootstrapFormatLineAt(starts: array<int>, offset: int): int {
+    var begin = 0
+    var end = starts.size
+    while (begin < end) {
+        val middle = begin + (end - begin) / 2
+        if (starts[middle] <= offset) begin = middle + 1 else end = middle
+    }
+    begin - 1
+}
+
+fun bootstrapFormatWrap(
+    source: string, parsed: BootstrapParseResult, tokens: array<BootstrapToken>,
+    trivia: array<BootstrapTrivia>, roles: Map<int, int>, width: int
+): string {
+    val syntax = BootstrapFormatPlan(Map(), Map(), Map(), Map(), Map(), Map(), tokens)
+    for (declaration in parsed.declarations) bootstrapFormatPlanDeclaration(declaration, syntax)
+    for (action in parsed.actions) bootstrapFormatPlanExpression(action, syntax)
+    val widths = BootstrapFormatWidths(Map(), Map(), syntax)
+    for (declaration in parsed.declarations) bootstrapFormatWidthDeclaration(declaration, widths)
+    for (action in parsed.actions) bootstrapFormatWidthExpression(action, widths)
+    val atoms = bootstrapFormatAtoms(source, tokens, trivia, syntax)
+    val starts = bootstrapFormatLineStarts(source)
+    val points: array<BootstrapFormatPoint> = []
+    val indents: array<int> = []
+    val kinds: array<int> = []
+    var line = -1
+    var lineIndent = 0
+    var lineBody = false
+    var i = 0
+    while (i < atoms.size) {
+        val atom = atoms[i]
+        val currentLine = bootstrapFormatLineAt(starts, atom.begin)
+        if (line != currentLine) {
+            line = currentLine
+            lineIndent = 0
+            while (starts[line] + lineIndent < source.size && source[starts[line] + lineIndent] == 32) lineIndent = lineIndent + 1
+            lineBody = syntax.bodies.has(atom.begin)
+        }
+        if (i > 0) {
+            val left = atoms[i - 1]
+            if (left.kind != -1 && atom.kind != -1 && !bootstrapFormatClosing(atom.kind) &&
+                bootstrapFormatNewlines(source, left.end, atom.begin) == 0) {
+                var priority = 0
+                val before = widths.before.get(atom.begin)
+                val after = widths.after.get(left.end)
+                val parameter = roles.get(left.end)
+                if (before != null) priority = before
+                if (after != null) priority = after
+                if (parameter != null) priority = parameter
+                if (syntax.binary.has(left.begin) && atom.kind != BOOTSTRAP_TOKEN_QUESTION) priority = 2
+                if (priority > 0) {
+                    var indent = 4
+                    if (kinds.size > 0) indent = indents[indents.size - 1] +
+                        (if (kinds[kinds.size - 1] == BOOTSTRAP_TOKEN_LBRACE) 8 else 4)
+                    if (lineIndent > indent) indent = lineIndent
+                    if (lineBody && lineIndent >= indent) indent = lineIndent + 4
+                    if (indent < width) points.append(BootstrapFormatPoint(left.end, atom.begin, line, indent, priority))
+                }
+            }
+        }
+        if (bootstrapFormatOpening(atom.kind)) {
+            var base = lineIndent
+            if (atom.kind == BOOTSTRAP_TOKEN_LBRACE && (kinds.size == 0 || kinds[kinds.size - 1] == BOOTSTRAP_TOKEN_LBRACE)) {
+                base = if (indents.size == 0) 0 else indents[indents.size - 1] + 4
+            }
+            kinds.append(atom.kind)
+            indents.append(base)
+        }
+        if (bootstrapFormatClosing(atom.kind) && kinds.size > 0) { kinds.removeLast(); indents.removeLast() }
+        i = i + 1
+    }
+    val chosen: array<BootstrapFormatPoint> = []
+    i = 0
+    while (i < points.size) {
+        val first = i
+        val row = points[i].line
+        while (i < points.size && points[i].line == row) i = i + 1
+        var finish = if (row + 1 < starts.size) starts[row + 1] else source.size
+        while (finish > starts[row] && (source[finish - 1] == 10 || source[finish - 1] == 13)) finish = finish - 1
+        var segment = starts[row]
+        var indent = 0
+        var next = first
+        while (finish - segment + indent > width && next < i) {
+            var best = -1
+            var priority = 4
+            var p = next
+            while (p < i && points[p].left - segment + indent <= width) {
+                if (points[p].left > segment && points[p].priority <= priority) {
+                    best = p
+                    priority = points[p].priority
+                }
+                p = p + 1
+            }
+            // If an indivisible token exceeds width, isolate its following
+            // code when possible; the token itself deliberately stays whole.
+            if (best < 0 && next < i) best = next
+            if (best < 0) break
+            chosen.append(points[best])
+            segment = points[best].right
+            indent = points[best].indent
+            next = best + 1
+        }
+    }
+    if (chosen.size == 0) return source
+    val output = byteBuffer()
+    var previous = 0
+    for (point in chosen) {
+        output.appendText(source.slice(previous, point.left))
+        output.appendText("\n${bootstrapFormatSpaces(point.indent)}")
+        previous = point.right
+    }
+    output.appendText(source.slice(previous, source.size))
+    output.toText()
+}
+
+// Every round adds breaks at source-ordered syntax boundaries. Normalize the
+// indentation they introduce, then stop at an exact fixed point before writing.
+fun bootstrapFormatLayout(
+    source: string, parsed: BootstrapParseResult, tokens: array<BootstrapToken>,
+    trivia: array<BootstrapTrivia>, width: int
+): BootstrapFormatResult {
+    var current = bootstrapFormatRender(source, parsed, tokens, trivia)
+    var round = 0
+    while (round < 16) {
+        val comments: array<BootstrapTrivia> = []
+        val stream = bootstrapLexWithTrivia(current, comments)
+        val roles: Map<int, int> = Map()
+        val syntax = bootstrapFormatParameterParse(current, stream, roles)
+        if (syntax.errors != 0) return BootstrapFormatResult(source, "width layout produced invalid syntax")
+        val wrapped = bootstrapFormatWrap(current, syntax, stream, comments, roles, width)
+        if (wrapped == current) return BootstrapFormatResult(current, "")
+        val afterComments: array<BootstrapTrivia> = []
+        val afterTokens = bootstrapLexWithTrivia(wrapped, afterComments)
+        val after = bootstrapParse(wrapped)
+        if (after.errors != 0) return BootstrapFormatResult(source, "width breakpoint is not valid here")
+        current = bootstrapFormatRender(wrapped, after, afterTokens, afterComments)
+        round = round + 1
+    }
+    BootstrapFormatResult(source, "width layout did not converge")
+}
+
+fun bootstrapFormatOpaqueBytes(
+    source: string, parsed: BootstrapParseResult,
+    tokens: array<BootstrapToken>, trivia: array<BootstrapTrivia>
+): array<string> {
+    val plan = BootstrapFormatPlan(Map(), Map(), Map(), Map(), Map(), Map(), tokens)
+    for (declaration in parsed.declarations) bootstrapFormatPlanDeclaration(declaration, plan)
+    for (action in parsed.actions) bootstrapFormatPlanExpression(action, plan)
+    val result: array<string> = []
+    for (atom in bootstrapFormatAtoms(source, tokens, trivia, plan)) {
+        if (atom.kind == -2) result.append(source.slice(atom.begin, atom.end))
+    }
+    result
+}
+
 fun bootstrapFormatValidate(
     source: string, candidate: string, parsed: BootstrapParseResult,
-    tokens: array<BootstrapToken>, trivia: array<BootstrapTrivia>
+    tokens: array<BootstrapToken>, trivia: array<BootstrapTrivia>, width: int = 100
 ): string {
     val afterTrivia: array<BootstrapTrivia> = []
     val afterTokens = bootstrapLexWithTrivia(candidate, afterTrivia)
@@ -454,14 +723,19 @@ fun bootstrapFormatValidate(
     if (!bootstrapFormatTokensEqual(source, candidate, tokens, afterTokens)) return "significant tokens changed"
     if (!bootstrapFormatAstEqual(parsed, after, tokens, afterTokens)) return "parsed syntax changed"
     if (!bootstrapFormatStringsEqual(
+        bootstrapFormatOpaqueBytes(source, parsed, tokens, trivia),
+        bootstrapFormatOpaqueBytes(candidate, after, afterTokens, afterTrivia)
+    )) return "verbatim source changed"
+    if (!bootstrapFormatStringsEqual(
         bootstrapFormatCommentAnchors(source, tokens, trivia),
         bootstrapFormatCommentAnchors(candidate, afterTokens, afterTrivia)
     )) return "comment attachment changed"
-    if (bootstrapFormatRender(candidate, after, afterTokens, afterTrivia) != candidate) return "formatting is not idempotent"
+    val repeated = bootstrapFormatLayout(candidate, after, afterTokens, afterTrivia, width)
+    if (repeated.error != "" || repeated.text != candidate) return "formatting is not idempotent"
     ""
 }
 
-fun bootstrapFormat(source: string): BootstrapFormatResult {
+fun bootstrapFormat(source: string, width: int = 100): BootstrapFormatResult {
     val parsed = bootstrapParse(source)
     if (parsed.errors > 0 || parsed.extensionErrors > 0) return BootstrapFormatResult(source, "input has syntax errors: ${parsed.diagnostics}")
     val trivia: array<BootstrapTrivia> = []
@@ -470,7 +744,9 @@ fun bootstrapFormat(source: string): BootstrapFormatResult {
         if (!comment.line && (comment.end < comment.begin + 4 ||
             source.slice(comment.end - 2, comment.end) != "*/")) return BootstrapFormatResult(source, "unterminated block comment")
     }
-    val candidate = bootstrapFormatRender(source, parsed, tokens, trivia)
-    val error = bootstrapFormatValidate(source, candidate, parsed, tokens, trivia)
+    val layout = bootstrapFormatLayout(source, parsed, tokens, trivia, width)
+    if (layout.error != "") return layout
+    val candidate = layout.text
+    val error = bootstrapFormatValidate(source, candidate, parsed, tokens, trivia, width)
     BootstrapFormatResult(if (error == "") candidate else source, error)
 }

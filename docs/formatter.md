@@ -17,7 +17,9 @@ ablac fmt - < input.ab > formatted.ab
 needed, 0 when every input is clean, or 2 on invalid input, a preservation-check
 failure, an unknown option or an I/O error. `-` reads stdin and writes formatted
 source to stdout; it cannot be combined with file operands. With `--check -`,
-stdout contains the diff instead.
+stdout contains the diff instead. Diffs use one enclosing prefix/suffix hunk
+per changed file; they are deterministic and valid unified diffs, but need not
+be minimal when changes are far apart.
 
 ## Style
 
@@ -32,8 +34,31 @@ kept rather than interpreted by another grammar.
 Intentional line breaks and aligned continuations remain. Blank-line runs are
 collapsed to one empty line; trailing whitespace is removed outside verbatim
 regions. Line endings outside those regions become LF, with a final newline
-for nonempty files. The spacing/indentation implementation accepts `--width`
-(40–240, default 100); width-driven breaking is a separate following change.
+for nonempty files.
+
+## Line width
+
+`--width` accepts 40–240 UTF-8 byte columns, default 100. Existing line breaks
+remain; the formatter does not flatten intentional vertical groups. On an
+over-width line it selects the last eligible boundary within the width, in
+this priority order:
+
+1. After a parameter, call-argument or array-element comma.
+2. After a value assignment or an actual binary operator.
+3. Before a member-chain dot.
+
+Parameter separators come directly from the compiler parser; type-argument
+commas are not mistaken for argument separators. The other boundaries come
+from parsed expression spans. Comments and verbatim regions cannot be split
+or have their attachment changed. Newly broken continuations use four spaces
+relative to their surrounding group; existing deeper alignment remains.
+
+If no boundary fits, the first eligible boundary isolates the following code.
+An indivisible literal, comment, identifier, type or already-deep indentation
+may still exceed the soft width. With no eligible boundary, the line stays
+whole. Layout is normalized to an exact fixed point, with a bounded failure
+instead of writing if it does not converge. The ordinary round-trip and
+second-pass checks remain mandatory.
 
 ## Preservation checks
 

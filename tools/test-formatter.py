@@ -35,13 +35,40 @@ for fixture in sorted(cases.glob('*.input.ab')):
     target = out / fixture.name
     target.write_text(original)
     target.chmod(0o600)
-    command('--check', target, status=int(original != formatted))
+    diff = command('--check', target, status=int(original != formatted)).stdout
+    if diff:
+        subprocess.run(['git', 'apply', '--check', '--unsafe-paths', '-p0', '-'],
+                       input=diff, text=True, check=True, capture_output=True)
     assert target.read_text() == original
     command(target)
     assert target.read_text() == expected
     assert target.stat().st_mode & 0o777 == 0o600
     assert command('--check', target).stdout == ''
     print('formatter:', fixture.stem, 'golden, stdin, check, idempotence and mode passed', flush=True)
+
+# Formatting is a parser-only command, independent of an installed sysroot.
+environment = {k: v for k, v in os.environ.items() if k not in ('ABLA_SYSROOT', 'ABLA_STDLIB')}
+r = subprocess.run([compiler, 'fmt', '-'], input='fun main:int=0\n', text=True,
+                   capture_output=True, cwd=out, env=environment)
+assert (r.returncode, r.stdout) == (0, 'fun main: int = 0\n'), r.stderr
+
+# One width setting, stable break priority, all breakable lines within width.
+wide = ('fun main(): int = ' + ' + '.join('value' + str(i) for i in range(40)) + '\n')
+for width in [40, 60, 100, 240]:
+    formatted = command('--width', width, '-', source=wide).stdout
+    assert all(len(line.encode()) <= width for line in formatted.splitlines())
+    assert command('--width', width, '-', source=formatted).stdout == formatted
+comment = '// ' + 'unbreakable-comment-' * 15 + '\n'
+assert command('--width', 40, '-', source=comment).stdout == comment
+array = 'fun main(): int { val xs = [' + ', '.join(str(i) for i in range(1000)) + ']; xs.size }\n'
+formatted = command('--width', 60, '-', source=array).stdout
+assert command('--width', 60, '-', source=formatted).stdout == formatted
+# Generic type commas are not parameter separators and must remain on their line.
+signature = 'fun choose(first: Map<string, array<int>>, second: Map<string, array<int>>, third: int): int = third\n'
+formatted = command('--width', 40, '-', source=signature).stdout
+assert 'Map<string, array<int>>' in formatted
+assert command('--width', 40, '-', source=formatted).stdout == formatted
+print('formatter: width limits, long arrays, generic roles and unbreakable comments passed', flush=True)
 
 # Comment and raw-literal bytes must survive even when Python's text-mode I/O
 # would otherwise normalize CRLFs and hide a regression.
@@ -73,7 +100,8 @@ valid = out / '000-valid.ab'
 invalid = out / '999-invalid.ab'
 valid.write_text('fun main:int=0\n')
 invalid.write_text('fun broken( {\n')
-command(valid, invalid, status=2)
+assert command(valid, invalid, status=2).stdout == ''
+assert command('-', source='fun broken( {\n', status=2).stdout == ''
 assert valid.read_text() == 'fun main:int=0\n'
 assert invalid.read_text() == 'fun broken( {\n'
 command('--width', '0', valid, status=2)
@@ -107,3 +135,14 @@ environment = dict(os.environ, ABLA_FORMATTER_EXPECTED_FILES=str(
 result = subprocess.run([str(program)], env=environment)
 assert result.returncode == 42, ('formatter preservation negatives', result.returncode)
 print('formatter: token/AST/comment/idempotence negative controls and invalid-input no-write passed', flush=True)
+
+# Execute both sides of the newline-sensitive control fixture too.
+executions = []
+for suffix in ['input', 'expected']:
+    executable = out / ('control-' + suffix)
+    subprocess.run([compiler, 'build', str(cases / ('control.' + suffix + '.ab')),
+                    '-o', str(executable), '--fast', '--no-cache'], check=True)
+    result = subprocess.run([str(executable)], capture_output=True)
+    executions.append((result.returncode, result.stdout, result.stderr))
+assert executions[0] == executions[1] == (2, b'', b'')
+print('formatter: original/formatted control-flow executions agree', flush=True)
