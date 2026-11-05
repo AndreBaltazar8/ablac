@@ -11,21 +11,30 @@ if [[ $# -ne 1 ]]; then
 fi
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 compiler=$1
+[[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
 cd "$project_root"
+# modules/filesystem works in build/filesystem-test under its working
+# directory, as test-self-hosted's native-filesystem does from the project
+# root at the same time: these run in a directory of their own, which sees
+# the project's tests (modules/host-runtime reads one).
+work="$project_root/build/jit-host-selection"
+rm -rf "$work"
+mkdir -p "$work"
+ln -s "$project_root/tests" "$work/tests"
 
 for program in bootstrap/block modules/filesystem modules/host-runtime; do
-    before=$(find build -maxdepth 1 \( -name '*.so' -o -name '*.dylib' \) 2>/dev/null | sort || true)
+    before=$(find build "$work/build" -maxdepth 1 \( -name '*.so' -o -name '*.dylib' \) 2>/dev/null | sort || true)
     set +e
-    ABLA_MAX_MEMORY_MB=768 ABLA_MAX_SECONDS=60 \
+    (cd "$work" && ABLA_MAX_MEMORY_MB=768 ABLA_MAX_SECONDS=60 \
         "$project_root/tools/run-limited.sh" "$compiler" run --jit \
-        "$project_root/tests/cases/$program.ab"
+        "$project_root/tests/cases/$program.ab")
     status=$?
     set -e
     [[ $status -eq 42 ]] || {
         printf 'run --jit %s: exit %s\n' "$program" "$status" >&2
         exit 1
     }
-    after=$(find build -maxdepth 1 \( -name '*.so' -o -name '*.dylib' \) 2>/dev/null | sort || true)
+    after=$(find build "$work/build" -maxdepth 1 \( -name '*.so' -o -name '*.dylib' \) 2>/dev/null | sort || true)
     [[ $after == "$before" ]] || exit 1
 done
 printf '%s\n' \
