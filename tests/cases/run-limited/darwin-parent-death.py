@@ -63,9 +63,13 @@ time.sleep(60)
         marker = root / (kind + "-" + mode)
         env = dict(os.environ, ABLA_MAX_SECONDS="1" if kind == "timeout" else "60",
                    ABLA_KILL_GRACE_SECONDS="1")
-        proc = subprocess.Popen([runner, sys.executable, str(worker), str(marker), mode],
-                                env=env, start_new_session=True,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log = root / (kind + "-" + mode + ".log")
+        diagnostics = log.open("w")
+        invocation = [runner, sys.executable, str(worker), str(marker), mode]
+        if kind == "term":
+            invocation = ["/bin/bash", "-x", *invocation]
+        proc = subprocess.Popen(invocation, env=env, start_new_session=True,
+                                stdout=subprocess.DEVNULL, stderr=diagnostics)
         payload = child = supervisor = group = 0
         try:
             wait_for(marker.exists, "payload and descendant readiness")
@@ -78,7 +82,9 @@ time.sleep(60)
             elif kind == "term":
                 proc.terminate()
             expected = {"group": -signal.SIGKILL, "term": 143, "timeout": 124}[kind]
-            assert proc.wait(timeout=10) == expected
+            status = proc.wait(timeout=10)
+            assert status == expected, (f"{kind}/{mode}: exit {status}, expected {expected}\n"
+                                        + log.read_text())
             try:
                 wait_for(lambda: not alive(payload) and not alive(child),
                          kind + " " + mode + " payload group cleanup", seconds=5)
@@ -93,6 +99,7 @@ time.sleep(60)
                 if pid: kill(pid)
             kill(proc.pid, group=True)
             proc.wait(timeout=5)
+            diagnostics.close()
 
     # Stop the interpreter trampoline before it can register the parent watch.
     # Killing only the shell leaves it alive so resuming exercises the PPID
