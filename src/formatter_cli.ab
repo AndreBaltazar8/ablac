@@ -1,0 +1,166 @@
+import "formatter.ab"
+import "abla/sys/linux"
+import "abla/sys/linux/io"
+import "abla/sys/linux/process"
+import "abla/sys/linux/fs"
+import "abla/bytes"
+import "abla/text"
+import "abla/array"
+
+class BootstrapFormatFile(val path: Path, val original: string, val formatted: string)
+
+fun bootstrapFormatCollect(path: Path, var files: array<string>, explicit: bool = true): string {
+    if (path.isSymbolicLink()) {
+        if (explicit) return "symbolic-link operands are not rewritten: ${path.text}"
+        return ""
+    }
+    val info = path.info()
+    if (info.isDirectory()) {
+        val names: array<string> = []
+        for (entry in path.entries()) {
+            val name = entry.name()
+            // `abla/build` (and nested platform build modules) are source.
+            val generated = name == "build" && !path.child(name).child("entry.ab").info().isFile()
+            if (!name.startsWith(".") && !generated) names.append(name)
+        }
+        for (name in sortedStrings(names)) {
+            val error = bootstrapFormatCollect(path.child(name), files, false)
+            if (error != "") return error
+        }
+    } else if (info.isFile()) {
+        if (explicit || path.extension() == "ab") files.append(path.text)
+    } else if (explicit) return "cannot read file or directory: ${path.text}"
+    ""
+}
+
+fun bootstrapFormatLines(text: string): array<string> {
+    val lines = text.split("\n")
+    if (lines.size > 0 && lines[lines.size - 1] == "") lines.removeLast()
+    lines
+}
+
+fun bootstrapFormatDiffLine(
+    var output: ByteBuffer, mark: string, line: string, newline: bool
+): void {
+    output.appendText("$mark$line\n")
+    if (!newline) output.appendText("\\ No newline at end of file\n")
+}
+
+// A deterministic prefix/suffix hunk: linear time and memory, without an
+// unbounded quadratic diff matrix on large generated compiler sources.
+fun bootstrapFormatDiff(path: string, original: string, formatted: string): string {
+    if (original == formatted) return ""
+    val left = bootstrapFormatLines(original)
+    val right = bootstrapFormatLines(formatted)
+    val leftNl = original.endsWith("\n")
+    val rightNl = formatted.endsWith("\n")
+    var prefix = 0
+    while (prefix < left.size && prefix < right.size && left[prefix] == right[prefix] &&
+           (prefix + 1 < left.size || prefix + 1 < right.size || leftNl == rightNl)) prefix = prefix + 1
+    var suffix = 0
+    while (suffix < left.size - prefix && suffix < right.size - prefix &&
+           left[left.size - 1 - suffix] == right[right.size - 1 - suffix] &&
+           (suffix > 0 || leftNl == rightNl)) suffix = suffix + 1
+    val begin = if (prefix > 3) prefix - 3 else 0
+    val context = if (suffix > 3) 3 else suffix
+    val leftEnd = left.size - suffix + context
+    val rightEnd = right.size - suffix + context
+    val output = byteBuffer()
+    val leftStart = if (leftEnd == begin) begin else begin + 1
+    val rightStart = if (rightEnd == begin) begin else begin + 1
+    output.appendText("--- $path\n+++ $path\n@@ -$leftStart,${leftEnd - begin} +$rightStart,${rightEnd - begin} @@\n")
+    var i = begin
+    while (i < prefix) {
+        bootstrapFormatDiffLine(output, " ", left[i], i + 1 < left.size || leftNl)
+        i = i + 1
+    }
+    while (i < left.size - suffix) {
+        bootstrapFormatDiffLine(output, "-", left[i], i + 1 < left.size || leftNl)
+        i = i + 1
+    }
+    i = prefix
+    while (i < right.size - suffix) {
+        bootstrapFormatDiffLine(output, "+", right[i], i + 1 < right.size || rightNl)
+        i = i + 1
+    }
+    i = left.size - suffix
+    while (i < leftEnd) {
+        bootstrapFormatDiffLine(output, " ", left[i], i + 1 < left.size || leftNl)
+        i = i + 1
+    }
+    output.toText()
+}
+
+fun bootstrapFormatError(message: string): int {
+    linuxPrintStandardError("error[E_FORMAT]: $message\n")
+    2
+}
+
+fun bootstrapFormatCommand(): int {
+    var check = false
+    var width = 100
+    val inputs: array<string> = []
+    var i = 1
+    while (i < linuxArgumentCount()) {
+        val argument = linuxArgument(i)
+        if (argument == "--check") check = true
+        else if (argument == "--width") {
+            i = i + 1
+            if (i == linuxArgumentCount()) return bootstrapFormatError("--width needs an integer from 40 to 240")
+            val raw = linuxArgument(i)
+            width = 0
+            for (byte in raw) {
+                if (byte < 48 || byte > 57 || width > 240) return bootstrapFormatError("--width needs an integer from 40 to 240")
+                width = width * 10 + byte - 48
+            }
+            if (width < 40 || width > 240) return bootstrapFormatError("--width needs an integer from 40 to 240")
+        } else if (argument == "-" || !argument.startsWith("-")) inputs.append(argument)
+        else return bootstrapFormatError("unknown option: $argument")
+        i = i + 1
+    }
+    if (inputs.size == 0) return bootstrapFormatError("usage: ablac fmt [--check] [--width 100] <file.ab|directory|->...")
+    if (inputs.size == 1 && inputs[0] == "-") {
+        val source = byteBuffer()
+        var chunk = LinuxFileDescriptor(0).read()
+        while (chunk.size > 0) { source.appendText(chunk); chunk = LinuxFileDescriptor(0).read() }
+        val text = source.toText()
+        val result = bootstrapFormat(text)
+        if (result.error != "") return bootstrapFormatError("stdin: ${result.error}")
+        if (!check) linuxPrintStandardOutput(result.text)
+        else if (result.text != text) { linuxPrintStandardOutput(bootstrapFormatDiff("stdin", text, result.text)); return 1 }
+        return 0
+    }
+    val paths: array<string> = []
+    for (input in inputs) {
+        if (input == "-") return bootstrapFormatError("stdin cannot be combined with file operands")
+        val error = bootstrapFormatCollect(Path(input), paths)
+        if (error != "") return bootstrapFormatError(error)
+    }
+    val files: array<BootstrapFormatFile> = []
+    val seen: Map<string, bool> = Map()
+    // Validate every input before publishing any output.
+    for (path in sortedStrings(paths)) {
+        if (!seen.has(path)) {
+            seen.set(path, true)
+            val original = Path(path).readTextResult()
+            if (!original.succeeded) return bootstrapFormatError("cannot read $path (error ${original.errorCode})")
+            val result = bootstrapFormat(original.text)
+            if (result.error != "") return bootstrapFormatError("$path: ${result.error}")
+            files.append(BootstrapFormatFile(Path(path), original.text, result.text))
+        }
+    }
+    var changed = false
+    for (file in files) {
+        if (file.formatted != file.original) {
+            changed = true
+            if (check) linuxPrintStandardOutput(bootstrapFormatDiff(file.path.text, file.original, file.formatted))
+            else {
+                val current = file.path.readTextResult()
+                if (current.succeeded && current.text == file.formatted && !file.path.isSymbolicLink()) continue
+                if (!current.succeeded || current.text != file.original || file.path.isSymbolicLink()) return bootstrapFormatError("file changed during formatting: ${file.path.text}")
+                if (!file.path.writeTextAtomic(file.formatted)) return bootstrapFormatError("cannot write ${file.path.text}")
+            }
+        }
+    }
+    if (check && changed) 1 else 0
+}

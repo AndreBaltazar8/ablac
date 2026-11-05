@@ -19,6 +19,7 @@ ablac build app.ab -o build/app -g        # debug information in a release build
 ablac run app.ab -- arguments  # compiled in process (--o1 IR pipeline) and called there
 ablac run --built app.ab   # built (--o1, cached) and exec'd
 ablac test tests/*.ab      # build and run test programs (abla/test)
+ablac fmt --check src/     # check layout without writing (formatter.md)
 ablac repl
 ablac serve app.ab
 ```
@@ -376,3 +377,6 @@ release gate still verifies byte-identical IR from the rebuilt compiler.
 | `ABLA_COMPILER_COLLECT_GROWTH_MB` | without a launcher memory budget, the compiler collects garbage each time its heap grows by this much (default 256; 0 never collects) |
 | `ABLA_COMPILER_MEMORY_TRACE`, `ABLA_COMPILER_REACHABILITY_TRACE` | when non-empty, print the compiler's live memory per phase, or its reachability decisions, to standard error |
 | `ABLA_EVAL_INDEX_CHECK`, `ABLA_OVERLOAD_CHECK`, `ABLA_BORROW_INDEX_CHECK`, `ABLA_RECEIVER_INDEX_CHECK`, `ABLA_EXPECTED_INDEX_CHECK`, `ABLA_MODULE_INDEX_CHECK`, `ABLA_LIFT_CODEC_CHECK` | compiler self-checks for its own tests: `=1` cross-checks a fast path against the slow one and reports any disagreement |
+
+Source formatting, preservation checks and editor stdin usage are described in
+[formatter.md](formatter.md).
