@@ -33,7 +33,7 @@ GUARDS = {
     'rsaCrt': 'ec3addee5a5fd74adebecd24260bbc8f67efcabc64d421633d3a44467254dd65',
     'bnResidueSquare': '2bb8f304e7c5f1047e19dfdb5507ec2bedb6331b54384daab6d73a6dcaf91905',
     'bnFromBytes': 'eeebce423076a53fb063f21cbfb0397b5be468ad3d3ef283e2363eb3b35219c8',
-    'aesSoftBlocks': '99de52049cb6e2afe8323c9e44c1f08625eaeb3b2450c90bd776135b74357b5b',
+    'aesSoftBlocks': '8ff73661c081f911087468327f77b4eef43a7cfea6b155f883861da35e242c60',
     'aesExpandBytes': '0bd6e6ea2aa47c7bebf6e69b0db1ae1b81682d6583fe91a83ebf52aa3686b150',
 }
 
