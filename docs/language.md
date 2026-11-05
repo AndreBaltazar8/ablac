@@ -2767,7 +2767,13 @@ A contract call left in the program fails with
 `E_CONTRACT_CALL_NOT_CONSUMED`. Contract extraction doesn't run the other
 module's initializers or compile-time actions, and it follows only the
 imports its declaration shapes need, so the backend's private dependencies
-and capabilities stay out of the client. A contract's fingerprint excludes
+and capabilities stay out of the client. Ordinary dependencies reached for
+those shapes contribute type declarations, rather than turning their helper
+functions into remote contracts. An explicit contract import keeps the root
+module's function signatures regardless of annotations or import order.
+Strict-import checks apply to the retained contract surface; when a module
+is also imported normally, its full implementation is checked as usual.
+A contract's fingerprint excludes
 function bodies: changing a signature, annotation, default or data shape
 changes it, and a body-only edit does not.
 

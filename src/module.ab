@@ -1561,15 +1561,18 @@ fun bootstrapContractDeclaration(
     )
 }
 
+// Explicit contracts keep their API functions. Ordinary dependencies provide
+// type shapes only, never remote externs for implementation helpers.
 fun bootstrapProjectContract(
     parsed: BootstrapParseResult,
-    moduleIdentity: string
+    moduleIdentity: string,
+    typesOnly: bool = false
 ): BootstrapParseResult {
     val declarations: array<BootstrapDeclaration> = []
     var index = 0
     while (index < parsed.declarations.size) {
         val declaration = parsed.declarations[index]
-        if (declaration.kind == "fun" || declaration.kind == "class" ||
+        if ((!typesOnly && declaration.kind == "fun") || declaration.kind == "class" ||
             declaration.kind == "interface" || declaration.kind == "extend") {
             declarations.append(bootstrapContractDeclaration(
                 declaration, moduleIdentity
@@ -2312,7 +2315,8 @@ fun bootstrapPrepareModuleSnapshot(
     aliases: array<BootstrapModuleAlias>,
     snapshots: array<BootstrapModuleSnapshot>,
     shadows: array<BootstrapModuleShadow>,
-    summary: BootstrapAliasSummary
+    summary: BootstrapAliasSummary,
+    typesOnly: bool = false
 ): BootstrapModuleSnapshot {
     val source = bootstrapRewriteModuleSource(
         snapshot, aliases, snapshots, shadows, summary
@@ -2324,7 +2328,7 @@ fun bootstrapPrepareModuleSnapshot(
     if (!contractOnly && source == snapshot.source) return snapshot
     var discovery = bootstrapModuleDiscovery(source, snapshot.path)
     if (contractOnly) {
-        discovery = bootstrapProjectContract(discovery, snapshot.path)
+        discovery = bootstrapProjectContract(discovery, snapshot.path, typesOnly)
     }
     val fingerprintSource = if (contractOnly) {
         bootstrapModuleInterfaceIdentity(discovery, 0, 0)
@@ -2480,7 +2484,9 @@ fun bootstrapRelativeImportSpelling(importer: string, target: string): string {
 
 fun bootstrapValidateStrictImports(
     aliases: array<BootstrapModuleAlias>,
-    snapshots: array<BootstrapModuleSnapshot>
+    snapshots: array<BootstrapModuleSnapshot>,
+    fullModules: Map<string, int>,
+    contractRoots: Map<string, int>
 ): BootstrapImportAliasValidation {
     val report = bootstrapVisibilityReportPath != ""
     val strict: array<bool> = []
@@ -2554,7 +2560,8 @@ fun bootstrapValidateStrictImports(
                 module, aliases, snapshots, asStrict
             )
             val findings = bootstrapStrictImportFindings(
-                snapshot, names, declaring, classes, classMembers, visible, typeNames
+                snapshot, names, declaring, classes, classMembers, visible, typeNames,
+                !fullModules.has(snapshot.path), !contractRoots.has(snapshot.path)
             )
             for (finding in findings) {
                 if (!suggestedKnown[finding.declaring]) {
@@ -2808,6 +2815,39 @@ class BootstrapStrictImportFinding(
     val column: int
 )
 
+fun bootstrapStrictContractTokens(
+    snapshot: BootstrapModuleSnapshot,
+    typesOnly: bool
+): array<BootstrapToken> {
+    val parsed = bootstrapParseWithIdentity(snapshot.source, snapshot.path)
+    val tokens = bootstrapLexShared(snapshot.source)
+    val retained: array<BootstrapToken> = []
+    var cursor = 0
+    for (declaration in parsed.declarations) {
+        // These are exactly the declaration kinds bootstrapProjectContract
+        // retains. It removes function expressions and class/extend methods.
+        if ((!typesOnly && declaration.kind == "fun") || declaration.kind == "class" ||
+            declaration.kind == "interface" || declaration.kind == "extend") {
+            var end = declaration.end
+            if (declaration.kind == "fun" &&
+                declaration.expression.kind != "missing") {
+                end = declaration.expression.begin
+            }
+            for (method in declaration.methods) {
+                if (method.begin < end) end = method.begin
+            }
+            while (cursor < tokens.size &&
+                tokens[cursor].begin < declaration.begin) cursor = cursor + 1
+            while (cursor < tokens.size && tokens[cursor].begin < end) {
+                retained.append(tokens[cursor])
+                cursor = cursor + 1
+            }
+        }
+    }
+    retained
+}
+
+
 /** The plain names `snapshot` uses from modules it doesn't see, each once.
  *  A name its own declarations bind (a parameter, local or field of the
  *  enclosing declaration, or a member of the class it is in or extends), a
@@ -2819,7 +2859,9 @@ fun bootstrapStrictImportFindings(
     classes: BootstrapStringSet,
     classMembers: array<array<string>>,
     visible: array<bool>,
-    typeNames: BootstrapStringSet
+    typeNames: BootstrapStringSet,
+    contractOnly: bool,
+    typesOnly: bool
 ): array<BootstrapStrictImportFinding> {
     val result: array<BootstrapStrictImportFinding> = []
     val source = snapshot.source
@@ -2828,7 +2870,8 @@ fun bootstrapStrictImportFindings(
     for (declaration in discovery.declarations) {
         if (declaration.extensionOwner == "") own.add(declaration.name)
     }
-    val tokens = bootstrapLexShared(source)
+    val tokens = if (contractOnly) bootstrapStrictContractTokens(snapshot, typesOnly)
+        else bootstrapLexShared(source)
     val bounds = bootstrapDeclarationBoundNamesIn(source, discovery, tokens)
     val reported = bootstrapStringSet()
     var inImport = false
@@ -3039,11 +3082,13 @@ class BootstrapModuleGraphIndex(
     // contract), and those of them loaded for their contract first.
     val fullModules: Map<string, int>,
     val upgradedModules: Map<string, int>,
+    // Explicit contract imports retain every root signature, in either order.
+    val contractRoots: Map<string, int>,
     var entryPath: string = ""
 )
 
 fun bootstrapModuleGraphIndex(): BootstrapModuleGraphIndex =
-    BootstrapModuleGraphIndex(Map(), [], [], [], Map(), Map(), 0, "", [], Map(), Map(), Map(), Map())
+    BootstrapModuleGraphIndex(Map(), [], [], [], Map(), Map(), 0, "", [], Map(), Map(), Map(), Map(), Map())
 
 class BootstrapModuleGraph(
     val modules: array<BootstrapModule>,
@@ -3220,8 +3265,9 @@ class BootstrapModuleGraph(
         this.index.modules.get(identity) != null
     }
 
-    fun loadContract(modulePath: string): string {
+    fun loadContract(modulePath: string, typesOnly: bool = false): string {
         val identity = bootstrapNormalizeModulePath(modulePath)
+        if (!typesOnly) this.index.contractRoots.set(identity, 1)
         if (!this.contains(identity)) {
             this.checkModuleManifest(identity)
             val snapshot = this.state.acquire(identity)
@@ -3252,7 +3298,7 @@ class BootstrapModuleGraph(
                             edge.end
                         )
                         this.recordImportEdge(snapshot, contractEdge, exposed)
-                        this.loadContract(imported)
+                        this.loadContract(imported, !edge.contractOnly)
                     }
                 }
                 index = index + 1
@@ -3568,7 +3614,8 @@ class BootstrapModuleGraph(
                 this.aliases,
                 this.orderedSnapshots,
                 shadows,
-                aliasSummary
+                aliasSummary,
+                !this.index.contractRoots.has(this.orderedSnapshots[preparedIndex].path)
             )
             preparedSnapshots.append(prepared)
             if (aliasSummary.twinnedTargets.has(prepared.path)) {
@@ -3584,7 +3631,8 @@ class BootstrapModuleGraph(
         )
         bootstrapFrontendTraceMemory("parse.aliases")
         val strictValidation = bootstrapValidateStrictImports(
-            this.aliases, this.orderedSnapshots
+            this.aliases, this.orderedSnapshots, this.index.fullModules,
+            this.index.contractRoots
         )
         var parseErrors = this.errors + aliasValidation.errors +
             strictValidation.errors

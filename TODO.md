@@ -555,6 +555,22 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
 
 ## Tried, not pursued
 
+- [ ] **Full contract-shape library loading needs a namespace design, not a
+  local import fix** (2026-11-05). Eager full loads broke compile-time provider
+  order; preserving ordinary order then leaked implementation helpers and
+  aliases into the flat namespace. Canonically hiding shape-only libraries
+  required transitive internal bindings, generated-module type names and
+  intrinsic/effect classification to change as well. On isolated NovaKind,
+  customer-editor-state produced 6,151 semantic errors in the direct-only
+  prototype, then 171 after internal transitive qualification, while v0.2.45
+  built both source snapshots cleanly. Keep the loading model stable for the
+  immediate fix: validate the retained contract surface and avoid projecting
+  dependency implementation functions as remote externs. Revisit full library
+  bodies only with an explicit design for flat sibling visibility, aliases,
+  generated code, compile-time registrations and intrinsics. Worktree
+  `ablac-contract-shape-namespace` retains the rejected prototypes and controls;
+  they are not approved production changes.
+
 - **Further user-release O2 trimming** (2026-11-04, LLVM23, master827d288a):
   14 configurations were screened with the actual held-module compiler on NovaKind's
   tool, the MVC server and QR; promising ones then reached the 13 benchmarks.

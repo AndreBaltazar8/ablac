@@ -106,3 +106,68 @@ perl -pi -e 's/\@rpc/\@changedContract/' "$temporary/backend.ab"
 
 printf '%s\n' \
     'contract imports: typed consumption + implementation isolation + stable body cache identity + rejection passed'
+
+visibility="$project_root/tests/cases/contract-visibility"
+for valid in main library-main cycle-main unused-signature; do
+    "$compiler" build "$visibility/$valid.ab" -o "$output/strict-$valid" \
+        --fast --no-cache --strict-imports
+    set +e
+    "$output/strict-$valid"
+    status=$?
+    set -e
+    [[ $status -eq 42 ]] || exit 1
+done
+
+# Prove the body-only dependency is poisonous if it is actually loaded.
+if "$compiler" --emit-llvm "$visibility/implementation-only.ab" \
+    > "$output/body-only.ll" 2> "$output/body-only.err"; then
+    echo "contract visibility: body-only poison unexpectedly compiled"; exit 1
+fi
+grep -qF 'error[E_IMPORT_NOT_FOUND]' "$output/body-only.err" || exit 1
+
+for invalid in missing-type contract-first ordinary-first unused-signature-full-first unused-signature-full-last; do
+    if "$compiler" build "$visibility/$invalid.ab" -o "$output/$invalid" \
+        --fast --no-cache --strict-imports > "$output/$invalid.err" 2>&1; then
+        echo "contract visibility: $invalid unexpectedly compiled"; exit 1
+    fi
+    name=helper
+    case $invalid in missing-type|unused-signature-full-*) name=HiddenType ;; esac
+    grep -qF "error[E_NAME_NOT_IMPORTED]: \`$name\`" "$output/$invalid.err" || \
+        { cat "$output/$invalid.err"; exit 1; }
+done
+
+# Flat programs keep their existing whole-program name resolution in either
+# order, including the implementation reference forbidden in strict mode.
+for flat in main contract-first ordinary-first; do
+    "$compiler" build "$visibility/$flat.ab" -o "$output/flat-$flat" --fast --no-cache
+    set +e
+    "$output/flat-$flat"
+    status=$?
+    set -e
+    [[ $status -eq 42 ]] || exit 1
+done
+
+# Projected dependencies do not become remote APIs. An explicit contract
+# import still exposes every root function, whether it is first or last.
+projection="$project_root/tests/cases/contract-projection"
+for name in main explicit-first explicit-last; do
+    "$compiler" build "$projection/$name.ab" -o "$output/projection-$name" --fast --no-cache
+    status=0
+    "$output/projection-$name" || status=$?
+    expected=2
+    [[ $name != main ]] || expected=1
+    [[ $status -eq $expected ]] || { echo "contract projection $name: $status != $expected"; exit 1; }
+done
+
+# Ordinary provider/consumer cycles keep v0.2.45's registration order.
+registrations="$project_root/tests/cases/contract-registration"
+for name in contract-first ordinary-first; do
+    "$compiler" build "$registrations/$name.ab" -o "$output/registration-$name" --fast --no-cache
+    status=0
+    "$output/registration-$name" || status=$?
+    [[ $status -eq 42 ]] || { echo "contract registration $name: $status"; exit 1; }
+    "$compiler" --emit-llvm "$registrations/$name.ab" > "$output/registration-$name-first.ll"
+    "$compiler" --emit-llvm "$registrations/$name.ab" > "$output/registration-$name-second.ll"
+    cmp "$output/registration-$name-first.ll" "$output/registration-$name-second.ll"
+done
+printf '%s\n' 'contract projection: strict surface, dependency types and root signatures passed'
