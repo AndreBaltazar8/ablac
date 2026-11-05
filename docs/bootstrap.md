@@ -64,6 +64,56 @@ Abla source graph and fixed-point check define the maintained compiler. A
 future release can be bootstrapped by the previous Abla release without
 reintroducing a second compiler implementation.
 
+## Historical-seed convergence
+
+The manual **Historical bootstrap convergence** workflow
+(`.github/workflows/bootstrap-convergence.yml`) compares two fresh Linux
+builders at the selected branch or commit. It never publishes a release.
+Its challenge seeds are fixed separately from the normal moving bootstrap
+pin:
+
+- Route A: checksum-pinned v0.2.45 → candidate stage 1 → stage 2 → stage 3.
+- Route B: checksum-pinned v0.2.44 → v0.2.45 sources, twice → candidate
+  stage 1 → stage 2 → stage 3. The historical source commit is
+  `ca9221b0615cd419284a9e8e9f671bf8429ccd3b`, the v0.2.45 tag; that tag's
+  own bootstrap pin is v0.2.44.
+
+Each source tree uses its own runtime, standard library and Nix shell.
+Candidate sources occupy `/build/source` on both builders, with a declared
+environment, fresh home, temporary and cache directories, no object-cache
+reuse, and at most four CPUs. The script refuses to overwrite an existing
+`/build/source` or `/build/historical`. Seed downloads are checked against
+reviewed SHA-256 values; missing, incompatible or corrupt seeds fail the job,
+with no fallback to a different seed.
+
+The canonical representation is the exact bytes of explicit, non-debug
+`--emit-llvm src/orc_main.ab`, before pruning, optimization or partitioning.
+Both stages emit it using the same entry spelling and logical source path.
+The gate checks stage 2 against stage 3 in each route, then compares the
+routes' stage-2 IR, ordinary compiler objects and executables. It also runs
+a native child returning 42. Kept production `.ll`, optimized bitcode and
+IR emitted by an older seed while building stage 1 are different artifacts;
+they are not substituted for this comparison. No source attributes, symbol
+names or other metadata are stripped to make a mismatch pass.
+
+Route artifacts retain both raw IR files, compiler binaries and objects,
+per-stage logs and durations, source revision/tree/archive hashes, seed and
+stage-chain hashes, and Nix toolchain paths, versions and closure identities.
+The join verifies those records and the dispatched revision, and retains an
+exact-match or first-difference report. Trigger with the Actions UI or:
+
+```sh
+gh workflow run bootstrap-convergence.yml --ref <branch-or-tag>
+```
+
+This is historical-seed route assurance within one compiler lineage, not a
+trusting-trust defense or an independent compiler implementation. It does not
+replace release tests or close tiers 4 and 5 of the
+[reliability roadmap](reliability-roadmap.md#7-complete-self-hosting-and-bootstrap-trust).
+Initially run it manually around releases, rather than adding five historical
+route builds to every push. Allow about 6–12 extra build minutes plus cold
+toolchain setup for route B; these are planning estimates, not a latency gate.
+
 ## Repository layout
 
 ```text

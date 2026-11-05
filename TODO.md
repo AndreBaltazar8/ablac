@@ -262,6 +262,11 @@
   capabilities are validated; use the same parser-derived `ablac fmt` for formatting.
 - [ ] **Clean-bootstrap convergence.** Tiers 4 and 5 of `docs/reliability-roadmap.md`: two
   independent bootstrap routes that reach the same canonical compiler IR on fresh builders.
+  Bounded first gate: manual Linux `bootstrap-convergence.yml` compares the pinned
+  v0.2.45 route with v0.2.44 through the v0.2.45 source tag, raw pre-prune IR at
+  identical logical paths, fixed points, provenance and compiler objects/binaries.
+  This is historical-seed convergence within one lineage; an independent translator
+  and target-independent maintenance remain open, as do both roadmap tiers.
 - [ ] **Language editions and a deprecation policy,** and signed package identities above the
   immutable locks, when the ecosystem needs them (`docs/reliability-roadmap.md` section 8).
 

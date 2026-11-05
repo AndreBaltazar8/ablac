@@ -444,6 +444,24 @@ Exit gate: two clean bootstrap routes on fresh builders produce the same
 canonical compiler IR and equivalent binaries; the resulting compiler passes
 the full suite and can compile the next source revision without seed changes.
 
+The manual Linux `bootstrap-convergence.yml` workflow is a bounded step toward
+tier 4. Two fresh builders use checksum-pinned releases: route A starts from
+v0.2.45; route B starts from v0.2.44 and rebuilds the v0.2.45 source tag twice
+before building the candidate. Each builds three candidate generations and
+requires generations 2 and 3 to agree, then a join job compares both routes.
+It checks exact raw, non-debug `--emit-llvm src/orc_main.ab` output, before
+release pruning or optimization, at the same absolute source path, with the
+same target and pinned LLVM environment. It strips no provenance or IR.
+Linux compiler objects and executables must also match. Logs, raw IR, seed
+and source hashes, stage chains and toolchain provenance are retained.
+
+This tests convergence from two historical starting artifacts within the same
+compiler lineage. It does not supply an independently implemented translator,
+exclude a common seed compromise, establish tier 5 target independence, or
+replace the release's functional suite. **Tiers 4 and 5 remain open.** See
+[the bootstrap gate](bootstrap.md#historical-seed-convergence) for its fixed
+routes, invocation and failure policy.
+
 ## 8. Production usability
 
 - Build signed publisher identities, a content-addressed registry, and
