@@ -19,6 +19,24 @@ if [[ ! -x $compiler ]]; then
         "$compiler" >&2
     exit 127
 fi
+# A payload that is this launcher (ABLA_COMPILER_PAYLOAD=build/ablac) would
+# start itself again in every child, without end.
+payload=$compiler
+while [[ -L $payload ]]; do
+    payload_directory=$(cd -- "$(dirname -- "$payload")" && pwd)
+    payload_target=$(readlink "$payload")
+    if [[ $payload_target == /* ]]; then
+        payload=$payload_target
+    else
+        payload=$payload_directory/$payload_target
+    fi
+done
+if [[ $(cd -- "$(dirname -- "$payload")" && pwd)/$(basename -- "$payload") == \
+      "$script_directory/$(basename -- "$launcher")" ]]; then
+    printf '[abla-limit] compiler payload is this launcher, not a compiler: %q\n' \
+        "$compiler" >&2
+    exit 127
+fi
 # Large pure-Abla applications can make the self-hosted frontend traverse
 # deeply nested typed source graphs. Reserve enough stack and virtual address
 # space for those builds while retaining the launcher's hard process bounds.
