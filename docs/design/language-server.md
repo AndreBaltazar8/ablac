@@ -1,7 +1,13 @@
 # `ablac lsp`: first implementation proposal
 
-Status: **approved design; shared-frontend extraction ready for lead validation.**
-The LSP adapter is a separate, later commit.
+Status: **the native transport proposal below is superseded.**
+`abla-lsp` 0.3.0 already owns LSP and transactional refactoring as a deliberately
+separate project. Task #457 now extends only `ablac analyze`: opt-in graph-aware
+snapshots and indexed positional queries, preserving schema 1. No native
+`ablac lsp` command and no Node dependency will be added to ablac. The existing
+adapter design is retained below as review history; transport/UI belong to
+abla-lsp, and formatting belongs to the separate `ablac fmt` stack.
+
 Source audit: compiler checkout `144a3c1f` (v0.2.45 preparation). The pending
 formatter commits `0ec220f0` and `0abf3343` are a dependency. The ongoing
 contract-loading regression fix must land before editor/build parity is gated.

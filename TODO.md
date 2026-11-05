@@ -254,9 +254,12 @@
 - [x] **Parser-derived formatter.** `ablac fmt` preserves comments and verbatim syntax,
   checks full AST/token parity and idempotence before atomic writes, and supports stdin,
   `--check` diffs and one line-width setting. See `docs/formatter.md`.
-- [ ] **No language server.** `ablac` has `analyze` and the analysis service to build it on
-  (`docs/reliability-roadmap.md` section 8: derive it from the compiler's parser and type
-  APIs so it can't drift from the language).
+- [x] **Language server.** `abla-lsp` is the separate compiler-backed language server and
+  transactional refactoring engine, using protocol 1 over `ablac analyze --stdio`.
+  No native LSP adapter or Node dependency belongs in ablac.
+- [ ] **Editor analysis integration.** Grow opt-in graph-aware analysis and indexed positional
+  queries from the compiler's own parser/type APIs. Update abla-lsp separately after the compiler
+  capabilities are validated; use the same parser-derived `ablac fmt` for formatting.
 - [ ] **Clean-bootstrap convergence.** Tiers 4 and 5 of `docs/reliability-roadmap.md`: two
   independent bootstrap routes that reach the same canonical compiler IR on fresh builders.
 - [ ] **Language editions and a deprecation policy,** and signed package identities above the

@@ -1,3 +1,5 @@
+import "module_paths.ab"
+import "abla/sys/linux/fs"
 // Compiler frontend operations shared by builds and editor analysis.
 // This module owns no protocol, filesystem writes, LLVM emission or type inference.
 import "module.ab"
@@ -47,7 +49,8 @@ class BootstrapFrontendProject(
     val modules: array<BootstrapModule>,
     val blocked: array<BootstrapExpression>,
     val blockedSources: array<string>,
-    val namedArgumentsNormalized: bool
+    val namedArgumentsNormalized: bool,
+    val fullModules: Map<string, int> = Map()
 )
 
 fun bootstrapFrontendCollectCompile(
@@ -119,7 +122,7 @@ fun bootstrapFrontendLoadProject(
             }
         }
     }
-    BootstrapFrontendProject(parsed, graph.modules, blocked, sources, policy.compileTime)
+    BootstrapFrontendProject(parsed, graph.modules, blocked, sources, policy.compileTime, graph.index.fullModules)
 }
 
 // Declaration handles in typed calls refer to this normalized parse, not to
@@ -140,6 +143,61 @@ fun bootstrapFrontendAnalyzeProject(
     sources: array<string>
 ): BootstrapFrontendAnalysis? {
     if (project.blocked.size > 0 || project.written.errors > 0) return null
+    val named = if (project.namedArgumentsNormalized) project.written
+        else bootstrapNormalizeNamedArguments(project.written)
+    val prepared = bootstrapPreSemanticPipeline(named)
+    BootstrapFrontendAnalysis(prepared, bootstrapAnalyzeRequestedSourceSpans(
+        prepared, begins, ends, kinds, sources
+    ))
+}
+
+// Host executable builds load entry, platform, then self runtime. Keep
+// runtime source declarations in analysis too; unsafe wrappers call that ABI.
+fun bootstrapFrontendLoadHostGraph(
+    sourcePath: string,
+    var state: BootstrapModuleState
+): BootstrapModuleGraph {
+    val graph = BootstrapModuleGraph([], 0, state, [], [], "", [], bootstrapModuleGraphIndex())
+    val standardLibrary = Path(bootstrapStandardLibraryRoot())
+    graph.useRootManifest(bootstrapNormalizeModulePath(sourcePath))
+    graph.load(sourcePath)
+    graph.load(standardLibrary.child("abla/runtime/platform/host.ab").text)
+    graph.load(standardLibrary.child("abla/runtime/self/entry.ab").text)
+    graph
+}
+
+fun bootstrapFrontendLoadHostProject(
+    entry: string,
+    var state: BootstrapModuleState
+): BootstrapFrontendProject {
+    val previous = state.syntaxOnly
+    state.syntaxOnly = true
+    state.beginCounting()
+    val graph = bootstrapFrontendLoadHostGraph(entry, state)
+    val parsed = graph.parse()
+    state.syntaxOnly = previous
+    val blocked: array<BootstrapExpression> = []
+    val sources: array<string> = []
+    for (module in graph.modules) {
+        val local = bootstrapParseWithIdentity(module.source, module.path)
+        for (declaration in local.declarations) {
+            bootstrapFrontendCollectDeclarationCompile(declaration, blocked, sources)
+        }
+        for (action in local.actions) {
+            bootstrapFrontendCollectCompile(action, module.path, blocked, sources)
+        }
+    }
+    BootstrapFrontendProject(parsed, graph.modules, blocked, sources, false, graph.index.fullModules)
+}
+
+// Symbolic pre-CT typing only: sema.inferCompile types its operand and checks
+// effects; it does not evaluate it. Do not call bootstrapCtAnalyze or staged
+// evaluation here. Pending evaluations remain explicit in the protocol result.
+fun bootstrapFrontendTypeProject(
+    project: BootstrapFrontendProject,
+    begins: array<int>, ends: array<int>, kinds: array<string>, sources: array<string>
+): BootstrapFrontendAnalysis? {
+    if (project.written.errors > 0) return null
     val named = if (project.namedArgumentsNormalized) project.written
         else bootstrapNormalizeNamedArguments(project.written)
     val prepared = bootstrapPreSemanticPipeline(named)

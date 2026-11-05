@@ -1,7 +1,9 @@
 # Shared frontend extraction for the language server
 
 This is the first implementation step of the [LSP design](language-server.md),
-separate from the adapter. The [pre-change baseline](language-server-baseline.md)
+before the separate abla-lsp project was identified. No native LSP adapter is
+planned in ablac; the next compiler step is [opt-in graph analysis](analysis-graph.md).
+The [pre-change baseline](language-server-baseline.md)
 records the current service's measured behavior and phase breakdown.
 
 ## API boundary

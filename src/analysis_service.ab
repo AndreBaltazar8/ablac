@@ -1,3 +1,4 @@
+import "analysis_graph.ab"
 import "frontend_diagnostics.ab"
 import "frontend.ab"
 // Persistent, editor-independent compiler analysis protocol.
@@ -37,7 +38,11 @@ class BootstrapAnalysisService(
     val overlays: array<BootstrapAnalysisDocument>,
     var revision: int,
     var initialized: bool,
-    var running: bool
+    var running: bool,
+    var graphMode: bool = false,
+    val graphEntries: array<string> = [],
+    val graphInputPaths: array<string> = [],
+    val graphInputValues: array<string> = []
 )
 
 class BootstrapAnalysisSemanticGroup(
@@ -623,7 +628,9 @@ fun bootstrapAnalysisOccurrencesJson(
     sourceIdentity: string,
     parsed: BootstrapParseResult,
     declarations: array<BootstrapDeclaration>,
-    semantic: BootstrapSemanticResult
+    semantic: BootstrapSemanticResult,
+    aliases: Map<string, string> = Map(),
+    requireKnownIdentity: bool = false
 ): Json {
     val values: array<Json> = []
     val tokens = bootstrapLex(source)
@@ -712,6 +719,11 @@ fun bootstrapAnalysisOccurrencesJson(
                     resolvedType = typed.type
                 }
                 call = call + 1
+            }
+            if (declarationId != "") {
+                val canonical = aliases.get(declarationId)
+                if (canonical != null) declarationId = canonical
+                else if (requireKnownIdentity) declarationId = ""
             }
             if (declarationId != "") {
                 keys.append("declarationId")
@@ -963,7 +975,7 @@ fun bootstrapAnalysisSemanticGroup(
     )
 }
 
-fun BootstrapAnalysisService.snapshot(): Json {
+fun BootstrapAnalysisService.legacySnapshot(): Json {
     val documents = this.documents()
     val parsedDocuments: array<BootstrapParseResult> = []
     var documentIndex = 0
@@ -1005,6 +1017,9 @@ fun BootstrapAnalysisService.snapshot(): Json {
         [jsonString("${this.revision}"), jsonArray(values)]
     )
 }
+
+fun BootstrapAnalysisService.snapshot(): Json =
+    if (this.graphMode) this.graphSnapshot() else this.legacySnapshot()
 
 fun bootstrapAnalysisSnapshotDiagnosticCount(
     snapshot: Json,
@@ -1111,9 +1126,12 @@ fun bootstrapAnalysisSnapshotPreservesUneditedSymbols(
 fun bootstrapAnalysisOwnedString(value: string): string = "$value"
 
 fun BootstrapAnalysisService.validateEdit(params: Json): Json {
+    val graphBaseline = if (this.graphMode) this.graphSnapshot() else jsonNull()
     var valid = params.getString("baseRevision") == "${this.revision}"
     var reason = if (valid) "" else "analysis revision is stale"
     val candidate = BootstrapAnalysisService([], [], this.revision, true, true)
+    candidate.graphMode = this.graphMode
+    for (entry in this.graphEntries) candidate.graphEntries.append(entry)
     var root = 0
     while (root < this.roots.size) {
         candidate.roots.append(bootstrapAnalysisOwnedString(this.roots[root]))
@@ -1228,8 +1246,19 @@ fun BootstrapAnalysisService.validateEdit(params: Json): Json {
         edit = edit + 1
     }
 
-    val baseline = this.snapshot()
+    val baseline = if (this.graphMode) graphBaseline else this.snapshot()
+    if (this.graphMode && !baseline.get("complete").asBoolean()) {
+        return jsonObject(["valid", "reason"], [jsonBoolean(false), jsonString("graph analysis is incomplete; compile-time evaluation was not performed")])
+    }
+    if (this.graphMode) {
+        candidate.graphEntries.truncate(0)
+        candidate.graphEntries.append(baseline.getString("entry"))
+    }
     val prospective = if (valid) candidate.snapshot() else jsonNull()
+    if (valid && this.graphMode && !prospective.get("complete").asBoolean()) {
+        valid = false
+        reason = "prospective graph analysis is incomplete; compile-time evaluation was not performed"
+    }
     if (valid && bootstrapAnalysisSnapshotIntroducesDiagnostic(
         baseline, prospective
     )) {
@@ -1280,19 +1309,28 @@ fun BootstrapAnalysisService.initialize(params: Json): Json {
             index = index + 1
         }
     }
+    this.graphMode = params.getString("analysisMode") == "graph-v1"
+    val entries = params.get("entryPoints")
+    var entryIndex = 0
+    while (entries.isArray() && entryIndex < entries.size()) {
+        if (entries.at(entryIndex).isString()) this.graphEntries.append(entries.at(entryIndex).asString())
+        entryIndex = entryIndex + 1
+    }
+    val capabilities = [jsonString("document-overlays"), jsonString("parser-diagnostics"),
+        jsonString("declarations"), jsonString("semantic-call-references"), jsonString("semantic-name-references")]
+    if (this.graphMode) {
+        capabilities.append(jsonString("module-graph-analysis-v1"))
+        capabilities.append(jsonString("no-eval-ct"))
+        capabilities.append(jsonString("pre-ct-types"))
+        capabilities.append(jsonString("refactor-validation-complete-only"))
+    }
     this.initialized = true
     jsonObject(
         ["compilerVersion", "protocolVersion", "capabilities"],
         [
             jsonString(ABLA_COMPILER_VERSION),
             jsonInteger(ABLA_ANALYSIS_PROTOCOL_VERSION),
-            jsonArray([
-                jsonString("document-overlays"),
-                jsonString("parser-diagnostics"),
-                jsonString("declarations"),
-                jsonString("semantic-call-references"),
-                jsonString("semantic-name-references")
-            ])
+            jsonArray(capabilities)
         ]
     )
 }
@@ -1308,13 +1346,25 @@ fun BootstrapAnalysisService.handle(request: Json): string {
             id, "unsupported_schema", "unsupported analysis protocol schema"
         )
     } else if (method == "initialize") {
-        response = bootstrapAnalysisResponse(id, this.initialize(params))
+        val mode = params.getString("analysisMode")
+        if (mode != "" && mode != "graph-v1") response = bootstrapAnalysisError(id, "unsupported_analysis_mode", "unsupported analysisMode")
+        else if (this.initialized && (this.graphMode || mode == "graph-v1")) response = bootstrapAnalysisError(id, "already_initialized", "initialize may only run once in graph mode")
+        else response = bootstrapAnalysisResponse(id, this.initialize(params))
     } else if (!this.initialized) {
         response = bootstrapAnalysisError(
             id, "not_initialized", "initialize must be the first request"
         )
     } else if (method == "document/open" || method == "document/change") {
         val uri = params.getString("uri")
+        if (this.graphMode && !bootstrapAnalysisGraphUriValid(uri)) return bootstrapAnalysisError(
+            id, "invalid_params", "graph documents require a local absolute file URI")
+        if (this.graphMode) {
+            for (overlay in this.overlays) {
+                if (overlay.active && overlay.uri != uri && bootstrapAnalysisGraphPath(overlay.path) == bootstrapAnalysisGraphPath(uri)) {
+                    return bootstrapAnalysisError(id, "duplicate_document_path", "the same lexical path is already open under another URI")
+                }
+            }
+        }
         val accepted = this.storeOverlay(
             uri, params.getInt("version"), params.getString("text")
         )
@@ -1329,6 +1379,12 @@ fun BootstrapAnalysisService.handle(request: Json): string {
         this.closeOverlay(params.getString("uri"))
         response = bootstrapAnalysisResponse(id, jsonNull())
     } else if (method == "analyze") {
+        if (this.graphMode && params.get("roots").isArray()) {
+            this.graphEntries.truncate(0)
+            for (root in params.get("roots").values) {
+                if (root.isString()) this.graphEntries.append(root.asString())
+            }
+        }
         response = bootstrapAnalysisResponse(id, this.snapshot())
     } else if (method == "refactor/validate") {
         response = bootstrapAnalysisResponse(id, this.validateEdit(params))

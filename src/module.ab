@@ -974,6 +974,90 @@ class BootstrapImportProviderDiscovery(
     }
 }
 
+// Literal package descriptors are data, not compile-time programs. Use the
+// compiler parser and the evaluator's pure value constructors, never its AST
+// dispatcher, user declarations, resolver closures, or native providers.
+fun bootstrapLiteralImportValue(expression: BootstrapExpression, depth: int): BootstrapEvalValue {
+    if (depth > 8 || expression.kind != "call") return bootstrapEvalNull()
+    if (expression.text == "github" && expression.children.size == 1 &&
+        expression.children[0].kind == "string" && expression.children[0].text.size <= 16384) {
+        return bootstrapGithubImportValue(expression.children[0].text)
+    }
+    if (expression.text == "gitImportSource" && expression.children.size == 4) {
+        for (child in expression.children) {
+            if (child.kind != "string" || child.text.size > 16384) return bootstrapEvalNull()
+        }
+        return bootstrapGitImportValue(bootstrapEvalString(expression.children[0].text),
+            bootstrapEvalString(expression.children[1].text), bootstrapEvalString(expression.children[2].text),
+            bootstrapEvalString(expression.children[3].text))
+    }
+    if (expression.text == "importSubpath" && expression.children.size == 2 &&
+        expression.children[1].kind == "string" && expression.children[1].text.size <= 16384) {
+        val source = bootstrapLiteralImportValue(expression.children[0], depth + 1)
+        if (source.kind == "object" && source.owner == "ImportSource" && source.elements.size == 11) {
+            return bootstrapImportSubpathValue(source, expression.children[1].text)
+        }
+    }
+    bootstrapEvalNull()
+}
+
+fun bootstrapLiteralImportProvider(
+    expression: string, rootManifest: string,
+    ordered: array<BootstrapModuleSnapshot>, current: BootstrapParseResult
+): BootstrapImportProviderResult {
+    val empty = BootstrapPackageDependency("", "", "", "", "", "", "", "", [])
+    // A same-spelled callable may shadow the constructor. Keep this case
+    // pending rather than pretending that the user's provider is builtin.
+    for (snapshot in ordered) {
+        for (declaration in snapshot.discovery.declarations) {
+            if (declaration.name == "github" || declaration.name == "gitImportSource" ||
+                declaration.name == "importSubpath") return BootstrapImportProviderResult(empty, 1,
+                "error[E_ANALYSIS_CT_REQUIRED]: analysis incomplete: shadowed import provider requires evaluation\n")
+        }
+    }
+    for (declaration in current.declarations) {
+        if (declaration.name == "github" || declaration.name == "gitImportSource" ||
+            declaration.name == "importSubpath") return BootstrapImportProviderResult(empty, 1,
+            "error[E_ANALYSIS_CT_REQUIRED]: analysis incomplete: shadowed import provider requires evaluation\n")
+    }
+    val parsed = bootstrapParse("#$expression")
+    var value = bootstrapEvalNull()
+    if (parsed.errors == 0 && parsed.actions.size == 1 &&
+        parsed.actions[0].kind == "compile" && parsed.actions[0].children.size == 1) {
+        value = bootstrapLiteralImportValue(parsed.actions[0].children[0], 0)
+    }
+    if (value.kind != "object") return BootstrapImportProviderResult(empty, 1,
+        "error[E_ANALYSIS_CT_REQUIRED]: analysis incomplete: nonliteral import provider requires evaluation\n")
+    val decoded = bootstrapPackageDependencyFromValue(value, false)
+    if (decoded.errors != 0) return decoded
+    if (rootManifest == "" || rootManifest == "-") return BootstrapImportProviderResult(empty, 1,
+        "error[E_PACKAGE_LOCK_DISAGREEMENT]: literal provider requires a project manifest and lock\n")
+    val lock = bootstrapPackageReadLock(Path(rootManifest).parent().child("abla.lock").text)
+    val index = bootstrapPackageLockIndex(lock.packages, decoded.dependency.name)
+    if (!lock.valid || index < 0 || !bootstrapPackageDependencyMatches(decoded.dependency, lock.packages[index])) {
+        return BootstrapImportProviderResult(empty, 1,
+            "error[E_PACKAGE_LOCK_DISAGREEMENT]: literal import provider does not match the root abla.lock; update packages explicitly\n")
+    }
+    decoded
+}
+
+fun bootstrapLiteralImportCurrent(rootManifest: string, dependency: BootstrapPackageDependency, imported: string): bool {
+    if (rootManifest == "" || rootManifest == "-") return false
+    val lock = bootstrapPackageReadLock(Path(rootManifest).parent().child("abla.lock").text)
+    val index = bootstrapPackageLockIndex(lock.packages, dependency.name)
+    if (!lock.valid || index < 0 || !bootstrapPackageDependencyMatches(dependency, lock.packages[index])) return false
+    val package = lock.packages[index]
+    val wrapper = Path(imported).parent()
+    if (wrapper.name() == dependency.name && wrapper.parent().name() == "packages") {
+        return wrapper.child("revision").readText() == package.revision &&
+            wrapper.child("digest").readText() == package.digest &&
+            wrapper.child("source-url").readText() == package.source
+    }
+    val vendor = bootstrapPackageRootOfEntry(imported, dependency.name)
+    vendor != "" && Path(vendor).child(".abla-revision").readText() == package.revision &&
+        Path(vendor).child(".abla-digest").readText() == package.digest
+}
+
 fun bootstrapEvaluateImportProvider(
     expression: string,
     ordered: array<BootstrapModuleSnapshot>,
@@ -3359,11 +3443,9 @@ class BootstrapModuleGraph(
                         this.loadContract(imported)
                     } else this.load(imported)
                 } else {
-                    val provider = if (this.state.syntaxOnly) BootstrapImportProviderResult(
-                        BootstrapPackageDependency("", "", "", "", "", "", "", "", []),
-                        1,
-                        "error[E_ANALYSIS_CT_REQUIRED]: analysis incomplete: import provider evaluation is disabled\nsource[import]:$identity:${edge.begin}:${edge.end}\n"
-                    ) else bootstrapEvaluateImportProvider(
+                    val provider = if (this.state.syntaxOnly)
+                        bootstrapLiteralImportProvider(edge.source, this.index.remapRoot,
+                            this.orderedSnapshots, snapshot.discovery) else bootstrapEvaluateImportProvider(
                         edge.source, this.orderedSnapshots,
                         snapshot.discovery
                     )
@@ -3372,7 +3454,11 @@ class BootstrapModuleGraph(
                             identity, "package/${provider.dependency.name}"
                         )
                         var subpathDiagnostic = ""
-                        if (imported != "" && provider.dependency.subpaths.size > 0) {
+                        if (this.state.syntaxOnly && imported != "" &&
+                            !bootstrapLiteralImportCurrent(this.index.remapRoot, provider.dependency, imported)) {
+                            subpathDiagnostic = "error[E_PACKAGE_LOCK_DISAGREEMENT]: materialized package metadata does not match the root lock\n"
+                        }
+                        if (subpathDiagnostic == "" && imported != "" && provider.dependency.subpaths.size > 0) {
                             val found = bootstrapPackageFindSubpath(
                                 bootstrapPackageRootOfEntry(imported, provider.dependency.name),
                                 provider.dependency.name, provider.dependency.subpaths[0]
@@ -3398,12 +3484,12 @@ class BootstrapModuleGraph(
                         } else {
                             this.errors = this.errors + 1
                             this.diagnostics =
-                                "${this.diagnostics}error[E_PACKAGE_IMPORT]: locked package `${provider.dependency.name}` could not be resolved from module `$identity`\n"
+                                "${this.diagnostics}error[E_PACKAGE_IMPORT]: locked package `${provider.dependency.name}` could not be resolved from module `$identity`\n${if (this.state.syntaxOnly) "source[import]:$identity:${edge.begin}:${edge.end}\n" else ""}"
                         }
                     } else {
                         this.errors = this.errors + provider.errors
                         this.diagnostics =
-                            "${this.diagnostics}${provider.diagnostic}"
+                            "${this.diagnostics}${provider.diagnostic}${if (this.state.syntaxOnly) "source[import]:$identity:${edge.begin}:${edge.end}\n" else ""}"
                     }
                 }
                 index = index + 1
