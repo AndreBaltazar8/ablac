@@ -129,8 +129,8 @@
 
 ## Compiler and stdlib
 
-- [ ] **abla-pdf still carries its own unblinded RSA for signing.** It could move to the released
-  `abla/crypto/rsa`, as abla-saft has done.
+- [x] **abla-pdf signs through the released `abla/crypto/rsa`** (since its 1a2c416, as abla-saft does). Its
+  64c36d1 checks signatures against OpenSSL and against the old signer, byte for byte, on ablac 0.2.45.
 - [x] **Encrypted RSA key import:** pure PBES2/PBKDF2 SHA256/SHA1 + AES128/256-CBC PKCS#8 and MAC-verified DER PKCS#12 key bags, with owned passwords and bounded work. Legacy PBES1/RC2/DES and broader PFX formats remain unsupported; see [the scope and limits](docs/stdlib/encrypted-keys.md).
 - [ ] **No timing measurements of abla/crypto.** `tools/test-ct.sh` reads the assembly; nothing has run a statistical
   test (`dudect`) on real hardware, or anything at all on an ESP32-S3. The Xtensa path is compiled and read only.
