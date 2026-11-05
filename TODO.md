@@ -261,10 +261,6 @@
   independent bootstrap routes that reach the same canonical compiler IR on fresh builders.
 - [ ] **Language editions and a deprecation policy,** and signed package identities above the
   immutable locks, when the ecosystem needs them (`docs/reliability-roadmap.md` section 8).
-- [ ] **Docs behind the code.** `docs/status.md`'s next priorities still list interfaces and
-  checked generics, and comments still call shipped features unsupported: `failReserved` in
-  `src/parser.ab` (`<T>`, `sealed`) and `validateConformances` in `src/sema.ab` (an
-  interface's parents).
 
 ## Packages
 

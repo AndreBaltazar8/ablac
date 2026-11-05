@@ -15,6 +15,10 @@ require libc; hosted facilities are optional capabilities.
 
 - The self-hosted compiler builds directly through LLVM and reproduces its
   generated LLVM module byte-for-byte at the fixed point.
+- The language supports nominal interfaces with inheritance and default
+  members, sealed interfaces with exhaustive `when`, and generic functions,
+  classes and methods with interface bounds and type-argument inference.
+  See [language.md](language.md#interfaces) and its [generics section](language.md#generics).
 - The hosted compiler and ordinary Abla programs build and run natively on
   x86-64 Linux plus Intel and Apple Silicon macOS; the macOS gate covers
   Mach-O emission, ORC, console, filesystem, and child-process behavior.
@@ -78,8 +82,10 @@ follow-on performance and API work, not blockers for the foundation milestone.
 
 1. Reduce cold semantic-analysis and lowering cost without weakening fixed-point
    or conformance gates; preserve the warm cache path.
-2. Continue the language safety/type layer: checked generics, interfaces,
-   inference, aggregate lifetime cases, and concurrency primitives.
+2. Close remaining ownership and inference edge cases, and decide which
+   reserved generic forms to implement: `where` clauses, `const` type
+   parameters and associated types. Preserve the shipped interface and
+   generic conformance gates; open work is tracked in [TODO.md](../TODO.md).
 3. Grow host-neutral standard libraries and extension-owned Android/WASM
    packages on top of the generic compiler contracts.
 4. Add signed package/registry identities above the immutable provider/lock
