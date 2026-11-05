@@ -305,25 +305,32 @@ with tempfile.TemporaryDirectory(prefix="abla-device-test-") as directory:
 
     # Interrupt a stalled poll repeatedly. A retry that reuses the old duration
     # instead of recomputing the deadline would run until this two-second
-    # signal stream ends, rather than the requested 100ms.
+    # signal stream ends, rather than the requested 400ms. Synchronize the
+    # sender first, and allow timer granularity/scheduling on hosted runners.
     master, slave = pty.openpty()
     client = None
     stop_signals = threading.Event()
+    sender_ready = threading.Event()
+    start_signals = threading.Event()
     sender = None
     sent = []
     try:
         tty.setraw(slave)
-        client = Client("signals", os.ttyname(slave), large, timeout=100)
+        client = Client("signals", os.ttyname(slave), large, timeout=400)
         client.send("G")
         line(client.proc, "WRITING")
-        client.send("G")
         def interrupt():
+            sender_ready.set()
+            start_signals.wait()
             until = time.monotonic() + 2
             while time.monotonic() < until and not stop_signals.wait(0.005):
                 os.kill(client.proc.pid, signal.SIGUSR1)
                 sent.append(1)
         sender = threading.Thread(target=interrupt)
         sender.start()
+        assert sender_ready.wait(3), "signal sender did not start"
+        client.send("G")
+        start_signals.set()
         state, written, error, elapsed = map(int, line(client.proc, "RESULT"))
         stop_signals.set()
         sender.join(timeout=3)
@@ -334,6 +341,7 @@ with tempfile.TemporaryDirectory(prefix="abla-device-test-") as directory:
         print(f"device interrupted poll: {len(sent)} signals, {elapsed}ms", flush=True)
     finally:
         stop_signals.set()
+        start_signals.set()
         if sender: sender.join(timeout=3)
         if client: client.clean()
         os.close(master)
