@@ -11902,6 +11902,55 @@ fun bootstrapLowerDoWhile(
     result
 }
 
+// Only syntax-known native scalar constants qualify. Do not speculate on
+// identifiers or calls, even ones an optimizer might later fold: their source
+// evaluation and ownership remain the ordinary array path's responsibility.
+fun bootstrapForScalarLiteral(expression: BootstrapExpression, type: string): bool {
+    var literal = expression
+    if ((literal.kind == "unary-" || literal.kind == "unary+") &&
+        literal.children.size == 1) {
+        literal = literal.children[0]
+        if (literal.kind == "true" || literal.kind == "false") return false
+    }
+    (type == "i64" && literal.kind == "integer") ||
+        (type == "f64" && literal.kind == "float") ||
+        (type == "f32" && literal.kind == "float32") ||
+        (type == "bool" && (literal.kind == "true" || literal.kind == "false"))
+}
+
+fun bootstrapForConstantArray(expression: BootstrapExpression, type: string): bool {
+    if (expression.kind != "array" || expression.children.size > 16) return false
+    if (type != "i64" && type != "f64" && type != "f32" && type != "bool") return false
+    for (element in expression.children) {
+        if (!bootstrapForScalarLiteral(element, type)) return false
+    }
+    true
+}
+
+// One copy of the loop body, with a native scalar selection by the public
+// ordinal. Existing IR has no typed constant-table lookup; this bounded tree
+// needs no array, boxing or target-specific operation, including at --fast.
+fun bootstrapLowerForLiteralSelect(
+    var lowerer: BootstrapLowerer, values: array<int>, ordinal: int,
+    begin: int, end: int, storage: string, done: int
+): void {
+    if (end - begin == 1) {
+        lowerer.emitControl("local.set", values[begin], -1, -1, storage)
+        lowerer.emitControl("jump", -1, done, -1, "")
+        return
+    }
+    val middle = begin + (end - begin) / 2
+    val left = lowerer.allocateLabel()
+    val right = lowerer.allocateLabel()
+    val limit = lowerer.emit("const.i64", -1, -1, "$middle")
+    val before = lowerer.emit("<", ordinal, limit, "")
+    lowerer.emitControl("branch", before, left, right, "")
+    lowerer.emitControl("label", -1, left, -1, "")
+    bootstrapLowerForLiteralSelect(lowerer, values, ordinal, begin, middle, storage, done)
+    lowerer.emitControl("label", -1, right, -1, "")
+    bootstrapLowerForLiteralSelect(lowerer, values, ordinal, middle, end, storage, done)
+}
+
 @noinline
 fun bootstrapLowerFor(
     var lowerer: BootstrapLowerer,
@@ -11921,6 +11970,18 @@ fun bootstrapLowerFor(
     // never materialised as an array. Both bounds are evaluated once.
     val rangeKind = expression.children[0].kind
     val range = rangeKind == "range.until" || rangeKind == "range.closed"
+    val literal = bootstrapForConstantArray(expression.children[0], elementType)
+    val constants: array<int> = []
+    var literalStorage = ""
+    if (literal) {
+        // Constants still pass through ordinary literal lowering in source
+        // order. The hidden native slot also types the unreachable empty body.
+        for (element in expression.children[0].children) {
+            constants.append(lowerer.lowerExpression(element))
+        }
+        literalStorage = "for_literal_${lowerer.allocateLabel()}"
+        lowerer.emitControl(bootstrapIrLocalZeroOpcode(elementType), -1, -1, -1, literalStorage)
+    }
     var source = -1
     var length = -1
     var indexStorage = ""
@@ -11932,7 +11993,7 @@ fun bootstrapLowerFor(
             "local.zero.i64", -1, -1, -1, indexStorage
         )
         lowerer.emitControl("local.set", begin, -1, -1, indexStorage)
-    } else {
+    } else if (!literal) {
         source = lowerer.lowerExpression(expression.children[0])
     }
     // A generator iterated in place is the loop's: a local of a scope around
@@ -11955,7 +12016,8 @@ fun bootstrapLowerFor(
         val lengthOpcode = if (sourceType == "string") {
             "string.length"
         } else "array.length"
-        length = lowerer.emit(lengthOpcode, source, -1, "")
+        length = if (literal) lowerer.emit("const.i64", -1, -1, "${constants.size}")
+            else lowerer.emit(lengthOpcode, source, -1, "")
         indexStorage = "for_index_${lowerer.nextLabel}"
         lowerer.emitControl(
             "local.zero.i64", -1, -1, -1, indexStorage
@@ -12005,7 +12067,13 @@ fun bootstrapLowerFor(
     }
     lowerer.emitControl("branch", more, bodyLabel, mergeLabel, "")
     lowerer.emitControl("label", -1, bodyLabel, -1, "")
+    if (literal && constants.size > 0) {
+        val selected = lowerer.allocateLabel()
+        bootstrapLowerForLiteralSelect(lowerer, constants, index, 0, constants.size, literalStorage, selected)
+        lowerer.emitControl("label", -1, selected, -1, "")
+    }
     val value = if (range) index
+    else if (literal) lowerer.emit("local.load", -1, -1, literalStorage)
     else if (bootstrapIsGeneratorType(sourceType))
         lowerer.emit(
             "generator.value",

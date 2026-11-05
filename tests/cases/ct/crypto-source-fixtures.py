@@ -69,27 +69,9 @@ def fixture(name, args, setup, actual, taints, leak_address='work'):
         (leaks if bad else specs).append(exported + ':' + taints)
 
 
-# The middle orthogonalization pass walks a public literal array. The actual
-# array/static-value/GC dispatch cannot be followed by this checker. Unroll
-# its literal indices from source, keeping every arithmetic statement intact.
-orthogonal = body(AES, 'aesOrthogonalize')
-match = re.search(r'    for \(i in \[([0-9, ]+)\]\) \{\n(.*?)\n    \}', orthogonal, re.S)
-assert match, 'orthogonalization public literal loop changed'
-indices = [int(x.strip()) for x in match[1].split(',')]
-stages = []
-for at, index in enumerate(indices):
-    # Rename the two per-iteration locals so no new lexical block/closure is
-    # introduced when replacing the public array loop with these four stages.
-    stage = re.sub(r'\bx\b', 'ctLiteralX' + str(at), match[2])
-    stage = re.sub(r'\by\b', 'ctLiteralY' + str(at), stage)
-    stages.append(re.sub(r'\bi\b', str(index), stage))
-expanded = '\n'.join(stages)
-orthogonal = orthogonal[:match.start()] + expanded + orthogonal[match.end():]
-out.append('@inline trusted fun ctSourceOrthogonalize(q: int): void {' + orthogonal + '\n}\n')
-
 # Expand the source SubWord calls textually so the local checker sees their
 # arithmetic rather than stopping at a potentially out-of-line helper call.
-subword = body(AES, 'aesSubWord').replace('aesOrthogonalize(', 'ctSourceOrthogonalize(')
+subword = body(AES, 'aesSubWord')
 assert subword.endswith('    aesLoad(q)')
 subword = subword[:-len('    aesLoad(q)')]
 schedule, before, after = section(body(AES, 'aesExpandBytes'),
@@ -100,7 +82,6 @@ for arg, suffix in [('t.rotr(8)', ' ^ rcon'), ('t', '')]:
     assert schedule.count(call) == 1
     inlined = '            val q = memory\n            val word = ' + arg + '\n' + subword + '            t = aesLoad(q)' + suffix
     schedule = schedule.replace(call, inlined)
-schedule = schedule.replace('aesOrthogonalize(', 'ctSourceOrthogonalize(')
 for bits in [128, 192, 256]:
     setup = f'    val words = {bits // 32}\n    val rounds = words + 6\n    val total = 4 * (rounds + 1)\n    val memory = work\n    val schedule = work + 64'
     fixture('aes_schedule_' + str(bits), 'work: int, source: int', setup,

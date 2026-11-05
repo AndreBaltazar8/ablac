@@ -142,19 +142,20 @@
 - [x] **Secret arithmetic around the crypto fixtures:** source-generated AES-128/192/256
   schedule and byte/block I/O, CRT subtract/correction/recombination and wide-reduction glue,
   `bnFromBytes`, `bnToBytes` and `bnResidueSquare` have assembly fixtures and individual
-  secret-index negative controls. AES orthogonalization's public literal indices are substituted
-  from source; excluded scaffolding is guarded against unnoticed edits.
+  secret-index negative controls. AES orthogonalization is the actual imported implementation,
+  without fixture-only index substitution; excluded scaffolding is guarded against unnoticed edits.
 - [ ] **Crypto allocation/call orchestration remains outside `test-ct.sh` coverage:** AES key
-  allocation, managed-string address acquisition, literal-array construction/iteration dispatch,
-  hardware decryption-key conversion and hardware block dispatch; `rsaCrt` key/modulus
+  allocation, managed-string address acquisition, hardware decryption-key conversion and hardware
+  block dispatch; `rsaCrt` key/modulus
   construction, allocation/free, wide-reduce/encode/decode/exponentiation/multiply/copy calls
   (only their separately tested primitives/glue are covered); `bnFromBytes` and
   `bnResidueSquare`'s initial `bnClear` call. The checker rejects calls and cannot verify those
   whole routines as structured. Neither full loader timing nor secret-memory wiping is claimed.
-- [ ] **Lower `for (x in [constant, ...])` without materializing an array.** For example,
-  `aesOrthogonalize` walks `[0, 1, 4, 5]`; the array/runtime iteration machinery obstructs
-  intraprocedural CT checking and costs work on key setup. Preserve element evaluation/order
-  and loop control, then remove the CT fixture's source-index substitution.
+- [x] **Small constant-array `for` loops avoid materializing an array.** Up to16 homogeneous
+  native scalar literals (optionally signed) use a bounded scalar selector and one body copy;
+  other/larger arrays keep the ordinary path. Order, capture cells and loop exits are preserved.
+  `aesOrthogonalize` now uses this path and its actual helper is checked without index
+  substitution. Optimized x86/Xtensa retain its three loops; neither fully unrolls it.
 
 - [ ] The rest of integers up to 256 bits: `uint256` is in (`abla/uint256`, docs/stdlib/uint256.md), with big-endian
       bytes. Left: signed 256, 128 both ways, and little-endian bytes, when something needs them.

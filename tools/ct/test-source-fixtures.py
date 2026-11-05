@@ -42,11 +42,8 @@ with tempfile.TemporaryDirectory(prefix='abla-ct-source-') as directory:
     assert changed.returncode != 0
     assert 'aesExpandBytes: excluded source changed' in changed.stderr
 
-    # Literal indices are read from source, not silently hard-coded in fixtures.
-    marker = 'for (i in [0, 1, 4, 5])'
-    assert source.count(marker) == 1
-    (copied / aes).write_text(source.replace(marker, 'for (i in [0, 2, 4, 6])'))
-    changed = run()
-    assert changed.returncode == 0, changed.stderr
-    assert (copied / 'fixture.ab').read_text() != original, 'stale literal indices'
-print('ok   crypto fixture generation: source leak propagated, scaffold edit refused, indices regenerated')
+    # Orthogonalization now uses the actual imported helper: no fixture-only
+    # substitution of its literal indices or arithmetic remains.
+    assert 'aesOrthogonalize(' in original
+    assert 'ctSourceOrthogonalize' not in original
+print('ok   crypto fixture generation: source leak propagated, scaffold edit refused, actual orthogonalization imported')

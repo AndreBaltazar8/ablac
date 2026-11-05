@@ -275,6 +275,7 @@ test-serial: ablac
 	tools/test-module-incremental-state.sh $(COMPILER)
 	tools/test-canonical-module-paths.sh $(COMPILER)
 	tools/test-for-range.sh $(COMPILER)
+	tools/test-for-constant-array.sh $(COMPILER)
 	tools/test-generated-virtual-module.sh $(COMPILER)
 	tools/test-global-array-mutation.sh $(COMPILER)
 	tools/test-global-init-order.sh $(COMPILER)
