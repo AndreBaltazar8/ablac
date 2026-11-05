@@ -26,6 +26,7 @@
 #include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/resource.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
@@ -129,6 +130,61 @@ static int linux_open_flags(int flags) {
   if (flags & O_APPEND) result |= 1024;
   if (flags & O_NONBLOCK) result |= 2048;
   if (flags & O_DIRECTORY) result |= 65536;
+  return result;
+}
+
+// Darwin poll(2) does not support character devices. DeviceConnection waits
+// on one descriptor; use the driver's select hook for that case, leaving the
+// existing socket/multi-descriptor poll path unchanged. _DARWIN_C_SOURCE
+// selects the unlimited select entry point. Size masks for the actual fd, not
+// FD_SETSIZE, so a valid high-numbered descriptor is supported as well.
+static int darwin_poll(struct pollfd *fds, nfds_t count, int timeout) {
+  struct stat information;
+  if (count != 1 || fds[0].fd < 0 ||
+      (fds[0].events & ~(POLLIN | POLLOUT)) != 0 ||
+      fstat(fds[0].fd, &information) != 0 || !S_ISCHR(information.st_mode))
+    return poll(fds, count, timeout);
+  if (timeout < -1) {
+    errno = EINVAL;
+    return -1;
+  }
+  const int descriptor = fds[0].fd;
+  if (descriptor == INT_MAX) {
+    errno = EINVAL;
+    return -1;
+  }
+  size_t words = (size_t)descriptor / 32 + 1;
+  size_t bytes = words * sizeof(uint32_t);
+  fd_set local[3];
+  uint32_t *masks = (uint32_t *)local;
+  int allocated = bytes > sizeof(fd_set);
+  if (allocated) {
+    masks = calloc(3, bytes);
+    if (masks == NULL) return -1;
+  } else {
+    bytes = sizeof(fd_set);
+    words = bytes / sizeof(uint32_t);
+    memset(local, 0, sizeof(local));
+  }
+  uint32_t *reads = masks, *writes = masks + words, *errors = masks + 2 * words;
+  size_t index = (size_t)descriptor / 32;
+  uint32_t bit = UINT32_C(1) << (descriptor % 32);
+  if (fds[0].events & POLLIN) reads[index] = bit;
+  if (fds[0].events & POLLOUT) writes[index] = bit;
+  errors[index] = bit;
+  struct timeval duration = {timeout / 1000, (timeout % 1000) * 1000};
+  int result = select(descriptor + 1, (fd_set *)reads, (fd_set *)writes,
+                      (fd_set *)errors, timeout < 0 ? NULL : &duration);
+  int saved_errno = errno;
+  if (result >= 0) {
+    fds[0].revents = 0;
+    if (reads[index] & bit) fds[0].revents |= POLLIN;
+    if (writes[index] & bit) fds[0].revents |= POLLOUT;
+    if (errors[index] & bit) fds[0].revents |= POLLERR;
+    result = fds[0].revents != 0;
+  }
+  if (allocated) free(masks);
+  errno = saved_errno;
   return result;
 }
 
@@ -808,7 +864,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     break;
   }
   case 7:
-    result = poll((struct pollfd *)(uintptr_t)argument0, (nfds_t)argument1,
+    result = darwin_poll((struct pollfd *)(uintptr_t)argument0, (nfds_t)argument1,
                   (int)argument2);
     break;
   case 14:

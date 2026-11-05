@@ -32,11 +32,15 @@ def line(proc, prefix):
 class Client:
     def __init__(self, mode, path, payload, timeout=1000, baud=9600, bits=8,
                  parity="none", stop=1, raw=True, flow="none", rw=False):
+        def descriptor_limit():
+            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            resource.setrlimit(resource.RLIMIT_NOFILE, (max(soft, 2048), hard))
         self.proc = subprocess.Popen(
             [program, mode, str(path), str(payload), str(timeout), str(baud),
              str(bits), parity, str(stop), str(raw).lower(), flow, "rw" if rw else "w"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, bufsize=1, start_new_session=True)
+            text=True, bufsize=1, start_new_session=True,
+            preexec_fn=descriptor_limit if mode == "high-fd" else None)
         try:
             self.ready = line(self.proc, "READY")
             if self.ready[0] == "true":
@@ -109,13 +113,21 @@ with tempfile.TemporaryDirectory(prefix="abla-device-test-") as directory:
                      dict(parity="mark"), dict(stop=3), dict(flow="xon-xoff")):
         rejected("serial", "/dev/null", {errno.EINVAL}, **settings)
 
-    client = Client("device", "/dev/null", small)
-    try:
-        assert client.write()[:3] == (1, len(small_bytes), 0)
-        client.close()
-        checks += 1
-    finally:
-        client.clean()
+    if sys.platform == "darwin":
+        with open("/dev/null", "wb", buffering=0) as device:
+            poller = select.poll()
+            poller.register(device, select.POLLOUT)
+            print("Darwin native /dev/null readiness:", poller.poll(0),
+                  bool(select.select([], [device], [], 0)[1]), flush=True)
+    for mode in ("device", "high-fd"):
+        client = Client(mode, "/dev/null", small)
+        try:
+            outcome = client.write()
+            assert outcome[:3] == (1, len(small_bytes), 0), (mode, outcome)
+            client.close()
+            checks += 1
+        finally:
+            client.clean()
 
     def limited_descriptors():
         resource.setrlimit(resource.RLIMIT_NOFILE, (32, 32))
