@@ -2,13 +2,11 @@
 set -euo pipefail
 
 compiler=${1:-build/ablac.bin}
-output=build/module-incremental-state-test
-
-"$compiler" build tests/cases/modules/module-incremental-state.ab \
-    -o "$output" --fast --no-cache
+project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+output=$("$project_root/tools/compiler-api-test-program.py" "$compiler")
 
 set +e
-ABLA_MAX_MEMORY_MB=256 ABLA_MAX_SECONDS=30 \
+ABLA_COMPILER_API_CASE=module-incremental-state ABLA_MAX_MEMORY_MB=256 ABLA_MAX_SECONDS=30 \
     tools/run-limited.sh "$output"
 status=$?
 set -e

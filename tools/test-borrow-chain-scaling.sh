@@ -32,9 +32,8 @@ if ((large > 3 * small + 50)); then
     exit 1
 fi
 echo "borrow chain scaling: 20 calls ${small}cs, 40 calls ${large}cs"
-"$compiler" build "$root/tests/cases/borrow-chain-scaling/refinement.ab" \
-    -o "$output/refinement" --fast --no-cache
+program=$("$root/tools/compiler-api-test-program.py" "$compiler")
 status=0
-"$output/refinement" || status=$?
+ABLA_COMPILER_API_CASE=borrow-refinement "$program" || status=$?
 [[ $status -eq 42 ]]
 echo 'type cache respects narrowing and restored scope for the same expression'
