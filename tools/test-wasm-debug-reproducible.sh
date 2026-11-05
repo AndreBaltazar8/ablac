@@ -59,8 +59,8 @@ cmp -s "$output_directory/first/map.normalized" \
 cmp -s "$output_directory/first/lines.normalized" \
     "$output_directory/longer/lines.normalized" ||
     fail "the DWARF line table differs between sysroot paths"
-if strings "$output_directory/first/module.wasm.debug.wasm" |
-    grep -q 'module\.wasm\.tmp\.'; then
+if [ -n "$(strings "$output_directory/first/module.wasm.debug.wasm" |
+    grep -m1 'module\.wasm\.tmp\.' || true)" ]; then
     fail "the DWARF module names a temporary file"
 fi
 
@@ -88,10 +88,16 @@ do
     [ "$declared" = "$expected" ] ||
         fail "$module.$function is at line $declared, declared at $expected"
 done
+# The text's "abla.source" attribute is the compiler's own name for a function,
+# for audits to map it back (src/backend/llvm/backend.ab): its symbol, debug
+# metadata and the two modules use the visible one. The matches are collected,
+# not tested with `grep -q`: under pipefail, `strings` dying of SIGPIPE when
+# grep stops early would make a match look like none.
 for file in "$output_directory/text/module.wasm.ll" \
     "$output_directory/first/module.wasm" "$output_directory/first/module.wasm.debug.wasm"
 do
-    prefixed=$(strings "$file" | grep '__abla_module_' | head -5 || true)
+    prefixed=$(strings "$file" | sed 's/"abla\.source"="[^"]*"//g' |
+        grep -m5 '__abla_module_' || true)
     if [ -n "$prefixed" ]; then
         fail "$(basename "$file") names a function by its module prefix:
 $prefixed"
