@@ -94,6 +94,17 @@ else
         COMPILER="$compiler" >"$output/commands.txt" || exit 2
 fi
 
+# Cache command text and self-hosted membership once, including blank recipe lines.
+# Indexed arrays keep this compatible with the macOS system Bash (3.2).
+commands=()
+self_hosted_commands=()
+while IFS= read -r command; do
+    commands+=("$command")
+    if [[ $command == *tools/test-self-hosted.sh* ]]; then
+        self_hosted_commands[${#commands[@]}]=1
+    fi
+done <"$output/commands.txt"
+
 # "<seconds> <n>" for every selected command, the longest of the last run
 # first (unknown ones keep the recipe's order, after the known ones).
 order() {
@@ -124,7 +135,7 @@ order() {
 parallel=()
 serial=()
 while IFS= read -r n; do
-    command=$(sed -n "${n}p" "$output/commands.txt")
+    command=${commands[n-1]}
     if [[ -n $(serial_reason "$command") ]]; then
         serial+=("$n")
     else
@@ -142,7 +153,7 @@ started_at=$(seconds_now)
 # <output>/<n>.done when it ends.
 start() { # n
     local n=$1 command
-    command=$(sed -n "${n}p" "$output/commands.txt")
+    command=${commands[n-1]}
     (
         begin=$(seconds_now)
         fast_builds=
@@ -171,7 +182,7 @@ reap() {
             wait "${running_pids[$index]}" 2>/dev/null
             read -r status seconds <"$output/$n.done"
             rm -f "$output/$n.done"
-            command=$(sed -n "${n}p" "$output/commands.txt")
+            command=${commands[n-1]}
             printf '%s\t%s\t%s\t%s\n' "$n" "$status" "$seconds" "$command" >>"$output/results.tsv"
             if [[ $status -eq 0 ]]; then
                 passed=$((passed + 1))
@@ -204,7 +215,7 @@ trap stop INT TERM
 self_hosted_active() {
     local n
     for n in ${pending[@]+"${pending[@]}"} ${running_ns[@]+"${running_ns[@]}"}; do
-        [[ $(sed -n "${n}p" "$output/commands.txt") == *tools/test-self-hosted.sh* ]] && return 0
+        [[ ${self_hosted_commands[n]:-} == 1 ]] && return 0
     done
     return 1
 }
