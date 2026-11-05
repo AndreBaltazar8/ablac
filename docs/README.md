@@ -35,6 +35,7 @@ in seven short sections of runnable programs.
 
 | Document | What it covers |
 |---|---|
+| [targets.md](targets.md) | Target selection, release platforms and evidence for cross-target coverage |
 | [toolchain.md](toolchain.md) | `ablac build`, `run`, `repl`, `serve`, `package`; targets and Wasm |
 | [llvm-backend.md](llvm-backend.md) | How code is emitted; `@naked`, `@section`, inline assembly |
 | [freestanding.md](freestanding.md) | Programs without libc or an operating system |

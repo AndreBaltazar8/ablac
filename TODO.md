@@ -259,8 +259,6 @@
   APIs so it can't drift from the language).
 - [ ] **Clean-bootstrap convergence.** Tiers 4 and 5 of `docs/reliability-roadmap.md`: two
   independent bootstrap routes that reach the same canonical compiler IR on fresh builders.
-- [ ] **No target support matrix.** Publish which targets are tested and at what level
-  (`docs/reliability-roadmap.md` section 8).
 - [ ] **Language editions and a deprecation policy,** and signed package identities above the
   immutable locks, when the ecosystem needs them (`docs/reliability-roadmap.md` section 8).
 - [ ] **Docs behind the code.** `docs/status.md`'s next priorities still list interfaces and

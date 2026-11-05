@@ -259,6 +259,7 @@ Abla? Start with [the tour](docs/guide.md).
 - [Cleanup, generators, tasks and threads](docs/concurrency.md)
 - [Diagnostics: reading compiler errors](docs/diagnostics.md)
 - [Toolchain interface](docs/toolchain.md)
+- [Target support and test coverage](docs/targets.md)
 - [Debugging: lldb, crash stacks, browser developer tools](docs/debugging.md)
 - [Compiler extension API](docs/compiler-api.md)
 - [Programmable builds](docs/programmable-builds.md)
