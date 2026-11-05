@@ -279,13 +279,59 @@ Package-side work (not changed from ablac):
 
 ## Compile time and memory
 
-- [ ] **Cached small blocks cannot be reused for another size.** Since v0.2.31 the free lists
-  (`__ablaRuntimeHostSmallLists`) retain about 32 MiB at most; later frees return to the system, but retained blocks
-  remain on their size's list and `malloc_trim` can't reach them. A program whose allocation sizes shift may retain
-  the old sizes' memory. Cross-class miss frequency is unmeasured; bounded next-class fallback needs physical-capacity
-  metadata. Before the cap, measurements on 2026-11-01
-  showed peak RSS against malloc for each: trees, strings and maps 7 to 19% lower, json-readers 33% higher
-  (137 to 182 MB), json-megabyte varying between runs (190 to 319 MB against 243 to 308); remeasure with the cap.
+- [ ] **Cached small blocks cannot be reused for another size.** The native lists
+  (`__ablaRuntimeHostSmallLists`) use an adaptive 32 MiB floor and 128 MiB ceiling;
+  the compiler explicitly caps them at 32 MiB. A smaller budget does not evict
+  blocks already retained on the wrong size's list. Remeasured on `6c69d56c`
+  (2026-11-05), three alternating triplets, release binaries, CPU6; GNU time
+  `%M`, median MiB, not a sum over processes:
+
+  | Program | Plain malloc/free | 32 MiB cap | Adaptive default |
+  | --- | ---: | ---: | ---: |
+  | trees | 227.02 | 227.01 | 227.04 |
+  | strings | 160.25 | 160.45 | 159.28 |
+  | maps | 124.71 | 123.78 | 124.05 |
+  | json-readers (3000,100) | 116.77 | 150.75 | 167.87 |
+  | json-megabyte (30000) | 183.69 | 266.59 | 215.10 |
+  | sizes rising by 8 B, phase by phase | 70.84 | 111.56 | 111.58 |
+  | sizes falling by 8 B, phase by phase | 70.71 | 100.43 | 100.42 |
+
+  Synthetic phases retain 500,000 fresh flat strings at each length 8..56,
+  release the phase, then collect. Final list walks confirm 32 MiB stranded in
+  the first 48/56 B classes when rising, or the first 96 B class when falling.
+  Separate unmanaged counters (not used for RSS) measure exact-class misses
+  with a free block in either of the next two 8 B classes. Rates, 32 MiB / adaptive:
+  trees 0/0%, strings 3.69/2.19%, maps 6.70/6.79%, json-readers 35.95/34.66%,
+  json-megabyte 78.85/80.70%, rising phases 0/0%, falling phases 28.57/28.57%.
+  A repeatedly visible free head can count many times: these are opportunities,
+  not predictions of useful reuse. Reader counts reproduce exactly in repeats.
+
+  Tried and dropped: (1) exact hit first, then at most two larger classes,
+  at most 16 B slack; physical capacity in existing unused header+8 (no header
+  growth), physical-class return/accounting, logical GC bounds unchanged;
+  (2) age trimming after two collections without a class hit, bounded to 8 MiB /
+  131,072 free calls per GC, with a rotating cursor; (3) their combination.
+  No variant passes. With the adaptive default, fallback adds 2.18% strings
+  instructions, trim adds 1.68% trees, and combined adds 2.52% trees / 2.97%
+  strings. Megabyte peak rises 215.10 -> 301.36 / 318.44 / 302.98 MiB
+  (fallback / trim / combined); reader only falls 167.86 -> 166.22 / 167.86 /
+  166.21. At 32 MiB, combined helps megabyte 266.37 -> 189.59 MiB (trim alone
+  also helps, to 206.26), but reader rises 150.75 -> 151.22 and trees instructions
+  rise 4.49%. Rising-phase peak only falls 111.55 -> 107.75 with trim/combined;
+  fallback cannot borrow smaller old blocks. Falling phases improve to 94.95 MiB
+  with fallback/combined. Fib/nbody instructions stay within 0.00001%.
+  Trimming opposes the adaptive reuse/exhaustion policy: discarding idle lists
+  can leave room for a subsequent larger keep budget, while per-hit age tracking
+  adds work. The nonlinear RSS is not attributable solely to cached-byte totals.
+  Stopped at the failed runtime/RSS gates: no compiler self-build peak, firmware,
+  GC-stress or threads success is claimed for these rejected variants.
+  Next possible screen: a smaller adaptive floor/ceiling for cycles with high
+  unused bytes and little reuse, using existing GC-cycle counters and hysteresis
+  instead of per-hit bookkeeping. Merely lowering the budget cannot evict old
+  lists; it would also need bounded cap enforcement. Not implemented.
+  Prototypes, exact patches, scripts and raw data remain in
+  `worktrees/ablac-small-remeasure/build/cache-lab/` (`report.md`, `summary.json`,
+  `rss-runs.json`, `probe-{runs,rechecks}.json`, `screen-{runs,summary}.json`).
   Tried and dropped (2026-11-04): a host-only miss-path pool with4KiB pages and a
   strict1MiB reservation, exact-size lists first and libc fallback,16-byte slot strides
   but unchanged32-byte object headers. Fresh NovaKind icons saves11.81% instructions
