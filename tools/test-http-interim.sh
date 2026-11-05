@@ -5,6 +5,10 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 out="$root/build/http-interim"
 mkdir -p "$out"
 rm -f "$out/ready"
+# The clients trust the test certificate through SSL_CERT_FILE. Nixpkgs' OpenSSL
+# reads NIX_SSL_CERT_FILE before it, and a Nix install sets that to the system
+# bundle (CI does), so it would not see the certificate.
+unset NIX_SSL_CERT_FILE
 cp "$root/tests/vectors/crypto/test-keys/tls-server.pem" "$out/key.pem"
 openssl req -x509 -new -key "$out/key.pem" -days 2 -subj /CN=localhost \
     -addext subjectAltName=DNS:localhost,IP:127.0.0.1 \

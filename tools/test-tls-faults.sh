@@ -13,6 +13,10 @@ output_directory=${TLS_FAULTS_OUTPUT:-$project_root/build/tls-faults}
 mkdir -p "$output_directory"
 cd "$project_root"
 
+# The clients trust the test certificate through SSL_CERT_FILE. Nixpkgs' OpenSSL
+# reads NIX_SSL_CERT_FILE before it, and a Nix install sets that to the system
+# bundle (CI does), so it would not see the certificate.
+unset NIX_SSL_CERT_FILE
 cp tests/vectors/crypto/test-keys/tls-server.pem "$output_directory/key.pem"
 openssl req -x509 -new -key "$output_directory/key.pem" -days 2 -subj /CN=localhost \
     -addext subjectAltName=DNS:localhost,IP:127.0.0.1 \
