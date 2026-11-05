@@ -201,7 +201,9 @@ fun bootstrapLiftEmit(
     }
     // A boxed `uint256` is a string of its bytes.
     if (kind == "string" || kind == "uint256") return lowerer.emit("const.string", -1, -1, value.text)
-    if (kind == "f64") return bootstrapLiftEmitF64(lowerer, value.integer)
+    if (kind == "f64") return lowerer.lowerEraseFloat(
+        bootstrapLiftEmitF64(lowerer, value.integer), "f64", type
+    )
     if (kind == "f32") {
         // A boxed f32 is its bits: the cast reinterprets them, NaN payload
         // included (written sign-extended, as both tiers read them).
@@ -209,7 +211,9 @@ fun bootstrapLiftEmit(
             "const.i64", -1, -1,
             "${bootstrapLiftCanonicalInteger(value.integer, "i32")}"
         )
-        return lowerer.emit("scalar.cast", bits, -1, "f32")
+        return lowerer.lowerEraseFloat(
+            lowerer.emit("scalar.cast", bits, -1, "f32"), "f32", type
+        )
     }
     if (kind == "null") return lowerer.emit("const.null", -1, -1, "")
     if (kind == "void") return lowerer.emit("const.void", -1, -1, "")
@@ -287,7 +291,7 @@ fun bootstrapLiftEmitArray(
     value: BootstrapEvalValue,
     type: string
 ): int {
-    val elementType = bootstrapLiftElementType(type)
+    val elementType = if (bootstrapIsArrayType(type)) bootstrapArrayElementType(type) else "any"
     // An array of numbers, booleans or strings is one array.create of
     // constants, which the backend builds from a static table.
     var scalars = value.elements.size >= 2
@@ -1324,7 +1328,9 @@ fun bootstrapLiftDecodeClosure(var decoder: BootstrapLiftDecoder): BootstrapEval
 // closure by its function's runtime id. Raw nodes:
 //
 //   v  n  b0  b1       void, null, booleans
-//   i<word>;           a boxed integer word (integers, f64 bits, f32 bits)
+//   V2;                required wire version (old records are rejected)
+//   i<word>;           an integer word (typed floats can still use static retyping)
+//   d<bits>; f<bits>;  explicitly tagged f64/f32, from phase (b) metadata only
 //   s<n>:<n bytes>     string
 //   a<count>;<nodes>   array (also a Map's representation)
 //   o<type id>;<count>;(<field id>;<node>)...   object
@@ -1333,6 +1339,8 @@ fun bootstrapLiftDecodeClosure(var decoder: BootstrapLiftDecoder): BootstrapEval
 //   F<function id>;<count>;<capture nodes>      function value
 //   r<id>;             the id-th a/o/c/h/F-with-captures, numbered as opened
 //   x<tag>;            a value native results cannot carry (a task, ...)
+
+val BOOTSTRAP_CT_LIFT_WIRE_VERSION: int = 2
 
 class BootstrapCtEncoder(
     val name: string,
@@ -1448,7 +1456,13 @@ fun bootstrapCtLiftEncoder(
         "    val tag = __ablaRuntimeTag(value)\n" +
         "    if (tag == 0) __abla_lift_byte_$s(out, 118)\n" +
         "    else if (tag == 1) __abla_lift_byte_$s(out, 110)\n" +
-        "    else if (tag == 2) __abla_lift_number_$s(out, 105, __ablaRuntimeWord0(value))\n" +
+        "    else if (tag == 2) {\n" +
+        "        val kind = ablaRuntimeLoadI32(ablaRuntimeValueAddress(value) + 4)\n" +
+        "        if (kind == 0) __abla_lift_number_$s(out, 105, __ablaRuntimeWord0(value))\n" +
+        "        else if (kind == 1) __abla_lift_number_$s(out, 102, __ablaRuntimeWord0(value))\n" +
+        "        else if (kind == 2) __abla_lift_number_$s(out, 100, __ablaRuntimeWord0(value))\n" +
+        "        else __abla_lift_number_$s(out, 120, tag)\n" +
+        "    }\n" +
         "    else if (tag == 3) {\n" +
         "        __abla_lift_byte_$s(out, 98)\n" +
         "        __abla_lift_byte_$s(out, if (__ablaRuntimeWord0(value) != 0) 49 else 48)\n" +
@@ -1470,7 +1484,7 @@ fun bootstrapCtLiftEncoder(
         "            __abla_lift_number_$s(out, 97, count)\n" +
         "            var index = 0\n" +
         "            while (index < count) {\n" +
-        "                __abla_lift_value_$s(out, __ablaRuntimeArrayGet(value, __ablaRuntimeI64(index)))\n" +
+        "                __abla_lift_value_$s(out, __ablaRuntimeFloatArrayIndexGet(value, __ablaRuntimeI64(index)))\n" +
         "                index = index + 1\n" +
         "            }\n" +
         "        }\n" +
@@ -1488,7 +1502,7 @@ fun bootstrapCtLiftEncoder(
         "            var index = 0\n" +
         "            while (index < count) {\n" +
         "                __abla_lift_number_$s(out, 0, ablaRuntimeLoadI32(descriptor + 16 + index * 16))\n" +
-        "                __abla_lift_value_$s(out, __ablaRuntimeFieldLoad(object, __ablaRuntimeDescriptorPlace(descriptor, index)))\n" +
+        "                __abla_lift_value_$s(out, __ablaRuntimeFieldLoadFloat(object, __ablaRuntimeDescriptorPlace(descriptor, index)))\n" +
         "                index = index + 1\n" +
         "            }\n" +
         "            index = 0\n" +
@@ -1524,6 +1538,7 @@ fun bootstrapCtLiftEncoder(
         "}\n" +
         "trusted fun $name(value: any): int {\n" +
         "    var out = __AblaLiftRaw_$s(0, 0, 0, Map())\n" +
+        "    __abla_lift_number_$s(out, 86, $BOOTSTRAP_CT_LIFT_WIRE_VERSION)\n" +
         "    __abla_lift_value_$s(out, value)\n" +
         "    if (out.address == 0) __abla_lift_byte_$s(out, 118)\n" +
         "    ablaRuntimeStoreI64(out.address, out.size)\n" +
@@ -1589,6 +1604,12 @@ fun bootstrapLiftRawValue(var reader: BootstrapLiftRawReader): BootstrapEvalValu
     if (tag == 110) return bootstrapEvalNull()
     if (tag == 105) {
         return BootstrapEvalValue("raw.integer", reader.number(), false, "", [], "", [])
+    }
+    if (tag == 100 || tag == 102) {
+        return BootstrapEvalValue(
+            if (tag == 100) "f64" else "f32", reader.number(), false, "",
+            BOOTSTRAP_EVAL_NO_ELEMENTS, "", BOOTSTRAP_EVAL_NO_FIELDS
+        )
     }
     if (tag == 98) {
         val bit = if (reader.at < reader.bytes.size) reader.bytes[reader.at] else 0
@@ -2036,6 +2057,11 @@ fun bootstrapCtLiftDecode(
 ): BootstrapCtDecoded {
     val syntax: array<BootstrapExpression> = []
     var reader = BootstrapLiftRawReader(bytes, 0, functions, [], "")
+    if (bytes.size == 0 || bytes[0] != 86) reader.fail("missing wire version")
+    else {
+        reader.at = 1
+        if (reader.number() != BOOTSTRAP_CT_LIFT_WIRE_VERSION) reader.fail("unsupported wire version")
+    }
     val raw = bootstrapLiftRawValue(reader)
     if (reader.problem == "" && reader.at != bytes.size) reader.fail("trailing bytes")
     var retyper = bootstrapLiftRetyper(declarations, syntax)

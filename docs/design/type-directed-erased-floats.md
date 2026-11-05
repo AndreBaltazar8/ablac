@@ -1,7 +1,8 @@
 # Type-directed float identity at erasure boundaries
 
-Status: scalar-boundary phase (a) and collection-boundary phase (b) are
-implemented for review, 2026-11-04. Formatting and JIT lifting remain open.
+Status: scalar-boundary phase (a), collection-boundary phase (b), and CT wire/
+lifting phase (d) are implemented for review. Formatting phase (c) remains
+separately owned. Phase (d) evidence is recorded below, 2026-11-05.
 Before phase (a), native `any` boxes used the same integer tag and auxiliary
 word for floats and integers. Phase (a) preserves scalar float kinds at the
 covered boundaries; dynamic interpolation still formats their payload bits as
@@ -92,6 +93,38 @@ paths, and compare them on ordinary values, f32 rounding, subnormals,
 infinities, NaNs, negative zero and nested containers. Preserve hostless Wasm
 import sets. This is a separate stage from introducing the representation;
 phase boundaries must remain correct and independently testable.
+
+### Phase (d): explicit wire kinds and reconstruction
+
+The native reply begins with `V2;`. Explicit `d<bits>;` and `f<bits>;` nodes carry
+f64/f32 identity from the boxed auxiliary word. Integer nodes remain integers,
+including payloads equal to the bit pattern of a float. The encoder uses the
+phase (b) array and field readers to recover types from array/descriptor metadata
+before traversing dense storage. Untagged numeric words may still be retyped by
+a known static float type; their payload never determines their kind.
+
+The common lift emitter retains float kinds at `any` destinations in both the
+interpreter and JIT. An array with an erased/unknown element type rebuilds tagged
+float elements; statically typed dense arrays retain their existing path. f32
+parity compares its meaningful low 32 bits, allowing the existing zero/sign
+extension difference in the unused upper payload half. Graph references retain
+the existing memoized reconstruction, including shared values and cycles.
+
+Native build cache entries advance to v17 and run records to v5, and the run
+identity includes the wire version. Old or missing native wire headers are
+rejected. The ordinary evaluator/kept-value codec already has explicit float
+records and keeps its format. No formatter, equality, hash, or public ABI change
+is included in this phase. The existing developer-only
+`ABLA_LIFT_CODEC_CHECK=1` round-trip of a native positional closure loses its
+capture layout (also reproduced before phase (d)); that codec issue is recorded
+separately in TODO.md and is not included in the passing native-closure claim.
+
+`tools/test-compile-time-erased-floats.sh` exercises both tiers without allowing
+native JIT fallback, plus exact bits, integer lookalikes, nested/dense erased
+arrays, typed/nullable/erased fields, maps and captures. It also checks hostless
+Wasm fast/release with zero imports, and the compiler-API client checks wire
+version rejection, static retyping and cycles. The repro-only commit records
+executing known failures; the implementation requires every case to pass.
 
 ## Acceptance gates and evidence
 
