@@ -249,8 +249,8 @@
   run optimized: it runs 23x faster because collections move, so it would prove less. The frontend's
   hot spots are its lexer and string comparison, flat. 100 of 1,579 builds take 40% of build time: test
   programs importing the compiler, each compiled from scratch, which is what reuse between builds saves.
-- [ ] **Nothing runs the tests on a push.** `.github/workflows/release.yml` is the only workflow,
-  and it starts by hand. Run `make test` and the fixed point on pushes to master.
+- [x] **Tests run on every push to master and on PRs** ([CI](docs/ci.md)): the Linux suite and an
+  arm64 macOS host/fixed-point job. Tests only; releases still start by hand.
 - [x] **Parser-derived formatter.** `ablac fmt` preserves comments and verbatim syntax,
   checks full AST/token parity and idempotence before atomic writes, and supports stdin,
   `--check` diffs and one line-width setting. See `docs/formatter.md`.
