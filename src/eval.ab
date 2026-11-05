@@ -1,4 +1,5 @@
 import "source_rewrite.ab"
+import "named_arguments.ab"
 import "f32_literal.ab"
 import "sema.ab"
 import "abla/unsafe/memory/raw"
@@ -5849,6 +5850,10 @@ class BootstrapEvaluator(
             51 -> bootstrapEvaluateFor(this, expression)
             else -> bootstrapEvaluateUncommon(this, expression, form)
         }
+        if (result.kind == "invalid" && this.errors == errorsBefore &&
+            !bootstrapEvalStmRetrying) {
+            this.errors = this.errors + 1
+        }
         bootstrapEvalDepth = bootstrapEvalDepth - 1
         // While a stack-depth stop unwinds, the levels it passes through
         // failed because of it: it is the one diagnostic, not one per level.
@@ -5990,6 +5995,85 @@ fun bootstrapEvalGlobalCallable(
     callable
 }
 
+// Subparser handlers run on discovery bodies, before named-call lowering.
+// Use the same supplied-argument matching as that lowering, and evaluate each
+// source expression once before ordering the resulting constructor values.
+@noinline
+fun bootstrapEvalConstructionArguments(
+    var evaluator: BootstrapEvaluator,
+    expression: BootstrapExpression,
+    declaration: BootstrapDeclaration
+): array<BootstrapEvalValue> {
+    var matching = BootstrapNamedArgumentNormalizer(
+        [], BootstrapNamedTargetIndex([], [], []), 0, "", evaluator.sourceIdentity
+    )
+    val selected = matching.suppliedParameters(declaration, expression)
+    if (matching.errors > 0) {
+        evaluator.errors = evaluator.errors + matching.errors
+        evaluator.diagnostics = "${evaluator.diagnostics}${matching.diagnostics}"
+        return BOOTSTRAP_EVAL_NO_ELEMENTS
+    }
+    val supplied: array<bool> = []
+    val values: array<BootstrapEvalValue> = []
+    for (name in declaration.parameters) {
+        supplied.append(false)
+        values.append(bootstrapEvalInvalid())
+    }
+    var argument = 0
+    while (argument < expression.children.size) {
+        val syntax = expression.children[argument]
+        val value = evaluator.evaluate(
+            if (syntax.kind == "named.argument") syntax.children[0] else syntax
+        )
+        if (value.kind == "invalid") return BOOTSTRAP_EVAL_NO_ELEMENTS
+        val parameter = selected[argument]
+        values[parameter] = value
+        supplied[parameter] = true
+        if (bootstrapEvalLeaves(value)) return values
+        argument = argument + 1
+    }
+    val names: array<string> = []
+    val bound: array<BootstrapEvalValue> = []
+    val mutable: array<bool> = []
+    var parameter = 0
+    while (parameter < declaration.parameters.size) {
+        if (!supplied[parameter]) {
+            if (parameter >= declaration.parameterDefaults.size ||
+                declaration.parameterDefaults[parameter].kind == "missing") {
+                matching.fail(
+                    "MISSING",
+                    "parameter `${declaration.parameters[parameter]}` of `${expression.text}` has no default: pass it",
+                    expression
+                )
+                evaluator.errors = evaluator.errors + matching.errors
+                evaluator.diagnostics = "${evaluator.diagnostics}${matching.diagnostics}"
+                return BOOTSTRAP_EVAL_NO_ELEMENTS
+            }
+            // Defaults see prior parameters and their declaring module, never
+            // caller locals whose spelling happens to be the same.
+            val defaults = bootstrapEvalInvocation(evaluator, names, bound, mutable)
+            values[parameter] = bootstrapEvaluateFrom(
+                defaults, declaration.sourceIdentity, declaration.parameterDefaults[parameter]
+            )
+            evaluator.errors = defaults.errors
+            evaluator.steps = defaults.steps
+            evaluator.diagnostics = defaults.diagnostics
+            if (values[parameter].kind == "invalid") return BOOTSTRAP_EVAL_NO_ELEMENTS
+            if (bootstrapEvalLeaves(values[parameter])) return values
+        }
+        if (parameter < declaration.parameterTypes.size) {
+            values[parameter] = bootstrapEvalCoerce(
+                evaluator, values[parameter], declaration.parameterTypes[parameter]
+            )
+        }
+        names.append(declaration.parameters[parameter])
+        bound.append(values[parameter])
+        mutable.append(false)
+        parameter = parameter + 1
+    }
+    values
+}
+
 @noinline
 fun bootstrapEvaluateConstruction(
     var evaluator: BootstrapEvaluator,
@@ -5998,6 +6082,19 @@ fun bootstrapEvaluateConstruction(
     declarationIndex: int
 ): BootstrapEvalValue {
     var result = bootstrapEvalInvalid()
+    var hasNamed = false
+    for (argument in expression.children) {
+        if (argument.kind == "named.argument") hasNamed = true
+    }
+    val bindArguments = hasNamed || expression.children.size != declaration.parameters.size
+    val boundArguments = if (bindArguments)
+        bootstrapEvalConstructionArguments(evaluator, expression, declaration)
+        else BOOTSTRAP_EVAL_NO_ELEMENTS
+    if (bindArguments) {
+        if (boundArguments.size != declaration.parameters.size) return result
+        val escapedArgument = bootstrapEvalFirstEscape(boundArguments)
+        if (escapedArgument >= 0) return boundArguments[escapedArgument]
+    }
     val fields: array<BootstrapEvalValue> = []
     val context = evaluator.context
     val cacheable = declarationIndex >= 0 && declarationIndex < context.size &&
@@ -6014,7 +6111,8 @@ fun bootstrapEvaluateConstruction(
     var parameter = 0
     while (parameter < declaration.parameters.size) {
         var value = bootstrapEvalInvalid()
-        if (parameter < expression.children.size) {
+        if (bindArguments) value = boundArguments[parameter]
+        else if (parameter < expression.children.size) {
             value = evaluator.evaluate(expression.children[parameter])
         } else if (parameter < declaration.parameterDefaults.size &&
             declaration.parameterDefaults[parameter].kind !=

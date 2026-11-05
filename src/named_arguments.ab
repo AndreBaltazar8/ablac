@@ -720,6 +720,59 @@ class BootstrapNamedArgumentNormalizer(
         declaration.parameters.size
     }
 
+    // Match supplied syntax to parameters once, before either lowering or the
+    // early evaluator binds values. Neither path reimplements name/order rules.
+    fun suppliedParameters(
+        declaration: BootstrapDeclaration,
+        call: BootstrapExpression
+    ): array<int> {
+        val selectedParameters: array<int> = []
+        val seen: array<bool> = []
+        for (name in declaration.parameters) seen.append(false)
+        var positional = 0
+        var namedSeen = false
+        var argument = if (call.kind == "member.call") 1 else 0
+        while (argument < call.children.size) {
+            val supplied = call.children[argument]
+            var selected = this.positionalParameter(declaration, positional)
+            if (supplied.kind == "named.argument") {
+                namedSeen = true
+                selected = this.parameter(declaration, supplied.text)
+                if (selected < 0) this.fail(
+                    "UNKNOWN", "`${supplied.text}` is not a parameter of `${call.text}`", supplied
+                )
+                if (selected >= 0 && bootstrapIsAnyDelegatedProperty(declaration, selected)) {
+                    this.fail(
+                        "DELEGATED",
+                        "`${supplied.text}` is a delegated property of `${call.text}`: its delegate comes from `by`, not from an argument",
+                        supplied
+                    )
+                    selected = -1
+                }
+                if (supplied.children.size != 1) this.fail(
+                    "VALUE", "named argument `${supplied.text}` requires one value", supplied
+                )
+            } else {
+                if (namedSeen) this.fail(
+                    "ORDER", "positional arguments must precede named arguments", supplied
+                )
+                positional = positional + 1
+            }
+            if (selected >= declaration.parameters.size) this.fail(
+                "ARITY", "too many arguments for `${call.text}`", supplied
+            )
+            if (selected >= 0 && selected < seen.size) {
+                if (seen[selected]) this.fail(
+                    "DUPLICATE", "parameter `${declaration.parameters[selected]}` is supplied more than once", supplied
+                )
+                seen[selected] = true
+            }
+            selectedParameters.append(selected)
+            argument = argument + 1
+        }
+        selectedParameters
+    }
+
     fun replaceParameterReferences(
         expression: BootstrapExpression,
         names: array<string>,
@@ -883,55 +936,15 @@ class BootstrapNamedArgumentNormalizer(
                         )
                     }
                 }
-                var positional = 0
-                var namedSeen = false
+                val selectedParameters = this.suppliedParameters(declaration, result)
                 val argumentBegin = if (result.kind == "member.call") 1 else 0
                 var argument = argumentBegin
                 while (argument < result.children.size) {
                     val supplied = result.children[argument]
-                    var selected = this.positionalParameter(declaration, positional)
-                    var value = supplied
-                    if (supplied.kind == "named.argument") {
-                        namedSeen = true
-                        selected = this.parameter(declaration, supplied.text)
-                        if (supplied.children.size == 1) {
-                            value = supplied.children[0]
-                        }
-                        if (selected < 0) this.fail(
-                            "UNKNOWN",
-                            "`${supplied.text}` is not a parameter of `${result.text}`",
-                            supplied
-                        )
-                        if (selected >= 0 && bootstrapIsAnyDelegatedProperty(declaration, selected)) {
-                            this.fail(
-                                "DELEGATED",
-                                "`${supplied.text}` is a delegated property of `${result.text}`: its delegate comes from `by`, not from an argument",
-                                supplied
-                            )
-                            selected = -1
-                        }
-                    } else {
-                        if (namedSeen) this.fail(
-                            "ORDER",
-                            "positional arguments must precede named arguments",
-                            supplied
-                        )
-                        positional = positional + 1
-                    }
-                    if (selected >= declaration.parameters.size) {
-                        this.fail(
-                            "ARITY",
-                            "too many arguments for `${result.text}`",
-                            supplied
-                        )
-                    }
-                    if (selected >= 0 &&
-                        selected < declaration.parameters.size) {
-                        if (temporaryNames[selected] != "") this.fail(
-                            "DUPLICATE",
-                            "parameter `${declaration.parameters[selected]}` is supplied more than once",
-                            supplied
-                        )
+                    val selected = selectedParameters[argument - argumentBegin]
+                    val value = if (supplied.kind == "named.argument" && supplied.children.size == 1)
+                        supplied.children[0] else supplied
+                    if (selected >= 0 && selected < declaration.parameters.size) {
                         // A `var` parameter borrows the caller's place
                         // itself; through a `val` temporary it borrowed a
                         // borrow and failed ownership.borrow-exclusive.
