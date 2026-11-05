@@ -42,6 +42,12 @@ pkgs.mkShell {
     util-linux
     # tools/build-self-hosted-current.sh, for a compiler linked elsewhere.
     patchelf
+    # What the test scripts call: rg, AArch64/x86-64 emulation (test-ct,
+    # crypto-pure, bignum-secret), and a bash with its interactive builtins
+    # (compgen) on hosts whose own bash lacks them, such as CI.
+    ripgrep
+    qemu-user
+    bashInteractive
   ];
 
   shellHook = ''
