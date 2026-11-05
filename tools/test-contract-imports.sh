@@ -104,48 +104,5 @@ perl -pi -e 's/\@rpc/\@changedContract/' "$temporary/backend.ab"
 "$compiler" --emit-llvm "$temporary/root.ab" > "$temporary/changed.ll"
 ! cmp -s "$temporary/before.ll" "$temporary/changed.ll" || exit 1
 
-# A contract retains signatures, not implementation bodies or their imports.
-# Strict validation must use the same surface, while a later/earlier ordinary
-# import of that module still checks its actual implementation.
-visibility="$project_root/tests/cases/contract-visibility"
-for valid in main library-main cycle-main; do
-    "$compiler" build "$visibility/$valid.ab" -o "$output/strict-$valid" \
-        --fast --no-cache --strict-imports
-    set +e
-    "$output/strict-$valid"
-    status=$?
-    set -e
-    [[ $status -eq 42 ]] || exit 1
-done
-
-# Prove the body-only dependency is poisonous if it is actually loaded.
-if "$compiler" --emit-llvm "$visibility/implementation-only.ab" \
-    > "$output/body-only.ll" 2> "$output/body-only.err"; then
-    echo "contract visibility: body-only poison unexpectedly compiled"; exit 1
-fi
-grep -qF 'error[E_IMPORT_NOT_FOUND]' "$output/body-only.err" || exit 1
-
-for invalid in missing-type contract-first ordinary-first; do
-    if "$compiler" build "$visibility/$invalid.ab" -o "$output/$invalid" \
-        --fast --no-cache --strict-imports > "$output/$invalid.err" 2>&1; then
-        echo "contract visibility: $invalid unexpectedly compiled"; exit 1
-    fi
-    name=helper
-    [[ $invalid != missing-type ]] || name=HiddenType
-    grep -qF "error[E_NAME_NOT_IMPORTED]: \`$name\`" "$output/$invalid.err" || \
-        { cat "$output/$invalid.err"; exit 1; }
-done
-
-# Flat programs keep their existing whole-program name resolution in either
-# order, including the implementation reference forbidden in strict mode.
-for flat in main contract-first ordinary-first; do
-    "$compiler" build "$visibility/$flat.ab" -o "$output/flat-$flat" --fast --no-cache
-    set +e
-    "$output/flat-$flat"
-    status=$?
-    set -e
-    [[ $status -eq 42 ]] || exit 1
-done
-
 printf '%s\n' \
     'contract imports: typed consumption + implementation isolation + stable body cache identity + rejection passed'

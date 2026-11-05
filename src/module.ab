@@ -2348,8 +2348,7 @@ fun bootstrapRelativeImportSpelling(importer: string, target: string): string {
 
 fun bootstrapValidateStrictImports(
     aliases: array<BootstrapModuleAlias>,
-    snapshots: array<BootstrapModuleSnapshot>,
-    fullModules: Map<string, int>
+    snapshots: array<BootstrapModuleSnapshot>
 ): BootstrapImportAliasValidation {
     val report = bootstrapVisibilityReportPath != ""
     val strict: array<bool> = []
@@ -2423,8 +2422,7 @@ fun bootstrapValidateStrictImports(
                 module, aliases, snapshots, asStrict
             )
             val findings = bootstrapStrictImportFindings(
-                snapshot, names, declaring, classes, classMembers, visible, typeNames,
-                !fullModules.has(snapshot.path)
+                snapshot, names, declaring, classes, classMembers, visible, typeNames
             )
             for (finding in findings) {
                 if (!suggestedKnown[finding.declaring]) {
@@ -2678,41 +2676,6 @@ class BootstrapStrictImportFinding(
     val column: int
 )
 
-// Contract loading follows only imports needed by the retained shape. Its
-// discarded implementations must not be checked against those pruned edges.
-// Discovery omits function body bounds, so reparse only contract-only modules
-// to locate their headers. Keep original tokens/offsets for exact diagnostics.
-fun bootstrapStrictContractTokens(
-    snapshot: BootstrapModuleSnapshot
-): array<BootstrapToken> {
-    val parsed = bootstrapParseWithIdentity(snapshot.source, snapshot.path)
-    val tokens = bootstrapLexShared(snapshot.source)
-    val retained: array<BootstrapToken> = []
-    var cursor = 0
-    for (declaration in parsed.declarations) {
-        // These are exactly the declaration kinds bootstrapProjectContract
-        // retains. It removes function expressions and class/extend methods.
-        if (declaration.kind == "fun" || declaration.kind == "class" ||
-            declaration.kind == "interface" || declaration.kind == "extend") {
-            var end = declaration.end
-            if (declaration.kind == "fun" &&
-                declaration.expression.kind != "missing") {
-                end = declaration.expression.begin
-            }
-            for (method in declaration.methods) {
-                if (method.begin < end) end = method.begin
-            }
-            while (cursor < tokens.size &&
-                tokens[cursor].begin < declaration.begin) cursor = cursor + 1
-            while (cursor < tokens.size && tokens[cursor].begin < end) {
-                retained.append(tokens[cursor])
-                cursor = cursor + 1
-            }
-        }
-    }
-    retained
-}
-
 /** The plain names `snapshot` uses from modules it doesn't see, each once.
  *  A name its own declarations bind (a parameter, local or field of the
  *  enclosing declaration, or a member of the class it is in or extends), a
@@ -2724,8 +2687,7 @@ fun bootstrapStrictImportFindings(
     classes: BootstrapStringSet,
     classMembers: array<array<string>>,
     visible: array<bool>,
-    typeNames: BootstrapStringSet,
-    contractOnly: bool
+    typeNames: BootstrapStringSet
 ): array<BootstrapStrictImportFinding> {
     val result: array<BootstrapStrictImportFinding> = []
     val source = snapshot.source
@@ -2734,8 +2696,7 @@ fun bootstrapStrictImportFindings(
     for (declaration in discovery.declarations) {
         if (declaration.extensionOwner == "") own.add(declaration.name)
     }
-    val tokens = if (contractOnly) bootstrapStrictContractTokens(snapshot)
-        else bootstrapLexShared(source)
+    val tokens = bootstrapLexShared(source)
     val bounds = bootstrapDeclarationBoundNamesIn(source, discovery, tokens)
     val reported = bootstrapStringSet()
     var inImport = false
@@ -2985,8 +2946,7 @@ class BootstrapModuleGraph(
             val found = this.aliases[ownEdge]
             // A module loaded for its contract before its implementations
             // recorded this edge then: the edge now is the implementation's.
-            if (found.target == target && found.begin == edge.begin &&
-                found.end == edge.end &&
+            if (found.target == target && found.contractOnly &&
                 this.index.upgradedModules.has(importer.path)) {
                 this.aliases[ownEdge] = BootstrapModuleAlias(
                     importer.path, target, edge.alias, edge.contractOnly,
@@ -3151,21 +3111,21 @@ class BootstrapModuleGraph(
                         edge,
                         importedSnapshot.discovery
                     )) {
-                        // Only the explicitly contract-imported module is a
-                        // remote surface. Its ordinary shape libraries retain
-                        // their real code, annotations and overloads.
-                        this.recordImportEdge(snapshot, edge, exposed)
-                        if (edge.contractOnly) this.loadContract(imported)
-                        else this.load(imported)
+                        val contractEdge = BootstrapImportEdge(
+                            edge.source,
+                            edge.provider,
+                            edge.alias,
+                            true,
+                            edge.begin,
+                            edge.end
+                        )
+                        this.recordImportEdge(snapshot, contractEdge, exposed)
+                        this.loadContract(imported)
                     }
                 }
                 index = index + 1
             }
-            // An ordinary shape dependency can import this module back and
-            // upgrade it while it is loading. That full load already ordered it.
-            if (!this.index.fullModules.has(identity)) {
-                this.orderedSnapshots.append(snapshot)
-            }
+            this.orderedSnapshots.append(snapshot)
         }
         ""
     }
@@ -3486,7 +3446,7 @@ class BootstrapModuleGraph(
         )
         bootstrapFrontendTraceMemory("parse.aliases")
         val strictValidation = bootstrapValidateStrictImports(
-            this.aliases, this.orderedSnapshots, this.index.fullModules
+            this.aliases, this.orderedSnapshots
         )
         var parseErrors = this.errors + aliasValidation.errors +
             strictValidation.errors

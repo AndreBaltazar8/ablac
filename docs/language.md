@@ -2766,14 +2766,8 @@ val request = $rpc(counter.incrementRemotely(41))
 A contract call left in the program fails with
 `E_CONTRACT_CALL_NOT_CONSUMED`. Contract extraction doesn't run the other
 module's initializers or compile-time actions, and it follows only the
-imports its declaration shapes need, so the backend's implementation-only
-dependencies and capabilities stay out of the client. An ordinary import needed
-by a shape loads that library normally, sharing its types and implementations
-with any other ordinary import in the program; it does not turn the library's
-functions into remote contracts. An explicit contract import in that dependency
-list remains a contract import. Strict-import validation checks only the
-retained contract surface unless the module is also loaded normally, when its
-full implementation is checked regardless of import order. A contract's fingerprint excludes
+imports its declaration shapes need, so the backend's private dependencies
+and capabilities stay out of the client. A contract's fingerprint excludes
 function bodies: changing a signature, annotation, default or data shape
 changes it, and a body-only edit does not.
 
