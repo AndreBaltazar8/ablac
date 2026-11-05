@@ -146,7 +146,31 @@ def disk_revision():
  assert not result['valid'] and 'incomplete' in result['reason'],result
  s.close()
 
-for test in [simple,alias_private,generic_fields,no_eval,strict,symlinks,negative_protocol,packages,contract_surface,disk_revision]:
+def queries():
+ p=fixture('queries',{'main.ab':'// café 😀\nimport "dep.ab"\nfun main: int = answer()\n','dep.ab':'fun answer: int = 42\n'})
+ s=Session(p);a=s.analyze();main=doc(a,p/'main.ab');call=occurrence(main,'answer')[0]
+ params={'uri':(p/'main.ab').as_uri(),'offset':call['range']['start'],'revision':a['revision']}
+ definition=s.rpc('query/definition',params)['result']
+ assert definition['value']['uri']==(p/'dep.ab').as_uri(),definition
+ hover=s.rpc('query/hover',params)['result'];assert hover['value']['type']=='i64',hover
+ refs=s.rpc('query/references',params)['result']['value'];assert len(refs)==2,refs
+ assert {x['uri'] for x in refs}=={(p/'main.ab').as_uri(),(p/'dep.ab').as_uri()}
+ empty=s.rpc('query/definition',dict(params,offset=0))['result'];assert empty['value'] is None
+ for offset in [-1,1.5,len(main['text'].encode())+1]:
+  assert s.rpc('query/definition',dict(params,offset=offset))['error']['code']=='invalid_params'
+ s.rpc('document/open',{'uri':(p/'dep.ab').as_uri(),'version':1,'text':'fun answer: string = "changed"\n'})
+ assert s.rpc('query/hover',params)['error']['code']=='stale_revision'
+ updated=s.rpc('query/hover',{'uri':params['uri'],'offset':params['offset']})['result'];assert updated['value']['type']=='string',updated
+ s.rpc('document/close',{'uri':(p/'dep.ab').as_uri()})
+ restored=s.rpc('query/hover',{'uri':params['uri'],'offset':params['offset']})['result'];assert restored['value']['type']=='i64',restored
+ (p/'dep.ab').write_text('fun answer: string = "on disk"\n')
+ changed=s.rpc('query/hover',{'uri':params['uri'],'offset':params['offset']})['result'];assert changed['value']['type']=='string',changed
+ assert changed['revision']!=restored['revision'];s.close()
+ legacy=Session(p,graph=False)
+ assert legacy.rpc('query/hover',params)['error']['code']=='method_not_found';legacy.close()
+
+
+for test in [simple,alias_private,generic_fields,no_eval,strict,symlinks,negative_protocol,packages,contract_surface,disk_revision,queries]:
  if os.environ.get('ANALYSIS_TEST_FILTER') and test.__name__ not in os.environ['ANALYSIS_TEST_FILTER'].split(','):continue
  test();print('ok',test.__name__,flush=True)
 print('analysis graph: protocol fixtures passed',flush=True)

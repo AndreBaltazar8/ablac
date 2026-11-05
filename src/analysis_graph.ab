@@ -280,8 +280,8 @@ fun bootstrapAnalysisGraphDiagnostics(
 // message counts. Keep immutable strings, and compare exact contents rather
 // than treating a hash collision as permission to validate stale edits.
 fun BootstrapAnalysisService.graphObserveInputs(project: BootstrapFrontendProject, entry: string): void {
-    val paths: array<string> = ["entry"]
-    val values: array<string> = [entry]
+    val paths: array<string> = ["entry", "errors", "diagnostics"]
+    val values: array<string> = [entry, "${project.written.errors}", project.written.diagnostics]
     val observed: Map<string, bool> = Map()
     for (module in project.modules) {
         paths.append("source:${module.path}")
@@ -330,6 +330,8 @@ fun BootstrapAnalysisService.graphSnapshot(): Json {
     bootstrapSourceRewrites = []
     val project = bootstrapFrontendLoadHostProject(entry, bootstrapAnalysisGraphModules)
     this.graphObserveInputs(project, entry)
+    val cached = this.graphQueryIndex
+    if (cached != null && cached.revision == this.revision) return cached.snapshot
     val documents: array<BootstrapAnalysisGraphDocument> = []
     val names: Map<string, string> = Map()
     for (module in project.modules) {
@@ -380,12 +382,13 @@ fun BootstrapAnalysisService.graphSnapshot(): Json {
         }
         val semantic = bootstrapAnalysisGraphSemantic(analyzed.semantic, documents, names)
         semanticDiagnostics = semantic.diagnostics
+        val occurrenceIndex = bootstrapAnalysisOccurrenceIndex(analyzed.parsed.declarations, semantic)
         for (document in documents) {
             values.append(jsonObject(["uri", "version", "text", "symbols", "occurrences", "diagnostics"],
                 [jsonString(document.document.uri), jsonInteger(document.document.version),
                     jsonString(document.document.text), document.symbols,
                     bootstrapAnalysisOccurrencesJson(document.document.text, document.document.path,
-                        document.parsed, analyzed.parsed.declarations, semantic, aliases, true),
+                        document.parsed, analyzed.parsed.declarations, semantic, aliases, true, occurrenceIndex),
                     bootstrapAnalysisGraphDiagnostics(document, project, semanticDiagnostics)]))
         }
     } else {
@@ -404,7 +407,90 @@ fun BootstrapAnalysisService.graphSnapshot(): Json {
                 jsonObject(["start", "end"], [jsonInteger(site.begin), jsonInteger(site.end)]),
                 jsonString("compile-time evaluation was not performed; types describe the pre-evaluation source")]))
     }
-    return jsonObject(["revision", "documents", "analysisMode", "complete", "pending", "entry"],
+    val result = jsonObject(["revision", "documents", "analysisMode", "complete", "pending", "entry"],
         [jsonString("${this.revision}"), jsonArray(values), jsonString("graph-v1"),
             jsonBoolean(analyzed != null && pending.size == 0), jsonArray(pending), jsonString(entry)])
+    this.graphQueryIndex = bootstrapAnalysisGraphQueryIndex(result, this.revision)
+    return result
+}
+
+// One immutable export/index generation per service. Replacing it releases all
+// previous references; no per-edit history, AST or sema graph is retained here.
+class BootstrapAnalysisGraphQueryIndex(
+    val revision: int,
+    val snapshot: Json,
+    val documents: Map<string, Json>,
+    val symbols: Map<string, Json>,
+    val references: Map<string, array<Json>>
+)
+
+fun bootstrapAnalysisGraphQueryIndex(snapshot: Json, revision: int): BootstrapAnalysisGraphQueryIndex {
+    val documents: Map<string, Json> = Map()
+    val symbols: Map<string, Json> = Map()
+    val references: Map<string, array<Json>> = Map()
+    for (document in snapshot.get("documents").values) {
+        val uri = document.getString("uri")
+        documents.set(bootstrapAnalysisGraphPath(uri), document)
+        for (symbol in document.get("symbols").values) symbols.set(symbol.getString("id"), symbol)
+        for (occurrence in document.get("occurrences").values) {
+            val id = occurrence.getString("declarationId")
+            if (id != "") {
+                val location = jsonObject(["uri", "range"], [jsonString(uri), occurrence.get("range")])
+                val previous = references.get(id)
+                if (previous != null) previous.append(location)
+                else references.set(id, [location])
+            }
+        }
+    }
+    BootstrapAnalysisGraphQueryIndex(revision, snapshot, documents, symbols, references)
+}
+
+fun BootstrapAnalysisService.graphQuery(id: int, method: string, params: Json): string {
+    val uri = params.getString("uri")
+    if (!bootstrapAnalysisGraphUriValid(uri) || !params.get("offset").intAvailable() ||
+        params.getInt("offset") < 0) return bootstrapAnalysisError(id, "invalid_params",
+            "queries require a local absolute file URI and a nonnegative UTF-8 byte offset")
+    val snapshot = this.graphSnapshot()
+    val requestedRevision = params.get("revision")
+    if (!requestedRevision.isNull() && (!requestedRevision.isString() ||
+        requestedRevision.asString() != snapshot.getString("revision"))) {
+        return bootstrapAnalysisError(id, "stale_revision", "analysis revision is stale")
+    }
+    val index = this.graphQueryIndex
+    if (index == null || !snapshot.has("entry") || index.revision != this.revision) {
+        return bootstrapAnalysisError(id, "analysis_incomplete", "no project entry is available for this query")
+    }
+    val document = index.documents.get(bootstrapAnalysisGraphPath(uri))
+    if (document == null) return bootstrapAnalysisError(id, "document_not_analyzed",
+        "the document is outside the selected program graph")
+    val offset = params.getInt("offset")
+    if (offset > document.getString("text").size) return bootstrapAnalysisError(id, "invalid_params",
+        "offset is outside the document")
+    val occurrences = document.get("occurrences")
+    var low = 0
+    var high = occurrences.size()
+    while (low < high) {
+        val middle = low + (high - low) / 2
+        if (occurrences.at(middle).get("range").getInt("end") <= offset) low = middle + 1
+        else high = middle
+    }
+    var occurrence = jsonNull()
+    if (low < occurrences.size() && occurrences.at(low).get("range").getInt("start") <= offset) {
+        occurrence = occurrences.at(low)
+    }
+    val identity = occurrence.getString("declarationId")
+    val symbol = index.symbols.get(identity)
+    var value = jsonNull()
+    if (method == "query/definition") {
+        if (symbol != null) value = symbol
+    } else if (method == "query/hover") {
+        if (!occurrence.isNull()) value = jsonObject(["range", "type", "symbol"],
+            [occurrence.get("range"), jsonString(occurrence.getString("type")),
+                if (symbol != null) symbol else jsonNull()])
+    } else {
+        val references = index.references.get(identity)
+        value = if (references != null) jsonArray(references) else jsonArray([])
+    }
+    bootstrapAnalysisResponse(id, jsonObject(["revision", "complete", "pending", "value"],
+        [snapshot.get("revision"), snapshot.get("complete"), snapshot.get("pending"), value]))
 }

@@ -1,5 +1,8 @@
 # Opt-in module-graph analysis
 
+The subsequent [indexed-query extension](analysis-queries.md) adds warm snapshot
+reuse and positional requests. Measurements below describe the initial graph step.
+
 `abla-lsp` is the separate language server and refactoring client. The compiler
 provides semantic facts over `ablac analyze --stdio`; it does not implement LSP.
 The client at version 0.3.0 uses schema 1, numeric request IDs, full-text

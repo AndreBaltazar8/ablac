@@ -42,12 +42,14 @@ class BootstrapAnalysisService(
     var graphMode: bool = false,
     val graphEntries: array<string> = [],
     val graphInputPaths: array<string> = [],
-    val graphInputValues: array<string> = []
+    val graphInputValues: array<string> = [],
+    var graphQueryIndex: BootstrapAnalysisGraphQueryIndex? = null
 )
 
 class BootstrapAnalysisSemanticGroup(
     val declarations: array<BootstrapDeclaration>,
-    val semantic: BootstrapSemanticResult
+    val semantic: BootstrapSemanticResult,
+    val occurrenceIndex: BootstrapAnalysisOccurrenceIndex
 )
 
 fun bootstrapAnalysisHexDigit(value: int): int {
@@ -623,6 +625,82 @@ fun bootstrapAnalysisCollectDeclarationIdentities(
     )
 }
 
+// Build once per semantic group. Preserve the legacy first-success ordering:
+// declarations win, then resolved names, then the earliest successful call.
+class BootstrapAnalysisOccurrenceTarget(val identity: string, val type: string)
+class BootstrapAnalysisOccurrenceIndex(
+    val resolved: Map<string, BootstrapAnalysisOccurrenceTarget>,
+    val calls: Map<string, array<BootstrapTypedCall>>,
+    val handles: array<string>
+)
+
+fun bootstrapAnalysisOccurrenceKey(source: string, begin: int, end: int, name: string): string =
+    "$source:$begin:$end:$name"
+
+fun bootstrapAnalysisOccurrenceIndex(
+    declarations: array<BootstrapDeclaration>, semantic: BootstrapSemanticResult
+): BootstrapAnalysisOccurrenceIndex {
+    val resolved: Map<string, BootstrapAnalysisOccurrenceTarget> = Map()
+    val calls: Map<string, array<BootstrapTypedCall>> = Map()
+    val handles: array<string> = []
+    for (declaration in declarations) handles.append(bootstrapAnalysisDeclarationId(declaration))
+    for (declaration in declarations) {
+        for (method in declaration.methods) handles.append(bootstrapAnalysisDeclarationId(method))
+    }
+    for (name in semantic.resolvedNames) {
+        val key = bootstrapAnalysisOccurrenceKey(name.sourceIdentity, name.begin, name.end, name.name)
+        val previous = resolved.get(key)
+        if (previous == null || previous.identity == "") {
+            resolved.set(key, BootstrapAnalysisOccurrenceTarget(name.declarationIdentity, name.type))
+        }
+    }
+    for (call in semantic.typedCalls) {
+        val previous = calls.get(call.sourceIdentity)
+        if (previous != null) previous.append(call)
+        else calls.set(call.sourceIdentity, [call])
+    }
+    BootstrapAnalysisOccurrenceIndex(resolved, calls, handles)
+}
+
+// Index call candidates against token positions once, visiting only tokens in
+// each call's source span. No scan of all program calls for every identifier.
+fun bootstrapAnalysisCallTokens(
+    source: string, sourceIdentity: string, tokens: array<BootstrapToken>,
+    index: BootstrapAnalysisOccurrenceIndex
+): Map<int, BootstrapAnalysisOccurrenceTarget> {
+    val matches: Map<int, BootstrapAnalysisOccurrenceTarget> = Map()
+    val calls = index.calls.get(sourceIdentity)
+    if (calls == null) return matches
+    for (call in calls) {
+        var low = 0
+        var high = tokens.size
+        while (low < high) {
+            val middle = low + (high - low) / 2
+            if (tokens[middle].begin < call.begin) low = middle + 1 else high = middle
+        }
+        var cursor = low
+        while (cursor < tokens.size && tokens[cursor].begin < call.end) {
+            val token = tokens[cursor]
+            var matchesCall = token.kind == BOOTSTRAP_TOKEN_IDENTIFIER && token.end <= call.end &&
+                bootstrapTokenText(source, token) == call.name
+            if (matchesCall && call.kind == "call") matchesCall = token.begin == call.begin
+            if (matchesCall && call.kind == "member.call") {
+                matchesCall = cursor > 0 && tokens[cursor - 1].kind == BOOTSTRAP_TOKEN_DOT
+            }
+            if (matchesCall) {
+                val previous = matches.get(cursor)
+                if (previous == null || previous.identity == "") {
+                    val id = if (call.target >= 0 && call.target < index.handles.size)
+                        index.handles[call.target] else ""
+                    matches.set(cursor, BootstrapAnalysisOccurrenceTarget(id, call.type))
+                }
+            }
+            cursor = cursor + 1
+        }
+    }
+    matches
+}
+
 fun bootstrapAnalysisOccurrencesJson(
     source: string,
     sourceIdentity: string,
@@ -630,7 +708,8 @@ fun bootstrapAnalysisOccurrencesJson(
     declarations: array<BootstrapDeclaration>,
     semantic: BootstrapSemanticResult,
     aliases: Map<string, string> = Map(),
-    requireKnownIdentity: bool = false
+    requireKnownIdentity: bool = false,
+    occurrenceIndex: BootstrapAnalysisOccurrenceIndex? = null
 ): Json {
     val values: array<Json> = []
     val tokens = bootstrapLex(source)
@@ -665,6 +744,13 @@ fun bootstrapAnalysisOccurrencesJson(
         }
         declaration = declaration + 1
     }
+    val declarationAt: Map<string, string> = Map()
+    for (item in 0 until declarationIds.size) {
+        declarationAt.set("${declarationBegins[item]}:${declarationEnds[item]}", declarationIds[item])
+    }
+    val semanticIndex = if (occurrenceIndex != null) occurrenceIndex
+        else bootstrapAnalysisOccurrenceIndex(declarations, semantic)
+    val callAt = bootstrapAnalysisCallTokens(source, sourceIdentity, tokens, semanticIndex)
     var index = 0
     while (index < tokens.size) {
         val token = tokens[index]
@@ -678,47 +764,23 @@ fun bootstrapAnalysisOccurrencesJson(
                     [jsonInteger(token.begin), jsonInteger(token.end)]
                 )
             ]
-            declaration = 0
-            var declarationId = ""
+            val declared = declarationAt.get("${token.begin}:${token.end}")
+            var declarationId = if (declared != null) declared else ""
             var resolvedType = ""
-            while (declaration < declarationIds.size) {
-                if (declarationBegins[declaration] == token.begin &&
-                    declarationEnds[declaration] == token.end) {
-                    declarationId = declarationIds[declaration]
-                }
-                declaration = declaration + 1
-            }
-            var resolvedName = 0
-            while (declarationId == "" &&
-                resolvedName < semantic.resolvedNames.size) {
-                val resolved = semantic.resolvedNames[resolvedName]
-                if (resolved.sourceIdentity == sourceIdentity &&
-                    resolved.begin == token.begin &&
-                    resolved.end == token.end && resolved.name == name) {
-                    declarationId = resolved.declarationIdentity
+            if (declarationId == "") {
+                val resolved = semanticIndex.resolved.get(bootstrapAnalysisOccurrenceKey(
+                    sourceIdentity, token.begin, token.end, name))
+                if (resolved != null) {
+                    declarationId = resolved.identity
                     resolvedType = resolved.type
                 }
-                resolvedName = resolvedName + 1
             }
-            var call = 0
-            while (declarationId == "" && call < semantic.typedCalls.size) {
-                val typed = semantic.typedCalls[call]
-                var matches = typed.sourceIdentity == sourceIdentity &&
-                    typed.name == name && token.begin >= typed.begin &&
-                    token.end <= typed.end
-                if (matches && typed.kind == "call") {
-                    matches = token.begin == typed.begin
+            if (declarationId == "") {
+                val call = callAt.get(index)
+                if (call != null) {
+                    declarationId = call.identity
+                    resolvedType = call.type
                 }
-                if (matches && typed.kind == "member.call") {
-                    matches = index > 0 && tokens[index - 1].kind == BOOTSTRAP_TOKEN_DOT
-                }
-                if (matches) {
-                    declarationId = bootstrapAnalysisHandleId(
-                        declarations, typed.target
-                    )
-                    resolvedType = typed.type
-                }
-                call = call + 1
             }
             if (declarationId != "") {
                 val canonical = aliases.get(declarationId)
@@ -893,7 +955,8 @@ fun bootstrapAnalysisDocumentJson(
     document: BootstrapAnalysisDocument,
     parsed: BootstrapParseResult,
     declarations: array<BootstrapDeclaration>,
-    semantic: BootstrapSemanticResult
+    semantic: BootstrapSemanticResult,
+    occurrenceIndex: BootstrapAnalysisOccurrenceIndex
 ): Json {
     jsonObject(
         [
@@ -906,7 +969,7 @@ fun bootstrapAnalysisDocumentJson(
             jsonString(document.text),
             bootstrapAnalysisSymbolsJson(document.text, document.uri, parsed),
             bootstrapAnalysisOccurrencesJson(
-                document.text, document.path, parsed, declarations, semantic
+                document.text, document.path, parsed, declarations, semantic, Map(), false, occurrenceIndex
             ),
             bootstrapAnalysisDiagnosticsJson(
                 document.text, parsed, semantic, document.path
@@ -964,15 +1027,11 @@ fun bootstrapAnalysisSemanticGroup(
         declarations, actions, errors, extensionErrors,
         compileInputPaths, compileInputContents, diagnostics
     )
-    BootstrapAnalysisSemanticGroup(
-        declarations,
-        // The same rewrites the build applies before analysis (backend.ab,
-        // ir.ab): receiver members by plain name, generics' instances,
-        // expected literal types, overloads, inferred borrow contracts.
-        bootstrapFrontendAnalyzeRequested(
-            merged, typedBegins, typedEnds, typedKinds, typedSources
-        )
+    val semantic = bootstrapFrontendAnalyzeRequested(
+        merged, typedBegins, typedEnds, typedKinds, typedSources
     )
+    BootstrapAnalysisSemanticGroup(declarations, semantic,
+        bootstrapAnalysisOccurrenceIndex(declarations, semantic))
 }
 
 fun BootstrapAnalysisService.legacySnapshot(): Json {
@@ -1008,7 +1067,7 @@ fun BootstrapAnalysisService.legacySnapshot(): Json {
         }
         values.append(bootstrapAnalysisDocumentJson(
             documents[index], parsedDocuments[index],
-            groups[group].declarations, groups[group].semantic
+            groups[group].declarations, groups[group].semantic, groups[group].occurrenceIndex
         ))
         index = index + 1
     }
@@ -1322,6 +1381,7 @@ fun BootstrapAnalysisService.initialize(params: Json): Json {
         capabilities.append(jsonString("module-graph-analysis-v1"))
         capabilities.append(jsonString("no-eval-ct"))
         capabilities.append(jsonString("pre-ct-types"))
+        capabilities.append(jsonString("analysis-queries-v1"))
         capabilities.append(jsonString("refactor-validation-complete-only"))
     }
     this.initialized = true
@@ -1386,6 +1446,9 @@ fun BootstrapAnalysisService.handle(request: Json): string {
             }
         }
         response = bootstrapAnalysisResponse(id, this.snapshot())
+    } else if (this.graphMode && (method == "query/definition" || method == "query/hover" ||
+        method == "query/references")) {
+        response = this.graphQuery(id, method, params)
     } else if (method == "refactor/validate") {
         response = bootstrapAnalysisResponse(id, this.validateEdit(params))
     } else if (method == "shutdown") {
