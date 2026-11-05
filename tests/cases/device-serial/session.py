@@ -226,19 +226,30 @@ with tempfile.TemporaryDirectory(prefix="abla-device-test-") as directory:
     for mode in ("device", "serial"):
         master, slave = pty.openpty()
         client = None
+        received = []
+        reader = None
         try:
             tty.setraw(slave)
             client = Client(mode, os.ttyname(slave), small)
-            assert client.write()[:3] == (1, len(small_bytes), 0)
-            received = b""
-            while len(received) < len(small_bytes):
-                assert select.select([master], [], [], 3)[0]
-                received += os.read(master, 4096)
-            assert received == small_bytes
+            # Consume concurrently: on Darwin even a short tty write can
+            # exceed the output low-water mark used by final readiness.
+            # The separate stalled-reader cases deliberately do not drain.
+            def read_small():
+                while sum(map(len, received)) < len(small_bytes):
+                    if not select.select([master], [], [], 3)[0]: return
+                    received.append(os.read(master, 4096))
+            reader = threading.Thread(target=read_small)
+            reader.start()
+            outcome = client.write()
+            reader.join(timeout=4)
+            assert not reader.is_alive()
+            assert outcome[:3] == (1, len(small_bytes), 0), (mode, outcome)
+            assert b"".join(received) == small_bytes
             client.close()
             checks += 1
         finally:
             if client: client.clean()
+            if reader: reader.join(timeout=4)
             os.close(master)
             os.close(slave)
 
