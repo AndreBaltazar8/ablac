@@ -1,6 +1,8 @@
 """Protocol-only fixtures. Run against a built compiler; never executes source CT."""
 import json, os, pathlib, subprocess, sys, shutil
-compiler=pathlib.Path(sys.argv[1]).resolve()
+# Absolute, not resolved: build/ablac is a symlink to a launcher that finds
+# its payload beside the name it was run as.
+compiler=pathlib.Path(os.path.abspath(sys.argv[1]))
 root=pathlib.Path('build/analysis-graph').resolve()
 root.mkdir(parents=True,exist_ok=True)
 
