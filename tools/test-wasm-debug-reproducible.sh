@@ -91,7 +91,9 @@ done
 for file in "$output_directory/text/module.wasm.ll" \
     "$output_directory/first/module.wasm" "$output_directory/first/module.wasm.debug.wasm"
 do
-    if strings "$file" | grep -q '__abla_module_'; then
-        fail "$(basename "$file") names a function by its module prefix"
+    prefixed=$(strings "$file" | grep '__abla_module_' | head -5 || true)
+    if [ -n "$prefixed" ]; then
+        fail "$(basename "$file") names a function by its module prefix:
+$prefixed"
     fi
 done
