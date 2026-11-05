@@ -22,27 +22,39 @@ fun currentMask(): int {
     value.close()
     result
 }
-resource class Gate(var step: int)
-fun markReady(var gate: Gate): int { gate.step = 1; gate.step }
-fun markDone(var gate: Gate): int { gate.step = 2; gate.step }
-fun getStep(var gate: Gate): int = gate.step
-fun waitStep(gate: Mutex<Gate>, expected: int): bool {
-    var tries = 0
-    while (tries < 100000 && gate.with(getStep) < expected) {
-        linuxSyscall0(24) // sched_yield
-        tries = tries + 1
+// Blocking pipes make readiness independent of how soon the worker is scheduled.
+// The test runner's deadline still bounds a genuine deadlock.
+fun handshakePipe(): array<int> {
+    val value = nativeByteBuffer(8)
+    val result = linuxSyscall2(293, nativePointerAddress(value.address), 524288) // pipe2, O_CLOEXEC
+    val descriptors = value.loadI64(0)
+    value.close()
+    if (result == 0) [descriptors & 4294967295, descriptors >> 32] else [-1, -1]
+}
+fun handshake(descriptor: int, sending: bool): bool {
+    val value = nativeByteBuffer(8)
+    value.storeI64(0, 1)
+    val operation = if (sending) 1 else 0 // write or read
+    var result = linuxSyscall3(operation, descriptor, nativePointerAddress(value.address), 1)
+    while (result == -4) { // EINTR
+        result = linuxSyscall3(operation, descriptor, nativePointerAddress(value.address), 1)
     }
-    gate.with(getStep) >= expected
+    val ok = result == 1 && value.loadI64(0) == 1
+    value.close()
+    ok
 }
 // Keep close callable through the same borrowed parameter accepted by 0.2.37.
 fun stopWatch(watch: SignalWatch): void { watch.close() }
-fun otherThread(gate: Mutex<Gate>, bit: int): int {
+resource class HandshakeDescriptors(val readyOutput: int, val releaseInput: int)
+fun otherThread(descriptors: Shared<HandshakeDescriptors>, bit: int): int {
+    val readyOutput = descriptors.get().readyOutput
+    val releaseInput = descriptors.get().releaseInput
     val before = currentMask()
     val watch = watchSignals([signalTerminate])
-    gate.with(markReady)
-    val signalled = waitStep(gate, 2)
+    val ready = handshake(readyOutput, true)
+    val signalled = handshake(releaseInput, false)
     watch.close()
-    if (watch.started && signalled && (before & bit) != 0 && currentMask() == before) 1 else 0
+    if (watch.started && ready && signalled && (before & bit) != 0 && currentMask() == before) 1 else 0
 }
 fun main: int {
     val interrupt = 1 << (signalInterrupt - 1)
@@ -80,15 +92,26 @@ fun main: int {
     stopWatch(replacement)
     check(currentMask() == baseline, "replacement close restores mask")
     val parentWatch = watchSignals([signalTerminate])
-    val gate = Mutex(Gate(0))
-    val childGate = gate.clone()
-    val worker = thread { otherThread(childGate, 1 << 14) }
-    val ready = waitStep(gate, 1)
+    val readyPipe = handshakePipe()
+    val releasePipe = handshakePipe()
+    if (readyPipe[0] < 0 || releasePipe[0] < 0) {
+        check(false, "handshake pipes opened")
+        for (descriptor in readyPipe) { if (descriptor >= 0) linuxSyscall1(3, descriptor) }
+        for (descriptor in releasePipe) { if (descriptor >= 0) linuxSyscall1(3, descriptor) }
+        parentWatch.close()
+        changeMask(2, original)
+        return 1
+    }
+    val descriptors = Shared(HandshakeDescriptors(readyPipe[1], releasePipe[0]))
+    val worker = thread { otherThread(descriptors, 1 << 14) }
+    val ready = handshake(readyPipe[0], false)
     parentWatch.close()
     check(ready && currentMask() == baseline, "other thread's watch does not hold this thread's mask")
-    gate.with(markDone)
+    check(handshake(releasePipe[1], true), "worker release sent")
     val workerOk = await worker
     check(workerOk == 1, "worker restores its inherited signal mask")
+    for (descriptor in readyPipe) { linuxSyscall1(3, descriptor) }
+    for (descriptor in releasePipe) { linuxSyscall1(3, descriptor) }
     changeMask(2, original)
     if (failures == 0) 42 else 1
 }
