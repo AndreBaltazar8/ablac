@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Darwin development runner: supervise a payload group and its caller's lifetime."""
+from contextlib import closing
 import errno
 import os
 import select
@@ -31,7 +32,7 @@ def supervise(parent, seconds, grace, command):
         signal.signal(number, interrupted)
     # Register before spawning, so even an immediately exiting child wakes us.
     signal.signal(signal.SIGCHLD, lambda number, frame: None)
-    with select.kqueue() as queue:
+    with closing(select.kqueue()) as queue:
         changes = [select.kevent(parent, filter=select.KQ_FILTER_PROC,
                                  flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
                                  fflags=select.KQ_NOTE_EXIT)]
