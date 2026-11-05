@@ -391,6 +391,7 @@ test-serial: ablac
 	tools/test-loop-safe-point.sh $(COMPILER)
 	tools/test-codegen-units.sh $(COMPILER)
 	tools/test-codegen-cache.sh $(COMPILER)
+	tools/test-codegen-cache-race.sh $(COMPILER)
 	tools/test-compiler-bitcode.sh $(COMPILER)
 	tools/test-native-cache-failures.sh $(COMPILER)
 

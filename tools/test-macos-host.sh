@@ -87,5 +87,7 @@ expect_status_42 "$output_directory/process-capture"
 expect_status_42 \
     "$compiler" run --jit "$project_root/tests/cases/bootstrap/block.ab"
 
+"$project_root/tools/test-codegen-cache-race.sh" "$compiler"
+
 printf '%s\n' \
     'macOS host: Mach-O build, console, filesystem, process, and ORC paths passed'

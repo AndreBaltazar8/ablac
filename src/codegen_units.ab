@@ -39,6 +39,11 @@ import "abla/llvm/orc"
 import "backend/llvm/bindings.ab"
 import "backend/llvm/debug.ab"
 
+// POSIX on both hosted compiler platforms. Unlike touch(1), utimes never
+// creates a name that a concurrent eviction has just removed.
+noescape extern:"c" fun link(existing: cstring, destination: cstring): i32
+noescape extern:"c" fun utimes(path: cstring, times: i64*): i32
+
 noescape extern:"c" fun LLVMGetFirstGlobal(module: i64*): i64*
 noescape extern:"c" fun LLVMGetNextGlobal(global: i64*): i64*
 noescape extern:"c" fun LLVMGetFirstGlobalAlias(module: i64*): i64*
@@ -647,12 +652,74 @@ fun bootstrapReadCodegenUnitPlan(path: string): array<int> {
 
 /** Copies the file `source` to `destination` (`cp`; a clone where the file
  *  system makes one): its status. */
-fun bootstrapCodegenCopy(source: string, destination: string): int {
+fun bootstrapCodegenCopy(source: string, destination: string, quiet: bool = false): int {
     val copy = linuxCommand("cp")
     if (ablaHostIsMacOS()) copy.argument("-c")
     copy.argument(source)
     copy.argument(destination)
-    copy.run()
+    if (quiet || ablaHostIsMacOS()) copy.errors("/dev/null")
+    var status = copy.run()
+    // clonefile cannot cross volumes, and some file systems do not support
+    // clones. A normal copy still gives this build an independent file.
+    if (status != 0 && ablaHostIsMacOS()) {
+        Path(destination).remove()
+        val plain = linuxCommand("cp")
+        plain.argument(source)
+        plain.argument(destination)
+        if (quiet) plain.errors("/dev/null")
+        status = plain.run()
+    }
+    status
+}
+
+/** Pins a hit in this build's private directory before the child reports it.
+ *  Losing the cache name before link/open is a miss, not a failed build. */
+fun bootstrapCodegenMaterializeHit(entry: string, part: string): bool {
+    val evict = linuxEnvironment("ABLA_CODEGEN_TEST_EVICT_BEFORE_PIN")
+    if (evict.found && evict.value == "1") Path(entry).remove()
+    Path(part).remove()
+    val copy = linuxEnvironment("ABLA_CODEGEN_TEST_COPY_HITS")
+    if (!(copy.found && copy.value == "1") && link(entry, part) == i32(0)) {
+        utimes(part, nativeNullPointer())
+        return true
+    }
+    // This also covers EXDEV and file systems that forbid hard links. If a
+    // sweep unlinks the source after cp opens it, its descriptor keeps it alive.
+    if (Path(entry).info().isFile() && bootstrapCodegenCopy(entry, part, true) == 0) {
+        utimes(entry, nativeNullPointer())
+        return true
+    }
+    Path(part).remove()
+    false
+}
+
+/** Publishes complete bytes by rename on the cache's file system. The private
+ *  part remains owned by this build even if the new cache name is evicted. */
+fun bootstrapCodegenPublish(entry: string, part: string): bool {
+    val temporary = "$entry.tmp.${linuxProcessId()}"
+    Path(temporary).remove()
+    // Neither the child nor the parent writes a completed part again: llvm-ar
+    // and wasm-ld only read it. Share its inode when the cache is on this volume.
+    val ready = link(part, temporary) == i32(0) ||
+        bootstrapCodegenCopy(part, temporary, true) == 0
+    val published = ready && Path(temporary).moveTo(Path(entry))
+    Path(temporary).remove()
+    published
+}
+
+// Deterministic test barrier after all children have reported, before the
+// parent uses its parts. A different compiler can sweep the shared cache.
+fun bootstrapCodegenTestBarrier(): int {
+    val configured = linuxEnvironment("ABLA_CODEGEN_TEST_BARRIER")
+    if (!configured.found || configured.value == "") return 0
+    val directory = configured.value
+    if (!Path("$directory/ready").writeText("ready")) return 145
+    var remaining = 60000
+    while (!Path("$directory/release").exists() && remaining > 0) {
+        linuxSleepMillisecondsChecked(1)
+        remaining = remaining - 1
+    }
+    if (remaining > 0) 0 else 145
 }
 
 /** Writes `objectPath` from the bitcode bootstrapWriteCodegenUnits wrote: one
@@ -661,8 +728,8 @@ fun bootstrapCodegenCopy(source: string, destination: string): int {
  *  `wasm-eh`; `triple` the target), at most bootstrapCodegenJobs at once,
  *  the objects combined into one file (bootstrapCodegenCombineUnits). A child
  *  writes `unit<n>.o` in `<objectPath>.units` (removed after); with the code
- *  generation cache on, it reuses its unit's object from the cache or adds it
- *  there, and the part is a copy of the cache's object: the result is the
+ *  generation cache on, it pins its unit's cached object or publishes a copy
+ *  of its generated part. The result is the
  *  bytes of a build without the cache. */
 fun bootstrapRunCodegenUnits(
     kind: string,
@@ -675,10 +742,10 @@ fun bootstrapRunCodegenUnits(
     val bitcodePath = "$objectPath.units.bc"
     val planPath = "$objectPath.units.plan"
     val directory = "$objectPath.units"
-    val cached = places.cache != ""
+    var cached = places.cache != ""
     Path(directory).removeTree()
     var status = if (Path(directory).createDirectories()) 0 else 145
-    if (status == 0 && cached && !Path(places.cache).createDirectories()) status = 145
+    if (cached && !Path(places.cache).createDirectories()) cached = false
     val parts: array<string> = []
     val commands: array<array<string>> = []
     var unit = 0
@@ -688,7 +755,7 @@ fun bootstrapRunCodegenUnits(
             parts.append(part)
             commands.append([
                 "--codegen-unit", kind, triple, bitcodePath, planPath, "$unit", part,
-                places.cache, places.salt
+                if (cached) places.cache else "", places.salt
             ])
         }
         unit = unit + 1
@@ -696,12 +763,11 @@ fun bootstrapRunCodegenUnits(
     val count = parts.size
     val jobs = bootstrapCodegenJobs(count)
     if (status == 0) status = bootstrapCodegenRunUnits(commands, jobs)
+    if (status == 0 && cached) status = bootstrapCodegenTestBarrier()
     Path(bitcodePath).remove()
     Path(planPath).remove()
-    // A child that used the cache says which object is its unit's
-    // (`<part>.path`: the path, then 1 when it was reused).
-    // Its object is copied to the part, so what is combined, and an archive's
-    // member names, are those of a build without the cache.
+    // Cache paths are hints for tracing and this build's sweep only. Every
+    // child already owns its private part; another build may evict any entry.
     val entries: array<string> = []
     var reused = 0
     var generated = ""
@@ -714,7 +780,7 @@ fun bootstrapRunCodegenUnits(
                 entries.append(entry)
                 if (said[end + 1] == 49) reused = reused + 1
                 else generated = "$generated ${Path(part).name()}"
-                if (status == 0 && bootstrapCodegenCopy(entry, part) != 0) status = 145
+                if (status == 0 && !Path(part).info().isFile()) status = 145
             } else if (status == 0) status = 145
         }
     }
