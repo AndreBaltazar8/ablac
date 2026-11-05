@@ -555,6 +555,25 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
 
 ## Tried, not pursued
 
+- **STM inline logged-access fast paths** (2026-11-05, #499, base
+  `444eebde`): rejected one same-protocol prototype. Inline the stable first
+  read and first logged write; keep snapshot extension, retry, direct undo and
+  repeated-write handling out of line. Seven alternating baseline/candidate
+  pairs per scenario on CPUs 4,8,10,14, release builds without cache, returned
+  42 in all 56 runs. Disjoint cycles fell 21.65% by ratio of medians, but the
+  median within-pair change was only -9.53%, below the required 10% improvement
+  (individual pairs ranged from -30.88% to +19.10% under load). Instructions
+  fell 14.91%. Shared and forced-logged single cycles fell 11.86% and 15.93%
+  by ratio of medians (median pair: -13.04% and -19.44%). Direct single
+  regressed: instructions +14.82% (680.26M to 781.06M per 800,000 blocks),
+  cycles +9.84% by ratio of medians, +7.16% median pair. The stripped scenario
+  binary grew from 47,120 to 47,504 bytes (+0.815%, above the 0.5% cap).
+  Stop: no runtime changes retained, no second variant or clock prototype.
+  Raw pairs, binaries and rejected patch remain in worktree `ablac-stm-fast`,
+  `build/stm-fast-lab/{screen.json,final-summary.json,rejected-prototype.patch}`.
+  These are aggregate worker cycles, not latency; correctness/stress gates
+  beyond the scenario counters were not run for the rejected change.
+
 - [ ] **Full contract-shape library loading needs a namespace design, not a
   local import fix** (2026-11-05). Eager full loads broke compile-time provider
   order; preserving ordinary order then leaked implementation helpers and
