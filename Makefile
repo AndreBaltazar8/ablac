@@ -83,6 +83,7 @@ test-full: ablac
 test-serial: ablac
 	tools/test-version.sh $(COMPILER)
 	tools/test-analysis-service.sh $(COMPILER)
+	tools/test-frontend-analysis.sh $(COMPILER)
 	tools/test-deep-logical.sh $(COMPILER)
 	tools/test-compile-effect-path.sh $(COMPILER)
 	tools/test-value-abi.sh $(COMPILER)

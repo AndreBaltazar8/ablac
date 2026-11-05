@@ -567,6 +567,10 @@ fun bootstrapModuleDiscovery(
 // A snapshot is the reusable, module-local part of graph loading. Keeping the
 // source and import scan together is important: publishing a new source with
 // stale dependency edges would make incremental invalidation unsound.
+// Unsaved source is supplied at its lexical path, never through shadow files.
+// Versions are session-local; content fingerprints still key reusable parses.
+class BootstrapModuleOverlay(val path: string, val text: string, val version: int)
+
 class BootstrapModuleSnapshot(
     val path: string,
     val source: string,
@@ -666,7 +670,10 @@ class BootstrapModuleState(
     var discoveryPrepared: bool = false,
     // Explicit per-build policy; ordinary parser/module APIs stay cache-free.
     var discoveryDirectory: string = "",
-    var discoveryIdentity: string = ""
+    var discoveryIdentity: string = "",
+    var overlays: array<BootstrapModuleOverlay> = [],
+    val overlaySnapshots: Map<string, bool> = Map(),
+    var syntaxOnly: bool = false
 ) {
     fun beginBuild(): void {
         if (this.discoveryPrepared) this.discoveryPrepared = false
@@ -745,6 +752,18 @@ class BootstrapModuleState(
         parsed
     }
 
+    fun overlayIndex(modulePath: string): int {
+        var index = 0
+        while (index < this.overlays.size) {
+            if (this.overlays[index].path == modulePath) return index
+            index = index + 1
+        }
+        -1
+    }
+
+    fun sourceExists(modulePath: string): bool =
+        this.overlayIndex(modulePath) >= 0 || Path(modulePath).info().exists()
+
     fun acquire(modulePath: string): BootstrapModuleSnapshot {
         val existing = this.indexOf(modulePath)
         val acquiredIn = this.acquiredIn.get(modulePath)
@@ -752,9 +771,35 @@ class BootstrapModuleState(
             return this.snapshots[existing]
         }
         this.acquiredIn.set(modulePath, this.build)
+        val overlay = this.overlayIndex(modulePath)
+        if (overlay >= 0) {
+            val source = this.overlays[overlay]
+            this.overlaySnapshots.set(modulePath, true)
+            if (existing >= 0 && this.snapshots[existing].exists && this.snapshots[existing].source == source.text) {
+                this.reused = this.reused + 1
+                return this.snapshots[existing]
+            }
+            val scan = bootstrapScanImports(source.text)
+            val first = bootstrapModuleFingerprint(source.text, 17, 257, 1000000007)
+            val second = bootstrapModuleFingerprint(source.text, 97, 263, 1000000009)
+            val discovery = this.discover(source.text, modulePath, scan.errors, first, second)
+            val snapshot = BootstrapModuleSnapshot(
+                modulePath, source.text, scan.edges, scan.errors, true,
+                source.text.size, source.version, first, second, discovery
+            )
+            if (existing >= 0) this.snapshots[existing] = snapshot
+            else {
+                this.snapshotIndex.set(modulePath, this.snapshots.size)
+                this.snapshots.append(snapshot)
+            }
+            this.refreshed = this.refreshed + 1
+            return snapshot
+        }
+        val wasOverlay = this.overlaySnapshots.get(modulePath)
+        if (wasOverlay != null && wasOverlay) this.overlaySnapshots.set(modulePath, false)
         val info = Path(modulePath).info()
         var reusable = false
-        if (existing >= 0) {
+        if (existing >= 0 && !(wasOverlay != null && wasOverlay)) {
             val snapshot = this.snapshots[existing]
             reusable = snapshot.exists == info.exists() &&
                 snapshot.size == info.size &&
@@ -844,6 +889,9 @@ class BootstrapModuleState(
         registry: BootstrapSubparserRegistry,
         allowedCompileEffects: int
     ): BootstrapParseResult {
+        // Editor syntax mode must not touch the staged cache: neither reuse a
+        // broader-policy result nor publish an incomplete parse into that cache.
+        if (this.syntaxOnly) return bootstrapParseWithIdentity(snapshot.source, snapshot.path)
         var existing = this.frontendIndex(
             snapshot,
             dependencyFingerprint
@@ -3303,7 +3351,7 @@ class BootstrapModuleGraph(
                     )
                     // A missing file is an error at its import, not an empty module
                     // whose declarations later fail as unknown names.
-                    if (!Path(imported).info().exists()) {
+                    if (!this.state.sourceExists(imported)) {
                         this.errors = this.errors + 1
                         this.diagnostics =
                             "${this.diagnostics}error[E_IMPORT_NOT_FOUND]: imported module `${edge.source}` doesn't exist (looked for $imported)\nsource[import]:$identity:${edge.begin}:${edge.end}\n"
@@ -3311,7 +3359,11 @@ class BootstrapModuleGraph(
                         this.loadContract(imported)
                     } else this.load(imported)
                 } else {
-                    val provider = bootstrapEvaluateImportProvider(
+                    val provider = if (this.state.syntaxOnly) BootstrapImportProviderResult(
+                        BootstrapPackageDependency("", "", "", "", "", "", "", "", []),
+                        1,
+                        "error[E_ANALYSIS_CT_REQUIRED]: analysis incomplete: import provider evaluation is disabled\nsource[import]:$identity:${edge.begin}:${edge.end}\n"
+                    ) else bootstrapEvaluateImportProvider(
                         edge.source, this.orderedSnapshots,
                         snapshot.discovery
                     )
@@ -3518,7 +3570,7 @@ class BootstrapModuleGraph(
                 "parse.module.begin:$moduleIndex:${snapshot.path}"
             )
             var localRegistry = BootstrapSubparserRegistry([], 0, "")
-            if (bootstrapActionsRegisterSubparser(
+            if (!this.state.syntaxOnly && bootstrapActionsRegisterSubparser(
                 snapshot.discovery.actions
             )) {
                 val visibleDeclarations: array<BootstrapDeclaration> = []
@@ -3721,7 +3773,7 @@ class BootstrapModuleGraph(
         // One graph's count: a parse whose result never reached code generation
         // (an analysis-only request) leaves nothing behind for the next one.
         val staleNamedArgumentErrors = bootstrapTakeNamedArgumentErrors()
-        val normalized = bootstrapNormalizeNamedArguments(BootstrapParseResult(
+        val assembled = BootstrapParseResult(
             declarations,
             actions,
             parseErrors,
@@ -3729,7 +3781,11 @@ class BootstrapModuleGraph(
             compileInputPaths,
             compileInputContents,
             parseDiagnostics
-        ))
+        )
+        // Named overload probing calls sema; keep it out of the no-evaluation
+        // parse boundary, until the caller has inspected blocked CT sites.
+        val normalized = if (this.state.syntaxOnly) assembled
+            else bootstrapNormalizeNamedArguments(assembled)
         bootstrapFrontendTraceMemory("parse.normalize.end")
         bootstrapLexMemoEnd()
         bootstrapModuleIdentityRoot = enclosingRoot

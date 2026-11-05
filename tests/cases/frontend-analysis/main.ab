@@ -1,0 +1,95 @@
+import "../../../src/frontend.ab"
+import "../../../src/frontend_diagnostics.ab"
+import "../../../src/module.ab"
+import "../../../src/parser.ab"
+import "../../../src/sema.ab"
+import "abla/sys/linux/fs"
+
+fun frontendFind(parsed: BootstrapParseResult, name: string): int {
+    var index = 0
+    while (index < parsed.declarations.size) {
+        if (parsed.declarations[index].name == name) return index
+        index = index + 1
+    }
+    -1
+}
+
+fun main: int {
+    val state = bootstrapModuleState()
+    val root = "build/frontend-analysis"
+    val dep = "$root/dep.ab"
+    state.overlays.append(BootstrapModuleOverlay(dep, "fun value: int = 9\n", Path(dep).info().revision))
+    val project = bootstrapFrontendLoadProject("$root/main.ab", state, BootstrapFrontendPolicy(false))
+    if (project.written.errors != 0 || project.blocked.size != 0) return 1
+    if (state.snapshots[state.indexOf(dep)].source != "fun value: int = 9\n") return 2
+    val index = frontendFind(project.written, "answer")
+    if (index < 0) return 3
+    val source = project.written.declarations[index].sourceIdentity
+    val begins: array<int> = []
+    val ends: array<int> = []
+    val kinds: array<string> = []
+    val sources: array<string> = []
+    begins.append(project.written.declarations[index].expression.begin)
+    ends.append(project.written.declarations[index].expression.end)
+    kinds.append("call")
+    sources.append(source)
+    val analyzed = bootstrapFrontendAnalyzeProject(project, begins, ends, kinds, sources)
+    if (analyzed == null) return 4
+    val semantic = analyzed.semantic
+    if (frontendFind(analyzed.parsed, "answer") < 0) return 16
+    if (semantic.errors != 0 || semantic.typedCalls.size != 1 || semantic.typedCalls[0].type != "i64") return 4
+    // Closing restores disk even when its metadata could match an overlay.
+    state.overlays = []
+    val disk = bootstrapFrontendLoadProject("$root/main.ab", state, BootstrapFrontendPolicy(false))
+    if (disk.written.errors != 0 || state.snapshots[state.indexOf(dep)].source != "fun value: int = 7\n") return 5
+    // A never-saved dependency must exist from the graph's point of view.
+    state.overlays = [
+        BootstrapModuleOverlay("$root/main.ab", "import \"new.ab\"\nfun answer: int = fresh()\n", 2),
+        BootstrapModuleOverlay("$root/new.ab", "fun fresh: int = 19\n", 1)
+    ]
+    val fresh = bootstrapFrontendLoadProject("$root/main.ab", state, BootstrapFrontendPolicy(false))
+    if (fresh.written.errors != 0 || frontendFind(fresh.written, "fresh") < 0) return 6
+    // Source authorization alone must not make a syntax-only project execute.
+    state.overlays = []
+    val blocked = bootstrapFrontendLoadProject("$root/ct.ab", state, BootstrapFrontendPolicy(false))
+    if (blocked.blocked.size == 0 || bootstrapFrontendAnalyzeProject(blocked, [], [], [], []) != null) return 7
+    if (Path("$root/forbidden").exists()) return 8
+    if (state.syntaxOnly) return 9
+    val noHandler = bootstrapFrontendLoadProject("$root/handler.ab", state, BootstrapFrontendPolicy(false))
+    if (bootstrapTextContains(noHandler.written.diagnostics, "source[eval]:")) return 11
+    // Negative control: the ordinary staged policy really executes the handler.
+    val handler = bootstrapFrontendLoadProject("$root/handler.ab", state, BootstrapFrontendPolicy(true))
+    if (!bootstrapTextContains(handler.written.diagnostics, "source[eval]:") ||
+        !bootstrapTextContains(handler.written.diagnostics, "context[subparser]: `parseProbe`")) return 12
+    state.overlays = [BootstrapModuleOverlay("$root/main.ab", "compile val cached = 1\nfun main: int = 0\n", 3)]
+    val compileGlobal = bootstrapFrontendLoadProject("$root/main.ab", state, BootstrapFrontendPolicy(false))
+    if (compileGlobal.blocked.size == 0) return 13
+    state.overlays = [BootstrapModuleOverlay("$root/main.ab", "fun pick(value: int = #1): int = value\n", 4)]
+    val defaulted = bootstrapFrontendLoadProject("$root/main.ab", state, BootstrapFrontendPolicy(false))
+    if (defaulted.blocked.size == 0) return 14
+    state.overlays = [BootstrapModuleOverlay("$root/main.ab", "import github(\"unknown/never-fetch\", ref = \"main\")\nfun main: int = 0\n", 5)]
+    val provider = bootstrapFrontendLoadProject("$root/main.ab", state, BootstrapFrontendPolicy(false))
+    if (!bootstrapTextContains(provider.written.diagnostics, "E_ANALYSIS_CT_REQUIRED") ||
+        bootstrapTextContains(provider.written.diagnostics, "source[eval]:")) return 15
+    val privateSource = "private fun hidden: int = 1\nval computed = #1\nfun value: int = 7\n"
+    state.overlays = [BootstrapModuleOverlay(dep, privateSource, 6)]
+    val origin = bootstrapFrontendLoadProject("$root/main.ab", state, BootstrapFrontendPolicy(false))
+    var hash = 0
+    while (hash < privateSource.size && privateSource[hash] != 35) hash = hash + 1
+    var found = false
+    var site = 0
+    while (site < origin.blocked.size) {
+        if (origin.blockedSources[site] == dep && origin.blocked[site].begin == hash) found = true
+        site = site + 1
+    }
+    if (!found) return 17
+    val located: array<BootstrapFrontendDiagnostic> = []
+    bootstrapFrontendAppendLocatedDiagnostics(
+        "error[E_SAMPLE]: sample\nsource[semantic]:fixture:2:999\n",
+        "source[semantic]:fixture:", "fixture", "abc", located
+    )
+    if (located.size != 1 || located[0].code != "E_SAMPLE" ||
+        located[0].begin != 2 || located[0].end != 3 ||
+        located[0].sourceIdentity != "fixture") return 10
+    0
+}

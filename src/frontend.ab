@@ -1,0 +1,149 @@
+// Compiler frontend operations shared by builds and editor analysis.
+// This module owns no protocol, filesystem writes, LLVM emission or type inference.
+import "module.ab"
+import "parser.ab"
+import "sema.ab"
+import "receiver_names.ab"
+import "generics.ab"
+import "expected_types.ab"
+import "overload.ab"
+import "delegated_properties.ab"
+import "borrow_inference.ab"
+import "named_arguments.ab"
+
+/** The rewrites between the parse and the analysis, in order: receiver
+ *  members by plain name become `this.` accesses, array literals take the type
+ *  expected of them (expected_types.ab), overloads get distinct names and their
+ *  calls name them (overload.ab), delegated properties' accesses become calls of
+ *  their delegates (delegated_properties.ab), and results that return a view of
+ *  a parameter get its borrow contract. Run over the whole raw program each
+ *  round (bootstrapCommitEdits): they are not idempotent. */
+fun bootstrapPreSemanticPipeline(written: BootstrapParseResult): BootstrapParseResult =
+    bootstrapInferBorrowContracts(bootstrapResolveDelegatedProperties(
+        bootstrapResolveOverloads(bootstrapResolveExpectedTypes(
+            bootstrapInstantiateGenerics(bootstrapResolveReceiverNames(written))
+        ))
+    ))
+
+// Keep the requested source spans in the caller's original source coordinates.
+// The same sema implementation answers both builds and analysis queries.
+fun bootstrapFrontendAnalyzeRequested(
+    written: BootstrapParseResult,
+    begins: array<int>,
+    ends: array<int>,
+    kinds: array<string>,
+    sources: array<string>
+): BootstrapSemanticResult = bootstrapAnalyzeRequestedSourceSpans(
+    bootstrapPreSemanticPipeline(written), begins, ends, kinds, sources
+)
+
+// Policy is explicit at the graph boundary. A syntax-only graph never runs
+// staged parsers, registration handlers, transforms, or compile-time actions.
+// The ordinary compiler retains its existing staged behavior by default.
+class BootstrapFrontendPolicy(val compileTime: bool)
+
+class BootstrapFrontendProject(
+    val written: BootstrapParseResult,
+    val modules: array<BootstrapModule>,
+    val blocked: array<BootstrapExpression>,
+    val blockedSources: array<string>,
+    val namedArgumentsNormalized: bool
+)
+
+fun bootstrapFrontendCollectCompile(
+    expression: BootstrapExpression,
+    source: string,
+    var blocked: array<BootstrapExpression>,
+    var sources: array<string>
+): void {
+    if (expression.kind == "compile") {
+        blocked.append(expression)
+        sources.append(source)
+    }
+    for (child in expression.children) {
+        bootstrapFrontendCollectCompile(child, source, blocked, sources)
+    }
+    return
+}
+
+fun bootstrapFrontendCollectDeclarationCompile(
+    declaration: BootstrapDeclaration,
+    var blocked: array<BootstrapExpression>,
+    var sources: array<string>
+): void {
+    if (declaration.kind == "compile.val" || declaration.kind == "compile.var") {
+        blocked.append(declaration.expression)
+        sources.append(declaration.sourceIdentity)
+    }
+    bootstrapFrontendCollectCompile(declaration.expression, declaration.sourceIdentity, blocked, sources)
+    for (value in declaration.parameterDefaults) {
+        bootstrapFrontendCollectCompile(value, declaration.sourceIdentity, blocked, sources)
+    }
+    for (argument in declaration.annotationArguments) {
+        bootstrapFrontendCollectCompile(argument, declaration.sourceIdentity, blocked, sources)
+    }
+    for (method in declaration.methods) {
+        bootstrapFrontendCollectDeclarationCompile(method, blocked, sources)
+    }
+    return
+}
+
+// Load through the compiler's graph, including strict imports, contract twins,
+// lexical identity and source overrides. This is deliberately separate from
+// inference: an editor must not infer across a blocked CT site as if it ran.
+fun bootstrapFrontendLoadProject(
+    entry: string,
+    var state: BootstrapModuleState,
+    policy: BootstrapFrontendPolicy
+): BootstrapFrontendProject {
+    val previous = state.syntaxOnly
+    state.syntaxOnly = !policy.compileTime
+    state.beginCounting()
+    val graph = BootstrapModuleGraph([], 0, state, [], [], "", [], bootstrapModuleGraphIndex())
+    graph.load(entry)
+    val parsed = graph.parse()
+    state.syntaxOnly = previous
+    val blocked: array<BootstrapExpression> = []
+    val sources: array<string> = []
+    if (!policy.compileTime) {
+        // All blocked spans use the original file's coordinates. The graph's
+        // prepared declarations can have rewritten-name offsets, and actions
+        // have no sourceIdentity: inspect each original module uniformly.
+        for (module in graph.modules) {
+            val local = bootstrapParseWithIdentity(module.source, module.path)
+            for (declaration in local.declarations) {
+                bootstrapFrontendCollectDeclarationCompile(declaration, blocked, sources)
+            }
+            for (action in local.actions) {
+                bootstrapFrontendCollectCompile(action, module.path, blocked, sources)
+            }
+        }
+    }
+    BootstrapFrontendProject(parsed, graph.modules, blocked, sources, policy.compileTime)
+}
+
+// Declaration handles in typed calls refer to this normalized parse, not to
+// the original declarations (generics/defaults/overloads may add or reorder them).
+class BootstrapFrontendAnalysis(
+    val parsed: BootstrapParseResult,
+    val semantic: BootstrapSemanticResult
+)
+
+// The editor entry cannot accidentally evaluate a blocked project's expressions
+// through sema or named-overload probes. Broader CT authorization is not enabled
+// by this API; the initial no-evaluation mode reports partial results instead.
+fun bootstrapFrontendAnalyzeProject(
+    project: BootstrapFrontendProject,
+    begins: array<int>,
+    ends: array<int>,
+    kinds: array<string>,
+    sources: array<string>
+): BootstrapFrontendAnalysis? {
+    if (project.blocked.size > 0 || project.written.errors > 0) return null
+    val named = if (project.namedArgumentsNormalized) project.written
+        else bootstrapNormalizeNamedArguments(project.written)
+    val prepared = bootstrapPreSemanticPipeline(named)
+    BootstrapFrontendAnalysis(prepared, bootstrapAnalyzeRequestedSourceSpans(
+        prepared, begins, ends, kinds, sources
+    ))
+}
