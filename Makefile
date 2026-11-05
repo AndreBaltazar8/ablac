@@ -133,6 +133,7 @@ test-serial: ablac
 	tools/test-xtensa-test-tools.sh
 	tools/test-simd.sh $(COMPILER)
 	tools/test-ct.sh $(COMPILER)
+	python3 tools/ct-timing/test-stats.py
 	tools/test-bignum-secret.sh $(COMPILER)
 	tools/test-uint256.sh $(COMPILER)
 	tools/test-array-truncate.sh $(COMPILER)

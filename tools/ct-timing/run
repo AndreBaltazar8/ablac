@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""Opt-in Linux x86-64 timing experiment. Run inside nix-shell shell.nix."""
+import argparse, hashlib, json, os, pathlib, platform, shutil, subprocess, sys, time
+from stats import analyze,finite_json,read_samples
+ROOT=pathlib.Path(__file__).resolve().parents[2]
+TARGETS=['aes-software','aes-hardware','compare','rsa-crt','bn-from-bytes','bn-to-bytes','bn-residue-square','bn-montgomery','bn-divide','bn-reduce','bn-exact','bn-divsteps','bn-gcd','bn-inverse']
+def digest(p):return hashlib.sha256(p.read_bytes()).hexdigest()
+def build(args,out):
+    compiler=pathlib.Path(os.path.abspath(args.compiler)) # Preserve launcher invocation name.
+    if not compiler.is_file():raise ValueError('compiler missing: build ablac first or pass --compiler')
+    payload=pathlib.Path(os.environ.get('ABLA_COMPILER_PAYLOAD',str(compiler)+'.bin'))
+    identity=digest(payload if payload.is_file() else compiler)
+    sources=list((ROOT/'stdlib').rglob('*.ab'))+[ROOT/'tools/ct-timing'/n for n in ['driver.ab','sampler.c','generate.py','run']]
+    source_hash=hashlib.sha256(''.join(str(p.relative_to(ROOT))+digest(p) for p in sorted(sources)).encode()).hexdigest()
+    build_env={k:v for k,v in os.environ.items() if k.startswith('ABLA_') or k in ('PATH','LIBRARY_PATH','LD_LIBRARY_PATH')}
+    metadata={'compiler_sha256':identity,'sources_sha256':source_hash,'clang_version':subprocess.check_output(['clang','--version'],text=True).strip(),'build_environment_sha256':hashlib.sha256(json.dumps(build_env,sort_keys=True).encode()).hexdigest()}
+    stamp=out/'build.json';binary=out/'driver'
+    if args.reuse and stamp.exists() and binary.exists() and json.loads(stamp.read_text())==metadata:return binary
+    subprocess.run([sys.executable,str(ROOT/'tools/ct-timing/generate.py'),str(out/'main.ab')],check=True)
+    (out/'abla.toml').write_text('name = "ct-timing"\nentry = "main.ab"\nnativeLibraries = ["cttiming"]\n')
+    subprocess.run(['clang','-O2','-Wall','-Wextra','-Werror','-c',str(ROOT/'tools/ct-timing/sampler.c'),'-o',str(out/'sampler.o')],check=True)
+    subprocess.run(['ar','rcs',str(out/'libcttiming.a'),str(out/'sampler.o')],check=True)
+    env=dict(os.environ,ABLA_SYSROOT=str(ROOT),ABLA_LINK_DIRECT='0',ABLA_NATIVE_JOBS='4',JOBS='4',LIBRARY_PATH=str(out)+(':'+os.environ['LIBRARY_PATH'] if os.environ.get('LIBRARY_PATH') else ''))
+    with (out/'build.log').open('w') as log:
+        result=subprocess.run(['taskset','-c',','.join(map(str,sorted(os.sched_getaffinity(0))[:4])),str(compiler),'build',str(out/'main.ab'),'-o',str(binary),'--no-cache'],cwd=ROOT,env=env,stdout=log,stderr=subprocess.STDOUT)
+    if result.returncode:raise ValueError(f'build failed; see {out / "build.log"}')
+    stamp.write_text(json.dumps(metadata,indent=2)+'\n');return binary
+
+def main():
+    ap=argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--compiler',default=str(ROOT/'build/ablac'));ap.add_argument('--cpu',type=int,required=True)
+    ap.add_argument('--confirm-cpu',type=int,help='different core for one fresh-order candidate confirmation')
+    ap.add_argument('--samples',type=int,default=40000,help='measurement samples per primitive, plus independent pilot/warmup')
+    ap.add_argument('--pilot',type=int,default=4096);ap.add_argument('--seed',type=int,default=0x43545449)
+    ap.add_argument('--targets',nargs='+',choices=TARGETS+['leaky-compare'],default=TARGETS)
+    ap.add_argument('--output',type=pathlib.Path,default=ROOT/'build/ct-timing')
+    ap.add_argument('--timeout',type=int,default=1800,help='wall seconds per candidate run; control is capped at 60')
+    ap.add_argument('--reuse',action='store_true',help='reuse driver only if compiler and all stdlib/driver source hashes match')
+    ap.add_argument('--smoke',action='store_true',help='bounded deliberately leaky control only; no crypto pass claim')
+    args=ap.parse_args()
+    if platform.system()!='Linux' or platform.machine() not in ['x86_64','AMD64']:
+        print('ct-timing unavailable: requires Linux x86_64, taskset and RDTSCP');return 0
+    if 'rdtscp' not in pathlib.Path('/proc/cpuinfo').read_text():
+        print('ct-timing unavailable: RDTSCP is not advertised');return 0
+    allowed=os.sched_getaffinity(0)
+    if args.cpu not in allowed or (args.confirm_cpu is not None and args.confirm_cpu not in allowed):raise ValueError('requested CPU is outside the current affinity mask')
+    def core(cpu):
+        base=pathlib.Path(f'/sys/devices/system/cpu/cpu{cpu}/topology')
+        return ((base/'physical_package_id').read_text().strip(),(base/'core_id').read_text().strip())
+    if args.confirm_cpu is None:
+        args.confirm_cpu=next((c for c in sorted(allowed) if core(c)!=core(args.cpu)),None)
+    if args.confirm_cpu is None or core(args.confirm_cpu)==core(args.cpu):raise ValueError('confirmation requires a different available physical core, not its SMT sibling')
+    if args.samples<4 or args.samples%2 or not 2<=args.pilot<=100000 or args.pilot%2 or args.seed<=0 or args.seed>=2**63-100100 or args.timeout<1:raise ValueError('samples and pilot must be positive even budgets; seed must fit signed 63 bits')
+    if args.samples+args.pilot+128>10000000:raise ValueError('total sample budget exceeds 10000000')
+    out=args.output.absolute();out.mkdir(parents=True,exist_ok=True)
+    binary=build(args,out)
+    build_info=json.loads((out/'build.json').read_text())
+    out=out/'runs'/(time.strftime('%Y%m%dT%H%M%SZ',time.gmtime())+'-'+str(os.getpid()))
+    out.mkdir(parents=True,exist_ok=False)
+    print('report: '+str(out/'report.json'),flush=True)
+    report={'platform':platform.platform(),'cpu':args.cpu,'confirmation_cpu':args.confirm_cpu,'cpu_model':next((l.split(':',1)[1].strip() for l in pathlib.Path('/proc/cpuinfo').read_text().splitlines() if l.startswith('model name')),''),'planned_targets':[] if args.smoke else args.targets,'smoke':args.smoke,'rsa_fixture_sha256':digest(ROOT/'tests/vectors/crypto/rsa-implicit-key.pem'),'statistics_sha256':digest(ROOT/'tools/ct-timing/stats.py'),'driver_sha256':digest(binary),'build':build_info,'counter':'serialized TSC ticks, not core cycles','constant_tsc_advertised':'constant_tsc' in pathlib.Path('/proc/cpuinfo').read_text(),'threshold':10,'unavailable':['P-256: no implementation in abla/crypto','X25519: no implementation in abla/crypto'],'runs':[]}
+    def save(): (out/'report.json').write_text(json.dumps(finite_json(report),indent=2,allow_nan=False)+'\n')
+    def run(target,cpu,seed,n,tag):
+        raw=out/f'{tag}.raw';start=time.monotonic()
+        try:
+            with raw.open('wb') as stdout,(out/f'{tag}.stderr').open('wb') as stderr:
+                result=subprocess.run(['taskset','-c',str(cpu),str(binary),target,str(n+128+args.pilot),str(seed),str(ROOT/'tests/vectors/crypto/rsa-implicit-key.pem')],stdout=stdout,stderr=stderr,cwd=ROOT,timeout=min(args.timeout,60) if target=='leaky-compare' else args.timeout)
+        except subprocess.TimeoutExpired:
+            report['runs'].append({'target':target,'cpu':cpu,'seed':seed,'status':'measurement timeout','raw_file':str(raw),'wall_s':time.monotonic()-start});save();raise
+        if result.returncode==3 and target=='aes-hardware':
+            record={'target':target,'status':'unavailable: AES CPU feature absent','cpu':cpu};report['runs'].append(record);save();print(json.dumps(record),flush=True);return record
+        if result.returncode:
+            report['runs'].append({'target':target,'cpu':cpu,'seed':seed,'status':'measurement failed','exit_code':result.returncode,'raw_file':str(raw)});save()
+            raise ValueError(f'{target} returned {result.returncode}; see {out / (tag+".stderr")}')
+        record=analyze(read_samples(raw),pilot=args.pilot,minimum=1000 if args.smoke else 10000)
+        record.update(target=target,cpu=cpu,seed=seed,wall_s=time.monotonic()-start,raw_file=str(raw),raw_sha256=digest(raw))
+        report['runs'].append(record);save()
+        print(json.dumps(finite_json({k:v for k,v in record.items() if k!='tests'})),flush=True);return record
+    save()
+    control=run('leaky-compare',args.cpu,args.seed,20000 if args.smoke else 40000,'control')
+    if control['status']!='leak detected':raise ValueError('negative control did not exceed |t|>10 within its fixed sample/time budget; run is invalid')
+    if args.smoke:return 0
+    for i,target in enumerate(args.targets):
+        r=run(target,args.cpu,args.seed+2*i+1,args.samples,target)
+        if r['status']=='leak detected':
+            run(target,args.confirm_cpu,args.seed+100003+2*i,args.samples,target+'-confirmation')
+            print('Candidate crossed |t|>10. Both runs retained; STOP without changing crypto.',file=sys.stderr);return 1
+        if r['status']=='insufficient samples':raise ValueError('not enough samples in either class; no no-leak result can be reported')
+    return 0
+if __name__=='__main__':
+    try:sys.exit(main())
+    except (ValueError,OSError,subprocess.SubprocessError) as e:print(f'ct-timing: {e}',file=sys.stderr);sys.exit(2)

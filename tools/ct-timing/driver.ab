@@ -1,0 +1,152 @@
+import "abla/ct"
+import "abla/crypto/aes"
+import "abla/crypto/rsa"
+import "abla/crypto/bignum"
+import "abla/unsafe/memory/raw"
+import "abla/fs"
+import "abla/integer"
+import "abla/process/arguments"
+
+noescape extern:"c" fun ctt_init(count: int, size: int, seed: int): int
+noescape extern:"c" fun ctt_input(state: int, index: int): int
+noescape extern:"c" fun ctt_begin(state: int, data: int, output: int, work: int): void
+noescape extern:"c" fun ctt_end(state: int, index: int, data: int, output: int, work: int, result: int): void
+noescape extern:"c" fun ctt_consume(data: int): void
+noescape extern:"c" fun ctt_check_aes(output: int): int
+noescape extern:"c" fun ctt_finish(state: int): int
+
+@noinline trusted fun timingLeaky(left: int, right: int): int {
+    for (i in 0 until 256) {
+        if (ablaUnsafeLoadU8(bnPointer(left + i)) != ablaUnsafeLoadU8(bnPointer(right + i))) return 1
+    }
+    0
+}
+
+// Width is public. Eight limbs exercise key-generation arithmetic without
+// making the opt-in default take hours; --samples can raise every budget.
+trusted fun main: int {
+    val mode = processArgument(0)
+    val count = processArgument(1).parseInt() ?? 0
+    val seed = processArgument(2).parseInt() ?? 1
+    val size = 256
+    val state = ctt_init(count, size, seed)
+    if (state == 0) return 2
+    val output = bnAllocate(128)
+    val work = bnAllocate(512)
+    val input = bnAllocate(64)
+    val divisor = bnAllocate(8)
+    val zero = bnAllocate(64)
+    // 2^255 - 19, an odd fixed modulus, with all operands kept full-width.
+    for (i in 0 until 8) bnStore(divisor + i * 4, secretU32(u32(4294967295)))
+    bnStore(divisor, secretU32(u32(4294967277)))
+    bnStore(divisor + 28, secretU32(u32(2147483647)))
+    val aes = aesExpand("\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", false)
+    val hardware = aesExpand("\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", aesHardwareAvailable())
+    if (mode == "aes-hardware" && !hardware.hardware) return 3
+    val key = rsaPrivateKeyFromPem(path(processArgument(3)).readText())
+    if (!key.ok() || key.bits != 2048) return 4
+    val modulus = bnModulusFrom(ablaUnsafeStringAddress(key.modulus), key.modulus.size, 64)
+    // Untimed functional preflight of the actual selected AES/CRT machinery.
+    aesSoftBlocks(aes, true, zero, output, 1)
+    if (ctt_check_aes(output) != 1) return 6
+    if (hardware.hardware) {
+        aesBlocks(hardware, true, zero, output, 1)
+        if (ctt_check_aes(output) != 1) return 7
+    }
+    if (mode == "rsa-crt") {
+        bnStore(input, secretU32(u32(2)))
+        rsaCrt(key, modulus, output, input)
+        bnExpPublic(modulus, work, output, key.publicExponent)
+        if (!bnEqual(work, input, 64)) return 8
+    }
+    // Warm every selected primitive on separate samples. The first 128 records
+    // are removed by the runner; class labels never enter this code.
+    for (i in 0 until count) {
+        val data = ctt_input(state, i)
+        if (mode == "rsa-crt") {
+            // Input < 2^2047 < n. Import is outside the CRT timing interval.
+            ablaUnsafeStoreU8(bnPointer(data), ablaUnsafeLoadU8(bnPointer(data)) & 127)
+            bnFromBytes(input, 64, data, 256)
+            ctt_begin(state, input, output, key.memory)
+            rsaCrt(key, modulus, output, input)
+            ctt_end(state, i, input, output, key.memory, 0)
+        } else if (mode == "aes-software") {
+            ctt_begin(state, data, output, aes.memory)
+            aesSoftBlocks(aes, true, data, output, 1)
+            ctt_end(state, i, data, output, aes.memory, 0)
+        } else if (mode == "aes-hardware") {
+            ctt_begin(state, data, output, hardware.memory)
+            aesBlocks(hardware, true, data, output, 1)
+            ctt_end(state, i, data, output, hardware.memory, 0)
+        } else if (mode == "compare") {
+            ctt_begin(state, data, output, zero)
+            val result = int(ctDifferenceAddress(zero, data, 256).declassify())
+            ctt_end(state, i, data, output, zero, result)
+        } else if (mode == "leaky-compare") {
+            ctt_begin(state, data, output, zero)
+            val result = timingLeaky(zero, data)
+            ctt_end(state, i, data, output, zero, result)
+        } else if (mode == "bn-from-bytes") {
+            ctt_begin(state, data, output, work)
+            bnFromBytes(output, 8, data, 32)
+            ctt_end(state, i, data, output, work, 0)
+        } else {
+            // Interpret the first 32 bytes as native little-endian limbs. The
+            // division family's fixed divisor is nonzero; no rejection path.
+            if (mode == "bn-residue-square") {
+                for (j in 0 until 8) bnStore(input + j * 4, bnLoad(data + j * 4))
+                bnStore(input, bnLoad(input) | secretU32(u32(1)))
+                bnStore(input + 28, bnLoad(input + 28) | secretU32(u32(2147483648)))
+            }
+            if (mode == "bn-montgomery") {
+                ablaUnsafeStoreU8(bnPointer(data + 31), ablaUnsafeLoadU8(bnPointer(data + 31)) & 63)
+                bnInverseWord(work + 2000, divisor)
+            }
+            if (mode == "bn-to-bytes") {
+                ctt_begin(state, data, output, work)
+                bnToBytes(output, 32, data)
+                ctt_end(state, i, data, output, work, 0)
+            } else if (mode == "bn-residue-square") {
+                ctt_begin(state, data, output, work)
+                bnResidueSquare(output, input, 8, work)
+                ctt_end(state, i, data, output, work, 0)
+            } else if (mode == "bn-montgomery") {
+                ctt_begin(state, data, output, work)
+                bnMontgomeryMultiply(output, data, data, divisor, work + 2000, 8, work)
+                ctt_end(state, i, data, output, work, 0)
+            } else if (mode == "bn-divide") {
+                ctt_begin(state, data, output, work)
+                val result = bnSecretDivModBody(output, output + 64, data, 16, divisor, 8, work)
+                ctt_end(state, i, data, output, work, int(result.declassify()))
+            } else if (mode == "bn-reduce") {
+                ctt_begin(state, data, output, work)
+                val result = bnSecretReduceBody(output + 64, data, 16, divisor, 8, output, work)
+                ctt_end(state, i, data, output, work, int(result.declassify()))
+            } else if (mode == "bn-exact") {
+                ctt_begin(state, data, output, work)
+                val result = bnSecretExactDivBody(output, data, 16, divisor, 8, output + 64, work)
+                ctt_end(state, i, data, output, work, int(result.declassify()))
+            } else if (mode == "bn-divsteps") {
+                ctt_begin(state, data, output, work)
+                val result = bnSecretDivstepsBody(output, output + 64, divisor, data, 8, work)
+                ctt_end(state, i, data, output, work, int(result.declassify()))
+            } else if (mode == "bn-gcd") {
+                ctt_begin(state, data, output, work)
+                val result = bnSecretGcdBody(output, divisor, data, 8, work)
+                ctt_end(state, i, data, output, work, int(result.declassify()))
+            } else if (mode == "bn-inverse") {
+                ctt_begin(state, data, output, work)
+                val result = bnSecretInverseBody(output, divisor, data, 8, work)
+                ctt_end(state, i, data, output, work, int(result.declassify()))
+            } else return 5
+        }
+        ctt_consume(output)
+    }
+    bnModulusRelease(modulus)
+    bnRelease(output, 128)
+    bnRelease(work, 512)
+    bnRelease(input, 64)
+    bnRelease(divisor, 8)
+    bnRelease(zero, 64)
+    ctt_finish(state)
+}

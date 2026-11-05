@@ -132,8 +132,11 @@
 - [x] **abla-pdf signs through the released `abla/crypto/rsa`** (since its 1a2c416, as abla-saft does). Its
   64c36d1 checks signatures against OpenSSL and against the old signer, byte for byte, on ablac 0.2.45.
 - [x] **Encrypted RSA key import:** pure PBES2/PBKDF2 SHA256/SHA1 + AES128/256-CBC PKCS#8 and MAC-verified DER PKCS#12 key bags, with owned passwords and bounded work. Legacy PBES1/RC2/DES and broader PFX formats remain unsupported; see [the scope and limits](docs/stdlib/encrypted-keys.md).
-- [ ] **No timing measurements of abla/crypto.** `tools/test-ct.sh` reads the assembly; nothing has run a statistical
-  test (`dudect`) on real hardware, or anything at all on an ESP32-S3. The Xtensa path is compiled and read only.
+- [x] **Native crypto timing measurements.** Opt-in [tools/ct-timing](tools/ct-timing/README.md) runs pinned
+  fixed/random TSC experiments with Welch tests, pooled pilot crops and a required early-exit control.
+  [Results](tools/ct-timing/RESULTS.md): no leak detected at 40,000 samples on each of 14 available x86-64
+  primitives; this is not a constant-time proof. `tools/test-ct.sh` remains the static assembly check.
+- [ ] **Crypto timing on ESP32-S3.** Xtensa is still compiled and read only; no hardware timing campaign exists.
 - [ ] **`--fast` builds aren't read by `tools/test-ct.sh`**: the checker stops at their calls. It could follow
   internal calls.
 - [ ] **Secret residue is not checked by `tools/test-ct.sh`.** It checks timing-related branches,
