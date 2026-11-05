@@ -90,6 +90,13 @@ for evaluator in interp jit; do
     [[ $(mode_of "$dir/recreated") == 600 && $(cat "$dir/recreated") == private ]]
   done
 done
+# A relative toolchain root (a bare compiler run from the checkout, as on
+# macOS CI) must still recognize the filesystem provider.
+rm -rf "$dir"
+prepare "$dir"
+ABLA_SYSROOT=. "$compiler" build "$out/staged.ab" -o "$out/staged-relative" --fast --no-cache
+"$out/staged-relative"
+[[ $(mode_of "$dir/secret") == 600 && $(cat "$dir/secret") == secret ]]
 # A later compile-time error must discard a staged secret.
 cat > "$out/failed.ab" <<'ABLA'
 import "abla/fs"
