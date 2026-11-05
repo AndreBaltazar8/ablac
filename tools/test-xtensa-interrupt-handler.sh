@@ -3,14 +3,11 @@ set -euo pipefail
 
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 compiler=${1:-$project_root/build/ablac}
-program=$project_root/build/xtensa-interrupt-handler-test
+program=$("$project_root/tools/compiler-api-test-program.py" "$compiler")
 diagnostics=$project_root/build/xtensa-interrupt-handler-test.stderr
 
-"$compiler" build \
-    "$project_root/tests/cases/modules/xtensa-interrupt-handler.ab" \
-    -o "$program" --fast
 set +e
-"$program" 2>"$diagnostics"
+ABLA_COMPILER_API_CASE=xtensa-interrupt "$program" 2>"$diagnostics"
 status=$?
 set -e
 if [[ $status -ne 42 ]]; then

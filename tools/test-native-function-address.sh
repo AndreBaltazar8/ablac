@@ -3,13 +3,10 @@ set -euo pipefail
 
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 compiler=${1:-$project_root/build/ablac}
-program=$project_root/build/native-function-address-test
+program=$("$project_root/tools/compiler-api-test-program.py" "$compiler")
 
-"$compiler" build \
-    "$project_root/tests/cases/modules/native-function-address.ab" \
-    -o "$program" --fast
 set +e
-"$program"
+ABLA_COMPILER_API_CASE=native-address "$program"
 status=$?
 set -e
 if [[ $status -ne 42 ]]; then
