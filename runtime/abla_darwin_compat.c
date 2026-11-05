@@ -155,32 +155,33 @@ static int darwin_poll(struct pollfd *fds, nfds_t count, int timeout) {
   }
   size_t words = (size_t)descriptor / 32 + 1;
   size_t bytes = words * sizeof(uint32_t);
-  fd_set local[3];
+  fd_set local[2];
   uint32_t *masks = (uint32_t *)local;
   int allocated = bytes > sizeof(fd_set);
   if (allocated) {
-    masks = calloc(3, bytes);
+    masks = calloc(2, bytes);
     if (masks == NULL) return -1;
   } else {
     bytes = sizeof(fd_set);
     words = bytes / sizeof(uint32_t);
     memset(local, 0, sizeof(local));
   }
-  uint32_t *reads = masks, *writes = masks + words, *errors = masks + 2 * words;
+  uint32_t *reads = masks, *writes = masks + words;
   size_t index = (size_t)descriptor / 32;
   uint32_t bit = UINT32_C(1) << (descriptor % 32);
   if (fds[0].events & POLLIN) reads[index] = bit;
   if (fds[0].events & POLLOUT) writes[index] = bit;
-  errors[index] = bit;
   struct timeval duration = {timeout / 1000, (timeout % 1000) * 1000};
+  // select's exceptional set denotes priority data, not POLLERR. Some
+  // character drivers (including /dev/null) report every select operation
+  // ready. A disconnected device is diagnosed by the subsequent I/O call.
   int result = select(descriptor + 1, (fd_set *)reads, (fd_set *)writes,
-                      (fd_set *)errors, timeout < 0 ? NULL : &duration);
+                      NULL, timeout < 0 ? NULL : &duration);
   int saved_errno = errno;
   if (result >= 0) {
     fds[0].revents = 0;
     if (reads[index] & bit) fds[0].revents |= POLLIN;
     if (writes[index] & bit) fds[0].revents |= POLLOUT;
-    if (errors[index] & bit) fds[0].revents |= POLLERR;
     result = fds[0].revents != 0;
   }
   if (allocated) free(masks);
