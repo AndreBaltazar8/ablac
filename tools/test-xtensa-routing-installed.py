@@ -35,7 +35,7 @@ def snapshot(root):
 env = dict(os.environ, ABLA_CACHE_DIR=str(out / 'cache'))
 env.pop('ABLA_XTENSA_LLVM_ROOT', None)
 env.pop('ABLA_STDLIB', None)
-for name in ('ABLA_ESP_CPU', 'ABLA_XTENSA_DIRECT_CALLS', 'ABLA_XTENSA_NARROW_BRANCHES', 'ABLA_XTENSA_TEXT_LITERALS'):
+for name in ('ABLA_ESP_CPU', 'ABLA_XTENSA_DIRECT_CALLS', 'ABLA_XTENSA_NARROW_BRANCHES', 'ABLA_XTENSA_TEXT_LITERALS', 'ABLA_XTENSA_NARROW', 'ABLA_ESP_KEEP_UNWIND'):
     env.pop(name, None)
 originals = snapshot(prefix)
 run(sys.executable, prefix / 'bin/abla-install-xtensa', '--version', '23.1.3-1', env=env)
@@ -46,7 +46,7 @@ for entry in reference['objects']:
     source = project / entry['source']
     assert companions.file_sha256(source) == entry['sourceSha256']
     output = out / (entry['name'] + '.o')
-    active = dict(env, ABLA_ESP_CPU=entry['cpu'])
+    active = dict(env, ABLA_ESP_CPU=entry['cpu'], ABLA_XTENSA_NARROW='1' if entry['narrow'] else '0')
     args = ['build', source, '-o', output, '--target-triple', 'xtensa-esp-unknown-elf',
             '--object-format', 'elf', '--emit', 'object', '--no-cache', '--no-debug']
     if entry['fast']:
@@ -61,7 +61,7 @@ repeat = out / 'different-process-output.o'
 run(compiler, 'build', project / entry['source'], '-o', repeat,
     '--target-triple', 'xtensa-esp-unknown-elf', '--object-format', 'elf',
     '--emit', 'object', '--no-cache', '--no-debug',
-    env=dict(env, ABLA_ESP_CPU=entry['cpu']))
+    env=dict(env, ABLA_ESP_CPU=entry['cpu'], ABLA_XTENSA_NARROW='1' if entry['narrow'] else '0'))
 assert companions.file_sha256(repeat) == entry['sha256'], 'output path or PID changed object bytes'
 # Without the launcher, poison both PATH tools. Automatic selection must still
 # derive the same installed cohort from the actual compiler image.

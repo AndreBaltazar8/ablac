@@ -227,8 +227,8 @@ even with `+density`. An isolated compiled stage mirrors the SDK narrowing
 transform, preserves verbatim inline assembly, and sets literal alignment in
 assembly before object emission. It uses the same selected private llc for
 assembly, requires no production Python, and never invokes objcopy.
-`ABLA_XTENSA_NARROW=0` disables density rewriting; it does not disable the
-alignment safety requirement. A successful CLI build records stage/version,
+`ABLA_XTENSA_NARROW=0` disables this additional density rewriting; it keeps
+literal placement/alignment repair and the backend's own existing narrow forms. A successful CLI build records stage/version,
 options and selected tool identities in `<output>.xtensa-tools.json`, also on
 cache hits. These settings enter the cache identity.
 

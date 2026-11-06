@@ -41,15 +41,22 @@ with tempfile.TemporaryDirectory(prefix='abla-xtensa-assembly-') as directory:
     for name, source in [('edges', edges), ('firmware', firmware)]:
         input_path, output_path = work / f'{name}.s', work / f'{name}.out'
         input_path.write_bytes(source)
-        for keep in [False, True]:
+        for keep, narrow in [(False, True), (True, True), (False, False), (True, False)]:
             env = dict(os.environ, ABLA_ESP_KEEP_UNWIND='1' if keep else '0')
-            expected = subprocess.run([sys.executable, '-I', str(reference)], input=source, capture_output=True, env=env, check=True).stdout
-            subprocess.run([str(binary), str(input_path), str(output_path), 'keep' if keep else 'narrow'], check=True, timeout=60)
+            args = [sys.executable, '-I', str(reference)]
+            if not narrow:
+                # Run the pinned placement/verbatim logic with identity instruction
+                # mapping: opt-out skips encodings, not the text printer repair.
+                code = "import runpy,sys; d=runpy.run_path(sys.argv[1]); d['main'].__globals__['narrow']=lambda line:line; d['main']()"
+                args = [sys.executable, '-I', '-c', code, str(reference)]
+            expected = subprocess.run(args, input=source, capture_output=True, env=env, check=True).stdout
+            mode = ('keep' if keep else 'narrow') if narrow else ('keep-no-narrow' if keep else 'no-narrow')
+            subprocess.run([str(binary), str(input_path), str(output_path), mode], check=True, timeout=60)
             actual = output_path.read_bytes()
-            assert actual == expected, f'{name}: exact SDK differential failed (keep={keep})'
-            # Prove these comparisons distinguish an unchanged, unnarrowed input.
+            assert actual == expected, f'{name}: exact SDK differential failed (keep={keep}, narrow={narrow})'
             assert expected != source, f'{name}: fixture exercises no transformation'
-            assert actual.replace(b'movi.n', b'movi', 1) != expected, f'{name}: broken transform was not detected'
+            if narrow:
+                assert actual.replace(b'movi.n', b'movi', 1) != expected, f'{name}: broken transform was not detected'
     subprocess.run([str(binary), str(input_path), str(output_path), 'module'], check=True, timeout=60)
     encoded = output_path.read_text()
     assert encoded.startswith('source_filename = "abla"\ntarget triple = "xtensa-esp-unknown-elf"\nmodule asm "')

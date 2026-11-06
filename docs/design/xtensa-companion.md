@@ -448,3 +448,13 @@ wrapper, 144,824 bytes, SHA-256
 `8d09555ca807d581fa02d48ebccfe5ec88e1e584601ffb6b657a50339a7b471c`.
 This supersedes the earlier 36/68-byte metadata allowances. Final source-frozen
 compiler and all-platform gates are still being repeated.
+
+
+Instruction opt-out still runs literal-placement legalization. The SDK opt-out
+uses direct object emission and so avoids the text printer's previous-section
+bug; when using an assembly envelope, skipping placement repair would move
+literal pools into a preceding jump-table section. Stage `xtensa-assembly-v3`
+therefore makes only instruction rewriting optional. The offline pinned-script
+differential covers both mappings and identity mappings with CFI on/off. Nix
+and installed-toolchain references cover both instruction settings, all three
+ESP CPUs and fast/release modes (24 objects).
