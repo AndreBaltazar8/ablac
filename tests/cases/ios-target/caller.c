@@ -34,10 +34,20 @@ int main(void) {
     fputs("ios-caller: before managed export\n", stderr);
     const int64_t managed = abla_ios_managed_answer(41);
     fputs("ios-caller: managed export returned\n", stderr);
+    const int64_t target = abla_ios_target_check();
+    fputs("ios-caller: before managed paths\n", stderr);
+    const int64_t paths = abla_ios_managed_paths(3);
+    fputs("ios-caller: before native callback\n", stderr);
+    const uintptr_t address = (uintptr_t)abla_ios_native_address();
+    if (!address) return 1;
+    const int64_t native = ((int64_t (*)(int64_t))address)(41);
+    fputs("ios-caller: managed paths and native callback returned\n", stderr);
     const mach_task_basic_info_data_t after = memory_info();
-    if (result != 42 || managed != 126) {
-        fprintf(stderr, "iOS exports returned %lld/%lld, expected 42/126\n",
-                (long long)result, (long long)managed);
+    if (result != 42 || managed != 126 || target != 42 || paths != 21 || native != 42) {
+        fprintf(stderr, "iOS exports returned %lld/%lld/%lld, expected 42/126/42\n",
+                (long long)result, (long long)managed, (long long)target);
+        fprintf(stderr, "paths=%lld native=%lld, expected 21/42\n",
+                (long long)paths, (long long)native);
         return 1;
     }
     const int64_t limit = abla_ios_memory_limit();

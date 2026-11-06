@@ -316,6 +316,7 @@ test-serial: ablac
 	tools/test-ios-target.sh $(COMPILER)
 	tools/test-ios-static-library.sh $(COMPILER)
 	tools/test-ios-package.sh $(COMPILER)
+	python3 tools/test-ios-availability.py $(COMPILER)
 	tools/test-text-unicode.sh $(COMPILER)
 	tools/test-json-native-paths.sh $(COMPILER)
 	tools/test-transactional-native-output.sh $(COMPILER)

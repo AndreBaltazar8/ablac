@@ -1,3 +1,4 @@
+import "ios.ab"
 import "../../frontend.ab"
 import "../../module_paths.ab"
 import "../../codegen_units.ab"
@@ -171,10 +172,22 @@ fun bootstrapEmitLlvmProgramPrepared(
     val nativeFunctionRoots = bootstrapLlvmNativeFunctionAddressRoots(
         program, functionIndex
     )
+    // Native addresses in CT-only helper bodies are not runtime roots on
+    // iOS. Follow those edges from the exported runtime graph instead.
+    val ios = bootstrapLlvmTargetIsIOS(targetTriple)
+    val initialNativeRoots: array<bool> = if (ios) [] else nativeFunctionRoots
     val exportReachability = bootstrapLlvmReachableExports(
         program, exports, functionIndex,
-        interruptHandlerRoots, nativeFunctionRoots
+        interruptHandlerRoots, initialNativeRoots, ios
     )
+    if (ios) {
+        index = 0
+        while (index < nativeFunctionRoots.size) {
+            nativeFunctionRoots[index] = nativeFunctionRoots[index] &&
+                exportReachability.functions[index]
+            index = index + 1
+        }
+    }
     val emittedFunctions: array<bool> = []
     val closedProgram = bootstrapLlvmTargetHasClosedProgramBoundary(
         targetTriple
@@ -200,6 +213,12 @@ fun bootstrapEmitLlvmProgramPrepared(
          !bootstrapTextContains(targetTriple, "wasm32")))
         functionIndex.find("__ablaRuntimeWasmSyscall") else -1
     if (wasmSyscall >= 0) emittedFunctions[wasmSyscall] = true
+    if (bootstrapLlvmTargetIsIOS(targetTriple) &&
+        bootstrapLlvmIosAvailability(
+            program, functionIndex, nativeIndex, emittedFunctions
+        ) > 0) {
+        return BootstrapLlvmEmission("", program.errors + 1, "")
+    }
     exports = exportReachability.exports
     bootstrapLlvmCheckedExports = false
     for (export in exports) {
@@ -984,7 +1003,9 @@ fun bootstrapCompileLlvmParsedCached(
         semanticErrors + annotationErrors + actionErrors + diagnosedLowering,
         irErrors,
         diagnostics,
-        bootstrapLlvmNeedsLlvm(program),
+        // iOS rejects reachable LLVM calls before emission. Unused native
+        // declarations (including CT-only helpers) must not request a JIT link.
+        !bootstrapLlvmTargetIsIOS(targetTriple) && bootstrapLlvmNeedsLlvm(program),
         bootstrapLlvmNeedsHostRuntime(program),
         program.compileInputPaths,
         program.compileInputContents,

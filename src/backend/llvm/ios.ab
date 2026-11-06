@@ -1,0 +1,137 @@
+import "analysis.ab"
+import "core.ab"
+import "../../ir.ab"
+import "../../sema.ab"
+import "../../eval.ab"
+import "../../parser.ab"
+
+// Availability follows lowered runtime callees. Compile-time host operations
+// have already been evaluated/removed; importing a module is not itself a use.
+fun bootstrapLlvmIosFunctionCategory(function: BootstrapIrFunction): string {
+    val file = bootstrapIrSourcePositionFile(function.position)
+    if (file < 0 || file >= bootstrapIrSourceFiles.size) return ""
+    val source = bootstrapIrSourceFiles[file]
+    if (!bootstrapStandardLibraryModuleSource(source)) return ""
+    val relative = source.slice(bootstrapStandardLibraryModulePrefix.size, source.size)
+    if (relative.startsWith("abla/device/")) return "device I/O"
+    if (relative.startsWith("abla/serial/")) return "serial I/O"
+    if (relative.startsWith("abla/process/signal/")) return "signals"
+    if (relative.startsWith("abla/process/command/") ||
+        relative.startsWith("abla/process/supervisor/")) return "process creation/execution"
+    if (relative.startsWith("abla/llvm/")) return "runtime LLVM/JIT"
+    if (relative == "abla/sys/linux/process/entry.ab") {
+        val label = bootstrapCanonicalDeclarationSourceName(
+            if (function.label != "") function.label else function.name
+        )
+        if (label == "linuxExecute" || label == "linuxExecPrepared" ||
+            label == "linuxReexecute" || label == "linuxWaitProcess" ||
+            label.startsWith("linuxStart") || label.startsWith("linuxPipeline") ||
+            label.startsWith("LinuxCommand.") ||
+            label.startsWith("LinuxChildProcess.")) return "process creation/execution"
+    }
+    ""
+}
+
+fun bootstrapLlvmIosNativeCategory(name: string, runtime: bool): string {
+    if (name.startsWith("LLVM")) return "runtime LLVM/JIT"
+    if (name == "fork" || name == "vfork" ||
+        name == "execve" || name == "execv" || name == "execvp" ||
+        name == "execvpe" || name == "execl" || name == "execlp" ||
+        name == "execle" || name == "fexecve" ||
+        name == "posix_spawn" || name == "posix_spawnp" ||
+        name == "system" || name == "popen" || name == "pclose" ||
+        name == "wait" || name == "waitpid" || name == "wait3" ||
+        name == "wait4") return "process creation/execution"
+    // Fatal runtime paths may raise/abort. This does not expose SignalWatch or
+    // user signal-handler/mask APIs, which are unavailable on the iOS target.
+    if (!runtime && (name == "signal" || name == "sigaction" ||
+        name == "sigprocmask" || name == "pthread_sigmask" ||
+        name == "sigaltstack" || name == "kill" || name == "raise")) return "signals"
+    ""
+}
+
+fun bootstrapLlvmIosRefusal(category: string, operation: string, position: int): int {
+    var diagnostic =
+        "error[E_TARGET_IOS_UNSUPPORTED]: $category APIs are not supported on iOS (`$operation`)\n"
+    val file = bootstrapIrSourcePositionFile(position)
+    if (file >= 0 && file < bootstrapIrSourceFiles.size) {
+        val offset = bootstrapIrSourcePositionOffset(position)
+        diagnostic = "$diagnostic" +
+            "source[target]:${bootstrapIrSourceFiles[file]}:$offset:${offset + 1}\n"
+    }
+    bootstrapStageDriverDiagnostic(diagnostic)
+    bootstrapNoteDiagnosedLoweringErrors(1)
+    1
+}
+
+fun bootstrapLlvmIosCheckInstructions(
+    instructions: array<BootstrapInstruction>,
+    functions: BootstrapLlvmNameIndex,
+    natives: BootstrapLlvmNameIndex,
+    categories: array<string>,
+    runtime: bool
+): int {
+    for (instruction in instructions) {
+        if (instruction.opcode == "extern.host") return bootstrapLlvmIosRefusal(
+            "runtime compiler-host evaluation", instruction.text, instruction.position
+        )
+        if (instruction.opcode == "call" || instruction.opcode == "function.ref" ||
+            instruction.opcode == "closure.create" ||
+            instruction.opcode == "extern.c" || instruction.opcode == "extern.intrinsic" ||
+            instruction.opcode == "native.function.address") {
+            val external = instruction.opcode == "extern.c" ||
+                instruction.opcode == "extern.intrinsic"
+            val target = if (external) -1 else functions.find(instruction.text)
+            val category = if (external) bootstrapLlvmIosNativeCategory(instruction.text, runtime)
+                else if (target >= 0) categories[target]
+                else if (natives.find(instruction.text) >= 0)
+                    bootstrapLlvmIosNativeCategory(instruction.text, runtime)
+                else ""
+            if (category != "") return bootstrapLlvmIosRefusal(
+                category, instruction.text, instruction.position
+            )
+        }
+    }
+    0
+}
+
+fun bootstrapLlvmIosAvailability(
+    program: BootstrapIrProgram,
+    functions: BootstrapLlvmNameIndex,
+    natives: BootstrapLlvmNameIndex,
+    emitted: array<bool>
+): int {
+    val categories: array<string> = []
+    for (function in program.functions) {
+        categories.append(bootstrapLlvmIosFunctionCategory(function))
+    }
+    var denied = bootstrapLlvmIosCheckInstructions(
+        program.instructions, functions, natives, categories, false
+    )
+    if (denied > 0) return denied
+    // Prefer a user's direct API call over an implementation detail in a
+    // stdlib wrapper. The second pass still catches inserted/indirect paths.
+    var pass = 0
+    while (pass < 2) {
+        var functionId = 0
+        while (functionId < program.functions.size) {
+            val function = program.functions[functionId]
+            val file = bootstrapIrSourcePositionFile(function.position)
+            val source = if (file >= 0 && file < bootstrapIrSourceFiles.size)
+                bootstrapIrSourceFiles[file] else ""
+            val standard = bootstrapStandardLibraryModuleSource(source)
+            if (emitted[functionId] &&
+                ((pass == 0 && !standard) || (pass == 1 && standard))) {
+                val runtime = bootstrapRuntimeModuleSource(source) ||
+                    function.name.startsWith("__ablaRuntime")
+                denied = bootstrapLlvmIosCheckInstructions(
+                    function.instructions, functions, natives, categories, runtime
+                )
+                if (denied > 0) return denied
+            }
+            functionId = functionId + 1
+        }
+        pass = pass + 1
+    }
+    0
+}

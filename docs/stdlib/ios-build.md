@@ -105,3 +105,21 @@ added by the build helpers.
 
 Static-library and Simulator inspection do not by themselves establish support
 for every native stdlib API or constitute a physical-device test.
+
+## Runtime API availability
+
+The iOS targets reject runtime process creation/execution, signal watches,
+character-device/serial I/O, and LLVM/ORC calls with
+`E_TARGET_IOS_UNSUPPORTED`. Checks run on lowered runtime calls and function references, including calls
+inserted by lowering. Static libraries use the existing export-reachability plan:
+exports, global initializers, runtime helpers, callbacks, resource drops, native
+function addresses and assembly references. A native address taken only by a
+compile-time helper does not retain its target in the application. Importing an unused module
+is not itself an operation. Build-time operations still execute on the compiler's
+host under the ordinary compile-capability policy; this does not grant the
+resulting application those host APIs.
+
+`ablaHostIsIOS()` from `abla/platform/host` queries the executing target, and
+`ablaHostIsMacOS()` is false on iOS. In compile-time evaluation these query the
+compiler host. These availability diagnostics are not a sandbox for unsafe code
+or arbitrary application-owned C adapters.
