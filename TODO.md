@@ -253,6 +253,16 @@
   normalized relocations match the SDK wrapper; package-import passes the 4 GiB cap.
   Final installed-cohort, downstream and suite gates remain in progress; v0.2.48
   does not contain routing. See [design and evidence](docs/design/xtensa-companion.md).
+- [ ] **Compiler GC trigger sensitivity at normalize → semantic.** A +0.84 MB parse
+  increase in the Xtensa routing source moves normalization across a collection:
+  `parse.normalize.end` is about 339 MB before, 168 MB after. High runs already
+  retain another 50–60 MB before annotations (253–257 MB versus 196–200 MB),
+  continuing to module-end (about 600–609 MB versus 550 MB). Frozen old/new
+  compilers produce identical IR on each input; either shows the high mode under
+  contention. CI three-round medians for old/new input are 1,496,012/1,548,292 KiB;
+  local medians 1,297,016/1,319,716 KiB. Investigate collection placement without
+  adding per-node state or trading frontend CPU for an RSS-only win. See
+  [paired CI evidence](https://github.com/AndreBaltazar8/ablac/actions/runs/42297453462).
 - [ ] **Move Xtensa density legalization into companion 23.1.3-2.** The phase-3
   compiler stage mirrors the SDK's exact narrow encodings because `-mcpu=esp32`
   and explicit `+density` still leave 5,211 bytes across 199 firmware sections.
