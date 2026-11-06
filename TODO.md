@@ -241,6 +241,22 @@
   apt.llvm.org's LLVM from an Ubuntu 22.04 image and the macOS jobs use Homebrew's, neither
   with Xtensa. The Nix-built one needs Nix's glibc 2.44, so Linux would need a build against an
   old glibc, and macOS one built on a Mac of each architecture.
+  #575 resumable state (2026-11-06): branch `feat-xtensa-companion`, installer/evidence at `d0920780`
+  on `6c6755ae`; no compiler routing yet. Fork main is the approved `9b2956f`. Manual publish
+  [run 42228156011](https://github.com/AndreBaltazar8/llvm-project/actions/runs/42228156011), attempt 4,
+  passed all three source builds and clean Ubuntu 22.04 verification; every assembly/direct/optimized
+  object digest matches Nix. Publish alone failed HTTP 403 with `GITHUB_TOKEN` Contents: write.
+  No companion release or tag exists. Source target `a2549329` is reachable from `abla/xtensa-23.1.3`
+  and changes only `XtensaFrameLowering.cpp` relative to its parent; permission cause is not proven.
+  The bounded hourly retry worker stopped on this non-capacity failure after one of four additional
+  tries; no retry timer remains active. Logs/state are in the worktree's ignored
+  `build/companion-lab/publication-{retries.jsonl,retry-state.json}`.
+  Next: lead decides how to create the exact source tag/publish verified artifacts using owner
+  credentials; do not change runners, workflow or artifact source. Then verify published checksums,
+  fill the canonical catalog, run the three-host live installer probe and hand off phase 2. Its
+  [unpublished-fixture probe passed](https://github.com/AndreBaltazar8/ablac/actions/runs/42242927842)
+  on all three hosts. Phase 3 target routing waits for that handoff; see
+  [design and evidence](docs/design/xtensa-companion.md).
 - [ ] **`make test` under 2 minutes after a compiler change too, and its tooling in Abla.** On 2026-11-01 at
   JOBS=30, starting at load 7.5 from other work: 154 s after a compiler change (about 3,850 CPU-seconds),
   115 to 119 s on a rerun with the same compiler (about 2,900; the suite's builds share the default cache, and

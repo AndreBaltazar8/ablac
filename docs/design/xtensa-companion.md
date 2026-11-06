@@ -1,6 +1,6 @@
 # Optional Xtensa LLVM companion
 
-Status: publication approved and building; ARM runner acquisition is blocked by GitHub capacity, 2026-11-06.
+Status: all three publish builds and clean Linux passed; release creation is blocked by a GitHub token HTTP 403, 2026-11-06.
 André chose the optional, separately versioned companion after the
 [feasibility measurements](xtensa-release-feasibility.md). The phases 2–3 design
 below is approved; installer and compiler routing remain separate handoffs.
@@ -242,7 +242,7 @@ The [three-platform installer run 42242927842](https://github.com/AndreBaltazar8
 passed at `90204bef`, with the explicit unpublished input. It used the published
 v0.2.48 parent toolchains, relocated under a directory with spaces. The installer
 left all 472 original Linux files/symlinks and all 115 files/symlinks on each
-Mac unchanged, including their modes. Offline install, idempotent activation
+Mac unchanged (regular-file bytes/modes and symlink targets). Offline install, idempotent activation
 and full verification passed. Assembly, direct object and optimized object
 hashes matched the Nix digests above on every host.
 
@@ -256,3 +256,43 @@ There are also 21 passing offline catalog/installer controls.
 This proves the installer against the frozen dry-run cohorts, **not** against
 published companion assets. Only the canonical catalog fill and the corresponding
 live-input probe remain; compiler routing is still a separate phase.
+
+
+## Publication attempt and permission blocker
+
+[Run 42228156011](https://github.com/AndreBaltazar8/llvm-project/actions/runs/42228156011),
+at builder `9b2956f`, acquired ARM on attempt 4 after three requests ended before
+any step with hosted-runner capacity errors. Only one of the four subsequently
+authorized hourly retries was needed. Linux and Intel successful builds were
+reused, not rebuilt. All three source builds and the clean Ubuntu 22.04 check
+then passed. Their assembly and direct/optimized object hashes still match
+Nix exactly. **All three archive byte hashes differ from the dry run**, as
+allowed: the builder/run metadata and packaged README differ. These are still
+unpublished build artifacts, not canonical installer pins. The
+[package comparison](xtensa-companion-data/publication-build-packages.json)
+records exact sizes and hashes.
+
+Release creation failed HTTP 403, `Resource not accessible by integration`,
+despite the job log showing `GITHUB_TOKEN` Contents: write. No release or tag
+was created. The stopped retry controller deliberately does not retry this
+non-capacity failure, and no hourly retry timer remains active.
+
+`source-commit.txt` is generated from the identical `sourceCommit` in all three
+retained manifests: exactly `a254932917786ca006920fcb8ec02f3c5556dd06`, without
+a newline. That file was not retained separately, but its exact content follows
+from the publisher code and verified manifests. The target is reachable from
+branch `abla/xtensa-23.1.3`, whose head `e4da75d4` is one commit ahead. Relative
+to its parent `0a4c02e4`, `a2549329` changes only
+`llvm/lib/Target/Xtensa/XtensaFrameLowering.cpp`; it does **not** change workflows.
+Its history diverges from current fork main and does differ in workflow files.
+The broader tag/workflow-permission explanation is plausible, not established.
+[Commit evidence](xtensa-companion-data/publish-source-commit.json) and
+[branch reachability](xtensa-companion-data/publish-source-branch-reachability.json)
+are retained.
+
+The lead is deciding whether to pre-create the exact `a2549329` source tag using
+owner credentials and rerun only the publisher, or publish all verified artifacts
+together manually with owner credentials. Neither has been attempted. Changing
+the tag to `e4da75d4` would misstate the artifacts' source: that extra scavenging
+fix is under a separate gate. The canonical catalog stays pending until the
+full release exists; phase 3 still waits for phase 2.
