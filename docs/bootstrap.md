@@ -59,6 +59,47 @@ bytes and nothing else. Releases up to v0.2.27 were built without Xtensa and cut
 by the machine's processors, so they match only with `ABLA_NIX_XTENSA=0 ABLA_NATIVE_JOBS=4`.
 `tools/test-reproducible-elsewhere.sh` guards this; `--self` is the release's gate.
 
+### Compare a published macOS compiler
+
+The manual CI input `macos_published_rebuild=true` runs independent native
+rebuilds on `macos-15` (arm64) and `macos-15-intel` (x86_64):
+
+```sh
+gh workflow run ci.yml --ref master -f macos_published_rebuild=true
+```
+
+This check is deliberately pinned to v0.2.47. It checks out that tag in a
+separate directory, downloads the checksum-pinned v0.2.46 seed named by the
+**tag's** bootstrap script, and builds two generations with the release's
+LLVM toolchain. It also checks the downloaded v0.2.47 assets against their
+published SHA-256 values. Ordinary CI jobs do not run in this opt-in mode.
+
+[Independent rebuild run 42158176059](https://github.com/AndreBaltazar8/ablac/actions/runs/42158176059)
+on November 6, 2026 matched both raw published assets:
+
+| Architecture | Bytes | Rebuild environment | Published and rebuilt SHA-256 |
+| --- | ---: | --- | --- |
+| arm64 | 5,941,568 | macOS 15.8.2, Xcode 16.4, SDK 15.5, LLVM 23.1.5 | `9dabf38f755b2799bebd26fe6923805505fed0b87a5673af8880984e871d1d35` |
+| x86_64 | 7,505,280 | macOS 15.7.9, Xcode 16.4, SDK 15.5, LLVM 23.1.0 | `528ea7b619820215b63a678a8c4d43e55a326428014d13f92d9ee64db36c2e4d` |
+
+Both had zero differing sections and function spans. This verifies that release
+with those recorded toolchains, not arbitrary future SDK or LLVM versions.
+No timestamp, path, UUID or signature exception was needed.
+
+The final link name is `fixed-compiler`, matching release CI: Apple's arm64
+ad-hoc CodeDirectory includes this name as its identifier. Renaming the
+finished file preserves its bytes; linking it with another name need not.
+The existing `ZERO_AR_DATE=1` link environment also remains in effect.
+
+The gate is raw `cmp`, including UUIDs, paths, load commands and signatures.
+It does not strip, normalize or re-sign either image. Artifacts retain both
+binaries, build logs, seed/toolchain/SDK provenance, and Mach-O inventories.
+On a mismatch, `comparison/comparison.json` identifies the first differing
+byte, its section or load command, and changed function spans where symbols
+permit. Deliberate code, UUID and (when present) signature mutations verify
+that the comparator rejects differences. A changed SDK, linker or LLVM
+version is recorded, not silently accepted as an exception.
+
 The published binary is trusted only as the initial translator. The readable
 Abla source graph and fixed-point check define the maintained compiler. A
 future release can be bootstrapped by the previous Abla release without

@@ -110,8 +110,11 @@
       `Tagged` hides the constructor in `Box<string>(n = 1)`. Generic probing precedes delegated-property rewriting, so the
       generated wrapper cannot yet safely pass that delegate. Pass `tag` explicitly; renaming the local alone still gives
       `constructor.argument:Box<string>` for this example.
-- [ ] macOS: nobody has compared a local rebuild with the published binary, and
-      `tools/test-reproducible-elsewhere.sh` skips it (2026-11-01).
+- [x] macOS published-binary comparison: independent v0.2.47 tag rebuilds from its pinned
+      v0.2.46 seed matched both raw assets byte-for-byte on macos-15 arm64 and
+      macos-15-intel (2026-11-06, CI 42158176059). The opt-in CI input
+      `macos_published_rebuild` retains toolchain provenance and strict Mach-O diagnostics;
+      see docs/bootstrap.md. No normalization or signature exception was needed.
 - [ ] ARM64 Android tagged pointers: `adoptNativeString` now tests `address != 0`, not `> 0`, but the fix has not been
       run on the affected device. Other runtime address comparisons need the same check (`__ablaRuntimeHostCollection*`
       tables shift addresses arithmetically). abla-mobile's `allowNativeHeapPointerTagging="false"` masks this for its apps.
