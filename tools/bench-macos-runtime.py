@@ -14,7 +14,6 @@ import os
 from pathlib import Path
 import platform
 import re
-import resource
 import statistics
 import subprocess
 import time
@@ -33,13 +32,6 @@ PROGRAMS.update({
 
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def stack_limit():
-    soft, hard = resource.getrlimit(resource.RLIMIT_STACK)
-    wanted = 131072 * 1024
-    resource.setrlimit(resource.RLIMIT_STACK,
-                       (wanted if hard == resource.RLIM_INFINITY else min(wanted, hard), hard))
 
 
 def time_metrics(stderr):
@@ -115,14 +107,16 @@ def run(args):
             log = output / 'logs' / f'build-{version}-{name}.log'
             cache = output / 'cache' / f'{version}-{name}'
             build_env = dict(env, ABLA_SYSROOT=str(roots[version]), ABLA_CACHE_DIR=str(cache),
-                             ABLA_NATIVE_JOBS='4', ABLA_CODEGEN_JOBS='4')
-            command = [str(compilers[version]), 'build', str(sources / config['source']),
+                             ABLA_NATIVE_JOBS='4', ABLA_CODEGEN_JOBS='4',
+                             ABLA_COMPILER_PAYLOAD=str(compilers[version]), ABLA_MAX_SECONDS='600')
+            command = [str(roots[version] / 'tools/run-limited-compiler.sh'),
+                       'build', str(sources / config['source']),
                        '-o', str(target), '--no-cache']
             print('BUILD', version, name, flush=True)
             began = time.monotonic()
             with log.open('wb') as handle:
                 completed = subprocess.run(command, cwd=sources, env=build_env, stdout=handle,
-                                           stderr=subprocess.STDOUT, timeout=600, preexec_fn=stack_limit)
+                                           stderr=subprocess.STDOUT, timeout=660)
             result['buildSamples'].append(dict(version=version, program=name, command=command,
                                                wallSeconds=time.monotonic() - began, exit=completed.returncode))
             write_json(output / 'raw.json', result)
@@ -150,7 +144,7 @@ def run(args):
                 command = ['/usr/bin/time', '-l', '-p', str(binary)] + config['args']
                 started = time.monotonic()
                 completed = subprocess.run(command, env=env, cwd=sources, capture_output=True,
-                                           timeout=180, preexec_fn=stack_limit)
+                                           timeout=180)
                 wall = time.monotonic() - started
                 stdout = completed.stdout.decode('utf-8')
                 stderr = completed.stderr.decode('utf-8')
