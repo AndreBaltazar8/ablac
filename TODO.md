@@ -137,6 +137,9 @@
 
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
+- [ ] **Abla-native Xtensa companion installer.** The explicit optional installer uses only the Python
+  standard library until `abla/compression` can inflate gzip and read tar with bounded, safe extraction.
+  Move it to Abla once those archive primitives exist; keep checksum and manifest verification.
 - [ ] `abla/crypto/hosted` can use an RSA key but not generate one; `abla/crypto/rsa` provides pure key generation.
 - [x] `abla/yaml` provides bounded Core-schema parsing, checked emission and comment/format-preserving path edits;
       see [docs/stdlib/yaml.md](docs/stdlib/yaml.md) and the synthetic provision-mail fixture. NovaKind can adopt it after release.

@@ -7,6 +7,16 @@ on:
   # Run a branch by hand before it reaches master.
   workflow_dispatch:
     inputs:
+      xtensa_companion_unpublished_fixture:
+        description: Installer probe ONLY using hash-pinned UNPUBLISHED dry-run artifacts
+        type: boolean
+        required: false
+        default: false
+      xtensa_companion_install_probe:
+        description: Only test optional published Xtensa installation on Linux and both Macs
+        type: boolean
+        required: false
+        default: false
       android_pointer_tags_control:
         description: Also prove the tagged-pointer regression fails with the v0.2.47 stdlib
         type: boolean
@@ -38,7 +48,7 @@ defaults:
 
 jobs:
   linux:
-    if: ${{ !inputs.macos_published_rebuild && !inputs.macos_runtime_bench && !inputs.android_pointer_tags_control }}
+    if: ${{ !inputs.xtensa_companion_install_probe && !inputs.macos_published_rebuild && !inputs.macos_runtime_bench && !inputs.android_pointer_tags_control }}
     name: Linux suite (8 jobs)
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -56,6 +66,8 @@ jobs:
         with:
           # nix-shell finds its interactive bash through <nixpkgs>: the pinned one.
           nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/6510408d147d8c5e6d76043e899e9251756f6a75.tar.gz
+      - name: Verify optional Xtensa catalog against published checksums
+        run: python3 tools/xtensa_companions.py --check
       - name: Build the current compiler from the checksum-pinned bootstrap
         env:
           ABLA_NATIVE_JOBS: '4'
@@ -81,7 +93,7 @@ jobs:
           if-no-files-found: ignore
 
   macos:
-    if: ${{ !inputs.macos_published_rebuild && !inputs.macos_runtime_bench && !inputs.android_pointer_tags_control }}
+    if: ${{ !inputs.xtensa_companion_install_probe && !inputs.macos_published_rebuild && !inputs.macos_runtime_bench && !inputs.android_pointer_tags_control }}
     name: macOS host and compiler fixed point
     # One standard arm64 runner; Intel remains part of the release matrix.
     runs-on: macos-15
@@ -291,5 +303,67 @@ jobs:
             build/ci-logs/
             build/android-pointer-tags/
             build/tagged-pointer-negative/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  xtensa-companion-install:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.xtensa_companion_install_probe }}
+    name: Optional Xtensa installer (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: x86_64-linux
+          - runner: macos-15
+            platform: arm64-macos
+          - runner: macos-15-intel
+            platform: x86_64-macos
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Offline negative controls and published checksum check
+        run: |
+          python3 tools/test-xtensa-catalog.py
+          python3 tools/test-xtensa-installer.py
+      - name: Check the canonical catalog against published checksums
+        if: ${{ !inputs.xtensa_companion_unpublished_fixture }}
+        run: python3 tools/xtensa_companions.py --check
+      - name: Fetch explicitly UNPUBLISHED dry-run test input
+        if: inputs.xtensa_companion_unpublished_fixture
+        uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
+        with:
+          repository: AndreBaltazar8/llvm-project
+          run-id: '42214578962'
+          name: companion-${{ matrix.platform }}
+          github-token: ${{ github.token }}
+          path: build/UNPUBLISHED-cohort
+      - name: Install into the published parent without replacing its LLVM or Clang
+        env:
+          USE_UNPUBLISHED: ${{ inputs.xtensa_companion_unpublished_fixture }}
+        run: |
+          if [[ "$USE_UNPUBLISHED" == true ]]; then
+            python3 tools/test-xtensa-installed.py build/xtensa-installed \
+              --unpublished-fixture tools/fixtures/xtensa-companion-unpublished.json \
+              --archive "$(find build/UNPUBLISHED-cohort -maxdepth 1 -name '*.tar.gz' -print)"
+          else
+            python3 tools/test-xtensa-installed.py build/xtensa-installed
+          fi
+      - name: Retain exact codegen and installation results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: xtensa-installed-${{ matrix.runner }}
+          path: |
+            build/xtensa-installed/result.json
+            build/xtensa-installed/tamper-negative.txt
+            build/xtensa-installed/*.s
+            build/xtensa-installed/*.o
           retention-days: 7
           if-no-files-found: ignore

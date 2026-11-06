@@ -125,6 +125,9 @@ for package in binaryen clang-23 libbsd0 libedit2 libffi8 libgcc-s1 \
     fi
 done
 
+# Add the optional installer after the executable/dependency loops above.
+"$(dirname -- "${BASH_SOURCE[0]}")/package-xtensa-installer.sh" "$bundle"
+
 mkdir -p "$(dirname "$output")"
 tar -C "$working" -czf "$output" abla-toolchain-x86_64-linux
 (

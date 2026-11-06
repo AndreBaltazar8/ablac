@@ -57,6 +57,55 @@ It does not replace the ESP SDK, GNU linker, startup files, target libraries or
 GNU-as orchestration for boot/vector assembly. This fork has no Xtensa LLD
 backend. No Abla build downloads a companion implicitly.
 
+### Explicit installation
+
+The installer requires Python 3.9 or newer and its standard library; it uses no pip packages.
+The Abla toolchain packagers include `bin/abla-install-xtensa`. From an existing
+source checkout the equivalent command is:
+
+```sh
+python3 tools/install-xtensa-llvm.py --toolchain-root /path/to/abla-toolchain \
+    --version 23.1.3-1
+```
+
+From a packaged toolchain use its absolute path, without adding the companion's
+`bin` directory to `PATH`:
+
+```sh
+/path/to/abla-toolchain/bin/abla-install-xtensa --version 23.1.3-1
+/path/to/abla-toolchain/bin/abla-install-xtensa --verify
+```
+
+For an offline install add `--archive /path/to/the-host-archive.tar.gz`. The
+archive still has to match the checked-in catalog. Installation never changes
+Clang, the parent LLVM, or the compiler binary. The current compiler does **not
+yet route Xtensa code generation to the companion**; that is a separate gated
+change. Installing it alone does not make a released compiler support Xtensa.
+
+The catalog is `tools/xtensa-companions.json`, also shipped under
+`share/abla/xtensa-companions.json`. It pins the archive URL and SHA-256 and the
+raw per-archive manifest SHA-256 for each host. CI compares those pins with the
+fork's published `.sha256` files and combined manifest; it downloads only this
+small metadata, never LLVM sources or companion archives on a normal CI run.
+A separate manually dispatched installer probe runs the real tools on all three
+hosts and compares their output with the frozen Nix reference.
+
+The installer hashes the entire archive before extracting it, rejects links and
+special files, limits compressed and unpacked sizes, and checks the exact file
+set and every file's SHA-256 before running a helper. It installs a read-only
+revision under `lib/abla/xtensa-llvm/23.1.3-1` and atomically selects it with the
+relative `current` symlink. Old revisions remain intact. A failed install keeps
+the old selection; reinstalling the same revision fully verifies it first.
+
+Every install, activation and explicit `--verify` rehashes **all** files. A
+changed library with the same size and modification time fails that next full
+check, and changing its manifest cannot bypass the catalog's pinned manifest
+hash. This is not a promise to hash libraries on every build: the planned
+compiler routing uses the selected immutable revision's manifest and file
+identity in its cache key. After copying or restoring a toolchain, run
+`--verify` before using it. Read-only file modes guard accidental writes, not a
+malicious owner who can replace the installer, catalog or compiler themselves.
+
 ### Building a companion (maintainers)
 
 The only source-building workflow is the fork's

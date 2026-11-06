@@ -1,6 +1,6 @@
 # Optional Xtensa LLVM companion
 
-Status: phase 1 dry-run checks passed; publication awaits review, 2026-11-06.
+Status: publication approved and building; ARM runner acquisition is blocked by GitHub capacity, 2026-11-06.
 André chose the optional, separately versioned companion after the
 [feasibility measurements](xtensa-release-feasibility.md). The phases 2–3 design
 below is approved; installer and compiler routing remain separate handoffs.
@@ -221,3 +221,19 @@ Raw [package sizes and dry hashes](xtensa-companion-data/dry-run-packages.json),
 and smoke files are retained under `xtensa-companion-data/`. This is the
 LLVM-helper fixture, not the complete firmware or stock-parent compiler
 interoperability gate; those remain phase 3 work.
+
+
+## Installer test fixture while publication waits
+
+The production catalog remains pending until the fork publishes all three
+archives. `tools/fixtures/xtensa-companion-unpublished.json` is explicitly marked
+`UNPUBLISHED_TEST_FIXTURE`; it pins the original dry-run archives and manifests
+from run 42214578962. It is never copied into a packaged toolchain. Its nested
+catalog simulates accepted metadata only for the offline integration test.
+
+The opt-in installer probe can download those retained Actions artifacts and
+pass `--archive` plus an explicitly generated test catalog to the exact packaged
+installer. This does not publish or activate an archive in a user's toolchain,
+and does not replace the canonical catalog. The report records
+`unpublishedTestFixture: true`. After publication the same probe runs without
+the test-fixture input and checks the actual published catalog and downloads.

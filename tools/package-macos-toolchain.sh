@@ -118,6 +118,9 @@ SH
 } > "$bundle/bin/ablac"
 chmod 0755 "$bundle/bin/ablac"
 
+# Add the optional installer after the executable/dependency loops above.
+"$(dirname -- "${BASH_SOURCE[0]}")/package-xtensa-installer.sh" "$bundle"
+
 tar -C "$working" -czf "$output" "abla-toolchain-$architecture-macos"
 (
     cd "$output_directory"
