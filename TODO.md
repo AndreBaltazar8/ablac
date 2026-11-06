@@ -383,6 +383,17 @@ Package-side work (not changed from ablac):
 - [ ] **`abla-compare`'s server builds only a few percent faster than on v0.2.31** (3.9 to 3.8 s,
   2026-11-02): its frontend is about 1.7 s of it and its O2 1.8 s, and neither shrank much.
   On 2026-11-03 its build ran 15% fewer instructions (frontend 6 to 10%, opt and llc 14%).
+- [ ] **`abla-compare` headers-32 is slower with one worker** (2026-11-06):
+  217,171 requests/s versus Zig's 255,180; Abla leads by 8% with six workers.
+  A last-byte case-folded rejection filter before full header-name comparison
+  passed differential, native, JIT, GC-stress and Wasm tests but had no clear
+  speed win. Three alternating baseline/candidate pairs were 180,330/195,325,
+  187,947/178,417 and 177,240/183,638 requests/s (+8.32%, -5.07%, +3.61%);
+  ratio of medians +1.83%. Admission load was 11.34 (one-minute load average).
+  At that load a three-pair screen cannot resolve effects under about 5%; other
+  scenarios were not measured. Rejected patch and raw samples are in
+  `worktrees/ablac-headers-32/build/headers-lab/`. No larger header-summary
+  rewrite is planned for now.
 - [ ] **A map lookup waits on a cache miss** (2026-11-03): 83% of `__ablaRuntimeMapEntry`'s cycles in
   maps are the load of its slot from a 4 MB slot array; fewer instructions in the probe saved
   0.4%. A denser table (32-bit slots, keys' hashes beside them) would miss less. A prototype
