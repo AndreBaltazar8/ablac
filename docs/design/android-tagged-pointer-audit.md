@@ -1,6 +1,6 @@
 # Android top-byte heap pointer audit
 
-Status: candidate; device-free controls pass, complete validation gates are still running.
+Status: device-free validation complete on the e58429b0 base; on-device validation remains separate.
 The Mobile manifest workaround remains in place until NovaKind performs its
 on-device gate. This is a TBI audit, not an MTE or HWASan certification.
 
@@ -101,7 +101,7 @@ negative-control success. Both release and fast output are checked.
 
 ## Verified device-free evidence
 
-[CI 42165873324](https://github.com/AndreBaltazar8/ablac/actions/runs/42165873324)
+[CI 42169396786](https://github.com/AndreBaltazar8/ablac/actions/runs/42169396786)
 passes all 14 candidate cases (seven each in release/fast, including the two
 expected exit-66 tag-loss controls). With the released stdlib, the same fixtures
 fail in both modes: TLS 11, collector unsigned bounds 24, descriptor SIGTRAP 133
@@ -119,8 +119,15 @@ compiler ever ships. No Android-host compiler is currently shipped.
 
 ## Gate status
 
-- Complete Linux suite, including four-target CT checks and real TLS tests.
-- Native macOS host/fixed-point passed in CI 42166239263.
-- Local stage 2 == stage 3 (SHA256 e95ee2b3beb8aeb6f3663fba03bc2b9677f745ef86cc221a7ad1da4626bf7106), before the package-path rebase; final rebased gates are pending.
+- [Full CI 42169555608](https://github.com/AndreBaltazar8/ablac/actions/runs/42169555608):
+  Linux 324/324, including four-target CT checks, source guards and real TLS;
+  macOS native host, iOS Simulator and compiler fixed-point checks all green.
+- Local rebased stages 1, 2 and 3 are byte-identical:
+  SHA256 `0cf8626ddc3e909cfb81952c720bc5a6155395c8467818fed9f552ed4b19ed16`.
+  Stage-2/3 GNU-time peaks were 1,377,864 / 1,378,812 KiB.
+- All 14 tagged-pointer cases also pass locally through the exact
+  `build/ablac` launcher on the rebased stage-2 compiler.
+- Source formatting, actionlint and the source-fixture/leak scaffold checks pass;
+  excluded-source guard digests are unchanged.
 - On-device Android validation and removal of Mobile's manifest workaround by
   NovaKind, separately; no device result is implied by emulation.

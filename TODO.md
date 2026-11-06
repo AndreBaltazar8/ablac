@@ -116,7 +116,7 @@
       `macos_published_rebuild` retains toolchain provenance and strict Mach-O diagnostics;
       see docs/bootstrap.md. No normalization or signature exception was needed.
 - [ ] ARM64 Android tagged pointers: runtime/stdlib address checks are corrected and
-      deliberately tagged AArch64 TBI fixtures pass release/fast (CI42165873324;
+      deliberately tagged AArch64 TBI fixtures pass release/fast (CI42169396786;
       docs/design/android-tagged-pointer-audit.md). Collector ordering/extents are
       unsigned and page shifts logical; TLS control pointers use the -1 sentinel;
       RSA public range/alias guards ignore tag bits without changing actual pointers.
