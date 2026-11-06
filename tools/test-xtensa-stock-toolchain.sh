@@ -9,10 +9,16 @@ mkdir -p "$out"
 export ABLA_NATIVE_JOBS=4 ABLA_CODEGEN_JOBS=4 ABLA_SYSROOT="$root"
 unset ABLA_XTENSA_LLVM_ROOT
 llc --version > "$out/parent-llc-version.txt"
-if grep -q 'xtensa ' "$out/parent-llc-version.txt"; then
-    echo 'expected the ordinary stock parent LLVM without Xtensa' >&2
-    exit 1
-fi
+# Newer stock distributions may enable the upstream Xtensa backend. They must
+# still be ordinary, unpatched tools; actual routing is proved with poisoned
+# PATH and exact objects, not by assuming a backend is absent forever.
+llc --help-hidden > "$out/parent-llc-options.txt"
+for option in xtensa-direct-calls xtensa-narrow-branches xtensa-text-section-literals; do
+    if grep -q -- "--$option" "$out/parent-llc-options.txt"; then
+        echo "expected stock parent LLVM without private --$option" >&2
+        exit 1
+    fi
+done
 tools/bootstrap-compiler.sh "$out/bootstrap.bin"
 ABLA_COMPILER_PAYLOAD="$out/bootstrap.bin" ABLA_MAX_MEMORY_MB=4096 ABLA_MAX_SECONDS=1200 \
     tools/run-limited-compiler.sh build src/orc_main.ab -o "$out/compiler.bin" --no-cache

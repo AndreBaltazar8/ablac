@@ -98,7 +98,8 @@ run(sys.executable, project / 'tools/test-xtensa-routing.py', raw_compiler, env=
 # Parent files remain unchanged, including its ordinary tools and libraries.
 after = snapshot(prefix)
 assert all(after.get(name) == value for name, value in originals.items()), 'parent toolchain was modified'
-report = {'status': 'passed', 'platform': companions.host_platform(), 'parentHasXtensa': False,
+report = {'status': 'passed', 'platform': companions.host_platform(), 'parentHasXtensa': 'xtensa ' in (out / 'parent-llc-version.txt').read_text(),
+          'parentHasPrivateXtensaOptions': False,
           'unchangedParentEntries': len(originals), 'objects': results,
           'poisonedPathPassed': True, 'missingWarmCohortRejected': True, 'realLibraryIdentityInvalidatedCache': True}
 (out / 'result.json').write_text(json.dumps(report, indent=2) + '\n')
