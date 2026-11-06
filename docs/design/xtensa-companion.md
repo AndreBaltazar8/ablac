@@ -1,6 +1,6 @@
 # Optional Xtensa LLVM companion
 
-Status: revision 23.1.3-1 published with owner credentials; canonical catalog filled, live installer probe pending, 2026-11-06.
+Status: phases 1–2 ready for review; revision 23.1.3-1 published, canonical installer verified on all three hosts, 2026-11-06.
 André chose the optional, separately versioned companion after the
 [feasibility measurements](xtensa-release-feasibility.md). The phases 2–3 design
 below is approved; installer and compiler routing remain separate handoffs.
@@ -324,3 +324,31 @@ The [published package comparison](xtensa-companion-data/published-packages.json
 [release metadata](xtensa-companion-data/published-release.json),
 [tag metadata](xtensa-companion-data/published-tag.json), published checksum
 files and the negative-control message are retained alongside the other evidence.
+
+
+## Live installer verification
+
+[Run 42269233930](https://github.com/AndreBaltazar8/ablac/actions/runs/42269233930)
+passed on `1327720e` using the canonical catalog and public release URLs, with
+no unpublished input or offline archive override. It uses the same packaging
+helper as the Linux and Mac toolchain packagers.
+
+| Host | Original parent entries preserved | Nix assembly/direct/optimized object hashes | Real DSO tamper rejected and restored |
+| --- | ---: | --- | --- |
+| x86_64 Linux | 472 | all three exact | yes |
+| arm64 macOS | 115 | all three exact | yes |
+| x86_64 macOS | 115 | all three exact | yes |
+
+Regular-file bytes and modes, and symlink targets, are unchanged in the parent
+v0.2.48 toolchains. Installation into a relocated path with spaces, idempotent
+selection and explicit verification pass. On each host a byte in the real
+private libLLVM was changed while preserving file size and nanosecond mtime;
+verification rejected it by its pinned hash before execution. Restoring the
+original byte, timestamp and mode allowed verification to pass again. The
+report explicitly records `unpublishedTestFixture: false`.
+
+[Raw run metadata](xtensa-companion-data/published-installer-run.json), per-host
+result JSON and negative messages are retained. The 21 offline controls,
+actionlint, shellcheck and touched doc-example filter also pass. No compiler or
+stdlib source changed, and no claim is made that the current compiler routes
+Xtensa through this cohort: that is the separately reviewed phase 3.

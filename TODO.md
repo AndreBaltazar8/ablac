@@ -239,13 +239,15 @@
 - [ ] **Released toolchains can't target Xtensa.** CI's Nix shell has the patched LLVM
   ([llvm-xtensa.md](docs/llvm-xtensa.md)), but `abla-toolchain-x86_64-linux` bundles
   apt.llvm.org's LLVM from an Ubuntu 22.04 image and the macOS jobs use Homebrew's, neither
-  with Xtensa. The Nix-built one needs Nix's glibc 2.44, so Linux would need a build against an
-  old glibc, and macOS one built on a Mac of each architecture.
+  with Xtensa. The old Nix-built one needs Nix's glibc 2.44; a separate glibc 2.35 companion
+  and native companions for both Macs are now published. Target-specific compiler routing remains.
   #575 phases 1–2 (2026-11-06): [optional revision 23.1.3-1 is published](https://github.com/AndreBaltazar8/llvm-project/releases/tag/abla-xtensa-llvm-23.1.3-1)
   for Linux and both Macs; branch `feat-xtensa-companion` implements explicit verified installation.
   Source is `a2549329`; all three builds and clean Ubuntu 22.04 pass the Nix assembly/direct/optimized
   object hashes. Canonical catalog pins the published archive and manifest hashes. The installer
-  passed all three hosts on unpublished inputs; the live-input probe is the final phase-2 check.
+  passed all three hosts on both unpublished and
+  [published inputs](https://github.com/AndreBaltazar8/ablac/actions/runs/42269233930), including real
+  stat-preserved libLLVM tamper negatives. Phases 1–2 are ready for review; phase 3 is not implemented.
   Next, after review: phase 3 routes only Xtensa opt/llc through the installed cohort, keys its identity
   and ESP settings, and passes the real package-import/4 GiB and downstream gates. No compiler routing
   is implemented yet; see [design and evidence](docs/design/xtensa-companion.md).
