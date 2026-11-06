@@ -50,6 +50,73 @@ fun BootstrapParser.expect(kind: int) {
     }
 }
 
+// Only type readers interpret these leading `>` bytes as closing delimiters.
+// The lexer keeps ordinary comparison and shift operators intact.
+@inline
+fun bootstrapTypeCloseCount(kind: int): int =
+    if (kind == BOOTSTRAP_TOKEN_GREATER || kind == BOOTSTRAP_TOKEN_GREATER_EQUAL) 1
+    else if (kind == BOOTSTRAP_TOKEN_SHIFT_RIGHT) 2
+    else if (kind == BOOTSTRAP_TOKEN_SHIFT_UNSIGNED) 3 else 0
+
+fun BootstrapParser.prepareTypeClose(depth: int): void {
+    if (depth <= 0) return
+    val token = this.tokens[this.position]
+    val count = bootstrapTypeCloseCount(token.kind)
+    if (count == 0 || (count <= depth && token.kind != BOOTSTRAP_TOKEN_GREATER_EQUAL)) return
+    val taken = if (count < depth) count else depth
+    val prefix = BootstrapToken(
+        if (taken == 1) BOOTSTRAP_TOKEN_GREATER else BOOTSTRAP_TOKEN_SHIFT_RIGHT,
+        token.begin, token.begin + taken
+    )
+    val remaining = count - taken
+    var remainderKind = if (remaining == 0) BOOTSTRAP_TOKEN_EQUAL
+        else if (remaining == 1) BOOTSTRAP_TOKEN_GREATER else BOOTSTRAP_TOKEN_SHIFT_RIGHT
+    var remainderEnd = token.end
+    // `>>=` lexes as `>>`, `=`. After one close, its remainder is `>=`.
+    val mergeEqual = remaining == 1 && this.position + 1 < this.tokens.size &&
+        this.tokens[this.position + 1].kind == BOOTSTRAP_TOKEN_EQUAL &&
+        this.tokens[this.position + 1].begin == token.end
+    if (mergeEqual) {
+        remainderKind = BOOTSTRAP_TOKEN_GREATER_EQUAL
+        remainderEnd = this.tokens[this.position + 1].end
+    }
+    val remainder = BootstrapToken(remainderKind, token.begin + taken, remainderEnd)
+    if (!this.typeTokensOwned) {
+        // Lex memo arrays belong to the graph. Never mutate a shared stream or
+        // any other parser using the memoized stream.
+        val replacement: array<BootstrapToken> = []
+        var index = 0
+        while (index < this.tokens.size) {
+            if (index == this.position) {
+                replacement.append(prefix)
+                replacement.append(remainder)
+            } else if (!mergeEqual || index != this.position + 1) {
+                replacement.append(this.tokens[index])
+            }
+            index = index + 1
+        }
+        this.tokens = replacement
+        this.typeTokensOwned = true
+    } else {
+        if (!mergeEqual) {
+            this.tokens.append(this.tokens[this.tokens.size - 1])
+            var index = this.tokens.size - 1
+            while (index > this.position + 1) {
+                this.tokens[index] = this.tokens[index - 1]
+                index = index - 1
+            }
+        }
+        this.tokens[this.position] = prefix
+        this.tokens[this.position + 1] = remainder
+    }
+    this.kindPosition = -1
+}
+
+fun BootstrapParser.expectTypeClose(): void {
+    this.prepareTypeClose(1)
+    this.expect(BOOTSTRAP_TOKEN_GREATER)
+}
+
 class BootstrapExpression(
     val kind: string,
     val text: string,
@@ -504,7 +571,7 @@ fun bootstrapDecodeString(raw: string): string {
 class BootstrapParser(
     val sourceIdentity: string,
     val source: string,
-    val tokens: array<BootstrapToken>,
+    var tokens: array<BootstrapToken>,
     val expansionBegins: array<int>,
     val expansionEnds: array<int>,
     val expansionExpressions: array<BootstrapExpression>,
@@ -522,7 +589,8 @@ class BootstrapParser(
     var currentKind: int,
     // Formatter-only grammar events. Empty disables capture with no trace
     // allocations. A formatter starts with ";" and decodes offset:priority;.
-    var layoutTrace: string
+    var layoutTrace: string,
+    var typeTokensOwned: bool = false
 ) {
     fun declareBinding(name: string, stable: bool) {
         this.bindingNames.append(name)
@@ -753,6 +821,7 @@ class BootstrapParser(
         var parentheses = 0
         var finished = false
         while (!finished && !this.at(BOOTSTRAP_TOKEN_END)) {
+            this.prepareTypeClose(angles)
             if (angles == 0 && parentheses == 0 &&
                 (this.at(BOOTSTRAP_TOKEN_EQUAL) || this.atWord("by") ||
                     this.at(BOOTSTRAP_TOKEN_LBRACE) ||
@@ -760,7 +829,8 @@ class BootstrapParser(
                  this.at(BOOTSTRAP_TOKEN_RBRACE) ||
                  this.at(BOOTSTRAP_TOKEN_NEWLINE) || this.at(BOOTSTRAP_TOKEN_SEMICOLON) ||
                  // `fun f(): T where …`: a reserved generic constraint.
-                 (type != "" && this.atWord("where")))) {
+                    (type != "" && this.atWord("where")) ||
+                    bootstrapTypeCloseCount(this.tokens[this.position].kind) > 0)) {
                 finished = true
             } else if (angles == 0 && parentheses == 0 &&
                 (this.at(BOOTSTRAP_TOKEN_COMMA) || (stopOnRightParen &&
@@ -768,9 +838,7 @@ class BootstrapParser(
                 finished = true
             } else {
                 if (this.at(BOOTSTRAP_TOKEN_LESS)) angles = angles + 1
-                if (this.at(BOOTSTRAP_TOKEN_GREATER)) angles = angles - 1
-                if (this.at(BOOTSTRAP_TOKEN_SHIFT_RIGHT)) angles = angles - 2
-                if (this.at(BOOTSTRAP_TOKEN_SHIFT_UNSIGNED)) angles = angles - 3
+                angles = angles - bootstrapTypeCloseCount(this.tokens[this.position].kind)
                 if (this.at(BOOTSTRAP_TOKEN_LPAREN)) parentheses = parentheses + 1
                 if (this.at(BOOTSTRAP_TOKEN_RPAREN)) parentheses = parentheses - 1
                 type = "$type${bootstrapTokenText(this.source, this.tokens[this.position])}"
@@ -866,13 +934,17 @@ class BootstrapParser(
         var finished = false
         while (!finished && !this.at(BOOTSTRAP_TOKEN_END)) {
             if (angles == 0 && parentheses == 0 &&
-                (this.at(BOOTSTRAP_TOKEN_COMMA) || this.at(BOOTSTRAP_TOKEN_ARROW))) {
+                (this.at(BOOTSTRAP_TOKEN_COMMA) || this.at(BOOTSTRAP_TOKEN_ARROW) ||
+                    bootstrapTypeCloseCount(this.tokens[this.position].kind) > 0)) {
+                finished = true
+            } else if (this.at(BOOTSTRAP_TOKEN_GREATER_EQUAL) ||
+                bootstrapTypeCloseCount(this.tokens[this.position].kind) > angles) {
+                // A speculative parameter type cannot have `=` or extra `>`
+                // before its arrow. Leave the token stream untouched on failure.
                 finished = true
             } else {
                 if (this.at(BOOTSTRAP_TOKEN_LESS)) angles = angles + 1
-                if (this.at(BOOTSTRAP_TOKEN_GREATER)) angles = angles - 1
-                if (this.at(BOOTSTRAP_TOKEN_SHIFT_RIGHT)) angles = angles - 2
-                if (this.at(BOOTSTRAP_TOKEN_SHIFT_UNSIGNED)) angles = angles - 3
+                angles = angles - bootstrapTypeCloseCount(this.tokens[this.position].kind)
                 if (this.at(BOOTSTRAP_TOKEN_LPAREN)) parentheses = parentheses + 1
                 if (this.at(BOOTSTRAP_TOKEN_RPAREN)) parentheses = parentheses - 1
                 type = "$type${bootstrapTokenText(
@@ -932,6 +1004,7 @@ class BootstrapParser(
             if (this.consume(BOOTSTRAP_TOKEN_ARROW)) hasArrow = true
             else {
                 this.position = parameterStart
+                this.kindPosition = -1
                 hasArrow = hasArrow
             }
         } else hasArrow = hasArrow
@@ -1601,9 +1674,10 @@ class BootstrapParser(
         while (index < this.tokens.size) {
             val kind = this.tokens[index].kind
             if (kind == BOOTSTRAP_TOKEN_LESS) angles = angles + 1
-            else if (kind == BOOTSTRAP_TOKEN_GREATER) angles = angles - 1
-            else if (kind == BOOTSTRAP_TOKEN_SHIFT_RIGHT) angles = angles - 2
-            else if (kind == BOOTSTRAP_TOKEN_SHIFT_UNSIGNED) angles = angles - 3
+            else if (bootstrapTypeCloseCount(kind) > 0) {
+                if (kind == BOOTSTRAP_TOKEN_GREATER_EQUAL) return -1
+                angles = angles - bootstrapTypeCloseCount(kind)
+            }
             else if (kind == BOOTSTRAP_TOKEN_LPAREN) parentheses = parentheses + 1
             else if (kind == BOOTSTRAP_TOKEN_RPAREN) parentheses = parentheses - 1
             else if (kind != BOOTSTRAP_TOKEN_IDENTIFIER && kind != BOOTSTRAP_TOKEN_COMMA && kind !=
@@ -1644,33 +1718,23 @@ class BootstrapParser(
                 var reading = true
                 while (reading && !this.at(BOOTSTRAP_TOKEN_END)) {
                     if (angles == 0 && (this.at(BOOTSTRAP_TOKEN_COMMA) ||
-                        this.at(BOOTSTRAP_TOKEN_GREATER) || this.at(BOOTSTRAP_TOKEN_SHIFT_RIGHT))) {
-                        reading = false
-                    } else if (angles == 1 && this.at(BOOTSTRAP_TOKEN_SHIFT_RIGHT)) {
-                        // `<T : Source<int>>`: the `>>` closes the bound and the list.
-                        bound = "$bound>"
-                        angles = 0
+                        bootstrapTypeCloseCount(this.tokens[this.position].kind) > 0)) {
                         reading = false
                     } else {
+                        this.prepareTypeClose(angles)
                         if (this.at(BOOTSTRAP_TOKEN_LESS)) angles = angles + 1
-                        if (this.at(BOOTSTRAP_TOKEN_GREATER)) angles = angles - 1
+                        angles = angles - bootstrapTypeCloseCount(this.tokens[this.position].kind)
                         bound =
                             "$bound${bootstrapTokenText(this.source, this.tokens[this.position])}"
                         this.position = this.position + 1
                     }
                 }
                 parameter = "$parameter:$bound"
-                if (this.at(BOOTSTRAP_TOKEN_SHIFT_RIGHT) && bound.size > 0 && bound[bound.size -
-                    1] == 62) {
-                    this.position = this.position + 1
-                    parameters.append(parameter)
-                    return parameters
-                }
             }
             parameters.append(parameter)
             if (!this.consume(BOOTSTRAP_TOKEN_COMMA)) open = false
         }
-        this.expect(BOOTSTRAP_TOKEN_GREATER)
+        this.expectTypeClose()
         parameters
     }
 
@@ -1686,9 +1750,8 @@ class BootstrapParser(
                 BOOTSTRAP_TOKEN_SEMICOLON || kind == BOOTSTRAP_TOKEN_EQUAL ||
                 kind == BOOTSTRAP_TOKEN_LBRACE || kind == BOOTSTRAP_TOKEN_RBRACE) return -1
             if (kind == BOOTSTRAP_TOKEN_LESS) angles = angles + 1
-            if (kind == BOOTSTRAP_TOKEN_GREATER) angles = angles - 1
-            if (kind == BOOTSTRAP_TOKEN_SHIFT_RIGHT) angles = angles - 2
-            if (kind == BOOTSTRAP_TOKEN_SHIFT_UNSIGNED) angles = angles - 3
+            if (kind == BOOTSTRAP_TOKEN_GREATER_EQUAL) return -1
+            angles = angles - bootstrapTypeCloseCount(kind)
             if (kind == BOOTSTRAP_TOKEN_LPAREN) parentheses = parentheses + 1
             if (kind == BOOTSTRAP_TOKEN_RPAREN) parentheses = parentheses - 1
             if (angles < 0 || parentheses < 0) return -1
@@ -2182,9 +2245,9 @@ class BootstrapParser(
             var angles = 0
             var more = true
             while (more && !this.at(BOOTSTRAP_TOKEN_END)) {
+                this.prepareTypeClose(angles)
                 if (this.at(BOOTSTRAP_TOKEN_LESS)) angles = angles + 1
-                if (this.at(BOOTSTRAP_TOKEN_GREATER)) angles = angles - 1
-                if (this.at(BOOTSTRAP_TOKEN_SHIFT_RIGHT)) angles = angles - 2
+                angles = angles - bootstrapTypeCloseCount(this.tokens[this.position].kind)
                 type = "$type${bootstrapTokenText(this.source, this.tokens[this.position])}"
                 this.position = this.position + 1
                 more = angles > 0
@@ -2631,10 +2694,9 @@ class BootstrapParser(
         var depth = 0
         var more = true
         while (more && !this.at(BOOTSTRAP_TOKEN_END)) {
+            this.prepareTypeClose(depth)
             if (this.at(BOOTSTRAP_TOKEN_LESS)) depth = depth + 1
-            if (this.at(BOOTSTRAP_TOKEN_GREATER)) depth = depth - 1
-            if (this.at(BOOTSTRAP_TOKEN_SHIFT_RIGHT)) depth = depth - 2
-            if (this.at(BOOTSTRAP_TOKEN_SHIFT_UNSIGNED)) depth = depth - 3
+            depth = depth - bootstrapTypeCloseCount(this.tokens[this.position].kind)
             this.position = this.position + 1
             if (depth <= 0) more = false
         }
@@ -2675,10 +2737,9 @@ class BootstrapParser(
                            this.at(BOOTSTRAP_TOKEN_RPAREN))) {
                     more = false
                 } else {
+                    this.prepareTypeClose(angles)
                     if (this.at(BOOTSTRAP_TOKEN_LESS)) angles = angles + 1
-                    if (this.at(BOOTSTRAP_TOKEN_GREATER)) angles = angles - 1
-                    if (this.at(BOOTSTRAP_TOKEN_SHIFT_RIGHT)) angles = angles - 2
-                    if (this.at(BOOTSTRAP_TOKEN_SHIFT_UNSIGNED)) angles = angles - 3
+                    angles = angles - bootstrapTypeCloseCount(this.tokens[this.position].kind)
                     receiverType =
                         "$receiverType${bootstrapTokenText(this.source, this.tokens[this.position])}"
                     this.position = this.position + 1
@@ -3475,16 +3536,17 @@ fun bootstrapAppendExtensionFieldDefaults(var declarations: array<BootstrapDecla
 }
 
 fun bootstrapParse(source: string): BootstrapParseResult {
-    BootstrapParser(
+    val parser = BootstrapParser(
         "<memory>", source, bootstrapLex(source), [], [], [], 0, 0, "", [], [], 0, -1, 0, ""
-    ).parse()
+    )
+    parser.parse()
 }
 
 fun bootstrapParseWithIdentity(
     source: string,
     sourceIdentity: string
 ): BootstrapParseResult {
-    BootstrapParser(
+    val parser = BootstrapParser(
         sourceIdentity,
         source,
         bootstrapLexShared(source),
@@ -3497,7 +3559,8 @@ fun bootstrapParseWithIdentity(
         [],
         [],
         0, -1, 0, ""
-    ).parse()
+    )
+    parser.parse()
 }
 
 fun bootstrapPrimaryDiagnosticCount(diagnostics: string): int {
