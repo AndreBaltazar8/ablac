@@ -11,4 +11,4 @@ test "$fingerprint" = 6084F3CF814B57C1CF12EFD515CF4D18AF4F7421
 gpg --dearmor -o /usr/share/keyrings/apt.llvm.org.gpg /tmp/llvm.asc
 echo 'deb [signed-by=/usr/share/keyrings/apt.llvm.org.gpg] http://apt.llvm.org/noble/ llvm-toolchain-noble-23 main' > /etc/apt/sources.list.d/llvm.list
 apt-get update
-apt-get install -y --no-install-recommends clang-23 llvm-23 lld-23 libssl3
+apt-get install -y --no-install-recommends clang-23 llvm-23 llvm-23-dev lld-23 libssl-dev

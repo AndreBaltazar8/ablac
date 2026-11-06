@@ -25,6 +25,8 @@ if [[ $(uname -s) == Linux ]]; then
     # adapt only this private bootstrap copy to the stock container.
     patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 "$out/bootstrap.bin"
     patchelf --set-rpath "$(llvm-config --libdir)" "$out/bootstrap.bin"
+    stock_libdir=$(llvm-config --libdir)
+    export LIBRARY_PATH="$stock_libdir:${LIBRARY_PATH:-}"
     ldd "$out/bootstrap.bin" > "$out/bootstrap-dependencies.txt"
     if grep -q "not found" "$out/bootstrap-dependencies.txt"; then
         cat "$out/bootstrap-dependencies.txt" >&2
