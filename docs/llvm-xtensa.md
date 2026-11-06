@@ -22,7 +22,7 @@ explicitly requests a new companion.
 change, a local shell builds from source, so the patches being worked on are the
 ones in use, and a CI shell stops with an error rather than build for an hour.
 
-macOS doesn't use `shell.nix`: its jobs use Homebrew's LLVM, which has no Xtensa.
+macOS doesn't use `shell.nix`: its jobs use ordinary Homebrew LLVM, without the private Xtensa patches.
 The packaged Linux toolchain likewise uses stock LLVM. The Nix-built library
 requires newer glibc interfaces, including GLIBC_2.44; changing its RPATH is not
 enough to use it on Ubuntu 22.04. See the measured
@@ -211,3 +211,34 @@ from compilation.
 The portable companion has its own revision and release workflow; updating the
 Nix pin does not publish a companion or silently select a held patch. The
 128–255-byte scavenging-slot fix remains under its separate hardware gate.
+
+### Source compiler routing and firmware density
+
+The source compiler chooses the installed companion only for Xtensa. The
+parent LLVM and Clang remain selected for other targets. In a Nix development
+shell, a manifested store cohort supplies the same explicit selection; an
+`ABLA_XTENSA_LLVM_ROOT` override wins. The ESP32 CPU defaults to `esp32`;
+`ABLA_ESP_CPU=esp32s2` and `esp32s3` select the existing SDK-compatible settings.
+Xtensa uses static relocation and function/data sections in both fast and
+optimized modes.
+
+The companion's current backend does not select all the SDK's density forms,
+even with `+density`. An isolated compiled stage mirrors the SDK narrowing
+transform, preserves verbatim inline assembly, and sets literal alignment in
+assembly before object emission. It uses the same selected private llc for
+assembly, requires no production Python, and never invokes objcopy.
+`ABLA_XTENSA_NARROW=0` disables density rewriting; it does not disable the
+alignment safety requirement. A successful CLI build records stage/version,
+options and selected tool identities in `<output>.xtensa-tools.json`, also on
+cache hits. These settings enter the cache identity.
+
+`ABLA_XTENSA_DIRECT_CALLS`, `ABLA_XTENSA_NARROW_BRANCHES` and
+`ABLA_XTENSA_TEXT_LITERALS` retain the SDK defaults 1, 1 and 0, respectively.
+`ABLA_ESP_KEEP_UNWIND=1` opts into retaining unwind directives; otherwise
+freestanding functions are nounwind and no unwind-table stripping is needed.
+Unsupported integrated-assembler CFI remains an explicit build failure.
+Live SDK boot/vector layout markers produce `E_XTENSA_EXTERNAL_ASSEMBLER`;
+those paths still need the SDK's GNU-as orchestration. Ordinary code generation
+and the real package-import memory gate are tested separately from that SDK
+boundary. Routing and downstream release gates are still in progress; this
+section does not claim the change is in an already published Abla release.

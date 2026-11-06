@@ -364,7 +364,7 @@ PATH, helper/library/manifest changes, warm-cache missing-file refusals, and a
 `current` link switched during the version check. Live GNU layout markers refuse;
 markers eliminated by optimization pass.
 
-Local stages 2 and 3 are byte-identical with SHA-256
+Before density legalization, local stages 2 and 3 were byte-identical with SHA-256
 `d482834dc5e6c5ad607b061b0b50707c9cf097fbdc0fede0c700096f873cfba7`.
 The two compiler builds peaked at 1,375,376 and 1,380,088 KiB with four CPUs.
 These are verification samples, not a wall-time performance claim.
@@ -375,3 +375,56 @@ error is `region.noescape-effect:nvs_flash_init`. The gate uses the previously
 approved `da5a939` checkout instead. No embedded sources are modified. The real
 firmware peak, check-source, stock-parent Linux/Mac CI, host-output comparisons
 and downstream compatibility gates are still pending at this prototype commit.
+
+### Firmware parity and the compiled assembly stage
+
+The existing SDK wrapper does more than choose a CPU. It defaults
+`ABLA_XTENSA_NARROW=1` and applies a code-density transform before assembly.
+Selecting `esp32` already enables density; adding `+density` produces an
+identical direct object, so it does not recover those instruction selections.
+On frozen embedded `da5a939` package-import, bypassing that transform added
+5,211 bytes across 199 of 558 allocatable sections. Disabling the wrapper's
+transform made its allocatable bodies match direct llc on the same bitcode.
+
+The companion route therefore has an isolated, compiled Abla legalization
+stage in `src/xtensa_assembly.ab`. Its mappings, verbatim regions and literal
+placement are checked by exact text differential against the frozen SDK script
+(SHA-256 `a2fd95380faf9c54d500cfed1795cad53c557fabd031df31c008e324db2a10c3`).
+The offline test includes operand boundaries and the complete firmware assembly.
+Python is used only for this test, not by the build stage. `ABLA_XTENSA_NARROW=0`
+disables instruction narrowing; both choices and the stage identity enter the
+cache key and the successful CLI build's `<output>.xtensa-tools.json` manifest.
+
+The selected private llc emits assembly. After legalization, that text becomes
+module-level assembly in an otherwise empty LLVM module, assembled by the same
+absolute private llc. No `llvm-mc`, assembler or Python is discovered on PATH.
+An assembly failure is an `E_XTENSA_ASSEMBLY` failure, never accepted as an object.
+This is ordinary Abla codegen, not the SDK's GNU-as boot/vector layout pipeline.
+
+Freestanding Xtensa defaults to `nounwind`, including fast builds, so unwind
+tables are not emitted. `ABLA_ESP_KEEP_UNWIND=1` preserves the existing opt-in
+contract; LLVM's integrated assembler can reject unsupported CFI forms and that
+failure stays visible. Literal sections are aligned by assembly declarations
+before object emission. This repairs LLVM 23.1.3's inline-assembly `emitLiteral`
+path, which omits the alignment used by `startLiteralSection`. L32R requires the
+four-byte alignment; it is not an arbitrary linker-script convention. No object
+section, unwind bytes or loadable content is patched with objcopy.
+
+Inspection of live GNU layout markers renders a separate copy of the optimized
+bitcode. Code generation keeps the original bitcode: printing and reparsing it
+otherwise changed use-list ordering and five equal-sized instruction bodies.
+The scratch legalized object matches all 558 allocatable bodies and their
+alignments, with no new sections; its extra 36 bytes are non-loadable metadata.
+Final compiler/firmware and installed-cohort gates remain in progress.
+
+The stock-parent Linux probe uses Ubuntu 24.04: the published v0.2.48 compiler
+itself needs GLIBC_2.38. This does not change the companion's separately proven
+clean Ubuntu 22.04/glibc 2.35 compatibility.
+
+Final compiled-stage stages 2 and 3 are byte-identical with SHA-256
+`2a2735f29a590a44ef6756c09bd81fa6643e7846b6635c0f4da0889f0873998e`.
+The frozen `da5a939` firmware build passes the 4 GiB launcher, peaking at
+3,403,912 KiB. Its object is 144,892 bytes against 144,824 for the SDK wrapper:
+all 558 allocatable section bodies and every section alignment match, with
+no added sections. The remaining 68 bytes are non-loadable metadata. This
+single peak is a capacity check, not evidence of an RSS improvement.

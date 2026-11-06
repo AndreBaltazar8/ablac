@@ -29,7 +29,7 @@ with tempfile.TemporaryDirectory(prefix='abla Xtensa routing ') as temporary:
                ABLA_XTENSA_ROUTING_TRACE=str(trace))
     env.pop('ABLA_STDLIB', None)
     for name in ('ABLA_ESP_CPU', 'ABLA_XTENSA_DIRECT_CALLS', 'ABLA_XTENSA_NARROW_BRANCHES',
-                 'ABLA_XTENSA_TEXT_LITERALS'):
+                 'ABLA_XTENSA_TEXT_LITERALS', 'ABLA_XTENSA_NARROW', 'ABLA_ESP_KEEP_UNWIND'):
         env.pop(name, None)
 
     def cohort(name):
@@ -86,7 +86,7 @@ with tempfile.TemporaryDirectory(prefix='abla Xtensa routing ') as temporary:
         return result
 
     def emissions():
-        return [row for row in rows() if row['tool'] == 'llc' and '--version' not in row['args']]
+        return [row for row in rows() if row['tool'] == 'llc' and '-filetype=asm' in row['args']]
 
     build('cold')
     assert len(emissions()) == 1
@@ -94,8 +94,15 @@ with tempfile.TemporaryDirectory(prefix='abla Xtensa routing ') as temporary:
     assert '-mcpu=esp32' in call and '-relocation-model=static' in call
     assert '-xtensa-direct-calls' in call and '-xtensa-narrow-branches' in call
     assert '-xtensa-text-section-literals' not in call
+    build_manifest = json.loads((root / 'cold.o.xtensa-tools.json').read_text())
+    assert build_manifest['assemblyNarrowing'] is True
+    assert 'a2fd95380faf9c54' in build_manifest['stage']
     build('warm')
     assert len(emissions()) == 1, 'unchanged build did not hit cache'
+    build('no-narrow', changes={'ABLA_XTENSA_NARROW': '0'})
+    build_manifest = json.loads((root / 'no-narrow.o.xtensa-tools.json').read_text())
+    assert build_manifest['assemblyNarrowing'] is False
+    assert len(emissions()) == 2, 'narrow opt-out reused the wrong cache entry'
     build('fast', ['--fast'])
     assert '-O0' in emissions()[-1]['args'] and '-relocation-model=static' in emissions()[-1]['args']
     before = len(emissions())
@@ -180,7 +187,7 @@ with tempfile.TemporaryDirectory(prefix='abla Xtensa routing ') as temporary:
                       ' if (never()) marked("# ABLA_XTENSA_LITERAL_ISLAND", "~{memory}")\n'
                       ' value + 1\n}\n')
     build('dead-gnu-marker', ['--no-cache'])
-    assert any(arg.endswith('.checked.ll') for arg in emissions()[-1]['args']), 'dead-marker control did not inspect optimized IR'
+    assert any(row['tool'] == 'opt' and any(arg.endswith('.checked.ll') for arg in row['args']) for row in rows()), 'dead-marker control did not inspect optimized IR'
     # The ordinary host path ignores even a deliberately missing Xtensa root.
     host = subprocess.run([compiler, 'build', str(source), '-o', str(root / 'host.o'),
                            '--emit', 'object', '--fast', '--no-cache'],

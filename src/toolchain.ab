@@ -1,4 +1,5 @@
 import "xtensa_tools.ab"
+import "xtensa_assembly.ab"
 import "apple_build.ab"
 import "backend/llvm/backend.ab"
 import "module.ab"
@@ -1244,11 +1245,11 @@ fun bootstrapExternalEmitObjectForTargetWithTools(
     // GNU-as layout markers must not silently become LLVM-assembler comments.
     // Inspect after dead-code removal, so unused SDK vector helpers don't
     // constrain ordinary programs. Only this uncommon path prints optimized IR.
-    val inputPath = if (inspectAssembly) "$objectPath.checked.ll" else "$objectPath.bc"
+    val inputPath = "$objectPath.bc"
+    val checkedPath = "$objectPath.checked.ll"
     val optimize = bootstrapXtensaCommand(tools, "opt")
-    if (inspectAssembly) optimize.argument("-S")
     bootstrapXtensaTargetOptions(tools, optimize)
-    optimize.argument(if (fast) {
+    val passes = if (fast) {
         // Scalar promotion, local cleanup and the inliner (small helpers and
         // column accessors dominate generated code), without O1's loop and
         // global passes: on a large wasm module opt + llc drop from ~13s to ~7s
@@ -1265,10 +1266,13 @@ fun bootstrapExternalEmitObjectForTargetWithTools(
         // platform-specific annotation. Size comes from the minsize attribute
         // below (LLVM 23 dropped default<Oz> for O2 on minsize functions).
         "-passes=default<O2>,ipsccp<func-spec>,deadargelim,globaldce"
-    } else "-passes=default<O2>,globaldce")
+    } else "-passes=default<O2>,globaldce"
+    optimize.argument(if (tools.root != "" && !tools.keepUnwind) "$passes,forceattrs" else passes)
     // Every function is minsize on an MCU (optnone ones keep theirs), so llc's
     // code generation optimizes for size as well.
     if (mcuTarget && !fast) optimize.argument("--force-attribute=minsize")
+    // MCU panic traps: emit no unwind tables, rather than stripping them later.
+    if (tools.root != "" && !tools.keepUnwind) optimize.argument("--force-attribute=nounwind")
     // LLVM can still expand constant-trip loops under minsize. On MCUs this often
     // duplicates MMIO and call sequences (for example one copy per byte or
     // digit), increasing both flash use and instruction-cache pressure. Make
@@ -1286,7 +1290,15 @@ fun bootstrapExternalEmitObjectForTargetWithTools(
     optimize.argument(inputPath)
     var status = if (prepared) optimize.run() else 1
     if (status == 0 && inspectAssembly) {
-        val optimized = Path(inputPath).readText()
+        // Inspect a separate rendering; code generation keeps the original
+        // bitcode and its use-list order, exactly as the SDK wrapper does.
+        val inspect = bootstrapXtensaCommand(tools, "opt")
+        inspect.argument("-S").argument("-passes=no-op-module").argument(inputPath)
+        inspect.argument("-o").argument(checkedPath)
+        status = inspect.run()
+    }
+    if (status == 0 && inspectAssembly) {
+        val optimized = Path(checkedPath).readText()
         if (bootstrapTextContains(optimized, "ABLA_XTENSA_") ||
             bootstrapTextContains(optimized, "WindowVectors")) {
             linuxPrintStandardError(
@@ -1298,7 +1310,7 @@ fun bootstrapExternalEmitObjectForTargetWithTools(
     if (status == 0) {
         val emitObject = bootstrapXtensaCommand(tools, "llc")
         bootstrapXtensaTargetOptions(tools, emitObject)
-        emitObject.argument("-filetype=obj")
+        emitObject.argument(if (tools.root != "") "-filetype=asm" else "-filetype=obj")
         // A WebAssembly module links as one static module (no -pie), so
         // position-independent code only reaches its globals through the GOT,
         // and fast instruction selection gives up on every global address
@@ -1326,11 +1338,34 @@ fun bootstrapExternalEmitObjectForTargetWithTools(
         }
         emitObject.argument(inputPath)
         emitObject.argument("-o")
-        emitObject.argument(objectPath)
+        val assemblyPath = "$objectPath.xtensa.s"
+        emitObject.argument(if (tools.root != "") assemblyPath else objectPath)
         status = emitObject.run()
+        if (status == 0 && tools.root != "") {
+            val emitted = Path(assemblyPath).readText()
+            val narrowed = if (tools.narrowAssembly) bootstrapXtensaNarrowAssembly(emitted,
+                tools.keepUnwind) else emitted
+            val aligned = bootstrapXtensaAlignedAssembly(narrowed)
+            val modulePath = "$objectPath.assembly.ll"
+            if (!Path(modulePath).writeText(bootstrapXtensaAssemblyModule(aligned))) status = 190
+            else {
+                val assemble = bootstrapXtensaCommand(tools, "llc")
+                bootstrapXtensaTargetOptions(tools, assemble)
+                assemble.argument("-mtriple=$llvmTriple")
+                assemble.argument("-relocation-model=static")
+                assemble.argument("-filetype=obj")
+                if (tools.textLiterals) assemble.argument("-xtensa-text-section-literals")
+                assemble.argument(modulePath).argument("-o").argument(objectPath)
+                status = assemble.run()
+            }
+            if (status !=
+                0) linuxPrintStandardError("error[E_XTENSA_ASSEMBLY]: private Xtensa assembly legalization or integrated assembly failed; no object is accepted\n")
+            Path(modulePath).remove()
+            Path(assemblyPath).remove()
+        }
     }
     Path(targetLlvmPath).remove()
-    if (inspectAssembly) Path(inputPath).remove()
+    if (inspectAssembly) Path(checkedPath).remove()
     status
 }
 

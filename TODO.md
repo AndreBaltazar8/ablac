@@ -238,8 +238,7 @@
   `build/.abla-build-transaction-<pid>`, is in use.
 - [ ] **Released toolchains can't target Xtensa.** CI's Nix shell has the patched LLVM
   ([llvm-xtensa.md](docs/llvm-xtensa.md)), but `abla-toolchain-x86_64-linux` bundles
-  apt.llvm.org's LLVM from an Ubuntu 22.04 image and the macOS jobs use Homebrew's, neither
-  with Xtensa. The old Nix-built one needs Nix's glibc 2.44; a separate glibc 2.35 companion
+  stock LLVM and the macOS jobs use Homebrew's, without the private Xtensa patches. The old Nix-built one needs Nix's glibc 2.44; a separate glibc 2.35 companion
   and native companions for both Macs are now published. Target-specific compiler routing remains.
   #575 phases 1–2 (2026-11-06): [optional revision 23.1.3-1 is published](https://github.com/AndreBaltazar8/llvm-project/releases/tag/abla-xtensa-llvm-23.1.3-1)
   for Linux and both Macs; branch `feat-xtensa-companion` implements explicit verified installation.
@@ -247,10 +246,20 @@
   object hashes. Canonical catalog pins the published archive and manifest hashes. The installer
   passed all three hosts on both unpublished and
   [published inputs](https://github.com/AndreBaltazar8/ablac/actions/runs/42269233930), including real
-  stat-preserved libLLVM tamper negatives. Phases 1–2 are ready for review; phase 3 is not implemented.
-  Next, after review: phase 3 routes only Xtensa opt/llc through the installed cohort, keys its identity
-  and ESP settings, and passes the real package-import/4 GiB and downstream gates. No compiler routing
-  is implemented yet; see [design and evidence](docs/design/xtensa-companion.md).
+  stat-preserved libLLVM tamper negatives. Phases 1–2 merged as `dffc60aa`. Phase 3 is
+  implemented on `feat-xtensa-routing`, with a compiled SDK-density stage, explicit
+  opt-out and build manifest, target-local tool/cache identity, static relocation and
+  source-level literal alignment. Its 558 firmware bodies, alignments and 2,005
+  normalized relocations match the SDK wrapper; package-import passes the 4 GiB cap.
+  Final installed-cohort, downstream and suite gates remain in progress; v0.2.48
+  does not contain routing. See [design and evidence](docs/design/xtensa-companion.md).
+- [ ] **Move Xtensa density legalization into companion 23.1.3-2.** The phase-3
+  compiler stage mirrors the SDK's exact narrow encodings because `-mcpu=esp32`
+  and explicit `+density` still leave 5,211 bytes across 199 firmware sections.
+  Keep its frozen-script text differential until native selection replaces it.
+  LLVM's inline-assembly literal creation must also set section alignment to 4
+  (L32R requirement); normal compiler literal pools already do. Remove the
+  compiler legalization only when all firmware bodies and alignments match.
 - [ ] **Xtensa companion workflow publishing needs owner credentials.** In this fork, the manual
   workflow's `GITHUB_TOKEN` with Contents: write receives HTTP 403 creating a release, including after
   the exact source tag already exists. Revision 1 was published from the verified artifacts with the
