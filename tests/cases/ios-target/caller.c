@@ -1,3 +1,4 @@
+#include "runtime-deadline.h"
 #include "abla_app.h"
 #include <mach/mach.h>
 #include <stdint.h>
@@ -16,6 +17,7 @@ static mach_task_basic_info_data_t memory_info(void) {
 }
 
 int main(void) {
+    ios_test_runtime_deadline();
     fputs("ios-caller: entered C main\n", stderr);
     /* Prime libc's own allocation zones before attributing new mappings to
        the managed runtime. This is not a physical-device memory-limit test. */

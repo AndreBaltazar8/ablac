@@ -71,11 +71,17 @@ xcrun --sdk iphonesimulator clang \
     --target=arm64-apple-ios17.0-simulator \
     -isysroot "$ABLA_APPLE_SDK_IPHONESIMULATOR" -O2 \
     tests/cases/ios-target/baseline.c -o "$directory/ios-baseline"
+xcrun --sdk iphonesimulator clang \
+    --target=arm64-apple-ios17.0-simulator \
+    -isysroot "$ABLA_APPLE_SDK_IPHONESIMULATOR" -O2 \
+    -DABLA_IOS_DEADLINE_NEGATIVE tests/cases/ios-target/baseline.c \
+    -o "$directory/ios-deadline-negative"
 # Ad-hoc signing needs no provisioning profile or extended-address entitlement.
 codesign --force --sign - "$directory/ios-caller"
 codesign --force --sign - "$directory/ios-baseline"
+codesign --force --sign - "$directory/ios-deadline-negative"
 xcrun simctl list devices available --json > "$directory/simulators.json"
-python3 - "$directory/simulators.json" "$directory/ios-caller" "$directory/ios-baseline" <<'SIM'
+python3 - "$directory/simulators.json" "$directory/ios-caller" "$directory/ios-baseline" "$directory/ios-deadline-negative" <<'SIM'
 import json, subprocess, sys
 from pathlib import Path
 all_devices = json.load(open(sys.argv[1]))['devices']
@@ -97,11 +103,20 @@ try:
                               check=True, text=True, stdout=subprocess.PIPE, timeout=120)
     print(baseline.stdout, end='', flush=True)
     assert 'pure C baseline ready' in baseline.stdout
+    print('iOS Simulator: deliberate execution-deadline control', flush=True)
+    negative = subprocess.run(['xcrun', 'simctl', 'spawn', udid, str(Path(sys.argv[4]).absolute())],
+                              text=True, capture_output=True, timeout=120)
+    print(negative.stdout, end='', flush=True)
+    print(negative.stderr, end='', file=sys.stderr, flush=True)
+    assert 'ios-deadline-control: waiting for SIGALRM' in negative.stderr
+    assert negative.returncode in (-14, 14, 142), negative.returncode
+    print('iOS Simulator: stalled C process stopped by SIGALRM', flush=True)
     for attempt in range(3):
         print('iOS Simulator: fresh Abla process', attempt + 1, flush=True)
-        # Keep stderr live so a timeout identifies the last entered export.
+        # Launch may be slow before C main; the C watchdog bounds execution
+        # to 15 s. Keep stderr live to identify the last entered export.
         result = subprocess.run(['xcrun', 'simctl', 'spawn', udid, str(Path(sys.argv[2]).absolute())],
-                                check=True, text=True, stdout=subprocess.PIPE, timeout=60)
+                                check=True, text=True, stdout=subprocess.PIPE, timeout=120)
         print(result.stdout, end='', flush=True)
         assert 'Abla C export returned 42' in result.stdout
 
