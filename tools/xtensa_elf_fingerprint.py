@@ -10,6 +10,7 @@ def digest(value):
 
 def fingerprint(raw, controls=False):
     assert raw[:7] == b'\x7fELF\x01\x01\x01'
+    assert struct.unpack_from('<H', raw, 16)[0] == 1, 'not a relocatable object'
     assert struct.unpack_from('<H', raw, 18)[0] == 94, 'not Xtensa'
     offset = struct.unpack_from('<I', raw, 32)[0]
     width, count, names_index = struct.unpack_from('<HHH', raw, 46)
@@ -63,6 +64,8 @@ def fingerprint(raw, controls=False):
     result = dict(schema=1, elfFlags=struct.unpack_from('<I', raw, 36)[0],
                   allocatedSections=len(sections), normalizedRelocations=len(relocations),
                   maskedL32rFields=len(masked), sectionsSha256=digest(sections),
+                  symbolsSha256=digest(sorted([entry for table in symbols.values() for entry in table],
+                                             key=lambda entry: json.dumps(entry))),
                   relocationsSha256=digest(sorted(relocations)))
     if controls:
         # A placeholder mutation is equivalent; a real opcode or RELA-addend
