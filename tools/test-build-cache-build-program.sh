@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# A programmable build (compilerBuildProgram) must run on every build, so a program
+# A programmable build or XCFramework packaging request must run on every build, so a program
 # whose compile-time code can reach one is never served from the native object
 # cache. A program that only imports abla/compiler, whose Compiler.buildProgram
-# wrapper nothing calls, is cached like any other.
+# wrapper nothing calls, is cached like any other. The false branches test
+# structural reachability without executing either request on this host.
 set -euo pipefail
 
 if [[ $# -ne 1 ]]; then
@@ -33,6 +34,19 @@ val seven = #maybe(false)
 
 fun main: int = seven * 6
 SOURCE
+cat >package-reached.ab <<'SOURCE'
+import "abla/compiler"
+
+compile fun maybePackage(flag: bool): int {
+    if (flag) {
+        val accepted = compilerCreateXcframework("App.xcframework", ["libapp.a"], "include")
+    }
+    7
+}
+
+val seven = #maybePackage(false)
+fun main: int = seven * 6
+SOURCE
 
 # cached <name>: builds twice; a hit leaves the marker written over the first
 # build's LLVM text in place.
@@ -51,4 +65,9 @@ if cached reached; then
     echo 'build cache: a reachable compilerBuildProgram was served from the cache' >&2
     exit 1
 fi
+if cached package-reached; then
+    echo 'build cache: a reachable compilerCreateXcframework was served from the cache' >&2
+    exit 1
+fi
 printf '%s\n' 'build cache: only a reachable compilerBuildProgram disables caching'
+printf '%s\n' 'build cache: reachable XCFramework packaging also disables caching'
