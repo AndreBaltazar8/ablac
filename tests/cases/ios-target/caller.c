@@ -16,6 +16,7 @@ static mach_task_basic_info_data_t memory_info(void) {
 }
 
 int main(void) {
+    fputs("ios-caller: entered C main\n", stderr);
     /* Prime libc's own allocation zones before attributing new mappings to
        the managed runtime. This is not a physical-device memory-limit test. */
     void *small = malloc(16);
@@ -26,8 +27,11 @@ int main(void) {
     free(small);
     free(large);
     const mach_task_basic_info_data_t before = memory_info();
+    fputs("ios-caller: before scalar export\n", stderr);
     const int64_t result = abla_ios_answer();
+    fputs("ios-caller: before managed export\n", stderr);
     const int64_t managed = abla_ios_managed_answer(41);
+    fputs("ios-caller: managed export returned\n", stderr);
     const mach_task_basic_info_data_t after = memory_info();
     if (result != 42 || managed != 126) {
         fprintf(stderr, "iOS exports returned %lld/%lld, expected 42/126\n",

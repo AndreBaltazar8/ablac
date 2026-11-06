@@ -67,10 +67,15 @@ xcrun --sdk iphonesimulator clang \
     -isysroot "$ABLA_APPLE_SDK_IPHONESIMULATOR" -O2 \
     -Itests/cases/ios-target/include tests/cases/ios-target/caller.c \
     "$directory/simulator/libabla_app.a" -pthread -o "$directory/ios-caller"
+xcrun --sdk iphonesimulator clang \
+    --target=arm64-apple-ios17.0-simulator \
+    -isysroot "$ABLA_APPLE_SDK_IPHONESIMULATOR" -O2 \
+    tests/cases/ios-target/baseline.c -o "$directory/ios-baseline"
 # Ad-hoc signing needs no provisioning profile or extended-address entitlement.
 codesign --force --sign - "$directory/ios-caller"
+codesign --force --sign - "$directory/ios-baseline"
 xcrun simctl list devices available --json > "$directory/simulators.json"
-python3 - "$directory/simulators.json" "$directory/ios-caller" <<'SIM'
+python3 - "$directory/simulators.json" "$directory/ios-caller" "$directory/ios-baseline" <<'SIM'
 import json, subprocess, sys
 from pathlib import Path
 all_devices = json.load(open(sys.argv[1]))['devices']
@@ -86,11 +91,20 @@ try:
     if booted_here:
         subprocess.run(['xcrun', 'simctl', 'boot', udid], check=True, timeout=60)
     subprocess.run(['xcrun', 'simctl', 'bootstatus', udid, '-b'], check=True, timeout=240)
-    result = subprocess.run(['xcrun', 'simctl', 'spawn', udid, str(Path(sys.argv[2]).absolute())],
-                            check=True, text=True, capture_output=True, timeout=60)
-    print(result.stdout, end='', flush=True)
-    print(result.stderr, end='', file=sys.stderr, flush=True)
-    assert 'Abla C export returned 42' in result.stdout
+    # A C-only process separates launch-service readiness from Abla startup.
+    print('iOS Simulator: launch pure C baseline', flush=True)
+    baseline = subprocess.run(['xcrun', 'simctl', 'spawn', udid, str(Path(sys.argv[3]).absolute())],
+                              check=True, text=True, stdout=subprocess.PIPE, timeout=120)
+    print(baseline.stdout, end='', flush=True)
+    assert 'pure C baseline ready' in baseline.stdout
+    for attempt in range(3):
+        print('iOS Simulator: fresh Abla process', attempt + 1, flush=True)
+        # Keep stderr live so a timeout identifies the last entered export.
+        result = subprocess.run(['xcrun', 'simctl', 'spawn', udid, str(Path(sys.argv[2]).absolute())],
+                                check=True, text=True, stdout=subprocess.PIPE, timeout=60)
+        print(result.stdout, end='', flush=True)
+        assert 'Abla C export returned 42' in result.stdout
+
 finally:
     if booted_here:
         subprocess.run(['xcrun', 'simctl', 'shutdown', udid], timeout=60, check=False)
