@@ -1,0 +1,150 @@
+import "abla/sys/linux/fs"
+import "abla/sys/linux"
+import "abla/sys/linux/io"
+import "abla/sys/linux/process"
+import "abla/platform/host"
+
+// Post-build packaging is separate from the frontend transaction: child
+// program requests must have published their archives before this runs.
+class BootstrapApplePackageRequest(
+    val output: string,
+    val slices: array<string>,
+    val headers: string
+)
+
+var bootstrapApplePackageCount: int = 0
+
+fun bootstrapApplePackageRoot(): string =
+    "build/.abla-apple-packages-${linuxProcessId()}"
+
+fun bootstrapApplePackagePathValid(value: string): bool {
+    if (value.size == 0 || value.size > 4096) return false
+    for (byte in value) {
+        if (byte == 0 || byte == 10 || byte == 13) return false
+    }
+    true
+}
+
+fun bootstrapStageApplePackage(request: BootstrapApplePackageRequest): bool {
+    var valid = bootstrapApplePackageCount < 16 &&
+        bootstrapApplePackagePathValid(request.output) &&
+        request.output.endsWith(".xcframework") &&
+        bootstrapApplePackagePathValid(request.headers) &&
+        request.slices.size > 0 && request.slices.size <= 16
+    var joined = ""
+    for (slice in request.slices) {
+        if (!bootstrapApplePackagePathValid(slice) ||
+            !slice.endsWith(".a")) valid = false
+        if (joined != "") joined = "$joined\n"
+        joined = "$joined$slice"
+    }
+    val root = bootstrapApplePackageRoot()
+    var index = 0
+    while (valid && index < bootstrapApplePackageCount) {
+        if (Path("$root/$index.output").readText() == request.output) {
+            valid = false
+        }
+        index = index + 1
+    }
+    if (valid) valid = Path(root).createDirectories()
+    val slot = bootstrapApplePackageCount
+    if (valid) valid = Path("$root/$slot.output").writeText(request.output)
+    if (valid) valid = Path("$root/$slot.slices").writeText(joined)
+    if (valid) valid = Path("$root/$slot.headers").writeText(request.headers)
+    if (valid) bootstrapApplePackageCount = slot + 1
+    else {
+        Path("$root/$slot.output").remove()
+        Path("$root/$slot.slices").remove()
+        Path("$root/$slot.headers").remove()
+    }
+    valid
+}
+
+fun bootstrapTakeApplePackages(): array<BootstrapApplePackageRequest> {
+    val requests: array<BootstrapApplePackageRequest> = []
+    val root = bootstrapApplePackageRoot()
+    var index = 0
+    while (index < bootstrapApplePackageCount) {
+        requests.append(BootstrapApplePackageRequest(
+            Path("$root/$index.output").readText(),
+            Path("$root/$index.slices").readText().split("\n"),
+            Path("$root/$index.headers").readText()
+        ))
+        Path("$root/$index.output").remove()
+        Path("$root/$index.slices").remove()
+        Path("$root/$index.headers").remove()
+        index = index + 1
+    }
+    bootstrapApplePackageCount = 0
+    Path(root).remove()
+    requests
+}
+
+fun bootstrapAppleAbsolutePath(value: string): string =
+    if (value[0] == 47) value else currentDirectory().child(value).text
+
+fun bootstrapRunApplePackage(request: BootstrapApplePackageRequest): int {
+    if (!ablaHostIsMacOS()) {
+        linuxPrintStandardError(
+            "error[E_IOS_XCFRAMEWORK_HOST]: XCFramework packaging requires macOS and Xcode\n"
+        )
+        return 161
+    }
+    val output = bootstrapAppleAbsolutePath(request.output)
+    val headers = bootstrapAppleAbsolutePath(request.headers)
+    val temporary = "$output.tmp.${linuxProcessId()}.xcframework"
+    val previous = "$output.previous.${linuxProcessId()}"
+    // Never remove an unrelated pre-existing temporary. Preserve the old
+    // artifact until xcodebuild has produced a complete replacement.
+    if (Path(temporary).linkInfo().exists() || Path(previous).linkInfo().exists() ||
+        !Path(headers).info().isDirectory() ||
+        !Path(output).parent().createDirectories()) {
+        linuxPrintStandardError(
+            "error[E_IOS_XCFRAMEWORK_OUTPUT]: invalid headers or occupied packaging scratch path\n"
+        )
+        return 162
+    }
+    val command = linuxCommand("xcodebuild")
+    command.argument("-create-xcframework")
+    for (slice in request.slices) {
+        val archive = bootstrapAppleAbsolutePath(slice)
+        if (!Path(archive).info().isFile()) {
+            linuxPrintStandardError(
+                "error[E_IOS_XCFRAMEWORK_SLICE]: archive '$slice' was not built\n"
+            )
+            return 163
+        }
+        command.argument("-library")
+        command.argument(archive)
+        command.argument("-headers")
+        command.argument(headers)
+    }
+    command.argument("-output")
+    command.argument(temporary)
+    val result = command.run()
+    if (result != 0) {
+        Path(temporary).removeTree()
+        linuxPrintStandardError(
+            "error[E_IOS_XCFRAMEWORK_BUILD]: xcodebuild failed with status $result\n"
+        )
+        return 164
+    }
+    val replaced = Path(output).linkInfo().exists()
+    if (replaced && !Path(output).moveTo(Path(previous))) {
+        Path(temporary).removeTree()
+        linuxPrintStandardError(
+            "error[E_IOS_XCFRAMEWORK_OUTPUT]: cannot retain previous XCFramework\n"
+        )
+        return 162
+    }
+    if (!Path(temporary).moveTo(Path(output))) {
+        if (replaced) Path(previous).moveTo(Path(output))
+        Path(temporary).removeTree()
+        linuxPrintStandardError(
+            "error[E_IOS_XCFRAMEWORK_OUTPUT]: cannot publish XCFramework\n"
+        )
+        return 162
+    }
+    if (replaced) Path(previous).removeTree()
+    0
+}
