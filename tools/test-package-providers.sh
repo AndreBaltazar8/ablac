@@ -47,8 +47,20 @@ EOF
 cat > "$repository/src/provider-dep.ab" <<'EOF'
 import "leaf-provider.ab"
 import "literal.ab"
+import "core/node.ab"
 import leafDependency()
-fun dependencyAnswer: int = 38 + leafAnswer() + literalAnswer()
+fun dependencyAnswer: int = 38 + leafAnswer() + literalAnswer() + nodeZero()
+EOF
+# Two directories that import each other through `../`, as abla-one's core
+# and layout do: the provider scan must see one module, not a growing path.
+mkdir -p -- "$repository/src/core" "$repository/src/layout"
+cat > "$repository/src/core/node.ab" <<'EOF'
+import "../layout/layout.ab"
+fun nodeZero: int = layoutZero()
+EOF
+cat > "$repository/src/layout/layout.ab" <<'EOF'
+import "../core/node.ab"
+fun layoutZero: int = 0
 EOF
 cat > "$repository/src/literal.ab" <<'EOF'
 import "abla/json"
@@ -56,7 +68,7 @@ val literalBody = #$jsons {"answer": 42}
 fun literalAnswer: int = if (literalBody == "{\"answer\":42}") 2 else 0
 EOF
 git -C "$repository" add abla.toml src/provider-dep.ab src/leaf-provider.ab \
-    src/literal.ab
+    src/literal.ab src/core/node.ab src/layout/layout.ab
 git -C "$repository" commit --quiet -m 'initial dependency'
 first_revision=$(git -C "$repository" rev-parse HEAD)
 
