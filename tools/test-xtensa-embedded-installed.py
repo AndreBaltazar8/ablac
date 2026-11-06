@@ -7,6 +7,8 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+sys.dont_write_bytecode = True
+from xtensa_elf_fingerprint import fingerprint
 
 assert os.environ.get('GITHUB_ACTIONS') == 'true', 'installed embedded probe is CI-only'
 assert sys.platform.startswith('linux'), 'this capacity probe requires Linux'
@@ -48,7 +50,13 @@ def verify(path, kind):
     expected = reference['objects'][kind]
     raw = path.read_bytes()
     actual = hashlib.sha256(raw).hexdigest()
-    assert len(raw) == expected['bytes'] and actual == expected['sha256'], (kind, len(raw), actual, expected)
+    assert len(raw) == expected['bytes'], (kind, len(raw), expected['bytes'])
+    if kind == 'narrow':
+        assert actual == expected['sha256'], (kind, actual, expected['sha256'])
+    else:
+        # Only explicit RELA-covered L32R immediates may differ from direct
+        # object emission; source opcode/register bytes stay exact.
+        assert fingerprint(raw, controls=True) == expected['relocationMasked'], kind
     destination = out / ('embedded-firmware-' + kind + '.o')
     shutil.copyfile(path, destination)
     manifest = json.loads(Path(str(path) + '.xtensa-tools.json').read_text())
@@ -56,7 +64,9 @@ def verify(path, kind):
     cohort = (prefix / 'lib/abla/xtensa-llvm/current').resolve()
     assert str(cohort) in manifest['identity']
     assert 'a254932917786ca006920fcb8ec02f3c5556dd06' in manifest['identity']
-    return dict(kind=kind, bytes=len(raw), sha256=actual, stage=manifest['stage'])
+    return dict(kind=kind, bytes=len(raw), sha256=actual, stage=manifest['stage'],
+                comparison='whole-object' if kind == 'narrow' else 'L32R fields masked plus normalized RELA',
+                linkedCheck='unavailable: companion intentionally has no GNU firmware linker')
 
 
 objects = [verify(narrow, 'narrow')]
