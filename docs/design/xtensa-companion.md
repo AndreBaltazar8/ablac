@@ -1,6 +1,6 @@
 # Optional Xtensa LLVM companion
 
-Status: phases 1–2 merged at dffc60aa; phase 3 routing prototype under validation, 2026-11-06.
+Status: phases 1–2 merged at dffc60aa; phase 3 routing is ready for review, with final Linux/macOS CI green, 2026-11-06.
 André chose the optional, separately versioned companion after the
 [feasibility measurements](xtensa-release-feasibility.md). The phases 2–3 design
 below is approved; installer and compiler routing remain separate handoffs.
@@ -354,107 +354,145 @@ stdlib source changed, and no claim is made that the current compiler routes
 Xtensa through this cohort: that is the separately reviewed phase 3.
 
 
-## Phase 3 validation in progress
+## Phase 3 implementation and validation
 
-The prototype on `feat-xtensa-routing` starts at `dffc60aa`. Selection is an
-immutable value captured by the emitter and explicitly passed to the native
-cache identity; it is not a process-global context. Target-local tool/CPU/flag
-controls pass using real LLVM behind instrumented wrappers, including poisoned
-PATH, helper/library/manifest changes, warm-cache missing-file refusals, and a
-`current` link switched during the version check. Live GNU layout markers refuse;
-markers eliminated by optimization pass.
+The compiler resolves a target-local cohort before cache lookup and retains that
+same immutable selection through optimization and code generation. Absolute opt
+and llc paths, manifest bytes, helper/library file identities, CPU and feature
+settings enter the cache identity. Non-Xtensa tool selection is unchanged. The
+Darwin virtual `/proc/self/exe` readlink correction is a separate commit; it uses
+the adapter's existing recorded-image validation.
 
-Before density legalization, local stages 2 and 3 were byte-identical with SHA-256
-`d482834dc5e6c5ad607b061b0b50707c9cf097fbdc0fede0c700096f873cfba7`.
-The two compiler builds peaked at 1,375,376 and 1,380,088 KiB with four CPUs.
-These are verification samples, not a wall-time performance claim.
+`ABLA_XTENSA_FEATURES` is an explicit comma-separated `+name,-name` override,
+appended after CPU defaults. Malformed syntax is `E_XTENSA_FEATURES`; LLVM owns
+feature vocabulary. The QEMU uint256 test uses `-mul32high`, because its CPU
+lacks that instruction. No PATH wrapper carries these settings implicitly.
 
-The stale embedded checkout `7e9ce53` fails with the same 71 semantic error
-headings under released v0.2.48, exact `dffc60aa` and the prototype; its first
-error is `region.noescape-effect:nvs_flash_init`. The gate uses the previously
-approved `da5a939` checkout instead. No embedded sources are modified. The real
-firmware peak, check-source, stock-parent Linux/Mac CI, host-output comparisons
-and downstream compatibility gates are still pending at this prototype commit.
+### Density, literal alignment and object identity
 
-### Firmware parity and the compiled assembly stage
+The pinned backend does not select all SDK density forms: explicit `+density`
+leaves the same 5,211-byte gap across 199 firmware sections. The isolated
+`src/xtensa_assembly.ab` stage mirrors the frozen SDK script, SHA-256
+`a2fd95380faf9c54d500cfed1795cad53c557fabd031df31c008e324db2a10c3`.
+Its offline test uses the real firmware assembly and operand edges, requires
+exact text, preserves verbatim regions, and covers density and unwind options.
+Python is used only in this test. The production stage is compiled Abla, followed
+by the same selected llc's integrated assembler; no objcopy or GNU tool lookup.
 
-The existing SDK wrapper does more than choose a CPU. It defaults
-`ABLA_XTENSA_NARROW=1` and applies a code-density transform before assembly.
-Selecting `esp32` already enables density; adding `+density` produces an
-identical direct object, so it does not recover those instruction selections.
-On frozen embedded `da5a939` package-import, bypassing that transform added
-5,211 bytes across 199 of 558 allocatable sections. Disabling the wrapper's
-transform made its allocatable bodies match direct llc on the same bitcode.
+Freestanding functions are `nounwind` by default, including fast builds, so no
+unwind-table stripping is needed. `ABLA_ESP_KEEP_UNWIND=1` preserves the opt-in;
+unsupported integrated-assembler CFI still fails visibly. Literal sections are
+aligned before object emission. LLVM 23.1.3's inline-assembly `emitLiteral` omits
+the alignment that its ordinary `startLiteralSection` sets; L32R requires four
+bytes. This is an emitter requirement, not arbitrary linker-script padding.
 
-The companion route therefore has an isolated, compiled Abla legalization
-stage in `src/xtensa_assembly.ab`. Its mappings, verbatim regions and literal
-placement are checked by exact text differential against the frozen SDK script
-(SHA-256 `a2fd95380faf9c54d500cfed1795cad53c557fabd031df31c008e324db2a10c3`).
-The offline test includes operand boundaries and the complete firmware assembly.
-Python is used only for this test, not by the build stage. `ABLA_XTENSA_NARROW=0`
-disables instruction narrowing; both choices and the stage identity enter the
-cache key and the successful CLI build's `<output>.xtensa-tools.json` manifest.
+The GNU-marker inspection prints a separate copy of optimized bitcode; codegen
+keeps the original, preserving its use-list order. Live boot/vector markers are
+`E_XTENSA_EXTERNAL_ASSEMBLER`; GNU-as and ESP SDK orchestration stay outside the
+companion. The stock-parent probe uses Ubuntu 24.04 because the published v0.2.48
+**compiler** requires GLIBC_2.38. The independent companion retains its separately
+verified Ubuntu 22.04/glibc 2.35 compatibility.
 
-The selected private llc emits assembly. After legalization, that text becomes
-module-level assembly in an otherwise empty LLVM module, assembled by the same
-absolute private llc. No `llvm-mc`, assembler or Python is discovered on PATH.
-An assembly failure is an `E_XTENSA_ASSEMBLY` failure, never accepted as an object.
-This is ordinary Abla codegen, not the SDK's GNU-as boot/vector layout pipeline.
+An early installed test exposed an extra temporary/PID `STT_FILE` symbol. The
+empty module now has canonical `source_filename = "abla"`, replacing only llc's
+first unnumbered `.file "abla"`; numbered DWARF directives stay intact. The offline
+test also requires identical objects for two temporary input filenames.
+Stage `xtensa-assembly-v3` always repairs literal placement: disabling instruction
+rewriting must not put literal pools in the preceding jump-table section.
 
-Freestanding Xtensa defaults to `nounwind`, including fast builds, so unwind
-tables are not emitted. `ABLA_ESP_KEEP_UNWIND=1` preserves the existing opt-in
-contract; LLVM's integrated assembler can reject unsupported CFI forms and that
-failure stays visible. Literal sections are aligned by assembly declarations
-before object emission. This repairs LLVM 23.1.3's inline-assembly `emitLiteral`
-path, which omits the alignment used by `startLiteralSection`. L32R requires the
-four-byte alignment; it is not an arbitrary linker-script convention. No object
-section, unwind bytes or loadable content is patched with objcopy.
-
-Inspection of live GNU layout markers renders a separate copy of the optimized
-bitcode. Code generation keeps the original bitcode: printing and reparsing it
-otherwise changed use-list ordering and five equal-sized instruction bodies.
-The scratch legalized object matches all 558 allocatable bodies and their
-alignments, with no new sections; its extra 36 bytes are non-loadable metadata.
-Final compiler/firmware and installed-cohort gates remain in progress.
-
-The stock-parent Linux probe uses Ubuntu 24.04: the published v0.2.48 compiler
-itself needs GLIBC_2.38. This does not change the companion's separately proven
-clean Ubuntu 22.04/glibc 2.35 compatibility.
-
-Final compiled-stage stages 2 and 3 are byte-identical with SHA-256
-`2a2735f29a590a44ef6756c09bd81fa6643e7846b6635c0f4da0889f0873998e`.
-The frozen `da5a939` firmware build passes the 4 GiB launcher, peaking at
-3,403,912 KiB. Its object is 144,892 bytes against 144,824 for the SDK wrapper:
-all 558 allocatable section bodies and every section alignment match, with
-no added sections. The remaining 68 bytes are non-loadable metadata. This
-single peak is a capacity check, not evidence of an RSS improvement.
-
-
-### Empty-module file-symbol correction
-
-The first installed density probe (run `42285059322`) failed exact object hashes
-on Linux and arm64 macOS. The loadable content was equal, but LLVM's empty-module
-wrapper acquired its temporary input filename, including the PID, as an extra
-ELF `STT_FILE` symbol. This was a reproducibility defect, not an acceptable
-host-specific difference. The source wrapper now sets `source_filename = "abla"`
-and replaces only llc's initial unnumbered `.file "abla"` directive; numbered
-DWARF file directives remain intact. Stage identity is `xtensa-assembly-v2`.
-The offline test assembles identical envelopes at two different filenames with
-stock host LLVM and requires identical whole objects. The installed gate also
-repeats a cold build at another output name.
-
-With that correction the scratch firmware object is byte-identical to the SDK
-wrapper, 144,824 bytes, SHA-256
+Default firmware output is **whole-object identical** to the SDK wrapper:
+144,824 bytes, SHA-256
 `8d09555ca807d581fa02d48ebccfe5ec88e1e584601ffb6b657a50339a7b471c`.
-This supersedes the earlier 36/68-byte metadata allowances. Final source-frozen
-compiler and all-platform gates are still being repeated.
+All 558 allocated section bodies/alignments and 2,005 normalized relocations
+therefore agree.
 
+With `ABLA_XTENSA_NARROW=0`, both objects are 150,008 bytes. Thirty bytes in three
+bodies differ only in L32R immediate fields overwritten by identical
+`R_XTENSA_SLOT0_OP` RELA records. The opt-out gate masks **only** those 16-bit
+fields, requires every section's metadata and remaining bytes, all symbol
+definitions/bindings, and all normalized relocations including addends to match.
+Actual-object controls reject a changed register/opcode or RELA addend and accept
+a changed relocated placeholder. Default density keeps the stricter whole-object
+comparison.
 
-Instruction opt-out still runs literal-placement legalization. The SDK opt-out
-uses direct object emission and so avoids the text printer's previous-section
-bug; when using an assembly envelope, skipping placement repair would move
-literal pools into a preceding jump-table section. Stage `xtensa-assembly-v3`
-therefore makes only instruction rewriting optional. The offline pinned-script
-differential covers both mappings and identity mappings with CFI on/off. Nix
-and installed-toolchain references cover both instruction settings, all three
-ESP CPUs and fast/release modes (24 objects).
+The SDK and installed opt-out objects also link to byte-identical **stripped
+entire ELF images**, SHA-256
+`3ced584ed5bb5d36248ebcba1c88a64f4151ddd65d04ebeef8b8e47bbc0dc116`, with
+ESP `15.2.0_20251204` GNU ld and the checked-in
+[comparison linker script](../../tests/cases/xtensa-routing/firmware-link.ld).
+That script supplies synthetic SDK symbol bindings to compare relocated bytes;
+the image is not executed and is not a board image. CI has no GNU firmware
+linker, so records that linked check as unavailable rather than claiming it ran.
+
+### Frozen compiler and downstream gates
+
+The final source tree is `28d778d34371e5326452b3378779111a93762ea6`. Stages 1,
+2 and 3 are byte-identical, 8,289,520 bytes, SHA-256
+`f6f265c09eb475dbe477b119c391918d5556b9edde8f1ff08c44aaee06b00604`.
+The pure self-rebuild also passes its IR comparison and native child check.
+
+- Full local suite: **329 passed, 0 failed, 214 s**, JOBS=8 on CPUs 0–7,
+  ordinary 8 MiB parent stack, no nohup; load 17.30 at start and 16.67 at end.
+- Non-Xtensa: eight whole objects (fib/readers native, Wasm and RISC-V,
+  fast/release) and fib/readers diagnostic IR equal the frozen dffc60aa compiler.
+- Frozen `abla-embedded da5a939` full `tools/check-source`: passes, peak
+  **3,132,076 KiB**, 158.72 s, under the 4 GiB launcher. Its default package-import
+  object has the exact SDK hash above. These are source/codegen tests, not hardware.
+- NovaKind: android-plan, tool-rebuild, native-build-roots and operation-log-unit
+  pass against frozen `da132731`, using a separate FIFO retained build-focus lease
+  per program, released after each run. No DB/full-test lease or consumer edit.
+- [Three-host installed routing](https://github.com/AndreBaltazar8/ablac/actions/runs/42289218049):
+  stock parent LLVM remains unchanged, 24 objects equal Nix (two fixtures, three
+  CPUs, fast/release and both density settings), poisoned PATH and warm identity
+  controls pass. [Final Linux installed firmware](https://github.com/AndreBaltazar8/ablac/actions/runs/42299874099)
+  also passes the 24 objects and actual firmware comparison under 4 GiB,
+  peak **3,216,368 KiB**, 60.5 s. Its wide object additionally passes the final
+  all-symbol and mutation checks after download.
+- Regular final Linux/macOS CI:
+  [42300669653](https://github.com/AndreBaltazar8/ablac/actions/runs/42300669653):
+  **green**, Linux 329/329 in 801 s, plus macOS hosted paths, iOS Simulator
+  smoke and the pure compiler fixed point. The Linux memory guard passed
+  (its successful numeric stdout is not retained by the workflow).
+
+GNU time peaks above are the largest single process, not summed children, and
+are capacity observations, not claims of an RSS improvement. Raw results are
+[final local gates](xtensa-companion-data/phase3-final-local.json),
+[installed firmware](xtensa-companion-data/phase3-embedded-installed.json) and
+`phase3-routing-*.json` alongside the other evidence.
+
+### Self-emission memory attribution
+
+The first regular CI peak, 1,651,436 KiB, exceeded the old 1,400,000 × 1.10 guard.
+Master's earlier push passed that guard but did not retain its successful numeric
+stdout. The [frozen paired CI matrix](https://github.com/AndreBaltazar8/ablac/actions/runs/42297453462)
+therefore rebuilt dffc60aa and 13ddb261 in the same runner, at the same absolute
+source path, with three alternating rounds for every source/compiler combination.
+It retained exact IR hashes, GNU time samples and memory-by-phase traces.
+
+| Source | Compiler | Median KiB | Range KiB |
+| --- | --- | ---: | ---: |
+| dffc60aa | dffc60aa | 1,496,012 | 1,494,332–1,498,588 |
+| dffc60aa | 13ddb261 | 1,498,088 | 1,492,740–1,503,012 |
+| 13ddb261 | dffc60aa | 1,551,272 | 1,547,208–1,554,384 |
+| 13ddb261 | 13ddb261 | 1,548,292 | 1,543,308–1,638,804 |
+
+Each source produces identical IR with either compiler. Added source, not running
+the Xtensa route on a host build, accounts for the median change. New module parse
+deltas are 323,055 bytes for assembly and 213,341 for tools; total parse-end growth
+is about 0.84 MB, with 22 extra reached functions and only five extra demanded
+functions beyond those. There is no embedded fixture, large table or broad generic
+fan-out. Local old/new-source/compiler medians are 1,297,016/1,319,716 KiB; isolated
+source additions give roughly 26 MB peak growth.
+
+The remaining spread is collection placement: normalization crosses a collection
+(about 339 → 168 MB). High runs keep another 50–60 MB **before annotations**, then
+carry it into module emission. Either compiler shows this mode under contention.
+No allocator or GC policy changes belong to this routing patch; the sensitivity
+is recorded separately in TODO.md. The reviewed record is 1,430,000 KiB, keeping
+the guard's existing 10% rule. The final local guard measured 1,312,860 KiB.
+
+[CI samples](xtensa-companion-data/phase3-memory-ci.json),
+[compressed raw phase traces](xtensa-companion-data/phase3-memory-traces.json.gz),
+[local pairs](xtensa-companion-data/phase3-memory-local.json) and
+[isolated source additions](xtensa-companion-data/phase3-memory-attribution.json)
+retain the attribution and its limits.

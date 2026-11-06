@@ -239,7 +239,8 @@
 - [ ] **Released toolchains can't target Xtensa.** CI's Nix shell has the patched LLVM
   ([llvm-xtensa.md](docs/llvm-xtensa.md)), but `abla-toolchain-x86_64-linux` bundles
   stock LLVM and the macOS jobs use Homebrew's, without the private Xtensa patches. The old Nix-built one needs Nix's glibc 2.44; a separate glibc 2.35 companion
-  and native companions for both Macs are now published. Target-specific compiler routing remains.
+  and native companions for both Macs are now published. Target-specific source routing is
+  validated; release packaging with that compiler is still pending.
   #575 phases 1–2 (2026-11-06): [optional revision 23.1.3-1 is published](https://github.com/AndreBaltazar8/llvm-project/releases/tag/abla-xtensa-llvm-23.1.3-1)
   for Linux and both Macs; branch `feat-xtensa-companion` implements explicit verified installation.
   Source is `a2549329`; all three builds and clean Ubuntu 22.04 pass the Nix assembly/direct/optimized
@@ -251,8 +252,12 @@
   opt-out and build manifest, target-local tool/cache identity, static relocation and
   source-level literal alignment. Its 558 firmware bodies, alignments and 2,005
   normalized relocations match the SDK wrapper; package-import passes the 4 GiB cap.
-  Final installed-cohort, downstream and suite gates remain in progress; v0.2.48
-  does not contain routing. See [design and evidence](docs/design/xtensa-companion.md).
+  Final gates pass: stages 1–3 byte-identical, local and Linux CI 329/329, macOS
+  host/fixed-point/Simulator green, four NovaKind DB-free programs, and the real
+  installed firmware under 4 GiB. Default density is whole-object SDK-exact;
+  opt-out matches every relocated field and links to identical bytes (L32R
+  placeholder bits may differ). Source is ready for review, but v0.2.48 does not
+  contain routing. See [design and evidence](docs/design/xtensa-companion.md).
 - [ ] **Compiler GC trigger sensitivity at normalize → semantic.** A +0.84 MB parse
   increase in the Xtensa routing source moves normalization across a collection:
   `parse.normalize.end` is about 339 MB before, 168 MB after. High runs already
