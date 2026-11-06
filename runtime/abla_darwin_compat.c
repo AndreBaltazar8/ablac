@@ -1092,11 +1092,31 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     result = symlink((const char *)(uintptr_t)argument0,
                      (const char *)(uintptr_t)argument1);
     break;
-  case 89:
-    // Like Linux, the byte count without a terminator.
-    result = readlink((const char *)(uintptr_t)argument0,
-                      (char *)(uintptr_t)argument1, (size_t)argument2);
+  case 89: {
+    // Like Linux, the byte count without a terminator. The virtual image
+    // link follows the same recorded-image check as open/stat; ordinary
+    // filesystem links retain Darwin's native readlink behavior.
+    const char *path = (const char *)(uintptr_t)argument0;
+    if (darwin_names_image(path)) {
+      if (argument2 <= 0) {
+        errno = EINVAL;
+        break;
+      }
+      char image[PATH_MAX];
+      const char *resolved = darwin_linux_path(path, image);
+      if (resolved != NULL) {
+        size_t length = strlen(resolved);
+        size_t capacity = (size_t)argument2;
+        if (length > capacity)
+          length = capacity;
+        memcpy((void *)(uintptr_t)argument1, resolved, length);
+        result = (long)length;
+      }
+    } else {
+      result = readlink(path, (char *)(uintptr_t)argument1, (size_t)argument2);
+    }
     break;
+  }
   case 90:
     result = chmod((const char *)(uintptr_t)argument0, (mode_t)argument1);
     break;

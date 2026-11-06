@@ -73,6 +73,11 @@ expect_status_42 "$output_directory/uuid"
     --fast -o "$output_directory/filesystem"
 expect_status_42 "$output_directory/filesystem"
 
+# The compiler uses the virtual image link to find its installed toolchain.
+"$compiler" build "$project_root/tests/cases/xtensa-routing/image-path.ab" \
+    --fast -o "$output_directory/image-path"
+expect_status_42 "$output_directory/image-path"
+
 "$compiler" build "$project_root/tests/cases/path-home/main.ab" \
     --fast -o "$output_directory/path-home"
 HOME='/tmp/abla test home' ABLA_EXPECT_HOME='/tmp/abla test home' "$output_directory/path-home"
