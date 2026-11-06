@@ -258,6 +258,47 @@
   opt-out matches every relocated field and links to identical bytes (L32R
   placeholder bits may differ). Source is ready for review, but v0.2.48 does not
   contain routing. See [design and evidence](docs/design/xtensa-companion.md).
+- [ ] **v0.2.49 release-note draft: Xtensa migration (planned break).** Publish this
+  with the release; v0.2.48 does not implement the new routing:
+
+  > Xtensa codegen now requires the optional companion; the former PATH-wrapper route is gone, and a missing cohort gives `E_XTENSA_LLVM_MISSING`.
+  > Install explicitly with `<toolchain>/bin/abla-install-xtensa --version 23.1.3-1`; builds never download it automatically.
+  > For source/custom setups set `ABLA_XTENSA_LLVM_ROOT=<cohort-root>` containing `manifest.json`, `bin/` and `lib/`; the updated ablac Nix shell already exports its store cohort.
+  > Select `ABLA_ESP_CPU=esp32`, `esp32s2` or `esp32s3` (default `esp32`); extra LLVM features use `ABLA_XTENSA_FEATURES=+name,-name` (QEMU: `-mul32high`), not hidden llc wrapper flags.
+  > `ABLA_XTENSA_NARROW=0` disables the extra SDK instruction narrowing, keeping literal placement/alignment repair; ESP-IDF and GNU boot/vector assembly/link tools remain separate requirements.
+
+  **Exact abla-embedded setup changes** (checked against `da5a939`; this does not
+  edit that repository):
+  - Its current Makefile already runs Abla compilation through
+    `nix-shell $(ABLA_PROJECT_ROOT)/shell.nix`. Point `ABLA_PROJECT_ROOT` at the
+    updated ablac checkout and use its rebuilt compiler. No object recipe or
+    new PATH entry is required: that shell's hook supplies
+    `ABLA_XTENSA_LLVM_ROOT` unless an explicit value is already exported.
+    For a non-default compiler checkout, also set `ABLA_COMPILER_ROOT` to the
+    same checkout for `tools/check-source` (which uses that distinct variable).
+  - Its own `shell.nix` is an ESP SDK shell, not ablac's compiler shell. A caller
+    building there directly must either use a released toolchain with the
+    companion installed next to its actual compiler image, or export
+    `ABLA_XTENSA_LLVM_ROOT` to the manifested cohort before invoking Abla.
+    If a Makefile runs the installer, make it an explicit setup target, never
+    an automatic download in a build recipe. A source checkout can run
+    `python3 <ablac>/tools/install-xtensa-llvm.py --toolchain-root <prefix> --version 23.1.3-1`
+    and export `<prefix>/lib/abla/xtensa-llvm/current` as the cohort root.
+  - Preserve the existing per-example `ABLA_ESP_CPU` selection in
+    `tools/build-example`; export any feature mask and `ABLA_XTENSA_NARROW`
+    through the shell/Make invocation as well. A flag injected only by
+    `tools/esp-llvm-bin/llc` no longer affects Abla's Xtensa path. Do not point
+    `ABLA_LLVM_TOOLS` at the companion or prepend its private tools globally.
+  - Keep `ABLA_ESP_LLVM_ROOT`, ESP-IDF setup, `tools/idf-project` and the SDK
+    PATH wrappers for their separate GNU-as/link, RISC-V and direct-tool uses;
+    `ABLA_ESP_LLVM_ROOT` is **not** the companion root. The full `make check`
+    still uses ablac's development shell: its direct SDK-wrapper self-test
+    needs patched `llvm-mc`, which the opt/llc/libLLVM-only companion does not ship.
+
+  NovaKind final gate assertion counts: android-plan **52**, tool-rebuild **23**,
+  native-build-roots **2**, operation-log-unit **31**, total **108**. The runner's
+  raw result fields 53/24/3/31 include the first three PASS-summary lines;
+  those are not extra assertions.
 - [ ] **Compiler GC trigger sensitivity at normalize → semantic.** A +0.84 MB parse
   increase in the Xtensa routing source moves normalization across a collection:
   `parse.normalize.end` is about 339 MB before, 168 MB after. High runs already
