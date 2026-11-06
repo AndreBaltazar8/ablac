@@ -31,10 +31,11 @@ enough to use it on Ubuntu 22.04. See the measured
 ## Optional portable companion
 
 André chose a separately versioned, optional download. It does not go into every
-Abla release or replace the parent LLVM or Clang. Implementation is staged:
-the fork's manual artifact workflow exists, but publication, installation and
-compiler routing are not complete yet. Released compilers still need the Nix
-setup for Xtensa until those gates pass. The
+Abla release or replace the parent LLVM or Clang. Revision
+[23.1.3-1](https://github.com/AndreBaltazar8/llvm-project/releases/tag/abla-xtensa-llvm-23.1.3-1)
+is published for all three hosts, and explicit verified installation is implemented.
+Compiler routing remains a separate phase: released compilers still need the Nix
+setup for Xtensa until that change and its gates pass. The
 [design and gate list](design/xtensa-companion.md) records that status.
 
 The private cohort is `opt`, `llc` and `libLLVM`, with the Xtensa backend, for
@@ -123,13 +124,19 @@ Review all three host builds, relocation and the clean Ubuntu 22.04 check,
 sizes and timings, and the frozen assembly digest before requesting a
 `publish=true` run. The Linux helper must run without the source build's GCC
 installation; both Mac architectures run natively. The optional publisher
-requires every gate to pass, creates a draft with all archives/checksums, and
-then publishes it without changing the fork's latest-release marker. Failed
-or already-used versions are not overwritten.
+requires every gate to pass and is designed to create a draft with all
+archives/checksums, then publish without changing the fork's latest-release
+marker. In this fork, the tested `GITHUB_TOKEN` with Contents: write returns
+HTTP 403 at release creation, even with the source tag already present.
+Revision 1 was therefore published from the verified artifacts using the
+owner's token: draft first, then undraft with `--latest=false`. Future releases
+need explicitly approved owner credentials or the same manual publishing step;
+no owner token is stored in this repository. Failed or already-used versions
+are not overwritten.
 
 The release includes per-archive `.sha256`, `SHA256SUMS` and a combined
-`manifest.json`. The installer catalog will pin the archive and manifest hashes
-in one checked-in table and check them against the published metadata in CI.
+`manifest.json`. The installer catalog pins the archive and manifest hashes
+in one checked-in table and checks them against the published metadata in CI.
 Installation and full integrity verification remain explicit actions, separate
 from compilation.
 

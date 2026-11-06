@@ -1,6 +1,6 @@
 # Optional Xtensa LLVM companion
 
-Status: all three publish builds and clean Linux passed; release creation is blocked by a GitHub token HTTP 403, 2026-11-06.
+Status: revision 23.1.3-1 published with owner credentials; canonical catalog filled, live installer probe pending, 2026-11-06.
 André chose the optional, separately versioned companion after the
 [feasibility measurements](xtensa-release-feasibility.md). The phases 2–3 design
 below is approved; installer and compiler routing remain separate handoffs.
@@ -225,8 +225,8 @@ interoperability gate; those remain phase 3 work.
 
 ## Installer test fixture while publication waits
 
-The production catalog remains pending until the fork publishes all three
-archives. `tools/fixtures/xtensa-companion-unpublished.json` is explicitly marked
+Before publication, the production catalog remained pending until the fork
+published all three archives. `tools/fixtures/xtensa-companion-unpublished.json` is explicitly marked
 `UNPUBLISHED_TEST_FIXTURE`; it pins the original dry-run archives and manifests
 from run 42214578962. It is never copied into a packaged toolchain. Its nested
 catalog simulates accepted metadata only for the offline integration test.
@@ -254,8 +254,9 @@ messages are [retained beside the other evidence](xtensa-companion-data/unpublis
 There are also 21 passing offline catalog/installer controls.
 
 This proves the installer against the frozen dry-run cohorts, **not** against
-published companion assets. Only the canonical catalog fill and the corresponding
-live-input probe remain; compiler routing is still a separate phase.
+published companion assets. The canonical catalog is now filled from the live
+release; the corresponding live-input probe is recorded separately below.
+Compiler routing is still a separate phase.
 
 
 ## Publication attempt and permission blocker
@@ -267,14 +268,14 @@ authorized hourly retries was needed. Linux and Intel successful builds were
 reused, not rebuilt. All three source builds and the clean Ubuntu 22.04 check
 then passed. Their assembly and direct/optimized object hashes still match
 Nix exactly. **All three archive byte hashes differ from the dry run**, as
-allowed: the builder/run metadata and packaged README differ. These are still
-unpublished build artifacts, not canonical installer pins. The
+allowed: the builder/run metadata and packaged README differ. They were initially
+unpublished build artifacts; the owner subsequently published those exact bytes,
+as verified separately below. The
 [package comparison](xtensa-companion-data/publication-build-packages.json)
 records exact sizes and hashes.
 
 Release creation failed HTTP 403, `Resource not accessible by integration`,
-despite the job log showing `GITHUB_TOKEN` Contents: write. No release or tag
-was created. The stopped retry controller deliberately does not retry this
+despite the job log showing `GITHUB_TOKEN` Contents: write. That initial automatic attempt created no release or tag. The stopped retry controller deliberately does not retry this
 non-capacity failure, and no hourly retry timer remains active.
 
 `source-commit.txt` is generated from the identical `sourceCommit` in all three
@@ -290,9 +291,36 @@ The broader tag/workflow-permission explanation is plausible, not established.
 [branch reachability](xtensa-companion-data/publish-source-branch-reachability.json)
 are retained.
 
-The lead is deciding whether to pre-create the exact `a2549329` source tag using
-owner credentials and rerun only the publisher, or publish all verified artifacts
-together manually with owner credentials. Neither has been attempted. Changing
-the tag to `e4da75d4` would misstate the artifacts' source: that extra scavenging
-fix is under a separate gate. The canonical catalog stays pending until the
-full release exists; phase 3 still waits for phase 2.
+The owner pre-created the exact `a2549329` tag over SSH and reran only the
+publisher. Release creation still returned the same HTTP 403. Thus a missing tag
+was not sufficient to explain or fix this failure. The owner then ran the exact
+workflow index script against the verified run artifacts, checked every assertion,
+created a draft release with the owner token, and undrafted it with
+`--latest=false`. The fork's latest release stayed `llvm-23.1.3-xtensa-2`.
+The workflow's release-creation step needs explicitly approved owner credentials
+or this manual step; the repository does not contain such a token.
+
+The tag still names the exact built source. Changing it to `e4da75d4` would
+misstate the artifacts' source: that extra scavenging fix is under a separate
+gate. Phase 3 still waits for the phase-2 handoff.
+
+
+## Published revision 1 verification
+
+The [published release](https://github.com/AndreBaltazar8/llvm-project/releases/tag/abla-xtensa-llvm-23.1.3-1)
+was downloaded again independently. All three per-archive `.sha256` files and all
+four `SHA256SUMS` entries pass. The combined index SHA-256 is
+`3204023d7dac2f3a6044efd925e4fe7c61f7fdd10753879a7d4e39bf46d6f4a8`.
+The tag points to `a254932917786ca006920fcb8ec02f3c5556dd06`. Each published
+archive is byte-identical to its verified publish-run archive, linking it to
+the matching Nix code-generation hashes above. All differ from the original
+dry-run archive bytes.
+
+The canonical `tools/xtensa-companions.json` now pins those published archive
+SHA-256 values and each raw per-archive manifest hash. The live metadata check
+passes for all three hosts. A copied catalog with one intentionally wrong pin
+fails with `published .sha256 mismatch`; it is never used for installation.
+The [published package comparison](xtensa-companion-data/published-packages.json),
+[release metadata](xtensa-companion-data/published-release.json),
+[tag metadata](xtensa-companion-data/published-tag.json), published checksum
+files and the negative-control message are retained alongside the other evidence.
