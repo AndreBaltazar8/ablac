@@ -347,9 +347,16 @@ Package-side work (not changed from ablac):
   run; no memory-success claim. The native string smoke and its GC-stress run passed.
   Runtime source restored; prototype and raw data retained under
   worktrees/ablac-small-pool/build/pool-lab/{report.md,prototype.patch,summary.json}.
-- [ ] **Run times of non-Linux hosted targets aren't measured with the new allocator and root frames.** macOS keeps
-  its LTO link (`wholeProgram` is ELF only) and has not been built or run with these changes; Wasm passes the suite,
-  its size and speed not compared. An earlier try at size lists on Darwin gained no cycles and raised peak memory.
+- [ ] **Non-Linux runtime baselines remain incomplete.** macOS arm64/Intel now have five-run
+  v0.2.45→v0.2.47 runtime/RSS/size measurements (2026-11-06, CI42159997472;
+  docs/macos-runtime-measurements.md plus checked-in raw data). Median-time geomeans
+  +1.42%/−0.59%, all individual timing ranges overlap; JSON peaks broadly flat.
+  Shared Darwin adapter growth adds 448–464 B on arm64, 456–4,560 B on Intel (page thresholds).
+  This pair already contains the allocator/root-frame work in both arms, so its
+  original pre-change baseline remains unmeasured. Wasm passes the suite but its
+  size/speed and other non-Linux targets still lack comparisons. No optimization
+  selected from this noisy measurement. An earlier Darwin size-list try gained no
+  cycles and raised peak memory.
 - [ ] **Strict-imports rechecks loaded standard-library modules on every build.** On 2026-11-03,
   the entire validation cost 41.46M instructions (2.27% of a fib `--fast` build) and
   104.59M (0.56% of a NovaKind tool build); the library-only saving is smaller. Not pursued.

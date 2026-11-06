@@ -41,6 +41,7 @@ in seven short sections of runnable programs.
 | [llvm-backend.md](llvm-backend.md) | How code is emitted; `@naked`, `@section`, inline assembly |
 | [freestanding.md](freestanding.md) | Programs without libc or an operating system |
 | [performance.md](performance.md) | Compiler speed and memory budgets |
+| [macos-runtime-measurements.md](macos-runtime-measurements.md) | Native Mac v0.2.45/v0.2.47 timings, RSS and binary sizes |
 
 ## The compiler project
 
