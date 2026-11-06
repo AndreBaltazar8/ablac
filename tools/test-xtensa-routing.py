@@ -21,7 +21,7 @@ version = manifest['llvmVersion']
 sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
 
 with tempfile.TemporaryDirectory(prefix='abla Xtensa routing ') as temporary:
-    root = Path(temporary)
+    root = Path(temporary).resolve()
     source = root / 'probe.ab'
     source.write_text('@export("probe")\nfun probe(value: int): int = (value & 255) + 7\n')
     trace = root / 'trace.jsonl'

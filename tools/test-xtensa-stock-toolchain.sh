@@ -20,6 +20,17 @@ for option in xtensa-direct-calls xtensa-narrow-branches xtensa-text-section-lit
     fi
 done
 tools/bootstrap-compiler.sh "$out/bootstrap.bin"
+if [[ $(uname -s) == Linux ]]; then
+    # The standalone artifact retains the release builder's interpreter/RPATH;
+    # adapt only this private bootstrap copy to the stock container.
+    patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 "$out/bootstrap.bin"
+    patchelf --set-rpath "$(llvm-config --libdir)" "$out/bootstrap.bin"
+    ldd "$out/bootstrap.bin" > "$out/bootstrap-dependencies.txt"
+    if grep -q "not found" "$out/bootstrap-dependencies.txt"; then
+        cat "$out/bootstrap-dependencies.txt" >&2
+        exit 1
+    fi
+fi
 ABLA_COMPILER_PAYLOAD="$out/bootstrap.bin" ABLA_MAX_MEMORY_MB=4096 ABLA_MAX_SECONDS=1200 \
     tools/run-limited-compiler.sh build src/orc_main.ab -o "$out/compiler.bin" --no-cache
 case $(uname -s) in
