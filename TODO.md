@@ -66,6 +66,15 @@
   lift emission, with explicit interp/JIT and hostless Wasm bit-level tests.
   A demand-driven formatter and its end-to-end native/compile-time/Wasm tests
   remain phase (c)'s work; bit preservation does not make formatting correct.
+  The phase (c) WIP is `float-erasure-formatter` at `6acf2811`. In staged
+  integer-only builds, preloading the bridge analyzes `abla/float/text/entry.ab`;
+  an `f64`/`void` join there conservatively marks float formatting as needed,
+  retaining the formatter. Ignoring such joins is unsound: `val v: any = if
+  (true) 1.5 else {}` carries a boxed float. The WIP regression fixture
+  `tests/cases/erased-float-format/main.ab` covers that case. Determine how to
+  distinguish analysis needed only by the preloaded bridge from reachable
+  user origins without missing real erasures; recheck byte identity, size and
+  runtime gates before enabling the formatter.
   Equality and hashing through `any` currently ignore the auxiliary word, so
   a boxed float and an integer with identical payload bits compare equal and
   hash alike through `any`; deciding whether to change that is a separate language issue.
