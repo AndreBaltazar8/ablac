@@ -1088,6 +1088,15 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
   case 87:
     result = unlink((const char *)(uintptr_t)argument0);
     break;
+  case 88:
+    result = symlink((const char *)(uintptr_t)argument0,
+                     (const char *)(uintptr_t)argument1);
+    break;
+  case 89:
+    // Like Linux, the byte count without a terminator.
+    result = readlink((const char *)(uintptr_t)argument0,
+                      (char *)(uintptr_t)argument1, (size_t)argument2);
+    break;
   case 90:
     result = chmod((const char *)(uintptr_t)argument0, (mode_t)argument1);
     break;
