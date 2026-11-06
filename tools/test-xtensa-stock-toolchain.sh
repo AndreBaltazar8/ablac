@@ -48,3 +48,7 @@ mkdir -p "$out/installed"
 tar -xzf "$out/toolchain.tar.gz" -C "$out/installed"
 prefix=$(find "$out/installed" -mindepth 1 -maxdepth 1 -type d -print)
 python3 tools/test-xtensa-routing-installed.py "$prefix" "$out"
+
+if [[ ${ABLA_XTENSA_EMBEDDED_GATE:-false} == true ]]; then
+    python3 tools/test-xtensa-embedded-installed.py "$prefix" "$root/build/xtensa-embedded-source" "$out"
+fi

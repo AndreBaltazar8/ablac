@@ -7,6 +7,16 @@ on:
   # Run a branch by hand before it reaches master.
   workflow_dispatch:
     inputs:
+      xtensa_compiler_memory_probe:
+        description: Only compare frozen baseline/candidate emit memory with phase traces (no threshold change)
+        type: boolean
+        required: false
+        default: false
+      xtensa_companion_embedded_probe:
+        description: Only test frozen embedded source and the 4 GiB cap with the installed Linux companion
+        type: boolean
+        required: false
+        default: false
       xtensa_companion_routing_probe:
         description: Only build with stock parent LLVM and test installed Xtensa routing on all three hosts
         type: boolean
@@ -53,7 +63,7 @@ defaults:
 
 jobs:
   linux:
-    if: ${{ !inputs.xtensa_companion_routing_probe && !inputs.xtensa_companion_install_probe && !inputs.macos_published_rebuild && !inputs.macos_runtime_bench && !inputs.android_pointer_tags_control }}
+    if: ${{ !inputs.xtensa_companion_routing_probe && !inputs.xtensa_companion_embedded_probe && !inputs.xtensa_companion_install_probe && !inputs.macos_published_rebuild && !inputs.macos_runtime_bench && !inputs.android_pointer_tags_control }}
     name: Linux suite (8 jobs)
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -74,13 +84,31 @@ jobs:
       - name: Verify optional Xtensa catalog against published checksums
         run: python3 tools/xtensa_companions.py --check
       - name: Build the current compiler from the checksum-pinned bootstrap
+        if: ${{ !inputs.xtensa_compiler_memory_probe }}
         env:
           ABLA_NATIVE_JOBS: '4'
           ABLA_CODEGEN_JOBS: '4'
         run: |
           mkdir -p build/ci-logs
           nix-shell shell.nix --run 'make ablac' 2>&1 | tee build/ci-logs/linux-build.log
+      - name: Diagnose frozen compiler emit memory in alternating pairs
+        if: inputs.xtensa_compiler_memory_probe
+        run: |
+          ulimit -S -s 8192
+          nix-shell shell.nix --run 'python3 tools/probe-xtensa-emit-memory.py' 2>&1 | tee build-memory-probe.log
+      - name: Retain paired memory samples and raw phase traces
+        if: always() && inputs.xtensa_compiler_memory_probe
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: xtensa-emit-memory
+          path: |
+            build-memory-probe.log
+            build/xtensa-emit-memory/*.json
+            build/xtensa-emit-memory/*.err
+            build/xtensa-emit-memory/*.time
+          retention-days: 7
       - name: Run the Linux suite
+        if: ${{ !inputs.xtensa_compiler_memory_probe }}
         run: |
           # Keep the suite parent at its ordinary stack size; compiler launchers
           # raise their own stack. Large inherited stacks break capped threads.
@@ -98,7 +126,7 @@ jobs:
           if-no-files-found: ignore
 
   macos:
-    if: ${{ !inputs.xtensa_companion_routing_probe && !inputs.xtensa_companion_install_probe && !inputs.macos_published_rebuild && !inputs.macos_runtime_bench && !inputs.android_pointer_tags_control }}
+    if: ${{ !inputs.xtensa_compiler_memory_probe && !inputs.xtensa_companion_routing_probe && !inputs.xtensa_companion_embedded_probe && !inputs.xtensa_companion_install_probe && !inputs.macos_published_rebuild && !inputs.macos_runtime_bench && !inputs.android_pointer_tags_control }}
     name: macOS host and compiler fixed point
     # One standard arm64 runner; Intel remains part of the release matrix.
     runs-on: macos-15
@@ -374,12 +402,12 @@ jobs:
           if-no-files-found: ignore
 
   xtensa-companion-routing:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.xtensa_companion_routing_probe }}
+    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.xtensa_companion_routing_probe || inputs.xtensa_companion_embedded_probe) }}
     name: Stock parent Xtensa routing (${{ matrix.runner }})
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-24.04, macos-15, macos-15-intel]
+        runner: ${{ fromJSON(inputs.xtensa_companion_embedded_probe && '["ubuntu-24.04"]' || '["ubuntu-24.04","macos-15","macos-15-intel"]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
     env:
@@ -388,6 +416,14 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          persist-credentials: false
+      - name: Check out the frozen public embedded gate
+        if: inputs.xtensa_companion_embedded_probe
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: AndreBaltazar8/abla-embedded
+          ref: da5a939a4b0a20a7f97fb58494e3eac7ec4bc7ff
+          path: build/xtensa-embedded-source
           persist-credentials: false
       - name: Install bottled stock Mac LLVM, never build LLVM from source
         if: runner.os == 'macOS'
@@ -399,6 +435,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           docker run --rm -v "$PWD:/abla" -w /abla -e GITHUB_ACTIONS=true \
+            -e ABLA_XTENSA_EMBEDDED_GATE=${{ inputs.xtensa_companion_embedded_probe }} \
             ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852 \
             bash -ceu '
               tools/install-xtensa-stock-test-deps.sh
@@ -415,6 +452,8 @@ jobs:
             build/xtensa-stock/result.json
             build/xtensa-stock/parent-llc-version.txt
             build/xtensa-stock/parent-llc-options.txt
+            build/xtensa-stock/embedded-check-source.log
+            build/xtensa-stock/embedded-check-time.json
             build/xtensa-stock/*.o
             build/xtensa-stock/*.o.ll
           retention-days: 7

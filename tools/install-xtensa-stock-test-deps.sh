@@ -4,7 +4,7 @@ set -euo pipefail
 [[ ${GITHUB_ACTIONS:-} == true && -f /.dockerenv ]] || { echo 'stock dependencies require a disposable CI container' >&2; exit 2; }
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y --no-install-recommends ca-certificates curl gnupg python3 gcc g++ make patchelf binutils binaryen
+apt-get install -y --no-install-recommends ca-certificates curl gnupg python3 gcc g++ make patchelf binutils binaryen git time
 curl -fsSL --retry 5 --retry-all-errors --connect-timeout 15 https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm.asc
 fingerprint=$(gpg --show-keys --with-colons /tmp/llvm.asc | awk -F: '$1 == "fpr" { print $10; exit }')
 test "$fingerprint" = 6084F3CF814B57C1CF12EFD515CF4D18AF4F7421
