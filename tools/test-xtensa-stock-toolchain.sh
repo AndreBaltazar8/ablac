@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# CI-only stock-parent build. No LLVM source build or global patched tools.
+set -euo pipefail
+[[ ${GITHUB_ACTIONS:-} == true ]] || { echo 'stock Xtensa toolchain probe is CI-only' >&2; exit 2; }
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$root"
+out="$root/build/xtensa-stock"
+mkdir -p "$out"
+export ABLA_NATIVE_JOBS=4 ABLA_CODEGEN_JOBS=4 ABLA_SYSROOT="$root"
+unset ABLA_XTENSA_LLVM_ROOT
+llc --version > "$out/parent-llc-version.txt"
+if grep -q 'xtensa ' "$out/parent-llc-version.txt"; then
+    echo 'expected the ordinary stock parent LLVM without Xtensa' >&2
+    exit 1
+fi
+tools/bootstrap-compiler.sh "$out/bootstrap.bin"
+ABLA_COMPILER_PAYLOAD="$out/bootstrap.bin" ABLA_MAX_MEMORY_MB=4096 ABLA_MAX_SECONDS=1200 \
+    tools/run-limited-compiler.sh build src/orc_main.ab -o "$out/compiler.bin" --no-cache
+case $(uname -s) in
+    Linux)
+        tools/package-linux-toolchain.sh "$out/compiler.bin" "$root" "$out/toolchain.tar.gz"
+        ;;
+    Darwin)
+        tools/package-macos-toolchain.sh "$(uname -m)" "$out/compiler.bin" "$root" "$out/toolchain.tar.gz"
+        ;;
+    *) exit 2 ;;
+esac
+mkdir -p "$out/installed"
+tar -xzf "$out/toolchain.tar.gz" -C "$out/installed"
+prefix=$(find "$out/installed" -mindepth 1 -maxdepth 1 -type d -print)
+python3 tools/test-xtensa-routing-installed.py "$prefix" "$out"

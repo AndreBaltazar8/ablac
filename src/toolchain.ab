@@ -1,3 +1,4 @@
+import "xtensa_tools.ab"
 import "apple_build.ab"
 import "backend/llvm/backend.ab"
 import "module.ab"
@@ -1204,26 +1205,49 @@ fun bootstrapExternalEmitObjectForTarget(
     llvmTriple: string,
     fast: bool
 ): int {
+    val tools = bootstrapXtensaLlvmTools(llvmTriple)
+    if (tools.error != "") {
+        linuxPrintStandardError(tools.error)
+        return 188
+    }
+    bootstrapExternalEmitObjectForTargetWithTools(llvmPath, objectPath, llvmTriple, fast, tools)
+}
+
+fun bootstrapExternalEmitObjectForTargetWithTools(
+    llvmPath: string,
+    objectPath: string,
+    llvmTriple: string,
+    fast: bool,
+    tools: BootstrapXtensaTools
+): int {
     // Cross-target LLVM still contains the complete portable runtime. Even a
     // fast build must prune unreachable host-only implementation details before
     // llc validates target-specific inline assembly and register constraints.
-    val inputPath = "$objectPath.bc"
     val targetLlvmPath = "$objectPath.target.ll"
     val mcuTarget = bootstrapTextContains(llvmTriple, "xtensa") ||
         bootstrapTextContains(llvmTriple, "riscv32") ||
         bootstrapTextContains(llvmTriple, "thumb")
     var optimizationSource = llvmPath
     var prepared = true
+    var inspectAssembly = tools.root != "" && llvmPath.endsWith(".bc")
     // Bitcode comes straight from the module, which defines no runtime panic to patch.
     val bitcodeInput = llvmPath.size > 3 &&
         llvmPath.slice(llvmPath.size - 3, llvmPath.size) == ".bc"
     if (llvmTriple != "x86_64-unknown-linux-gnu" && !bitcodeInput) {
-        prepared = Path(targetLlvmPath).writeTextAtomic(
-            bootstrapTargetNeutralPanicRuntime(Path(llvmPath).readText())
-        )
+        val source = bootstrapTargetNeutralPanicRuntime(Path(llvmPath).readText())
+        inspectAssembly = tools.root != "" &&
+            (bootstrapTextContains(source, "ABLA_XTENSA_") ||
+             bootstrapTextContains(source, "WindowVectors"))
+        prepared = Path(targetLlvmPath).writeTextAtomic(source)
         if (prepared) optimizationSource = targetLlvmPath
     }
-    val optimize = linuxCommand("opt")
+    // GNU-as layout markers must not silently become LLVM-assembler comments.
+    // Inspect after dead-code removal, so unused SDK vector helpers don't
+    // constrain ordinary programs. Only this uncommon path prints optimized IR.
+    val inputPath = if (inspectAssembly) "$objectPath.checked.ll" else "$objectPath.bc"
+    val optimize = bootstrapXtensaCommand(tools, "opt")
+    if (inspectAssembly) optimize.argument("-S")
+    bootstrapXtensaTargetOptions(tools, optimize)
     optimize.argument(if (fast) {
         // Scalar promotion, local cleanup and the inliner (small helpers and
         // column accessors dominate generated code), without O1's loop and
@@ -1261,8 +1285,19 @@ fun bootstrapExternalEmitObjectForTarget(
     optimize.argument("-o")
     optimize.argument(inputPath)
     var status = if (prepared) optimize.run() else 1
+    if (status == 0 && inspectAssembly) {
+        val optimized = Path(inputPath).readText()
+        if (bootstrapTextContains(optimized, "ABLA_XTENSA_") ||
+            bootstrapTextContains(optimized, "WindowVectors")) {
+            linuxPrintStandardError(
+                "error[E_XTENSA_EXTERNAL_ASSEMBLER]: retained boot/vector assembly needs the ESP SDK's GNU-as layout step; the companion handles ordinary Abla code generation, not GNU layout directives\n"
+            )
+            status = 189
+        }
+    }
     if (status == 0) {
-        val emitObject = linuxCommand("llc")
+        val emitObject = bootstrapXtensaCommand(tools, "llc")
+        bootstrapXtensaTargetOptions(tools, emitObject)
         emitObject.argument("-filetype=obj")
         // A WebAssembly module links as one static module (no -pie), so
         // position-independent code only reaches its globals through the GOT,
@@ -1270,10 +1305,16 @@ fun bootstrapExternalEmitObjectForTarget(
         // under PIC.
         val staticWasm = fast && bootstrapTextContains(llvmTriple, "wasm")
         emitObject.argument(
-            if (staticWasm) "-relocation-model=static" else "-relocation-model=pic"
+            if (staticWasm || tools.root !=
+                "") "-relocation-model=static" else "-relocation-model=pic"
         )
         emitObject.argument(if (fast) "-O0" else "-O2")
         emitObject.argument("-mtriple=$llvmTriple")
+        if (tools.root != "") {
+            if (tools.directCalls) emitObject.argument("-xtensa-direct-calls")
+            if (tools.narrowBranches) emitObject.argument("-xtensa-narrow-branches")
+            if (tools.textLiterals) emitObject.argument("-xtensa-text-section-literals")
+        }
         if (bootstrapTextContains(llvmTriple, "wasm")) {
             for (option in bootstrapWasmExceptionOptions()) emitObject.argument(option)
         }
@@ -1289,6 +1330,7 @@ fun bootstrapExternalEmitObjectForTarget(
         status = emitObject.run()
     }
     Path(targetLlvmPath).remove()
+    if (inspectAssembly) Path(inputPath).remove()
     status
 }
 
@@ -3086,7 +3128,8 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     var irCache: BootstrapIrCacheState,
     allowCache: bool,
     target: BootstrapTargetDescriptor,
-    artifact: string
+    artifact: string,
+    targetToolsIdentity: string = ""
 ): BootstrapNativeBuild {
     // A libc-free target is not necessarily the built-in raw Linux process.
     // An entry symbol identifies the latter; external module formats provide
@@ -3376,7 +3419,9 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             backendIdentity =
                 "$backendIdentity\nbalanced-passes:${llvmPassesBalanced()}\nbalanced-inline-threshold:${llvmBalancedAotInlineThreshold()}"
         }
-        if (bootstrapTextContains(cacheProfile, "cross-")) {
+        if (targetToolsIdentity != "") {
+            backendIdentity = "$backendIdentity\n$targetToolsIdentity"
+        } else if (bootstrapTextContains(cacheProfile, "cross-")) {
             backendIdentity =
                 "$backendIdentity\nopt:${linuxCommand("opt").argument(
                     "--version"
@@ -4411,7 +4456,8 @@ fun bootstrapNativeArtifactBuildWithEmitterModuleState(
     useCache: bool,
     target: BootstrapTargetDescriptor,
     artifact: string,
-    var moduleState: BootstrapModuleState
+    var moduleState: BootstrapModuleState,
+    targetToolsIdentity: string = ""
 ): BootstrapNativeBuild {
     val irCache = bootstrapIrTransientState()
     bootstrapNativeBuildWithEmitterStateCache(
@@ -4423,7 +4469,8 @@ fun bootstrapNativeArtifactBuildWithEmitterModuleState(
         irCache,
         useCache,
         target,
-        artifact
+        artifact,
+        targetToolsIdentity
     )
 }
 

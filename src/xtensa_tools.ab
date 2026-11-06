@@ -1,0 +1,222 @@
+// Target-local LLVM selection. Never loads the companion into the compiler or
+// changes PATH. One immutable selection is shared by emission and cache keys.
+import "module_paths.ab"
+import "abla/json"
+import "abla/text"
+import "abla/sys/linux/fs"
+import "abla/sys/linux/process"
+import "abla/sys/linux/io"
+import "abla/platform/host"
+import "abla/llvm/orc"
+
+class BootstrapXtensaTools(
+    val root: string,
+    val opt: string,
+    val llc: string,
+    val cpu: string,
+    val features: string,
+    val directCalls: bool,
+    val narrowBranches: bool,
+    val textLiterals: bool,
+    val identity: string,
+    val error: string
+)
+
+fun bootstrapXtensaTarget(triple: string): bool =
+    triple == "xtensa" || triple.startsWith("xtensa-")
+
+fun bootstrapXtensaEmptyTools(error: string = ""): BootstrapXtensaTools =
+    BootstrapXtensaTools("", "opt", "llc", "", "", false, false, false, "", error)
+
+// Unlike source/module identities, executable paths must follow links. Resolve
+// every component, including the installed `current` link, before retaining it.
+fun bootstrapXtensaPhysicalPath(path: string): string {
+    if (path == "" || path.size > 4096) return ""
+    var pending = if (path.startsWith("/")) path else "${currentDirectory().text}/$path"
+    var hops = 0
+    while (hops < 40) {
+        val parts = pending.split("/")
+        var prefix = "/"
+        var index = 0
+        var redirected = false
+        while (index < parts.size && !redirected) {
+            val part = parts[index]
+            if (part == "..") prefix = Path(prefix).parent().text
+            else if (part != "" && part != ".") {
+                val candidate = Path(prefix).child(part)
+                if (candidate.linkInfo().kind == 4) {
+                    val target = candidate.linkTarget()
+                    if (target == "") return ""
+                    pending = if (target.startsWith("/")) target else "${prefix}/$target"
+                    var rest = index + 1
+                    while (rest < parts.size) {
+                        pending = "$pending/${parts[rest]}"
+                        rest = rest + 1
+                    }
+                    redirected = true
+                } else prefix = candidate.text
+            }
+            index = index + 1
+        }
+        if (!redirected) return prefix
+        hops = hops + 1
+    }
+    ""
+}
+
+fun bootstrapXtensaHostPlatform(): string {
+    val triple = llvmDefaultTargetTriple()
+    val arm = triple.startsWith("aarch64-") || triple.startsWith("arm64-")
+    val architecture = if (arm) "arm64" else if (triple.startsWith("x86_64-")) "x86_64" else ""
+    if (architecture == "") "" else "$architecture-${if (ablaHostIsMacOS()) "macos" else "linux"}"
+}
+
+fun bootstrapXtensaHex(text: string, size: int): bool {
+    if (text.size != size) return false
+    for (byte in text) {
+        if (!((byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 102))) return false
+    }
+    true
+}
+
+fun bootstrapXtensaRelativeFile(path: string): bool {
+    if (path == "" || path.size > 4096 || path.startsWith("/")) return false
+    for (byte in path) {
+        if (byte == 0 || byte == 10 || byte == 13) return false
+    }
+    for (part in path.split("/")) {
+        if (part == "" || part == "." || part == "..") return false
+    }
+    true
+}
+
+fun bootstrapXtensaFlag(name: string, fallback: bool): bool {
+    val configured = linuxEnvironment(name)
+    if (!configured.found || configured.value == "") fallback else configured.value == "1"
+}
+
+fun bootstrapXtensaError(code: string, detail: string): BootstrapXtensaTools =
+    bootstrapXtensaEmptyTools("error[$code]: $detail\n")
+
+fun bootstrapXtensaLlvmTools(triple: string): BootstrapXtensaTools {
+    if (!bootstrapXtensaTarget(triple)) return bootstrapXtensaEmptyTools()
+    val configured = linuxEnvironment("ABLA_XTENSA_LLVM_ROOT")
+    val image = bootstrapXtensaPhysicalPath(Path("/proc/self/exe").linkTarget())
+    val toolchain = Path(image).parent().parent()
+    val requested = if (configured.found && configured.value != "") configured.value
+        else toolchain.child("lib/abla/xtensa-llvm/current").text
+    val root = bootstrapXtensaPhysicalPath(requested)
+    val manifestPath = Path(root).child("manifest.json")
+    val info = manifestPath.info()
+    if (root == "" || !info.isFile()) {
+        return bootstrapXtensaError("E_XTENSA_LLVM_MISSING",
+            "Xtensa needs its optional LLVM companion; run '${toolchain.child("bin/abla-install-xtensa").text} --version 23.1.3-1', or set ABLA_XTENSA_LLVM_ROOT to a manifested cohort (no tools are downloaded by a build)")
+    }
+    if (info.size <= 0 || info.size > 65536) {
+        return bootstrapXtensaError("E_XTENSA_LLVM_MANIFEST",
+            "invalid companion manifest size at $root")
+    }
+    val raw = manifestPath.readText()
+    val parsed = jsonParse(raw, JsonLimits(65536, 8, 1024, 8192, 256, true))
+    if (!parsed.succeeded || !parsed.value.isObject()) {
+        return bootstrapXtensaError("E_XTENSA_LLVM_MANIFEST", "invalid companion manifest at $root")
+    }
+    val manifest = parsed.value
+    val development = manifest.getString("origin") == "nix-store"
+    if (manifest.getInt("schema") != 1 ||
+        (manifest.getString("origin") != "" && !development) ||
+        (development && !root.startsWith("/nix/store/")) ||
+        !manifest.getString("version").startsWith("abla-xtensa-llvm-")) {
+        return bootstrapXtensaError("E_XTENSA_LLVM_MANIFEST",
+            "unsupported companion manifest at $root")
+    }
+    if (!development && (!bootstrapXtensaHex(manifest.getString("sourceCommit"), 40) ||
+        !bootstrapXtensaHex(manifest.getString("sourceArchiveSha256"), 64))) {
+        return bootstrapXtensaError("E_XTENSA_LLVM_MANIFEST",
+            "companion source identity is missing at $root")
+    }
+    if (manifest.getString("platform") != bootstrapXtensaHostPlatform()) {
+        return bootstrapXtensaError("E_XTENSA_LLVM_HOST", "companion at $root is for another host")
+    }
+    val version = manifest.getString("llvmVersion")
+    val parent = llvmLibraryVersion()
+    if (version == "" || version.split(".")[0] != parent.split(".")[0]) {
+        return bootstrapXtensaError("E_XTENSA_LLVM_VERSION",
+            "companion LLVM '$version' is incompatible with compiler LLVM '$parent'")
+    }
+    val files = manifest.get("files")
+    if (!files.isObject() || files.keys.size > 256 ||
+        !files.has("bin/opt") || !files.has("bin/llc")) {
+        return bootstrapXtensaError("E_XTENSA_LLVM_MANIFEST",
+            "companion must describe opt, llc and its private libraries")
+    }
+    var identity = "abla-xtensa-tools-v1\nmanifest:${raw.size}:$raw"
+    var opt = ""
+    var llc = ""
+    var libraries = 0
+    for (name in files.keys) {
+        if (!bootstrapXtensaRelativeFile(name) || !bootstrapXtensaHex(files.getString(name), 64)) {
+            return bootstrapXtensaError("E_XTENSA_LLVM_MANIFEST",
+                "invalid companion file identity at $root")
+        }
+        val path = bootstrapXtensaPhysicalPath(Path(root).child(name).text)
+        val measured = Path(path).info()
+        if (!measured.isFile() || measured.size <= 0 ||
+            (development && !path.startsWith("/nix/store/")) ||
+            (!development && !path.startsWith("$root/"))) {
+            return bootstrapXtensaError("E_XTENSA_LLVM_FILE",
+                "missing or invalid companion file '$name' at $root; reinstall or run abla-install-xtensa --verify")
+        }
+        if (name == "bin/opt") opt = path
+        if (name == "bin/llc") llc = path
+        if (name.startsWith("lib/libLLVM")) libraries = libraries + 1
+        // No DSO contents are read here. Full hashes are checked at install,
+        // activation and explicit --verify, even if size/mtime are unchanged.
+        identity = "$identity\nfile:${path.size}:$path:${measured.size}:${measured.revision}"
+    }
+    if (libraries == 0 || (Path(opt).permissions() & 0o111) == 0 ||
+        (Path(llc).permissions() & 0o111) == 0) {
+        return bootstrapXtensaError("E_XTENSA_LLVM_FILE",
+            "companion private library or executable permissions are missing at $root")
+    }
+    val chipSetting = linuxEnvironment("ABLA_ESP_CPU")
+    val chip = if (chipSetting.found && chipSetting.value != "") chipSetting.value else "esp32"
+    if (chip != "esp32" && chip != "esp32s2" && chip != "esp32s3") {
+        return bootstrapXtensaError("E_XTENSA_CPU",
+            "ABLA_ESP_CPU '$chip' is not an Xtensa CPU (use esp32, esp32s2 or esp32s3)")
+    }
+    val cpu = if (chip == "esp32s2") chip else "esp32"
+    val features = if (chip == "esp32s3") "-dfpaccel" else ""
+    val direct = bootstrapXtensaFlag("ABLA_XTENSA_DIRECT_CALLS", true)
+    val narrow = bootstrapXtensaFlag("ABLA_XTENSA_NARROW_BRANCHES", true)
+    val literals = bootstrapXtensaFlag("ABLA_XTENSA_TEXT_LITERALS", false)
+    identity =
+        "$identity\nchip:$chip\ncpu:$cpu\nfeatures:$features\ndirect:$direct\nnarrow:$narrow\nliterals:$literals\nrelocation:static\nsections:function,data"
+    val tools = BootstrapXtensaTools(root, opt, llc, cpu, features, direct, narrow, literals,
+        identity, "")
+    for (name in ["opt", "llc"]) {
+        val reported = bootstrapXtensaCommand(tools, name).argument("--version").captureText()
+        if (!reported.contains("LLVM version $version\n") ||
+            (name == "llc" && !reported.contains("xtensa"))) {
+            return bootstrapXtensaError("E_XTENSA_LLVM_VERSION",
+                "companion $name at $root does not report LLVM $version with Xtensa support")
+        }
+    }
+    tools
+}
+
+fun bootstrapXtensaCommand(tools: BootstrapXtensaTools, name: string): LinuxCommand {
+    val command = linuxCommand(if (name == "opt") tools.opt else tools.llc)
+    if (tools.root != "" && ablaHostIsMacOS()) {
+        command.environment("DYLD_LIBRARY_PATH", "${tools.root}/lib")
+    }
+    command
+}
+
+fun bootstrapXtensaTargetOptions(tools: BootstrapXtensaTools, var command: LinuxCommand): void {
+    if (tools.root != "") {
+        command.argument("-mcpu=${tools.cpu}")
+        if (tools.features != "") command.argument("-mattr=${tools.features}")
+    }
+    return
+}

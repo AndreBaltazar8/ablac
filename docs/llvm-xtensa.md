@@ -34,8 +34,9 @@ André chose a separately versioned, optional download. It does not go into ever
 Abla release or replace the parent LLVM or Clang. Revision
 [23.1.3-1](https://github.com/AndreBaltazar8/llvm-project/releases/tag/abla-xtensa-llvm-23.1.3-1)
 is published for all three hosts, and explicit verified installation is implemented.
-Compiler routing remains a separate phase: released compilers still need the Nix
-setup for Xtensa until that change and its gates pass. The
+The source compiler routes Xtensa through that installed cohort; releases up to
+v0.2.48 still require the older Nix setup. The routing change's validation is
+tracked in the [design and evidence](design/xtensa-companion.md). The
 [design and gate list](design/xtensa-companion.md) records that status.
 
 The private cohort is `opt`, `llc` and `libLLVM`, with the Xtensa backend, for
@@ -106,6 +107,49 @@ compiler routing uses the selected immutable revision's manifest and file
 identity in its cache key. After copying or restoring a toolchain, run
 `--verify` before using it. Read-only file modes guard accidental writes, not a
 malicious owner who can replace the installer, catalog or compiler themselves.
+
+### Target-local selection
+
+For an `xtensa-*` LLVM triple, the source compiler resolves the cohort once,
+before frontend work or a cache lookup. A packaged compiler finds
+`lib/abla/xtensa-llvm/current` relative to its actual running image. It resolves
+that link to one immutable revision and keeps the same selection for both
+optimization and object generation, including the cache identity. An explicit
+`ABLA_XTENSA_LLVM_ROOT` selects another manifested cohort. No build downloads
+tools, loads its private LLVM into the parent, or changes global `PATH`.
+Native, Wasm, RISC-V and other target selection stays unchanged.
+
+The Nix shell describes its already-selected patched LLVM in a small immutable
+store manifest and supplies that root through `ABLA_XTENSA_LLVM_ROOT` (an
+explicit existing value wins). This metadata derivation does not compile LLVM;
+the existing patch/pin/source-build policy is unchanged. A shell without Xtensa
+does not set the variable. Nix helpers and libraries stay in their immutable
+store outputs rather than being copied into a portable installation.
+
+The compiler validates schema, host, LLVM major compatibility, file presence,
+permissions and identities. It invokes the selected tools' `--version` before
+using them. Missing or invalid cohorts produce `E_XTENSA_LLVM_*` diagnostics,
+even if the object cache is warm. The selected manifest bytes and every listed
+file's resolved path, size and nanosecond revision join the cache key; library
+changes therefore invalidate objects without relying on `opt --version`.
+This is the fast identity check described above, not per-build content hashing.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `ABLA_ESP_CPU` | `esp32` | `esp32`, `esp32s2`, or `esp32s3`; S3 uses LLVM's `esp32` with `-dfpaccel` |
+| `ABLA_XTENSA_DIRECT_CALLS` | `1` | Enable the patched direct CALL8 lowering |
+| `ABLA_XTENSA_NARROW_BRANCHES` | `1` | Enable proven-in-range narrow branches |
+| `ABLA_XTENSA_TEXT_LITERALS` | `0` | Put literal pools in each function's text section |
+
+CPU/features reach both opt and llc. Xtensa always uses static relocation and
+function/data sections, including `--fast`. All resolved settings join the cache
+identity. A RISC-V ESP CPU with an Xtensa triple is an `E_XTENSA_CPU` error.
+
+Retained `ABLA_XTENSA_*` or `WindowVectors` layout markers require the ESP SDK's
+GNU-as preparation and produce `E_XTENSA_EXTERNAL_ASSEMBLER`, rather than silently
+being treated as LLVM-assembler comments. The check follows optimization so dead
+helpers do not constrain an ordinary module. This companion does not implement
+the SDK's boot/vector assembly step; that boundary needs framework orchestration.
 
 ### Building a companion (maintainers)
 

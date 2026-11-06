@@ -1,6 +1,6 @@
 # Optional Xtensa LLVM companion
 
-Status: phases 1–2 ready for review; revision 23.1.3-1 published, canonical installer verified on all three hosts, 2026-11-06.
+Status: phases 1–2 merged at dffc60aa; phase 3 routing prototype under validation, 2026-11-06.
 André chose the optional, separately versioned companion after the
 [feasibility measurements](xtensa-release-feasibility.md). The phases 2–3 design
 below is approved; installer and compiler routing remain separate handoffs.
@@ -352,3 +352,26 @@ result JSON and negative messages are retained. The 21 offline controls,
 actionlint, shellcheck and touched doc-example filter also pass. No compiler or
 stdlib source changed, and no claim is made that the current compiler routes
 Xtensa through this cohort: that is the separately reviewed phase 3.
+
+
+## Phase 3 validation in progress
+
+The prototype on `feat-xtensa-routing` starts at `dffc60aa`. Selection is an
+immutable value captured by the emitter and explicitly passed to the native
+cache identity; it is not a process-global context. Target-local tool/CPU/flag
+controls pass using real LLVM behind instrumented wrappers, including poisoned
+PATH, helper/library/manifest changes, warm-cache missing-file refusals, and a
+`current` link switched during the version check. Live GNU layout markers refuse;
+markers eliminated by optimization pass.
+
+Local stages 2 and 3 are byte-identical with SHA-256
+`d482834dc5e6c5ad607b061b0b50707c9cf097fbdc0fede0c700096f873cfba7`.
+The two compiler builds peaked at 1,375,376 and 1,380,088 KiB with four CPUs.
+These are verification samples, not a wall-time performance claim.
+
+The stale embedded checkout `7e9ce53` fails with the same 71 semantic error
+headings under released v0.2.48, exact `dffc60aa` and the prototype; its first
+error is `region.noescape-effect:nvs_flash_init`. The gate uses the previously
+approved `da5a939` checkout instead. No embedded sources are modified. The real
+firmware peak, check-source, stock-parent Linux/Mac CI, host-output comparisons
+and downstream compatibility gates are still pending at this prototype commit.
