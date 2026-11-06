@@ -237,3 +237,22 @@ installer. This does not publish or activate an archive in a user's toolchain,
 and does not replace the canonical catalog. The report records
 `unpublishedTestFixture: true`. After publication the same probe runs without
 the test-fixture input and checks the actual published catalog and downloads.
+
+The [three-platform installer run 42242927842](https://github.com/AndreBaltazar8/ablac/actions/runs/42242927842)
+passed at `90204bef`, with the explicit unpublished input. It used the published
+v0.2.48 parent toolchains, relocated under a directory with spaces. The installer
+left all 472 original Linux files/symlinks and all 115 files/symlinks on each
+Mac unchanged, including their modes. Offline install, idempotent activation
+and full verification passed. Assembly, direct object and optimized object
+hashes matched the Nix digests above on every host.
+
+Each host then flipped a byte in the **real private libLLVM**, preserving its
+size and nanosecond modification time. `--verify` rejected it with a file
+SHA-256 mismatch before invoking a helper. Restoring the byte, timestamp and
+mode allowed a fresh verification to pass. Raw results and negative-control
+messages are [retained beside the other evidence](xtensa-companion-data/unpublished-installer-run.json).
+There are also 21 passing offline catalog/installer controls.
+
+This proves the installer against the frozen dry-run cohorts, **not** against
+published companion assets. Only the canonical catalog fill and the corresponding
+live-input probe remain; compiler routing is still a separate phase.
