@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -51,12 +52,13 @@ with tempfile.TemporaryDirectory(prefix='abla-xtensa-assembly-') as directory:
             assert actual.replace(b'movi.n', b'movi', 1) != expected, f'{name}: broken transform was not detected'
     subprocess.run([str(binary), str(input_path), str(output_path), 'module'], check=True, timeout=60)
     encoded = output_path.read_text()
-    assert encoded.startswith('target triple = "xtensa-esp-unknown-elf"\nmodule asm "')
+    assert encoded.startswith('source_filename = "abla"\ntarget triple = "xtensa-esp-unknown-elf"\nmodule asm "')
     assert '\\0A' in encoded and '.p2align 2' in encoded
     payload = encoded.split('module asm "', 1)[1].rsplit('"', 1)[0]
     decoded = re.sub(rb'\\([0-9A-F]{2})', lambda match: bytes([int(match[1], 16)]), payload.encode())
-    assert decoded.startswith(firmware), 'module encoding changed the assembly body'
-    alignment = decoded[len(firmware):]
+    expected_body = firmware.removeprefix(b'\t.file\t"abla"\n')
+    assert decoded.startswith(expected_body), 'module encoding changed the assembly body'
+    alignment = decoded[len(expected_body):]
     for section in [b'.iram1.abla.freertos.yield.literal', b'.iram1.abla.freertos.coproc_exc_hook.literal']:
         assert b'.pushsection ' + section + b',"ax",@progbits\n.p2align 2\n.popsection\n' in alignment
 
@@ -74,5 +76,21 @@ with tempfile.TemporaryDirectory(prefix='abla-xtensa-assembly-') as directory:
     assert decoded.startswith(section_edges)
     pools = re.findall(rb'\.pushsection ([^,\n]+),"ax",@progbits\n\.p2align 2\n\.popsection', decoded[len(section_edges):])
     assert set(pools) == {b'.literal.root', b'.iram.child.literal', b'.literal', b'.literal.quoted'}, pools
+
+    # The target-independent empty-module envelope must not encode an input
+    # filename/PID. ELF data directives let stock host llc prove this offline.
+    llc = shutil.which('llc')
+    if llc:
+        input_path.write_bytes(b'\t.file\t"abla"\n.section .rodata.abla_probe,"a",@progbits\n.long 42\n')
+        subprocess.run([str(binary), str(input_path), str(output_path), 'module'], check=True, timeout=60)
+        objects = []
+        for stem in ['first-process-123', 'other-process-987']:
+            module, obj = work / (stem + '.ll'), work / (stem + '.o')
+            module.write_bytes(output_path.read_bytes())
+            subprocess.run([llc, '-mtriple=x86_64-unknown-linux-gnu', '-filetype=obj', str(module), '-o', str(obj)], check=True, timeout=60)
+            objects.append(obj.read_bytes())
+        assert objects[0] == objects[1], 'temporary module filename leaked into the object'
+    else:
+        print('SKIP object-envelope reproducibility: host llc is unavailable')
 
 print('PASS Xtensa assembly: SDK exact text on operand edges and complete firmware, raw regions, CFI, and negative control')

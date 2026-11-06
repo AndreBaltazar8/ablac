@@ -55,6 +55,14 @@ for entry in reference['objects']:
     actual = companions.file_sha256(output)
     assert actual == entry['sha256'], (entry['name'], actual, entry['sha256'])
     results.append({'name': entry['name'], 'sha256': actual})
+# A distinct process and output name cannot introduce a temporary FILE symbol.
+entry = reference['objects'][0]
+repeat = out / 'different-process-output.o'
+run(compiler, 'build', project / entry['source'], '-o', repeat,
+    '--target-triple', 'xtensa-esp-unknown-elf', '--object-format', 'elf',
+    '--emit', 'object', '--no-cache', '--no-debug',
+    env=dict(env, ABLA_ESP_CPU=entry['cpu']))
+assert companions.file_sha256(repeat) == entry['sha256'], 'output path or PID changed object bytes'
 # Without the launcher, poison both PATH tools. Automatic selection must still
 # derive the same installed cohort from the actual compiler image.
 poison = out / 'poison'

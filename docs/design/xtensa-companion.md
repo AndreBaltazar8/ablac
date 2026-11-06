@@ -428,3 +428,23 @@ The frozen `da5a939` firmware build passes the 4 GiB launcher, peaking at
 all 558 allocatable section bodies and every section alignment match, with
 no added sections. The remaining 68 bytes are non-loadable metadata. This
 single peak is a capacity check, not evidence of an RSS improvement.
+
+
+### Empty-module file-symbol correction
+
+The first installed density probe (run `42285059322`) failed exact object hashes
+on Linux and arm64 macOS. The loadable content was equal, but LLVM's empty-module
+wrapper acquired its temporary input filename, including the PID, as an extra
+ELF `STT_FILE` symbol. This was a reproducibility defect, not an acceptable
+host-specific difference. The source wrapper now sets `source_filename = "abla"`
+and replaces only llc's initial unnumbered `.file "abla"` directive; numbered
+DWARF file directives remain intact. Stage identity is `xtensa-assembly-v2`.
+The offline test assembles identical envelopes at two different filenames with
+stock host LLVM and requires identical whole objects. The installed gate also
+repeats a cold build at another output name.
+
+With that correction the scratch firmware object is byte-identical to the SDK
+wrapper, 144,824 bytes, SHA-256
+`8d09555ca807d581fa02d48ebccfe5ec88e1e584601ffb6b657a50339a7b471c`.
+This supersedes the earlier 36/68-byte metadata allowances. Final source-frozen
+compiler and all-platform gates are still being repeated.
