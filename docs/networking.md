@@ -571,6 +571,10 @@ times out leaves the connection unusable.
 of these, and `webSocketTlsClient` for everything except waiting for a frame, which
 a quiet conversation can make as long as it likes.
 
+`TlsConnection.handle` and `TlsListener.handle` contain native control pointers.
+Only `-1` means failed or closed: use `handle == -1`, never a sign check.
+A live Android heap pointer can be negative because its top byte is tagged.
+
 A peer that resets the socket fails the operation that notices it. OpenSSL's
 writes would raise `SIGPIPE`, so `TlsConnection` and `abla/http/async` hold the
 signal around each OpenSSL call, and the thread's mask and the program's handler

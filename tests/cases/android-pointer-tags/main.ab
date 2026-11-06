@@ -1,0 +1,163 @@
+import "abla/memory"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+import "abla/runtime/scalar"
+import "abla/runtime/self"
+import "@HOST_PLATFORM@"
+import "abla/crypto/bignum"
+import "abla/ct"
+
+trusted noescape extern:"c" fun tagged_set_mode(mode: int): void
+trusted noescape extern:"c" fun tagged_free_count(): int
+trusted noescape extern:"c" fun tagged_probe_free(pointer: i64*): void
+trusted noescape extern:"c" fun tagged_probe_realloc(pointer: i64*, size: int): i64*
+
+class TaggedItem(val text: string, val numbers: array<int>)
+
+@export("tagged_values")
+trusted fun taggedValues(): int {
+    tagged_set_mode(1)
+    memorySetManualCollection()
+    memorySetFreeBlockLimit(0)
+    val native = nativeByteBuffer(32)
+    val address = nativePointerAddress(native.address)
+    if ((address >>> 56) != 0xb4) return 1
+    native.store(0, 97)
+    native.store(1, 98)
+    native.store(2, 99)
+    native.store(3, 100)
+    val adopted = native.adoptString(4)
+    if (adopted != "abcd" || nativeStringDataAddress(adopted) != address) return 2
+    val slice = adopted.slice(1, 3)
+    var rope = ""
+    var i = 0
+    while (i < 128) {
+        rope = "$rope$adopted"
+        i += 1
+    }
+    val items: array<TaggedItem> = []
+    i = 0
+    while (i < 100) {
+        items.append(TaggedItem("item-$i", [i, i + 1]))
+        i += 1
+    }
+    memoryCollect()
+    if (slice != "bc" || rope.size != 512 || rope[511] != 100) return 3
+    if (items[99].text != "item-99" || items[99].numbers[1] != 100) return 4
+    if (tagged_free_count() == 0) return 5
+    0
+}
+
+@export("tagged_pages")
+trusted fun taggedPages(): int {
+    tagged_set_mode(0)
+    memorySetManualCollection()
+    memorySetFreeBlockLimit(0)
+    val small: array<int> = []
+    val large: array<int> = []
+    var i = 0
+    while (i < 3000) {
+        small.append(__ablaRuntimePlatformAllocateLayout(16384, 1))
+        i += 1
+    }
+    i = 0
+    while (i < 70) {
+        large.append(__ablaRuntimePlatformAllocateLayout(40000, 1))
+        i += 1
+    }
+    // Invoke the actual production directory builder, including list growth,
+    // on positive and negative tagged addresses. 16 KiB blocks also force bitmap
+    // and hash-table growth. No copied collector algorithm.
+    __ablaRuntimeHostCollectionPagesBuild()
+    for (payload in small) {
+        val page = (payload - 32) >>> 16
+        if (__ablaRuntimeHostCollectionBitmapOf(page) == 0) return 21
+        if (__ablaRuntimeHostCollectionLocate(payload) != payload - 32) return 22
+        if (__ablaRuntimeHostCollectionLocate(payload + 16383) != payload - 32) return 23
+        if (u64(payload) < u64(__ablaRuntimeHostCollectionMinimum) ||
+            u64(payload + 16384) > u64(__ablaRuntimeHostCollectionMaximum)) return 24
+    }
+    i = 1
+    while (i < __ablaRuntimeHostCollectionLargeCount) {
+        val previous = ablaRuntimeLoadI64(__ablaRuntimeHostCollectionRanges + (i - 1) * 8)
+        val next = ablaRuntimeLoadI64(__ablaRuntimeHostCollectionRanges + i * 8)
+        if (u64(previous) > u64(next)) return 25
+        i += 1
+    }
+    for (payload in large) {
+        if (__ablaRuntimeHostCollectionLocate(payload) != payload - 32) return 26
+        if (__ablaRuntimeHostCollectionLocate(payload + 39999) != payload - 32) return 27
+    }
+    // Raw table storage must be returned with the allocator's original tag.
+    free(nativePointerFromAddress(__ablaRuntimeHostCollectionPages))
+    free(nativePointerFromAddress(__ablaRuntimeHostCollectionBitmaps))
+    free(nativePointerFromAddress(__ablaRuntimeHostCollectionRanges))
+    __ablaRuntimeHostCollectionPages = 0
+    __ablaRuntimeHostCollectionBitmaps = 0
+    __ablaRuntimeHostCollectionRanges = 0
+    for (payload in small) __ablaRuntimePlatformFree(payload)
+    for (payload in large) __ablaRuntimePlatformFree(payload)
+    if (tagged_free_count() < 70) return 28
+    0
+}
+
+@export("tagged_descriptor")
+trusted fun taggedDescriptor(): int {
+    tagged_set_mode(1)
+    memorySetManualCollection()
+    val descriptor = nativeByteBuffer(32)
+    descriptor.storeI64(0, 12345)
+    descriptor.storeI64(8, 16)
+    val address = nativePointerAddress(descriptor.address)
+    if ((address >>> 56) != 0xb4) return 31
+    val marked = address + 4611686018427387904
+    val value = __ablaRuntimeObjectCreate(12345, marked)
+    if (__ablaRuntimeTag(value) != 8) return 32
+    0
+}
+
+@export("tagged_rsa")
+trusted fun taggedRsa(): int {
+    tagged_set_mode(1)
+    memorySetFreeBlockLimit(0)
+    val top = 0xb4 << 56
+    if (!bnSecretRangeValid(top | 4096, 1)) return 41
+    if (bnSecretRangeValid(top, 1)) return 42
+    if (bnSecretRangeValid(top | 72057594037927935, 1)) return 43
+    // TBI aliases overlap even when the public tag bytes differ.
+    if (bnSecretDisjoint(top | 4096, 2, (0x54 << 56) | 4100, 1)) return 44
+    val q = bnAllocate(1)
+    val r = bnAllocate(1)
+    val n = bnAllocate(1)
+    val d = bnAllocate(1)
+    val scratch = bnAllocate(1)
+    bnStore(n, secretU32(u32(10)))
+    bnStore(d, secretU32(u32(2)))
+    val success = bnSecretDivModBody(q, r, n, 1, d, 1, scratch).declassify()
+    val ok = success != u32(0) && bnLoad(q).declassify() == u32(5) &&
+        bnLoad(r).declassify() == u32(0)
+    bnRelease(q, 1)
+    bnRelease(r, 1)
+    bnRelease(n, 1)
+    bnRelease(d, 1)
+    bnRelease(scratch, 1)
+    if (ok) 0 else 45
+}
+
+// These two subprocesses must be rejected by the test allocator itself. They
+// prove that a future runtime that strips malloc tags cannot get a green test.
+@export("tagged_bad_free")
+trusted fun taggedBadFree(): int {
+    tagged_set_mode(1)
+    val pointer = malloc(16)
+    tagged_probe_free(nativePointerFromAddress(nativePointerAddress(pointer) & 72057594037927935))
+    99
+}
+
+@export("tagged_bad_realloc")
+trusted fun taggedBadRealloc(): int {
+    tagged_set_mode(1)
+    val pointer = malloc(16)
+    tagged_probe_realloc(nativePointerFromAddress(nativePointerAddress(pointer) & 72057594037927935), 32)
+    99
+}

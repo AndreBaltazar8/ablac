@@ -7,6 +7,11 @@ on:
   # Run a branch by hand before it reaches master.
   workflow_dispatch:
     inputs:
+      android_pointer_tags_control:
+        description: Also prove the tagged-pointer regression fails with the v0.2.47 stdlib
+        type: boolean
+        required: false
+        default: false
       macos_runtime_bench:
         description: Only measure v0.2.45 versus v0.2.47 native Mac benchmark runtimes
         type: boolean
@@ -33,7 +38,7 @@ defaults:
 
 jobs:
   linux:
-    if: ${{ !inputs.macos_published_rebuild && !inputs.macos_runtime_bench }}
+    if: ${{ !inputs.macos_published_rebuild && !inputs.macos_runtime_bench && !inputs.android_pointer_tags_control }}
     name: Linux suite (8 jobs)
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -76,7 +81,7 @@ jobs:
           if-no-files-found: ignore
 
   macos:
-    if: ${{ !inputs.macos_published_rebuild && !inputs.macos_runtime_bench }}
+    if: ${{ !inputs.macos_published_rebuild && !inputs.macos_runtime_bench && !inputs.android_pointer_tags_control }}
     name: macOS host and compiler fixed point
     # One standard arm64 runner; Intel remains part of the release matrix.
     runs-on: macos-15
@@ -232,3 +237,59 @@ jobs:
             !driver/build/macos-runtime/${{ matrix.architecture }}/results/cache/
           retention-days: 14
           if-no-files-found: error
+
+  android-pointer-tags-control:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.android_pointer_tags_control }}
+    name: AArch64 tagged-pointer positive and negative controls
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      JOBS: '4'
+      ABLA_NATIVE_JOBS: '4'
+      ABLA_CODEGEN_JOBS: '4'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        with:
+          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/6510408d147d8c5e6d76043e899e9251756f6a75.tar.gz
+      - name: Fetch the pinned compiler (runtime-only source change)
+        run: |
+          mkdir -p build/ci-logs
+          nix-shell shell.nix --run 'tools/bootstrap-compiler.sh build/pointer-bootstrap.bin'
+      - name: Fetch the tagged-pointer negative-control stdlib
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: v0.2.47
+          path: build/tagged-pointer-baseline
+          persist-credentials: false
+      - name: Prove tagged-pointer positive and released-stdlib negative controls
+        run: |
+          ABLA_SYSROOT="$PWD" nix-shell shell.nix --run 'tools/test-android-pointer-tags.sh build/pointer-bootstrap.bin' \
+            > build/ci-logs/pointer-tags-positive.log 2>&1
+          if ABLA_SYSROOT="$PWD/build/tagged-pointer-baseline" \
+            ABLA_TAGGED_POINTERS_OUT="$PWD/build/tagged-pointer-negative" \
+            nix-shell shell.nix --run 'tools/test-android-pointer-tags.sh build/pointer-bootstrap.bin' \
+            > build/ci-logs/pointer-tags-negative.log 2>&1; then
+            echo 'released stdlib unexpectedly passed tagged-pointer regression' >&2
+            exit 1
+          fi
+          # Require the specific old refusals, not an arbitrary build/emulator failure.
+          grep -q 'FAIL tls-release: exit 11' build/ci-logs/pointer-tags-negative.log
+          grep -q 'FAIL pages-release: exit 24' build/ci-logs/pointer-tags-negative.log
+          grep -q 'FAIL rsa-release: exit 41' build/ci-logs/pointer-tags-negative.log
+          grep -q 'FAIL descriptor-release: exit 133' build/ci-logs/pointer-tags-negative.log
+          cat build/ci-logs/pointer-tags-positive.log
+          cat build/ci-logs/pointer-tags-negative.log
+      - name: Keep probe logs and generated objects
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: android-pointer-tags-control
+          path: |
+            build/ci-logs/
+            build/android-pointer-tags/
+            build/tagged-pointer-negative/
+          retention-days: 7
+          if-no-files-found: ignore

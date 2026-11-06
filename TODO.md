@@ -115,9 +115,15 @@
       macos-15-intel (2026-11-06, CI 42158176059). The opt-in CI input
       `macos_published_rebuild` retains toolchain provenance and strict Mach-O diagnostics;
       see docs/bootstrap.md. No normalization or signature exception was needed.
-- [ ] ARM64 Android tagged pointers: `adoptNativeString` now tests `address != 0`, not `> 0`, but the fix has not been
-      run on the affected device. Other runtime address comparisons need the same check (`__ablaRuntimeHostCollection*`
-      tables shift addresses arithmetically). abla-mobile's `allowNativeHeapPointerTagging="false"` masks this for its apps.
+- [ ] ARM64 Android tagged pointers: runtime/stdlib address checks are corrected and
+      deliberately tagged AArch64 TBI fixtures pass release/fast (CI42165873324;
+      docs/design/android-tagged-pointer-audit.md). Collector ordering/extents are
+      unsigned and page shifts logical; TLS control pointers use the -1 sentinel;
+      RSA public range/alias guards ignore tag bits without changing actual pointers.
+      On-device validation and dropping Mobile's `allowNativeHeapPointerTagging="false"`
+      remain NovaKind's gate; no MTE or Android TLS interop claim from emulation.
+      Compiler-host-only `ctNativeCheckedAddress` would need host-architecture gating
+      if an ARM64 tagged-heap host compiler ever ships.
 
 
 ## Tools (found porting NovaKind's scripts, 2026-10-31)

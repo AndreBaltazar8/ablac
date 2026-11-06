@@ -144,6 +144,7 @@ test-serial: ablac
 	tools/test-memory-checkpoint.sh $(COMPILER)
 	tools/test-memory-drop-root.sh $(COMPILER)
 	tools/test-collection-modes.sh $(COMPILER)
+	tools/test-android-pointer-tags.sh $(COMPILER)
 	tools/test-arrays-dense.sh $(COMPILER)
 	tools/test-json-limits.sh $(COMPILER)
 	tools/test-yaml.sh $(COMPILER)
