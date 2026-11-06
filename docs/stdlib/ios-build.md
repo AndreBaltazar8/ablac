@@ -123,3 +123,8 @@ resulting application those host APIs.
 `ablaHostIsMacOS()` is false on iOS. In compile-time evaluation these query the
 compiler host. These availability diagnostics are not a sandbox for unsafe code
 or arbitrary application-owned C adapters.
+
+Availability checks are conservative inside an emitted function: they do not
+use later LLVM constant folding to excuse a forbidden operation. Select
+platform-specific implementations through the build's entry points instead of
+placing an unsupported API behind a runtime target test.
