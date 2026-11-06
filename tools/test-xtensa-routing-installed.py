@@ -35,7 +35,7 @@ def snapshot(root):
 env = dict(os.environ, ABLA_CACHE_DIR=str(out / 'cache'))
 env.pop('ABLA_XTENSA_LLVM_ROOT', None)
 env.pop('ABLA_STDLIB', None)
-for name in ('ABLA_ESP_CPU', 'ABLA_XTENSA_DIRECT_CALLS', 'ABLA_XTENSA_NARROW_BRANCHES', 'ABLA_XTENSA_TEXT_LITERALS', 'ABLA_XTENSA_NARROW', 'ABLA_ESP_KEEP_UNWIND'):
+for name in ('ABLA_ESP_CPU', 'ABLA_XTENSA_DIRECT_CALLS', 'ABLA_XTENSA_NARROW_BRANCHES', 'ABLA_XTENSA_TEXT_LITERALS', 'ABLA_XTENSA_NARROW', 'ABLA_ESP_KEEP_UNWIND', 'ABLA_XTENSA_FEATURES'):
     env.pop(name, None)
 originals = snapshot(prefix)
 run(sys.executable, prefix / 'bin/abla-install-xtensa', '--version', '23.1.3-1', env=env)

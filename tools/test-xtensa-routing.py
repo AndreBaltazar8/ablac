@@ -29,7 +29,7 @@ with tempfile.TemporaryDirectory(prefix='abla Xtensa routing ') as temporary:
                ABLA_XTENSA_ROUTING_TRACE=str(trace))
     env.pop('ABLA_STDLIB', None)
     for name in ('ABLA_ESP_CPU', 'ABLA_XTENSA_DIRECT_CALLS', 'ABLA_XTENSA_NARROW_BRANCHES',
-                 'ABLA_XTENSA_TEXT_LITERALS', 'ABLA_XTENSA_NARROW', 'ABLA_ESP_KEEP_UNWIND'):
+                 'ABLA_XTENSA_TEXT_LITERALS', 'ABLA_XTENSA_NARROW', 'ABLA_ESP_KEEP_UNWIND', 'ABLA_XTENSA_FEATURES'):
         env.pop(name, None)
 
     def cohort(name):
@@ -121,6 +121,16 @@ with tempfile.TemporaryDirectory(prefix='abla Xtensa routing ') as temporary:
     call = emissions()[-1]['args']
     assert '-xtensa-direct-calls' not in call and '-xtensa-narrow-branches' not in call
     assert '-xtensa-text-section-literals' in call
+    before = len(emissions())
+    build('feature-override', changes={'ABLA_XTENSA_FEATURES': '-mul32high,+density'})
+    assert '-mattr=-mul32high,+density' in emissions()[-1]['args']
+    opt_call = [r for r in rows() if r['tool'] == 'opt' and '--version' not in r['args']][-1]['args']
+    assert '-mattr=-mul32high,+density' in opt_call
+    assert len(emissions()) == before + 1, 'feature override reused cached object'
+    build('feature-warm', changes={'ABLA_XTENSA_FEATURES': '-mul32high,+density'})
+    assert len(emissions()) == before + 1, 'unchanged feature override missed cache'
+    for invalid in ['mul32high', '-', '-mul32high,,+density', '-mul32high, +density', '+density\n-O0', '+bad/name']:
+        build('bad-features', changes={'ABLA_XTENSA_FEATURES': invalid}, expected='E_XTENSA_FEATURES')
     build('badcpu', changes={'ABLA_ESP_CPU': 'esp32c3'}, expected='E_XTENSA_CPU')
     build('missing', changes={'ABLA_XTENSA_LLVM_ROOT': str(root / 'missing')}, expected='E_XTENSA_LLVM_MISSING')
     saved_manifest = (first / 'manifest.json').read_text()

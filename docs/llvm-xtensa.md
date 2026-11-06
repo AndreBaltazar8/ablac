@@ -137,6 +137,7 @@ This is the fast identity check described above, not per-build content hashing.
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `ABLA_ESP_CPU` | `esp32` | `esp32`, `esp32s2`, or `esp32s3`; S3 uses LLVM's `esp32` with `-dfpaccel` |
+| `ABLA_XTENSA_FEATURES` | empty | Extra LLVM features, a comma-separated `+name,-name` list; appended after CPU defaults and included in the cache identity. Spaces and empty elements are rejected with `E_XTENSA_FEATURES`. For QEMU CPUs without high multiply use `-mul32high`. |
 | `ABLA_XTENSA_DIRECT_CALLS` | `1` | Enable the patched direct CALL8 lowering |
 | `ABLA_XTENSA_NARROW_BRANCHES` | `1` | Enable proven-in-range narrow branches |
 | `ABLA_XTENSA_TEXT_LITERALS` | `0` | Put literal pools in each function's text section |

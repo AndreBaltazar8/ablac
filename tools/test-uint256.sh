@@ -68,25 +68,9 @@ else
     echo "skip riscv32: no qemu-riscv32"
 fi
 
-# Xtensa: `mul32high` is off because qemu's CPUs don't have it. As in tools/test-simd.sh, llc in
-# front of the real one for the CPU and static code.
-tools_directory="$out/xtensa-tools"
-mkdir -p "$tools_directory"
-real_llc=$(command -v llc)
-xtensa_tools() { # llc flags
-    cat > "$tools_directory/llc" <<EOF
-#!/usr/bin/env bash
-arguments=()
-for argument in "\$@"; do
-    [[ \$argument == -relocation-model=pic ]] && argument=-relocation-model=static
-    arguments+=("\$argument")
-done
-exec "$real_llc" $1 "\${arguments[@]}"
-EOF
-    chmod +x "$tools_directory/llc"
-}
-xtensa_tools "-mcpu=esp32"
-PATH="$tools_directory:$PATH" "$compiler" build "$out/src/object.ab" -o "$out/xtensa.o" --no-cache \
+# Xtensa: the companion owns CPU/static selection. QEMU's CPU lacks mul32high,
+# so request that feature mask explicitly rather than hiding it in a PATH shim.
+ABLA_ESP_CPU=esp32 ABLA_XTENSA_FEATURES='' "$compiler" build "$out/src/object.ab" -o "$out/xtensa.o" --no-cache \
     --target-triple xtensa-esp-unknown-elf --object-format elf --emit object
 grep -q 'Machine: EM_XTENSA' <<<"$(llvm-readobj --file-headers "$out/xtensa.o")"
 esp_bin=$(ls -d "$HOME"/.espressif/tools/xtensa-esp-elf/*/xtensa-esp-elf/bin 2>/dev/null | tail -1 || true)
@@ -95,8 +79,7 @@ command -v steam-run > /dev/null && runner=(steam-run)
 if [[ -n $esp_bin ]] && command -v qemu-xtensa > /dev/null &&
     "${runner[@]}" "$esp_bin/xtensa-esp32-elf-gcc" -ffreestanding -fno-builtin -fno-stack-protector -O0 \
         -mtext-section-literals -mlongcalls -c "$cases/start.c" -o "$out/start-xtensa.o"; then
-    xtensa_tools "-mcpu=esp32 -mattr=-mul32high"
-    PATH="$tools_directory:$PATH" "$compiler" build "$out/src/object.ab" -o "$out/xtensa-run.o" --no-cache \
+    ABLA_ESP_CPU=esp32 ABLA_XTENSA_FEATURES=-mul32high "$compiler" build "$out/src/object.ab" -o "$out/xtensa-run.o" --no-cache \
         --target-triple xtensa-esp-unknown-elf --object-format elf --emit object
     "${runner[@]}" "$esp_bin/xtensa-esp32-elf-ld" -z noexecstack -static "$out/xtensa-run.o" "$out/start-xtensa.o" -o "$out/xtensa"
     qemu-xtensa -cpu dc232b "$out/xtensa" || { echo "uint256 xtensa: failed with $?" >&2; exit 1; }
@@ -117,8 +100,7 @@ fun arithmetic(x: u32): int {
     if (a < b) 2 else 0
 }
 EOF
-xtensa_tools "-mcpu=esp32"
-PATH="$tools_directory:$PATH" "$compiler" build "$out/src/arithmetic.ab" -o "$out/arithmetic-xtensa.o" --no-cache \
+ABLA_ESP_CPU=esp32 ABLA_XTENSA_FEATURES='' "$compiler" build "$out/src/arithmetic.ab" -o "$out/arithmetic-xtensa.o" --no-cache \
     --target-triple xtensa-esp-unknown-elf --object-format elf --emit object
 [[ -z $(llvm-nm -u "$out/arithmetic-xtensa.o") ]] || { echo "Xtensa arithmetic needs: $(llvm-nm -u "$out/arithmetic-xtensa.o")" >&2; exit 1; }
 "$compiler" build "$out/src/arithmetic.ab" -o "$out/arithmetic-riscv32.o" --no-cache \
