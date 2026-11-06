@@ -256,8 +256,12 @@
   host/fixed-point/Simulator green, four NovaKind DB-free programs, and the real
   installed firmware under 4 GiB. Default density is whole-object SDK-exact;
   opt-out matches every relocated field and links to identical bytes (L32R
-  placeholder bits may differ). Source is ready for review, but v0.2.48 does not
-  contain routing. See [design and evidence](docs/design/xtensa-companion.md).
+  placeholder bits may differ). Source routing merged at `4b944cfc`. Phase 4 also
+  passes the unmodified full embedded checker with the published portable cohort
+  selected (21 fresh manifests; peak 3,152,424 KiB), plus a separate SDK-exact
+  package-import build (3,137,848 KiB); both use the 4 GiB launcher and verify the
+  cohort before/after. v0.2.48 does not contain routing. See
+  [design and evidence](docs/design/xtensa-companion.md).
 - [ ] **v0.2.49 release-note draft: Xtensa migration (planned break).** Publish this
   with the release; v0.2.48 does not implement the new routing:
 

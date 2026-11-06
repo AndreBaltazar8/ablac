@@ -1,6 +1,6 @@
 # Optional Xtensa LLVM companion
 
-Status: phases 1–2 merged at dffc60aa; phase 3 routing is ready for review, with final Linux/macOS CI green, 2026-11-06.
+Status: phases 1–2 merged at dffc60aa; phase 3 merged at 4b944cfc; phase 4 published-cohort consumer gates pass, 2026-11-06.
 André chose the optional, separately versioned companion after the
 [feasibility measurements](xtensa-release-feasibility.md). The phases 2–3 design
 below is approved; installer and compiler routing remain separate handoffs.
@@ -496,3 +496,49 @@ the guard's existing 10% rule. The final local guard measured 1,312,860 KiB.
 [local pairs](xtensa-companion-data/phase3-memory-local.json) and
 [isolated source additions](xtensa-companion-data/phase3-memory-attribution.json)
 retain the attribution and its limits.
+
+
+## Phase 4: full consumer gate with the published cohort
+
+After phase 3 merged at `4b944cfc`, the unmodified `abla-embedded da5a939`
+`tools/check-source` passed with an owned installed-layout copy of the same
+`f6f265c0…` compiler and the **published portable** `23.1.3-1` cohort.
+`ABLA_XTENSA_LLVM_ROOT` was cleared, so the compiler discovered it from its actual
+image. All 21 fresh Xtensa sidecars identify that published cohort. The installer
+fully verified every cohort file before and after the checker and again after
+the separate package-import build; the compiler image remained unchanged.
+
+| Gate | Peak KiB | Wall seconds | Limit |
+| --- | ---: | ---: | ---: |
+| Full embedded source checker | 3,152,424 | 228.39 | 4 GiB |
+| Separate package-import object | 3,137,848 | 45.46 | 4 GiB |
+
+The separate object is whole-byte SDK/Nix exact: 144,824 bytes,
+`8d09555ca807d581fa02d48ebccfe5ec88e1e584601ffb6b657a50339a7b471c`.
+The full checker's package object has the same hash. Peaks are GNU time's largest
+single process, not summed children, and are capacity checks rather than a claimed
+RSS improvement. No board code was executed.
+
+This local NixOS run used `steam-run` to provide the portable helpers' FHS loader.
+The parent compiler remained linked to developer Nix LLVM; the legacy SDK's
+independent llc/llvm-mc self-tests also used those developer tools. This is not a
+new claim about a stock released parent: the three-host stock-parent and actual
+Linux firmware proofs remain the phase 3 CI runs above.
+
+The first attempt stopped at a host build because the inherited Nix-shell
+`TMPDIR` was hidden inside the FHS environment. Its failure log is retained. The
+successful attempt used a new owned temporary directory visible inside FHS; no
+compiler or consumer source was changed.
+
+Usual compiler gates and the four NovaKind programs are inherited from the exact
+same source/tests/tools, as verified against `26c10687` and `4b944cfc`; they were
+not repeated for this documentation-only follow-up. NovaKind's assertion counts
+are 52 / 23 / 2 / 31, total 108. The runner's first three raw counters include a
+PASS-summary line as well.
+
+[Structured proof and 21 manifest identities](xtensa-companion-data/phase4-published-check-source.json),
+[full checker log](xtensa-companion-data/phase4-check-source.log),
+[initial FHS setup failure](xtensa-companion-data/phase4-fhs-setup-failure.log),
+[pre-check verification](xtensa-companion-data/phase4-verify-before.log), and
+[post-check verification](xtensa-companion-data/phase4-verify-after.log) retain
+these results and their scope.

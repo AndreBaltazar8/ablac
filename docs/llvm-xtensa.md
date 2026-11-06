@@ -80,9 +80,11 @@ From a packaged toolchain use its absolute path, without adding the companion's
 
 For an offline install add `--archive /path/to/the-host-archive.tar.gz`. The
 archive still has to match the checked-in catalog. Installation never changes
-Clang, the parent LLVM, or the compiler binary. The current compiler does **not
-yet route Xtensa code generation to the companion**; that is a separate gated
-change. Installing it alone does not make a released compiler support Xtensa.
+Clang, the parent LLVM, or the compiler binary. The source compiler now routes
+Xtensa through the selected companion. Releases
+through v0.2.48 predate that routing change: installing it alone does not add
+Xtensa support to those older compiler binaries. The v0.2.49 migration draft is
+in TODO.md.
 
 The catalog is `tools/xtensa-companions.json`, also shipped under
 `share/abla/xtensa-companions.json`. It pins the archive URL and SHA-256 and the
@@ -102,8 +104,8 @@ the old selection; reinstalling the same revision fully verifies it first.
 Every install, activation and explicit `--verify` rehashes **all** files. A
 changed library with the same size and modification time fails that next full
 check, and changing its manifest cannot bypass the catalog's pinned manifest
-hash. This is not a promise to hash libraries on every build: the planned
-compiler routing uses the selected immutable revision's manifest and file
+hash. This is not a promise to hash libraries on every build: compiler
+routing uses the selected immutable revision's manifest and file
 identity in its cache key. After copying or restoring a toolchain, run
 `--verify` before using it. Read-only file modes guard accidental writes, not a
 malicious owner who can replace the installer, catalog or compiler themselves.
@@ -241,5 +243,6 @@ Unsupported integrated-assembler CFI remains an explicit build failure.
 Live SDK boot/vector layout markers produce `E_XTENSA_EXTERNAL_ASSEMBLER`;
 those paths still need the SDK's GNU-as orchestration. Ordinary code generation
 and the real package-import memory gate are tested separately from that SDK
-boundary. Routing and downstream release gates are still in progress; this
-section does not claim the change is in an already published Abla release.
+boundary. Source routing and downstream gates have passed; the next release will carry
+the routing change. This section does not claim it is in an already published
+Abla release.
