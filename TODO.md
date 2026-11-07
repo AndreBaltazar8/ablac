@@ -713,6 +713,20 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   a compiler built without `-g` names functions
   `abla_fn_<a>_<b>`; the compiler's own `--emit-llvm` maps each to its source name
   through the function's `"abla.source"` attribute.
+  Tried that candidate (2026-11-07, v0.2.49 seed, stage1 builds of master `3d918b58` with and
+  without it; `lowerer.currentOwnerDeclaration` computed where each lowerer is made, used by
+  `isField` and the current owner's `lowerFieldType`): the emitted IR is byte-identical on
+  `src/orc_main.ab` (80,393,150 bytes), `tests/cases/modules/unsafe-boundary.ab`, `examples/websocket-echo-server.ab`
+  (`tests/cases/simd/checks.ab` emits nothing in either compiler), and user instructions of `--emit-llvm` are unchanged
+  within noise: 2,569.56M vs 2,568.29M (-0.05%), 2,703.18M vs 2,702.00M (-0.04%), 3,890.71M vs
+  3,890.76M (0.0%), and `src/orc_main.ab` 66.08G vs 66.74G (+1.0%: run-to-run spread on that
+  input is about 2%). The 66k owner lookups
+  are about 0.007% of the instructions of the emit if a lookup costs about 100 (an estimate,
+  not a measurement), so the owner cache is invisible; remembering every repeat (49% of 1M)
+  would be about 0.07% by the same estimate, well under the 1% bar. The 4% sample share above
+  was probably cache misses, which instruction counts do not see. A cache inside `find`
+  itself is not possible: any write makes `find` a mutating receiver and 32 callers that
+  only borrow the index fail `ownership.mutable-borrow`. Nothing changed.
 
 ## Tried, not pursued
 
