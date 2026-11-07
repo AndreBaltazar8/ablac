@@ -43,44 +43,23 @@
   reachable empty write where baseline has no imports, in both fast and
   release builds. Neither was kept; preserve final import sets when revisiting.
 
-- [ ] Floats erased to `any` interpolate as integer bit patterns: native
-  `text(1.5)` through `fun text(value: any): string = "$value"` prints
-  `4609434218613702656`; f32 2.25 prints `1074790400`, while compile-time
-  evaluation prints `1.5`. Scalar typed-to-`any` boundaries now preserve float
-  identity in the auxiliary word; dynamic formatting and collection boundaries
-  still need to use it. A complete fix must preserve float identity at every typed-to-any boundary
-  (calls, locals, fields, collections, returns and closures), through generic
-  storage, on native and Wasm; keep dense typed arrays and integer/GC ABI
-  behavior; and check NaN, infinity, negative zero, formatting, bootstrap and
-  size/performance. An isolated probe used the auxiliary word as a float tag
-  and imported `abla/float/text` into the runtime: it formatted a manually
-  tagged value but grew an int-only executable from 14,600 to 40,408 bytes
-  (2026-11-03). A later representation-only prototype with auxiliary float
-  kinds, dense float arrays and a module-wide demand flag kept an int-only
-  release probe byte-identical, but an O1 QR test bundle grew from 543,128 to
-  551,512 stripped bytes (+1.54%) and used 209.462 to 210.490 billion
-  instructions (+0.49%; one paired run). A module-wide flag makes shared
-  integer-array paths float-aware whenever any float exists; it is not enough
-  to meet the performance budget. The prototype remains uncommitted on
-  `fix-erased-float`. Revisit with type-directed identity added at proven
-  erasure boundaries while keeping typed float and array paths unchanged;
-  retain conservative behavior at generic, reflective and foreign boundaries.
-  Phase (d) now preserves erased float kinds through native CT wire and shared
-  lift emission, with explicit interp/JIT and hostless Wasm bit-level tests.
-  A demand-driven formatter and its end-to-end native/compile-time/Wasm tests
-  remain phase (c)'s work; bit preservation does not make formatting correct.
-  The phase (c) WIP is `float-erasure-formatter` at `6acf2811`. In staged
-  integer-only builds, preloading the bridge analyzes `abla/float/text/entry.ab`;
-  an `f64`/`void` join there conservatively marks float formatting as needed,
-  retaining the formatter. Ignoring such joins is unsound: `val v: any = if
-  (true) 1.5 else {}` carries a boxed float. The WIP regression fixture
-  `tests/cases/erased-float-format/main.ab` covers that case. Determine how to
-  distinguish analysis needed only by the preloaded bridge from reachable
-  user origins without missing real erasures; recheck byte identity, size and
-  runtime gates before enabling the formatter.
-  Equality and hashing through `any` currently ignore the auxiliary word, so
-  a boxed float and an integer with identical payload bits compare equal and
-  hash alike through `any`; deciding whether to change that is a separate language issue.
+- [ ] Equality and hashing through `any` ignore the auxiliary word, so a
+  boxed float and an integer with identical payload bits compare equal and
+  hash alike through `any`. Interpolation now tells them apart (the erased
+  float formatter, 2026-11-07); whether `==` and hashing should too is a
+  language decision.
+
+- [ ] Programs that need the erased float formatter analyze twice. When a
+  program both erases a float to `any` and interpolates an `any`, the first
+  semantic pass only discovers that, then the graph is parsed and analyzed
+  again with the bridge loaded. On 2026-11-07 (`--fast --no-cache`,
+  `json-document.ab` plus a two-line `"$value"` of an erased `1.5`):
+  4.103 billion compiler instructions on master, 4.357 billion with the
+  formatter (+6.2%, including its code generation); the same program erasing
+  an integer went from 4.102 to 4.127 billion (+0.6%, the demand tracking).
+  Programs without the pair build byte-identically. Loading the bridge
+  up front when the entry module's imports or text make demand likely would
+  avoid the second pass.
 
 - [ ] **Xtensa `llc` aborts on frames of 128 to 255 bytes that take a stack address.** `LLVM ERROR: Error
   while trying to spill A6 from class AR: Cannot scavenge register without an emergency spill slot!`, seen
