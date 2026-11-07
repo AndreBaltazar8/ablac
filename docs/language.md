@@ -189,10 +189,12 @@ Such helpers accept nullable printable values, writing `null` for null. In
 `$mvcview`, use `{node value}` for an `MvcHtml` child.
 
 When an unsupported value has already been erased to `any`, native interpolation
-panics with its runtime tag; WebAssembly traps without a message. A known
-limitation is that `f32` and `f64`
-currently lose their float type when erased to `any`; interpolation then
-prints their bit pattern as an integer. Keep floats typed for interpolation.
+panics with its runtime tag; WebAssembly traps without a message. An `f32` or
+`f64` erased to `any` keeps its float kind and interpolates as it would typed
+(`1.5`, `NaN`, `-Infinity`). A program that erases floats and interpolates an
+`any` gets the float formatter; others build without it. Equality and hashing
+through `any` still compare only the payload, so a boxed float and an integer
+with the same bits are equal there.
 
 ### Raw text blocks
 
