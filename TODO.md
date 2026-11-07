@@ -416,15 +416,29 @@ Package-side work (not changed from ablac):
   remaining matrix; no full-suite or bootstrap claim. Exact scalar differential,
   548 JSON golden blocks, native/fast/GC-stress, hostless Wasm and 84 persistent
   server-response checks passed; correctness alone did not meet the runtime bar.
-  **Follow-up for André:** the roughly +76% target win versus a consistent
-  -0.8% on items may justify screening a length-gated variant, using K=32 only
-  above some string length. The parser receives the remaining document bound,
-  not the closing quote: `end - begin` is not the string's length. Any such
-  gate must use a known or actually observed length, preserving UTF-8 errors,
-  offsets and bounded reads. No production changes retained. Frozen sources,
-  binaries, LLVM IR, commands and raw results remain under
+  No production changes retained. Frozen sources, binaries, LLVM IR, commands and raw
+  results remain under
   `worktrees/ablac-json-span/build/json-span-lab/{attempt1,attempt2,attempt3,prefix-screen}/`;
   the shared note is `~/agents-memory/abla/ablac-json-ascii-spans.md`.
+  **Length-gated follow-up (decision #43), also no-go, 2026-11-07, published v0.2.49.**
+  items-128's strings are 2–18 bytes and never reached the word scan even with K=32;
+  its cost is the per-string prefix bound and setup, which any length gate also pays.
+  Instruction probes (same method as above):
+
+  | Variant | strings-4k | items-128 | roles-64 |
+  | --- | ---: | ---: | ---: |
+  | K=32 (attempt3) | -66.67% | +0.22% | +0.49% |
+  | K=128 prefix | -65.15% | +0.17% | +0.37% |
+  | `size > 64` / `end - begin > 32` gates | -66.85% | +0.27% | +0.57% |
+
+  K=128 went to throughput (same driver and keep rule, 12:30 UTC window):
+  strings-4k **+77.1% paired median** (pairs 1.686, 1.772, 1.771), items-128
+  **-0.74%** with all three pairs negative (-0.15%, -0.74%, -1.06%): rule failed again;
+  roles and the matrix not run. Correctness passed (548 JSON blocks, native/Wasm paths,
+  text-unicode, exact responses on all 21 scenarios). Next idea, not tried: decide the
+  scan once per document (or per input buffer) so short strings keep the unchanged
+  scalar loop with no per-string setup. K=128 runtime is on branch `perf-json-gate`;
+  lab in `~/archive/ablac-json-gate-2026-11-07/`.
 
 - [ ] **Cached small blocks cannot be reused for another size.** The native lists
   (`__ablaRuntimeHostSmallLists`) use an adaptive 32 MiB floor and 128 MiB ceiling;
