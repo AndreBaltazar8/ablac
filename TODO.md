@@ -728,6 +728,12 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   of executable). Avoiding the second pass would save at most ~1.7% of that
   compile and only for such programs; programs without the pair build
   byte-identically already. Not worth the risk of loading the bridge early.
+  The bridge is preloaded whenever any loaded module mentions `compiler` and
+  has compile-time actions, which takes in every `abla/json` program. Counting
+  only the program's own imports of `abla/compiler` and its own actions saved
+  0.5% of the instructions of a JSON program without erased floats (4.12 to
+  4.10 billion) but cost 36% on one with them (4.35 to 5.94 billion): its
+  second compilation replays the JSON library's compile-time actions. Kept.
 
 - **STM inline logged-access fast paths** (2026-11-05, #499, base
   `444eebde`): rejected one same-protocol prototype. Inline the stable first
