@@ -3356,10 +3356,56 @@ trusted fun __ablaRuntimeMemoryCensusCount(census: int, header: int, overhead: i
     return
 }
 
+// Every byte must be ordinary ASCII: no control, quote, backslash or high
+// bit. The repeated-byte masks are endian-independent. A failed word test
+// only selects the original scalar path, which retains exact UTF-8 handling.
+// Cross-byte borrows may conservatively flag another byte; they never skip
+// an exceptional byte and only cause the scalar fallback to run sooner.
+@inline
+trusted fun __ablaRuntimeJsonAsciiWordPlain(word: int): bool {
+    val quote = word ^ 2459565876494606882
+    val slash = word ^ 6655295901103053916
+    val controls = (word - 2314885530818453536) & ~word
+    val quotes = (quote - 72340172838076673) & ~quote
+    val slashes = (slash - 72340172838076673) & ~slash
+    ((word | controls | quotes | slashes) & -9187201950435737472) == 0
+}
+
+// Skip a printable ASCII prefix; retain the original scalar loop for the
+// first exceptional word and the rest of the string. Callers use this only
+// for longer ranges, so short keys keep their original per-byte loop.
+@noinline
+trusted fun __ablaRuntimeJsonAsciiPrefixEnd(data: int, begin: int, end: int): int {
+    var offset = begin
+    val aligned = begin + ((8 - ((data + begin) & 7)) & 7)
+    var ascii = true
+    while (ascii && offset < aligned && offset < end) {
+        val byte = ablaRuntimeLoadU8(data + offset)
+        ascii = byte >= 32 && byte < 128 && byte != 34 && byte != 92
+        if (ascii) offset = offset + 1
+    }
+    // RuntimeLoadI64 requires alignment. Read only complete in-range words.
+    while (ascii && end - offset >= 8) {
+        ascii = __ablaRuntimeJsonAsciiWordPlain(ablaRuntimeLoadI64(data + offset))
+        if (ascii) offset = offset + 8
+    }
+    offset
+}
+
 trusted fun __ablaRuntimeJsonStringIsPlain(value: string): bool {
     val size = __ablaRuntimeStringLengthValue(value)
     val data = if (size == 0) 0 else __ablaRuntimeStringData(value)
     var offset = 0
+    val prefixEnd = if (size < 128) size else 128
+    while (offset < prefixEnd) {
+        val lead = ablaRuntimeLoadU8(data + offset)
+        if (lead == 34 || lead == 92 || lead < 32) return false
+        else if (lead < 128) offset = offset + 1
+        else break
+    }
+    if (offset == prefixEnd && offset < size) {
+        offset = __ablaRuntimeJsonAsciiPrefixEnd(data, offset, size)
+    }
     while (offset < size) {
         val lead = ablaRuntimeLoadU8(data + offset)
         if (lead == 34 || lead == 92 || lead < 32) return false
