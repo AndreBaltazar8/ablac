@@ -43,18 +43,6 @@
   float formatter, 2026-11-07); whether `==` and hashing should too is a
   language decision.
 
-- [ ] Programs that need the erased float formatter analyze twice. When a
-  program both erases a float to `any` and interpolates an `any`, the first
-  semantic pass only discovers that, then the graph is parsed and analyzed
-  again with the bridge loaded. On 2026-11-07 (`--fast --no-cache`,
-  `json-document.ab` plus a two-line `"$value"` of an erased `1.5`):
-  4.103 billion compiler instructions on master, 4.357 billion with the
-  formatter (+6.2%, including its code generation); the same program erasing
-  an integer went from 4.102 to 4.127 billion (+0.6%, the demand tracking).
-  Programs without the pair build byte-identically. Loading the bridge
-  up front when the entry module's imports or text make demand likely would
-  avoid the second pass.
-
 - [ ] **Xtensa `llc` aborts on frames of 128 to 255 bytes that take a stack address.** `LLVM ERROR: Error
   while trying to spill A6 from class AR: Cannot scavenge register without an emergency spill slot!`, seen
   2026-11-01 on `esp32RecoveredZN3nvs7Storage9writeItem...` from abla-embedded's `tools/build-example
@@ -727,6 +715,19 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   through the function's `"abla.source"` attribute.
 
 ## Tried, not pursued
+
+- **Skipping the erased float formatter's second analysis** (2026-11-07,
+  master `1a9db095`): a program that erases a float to `any` and interpolates
+  an `any` is analyzed once to find that out, then parsed and analyzed again
+  with the formatter bridge loaded. On `json-document.ab` plus a two-line
+  `"$value"` of an erased `1.5` (`--fast --no-cache`), a sampled profile
+  (every 200,000 user instructions) of the compiler process puts the whole
+  increase over the same program erasing an integer at about 57M
+  instructions: ~18M in the compiler itself (the second pass plus lowering the
+  formatter) and ~39M in LLVM compiling the formatter's code (+35,624 bytes
+  of executable). Avoiding the second pass would save at most ~1.7% of that
+  compile and only for such programs; programs without the pair build
+  byte-identically already. Not worth the risk of loading the bridge early.
 
 - **STM inline logged-access fast paths** (2026-11-05, #499, base
   `444eebde`): rejected one same-protocol prototype. Inline the stable first
