@@ -20,12 +20,6 @@
 
 ## Bugs seen
 
-- [ ] A local callable shadowing a constructor can be normalized as the
-  constructor when their arities differ: `class FloatMaker(val value: int)`
-  followed by `val FloatMaker = { -> 1.5 }; FloatMaker()` reports
-  `E_NAMED_ARGUMENT_REQUIRED` instead of calling the local function. Seen on
-  master 424980cb on 2026-11-04.
-
 - [ ] Additional `--fast` ELF sections: LLVM's in-process C API ignores
   `--function-sections`/`--data-sections` set through its command-line parser.
   A manual section screen moved relocated constants out of RELRO and is unsafe.

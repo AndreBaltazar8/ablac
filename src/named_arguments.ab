@@ -120,7 +120,10 @@ class BootstrapNamedArgumentNormalizer(
     // Functions that read a global a caller's name hides (globalAccessor).
     val accessors: array<BootstrapDeclaration> = [],
     val affineTypes: array<string> = [],
-    var typeProbe: BootstrapNamedProbe? = null
+    var typeProbe: BootstrapNamedProbe? = null,
+    // The parameters and locals in scope where the normalizer is: a plain
+    // call of one of them is that local's, not a constructor's or function's.
+    var visibleLocals: array<string> = []
 ) {
     fun fail(code: string, message: string, expression: BootstrapExpression) {
         this.errors = this.errors + 1
@@ -830,15 +833,41 @@ class BootstrapNamedArgumentNormalizer(
             ]
         )
 
+    // `visibleLocals` cut back to its first `size` names.
+    fun leaveScope(size: int): void {
+        val kept: array<string> = []
+        var index = 0
+        while (index < size) {
+            kept.append(this.visibleLocals[index])
+            index = index + 1
+        }
+        this.visibleLocals = kept
+    }
+
     fun normalize(expression: BootstrapExpression): BootstrapExpression {
         val normalizedChildren: array<BootstrapExpression> = []
+        val scope = this.visibleLocals.size
+        if (expression.kind == "for") this.visibleLocals.append(bootstrapForName(expression))
+        val lambda = (expression.kind == "lambda" || expression.kind == "lambda.move") &&
+            expression.children.size > 0
         var child = 0
         while (child < expression.children.size) {
+            // A lambda's parameters are in scope in its body, its last child.
+            if (lambda && child + 1 < expression.children.size) {
+                this.visibleLocals.append(expression.children[child].text)
+            }
             normalizedChildren.append(this.normalize(
                 expression.children[child]
             ))
+            // A block's local is in scope in the statements after it.
+            val statement = expression.children[child]
+            if (expression.kind == "block" &&
+                (statement.kind == "local.val" || statement.kind == "local.var")) {
+                this.visibleLocals.append(statement.text)
+            }
             child = child + 1
         }
+        this.leaveScope(scope)
         var result = BootstrapExpression(
             expression.kind,
             expression.text,
@@ -859,9 +888,14 @@ class BootstrapNamedArgumentNormalizer(
         var selectedTarget = -1
         var selectedOverload = -1
         var memberTargets = BootstrapNamedMethodTargets([], [])
+        // A local of the called name hides every declaration of it; type
+        // arguments only follow a declared function or constructor.
+        val localCall = result.kind == "call" &&
+            bootstrapNamedCallBase(result.text) == result.text &&
+            bootstrapReceiverNameIn(this.visibleLocals, result.text)
         // A plain call in a method that the receiver's method takes is that
         // method's, before any top-level declaration of the name.
-        if (result.kind == "call" && hasNamed && this.receiver != "") {
+        if (result.kind == "call" && hasNamed && this.receiver != "" && !localCall) {
             val arguments: array<BootstrapExpression> = [
                 BootstrapExpression("identifier", "this", result.begin, result.begin, [])
             ]
@@ -875,7 +909,9 @@ class BootstrapNamedArgumentNormalizer(
                 memberTargets = own
             }
         }
-        if (result.kind == "call") selectedTarget = this.target(bootstrapNamedCallBase(result.text))
+        if (result.kind == "call" && !localCall) {
+            selectedTarget = this.target(bootstrapNamedCallBase(result.text))
+        }
         if (result.kind == "member.call" && hasNamed) {
             if (memberTargets.owners.size == 0) {
                 memberTargets = this.methodTargets(bootstrapNamedCallBase(result.text),
@@ -1154,8 +1190,15 @@ class BootstrapNamedArgumentNormalizer(
                             if (method) substituted = this.qualifyReceiver(
                                 substituted, receiver, this.methodClass(memberTargets, 0)
                             )
+                            // The default means what it does at its callee,
+                            // where none of the caller's locals is in scope.
+                            val callerVisible: array<string> = []
+                            for (name in this.visibleLocals) callerVisible.append(name)
+                            this.visibleLocals = []
+                            val calleeDefault = this.normalize(substituted)
+                            this.visibleLocals = callerVisible
                             var normalizedDefault = bootstrapNamedTypedLiteral(
-                                this.normalize(substituted),
+                                calleeDefault,
                                 declaration.parameterTypes[parameter],
                                 generic
                             )
@@ -1360,6 +1403,8 @@ fun bootstrapNormalizeNamedDeclaration(
     val enclosing = normalizer.receiver
     val enclosingNames: array<string> = []
     for (name in normalizer.callerNames) enclosingNames.append(name)
+    val enclosingVisible: array<string> = []
+    for (name in normalizer.visibleLocals) enclosingVisible.append(name)
     if (declaration.kind != "class") {
         var names: array<string> = []
         for (name in enclosingNames) names.append(name)
@@ -1387,7 +1432,16 @@ fun bootstrapNormalizeNamedDeclaration(
     }
     val enclosingBody = normalizer.inReceiverBody
     normalizer.inReceiverBody = normalizer.receiver != "" && declaration.kind != "class"
+    if (declaration.kind != "class") {
+        val visible: array<string> = []
+        for (name in enclosingVisible) visible.append(name)
+        for (name in declaration.parameters) visible.append(name)
+        normalizer.visibleLocals = visible
+    }
     val body = normalizer.normalize(declaration.expression)
+    val restoredVisible: array<string> = []
+    for (name in enclosingVisible) restoredVisible.append(name)
+    normalizer.visibleLocals = restoredVisible
     normalizer.inReceiverBody = enclosingBody
     normalizer.receiver = enclosing
     val restoredNames: array<string> = []

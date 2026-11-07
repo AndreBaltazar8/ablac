@@ -5,7 +5,7 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
 out=build/named-generic-default-test
 mkdir -p "$out"
-for case in main foreign borrowed extension multiple-receivers interface nested modules type-in-default delegated-valid resource-default; do
+for case in main foreign borrowed extension multiple-receivers interface nested modules type-in-default delegated-valid resource-default local-shadow; do
     "$compiler" build "tests/cases/named-generic-default/$case.ab" -o "$out/$case" --fast --no-cache
     "$out/$case"
 done
