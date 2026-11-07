@@ -88,13 +88,6 @@
       and `suite-package-providers` failed to resolve a local git dependency, with neither recurring
       in the next runs. Suspected: the Nix profile changing mid-run. Not confirmed, but during a `home-manager switch`
       on 2026-11-01, `~/.nix-profile/bin/git` was missing for a moment.
-- [ ] `E_NAMED_ARGUMENT_HIDDEN` remains when a generic constructor also has a delegated property and an omitted default calls a
-      constructor hidden by the caller, with no earlier argument giving the type. For example, with
-      `class Tagged<T>(val n: int)`, `class Slot<T>(var value: T) { fun getValue(): T = value }`, and
-      `class Box<T>(val n: int, val tag: Tagged<T> = Tagged<T>(2), val saved: int by Slot(1))`, a local function named
-      `Tagged` hides the constructor in `Box<string>(n = 1)`. Generic probing precedes delegated-property rewriting, so the
-      generated wrapper cannot yet safely pass that delegate. Pass `tag` explicitly; renaming the local alone still gives
-      `constructor.argument:Box<string>` for this example.
 - [x] macOS published-binary comparison: independent v0.2.47 tag rebuilds from its pinned
       v0.2.46 seed matched both raw assets byte-for-byte on macos-15 arm64 and
       macos-15-intel (2026-11-06, CI 42158176059). The opt-in CI input

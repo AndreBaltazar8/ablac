@@ -5,7 +5,7 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
 out=build/named-generic-default-test
 mkdir -p "$out"
-for case in main foreign borrowed extension multiple-receivers interface nested modules type-in-default delegated-valid resource-default local-shadow; do
+for case in main foreign borrowed extension multiple-receivers interface nested modules type-in-default delegated-valid resource-default local-shadow delegated delegated-type-arguments; do
     "$compiler" build "tests/cases/named-generic-default/$case.ab" -o "$out/$case" --fast --no-cache
     "$out/$case"
 done
@@ -15,7 +15,7 @@ for mode in interp jit; do
     "$out/staged"
 done
 grep -q 'native at' "$out/jit.trace"
-for spec in 'required:generic.cannot-infer:f:T' 'required-expression:generic.cannot-infer:f:T' 'own-invalid:ownership.move-required' 'delegated:E_NAMED_ARGUMENT_HIDDEN'; do
+for spec in 'required:generic.cannot-infer:f:T' 'required-expression:generic.cannot-infer:f:T' 'own-invalid:ownership.move-required'; do
     case=${spec%%:*}
     error=${spec#*:}
     if "$compiler" build "tests/cases/named-generic-default/$case.ab" -o "$out/$case" --fast --no-cache >"$out/$case.log" 2>&1; then
