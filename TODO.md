@@ -386,6 +386,43 @@ Package-side work (not changed from ablac):
 
 ## Compile time and memory
 
+- [ ] **JSON ASCII word scans need a short-string gate.** No-go screen on
+  2026-11-06/07 with published v0.2.48: one server on CPU0, 64 connections,
+  3 s warmup and three 10 s samples. Acceptance cases used alternating
+  baseline/candidate pairs; the other cases used alternating variant groups.
+  Inlining the word scanner improved `json-strings-4k` by 77.2%, but the full
+  21-scenario screen regressed items-128 by 5.7% and roles-64 by 7.7%.
+  Outlining it retained +77.6% on strings but still lost 4.4% on items.
+  Both private scalar wrappers were already out of line; this was not an
+  inlining-threshold crossover.
+  Running the original scalar path for the first K ASCII bytes before the
+  outlined word scan reduced the short-case penalty. Fixed-count probes
+  (100,000 requests after 10,000 warmup, server CPU8, three reordered rounds)
+  measured these changes in server user instructions per request:
+
+  | Scalar prefix | strings-4k | items-128 | roles-64 |
+  | --- | ---: | ---: | ---: |
+  | K=16 | -66.92% | +0.241% | +0.605% |
+  | K=32 | -66.67% | +0.223% | +0.493% |
+
+  The final K=32 throughput screen improved strings by **75.88% paired median**
+  (92,903 to 163,261 req/s by medians), but items lost **0.82% paired median**
+  (82,668 to 82,018 req/s by medians). All three items pairs were negative:
+  -0.27%, -0.82%, -1.44%. It failed the agreed rule requiring a median no worse
+  than -1.5% **and** at least one nonnegative pair. Stopped before roles or the
+  remaining matrix; no full-suite or bootstrap claim. Exact scalar differential,
+  548 JSON golden blocks, native/fast/GC-stress, hostless Wasm and 84 persistent
+  server-response checks passed; correctness alone did not meet the runtime bar.
+  **Follow-up for André:** the roughly +76% target win versus a consistent
+  -0.8% on items may justify screening a length-gated variant, using K=32 only
+  above some string length. The parser receives the remaining document bound,
+  not the closing quote: `end - begin` is not the string's length. Any such
+  gate must use a known or actually observed length, preserving UTF-8 errors,
+  offsets and bounded reads. No production changes retained. Frozen sources,
+  binaries, LLVM IR, commands and raw results remain under
+  `worktrees/ablac-json-span/build/json-span-lab/{attempt1,attempt2,attempt3,prefix-screen}/`;
+  the shared note is `~/agents-memory/abla/ablac-json-ascii-spans.md`.
+
 - [ ] **Cached small blocks cannot be reused for another size.** The native lists
   (`__ablaRuntimeHostSmallLists`) use an adaptive 32 MiB floor and 128 MiB ceiling;
   the compiler explicitly caps them at 32 MiB. A smaller budget does not evict
