@@ -355,69 +355,6 @@ Package-side work (not changed from ablac):
 
 ## Compile time and memory
 
-- [ ] **JSON parsing: ASCII word scan needs a short-string gate.** No-go screen on
-  2026-11-06/07 with published v0.2.48: one server on CPU0, 64 connections,
-  3 s warmup and three 10 s samples. Acceptance cases used alternating
-  baseline/candidate pairs; the other cases used alternating variant groups.
-  Inlining the word scanner improved `json-strings-4k` by 77.2%, but the full
-  21-scenario screen regressed items-128 by 5.7% and roles-64 by 7.7%.
-  Outlining it retained +77.6% on strings but still lost 4.4% on items.
-  Both private scalar wrappers were already out of line; this was not an
-  inlining-threshold crossover.
-  Running the original scalar path for the first K ASCII bytes before the
-  outlined word scan reduced the short-case penalty. Fixed-count probes
-  (100,000 requests after 10,000 warmup, server CPU8, three reordered rounds)
-  measured these changes in server user instructions per request:
-
-  | Scalar prefix | strings-4k | items-128 | roles-64 |
-  | --- | ---: | ---: | ---: |
-  | K=16 | -66.92% | +0.241% | +0.605% |
-  | K=32 | -66.67% | +0.223% | +0.493% |
-
-  The final K=32 throughput screen improved strings by **75.88% paired median**
-  (92,903 to 163,261 req/s by medians), but items lost **0.82% paired median**
-  (82,668 to 82,018 req/s by medians). All three items pairs were negative:
-  -0.27%, -0.82%, -1.44%. It failed the agreed rule requiring a median no worse
-  than -1.5% **and** at least one nonnegative pair. Stopped before roles or the
-  remaining matrix; no full-suite or bootstrap claim. Exact scalar differential,
-  548 JSON golden blocks, native/fast/GC-stress, hostless Wasm and 84 persistent
-  server-response checks passed; correctness alone did not meet the runtime bar.
-  No production changes retained. Frozen sources, binaries, LLVM IR, commands and raw
-  results remain under
-  `worktrees/ablac-json-span/build/json-span-lab/{attempt1,attempt2,attempt3,prefix-screen}/`;
-  the shared note is `~/agents-memory/abla/ablac-json-ascii-spans.md`.
-  **Length-gated follow-up (decision #43), also no-go, 2026-11-07, published v0.2.49.**
-  items-128's strings are 2–18 bytes and never reached the word scan even with K=32;
-  its cost is the per-string prefix bound and setup, which any length gate also pays.
-  Instruction probes (same method as above):
-
-  | Variant | strings-4k | items-128 | roles-64 |
-  | --- | ---: | ---: | ---: |
-  | K=32 (attempt3) | -66.67% | +0.22% | +0.49% |
-  | K=128 prefix | -65.15% | +0.17% | +0.37% |
-  | `size > 64` / `end - begin > 32` gates | -66.85% | +0.27% | +0.57% |
-
-  K=128 went to throughput (same driver and keep rule, 12:30 UTC window):
-  strings-4k **+77.1% paired median** (pairs 1.686, 1.772, 1.771), items-128
-  **-0.74%** with all three pairs negative (-0.15%, -0.74%, -1.06%): rule failed again;
-  roles and the matrix not run. Correctness passed (548 JSON blocks, native/Wasm paths,
-  text-unicode, exact responses on all 21 scenarios). Next idea, not tried: decide the
-  scan once per document (or per input buffer) so short strings keep the unchanged
-  scalar loop with no per-string setup. K=128 runtime is on branch `perf-json-gate`;
-  lab in `~/archive/ablac-json-gate-2026-11-07/`.
-  **Serialize side shipped (2026-11-07).** Splitting k128 by side showed the parse
-  scan carries the whole short-string cost (items-128 +0.160%, roles-64 +0.33%
-  instructions) and the serialize scan none (+0.009%, -0.02%; strings-4k -23.2%).
-  `__ablaRuntimeJsonStringIsPlain` alone now has the 128-byte prefix and word scan.
-  Throughput (17:30 UTC window, same rule): strings-4k **+16.3%** (pairs 1.155,
-  1.166, 1.163), items-128 +0.42% paired, roles-64 -0.52% paired (one pair
-  positive); the other 18 cases moved -5.4% to +4.8% (json-empty -5.4%,
-  plaintext +4.8%), which instruction counts show as layout: json-empty +0.064%,
-  json-escaped +0.004%, headers-32 0.000%, plaintext +0.005%, json-int64 +0.074%.
-  **What remains open** is the parse side (`__ablaRuntimeJsonFindPlainStringEnd`,
-  -41.9% strings-4k instructions available): decide the scan once per document or
-  input buffer so short strings keep the unchanged scalar loop.
-
 - [ ] **Cached small blocks cannot be reused for another size.** The native lists
   (`__ablaRuntimeHostSmallLists`) use an adaptive 32 MiB floor and 128 MiB ceiling;
   the compiler explicitly caps them at 32 MiB. A smaller budget does not evict
@@ -741,6 +678,18 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   only borrow the index fail `ownership.mutable-borrow`. Nothing changed.
 
 ## Tried, not pursued
+
+- **JSON ASCII word scans without a short-string fast path** (2026-11-06/07,
+  published v0.2.48/v0.2.49). Scanning JSON strings a word at a time won 66-77%
+  on json-strings-4k but cost short strings: an inlined scan lost 5.7% on
+  items-128 and 7.7% on roles-64; an outlined one 4.4% on items. Scalar
+  prefixes (K=32, K=128) and length gates (`size > 64`, `end - begin > 32`)
+  still added +0.17% to +0.27% items-128 instructions, with all three items
+  throughput pairs negative (K=32 -0.82%, K=128 -0.74%). What shipped instead:
+  the serialize side (128-byte prefix, then the word scan; strings-4k +16.3%)
+  and the parse side (a 128-byte prefix whose head tests the common ASCII byte
+  first, then the word scan; strings-4k +49.2%). Labs:
+  `~/archive/ablac-json-gate-2026-11-07/`.
 
 - **Skipping the erased float formatter's second analysis** (2026-11-07,
   master `1a9db095`): a program that erases a float to `any` and interpolates

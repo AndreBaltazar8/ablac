@@ -1,10 +1,10 @@
 import "abla/bytes"
 import "abla/json"
 
-// Serializing a string scans it once for bytes JSON must escape; long ASCII
-// runs take an aligned word scan. Every exceptional byte, at every offset
-// around the word and prefix boundaries and at several start alignments, must
-// give what a per-byte reference expects.
+// Serializing and parsing a string each scan it once for the bytes JSON
+// treats specially; long ASCII runs take an aligned word scan. Every
+// exceptional byte, at every offset around the word and prefix boundaries and
+// at several start alignments, must give what a per-byte reference expects.
 
 fun referencePlain(value: string): bool {
     var index = 0
@@ -16,15 +16,43 @@ fun referencePlain(value: string): bool {
     value.isValidUtf8()
 }
 
-fun quotedMatches(value: string): bool {
+fun spaces(count: int): string {
+    var text = ""
+    var index = 0
+    while (index < count) {
+        text = "$text "
+        index = index + 1
+    }
+    text
+}
+
+// The parser finds a string's end in the source document: the escaped form
+// round-trips through the document, the object reader's read and its skip,
+// at the given offset into the source.
+fun parsedMatches(value: string, quoted: string, shift: int): bool {
+    val parsed = jsonParse("${spaces(shift)}$quoted")
+    val reader = jsonObjectReader("{\"k\":${spaces(shift)}$quoted,\"n\":${spaces(shift)}$quoted}")
+    reader.nextExpectedRaw("k")
+    val read = reader.readString()
+    val skipped = reader.nextExpectedRaw("n")
+    reader.skip()
+    skipped && parsed.succeeded && parsed.value.asString() == value && read == value && reader.finish()
+}
+
+fun quotedMatches(value: string, shift: int): bool {
     val quoted = jsonQuote(value)
     val stringified = jsonStringify(jsonString(value))
-    if (referencePlain(value)) quoted == "\"$value\"" && stringified == quoted
-    else if (!value.isValidUtf8()) quoted == "null"
+    // Unescaped bytes straight in the source: accepted exactly when plain.
+    val raw = jsonParse("${spaces(shift)}\"$value\"")
+    val rawMatches = value.contains("\"") || value.contains("\\") ||
+        (raw.succeeded == referencePlain(value) &&
+            (!raw.succeeded || raw.value.asString() == value))
+    if (!rawMatches) false
+    else if (referencePlain(value)) {
+        quoted == "\"$value\"" && stringified == quoted && parsedMatches(value, quoted, shift)
+    } else if (!value.isValidUtf8()) quoted == "null"
     else {
-        val parsed = jsonParse(quoted)
-        quoted != "\"$value\"" && stringified == quoted &&
-            parsed.succeeded && parsed.value.asString() == value
+        quoted != "\"$value\"" && stringified == quoted && parsedMatches(value, quoted, shift)
     }
 }
 
@@ -48,14 +76,14 @@ fun specials(): array<string> = [
 
 fun lengthChecked(length: int): bool {
     val filler = repeated(length + 16)
-    if (!quotedMatches(filler.slice(0, length))) return false
+    if (!quotedMatches(filler.slice(0, length), 0)) return false
     for (shift in [0, 1, 3, 7]) {
         var position = 0
         while (position < length) {
             for (special in specials()) {
                 val text =
                     "${filler.slice(0, shift + position)}$special${filler.slice(0, length - position)}"
-                if (!quotedMatches(text.slice(shift, text.size))) return false
+                if (!quotedMatches(text.slice(shift, text.size), shift)) return false
             }
             position = position + 1
         }
