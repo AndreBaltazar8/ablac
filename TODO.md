@@ -481,6 +481,19 @@ Package-side work (not changed from ablac):
   scenarios were not measured. Rejected patch and raw samples are in
   `worktrees/ablac-headers-32/build/headers-lab/`. No larger header-summary
   rewrite is planned for now.
+- [ ] **`abla-compare` one-worker parameter routing trails Zig** (2026-11-06):
+  parameters measured 276,924 versus 308,076 requests/s. The locked abla-web
+  `webNoEscapeRoute` and stdlib `HttpRouter` both use `httpMatchPath`; the
+  direct web routes do not have a precompiled route object. A bounded native
+  segment-scan prototype retained the checked matcher for compile time and
+  passed matcher/capture/precedence differential, GC-stress and hostless Wasm
+  tests. On 2026-11-07, three alternating pairs gave median gains of 1.81%
+  (parameters), 2.77% (parameters-16) and 1.54% (route-tail-128). Other
+  scenario ratios of medians included context -4.22%, json-int64 -6.04%, and
+  body-1k -4.87%; grouped samples may include drift, so those drops are not
+  attributed to the change. They exceed the noise gate, so this is a no-go.
+  Full samples, baseline/candidate binaries and the uncommitted prototype are
+  in `worktrees/ablac-route-match` (`build/route-lab/measurement.json`).
 - [ ] **A map lookup waits on a cache miss** (2026-11-03): 83% of `__ablaRuntimeMapEntry`'s cycles in
   maps are the load of its slot from a 4 MB slot array; fewer instructions in the probe saved
   0.4%. A denser table (32-bit slots, keys' hashes beside them) would miss less. A prototype
