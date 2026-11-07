@@ -22,6 +22,12 @@ for case in dynamic-fields extension-only; do
 done
 "$compiler" build "$root/tests/cases/erased-float-format/staged.ab" -o "$out/staged" --fast --no-cache
 "$out/staged"
+"$compiler" build "$root/tests/cases/erased-float-format/staged-integer.ab" -o "$out/staged-integer" --fast --no-cache
+"$out/staged-integer"
+if llvm-nm "$out/staged-integer" | grep -q ' abla_erased_to_string$'; then
+    echo 'a staged program without erased floats retained the float formatter' >&2
+    exit 1
+fi
 cat > "$out/build-wasm.ab" <<WASM
 import "abla/wasm/build"
 val a = #wasmBuildModule("erased-float", "tests/cases/erased-float-format/main.ab", "build/erased-float-format/release.wasm", false, false)
