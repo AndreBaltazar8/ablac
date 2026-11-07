@@ -389,7 +389,7 @@ Package-side work (not changed from ablac):
 
 ## Compile time and memory
 
-- [ ] **JSON ASCII word scans need a short-string gate.** No-go screen on
+- [ ] **JSON parsing: ASCII word scan needs a short-string gate.** No-go screen on
   2026-11-06/07 with published v0.2.48: one server on CPU0, 64 connections,
   3 s warmup and three 10 s samples. Acceptance cases used alternating
   baseline/candidate pairs; the other cases used alternating variant groups.
@@ -439,6 +439,18 @@ Package-side work (not changed from ablac):
   scan once per document (or per input buffer) so short strings keep the unchanged
   scalar loop with no per-string setup. K=128 runtime is on branch `perf-json-gate`;
   lab in `~/archive/ablac-json-gate-2026-11-07/`.
+  **Serialize side shipped (2026-11-07).** Splitting k128 by side showed the parse
+  scan carries the whole short-string cost (items-128 +0.160%, roles-64 +0.33%
+  instructions) and the serialize scan none (+0.009%, -0.02%; strings-4k -23.2%).
+  `__ablaRuntimeJsonStringIsPlain` alone now has the 128-byte prefix and word scan.
+  Throughput (17:30 UTC window, same rule): strings-4k **+16.3%** (pairs 1.155,
+  1.166, 1.163), items-128 +0.42% paired, roles-64 -0.52% paired (one pair
+  positive); the other 18 cases moved -5.4% to +4.8% (json-empty -5.4%,
+  plaintext +4.8%), which instruction counts show as layout: json-empty +0.064%,
+  json-escaped +0.004%, headers-32 0.000%, plaintext +0.005%, json-int64 +0.074%.
+  **What remains open** is the parse side (`__ablaRuntimeJsonFindPlainStringEnd`,
+  -41.9% strings-4k instructions available): decide the scan once per document or
+  input buffer so short strings keep the unchanged scalar loop.
 
 - [ ] **Cached small blocks cannot be reused for another size.** The native lists
   (`__ablaRuntimeHostSmallLists`) use an adaptive 32 MiB floor and 128 MiB ceiling;
