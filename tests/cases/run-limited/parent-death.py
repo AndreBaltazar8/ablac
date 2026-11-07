@@ -52,7 +52,7 @@ def kill(pid, sig=signal.SIGKILL):
 with tempfile.TemporaryDirectory(prefix="abla-limiter-test-") as tmp:
     root = pathlib.Path(tmp)
     worker = root / "worker.py"
-    worker.write_text('''import os, pathlib, signal, subprocess, sys, time\nroot = pathlib.Path(sys.argv[1])\nstubborn = sys.argv[2] == "stubborn"\nif stubborn: signal.signal(signal.SIGTERM, signal.SIG_IGN)\ncode = "import os,pathlib,signal,sys,time; " + ("signal.signal(signal.SIGTERM,signal.SIG_IGN); " if stubborn else "") + "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(60)"\nchild = subprocess.Popen([sys.executable, "-c", code, str(root / "child")])\nwhile not (root / "child").exists(): time.sleep(0.005)\n(root / "parent").write_text(str(os.getpid()))\ntime.sleep(60)\n''')
+    worker.write_text('''import os, pathlib, signal, subprocess, sys, time\nroot = pathlib.Path(sys.argv[1])\nstubborn = sys.argv[2] == "stubborn"\nif stubborn: signal.signal(signal.SIGTERM, signal.SIG_IGN)\ncode = "import os,pathlib,signal,sys,time; " + ("signal.signal(signal.SIGTERM,signal.SIG_IGN); " if stubborn else "") + "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(60)"\nchild = subprocess.Popen([sys.executable, "-c", code, str(root / "child")])\nwhile not ((root / "child").exists() and (root / "child").stat().st_size > 0): time.sleep(0.005)\n(root / "parent").write_text(str(os.getpid()))\ntime.sleep(60)\n''')
 
     def run_tree(mode, stubborn=False):
         case = root / (mode + ("-stubborn" if stubborn else ""))
