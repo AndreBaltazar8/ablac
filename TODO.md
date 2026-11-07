@@ -10,6 +10,9 @@
   finishes it. Git history is the record of what got done.
 - Only list what is really open. A task is done when it is verified where it runs (the tests,
   the fixed point, and the target or package it is for), not just when it compiles.
+- The `worktrees/ablac-*` paths cited below were removed on 2026-11-07. Their text evidence
+  is in `~/archive/ablac-cleanup-2026-11-07/evidence/<worktree>.tgz`, uncommitted prototypes
+  in `dirty/`, and every branch in `ablac-all-refs.bundle` (see that directory's README).
 - Any bug or error seen goes here right away, even if it looks minor or unrelated, with what
   was seen and how to reproduce it. Don't only mention it in a report.
 - Keep the measurements on performance items, and what was tried and dropped, so nobody
