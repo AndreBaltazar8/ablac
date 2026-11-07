@@ -1,0 +1,129 @@
+// abla/crypto/hosted's RSA key generation: a generated key signs, verifies, encrypts and decrypts through hosted,
+// round-trips through its own exports, and works both ways with abla/crypto/rsa in one program. Writes the 2048-bit
+// key and its public half to the directory given, for the openssl CLI to check; prints no key material.
+import "abla/crypto/hosted"
+import "abla/crypto/rsa"
+import "abla/fs"
+import "abla/io"
+import "abla/process/arguments"
+import "abla/text"
+
+var failures = 0
+
+fun expect(ok: bool, what: string): void {
+    if (!ok) {
+        failures = failures + 1
+        println("FAIL $what")
+    }
+    return
+}
+
+fun refused(bits: int): void {
+    val key = hostedRsaGeneratePrivateKey(bits)
+    expect(!key.ok() && key.error.contains("2048, 3072, or 4096"),
+        "bits $bits refused: ${key.error}")
+    expect(!key.toPkcs8Der().ok && !key.toPkcs8Pem().ok && !key.toSpkiDer().ok,
+        "no export of a failed key")
+    expect(!key.signPkcs1Sha256("x").ok, "no signing with a failed key")
+    return
+}
+
+fun hostedPublic(key: HostedRsaPrivateKey): HostedRsaPublicKey =
+    hostedRsaPublicKeyFromDer(key.toSpkiDer().bytes)
+
+fun checkHosted(key: HostedRsaPrivateKey, bits: int): void {
+    expect(key.ok() && key.bits == bits, "generates $bits bits: ${key.error}")
+    val public = hostedPublic(key)
+    expect(public.ok() && public.bits == bits, "public half of $bits")
+    val signature = key.signPkcs1Sha256("hosted message")
+    expect(signature.ok && signature.bytes.size == bits / 8, "$bits signs")
+    expect(public.verifyPkcs1Sha256("hosted message", signature.bytes), "$bits verifies")
+    expect(!public.verifyPkcs1Sha256("another message", signature.bytes),
+        "$bits refuses another message")
+    val sealed = public.encryptOaepSha256("a secret")
+    expect(sealed.ok && key.decryptOaepSha256(sealed.bytes).bytes == "a secret",
+        "$bits OAEP round trip")
+    return
+}
+
+// Exports read back to a key that makes the same signature (PKCS#1 v1.5 is deterministic).
+fun checkRoundTrip(key: HostedRsaPrivateKey): void {
+    val der = key.toPkcs8Der()
+    val pem = key.toPkcs8Pem()
+    expect(der.ok && pem.ok && pem.bytes.startsWith("-----BEGIN PRIVATE KEY-----\n"), "exports")
+    val fromDer = hostedRsaPrivateKeyFromDer(der.bytes)
+    val fromPem = hostedRsaPrivateKeyFromPem(pem.bytes)
+    val expected = key.signPkcs1Sha256("round trip").bytes
+    expect(fromDer.ok() && fromDer.signPkcs1Sha256("round trip").bytes == expected,
+        "DER round trip")
+    expect(fromPem.ok() && fromPem.signPkcs1Sha256("round trip").bytes == expected,
+        "PEM round trip")
+    val spki = key.toSpkiPem()
+    val public = hostedRsaPublicKeyFromPem(spki.bytes)
+    expect(spki.ok && spki.bytes.startsWith("-----BEGIN PUBLIC KEY-----\n") && public.ok(),
+        "public PEM")
+    expect(public.toSpkiDer().bytes == key.toSpkiDer().bytes, "public key exports the same DER")
+    expect(public.toSpkiPem().bytes == spki.bytes, "public key exports the same PEM")
+    return
+}
+
+// A hosted key through abla/crypto/rsa, and the other way.
+fun checkInterop(hosted: HostedRsaPrivateKey, pure: RsaPrivateKey): void {
+    val hostedPem = hosted.toPkcs8Pem().bytes
+    val pureOfHosted = rsaPrivateKeyFromPem(hostedPem)
+    val pureOfHostedPublic = rsaPublicKeyFromDer(hosted.toSpkiDer().bytes)
+    expect(pureOfHosted.ok() && pureOfHostedPublic.ok(),
+        "pure reads the hosted key: ${pureOfHosted.error}")
+    val hostedSignature = hosted.signPkcs1Sha256("interop").bytes
+    expect(pureOfHostedPublic.verifyPkcs1Sha256("interop", hostedSignature),
+        "pure verifies hosted's signature")
+    expect(pureOfHosted.signPkcs1Sha256("interop").bytes == hostedSignature,
+        "pure signs as hosted does")
+    val toHosted = pureOfHostedPublic.encryptOaepSha256("pure to hosted")
+    expect(toHosted.ok && hosted.decryptOaepSha256(toHosted.bytes).bytes == "pure to hosted",
+        "hosted decrypts pure's OAEP")
+    val toPure = hostedPublic(hosted).encryptOaepSha256("hosted to pure")
+    expect(toPure.ok && pureOfHosted.decryptOaepSha256(toPure.bytes).bytes == "hosted to pure",
+        "pure decrypts hosted's OAEP")
+
+    val purePem = pure.toPkcs8Pem()
+    val hostedOfPure = hostedRsaPrivateKeyFromPem(purePem.bytes)
+    expect(purePem.ok && hostedOfPure.ok() && hostedOfPure.bits == 2048,
+        "hosted reads the pure key: ${hostedOfPure.error}")
+    val pureSignature = pure.signPkcs1Sha256("interop").bytes
+    expect(hostedPublic(hostedOfPure).verifyPkcs1Sha256("interop", pureSignature),
+        "hosted verifies pure's signature")
+    expect(hostedOfPure.signPkcs1Sha256("interop").bytes == pureSignature,
+        "hosted signs as pure does")
+    return
+}
+
+fun main: int {
+    refused(0)
+    refused(1024)
+    refused(2047)
+    refused(2049)
+    refused(8192)
+    refused(-2048)
+    val key = hostedRsaGeneratePrivateKey()
+    checkHosted(key, 2048)
+    checkRoundTrip(key)
+    val other = hostedRsaGeneratePrivateKey(2048)
+    expect(other.ok() && other.toSpkiDer().bytes != key.toSpkiDer().bytes, "two keys differ")
+    checkHosted(hostedRsaGeneratePrivateKey(3072), 3072)
+    checkHosted(hostedRsaGeneratePrivateKey(4096), 4096)
+    val pure = rsaGeneratePrivateKey(2048)
+    expect(pure.ok(), "pure key for interop")
+    checkInterop(key, pure)
+    val directory = processArgument(0)
+    if (directory != "") {
+        expect(path(directory + "/hosted.pem").writeText(key.toPkcs8Pem().bytes),
+            "writes the private key")
+        expect(path(directory + "/hosted.der").writeText(key.toPkcs8Der().bytes),
+            "writes the private key DER")
+        expect(path(directory + "/hosted-spki.pem").writeText(key.toSpkiPem().bytes),
+            "writes the public key")
+    }
+    if (failures == 0) println("hosted keygen: ok")
+    if (failures == 0) 0 else 1
+}

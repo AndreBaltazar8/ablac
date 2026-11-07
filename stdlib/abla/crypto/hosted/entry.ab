@@ -13,6 +13,7 @@
 import "libcrypto.ab"
 import "../../jwt/libcrypto.ab"
 import "pkcs12.ab"
+import "abla/crypto"
 import "abla/text"
 import "abla/unsafe/memory"
 import "abla/unsafe/memory/raw"
@@ -284,6 +285,48 @@ private trusted fun rsaPublicFrom(key: i64*, unreadable: string): HostedRsaPubli
     val bits = rsaInspect(key, false)
     if (bits == -1) return rsaPublicFailed("not an RSA key")
     HostedRsaPublicKey(nativePointerAddress(key), bits, "")
+}
+
+private val rsaKeyType = 6
+private val rsaOperationKeygen = 4
+private val rsaControlKeygenBits = 4099
+
+// A fresh RSA private key of 2048, 3072 or 4096 bits with e = 65537 (OpenSSL's default),
+// the sizes abla/crypto/rsa's rsaGeneratePrivateKey makes. OpenSSL draws the primes from
+// its own seeded generator and frees and cleanses its working copies. The key is in
+// OpenSSL's memory and wiped when dropped; hostedRsaPrivateKey.toPkcs8Der and toPkcs8Pem
+// copy it out into Abla strings, which can't be wiped.
+trusted fun hostedRsaGeneratePrivateKey(bits: int = 2048): HostedRsaPrivateKey {
+    if (bits != 2048 && bits != 3072 && bits != 4096) {
+        return rsaPrivateFailed("RSA generation requires 2048, 3072, or 4096 bits")
+    }
+    val failed = "OpenSSL could not generate an RSA key"
+    val context = EVP_PKEY_CTX_new_id(rsaKeyType, nativeNullPointer())
+    if (pointerIsNull(context)) {
+        ERR_clear_error()
+        return rsaPrivateFailed(failed)
+    }
+    val cell = nativeByteBuffer(8)
+    cell.storeI64(0, 0)
+    val generated = EVP_PKEY_keygen_init(context) == i32(1) &&
+        EVP_PKEY_CTX_ctrl(
+            context, rsaKeyType, rsaOperationKeygen, rsaControlKeygenBits, bits,
+            nativeNullPointer()
+        ) == i32(1) &&
+        EVP_PKEY_keygen(context, cell.address) == i32(1)
+    val key = nativePointerFromAddress(cell.loadI64(0))
+    cell.close()
+    EVP_PKEY_CTX_free(context)
+    ERR_clear_error()
+    if (!generated) {
+        if (!pointerIsNull(key)) EVP_PKEY_free(key)
+        return rsaPrivateFailed(failed)
+    }
+    val result = rsaPrivateFrom(key, failed)
+    if (result.ok() && result.bits != bits) {
+        return rsaPrivateFailed(failed)
+    }
+    result
 }
 
 private trusted fun cryptoBioFor(text: string): i64* =
@@ -612,4 +655,99 @@ trusted fun HostedRsaPrivateKey.decryptPkcs1Legacy(ciphertext: string): CryptoRe
     if (this.handle == 0) return cryptoFailed(this.error)
     if (this.bits < rsaLegacyMinimumBits) return cryptoFailed("the key has under 1024 bits")
     rsaCipher(false, this.handle, rsaPaddingPkcs1, nativeNullPointer(), ciphertext)
+}
+
+// ---------------------------------------------------------------------------
+// RSA export
+
+private fun rsaPem(label: string, der: string): string {
+    val encoded = base64Encode(der)
+    var body = ""
+    var at = 0
+    while (at < encoded.size) {
+        val end = if (at + 64 < encoded.size) at + 64 else encoded.size
+        body = body + encoded.slice(at, end) + "\n"
+        at = end
+    }
+    "-----BEGIN $label-----\n" + body + "-----END $label-----\n"
+}
+
+private fun rsaExportFailed(): CryptoResult = cryptoFailed("OpenSSL could not export the RSA key")
+
+// The same DER the key was read from: PKCS#8 PrivateKeyInfo. OpenSSL's copy of the
+// encoding is freed with cleansing; the buffer here is wiped when it fails.
+private trusted fun rsaExportPrivateDer(handle: int): CryptoResult {
+    if (handle == 0) return rsaExportFailed()
+    val info = EVP_PKEY2PKCS8(nativePointerFromAddress(handle))
+    if (pointerIsNull(info)) {
+        ERR_clear_error()
+        return rsaExportFailed()
+    }
+    val length = i2d_PKCS8_PRIV_KEY_INFO(info, nativeNullPointer())
+    if (length <= 0 || length > 65536) {
+        PKCS8_PRIV_KEY_INFO_free(info)
+        ERR_clear_error()
+        return rsaExportFailed()
+    }
+    val output = nativeByteBuffer(length + 1)
+    val cursor = nativeByteBuffer(8)
+    cursor.storeI64(0, nativePointerAddress(output.address))
+    val written = i2d_PKCS8_PRIV_KEY_INFO(info, cursor.address)
+    cursor.close()
+    PKCS8_PRIV_KEY_INFO_free(info)
+    ERR_clear_error()
+    if (written == length) return CryptoResult(output.adoptString(length), true, "")
+    OPENSSL_cleanse(output.address, length + 1)
+    output.close()
+    rsaExportFailed()
+}
+
+private trusted fun rsaExportPublicDer(handle: int): CryptoResult {
+    if (handle == 0) return rsaExportFailed()
+    val key = nativePointerFromAddress(handle)
+    val length = i2d_PUBKEY(key, nativeNullPointer())
+    if (length <= 0 || length > 65536) {
+        ERR_clear_error()
+        return rsaExportFailed()
+    }
+    val output = nativeByteBuffer(length + 1)
+    val cursor = nativeByteBuffer(8)
+    cursor.storeI64(0, nativePointerAddress(output.address))
+    val written = i2d_PUBKEY(key, cursor.address)
+    cursor.close()
+    ERR_clear_error()
+    if (written == length) return CryptoResult(output.adoptString(length), true, "")
+    output.close()
+    rsaExportFailed()
+}
+
+// An unencrypted PKCS#8 PrivateKeyInfo, which hostedRsaPrivateKeyFromDer reads back.
+// The copy is an Abla string and can't be wiped: write it where it must go and drop it.
+trusted fun HostedRsaPrivateKey.toPkcs8Der(): CryptoResult =
+    if (this.handle == 0) cryptoFailed(this.error) else rsaExportPrivateDer(this.handle)
+
+// The same as a PRIVATE KEY PEM, which hostedRsaPrivateKeyFromPem reads back.
+trusted fun HostedRsaPrivateKey.toPkcs8Pem(): CryptoResult {
+    val der = this.toPkcs8Der()
+    if (!der.ok) return der
+    CryptoResult(rsaPem("PRIVATE KEY", der.bytes), true, "")
+}
+
+// The public half as a SubjectPublicKeyInfo, which hostedRsaPublicKeyFromDer reads.
+trusted fun HostedRsaPrivateKey.toSpkiDer(): CryptoResult =
+    if (this.handle == 0) cryptoFailed(this.error) else rsaExportPublicDer(this.handle)
+
+trusted fun HostedRsaPrivateKey.toSpkiPem(): CryptoResult {
+    val der = this.toSpkiDer()
+    if (!der.ok) return der
+    CryptoResult(rsaPem("PUBLIC KEY", der.bytes), true, "")
+}
+
+trusted fun HostedRsaPublicKey.toSpkiDer(): CryptoResult =
+    if (this.handle == 0) cryptoFailed(this.error) else rsaExportPublicDer(this.handle)
+
+trusted fun HostedRsaPublicKey.toSpkiPem(): CryptoResult {
+    val der = this.toSpkiDer()
+    if (!der.ok) return der
+    CryptoResult(rsaPem("PUBLIC KEY", der.bytes), true, "")
 }

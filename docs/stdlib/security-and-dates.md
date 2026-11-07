@@ -112,6 +112,9 @@ copy is freed and cleansed when it's dropped.
 | `hostedRsaPrivateKeyFromPkcs12(der, password)` | a `.pfx`. OpenSSL 3 refuses RC2 (what OpenSSL 1.x's `pkcs12 -export` writes) unless re-encrypted: `openssl pkcs12 -in old.pfx -legacy -nodes \| openssl pkcs12 -export -out new.pfx` |
 | `hostedRsaPublicKeyFromPem(pem)` | `PUBLIC KEY` (SubjectPublicKeyInfo), `RSA PUBLIC KEY`, or the key of a `CERTIFICATE`. The certificate's chain and dates aren't checked |
 | `hostedRsaPublicKeyFromDer(der)`, `hostedRsaPublicKeyFromCertificateDer(der)` | SubjectPublicKeyInfo; an X.509 certificate's key |
+| `hostedRsaGeneratePrivateKey(bits = 2048)` | a new key of 2048, 3072 or 4096 bits with e = 65537, the sizes and exponent of `rsaGeneratePrivateKey` in `abla/crypto/rsa`; any other size fails. OpenSSL draws the primes, and the key stays in its memory, wiped on drop |
+
+A key, generated or read, exports with `private.toPkcs8Der()` and `private.toPkcs8Pem()` (unencrypted PKCS#8, which `hostedRsaPrivateKeyFromDer` and `FromPem` read back and `abla/crypto/rsa` reads too), and with `toSpkiDer()` and `toSpkiPem()` on a private or a public key (SubjectPublicKeyInfo, read by `hostedRsaPublicKeyFromDer` and `FromPem`). An export is a `CryptoResult` of Abla bytes: it can't be wiped, so write it where it must go and drop it. Nothing in an error names key material.
 
 | Method | Keys | Notes |
 |---|---|---|
@@ -136,9 +139,10 @@ that a compiler can't make it stop early. Different lengths are unequal at once.
 | AES | AES-NI, ARMv8 instructions, or vector code (VPAES) | a CPU with none of them falls back to OpenSSL's table code, which isn't constant-time. Any x86-64 or ARMv8 server of the last decade has them |
 | GCM's tag | carry-less multiply instructions | without them, table-based |
 | Verification and public-key encryption | no secret is involved in the key | |
+| Key generation | OpenSSL's generator, with its working numbers freed and cleansed | the exported PKCS#8 or PEM is an Abla string, like the key bytes below |
 | Key bytes in Abla strings | none: strings can't be wiped | PEM text, passphrases and `secureRandomBytes` results stay in memory until it is reused. Read them late and don't keep them. Failed decryptions cleanse their buffer, and successful ones are the caller's |
 
-Left out so far: RSA-PSS, RSA key generation, ECDSA signing, Ed25519, ChaCha20-Poly1305, HKDF,
+Left out so far: RSA-PSS, ECDSA signing, Ed25519, ChaCha20-Poly1305, HKDF,
 SHA-3, SHA-224, CBC without padding, GCM with other nonce or tag sizes, and OAEP labels. Nothing here needs them
 yet, and each is a short wrapper around OpenSSL when something does.
 
@@ -237,6 +241,11 @@ than that.
 on this CPU and on `qemu-x86_64 -cpu qemu64` with neither instruction; refusals; random inputs against
 `abla/crypto/hosted` and the `openssl` CLI, both ways. Known answers on AArch64 under qemu (with AES and PMULL) and
 on Wasm under Node. On Xtensa it's compiled, and read by `tools/test-ct.sh`, not run. RSA decryption vectors run on the hosted native paths.
+
+`tools/test-crypto-hosted-keygen.sh`: `hostedRsaGeneratePrivateKey` at 2048, 3072 and 4096 bits signs, verifies, encrypts and
+decrypts through hosted; its exports read back to the same key; it works both ways with `abla/crypto/rsa` in one program; other sizes
+are refused; and the `openssl` CLI checks the 2048-bit key (consistency, e = 65537, its signature) and that its exports are byte-equal to
+openssl's.
 
 ## Dates: `abla/date`
 
