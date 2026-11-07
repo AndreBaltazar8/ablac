@@ -104,7 +104,7 @@ fun main {
 A `FileWatch` made by `watchFile` compares each file's modification time, size, inode and
 change time from one stat, so a rewrite inside one clock tick is still seen when it changes
 the size or swaps in a new file, as `writeTextAtomic` does. The modification time alone can
-repeat there: the kernel stamps a file nobody has read yet from a clock that ticks every few
+repeat there: kernels before 6.13 stamp a file nobody has read yet from a clock that ticks every few
 milliseconds.
 
 `writeText` and `writeTextAtomic` accept creation modes from `0o000` through
