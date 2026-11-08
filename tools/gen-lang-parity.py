@@ -496,6 +496,162 @@ def whens():
     write("when", DECLARATIONS, cases)
 
 
+def escapes():
+    cases = []
+    cases.append(("literals", [
+        "val tab = " + o("string", r'"a\tb\\c\"d\$e\0f\x41é\u{1F600}\n"'),
+        'out.append("size ${tab.size} cp ${tab.codePointCount()}")',
+        "var sum = 0",
+        "for (b in tab) sum = sum * 31 + b",
+        'out.append("bytes ${sum}")',
+        "val raw = " + o("string", '"""a "quote", $HOME and \\n"""'),
+        'out.append("raw ${raw.size} [${raw}]")',
+        "val dollars = " + o("string", r'"cost: $ \$5 $5 ${1 + 1}$"'),
+        'out.append("dollar [${dollars}]")',
+        "val binary = " + o("string", r'"\xff\xfe\x00\x80"'),
+        'out.append("binary ${binary.size} ${binary[0]} ${binary[1]} ${binary[2]} ${binary[3]}'
+        ' ${binary.isValidUtf8()}")',
+        "val multi = " + o("string", '"line one\nline two"'),
+        'out.append("multi ${multi.size} ${multi.split("\\n").size}")',
+        "val a = " + o("string", '"x"'),
+        'out.append("names $a$a ${a}b $a.size ${a.size}")',
+        "val m = " + o("int", "-9223372036854775807 - 1"),
+        'out.append("min ${m} ${m + 1} ${-(m + 1)} ${m / -1} ${m % -1} ${i32(-2147483647 - 1)}")',
+    ]))
+    write("escapes", DECLARATIONS, cases, imports=("abla/text",))
+
+
+GENERIC_DECLARATIONS = DECLARATIONS + [
+    "class Box<T>(val value: T) {",
+    "    fun get(): T = this.value",
+    "}",
+    "class Pair<A, B>(val first: A, val second: B)",
+    "fun <T> firstOf(items: array<T>): T = items[0]",
+    "fun <T, R> array<T>.mapped(f: (T) -> R): array<R> {",
+    "    val out: array<R> = []",
+    "    for (item in this) out.append(f(item))",
+    "    out",
+    "}",
+    "fun <K, V> Map<K, V>.valueOr(key: K, fallback: V): V {",
+    "    val found = this.get(key)",
+    "    if (found != null) found else fallback",
+    "}",
+]
+
+
+def generics():
+    cases = []
+    cases.append(("instances", [
+        'out.append("first ${firstOf([' + o("int", "3") + ', 4])} ${firstOf(['
+        + o("string", '"a"') + ', "b"])} ${firstOf([u8(200)])}")',
+        'val words = [' + o("int", "1") + ', 2].mapped { n -> "n${n}" }',
+        'out.append("mapped ${words[1]} ${words.size} ${[1, 2, 3].mapped { n -> n * n }.size}")',
+        "val box = Box(" + o("int", "7") + ")",
+        'val small: Box<u8> = Box(200)',
+        'val text = Box<string>(' + o("string", '"written"') + ")",
+        'out.append("box ${box.get() + 1} ${small.get()} ${text.get()} ${Box(Box(5)).get().get()}")',
+        "val ages: Map<string, int> = Map()",
+        'ages.set("ada", ' + o("int", "36") + ")",
+        'out.append("valueOr ${ages.valueOr("ada", 0)} ${ages.valueOr("bob", -1)}")',
+        'out.append("pair ${Pair("x", 2).first} ${Pair(' + o("int", "1") + ', "y").second}")',
+        "val boxes: array<Box<string>> = [Box(" + o("string", '"p"') + '), Box("q")]',
+        'var joined = ""',
+        'for (b in boxes) joined = joined + b.get()',
+        'out.append("boxes ${joined}")',
+    ]))
+    write("generics", GENERIC_DECLARATIONS, cases)
+
+
+def anys():
+    cases = []
+    cases.append(("erasure", [
+        "val xs: array<any> = [" + o("int", "1") + ', "a", true, 2.5, f64ToF32(2.5), -7, "a"]',
+        "var text = \"\"",
+        'for (x in xs) text = text + "${x};"',
+        'out.append("shown ${text}")',
+        "var eq = \"\"",
+        "var i = 0",
+        "while (i < xs.size) {",
+        "    var j = 0",
+        "    while (j < xs.size) {",
+        '        eq = eq + (if (xs[i] == xs[j]) "1" else "0")',
+        "        j = j + 1",
+        "    }",
+        '    eq = eq + "/"',
+        "    i = i + 1",
+        "}",
+        'out.append("equal ${eq}")',
+    ]))
+    write("any", DECLARATIONS, cases, imports=("abla/float", "abla/float/text"))
+
+
+def control():
+    cases = []
+    cases.append(("loops", [
+        "var found = \"\"",
+        "var i = 0",
+        "while (i < " + o("int", "6") + ") {",
+        "    var j = 0",
+        "    while (j < 6) {",
+        "        j = j + 1",
+        "        if (j == 2) continue",
+        "        if (j > 4) break",
+        "        if (i == 3) { j = 100; continue }",
+        '        found = found + "${i}${j},"',
+        "    }",
+        "    i = i + 1",
+        "}",
+        'out.append("nested ${found}")',
+        "var acc = 0",
+        "for (a in 0 until 5) {",
+        "    for (b in [10, 20, 30]) {",
+        "        if (b == 20 && a % 2 == 0) continue",
+        "        acc = acc * 3 + a + b",
+        "    }",
+        "}",
+        'out.append("for ${acc}")',
+    ]))
+    cases.append(("assignment", [
+        "val xs = [" + o("int", "10") + ", 20, 30]",
+        "xs[1] += " + o("int", "5"),
+        "xs[2] -= 7",
+        "xs[0] *= 3",
+        'out.append("elements ${showInts(xs)}")',
+        "val c = Counter(" + o("int", "100") + ", 2)",
+        "c.count -= 30",
+        "c.count += c.step * 5",
+        'out.append("field ${c.count}")',
+        "val x = " + o("int", "1"),
+        "var log = \"\"",
+        "if (x > 0) {",
+        "    val x = 2",
+        "    log = log + \"${x}\"",
+        "    if (x > 1) {",
+        "        val x = 3",
+        "        log = log + \"${x}\"",
+        "    }",
+        "}",
+        'out.append("shadow ${log}${x}")',
+    ]))
+    cases.append(("recursion", [
+        "out.append(\"fact ${factorial(" + o("int", "20") + ")} ${fib(" + o("int", "22") + ")}\")",
+        "out.append(\"deep ${depthSum(" + o("int", "3000") + ")}\")",
+        "out.append(\"early ${firstNegative([" + o("int", "3") + ", 4, -5, 6, -7])} ${firstNegative([1, 2])}\")",
+    ]))
+    declarations = DECLARATIONS + [
+        "fun factorial(n: int): int = if (n <= 1) 1 else n * factorial(n - 1)",
+        "fun fib(n: int): int = if (n < 2) n else fib(n - 1) + fib(n - 2)",
+        "fun depthSum(n: int): int = if (n == 0) 0 else n + depthSum(n - 1)",
+        "fun firstNegative(values: array<int>): int {",
+        "    for (v in values) {",
+        "        if (v < 0) return v",
+        "    }",
+        "    0",
+        "}",
+    ]
+    write("control", declarations, cases)
+
+
 def main():
     strings()
     arrays()
@@ -504,6 +660,10 @@ def main():
     closures()
     nullables()
     whens()
+    escapes()
+    generics()
+    anys()
+    control()
 
 
 main()
