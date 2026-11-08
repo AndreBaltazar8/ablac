@@ -863,6 +863,26 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   generation units 1.42 GB (−16%); the wall times (38.6 s against 50.4 s) are not comparable at that load. Units cut
   the peak a little and the child compilers each parse the module again, so the 1.9 GB of a
   single release `llc` is untouched: only fewer or smaller functions per `llc` would help.
+- [ ] **Where the runtime benchmarks spend their instructions** (2026-11-08, master `e42b1b99`, release
+  builds, `perf record -e cpu_core/instructions/u` pinned to one P-core, symbols named through each
+  program's `abla.source` attributes). strings (2.07 G): `main` 20% (the inlined slice/indexOf loops),
+  `__ablaRuntimeHostPressureCollect` 17.9%, `abla_to_string` 17.0%, `_int_malloc` 12.1%,
+  `AllocateOutOfLine` 5.8%, `StringConcat4` 5.6%, memmove 4.4%. trees (12.35 G): the collector 33.4% plus
+  `HostMarkPointer` 4.5%, `check` 20.9%, `make` 16.4%, `ObjectBlock` 14.9%, `abla_not_equal` 4.3%.
+  dispatch (3.51 G): 99.7% in `main`, IPC 2.9, nothing to win in the runtime. json-readers (22.1 G):
+  `readNumber` 15.1%, the collector 13.0%, `jsonParseValue` 7.9%, `HostMarkPointer` 7.1%, `next` 5.0%,
+  `array_append` 5.0%, `appendText` 4.7%, malloc 4.6%, `abla_to_string` 3.9%. So the collector is 13 to 33% of
+  three of the four (see "A collection still visits every allocation" below), and integer-to-text is 17% of
+  strings. Done from it: `x == null` and `x != null` on a nullable value lowered to a boxed `null`
+  constant, the generic `abla_not_equal` call (a wrapper that is not inlined), a boxed bool result and an
+  `abla_as_bool` re-test, and made the `&&` join a boxed local; they are now one inline tag test
+  (`value.is.null` / `value.is.not.null`, tag 1 is null) and a native `i1`. Instructions, baseline
+  compiler against the change, same master: trees 12,403 M to 10,514 M (-15.23%), maps -3.03%,
+  json-readers -0.33%, json-megabyte -0.12%, strings, dispatch, fib, matrix, nbody, sieve unchanged
+  (+-0.00%); peak RSS within +-0.3% on all. `tools/test-null-compare.sh` pins the results (fast and
+  release, and under `#`) and that the release IR has the inline test and no generic equality call.
+  Left in `check`: each field read of a reference is still a boxed `abla_field_get_reference` call plus
+  copies through value slots; `abla_to_string` has not been looked at.
 - [ ] **Per-call boxing in the lowering.** 17% of the IR's instructions are
   `alloca %AblaValue` (146K in that program), with as many stores and loads around them
   and 29K `abla_i64` boxing calls. `opt`'s time is mostly the inliner, instcombine and SROA
