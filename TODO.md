@@ -185,6 +185,17 @@
   produced compiler was not measured. Imports are dropped, not committed. A new approach
   should test cleanup's effect on serial CGSCC inline costs and decisions. Call-graph
   clustering and other reorderings remain unmeasured after this timebox, rather than disproved.
+  Screened again 2026-11-08 for a byte-identical gain. `opt -time-passes` of
+  `BOOTSTRAP_COMPILER_RELEASE_PASSES` over the compiler's own IR (22 MB of bitcode) took 24.2 s on one P-core
+  under load; shares of that run: SROA 15.0%, the inliner 14.8%, InstCombine 9.4%, bitcode writing 8.6%
+  (the one output write), EarlyCSE 7.6%, AlwaysInliner 7.3%, SimplifyCFG 6.1%, IPSCCP 4.4%, LICM 4.4%,
+  GlobalOpt 3.4%, MemCpyOpt 3.0%, the verifier 2.3%. Output is byte-identical with `-disable-verify`
+  (17,884,212 B both) for this input; that saves at most 2.3% and drops the check that catches a bad pass, so it
+  is under the 10% bar and not worth the trade. Separate wall times of that command (30.4 and 33.9 s with the
+  verifier, 33.2 and 24.8 s without) are load noise. How much of the inliner's 14.8% is cleanup inside the
+  CGSCC was not measured separately; it is at most that, and the compact pipeline above (−12.4% of serial
+  instructions) is the only variant that reached 10%, but it changes the bitcode. A byte-identical 10% would need
+  the serial passes' work to shrink or to run in parallel, which these measurements don't show. Not pursued.
 
 - [ ] **Drop the clean-up of old build transactions** (`bootstrapRemoveOldBuildTransactions` in `src/toolchain.ab`,
   its call in `src/orc_main.ab`, docs/programmable-builds.md) once no compiler up to 0.2.32, which made
