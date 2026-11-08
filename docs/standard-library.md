@@ -18,6 +18,7 @@ carry them.
 | [256-bit integers](stdlib/uint256.md) | `abla/uint256`, `abla/int256` ([int256](stdlib/int256.md)) |
 | [128-bit integers](stdlib/uint128.md) | `abla/uint128`, `abla/int128` ([int128](stdlib/int128.md)) |
 | [UUIDs](stdlib/uuid.md) | `abla/uuid` |
+| [Regular expressions](stdlib/regex.md) | `abla/regex` |
 | [Hashing, encryption, encoding and dates](stdlib/security-and-dates.md) | `abla/crypto`, `abla/crypto/hosted`, `abla/date` |
 | [Testing](stdlib/testing.md) | `abla/test` and `ablac test` |
 | [JSON](json.md) | `abla/json`, `abla/http/json`, `$json` |
@@ -59,6 +60,7 @@ Built into the language rather than imported: `string`, arrays, `Map`,
 | `abla/process/metrics` | the process's CPU time, resident/virtual memory, open descriptors and their limit, start time and tracked heap bytes |
 | `abla/random` | bounded cryptographic entropy (`getrandom`) |
 | `abla/uuid` | random UUIDv4, time-ordered UUIDv7, bytes and strict text parsing |
+| `abla/regex` | linear-time regular expressions: find, findAll, replace, groups |
 | `abla/random/hosted` | the same function under its hosted name, `hostedSecureRandomBytes` |
 | `abla/random/result` | `SecureRandomResult` |
 | `abla/memory` | heap limit, collection mode, `memoryCollect()`, live-byte statistics |

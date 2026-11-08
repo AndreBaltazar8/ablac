@@ -8,7 +8,8 @@ and output. `$` is compared with Python's `\\Z` (end of text only).
   tools/fuzz-regex [--seeds A-B] [--cases N] [--compiler PATH] [--keep]
   tools/fuzz-regex --program   # patterns known to differ, see the notes
 """
-import argparse, os, random, re, subprocess, sys, tempfile
+import argparse, os, random, re, subprocess, sys, tempfile, warnings
+warnings.simplefilter("ignore")
 
 ALPHABET = ["a", "b", "c", "a", "b", "1", "2", "_", " ", "\n", "-", "é", "ü", "😀", "Z"]
 ATOM_CHARS = ["a", "b", "c", "1", "é", "😀", "\\.", "\\-", "\\n", "\\x41", "\\u00e9"]
@@ -112,6 +113,24 @@ def expect(pattern, text):
     return lines
 
 
+# Patterns Python accepts and Abla refuses on purpose (see docs/stdlib/regex.md).
+KNOWN_REJECTIONS = ("lookaround is not supported", "unsupported group syntax",
+                    "backreferences and octal escapes are not supported",
+                    "unsupported escape in a class", "the pattern is too large",
+                    "repeat count is larger than 1000", "groups are nested too deeply",
+                    "multiple repeat", "nothing to repeat", "unknown escape")
+
+
+def mutate(rng, p):
+    """One random edit that often breaks the pattern."""
+    noise = ["(", ")", "[", "]", "{", "}", "*", "+", "?", "|", "\\", "^", "$", "-", "(?", "{,", "\\1", "(?=", "{2,1}"]
+    i = rng.randrange(len(p) + 1)
+    k = rng.random()
+    if k < 0.5 or not p: return p[:i] + rng.choice(noise) + p[i:]
+    if k < 0.8: return p[:i] + p[i + 1:]
+    return p[:i] + rng.choice(noise) + p[i + 1:]
+
+
 def lit(s):
     return '"' + "".join(f"\\x{b:02x}" for b in s.encode()) + '"'
 
@@ -137,7 +156,7 @@ fun spansText(m: RegexMatch): string {
 
 fun run(pattern: string, text: string) {
     val compiled = regexCompile(pattern)
-    if (!compiled.succeeded) { println("ERR"); return }
+    if (!compiled.succeeded) { println("ERR ${compiled.error.message}"); return }
     val re = compiled.regex
     val m = re.find(text)
     println(if (m == null) "F -" else "F " + spansText(m))
@@ -180,11 +199,14 @@ def check(compiler, workdir, cases, tag):
     for p, t in cases:
         want = expect(p, t)
         if want is None:
-            if out[pos] != "ERR": bad.append((p, t, "python rejects, abla accepts", out[pos]))
+            if not out[pos].startswith("ERR"): bad.append((p, t, "python rejects, abla accepts", out[pos]))
             pos += 1
             continue
-        if out[pos] == "ERR":
-            bad.append((p, t, "abla rejects", want)); pos += 1; continue
+        if out[pos].startswith("ERR"):
+            if not out[pos].endswith(KNOWN_REJECTIONS):
+                bad.append((p, t, "abla rejects", out[pos]))
+            pos += 1
+            continue
         got = out[pos:pos + 4]; pos += 4
         if got != want: bad.append((p, t, want, got))
     return bad
@@ -213,6 +235,7 @@ def main():
         cases = []
         while len(cases) < a.cases:
             p = g.alt(0)[0]
+            if g.r.random() < 0.3: p = mutate(g.r, p)
             for _ in range(4): cases.append((p, g.text()))
         bad = check(a.compiler, work, cases, f"s{seed}")
         print(f"seed {seed}: {len(cases)} cases, {len(bad)} disagreements")
