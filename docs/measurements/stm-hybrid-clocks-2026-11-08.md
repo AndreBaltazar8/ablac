@@ -24,18 +24,18 @@ regions that map to the same clock, `retry` and `orElse`; `test-stm` covers the 
 
 `tools/test-stm.sh` (now including `tests/cases/stm/bank-spread.ab`: sixteen accounts 1,200 bytes apart, so every
 transfer and audit moves between clocks, and `tests/cases/stm/blind-spread.ab`: four writers set three accounts in
-three clocks without reading them, two auditors check they agree), `tools/test-stm-wasm-unwinding.sh` and
+three clocks after reading a fourth account, without reading them, two auditors check they agree), `tools/test-stm-wasm-unwinding.sh` and
 `tools/test-gc-stress.sh` pass. Each new test run alone, three runs, against a broken runtime:
 
 | Runtime change | `bank-spread` | `blind-spread` |
 |---|---|---|
 | no revalidation at a clock's first read | fails: 26 to 49 wrong audits | fails: 61 to 327 wrong audits |
 | moving to the second clock samples the first again (`resample`) | fails: totals 1,591 to 1,610 | passes |
-| a new write entry does not move the mode | passes | fails: the commit's panic (a transaction with writes and no mode) |
+| a new write entry does not move the mode | passes | fails: does not finish (killed at the 120 s limit; the commit takes the writes' versions from the clock of the account read first) |
 
 `bank-spread` abandoned between 2,084 and 5,580 attempts in 20 runs (median 2,312), so its "conflicts true" is
-reliable. The commit of a transaction with writes and mode 0 (no access recorded) panics instead of reading the
-sampled list of an earlier attempt.
+reliable. `__ablaRuntimeStmBegin` clears the mask and the list count of the partitioned mode, so a commit in
+that branch never reads an earlier attempt's.
 
 ## Measurements
 
@@ -58,5 +58,9 @@ commit that loses retries); its pairs spread wider than any difference. A four-t
 not apart pays the second clock's sampling at each escalation, and still gains in cycles. Most programs make
 related TVars one after the other, so the consecutive column is as much the result as the own-region one: a gain
 of 12.5% in time and 23% in cycles on disjoint TVars, 12% more instructions, and no gain it can show on shared ones.
-The accesses in the partitioned mode no longer call the mode function (`mode >= 0` guards the call); the
-instruction columns above are from before that change.
+Every access in the partitioned mode still calls the mode function just to get -1 back. Guarding that call inline
+(`mode >= 0`, in either order, or nested) made the compiler's code for the one-clock mode worse: 1,388 to 1,413
+instructions a logged block against 1,339, and the consecutive disjoint run also executed more, so it was not kept.
+The final code adds two stores to `__ablaRuntimeStmBegin` (the sampled mask and list count, so a commit in the
+partitioned branch can never read an earlier attempt's) and executes 1,341 instructions a forced-logged block
+(+8.1%) against the 1,339 measured above; the cycles above are from the code before those two stores.
