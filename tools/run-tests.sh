@@ -28,8 +28,8 @@
 #                        times order this one (default: the last run's, kept in
 #                        build/test-results/suite-history.tsv)
 #
-# Results: <output>/results.tsv (n, exit status, seconds, command; n is the
-# command's place in the recipe), <output>/<n>.log, and <output>/failures.txt
+# Results: <output>/results.tsv (n, exit status, seconds, command, CPU seconds
+# of the command and what it ran; n is the command's place in the recipe), <output>/<n>.log, and <output>/failures.txt
 # (one line per failed command). Exits 1 when any command failed.
 set -uo pipefail
 
@@ -161,10 +161,20 @@ start() { # n
             grep -qx "${BASH_REMATCH[1]}" "$project_root/tools/test-fast-builds.txt"; then
             fast_builds=1
         fi
-        ABLA_TEST_FAST_BUILDS=$fast_builds bash -c "$command" >"$output/$n.log" 2>&1 </dev/null
+        # perl runs the command and reports the user and system seconds of the
+        # command and everything it ran (`times` of the waited children).
+        ABLA_TEST_FAST_BUILDS=$fast_builds perl -e '
+            my $status = system("bash", "-c", $ARGV[0]);
+            my @t = times;
+            open(my $f, ">", $ARGV[1]) or exit 1;
+            printf $f "%.1f\n", $t[2] + $t[3];
+            exit($status == -1 ? 127 : ($status & 127) ? 128 + ($status & 127) : $status >> 8);
+        ' "$command" "$output/$n.cpu" >"$output/$n.log" 2>&1 </dev/null
         status=$?
         end=$(seconds_now)
-        printf '%s %s\n' "$status" "$(awk -v b="$begin" -v e="$end" 'BEGIN { printf "%.1f", e - b }')" \
+        cpu=$(cat "$output/$n.cpu" 2>/dev/null || echo 0)
+        rm -f "$output/$n.cpu"
+        printf '%s %s %s\n' "$status" "$(awk -v b="$begin" -v e="$end" 'BEGIN { printf "%.1f", e - b }')" "${cpu:-0}" \
             >"$output/$n.done.next"
         mv -f "$output/$n.done.next" "$output/$n.done"
     ) &
@@ -174,19 +184,19 @@ start() { # n
 
 # Records every command that has ended; keeps the rest running.
 reap() {
-    local index pids=() ns=() n status seconds command
+    local index pids=() ns=() n status seconds cpu command
     ((${#running_ns[@]} > 0)) || return 0
     for index in "${!running_ns[@]}"; do
         n=${running_ns[$index]}
         if [[ -f $output/$n.done ]]; then
             wait "${running_pids[$index]}" 2>/dev/null
-            read -r status seconds <"$output/$n.done"
+            read -r status seconds cpu <"$output/$n.done"
             rm -f "$output/$n.done"
             command=${commands[n-1]}
-            printf '%s\t%s\t%s\t%s\n' "$n" "$status" "$seconds" "$command" >>"$output/results.tsv"
+            printf '%s\t%s\t%s\t%s\t%s\n' "$n" "$status" "$seconds" "$command" "${cpu:-0}" >>"$output/results.tsv"
             if [[ $status -eq 0 ]]; then
                 passed=$((passed + 1))
-                printf 'PASS %6ss  %s\n' "$seconds" "$command"
+                printf 'PASS %6ss %7scpu  %s\n' "$seconds" "${cpu:-0}" "$command"
             else
                 failed=$((failed + 1))
                 printf 'FAIL %6ss  %s (exit %s, log %s)\n' "$seconds" "$command" "$status" "$output/$n.log"
