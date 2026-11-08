@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Fail closed on unreviewed scaffolding; never check stale arithmetic copies."""
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -32,17 +33,27 @@ with tempfile.TemporaryDirectory(prefix='abla-ct-source-') as directory:
     for name in ['aesExpandSchedule', 'aesSubWord', 'aesDecryptionKeys', 'aesHardwareEncryptAt', 'aesHardwareDecryptAt']:
         assert f'fun {name}(' in region, f'{name} is outside the region the fixtures read'
         assert name == 'aesSubWord' or f'{name}(' in original, f'no fixture calls {name}'
-    for name in ['aesAllocateMemory', 'aesNewKey', 'aesStringAddress', 'aesExpandBytes']:
+    # A call out of the region must be to a helper the checker reads or an intrinsic: a new call to an allocating
+    # or opaque function inside it would otherwise be followed and fail only by accident.
+    allowed = {'GF', 'aesDecLastRound', 'aesDecRound', 'aesEncLastRound', 'aesEncRound', 'aesInvMixColumns', 'aesLoad',
+               'aesLoadBytes', 'aesOrthogonalize', 'aesStore', 'aesSubBytes', 'rotr', 'secretU32', 'storeAddress',
+               'target', 'u32', 'u8x16LoadAddress'}
+    defined = set(re.findall(r'\bfun (?:\w+\.)?(\w+)\(', region))
+    outside = set(re.findall(r'\b([A-Za-z_]\w*)\(', region)) - defined - allowed
+    assert not outside, f'the region calls {sorted(outside)}, which the fixtures do not read; list it or move it out'
+    for name in ['aesKeyBytes', 'aesAllocateMemory', 'aesNewKey', 'aesStringAddress', 'aesExpandBytes']:
         assert f'fun {name}(' in source and f'fun {name}(' not in region, f'{name} must stay outside the region'
 
     # Even a comment in the allocation wrappers, which the checker does not read, requires an explicit review.
-    marker = '    val words = count / 4\n'
-    assert source.count(marker) >= 2
-    (copied / aes).write_text(source.replace(marker, '    // unreviewed scaffold\n' + marker, 1))
-    changed = run()
-    assert changed.returncode != 0
-    assert 'aesWrappers: excluded source changed' in changed.stderr
-    (copied / aes).write_text(source)
+    # The same goes for the public entries that pick the addresses and rounds the read workers get.
+    for marker in ['    val total = 4 * (count / 4 + 7)\n', '    aesHardwareDecryptAt(key.decryption(), key.rounds, input, output, count)']:
+        assert source.count(marker) == 1, marker
+        (copied / aes).write_text(source.replace(marker, '    // unreviewed scaffold\n' + marker, 1) if marker.startswith('    val')
+                                  else source.replace(marker, marker.replace('key.decryption()', 'key.schedule()')))
+        changed = run()
+        assert changed.returncode != 0, marker
+        assert 'aesWrappers: excluded source changed' in changed.stderr, marker
+        (copied / aes).write_text(source)
 
     # Orthogonalization now uses the actual imported helper: no fixture-only
     # substitution of its literal indices or arithmetic remains.

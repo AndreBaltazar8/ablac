@@ -34,7 +34,7 @@ GUARDS = {
     'bnResidueSquare': '2bb8f304e7c5f1047e19dfdb5507ec2bedb6331b54384daab6d73a6dcaf91905',
     'bnFromBytes': 'eeebce423076a53fb063f21cbfb0397b5be468ad3d3ef283e2363eb3b35219c8',
     'aesSoftBlocks': '8ff73661c081f911087468327f77b4eef43a7cfea6b155f883861da35e242c60',
-    'aesWrappers': 'f514a6be88264363408d2cd9db2438af6b8636faf32ab2007dc64b6e3fb1e94b',
+    'aesWrappers': 'd2951fcd9ac1af4d3560dd97d0356b52be56f2322af65db80e98f512b7a3f441',
 }
 
 
@@ -77,7 +77,16 @@ def fixture(name, args, setup, actual, taints, leak_address='work', follow=False
 # plain integers between BEGIN/END AES KEY EXPANSION (the test appends that region to the fixture module, and
 # follows the calls between its functions). What allocates, builds the key object or finds a managed string's
 # address is outside it, and given nothing secret: the guard below makes a change there a reviewed one.
-wrappers = ''.join(body(AES, name) for name in ['aesAllocateMemory', 'aesNewKey', 'aesStringAddress', 'aesExpandBytes'])
+def chunk(source, name):
+    # A function written as one expression: from its `fun` to the next blank line.
+    match = re.search(r'^[^\n]*\bfun ' + name + r'\(.*?(?=\n\n)', source, re.M | re.S)
+    assert match, name
+    return match.group(0)
+
+
+# The wrappers, and the public entries that choose which addresses and how many rounds reach the read workers.
+wrappers = ''.join(body(AES, name) for name in ['aesKeyBytes', 'aesAllocateMemory', 'aesNewKey', 'aesStringAddress', 'aesExpandBytes'])
+wrappers += ''.join(chunk(AES, name) for name in ['AesKey.schedule', 'AesKey.decryption', 'aesHardwareEncrypt', 'aesHardwareDecrypt'])
 guard('aesWrappers', wrappers)
 # A secret never becomes a public integer in the text the checker doesn't read: the compiler rejects branching on,
 # indexing by or dividing a secret, so what is left to the assembly check there is only what the compiler itself
