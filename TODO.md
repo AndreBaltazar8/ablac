@@ -582,6 +582,21 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   compiler image a word at a time with two modulo steps per word (1.3 to 1.6% of a build); two words a step
   gives the same two residues with half the divisions: 3,559.7 M to 3,550.8 M and 3,637.5 M to 3,628.3 M
   instructions (-0.25% each, three alternating runs; the executables are byte-identical).
+- [ ] **Reuse the frontend's work on the standard library between builds** (parked 2026-11-08). In the profile
+  above the compiler's own code is 58 to 59% of a `--fast` build and the standard library's modules are
+  most of what a small program imports, so lexing, parsing, analyzing and lowering them again each
+  build is the largest block left. My estimate, not a measurement: if a build could load their analyzed
+  and lowered form from a cache keyed on the module's sources and the compiler, a small program would drop by
+  a quarter to a third of its instructions; the cost is a serialized form of the analyzer's and lowerer's
+  state (declarations, indexes, inferred results) that must give byte-identical output.
+  Tried first, and not worth keeping (2026-11-08, `--fast` builds of `unsafe-boundary.ab` and
+  `websocket-echo-server.ab`, three to four alternating runs): `__ablaRuntimeStringBytesEqual` comparing
+  eight-byte words when both strings are 8-byte aligned (the precedent of `bootstrapNameEquals`):
+  3,634 M vs 3,638 M and 3,556 M vs 3,556 M instructions, output identical: the compiler's strings are
+  mostly unaligned (literals are `align 1`, names are slices of source text) or short, so the word path
+  rarely runs, and an unaligned word load needs a new intrinsic the v0.2.49 seed cannot compile.
+  `__ablaRuntimeArrayAppend` is already a fast path (room and kind check, one store); its 4.5% is the number
+  of calls, not their cost.
 - [ ] **`opt` and `llc` run one after the other on one module.** In that dev build they are
   22.6 of its 54 wall seconds (opt 11.6, llc 11.0). Emitting the module as N partitions
   during emission and running N opt/llc pairs at once would cut most of that wall time on a
