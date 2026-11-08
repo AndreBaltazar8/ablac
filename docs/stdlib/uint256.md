@@ -55,19 +55,21 @@ for byte. Its name is `uint256` because that's what's asked of it and what Solid
 | `a.toDecimal()`, `uint256FromDecimal(text)` | digits only: no sign, space or point; leading zeros are allowed; null otherwise, or above the range |
 | `a.toHex()`, `uint256FromHex(text)` | `0x`, lower case, no leading zeros, as a JSON-RPC quantity; reads with or without `0x`, in either case |
 | `a.toBytes()`, `uint256FromBytes(bytes)` | 32 bytes, big-endian, an EVM word; reads up to 32, padding on the left |
+| `a.toBytesLittleEndian()`, `uint256FromBytesLittleEndian(bytes)` | the same little-endian: the least significant byte first, and a short input padding at the top |
 | `a.isZero()`, `a.bit(i)`, `a.bitLength()` | |
 
 ## What it doesn't do
 
 - **Mix with other types.** `x + 1` and `x == 0` are `arithmetic.type` and `comparison.type`, as for vectors:
   `x + uint256(1)`. A literal too big for an `int` comes through `uint256Words` or `uint256FromHex`.
-- **Keep secrets.** Its comparison and division take a time that depends on the value. A key belongs in
-  `abla/ct` ([ct.md](ct.md)).
+- **Keep secrets: it is not constant-time.** Its comparison and division take a time that depends on the value, and
+  `tools/test-ct.sh` does not read it. A key belongs in `abla/ct` ([ct.md](ct.md): `secretU32`, `secretU64`) and the
+  bignum helpers.
 - **Cross an `@export`** (`simd.export`), be the subject of a `when` (`secret.when`: use `if`), or be a `Map`
   key (use `.toBytes()`). `u64(x)` doesn't take one: `x.toU64()`. All of these are as vectors have it.
 - **Lend a `type Wei = uint256` its operators.** It converts as any nominal scalar does, `Wei(x)` in and
   `val x: uint256 = wei` out; arithmetic, comparison and methods are the `uint256`'s, on that `x`.
-- **Mean anything unsigned in another width.** 128 bits and signed 256 aren't here yet (TODO.md).
+- **Mean anything unsigned in another width.** The others are [`uint128`](uint128.md), [`int256`](int256.md) and [`int128`](int128.md), each a type and a module of its own; none converts to another implicitly.
 
 ## At compile time
 
@@ -76,7 +78,7 @@ for byte. Its name is `uint256` because that's what's asked of it and what Solid
 
 ## On each target
 
-`tools/test-uint256.sh` runs it against Python's integers on fresh random values and edge values each
+`WIDE_FULL=1 tools/test-wide-integers.sh` (`make test-wide-integers-full`; `make test` runs a quick version) runs it against Python's integers on fresh random values and edge values each
 time, without a C library:
 
 | Target | How it's run | What it calls |
@@ -84,7 +86,7 @@ time, without a C library:
 | x86-64, AArch64 | natively, under qemu | nothing |
 | Wasm | under Node | nothing: a program using this has its own `__multi3`, for the wide `mul` LLVM makes |
 | Xtensa (`-mcpu=esp32`) | under qemu (dc232b), without `mul32high` because it has none; built with it too | nothing for arithmetic |
-| RISC-V 32 and 64 | under qemu | without the M extension, which ablac's RISC-V code doesn't assume, libgcc's `__muldi3`, `__mulsi3`, on 64 bits `__multi3`, and on 32 bits the shifts `__ashldi3` and `__lshrdi3`: what a `*` or a `u64` shift calls there anyway. They aren't libc |
+| RISC-V 32 and 64 | under qemu | without the M extension, which ablac's RISC-V code doesn't assume, libgcc's `__muldi3`, `__mulsi3`, on 64 bits `__multi3`, and on 32 bits the shifts `__ashldi3` and `__lshrdi3` (and `__ashrdi3` for the signed types): what a `*` or a `u64` shift calls there anyway. They aren't libc |
 
 Multiplication is `i256`'s `mul` on x86-64 and AArch64 and 36 word products elsewhere. Division is LLVM's
 expansion to a shift-and-subtract loop, one for `/` and one for `%`, each once in a program (about 2 KB on Xtensa).

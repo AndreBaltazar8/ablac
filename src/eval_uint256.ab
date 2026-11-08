@@ -1,37 +1,38 @@
-// `uint256` in the compile-time evaluator. A value's `text` is its 32 bytes, as a boxed
-// `uint256` holds them at run time, so lifting one is its bytes (ct_lift.ab). Arithmetic is on
-// 16 16-bit limbs, least significant first: a limb's product fits an int with room to carry.
+// `uint256`, `int256`, `uint128` and `int128` in the compile-time evaluator. A value's `text` is its
+// 32 or 16 bytes, little-endian, as a boxed one holds them at run time, so lifting one is its bytes
+// (ct_lift.ab). Arithmetic is on 16-bit limbs, least significant first (16 or 8): a limb's product fits
+// an int with room to carry. The value's kind is its type's name; the signed ones differ in text,
+// order, division and `>>` only.
 import "abla/bytes"
 import "eval.ab"
 import "parser.ab"
+import "simd_types.ab"
 
-val BOOTSTRAP_U256_LIMBS = 16
-
-fun bootstrapEvalU256(limbs: array<int>): BootstrapEvalValue {
+fun bootstrapEvalU256(limbs: array<int>, kind: string = "uint256"): BootstrapEvalValue {
     val bytes = byteBuffer()
     for (limb in limbs) {
         bytes.appendByteValue(limb & 255)
         bytes.appendByteValue((limb >> 8) & 255)
     }
-    BootstrapEvalValue("uint256", 0, false, bytes.toText(), BOOTSTRAP_EVAL_NO_ELEMENTS, "",
+    BootstrapEvalValue(kind, 0, false, bytes.toText(), BOOTSTRAP_EVAL_NO_ELEMENTS, "",
         BOOTSTRAP_EVAL_NO_FIELDS)
 }
 
 fun bootstrapEvalU256Limbs(value: BootstrapEvalValue): array<int> {
     val limbs: array<int> = []
     var limb = 0
-    while (limb < BOOTSTRAP_U256_LIMBS) {
+    while (limb < value.text.size / 2) {
         limbs.append(int(value.text[limb * 2]) + int(value.text[limb * 2 + 1]) * 256)
         limb = limb + 1
     }
     limbs
 }
 
-fun bootstrapU256FromWord(word: int, signed: bool): array<int> {
+fun bootstrapU256FromWord(word: int, signed: bool, size: int = 16): array<int> {
     val fill = if (signed && word < 0) 65535 else 0
     val limbs: array<int> = []
     var limb = 0
-    while (limb < BOOTSTRAP_U256_LIMBS) {
+    while (limb < size) {
         limbs.append(if (limb < 4) (word >> (limb * 16)) & 65535 else fill)
         limb = limb + 1
     }
@@ -42,7 +43,7 @@ fun bootstrapU256Add(a: array<int>, b: array<int>, carryIn: int): array<int> {
     val out: array<int> = []
     var carry = carryIn
     var limb = 0
-    while (limb < BOOTSTRAP_U256_LIMBS) {
+    while (limb < a.size) {
         val sum = a[limb] + b[limb] + carry
         out.append(sum & 65535)
         carry = sum >> 16
@@ -63,15 +64,15 @@ fun bootstrapU256Sub(a: array<int>, b: array<int>): array<int> =
 fun bootstrapU256Mul(a: array<int>, b: array<int>): array<int> {
     val out: array<int> = []
     var limb = 0
-    while (limb < BOOTSTRAP_U256_LIMBS) {
+    while (limb < a.size) {
         out.append(0)
         limb = limb + 1
     }
     limb = 0
-    while (limb < BOOTSTRAP_U256_LIMBS) {
+    while (limb < a.size) {
         var carry = 0
         var other = 0
-        while (limb + other < BOOTSTRAP_U256_LIMBS) {
+        while (limb + other < a.size) {
             val sum = out[limb + other] + a[limb] * b[other] + carry
             out[limb + other] = sum & 65535
             carry = sum >> 16
@@ -83,7 +84,7 @@ fun bootstrapU256Mul(a: array<int>, b: array<int>): array<int> {
 }
 
 fun bootstrapU256Less(a: array<int>, b: array<int>): bool {
-    var limb = BOOTSTRAP_U256_LIMBS - 1
+    var limb = a.size - 1
     while (limb >= 0) {
         if (a[limb] != b[limb]) return a[limb] < b[limb]
         limb = limb - 1
@@ -96,9 +97,9 @@ fun bootstrapU256Shift(a: array<int>, count: int, left: bool): array<int> {
     val words = count / 16
     val bits = count % 16
     var limb = 0
-    while (limb < BOOTSTRAP_U256_LIMBS) {
+    while (limb < a.size) {
         var value = 0
-        if (count >= 0 && count < 256) {
+        if (count >= 0 && count < a.size * 16) {
             if (left) {
                 val high = limb - words
                 val low = high - 1
@@ -107,8 +108,8 @@ fun bootstrapU256Shift(a: array<int>, count: int, left: bool): array<int> {
             } else {
                 val low = limb + words
                 val high = low + 1
-                if (low < BOOTSTRAP_U256_LIMBS) value = a[low] >> bits
-                if (high < BOOTSTRAP_U256_LIMBS) value = value | (a[high] << (16 - bits))
+                if (low < a.size) value = a[low] >> bits
+                if (high < a.size) value = value | (a[high] << (16 - bits))
             }
         }
         out.append(value & 65535)
@@ -117,11 +118,31 @@ fun bootstrapU256Shift(a: array<int>, count: int, left: bool): array<int> {
     out
 }
 
+fun bootstrapU256Negative(a: array<int>): bool = a[a.size - 1] >= 32768
+
+/** `a >> count` keeping the sign: a count of at least the width gives 0 or -1. The stdlib calls this only with a
+ *  count from 0 to the width less one (it answers 0 itself outside that, the language's rule), as LLVM's `ashr`
+ *  is poison beyond it: the other counts are not the language's. */
+fun bootstrapU256ArithmeticShift(a: array<int>, count: int): array<int> {
+    val shifted = bootstrapU256Shift(a, count, false)
+    if (!bootstrapU256Negative(a) || count <= 0) return shifted
+    val ones = bootstrapU256Not(bootstrapU256FromWord(0, false, a.size))
+    if (count >= a.size * 16) return ones
+    val mask = bootstrapU256Shift(ones, a.size * 16 - count, true)
+    val out: array<int> = []
+    var limb = 0
+    while (limb < a.size) {
+        out.append(shifted[limb] | mask[limb])
+        limb = limb + 1
+    }
+    out
+}
+
 /** `a / b` when `quotient`, else `a % b`, by shift and subtract: `b` isn't zero. */
 fun bootstrapU256Divide(a: array<int>, b: array<int>, quotient: bool): array<int> {
-    var remainder = bootstrapU256FromWord(0, false)
-    var result = bootstrapU256FromWord(0, false)
-    var bit = 255
+    var remainder = bootstrapU256FromWord(0, false, a.size)
+    var result = bootstrapU256FromWord(0, false, a.size)
+    var bit = a.size * 16 - 1
     while (bit >= 0) {
         remainder = bootstrapU256Shift(remainder, 1, true)
         remainder[0] = remainder[0] | ((a[bit / 16] >> (bit % 16)) & 1)
@@ -131,14 +152,37 @@ fun bootstrapU256Divide(a: array<int>, b: array<int>, quotient: bool): array<int
         }
         bit = bit - 1
     }
-    bootstrapU256Add(if (quotient) result else remainder, bootstrapU256FromWord(0, false), 0)
+    bootstrapU256Add(if (quotient) result else remainder, bootstrapU256FromWord(0, false, a.size),
+        0)
+}
+
+fun bootstrapU256Negate(a: array<int>): array<int> =
+    bootstrapU256Sub(bootstrapU256FromWord(0, false, a.size), a)
+
+/** Truncating signed division and remainder, by magnitudes. The caller keeps -MIN / -1 away. */
+fun bootstrapU256SignedDivide(a: array<int>, b: array<int>, quotient: bool): array<int> {
+    val negativeA = bootstrapU256Negative(a)
+    val negativeB = bootstrapU256Negative(b)
+    val result = bootstrapU256Divide(if (negativeA) bootstrapU256Negate(a) else a,
+        if (negativeB) bootstrapU256Negate(b) else b, quotient)
+    val negate = if (quotient) negativeA != negativeB else negativeA
+    if (negate) bootstrapU256Negate(result) else result
+}
+
+/** Less than, as two's complement: the top bit counts the other way. */
+fun bootstrapU256SignedLess(a: array<int>, b: array<int>): bool {
+    val x = bootstrapU256Add(a, bootstrapU256FromWord(0, false, a.size), 0)
+    val y = bootstrapU256Add(b, bootstrapU256FromWord(0, false, a.size), 0)
+    x[a.size - 1] = x[a.size - 1] ^ 32768
+    y[a.size - 1] = y[a.size - 1] ^ 32768
+    bootstrapU256Less(x, y)
 }
 
 // Divide private working limbs in place, returning the remainder as well as leaving the
 // quotient. With base 1e9 and 16-bit limbs, the intermediate is below 65536e9, within int.
 private fun bootstrapEvalU256DecimalChunk(var limbs: array<int>): int {
     var remainder = 0
-    var limb = BOOTSTRAP_U256_LIMBS - 1
+    var limb = limbs.size - 1
     while (limb >= 0) {
         val dividend = remainder * 65536 + limbs[limb]
         limbs[limb] = dividend / 1000000000
@@ -148,11 +192,13 @@ private fun bootstrapEvalU256DecimalChunk(var limbs: array<int>): int {
     remainder
 }
 
-/** `value` in decimal, as `"$x"` gives it at run time. */
+/** `value` in decimal, as `"$x"` gives it at run time; a signed one with its minus. */
 fun bootstrapEvalU256Text(value: BootstrapEvalValue): string {
     // This copy belongs only to the formatter; no evaluator value's storage is mutated.
     var rest = bootstrapEvalU256Limbs(value)
-    val zero = bootstrapU256FromWord(0, false)
+    val negative = bootstrapWideIntSigned(value.kind) && bootstrapU256Negative(rest)
+    if (negative) rest = bootstrapU256Negate(rest)
+    val zero = bootstrapU256FromWord(0, false, rest.size)
     var text = ""
     while (bootstrapU256Less(zero, rest)) {
         val remainder = bootstrapEvalU256DecimalChunk(rest)
@@ -162,62 +208,74 @@ fun bootstrapEvalU256Text(value: BootstrapEvalValue): string {
         }
         text = "$chunk$text"
     }
-    if (text == "") "0" else text
+    if (text == "") "0" else if (negative) "-$text" else text
 }
 
 /** Orders two values for `<`, `<=`, `>` and `>=`: -1, 0 or 1. */
 fun bootstrapEvalU256Order(left: BootstrapEvalValue, right: BootstrapEvalValue): int {
     val a = bootstrapEvalU256Limbs(left)
     val b = bootstrapEvalU256Limbs(right)
-    if (bootstrapU256Less(a, b)) -1 else if (bootstrapU256Less(b, a)) 1 else 0
+    val signed = bootstrapWideIntSigned(left.kind)
+    if (if (signed) bootstrapU256SignedLess(a, b) else bootstrapU256Less(a, b)) -1
+    else if (if (signed) bootstrapU256SignedLess(b, a) else bootstrapU256Less(b, a)) 1 else 0
 }
 
-/** A call of abla/uint256's intrinsic `name`. What a target's code picks between is
- *  answered as a 64-bit target's: multiplying here is exact either way. */
+/** A call of a wide integer module's intrinsic `name` (`ablaI128_sdiv`). What a target's code picks
+ *  between is answered as a 64-bit target's: multiplying here is exact either way. */
 fun bootstrapEvaluateU256Intrinsic(
     var evaluator: BootstrapEvaluator,
     expression: BootstrapExpression,
     name: string
 ): BootstrapEvalValue {
-    if (name == "ablaU256NativeMul") return bootstrapEvalBoolean(true)
-    if (name == "ablaU256NarrowTarget") return bootstrapEvalBoolean(false)
+    if (name.endsWith("NativeMul")) return bootstrapEvalBoolean(true)
+    if (name.endsWith("NarrowTarget")) return bootstrapEvalBoolean(false)
+    val kind = bootstrapWideIntrinsicType(name)
+    val size = bootstrapWideIntBits(kind) / 16
+    val operation = name.slice(9, name.size)
     val values: array<BootstrapEvalValue> = []
     for (child in expression.children) {
         val value = bootstrapEvalUnwrapBorrow(evaluator.evaluate(child))
         if (bootstrapEvalLeaves(value) || value.kind == "invalid") return value
         values.append(value)
     }
-    if (name ==
-        "ablaU256_fromU64") return bootstrapEvalU256(bootstrapU256FromWord(values[0].integer,
-            false))
-    if (name ==
-        "ablaU256_fromI64") return bootstrapEvalU256(bootstrapU256FromWord(values[0].integer, true))
+    val unary = operation == "fromU64" || operation == "fromI64" || operation == "toU64" ||
+        operation == "not"
+    if (values.size < (if (unary) 1 else 2)) return bootstrapEvalInvalid()
+    if (operation == "fromU64") return bootstrapEvalU256(bootstrapU256FromWord(values[0].integer,
+        false, size), kind)
+    if (operation == "fromI64") return bootstrapEvalU256(bootstrapU256FromWord(values[0].integer,
+        true, size), kind)
     val a = bootstrapEvalU256Limbs(values[0])
-    if (name == "ablaU256_toU64") {
+    if (operation == "toU64") {
         return bootstrapEvalScalar(a[0] | (a[1] << 16) | (a[2] << 32) | (a[3] << 48), "u64", "")
     }
-    if (name == "ablaU256_not") return bootstrapEvalU256(bootstrapU256Not(a))
-    if (name == "ablaU256_shl") return bootstrapEvalU256(bootstrapU256Shift(a, values[1].integer,
-        true))
-    if (name == "ablaU256_lshr") return bootstrapEvalU256(bootstrapU256Shift(a, values[1].integer,
-        false))
+    if (operation == "not") return bootstrapEvalU256(bootstrapU256Not(a), kind)
+    if (operation == "shl") return bootstrapEvalU256(bootstrapU256Shift(a, values[1].integer,
+        true), kind)
+    if (operation == "lshr") return bootstrapEvalU256(bootstrapU256Shift(a, values[1].integer,
+        false), kind)
+    if (operation == "ashr") return bootstrapEvalU256(bootstrapU256ArithmeticShift(a,
+        values[1].integer), kind)
     val b = bootstrapEvalU256Limbs(values[1])
-    if (name == "ablaU256_add") return bootstrapEvalU256(bootstrapU256Add(a, b, 0))
-    if (name == "ablaU256_sub") return bootstrapEvalU256(bootstrapU256Sub(a, b))
-    if (name == "ablaU256_mul") return bootstrapEvalU256(bootstrapU256Mul(a, b))
-    if (name == "ablaU256_udiv") return bootstrapEvalU256(bootstrapU256Divide(a, b, true))
-    if (name == "ablaU256_urem") return bootstrapEvalU256(bootstrapU256Divide(a, b, false))
-    if (name == "ablaU256_eq") return bootstrapEvalBoolean(values[0].text == values[1].text)
-    if (name == "ablaU256_lt") return bootstrapEvalBoolean(bootstrapU256Less(a, b))
+    if (operation == "add") return bootstrapEvalU256(bootstrapU256Add(a, b, 0), kind)
+    if (operation == "sub") return bootstrapEvalU256(bootstrapU256Sub(a, b), kind)
+    if (operation == "mul") return bootstrapEvalU256(bootstrapU256Mul(a, b), kind)
+    if (operation == "udiv") return bootstrapEvalU256(bootstrapU256Divide(a, b, true), kind)
+    if (operation == "urem") return bootstrapEvalU256(bootstrapU256Divide(a, b, false), kind)
+    if (operation == "sdiv") return bootstrapEvalU256(bootstrapU256SignedDivide(a, b, true), kind)
+    if (operation == "srem") return bootstrapEvalU256(bootstrapU256SignedDivide(a, b, false), kind)
+    if (operation == "eq") return bootstrapEvalBoolean(values[0].text == values[1].text)
+    if (operation == "lt") return bootstrapEvalBoolean(bootstrapU256Less(a, b))
+    if (operation == "slt") return bootstrapEvalBoolean(bootstrapU256SignedLess(a, b))
     val bitwise: array<int> = []
     var limb = 0
-    while (limb < BOOTSTRAP_U256_LIMBS) {
+    while (limb < size) {
         bitwise.append(
-            if (name == "ablaU256_and") a[limb] & b[limb]
-            else if (name == "ablaU256_or") a[limb] | b[limb]
+            if (operation == "and") a[limb] & b[limb]
+            else if (operation == "or") a[limb] | b[limb]
             else a[limb] ^ b[limb]
         )
         limb = limb + 1
     }
-    bootstrapEvalU256(bitwise)
+    bootstrapEvalU256(bitwise, kind)
 }

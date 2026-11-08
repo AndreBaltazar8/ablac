@@ -22,7 +22,7 @@ define install_launcher
 	fi
 endef
 
-.PHONY: all bootstrap ablac ablac-dev self-rebuild test test-full test-serial check compile benchmark \
+.PHONY: all bootstrap ablac ablac-dev self-rebuild test test-full test-serial test-wide-integers-full check compile benchmark \
 	benchmark-network clean prepare-test-driver
 
 all: ablac
@@ -79,6 +79,11 @@ test: ablac
 # Every script's builds for release: what a release must pass.
 test-full: ablac
 	RUN_TESTS_FULL=1 tools/run-tests.sh $(COMPILER)
+
+# The wide integers' whole differential run (60,000 random cases on every target, release, GC stress): the default
+# suite runs a quick one. `make test-full` runs it as well.
+test-wide-integers-full: ablac
+	for type in uint256 int256 uint128 int128; do WIDE_FULL=1 tools/test-wide-integers.sh $(COMPILER) $$type || exit 1; done
 
 test-serial: ablac
 	tools/test-version.sh $(COMPILER)
@@ -140,7 +145,7 @@ test-serial: ablac
 	tools/test-ct.sh $(COMPILER)
 	python3 tools/ct-timing/test-stats.py
 	tools/test-bignum-secret.sh $(COMPILER)
-	tools/test-uint256.sh $(COMPILER)
+	tools/test-wide-integers.sh $(COMPILER)
 	tools/test-array-truncate.sh $(COMPILER)
 	tools/test-array-filled.sh $(COMPILER)
 	tools/test-borrow-chain-scaling.sh $(COMPILER)

@@ -114,7 +114,7 @@ fun bootstrapLlvmProgramHasSimd(program: BootstrapIrProgram): bool {
             if (instruction.opcode == "extern.intrinsic" &&
                 bootstrapSimdIntrinsic(instruction.text) &&
                 !instruction.text.startsWith("ablaCt") &&
-                !instruction.text.startsWith("ablaU256") &&
+                bootstrapWideIntrinsicType(instruction.text) == "" &&
                 !instruction.text.startsWith("ablaSimdTarget") &&
                 !instruction.text.startsWith("ablaSimdCpu")) {
                 return true
@@ -463,7 +463,7 @@ fun bootstrapLlvmEmitSimdIntrinsic(
     if (name.startsWith("ablaCt")) {
         return bootstrapLlvmEmitCtIntrinsic(backend, storage, instruction)
     }
-    if (name.startsWith("ablaU256")) {
+    if (bootstrapWideIntrinsicType(name) != "") {
         return bootstrapLlvmEmitUint256Intrinsic(backend, storage, instruction)
     }
     val shuffled = bootstrapSimdShuffleType(name)
@@ -866,11 +866,41 @@ fun bootstrapLlvmEnsureWasmMulti3(backend: BootstrapLlvmBackend): void {
     return
 }
 
-// abla/uint256: `ablaU256_<operation>`, each one LLVM instruction on an i256, none of which
-// calls anything on any target but `mul`: i128's __multi3 on Wasm and RISC-V, __muldi3 on
-// 32-bit ones, neither of which a program here links. ablaU256NativeMul says where it's
-// inline, and elsewhere abla/uint256 multiplies words itself. Shift counts below 256 are
-// abla/uint256's to check. Division is expanded inline by LLVM, so it's a function there.
+// `__abla_wide256_<operation>(i256, i256): i256`, the one operation at 256 bits, which LLVM expands inline. In
+// optnone, so no pass narrows the zero- or sign-extended operands back to 128 bits and its libcall.
+fun bootstrapLlvmEnsureWideHelper(backend: BootstrapLlvmBackend, operation: string): string {
+    val name = "__abla_wide256_$operation"
+    if (!pointerIsNull(LLVMGetNamedFunction(backend.module, name))) return name
+    val huge = LLVMIntTypeInContext(backend.context, 256)
+    val function = LLVMAddFunction(backend.module, name,
+        bootstrapLlvmFunctionType(backend, huge, [huge, huge]))
+    LLVMSetVisibility(function, llvmHiddenVisibility())
+    bootstrapLlvmAddFunctionAttribute(backend, function, "noinline")
+    bootstrapLlvmAddFunctionAttribute(backend, function, "optnone")
+    val resume = LLVMGetInsertBlock(backend.builder)
+    LLVMPositionBuilderAtEnd(backend.builder, LLVMAppendBasicBlockInContext(backend.context,
+        function, "entry"))
+    val builder = backend.builder
+    val x = LLVMGetParam(function, 0)
+    val y = LLVMGetParam(function, 1)
+    LLVMBuildRet(builder,
+        if (operation == "udiv") LLVMBuildUDiv(builder, x, y, "r")
+        else if (operation == "urem") LLVMBuildURem(builder, x, y, "r")
+        else if (operation == "sdiv") LLVMBuildSDiv(builder, x, y, "r")
+        else if (operation == "srem") LLVMBuildSRem(builder, x, y, "r")
+        else if (operation == "shl") LLVMBuildShl(builder, x, y, "r")
+        else if (operation == "lshr") LLVMBuildLShr(builder, x, y, "r")
+        else LLVMBuildAShr(builder, x, y, "r"))
+    LLVMPositionBuilderAtEnd(backend.builder, resume)
+    name
+}
+
+// abla/uint256, int256, uint128 and int128: `abla<U|I><bits>_<operation>`, each one LLVM instruction on an
+// iN, none of which calls anything on any target but `mul`: i128's __multi3 on Wasm and RISC-V,
+// __muldi3 on 32-bit ones, neither of which a program here links. ablaU256NativeMul says where it's
+// inline, and elsewhere the module multiplies words itself. Shift counts below the width are the
+// module's to check. Division is expanded inline by LLVM, so it's a function there. The signed
+// modules keep -MIN / -1 away from `sdiv`, which is undefined there.
 fun bootstrapLlvmEmitUint256Intrinsic(
     backend: BootstrapLlvmBackend,
     var storage: BootstrapLlvmFunctionStorage,
@@ -878,8 +908,9 @@ fun bootstrapLlvmEmitUint256Intrinsic(
 ): bool {
     val name = instruction.text
     val operands = instruction.operands
+    val type = bootstrapWideIntrinsicType(name)
     bootstrapLlvmEnsureWasmMulti3(backend)
-    if (name == "ablaU256NativeMul") {
+    if (name.endsWith("NativeMul")) {
         val arch = bootstrapLlvmSimdArch(backend.targetTriple)
         val native = arch == BOOTSTRAP_SIMD_ARCH_X86_64 || arch == BOOTSTRAP_SIMD_ARCH_AARCH64
         bootstrapLlvmSetNativeValue(
@@ -888,7 +919,7 @@ fun bootstrapLlvmEmitUint256Intrinsic(
         )
         return true
     }
-    if (name == "ablaU256NarrowTarget") {
+    if (name.endsWith("NarrowTarget")) {
         val narrow = bootstrapLlvmTargetUses32BitPointers(backend.targetTriple) &&
             bootstrapLlvmSimdArch(backend.targetTriple) != BOOTSTRAP_SIMD_ARCH_WASM
         bootstrapLlvmSetNativeValue(
@@ -897,56 +928,85 @@ fun bootstrapLlvmEmitUint256Intrinsic(
         )
         return true
     }
-    if (!name.startsWith("ablaU256_") || operands.size < 1) return false
+    if (name.size < 10 || name[8] != 95 || operands.size < 1) return false
     val operation = name.slice(9, name.size)
-    val wide = LLVMIntTypeInContext(backend.context, 256)
+    val wide = backend.type(type)
     val builder = backend.builder
     if (operation == "fromU64" || operation == "fromI64") {
         val word = bootstrapLlvmScalarOperand(backend, storage, operands[0], "u64")
         bootstrapLlvmSetNativeValue(
             backend, storage, instruction.result,
-            if (operation == "fromU64") LLVMBuildZExt(builder, word, wide, "u256.from")
-            else LLVMBuildSExt(builder, word, wide, "u256.from")
+            if (operation == "fromU64") LLVMBuildZExt(builder, word, wide, "wide.from")
+            else LLVMBuildSExt(builder, word, wide, "wide.from")
         )
         return true
     }
-    val a = bootstrapLlvmScalarOperand(backend, storage, operands[0], "uint256")
+    val a = bootstrapLlvmScalarOperand(backend, storage, operands[0], type)
     if (operation == "toU64") {
         bootstrapLlvmSetNativeValue(
             backend, storage, instruction.result, LLVMBuildTrunc(builder, a, backend.i64Type,
-                "u256.low")
+                "wide.low")
         )
         return true
     }
     if (operation == "not") {
         bootstrapLlvmSetNativeValue(
-            backend, storage, instruction.result, LLVMBuildNot(builder, a, "u256.not")
+            backend, storage, instruction.result, LLVMBuildNot(builder, a, "wide.not")
         )
         return true
     }
     if (operands.size != 2) return false
-    val shift = operation == "shl" || operation == "lshr"
+    val shift = operation == "shl" || operation == "lshr" || operation == "ashr"
     val b = if (shift) {
         LLVMBuildZExt(builder, bootstrapLlvmScalarOperand(backend, storage, operands[1], "u32"),
-            wide, "u256.count")
-    } else bootstrapLlvmScalarOperand(backend, storage, operands[1], "uint256")
+            wide, "wide.count")
+    } else bootstrapLlvmScalarOperand(backend, storage, operands[1], type)
     if (operation != "add" && operation != "sub" && operation != "mul" && operation != "udiv" &&
-        operation != "urem" && operation != "and" && operation != "or" && operation != "xor" &&
-        !shift && operation != "eq" && operation != "lt") return false
+        operation != "urem" && operation != "sdiv" && operation != "srem" && operation != "and" &&
+        operation != "or" && operation != "xor" && !shift && operation != "eq" &&
+        operation != "lt" && operation != "slt") return false
+    // A 128-bit division is a libcall (__udivti3) everywhere, and a variable shift one (__lshrti3) off x86-64
+    // and AArch64, none of which is linked. Done at 256 bits, which LLVM expands inline, and kept there by a
+    // function of its own that nothing narrows (as __multi3 below), the quotient of -MIN / -1 then truncates
+    // to MIN instead of trapping.
+    val arch = bootstrapLlvmSimdArch(backend.targetTriple)
+    val nativeShift = arch == BOOTSTRAP_SIMD_ARCH_X86_64 || arch == BOOTSTRAP_SIMD_ARCH_AARCH64
+    val division = operation == "udiv" || operation == "urem" || operation == "sdiv" || operation ==
+        "srem"
+    if (bootstrapWideIntBits(type) == 128 && (division || (shift && !nativeShift))) {
+        val signed = operation == "sdiv" || operation == "srem" || operation == "ashr"
+        val huge = LLVMIntTypeInContext(backend.context, 256)
+        val x = if (signed) LLVMBuildSExt(builder, a, huge, "wide.x") else LLVMBuildZExt(builder, a,
+            huge, "wide.x")
+        val y = if (shift || !signed) LLVMBuildZExt(builder, b, huge, "wide.y") else LLVMBuildSExt(
+            builder, b, huge, "wide.y")
+        val result = bootstrapLlvmCallNamed(
+            backend, bootstrapLlvmEnsureWideHelper(backend, operation), [x, y], "wide.call", false,
+            []
+        )
+        bootstrapLlvmSetNativeValue(backend, storage, instruction.result,
+            LLVMBuildTrunc(builder, result, wide, "wide.narrow"))
+        return true
+    }
     bootstrapLlvmSetNativeValue(
         backend, storage, instruction.result,
-        if (operation == "add") LLVMBuildAdd(builder, a, b, "u256.add")
-        else if (operation == "sub") LLVMBuildSub(builder, a, b, "u256.sub")
-        else if (operation == "mul") LLVMBuildMul(builder, a, b, "u256.mul")
-        else if (operation == "udiv") LLVMBuildUDiv(builder, a, b, "u256.div")
-        else if (operation == "urem") LLVMBuildURem(builder, a, b, "u256.rem")
-        else if (operation == "and") LLVMBuildAnd(builder, a, b, "u256.and")
-        else if (operation == "or") LLVMBuildOr(builder, a, b, "u256.or")
-        else if (operation == "xor") LLVMBuildXor(builder, a, b, "u256.xor")
-        else if (operation == "shl") LLVMBuildShl(builder, a, b, "u256.shl")
-        else if (operation == "lshr") LLVMBuildLShr(builder, a, b, "u256.shr")
-        else if (operation == "eq") LLVMBuildICmp(builder, llvmIntEqual(), a, b, "u256.eq")
-        else LLVMBuildICmp(builder, llvmIntUnsignedLessThan(), a, b, "u256.lt")
+        if (operation == "add") LLVMBuildAdd(builder, a, b, "wide.add")
+        else if (operation == "sub") LLVMBuildSub(builder, a, b, "wide.sub")
+        else if (operation == "mul") LLVMBuildMul(builder, a, b, "wide.mul")
+        else if (operation == "udiv") LLVMBuildUDiv(builder, a, b, "wide.div")
+        else if (operation == "urem") LLVMBuildURem(builder, a, b, "wide.rem")
+        else if (operation == "sdiv") LLVMBuildSDiv(builder, a, b, "wide.sdiv")
+        else if (operation == "srem") LLVMBuildSRem(builder, a, b, "wide.srem")
+        else if (operation == "and") LLVMBuildAnd(builder, a, b, "wide.and")
+        else if (operation == "or") LLVMBuildOr(builder, a, b, "wide.or")
+        else if (operation == "xor") LLVMBuildXor(builder, a, b, "wide.xor")
+        else if (operation == "shl") LLVMBuildShl(builder, a, b, "wide.shl")
+        else if (operation == "lshr") LLVMBuildLShr(builder, a, b, "wide.shr")
+        else if (operation == "ashr") LLVMBuildAShr(builder, a, b, "wide.ashr")
+        else if (operation == "eq") LLVMBuildICmp(builder, llvmIntEqual(), a, b, "wide.eq")
+        else if (operation == "slt") LLVMBuildICmp(builder, llvmIntSignedLessThan(), a, b,
+            "wide.slt")
+        else LLVMBuildICmp(builder, llvmIntUnsignedLessThan(), a, b, "wide.lt")
     )
     true
 }

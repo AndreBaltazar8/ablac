@@ -1,9 +1,9 @@
 // What a test object needs to run under qemu with no C library: a start, a bump allocator that
 // never reuses, and exit(99) for what it should never reach. It runs one export and exits with
-// its result. Built for AArch64, RISC-V and Xtensa by tools/test-uint256.sh.
+// its result. Built for AArch64, RISC-V and Xtensa by tools/test-wide-integers.sh.
 typedef __SIZE_TYPE__ size_t;
 
-long long uint256_checks(void);
+long long __T___checks(void);
 
 static char heap[1 << 28] __attribute__((aligned(16)));
 static size_t used;
@@ -38,7 +38,7 @@ void begin(void) {
     size_t probe[] = {1, (size_t)-0x800};
     if (__tls_get_addr(probe) != tls) leave(97);
 #endif
-    leave((long)uint256_checks());
+    leave((long)__T___checks());
 }
 
 #if defined(__XTENSA__)
@@ -206,6 +206,14 @@ unsigned long long __lshrdi3(unsigned long long value, int count) {
     out.word[1] = count >= 32 ? 0 : in.word[1] >> count;
     out.word[0] = count >= 32 ? in.word[1] >> (count - 32) : (in.word[0] >> count) | (in.word[1] << (32 - count));
     return out.whole;
+}
+long long __ashrdi3(long long value, int count) {
+    union halves in = {(unsigned long long)value}, out;
+    int sign = (int)in.word[1] >> 31;
+    if (count == 0) return value;
+    out.word[1] = count >= 32 ? (unsigned)sign : (unsigned)((int)in.word[1] >> count);
+    out.word[0] = count >= 32 ? (unsigned)((int)in.word[1] >> (count - 32)) : (in.word[0] >> count) | (in.word[1] << (32 - count));
+    return (long long)out.whole;
 }
 #endif
 #endif
