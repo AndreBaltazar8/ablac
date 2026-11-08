@@ -175,12 +175,18 @@
   redefined while the program runs.
 
 - [ ] **Transactional memory: partitioned clocks.** Every writing commit takes a version
-  from one global clock, so small transactions on many threads queue on its cache line:
-  four threads each reading and writing 4 TVars a block take 88 ns a block (wall over all
-  blocks) on disjoint TVars and 151 on shared ones, against 52 under one Mutex
-  (tests/cases/stm/bench.ab, with TL2's GV4 already sharing a version between commits
-  that race for the clock). Clocks per partition of TVars (or per thread, compared as
-  vectors) would let disjoint transactions scale.
+  from one global clock, so transactions on disjoint TVars queue on its cache line: four
+  threads each reading and writing 4 TVars a block take 95 ns a block on disjoint TVars
+  against 17 under one Mutex and 34 for one thread running directly. A prototype with sixteen
+  clocks by TVar address (snapshots taken per partition at the first read there, a version per
+  written partition at commit) takes disjoint blocks 26% faster (cycles −30%; the model of the
+  protocol and its negative controls, `test-stm` and the Wasm unwinding test pass) and leaves
+  shared and direct within noise, but costs a forced-logged one-thread block 30% more
+  instructions (+22% time), 1,241 to 1,620: 167 of that is fixed, about 70 more for each
+  extra partition a block touches. Not shipped; the prototype is on branch `stm-clocks`,
+  numbers in `docs/measurements/stm-partitioned-clocks-2026-11-08.md`. Next: keep the
+  single-clock path for a transaction that touches one partition and partition only when it
+  reads or writes a second.
 
 - [ ] **The rest of the reserved generic syntax.** `where` clauses, `const` type parameters and
   an interface's `type Item` still give `E_PARSE_NOT_YET_SUPPORTED`. Decide which to build.
