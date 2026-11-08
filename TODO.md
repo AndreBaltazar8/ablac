@@ -111,6 +111,15 @@
   `any-eq-ieee`) and kept as `tests/cases/fuzz-differential/any-mixed-kinds.ab`.
   After both: seeds 21 to 28 and 29 to 40 (30 checks each, six modes, 600 checks) agree; the generator
   does not yet draw `f32(literal)` conversions or f32 division by zero (the two open evaluator gaps above).
+  Grown 2026-11-08 (branch `fuzz-grow`): checks for integer conversions between every width pair and
+  float-to-integer saturation, generics (`Box<T>`, `Pair<A, B>`, generic functions over int, f64, string,
+  u8, i32), interfaces with a default method and dynamic dispatch, nullable chains (`?.`, `??`, `when` on
+  null, `int?`), Unicode strings (slices that cut a sequence, byte reads, ordering, iteration), and one
+  panicking program per seed (index, slice, division, remainder, `filledArray`, `truncate`, `panic`: native
+  and WebAssembly must print `before`, report `panic` on standard error and end with status 101). The
+  language has no exceptions or recover, so a panic is the only failure to compare. Campaigns: seeds
+  100 to 125 (older compiler, no `any`), 200 to 225 and 300 to 351 (24 to 30 checks each, six modes
+  plus the panic programs): no disagreement.
 
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
