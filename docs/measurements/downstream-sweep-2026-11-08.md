@@ -18,7 +18,7 @@ needed; a step that needs a service is noted in its cell. "Pin" is the `setup-ab
 | abla-mobile | 8c0df8e | 0.2.48 | tools/test-file-exports.sh ok; tools/test-android-build-config.sh ok; tools/test-mobile-template.sh ok |
 | abla-mvc | a21baba | none | test-library ok |
 | abla-nats | 0bd19ea | none | check ok |
-| abla-one | 9b0ee3f | 0.2.48 | test FAIL(2): 42 tests pass; `tests/backends/android_tree.ab` and `ios_tree.ab` fail with E_PACKAGE_IMPORT for the locked `abla-mobile` (identical on v0.2.50) |
+| abla-one | 9b0ee3f | 0.2.48 | test FAIL(2): 42 tests pass; `tests/backends/android_tree.ab` and `ios_tree.ab` fail with E_PACKAGE_IMPORT for the locked `abla-mobile` (identical on v0.2.50). Cause: a fresh clone has no `.abla/packages` (nothing vendored the locked packages first); fixed in abla-one `7af7766` (main): `make test` now depends on a `.abla/packages` target (`ablac package vendor --project .`), and from a fresh worktree with no `.abla` it passes 45/45 with v0.2.50 |
 | abla-pdf | 68982d9 | 0.2.45 | test-in-shell ok |
 | abla-postgres | b56c87a | none | check ok |
 | abla-printers | 7f4f7b1 | 0.2.45,0.2.48 | test-in-shell ok |
