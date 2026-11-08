@@ -1,0 +1,133 @@
+import "abla/io"
+import "abla/regex"
+import "abla/text"
+
+var failures = 0
+
+fun expect(label: string, ok: bool): void {
+    if (!ok) {
+        failures += 1
+        println("FAIL ${label}")
+    }
+}
+
+fun compiled(pattern: string): Regex {
+    val r = regexCompile(pattern)
+    if (!r.succeeded) {
+        failures += 1
+        println("FAIL compile ${pattern}: ${r.error.message}")
+    }
+    r.regex
+}
+
+fun rejected(pattern: string, offset: int): void {
+    val r = regexCompile(pattern)
+    expect("reject ${pattern}", !r.succeeded)
+    if (!r.succeeded) expect("offset of ${pattern}: ${r.error.offset}", r.error.offset == offset)
+}
+
+fun span(re: Regex, text: string): string {
+    val m = re.find(text)
+    if (m == null) "none" else "${m.start()}-${m.end()}"
+}
+
+fun main: int {
+    // Errors carry the byte offset of the problem.
+    rejected("(", 0)
+    rejected("a)", 1)
+    rejected("a(b", 1)
+    rejected("[a", 0)
+    rejected("*a", 0)
+    rejected("a**", 2)
+    rejected("a{3,2}", 1)
+    rejected("a{1001}", 1)
+    rejected("(a)\\1", 3)
+    rejected("(?=a)", 0)
+    rejected("(?<!a)", 0)
+    rejected("(?P<n>a)", 0)
+    rejected("\\q", 0)
+    rejected("a\\", 1)
+    rejected("[z-a]", 4)
+    rejected("\\xZZ", 0)
+    rejected("a\xff", 1)
+    rejected("(".repeat(250) + "a", 200)
+
+    // Spans are byte offsets, matching is by code point.
+    val dot = compiled("é.")
+    expect("dot", span(dot, "xéü") == "1-5")
+    expect("dot newline", span(compiled("a.b"), "a\nb") == "none")
+    expect("emoji", span(compiled("a.b"), "a😀b") == "0-6")
+    expect("class unicode", span(compiled("[é-ü]+"), "aéõü!") == "1-7")
+    expect("negated class", span(compiled("[^a]"), "a😀") == "1-5")
+    expect("ascii shorthands", span(compiled("\\w+"), "é_a1é") == "2-5")
+    expect("invalid byte", span(compiled("."), "\xff") == "0-1")
+
+    // Leftmost-first, like Perl and Python.
+    val alt = compiled("(a|ab)(c|bcd)(d*)")
+    val m = alt.find("abcd")
+    expect("alt", m != null && m.group(1) == "a" && m.group(2) == "bcd" && m.group(3) == "")
+    expect("lazy", span(compiled("a+?"), "aaa") == "0-1")
+    expect("greedy", span(compiled("a+"), "aaa") == "0-3")
+    expect("lazy bounded", span(compiled("a{2,3}?"), "aaaa") == "0-2")
+    expect("empty alternative", span(compiled("a|"), "b") == "0-0")
+
+    // Groups.
+    val g = compiled("(a)|(b)(?:c)")
+    val gm = g.find("bc")
+    expect("groups",
+        gm != null && gm.groupCount() == 2 && gm.group(1) == null && gm.group(2) == "b")
+    expect("group spans",
+        gm != null && gm.groupStart(2) == 0 && gm.groupEnd(2) == 1 && gm.groupStart(1) == -1)
+    expect("repeat group is last", compiled("(a|b){3}").find("abb")?.group(1) == "b")
+
+    // Anchors and word boundaries.
+    expect("bol", span(compiled("^b"), "ab") == "none")
+    expect("eol", span(compiled("a$"), "a\n") == "none")
+    expect("word boundary", span(compiled("\\bfoo\\b"), "a foo b") == "2-5")
+    expect("not word boundary", span(compiled("\\Boo"), "foo") == "1-3")
+    expect("find offset", compiled("a").find("aXa", 1)?.start() == 2)
+    expect("find offset anchor", compiled("^a").find("aXa", 1) == null)
+
+    // Whole-string match, find all, replace.
+    expect("matches", compiled("a+b").matches("aaab") && !compiled("a+").matches("aaab"))
+    expect("matches priority", compiled("a|ab").matches("ab"))
+    val all = compiled("a*").findAll("baac")
+    expect("findAll empties", all.size == 4 && all[1].start() == 1 && all[1].end() == 3 &&
+        all[2].start() == 3 && all[2].end() == 3 && all[3].start() == 4)
+    expect("findAll alternation", compiled("|a").findAll("a").size == 3)
+    expect("replace", compiled("(\\w)(\\d)").replace("a1 b2", "$2$1") == "1a 2b")
+    expect("replace braces", compiled("(a)").replace("a", "\${1}1") == "a1")
+    expect("replace dollar", compiled("a").replace("a", "$$1$") == "$1$")
+    expect("replace missing group", compiled("(a)|b").replace("ab", "[$1]") == "[a][]")
+    expect("replace whole", compiled("b").replace("abc", "<$0>") == "a<b>c")
+    expect("replace empty", compiled("x*").replace("ab", "-") == "-a-b-")
+
+    // Counted repeats, nesting, escapes.
+    expect("repeat", span(compiled("(ab){2,3}"), "ababababab") == "0-6")
+    expect("nested repeat", span(compiled("((a{2}){3}){2}"), "aaaaaaaaaaaaa") == "0-12")
+    expect("hex", span(compiled("\\x41\\u00e9"), "Aé") == "0-3")
+    expect("escaped punctuation", span(compiled("\\.\\*\\[\\("), "a.*[(") == "1-5")
+    expect("brace literal", span(compiled("a{"), "a{") == "0-2")
+    expect("class edges", span(compiled("[]a-]+"), "x]a-") == "1-4")
+    expect("class shorthand", span(compiled("[\\d\\s]+"), "ab 12") == "2-5")
+    expect("class negated shorthand", span(compiled("[\\D]+"), "12ab3") == "2-4")
+
+    // Linear time: these take exponential time with backtracking.
+    val long = "a".repeat(100000)
+    expect("(a*)*b", span(compiled("(a*)*b"), long) == "none")
+    expect("(a|aa)+$", span(compiled("(a|aa)+$"), long + "b") == "none")
+    expect("(a+)+b", compiled("(a+)+b").find(long + "c") == null)
+    expect("x+x+y", span(compiled("(x+x+)+y"), "x".repeat(50000)) == "none")
+    var optional = ""
+    var needed = ""
+    for (i in 0 until 40) { optional = optional + "a?"; needed = needed + "a" }
+    expect("a?^n a^n", compiled(optional + needed).matches("a".repeat(40)))
+
+    // Large matches and many matches.
+    expect("findAll many", compiled("a").findAll("a".repeat(20000)).size == 20000)
+    expect("replace many", compiled("a").replace("a".repeat(5000), "bb").size == 10000)
+    expect("too large", !regexCompile("((a{1000}){1000}){1000}").succeeded)
+
+    if (failures == 0) println("ok")
+    failures
+}
