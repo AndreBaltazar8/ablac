@@ -171,6 +171,7 @@ test-serial: ablac
 	tools/test-ownership-help.sh $(COMPILER)
 	tools/test-fs-tree.sh $(COMPILER)
 	tools/test-compile-time-floats.sh $(COMPILER)
+	tools/test-eval-parity.sh $(COMPILER)
 	tools/test-compile-time-depth.sh $(COMPILER)
 	tools/test-compile-time-arguments.sh $(COMPILER)
 	tools/test-import-precedence-diagnostics.sh $(COMPILER)
