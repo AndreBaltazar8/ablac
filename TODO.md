@@ -899,21 +899,29 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   globals per object); passing an object as a pointer instead of a boxed argument (per-call boxing);
   dropping the constructor's tag test when the argument's static type is the field's class (about 6
   instructions a child, 3% of trees at most).
-- [ ] **Per-call boxing in the lowering.** 17% of the IR's instructions are
-  `alloca %AblaValue` (146K in that program), with as many stores and loads around them
-  and 29K `abla_i64` boxing calls. `opt`'s time is mostly the inliner, instcombine and SROA
-  undoing it. Passing and returning scalars unboxed would shrink opt and llc time, the Wasm
-  and run time together; it is the largest lever left, and a large change.
-  Of the slots `opt` keeps in a 6.7K-function client, two thirds are passed to calls (the
-  boxed argument ABI: string concatenation, field and array stores lead) and most of the
-  rest were pinned by the runtime reading a value through `ablaRuntimeValueAddress`; the
-  backend now addresses the slot itself there, which freed 21% of the kept slots.
-  Tried and dropped: boxing constants by copying a private constant value (instcombine
-  then passes the constant itself to read-only parameters) and copying values with
-  `memcpy`. Fewer slots survived, yet the Wasm grew 0.5% to 15%. A string's static value
-  holds its address in two 32-bit halves there, which LLVM cannot read back as one
-  constant word, so checks on it stop folding, and the module initializer is never
-  optimized, so its copies stay copies. Kept slots are a poor proxy; measure the output.
+- **Per-call boxing in the lowering: two alias cuts measured, held; the rest is a no-go** (2026-11-08,
+  master `04aa6c7d`). Branch `per-call-boxing` (not merged, kept for reference): a boxed `local.load` or a `parameter.load` (no default) whose value only
+  feeds read-only runtime readers (string, field, array reads, `object.is`) and has no label,
+  jump, branch, or same-name store between load and last use reads the local's or parameter's
+  own slot instead of a copy (`bootstrapLlvmLocalLoadAliases`). `src/orc_main.ab --emit-llvm`:
+  `alloca %AblaValue` 193,785 to 188,520 (-2.7%), instructions 1,213,775 to 1,187,445 (-2.2%),
+  bytes 80.59 M to 79.24 M (-1.7%); `abla_i64` calls unchanged (16.3 K). Compile instructions:
+  the compiler's own build -0.2%, benchmarks +0.1% to +0.3% (websocket-codec +0.7%); run instructions unchanged
+  (+-0.1%). Allowing rooted locals added nothing. Tried and dropped: no slot for an unread
+  `const.void`/`const.null` (one alloca fewer of 193,782).
+  Why not further: of the 193 K slots, 25 K are `abla_string_static` constants (the
+  copy-a-private-constant form is already dropped above: the Wasm grew), 22 K `field_get`
+  results (`abla_field_get_reference`/`_string`), 9.7 K `abla_string_equal_bool` results,
+  16 K `abla_i64`, and what a call receives must be a slot. Cutting them takes strings and
+  object references in a non-slot form (a register pair, or a typed argument ABI for the runtime
+  readers), which changes the runtime ABI: the large change this item described, not a cut.
+  Held, not merged (ablac-45): the IR is smaller but nothing measurable is bought (self-build -0.2%, run
+  instructions +-0.1%) and small programs compile +0.1% to +0.7% slower. The remaining boxing needs a
+  runtime ABI change.
+  Also tried and dropped earlier: boxing constants by copying a private constant value, and copying
+  values with `memcpy`: fewer slots survived, yet the Wasm grew 0.5% to 15% (a string static holds its
+  address in two 32-bit halves there, which LLVM cannot read back as one constant word). Kept slots are a
+  poor proxy; measure the output.
 - [ ] **The overload probe is a second semantic analysis.** It types only the bodies that
   may come by a value of a candidate's owner type (647 of a 4,979-body client, 38 of which
   resolve something) and builds no compile-effect summary (nor, without regions, a region
