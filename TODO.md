@@ -323,6 +323,22 @@
   test-json-ascii-spans 40, test-crypto-pure 39, test-compiler-memory-peak 36, test-uint256 34,
   test-crypto 34; the sum of every command's wall time is 1,657 s, so none is a serial
   bottleneck at JOBS=8.
+  By CPU (2026-11-08, `tools/run-tests.sh` now records each command's user and system seconds
+  as the fifth column of `results.tsv`; cold cache, JOBS=8, four chunks, 332 commands, 1,754
+  CPU-seconds): test-self-hosted 95, test-reproducible-elsewhere 94, test-ct-bridge 91,
+  test-doc-examples 71, test-bignum-secret 54, test-gc-growth 54, test-crypto-pure 51,
+  test-math-v8 43, test-transactions 43, the compile-time parity probes 40, test-json-ascii-spans 36,
+  test-uint256 31 and test-project-path-symbols 31. The top 15 are 791 CPU-seconds and the top 40
+  1,196: a flat tail. Getting to 960 (under 2 minutes at JOBS=8 on CPUs 0-7) needs about 40% less
+  CPU, and checking the biggest for duplicated work found little to share: test-bignum-secret's
+  builds are two different programs, each in fast and release; test-self-hosted's 89 tests build
+  distinct programs, and the ten of its `suite-*` entries that rerun a script also in the recipe
+  (borrow-lifetimes, floating-point, nominal-scalars, unsafe-stack-memory, local-shadowing,
+  eval-steps, borrow-duplicates) cost about 13 CPU-seconds; test-reproducible-elsewhere builds
+  two things to compare them, so both builds are the test. Stripping `--no-cache` from
+  test-uint256 gave 22.0 and 14.8 CPU-seconds against 18.5 and 25.0 as written: inside one
+  suite run each program and flag set is built once, so the cache shares little. What is left
+  is the cost of each compile (LLVM is 45%), a separate item.
 - [x] **Tests run on every push to master and on PRs** ([CI](docs/ci.md)): the Linux suite and an
   arm64 macOS host/fixed-point job. Tests only; releases still start by hand.
 - [x] **Parser-derived formatter.** `ablac fmt` preserves comments and verbatim syntax,
