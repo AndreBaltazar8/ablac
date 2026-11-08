@@ -101,6 +101,11 @@ fun main {
 | `p.remove()`, `p.removeTree()` | delete a file or empty directory, or a whole tree |
 | `watchFile(p)`, `watchFiles(paths)` | a `FileWatch`; `changed()` reports a change since the last `refresh()` |
 
+A `FileWatch` made by `watchFile` compares each file's modification time, size, inode and
+change time from one stat, so a rewrite inside one clock tick (kernels before 6.13 stamp
+files from a clock that ticks every few milliseconds) is still seen when it changes the size
+or swaps in a new file, as `writeTextAtomic` does.
+
 `writeText` and `writeTextAtomic` accept creation modes from `0o000` through
 `0o777`. Special bits and negative modes fail without writing. For example,
 `Path("secret.txt").writeText("secret", mode = 0o600)` creates a private file;

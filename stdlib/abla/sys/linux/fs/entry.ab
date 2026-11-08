@@ -25,9 +25,13 @@ class FileInfo(
     fun isDirectory(): bool = this.kind == 2
 }
 
+// `fingerprints` (what watchFiles records) catches a rewrite inside one clock
+// tick, which the modification time alone misses; a watch built with only
+// `revisions` compares those.
 class FileWatch(
     val paths: array<Path>,
-    var revisions: array<int>
+    var revisions: array<int>,
+    var fingerprints: array<string> = []
 )
 
 fun path(value: string): Path = Path(value)
@@ -195,6 +199,27 @@ fun Path.info(): FileInfo = linuxFileInfo(this)
 fun Path.linkInfo(): FileInfo = linuxStatInfo(this, 256)
 
 fun Path.revision(): int = this.info().revision
+
+// Modification time (nanoseconds), size, inode and change time from one stat:
+// a rename that swaps in a new file changes the inode even when the clock
+// has not ticked and the size is the same.
+private fun Path.fingerprint(): string {
+    val status = nativeByteBuffer(144)
+    val measured = linuxSyscall4(
+        262,
+        -100,
+        nativeCStringAddress(this.text),
+        nativePointerAddress(status.address),
+        0
+    )
+    var result = "missing"
+    if (measured == 0) {
+        result = "${status.loadI64(88)}.${status.loadI64(96)}:${status.loadI64(48)}:" +
+            "${status.loadI64(8)}:${status.loadI64(104)}.${status.loadI64(112)}"
+    }
+    status.close()
+    result
+}
 
 fun Path.exists(): bool = this.info().exists()
 
@@ -597,12 +622,14 @@ fun Path.entries(): array<Path> {
 
 fun watchFiles(paths: array<Path>): FileWatch {
     val revisions: array<int> = []
+    val fingerprints: array<string> = []
     var index = 0
     while (index < paths.size) {
         revisions.append(paths[index].revision())
+        fingerprints.append(paths[index].fingerprint())
         index = index + 1
     }
-    FileWatch(paths, revisions)
+    FileWatch(paths, revisions, fingerprints)
 }
 
 fun watchFile(filePath: Path): FileWatch = watchFiles([filePath])
@@ -616,6 +643,10 @@ fun FileWatch.changed(): bool {
         if (this.paths[index].revision() != this.revisions[index]) {
             changed = true
         }
+        if (index < this.fingerprints.size &&
+            this.paths[index].fingerprint() != this.fingerprints[index]) {
+            changed = true
+        }
         index = index + 1
     }
     changed
@@ -623,11 +654,14 @@ fun FileWatch.changed(): bool {
 
 fun FileWatch.refresh(): void {
     val revisions: array<int> = []
+    val fingerprints: array<string> = []
     var index = 0
     while (index < this.paths.size) {
         revisions.append(this.paths[index].revision())
+        fingerprints.append(this.paths[index].fingerprint())
         index = index + 1
     }
     this.revisions = revisions
+    this.fingerprints = fingerprints
     fileWatchUnit()
 }
