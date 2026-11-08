@@ -24,26 +24,28 @@ with tempfile.TemporaryDirectory(prefix='abla-ct-source-') as directory:
     original = (copied / 'fixture.ab').read_text()
     source = (copied / aes).read_text()
 
-    # A deliberately leaky edit to tested SubWord code must reach the fixture.
-    marker = '    aesStore(q, word)\n'
-    assert source.count(marker) == 1
-    leak = '    if (word.declassify() == u32(0)) ablaUnsafeVolatileStoreU8(q, 1)\n'
-    (copied / aes).write_text(source.replace(marker, marker + leak))
-    changed = run()
-    assert changed.returncode == 0, changed.stderr
-    generated = (copied / 'fixture.ab').read_text()
-    assert leak in generated and generated != original, 'stale SubWord fixture'
+    # What touches a key is read from the production source itself: the region between BEGIN/END AES KEY EXPANSION is
+    # appended to the fixture module by tools/test-ct.sh, so every function the fixtures call must lie inside it.
+    begin, end = source.index('// BEGIN AES KEY EXPANSION\n'), source.index('// END AES KEY EXPANSION\n')
+    assert source.count('// BEGIN AES KEY EXPANSION\n') == source.count('// END AES KEY EXPANSION\n') == 1
+    region = source[begin:end]
+    for name in ['aesExpandSchedule', 'aesSubWord', 'aesDecryptionKeys', 'aesHardwareEncryptAt', 'aesHardwareDecryptAt']:
+        assert f'fun {name}(' in region, f'{name} is outside the region the fixtures read'
+        assert name == 'aesSubWord' or f'{name}(' in original, f'no fixture calls {name}'
+    for name in ['aesAllocateMemory', 'aesNewKey', 'aesStringAddress', 'aesExpandBytes']:
+        assert f'fun {name}(' in source and f'fun {name}(' not in region, f'{name} must stay outside the region'
 
-    # Even a comment outside the tested stages requires an explicit review.
+    # Even a comment in the allocation wrappers, which the checker does not read, requires an explicit review.
     marker = '    val words = count / 4\n'
-    assert source.count(marker) == 1
-    (copied / aes).write_text(source.replace(marker, '    // unreviewed scaffold\n' + marker))
+    assert source.count(marker) >= 2
+    (copied / aes).write_text(source.replace(marker, '    // unreviewed scaffold\n' + marker, 1))
     changed = run()
     assert changed.returncode != 0
-    assert 'aesExpandBytes: excluded source changed' in changed.stderr
+    assert 'aesWrappers: excluded source changed' in changed.stderr
+    (copied / aes).write_text(source)
 
     # Orthogonalization now uses the actual imported helper: no fixture-only
     # substitution of its literal indices or arithmetic remains.
-    assert 'aesOrthogonalize(' in original
-    assert 'ctSourceOrthogonalize' not in original
-print('ok   crypto fixture generation: source leak propagated, scaffold edit refused, actual orthogonalization imported')
+    assert 'aesOrthogonalize(' in region
+    assert 'ctSourceOrthogonalize' not in original and 'ctSourceOrthogonalize' not in region
+print('ok   crypto fixture generation: the key functions lie in the region the fixtures read, a wrapper edit is refused, actual orthogonalization imported')

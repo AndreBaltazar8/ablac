@@ -347,15 +347,6 @@ trusted fun aesWipe(address: int, size: int): void {
 }
 
 // --- The key schedule (software on every target: AESKEYGENASSIST has no ARM counterpart) ---
-/** SubWord on one word, through the bitsliced S-box. */
-trusted fun aesSubWord(q: int, word: secretU32): secretU32 {
-    aesStore(q, word)
-    for (i in 1 until 8) aesStore(q + i * 4, secretU32(u32(0)))
-    aesOrthogonalize(q)
-    aesSubBytes(q)
-    aesOrthogonalize(q)
-    aesLoad(q)
-}
 
 /** An AES key's expanded form, in memory this module owns. `words` is the schedule (little-endian
  *  words, 4 a round); `sliced` the bitsliced round keys, or 0 if hardware rounds take over. */
@@ -366,26 +357,71 @@ resource class AesKey(val memory: int, val size: int, val rounds: int, val hardw
     }
 }
 
-private val AES_SCRATCH_BYTES = 64
-
 @inline fun AesKey.schedule(): int = this.memory + AES_SCRATCH_BYTES
 
 @noinline trusted fun aesExpand(key: string, hardware: bool): AesKey =
     aesExpandBytes(0, key.size, hardware, key)
 
-private @noinline trusted fun aesExpandBytes(data: int, count: int, hardware: bool,
-    owner: string): AesKey {
+// The allocations of a key's expansion and a managed string's address, each in a function of its own that is
+// given nothing secret.
+private @noinline trusted fun aesAllocateMemory(count: int): int {
     val words = count / 4
     val rounds = words + 6
     val total = 4 * (rounds + 1)
     // Scratch, the schedule (and the decryption keys hardware wants), and the bitsliced keys.
     val size = AES_SCRATCH_BYTES + total * 8 + total * 8 + 16
-    val memory = ablaUnsafePointerAddress(ablaUnsafeAllocate(size))
-    val result = AesKey(memory, size, rounds, hardware)
-    val schedule = result.schedule()
+    ablaUnsafePointerAddress(ablaUnsafeAllocate(size))
+}
+
+private @noinline trusted fun aesNewKey(memory: int, count: int, hardware: bool): AesKey {
+    val words = count / 4
+    val rounds = words + 6
+    val total = 4 * (rounds + 1)
+    AesKey(memory, AES_SCRATCH_BYTES + total * 8 + total * 8 + 16, rounds, hardware)
+}
+
+private @noinline trusted fun aesStringAddress(owner: string): int = ablaUnsafeStringAddress(owner)
+
+private @noinline trusted fun aesExpandBytes(data: int, count: int, hardware: bool,
+    owner: string): AesKey {
+    val memory = aesAllocateMemory(count)
+    val result = aesNewKey(memory, count, hardware)
     // Materialize a managed string's address after the allocations above. The
     // owner stays rooted across them; buffer-key callers borrow native memory.
-    val source = if (owner.size > 0) ablaUnsafeStringAddress(owner) else data
+    val source = if (owner.size > 0) aesStringAddress(owner) else data
+    aesExpandSchedule(memory, source, count, hardware)
+    result
+}
+
+// BEGIN AES KEY EXPANSION
+// What touches a key, in functions of plain integers (addresses and counts, none of an object's fields) that call
+// nothing but each other: tools/test-ct.sh reads this region as written, in a module of its own
+// (tests/cases/ct/fixture.ab). What allocates or reads an object is above, given nothing secret, and not read
+// there: the runtime's allocator and collector branch on state the checker can't tell from secrets, and an
+// object's fields are public but look like any other load.
+/** SubWord on one word, through the bitsliced S-box. */
+private trusted fun aesSubWord(q: int, word: secretU32): secretU32 {
+    aesStore(q, word)
+    for (i in 1 until 8) aesStore(q + i * 4, secretU32(u32(0)))
+    aesOrthogonalize(q)
+    aesSubBytes(q)
+    aesOrthogonalize(q)
+    aesLoad(q)
+}
+
+private val AES_SCRATCH_BYTES = 64
+
+/** Where the decryption keys hardware wants lie: after the schedule and the bitsliced keys. */
+private @inline fun aesDecryptionAt(schedule: int, rounds: int): int =
+    schedule + (rounds + 1) * 4 * 4 + (rounds + 1) * 32
+
+/** The schedule, the bitsliced round keys and, for hardware rounds, the decryption keys of the key at `source`. */
+private @noinline trusted fun aesExpandSchedule(memory: int, source: int, count: int,
+    hardware: bool): void {
+    val words = count / 4
+    val rounds = words + 6
+    val total = 4 * (rounds + 1)
+    val schedule = memory + AES_SCRATCH_BYTES
     for (i in 0 until words) aesStore(schedule + i * 4, aesLoadBytes(source + i * 4))
     var rcon = secretU32(u32(1))
     for (i in words until total) {
@@ -410,29 +446,22 @@ private @noinline trusted fun aesExpandBytes(data: int, count: int, hardware: bo
         }
         aesOrthogonalize(sliced + round * 32)
     }
-    if (hardware) aesExpandDecryption(result)
-    result
+    if (hardware) aesDecryptionKeys(schedule, aesDecryptionAt(schedule, rounds), rounds)
 }
 
-@inline fun AesKey.decryption(): int = this.schedule() + (this.rounds + 1) * 4 * 4 + (this.rounds +
-    1) * 32
-
 // --- Hardware rounds: only ever reached past cpuHas -----------------------------------------
-@target("aes")
-@noinline trusted fun aesExpandDecryption(key: AesKey): void {
-    val schedule = key.schedule()
-    val out = key.decryption()
-    for (round in 0 .. key.rounds) {
+/** The decryption keys: the round keys with InvMixColumns applied to all but the first and the last. */
+private @target("aes") @noinline trusted fun aesDecryptionKeys(schedule: int, out: int,
+    rounds: int): void {
+    for (round in 0 .. rounds) {
         val roundKey = u8x16LoadAddress(schedule + round * 16)
-        val turned = if (round == 0 || round == key.rounds) roundKey else aesInvMixColumns(roundKey)
+        val turned = if (round == 0 || round == rounds) roundKey else aesInvMixColumns(roundKey)
         turned.storeAddress(out + round * 16)
     }
 }
 
-@target("aes")
-@noinline trusted fun aesHardwareEncrypt(key: AesKey, input: int, output: int, count: int): void {
-    val schedule = key.schedule()
-    val rounds = key.rounds
+private @target("aes") @noinline trusted fun aesHardwareEncryptAt(schedule: int, rounds: int,
+    input: int, output: int, count: int): void {
     for (block in 0 until count) {
         var state = u8x16LoadAddress(input + block * 16) ^ u8x16LoadAddress(schedule)
         for (round in 1 until rounds) {
@@ -443,10 +472,8 @@ private @noinline trusted fun aesExpandBytes(data: int, count: int, hardware: bo
     }
 }
 
-@target("aes")
-@noinline trusted fun aesHardwareDecrypt(key: AesKey, input: int, output: int, count: int): void {
-    val keys = key.decryption()
-    val rounds = key.rounds
+private @target("aes") @noinline trusted fun aesHardwareDecryptAt(keys: int, rounds: int,
+    input: int, output: int, count: int): void {
     for (block in 0 until count) {
         var state = u8x16LoadAddress(input + block * 16) ^ u8x16LoadAddress(keys + rounds * 16)
         var round = rounds - 1
@@ -457,6 +484,17 @@ private @noinline trusted fun aesExpandBytes(data: int, count: int, hardware: bo
         aesDecLastRound(state, u8x16LoadAddress(keys)).storeAddress(output + block * 16)
     }
 }
+// END AES KEY EXPANSION
+
+@inline fun AesKey.decryption(): int = aesDecryptionAt(this.schedule(), this.rounds)
+
+@target("aes")
+@noinline trusted fun aesHardwareEncrypt(key: AesKey, input: int, output: int, count: int): void =
+    aesHardwareEncryptAt(key.schedule(), key.rounds, input, output, count)
+
+@target("aes")
+@noinline trusted fun aesHardwareDecrypt(key: AesKey, input: int, output: int, count: int): void =
+    aesHardwareDecryptAt(key.decryption(), key.rounds, input, output, count)
 
 // --- Blocks: hardware or software, input and output may be the same memory ------------------
 trusted fun aesSoftBlocks(key: AesKey, encrypt: bool, input: int, output: int, count: int): void {

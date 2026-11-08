@@ -159,13 +159,26 @@
   `bnFromBytes`, `bnToBytes` and `bnResidueSquare` have assembly fixtures and individual
   secret-index negative controls. AES orthogonalization is the actual imported implementation,
   without fixture-only index substitution; excluded scaffolding is guarded against unnoticed edits.
-- [ ] **Crypto allocation/call orchestration is still partly outside `test-ct.sh` coverage.** Done on x86-64
-  release: `bnFromBytes` and `bnResidueSquare` are read whole, their `bnClear` call followed (the build fails
-  without following). Still not read: AES key allocation (`aesExpandBytes`: the allocator and the managed-string
-  address acquisition are calls the checker can't name, so it stops at one inside the function), hardware
-  decryption-key conversion and block dispatch, and `rsaCrt`'s key/modulus construction, allocation/free and its
-  wide-reduce/encode/decode/exponentiation/multiply/copy calls (it takes resource objects, not the pointers the
-  checker models). Neither full loader timing nor secret-memory wiping is claimed.
+- [ ] **Crypto allocation and object plumbing stays outside `test-ct.sh`.** Read whole now, on x86-64 with the
+  calls between them followed, each with a secret-indexed twin that is found: `bnFromBytes` and `bnResidueSquare`
+  with their `bnClear`; and AES's key schedule, bitsliced round keys and hardware decryption keys (`aesExpandSchedule`,
+  `aesDecryptionKeys`) and its hardware block loops (`aesHardwareEncryptAt`, `aesHardwareDecryptAt`), which are
+  functions of plain integers appended from the production source (the region between BEGIN/END AES KEY EXPANSION);
+  the same specs are refused without following. Not read: (1) AES's key allocation, key object and a managed
+  string's address (`aesAllocateMemory`, `aesNewKey`, `aesStringAddress`), which are given nothing secret and carry a
+  source hash and a no-`declassify` assertion in the generator, so a change there is a reviewed one; (2) `rsaCrt`: its
+  `BnModulus` and key objects, `bnAllocate`/release and the order of calls around primitives that are fixtures
+  themselves, with the same hash and no-`declassify` assertions (`rsaCrt`, `rsaModulusFromLimbs`, `rsaReduceWide`).
+  They are not read because the checker takes every load it cannot place in the frame for a secret, and an object's
+  fields, the runtime's counters and a call's result slot are loads like any other. Tried: not following the
+  runtime's allocator and collector (a `--opaque` rule for functions given only public arguments); it still fails on
+  the collector's pressure check and on reading a call's result slot, neither of which is a secret. What would close it
+  is typed or tagged public loads (object fields, a result slot). Until then the type system covers that text (no
+  branch, index or division from a secret, `declassify` the only way out), and a branch the compiler itself adds there
+  is not read. The checker gained two precisions for this: `cqto` defines `rdx` from `rax` (a stale secret in `rdx`
+  was a false "secret division", which also shrinks `fast-known.txt` by its eight division entries), and a call to
+  `abla_platform_panic` is not followed (it ends the program) but must be given nothing secret. Neither full loader
+  timing nor secret-memory wiping is claimed.
 - [x] **Small constant-array `for` loops avoid materializing an array.** Up to16 homogeneous
   native scalar literals (optionally signed) use a bounded scalar selector and one body copy;
   other/larger arrays keep the ordinary path. Order, capture cells and loop exits are preserved.

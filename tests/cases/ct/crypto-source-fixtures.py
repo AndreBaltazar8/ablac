@@ -34,7 +34,7 @@ GUARDS = {
     'bnResidueSquare': '2bb8f304e7c5f1047e19dfdb5507ec2bedb6331b54384daab6d73a6dcaf91905',
     'bnFromBytes': 'eeebce423076a53fb063f21cbfb0397b5be468ad3d3ef283e2363eb3b35219c8',
     'aesSoftBlocks': '8ff73661c081f911087468327f77b4eef43a7cfea6b155f883861da35e242c60',
-    'aesExpandBytes': '0bd6e6ea2aa47c7bebf6e69b0db1ae1b81682d6583fe91a83ebf52aa3686b150',
+    'aesWrappers': 'f514a6be88264363408d2cd9db2438af6b8636faf32ab2007dc64b6e3fb1e94b',
 }
 
 
@@ -42,7 +42,7 @@ def guard(name, *pieces):
     actual = hashlib.sha256('\0'.join(pieces).encode()).hexdigest()
     if name not in GUARDS:
         raise AssertionError(f'missing source guard {name}: {actual}')
-    assert GUARDS[name] == actual, f'{name}: excluded source changed; review CT coverage'
+    assert GUARDS[name] == actual, f'{name}: excluded source changed; review CT coverage (now {actual})'
 
 
 def section(text, begin, end):
@@ -56,36 +56,44 @@ def section(text, begin, end):
 out = []
 specs = []
 leaks = []
+follow_specs = []
+follow_leaks = []
 
 
-def fixture(name, args, setup, actual, taints, leak_address='work'):
+def fixture(name, args, setup, actual, taints, leak_address='work', follow=False):
     # Leak controls run the same generated body before a genuine secret-indexed
     # volatile store; a missed call is NOT accepted as detecting this leak.
+    # `follow`: the body calls private functions that stay calls, so only the x86-64 checker that follows calls
+    # (tools/test-ct.sh orchestration_read) reads it, and it is listed apart.
     for bad in [False, True]:
         exported = 'ct_' + ('leak_' if bad else 'fix_') + name
         extra = ('\n    ablaUnsafeVolatileStoreU8(work + int(bnLoad(' + leak_address +
                  ').declassify() & u32(255)), 1)\n') if bad else ''
         out.append(f'\n@inline @export("{exported}")\ntrusted fun {exported}({args}): void {{\n{setup}\n{actual}{extra}\n}}\n')
-        (leaks if bad else specs).append(exported + ':' + taints)
+        ((follow_leaks if follow else leaks) if bad else (follow_specs if follow else specs)).append(exported + ':' + taints)
 
 
-# Expand the source SubWord calls textually so the local checker sees their
-# arithmetic rather than stopping at a potentially out-of-line helper call.
-subword = body(AES, 'aesSubWord')
-assert subword.endswith('    aesLoad(q)')
-subword = subword[:-len('    aesLoad(q)')]
-schedule, before, after = section(body(AES, 'aesExpandBytes'),
-    '    for (i in 0 until words)', '    if (hardware) aesExpandDecryption(result)')
-guard('aesExpandBytes', before, after)
-for arg, suffix in [('t.rotr(8)', ' ^ rcon'), ('t', '')]:
-    call = '            t = aesSubWord(memory, ' + arg + ')' + suffix
-    assert schedule.count(call) == 1
-    inlined = '            val q = memory\n            val word = ' + arg + '\n' + subword + '            t = aesLoad(q)' + suffix
-    schedule = schedule.replace(call, inlined)
-for bits in [128, 192, 256]:
-    setup = f'    val words = {bits // 32}\n    val rounds = words + 6\n    val total = 4 * (rounds + 1)\n    val memory = work\n    val schedule = work + 64'
-    fixture('aes_schedule_' + str(bits), 'work: int, source: int', setup,
-            schedule, '@0,@1', 'source')
+# The key schedule, the hardware decryption keys and the hardware block loops are read as written: the functions of
+# plain integers between BEGIN/END AES KEY EXPANSION (the test appends that region to the fixture module, and
+# follows the calls between its functions). What allocates, builds the key object or finds a managed string's
+# address is outside it, and given nothing secret: the guard below makes a change there a reviewed one.
+wrappers = ''.join(body(AES, name) for name in ['aesAllocateMemory', 'aesNewKey', 'aesStringAddress', 'aesExpandBytes'])
+guard('aesWrappers', wrappers)
+# A secret never becomes a public integer in the text the checker doesn't read: the compiler rejects branching on,
+# indexing by or dividing a secret, so what is left to the assembly check there is only what the compiler itself
+# might add, and declassifying is the one way out of the type.
+assert 'declassify' not in wrappers, 'an allocation wrapper declassifies'
+for count in [16, 24, 32]:
+    fixture(f'aes_expand_{count * 8}', 'work: int, source: int, hardware: bool', '',
+            f'    aesExpandSchedule(work, source, {count}, hardware)', '@0,@1', 'source', follow=True)
+fixture('aes_expand_variable', 'work: int, source: int, count: int, hardware: bool', '',
+        '    aesExpandSchedule(work, source, count, hardware)', '@0,@1', 'source', follow=True)
+fixture('aes_decryption_keys', 'schedule: int, out: int, rounds: int, work: int', '',
+        '    aesDecryptionKeys(schedule, out, rounds)', '@0,@1', 'schedule', follow=True)
+fixture('aes_hardware_encrypt', 'schedule: int, rounds: int, input: int, output: int, count: int, work: int', '',
+        '    aesHardwareEncryptAt(schedule, rounds, input, output, count)', '@0,@2,@3', 'schedule', follow=True)
+fixture('aes_hardware_decrypt', 'keys: int, rounds: int, input: int, output: int, count: int, work: int', '',
+        '    aesHardwareDecryptAt(keys, rounds, input, output, count)', '@0,@2,@3', 'keys', follow=True)
 
 # Exact byte-loader body (unaligned source), writing all four loaded bytes.
 load = body(AES, 'aesLoadBytes')
@@ -124,6 +132,8 @@ crt = body(RSA, 'rsaCrt')
 correction, prefix, suffix = section(crt, '    var borrow =', '    rsaMultiplyPlain(p, h, h, key.inverseQ())')
 recombine, bridge, ending = section(suffix, '    carry = secretU32', '    bnCopy(out, padded, nWords)')
 guard('rsaCrt', prefix, bridge, ending)
+for name in ['rsaCrt', 'rsaModulusFromLimbs', 'rsaReduceWide']:
+    assert 'declassify' not in body(RSA, name), f'{name} declassifies: its text is read only by the type system'
 assert correction.count('p.value()') == 1
 fixture('rsa_crt_correction', 'work: int, words: int',
         '    val m1 = work\n    val m2p = work + words * 4\n    val h = work + words * 8\n    val prime = work + words * 12',
@@ -144,4 +154,6 @@ path = Path(sys.argv[1])
 path.write_text(''.join(out))
 path.with_suffix('.good').write_text('\n'.join(specs) + '\n')
 path.with_suffix('.leaks').write_text('\n'.join(leaks) + '\n')
-print(f'crypto source fixtures: {len(specs)} paths with {len(leaks)} secret-index controls')
+path.with_suffix('.follow').write_text('\n'.join(follow_specs) + '\n')
+path.with_suffix('.followleaks').write_text('\n'.join(follow_leaks) + '\n')
+print(f'crypto source fixtures: {len(specs)} paths with {len(leaks)} secret-index controls, {len(follow_specs)} read by following calls with {len(follow_leaks)}')

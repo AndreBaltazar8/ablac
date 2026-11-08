@@ -24,6 +24,8 @@ sed -n '/^\/\/ BEGIN RSA SECRET BIGNUM PRIMITIVES$/,/^\/\/ END RSA SECRET BIGNUM
 sed -n '/^\/\/ BEGIN PBE SECRET CORES$/,/^\/\/ END PBE SECRET CORES$/p' stdlib/abla/crypto/pbe/entry.ab >> "$cases/fixture.ab"
 # Source-generated coverage for loops around the previously checked primitives.
 # No production edits or call exemptions: see generator's scope guards.
+# The AES functions that touch a key, as written (their allocating wrappers stay outside, see the generator).
+sed -n '/^\/\/ BEGIN AES KEY EXPANSION$/,/^\/\/ END AES KEY EXPANSION$/p' stdlib/abla/crypto/aes/entry.ab >> "$cases/fixture.ab"
 python3 "$cases/crypto-source-fixtures.py" "$cases/crypto-generated.ab"
 cat "$cases/crypto-generated.ab" >> "$cases/fixture.ab"
 # Every fixture also gets a residue entry: a @noinline copy as a worker, and an export that calls it and then
@@ -128,6 +130,51 @@ orchestration_read() { # object
         echo "ct: the orchestration fixtures didn't need following their calls" >&2; exit 1
     fi
     echo "ok   x86_64 orchestration: bnFromBytes and bnResidueSquare read whole, their calls followed"
+}
+
+# The key-handling functions of AES (the schedule, the hardware decryption keys, the hardware block loops), which are
+# functions of plain integers that stay calls. They are read whole with their calls followed: x86-64 only. The same
+# specs must be refused without following (the calls are what is covered), and each has a twin with a secret-indexed
+# store after the call, which has to be found for a secret address and not for a refused call.
+worker_read() { # object
+    local object=$1 specs=() leaks_follow=() spec
+    while IFS= read -r spec; do specs+=("$spec"); done < "$cases/crypto-generated.follow"
+    while IFS= read -r spec; do leaks_follow+=("$spec"); done < "$cases/crypto-generated.followleaks"
+    $check --follow-calls x86_64 "$object" "${specs[@]}" > "$out/x86_64-workers.log" 2>&1 || {
+        cat "$out/x86_64-workers.log" >&2; echo "ct: a secret reached a branch or an address in a key-handling function" >&2; exit 1
+    }
+    if $check x86_64 "$object" "${specs[@]}" > "$out/x86_64-workers-nofollow.log" 2>&1; then
+        echo "ct: the key-handling fixtures didn't need following their calls" >&2; exit 1
+    fi
+    for spec in "${leaks_follow[@]}"; do
+        if $check --follow-calls x86_64 "$object" "$spec" > "$out/x86_64-worker-leak.log" 2>&1; then
+            echo "ct: the checker missed $spec after following the call" >&2; exit 1
+        fi
+        grep -Eq 'secret (address|memory|index)' "$out/x86_64-worker-leak.log" || {
+            cat "$out/x86_64-worker-leak.log" >&2; echo "ct: expected secret-index detection for $spec" >&2; exit 1
+        }
+    done
+    echo "ok   x86_64 key functions: ${#specs[@]} read with their calls followed, ${#leaks_follow[@]} leaks after them caught, refused without following"
+}
+
+# Two rules of the checker, with hand-written controls: cqto defines rdx from rax (a secret left in rdx is not a secret
+# divisor), and a panic is not read but must be given nothing secret. The secret forms are found, the public ones pass.
+division_read() {
+    llvm-mc -triple x86_64-linux-gnu -filetype=obj "$cases/division-x86.s" -o "$out/division-x86.o"
+    ld.lld -static -e div_public_rdx "$out/division-x86.o" -o "$out/division-x86"
+    local entry
+    for entry in div_public_rdx panic_public; do
+        $check --follow-calls x86_64 "$out/division-x86" "$entry:@0" > "$out/division-$entry.log" 2>&1 || {
+            cat "$out/division-$entry.log" >&2; echo "ct: $entry was reported" >&2; exit 1
+        }
+    done
+    for entry in div_secret_rax panic_secret; do
+        if $check --follow-calls x86_64 "$out/division-x86" "$entry:@0" > "$out/division-$entry.log" 2>&1; then
+            echo "ct: missed $entry" >&2; exit 1
+        fi
+        grep -q '^LEAK' "$out/division-$entry.log" || { cat "$out/division-$entry.log" >&2; exit 1; }
+    done
+    echo "ok   x86_64 checker: cqto redefines rdx, a panic takes nothing secret (four controls)"
 }
 
 # Secret residue: what a secret-handling call leaves in memory that nothing wipes. The register allocator spills
@@ -269,6 +316,8 @@ frame_address_read
 residue_read
 real_entries_run
 orchestration_read "$out/x86.o"
+worker_read "$out/x86.o"
+division_read
 
 # --- AArch64 --------------------------------------------------------------------------
 "$compiler" build "$cases/aarch64-build.ab" -o "$out/aarch64-driver" --no-cache

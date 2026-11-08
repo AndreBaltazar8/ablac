@@ -243,6 +243,12 @@ def check_x86(lines, secret, pointers):
 
     def after_call(state, name, text):
         state = set(state)
+        if name == "abla_platform_panic":
+            # A panic (a division by zero, an index out of range) ends the program, so what it does isn't read.
+            # It is reached only on a branch the checker has already required to be public, and no secret goes in.
+            if "rdi" in state or "ptr:rdi" in state:  # its one argument, a message
+                raise Violation(f"call: a panic is given a secret or a pointer to one: {text}")
+            return frozenset(state)
         inputs = callee_inputs(name)
         secret_arguments = [i for i, r in enumerate(X86_ARGS) if r in state and r in inputs]
         pointer_arguments = [i for i, r in enumerate(X86_ARGS) if "ptr:" + r in state and r not in state and r in inputs]
@@ -419,6 +425,13 @@ def check_x86(lines, secret, pointers):
                 raise Violation(f"call: {text}")
             return after_call(state, callee.group(1), text)
         if op.startswith(("ret", "nop", "endbr", "ud2", "int3", "hlt")) or op == "":
+            return frozenset(state)
+        if op in ("cqto", "cqo", "cltd", "cdq", "cwtd", "cwd"):
+            # Sign-extends rax into rdx: rdx is a function of rax alone, whatever it held.
+            if "rax" in state:
+                state.add("rdx")
+            else:
+                state.discard("rdx")
             return frozenset(state)
         if re.match(r"^(i?div)[bwlq]?$", op):
             if any(read(o) for o in ops) or "rax" in state or "rdx" in state:
