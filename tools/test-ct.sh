@@ -143,6 +143,10 @@ worker_read() { # object
     $check --follow-calls x86_64 "$object" "${specs[@]}" > "$out/x86_64-workers.log" 2>&1 || {
         cat "$out/x86_64-workers.log" >&2; echo "ct: a secret reached a branch or an address in a key-handling function" >&2; exit 1
     }
+    # Every read really went into a callee: the ok line names how many functions it followed.
+    [[ $(grep -c '^ok.*following [1-9]' "$out/x86_64-workers.log") == "${#specs[@]}" ]] || {
+        cat "$out/x86_64-workers.log" >&2; echo "ct: a key-handling read followed no call" >&2; exit 1
+    }
     if $check x86_64 "$object" "${specs[@]}" > "$out/x86_64-workers-nofollow.log" 2>&1; then
         echo "ct: the key-handling fixtures didn't need following their calls" >&2; exit 1
     fi
@@ -168,13 +172,13 @@ division_read() {
             cat "$out/division-$entry.log" >&2; echo "ct: $entry was reported" >&2; exit 1
         }
     done
-    for entry in div_secret_rax panic_secret; do
+    for entry in div_secret_rax panic_secret panic_branch; do
         if $check --follow-calls x86_64 "$out/division-x86" "$entry:@0" > "$out/division-$entry.log" 2>&1; then
             echo "ct: missed $entry" >&2; exit 1
         fi
         grep -q '^LEAK' "$out/division-$entry.log" || { cat "$out/division-$entry.log" >&2; exit 1; }
     done
-    echo "ok   x86_64 checker: cqto redefines rdx, a panic takes nothing secret (four controls)"
+    echo "ok   x86_64 checker: cqto redefines rdx, a panic takes nothing secret and is not reached by a secret branch (five controls)"
 }
 
 # Secret residue: what a secret-handling call leaves in memory that nothing wipes. The register allocator spills

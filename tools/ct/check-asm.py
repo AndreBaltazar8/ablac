@@ -197,10 +197,11 @@ def stack_extent(name, seen=()):
 # With --follow-calls, a call to a function defined in the same object (what a --fast build makes of
 # every Abla call) is checked as a function of its own, on the arguments the caller passes, instead of
 # failing. A call to anything not defined there, or a recursion, still fails.
-FOLLOW = {"path": None, "stack": [], "done": {}, "residue": False}
+FOLLOW = {"path": None, "stack": [], "done": {}, "residue": False, "followed": set()}
 
 
 def follow_call(name, secret, pointers, text):
+    FOLLOW["followed"].add(name)
     key = (name, tuple(secret), tuple(pointers))
     if key in FOLLOW["done"]:
         return FOLLOW["done"][key]
@@ -1111,9 +1112,11 @@ def main():
             print(f"LEAK {arch} {name}: the disassembler can't read: {unread[0]}")
             failed = 1
             continue
+        FOLLOW["followed"] = set()
         try:
             CHECKERS[arch](lines, secret, pointers)
-            print(f"ok   {arch} {name} ({len(lines)} instructions)")
+            following = f", following {len(FOLLOW['followed'])}" if FOLLOW["followed"] else ""
+            print(f"ok   {arch} {name} ({len(lines)} instructions{following})")
         except Violation as violation:
             print(f"LEAK {arch} {name}: {violation}")
             failed = 1
