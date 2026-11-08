@@ -195,6 +195,9 @@
 - [ ] **Drop the clean-up of old build transactions** (`bootstrapRemoveOldBuildTransactions` in `src/toolchain.ab`,
   its call in `src/orc_main.ab`, docs/programmable-builds.md) once no compiler up to 0.2.32, which made
   `build/.abla-build-transaction-<pid>`, is in use.
+  Checked 2026-11-08: still in use, so it stays. NovaKind's `gateway/toolchain/ablac-version` is 0.2.32;
+  the CI workflows of abla-cli and abla-mjml pin 0.2.10, abla-qr 0.2.29 and abla-saft 0.2.32 (abla-s3's is
+  0.2.45; NovaKind's main pin is 0.2.48). Drop it once those are bumped.
 - [ ] **Released toolchains can't target Xtensa.** CI's Nix shell has the patched LLVM
   ([llvm-xtensa.md](docs/llvm-xtensa.md)), but `abla-toolchain-x86_64-linux` bundles
   stock LLVM and the macOS jobs use Homebrew's, without the private Xtensa patches. The old Nix-built one needs Nix's glibc 2.44; a separate glibc 2.35 companion
