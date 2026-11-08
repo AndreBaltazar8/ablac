@@ -487,7 +487,13 @@ Package-side work (not changed from ablac):
   element: entry + 1 in the mask's bits, the hash's upper bits above them as a mark), halving the
   array. 2026-11-08, wall time on a pinned core: maps 0.220 s to 0.197 s (-10.5%); json-megabyte
   peak RSS +1.5% (the earlier 64-bit-to-two-slot prototype was +7.7%), time unchanged. Cycles and
-  instructions still wait for a projects-e8 fair window.
+  instructions still wait for a projects-e8 fair window. Instructions (bench-compare, 3 rounds):
+  maps -9.3%, every other case within +-0.1%. maps' peak RSS is +12.2% (127 to 142 MB) though
+  nothing is retained: tracked live after a forced collection is lower (6.6 against 8.8 MB at
+  150000 entries), and with collections off its peak is 15% lower (177 against 210 MB). The
+  program ends within one growth step of its first collection; the new layout allocates fewer
+  bytes per entry, so that collection comes later in the run, when more is live. Other
+  benchmarks' peaks move -0.5% to +1.6%.
 - [ ] **`ablac test --o1` costs short suites build time** (2026-11-03): a bundle's build is about
   65% dearer than `--fast`'s (abla-qr: 28 G instructions against 17 G) for tests that run 10x
   faster; a suite of tests that each run in milliseconds is slower than before. `--fast` keeps
