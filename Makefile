@@ -175,6 +175,7 @@ test-serial: ablac
 	tools/test-interpolate-fixed-width.sh $(COMPILER)
 	tools/test-any-text-validation.sh $(COMPILER)
 	tools/test-any-text-panic.sh $(COMPILER)
+	tools/test-any-equality.sh $(COMPILER)
 	tools/test-contextual-keywords.sh $(COMPILER)
 	tools/test-lambda-void-assignment.sh $(COMPILER)
 	tools/test-process-environment.sh $(COMPILER)
