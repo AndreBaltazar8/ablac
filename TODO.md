@@ -95,11 +95,15 @@
   strings and interpolation, arrays, maps, classes, closures, `if`/`when`/loops, `any` erasure and
   equality) and runs them under native `--fast`, native release, the compile-time evaluator
   (`ABLA_COMPILE_EVAL=interp` and `jit`, every check behind `#`) and hostless Wasm (release and
-  development modules, node). Found so far: (1) equality through `any` in the interpreter:
-  `a == b` over two `any` NaNs was false (IEEE) where native, JIT and Wasm say true (payload bits);
-  fixed in `bootstrapEvaluateEquality` by the operands' static `any` type, regression
-  `tests/cases/fuzz-differential/any-nan-equality.ab`. Open: whatever later campaigns report is
-  listed here with its minimised program under `tests/cases/fuzz-differential/`.
+  development modules, node). Found so far: (1) equality through `any` of two NaNs was false in the
+  interpreter (IEEE) and true natively, in the JIT and in Wasm (payload bits); NaN sign and payload
+  from arithmetic are unspecified, so bit equality was mode-dependent. Resolved by `any-eq-ieee`
+  (erased floats of one kind compare as typed `==`); regression
+  `tests/cases/fuzz-differential/any-nan-equality.ab` (also checks forms through array, field, `when`,
+  f32 versus its bits). (2) In a `compile fun`, `f32(1.5)` fails with `E_EVAL_EXPRESSION` (call `f32`),
+  and f32 `0.0 / 0.0` fails with `E_EVAL_DIVISION_BY_ZERO` where f64 gives NaN; both run natively
+  (found by ablac-45). Open: whatever later campaigns report is listed here with its minimised
+  program under `tests/cases/fuzz-differential/`.
 
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
