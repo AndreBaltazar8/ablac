@@ -146,6 +146,7 @@ test-serial: ablac
 	python3 tools/ct-timing/test-stats.py
 	tools/test-bignum-secret.sh $(COMPILER)
 	tools/test-wide-integers.sh $(COMPILER)
+	tools/test-wide-integers.sh $(COMPILER) int256
 	tools/test-wide-integers.sh $(COMPILER) uint128
 	tools/test-array-truncate.sh $(COMPILER)
 	tools/test-array-filled.sh $(COMPILER)
