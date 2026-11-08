@@ -557,6 +557,15 @@ Package-side work (not changed from ablac):
   whose slot addresses the root frame holds for the whole call. Liveness over the block
   graph (the borrow analysis computes one) would let markers cover the first; roots need
   their frame entry cleared where they die.
+  Screened 2026-11-08 (master `3ceffa02`, v0.2.49 seed, stage1 with a temporary switch that lets a
+  non-root value touched in several blocks take its markers from its first to its last access in
+  instruction order, which is an upper bound: it ignores loops and branches, so real liveness keeps
+  slots at least as long): the stripped compiler built with the switch is 7,605,840 bytes against
+  7,606,192 (-0.005%), the websocket echo server 93,808 against 93,840 (-0.03%), and the compiler's
+  `sub $n,%rsp` frame bytes over its 2,368 functions 757,520 against 764,624 (-0.93%). So block-graph
+  liveness for non-root values would free under 1% of frame bytes and almost no code, below the
+  bars (1% of size, 5% of peak stack); the switch is not kept and nothing changed. Roots, which hold
+  most of the slots across blocks, are the part left, and need their frame entry cleared where they die.
 
 Measured on a 10K-function Wasm application (86 MB of LLVM IR). Its dev build's compiler,
 collecting each time its heap grows by 256 MiB, peaks at about 1 GB and takes about 28 CPU
