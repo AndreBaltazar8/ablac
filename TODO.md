@@ -107,8 +107,8 @@
   every disagreement was this one class, equality through `any` between a float and something else:
   `anyEq(-0.0, 0.0)` (native false, interpreter true), `anyEq(f64FromInt(1), 4607182418800017408)`
   (native true, interpreter false), `anyEq(f64ToF32(0.0), 0)` (native true, interpreter false), NaN with
-  itself and with a payload. They stay open in `tests/cases/fuzz-differential/open/any-mixed-kinds.ab`
-  until the semantics of mixed kinds is decided (`any-eq-ieee` covers same-kind floats).
+  itself and with a payload. They are decided (a float never equals an integer, bec6dfcf; same-kind floats compare as typed `==`,
+  `any-eq-ieee`) and kept as `tests/cases/fuzz-differential/any-mixed-kinds.ab`.
 
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
