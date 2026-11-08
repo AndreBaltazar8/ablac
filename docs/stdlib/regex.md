@@ -96,6 +96,10 @@ not take part, or does not exist, is empty; any other `$` stays literal.
 empty last iteration does not reset the group (`(a*)*` over `aa` captures `aa`
 where Python captures the empty string). Whole-match spans are identical.
 
+On a release build a search with a few alternatives and classes runs at about
+3 to 4 MB/s (1 MB of text, 20 000 matches in 0.28 s); the cost per byte grows
+with the number of instructions in the pattern, not with its nesting.
+
 ## Testing
 
 `tools/test-regex.sh` (part of `make test`) runs unit cases, the
