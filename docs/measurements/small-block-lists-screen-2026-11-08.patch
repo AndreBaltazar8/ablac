@@ -1,0 +1,143 @@
+diff --git a/stdlib/abla/runtime/platform/host.ab b/stdlib/abla/runtime/platform/host.ab
+index f4827352..c9334f8b 100644
+--- a/stdlib/abla/runtime/platform/host.ab
++++ b/stdlib/abla/runtime/platform/host.ab
+@@ -615,10 +615,101 @@ trusted fun __ablaRuntimeHostSmallLists(): int = nativeStaticAllocate(520)
+ // exhaustion check runs only here, with no new accounting on allocation or freeing.
+ // Limits by size, at least 1 MB each and half again what each served, did worse: trees and
+ // strings lost what they gained, as most sizes stayed small and each free counted twice.
+-var __ablaRuntimeHostSmallKept: int = 33554432
++var __ablaRuntimeHostSmallKept: int = __ablaRuntimeHostSmallEnvFloor()
+ var __ablaRuntimeHostSmallMarked: int = 0
+ var __ablaRuntimeHostSmallPushed: int = 0
+ 
++// EXPERIMENT (not for commit): ABLA_SB_FLOOR (MiB), ABLA_SB_TRIM (0|1), ABLA_SB_STRAND (0|1).
++@noinline
++trusted fun __ablaRuntimeHostSmallEnvFloor(): int {
++    val value = ablaRuntimePointerAddress(getenv(ablaRuntimePointerFromAddress(
++        __ablaRuntimeWord0("ABLA_SB_FLOOR")
++    )))
++    if (value == 0) return 33554432
++    var mebi = 0
++    var at = value
++    var digit = ablaRuntimeLoadU8(at)
++    while (digit >= 48 && digit <= 57 && mebi < 100000) {
++        mebi = mebi * 10 + digit - 48
++        at = at + 1
++        digit = ablaRuntimeLoadU8(at)
++    }
++    mebi * 1048576
++}
++@noinline
++trusted fun __ablaRuntimeHostSmallEnvTrim(): int {
++    val value = ablaRuntimePointerAddress(getenv(ablaRuntimePointerFromAddress(
++        __ablaRuntimeWord0("ABLA_SB_TRIM")
++    )))
++    if (value != 0 && ablaRuntimeLoadU8(value) == 49) 1 else 0
++}
++var __ablaRuntimeHostSmallFloor: int = __ablaRuntimeHostSmallEnvFloor()
++@noinline
++trusted fun __ablaRuntimeHostSmallEnvStrand(): int {
++    val value = ablaRuntimePointerAddress(getenv(ablaRuntimePointerFromAddress(
++        __ablaRuntimeWord0("ABLA_SB_STRAND")
++    )))
++    if (value != 0 && ablaRuntimeLoadU8(value) == 49) 1 else 0
++}
++var __ablaRuntimeHostSmallTrim: int = __ablaRuntimeHostSmallEnvTrim()
++var __ablaRuntimeHostSmallStrand: int = __ablaRuntimeHostSmallEnvStrand()
++
++// Each list's head as the last foreground sweep left it. A head still the same at the next
++// collection means nothing was taken from that size since: the list is stranded.
++trusted fun __ablaRuntimeHostSmallSnapshots(): int = nativeStaticAllocate(520)
++
++@noinline
++trusted fun __ablaRuntimeHostSmallListsSnapshot(): void {
++    if (__ablaRuntimeHostSmallStrand == 0) return
++    var total = 40
++    while (total <= 512) {
++        ablaRuntimeStoreI64(__ablaRuntimeHostSmallSnapshots() + total,
++            ablaRuntimeLoadI64(__ablaRuntimeHostSmallLists() + total))
++        total = total + 8
++    }
++    return
++}
++
++@noinline
++trusted fun __ablaRuntimeHostSmallListsStrand(): void {
++    var total = 40
++    while (total <= 512) {
++        val list = __ablaRuntimeHostSmallLists() + total
++        var head = ablaRuntimeLoadI64(list)
++        if (head != 0 && head == ablaRuntimeLoadI64(__ablaRuntimeHostSmallSnapshots() + total)) {
++            while (head != 0) {
++                val next = ablaRuntimeLoadI64(head)
++                free(ablaRuntimePointerFromAddress(head))
++                __ablaRuntimeHostSmallBytes = __ablaRuntimeHostSmallBytes - total
++                head = next
++            }
++            ablaRuntimeStoreI64(list, 0)
++        }
++        ablaRuntimeStoreI64(__ablaRuntimeHostSmallSnapshots() + total, 0)
++        total = total + 8
++    }
++    return
++}
++
++// Frees blocks from the lists, largest class first, until at most `target` bytes remain.
++@noinline
++trusted fun __ablaRuntimeHostSmallListsTrim(target: int): void {
++    var total = 512
++    while (total >= 40 && __ablaRuntimeHostSmallBytes > target) {
++        val list = __ablaRuntimeHostSmallLists() + total
++        var head = ablaRuntimeLoadI64(list)
++        while (head != 0 && __ablaRuntimeHostSmallBytes > target) {
++            val next = ablaRuntimeLoadI64(head)
++            free(ablaRuntimePointerFromAddress(head))
++            __ablaRuntimeHostSmallBytes = __ablaRuntimeHostSmallBytes - total
++            head = next
++        }
++        ablaRuntimeStoreI64(list, head)
++        total = total - 8
++    }
++    return
++}
++
+ // Before a sweep: the lists' size for the sweep and the cycle after it, from what they
+ // served in the cycle that ends; and where the next cycle's serving is counted from (the
+ // sweep's frees add to what the lists hold and to what was given back alike).
+@@ -629,9 +720,14 @@ trusted fun __ablaRuntimeHostSmallListsSettle(): void {
+     if (served >= 33554432 && __ablaRuntimeHostSmallBytes < served / 64) {
+         kept = served * 2
+     }
+-    if (kept < 33554432) kept = 33554432
++    val floor = __ablaRuntimeHostSmallFloor
++    if (kept < floor) kept = floor
+     if (kept > __ablaRuntimeHostSmallLimit) kept = __ablaRuntimeHostSmallLimit
++    if (__ablaRuntimeHostSmallTrim != 0 && __ablaRuntimeHostSmallBytes > kept) {
++        __ablaRuntimeHostSmallListsTrim(kept)
++    }
+     __ablaRuntimeHostSmallKept = kept
++    if (__ablaRuntimeHostSmallStrand != 0) __ablaRuntimeHostSmallListsStrand()
+     __ablaRuntimeHostSmallMarked = __ablaRuntimeHostSmallBytes
+     __ablaRuntimeHostSmallPushed = 0
+ }
+@@ -1420,6 +1516,7 @@ trusted fun __ablaRuntimePlatformMemoryCollect(): int {
+     __ablaRuntimeHostTraceMarkedAllocations()
+     __ablaRuntimeHostSmallListsSettle()
+     __ablaRuntimeHostCollectionSweep()
++    __ablaRuntimeHostSmallListsSnapshot()
+     free(ablaRuntimePointerFromAddress(
+         __ablaRuntimeHostCollectionWorklist
+     ))
+@@ -1479,7 +1576,10 @@ trusted fun __ablaRuntimeHostBackgroundMemoryCollect(): int {
+     if (background) {
+         __ablaRuntimeHostBackgroundSweep()
+         __ablaRuntimeHostFreeStart()
+-    } else __ablaRuntimeHostCollectionSweep()
++    } else {
++        __ablaRuntimeHostCollectionSweep()
++        __ablaRuntimeHostSmallListsSnapshot()
++    }
+     free(ablaRuntimePointerFromAddress(
+         __ablaRuntimeHostCollectionWorklist
+     ))

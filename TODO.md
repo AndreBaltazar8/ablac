@@ -506,10 +506,13 @@
   adds work. The nonlinear RSS is not attributable solely to cached-byte totals.
   Stopped at the failed runtime/RSS gates: no compiler self-build peak, firmware,
   GC-stress or threads success is claimed for these rejected variants.
-  Next possible screen: a smaller adaptive floor/ceiling for cycles with high
-  unused bytes and little reuse, using existing GC-cycle counters and hysteresis
-  instead of per-hit bookkeeping. Merely lowering the budget cannot evict old
-  lists; it would also need bounded cap enforcement. Not implemented.
+  Screened 2026-11-08 (`docs/measurements/small-block-lists-screen-2026-11-08.md`, patch beside it): a
+  lower floor (16, 8, 4 MiB), trimming the lists to the new budget at each collection, and freeing every list
+  that saw no hit since the last sweep (its head unchanged, no per-hit cost). A lower floor costs trees
+  +15% to +49% instructions, strings +31% to +45%, maps +11% to +18%, and gets json-readers 168 to 143 MiB
+  (-14.9%, floor 8) for +5.2% instructions; trim changes nothing, freeing unhit lists changes json-readers by
+  0 MiB and raises json-megabyte 218 to 298 MiB. No variant passes; not pursued. What would still be open is
+  a signal that separates json-readers' use of its lists from trees' without a per-hit counter.
   Prototypes, exact patches, scripts and raw data remain in
   `worktrees/ablac-small-remeasure/build/cache-lab/` (`report.md`, `summary.json`,
   `rss-runs.json`, `probe-{runs,rechecks}.json`, `screen-{runs,summary}.json`).
