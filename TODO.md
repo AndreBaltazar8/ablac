@@ -685,6 +685,13 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   compiler image a word at a time with two modulo steps per word (1.3 to 1.6% of a build); two words a step
   gives the same two residues with half the divisions: 3,559.7 M to 3,550.8 M and 3,637.5 M to 3,628.3 M
   instructions (-0.25% each, three alternating runs; the executables are byte-identical).
+  Screened 2026-11-08 (`docs/measurements/native-fast-screen-2026-11-08.md`): the in-process passes
+  (`mem2reg`, `simplifycfg`) are 0.2% to 2.5% of the LLVM time and dropping them moves code generation by +7%,
+  +6.6% and −11% on three programs; FastISel at -O0 is the cheapest code generator (SelectionDAG +34% to +62%,
+  -O1 +156% to +190%); the DWARF line tables `--fast` carries by default are 7% to 9% of a build (up to 15% in a first run)
+  (`--no-debug`: 9% to 17% smaller executables). Adding `sroa` or `instcombine` to `mem2reg` and `simplifycfg`
+  changes the pair's total by +0.2% and -0.4% (`map`), -20.3% and -7.7% (`unsafe-boundary`), -1.4% and -0.8%
+  (`string-helpers`). No setting reaches 10% on the small programs; not pursued.
 - [ ] **Reuse the frontend's work on the standard library between builds** (parked 2026-11-08). In the profile
   above the compiler's own code is 58 to 59% of a `--fast` build and the standard library's modules are
   most of what a small program imports, so lexing, parsing, analyzing and lowering them again each
