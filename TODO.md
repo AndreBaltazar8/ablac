@@ -90,6 +90,17 @@
       if an ARM64 tagged-heap host compiler ever ships.
 
 
+- [ ] **`tools/fuzz-differential` findings** (2026-11-08; branch `fuzz-differential`). The fuzzer builds
+  random well-typed programs (integers of every width with wrapping and shift edges, `f64`/`f32`,
+  strings and interpolation, arrays, maps, classes, closures, `if`/`when`/loops, `any` erasure and
+  equality) and runs them under native `--fast`, native release, the compile-time evaluator
+  (`ABLA_COMPILE_EVAL=interp` and `jit`, every check behind `#`) and hostless Wasm (release and
+  development modules, node). Found so far: (1) equality through `any` in the interpreter:
+  `a == b` over two `any` NaNs was false (IEEE) where native, JIT and Wasm say true (payload bits);
+  fixed in `bootstrapEvaluateEquality` by the operands' static `any` type, regression
+  `tests/cases/fuzz-differential/any-nan-equality.ab`. Open: whatever later campaigns report is
+  listed here with its minimised program under `tests/cases/fuzz-differential/`.
+
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
 - [ ] **Abla-native Xtensa companion installer.** The explicit optional installer uses only the Python
