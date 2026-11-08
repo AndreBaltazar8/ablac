@@ -48,6 +48,11 @@ output=$(run "$output_directory/bank-spread")
 [[ $output == *$'wrong audits 0, total 1600, conflicts true\nstatus 42' ]] ||
     { echo "stm, bank across clocks: $output" >&2; exit 1; }
 
+build blind-spread.ab blind-spread
+output=$(run "$output_directory/blind-spread")
+[[ $output == *$'blind writes, wrong audits 0\nstatus 42' ]] ||
+    { echo "stm, blind writes across clocks: $output" >&2; exit 1; }
+
 build retry.ab retry
 output=$(run "$output_directory/retry")
 [[ $output == $'produced 5000, sum 12502500\nstatus 42' ]] ||

@@ -18,11 +18,24 @@ state, and the final state is serial). `python3 stm-hybrid-clock-model.py hybrid
 schedules): 0 violations. Negative controls with 40,000 schedules a spec (200,000): `resample` (moving to the
 second clock samples the first one again instead of keeping the snapshot) 2,417 violations; `nosample` (no
 revalidation at a new clock's first read) 50; `broken` (no revalidation when a snapshot is moved up) 7,072;
-`skipfresh` (a commit never validates) 579. GV4's sharing of a version is not modelled; `test-stm` covers it.
+`skipfresh` (a commit never validates) 579. Not modelled: GV4's sharing of a version, a transaction that moves
+from one clock to the next by a write it did not read first (every modelled writer reads what it writes), two
+regions that map to the same clock, `retry` and `orElse`; `test-stm` covers the first three.
 
 `tools/test-stm.sh` (now including `tests/cases/stm/bank-spread.ab`: sixteen accounts 1,200 bytes apart, so every
-transfer and audit moves between clocks), `tools/test-stm-wasm-unwinding.sh` and `tools/test-gc-stress.sh` pass.
-With the revalidation at a clock's first read disabled, `test-stm` fails (130 to 260 wrong audits in `bank`).
+transfer and audit moves between clocks, and `tests/cases/stm/blind-spread.ab`: four writers set three accounts in
+three clocks without reading them, two auditors check they agree), `tools/test-stm-wasm-unwinding.sh` and
+`tools/test-gc-stress.sh` pass. Each new test run alone, three runs, against a broken runtime:
+
+| Runtime change | `bank-spread` | `blind-spread` |
+|---|---|---|
+| no revalidation at a clock's first read | fails: 26 to 49 wrong audits | fails: 61 to 327 wrong audits |
+| moving to the second clock samples the first again (`resample`) | fails: totals 1,591 to 1,610 | passes |
+| a new write entry does not move the mode | passes | fails: the commit's panic (a transaction with writes and no mode) |
+
+`bank-spread` abandoned between 2,084 and 5,580 attempts in 20 runs (median 2,312), so its "conflicts true" is
+reliable. The commit of a transaction with writes and mode 0 (no access recorded) panics instead of reading the
+sampled list of an earlier attempt.
 
 ## Measurements
 
@@ -35,11 +48,15 @@ sharing a region with its neighbour.
 | Scenario | own region: ns | cycles | instructions | consecutive: ns | cycles | instructions |
 |---|---:|---:|---:|---:|---:|---:|
 | four threads, disjoint | −57.9% | −55.5% | +1.8% | −12.5% | −23.0% | +12.4% |
-| four threads, shared | +4.8% (pairs −9 to +27) | +3.1% | +14.7% | −12.5% (pairs −21 to +82) | −13.4% | +5.2% |
+| four threads, shared | +4.8% (pairs −9 to +27) | +3.1% | +14.7% | −12.5%, within noise (pairs −21 to +82) | −13.4% | +5.2% |
 | forced logged, one thread | −1.4% | −1.2% | +7.9% | +0.0% | +0.1% | +7.9% |
 | direct, one thread | +0.0% | +0.3% | +0.0% | +0.0% | +1.4% | +0.0% |
 
 Forced-logged one-thread blocks execute 1,339 instructions against 1,241 (the access test and the mode
 branches at commit), and their cycles are the baseline's to within 1.5%. Shared is the conflict-bound case (a
 commit that loses retries); its pairs spread wider than any difference. A four-thread run on TVars that are
-not apart pays the second clock's sampling at each escalation, and still gains in cycles.
+not apart pays the second clock's sampling at each escalation, and still gains in cycles. Most programs make
+related TVars one after the other, so the consecutive column is as much the result as the own-region one: a gain
+of 12.5% in time and 23% in cycles on disjoint TVars, 12% more instructions, and no gain it can show on shared ones.
+The accesses in the partitioned mode no longer call the mode function (`mode >= 0` guards the call); the
+instruction columns above are from before that change.

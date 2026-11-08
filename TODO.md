@@ -187,9 +187,10 @@
 - [ ] **Transactional memory: clocks beyond the region.** A logged transaction now runs the
   single-clock protocol on the clock of its first 1 KB region (sixteen clocks, region & 15) and keeps
   a snapshot for each clock only once it touches a second region
-  (`docs/measurements/stm-hybrid-clocks-2026-11-08.md`). Four threads on TVars made apart take 58%
-  less time per block (cycles −55%); on sixteen TVars made one after the other, where a thread's
-  group of four can straddle a region boundary, 12% less (cycles −23%). The costs: a forced-logged
+  (`docs/measurements/stm-hybrid-clocks-2026-11-08.md`). Four threads on disjoint TVars take 58% less
+  time per block (cycles −55%) when each thread's TVars were made apart from the others', and 12% less
+  (cycles −23%) when sixteen TVars were made one after the other, a thread's group of four straddling a
+  region boundary or sharing a region with its neighbour; shared TVars show no gain beyond noise. The costs: a forced-logged
   one-thread block executes 7.9% more instructions (1,241 to 1,339; its cycles are the baseline's to
   within noise) and a transaction that touches a second region pays the partitioned protocol's
   per-clock sampling. Open: a block over TVars made together can still straddle two regions (it then
