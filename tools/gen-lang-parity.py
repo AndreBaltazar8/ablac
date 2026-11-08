@@ -652,6 +652,52 @@ def control():
     write("control", declarations, cases)
 
 
+def captured_calls():
+    cases = []
+    cases.append(("calls", [
+        "val g = { n: int -> n + 1 }",
+        "val h = { x: int -> g(x) }",
+        'out.append("lambda ${h(' + o("int", "10") + ')} ${h(-5)}")',
+        "val composed = compose(double, { n: int -> n + 1 })",
+        'out.append("compose ${composed(' + o("int", "10") + ')} ${composed(0)}")',
+        "val both = compose(composed, adder(" + o("int", "100") + "))",
+        'out.append("nested ${both(3)}")',
+        "val again = twice({ n: int -> n * 3 })",
+        'out.append("twice ${again(' + o("int", "2") + ')} ${twice(again)(1)}")',
+        "val named = double",
+        "val viaName = { x: int -> named(x) + 1 }",
+        'out.append("function value ${viaName(' + o("int", "7") + ')}")',
+        "val chain = { x: int -> { y: int -> g(x) + composed(y) } }",
+        'out.append("inner ${chain(1)(' + o("int", "2") + ')}")',
+        "val fns: array<(int) -> int> = [g, double, composed]",
+        'out.append("all ${applyAll(fns, ' + o("int", "1") + ')}")',
+        "val sums = { x: int -> fns[0](x) + fns[1](x) }",
+        'out.append("array ${sums(' + o("int", "4") + ')}")',
+    ]))
+    cases.append(("state", [
+        "var total = " + o("int", "0"),
+        "val add = { n: int -> total = total + n }",
+        "add(" + o("int", "3") + ")",
+        "val addOnce = move { n: int -> add(n); add(n) }",
+        "addOnce(4)",
+        'out.append("mutating ${total}")',
+    ]))
+    write("captured-calls", CAPTURED_DECLARATIONS, cases)
+
+
+CAPTURED_DECLARATIONS = DECLARATIONS + [
+    "fun double(n: int): int = n * 2",
+    "fun compose(f: (int) -> int, g: (int) -> int): (int) -> int = { x: int -> g(f(x)) }",
+    "fun twice(f: (int) -> int): (int) -> int = { x: int -> f(f(x)) }",
+    "fun adder(base: int): (int) -> int = { x: int -> x + base }",
+    "fun applyAll(fs: array<(int) -> int>, x: int): int {",
+    "    var value = x",
+    "    for (f in fs) value = f(value)",
+    "    value",
+    "}",
+]
+
+
 def format_outputs():
     """The files are written in the formatter's own layout (house rule: fmt --check).
     Needs a compiler: argv[1], else build/ablac.bin or build/ablac."""
@@ -678,6 +724,7 @@ def main():
     generics()
     anys()
     control()
+    captured_calls()
     format_outputs()
 
 
