@@ -118,9 +118,9 @@
   panicking program per seed (index, slice, division, remainder, `filledArray`, `truncate`, `panic`: native
   and WebAssembly must print `before`, report `panic` on standard error and end with status 101). The
   language has no exceptions or recover, so a panic is the only failure to compare. Campaigns: seeds
-  100 to 125 (older compiler, no `any`), 200 to 225 and 300 to 351 (24 to 30 checks each, six modes
-  plus the panic programs; 104 seeds, 2,808 checks): no disagreement. The generator also draws `f32(literal)`
-  and f32 division edges since ablac-e5's evaluator fixes (570b6462).
+  100 to 125 (older compiler, no `any`), 200 to 225, 300 to 351 and 400 to 451 (24 to 30 checks each, six
+  modes plus the panic programs; 156 seeds, 4,368 checks): no disagreement. Seeds 400 to 451 also draw
+  `f32(literal)` and f32 division edges (ablac-e5's evaluator fixes, 570b6462).
 
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
