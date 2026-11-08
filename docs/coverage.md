@@ -19,7 +19,7 @@ Test scripts marked † run in no suite: neither the Makefile `test` target nor
 
 | Feature | Implemented in | Documented in | Quality | Tested by |
 |---|---|---|---|---|
-| Programs, `main`, exit status, `exit`, `panic` | `backend/llvm/exports.ab`, `stdlib/abla/process/exit` | [language.md#programs](language.md#programs) | good | test-main-void, shell-process-exit |
+| Programs, `main`, exit status, `exit`, `panic` | `backend/llvm/exports.ab`, `stdlib/abla/process/exit` | [language.md#programs](language.md#programs) | good | shell-main-void, shell-process-exit |
 | Comments, identifiers, keywords, contextual keywords | `lexer.ab`, `parser.ab` (`atContextualKeyword`) | [language.md#lexical-structure](language.md#lexical-structure) | good | shell-contextual-keywords |
 | Line continuation (`+`, `-`, `.` at line start) | `parser.ab` `continueAdditiveExpression`, `continueMemberChain` | [language.md#lexical-structure](language.md#lexical-structure) | good | shell-line-continuation |
 | Literals, string escapes, templates, multi-line strings | `lexer.ab`, `parser.ab` `bootstrapDecodeString` | [language.md#lexical-structure](language.md#lexical-structure) | good | shell-static-strings, test-string-escapes, test-float-interpolation, shell-interpolate-fixed-width, shell-string-plus |
@@ -35,7 +35,7 @@ Test scripts marked † run in no suite: neither the Makefile `test` target nor
 | Functions, defaults, named arguments | `parser.ab`, `module.ab` normalizer | [language.md#functions](language.md#functions) | good | test-named-default-arguments, shell-argument-diagnostics |
 | Inferred result types | `sema.ab` | [language.md#functions](language.md#functions) (known issue) | good | — |
 | Extension functions | `parser.ab` `parseDeclaration` | [language.md#extension-functions](language.md#extension-functions) | good | shell-line-continuation, test-nominal-scalars |
-| Lambdas, trailing lambdas, closures | `parser.ab` `parseLambda`, `sema.ab` | [language.md#lambdas-and-closures](language.md#lambdas-and-closures) | good | test-closure-captures, test-lambda-void-assignment |
+| Lambdas, trailing lambdas, closures | `parser.ab` `parseLambda`, `sema.ab` | [language.md#lambdas-and-closures](language.md#lambdas-and-closures) | good | test-closure-captures, shell-lambda-void-assignment |
 | Classes, methods, properties | `parser.ab`, `sema.ab` | [language.md#classes](language.md#classes) | good | classes (native) |
 | Interfaces | `parser.ab`, `sema.ab` (nominal only) | [language.md#interfaces](language.md#interfaces) | reference | overload-probe-filter |
 | `abstract`, `constructor` keywords | being removed (they did nothing) | not documented | — | — |
@@ -139,6 +139,6 @@ under its first matching reason, in this order):
 - **tool** (17): need other tools or text processing between steps (`opt`, `clang`, `sed`, `awk`, `cmp`, `diff`, `curl`, `nix-shell`).
   test-build-same-process, test-checked-export, test-definite-assignment, test-generated-virtual-module, test-global-array-mutation, test-lazy-root-frames, test-linux-arguments, test-linux-io, test-native-cstring-lifetime, test-native-initialize-globals, test-path-home, test-portable-io, test-rewritten-module-diagnostics, test-run-built, test-sidecar, test-typed-subparser-inspection
 - **captured** (33): compare a program's output captured with `$(...)` in shell, usually with counts or several conditions.
-  test-cache-layout-version, test-compile-time-arguments, test-compile-time-depth, test-direct-syscall, test-extension-receivers, test-frontend-analysis, test-fs-tree, test-inferred-receivers, test-ios-package, test-ir-finalization, test-json-ascii-spans, test-lambda-symbols, test-lambda-void-assignment, test-lowered-ir-cache, test-main-void, test-orc-session, test-parse-errors-stop, test-recursive-class-types, test-region-escape-operators, test-shell-environment, test-stable-native-symbols, test-structured-type-reflection, test-transactional-native-output, test-value-lifetimes, test-version, test-when-null, test-xtensa-interrupt-handler
+  test-cache-layout-version, test-compile-time-depth, test-direct-syscall, test-extension-receivers, test-frontend-analysis, test-fs-tree, test-inferred-receivers, test-ios-package, test-ir-finalization, test-json-ascii-spans, test-lowered-ir-cache, test-orc-session, test-parse-errors-stop, test-recursive-class-types, test-shell-environment, test-stable-native-symbols, test-transactional-native-output, test-value-lifetimes, test-version, test-when-null, test-xtensa-interrupt-handler
 - **regex** (1): check output with a regular expression (`grep -E`, character classes, anchors) the driver's fixed-string and in-order-line checks do not express.
   test-unsafe-stack-memory
