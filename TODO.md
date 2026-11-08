@@ -790,6 +790,18 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   dropped: the analyzer reads other bodies syntactically (fresh values, borrow sources,
   region retention, no-escape inference), and in one pass those would see `a + b` where
   the rewritten program has `a.plus__N(b)`, with no cheap way to notice.
+  Measured on the release compiler (instructions, one P-core; the probe run a second time
+  and the difference taken, output identical): on `src/orc_main.ab --emit-llvm` (66.3 G)
+  the probe types 52 of its bodies for 67 candidates, and the whole of it is 3.1%: the
+  pre-filter (`bootstrapOverloadProbedBodies`) 2.4% and the analysis 0.7%. On
+  `tests/cases/modules/overloads.ab` (0.93 G, mostly the prelude) it is 6% (filter 3%,
+  analysis 2.3%). So a probe that cost nothing would not reach 3% of a compile of the
+  compiler, and the pre-filter already admits only the bodies that name an owner type of a
+  candidate. Tried and dropped: collecting a body's names only after a first scan finds it
+  needs them (same IR): 0.36% fewer on orc_main, 1% more on overloads.ab, where most
+  bodies need the second scan. The filter's cost is its per-declaration sets and the
+  fixpoint over the whole program, not the bodies it admits; a per-spelling closure would
+  admit fewer bodies but cannot win what the analysis (0.7%) costs.
 - [ ] **A collection still visits every allocation.** It builds the page bitmaps from the
   whole registry and sweeps it all, garbage and live alike, freeing garbage one block at a
   time. Of that build's active time the marker is about 8%, free() 4% and the page release
