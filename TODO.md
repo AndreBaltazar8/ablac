@@ -752,6 +752,23 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   (`--no-debug`: 9% to 17% smaller executables). Adding `sroa` or `instcombine` to `mem2reg` and `simplifycfg`
   changes the pair's total by +0.2% and -0.4% (`map`), -20.3% and -7.7% (`unsafe-boundary`), -1.4% and -0.8%
   (`string-helpers`). No setting reaches 10% on the small programs; not pursued.
+  Call-site screen 2026-11-08 (master `3fce16e3`, a `-g` release compiler, `perf record --call-graph dwarf` at one
+  sample per 1 M instructions of a `--fast` build of `unsafe-boundary.ab` (4.0 G) and per 20 M of the compiler's own
+  `--fast` self-build (83.7 G); the DWARF inline frames name the source function): in the small build
+  `__ablaRuntimeStringBytesEqual` is 3.6% with no caller above 0.2% (type-name comparisons in sema), `ArrayAppend`
+  1.6% + 1.1% growing (the lexer 0.30%, `bootstrapLlvmEmitFunction` 0.18%), and `bootstrapTextContains` 2.2%, of which
+  `bootstrapFloatBridgeMustPreload` (a scan of every module's whole source for "compiler", twice, with no stop at
+  the first hit) 0.70%, `bootstrapCompileBuiltinEffect` 0.58%, `bootstrapCompileExternalEffect` 0.23%. In the
+  self-build the same helpers are 3.0%, 2.3% + 0.9% and 0.6%, the biggest single call site 0.56% (`ArrayAppend` from
+  `bootstrapLlvmEmitFunction`), `malloc`/`free` about 9% and the collector (`MemoryCollect`, marking) about 7.6%:
+  flat, no site to cut for 3%. Done: `bootstrapTextContains` calls `textFindSequence` (the tuned scan, same result)
+  and the preload check scans once and stops at the first hit. Stage-1 compilers of master and of the change,
+  `build --fast --no-cache`, user instructions, best of 2 to 3 alternating runs, outputs byte-identical: fib 1.288 G
+  to 1.263 G (-1.93%), maps 1.442 to 1.417 (-1.74%), unsafe-boundary 3.656 to 3.557 (-2.70%), the self-build
+  83.702 to 83.370 (-0.40%). The bar was 3% of the self-build: not met; the small builds, which the suite is made of, gain
+  about 2%. (`bootstrapReadRunningImageIdentity` reads as 4.5% in the `-g` profile only because that image is 24.8 MB;
+  the release compiler's is 8.3 MB.) One of two candidate stage-1 builds, run through the v0.2.50 seed, crashed at
+  the 4 GiB address-space limit (`[abla-limit] process crashed`) and the rerun passed, the peak sensitivity above.
 - [ ] **Reuse the frontend's work on the standard library between builds** (parked 2026-11-08). In the profile
   above the compiler's own code is 58 to 59% of a `--fast` build and the standard library's modules are
   most of what a small program imports, so lexing, parsing, analyzing and lowering them again each
