@@ -499,7 +499,14 @@
   build/codegen-lab/report.md has the raw build/run/size data.
 - [ ] **A map is built on boxed generic arrays.** maps spends 21% in `__ablaRuntimeMapEntry`, 12% in
   `abla_map_set`, 17% appending to and setting its parts' arrays (2026-11-02). Since string
-  concatenation allocates out of line, maps runs 1.3% more instructions.
+  concatenation allocates out of line, maps runs 1.3% more instructions. 2026-11-08: the entry
+  arrays already store int keys and values densely (an array takes its first element's kind), so
+  only string keys and boxed values pay 24 bytes an entry; a dense string kind would need the
+  collector to scan it, so the parts stay generic arrays. Instead a probe reads a key where it
+  sits (boxed or dense) without building a value, a set hashes its key once, and the entry
+  arrays append and store through inline in-place cases: maps -14.0% instructions and -15.6% cycles
+  (best of 9, one P-core) against the packed slots alone; json-megabyte -0.7% / -2.0%; peaks
+  within 0.5%. Compile cost: maps +5.7% instructions, json-megabyte +0.9%, stripped size +4.9% / +0.7%.
 - [ ] **A call through a function value calls its wrapper directly only for a capture-free lambda kept
   in a `val`** (`bootstrapLlvmKnownFunctionValue`). A parameter that a caller's inlining makes
   constant still goes through `abla_llvm_call_indirect`'s copy and switch.
