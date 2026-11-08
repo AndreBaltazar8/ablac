@@ -275,6 +275,24 @@
   local medians 1,297,016/1,319,716 KiB. Investigate collection placement without
   adding per-node state or trading frontend CPU for an RSS-only win. See
   [paired CI evidence](https://github.com/AndreBaltazar8/ablac/actions/runs/42297453462).
+  Mechanism found 2026-11-08 (master `edfce209`, v0.2.50 seed, `--emit-llvm src/orc_main.ab` of the
+  `dffc60aa` tree, 8 identical runs with `ABLA_COMPILER_MEMORY_TRACE=1`, per-stage markers added
+  temporarily to `bootstrapPreSemanticPipeline`): 3 of 8 runs end at 1.50 GB and 5 at 1.40 GB. They
+  are identical until `parse.normalize.end` (the first pressure collection falls inside normalization:
+  309.5 MB to 160 MB, every run). The pre-semantic pipeline then runs the generics stage (160 to 344 MB)
+  and expected types (to 385 MB) without a collection, and the next pressure collection (threshold the
+  kept 160 MB plus the 256 MiB step) falls inside the overloads stage: it keeps 180-188 MB in five runs
+  and 236-241 MB in three, so the high mode is a ~55 MB structure the overloads stage builds (live
+  or not at the instant the step is crossed), and the heap stays that much larger to module end. The
+  stages before it allocate within ±1 MB from run to run, enough to move the crossing across that
+  structure, so a new input only changes how often. Tried (not kept; commit `774eb066` on branch
+  `gc-pre-overloads`): collecting between expected types and overloads when the heap is at least
+  256 MiB and twice what parsing kept: the high mode is gone (old input, six runs each: 1,337-1,447 MB with the
+  change, median 1,433, against 1,388-1,505 MB, median 1,403, without it, where four runs were in the
+  low mode and two at 1.50 GB; new input: 1,428-1,458 against 1,400-1,522), the emitted IR is identical,
+  the self-build is 0.8% fewer instructions (66.78 G vs 67.29 G, five alternating runs), but the median
+  peak rises 2.1%, the baseline's low mode being its best case, so the bar (median lower) is not met. Six
+  runs an arm is thin: the gap is within the baseline's own 1.40/1.50 GB spread. A better fix would shorten what the overloads stage holds, not move the collection.
 - [ ] **Move Xtensa density legalization into companion 23.1.3-2.** The phase-3
   compiler stage mirrors the SDK's exact narrow encodings because `-mcpu=esp32`
   and explicit `+density` still leave 5,211 bytes across 199 firmware sections.
