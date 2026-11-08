@@ -509,6 +509,18 @@ Package-side work (not changed from ablac):
 - [ ] **A call through a function value calls its wrapper directly only for a capture-free lambda kept
   in a `val`** (`bootstrapLlvmKnownFunctionValue`). A parameter that a caller's inlining makes
   constant still goes through `abla_llvm_call_indirect`'s copy and switch.
+  Screened 2026-11-08 (v0.2.50's `--emit-llvm`, counting `call` sites of `abla_llvm_call_indirect` that
+  `bootstrapLlvmKnownFunctionValue` does not already make direct): the compiler has 5 (3 in
+  `bootstrapEmitPartitionedObject`, 2 in `bootstrapNativeBuildWithEmitterStateCache`: a few calls per
+  build); the abla-compare server 7 (`webNoEscapeRoute`, `webInvokeScopedMiddleware` twice, the router's
+  `dispatch`, `HttpEventServer` slot processing, a bearer-auth lambda), the websocket load server 9
+  (`WebSocketServer` tls and release paths); `perf/dispatch.ab` (its `weigh` lambda is a `val`, so already
+  direct), the other seven `perf/` benchmarks, `json-megabyte`, `json-readers` and `websocket-codec` have none.
+  The server sites take handlers out of tables or fields, which are not provably one function, and a
+  profile of the compiler's `--fast` self-build (every 20 M instructions) has no sample in the
+  dispatcher at all. Under 1% on every benchmark and the self-build, below the bar, so nothing changed.
+  I did not run the servers under load (the websocket harness needs its Bun client); their sites are the
+  unprovable kind.
 - [ ] **A benchmark's cycles can move 20% with the code unchanged.** `fib` at 2026-11-01 is byte-identical machine
   code at another address and takes 20% more cycles. `tools/bench-compare.py` reports instructions for that reason.
   Reproduced 2026-11-04 with string bulk copies: the new `memcpy` import moves fib's
