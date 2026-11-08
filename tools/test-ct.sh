@@ -56,7 +56,7 @@ while IFS= read -r spec; do fixtures+=("$spec"); done < "$cases/crypto-generated
 # Xtensa passes later pointer parameters on the stack; its checker cannot yet
 # taint those parameters, so this separate-pointer shape is read on these ABIs.
 host_fixtures=(ct_fix_wide_separate:@0,@1,@2,@3,@5)
-leaks=(ct_leak_branch:0 ct_leak_index:0 ct_leak_compare:@0,@1 ct_leak_divide:0,1 ct_pbe_leak:@0)
+leaks=(ct_leak_branch:0 ct_leak_callee:0 ct_leak_callee_store:0 ct_leak_index:0 ct_leak_compare:@0,@1 ct_leak_divide:0,1 ct_pbe_leak:@0)
 while IFS= read -r spec; do leaks+=("$spec"); done < "$cases/crypto-generated.leaks"
 
 # Hand-written spill regressions ensure the test includes the actual assembly pattern.
@@ -86,27 +86,68 @@ for entry in x86_64:pointer-frame-x86 aarch64:pointer-frame-a64; do
 done
 echo "ok   x86-64 and AArch64 frame-register leaks caught"
 
-read_target() { # arch, object
-    local arch=$1 object=$2
+read_target() { # arch, object, label (default the arch), then flags for the checker
+    local arch=$1 object=$2 label=${3:-$1}
+    local check="$check ${*:4}"
     local target_fixtures=("${fixtures[@]}")
     if [[ $arch == x86_64 || $arch == aarch64 ]]; then target_fixtures+=("${host_fixtures[@]}"); fi
-    $check "$arch" "$object" "${target_fixtures[@]}" > "$out/$arch.log" 2>&1 || {
-        cat "$out/$arch.log" >&2; echo "ct: a secret reached a branch or an address on $arch" >&2; exit 1
+    $check "$arch" "$object" "${target_fixtures[@]}" > "$out/$label.log" 2>&1 || {
+        cat "$out/$label.log" >&2; echo "ct: a secret reached a branch or an address on $arch" >&2; exit 1
     }
     for leak in "${leaks[@]}"; do
-        if $check "$arch" "$object" "$leak" > "$out/$arch-leak.log" 2>&1; then
+        if $check "$arch" "$object" "$leak" > "$out/$label-leak.log" 2>&1; then
             echo "ct: the checker missed $leak on $arch" >&2; exit 1
         fi
-        grep -q '^LEAK' "$out/$arch-leak.log" || { cat "$out/$arch-leak.log" >&2; exit 1; }
+        grep -q '^LEAK' "$out/$label-leak.log" || { cat "$out/$label-leak.log" >&2; exit 1; }
         # A rejected call/unknown instruction is not evidence that our generated
         # twin's deliberate secret-index store was detected.
         if grep -qF "$leak" "$cases/crypto-generated.leaks"; then
-            grep -Eq 'secret (address|memory|index)' "$out/$arch-leak.log" || {
-                cat "$out/$arch-leak.log" >&2; echo "ct: expected secret-index detection for $leak" >&2; exit 1;
+            grep -Eq 'secret (address|memory|index)' "$out/$label-leak.log" || {
+                cat "$out/$label-leak.log" >&2; echo "ct: expected secret-index detection for $leak" >&2; exit 1;
             }
         fi
     done
-    echo "ok   $arch: ${#target_fixtures[@]} fixtures clean in the assembly, ${#leaks[@]} leaks caught"
+    echo "ok   $label: ${#target_fixtures[@]} fixtures clean in the assembly, ${#leaks[@]} leaks caught"
+}
+
+# A --fast build doesn't optimise, so it keeps what release builds remove: the type-tag check of every
+# erased scalar conversion branches on a value copied from a secret's box, and a division by a secret
+# stays a division. The checker can't tell those from payload, and they are not what the fast fixtures
+# are for, so tests/cases/ct/fast-known.txt lists the fixtures that fail and the class of finding. Any other
+# finding fails here, and so does a listed fixture that comes out clean (shrink the list), or one that fails
+# differently. The leaks must be caught as in release, the one a call down by following that call.
+# Only the x86-64 checker follows calls, and --fast builds are read for the host only (TODO.md).
+fast_read() { # arch, object
+    local arch=$1 object=$2 label=$1-fast
+    local target_fixtures=("${fixtures[@]}" "${host_fixtures[@]}")
+    $check --follow-calls "$arch" "$object" "${target_fixtures[@]}" > "$out/$label.log" 2>&1 || true
+    local found=0 clean=0 name rest class
+    : > "$out/$label.found"
+    while read -r _ _ name rest; do
+        name=${name%:}
+        case $rest in
+            *__ablaRuntimeRequire*) class=tag-check ;;
+            "secret division"*|*"in "*": secret division"*) class=division ;;
+            *) class=other ;;
+        esac
+        echo "$name $class" >> "$out/$label.found"
+        [[ $class != other ]] || { echo "ct: $name on $label: $rest" >&2; exit 1; }
+    done < <(grep '^LEAK' "$out/$label.log")
+    clean=$(grep -c '^ok' "$out/$label.log" || true)
+    sort -o "$out/$label.found" "$out/$label.found"
+    if ! diff -u <(sort "$cases/fast-known.txt") "$out/$label.found" > "$out/$label.diff"; then
+        cat "$out/$label.diff" >&2; echo "ct: the fast build's findings changed (tests/cases/ct/fast-known.txt)" >&2; exit 1
+    fi
+    for leak in "${leaks[@]}"; do
+        if $check --follow-calls "$arch" "$object" "$leak" > "$out/$label-leak.log" 2>&1; then
+            echo "ct: the checker missed $leak on $label" >&2; exit 1
+        fi
+        grep -q '^LEAK' "$out/$label-leak.log" || { cat "$out/$label-leak.log" >&2; exit 1; }
+    done
+    grep -Eq 'in [A-Za-z.]*leakBranchCallee: secret branch' <($check --follow-calls "$arch" "$object" ct_leak_callee:0 2>&1) || {
+        echo "ct: the leak inside a callee wasn't found by following the call" >&2; exit 1
+    }
+    echo "ok   $label: $clean fixtures clean, $(wc -l < "$out/$label.found") listed in fast-known.txt, ${#leaks[@]} leaks caught, the callee leak found by following the call"
 }
 
 # --- x86-64 ---------------------------------------------------------------------------
@@ -116,6 +157,10 @@ for mode in "" --fast; do
 done
 "$compiler" build "$cases/object-x86.ab" -o "$out/x86.o" --emit object --no-cache
 read_target x86_64 "$out/x86.o"
+# A --fast build keeps every Abla call as a call. The checker follows each one into its callee, which is
+# defined in the same object, with the argument secrecy the caller passes.
+"$compiler" build "$cases/object-x86.ab" -o "$out/x86-fast.o" --emit object --no-cache --fast
+fast_read x86_64 "$out/x86-fast.o"
 
 # --- AArch64 --------------------------------------------------------------------------
 "$compiler" build "$cases/aarch64-build.ab" -o "$out/aarch64-driver" --no-cache

@@ -108,8 +108,13 @@
   [Results](tools/ct-timing/RESULTS.md): no leak detected at 40,000 samples on each of 14 available x86-64
   primitives; this is not a constant-time proof. `tools/test-ct.sh` remains the static assembly check.
 - [ ] **Crypto timing on ESP32-S3.** Xtensa is still compiled and read only; no hardware timing campaign exists.
-- [ ] **`--fast` builds aren't read by `tools/test-ct.sh`**: the checker stops at their calls. It could follow
-  internal calls.
+- [ ] **`--fast` builds are read on x86-64 only.** `tools/test-ct.sh` builds the fixture object with `--fast`
+  and the checker follows every call into its callee (`--follow-calls`, x86-64; recursion and callees outside
+  the object still fail), with controls for a leak and for a secret stored through a pointer inside a callee.
+  A fast build keeps what release removes, so `tests/cases/ct/fast-known.txt` lists the 37 fixtures that fail:
+  the type-tag check of every erased scalar conversion (`__ablaRuntimeRequire`, which the checker can't tell
+  from payload) and divisions by a secret that aren't strength-reduced. AArch64, Wasm and Xtensa don't follow
+  calls (an AArch64 jump out of a function is now refused, which the new callee control showed was missed).
 - [ ] **Secret residue is not checked by `tools/test-ct.sh`.** It checks timing-related branches,
   addresses and divisions, not unwiped copies in GC-registered stack temporaries, ordinary
   register spills or the GC heap. AES's discarded conditional exposed such a stack copy;

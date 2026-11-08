@@ -2,7 +2,7 @@
 """Reads a target's disassembly of named functions and says whether a secret reaches a
 conditional branch, a memory address or a division.
 
-    check-asm.py <arch> <object> <spec> ...      spec:  function:secret-params
+    check-asm.py [--follow-calls] <arch> <object> <spec> ...      spec:  function:secret-params
 
 `arch` is x86_64, aarch64, wasm or xtensa. `secret-params` is a comma list of parameter
 positions (0-based) holding secrets, or `*` for all; `@n` marks parameter n as a public
@@ -71,6 +71,7 @@ def fixpoint(lines, start, step, successors):
             if new != old:
                 states[s] = new
                 work.append(s)
+    return states
 
 
 # --- x86-64 (AT&T syntax) --------------------------------------------------------------
@@ -115,8 +116,60 @@ X86_FLAGLESS = re.compile(r"^(mov|lea|cmov|set|vmov|vpxor|pxor|movz|movs|bswap|n
 X86_READWRITE = re.compile(r"^(add|adc|sub|sbb|and|or|xor|imul|shl|sal|shr|sar|rol|ror|neg|not|inc|dec|pand|por|pxor|pandn|padd|psub|psll|psrl|psra|pmul|punpck|pshufb|bswap|shld|shrd|cmov|aes|pclmul|andn|xchg)")
 
 
+# With --follow-calls, a call to a function defined in the same object (what a --fast build makes of
+# every Abla call) is checked as a function of its own, on the arguments the caller passes, instead of
+# failing. A call to anything not defined there, or a recursion, still fails.
+FOLLOW = {"path": None, "stack": [], "done": {}}
+
+
+def follow_call(name, secret, pointers, text):
+    key = (name, tuple(secret), tuple(pointers))
+    if key in FOLLOW["done"]:
+        return FOLLOW["done"][key]
+    if name in FOLLOW["stack"]:
+        raise Violation(f"call: recursion into {name}: {text}")
+    try:
+        lines = disassemble(FOLLOW["path"], name)
+    except SystemExit:
+        raise Violation(f"call: {name} isn't defined in the object: {text}")
+    unread = [t for _, t in lines if "unknown" in t]
+    if unread:
+        raise Violation(f"call: the disassembler can't read {name}: {unread[0]}")
+    FOLLOW["stack"].append(name)
+    try:
+        returned = check_x86(lines, secret, pointers)
+    except Violation as violation:
+        raise Violation(f"in {name}: {violation}")
+    finally:
+        FOLLOW["stack"].pop()
+    FOLLOW["done"][key] = returned
+    return returned
+
+
 def check_x86(lines, secret, pointers):
+    index_of_lines = {address for address, _ in lines}
+    returned = []
     start = frozenset(X86_ARGS[i] for i in secret) | frozenset(["ptr:" + X86_ARGS[i] for i in pointers])
+
+    def after_call(state, name, text):
+        state = set(state)
+        secret_arguments = [i for i, r in enumerate(X86_ARGS) if r in state]
+        pointer_arguments = [i for i, r in enumerate(X86_ARGS) if "ptr:" + r in state and r not in state]
+        out = follow_call(name, secret_arguments, pointer_arguments, text)
+        # The callee ran on exactly these arguments. What it returns in rax, rdx and the vector
+        # registers is what its own analysis found; the other registers it may clobber are dead.
+        for r in ["rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11"] + [f"v{n}" for n in range(16)]:
+            state.discard(r)
+            state.discard("ptr:" + r)
+            if r in out:
+                state.add(r)
+            if "ptr:" + r in out:
+                state.add("ptr:" + r)
+        state.discard("flags")
+        # Memory it was given may now hold secrets: if it was given a frame address, any slot might.
+        if any("stackaddr:" + r in state for r in X86_ARGS):
+            state.add("pushed")
+        return frozenset(state)
 
     def mem_parts(op):
         m = re.match(r"^(-?(?:0x)?[0-9a-f]*)\((%\w+)?(?:,(%\w+)(?:,\d+)?)?\)$", op)
@@ -229,10 +282,19 @@ def check_x86(lines, secret, pointers):
         if op.startswith(("jmp",)):
             if ops and (ops[0].startswith("*")):
                 raise Violation(f"indirect jump: {text}")
+            tail = re.match(r"^(?:0x)?([0-9a-f]+) <([^>+]+)>$", ops[0]) if ops else None
+            if tail and int(tail.group(1), 16) not in index_of_lines:
+                # A jump out of the function: a call that returns for us.
+                if not FOLLOW["path"]:
+                    raise Violation(f"call: {text}")
+                returned.append(after_call(state, tail.group(2), text))
             return frozenset(state)
         if op.startswith("call"):
             target = ops[0] if ops else ""
-            raise Violation(f"call: {text}")
+            callee = re.search(r"<([^>+]+)>$", target)
+            if not FOLLOW["path"] or not callee:
+                raise Violation(f"call: {text}")
+            return after_call(state, callee.group(1), text)
         if op.startswith(("ret", "nop", "endbr", "ud2", "int3", "hlt")) or op == "":
             return frozenset(state)
         if re.match(r"^(i?div)[bwlq]?$", op):
@@ -306,7 +368,21 @@ def check_x86(lines, secret, pointers):
                 state.add("rdx")
             return frozenset(state)
         if ops:
-            write(ops[-1], inputs)
+            # Adding to or subtracting from a pointer is still a pointer.
+            moves_pointer = (op.startswith(("add", "sub")) and len(ops) == 2 and not inputs and
+                             (read_pointer(ops[-1]) or read_pointer(ops[0])))
+            destination = x86_reg(ops[-1]) if ops[-1].startswith("%") else None
+            # A register that holds an address in our own frame: a callee may write through it.
+            stack_address = destination is not None and (
+                (op.startswith("lea") and (m := mem_parts(ops[0])) is not None and m.group(2) and
+                 x86_reg(m.group(2)) in ("rsp", "rbp")) or
+                (op.startswith("mov") and ops[0].startswith("%") and "stackaddr:" + x86_reg(ops[0]) in state) or
+                (op.startswith(("add", "sub")) and "stackaddr:" + destination in state))
+            write(ops[-1], inputs, moves_pointer)
+            if destination is not None:
+                state.discard("stackaddr:" + destination)
+                if stack_address:
+                    state.add("stackaddr:" + destination)
         if not X86_FLAGLESS.match(op):
             if inputs:
                 state.add("flags")
@@ -329,7 +405,15 @@ def check_x86(lines, secret, pointers):
         out.append(i + 1)
         return out
 
-    fixpoint(lines, start, step, successors)
+    states = fixpoint(lines, start, step, successors)
+    # What the function can leave in its registers when it returns, for a caller that follows it.
+    out = set()
+    for i, (_, text) in enumerate(lines):
+        if text.split()[0].startswith("ret") and i in states:
+            out |= states[i]
+    for state in returned:
+        out |= state
+    return frozenset(out)
 
 
 # --- AArch64 -----------------------------------------------------------------------------
@@ -349,6 +433,7 @@ A64_BRANCH_REG = re.compile(r"^(cbz|cbnz|tbz|tbnz)$")
 
 
 def check_aarch64(lines, secret, pointers):
+    function_addresses = {address for address, _ in lines}
     start = frozenset(f"x{i}" for i in secret) | frozenset(f"ptr:x{i}" for i in pointers)
 
     def split(ops):
@@ -397,7 +482,13 @@ def check_aarch64(lines, secret, pointers):
             elif t(ops[0]):
                 raise Violation(f"secret branch: {text}")
             return frozenset(state)
-        if op in ("b", "ret", "nop", "brk", "hint", "bti", "paciasp", "autiasp", "udf", "dmb"):
+        if op == "b":
+            # A jump out of the function is a call that returns for us (a tail call), and an unknown one.
+            target = re.search(r"0x([0-9a-f]+)", text)
+            if target and int(target.group(1), 16) not in function_addresses:
+                raise Violation(f"call: {text}")
+            return frozenset(state)
+        if op in ("ret", "nop", "brk", "hint", "bti", "paciasp", "autiasp", "udf", "dmb"):
             return frozenset(state)
         if op in ("bl", "blr", "br"):
             raise Violation(f"call: {text}")
@@ -804,7 +895,11 @@ def parse_spec(spec, count_hint=8):
 
 
 def main():
-    arch, path, *specs = sys.argv[1:]
+    arguments = sys.argv[1:]
+    if "--follow-calls" in arguments:
+        arguments.remove("--follow-calls")
+        FOLLOW["path"] = arguments[1]
+    arch, path, *specs = arguments
     failed = 0
     for spec in specs:
         name, secret, pointers = parse_spec(spec)
