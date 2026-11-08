@@ -437,6 +437,21 @@
   test-uint256 gave 22.0 and 14.8 CPU-seconds against 18.5 and 25.0 as written: inside one
   suite run each program and flag set is built once, so the cache shares little. What is left
   is the cost of each compile (LLVM is 45%), a separate item.
+  Fast-build screen of the biggest scripts outside `tools/test-fast-builds.txt` (2026-11-08, each run alone in a
+  slot with `taskset -c 0-7`, the compiler `make ablac` builds from master `3fce16e3`, CPU-seconds release against
+  `ABLA_TEST_FAST_BUILDS=1`, all passing both ways): doc-examples 70.8 / 23.8, generics 18.0 / 12.8, yaml 13.5 /
+  10.7, affine-move 18.0 / 16.1, uint256 27.2 / 25.0, json-limits 23.9 / 24.6, crypto-encrypted-rsa 27.5 /
+  32.9, math-v8 39.9 / 51.2, transactions 28.4 / 56.1: a program that computes a lot costs more unoptimised.
+  Moved onto the list: doc-examples, generics, yaml and affine-move (they check what programs compute and
+  what the compiler reports, not release code). In a default suite run their CPU went 69.5 / 19.2 / 21.4 / 18.9
+  to 27.2 / 13.9 / 19.9 / 17.9 (129.0 to 78.9, -50.1 CPU-seconds); suite totals between runs differ by more than
+  that (master changed in between), so the saving is per script: 50.1 of a cold-cache suite of 1,920 CPU-seconds
+  (about 2.6%), under the 5% this lever was meant to reach. The release builds of the four still run in `make test-full` (4 passed). Left out:
+  uint256 (explicit modes, 2 CPU-s), json-ascii-spans 114 CPU-s (word scans in optimised code),
+  reproducible-elsewhere 82 (builds twice to compare), crypto-pure 54, bignum-secret 54 and ct 43 (release output
+  or explicit modes), compiler-memory-peak 25.
+  CI runs `make test`, so the release builds of the moved scripts run in the release process's `make test-full`
+  gate (run by hand), not on every push, as for the 78 scripts already on the list.
 - [x] **Tests run on every push to master and on PRs** ([CI](docs/ci.md)): the Linux suite and an
   arm64 macOS host/fixed-point job. Tests only; releases still start by hand.
 - [x] **Parser-derived formatter.** `ablac fmt` preserves comments and verbatim syntax,
