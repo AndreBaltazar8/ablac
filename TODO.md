@@ -109,6 +109,8 @@
   (native true, interpreter false), `anyEq(f64ToF32(0.0), 0)` (native true, interpreter false), NaN with
   itself and with a payload. They are decided (a float never equals an integer, bec6dfcf; same-kind floats compare as typed `==`,
   `any-eq-ieee`) and kept as `tests/cases/fuzz-differential/any-mixed-kinds.ab`.
+  After both: seeds 21 to 28 and 29 to 40 (30 checks each, six modes, 600 checks) agree; the generator
+  does not yet draw `f32(literal)` conversions or f32 division by zero (the two open evaluator gaps above).
 
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 

@@ -16,8 +16,9 @@ python3 tools/fuzz-differential --compiler "$compiler" --seeds 1-2 --checks 16
 # a compile-time answer that differs from the run-time one prints MISMATCH.
 for program in tests/cases/fuzz-differential/*.ab; do
     python3 tools/fuzz-differential --compiler "$compiler" --program "$program"
-    python3 tools/fuzz-differential --compiler "$compiler" --program "$program" --show | grep -q MISMATCH && {
+    if python3 tools/fuzz-differential --compiler "$compiler" --program "$program" --show | grep -q MISMATCH; then
         echo "fuzz differential: $program: compile time disagrees with run time" >&2
         exit 1
-    }
+    fi
 done
+echo "fuzz differential: seeded programs and the recorded cases agree in every mode"
