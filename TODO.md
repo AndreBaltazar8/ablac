@@ -310,6 +310,19 @@
   run optimized: it runs 23x faster because collections move, so it would prove less. The frontend's
   hot spots are its lexer and string comparison, flat. 100 of 1,579 builds take 40% of build time: test
   programs importing the compiler, each compiled from scratch, which is what reuse between builds saves.
+  Remeasured on master `8ccd7bb4` (2026-11-08), a stage1 compiler built from the v0.2.49
+  seed, cold cache, `taskset -c 0-7`, JOBS=8, on a machine at load 12 to 16 from other work,
+  in four chunks so each slot hold stayed under 10 minutes (the cache carries over between
+  chunks): 331 commands, all passed, 277 s wall and 1,648 CPU-seconds in all (chunks
+  `test-[a-c]` 84 s / 556 CPU-s, `[d-h]` 57 / 310, `[i-o]` 54 / 278, the rest 82 / 504).
+  That is less than half the 3,850 above; at the 23.5 CPU-seconds a second this machine does
+  with every core, it is about 70 s of wall time, so the 2-minute goal is met on a quiet
+  machine and the 8-CPU slot is what takes longer. The longest commands (seconds, under
+  contention): test-bignum-secret 71 (two `--no-cache` builds of one program, fast and
+  release, plus an AArch64 build), test-ct 42, test-reproducible-elsewhere 42,
+  test-json-ascii-spans 40, test-crypto-pure 39, test-compiler-memory-peak 36, test-uint256 34,
+  test-crypto 34; the sum of every command's wall time is 1,657 s, so none is a serial
+  bottleneck at JOBS=8.
 - [x] **Tests run on every push to master and on PRs** ([CI](docs/ci.md)): the Linux suite and an
   arm64 macOS host/fixed-point job. Tests only; releases still start by hand.
 - [x] **Parser-derived formatter.** `ablac fmt` preserves comments and verbatim syntax,
