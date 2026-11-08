@@ -105,7 +105,7 @@ else
 fi
 if [[ ! -s $expected ]]; then
     report FAIL assets "no expected asset names ($basis)"
-elif diff_out=$(diff "$expected" "$actual"); then
+elif diff -q "$expected" "$actual" >/dev/null; then
     report PASS assets "$count files, the names of $basis"
 else
     missing=$(comm -23 "$expected" "$actual" | tr '\n' ' ')
