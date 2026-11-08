@@ -10,6 +10,7 @@
 #   README.md                     every mention of the version being replaced
 #   docs/bootstrap.md             every mention of the version being replaced
 # and prints the diff stat. Nothing is committed. Writes nothing when a check fails.
+# Needs bash, curl (or --dir), python3 and perl (a minimal CI image may lack the last two).
 # Afterwards verify the pin the way the release process says: build master from the pinned
 # bootstrap (tools/bootstrap-compiler.sh build/bootstrap-ablac, then the stages) and cmp.
 #
