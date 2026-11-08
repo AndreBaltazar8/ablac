@@ -12,3 +12,12 @@ project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$project_root"
 python3 tools/fuzz-differential --selftest
 python3 tools/fuzz-differential --compiler "$compiler" --seeds 1-2 --checks 16
+# The cases the fuzzer found stay as programs: every mode must print the same, and
+# a compile-time answer that differs from the run-time one prints MISMATCH.
+for program in tests/cases/fuzz-differential/*.ab; do
+    python3 tools/fuzz-differential --compiler "$compiler" --program "$program"
+    python3 tools/fuzz-differential --compiler "$compiler" --program "$program" --show | grep -q MISMATCH && {
+        echo "fuzz differential: $program: compile time disagrees with run time" >&2
+        exit 1
+    }
+done

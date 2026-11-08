@@ -200,8 +200,17 @@ class Gen:
         return v if v else r.choice(["true", "false"])
 
     def any_arg(self, depth, env):
+        """A value to box. Through `any` equality compares payload bits, and the sign
+        and payload of a NaN made by arithmetic are unspecified (they differ between
+        compile time, run time and WebAssembly), so a float that may be NaN goes
+        through canonF64/canonF32 first."""
         ty = self.r.choice(["int", "u8", "i32", "u32", "f64", "f32", "bool", "str", "int"])
-        return self.expr(ty, depth, env)
+        text = self.expr(ty, depth, env)
+        if ty == "f64":
+            return f"canonF64({text})"
+        if ty == "f32":
+            return f"canonF32({text})"
+        return text
 
     def str_expr(self, depth, env):
         r = self.r
@@ -318,6 +327,8 @@ fun Acc.add(x: int): int {
     this.total = this.total * 31 + x * this.step
     this.total
 }
+fun canonF64(x: f64): f64 = if (x != x) f64FromBits(9221120237041090560) else x
+fun canonF32(x: f32): f32 = if (x != x) f64ToF32(0.0) else x
 fun fmtF(x: f64): string = if (x != x) "nan" else f64Text(x)
 fun anyEq(a: any, b: any): bool = a == b
 fun applyTwice(f: (int) -> int, x: int): int = f(f(x))
@@ -329,10 +340,10 @@ fun safeSlice(s: string, a: int, b: int): string {
 """
 
     POOL = ["0", "1", "(-1)", "u8(1)", "u8(255)", "i8(-1)", "u64(-1)", "i32(1)", "true", "false",
-            "0.0", "(-0.0)", "1.0", "(0.0 / 0.0)", "f64FromInt(1)", "f64ToF32(1.0)", "f64ToF32(0.0)",
+            "0.0", "(-0.0)", "1.0", "f64FromBits(9221120237041090560)", "f64FromBits(9221120237041090561)", "f64FromInt(1)", "f64ToF32(1.0)", "f64ToF32(0.0)",
             "4607182418800017408", "4611686018427387904", "9218868437227405312",
             '"a"', '("" + "a")', '"ab"', '("a" + "b")', '""', "[1]", "[1]", "o", "o", "Acc(1, 1)",
-            "f64FromBits(1)", "f64FromBits(4607182418800017408)", "97", "u8(97)"]
+            "f64FromBits(1)", "f64FromBits(4607182418800017408)", "97", "u8(97)", "f64ToF32(-1.5)", "3217031168", "(-1077936128)", "i32(-1077936128)"]
 
     def any_pool_check(self, index):
         """Pairs of values whose bits or contents collide, compared through `any`."""
@@ -493,8 +504,6 @@ def verdict(results):
     distinct = {}
     for mode, value in results.items():
         distinct.setdefault(repr(value), []).append(mode)
-    if len(distinct) == 1 and not isinstance(next(iter(results.values())), tuple) is False:
-        pass
     if len(distinct) == 1:
         value = next(iter(results.values()))
         if value[0] == "build-failed":
@@ -546,8 +555,9 @@ def minimise(args, seed, runner, checks, results, first):
         def still(candidate_lines, tag):
             trial = [(candidate_lines, check[1], check[2], check[3])]
             got = runner.all_modes(os.path.join(WORK, f"min{seed}-{key}-{tag}"), (Gen.PRELUDE, trial))
-            ok = verdict(got) is not None and not verdict(got).startswith("all modes failed") \
-                and not any(v[0] == "build-failed" for v in got.values())
+            # The same check must still differ, so a reduction cannot drift to another bug.
+            ok = verdict(got) is not None and not any(v[0] == "build-failed" for v in got.values()) \
+                and key in differing_lines(got)
             return ok, got
 
         ok, got = still(lines, "base")
@@ -607,6 +617,7 @@ def main():
     ap.add_argument("--timeout", type=int, default=120)
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--selftest", action="store_true", help="check the comparison on made-up results")
+    ap.add_argument("--show", action="store_true", help="with --program: print the output of the fast build")
     ap.add_argument("--program", help="run an existing .ab program (with @export(\"run\")) all ways")
     args = ap.parse_args()
     if args.selftest:
@@ -623,6 +634,9 @@ def main():
         results["release"] = runner.native(plain, os.path.join(directory, "release"), False, False)
         results.update(runner.wasm(plain, directory))
         bad = verdict(results)
+        if args.show:
+            print(results["fast"][0] if results["fast"][0] != "build-failed" else results["fast"][1])
+            return 0
         print(bad or "all modes agree")
         return 1 if bad else 0
     failures = 0
