@@ -3,6 +3,7 @@
 and again under `#`, and the two strings are compared. One area per file.
 Regenerate with: python3 tools/gen-eval-parity.py (then commit the output)."""
 import os
+import re
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "tests", "cases", "eval-parity")
@@ -13,12 +14,30 @@ INTS = [("i8", 8, True), ("i16", 16, True), ("i32", 32, True), ("int", 64, True)
 I64_MIN = "(-9223372036854775807 - 1)"
 
 
+OPAQUE = re.compile("\x01([a-z0-9]+)\x02(.*?)\x03", re.S)
+
+
+def mark(ty, text):
+    """An operand: plain under `#`, but through a non-inlined identity natively, so the
+    program's own lowering runs instead of the builder's constant folding."""
+    return f"\x01{ty}\x02{text}\x03"
+
+
+def side(text, native):
+    return OPAQUE.sub((lambda m: f"id_{m.group(1)}({m.group(2)})") if native
+                      else (lambda m: m.group(2)), text)
+
+
 def lit(value, ty):
     """A literal of `ty` holding `value` (a u64 beyond int range is its two's complement)."""
     if ty == "u64" and value >= 2 ** 63:
         value -= 2 ** 64
     text = I64_MIN if value == -2 ** 63 else (f"({value})" if value < 0 else str(value))
-    return text if ty == "int" else f"{ty}({text})"
+    return mark(ty, text if ty == "int" else f"{ty}({text})")
+
+
+def flt(text):
+    return mark("f64", text)
 
 
 def edges(ty, bits, signed):
@@ -41,18 +60,22 @@ def write(name, cases, imports=(), helpers=()):
              'import "abla/io"', 'import "abla/float"']
     lines += [f'import "{i}"' for i in imports]
     lines.append("")
+    # Natively every operand passes through one of these, which are never inlined.
+    for ty in [t for t, _, _ in INTS] + ["f64"]:
+        lines.append(f"@noinline fun id_{ty}(x: {ty}): {ty} = x")
+    lines.append("")
     for kind in ("fun", "compile fun"):
         suffix = "N" if kind == "fun" else "C"
         for helper, result, body in helpers:
             lines.append(f"{kind} {helper}{suffix}(): {result} {{")
-            lines += ["    " + line for line in body]
+            lines += ["    " + side(line, kind == "fun") for line in body]
             lines.append("}")
             lines.append("")
         for index, chunk in enumerate(chunks):
             lines.append(f"{kind} chunk{suffix}{index}(): array<string> {{")
             lines.append("    val out: array<string> = []")
             for label, expression in chunk:
-                lines.append(f'    out.append("{label} = ${{{expression.replace("@", suffix)}}}")')
+                lines.append(f'    out.append("{label} = ${{{side(expression, kind == "fun").replace("@", suffix)}}}")')
             lines.append("    out")
             lines.append("}")
             lines.append("")
@@ -117,6 +140,12 @@ def main():
             for a in values:
                 for c in counts:
                     shifts.append((f"{ty} {a} {op} {c}", f"{lit(a, ty)} {op} {lit(c, ty)}"))
+        # A count of another width (an int) converts to the shifted value's width first.
+        for op in ("<<", ">>", ">>>"):
+            for a in values:
+                for c in (0, 1, bits - 1, bits, bits + 1, 255, 256, 257, 65537, -1, -255):
+                    shifts.append((f"{ty} {a} {op} int {c}",
+                                   f"{lit(a, ty)} {op} {lit(c, 'int')}"))
         if signed:
             for a in values:
                 unary.append((f"{ty} -{a}", f"-{lit(a, ty)}"))
@@ -145,41 +174,68 @@ def main():
         mixed.append((f"loop {ty}", f"{helper}@()"))
     write("integer-mixed", mixed, helpers=helpers)
 
-    # Floats: f32 rounding and arithmetic, widening, saturating conversion to integers.
+    # Floats: f32 rounding and arithmetic, f64 arithmetic with NaN, infinities and
+    # -0.0, widening, saturating conversion to integers, integer to float rounding.
+    # A NaN is compared by being one (its sign and payload come from the machine).
+    def norm64(x):
+        return f"(if ({x} != {x}) 9221120237041090560 else f64ToBits({x}))"
+
+    def norm32(x):
+        return f"(if ({x} != {x}) u32(2143289344) else f32ToBits({x}))"
+
     f64s = ["0.0", "(-0.0)", "1.0", "0.1", "(-1.5)", "2.5", "3.0e10", "16777217.0", "16777219.0",
             "1.0e-45", "7.0e-46", "3.4028235e38", "3.4028236e38", "3.4028235677973366e38",
             "1.0e39", "(-1.0e39)", "1.00000011920928955", "1.00000005960464478",
             "1.0000000596046448", "1.0e300", "4.9e-324"]
     floats = []
     for x in f64s:
-        floats.append((f"f32bits({x})", f"f32ToBits(f64ToF32({x}))"))
-        floats.append((f"widen({x})", f"f64ToBits(f32ToF64(f64ToF32({x})))"))
-    f32s = [f"f64ToF32({x})" for x in ["0.0", "1.0", "0.1", "(-2.5)", "16777216.0", "3.4028235e38",
-                                       "1.0e-45", "1.17549435e-38", "0.3", "7.0", "(-7.0)", "2.0"]]
+        floats.append((f"f32bits({x})", norm32(f"f64ToF32({flt(x)})")))
+        floats.append((f"widen({x})", f"f64ToBits(f32ToF64(f64ToF32({flt(x)})))"))
+    f32s = [f"f64ToF32({flt(x)})" for x in ["0.0", "1.0", "0.1", "(-2.5)", "16777216.0",
+            "3.4028235e38", "1.0e-45", "1.17549435e-38", "0.3", "7.0", "(-7.0)", "2.0",
+            "(0.0 / 0.0)", "(1.0 / 0.0)", "(-1.0 / 0.0)", "(-0.0)"]]
     for i, a in enumerate(f32s):
         for j, b in enumerate(f32s):
             for op in ("+", "-", "*", "/", "%"):
-                floats.append((f"f32 #{i} {op} #{j}", f"f32ToBits({a} {op} {b})"))
+                floats.append((f"f32 #{i} {op} #{j}", norm32(f"({a} {op} {b})")))
             for op in ("<", "==", ">="):
                 floats.append((f"f32 #{i} {op} #{j}", f"{a} {op} {b}"))
+    f64v = [flt(x) for x in ["0.0", "(-0.0)", "1.0", "0.1", "(-1.5)", "2.5", "1.0e300", "(-1.0e300)",
+                             "4.9e-324", "9007199254740993.0", "(0.0 / 0.0)", "(1.0 / 0.0)",
+                             "(-1.0 / 0.0)", "5.5", "(-5.5)"]]
+    for i, a in enumerate(f64v):
+        for j, b in enumerate(f64v):
+            for op in ("+", "-", "*", "/", "%"):
+                floats.append((f"f64 #{i} {op} #{j}", norm64(f"({a} {op} {b})")))
+            for op in ("<", "<=", "==", "!="):
+                floats.append((f"f64 #{i} {op} #{j}", f"{a} {op} {b}"))
     sat = ["0.0", "(-0.5)", "0.9999999", "1.0e10", "(-1.0e10)", "2147483647.0", "2147483648.0",
            "(-2147483648.0)", "(-2147483649.0)", "4294967295.0", "4294967296.0", "(-1.0)",
-           "9.3e18", "(-9.3e18)", "1.0e19", "1.0e300", "(0.0 / 0.0)", "(1.0 / 0.0)", "(-1.0 / 0.0)"]
+           "9.3e18", "(-9.3e18)", "1.0e19", "1.0e300", "(0.0 / 0.0)", "(1.0 / 0.0)", "(-1.0 / 0.0)",
+           "255.5", "256.0", "65535.9", "300.0", "(-129.5)"]
     for x in sat:
-        floats.append((f"f64ToInt({x})", f"f64ToInt({x})"))
-        floats.append((f"f32ToI32({x})", f"f32ToI32(f64ToF32({x}))"))
-        floats.append((f"f32ToU32({x})", f"f32ToU32(f64ToF32({x}))"))
-        floats.append((f"f32ToInt({x})", f"f32ToInt(f64ToF32({x}))"))
+        floats.append((f"f64ToInt({x})", f"f64ToInt({flt(x)})"))
+        floats.append((f"f32ToI32({x})", f"f32ToI32(f64ToF32({flt(x)}))"))
+        floats.append((f"f32ToU32({x})", f"f32ToU32(f64ToF32({flt(x)}))"))
+        floats.append((f"f32ToInt({x})", f"f32ToInt(f64ToF32({flt(x)}))"))
+        # a float to a narrower integer goes through the saturating int, then wraps
+        for dst, _, _ in INTS:
+            floats.append((f"{dst}(f64ToInt({x}))", f"{dst}(f64ToInt({flt(x)}))"))
+    ints = ["0", "1", "(-1)", "16777217", "2147483647", "(-2147483647 - 1)", "9007199254740993",
+            "(-9007199254740993)", "9223372036854775807", "(-9223372036854775807 - 1)",
+            "4611686018427387905"]
+    for v in ints:
+        floats.append((f"f64FromInt({v})", f"f64ToBits(f64FromInt({mark('int', v)}))"))
+        floats.append((f"f32FromInt({v})", f"f32ToBits(f32FromInt({mark('int', v)}))"))
     for v in ["0", "1", "(-1)", "16777217", "2147483647", "(-2147483647 - 1)"]:
-        floats.append((f"f32FromI32({v})", f"f32ToBits(f32FromI32(i32({v})))"))
-        floats.append((f"f64FromInt({v})", f"f64ToBits(f64FromInt({v}))"))
+        floats.append((f"f32FromI32({v})", f"f32ToBits(f32FromI32({mark('i32', 'i32(' + v + ')')}))"))
     for v in ["0", "1", "16777217", "4294967295", "4294967041"]:
-        floats.append((f"f32FromU32({v})", f"f32ToBits(f32FromU32(u32({v})))"))
+        floats.append((f"f32FromU32({v})", f"f32ToBits(f32FromU32({mark('u32', 'u32(' + v + ')')}))"))
     # Text of floats: the shortest form that reads back.
     for x in f64s + ["123456.789", "1.5e-7", "1.0e21", "1.0e22", "0.000001", "5.0e-324",
                      "1.7976931348623157e308", "100.0", "2.0e-5", "(-0.0)", "0.30000000000000004"]:
-        floats.append((f"text f64 {x}", f"{x}"))
-        floats.append((f"text f32 {x}", f"f64ToF32({x})"))
+        floats.append((f"text f64 {x}", f"{flt(x)}"))
+        floats.append((f"text f32 {x}", f"f64ToF32({flt(x)})"))
     write("float-scalars", floats, imports=("abla/float/text",))
 
 
