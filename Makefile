@@ -375,6 +375,7 @@ test-serial: ablac
 	tools/test-compiler-memory-budget.sh $(COMPILER_PAYLOAD)
 	tools/test-gc-background-free.sh $(COMPILER)
 	tools/test-json-differential.sh $(COMPILER)
+	tools/test-fuzz-differential.sh $(COMPILER)
 	tools/test-lambda-symbols.sh $(COMPILER)
 	tools/test-subparser-site-key.sh $(COMPILER)
 	tools/test-stable-names.sh $(COMPILER)

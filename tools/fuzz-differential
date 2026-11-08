@@ -7,7 +7,8 @@ that prints its result). The same checks run as
   fast     native, `build --fast`
   release  native, default optimization
   ct       every check evaluated by the compile-time evaluator (`#`), native
-           --fast for the rest (ABLA_COMPILE_EVAL=interp)
+           --fast for the rest (ABLA_COMPILE_EVAL=interp); ct-jit the same as
+           native code (ABLA_COMPILE_EVAL=jit)
   wasm     hostless WebAssembly, release module and development module (node)
 
 and output plus exit status must agree. A disagreement is minimised to one check
@@ -327,9 +328,33 @@ fun safeSlice(s: string, a: int, b: int): string {
 }
 """
 
+    POOL = ["0", "1", "(-1)", "u8(1)", "u8(255)", "i8(-1)", "u64(-1)", "i32(1)", "true", "false",
+            "0.0", "(-0.0)", "1.0", "(0.0 / 0.0)", "f64FromInt(1)", "f64ToF32(1.0)", "f64ToF32(0.0)",
+            "4607182418800017408", "4611686018427387904", "9218868437227405312",
+            '"a"', '("" + "a")', '"ab"', '("a" + "b")', '""', "[1]", "[1]", "o", "o", "Acc(1, 1)",
+            "f64FromBits(1)", "f64FromBits(4607182418800017408)", "'a'", "97", "u8(97)"]
+
+    def any_pool_check(self, index):
+        """Pairs of values whose bits or contents collide, compared through `any`."""
+        r = self.r
+        pairs = []
+        for _ in range(r.randint(6, 12)):
+            a, b = r.choice(self.POOL), r.choice(self.POOL)
+            if r.random() < 0.3:
+                b = a
+            pairs.append((a, b))
+        lines = [f"fun c{index}(): string {{", "    val o = Acc(3, 4)", '    var out = ""']
+        for a, b in pairs:
+            lines.append(f'    out = out + (if (anyEq({a}, {b})) "1" else "0")')
+        lines.append("    out")
+        lines.append("}")
+        return lines, f"c{index}()", "str"
+
     def check(self, index):
         """One check: a function and its call; returns (function lines, call text, result type)."""
         r = self.r
+        if r.random() < 0.15:
+            return self.any_pool_check(index)
         nparams = r.randint(0, 3)
         env = []
         params = []
@@ -395,14 +420,14 @@ class Runner:
         if env:
             e.update(env)
         try:
-            p = subprocess.run(args, cwd=cwd, env=e, capture_output=True, text=True,
-                               timeout=self.timeout)
-            return p.returncode, p.stdout, p.stderr
+            p = subprocess.run(args, cwd=cwd, env=e, capture_output=True, timeout=self.timeout)
+            # Bytes, kept exact: a string slice may cut a UTF-8 sequence.
+            return p.returncode, p.stdout.decode("latin-1"), p.stderr.decode("latin-1")
         except subprocess.TimeoutExpired:
             return 124, "", "timeout"
 
     def native(self, source, out, fast, ct):
-        env = {"ABLA_COMPILE_EVAL": "interp"} if ct else None
+        env = {"ABLA_COMPILE_EVAL": ct} if ct else None
         args = [self.compiler, "build", source, "-o", out, "--no-cache"]
         if fast:
             args.append("--fast")
@@ -447,11 +472,12 @@ fun main: int = if (release && development) 0 else 1
         jobs = {
             "fast": lambda: self.native(plain, os.path.join(directory, "fast"), True, False),
             "release": lambda: self.native(plain, os.path.join(directory, "release"), False, False),
-            "ct": lambda: self.native(ct, os.path.join(directory, "ct"), True, True),
+            "ct": lambda: self.native(ct, os.path.join(directory, "ct"), True, "interp"),
+            "ct-jit": lambda: self.native(ct, os.path.join(directory, "ctjit"), True, "jit"),
             "wasm": lambda: self.wasm(plain, directory),
         }
         results = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
             futures = {k: pool.submit(v) for k, v in jobs.items()}
             for k, fut in futures.items():
                 v = fut.result()
@@ -546,6 +572,25 @@ def minimise(args, seed, runner, checks, results, first):
     return "\n".join(report)
 
 
+def selftest():
+    """The comparison itself: agreeing results pass, any difference is reported."""
+    same = {m: ("c0=1\nc1=2\n", 0) for m in ("fast", "release", "ct", "wasm")}
+    assert verdict(same) is None
+    other = dict(same)
+    other["ct"] = ("c0=1\nc1=3\n", 0)
+    assert verdict(other) is not None and differing_lines(other) == ["c1"], differing_lines(other)
+    status = dict(same)
+    status["wasm"] = ("c0=1\nc1=2\n", 101)
+    assert verdict(status) is not None and differing_lines(status) == []
+    broken = dict(same)
+    broken["release"] = ("build-failed", ["error"])
+    assert verdict(broken) is not None
+    both = {m: ("build-failed", ["error"]) for m in same}
+    assert verdict(both).startswith("all modes failed")
+    print("fuzz-differential: comparison self-test passed")
+    return 0
+
+
 def seed_range(text):
     if "-" in text:
         a, b = text.split("-")
@@ -561,8 +606,11 @@ def main():
     ap.add_argument("--compiler", default="build/ablac")
     ap.add_argument("--timeout", type=int, default=120)
     ap.add_argument("--keep", action="store_true")
+    ap.add_argument("--selftest", action="store_true", help="check the comparison on made-up results")
     ap.add_argument("--program", help="run an existing .ab program (with @export(\"run\")) all ways")
     args = ap.parse_args()
+    if args.selftest:
+        return selftest()
     runner = Runner(args.compiler, args.timeout)
     if args.program:
         directory = os.path.join(WORK, "program")
