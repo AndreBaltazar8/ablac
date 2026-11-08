@@ -1,0 +1,336 @@
+// Signed 128-bit integers: the language's `int128` and what's done with it (docs/stdlib/int128.md).
+// Two's complement, as every signed width is: operators wrap, `/` and `%` truncate toward zero, and the one
+// quotient too large, the smallest value over -1, wraps to itself with a remainder of 0. The `Checked`
+// forms say when a result doesn't fit.
+// Not for secrets: comparison and division take a time that depends on the value. abla/ct is for those.
+
+noescape extern:"intrinsic" fun ablaI128NativeMul(): bool
+noescape extern:"intrinsic" fun ablaI128_fromU64(value: u64): int128
+noescape extern:"intrinsic" fun ablaI128_fromI64(value: i64): int128
+noescape extern:"intrinsic" fun ablaI128_toU64(value: int128): u64
+noescape extern:"intrinsic" fun ablaI128_not(value: int128): int128
+noescape extern:"intrinsic" fun ablaI128_add(a: int128, b: int128): int128
+noescape extern:"intrinsic" fun ablaI128_sub(a: int128, b: int128): int128
+noescape extern:"intrinsic" fun ablaI128_mul(a: int128, b: int128): int128
+noescape extern:"intrinsic" fun ablaI128_udiv(a: int128, b: int128): int128
+noescape extern:"intrinsic" fun ablaI128_urem(a: int128, b: int128): int128
+noescape extern:"intrinsic" fun ablaI128_sdiv(a: int128, b: int128): int128
+noescape extern:"intrinsic" fun ablaI128_srem(a: int128, b: int128): int128
+noescape extern:"intrinsic" fun ablaI128_and(a: int128, b: int128): int128
+noescape extern:"intrinsic" fun ablaI128_or(a: int128, b: int128): int128
+noescape extern:"intrinsic" fun ablaI128_xor(a: int128, b: int128): int128
+noescape extern:"intrinsic" fun ablaI128_shl(a: int128, count: u32): int128
+noescape extern:"intrinsic" fun ablaI128_lshr(a: int128, count: u32): int128
+noescape extern:"intrinsic" fun ablaI128_ashr(a: int128, count: u32): int128
+noescape extern:"intrinsic" fun ablaI128_eq(a: int128, b: int128): bool
+noescape extern:"intrinsic" fun ablaI128_lt(a: int128, b: int128): bool
+noescape extern:"intrinsic" fun ablaI128_slt(a: int128, b: int128): bool
+noescape extern:"intrinsic" fun ablaI128NarrowTarget(): bool
+
+// As every widening: a signed source extends its sign, an unsigned one its zeros.
+@inline fun int128(value: int): int128 = ablaI128_fromI64(value)
+@inline fun int128(value: i32): int128 = ablaI128_fromI64(i64(value))
+@inline fun int128(value: i16): int128 = ablaI128_fromI64(i64(value))
+@inline fun int128(value: i8): int128 = ablaI128_fromI64(i64(value))
+@inline fun int128(value: u64): int128 = ablaI128_fromU64(value)
+@inline fun int128(value: u32): int128 = ablaI128_fromU64(u64(value))
+@inline fun int128(value: u16): int128 = ablaI128_fromU64(u64(value))
+@inline fun int128(value: u8): int128 = ablaI128_fromU64(u64(value))
+/** Four words of its two's complement, most significant first: how to write a constant that doesn't fit an `int`. */
+fun int128Words(w3: u32, w2: u32, w1: u32, w0: u32): int128 {
+    var out = int128(w3)
+    out = ablaI128_or(ablaI128_shl(out, u32(32)), int128(w2))
+    out = ablaI128_or(ablaI128_shl(out, u32(32)), int128(w1))
+    ablaI128_or(ablaI128_shl(out, u32(32)), int128(w0))
+}
+/** 2^127 - 1. */
+fun int128Max(): int128 = ablaI128_lshr(ablaI128_not(int128(0)), u32(1))
+/** -2^127. */
+fun int128Min(): int128 = ablaI128_shl(int128(1), u32(127))
+
+// What the compiler calls for `==`, `<` and the rest (bootstrapLowerArithmetic), and for "$x".
+@inline fun int128Equal(a: int128, b: int128): bool = ablaI128_eq(a, b)
+@inline fun int128NotEqual(a: int128, b: int128): bool = !ablaI128_eq(a, b)
+@inline fun int128Less(a: int128, b: int128): bool = ablaI128_slt(a, b)
+@inline fun int128LessEqual(a: int128, b: int128): bool = !ablaI128_slt(b, a)
+@inline fun int128Greater(a: int128, b: int128): bool = ablaI128_slt(b, a)
+@inline fun int128GreaterEqual(a: int128, b: int128): bool = !ablaI128_slt(a, b)
+fun int128Text(value: int128): string = value.toDecimal()
+
+@inline operator fun int128.plus(other: int128): int128 = ablaI128_add(this, other)
+@inline operator fun int128.minus(other: int128): int128 = ablaI128_sub(this, other)
+@inline operator fun int128.unaryMinus(): int128 = ablaI128_sub(int128(0), this)
+@inline operator fun int128.and(other: int128): int128 = ablaI128_and(this, other)
+@inline operator fun int128.or(other: int128): int128 = ablaI128_or(this, other)
+@inline operator fun int128.xor(other: int128): int128 = ablaI128_xor(this, other)
+@inline operator fun int128.inv(): int128 = ablaI128_not(this)
+
+// One word of a number, least significant first.
+private @inline fun int128Word(value: int128,
+    index: int): u32 = u32(ablaI128_toU64(ablaI128_lshr(value, u32(index * 32))))
+
+// A word times a word. On a 32-bit target a u64 product calls __muldi3, and four 16-bit products don't.
+// Not inlined, or LLVM evaluates the product at the width of what it's added to, and calls __multi3 for it.
+private @noinline fun int128WordProduct(a: u32, b: u32): u64 {
+    if (!ablaI128NarrowTarget()) return u64(a) * u64(b)
+    val aLow = a & u32(65535)
+    val aHigh = a >> 16
+    val bLow = b & u32(65535)
+    val bHigh = b >> 16
+    val low = aLow * bLow
+    val first = aHigh * bLow + (low >> 16)
+    val second = aLow * bHigh + (first & u32(65535))
+    (u64(aHigh * bHigh + (first >> 16) + (second >> 16)) << 32) | u64((second << 16) | (low &
+        u32(65535)))
+}
+
+// Column by column from the top: each step moves what's done up a word and adds the next column.
+// The product of two's complements is the same bits whichever sign they stand for, so this is the unsigned one.
+private @noinline fun int128MultiplyWords(a: int128, b: int128): int128 {
+    var out = int128(0)
+    var column = 3
+    while (column >= 0) {
+        out = ablaI128_shl(out, u32(32))
+        for (i in 0 until column + 1) {
+            out = ablaI128_add(out, ablaI128_fromU64(int128WordProduct(int128Word(a, i),
+                int128Word(b, column - i))))
+        }
+        column = column - 1
+    }
+    out
+}
+
+@inline operator fun int128.times(other: int128): int128 =
+    if (ablaI128NativeMul()) ablaI128_mul(this, other) else int128MultiplyWords(this, other)
+
+// LLVM expands a division to a loop where it's written, so it's written once.
+// By zero, the language's own panic: a u32 divided by the zero it's been told about.
+private @inline fun int128CheckDivisor(b: int128): void {
+    if (ablaI128_eq(b, int128(0))) u32(1) / u32(ablaI128_toU64(b))
+}
+// The smallest value over -1 wraps to itself, with a remainder of 0, as every width's does.
+private @noinline fun int128Divide(a: int128, b: int128): int128 {
+    int128CheckDivisor(b)
+    if (ablaI128_eq(b, int128(-1))) return ablaI128_sub(int128(0), a)
+    ablaI128_sdiv(a, b)
+}
+private @noinline fun int128Remainder(a: int128, b: int128): int128 {
+    int128CheckDivisor(b)
+    if (ablaI128_eq(b, int128(-1))) return int128(0)
+    ablaI128_srem(a, b)
+}
+@inline operator fun int128.div(other: int128): int128 = int128Divide(this, other)
+@inline operator fun int128.rem(other: int128): int128 = int128Remainder(this, other)
+
+// As every width's: a count that's negative or at least the width gives zero.
+fun int128ShiftLeft(value: int128, count: int): int128 =
+    if (count < 0 || count >= 128) int128(0) else ablaI128_shl(value, u32(count))
+fun int128ShiftRight(value: int128, count: int): int128 =
+    if (count < 0 || count >= 128) int128(0) else ablaI128_ashr(value, u32(count))
+fun int128UnsignedShiftRight(value: int128, count: int): int128 =
+    if (count < 0 || count >= 128) int128(0) else ablaI128_lshr(value, u32(count))
+@inline operator fun int128.shl(count: int): int128 = int128ShiftLeft(this, count)
+@inline operator fun int128.shr(count: int): int128 = int128ShiftRight(this, count)
+@inline operator fun int128.shl(count: i32): int128 = int128ShiftLeft(this, int(count))
+@inline operator fun int128.shr(count: i32): int128 = int128ShiftRight(this, int(count))
+@inline operator fun int128.shl(count: i16): int128 = int128ShiftLeft(this, int(count))
+@inline operator fun int128.shr(count: i16): int128 = int128ShiftRight(this, int(count))
+@inline operator fun int128.shl(count: i8): int128 = int128ShiftLeft(this, int(count))
+@inline operator fun int128.shr(count: i8): int128 = int128ShiftRight(this, int(count))
+@inline operator fun int128.shl(count: u64): int128 = int128ShiftLeft(this, int(count))
+@inline operator fun int128.shr(count: u64): int128 = int128ShiftRight(this, int(count))
+@inline operator fun int128.shl(count: u32): int128 = int128ShiftLeft(this, int(count))
+@inline operator fun int128.shr(count: u32): int128 = int128ShiftRight(this, int(count))
+@inline operator fun int128.shl(count: u16): int128 = int128ShiftLeft(this, int(count))
+@inline operator fun int128.shr(count: u16): int128 = int128ShiftRight(this, int(count))
+@inline operator fun int128.shl(count: u8): int128 = int128ShiftLeft(this, int(count))
+@inline operator fun int128.shr(count: u8): int128 = int128ShiftRight(this, int(count))
+/** `>>>`: logical, zeros shifted in whatever the sign. */
+@inline fun int128.ushr(count: int): int128 = int128UnsignedShiftRight(this, count)
+
+@inline fun int128.isZero(): bool = ablaI128_eq(this, int128(0))
+@inline fun int128.isNegative(): bool = ablaI128_slt(this, int128(0))
+/** -1, 0 or 1. */
+fun int128.signum(): int = if (ablaI128_slt(this, int128(0))) -1 else if (this.isZero()) 0 else 1
+/** The magnitude; the smallest value has none that fits, and stays itself. */
+fun int128.abs(): int128 = if (this.isNegative()) ablaI128_sub(int128(0), this) else this
+/** Bit `index` of its two's complement, the least significant being 0; beyond the width, the sign. */
+fun int128.bit(index: int): bool =
+    (ablaI128_toU64(ablaI128_ashr(this,
+        u32(if (index < 0 || index > 127) 127 else index))) & u64(1)) == u64(1)
+
+/** The sum, or null if it doesn't fit. */
+fun int128.addChecked(other: int128): int128? {
+    val sum = ablaI128_add(this, other)
+    if (this.isNegative() == other.isNegative() && sum.isNegative() !=
+        this.isNegative()) null else sum
+}
+/** The difference, or null if it doesn't fit. */
+fun int128.subChecked(other: int128): int128? {
+    val difference = ablaI128_sub(this, other)
+    if (this.isNegative() != other.isNegative() && difference.isNegative() !=
+        this.isNegative()) null
+    else difference
+}
+/** The product, or null if it doesn't fit. */
+fun int128.mulChecked(other: int128): int128? {
+    if (this.isZero() || other.isZero()) return int128(0)
+    val minimum = int128Min()
+    val minusOne = int128(-1)
+    if ((ablaI128_eq(this, minimum) && ablaI128_eq(other, minusOne)) ||
+        (ablaI128_eq(other, minimum) && ablaI128_eq(this, minusOne))) return null
+    val product = this * other
+    if (ablaI128_eq(int128Divide(product, other), this)) product else null
+}
+
+// Narrowing as every width's does: keeps the low bits.
+@inline fun int128.toU64(): u64 = ablaI128_toU64(this)
+@inline fun int128.toInt(): int = int(ablaI128_toU64(this))
+@inline fun int128.toI32(): i32 = i32(ablaI128_toU64(this))
+@inline fun int128.toU32(): u32 = u32(ablaI128_toU64(this))
+@inline fun int128.toU16(): u16 = u16(ablaI128_toU64(this))
+@inline fun int128.toU8(): u8 = u8(ablaI128_toU64(this))
+// Or null if it doesn't fit.
+fun int128.toIntOrNull(): int? = if (ablaI128_eq(int128(this.toInt()), this)) this.toInt() else null
+fun int128.toI32OrNull(): i32? = if (ablaI128_eq(int128(this.toI32()), this)) this.toI32() else null
+fun int128.toU64OrNull(): u64? = if (ablaI128_eq(int128(this.toU64()), this)) this.toU64() else null
+fun int128.toU32OrNull(): u32? = if (ablaI128_eq(int128(this.toU32()), this)) this.toU32() else null
+fun int128.toU16OrNull(): u16? = if (ablaI128_eq(int128(this.toU16()), this)) this.toU16() else null
+fun int128.toU8OrNull(): u8? = if (ablaI128_eq(int128(this.toU8()), this)) this.toU8() else null
+
+private @inline fun int128ByteBefore(byte: int, text: string): string = "${char(byte)}$text"
+
+/** In decimal, as "$x" writes it: a minus for a negative one. */
+fun int128.toDecimal(): string {
+    if (this.isZero()) return "0"
+    // Nine digits at a time, in a u32: dividing a u64 would call __udivti3 on a 32-bit target.
+    // The magnitude is read as unsigned, which the smallest value needs.
+    val chunk = int128(1000000000)
+    var text = ""
+    var rest = if (this.isNegative()) ablaI128_sub(int128(0), this) else this
+    while (!rest.isZero()) {
+        var low = u32(ablaI128_toU64(ablaI128_urem(rest, chunk)))
+        rest = ablaI128_udiv(rest, chunk)
+        for (digit in 0 until 9) {
+            if (low != u32(0) || !rest.isZero()) text = int128ByteBefore(48 + int(low % u32(10)),
+                text)
+            low = low / u32(10)
+        }
+    }
+    if (this.isNegative()) "-$text" else text
+}
+
+/** In hex with 0x, in lower case, no leading zeros, a minus before the 0x for a negative one. */
+fun int128.toHex(): string {
+    if (this.isZero()) return "0x0"
+    var text = ""
+    var rest = if (this.isNegative()) ablaI128_sub(int128(0), this) else this
+    while (!rest.isZero()) {
+        val digit = int(rest.toU64() & u64(15))
+        text = int128ByteBefore(if (digit < 10) 48 + digit else 87 + digit, text)
+        rest = ablaI128_lshr(rest, u32(4))
+    }
+    if (this.isNegative()) "-0x$text" else "0x$text"
+}
+
+// The magnitude read from digits, as unsigned bits, or null if it doesn't fit 128 bits.
+private fun int128Magnitude(text: string, start: int): int128? {
+    if (text.size == start) return null
+    // floor((2^128 - 1) / 10), whose last digit then allows up to 5.
+    val limit = int128Words(u32(429496729), u32(2576980377), u32(2576980377), u32(2576980377))
+    var out = int128(0)
+    for (at in start until text.size) {
+        val digit = int(text[at]) - 48
+        if (digit < 0 || digit > 9) return null
+        if (ablaI128_lt(limit, out) || (ablaI128_eq(out, limit) && digit > 5)) return null
+        out = ablaI128_add(ablaI128_add(ablaI128_shl(out, u32(3)), ablaI128_shl(out, u32(1))),
+            int128(digit))
+    }
+    out
+}
+
+// A magnitude with its sign, or null if it's beyond the range.
+private fun int128Signed(magnitude: int128?, negative: bool): int128? {
+    if (magnitude == null) return null
+    val bits = magnitude
+    if (negative) {
+        if (ablaI128_lt(int128Min(), bits)) return null
+        return ablaI128_sub(int128(0), bits)
+    }
+    if (bits.isNegative()) null else bits
+}
+
+/** Digits with an optional leading minus (no plus, space or point); leading zeros are allowed. Null if it isn't that, or doesn't fit. */
+fun int128FromDecimal(text: string): int128? {
+    val negative = text.size > 0 && int(text[0]) == 45
+    int128Signed(int128Magnitude(text, if (negative) 1 else 0), negative)
+}
+
+// The magnitude from hex digits, after the 0x if there is one.
+private fun int128HexMagnitude(text: string, from: int): int128? {
+    var start = from
+    if (text.size >= start + 2 && int(text[start]) == 48 && (int(text[start + 1]) == 120 ||
+        int(text[start + 1]) == 88)) start =
+        start + 2
+    if (text.size == start) return null
+    var out = int128(0)
+    for (at in start until text.size) {
+        val c = int(text[at])
+        val digit = if (c >= 48 && c <= 57) c - 48
+            else if (c >= 97 && c <= 102) c - 87
+            else if (c >= 65 && c <= 70) c - 55
+            else -1
+        if (digit < 0 || !ablaI128_lshr(out, u32(124)).isZero()) return null
+        out = ablaI128_or(ablaI128_shl(out, u32(4)), int128(digit))
+    }
+    out
+}
+
+/** With or without 0x, in either case, after an optional minus. Null with no digits, on anything else, or if it doesn't fit. */
+fun int128FromHex(text: string): int128? {
+    val negative = text.size > 0 && int(text[0]) == 45
+    int128Signed(int128HexMagnitude(text, if (negative) 1 else 0), negative)
+}
+
+/** 16 bytes, big-endian, in two's complement. */
+fun int128.toBytes(): string {
+    var text = ""
+    var rest = this
+    for (at in 0 until 16) {
+        text = int128ByteBefore(int(rest.toU64() & u64(255)), text)
+        rest = ablaI128_lshr(rest, u32(8))
+    }
+    text
+}
+
+/** 16 bytes, little-endian: the least significant byte first. */
+fun int128.toBytesLittleEndian(): string {
+    var text = ""
+    var rest = this
+    for (at in 0 until 16) {
+        text = "$text${char(int(rest.toU64() & u64(255)))}"
+        rest = ablaI128_lshr(rest, u32(8))
+    }
+    text
+}
+
+/** Big-endian bytes, fewer than 16 extending the sign of the first. Null above 16. */
+fun int128FromBytes(bytes: string): int128? {
+    if (bytes.size > 16) return null
+    var out = if (bytes.size > 0 && int(bytes[0]) >= 128) int128(-1) else int128(0)
+    for (at in 0 until bytes.size) out = ablaI128_or(ablaI128_shl(out, u32(8)),
+        int128(int(bytes[at])))
+    out
+}
+
+/** Little-endian bytes, fewer than 16 extending the sign of the last. Null above 16. */
+fun int128FromBytesLittleEndian(bytes: string): int128? {
+    if (bytes.size > 16) return null
+    var out = if (bytes.size > 0 && int(bytes[bytes.size - 1]) >= 128) int128(-1) else int128(0)
+    var at = bytes.size - 1
+    while (at >= 0) {
+        out = ablaI128_or(ablaI128_shl(out, u32(8)), int128(int(bytes[at])))
+        at = at - 1
+    }
+    out
+}

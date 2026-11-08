@@ -10,6 +10,9 @@
 | `abla/bits` | named bit operations (`bitAnd`, `bitShiftLeft`, ...) |
 | `abla/integer` | `u32.countLeadingZeros()`, `string.parseInt()` |
 | [`abla/uint256`](uint256.md) | unsigned 256-bit integers |
+| [`abla/int256`](int256.md) | signed 256-bit integers |
+| [`abla/uint128`](uint128.md) | unsigned 128-bit integers |
+| [`abla/int128`](int128.md) | signed 128-bit integers |
 | `abla/random` | cryptographically secure random bytes |
 
 Integer arithmetic, widths and conversions are part of the language

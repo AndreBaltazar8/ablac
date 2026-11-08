@@ -337,6 +337,9 @@ fun main {
 | `i8`, `i16`, `i32`, `i64` | signed integers; `int` is `i64` |
 | `u8`, `u16`, `u32`, `u64` | unsigned integers |
 | `uint256` | unsigned 256 bits, with [`abla/uint256`](stdlib/uint256.md) |
+| `int256` | signed 256 bits, with [`abla/int256`](stdlib/int256.md) |
+| `uint128` | unsigned 128 bits, with [`abla/uint128`](stdlib/uint128.md) |
+| `int128` | signed 128 bits, with [`abla/int128`](stdlib/int128.md) |
 | `f32`, `f64` | IEEE floating point; a literal is `f64` unless its context wants `f32` |
 | `char` | a byte-sized character code |
 | `string` | immutable UTF-8 text, indexed by byte |

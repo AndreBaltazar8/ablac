@@ -15,7 +15,8 @@ carry them.
 | [Numbers, bits and randomness](stdlib/numbers.md) | `abla/core`, `abla/math`, `abla/math/v8`, `abla/math/fast`, `abla/float`, `abla/bits`, `abla/integer`, `abla/random` |
 | [Vectors](stdlib/simd.md) | `abla/simd`, `abla/simd/target` |
 | [Constant-time primitives](stdlib/ct.md) | `abla/ct` |
-| [256-bit integers](stdlib/uint256.md) | `abla/uint256` |
+| [256-bit integers](stdlib/uint256.md) | `abla/uint256`, `abla/int256` ([int256](stdlib/int256.md)) |
+| [128-bit integers](stdlib/uint128.md) | `abla/uint128`, `abla/int128` ([int128](stdlib/int128.md)) |
 | [UUIDs](stdlib/uuid.md) | `abla/uuid` |
 | [Hashing, encryption, encoding and dates](stdlib/security-and-dates.md) | `abla/crypto`, `abla/crypto/hosted`, `abla/date` |
 | [Testing](stdlib/testing.md) | `abla/test` and `ablac test` |
@@ -43,7 +44,7 @@ Built into the language rather than imported: `string`, arrays, `Map`,
 | `abla/text` | string helpers (split, trim, replace, ...) and UTF-8 validation, code points and slicing |
 | `abla/simd` | fixed-width vectors; `targetHas`, `cpuHas`, AES rounds and carry-less multiply |
 | `abla/ct` | secret integers, masks and selects with no branch or index on the value |
-| `abla/uint256` | `uint256`'s arithmetic, comparisons, conversions, decimal and hex text, and big-endian bytes |
+| `abla/uint256` | `uint256`'s arithmetic, comparisons, conversions, decimal and hex text, and big- and little-endian bytes; `abla/int256`, `abla/uint128` and `abla/int128` likewise for their types |
 | `abla/crypto` | SHA-512, SHA-384, SHA-256, SHA-1, MD5, HMAC, PBKDF2, Base64, hexadecimal, constant-time comparison |
 | `abla/crypto/aes`, `abla/crypto/rsa`, `abla/crypto/pure` | AES and RSA in Abla, no OpenSSL, on every target; what timing protection each has is documented |
 | `abla/crypto/hosted` | AES-GCM, AES-CBC, AES-ECB, RSA signatures and encryption, PEM, DER, X.509 and PKCS#12 keys, through OpenSSL |

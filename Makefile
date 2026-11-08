@@ -148,6 +148,7 @@ test-serial: ablac
 	tools/test-wide-integers.sh $(COMPILER)
 	tools/test-wide-integers.sh $(COMPILER) int256
 	tools/test-wide-integers.sh $(COMPILER) uint128
+	tools/test-wide-integers.sh $(COMPILER) int128
 	tools/test-array-truncate.sh $(COMPILER)
 	tools/test-array-filled.sh $(COMPILER)
 	tools/test-borrow-chain-scaling.sh $(COMPILER)

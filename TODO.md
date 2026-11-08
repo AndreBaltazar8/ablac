@@ -170,8 +170,6 @@
   `aesOrthogonalize` now uses this path and its actual helper is checked without index
   substitution. Optimized x86/Xtensa retain its three loops; neither fully unrolls it.
 
-- [ ] The rest of integers up to 256 bits: `uint256` is in (`abla/uint256`, docs/stdlib/uint256.md), with big-endian
-      bytes. Left: signed 256, 128 both ways, and little-endian bytes, when something needs them.
 - [ ] **`ablac run` becomes a live JIT.** The direction for `run` is a live in-process JIT: a
   running program loads code and redefines its own functions while it runs. Done: the JIT
   module gets the `--o1` IR pipeline (`--fast`: the fast one), which made `run` the in-process
