@@ -634,6 +634,46 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   and lowered form from a cache keyed on the module's sources and the compiler, a small program would drop by
   a quarter to a third of its instructions; the cost is a serialized form of the analyzer's and lowerer's
   state (declarations, indexes, inferred results) that must give byte-identical output.
+  Measured (2026-11-08, `build/ablac.bin` of master, `perf stat -e instructions:u` on one P-core, `--fast
+  --no-cache`; M instructions). An empty `main` costs 1,157. The same imports with an empty `main` (nothing
+  reachable, so nothing lowered or sent to LLVM, but every imported module loaded, parsed, rewritten and
+  analyzed): `abla/bits` 1,160; `abla/udp` program 1,606 (full 2,013); event-http-server 1,977 (full 3,649);
+  https-client 2,241 (full 3,991); websocket-echo 2,346 (full 3,817); `unsafe-boundary.ab` (a 92 KB program) 2,178
+  (full 3,602). So loading and analyzing the imports alone is 0 to 1,190 M over the empty build, 31% of
+  websocket-echo. Where the time goes, from `perf script` sample order of the websocket-echo build (a sample is
+  400 k instructions): load + lex + discovery/staged parse about 24%, the whole-program rewrite passes
+  (receiver names, generics, expected types, overloads) 8%, semantic analysis 20%, IR lowering 20%, LLVM and
+  link 28%. The import-only build splits alike up to lowering: parse 33%, rewrites 10%, analysis 28%. So for a
+  small program the stdlib's frontend (parse through analysis) is about half of a build, more than the 25 to
+  33% estimated above, but only the parse part is a per-module function. The existing discovery cache (parser
+  data of unaliased modules, keyed by compiler image and content) is already in play on cached builds and
+  gains little: an edited program with a warm discovery cache is 3,608 to 3,736 vs 3,817 M (-2 to -5%).
+  What blocks a bigger cache: `BootstrapModuleGraph.parse` rewrites each module's text by the aliases,
+  prefixes and shadows of the whole graph (`bootstrapRewriteModuleSource`), the rewrite passes after it run
+  "over the whole raw program each round" and are not idempotent (frontend.ab), and sema consumes the merged
+  declaration list, so analysis results are not per-module values.
+  Built and measured (2026-11-08, branch `frontend-reuse`, stage1 from the same tree vs its seed; records of
+  the staged parse in `BootstrapModuleState.acquireParsed` and, under `--no-cache`, discovery records for
+  standard-library modules only; both keyed by the compiler image and the exact source; the staged key adds the
+  module's own declaration names and the effect grant, not the other modules': a first key that included
+  `dependencyFingerprint` missed on every edited program, because that fingerprint contains the program's own
+  source). `--fast --no-cache`, records written by a build of a different program: udp-echo-once -8.9%,
+  unsafe-boundary -4.8%, https-client -3.9%, websocket-echo -2.2%, event-http-server -1.3%; executables
+  byte-identical in all; the build that fills a cold directory costs 2.5% more. Below the 8% bar for small
+  builds (mean about 4%), so not merged: the staged parse of 17 of 18 modules is a hit and still saves only
+  3.4% (130 M) of websocket-echo, because the parse is a small part of the "24%" above (loading, import
+  scans, the rewrite and strict-import passes and lexing stay), and what remains is the whole-program rewrite
+  and analysis, which are not per-module values. Next lever would be caching the analysis, not the parse.
+  Design of a safe cache (as first designed; the built key above is narrower): immutable per-module records of the staged parse (declarations, bodies,
+  handlers) for modules that are unaliased, have no compile-time actions/transforms/subparser registrations and
+  no declaration edits, keyed by compiler image identity (size + sampled hashes as the discovery cache has,
+  or a full content hash), the module's canonical path identity, the exact rewritten source text, the manifest
+  visibility/strict flags and `syntaxOnly`/target; anything else is a miss, a record that fails validation is a
+  miss, and `--no-cache` bypasses it. The graph still loads, resolves imports and rewrites every build, so
+  diagnostics, strict-imports and visibility reports see the same inputs. Expected gain: parse is at most the
+  24% above, minus decode cost and minus what the discovery cache already saves, so a ceiling of about 12 to
+  16% and likely under the 15% bar; it reaches the bar only together with caching the rewrite or analysis
+  stages, which needs the structural change above.
   Tried first, and not worth keeping (2026-11-08, `--fast` builds of `unsafe-boundary.ab` and
   `websocket-echo-server.ab`, three to four alternating runs): `__ablaRuntimeStringBytesEqual` comparing
   eight-byte words when both strings are 8-byte aligned (the precedent of `bootstrapNameEquals`):
