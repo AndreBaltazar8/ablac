@@ -3,7 +3,7 @@
 // which writes "panic: <message>" through the host's write import. That import
 // must not appear in a module only because of it, so after optimization (when
 // what else reaches the import is known) the calls are kept or erased:
-// bootstrapSettleWasmPanicWrite for a development module in process, a link
+// bootstrapOptimizeWasmPanicWrite for a development module in process, a link
 // without and then with the calls for a release module (toolchain.ab), and
 // the backend erases them at once for a target without that import.
 //
@@ -22,6 +22,7 @@ noescape extern:"c" fun LLVMGetStringAttributeAtIndex(
     key: cstring,
     keyLength: int
 ): i64*
+noescape extern:"c" fun LLVMCloneModule(module: i64*): i64*
 noescape extern:"c" fun LLVMIsAInstruction(value: i64*): i64*
 noescape extern:"c" fun LLVMGetInstructionParent(instruction: i64*): i64*
 noescape extern:"c" fun LLVMGetBasicBlockParent(block: i64*): i64*
@@ -76,20 +77,39 @@ trusted fun bootstrapEraseWasmPanicWrite(module: i64*): bool {
     erased
 }
 
-// A development module, optimized: keeps the writer only when the module
-// reaches the host's write anyway. Without it the callers of the panic path
-// are smaller, so the module is optimized once more with `passes` (what
-// inlining and cleanup the module would have had without the writer). The
-// status of that run, else 0.
-trusted fun bootstrapSettleWasmPanicWrite(
+// A development module, optimized with `passes`: the module without the panic
+// writer first, which is what a module that never wrote gets bit for bit; the
+// one with it only if that reaches the host's write anyway (the callers of the
+// panic path inline differently with the writer, so erasing it afterwards would
+// not give the same module). Returns the module to generate (the held module
+// is replaced and disposed when it is the bare one), or null on a failed pass.
+trusted fun bootstrapOptimizeWasmPanicWrite(
     module: i64*,
     machine: i64*,
     options: i64*,
     passes: string
-): int {
-    if (bootstrapWasmHostWriteReached(module)) return 0
-    if (!bootstrapEraseWasmPanicWrite(module)) return 0
-    llvmConsumeError(LLVMRunPasses(module, passes, machine, options), 167)
+): i64* {
+    var hasWriter = false
+    var function = LLVMGetFirstFunction(module)
+    while (!hasWriter && !pointerIsNull(function)) {
+        hasWriter = bootstrapIsWasmPanicWrite(function)
+        function = LLVMGetNextFunction(function)
+    }
+    var bare = nativeNullPointer()
+    if (hasWriter) {
+        bare = LLVMCloneModule(module)
+        if (bootstrapEraseWasmPanicWrite(bare) &&
+            llvmConsumeError(LLVMRunPasses(bare, passes, machine, options), 167) == 0 &&
+            !bootstrapWasmHostWriteReached(bare)) {
+            LLVMDisposeModule(module)
+            return bare
+        }
+        LLVMDisposeModule(bare)
+    }
+    if (llvmConsumeError(LLVMRunPasses(module, passes, machine, options), 167) != 0) {
+        return nativeNullPointer()
+    }
+    module
 }
 
 // `inputPath`'s bitcode written to `outputPath` without the panic writer.

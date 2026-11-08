@@ -7,10 +7,11 @@ set -euo pipefail
 compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-out="$root/build/wasm-panic-message"
+cd "$root"
+# (relative: the build program takes a path under the project)
+out=build/wasm-panic-message
 rm -rf "$out"
 mkdir -p "$out"
-cd "$root"
 cases=tests/cases/wasm-panic-message
 tools/wasm-imports.sh "$compiler" "$out" "$cases"/*.ab >"$out/imports.txt"
 for source in "$cases"/*.ab; do
