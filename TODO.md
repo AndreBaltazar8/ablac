@@ -386,25 +386,31 @@
   test-json-ascii-spans 40, test-crypto-pure 39, test-compiler-memory-peak 36, test-uint256 34,
   test-crypto 34; the sum of every command's wall time is 1,657 s, so none is a serial
   bottleneck at JOBS=8.
-  Critical path of the default `make test` (JOBS=30), 2026-11-08: a full run on master `04aa6c7d` plus the
-  step-4 test-driver moves (308 commands, 326 s wall at a load average of 30 to 50 from other work;
-  commands' wall times include waiting for cores). The longest were test-bignum-secret 237 s (54 CPU-s),
-  test-ct 218 (43), test-json-ascii-spans 189 (114), test-uint256 165 (29), test-compiler-memory-peak 136
-  (25), test-reproducible-elsewhere 133 (82), test-crypto-pure 121 (54). Alone in a slot (`taskset -c 0-7`),
-  test-bignum-secret takes 39.0 s wall for 38.9 CPU-seconds: a serial chain of builds, but short, and its 237 s
-  in the suite was waiting for cores. Running its four independent sections (the two forbidden-helper
-  builds, the fast and the release oracle, the AArch64 oracle) side by side took 26.7 s wall (-31%) for
-  53.8 CPU-seconds (+38%): at JOBS=8 the suite is CPU-bound (about 1,750 CPU-seconds over 8 CPUs is 220 s
-  of the 277 s measured), so that only adds load; not kept. test-self-hosted alone: 63 s wall, 118 tests,
-  and one of them, native-bootstrap-sema (a release build of the sema module, one `ablac build`), takes 61 s
-  of that; the other 117 end within about 20 s (suite-contract-imports 20, native-network-advanced 15),
-  so sharding the driver cannot shorten it. The seven suite scripts that wait for it (`serial_reason` in
-  `tools/run-tests.sh`: they share build directories with its `suite-*` entries) total 45 s of wall time and
-  10 CPU-seconds, the longest 20 s, so on a quiet 32-thread machine the tail is about 61 + 20 = 81 s against
-  a CPU bound of about 2,000 / 23.5 = 85 s: the two are level, and nothing splits further. They are not
-  duplicates to delete: five of the seven (borrow-lifetimes, eval-steps, floating-point, local-shadowing,
+  Critical path of the default `make test`, 2026-11-08. Run A: master `04aa6c7d` plus the step-4 test-driver
+  moves, JOBS=30, 308 commands, 326 s wall and 2,050 CPU-seconds (the sum of `results.tsv`'s CPU column)
+  at a load average of 30 to 50 from other work, so a command's wall time includes waiting for cores. Its
+  longest commands (wall s, CPU-s in parentheses): test-bignum-secret 237 (54), test-ct 218 (43),
+  test-json-ascii-spans 189 (114), test-uint256 165 (29), test-compiler-memory-peak 136 (25),
+  test-reproducible-elsewhere 133 (82), test-crypto-pure 121 (54). The JOBS=8 figures above (277 s, 1,648
+  CPU-seconds, 220 s as 1,750 over 8 CPUs) are the earlier chunked run, a different load. Timed alone in a
+  slot (`taskset -c 0-7`, the installed v0.2.50 compiler, cold cache): test-bignum-secret 39.0 s wall for 38.9
+  CPU-seconds, a short serial chain, so its 237 s in run A was waiting for cores; running its four independent
+  sections side by side took 26.7 s (-31%) for 53.8 CPU-seconds (+38%), which only adds load to a CPU-bound
+  suite, so it was not kept. test-self-hosted alone: 63 s wall and 216 CPU-seconds for 118 tests at 8 jobs;
+  native-bootstrap-sema, the test with the longest wall time in it (61 s), is one `ablac build` of the sema
+  module that takes 19.8 s wall (45.4 CPU-s) release, 24.9 s (25.3) `--o1` and 4.5 s (6.1) `--fast` when it
+  has the machine to itself, and its program runs in 0.0 s: the 61 s was it sharing 8 CPUs with 117 other
+  builds, and 216 CPU-seconds over 8 jobs is 27 s however the tests are cut. Splitting the driver cannot
+  shorten it, and building that one test `--fast` would save 39 CPU-seconds (1.9% of run A) while taking the
+  release pipeline off the largest program the driver builds: not changed. The seven suite scripts that wait
+  for it (`serial_reason` in `tools/run-tests.sh`: they share build directories with its `suite-*` entries)
+  took 45 s of wall time and 10 CPU-seconds in run A, the longest 20 s (test-borrow-lifetimes), and they are not
+  duplicates to delete: five of them (borrow-lifetimes, eval-steps, floating-point, local-shadowing,
   nominal-scalars) are in `tools/test-fast-builds.txt`, so the recipe builds them at `--fast` and the driver
-  entry builds them for release. Not pursued: the way to a shorter run is less CPU, as above.
+  entry builds them for release. On a quiet 32-thread machine the tail is then about 27 s of driver plus 20 s
+  of those scripts, against a whole-suite CPU bound of 2,050 / 23.5 (the CPU-seconds a second this machine does
+  with every core, above) = 87 s: the suite is CPU-bound there too, so the way to a shorter run is less CPU,
+  as above. Not pursued.
   By CPU (2026-11-08, `tools/run-tests.sh` now records each command's user and system seconds
   as the fifth column of `results.tsv`; cold cache, JOBS=8, four chunks, 332 commands, 1,754
   CPU-seconds): test-self-hosted 95, test-reproducible-elsewhere 94, test-ct-bridge 91,
