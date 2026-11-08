@@ -1016,7 +1016,7 @@ trusted fun __ablaRuntimeTVarCreate(value: any): any {
 
 // The clock a TVar's version comes from: one of sixteen, by its address.
 @inline
-trusted fun __ablaRuntimeStmPartition(tvar: int): int = (tvar >> 4) & 15
+trusted fun __ablaRuntimeStmPartition(tvar: int): int = (tvar >> 10) & 15
 
 // A TVar's bit in a descriptor's written filter.
 @inline
@@ -1127,15 +1127,77 @@ trusted fun __ablaRuntimeStmAbandon(descriptor: int, retrying: bool): never {
     __ablaRuntimePlatformAbandon(descriptor + 120)
 }
 
+// A partition's clock.
+@inline
+trusted fun __ablaRuntimeStmClock(partition: int): int =
+    ablaRuntimeLoadI64(__ablaRuntimeStmShared + 176) + partition * 64
+
+// A logged transaction's mode, at +728: 0 before its first access, the region (address >> 10)
+// of its first access while every access so far is in that region (one clock, partition
+// region & 15, whose value is the snapshot at +16: the protocol of a single global clock),
+// -1 once it has touched a second region (a snapshot for each clock, at +336, the mask of
+// those taken at +736, in the order taken at +592 with their count at +720). An access
+// outside the mode's region comes here, and returns the mode that applies after it.
+@noinline
+trusted fun __ablaRuntimeStmAccess(descriptor: int, region: int, mode: int): int {
+    if (mode == 0) {
+        ablaRuntimeStoreI64(
+            descriptor + 16, ablaRuntimeAtomicLoadI64(__ablaRuntimeStmClock(region & 15))
+        )
+        ablaRuntimeStoreI64(descriptor + 728, region)
+        return region
+    }
+    if (mode > 0) {
+        // Everything so far is in the mode's region, as if its clock had been sampled first.
+        val first = mode & 15
+        ablaRuntimeStoreI64(descriptor + 336 + first * 8, ablaRuntimeLoadI64(descriptor + 16))
+        ablaRuntimeStoreI64(descriptor + 592, first)
+        ablaRuntimeStoreI64(descriptor + 720, 1)
+        ablaRuntimeStoreI64(descriptor + 736, 1 << first)
+        ablaRuntimeStoreI64(descriptor + 728, -1)
+    }
+    return -1
+}
+
 @noinline
 trusted fun __ablaRuntimeStmReadLogged(descriptor: int, tvarValue: any, tvar: int): any {
     val written = __ablaRuntimeStmWritten(descriptor, tvar)
     if (written >= 0) {
         return __ablaRuntimeValueAt(ablaRuntimeLoadI64(descriptor + 96) + written * 56 + 24)
     }
-    val partition = __ablaRuntimeStmPartition(tvar)
-    val clock = ablaRuntimeLoadI64(__ablaRuntimeStmShared + 176) + partition * 64
-    val sampled = ablaRuntimeLoadI64(descriptor + 16)
+    val region = tvar >> 10
+    var mode = ablaRuntimeLoadI64(descriptor + 728)
+    if (mode != region) mode = __ablaRuntimeStmAccess(descriptor, region, mode)
+    if (mode > 0) {
+        // One clock so far: this one's snapshot is at +16.
+        var tries = 0
+        while (tries < 256) {
+            val word = ablaRuntimeAtomicLoadI64(tvar)
+            if ((word & 1) == 0) {
+                val value = __ablaRuntimeValueAt(tvar + 16)
+                ablaRuntimeFenceAcquire()
+                if (ablaRuntimeLoadI64(tvar) == word) {
+                    val version = word >> 1
+                    if (version <= ablaRuntimeLoadI64(descriptor + 16)) {
+                        __ablaRuntimeStmLogRead(descriptor, tvarValue, version)
+                        return value
+                    }
+                    // Newer than the snapshot: move the snapshot up, then read again.
+                    val now = ablaRuntimeAtomicLoadI64(__ablaRuntimeStmClock(region & 15))
+                    if (!__ablaRuntimeStmValidate(descriptor, false)) {
+                        __ablaRuntimeStmAbandon(descriptor, false)
+                    }
+                    ablaRuntimeStoreI64(descriptor + 16, now)
+                }
+            }
+            tries = tries + 1
+        }
+        __ablaRuntimeStmAbandon(descriptor, false)
+    }
+    // Partitioned: a snapshot for each clock, taken at its first read.
+    val partition = region & 15
+    val clock = __ablaRuntimeStmClock(partition)
+    val sampled = ablaRuntimeLoadI64(descriptor + 736)
     if (((sampled >> partition) & 1) == 0) {
         // The partition's first read: its snapshot is its clock now, and the reads
         // so far must still hold at this point.
@@ -1143,7 +1205,7 @@ trusted fun __ablaRuntimeStmReadLogged(descriptor: int, tvarValue: any, tvar: in
         val listed = ablaRuntimeLoadI64(descriptor + 720)
         ablaRuntimeStoreI64(descriptor + 592 + listed * 8, partition)
         ablaRuntimeStoreI64(descriptor + 720, listed + 1)
-        ablaRuntimeStoreI64(descriptor + 16, sampled | (1 << partition))
+        ablaRuntimeStoreI64(descriptor + 736, sampled | (1 << partition))
         if (ablaRuntimeLoadI64(descriptor + 48) != 0 &&
             !__ablaRuntimeStmValidate(descriptor, false)) {
             __ablaRuntimeStmAbandon(descriptor, false)
@@ -1220,6 +1282,9 @@ trusted fun __ablaRuntimeStmWriteLogged(descriptor: int, tvarValue: any, tvar: i
             )
         } else __ablaRuntimeCopyValue(value, tvar + 16)
     } else if (logged) {
+        val region = tvar >> 10
+        val mode = ablaRuntimeLoadI64(descriptor + 728)
+        if (mode != region) __ablaRuntimeStmAccess(descriptor, region, mode)
         __ablaRuntimeStmLogWrite(descriptor, tvarValue, value)
     } else {
         __ablaRuntimeStmLogWrite(descriptor, tvarValue, __ablaRuntimeValueAt(tvar + 16))
@@ -1261,8 +1326,7 @@ trusted fun __ablaRuntimeStmBegin(descriptor: int): void {
     ablaRuntimeStoreI64(descriptor + 280, 0)
     if (logged) {
         __ablaRuntimeStmState()
-        ablaRuntimeStoreI64(descriptor + 16, 0)
-        ablaRuntimeStoreI64(descriptor + 720, 0)
+        ablaRuntimeStoreI64(descriptor + 728, 0)
     }
     __ablaRuntimeRootsPush(descriptor + 176, ablaRuntimeLoadI64(descriptor + 72), 0)
     __ablaRuntimeRootsPush(descriptor + 200, ablaRuntimeLoadI64(descriptor + 104), 0)
@@ -1329,39 +1393,54 @@ trusted fun __ablaRuntimeStmCommit(descriptor: int): bool {
     // may share it, and a contended clock sees one write instead of a queue of them).
     // The reads need checking again unless this commit moved the clock up from the
     // snapshot itself.
-    val clocks = ablaRuntimeLoadI64(shared + 176)
-    val sampled = ablaRuntimeLoadI64(descriptor + 16)
-    var done = 0
+    val mode = ablaRuntimeLoadI64(descriptor + 728)
+    var version = 0
     var fresh = true
-    var clockIndex = 0
-    while (clockIndex < writes) {
-        val partition = __ablaRuntimeStmPartition(ablaRuntimeLoadI64(log + clockIndex * 56 + 8))
-        if (((done >> partition) & 1) == 0) {
-            done = done | (1 << partition)
-            val clock = clocks + partition * 64
-            val seen = ablaRuntimeAtomicLoadI64(clock)
-            val observed = ablaRuntimeAtomicCompareExchangeI64(clock, seen, seen + 1)
-            ablaRuntimeStoreI64(descriptor + 464 + partition * 8,
-                if (observed == seen) seen + 1 else observed)
-            if (observed != seen ||
-                (((sampled >> partition) & 1) != 0 &&
-                    seen != ablaRuntimeLoadI64(descriptor + 336 + partition * 8))) {
+    if (mode > 0) {
+        // One clock: the new version is its value moved up by one, or the one the commit
+        // that moved it first took; the reads are checked again unless this commit moved
+        // the clock up from the snapshot itself.
+        val clock = __ablaRuntimeStmClock(mode & 15)
+        val seen = ablaRuntimeAtomicLoadI64(clock)
+        val observed = ablaRuntimeAtomicCompareExchangeI64(clock, seen, seen + 1)
+        version = if (observed == seen) seen + 1 else observed
+        fresh = observed == seen && seen == ablaRuntimeLoadI64(descriptor + 16)
+    } else {
+        val clocks = ablaRuntimeLoadI64(shared + 176)
+        val sampled = ablaRuntimeLoadI64(descriptor + 736)
+        var done = 0
+        var clockIndex = 0
+        while (clockIndex < writes) {
+            val partition = __ablaRuntimeStmPartition(
+                ablaRuntimeLoadI64(log + clockIndex * 56 + 8)
+            )
+            if (((done >> partition) & 1) == 0) {
+                done = done | (1 << partition)
+                val clock = clocks + partition * 64
+                val seen = ablaRuntimeAtomicLoadI64(clock)
+                val observed = ablaRuntimeAtomicCompareExchangeI64(clock, seen, seen + 1)
+                ablaRuntimeStoreI64(descriptor + 464 + partition * 8,
+                    if (observed == seen) seen + 1 else observed)
+                if (observed != seen ||
+                    (((sampled >> partition) & 1) != 0 &&
+                        seen != ablaRuntimeLoadI64(descriptor + 336 + partition * 8))) {
+                    fresh = false
+                }
+            }
+            clockIndex = clockIndex + 1
+        }
+        // A partition read but not written must not have moved either.
+        val listed = ablaRuntimeLoadI64(descriptor + 720)
+        var listIndex = 0
+        while (fresh && listIndex < listed) {
+            val partition = ablaRuntimeLoadI64(descriptor + 592 + listIndex * 8)
+            if (((done >> partition) & 1) == 0 &&
+                ablaRuntimeAtomicLoadI64(clocks + partition * 64) !=
+                    ablaRuntimeLoadI64(descriptor + 336 + partition * 8)) {
                 fresh = false
             }
+            listIndex = listIndex + 1
         }
-        clockIndex = clockIndex + 1
-    }
-    // A partition read but not written must not have moved either.
-    val listed = ablaRuntimeLoadI64(descriptor + 720)
-    var listIndex = 0
-    while (fresh && listIndex < listed) {
-        val partition = ablaRuntimeLoadI64(descriptor + 592 + listIndex * 8)
-        if (((done >> partition) & 1) == 0 &&
-            ablaRuntimeAtomicLoadI64(clocks + partition * 64) !=
-                ablaRuntimeLoadI64(descriptor + 336 + partition * 8)) {
-            fresh = false
-        }
-        listIndex = listIndex + 1
     }
     if (!fresh && !__ablaRuntimeStmValidate(descriptor, true)) {
         __ablaRuntimeStmRelease(descriptor, writes)
@@ -1381,11 +1460,19 @@ trusted fun __ablaRuntimeStmCommit(descriptor: int): bool {
         index = index + 1
     }
     index = 0
-    while (index < writes) {
-        val released = ablaRuntimeLoadI64(log + index * 56 + 8)
-        ablaRuntimeAtomicStoreI64(released,
-            ablaRuntimeLoadI64(descriptor + 464 + __ablaRuntimeStmPartition(released) * 8) << 1)
-        index = index + 1
+    if (mode > 0) {
+        val word = version << 1
+        while (index < writes) {
+            ablaRuntimeAtomicStoreI64(ablaRuntimeLoadI64(log + index * 56 + 8), word)
+            index = index + 1
+        }
+    } else {
+        while (index < writes) {
+            val released = ablaRuntimeLoadI64(log + index * 56 + 8)
+            ablaRuntimeAtomicStoreI64(released,
+                ablaRuntimeLoadI64(descriptor + 464 + __ablaRuntimeStmPartition(released) * 8) << 1)
+            index = index + 1
+        }
     }
     ablaRuntimeStoreI64(descriptor + 256, ablaRuntimeLoadI64(descriptor + 256) + 1)
     // Ordered after the releases: a thread that counted itself waiting before this
@@ -1458,7 +1545,7 @@ trusted fun __ablaRuntimeStmBackOff(descriptor: int): void {
     val window = 1 << (if (failures > 10) 10 else failures)
     var spins = (random & (window - 1)) * 16
     while (spins > 0) {
-        ablaRuntimeAtomicLoadI64(shared)
+        ablaRuntimeAtomicLoadI64(ablaRuntimeLoadI64(shared + 176))
         spins = spins - 1
     }
 }
