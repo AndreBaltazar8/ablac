@@ -115,10 +115,11 @@
   the type-tag check of every erased scalar conversion (`__ablaRuntimeRequire`, which the checker can't tell
   from payload) and divisions by a secret that aren't strength-reduced. AArch64, Wasm and Xtensa don't follow
   calls (an AArch64 jump out of a function is now refused, which the new callee control showed was missed).
-- [ ] **Secret residue is not checked by `tools/test-ct.sh`.** It checks timing-related branches,
-  addresses and divisions, not unwiped copies in GC-registered stack temporaries, ordinary
-  register spills or the GC heap. AES's discarded conditional exposed such a stack copy;
-  removing unused joins does not make general secret lifetime/wiping guarantees.
+- [ ] **Secret residue is checked for stack slots on x86-64 release only.** `--residue` fails a function that
+  returns with a secret still in a slot of its frame (hand-written control pair: one spills, one clears).
+  `tests/cases/ct/residue-known.txt` lists the 21 fixtures that do, among them AES encryption, the key
+  schedules, the GCD/inverse cores and SHA-256/HMAC-256: that is work for the code, which must clear
+  those slots. Not checked: registers, the GC heap, other targets and the `--fast` build.
 - [x] **Secret arithmetic around the crypto fixtures:** source-generated AES-128/192/256
   schedule and byte/block I/O, CRT subtract/correction/recombination and wide-reduction glue,
   `bnFromBytes`, `bnToBytes` and `bnResidueSquare` have assembly fixtures and individual

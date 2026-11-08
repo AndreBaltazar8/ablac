@@ -2,7 +2,7 @@
 """Reads a target's disassembly of named functions and says whether a secret reaches a
 conditional branch, a memory address or a division.
 
-    check-asm.py [--follow-calls] <arch> <object> <spec> ...      spec:  function:secret-params
+    check-asm.py [--follow-calls] [--residue] <arch> <object> <spec> ...      spec:  function:secret-params
 
 `arch` is x86_64, aarch64, wasm or xtensa. `secret-params` is a comma list of parameter
 positions (0-based) holding secrets, or `*` for all; `@n` marks parameter n as a public
@@ -119,7 +119,7 @@ X86_READWRITE = re.compile(r"^(add|adc|sub|sbb|and|or|xor|imul|shl|sal|shr|sar|r
 # With --follow-calls, a call to a function defined in the same object (what a --fast build makes of
 # every Abla call) is checked as a function of its own, on the arguments the caller passes, instead of
 # failing. A call to anything not defined there, or a recursion, still fails.
-FOLLOW = {"path": None, "stack": [], "done": {}}
+FOLLOW = {"path": None, "stack": [], "done": {}, "residue": False}
 
 
 def follow_call(name, secret, pointers, text):
@@ -413,6 +413,13 @@ def check_x86(lines, secret, pointers):
             out |= states[i]
     for state in returned:
         out |= state
+    if FOLLOW["residue"] and not FOLLOW["stack"]:
+        # What a function leaves behind when it returns: a secret in a stack slot of its frame is a
+        # copy in memory that nothing wipes. Registers are not counted: scratch registers hold
+        # secrets all the time and are overwritten, not left in memory.
+        residue = sorted(item for item in out if item.startswith("slot:"))
+        if residue:
+            raise Violation(f"secret residue at return: {', '.join(residue[:4])}")
     return frozenset(out)
 
 
@@ -899,6 +906,11 @@ def main():
     if "--follow-calls" in arguments:
         arguments.remove("--follow-calls")
         FOLLOW["path"] = arguments[1]
+    if "--residue" in arguments:
+        # Checks x86-64 only. A callee followed from a checked function isn't checked for residue
+        # itself: its caller's frame and registers are what remain.
+        arguments.remove("--residue")
+        FOLLOW["residue"] = True
     arch, path, *specs = arguments
     failed = 0
     for spec in specs:

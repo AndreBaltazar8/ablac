@@ -110,6 +110,32 @@ read_target() { # arch, object, label (default the arch), then flags for the che
     echo "ok   $label: ${#target_fixtures[@]} fixtures clean in the assembly, ${#leaks[@]} leaks caught"
 }
 
+# Secret residue: a secret a function leaves in a stack slot of its frame is a copy in memory that nothing
+# wipes. Registers aren't counted. The control pair is hand-written assembly: one function spills and
+# returns, the other clears its slot. Then the release fixtures are read, and tests/cases/ct/residue-known.txt
+# lists the ones that leave a slot (work for the code, not the checker). Any other finding fails, and so does
+# a listed fixture that comes out clean (shrink the list).
+residue_read() { # object
+    local object=$1
+    llvm-mc -triple x86_64-linux-gnu -filetype=obj "$cases/residue-x86.s" -o "$out/residue-x86.o"
+    if $check --residue x86_64 "$out/residue-x86.o" residue_left:0 > "$out/residue-left.log" 2>&1; then
+        echo "ct: missed a secret left in a stack slot" >&2; exit 1
+    fi
+    grep -q 'secret residue' "$out/residue-left.log" || { cat "$out/residue-left.log" >&2; exit 1; }
+    $check --residue x86_64 "$out/residue-x86.o" residue_wiped:0 > "$out/residue-wiped.log" 2>&1 || {
+        cat "$out/residue-wiped.log" >&2; echo "ct: a wiped slot was reported" >&2; exit 1
+    }
+    $check --residue x86_64 "$object" "${fixtures[@]}" "${host_fixtures[@]}" > "$out/x86_64-residue.log" 2>&1 || true
+    if grep '^LEAK' "$out/x86_64-residue.log" | grep -v 'secret residue'; then
+        echo "ct: a finding other than residue" >&2; exit 1
+    fi
+    grep '^LEAK' "$out/x86_64-residue.log" | awk '{sub(":", "", $3); print $3}' | sort > "$out/x86_64-residue.found"
+    if ! diff -u <(sort "$cases/residue-known.txt") "$out/x86_64-residue.found" > "$out/x86_64-residue.diff"; then
+        cat "$out/x86_64-residue.diff" >&2; echo "ct: the residue findings changed (tests/cases/ct/residue-known.txt)" >&2; exit 1
+    fi
+    echo "ok   x86_64 residue: $(grep -c '^ok' "$out/x86_64-residue.log") fixtures leave no secret in a slot, $(wc -l < "$out/x86_64-residue.found") listed in residue-known.txt, the control pair told apart"
+}
+
 # A --fast build doesn't optimise, so it keeps what release builds remove: the type-tag check of every
 # erased scalar conversion branches on a value copied from a secret's box, and a division by a secret
 # stays a division. The checker can't tell those from payload, and they are not what the fast fixtures
@@ -161,6 +187,7 @@ read_target x86_64 "$out/x86.o"
 # defined in the same object, with the argument secrecy the caller passes.
 "$compiler" build "$cases/object-x86.ab" -o "$out/x86-fast.o" --emit object --no-cache --fast
 fast_read x86_64 "$out/x86-fast.o"
+residue_read "$out/x86.o"
 
 # --- AArch64 --------------------------------------------------------------------------
 "$compiler" build "$cases/aarch64-build.ab" -o "$out/aarch64-driver" --no-cache
