@@ -3,7 +3,7 @@
 ordinary function and as a `compile fun`, and the strings the two return must match
 (the second is evaluated under `#`). Native operands go through non-inlined identities
 so the program's own lowering runs instead of the builder's constant folding.
-Regenerate with: python3 tools/gen-lang-parity.py (then commit the output).
+Regenerate with: python3 tools/gen-lang-parity.py [compiler] (then commit the output).
 
 A body is a list of lines using `out.append(...)`; `o("string", '"x"')` marks an operand
 that is opaque on the native side only; `@` in a call becomes N or C."""
@@ -652,6 +652,20 @@ def control():
     write("control", declarations, cases)
 
 
+def format_outputs():
+    """The files are written in the formatter's own layout (house rule: fmt --check).
+    Needs a compiler: argv[1], else build/ablac.bin or build/ablac."""
+    import subprocess
+    import sys
+    candidates = sys.argv[1:2] + [os.path.join(ROOT, "build", "ablac.bin"),
+                                  os.path.join(ROOT, "build", "ablac")]
+    compiler = next((c for c in candidates if os.path.exists(c)), None)
+    if compiler is None:
+        raise SystemExit("gen-lang-parity: no compiler to format with (pass its path)")
+    files = sorted(os.path.join(OUT, f) for f in os.listdir(OUT) if f.endswith(".ab"))
+    subprocess.run([compiler, "fmt", *files], check=True)
+
+
 def main():
     strings()
     arrays()
@@ -664,6 +678,7 @@ def main():
     generics()
     anys()
     control()
+    format_outputs()
 
 
 main()
