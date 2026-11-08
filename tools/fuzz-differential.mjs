@@ -8,5 +8,5 @@ const abla_host = {
   clock_ns: () => 0n, random: (d, l) => l };
 const { exports } = new WebAssembly.Instance(module, { abla_host });
 memory = exports.memory;
-try { code = Number(exports.run()); } catch (e) { if (e instanceof Exit) code = e.code; else { code = 101; out.push(Buffer.from("TRAP " + e.message)); } }
+try { code = Number(exports.run()); } catch (e) { if (e instanceof Exit) code = e.code; else { code = 101; process.stderr.write("TRAP " + e.message + "\n"); } }
 process.stdout.write(Buffer.concat(out)); process.exitCode = code;
