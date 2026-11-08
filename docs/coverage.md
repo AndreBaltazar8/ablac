@@ -9,6 +9,9 @@ Quality: **good** = explained, with runnable examples checked by
 `tools/test-doc-examples.sh`; **reference** = precise rules with only a
 little example code; **mentioned** = named, not explained; **missing**.
 
+Names starting `shell-` are entries of `tests/abla-tests.json` (run by the Abla test driver); the others are
+`tools/test-*.sh` scripts.
+
 Test scripts marked † run in no suite: neither the Makefile `test` target nor
 `tests/abla-tests.json` runs them.
 
@@ -17,15 +20,15 @@ Test scripts marked † run in no suite: neither the Makefile `test` target nor
 | Feature | Implemented in | Documented in | Quality | Tested by |
 |---|---|---|---|---|
 | Programs, `main`, exit status, `exit`, `panic` | `backend/llvm/exports.ab`, `stdlib/abla/process/exit` | [language.md#programs](language.md#programs) | good | test-main-void, test-process-exit |
-| Comments, identifiers, keywords, contextual keywords | `lexer.ab`, `parser.ab` (`atContextualKeyword`) | [language.md#lexical-structure](language.md#lexical-structure) | good | test-contextual-keywords |
+| Comments, identifiers, keywords, contextual keywords | `lexer.ab`, `parser.ab` (`atContextualKeyword`) | [language.md#lexical-structure](language.md#lexical-structure) | good | shell-contextual-keywords |
 | Line continuation (`+`, `-`, `.` at line start) | `parser.ab` `continueAdditiveExpression`, `continueMemberChain` | [language.md#lexical-structure](language.md#lexical-structure) | good | test-line-continuation |
-| Literals, string escapes, templates, multi-line strings | `lexer.ab`, `parser.ab` `bootstrapDecodeString` | [language.md#lexical-structure](language.md#lexical-structure) | good | test-static-strings, test-string-escapes, test-float-interpolation, test-interpolate-fixed-width, test-string-plus |
+| Literals, string escapes, templates, multi-line strings | `lexer.ab`, `parser.ab` `bootstrapDecodeString` | [language.md#lexical-structure](language.md#lexical-structure) | good | test-static-strings, test-string-escapes, test-float-interpolation, shell-interpolate-fixed-width, test-string-plus |
 | `val`/`var`, deferred `var` initialization, shadowing | `parser.ab` `parseLocal`, `sema.ab` | [language.md#values-and-variables](language.md#values-and-variables) | good | definite-assignment (native), test-local-shadowing, test-module-shadowing |
 | Integer widths, conversions, wrapping, shifts | `sema.ab` primitive casts, `ir.ab` `scalar.cast` | [language.md#integers](language.md#integers) | good | test-native-width-integers, test-fixed-width-boxed-arithmetic, test-bitwise-crypto |
 | `f64`/`f32` | `lexer.ab`, `stdlib/abla/float` | [language.md#floating-point](language.md#floating-point), [stdlib/numbers.md](stdlib/numbers.md) | good | test-floating-point, test-compile-time-floats |
-| Strings | `sema.ab` `string.*` | [language.md#strings](language.md#strings), [stdlib/text.md](stdlib/text.md) | good | test-string-helpers, test-string-retention |
+| Strings | `sema.ab` `string.*` | [language.md#strings](language.md#strings), [stdlib/text.md](stdlib/text.md) | good | test-string-helpers, shell-string-retention |
 | Arrays (`append`, `truncate`, `clear`, `filledArray`) | `sema.ab`, `ir.ab` | [language.md#arrays](language.md#arrays) | good | test-array-filled, test-array-truncate, test-arrays-dense, test-collection-modes |
-| `Map<K, V>` | `sema.ab` `map.*`, `ir.ab` | [language.md#maps](language.md#maps) | good | test-map |
+| `Map<K, V>` | `sema.ab` `map.*`, `ir.ab` | [language.md#maps](language.md#maps) | good | shell-map-basic, shell-map-collect, shell-map-compile-time, shell-map-differential |
 | Nullable types and narrowing | `sema.ab` refinement | [language.md#nullable-types](language.md#nullable-types) | good | test-narrowing-and-branches, test-nullable-refinement |
 | Nominal `type X = int` | `parser.ab`, `sema.ab` | [language.md#nominal-types](language.md#nominal-types) | good | test-nominal-scalars |
 | `void`, `never` | `sema.ab` divergence, `ir.ab` unreachable | [language.md#void-and-never](language.md#void-and-never) | good | test-exhaustive-when |
@@ -48,7 +51,7 @@ Test scripts marked † run in no suite: neither the Makefile `test` target nor
 | `trusted`, `extern` kinds, `noescape` | `parser.ab`, `sema.ab` | [language.md#trusted-native-implementations](language.md#trusted-native-implementations) | reference | test-unsafe-boundary, test-native-libraries |
 | Native ABI, exports | backend | [language.md#native-declarations](language.md#native-declarations), [compiler-api.md](compiler-api.md) | reference | test-value-abi, test-native-cstring-lifetime |
 | Inline assembly | `sema.ab`, `ir.ab` | [llvm-backend.md](llvm-backend.md), [subparsers.md](subparsers.md) | reference | test-internal-function, test-xtensa-interrupt-handler |
-| Memory management, collection modes | runtime, `stdlib/abla/memory` | [language.md#memory-management](language.md#memory-management), [standard-library.md](standard-library.md) | reference | test-runtime-memory, test-memory-checkpoint, test-memory-drop-root |
+| Memory management, collection modes | runtime, `stdlib/abla/memory` | [language.md#memory-management](language.md#memory-management), [standard-library.md](standard-library.md) | reference | test-runtime-memory, shell-memory-checkpoint, shell-memory-drop-root |
 
 ## Ownership
 
