@@ -1139,13 +1139,100 @@ trusted fun bootstrapEmitHeldNativeObject(
     status
 }
 
-// Whether the linked WebAssembly module at `path` imports abla_host's write:
-// its import entry is the length-prefixed module name and field name.
-fun bootstrapWasmImportsHostWrite(path: string): bool =
-    bootstrapTextContains(
-        Path(path).readText(),
-        "${byteEncode(9)}abla_host${byteEncode(5)}write"
-    )
+// A reader over a WebAssembly binary. Past the end (a truncated or malformed
+// module) `at` is one beyond the size and every read gives 0.
+class BootstrapWasmReader(val data: string, var at: int)
+
+fun BootstrapWasmReader.ended(): bool = this.at >= this.data.size
+
+fun BootstrapWasmReader.fail(): void {
+    this.at = this.data.size + 1
+}
+
+fun BootstrapWasmReader.byte(): int {
+    if (this.ended()) {
+        this.fail()
+        return 0
+    }
+    val value = this.data[this.at]
+    this.at = this.at + 1
+    value
+}
+
+fun BootstrapWasmReader.unsigned(): int {
+    var result = 0
+    var shift = 0
+    var more = true
+    while (more) {
+        val byte = this.byte()
+        result = result | ((byte & 127) << shift)
+        shift = shift + 7
+        more = (byte & 128) != 0 && shift < 35 && this.at <= this.data.size
+    }
+    result
+}
+
+fun BootstrapWasmReader.name(): string {
+    val length = this.unsigned()
+    val begin = this.at
+    if (length < 0 || begin + length > this.data.size) {
+        this.fail()
+        return ""
+    }
+    this.at = begin + length
+    this.data.slice(begin, begin + length)
+}
+
+// Skips a limits entry: the flags, the minimum and, with bit 0, the maximum.
+fun BootstrapWasmReader.limits(): void {
+    val flags = this.unsigned()
+    this.unsigned()
+    if ((flags & 1) != 0) this.unsigned()
+}
+
+// Whether the linked WebAssembly module at `path` imports the function
+// `write` from `abla_host`: its import section (id 2) is walked entry by
+// entry, so bytes of other sections that spell the same names do not count.
+fun bootstrapWasmImportsHostWrite(path: string): bool {
+    val reader = BootstrapWasmReader(Path(path).readText(), 8)
+    val data = reader.data
+    var found = false
+    if (data.size < 8 || data[0] != 0 || data[1] != 97 || data[2] != 115 || data[3] != 109) {
+        return false
+    }
+    while (!found && !reader.ended()) {
+        val id = reader.byte()
+        val size = reader.unsigned()
+        val end = reader.at + size
+        if (id == 2) {
+            var count = reader.unsigned()
+            while (!found && count > 0 && reader.at <= data.size) {
+                count = count - 1
+                val module = reader.name()
+                val field = reader.name()
+                val kind = reader.byte()
+                // function: type index; table: reference type, limits;
+                // memory: limits; global: value type, mutability; tag: attribute, type
+                if (kind == 0) {
+                    reader.unsigned()
+                    found = module == "abla_host" && field == "write"
+                } else if (kind == 1) {
+                    reader.byte()
+                    reader.limits()
+                } else if (kind == 2) reader.limits()
+                else if (kind == 3) {
+                    reader.byte()
+                    reader.byte()
+                } else if (kind == 4) {
+                    reader.byte()
+                    reader.unsigned()
+                } else reader.fail()
+            }
+        }
+        if (reader.at <= data.size) reader.at = end
+    }
+    found
+}
 
 fun bootstrapDisposeHeldModule(): void {
     if (!pointerIsNull(bootstrapLlvmHeldModule)) LLVMDisposeModule(bootstrapLlvmHeldModule)

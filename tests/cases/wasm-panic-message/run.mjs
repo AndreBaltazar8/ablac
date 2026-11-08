@@ -8,6 +8,7 @@ const module = new WebAssembly.Module(
 const imports = WebAssembly.Module.imports(module).map((i) => `${i.module}.${i.name}`).sort();
 const expected = {
     hostless: [],
+    "data-marker": [],
     "empty-write": [],
     "folded-write": [],
     clock: ["abla_host.clock_ns"],
@@ -17,6 +18,11 @@ const expected = {
 }[name];
 if (JSON.stringify(imports) !== JSON.stringify(expected)) {
     throw new Error(`${name} ${mode}: imports ${imports} (expected ${expected})`);
+}
+if (name === "data-marker") {
+    const bytes = readFileSync(`${directory}/wasm-panic-message-${name}-${mode}.wasm`);
+    const entry = Buffer.from("\x09abla_host\x05write", "latin1");
+    if (bytes.indexOf(entry) < 0) throw new Error(`${name} ${mode}: the marker bytes are not in the module`);
 }
 let written = "";
 const host = {
