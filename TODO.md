@@ -696,6 +696,15 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   says whether its allocation is large, so the build reads no header (about 2% less wall
   time for a compiler emitting a large program; the sweep, `free` and madvise are what
   is left).
+  Measured on Linux (2026-11-08, master `ea19ccb1`, a stage2 compiler with the build marked `@noinline`
+  only to see it, `perf record -e instructions:u -c 20000000 --inherit` of `build --fast --no-cache
+  src/orc_main.ab`, 14.6 s): `__ablaRuntimeHostCollectionPagesBuild` is 1.10% of the self-build's instructions;
+  the rest of the collector is `HostMarkPointer` 2.6%, `PlatformMemoryCollect` (the sweep) 2.2%,
+  `HostCollectionNearest` 0.7% and `PlatformFree` 0.5%, with libc's `free` (3.9% in all, not only the sweep's)
+  below them. Keeping the directory across collections could win at most that 1.1%, under the 3% bar for the
+  change and its risk of a directory out of step with the heap, so nothing changed. The 7% on the game
+  client's front end is a much larger heap (up to 7.8 M registry slots per collection); the compiler's own
+  build does not collect enough for it to matter.
 - [ ] **Name lookups in lowering.** Over a game server's `--emit-llvm` the method index's
   `find` was 200 of 3,552 samples, the declaration index's 148 and the name hashes 98 and
   76. Done: the method index hashes owner and name in place instead of a key string made
