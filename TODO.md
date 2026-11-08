@@ -41,12 +41,6 @@
   billion), and NovaKind's tool 2,674,576 to 2,824,680 (31.794 to 32.779
   billion). Revisit only with LLVM-correct relocation and section rules.
 
-- [ ] Equality and hashing through `any` ignore the auxiliary word, so a
-  boxed float and an integer with identical payload bits compare equal and
-  hash alike through `any`. Interpolation now tells them apart (the erased
-  float formatter, 2026-11-07); whether `==` and hashing should too is a
-  language decision.
-
 - [ ] **Xtensa `llc` aborts on frames of 128 to 255 bytes that take a stack address.** `LLVM ERROR: Error
   while trying to spill A6 from class AR: Cannot scavenge register without an emergency spill slot!`, seen
   2026-11-01 on `esp32RecoveredZN3nvs7Storage9writeItem...` from abla-embedded's `tools/build-example

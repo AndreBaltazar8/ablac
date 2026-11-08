@@ -6,7 +6,7 @@ compiler=${1:-$root/build/ablac}
 cd "$root"
 out="$root/build/any-equality"
 mkdir -p "$out"
-for case in functions; do
+for case in functions floats; do
     "$compiler" build "$root/tests/cases/any-equality/$case.ab" -o "$out/$case-fast" --fast --no-cache
     "$out/$case-fast"
     "$compiler" build "$root/tests/cases/any-equality/$case.ab" -o "$out/$case-release" --no-cache

@@ -192,9 +192,11 @@ When an unsupported value has already been erased to `any`, native interpolation
 panics with its runtime tag; WebAssembly traps without a message. An `f32` or
 `f64` erased to `any` keeps its float kind and interpolates as it would typed
 (`1.5`, `NaN`, `-Infinity`). A program that erases floats and interpolates an
-`any` gets the float formatter; others build without it. Equality and hashing
-through `any` still compare only the payload, so a boxed float and an integer
-with the same bits are equal there.
+`any` gets the float formatter; others build without it. Equality through
+`any` compares a value's kind as well as its bits: a boxed float never equals an
+integer, an `f32` never equals an `f64`, and two function values are equal only
+when they call the same function. Floats compare by bits there, so a `NaN`
+equals the same `NaN` and `0.0` does not equal `-0.0`.
 
 ### Raw text blocks
 
