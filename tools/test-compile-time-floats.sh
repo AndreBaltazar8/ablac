@@ -43,4 +43,12 @@ set +e
 status=$?
 set -e
 [[ $status -eq 42 ]] || exit 1
+# f32(...) and f32 0/0 evaluate as they run: the same bits, no error.
+"$compiler" build "$project_root/tests/cases/modules/compile-time-f32-parity.ab" \
+    -o "$output_directory/f32-parity" --fast --no-cache
+set +e
+"$output_directory/f32-parity"
+status=$?
+set -e
+[[ $status -eq 42 ]] || exit 1
 echo "compile-time floats: bit-identical to run time"
