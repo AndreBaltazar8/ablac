@@ -1,0 +1,592 @@
+#!/usr/bin/env python3
+"""Differential fuzzer: random well-typed Abla programs, run four ways.
+
+Each generated program is a list of independent checks (a function and a call
+that prints its result). The same checks run as
+
+  fast     native, `build --fast`
+  release  native, default optimization
+  ct       every check evaluated by the compile-time evaluator (`#`), native
+           --fast for the rest (ABLA_COMPILE_EVAL=interp)
+  wasm     hostless WebAssembly, release module and development module (node)
+
+and output plus exit status must agree. A disagreement is minimised to one check
+with the fewest statements that still disagrees and kept under
+tests/cases/fuzz-differential-<seed>-<check>/ (program.ab and expected outputs).
+
+  tools/fuzz-differential --seeds 1-3 [--checks 24] [--compiler build/ablac]
+  tools/fuzz-differential --seed 7 --keep     # one seed, keep its directory
+  tools/fuzz-differential --program x.ab      # run one existing program, all ways
+Exit status 0 when every mode agreed.
+"""
+import argparse
+import concurrent.futures
+import os
+import random
+import shutil
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+WORK = os.path.join("build", "fuzz-differential")
+
+INTS = ["i8", "i16", "i32", "int", "u8", "u16", "u32", "u64"]
+SIGNED = {"i8", "i16", "i32", "int"}
+EDGES = [0, 1, 2, 3, 7, 8, 15, 16, 31, 32, 63, 64, 100, 127, 128, 255, 256, 32767,
+         32768, 65535, 65536, 2147483647, 2147483648, 4294967295, 4294967296,
+         9223372036854775807]
+FLOAT_EDGES = ["0.0", "1.0", "0.5", "2.5", "-1.5", "3.0e10", "1.0e-5", "123456.789",
+               "1.0e300", "4.9e-324", "0.1", "-0.0"]
+STRINGS = ["", "a", "ab", "hello", "x y", "0123456789", "é", "line"]
+
+
+class Gen:
+    def __init__(self, seed):
+        self.r = random.Random(seed)
+        self.depth_limit = 4
+
+    # ---- literals
+    def int_lit(self, ty):
+        r = self.r
+        pick = r.random()
+        if pick < 0.5:
+            v = r.choice(EDGES)
+        elif pick < 0.8:
+            v = r.randint(0, 300)
+        else:
+            v = r.getrandbits(r.choice([8, 16, 32, 63]))
+        if r.random() < 0.35:
+            v = -v
+        return self.int_const(v, ty)
+
+    def int_const(self, v, ty):
+        text = "(-9223372036854775807 - 1)" if v == -9223372036854775808 else (
+            f"({v})" if v < 0 else str(v))
+        if v < -9223372036854775807:
+            text = "(-9223372036854775807 - 1)"
+        return text if ty == "int" else f"{ty}({text})"
+
+    def float_lit(self):
+        v = self.r.choice(FLOAT_EDGES)
+        return f"({v})" if v.startswith("-") else v
+
+    # ---- expressions
+    def expr(self, ty, depth, env):
+        """An expression of type `ty`; `env` is a list of (name, type)."""
+        if ty in INTS:
+            return self.int_expr(ty, depth, env)
+        if ty == "f64":
+            return self.f64_expr(depth, env)
+        if ty == "f32":
+            return self.f32_expr(depth, env)
+        if ty == "bool":
+            return self.bool_expr(depth, env)
+        if ty == "str":
+            return self.str_expr(depth, env)
+        raise ValueError(ty)
+
+    def var_of(self, ty, env):
+        names = [n for n, t in env if t == ty]
+        return self.r.choice(names) if names else None
+
+    def int_expr(self, ty, depth, env):
+        r = self.r
+        if depth <= 0:
+            v = self.var_of(ty, env)
+            return v if v and r.random() < 0.6 else self.int_lit(ty)
+        c = r.random()
+        if c < 0.30:
+            op = r.choice(["+", "-", "*", "&", "|", "^"])
+            return f"({self.int_expr(ty, depth - 1, env)} {op} {self.int_expr(ty, depth - 1, env)})"
+        if c < 0.40:
+            op = r.choice(["/", "%"])
+            d = self.int_expr(ty, depth - 1, env)
+            one = self.int_const(1, ty)
+            return f"({self.int_expr(ty, depth - 1, env)} {op} ({d} | {one}))"
+        if c < 0.50:
+            op = r.choice(["<<", ">>", ">>>"])
+            count = self.int_expr(r.choice(INTS), depth - 1, env)
+            return f"({self.int_expr(ty, depth - 1, env)} {op} {count})"
+        if c < 0.56:
+            return f"(~{self.int_expr(ty, depth - 1, env)})" if r.random() < 0.5 else (
+                f"(-{self.int_expr(ty, depth - 1, env)})" if ty in SIGNED else
+                f"(~{self.int_expr(ty, depth - 1, env)})")
+        if c < 0.68:
+            src = r.choice(INTS)
+            return f"{ty}({self.int_expr(src, depth - 1, env)})"
+        if c < 0.74:
+            return (f"(if ({self.bool_expr(depth - 1, env)}) {self.int_expr(ty, depth - 1, env)} "
+                    f"else {self.int_expr(ty, depth - 1, env)})")
+        if c < 0.78:
+            sel = self.int_expr("int", depth - 1, env)
+            arms = []
+            for k in sorted(r.sample(range(-3, 6), 3)):
+                arms.append(f"{k} -> {self.int_expr(ty, depth - 1, env)}")
+            return f"(when ({sel}) {{ {'; '.join(arms)}; else -> {self.int_expr(ty, depth - 1, env)} }})"
+        if c < 0.82:
+            return f"{ty}(f64ToInt({self.f64_expr(depth - 1, env)}))"
+        if c < 0.85:
+            return f"{ty}({self.str_expr(depth - 1, env)}.size)"
+        if c < 0.88:
+            return f"{ty}(f32ToI32({self.f32_expr(depth - 1, env)}))"
+        v = self.var_of(ty, env)
+        return v if v else self.int_lit(ty)
+
+    def f64_expr(self, depth, env):
+        r = self.r
+        if depth <= 0:
+            v = self.var_of("f64", env)
+            return v if v and r.random() < 0.6 else self.float_lit()
+        c = r.random()
+        if c < 0.45:
+            op = r.choice(["+", "-", "*", "/"])
+            return f"({self.f64_expr(depth - 1, env)} {op} {self.f64_expr(depth - 1, env)})"
+        if c < 0.55:
+            return f"(-{self.f64_expr(depth - 1, env)})"
+        if c < 0.70:
+            return f"f64FromInt({self.int_expr('int', depth - 1, env)})"
+        if c < 0.78:
+            return f"f32ToF64({self.f32_expr(depth - 1, env)})"
+        if c < 0.86:
+            return (f"(if ({self.bool_expr(depth - 1, env)}) {self.f64_expr(depth - 1, env)} "
+                    f"else {self.f64_expr(depth - 1, env)})")
+        v = self.var_of("f64", env)
+        return v if v else self.float_lit()
+
+    def f32_expr(self, depth, env):
+        r = self.r
+        if depth <= 0:
+            v = self.var_of("f32", env)
+            return v if v and r.random() < 0.6 else f"f64ToF32({self.float_lit()})"
+        c = r.random()
+        if c < 0.5:
+            op = r.choice(["+", "-", "*", "/"])
+            return f"({self.f32_expr(depth - 1, env)} {op} {self.f32_expr(depth - 1, env)})"
+        if c < 0.7:
+            return f"f64ToF32({self.f64_expr(depth - 1, env)})"
+        if c < 0.85:
+            return f"f32FromInt({self.int_expr('int', depth - 1, env)})"
+        v = self.var_of("f32", env)
+        return v if v else f"f64ToF32({self.float_lit()})"
+
+    def bool_expr(self, depth, env):
+        r = self.r
+        if depth <= 0:
+            v = self.var_of("bool", env)
+            return v if v and r.random() < 0.5 else r.choice(["true", "false"])
+        c = r.random()
+        if c < 0.35:
+            ty = r.choice(INTS)
+            op = r.choice(["<", "<=", ">", ">=", "==", "!="])
+            return f"({self.int_expr(ty, depth - 1, env)} {op} {self.int_expr(ty, depth - 1, env)})"
+        if c < 0.45:
+            op = r.choice(["<", "<=", ">", ">=", "==", "!="])
+            return f"({self.f64_expr(depth - 1, env)} {op} {self.f64_expr(depth - 1, env)})"
+        if c < 0.50:
+            op = r.choice(["<", "<=", ">", ">=", "==", "!="])
+            return f"({self.f32_expr(depth - 1, env)} {op} {self.f32_expr(depth - 1, env)})"
+        if c < 0.60:
+            op = r.choice(["&&", "||"])
+            return f"({self.bool_expr(depth - 1, env)} {op} {self.bool_expr(depth - 1, env)})"
+        if c < 0.65:
+            return f"(!{self.bool_expr(depth - 1, env)})"
+        if c < 0.75:
+            op = r.choice(["==", "!=", "<", ">="])
+            return f"({self.str_expr(depth - 1, env)} {op} {self.str_expr(depth - 1, env)})"
+        if c < 0.90:
+            return f"anyEq({self.any_arg(depth - 1, env)}, {self.any_arg(depth - 1, env)})"
+        v = self.var_of("bool", env)
+        return v if v else r.choice(["true", "false"])
+
+    def any_arg(self, depth, env):
+        ty = self.r.choice(["int", "u8", "i32", "u32", "f64", "f32", "bool", "str", "int"])
+        return self.expr(ty, depth, env)
+
+    def str_expr(self, depth, env):
+        r = self.r
+        if depth <= 0:
+            v = self.var_of("str", env)
+            return v if v and r.random() < 0.6 else '"' + r.choice(STRINGS) + '"'
+        c = r.random()
+        if c < 0.30:
+            return f"({self.str_expr(depth - 1, env)} + {self.str_expr(depth - 1, env)})"
+        if c < 0.55:
+            ty = r.choice(["int", "u8", "i32", "u32", "u64", "i16", "bool"])
+            return f"\"<${{{self.expr(ty, depth - 1, env)}}}>\""
+        if c < 0.65:
+            return f"fmtF({self.f64_expr(depth - 1, env)})"
+        if c < 0.75:
+            s = self.str_expr(depth - 1, env)
+            return f"safeSlice({s}, {self.int_expr('int', depth - 1, env)}, {self.int_expr('int', depth - 1, env)})"
+        if c < 0.85:
+            return (f"(if ({self.bool_expr(depth - 1, env)}) {self.str_expr(depth - 1, env)} "
+                    f"else {self.str_expr(depth - 1, env)})")
+        v = self.var_of("str", env)
+        return v if v else '"' + r.choice(STRINGS) + '"'
+
+    # ---- statements (each is a self-contained line or a short block)
+    def statements(self, env, depth, count, indent="    "):
+        """Lines that extend `env` in place; every line is deletable on its own
+        unless it names a variable a later line reads (the minimiser retries)."""
+        r = self.r
+        out = []
+        for _ in range(count):
+            k = r.random()
+            n = f"v{len(env)}"
+            if k < 0.30:
+                ty = r.choice(INTS + ["f64", "f32", "bool", "str"])
+                out.append(f"{indent}val {n}: {self.type_name(ty)} = {self.expr(ty, depth, env)}")
+                env.append((n, ty))
+            elif k < 0.40:
+                ty = r.choice(INTS)
+                out.append(f"{indent}var {n}: {ty} = {self.expr(ty, depth, env)}")
+                inner = [e for e in env] + [(f"i{len(env)}", "int")]
+                loop = r.choice(["for", "while"])
+                it = f"i{len(env)}"
+                op = r.choice(["+", "-", "*", "^", "|", "&"])
+                body = self.int_expr(ty, max(depth - 1, 1), inner + [(n, ty)])
+                bound = r.randint(1, 6)
+                if loop == "for":
+                    out.append(f"{indent}for ({it} in 0 until {bound}) {{")
+                    out.append(f"{indent}    {n} = {n} {op} {body}")
+                else:
+                    out.append(f"{indent}var {it} = 0")
+                    out.append(f"{indent}while ({it} < {bound}) {{")
+                    out.append(f"{indent}    {n} = {n} {op} {body}")
+                    out.append(f"{indent}    {it} += 1")
+                out.append(f"{indent}}}")
+                env.append((n, ty))
+            elif k < 0.50:
+                a = f"xs{len(env)}"
+                size = r.randint(1, 5)
+                elems = ", ".join(self.int_expr("int", max(depth - 1, 0), env) for _ in range(size))
+                out.append(f"{indent}val {a} = [{elems}]")
+                if r.random() < 0.5:
+                    out.append(f"{indent}{a}.append({self.int_expr('int', max(depth - 1, 0), env)})")
+                idx = self.int_expr("int", max(depth - 1, 0), env)
+                out.append(f"{indent}val {n}: int = {a}[(({idx}) & 2147483647) % {a}.size] + {a}.size")
+                env.append((n, "int"))
+            elif k < 0.60:
+                m = f"m{len(env)}"
+                out.append(f"{indent}val {m}: Map<int, int> = Map()")
+                for _ in range(r.randint(1, 4)):
+                    key = self.int_expr("int", 1, env)
+                    out.append(f"{indent}{m}.set({key} & 7, {self.int_expr('int', max(depth - 1, 0), env)})")
+                probe = self.int_expr("int", 1, env)
+                out.append(f"{indent}val {n}: int = (if ({m}.has({probe} & 7)) 1 else 0) + {m}.size")
+                env.append((n, "int"))
+            elif k < 0.70:
+                acc = f"acc{len(env)}"
+                out.append(f"{indent}val {acc} = Acc({self.int_expr('int', 1, env)}, {self.int_expr('int', 1, env)})")
+                out.append(f"{indent}{acc}.add({self.int_expr('int', max(depth - 1, 0), env)})")
+                out.append(f"{indent}val {n}: int = {acc}.add({self.int_expr('int', max(depth - 1, 0), env)}) + {acc}.total")
+                env.append((n, "int"))
+            elif k < 0.80:
+                cap = self.int_expr("int", 1, env)
+                g = f"g{len(env)}"
+                out.append(f"{indent}val {g} = {{ x: int -> (x {r.choice(['+', '^', '*'])} {cap}) }}")
+                out.append(f"{indent}val {n}: int = {g}({self.int_expr('int', 1, env)}) + applyTwice({g}, {self.int_expr('int', 1, env)})")
+                env.append((n, "int"))
+            elif k < 0.90:
+                cond = self.bool_expr(max(depth - 1, 1), env)
+                ty = r.choice(INTS)
+                out.append(f"{indent}var {n}: {ty} = {self.expr(ty, 1, env)}")
+                out.append(f"{indent}if ({cond}) {{")
+                out.append(f"{indent}    {n} = {self.expr(ty, max(depth - 1, 1), env)}")
+                out.append(f"{indent}}} else {{")
+                out.append(f"{indent}    {n} = {self.expr(ty, max(depth - 1, 1), env)}")
+                out.append(f"{indent}}}")
+                env.append((n, ty))
+            else:
+                out.append(f"{indent}val {n}: any = {self.any_arg(depth, env)}")
+                out.append(f"{indent}val {n}b: bool = anyEq({n}, {self.any_arg(depth, env)})")
+                env.append((f"{n}b", "bool"))
+        return out
+
+    @staticmethod
+    def type_name(ty):
+        return {"str": "string"}.get(ty, ty)
+
+    # ---- program
+    PRELUDE = """import "abla/io"
+import "abla/float"
+import "abla/float/text"
+
+class Acc(var total: int, val step: int)
+fun Acc.add(x: int): int {
+    this.total = this.total * 31 + x * this.step
+    this.total
+}
+fun fmtF(x: f64): string = if (x != x) "nan" else f64Text(x)
+fun anyEq(a: any, b: any): bool = a == b
+fun applyTwice(f: (int) -> int, x: int): int = f(f(x))
+fun safeSlice(s: string, a: int, b: int): string {
+    val lo = (a & 2147483647) % (s.size + 1)
+    val hi = lo + ((b & 2147483647) % (s.size - lo + 1))
+    s.slice(lo, hi)
+}
+"""
+
+    def check(self, index):
+        """One check: a function and its call; returns (function lines, call text, result type)."""
+        r = self.r
+        nparams = r.randint(0, 3)
+        env = []
+        params = []
+        for p in range(nparams):
+            ty = r.choice(INTS + ["f64", "bool", "str"])
+            params.append((f"p{p}", ty))
+            env.append((f"p{p}", ty))
+        result = r.choice(INTS + ["f64", "f32", "bool", "str"])
+        lines = [f"fun c{index}({', '.join(f'{n}: {self.type_name(t)}' for n, t in params)}): {self.type_name(result)} {{"]
+        lines += self.statements(env, self.depth_limit - 1, r.randint(1, 5))
+        lines.append(f"    {self.expr(result, self.depth_limit, env)}")
+        lines.append("}")
+        args = ", ".join(self.arg(t) for _, t in params)
+        return lines, f"c{index}({args})", result
+
+    def arg(self, ty):
+        if ty in INTS:
+            return self.int_lit(ty)
+        if ty == "f64":
+            return self.float_lit()
+        if ty == "bool":
+            return self.r.choice(["true", "false"])
+        return '"' + self.r.choice(STRINGS) + '"'
+
+
+def render_result(call, ty):
+    if ty == "f64":
+        return f"fmtF({call})"
+    if ty == "f32":
+        return f"fmtF(f32ToF64({call}))"
+    return call
+
+
+def assemble(prelude, checks, ct):
+    """Source text for a list of (function lines, call, type, id) checks."""
+    out = [prelude]
+    for lines, _, _, _ in checks:
+        out += lines + [""]
+    out.append('@export("run")')
+    out.append("fun run(): int {")
+    for _, call, ty, ident in checks:
+        shown = render_result(call, ty)
+        value = f"#({shown})" if ct else shown
+        out.append(f'    println("c{ident}=${{{value}}}")')
+    out.append("    0")
+    out.append("}")
+    out.append("")
+    out.append("fun main: int = run()")
+    return "\n".join(out) + "\n"
+
+
+# ---------------------------------------------------------------- running
+
+class Runner:
+    def __init__(self, compiler, timeout):
+        self.compiler = compiler if os.path.isabs(compiler) or os.sep not in compiler else (
+            os.path.join(ROOT, compiler))
+        self.timeout = timeout
+
+    def sh(self, args, env=None, cwd=ROOT):
+        e = dict(os.environ)
+        e.pop("ABLA_COMPILE_EVAL", None)
+        if env:
+            e.update(env)
+        try:
+            p = subprocess.run(args, cwd=cwd, env=e, capture_output=True, text=True,
+                               timeout=self.timeout)
+            return p.returncode, p.stdout, p.stderr
+        except subprocess.TimeoutExpired:
+            return 124, "", "timeout"
+
+    def native(self, source, out, fast, ct):
+        env = {"ABLA_COMPILE_EVAL": "interp"} if ct else None
+        args = [self.compiler, "build", source, "-o", out, "--no-cache"]
+        if fast:
+            args.append("--fast")
+        rc, _, err = self.sh(args, env)
+        if rc != 0:
+            return ("build-failed", err.strip().splitlines()[:6])
+        rc, stdout, _ = self.sh([out])
+        return (stdout, rc)
+
+    def wasm(self, source, directory):
+        stem = os.path.join(directory, "w")
+        driver = os.path.join(directory, "build-wasm.ab")
+        with open(driver, "w") as f:
+            f.write(f'''import "abla/wasm/build"
+
+val release = #wasmBuildModule("w", "{source}", "{stem}.wasm", false, false)
+val development = #buildProgram("w-dev", "{source}", "{stem}-dev.wasm", "wasm32-module", "module", true, false)
+
+fun main: int = if (release && development) 0 else 1
+''')
+        rc, _, err = self.sh([self.compiler, "build", driver, "-o", os.path.join(directory, "wasm-driver"),
+                              "--fast", "--no-cache"])
+        results = {}
+        for name, path in (("wasm", f"{stem}.wasm"), ("wasm-dev", f"{stem}-dev.wasm")):
+            if rc != 0 or not os.path.exists(os.path.join(ROOT, path)):
+                results[name] = ("build-failed", err.strip().splitlines()[:6])
+                continue
+            code, stdout, stderr = self.sh(["node", os.path.join(ROOT, "tools", "fuzz-differential.mjs"), path])
+            results[name] = (stdout, code)
+        return results
+
+    def all_modes(self, directory, prelude_checks):
+        """prelude_checks: (prelude, checks); returns {mode: (stdout, rc) | failure}."""
+        prelude, checks = prelude_checks
+        os.makedirs(os.path.join(ROOT, directory), exist_ok=True)
+        plain = os.path.join(directory, "program.ab")
+        ct = os.path.join(directory, "program-ct.ab")
+        with open(os.path.join(ROOT, plain), "w") as f:
+            f.write(assemble(prelude, checks, False))
+        with open(os.path.join(ROOT, ct), "w") as f:
+            f.write(assemble(prelude, checks, True))
+        jobs = {
+            "fast": lambda: self.native(plain, os.path.join(directory, "fast"), True, False),
+            "release": lambda: self.native(plain, os.path.join(directory, "release"), False, False),
+            "ct": lambda: self.native(ct, os.path.join(directory, "ct"), True, True),
+            "wasm": lambda: self.wasm(plain, directory),
+        }
+        results = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {k: pool.submit(v) for k, v in jobs.items()}
+            for k, fut in futures.items():
+                v = fut.result()
+                if k == "wasm":
+                    results.update(v)
+                else:
+                    results[k] = v
+        return results
+
+
+def verdict(results):
+    """None when every mode agrees, else a short description."""
+    distinct = {}
+    for mode, value in results.items():
+        distinct.setdefault(repr(value), []).append(mode)
+    if len(distinct) == 1 and not isinstance(next(iter(results.values())), tuple) is False:
+        pass
+    if len(distinct) == 1:
+        value = next(iter(results.values()))
+        if value[0] == "build-failed":
+            return "all modes failed to build: " + " | ".join(value[1][:3])
+        return None
+    return "; ".join(f"{'+'.join(modes)} -> {value[:200]}" for value, modes in distinct.items())
+
+
+def differing_lines(results):
+    """The check ids whose printed line differs between modes."""
+    lines = {}
+    for mode, value in results.items():
+        if value[0] == "build-failed":
+            continue
+        for line in value[0].splitlines():
+            key, _, text = line.partition("=")
+            lines.setdefault(key, {}).setdefault(text, []).append(mode)
+    return sorted(k for k, v in lines.items() if len(v) > 1)
+
+
+def run_seed(args, seed, runner):
+    gen = Gen(seed)
+    checks = []
+    for i in range(args.checks):
+        lines, call, ty = gen.check(i)
+        checks.append((lines, call, ty, i))
+    directory = os.path.join(WORK, f"seed{seed}")
+    results = runner.all_modes(directory, (Gen.PRELUDE, checks))
+    bad = verdict(results)
+    if bad is None:
+        if not args.keep:
+            shutil.rmtree(os.path.join(ROOT, directory), ignore_errors=True)
+        return None
+    return minimise(args, seed, runner, checks, results, bad)
+
+
+def minimise(args, seed, runner, checks, results, first):
+    """Reduce a disagreement to one check, then to fewer statements."""
+    ids = differing_lines(results)
+    report = [f"seed {seed}: {first}"]
+    if not ids:
+        report.append("  no single check line differs (build or exit status differs); kept whole")
+        return "\n".join(report)
+    by_id = {f"c{c[3]}": c for c in checks}
+    for key in ids[:3]:
+        check = by_id[key]
+        lines = list(check[0])
+
+        def still(candidate_lines, tag):
+            trial = [(candidate_lines, check[1], check[2], check[3])]
+            got = runner.all_modes(os.path.join(WORK, f"min{seed}-{key}-{tag}"), (Gen.PRELUDE, trial))
+            ok = verdict(got) is not None and not verdict(got).startswith("all modes failed") \
+                and not any(v[0] == "build-failed" for v in got.values())
+            return ok, got
+
+        ok, got = still(lines, "base")
+        if not ok:
+            report.append(f"  {key}: disagreement does not reproduce alone")
+            continue
+        # drop body lines one at a time while the disagreement persists
+        tag = 0
+        i = 1
+        while i < len(lines) - 2:
+            candidate = lines[:i] + lines[i + 1:]
+            tag += 1
+            ok2, got2 = still(candidate, str(tag))
+            if ok2:
+                lines, got = candidate, got2
+            else:
+                i += 1
+        report.append(f"  {key} minimised to {len(lines)} lines:")
+        report += ["    " + l for l in lines]
+        report.append(f"  call: {check[1]}")
+        report.append("  outputs: " + verdict(got))
+    return "\n".join(report)
+
+
+def seed_range(text):
+    if "-" in text:
+        a, b = text.split("-")
+        return range(int(a), int(b) + 1)
+    return [int(text)]
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--seeds", default="1", help="seed or range such as 1-5")
+    ap.add_argument("--seed", help="alias of --seeds")
+    ap.add_argument("--checks", type=int, default=24)
+    ap.add_argument("--compiler", default="build/ablac")
+    ap.add_argument("--timeout", type=int, default=120)
+    ap.add_argument("--keep", action="store_true")
+    ap.add_argument("--program", help="run an existing .ab program (with @export(\"run\")) all ways")
+    args = ap.parse_args()
+    runner = Runner(args.compiler, args.timeout)
+    if args.program:
+        directory = os.path.join(WORK, "program")
+        os.makedirs(os.path.join(ROOT, directory), exist_ok=True)
+        text = open(args.program).read()
+        results = {}
+        plain = os.path.join(directory, "program.ab")
+        open(os.path.join(ROOT, plain), "w").write(text)
+        results["fast"] = runner.native(plain, os.path.join(directory, "fast"), True, False)
+        results["release"] = runner.native(plain, os.path.join(directory, "release"), False, False)
+        results.update(runner.wasm(plain, directory))
+        bad = verdict(results)
+        print(bad or "all modes agree")
+        return 1 if bad else 0
+    failures = 0
+    for seed in seed_range(args.seed or args.seeds):
+        found = run_seed(args, seed, runner)
+        if found:
+            failures += 1
+            print(found)
+        else:
+            print(f"seed {seed}: {args.checks} checks agree in all modes")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
