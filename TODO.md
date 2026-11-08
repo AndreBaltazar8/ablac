@@ -335,7 +335,7 @@
   1,196: a flat tail. Getting to 960 (under 2 minutes at JOBS=8 on CPUs 0-7) needs about 40% less
   CPU, and checking the biggest for duplicated work found little to share: test-bignum-secret's
   builds are two different programs, each in fast and release; test-self-hosted's 89 tests build
-  distinct programs, and the ten of its `suite-*` entries that rerun a script also in the recipe
+  distinct programs, and the seven of its `suite-*` entries that rerun a script also in the recipe
   (borrow-lifetimes, floating-point, nominal-scalars, unsafe-stack-memory, local-shadowing,
   eval-steps, borrow-duplicates) cost about 13 CPU-seconds; test-reproducible-elsewhere builds
   two things to compare them, so both builds are the test. Stripping `--no-cache` from
