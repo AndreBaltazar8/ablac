@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""Differential fuzzer for abla/regex against Python's re (ASCII mode).
+
+Random patterns from the supported subset and random texts are matched by
+both; find, findAll, full match and replace must agree on byte spans, groups
+and output. `$` is compared with Python's `\\Z` (end of text only).
+
+  tools/fuzz-regex [--seeds A-B] [--cases N] [--compiler PATH] [--keep]
+  tools/fuzz-regex --program   # patterns known to differ, see the notes
+"""
+import argparse, os, random, re, subprocess, sys, tempfile
+
+ALPHABET = ["a", "b", "c", "a", "b", "1", "2", "_", " ", "\n", "-", "é", "ü", "😀", "Z"]
+ATOM_CHARS = ["a", "b", "c", "1", "é", "😀", "\\.", "\\-", "\\n", "\\x41", "\\u00e9"]
+CLASSES = ["[ab]", "[^a]", "[a-c]", "[^b-c1]", "[\\d_]", "[\\w-]", "[é-ü]", "[^\\s]", "[]a]", "[a\\-z]",
+           "[\\D]", "[a-c\\d]"]
+SHORT = ["\\d", "\\D", "\\w", "\\W", "\\s", "\\S", "."]
+
+
+class Gen:
+    """Patterns come with a nullable flag. A loop over a body that can match
+    empty is skipped: Python keeps the group of an empty last iteration and the
+    Pike VM (like RE2) does not; the whole-match spans agree (see the docs)."""
+
+    def __init__(self, rng):
+        self.r = rng
+
+    def atom(self, depth):
+        r = self.r
+        c = r.random()
+        if c < 0.35: return r.choice(ATOM_CHARS), False, False
+        if c < 0.5: return r.choice(CLASSES), False, False
+        if c < 0.65: return r.choice(SHORT), False, False
+        if c < 0.72: return r.choice(["^", "$", "\\b", "\\B"]), True, True
+        if depth < 3:
+            inner, nullable = self.alt(depth + 1)
+            return ("(" if r.random() < 0.7 else "(?:") + inner + ")", nullable, False
+        return r.choice(ATOM_CHARS), False, False
+
+    def quant(self, text, nullable, is_assert):
+        r = self.r
+        if is_assert or r.random() < 0.55: return text, nullable
+        q = r.choice(["*", "+", "?", "{2}", "{1,3}", "{2,}", "{0,2}"])
+        if nullable and q not in ("?", "{0,1}"): return text, nullable
+        if r.random() < 0.25: q += "?"
+        return text + q, nullable or q.startswith(("*", "?", "{0"))
+
+    def cat(self, depth):
+        out, nullable = "", True
+        for _ in range(self.r.choice([1, 2, 2, 3, 4])):
+            a, n, is_assert = self.atom(depth)
+            t, n = self.quant(a, n, is_assert)
+            out += t
+            nullable = nullable and n
+        return out, nullable
+
+    def alt(self, depth):
+        parts = [self.cat(depth) for _ in range(self.r.choice([1, 1, 1, 2, 3]))]
+        return "|".join(p for p, _ in parts), any(n for _, n in parts)
+
+    def text(self):
+        return "".join(self.r.choice(ALPHABET) for _ in range(self.r.randrange(0, 14)))
+
+
+def py_pattern(p):
+    # `$` outside classes -> \Z; escaped \$ never appears in the generator.
+    out, i, in_class = "", 0, False
+    while i < len(p):
+        c = p[i]
+        if c == "\\": out += p[i:i + 2]; i += 2; continue
+        if c == "[" and not in_class:
+            in_class = True; out += c; i += 1
+            if p[i:i + 1] == "^": out += "^"; i += 1
+            if p[i:i + 1] == "]": out += "\\]"; i += 1
+            continue
+        if c == "]" and in_class: in_class = False
+        out += "\\Z" if (c == "$" and not in_class) else c
+        i += 1
+    return out
+
+
+def byte_offsets(text):
+    offs, o = [], 0
+    for ch in text:
+        offs.append(o); o += len(ch.encode())
+    offs.append(o)
+    return offs
+
+
+def spans(m, offs):
+    out = []
+    for g in range(m.re.groups + 1):
+        s, e = m.span(g)
+        out += [offs[s] if s >= 0 else -1, offs[e] if e >= 0 else -1]
+    return out
+
+
+def expect(pattern, text):
+    """The program's expected output lines, or None when Python rejects it."""
+    try:
+        rx = re.compile(py_pattern(pattern), re.ASCII)
+    except re.error:
+        return None
+    offs = byte_offsets(text)
+    m = rx.search(text)
+    lines = ["F " + (" ".join(map(str, spans(m, offs))) if m else "-")]
+    lines.append("A " + " ".join(f"{offs[x.start()]}-{offs[x.end()]}" for x in rx.finditer(text)))
+    f = rx.fullmatch(text)
+    lines.append("M " + (" ".join(map(str, spans(f, offs))) if f else "-"))
+    out = rx.sub(lambda x: "[" + x.group(0) + "]", text)
+    lines.append("R " + out.encode().hex())
+    return lines
+
+
+def lit(s):
+    return '"' + "".join(f"\\x{b:02x}" for b in s.encode()) + '"'
+
+
+PROGRAM = '''import "abla/io"
+import "abla/regex"
+
+fun hex(s: string): string {
+    val digits = "0123456789abcdef"
+    var out = ""
+    for (b in s) out = out + digits.slice(b / 16, b / 16 + 1) + digits.slice(b % 16, b % 16 + 1)
+    out
+}
+
+fun spansText(m: RegexMatch): string {
+    var out = ""
+    for (g in 0..m.groupCount()) {
+        if (g > 0) out = out + " "
+        out = out + "${m.groupStart(g)} ${m.groupEnd(g)}"
+    }
+    out
+}
+
+fun run(pattern: string, text: string) {
+    val compiled = regexCompile(pattern)
+    if (!compiled.succeeded) { println("ERR"); return }
+    val re = compiled.regex
+    val m = re.find(text)
+    println(if (m == null) "F -" else "F " + spansText(m))
+    var all = "A "
+    var first = true
+    for (x in re.findAll(text)) {
+        if (!first) all = all + " "
+        first = false
+        all = all + "${x.start()}-${x.end()}"
+    }
+    println(all)
+    val f = re.matchFull(text)
+    println(if (f == null) "M -" else "M " + spansText(f))
+    println("R " + hex(re.replace(text, "[$0]")))
+}
+
+fun main {
+@@BODY@@}
+'''
+
+
+def build_and_run(compiler, workdir, cases, tag):
+    body = "".join(f"    run({lit(p)}, {lit(t)})\n" for p, t in cases)
+    src = os.path.join(workdir, f"{tag}.ab")
+    open(src, "w", encoding="utf-8").write(PROGRAM.replace('@@BODY@@', body))
+    exe = os.path.join(workdir, tag)
+    b = subprocess.run([compiler, "build", src, "-o", exe, "--fast", "--no-cache"],
+                       capture_output=True, text=True)
+    if b.returncode != 0:
+        return None, b.stdout + b.stderr
+    r = subprocess.run([exe], capture_output=True, text=True, timeout=600)
+    return r.stdout.split("\n"), r.stderr
+
+
+def check(compiler, workdir, cases, tag):
+    out, err = build_and_run(compiler, workdir, cases, tag)
+    if out is None:
+        print("BUILD FAILED\n" + err[:2000]); return [("build", err)]
+    bad, pos = [], 0
+    for p, t in cases:
+        want = expect(p, t)
+        if want is None:
+            if out[pos] != "ERR": bad.append((p, t, "python rejects, abla accepts", out[pos]))
+            pos += 1
+            continue
+        if out[pos] == "ERR":
+            bad.append((p, t, "abla rejects", want)); pos += 1; continue
+        got = out[pos:pos + 4]; pos += 4
+        if got != want: bad.append((p, t, want, got))
+    return bad
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--seeds", default="1-3")
+    ap.add_argument("--cases", type=int, default=300)
+    ap.add_argument("--compiler", default="build/ablac")
+    ap.add_argument("--keep", action="store_true")
+    ap.add_argument("--pattern"); ap.add_argument("--text", default="")
+    a = ap.parse_args()
+    seeds = []
+    for part in a.seeds.split(","):
+        lo, _, hi = part.partition("-")
+        seeds += range(int(lo), int(hi or lo) + 1)
+    work = tempfile.mkdtemp(prefix="fuzz-regex-")
+    failures = 0
+    if a.pattern is not None:
+        bad = check(a.compiler, work, [(a.pattern, a.text)], "one")
+        for b in bad: print(b)
+        return 1 if bad else 0
+    for seed in seeds:
+        g = Gen(random.Random(seed))
+        cases = []
+        while len(cases) < a.cases:
+            p = g.alt(0)[0]
+            for _ in range(4): cases.append((p, g.text()))
+        bad = check(a.compiler, work, cases, f"s{seed}")
+        print(f"seed {seed}: {len(cases)} cases, {len(bad)} disagreements")
+        for b in bad[:5]: print("  ", b)
+        failures += len(bad)
+    if not a.keep:
+        import shutil; shutil.rmtree(work, ignore_errors=True)
+    return 1 if failures else 0
+
+
+sys.exit(main())

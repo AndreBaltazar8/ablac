@@ -1,0 +1,743 @@
+// Linear-time regular expressions (RE2 style): a pattern is parsed to a tree,
+// compiled to a small program, and run by a Pike VM that advances every
+// possible path in lock step. Matching costs O(text size * program size) with
+// no backtracking, so no pattern can take exponential time. Backreferences and
+// lookaround are rejected when the pattern is compiled.
+//
+// Text is UTF-8: `.`, classes and literals match whole code points, and every
+// span is a byte offset into the text. A byte that is not part of valid UTF-8
+// reads as U+FFFD, one byte wide. `\d`, `\w`, `\s` and `\b` are ASCII only.
+import "abla/text"
+
+class RegexError(val message: string, val offset: int)
+
+// `program` holds (operation, x, y) triples; `classes` holds [low, high, ...]
+// code point ranges. A failed compile returns an empty Regex.
+class Regex(
+    val pattern: string,
+    val groupCount: int,
+    val program: array<int>,
+    val classes: array<array<int>>
+) {
+    /** True when the whole text matches. */
+    fun matches(text: string): bool {
+        var vm = regexVm(this, text)
+        regexRun(this, vm, 0, true, true, false).size > 0
+    }
+    /** The match of the whole text with its groups, or null. */
+    fun matchFull(text: string): RegexMatch? {
+        var vm = regexVm(this, text)
+        val spans = regexRun(this, vm, 0, true, true, false)
+        if (spans.size == 0) null else RegexMatch(text, spans)
+    }
+    /** The leftmost match starting at or after byte offset `start`, or null. */
+    fun find(text: string, start: int = 0): RegexMatch? {
+        if (start < 0 || start > text.size) return null
+        var vm = regexVm(this, text)
+        val spans = regexRun(this, vm, start, false, false, false)
+        if (spans.size == 0) null else RegexMatch(text, spans)
+    }
+    /** Every non-overlapping match, left to right. */
+    fun findAll(text: string): array<RegexMatch> {
+        val found: array<RegexMatch> = []
+        var vm = regexVm(this, text)
+        var position = 0
+        var advance = false
+        var more = true
+        while (more && position <= text.size) {
+            val spans = regexRun(this, vm, position, false, false, advance)
+            if (spans.size == 0) {
+                more = false
+            } else {
+                found.append(RegexMatch(text, spans))
+                advance = spans[1] == spans[0]
+                position = spans[1]
+            }
+        }
+        found
+    }
+    /**
+     * Replace every match. In `replacement`, `$0` is the whole match, `$1`
+     * and up are groups (all digits after the `$`, `${12}` also works), and
+     * `$$` is a dollar sign. A group that did not take part, or does not
+     * exist, is empty; a `$` followed by anything else stays a dollar sign.
+     */
+    fun replace(text: string, replacement: string): string {
+        var out = ""
+        var last = 0
+        for (m in this.findAll(text)) {
+            out = out + text.slice(last, m.start()) + regexExpand(m, replacement)
+            last = m.end()
+        }
+        out + text.slice(last, text.size)
+    }
+}
+
+class RegexCompileResult(val regex: Regex, val succeeded: bool, val error: RegexError)
+
+class RegexMatch(val text: string, val spans: array<int>) {
+    fun start(): int = this.spans[0]
+    fun end(): int = this.spans[1]
+    fun text0(): string = this.text.slice(this.spans[0], this.spans[1])
+    /** Number of capturing groups, not counting the whole match. */
+    fun groupCount(): int = this.spans.size / 2 - 1
+    /** True when group `index` (0 is the whole match) took part in the match. */
+    fun hasGroup(index: int): bool =
+        index >= 0 && index <= this.groupCount() && this.spans[index * 2] >= 0
+    fun groupStart(index: int): int = if (this.hasGroup(index)) this.spans[index * 2] else -1
+    fun groupEnd(index: int): int = if (this.hasGroup(index)) this.spans[index * 2 + 1] else -1
+    /** The text of group `index`, or null when it did not take part. */
+    fun group(index: int): string? =
+        if (this.hasGroup(index)) this.text.slice(this.spans[index * 2], this.spans[index * 2 + 1])
+        else null
+}
+
+// Node kinds: 0 empty, 1 char(a), 2 any, 3 class(a = index, b = negated),
+// 4 concatenation, 5 alternation, 6 repeat(a = min, b = max or -1, c = lazy),
+// 7 group(a = capture index or -1), 8 assertion(a: 0 ^, 1 $, 2 \b, 3 \B).
+class RegexNode(val kind: int, val a: int, val b: int, val c: int, val kids: array<RegexNode>)
+
+private val regexNoKids: array<RegexNode> = []
+private val regexMaximumInstructions = 100000
+private val regexMaximumRepeat = 1000
+private val regexMaximumDepth = 200
+
+private fun regexLeaf(kind: int, a: int, b: int): RegexNode = RegexNode(kind, a, b, 0, regexNoKids)
+
+private fun regexEmptyRegex(pattern: string): Regex = Regex(pattern, 0, [], [])
+
+private fun regexFail(pattern: string, message: string, offset: int): RegexCompileResult =
+    RegexCompileResult(regexEmptyRegex(pattern), false, RegexError(message, offset))
+
+private fun regexIsWordByte(c: int): bool =
+    (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+
+private fun regexHexValue(c: int): int {
+    if (c >= 48 && c <= 57) return c - 48
+    if (c >= 65 && c <= 70) return c - 55
+    if (c >= 97 && c <= 102) return c - 87
+    -1
+}
+
+// The three shorthand sets, as ascending disjoint ranges.
+private fun regexShorthand(letter: int): array<int> {
+    if (letter == 100) return [48, 57]
+    if (letter == 119) return [48, 57, 65, 90, 95, 95, 97, 122]
+    [9, 13, 32, 32]
+}
+
+private fun regexComplement(ranges: array<int>): array<int> {
+    val out: array<int> = []
+    var next = 0
+    var i = 0
+    while (i < ranges.size) {
+        if (ranges[i] > next) { out.append(next); out.append(ranges[i] - 1) }
+        next = ranges[i + 1] + 1
+        i += 2
+    }
+    if (next <= 1114111) { out.append(next); out.append(1114111) }
+    out
+}
+
+class RegexParser(
+    val src: string,
+    var pos: int,
+    var groups: int,
+    var depth: int,
+    var failed: bool,
+    var message: string,
+    var errorOffset: int,
+    val classes: array<array<int>>
+) {
+    fun fail(message: string, offset: int): RegexNode {
+        if (!this.failed) {
+            this.failed = true
+            this.message = message
+            this.errorOffset = offset
+        }
+        regexLeaf(0, 0, 0)
+    }
+
+    fun peek(): int = if (this.pos < this.src.size) this.src[this.pos] else -1
+
+    // The code point at `pos`; the pattern was checked to be valid UTF-8.
+    fun codePoint(): int = utf8DecodeAt(this.src, this.pos)
+
+    fun advanceCodePoint(): void {
+        this.pos = this.pos + utf8SequenceLength(this.src[this.pos])
+    }
+
+    fun addClass(ranges: array<int>): int {
+        val copy: array<int> = []
+        for (value in ranges) copy.append(value)
+        this.classes.append(copy)
+        this.classes.size - 1
+    }
+
+    fun parseAlternation(): RegexNode {
+        val branches: array<RegexNode> = []
+        branches.append(this.parseConcatenation())
+        while (!this.failed && this.peek() == 124) {
+            this.pos = this.pos + 1
+            branches.append(this.parseConcatenation())
+        }
+        if (branches.size == 1) branches[0] else RegexNode(5, 0, 0, 0, branches)
+    }
+
+    fun parseConcatenation(): RegexNode {
+        val items: array<RegexNode> = []
+        while (!this.failed && this.pos < this.src.size && this.peek() != 124 && this.peek() != 41) {
+            val atomStart = this.pos
+            val atom = this.parseAtom()
+            if (!this.failed) items.append(this.parseQuantifiers(atom, atomStart))
+        }
+        if (items.size == 0) regexLeaf(0, 0, 0)
+        else if (items.size == 1) items[0]
+        else RegexNode(4, 0, 0, 0, items)
+    }
+
+    // Reads `{m}`, `{m,}` or `{m,n}` at `pos`. Returns [min, max, length] with
+    // max -1 for open, [] when the text is not a repeat, or [-1, message] is
+    // not representable, so a bad interval is reported through `failed`.
+    fun repeatBraces(): array<int> {
+        var i = this.pos + 1
+        var low = 0
+        var digits = 0
+        while (i < this.src.size && this.src[i] >= 48 && this.src[i] <= 57) {
+            if (low <= 100000) low = low * 10 + this.src[i] - 48
+            i += 1
+            digits += 1
+        }
+        val none: array<int> = []
+        if (digits == 0) return none
+        var high = low
+        if (i < this.src.size && this.src[i] == 44) {
+            i += 1
+            var highDigits = 0
+            high = 0
+            while (i < this.src.size && this.src[i] >= 48 && this.src[i] <= 57) {
+                if (high <= 100000) high = high * 10 + this.src[i] - 48
+                i += 1
+                highDigits += 1
+            }
+            if (highDigits == 0) high = -1
+        }
+        if (i >= this.src.size || this.src[i] != 125) return none
+        [low, high, i + 1 - this.pos]
+    }
+
+    fun parseQuantifiers(atom: RegexNode, atomStart: int): RegexNode {
+        var low = -1
+        var high = -1
+        var length = 0
+        val c = this.peek()
+        if (c == 42) { low = 0; high = -1; length = 1 }
+        else if (c == 43) { low = 1; high = -1; length = 1 }
+        else if (c == 63) { low = 0; high = 1; length = 1 }
+        else if (c == 123) {
+            val braces = this.repeatBraces()
+            if (braces.size == 3) { low = braces[0]; high = braces[1]; length = braces[2] }
+        }
+        if (length == 0) return atom
+        val quantifierStart = this.pos
+        if (atom.kind == 8) return this.fail("nothing to repeat", quantifierStart)
+        if (low > regexMaximumRepeat || high > regexMaximumRepeat) {
+            return this.fail("repeat count is larger than 1000", quantifierStart)
+        }
+        if (high >= 0 && high < low) return this.fail("bad repeat interval", quantifierStart)
+        this.pos = this.pos + length
+        var lazy = 0
+        if (this.peek() == 63) { lazy = 1; this.pos = this.pos + 1 }
+        val next = this.peek()
+        if (next == 42 || next == 43 || next == 63) return this.fail("multiple repeat", this.pos)
+        if (next == 123 && this.repeatBraces().size == 3) return this.fail("multiple repeat", this.pos)
+        RegexNode(6, low, high, lazy, [atom])
+    }
+
+    fun parseAtom(): RegexNode {
+        val c = this.peek()
+        if (c == 40) return this.parseGroup()
+        if (c == 91) return this.parseClass()
+        if (c == 46) { this.pos = this.pos + 1; return regexLeaf(2, 0, 0) }
+        if (c == 94) { this.pos = this.pos + 1; return regexLeaf(8, 0, 0) }
+        if (c == 36) { this.pos = this.pos + 1; return regexLeaf(8, 1, 0) }
+        if (c == 92) return this.parseEscape()
+        if (c == 42 || c == 43 || c == 63) return this.fail("nothing to repeat", this.pos)
+        if (c == 123 && this.repeatBraces().size == 3) return this.fail("nothing to repeat", this.pos)
+        val scalar = this.codePoint()
+        this.advanceCodePoint()
+        regexLeaf(1, scalar, 0)
+    }
+
+    fun parseGroup(): RegexNode {
+        val open = this.pos
+        this.pos = this.pos + 1
+        var capture = -1
+        if (this.peek() == 63) {
+            val kind = if (this.pos + 1 < this.src.size) this.src[this.pos + 1] else -1
+            if (kind == 58) {
+                this.pos = this.pos + 2
+            } else if (kind == 61 || kind == 33 || kind == 60) {
+                return this.fail("lookaround is not supported", open)
+            } else {
+                return this.fail("unsupported group syntax", open)
+            }
+        } else {
+            this.groups = this.groups + 1
+            capture = this.groups
+        }
+        if (this.depth >= regexMaximumDepth) return this.fail("groups are nested too deeply", open)
+        this.depth = this.depth + 1
+        val inner = this.parseAlternation()
+        this.depth = this.depth - 1
+        if (this.failed) return inner
+        if (this.peek() != 41) return this.fail("missing )", open)
+        this.pos = this.pos + 1
+        RegexNode(7, capture, 0, 0, [inner])
+    }
+
+    fun escapeScalar(letter: int): int {
+        if (letter == 110) return 10
+        if (letter == 114) return 13
+        if (letter == 116) return 9
+        if (letter == 102) return 12
+        if (letter == 118) return 11
+        -1
+    }
+
+    // Reads `count` hex digits at `pos`; -1 when they are not all there.
+    fun hexDigits(count: int): int {
+        var value = 0
+        var i = 0
+        while (i < count) {
+            val digit = if (this.pos + i < this.src.size) regexHexValue(this.src[this.pos + i]) else -1
+            if (digit < 0) return -1
+            value = value * 16 + digit
+            i += 1
+        }
+        value
+    }
+
+    // After `\` in an atom or a class: a code point, or -1 with `failed` set.
+    // Shorthand letters are left to the callers.
+    fun escapedScalar(): int {
+        val at = this.pos - 1
+        val e = this.peek()
+        if (e < 0) { this.fail("a pattern cannot end with a backslash", at); return -1 }
+        val simple = this.escapeScalar(e)
+        if (simple >= 0) { this.pos = this.pos + 1; return simple }
+        if (e == 120 || e == 117) {
+            val count = if (e == 120) 2 else 4
+            this.pos = this.pos + 1
+            val value = this.hexDigits(count)
+            if (value < 0) { this.fail("bad hexadecimal escape", at); return -1 }
+            this.pos = this.pos + count
+            return value
+        }
+        if (e >= 48 && e <= 57) {
+            this.fail("backreferences and octal escapes are not supported", at)
+            return -1
+        }
+        if ((e >= 65 && e <= 90) || (e >= 97 && e <= 122)) {
+            this.fail("unknown escape", at)
+            return -1
+        }
+        val scalar = this.codePoint()
+        this.advanceCodePoint()
+        scalar
+    }
+
+    fun parseEscape(): RegexNode {
+        this.pos = this.pos + 1
+        val e = this.peek()
+        if (e == 100 || e == 119 || e == 115) {
+            this.pos = this.pos + 1
+            return regexLeaf(3, this.addClass(regexShorthand(e)), 0)
+        }
+        if (e == 68 || e == 87 || e == 83) {
+            this.pos = this.pos + 1
+            return regexLeaf(3, this.addClass(regexShorthand(e + 32)), 1)
+        }
+        if (e == 98) { this.pos = this.pos + 1; return regexLeaf(8, 2, 0) }
+        if (e == 66) { this.pos = this.pos + 1; return regexLeaf(8, 3, 0) }
+        val scalar = this.escapedScalar()
+        if (this.failed) regexLeaf(0, 0, 0) else regexLeaf(1, scalar, 0)
+    }
+
+    fun parseClass(): RegexNode {
+        val open = this.pos
+        this.pos = this.pos + 1
+        var negated = 0
+        if (this.peek() == 94) { negated = 1; this.pos = this.pos + 1 }
+        val ranges: array<int> = []
+        var first = true
+        var closed = false
+        while (!this.failed && !closed) {
+            if (this.pos >= this.src.size) return this.fail("missing ]", open)
+            val c = this.peek()
+            if (c == 93 && !first) {
+                this.pos = this.pos + 1
+                closed = true
+            } else {
+                first = false
+                val low = this.classAtom(ranges)
+                if (!this.failed && low >= 0) {
+                    var high = low
+                    if (this.peek() == 45 && this.pos + 1 < this.src.size && this.src[this.pos + 1] != 93) {
+                        this.pos = this.pos + 1
+                        high = this.classAtom(ranges)
+                        if (!this.failed && high < 0) return this.fail("bad character range", this.pos)
+                        if (!this.failed && high < low) return this.fail("bad character range", this.pos)
+                    }
+                    ranges.append(low)
+                    ranges.append(high)
+                }
+            }
+        }
+        if (this.failed) regexLeaf(0, 0, 0) else regexLeaf(3, this.addClass(ranges), negated)
+    }
+
+    // One class member: a code point, or -1 after adding a shorthand set to
+    // `ranges` (or after failing).
+    fun classAtom(var ranges: array<int>): int {
+        val c = this.peek()
+        if (c != 92) {
+            val scalar = this.codePoint()
+            this.advanceCodePoint()
+            return scalar
+        }
+        this.pos = this.pos + 1
+        val e = this.peek()
+        if (e == 100 || e == 119 || e == 115 || e == 68 || e == 87 || e == 83) {
+            this.pos = this.pos + 1
+            val lower = if (e >= 97) e else e + 32
+            val set = regexShorthand(lower)
+            val use = if (e >= 97) set else regexComplement(set)
+            for (value in use) ranges.append(value)
+            return -1
+        }
+        if (e == 98 || e == 66) { this.fail("unsupported escape in a class", this.pos - 1); return -1 }
+        this.escapedScalar()
+    }
+}
+
+class RegexEmitter(val program: array<int>, var failed: bool, var groupSlots: int) {
+    fun count(): int = this.program.size / 3
+
+    fun add(op: int, x: int, y: int): int {
+        this.program.append(op)
+        this.program.append(x)
+        this.program.append(y)
+        if (this.program.size / 3 > regexMaximumInstructions) this.failed = true
+        this.program.size / 3 - 1
+    }
+
+    fun setX(at: int, x: int): void { this.program[at * 3 + 1] = x }
+    fun setY(at: int, y: int): void { this.program[at * 3 + 2] = y }
+
+    fun emit(node: RegexNode): void {
+        if (this.failed) return
+        val kind = node.kind
+        if (kind == 1) { this.add(0, node.a, 0); return }
+        if (kind == 2) { this.add(1, 0, 0); return }
+        if (kind == 3) { this.add(2, node.a, node.b); return }
+        if (kind == 8) { this.add(6, node.a, 0); return }
+        if (kind == 4) {
+            for (kid in node.kids) this.emit(kid)
+            return
+        }
+        if (kind == 5) {
+            val jumps: array<int> = []
+            var i = 0
+            while (i < node.kids.size && !this.failed) {
+                if (i < node.kids.size - 1) {
+                    val split = this.add(3, 0, 0)
+                    this.setX(split, this.count())
+                    this.emit(node.kids[i])
+                    jumps.append(this.add(4, 0, 0))
+                    this.setY(split, this.count())
+                } else {
+                    this.emit(node.kids[i])
+                }
+                i += 1
+            }
+            for (jump in jumps) this.setX(jump, this.count())
+            return
+        }
+        if (kind == 7) {
+            if (node.a >= 0) this.add(5, node.a * 2, 0)
+            this.emit(node.kids[0])
+            if (node.a >= 0) this.add(5, node.a * 2 + 1, 0)
+            return
+        }
+        if (kind == 6) {
+            val body = node.kids[0]
+            var i = 0
+            while (i < node.a && !this.failed) { this.emit(body); i += 1 }
+            if (node.b < 0) {
+                val split = this.add(3, 0, 0)
+                this.emit(body)
+                this.add(4, split, 0)
+                this.fillSplit(split, split + 1, this.count(), node.c)
+            } else {
+                val splits: array<int> = []
+                var extra = node.a
+                while (extra < node.b && !this.failed) {
+                    val split = this.add(3, 0, 0)
+                    splits.append(split)
+                    this.emit(body)
+                    extra += 1
+                }
+                for (split in splits) this.fillSplit(split, split + 1, this.count(), node.c)
+            }
+        }
+    }
+
+    // Greedy tries `enter` first; lazy tries `leave` first.
+    fun fillSplit(split: int, enter: int, leave: int, lazy: int): void {
+        this.setX(split, if (lazy == 1) leave else enter)
+        this.setY(split, if (lazy == 1) enter else leave)
+    }
+}
+
+/** Compile `pattern`. On failure `error` has the message and its byte offset. */
+fun regexCompile(pattern: string): RegexCompileResult {
+    val info = utf8Info(pattern)
+    if (!info.valid) return regexFail(pattern, "the pattern is not valid UTF-8", info.errorOffset)
+    val parser = RegexParser(pattern, 0, 0, 0, false, "", 0, [])
+    val tree = parser.parseAlternation()
+    if (!parser.failed && parser.pos < pattern.size) parser.fail("unmatched )", parser.pos)
+    if (parser.failed) return regexFail(pattern, parser.message, parser.errorOffset)
+    val emitter = RegexEmitter([], false, 0)
+    emitter.add(5, 0, 0)
+    emitter.emit(tree)
+    emitter.add(5, 1, 0)
+    emitter.add(7, 0, 0)
+    if (emitter.failed) return regexFail(pattern, "the pattern is too large", 0)
+    RegexCompileResult(Regex(pattern, parser.groups, emitter.program, parser.classes), true,
+        RegexError("", 0))
+}
+
+// ---- The Pike VM ----
+
+// All capture slots live in one flat `store` of entries, `slots` ints each:
+// entries [0, 2n) are the two thread lists (list 0 first, list 1 from n),
+// [2n, 4n + 2) the work stack, then a start entry, a result entry and a work
+// entry. `seen` marks the instructions already added in this generation.
+class RegexVm(
+    val program: array<int>,
+    val classes: array<array<int>>,
+    val text: string,
+    val n: int,
+    val slots: int,
+    val pcs: array<int>,
+    val store: array<int>,
+    val counts: array<int>,
+    val seen: array<int>,
+    var generation: int,
+    val stackPcs: array<int>
+) {
+    fun assertionHolds(kind: int, position: int): bool {
+        if (kind == 0) return position == 0
+        if (kind == 1) return position == this.text.size
+        val before = position > 0 && regexIsWordByte(this.text[position - 1])
+        val after = position < this.text.size && regexIsWordByte(this.text[position])
+        if (kind == 2) before != after else before == after
+    }
+
+    fun startEntry(): int = this.n * 4 + 2
+    fun resultEntry(): int = this.n * 4 + 3
+    fun workEntry(): int = this.n * 4 + 4
+
+    fun copyEntry(from: int, to: int): void {
+        val a = from * this.slots
+        val b = to * this.slots
+        for (i in 0 until this.slots) this.store[b + i] = this.store[a + i]
+    }
+
+    // Adds the thread at `pc0` with the captures of entry `source`, and
+    // everything reachable without consuming text, in priority order.
+    fun add(list: int, pc0: int, source: int, position: int): void {
+        val stackBase = this.n * 2
+        val work = this.workEntry()
+        var sp = 1
+        this.stackPcs[0] = pc0
+        this.copyEntry(source, stackBase)
+        while (sp > 0) {
+            sp -= 1
+            var pc = this.stackPcs[sp]
+            this.copyEntry(stackBase + sp, work)
+            var follow = true
+            while (follow) {
+                follow = false
+                if (this.seen[pc] != this.generation) {
+                    this.seen[pc] = this.generation
+                    val op = this.program[pc * 3]
+                    if (op == 4) {
+                        pc = this.program[pc * 3 + 1]
+                        follow = true
+                    } else if (op == 3) {
+                        this.stackPcs[sp] = this.program[pc * 3 + 2]
+                        this.copyEntry(work, stackBase + sp)
+                        sp += 1
+                        pc = this.program[pc * 3 + 1]
+                        follow = true
+                    } else if (op == 5) {
+                        this.store[work * this.slots + this.program[pc * 3 + 1]] = position
+                        pc += 1
+                        follow = true
+                    } else if (op == 6) {
+                        if (this.assertionHolds(this.program[pc * 3 + 1], position)) {
+                            pc += 1
+                            follow = true
+                        }
+                    } else {
+                        val at = list * this.n + this.counts[list]
+                        this.pcs[at] = pc
+                        this.copyEntry(work, at)
+                        this.counts[list] = this.counts[list] + 1
+                    }
+                }
+            }
+        }
+    }
+
+    fun classMatches(index: int, c: int): bool {
+        val ranges = this.classes[index]
+        var i = 0
+        var hit = false
+        while (!hit && i < ranges.size) {
+            hit = c >= ranges[i] && c <= ranges[i + 1]
+            i += 2
+        }
+        hit
+    }
+}
+
+private fun regexVm(re: Regex, text: string): RegexVm {
+    val n = re.program.size / 3
+    val slots = (re.groupCount + 1) * 2
+    RegexVm(re.program, re.classes, text, n, slots, filledArray(n * 2, 0),
+        filledArray((n * 4 + 5) * slots, -1), [0, 0], filledArray(n, 0), 0, filledArray(n + 2, 0))
+}
+
+// The width of the code point at `i`; an invalid byte is U+FFFD, one wide.
+private fun regexWidth(text: string, i: int): int {
+    val length = utf8SequenceLength(text[i])
+    if (length > 0 && utf8SequenceValid(text, i, length)) length else 1
+}
+
+private fun regexScalar(text: string, i: int, width: int): int =
+    if (width == 1 && text[i] >= 128) 65533 else utf8DecodeAt(text, i)
+
+/**
+ * Run the program over `text` from byte offset `from`. `anchored` allows a
+ * match only to start at `from`, `needEnd` only to end at the text's end, and
+ * `advance` refuses an empty match at `from`. Returns the slot array
+ * (start, end, group 1 start, ...) with -1 for groups that did not take
+ * part, or an empty array when nothing matches.
+ */
+private fun regexRun(re: Regex, var vm: RegexVm, from: int, anchored: bool, needEnd: bool,
+    advance: bool): array<int> {
+    val size = vm.text.size
+    var matched = false
+    var current = 0
+    vm.generation = vm.generation + 1
+    vm.counts[0] = 0
+    vm.counts[1] = 0
+    var i = from
+    var running = true
+    while (running) {
+        if (!matched && (!anchored || i == from)) {
+            val start = vm.startEntry()
+            for (k in 0 until vm.slots) vm.store[start * vm.slots + k] = -1
+            vm.add(current, 0, start, i)
+        }
+        if (vm.counts[current] == 0 && (matched || anchored)) {
+            running = false
+        } else {
+            val next = 1 - current
+            vm.generation = vm.generation + 1
+            vm.counts[next] = 0
+            var width = 0
+            var scalar = -1
+            if (i < size) {
+                width = regexWidth(vm.text, i)
+                scalar = regexScalar(vm.text, i, width)
+            }
+            var t = 0
+            var cut = false
+            while (!cut && t < vm.counts[current]) {
+                val entry = current * vm.n + t
+                val pc = vm.pcs[entry]
+                val op = vm.program[pc * 3]
+                if (op == 7) {
+                    if (!(advance && i == from) && (!needEnd || i == size)) {
+                        vm.copyEntry(entry, vm.resultEntry())
+                        matched = true
+                        cut = true
+                    }
+                } else if (scalar >= 0) {
+                    val x = vm.program[pc * 3 + 1]
+                    var hit = false
+                    if (op == 0) hit = scalar == x
+                    else if (op == 1) hit = scalar != 10
+                    else if (op == 2) hit = vm.classMatches(x, scalar) != (vm.program[pc * 3 + 2] == 1)
+                    if (hit) vm.add(next, pc + 1, entry, i + width)
+                }
+                t += 1
+            }
+            if (i >= size) {
+                running = false
+            } else {
+                i += width
+                current = next
+            }
+        }
+    }
+    val result: array<int> = []
+    if (matched) {
+        val base = vm.resultEntry() * vm.slots
+        for (k in 0 until vm.slots) result.append(vm.store[base + k])
+    }
+    result
+}
+
+private fun regexExpand(m: RegexMatch, replacement: string): string {
+    var out = ""
+    var i = 0
+    while (i < replacement.size) {
+        val c = replacement[i]
+        if (c != 36 || i + 1 >= replacement.size) {
+            out = out + replacement.slice(i, i + 1)
+            i += 1
+        } else {
+            val d = replacement[i + 1]
+            if (d == 36) {
+                out = out + "$"
+                i += 2
+            } else {
+                var j = i + 1
+                var braced = false
+                if (d == 123) { braced = true; j += 1 }
+                var number = 0
+                var digits = 0
+                while (j < replacement.size && replacement[j] >= 48 && replacement[j] <= 57) {
+                    if (number < 100000) number = number * 10 + replacement[j] - 48
+                    j += 1
+                    digits += 1
+                }
+                val closed = !braced || (j < replacement.size && replacement[j] == 125)
+                if (digits == 0 || !closed) {
+                    out = out + "$"
+                    i += 1
+                } else {
+                    val g = m.group(number)
+                    if (g != null) out = out + g
+                    i = if (braced) j + 1 else j
+                }
+            }
+        }
+    }
+    out
+}
