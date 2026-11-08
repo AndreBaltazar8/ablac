@@ -248,10 +248,11 @@ trusted fun __ablaRuntimeCellSet(cell: any, value: any): any {
 
 // Map<K, V> (K string or int) is an ordinary array the collector already
 // traces: [keys, values, slots, live count]. Entries keep insertion order in
-// keys/values; a removed entry's key becomes null. `slots` (dense ints, a
-// power of two, at most half used) holds entry index + 1 per occupied slot, under
-// the hash's top 32 bits, so most other keys in the way aren't read; slots are
-// found by linear probing from the key's hash.
+// keys/values; a removed entry's key becomes null. `slots` (a dense int array holding
+// two 32-bit slots to an element; a power of two of them, at most half used) holds
+// entry index + 1 per occupied slot, under bits of the hash's upper half, so most
+// other keys in the way aren't read; slots are found by linear probing from the key's
+// hash.
 @inline
 trusted fun __ablaRuntimeMapPart(map: any, part: int): any =
     __ablaRuntimeArrayGet(map, __ablaRuntimeI64(part))
@@ -307,13 +308,33 @@ trusted fun __ablaRuntimeMapKeyEqual(left: any, right: any): bool {
 trusted fun __ablaRuntimeMapSlotBase(slots: any): int =
     ablaRuntimeLoadI64(__ablaRuntimeArrayAddress(slots) + 16)
 
+// Whether the key array's element `index` (an entry's key, in bounds) equals `key`, whose
+// tag is `tag`: read in place, whether the array is boxed or dense.
+@inline
+trusted fun __ablaRuntimeMapEntryKeyEqual(array: int, index: int, key: any, tag: int): bool {
+    val kind = __ablaRuntimeArrayKind(array)
+    val values = ablaRuntimeLoadI64(array + 16)
+    if (kind == 0) {
+        val address = values + index * 24
+        if (ablaRuntimeLoadI32(address) != tag) false
+        else if (tag == 4) __ablaRuntimeStringEqualBool(__ablaRuntimeValueAt(address), key)
+        else ablaRuntimeLoadI64(address + 8) == __ablaRuntimeWord0(key)
+    } else kind + 1 == tag &&
+        ablaRuntimeLoadI64(values + index * 8) == __ablaRuntimeWord0(key)
+}
+
 // The entry index of `key`, or -1.
-trusted fun __ablaRuntimeMapEntry(map: any, key: any): int {
-    val keys = __ablaRuntimeMapPart(map, 0)
+trusted fun __ablaRuntimeMapEntry(map: any, key: any): int =
+    __ablaRuntimeMapEntryHashed(map, key, __ablaRuntimeMapHash(key))
+
+// `hash` is the key's __ablaRuntimeMapHash.
+@inline
+trusted fun __ablaRuntimeMapEntryHashed(map: any, key: any, hash: int): int {
+    val keysAddress = __ablaRuntimeArrayAddress(__ablaRuntimeMapPart(map, 0))
+    val tag = __ablaRuntimeTag(key)
     val slots = __ablaRuntimeMapPart(map, 2)
     val base = __ablaRuntimeMapSlotBase(slots)
     val mask = __ablaRuntimeArrayLengthI64(slots) * 2 - 1
-    val hash = __ablaRuntimeMapHash(key)
     val mark = (hash >>> 32) & ~mask & 4294967295
     var slot = hash & mask
     var found = -1
@@ -321,9 +342,8 @@ trusted fun __ablaRuntimeMapEntry(map: any, key: any): int {
     while (probing) {
         val held = ablaRuntimeLoadI32(base + slot * 4) & 4294967295
         if (held == 0) probing = false
-        else if ((held & ~mask) == mark && __ablaRuntimeMapKeyEqual(
-            __ablaRuntimeArrayGet(keys, __ablaRuntimeI64((held & mask) - 1)), key
-        )) {
+        else if ((held & ~mask) == mark &&
+            __ablaRuntimeMapEntryKeyEqual(keysAddress, (held & mask) - 1, key, tag)) {
             found = (held & mask) - 1
             probing = false
         } else slot = (slot + 1) & mask
@@ -331,11 +351,10 @@ trusted fun __ablaRuntimeMapEntry(map: any, key: any): int {
     found
 }
 
-// Points the first free slot for `key` at entry `entry`.
-trusted fun __ablaRuntimeMapPlace(slots: any, key: any, entry: int): int {
+// Points the first free slot for a key of hash `hash` at entry `entry`.
+trusted fun __ablaRuntimeMapPlace(slots: any, hash: int, entry: int): int {
     val base = __ablaRuntimeMapSlotBase(slots)
     val mask = __ablaRuntimeArrayLengthI64(slots) * 2 - 1
-    val hash = __ablaRuntimeMapHash(key)
     var slot = hash & mask
     while (ablaRuntimeLoadI32(base + slot * 4) != 0) slot = (slot + 1) & mask
     ablaRuntimeStoreI32(base + slot * 4, ((hash >>> 32) & ~mask & 4294967295) | (entry + 1))
@@ -359,11 +378,11 @@ trusted fun __ablaRuntimeMapRehash(map: any, extra: int): int {
     while (index < count) {
         val key = __ablaRuntimeArrayGet(keys, __ablaRuntimeI64(index))
         if (__ablaRuntimeTag(key) != 1) {
-            __ablaRuntimeArrayAppend(liveKeys, key)
-            __ablaRuntimeArrayAppend(
+            __ablaRuntimeMapAppend(liveKeys, key)
+            __ablaRuntimeMapAppend(
                 liveValues, __ablaRuntimeArrayGet(values, __ablaRuntimeI64(index))
             )
-            __ablaRuntimeMapPlace(slots, key, kept)
+            __ablaRuntimeMapPlace(slots, __ablaRuntimeMapHash(key), kept)
             kept = kept + 1
         }
         index = index + 1
@@ -383,8 +402,26 @@ trusted fun __ablaRuntimeMapGet(map: any, key: any): any {
 trusted fun __ablaRuntimeMapHas(map: any, key: any): any =
     __ablaRuntimeBool(__ablaRuntimeMapEntry(map, key) >= 0)
 
+// ArrayAppend's in-place case inline, for a map's entry arrays.
+@inline
+trusted fun __ablaRuntimeMapAppend(value: any, element: any): void {
+    val array = __ablaRuntimeArrayAddress(value)
+    val length = ablaRuntimeLoadI64(array)
+    val kind = __ablaRuntimeArrayKind(array)
+    val source = ablaRuntimeValueAddress(element)
+    if (length < __ablaRuntimeArrayCapacity(array) &&
+        (kind == 0 || __ablaRuntimeDenseKind(source) == kind)) {
+        val values = ablaRuntimeLoadI64(array + 16)
+        if (kind != 0) {
+            ablaRuntimeStoreI64(values + length * 8, ablaRuntimeLoadI64(source + 8))
+        } else __ablaRuntimeCopyValue(element, values + length * 24)
+        ablaRuntimeStoreI64(array, length + 1)
+    } else __ablaRuntimeArrayAppendGrowing(array, element)
+}
+
 trusted fun __ablaRuntimeMapSet(map: any, key: any, value: any): any {
-    val entry = __ablaRuntimeMapEntry(map, key)
+    val hash = __ablaRuntimeMapHash(key)
+    val entry = __ablaRuntimeMapEntryHashed(map, key, hash)
     if (entry >= 0) {
         __ablaRuntimeArraySet(
             __ablaRuntimeMapPart(map, 1), __ablaRuntimeI64(entry), value
@@ -395,9 +432,9 @@ trusted fun __ablaRuntimeMapSet(map: any, key: any, value: any): any {
         if ((used + 1) * 2 > capacity) __ablaRuntimeMapRehash(map, 1)
         val keys = __ablaRuntimeMapPart(map, 0)
         val added = __ablaRuntimeArrayLengthI64(keys)
-        __ablaRuntimeArrayAppend(keys, key)
-        __ablaRuntimeArrayAppend(__ablaRuntimeMapPart(map, 1), value)
-        __ablaRuntimeMapPlace(__ablaRuntimeMapPart(map, 2), key, added)
+        __ablaRuntimeMapAppend(keys, key)
+        __ablaRuntimeMapAppend(__ablaRuntimeMapPart(map, 1), value)
+        __ablaRuntimeMapPlace(__ablaRuntimeMapPart(map, 2), hash, added)
         __ablaRuntimeArraySet(map, __ablaRuntimeI64(3), __ablaRuntimeI64(
             __ablaRuntimeAsI64(__ablaRuntimeMapPart(map, 3)) + 1
         ))

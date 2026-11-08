@@ -34,4 +34,13 @@ set +e
 status=$?
 set -e
 [[ $status -eq 42 ]] || exit 1
-echo "map: keys, values, removal, growth, under collection, at compile time"
+# A randomized differential against a reference model, also under a collection at every safe point.
+"$compiler" build \
+    "$project_root/tests/cases/modules/map-differential.ab" \
+    -o "$output_directory/differential"
+for stress in 0 1; do
+    status=0
+    ABLA_GC_STRESS=$stress "$output_directory/differential" || status=$?
+    [[ $status -eq 42 ]] || exit 1
+done
+echo "map: keys, values, removal, growth, under collection, at compile time, randomized against a model"
