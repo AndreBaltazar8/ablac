@@ -723,7 +723,7 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   (examples only, no tests), `abla-site` (a deploy, dirty checkout), `abla-tmlanguage` (Node only),
   `abla-original` (an archive of the old tree). Local checkouts behind origin when the sweep began:
   abla-mobile 51, abla-web3d 87, abla-one 47, abla-mvc 4, abla-compare 3, abla-embedded 3.
-  Stale pins (later than the 0.2.50 release is none; earlier ones still pass with master's compiler):
+  Older pins (the repos still pass with master's compiler):
   0.2.29 abla-xml; 0.2.32 abla-blockchain, abla-soap; 0.2.45 abla-pdf, abla-printers, abla-s3; 0.2.48
   abla-mobile, abla-one; abla-cli, abla-mjml, abla-qr, abla-saft are at 0.2.50.
 - [ ] **A Wasm dev build's `opt` runs whole-module and serial.** In the compiler's driver
