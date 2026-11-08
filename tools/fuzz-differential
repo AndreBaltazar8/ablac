@@ -588,6 +588,11 @@ fun main: int = run()
 """
 
 
+# Conversions of NaN, infinities and huge floats to integers (conv_check) are defined: they
+# saturate, NaN gives 0 (docs/language.md, floating point). WebAssembly needs the
+# saturating truncation instructions for that, which the toolchain enables.
+
+
 def render_result(call, ty):
     if ty == "f64":
         return f"fmtF({call})"
@@ -634,7 +639,7 @@ class Runner:
         except subprocess.TimeoutExpired:
             return 124, "", "timeout"
 
-    def native(self, source, out, fast, ct):
+    def native(self, source, out, fast, ct, stderr=False):
         env = {"ABLA_COMPILE_EVAL": ct} if ct else None
         args = [self.compiler, "build", source, "-o", out, "--no-cache"]
         if fast:
@@ -642,13 +647,13 @@ class Runner:
         rc, _, err = self.sh(args, env)
         if rc != 0:
             return ("build-failed", err.strip().splitlines()[:6])
-        rc, stdout, _ = self.sh([out])
-        return (stdout, rc)
+        rc, stdout, err = self.sh([out])
+        return (stdout, rc, err.strip().splitlines()[:1]) if stderr else (stdout, rc)
 
-    def wasm(self, source, directory):
+    def wasm(self, source, directory, stderr=False):
         stem = os.path.join(directory, "w")
         driver = os.path.join(directory, "build-wasm.ab")
-        with open(driver, "w") as f:
+        with open(driver, "w", encoding="utf-8") as f:
             f.write(f'''import "abla/wasm/build"
 
 val release = #wasmBuildModule("w", "{source}", "{stem}.wasm", false, false)
@@ -663,8 +668,8 @@ fun main: int = if (release && development) 0 else 1
             if rc != 0 or not os.path.exists(os.path.join(ROOT, path)):
                 results[name] = ("build-failed", err.strip().splitlines()[:6])
                 continue
-            code, stdout, stderr = self.sh(["node", os.path.join(ROOT, "tools", "fuzz-differential.mjs"), path])
-            results[name] = (stdout, code)
+            code, stdout, err = self.sh(["node", os.path.join(ROOT, "tools", "fuzz-differential.mjs"), path])
+            results[name] = (stdout, code, err.strip().splitlines()[:1]) if stderr else (stdout, code)
         return results
 
     def all_modes(self, directory, prelude_checks):
@@ -673,9 +678,9 @@ fun main: int = if (release && development) 0 else 1
         os.makedirs(os.path.join(ROOT, directory), exist_ok=True)
         plain = os.path.join(directory, "program.ab")
         ct = os.path.join(directory, "program-ct.ab")
-        with open(os.path.join(ROOT, plain), "w") as f:
+        with open(os.path.join(ROOT, plain), "w", encoding="utf-8") as f:
             f.write(assemble(prelude, checks, False))
-        with open(os.path.join(ROOT, ct), "w") as f:
+        with open(os.path.join(ROOT, ct), "w", encoding="utf-8") as f:
             f.write(assemble(prelude, checks, True))
         jobs = {
             "fast": lambda: self.native(plain, os.path.join(directory, "fast"), True, False),
@@ -701,14 +706,26 @@ def run_panic(runner, seed, keep):
     directory = os.path.join(WORK, f"panic{seed}")
     os.makedirs(os.path.join(ROOT, directory), exist_ok=True)
     plain = os.path.join(directory, "program.ab")
-    with open(os.path.join(ROOT, plain), "w") as f:
+    with open(os.path.join(ROOT, plain), "w", encoding="utf-8") as f:
         f.write(text)
     results = {
-        "fast": runner.native(plain, os.path.join(directory, "fast"), True, False),
-        "release": runner.native(plain, os.path.join(directory, "release"), False, False),
+        "fast": runner.native(plain, os.path.join(directory, "fast"), True, False, True),
+        "release": runner.native(plain, os.path.join(directory, "release"), False, False, True),
     }
-    results.update(runner.wasm(plain, directory))
-    bad = verdict(results)
+    results.update(runner.wasm(plain, directory, True))
+    # Agreement is not enough (all modes could be wrong the same way): a panic prints
+    # `before` and not `after`, ends with status 101 (the language's panic status, not
+    # a normalisation here) and reports itself on standard error before it ends.
+    absolute = []
+    for mode, value in results.items():
+        if value[0] == "build-failed":
+            continue
+        stdout, code, err = value
+        if stdout != "before\n" or code != 101 or not (err and err[0].startswith("panic")):
+            absolute.append(f"{mode}: stdout {stdout!r}, status {code}, stderr {err}")
+    bad = verdict({m: v[:2] for m, v in results.items()})
+    if bad is None and absolute:
+        bad = "all modes agree but do not panic as specified: " + "; ".join(absolute)
     if bad is None and not keep:
         shutil.rmtree(os.path.join(ROOT, directory), ignore_errors=True)
     return None if bad is None else f"panic ({name}), seed {seed}: {bad}"
@@ -843,10 +860,10 @@ def main():
     if args.program:
         directory = os.path.join(WORK, "program")
         os.makedirs(os.path.join(ROOT, directory), exist_ok=True)
-        text = open(args.program).read()
+        text = open(args.program, encoding="utf-8").read()
         results = {}
         plain = os.path.join(directory, "program.ab")
-        open(os.path.join(ROOT, plain), "w").write(text)
+        open(os.path.join(ROOT, plain), "w", encoding="utf-8").write(text)
         results["fast"] = runner.native(plain, os.path.join(directory, "fast"), True, False)
         results["release"] = runner.native(plain, os.path.join(directory, "release"), False, False)
         results.update(runner.wasm(plain, directory))

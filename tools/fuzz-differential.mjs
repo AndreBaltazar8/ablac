@@ -3,7 +3,11 @@ const module = new WebAssembly.Module(readFileSync(process.argv[2]));
 let memory; const out = []; let code = 0;
 class Exit extends Error { constructor(c) { super("exit"); this.code = c; } }
 const abla_host = {
-  write: (fd, data, length) => { if (fd === 1) out.push(Buffer.from(new Uint8Array(memory.buffer, data, length))); return length; },
+  write: (fd, data, length) => {
+    const bytes = Buffer.from(new Uint8Array(memory.buffer, data, length));
+    if (fd === 1) out.push(bytes); else if (fd === 2) process.stderr.write(bytes);
+    return length;
+  },
   exit: (c) => { throw new Exit(c); },
   clock_ns: () => 0n, random: (d, l) => l };
 const { exports } = new WebAssembly.Instance(module, { abla_host });
