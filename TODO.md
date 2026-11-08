@@ -483,11 +483,11 @@ Package-side work (not changed from ablac):
   Full samples, baseline/candidate binaries and the uncommitted prototype are
   in `worktrees/ablac-route-match` (`build/route-lab/measurement.json`).
 - [ ] **A map lookup waits on a cache miss** (2026-11-03): 83% of `__ablaRuntimeMapEntry`'s cycles in
-  maps are the load of its slot from a 4 MB slot array; fewer instructions in the probe saved
-  0.4%. A denser table (32-bit slots, keys' hashes beside them) would miss less. A prototype
-  (two 32-bit slots a word, old tables retired at once; worktree ablac-map-dense, report in
-  its build/map-lab/report.json) ran maps 30% fewer cycles, but json-megabyte peaked 7.7%
-  higher: a smaller live heap moves its collections later, so the peak grows.
+  maps are the load of its slot from a 4 MB slot array. Slots are now 32-bit (two to an i64
+  element: entry + 1 in the mask's bits, the hash's upper bits above them as a mark), halving the
+  array. 2026-11-08, wall time on a pinned core: maps 0.220 s to 0.197 s (-10.5%); json-megabyte
+  peak RSS +1.5% (the earlier 64-bit-to-two-slot prototype was +7.7%), time unchanged. Cycles and
+  instructions still wait for a projects-e8 fair window.
 - [ ] **`ablac test --o1` costs short suites build time** (2026-11-03): a bundle's build is about
   65% dearer than `--fast`'s (abla-qr: 28 G instructions against 17 G) for tests that run 10x
   faster; a suite of tests that each run in milliseconds is slower than before. `--fast` keeps
