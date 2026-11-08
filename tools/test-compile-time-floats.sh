@@ -51,4 +51,13 @@ set +e
 status=$?
 set -e
 [[ $status -eq 42 ]] || exit 1
+# f32 of an f64 expression is rejected the same way in a plain and a compile function.
+for rejected in f32-of-f64-native f32-of-f64-compile-time; do
+    if "$compiler" build "$project_root/tests/cases/modules/$rejected.ab" \
+        -o "$output_directory/$rejected" --fast --no-cache > "$output_directory/$rejected.log" 2>&1; then
+        echo "$rejected built, but analysis must reject it" >&2
+        exit 1
+    fi
+    grep -q 'type.constructor-argument:f32' "$output_directory/$rejected.log" || exit 1
+done
 echo "compile-time floats: bit-identical to run time"
