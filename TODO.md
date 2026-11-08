@@ -20,6 +20,19 @@
 
 ## Bugs seen
 
+- [x] **Master's Linux job failed from e031754a to 66d3dfec (2026-11-07), two flakes.** (1)
+  `tests/cases/run-limited/parent-death.py`: the worker wrote `parent` once `child` existed, but
+  the child creates that file empty before writing its pid, so the test read `''`
+  (CI 42422564852, `suite-limited-runner`); fixed in 66d3dfec. (2) `test-jit-host-selection`:
+  `modules/filesystem` exited 6, the `watchFile` check (CI 42425955626, `suite/84.log`); it
+  passed in 42428033368 and locally. Not a coarse clock: that runner is 7.0.0-1017-azure
+  (image ubuntu-24.04 20261101.360.1) and 200 back-to-back stat'd writes gave 200 distinct
+  mtimes. Likely cause, unproven: the kernel's multigrain timestamps hand a fine stamp only to a
+  file whose mtime was read since its last change, and `writeTextAtomic` renames in a new file
+  that nobody has read, so it gets the coarse stamp, which can equal the old file's when both
+  land in one tick. `watchFile` compared only the mtime; it now also compares size, inode and
+  ctime. If `modules/filesystem` exits 6 or 7 again after that, the cause is not this.
+
 - [ ] Additional `--fast` ELF sections: LLVM's in-process C API ignores
   `--function-sections`/`--data-sections` set through its command-line parser.
   A manual section screen moved relocated constants out of RELRO and is unsafe.
