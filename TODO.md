@@ -565,6 +565,23 @@ seconds (88 G cycles); never collecting, it takes about 24 (73 G cycles) and pea
 10 GB. (Plain globals for the root frame until threads are enabled were tried: 5% faster
 compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not yet done:
 
+- [ ] **Where a `--fast` build's CPU goes** (2026-11-08, master `8cbb4a67`, stage1 from the v0.2.49 seed,
+  `perf record -e instructions:u -c 400000 --inherit` of `build --fast --no-cache`; a function's
+  `abla_fn_` name maps to its source name through the `"abla.source"` attribute of the compiler's own
+  `--emit-llvm src/orc_main.ab`). `tests/cases/modules/unsafe-boundary.ab` and
+  `examples/websocket-echo-server.ab` (about 3.6 G instructions each) split alike: the compiler's own code
+  58 to 59%, in-process LLVM (opt and FastISel code generation together) 27%, libc (malloc, memset) 7 to 8%,
+  the separate clang and ld.lld processes under 5%. Inside the compiler's share: runtime helpers 17 to 18%
+  (`__ablaRuntimeStringBytesEqual` 4 to 5%, `ArrayAppend` plus `ArrayAppendGrowing` 4.5%,
+  `ObjectBlock`/`AllocateOutOfLine` 2.5%, `MapEntry` 1%), module/hash/text utilities 8.5 to 10%
+  (`bootstrapTextContains` 1.2 to 2%, the name hash 1.5 to 1.8%, the declaration index's `find` 1 to 1.5%),
+  the parser 5%, the lexer 1.4 to 2%, the analyzer 2 to 5%, IR lowering 3 to 4%, the LLVM emission on the
+  ablac side 4 to 5%. libLLVM itself is flat: no symbol over 1%. Nothing reaches 5% alone, so a 5% cut on
+  `--fast` programs needs several of these together or a structural change (reusing the frontend's work on
+  the standard library between builds). Done from it: `bootstrapReadRunningImageIdentity` hashed the 8.3 MB
+  compiler image a word at a time with two modulo steps per word (1.3 to 1.6% of a build); two words a step
+  gives the same two residues with half the divisions: 3,559.7 M to 3,550.8 M and 3,637.5 M to 3,628.3 M
+  instructions (-0.25% each, three alternating runs; the executables are byte-identical).
 - [ ] **`opt` and `llc` run one after the other on one module.** In that dev build they are
   22.6 of its 54 wall seconds (opt 11.6, llc 11.0). Emitting the module as N partitions
   during emission and running N opt/llc pairs at once would cut most of that wall time on a
