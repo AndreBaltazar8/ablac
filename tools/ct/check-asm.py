@@ -166,8 +166,10 @@ def check_x86(lines, secret, pointers):
             if "ptr:" + r in out:
                 state.add("ptr:" + r)
         state.discard("flags")
-        # Memory it was given may now hold secrets: if it was given a frame address, any slot might.
-        if any("stackaddr:" + r in state for r in X86_ARGS):
+        # Memory it was given may now hold secrets. Once the function has made an address in its own
+        # frame (lea or mov from rsp), it may have been spilled, pushed or kept in a callee-saved
+        # register, and the callee may have written through it: every slot read after a call is secret.
+        if "frameaddr" in state:
             state.add("pushed")
         return frozenset(state)
 
@@ -261,6 +263,7 @@ def check_x86(lines, secret, pointers):
                 else:
                     state.discard(r)
                 (state.add if pointer else state.discard)("ptr:" + r)
+                state.discard("stackaddr:" + r)
                 if r != "rsp":
                     state.discard("stackbase:" + r)
             else:
@@ -332,6 +335,9 @@ def check_x86(lines, secret, pointers):
             write(ops[1], value, pointer_input)
             if stack_base and ops[1].startswith("%"):
                 state.add("stackbase:" + x86_reg(ops[1]))
+                state.add("stackaddr:" + x86_reg(ops[1]))
+            if stack_base:
+                state.add("frameaddr")
             return frozenset(state)
         # A zeroing idiom forgets what it wrote over.
         if (op.startswith(("xor", "pxor", "vpxor", "sub", "xorp")) and len(ops) >= 2 and
@@ -344,9 +350,15 @@ def check_x86(lines, secret, pointers):
             value = read(ops[0])
             source = x86_reg(ops[0]) if ops[0].startswith("%") else ""
             stack_base = source == "rsp" or "stackbase:" + source in state
+            from_stack_address = "stackaddr:" + source in state
             write(ops[1], value, pointer)
             if stack_base and ops[1].startswith("%"):
                 state.add("stackbase:" + x86_reg(ops[1]))
+            if (stack_base or from_stack_address) and ops[1].startswith("%"):
+                state.add("stackaddr:" + x86_reg(ops[1]))
+            # mov %rsp, %rbp sets up the frame pointer; it isn't an address given away.
+            if (stack_base or from_stack_address) and not (source == "rsp" and ops[1] == "%rbp"):
+                state.add("frameaddr")
             return frozenset(state)
         inputs = any(read(o) for o in ops[:-1]) if ops else False
         # Three-operand IMUL overwrites its destination; unlike the two-operand
@@ -372,12 +384,9 @@ def check_x86(lines, secret, pointers):
             moves_pointer = (op.startswith(("add", "sub")) and len(ops) == 2 and not inputs and
                              (read_pointer(ops[-1]) or read_pointer(ops[0])))
             destination = x86_reg(ops[-1]) if ops[-1].startswith("%") else None
-            # A register that holds an address in our own frame: a callee may write through it.
-            stack_address = destination is not None and (
-                (op.startswith("lea") and (m := mem_parts(ops[0])) is not None and m.group(2) and
-                 x86_reg(m.group(2)) in ("rsp", "rbp")) or
-                (op.startswith("mov") and ops[0].startswith("%") and "stackaddr:" + x86_reg(ops[0]) in state) or
-                (op.startswith(("add", "sub")) and "stackaddr:" + destination in state))
+            # A register that holds an address in our own frame stays one when a constant is added.
+            stack_address = (destination is not None and op.startswith(("add", "sub")) and
+                             "stackaddr:" + destination in state)
             write(ops[-1], inputs, moves_pointer)
             if destination is not None:
                 state.discard("stackaddr:" + destination)

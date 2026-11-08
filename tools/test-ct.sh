@@ -136,6 +136,22 @@ residue_read() { # object
     echo "ok   x86_64 residue: $(grep -c '^ok' "$out/x86_64-residue.log") fixtures leave no secret in a slot, $(wc -l < "$out/x86_64-residue.found") listed in residue-known.txt, the control pair told apart"
 }
 
+# A callee that writes a secret through an address of the caller's own frame (made by lea or by mov from rsp)
+# makes the caller's slots secret; a secret passed in a stack slot is found inside the callee. Hand-written assembly,
+# linked so that the calls resolve.
+frame_address_read() {
+    llvm-mc -triple x86_64-linux-gnu -filetype=obj "$cases/frame-address-x86.s" -o "$out/frame-address-x86.o"
+    ld.lld -static -e caller_lea "$out/frame-address-x86.o" -o "$out/frame-address-x86"
+    local entry
+    for entry in caller_lea caller_mov caller_spill caller_push caller_calleesaved caller_stackarg; do
+        if $check --follow-calls x86_64 "$out/frame-address-x86" "$entry:0" > "$out/frame-address-$entry.log" 2>&1; then
+            echo "ct: missed $entry" >&2; exit 1
+        fi
+        grep -q '^LEAK' "$out/frame-address-$entry.log" || { cat "$out/frame-address-$entry.log" >&2; exit 1; }
+    done
+    echo "ok   x86_64 following calls: a secret written through a frame address, and one passed on the stack, found"
+}
+
 # A --fast build doesn't optimise, so it keeps what release builds remove: the type-tag check of every
 # erased scalar conversion branches on a value copied from a secret's box, and a division by a secret
 # stays a division. The checker can't tell those from payload, and they are not what the fast fixtures
@@ -187,6 +203,7 @@ read_target x86_64 "$out/x86.o"
 # defined in the same object, with the argument secrecy the caller passes.
 "$compiler" build "$cases/object-x86.ab" -o "$out/x86-fast.o" --emit object --no-cache --fast
 fast_read x86_64 "$out/x86-fast.o"
+frame_address_read
 residue_read "$out/x86.o"
 
 # --- AArch64 --------------------------------------------------------------------------
