@@ -103,7 +103,6 @@
   Move it to Abla once those archive primitives exist; keep checksum and manifest verification.
 - [x] `abla/yaml` provides bounded Core-schema parsing, checked emission and comment/format-preserving path edits;
       see [docs/stdlib/yaml.md](docs/stdlib/yaml.md) and the synthetic provision-mail fixture. NovaKind can adopt it after release.
-- [ ] `abla-s3` has no list-objects, create-bucket or head-bucket; a tool goes through `bucketRequest` and `sendOnce`, and parses the XML.
 
 ## Compiler and stdlib
 
