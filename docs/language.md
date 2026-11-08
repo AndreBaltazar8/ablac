@@ -195,8 +195,8 @@ panics with its runtime tag; WebAssembly traps without a message. An `f32` or
 `any` gets the float formatter; others build without it. Equality through
 `any` compares a value's kind as well as its bits: a boxed float never equals an
 integer, an `f32` never equals an `f64`, and two function values are equal only
-when they call the same function. Floats compare by bits there, so a `NaN`
-equals the same `NaN` and `0.0` does not equal `-0.0`.
+when they call the same function. Two floats of one kind compare as typed `==`
+does: a `NaN` equals nothing and `0.0` equals `-0.0`.
 
 ### Raw text blocks
 
