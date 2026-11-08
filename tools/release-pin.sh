@@ -30,13 +30,14 @@ repo=AndreBaltazar8/ablac
 dir=
 check_binaries=1
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+root_given=0
 positional=()
 while (($#)); do
     case $1 in
         --repo) repo=${2:?}; shift 2 ;;
         --dir) dir=${2:?}; shift 2 ;;
         --no-binaries) check_binaries=0; shift ;;
-        --root) root=${2:?}; shift 2 ;;
+        --root) root=${2:?}; root_given=1; shift 2 ;;
         -h | --help) usage ;;
         -*) echo "release-pin: unknown option $1" >&2; usage ;;
         *) positional+=("$1"); shift ;;
@@ -45,6 +46,17 @@ done
 ((${#positional[@]} == 1)) || usage
 tag=${positional[0]}
 [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "release-pin: tag must look like v0.2.51, got $tag" >&2; exit 2; }
+
+# The default checkout is the one this script is in: not the main checkout while it is on master (that one
+# stays clean; pin in a worktree on a branch, or name the checkout with --root).
+if ((!root_given)) && git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
+    branch=$(git -C "$root" symbolic-ref --short HEAD 2>/dev/null || true)
+    if [[ $branch == master || $branch == main ]] &&
+        [[ $(git -C "$root" rev-parse --absolute-git-dir) == "$(git -C "$root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" ]]; then
+        echo "release-pin: $root is the main checkout, on $branch: pin in a worktree on a branch (or pass --root)" >&2
+        exit 2
+    fi
+fi
 
 script=$root/tools/bootstrap-compiler.sh
 [[ -f $script ]] || { echo "release-pin: no $script" >&2; exit 2; }
@@ -125,11 +137,12 @@ open(path, 'w').write(text)
 PY
 
 # README.md and docs/bootstrap.md: every mention of the version being replaced.
+# (A mention is the version followed by neither a letter, a digit nor `.digit`, so v0.2.49 leaves v0.2.490 alone.)
 for file in README.md docs/bootstrap.md; do
     path=$root/$file
     [[ -f $path ]] || continue
-    count=$(grep -o "$old" "$path" | wc -l | tr -d ' ')
-    sed -i.pin "s/${old//./\\.}/$tag/g" "$path" && rm -f -- "$path.pin"
+    count=$(OLD=$old perl -ne '$c++ while /(?<![0-9A-Za-z])\Q$ENV{OLD}\E(?![0-9A-Za-z]|\.[0-9])/g; END { print $c + 0 }' "$path")
+    OLD=$old NEW=$tag perl -pi -e 's/(?<![0-9A-Za-z])\Q$ENV{OLD}\E(?![0-9A-Za-z]|\.[0-9])/$ENV{NEW}/g' "$path"
     echo "  $file: $count mention(s) of $old now $tag"
 done
 # The setup-abla version in README.md (`version: '0.2.51'`, no `v`) is the Prepare commit's, not the pin's.
@@ -139,6 +152,7 @@ if grep -q "'$old_plain'" "$root/README.md" 2>/dev/null; then
 fi
 if git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
     git -C "$root" diff --stat -- tools/bootstrap-compiler.sh README.md docs/bootstrap.md
+    git -C "$root" diff -U0 -- tools/bootstrap-compiler.sh README.md docs/bootstrap.md | grep '^[-+][^-+]' | head -40
     echo "review 'git diff': a mention of $old that is history, not the pin, should stay"
 fi
 echo "pinned to $tag (not committed)"

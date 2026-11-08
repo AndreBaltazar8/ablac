@@ -105,6 +105,29 @@ printf 'a different compiler\n' >"$work/other-stage2"
 expect_fail "a different local stage 2" run_check "$release" v9.9.9 "$work/other-stage2"
 grep -q '^FAIL  stage2' "$work/out.txt" || fail "a different stage 2 did not fail the stage2 check"
 
+# --out is never wiped by mistake; a repeated file name and an empty directory are reported.
+expect_fail "--out ." run_check "$release" v9.9.9 "$stage2" --out .
+expect_fail "--out /" run_check "$release" v9.9.9 "$stage2" --out /
+mkdir -p "$work/not-ours"
+printf 'x\n' >"$work/not-ours/file"
+expect_fail "--out a non-empty directory not made by the script" run_check "$release" v9.9.9 "$stage2" --out "$work/not-ours"
+[[ -f $work/not-ours/file ]] || fail "release-check wiped a directory it did not make"
+expect_fail "--out inside --artifacts" run_check "$release" v9.9.9 "$stage2" --out "$release/inside"
+expect_fail "--out containing --artifacts" run_check "$release" v9.9.9 "$stage2" --out "$work"
+[[ -f $release/ablac-x86_64-linux ]] || fail "release-check wiped the artifacts"
+directory=$(mutated duplicated)
+mkdir -p "$directory/second"
+cp "$directory/ablac-arm64-macos.sha256" "$directory/second/"
+expect_fail "the same file name in two places" run_check "$directory" v9.9.9 "$stage2"
+grep -q '^FAIL  assets.*same file name' "$work/out.txt" || fail "a repeated file name did not fail the assets check"
+mkdir -p "$work/empty-artifacts"
+expect_fail "no artifacts" run_check "$work/empty-artifacts" v9.9.9 "$stage2"
+grep -q '^FAIL  assets.*no files' "$work/out.txt" || fail "an empty artifacts directory did not fail clearly"
+# A second run into the directory the script made is allowed.
+out2=$work/out-again
+"$check" v9.9.9 1 "$stage2" --artifacts "$release" --assets-from "$work/names.txt" --out "$out2" >/dev/null || fail "release-check refused a first run"
+"$check" v9.9.9 1 "$stage2" --artifacts "$release" --assets-from "$work/names.txt" --out "$out2" >/dev/null || fail "release-check refused its own directory"
+
 # --- release-pin: a checkout pinned to v9.9.8 moves to v9.9.9.
 root=$work/root
 mkdir -p "$root/tools" "$root/docs"
@@ -126,7 +149,7 @@ case "$platform/$machine" in
 esac
 EOF
 printf 'compiler from `v9.9.8`, then recompiles\nsetup-abla version: '"'"'9.9.8'"'"'\n' >"$root/README.md"
-printf 'native `v9.9.8` artifact\nstable v9.9.8 binaries\nv9.9.8 bootstrap\npinned v9.9.8 compiler\nthe v9.9.7 bridge\n' >"$root/docs/bootstrap.md"
+printf 'native `v9.9.8` artifact\nstable v9.9.8 binaries\nv9.9.8 bootstrap\npinned v9.9.8 compiler\nends a sentence at v9.9.8.\n(v9.9.8) in brackets\nthe v9.9.7 bridge\nand v9.9.80 is another\n' >"$root/docs/bootstrap.md"
 snapshot() { cat "$root/tools/bootstrap-compiler.sh" "$root/README.md" "$root/docs/bootstrap.md" | sha256sum; }
 before=$(snapshot)
 
@@ -159,6 +182,26 @@ done
 grep -q 'from `v9.9.9`' "$root/README.md" || fail "README.md was not moved"
 grep -q "'9.9.8'" "$root/README.md" || fail "the setup-abla version (the Prepare commit's) was changed"
 grep -q '^note: README.md still has' "$work/out.txt" || fail "no note about the setup-abla version"
-[[ $(grep -c 'v9.9.9' "$root/docs/bootstrap.md") -eq 4 ]] || fail "docs/bootstrap.md has the wrong number of v9.9.9 mentions"
+[[ $(grep -c 'v9.9.9' "$root/docs/bootstrap.md") -eq 6 ]] || fail "docs/bootstrap.md has the wrong number of v9.9.9 mentions"
+grep -q 'v9.9.80 is another' "$root/docs/bootstrap.md" || fail "v9.9.80 was changed with v9.9.8"
+grep -q 'ends a sentence at v9.9.9\.' "$root/docs/bootstrap.md" || fail "a mention at the end of a sentence was not moved"
+grep -q '(v9.9.9) in brackets' "$root/docs/bootstrap.md" || fail "a bracketed mention was not moved"
 grep -q 'v9.9.7 bridge' "$root/docs/bootstrap.md" || fail "a mention of another version was changed"
+# release-pin does not write into a main checkout that is on master, but does in a linked worktree.
+main=$work/main-checkout
+mkdir -p "$main/tools" "$main/docs"
+cp "$pin" "$main/tools/release-pin.sh"
+cp "$root/tools/bootstrap-compiler.sh" "$main/tools/bootstrap-compiler.sh"
+sed -i "s/^version=v9.9.9$/version=v9.9.8/" "$main/tools/bootstrap-compiler.sh"
+[[ $(grep -c "^version=v9.9.8$" "$main/tools/bootstrap-compiler.sh") -eq 1 ]] || fail "the main checkout fixture is not at v9.9.8"
+git -C "$main" init -q -b master
+git -C "$main" -c user.name=t -c user.email=t@t add -A
+git -C "$main" -c user.name=t -c user.email=t@t commit -q -m start
+printf 'v9.9.9 stays\n' >"$work/unused"
+expect_fail "pinning in a main checkout on master" "$main/tools/release-pin.sh" v9.9.9 --dir "$release"
+grep -q 'main checkout' "$work/out.txt" || fail "no explanation for refusing the main checkout"
+grep -q "^version=v9.9.8$" "$main/tools/bootstrap-compiler.sh" || fail "the refused pin changed the main checkout"
+git -C "$main" worktree add -q -b pin "$work/linked"
+"$work/linked/tools/release-pin.sh" v9.9.9 --dir "$release" >/dev/null 2>&1 || fail "release-pin refused a linked worktree"
+grep -q '^version=v9.9.9$' "$work/linked/tools/bootstrap-compiler.sh" || fail "the linked worktree was not pinned"
 echo "release scripts: a good release is accepted; a doctored sha256, a changed asset, a missing or extra asset, a wrong version and another stage 2 are refused; a pin moves the version and three sha256s and refuses a bad .sha256"

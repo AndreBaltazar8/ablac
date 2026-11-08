@@ -57,9 +57,44 @@ sha256() {
     else shasum -a 256 "$1" | cut -d' ' -f1; fi
 }
 
-# Collect the artifacts in one flat directory.
-rm -rf -- "$out"
+# Where the flattened artifacts go: refuse a directory this script could wipe by mistake. An existing
+# one is only emptied if it is empty or this script made it (it holds the .release-check marker).
+physical() { # directory that exists -> its physical path
+    (cd -P -- "$1" 2>/dev/null && pwd -P)
+}
+mkdir -p -- "$(dirname -- "$out")"
+out_parent=$(physical "$(dirname -- "$out")") || { echo "release-check: cannot use --out $out" >&2; exit 2; }
+out_physical=$out_parent/$(basename -- "$out")
+project_root=$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+case $out_physical in
+    / | "$HOME" | "$project_root" | "$out_parent" | */. | */..)
+        echo "release-check: refusing --out $out (it resolves to $out_physical)" >&2
+        exit 2 ;;
+esac
+if [[ -n $artifacts ]]; then
+    artifacts_physical=$(physical "$artifacts") || { echo "release-check: no artifacts directory $artifacts" >&2; exit 2; }
+    case $out_physical/ in
+        "$artifacts_physical"/* ) echo "release-check: --out $out is inside --artifacts $artifacts" >&2; exit 2 ;;
+    esac
+    case $artifacts_physical/ in
+        "$out_physical"/* ) echo "release-check: --out $out contains --artifacts $artifacts" >&2; exit 2 ;;
+    esac
+fi
+if [[ -e $out ]]; then
+    if [[ ! -d $out ]]; then
+        echo "release-check: --out $out exists and is not a directory" >&2
+        exit 2
+    fi
+    if [[ -n $(ls -A -- "$out") && ! -f $out/.release-check ]]; then
+        echo "release-check: --out $out is not empty and was not made by this script (no .release-check marker)" >&2
+        exit 2
+    fi
+    rm -rf -- "$out"
+fi
 mkdir -p -- "$out"
+: >"$out/.release-check"
+
+# Collect the artifacts in one flat directory.
 if [[ -n $artifacts ]]; then
     source_dir=$artifacts
 else
@@ -70,8 +105,11 @@ else
         exit 2
     fi
 fi
+# Two artifacts holding a file of the same name would overwrite each other in the flat directory:
+# list the names first and report a repeat.
+duplicates=$(find "$source_dir" -type f -exec basename {} \; | sort | uniq -d | tr '\n' ' ')
 find "$source_dir" -type f -exec cp -f {} "$out"/ \;
-count=$(find "$out" -type f | wc -l | tr -d ' ')
+count=$(find "$out" -type f ! -name .release-check | wc -l | tr -d ' ')
 
 results=()
 failed=0
@@ -83,15 +121,17 @@ report() { # PASS|FAIL name detail
 # 1. assets: the previous release's names.
 expected=$(mktemp)
 actual=$(mktemp)
+# (This trap replaces the earlier one on purpose: it repeats that cleanup of the download directory, which
+# only exists when nothing was given with --artifacts, and also removes the two temporary lists.)
 trap 'rm -f -- "$expected" "$actual"; [[ -z ${source_dir:-} || -n $artifacts ]] || rm -rf -- "$source_dir"' EXIT
-( cd "$out" && ls ) | sort >"$actual"
+( cd "$out" && ls ) | sort >"$actual"   # (ls leaves out the .release-check marker)
 if [[ -n $assets_from ]]; then
     sort "$assets_from" >"$expected"
     basis="$assets_from"
 else
     if [[ -z $previous ]]; then
         previous=$(gh release list -R "$repo" -L 100 --exclude-drafts --json tagName --jq '.[].tagName' 2>/dev/null |
-            grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V |
+            grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//' | sort -t. -k1,1n -k2,2n -k3,3n | sed 's/^/v/' |
             awk -v tag="$tag" 'BEGIN { prior = "" } $0 == tag { print prior; found = 1; exit } { prior = $0 }
                 END { if (!found) print prior }')
     fi
@@ -103,7 +143,11 @@ else
         basis="(no previous release found)"
     fi
 fi
-if [[ ! -s $expected ]]; then
+if ((count == 0)); then
+    report FAIL assets "no files in the artifacts"
+elif [[ -n $duplicates ]]; then
+    report FAIL assets "the same file name in more than one artifact: ${duplicates% }"
+elif [[ ! -s $expected ]]; then
     report FAIL assets "no expected asset names ($basis)"
 elif diff -q "$expected" "$actual" >/dev/null; then
     report PASS assets "$count files, the names of $basis"
@@ -117,6 +161,7 @@ fi
 bad=
 checked=0
 for file in "$out"/*; do
+    [[ -e $file ]] || continue
     name=$(basename "$file")
     if [[ $name == *.sha256 ]]; then
         asset=${name%.sha256}
