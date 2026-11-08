@@ -59,13 +59,14 @@ fun main {
 | `* + ? {m} {m,} {m,n} {,n}` | greedy repetition (`{,n}` is `{0,n}`, as in Python); add `?` (`*?`, `{2,5}?`) for lazy |
 
 Repeat counts go up to 1000; a pattern whose expansion exceeds 100 000
-instructions (`((a{1000}){1000}){1000}`) or that nests groups deeper than 200
-levels is rejected. A `{` that does not start a valid repeat is a literal.
+instructions (`((a{1000}){1000}){1000}`) or whose instructions times capture slots exceed 2 000 000, or that has more
+than 500 groups or nests groups deeper than 200 levels, is rejected ("too large",
+"too many groups"), which bounds the memory a search needs. A `{` that does not start a valid repeat is a literal.
 
 **Rejected at compile time:** backreferences (`\1`) and octal escapes, lookahead
 and lookbehind (`(?=`, `(?!`, `(?<=`, `(?<!`), every other `(?` form including
-named groups, unknown letter escapes, `\b` inside a class, quantifiers with
-nothing to repeat (`*a`, `^*`), stacked quantifiers (`a**`, `a*+`), `{m,n}` with
+named groups and inline flags such as `(?i)`, unknown letter escapes, `\b` inside a class, quantifiers with
+nothing to repeat (`*a`, `^*`), stacked quantifiers (`a**`, possessive `a*+`), `{m,n}` with
 `n < m`, unterminated groups and classes, and patterns that are not valid UTF-8.
 
 ## Text model
