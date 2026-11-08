@@ -184,19 +184,19 @@
   indirection stubs (ORC lazy reexports or an indirect stubs manager) so a function can be
   redefined while the program runs.
 
-- [ ] **Transactional memory: partitioned clocks.** Every writing commit takes a version
-  from one global clock, so transactions on disjoint TVars queue on its cache line: four
-  threads each reading and writing 4 TVars a block take 95 ns a block on disjoint TVars
-  against 17 under one Mutex and 34 for one thread running directly. A prototype with sixteen
-  clocks by TVar address (snapshots taken per partition at the first read there, a version per
-  written partition at commit) takes disjoint blocks 26% faster (cycles −30%; the model of the
-  protocol and its negative controls, `test-stm` and the Wasm unwinding test pass) and leaves
-  shared and direct within noise, but costs a forced-logged one-thread block 30% more
-  instructions (+22% time), 1,241 to 1,620: 167 of that is fixed, about 70 more for each
-  extra partition a block touches. Not shipped; the prototype is on branch `stm-clocks`,
-  numbers in `docs/measurements/stm-partitioned-clocks-2026-11-08.md`. Next: keep the
-  single-clock path for a transaction that touches one partition and partition only when it
-  reads or writes a second.
+- [ ] **Transactional memory: clocks beyond the region.** A logged transaction now runs the
+  single-clock protocol on the clock of its first 1 KB region (sixteen clocks, region & 15) and keeps
+  a snapshot for each clock only once it touches a second region
+  (`docs/measurements/stm-hybrid-clocks-2026-11-08.md`). Four threads on TVars made apart take 58%
+  less time per block (cycles −55%); on sixteen TVars made one after the other, where a thread's
+  group of four can straddle a region boundary, 12% less (cycles −23%). The costs: a forced-logged
+  one-thread block executes 7.9% more instructions (1,241 to 1,339; its cycles are the baseline's to
+  within noise) and a transaction that touches a second region pays the partitioned protocol's
+  per-clock sampling. Open: a block over TVars made together can still straddle two regions (it then
+  samples two clocks, and neighbours that share a region share its clock); a region size that follows
+  the allocator's size classes, or counting a TVar's region at creation, would keep a structure's
+  TVars on one clock. The partitioned-only prototype that cost a logged block 30% more is on
+  branch `stm-clocks`.
 
 - [ ] **The rest of the reserved generic syntax.** `where` clauses, `const` type parameters and
   an interface's `type Item` still give `E_PARSE_NOT_YET_SUPPORTED`. Decide which to build.
