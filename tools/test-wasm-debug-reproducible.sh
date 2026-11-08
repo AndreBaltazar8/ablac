@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# It reads the source map and the DWARF module of a development build, which exist only with
+# debug information; tools/run-tests.sh builds without it.
+export ABLA_DEBUG=1
 # A development Wasm build's module, source map and DWARF module are the same
 # from one build to the next, and from a sysroot reached through another path
 # up to that path itself (they name the sources by absolute path). Their lines

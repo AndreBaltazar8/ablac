@@ -314,7 +314,9 @@ done
 read_target x86_64 "$out/x86.o"
 # A --fast build keeps every Abla call as a call. The checker follows each one into its callee, which is
 # defined in the same object, with the argument secrecy the caller passes.
-"$compiler" build "$cases/object-x86.ab" -o "$out/x86-fast.o" --emit object --no-cache --fast
+# -g: the object is read for secret branches, and without debug information (tools/run-tests.sh builds
+# without it) the fast code differs and ct_fix_arithmetic_u32 reports a branch.
+"$compiler" build "$cases/object-x86.ab" -o "$out/x86-fast.o" --emit object --no-cache --fast -g
 fast_read x86_64 "$out/x86-fast.o"
 frame_address_read
 residue_read

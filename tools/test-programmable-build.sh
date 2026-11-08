@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# The ABI checks grep readable function symbols (`@abla_scalar_next = alias ...`), which a build
+# carries only with debug information; tools/run-tests.sh builds without it.
+export ABLA_DEBUG=1
 # The ABI checks below inspect the generated LLVM, including fast libraries.
 export ABLA_KEEP_LLVM_TEXT=1
 
