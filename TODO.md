@@ -742,6 +742,11 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   Writing no object (`-filetype=null`) still peaks at 1.93 GB, and without debug
   information at 1.84 GB, so no `llc` option cuts it. Smaller functions (the boxing item
   below) or fewer functions per `llc` (partitions, above) would.
+  Remeasured 2026-11-08 on a synthetic 6,000-function dev module (82 MB of IR; peak RSS of
+  the whole `ablac build`, one run each at load 30 to 40): one object 1.68 GB, 8 code
+  generation units 1.42 GB (−16%), 38.6 s against 50.4 s wall under that load. Units cut
+  the peak a little and the child compilers each parse the module again, so the 1.9 GB of a
+  single release `llc` is untouched: only fewer or smaller functions per `llc` would help.
 - [ ] **Per-call boxing in the lowering.** 17% of the IR's instructions are
   `alloca %AblaValue` (146K in that program), with as many stores and loads around them
   and 29K `abla_i64` boxing calls. `opt`'s time is mostly the inliner, instcombine and SROA
