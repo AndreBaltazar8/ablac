@@ -28,15 +28,6 @@
   billion), and NovaKind's tool 2,674,576 to 2,824,680 (31.794 to 32.779
   billion). Revisit only with LLVM-correct relocation and section rules.
 
-- [ ] Report a readable unsupported interpolation panic on WebAssembly when
-  the module already imports the host write path, without adding imports to
-  hostless modules; these currently trap without a message. On 2026-11-03,
-  a writer-slot probe set from the generic syscall shim added `abla_host.write`
-  to clock-only modules. Setting it from the standard output writer instead
-  preserved clock-only and unused-output modules, but added `write` for a
-  reachable empty write where baseline has no imports, in both fast and
-  release builds. Neither was kept; preserve final import sets when revisiting.
-
 - [ ] Equality and hashing through `any` ignore the auxiliary word, so a
   boxed float and an integer with identical payload bits compare equal and
   hash alike through `any`. Interpolation now tells them apart (the erased
