@@ -1,0 +1,311 @@
+// Unsigned 128-bit integers: the language's `uint128` and what's done with it (docs/stdlib/uint128.md).
+// Operators wrap, as every fixed width's do and as the EVM's do; the `Checked` forms say when it doesn't fit.
+// Not for secrets: comparison and division take a time that depends on the value. abla/ct is for those.
+
+noescape extern:"intrinsic" fun ablaU128NativeMul(): bool
+noescape extern:"intrinsic" fun ablaU128_fromU64(value: u64): uint128
+noescape extern:"intrinsic" fun ablaU128_fromI64(value: i64): uint128
+noescape extern:"intrinsic" fun ablaU128_toU64(value: uint128): u64
+noescape extern:"intrinsic" fun ablaU128_not(value: uint128): uint128
+noescape extern:"intrinsic" fun ablaU128_add(a: uint128, b: uint128): uint128
+noescape extern:"intrinsic" fun ablaU128_sub(a: uint128, b: uint128): uint128
+noescape extern:"intrinsic" fun ablaU128_mul(a: uint128, b: uint128): uint128
+noescape extern:"intrinsic" fun ablaU128_udiv(a: uint128, b: uint128): uint128
+noescape extern:"intrinsic" fun ablaU128_urem(a: uint128, b: uint128): uint128
+noescape extern:"intrinsic" fun ablaU128_and(a: uint128, b: uint128): uint128
+noescape extern:"intrinsic" fun ablaU128_or(a: uint128, b: uint128): uint128
+noescape extern:"intrinsic" fun ablaU128_xor(a: uint128, b: uint128): uint128
+noescape extern:"intrinsic" fun ablaU128_shl(a: uint128, count: u32): uint128
+noescape extern:"intrinsic" fun ablaU128_lshr(a: uint128, count: u32): uint128
+noescape extern:"intrinsic" fun ablaU128_eq(a: uint128, b: uint128): bool
+noescape extern:"intrinsic" fun ablaU128_lt(a: uint128, b: uint128): bool
+noescape extern:"intrinsic" fun ablaU128NarrowTarget(): bool
+
+// As every widening: a signed source sign-extends, so uint128(-1) is the largest value, as u64(-1) is.
+@inline fun uint128(value: int): uint128 = ablaU128_fromI64(value)
+@inline fun uint128(value: i32): uint128 = ablaU128_fromI64(i64(value))
+@inline fun uint128(value: i16): uint128 = ablaU128_fromI64(i64(value))
+@inline fun uint128(value: i8): uint128 = ablaU128_fromI64(i64(value))
+@inline fun uint128(value: u64): uint128 = ablaU128_fromU64(value)
+@inline fun uint128(value: u32): uint128 = ablaU128_fromU64(u64(value))
+@inline fun uint128(value: u16): uint128 = ablaU128_fromU64(u64(value))
+@inline fun uint128(value: u8): uint128 = ablaU128_fromU64(u64(value))
+/** Four words, most significant first: how to write a constant that doesn't fit an `int`. */
+fun uint128Words(w3: u32, w2: u32, w1: u32, w0: u32): uint128 {
+    var out = uint128(w3)
+    out = ablaU128_or(ablaU128_shl(out, u32(32)), uint128(w2))
+    out = ablaU128_or(ablaU128_shl(out, u32(32)), uint128(w1))
+    ablaU128_or(ablaU128_shl(out, u32(32)), uint128(w0))
+}
+/** 2^128 - 1. */
+@inline fun uint128Max(): uint128 = ablaU128_not(uint128(0))
+/** Refuses what's below zero, where uint128(value) would extend the sign. */
+fun uint128OrNull(value: int): uint128? = if (value < 0) null else uint128(value)
+
+// What the compiler calls for `==`, `<` and the rest (bootstrapLowerArithmetic), and for "$x".
+@inline fun uint128Equal(a: uint128, b: uint128): bool = ablaU128_eq(a, b)
+@inline fun uint128NotEqual(a: uint128, b: uint128): bool = !ablaU128_eq(a, b)
+@inline fun uint128Less(a: uint128, b: uint128): bool = ablaU128_lt(a, b)
+@inline fun uint128LessEqual(a: uint128, b: uint128): bool = !ablaU128_lt(b, a)
+@inline fun uint128Greater(a: uint128, b: uint128): bool = ablaU128_lt(b, a)
+@inline fun uint128GreaterEqual(a: uint128, b: uint128): bool = !ablaU128_lt(a, b)
+fun uint128Text(value: uint128): string = value.toDecimal()
+
+@inline operator fun uint128.plus(other: uint128): uint128 = ablaU128_add(this, other)
+@inline operator fun uint128.minus(other: uint128): uint128 = ablaU128_sub(this, other)
+@inline operator fun uint128.unaryMinus(): uint128 = ablaU128_sub(uint128(0), this)
+@inline operator fun uint128.and(other: uint128): uint128 = ablaU128_and(this, other)
+@inline operator fun uint128.or(other: uint128): uint128 = ablaU128_or(this, other)
+@inline operator fun uint128.xor(other: uint128): uint128 = ablaU128_xor(this, other)
+@inline operator fun uint128.inv(): uint128 = ablaU128_not(this)
+
+// One word of a number, least significant first.
+private @inline fun uint128Word(value: uint128,
+    index: int): u32 = u32(ablaU128_toU64(ablaU128_lshr(value, u32(index * 32))))
+
+// A word times a word. On a 32-bit target a u64 product calls __muldi3, and four 16-bit products don't.
+// Not inlined, or LLVM evaluates the product at the width of what it's added to, and calls __multi3 for it.
+private @noinline fun uint128WordProduct(a: u32, b: u32): u64 {
+    if (!ablaU128NarrowTarget()) return u64(a) * u64(b)
+    val aLow = a & u32(65535)
+    val aHigh = a >> 16
+    val bLow = b & u32(65535)
+    val bHigh = b >> 16
+    val low = aLow * bLow
+    val first = aHigh * bLow + (low >> 16)
+    val second = aLow * bHigh + (first & u32(65535))
+    (u64(aHigh * bHigh + (first >> 16) + (second >> 16)) << 32) | u64((second << 16) | (low &
+        u32(65535)))
+}
+
+// Column by column from the top: each step moves what's done up a word and adds the next column.
+private @noinline fun uint128MultiplyWords(a: uint128, b: uint128): uint128 {
+    var out = uint128(0)
+    var column = 3
+    while (column >= 0) {
+        out = ablaU128_shl(out, u32(32))
+        for (i in 0 until column + 1) {
+            out = ablaU128_add(out, ablaU128_fromU64(uint128WordProduct(uint128Word(a, i),
+                uint128Word(b, column - i))))
+        }
+        column = column - 1
+    }
+    out
+}
+
+@inline operator fun uint128.times(other: uint128): uint128 =
+    if (ablaU128NativeMul()) ablaU128_mul(this, other) else uint128MultiplyWords(this, other)
+
+// LLVM expands a division to a loop where it's written, so it's written once.
+// By zero, the language's own panic: a u32 divided by the zero it's been told about.
+private @inline fun uint128CheckDivisor(b: uint128): void {
+    if (ablaU128_eq(b, uint128(0))) u32(1) / u32(ablaU128_toU64(b))
+}
+private @noinline fun uint128Divide(a: uint128, b: uint128): uint128 {
+    uint128CheckDivisor(b)
+    ablaU128_udiv(a, b)
+}
+private @noinline fun uint128Remainder(a: uint128, b: uint128): uint128 {
+    uint128CheckDivisor(b)
+    ablaU128_urem(a, b)
+}
+@inline operator fun uint128.div(other: uint128): uint128 = uint128Divide(this, other)
+@inline operator fun uint128.rem(other: uint128): uint128 = uint128Remainder(this, other)
+
+// As every width's: a count that's negative or at least the width gives zero.
+fun uint128ShiftLeft(value: uint128, count: int): uint128 =
+    if (count < 0 || count >= 128) uint128(0) else ablaU128_shl(value, u32(count))
+fun uint128ShiftRight(value: uint128, count: int): uint128 =
+    if (count < 0 || count >= 128) uint128(0) else ablaU128_lshr(value, u32(count))
+@inline operator fun uint128.shl(count: int): uint128 = uint128ShiftLeft(this, count)
+@inline operator fun uint128.shr(count: int): uint128 = uint128ShiftRight(this, count)
+@inline operator fun uint128.shl(count: i32): uint128 = uint128ShiftLeft(this, int(count))
+@inline operator fun uint128.shr(count: i32): uint128 = uint128ShiftRight(this, int(count))
+@inline operator fun uint128.shl(count: i16): uint128 = uint128ShiftLeft(this, int(count))
+@inline operator fun uint128.shr(count: i16): uint128 = uint128ShiftRight(this, int(count))
+@inline operator fun uint128.shl(count: i8): uint128 = uint128ShiftLeft(this, int(count))
+@inline operator fun uint128.shr(count: i8): uint128 = uint128ShiftRight(this, int(count))
+@inline operator fun uint128.shl(count: u64): uint128 = uint128ShiftLeft(this, int(count))
+@inline operator fun uint128.shr(count: u64): uint128 = uint128ShiftRight(this, int(count))
+@inline operator fun uint128.shl(count: u32): uint128 = uint128ShiftLeft(this, int(count))
+@inline operator fun uint128.shr(count: u32): uint128 = uint128ShiftRight(this, int(count))
+@inline operator fun uint128.shl(count: u16): uint128 = uint128ShiftLeft(this, int(count))
+@inline operator fun uint128.shr(count: u16): uint128 = uint128ShiftRight(this, int(count))
+@inline operator fun uint128.shl(count: u8): uint128 = uint128ShiftLeft(this, int(count))
+@inline operator fun uint128.shr(count: u8): uint128 = uint128ShiftRight(this, int(count))
+// The EVM's SHL and SHR take a 256-bit count.
+fun uint128.shl(count: uint128): uint128 =
+    if (ablaU128_lt(count, uint128(128))) ablaU128_shl(this,
+        u32(ablaU128_toU64(count))) else uint128(0)
+fun uint128.shr(count: uint128): uint128 =
+    if (ablaU128_lt(count, uint128(128))) ablaU128_lshr(this,
+        u32(ablaU128_toU64(count))) else uint128(0)
+
+@inline fun uint128.isZero(): bool = ablaU128_eq(this, uint128(0))
+/** Bit `index`, the least significant being 0; beyond the width, 0. */
+fun uint128.bit(index: int): bool =
+    index >= 0 && index < 128 && (ablaU128_toU64(ablaU128_lshr(this,
+        u32(index))) & u64(1)) == u64(1)
+/** The fewest bits that hold it: 0 for zero. */
+fun uint128.bitLength(): int {
+    var word = 3
+    while (word >= 0) {
+        var top = uint128Word(this, word)
+        if (top != u32(0)) {
+            var bits = 0
+            while (top != u32(0)) {
+                top = top >> 1
+                bits = bits + 1
+            }
+            return word * 32 + bits
+        }
+        word = word - 1
+    }
+    0
+}
+
+/** The sum, or null if it doesn't fit. */
+fun uint128.addChecked(other: uint128): uint128? {
+    val sum = ablaU128_add(this, other)
+    if (ablaU128_lt(sum, this)) null else sum
+}
+/** The difference, or null below zero. */
+fun uint128.subChecked(other: uint128): uint128? =
+    if (ablaU128_lt(this, other)) null else ablaU128_sub(this, other)
+/** The product, or null if it doesn't fit. */
+fun uint128.mulChecked(other: uint128): uint128? {
+    val bits = this.bitLength() + other.bitLength()
+    if (bits <= 128) return this * other
+    if (bits > 129) return null
+    // Two numbers of 129 bits between them: half of it fits, and doubling it says.
+    val half = this * ablaU128_lshr(other, u32(1))
+    if (half.bit(127)) return null
+    val doubled = ablaU128_shl(half, u32(1))
+    if (!other.bit(0)) return doubled
+    doubled.addChecked(this)
+}
+
+// Narrowing as every width's does: keeps the low bits.
+@inline fun uint128.toU64(): u64 = ablaU128_toU64(this)
+@inline fun uint128.toInt(): int = int(ablaU128_toU64(this))
+@inline fun uint128.toU32(): u32 = u32(ablaU128_toU64(this))
+@inline fun uint128.toU16(): u16 = u16(ablaU128_toU64(this))
+@inline fun uint128.toU8(): u8 = u8(ablaU128_toU64(this))
+// Or null if it doesn't fit.
+fun uint128.toU64OrNull(): u64? = if (this.bitLength() > 64) null else this.toU64()
+fun uint128.toIntOrNull(): int? = if (this.bitLength() > 63) null else this.toInt()
+fun uint128.toU32OrNull(): u32? = if (this.bitLength() > 32) null else this.toU32()
+fun uint128.toU16OrNull(): u16? = if (this.bitLength() > 16) null else this.toU16()
+fun uint128.toU8OrNull(): u8? = if (this.bitLength() > 8) null else this.toU8()
+
+private @inline fun uint128ByteBefore(byte: int, text: string): string = "${char(byte)}$text"
+
+/** In decimal, as "$x" writes it. */
+fun uint128.toDecimal(): string {
+    if (this.isZero()) return "0"
+    // Nine digits at a time, in a u32: dividing a u64 would call __udivdi3 on a 32-bit target.
+    val chunk = uint128(1000000000)
+    var text = ""
+    var rest = this
+    while (!rest.isZero()) {
+        var low = uint128Remainder(rest, chunk).toU32()
+        rest = uint128Divide(rest, chunk)
+        for (digit in 0 until 9) {
+            if (low != u32(0) || !rest.isZero()) text = uint128ByteBefore(48 + int(low % u32(10)),
+                text)
+            low = low / u32(10)
+        }
+    }
+    text
+}
+
+/** In hex with 0x, in lower case, and no leading zeros: a JSON-RPC quantity. */
+fun uint128.toHex(): string {
+    if (this.isZero()) return "0x0"
+    var text = ""
+    var rest = this
+    while (!rest.isZero()) {
+        val digit = int(rest.toU64() & u64(15))
+        text = uint128ByteBefore(if (digit < 10) 48 + digit else 87 + digit, text)
+        rest = ablaU128_lshr(rest, u32(4))
+    }
+    "0x$text"
+}
+
+/** Digits only: no sign, space or point; leading zeros are allowed. Null if it isn't that, or doesn't fit. */
+fun uint128FromDecimal(text: string): uint128? {
+    if (text.size == 0) return null
+    // floor((2^128 - 1) / 10), whose last digit then allows up to 5.
+    val limit = uint128Words(u32(429496729), u32(2576980377), u32(2576980377), u32(2576980377))
+    var out = uint128(0)
+    for (at in 0 until text.size) {
+        val digit = int(text[at]) - 48
+        if (digit < 0 || digit > 9) return null
+        if (ablaU128_lt(limit, out) || (ablaU128_eq(out, limit) && digit > 5)) return null
+        out = ablaU128_add(ablaU128_add(ablaU128_shl(out, u32(3)), ablaU128_shl(out, u32(1))),
+            uint128(digit))
+    }
+    out
+}
+
+/** With or without 0x, in either case. Null with no digits, on anything else, or if it doesn't fit. */
+fun uint128FromHex(text: string): uint128? {
+    var start = 0
+    if (text.size >= 2 && int(text[0]) == 48 && (int(text[1]) == 120 || int(text[1]) == 88)) start =
+        2
+    if (text.size == start) return null
+    var out = uint128(0)
+    for (at in start until text.size) {
+        val c = int(text[at])
+        val digit = if (c >= 48 && c <= 57) c - 48
+            else if (c >= 97 && c <= 102) c - 87
+            else if (c >= 65 && c <= 70) c - 55
+            else -1
+        if (digit < 0 || !ablaU128_lshr(out, u32(124)).isZero()) return null
+        out = ablaU128_or(ablaU128_shl(out, u32(4)), uint128(digit))
+    }
+    out
+}
+
+/** 16 bytes, big-endian: an EVM word. */
+fun uint128.toBytes(): string {
+    var text = ""
+    var rest = this
+    for (at in 0 until 16) {
+        text = uint128ByteBefore(int(rest.toU64() & u64(255)), text)
+        rest = ablaU128_lshr(rest, u32(8))
+    }
+    text
+}
+
+/** Big-endian bytes, fewer than 16 padding on the left. Null above 16. */
+fun uint128FromBytes(bytes: string): uint128? {
+    if (bytes.size > 16) return null
+    var out = uint128(0)
+    for (at in 0 until bytes.size) out = ablaU128_or(ablaU128_shl(out, u32(8)),
+        uint128(int(bytes[at])))
+    out
+}
+
+/** 16 bytes, little-endian: the least significant byte first. */
+fun uint128.toBytesLittleEndian(): string {
+    var text = ""
+    var rest = this
+    for (at in 0 until 16) {
+        text = "$text${char(int(rest.toU64() & u64(255)))}"
+        rest = ablaU128_lshr(rest, u32(8))
+    }
+    text
+}
+
+/** Little-endian bytes, fewer than 16 padding at the top. Null above 16. */
+fun uint128FromBytesLittleEndian(bytes: string): uint128? {
+    if (bytes.size > 16) return null
+    var out = uint128(0)
+    var at = bytes.size - 1
+    while (at >= 0) {
+        out = ablaU128_or(ablaU128_shl(out, u32(8)), uint128(int(bytes[at])))
+        at = at - 1
+    }
+    out
+}
