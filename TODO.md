@@ -940,6 +940,25 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   globals per object); passing an object as a pointer instead of a boxed argument (per-call boxing);
   dropping the constructor's tag test when the argument's static type is the field's class (about 6
   instructions a child, 3% of trees at most).
+- [ ] **The object allocator's fast path** (2026-11-08, master `3d2f2154`, release builds, instructions
+  against the same compiler with only the runtime text changed; branch `alloc-fast`). Per object it was
+  67 instructions (trees: 21.7%): the call into `ObjectBlock` with five callee-saved registers pushed and
+  popped around the inlined allocator, the limit check, the size-class pop, three header stores, the
+  registry append, an allocation count, the collector's address water marks (about 12 instructions), the
+  live-byte counter, and the zeroing ladder. Done: (1) the water marks (`CollectionMinimum` / `Maximum`,
+  read only by the marker's quick reject) are computed once a collection, from the page directory that
+  the collection builds anyway and from the sorted large list, instead of on every allocation; (2) the
+  allocation count is gone (the collections size their worklist by the registry's slots, which bound it);
+  (3) an object's allocation (layout 5, a constant where it is inlined) first tries a straight-line path
+  with no call: one thread (no heap lock yet), no region, a block waiting on its size's list, room in the
+  registry and under the memory limit; anything else is the general allocation out of line. Trees
+  10,514 M to 9,854 M instructions (-6.28%), strings -1.52%, maps -0.59%, json-readers -0.06%,
+  json-megabyte +0.09%, the others unchanged; peak RSS within 1% everywhere (trees 226M both,
+  json-megabyte 1045M to 1044M). Tried and dropped: the same fast attempt for every layout: trees -6.19%
+  but strings +0.88% and json-readers +0.46%, because a program that allocates more between collections
+  than the lists keep (the 64 MiB growth step against at most 32 MB kept) misses often, and a miss then
+  pays the failed checks and a call. The live-byte and small-list counters are untouched (the collection
+  trigger reads them).
 - **Per-call boxing in the lowering: two alias cuts measured, held; the rest is a no-go** (2026-11-08,
   master `04aa6c7d`). Branch `per-call-boxing` (not merged, kept for reference): a boxed `local.load` or a `parameter.load` (no default) whose value only
   feeds read-only runtime readers (string, field, array reads, `object.is`) and has no label,

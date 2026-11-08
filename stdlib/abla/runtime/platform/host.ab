@@ -274,7 +274,6 @@ trusted fun __ablaRuntimePlatformUnwindRestore(at: int): void {
 var __ablaRuntimeHostRegistry: int = 0
 var __ablaRuntimeHostRegistrySlots: int = 0
 var __ablaRuntimeHostRegistryCapacity: int = 0
-var __ablaRuntimeHostAllocationCount: int = 0
 var __ablaRuntimeHostLiveBytes: int = 0
 var __ablaRuntimeHostLimit: int = 4611686018427387903
 var __ablaRuntimeHostRegionCache: int = 0
@@ -682,23 +681,14 @@ trusted fun __ablaRuntimeHostTrackedAllocate(size: int, layout: int): int {
     __ablaRuntimeHostRegister(
         header, size > __ablaRuntimeHostCollectionSmallBytes - 32
     )
-    __ablaRuntimeHostAllocationCount =
-        __ablaRuntimeHostAllocationCount + 1
-    val payload = header + 32
-    val end = payload + size
-    if (__ablaRuntimeHostCollectionMinimum == 0 ||
-        u64(payload) < u64(__ablaRuntimeHostCollectionMinimum)) {
-        __ablaRuntimeHostCollectionMinimum = payload
-    }
-    if (u64(end) > u64(__ablaRuntimeHostCollectionMaximum)) {
-        __ablaRuntimeHostCollectionMaximum = end
-    }
     __ablaRuntimeHostLiveBytes = __ablaRuntimeHostLiveBytes + size
     header + 32
 }
 
+// The general allocation: under the heap lock, in a region or from the lists, malloc, or past the
+// registry's room.
 @inline
-trusted fun __ablaRuntimePlatformAllocateLayout(
+trusted fun __ablaRuntimeHostAllocateBody(
     requested: int,
     layout: int
 ): int {
@@ -723,6 +713,53 @@ trusted fun __ablaRuntimePlatformAllocateLayout(
     result
 }
 
+// The same, out of line: what an object's allocation falls back to, so that its common case
+// below keeps no registers across a call.
+@noinline
+trusted fun __ablaRuntimeHostAllocateGeneral(requested: int, layout: int): int =
+    __ablaRuntimeHostAllocateBody(requested, layout)
+
+// Allocation. An object's (layout 5, a constant where this is inlined) common case is
+// straight-line code with no call: one thread (no heap lock), no region, a block of this size
+// waiting on its list, room in the registry and under the memory limit. It does what
+// __ablaRuntimeHostTrackedAllocate does for a small block. Any other case, and every other
+// layout (strings and arrays miss the lists often enough that the attempt costs them more
+// than it saves), is the general allocation inline.
+@inline
+trusted fun __ablaRuntimePlatformAllocateLayout(
+    requested: int,
+    layout: int
+): int {
+    if (layout == 5) {
+        val size: int = if (requested <= 0) 1 else requested
+        if (__ablaRuntimeHostHeapMutex == 0 && size <= 480) {
+            val total = (size + 39) & -8
+            val list = __ablaRuntimeHostSmallLists() + total
+            val free = ablaRuntimeLoadI64(list)
+            val slots = __ablaRuntimeHostRegistrySlots
+            val limit: int = if (__ablaRuntimeHostLimit == 0) {
+                4611686018427387903
+            } else __ablaRuntimeHostLimit
+            if (free != 0 && slots != __ablaRuntimeHostRegistryCapacity &&
+                size <= limit - __ablaRuntimeHostLiveBytes &&
+                __ablaRuntimeHostRegionLoad() == 0) {
+                ablaRuntimeStoreI64(list, ablaRuntimeLoadI64(free))
+                __ablaRuntimeHostSmallBytes = __ablaRuntimeHostSmallBytes - total
+                ablaRuntimeStoreI64(free + 8, 0)
+                ablaRuntimeStoreI64(free + 16, size)
+                ablaRuntimeStoreI64(free + 24, layout)
+                ablaRuntimeStoreI64(free, slots)
+                ablaRuntimeStoreI64(__ablaRuntimeHostRegistry + slots * 8, free)
+                __ablaRuntimeHostRegistrySlots = slots + 1
+                __ablaRuntimeHostLiveBytes = __ablaRuntimeHostLiveBytes + size
+                return free + 32
+            }
+        }
+        return __ablaRuntimeHostAllocateGeneral(requested, layout)
+    }
+    __ablaRuntimeHostAllocateBody(requested, layout)
+}
+
 @inline
 trusted fun __ablaRuntimePlatformAllocate(requested: int): int =
     __ablaRuntimePlatformAllocateLayout(requested, 0)
@@ -736,8 +773,6 @@ trusted fun __ablaRuntimeHostFreeUnlocked(address: int): void {
             if (owner >= 0 && owner < 48) {
                 __ablaRuntimeHostUnregister(header)
                 __ablaRuntimeHostBlockFree(header, size)
-                __ablaRuntimeHostAllocationCount =
-                    __ablaRuntimeHostAllocationCount - 1
             } else {
                 ablaRuntimeStoreI64(
                     owner + 16,
@@ -985,15 +1020,26 @@ trusted fun __ablaRuntimeHostCollectionPagesBuild(): void {
         }
         slot = slot + 1
     }
+    // The marker's quick reject: the lowest and highest address a candidate can name, from
+    // the pages that hold small allocations (a block starts in its page and ends at most
+    // `CollectionSmallBytes` past it); the large ones are added after they are sorted.
+    var lowPage = -1
+    var highPage = 0
     slot = 0
     while (slot < capacity) {
-        if (ablaRuntimeLoadI64(table + slot * 16) != 0) {
+        val key = ablaRuntimeLoadI64(table + slot * 16)
+        if (key != 0) {
             ablaRuntimeStoreI64(
                 table + slot * 16 + 8, bitmaps + ablaRuntimeLoadI64(table + slot * 16 + 8)
             )
+            if (u64(key - 1) < u64(lowPage)) lowPage = key - 1
+            if (u64(key - 1) > u64(highPage)) highPage = key - 1
         }
         slot = slot + 1
     }
+    __ablaRuntimeHostCollectionMinimum = if (pages == 0) 0 else lowPage << 16
+    __ablaRuntimeHostCollectionMaximum = if (pages == 0) 0
+        else ((highPage + 1) << 16) + __ablaRuntimeHostCollectionSmallBytes
     __ablaRuntimeHostCollectionPages = table
     __ablaRuntimeHostCollectionPageMask = capacity - 1
     val cache = __ablaRuntimeHostCollectionPageCache()
@@ -1006,6 +1052,18 @@ trusted fun __ablaRuntimeHostCollectionPagesBuild(): void {
     __ablaRuntimeHostCollectionRanges = list
     __ablaRuntimeHostCollectionLargeCount = listed
     __ablaRuntimeHostCollectionRangesHeapSort(listed)
+    if (listed > 0) {
+        val first = ablaRuntimeLoadI64(list)
+        val last = ablaRuntimeLoadI64(list + (listed - 1) * 8)
+        val lastEnd = last + 32 + ablaRuntimeLoadI64(last + 16)
+        if (__ablaRuntimeHostCollectionMaximum == 0 ||
+            u64(first) < u64(__ablaRuntimeHostCollectionMinimum)) {
+            __ablaRuntimeHostCollectionMinimum = first
+        }
+        if (u64(lastEnd) > u64(__ablaRuntimeHostCollectionMaximum)) {
+            __ablaRuntimeHostCollectionMaximum = lastEnd
+        }
+    }
     return
 }
 
@@ -1284,7 +1342,6 @@ trusted fun __ablaRuntimeHostCollectionSweep(): void {
             if (state >= 0 && state < 16 && state != 10 && state != 12) {
                 val size = ablaRuntimeLoadI64(header + 16)
                 __ablaRuntimeHostLiveBytes = __ablaRuntimeHostLiveBytes - size
-                __ablaRuntimeHostAllocationCount = __ablaRuntimeHostAllocationCount - 1
                 __ablaRuntimeHostBlockFree(header, size)
             } else {
                 if (state >= 16) ablaRuntimeStoreI64(header + 24, state - 32)
@@ -1403,7 +1460,8 @@ trusted fun __ablaRuntimePlatformMemoryCollect(): int {
         return 0
     }
     val before = __ablaRuntimeHostLiveBytes
-    val allocationCount = __ablaRuntimeHostAllocationCount
+    // The registry's slots bound the allocations (freed ones leave holes).
+    val allocationCount = __ablaRuntimeHostRegistrySlots
     if (allocationCount == 0) {
         __ablaRuntimeHostHeapUnlock(mutex)
         return 0
@@ -1456,7 +1514,8 @@ trusted fun __ablaRuntimeHostBackgroundMemoryCollect(): int {
         return 0
     }
     val before = __ablaRuntimeHostLiveBytes
-    val allocationCount = __ablaRuntimeHostAllocationCount
+    // The registry's slots bound the allocations (freed ones leave holes).
+    val allocationCount = __ablaRuntimeHostRegistrySlots
     if (allocationCount == 0) {
         __ablaRuntimeHostHeapUnlock(mutex)
         return 0
@@ -1513,7 +1572,6 @@ trusted fun __ablaRuntimeHostBackgroundSweep(): void {
             if (state >= 0 && state < 16 && state != 10 && state != 12) {
                 __ablaRuntimeHostLiveBytes =
                     __ablaRuntimeHostLiveBytes - ablaRuntimeLoadI64(header + 16)
-                __ablaRuntimeHostAllocationCount = __ablaRuntimeHostAllocationCount - 1
                 __ablaRuntimeHostFreeLater(header)
             } else {
                 if (state >= 16) ablaRuntimeStoreI64(header + 24, state - 32)
