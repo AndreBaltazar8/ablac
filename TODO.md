@@ -367,11 +367,6 @@
 
 Package-side work (not changed from ablac):
 
-- [ ] **abla-mobile still carries the removed C runtime's path.**
-  `runtime/native/CMakeLists.txt` picks it when ablac has `runtime/abla_runtime.c`, removed in
-  `93ce196`, so that branch and the C platform layer behind it can go. Verify a complete
-  Gradle/NDK build on both architectures.
-
 ## Compile time and memory
 
 - [ ] **Cached small blocks cannot be reused for another size.** The native lists
