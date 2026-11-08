@@ -536,6 +536,18 @@
 - [ ] **Strict-imports rechecks loaded standard-library modules on every build.** On 2026-11-03,
   the entire validation cost 41.46M instructions (2.27% of a fib `--fast` build) and
   104.59M (0.56% of a NovaKind tool build); the library-only saving is smaller. Not pursued.
+  Remeasured 2026-11-08 on master `7ec1bdf4` as the most any cache could win: a compiler with a
+  switch that returns from `bootstrapValidateStrictImports` before any work (every module of the
+  standard library is strict, so the check runs in every build), user instructions of `build --fast
+  --no-cache` on one P-core, three alternating pairs, best of each: fib 1,287.7 M against 1,261.1 M
+  (-2.06%), maps 1,441.4 against 1,415.7 (-1.78%), string-helpers 1,901.6 against 1,869.3 (-1.70%),
+  json-megabyte 5,077.7 against 5,016.1 (-1.21%). Even deleting the whole check stays under the 2%
+  bar on three of the four programs, and a cache that must be keyed on the compiler, every module's
+  contents, aliases, edges, manifests, target and report mode, and still runs for the program's own
+  modules, would win a fraction of that: a measured no-go, nothing changed. (Both columns are the best of
+  three, whole-build `instructions:u`, so each drop is the check's work plus its allocation and the collector
+  pressure that goes with it; a cache's lookup and key hashing cost something too, so its real ceiling is a
+  little below these drops.)
   Narrowing the scan can change diagnostics: it uses all loaded declarations, class members,
   visibility and module order. A safe cache must account for compiler/checker version, all
   ordered module contents, aliases and import/export edges, manifests, target and report mode;
