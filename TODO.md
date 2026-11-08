@@ -883,6 +883,22 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   release, and under `#`) and that the release IR has the inline test and no generic equality call.
   Left in `check`: each field read of a reference is still a boxed `abla_field_get_reference` call plus
   copies through value slots; `abla_to_string` has not been looked at.
+- [ ] **trees: the field reads are not the cost any more** (2026-11-08, master `640898d5`, release build, the
+  compiler of the null-compare change; ablac-e5's screen of "lower `tree.left` / `tree.right` to a typed
+  load"). In the IR `check()` reads each nullable object field through `abla_field_get_reference` and boxes the
+  result, but link-time inlining already collapses that: the machine code of `check` is 33 instructions, the
+  two reads are two loads and two null tests (`test`/`setne`), and the rest is the boxed-argument convention
+  (three stores to build each child's 24-byte argument, one call). A direct typed load would save a few
+  instructions in a function that is 8.4% of the benchmark, so it cannot reach 5%; not built. Where trees'
+  10,514 M instructions go (33.8 M objects, 311 a piece): the collector 86 (27.6%), `make` 82 (26.4%: the
+  GC root frame push and pop, the safe-point check, and for each child a three-way tag test (null, or the
+  declared class) that a child of the declared class cannot fail), the object block allocator 67 (21.7%:
+  size-class free-list pop 11, header and registry append and byte accounting about 40, high-water marks),
+  `check` 26 (8.4%), malloc and free 22, other 27. What would move trees, in order of size: the collector's
+  schedule and its visit of every allocation (ablac-39, #677); the allocator fast path (accounting touches
+  eight globals per object); passing an object as a pointer instead of a boxed argument (per-call boxing);
+  dropping the constructor's tag test when the argument's static type is the field's class (about 6
+  instructions a child, 3% of trees at most).
 - [ ] **Per-call boxing in the lowering.** 17% of the IR's instructions are
   `alloca %AblaValue` (146K in that program), with as many stores and loads around them
   and 29K `abla_i64` boxing calls. `opt`'s time is mostly the inliner, instcombine and SROA
