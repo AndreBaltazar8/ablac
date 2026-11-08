@@ -110,6 +110,19 @@ read_target() { # arch, object, label (default the arch), then flags for the che
     echo "ok   $label: ${#target_fixtures[@]} fixtures clean in the assembly, ${#leaks[@]} leaks caught"
 }
 
+# The two bignum routines the generated twins cut at their first call (bnClear) are read whole, with that
+# call followed. Without following, the same objects must be refused: the call is what is being covered.
+orchestration_read() { # object
+    local object=$1 specs=(ct_orch_bn_from_bytes:@2 ct_orch_bn_residue_square:@1)
+    $check --follow-calls x86_64 "$object" "${specs[@]}" > "$out/x86_64-orchestration.log" 2>&1 || {
+        cat "$out/x86_64-orchestration.log" >&2; echo "ct: a bignum routine and its calls" >&2; exit 1
+    }
+    if $check x86_64 "$object" "${specs[@]}" > "$out/x86_64-orchestration-nofollow.log" 2>&1; then
+        echo "ct: the orchestration fixtures didn't need following their calls" >&2; exit 1
+    fi
+    echo "ok   x86_64 orchestration: bnFromBytes and bnResidueSquare read whole, their calls followed"
+}
+
 # Secret residue: a secret a function leaves in a stack slot of its frame is a copy in memory that nothing
 # wipes. Registers aren't counted. The control pair is hand-written assembly: one function spills and
 # returns, the other clears its slot. Then the release fixtures are read, and tests/cases/ct/residue-known.txt
@@ -205,6 +218,7 @@ read_target x86_64 "$out/x86.o"
 fast_read x86_64 "$out/x86-fast.o"
 frame_address_read
 residue_read "$out/x86.o"
+orchestration_read "$out/x86.o"
 
 # --- AArch64 --------------------------------------------------------------------------
 "$compiler" build "$cases/aarch64-build.ab" -o "$out/aarch64-driver" --no-cache

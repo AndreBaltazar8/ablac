@@ -125,13 +125,13 @@
   `bnFromBytes`, `bnToBytes` and `bnResidueSquare` have assembly fixtures and individual
   secret-index negative controls. AES orthogonalization is the actual imported implementation,
   without fixture-only index substitution; excluded scaffolding is guarded against unnoticed edits.
-- [ ] **Crypto allocation/call orchestration remains outside `test-ct.sh` coverage:** AES key
-  allocation, managed-string address acquisition, hardware decryption-key conversion and hardware
-  block dispatch; `rsaCrt` key/modulus
-  construction, allocation/free, wide-reduce/encode/decode/exponentiation/multiply/copy calls
-  (only their separately tested primitives/glue are covered); `bnFromBytes` and
-  `bnResidueSquare`'s initial `bnClear` call. The checker rejects calls and cannot verify those
-  whole routines as structured. Neither full loader timing nor secret-memory wiping is claimed.
+- [ ] **Crypto allocation/call orchestration is still partly outside `test-ct.sh` coverage.** Done on x86-64
+  release: `bnFromBytes` and `bnResidueSquare` are read whole, their `bnClear` call followed (the build fails
+  without following). Still not read: AES key allocation (`aesExpandBytes`: the allocator and the managed-string
+  address acquisition are calls the checker can't name, so it stops at one inside the function), hardware
+  decryption-key conversion and block dispatch, and `rsaCrt`'s key/modulus construction, allocation/free and its
+  wide-reduce/encode/decode/exponentiation/multiply/copy calls (it takes resource objects, not the pointers the
+  checker models). Neither full loader timing nor secret-memory wiping is claimed.
 - [x] **Small constant-array `for` loops avoid materializing an array.** Up to16 homogeneous
   native scalar literals (optionally signed) use a bounded scalar selector and one body copy;
   other/larger arrays keep the ordinary path. Order, capture cells and loop exits are preserved.
