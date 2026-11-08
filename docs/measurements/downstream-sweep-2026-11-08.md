@@ -32,6 +32,9 @@ needed; a step that needs a service is noted in its cell. "Pin" is the `setup-ab
 | abla-testrunner | 4a79746 | none | check ok |
 | abla-web | 224870e | none | check ok |
 | abla-xml | fea4622 | 0.2.29 | unit ok; conformance ok; fuzz ok |
+| abla-lsp | origin/HEAD | 0.2.46 | `npm test` with `ABLA_COMPILER` set to the master compiler: 61 pass, 0 fail (66 tests) |
+| abla-tmlanguage | origin/HEAD | none | `npm test`: 3 pass (no Abla compiler involved) |
+| abla-web3d | ca5320d | none | no test suite; `examples/characters` builds to a 647,518-byte Wasm module |
 
 No ablac regression was found.
 
@@ -40,8 +43,7 @@ No ablac regression was found.
   pass (2,000 documents, 0 failures). It is not in the table's steps.
 - `abla-embedded` `make check` passes at `origin/master`. A checkout 3 commits behind fails with 71
   `call.target`/`region.noescape-effect` errors that v0.2.49 gives too.
-- Not run: `abla-doom` (needs xvfb and a GPU), `abla-lsp` (npm with its VS Code extension), `abla-web3d` (examples
-  only, no tests), `abla-site` (a deploy, dirty checkout), `abla-tmlanguage` (Node only), `abla-original` (an archive
+- Not run: `abla-doom` (needs xvfb and a GPU), `abla-site` (a deploy, dirty checkout), `abla-tmlanguage` (Node only), `abla-original` (an archive
   of the old tree).
 - Local checkouts behind origin when the sweep began: abla-mobile 51, abla-web3d 87, abla-one 47, abla-mvc 4,
   abla-compare 3, abla-embedded 3.
