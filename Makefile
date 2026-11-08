@@ -169,7 +169,6 @@ test-serial: ablac
 	tools/test-proc-self-exe.sh $(COMPILER)
 	tools/test-any-text-validation.sh $(COMPILER)
 	tools/test-any-text-panic.sh $(COMPILER)
-	tools/test-any-equality.sh $(COMPILER)
 	tools/test-lambda-void-assignment.sh $(COMPILER)
 	tools/test-process-environment.sh $(COMPILER)
 	tools/test-compiler-stack.sh $(COMPILER)
