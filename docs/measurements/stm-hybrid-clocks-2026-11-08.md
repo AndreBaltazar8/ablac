@@ -29,11 +29,12 @@ three clocks after reading a fourth account, without reading them, two auditors 
 
 | Runtime change | `bank-spread` | `blind-spread` |
 |---|---|---|
-| no revalidation at a clock's first read | fails: 26 to 49 wrong audits | fails: 61 to 327 wrong audits |
-| moving to the second clock samples the first again (`resample`) | fails: totals 1,591 to 1,610 | passes |
-| a new write entry does not move the mode | passes | fails: does not finish (killed at the 120 s limit; the commit takes the writes' versions from the clock of the account read first) |
+| no revalidation at a clock's first read | fails: 26 to 49 wrong audits | fails: 109 to 272 wrong audits |
+| moving to the second clock samples the first again (`resample`) | fails: totals 1,591 to 1,610 | passes: it never reads the first clock again after its blind writes |
+| a new write entry does not move the mode | passes: its transfers read before they write | livelock: does not finish, killed at the 120 s limit (no audit count; the commit takes the writes' versions from the clock of the account read first) |
 
-`bank-spread` abandoned between 2,084 and 5,580 attempts in 20 runs (median 2,312), so its "conflicts true" is
+So `bank-spread` is the test that covers `resample`, and `blind-spread` the one for the write hook; each
+fails on its own against its control. `bank-spread` abandoned between 2,084 and 5,580 attempts in 20 runs (median 2,312), so its "conflicts true" is
 reliable. `__ablaRuntimeStmBegin` clears the mask and the list count of the partitioned mode, so a commit in
 that branch never reads an earlier attempt's.
 
