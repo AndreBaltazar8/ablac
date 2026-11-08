@@ -1,8 +1,10 @@
-{ pkgs ? import (builtins.fetchTarball {
-    name = "nixpkgs-5e2a59a5b1a82f89f2c7e598302a9cacebb72a67";
-    url = "https://github.com/NixOS/nixpkgs/archive/5e2a59a5b1a82f89f2c7e598302a9cacebb72a67.tar.gz";
-    sha256 = "02rf59xj2v1ml7v35x4j64ax1fb7xx96ld7va6rifyxazmwsr4rb";
-  }) { config.android_sdk.accept_license = true; } }:
+# The Android SDK is unfree and asks for its licence: this file accepts both,
+# so a caller needs no NIXPKGS_ALLOW_UNFREE. Its packages come from the nixpkgs
+# of ablac's own shell (nix/nixpkgs.nix, the one with the LLVM the compiler
+# needs), re-imported with that configuration.
+{ pkgs ? import (import ../../nix/nixpkgs.nix).path {
+    config = { android_sdk.accept_license = true; allowUnfree = true; };
+  } }:
 
 let
   baseShell = import ../../shell.nix { inherit pkgs; };
