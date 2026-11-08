@@ -124,11 +124,12 @@
   Grown again (branch `fuzz-grow2`): arrays (append, index store, truncate, nested rows, `filledArray`,
   string arrays), `Map<string, int>` and `Map<int, int>` (set, get, has, remove, insertion-order `keys` and
   `values`, clear), and lambdas (captured counters, function values in arrays, `applyTwice`). Seeds 500 to
-  535 (30 checks, six modes): no disagreement. Finding (evaluator, handed to ablac-e5): a lambda that
-  calls another lambda it captured fails under `#` with E_EVAL_EXPRESSION ("evaluating `call` `g`"):
-  `val g = { n: int -> n + 1 }; val h = { x: int -> g(x) }; h(10)` in a function run through `#run()`
-  (also `compose(f, g) = { x -> g(f(x)) }`). Native and Wasm give 11. The generator avoids the construct
-  until it is fixed; add the repro to `tests/cases/fuzz-differential` with the fix.
+  535 (30 checks, six modes): no disagreement. Finding (evaluator, fixed by ablac-e5 in closure-eval,
+  a1a06ad3): a lambda that called another lambda it captured failed under `#` with E_EVAL_EXPRESSION
+  ("evaluating `call` `g`"); the evaluator boxes captured bindings and `evaluateCall` did not look through
+  the box. Regression: `tests/cases/fuzz-differential/closure-captured-call.ab`; the closure generator now
+  draws `compose` and `{ x -> g(f(x)) + calls }`. Also drawn: sealed interfaces with an exhaustive `when`
+  over `is` arms, and `for` over `until` and `..` ranges (empty, reversed, negative bounds).
 
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
