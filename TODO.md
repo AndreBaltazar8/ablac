@@ -363,10 +363,6 @@
 - [ ] **Language editions and a deprecation policy,** and signed package identities above the
   immutable locks, when the ecosystem needs them (`docs/reliability-roadmap.md` section 8).
 
-## Packages
-
-Package-side work (not changed from ablac):
-
 ## Compile time and memory
 
 - [ ] **Cached small blocks cannot be reused for another size.** The native lists
