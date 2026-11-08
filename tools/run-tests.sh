@@ -16,7 +16,9 @@
 # ABLA_DEBUG): a --fast build's debug information is 7% to 9% of its compile time and
 # no test but a few reads it. The scripts that read it (test-ct.sh,
 # test-programmable-build.sh, test-wasm-debug-reproducible.sh) set ABLA_DEBUG=1 for
-# themselves, and others build with an explicit -g.
+# themselves, and others build with an explicit -g. RUN_TESTS_DEBUG=default leaves
+# ABLA_DEBUG unset (--fast builds carry debug information, release builds do not), the
+# way the suite ran before; RUN_TESTS_DEBUG=1 sets ABLA_DEBUG=1 for every build.
 #
 # Environment:
 #   JOBS                 commands run at once (default: the number of CPUs)
@@ -40,7 +42,11 @@
 set -uo pipefail
 
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-export ABLA_DEBUG=${ABLA_DEBUG:-0}
+case ${RUN_TESTS_DEBUG:-} in
+    default) ;;
+    1) export ABLA_DEBUG=1 ;;
+    *) export ABLA_DEBUG=${ABLA_DEBUG:-0} ;;
+esac
 compiler=${1:-build/ablac}
 jobs=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
 min_free=${RUN_TESTS_MIN_FREE:-25}
