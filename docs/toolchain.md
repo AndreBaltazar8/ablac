@@ -108,6 +108,12 @@ exact fmod.
 
 Pointers are addresses in the module's exported `memory`.
 
+A panic traps. A module that imports `abla_host.write` for another reason also
+writes `panic: <message>` and a newline to descriptor 2 first; no module gains
+an import for it. A development build decides when the module is optimized; a
+release build links without the message, and links again with it only if that
+first link imports `write`.
+
 Development (`--fast`) builds carry debug information: DWARF line tables,
 readable function symbols and, natively, frame pointers and a printed stack on
 a crash. Release builds don't; `-g`/`--debug`, `--no-debug` and

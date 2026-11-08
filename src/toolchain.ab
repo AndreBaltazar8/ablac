@@ -24,6 +24,7 @@ import "abla/unsafe/memory/raw"
 import "backend/llvm/debug.ab"
 import "backend/llvm/bindings.ab"
 import "codegen_units.ab"
+import "wasm_panic.ab"
 import "sema.ab"
 import "abla/sys/linux"
 import "ir.ab"
@@ -891,6 +892,7 @@ trusted fun bootstrapEmitHeldWasmObject(
         status = llvmConsumeError(
             LLVMRunPasses(module, bootstrapFastPasses(), machine, options), 167
         )
+        if (status == 0) status = bootstrapSettleWasmPanicWrite(module, machine, options)
     }
     // A large module is generated as units, by child compilers at once.
     val units = status == 0 && bootstrapCodegenUnitsFor(module)
@@ -1132,6 +1134,14 @@ trusted fun bootstrapEmitHeldNativeObject(
     bootstrapDisposeHeldModule()
     status
 }
+
+// Whether the linked WebAssembly module at `path` imports abla_host's write:
+// its import entry is the length-prefixed module name and field name.
+fun bootstrapWasmImportsHostWrite(path: string): bool =
+    bootstrapTextContains(
+        Path(path).readText(),
+        "${byteEncode(9)}abla_host${byteEncode(5)}write"
+    )
 
 fun bootstrapDisposeHeldModule(): void {
     if (!pointerIsNull(bootstrapLlvmHeldModule)) LLVMDisposeModule(bootstrapLlvmHeldModule)
@@ -1781,9 +1791,6 @@ fun bootstrapPreparePartitionLlvm(
 // The text pruning below, on the held module: function uses lead either to
 // their containing function or through constants to a global (an outside root).
 // Globals and assembly may also name functions as text, as the old walk did.
-noescape extern:"c" fun LLVMIsAInstruction(value: i64*): i64*
-noescape extern:"c" fun LLVMGetInstructionParent(instruction: i64*): i64*
-noescape extern:"c" fun LLVMGetBasicBlockParent(block: i64*): i64*
 
 trusted fun bootstrapPruneHeldCompilerModule(): void {
     val module = bootstrapLlvmHeldModule
@@ -3860,7 +3867,11 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                         bootstrapEmitHeldWasmObject(target.llvmTriple, emittedObjectPath, places)
                         else bootstrapEmitHeldNativeObject(emittedObjectPath, nativeUnits, places)
                 } else if (bitcodeHandoff) {
-                    status = emitObject(bitcodePath, emittedObjectPath)
+                    // (The tools cannot count the panic writer's uses: without it.)
+                    val bareBitcodePath = "$bitcodePath.nopanic.bc"
+                    status = bootstrapWriteWithoutWasmPanicWrite(bitcodePath, bareBitcodePath)
+                    if (status == 0) status = emitObject(bareBitcodePath, emittedObjectPath)
+                    Path(bareBitcodePath).remove()
                     Path(bitcodePath).remove()
                 } else status = emitObject(llvmPath, emittedObjectPath)
             }
@@ -4344,39 +4355,60 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     }
     if (status == 0 && target.objectFormat == "wasm" &&
         artifact == "module") {
-        val linkModule = linuxCommand("wasm-ld")
-        linkModule.argument("--threads=1")
-        linkModule.argument("--no-entry")
-        linkModule.argument("--gc-sections")
-        linkModule.argument("--export-dynamic")
-        // Explicit foreign declarations become ordinary WebAssembly imports.
-        // The embedding runtime remains responsible for validating and
-        // satisfying the module/name/signature allowlist.
-        linkModule.argument("--allow-undefined")
-        if (wasmLtoEligible) {
-            linkModule.argument("--lto-O3")
-            linkModule.argument("--lto-partitions=$BOOTSTRAP_WASM_LTO_PARTITIONS")
-            for (option in bootstrapWasmExceptionOptions()) {
-                linkModule.argument("-mllvm")
-                linkModule.argument(option)
+        // A release module is linked without the panic writer first (the
+        // import set of a module that never wrote), and again with it only if
+        // that link imports the host's write anyway (wasm_panic.ab): the
+        // final optimization is inside this link, past where the writer's
+        // uses can be counted.
+        val withoutPanicWrite = "$ltoObjectPath.nopanic.bc"
+        if (wasmLtoEligible) status = bootstrapWriteWithoutWasmPanicWrite(
+            ltoObjectPath, withoutPanicWrite
+        )
+        var panicWriteLinked = !wasmLtoEligible
+        var linking = status == 0
+        while (linking) {
+            linking = false
+            val linkModule = linuxCommand("wasm-ld")
+            linkModule.argument("--threads=1")
+            linkModule.argument("--no-entry")
+            linkModule.argument("--gc-sections")
+            linkModule.argument("--export-dynamic")
+            // Explicit foreign declarations become ordinary WebAssembly imports.
+            // The embedding runtime remains responsible for validating and
+            // satisfying the module/name/signature allowlist.
+            linkModule.argument("--allow-undefined")
+            if (wasmLtoEligible) {
+                linkModule.argument("--lto-O3")
+                linkModule.argument("--lto-partitions=$BOOTSTRAP_WASM_LTO_PARTITIONS")
+                for (option in bootstrapWasmExceptionOptions()) {
+                    linkModule.argument("-mllvm")
+                    linkModule.argument(option)
+                }
+            }
+            linkModule.argument("-z")
+            // Keep the module's committed linear-memory floor aligned with
+            // ordinary Wasm guests. One MiB remains generous for Abla's
+            // iterative runtime paths while avoiding a two-MiB charge before the
+            // function handles its first request.
+            linkModule.argument("stack-size=1048576")
+            // A build without debug information publishes a module without the
+            // custom name section; a debug build keeps the name section and DWARF
+            // (and gets a source map below).
+            if (!bootstrapLlvmDebugInfo) linkModule.argument("--strip-all")
+            linkModule.argument(if (!wasmLtoEligible)
+                objectPath
+                else if (panicWriteLinked) ltoObjectPath
+                else withoutPanicWrite)
+            linkModule.argument("-o")
+            linkModule.argument(publishPath)
+            status = linkModule.run()
+            if (status == 0 && !panicWriteLinked &&
+                bootstrapWasmImportsHostWrite(publishPath)) {
+                panicWriteLinked = true
+                linking = true
             }
         }
-        linkModule.argument("-z")
-        // Keep the module's committed linear-memory floor aligned with
-        // ordinary Wasm guests. One MiB remains generous for Abla's
-        // iterative runtime paths while avoiding a two-MiB charge before the
-        // function handles its first request.
-        linkModule.argument("stack-size=1048576")
-        // A build without debug information publishes a module without the
-        // custom name section; a debug build keeps the name section and DWARF
-        // (and gets a source map below).
-        if (!bootstrapLlvmDebugInfo) linkModule.argument("--strip-all")
-        linkModule.argument(if (wasmLtoEligible)
-            ltoObjectPath
-            else objectPath)
-        linkModule.argument("-o")
-        linkModule.argument(publishPath)
-        status = linkModule.run()
+        Path(withoutPanicWrite).remove()
         if (status == 0) {
             Path(ltoObjectPath).remove()
         }

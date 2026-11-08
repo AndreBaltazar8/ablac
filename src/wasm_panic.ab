@@ -1,0 +1,120 @@
+// The message of a WebAssembly panic. The Wasm platform's panic
+// (stdlib/abla/runtime/platform/wasm.ab) calls __ablaRuntimeWasmPanicWrite,
+// which writes "panic: <message>" through the host's write import. That import
+// must not appear in a module only because of it, so after optimization (when
+// what else reaches the import is known) the calls are kept or erased:
+// bootstrapSettleWasmPanicWrite for a development module in process, a link
+// without and then with the calls for a release module (toolchain.ab), and
+// the backend erases them at once for a target without that import.
+//
+// The backend marks the writer with the function attribute `abla.panic-write`;
+// it survives optimization, and nothing else carries it.
+
+import "abla/unsafe/memory"
+import "abla/llvm/orc"
+import "backend/llvm/bindings.ab"
+import "backend/llvm/debug.ab"
+
+noescape extern:"c" fun LLVMGetStringAttributeAtIndex(
+    function: i64*,
+    index: i32,
+    key: cstring,
+    keyLength: int
+): i64*
+noescape extern:"c" fun LLVMIsAInstruction(value: i64*): i64*
+noescape extern:"c" fun LLVMGetInstructionParent(instruction: i64*): i64*
+noescape extern:"c" fun LLVMGetBasicBlockParent(block: i64*): i64*
+
+trusted fun bootstrapIsWasmPanicWrite(function: i64*): bool =
+    !pointerIsNull(LLVMGetStringAttributeAtIndex(
+        function, -1, "abla.panic-write", 16
+    ))
+
+// Whether anything but the panic writer uses the host's write: a call from
+// another function, or its address in a constant or a global.
+trusted fun bootstrapWasmHostWriteReached(module: i64*): bool {
+    val write = LLVMGetNamedFunction(module, "__ablaHostWrite")
+    var reached = false
+    if (!pointerIsNull(write)) {
+        var use = LLVMGetFirstUse(write)
+        while (!reached && !pointerIsNull(use)) {
+            val user = LLVMGetUser(use)
+            if (pointerIsNull(LLVMIsAInstruction(user))) reached = true
+            else if (!bootstrapIsWasmPanicWrite(
+                LLVMGetBasicBlockParent(LLVMGetInstructionParent(user))
+            )) reached = true
+            use = LLVMGetNextUse(use)
+        }
+    }
+    reached
+}
+
+// Removes the panic writer: its calls, then the function (and with it its
+// uses of the host's write). False when a use is not a call, which is left.
+trusted fun bootstrapEraseWasmPanicWrite(module: i64*): bool {
+    var erased = true
+    var function = LLVMGetFirstFunction(module)
+    while (!pointerIsNull(function)) {
+        val following = LLVMGetNextFunction(function)
+        if (bootstrapIsWasmPanicWrite(function)) {
+            var use = LLVMGetFirstUse(function)
+            while (!pointerIsNull(use)) {
+                val next = LLVMGetNextUse(use)
+                val user = LLVMGetUser(use)
+                if (!pointerIsNull(LLVMIsACallInst(user))) {
+                    LLVMInstructionEraseFromParent(user)
+                } else erased = false
+                use = next
+            }
+            if (pointerIsNull(LLVMGetFirstUse(function))) {
+                LLVMDeleteFunction(function)
+            }
+        }
+        function = following
+    }
+    erased
+}
+
+// A development module, optimized: keeps the writer only when the module
+// reaches the host's write anyway. Removing it leaves its strings unused, so
+// the module is cleaned once more. The status of that pass, else 0.
+trusted fun bootstrapSettleWasmPanicWrite(
+    module: i64*,
+    machine: i64*,
+    options: i64*
+): int {
+    if (bootstrapWasmHostWriteReached(module)) return 0
+    if (!bootstrapEraseWasmPanicWrite(module)) return 0
+    llvmConsumeError(LLVMRunPasses(module, "globaldce", machine, options), 167)
+}
+
+// `inputPath`'s bitcode written to `outputPath` without the panic writer.
+trusted fun bootstrapWriteWithoutWasmPanicWrite(
+    inputPath: string,
+    outputPath: string
+): int {
+    val nullPointer = nativeNullPointer()
+    val buffer = nativePointerCell(nullPointer)
+    val message = nativePointerCell(nullPointer)
+    val module = nativePointerCell(nullPointer)
+    val context = LLVMContextCreate()
+    var status = 0
+    if (LLVMCreateMemoryBufferWithContentsOfFile(
+        inputPath, buffer.address, message.address
+    ) != 0) status = 145
+    // (The module takes the buffer.)
+    if (status == 0 && LLVMParseIRInContext(
+        context, buffer.load(), module.address, message.address
+    ) != 0) status = 145
+    if (status == 0) {
+        bootstrapEraseWasmPanicWrite(module.load())
+        if (LLVMWriteBitcodeToFile(module.load(), outputPath) != 0) status = 145
+    }
+    if (!pointerIsNull(module.load())) LLVMDisposeModule(module.load())
+    LLVMContextDispose(context)
+    if (!pointerIsNull(message.load())) LLVMDisposeMessage(message.load())
+    buffer.close()
+    message.close()
+    module.close()
+    status
+}
