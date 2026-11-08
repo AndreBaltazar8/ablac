@@ -121,6 +121,14 @@
   100 to 125 (older compiler, no `any`), 200 to 225, 300 to 351 and 400 to 451 (24 to 30 checks each, six
   modes plus the panic programs; 156 seeds, 4,368 checks): no disagreement. Seeds 400 to 451 also draw
   `f32(literal)` and f32 division edges (ablac-e5's evaluator fixes, 570b6462).
+  Grown again (branch `fuzz-grow2`): arrays (append, index store, truncate, nested rows, `filledArray`,
+  string arrays), `Map<string, int>` and `Map<int, int>` (set, get, has, remove, insertion-order `keys` and
+  `values`, clear), and lambdas (captured counters, function values in arrays, `applyTwice`). Seeds 500 to
+  535 (30 checks, six modes): no disagreement. Finding (evaluator, handed to ablac-e5): a lambda that
+  calls another lambda it captured fails under `#` with E_EVAL_EXPRESSION ("evaluating `call` `g`"):
+  `val g = { n: int -> n + 1 }; val h = { x: int -> g(x) }; h(10)` in a function run through `#run()`
+  (also `compose(f, g) = { x -> g(f(x)) }`). Native and Wasm give 11. The generator avoids the construct
+  until it is fixed; add the repro to `tests/cases/fuzz-differential` with the fix.
 
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
