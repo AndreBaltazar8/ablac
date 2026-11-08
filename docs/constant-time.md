@@ -71,8 +71,9 @@ they don't stop you declassifying.
   fault injection are out of scope. So are things that look at the machine from outside (Hertzbleed-style
   frequency effects).
 - **What surrounds the secret.** Lengths and public values aren't hidden. An allocation's timing and a
-  collector's pause don't depend on a value's bits but do depend on sizes. Nothing wipes memory: a secret
-  stays in a string or an array until reused. A boxed secret (in an array or a field) is copied in plain
+  collector's pause don't depend on a value's bits but do depend on sizes. Nothing wipes memory by itself: a secret
+  stays in a string or an array until reused, and a spill the register allocator makes stays on the stack (see
+  `abla/ct/scrub`, which the AES and RSA private entry points call to wipe the stack their work used). A boxed secret (in an array or a field) is copied in plain
   moves, which is fine for timing, and is one more copy.
 - **Code outside the types.** A `string` or `u32` holding a secret has none of this. `.declassify()` ends it
   by design. The types are only as good as the code that puts a secret in them right away.

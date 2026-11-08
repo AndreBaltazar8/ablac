@@ -7,8 +7,8 @@ mkdir -p "$out"
 chmod 700 "$out"
 # Export is private until key generation lands. A test-local copy exposes
 # only the helpers under test, without changing the shipped module's API.
-sed -e 's/^private trusted fun rsaPrivateExportDer/trusted fun rsaPrivateExportDer/' \
-    -e 's/^private trusted fun rsaPrivateExportPem/trusted fun rsaPrivateExportPem/' \
+sed -e 's/^private @noinline trusted fun rsaPrivateExportDer/trusted fun rsaPrivateExportDer/' \
+    -e 's/^private @noinline trusted fun rsaPrivateExportPem/trusted fun rsaPrivateExportPem/' \
     -e 's/^private trusted fun rsaExportLimbs/trusted fun rsaExportLimbs/' \
     "$root/stdlib/abla/crypto/rsa/entry.ab" > "$out/rsa-copy.ab"
 # The real module must not expose the export before key generation lands.
