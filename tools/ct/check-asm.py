@@ -116,6 +116,84 @@ X86_FLAGLESS = re.compile(r"^(mov|lea|cmov|set|vmov|vpxor|pxor|movz|movs|bswap|n
 X86_READWRITE = re.compile(r"^(add|adc|sub|sbb|and|or|xor|imul|shl|sal|shr|sar|rol|ror|neg|not|inc|dec|pand|por|pxor|pandn|padd|psub|psll|psrl|psra|pmul|punpck|pshufb|bswap|shld|shrd|cmov|aes|pclmul|andn|xchg)")
 
 
+def callee_inputs(name):
+    """The argument registers a function may read before writing them. In its straight-line start it is what
+    that code reads first; from the first branch, call or jump on, every register not yet written counts as read."""
+    written = set()
+    read = set()
+    for _, text in disassemble(FOLLOW["path"], name):
+        parts = text.split(None, 1)
+        op = parts[0]
+        if op in ("rep", "lock", "notrack") and len(parts) > 1:
+            parts = parts[1].split(None, 1)
+            op = parts[0]
+        ops = x86_split(parts[1]) if len(parts) > 1 else []
+        if op.startswith(("j", "call", "ret")) or op.startswith("loop"):
+            if op.startswith("ret"):
+                return read
+            return read | (set(X86_ARGS) - written)
+        mentioned = [[x86_reg(r) for r in re.findall(r"%\w+", o)] for o in ops]
+        zeroing = (op.startswith(("xor", "sub", "pxor")) and len(ops) == 2 and ops[0] == ops[1])
+        string_op = op.startswith(("stos", "movs", "scas", "cmps", "lods"))
+        for index, regs in enumerate(mentioned):
+            is_destination = index == len(ops) - 1 and len(ops) >= 2
+            if ops[index].startswith("%") and is_destination and not X86_READWRITE.match(op) and not op.startswith(("cmp", "test")):
+                continue
+            if zeroing:
+                continue
+            read |= {r for r in regs if r not in written}
+        if string_op:
+            used = ("rdi", "rcx", "rax") if op.startswith("stos") else ("rdi", "rcx", "rsi") if op.startswith("movs") else ("rdi", "rcx", "rax", "rsi")
+            read |= {r for r in used if r not in written}
+        if ops and ops[-1].startswith("%"):
+            written.add(x86_reg(ops[-1]))
+        if zeroing:
+            written.add(x86_reg(ops[-1]))
+    return read | (set(X86_ARGS) - written)
+
+
+EXTENTS = {}
+
+
+def stack_extent(name, seen=()):
+    """How many bytes below its caller's stack pointer a function and what it calls can have written:
+    the return address, everything that grows its stack (pushes, a frame, alignment), the red zone below
+    that, and the deepest callee. Growth it can't evaluate is a Violation, not a guess."""
+    if name in seen:
+        raise Violation(f"call: recursion into {name}")
+    if name in EXTENTS:
+        return EXTENTS[name]
+    lines = disassemble(FOLLOW["path"], name)
+    growth = 8
+    red_zone = 0
+    deepest = 0
+    for _, text in lines:
+        parts = text.split(None, 1)
+        op = parts[0]
+        ops = x86_split(parts[1]) if len(parts) > 1 else []
+        if op.startswith(("push",)):
+            growth += 8
+        elif ops and ops[-1] in ("%rsp", "%esp"):
+            if op.startswith(("sub", "add")) and ops[0].startswith("$"):
+                value = int(ops[0][1:], 0)
+                growth += value if op.startswith("sub") else -value if value < 0 else 0
+            elif op.startswith("and") and ops[0].startswith("$"):
+                growth += 15
+            elif op.startswith("lea") and (m := re.match(r"^(-?(?:0x)?[0-9a-f]+)\(%rsp\)$", ops[0])):
+                growth += max(-int(m.group(1), 0), 0)
+            elif op.startswith(("add", "lea")) or op.startswith("mov") and ops[0] == "%rbp":
+                pass  # an epilogue: the stack gets shallower
+            else:
+                raise Violation(f"call: the stack growth of {name} can't be evaluated: {text}")
+        for m in re.finditer(r"(-(?:0x)?[0-9a-f]+)\(%rsp\)", text):
+            red_zone = max(red_zone, -int(m.group(1), 0))
+        target = re.search(r"^(?:call\w*|jmp\w*)\s+(?:0x)?[0-9a-f]+ <([^>+]+)>$", text)
+        if target and target.group(1) != name:
+            deepest = max(deepest, stack_extent(target.group(1), seen + (name,)))
+    EXTENTS[name] = growth + red_zone + deepest
+    return EXTENTS[name]
+
+
 # With --follow-calls, a call to a function defined in the same object (what a --fast build makes of
 # every Abla call) is checked as a function of its own, on the arguments the caller passes, instead of
 # failing. A call to anything not defined there, or a recursion, still fails.
@@ -149,18 +227,33 @@ def follow_call(name, secret, pointers, text):
 def check_x86(lines, secret, pointers):
     index_of_lines = {address for address, _ in lines}
     returned = []
-    start = frozenset(X86_ARGS[i] for i in secret) | frozenset(["ptr:" + X86_ARGS[i] for i in pointers])
+    start = (frozenset(X86_ARGS[i] for i in secret) | frozenset(["ptr:" + X86_ARGS[i] for i in pointers]) |
+             frozenset(["rspd:0"]))
+
+    def rsp_delta(state):
+        """How far rsp is below its value at entry, as the tag says; "?" if it isn't one number."""
+        deltas = [t.split(":")[1] for t in state if t.startswith("rspd:")]
+        return deltas[0] if len(deltas) == 1 else "?"
+
+    def move_rsp(state, change):
+        before = rsp_delta(state)
+        for tag in [t for t in state if t.startswith(("rspd:", "rspoff:"))]:
+            state.discard(tag)
+        state.add("rspd:" + (str(int(before) + change) if before != "?" and change is not None else "?"))
 
     def after_call(state, name, text):
         state = set(state)
-        secret_arguments = [i for i, r in enumerate(X86_ARGS) if r in state]
-        pointer_arguments = [i for i, r in enumerate(X86_ARGS) if "ptr:" + r in state and r not in state]
+        inputs = callee_inputs(name)
+        secret_arguments = [i for i, r in enumerate(X86_ARGS) if r in state and r in inputs]
+        pointer_arguments = [i for i, r in enumerate(X86_ARGS) if "ptr:" + r in state and r not in state and r in inputs]
         out = follow_call(name, secret_arguments, pointer_arguments, text)
         # The callee ran on exactly these arguments. What it returns in rax, rdx and the vector
         # registers is what its own analysis found; the other registers it may clobber are dead.
         for r in ["rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11"] + [f"v{n}" for n in range(16)]:
             state.discard(r)
             state.discard("ptr:" + r)
+            for tag in [t for t in state if t.startswith(("rspoff:" + r + ":", "const:" + r + ":", "zero:" + r))]:
+                state.discard(tag)
             if r in out:
                 state.add(r)
             if "ptr:" + r in out:
@@ -171,6 +264,19 @@ def check_x86(lines, secret, pointers):
         # register, and the callee may have written through it: every slot read after a call is secret.
         if "frameaddr" in state:
             state.add("pushed")
+        here = rsp_delta(state)
+        for wipe in [t for t in out if t.startswith("wipe:")]:
+            # A callee that wiped the stack below itself: its stack pointer is 8 below ours (the return address).
+            _, low, high = wipe.split(":")
+            for tag in [t for t in state if t.startswith("dirty:")]:
+                _, at_call, depth = tag.split(":")
+                if here != "?" and at_call != "?":
+                    if (-int(here) - 8 + int(low) <= -int(at_call) - int(depth) and
+                            -int(here) - 8 + int(high) >= -int(at_call) - 8):
+                        state.discard(tag)
+        if FOLLOW["residue"] and (secret_arguments or pointer_arguments):
+            # Whatever the callee wrote below our stack pointer may hold a secret; a wipe has to reach it.
+            state.add(f"dirty:{rsp_delta(state)}:{stack_extent(name)}")
         return frozenset(state)
 
     def mem_parts(op):
@@ -181,10 +287,22 @@ def check_x86(lines, secret, pointers):
         state = set(state)
         parts = text.split(None, 1)
         op = parts[0]
+        repeated = op == "rep"
         if op in ("lock", "rep", "notrack", "data16", "cs") and len(parts) > 1:
             parts = parts[1].split(None, 1)
             op = parts[0]
         ops = x86_split(parts[1]) if len(parts) > 1 else []
+        if op.startswith("push"):
+            move_rsp(state, 8)
+        elif op.startswith("pop"):
+            move_rsp(state, -8)
+        elif ops and ops[-1] in ("%rsp", "%esp") and not op.startswith(("cmp", "test")):
+            if op.startswith(("sub", "add")) and ops[0].startswith("$"):
+                move_rsp(state, int(ops[0][1:], 0) * (1 if op.startswith("sub") else -1))
+            elif op.startswith("lea") and (m := re.match(r"^(-?(?:0x)?[0-9a-f]+)\(%rsp\)$", ops[0])):
+                move_rsp(state, -int(m.group(1), 0))
+            else:
+                move_rsp(state, None)
         tainted = lambda r: x86_reg(r) in state
 
         def stack_slots(o):
@@ -264,6 +382,8 @@ def check_x86(lines, secret, pointers):
                     state.discard(r)
                 (state.add if pointer else state.discard)("ptr:" + r)
                 state.discard("stackaddr:" + r)
+                for tag in [t for t in state if t.startswith(("rspoff:" + r + ":", "const:" + r + ":", "zero:" + r))]:
+                    state.discard(tag)
                 if r != "rsp":
                     state.discard("stackbase:" + r)
             else:
@@ -333,6 +453,9 @@ def check_x86(lines, secret, pointers):
             pointer_input = "ptr:" + base in state or "ptr:" + index in state
             stack_base = base == "rsp" or "stackbase:" + base in state
             write(ops[1], value, pointer_input)
+            if base == "rsp" and not index and ops[1].startswith("%"):
+                displacement = parts.group(1)
+                state.add(f"rspoff:{x86_reg(ops[1])}:{int(displacement, 0) if displacement not in ('', '-') else 0}")
             if stack_base and ops[1].startswith("%"):
                 state.add("stackbase:" + x86_reg(ops[1]))
                 state.add("stackaddr:" + x86_reg(ops[1]))
@@ -343,7 +466,45 @@ def check_x86(lines, secret, pointers):
         if (op.startswith(("xor", "pxor", "vpxor", "sub", "xorp")) and len(ops) >= 2 and
                 x86_reg(ops[0]) == x86_reg(ops[1]) and ops[0].startswith("%")):
             write(ops[-1], False)
+            state.add("zero:" + x86_reg(ops[-1]))
             state.discard("flags")
+            return frozenset(state)
+        if repeated and op.startswith("stos") and "zero:rax" in state and not tainted("%rax"):
+            # `rep stos` of zero over a constant number of elements starting at a constant offset from
+            # rsp: it wipes those bytes of the frame (what ctScrubStack emits).
+            width = {"b": 1, "w": 2, "l": 4, "q": 8}.get(op[-1], 0)
+            start = next((int(t.split(":")[2]) for t in state if t.startswith("rspoff:rdi:")), None)
+            count = next((int(t.split(":")[2]) for t in state if t.startswith("const:rcx:")), None)
+            if width and start is not None and count is not None:
+                covered = {f"rsp:{offset}" for offset in range(start, start + width * count)}
+                for tag in [t for t in state if t.startswith(("slot:", "ptrslot:")) and t.split(":", 1)[1] in covered]:
+                    state.discard(tag)
+                # A wipe that reaches above the stack pointer overwrites the entry's own live frame.
+                if start + width * count > 0:
+                    raise Violation(f"a wipe reaches above the stack pointer: {text}")
+                # It clears a callee's frames when it covers [rsp at the call - depth, rsp at the call): the
+                # wipe's own rsp may differ from the call's, and an unknown difference clears nothing.
+                here = rsp_delta(state)
+                for tag in [t for t in state if t.startswith("dirty:")]:
+                    _, at_call, depth = tag.split(":")
+                    if here != "?" and at_call != "?":
+                        low = int(here) * -1 + start
+                        high = int(here) * -1 + start + width * count
+                        # The 8 bytes under the stack pointer at a call hold its return address, not a secret.
+                        if low <= -int(at_call) - int(depth) and high >= -int(at_call) - 8:
+                            state.discard(tag)
+                if here != "?":
+                    state.add(f"wipe:{-int(here) + start}:{-int(here) + start + width * count}")
+                state.discard("rdi")
+                state.discard("rcx")
+                return frozenset(state)
+        if op.startswith("mov") and len(ops) == 2 and ops[0].startswith("$") and ops[1].startswith("%"):
+            constant = ops[0][1:]
+            write(ops[1], False)
+            try:
+                state.add(f"const:{x86_reg(ops[1])}:{int(constant, 0)}")
+            except ValueError:
+                pass
             return frozenset(state)
         if op.startswith("mov") and len(ops) == 2:
             pointer = read_pointer(ops[0])
@@ -417,16 +578,22 @@ def check_x86(lines, secret, pointers):
     states = fixpoint(lines, start, step, successors)
     # What the function can leave in its registers when it returns, for a caller that follows it.
     out = set()
+    paths = []
     for i, (_, text) in enumerate(lines):
         if text.split()[0].startswith("ret") and i in states:
-            out |= states[i]
-    for state in returned:
-        out |= state
+            paths.append(states[i])
+    paths += list(returned)
+    for path in paths:
+        out |= {t for t in path if not t.startswith("wipe:")}
+    # A wipe counts for a caller only if it happened on every path to a return.
+    if paths:
+        out |= frozenset.intersection(*[frozenset(t for t in path if t.startswith("wipe:")) for path in paths])
     if FOLLOW["residue"] and not FOLLOW["stack"]:
         # What a function leaves behind when it returns: a secret in a stack slot of its frame is a
         # copy in memory that nothing wipes. Registers are not counted: scratch registers hold
         # secrets all the time and are overwritten, not left in memory.
         residue = sorted(item for item in out if item.startswith("slot:"))
+        residue += sorted(f"{item.split(':')[2]} bytes of callee frames" for item in out if item.startswith("dirty:"))
         if residue:
             raise Violation(f"secret residue at return: {', '.join(residue[:4])}")
     return frozenset(out)
@@ -912,14 +1079,14 @@ def parse_spec(spec, count_hint=8):
 
 def main():
     arguments = sys.argv[1:]
-    if "--follow-calls" in arguments:
-        arguments.remove("--follow-calls")
-        FOLLOW["path"] = arguments[1]
     if "--residue" in arguments:
         # Checks x86-64 only. A callee followed from a checked function isn't checked for residue
         # itself: its caller's frame and registers are what remain.
         arguments.remove("--residue")
         FOLLOW["residue"] = True
+    if "--follow-calls" in arguments:
+        arguments.remove("--follow-calls")
+        FOLLOW["path"] = arguments[1]
     arch, path, *specs = arguments
     failed = 0
     for spec in specs:

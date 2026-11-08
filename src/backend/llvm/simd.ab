@@ -786,6 +786,46 @@ fun bootstrapLlvmEmitCtBarrier(backend: BootstrapLlvmBackend, value: i64*, lane:
     )
 }
 
+// ablaCtScrubStack<N>(): zeroes the N bytes below the stack pointer (docs/stdlib/ct.md; stdlib/abla/ct/scrub keeps it
+// in a @noinline function of its own, whose caller is then not a leaf and has no red zone), as `rep stosq` on
+// x86-64 and a store loop on AArch64; nothing elsewhere. Emitted here, per target, so that no other target's
+// assembly is ever in the module.
+fun bootstrapLlvmEmitCtScrubStack(backend: BootstrapLlvmBackend, name: string): bool {
+    val bytes =
+        if (name == "ablaCtScrubStack512") 512
+        else if (name == "ablaCtScrubStack1024") 1024
+        else if (name == "ablaCtScrubStack2048") 2048
+        else if (name == "ablaCtScrubStack4096") 4096
+        else 0
+    if (bytes == 0) return false
+    val arch = bootstrapLlvmSimdArch(backend.targetTriple)
+    var assembly = ""
+    var constraints = ""
+    if (arch == BOOTSTRAP_SIMD_ARCH_X86_64) {
+        assembly =
+            "leaq -$bytes(%rsp), %rdi\nmovl \$\$${bytes / 8}, %ecx\nxorl %eax, %eax\nrep stosq"
+        constraints = "~{rdi},~{rcx},~{rax},~{memory},~{dirflag},~{fpsr},~{flags}"
+    } else if (arch == BOOTSTRAP_SIMD_ARCH_AARCH64) {
+        val size = if (bytes == 4096) "#1, lsl #12" else "#$bytes"
+        assembly =
+            "sub x9, sp, $size\nmov x10, sp\n1:\nstp xzr, xzr, [x9], #16\ncmp x9, x10\nb.ne 1b"
+        constraints = "~{x9},~{x10},~{memory},~{cc}"
+    } else {
+        return true
+    }
+    val type = bootstrapLlvmFunctionType(backend, backend.voidType, [])
+    bootstrapLlvmCallTyped(
+        backend, type,
+        LLVMGetInlineAsm(type, assembly, assembly.size, constraints, constraints.size, 1, 0, 0, 0),
+        [], ""
+    )
+    // The wipe writes where a red zone would be: the function holding it must never keep live data there.
+    bootstrapLlvmAddFunctionAttribute(
+        backend, LLVMGetBasicBlockParent(LLVMGetInsertBlock(backend.builder)), "noredzone"
+    )
+    true
+}
+
 // ablaCtSecret_<lane>(lane): the barrier; ablaCtBits_<lane>(secret): the same bits, public.
 fun bootstrapLlvmEmitCtIntrinsic(
     backend: BootstrapLlvmBackend,
@@ -801,6 +841,9 @@ fun bootstrapLlvmEmitCtIntrinsic(
                 0)
         )
         return true
+    }
+    if (name.startsWith("ablaCtScrubStack")) {
+        return bootstrapLlvmEmitCtScrubStack(backend, name)
     }
     if (instruction.operands.size != 1) return false
     val barrier = name.startsWith("ablaCtSecret_")

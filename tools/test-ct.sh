@@ -26,6 +26,13 @@ sed -n '/^\/\/ BEGIN PBE SECRET CORES$/,/^\/\/ END PBE SECRET CORES$/p' stdlib/a
 # No production edits or call exemptions: see generator's scope guards.
 python3 "$cases/crypto-source-fixtures.py" "$cases/crypto-generated.ab"
 cat "$cases/crypto-generated.ab" >> "$cases/fixture.ab"
+# Every fixture also gets a residue entry: a @noinline copy as a worker, and an export that calls it and then
+# wipes the stack below it (abla/ct/scrub), the shape of a public entry point. They are read for residue below.
+mkdir -p "$out/residue-cases"
+cp "$cases"/*.ab "$cases"/abla.toml "$out/residue-cases/" 2>/dev/null || true
+sed -i 's|^import "abla/ct"$|import "abla/ct"\nimport "abla/ct/scrub"|' "$out/residue-cases/fixture.ab"
+python3 "$cases/residue-entries.py" "$out/residue-cases/fixture.ab" ctScrubStack1024 "$out/residue-cases/fixture.ab" \
+    "$cases/crypto-generated.follow" > "$out/residue-entries.txt"
 # Staged build drivers need the scratch fixture paths as well.
 sed -i 's@tests/cases/ct/@build/ct/cases/@g' "$cases/build.ab" "$cases/aarch64-build.ab"
 python3 -I tools/ct/test-check-asm.py
@@ -123,30 +130,47 @@ orchestration_read() { # object
     echo "ok   x86_64 orchestration: bnFromBytes and bnResidueSquare read whole, their calls followed"
 }
 
-# Secret residue: a secret a function leaves in a stack slot of its frame is a copy in memory that nothing
-# wipes. Registers aren't counted. The control pair is hand-written assembly: one function spills and
-# returns, the other clears its slot. Then the release fixtures are read, and tests/cases/ct/residue-known.txt
-# lists the ones that leave a slot (work for the code, not the checker). Any other finding fails, and so does
-# a listed fixture that comes out clean (shrink the list).
-residue_read() { # object
-    local object=$1
+# Secret residue: what a secret-handling call leaves in memory that nothing wipes. The register allocator spills
+# into the red zone and frames the compiler can't name, so the entry that called the work wipes the stack below
+# it afterwards (abla/ct/scrub), and the checker (--residue, with --follow-calls) requires that: a slot of the
+# entry's own frame that holds a secret at return, or the frames of a callee given a secret that no wipe up to
+# the stack pointer reached, fail. Controls, hand-written assembly: a spill that stays, a spill that is cleared,
+# a callee with no wipe after it, a wipe shorter than the callee's depth, and one that reaches it. Then every
+# fixture's residue entry is read. tests/cases/ct/residue-known.txt lists what stays unwiped, with a reason;
+# it is empty on x86-64. Wasm has no addressable native stack, AArch64 is wiped but not read, and Xtensa is
+# compiled, not run: the wipe is a no-op there.
+residue_read() {
+    local entry object="$out/x86-residue.o"
+    "$compiler" build "$out/residue-cases/object-x86.ab" -o "$object" --emit object --no-cache
     llvm-mc -triple x86_64-linux-gnu -filetype=obj "$cases/residue-x86.s" -o "$out/residue-x86.o"
-    if $check --residue x86_64 "$out/residue-x86.o" residue_left:0 > "$out/residue-left.log" 2>&1; then
-        echo "ct: missed a secret left in a stack slot" >&2; exit 1
-    fi
-    grep -q 'secret residue' "$out/residue-left.log" || { cat "$out/residue-left.log" >&2; exit 1; }
-    $check --residue x86_64 "$out/residue-x86.o" residue_wiped:0 > "$out/residue-wiped.log" 2>&1 || {
-        cat "$out/residue-wiped.log" >&2; echo "ct: a wiped slot was reported" >&2; exit 1
-    }
-    $check --residue x86_64 "$object" "${fixtures[@]}" "${host_fixtures[@]}" > "$out/x86_64-residue.log" 2>&1 || true
-    if grep '^LEAK' "$out/x86_64-residue.log" | grep -v 'secret residue'; then
+    ld.lld -static -e residue_left "$out/residue-x86.o" -o "$out/residue-x86"
+    for entry in residue_left:0 residue_unwiped:0 residue_short:0 residue_pushed:0 residue_clobbered:1 residue_above:0 \
+        residue_called_short:0 residue_conditional:0; do
+        if $check --follow-calls --residue x86_64 "$out/residue-x86" "$entry" > "$out/${entry%%:*}.log" 2>&1; then
+            echo "ct: missed ${entry%%:*}" >&2; exit 1
+        fi
+        grep -Eq 'secret residue|reaches above' "$out/${entry%%:*}.log" || { cat "$out/${entry%%:*}.log" >&2; exit 1; }
+    done
+    for entry in residue_wiped residue_covered residue_called; do
+        $check --follow-calls --residue x86_64 "$out/residue-x86" "$entry:0" > "$out/$entry.log" 2>&1 || {
+            cat "$out/$entry.log" >&2; echo "ct: $entry was reported" >&2; exit 1
+        }
+    done
+    local specs=() spec name
+    for spec in "${fixtures[@]}" "${host_fixtures[@]}"; do
+        name=${spec%%:*}
+        grep -qx "ct_res_${name#ct_}" "$out/residue-entries.txt" || { echo "ct: no residue entry for $name" >&2; exit 1; }
+        specs+=("ct_res_${name#ct_}:${spec#*:}")
+    done
+    $check --follow-calls --residue x86_64 "$object" "${specs[@]}" > "$out/x86_64-residue.log" 2>&1 || true
+    if { grep '^LEAK' "$out/x86_64-residue.log" || true; } | grep -v 'secret residue'; then
         echo "ct: a finding other than residue" >&2; exit 1
     fi
-    grep '^LEAK' "$out/x86_64-residue.log" | awk '{sub(":", "", $3); print $3}' | sort > "$out/x86_64-residue.found"
-    if ! diff -u <(sort "$cases/residue-known.txt") "$out/x86_64-residue.found" > "$out/x86_64-residue.diff"; then
+    { grep '^LEAK' "$out/x86_64-residue.log" || true; } | awk '{sub(":", "", $3); print $3}' | sort > "$out/x86_64-residue.found"
+    if ! diff -u <(grep -v '^#' "$cases/residue-known.txt" | sort) "$out/x86_64-residue.found" > "$out/x86_64-residue.diff"; then
         cat "$out/x86_64-residue.diff" >&2; echo "ct: the residue findings changed (tests/cases/ct/residue-known.txt)" >&2; exit 1
     fi
-    echo "ok   x86_64 residue: $(grep -c '^ok' "$out/x86_64-residue.log") fixtures leave no secret in a slot, $(wc -l < "$out/x86_64-residue.found") listed in residue-known.txt, the control pair told apart"
+    echo "ok   x86_64 residue: ${#specs[@]} entries wipe what their work used, $(wc -l < "$out/x86_64-residue.found") unwiped, the eleven controls told apart"
 }
 
 # A callee that writes a secret through an address of the caller's own frame (made by lea or by mov from rsp)
@@ -165,6 +189,31 @@ frame_address_read() {
     echo "ok   x86_64 following calls: a secret written through a frame address, and one passed on the stack, found"
 }
 
+# The real entry points, run: the 16 KiB below the stack pointer is zeroed, each public AES (every key size, and a
+# 64 KiB input) and RSA private entry (2048, 3072 and 4096 bits) is called from a helper that returns, and the region
+# must still be zero beneath the entry's own frame. A worker that outgrows its wipe (ctScrubStack2048 in abla/crypto/aes,
+# ctScrubStack4096 in abla/crypto/rsa) fails this; the fixtures' static depth check can't reach the allocator and runtime
+# frames these workers use. Three plain runs and one with a collection at every safe point (ABLA_GC_STRESS=1), the
+# deterministic worst case, since a collection in the middle of an entry makes it deeper. Controls: a byte left in the
+# red zone is found, and gone after ctScrubStack1024.
+real_entries_run() {
+    "$compiler" build "$cases/residue-run.ab" -o "$out/residue-run" --no-cache
+    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$out/keys-3072.pem" 2> /dev/null
+    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out "$out/keys-4096.pem" 2> /dev/null
+    local run
+    for run in 1 2 3; do
+        "$out/residue-run" "$out/keys-3072.pem" "$out/keys-4096.pem" > "$out/residue-run.log" 2>&1 || {
+            "$out/residue-run" v "$out/keys-3072.pem" "$out/keys-4096.pem" >&2
+            echo "ct: a real entry point left bytes below itself (check $?)" >&2; exit 1
+        }
+    done
+    ABLA_GC_STRESS=1 "$out/residue-run" "$out/keys-3072.pem" "$out/keys-4096.pem" > "$out/residue-run-stress.log" 2>&1 || {
+        ABLA_GC_STRESS=1 "$out/residue-run" v "$out/keys-3072.pem" "$out/keys-4096.pem" >&2
+        echo "ct: a real entry point left bytes below itself with a collection at every safe point" >&2; exit 1
+    }
+    rm -f "$out"/keys-*.pem
+    echo "ok   x86_64 real entry points: AES at 128, 192 and 256 bits with a 64 KiB input, RSA at 2048, 3072 and 4096, key generation: nothing below their own frame in 16 KiB, three runs and one under GC stress"
+}
 # A --fast build doesn't optimise, so it keeps what release builds remove: the type-tag check of every
 # erased scalar conversion branches on a value copied from a secret's box, and a division by a secret
 # stays a division. The checker can't tell those from payload, and they are not what the fast fixtures
@@ -217,7 +266,8 @@ read_target x86_64 "$out/x86.o"
 "$compiler" build "$cases/object-x86.ab" -o "$out/x86-fast.o" --emit object --no-cache --fast
 fast_read x86_64 "$out/x86-fast.o"
 frame_address_read
-residue_read "$out/x86.o"
+residue_read
+real_entries_run
 orchestration_read "$out/x86.o"
 
 # --- AArch64 --------------------------------------------------------------------------

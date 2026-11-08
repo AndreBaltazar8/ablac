@@ -1,0 +1,157 @@
+// Runs the real AES and RSA private entry points on x86-64 and looks at what they left on the dead stack. The 16 KiB
+// below the stack pointer is zeroed, an entry is called from a helper that has returned, and the region must still be
+// all zero: the entry's own wipe reached every frame its work used, however deep (a worker that outgrows the wipe
+// leaves bytes below it). Exit 0 if so for every entry; the number of the first failing check otherwise. With the
+// wipes removed the same program fails (tools/test-ct.sh builds that variant too), and a control checks that the
+// scan sees a byte left in the red zone and that ctScrubStack1024 removes it.
+import "abla/crypto/aes"
+import "abla/crypto/rsa"
+import "abla/ct/scrub"
+import "abla/fs"
+import "abla/io"
+import "abla/process/arguments"
+import "abla/unsafe/memory/raw"
+
+trusted noescape extern:"inline-assembly" fun stackPointer(template: string, constraints: string): int
+trusted noescape extern:"inline-assembly" fun leaveInRedZone(template: string, constraints: string, value: int): void
+
+val region = 16384
+
+fun verbose(): bool {
+    for (at in 0 until processArgumentCount()) if (processArgument(at) == "v") return true
+    false
+}
+var failure = 0
+var checks = 0
+
+@inline trusted fun paint(top: int): void {
+    var at = top - region
+    while (at < top) {
+        ablaUnsafeStoreU8(nativePointerFromAddress(at), 0)
+        at = at + 1
+    }
+}
+
+// How far below `top` the deepest nonzero byte of the painted region is; 0 if the region is all zero. The 192 bytes
+// right under the stack pointer are the entry's own frame (its return address and saved registers) and the frames of
+// the calls it makes after the wipe (the wipe function itself, the runtime's entry and exit): public pointers and
+// small counts, which the wipe cannot clear. tools/test-ct.sh reads the entry's own slots for secrets statically.
+@inline trusted fun deepest(top: int): int {
+    var at = top - region
+    while (at < top - 192) {
+        if (ablaUnsafeLoadU8(nativePointerFromAddress(at)) != 0) return top - at
+        at = at + 1
+    }
+    0
+}
+
+fun record(ok: bool): void {
+    checks = checks + 1
+    if (!ok && failure == 0) failure = checks
+    return
+}
+
+// The helpers record their own stack pointer after the entry returns: the entry wiped the region below it, so that
+// is where the scan starts (the helper's own frame, above it, holds public values and return addresses).
+var entrySp = 0
+
+@noinline trusted fun aesEntries(which: int, key: string, text: string): int {
+    val size = when (which) {
+        0 -> aesEcbEncryptPkcs5(key, text).bytes.size
+        1 -> aesEcbDecryptPkcs5(key, text + text).bytes.size
+        2 -> aesCbcEncryptPkcs7(key, "0123456789abcdef", text).bytes.size
+        3 -> aesCbcDecryptPkcs7(key, "0123456789abcdef", text + text).bytes.size
+        4 -> aesGcmEncrypt(key, "123456789012", text, "").bytes.size
+        else -> aesGcmDecrypt(key, "123456789012", text + text, "").bytes.size
+    }
+    entrySp = stackPointer("movq %rsp, $0", "=r")
+    return size
+}
+
+@noinline trusted fun rsaEntries(which: int, der: string, text: string): int {
+    val key = rsaPrivateKeyFromDer(der)
+    val size = when (which) {
+        0 -> key.signPkcs1Sha256(text).bytes.size
+        1 -> key.signPkcs1Sha1Legacy(text).bytes.size
+        2 -> key.decryptOaepSha256(text).bytes.size
+        3 -> key.decryptOaepSha1Legacy(text).bytes.size
+        else -> key.decryptPkcs1Legacy(text).bytes.size
+    }
+    entrySp = stackPointer("movq %rsp, $0", "=r")
+    return size
+}
+
+@noinline trusted fun generateEntry(): int {
+    val size = rsaGeneratePrivateKey(2048).toPkcs8Der().bytes.size
+    entrySp = stackPointer("movq %rsp, $0", "=r")
+    return size
+}
+
+@noinline trusted fun leaky(value: int): void =
+    leaveInRedZone("movq $0, -256(%rsp)\nmovq $0, -248(%rsp)", "r,~{memory}", value)
+
+@noinline trusted fun leakyThenWiped(value: int): void {
+    leaky(value)
+    ctScrubStack1024()
+}
+
+// Every AES key size and a long input; the RSA key of every file named on the command line (PKCS#8 PEM), and one
+// generated here. Each entry runs on a freshly zeroed region.
+@inline trusted fun checkAes(top: int, key: string, text: string): void {
+    // The first call of a process also initializes the runtime (a lazy CPU probe, the allocator), which goes
+    // deeper and holds nothing secret: run each entry once unmeasured.
+    for (which in 0 until 6) aesEntries(which, key, text)
+    for (which in 0 until 6) {
+        paint(top)
+        aesEntries(which, key, text)
+        val depth = deepest(entrySp)
+        if (verbose()) println("aes ${key.size * 8} ${text.size} $which: $depth")
+        record(depth == 0)
+    }
+}
+
+@inline trusted fun checkRsa(top: int, der: string, label: string): void {
+    val data = "A".repeat(200)
+    for (which in 0 until 5) rsaEntries(which, der, data)
+    for (which in 0 until 5) {
+        paint(top)
+        rsaEntries(which, der, data)
+        val depth = deepest(entrySp)
+        if (verbose()) println("rsa $label $which: $depth")
+        record(depth == 0)
+    }
+}
+
+trusted fun main: int {
+    var top = stackPointer("movq %rsp, $0", "=r")
+    paint(top)
+    leaky(72623859790382856)
+    record(deepest(top) > 0)
+    paint(top)
+    leakyThenWiped(72623859790382856)
+    record(deepest(top) == 0)
+
+    checkAes(top, "SECRETKEY0123456", "PLAINTEXT-MARKER")
+    checkAes(top, "SECRETKEY0123456SECRETKE", "PLAINTEXT-MARKER")
+    checkAes(top, "SECRETKEY0123456SECRETKEY0123456", "PLAINTEXT-MARKER")
+    checkAes(top, "SECRETKEY0123456", "PLAINTEXT-MARKER".repeat(4096))
+
+    val rsaKey = rsaGeneratePrivateKey(2048)
+    record(rsaKey.ok())
+    val der = rsaKey.toPkcs8Der().bytes
+    checkRsa(top, der, "2048")
+    for (at in 0 until processArgumentCount()) {
+        val argument = processArgument(at)
+        if (argument != "v") {
+            val loaded = rsaPrivateKeyFromPem(path(argument).readText())
+            record(loaded.ok())
+            checkRsa(top, loaded.toPkcs8Der().bytes, argument)
+        }
+    }
+    paint(top)
+    generateEntry()
+    val generated = deepest(entrySp)
+    if (verbose()) println("generate: $generated")
+    record(generated == 0)
+    failure
+}
