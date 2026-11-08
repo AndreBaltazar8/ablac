@@ -21,7 +21,7 @@ Test scripts marked † run in no suite: neither the Makefile `test` target nor
 |---|---|---|---|---|
 | Programs, `main`, exit status, `exit`, `panic` | `backend/llvm/exports.ab`, `stdlib/abla/process/exit` | [language.md#programs](language.md#programs) | good | test-main-void, test-process-exit |
 | Comments, identifiers, keywords, contextual keywords | `lexer.ab`, `parser.ab` (`atContextualKeyword`) | [language.md#lexical-structure](language.md#lexical-structure) | good | shell-contextual-keywords |
-| Line continuation (`+`, `-`, `.` at line start) | `parser.ab` `continueAdditiveExpression`, `continueMemberChain` | [language.md#lexical-structure](language.md#lexical-structure) | good | test-line-continuation |
+| Line continuation (`+`, `-`, `.` at line start) | `parser.ab` `continueAdditiveExpression`, `continueMemberChain` | [language.md#lexical-structure](language.md#lexical-structure) | good | shell-line-continuation |
 | Literals, string escapes, templates, multi-line strings | `lexer.ab`, `parser.ab` `bootstrapDecodeString` | [language.md#lexical-structure](language.md#lexical-structure) | good | test-static-strings, test-string-escapes, test-float-interpolation, shell-interpolate-fixed-width, test-string-plus |
 | `val`/`var`, deferred `var` initialization, shadowing | `parser.ab` `parseLocal`, `sema.ab` | [language.md#values-and-variables](language.md#values-and-variables) | good | definite-assignment (native), test-local-shadowing, test-module-shadowing |
 | Integer widths, conversions, wrapping, shifts | `sema.ab` primitive casts, `ir.ab` `scalar.cast` | [language.md#integers](language.md#integers) | good | test-native-width-integers, test-fixed-width-boxed-arithmetic, test-bitwise-crypto |
@@ -29,12 +29,12 @@ Test scripts marked † run in no suite: neither the Makefile `test` target nor
 | Strings | `sema.ab` `string.*` | [language.md#strings](language.md#strings), [stdlib/text.md](stdlib/text.md) | good | test-string-helpers, shell-string-retention |
 | Arrays (`append`, `truncate`, `clear`, `filledArray`) | `sema.ab`, `ir.ab` | [language.md#arrays](language.md#arrays) | good | test-array-filled, test-array-truncate, test-arrays-dense, test-collection-modes |
 | `Map<K, V>` | `sema.ab` `map.*`, `ir.ab` | [language.md#maps](language.md#maps) | good | shell-map-basic, shell-map-collect, shell-map-compile-time, shell-map-differential |
-| Nullable types and narrowing | `sema.ab` refinement | [language.md#nullable-types](language.md#nullable-types) | good | test-narrowing-and-branches, test-nullable-refinement |
+| Nullable types and narrowing | `sema.ab` refinement | [language.md#nullable-types](language.md#nullable-types) | good | shell-narrowing-and-branches, test-nullable-refinement |
 | Nominal `type X = int` | `parser.ab`, `sema.ab` | [language.md#nominal-types](language.md#nominal-types) | good | test-nominal-scalars |
 | `void`, `never` | `sema.ab` divergence, `ir.ab` unreachable | [language.md#void-and-never](language.md#void-and-never) | good | test-exhaustive-when |
 | Functions, defaults, named arguments | `parser.ab`, `module.ab` normalizer | [language.md#functions](language.md#functions) | good | test-named-default-arguments, test-argument-diagnostics |
 | Inferred result types | `sema.ab` | [language.md#functions](language.md#functions) (known issue) | good | — |
-| Extension functions | `parser.ab` `parseDeclaration` | [language.md#extension-functions](language.md#extension-functions) | good | test-line-continuation, test-nominal-scalars |
+| Extension functions | `parser.ab` `parseDeclaration` | [language.md#extension-functions](language.md#extension-functions) | good | shell-line-continuation, test-nominal-scalars |
 | Lambdas, trailing lambdas, closures | `parser.ab` `parseLambda`, `sema.ab` | [language.md#lambdas-and-closures](language.md#lambdas-and-closures) | good | test-closure-captures, test-lambda-void-assignment |
 | Classes, methods, properties | `parser.ab`, `sema.ab` | [language.md#classes](language.md#classes) | good | classes (native) |
 | Interfaces | `parser.ab`, `sema.ab` (nominal only) | [language.md#interfaces](language.md#interfaces) | reference | overload-probe-filter |
