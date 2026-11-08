@@ -893,10 +893,10 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   10,514 M instructions go (33.8 M objects, 311 a piece): the collector 86 (27.6%), `make` 82 (26.4%: the
   GC root frame push and pop, the safe-point check, and for each child a three-way tag test (null, or the
   declared class) that a child of the declared class cannot fail), the object block allocator 67 (21.7%:
-  size-class free-list pop 11, header and registry append and byte accounting about 40, high-water marks),
+  size-class free-list pop about 13, header, registry append, byte accounting and water marks the rest),
   `check` 26 (8.4%), malloc and free 22, other 27. What would move trees, in order of size: the collector's
-  schedule and its visit of every allocation (ablac-39, #677); the allocator fast path (accounting touches
-  eight globals per object); passing an object as a pointer instead of a boxed argument (per-call boxing);
+  schedule and its visit of every allocation (ablac-39, #677); the allocator fast path (it touches seven
+  globals per object); passing an object as a pointer instead of a boxed argument (per-call boxing);
   dropping the constructor's tag test when the argument's static type is the field's class (about 6
   instructions a child, 3% of trees at most).
 - [ ] **Per-call boxing in the lowering.** 17% of the IR's instructions are
