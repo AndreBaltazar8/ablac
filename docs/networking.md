@@ -614,7 +614,7 @@ with a target starting `/` or `*`, a `Content-Length` together with
 is answered `400` and the connection closes. A body shorter than declared waits
 for the rest and the idle timeout closes the connection without an answer; bytes
 after a body of the declared length are the next request, never part of this
-one. `tests/cases/modules/http-event.ab` runs each of these.
+one. A blank line before the request line is not skipped (it is answered `400`). `tests/cases/modules/http-event.ab` runs each of these.
 
 The steady-state HTTP path keeps only readable interest registered. A response
 that fills the kernel send buffer enables writable interest exactly once, then
