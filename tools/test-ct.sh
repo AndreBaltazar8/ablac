@@ -251,12 +251,24 @@ real_entries_run() {
     "$compiler" build "$cases/residue-run.ab" -o "$out/residue-run" --no-cache
     openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$out/keys-3072.pem" 2> /dev/null
     openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out "$out/keys-4096.pem" 2> /dev/null
-    # An encrypted PKCS#8 (PBES2, AES-256, PBKDF2 SHA-256) and a PKCS#12 of the same key, for the password-based entries.
-    openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA256 -iter 2000 -in "$out/keys-3072.pem" -outform DER \
-        -out "$out/keys-enc.p8" -passout pass:PASSWORD-MARKER-0123456789 2> /dev/null
-    openssl pkcs12 -export -inkey "$out/keys-3072.pem" -nocerts -out "$out/keys-enc.p12" -macalg sha256 -iter 2000 \
-        -certpbe AES-256-CBC -keypbe AES-256-CBC -passout pass:PASSWORD-MARKER-0123456789 2> /dev/null
-    local run files=("$out/keys-3072.pem" "$out/keys-4096.pem" "$out/keys-enc.p8" "$out/keys-enc.p12")
+    # Every supported shape of the password-based entries: PBES2 with a SHA-256 and a SHA-1 PRF, AES-128 and AES-256, an
+    # RSA key of 2048 and of 4096 bits inside, and a PKCS#12 with a SHA-256 and a SHA-1 MAC.
+    local pbe_files=() prf cipher keys
+    for keys in 3072 4096; do
+        for prf in hmacWithSHA256 hmacWithSHA1; do
+            for cipher in aes-128-cbc aes-256-cbc; do
+                openssl pkcs8 -topk8 -v2 $cipher -v2prf $prf -iter 2000 -in "$out/keys-$keys.pem" -outform DER \
+                    -out "$out/keys-$keys-$prf-$cipher.p8" -passout pass:PASSWORD-MARKER-0123456789 2> /dev/null
+                pbe_files+=("$out/keys-$keys-$prf-$cipher.p8")
+            done
+        done
+        for prf in sha256 sha1; do
+            openssl pkcs12 -export -inkey "$out/keys-$keys.pem" -nocerts -out "$out/keys-$keys-$prf.p12" -macalg $prf \
+                -iter 2000 -certpbe AES-256-CBC -keypbe AES-256-CBC -passout pass:PASSWORD-MARKER-0123456789 2> /dev/null
+            pbe_files+=("$out/keys-$keys-$prf.p12")
+        done
+    done
+    local run files=("$out/keys-3072.pem" "$out/keys-4096.pem" "${pbe_files[@]}")
     for run in 1 2 3; do
         "$out/residue-run" "${files[@]}" > "$out/residue-run.log" 2>&1 || {
             "$out/residue-run" v "${files[@]}" >&2
@@ -267,7 +279,7 @@ real_entries_run() {
         ABLA_GC_STRESS=1 "$out/residue-run" v "${files[@]}" >&2
         echo "ct: a real entry point left bytes below itself with a collection at every safe point" >&2; exit 1
     }
-    rm -f "$out"/keys-*.pem
+    rm -f "$out"/keys-*.pem "$out"/keys-*.p8 "$out"/keys-*.p12
     echo "ok   x86_64 real entry points: AES at 128, 192 and 256 bits with a 64 KiB input, RSA at 2048, 3072 and 4096, key generation: nothing below their own frame in 16 KiB, three runs and one under GC stress"
 }
 # A --fast build doesn't optimise, so it keeps what release builds remove: the type-tag check of every

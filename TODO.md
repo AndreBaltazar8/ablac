@@ -162,7 +162,7 @@
   (`@noinline` worker, then the wipe) passes, and `residue-known.txt` has no entries. The AES and RSA private entry
   points (including key reading, export and generation) and the password entries of `abla/crypto/pbe`
   (`cryptoPassword`, `pbeOpenPkcs8`, `pbeOpenPkcs12`) call the wipe and are run against it (the run scan reads an
-  encrypted PKCS#8 and a PKCS#12; without the wipes they leave 704, 1,024 and 2,784 bytes). Not checked: registers, the GC heap,
+  encrypted PKCS#8 (SHA-256 and SHA-1 PRF, AES-128 and -256, 2048- and 4096-bit keys) and a PKCS#12 (SHA-256 and SHA-1 MAC), each with the right password, a wrong one, a truncated input and a changed last byte; without the wipes the first three leave 704, 1,024 and 2,784 bytes). A panic inside an entry leaves the process and is not wiped. Not checked: registers, the GC heap,
   AArch64 (wiped, not read), Wasm (no native stack to wipe) and Xtensa, and the `--fast` build.
 - [x] **Secret arithmetic around the crypto fixtures:** source-generated AES-128/192/256
   schedule and byte/block I/O, CRT subtract/correction/recombination and wide-reduction glue,
