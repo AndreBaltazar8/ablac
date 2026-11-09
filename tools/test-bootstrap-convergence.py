@@ -88,6 +88,8 @@ def same(left, right):
 
 
 def command(argv, cwd, log, env=None, output=None, timeout=1800):
+    if WRAPPER:
+        timeout = None  # the wrapper may queue for a slot; its time is not the build's
     print("+", shlex.join(map(str, argv)), flush=True)
     with Path(log).open("wb") as errors:
         if output is None:
