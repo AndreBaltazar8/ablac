@@ -1299,6 +1299,13 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   would hold the gain without the size: a flat string value for the scanner (the parse entry points reading
   their `source` once into a flat string, which the rope's copy cannot give because a string value copies
   the rope pointer), or a smaller inline form.
+- **JSON checked UTF-8 with the per-byte pass** (2026-11-09, master `0762174d`, release builds, instructions on one
+  P-core): `jsonParse`, `jsonValidate` and `jsonDocument` ran `utf8Info` over the whole text (the per-byte
+  `utf8Info` plus `utf8SequenceValid`, 12.3% and 8.3% of `json-megabyte` at 100,000 objects) before parsing. They
+  now ask the runtime's validator first (`isValidUtf8`, which skips ASCII a word at a time and applies the same
+  rules) and run `utf8Info` only to find the offset of invalid input. json-megabyte 81.11 G to 62.40 G
+  (-23.1%), json-readers 22.20 G to 20.14 G (-9.3%); the error code and byte offset of invalid input are
+  unchanged (`tests/cases/json-utf8`, passing with both the old and the new check).
 
 ## Tried, not pursued
 
