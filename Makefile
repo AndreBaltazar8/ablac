@@ -322,6 +322,7 @@ test-serial: ablac
 	tools/test-typed-subparser-inspection.sh $(COMPILER)
 	tools/test-unsafe-boundary.sh $(COMPILER)
 	tools/test-wasm-gc.sh $(COMPILER)
+	tools/test-fast-inline-cache.sh $(COMPILER)
 	tools/test-wasm-reclaim-limit.sh $(COMPILER)
 	tools/test-wasm-export-roots.sh $(COMPILER)
 	tools/test-repl.sh $(COMPILER)
