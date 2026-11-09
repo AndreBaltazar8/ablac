@@ -1257,6 +1257,20 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   interior-pointer fallback are not told apart by the counters (both count a directory build).
   Release builds, instructions, vs master `98c5c7a2`: trees 11,742.5 M to 10,767.2 M (-8.3%), strings
   2,036.9 M to 1,926.6 M (-5.4%), maps 2,560.8 M to 2,500.1 M (-2.4%), same output.
+  Where the collector's cycles go after the registry lookup and the locals (2026-11-09, master `85f5e3f3`, release build
+  of `trees`, `perf record -e cycles:u` and `instructions:u`, the sweep marked `@noinline` only to see it):
+  instructions put the sweep at about 10% of trees, but cycles put it at **30.7%** (`check` 21.4%, the object
+  allocator 18.8%, the registry lookup `CollectionFind` 12.2%, `make` 8.3%, the rest of the collector under 4%).
+  `perf annotate` of the sweep: 58.7% of its samples sit on the instruction after the load of a block's state word
+  (`header + 24`): the sweep spends its cycles waiting for each garbage block's cache line, and the free-list push
+  that follows writes the same line. The loop itself is about 17 instructions a garbage block, so cutting
+  instructions cannot help; fewer touched lines could. A sketch, not built: record the mark in a side bitmap by
+  registry slot, keep the size class in the registry entry, and hold freed blocks in per-class arrays of addresses
+  instead of links written into the blocks, so the sweep never loads a garbage block's line; the first touch moves
+  to the allocation that reuses the block, which writes the header (a store the store buffer absorbs, not a load
+  that stalls). It would touch the registry's entry format, the allocator's fast path (alloc-fast), the
+  free-list accounting and the collector's mark; its win is in cycles, not instructions, so it needs the quiet
+  benchmark window to be judged (instructions will not move).
 - [ ] **Name lookups in lowering.** Over a game server's `--emit-llvm` the method index's
   `find` was 200 of 3,552 samples, the declaration index's 148 and the name hashes 98 and
   76. Done: the method index hashes owner and name in place instead of a key string made
