@@ -25,6 +25,8 @@ Test scripts marked † run in no suite: neither the Makefile `test` target nor
 | Literals, string escapes, templates, multi-line strings | `lexer.ab`, `parser.ab` `bootstrapDecodeString` | [language.md#lexical-structure](language.md#lexical-structure) | good | shell-static-strings, test-string-escapes, test-float-interpolation, shell-interpolate-fixed-width, shell-string-plus |
 | `val`/`var`, deferred `var` initialization, shadowing | `parser.ab` `parseLocal`, `sema.ab` | [language.md#values-and-variables](language.md#values-and-variables) | good | definite-assignment (native), test-local-shadowing, shell-module-shadowing |
 | Integer widths, conversions, wrapping, shifts | `sema.ab` primitive casts, `ir.ab` `scalar.cast` | [language.md#integers](language.md#integers) | good | test-native-width-integers, test-fixed-width-boxed-arithmetic, test-bitwise-crypto |
+| `uint256`, `int256`, `uint128`, `int128` (one compiler family: `i128`/`i256` in the scalar plan, bytes in a slot) | `simd_types.ab` `bootstrapWideInt*`, `backend/llvm/simd.ab`, `eval_uint256.ab`, `ct_lift.ab` | [language.md#integers](language.md#integers), [stdlib/numbers.md](stdlib/numbers.md) | good | test-wide-integers (differential against Python, native, Wasm and object) |
+| Equality through `any`: kind-aware floats, a float operand | `stdlib/abla/runtime/self` `__ablaRuntimeEqual`, `ir.ab`, `eval.ab` | [language.md#lexical-structure](language.md#lexical-structure) | reference | test-any-eq-split, test-any-float-literal, test-fuzz-differential |
 | `f64`/`f32` | `lexer.ab`, `stdlib/abla/float` | [language.md#floating-point](language.md#floating-point), [stdlib/numbers.md](stdlib/numbers.md) | good | test-floating-point, test-compile-time-floats |
 | Strings | `sema.ab` `string.*` | [language.md#strings](language.md#strings), [stdlib/text.md](stdlib/text.md) | good | test-string-helpers, shell-string-retention |
 | Arrays (`append`, `truncate`, `clear`, `filledArray`) | `sema.ab`, `ir.ab` | [language.md#arrays](language.md#arrays) | good | test-array-filled, test-array-truncate, test-arrays-dense, test-collection-modes |
@@ -99,6 +101,8 @@ Test scripts marked † run in no suite: neither the Makefile `test` target nor
 | `abla/text`, `abla/bytes`, `abla/float/text` | [stdlib/text.md](stdlib/text.md) | good | string-helpers, text-unicode, bytes, floating-text |
 | `abla/io`, `abla/fs`, `abla/process/*` | [stdlib/system.md](stdlib/system.md) | good | portable-buffered-io, filesystem, fs-tree, process-capture, process-environment, process-exit, process-metrics |
 | `abla/core`, `abla/math`, `abla/math/v8`, `abla/math/fast`, `abla/float`, `abla/bits`, `abla/integer`, `abla/random` | [stdlib/numbers.md](stdlib/numbers.md) | good | floating-math, stdlib, bits, math-v8, math-fast (`abla/integer`: none) |
+| `abla/uint256`, `abla/int256`, `abla/uint128`, `abla/int128` | [stdlib/uint256.md](stdlib/uint256.md), [int256](stdlib/int256.md), [uint128](stdlib/uint128.md), [int128](stdlib/int128.md) | good | test-wide-integers |
+| `abla/regex` | [stdlib/regex.md](stdlib/regex.md) | good | test-regex, `tools/fuzz-regex` (Python `re`) |
 | `abla/crypto`, `abla/date` | [stdlib/security-and-dates.md](stdlib/security-and-dates.md) | good | crypto, date |
 | `abla/test`, `ablac test` | [stdlib/testing.md](stdlib/testing.md) | good | shell-ablac-test |
 | `abla/json`, `abla/http/json` | [json.md](json.md) | good | json-subparser, json-expressions, runtime-json, test-json-limits |
