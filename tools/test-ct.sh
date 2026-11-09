@@ -251,15 +251,20 @@ real_entries_run() {
     "$compiler" build "$cases/residue-run.ab" -o "$out/residue-run" --no-cache
     openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$out/keys-3072.pem" 2> /dev/null
     openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out "$out/keys-4096.pem" 2> /dev/null
-    local run
+    # An encrypted PKCS#8 (PBES2, AES-256, PBKDF2 SHA-256) and a PKCS#12 of the same key, for the password-based entries.
+    openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA256 -iter 2000 -in "$out/keys-3072.pem" -outform DER \
+        -out "$out/keys-enc.p8" -passout pass:PASSWORD-MARKER-0123456789 2> /dev/null
+    openssl pkcs12 -export -inkey "$out/keys-3072.pem" -nocerts -out "$out/keys-enc.p12" -macalg sha256 -iter 2000 \
+        -certpbe AES-256-CBC -keypbe AES-256-CBC -passout pass:PASSWORD-MARKER-0123456789 2> /dev/null
+    local run files=("$out/keys-3072.pem" "$out/keys-4096.pem" "$out/keys-enc.p8" "$out/keys-enc.p12")
     for run in 1 2 3; do
-        "$out/residue-run" "$out/keys-3072.pem" "$out/keys-4096.pem" > "$out/residue-run.log" 2>&1 || {
-            "$out/residue-run" v "$out/keys-3072.pem" "$out/keys-4096.pem" >&2
+        "$out/residue-run" "${files[@]}" > "$out/residue-run.log" 2>&1 || {
+            "$out/residue-run" v "${files[@]}" >&2
             echo "ct: a real entry point left bytes below itself (check $?)" >&2; exit 1
         }
     done
-    ABLA_GC_STRESS=1 "$out/residue-run" "$out/keys-3072.pem" "$out/keys-4096.pem" > "$out/residue-run-stress.log" 2>&1 || {
-        ABLA_GC_STRESS=1 "$out/residue-run" v "$out/keys-3072.pem" "$out/keys-4096.pem" >&2
+    ABLA_GC_STRESS=1 "$out/residue-run" "${files[@]}" > "$out/residue-run-stress.log" 2>&1 || {
+        ABLA_GC_STRESS=1 "$out/residue-run" v "${files[@]}" >&2
         echo "ct: a real entry point left bytes below itself with a collection at every safe point" >&2; exit 1
     }
     rm -f "$out"/keys-*.pem

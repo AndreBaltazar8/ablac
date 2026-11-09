@@ -160,8 +160,9 @@
   secret in a slot of its frame, or that gave a secret to a callee and didn't wipe the stack below it
   (`abla/ct/scrub`; the checker reads the callees' depth and the size of the wipe). Every fixture's residue entry
   (`@noinline` worker, then the wipe) passes, and `residue-known.txt` has no entries. The AES and RSA private entry
-  points (including key reading, export and generation) call the wipe and are run against it; PBE and the PKCS#8/PKCS#12
-  readers' password paths in `abla/crypto/pbe` are not wrapped yet. Not checked: registers, the GC heap,
+  points (including key reading, export and generation) and the password entries of `abla/crypto/pbe`
+  (`cryptoPassword`, `pbeOpenPkcs8`, `pbeOpenPkcs12`) call the wipe and are run against it (the run scan reads an
+  encrypted PKCS#8 and a PKCS#12; without the wipes they leave 704, 1,024 and 2,784 bytes). Not checked: registers, the GC heap,
   AArch64 (wiped, not read), Wasm (no native stack to wipe) and Xtensa, and the `--fast` build.
 - [x] **Secret arithmetic around the crypto fixtures:** source-generated AES-128/192/256
   schedule and byte/block I/O, CRT subtract/correction/recombination and wide-reduction glue,
