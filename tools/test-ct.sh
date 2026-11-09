@@ -181,6 +181,38 @@ division_read() {
     echo "ok   x86_64 checker: cqto redefines rdx, a panic takes nothing secret and is not reached by a secret branch (five controls)"
 }
 
+# The header-public pointer (`%n`): the first 32 bytes of the object it points to are public, the rest is secret. The
+# clean entries read the header; the rest (payload read, a variable offset, the register overwritten, replaced on one
+# path, clobbered by a call, a secret stored through it or a copy of it) must be reported. x86-64 only; the other
+# targets refuse the spec.
+header_read() {
+    llvm-mc -triple x86_64-linux-gnu -filetype=obj "$cases/header-x86.s" -o "$out/header-x86.o"
+    ld.lld -static -e hdr_branch "$out/header-x86.o" -o "$out/header-x86"
+    local entry
+    for entry in hdr_branch hdr_loop; do
+        $check x86_64 "$out/header-x86" "$entry:%0" > "$out/header-$entry.log" 2>&1 || {
+            cat "$out/header-$entry.log" >&2; echo "ct: header entry $entry was reported" >&2; exit 1
+        }
+    done
+    for entry in payload_branch payload_index header_indexed header_overwritten header_merge header_call header_offset; do
+        if $check x86_64 "$out/header-x86" "$entry:%0" > "$out/header-$entry.log" 2>&1; then
+            echo "ct: missed header control $entry" >&2; exit 1
+        fi
+        grep -q '^LEAK' "$out/header-$entry.log" || { cat "$out/header-$entry.log" >&2; exit 1; }
+    done
+    for entry in header_store_secret header_store_other; do
+        if $check x86_64 "$out/header-x86" "$entry:%0,1" > "$out/header-$entry.log" 2>&1; then
+            echo "ct: missed header control $entry" >&2; exit 1
+        fi
+        grep -q 'LEAK.*secret stored through an object pointer' "$out/header-$entry.log" || { cat "$out/header-$entry.log" >&2; exit 1; }
+    done
+    if $check aarch64 "$out/header-x86" "hdr_branch:%0" > "$out/header-refused.log" 2>&1; then
+        echo "ct: a header pointer was accepted on a target that doesn't read it" >&2; exit 1
+    fi
+    grep -q "isn't read on aarch64" "$out/header-refused.log" || { cat "$out/header-refused.log" >&2; exit 1; }
+    echo "ok   x86_64 checker: header words of an object pointer are public (2 clean, 9 controls, other targets refuse the spec)"
+}
+
 # Secret residue: what a secret-handling call leaves in memory that nothing wipes. The register allocator spills
 # into the red zone and frames the compiler can't name, so the entry that called the work wipes the stack below
 # it afterwards (abla/ct/scrub), and the checker (--residue, with --follow-calls) requires that: a slot of the
@@ -532,6 +564,7 @@ real_entries_run
 orchestration_read "$out/x86.o"
 worker_read "$out/x86.o"
 division_read
+header_read
 
 # --- AArch64 --------------------------------------------------------------------------
 "$compiler" build "$cases/aarch64-build.ab" -o "$out/aarch64-driver" --no-cache

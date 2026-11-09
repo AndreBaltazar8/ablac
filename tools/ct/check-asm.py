@@ -272,8 +272,10 @@ def follow_call(name, secret, pointers, text, check=None):
 def check_x86(lines, secret, pointers):
     index_of_lines = {address for address, _ in lines}
     returned = []
+    header_args = FOLLOW.get("header_args", [])
+    FOLLOW["header_args"] = []  # a followed callee has none
     start = (frozenset(X86_ARGS[i] for i in secret) | frozenset(["ptr:" + X86_ARGS[i] for i in pointers]) |
-             frozenset(["rspd:0"]))
+             frozenset(["rspd:0"]) | frozenset("hdrp:" + X86_ARGS[i] for i in header_args))
 
     def rsp_delta(state):
         """How far rsp is below its value at entry, as the tag says; "?" if it isn't one number."""
@@ -343,6 +345,28 @@ def check_x86(lines, secret, pointers):
         m = re.match(r"^(-?(?:0x)?[0-9a-f]*)\((%\w+)?(?:,(%\w+)(?:,\d+)?)?\)$", op)
         return m
 
+    def mark_lost(state, op, ops):
+        """A header-public pointer stays one only while its register is never written: any instruction that may write
+        it (a bare register operand other than a mov/cmp/test/push source, or an implicit writer) or a call ends it. A
+        merge keeps `lost`, since the states are joined by union."""
+        if op.startswith(("call", "syscall")):
+            for r in ["rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11"]:
+                state.add("lost:" + r)
+            return
+        if op.startswith(("cmp", "test", "j", "push", "nop", "endbr", "ret")):
+            return
+        if op.startswith(("mul", "imul", "div", "idiv", "cqo", "cltd", "cdq", "cltq", "cwt", "cbw", "xchg", "cmpxchg",
+                          "xadd", "rep", "movs", "stos", "scas", "cmps", "lods", "cpuid", "rdtsc", "rdrand",
+                          "rdseed", "sh", "sa", "ro", "rc", "pop")) or op == "movsb":
+            for r in ["rax", "rcx", "rdx"]:
+                state.add("lost:" + r)
+        for i, o in enumerate(ops):
+            if o.startswith("%"):
+                if op.startswith("mov") and not op.startswith(("movs", "movz")) or op.startswith(("movz", "lea")):
+                    if i != len(ops) - 1:
+                        continue
+                state.add("lost:" + x86_reg(o))
+
     def step(state, text, address):
         state = set(state)
         parts = text.split(None, 1)
@@ -352,6 +376,8 @@ def check_x86(lines, secret, pointers):
             parts = parts[1].split(None, 1)
             op = parts[0]
         ops = x86_split(parts[1]) if len(parts) > 1 else []
+        if header_args:
+            mark_lost(state, op, ops)
         if op.startswith("push"):
             move_rsp(state, 8)
         elif op.startswith("pop"):
@@ -424,6 +450,11 @@ def check_x86(lines, secret, pointers):
                     if not op.startswith("lea"):
                         raise Violation(f"secret address: {text}")
                     return True
+                if (base and not idx and not op.startswith("lea") and "hdrp:" + x86_reg(base) in state and
+                        "lost:" + x86_reg(base) not in state and re.match(r"^-?(?:0x)?[0-9a-f]*$", m.group(1) or "") and
+                        0 <= (int(m.group(1), 0) if m.group(1) not in ("", "-") else 0) < HEADER_BYTES and
+                        op.startswith(("mov", "cmp", "test"))):
+                    return False  # a header word of an object whose payload is secret
                 if (base and "ptr:" + x86_reg(base) in state) or (idx and "ptr:" + x86_reg(idx) in state):
                     return True  # read through a pointer to secrets
                 slots = stack_slots(o)
@@ -452,6 +483,11 @@ def check_x86(lines, secret, pointers):
                     base, idx = m.group(2), m.group(3)
                     if base and tainted(base) or idx and tainted(idx):
                         raise Violation(f"secret address: {text}")
+                    if header_args and value and ((base and "ptr:" + x86_reg(base) in state) or
+                                                  (idx and "ptr:" + x86_reg(idx) in state)):
+                        # A secret stored through a pointer to an object could land in a header word the checker
+                        # reads as public.
+                        raise Violation(f"secret stored through an object pointer: {text}")
                     slots = stack_slots(o)
                     if slots is not None:
                         for slot in slots:
@@ -1733,15 +1769,25 @@ def check_wasm(lines, secret, pointers, results=0):
 CHECKERS = {"x86_64": check_x86, "aarch64": check_aarch64, "xtensa": check_xtensa, "wasm": check_wasm}
 
 
+HEADERS = {}
+HEADER_BYTES = 32
+HEADER_CHECKERS = ("x86_64",)
+
+
 def parse_spec(spec, count_hint=8):
     name, _, roles = spec.partition(":")
     secret, pointers = [], []
+    HEADERS[name] = []
     if roles == "*":
         secret = list(range(count_hint))
     elif roles:
         for r in roles.split(","):
             if r.startswith("@"):
                 pointers.append(int(r[1:]))
+            elif r.startswith("%"):
+                # A pointer to an object whose first HEADER_BYTES are public and whose rest is secret.
+                pointers.append(int(r[1:]))
+                HEADERS[name].append(int(r[1:]))
             else:
                 secret.append(int(r))
     return name, secret, pointers
@@ -1772,6 +1818,9 @@ def main():
             continue
         FOLLOW["followed"] = set()
         try:
+            if HEADERS.get(name) and arch not in HEADER_CHECKERS:
+                raise Violation(f"a header-public pointer (%) isn't read on {arch}")
+            FOLLOW["header_args"] = list(HEADERS.get(name, []))
             CHECKERS[arch](lines, secret, pointers)
             following = f", following {len(FOLLOW['followed'])}" if FOLLOW["followed"] else ""
             print(f"ok   {arch} {name} ({len(lines)} instructions{following})")
