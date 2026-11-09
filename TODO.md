@@ -165,6 +165,10 @@
   string arrays built from `split`; seeds 931 to 950 agree in all six modes with the v0.2.52 compiler. A
   first run with a pre-#703 compiler failed seeds 944 and 950 with the LLVM `fcmp` operand-type error: an
   `any` holding `u8(1)` or `true` compared with a float literal, which is #703, already fixed.
+  Sixth growth (branch `fuzz-grow7`): optional values inside collections (`array<int?>`, `array<string?>`,
+  `Map<string, int?>` with `??`, `!= null` and `has` against `get`); seeds 961 to 1010 agree in all six
+  modes with the v0.2.52 compiler, and that range draws every generator together (ablac-e5's deep generic,
+  interface, nullable and `any` ones included).
 
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
