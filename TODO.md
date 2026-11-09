@@ -1195,6 +1195,12 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   writable (one parse of `/proc/self/maps` a collection, merged ranges, a last-range check before the binary
   search). Without the mapped-memory guard it was -6.4% on trees; a page-set guard built from the registry cost
   about 20 instructions an allocation and kept only -1.9%; the maps guard keeps -8.3%.
+  The mapped ranges stay true for the whole marking: a foreground collection runs only with no other Abla
+  thread active and outside a region, marking maps and unmaps nothing (the directory fallback only allocates),
+  and the sweep, which frees, comes after. A process with 40,000 mappings (20,000 readable and writable ranges
+  split by `mprotect`) costs 1.7 K instructions a line in a `--fast` build, so a list over 256 KiB gives up
+  and builds the directory; a failed read does the same. `ABLA_GC_LOOKUP=directory|nomaps|untagged` forces each
+  fallback and `memoryHeapStat(5)` / `(6)` count the collections that went each way (`tools/test-gc-lookup.sh`).
   Release builds, instructions, vs master `98c5c7a2`: trees 11,742.5 M to 10,767.2 M (-8.3%), strings
   2,036.9 M to 1,926.6 M (-5.4%), maps 2,560.8 M to 2,500.1 M (-2.4%), same output.
 - [ ] **Name lookups in lowering.** Over a game server's `--emit-llvm` the method index's

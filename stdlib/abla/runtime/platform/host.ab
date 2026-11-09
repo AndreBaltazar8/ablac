@@ -326,6 +326,14 @@ var __ablaRuntimeHostCollectionNeedsDirectory: bool = false
 var __ablaRuntimeHostCollectionMapped: int = 0
 var __ablaRuntimeHostCollectionMappedCount: int = 0
 var __ablaRuntimeHostCollectionMappedLast: int = 0
+// Collections that found every candidate from the registry, and ones that built the directory
+// (memoryHeapStat 5 and 6).
+var __ablaRuntimeHostCollectionLazyCount: int = 0
+var __ablaRuntimeHostCollectionDirectoryCount: int = 0
+// ABLA_GC_LOOKUP forces a fallback, for the tests: 1 "directory" never looks up from the registry,
+// 2 "nomaps" behaves as if /proc/self/maps were unreadable, 3 "untagged" as if the registry's headers
+// were outside the mapped ranges (tagged pointers). 0 otherwise.
+var __ablaRuntimeHostCollectionForce: int = __ablaRuntimeHostCollectionForceConfigured()
 val __ablaRuntimeHostCollectionSmallBytes: int = 32768
 
 val __ablaRuntimeHostRegionCachedDescriptors: int = 64
@@ -835,7 +843,10 @@ trusted fun __ablaRuntimePlatformMemoryLiveBytes(): int =
 // Allocator numbers for diagnostics (see the wasm platform); the host's
 // system allocator reports only 4, tracked live bytes.
 trusted fun __ablaRuntimePlatformMemoryHeapStat(which: int): int =
-    if (which == 4) __ablaRuntimeHostLiveBytes else 0
+    if (which == 4) __ablaRuntimeHostLiveBytes
+    else if (which == 5) __ablaRuntimeHostCollectionLazyCount
+    else if (which == 6) __ablaRuntimeHostCollectionDirectoryCount
+    else 0
 
 // The heap census (abla/memory's memoryCensus): what the last
 // __ablaRuntimePlatformMemoryCensusTake found, as __ablaRuntimeMemoryCensusWords
@@ -977,9 +988,23 @@ trusted fun __ablaRuntimeHostHexDigit(byte: int): int =
     else if (byte >= 65 && byte <= 70) byte - 55
     else -1
 
+@noinline
+trusted fun __ablaRuntimeHostCollectionForceConfigured(): int {
+    val value = ablaRuntimePointerAddress(getenv(ablaRuntimePointerFromAddress(
+        __ablaRuntimeWord0("ABLA_GC_LOOKUP")
+    )))
+    if (value == 0) return 0
+    val first = ablaRuntimeLoadU8(value)
+    if (first == 100) return 1
+    if (first == 110) return 2
+    if (first == 117) return 3
+    0
+}
+
 // Reads /proc/self/maps into Mapped: the ranges the process can read and write, merged, in address
 // order. False when there is no /proc (the collection then builds its directory as always).
 trusted fun __ablaRuntimeHostCollectionMappingsLoad(): bool {
+    if (__ablaRuntimeHostCollectionForce == 2) return false
     val descriptor = open(
         ablaRuntimePointerFromAddress(__ablaRuntimeWord0("/proc/self/maps")), 0
     )
@@ -989,6 +1014,7 @@ trusted fun __ablaRuntimeHostCollectionMappingsLoad(): bool {
     if (buffer == 0) __ablaRuntimeHostOutOfMemory()
     var length = 0
     var reading = true
+    var failed = false
     while (reading) {
         if (length + 1 >= capacity) {
             capacity = capacity * 2
@@ -998,9 +1024,21 @@ trusted fun __ablaRuntimeHostCollectionMappingsLoad(): bool {
         }
         val got = read(descriptor, ablaRuntimePointerFromAddress(buffer + length),
             capacity - length - 1)
+        if (got < 0) failed = true
         if (got <= 0) reading = false else length = length + got
+        // A process with thousands of mappings: parsing them all costs more than the directory.
+        if (length > 262144) {
+            failed = true
+            reading = false
+        }
     }
     close(descriptor)
+    // A read that failed (seccomp, a container) leaves a list cut short, and the heap's ranges
+    // may be past its end: the collection builds its directory instead.
+    if (failed) {
+        free(ablaRuntimePointerFromAddress(buffer))
+        return false
+    }
     ablaRuntimeStoreU8(buffer + length, 0)
     // A line is at least 16 bytes, so there are at most length / 16 + 1 ranges.
     val pairs = ablaRuntimePointerAddress(malloc((length / 16 + 2) * 16))
@@ -1081,6 +1119,7 @@ trusted fun __ablaRuntimeHostCollectionIsMapped(address: int): bool {
 // Whether the registry's first and last headers are in the mapped ranges: a target whose heap
 // addresses carry tag bits (Android's tagged pointers) shows none of /proc/self/maps' untagged ones.
 trusted fun __ablaRuntimeHostCollectionRegistryMapped(): bool {
+    if (__ablaRuntimeHostCollectionForce == 3) return false
     val registry = __ablaRuntimeHostRegistry
     val slots = __ablaRuntimeHostRegistrySlots
     val first = ablaRuntimeLoadI64(registry) & -16
@@ -1670,13 +1709,19 @@ trusted fun __ablaRuntimePlatformMemoryCollect(): int {
     __ablaRuntimeHostCollectionWorklistCount = 0
     __ablaRuntimeHostCollectionMode = 0
     if (__ablaRuntimeHostGcStress) __ablaRuntimeHostCollectionMode = 2
-    else if (!__ablaRuntimeHostCollectionNeedsDirectory &&
+    else if (__ablaRuntimeHostCollectionForce != 1 && !__ablaRuntimeHostCollectionNeedsDirectory &&
         __ablaRuntimeHostCollectionMappingsLoad() && __ablaRuntimeHostCollectionRegistryMapped()) {
+        // The mapped ranges stay true for the whole marking: a foreground collection runs only with
+        // no other Abla thread active and outside a region (above), marking maps or unmaps nothing
+        // (the directory fallback only allocates), and the sweep, which frees, comes after.
         __ablaRuntimeHostCollectionMode = 1
     }
     if (__ablaRuntimeHostCollectionMode != 1) __ablaRuntimeHostCollectionPagesBuild()
     __ablaRuntimeHostMarkRootValues()
     __ablaRuntimeHostTraceMarkedAllocations()
+    if (__ablaRuntimeHostCollectionMode == 1) {
+        __ablaRuntimeHostCollectionLazyCount = __ablaRuntimeHostCollectionLazyCount + 1
+    } else __ablaRuntimeHostCollectionDirectoryCount = __ablaRuntimeHostCollectionDirectoryCount + 1
     __ablaRuntimeHostCollectionMode = 0
     free(ablaRuntimePointerFromAddress(__ablaRuntimeHostCollectionMapped))
     __ablaRuntimeHostCollectionMapped = 0
