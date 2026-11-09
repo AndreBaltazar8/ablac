@@ -281,7 +281,7 @@ fast_read() { # arch, object
     while read -r _ _ name rest; do
         name=${name%:}
         case $rest in
-            *__ablaRuntimeRequire*) class=tag-check ;;
+            *__ablaRuntimeRequire*|*"secret branch (to trap)"*) class=tag-check ;;
             "secret division"*|*"in "*": secret division"*) class=division ;;
             *) class=other ;;
         esac
@@ -299,7 +299,7 @@ fast_read() { # arch, object
         fi
         grep -q '^LEAK' "$out/$label-leak.log" || { cat "$out/$label-leak.log" >&2; exit 1; }
     done
-    grep -Eq 'in [A-Za-z.]*leakBranchCallee: secret branch' <($check --follow-calls "$arch" "$object" ct_leak_callee:0 2>&1) || {
+    grep -Eq 'ct_leak_callee: in [^:]+: secret branch' <($check --follow-calls "$arch" "$object" ct_leak_callee:0 2>&1) || {
         echo "ct: the leak inside a callee wasn't found by following the call" >&2; exit 1
     }
     echo "ok   $label: $clean fixtures clean, $(wc -l < "$out/$label.found") listed in fast-known.txt, ${#leaks[@]} leaks caught, the callee leak found by following the call"

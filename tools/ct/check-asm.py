@@ -286,6 +286,15 @@ def check_x86(lines, secret, pointers):
             state.add(f"dirty:{rsp_delta(state)}:{stack_extent(name)}")
         return frozenset(state)
 
+    texts_at = {address: text for address, text in lines}
+
+    def trap_note(text):
+        """A branch whose taken side is a ud2 is a runtime check (a type-tag require); say so, so the name of
+        its function (hashed without -g) doesn't decide how the fast build's finding is classed."""
+        m = re.match(r"^\S+\s+(?:0x)?([0-9a-f]+)", text)
+        target = texts_at.get(int(m.group(1), 16), "") if m else ""
+        return " (to trap)" if target.split()[:1] == ["ud2"] else ""
+
     def mem_parts(op):
         m = re.match(r"^(-?(?:0x)?[0-9a-f]*)\((%\w+)?(?:,(%\w+)(?:,\d+)?)?\)$", op)
         return m
@@ -407,7 +416,7 @@ def check_x86(lines, secret, pointers):
 
         if op.startswith("j") and op not in ("jmp", "jmpq"):
             if "flags" in state:
-                raise Violation(f"secret branch: {text}")
+                raise Violation(f"secret branch{trap_note(text)}: {text}")
             return frozenset(state)
         if op.startswith(("jmp",)):
             if ops and (ops[0].startswith("*")):
