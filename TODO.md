@@ -180,21 +180,28 @@
   [Results](tools/ct-timing/RESULTS.md): no leak detected at 40,000 samples on each of 14 available x86-64
   primitives; this is not a constant-time proof. `tools/test-ct.sh` remains the static assembly check.
 - [ ] **Crypto timing on ESP32-S3.** Xtensa is still compiled and read only; no hardware timing campaign exists.
-- [ ] **`--fast` builds are read on x86-64 and AArch64; Wasm and Xtensa don't follow calls.** `tools/test-ct.sh`
-  builds the fixture object with `--fast` and the checker follows every call into its callee (`--follow-calls`;
-  recursion, indirect calls and callees outside the object still fail), with controls for a leak and for a secret
-  stored through a pointer inside a callee. A fast build keeps what release removes, so `tests/cases/ct/fast-known.txt`
-  lists the fixtures that fail on x86-64: the type-tag check of every erased scalar conversion
-  (`__ablaRuntimeRequire`, which the checker can't tell from payload) and divisions by a secret that aren't
-  strength-reduced. AArch64 follows `bl` and tail calls too (arguments per x0 to x7 and v0 to v7, results in x0, x1
-  and the vector registers, x19 and up kept, a frame address passed makes the frame's slots secret after the call),
-  names stack slots by their distance below the entry stack pointer so `sp`- and `x29`-relative accesses to one
-  byte agree (an unoptimised frame reached both ways read as a secret address before), reads the `--fast` object
-  (all 64 fixtures clean, 15 leaks caught, `fast-known-aarch64.txt` is empty: AArch64 has no tag-check or division
-  findings there) and, as on x86-64, the AES key functions with their calls followed (7 reads, 7 leaks after the call
-  caught, refused without following) and the bignum routines; hand-written assembly controls cover a callee that
-  branches, stale argument registers, a secret result, caller-saved and callee-saved registers, a secret written
-  through a frame address, a tail call, recursion and `blr` (`tests/cases/ct/follow-a64.s`).
+- [ ] **`--fast` builds are read on every target; the Xtensa one is partly unplaced.** `tools/test-ct.sh` builds the fixture
+  object with `--fast` and the checker follows every call into its callee (`--follow-calls`; recursion, indirect calls
+  and callees outside the object still fail), with controls for a leak and for a secret stored through a pointer inside
+  a callee. A fast build keeps what release removes, so `tests/cases/ct/fast-known.txt` lists the fixtures that fail on
+  x86-64: the type-tag check of every erased scalar conversion (`__ablaRuntimeRequire`, which the checker can't tell
+  from payload) and divisions by a secret that aren't strength-reduced. **AArch64** follows `bl` and tail calls (arguments
+  per x0 to x7 and v0 to v7, results in x0, x1 and the vector registers, x19 and up kept, a frame address passed makes the
+  frame's slots secret after the call), names stack slots by their distance below the entry stack pointer so `sp`- and
+  `x29`-relative accesses to one byte agree, and reads the `--fast` object with all 64 fixtures clean
+  (`fast-known-aarch64.txt` is empty). **Wasm** follows `call <function index>` (the module's types, imports and
+  bodies are read from the binary; arguments off the operand stack with their taint, results back on it; imports and
+  `call_indirect` are refused), looks fixtures up by export name when the module has no name section, and reads the
+  `--fast` module with all 63 fixtures clean; that module only builds through the compiler's text route
+  (`ABLA_KEEP_LLVM_TEXT=1`): the in-process one aborts on the constant-time barrier's inline assembly ("Inline asm not
+  supported by this streamer"), a compiler bug to fix after the v0.2.52 freeze. **Xtensa** follows windowed
+  `call4/8/12` (the callee is named by the call's relocation, or by the literal a long call loads; the window
+  registers come back from a(rotation+2); compiler-rt arithmetic helpers such as `__moddi3` are accepted with public
+  operands), tracks a frame register (`mov a7, a1` and `addi`/`add` of constants) so an unoptimised frame is addressed
+  exactly, reads the AES key functions and bignum routines with calls followed, and reads the `--fast` object: 47 fixtures
+  clean, 16 listed in `fast-known-xtensa.txt` as `unplaced` (the unoptimised bignum code indexes frame arrays at
+  offsets the checker can't place, and what it loads from there reads as secret). Hand-written controls for all three:
+  `follow-a64.s`, `follow-wasm.s`, `follow-xtensa.s`.
 - [ ] **Secret residue is checked for stack slots on x86-64 release only.** `--residue` fails an entry that returns with a
   secret in a slot of its frame, or that gave a secret to a callee and didn't wipe the stack below it
   (`abla/ct/scrub`; the checker reads the callees' depth and the size of the wipe). Every fixture's residue entry

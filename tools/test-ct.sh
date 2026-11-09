@@ -329,11 +329,15 @@ real_entries_run() {
 # How a finding of a fast build is classed. A trap is not a tag check by being a trap (ablaRuntimeTrap, unreachable
 # and the no-FMA fallback emit ud2 too): the build with debug info names the function and classes by it, and a
 # build without it, whose symbols are hashed, is held to the findings that build has (fast_read's third argument).
-fast_class() { # finding text, whether a branch to a trap counts as a tag check
+fast_class() { # finding text, whether a branch to a trap counts as a tag check, the architecture
     case $1 in
         *__ablaRuntimeRequire*) echo tag-check ;;
         *"secret branch (to trap)"*) [[ $2 == trap ]] && echo tag-check || echo other ;;
         "secret division"*|*"in "*": secret division"*) echo division ;;
+        # Unoptimised Xtensa code indexes arrays in its frame at offsets the checker can't place (an address
+        # that is a1 plus a register), so a load or a branch after it reads as secret. Pinned per fixture by
+        # fast-known-xtensa.txt, like the other classes; the leak controls below still have to be caught.
+        "secret branch"*|"secret address"*) [[ $3 == xtensa ]] && echo unplaced || echo other ;;
         *) echo other ;;
     esac
 }
@@ -346,7 +350,7 @@ fast_read() { # arch, object, label suffix, "trap" to class a branch to a trap a
     : > "$out/$label.found"
     while read -r _ _ name rest; do
         name=${name%:}
-        class=$(fast_class "$rest" "$trap")
+        class=$(fast_class "$rest" "$trap" "$arch")
         echo "$name $class" >> "$out/$label.found"
         [[ $class != other ]] || { echo "ct: $name on $label: $rest" >&2; exit 1; }
     done < <(grep '^LEAK' "$out/$label.log")
@@ -462,6 +466,39 @@ wasm_follow_read() {
     echo "ok   wasm call following: four clean calls read, five leaks and refusals found, the calls refused without following"
 }
 
+# The Xtensa checker follows calls too (windowed: `call8` rotates the window by eight, so the callee's a2 is our a10 and
+# its result comes back in a10; an unlinked object names the callee in a relocation, which the checker reads, and a
+# long call loads its address from a literal). tests/cases/ct/follow-xtensa.s, the same shapes as the other targets.
+xtensa_follow_read() {
+    llvm-mc -triple xtensa -mcpu=esp32 -filetype=obj "$cases/follow-xtensa.s" -o "$out/follow-xtensa.o"
+    local spec expected
+    for spec in follow_clean:0 follow_stale:1 follow_public:0 follow_clobber:0; do
+        $check --follow-calls xtensa "$out/follow-xtensa.o" "$spec" > "$out/follow-xtensa-clean.log" 2>&1 || {
+            cat "$out/follow-xtensa-clean.log" >&2; echo "ct: $spec was reported on xtensa" >&2; exit 1
+        }
+        grep -q 'following [1-9]' "$out/follow-xtensa-clean.log" || {
+            cat "$out/follow-xtensa-clean.log" >&2; echo "ct: $spec didn't follow its call on xtensa" >&2; exit 1
+        }
+        if $check xtensa "$out/follow-xtensa.o" "$spec" > "$out/follow-xtensa-nofollow.log" 2>&1; then
+            echo "ct: $spec passed on xtensa without following its call" >&2; exit 1
+        fi
+        grep -q 'LEAK.*call:' "$out/follow-xtensa-nofollow.log" || { cat "$out/follow-xtensa-nofollow.log" >&2; exit 1; }
+    done
+    for spec in follow_branch:0:'in callee_branch: secret branch' follow_result:0:'secret branch' \
+        follow_saved:0:'secret branch' follow_stack:0:'secret branch' \
+        follow_recursive:0:'recursion into follow_recursive' follow_indirect:0:'call: callx8'; do
+        expected=${spec#*:*:}
+        spec=${spec%:"$expected"}
+        if $check --follow-calls xtensa "$out/follow-xtensa.o" "$spec" > "$out/follow-xtensa-leak.log" 2>&1; then
+            echo "ct: the checker missed $spec on xtensa after following its call" >&2; exit 1
+        fi
+        grep -qF "$expected" "$out/follow-xtensa-leak.log" || {
+            cat "$out/follow-xtensa-leak.log" >&2; echo "ct: $spec on xtensa: expected '$expected'" >&2; exit 1
+        }
+    done
+    echo "ok   xtensa call following: four clean calls read, six leaks and refusals found, the calls refused without following"
+}
+
 # --- x86-64 ---------------------------------------------------------------------------
 for mode in "" --fast; do
     "$compiler" build "$cases/native.ab" -o "$out/native" --no-cache $mode
@@ -527,6 +564,14 @@ abla_xtensa_test_prepare "$tools_directory"
 abla_xtensa_test_build "$compiler" "$tools_directory" build "$cases/object.ab" -o "$out/xtensa.o" --no-cache \
     --target-triple xtensa-esp-unknown-elf --object-format elf --emit object
 read_target xtensa "$out/xtensa.o"
+xtensa_follow_read
+orchestration_read "$out/xtensa.o" xtensa
+worker_read "$out/xtensa.o" xtensa
+# The --fast object keeps every call, which the checker follows. 47 fixtures come out clean; the rest are in
+# fast-known-xtensa.txt (class unplaced, see fast_class).
+abla_xtensa_test_build "$compiler" "$tools_directory" build "$cases/object.ab" -o "$out/xtensa-fast.o" --no-cache \
+    --target-triple xtensa-esp-unknown-elf --object-format elf --emit object --fast
+fast_read xtensa "$out/xtensa-fast.o" "" "" "$cases/fast-known-xtensa.txt"
 
 # --- What the compiler refuses ----------------------------------------------------------
 for invalid in "$cases"/invalid-*.ab; do

@@ -23,9 +23,30 @@ import sys
 OBJDUMP = "llvm-objdump"
 
 
+XT_LITERALS = {}
+
+
+def xtensa_literal_symbols(path):
+    """(literal section, offset) -> the symbol an R_XTENSA_32 relocation puts there: the address a `l32r` loads."""
+    if path not in XT_LITERALS:
+        table = {}
+        section = None
+        for line in subprocess.run([OBJDUMP, "-r", path], capture_output=True, text=True, check=True).stdout.splitlines():
+            m = re.match(r"^RELOCATION RECORDS FOR \[(.*)\]:", line)
+            if m:
+                section = m.group(1)
+                continue
+            m = re.match(r"^([0-9a-f]+)\s+R_XTENSA_32\s+(\S+)$", line)
+            if m and section:
+                table[(section, int(m.group(1), 16))] = m.group(2)
+        XT_LITERALS[path] = table
+    return XT_LITERALS[path]
+
+
 def disassemble(path, name, extra=()):
     text = subprocess.run(
-        [OBJDUMP, "-d", "--no-show-raw-insn", "--disassemble-symbols=" + name, *extra, path],
+        [OBJDUMP, "-d", "--no-show-raw-insn", "--disassemble-symbols=" + name, *extra,
+         *(["-r"] if "--mcpu=esp32" in extra else []), path],
         capture_output=True, text=True, check=True).stdout
     lines = []
     active = False
@@ -34,6 +55,22 @@ def disassemble(path, name, extra=()):
             active = line.endswith(f"<{name}>:")
             continue
         if active and line.strip():
+            relocation = re.match(r"^\s*[0-9a-f]+:\s+R_XTENSA_\w+\s+(\S+)$", line)
+            if relocation:
+                # A call in an unlinked Xtensa object names its callee by relocation, against the callee's section
+                # (one function a section): put it where an x86 disassembly puts `<name>`.
+                target = relocation.group(1)
+                if lines and lines[-1][1].split()[0].startswith("call") and "<" not in lines[-1][1]:
+                    target = target[len(".text."):] if target.startswith(".text.") else target
+                    lines[-1] = (lines[-1][0], f"{lines[-1][1]} <{target}>")
+                elif lines and lines[-1][1].split()[0] == "l32r":
+                    # A literal's address: the symbol its own relocation names, in the next call if it is a callx.
+                    literal = re.match(r"^(\.literal\.\S+?)(?:\+0x([0-9a-f]+))?$", target)
+                    if literal:
+                        symbol = xtensa_literal_symbols(path).get((literal.group(1), int(literal.group(2) or "0", 16)))
+                        if symbol:
+                            lines[-1] = (lines[-1][0], f"{lines[-1][1]} <{symbol}>")
+                continue
             m = re.match(r"^\s*([0-9a-f]+):\s*(.*)$", line)
             if m:
                 # AArch64 uses # for immediates, including stack offsets; only
@@ -41,6 +78,12 @@ def disassemble(path, name, extra=()):
                 instruction = m.group(2).split("//")[0]
                 instruction = re.sub(r"\s+#\s+.*$", "", instruction).strip()
                 lines.append((int(m.group(1), 16), instruction))
+    for i in range(1, len(lines)):
+        # `l32r aN, <literal> <sym>` straight before `callxK aN`: a call to sym (the long-call form).
+        load = re.match(r"^l32r\s+(a\d+),\s*\S+\s+<([^>]+)>$", lines[i - 1][1])
+        call = re.match(r"^callx(4|8|12)\s+(a\d+)$", lines[i][1])
+        if load and call and load.group(1) == call.group(2):
+            lines[i] = (lines[i][0], f"call{call.group(1)} 0x0 <{load.group(2)}>")
     if not lines:
         raise SystemExit(f"{name}: no such function in {path}")
     return lines
@@ -1086,11 +1129,70 @@ XT_BRANCH = re.compile(r"^(beq|bne|bge|blt|bgeu|bltu|bany|bnone|ball|bnall|bbc|b
 XT_COND_MOVE = re.compile(r"^(moveqz|movnez|movltz|movgez)")
 
 
+XT_ARGS = [f"a{i}" for i in range(2, 8)]
+XT_PURE_LIBCALLS = {"__divdi3", "__udivdi3", "__moddi3", "__umoddi3", "__muldi3", "__ashldi3", "__lshrdi3", "__ashrdi3"}
+
+
+def callee_inputs_xtensa(name):
+    """The argument registers (a2 to a7) a function may read before it writes them, as for the other targets."""
+    written = set()
+    read = set()
+    for _, text in disassemble(FOLLOW["path"], name, ["--mcpu=esp32"]):
+        parts = text.split(None, 1)
+        op = parts[0]
+        ops = [o.strip() for o in parts[1].split(",")] if len(parts) > 1 else []
+        if op in ("retw", "retw.n"):
+            return read
+        if XT_BRANCH.match(op):
+            read |= {o for o in ops[:-1] if re.fullmatch(r"a\d+", o)} - written
+            return read | (set(XT_ARGS) - written)
+        if op in ("j", "j.n") or op.startswith(("call", "jx")):
+            return read | (set(XT_ARGS) - written)
+        stores = op in ("s8i", "s16i", "s32i", "s32i.n", "s32c1i", "s32ri")
+        for index, operand in enumerate(ops):
+            if re.fullmatch(r"a\d+", operand) and (stores or index > 0):
+                if not (op == "xor" and ops[1] == ops[2]):
+                    read |= {operand} - written
+        if ops and not stores and re.fullmatch(r"a\d+", ops[0]) and op not in ("entry", "memw"):
+            written.add(ops[0])
+    return read | (set(XT_ARGS) - written)
+
+
+def follow_call_xtensa(name, tags, text):
+    """follow_call for the Xtensa checker: the callee starts with exactly these register tags (its a2 to a7)."""
+    FOLLOW["followed"].add(name)
+    key = ("xtensa", name, tuple(tags))
+    if key in FOLLOW["done"]:
+        return FOLLOW["done"][key]
+    if name in FOLLOW["stack"]:
+        raise Violation(f"call: recursion into {name}: {text}")
+    try:
+        lines = disassemble(FOLLOW["path"], name, ["--mcpu=esp32"])
+    except (SystemExit, subprocess.CalledProcessError):
+        raise Violation(f"call: {name} isn't defined in the object: {text}")
+    unread = [t for _, t in lines if "unknown" in t]
+    if unread:
+        raise Violation(f"call: the disassembler can't read {name}: {unread[0]}")
+    FOLLOW["stack"].append(name)
+    try:
+        returned = check_xtensa(lines, sorted(tags), [])
+    except Violation as violation:
+        raise Violation(f"in {name}: {violation}")
+    finally:
+        FOLLOW["stack"].pop()
+    FOLLOW["done"][key] = returned
+    return returned
+
+
 def check_xtensa(lines, secret, pointers):
     # A u64 takes an aligned pair of registers, so positions don't map one to one: any secret
     # parameter makes all the argument registers secret, and only pointer lists are exact.
     # (A pointer parameter is an `int`, so also a pair: the address is the low one.)
-    start = frozenset(f"ptr:a{2 + 2 * i}" for i in pointers)
+    returned = []
+    if secret and isinstance(secret[0], str):
+        start, secret, pointers = frozenset(secret), [], []
+    else:
+        start = frozenset(f"ptr:a{2 + 2 * i}" for i in pointers)
     if secret and not pointers:
         start = start | frozenset(f"a{i}" for i in range(2, 8))
     elif secret:
@@ -1101,6 +1203,68 @@ def check_xtensa(lines, secret, pointers):
             if at > 7:
                 raise SystemExit("a secret past the argument registers isn't read here")
             start = start | frozenset([f"a{at}"])
+
+    def after_call(state, rotation, name, text):
+        if name in XT_PURE_LIBCALLS:
+            return pure_libcall(state, rotation, name, text)
+        return after_followed_call(state, rotation, name, text)
+
+    def pure_libcall(state, rotation, name, text):
+        """A compiler-rt arithmetic helper (no loads of its own beyond its arguments): with public arguments its
+        results are public; a division by a secret or of one is a secret division, any other helper's results
+        are as secret as its arguments."""
+        state = set(state)
+        arguments = [f"a{rotation + k}" for k in range(2, 6) if rotation + k <= 15]  # two 64-bit operands
+        secret = any(a in state for a in arguments)
+        if any(f"ptr:{a}" in state for a in arguments):
+            raise Violation(f"call: {name} is given a pointer to a secret: {text}")
+        if secret and re.match(r"^__u?(div|mod)", name):
+            raise Violation(f"secret division: {text}")
+        for r in range(rotation, 16):
+            for tag in (f"a{r}", f"ptr:a{r}", f"stackbase:a{r}"):
+                state.discard(tag)
+        if secret:
+            state.update(f"a{rotation + k}" for k in (2, 3) if rotation + k <= 15)
+        return frozenset(state)
+
+    def after_followed_call(state, rotation, name, text):
+        """The state after a windowed call to a function of the same object: its a2 to a7 are our a(rotation+2) up,
+        checked as a function of its own on the arguments it reads; what it leaves in a2 and up comes back to
+        a(rotation+2) and up, and our registers from a(rotation) on are the callee's window (dead)."""
+        state = set(state)
+        inputs = callee_inputs_xtensa(name)
+        tags = set()
+        for k in range(2, 8):
+            if rotation + k > 15 or f"a{k}" not in inputs:
+                continue
+            if f"a{rotation + k}" in state:
+                tags.add(f"a{k}")
+            elif f"ptr:a{rotation + k}" in state:
+                tags.add(f"ptr:a{k}")
+        out = follow_call_xtensa(name, tags, text)
+        # Once an address in this frame was made (anywhere before: it may have been spilled and reloaded) a callee
+        # may have written through it.
+        frame_address = "frameaddr" in state
+        for r in range(rotation, 16):
+            for tag in (f"a{r}", f"ptr:a{r}", f"stackbase:a{r}"):
+                state.discard(tag)
+        for k in range(2, 8):
+            if rotation + k <= 15:
+                if f"a{k}" in out:
+                    state.add(f"a{rotation + k}")
+                if f"ptr:a{k}" in out:
+                    state.add(f"ptr:a{rotation + k}")
+        if frame_address:
+            state.add("frame-dirty")
+        return frozenset(state)
+
+    def frame_offset(state, register):
+        """How far `register` is above a1, when it is a1 itself or a copy of it plus a constant (an unoptimised
+        function addresses its frame through such a register), else None."""
+        if register == "a1":
+            return 0
+        values = [tag.split(":")[2] for tag in state if tag.startswith(f"sb:{register}:")]
+        return int(values[0]) if len(values) == 1 else None
 
     def step(state, text, address):
         state = set(state)
@@ -1114,6 +1278,9 @@ def check_xtensa(lines, secret, pointers):
             return frozenset(state)
         if op in ("j", "j.n", "retw", "retw.n", "ret", "ret.n", "nop", "nop.n", "memw", "entry", "ill", "ill.n"):
             return frozenset(state)
+        call = re.match(r"^call(4|8|12)\s+\S+\s+<([^>+]+)>$", text)
+        if call and FOLLOW["path"]:
+            return after_call(state, int(call.group(1)), call.group(2), text)
         if op.startswith(("call", "callx", "jx")):
             raise Violation(f"call: {text}")
         if ops and ops[0] == "a1" and op in ("addi", "addi.n", "add", "add.n", "addmi", "mov", "mov.n"):
@@ -1127,8 +1294,9 @@ def check_xtensa(lines, secret, pointers):
             if t(base):
                 raise Violation(f"secret address: {text}")
             size = 1 if op.startswith("l8") else 2 if op.startswith("l16") else 4
-            slots = [f"slot:{int(offset, 0) + i}" for i in range(size)] if base == "a1" else []
-            value = (any(slot in state for slot in slots) or (
+            at = frame_offset(state, base)
+            slots = [f"slot:{at + int(offset, 0) + i}" for i in range(size)] if at is not None else []
+            value = (any(slot in state for slot in slots) or "frame-dirty" in state or (
                 "stack-moved" in state and any(item.startswith("slot:") for item in state)
             )) if slots else True
             pointer = any("ptr" + slot in state for slot in slots) or (
@@ -1142,10 +1310,11 @@ def check_xtensa(lines, secret, pointers):
             source, base, offset = ops[0], ops[1], ops[2] if len(ops) > 2 else "0"
             if t(base):
                 raise Violation(f"secret address: {text}")
-            if base == "a1":
+            at = frame_offset(state, base)
+            if at is not None:
                 size = 1 if op.startswith("s8") else 2 if op.startswith("s16") else 4
                 for i in range(size):
-                    slot = f"slot:{int(offset, 0) + i}"
+                    slot = f"slot:{at + int(offset, 0) + i}"
                     (state.add if t(source) else state.discard)(slot)
                     (state.add if "ptr:" + source in state else state.discard)("ptr" + slot)
             return frozenset(state)
@@ -1161,6 +1330,42 @@ def check_xtensa(lines, secret, pointers):
             value = value or t(dest)
         if op in ("xor",) and ops[1] == ops[2]:
             value = False
+        # Registers that are a1 plus a constant, or a constant (a big frame is addressed through `movi aN, 1440` and
+        # `add.n aD, a7, aN`).
+        constant = lambda register: next((int(x.split(":")[2]) for x in state if x.startswith(f"const:{register}:")), None)
+        fresh = []
+        if op in ("movi", "movi.n") and len(ops) == 2:
+            fresh.append(f"const:{dest}:{int(ops[1], 0)}")
+        elif op in ("mov", "mov.n") and len(ops) == 2:
+            if frame_offset(state, ops[1]) is not None:
+                fresh.append(f"sb:{dest}:{frame_offset(state, ops[1])}")
+            if constant(ops[1]) is not None:
+                fresh.append(f"const:{dest}:{constant(ops[1])}")
+        elif op in ("addi", "addi.n", "addmi") and len(ops) == 3:
+            step_by = int(ops[2], 0) * (256 if op == "addmi" else 1)
+            if frame_offset(state, ops[1]) is not None:
+                fresh.append(f"sb:{dest}:{frame_offset(state, ops[1]) + step_by}")
+            if constant(ops[1]) is not None:
+                fresh.append(f"const:{dest}:{constant(ops[1]) + step_by}")
+        elif op in ("add", "add.n") and len(ops) == 3:
+            if frame_offset(state, ops[1]) is not None and constant(ops[2]) is not None:
+                fresh.append(f"sb:{dest}:{frame_offset(state, ops[1]) + constant(ops[2])}")
+            elif frame_offset(state, ops[2]) is not None and constant(ops[1]) is not None:
+                fresh.append(f"sb:{dest}:{frame_offset(state, ops[2]) + constant(ops[1])}")
+            if constant(ops[1]) is not None and constant(ops[2]) is not None:
+                fresh.append(f"const:{dest}:{constant(ops[1]) + constant(ops[2])}")
+        for tag in [x for x in state if x.startswith((f"sb:{dest}:", f"const:{dest}:"))]:
+            state.discard(tag)
+        state.update(fresh)
+        if op in ("addi", "addi.n", "mov", "mov.n", "or", "add", "add.n", "addmi", "addx2", "addx4", "addx8"):
+            # An address in this function's frame (a1 plus something): a callee given it may write through it.
+            if any(o == "a1" or "stackbase:" + o in state or frame_offset(state, o) is not None for o in ops[1:]):
+                state.add("stackbase:" + dest)
+                state.add("frameaddr")
+            else:
+                state.discard("stackbase:" + dest)
+        else:
+            state.discard("stackbase:" + dest)
         if op in ("addi", "addi.n", "mov", "mov.n", "or", "add", "add.n", "addmi", "addx2", "addx4", "addx8") and \
                 any("ptr:" + o in state for o in ops[1:]):
             state.add("ptr:" + dest)
@@ -1185,7 +1390,13 @@ def check_xtensa(lines, secret, pointers):
         out.append(i + 1)
         return out
 
-    fixpoint(lines, start, step, successors)
+    states = fixpoint(lines, start, step, successors)
+    # What the function leaves in its registers when it returns, for a caller that follows it.
+    out = set()
+    for i, (_, text) in enumerate(lines):
+        if text.split()[0] in ("retw", "retw.n", "ret", "ret.n") and i in states:
+            out |= states[i]
+    return frozenset(out)
 
 
 # --- Wasm ----------------------------------------------------------------------------------
