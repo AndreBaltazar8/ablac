@@ -193,6 +193,19 @@ fun bootstrapEmitLlvmProgramPrepared(
     // iOS. Follow those edges from the exported runtime graph instead.
     val ios = bootstrapLlvmTargetIsIOS(targetTriple)
     val initialNativeRoots: array<bool> = if (ios) [] else nativeFunctionRoots
+    // Pruning: the runtime functions a used bridge forwards to are roots; the rest are
+    // emitted only if the program reaches them.
+    if (bootstrapLlvmPruneRuntime && !bootstrapLlvmTargetHasClosedProgramBoundary(targetTriple)) {
+        var pruneIndex = 0
+        while (pruneIndex < program.functions.size) {
+            val pruneSymbol = bootstrapLlvmSelfHostedRuntimeSymbol(program.functions[pruneIndex].name)
+            if (pruneSymbol != "" && bootstrapLlvmRuntimeBridgeUsed(program, pruneSymbol)) {
+                initialNativeRoots[pruneIndex] = true
+                linuxWriteStandardError("prune-root ${program.functions[pruneIndex].name} $pruneSymbol\n")
+            }
+            pruneIndex = pruneIndex + 1
+        }
+    }
     val exportReachability = bootstrapLlvmReachableExports(
         program, exports, functionIndex,
         interruptHandlerRoots, initialNativeRoots, ios
@@ -212,9 +225,20 @@ fun bootstrapEmitLlvmProgramPrepared(
     index = 0
     while (index < program.functions.size) {
         emittedFunctions.append(
-            !closedProgram || exportReachability.functions[index]
+            (!closedProgram && !bootstrapLlvmPruneRuntime) || exportReachability.functions[index]
         )
         index = index + 1
+    }
+    if (bootstrapLlvmPruneRuntime) {
+        var emittedCount = 0
+        var debugIndex = 0
+        while (debugIndex < program.functions.size) {
+            if (emittedFunctions[debugIndex]) emittedCount = emittedCount + 1
+            if (program.functions[debugIndex].name == "__ablaRuntimeVoid" || bootstrapTextContains(program.functions[debugIndex].name, "RuntimeVoid"))
+                linuxWriteStandardError("prune-fn ${program.functions[debugIndex].name} emitted=${emittedFunctions[debugIndex]} reach=${exportReachability.functions[debugIndex]}\n")
+            debugIndex = debugIndex + 1
+        }
+        linuxWriteStandardError("prune-emitted $emittedCount of ${program.functions.size}\n")
     }
     // A float `%` on WebAssembly calls the platform's fmod
     // (bootstrapLlvmEmitScalarOperation), which no export reaches.
