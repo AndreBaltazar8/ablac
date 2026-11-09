@@ -169,6 +169,9 @@
   `Map<string, int?>` with `??`, `!= null` and `has` against `get`); seeds 961 to 1010 agree in all six
   modes with the v0.2.52 compiler, and that range draws every generator together (ablac-e5's deep generic,
   interface, nullable and `any` ones included).
+  Seeds 1011 to 1080 (every generator together, v0.2.52 compiler): no disagreement. Seventh growth (branch
+  `fuzz-grow8`): `when` on ints (multi-value arms, `else`), strings and bools, nested `when`, and a subject
+  with a side effect that must run once (`Acc.add`); seeds 1101 to 1140 agree in all six modes.
 
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
