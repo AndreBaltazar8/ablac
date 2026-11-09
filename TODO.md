@@ -202,7 +202,7 @@
   points (including key reading, export and generation) and the password entries of `abla/crypto/pbe`
   (`cryptoPassword`, `pbeOpenPkcs8`, `pbeOpenPkcs12`) call the wipe and are run against it (the run scan reads an
   encrypted PKCS#8 (SHA-256 and SHA-1 PRF, AES-128 and -256, 3072- and 4096-bit keys) and a PKCS#12 (SHA-256 and SHA-1 MAC), each with the right password, a wrong one, a truncated input and a changed last byte; without the wipes the first three leave 704, 1,024 and 2,784 bytes). A panic inside an entry leaves the process and is not wiped. Not checked: registers (measured once: after `aesCbcEncryptPkcs7` returns, xmm0-15 hold only the constant masks 0x10, 0xff and 0x2f, no key or text bytes; the static checker can't read the real entries' registers, since they branch on secrets by design, and the fixtures return only their result in rax), the GC heap,
-  AArch64 (wiped, not read), Wasm (no native stack to wipe) and Xtensa, and the `--fast` build.
+  Wasm (no native stack to wipe) and Xtensa, and the `--fast` build. AArch64 is read like x86-64 (a secret left in a slot at `ret`, a callee's frames no wipe covered; the wipe is recognised only as exactly the `ctScrubStack` loop): 64 fixture entries clean and six hand controls in `residue-a64.s`; the real entry points are not run on AArch64.
 - [x] **Secret arithmetic around the crypto fixtures:** source-generated AES-128/192/256
   schedule and byte/block I/O, CRT subtract/correction/recombination and wide-reduction glue,
   `bnFromBytes`, `bnToBytes` and `bnResidueSquare` have assembly fixtures and individual

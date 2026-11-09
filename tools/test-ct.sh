@@ -241,14 +241,12 @@ residue_a64_read() {
             cat "$out/a64-$entry.log" >&2; echo "ct: $entry was reported on aarch64" >&2; exit 1
         }
     done
-    "$compiler" build "$out/residue-cases/object.ab" -o "$out/a64-residue.o" --emit object --no-cache \
-        --target-triple aarch64-unknown-linux-gnu --object-format elf
     local specs=() spec name
     for spec in "${fixtures[@]}" "${host_fixtures[@]}"; do
         name=${spec%%:*}
         specs+=("ct_res_${name#ct_}:${spec#*:}")
     done
-    $check --follow-calls --residue aarch64 "$out/a64-residue.o" "${specs[@]}" > "$out/aarch64-residue.log" 2>&1 || true
+    $check --follow-calls --residue aarch64 "$out/aarch64-residue.o" "${specs[@]}" > "$out/aarch64-residue.log" 2>&1 || true
     if { grep '^LEAK' "$out/aarch64-residue.log" || true; } | grep -v 'secret residue'; then
         echo "ct: a finding other than residue on aarch64" >&2; exit 1
     fi
