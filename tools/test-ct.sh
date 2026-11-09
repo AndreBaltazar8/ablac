@@ -121,44 +121,44 @@ read_target() { # arch, object, label (default the arch), then flags for the che
 
 # The two bignum routines the generated twins cut at their first call (bnClear) are read whole, with that
 # call followed. Without following, the same objects must be refused: the call is what is being covered.
-orchestration_read() { # object
-    local object=$1 specs=(ct_orch_bn_from_bytes:@2 ct_orch_bn_residue_square:@1)
-    $check --follow-calls x86_64 "$object" "${specs[@]}" > "$out/x86_64-orchestration.log" 2>&1 || {
-        cat "$out/x86_64-orchestration.log" >&2; echo "ct: a bignum routine and its calls" >&2; exit 1
+orchestration_read() { # object, architecture (default x86_64)
+    local object=$1 arch=${2:-x86_64} specs=(ct_orch_bn_from_bytes:@2 ct_orch_bn_residue_square:@1)
+    $check --follow-calls "$arch" "$object" "${specs[@]}" > "$out/$arch-orchestration.log" 2>&1 || {
+        cat "$out/$arch-orchestration.log" >&2; echo "ct: a bignum routine and its calls" >&2; exit 1
     }
-    if $check x86_64 "$object" "${specs[@]}" > "$out/x86_64-orchestration-nofollow.log" 2>&1; then
+    if $check "$arch" "$object" "${specs[@]}" > "$out/$arch-orchestration-nofollow.log" 2>&1; then
         echo "ct: the orchestration fixtures didn't need following their calls" >&2; exit 1
     fi
-    echo "ok   x86_64 orchestration: bnFromBytes and bnResidueSquare read whole, their calls followed"
+    echo "ok   $arch orchestration: bnFromBytes and bnResidueSquare read whole, their calls followed"
 }
 
 # The key-handling functions of AES (the schedule, the hardware decryption keys, the hardware block loops), which are
 # functions of plain integers that stay calls. They are read whole with their calls followed: x86-64 only. The same
 # specs must be refused without following (the calls are what is covered), and each has a twin with a secret-indexed
 # store after the call, which has to be found for a secret address and not for a refused call.
-worker_read() { # object
-    local object=$1 specs=() leaks_follow=() spec
+worker_read() { # object, architecture (default x86_64)
+    local object=$1 arch=${2:-x86_64} specs=() leaks_follow=() spec
     while IFS= read -r spec; do specs+=("$spec"); done < "$cases/crypto-generated.follow"
     while IFS= read -r spec; do leaks_follow+=("$spec"); done < "$cases/crypto-generated.followleaks"
-    $check --follow-calls x86_64 "$object" "${specs[@]}" > "$out/x86_64-workers.log" 2>&1 || {
-        cat "$out/x86_64-workers.log" >&2; echo "ct: a secret reached a branch or an address in a key-handling function" >&2; exit 1
+    $check --follow-calls "$arch" "$object" "${specs[@]}" > "$out/$arch-workers.log" 2>&1 || {
+        cat "$out/$arch-workers.log" >&2; echo "ct: a secret reached a branch or an address in a key-handling function" >&2; exit 1
     }
     # Every read really went into a callee: the ok line names how many functions it followed.
-    [[ $(grep -c '^ok.*following [1-9]' "$out/x86_64-workers.log") == "${#specs[@]}" ]] || {
-        cat "$out/x86_64-workers.log" >&2; echo "ct: a key-handling read followed no call" >&2; exit 1
+    [[ $(grep -c '^ok.*following [1-9]' "$out/$arch-workers.log") == "${#specs[@]}" ]] || {
+        cat "$out/$arch-workers.log" >&2; echo "ct: a key-handling read followed no call" >&2; exit 1
     }
-    if $check x86_64 "$object" "${specs[@]}" > "$out/x86_64-workers-nofollow.log" 2>&1; then
+    if $check "$arch" "$object" "${specs[@]}" > "$out/$arch-workers-nofollow.log" 2>&1; then
         echo "ct: the key-handling fixtures didn't need following their calls" >&2; exit 1
     fi
     for spec in "${leaks_follow[@]}"; do
-        if $check --follow-calls x86_64 "$object" "$spec" > "$out/x86_64-worker-leak.log" 2>&1; then
+        if $check --follow-calls "$arch" "$object" "$spec" > "$out/$arch-worker-leak.log" 2>&1; then
             echo "ct: the checker missed $spec after following the call" >&2; exit 1
         fi
-        grep -Eq 'secret (address|memory|index)' "$out/x86_64-worker-leak.log" || {
-            cat "$out/x86_64-worker-leak.log" >&2; echo "ct: expected secret-index detection for $spec" >&2; exit 1
+        grep -Eq 'secret (address|memory|index)' "$out/$arch-worker-leak.log" || {
+            cat "$out/$arch-worker-leak.log" >&2; echo "ct: expected secret-index detection for $spec" >&2; exit 1
         }
     done
-    echo "ok   x86_64 key functions: ${#specs[@]} read with their calls followed, ${#leaks_follow[@]} leaks after them caught, refused without following"
+    echo "ok   $arch key functions: ${#specs[@]} read with their calls followed, ${#leaks_follow[@]} leaks after them caught, refused without following"
 }
 
 # Two rules of the checker, with hand-written controls: cqto defines rdx from rax (a secret left in rdx is not a secret
@@ -410,6 +410,9 @@ ld.lld -static --no-pie -z notext "$out/aarch64.o" "$out/aarch64-start.o" -o "$o
 qemu-aarch64 -cpu max "$out/aarch64" || { echo "ct aarch64: check $? failed" >&2; exit 1; }
 read_target aarch64 "$out/aarch64.o"
 a64_follow_read
+# The bignum routines and the AES key functions, read whole on AArch64 with their calls followed.
+orchestration_read "$out/aarch64.o" aarch64
+worker_read "$out/aarch64.o" aarch64
 # A --fast build keeps every call: the checker follows each into its callee, defined in the same object.
 fast_read aarch64 "$out/aarch64-fast.o" "" "" "$cases/fast-known-aarch64.txt"
 

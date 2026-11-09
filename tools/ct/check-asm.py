@@ -711,7 +711,7 @@ def check_aarch64(lines, secret, pointers):
     function_addresses = {address for address, _ in lines}
     # A spec gives argument numbers; a followed call gives the register tags it passes (x0, v1, ptr:x2).
     start = (frozenset(i if isinstance(i, str) else f"x{i}" for i in secret) |
-             frozenset(f"ptr:x{i}" for i in pointers))
+             frozenset(f"ptr:x{i}" for i in pointers) | frozenset(["spd:0"]))
     returned = []
 
     def after_call(state, name, text):
@@ -761,7 +761,16 @@ def check_aarch64(lines, secret, pointers):
             parts.append(cur.strip())
         return parts
 
-    def stack_bytes(memory, register, op, index=0):
+    def tag_value(state, prefix):
+        values = [t.split(":")[1] for t in state if t.startswith(prefix)]
+        return int(values[0]) if len(values) == 1 and values[0] != "?" else None
+
+    def set_tag(state, prefix, value):
+        for tag in [t for t in state if t.startswith(prefix)]:
+            state.discard(tag)
+        state.add(prefix + ("?" if value is None else str(value)))
+
+    def stack_bytes(memory, register, op, index=0, state=frozenset()):
         match = re.fullmatch(r"\[(sp|x29)(?:,\s*#(-?(?:0x[0-9a-f]+|[0-9]+)))?\]!?", memory)
         if not match:
             return None
@@ -775,9 +784,15 @@ def check_aarch64(lines, secret, pointers):
         elif op.startswith(("ldrsw", "ldursw")):
             size = 4
         offset += index * size
+        # While the stack pointer and the frame register are known numbers of bytes below the stack pointer at
+        # entry, a slot is named by its distance from that point, so sp- and x29-relative accesses to one
+        # byte agree; otherwise it is named by its base register and aliases of another base are assumed.
+        below = tag_value(state, "spd:") if match.group(1) == "sp" else tag_value(state, "fpd:")
+        if below is not None:
+            return [f"slot:f:{offset - below + i}" for i in range(size)]
         return [f"slot:{match.group(1)}:{offset + i}" for i in range(size)]
 
-    def step(state, text, address):
+    def step_inner(state, text, address):
         state = set(state)
         parts = text.split(None, 1)
         op = parts[0]
@@ -816,8 +831,9 @@ def check_aarch64(lines, secret, pointers):
             any("[sp" in operand and ("!" in operand or len(ops) > ops.index(operand) + 1)
                 for operand in ops)
         )
-        if stack_change and (any(item.startswith(("slot:", "ptrslot:")) for item in state) or
-            any("ptr:" + a64_reg(operand) in state or t(operand) for operand in ops[:2])):
+        if stack_change and tag_value(state, "spd:") is None and (
+                any(item.startswith(("slot:", "ptrslot:")) for item in state) or
+                any("ptr:" + a64_reg(operand) in state or t(operand) for operand in ops[:2])):
             state.add("stack-moved")
 
         def tagged(slots, prefix):
@@ -839,7 +855,7 @@ def check_aarch64(lines, secret, pointers):
                 r = a64_reg(d)
                 pointer_base = any("ptr:" + reg in state for reg in inner)
                 frame = not inner or inner[0] != "x29" or "stackbase:x29" in state
-                slots = None if pointer_base or not frame else stack_bytes(memory, d, op, i)
+                slots = None if pointer_base or not frame else stack_bytes(memory, d, op, i, state)
                 value = (tagged(slots, "") or "frame-dirty" in state) if slots is not None else True
                 pointer = slots is not None and tagged(slots, "ptr")
                 (state.add if value else state.discard)(r)
@@ -857,7 +873,7 @@ def check_aarch64(lines, secret, pointers):
             for i, source in enumerate(sources):
                 pointer_base = any("ptr:" + reg in state for reg in inner)
                 frame = not inner or inner[0] != "x29" or "stackbase:x29" in state
-                slots = None if pointer_base or not frame else stack_bytes(memory, source, op, i)
+                slots = None if pointer_base or not frame else stack_bytes(memory, source, op, i, state)
                 if slots is not None:
                     pointer = "ptr:" + a64_reg(source) in state
                     for slot in slots:
@@ -901,6 +917,48 @@ def check_aarch64(lines, secret, pointers):
         if A64_FLAGS.match(op):
             (state.add if value else state.discard)("flags")
         return frozenset(state)
+
+    def step(state_in, text, address):
+        """step_inner, then the new distances of sp and x29 below the stack pointer at entry (spd, fpd)."""
+        out = set(step_inner(state_in, text, address))
+        parts = text.split(None, 1)
+        op = parts[0]
+        ops = split(parts[1]) if len(parts) > 1 else []
+        spd = tag_value(state_in, "spd:")
+        fpd = tag_value(state_in, "fpd:") if "stackbase:x29" in state_in else None
+        number = lambda o: int(o.lstrip("#"), 0) if re.fullmatch(r"#-?(?:0x[0-9a-f]+|[0-9]+)", o) else None
+        new_sp = spd
+        if ops and ops[0] == "sp" and op in ("add", "sub", "mov"):
+            if op in ("add", "sub") and len(ops) == 3 and ops[1] == "sp" and number(ops[2]) is not None:
+                new_sp = None if spd is None else spd + (number(ops[2]) if op == "sub" else -number(ops[2]))
+            elif op == "mov" and len(ops) == 2 and ops[1] == "x29":
+                new_sp = fpd
+            elif op == "add" and len(ops) == 3 and ops[1] == "x29" and number(ops[2]) is not None:
+                new_sp = None if fpd is None else fpd - number(ops[2])
+            else:
+                new_sp = None
+        for index, operand in enumerate(ops):
+            pre = re.fullmatch(r"\[sp,\s*#(-?(?:0x[0-9a-f]+|[0-9]+))\]!", operand)
+            if pre and op.startswith(("ldr", "ldp", "str", "stp")):
+                new_sp = None if new_sp is None else new_sp - int(pre.group(1), 0)
+            elif operand == "[sp]" and index + 1 < len(ops) and number(ops[index + 1]) is not None:
+                new_sp = None if new_sp is None else new_sp - number(ops[index + 1])
+        set_tag(out, "spd:", new_sp)
+        if new_sp is None and spd is not None and any(i.startswith(("slot:", "ptrslot:")) for i in out):
+            out.add("stack-moved")
+        # x29: a frame address (x29 = sp + n), or anything else written to it.
+        written = [a64_reg(o) for o in ops[:2]] if op.startswith(("ldp", "ldnp")) else (
+            [a64_reg(ops[0])] if ops and not op.startswith(("str", "stp", "stur", "cmp", "cmn", "tst", "b", "cb", "tb"))
+            else [])
+        if "x29" in written:
+            if op in ("add", "mov") and ops[1] == "sp" and spd is not None:
+                set_tag(out, "fpd:", spd - (number(ops[2]) if len(ops) == 3 and number(ops[2]) is not None else 0)
+                        if len(ops) == 2 or number(ops[2]) is not None else None)
+            else:
+                set_tag(out, "fpd:", None)
+        elif not any(t.startswith("fpd:") for t in out) and any(t.startswith("fpd:") for t in state_in):
+            set_tag(out, "fpd:", tag_value(state_in, "fpd:"))
+        return frozenset(out)
 
     def successors(text, i, index):
         parts = text.split()
