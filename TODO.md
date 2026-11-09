@@ -153,6 +153,10 @@
   the box. Regression: `tests/cases/fuzz-differential/captured-closure-calls.ab`; the closure generator now
   draws `compose` and `{ x -> g(f(x)) + calls }`. Also drawn: sealed interfaces with an exhaustive `when`
   over `is` arms, and `for` over `until` and `..` ranges (empty, reversed, negative bounds).
+  Seeds 600 to 620 clean with the sealed and range generators. Grown a third time (branch `fuzz-grow4`):
+  `abla/regex` (compile errors, `matches`, `find`, `findAll` spans, `replace`) at run time and under `#`;
+  seeds 701 to 720 (10 regex checks among them) agree in all six modes. There are no stepped ranges in the
+  language, and class field mutation was already drawn (`Acc.total`).
 
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
