@@ -72,6 +72,11 @@ status=$?
 set -e
 test "$status" -eq 0 || { echo "floats.ab exited $status" >&2; exit 1; }
 
+# A float that only a `#` computation erases still keeps the comparison.
+"$compiler" build "$project_root/tests/cases/any-equality-split/computed-float.ab" -o "$out/computed" --no-cache
+expect true "$out/computed.ll" "a program whose compile-time code erases a float lost the float comparison"
+"$out/computed"
+
 # An object stays float-aware.
 "$compiler" build "$project_root/tests/cases/any-equality-split/no-floats.ab" -o "$out/plain.o" \
     --emit object --no-cache
