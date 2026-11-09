@@ -126,15 +126,6 @@ pthread_mutex_destroy:
     mov x0, #0
     ret
 
-    .globl open
-    .globl read
-    .globl close
-open:
-read:
-close:
-    mov x0, #-1
-    ret
-
     .globl write
 write:
     mov w8, #64
