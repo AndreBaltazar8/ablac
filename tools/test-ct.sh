@@ -183,34 +183,43 @@ division_read() {
 
 # The header-public pointer (`%n`): the first 32 bytes of the object it points to are public, the rest is secret. The
 # clean entries read the header; the rest (payload read, a variable offset, the register overwritten, replaced on one
-# path, clobbered by a call, a secret stored through it or a copy of it) must be reported. x86-64 only; the other
-# targets refuse the spec.
+# path, clobbered by a call, a secret stored through it or a copy of it) must be reported. x86-64 and AArch64 (hand
+# fixtures); Wasm and Xtensa refuse the spec.
 header_read() {
-    llvm-mc -triple x86_64-linux-gnu -filetype=obj "$cases/header-x86.s" -o "$out/header-x86.o"
-    ld.lld -static -e hdr_branch "$out/header-x86.o" -o "$out/header-x86"
-    local entry
+    local arch=$1 triple=$2 file=$3 entry
+    llvm-mc -triple "$triple" -filetype=obj "$cases/$file.s" -o "$out/$file.o"
+    ld.lld -static -e hdr_branch "$out/$file.o" -o "$out/$file"
     for entry in hdr_branch hdr_loop; do
-        $check x86_64 "$out/header-x86" "$entry:%0" > "$out/header-$entry.log" 2>&1 || {
-            cat "$out/header-$entry.log" >&2; echo "ct: header entry $entry was reported" >&2; exit 1
+        $check "$arch" "$out/$file" "$entry:%0" > "$out/$file-$entry.log" 2>&1 || {
+            cat "$out/$file-$entry.log" >&2; echo "ct: header entry $entry was reported on $arch" >&2; exit 1
         }
     done
     for entry in payload_branch payload_index header_indexed header_overwritten header_merge header_call header_offset; do
-        if $check x86_64 "$out/header-x86" "$entry:%0" > "$out/header-$entry.log" 2>&1; then
-            echo "ct: missed header control $entry" >&2; exit 1
+        # The call is followed, so what is reported is the header read after it, not the call.
+        if $check --follow-calls "$arch" "$out/$file" "$entry:%0" > "$out/$file-$entry.log" 2>&1; then
+            echo "ct: missed header control $entry on $arch" >&2; exit 1
         fi
-        grep -q '^LEAK' "$out/header-$entry.log" || { cat "$out/header-$entry.log" >&2; exit 1; }
+        grep -q '^LEAK' "$out/$file-$entry.log" || { cat "$out/$file-$entry.log" >&2; exit 1; }
+        ! grep -q ': call: ' "$out/$file-$entry.log" || { cat "$out/$file-$entry.log" >&2; exit 1; }
     done
     for entry in header_store_secret header_store_other; do
-        if $check x86_64 "$out/header-x86" "$entry:%0,1" > "$out/header-$entry.log" 2>&1; then
-            echo "ct: missed header control $entry" >&2; exit 1
+        if $check "$arch" "$out/$file" "$entry:%0,1" > "$out/$file-$entry.log" 2>&1; then
+            echo "ct: missed header control $entry on $arch" >&2; exit 1
         fi
-        grep -q 'LEAK.*secret stored through an object pointer' "$out/header-$entry.log" || { cat "$out/header-$entry.log" >&2; exit 1; }
+        grep -q 'LEAK.*secret stored through an object pointer' "$out/$file-$entry.log" || { cat "$out/$file-$entry.log" >&2; exit 1; }
     done
-    if $check aarch64 "$out/header-x86" "hdr_branch:%0" > "$out/header-refused.log" 2>&1; then
-        echo "ct: a header pointer was accepted on a target that doesn't read it" >&2; exit 1
-    fi
-    grep -q "isn't read on aarch64" "$out/header-refused.log" || { cat "$out/header-refused.log" >&2; exit 1; }
-    echo "ok   x86_64 checker: header words of an object pointer are public (2 clean, 9 controls, other targets refuse the spec)"
+    echo "ok   $arch checker: header words of an object pointer are public (2 clean, 9 controls)"
+}
+
+header_refused() {
+    local arch
+    for arch in wasm xtensa; do
+        if $check "$arch" "$out/header-x86" "hdr_branch:%0" > "$out/header-refused-$arch.log" 2>&1; then
+            echo "ct: a header pointer was accepted on $arch, which doesn't read it" >&2; exit 1
+        fi
+        grep -q "isn't read on $arch" "$out/header-refused-$arch.log" || { cat "$out/header-refused-$arch.log" >&2; exit 1; }
+    done
+    echo "ok   wasm and xtensa refuse the header pointer spec"
 }
 
 # Secret residue: what a secret-handling call leaves in memory that nothing wipes. The register allocator spills
@@ -564,7 +573,9 @@ real_entries_run
 orchestration_read "$out/x86.o"
 worker_read "$out/x86.o"
 division_read
-header_read
+header_read x86_64 x86_64-linux-gnu header-x86
+header_read aarch64 aarch64-linux-gnu header-a64
+header_refused
 
 # --- AArch64 --------------------------------------------------------------------------
 "$compiler" build "$cases/aarch64-build.ab" -o "$out/aarch64-driver" --no-cache

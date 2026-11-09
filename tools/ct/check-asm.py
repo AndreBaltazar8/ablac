@@ -861,10 +861,31 @@ def follow_call_a64(name, tags, text):
 
 def check_aarch64(lines, secret, pointers):
     function_addresses = {address for address, _ in lines}
+    header_args = FOLLOW.get("header_args", [])
+    FOLLOW["header_args"] = []  # a followed callee has none
     # A spec gives argument numbers; a followed call gives the register tags it passes (x0, v1, ptr:x2).
     start = (frozenset(i if isinstance(i, str) else f"x{i}" for i in secret) |
-             frozenset(f"ptr:x{i}" for i in pointers) | frozenset(["spd:0"]))
+             frozenset(f"ptr:x{i}" for i in pointers) | frozenset(["spd:0"]) |
+             frozenset(f"hdrp:x{i}" for i in header_args))
     returned = []
+
+    def mark_lost(state, op, ops):
+        """As on x86-64: a header-public pointer is one only while its register is never written. A call, or any
+        bare register operand of an instruction that isn't a compare, branch or store, or a base written back, ends it."""
+        if op in ("bl", "blr"):
+            state.update("lost:x%d" % i for i in range(19))
+            return
+        if op.startswith(("cmp", "cmn", "tst", "ccmp", "ccmn", "b", "ret", "st", "nop", "hint")) and op != "bic":
+            for o in ops:
+                if "[" in o and ("!" in o or (o != ops[-1] and op.startswith("st"))):
+                    state.update("lost:" + a64_reg(r) for r in re.findall(r"\b[xw]\d+\b", o))
+            return
+        for k, o in enumerate(ops):
+            if "[" in o:
+                if "!" in o or k != len(ops) - 1:
+                    state.update("lost:" + a64_reg(r) for r in re.findall(r"\b[xw]\d+\b", o))
+            else:
+                state.update("lost:" + a64_reg(r) for r in re.findall(r"\b[xwvbhsdq]\d+\b", o))
 
     def after_call(state, name, text):
         """The state after a call to a function of the same object, checked as a function of its own on the
@@ -964,6 +985,8 @@ def check_aarch64(lines, secret, pointers):
         ops = split(parts[1]) if len(parts) > 1 else []
         regs = lambda o: [a64_reg(r) for r in re.findall(r"\b[wxvbhsdq]\d+(?:\.\w+)?\b|\bsp\b", o)]
         t = lambda o: any(r in state for r in regs(o))
+        if header_args:
+            mark_lost(state, op, ops)
         if op.startswith("b.") or A64_BRANCH_REG.match(op):
             if op.startswith("b."):
                 if "flags" in state:
@@ -1016,12 +1039,17 @@ def check_aarch64(lines, secret, pointers):
             if any(r in state for r in inner):
                 raise Violation(f"secret address: {text}")
             dests = ops[:ops.index(memory)]
+            header = re.fullmatch(r"\[(x\d+)(?:,\s*#(0x[0-9a-f]+|\d+))?\]", memory)
+            public_header = bool(header and op.startswith(("ldr", "ldur")) and
+                                 "hdrp:" + a64_reg(header.group(1)) in state and
+                                 "lost:" + a64_reg(header.group(1)) not in state and
+                                 int(header.group(2) or "0", 0) < HEADER_BYTES)
             for i, d in enumerate(dests):
                 r = a64_reg(d)
                 pointer_base = any("ptr:" + reg in state for reg in inner)
                 frame = not inner or inner[0] != "x29" or "stackbase:x29" in state
                 slots = None if pointer_base or not frame else stack_bytes(memory, d, op, i, state)
-                value = (tagged(slots, "") or "frame-dirty" in state) if slots is not None else True
+                value = (tagged(slots, "") or "frame-dirty" in state) if slots is not None else not public_header
                 pointer = slots is not None and tagged(slots, "ptr")
                 (state.add if value else state.discard)(r)
                 (state.add if pointer else state.discard)("ptr:" + r)
@@ -1035,6 +1063,8 @@ def check_aarch64(lines, secret, pointers):
             if any(r in state for r in inner):
                 raise Violation(f"secret address: {text}")
             sources = ops[:ops.index(memory)]
+            if header_args and any(t(source) for source in sources) and any("ptr:" + reg in state for reg in inner):
+                raise Violation(f"secret stored through an object pointer: {text}")
             for i, source in enumerate(sources):
                 pointer_base = any("ptr:" + reg in state for reg in inner)
                 frame = not inner or inner[0] != "x29" or "stackbase:x29" in state
@@ -1771,7 +1801,7 @@ CHECKERS = {"x86_64": check_x86, "aarch64": check_aarch64, "xtensa": check_xtens
 
 HEADERS = {}
 HEADER_BYTES = 32
-HEADER_CHECKERS = ("x86_64",)
+HEADER_CHECKERS = ("x86_64", "aarch64")
 
 
 def parse_spec(spec, count_hint=8):
@@ -1807,6 +1837,10 @@ def main():
     failed = 0
     for spec in specs:
         name, secret, pointers = parse_spec(spec)
+        if HEADERS.get(name) and arch not in HEADER_CHECKERS:
+            print(f"LEAK {arch} {name}: a header-public pointer (%) isn't read on {arch}")
+            failed = 1
+            continue
         lines = wasm_export_lines(path, name) if arch == "wasm" else None
         if lines is None:
             lines = disassemble(path, name, ["--mcpu=esp32"] if arch == "xtensa" else [])
@@ -1818,8 +1852,6 @@ def main():
             continue
         FOLLOW["followed"] = set()
         try:
-            if HEADERS.get(name) and arch not in HEADER_CHECKERS:
-                raise Violation(f"a header-public pointer (%) isn't read on {arch}")
             FOLLOW["header_args"] = list(HEADERS.get(name, []))
             CHECKERS[arch](lines, secret, pointers)
             following = f", following {len(FOLLOW['followed'])}" if FOLLOW["followed"] else ""
