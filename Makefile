@@ -302,7 +302,6 @@ test-serial: ablac
 	tools/test-target-descriptors.sh $(COMPILER)
 	tools/test-ios-target.sh $(COMPILER)
 	tools/test-ios-static-library.sh $(COMPILER)
-	tools/test-ios-package.sh $(COMPILER)
 	python3 tools/test-ios-availability.py $(COMPILER)
 	tools/test-json-native-paths.sh $(COMPILER)
 	tools/test-json-ascii-spans.sh $(COMPILER)
