@@ -20,6 +20,29 @@
 
 ## Bugs seen
 
+- [ ] **A contract import does not carry a class its module reaches only through another module
+  (NovaKind report 98, #698).** `import contract "api.ab"` where `api.ab` imports `mid.ab`, `mid.ab`
+  imports `lib.ab`, and `lib.ab` declares `class Payload`, with `@server fun remote(): Payload` in `api.ab`:
+  the client sees `Payload` as a nominal type (`compilerFindType` answers) but there is no declaration
+  (`compilerFindClass` and `compilerTypeDeclaration` answer -1, `compilerTypeModuleIdentity` is `""`), so
+  `Payload(42)` in the client fails `call.target:Payload`. Cause: `bootstrapContractImportRequired`
+  (src/module.ab) follows a contract module's import only when the module it imports *directly* declares a
+  class its shape mentions; `mid.ab` declares none, so `loadContract` stops there and `lib.ab` is never
+  loaded. In NovaKind it surfaces in abla-one's `oneRemoteCodec` (`compilerFindClass(head) < 0`) as 3,312
+  errors, a hidden value that "can't cross the network"; abla-one now says which import is missing
+  (remote-hidden-class). Workaround: import the class's module in `api.ab` itself. A minimal repro is four
+  files (`lib.ab`: `class TransitivePayload(val value: int)`; `mid.ab`: imports it, `fun transitiveMid() =
+  TransitivePayload(42)`; `api.ab`: imports `mid.ab`, `@rpc fun remote(): TransitivePayload`; `main.ab`:
+  `import contract "api.ab" as api` and `TransitivePayload(42).value`): v0.2.51 and master give
+  `call.target:TransitivePayload`. **Tried:** following a non-aliased import transitively when a module it
+  reaches declares a mentioned class (`contractReaches`, the shapes carried down through `loadContract`).
+  The repro builds and returns 42, but NovaKind's client build then fails with 7 `interface.missing-member`
+  errors (`OneApp.render`/`receive` on `NovaKindLanding`, `NovaKindRecoveredApp`, `NovaKindRecoveredLanding`,
+  `XmlSink.write` on `NovaKindSaftSink`): the walk loads modules as contract copies (classes without their
+  methods) before the app's ordinary import loads them in full. A fix has to load only the module that
+  declares the class, skip modules the program loads in full anyway, and keep the contract-first and
+  ordinary-first registration orders (tests/cases/contract-registration). The patch is not kept.
+
 - [x] **Master's Linux job failed from e031754a to 66d3dfec (2026-11-07), two flakes.** (1)
   `tests/cases/run-limited/parent-death.py`: the worker wrote `parent` once `child` existed, but
   the child creates that file empty before writing its pid, so the test read `''`
