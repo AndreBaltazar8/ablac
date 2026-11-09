@@ -73,7 +73,8 @@ fun bootstrapLlvmObjectZeroPolicy(
     if (program.errors > 0) return program
     var found = false
     for (function in program.functions) {
-        if (function.name == "__ablaRuntimeUseBulkObjectZero") found = true
+        if (function.name == "__ablaRuntimeUseBulkObjectZero" ||
+            function.name == "__ablaRuntimeEqualFloatKinds") found = true
     }
     if (!found) return program
     val host64 = targetTriple.startsWith("x86_64") ||
@@ -87,7 +88,9 @@ fun bootstrapLlvmObjectZeroPolicy(
     val functions: array<BootstrapIrFunction> = []
     for (function in program.functions) {
         if (function.name == "__ablaRuntimeObjectBlock" ||
-            function.name == "__ablaRuntimeUseBulkObjectZero") {
+            function.name == "__ablaRuntimeUseBulkObjectZero" ||
+            function.name == "__ablaRuntimeEqual" ||
+            function.name == "__ablaRuntimeEqualFloatKinds") {
             val instructions: array<BootstrapInstruction> = []
             for (instruction in function.instructions) {
                 val policyCall = function.name == "__ablaRuntimeObjectBlock" &&
@@ -95,10 +98,23 @@ fun bootstrapLlvmObjectZeroPolicy(
                     instruction.text == "__ablaRuntimeUseBulkObjectZero"
                 val policyBody = function.name == "__ablaRuntimeUseBulkObjectZero" &&
                     instruction.opcode == "const.bool"
+                // `==` through `any` compares erased floats by kind only where a float may be
+                // erased (bootstrapLlvmFloatKindEquality).
+                val kindsCall = function.name == "__ablaRuntimeEqual" &&
+                    instruction.opcode == "call" &&
+                    instruction.text == "__ablaRuntimeEqualFloatKinds"
+                val kindsBody = function.name == "__ablaRuntimeEqualFloatKinds" &&
+                    instruction.opcode == "const.bool"
                 if (policyCall || policyBody) {
                     instructions.append(BootstrapInstruction(
                         "const.bool", instruction.result, -1, -1,
                         if (enabled) "true" else "false", -1, -1, [], [],
+                        instruction.position
+                    ))
+                } else if (kindsCall || kindsBody) {
+                    instructions.append(BootstrapInstruction(
+                        "const.bool", instruction.result, -1, -1,
+                        if (bootstrapLlvmFloatKindEquality) "true" else "false", -1, -1, [], [],
                         instruction.position
                     ))
                 } else instructions.append(instruction)
@@ -647,6 +663,9 @@ var bootstrapLlvmWasmUnwinding = false
 // The graph owner requests one semantic probe before running user actions.
 // Nested CT compilations leave this off and cannot consume the request.
 var bootstrapFloatBridgeProbe = false
+// A whole program asks the same semantic probe for one fact only: whether any float is
+// erased to `any` (bootstrapLlvmFloatKindEquality), with no bridge or formatting effect.
+var bootstrapFloatOriginProbe = false
 var bootstrapFloatBridgeAvailable = false
 
 // The WebAssembly platform's attempt, abandon and unwinding, and the versions
@@ -794,8 +813,12 @@ fun bootstrapCompileLlvmParsedCached(
     // after lowering, without changing ordinary programs or nested CT emits.
     holdLlvmClient: bool = false
 ): BootstrapLlvmCompilation {
-    val floatProbe = bootstrapFloatBridgeProbe
+    val bridgeProbe = bootstrapFloatBridgeProbe
+    val originProbe = bootstrapFloatOriginProbe
+    val floatProbe = bridgeProbe || originProbe
     bootstrapFloatBridgeProbe = false
+    bootstrapFloatOriginProbe = false
+    var floatKinds = true
     // A parse error stops the build after the parser: analysis and code
     // generation would only run over the holes it left, and their errors
     // (unknown types, invalid IR) would bury it. Named-argument mistakes are
@@ -852,14 +875,18 @@ fun bootstrapCompileLlvmParsedCached(
     if (floatProbe) bootstrapFloatDemandNames = Map()
     if (floatProbe && analyzed.errors == 0) {
         val demanded = bootstrapFloatDemandOrigin && bootstrapFloatDemandText
-        if (demanded && !bootstrapFloatBridgeAvailable) {
-            bootstrapSemanticTargetsWasm = outerTargetsWasm
-            bootstrapSemanticWasmUnwinds = false
-            bootstrapCtFinishPass()
-            val discardedExports = bootstrapTakeExportRequests()
-            return BootstrapLlvmCompilation("", 0, 0, 0, 0, 0, "", false, false, [], [], "", true)
+        if (bridgeProbe) {
+            if (demanded && !bootstrapFloatBridgeAvailable) {
+                bootstrapSemanticTargetsWasm = outerTargetsWasm
+                bootstrapSemanticWasmUnwinds = false
+                bootstrapCtFinishPass()
+                val discardedExports = bootstrapTakeExportRequests()
+                return BootstrapLlvmCompilation("", 0, 0, 0, 0, 0, "", false, false, [], [], "",
+                    true)
+            }
+            bootstrapFloatFormattingRequested = demanded
         }
-        bootstrapFloatFormattingRequested = demanded
+        if (originProbe) floatKinds = bootstrapFloatDemandOrigin
     }
     bootstrapSemanticTargetsWasm = outerTargetsWasm
     // A WebAssembly program whose `orElse` alternatives can retry leaves them
@@ -957,6 +984,7 @@ fun bootstrapCompileLlvmParsedCached(
         for (edit in committed) sofar.append(edit)
         for (edit in roundEdits) sofar.append(edit)
         bootstrapFloatBridgeProbe = bootstrapFloatBridgeAvailable
+        bootstrapFloatOriginProbe = originProbe
         return bootstrapCompileLlvmParsedCached(
             bootstrapCommitEdits(written, roundEdits), cache, targetTriple,
             pruneUnused, requireMain, round + 1, sofar, globals, holdLlvmClient
@@ -1002,9 +1030,15 @@ fun bootstrapCompileLlvmParsedCached(
             "", analyzed.errors + actionErrors + diagnosedLowering, ""
         )
         // After a parse error, a `main` the parser skipped isn't missing.
-    } else bootstrapEmitLlvmProgram(
-        program, targetTriple, requireMain && written.errors == 0
-    )
+    } else {
+        val enclosingFloatKinds = bootstrapLlvmFloatKindEquality
+        bootstrapLlvmFloatKindEquality = floatKinds
+        val result = bootstrapEmitLlvmProgram(
+            program, targetTriple, requireMain && written.errors == 0
+        )
+        bootstrapLlvmFloatKindEquality = enclosingFloatKinds
+        result
+    }
     bootstrapLlvmHoldModule = enclosingHold
     // Code generation's own diagnosed errors (E_NO_MAIN) are named already.
     val emissionErrors = bootstrapTakeDiagnosedLoweringErrors()
