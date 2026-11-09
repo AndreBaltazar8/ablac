@@ -16,10 +16,12 @@ build() { # threshold output [cache directory]
     local threshold=$1 output=$2 cache=${3:-}
     local flags=(--fast)
     [[ -n $cache ]] || flags+=(--no-cache)
+    local environment=(ABLA_FAST_INLINE_THRESHOLD="$threshold")
+    [[ -z $cache ]] || environment+=(ABLA_CACHE_DIR="$cache")
     (cd "$project_root" &&
-        ABLA_FAST_INLINE_THRESHOLD=$threshold ${cache:+ABLA_CACHE_DIR=$cache} \
-        "$compiler" build "$source" --target-triple wasm32-unknown-unknown \
-        --object-format wasm --emit object "${flags[@]}" -o "$output")
+        env "${environment[@]}" "$compiler" build "$source" \
+        --target-triple wasm32-unknown-unknown --object-format wasm --emit object \
+        "${flags[@]}" -o "$output")
 }
 
 build 100 "$output_directory/plain-100.o"
