@@ -187,3 +187,72 @@ alias_secret:
 	ldp	x29, x30, [sp], #32
 	ret
 	.size alias_secret, .-alias_secret
+
+// Stores the callee only reads (stnp has no writeback, and the checker must still count x0 as read by it):
+//   follow_stnp:0    the callee stores x0 with stnp, loads it back and branches on it: found in callee_stnp
+	.globl callee_stnp
+	.type callee_stnp,@function
+callee_stnp:
+	sub	sp, sp, #16
+	stnp	x0, xzr, [sp]
+	ldr	x3, [sp]
+	add	sp, sp, #16
+	cbz	x3, 1f
+	mov	x0, #1
+1:	ret
+	.size callee_stnp, .-callee_stnp
+
+	.globl follow_stnp
+	.type follow_stnp,@function
+follow_stnp:
+	stp	x29, x30, [sp, #-16]!
+	bl	callee_stnp
+	ldp	x29, x30, [sp], #16
+	ret
+	.size follow_stnp, .-follow_stnp
+
+// A stack pointer that stops being a number of bytes below the entry one:
+//   alias_unknown_sp:0   sub sp, sp, x1 and then an sp-relative load of a slot stored before it: secret (fails closed)
+//   frame_restore:0      mov sp, x29 brings sp back to a known place: a slot beside the secret one is public
+//   frame_restore_secret:0  the secret slot read after the restore: found
+	.globl alias_unknown_sp
+	.type alias_unknown_sp,@function
+alias_unknown_sp:
+	stp	x29, x30, [sp, #-32]!
+	mov	x29, sp
+	str	x0, [sp, #16]
+	sub	sp, sp, x1
+	ldr	x3, [sp, #16]
+	ldrb	w0, [x1, x3]
+	mov	sp, x29
+	ldp	x29, x30, [sp], #32
+	ret
+	.size alias_unknown_sp, .-alias_unknown_sp
+
+	.globl frame_restore
+	.type frame_restore,@function
+frame_restore:
+	stp	x29, x30, [sp, #-32]!
+	add	x29, sp, #0
+	str	x0, [sp, #16]
+	sub	sp, sp, #64
+	mov	sp, x29
+	ldr	x3, [sp, #8]
+	ldrb	w0, [x1, x3]
+	ldp	x29, x30, [sp], #32
+	ret
+	.size frame_restore, .-frame_restore
+
+	.globl frame_restore_secret
+	.type frame_restore_secret,@function
+frame_restore_secret:
+	stp	x29, x30, [sp, #-32]!
+	add	x29, sp, #0
+	str	x0, [sp, #16]
+	sub	sp, sp, #64
+	mov	sp, x29
+	ldr	x3, [sp, #16]
+	ldrb	w0, [x1, x3]
+	ldp	x29, x30, [sp], #32
+	ret
+	.size frame_restore_secret, .-frame_restore_secret

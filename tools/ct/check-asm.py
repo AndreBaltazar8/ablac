@@ -641,7 +641,8 @@ A64_BRANCH_REG = re.compile(r"^(cbz|cbnz|tbz|tbnz)$")
 
 A64_ARGS = [f"x{i}" for i in range(8)] + [f"v{i}" for i in range(8)]
 # Registers a call may change (the AAPCS64 caller-saved ones: x0 to x18, v0 to v7 and v16 to v31); x19 to x30
-# and the low halves of v8 to v15 are the callee's to restore.
+# and the low halves of v8 to v15 are the callee's to restore. The state keeps v8 to v15 whole across a call, which
+# is right for what the ABI guarantees: a caller reads only d8 to d15 after it.
 A64_CLOBBERED = [f"x{i}" for i in range(19)] + [f"v{i}" for i in list(range(8)) + list(range(16, 32))]
 
 
@@ -663,7 +664,7 @@ def a64_split(ops):
 
 
 A64_REGISTER = re.compile(r"\b[wxvbhsdq]\d+(?:\.\w+)?\b")
-A64_READS_ALL = re.compile(r"^(cmp|cmn|tst|ccmp|ccmn|fcmp|fccmp|cbz|cbnz|tbz|tbnz|str|stur|stp|stxr|stlr|stlxr|st1|st2|st3|st4|prfm|prfum)")
+A64_READS_ALL = re.compile(r"^(cmp|cmn|tst|ccmp|ccmn|fcmp|fccmp|cbz|cbnz|tbz|tbnz|st[a-z0-9]*|prfm|prfum)")
 A64_READS_DEST = re.compile(r"^(movk|bfi|bfxil|bfm|ins|bsl|bit|bif|sli|sri|aese|aesd|aesmc|aesimc|mla|mls|fmla|fmls|usra|ssra|umlal|smlal|fmadd)")
 
 
@@ -845,7 +846,7 @@ def check_aarch64(lines, secret, pointers):
             ) for item in state)
         if op in ("sdiv", "udiv") and any(t(o) for o in ops[1:]):
             raise Violation(f"secret division: {text}")
-        if op.startswith(("ldr", "ldur", "ldp", "ldrb", "ldrh", "ldrs", "ldx", "ldar", "ld1")):
+        if op.startswith("ld"):
             memory = next(o for o in ops if "[" in o)
             inner = regs(memory)
             if any(r in state for r in inner):
@@ -864,7 +865,7 @@ def check_aarch64(lines, secret, pointers):
             if "!" in memory or (len(ops) > len(dests) + 1):
                 pass
             return frozenset(state)
-        if op.startswith(("str", "stur", "stp", "stx", "stlr", "st1")):
+        if op.startswith("st"):
             memory = next(o for o in ops if "[" in o)
             inner = regs(memory)
             if any(r in state for r in inner):

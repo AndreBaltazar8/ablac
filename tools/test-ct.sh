@@ -363,6 +363,7 @@ a64_follow_read() {
     local expected
     for spec in follow_branch:0:'in callee_branch: secret branch' follow_tail:0:'in callee_branch: secret branch' \
         follow_result:0:'secret branch' follow_saved:0:'secret branch' follow_stack:0:'secret branch' \
+        follow_stnp:0:'in callee_stnp: secret branch' \
         follow_recursive:0:'recursion into follow_recursive' follow_indirect:0:'call: blr'; do
         expected=${spec#*:*:}
         spec=${spec%:"$expected"}
@@ -374,14 +375,20 @@ a64_follow_read() {
         }
     done
     # One frame reached through sp and through x29 (a public slot beside the secret one is not the secret).
-    $check aarch64 "$out/follow-a64" alias_public:0 > "$out/follow-a64-alias.log" 2>&1 || {
-        cat "$out/follow-a64-alias.log" >&2; echo "ct: a public slot read through x29 was reported on aarch64" >&2; exit 1
-    }
-    if $check aarch64 "$out/follow-a64" alias_secret:0 > "$out/follow-a64-alias.log" 2>&1; then
-        echo "ct: the secret slot read through x29 was missed on aarch64" >&2; exit 1
-    fi
-    grep -q 'secret address' "$out/follow-a64-alias.log" || { cat "$out/follow-a64-alias.log" >&2; exit 1; }
-    echo "ok   aarch64 call following: four clean calls read, seven leaks and refusals found, the calls refused without following, sp and x29 name one frame"
+    for spec in alias_public:0 frame_restore:0; do
+        $check aarch64 "$out/follow-a64" "$spec" > "$out/follow-a64-alias.log" 2>&1 || {
+            cat "$out/follow-a64-alias.log" >&2; echo "ct: a public slot beside the secret one was reported on aarch64: $spec" >&2; exit 1
+        }
+    done
+    # The secret slot read through x29, after an sp restored from x29, and after an sp that is no longer a known
+    # distance from its entry value (which fails closed): all found.
+    for spec in alias_secret:0 frame_restore_secret:0 alias_unknown_sp:0,1; do
+        if $check aarch64 "$out/follow-a64" "$spec" > "$out/follow-a64-alias.log" 2>&1; then
+            echo "ct: the secret slot was missed on aarch64: $spec" >&2; exit 1
+        fi
+        grep -q 'secret address' "$out/follow-a64-alias.log" || { cat "$out/follow-a64-alias.log" >&2; exit 1; }
+    done
+    echo "ok   aarch64 call following: four clean calls read, eight leaks and refusals found, the calls refused without following, sp and x29 name one frame"
 }
 
 # --- x86-64 ---------------------------------------------------------------------------
