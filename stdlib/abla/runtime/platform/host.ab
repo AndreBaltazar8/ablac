@@ -12,6 +12,9 @@ trusted noescape extern:"c" fun write(
     data: i64*,
     length: int
 ): int
+trusted noescape extern:"c" fun open(path: i64*, flags: int): int
+trusted noescape extern:"c" fun read(descriptor: int, data: i64*, length: int): int
+trusted noescape extern:"c" fun close(descriptor: int): int
 trusted noescape extern:"c" fun _exit(status: int): void
 trusted noescape extern:"c" fun _longjmp(buffer: i64*, value: int): void
 trusted noescape extern:"c" fun getenv(name: i64*): i64*
@@ -311,6 +314,16 @@ var __ablaRuntimeHostCollectionLargeCount: int = 0
 var __ablaRuntimeHostCollectionPages: int = 0
 var __ablaRuntimeHostCollectionPageMask: int = 0
 var __ablaRuntimeHostCollectionBitmaps: int = 0
+// A foreground collection first tries to find each candidate's allocation from the registry alone
+// (CollectionLazy; see __ablaRuntimeHostMarkPointer) and builds the page directory only when a
+// candidate is not a payload's start. The registry's lookup reads the word before the candidate, which
+// is safe only in memory the process has mapped: Mapped holds the readable and writable ranges
+// (start, end) of /proc/self/maps for the collection. NeedsDirectory remembers that a directory was needed.
+var __ablaRuntimeHostCollectionLazy: bool = false
+var __ablaRuntimeHostCollectionNeedsDirectory: bool = false
+var __ablaRuntimeHostCollectionMapped: int = 0
+var __ablaRuntimeHostCollectionMappedCount: int = 0
+var __ablaRuntimeHostCollectionMappedLast: int = 0
 val __ablaRuntimeHostCollectionSmallBytes: int = 32768
 
 val __ablaRuntimeHostRegionCachedDescriptors: int = 64
@@ -954,6 +967,115 @@ trusted fun __ablaRuntimeHostCollectionPagesGrow(table: int, capacity: int): int
     grown
 }
 
+// The value of a hexadecimal digit, or -1.
+@inline
+trusted fun __ablaRuntimeHostHexDigit(byte: int): int =
+    if (byte >= 48 && byte <= 57) byte - 48
+    else if (byte >= 97 && byte <= 102) byte - 87
+    else if (byte >= 65 && byte <= 70) byte - 55
+    else -1
+
+// Reads /proc/self/maps into Mapped: the ranges the process can read and write, merged, in address
+// order. False when there is no /proc (the collection then builds its directory as always).
+trusted fun __ablaRuntimeHostCollectionMappingsLoad(): bool {
+    val descriptor = open(
+        ablaRuntimePointerFromAddress(__ablaRuntimeWord0("/proc/self/maps")), 0
+    )
+    if (descriptor < 0) return false
+    var capacity = 65536
+    var buffer = ablaRuntimePointerAddress(malloc(capacity))
+    if (buffer == 0) __ablaRuntimeHostOutOfMemory()
+    var length = 0
+    var reading = true
+    while (reading) {
+        if (length + 1 >= capacity) {
+            capacity = capacity * 2
+            buffer = ablaRuntimePointerAddress(realloc(ablaRuntimePointerFromAddress(buffer),
+                capacity))
+            if (buffer == 0) __ablaRuntimeHostOutOfMemory()
+        }
+        val got = read(descriptor, ablaRuntimePointerFromAddress(buffer + length),
+            capacity - length - 1)
+        if (got <= 0) reading = false else length = length + got
+    }
+    close(descriptor)
+    ablaRuntimeStoreU8(buffer + length, 0)
+    // A line is at least 16 bytes, so there are at most length / 16 + 1 ranges.
+    val pairs = ablaRuntimePointerAddress(malloc((length / 16 + 2) * 16))
+    if (pairs == 0) __ablaRuntimeHostOutOfMemory()
+    var count = 0
+    var at = 0
+    var good = true
+    while (at < length && good) {
+        var start = 0
+        var digit = __ablaRuntimeHostHexDigit(ablaRuntimeLoadU8(buffer + at))
+        while (digit >= 0) {
+            start = start * 16 + digit
+            at = at + 1
+            digit = __ablaRuntimeHostHexDigit(ablaRuntimeLoadU8(buffer + at))
+        }
+        if (ablaRuntimeLoadU8(buffer + at) != 45) good = false
+        at = at + 1
+        var end = 0
+        digit = __ablaRuntimeHostHexDigit(ablaRuntimeLoadU8(buffer + at))
+        while (digit >= 0) {
+            end = end * 16 + digit
+            at = at + 1
+            digit = __ablaRuntimeHostHexDigit(ablaRuntimeLoadU8(buffer + at))
+        }
+        if (ablaRuntimeLoadU8(buffer + at) != 32) good = false
+        at = at + 1
+        // The permissions: r, w, x, p or s.
+        val readable = ablaRuntimeLoadU8(buffer + at) == 114
+        val writable = ablaRuntimeLoadU8(buffer + at + 1) == 119
+        if (good && readable && writable && end > start) {
+            if (count > 0 && ablaRuntimeLoadI64(pairs + (count - 1) * 16 + 8) == start) {
+                ablaRuntimeStoreI64(pairs + (count - 1) * 16 + 8, end)
+            } else {
+                ablaRuntimeStoreI64(pairs + count * 16, start)
+                ablaRuntimeStoreI64(pairs + count * 16 + 8, end)
+                count = count + 1
+            }
+        }
+        while (at < length && ablaRuntimeLoadU8(buffer + at) != 10) at = at + 1
+        at = at + 1
+    }
+    free(ablaRuntimePointerFromAddress(buffer))
+    if (!good || count == 0) {
+        free(ablaRuntimePointerFromAddress(pairs))
+        return false
+    }
+    __ablaRuntimeHostCollectionMapped = pairs
+    __ablaRuntimeHostCollectionMappedCount = count
+    __ablaRuntimeHostCollectionMappedLast = 0
+    __ablaRuntimeHostCollectionMinimum = ablaRuntimeLoadI64(pairs)
+    __ablaRuntimeHostCollectionMaximum = ablaRuntimeLoadI64(pairs + (count - 1) * 16 + 8)
+    true
+}
+
+// Whether the 16 bytes at `address` are in mapped, readable memory.
+trusted fun __ablaRuntimeHostCollectionIsMapped(address: int): bool {
+    val pairs = __ablaRuntimeHostCollectionMapped
+    // Candidates come in runs from one range (the heap's): try the last range that held one first.
+    val last = __ablaRuntimeHostCollectionMappedLast
+    if (u64(ablaRuntimeLoadI64(pairs + last * 16)) <= u64(address) &&
+        u64(address + 15) < u64(ablaRuntimeLoadI64(pairs + last * 16 + 8))) return true
+    var lower = 0
+    var upper = __ablaRuntimeHostCollectionMappedCount
+    while (lower < upper) {
+        val middle = lower + (upper - lower) / 2
+        if (u64(ablaRuntimeLoadI64(pairs + middle * 16 + 8)) <= u64(address + 15)) lower = middle +
+            1
+        else upper = middle
+    }
+    if (lower < __ablaRuntimeHostCollectionMappedCount &&
+        u64(ablaRuntimeLoadI64(pairs + lower * 16)) <= u64(address)) {
+        __ablaRuntimeHostCollectionMappedLast = lower
+        return true
+    }
+    false
+}
+
 // Every registered allocation into the page directory (or, when larger, the address-ordered
 // list of large allocations), in one pass over the registry: its entries say which are
 // large, so no header is read. A page's bitmap is placed when the page is first met (the
@@ -1188,7 +1310,35 @@ trusted fun __ablaRuntimeHostMarkPointer(candidate: int): bool {
     }
     if (u64(candidate) < u64(__ablaRuntimeHostCollectionMinimum) ||
         u64(candidate) >= u64(__ablaRuntimeHostCollectionMaximum)) return false
-    val header = __ablaRuntimeHostCollectionLocate(candidate)
+    var header = 0
+    var exact = 0
+    if (__ablaRuntimeHostCollectionLazy || __ablaRuntimeHostGcStress) {
+        // A payload's start: the word before it, 32 bytes back, is its slot in the registry, and
+        // that slot names this header. Anything else needs the page directory.
+        val at = candidate - 32
+        if (u64(at) >= u64(__ablaRuntimeHostCollectionMinimum) && (at & 15) == 0 &&
+            (if (__ablaRuntimeHostCollectionLazy) __ablaRuntimeHostCollectionIsMapped(at)
+                else __ablaRuntimeHostCollectionBitmapOf(at >>> 16) != 0)) {
+            val slot = ablaRuntimeLoadI64(at)
+            if (u64(slot) < u64(__ablaRuntimeHostRegistrySlots) &&
+                (ablaRuntimeLoadI64(__ablaRuntimeHostRegistry + slot * 8) & -16) == at &&
+                ablaRuntimeLoadI64(at + 16) > 0) exact = at
+        }
+    }
+    if (__ablaRuntimeHostCollectionLazy) {
+        header = exact
+        if (header == 0) {
+            __ablaRuntimeHostCollectionLazy = false
+            __ablaRuntimeHostCollectionNeedsDirectory = true
+            __ablaRuntimeHostCollectionPagesBuild()
+            header = __ablaRuntimeHostCollectionLocate(candidate)
+        }
+    } else {
+        header = __ablaRuntimeHostCollectionLocate(candidate)
+        // Under ABLA_GC_STRESS=1 every collection builds the directory: the registry's answer,
+        // where it has one, must be the directory's.
+        if (exact != 0 && exact != header) ablaRuntimeTrap()
+    }
     if (header == 0) return false
     val payload = header + 32
     val size = ablaRuntimeLoadI64(header + 16)
@@ -1261,6 +1411,12 @@ trusted fun __ablaRuntimeHostTraceMarkedAllocations(): void {
         val size = ablaRuntimeLoadI64(header + 16)
         val payload = header + 32
         if (layout == 0) {
+            // Raw words are candidates of any value: only the directory may answer for them.
+            if (__ablaRuntimeHostCollectionLazy) {
+                __ablaRuntimeHostCollectionLazy = false
+                __ablaRuntimeHostCollectionNeedsDirectory = true
+                __ablaRuntimeHostCollectionPagesBuild()
+            }
             var offset: int = 0
             while (offset + 8 <= size) {
                 __ablaRuntimeHostMarkPointer(
@@ -1495,9 +1651,16 @@ trusted fun __ablaRuntimePlatformMemoryCollect(): int {
     __ablaRuntimeHostCollectionCount = allocationCount
     __ablaRuntimeHostCollected = true
     __ablaRuntimeHostCollectionWorklistCount = 0
-    __ablaRuntimeHostCollectionPagesBuild()
+    if (__ablaRuntimeHostGcStress || __ablaRuntimeHostCollectionNeedsDirectory ||
+        !__ablaRuntimeHostCollectionMappingsLoad()) {
+        __ablaRuntimeHostCollectionPagesBuild()
+    } else __ablaRuntimeHostCollectionLazy = true
     __ablaRuntimeHostMarkRootValues()
     __ablaRuntimeHostTraceMarkedAllocations()
+    __ablaRuntimeHostCollectionLazy = false
+    free(ablaRuntimePointerFromAddress(__ablaRuntimeHostCollectionMapped))
+    __ablaRuntimeHostCollectionMapped = 0
+    __ablaRuntimeHostCollectionMappedCount = 0
     __ablaRuntimeHostSmallListsSettle()
     __ablaRuntimeHostCollectionSweep()
     free(ablaRuntimePointerFromAddress(
