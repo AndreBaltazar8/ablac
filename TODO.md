@@ -259,6 +259,16 @@
   Controls: a secret stored at offset 8, a secret-indexed header read, and a pointer spilled and reloaded.
   **No real entry uses `%n` yet:** what exists is the mechanism and its hand-written controls, not coverage of `aesNewKey`,
   `rsaCrt` or any other function of the crypto plumbing; those stay unread until the application below is done.
+  *Finding against the allocator step (2026-11-09, release x86-64, a key-shaped `resource class` and an
+  `ablaUnsafeAllocate` wrapper compiled with master's compiler):* the allocator is not a call the checker can tag. A
+  release build inlines the arena's size checks, free-list and cursor loads and its slow-path calls into the
+  function that allocates (about 100 instructions with a dozen branches on runtime state, then `callq`s into
+  `abla_fn_*_direct`), and a constructor's field stores follow it. The branches depend on the public size and the
+  heap's state, not on secrets, but each of those loads is "unknown memory" to the checker and so secret. A result-slot
+  tag would not close it; what would is either an out-of-line `@noinline` allocation entry in the runtime (a src
+  change: one call per allocation, tagged as returning a `%` pointer, its arguments required public) or public-global
+  loads (rip-relative reads of runtime symbols that nothing secret is ever stored to), which the checker can't prove
+  and so would be a trusted list. Neither is built; the second #734 branch starts with whichever ablac-d1 picks.
   *Built so far:* the `%n` parameter on x86-64, AArch64, Wasm and Xtensa (on Wasm a parameter no instruction writes, in a function with no call, since a callee could store through it), as a pointer whose register
   is never written (any instruction that may write it, or a call, ends it; a merge keeps that, since states join by
   union) and whose 32 header bytes are read at a constant offset by `mov`, `cmp` or `test`; a secret stored through any
