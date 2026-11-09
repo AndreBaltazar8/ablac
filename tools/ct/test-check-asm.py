@@ -26,6 +26,22 @@ check(["imulq $3, %rdi, %rdx", "cmpq $0, %rdx", "jne 0x3"], [0], True)
 check(["imulq %rdx, %rdi", "cmpq $0, %rdi", "jne 0x3"], [0], True)
 print("ok   checker: x86 IMUL operand taint")
 
+# A secret-dependent branch to a trap is still a leak: it is only worded as one, so a fast build's type-tag
+# check (listed in fast-known.txt) is told from a bounds check on a secret by being listed, never by passing.
+def trap_message(code, secret):
+    try:
+        checker.check_x86(list(enumerate(code)), secret, [])
+    except checker.Violation as violation:
+        return str(violation)
+    return None
+
+
+bounds = ["cmpq $16, %rdi", "jae 0x3", "retq", "ud2"]
+assert "secret branch (to trap)" in trap_message(bounds, [0]), "a secret bounds check to ud2 must be reported"
+assert trap_message(bounds, []) is None, "the same check on a public value is clean"
+assert "(to trap)" not in trap_message(["cmpq $16, %rdi", "jae 0x3", "retq", "nop", "retq"], [0])
+print("ok   checker: a secret branch to a trap is a leak")
+
 # AArch64 immediates are operands, not comments; single and paired stack
 # accesses must use the same byte offsets, including partial overwrites.
 from types import SimpleNamespace
