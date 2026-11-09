@@ -71,6 +71,9 @@ def write_json(path, value):
 
 
 def run(args):
+    global VERSIONS
+    VERSIONS = (args.old_version, args.new_version)
+    short = [version.replace('v0.2.', 'v0').replace('.', '') for version in VERSIONS]
     if platform.system() != 'Darwin':
         raise SystemExit('macOS runtime measurement requires Darwin (no work performed)')
     output = args.output.absolute()
@@ -174,11 +177,11 @@ def run(args):
                 for metric in ['wallSeconds', 'timeRealSeconds', 'userSeconds', 'systemSeconds', 'rssBytes']}
     write_json(output / 'raw.json', result)
     report = ['# Native macOS release runtime comparison', '',
-              f'Architecture: `{result["architecture"]}`. v0.2.45 → v0.2.47. Five alternating runs, '
+              f'Architecture: `{result["architecture"]}`. {VERSIONS[0]} → {VERSIONS[1]}. Five alternating runs, '
               'one warmup per arm. Median [minimum–maximum].', '',
               'Times are milliseconds; RSS is MiB (2^20 bytes); size is stripped bytes. '
-              'Positive deltas mean v0.2.47 uses more. No runner/core-isolation claim.', '',
-              '| Program | v045 time | v047 time | Δ | v045 RSS | v047 RSS | Δ | v045 size | v047 size | Δ |',
+              f'Positive deltas mean {VERSIONS[1]} uses more. No runner/core-isolation claim.', '',
+              f'| Program | {short[0]} time | {short[1]} time | Δ | {short[0]} RSS | {short[1]} RSS | Δ | {short[0]} size | {short[1]} size | Δ |',
               '|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|']
     changes = []
     for name, config in result['programs'].items():
@@ -209,4 +212,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ['old-root', 'new-root', 'old-compiler', 'new-compiler', 'output']:
         parser.add_argument('--' + name, type=Path, required=True)
+    parser.add_argument('--old-version', default='v0.2.45')
+    parser.add_argument('--new-version', default='v0.2.47')
     run(parser.parse_args())
