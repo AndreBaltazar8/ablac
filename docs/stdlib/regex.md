@@ -67,7 +67,7 @@ than 500 groups or nests groups deeper than 200 levels, is rejected ("too large"
 and lookbehind (`(?=`, `(?!`, `(?<=`, `(?<!`), every other `(?` form including
 named groups and inline flags such as `(?i)`, unknown letter escapes, `\b` inside a class, quantifiers with
 nothing to repeat (`*a`, `^*`), stacked quantifiers (`a**`, possessive `a*+`), `{m,n}` with
-`n < m`, unterminated groups and classes, and patterns that are not valid UTF-8.
+`n < m`, a class range that starts at a shorthand (`[\w-z]`), unterminated groups and classes, and patterns that are not valid UTF-8.
 
 ## Text model
 
