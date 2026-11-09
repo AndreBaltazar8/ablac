@@ -813,17 +813,29 @@ fun bootstrapLlvmBackendBridgeSymbols(): array<string> = [
     "abla_array_get_bool"
 ]
 
-// Families of bridges the backend or the standard library's natives reach without an instruction
-// the gather maps: field and object access (emitted around every class), generators, tasks and
-// threads (their steps and entries), and the text, JSON, byte and encoding natives the standard
-// library calls by name. They stay with the program whenever they are declared (found by sweeping
-// every program of the suite for an unresolved symbol with the bridge pruned).
+// Families of bridges the backend emits around a kind of instruction without a per-instruction
+// symbol the gather maps: field and object access (and array stores), and generators, tasks and
+// threads (their steps and entries). A family stays with the program when a reachable instruction
+// belongs to it (bootstrapLlvmPruneFieldFamily, bootstrapLlvmPruneConcurrencyFamily), set by the
+// gather below. Found by sweeping every program of the suite for an unresolved symbol with the
+// bridge pruned.
+var bootstrapLlvmPruneFieldFamily: bool = false
+var bootstrapLlvmPruneConcurrencyFamily: bool = false
+
+fun bootstrapLlvmTextStartsWith(text: string, prefix: string): bool =
+    text.size >= prefix.size && text.slice(0, prefix.size) == prefix
+
 fun bootstrapLlvmBackendOwnedBridge(symbol: string): bool {
     var owned = false
-    for (prefix in ["abla_field_", "abla_object_", "abla_generator_", "abla_task_", "abla_thread_",
-                    "abla_runtime_thread", "abla_await", "ablaText", "ablaJson", "ablaByte",
-                    "ablaBase64", "ablaUtf8", "abla_array_set"]) {
-        if (symbol.size >= prefix.size && symbol.slice(0, prefix.size) == prefix) owned = true
+    if (bootstrapLlvmPruneFieldFamily) {
+        for (prefix in ["abla_field_", "abla_object_", "abla_array_set"]) {
+            if (bootstrapLlvmTextStartsWith(symbol, prefix)) owned = true
+        }
+    }
+    if (bootstrapLlvmPruneConcurrencyFamily) {
+        for (prefix in ["abla_generator_", "abla_task_", "abla_thread_", "abla_runtime_thread", "abla_await"]) {
+            if (bootstrapLlvmTextStartsWith(symbol, prefix)) owned = true
+        }
     }
     owned
 }
@@ -835,11 +847,28 @@ fun bootstrapLlvmBridgeSymbolsGatherReachable(
     reachable: array<bool>
 ): void {
     bootstrapLlvmBridgeSymbolsReset()
+    bootstrapLlvmPruneFieldFamily = false
+    bootstrapLlvmPruneConcurrencyFamily = false
     var index = 0
     while (index < program.functions.size) {
         if (index < reachable.size && reachable[index]) {
             for (instruction in program.functions[index].instructions) {
                 bootstrapLlvmBridgeSymbolAdd(bootstrapLlvmRuntimeBridgeInstructionSymbol(instruction))
+                val opcode = instruction.opcode
+                if (bootstrapLlvmTextStartsWith(opcode, "field.") || bootstrapLlvmTextStartsWith(opcode, "object.") ||
+                    bootstrapLlvmTextStartsWith(opcode, "array.")) {
+                    bootstrapLlvmPruneFieldFamily = true
+                }
+                if (bootstrapLlvmTextStartsWith(opcode, "generator.") || bootstrapLlvmTextStartsWith(opcode, "task.") ||
+                    bootstrapLlvmTextStartsWith(opcode, "thread.") || opcode == "await") {
+                    bootstrapLlvmPruneConcurrencyFamily = true
+                }
+                // A call to an extern the standard library declares by a bridge's name (the text,
+                // JSON, byte and encoding natives).
+                if (bootstrapLlvmTextStartsWith(opcode, "extern.")) {
+                    bootstrapLlvmBridgeSymbolAdd(instruction.text)
+                    for (name in instruction.texts) bootstrapLlvmBridgeSymbolAdd(name)
+                }
             }
         }
         index = index + 1
