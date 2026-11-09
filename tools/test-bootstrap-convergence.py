@@ -42,6 +42,8 @@ def configure(lineage, root=None):
     SEEDS = dict(LINEAGES[lineage]["seeds"])
     CANONICAL_ROOT = root if root is not None else "/build/source"
 CANONICAL_ROOT = "/build/source"
+# A command put in front of every build step (a shared machine's queue); empty in CI.
+WRAPPER = []
 ENTRY = "src/orc_main.ab"
 
 
@@ -146,7 +148,7 @@ def route(which, repo, output):
         def shell(source, args, label, stdout=None):
             settings = dict(shell_settings, ABLA_SYSROOT=str(source))
             body = "ulimit -s 131072; exec env " + shlex.join([f"{k}={v}" for k, v in settings.items()] + list(map(str, args)))
-            command(["taskset", "-c", ",".join(map(str, cpus)), "nix-shell", "--pure", str(source / "shell.nix"),
+            command([*WRAPPER, "taskset", "-c", ",".join(map(str, cpus)), "nix-shell", "--pure", str(source / "shell.nix"),
                      "--arg", "xtensa", "true", "--run", body], source, output / (label + ".log"), env, stdout)
 
         # Capture the immutable tool paths, versions and their full Nix closures.
@@ -263,6 +265,7 @@ def main():
     run = sub.add_parser("route")
     run.add_argument("--lineage", default="v0.2.45", choices=sorted(LINEAGES))
     run.add_argument("--root", help="absolute candidate source directory (default /build/source)")
+    run.add_argument("--wrap", default="", help="a command line put in front of every build step, such as a slot queue")
     run.add_argument("route", choices=["a", "b"])
     run.add_argument("output", type=Path)
     join = sub.add_parser("compare")
@@ -275,6 +278,8 @@ def main():
     if args.root is not None and not os.path.isabs(args.root):
         parser.error("--root must be an absolute path")
     configure(args.lineage, args.root)
+    if args.mode == "route":
+        WRAPPER[:] = shlex.split(args.wrap)
     if args.mode == "route":
         route(args.route, Path(__file__).absolute().parent.parent, args.output.absolute())
     else:
