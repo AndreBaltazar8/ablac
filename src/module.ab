@@ -3136,12 +3136,16 @@ class BootstrapModuleGraphIndex(
     val upgradedModules: Map<string, int>,
     // Explicit contract imports retain every root signature, in either order.
     val contractRoots: Map<string, int>,
+    // The contract edges a contract module got to a class its direct imports only
+    // reach through other modules ("importer\ntarget"), which its own full load
+    // makes redundant.
+    val transitiveEdges: Map<string, int>,
     var entryPath: string = ""
 )
 
 fun bootstrapModuleGraphIndex(): BootstrapModuleGraphIndex =
     BootstrapModuleGraphIndex(Map(), [], [], [], Map(), Map(), 0, "", [], Map(), Map(), Map(),
-        Map(), Map())
+        Map(), Map(), Map())
 
 class BootstrapModuleGraph(
     val modules: array<BootstrapModule>,
@@ -3318,6 +3322,54 @@ class BootstrapModuleGraph(
         this.index.modules.get(identity) != null
     }
 
+    /** Whether `importer` has an import edge of its own to `target`. */
+    fun importsDirectly(importer: BootstrapModuleSnapshot, target: string): bool {
+        for (edge in importer.importEdges) {
+            if (!edge.provider && this.state.exposedTarget(
+                bootstrapResolveImport(importer.path, edge.source)
+            ) == target) return true
+        }
+        false
+    }
+
+    /** The modules `start` reaches through plain imports (not `start` itself) that
+     *  declare a class or interface the shape of `parsed` (the module `importer`) mentions,
+     *  nearest first; `importer` is never one of them. */
+    fun contractDeclarers(
+        parsed: BootstrapParseResult,
+        importer: string,
+        start: string
+    ): array<string> {
+        val found: array<string> = []
+        val seen = bootstrapStringSet()
+        seen.add(importer)
+        seen.add(start)
+        val queue: array<string> = [start]
+        var head = 0
+        while (head < queue.size) {
+            val current = queue[head]
+            head = head + 1
+            val snapshot = this.state.acquire(current)
+            for (edge in snapshot.importEdges) {
+                if (edge.provider || edge.alias != "") continue
+                val reached = this.state.exposedTarget(
+                    bootstrapResolveImport(current, edge.source)
+                )
+                if (seen.indexOf(reached) >= 0 || !this.state.sourceExists(reached)) continue
+                seen.add(reached)
+                queue.append(reached)
+                for (candidate in this.state.acquire(reached).discovery.declarations) {
+                    if ((candidate.kind == "class" || candidate.kind == "interface") &&
+                        bootstrapContractShapeMentions(parsed, candidate.name)) {
+                        found.append(reached)
+                        break
+                    }
+                }
+            }
+        }
+        found
+    }
+
     fun loadContract(modulePath: string, typesOnly: bool = false): string {
         val identity = bootstrapNormalizeModulePath(modulePath)
         if (!typesOnly) this.index.contractRoots.set(identity, 1)
@@ -3330,6 +3382,7 @@ class BootstrapModuleGraph(
                     "${this.diagnostics}${bootstrapScanImportsWithIdentity(snapshot.source, snapshot.path).diagnostics}"
             }
             this.modules.append(BootstrapModule(identity, ""))
+            val recordedDeclarers = bootstrapStringSet()
             var index = 0
             while (index < snapshot.importEdges.size) {
                 val edge = snapshot.importEdges[index]
@@ -3352,6 +3405,22 @@ class BootstrapModuleGraph(
                         )
                         this.recordImportEdge(snapshot, contractEdge, exposed)
                         this.loadContract(imported, !edge.contractOnly)
+                    } else if (edge.alias == "") {
+                        // The shape mentions a class the direct import only reaches
+                        // through its own plain imports: load the module that declares
+                        // it (not the modules between), for the contract.
+                        for (declarer in this.contractDeclarers(
+                            snapshot.discovery, snapshot.path, exposed
+                        )) {
+                            if (recordedDeclarers.indexOf(declarer) >= 0 ||
+                                this.importsDirectly(snapshot, declarer)) continue
+                            recordedDeclarers.add(declarer)
+                            this.index.transitiveEdges.set("${snapshot.path}\n$declarer", 1)
+                            this.recordImportEdge(snapshot, BootstrapImportEdge(
+                                declarer, false, "", true, edge.begin, edge.end
+                            ), declarer)
+                            this.loadContract(declarer, !edge.contractOnly)
+                        }
                     }
                 }
                 index = index + 1
@@ -3471,6 +3540,22 @@ class BootstrapModuleGraph(
     /** A module loaded for its contract now loads in full, at its new place. */
     fun dropContractLoad(identity: string): void {
         this.index.upgradedModules.set(identity, 1)
+        // The contract edges it got to classes behind other modules are redundant
+        // now: its own imports load those in full. Each becomes an unreachable
+        // placeholder (a contract edge that stayed would make a second, contract
+        // copy of a module the program also loads in full).
+        val slot = this.index.importers.get(identity)
+        var edge = if (slot != null) this.index.firstAlias[slot] else -1
+        while (edge >= 0) {
+            val found = this.aliases[edge]
+            if (found.contractOnly &&
+                this.index.transitiveEdges.get("$identity\n${found.target}") != null) {
+                this.aliases[edge] = BootstrapModuleAlias(
+                    "", "", "<dropped>", true, found.begin, found.end
+                )
+            }
+            edge = this.index.aliasNext[edge]
+        }
         var index = 0
         while (index < this.orderedSnapshots.size) {
             if (this.orderedSnapshots[index].path == identity) {

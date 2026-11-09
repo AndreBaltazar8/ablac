@@ -171,3 +171,15 @@ for name in contract-first ordinary-first; do
     cmp "$output/registration-$name-first.ll" "$output/registration-$name-second.ll"
 done
 printf '%s\n' 'contract projection: strict surface, dependency types and root signatures passed'
+
+# A contract carries a class its module reaches only through another module's
+# import: the declaring module is loaded for the contract, the module between is
+# not, and a module the program also imports in full stays whole in either order.
+transitive="$project_root/tests/cases/contract-transitive"
+for name in contract-only full-first contract-first api-full-elsewhere api-full-first json-full-elsewhere; do
+    "$compiler" build "$transitive/$name.ab" -o "$output/transitive-$name" --fast --no-cache
+    status=0
+    "$output/transitive-$name" || status=$?
+    [[ $status -eq 42 ]] || { echo "contract transitive $name: $status != 42"; exit 1; }
+done
+printf '%s\n' 'contract transitive: class reached through another module passed'
