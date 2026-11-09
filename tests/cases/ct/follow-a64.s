@@ -158,3 +158,32 @@ follow_indirect:
 	ldp	x29, x30, [sp], #16
 	ret
 	.size follow_indirect, .-follow_indirect
+
+// A frame reached through sp and through x29 (x29 = sp after the prologue): the secret is stored at sp+16.
+//   alias_public:0   a public index stored at sp+8 and loaded through x29+8 is used as an address: clean
+//   alias_secret:0   the secret slot loaded through x29+16 is used as an address: found
+	.globl alias_public
+	.type alias_public,@function
+alias_public:
+	stp	x29, x30, [sp, #-32]!
+	mov	x29, sp
+	str	x0, [sp, #16]
+	mov	x2, #3
+	str	x2, [sp, #8]
+	ldr	x3, [x29, #8]
+	ldrb	w0, [x1, x3]
+	ldp	x29, x30, [sp], #32
+	ret
+	.size alias_public, .-alias_public
+
+	.globl alias_secret
+	.type alias_secret,@function
+alias_secret:
+	stp	x29, x30, [sp, #-32]!
+	mov	x29, sp
+	str	x0, [sp, #16]
+	ldr	x3, [x29, #16]
+	ldrb	w0, [x1, x3]
+	ldp	x29, x30, [sp], #32
+	ret
+	.size alias_secret, .-alias_secret

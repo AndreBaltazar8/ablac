@@ -373,7 +373,15 @@ a64_follow_read() {
             cat "$out/follow-a64-leak.log" >&2; echo "ct: $spec on aarch64: expected '$expected'" >&2; exit 1
         }
     done
-    echo "ok   aarch64 call following: four clean calls read, seven leaks and refusals found, the calls refused without following"
+    # One frame reached through sp and through x29 (a public slot beside the secret one is not the secret).
+    $check aarch64 "$out/follow-a64" alias_public:0 > "$out/follow-a64-alias.log" 2>&1 || {
+        cat "$out/follow-a64-alias.log" >&2; echo "ct: a public slot read through x29 was reported on aarch64" >&2; exit 1
+    }
+    if $check aarch64 "$out/follow-a64" alias_secret:0 > "$out/follow-a64-alias.log" 2>&1; then
+        echo "ct: the secret slot read through x29 was missed on aarch64" >&2; exit 1
+    fi
+    grep -q 'secret address' "$out/follow-a64-alias.log" || { cat "$out/follow-a64-alias.log" >&2; exit 1; }
+    echo "ok   aarch64 call following: four clean calls read, seven leaks and refusals found, the calls refused without following, sp and x29 name one frame"
 }
 
 # --- x86-64 ---------------------------------------------------------------------------
