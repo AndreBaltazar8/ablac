@@ -393,6 +393,19 @@
   the self-build is 0.8% fewer instructions (66.78 G vs 67.29 G, five alternating runs), but the median
   peak rises 2.1%, the baseline's low mode being its best case, so the bar (median lower) is not met. Six
   runs an arm is thin: the gap is within the baseline's own 1.40/1.50 GB spread. A better fix would shorten what the overloads stage holds, not move the collection.
+- [ ] **Peak RSS follows where a collection falls, not the trigger's counter (#677).** (2026-11-09,
+  master `544efc82`.) `tests/benchmarks/json-megabyte.ab`, the same binary and input (170000), peaks
+  at 912 MB in five of six runs and 1,946 MB in the sixth; the collection traces (live bytes before
+  and after each pressure collection) differ between runs by about 1 MB of allocation (timing text),
+  and in the high run one collection at 495 MB live kept 495 where the low runs kept 157, so the
+  next threshold (live + half of live) came at 742 and the heap reached 1,115 MB tracked. Peak RSS
+  also runs about 40% above the tracked live bytes (free lists, malloc fragmentation, the
+  collector's tables). Across input sizes 140k to 180k the peak ranges 912 to 1,610 MB at today's
+  50%. Tried (not kept): growth of 25% or 12% of live instead of 50% (`ABLA_GC_RATIO`, branch
+  `gc-schedule`): the spread stays about ±25% (937 to 1,564 MB at 25%) and json-megabyte costs
+  +5.8% (25%) and +9% (12%) instructions, over the +1% bar; trees, strings and maps do not change
+  (their live heap is small). The to-string cut's +7% peak at 50% (1,148 against 1,071 MB) is
+  inside this spread.
 - [ ] **Move Xtensa density legalization into companion 23.1.3-2.** The phase-3
   compiler stage mirrors the SDK's exact narrow encodings because `-mcpu=esp32`
   and explicit `+density` still leave 5,211 bytes across 199 firmware sections.
