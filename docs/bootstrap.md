@@ -119,6 +119,11 @@ pin:
   `ca9221b0615cd419284a9e8e9f671bf8429ccd3b`, the v0.2.45 tag; that tag's
   own bootstrap pin is v0.2.44.
 
+A newer pair is chosen with `--lineage` (and the workflow's `lineage` input); `LINEAGES` in
+`tools/test-bootstrap-convergence.py` lists them. `v0.2.51`: route A starts from the checksum-pinned v0.2.51
+and route B from v0.2.50, rebuilding the v0.2.51 sources (`1758d94e64b0e7f31f22107f8556fd63dc4351c6`) twice; the
+default stays the v0.2.45 pair above. Adding a lineage is adding its two seed checksums and the bridge commit.
+
 Each source tree uses its own runtime, standard library and Nix shell.
 Candidate sources occupy `/build/source` on both builders, with a declared
 environment, fresh home, temporary and cache directories, no object-cache
@@ -144,7 +149,7 @@ The join verifies those records and the dispatched revision, and retains an
 exact-match or first-difference report. Trigger with the Actions UI or:
 
 ```sh
-gh workflow run bootstrap-convergence.yml --ref <branch-or-tag>
+gh workflow run bootstrap-convergence.yml --ref <branch-or-tag> -f lineage=v0.2.51
 ```
 
 This is historical-seed route assurance within one compiler lineage, not a

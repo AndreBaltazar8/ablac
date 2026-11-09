@@ -16,6 +16,28 @@ SEEDS = {
     "a": ("v0.2.45", "f30c9027a23923bcb97bb27d1b23f818e612e7aed157636d72db136aa56006f3"),
     "b": ("v0.2.44", "90a5614b3557221baf62a224160d4b42e884bcd18545af8475da22c096f03a98"),
 }
+# The pairs of routes the gate knows. A lineage names the tag whose source route B rebuilds (the "bridge"), the
+# route A seed (that tag's own release) and the route B seed (the release before it). The default is the first
+# pair the gate was built for; --lineage picks a newer one. Seeds are checksum-pinned release assets.
+LINEAGES = {
+    "v0.2.45": {"historical": HISTORICAL, "seeds": dict(SEEDS)},
+    "v0.2.51": {
+        "historical": "1758d94e64b0e7f31f22107f8556fd63dc4351c6",
+        "seeds": {
+            "a": ("v0.2.51", "d8e24762f3657cfc90289a6bc93ddcb6aa7b9df8338c93d4090e5b06319f4d7d"),
+            "b": ("v0.2.50", "aa40e582e66f40013571b7ef1311e9079582d0fbeffa7843d57707a18205b7a9"),
+        },
+    },
+}
+
+
+def configure(lineage):
+    """Select the pair of routes (the module-level HISTORICAL and SEEDS the rest of the gate reads)."""
+    global HISTORICAL, SEEDS
+    if lineage not in LINEAGES:
+        raise ValueError(f"unknown lineage {lineage}; known: {', '.join(sorted(LINEAGES))}")
+    HISTORICAL = LINEAGES[lineage]["historical"]
+    SEEDS = dict(LINEAGES[lineage]["seeds"])
 CANONICAL_ROOT = "/build/source"
 ENTRY = "src/orc_main.ab"
 
@@ -236,13 +258,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="mode", required=True)
     run = sub.add_parser("route")
+    run.add_argument("--lineage", default="v0.2.45", choices=sorted(LINEAGES))
     run.add_argument("route", choices=["a", "b"])
     run.add_argument("output", type=Path)
     join = sub.add_parser("compare")
+    join.add_argument("--lineage", default="v0.2.45", choices=sorted(LINEAGES))
     join.add_argument("a", type=Path)
     join.add_argument("b", type=Path)
     join.add_argument("output", type=Path)
     args = parser.parse_args()
+    configure(args.lineage)
     if args.mode == "route":
         route(args.route, Path(__file__).absolute().parent.parent, args.output.absolute())
     else:

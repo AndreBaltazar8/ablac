@@ -115,5 +115,48 @@ class ComparisonTests(unittest.TestCase):
             self.check()
 
 
+class LineageTests(unittest.TestCase):
+    """The pairs of routes the gate knows, selected by --lineage."""
+
+    def tearDown(self):
+        gate.configure("v0.2.45")
+
+    def test_default_is_the_first_pair(self):
+        self.assertEqual(gate.HISTORICAL, "ca9221b0615cd419284a9e8e9f671bf8429ccd3b")
+        self.assertEqual(gate.SEEDS["a"][0], "v0.2.45")
+        self.assertEqual(gate.SEEDS["b"][0], "v0.2.44")
+
+    def test_every_lineage_is_a_distinct_pinned_pair(self):
+        for name, lineage in gate.LINEAGES.items():
+            self.assertRegex(lineage["historical"], r"^[0-9a-f]{40}$", name)
+            self.assertEqual(sorted(lineage["seeds"]), ["a", "b"], name)
+            self.assertEqual(lineage["seeds"]["a"][0], name, "route A starts from the bridge tag's own release")
+            self.assertNotEqual(lineage["seeds"]["a"][0], lineage["seeds"]["b"][0], name)
+            for version, checksum in lineage["seeds"].values():
+                self.assertRegex(checksum, r"^[0-9a-f]{64}$", version)
+
+    def test_configure_selects_and_refuses(self):
+        gate.configure("v0.2.51")
+        self.assertEqual(gate.SEEDS["a"][0], "v0.2.51")
+        self.assertEqual(gate.SEEDS["b"][0], "v0.2.50")
+        self.assertEqual(gate.HISTORICAL, "1758d94e64b0e7f31f22107f8556fd63dc4351c6")
+        with self.assertRaisesRegex(ValueError, "unknown lineage"):
+            gate.configure("v9.9.9")
+        self.assertEqual(gate.SEEDS["a"][0], "v0.2.51", "a refused lineage leaves the selection alone")
+
+    def test_a_route_of_another_lineage_is_refused(self):
+        # A manifest built for the first pair must not pass the comparison of the newer one.
+        first = ComparisonTests("test_identical_complete_routes")
+        first.setUp()
+        try:
+            for directory, manifest in zip(first.dirs, first.manifests):
+                gate.write_json(directory / "manifest.json", manifest)
+            gate.configure("v0.2.51")
+            with self.assertRaisesRegex(ValueError, "wrong seed"):
+                gate.compare(*first.dirs, first.root / "comparison")
+        finally:
+            first.doCleanups()
+
+
 if __name__ == "__main__":
     unittest.main()
