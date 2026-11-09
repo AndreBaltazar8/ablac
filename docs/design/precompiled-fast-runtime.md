@@ -22,29 +22,40 @@ the shell for whole builds.
   fixed part is the runtime (216 functions in the emitted module of the empty program) plus the imported standard library.
 - **libLLVM's fixed share** (empty libLLVM instructions over the program's): fib 0.263 of 0.275 G (96%), maps
   0.263 of 0.335 (78%), unsafe-boundary 0.263 of 0.853 (31%). In whole-build terms the LLVM time that does not depend
-  on the program is 25% of fib's, 23% of maps' and 9% of unsafe-boundary's. (The program's own functions in fib are
+  on the program is 26% of fib's, 23% of maps' and 9% of unsafe-boundary's. (The program's own functions in fib are
   2 functions, 39 IR instructions; in maps 1 function, 277.)
 - With the link included (`perf stat`): empty 1.316 G, fib 1.405, maps 1.558 (units off, `--no-cache`).
 - **How alike the runtime is across programs.** Emitted IR (`--emit-llvm`) of the empty program, fib, maps and
   unsafe-boundary: all 216 runtime functions of the empty program exist in each of the others; the bodies are
   identical for 190 (fib), 177 (maps) and 175 (unsafe-boundary) of them, which is 84%, 80% and 77% of the runtime's IR
-  instructions. The rest differ in the declaration only: parameter attributes the program's use led the compiler to infer
-  (`byval(%AblaValue)` against `nofree readonly captures(none)` on `abla_string_data`, `abla_add`, `abla_null`),
-  an attribute group number, never the body (the ones I diffed: `abla_runtime_roots_push`, `abla_string_data`,
-  `abla_add`).
+  instructions. The remainder differs in the declaration: `byval(%AblaValue)` parameters on a runtime bridge against
+  plain `nofree readonly captures(none)` pointers (`abla_string_data`, `abla_add`, `abla_null`, ...). That is not LLVM's
+  attribute inference but our own pass, `bootstrapLlvmBridgeValuesByPointer` (`src/backend/llvm/runtime.ab`): after
+  `cgscc(function-attrs)` it strips `byval` from a self-hosted runtime bridge, and from every call site, when every value
+  parameter is read-only and every use of the bridge is a direct call, so the choice depends on the program (whether
+  any use takes the bridge's address, and what function-attrs finds through the bridge's callees).
+- **After optimization the module is small and its content depends on demand.** With the same fast passes
+  (`opt`, ending in `globaldce`) the emitted modules shrink to 6 functions (empty), 26 (fib), 36 (maps) and 175
+  (unsafe-boundary), most of the runtime having been inlined into the program's functions. Between fib and maps 25
+  functions have the same name and 23 of them are byte-identical (2,431 of fib's 2,665 instructions, 91%); against
+  unsafe-boundary 15 of 21 and 58%. So the optimized runtime code is largely shared, but the *set* of functions and
+  what was inlined into the program's own functions differ, and a unit that groups functions by source file changes
+  with the set.
 - **The existing code generation cache does not share the runtime between programs.** Units are cut after
   optimization and keyed by the unit's bitcode (`src/codegen_units.ab`), by default only for modules over 150,000
   instructions. Forcing units for small programs (`ABLA_CODEGEN_UNITS_MINIMUM=1`) with one cache: fib creates 8
   objects, maps 7 more, the empty program 5 more; maps with a cache warmed by fib costs 1.84 G instructions against
-  1.56 G for the default `--no-cache` build, and a cold units build costs 7 to 15% more than the default. Whole-program
-  attribute inference makes the same runtime function's unit differ between programs, so the keys miss.
+  1.56 G for the default `--no-cache` build, and a cold units build costs 7 to 15% more than the default. The keys miss
+  because a unit holds the functions its file contributes to *this* program (the reachable subset, with the bridge
+  `byval` choice above), so the same file gives a different unit for each program.
 - Standalone `opt` and `llc` runs on the emitted text IR (the same fast passes, FastISel) read opt 128 M and llc 29 M
   instructions for the empty program against 285 M and 94 M for fib, but parsing the text IR dominates them (running
   `globaldce` first changes opt by only -0.7% to -1.4% on the three programs), so I do not use them as the split.
 
-Verdict: the "same in every program" LLVM work is **20 to 28% of a small `--fast` build** (above 30% of the LLVM time
+Verdict: the "same in every program" LLVM work is **23 to 26% of a small `--fast` build** (9% of a 92 KB program) (above 30% of the LLVM time
 for every program measured, 78% to 96% for fib and maps). That is the ceiling of what linking a precompiled runtime can
-remove from LLVM; the other 58% (`ablac.bin`) is the frontend over the same runtime and imports, which is the item
+remove from LLVM; most of the rest is the compiler's own code (`ablac.bin` 56 to 58%, plus libc's malloc and memcpy,
+10 to 12%, which is also the compiler's), the frontend over the same runtime and imports, which is the item
 "Reuse the frontend's work on the standard library between builds" and which a runtime object alone does not touch
 (the runtime's source still has to be parsed and analyzed for its declarations, unless a declaration file replaces it).
 
@@ -61,6 +72,11 @@ remove from LLVM; the other 58% (`ablac.bin`) is the frontend over the same runt
    `--gc-sections` removes the unreferenced, but data tables the runtime owns (root frames, type and string
    tables, the GC's configuration `__ablaRuntimeHostGcGrowthConfigured`) must not depend on the program. Anything
    that does (per-program tables) stays generated and is passed in, not compiled into the object.
+   The set of runtime bridges itself depends on the program (`bootstrapLlvmRuntimeBridgeUsed`: for example
+   `abla_runtime_thread_entry` exists only if `abla_thread_create` is used), and so do the per-target inline marks
+   (`bootstrapLlvmNativeRuntimeInline`), so a unit keyed by file changes with the program. GC roots: the frame
+   pushes (`abla_runtime_roots_push` / `pop`) are program-independent only while the runtime treats frames as opaque;
+   the invariant to keep, and to check, is that no runtime function reads a per-program type or descriptor table.
 4. **Policies that change the runtime's code.** Float demand (#695: plain equality against the float-aware variants), the
    stack guard (`bootstrapLlvmStackGuard`, hosted executables only), the initializer chunk, `ABLA_FAST_INLINE_THRESHOLD`,
    debug info, strict imports, hosted against freestanding and every target. Each is either a second object variant (key:
@@ -74,27 +90,35 @@ remove from LLVM; the other 58% (`ablac.bin`) is the frontend over the same runt
 ## Options
 
 - **A. Fixed-ABI runtime object per (compiler, target, policy set)**, program modules `declare` it, link with
-  `--gc-sections`. Most gain (up to 20 to 28% of a small build), largest change: points 1 and 2 above.
-- **B. Post-optimization runtime units that do hit the cache across programs.** Make the runtime's functions
-  program-independent *before* the cut (no per-program attribute inference on them: infer attributes on the program's own
-  functions only; same body text), so the existing code generation cache keys match. Saves codegen only (the `llc` part,
-  the smaller half of LLVM), no ABI change, inlining unchanged because the cut is after optimization. Much smaller step;
-  the measurement above shows today's misses are about declarations.
+  `--gc-sections`. Most gain (up to 23 to 26% of a small build), largest change: points 1 and 2 above.
+- **B. Make the existing code generation cache hit across programs.** As first written (declarations
+  program-independent) this is not enough: the unit contents also follow the reachable subset. It needs both
+  (1) the bridges' `byval` choice pinned (never strip, or strip by a rule that does not look at the program: it costs the
+  copies the pass saves, measured on the benchmarks) and (2) a unit key per function (or per demand-independent group)
+  instead of per file: the object cache then holds each optimized function once, and a build links the ones it needs.
+  Codegen only (the `llc` part: 29 M of the empty and 94 M of fib's 379 M standalone, so at most 7% of a small build),
+  inlining unchanged because the cut stays after optimization. The cost is a per-function object boundary
+  (cross-function references become symbols, no cross-function scheduling), which FastISel `-O0` does not use.
 - **C. Do nothing about LLVM, take the frontend reuse first**: its estimate is larger (about half of a small build).
 
-Recommendation: **B first** (it tests the premise cheaply: do the runtime units hit across programs once their
-declarations agree, and how much of `llc` does that remove?), then decide A from the measured codegen share. The
-precompiled object (A) is worth designing in full only if B leaves most of the opt cost, since opt runs over the whole
-module either way.
+Recommendation, after the measurements above: B can remove only the codegen share (at most about 7% of a small build)
+and needs the bridge ABI pinned and a per-function key, so it is a smaller prize than the table suggests; the rest of the
+program-independent LLVM time is `opt` and module construction over all 216 runtime functions before `globaldce` removes
+the ones the program does not reach. The first thing to establish is where the empty program's 0.26 G libLLVM
+instructions go (experiment 1), because dropping unreachable runtime functions before they reach LLVM (and before
+the ablac side lowers and emits them) would remove it without an object, an ABI change or a cache.
 
 ## Experiments before any design is final
 
-1. For fib/maps/unsafe-boundary: instructions of the in-process `opt` step and of the FastISel step separately (a phase
-   counter in the compiler, not text IR), to split the 25% into opt and codegen.
-2. B's premise: make `abla_string_data`, `abla_add`, ... declarations program-independent (a flag that stops
-   interprocedural attribute inference on runtime functions) and count the units that hit with
-   `ABLA_CODEGEN_UNITS_MINIMUM=1` across fib, maps and the empty program.
-3. Run-time cost of pinning the ABI (point 1) on the eight `perf` benchmarks.
+1. Where the empty program's 0.26 G libLLVM instructions go: module construction and verification, the fast
+   passes over 216 functions, bitcode write and read, code generation of the 6 that survive, target setup (a phase
+   counter in the compiler, or `perf` with call graphs on a `-g` compiler; the flat symbol profile gives no answer).
+2. Prune the runtime functions the program cannot reach before LLVM sees them (and before lowering), as the local
+   `prune-dead-functions` branch did for release builds in 2026-11 (hello world 374 to 91 functions, 6 to 19% less CPU
+   on small release builds, but `readInteger` 54% slower from different inlining): measure small `--fast` builds
+   (CPU, run instructions on the eight benchmarks).
+3. B's premise: skip `bootstrapLlvmBridgeValuesByPointer`, force units for small programs
+   (`ABLA_CODEGEN_UNITS_MINIMUM=1`) and count the units that still miss across fib, maps and the empty program.
 
 The raw numbers behind the table are in the session scratch files; the commands are the ones named above
 (`perf record`/`perf stat` as quoted, `--emit-llvm` for the function comparison).
