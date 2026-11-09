@@ -149,10 +149,10 @@ maps −17.3%), and trees is up on both architectures (+10.8% / +14.9%; it was +
 so it is the one to look at first on a quiet machine. No regression is established.
 
 Sizes: stripped binaries are byte-identical on arm64 except `https-client` (+16,512 bytes, +10.6%) and
-`json-readers` (+16); on Intel `maps` grows 4,096 bytes (+9.0%, a page), `json-megabyte` 4,096 (+1.9%),
+`json-readers` (+16); on Intel `trees` and `json-readers` grow 8 bytes, `maps` grows 4,096 bytes (+9.0%, a page), `json-megabyte` 4,096 (+1.9%),
 `event-http-server` and `https-client` 4,096 each (+2.6% / +2.8%). Peak RSS: `maps` +9.4% on arm64 (144.1 to
-157.5 MiB) and +12.3% on Intel (132.4 to 148.7 MiB), outside the observed ranges on both and as the Linux maps peak RSS rise
-recorded in TODO.md does; `json-megabyte` falls 4.5% / 3.9%; every other program is
+157.5 MiB) and +12.3% on Intel (132.4 to 148.7 MiB), above the observed range on Intel and with overlapping ranges on arm64, matching the Linux maps rise
+in TODO.md; `json-megabyte` falls 4.5% / 3.9%; every other program is
 within ±3% (the small-RSS programs by a few hundredths of a MiB).
 
 ### arm64
