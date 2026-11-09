@@ -1201,6 +1201,20 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   itself is not possible: any write makes `find` a mutating receiver and 32 callers that
   only borrow the index fail `ownership.mutable-borrow`. Nothing changed.
 
+- **A flattened rope's copy read inline** (2026-11-09, master `0762174d`, release builds, one P-core; not
+  kept). `__ablaRuntimeStringData` sends every read of a rope through the noinline
+  `__ablaRuntimeStringDataSlow`, even when the rope's flat copy exists (6.1% of json-megabyte's instructions,
+  whose 15 MB document is built by concatenation). Reading the copy inline first (`__ablaRuntimeRopeFlat`, +40 and
+  its fence once threads run): json-megabyte 81.10 G to 78.75 G (-2.9%), strings -0.3%, websocket-codec -0.2%,
+  trees 0.0%, maps +0.1%, json-readers 0.0%, but stripped sizes grow where strings are read a lot:
+  json-readers +2.8%, json-megabyte +2.2%, websocket-codec +1.4%, the rest +0.0% to +0.4% (hello and fib
+  unchanged). In `__ablaRuntimeStringGetI64` alone (the byte read of a scanner's loop): json-megabyte -2.1%
+  (79.39 G), json-readers 0.0%, sizes json-readers +1.8%, json-megabyte +1.4%, websocket-codec +0.9%,
+  websocket-server-load +0.6%, the others 0.0%. Both exceed +0.5% on the size bar, so neither is kept. What
+  would hold the gain without the size: a flat string value for the scanner (the parse entry points reading
+  their `source` once into a flat string, which the rope's copy cannot give because a string value copies
+  the rope pointer), or a smaller inline form.
+
 ## Tried, not pursued
 
 - **JSON ASCII word scans without a short-string fast path** (2026-11-06/07,
