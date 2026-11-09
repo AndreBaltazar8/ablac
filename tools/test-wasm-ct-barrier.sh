@@ -11,8 +11,12 @@ out=build/wasm-ct-barrier
 rm -rf "$out"
 mkdir -p "$out"
 cp tests/cases/wasm-ct-barrier/mod.ab "$out/mod.ab"
+# The --fast module (the held-object route; a module big enough to be split into code generation units
+# takes the other route, which tests/cases/ct's whole fixture module exercises in test-ct.sh) and a release one.
 env -u ABLA_KEEP_LLVM_TEXT "$compiler" build tests/cases/wasm-ct-barrier/build.ab -o "$out/driver" --fast --no-cache
-[[ -s $out/ct-barrier.wasm ]] || { echo "wasm ct barrier: no module built" >&2; exit 1; }
+env -u ABLA_KEEP_LLVM_TEXT "$compiler" build tests/cases/wasm-ct-barrier/build-release.ab -o "$out/driver-release" --fast --no-cache
+for module in ct-barrier ct-barrier-release; do
+[[ -s $out/$module.wasm ]] || { echo "wasm ct barrier: no module $module built" >&2; exit 1; }
 node -e '
 const bytes = require("fs").readFileSync(process.argv[1]);
 const { exports } = new WebAssembly.Instance(new WebAssembly.Module(bytes), {
@@ -24,5 +28,6 @@ for (const [mask, a, b, want] of cases) {
     const got = pick(mask | 0, a | 0, b | 0) >>> 0;
     if (got !== (want >>> 0)) { console.error("pick", mask, a, b, "=", got, "expected", want >>> 0); process.exit(1); }
 }
-' "$out/ct-barrier.wasm"
-echo "wasm ct barrier: a --fast module with the barrier builds in process and selects"
+' "$out/$module.wasm"
+done
+echo "wasm ct barrier: a --fast and a release module with the barrier build in process and select"
