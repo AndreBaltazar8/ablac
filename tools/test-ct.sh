@@ -288,7 +288,7 @@ real_entries_run() {
 # are for, so tests/cases/ct/fast-known.txt lists the fixtures that fail and the class of finding. Any other
 # finding fails here, and so does a listed fixture that comes out clean (shrink the list), or one that fails
 # differently. The leaks must be caught as in release, the one a call down by following that call.
-# Only the x86-64 checker follows calls, and --fast builds are read for the host only (TODO.md).
+# The x86-64 and AArch64 checkers follow calls; Wasm and Xtensa don't (TODO.md).
 # How a finding of a fast build is classed. A trap is not a tag check by being a trap (ablaRuntimeTrap, unreachable
 # and the no-FMA fallback emit ud2 too): the build with debug info names the function and classes by it, and a
 # build without it, whose symbols are hashed, is held to the findings that build has (fast_read's third argument).
@@ -300,8 +300,8 @@ fast_class() { # finding text, whether a branch to a trap counts as a tag check
         *) echo other ;;
     esac
 }
-fast_read() { # arch, object, label suffix, "trap" to class a branch to a trap as a tag check
-    local arch=$1 object=$2 label=$1-fast${3:-} trap=${4:-}
+fast_read() { # arch, object, label suffix, "trap" to class a branch to a trap as a tag check, known findings (fast-known.txt)
+    local arch=$1 object=$2 label=$1-fast${3:-} trap=${4:-} known=${5:-$cases/fast-known.txt}
     local target_fixtures=("${fixtures[@]}" "${host_fixtures[@]}")
     $check --follow-calls "$arch" "$object" "${target_fixtures[@]}" > "$out/$label.log" 2>&1 || true
     local found=0 clean=0 name rest class
@@ -314,8 +314,8 @@ fast_read() { # arch, object, label suffix, "trap" to class a branch to a trap a
     done < <(grep '^LEAK' "$out/$label.log")
     clean=$(grep -c '^ok' "$out/$label.log" || true)
     sort -o "$out/$label.found" "$out/$label.found"
-    if ! diff -u <(sort "$cases/fast-known.txt") "$out/$label.found" > "$out/$label.diff"; then
-        cat "$out/$label.diff" >&2; echo "ct: the fast build's findings changed (tests/cases/ct/fast-known.txt)" >&2; exit 1
+    if ! diff -u <(sort "$known") "$out/$label.found" > "$out/$label.diff"; then
+        cat "$out/$label.diff" >&2; echo "ct: the fast build's findings changed ($known)" >&2; exit 1
     fi
     for leak in "${leaks[@]}"; do
         if $check --follow-calls "$arch" "$object" "$leak" > "$out/$label-leak.log" 2>&1; then
@@ -338,6 +338,42 @@ fast_read() { # arch, object, label suffix, "trap" to class a branch to a trap a
         echo "ct: a secret branch to a non-tag trap was classed as a tag check on $label: $trap_finding" >&2; exit 1
     }
     echo "ok   $label: $clean fixtures clean, $(wc -l < "$out/$label.found") listed in fast-known.txt, ${#leaks[@]} leaks caught, the callee leak found by following the call"
+}
+
+# The AArch64 checker follows calls too (bl to a function of the same object, a tail call): hand-written assembly,
+# with the specs listed in tests/cases/ct/follow-a64.s. The clean ones must pass; a branch, a result, a callee-saved
+# register or a stack slot that holds a secret after the call must be found (the first two in the callee itself);
+# recursion and an indirect call are refused; and without following the calls are refused.
+a64_follow_read() {
+    llvm-mc -triple aarch64-linux-gnu -filetype=obj "$cases/follow-a64.s" -o "$out/follow-a64.o"
+    ld.lld -static -e follow_clean "$out/follow-a64.o" -o "$out/follow-a64"
+    local spec
+    for spec in follow_clean:0 follow_stale:0 follow_public:0 follow_clobber:0; do
+        $check --follow-calls aarch64 "$out/follow-a64" "$spec" > "$out/follow-a64-clean.log" 2>&1 || {
+            cat "$out/follow-a64-clean.log" >&2; echo "ct: $spec was reported on aarch64" >&2; exit 1
+        }
+        grep -q 'following [1-9]' "$out/follow-a64-clean.log" || {
+            cat "$out/follow-a64-clean.log" >&2; echo "ct: $spec didn't follow its call on aarch64" >&2; exit 1
+        }
+        if $check aarch64 "$out/follow-a64" "$spec" > "$out/follow-a64-nofollow.log" 2>&1; then
+            echo "ct: $spec passed on aarch64 without following its call" >&2; exit 1
+        fi
+        grep -q 'LEAK.*call:' "$out/follow-a64-nofollow.log" || { cat "$out/follow-a64-nofollow.log" >&2; exit 1; }
+    done
+    local expected
+    for spec in follow_branch:0:'in callee_branch: secret branch' follow_tail:0:'in callee_branch: secret branch' \
+        follow_result:0:'secret branch' follow_saved:0:'secret branch' follow_stack:0:'secret branch' \
+        follow_recursive:0:'recursion into follow_recursive' follow_indirect:0:'call: blr'; do
+        expected=${spec#*:*:}
+        spec=${spec%:"$expected"}
+        if $check --follow-calls aarch64 "$out/follow-a64" "$spec" > "$out/follow-a64-leak.log" 2>&1; then
+            echo "ct: the checker missed $spec on aarch64 after following its call" >&2; exit 1
+        fi
+        grep -qF "$expected" "$out/follow-a64-leak.log" || {
+            cat "$out/follow-a64-leak.log" >&2; echo "ct: $spec on aarch64: expected '$expected'" >&2; exit 1
+        }
+    done
+    echo "ok   aarch64 call following: four clean calls read, seven leaks and refusals found, the calls refused without following"
 }
 
 # --- x86-64 ---------------------------------------------------------------------------
@@ -373,6 +409,9 @@ llvm-mc -triple aarch64-linux-gnu -filetype=obj tests/cases/simd/aarch64-start.s
 ld.lld -static --no-pie -z notext "$out/aarch64.o" "$out/aarch64-start.o" -o "$out/aarch64"
 qemu-aarch64 -cpu max "$out/aarch64" || { echo "ct aarch64: check $? failed" >&2; exit 1; }
 read_target aarch64 "$out/aarch64.o"
+a64_follow_read
+# A --fast build keeps every call: the checker follows each into its callee, defined in the same object.
+fast_read aarch64 "$out/aarch64-fast.o" "" "" "$cases/fast-known-aarch64.txt"
 
 # --- Wasm: the final module ----------------------------------------------------------
 "$compiler" build "$cases/build.ab" -o "$out/wasm-driver" --no-cache 2> "$out/wasm.log" || { cat "$out/wasm.log" >&2; exit 1; }

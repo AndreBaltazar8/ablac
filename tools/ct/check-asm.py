@@ -200,9 +200,10 @@ def stack_extent(name, seen=()):
 FOLLOW = {"path": None, "stack": [], "done": {}, "residue": False, "followed": set()}
 
 
-def follow_call(name, secret, pointers, text):
+def follow_call(name, secret, pointers, text, check=None):
     FOLLOW["followed"].add(name)
-    key = (name, tuple(secret), tuple(pointers))
+    check = check or check_x86
+    key = (check.__name__, name, tuple(secret), tuple(pointers))
     if key in FOLLOW["done"]:
         return FOLLOW["done"][key]
     if name in FOLLOW["stack"]:
@@ -216,7 +217,7 @@ def follow_call(name, secret, pointers, text):
         raise Violation(f"call: the disassembler can't read {name}: {unread[0]}")
     FOLLOW["stack"].append(name)
     try:
-        returned = check_x86(lines, secret, pointers)
+        returned = check(lines, secret, pointers)
     except Violation as violation:
         raise Violation(f"in {name}: {violation}")
     finally:
@@ -638,9 +639,111 @@ A64_FLAGS = re.compile(r"^(adds|subs|ands|bics|cmp|cmn|tst|ccmp|ccmn|adcs|sbcs|f
 A64_BRANCH_REG = re.compile(r"^(cbz|cbnz|tbz|tbnz)$")
 
 
+A64_ARGS = [f"x{i}" for i in range(8)] + [f"v{i}" for i in range(8)]
+# Registers a call may change (the AAPCS64 caller-saved ones: x0 to x18, v0 to v7 and v16 to v31); x19 to x30
+# and the low halves of v8 to v15 are the callee's to restore.
+A64_CLOBBERED = [f"x{i}" for i in range(19)] + [f"v{i}" for i in list(range(8)) + list(range(16, 32))]
+
+
+def a64_split(ops):
+    parts, depth, cur = [], 0, ""
+    for c in ops:
+        if c in "[{":
+            depth += 1
+        if c in "]}":
+            depth -= 1
+        if c == "," and depth == 0:
+            parts.append(cur.strip())
+            cur = ""
+        else:
+            cur += c
+    if cur.strip():
+        parts.append(cur.strip())
+    return parts
+
+
+A64_REGISTER = re.compile(r"\b[wxvbhsdq]\d+(?:\.\w+)?\b")
+A64_READS_ALL = re.compile(r"^(cmp|cmn|tst|ccmp|ccmn|fcmp|fccmp|cbz|cbnz|tbz|tbnz|str|stur|stp|stxr|stlr|stlxr|st1|st2|st3|st4|prfm|prfum)")
+A64_READS_DEST = re.compile(r"^(movk|bfi|bfxil|bfm|ins|bsl|bit|bif|sli|sri|aese|aesd|aesmc|aesimc|mla|mls|fmla|fmls|usra|ssra|umlal|smlal|fmadd)")
+
+
+def callee_inputs_a64(name):
+    """The argument registers (x0 to x7, v0 to v7) a function may read before it writes them: what its straight-line
+    start reads first; from the first branch, call or tail call on, every argument not yet written counts as read."""
+    written = set()
+    read = set()
+    for _, text in disassemble(FOLLOW["path"], name):
+        parts = text.split(None, 1)
+        op = parts[0]
+        ops = a64_split(parts[1]) if len(parts) > 1 else []
+        regs = [[a64_reg(r) for r in A64_REGISTER.findall(o)] for o in ops]
+        if op in ("cbz", "cbnz", "tbz", "tbnz"):
+            read |= {r for r in regs[0] if r not in written}
+        if op == "ret":
+            return read
+        if op in ("b", "bl", "blr", "br") or op.startswith("b.") or op in ("cbz", "cbnz", "tbz", "tbnz"):
+            return read | (set(A64_ARGS) - written)
+        loads = op.startswith(("ldr", "ldur", "ldp", "ldnp", "ldx", "ldar", "ld1", "ld2", "ld3", "ld4"))
+        memory = next((i for i, o in enumerate(ops) if "[" in o), None)
+        zeroing = op == "eor" and len(ops) == 3 and ops[1] == ops[2]
+        if A64_READS_ALL.match(op) and not loads:
+            destinations = 0
+        elif loads and memory is not None:
+            destinations = memory
+        else:
+            destinations = 1
+        for index, rs in enumerate(regs):
+            if index < destinations and not (A64_READS_DEST.match(op) and index == 0):
+                continue
+            if not zeroing:
+                read |= {r for r in rs if r not in written}
+        for rs in regs[:destinations]:
+            written |= set(rs)
+    return read | (set(A64_ARGS) - written)
+
+
+def follow_call_a64(name, tags, text):
+    """follow_call for the AArch64 checker: the callee starts with exactly these register tags."""
+    return follow_call(name, sorted(tags), [], text, check=check_aarch64)
+
+
 def check_aarch64(lines, secret, pointers):
     function_addresses = {address for address, _ in lines}
-    start = frozenset(f"x{i}" for i in secret) | frozenset(f"ptr:x{i}" for i in pointers)
+    # A spec gives argument numbers; a followed call gives the register tags it passes (x0, v1, ptr:x2).
+    start = (frozenset(i if isinstance(i, str) else f"x{i}" for i in secret) |
+             frozenset(f"ptr:x{i}" for i in pointers))
+    returned = []
+
+    def after_call(state, name, text):
+        """The state after a call to a function of the same object, checked as a function of its own on the
+        arguments the caller passes (only those it reads): what it hands back in x0, x1 and the vector
+        registers is what its own analysis found, the other caller-saved registers are dead, x19 and up stay."""
+        state = set(state)
+        if name == "abla_platform_panic":
+            # A panic ends the program, so what it does isn't read; it is reached only on a branch already
+            # required to be public, and no secret goes in (its one argument is a message).
+            if "x0" in state or "ptr:x0" in state:
+                raise Violation(f"call: a panic is given a secret or a pointer to one: {text}")
+            return frozenset(state)
+        inputs = callee_inputs_a64(name)
+        passed = frozenset(r for r in A64_ARGS if r in state and r in inputs)
+        pointed = frozenset("ptr:" + r for r in A64_ARGS if "ptr:" + r in state and r not in state and r in inputs)
+        out = follow_call_a64(name, passed | pointed, text)
+        frame_address = any(item.startswith(("stackbase:", "ptrslot:")) for item in state)
+        for r in A64_CLOBBERED:
+            for tag in (r, "ptr:" + r, "stackbase:" + r):
+                state.discard(tag)
+            if r in out:
+                state.add(r)
+            if "ptr:" + r in out:
+                state.add("ptr:" + r)
+        state.discard("flags")
+        # Memory it was given may now hold secrets. Once the function has made an address in its own frame
+        # (from sp), it may have been passed or kept in a callee-saved register, and the callee may have
+        # written through it: every slot read after a call is secret.
+        if frame_address:
+            state.add("frame-dirty")
+        return frozenset(state)
 
     def split(ops):
         parts, depth, cur = [], 0, ""
@@ -689,14 +792,24 @@ def check_aarch64(lines, secret, pointers):
                 raise Violation(f"secret branch: {text}")
             return frozenset(state)
         if op == "b":
-            # A jump out of the function is a call that returns for us (a tail call), and an unknown one.
-            target = re.search(r"0x([0-9a-f]+)", text)
+            # A jump out of the function is a call that returns for us (a tail call).
+            target = re.search(r"0x([0-9a-f]+)\s*<([^>+]+)>", text)
             if target and int(target.group(1), 16) not in function_addresses:
+                if not FOLLOW["path"]:
+                    raise Violation(f"call: {text}")
+                returned.append(after_call(state, target.group(2), text))
+            elif target is None and re.search(r"0x([0-9a-f]+)", text) and \
+                    int(re.search(r"0x([0-9a-f]+)", text).group(1), 16) not in function_addresses:
                 raise Violation(f"call: {text}")
             return frozenset(state)
         if op in ("ret", "nop", "brk", "hint", "bti", "paciasp", "autiasp", "udf", "dmb"):
             return frozenset(state)
-        if op in ("bl", "blr", "br"):
+        if op == "bl":
+            callee = re.search(r"<([^>+]+)>\s*$", text)
+            if not FOLLOW["path"] or not callee:
+                raise Violation(f"call: {text}")
+            return after_call(state, callee.group(1), text)
+        if op in ("blr", "br"):
             raise Violation(f"call: {text}")
         stack_change = (op in ("add", "sub", "mov") and ops and ops[0] == "sp") or (
             op.startswith(("ldr", "ldp", "str", "stp")) and
@@ -727,7 +840,7 @@ def check_aarch64(lines, secret, pointers):
                 pointer_base = any("ptr:" + reg in state for reg in inner)
                 frame = not inner or inner[0] != "x29" or "stackbase:x29" in state
                 slots = None if pointer_base or not frame else stack_bytes(memory, d, op, i)
-                value = tagged(slots, "") if slots is not None else True
+                value = (tagged(slots, "") or "frame-dirty" in state) if slots is not None else True
                 pointer = slots is not None and tagged(slots, "ptr")
                 (state.add if value else state.discard)(r)
                 (state.add if pointer else state.discard)("ptr:" + r)
@@ -806,7 +919,15 @@ def check_aarch64(lines, secret, pointers):
         out.append(i + 1)
         return out
 
-    fixpoint(lines, start, step, successors)
+    states = fixpoint(lines, start, step, successors)
+    # What the function leaves in its registers when it returns, for a caller that follows it.
+    out = set()
+    for i, (_, text) in enumerate(lines):
+        if text.split()[0] == "ret" and i in states:
+            out |= states[i]
+    for path in returned:
+        out |= path
+    return frozenset(out)
 
 
 # --- Xtensa (windowed ABI: arguments in a2 up) ----------------------------------------------
