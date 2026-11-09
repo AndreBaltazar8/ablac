@@ -483,6 +483,21 @@
 - [x] **Language server.** `abla-lsp` is the separate compiler-backed language server and
   transactional refactoring engine, using protocol 1 over `ablac analyze --stdio`.
   No native LSP adapter or Node dependency belongs in ablac.
+  Duplicate builds across scripts, 2026-11-09 (master `544efc82`, stage1 built from the v0.2.49 seed; every compiler
+  call of one full run logged through a wrapper passed as the compiler to `tools/run-tests.sh`: parent script, `ABLA_*`
+  environment, arguments with the `-o` value removed, source-file hash; `JOBS=8`, cold cache, calls made by other
+  compilers inside `test-self-hosted.sh` not seen): 2,479 `build` calls, 2,334 distinct (source, flags,
+  environment) keys, so 145 repeats (5.8%). Only 16 repeats are across different scripts (14 keys): the four
+  `--no-cache` hosted builds that `test-build-removed-outputs.sh` and `test-sidecar.sh` share, two invalid-program
+  diagnostics shared by `test-diagnostic-hints.sh` and `test-null-operators.sh`, `math-v8/interface.ab`
+  (`test-math-fast.sh`, `test-math-v8.sh`), `rsa-keygen/generate.ab` (`test-crypto.sh`, `test-crypto-pure.sh`) and
+  six single-source programs the driver builds that a shell script builds again. The other 129 repeats are one script
+  building the same thing again on purpose: `test-codegen-cache-race.sh` (32), `test-discovery-cache.sh`,
+  `test-build-killed.sh`, `test-compile-effects.sh`, the fuzzer: scripts that test the cache or the build itself.
+  1,371 of the 2,479 calls carry `--no-cache` (55%), so a shared cache would not reach them. A suite-wide cache
+  for identical (source, flags) builds would save about 0.6% of the builds (not CPU-weighted, but the shared
+  ones are small cases): a measured no-go, nothing changed. The suite's CPU is in distinct builds (the
+  frontend and LLVM per program), which is the compile-cost work above, not in repeats.
 - [ ] **Editor analysis integration.** Grow opt-in graph-aware analysis and indexed positional
   queries from the compiler's own parser/type APIs. Update abla-lsp separately after the compiler
   capabilities are validated; use the same parser-derived `ablac fmt` for formatting.
