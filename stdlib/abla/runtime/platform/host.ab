@@ -315,11 +315,13 @@ var __ablaRuntimeHostCollectionPages: int = 0
 var __ablaRuntimeHostCollectionPageMask: int = 0
 var __ablaRuntimeHostCollectionBitmaps: int = 0
 // A foreground collection first tries to find each candidate's allocation from the registry alone
-// (CollectionLazy; see __ablaRuntimeHostMarkPointer) and builds the page directory only when a
+// (CollectionMode 1; see __ablaRuntimeHostMarkPointer) and builds the page directory only when a
 // candidate is not a payload's start. The registry's lookup reads the word before the candidate, which
 // is safe only in memory the process has mapped: Mapped holds the readable and writable ranges
 // (start, end) of /proc/self/maps for the collection. NeedsDirectory remembers that a directory was needed.
-var __ablaRuntimeHostCollectionLazy: bool = false
+// 0: the directory answers; 1: lazy; 2: the directory answers and the registry's answer is checked
+// against it (ABLA_GC_STRESS=1).
+var __ablaRuntimeHostCollectionMode: int = 0
 var __ablaRuntimeHostCollectionNeedsDirectory: bool = false
 var __ablaRuntimeHostCollectionMapped: int = 0
 var __ablaRuntimeHostCollectionMappedCount: int = 0
@@ -1076,6 +1078,17 @@ trusted fun __ablaRuntimeHostCollectionIsMapped(address: int): bool {
     false
 }
 
+// Whether the registry's first and last headers are in the mapped ranges: a target whose heap
+// addresses carry tag bits (Android's tagged pointers) shows none of /proc/self/maps' untagged ones.
+trusted fun __ablaRuntimeHostCollectionRegistryMapped(): bool {
+    val registry = __ablaRuntimeHostRegistry
+    val slots = __ablaRuntimeHostRegistrySlots
+    val first = ablaRuntimeLoadI64(registry) & -16
+    val last = ablaRuntimeLoadI64(registry + (slots - 1) * 8) & -16
+    (first == 0 || __ablaRuntimeHostCollectionIsMapped(first)) &&
+        (last == 0 || __ablaRuntimeHostCollectionIsMapped(last))
+}
+
 // Every registered allocation into the page directory (or, when larger, the address-ordered
 // list of large allocations), in one pass over the registry: its entries say which are
 // large, so no header is read. A page's bitmap is placed when the page is first met (the
@@ -1304,41 +1317,45 @@ trusted fun __ablaRuntimeHostCollectionLocate(candidate: int): int {
         16))) large else 0
 }
 
+// The allocation holding `candidate` while the collection is lazy (mode 1) or checks the registry
+// against the directory (mode 2), or 0.
+@noinline
+trusted fun __ablaRuntimeHostCollectionFind(candidate: int): int {
+    // A payload's start: the word before it, 32 bytes back, is its slot in the registry, and that
+    // slot names this header. Anything else needs the page directory.
+    var exact = 0
+    val at = candidate - 32
+    if (u64(at) >= u64(__ablaRuntimeHostCollectionMinimum) && (at & 15) == 0 &&
+        (if (__ablaRuntimeHostCollectionMode == 1) __ablaRuntimeHostCollectionIsMapped(at)
+            else __ablaRuntimeHostCollectionBitmapOf(at >>> 16) != 0)) {
+        val slot = ablaRuntimeLoadI64(at)
+        if (u64(slot) < u64(__ablaRuntimeHostRegistrySlots) &&
+            (ablaRuntimeLoadI64(__ablaRuntimeHostRegistry + slot * 8) & -16) == at &&
+            ablaRuntimeLoadI64(at + 16) > 0) exact = at
+    }
+    if (__ablaRuntimeHostCollectionMode == 1) {
+        if (exact != 0) return exact
+        __ablaRuntimeHostCollectionMode = 0
+        __ablaRuntimeHostCollectionNeedsDirectory = true
+        __ablaRuntimeHostCollectionPagesBuild()
+        return __ablaRuntimeHostCollectionLocate(candidate)
+    }
+    // Under ABLA_GC_STRESS=1 every collection builds the directory: the registry's answer, where it
+    // has one, must be the directory's.
+    val header = __ablaRuntimeHostCollectionLocate(candidate)
+    if (exact != 0 && exact != header) ablaRuntimeTrap()
+    header
+}
+
 trusted fun __ablaRuntimeHostMarkPointer(candidate: int): bool {
     if (candidate == 0 || __ablaRuntimeHostCollectionCount == 0) {
         return false
     }
     if (u64(candidate) < u64(__ablaRuntimeHostCollectionMinimum) ||
         u64(candidate) >= u64(__ablaRuntimeHostCollectionMaximum)) return false
-    var header = 0
-    var exact = 0
-    if (__ablaRuntimeHostCollectionLazy || __ablaRuntimeHostGcStress) {
-        // A payload's start: the word before it, 32 bytes back, is its slot in the registry, and
-        // that slot names this header. Anything else needs the page directory.
-        val at = candidate - 32
-        if (u64(at) >= u64(__ablaRuntimeHostCollectionMinimum) && (at & 15) == 0 &&
-            (if (__ablaRuntimeHostCollectionLazy) __ablaRuntimeHostCollectionIsMapped(at)
-                else __ablaRuntimeHostCollectionBitmapOf(at >>> 16) != 0)) {
-            val slot = ablaRuntimeLoadI64(at)
-            if (u64(slot) < u64(__ablaRuntimeHostRegistrySlots) &&
-                (ablaRuntimeLoadI64(__ablaRuntimeHostRegistry + slot * 8) & -16) == at &&
-                ablaRuntimeLoadI64(at + 16) > 0) exact = at
-        }
-    }
-    if (__ablaRuntimeHostCollectionLazy) {
-        header = exact
-        if (header == 0) {
-            __ablaRuntimeHostCollectionLazy = false
-            __ablaRuntimeHostCollectionNeedsDirectory = true
-            __ablaRuntimeHostCollectionPagesBuild()
-            header = __ablaRuntimeHostCollectionLocate(candidate)
-        }
-    } else {
-        header = __ablaRuntimeHostCollectionLocate(candidate)
-        // Under ABLA_GC_STRESS=1 every collection builds the directory: the registry's answer,
-        // where it has one, must be the directory's.
-        if (exact != 0 && exact != header) ablaRuntimeTrap()
-    }
+    val header = if (__ablaRuntimeHostCollectionMode ==
+        0) __ablaRuntimeHostCollectionLocate(candidate)
+        else __ablaRuntimeHostCollectionFind(candidate)
     if (header == 0) return false
     val payload = header + 32
     val size = ablaRuntimeLoadI64(header + 16)
@@ -1412,8 +1429,8 @@ trusted fun __ablaRuntimeHostTraceMarkedAllocations(): void {
         val payload = header + 32
         if (layout == 0) {
             // Raw words are candidates of any value: only the directory may answer for them.
-            if (__ablaRuntimeHostCollectionLazy) {
-                __ablaRuntimeHostCollectionLazy = false
+            if (__ablaRuntimeHostCollectionMode == 1) {
+                __ablaRuntimeHostCollectionMode = 0
                 __ablaRuntimeHostCollectionNeedsDirectory = true
                 __ablaRuntimeHostCollectionPagesBuild()
             }
@@ -1651,13 +1668,16 @@ trusted fun __ablaRuntimePlatformMemoryCollect(): int {
     __ablaRuntimeHostCollectionCount = allocationCount
     __ablaRuntimeHostCollected = true
     __ablaRuntimeHostCollectionWorklistCount = 0
-    if (__ablaRuntimeHostGcStress || __ablaRuntimeHostCollectionNeedsDirectory ||
-        !__ablaRuntimeHostCollectionMappingsLoad()) {
-        __ablaRuntimeHostCollectionPagesBuild()
-    } else __ablaRuntimeHostCollectionLazy = true
+    __ablaRuntimeHostCollectionMode = 0
+    if (__ablaRuntimeHostGcStress) __ablaRuntimeHostCollectionMode = 2
+    else if (!__ablaRuntimeHostCollectionNeedsDirectory &&
+        __ablaRuntimeHostCollectionMappingsLoad() && __ablaRuntimeHostCollectionRegistryMapped()) {
+        __ablaRuntimeHostCollectionMode = 1
+    }
+    if (__ablaRuntimeHostCollectionMode != 1) __ablaRuntimeHostCollectionPagesBuild()
     __ablaRuntimeHostMarkRootValues()
     __ablaRuntimeHostTraceMarkedAllocations()
-    __ablaRuntimeHostCollectionLazy = false
+    __ablaRuntimeHostCollectionMode = 0
     free(ablaRuntimePointerFromAddress(__ablaRuntimeHostCollectionMapped))
     __ablaRuntimeHostCollectionMapped = 0
     __ablaRuntimeHostCollectionMappedCount = 0
