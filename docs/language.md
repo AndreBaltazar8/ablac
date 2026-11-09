@@ -196,7 +196,11 @@ panics with its runtime tag; WebAssembly traps without a message. An `f32` or
 `any` compares a value's kind as well as its bits: a boxed float never equals an
 integer, an `f32` never equals an `f64`, and two function values are equal only
 when they call the same function. Two floats of one kind compare as typed `==`
-does: a `NaN` equals nothing and `0.0` equals `-0.0`.
+does: a `NaN` equals nothing and `0.0` equals `-0.0`. A float on the other side
+of `==`, `!=` or a `when` case is boxed before it is compared, so the answer is
+the same as between two erased values: an erased `0` is not `0.0`, an erased
+string is not either, and a float literal is an `f64` there, so an erased `f32`
+equals `f32(1.5)` and not `1.5`.
 
 ### Raw text blocks
 
@@ -408,6 +412,15 @@ fun main {
   is negative or at least the width gives zero.
 - Mixing types (`f64 + int`, `string + int`) is `arithmetic.type`. Mixing
   bit-operation types is `bitwise.type`.
+- The wide types `uint256`, `int256`, `uint128` and `int128` follow the same rules
+  at their width (division by zero, the smallest signed value divided by `-1`,
+  shift counts, `>>` arithmetic for the signed ones) and at compile time. Each is
+  used after importing its module (`wideint.import` otherwise). They have no
+  literals: a value comes from a conversion with the type's name (`int128(-7)`) or from text or
+  bytes. Comparing one with an `int`
+  is `comparison.type` and mixing two of them in arithmetic is `arithmetic.type`;
+  none is a `Map` key (`map.key-type`) or a `when` subject (`secret.when`), and an
+  `@export` function can't use one in its signature (`simd.export`). See [numbers](stdlib/numbers.md).
 
 - An `int` argument for a parameter of a narrower type (`u8`, `i32`, ...) of
   a function, method or constructor is `integer.narrowing`: write `u8(value)`
