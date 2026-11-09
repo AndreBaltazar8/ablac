@@ -7,6 +7,7 @@ import "../../sema.ab"
 import "functions.ab"
 import "analysis.ab"
 import "exports.ab"
+import "debug.ab"
 
 fun bootstrapLlvmDeclareRuntime(
     backend: BootstrapLlvmBackend,
@@ -749,6 +750,30 @@ fun bootstrapLlvmBridgeSymbolSlot(symbol: string): int {
     slot
 }
 
+/** Adds `symbol` to the gathered set (a no-op when it is there). */
+fun bootstrapLlvmBridgeSymbolAdd(symbol: string): void {
+    var slot = bootstrapLlvmBridgeSymbolSlot(symbol)
+    if (bootstrapLlvmBridgeSymbols.slots[slot] < 0) {
+        // Half full at most: grow the table first.
+        if ((bootstrapLlvmBridgeSymbols.names.size + 1) * 2 >=
+            bootstrapLlvmBridgeSymbols.slots.size) {
+            bootstrapLlvmBridgeSymbols.slots =
+                bootstrapIrLookupSlots(bootstrapLlvmBridgeSymbols.slots.size)
+            var entry = 0
+            while (entry < bootstrapLlvmBridgeSymbols.names.size) {
+                bootstrapLlvmBridgeSymbols.slots[bootstrapLlvmBridgeSymbolSlot(
+                    bootstrapLlvmBridgeSymbols.names[entry]
+                )] = entry
+                entry = entry + 1
+            }
+            slot = bootstrapLlvmBridgeSymbolSlot(symbol)
+        }
+        bootstrapLlvmBridgeSymbols.slots[slot] = bootstrapLlvmBridgeSymbols.names.size
+        bootstrapLlvmBridgeSymbols.names.append(symbol)
+    }
+    return
+}
+
 fun bootstrapLlvmBridgeSymbolsGather(program: BootstrapIrProgram): void {
     var previous = ""
     var gathered = false
@@ -756,31 +781,70 @@ fun bootstrapLlvmBridgeSymbolsGather(program: BootstrapIrProgram): void {
         for (instruction in function.instructions) {
             val symbol = bootstrapLlvmRuntimeBridgeInstructionSymbol(instruction)
             // (Runs of one symbol are common: only a new one is looked up.)
-            if (!gathered || symbol != previous) {
-                var slot = bootstrapLlvmBridgeSymbolSlot(symbol)
-                if (bootstrapLlvmBridgeSymbols.slots[slot] < 0) {
-                    // Half full at most: grow the table first.
-                    if ((bootstrapLlvmBridgeSymbols.names.size + 1) * 2 >=
-                        bootstrapLlvmBridgeSymbols.slots.size) {
-                        bootstrapLlvmBridgeSymbols.slots =
-                            bootstrapIrLookupSlots(bootstrapLlvmBridgeSymbols.slots.size)
-                        var entry = 0
-                        while (entry < bootstrapLlvmBridgeSymbols.names.size) {
-                            bootstrapLlvmBridgeSymbols.slots[bootstrapLlvmBridgeSymbolSlot(
-                                bootstrapLlvmBridgeSymbols.names[entry]
-                            )] = entry
-                            entry = entry + 1
-                        }
-                        slot = bootstrapLlvmBridgeSymbolSlot(symbol)
-                    }
-                    bootstrapLlvmBridgeSymbols.slots[slot] = bootstrapLlvmBridgeSymbols.names.size
-                    bootstrapLlvmBridgeSymbols.names.append(symbol)
-                }
-                previous = symbol
-                gathered = true
-            }
+            if (!gathered || symbol != previous) bootstrapLlvmBridgeSymbolAdd(symbol)
+            previous = symbol
+            gathered = true
         }
     }
+    bootstrapLlvmBridgeSymbols.ready = true
+    return
+}
+
+// The bridges the backend itself calls whatever the program's instructions are: boxing and
+// unboxing of the scalar values every program passes through, string and function values,
+// closures, the roots and panic entries. A --fast build that emits only the bridges a
+// program needs (bootstrapLlvmPruneRuntime) keeps these; every other bridge is wanted only
+// when an instruction the program can reach maps to it (bootstrapLlvmRuntimeBridgeInstructionSymbol).
+// A bridge missing from this list that the backend emits by itself shows up as an
+// unresolved symbol at the native link, naming it.
+fun bootstrapLlvmBackendBridgeSymbols(): array<string> = [
+    "abla_void", "abla_null", "abla_i64", "abla_bool", "abla_as_i64", "abla_as_bool",
+    "abla_string_static", "abla_string_data", "abla_function", "abla_closure",
+    "abla_as_function", "abla_as_cstring", "abla_function_capture_count",
+    "abla_function_capture_pointer", "abla_function_capture", "abla_closure_release",
+    "abla_platform_panic", "abla_platform_free", "abla_runtime_roots_push",
+    "abla_runtime_roots_pop", "abla_runtime_recovery_enter", "abla_runtime_recovery_leave",
+    "abla_runtime_recovery_restore", "abla_runtime_panic_contain",
+    "abla_runtime_memory_pressure", "abla_runtime_memory_pressure_loop",
+    "abla_owned_bytes_from_value", "abla_owned_bytes_data", "abla_owned_bytes_length",
+    "abla_owned_bytes_release", "abla_array_length_i64", "abla_string_length_i64",
+    "abla_string_equal_bool", "abla_string_not_equal_bool", "abla_field_get", "abla_object_create",
+    "abla_array_create", "abla_vector_box", "abla_string_get_i64", "abla_array_get_i64",
+    "abla_array_get_bool"
+]
+
+// Families of bridges the backend or the standard library's natives reach without an instruction
+// the gather maps: field and object access (emitted around every class), generators, tasks and
+// threads (their steps and entries), and the text, JSON, byte and encoding natives the standard
+// library calls by name. They stay with the program whenever they are declared (found by sweeping
+// every program of the suite for an unresolved symbol with the bridge pruned).
+fun bootstrapLlvmBackendOwnedBridge(symbol: string): bool {
+    var owned = false
+    for (prefix in ["abla_field_", "abla_object_", "abla_generator_", "abla_task_", "abla_thread_",
+                    "abla_runtime_thread", "abla_await", "ablaText", "ablaJson", "ablaByte",
+                    "ablaBase64", "ablaUtf8", "abla_array_set"]) {
+        if (symbol.size >= prefix.size && symbol.slice(0, prefix.size) == prefix) owned = true
+    }
+    owned
+}
+
+/** The set for a pruned build: the symbols of the instructions of the functions in
+ *  `reachable`, and the backend's own. */
+fun bootstrapLlvmBridgeSymbolsGatherReachable(
+    program: BootstrapIrProgram,
+    reachable: array<bool>
+): void {
+    bootstrapLlvmBridgeSymbolsReset()
+    var index = 0
+    while (index < program.functions.size) {
+        if (index < reachable.size && reachable[index]) {
+            for (instruction in program.functions[index].instructions) {
+                bootstrapLlvmBridgeSymbolAdd(bootstrapLlvmRuntimeBridgeInstructionSymbol(instruction))
+            }
+        }
+        index = index + 1
+    }
+    for (symbol in bootstrapLlvmBackendBridgeSymbols()) bootstrapLlvmBridgeSymbolAdd(symbol)
     bootstrapLlvmBridgeSymbols.ready = true
     return
 }
@@ -789,6 +853,14 @@ fun bootstrapLlvmRuntimeBridgeUsed(
     program: BootstrapIrProgram,
     symbol: string
 ): bool {
+    if (bootstrapLlvmPruneBridgesFinal) {
+        var member = bootstrapLlvmBridgeSymbols.slots[bootstrapLlvmBridgeSymbolSlot(symbol)] >= 0 ||
+            bootstrapLlvmBackendOwnedBridge(symbol)
+        if (!member && symbol == "abla_runtime_thread_entry") {
+            member = bootstrapLlvmRuntimeBridgeUsed(program, "abla_thread_create")
+        }
+        return member
+    }
     var used = !bootstrapLlvmOptionalRuntimeBridge(symbol)
     if (!used) {
         if (!bootstrapLlvmBridgeSymbols.ready) bootstrapLlvmBridgeSymbolsGather(program)

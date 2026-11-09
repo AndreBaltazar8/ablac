@@ -193,22 +193,48 @@ fun bootstrapEmitLlvmProgramPrepared(
     // iOS. Follow those edges from the exported runtime graph instead.
     val ios = bootstrapLlvmTargetIsIOS(targetTriple)
     val initialNativeRoots: array<bool> = if (ios) [] else nativeFunctionRoots
-    // Pruning: the runtime functions a used bridge forwards to are roots; the rest are
-    // emitted only if the program reaches them.
-    if (bootstrapLlvmPruneRuntime && !bootstrapLlvmTargetHasClosedProgramBoundary(targetTriple)) {
-        var pruneIndex = 0
-        while (pruneIndex < program.functions.size) {
-            val pruneSymbol = bootstrapLlvmSelfHostedRuntimeSymbol(program.functions[pruneIndex].name)
-            if (pruneSymbol != "" && bootstrapLlvmRuntimeBridgeUsed(program, pruneSymbol)) {
-                initialNativeRoots[pruneIndex] = true
-                linuxWriteStandardError("prune-root ${program.functions[pruneIndex].name} $pruneSymbol\n")
+    // Pruning (--fast, hosted): the roots are main, the globals and the exports, plus the runtime
+    // function behind each bridge the reachable code needs. Which bridges those are depends on the
+    // reachable instructions and on the roots, so it is settled by iteration: reach from the roots,
+    // gather the bridges the reachable instructions call (and the backend's own), add their
+    // implementations as roots, until nothing is added.
+    val reachRoots: array<bool> = []
+    for (flag in initialNativeRoots) reachRoots.append(flag)
+    val pruning = bootstrapLlvmPruneRuntime && !bootstrapLlvmTargetHasClosedProgramBoundary(targetTriple)
+    bootstrapLlvmPruneBridgesFinal = false
+    bootstrapLlvmPruneActive = pruning
+    if (pruning) {
+        var changed = true
+        var rounds = 0
+        while (changed && rounds < 32) {
+            changed = false
+            rounds = rounds + 1
+            val settled = bootstrapLlvmReachableExports(
+                program, exports, functionIndex,
+                interruptHandlerRoots, reachRoots, ios
+            )
+            bootstrapLlvmBridgeSymbolsGatherReachable(program, settled.functions)
+            var pruneIndex = 0
+            while (pruneIndex < program.functions.size) {
+                if (!reachRoots[pruneIndex]) {
+                    val pruneSymbol = bootstrapLlvmSelfHostedRuntimeSymbol(program.functions[pruneIndex].name)
+                    if (pruneSymbol != "" && (
+                        bootstrapLlvmBackendOwnedBridge(pruneSymbol) ||
+                        bootstrapLlvmBridgeSymbols.slots[bootstrapLlvmBridgeSymbolSlot(pruneSymbol)] >= 0 ||
+                        (pruneSymbol == "abla_runtime_thread_entry" &&
+                         bootstrapLlvmBridgeSymbols.slots[bootstrapLlvmBridgeSymbolSlot("abla_thread_create")] >= 0))) {
+                        reachRoots[pruneIndex] = true
+                        changed = true
+                    }
+                }
+                pruneIndex = pruneIndex + 1
             }
-            pruneIndex = pruneIndex + 1
         }
+        bootstrapLlvmPruneBridgesFinal = true
     }
     val exportReachability = bootstrapLlvmReachableExports(
         program, exports, functionIndex,
-        interruptHandlerRoots, initialNativeRoots, ios
+        interruptHandlerRoots, if (pruning) reachRoots else initialNativeRoots, ios
     )
     if (ios) {
         index = 0
@@ -225,20 +251,9 @@ fun bootstrapEmitLlvmProgramPrepared(
     index = 0
     while (index < program.functions.size) {
         emittedFunctions.append(
-            (!closedProgram && !bootstrapLlvmPruneRuntime) || exportReachability.functions[index]
+            (!closedProgram && !pruning) || exportReachability.functions[index]
         )
         index = index + 1
-    }
-    if (bootstrapLlvmPruneRuntime) {
-        var emittedCount = 0
-        var debugIndex = 0
-        while (debugIndex < program.functions.size) {
-            if (emittedFunctions[debugIndex]) emittedCount = emittedCount + 1
-            if (program.functions[debugIndex].name == "__ablaRuntimeVoid" || bootstrapTextContains(program.functions[debugIndex].name, "RuntimeVoid"))
-                linuxWriteStandardError("prune-fn ${program.functions[debugIndex].name} emitted=${emittedFunctions[debugIndex]} reach=${exportReachability.functions[debugIndex]}\n")
-            debugIndex = debugIndex + 1
-        }
-        linuxWriteStandardError("prune-emitted $emittedCount of ${program.functions.size}\n")
     }
     // A float `%` on WebAssembly calls the platform's fmod
     // (bootstrapLlvmEmitScalarOperation), which no export reaches.
