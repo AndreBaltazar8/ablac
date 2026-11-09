@@ -1193,7 +1193,140 @@ WASM_BINARY = re.compile(r"^(i32|i64|f32|f64|v128|i8x16|i16x8|i32x4|i64x2|f32x4|
 WASM_UNARY = re.compile(r"^(i32|i64|f32|f64|v128|i8x16|i16x8|i32x4|i64x2|f32x4|f64x2)\.(eqz|clz|ctz|popcnt|wrap_i64|extend\w*|trunc\w*|convert\w*|reinterpret\w*|promote\w*|demote\w*|not|neg|abs|sqrt|splat|any_true|all_true|bitmask|extract_lane\w*)\b")
 
 
-def check_wasm(lines, secret, pointers):
+WASM_MODULES = {}
+
+
+def wasm_leb(data, at):
+    value, shift = 0, 0
+    while True:
+        byte = data[at]
+        at += 1
+        value |= (byte & 0x7F) << shift
+        shift += 7
+        if not byte & 0x80:
+            return value, at
+
+
+def wasm_module(path):
+    """What a call needs of a linked module: the parameter and result counts of its types, which type each
+    function has, how many functions are imports (they come first in the index space), and the instructions of
+    every defined function in order (names may be stripped, so a call is followed by its index)."""
+    if path in WASM_MODULES:
+        return WASM_MODULES[path]
+    data = open(path, "rb").read()
+    types, functions, imports, exports = [], [], 0, {}
+    at = 8
+    while at < len(data):
+        section = data[at]
+        size, body = wasm_leb(data, at + 1)
+        end = body + size
+        if section == 1:
+            count, i = wasm_leb(data, body)
+            for _ in range(count):
+                i += 1  # 0x60
+                params, i = wasm_leb(data, i)
+                i += params  # one byte a value type
+                results, i = wasm_leb(data, i)
+                i += results
+                types.append((params, results))
+        elif section == 2:
+            count, i = wasm_leb(data, body)
+            for _ in range(count):
+                for _ in range(2):  # module and field names
+                    length, i = wasm_leb(data, i)
+                    i += length
+                kind = data[i]
+                i += 1
+                if kind == 0:
+                    _, i = wasm_leb(data, i)
+                    imports += 1
+                elif kind == 1:
+                    i += 1
+                    flag = data[i]
+                    i += 1
+                    _, i = wasm_leb(data, i)
+                    if flag & 1:
+                        _, i = wasm_leb(data, i)
+                elif kind == 2:
+                    flag = data[i]
+                    i += 1
+                    _, i = wasm_leb(data, i)
+                    if flag & 1:
+                        _, i = wasm_leb(data, i)
+                elif kind == 3:
+                    i += 2
+                else:
+                    i += 1
+                    _, i = wasm_leb(data, i)
+        elif section == 3:
+            count, i = wasm_leb(data, body)
+            for _ in range(count):
+                index, i = wasm_leb(data, i)
+                functions.append(index)
+        elif section == 7:
+            count, i = wasm_leb(data, body)
+            for _ in range(count):
+                length, i = wasm_leb(data, i)
+                name = data[i:i + length].decode("utf-8", "replace")
+                i += length
+                kind = data[i]
+                index, i = wasm_leb(data, i + 1)
+                if kind == 0:
+                    exports[name] = index
+        at = end
+    text = subprocess.run([OBJDUMP, "-d", "--no-show-raw-insn", path], capture_output=True, text=True, check=True).stdout
+    bodies = []
+    for line in text.splitlines():
+        if re.match(r"^[0-9a-f]+ <.*>:$", line):
+            bodies.append([])
+        elif bodies:
+            m = re.match(r"^\s*([0-9a-f]+):\s*(.*)$", line)
+            if m:
+                bodies[-1].append((int(m.group(1), 16), m.group(2).split("//")[0].strip()))
+    bodies = bodies[1:]  # the first header is the CODE section itself
+    if len(bodies) != len(functions):
+        raise Violation(f"call: {path} has {len(functions)} functions but {len(bodies)} disassembled")
+    WASM_MODULES[path] = (types, functions, imports, bodies, exports)
+    return WASM_MODULES[path]
+
+
+def wasm_export_lines(path, name):
+    """The instructions of the function a module exports under `name` (a module built without a name section has
+    no symbol to disassemble by), or None."""
+    _types, _functions, imports, bodies, exports = wasm_module(path)
+    index = exports.get(name)
+    if index is None or index < imports:
+        return None
+    return bodies[index - imports]
+
+
+def follow_wasm(index, secret, pointers, text):
+    """Check the function `index` of the module on the arguments the caller passes; what it returns, per result."""
+    types, functions, imports, bodies, _exports = wasm_module(FOLLOW["path"])
+    FOLLOW["followed"].add(f"function {index}")
+    if index < imports:
+        raise Violation(f"call: function {index} is an import: {text}")
+    if index - imports >= len(functions):
+        raise Violation(f"call: no function {index} in the module: {text}")
+    key = ("wasm", index, tuple(secret), tuple(pointers))
+    if key in FOLLOW["done"]:
+        return FOLLOW["done"][key]
+    if ("wasm", index) in FOLLOW["stack"]:
+        raise Violation(f"call: recursion into function {index}: {text}")
+    lines = bodies[index - imports]
+    results = types[functions[index - imports]][1]
+    FOLLOW["stack"].append(("wasm", index))
+    try:
+        returned = check_wasm(lines, secret, pointers, results)
+    except Violation as violation:
+        raise Violation(f"in function {index}: {violation}")
+    finally:
+        FOLLOW["stack"].pop()
+    FOLLOW["done"][key] = returned
+    return returned
+
+
+def check_wasm(lines, secret, pointers, results=0):
     # Function parameters are locals. The stack's shape follows from each instruction, and the
     # lines are visited in order several times to carry what locals pick up around loops.
     # Each pass starts at the function's entry; a loop's head joins what its back edges brought in
@@ -1201,6 +1334,13 @@ def check_wasm(lines, secret, pointers):
     heads = {}
     for _ in range(64):
         before = {k: (set(v[0]), set(v[1])) for k, v in heads.items()}
+        returned = []
+
+        def record_return():
+            # The top `results` values of the stack, as the caller of a followed function receives them.
+            top = stack[-results:] if results and len(stack) >= results else [(True, False)] * results
+            returned.append(top)
+
         locals_tainted = set(secret)
         pointer_locals = set(pointers)
         stack = []
@@ -1244,6 +1384,8 @@ def check_wasm(lines, secret, pointers):
             if op in ("else", "end"):
                 entry = control.pop() if control else None
                 if entry is None:
+                    if not unreachable:
+                        record_return()
                     continue  # the function's own end
                 if not unreachable:
                     entry["exit_tainted"].update(locals_tainted)
@@ -1275,6 +1417,8 @@ def check_wasm(lines, secret, pointers):
                     stack.pop()
                 continue
             if op in ("return", "unreachable"):
+                if op == "return":
+                    record_return()
                 unreachable = True
                 continue
             if op == "br":
@@ -1329,6 +1473,19 @@ def check_wasm(lines, secret, pointers):
                 b = stack.pop() if stack else (False, False)
                 a = stack.pop() if stack else (False, False)
                 stack.append((a[0] or b[0] or c[0], a[1] or b[1]))
+            elif op == "call" and FOLLOW["path"] and len(parts) > 1 and parts[1].isdigit():
+                index = int(parts[1])
+                types, functions, imports, _bodies, _exports = wasm_module(FOLLOW["path"])
+                if index < imports or index - imports >= len(functions):
+                    raise Violation(f"call: {text}")
+                params, outputs = types[functions[index - imports]]
+                arguments = [stack.pop() if stack else (False, False) for _ in range(params)][::-1]
+                passed = [i for i, a in enumerate(arguments) if a[0]]
+                pointed = [i for i, a in enumerate(arguments) if a[1] and not a[0]]
+                out = follow_wasm(index, passed, pointed, text)
+                for position in range(outputs):
+                    column = [row[position] for row in out if len(row) > position]
+                    stack.append((any(c[0] for c in column), any(c[1] for c in column)))
             elif op in ("call", "call_indirect"):
                 raise Violation(f"call: {text}")
             elif re.match(r"^(i32|i64)\.(div|rem)_", op):
@@ -1351,7 +1508,7 @@ def check_wasm(lines, secret, pointers):
             else:
                 raise Violation(f"instruction this checker doesn't know: {text}")
         if {k: (set(v[0]), set(v[1])) for k, v in heads.items()} == before:
-            return
+            return returned
     raise SystemExit("no fixed point")
 
 
@@ -1386,7 +1543,9 @@ def main():
     failed = 0
     for spec in specs:
         name, secret, pointers = parse_spec(spec)
-        lines = disassemble(path, name, ["--mcpu=esp32"] if arch == "xtensa" else [])
+        lines = wasm_export_lines(path, name) if arch == "wasm" else None
+        if lines is None:
+            lines = disassemble(path, name, ["--mcpu=esp32"] if arch == "xtensa" else [])
         # What the disassembler can't read could be anything: a pass over it would mean nothing.
         unread = [text for _, text in lines if "unknown" in text]
         if unread:
