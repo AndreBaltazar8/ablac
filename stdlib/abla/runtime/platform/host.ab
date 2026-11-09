@@ -12,9 +12,19 @@ trusted noescape extern:"c" fun write(
     data: i64*,
     length: int
 ): int
-trusted noescape extern:"c" fun open(path: i64*, flags: int): int
-trusted noescape extern:"c" fun read(descriptor: int, data: i64*, length: int): int
-trusted noescape extern:"c" fun close(descriptor: int): int
+// The raw system call and the target's architecture, as abla/sys/linux and abla/simd/target declare them
+// (the runtime does not import them): the collection reads /proc/self/maps through the former, so a
+// freestanding guest needs no libc open, read or close.
+trusted noescape extern:"intrinsic" fun ablaLinuxSyscall(
+    number: int,
+    argument0: int,
+    argument1: int,
+    argument2: int,
+    argument3: int,
+    argument4: int,
+    argument5: int
+): int
+trusted noescape extern:"intrinsic" fun ablaSimdTargetArch(): int
 trusted noescape extern:"c" fun _exit(status: int): void
 trusted noescape extern:"c" fun _longjmp(buffer: i64*, value: int): void
 trusted noescape extern:"c" fun getenv(name: i64*): i64*
@@ -1005,8 +1015,14 @@ trusted fun __ablaRuntimeHostCollectionForceConfigured(): int {
 // order. False when there is no /proc (the collection then builds its directory as always).
 trusted fun __ablaRuntimeHostCollectionMappingsLoad(): bool {
     if (__ablaRuntimeHostCollectionForce == 2) return false
-    val descriptor = open(
-        ablaRuntimePointerFromAddress(__ablaRuntimeWord0("/proc/self/maps")), 0
+    // x86-64 and AArch64 Linux, the Darwin adapter taking both numbering (openat, read, close).
+    val arch = ablaSimdTargetArch()
+    if (arch != 1 && arch != 2) return false
+    val openat = if (arch == 1) 257 else 56
+    val readNumber = if (arch == 1) 0 else 63
+    val closeNumber = if (arch == 1) 3 else 57
+    val descriptor = ablaLinuxSyscall(
+        openat, -100, __ablaRuntimeWord0("/proc/self/maps"), 0, 0, 0, 0
     )
     if (descriptor < 0) return false
     var capacity = 65536
@@ -1022,8 +1038,8 @@ trusted fun __ablaRuntimeHostCollectionMappingsLoad(): bool {
                 capacity))
             if (buffer == 0) __ablaRuntimeHostOutOfMemory()
         }
-        val got = read(descriptor, ablaRuntimePointerFromAddress(buffer + length),
-            capacity - length - 1)
+        val got = ablaLinuxSyscall(readNumber, descriptor, buffer + length, capacity - length - 1,
+            0, 0, 0)
         if (got < 0) failed = true
         if (got <= 0) reading = false else length = length + got
         // A process with thousands of mappings: parsing them all costs more than the directory.
@@ -1032,7 +1048,7 @@ trusted fun __ablaRuntimeHostCollectionMappingsLoad(): bool {
             reading = false
         }
     }
-    close(descriptor)
+    ablaLinuxSyscall(closeNumber, descriptor, 0, 0, 0, 0, 0)
     // A read that failed (seccomp, a container) leaves a list cut short, and the heap's ranges
     // may be past its end: the collection builds its directory instead.
     if (failed) {
