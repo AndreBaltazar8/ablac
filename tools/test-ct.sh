@@ -309,7 +309,11 @@ fast_read() { # arch, object, label suffix, "trap" to class a branch to a trap a
     grep -Eq 'ct_leak_callee: in [^:]+: secret branch' <($check --follow-calls "$arch" "$object" ct_leak_callee:0 2>&1) || {
         echo "ct: the leak inside a callee wasn't found by following the call" >&2; exit 1
     }
-    # A trap that is not a tag check is a finding of its own, so it can't hide in a listed fixture's class.
+    # A trap that is not a tag check is a finding of its own, so it can't hide in a listed fixture's class. The build
+    # with debug info owns this assertion (the build without it classes any trap as a tag check and is held to the
+    # findings of that one). The limit: classification is per fixture and the checker stops at its first violation, so
+    # a trap-shaped leak after the tag check inside an already listed fixture hides in both builds, as it did when
+    # the class came from the function's name.
     local trap_finding
     trap_finding=$($check --follow-calls "$arch" "$object" ct_leak_trap:0 2>&1 | grep '^LEAK' || true)
     [[ -n $trap_finding ]] || { echo "ct: the checker missed ct_leak_trap on $label" >&2; exit 1; }
