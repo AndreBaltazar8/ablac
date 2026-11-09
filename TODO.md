@@ -1201,6 +1201,15 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   split by `mprotect`) costs 1.7 K instructions a line in a `--fast` build, so a list over 256 KiB gives up
   and builds the directory; a failed read does the same. `ABLA_GC_LOOKUP=directory|nomaps|untagged` forces each
   fallback and `memoryHeapStat(5)` / `(6)` count the collections that went each way (`tools/test-gc-lookup.sh`).
+  Limits accepted (review of ablac-f3-2): the list holds only anonymous ranges (inode 0), so a file mapping read past
+  its truncated end cannot fault the lookup; MTE tag mismatches and another thread's `munmap` during the marking
+  (a foreign pthread from an FFI library) are not covered; the first collection issues one `openat`, which a
+  seccomp profile that kills instead of answering an error would punish; the read buffer is one 260 KiB block
+  freed after the marking, so its own range is never stale; after an interior pointer the directory is used for
+  16 collections before the lazy lookup is tried again. The AArch64 system call numbers (56, 63, 57) are
+  checked by reading only: no AArch64 run reaches the real calls (the libc-free guests answer `syscall` with
+  the kernel's, and their tests pass through the lookup unchanged). The raw-word switch and the
+  interior-pointer fallback are not told apart by the counters (both count a directory build).
   Release builds, instructions, vs master `98c5c7a2`: trees 11,742.5 M to 10,767.2 M (-8.3%), strings
   2,036.9 M to 1,926.6 M (-5.4%), maps 2,560.8 M to 2,500.1 M (-2.4%), same output.
 - [ ] **Name lookups in lowering.** Over a game server's `--emit-llvm` the method index's
