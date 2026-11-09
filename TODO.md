@@ -1182,6 +1182,19 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   (2,036.9 M to 2,026.7 M), maps -0.18%; the bar of 3% for the collector is not met. The bitmap word updated per
   entry could be held across entries of one page (3 instructions of about 24), under 0.5% and bitmaps can move on
   growth, so not tried. What would still cut it is a collector whose cost follows what is live.
+  Directory kept across collections (asked for 2026-11-09), analysed and not built: in trees almost every
+  allocation is registered, built into the directory once and swept once, so keeping the bits saves nothing
+  and the sweep would pay to clear the bit of every garbage block (a page-table probe each, about the
+  cost of the build it replaces); only a long-lived heap re-built every collection would gain.
+  Tried instead (branch `collector-lazy`): finding a candidate's allocation from the registry alone for a
+  payload's start (the word 32 bytes back is its registry slot and the slot names the header), building
+  the directory only when a candidate is not a payload's start. Without any guard it cuts trees 6.4%,
+  strings 3.0%, maps 1.2% instructions, but the read of the word before a candidate is a wild read for a
+  garbage word in a scanned slot (a raw-word block, unfilled storage) that lands in the heap's span
+  over a gap; with a set of the pages that hold a header (one registry pass: the lowest and highest
+  header and the page set, `calloc`ed table) it is safe and cuts trees 1.9%, strings 1.8%, maps 0.8% with
+  the locals above included: the set's pass costs about 20 instructions an allocation, little under the
+  directory build's 24 plus lookups. Not worth its risk against the 3% bar.
 - [ ] **Name lookups in lowering.** Over a game server's `--emit-llvm` the method index's
   `find` was 200 of 3,552 samples, the declaration index's 148 and the name hashes 98 and
   76. Done: the method index hashes owner and name in place instead of a key string made
