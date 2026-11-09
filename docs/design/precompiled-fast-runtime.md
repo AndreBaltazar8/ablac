@@ -38,9 +38,9 @@ the shell for whole builds.
   objects, maps 7 more, the empty program 5 more; maps with a cache warmed by fib costs 1.84 G instructions against
   1.56 G for the default `--no-cache` build, and a cold units build costs 7 to 15% more than the default. Whole-program
   attribute inference makes the same runtime function's unit differ between programs, so the keys miss.
-- Standalone `opt`/`llc` on the emitted text IR (the same fast passes, FastISel) put the empty program at 157 M of fib's
-  379 M and 41% of... but text-IR parsing dominates it (`globaldce` first changes opt by only -0.7% to -1.4% on the
-  three programs), so I do not use it.
+- Standalone `opt` and `llc` runs on the emitted text IR (the same fast passes, FastISel) read opt 128 M and llc 29 M
+  instructions for the empty program against 285 M and 94 M for fib, but parsing the text IR dominates them (running
+  `globaldce` first changes opt by only -0.7% to -1.4% on the three programs), so I do not use them as the split.
 
 Verdict: the "same in every program" LLVM work is **20 to 28% of a small `--fast` build** (above 30% of the LLVM time
 for every program measured, 78% to 96% for fib and maps). That is the ceiling of what linking a precompiled runtime can
