@@ -176,3 +176,31 @@ follow_indirect:
 	callx8	a8
 	retw.n
 	.size	follow_indirect, .-follow_indirect
+
+// A compiler-rt shift helper (outside the object, accepted only with public operands where it branches on them): the
+// count is its third word (a4 of the callee, our a12).
+//   follow_shift_public:0   a secret value shifted by a constant count: clean
+//   follow_shift_secret:0   a secret count: found, "secret shift count"
+	.align	4
+	.global	follow_shift_public
+	.type	follow_shift_public,@function
+follow_shift_public:
+	entry	a1, 32
+	mov.n	a10, a2
+	mov.n	a11, a3
+	movi.n	a12, 3
+	call8	__ashldi3
+	retw.n
+	.size	follow_shift_public, .-follow_shift_public
+
+	.align	4
+	.global	follow_shift_secret
+	.type	follow_shift_secret,@function
+follow_shift_secret:
+	entry	a1, 32
+	movi.n	a10, 1
+	movi.n	a11, 0
+	mov.n	a12, a2
+	call8	__ashldi3
+	retw.n
+	.size	follow_shift_secret, .-follow_shift_secret

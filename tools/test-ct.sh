@@ -454,7 +454,9 @@ wasm_follow_read() {
         grep -q 'LEAK.*call:' "$out/follow-wasm-nofollow.log" || { cat "$out/follow-wasm-nofollow.log" >&2; exit 1; }
     done
     for spec in follow_branch:0:'in function [0-9]*: secret branch' follow_result:0:'secret branch' \
-        follow_store:0:'secret branch' follow_recursive:0:'recursion into function' follow_indirect:0,1:'call: call_indirect'; do
+        follow_store:0:'secret branch' follow_return_block:0:'secret branch' follow_br_return:0:'secret branch' \
+        follow_br_table:0:'secret branch' \
+        follow_recursive:0:'recursion into function' follow_indirect:0,1:'call: call_indirect'; do
         expected=${spec#*:*:}
         spec=${spec%:"$expected"}
         if $check --follow-calls wasm "$out/follow-wasm.wasm" "$spec" > "$out/follow-wasm-leak.log" 2>&1; then
@@ -464,7 +466,7 @@ wasm_follow_read() {
             cat "$out/follow-wasm-leak.log" >&2; echo "ct: $spec on wasm: expected '$expected'" >&2; exit 1
         }
     done
-    echo "ok   wasm call following: four clean calls read, five leaks and refusals found, the calls refused without following"
+    echo "ok   wasm call following: four clean calls read, eight leaks and refusals found (a result handed back by return, br or br_table included), the calls refused without following"
 }
 
 # The Xtensa checker follows calls too (windowed: `call8` rotates the window by eight, so the callee's a2 is our a10 and
@@ -486,7 +488,7 @@ xtensa_follow_read() {
         grep -q 'LEAK.*call:' "$out/follow-xtensa-nofollow.log" || { cat "$out/follow-xtensa-nofollow.log" >&2; exit 1; }
     done
     for spec in follow_branch:0:'in callee_branch: secret branch' follow_result:0:'secret branch' \
-        follow_saved:0:'secret branch' follow_stack:0:'secret branch' \
+        follow_saved:0:'secret branch' follow_stack:0:'secret branch' follow_shift_secret:0:'secret shift count' \
         follow_recursive:0:'recursion into follow_recursive' follow_indirect:0:'call: callx8'; do
         expected=${spec#*:*:}
         spec=${spec%:"$expected"}
@@ -497,7 +499,11 @@ xtensa_follow_read() {
             cat "$out/follow-xtensa-leak.log" >&2; echo "ct: $spec on xtensa: expected '$expected'" >&2; exit 1
         }
     done
-    echo "ok   xtensa call following: four clean calls read, six leaks and refusals found, the calls refused without following"
+    # A secret value shifted by a public count through the compiler-rt helper is fine.
+    $check --follow-calls xtensa "$out/follow-xtensa.o" follow_shift_public:0 > "$out/follow-xtensa-clean.log" 2>&1 || {
+        cat "$out/follow-xtensa-clean.log" >&2; echo "ct: a secret shifted by a public count was reported on xtensa" >&2; exit 1
+    }
+    echo "ok   xtensa call following: five clean calls read, seven leaks and refusals found, the calls refused without following"
 }
 
 # --- x86-64 ---------------------------------------------------------------------------
@@ -569,7 +575,9 @@ xtensa_follow_read
 orchestration_read "$out/xtensa.o" xtensa
 worker_read "$out/xtensa.o" xtensa
 # The --fast object keeps every call, which the checker follows. 47 fixtures come out clean; the rest are in
-# fast-known-xtensa.txt (class unplaced, see fast_class).
+# fast-known-xtensa.txt (class unplaced, see fast_class). Those 16 are blind in this build: the real check of the same
+# source is the release read of the same fixtures above, and the 16 leak controls prove a leak is still found in
+# unoptimised code wherever the frame can be placed.
 abla_xtensa_test_build "$compiler" "$tools_directory" build "$cases/object.ab" -o "$out/xtensa-fast.o" --no-cache \
     --target-triple xtensa-esp-unknown-elf --object-format elf --emit object --fast
 fast_read xtensa "$out/xtensa-fast.o" "" "" "$cases/fast-known-xtensa.txt"

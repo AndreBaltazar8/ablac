@@ -1212,7 +1212,8 @@ def check_xtensa(lines, secret, pointers):
     def pure_libcall(state, rotation, name, text):
         """A compiler-rt arithmetic helper (no loads of its own beyond its arguments): with public arguments its
         results are public; a division by a secret or of one is a secret division, any other helper's results
-        are as secret as its arguments."""
+        are as secret as its arguments. __muldi3 is constant-time where the core has the 32-bit multiplier (MUL32: the
+        ESP32 and ESP32-S3 do), which is what the secret-operand propagation here relies on."""
         state = set(state)
         arguments = [f"a{rotation + k}" for k in range(2, 6) if rotation + k <= 15]  # two 64-bit operands
         secret = any(a in state for a in arguments)
@@ -1220,6 +1221,9 @@ def check_xtensa(lines, secret, pointers):
             raise Violation(f"call: {name} is given a pointer to a secret: {text}")
         if secret and re.match(r"^__u?(div|mod)", name):
             raise Violation(f"secret division: {text}")
+        if re.match(r"^__(ashl|lshr|ashr)di3$", name) and f"a{rotation + 4}" in state:
+            # The count is the third argument word (a4 of the callee); the helpers branch on count >= 32.
+            raise Violation(f"secret shift count: {text}")
         for r in range(rotation, 16):
             for tag in (f"a{r}", f"ptr:a{r}", f"stackbase:a{r}"):
                 state.discard(tag)
@@ -1560,6 +1564,9 @@ def check_wasm(lines, secret, pointers, results=0):
 
         def branch_to(depth):
             if depth >= len(control):
+                # The function's own outermost label: a branch to it returns.
+                if not unreachable:
+                    record_return()
                 return
             entry = control[-1 - depth]
             if entry["kind"] == "loop":
@@ -1643,7 +1650,7 @@ def check_wasm(lines, secret, pointers, results=0):
                 if op == "br_if":
                     branch_to(int(parts[1]))
                 else:
-                    for depth in range(len(control)):
+                    for depth in range(len(control) + 1):  # the last is the function's own label: a return
                         branch_to(depth)
                     unreachable = True
                 continue

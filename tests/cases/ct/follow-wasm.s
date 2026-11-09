@@ -157,3 +157,72 @@ follow_indirect:
 	local.get	1
 	call_indirect	(i64) -> (i64)
 	end_function
+
+// Ways a function returns other than falling off its end: the checker must take the result's taint from each.
+//   follow_return_block:0   `return` inside a block hands back the secret: the caller's branch on it is found
+//   follow_br_return:0      `br 0` to the function's outermost label returns the secret: found
+	.globl	callee_return_block
+callee_return_block:
+	.functype	callee_return_block (i64) -> (i64)
+	block
+	local.get	0
+	return
+	end_block
+	i64.const	0
+	end_function
+
+	.globl	callee_br_return
+callee_br_return:
+	.functype	callee_br_return (i64) -> (i64)
+	local.get	0
+	br		0
+	end_function
+
+	.globl	follow_return_block
+follow_return_block:
+	.functype	follow_return_block (i64) -> (i64)
+	local.get	0
+	call		callee_return_block
+	i64.eqz
+	if		i64
+	i64.const	2
+	else
+	i64.const	1
+	end_if
+	end_function
+
+	.globl	follow_br_return
+follow_br_return:
+	.functype	follow_br_return (i64) -> (i64)
+	local.get	0
+	call		callee_br_return
+	i64.eqz
+	if		i64
+	i64.const	2
+	else
+	i64.const	1
+	end_if
+	end_function
+
+//   follow_br_table:0   `br_table` whose targets are the outermost label returns the secret: found
+	.globl	callee_br_table
+callee_br_table:
+	.functype	callee_br_table (i64, i32) -> (i64)
+	local.get	0
+	local.get	1
+	br_table	{0, 0}
+	end_function
+
+	.globl	follow_br_table
+follow_br_table:
+	.functype	follow_br_table (i64) -> (i64)
+	local.get	0
+	i32.const	0
+	call		callee_br_table
+	i64.eqz
+	if		i64
+	i64.const	2
+	else
+	i64.const	1
+	end_if
+	end_function

@@ -197,10 +197,12 @@
   supported by this streamer"), a compiler bug to fix after the v0.2.52 freeze. **Xtensa** follows windowed
   `call4/8/12` (the callee is named by the call's relocation, or by the literal a long call loads; the window
   registers come back from a(rotation+2); compiler-rt arithmetic helpers such as `__moddi3` are accepted with public
-  operands), tracks a frame register (`mov a7, a1` and `addi`/`add` of constants) so an unoptimised frame is addressed
+  operands, a secret shift count is refused (the helpers branch on `count >= 32`), and `__muldi3` relies on the core's
+  32-bit multiplier, which the ESP32 and ESP32-S3 have), tracks a frame register (`mov a7, a1` and `addi`/`add` of constants) so an unoptimised frame is addressed
   exactly, reads the AES key functions and bignum routines with calls followed, and reads the `--fast` object: 47 fixtures
   clean, 16 listed in `fast-known-xtensa.txt` as `unplaced` (the unoptimised bignum code indexes frame arrays at
-  offsets the checker can't place, and what it loads from there reads as secret). Hand-written controls for all three:
+  offsets the checker can't place, and what it loads from there reads as secret; those 16 are blind in the fast build,
+  and their release read is the real check). Hand-written controls for all three:
   `follow-a64.s`, `follow-wasm.s`, `follow-xtensa.s`.
 - [ ] **Secret residue is checked for stack slots on x86-64 release only.** `--residue` fails an entry that returns with a
   secret in a slot of its frame, or that gave a secret to a callee and didn't wipe the stack below it
