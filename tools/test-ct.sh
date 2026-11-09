@@ -330,6 +330,7 @@ real_entries_run() {
 # and the no-FMA fallback emit ud2 too): the build with debug info names the function and classes by it, and a
 # build without it, whose symbols are hashed, is held to the findings that build has (fast_read's third argument).
 fast_class() { # finding text, whether a branch to a trap counts as a tag check, the architecture
+    local arch=${3:-}
     case $1 in
         *__ablaRuntimeRequire*) echo tag-check ;;
         *"secret branch (to trap)"*) [[ $2 == trap ]] && echo tag-check || echo other ;;
@@ -337,7 +338,7 @@ fast_class() { # finding text, whether a branch to a trap counts as a tag check,
         # Unoptimised Xtensa code indexes arrays in its frame at offsets the checker can't place (an address
         # that is a1 plus a register), so a load or a branch after it reads as secret. Pinned per fixture by
         # fast-known-xtensa.txt, like the other classes; the leak controls below still have to be caught.
-        "secret branch"*|"secret address"*) [[ $3 == xtensa ]] && echo unplaced || echo other ;;
+        "secret branch"*|"secret address"*) [[ $arch == xtensa ]] && echo unplaced || echo other ;;
         *) echo other ;;
     esac
 }
@@ -376,7 +377,7 @@ fast_read() { # arch, object, label suffix, "trap" to class a branch to a trap a
     local trap_finding
     trap_finding=$($check --follow-calls "$arch" "$object" ct_leak_trap:0 2>&1 | grep '^LEAK' || true)
     [[ -n $trap_finding ]] || { echo "ct: the checker missed ct_leak_trap on $label" >&2; exit 1; }
-    [[ -n $trap || $(fast_class "${trap_finding#LEAK * * }" "") == other ]] || {
+    [[ -n $trap || $(fast_class "${trap_finding#LEAK * * }" "" "$arch") != tag-check ]] || {
         echo "ct: a secret branch to a non-tag trap was classed as a tag check on $label: $trap_finding" >&2; exit 1
     }
     echo "ok   $label: $clean fixtures clean, $(wc -l < "$out/$label.found") listed in fast-known.txt, ${#leaks[@]} leaks caught, the callee leak found by following the call"
