@@ -32,23 +32,46 @@ and `ctIsNonZero` work in 32-bit halves in plain arithmetic instead.
 `tools/test-ct.sh` builds `tests/cases/ct/fixture.ab` for each target and runs
 `tools/ct/check-asm.py` over its disassembly: a forward dataflow from the secret parameters through
 registers and stack slots, to a fixed point over the jumps. It fails on a conditional branch whose
-condition is secret, a load or store whose address is, a division of one, any call (what it does isn't
-known), on Wasm a `select` on a secret, and code the disassembler can't read. The same script builds four
-deliberate leaks (a secret `if`, a secret table index, `memcmp` over secret memory, a division) and fails
-if any target's check doesn't catch them, which is what keeps a passing result meaningful. Pointers to secret
-memory remain marked through stack spills; unclassified non-stack memory loads are conservatively secret. On Wasm,
-where linear-memory aliases aren't modeled, every memory load is considered secret. These rules can reject safe code.
+condition is secret, a load or store whose address is, a division of one, a call it can't read (see
+below), on Wasm a `select` on a secret, and code the disassembler can't read. The same script builds
+deliberate leaks (a secret `if`, a secret table index, `memcmp` over secret memory, a division, a branch to a
+trap, one a call down, a secret stored through a pointer inside a callee, and a twin of each generated crypto
+fixture with a secret-indexed store) and fails if any target's check doesn't catch them, which is what keeps a
+passing result meaningful. Pointers to secret memory remain marked through stack spills; unclassified
+non-stack memory loads are conservatively secret. On Wasm, where linear-memory aliases aren't modeled, every
+memory load is considered secret. These rules can reject safe code.
+
+**Calls.** A call is read, not refused, when it goes to a function of the same object or module
+(`--follow-calls`): the callee is checked on exactly the arguments the caller passes that it reads, what it
+hands back is what its own analysis found, and the registers it may clobber are dead. This holds on all four
+targets (x86-64 `call`, AArch64 `bl` and tail calls, Wasm `call` by function index, Xtensa `call4/8/12` named by
+the object's relocations). A recursion, an indirect call, a call to something outside the object and a Wasm
+import are still refused; the exceptions are `abla_platform_panic` (it ends the program, and must be given
+nothing secret) and, on Xtensa, the compiler-rt arithmetic helpers (`__moddi3`, shifts and the like) with
+public operands (a secret divisor, dividend or shift count is refused). Release builds inline most Abla
+calls, so this matters most for the `--fast` build and for the crypto entry points, whose key schedules and
+bignum helpers are `@noinline` workers read whole with the calls between them followed.
 
 | Target | Read | Run |
 |---|---|---|
-| x86-64 | release object | yes, here; values also checked with `--fast` |
-| AArch64 | release object | under qemu only |
-| Wasm | the final module, after `wasm-opt` | under Node |
-| Xtensa (`-mcpu=esp32`) | release object | **no**, nothing here runs it |
+| x86-64 | release object, `--fast` object | yes, here; values also checked with `--fast` |
+| AArch64 | release object, `--fast` object | under qemu only |
+| Wasm | the final module, after `wasm-opt`, and the `--fast` module | under Node |
+| Xtensa (`-mcpu=esp32`) | release object, `--fast` object | **no**, nothing here runs it |
 
-The check reads release builds. A `--fast` build isn't read: its calls aren't inlined, so this checker
-would stop at them. Nothing in that path is expected to add a branch, but that is an expectation, so
-build secret code in release.
+A `--fast` build keeps what release removes, so its findings are classed and pinned in
+`tests/cases/ct/fast-known*.txt` (x86-64: the type-tag check of every erased scalar conversion and the divisions
+by a secret that aren't strength-reduced; Xtensa: sixteen bignum fixtures whose unoptimised frames the checker
+can't place, which the release read covers; AArch64 and Wasm: none). A finding not in the list fails, and so
+does a listed fixture that comes out clean. Nothing in a `--fast` path is expected to add a branch on a
+secret that release doesn't, but the release read is still the one that counts, so build secret code in
+release.
+
+**Residue.** `--residue` (x86-64 and AArch64 release objects) also fails an entry
+that returns with a secret in a slot of its frame, or that gave a secret to a callee and did not wipe the
+stack below it (`abla/ct/scrub`: the checker reads the callees' depth and the size of the wipe). The AES and
+RSA private entry points and the password paths of `abla/crypto/pbe` wipe, and a run scan checks that nothing
+is left below them. Registers, the GC heap, Wasm and Xtensa are not covered.
 
 The fixtures are what is checked: `ctSelect`, `ctEq`, `ctLt`, `ctIsNonZero`, arithmetic and
 `ctDifferenceAddress`, at the widths listed in the script, and what `abla/crypto` builds on them: AES's
