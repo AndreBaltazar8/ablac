@@ -157,6 +157,10 @@
   `abla/regex` (compile errors, `matches`, `find`, `findAll` spans, `replace`) at run time and under `#`;
   seeds 701 to 720 (10 regex checks among them) agree in all six modes. There are no stepped ranges in the
   language, and class field mutation was already drawn (`Acc.total`).
+  Fourth growth (branch `fuzz-grow5`): `abla/text` (search, `split`, `trim*`, `replace`, case, `pad*`,
+  `repeat`, code point count, `codePointAt`, `codePointSlice`, `isValidUtf8`) over a pool with multibyte
+  text, at run time and under `#`; seeds 901 to 920 agree in all six modes. The `any`, generic, interface
+  and nullable generators are ablac-e5's; seeds 800+ are theirs, 900+ mine.
 
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
