@@ -393,27 +393,36 @@
   the self-build is 0.8% fewer instructions (66.78 G vs 67.29 G, five alternating runs), but the median
   peak rises 2.1%, the baseline's low mode being its best case, so the bar (median lower) is not met. Six
   runs an arm is thin: the gap is within the baseline's own 1.40/1.50 GB spread. A better fix would shorten what the overloads stage holds, not move the collection.
-- [ ] **Peak RSS swings from run to run with address randomisation, not with the trigger (#677).**
-  (2026-11-09, master `544efc82`..`8673fe81`, branch `gc-schedule`.) `tests/benchmarks/json-megabyte.ab`
-  at 170000 under `setarch -R` (no ASLR): 911.7 MB in eight of eight runs and an identical collection
-  trace. With ASLR on, the same binary and input peak at 912 MB in five of six runs and 1,946 MB in the
-  sixth; the traces (tracked live bytes before and after each pressure collection) differ from the first
-  difference on, and in the high run one collection at 495 MB live kept 495 where the low runs kept 157,
-  so the next threshold (live + half of live) came at 742 and the heap reached 1,115 MB tracked. So the
-  swing is a retention that depends on addresses (a word that looks like a pointer to a large dead
-  structure; roots are precise frames, `layout 0` blocks and the tag dispatch are the places to look), not
-  where the byte counter lands. Peak RSS also runs about 40% above tracked live (free lists, malloc
+- **Peak RSS swings with where a collection falls in the program's phases, not with the trigger (#677,
+  recorded as a no-go for a trigger or marking fix).** (2026-11-09, master `0eaf983e`, branch
+  `gc-schedule`.) `tests/benchmarks/json-megabyte.ab` at 170000, same binary and input: 912 MB in
+  five of six runs and 1,946 MB in the sixth with address randomisation, 911.7 MB in eight of eight
+  under `setarch -R`. The collection traces (tracked live bytes before and after each pressure
+  collection, plus the bytes each root slot and each block layout marked) show why. The program holds
+  one 338 MB parse tree at a time (`jsonParse` four times in a row, each previous tree dead once the
+  next result is assigned). A collection at 495 MB tracked live either falls where the previous tree
+  is already dead and the next not yet built (kept 157: roots 15 + 13 MB and the 128 MB text) or in the
+  middle of the next parse, where that tree is live (kept 495: the `jsonParse` frame's slot holds
+  338 MB). Nothing is retained wrongly: every marked byte is reachable from a rooted frame slot. The
+  next threshold is live + half of live (742 MB), so the second case lets the following tree start
+  over a heap that cannot be collected before 742 MB, and the peak is about 1.9 GB RSS. The ~1 MB of
+  allocation that differs between runs (nothing in the benchmark is address dependent in what it keeps;
+  the amount allocated before the collection differs slightly, so the collection lands on one side or
+  the other) moves the crossing. Peak RSS also runs about 40% above tracked live (free lists, malloc
   fragmentation, the collector's tables). Tried as trigger changes (not kept; `ABLA_GC_RATIO` and
   `ABLA_GC_RETRY` knobs, commits on `gc-schedule`): (1) growth of 25% or 12% of live instead of 50%:
-  json-megabyte spread stays about ±25% across input sizes 140k to 180k (912 to 1,610 MB at 50%, 937 to
-  1,564 MB at 25%) and it costs +5.8% (25%) and +9% (12%) instructions (trees, strings, maps unchanged:
-  small live heaps); (2) a second collection after a step of 12% or 25% of live when a collection of a
-  heap of at least 128 MiB freed under 10%: it removes the high mode on one build (1,101 to 1,153 MB, 14
-  of 14 runs, against 1,900 in 9 of 14) but is +3.2% instructions, makes another build's stable 890 MB
-  1,101 (12%) or 1,214 to 1,835 (25%), raised 175000 to 2,149 MB in two of sixteen runs (the others
-  lower, 1,237 to 1,245 against 1,389 to 1,421), and leaves the compiler's own 1.41 to 1.54 GB bimodality
-  unchanged (8 runs each). So a trigger-only fix does not meet the bar (spread ±5%, instructions +1%).
-  The lever is the address-dependent retention: find which word keeps the dead structure.
+  the spread stays about ±25% across input sizes 140k to 180k (912 to 1,610 MB at 50%, 937 to 1,564 MB
+  at 25%) and json-megabyte costs +5.8% (25%) and +9% (12%) instructions (trees, strings and maps do
+  not change: small live heaps); (2) a second collection after a step of 12% or 25% of live when a
+  collection of a heap of at least 128 MiB freed under 10%: removes the high mode on one build (1,101
+  to 1,153 MB in 14 of 14 runs, against 1,900 in 9 of 14) but is +3.2% instructions, turns another
+  build's stable 890 MB into 1,101 (12%) or 1,214 to 1,835 (25%), gave 2,149 MB in two of sixteen runs
+  elsewhere (the others 1,237 to 1,245 against 1,389 to 1,421), and leaves the compiler's 1.41 to
+  1.54 GB bimodality unchanged (8 runs each). A non-moving mark-sweep collector with a proportional
+  trigger has this sawtooth by construction; only a trigger that collects after every few percent of
+  growth (the instructions above) or knowing the program's phases would flatten it. Judge a runtime
+  allocation cut (ablac-e5's to-string cut, +7% peak at 50%) by instructions and by the peak's median
+  over many runs, not by one run.
 - [ ] **Move Xtensa density legalization into companion 23.1.3-2.** The phase-3
   compiler stage mirrors the SDK's exact narrow encodings because `-mcpu=esp32`
   and explicit `+density` still leave 5,211 bytes across 199 firmware sections.
