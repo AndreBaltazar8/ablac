@@ -492,7 +492,7 @@
   diagnostics shared by `test-diagnostic-hints.sh` and `test-null-operators.sh`, `math-v8/interface.ab`
   (`test-math-fast.sh`, `test-math-v8.sh`), `rsa-keygen/generate.ab` (`test-crypto.sh`, `test-crypto-pure.sh`) and
   six single-source programs the driver builds that a shell script builds again. The other 129 repeats are one script
-  building the same thing again on purpose: `test-codegen-cache-race.sh` (32), `test-discovery-cache.sh`,
+  building the same thing again on purpose: `test-codegen-cache-race.sh` (30), `test-discovery-cache.sh`,
   `test-build-killed.sh`, `test-compile-effects.sh`, the fuzzer: scripts that test the cache or the build itself.
   1,371 of the 2,479 calls carry `--no-cache` (55%), so a shared cache would not reach them. A suite-wide cache
   for identical (source, flags) builds would save about 0.6% of the builds (not CPU-weighted, but the shared
