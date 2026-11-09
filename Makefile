@@ -178,6 +178,7 @@ test-serial: ablac
 	tools/test-eval-parity.sh $(COMPILER)
 	tools/test-lang-parity.sh $(COMPILER)
 	tools/test-null-compare.sh $(COMPILER)
+	tools/test-int-text.sh $(COMPILER)
 	tools/test-compile-time-depth.sh $(COMPILER)
 	tools/test-import-precedence-diagnostics.sh $(COMPILER)
 	tools/test-string-escapes.sh $(COMPILER)

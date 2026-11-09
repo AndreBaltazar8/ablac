@@ -1111,6 +1111,48 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   values with `memcpy`: fewer slots survived, yet the Wasm grew 0.5% to 15% (a string static holds its
   address in two 32-bit halves there, which LLVM cannot read back as one constant word). Kept slots are a
   poor proxy; measure the output.
+- [ ] **Integer text allocates a block per conversion** (2026-11-08, master `51e5d0e3`; branch
+  `to-string-cut`). `__ablaRuntimeToString` for an int takes a 32-byte block through the inlined allocator
+  (free-list pop or malloc, registry append, byte accounting), writes the digits one divide at a time into it
+  and points the string into the block: about 110 instructions a call, 17% of strings. The digit loop is not
+  the cost: two digits a step with a pair table saved 0.5% of strings, the allocation is. A number below
+  100 is now a window of a 200-byte text "0001...99" (a string's data pointer may point into read-only data,
+  as a literal's does; a C string is a copy), with no allocation: strings -17.9% to -19.7% instructions
+  (-27% to -32% cycles), json-readers -2.1%, maps -0.3% with the collector fixed (`ABLA_GC_GROWTH` ~1 TB so
+  it never runs); a 1,000-entry table (3 KB) gives strings -19.2%, json-readers -3.9%, maps -2.3% the same
+  way. With the default collection schedule the same changes move other benchmarks by -2 to +3.3% in
+  instructions and, on json-megabyte, peak memory by -19% to +69%, in no order that follows the table size
+  (table 100: maps -0.4%, json-readers +0.9..+1.1%, json-megabyte 1045M to 1737M; 256: maps +3.3%,
+  json-readers -4.8%, megabyte 1767M; 1000: maps +2.4%, json-readers -5.2%, megabyte 846M; 10: maps 0.0%,
+  json-readers +0.6%, megabyte 1127M). Cause: collections are scheduled by the bytes counted since the last
+  one, so fewer counted allocations move every later collection and with it how much garbage is
+  live at the peak (collector instructions 79 M to 141 M in maps; with the collector off the same builds
+  are 2.3% cheaper). The cost of a collection scales with what it finds, so the benchmarks' totals depend
+  on where the schedule lands, not on the conversion. An exact-size block through `AllocateOutOfLine`
+  instead of the 32-byte scratch was worse everywhere (strings +2.1%, megabyte peak 1045M to 1701M).
+  A single input size cannot judge it: the collector's schedule is a permanent sawtooth, and any shift of
+  allocations flips a size's mode (json-megabyte at its default size: 1,046M to 1,723M). Judged across sizes
+  (table 100, 2026-11-09, master `96f7d75b`, one compiler for both sides, alternating runs): json-megabyte at
+  130k to 190k objects, 8 sizes, 3 runs each, median peak 1,102M against 1,121M (+1.7%; the mean +1.3%; some
+  sizes lower, some higher by up to 30%); json-readers at 7,000 to 9,100 objects, peak 8 to 12% lower at every
+  size and instructions -1.9% to +3.3% by size (median -0.1%), so its +1.3% at one size is the schedule;
+  strings -17.0% instructions and -9.3% peak; fib, matrix, nbody, sieve, trees, dispatch and maps within
+  +-0.02%.
+- [ ] **Per-call boxing in the lowering.** 17% of the IR's instructions are
+  `alloca %AblaValue` (146K in that program), with as many stores and loads around them
+  and 29K `abla_i64` boxing calls. `opt`'s time is mostly the inliner, instcombine and SROA
+  undoing it. Passing and returning scalars unboxed would shrink opt and llc time, the Wasm
+  and run time together; it is the largest lever left, and a large change.
+  Of the slots `opt` keeps in a 6.7K-function client, two thirds are passed to calls (the
+  boxed argument ABI: string concatenation, field and array stores lead) and most of the
+  rest were pinned by the runtime reading a value through `ablaRuntimeValueAddress`; the
+  backend now addresses the slot itself there, which freed 21% of the kept slots.
+  Tried and dropped: boxing constants by copying a private constant value (instcombine
+  then passes the constant itself to read-only parameters) and copying values with
+  `memcpy`. Fewer slots survived, yet the Wasm grew 0.5% to 15%. A string's static value
+  holds its address in two 32-bit halves there, which LLVM cannot read back as one
+  constant word, so checks on it stop folding, and the module initializer is never
+  optimized, so its copies stay copies. Kept slots are a poor proxy; measure the output.
 - [ ] **The overload probe is a second semantic analysis.** It types only the bodies that
   may come by a value of a candidate's owner type (647 of a 4,979-body client, 38 of which
   resolve something) and builds no compile-effect summary (nor, without regions, a region
