@@ -24,7 +24,9 @@ class HttpEventServerOptions(
 
 class HttpEventFrame(
     val length: int,
-    val request: HttpRequest?
+    val request: HttpRequest?,
+    // An HTTP/1.0 request: its connection closes unless it asks for keep-alive.
+    val http10: bool = false
 )
 
 resource class HttpEventServer(
@@ -207,6 +209,46 @@ fun HttpEventServer.closeSlot(slot: int): void {
     return
 }
 
+// The request line must be `method SP target SP HTTP/1.x` and nothing else: returns 1 for HTTP/1.1, 0 for HTTP/1.0
+// and -1 for anything else, which is refused (a line that is not a request is never routed).
+private fun httpEventRequestLineVersion(input: string, headerEnd: int): int {
+    var end = 0
+    while (end + 1 < headerEnd && !(input[end] == 13 && input[end + 1] == 10)) end = end + 1
+    var first = -1
+    var second = -1
+    var index = 0
+    var valid = true
+    while (valid && index < end) {
+        val byte = input[index]
+        if (byte == 32) {
+            if (first < 0) first = index
+            else if (second < 0) second = index
+            else valid = false
+        } else if (byte < 33 || byte > 126) valid = false
+        index = index + 1
+    }
+    var version = -1
+    if (valid && first > 0 && second > first + 1 && second + 1 < end &&
+        (input[first + 1] == 47 || input[first + 1] == 42)) {
+        val text = input.slice(second + 1, end)
+        if (text == "HTTP/1.1") version = 1
+        else if (text == "HTTP/1.0") version = 0
+    }
+    version
+}
+
+// Chunked framing and a Content-Length together are two answers to where the body ends, and a proxy in front may
+// pick the other one: the request is refused.
+private fun httpEventAmbiguousFraming(request: HttpRequest): bool =
+    request.header("Content-Length") != "" &&
+        request.header("Transfer-Encoding") != ""
+
+// HTTP/1.1 keeps the connection unless the request says close; HTTP/1.0 closes unless it says keep-alive.
+private fun httpEventKeepAlive(request: HttpRequest, http10: bool): bool =
+    if (http10) httpHeaderTokenContains(request.header("Connection"), "keep-alive") &&
+        httpRequestKeepAlive(request)
+    else httpRequestKeepAlive(request)
+
 fun httpEventRequestLength(
     input: string,
     maximumHeader: int,
@@ -219,7 +261,9 @@ fun httpEventRequestLength(
     if (headerEnd >= 0 && headerEnd <= maximumHeader) {
         val request = httpParseRequest(input.slice(0, headerEnd))
         val transfer = request.header("Transfer-Encoding")
-        if (httpHeaderTokenContains(transfer, "chunked")) {
+        if (httpEventRequestLineVersion(input, headerEnd) < 0 ||
+            httpEventAmbiguousFraming(request)) result = -1
+        else if (httpHeaderTokenContains(transfer, "chunked")) {
             val decoded = httpDecodeChunked(
                 input.slice(headerEnd, input.size), maximumBody
             )
@@ -269,6 +313,7 @@ fun httpEventFrame(
     val headerEnd = httpHeaderEnd(input)
     var length = 0
     var framedRequest: HttpRequest? = null
+    var http10 = false
     if ((headerEnd < 0 && input.size > maximumHeader) ||
         headerEnd > maximumHeader) length = -1
     if (headerEnd >= 0 && headerEnd <= maximumHeader) {
@@ -277,7 +322,10 @@ fun httpEventFrame(
         // discarded that graph, then parsed the same bytes again.
         val request = httpParseRequest(input)
         val transfer = request.header("Transfer-Encoding")
-        if (httpHeaderTokenContains(transfer, "chunked")) {
+        val version = httpEventRequestLineVersion(input, headerEnd)
+        http10 = version == 0
+        if (version < 0 || httpEventAmbiguousFraming(request)) length = -1
+        else if (httpHeaderTokenContains(transfer, "chunked")) {
             val decoded = httpDecodeChunked(
                 input.slice(headerEnd, input.size), maximumBody
             )
@@ -310,7 +358,7 @@ fun httpEventFrame(
             }
         }
     }
-    HttpEventFrame(length, framedRequest)
+    HttpEventFrame(length, framedRequest, http10)
 }
 
 fun httpEventResponse(
@@ -441,7 +489,7 @@ fun HttpEventServer.processNoEscapeInputInRegion(
         val eventHandler = this.noEscapeHandler
         val response = eventHandler(request)
         this.requestCounts[slot] = this.requestCounts[slot] + 1
-        val keepAlive = httpRequestKeepAlive(request) &&
+        val keepAlive = httpEventKeepAlive(request, frame.http10) &&
             !this.draining &&
             this.requestCounts[slot] <
                 this.options.maximumRequestsPerConnection
@@ -529,8 +577,13 @@ fun HttpEventServer.processSlot(slot: int): void {
         val length = frame.length
         if (length < 0) {
             this.outputs[slot] = httpText("bad request", 400).render()
+            this.outputOffsets[slot] = 0
             this.closing[slot] = true
             processing = false
+            // Written now, as the answer to a good request is: without this it
+            // waited for a writable event nothing had asked for, and the
+            // connection closed at its idle timeout with no 400.
+            this.writeReady(slot)
         } else if (length == 0) processing = false
         else {
             var framed = this.inputs[slot]
@@ -550,7 +603,7 @@ fun HttpEventServer.processSlot(slot: int): void {
                 response = eventHandler(request)
             }
             this.requestCounts[slot] = this.requestCounts[slot] + 1
-            val keepAlive = httpRequestKeepAlive(request) &&
+            val keepAlive = httpEventKeepAlive(request, frame.http10) &&
                 !this.draining &&
                 this.requestCounts[slot] <
                     this.options.maximumRequestsPerConnection

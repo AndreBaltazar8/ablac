@@ -221,6 +221,94 @@ fun eventResponseFraming(): bool {
     true
 }
 
+// What a connection does with the ways a request can end or be framed: the answer, and whether the server then
+// closed the connection (EOF) or left it open (a read that timed out).
+class FramingOutcome(val response: string, val closed: bool)
+
+fun framingExchange(port: int, bytes: string, waitMilliseconds: int): FramingOutcome {
+    val connection = tcpConnectIpv4("127.0.0.1", port, 1000)
+    var response = ""
+    var closed = false
+    if (connection.descriptor >= 0 && connection.write(bytes) == bytes.size) {
+        var reading = true
+        while (reading) {
+            val incoming = connection.readWithTimeoutResult(65536, waitMilliseconds)
+            if (incoming.hasData()) response = "${response}${incoming.bytes}"
+            else {
+                closed = incoming.reachedEof()
+                reading = false
+            }
+        }
+        connection.close()
+    }
+    FramingOutcome(response, closed)
+}
+
+fun textCount(input: string, wanted: string): int {
+    var count = 0
+    var index = 0
+    while (index + wanted.size <= input.size) {
+        if (input.slice(index, index + wanted.size) == wanted) {
+            count = count + 1
+            index = index + wanted.size
+        } else index = index + 1
+    }
+    count
+}
+
+// Returns 0, or the number of the first case that went wrong.
+fun framingClient(link: Mutex<EventLink>): int {
+    val port = link.with(eventLinkPort)
+    val get = "GET /one HTTP/1.1\r\nHost: local\r\n\r\n"
+    var failed = 0
+    // 1. HTTP/1.0 closes after its answer; so does Connection: close on 1.1.
+    val old = framingExchange(port, "GET /one HTTP/1.0\r\nHost: local\r\n\r\n", 2000)
+    if (failed == 0 && !(textContains(old.response, "first") && textContains(old.response, "Connection: close") && old.closed)) failed = 1
+    val close = framingExchange(port, "GET /one HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n", 2000)
+    if (failed == 0 && !(textContains(close.response, "first") && close.closed)) failed = 2
+    // 2. HTTP/1.1 stays open after an answer (a short read finds it open) and an idle one is closed by the server.
+    val open = framingExchange(port, get, 100)
+    if (failed == 0 && !(textContains(open.response, "first") && textContains(open.response, "keep-alive") && !open.closed)) failed = 3
+    val idle = framingExchange(port, get, 3000)
+    if (failed == 0 && !(textContains(idle.response, "first") && idle.closed)) failed = 4
+    // 3. The request cap (three a connection): the third answer says close, a fourth gets none.
+    val capped = framingExchange(port, "${get}${get}${get}${get}", 2000)
+    if (failed == 0 && !(textCount(capped.response, "first") == 3 && textCount(capped.response, "Connection: close") == 1 && capped.closed)) failed = 5
+    // 4. A body longer than declared: the extra bytes are the next request, never part of this one's body.
+    val extra = framingExchange(port, "POST /body HTTP/1.1\r\nHost: local\r\nContent-Length: 3\r\n\r\nabc${get}", 150)
+    if (failed == 0 && !(textContains(extra.response, "abc") && textContains(extra.response, "first") && !textContains(extra.response, "abcGET"))) failed = 6
+    //    ... and when the extra bytes are not a request, they are refused and the connection closes.
+    val junk = framingExchange(port, "POST /body HTTP/1.1\r\nHost: local\r\nContent-Length: 3\r\n\r\nabcjunk\r\n\r\n", 2000)
+    if (failed == 0 && !(textContains(junk.response, "abc") && textContains(junk.response, " 400 ") && junk.closed)) failed = 7
+    // 5. A body shorter than declared waits for the rest, and the idle timeout closes it with no answer.
+    val shorter = framingExchange(port, "POST /body HTTP/1.1\r\nHost: local\r\nContent-Length: 10\r\n\r\nabc", 3000)
+    if (failed == 0 && !(shorter.response == "" && shorter.closed)) failed = 8
+    // 6. Content-Length together with chunked framing is refused (request smuggling), and no handler runs.
+    val both = framingExchange(port, "POST /body HTTP/1.1\r\nHost: local\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n", 2000)
+    if (failed == 0 && !(!textContains(both.response, "abc") && textContains(both.response, " 400 ") && both.closed)) failed = 9
+    // 7. A declared length over the body limit is refused without reading it.
+    val huge = framingExchange(port, "POST /body HTTP/1.1\r\nHost: local\r\nContent-Length: 99999999\r\n\r\nabc", 2000)
+    if (failed == 0 && !(!textContains(huge.response, "abc") && textContains(huge.response, " 400 ") && huge.closed)) failed = 10
+    link.with(eventLinkFinish)
+    failed
+}
+
+fun eventFraming(): int {
+    val router = httpRouter()
+    router.get("/one", eventOne)
+    router.post("/body", eventBodyHandler)
+    val limits = HttpEventServerOptions(16, 65536, 65536, 2097152, 3, 400, 256, 1000)
+    val server = httpEventServer(router, ipv4Loopback(0), limits)
+    val link = eventLink(server.listener.localPort())
+    val forClient = link.clone()
+    val client = thread { framingClient(forClient) }
+    while (!link.with(eventLinkDone)) server.step(50)
+    val status = await client
+    server.stop()
+    server.drain()
+    status
+}
+
 fun main: int {
     if (!eventResponseFraming()) return 9
     val oversizedHead = "GET / HTTP/1.1\r\nHost: local\r\n\r\n"
@@ -246,5 +334,8 @@ fun main: int {
     else if (!eventBodyAcrossReads()) 5
     else if (!eventBackpressure(true)) 6
     else if (!eventBodyAcrossReads(true)) 7
-    else 42
+    else {
+        val framing = eventFraming()
+        if (framing != 0) 100 + framing else 42
+    }
 }
