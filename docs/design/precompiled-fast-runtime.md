@@ -96,7 +96,7 @@ remove from LLVM; most of the rest is the compiler's own code (`ablac.bin` 56 to
   (1) the bridges' `byval` choice pinned (never strip, or strip by a rule that does not look at the program: it costs the
   copies the pass saves, measured on the benchmarks) and (2) a unit key per function (or per demand-independent group)
   instead of per file: the object cache then holds each optimized function once, and a build links the ones it needs.
-  Codegen only (the `llc` part: 29 M of the empty and 94 M of fib's 379 M standalone, so at most 7% of a small build),
+  Codegen only: in-process code generation (instruction selection, register allocation, the object writer) is 10.2% of a fib `--fast` build by the profile below, and B can only save the shared part of it (91% of fib's instructions, so about 9% of the build at most),
   inlining unchanged because the cut stays after optimization. The cost is a per-function object boundary
   (cross-function references become symbols, no cross-function scheduling), which FastISel `-O0` does not use.
 - **C. Do nothing about LLVM, take the frontend reuse first**: its estimate is larger (about half of a small build).
@@ -122,3 +122,30 @@ the ablac side lowers and emits them) would remove it without an object, an ABI 
 
 The raw numbers behind the table are in the session scratch files; the commands are the ones named above
 (`perf record`/`perf stat` as quoted, `--emit-llvm` for the function comparison).
+
+## Where the compiler process spends libLLVM time, and a pruning experiment
+
+`perf record` of a fib `--fast --no-cache` build, samples of the compiler process classified by libLLVM symbol (3,181
+samples; the process is 86% of the build, clang 8%, ld.lld 3%; libLLVM is 23.6% of the build inside the compiler):
+register allocation and other machine passes 5.2%, building the IR (IRBuilder, attributes, containers) 4.8%, instruction
+selection 2.7%, bitcode write and read 2.6%, the object writer 2.3%, `opt` passes and analyses 1.7%, the verifier
+1.0%, debug info 0.5%, other 2.9%. So the passes are not where the time goes; code generation is 10.2%, and the
+construction, serialization and verification of a module in which 96% of the functions are dead
+(`globaldce` keeps 6 of 216 in the empty program) is 8.4% plus the optimizer's 1.7% and the compiler's own lowering and
+emission of the same functions (about 4 to 5% by the earlier profile). That is the case for pruning before emission:
+about 13% of a small build if all dead functions are never built.
+
+Experiment (branch `fast-prune`, `ABLA_FAST_PRUNE=1`, not for merge): treat a runtime implementation as a root only when
+its bridge is used, and emit only reachable functions, as closed targets already do. Result: 150 of 157 functions
+are still emitted, because the bridges (`abla_void`, `abla_add`, ... the value-runtime group, all non-optional in
+`bootstrapLlvmDeclareRuntime`) and the implementations they call are emitted whether or not the program uses them;
+only `globaldce` drops them later. (The first stage-1 numbers, 68% of the baseline's instructions, were an aborted
+build: the export thunk for an unemitted implementation failed LLVM's verifier. They mean nothing.)
+
+What it would take: bridge bodies are emitted after all function bodies, and the emission model computes
+reachability up front (emitted-function flags feed the stack-closure sites, the retained linked data, the inline-assembly
+list and the debug declarations before any body exists). Pruning the bridges therefore needs either the reachability to
+include the backend's own uses of each bridge (an audit of the 105 bridge names in `functions.ab`, with a loud link error for
+a missed one: dormant declarations are left external and hidden), or lazy emission driven by uses of the declarations
+(late roots, which conflicts with the analyses that run before emission). The audit route is a bounded change; its
+bar is the one set for this item.
