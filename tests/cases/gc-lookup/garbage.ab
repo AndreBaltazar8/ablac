@@ -1,0 +1,62 @@
+import "abla/io"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+import "abla/runtime/self"
+import "@HOST_PLATFORM@"
+
+// Garbage that reaches the marker as a candidate: none of these may be taken for an allocation, and none
+// may fault the registry lookup, which reads the 32 bytes before a candidate only inside the ranges
+// /proc/self/maps listed. Candidates: 0, -1, small and unaligned values, 2^63, the bytes around each listed
+// range, a PROT_NONE page, a page that was mapped and is gone, an address inside the snapshot's own buffer.
+trusted noescape extern:"c" fun mmap(address: int, length: int, protection: int, flags: int, descriptor: int, offset: int): int
+trusted noescape extern:"c" fun munmap(address: int, length: int): int
+trusted noescape extern:"c" fun malloc(size: int): i64*
+
+class Item(val value: int, val next: Item?)
+
+trusted fun probe(): int {
+    // Something in the registry, so that the lookup has headers to compare against.
+    var list: Item? = null
+    for (index in 0 until 200) list = Item(index, list)
+    val guard = mmap(0, 4096, 0, 34, -1, 0)
+    val gone = mmap(0, 4096, 3, 34, -1, 0)
+    munmap(gone, 4096)
+    __ablaRuntimeHostCollectionCount = 64
+    __ablaRuntimeHostCollectionWorklist = ablaRuntimePointerAddress(malloc(512))
+    __ablaRuntimeHostCollectionWorklistCount = 0
+    if (!__ablaRuntimeHostCollectionMappingsLoad()) return 0
+    val candidates: array<int> = [0, -1, 1, 7, 8, 40, 4096, 0x7fffffffffffffff, -9223372036854775807 - 1,
+        guard, guard + 32, guard + 4095, gone, gone + 32, gone + 4095,
+        __ablaRuntimeHostCollectionMappedBuffer, __ablaRuntimeHostCollectionMappedBuffer + 32,
+        __ablaRuntimeHostCollectionMappedBuffer + 40, __ablaRuntimeHostCollectionMinimum,
+        __ablaRuntimeHostCollectionMinimum + 32, __ablaRuntimeHostCollectionMaximum,
+        __ablaRuntimeHostCollectionMaximum - 1]
+    var ranges = 0
+    while (ranges < __ablaRuntimeHostCollectionMappedCount) {
+        val start = ablaRuntimeLoadI64(__ablaRuntimeHostCollectionMapped + ranges * 16)
+        val end = ablaRuntimeLoadI64(__ablaRuntimeHostCollectionMapped + ranges * 16 + 8)
+        candidates.append(start - 1)
+        candidates.append(start)
+        candidates.append(start + 32)
+        candidates.append(start + 33)
+        candidates.append(end - 1)
+        candidates.append(end)
+        candidates.append(end + 31)
+        ranges = ranges + 1
+    }
+    var index = 0
+    var wrong = 0
+    while (index < candidates.size) {
+        __ablaRuntimeHostCollectionMode = 1
+        if (__ablaRuntimeHostMarkPointer(candidates[index])) wrong = wrong + 1
+        index = index + 1
+    }
+    __ablaRuntimeHostCollectionMode = 0
+    wrong
+}
+
+fun main: int {
+    val wrong = probe()
+    println("garbage candidates taken for allocations: $wrong")
+    if (wrong == 0) 0 else 1
+}
