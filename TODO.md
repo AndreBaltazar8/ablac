@@ -248,6 +248,15 @@
   was a false "secret division", which also shrinks `fast-known.txt` by its eight division entries), and a call to
   `abla_platform_panic` is not followed (it ends the program) but must be given nothing secret. Neither full loader
   timing nor secret-memory wiping is claimed.
+  *Design (2026-11-09, not built).* Give the checker a third kind of parameter, `%n`: a public pointer to an object
+  whose header words (the fields at constant offsets 0 to 31: size, class id, refcount) are public and whose payload is
+  secret. A load at `[reg + constant < 32]` from a `%`-tagged register is public, a load at any other offset or at a
+  register index is secret, and the tag follows `lea`/`add` of a constant only. The result slot of an allocator call
+  becomes a `%` pointer of the size the call was given, so `aesNewKey` and `rsaCrt` can be read through
+  `bnAllocate`/`aesAllocateMemory` without following the collector (which stays refused). The cost to measure first: the
+  header size is a runtime layout fact, so the spec must be generated from `runtime/` (not typed by hand) and a layout
+  change must fail the generator; and the checker must still fail closed on a store of a secret into a header offset.
+  Controls: a secret stored at offset 8, a secret-indexed header read, and a pointer spilled and reloaded.
 - [x] **Small constant-array `for` loops avoid materializing an array.** Up to16 homogeneous
   native scalar literals (optionally signed) use a bounded scalar selector and one body copy;
   other/larger arrays keep the ordinary path. Order, capture cells and loop exits are preserved.
