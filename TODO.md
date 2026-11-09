@@ -127,7 +127,7 @@
   535 (30 checks, six modes): no disagreement. Finding (evaluator, fixed by ablac-e5 in closure-eval,
   a1a06ad3): a lambda that called another lambda it captured failed under `#` with E_EVAL_EXPRESSION
   ("evaluating `call` `g`"); the evaluator boxes captured bindings and `evaluateCall` did not look through
-  the box. Regression: `tests/cases/fuzz-differential/closure-captured-call.ab`; the closure generator now
+  the box. Regression: `tests/cases/fuzz-differential/captured-closure-calls.ab`; the closure generator now
   draws `compose` and `{ x -> g(f(x)) + calls }`. Also drawn: sealed interfaces with an exhaustive `when`
   over `is` arms, and `for` over `until` and `..` ranges (empty, reversed, negative bounds).
 
