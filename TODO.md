@@ -161,6 +161,10 @@
   `repeat`, code point count, `codePointAt`, `codePointSlice`, `isValidUtf8`) over a pool with multibyte
   text, at run time and under `#`; seeds 901 to 920 agree in all six modes. The `any`, generic, interface
   and nullable generators are ablac-e5's; seeds 800+ are theirs, 900+ mine.
+  Fifth growth (branch `fuzz-grow6`): `removeAt`, `removeLast` and `clear` on int and string arrays, and
+  string arrays built from `split`; seeds 931 to 950 agree in all six modes with the v0.2.52 compiler. A
+  first run with a pre-#703 compiler failed seeds 944 and 950 with the LLVM `fcmp` operand-type error: an
+  `any` holding `u8(1)` or `true` compared with a float literal, which is #703, already fixed.
 
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
