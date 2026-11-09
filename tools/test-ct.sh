@@ -65,7 +65,7 @@ while IFS= read -r spec; do fixtures+=("$spec"); done < "$cases/crypto-generated
 # Xtensa passes later pointer parameters on the stack; its checker cannot yet
 # taint those parameters, so this separate-pointer shape is read on these ABIs.
 host_fixtures=(ct_fix_wide_separate:@0,@1,@2,@3,@5)
-leaks=(ct_leak_branch:0 ct_leak_callee:0 ct_leak_callee_store:0 ct_leak_index:0 ct_leak_compare:@0,@1 ct_leak_divide:0,1 ct_pbe_leak:@0)
+leaks=(ct_leak_branch:0 ct_leak_callee:0 ct_leak_callee_store:0 ct_leak_index:0 ct_leak_trap:0 ct_leak_compare:@0,@1 ct_leak_divide:0,1 ct_pbe_leak:@0)
 while IFS= read -r spec; do leaks+=("$spec"); done < "$cases/crypto-generated.leaks"
 
 # Hand-written spill regressions ensure the test includes the actual assembly pattern.
@@ -272,19 +272,26 @@ real_entries_run() {
 # finding fails here, and so does a listed fixture that comes out clean (shrink the list), or one that fails
 # differently. The leaks must be caught as in release, the one a call down by following that call.
 # Only the x86-64 checker follows calls, and --fast builds are read for the host only (TODO.md).
-fast_read() { # arch, object
-    local arch=$1 object=$2 label=$1-fast
+# How a finding of a fast build is classed. A trap is not a tag check by being a trap (ablaRuntimeTrap, unreachable
+# and the no-FMA fallback emit ud2 too): the build with debug info names the function and classes by it, and a
+# build without it, whose symbols are hashed, is held to the findings that build has (fast_read's third argument).
+fast_class() { # finding text, whether a branch to a trap counts as a tag check
+    case $1 in
+        *__ablaRuntimeRequire*) echo tag-check ;;
+        *"secret branch (to trap)"*) [[ $2 == trap ]] && echo tag-check || echo other ;;
+        "secret division"*|*"in "*": secret division"*) echo division ;;
+        *) echo other ;;
+    esac
+}
+fast_read() { # arch, object, label suffix, "trap" to class a branch to a trap as a tag check
+    local arch=$1 object=$2 label=$1-fast${3:-} trap=${4:-}
     local target_fixtures=("${fixtures[@]}" "${host_fixtures[@]}")
     $check --follow-calls "$arch" "$object" "${target_fixtures[@]}" > "$out/$label.log" 2>&1 || true
     local found=0 clean=0 name rest class
     : > "$out/$label.found"
     while read -r _ _ name rest; do
         name=${name%:}
-        case $rest in
-            *__ablaRuntimeRequire*|*"secret branch (to trap)"*) class=tag-check ;;
-            "secret division"*|*"in "*": secret division"*) class=division ;;
-            *) class=other ;;
-        esac
+        class=$(fast_class "$rest" "$trap")
         echo "$name $class" >> "$out/$label.found"
         [[ $class != other ]] || { echo "ct: $name on $label: $rest" >&2; exit 1; }
     done < <(grep '^LEAK' "$out/$label.log")
@@ -302,6 +309,13 @@ fast_read() { # arch, object
     grep -Eq 'ct_leak_callee: in [^:]+: secret branch' <($check --follow-calls "$arch" "$object" ct_leak_callee:0 2>&1) || {
         echo "ct: the leak inside a callee wasn't found by following the call" >&2; exit 1
     }
+    # A trap that is not a tag check is a finding of its own, so it can't hide in a listed fixture's class.
+    local trap_finding
+    trap_finding=$($check --follow-calls "$arch" "$object" ct_leak_trap:0 2>&1 | grep '^LEAK' || true)
+    [[ -n $trap_finding ]] || { echo "ct: the checker missed ct_leak_trap on $label" >&2; exit 1; }
+    [[ -n $trap || $(fast_class "${trap_finding#LEAK * * }" "") == other ]] || {
+        echo "ct: a secret branch to a non-tag trap was classed as a tag check on $label: $trap_finding" >&2; exit 1
+    }
     echo "ok   $label: $clean fixtures clean, $(wc -l < "$out/$label.found") listed in fast-known.txt, ${#leaks[@]} leaks caught, the callee leak found by following the call"
 }
 
@@ -318,6 +332,13 @@ read_target x86_64 "$out/x86.o"
 # without it) the fast code differs and ct_fix_arithmetic_u32 reports a branch.
 "$compiler" build "$cases/object-x86.ab" -o "$out/x86-fast.o" --emit object --no-cache --fast -g
 fast_read x86_64 "$out/x86-fast.o"
+# Without debug info the symbols are hashed. Its findings may only be renamed, never added: each one of a branch
+# to a trap must be a finding the build with debug names as a tag check.
+"$compiler" build "$cases/object-x86.ab" -o "$out/x86-fast-nodebug.o" --emit object --no-cache --fast --no-debug
+fast_read x86_64 "$out/x86-fast-nodebug.o" -nodebug trap
+cmp "$out/x86_64-fast.found" "$out/x86_64-fast-nodebug.found" || {
+    echo "ct: the fast build without debug info has other findings than the one with" >&2; exit 1
+}
 frame_address_read
 residue_read
 real_entries_run
