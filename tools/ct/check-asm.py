@@ -1613,6 +1613,13 @@ def check_wasm(lines, secret, pointers, results=0):
     # Each pass starts at the function's entry; a loop's head joins what its back edges brought in
     # the pass before, and a block's end what branches out of it did, until nothing changes.
     heads = {}
+    header_args = FOLLOW.get("header_args", [])
+    FOLLOW["header_args"] = []  # a followed callee has none
+    # A header-public pointer is a parameter no instruction of the function ever writes, in a function that makes no
+    # call (a callee could store a secret through it): locals are untouched by a call, memory is not.
+    written = {int(t.split()[1]) for _, t in lines if t.split()[:1] in (["local.set"], ["local.tee"])}
+    calls = any(t.split()[:1] in (["call"], ["call_indirect"], ["return_call"]) for _, t in lines)
+    header_locals = set() if calls else {i for i in header_args if i not in written}
     for _ in range(64):
         before = {k: (set(v[0]), set(v[1])) for k, v in heads.items()}
         returned = []
@@ -1742,10 +1749,15 @@ def check_wasm(lines, secret, pointers, results=0):
                     raise Violation(f"secret address: {text}")
                 # Linear-memory aliases cannot be distinguished here; treating every
                 # load as secret also fails closed if a pointer was spilled there.
-                stack.append((True, False))
+                previous = lines[at - 1][1].split() if at else []
+                header_word = (header_locals and previous[:1] == ["local.get"] and int(previous[1]) in header_locals and
+                               len(parts) > 1 and re.fullmatch(r"\d+", parts[1]) and int(parts[1]) < HEADER_BYTES)
+                stack.append((not header_word, False))
             elif re.match(r"^(i32|i64|f32|f64|v128)\.store", op):
                 _value = stack.pop() if stack else (False, False)
                 address_value = stack.pop() if stack else (False, False)
+                if header_args and _value[0] and address_value[1]:
+                    raise Violation(f"secret stored through an object pointer: {text}")
                 if address_value[0]:
                     raise Violation(f"secret address: {text}")
             elif op in ("select", "f32.select"):
@@ -1801,7 +1813,7 @@ CHECKERS = {"x86_64": check_x86, "aarch64": check_aarch64, "xtensa": check_xtens
 
 HEADERS = {}
 HEADER_BYTES = 32
-HEADER_CHECKERS = ("x86_64", "aarch64")
+HEADER_CHECKERS = ("x86_64", "aarch64", "wasm")
 
 
 def parse_spec(spec, count_hint=8):

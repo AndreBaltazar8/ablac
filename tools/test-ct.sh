@@ -183,27 +183,32 @@ division_read() {
 
 # The header-public pointer (`%n`): the first 32 bytes of the object it points to are public, the rest is secret. The
 # clean entries read the header; the rest (payload read, a variable offset, the register overwritten, replaced on one
-# path, clobbered by a call, a secret stored through it or a copy of it) must be reported. x86-64 and AArch64 (hand
-# fixtures); Wasm and Xtensa refuse the spec.
+# path, clobbered by a call, a secret stored through it or a copy of it) must be reported. x86-64, AArch64 and Wasm (hand
+# fixtures); Xtensa refuses the spec.
 header_read() {
-    local arch=$1 triple=$2 file=$3 entry
+    local arch=$1 triple=$2 file=$3 entry binary="$out/$3"
     llvm-mc -triple "$triple" -filetype=obj "$cases/$file.s" -o "$out/$file.o"
-    ld.lld -static -e hdr_branch "$out/$file.o" -o "$out/$file"
+    if [ "$arch" = wasm ]; then
+        binary="$out/$file.wasm"
+        wasm-ld --no-entry --export-all --allow-undefined -o "$binary" "$out/$file.o"
+    else
+        ld.lld -static -e hdr_branch "$out/$file.o" -o "$binary"
+    fi
     for entry in hdr_branch hdr_loop; do
-        $check "$arch" "$out/$file" "$entry:%0" > "$out/$file-$entry.log" 2>&1 || {
+        $check "$arch" "$binary" "$entry:%0" > "$out/$file-$entry.log" 2>&1 || {
             cat "$out/$file-$entry.log" >&2; echo "ct: header entry $entry was reported on $arch" >&2; exit 1
         }
     done
     for entry in payload_branch payload_index header_indexed header_overwritten header_merge header_call header_offset; do
         # The call is followed, so what is reported is the header read after it, not the call.
-        if $check --follow-calls "$arch" "$out/$file" "$entry:%0" > "$out/$file-$entry.log" 2>&1; then
+        if $check --follow-calls "$arch" "$binary" "$entry:%0" > "$out/$file-$entry.log" 2>&1; then
             echo "ct: missed header control $entry on $arch" >&2; exit 1
         fi
         grep -q '^LEAK' "$out/$file-$entry.log" || { cat "$out/$file-$entry.log" >&2; exit 1; }
         ! grep -q ': call: ' "$out/$file-$entry.log" || { cat "$out/$file-$entry.log" >&2; exit 1; }
     done
     for entry in header_store_secret header_store_other; do
-        if $check "$arch" "$out/$file" "$entry:%0,1" > "$out/$file-$entry.log" 2>&1; then
+        if $check "$arch" "$binary" "$entry:%0,1" > "$out/$file-$entry.log" 2>&1; then
             echo "ct: missed header control $entry on $arch" >&2; exit 1
         fi
         grep -q 'LEAK.*secret stored through an object pointer' "$out/$file-$entry.log" || { cat "$out/$file-$entry.log" >&2; exit 1; }
@@ -213,13 +218,13 @@ header_read() {
 
 header_refused() {
     local arch
-    for arch in wasm xtensa; do
+    for arch in xtensa; do
         if $check "$arch" "$out/header-x86" "hdr_branch:%0" > "$out/header-refused-$arch.log" 2>&1; then
             echo "ct: a header pointer was accepted on $arch, which doesn't read it" >&2; exit 1
         fi
         grep -q "isn't read on $arch" "$out/header-refused-$arch.log" || { cat "$out/header-refused-$arch.log" >&2; exit 1; }
     done
-    echo "ok   wasm and xtensa refuse the header pointer spec"
+    echo "ok   xtensa refuses the header pointer spec"
 }
 
 # Secret residue: what a secret-handling call leaves in memory that nothing wipes. The register allocator spills
@@ -575,6 +580,7 @@ worker_read "$out/x86.o"
 division_read
 header_read x86_64 x86_64-linux-gnu header-x86
 header_read aarch64 aarch64-linux-gnu header-a64
+header_read wasm wasm32 header-wasm
 header_refused
 
 # --- AArch64 --------------------------------------------------------------------------

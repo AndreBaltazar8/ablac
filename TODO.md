@@ -257,12 +257,12 @@
   header size is a runtime layout fact, so the spec must be generated from `runtime/` (not typed by hand) and a layout
   change must fail the generator; and the checker must still fail closed on a store of a secret into a header offset.
   Controls: a secret stored at offset 8, a secret-indexed header read, and a pointer spilled and reloaded.
-  *Built so far:* the `%n` parameter on x86-64 and AArch64 (Wasm and Xtensa refuse the spec), as a pointer whose register
+  *Built so far:* the `%n` parameter on x86-64, AArch64 and Wasm (Xtensa refuses the spec; on Wasm a parameter no instruction writes, in a function with no call, since a callee could store through it), as a pointer whose register
   is never written (any instruction that may write it, or a call, ends it; a merge keeps that, since states join by
   union) and whose 32 header bytes are read at a constant offset by `mov`, `cmp` or `test`; a secret stored through any
   pointer in such a function is refused. Eleven entries each in `tests/cases/ct/header-x86.s` and `header-a64.s` (two clean, nine controls). Not built: the allocator's
   result as a `%` pointer (and the explicit allocator list, with a secret-sized allocation refused), `lea`/`add` of a
-  constant keeping the tag, Wasm and Xtensa, and the generated header size.
+  constant keeping the tag, Xtensa, and the generated header size.
 - [x] **Small constant-array `for` loops avoid materializing an array.** Up to16 homogeneous
   native scalar literals (optionally signed) use a bounded scalar selector and one body copy;
   other/larger arrays keep the ordinary path. Order, capture cells and loop exits are preserved.
