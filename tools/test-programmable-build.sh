@@ -20,7 +20,7 @@ mkdir -p "$output_directory"
 
 "$compiler" build \
     "$project_root/tests/cases/program-build/program-root.ab" \
-    -o "$output_directory/program-root" --fast
+    -o "$output_directory/program-root" --fast --no-cache
 "$compiler" build \
     "$project_root/tests/cases/program-build/generated-root.ab" \
     -o "$output_directory/generated-root" --fast --no-cache

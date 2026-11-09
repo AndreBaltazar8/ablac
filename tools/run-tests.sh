@@ -18,7 +18,9 @@
 # test-programmable-build.sh, test-wasm-debug-reproducible.sh) set ABLA_DEBUG=1 for
 # themselves, and others build with an explicit -g. RUN_TESTS_DEBUG=default leaves
 # ABLA_DEBUG unset (--fast builds carry debug information, release builds do not), the
-# way the suite ran before; RUN_TESTS_DEBUG=1 sets ABLA_DEBUG=1 for every build.
+# way the suite ran before; RUN_TESTS_DEBUG=1 sets ABLA_DEBUG=1 for every build. To triage
+# a failing command, re-run it with RUN_TESTS_DEBUG=1: a crash then prints a stack with
+# source locations, which a build without debug information cannot.
 #
 # Environment:
 #   JOBS                 commands run at once (default: the number of CPUs)
