@@ -495,8 +495,10 @@
   building the same thing again on purpose: `test-codegen-cache-race.sh` (30), `test-discovery-cache.sh`,
   `test-build-killed.sh`, `test-compile-effects.sh`, the fuzzer: scripts that test the cache or the build itself.
   1,371 of the 2,479 calls carry `--no-cache` (55%), so a shared cache would not reach them. A suite-wide cache
-  for identical (source, flags) builds would save about 0.6% of the builds (not CPU-weighted, but the shared
-  ones are small cases): a measured no-go, nothing changed. The suite's CPU is in distinct builds (the
+  for identical (source, flags) builds would save about 0.4% to 0.8% of the builds depending on the key (the key above:
+  source hash, arguments without the `-o` value, `ABLA_*` environment; re-derived by ablac-f3 with 2,338 distinct
+  keys, and with the `.ab` paths dropped 20 cross-script repeats), not CPU-weighted, but the shared ones are
+  small cases: a measured no-go, nothing changed. The suite's CPU is in distinct builds (the
   frontend and LLVM per program), which is the compile-cost work above, not in repeats.
 - [ ] **Editor analysis integration.** Grow opt-in graph-aware analysis and indexed positional
   queries from the compiler's own parser/type APIs. Update abla-lsp separately after the compiler
