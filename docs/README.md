@@ -42,6 +42,8 @@ in seven short sections of runnable programs.
 | [freestanding.md](freestanding.md) | Programs without libc or an operating system |
 | [performance.md](performance.md) | Compiler speed and memory budgets |
 | [macos-runtime-measurements.md](macos-runtime-measurements.md) | Native Mac v0.2.45/v0.2.47 timings, RSS and binary sizes |
+| [wasm-runtime-measurements.md](wasm-runtime-measurements.md) | WebAssembly module size and Node run time of the benchmark programs, v0.2.45 to v0.2.51 |
+| [constant-time.md](constant-time.md) | What `abla/ct` promises, what `tools/test-ct.sh` reads on each target, and what it does not cover |
 
 ## The compiler project
 
