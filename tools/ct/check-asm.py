@@ -727,19 +727,25 @@ def a64_stack_extent(name, seen=()):
         parts = text.split(None, 1)
         op = parts[0]
         ops = a64_split(parts[1]) if len(parts) > 1 else []
-        if op == "sub" and ops and ops[0] == "sp":
-            value = a64_immediate(ops[2]) if len(ops) >= 3 and ops[1] == "sp" else None
-            if len(ops) == 4 and ops[1] == "sp":
-                value = a64_immediate(ops[2] + ", " + ops[3])
-            if value is None:
+        if ops and ops[0] == "sp" and op not in ("str", "stp", "ldr", "ldp"):
+            if op == "sub" and len(ops) >= 3 and ops[1] == "sp":
+                value = a64_immediate(", ".join(ops[2:]))
+                if value is None:
+                    raise Violation(f"call: the stack growth of {name} can't be evaluated: {text}")
+                growth += value
+            elif op == "add" and len(ops) == 3 and ops[1] == "sp" and a64_immediate(ops[2]) is not None:
+                pass  # an epilogue: the stack gets shallower
+            elif (op == "mov" and ops[1:] == ["x29"]) or (op == "add" and len(ops) == 3 and ops[1] == "x29"):
+                pass  # sp restored from the frame register
+            else:
                 raise Violation(f"call: the stack growth of {name} can't be evaluated: {text}")
-            growth += value
-        elif op in ("add", "mov") and ops and ops[0] == "sp":
-            pass  # an epilogue (or a frame restored from x29): the stack gets shallower
-        for operand in ops:
+        for index, operand in enumerate(ops):
             pre = re.fullmatch(r"\[sp,\s*#(-(?:0x[0-9a-f]+|[0-9]+))\]!", operand)
             if pre:
                 growth += -int(pre.group(1), 0)
+            post = operand == "[sp]" and index + 1 < len(ops) and a64_immediate(ops[index + 1])
+            if post and post < 0:
+                growth += -post
             plain = re.fullmatch(r"\[sp,\s*#(-(?:0x[0-9a-f]+|[0-9]+))\]", operand)
             if plain:
                 red_zone = max(red_zone, -int(plain.group(1), 0))
@@ -753,15 +759,17 @@ def a64_stack_extent(name, seen=()):
 def a64_scrub_bytes(name):
     """How many bytes below sp a function wipes if it is exactly what ctScrubStack emits (the zeroing loop from
     sp - N up to sp), else None."""
-    lines = [text for _, text in disassemble(FOLLOW["path"], name)
-             if text.split()[0] not in ("paciasp", "autiasp", "bti", "hint", "nop")]
-    if len(lines) != 6:
+    body = [(address, text) for address, text in disassemble(FOLLOW["path"], name)
+            if text.split()[0] not in ("paciasp", "autiasp", "bti", "hint", "nop")]
+    if len(body) != 6:
         return None
+    lines = [text for _, text in body]
     first = re.fullmatch(r"sub\s+x9,\s*sp,\s*(#.*)", lines[0])
     size = a64_immediate(first.group(1)) if first else None
-    if (size and re.fullmatch(r"mov\s+x10,\s*sp", lines[1]) and
+    branch = re.fullmatch(r"b\.ne\s+(?:0x)?([0-9a-f]+)\b.*", lines[4])
+    if (size and size > 0 and re.fullmatch(r"mov\s+x10,\s*sp", lines[1]) and
             re.fullmatch(r"stp\s+xzr,\s*xzr,\s*\[x9\],\s*#(?:16|0x10)", lines[2]) and
-            re.fullmatch(r"cmp\s+x9,\s*x10", lines[3]) and re.fullmatch(r"b\.ne\s+.*", lines[4]) and
+            re.fullmatch(r"cmp\s+x9,\s*x10", lines[3]) and branch and int(branch.group(1), 16) == body[2][0] and
             lines[5] == "ret" and size % 16 == 0):
         return size
     return None

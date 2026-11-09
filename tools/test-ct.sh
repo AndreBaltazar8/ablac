@@ -230,12 +230,16 @@ residue_a64_read() {
     llvm-mc -triple aarch64-linux-gnu -filetype=obj "$cases/residue-a64.s" -o "$out/residue-a64.o"
     ld.lld -static -e residue_left "$out/residue-a64.o" -o "$out/residue-a64"
     local entry
-    for entry in residue_left residue_unwiped residue_short residue_early; do
+    for entry in residue_left residue_unwiped residue_short residue_early residue_fake; do
         if $check --follow-calls --residue aarch64 "$out/residue-a64" "$entry:0" > "$out/a64-$entry.log" 2>&1; then
             echo "ct: missed $entry on aarch64" >&2; exit 1
         fi
         grep -q 'secret residue' "$out/a64-$entry.log" || { cat "$out/a64-$entry.log" >&2; exit 1; }
     done
+    if $check --follow-calls --residue aarch64 "$out/residue-a64" residue_dynamic:0 > "$out/a64-residue_dynamic.log" 2>&1; then
+        echo "ct: missed residue_dynamic on aarch64" >&2; exit 1
+    fi
+    grep -q "can't be evaluated" "$out/a64-residue_dynamic.log" || { cat "$out/a64-residue_dynamic.log" >&2; exit 1; }
     for entry in residue_wiped residue_covered; do
         $check --follow-calls --residue aarch64 "$out/residue-a64" "$entry:0" > "$out/a64-$entry.log" 2>&1 || {
             cat "$out/a64-$entry.log" >&2; echo "ct: $entry was reported on aarch64" >&2; exit 1
@@ -254,7 +258,7 @@ residue_a64_read() {
     if ! diff -u <(grep -v '^#' "$cases/residue-known-aarch64.txt" | sort) "$out/aarch64-residue.found" > "$out/aarch64-residue.diff"; then
         cat "$out/aarch64-residue.diff" >&2; echo "ct: the aarch64 residue findings changed (tests/cases/ct/residue-known-aarch64.txt)" >&2; exit 1
     fi
-    echo "ok   aarch64 residue: ${#specs[@]} entries wipe what their work used, $(wc -l < "$out/aarch64-residue.found") unwiped, the six controls told apart"
+    echo "ok   aarch64 residue: ${#specs[@]} entries wipe what their work used, $(wc -l < "$out/aarch64-residue.found") unwiped, the eight controls told apart"
 }
 
 # A callee that writes a secret through an address of the caller's own frame (made by lea or by mov from rsp)

@@ -81,3 +81,42 @@ residue_early:
  bl residue_callee
  ldp x29, x30, [sp], #16
  ret
+# A lookalike of the wipe whose loop branch leaves for the return: it zeroes one pair at most, and must not count.
+.globl scrubfake
+.hidden scrubfake
+scrubfake:
+ sub x9, sp, #512
+ mov x10, sp
+ stp xzr, xzr, [x9], #16
+ cmp x9, x10
+ b.ne 1f
+1:
+ ret
+.globl residue_fake
+residue_fake:
+ stp x29, x30, [sp, #-16]!
+ mov x29, sp
+ bl residue_callee
+ bl scrubfake
+ ldp x29, x30, [sp], #16
+ ret
+# A callee that moves sp by a register (a dynamic frame): its depth can't be told, so it is refused.
+.globl residue_dynamic_callee
+.hidden residue_dynamic_callee
+residue_dynamic_callee:
+ stp x29, x30, [sp, #-16]!
+ mov x29, sp
+ sub x9, sp, #256
+ mov sp, x9
+ str x0, [sp]
+ mov sp, x29
+ ldp x29, x30, [sp], #16
+ ret
+.globl residue_dynamic
+residue_dynamic:
+ stp x29, x30, [sp, #-16]!
+ mov x29, sp
+ bl residue_dynamic_callee
+ bl scrub512
+ ldp x29, x30, [sp], #16
+ ret
