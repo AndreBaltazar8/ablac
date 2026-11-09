@@ -183,12 +183,15 @@ division_read() {
 
 # The header-public pointer (`%n`): the first 32 bytes of the object it points to are public, the rest is secret. The
 # clean entries read the header; the rest (payload read, a variable offset, the register overwritten, replaced on one
-# path, clobbered by a call, a secret stored through it or a copy of it) must be reported. x86-64, AArch64 and Wasm (hand
-# fixtures); Xtensa refuses the spec.
+# path, clobbered by a call, a secret stored through it or a copy of it) must be reported. x86-64, AArch64, Wasm and Xtensa (hand
+# fixtures).
 header_read() {
     local arch=$1 triple=$2 file=$3 entry binary="$out/$3"
-    llvm-mc -triple "$triple" -filetype=obj "$cases/$file.s" -o "$out/$file.o"
-    if [ "$arch" = wasm ]; then
+    [ "$arch" = xtensa ] || llvm-mc -triple "$triple" -filetype=obj "$cases/$file.s" -o "$out/$file.o"
+    if [ "$arch" = xtensa ]; then
+        binary="$out/$file.o"
+        llvm-mc -triple xtensa -mcpu=esp32 -filetype=obj "$cases/$file.s" -o "$binary"
+    elif [ "$arch" = wasm ]; then
         binary="$out/$file.wasm"
         wasm-ld --no-entry --export-all --allow-undefined -o "$binary" "$out/$file.o"
     else
@@ -214,17 +217,6 @@ header_read() {
         grep -q 'LEAK.*secret stored through an object pointer' "$out/$file-$entry.log" || { cat "$out/$file-$entry.log" >&2; exit 1; }
     done
     echo "ok   $arch checker: header words of an object pointer are public (2 clean, 9 controls)"
-}
-
-header_refused() {
-    local arch
-    for arch in xtensa; do
-        if $check "$arch" "$out/header-x86" "hdr_branch:%0" > "$out/header-refused-$arch.log" 2>&1; then
-            echo "ct: a header pointer was accepted on $arch, which doesn't read it" >&2; exit 1
-        fi
-        grep -q "isn't read on $arch" "$out/header-refused-$arch.log" || { cat "$out/header-refused-$arch.log" >&2; exit 1; }
-    done
-    echo "ok   xtensa refuses the header pointer spec"
 }
 
 # Secret residue: what a secret-handling call leaves in memory that nothing wipes. The register allocator spills
@@ -581,7 +573,7 @@ division_read
 header_read x86_64 x86_64-linux-gnu header-x86
 header_read aarch64 aarch64-linux-gnu header-a64
 header_read wasm wasm32 header-wasm
-header_refused
+header_read xtensa xtensa header-xtensa
 
 # --- AArch64 --------------------------------------------------------------------------
 "$compiler" build "$cases/aarch64-build.ab" -o "$out/aarch64-driver" --no-cache

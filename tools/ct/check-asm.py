@@ -1255,10 +1255,13 @@ def check_xtensa(lines, secret, pointers):
     # parameter makes all the argument registers secret, and only pointer lists are exact.
     # (A pointer parameter is an `int`, so also a pair: the address is the low one.)
     returned = []
+    header_args = FOLLOW.get("header_args", [])
+    FOLLOW["header_args"] = []  # a followed callee has none
     if secret and isinstance(secret[0], str):
         start, secret, pointers = frozenset(secret), [], []
     else:
         start = frozenset(f"ptr:a{2 + 2 * i}" for i in pointers)
+    start = start | frozenset(f"hdrp:a{2 + 2 * i}" for i in header_args)
     if secret and not pointers:
         start = start | frozenset(f"a{i}" for i in range(2, 8))
     elif secret:
@@ -1342,6 +1345,13 @@ def check_xtensa(lines, secret, pointers):
         op = parts[0]
         ops = [o.strip() for o in parts[1].split(",")] if len(parts) > 1 else []
         t = lambda o: o in state
+        if header_args:
+            # A header-public pointer is one only while its register is never written: a call (the window moves and
+            # the callee may write through it), or any instruction naming it first, other than a store or a branch.
+            if op.startswith(("call", "callx")):
+                state.update(f"lost:a{i}" for i in range(16))
+            elif ops and not XT_BRANCH.match(op) and not op.startswith(("s8i", "s16i", "s32i", "j", "ret", "nop", "memw")):
+                state.add("lost:" + ops[0])
         if XT_BRANCH.match(op):
             if any(t(o) for o in ops[:-1]):
                 raise Violation(f"secret branch: {text}")
@@ -1366,9 +1376,11 @@ def check_xtensa(lines, secret, pointers):
             size = 1 if op.startswith("l8") else 2 if op.startswith("l16") else 4
             at = frame_offset(state, base)
             slots = [f"slot:{at + int(offset, 0) + i}" for i in range(size)] if at is not None else []
+            public_header = ("hdrp:" + base in state and "lost:" + base not in state and
+                             re.fullmatch(r"-?(0x[0-9a-f]+|\d+)", offset) is not None and 0 <= int(offset, 0) < HEADER_BYTES)
             value = (any(slot in state for slot in slots) or "frame-dirty" in state or (
                 "stack-moved" in state and any(item.startswith("slot:") for item in state)
-            )) if slots else True
+            )) if slots else not public_header
             pointer = any("ptr" + slot in state for slot in slots) or (
                 bool(slots) and "stack-moved" in state and any(item.startswith("ptrslot:") for item in state)
             )
@@ -1380,6 +1392,8 @@ def check_xtensa(lines, secret, pointers):
             source, base, offset = ops[0], ops[1], ops[2] if len(ops) > 2 else "0"
             if t(base):
                 raise Violation(f"secret address: {text}")
+            if header_args and t(source) and "ptr:" + base in state:
+                raise Violation(f"secret stored through an object pointer: {text}")
             at = frame_offset(state, base)
             if at is not None:
                 size = 1 if op.startswith("s8") else 2 if op.startswith("s16") else 4
@@ -1813,7 +1827,7 @@ CHECKERS = {"x86_64": check_x86, "aarch64": check_aarch64, "xtensa": check_xtens
 
 HEADERS = {}
 HEADER_BYTES = 32
-HEADER_CHECKERS = ("x86_64", "aarch64", "wasm")
+HEADER_CHECKERS = ("x86_64", "aarch64", "wasm", "xtensa")
 
 
 def parse_spec(spec, count_hint=8):
