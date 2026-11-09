@@ -36,7 +36,7 @@ sed -i 's|^import "abla/ct"$|import "abla/ct"\nimport "abla/ct/scrub"|' "$out/re
 python3 "$cases/residue-entries.py" "$out/residue-cases/fixture.ab" ctScrubStack1024 "$out/residue-cases/fixture.ab" \
     "$cases/crypto-generated.follow" > "$out/residue-entries.txt"
 # Staged build drivers need the scratch fixture paths as well.
-sed -i 's@tests/cases/ct/@build/ct/cases/@g' "$cases/build.ab" "$cases/aarch64-build.ab"
+sed -i 's@tests/cases/ct/@build/ct/cases/@g' "$cases/build.ab" "$cases/build-fast.ab" "$cases/aarch64-build.ab"
 python3 -I tools/ct/test-check-asm.py
 python3 -I tools/ct/test-source-fixtures.py
 
@@ -136,7 +136,7 @@ orchestration_read() { # object, architecture (default x86_64)
 # functions of plain integers that stay calls. They are read whole with their calls followed: x86-64 only. The same
 # specs must be refused without following (the calls are what is covered), and each has a twin with a secret-indexed
 # store after the call, which has to be found for a secret address and not for a refused call.
-worker_read() { # object, architecture (default x86_64)
+worker_read() { # object, architecture (default x86_64), how many of the reads must follow a call (default all)
     local object=$1 arch=${2:-x86_64} specs=() leaks_follow=() spec
     while IFS= read -r spec; do specs+=("$spec"); done < "$cases/crypto-generated.follow"
     while IFS= read -r spec; do leaks_follow+=("$spec"); done < "$cases/crypto-generated.followleaks"
@@ -144,7 +144,7 @@ worker_read() { # object, architecture (default x86_64)
         cat "$out/$arch-workers.log" >&2; echo "ct: a secret reached a branch or an address in a key-handling function" >&2; exit 1
     }
     # Every read really went into a callee: the ok line names how many functions it followed.
-    [[ $(grep -c '^ok.*following [1-9]' "$out/$arch-workers.log") == "${#specs[@]}" ]] || {
+    [[ $(grep -c '^ok.*following [1-9]' "$out/$arch-workers.log") == "${3:-${#specs[@]}}" ]] || {
         cat "$out/$arch-workers.log" >&2; echo "ct: a key-handling read followed no call" >&2; exit 1
     }
     if $check "$arch" "$object" "${specs[@]}" > "$out/$arch-workers-nofollow.log" 2>&1; then
@@ -339,7 +339,8 @@ fast_class() { # finding text, whether a branch to a trap counts as a tag check
 }
 fast_read() { # arch, object, label suffix, "trap" to class a branch to a trap as a tag check, known findings (fast-known.txt)
     local arch=$1 object=$2 label=$1-fast${3:-} trap=${4:-} known=${5:-$cases/fast-known.txt}
-    local target_fixtures=("${fixtures[@]}" "${host_fixtures[@]}")
+    local target_fixtures=("${fixtures[@]}")
+    if [[ $arch == x86_64 || $arch == aarch64 ]]; then target_fixtures+=("${host_fixtures[@]}"); fi
     $check --follow-calls "$arch" "$object" "${target_fixtures[@]}" > "$out/$label.log" 2>&1 || true
     local found=0 clean=0 name rest class
     : > "$out/$label.found"
@@ -428,6 +429,39 @@ a64_follow_read() {
     echo "ok   aarch64 call following: four clean calls read, eight leaks and refusals found, the calls refused without following, sp and x29 name one frame"
 }
 
+# The Wasm checker follows calls too (`call <function index>` to a function of the same module; the arguments come off
+# the operand stack with their taint, the results go back on it). Hand-written module (tests/cases/ct/follow-wasm.s,
+# linked with wasm-ld), with the same shape of controls as the AArch64 ones.
+wasm_follow_read() {
+    llvm-mc -triple wasm32 -filetype=obj "$cases/follow-wasm.s" -o "$out/follow-wasm.o"
+    wasm-ld --no-entry --export-all --allow-undefined -o "$out/follow-wasm.wasm" "$out/follow-wasm.o"
+    local spec expected
+    for spec in follow_clean:0 follow_stale:1 follow_public:0 follow_drop:0; do
+        $check --follow-calls wasm "$out/follow-wasm.wasm" "$spec" > "$out/follow-wasm-clean.log" 2>&1 || {
+            cat "$out/follow-wasm-clean.log" >&2; echo "ct: $spec was reported on wasm" >&2; exit 1
+        }
+        grep -q 'following [1-9]' "$out/follow-wasm-clean.log" || {
+            cat "$out/follow-wasm-clean.log" >&2; echo "ct: $spec didn't follow its call on wasm" >&2; exit 1
+        }
+        if $check wasm "$out/follow-wasm.wasm" "$spec" > "$out/follow-wasm-nofollow.log" 2>&1; then
+            echo "ct: $spec passed on wasm without following its call" >&2; exit 1
+        fi
+        grep -q 'LEAK.*call:' "$out/follow-wasm-nofollow.log" || { cat "$out/follow-wasm-nofollow.log" >&2; exit 1; }
+    done
+    for spec in follow_branch:0:'in function [0-9]*: secret branch' follow_result:0:'secret branch' \
+        follow_store:0:'secret branch' follow_recursive:0:'recursion into function' follow_indirect:0,1:'call: call_indirect'; do
+        expected=${spec#*:*:}
+        spec=${spec%:"$expected"}
+        if $check --follow-calls wasm "$out/follow-wasm.wasm" "$spec" > "$out/follow-wasm-leak.log" 2>&1; then
+            echo "ct: the checker missed $spec on wasm after following its call" >&2; exit 1
+        fi
+        grep -q "$expected" "$out/follow-wasm-leak.log" || {
+            cat "$out/follow-wasm-leak.log" >&2; echo "ct: $spec on wasm: expected '$expected'" >&2; exit 1
+        }
+    done
+    echo "ok   wasm call following: four clean calls read, five leaks and refusals found, the calls refused without following"
+}
+
 # --- x86-64 ---------------------------------------------------------------------------
 for mode in "" --fast; do
     "$compiler" build "$cases/native.ab" -o "$out/native" --no-cache $mode
@@ -474,6 +508,17 @@ fast_read aarch64 "$out/aarch64-fast.o" "" "" "$cases/fast-known-aarch64.txt"
 "$out/wasm-driver"
 node "$cases/run.mjs" "$out/ct.wasm"
 read_target wasm "$out/ct.wasm"
+wasm_follow_read
+# The bignum routines and the AES key functions with their calls followed (two of the seven key reads need no call
+# in this module: the hardware paths have no body to call on Wasm).
+orchestration_read "$out/ct.wasm" wasm
+worker_read "$out/ct.wasm" wasm 5
+# The --fast module keeps every call. Its inline assembly (the barrier of the constant-time primitives) only builds
+# through the compiler's text route, which ABLA_KEEP_LLVM_TEXT selects; the in-process one aborts on it (TODO.md).
+ABLA_KEEP_LLVM_TEXT=1 "$compiler" build "$cases/build-fast.ab" -o "$out/wasm-fast-driver" --no-cache 2> "$out/wasm-fast.log" || {
+    cat "$out/wasm-fast.log" >&2; exit 1
+}
+fast_read wasm "$out/ct-fast.wasm" "" "" "$cases/fast-known-wasm.txt"
 
 # --- Xtensa: read, not run ------------------------------------------------------------
 tools_directory="$out/xtensa-tools"
