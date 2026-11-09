@@ -703,6 +703,70 @@ def callee_inputs_a64(name):
     return read | (set(A64_ARGS) - written)
 
 
+A64_EXTENTS = {}
+
+
+def a64_immediate(text):
+    """The value of `#4096` or `#1, lsl #12`, or None."""
+    m = re.fullmatch(r"#(-?(?:0x[0-9a-f]+|[0-9]+))(?:,\s*lsl #(\d+))?", text.strip())
+    return None if not m else int(m.group(1), 0) << int(m.group(2) or 0)
+
+
+def a64_stack_extent(name, seen=()):
+    """How many bytes below its caller's stack pointer a function and what it calls can have written: its frame
+    (sub sp and pre-index pushes), the red zone below sp (AArch64 leaf functions use up to 128 bytes of it), and
+    the deepest callee. Growth it can't evaluate is a Violation, not a guess."""
+    if name in seen:
+        raise Violation(f"call: recursion into {name}")
+    if name in A64_EXTENTS:
+        return A64_EXTENTS[name]
+    growth = 0
+    red_zone = 0
+    deepest = 0
+    for _, text in disassemble(FOLLOW["path"], name):
+        parts = text.split(None, 1)
+        op = parts[0]
+        ops = a64_split(parts[1]) if len(parts) > 1 else []
+        if op == "sub" and ops and ops[0] == "sp":
+            value = a64_immediate(ops[2]) if len(ops) >= 3 and ops[1] == "sp" else None
+            if len(ops) == 4 and ops[1] == "sp":
+                value = a64_immediate(ops[2] + ", " + ops[3])
+            if value is None:
+                raise Violation(f"call: the stack growth of {name} can't be evaluated: {text}")
+            growth += value
+        elif op in ("add", "mov") and ops and ops[0] == "sp":
+            pass  # an epilogue (or a frame restored from x29): the stack gets shallower
+        for operand in ops:
+            pre = re.fullmatch(r"\[sp,\s*#(-(?:0x[0-9a-f]+|[0-9]+))\]!", operand)
+            if pre:
+                growth += -int(pre.group(1), 0)
+            plain = re.fullmatch(r"\[sp,\s*#(-(?:0x[0-9a-f]+|[0-9]+))\]", operand)
+            if plain:
+                red_zone = max(red_zone, -int(plain.group(1), 0))
+        target = re.fullmatch(r"(?:bl|b)\s+(?:0x)?[0-9a-f]+ <([^>+]+)>", text)
+        if target and target.group(1) != name:
+            deepest = max(deepest, a64_stack_extent(target.group(1), seen + (name,)))
+    A64_EXTENTS[name] = growth + red_zone + deepest
+    return A64_EXTENTS[name]
+
+
+def a64_scrub_bytes(name):
+    """How many bytes below sp a function wipes if it is exactly what ctScrubStack emits (the zeroing loop from
+    sp - N up to sp), else None."""
+    lines = [text for _, text in disassemble(FOLLOW["path"], name)
+             if text.split()[0] not in ("paciasp", "autiasp", "bti", "hint", "nop")]
+    if len(lines) != 6:
+        return None
+    first = re.fullmatch(r"sub\s+x9,\s*sp,\s*(#.*)", lines[0])
+    size = a64_immediate(first.group(1)) if first else None
+    if (size and re.fullmatch(r"mov\s+x10,\s*sp", lines[1]) and
+            re.fullmatch(r"stp\s+xzr,\s*xzr,\s*\[x9\],\s*#(?:16|0x10)", lines[2]) and
+            re.fullmatch(r"cmp\s+x9,\s*x10", lines[3]) and re.fullmatch(r"b\.ne\s+.*", lines[4]) and
+            lines[5] == "ret" and size % 16 == 0):
+        return size
+    return None
+
+
 def follow_call_a64(name, tags, text):
     """follow_call for the AArch64 checker: the callee starts with exactly these register tags."""
     return follow_call(name, sorted(tags), [], text, check=check_aarch64)
@@ -730,6 +794,19 @@ def check_aarch64(lines, secret, pointers):
         passed = frozenset(r for r in A64_ARGS if r in state and r in inputs)
         pointed = frozenset("ptr:" + r for r in A64_ARGS if "ptr:" + r in state and r not in state and r in inputs)
         out = follow_call_a64(name, passed | pointed, text)
+        here = tag_value(state, "spd:")
+        wiped = a64_scrub_bytes(name) if FOLLOW["residue"] else None
+        if wiped:
+            # The callee zeroes [sp - wiped, sp) of the stack pointer it was called with (bl keeps sp). What it
+            # clears of a callee's earlier frames is what that range covers; the entry's own frame is above sp.
+            for tag in [t for t in state if t.startswith("dirty:")]:
+                _, at_call, depth = tag.split(":")
+                if here is not None and at_call != "?":
+                    if here <= int(at_call) and here + wiped >= int(at_call) + int(depth):
+                        state.discard(tag)
+        elif FOLLOW["residue"] and (passed or pointed):
+            # Whatever the callee wrote below our stack pointer may hold a secret; a wipe has to reach it.
+            state.add(f"dirty:{'?' if here is None else here}:{a64_stack_extent(name)}")
         frame_address = any(item.startswith(("stackbase:", "ptrslot:")) for item in state)
         for r in A64_CLOBBERED:
             for tag in (r, "ptr:" + r, "stackbase:" + r):
@@ -986,6 +1063,13 @@ def check_aarch64(lines, secret, pointers):
             out |= states[i]
     for path in returned:
         out |= path
+    if FOLLOW["residue"] and not FOLLOW["stack"]:
+        # A secret in a slot of the entry's frame is a copy in memory that nothing wipes, and so are the frames of
+        # a callee it gave a secret to, unless a wipe below sp covered them.
+        residue = sorted(item for item in out if item.startswith("slot:"))
+        residue += sorted(f"{item.split(':')[2]} bytes of callee frames" for item in out if item.startswith("dirty:"))
+        if residue:
+            raise Violation(f"secret residue at return: {', '.join(residue[:4])}")
     return frozenset(out)
 
 

@@ -224,6 +224,41 @@ residue_read() {
     echo "ok   x86_64 residue: ${#specs[@]} entries wipe what their work used, $(wc -l < "$out/x86_64-residue.found") unwiped, the eleven controls told apart"
 }
 
+# The same read on AArch64: hand-written controls (a secret left in a slot, a callee's frame unwiped, wiped short, wiped
+# after the call it should cover, and wiped enough), then every fixture's residue entry from an object of the target.
+residue_a64_read() {
+    llvm-mc -triple aarch64-linux-gnu -filetype=obj "$cases/residue-a64.s" -o "$out/residue-a64.o"
+    ld.lld -static -e residue_left "$out/residue-a64.o" -o "$out/residue-a64"
+    local entry
+    for entry in residue_left residue_unwiped residue_short residue_early; do
+        if $check --follow-calls --residue aarch64 "$out/residue-a64" "$entry:0" > "$out/a64-$entry.log" 2>&1; then
+            echo "ct: missed $entry on aarch64" >&2; exit 1
+        fi
+        grep -q 'secret residue' "$out/a64-$entry.log" || { cat "$out/a64-$entry.log" >&2; exit 1; }
+    done
+    for entry in residue_wiped residue_covered; do
+        $check --follow-calls --residue aarch64 "$out/residue-a64" "$entry:0" > "$out/a64-$entry.log" 2>&1 || {
+            cat "$out/a64-$entry.log" >&2; echo "ct: $entry was reported on aarch64" >&2; exit 1
+        }
+    done
+    "$compiler" build "$out/residue-cases/object.ab" -o "$out/a64-residue.o" --emit object --no-cache \
+        --target-triple aarch64-unknown-linux-gnu --object-format elf
+    local specs=() spec name
+    for spec in "${fixtures[@]}" "${host_fixtures[@]}"; do
+        name=${spec%%:*}
+        specs+=("ct_res_${name#ct_}:${spec#*:}")
+    done
+    $check --follow-calls --residue aarch64 "$out/a64-residue.o" "${specs[@]}" > "$out/aarch64-residue.log" 2>&1 || true
+    if { grep '^LEAK' "$out/aarch64-residue.log" || true; } | grep -v 'secret residue'; then
+        echo "ct: a finding other than residue on aarch64" >&2; exit 1
+    fi
+    { grep '^LEAK' "$out/aarch64-residue.log" || true; } | awk '{sub(":", "", $3); print $3}' | sort > "$out/aarch64-residue.found"
+    if ! diff -u <(grep -v '^#' "$cases/residue-known-aarch64.txt" | sort) "$out/aarch64-residue.found" > "$out/aarch64-residue.diff"; then
+        cat "$out/aarch64-residue.diff" >&2; echo "ct: the aarch64 residue findings changed (tests/cases/ct/residue-known-aarch64.txt)" >&2; exit 1
+    fi
+    echo "ok   aarch64 residue: ${#specs[@]} entries wipe what their work used, $(wc -l < "$out/aarch64-residue.found") unwiped, the six controls told apart"
+}
+
 # A callee that writes a secret through an address of the caller's own frame (made by lea or by mov from rsp)
 # makes the caller's slots secret; a secret passed in a stack slot is found inside the callee. Hand-written assembly,
 # linked so that the calls resolve.
@@ -425,6 +460,7 @@ ld.lld -static --no-pie -z notext "$out/aarch64.o" "$out/aarch64-start.o" -o "$o
 qemu-aarch64 -cpu max "$out/aarch64" || { echo "ct aarch64: check $? failed" >&2; exit 1; }
 read_target aarch64 "$out/aarch64.o"
 a64_follow_read
+residue_a64_read
 # The bignum routines and the AES key functions, read whole on AArch64 with their calls followed.
 orchestration_read "$out/aarch64.o" aarch64
 worker_read "$out/aarch64.o" aarch64
