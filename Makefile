@@ -312,6 +312,7 @@ test-serial: ablac
 	tools/test-wasm-gc.sh $(COMPILER)
 	tools/test-fast-inline-cache.sh $(COMPILER)
 	tools/test-any-eq-split.sh $(COMPILER)
+	tools/test-any-float-literal.sh $(COMPILER)
 	tools/test-wasm-reclaim-limit.sh $(COMPILER)
 	tools/test-wasm-export-roots.sh $(COMPILER)
 	tools/test-repl.sh $(COMPILER)
