@@ -144,6 +144,25 @@ class LineageTests(unittest.TestCase):
             gate.configure("v9.9.9")
         self.assertEqual(gate.SEEDS["a"][0], "v0.2.51", "a refused lineage leaves the selection alone")
 
+    def test_root_defaults_and_is_selectable(self):
+        self.assertEqual(gate.CANONICAL_ROOT, "/build/source")
+        gate.configure("v0.2.45", "/scratch/build/source")
+        self.assertEqual(gate.CANONICAL_ROOT, "/scratch/build/source")
+        gate.configure("v0.2.45")
+        self.assertEqual(gate.CANONICAL_ROOT, "/build/source", "the next configure without a root restores the default")
+
+    def test_routes_of_two_roots_are_refused(self):
+        first = ComparisonTests("test_identical_complete_routes")
+        first.setUp()
+        try:
+            for directory, manifest in zip(first.dirs, first.manifests):
+                gate.write_json(directory / "manifest.json", manifest)
+            gate.configure("v0.2.45", "/elsewhere/build/source")
+            with self.assertRaisesRegex(ValueError, "wrong IR contract"):
+                gate.compare(*first.dirs, first.root / "comparison")
+        finally:
+            first.doCleanups()
+
     def test_a_route_of_another_lineage_is_refused(self):
         # A manifest built for the first pair must not pass the comparison of the newer one.
         first = ComparisonTests("test_identical_complete_routes")

@@ -31,13 +31,16 @@ LINEAGES = {
 }
 
 
-def configure(lineage):
-    """Select the pair of routes (the module-level HISTORICAL and SEEDS the rest of the gate reads)."""
-    global HISTORICAL, SEEDS
+def configure(lineage, root=None):
+    """Select the pair of routes (the module-level HISTORICAL and SEEDS the rest of the gate reads), and where the
+    candidate source sits. Both routes and the comparison must use the same root: the IR carries source paths. CI
+    reserves /build/source; a local run without it names a directory it owns, such as <scratch>/build/source."""
+    global HISTORICAL, SEEDS, CANONICAL_ROOT
     if lineage not in LINEAGES:
         raise ValueError(f"unknown lineage {lineage}; known: {', '.join(sorted(LINEAGES))}")
     HISTORICAL = LINEAGES[lineage]["historical"]
     SEEDS = dict(LINEAGES[lineage]["seeds"])
+    CANONICAL_ROOT = root if root is not None else "/build/source"
 CANONICAL_ROOT = "/build/source"
 ENTRY = "src/orc_main.ab"
 
@@ -107,7 +110,7 @@ def route(which, repo, output):
     historical = root.parent / "historical"
     # Never clean an existing checkout, even when it belongs to the caller.
     if root.exists() or historical.exists():
-        raise ValueError("requires fresh /build/source and /build/historical; refusing to replace either")
+        raise ValueError(f"requires fresh {root} and {historical}; refusing to replace either")
     output.mkdir(parents=True, exist_ok=False)
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
     tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=repo, text=True).strip()
@@ -132,10 +135,10 @@ def route(which, repo, output):
         cpus = sorted(os.sched_getaffinity(0))[:4]
         env = dict(os.environ)
         # --pure removes ambient ABLA_*, LD_*, grants and optimization overrides.
-        env.update(HOME="/build/home", TMPDIR="/build/tmp")
+        env.update(HOME=str(root.parent / "home"), TMPDIR=str(root.parent / "tmp"))
         shell_settings = {"CI": "true", "TZ": "UTC", "LC_ALL": "C", "JOBS": str(len(cpus)),
                           "ABLA_NATIVE_JOBS": str(len(cpus)), "ABLA_CODEGEN_JOBS": str(len(cpus)),
-                          "ABLA_CACHE_DIR": "/build/cache", "ABLA_MAX_MEMORY_MB": "4096",
+                          "ABLA_CACHE_DIR": str(root.parent / "cache"), "ABLA_MAX_MEMORY_MB": "4096",
                           "ABLA_MAX_STACK_KB": "131072", "ABLA_RELEASE_SELFHOST_BUILD_SECONDS": "1800"}
         manifest["settings"] = {k: v for k, v in shell_settings.items() if k not in ("JOBS", "ABLA_NATIVE_JOBS", "ABLA_CODEGEN_JOBS")}
         manifest["cpus"] = cpus
@@ -259,15 +262,19 @@ def main():
     sub = parser.add_subparsers(dest="mode", required=True)
     run = sub.add_parser("route")
     run.add_argument("--lineage", default="v0.2.45", choices=sorted(LINEAGES))
+    run.add_argument("--root", help="absolute candidate source directory (default /build/source)")
     run.add_argument("route", choices=["a", "b"])
     run.add_argument("output", type=Path)
     join = sub.add_parser("compare")
     join.add_argument("--lineage", default="v0.2.45", choices=sorted(LINEAGES))
+    join.add_argument("--root", help="the --root the routes ran with")
     join.add_argument("a", type=Path)
     join.add_argument("b", type=Path)
     join.add_argument("output", type=Path)
     args = parser.parse_args()
-    configure(args.lineage)
+    if args.root is not None and not os.path.isabs(args.root):
+        parser.error("--root must be an absolute path")
+    configure(args.lineage, args.root)
     if args.mode == "route":
         route(args.route, Path(__file__).absolute().parent.parent, args.output.absolute())
     else:
