@@ -309,6 +309,7 @@ test-serial: ablac
 	tools/test-typed-subparser-inspection.sh $(COMPILER)
 	tools/test-unsafe-boundary.sh $(COMPILER)
 	tools/test-wasm-gc.sh $(COMPILER)
+	tools/test-wasm-ct-barrier.sh $(COMPILER)
 	tools/test-fast-inline-cache.sh $(COMPILER)
 	tools/test-any-eq-split.sh $(COMPILER)
 	tools/test-any-float-literal.sh $(COMPILER)
