@@ -1173,6 +1173,15 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   change and its risk of a directory out of step with the heap, so nothing changed. The 7% on the game
   client's front end is a much larger heap (up to 7.8 M registry slots per collection); the compiler's own
   build does not collect enough for it to matter.
+  Per phase on trees (2026-11-09, master `0eaf983e`, release build, the collector's phases marked `@noinline` only
+  to see them, `perf record -e instructions:u -c 2000000`; the collector is 29% of trees): the sweep 10.2%, the page
+  directory's build 8.4%, tracing 5.6%, `HostCollectionLocate` 2.5%, `HostMarkPointer` 2.3%, libc `free` and
+  `malloc` about 4%. The sweep and the build are per allocation, garbage included (30 and 24 instructions an object
+  over 33.8 M objects). Keeping the registry, the lists and their counters in locals for the sweep's walk and the
+  build's loop (nothing they call reads them): trees -1.04% instructions (11,742.5 M to 11,619.6 M), strings -0.5%
+  (2,036.9 M to 2,026.7 M), maps -0.18%; the bar of 3% for the collector is not met. The bitmap word updated per
+  entry could be held across entries of one page (3 instructions of about 24), under 0.5% and bitmaps can move on
+  growth, so not tried. What would still cut it is a collector whose cost follows what is live.
 - [ ] **Name lookups in lowering.** Over a game server's `--emit-llvm` the method index's
   `find` was 200 of 3,552 samples, the declaration index's 148 and the name hashes 98 and
   76. Done: the method index hashes owner and name in place instead of a key string made

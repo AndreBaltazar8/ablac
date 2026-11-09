@@ -975,8 +975,10 @@ trusted fun __ablaRuntimeHostCollectionPagesBuild(): void {
     var lastPage = -1
     var lastBitmap = 0
     var slot = 0
-    while (slot < __ablaRuntimeHostRegistrySlots) {
-        val entry = ablaRuntimeLoadI64(__ablaRuntimeHostRegistry + slot * 8)
+    val registry = __ablaRuntimeHostRegistry
+    val registrySlots = __ablaRuntimeHostRegistrySlots
+    while (slot < registrySlots) {
+        val entry = ablaRuntimeLoadI64(registry + slot * 8)
         if ((entry & 1) != 0) {
             if (listed == largeCapacity) {
                 largeCapacity = largeCapacity * 2
@@ -1332,26 +1334,46 @@ trusted fun __ablaRuntimeHostTraceMarkedAllocations(): void {
 // Free what the marker did not reach; clear the marks of what it did. What is
 // kept moves down the registry in its order, closing the empty slots.
 trusted fun __ablaRuntimeHostCollectionSweep(): void {
+    // The registry, the lists and their counters stay in locals for the walk: nothing it calls
+    // (free) reads them, and kept in the globals each freed block would load and store them.
+    val registry = __ablaRuntimeHostRegistry
+    val slots = __ablaRuntimeHostRegistrySlots
+    val lists = __ablaRuntimeHostSmallLists()
+    val keptLimit = __ablaRuntimeHostSmallKept
+    var smallBytes = __ablaRuntimeHostSmallBytes
+    var pushed = 0
+    var freedBytes = 0
     var kept = 0
     var slot = 0
-    while (slot < __ablaRuntimeHostRegistrySlots) {
-        val entry = ablaRuntimeLoadI64(__ablaRuntimeHostRegistry + slot * 8)
+    while (slot < slots) {
+        val entry = ablaRuntimeLoadI64(registry + slot * 8)
         if (entry != 0) {
             val header = entry & -16
             val state = ablaRuntimeLoadI64(header + 24)
             if (state >= 0 && state < 16 && state != 10 && state != 12) {
                 val size = ablaRuntimeLoadI64(header + 16)
-                __ablaRuntimeHostLiveBytes = __ablaRuntimeHostLiveBytes - size
-                __ablaRuntimeHostBlockFree(header, size)
+                freedBytes = freedBytes + size
+                // __ablaRuntimeHostBlockFree, with its counters held here.
+                if (size <= 480 && smallBytes < keptLimit) {
+                    val total = (size + 39) & -8
+                    val list = lists + total
+                    ablaRuntimeStoreI64(header, ablaRuntimeLoadI64(list))
+                    ablaRuntimeStoreI64(list, header)
+                    smallBytes = smallBytes + total
+                    pushed = pushed + total
+                } else free(ablaRuntimePointerFromAddress(header))
             } else {
                 if (state >= 16) ablaRuntimeStoreI64(header + 24, state - 32)
                 ablaRuntimeStoreI64(header, kept)
-                ablaRuntimeStoreI64(__ablaRuntimeHostRegistry + kept * 8, entry)
+                ablaRuntimeStoreI64(registry + kept * 8, entry)
                 kept = kept + 1
             }
         }
         slot = slot + 1
     }
+    __ablaRuntimeHostLiveBytes = __ablaRuntimeHostLiveBytes - freedBytes
+    __ablaRuntimeHostSmallBytes = smallBytes
+    __ablaRuntimeHostSmallPushed = __ablaRuntimeHostSmallPushed + pushed
     __ablaRuntimeHostRegistrySlots = kept
     return
 }
