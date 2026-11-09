@@ -257,6 +257,8 @@
   header size is a runtime layout fact, so the spec must be generated from `runtime/` (not typed by hand) and a layout
   change must fail the generator; and the checker must still fail closed on a store of a secret into a header offset.
   Controls: a secret stored at offset 8, a secret-indexed header read, and a pointer spilled and reloaded.
+  **No real entry uses `%n` yet:** what exists is the mechanism and its hand-written controls, not coverage of `aesNewKey`,
+  `rsaCrt` or any other function of the crypto plumbing; those stay unread until the application below is done.
   *Built so far:* the `%n` parameter on x86-64, AArch64, Wasm and Xtensa (on Wasm a parameter no instruction writes, in a function with no call, since a callee could store through it), as a pointer whose register
   is never written (any instruction that may write it, or a call, ends it; a merge keeps that, since states join by
   union) and whose 32 header bytes are read at a constant offset by `mov`, `cmp` or `test`; a secret stored through any
