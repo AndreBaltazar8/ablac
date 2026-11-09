@@ -742,11 +742,158 @@ fun safeSlice(s: string, a: int, b: int): string {
         lines.append("}")
         return lines, f"c{index}()", "str"
 
+    # ---- depth checks for generics, interfaces and nullable chains (PRELUDE_DEEP)
+    def typed_pair(self, ty, env):
+        """Two expressions of type ty and a function turning one into the text shown."""
+        a, b = self.expr(ty, 2, env), self.expr(ty, 2, env)
+        show = (lambda e: f"fmtF({e})") if ty == "f64" else (lambda e: f'"${{{e}}}"')
+        return a, b, show
+
+    def deep_generic_check(self, index):
+        """Nested generic classes, generic functions over interface values, closures through them."""
+        r = self.r
+        env = []
+        lines = [f"fun c{index}(): string {{", '    var out = ""']
+        for n in range(r.randint(2, 5)):
+            ty = r.choice(["int", "f64", "str", "u8", "i32"])
+            a, b, show = self.typed_pair(ty, env)
+            tn = self.type_name(ty)
+            kind = r.choice(["nested", "heldOr", "heldNull", "via", "zip", "twice", "boxbox"])
+            tag = f"{index}x{n}"
+            if kind == "nested":
+                lines.append(f"    val nb{tag} = nested({a})")
+                lines.append(f'    out = out + {show(f"nb{tag}.get().first")} + {show(f"nb{tag}.get().second[1]")} + ";"')
+            elif kind == "heldOr":
+                lines.append(f'    out = out + {show(f"heldOr(Cell({a}), {b})")} + ";"')
+            elif kind == "heldNull":
+                lines.append(f"    val hn{tag}: Holder<{tn}>? = {r.choice(['null', f'Cell({a})'])}")
+                lines.append(f'    out = out + {show(f"heldOr(hn{tag}, {b})")} + ";"')
+            elif kind == "via":
+                lines.append(f'    out = out + viaHolder(Twice({a}), {{ xs -> "${{xs.size}}${{xs[1]}}" }}) + ";"')
+            elif kind == "zip":
+                lines.append(f"    val zp{tag} = zipPair(Cell({a}), Cell({r.choice(['true', 'false'])}))")
+                lines.append(f'    out = out + {show(f"zp{tag}.first")} + "${{zp{tag}.second}};"')
+            elif kind == "twice":
+                lines.append(f'    out = out + {show(f"Twice({a}).held()[0]")} + "${{Twice({b}).held().size}};"')
+            else:
+                lines.append(f"    val bb{tag} = Box(Box({a}))")
+                lines.append(f'    out = out + {show(f"bb{tag}.get().get()")} + {show(f"Box(Box({b})).get().get()")} + ";"')
+        lines.append("    out")
+        lines.append("}")
+        return lines, f"c{index}()", "str"
+
+    def deep_iface_check(self, index):
+        """Interface dispatch through generic holders and arrays of holders."""
+        r = self.r
+        env = []
+        items = [f"Cell({self.int_expr('int', 2, env)})" for _ in range(r.randint(2, 4))]
+        lines = [f"fun c{index}(): string {{", f"    val hs: array<Holder<int>> = [{', '.join(items)}]",
+                 "    var total = 0", '    var out = ""',
+                 "    for (h in hs) total += h.held()",
+                 f"    val boxed = Box<Holder<int>>(hs[{r.randint(0, len(items) - 1)}])",
+                 '    out = out + "${total} ${boxed.get().held()}"']
+        for _ in range(r.randint(1, 3)):
+            k = r.choice(["via", "pick", "swap"])
+            x, y = self.int_expr("int", 2, env), self.int_expr("int", 2, env)
+            if k == "via":
+                lines.append(f'    out = out + " ${{viaHolder(Cell({x}), {{ v -> v * {self.int_lit("int")} }})}}"')
+            elif k == "pick":
+                lines.append(f'    out = out + " ${{pick<Holder<int>>(Cell({x}), Cell({y}), {self.bool_expr(1, env)}).held()}}"')
+            else:
+                lines.append(f'    out = out + " ${{swapped(Pair(Cell({x}), Cell({y}))).first.held()}}"')
+        lines.append("    out")
+        lines.append("}")
+        return lines, f"c{index}()", "str"
+
+    def deep_nullable_check(self, index):
+        """`?.` and `??` chains across nullable class fields, nullable generic instances, when on nullables."""
+        r = self.r
+        env = []
+
+        def chain(d):
+            if d == 0 or r.random() < 0.25:
+                return "null"
+            cell = "null" if r.random() < 0.35 else f"Cell({self.int_expr('int', 1, env)})"
+            tag = "null" if r.random() < 0.4 else '"' + r.choice(STRINGS) + '"'
+            return f"Chain({chain(d - 1)}, {cell}, {tag})"
+
+        lines = [f"fun c{index}(): string {{", f"    val c: Chain? = {chain(4)}", '    var out = ""']
+        for k in range(r.randint(3, 6)):
+            path = "c" + "".join(r.choice(["?.next"] * 3 + [""]) for _ in range(r.randint(1, 3)))
+            kind = r.choice(["cell", "tag", "size", "when", "cellnull", "guard", "elvis"])
+            if kind == "cell":
+                lines.append(f'    out = out + "${{{path}?.cell?.inner ?? {self.int_lit("int")}}};"')
+            elif kind == "tag":
+                lines.append(f'    out = out + "${{{path}?.tag ?? "d"}};"')
+            elif kind == "size":
+                lines.append(f'    out = out + "${{{path}?.tag?.size ?? -1}};"')
+            elif kind == "when":
+                lines.append(f'    out = out + when ({path}?.cell) {{ null -> "none;"; else -> "cell${{{path}?.cell?.inner ?? 0}};" }}')
+            elif kind == "cellnull":
+                lines.append(f'    out = out + "${{{path}?.cell == null}}${{{path}?.tag != null}};"')
+            elif kind == "guard":
+                x = f"g{k}"
+                lines.append(f"    val {x}: Cell<int>? = {path}?.cell")
+                lines.append(f'    out = out + (if ({x} != null) "${{{x}.held() + 1}};" else "no;")')
+            else:
+                lines.append(f'    out = out + "${{heldOr({path}?.cell, {self.int_lit("int")})}};"')
+        lines.append("    out")
+        lines.append("}")
+        return lines, f"c{index}()", "str"
+
+    ANY_VALUES = ["0", "1", "(-1)", '"0"', '"a"', "true", "false", "1.5", "0.0", "(-0.0)", "f64ToF32(1.5)",
+                  "f64ToF32(0.0)", "u8(0)", "u8(1)", "i32(1)", "[1]"]
+    ANY_FLOATS = ["0.0", "1.0", "1.5", "(-0.0)", "f64ToF32(1.5)", "f64ToF32(0.0)", "f64ToF32(1.0)"]
+
+    def any_check(self, index):
+        """An `any` holding one value compared with float literals and values: `==`, `!=`, `when`."""
+        r = self.r
+        lines = [f"fun c{index}(): string {{", '    var out = ""']
+        for k in range(r.randint(3, 6)):
+            held = r.choice(self.ANY_VALUES)
+            other = r.choice(self.ANY_FLOATS)
+            lines.append(f"    val a{k}: any = {held}")
+            kind = r.choice(["eq", "ne", "rev", "when", "both"])
+            if kind == "eq":
+                lines.append(f'    out = out + (if (a{k} == {other}) "1" else "0")')
+            elif kind == "ne":
+                lines.append(f'    out = out + (if (a{k} != {other}) "1" else "0")')
+            elif kind == "rev":
+                lines.append(f'    out = out + (if ({other} == a{k}) "1" else "0")')
+            elif kind == "when":
+                lines.append(f'    out = out + when (a{k}) {{ {other} -> "w"; else -> "n" }}')
+            else:
+                lines.append(f"    val v{k}: any = {other}")
+                lines.append(f'    out = out + (if (a{k} == v{k}) "1" else "0")')
+        lines.append("    out")
+        lines.append("}")
+        return lines, f"c{index}()", "str"
+
+    PRELUDE_DEEP = """interface Holder<T> {
+    fun held(): T
+}
+class Cell<T>(val inner: T) : Holder<T> {
+    fun held(): T = this.inner
+}
+class Twice<T>(val inner: T) : Holder<array<T>> {
+    fun held(): array<T> = [this.inner, this.inner]
+}
+class Chain(val next: Chain?, val cell: Cell<int>?, val tag: string?)
+fun <T> heldOr(h: Holder<T>?, fallback: T): T = if (h == null) fallback else h.held()
+fun <T, R> viaHolder(h: Holder<T>, f: (T) -> R): R = f(h.held())
+fun <A, B> zipPair(a: Cell<A>, b: Cell<B>): Pair<A, B> = Pair(a.inner, b.inner)
+fun <T> nested(x: T): Box<Pair<T, array<T>>> = Box(Pair(x, [x, x]))
+"""
+    PRELUDE = PRELUDE + PRELUDE_DEEP
+
     def check(self, index):
         """One check: a function and its call; returns (function lines, call text, result type)."""
         r = self.r
         if self.with_any and r.random() < 0.12:
             return self.any_pool_check(index)
+        if r.random() < 0.10:
+            return r.choice([self.deep_generic_check, self.deep_iface_check, self.deep_nullable_check,
+                             self.any_check])(index)
         extra = r.random()
         if extra < 0.30:
             return r.choice([self.conv_check, self.generic_check, self.iface_check,
