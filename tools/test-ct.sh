@@ -280,7 +280,7 @@ real_entries_run() {
         echo "ct: a real entry point left bytes below itself with a collection at every safe point" >&2; exit 1
     }
     rm -f "$out"/keys-*.pem "$out"/keys-*.p8 "$out"/keys-*.p12
-    echo "ok   x86_64 real entry points: AES at 128, 192 and 256 bits with a 64 KiB input, RSA at 2048, 3072 and 4096, key generation: nothing below their own frame in 16 KiB, three runs and one under GC stress"
+    echo "ok   x86_64 real entry points: AES at 128, 192 and 256 bits with a 64 KiB input, RSA at 2048, 3072 and 4096, key generation, the password entries of PBE over PKCS#8 and PKCS#12: nothing below their own frame in 16 KiB, three runs and one under GC stress"
 }
 # A --fast build doesn't optimise, so it keeps what release builds remove: the type-tag check of every
 # erased scalar conversion branches on a value copied from a secret's box, and a division by a secret
