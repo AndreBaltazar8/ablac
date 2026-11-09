@@ -754,14 +754,15 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   (`string-helpers`). No setting reaches 10% on the small programs; not pursued.
   Call-site screen 2026-11-08 (master `3fce16e3`, a `-g` release compiler, `perf record --call-graph dwarf` at one
   sample per 1 M instructions of a `--fast` build of `unsafe-boundary.ab` (4.0 G) and per 20 M of the compiler's own
-  `--fast` self-build (83.7 G); the DWARF inline frames name the source function): in the small build
+  `--fast` self-build (83.7 G); the DWARF inline frames name the source function; the two recordings are kept in
+  `~/archive/ablac-callsites-2026-11-09/`): in the small build
   `__ablaRuntimeStringBytesEqual` is 3.6% with no caller above 0.2% (type-name comparisons in sema), `ArrayAppend`
   1.6% + 1.1% growing (the lexer 0.30%, `bootstrapLlvmEmitFunction` 0.18%), and `bootstrapTextContains` 2.2%, of which
   `bootstrapFloatBridgeMustPreload` (a scan of every module's whole source for "compiler", twice, with no stop at
   the first hit) 0.70%, `bootstrapCompileBuiltinEffect` 0.58%, `bootstrapCompileExternalEffect` 0.23%. In the
   self-build the same helpers are 3.0%, 2.3% + 0.9% and 0.6%, the biggest single call site 0.56% (`ArrayAppend` from
   `bootstrapLlvmEmitFunction`), `malloc`/`free` about 9% and the collector (`MemoryCollect`, marking) about 7.6%:
-  flat, no site to cut for 3%. Done: `bootstrapTextContains` calls `textFindSequence` (the tuned scan, same result)
+  no single site above 0.56%, so 3% would take about six such sites. Done: `bootstrapTextContains` calls `textFindSequence` (the tuned scan, same result)
   and the preload check scans once and stops at the first hit. Stage-1 compilers of master and of the change,
   `build --fast --no-cache`, user instructions, best of 2 to 3 alternating runs, outputs byte-identical: fib 1.288 G
   to 1.263 G (-1.93%), maps 1.442 to 1.417 (-1.74%), unsafe-boundary 3.656 to 3.557 (-2.70%), the self-build
@@ -769,6 +770,11 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   about 2%. (`bootstrapReadRunningImageIdentity` reads as 4.5% in the `-g` profile only because that image is 24.8 MB;
   the release compiler's is 8.3 MB.) One of two candidate stage-1 builds, run through the v0.2.50 seed, crashed at
   the 4 GiB address-space limit (`[abla-limit] process crashed`) and the rerun passed, the peak sensitivity above.
+  Peak RSS of three stage-1 builds each through that seed (`ru_maxrss`, KiB): master at the v0.2.51 pin 1,420,024,
+  1,513,132 and 1,412,392, the change 1,517,412, 1,407,812 and 1,417,600: both show the 1.41 and 1.51 GB modes
+  of the item above, and the medians are 1,420,024 and 1,417,600 (-0.2%): no sign that the change raises the peak.
+  The change's gate (stage 2 == stage 3, `make self-rebuild`, suite 312/312) ran before its rebase onto the pin;
+  batch 2's combined gate on master (stage 2 == stage 3, self-rebuild, 317/317) covers the merged tip.
 - [ ] **Reuse the frontend's work on the standard library between builds** (parked 2026-11-08). In the profile
   above the compiler's own code is 58 to 59% of a `--fast` build and the standard library's modules are
   most of what a small program imports, so lexing, parsing, analyzing and lowering them again each
