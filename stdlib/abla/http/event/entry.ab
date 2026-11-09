@@ -210,7 +210,8 @@ fun HttpEventServer.closeSlot(slot: int): void {
 }
 
 // The request line must be `method SP target SP HTTP/1.x` and nothing else: returns 1 for HTTP/1.1, 0 for HTTP/1.0
-// and -1 for anything else, which is refused (a line that is not a request is never routed).
+// and -1 for anything else, which is refused (a line that is not a request is never routed). The target is an origin
+// form (`/p`), `*`, or an absolute form (`http://host/p`, which a proxy sends).
 private fun httpEventRequestLineVersion(input: string, headerEnd: int): int {
     var end = 0
     while (end + 1 < headerEnd && !(input[end] == 13 && input[end + 1] == 10)) end = end + 1
@@ -228,20 +229,42 @@ private fun httpEventRequestLineVersion(input: string, headerEnd: int): int {
         index = index + 1
     }
     var version = -1
-    if (valid && first > 0 && second > first + 1 && second + 1 < end &&
-        (input[first + 1] == 47 || input[first + 1] == 42)) {
-        val text = input.slice(second + 1, end)
-        if (text == "HTTP/1.1") version = 1
-        else if (text == "HTTP/1.0") version = 0
+    if (valid && first > 0 && second > first + 1 && end - second == 9 &&
+        input[second + 1] == 72 && input[second + 2] == 84 && input[second + 3] == 84 &&
+        input[second + 4] == 80 && input[second + 5] == 47 && input[second + 6] == 49 &&
+        input[second + 7] == 46 && (input[second + 8] == 48 || input[second + 8] == 49)) {
+        val lead = input[first + 1]
+        var accepted = lead == 47 || lead == 42
+        if (!accepted && ((lead >= 65 && lead <= 90) || (lead >= 97 && lead <= 122))) {
+            // A scheme, then "://".
+            var scan = first + 2
+            while (scan < second && ((input[scan] >= 65 && input[scan] <= 90) ||
+                (input[scan] >= 97 && input[scan] <= 122) || (input[scan] >= 48 && input[scan] <= 57) ||
+                input[scan] == 43 || input[scan] == 45 || input[scan] == 46)) scan = scan + 1
+            accepted = scan + 3 < second && input[scan] == 58 && input[scan + 1] == 47 && input[scan + 2] == 47
+        }
+        if (accepted) version = if (input[second + 8] == 49) 1 else 0
     }
     version
 }
 
-// Chunked framing and a Content-Length together are two answers to where the body ends, and a proxy in front may
-// pick the other one: the request is refused.
-private fun httpEventAmbiguousFraming(request: HttpRequest): bool =
-    request.header("Content-Length") != "" &&
-        request.header("Transfer-Encoding") != ""
+// Two answers to where a request's body ends are refused, since a proxy in front may pick the other one: a
+// Content-Length together with Transfer-Encoding, two Content-Lengths that differ, and Transfer-Encoding in an
+// HTTP/1.0 request (RFC 9112 6.1 and 6.3).
+private fun httpEventAmbiguousFraming(request: HttpRequest, http10: bool): bool {
+    var lengths = 0
+    var first = ""
+    var ambiguous = false
+    for (header in request.headers) {
+        if (header.name.size == 14 && httpAsciiEqualInsensitive(header.name, "Content-Length")) {
+            lengths = lengths + 1
+            if (lengths == 1) first = header.value
+            else if (header.value != first) ambiguous = true
+        }
+    }
+    val transfer = request.header("Transfer-Encoding") != ""
+    ambiguous || (lengths > 0 && transfer) || (http10 && transfer)
+}
 
 // HTTP/1.1 keeps the connection unless the request says close; HTTP/1.0 closes unless it says keep-alive.
 private fun httpEventKeepAlive(request: HttpRequest, http10: bool): bool =
@@ -262,7 +285,7 @@ fun httpEventRequestLength(
         val request = httpParseRequest(input.slice(0, headerEnd))
         val transfer = request.header("Transfer-Encoding")
         if (httpEventRequestLineVersion(input, headerEnd) < 0 ||
-            httpEventAmbiguousFraming(request)) result = -1
+            httpEventAmbiguousFraming(request, false)) result = -1
         else if (httpHeaderTokenContains(transfer, "chunked")) {
             val decoded = httpDecodeChunked(
                 input.slice(headerEnd, input.size), maximumBody
@@ -324,7 +347,7 @@ fun httpEventFrame(
         val transfer = request.header("Transfer-Encoding")
         val version = httpEventRequestLineVersion(input, headerEnd)
         http10 = version == 0
-        if (version < 0 || httpEventAmbiguousFraming(request)) length = -1
+        if (version < 0 || httpEventAmbiguousFraming(request, http10)) length = -1
         else if (httpHeaderTokenContains(transfer, "chunked")) {
             val decoded = httpDecodeChunked(
                 input.slice(headerEnd, input.size), maximumBody
@@ -477,6 +500,7 @@ fun HttpEventServer.processNoEscapeInputInRegion(
         this.outputs[slot] = memoryPromoteString(
             httpText("bad request", 400).render()
         )
+        this.outputOffsets[slot] = 0
         this.closing[slot] = true
         readyToWrite = true
     } else if (length > 0) {

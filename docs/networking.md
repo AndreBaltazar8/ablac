@@ -151,7 +151,7 @@ fun main {
 | `httpText(body, status = 200)`, `httpJson(body, status = 200)` | responses with a content type |
 | `httpGet(path)`, `httpPost(path, body)`, `httpRequest(method, path, body, headers)` | build a request |
 | `httpParseRequest(text)`, `httpParseResponse(text)`, `response.render()` | parse and render the wire format |
-| `serveHttp(router, port)`, `serveHttpOnce`, `serveHttpOnListener` | serve over TCP |
+| `serveHttp(router, port)`, `serveHttpOnce`, `serveHttpOnListener` | serve over TCP, one request per connection, serially (persistent connections: `abla/http/event`) |
 | `httpIpv4Client(authority, address, port, maxBytes, timeout, deadline)`, `httpsClient(host, port, maxBytes, timeout, deadline)` (from `abla/http/tls`), `client.send(request)` | send requests; `timeout` bounds each read and write, the optional `deadline` the whole exchange, in milliseconds |
 
 ### Portable sockets: `abla/net/hosted`
@@ -590,6 +590,31 @@ framework callback. On SIGTERM or explicit stop it closes the listener first,
 prevents keep-alive reuse, flushes queued responses up to a configured drain
 deadline, and force-closes stalled peers. The WebSocket event server performs
 the equivalent bounded close-frame drain.
+
+Choose it when connections should persist. `serveHttp`, `serveHttpOnce` and
+`serveHttpOnListener` are blocking and serial: they answer one request per
+connection and always send `Connection: close`, because a persistent
+connection would hold their only thread while other peers waited to be
+accepted. A service behind a proxy that wants to keep connections to its
+origin open (a CDN, a load balancer) moves to
+`httpEventServer(router, address, options).run()` with the same router and
+handlers; `options` sets the connection ceiling (1023), header and body
+limits (64 KiB, 1 MiB), the requests allowed on one connection (100), the idle
+timeout (30 s), the gzip threshold (256 bytes; a huge value turns gzip off)
+and the drain time at SIGTERM. Handlers still run on the one loop thread, so
+a handler that blocks holds every connection, as it does in the blocking
+server.
+
+The event server frames requests strictly, because a proxy in front may frame
+them differently. HTTP/1.1 connections persist unless the request says
+`Connection: close`; HTTP/1.0 connections close unless it says
+`Connection: keep-alive`. A request line that is not `method target HTTP/1.x`
+with a target starting `/` or `*`, a `Content-Length` together with
+`Transfer-Encoding` (RFC 9112 6.1), an invalid chunk, or a body over the limit
+is answered `400` and the connection closes. A body shorter than declared waits
+for the rest and the idle timeout closes the connection without an answer; bytes
+after a body of the declared length are the next request, never part of this
+one. `tests/cases/modules/http-event.ab` runs each of these.
 
 The steady-state HTTP path keeps only readable interest registered. A response
 that fills the kernel send buffer enables writable interest exactly once, then
