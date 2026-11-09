@@ -959,6 +959,18 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   than the lists keep (the 64 MiB growth step against at most 32 MB kept) misses often, and a miss then
   pays the failed checks and a call. The live-byte and small-list counters are untouched (the collection
   trigger reads them).
+  What is left of that path, measured on `alloc-fast` (2026-11-09): the guard chain is about 23
+  instructions (size normalised to at least 1, the size class and the list head, a registry slot, room
+  under the memory limit, no region), the pop with its header words and registry append about 13, then
+  the zeroing. Tried: reading the size back from the block's header after the allocation, so that it
+  needs no callee-saved register across the general path's call, a tail call for objects over 32 bytes
+  and the zeroing as two to four overlapping stores instead of a ladder of compares: the prologue was
+  already a single push in the release build, and trees fell by 0.44% (9,854 M to 9,810 M, 1.3
+  instructions an object), everything else unchanged; dropped as not worth the dependence on the host
+  header layout. The guards can only shrink by caching them in one flag that thread start, region begin
+  and end and the limit setters keep in step (no thread, no region, no limit: the limit compare and the
+  region test leave the path, about 8 instructions, 2.5% of trees), a stateful change whose failure is a
+  region allocation or a missed memory limit; not done.
 - **Per-call boxing in the lowering: two alias cuts measured, held; the rest is a no-go** (2026-11-08,
   master `04aa6c7d`). Branch `per-call-boxing` (not merged, kept for reference): a boxed `local.load` or a `parameter.load` (no default) whose value only
   feeds read-only runtime readers (string, field, array reads, `object.is`) and has no label,
