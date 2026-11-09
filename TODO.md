@@ -570,7 +570,11 @@
   +1.42%/−0.59%, all individual timing ranges overlap; JSON peaks broadly flat.
   Shared Darwin adapter growth adds 448–464 B on arm64, 456–4,560 B on Intel (page thresholds).
   This pair already contains the allocator/root-frame work in both arms, so its
-  original pre-change baseline remains unmeasured. Wasm now has one:
+  original pre-change baseline remains unmeasured. v0.2.47→v0.2.51 on the same runners
+  (2026-11-09, CI42612637080, same page): median geomeans +1.63% arm64 / +0.71% Intel,
+  every range overlapping; trees is up on both (+10.8% / +14.9%, as on Wasm below), maps' peak RSS
+  +9.4% / +12.3% (Intel maps binary +4,096 B, arm64 https-client +16,512 B), nothing else beyond noise.
+  The benchmark job takes the two tags as dispatch inputs. Wasm now has a baseline too:
   [docs/wasm-runtime-measurements.md](docs/wasm-runtime-measurements.md) (v0.2.45 to v0.2.51, eight programs under Node,
   nine to 25 rounds): sizes +1.5% at v0.2.50 and +3.4% at v0.2.51 (geomean), `trees` +10 to 20% in run time at v0.2.51 and
   back to v0.2.50's on master after the native null test, the rest inside the noise; tool in `tools/wasm-bench`.

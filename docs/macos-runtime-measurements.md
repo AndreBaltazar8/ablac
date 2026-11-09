@@ -131,3 +131,66 @@ gh workflow run ci.yml --ref master -f macos_runtime_bench=true
 The normal Linux/Mac suite jobs are skipped for that opt-in dispatch; their
 ordinary push/PR/default-dispatch behavior is unchanged. The harness is
 `tools/bench-macos-runtime.sh` plus `tools/bench-macos-runtime.py`.
+
+## v0.2.47 versus v0.2.51 (2026-11-09)
+
+Measured November 9, 2026 in [CI run 42612637080](https://github.com/AndreBaltazar8/ablac/actions/runs/42612637080),
+the same job and method as above with `macos_runtime_old=v0.2.47` and `macos_runtime_new=v0.2.51` (the two tags are
+dispatch inputs; the commits and compiler hashes of the supported tags are pinned in
+`tools/bench-macos-runtime.sh`). The benchmark sources are identical between the two tags (`git diff` is empty), every
+build and all timed runs completed, and all non-timing output matched. Raw samples, hashes and host provenance:
+[measurements/macos-runtime-v0.2.51.json](measurements/macos-runtime-v0.2.51.json). Same hosted-runner limits as
+above (arm64: three-vCPU Apple M1 VM, macOS 15.8.2; Intel: four vCPUs on i7-8700B, macOS 15.7.9; Xcode 16.4).
+
+Runtime median geomean over the 11 runnable programs: **+1.63% on arm64**, **+0.71% on x86_64** (v0.2.51 against
+v0.2.47). With five runs on an unpinned VM that is inside the noise: programs move both ways by up to 17% with
+overlapping ranges (arm64 sieve +10.3%, trees +10.8%, maps −8.1%; Intel fib +12.3%, trees +14.9%, sieve −10.4%,
+maps −17.3%), and trees is up on both architectures (+10.8% / +14.9%; it was +11.4% / +1.1% in the previous pair),
+so it is the one to look at first on a quiet machine. No regression is established.
+
+Sizes: stripped binaries are byte-identical on arm64 except `https-client` (+16,512 bytes, +10.6%) and
+`json-readers` (+16); on Intel `maps` grows 4,096 bytes (+9.0%, a page), `json-megabyte` 4,096 (+1.9%),
+`event-http-server` and `https-client` 4,096 each (+2.6% / +2.8%). Peak RSS: `maps` +9.4% on arm64 (144.1 to
+157.5 MiB) and +12.3% on Intel (132.4 to 148.7 MiB), outside the observed ranges on both and as the Linux maps peak RSS rise
+recorded in TODO.md does; `json-megabyte` falls 4.5% / 3.9%; every other program is
+within ±3% (the small-RSS programs by a few hundredths of a MiB).
+
+### arm64
+
+| Program | v047 time | v051 time | Δ | v047 RSS | v051 RSS | Δ | v047 size | v051 size | Δ |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| fib | 877.24 [846.66–962.84] | 882.87 [835.16–951.08] | +0.64% | 1.19 [1.19–1.22] | 1.22 [1.19–1.22] | +2.63% | 70952 | 70952 | +0.00% |
+| sieve | 611.27 [593.62–785.47] | 674.07 [646.19–744.53] | +10.27% | 124.33 [119.08–127.33] | 124.27 [115.81–130.58] | -0.05% | 70968 | 70968 | +0.00% |
+| nbody | 305.48 [301.18–316.95] | 308.13 [307.15–313.85] | +0.87% | 1.27 [1.25–1.27] | 1.27 [1.25–1.27] | +0.00% | 87512 | 87512 | +0.00% |
+| trees | 862.44 [828.80–934.83] | 955.32 [884.65–1025.04] | +10.77% | 223.31 [221.83–223.44] | 223.41 [221.98–223.44] | +0.04% | 70968 | 70968 | +0.00% |
+| strings | 173.08 [162.36–175.69] | 173.49 [169.69–180.17] | +0.24% | 159.38 [146.77–168.91] | 163.78 [149.86–165.53] | +2.76% | 70968 | 70968 | +0.00% |
+| maps | 256.80 [234.32–299.68] | 236.11 [222.30–264.38] | -8.06% | 144.06 [135.12–149.94] | 157.53 [148.48–161.05] | +9.35% | 70984 | 70984 | +0.00% |
+| dispatch | 162.51 [147.78–165.54] | 161.31 [154.76–169.12] | -0.74% | 1.61 [1.61–1.61] | 1.58 [1.58–1.61] | -1.94% | 70968 | 70968 | +0.00% |
+| matrix | 286.49 [276.79–304.59] | 293.16 [273.78–320.27] | +2.33% | 8.09 [8.09–8.09] | 8.09 [8.08–8.20] | +0.00% | 87512 | 87512 | +0.00% |
+| websocket-codec | 10.37 [9.99–10.88] | 11.03 [9.82–13.51] | +6.37% | 20.88 [20.88–20.88] | 20.88 [20.88–20.92] | +0.00% | 87520 | 87520 | +0.00% |
+| json-readers | 299.79 [283.22–350.53] | 291.53 [284.58–329.83] | -2.75% | 189.61 [183.83–192.31] | 191.06 [184.69–197.83] | +0.77% | 153664 | 153680 | +0.01% |
+| json-megabyte | 1611.14 [1508.61–1643.44] | 1603.36 [1499.65–1627.97] | -0.48% | 438.42 [428.33–448.81] | 418.72 [406.70–439.27] | -4.49% | 219792 | 219792 | +0.00% |
+| event-http-server | — | — | — | — | — | — | 170144 | 170144 | +0.00% |
+| https-client | — | — | — | — | — | — | 155152 | 171664 | +10.64% |
+
+Geomean of the 11 runtime median ratios: +1.63%.
+
+### x86_64
+
+| Program | v047 time | v051 time | Δ | v047 RSS | v051 RSS | Δ | v047 size | v051 size | Δ |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| fib | 772.59 [750.34–902.74] | 867.38 [817.56–929.05] | +12.27% | 0.56 [0.55–0.56] | 0.56 [0.55–0.57] | +0.00% | 37520 | 37520 | +0.00% |
+| sieve | 1377.18 [1223.61–1398.00] | 1234.01 [1164.96–1346.69] | -10.40% | 102.82 [102.76–102.93] | 102.88 [102.81–102.92] | +0.05% | 41632 | 41632 | +0.00% |
+| nbody | 597.56 [593.93–656.89] | 653.53 [614.08–845.50] | +9.37% | 0.60 [0.59–0.60] | 0.60 [0.59–0.61] | +0.00% | 66232 | 66232 | +0.00% |
+| trees | 2463.92 [2128.07–2776.12] | 2831.14 [2405.66–3129.78] | +14.90% | 210.21 [210.20–211.48] | 210.19 [210.18–210.21] | -0.01% | 41624 | 41632 | +0.02% |
+| strings | 485.60 [458.39–554.20] | 469.78 [444.87–630.57] | -3.26% | 140.24 [137.74–140.34] | 140.24 [137.81–140.32] | +0.00% | 45728 | 45728 | +0.00% |
+| maps | 625.74 [593.05–643.96] | 517.80 [462.87–599.98] | -17.25% | 132.41 [131.95–132.52] | 148.71 [148.55–148.96] | +12.31% | 45736 | 49832 | +8.96% |
+| dispatch | 299.27 [288.81–343.78] | 310.58 [295.76–311.72] | +3.78% | 0.94 [0.94–0.95] | 0.95 [0.94–0.95] | +0.83% | 41632 | 41632 | +0.00% |
+| matrix | 563.58 [558.86–630.44] | 607.51 [555.19–644.49] | +7.80% | 7.45 [7.45–7.46] | 7.45 [7.45–7.48] | +0.00% | 62136 | 62136 | +0.00% |
+| websocket-codec | 36.60 [33.49–41.79] | 35.69 [33.70–41.72] | -2.48% | 21.77 [21.77–21.77] | 21.78 [21.77–21.80] | +0.04% | 58040 | 58040 | +0.00% |
+| json-readers | 774.66 [727.78–834.80] | 763.40 [735.34–1047.93] | -1.45% | 180.66 [177.24–181.30] | 180.05 [177.25–183.39] | -0.34% | 144160 | 144168 | +0.01% |
+| json-megabyte | 3658.70 [3456.58–4095.42] | 3636.06 [3535.71–3650.12] | -0.62% | 325.89 [314.86–416.80] | 313.07 [302.48–351.62] | -3.93% | 213872 | 217968 | +1.92% |
+| event-http-server | — | — | — | — | — | — | 156416 | 160512 | +2.62% |
+| https-client | — | — | — | — | — | — | 145648 | 149752 | +2.82% |
+
+Geomean of the 11 runtime median ratios: +0.71%.
