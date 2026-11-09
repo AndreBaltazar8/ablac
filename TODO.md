@@ -221,8 +221,8 @@
   `bnFromBytes`, `bnToBytes` and `bnResidueSquare` have assembly fixtures and individual
   secret-index negative controls. AES orthogonalization is the actual imported implementation,
   without fixture-only index substitution; excluded scaffolding is guarded against unnoticed edits.
-- [ ] **Crypto allocation and object plumbing stays outside `test-ct.sh`.** Read whole now, on x86-64 with the
-  calls between them followed, each with a secret-indexed twin that is found: `bnFromBytes` and `bnResidueSquare`
+- [ ] **Crypto allocation and object plumbing stays outside `test-ct.sh`.** Read whole now, on every target (x86-64,
+  AArch64, Wasm and Xtensa) with the calls between them followed, each with a secret-indexed twin that is found: `bnFromBytes` and `bnResidueSquare`
   with their `bnClear`; and AES's key schedule, bitsliced round keys and hardware decryption keys (`aesExpandSchedule`,
   `aesDecryptionKeys`) and its hardware block loops (`aesHardwareEncryptAt`, `aesHardwareDecryptAt`), which are
   functions of plain integers appended from the production source (the region between BEGIN/END AES KEY EXPANSION);

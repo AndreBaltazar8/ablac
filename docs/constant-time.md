@@ -70,8 +70,8 @@ release.
 **Residue.** `--residue` (x86-64 and AArch64 release objects) also fails an entry
 that returns with a secret in a slot of its frame, or that gave a secret to a callee and did not wipe the
 stack below it (`abla/ct/scrub`: the checker reads the callees' depth and the size of the wipe). The AES and
-RSA private entry points and the password paths of `abla/crypto/pbe` wipe, and a run scan checks that nothing
-is left below them. Registers, the GC heap, Wasm and Xtensa are not covered.
+RSA private entry points and the password paths of `abla/crypto/pbe` wipe, and on x86-64 a run scan checks that
+nothing is left below them (AArch64 is read, not run). Registers, the GC heap, Wasm and Xtensa are not covered.
 
 The fixtures are what is checked: `ctSelect`, `ctEq`, `ctLt`, `ctIsNonZero`, arithmetic and
 `ctDifferenceAddress`, at the widths listed in the script, and what `abla/crypto` builds on them: AES's
