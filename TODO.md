@@ -1186,15 +1186,17 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   allocation is registered, built into the directory once and swept once, so keeping the bits saves nothing
   and the sweep would pay to clear the bit of every garbage block (a page-table probe each, about the
   cost of the build it replaces); only a long-lived heap re-built every collection would gain.
-  Tried instead (branch `collector-lazy`): finding a candidate's allocation from the registry alone for a
-  payload's start (the word 32 bytes back is its registry slot and the slot names the header), building
-  the directory only when a candidate is not a payload's start. Without any guard it cuts trees 6.4%,
-  strings 3.0%, maps 1.2% instructions, but the read of the word before a candidate is a wild read for a
-  garbage word in a scanned slot (a raw-word block, unfilled storage) that lands in the heap's span
-  over a gap; with a set of the pages that hold a header (one registry pass: the lowest and highest
-  header and the page set, `calloc`ed table) it is safe and cuts trees 1.9%, strings 1.8%, maps 0.8% with
-  the locals above included: the set's pass costs about 20 instructions an allocation, little under the
-  directory build's 24 plus lookups. Not worth its risk against the 3% bar.
+  Done instead (branch `collector-maps`): a collection finds a candidate's allocation from the registry alone when
+  the candidate is a payload's start (the word 32 bytes back is its registry slot and that slot names the header),
+  and builds the page directory only when a candidate is not (strings' interior pointers, a raw-word block's
+  words), under `ABLA_GC_STRESS=1` (which also checks the registry's answer against the directory's) or when
+  `/proc/self/maps` is unreadable (non-Linux hosts). The registry's lookup reads the word before the candidate, a
+  wild read for a garbage word in a scanned slot, so it reads only memory the process has mapped readable and
+  writable (one parse of `/proc/self/maps` a collection, merged ranges, a last-range check before the binary
+  search). Without the mapped-memory guard it was -6.4% on trees; a page-set guard built from the registry cost
+  about 20 instructions an allocation and kept only -1.9%; the maps guard keeps -8.3%.
+  Release builds, instructions, vs master `98c5c7a2`: trees 11,742.5 M to 10,767.2 M (-8.3%), strings
+  2,036.9 M to 1,926.6 M (-5.4%), maps 2,560.8 M to 2,500.1 M (-2.4%), same output.
 - [ ] **Name lookups in lowering.** Over a game server's `--emit-llvm` the method index's
   `find` was 200 of 3,552 samples, the declaration index's 148 and the name hashes 98 and
   76. Done: the method index hashes owner and name in place instead of a key string made
