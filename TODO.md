@@ -203,9 +203,9 @@
   (`fast-known-aarch64.txt` is empty). **Wasm** follows `call <function index>` (the module's types, imports and
   bodies are read from the binary; arguments off the operand stack with their taint, results back on it; imports and
   `call_indirect` are refused), looks fixtures up by export name when the module has no name section, and reads the
-  `--fast` module with all 63 fixtures clean; that module only builds through the compiler's text route
-  (`ABLA_KEEP_LLVM_TEXT=1`): the in-process one aborts on the constant-time barrier's inline assembly ("Inline asm not
-  supported by this streamer"), a compiler bug to fix after the v0.2.52 freeze. **Xtensa** follows windowed
+  `--fast` module with all 63 fixtures clean; that module builds on the default in-process route (it aborted on the
+  constant-time barrier's inline assembly, "Inline asm not supported by this streamer", until the WebAssembly asm
+  parser was registered there: `tools/test-wasm-ct-barrier.sh`). **Xtensa** follows windowed
   `call4/8/12` (the callee is named by the call's relocation, or by the literal a long call loads; the window
   registers come back from a(rotation+2); compiler-rt arithmetic helpers such as `__moddi3` are accepted with public
   operands, a secret shift count is refused (the helpers branch on `count >= 32`), and `__muldi3` relies on the core's

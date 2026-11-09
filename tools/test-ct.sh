@@ -557,9 +557,10 @@ wasm_follow_read
 # in this module: the hardware paths have no body to call on Wasm).
 orchestration_read "$out/ct.wasm" wasm
 worker_read "$out/ct.wasm" wasm 5
-# The --fast module keeps every call. Its inline assembly (the barrier of the constant-time primitives) only builds
-# through the compiler's text route, which ABLA_KEEP_LLVM_TEXT selects; the in-process one aborts on it (TODO.md).
-ABLA_KEEP_LLVM_TEXT=1 "$compiler" build "$cases/build-fast.ab" -o "$out/wasm-fast-driver" --no-cache 2> "$out/wasm-fast.log" || {
+# The --fast module keeps every call. Its inline assembly (the barrier of the constant-time primitives) builds on the
+# default in-process route since the WebAssembly asm parser is registered there (tools/test-wasm-ct-barrier.sh);
+# ABLA_KEEP_LLVM_TEXT is unset so that a developer shell with it set cannot hide a regression.
+env -u ABLA_KEEP_LLVM_TEXT "$compiler" build "$cases/build-fast.ab" -o "$out/wasm-fast-driver" --no-cache 2> "$out/wasm-fast.log" || {
     cat "$out/wasm-fast.log" >&2; exit 1
 }
 fast_read wasm "$out/ct-fast.wasm" "" "" "$cases/fast-known-wasm.txt"
