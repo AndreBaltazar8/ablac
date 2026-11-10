@@ -271,6 +271,16 @@
   their secret arguments in their own frame (an unoptimised entry spills its parameters, and a wipe below sp can't
   reach them: clearing them would be the compiler's, a decision not taken); 26 behind the known `--fast` trap branch
   (`fast-known.txt`). Not wired into `test-ct.sh`.
+  **The real entries in `--fast`** (2026-11-10, master `44eac47c`; `residue-run.ab` built `--fast` with its scan widened
+  to 256 KiB): release is clean, but every real entry leaves nonzero bytes far below its wipe, as unoptimised work goes 2
+  to 6 times deeper: AES 4,576 bytes (wipe 2,048), RSA private operations 17,168 and key generation 15,136 (wipe 4,096),
+  PBE 25,488 (wipe 4,096). No copy of the ASCII password is among them (the string lives on the heap); what is left is
+  derived state of unknown sensitivity. The wipes are sized for release, so a `--fast` build leaves residue. Options
+  (André, decision #52): (A) a `--fast` function that calls a wipe clears its own frame before returning (19 real
+  entries, frames of 208 to 400 bytes: up to 400 bytes of stores a call, about 15 bytes of code each; fixes the 27
+  own-frame cases, not the depth); (B) `--fast` wipes about 8 times the release size (AES 16 KiB, RSA and PBE 32 KiB:
+  one `rep stos` of up to 32 KiB a call, roughly 1 to 3 µs, against milliseconds for an RSA operation; closes the depth,
+  not the own frame); (C) neither, said in `docs/constant-time.md` (done).
 - [x] **Secret arithmetic around the crypto fixtures:** source-generated AES-128/192/256
   schedule and byte/block I/O, CRT subtract/correction/recombination and wide-reduction glue,
   `bnFromBytes`, `bnToBytes` and `bnResidueSquare` have assembly fixtures and individual

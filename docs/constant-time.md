@@ -73,6 +73,12 @@ stack below it (`abla/ct/scrub`: the checker reads the callees' depth and the si
 RSA private entry points and the password paths of `abla/crypto/pbe` wipe, and on x86-64 a run scan checks that
 nothing is left below them (AArch64 and Xtensa are read, not run). Registers, the GC heap and Wasm are not covered.
 
+**The wipes are sized for release.** A `--fast` build doesn't optimise, so its work goes deeper than the wipe after
+it, and the entry keeps its secret arguments in its own frame, where a wipe below the stack pointer can't reach them.
+Measured with the run scan built `--fast` (2026-11-10): AES leaves bytes 4,576 below the entry (its wipe is 2,048), RSA
+17,168 and PBE 25,488 (theirs are 4,096); release leaves none. Secret code ships in a release build, as the timing read
+above already asks.
+
 On Xtensa the windowed ABI decides where a frame's registers go when the register file overflows (a deep call
 chain, or any interrupt or task switch, which spills every live frame): a function's a0-a3 to the 16 bytes under
 the stack pointer of the function it is calling, its a4-a7 (a4-a11 when it was called by `call12`) to the 16 (32)
