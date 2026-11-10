@@ -2048,3 +2048,31 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   runner?) would make the jit tier a gain of up to 28-46 G of ~460 G (6-10% of a warm
   `--fast` build) for these sites, plus the catalog if `compilerApplyTransform` is taken.
   Not measured: the generation time itself (the trace prints no times).
+- Correction and the warm build (ablac-52, 2026-11-10; replaces the "generation cache" reading above): the
+  `ABLA_COMPILE_EVAL=jit` trace of the NovaKind build has no `generation N:` note at all, so jit
+  compiled no slice: the three heavy calls are top-level actions evaluated by the staged
+  parser before type checking, not jit sites (only `novakindCatalog`, i18n.ab@5533, is a site,
+  and it stays interpreted: it reaches `compilerApplyTransform`, which takes a function). The
+  jit build's +1.8% is the extra analysis pass alone. A second identical build with a warm cache
+  (private `ABLA_CACHE_DIR`, no `--no-cache`, same counters) takes the same 58,217,570 steps
+  in the same 958 evaluations (wall 82 s cold, 71 s warm: the saving is LLVM's codegen
+  and link caches): docs/compile-time.md says "an action that runs code ... disables the
+  whole-program native object cache for that build. Every build then runs it again". NovaKind
+  passes `--no-cache` everywhere (no recorded reason; its runner uses a private cache dir per
+  compile against concurrent sweeps) and caches whole programs itself by a stamp of every input,
+  so after a one-line edit each affected program pays the full 58 M steps (about 13% of the
+  build's instructions, 36-61 G) again.
+  Two ways out. (A) Make the three actions cacheable by journaling: key = the action's
+  expression and the fingerprint of every declaration it reaches (its own and the
+  functions it calls), the grants (`filesystem.read` / `environment` only, journaled
+  as for builds) and the compiler's identity; value = what the action did to the
+  compilation (the generated modules' sources, staged writes, `compile var` changes,
+  diagnostics); revalidate the journal, replay the value on a hit. Saves up to the whole 13% of
+  a `--fast` build where an edit touches none of the action's inputs; the risk is the value's
+  completeness (an action's side effects on the compile globals and on later actions), tested by
+  identical build output cold, warm and with a deliberately stale input, and a case with an action
+  that writes (uncacheable, must still run). (B) A native parse-phase path for actions: needs
+  a slice from the declarations parsed so far; generating a slice costs about what the
+  interpreter does (jit's analysis alone is +1.8%, and the in-process LLJIT generation is not
+  measured), so B pays only together with a cache of its own: A first. Review: ablac-e5
+  (evaluator), ablac-39 (cache keys).
