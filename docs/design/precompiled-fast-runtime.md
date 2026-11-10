@@ -149,3 +149,23 @@ include the backend's own uses of each bridge (an audit of the 105 bridge names 
 a missed one: dormant declarations are left external and hidden), or lazy emission driven by uses of the declarations
 (late roots, which conflicts with the analyses that run before emission). The audit route is a bounded change; its
 bar is the one set for this item.
+
+### Result of the audit route (landed in v0.2.53: `--fast` prunes on Linux hosts)
+
+The bridge roots are demand-driven: `bootstrapLlvmBridgeSymbolsGatherReachable` (runtime.ab) collects the bridge symbols
+the reachable instructions call (plus the `extern` names they mention), the field/object/array and
+generator/task/thread families by opcode prefix, and an explicit list of the symbols the backend emits by itself
+(`bootstrapLlvmBackendBridgeSymbols`); a fixpoint in `backend.ab` adds the implementations behind those symbols as
+reachability roots until nothing changes. Closed-program targets, Wasm, cross targets and release builds keep their
+paths; compile-time emission is unpruned; `ABLA_FAST_PRUNE=0` turns it off and the setting is part of the whole-build
+cache key. A function left dormant stays an external hidden declaration (a missed edge is a link error), and the unused
+ones are erased so an object carries no undefined symbols.
+
+Measured (instructions of the whole `--fast --no-cache` build, pruned over unpruned): hello 90.5%, fib 91.2%,
+maps 92.4%, strings 92.9%, trees 92.0%, dispatch 92.3% (7.1 to 9.5% less). The bar was 8% on fib, maps and hello:
+maps misses it by 0.4 points; it already drops 19 more functions than it keeps, so narrowing the family tests would
+not close that. The run instructions of the eight perf benchmarks are identical (differences under 0.00001%).
+Checks: 540 programs build both ways with the same status; 608 programs built, run and compared (exit status and output,
+`tools/sweep-fast-prune.sh`) with no real difference; `tools/test-fast-prune.sh` (threads, generators, floats and an
+export library, pruned against full, plus a size assertion); the suite, including `test-native-platform-boundary` at
+`--fast`, which caught the undefined symbols pruning left in objects.
