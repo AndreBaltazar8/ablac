@@ -5406,6 +5406,13 @@ class BootstrapLowerer(
     val typeQueryRefinements: array<int> = [],
     val typeQueryResults: array<string> = [],
     val typeQueryStack: array<int> = [],
+    // The cache's index, so a query finds its entry without scanning the others: a table
+    // of the latest entry (plus one) per slot of the expression's span, each entry
+    // linking to the previous one of its slot.
+    val typeQueryTable: array<int> = [],
+    val typeQueryNext: array<int> = [],
+    val typeQuerySlots: array<int> = [],
+    var typeQueryIndexed: bool = false,
     // Descriptor field places, built once for this lowering graph and shared
     // by its child lowerers. The declaration index preserves duplicate names.
     val classFieldPlaces: Map<int, array<int>> = Map(),
@@ -6179,15 +6186,48 @@ class BootstrapLowerer(
         result
     }
 
+    fun typeQuerySlot(expression: BootstrapExpression): int =
+        (expression.begin * 31 + expression.end) & (this.typeQueryTable.size - 1)
+
+    /** Links the cached entries through the table, oldest first, so each slot's chain
+     *  runs newest to oldest (the order a scan from the end meets them). */
+    fun typeQueryIndexAll(width: int): void {
+        this.typeQueryTable.truncate(0)
+        while (this.typeQueryTable.size < width) this.typeQueryTable.append(0)
+        this.typeQueryNext.truncate(0)
+        this.typeQuerySlots.truncate(0)
+        var entry = 0
+        while (entry < this.typeQueryExpressions.size) {
+            val slot = this.typeQuerySlot(this.typeQueryExpressions[entry])
+            this.typeQueryNext.append(this.typeQueryTable[slot] - 1)
+            this.typeQuerySlots.append(slot)
+            this.typeQueryTable[slot] = entry + 1
+            entry = entry + 1
+        }
+    }
+
     fun lowerExpressionType(expression: BootstrapExpression): string {
-        var index = this.typeQueryExpressions.size - 1
-        while (index >= 0) {
-            if (this.typeQueryExpressions[index] == expression &&
-                this.typeQueryScopes[index] == this.currentScope &&
-                this.typeQueryRefinements[index] == this.refinementNames.size) {
-                return this.typeQueryResults[index]
+        if (this.typeQueryIndexed) {
+            var found = this.typeQueryTable[this.typeQuerySlot(expression)] - 1
+            while (found >= 0) {
+                if (this.typeQueryExpressions[found] == expression &&
+                    this.typeQueryScopes[found] == this.currentScope &&
+                    this.typeQueryRefinements[found] == this.refinementNames.size) {
+                    return this.typeQueryResults[found]
+                }
+                found = this.typeQueryNext[found]
             }
-            index = index - 1
+        } else {
+            // A short cache is scanned from its newest entry; from 48 entries on it is indexed.
+            var index = this.typeQueryExpressions.size - 1
+            while (index >= 0) {
+                if (this.typeQueryExpressions[index] == expression &&
+                    this.typeQueryScopes[index] == this.currentScope &&
+                    this.typeQueryRefinements[index] == this.refinementNames.size) {
+                    return this.typeQueryResults[index]
+                }
+                index = index - 1
+            }
         }
         this.typeQueryStack.append(0)
         val scope = this.currentScope
@@ -6197,12 +6237,36 @@ class BootstrapLowerer(
         this.typeQueryScopes.append(scope)
         this.typeQueryRefinements.append(refinements)
         this.typeQueryResults.append(result)
+        if (this.typeQueryIndexed) {
+            if (this.typeQueryExpressions.size * 2 > this.typeQueryTable.size) {
+                this.typeQueryIndexAll(this.typeQueryTable.size * 2)
+            } else {
+                val slot = this.typeQuerySlot(expression)
+                this.typeQueryNext.append(this.typeQueryTable[slot] - 1)
+                this.typeQuerySlots.append(slot)
+                this.typeQueryTable[slot] = this.typeQueryExpressions.size
+            }
+        } else if (this.typeQueryExpressions.size >= 48) {
+            val width = if (this.typeQueryTable.size > 0) this.typeQueryTable.size else 1024
+            this.typeQueryIndexAll(width)
+            this.typeQueryIndexed = true
+        }
         this.typeQueryStack.truncate(this.typeQueryStack.size - 1)
         if (this.typeQueryStack.size == 0) {
+            if (this.typeQueryIndexed) {
+                var entry = 0
+                while (entry < this.typeQuerySlots.size) {
+                    this.typeQueryTable[this.typeQuerySlots[entry]] = 0
+                    entry = entry + 1
+                }
+                this.typeQueryIndexed = false
+            }
             this.typeQueryExpressions.truncate(0)
             this.typeQueryScopes.truncate(0)
             this.typeQueryRefinements.truncate(0)
             this.typeQueryResults.truncate(0)
+            this.typeQueryNext.truncate(0)
+            this.typeQuerySlots.truncate(0)
         }
         result
     }
