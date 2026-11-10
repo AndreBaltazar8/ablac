@@ -1,3 +1,8 @@
+// Every wait here is generous on purpose (a minute where a second would do): a loaded machine may be slow, and what a
+// test asserts is which event ended the wait (the deadline, or the peer), not how long it took. The stalled peers
+// trickle for 40 s and sleep for a minute, so an enforced 200 or 250 ms deadline ends them at about that and a
+// missing one only at 40 s or more; the bounds below sit between. (Connecting is limited to ten seconds by the
+// library, and a loopback or Unix connect takes no time.)
 import "abla/tls/hosted"
 import "abla/net"
 import "abla/fs"
@@ -11,23 +16,23 @@ fun addressOf(text: string): UnixSocketAddress = if (text.startsWith("@"))
 
 fun securedClient(address: UnixSocketAddress, certificate: string, key: string,
     bundle: string, mode: string, deadline: int = 0): TlsConnection {
-    var connection = unixConnect(address, 3000)
-    if (mode == "limits") connection.setTimeouts(250, 350)
+    var connection = unixConnect(address, 10000)
+    if (mode == "limits") connection.setTimeouts(20000, 30000)
     if (mode == "pem" || mode == "invalid") {
         val identity = tlsClientIdentityFromPem(path(certificate).readText(),
             if (mode == "invalid") "bad key" else path(key).readText())
-        tlsUpgradeWithIdentity(connection, "localhost", identity, certificate, 3000, 3000, deadline)
+        tlsUpgradeWithIdentity(connection, "localhost", identity, certificate, 60000, 60000, deadline)
     } else if (mode == "p12") {
         val identity = tlsClientIdentityFromPkcs12(path(bundle).readText(), "test")
-        tlsUpgradeWithIdentity(connection, "localhost", identity, certificate, 3000, 3000, deadline)
+        tlsUpgradeWithIdentity(connection, "localhost", identity, certificate, 60000, 60000, deadline)
     } else if (mode == "bad-host") {
-        tlsUpgrade(connection, "wrong.invalid", certificate, 3000, 3000)
+        tlsUpgrade(connection, "wrong.invalid", certificate, 60000, 60000)
     } else if (mode == "bad-ca") {
-        tlsUpgrade(connection, "localhost", "/no-such-ca-file", 3000, 3000)
+        tlsUpgrade(connection, "localhost", "/no-such-ca-file", 60000, 60000)
     } else if (deadline != 0) {
-        TlsConnection(tlsUpgradeHandle(connection, "localhost", certificate, 3000, 3000,
+        TlsConnection(tlsUpgradeHandle(connection, "localhost", certificate, 60000, 60000,
             deadline = deadline))
-    } else tlsUpgrade(connection, "localhost", certificate, 3000, 3000)
+    } else tlsUpgrade(connection, "localhost", certificate, 60000, 60000)
 }
 
 fun echoOnce(address: UnixSocketAddress, certificate: string, key: string, inherited: bool): bool {
@@ -37,23 +42,23 @@ fun echoOnce(address: UnixSocketAddress, certificate: string, key: string, inher
     if (child == 0) {
         var secured = securedClient(address, certificate, key, "", if (inherited) "limits" else "plain")
         val kept = !inherited || (secured.handle != -1 &&
-            linuxSocketTimeout(tlsControlInt(secured.handle, 16), 20) >= 200 &&
-            linuxSocketTimeout(tlsControlInt(secured.handle, 16), 20) < 1000)
+            linuxSocketTimeout(tlsControlInt(secured.handle, 16), 20) >= 16000 &&
+            linuxSocketTimeout(tlsControlInt(secured.handle, 16), 20) < 40000)
         val ok = secured.handle != -1 && kept && secured.write("hello") == 5 && secured.read(32) == "world"
         val closed = secured.close() && secured.close()
         linuxSyscall1(60, if (ok && closed) 0 else 1)
     }
     if (child < 0) return false
-    if (!linuxPollSocket(listener.descriptor, true, false, 3000).readable) return false
+    if (!linuxPollSocket(listener.descriptor, true, false, 60000).readable) return false
     var stream = listener.accept()
-    if (inherited) stream.setTimeouts(250, 350)
+    if (inherited) stream.setTimeouts(20000, 30000)
     val descriptor = stream.descriptor
     val nonIp = socketPeerAddress(descriptor) == null
-    var secured = tlsServerUpgrade(stream, certificate, key, 3000, 3000,
-        linuxMonotonicMilliseconds() + 3000)
+    var secured = tlsServerUpgrade(stream, certificate, key, 60000, 60000,
+        linuxMonotonicMilliseconds() + 60000)
     val unchanged = !inherited ||
-        (linuxSocketTimeout(descriptor, 20) >= 200 &&
-         linuxSocketTimeout(descriptor, 20) < 1000)
+        (linuxSocketTimeout(descriptor, 20) >= 16000 &&
+         linuxSocketTimeout(descriptor, 20) < 40000)
     val ok = secured.handle != -1 && nonIp && unchanged &&
         socketPeerAddress(tlsControlInt(secured.handle, 16)) == null &&
         secured.read(32) == "hello" && secured.write("world") == 5
@@ -72,16 +77,16 @@ fun stalledServer(address: UnixSocketAddress, certificate: string, key: string):
     if (child == 0) {
         var stream = unixConnect(address)
         stream.write("\x16\x03")
-        linuxSleep(3000)
+        linuxSleep(60000)
         linuxSyscall1(60, 0)
     }
-    if (child < 0 || !linuxPollSocket(listener.descriptor, true, false, 3000).readable) return false
+    if (child < 0 || !linuxPollSocket(listener.descriptor, true, false, 60000).readable) return false
     var stream = listener.accept()
     val descriptor = stream.descriptor
     val start = linuxMonotonicMilliseconds()
-    var secured = tlsServerUpgrade(stream, certificate, key, 3000, 3000, start + 200)
+    var secured = tlsServerUpgrade(stream, certificate, key, 60000, 60000, start + 200)
     val elapsed = linuxMonotonicMilliseconds() - start
-    val ok = secured.handle == -1 && elapsed >= 100 && elapsed < 2000 &&
+    val ok = secured.handle == -1 && elapsed >= 100 && elapsed < 30000 &&
         linuxSyscall3(72, descriptor, 1, 0) < 0
     linuxSyscall2(62, child, 15)
     linuxWaitProcess(child)
@@ -96,21 +101,21 @@ fun tcpOnce(certificate: string, key: string, withIdentity: bool): bool {
     val port = listener.localPort()
     val child = linuxSyscall0(57)
     if (child == 0) {
-        var stream = tcpConnectIpv4("127.0.0.1", port, 3000)
+        var stream = tcpConnectIpv4("127.0.0.1", port, 10000)
         var secured = TlsConnection(-1)
         if (withIdentity) {
             val identity = tlsClientIdentityFromPem(path(certificate).readText(), path(key).readText())
             secured = tlsUpgradeWithIdentity(stream, "localhost", identity, caPath = certificate,
-                timeoutMilliseconds = 3000, deadline = linuxMonotonicMilliseconds() + 3000)
+                timeoutMilliseconds = 60000, deadline = linuxMonotonicMilliseconds() + 60000)
         } else secured = tlsUpgrade(stream, "localhost", caPath = certificate,
-            timeoutMilliseconds = 3000, readWriteTimeoutMilliseconds = 3000)
+            timeoutMilliseconds = 60000, readWriteTimeoutMilliseconds = 60000)
         val ok = secured.handle != -1 && secured.write("hello") == 5 && secured.read(32) == "world"
         secured.close()
         linuxSyscall1(60, if (ok) 0 else 1)
     }
-    if (child < 0 || !linuxPollSocket(listener.descriptor, true, false, 3000).readable) return false
+    if (child < 0 || !linuxPollSocket(listener.descriptor, true, false, 60000).readable) return false
     var stream = listener.accept()
-    var secured = tlsServerUpgrade(stream, certificate, key, handshakeTimeoutMilliseconds = 3000)
+    var secured = tlsServerUpgrade(stream, certificate, key, handshakeTimeoutMilliseconds = 60000)
     val ok = secured.handle != -1 && socketPeerAddress(tlsControlInt(secured.handle, 16)) != null &&
         secured.read(32) == "hello" && secured.write("world") == 5
     secured.close()
@@ -135,7 +140,7 @@ fun main: int {
     var secured = securedClient(address, certificate, key, bundle, kind, deadline)
     if (deadline != 0) return if (secured.handle == -1 &&
         linuxMonotonicMilliseconds() - start >= 100 &&
-        linuxMonotonicMilliseconds() - start < 2000) 0 else 4
+        linuxMonotonicMilliseconds() - start < 30000) 0 else 4
     if (mode == "invalid" || mode == "bad-host" || mode == "bad-ca") {
         return if (secured.handle == -1) 0 else 5
     }

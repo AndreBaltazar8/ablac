@@ -13,7 +13,7 @@ binary, certificate, key, bundle, directory = map(os.path.abspath, sys.argv[1:])
 
 def run(address, mode):
     result = subprocess.run([binary, address, certificate, key, bundle, mode],
-                            capture_output=True, text=True, timeout=15)
+                            capture_output=True, text=True, timeout=600)
     if result.returncode:
         raise AssertionError(f'{mode} ({address!r}): {result.returncode}\n{result.stdout}{result.stderr}')
 
@@ -25,7 +25,7 @@ def python_peer(address, mode, require_identity=False, stall=False):
     server = socket.socket(socket.AF_UNIX)
     server.bind('\0' + address[1:] if address.startswith('@') else address)
     server.listen(2)
-    server.settimeout(10)
+    server.settimeout(120)
     errors = []
     unexpected_success = []
     reject = mode in ('invalid', 'bad-host', 'bad-ca')
@@ -38,12 +38,13 @@ def python_peer(address, mode, require_identity=False, stall=False):
         try:
             conn, _ = server.accept()
             with conn:
-                conn.settimeout(5)
+                conn.settimeout(120)
                 if stall:
                     conn.recv(4096)
-                    # A record that never completes: a per-read timeout cannot
-                    # substitute for the absolute handshake deadline.
-                    for byte in b'\x16\x03\x03\x01\x00':
+                    # A record that never completes (its header, then its 256 bytes one at a time, 40 s in all): a
+                    # per-read timeout cannot substitute for the absolute handshake deadline, and a client that
+                    # honours a deadline closes long before the record would end.
+                    for byte in b'\x16\x03\x03\x01\x00' + bytes(256):
                         time.sleep(.16)
                         try: conn.sendall(bytes([byte]))
                         except OSError: break
@@ -70,7 +71,7 @@ def python_peer(address, mode, require_identity=False, stall=False):
     try:
         run(address, mode)
     finally:
-        thread.join(6)
+        thread.join(120)
         server.close()
         if not address.startswith('@'): Path(address).unlink(missing_ok=True)
     if thread.is_alive(): raise AssertionError(f'peer outlived {mode}')
