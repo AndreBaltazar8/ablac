@@ -1975,3 +1975,11 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   `bootstrapInstantiateGenericsIn` 4.9% and flat: allocation and collection are over half of
   it (MarkPointer 1.0, malloc 0.7, MemoryCollect 0.6), the largest compiler function under it is
   0.18%; no cut. Then the analyzer 6.5% (`infer` 5.1%) and the parser proper 3.9%.
+  Instructions, not cycles (`-e instructions:u`, same tree, master c8fb910b sources): the
+  frontend process (`pid` of the compiler proper) is 20.8% of the whole build's user
+  instructions; the other ~79% is LLVM in the per-module child processes. Of the whole
+  build, `bootstrapClassInterfaces` is 3.1%, the string compares it feeds 1.3% and
+  `bootstrapInterfaceIndexIn` 0.8%: 5.2% together, about a quarter of the frontend
+  process. So the cut's ceiling is about 5% of a `--fast` NovaKind build (the
+  17–20% above were cycle shares of the frontend process's own samples, not of the
+  build).
