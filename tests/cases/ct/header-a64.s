@@ -73,3 +73,27 @@ header_offset:
         ldr     x2, [x0, #32]
         cbnz    x2, 1f
 1:      ret
+
+// Reads that leave the header although they start in it, a bitfield insert that writes x0, and a store into static
+// memory the object may be.
+        .globl  straddle, bfi_move, globstore
+straddle:                       // bytes 28 to 35 (ldur takes an unscaled offset)
+        ldur    x2, [x0, #28]
+        cbnz    x2, 1f
+1:      ret
+
+bfi_move:                       // bfi writes x0
+        bfi     x0, x1, #5, #1
+        ldr     x2, [x0]
+        cbnz    x2, 1f
+1:      ret
+
+globstore:                      // x1 is secret
+        adrp    x3, glob
+        str     x1, [x3, :lo12:glob]
+        ldr     x2, [x0, #8]
+        cbnz    x2, 1f
+1:      ret
+
+        .data
+glob:   .quad   0

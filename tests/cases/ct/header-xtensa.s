@@ -131,3 +131,20 @@ header_offset:
 	beqz	a3, 1f
 1:	retw.n
 	.size	header_offset, .-header_offset
+
+	.align	4
+	.global	globstore
+	.type	globstore,@function
+globstore:
+	entry	a1, 32
+	l32r	a3, glob_address
+	s32i	a4, a3, 0
+	l32i	a5, a2, 8
+	beqz	a5, 1f
+1:	retw.n
+	.size	globstore, .-globstore
+
+	.literal_position
+	.literal glob_address, glob
+	.data
+glob:	.long	0

@@ -269,6 +269,13 @@
   change: one call per allocation, tagged as returning a `%` pointer, its arguments required public) or public-global
   loads (rip-relative reads of runtime symbols that nothing secret is ever stored to), which the checker can't prove
   and so would be a trusted list. Neither is built; the second #734 branch starts with whichever ablac-d1 picks.
+  *Review fixes (ablac-f3-2, 2026-11-10):* a header read counts only when offset plus access width is within the 32
+  bytes (width from the mnemonic or register class; a vector move, string operation or unknown width is secret); the
+  string operations also lose rdi, rsi (cpuid rbx) and `cmpxchg` isn't taken for a compare; AArch64 uses exact branch
+  and store mnemonic sets (`bfi` and `stxr` write registers); a secret stored anywhere but the function's own frame
+  (static memory, any linear-memory address on Wasm, `memory.copy`/`fill`/`init`) is refused in a function with a
+  header pointer; Wasm's call test covers `call_ref` and the `return_call` forms. An `ldp` from the header is read as
+  secret (the load rule accepts `ldr` and `ldur` only).
   *Built so far:* the `%n` parameter on x86-64, AArch64, Wasm and Xtensa (on Wasm a parameter no instruction writes, in a function with no call, since a callee could store through it), as a pointer whose register
   is never written (any instruction that may write it, or a call, ends it; a merge keeps that, since states join by
   union) and whose 32 header bytes are read at a constant offset by `mov`, `cmp` or `test`; a secret stored through any

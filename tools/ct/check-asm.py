@@ -269,6 +269,41 @@ def follow_call(name, secret, pointers, text, check=None):
     return returned
 
 
+def x86_access_width(op, ops):
+    """The bytes a plain integer move, compare or test touches in its memory operand; 0 if it isn't one of those (a
+    vector move, a string operation, anything else), so that the access is never taken for a header word."""
+    sizes = {"b": 1, "w": 2, "l": 4, "q": 8}
+    widths = {}
+    for names, size in ((("al", "bl", "cl", "dl", "sil", "dil", "bpl", "spl", "ah", "bh", "ch", "dh"), 1),
+                        (("ax", "bx", "cx", "dx", "si", "di", "bp", "sp"), 2),
+                        (("eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp"), 4)):
+        for name in names:
+            widths[name] = size
+    def register_width(o):
+        name = o.lstrip("%")
+        if name in widths:
+            return widths[name]
+        if re.fullmatch(r"r(8|9|1[0-5])b", name):
+            return 1
+        if re.fullmatch(r"r(8|9|1[0-5])w", name):
+            return 2
+        if re.fullmatch(r"r(8|9|1[0-5])d", name):
+            return 4
+        if re.fullmatch(r"r[a-z0-9]+", name):
+            return 8
+        return 0
+    m = re.fullmatch(r"(mov|cmp|test)([bwlq]?)", op)
+    if m:
+        if m.group(2):
+            return sizes[m.group(2)]
+        registers = [register_width(o) for o in ops if o.startswith("%")]
+        return registers[0] if len(registers) == 1 else 0
+    m = re.fullmatch(r"mov[zs]([bwl])[wlq]", op)
+    if m:
+        return sizes[m.group(1)]
+    return 0
+
+
 def check_x86(lines, secret, pointers):
     index_of_lines = {address for address, _ in lines}
     returned = []
@@ -353,12 +388,16 @@ def check_x86(lines, secret, pointers):
             for r in ["rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11"]:
                 state.add("lost:" + r)
             return
-        if op.startswith(("cmp", "test", "j", "push", "nop", "endbr", "ret")):
+        if re.fullmatch(r"cmp[bwlq]?|test[bwlq]?|j\w+|push[wlq]?|nop\w*|endbr\w*|ret\w*", op):
             return
         if op.startswith(("mul", "imul", "div", "idiv", "cqo", "cltd", "cdq", "cltq", "cwt", "cbw", "xchg", "cmpxchg",
                           "xadd", "rep", "movs", "stos", "scas", "cmps", "lods", "cpuid", "rdtsc", "rdrand",
-                          "rdseed", "sh", "sa", "ro", "rc", "pop")) or op == "movsb":
+                          "rdseed", "sh", "sa", "ro", "rc", "pop")):
             for r in ["rax", "rcx", "rdx"]:
+                state.add("lost:" + r)
+        if op.startswith(("movs", "stos", "scas", "cmps", "lods", "cmpxchg", "cpuid")):
+            # The string operations advance rdi and rsi; cpuid writes rbx.
+            for r in ["rsi", "rdi", "rbx"]:
                 state.add("lost:" + r)
         for i, o in enumerate(ops):
             if o.startswith("%"):
@@ -450,11 +489,12 @@ def check_x86(lines, secret, pointers):
                     if not op.startswith("lea"):
                         raise Violation(f"secret address: {text}")
                     return True
-                if (base and not idx and not op.startswith("lea") and "hdrp:" + x86_reg(base) in state and
-                        "lost:" + x86_reg(base) not in state and re.match(r"^-?(?:0x)?[0-9a-f]*$", m.group(1) or "") and
-                        0 <= (int(m.group(1), 0) if m.group(1) not in ("", "-") else 0) < HEADER_BYTES and
-                        op.startswith(("mov", "cmp", "test"))):
-                    return False  # a header word of an object whose payload is secret
+                if (base and not idx and "hdrp:" + x86_reg(base) in state and
+                        "lost:" + x86_reg(base) not in state and re.match(r"^-?(?:0x)?[0-9a-f]*$", m.group(1) or "")):
+                    start = int(m.group(1), 0) if m.group(1) not in ("", "-") else 0
+                    width = x86_access_width(op, ops)
+                    if width and 0 <= start and start + width <= HEADER_BYTES:
+                        return False  # a header word of an object whose payload is secret
                 if (base and "ptr:" + x86_reg(base) in state) or (idx and "ptr:" + x86_reg(idx) in state):
                     return True  # read through a pointer to secrets
                 slots = stack_slots(o)
@@ -483,11 +523,13 @@ def check_x86(lines, secret, pointers):
                     base, idx = m.group(2), m.group(3)
                     if base and tainted(base) or idx and tainted(idx):
                         raise Violation(f"secret address: {text}")
-                    if header_args and value and ((base and "ptr:" + x86_reg(base) in state) or
-                                                  (idx and "ptr:" + x86_reg(idx) in state)):
-                        # A secret stored through a pointer to an object could land in a header word the checker
-                        # reads as public.
-                        raise Violation(f"secret stored through an object pointer: {text}")
+                    slots = stack_slots(o)
+                    if header_args and value and (slots is None or (
+                            (base and "ptr:" + x86_reg(base) in state) or (idx and "ptr:" + x86_reg(idx) in state))):
+                        # A secret stored anywhere but this function's own frame could land in a header word the
+                        # checker reads as public: through a pointer to the object, through a copy of it, or into
+                        # static memory the object may be.
+                        raise Violation(f"secret stored through an object pointer or outside the frame: {text}")
                     slots = stack_slots(o)
                     if slots is not None:
                         for slot in slots:
@@ -859,6 +901,20 @@ def follow_call_a64(name, tags, text):
     return follow_call(name, sorted(tags), [], text, check=check_aarch64)
 
 
+A64_STORES = {"str", "stur", "strb", "strh", "sturb", "sturh", "stp", "stnp"}
+# Instructions that write no general register (a store's status-writing forms, such as stxr, are not among them).
+A64_NO_REGISTER_WRITE = A64_STORES | {"cmp", "cmn", "tst", "ccmp", "ccmn", "fcmp", "b", "br", "ret", "cbz", "cbnz", "tbz",
+                                      "tbnz", "nop", "hint", "bti"}
+
+
+def a64_access_width(op, destination):
+    """The bytes a plain load into `destination` touches; 0 if the instruction is anything else."""
+    if op in ("ldr", "ldur"):
+        return {"w": 4, "x": 8, "b": 1, "h": 2, "s": 4, "d": 8, "q": 16}.get(destination.strip().lower()[:1], 0)
+    return {"ldrb": 1, "ldurb": 1, "ldrh": 2, "ldurh": 2, "ldrsb": 1, "ldursb": 1, "ldrsh": 2, "ldursh": 2,
+            "ldrsw": 4, "ldursw": 4}.get(op, 0)
+
+
 def check_aarch64(lines, secret, pointers):
     function_addresses = {address for address, _ in lines}
     header_args = FOLLOW.get("header_args", [])
@@ -875,9 +931,9 @@ def check_aarch64(lines, secret, pointers):
         if op in ("bl", "blr"):
             state.update("lost:x%d" % i for i in range(19))
             return
-        if op.startswith(("cmp", "cmn", "tst", "ccmp", "ccmn", "b", "ret", "st", "nop", "hint")) and op != "bic":
+        if op in A64_NO_REGISTER_WRITE or op.startswith("b."):
             for o in ops:
-                if "[" in o and ("!" in o or (o != ops[-1] and op.startswith("st"))):
+                if "[" in o and ("!" in o or (o != ops[-1] and op in A64_STORES)):
                     state.update("lost:" + a64_reg(r) for r in re.findall(r"\b[xw]\d+\b", o))
             return
         for k, o in enumerate(ops):
@@ -1040,10 +1096,10 @@ def check_aarch64(lines, secret, pointers):
                 raise Violation(f"secret address: {text}")
             dests = ops[:ops.index(memory)]
             header = re.fullmatch(r"\[(x\d+)(?:,\s*#(0x[0-9a-f]+|\d+))?\]", memory)
-            public_header = bool(header and op.startswith(("ldr", "ldur")) and
-                                 "hdrp:" + a64_reg(header.group(1)) in state and
+            width = a64_access_width(op, dests[0]) if len(dests) == 1 else 0
+            public_header = bool(header and width and "hdrp:" + a64_reg(header.group(1)) in state and
                                  "lost:" + a64_reg(header.group(1)) not in state and
-                                 int(header.group(2) or "0", 0) < HEADER_BYTES)
+                                 int(header.group(2) or "0", 0) + width <= HEADER_BYTES)
             for i, d in enumerate(dests):
                 r = a64_reg(d)
                 pointer_base = any("ptr:" + reg in state for reg in inner)
@@ -1069,6 +1125,9 @@ def check_aarch64(lines, secret, pointers):
                 pointer_base = any("ptr:" + reg in state for reg in inner)
                 frame = not inner or inner[0] != "x29" or "stackbase:x29" in state
                 slots = None if pointer_base or not frame else stack_bytes(memory, source, op, i, state)
+                if header_args and t(source) and slots is None:
+                    # Not this function's own frame: static memory could be the object whose header is read as public.
+                    raise Violation(f"secret stored through an object pointer or outside the frame: {text}")
                 if slots is not None:
                     pointer = "ptr:" + a64_reg(source) in state
                     for slot in slots:
@@ -1392,9 +1451,9 @@ def check_xtensa(lines, secret, pointers):
             source, base, offset = ops[0], ops[1], ops[2] if len(ops) > 2 else "0"
             if t(base):
                 raise Violation(f"secret address: {text}")
-            if header_args and t(source) and "ptr:" + base in state:
-                raise Violation(f"secret stored through an object pointer: {text}")
             at = frame_offset(state, base)
+            if header_args and t(source) and at is None:
+                raise Violation(f"secret stored through an object pointer or outside the frame: {text}")
             if at is not None:
                 size = 1 if op.startswith("s8") else 2 if op.startswith("s16") else 4
                 for i in range(size):
@@ -1621,6 +1680,16 @@ def follow_wasm(index, secret, pointers, text):
     return returned
 
 
+def wasm_load_width(op):
+    """The bytes a plain Wasm load reads; 0 for anything else (a splat, an extending vector load, a lane load)."""
+    m = re.fullmatch(r"(i32|i64|f32|f64|v128)\.load(\d+)?(_[su])?", op)
+    if not m:
+        return 0
+    if m.group(2):
+        return int(m.group(2)) // 8 if m.group(1) in ("i32", "i64") else 0
+    return {"i32": 4, "i64": 8, "f32": 4, "f64": 8, "v128": 16}[m.group(1)]
+
+
 def check_wasm(lines, secret, pointers, results=0):
     # Function parameters are locals. The stack's shape follows from each instruction, and the
     # lines are visited in order several times to carry what locals pick up around loops.
@@ -1632,7 +1701,8 @@ def check_wasm(lines, secret, pointers, results=0):
     # A header-public pointer is a parameter no instruction of the function ever writes, in a function that makes no
     # call (a callee could store a secret through it): locals are untouched by a call, memory is not.
     written = {int(t.split()[1]) for _, t in lines if t.split()[:1] in (["local.set"], ["local.tee"])}
-    calls = any(t.split()[:1] in (["call"], ["call_indirect"], ["return_call"]) for _, t in lines)
+    calls = any(t.split()[:1] and t.split()[0] in ("call", "call_indirect", "call_ref", "return_call",
+                                                    "return_call_indirect", "return_call_ref") for _, t in lines)
     header_locals = set() if calls else {i for i in header_args if i not in written}
     for _ in range(64):
         before = {k: (set(v[0]), set(v[1])) for k, v in heads.items()}
@@ -1765,13 +1835,18 @@ def check_wasm(lines, secret, pointers, results=0):
                 # load as secret also fails closed if a pointer was spilled there.
                 previous = lines[at - 1][1].split() if at else []
                 header_word = (header_locals and previous[:1] == ["local.get"] and int(previous[1]) in header_locals and
-                               len(parts) > 1 and re.fullmatch(r"\d+", parts[1]) and int(parts[1]) < HEADER_BYTES)
+                               len(parts) > 1 and re.fullmatch(r"\d+", parts[1]) and wasm_load_width(op) and
+                               int(parts[1]) + wasm_load_width(op) <= HEADER_BYTES)
                 stack.append((not header_word, False))
+            elif header_args and op in ("memory.copy", "memory.fill", "memory.init"):
+                raise Violation(f"a bulk memory write in a function with a header pointer: {text}")
             elif re.match(r"^(i32|i64|f32|f64|v128)\.store", op):
                 _value = stack.pop() if stack else (False, False)
                 address_value = stack.pop() if stack else (False, False)
-                if header_args and _value[0] and address_value[1]:
-                    raise Violation(f"secret stored through an object pointer: {text}")
+                if header_args and _value[0]:
+                    # Any linear-memory address could be the object (or its header); only a pointer proven to be
+                    # elsewhere would be safe, and the checker has no such proof.
+                    raise Violation(f"secret stored through an object pointer or outside the frame: {text}")
                 if address_value[0]:
                     raise Violation(f"secret address: {text}")
             elif op in ("select", "f32.select"):

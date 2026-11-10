@@ -74,3 +74,37 @@ header_offset:                  # the first byte past the header
         cmpq    $0, 32(%rdi)
         jne     1f
 1:      ret
+
+# Reads that leave the header although they start in it, a string operation that advances rdi, and a store into static
+# memory that the object may be.
+        .globl  straddle8, straddle16, repstos, globstore
+straddle8:                      # bytes 28 to 35
+        movq    28(%rdi), %rax
+        cmpq    $0, %rax
+        jne     1f
+1:      ret
+
+straddle16:                     # bytes 24 to 39, as LLVM merges two words into one vector load
+        movups  24(%rdi), %xmm0
+        movhlps %xmm0, %xmm1
+        movq    %xmm1, %rax
+        cmpq    $0, %rax
+        jne     1f
+1:      ret
+
+repstos:                        # rep stosb advances rdi past the header
+        xorl    %eax, %eax
+        movq    $40, %rcx
+        rep stosb
+        cmpq    $0, (%rdi)
+        jne     1f
+1:      ret
+
+globstore:                      # rsi is secret: a store to static memory, which the object could be
+        movq    %rsi, glob(%rip)
+        cmpq    $0, 8(%rdi)
+        jne     1f
+1:      ret
+
+        .data
+glob:   .quad   0

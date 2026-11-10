@@ -146,3 +146,25 @@ header_offset:
 	if
 	end_if
 	end_function
+
+	.globl	straddle
+straddle:
+	.functype	straddle (i32, i32) -> ()
+	local.get	0
+	i64.load	28
+	i32.wrap_i64
+	if
+	end_if
+	end_function
+
+	.globl	globstore
+globstore:
+	.functype	globstore (i32, i32) -> ()
+	i32.const	1024
+	local.get	1
+	i32.store	0
+	local.get	0
+	i32.load	8
+	if
+	end_if
+	end_function

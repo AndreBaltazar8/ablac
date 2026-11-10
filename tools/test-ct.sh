@@ -186,7 +186,7 @@ division_read() {
 # path, clobbered by a call, a secret stored through it or a copy of it) must be reported. x86-64, AArch64, Wasm and Xtensa (hand
 # fixtures).
 header_read() {
-    local arch=$1 triple=$2 file=$3 entry binary="$out/$3"
+    local arch=$1 triple=$2 file=$3 extra_reads=${4:-} extra_stores=${5:-} entry binary="$out/$3"
     [ "$arch" = xtensa ] || llvm-mc -triple "$triple" -filetype=obj "$cases/$file.s" -o "$out/$file.o"
     if [ "$arch" = xtensa ]; then
         binary="$out/$file.o"
@@ -202,7 +202,7 @@ header_read() {
             cat "$out/$file-$entry.log" >&2; echo "ct: header entry $entry was reported on $arch" >&2; exit 1
         }
     done
-    for entry in payload_branch payload_index header_indexed header_overwritten header_merge header_call header_offset; do
+    for entry in payload_branch payload_index header_indexed header_overwritten header_merge header_call header_offset $extra_reads; do
         # The call is followed, so what is reported is the header read after it, not the call.
         if $check --follow-calls "$arch" "$binary" "$entry:%0" > "$out/$file-$entry.log" 2>&1; then
             echo "ct: missed header control $entry on $arch" >&2; exit 1
@@ -210,13 +210,13 @@ header_read() {
         grep -q '^LEAK' "$out/$file-$entry.log" || { cat "$out/$file-$entry.log" >&2; exit 1; }
         ! grep -q ': call: ' "$out/$file-$entry.log" || { cat "$out/$file-$entry.log" >&2; exit 1; }
     done
-    for entry in header_store_secret header_store_other; do
+    for entry in header_store_secret header_store_other $extra_stores; do
         if $check "$arch" "$binary" "$entry:%0,1" > "$out/$file-$entry.log" 2>&1; then
             echo "ct: missed header control $entry on $arch" >&2; exit 1
         fi
         grep -q 'LEAK.*secret stored through an object pointer' "$out/$file-$entry.log" || { cat "$out/$file-$entry.log" >&2; exit 1; }
     done
-    echo "ok   $arch checker: header words of an object pointer are public (2 clean, 9 controls)"
+    echo "ok   $arch checker: header words of an object pointer are public (2 clean, $((9 + $(wc -w <<< "$extra_reads $extra_stores"))) controls)"
 }
 
 # Secret residue: what a secret-handling call leaves in memory that nothing wipes. The register allocator spills
@@ -570,10 +570,10 @@ real_entries_run
 orchestration_read "$out/x86.o"
 worker_read "$out/x86.o"
 division_read
-header_read x86_64 x86_64-linux-gnu header-x86
-header_read aarch64 aarch64-linux-gnu header-a64
-header_read wasm wasm32 header-wasm
-header_read xtensa xtensa header-xtensa
+header_read x86_64 x86_64-linux-gnu header-x86 "straddle8 straddle16 repstos" globstore
+header_read aarch64 aarch64-linux-gnu header-a64 "straddle bfi_move" globstore
+header_read wasm wasm32 header-wasm straddle globstore
+header_read xtensa xtensa header-xtensa "" globstore
 
 # --- AArch64 --------------------------------------------------------------------------
 "$compiler" build "$cases/aarch64-build.ab" -o "$out/aarch64-driver" --no-cache
