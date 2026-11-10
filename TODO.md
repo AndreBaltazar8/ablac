@@ -1657,3 +1657,9 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   field-slot alias tags (native 42/42 us a tick with mobs, WebAssembly within 1%). An
   `assume` would turn any producer missed later (extension fields with defaults,
   generics) into undefined behaviour instead of a trap, so it isn't worth carrying.
+
+- Word-wise name hash in the compiler (`bootstrapHashNameBytes`, src/sema.ab). It builds
+  each eight-byte word from eight byte loads and is about 1.5% of a self-build profile;
+  one unaligned `ablaUnsafeLoadI64` would give the same hash. Not pursued (ablac-d1,
+  2026-11-10): a 1.5% ceiling realises well under 1%, and it would put an unsafe
+  unaligned load in the compiler's own source for that.
