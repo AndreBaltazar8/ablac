@@ -35,26 +35,28 @@ if rg -q '^(ablaHost|abla_host_)' <<< "$symbols"; then
     exit 1
 fi
 
-"${new_session[@]}" env ABLA_MAX_MEMORY_MB=64 ABLA_MAX_SECONDS=15 \
+# The server's budget is CPU time, which load does not change; the wall-clock limit only ends a hang.
+"${new_session[@]}" env ABLA_MAX_MEMORY_MB=64 ABLA_MAX_SECONDS=300 ABLA_MAX_CPU_SECONDS=15 \
     "$project_root/tools/run-limited.sh" "$test_directory/server" \
     > "$test_directory/stdout.txt" 2> "$test_directory/stderr.txt" &
 server=$!
 
+# The server's first stderr line is its port: wait for that line for as long as the server runs
+# (a loaded machine may start it late), not for a fixed window.
 port=""
-for attempt in {1..100}; do
+while :; do
     port=$(sed -n '1p' "$test_directory/stderr.txt" 2>/dev/null || true)
-    if [[ $port =~ ^[0-9]+$ ]]; then
-        break
-    fi
+    [[ $port =~ ^[0-9]+$ ]] && break
+    kill -0 "$server" 2>/dev/null || break
     sleep 0.05
 done
-[[ $port =~ ^[0-9]+$ ]] || exit 1
+[[ $port =~ ^[0-9]+$ ]] || { echo 'http server: it ended before it listened' >&2; exit 1; }
 
-curl --silent --fail --max-time 2 \
+curl --silent --fail --max-time 60 \
     "http://127.0.0.1:$port/health" > "$test_directory/health.txt"
-curl --silent --fail --max-time 2 -H 'Stripe-Version: 2024-06-01' \
+curl --silent --fail --max-time 60 -H 'Stripe-Version: 2024-06-01' \
     "http://127.0.0.1:$port/customers/42" > "$test_directory/v1.txt"
-curl --silent --fail --max-time 2 \
+curl --silent --fail --max-time 60 \
     "http://127.0.0.1:$port/customers/42" > "$test_directory/latest.txt"
 
 set +e
