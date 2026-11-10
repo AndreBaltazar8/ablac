@@ -315,10 +315,10 @@ def is_allocator(name):
     return FOLLOW["object"] is not None and name in allocator_names(FOLLOW["object"])
 
 
-def follow_call(name, secret, pointers, text, check=None):
+def follow_call(name, secret, pointers, text, check=None, views=None):
     FOLLOW["followed"].add(name)
     check = check or check_x86
-    key = (check.__name__, name, tuple(secret), tuple(pointers))
+    key = (check.__name__, name, tuple(secret), tuple(pointers), tuple(sorted((views or {}).items())))
     if key in FOLLOW["done"]:
         return FOLLOW["done"][key]
     if name in FOLLOW["stack"]:
@@ -331,6 +331,7 @@ def follow_call(name, secret, pointers, text, check=None):
     if unread:
         raise Violation(f"call: the disassembler can't read {name}: {unread[0]}")
     FOLLOW["stack"].append(name)
+    FOLLOW["views"] = dict(views or {})
     try:
         returned = check(lines, secret, pointers)
     except Violation as violation:
@@ -380,15 +381,41 @@ def x86_access_width(op, ops):
 # caller's value, as secret as the caller's own taint says.
 X86_CALLEE_SAVED = ("rbx", "rbp", "r12", "r13", "r14", "r15")
 
+# A frame view: what a callee knows about memory its caller passed as an address in the caller's own frame (an
+# unoptimised build boxes a value in a slot and passes the slot, or the slot its result goes to): one character a byte
+# from the address, "1" where the caller held a secret or didn't know, "0" where it held a public byte (a boxed value's
+# type tag, written as a constant). In a callee, `vmem:<argument>:<mask>` is that memory and `vreg:<register>:<argument>`
+# a register pointing at its start; stores through it update the mask, which goes back to the caller with the result.
+# Bytes past the view, or reached through an index, are secret, as any unknown memory is.
+VIEW_BYTES = 64
+
 
 def check_x86(lines, secret, pointers):
     index_of_lines = {address for address, _ in lines}
     returned = []
     header_args = FOLLOW.get("header_args", [])
     FOLLOW["header_args"] = []  # a followed callee has none
+    views = FOLLOW.get("views", {})
+    FOLLOW["views"] = {}
     start = (frozenset(X86_ARGS[i] for i in secret) | frozenset(["ptr:" + X86_ARGS[i] for i in pointers]) |
              frozenset(["rspd:0"]) | frozenset("hdrp:" + X86_ARGS[i] for i in header_args) |
-             frozenset(f"entry:{r}" for r in X86_CALLEE_SAVED))
+             frozenset(f"entry:{r}" for r in X86_CALLEE_SAVED) |
+             frozenset(f"vmem:{i}:{mask}" for i, mask in views.items()) |
+             frozenset(f"vreg:{X86_ARGS[i]}:{i}" for i in views))
+
+    def view_index(state, r):
+        """The argument whose frame view register r points at, or None."""
+        found = [t.split(":")[2] for t in state if t.startswith(f"vreg:{r}:")]
+        return int(found[0]) if len(found) == 1 else None
+
+    def view_mask(state, i):
+        found = [t.split(":", 2)[2] for t in state if t.startswith(f"vmem:{i}:")]
+        return found[0] if len(found) == 1 else "1" * VIEW_BYTES
+
+    def set_view_mask(state, i, mask):
+        for tag in [t for t in state if t.startswith(f"vmem:{i}:")]:
+            state.discard(tag)
+        state.add(f"vmem:{i}:{mask}")
 
     def rsp_delta(state):
         """How far rsp is below its value at entry, as the tag says; "?" if it isn't one number."""
@@ -400,6 +427,28 @@ def check_x86(lines, secret, pointers):
         for tag in [t for t in state if t.startswith(("rspd:", "rspoff:"))]:
             state.discard(tag)
         state.add("rspd:" + (str(int(before) + change) if before != "?" and change is not None else "?"))
+
+    def frame_place(state, r):
+        """("rbp", N) or ("rsp", N) if register r holds an address in this function's frame at a known offset from the
+        frame base (lea N(%rbp)) or from the current stack pointer (lea N(%rsp), dropped when rsp moves), else None."""
+        offsets = [t.split(":")[2] for t in state if t.startswith(f"rbpoff:{r}:")]
+        if len(offsets) == 1 and "stackbase:rbp" in state:
+            return "rbp", int(offsets[0])
+        offsets = [t.split(":")[2] for t in state if t.startswith(f"rspoff:{r}:")]
+        if len(offsets) == 1 and "stack-moved" not in state:
+            return "rsp", int(offsets[0])
+        return None
+
+    def frame_view(state, r):
+        """The frame view (VIEW_BYTES characters) of register r if it holds an address in this function's frame at a
+        known place (frame_place), else None."""
+        place = frame_place(state, r)
+        if place is None:
+            return None
+        base, at = place
+        unknown = "pushed" in state or "stack-moved" in state
+        return "".join("1" if unknown or f"slot:{base}:{at + i}" in state or f"ptrslot:{base}:{at + i}" in state else "0"
+                       for i in range(VIEW_BYTES))
 
     def after_call(state, name, text):
         state = set(state)
@@ -428,7 +477,36 @@ def check_x86(lines, secret, pointers):
         inputs = callee_inputs(name)
         secret_arguments = [i for i, r in enumerate(X86_ARGS) if r in state and r in inputs]
         pointer_arguments = [i for i, r in enumerate(X86_ARGS) if "ptr:" + r in state and r not in state and r in inputs]
-        out = follow_call(name, secret_arguments, pointer_arguments, text)
+        views, forwarded, own_views = {}, {}, {}
+        for i, r in enumerate(X86_ARGS):
+            if r in inputs and i not in secret_arguments and i not in pointer_arguments:
+                # A view this function was given passes on with its register; an address in its own frame gets one
+                # from its slots.
+                given = view_index(state, r)
+                if given is not None:
+                    views[i] = view_mask(state, given)
+                    forwarded[i] = given
+                else:
+                    mask = frame_view(state, r)
+                    if mask is not None:
+                        views[i] = mask
+                        own_views[i] = frame_place(state, r)
+        out = follow_call(name, secret_arguments, pointer_arguments, text, views=views)
+        passed_tags = {i: [t for t in state if t.startswith((f"stackaddr:{r}", f"stackbase:{r}", f"rbpoff:{r}:",
+                                                             f"rspoff:{r}:", f"vreg:{r}:"))]
+                       for i, r in enumerate(X86_ARGS)}
+        returned_views = {t.split(":")[1]: int(t.split(":")[2]) for t in out if t.startswith("retview:")}
+        if any(int(i) not in views for i in returned_views.values()):
+            out = set(out) | {"escape"}
+        # What the callee left in the memory it was given a view of: back into the view, or into this frame's slots.
+        returned_masks = {i: next((t.split(":", 2)[2] for t in out if t.startswith(f"vmem:{i}:")), "1" * VIEW_BYTES)
+                          for i in views}
+        for i, given in forwarded.items():
+            set_view_mask(state, given, returned_masks[i])
+        for i, (base, at) in own_views.items():
+            for j, bit in enumerate(returned_masks[i]):
+                (state.add if bit == "1" else state.discard)(f"slot:{base}:{at + j}")
+                state.discard(f"ptrslot:{base}:{at + j}")
         # The callee ran on exactly these arguments. What it returns in rax, rdx and the vector
         # registers is what its own analysis found; the other registers it may clobber are dead.
         for r in ["rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11"] + [f"v{n}" for n in range(16)]:
@@ -441,10 +519,30 @@ def check_x86(lines, secret, pointers):
             if "ptr:" + r in out:
                 state.add("ptr:" + r)
         state.discard("flags")
+        for r, i in returned_views.items():
+            # The callee returned the address it was given for argument i: the register is that address again.
+            argument = X86_ARGS[i]
+            for tag in passed_tags[i]:
+                state.add(tag.replace(f":{argument}", f":{r}", 1) if ":" in tag else tag)
         # Memory it was given may now hold secrets. Once the function has made an address in its own
         # frame (lea or mov from rsp), it may have been spilled, pushed or kept in a callee-saved
         # register, and the callee may have written through it: every slot read after a call is secret.
-        if "frameaddr" in state:
+        # Unless the call is clean: every address in our frame it was given went as a frame view, and it (with
+        # whatever it called) wrote no memory but its own frame and returned nothing derived from a view.
+        passed_frame = [r for r in X86_ARGS if r in inputs and
+                        any(t.startswith((f"stackaddr:{r}", f"stackbase:{r}", f"rbpoff:{r}:", f"rspoff:{r}:",
+                                          f"vreg:{r}:")) for t in state)]
+        # A frame address can reach a callee only as a view: not if one was ever stored (and could be reloaded
+        # untracked) or is in a register the view doesn't cover.
+        frame_address_regs = {t.split(":")[1] for t in state
+                              if t.startswith(("stackaddr:", "stackbase:", "rspoff:", "rbpoff:"))} - {"rsp", "rbp"}
+        uncovered = {r for r in frame_address_regs if not (r in X86_ARGS and X86_ARGS.index(r) in views)}
+        clean = (all(X86_ARGS.index(r) in views for r in passed_frame) and not ({"wroteout", "escape"} & set(out)) and
+                 "frameleak" not in state and not uncovered)
+        for tag in ("wroteout", "escape"):
+            if tag in out:
+                state.add(tag)
+        if "frameaddr" in state and not clean:
             state.add("pushed")
         here = rsp_delta(state)
         for wipe in [t for t in out if t.startswith("wipe:")]:
@@ -534,12 +632,20 @@ def check_x86(lines, secret, pointers):
             if not m or not m.group(2) or m.group(3):
                 return None
             base = x86_reg(m.group(2))
-            if base != "rsp" and (base != "rbp" or "stackbase:rbp" not in state):
+            # A register holding rbp plus a known offset (lea N(%rbp)) names the same slots as rbp does.
+            relative = [int(t.split(":")[2]) for t in state if t.startswith(f"rbpoff:{base}:")]
+            from_rsp = [int(t.split(":")[2]) for t in state if t.startswith(f"rspoff:{base}:")]
+            shift = 0
+            if base not in ("rsp", "rbp") and len(relative) == 1 and "stackbase:rbp" in state:
+                shift, base = relative[0], "rbp"
+            elif base not in ("rsp", "rbp") and len(from_rsp) == 1 and "stack-moved" not in state:
+                shift, base = from_rsp[0], "rsp"
+            elif base != "rsp" and (base != "rbp" or "stackbase:rbp" not in state):
                 return None
             if "ptr:" + base in state:
                 return None
             displacement = m.group(1)
-            offset = int(displacement, 0) if displacement not in ("", "-") else 0
+            offset = (int(displacement, 0) if displacement not in ("", "-") else 0) + shift
             # The memory width is the source width for extending loads.
             if re.match(r"^mov[zs]b", op):
                 size = 1
@@ -596,6 +702,15 @@ def check_x86(lines, secret, pointers):
                         return False  # a header word of an object whose payload is secret
                 if (base and "ptr:" + x86_reg(base) in state) or (idx and "ptr:" + x86_reg(idx) in state):
                     return True  # read through a pointer to secrets
+                viewed = view_index(state, x86_reg(base)) if base else None
+                if viewed is not None and not idx and re.match(r"^-?(?:0x)?[0-9a-f]*$", m.group(1) or ""):
+                    # Through a frame view: secret if any byte read is (or lies past the view).
+                    at = int(m.group(1), 0) if m.group(1) not in ("", "-") else 0
+                    width = x86_access_width(op, ops)
+                    mask = view_mask(state, viewed)
+                    if width and 0 <= at and at + width <= VIEW_BYTES:
+                        return "1" in mask[at:at + width]
+                    return True
                 slots = stack_slots(o)
                 if slots is not None:
                     return "pushed" in state or stack_tagged(slots, "slot:")
@@ -607,6 +722,8 @@ def check_x86(lines, secret, pointers):
             if o.startswith("%"):
                 r = x86_reg(o)
                 state.discard("entry:" + r)
+                for tag in [t for t in state if t.startswith((f"vreg:{r}:", f"rbpoff:{r}:"))]:
+                    state.discard(tag)
                 if value:
                     state.add(r)
                 else:
@@ -634,6 +751,37 @@ def check_x86(lines, secret, pointers):
                         for slot in slots:
                             (state.add if value else state.discard)("slot:" + slot)
                             (state.add if pointer else state.discard)("ptrslot:" + slot)
+                    elif (value or pointer) and base and ("stackbase:" + x86_reg(base) in state or
+                                                         "stackaddr:" + x86_reg(base) in state or
+                                                         (idx and "stackbase:" + x86_reg(idx) in state)):
+                        # A secret stored through an address in this frame the checker can't place: any slot may
+                        # hold it now.
+                        state.add("pushed")
+                    viewed = view_index(state, x86_reg(base)) if base else None
+                    if viewed is not None and not idx:
+                        # Through a frame view: the bytes written are as secret as the value; an unknown width or
+                        # offset makes the whole view secret.
+                        mask = list(view_mask(state, viewed))
+                        displacement = m.group(1)
+                        width = x86_access_width(op, ops)
+                        try:
+                            at = int(displacement, 0) if displacement not in ("", "-") else 0
+                        except ValueError:
+                            at = None
+                        if at is None or not width:
+                            mask = ["1"] * VIEW_BYTES
+                        else:
+                            for i in range(at, at + width):
+                                if 0 <= i < VIEW_BYTES:
+                                    mask[i] = "1" if (value or pointer) else "0"
+                        if at is not None and width and not 0 <= at <= VIEW_BYTES - width:
+                            mask = ["1"] * VIEW_BYTES
+                            state.add("wroteout")  # past the view: could be anything in the caller's frame
+                        set_view_mask(state, viewed, "".join(mask))
+                    elif slots is None and (value or pointer):
+                        # Memory nothing names could be a view's: a secret stored there makes every view secret.
+                        for tag in [t for t in state if t.startswith("vmem:")]:
+                            set_view_mask(state, int(tag.split(":")[1]), "1" * VIEW_BYTES)
 
         if op.startswith("j") and op not in ("jmp", "jmpq"):
             if "flags" in state:
@@ -719,6 +867,9 @@ def check_x86(lines, secret, pointers):
             if base == "rsp" and not index and ops[1].startswith("%"):
                 displacement = parts.group(1)
                 state.add(f"rspoff:{x86_reg(ops[1])}:{int(displacement, 0) if displacement not in ('', '-') else 0}")
+            if base == "rbp" and not index and "stackbase:rbp" in state and ops[1].startswith("%"):
+                displacement = parts.group(1)
+                state.add(f"rbpoff:{x86_reg(ops[1])}:{int(displacement, 0) if displacement not in ('', '-') else 0}")
             if stack_base and ops[1].startswith("%"):
                 state.add("stackbase:" + x86_reg(ops[1]))
                 state.add("stackaddr:" + x86_reg(ops[1]))
@@ -854,7 +1005,105 @@ def check_x86(lines, secret, pointers):
         out.append(i + 1)
         return out
 
-    states = fixpoint(lines, start, step, successors)
+    def tracked(state, text, address):
+        """step, plus what a caller needs to know to trust its own frame after calling this function: `wroteout` once it
+        stores anywhere but its own frame (through a view, through unknown memory, above its stack pointer at entry),
+        `vd:<reg>` for a register derived from a frame view, and `escape` when one is returned in rax or rdx."""
+        before = state
+        after = set(step(state, text, address))
+        parts = text.split(None, 1)
+        op = parts[0]
+        if op in ("lock", "rep", "notrack", "data16", "cs") and len(parts) > 1:
+            parts = parts[1].split(None, 1)
+            op = parts[0]
+        ops = x86_split(parts[1]) if len(parts) > 1 else []
+        derived = lambda r: f"vd:{r}" in before or any(t.startswith(f"vreg:{r}:") for t in before)
+        # The registers whose value the instruction uses: register operands, and the address registers of a lea (an
+        # address computed from a view is derived from it; a value loaded through one is not).
+        sources = [x86_reg(o) for o in (ops[:-1] if len(ops) > 1 else ops) if o.startswith("%")]
+        if op.startswith("lea") and ops:
+            sources += [x86_reg(r) for r in re.findall(r"%\w+", ops[0])]
+        stores = (ops and not ops[-1].startswith(("%", "$", "*")) and "(" in ops[-1] and
+                  not op.startswith(("cmp", "test", "j", "call", "nop", "lea", "prefetch", "bt")) and op != "push")
+        if op.startswith("stos") or op.startswith("movs"):
+            stores = True
+        if stores:
+            m = mem_parts(ops[-1]) if not op.startswith(("stos", "movs")) else None
+            own = False
+            if m and not m.group(3):
+                base = x86_reg(m.group(2)) if m.group(2) else ""
+                displacement = m.group(1)
+                try:
+                    at = int(displacement, 0) if displacement not in ("", "-") else 0
+                except ValueError:
+                    at = None
+                width = x86_access_width(op, ops) or 16
+                here = rsp_delta(before)
+                if at is not None and base == "rbp" and "stackbase:rbp" in before and at + width <= 0:
+                    own = True
+                elif at is not None and base == "rsp" and here != "?" and at + width <= int(here):
+                    own = True
+            if op.startswith("stos") and "rspoff:rdi:" in " ".join(before):
+                own = True  # ctScrubStack's wipe of its own callee area, under the stack pointer
+            through_view = m and not m.group(3) and m.group(2) and view_index(before, x86_reg(m.group(2))) is not None
+            # A store reaches a caller's frame only through the stack registers past this frame, a register derived
+            # from a view (at an offset the view doesn't track), a copy of a frame address, or a string store; a
+            # pointer with no stack address behind it can't (a caller's frame address reaches a callee only as a view,
+            # and an escape of one is reported).
+            bases = [x86_reg(r) for r in re.findall(r"%\w+", ops[-1])] if m else []
+            stack_reached = (op.startswith(("stos", "movs")) or
+                             any(b in ("rsp", "rbp") or derived(b) or f"stackbase:{b}" in before or
+                                 f"stackaddr:{b}" in before for b in bases))
+            if not own and not through_view and stack_reached:
+                after.add("wroteout")
+            spilled = [view_index(before, r) for r in sources if view_index(before, r) is not None]
+            slot_base = x86_reg(m.group(2)) if m and m.group(2) else ""
+            if own and slot_base in ("rbp", "rsp"):
+                # Into this frame: not an escape. A view's register spilled there is given back by reloading the slot.
+                at = int(m.group(1), 0) if m.group(1) not in ("", "-") else 0
+                for tag in [t for t in after if t.startswith(f"vslot:{slot_base}:{at}:")]:
+                    after.discard(tag)
+                if spilled:
+                    after.add(f"vslot:{slot_base}:{at}:{spilled[0]}")
+            elif any(derived(r) for r in sources):
+                after.add("escape")
+            if any(t.startswith((f"stackaddr:{r}", f"stackbase:{r}", f"rspoff:{r}:", f"rbpoff:{r}:"))
+                   for r in sources if r not in ("rsp", "rbp") for t in before):
+                # A frame address stored to memory: it can come back without its tags.
+                after.add("frameleak")
+        elif op == "push" and ops and ops[0].startswith("%") and derived(x86_reg(ops[0])):
+            after.add("escape")
+        if op == "push" and ops and ops[0].startswith("%") and x86_reg(ops[0]) not in ("rsp", "rbp") and any(
+                t.startswith((f"stackaddr:{x86_reg(ops[0])}", f"stackbase:{x86_reg(ops[0])}",
+                              f"rspoff:{x86_reg(ops[0])}:", f"rbpoff:{x86_reg(ops[0])}:")) for t in before):
+            after.add("frameleak")
+        if ops and ops[-1].startswith("%") and not op.startswith(("cmp", "test", "push")):
+            dest = x86_reg(ops[-1])
+            if any(derived(r) for r in sources if r != dest) or (derived(dest) and op not in ("mov", "movq", "movl", "lea", "leaq") and not op.startswith("xor")):
+                after.add(f"vd:{dest}")
+            elif not any(t.startswith(f"vreg:{dest}:") for t in after):
+                after.discard(f"vd:{dest}")
+            # A register copy of a view's register points at the same view, and so does a reload of its spill.
+            if op.startswith("mov") and len(ops) == 2 and ops[0].startswith("%") and "(" not in ops[0]:
+                source = view_index(before, x86_reg(ops[0]))
+                if source is not None:
+                    after.add(f"vreg:{dest}:{source}")
+                    after.discard(f"vd:{dest}")
+            elif op in ("mov", "movq") and len(ops) == 2 and (m := mem_parts(ops[0])) and not m.group(3) and \
+                    m.group(2) and x86_reg(m.group(2)) in ("rbp", "rsp"):
+                at = int(m.group(1), 0) if m.group(1) not in ("", "-") else 0
+                spill = [t.split(":")[3] for t in before if t.startswith(f"vslot:{x86_reg(m.group(2))}:{at}:")]
+                if spill:
+                    after.add(f"vreg:{dest}:{spill[0]}")
+        # rsp-relative spills name other slots once rsp moves.
+        if ops and ops[-1] in ("%rsp", "%esp") or op.startswith(("push", "pop")):
+            for tag in [t for t in after if t.startswith("vslot:rsp:")]:
+                after.discard(tag)
+        if op.startswith("ret") and (derived("rax") or derived("rdx")):
+            after.add("escape")
+        return frozenset(after)
+
+    states = fixpoint(lines, start, tracked, successors)
     # What the function can leave in its registers when it returns, for a caller that follows it.
     out = set()
     paths = []
@@ -864,6 +1113,15 @@ def check_x86(lines, secret, pointers):
     paths += list(returned)
     for path in paths:
         out |= {t for t in path if not t.startswith("wipe:")}
+        # A result derived from a frame view lets the caller's frame be written later, unless it is the view's own
+        # address (what a function returning its result through memory hands back): the caller then gets its own
+        # address back as it passed it.
+        if any(t in path for t in ("vd:rax", "vd:rdx")):
+            out.add("escape")
+        for r in ("rax", "rdx"):
+            given = [t.split(":")[2] for t in path if t.startswith(f"vreg:{r}:")]
+            if given:
+                out.add(f"retview:{r}:{given[0]}")
     # A wipe counts for a caller only if it happened on every path to a return.
     if paths:
         out |= frozenset.intersection(*[frozenset(t for t in path if t.startswith("wipe:")) for path in paths])

@@ -451,6 +451,30 @@ frame_address_read() {
     echo "ok   x86_64 following calls: a secret written through a frame address, and one passed on the stack, found"
 }
 
+# Frame views (tests/cases/ct/frame-view-x86.s): an unoptimised build boxes a value in a slot, its type tag public and
+# its payload secret, and passes the slot's address; the checker follows what the callee reads and writes through that
+# address, so the tag reads as public. Clean: the tag read, also after the callee spills and reloads the address. Found:
+# a branch on the payload, a secret written over the tag, the address returned (and written through), stored in a
+# global, or the caller's frame written above the callee's return address; and a function's own store through a
+# register copy of its slot's address.
+frame_view_read() {
+    llvm-mc -triple x86_64-linux-gnu -filetype=obj "$cases/frame-view-x86.s" -o "$out/frame-view-x86.o"
+    ld.lld -static -e view_tag "$out/frame-view-x86.o" -o "$out/frame-view-x86"
+    local entry
+    for entry in view_tag view_spill; do
+        $check --follow-calls x86_64 "$out/frame-view-x86" "$entry:0" > "$out/frame-view-$entry.log" 2>&1 || {
+            cat "$out/frame-view-$entry.log" >&2; echo "ct: $entry was reported" >&2; exit 1
+        }
+    done
+    for entry in view_payload view_result view_escape view_stash view_above self_write; do
+        if $check --follow-calls x86_64 "$out/frame-view-x86" "$entry:0" > "$out/frame-view-$entry.log" 2>&1; then
+            echo "ct: missed $entry" >&2; exit 1
+        fi
+        grep -q '^LEAK' "$out/frame-view-$entry.log" || { cat "$out/frame-view-$entry.log" >&2; exit 1; }
+    done
+    echo "ok   x86_64 frame views: a boxed value's tag read as public through its slot's address, the six ways a secret could hide found"
+}
+
 # The real entry points, run: the 16 KiB below the stack pointer is zeroed, each public AES (every key size, and a
 # 64 KiB input) and RSA private entry (2048, 3072 and 4096 bits) is called from a helper that returns, and the region
 # must still be zero beneath the entry's own frame. A worker that outgrows its wipe (ctScrubStack2048 in abla/crypto/aes,
@@ -494,9 +518,10 @@ real_entries_run() {
     echo "ok   x86_64 real entry points: AES at 128, 192 and 256 bits with a 64 KiB input, RSA at 2048, 3072 and 4096, key generation, the password entries of PBE over PKCS#8 and PKCS#12: nothing below their own frame in 16 KiB, three runs and one under GC stress"
 }
 # A --fast build doesn't optimise, so it keeps what release builds remove: the type-tag check of every
-# erased scalar conversion branches on a value copied from a secret's box, and a division by a secret
-# stays a division. The checker can't tell those from payload, and they are not what the fast fixtures
-# are for, so tests/cases/ct/fast-known.txt lists the fixtures that fail and the class of finding. Any other
+# erased scalar conversion branches on the tag of a secret's box, and a division by a secret stays a
+# division. On x86-64 the checker reads the box through the slot's address (frame views: the tag was
+# written as a constant, so it is public), and no fixture fails there; a fixture that does is listed in
+# tests/cases/ct/fast-known.txt with the class of finding (empty now). Any other
 # finding fails here, and so does a listed fixture that comes out clean (shrink the list), or one that fails
 # differently. The leaks must be caught as in release, the one a call down by following that call.
 # The x86-64 and AArch64 checkers follow calls; Wasm and Xtensa don't (TODO.md).
@@ -701,6 +726,7 @@ cmp "$out/x86_64-fast.found" "$out/x86_64-fast-nodebug.found" || {
     echo "ct: the fast build without debug info has other findings than the one with" >&2; exit 1
 }
 frame_address_read
+frame_view_read
 residue_read
 real_entries_run
 orchestration_read "$out/x86.o"
