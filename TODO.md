@@ -1983,3 +1983,8 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   process. So the cut's ceiling is about 5% of a `--fast` NovaKind build (the
   17–20% above were cycle shares of the frontend process's own samples, not of the
   build).
+  Tried, neutral: remembering `conformsTo`'s answers per analyzer (key type and
+  interface) on top of the one-pass `bootstrapInterfaceImplementers` took the NovaKind
+  `--fast` build from 29,609 / 29,455 / 29,465 to 27,645 / 27,568 / 27,715 samples (×20M
+  instructions) with the one-pass rewrite alone at the same level (27,495 / 27,545):
+  no further gain, so not kept (a cache with no effect is only a place for stale answers).
