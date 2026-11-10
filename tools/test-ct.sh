@@ -455,8 +455,9 @@ frame_address_read() {
 # its payload secret, and passes the slot's address; the checker follows what the callee reads and writes through that
 # address, so the tag reads as public. Clean: the tag read, also after the callee spills and reloads the address. Found:
 # a branch on the payload, a secret written over the tag, the address returned (and written through), stored in a
-# global, or the caller's frame written above the callee's return address; and a function's own store through a
-# register copy of its slot's address.
+# global, passed on to a callee that writes, called through a register, a secret past the 64-byte view (read or
+# written), a box whose tag is the secret, the caller's frame written above the callee's return address (by a mov or a
+# rep stos); and a function's own store through a register copy of its slot's address.
 frame_view_read() {
     llvm-mc -triple x86_64-linux-gnu -filetype=obj "$cases/frame-view-x86.s" -o "$out/frame-view-x86.o"
     ld.lld -static -e view_tag "$out/frame-view-x86.o" -o "$out/frame-view-x86"
@@ -466,13 +467,14 @@ frame_view_read() {
             cat "$out/frame-view-$entry.log" >&2; echo "ct: $entry was reported" >&2; exit 1
         }
     done
-    for entry in view_payload view_result view_escape view_stash view_above self_write; do
+    for entry in view_payload view_result view_escape view_stash view_above view_passon view_indirect view_far_read \
+        view_far_write view_secret_tag view_stos_above self_write; do
         if $check --follow-calls x86_64 "$out/frame-view-x86" "$entry:0" > "$out/frame-view-$entry.log" 2>&1; then
             echo "ct: missed $entry" >&2; exit 1
         fi
         grep -q '^LEAK' "$out/frame-view-$entry.log" || { cat "$out/frame-view-$entry.log" >&2; exit 1; }
     done
-    echo "ok   x86_64 frame views: a boxed value's tag read as public through its slot's address, the six ways a secret could hide found"
+    echo "ok   x86_64 frame views: a boxed value's tag read as public through its slot's address, the twelve ways a secret could hide found"
 }
 
 # The real entry points, run: the 16 KiB below the stack pointer is zeroed, each public AES (every key size, and a

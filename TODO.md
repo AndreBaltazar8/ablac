@@ -260,9 +260,15 @@
     register (`frameleak`).
   - A store through a register copy of a frame address (`lea N(%rbp), %rax` then a store through `%rax`) now updates
     the slot; before, it was missed even in release reading.
-  - Eight hand controls in `frame-view-x86.s`: the tag read clean, also after a spill; found a branch on the payload, a
-    secret written over the tag, the address returned and written through, stored in a global, the caller's frame
-    written above the callee's return address, and the own-store through a copy.
+  - Fourteen hand controls in `frame-view-x86.s`. Clean: the tag read, also after a spill. Found: a branch on the
+    payload, a secret written over the tag, the address returned and written through, stored in a global, passed on
+    to a callee that writes, an indirect call, a secret past the 64-byte view (read, or written), a box whose tag is the
+    secret, the caller's frame written above the callee's return address (by `mov` and by `rep stos`), and the
+    own-store through a copy.
+  - The release reading is unchanged, byte for byte: master's checker and this one give identical logs on the release
+    x86-64 object (64 fixtures and the 16 leaks, with and without `--follow-calls`) and on its residue entries.
+  - Not covered, as on master: a callee that writes into its caller's frame with `rep stos` while the caller has no
+    frame address at all reads clean (no compiler emits it).
   - Once past the tag checks, no fixture showed a real secret branch from unoptimised lowering. The three `jge`s and
     the secret addresses that appeared on the way (loop bounds in `pbePadBody`, `rsa_crt_recombine`, `aes_block_io`;
     `bnStore`'s address) were slots made secret by the old "a call may write any slot" rule.

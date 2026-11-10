@@ -1043,8 +1043,15 @@ def check_x86(lines, secret, pointers):
                     own = True
                 elif at is not None and base == "rsp" and here != "?" and at + width <= int(here):
                     own = True
-            if op.startswith("stos") and "rspoff:rdi:" in " ".join(before):
-                own = True  # ctScrubStack's wipe of its own callee area, under the stack pointer
+            if op.startswith("stos"):
+                # A string store is this frame's only if all of it lies at or under the frame's top: from rdi at a known
+                # offset from rsp, rcx elements of the operation's width (ctScrubStack's wipe goes under rsp).
+                start = [int(t.split(":")[2]) for t in before if t.startswith("rspoff:rdi:")]
+                count = [int(t.split(":")[2]) for t in before if t.startswith("const:rcx:")]
+                width = {"b": 1, "w": 2, "l": 4, "q": 8}.get(op[-1], 0)
+                here = rsp_delta(before)
+                own = (len(start) == 1 and len(count) == 1 and width > 0 and here != "?" and
+                       start[0] + width * count[0] <= int(here))
             through_view = m and not m.group(3) and m.group(2) and view_index(before, x86_reg(m.group(2))) is not None
             # A store reaches a caller's frame only through the stack registers past this frame, a register derived
             # from a view (at an offset the view doesn't track), a copy of a frame address, or a string store; a
