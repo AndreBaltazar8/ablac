@@ -6,7 +6,9 @@ conditional branch, a memory address or a division.
 
 `arch` is x86_64, aarch64, wasm or xtensa. `secret-params` is a comma list of parameter
 positions (0-based) holding secrets, or `*` for all; `@n` marks parameter n as a public
-pointer to secret memory, so what is loaded through it is secret and the pointer isn't. A
+pointer to secret memory, so what is loaded through it is secret and the pointer isn't; `@n!`
+makes that memory write-only: a load through it fails, a store over it doesn't (a secret
+owner's drop, which may run after the entry's wipe and must not read what it wipes). A
 function's parameters are in the target's registers (or Wasm locals) as its ABI has them.
 Exits 1 and names the instruction when a secret gets there, so a fixture written to leak
 fails: tools/test-ct.sh checks that too, and that is what keeps this honest.
@@ -277,7 +279,8 @@ def stack_extent(name, seen=()):
 # With --follow-calls, a call to a function defined in the same object (what a --fast build makes of
 # every Abla call) is checked as a function of its own, on the arguments the caller passes, instead of
 # failing. A call to anything not defined there, or a recursion, still fails.
-FOLLOW = {"object": None, "path": None, "stack": [], "done": {}, "residue": False, "followed": set()}
+FOLLOW = {"object": None, "path": None, "stack": [], "done": {}, "residue": False, "followed": set(),
+          "write_only": False}
 
 
 ALLOCATOR = "abla_ct_allocate"
@@ -701,6 +704,8 @@ def check_x86(lines, secret, pointers):
                     if width and 0 <= start and start + width <= HEADER_BYTES:
                         return False  # a header word of an object whose payload is secret
                 if (base and "ptr:" + x86_reg(base) in state) or (idx and "ptr:" + x86_reg(idx) in state):
+                    if FOLLOW["write_only"]:
+                        raise Violation(f"reads the secret memory it may only overwrite: {text}")
                     return True  # read through a pointer to secrets
                 viewed = view_index(state, x86_reg(base)) if base else None
                 if viewed is not None and not idx and re.match(r"^-?(?:0x)?[0-9a-f]*$", m.group(1) or ""):
@@ -1508,6 +1513,8 @@ def check_aarch64(lines, secret, pointers):
             inner = regs(memory)
             if any(r in state for r in inner):
                 raise Violation(f"secret address: {text}")
+            if FOLLOW["write_only"] and any("ptr:" + reg in state for reg in inner):
+                raise Violation(f"reads the secret memory it may only overwrite: {text}")
             dests = ops[:ops.index(memory)]
             header = re.fullmatch(r"\[(x\d+)(?:,\s*#(0x[0-9a-f]+|\d+))?\]", memory)
             width = a64_access_width(op, dests[0]) if len(dests) == 1 else 0
@@ -2004,6 +2011,8 @@ def check_xtensa(lines, secret, pointers):
             dest, base, offset = ops[0], ops[1], ops[2] if len(ops) > 2 else "0"
             if t(base):
                 raise Violation(f"secret address: {text}")
+            if FOLLOW["write_only"] and "ptr:" + base in state:
+                raise Violation(f"reads the secret memory it may only overwrite: {text}")
             size = 1 if op.startswith("l8") else 2 if op.startswith("l16") else 4
             at = frame_offset(state, base)
             slots = [f"slot:{at + int(offset, 0) + i}" for i in range(size)] if at is not None else []
@@ -2508,6 +2517,8 @@ CHECKERS = {"x86_64": check_x86, "aarch64": check_aarch64, "xtensa": check_xtens
 
 
 HEADERS = {}
+# A write-only pointer (`@N!` in a spec): the memory a pointer to secrets reaches may be overwritten, never read (what
+# a secret owner's drop does, which since temporaries are dropped can run after an entry's wipe). Per spec, in main.
 HEADER_BYTES = 32
 HEADER_CHECKERS = ("x86_64", "aarch64", "wasm", "xtensa")
 
@@ -2521,6 +2532,7 @@ def parse_spec(spec, count_hint=8):
     elif roles:
         for r in roles.split(","):
             if r.startswith("@"):
+                r = r.rstrip("!")
                 pointers.append(int(r[1:]))
             elif r.startswith("%"):
                 # A pointer to an object whose first HEADER_BYTES are public and whose rest is secret.
@@ -2627,6 +2639,7 @@ def main():
             failed = 1
             continue
         FOLLOW["followed"] = set()
+        FOLLOW["write_only"] = any(role.startswith("@") and role.endswith("!") for role in spec.partition(":")[2].split(","))
         try:
             FOLLOW["header_args"] = list(HEADERS.get(name, []))
             CHECKERS[arch](lines, secret, pointers)

@@ -435,6 +435,34 @@ scrub_available_read() {
     echo "ok   ctScrubAvailable: true on the host; on Xtensa the weak abla_ct_stack_low, tested without it, true with it"
 }
 
+# A write-only pointer (`@0!`): what a secret owner's drop does to the memory it wipes. Since a temporary is dropped at
+# the end of its statement, an owner passed as one is dropped after the entry it was given to has wiped the stack, so
+# its drop may overwrite the secret but never read it. Controls on every target residue is read on: a store-only wipe
+# passes, a wipe that loads each byte first is found, and the same twin passes without the `!` (a load alone isn't a
+# timing leak: the flag is what refuses it).
+write_only_read() {
+    local arch triple label
+    for label in x86:x86_64:x86_64-linux-gnu a64:aarch64:aarch64-linux-gnu xtensa:xtensa:xtensa; do
+        IFS=: read -r file arch triple <<< "$label"
+        local extra=()
+        [[ $arch == xtensa ]] && extra=(-mcpu=esp32)
+        llvm-mc -triple "$triple" "${extra[@]}" -filetype=obj "$cases/write-only-$file.s" -o "$out/write-only-$file.o"
+        $check "$arch" "$out/write-only-$file.o" "wipe_only:@0!" > "$out/write-only-$file-clean.log" 2>&1 || {
+            cat "$out/write-only-$file-clean.log" >&2; echo "ct: wipe_only was reported on $arch" >&2; exit 1
+        }
+        if $check "$arch" "$out/write-only-$file.o" "wipe_reads:@0!" > "$out/write-only-$file-reads.log" 2>&1; then
+            echo "ct: missed wipe_reads on $arch" >&2; exit 1
+        fi
+        grep -q 'reads the secret memory it may only overwrite' "$out/write-only-$file-reads.log" || {
+            cat "$out/write-only-$file-reads.log" >&2; exit 1
+        }
+        $check "$arch" "$out/write-only-$file.o" "wipe_reads:@0" > "$out/write-only-$file-plain.log" 2>&1 || {
+            cat "$out/write-only-$file-plain.log" >&2; echo "ct: wipe_reads failed on $arch without the write-only flag" >&2; exit 1
+        }
+    done
+    echo "ok   write-only pointers: a store-only wipe passes and a wipe that reads is found, on x86-64, AArch64 and Xtensa"
+}
+
 # A callee that writes a secret through an address of the caller's own frame (made by lea or by mov from rsp)
 # makes the caller's slots secret; a secret passed in a stack slot is found inside the callee. Hand-written assembly,
 # linked so that the calls resolve.
@@ -827,6 +855,7 @@ abla_xtensa_test_build "$compiler" "$tools_directory" build "$cases/object.ab" -
 fast_read xtensa "$out/xtensa-fast.o" "" "" "$cases/fast-known-xtensa.txt"
 xtensa_residue_read
 scrub_available_read
+write_only_read
 
 # --- What the compiler refuses ----------------------------------------------------------
 for invalid in "$cases"/invalid-*.ab; do
