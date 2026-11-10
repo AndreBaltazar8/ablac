@@ -107,6 +107,17 @@
   compile-time metadata helpers in `abla/build`; that is not evidence of arbitrary runtime method reflection.
   Stopped without compiler changes: these inputs do not justify the reachability/drop/CT correctness risk.
   Raw counting pass, inputs, paired measurements and report: `worktrees/ablac-method-demand/build/method-lab/`.
+  Rechecked 2026-11-10 (master `44eac47c` stage 2, after the --fast runtime pruning; scratch tools not kept). The
+  `--fast -g` build's own LLVM text (`ABLA_KEEP_LLVM_TEXT=1`) for abla-one's gallery programs, with every function that
+  no `main` or global initialiser reaches by a call or an address counted as dead: web 2.28% of the module's
+  instructions, thin 1.72%, live 0.65%, and what is dead there is the runtime's backend-owned bridges (the 25 largest
+  dead functions are all `self.`/`host.` runtime ones), no user method. That screen cannot see a method that only a class
+  descriptor's wrapper reaches, which is the case that matters: a probe class with one uncalled method that calls
+  `jsonParse` is 100,696 bytes without the method and 123,392 with it under `--fast` (+22.5%), 16,072 and 18,128 in a
+  release build (+12.8%, the json module's globals and their initialisers). The counting screen above (0.06% of the
+  compiler's raw IR, 2.19% of abla-one's, 0.19% of the frozen NovaKind tool) therefore stays the best estimate of what
+  method-level demand would remove in real programs, below the 5% bar, and the item stays a no-go until a program is
+  found whose dead methods carry a large dependency (the probe's shape).
 - [ ] Once during `make test` (2026-11-01), `tools/test-ct.sh` saw `python3: No such file or directory`
       and `suite-package-providers` failed to resolve a local git dependency, with neither recurring
       in the next runs. Suspected: the Nix profile changing mid-run. Not confirmed, but during a `home-manager switch`
