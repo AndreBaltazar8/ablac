@@ -809,7 +809,7 @@
   The other non-Linux targets still lack comparisons. No optimization
   selected from this noisy measurement. An earlier Darwin size-list try gained no
   cycles and raised peak memory.
-- [ ] **Strict-imports rechecks loaded standard-library modules on every build.** On 2026-11-03,
+- [x] **Strict-imports rechecks loaded standard-library modules on every build.** On 2026-11-03,
   the entire validation cost 41.46M instructions (2.27% of a fib `--fast` build) and
   104.59M (0.56% of a NovaKind tool build); the library-only saving is smaller. Not pursued.
   Remeasured 2026-11-08 on master `7ec1bdf4` as the most any cache could win: a compiler with a
@@ -829,6 +829,18 @@
   ordered module contents, aliases and import/export edges, manifests, target and report mode;
   alternatively cache immutable per-module summaries and recompute against the complete graph.
   Test diagnostics and visibility reports across edits, collisions, alias and target changes.
+  **Done without a cache** (2026-11-10, #741): the cost is the findings walk (skipping only it saves 23.3 M of the
+  24.7 M the whole library check costs on an empty build; the visibility sets are 1.4 M), and most of that was two
+  linear costs in `bootstrapStrictImportFindings`: `bootstrapDeclarationAt` scanned every declaration of the module
+  for each candidate identifier that no visible module declares (a local `index` or `value` sharing a name with some
+  global), and every declaration's bound names were computed up front. The declarations come in source order, so the
+  enclosing one is now found by binary search (a step back to the last whose end is past the offset; unordered lists
+  keep the scan) and the bound names at the first candidate that needs them. Diagnostics and visibility reports are
+  identical to a master stage 2 (a 900-name clash program, https-client, empty, fib, maps, trees); user instructions of
+  `build --fast --no-cache` on one P-core, three alternating pairs: empty 1,355.3 M to 1,336.1 M (-1.42%), fib
+  1,456.2 to 1,436.5 (-1.38%), maps 1,623.2 to 1,595.2 (-1.73%). What remains of the check is the lexing it shares
+  with the parser (memoised) and the token walk itself, about 0.3 to 0.4% of a small build; a per-module summary cache
+  is not worth its risk.
 - [ ] **`abla-compare`'s server builds only a few percent faster than on v0.2.31** (3.9 to 3.8 s,
   2026-11-02): its frontend is about 1.7 s of it and its O2 1.8 s, and neither shrank much.
   On 2026-11-03 its build ran 15% fewer instructions (frontend 6 to 10%, opt and llc 14%).
