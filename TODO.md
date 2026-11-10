@@ -318,7 +318,17 @@
     The first four controls in `frame-place-xtensa.s` are each the reverse on master.
   - With the slots placed, the largest --fast function (secret_inverse, 27,047 instructions) takes more than the old
     200,000 fixpoint steps, so the guard is now 3,000,000. A register's constant counts only where the paths that
-    meet agree on it.
+    meet agree on it. Where they disagree, what is made from it is marked unknown for good (`sb:r:?`, `const:r:?`;
+    review by ablac-f3-2, control `const_loop`). Without the mark, an address made from the first path alone stays in
+    the successor (states only grow), and a loop's later secret store was placed at the first iteration's slot; master
+    misses `const_loop` too.
+  - Still open, the same family: a register that is a frame address on one path and not on the other keeps its one
+    frame offset after the join. A secret stored through it is placed (conservative), but a public store through it
+    clears that slot although on the other path it wrote elsewhere. Not hit by any fixture; a fix would mark a
+    register's offset unknown where one path has none, which needs the joins to see absence (they are plain unions).
+  - The fixpoint takes the lowest instruction first, each queued once, and the Xtensa step indexes a state's
+    register tags once: test-ct went from more than one 10-minute hold to 137 s (master 187 s), with every target's
+    reading byte for byte unchanged.
   - The Xtensa `--fast` residue lists grow with the 16 entries now read: their unoptimised work goes deeper than the
     fixtures' 1024-byte wipe (`residue-known-xtensa-fast*.txt`), as the four already listed did.
   - The release Xtensa reading is unchanged, byte for byte: identical logs from master's checker and this one on the

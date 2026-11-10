@@ -502,7 +502,7 @@ xtensa_place_read() {
         fi
         grep -q 'secret branch' "$out/xt-$entry.log" || { cat "$out/xt-$entry.log" >&2; exit 1; }
     done
-    for entry in reload_same reload_moved; do
+    for entry in reload_same reload_moved const_loop; do
         if $check xtensa "$out/frame-place-xtensa.o" "$entry:0" > "$out/xt-$entry.log" 2>&1; then
             echo "ct: missed $entry on xtensa" >&2; exit 1
         fi
@@ -513,7 +513,7 @@ xtensa_place_read() {
             cat "$out/xt-${entry%%:*}.log" >&2; echo "ct: ${entry%%:*} was reported on xtensa" >&2; exit 1
         }
     done
-    echo "ok   xtensa frame slots: addmi's immediate and reloaded registers placed, a spilled frame address reloaded, four secret slots found, three neighbours clean"
+    echo "ok   xtensa frame slots: addmi's immediate and reloaded registers placed, a spilled frame address reloaded, a loop's address unknown where its paths disagree, five secret slots found, three neighbours clean"
 }
 
 # A callee that writes a secret through an address of the caller's own frame (made by lea or by mov from rsp)

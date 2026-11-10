@@ -2014,7 +2014,7 @@ def check_xtensa(lines, secret, pointers):
         if register == "a1":
             return 0
         values = [tag.split(":")[2] for tag in tags if tag.startswith(f"sb:{register}:")]
-        return int(values[0]) if len(values) == 1 else None
+        return int(values[0]) if len(values) == 1 and values[0] != "?" else None
 
     # A state holds a tag per secret frame byte; the register tags a step reads (frame offsets, constants, header
     # pointers, spilled frame addresses) are few. They are picked out once per state, not by a scan per question.
@@ -2177,9 +2177,27 @@ def check_xtensa(lines, secret, pointers):
         # Registers that are a1 plus a constant, or a constant (a big frame is addressed through `movi aN, 1440` and
         # `add.n aD, a7, aN`).
         # A constant only if the paths that meet here agree on it (states join by union, so two values may be there).
-        known = lambda register: [int(x.split(":")[2]) for x in tags if x.startswith(f"const:{register}:")]
-        constant = lambda register: known(register)[0] if len(known(register)) == 1 else None
+        known = lambda register: [x.split(":")[2] for x in tags if x.startswith(f"const:{register}:")]
+        constant = lambda register: int(known(register)[0]) if len(known(register)) == 1 and known(register)[0] != "?" \
+            else None
+        # Where the paths that meet disagree, what is made from the register is unknown for good (`?`): states only grow,
+        # so a value made on an earlier visit, from one path alone, would otherwise stay in the successor alone.
+        unsure_base = lambda register: frame_offset(tags, register) is None and \
+            any(x.startswith(f"sb:{register}:") for x in tags)
+        unsure_constant = lambda register: constant(register) is None and bool(known(register))
         fresh = []
+        if op in ("mov", "mov.n", "addi", "addi.n", "addmi") and len(ops) >= 2:
+            if unsure_base(ops[1]):
+                fresh.append(f"sb:{dest}:?")
+            if unsure_constant(ops[1]):
+                fresh.append(f"const:{dest}:?")
+        elif op in ("add", "add.n") and len(ops) == 3:
+            a, b = ops[1], ops[2]
+            if unsure_base(a) or unsure_base(b) or (frame_offset(tags, a) is not None and unsure_constant(b)) or \
+                    (frame_offset(tags, b) is not None and unsure_constant(a)):
+                fresh.append(f"sb:{dest}:?")
+            if unsure_constant(a) or unsure_constant(b):
+                fresh.append(f"const:{dest}:?")
         if op in ("movi", "movi.n") and len(ops) == 2:
             fresh.append(f"const:{dest}:{int(ops[1], 0)}")
         elif op in ("mov", "mov.n") and len(ops) == 2:

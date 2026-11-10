@@ -98,6 +98,9 @@ place_reload_heap:
 //   reload_clean   the same, the branch on a7+48: clean
 //   reload_moved   the same, but a1 moves between the spill and the reload (the record is dropped, the reloaded
 //                  address is not placed): the secret stored through it may be anywhere in the frame, found
+//   const_loop     a loop adds a1 to a5, which is 8 on entry and 16 on the back edge, and stores the secret there; a
+//                  branch on a1+16: found (the address made from a5 on the first visit alone is unknown once the
+//                  paths disagree, not left at a1+8)
 	.section	.text.reload_same,"ax",@progbits
 	.align	4
 	.global	reload_same
@@ -149,3 +152,24 @@ reload_moved:
 1:
 	retw.n
 	.size	reload_moved, .-reload_moved
+
+	.section	.text.const_loop,"ax",@progbits
+	.align	4
+	.global	const_loop
+	.type	const_loop,@function
+const_loop:
+	entry	a1, 128
+	mov.n	a7, a1
+	movi	a5, 8
+	movi	a9, 0
+1:
+	add.n	a6, a7, a5
+	s32i.n	a2, a6, 0
+	movi	a5, 16
+	addi	a9, a9, 1
+	bnei	a9, 2, 1b
+	l32i.n	a11, a7, 16
+	beqz	a11, 2f
+2:
+	retw.n
+	.size	const_loop, .-const_loop
