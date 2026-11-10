@@ -220,6 +220,11 @@
   After v0.2.53: seeds 1941 to 2200 (the published v0.2.53 compiler; 2041 to 2100 at 60 checks per seed) and
   2201 to 2300 (batch 21's compiler: the interface index, the lowering type cache, the Wasm source map, the
   JSON `\u` decoding) agree in all six modes; no new finding.
+  For #736 (a fresh resource that is only a temporary is dropped at the end of its statement): the drop check
+  also draws a field read and a method call on a temporary, `if` branches, a safe call, an early `return` and a
+  `break` over temporaries, and `--focus resource_drop_check` draws every check from it. Seeds 2341 to 2560
+  (24 checks each, 2501 to 2560 all drop checks, 1440 programs) agree in all six modes on the drop-temporaries
+  compiler, the evaluator's drop log included.
 
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
