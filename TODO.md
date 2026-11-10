@@ -1937,3 +1937,16 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   of single runs but not demonstrably equal. The evaluator site adds nothing beyond the
   analyzer's. What is left in the profile is lowering's own scans (ir.ab ~3464, 3775, 5840), not
   tried; the cut stays unlanded (bar: -3% on its own, RSS not worse).
+  Correction and result (ablac-52, 2026-11-10): the profile with the name-index compiler showed
+  what was left of `bootstrapTypeConformsIn` under `bootstrapInferWhen` was
+  `bootstrapWhenCoversSealed` (every class against a full declaration scan, per sealed `when`),
+  not lowering. With that through the name index too (branch iface-names 9118db2d on iface-index):
+  NovaKind `--fast` build 23,196 / 23,226 / 23,250 / 23,389 samples (x20M instructions) against
+  26,569 / 26,532 / 26,640 for iface-index alone = -12.5% of the whole build (-21% against master's
+  ~29.5k). Identical: `--emit-llvm` of 524 programs against a master-built compiler, the NovaKind
+  app.ab binary (same md5 in 14 builds). Peak RSS of the build, 7 alternating each: median 3.640 GB
+  (3.51-3.78) against 3.637 GB (3.41-3.89). Small programs, pinned to one core, 4 alternating: the
+  counts are bimodal run to run (a --fast build of `empty` is 1.427 G or about 1.59 G with either
+  compiler); the floors agree to 0.06% (empty 1.4270 / 1.4272, fib 1.4295 / 1.4291, maps 1.6968 /
+  1.6978 G). The transform-edit test is tests/cases/interfaces/index-edits.ab. Not covered: the
+  Transactional-classes scan and the generic_types / generics call sites keep the scan.
