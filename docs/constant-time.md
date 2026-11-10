@@ -97,7 +97,10 @@ or as an exported Abla function:
 uint32_t abla_ct_stack_low(void);   /* lowest address of the running stack the wipe may zero; 0: don't wipe */
 ```
 
-It is linked weakly: an image that doesn't define it links, and its wipes do nothing (what Xtensa did before). The
+It is linked weakly: an image that doesn't define it links, and its wipes do nothing (what Xtensa did before);
+`ctScrubAvailable()` says which, so a firmware can check at startup that its wipes are on. It is decided by what is
+linked into the image: a definition loaded later (from another image) changes nothing, and a true answer still lets
+a wipe be skipped where `abla_ct_stack_low` returns 0. The
 wipe asks it once each time, from the task that wipes, so it can answer per task. For a FreeRTOS image: return 0
 when `xPortInIsrContext()` (an interrupt runs on the interrupt stack, which the task's limit doesn't describe), else
 `pxTaskGetStackStart(NULL) + 64`: the 64 bytes keep the wipe off the lowest bytes of the task's stack, where

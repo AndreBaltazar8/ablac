@@ -391,6 +391,42 @@ xtensa_residue_read() {
     echo "ok   xtensa residue: the sixteen controls told apart, and the wipe credited only with abla_ct_stack_low"
 }
 
+# ctScrubAvailable(): true on the host (release and --fast); on Xtensa a test of the weak abla_ct_stack_low, read both
+# ways: an object that doesn't define it keeps the symbol weak and undefined and compares its address at run time, and
+# one that defines it folds the answer to true.
+scrub_available_read() {
+    local mode
+    for mode in release fast; do
+        local extra=()
+        [[ $mode == fast ]] && extra=(--fast)
+        "$compiler" build "$cases/scrub-available.ab" -o "$out/scrub-available-$mode" --no-cache "${extra[@]}"
+        [[ $("$out/scrub-available-$mode") == "scrub available: true" ]] || {
+            echo "ct: ctScrubAvailable() isn't true on the host ($mode)" >&2; exit 1
+        }
+    done
+    local variant
+    for variant in xtensa xtensa-defined; do
+        abla_xtensa_test_build "$compiler" "$tools_directory" build "$cases/scrub-available-$variant.ab" \
+            -o "$out/scrub-available-$variant.o" --no-cache --target-triple xtensa-esp-unknown-elf --object-format elf \
+            --emit object
+        llvm-readelf -s "$out/scrub-available-$variant.o" > "$out/scrub-available-$variant.symbols"
+        llvm-objdump -d --no-show-raw-insn --mcpu=esp32 --disassemble-symbols=scrub_available \
+            "$out/scrub-available-$variant.o" > "$out/scrub-available-$variant.s"
+    done
+    grep -Eq 'WEAK +DEFAULT +UND abla_ct_stack_low$' "$out/scrub-available-xtensa.symbols" &&
+        grep -Eq '\bl32r\b' "$out/scrub-available-xtensa.s" && grep -Eq '\bbne\b' "$out/scrub-available-xtensa.s" || {
+        cat "$out/scrub-available-xtensa.symbols" "$out/scrub-available-xtensa.s" >&2
+        echo "ct: ctScrubAvailable() on Xtensa doesn't test the weak abla_ct_stack_low" >&2; exit 1
+    }
+    grep -Eq 'FUNC +GLOBAL +DEFAULT +[0-9]+ abla_ct_stack_low$' "$out/scrub-available-xtensa-defined.symbols" &&
+        grep -Eq 'movi(\.n)?\s+a2, 1$' "$out/scrub-available-xtensa-defined.s" &&
+        ! grep -Eq '\b(l32r|bne|beq)\b' "$out/scrub-available-xtensa-defined.s" || {
+        cat "$out/scrub-available-xtensa-defined.symbols" "$out/scrub-available-xtensa-defined.s" >&2
+        echo "ct: ctScrubAvailable() isn't true where the Xtensa program defines abla_ct_stack_low" >&2; exit 1
+    }
+    echo "ok   ctScrubAvailable: true on the host; on Xtensa the weak abla_ct_stack_low, tested without it, true with it"
+}
+
 # A callee that writes a secret through an address of the caller's own frame (made by lea or by mov from rsp)
 # makes the caller's slots secret; a secret passed in a stack slot is found inside the callee. Hand-written assembly,
 # linked so that the calls resolve.
@@ -733,6 +769,7 @@ abla_xtensa_test_build "$compiler" "$tools_directory" build "$cases/object.ab" -
     --target-triple xtensa-esp-unknown-elf --object-format elf --emit object --fast
 fast_read xtensa "$out/xtensa-fast.o" "" "" "$cases/fast-known-xtensa.txt"
 xtensa_residue_read
+scrub_available_read
 
 # --- What the compiler refuses ----------------------------------------------------------
 for invalid in "$cases"/invalid-*.ab; do

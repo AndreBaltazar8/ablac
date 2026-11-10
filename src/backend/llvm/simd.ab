@@ -844,6 +844,17 @@ fun bootstrapLlvmEmitCtScrubStack(backend: BootstrapLlvmBackend, name: string): 
     true
 }
 
+// The image's `uint32_t abla_ct_stack_low(void)`, declared external weak: null where the image doesn't define it.
+fun bootstrapLlvmCtStackLowSymbol(backend: BootstrapLlvmBackend): i64* {
+    var provided = LLVMGetNamedFunction(backend.module, "abla_ct_stack_low")
+    if (pointerIsNull(provided)) {
+        val type = bootstrapLlvmFunctionType(backend, backend.i32Type, [])
+        provided = LLVMAddFunction(backend.module, "abla_ct_stack_low", type)
+        LLVMSetLinkage(provided, llvmExternalWeakLinkage())
+    }
+    provided
+}
+
 // ablaCtScrubBoundedStack<N>(), Xtensa only (the other targets never call it: ablaCtScrubBounded): the wipe below
 // the stack pointer for a stack with no guard page under it. It stops at the address the image's
 // `abla_ct_stack_low()` returns (C ABI, external weak: absent, or returning 0, means no wipe; docs/stdlib/ct.md).
@@ -868,11 +879,7 @@ fun bootstrapLlvmEmitCtScrubBoundedStack(backend: BootstrapLlvmBackend, name: st
     if (pointerIsNull(ask)) {
         // One private function asks the image, so that the wipe's own frame stays the 32 bytes the tail reaches
         // even unoptimised: it holds the select and the call through a register, the wipe only calls it.
-        var provided = LLVMGetNamedFunction(backend.module, "abla_ct_stack_low")
-        if (pointerIsNull(provided)) {
-            provided = LLVMAddFunction(backend.module, "abla_ct_stack_low", lowType)
-            LLVMSetLinkage(provided, llvmExternalWeakLinkage())
-        }
+        val provided = bootstrapLlvmCtStackLowSymbol(backend)
         val resume = LLVMGetInsertBlock(backend.builder)
         val none = LLVMAddFunction(backend.module, "abla.ct.stack.low.none", lowType)
         LLVMSetLinkage(none, llvmPrivateLinkage())
@@ -923,6 +930,22 @@ fun bootstrapLlvmEmitCtIntrinsic(
             backend, storage, instruction.result, LLVMConstInt(backend.i1Type, if (narrow) 1 else 0,
                 0)
         )
+        return true
+    }
+    if (name == "ablaCtScrubAvailable") {
+        // Whether ctScrubStack* wipe as built and linked: always on x86-64 and AArch64, never where it emits
+        // nothing (Wasm, others), and on Xtensa when the image defines abla_ct_stack_low (the weak symbol isn't null).
+        val arch = bootstrapLlvmSimdArch(backend.targetTriple)
+        val available = if (arch == BOOTSTRAP_SIMD_ARCH_XTENSA) {
+            LLVMBuildICmp(
+                backend.builder, llvmIntNotEqual(), bootstrapLlvmCtStackLowSymbol(backend),
+                LLVMConstNull(backend.pointerType), "ct.scrub.available"
+            )
+        } else {
+            val wipes = arch == BOOTSTRAP_SIMD_ARCH_X86_64 || arch == BOOTSTRAP_SIMD_ARCH_AARCH64
+            LLVMConstInt(backend.i1Type, if (wipes) 1 else 0, 0)
+        }
+        bootstrapLlvmSetNativeValue(backend, storage, instruction.result, available)
         return true
     }
     if (name == "ablaCtScrubBounded") {
