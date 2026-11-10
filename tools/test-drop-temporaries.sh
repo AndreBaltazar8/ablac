@@ -12,6 +12,8 @@
 # - contexts: a lambda, an expression-bodied function, a `defer`, a generator and a global's initializer;
 # - loops: a `for` with a single-expression body drops on each pass and not at all when it does not run;
 # - evaluator: the compile-time evaluator drops the same temporaries in the same order as the compiled program;
+# - labeled: a labeled break or continue through statements with temporaries, and a generator given to a borrowing
+#   parameter (a `for` over it ends it: only class instances are held as temporaries);
 # - alias: a view of a temporary's field kept after its statement sees what the drop did (it is accepted);
 # - refused: a view of a temporary kept after its statement is still refused.
 set -euo pipefail
@@ -52,6 +54,7 @@ runs owned ' |constructor held |holder temporary 2 |own 3 |array |move 5 |bound 
 runs viewed '10 31 owner1 after10 owner3 owner2'
 runs contexts ' 90 |lambda 50 |expression body 51 52 |defer 54 touched55 55 53 deferred |generator 60 61 |generator break 60 61 |end'
 runs loops ' |bare body 0 1 2 |no pass |source item20 item21 20 |array |end'
+runs labeled ' |nested 0 100 1 10 110 11 111 12 20 120 |or break 200 201 |do continue 310 311 320 321 |generator argument 401 402 403 |end'
 runs alias '0'
 runs evaluator 'true'
 
