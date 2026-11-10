@@ -396,7 +396,7 @@
   refused) on x86-64, AArch64, Wasm and Xtensa as hand fixtures; the module and its use; `check-asm.py
   --expect-allocator` (a smoke test that a function reaches a call to the entry, directly or through functions of the
   object; not a proof that one function allocates through it), run by test-ct.sh on a real x86-64 release object.
-  Not built: the same on real AArch64, Wasm and Xtensa objects (Wasm has no section to mark the entry); reading the
+  Not built: the same on a real AArch64 object (test-ct.sh reads the Xtensa one since 2026-11-10) and on Wasm (no section to mark the entry); reading the
   RSA key and `aesNewKey` plumbing through the entry. The section is the mark, so an identical-code fold in a linked
   final image could merge the entry with another function; only hand fixtures are linked here.
   Bars (ablac-d1): a program importing no crypto builds byte-identical (release and `--fast`, the usual benchmark

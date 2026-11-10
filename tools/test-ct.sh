@@ -700,8 +700,8 @@ worker_read "$out/x86.o"
 division_read
 # The crypto allocation entry stays out of line in a release object: each export of the probe module, which reaches
 # the key and big-number allocations, calls the function in the section .text.abla_ct_allocate. (A function that
-# reaches no allocation must not pass, so the control is `main`.) x86-64 only: the other targets' objects come from
-# their drivers, and an unlinked Wasm module has no section to mark the entry.
+# reaches no allocation must not pass, so the control is `main`.) x86-64 and Xtensa (below): AArch64's object comes
+# from its driver, and an unlinked Wasm module has no section to mark the entry.
 "$compiler" build "$cases/alloc-probe.ab" -o "$out/alloc-probe.o" --emit object --no-cache
 $check --expect-allocator x86_64 "$out/alloc-probe.o" probe_bignum_allocate: probe_aes_expand: > "$out/alloc-probe.log" 2>&1 || {
     cat "$out/alloc-probe.log" >&2; echo "ct: the allocation entry is inlined or not called in a release object" >&2; exit 1
@@ -758,6 +758,16 @@ abla_xtensa_test_prepare "$tools_directory"
 abla_xtensa_test_build "$compiler" "$tools_directory" build "$cases/object.ab" -o "$out/xtensa.o" --no-cache \
     --target-triple xtensa-esp-unknown-elf --object-format elf --emit object
 read_target xtensa "$out/xtensa.o"
+# The same probe for Xtensa, whose calls name the entry by relocation against its section.
+abla_xtensa_test_build "$compiler" "$tools_directory" build "$cases/alloc-probe.ab" -o "$out/alloc-probe-xtensa.o" --no-cache \
+    --target-triple xtensa-esp-unknown-elf --object-format elf --emit object
+$check --expect-allocator xtensa "$out/alloc-probe-xtensa.o" probe_bignum_allocate: probe_aes_expand: > "$out/alloc-probe-xtensa.log" 2>&1 || {
+    cat "$out/alloc-probe-xtensa.log" >&2; echo "ct: the allocation entry is inlined or not called in an Xtensa object" >&2; exit 1
+}
+if $check --expect-allocator xtensa "$out/alloc-probe-xtensa.o" main: > "$out/alloc-probe-xtensa-control.log" 2>&1; then
+    echo "ct: a function with no allocation was said to call the allocation entry on Xtensa" >&2; exit 1
+fi
+echo "ok   xtensa release object: the crypto allocation entry is called out of line by the key and big-number paths (1 control)"
 xtensa_follow_read
 orchestration_read "$out/xtensa.o" xtensa
 worker_read "$out/xtensa.o" xtensa
