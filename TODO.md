@@ -1713,3 +1713,27 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   one unaligned `ablaUnsafeLoadI64` would give the same hash. Not pursued (ablac-d1,
   2026-11-10): a 1.5% ceiling realises well under 1%, and it would put an unsafe
   unaligned load in the compiler's own source for that.
+- What a NovaKind `--fast` build waits on, against the self-build (ablac-52, 2026-11-10,
+  master c8fb910b, a release compiler built with `ABLA_DEBUG=1` for readable symbols;
+  `perf record -F 499 -g` around `pinned-build app.ab --fast --no-cache` in the repro
+  worktree at NovaKind 9c62c61b, two compiler processes, shares of each). Ranked by what
+  the self-build's profile (collector about 4%, malloc/free 11%, name hash 1.5%) doesn't
+  show:
+  1. Interface conformance by scanning every declaration: `bootstrapClassInterfaces`
+     11.1% / 12.4% and `bootstrapInterfaceIndexIn` 5.7% / 3.5% (with the
+     `__ablaRuntimeStringBytesEqual` they feed, 2.6% / 5.2%). Each query walks all
+     declarations comparing `kind` and `name` strings: callers are `bootstrapInferWhen`
+     through `bootstrapTypeConformsIn` (5.6% / 3.8%), `bootstrapInterfaceImplementers`
+     in lowering (3.5% / 6.8%) and `bootstrapMethodDeclarationIndex` (1.9%). Both walks are
+     pure functions of the declarations, so one name -> (interface indices, class
+     interfaces) table built once per declaration array would turn each query into
+     a lookup. Expected share: most of 17–20% of the build in the first process and
+     about 16% in the second; the first cut.
+  2. `bootstrapGenericOwnershipCall` 5.5% in the first process (not in the self-build's
+     top list); look at it after 1.
+  3. `bootstrapRegionExpressionRetainsParameters` 1.3%.
+  Common to both (not NovaKind-specific): collector `HostMarkPointer` 14% /
+  `PlatformMemoryCollect` 10% in the first process (24%, against the self-build's 4%),
+  libc malloc/free about 8%.
+  Not done: the `--fast` NovaKind HEAD does not build offline here (its locked
+  abla-s3/abla-soap revisions need `.abla/packages` prepared); this is the 9c62c61b tree.
