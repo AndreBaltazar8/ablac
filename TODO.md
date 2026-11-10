@@ -1793,3 +1793,22 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   libc malloc/free about 8%.
   Not done: the `--fast` NovaKind HEAD does not build offline here (its locked
   abla-s3/abla-soap revisions need `.abla/packages` prepared); this is the 9c62c61b tree.
+
+- What allocates in a NovaKind `--fast` build's frontend (ablac-52, 2026-11-10, master
+  dd199bfb sources, `perf record -e instructions:u -c 50M -g`, NovaKind repro tree 9c62c61b;
+  inclusive shares of the second compiler process, the one that parses and analyzes):
+  the collector runs under pressure (`__ablaRuntimeHostPressureCollect` 14%,
+  `PlatformMemoryCollect` self 5.7%, `HostMarkPointer` 6%) and the allocations that drive
+  it come from the compile-time evaluator: `BootstrapEvaluator.evaluate` is 22.8% of
+  the process inclusive, all of it under `bootstrapParseStagedRegistered` (21.0%) and
+  `bootstrapApplyGeneratedModules` (17.2%) — the staged (subparser) modules NovaKind's
+  source runs while it is parsed — inside `BootstrapModuleGraph.parse` (23.0%). Not the
+  analyzer (`BootstrapAnalyzer.analyze` 19.9%, of which `infer` 17%, and that holds the
+  interface scans fixed by the one-pass implementers) or lowering (21%, 9% to write
+  the codegen units). The first process (the driver that runs the LLVM children) has one
+  explicit collect after the build (`bootstrapNativeBuildWithEmitterStateCache`, 2.0%
+  of the whole), nothing else. So the lever for the collector's 14% is the evaluator's
+  allocation per step (boxed locals, argument arrays, string building in the staged
+  parsers), not the collector itself; next measurement is an allocation-site count by
+  evaluator function (`bootstrapEvaluateLocal` 17.7%, `evaluateCall`) with
+  `memoryHeapStat`, before any change.
