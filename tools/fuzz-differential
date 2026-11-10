@@ -23,6 +23,7 @@ Exit status 0 when every mode agreed.
 import argparse
 import concurrent.futures
 import os
+import re
 import random
 import shutil
 import subprocess
@@ -820,6 +821,78 @@ class Gen:
         lines.append("}")
         return lines, f"c{index}()", "str"
 
+    MAP_KEY_FORMS = [
+        # (key expression of the loop counter i, uses i)
+        '"pre${i % 11}-common-suffix"',
+        '"aaaabbbbccccdddd".slice(i % 5, i % 5 + 4 + i % 7)',
+        '"ab" + "${i % 13}" + "cd" + "${i % 3}"',
+        '"0123456789abcdef0123".slice(0, 18) + "${i % 17}" + "tail"',
+        '"k${i}"',
+        '("x".repeat(i % 9)) + "|" + ("y".repeat(i % 4))',
+    ]
+
+    def map_stress_check(self, index):
+        """Many inserts and removes (growth, rehash, tombstones) over keys that share prefixes and
+        suffixes and are built as slices and concatenations; insertion order and sizes must agree."""
+        r = self.r
+        form = r.choice(self.MAP_KEY_FORMS)
+        n = r.choice([20, 40, 90, 200, 400])
+        every = r.choice([2, 3, 5, 7])
+        clear_at = r.choice([-1, -1, n // 2])
+        lines = [f"fun c{index}(): string {{", "    val m: Map<string, int> = Map()", '    var out = ""']
+        lines.append(f"    for (i in 0 until {n}) {{")
+        lines.append(f"        m.set({form}, i * 3 + {r.randint(0, 9)})")
+        lines.append(f"        if (i % {every} == 0) {{")
+        lines.append("            val j = (i * 7) % (i + 1)")
+        lines.append(f"            m.remove({re.sub(r'\bi\b', 'j', form)})")
+        lines.append("        }")
+        if clear_at >= 0:
+            lines.append(f"        if (i == {clear_at}) m.clear()")
+        lines.append("    }")
+        lines.append("    var h = 0")
+        lines.append("    var count = 0")
+        lines.append("    for (k in m.keys()) { for (b in k) h = h * 31 + b; count += 1 }")
+        lines.append("    var total = 0")
+        lines.append("    for (v in m.values()) total = total * 7 + v")
+        lines.append(f'    out = out + "${{m.size}}/${{count}}/${{h}}/${{total}};"')
+        lines.append(f"    for (i in 0 until {n}) if (i % {r.choice([13, 29, 41])} == 0) {{")
+        lines.append(f'        out = out + "${{m.has({form})}}${{m.get({form}) ?? -1}},"')
+        lines.append("    }")
+        lines.append("    out")
+        lines.append("}")
+        return lines, f"c{index}()", "str"
+
+    EQ_LENGTHS = [0, 1, 2, 3, 4, 7, 8, 9, 15, 16, 17, 23, 24, 31, 32, 33, 47, 48, 63, 64, 65]
+
+    def string_eq_check(self, index):
+        """Equality and ordering at every length and alignment: equal strings (as slices of a larger
+        string at offsets 0..7, and as concatenations), and strings differing in one byte at the
+        start, the middle and the end."""
+        r = self.r
+        lengths = sorted(r.sample(self.EQ_LENGTHS, r.randint(5, 9)))
+        glyph = r.choice(["abcdefgh", "xxxxxxxx", "0123456789", "éa", "ab😀"])
+        lines = [f"fun c{index}(): string {{", '    var out = ""']
+        lines.append(f"    val source = \"{glyph}\".repeat(70)")
+        lines.append(f"    for (len in [{', '.join(str(x) for x in lengths)}]) {{")
+        lines.append("        val base = source.slice(0, len)")
+        lines.append("        for (off in 0 until 8) {")
+        lines.append('            val big = "........".slice(0, off) + base + "!!!!!!!!"')
+        lines.append("            val view = big.slice(off, off + len)")
+        lines.append('            out = out + (if (view == base) "1" else "0") + (if (view != base) "1" else "0")')
+        lines.append("            if (len > 0) {")
+        lines.append("                for (at in [0, len / 2, len - 1]) {")
+        lines.append('                    val changed = base.slice(0, at) + "#" + base.slice(at + 1, len)')
+        lines.append("                    out = out + (if (view == changed) \"1\" else \"0\") + (if (changed < view) \"<\" else \">\")")
+        lines.append("                }")
+        lines.append("            }")
+        lines.append('            out = out + (if (view == base + "") "e" else "n") + (if (view == base + "z") "1" else "0")')
+        lines.append("        }")
+        lines.append('        out = out + "|"')
+        lines.append("    }")
+        lines.append("    out")
+        lines.append("}")
+        return lines, f"c{index}()", "str"
+
     PANIC_KINDS = [
         ("array index", "val xs = [1, 2, 3]\n    val i = 3 + zero\n    println(\"before\")\n    println(\"${xs[i]}\")"),
         ("string index", "val s = \"héllo\"\n    println(\"before\")\n    println(\"${s[10 + zero]}\")"),
@@ -1133,7 +1206,8 @@ fun <T, U> crossed(a: T, b: U): Pair<U, T> = Pair(b, a)
                              self.map_check, self.closure_check, self.sealed_check,
                              self.range_check, self.regex_check,
                              self.text_check, self.array_ops_check, self.optional_elements_check,
-                             self.when_forms_check, self.regex_groups_check])(index)
+                             self.when_forms_check, self.regex_groups_check,
+                             self.map_stress_check, self.string_eq_check])(index)
         nparams = r.randint(0, 3)
         env = []
         params = []

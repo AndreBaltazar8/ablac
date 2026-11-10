@@ -209,6 +209,11 @@
   `generic.cannot-infer:viaOpen:R`, since the substituted type spells the open `R`; the fix is to
   substitute through placeholders no source can spell, not the source spelling. The generator does not draw
   it yet.
+  Tenth growth (branch `fuzz-grow10`, aimed at the map growth in place and the word-wise string equality
+  of batch 15): map inserts and removes by the hundred over keys that share prefixes and suffixes and are
+  built as slices and concatenations (sizes, insertion order, `has`/`get` probes); string equality and
+  ordering at lengths 0 to 65, at offsets 0 to 7 of a larger string and with one byte changed at the start,
+  middle and end; seeds 1301 to 1340 agree in all six modes with the batch-15 compiler.
 
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
