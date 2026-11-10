@@ -1826,3 +1826,9 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   before, 183.4 / 135.1 / 138.4 G after; the run-to-run spread, with cold-cache first runs,
   is larger than 3%). Not pursued: the function's cost is its walk over every expression, not
   the two strings.
+
+- Generic ownership sites (ablac-52, 2026-11-10): `bootstrapGenericOwnershipSites` re-walks every
+  declaration's expression tree for each pending instance, which is quadratic, and
+  `bootstrapGenericOwnershipCall` was 5.5% of one process's cycles in a NovaKind `--fast` build
+  (tree walks missing the cache). In instructions it is about 0.55% of the whole build, so a
+  one-pass call-site index would be a sub-bar cut. Not pursued.
