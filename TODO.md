@@ -943,6 +943,14 @@
   structural: a header is an object with two substrings, and the lookup walks objects. A lowercase-name index built
   on the first `header()` call costs about what the lookups it replaces cost at five lookups and more for fewer,
   so it is not worth it; per-header laziness would change what `HttpRequest.headers` exposes. Stopping here.
+  Tried and dropped (2026-11-10): `textFindSequence` is 9.4% of a plaintext request (the header block's end, `\r\n\r\n`,
+  searched byte by byte in `httpEventFrame`). A version that skips eight bytes at a time while none is the first
+  byte (the exact zero-byte test on the word xor the repeated byte, guarded by `__ablaRuntimePlatformUnalignedWords`) passed
+  a differential against a plain search (every begin and end, sequences of one to nine bytes, first bytes at every word
+  alignment) but did not pay: instructions per request plaintext 8,012 to 8,009, parameters 12,038 to 11,927,
+  body-1k 10,870 to 10,939, headers-32 40,665 to 41,305 (+1.6%). A request has a `\r` every 20 to 30 bytes, so most
+  words contain the first byte and the word test is overhead; searching for the rarer last byte of the sequence
+  (`\n`) would face the same density. Not kept.
 - [x] **`abla-compare` json-strings-4k, one worker, rechecked** (2026-11-10, master `7c706497`'s runtime, the setup of the
   headers-32 entry; the 2026-11-06 matrix had Abla 91,781 requests/s against Rust 120,887, -24.1%, and a profile of
   52.3% `jsonPlainStringEnd` + 25.2% `jsonStringIsPlain`): instructions per request, three runs each, Abla 64,308
