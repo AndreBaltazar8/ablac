@@ -1958,3 +1958,20 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   branch slice-guard (one line) to ride along with a larger src batch. About two dozen other
   places slice a string per character to compare it (`slice(index, index + n) == literal`);
   none shows in the NovaKind profile above 0.5%.
+- What is left in a NovaKind `--fast` frontend after the name index (ablac-52, 2026-11-10; the
+  iface-names compiler, instructions:u at 8M with call graphs, inclusive shares of the whole
+  build; the compiler process proper is about a third of it, the LLVM children the rest).
+  (1) The staged-parser evaluation, `BootstrapModuleGraph.parse` 13.2% (`bootstrapApplyGeneratedModules`
+  9.9%, `BootstrapEvaluator.evaluate` 7.8% of it `evaluateLocal` / `evaluateIf` ~6 each): the
+  interpreter running NovaKind's subparser handlers. It is interpreted by design in every mode:
+  `ABLA_COMPILE_EVAL` defaults to `interp` ("while the native tier is completed", compile-time.md),
+  and the native tier runs only the sites of a slice built after type checking, while handlers
+  run during parsing. `ct_bridge.ab` has the scaffolding for native handler entries
+  (`ctBridgeEntrySource` writes the `subparser` entry, `ctBridgeEnterEntry` / `EntryArgument` /
+  `EntryResult` carry its arguments and result) but nothing outside it calls it: routing the
+  staged parser to it is a project (a slice before type checking, handler compiler-API calls
+  through the bridge, a cache by handler fingerprint), not an interpreter cut.
+  (2) The collector's pressure collections, 7.9% (pacing, above). (3) Generics instantiation,
+  `bootstrapInstantiateGenericsIn` 4.9% and flat: allocation and collection are over half of
+  it (MarkPointer 1.0, malloc 0.7, MemoryCollect 0.6), the largest compiler function under it is
+  0.18%; no cut. Then the analyzer 6.5% (`infer` 5.1%) and the parser proper 3.9%.
