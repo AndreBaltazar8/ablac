@@ -1930,3 +1930,10 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   26,700, with the index 25,843 / 25,935 (a first run after a fresh build was 29,456 each time a
   new compiler was first measured; excluded, it is a cold-cache run) = −2.7% of the whole build.
   Under the ceiling above because the evaluator's and lowering's own scans remain.
+  With the evaluator's `when` `is`-test through its own index as well (branch iface-names
+  d007c1b8): 26,636 / 26,594 / 26,548 samples (iface-index) against 25,851 / 25,859 (first
+  run after a build, 29,386, excluded) = −2.8%, binary and NovaKind app.ab byte-identical; peak RSS
+  of the build (median of three alternating) 3.63 GB against 3.81 GB, inside the +-4% spread
+  of single runs but not demonstrably equal. The evaluator site adds nothing beyond the
+  analyzer's. What is left in the profile is lowering's own scans (ir.ab ~3464, 3775, 5840), not
+  tried; the cut stays unlanded (bar: -3% on its own, RSS not worse).
