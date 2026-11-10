@@ -247,9 +247,26 @@
 - [ ] **`--fast` builds are read on every target; the Xtensa one is partly unplaced.** `tools/test-ct.sh` builds the fixture
   object with `--fast` and the checker follows every call into its callee (`--follow-calls`; recursion, indirect calls
   and callees outside the object still fail), with controls for a leak and for a secret stored through a pointer inside
-  a callee. A fast build keeps what release removes, so `tests/cases/ct/fast-known.txt` lists the fixtures that fail on
-  x86-64: the type-tag check of every erased scalar conversion (`__ablaRuntimeRequire`, which the checker can't tell
-  from payload) and divisions by a secret that aren't strength-reduced. **AArch64** follows `bl` and tail calls (arguments
+  a callee. **x86-64** (2026-11-10): all 64 fixtures read clean in both `--fast` builds; `fast-known.txt` is empty.
+  - The 26 it listed failed on the type-tag check of an erased scalar conversion (`abla_as_i64` →
+    `__ablaRuntimeRequire` → `__ablaRuntimeTag`). That was the checker's limit, not the lowering's. An unoptimised
+    build boxes the value in a slot (a 32-bit tag written as a constant at 0, the payload at 8) and passes the slot's
+    address, and a callee given an address it can't place read every byte as secret.
+  - The checker now passes a frame view with such an address: which of its 64 bytes the caller holds secret. A callee's
+    stores through it come back to the caller's slots, and its spills and reloads of the address are followed.
+  - A call no longer makes every slot of the caller secret when it provably can't touch the caller's frame: every frame
+    address it got went as a view, it wrote no memory but its own frame and the view (`wroteout`), returned nothing
+    derived from one except the address itself (`escape`), and no frame address was ever stored or left in another
+    register (`frameleak`).
+  - A store through a register copy of a frame address (`lea N(%rbp), %rax` then a store through `%rax`) now updates
+    the slot; before, it was missed even in release reading.
+  - Eight hand controls in `frame-view-x86.s`: the tag read clean, also after a spill; found a branch on the payload, a
+    secret written over the tag, the address returned and written through, stored in a global, the caller's frame
+    written above the callee's return address, and the own-store through a copy.
+  - Once past the tag checks, no fixture showed a real secret branch from unoptimised lowering. The three `jge`s and
+    the secret addresses that appeared on the way (loop bounds in `pbePadBody`, `rsa_crt_recombine`, `aes_block_io`;
+    `bnStore`'s address) were slots made secret by the old "a call may write any slot" rule.
+  - Divisions by a secret are strength-reduced in every fixture's `--fast` build now (none is listed). **AArch64** follows `bl` and tail calls (arguments
   per x0 to x7 and v0 to v7, results in x0, x1 and the vector registers, x19 and up kept, a frame address passed makes the
   frame's slots secret after the call), names stack slots by their distance below the entry stack pointer so `sp`- and
   `x29`-relative accesses to one byte agree, and reads the `--fast` object with all 64 fixtures clean
@@ -268,6 +285,14 @@
   offsets the checker can't place, and what it loads from there reads as secret; those 16 are blind in the fast build,
   and their release read is the real check). Hand-written controls for all three:
   `follow-a64.s`, `follow-wasm.s`, `follow-xtensa.s`.
+  **Xtensa `--fast`, the 16 in `fast-known-xtensa.txt`** (measured 2026-11-10):
+  - 12 are a secret address and 4 a secret branch: `beq`/`blt`/`bltu` in the divsteps, gcd and inverse bodies at widths
+    1, 3 and 128, `wide`, and `pbe_hmac1`.
+  - Each follows a load from a frame address the checker can't place: unoptimised code indexes its frame arrays through
+    a1 plus a register.
+  - The same 16 fixtures are clean in Xtensa release and on x86-64 and AArch64 `--fast`, so they are a checker limit
+    (a1-plus-register frame indexing), not a lowering that leaks. Placing them needs a frame index the checker can
+    bound (a public index into a frame array of known size), the Xtensa counterpart of the x86-64 frame views.
 - [ ] **Secret residue is checked for stack slots on x86-64 and AArch64 release and on Xtensa, not on Wasm.** `--residue` fails an entry that returns with a
   secret in a slot of its frame, or that gave a secret to a callee and didn't wipe the stack below it
   (`abla/ct/scrub`; the checker reads the callees' depth and the size of the wipe). Every fixture's residue entry
