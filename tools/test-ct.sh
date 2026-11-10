@@ -233,14 +233,14 @@ residue_read() {
     "$compiler" build "$out/residue-cases/object-x86.ab" -o "$object" --emit object --no-cache
     llvm-mc -triple x86_64-linux-gnu -filetype=obj "$cases/residue-x86.s" -o "$out/residue-x86.o"
     ld.lld -static -e residue_left "$out/residue-x86.o" -o "$out/residue-x86"
-    for entry in residue_left:0 residue_unwiped:0 residue_short:0 residue_pushed:0 residue_clobbered:1 residue_above:0 \
+    for entry in residue_left:0 residue_unwiped:0 residue_short:0 residue_pushed:0 residue_clobbered:1 residue_above:0 residue_frame_secret:0 \
         residue_called_short:0 residue_conditional:0; do
         if $check --follow-calls --residue x86_64 "$out/residue-x86" "$entry" > "$out/${entry%%:*}.log" 2>&1; then
             echo "ct: missed ${entry%%:*}" >&2; exit 1
         fi
         grep -Eq 'secret residue|reaches above' "$out/${entry%%:*}.log" || { cat "$out/${entry%%:*}.log" >&2; exit 1; }
     done
-    for entry in residue_wiped residue_covered residue_called; do
+    for entry in residue_wiped residue_covered residue_called residue_frame_wiped; do
         $check --follow-calls --residue x86_64 "$out/residue-x86" "$entry:0" > "$out/$entry.log" 2>&1 || {
             cat "$out/$entry.log" >&2; echo "ct: $entry was reported" >&2; exit 1
         }
@@ -259,7 +259,7 @@ residue_read() {
     if ! diff -u <(grep -v '^#' "$cases/residue-known.txt" | sort) "$out/x86_64-residue.found" > "$out/x86_64-residue.diff"; then
         cat "$out/x86_64-residue.diff" >&2; echo "ct: the residue findings changed (tests/cases/ct/residue-known.txt)" >&2; exit 1
     fi
-    echo "ok   x86_64 residue: ${#specs[@]} entries wipe what their work used, $(wc -l < "$out/x86_64-residue.found") unwiped, the eleven controls told apart"
+    echo "ok   x86_64 residue: ${#specs[@]} entries wipe what their work used, $(wc -l < "$out/x86_64-residue.found") unwiped, the thirteen controls told apart"
 }
 
 # The same read on AArch64: hand-written controls (a secret left in a slot, a callee's frame unwiped, wiped short, wiped

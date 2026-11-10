@@ -304,13 +304,19 @@ def x86_access_width(op, ops):
     return 0
 
 
+# Registers a function gets from its caller unchanged (SysV): until it writes one, what it pushes from it is the
+# caller's value, as secret as the caller's own taint says.
+X86_CALLEE_SAVED = ("rbx", "rbp", "r12", "r13", "r14", "r15")
+
+
 def check_x86(lines, secret, pointers):
     index_of_lines = {address for address, _ in lines}
     returned = []
     header_args = FOLLOW.get("header_args", [])
     FOLLOW["header_args"] = []  # a followed callee has none
     start = (frozenset(X86_ARGS[i] for i in secret) | frozenset(["ptr:" + X86_ARGS[i] for i in pointers]) |
-             frozenset(["rspd:0"]) | frozenset("hdrp:" + X86_ARGS[i] for i in header_args))
+             frozenset(["rspd:0"]) | frozenset("hdrp:" + X86_ARGS[i] for i in header_args) |
+             frozenset(f"entry:{r}" for r in X86_CALLEE_SAVED))
 
     def rsp_delta(state):
         """How far rsp is below its value at entry, as the tag says; "?" if it isn't one number."""
@@ -355,7 +361,9 @@ def check_x86(lines, secret, pointers):
         here = rsp_delta(state)
         for wipe in [t for t in out if t.startswith("wipe:")]:
             # A callee that wiped the stack below itself: its stack pointer is 8 below ours (the return address).
-            _, low, high = wipe.split(":")
+            _, low, high, *regs = wipe.split(":")
+            if regs and any(r in state or "ptr:" + r in state for r in regs[0].split("+")):
+                continue
             for tag in [t for t in state if t.startswith("dirty:")]:
                 _, at_call, depth = tag.split(":")
                 if here != "?" and at_call != "?":
@@ -417,6 +425,9 @@ def check_x86(lines, secret, pointers):
         ops = x86_split(parts[1]) if len(parts) > 1 else []
         if header_args:
             mark_lost(state, op, ops)
+        # Any instruction naming a register as its destination (AT&T: the last operand) may have changed it.
+        if ops and ops[-1].startswith("%") and not op.startswith(("push", "cmp", "test")):
+            state.discard("entry:" + x86_reg(ops[-1]))
         if op.startswith("push"):
             move_rsp(state, 8)
         elif op.startswith("pop"):
@@ -507,6 +518,7 @@ def check_x86(lines, secret, pointers):
         def write(o, value, pointer=False):
             if o.startswith("%"):
                 r = x86_reg(o)
+                state.discard("entry:" + r)
                 if value:
                     state.add(r)
                 else:
@@ -580,10 +592,29 @@ def check_x86(lines, secret, pointers):
                 state.add("pushed")
             if read_pointer(ops[0]):
                 state.add("pushed_ptr")
+            # The 8 bytes a push of a public register writes hold no secret: a wipe that stops just under them
+            # still leaves nothing behind (what a --fast build's ctScrubStack does after `push %rbp`). By the
+            # taint here, never by register name; dropped at a pop and at any store to memory.
+            here = rsp_delta(state)
+            if here != "?":
+                for tag in [t for t in state if t.startswith((f"pubpush:{-int(here)}", f"entrypush:{-int(here)}:"))]:
+                    state.discard(tag)
+                if ops[0].startswith("%") and "entry:" + x86_reg(ops[0]) in state:
+                    # The caller's value: the caller decides whether it was public (after_call).
+                    state.add(f"entrypush:{-int(here)}:{x86_reg(ops[0])}")
+                elif ops[0].startswith("%") and not tainted(ops[0]) and not read_pointer(ops[0]):
+                    state.add(f"pubpush:{-int(here)}")
             return frozenset(state)
         if op.startswith("pop"):
+            for tag in [t for t in state if t.startswith(("pubpush:", "entrypush:"))]:
+                if rsp_delta(state) == "?" or int(tag.split(":")[1]) < -int(rsp_delta(state)):
+                    state.discard(tag)
             write(ops[0], "pushed" in state, "pushed_ptr" in state)
             return frozenset(state)
+        if ops and not ops[-1].startswith(("%", "$")) and not op.startswith(("cmp", "test", "j", "call", "nop")) and \
+                not (repeated and op.startswith("stos")):
+            for tag in [t for t in state if t.startswith(("pubpush:", "entrypush:"))]:
+                state.discard(tag)
         if op.startswith(("cmp", "test", "vptest", "ptest", "bt", "ucomis", "comis")):
             if any(read(o) for o in ops):
                 state.add("flags")
@@ -639,7 +670,23 @@ def check_x86(lines, secret, pointers):
                         if low <= -int(at_call) - int(depth) and high >= -int(at_call) - 8:
                             state.discard(tag)
                 if here != "?":
-                    state.add(f"wipe:{-int(here) + start}:{-int(here) + start + width * count}")
+                    low = -int(here) + start
+                    high = low + width * count
+                    state.add(f"wipe:{low}:{high}")
+                    # Over pushes of public registers, and of the caller's own registers if the caller's taint
+                    # finds them public (a second, conditional wipe).
+                    regs = []
+                    while True:
+                        if f"pubpush:{high}" in state:
+                            high += 8
+                            continue
+                        pushed = [t.split(":")[2] for t in state if t.startswith(f"entrypush:{high}:")]
+                        if not pushed:
+                            break
+                        regs.append(pushed[0])
+                        high += 8
+                    if high != low + width * count:
+                        state.add(f"wipe:{low}:{high}" + (":" + "+".join(sorted(set(regs))) if regs else ""))
                 state.discard("rdi")
                 state.discard("rcx")
                 return frozenset(state)

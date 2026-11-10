@@ -154,3 +154,34 @@ residue_conditional:
  callq residue_wipe_maybe
  addq $8,%rsp
  retq
+# The --fast shape of ctScrubStack: it pushes the caller's rbp, then wipes the 512 bytes below that, so the wipe
+# ends 8 bytes under its return address. Those 8 bytes hold what the push wrote: the caller's rbp, public in
+# residue_frame_wiped (clean) and the secret in residue_frame_secret (the push puts it there: found).
+.globl residue_wipe_frame
+.hidden residue_wipe_frame
+residue_wipe_frame:
+ pushq %rbp
+ movq %rsp,%rbp
+ leaq -512(%rsp),%rdi
+ movl $64,%ecx
+ xorl %eax,%eax
+ rep stosq
+ popq %rbp
+ retq
+.globl residue_frame_wiped
+residue_frame_wiped:
+ pushq %rbp
+ movq %rsp,%rbp
+ callq residue_callee
+ callq residue_wipe_frame
+ popq %rbp
+ retq
+.globl residue_frame_secret
+residue_frame_secret:
+ pushq %rbp
+ movq %rdi,%rbp
+ callq residue_callee
+ callq residue_wipe_frame
+ xorl %ebp,%ebp
+ popq %rbp
+ retq
