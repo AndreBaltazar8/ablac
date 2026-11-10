@@ -1794,21 +1794,26 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   Not done: the `--fast` NovaKind HEAD does not build offline here (its locked
   abla-s3/abla-soap revisions need `.abla/packages` prepared); this is the 9c62c61b tree.
 
-- What allocates in a NovaKind `--fast` build's frontend (ablac-52, 2026-11-10, master
-  dd199bfb sources, `perf record -e instructions:u -c 50M -g`, NovaKind repro tree 9c62c61b;
-  inclusive shares of the second compiler process, the one that parses and analyzes):
-  the collector runs under pressure (`__ablaRuntimeHostPressureCollect` 14%,
-  `PlatformMemoryCollect` self 5.7%, `HostMarkPointer` 6%) and the allocations that drive
-  it come from the compile-time evaluator: `BootstrapEvaluator.evaluate` is 22.8% of
-  the process inclusive, all of it under `bootstrapParseStagedRegistered` (21.0%) and
-  `bootstrapApplyGeneratedModules` (17.2%) — the staged (subparser) modules NovaKind's
-  source runs while it is parsed — inside `BootstrapModuleGraph.parse` (23.0%). Not the
-  analyzer (`BootstrapAnalyzer.analyze` 19.9%, of which `infer` 17%, and that holds the
-  interface scans fixed by the one-pass implementers) or lowering (21%, 9% to write
-  the codegen units). The first process (the driver that runs the LLVM children) has one
-  explicit collect after the build (`bootstrapNativeBuildWithEmitterStateCache`, 2.0%
-  of the whole), nothing else. So the lever for the collector's 14% is the evaluator's
-  allocation per step (boxed locals, argument arrays, string building in the staged
-  parsers), not the collector itself; next measurement is an allocation-site count by
-  evaluator function (`bootstrapEvaluateLocal` 17.7%, `evaluateCall`) with
-  `memoryHeapStat`, before any change.
+- What the collector costs in a NovaKind `--fast` build, and who triggers it (ablac-52,
+  2026-11-10, master dd199bfb sources, NovaKind repro tree 9c62c61b,
+  `perf record -e instructions:u -c 8M -g`, 70,845 samples, all processes). Pressure
+  collections (`__ablaRuntimeHostPressureCollect` and below) are 11.9% of the whole
+  build's user instructions (14% of the compiler process alone); one explicit collect
+  after the build in the driver is 2.0%. Attributing each collection's samples to the
+  function that allocated when the threshold was crossed (a proxy for allocation volume,
+  since the trigger point is arbitrary) spreads it across the phases, no single
+  culprit: analyzer 3.5% (`recordTypedExpression` 1.3%, `bootstrapAnalyzer` 0.7%, the
+  string-set adds 0.7%), lowering 3.2% (`bootstrapLowerIdentifier` 0.9%, `catchUp` 0.8%,
+  `emitControl` 0.7%), compile-time evaluation 2.7% (`bootstrapEvalScalar` 0.9%,
+  `evaluateBlock` 0.6%, strings 0.3%), delegated properties 1.4%, generics 0.9%. The
+  instructions spent in the allocation entry itself are only 2.7% of the build. So there
+  is no one allocation site to remove; the cost is the pacing: the next collection
+  waits for `max(live / 2, collection growth)` more bytes, so each allocated byte pays
+  for about two marked bytes of the live heap. Waiting for `live` instead would roughly halve
+  the 11.9% at the price of up to 50% more heap before a collection, against a build
+  whose peak is already 3.5 GB: a peak-RSS trade, not a free cut. Not changed; if the
+  bar for peak is relaxed for `--fast` builds, `memorySetCollectionGrowth` from the driver
+  is the experiment (no runtime change needed). Evaluator-local cuts exist but are small
+  (`bootstrapEvaluateLocal` allocates an "uninitialized" value it overwrites and a
+  one-element array for the escape check on every local, about one allocation pair
+  per local declaration): worth doing only with a count of locals evaluated.
