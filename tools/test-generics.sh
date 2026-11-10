@@ -139,4 +139,12 @@ incremental $'first 1\n2'
 cp "$cases/incremental/library-edited.ab" "$work/library.ab"
 incremental $'second 1\n3'
 
+# A class's type parameter named like a program class and bound to it: the
+# lambda of a generic method or function still gets its parameter typed.
+"$compiler" build "$project_root/tests/cases/generic-type-parameter-capture/main.ab" \
+    -o "$output_directory/parameter-capture" --no-cache
+output=$(run "$output_directory/parameter-capture")
+[[ $output == $'3 10 5\nstatus 42' ]] ||
+    { echo "generics, parameter named like a class: $output" >&2; exit 1; }
+
 echo "generics: generic functions, extensions and classes compute what they should (built and under ablac run), private and strict-imports generics resolve, the compiler API reads and makes instances, misuses are the errors they should be, and an edited generic rebuilds its instances"
