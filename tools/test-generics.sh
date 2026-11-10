@@ -166,5 +166,11 @@ if "$compiler" build "$project_root/tests/cases/generic-type-parameter-capture/o
 fi
 grep -qF 'generic.cannot-infer:both:R' "$output_directory/parameter-open-class.err" ||
     { cat "$output_directory/parameter-open-class.err" >&2; echo "generics: no cannot-infer for R next to class R" >&2; exit 1; }
+# (A bare type parameter bound to a function type types its lambda.)
+"$compiler" build "$project_root/tests/cases/generic-type-parameter-capture/bare.ab" \
+    -o "$output_directory/parameter-bare" --no-cache
+output=$(run "$output_directory/parameter-bare")
+[[ $output == $'101\nstatus 42' ]] ||
+    { echo "generics, a bare parameter bound to a function type: $output" >&2; exit 1; }
 
 echo "generics: generic functions, extensions and classes compute what they should (built and under ablac run), private and strict-imports generics resolve, the compiler API reads and makes instances, misuses are the errors they should be, and an edited generic rebuilds its instances"
