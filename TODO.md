@@ -225,6 +225,19 @@
   `break` over temporaries, and `--focus resource_drop_check` draws every check from it. Seeds 2341 to 2560
   (24 checks each, 2501 to 2560 all drop checks, 1440 programs) agree in all six modes on the drop-temporaries
   compiler, the evaluator's drop log included.
+  Then labeled `break`/`continue`, `?? continue`, a labeled `do` block and Generators were added to it, and the
+  drop check found two bugs on seeds 2641 to 2700: (1) the evaluator left a jump on the right of `??` as a value
+  (`total += x ?? continue` under `#`: E_COMPILE_RESULT_NOT_LIFTABLE), #775, fixed on branch `elvis-jump` for
+  assignments, unary operators and `if`/`while`/`do`/`when` operands; (2) OPEN, not #736's (batch 23's compiler
+  crashes the same way): a local Generator that a `for` in a borrowing callee has ended is dropped again by the
+  caller's scope, a silent double free that crashes native code (--fast and release; Wasm and the evaluator are
+  fine) in a later free (`host.__ablaRuntimeHostUnregister`, via `__ablaRuntimeGeneratorDrop`). Smallest program:
+  `fun counted(limit: int): Generator<int> = generator { for (i in 0 until limit) yield i }`,
+  `fun drain(values: Generator<int>): int { var sum = 0; for (v in values) sum = sum + v; sum }`,
+  `fun once(round: int): int { val g = counted(3 + round); drain(g) }`, and a `main` that calls `once` for 40
+  rounds and then appends 2000 strings to an array: segmentation fault. The drop check draws Generators only with
+  `--generators` until that is fixed (ablac-f3-2 saw the same class as the `test-labeled-loops` segfault of #736's
+  first gate).
 
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
