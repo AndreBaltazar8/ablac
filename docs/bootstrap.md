@@ -124,6 +124,8 @@ A newer pair is chosen with `--lineage` (and the workflow's `lineage` input); `L
 and route B from v0.2.50, rebuilding the v0.2.51 sources (`1758d94e64b0e7f31f22107f8556fd63dc4351c6`) twice; the
 default stays the v0.2.45 pair above. Adding a lineage is adding its two seed checksums and the bridge commit.
 
+**Release step.** At each release, add a `LINEAGES` entry for the new tag (route A: the new tag's pinned seed; route B: the previous release's seed; historical: the new tag's source commit) and dispatch the workflow with `lineage=<tag>`.
+
 Each source tree uses its own runtime, standard library and Nix shell.
 Candidate sources occupy `/build/source` on both builders, with a declared
 environment, fresh home, temporary and cache directories, no object-cache
