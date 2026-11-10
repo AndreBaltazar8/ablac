@@ -147,6 +147,13 @@ In a finalizer's generated function the same calls work. The handler's result is
 what the check above covers; a misplaced named argument in generated code is an
 ordinary error of the generated code, located at its origin.
 
+The typed-target forms take them too: in the argument array of
+`syntaxCallTarget(target, arguments)` and
+`syntaxMethodCallTarget(target, receiver, arguments)`, a
+`syntaxNamedArgument` names a parameter of the declaration the handle selects
+(a method's parameters exclude its receiver), with the same rules and the
+same `E_NAMED_ARGUMENT_*` errors, reported at the generated code's origin.
+
 ```abla
 import "abla/io"
 import "abla/compiler/parser"
