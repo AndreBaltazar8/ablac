@@ -2017,3 +2017,16 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   fingerprint plus the compiler version. The 3.3 M per invocation is an upper bound (the 13.2%
   also holds the generated modules and the import parse); a perf split of the handler
   frames alone would sharpen it before the project starts.
+  Correction (ablac-52, 2026-11-10, same tree): the handlers are not where the interpreter's
+  time goes. A counter on `BootstrapEvaluator.evaluate` steps around each handler invocation
+  (919 invocations) gives 1.57 M steps in handlers out of 21.8 M evaluator steps counted up to
+  the last handler (7%): `oneRemoteCallParse` 0.82 M, `oneRemoteDecodeParse` 0.42 M,
+  `ablaJsonParseValue` 0.27 M, the other three 0.06 M. Extension finalizers were invoked 0 times.
+  So 93% of the evaluator's work in a NovaKind `--fast` frontend is compile-time code that is
+  neither a subparser handler nor a finalizer (top-level actions, `#` expressions and compile
+  functions they call), and a native handler path would reach at most about 7% of the
+  interpreter's 13.2% (under 1% of the build): the "up to 10 of the 13%" above is withdrawn.
+  The call-graph attribution of that work to `bootstrapApplyGeneratedModules` was the sampled
+  stack's nearest named frame (the evaluator is entered through inlined code there), not a
+  statement about generated modules. Next measurement: which top-level action or `#` expression
+  the 20 M steps belong to (a step counter per action).
