@@ -916,6 +916,19 @@
   scenarios were not measured. Rejected patch and raw samples are in
   `worktrees/ablac-headers-32/build/headers-lab/`. No larger header-summary
   rewrite is planned for now.
+  rewrite is planned for now.
+  Remeasured 2026-11-10 on master `7c706497`'s runtime (oha 1.10, one worker on CPU 2, clients on CPUs 4 to 7, three alternating runs, not a quiet window): headers-32 Abla
+  210,653 to 224,840 requests/s against Zig 228,291 to 242,594 (about -8%), and in instructions per request, which
+  do not move with placement or load: Abla 40,711, 40,711 and 40,713 (each within 0.01%) against Zig 19,156 to
+  19,028, cycles per request 10,448 / 10,059 / 10,331 against 4,954 / 4,931 / 4,829. The profile of Abla's
+  server (instructions:u, 200,000 per sample): `httpAsciiEqualInsensitive` 18.8%, `HttpRequest.header` 18.0%,
+  `httpParseRequest` 17.9%, `textFindSequence` 11.8%, then allocation (`HostAllocateGeneral` 8.1%, `ObjectBlock`
+  4.4%, `ArrayAppendGrowing` 4.0%). The five lookups each walk up to 32 headers of one length, so the length test
+  rejects nothing and the case-folding comparison runs on nearly every candidate. The last-byte rejection filter
+  the 2026-11-06 note tried (no clear throughput win at load 11) is a 10.4% cut in instructions per request here:
+  `HttpRequest.header` compares `(last byte | 32)` first, 40,553 to 36,354 (parameters 12,055 to 12,005, plaintext
+  8,017 to 7,976), branch `http-header-filter` with `tests/cases/http-header-lookup`. The rest of the gap is the
+  parse (header objects and two substrings each) and the line-end search.
 - [ ] **`abla-compare` one-worker parameter routing trails Zig** (2026-11-06):
   parameters measured 276,924 versus 308,076 requests/s. The locked abla-web
   `webNoEscapeRoute` and stdlib `HttpRouter` both use `httpMatchPath`; the
@@ -929,6 +942,13 @@
   attributed to the change. They exceed the noise gate, so this is a no-go.
   Full samples, baseline/candidate binaries and the uncommitted prototype are
   in `worktrees/ablac-route-match` (`build/route-lab/measurement.json`).
+  Remeasured 2026-11-10 on master `7c706497`'s runtime (string equality, maps and the packed
+  slots changed since; abla-compare `baed16d`, one worker pinned to CPU 2, oha 1.10 on CPUs 4 to 7 in a
+  slot hold, 6 s of load, three alternating runs, not a quiet window): parameters Abla 296,775 to 302,842
+  requests/s against Zig (1 event, 2 handler threads) 226,259 to 250,883, so Abla leads by about 25% in this
+  configuration and no longer trails; the 2026-11-06 quiet-window figures (276,924 against 308,076) used the
+  harness's own placement and oha 1.16, so the two are not paired. Instructions per request, the number this
+  placement does not disturb: parameters 12,055 (3 runs 11,994 to 12,078).
 - [ ] **A map lookup waits on a cache miss** (2026-11-03): 83% of `__ablaRuntimeMapEntry`'s cycles in
   maps are the load of its slot from a 4 MB slot array. Slots are now 32-bit (two to an i64
   element: entry + 1 in the mask's bits, the hash's upper bits above them as a mark), halving the
