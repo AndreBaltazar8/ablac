@@ -147,6 +147,7 @@ class LineageTests(unittest.TestCase):
     def test_lineages_chain(self):
         # Route B of a release is the previous release: its seed is the previous lineage's route A.
         self.assertEqual(gate.LINEAGES["v0.2.52"]["seeds"]["b"], gate.LINEAGES["v0.2.51"]["seeds"]["a"])
+        self.assertEqual(gate.LINEAGES["v0.2.53"]["seeds"]["b"], gate.LINEAGES["v0.2.52"]["seeds"]["a"])
         self.assertEqual(gate.LINEAGES["v0.2.51"]["seeds"]["b"][0], "v0.2.50")
 
     def test_root_defaults_and_is_selectable(self):
