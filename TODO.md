@@ -1867,3 +1867,15 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   of a NovaKind `--fast` build on top of the one-pass implementers; 0 on the self-build;
   output unchanged (the lists are built in the same order). Bars as for iface-index:
   byte-identical binaries and IR, instructions by sampled alternating runs, RSS.
+  The size guard only sees appends, so the index must also survive an in-place replacement
+  at the same count. By reading: the places that write `declarations[i] = …` or
+  `truncate(0)` and re-append are all in the staged parser (`staged_parser.ab`: a transform's
+  annotation at ~283, the artifact-slice rename of `main` at ~1266, the dropped extension
+  fields at ~428 and the removed declarations at ~455), they run while the
+  `BootstrapParseResult` is being built, and each analyzer builds its `declarationNames` from
+  the array it is handed after that; none of these names is a class, extend or interface.
+  What is not proven is that no analyzer outlives an edit of its own array (a probe analyzer
+  during compile-time evaluation); so the guard would also check, per node it visits, that
+  `declarations[node].name == name` (a renamed or replaced slot falls back to the scan), and the
+  test is a staged transform that annotates a class and one that drops an extension field
+  followed by a conformance query through the index, compared with the scan's answer.
