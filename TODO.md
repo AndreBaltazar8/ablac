@@ -1950,3 +1950,11 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   compiler); the floors agree to 0.06% (empty 1.4270 / 1.4272, fib 1.4295 / 1.4291, maps 1.6968 /
   1.6978 G). The transform-edit test is tests/cases/interfaces/index-edits.ab. Not covered: the
   Transactional-classes scan and the generic_types / generics call sites keep the scan.
+- Type text without module prefixes (ablac-52, 2026-11-10): `bootstrapSourceVisibleType` (parser.ab)
+  sliced the type for every character to compare with `__abla_module_`; with the profile at 2.4%
+  of the frontend process, a first-character test (`type[index] == 95`) before the slice gives the
+  same strings and, on a NovaKind `--fast` build, 23,147 / 23,257 / 23,198 / 23,159 samples
+  against 22,969 / 23,075 / 23,097 (first run after a build excluded) = -0.6%. Sub-bar alone; kept as
+  branch slice-guard (one line) to ride along with a larger src batch. About two dozen other
+  places slice a string per character to compare it (`slice(index, index + n) == literal`);
+  none shows in the NovaKind profile above 0.5%.
