@@ -396,7 +396,7 @@
   refused) on x86-64, AArch64, Wasm and Xtensa as hand fixtures; the module and its use; `check-asm.py
   --expect-allocator` (a smoke test that a function reaches a call to the entry, directly or through functions of the
   object; not a proof that one function allocates through it), run by test-ct.sh on a real x86-64 release object.
-  Not built: the same on Wasm (no section to mark the entry; test-ct.sh reads the x86-64, AArch64 and Xtensa objects); reading the
+  Not built: the same on Wasm (test-ct.sh reads the x86-64, AArch64 and Xtensa objects). Measured 2026-11-10: a release Wasm module of the probe has sections TYPE, FUNCTION, MEMORY, GLOBAL, EXPORT, DATACOUNT and CODE only, no name section, so the entry has no mark there; the cheap options are an export (about 880 bytes, the cost that ruled `@export` out above) or a custom name section for this one function; reading the
   RSA key and `aesNewKey` plumbing through the entry. The section is the mark, so an identical-code fold in a linked
   final image could merge the entry with another function; only hand fixtures are linked here.
   Bars (ablac-d1): a program importing no crypto builds byte-identical (release and `--fast`, the usual benchmark
