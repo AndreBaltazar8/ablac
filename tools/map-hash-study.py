@@ -36,19 +36,25 @@ def study(keys,hf):
     n=len(keys); cap=capacity(n); mask=cap-1
     table=[0]*cap
     maxd=0; tot=0
+    marks=[0]*cap
+    falsemarks=0
     for k in keys:
-        s=hf(k)&mask; d=0
-        while table[s]: s=(s+1)&mask; d+=1
-        table[s]=1; tot+=d+1; maxd=max(maxd,d+1)
+        h=hf(k)
+        mark=(h>>32)&~mask&0xFFFFFFFF
+        s=h&mask; d=0
+        while table[s]:
+            if marks[s]==mark: falsemarks+=1   # a probe that would go on to compare the keys for nothing
+            s=(s+1)&mask; d+=1
+        table[s]=1; marks[s]=mark; tot+=d+1; maxd=max(maxd,d+1)
     # longest occupied run
     run=best=0
     for v in table+table:
         run=run+1 if v else 0; best=max(best,run)
-    return n,cap,tot/n,maxd,min(best,cap)
+    return n,cap,tot/n,maxd,min(best,cap),falsemarks
 def report(name,keys):
     keys=list(dict.fromkeys(keys))
     a=study(keys,lambda b:fnv(b)); b=study(keys,new)
-    print("%-34s n=%-7d cap=%-8d | old: mean %.2f max %-3d run %-4d | new: mean %.2f max %-3d run %-4d"%(name,a[0],a[1],a[2],a[3],a[4],b[2],b[3],b[4]))
+    print("%-34s n=%-7d cap=%-8d | old: mean %.2f max %-3d run %-4d marks %-3d | new: mean %.2f max %-3d run %-4d marks %-3d"%(name,a[0],a[1],a[2],a[3],a[4],a[5],b[2],b[3],b[4],b[5]))
 # (a) compiler identifiers
 idents=[]
 for f in sorted(glob.glob('src/**/*.ab',recursive=True))+sorted(glob.glob('stdlib/**/*.ab',recursive=True)):
