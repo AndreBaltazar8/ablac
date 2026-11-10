@@ -86,8 +86,15 @@ fun bootstrapSourceMapStartsWith(
     begin: int,
     end: int,
     prefix: string
-): bool = end - begin >= prefix.size &&
-    text.slice(begin, begin + prefix.size) == prefix
+): bool {
+    var same = end - begin >= prefix.size
+    var index = 0
+    while (same && index < prefix.size) {
+        if (text[begin + index] != prefix[index]) same = false
+        index = index + 1
+    }
+    same
+}
 
 fun bootstrapSourceMapJoin(directory: string, name: string): string =
     if (name.size > 0 && name[0] == 47) name
@@ -178,28 +185,56 @@ fun bootstrapSourceMapReadLineTables(dump: string): BootstrapSourceMapRows {
                 }
                 resolved = true
             }
-            val fields = bootstrapSourceMapFields(dump, begin, lineEnd)
+            // The row's first four fields, by their places in the line (no substring is made).
+            var count = 0
+            var begin0 = 0
+            var end0 = 0
+            var begin1 = 0
+            var end1 = 0
+            var begin2 = 0
+            var end2 = 0
+            var begin3 = 0
+            var end3 = 0
             var endSequence = false
-            for (field in fields) {
-                if (field == "end_sequence") endSequence = true
+            var cursor = begin
+            while (cursor < lineEnd) {
+                while (cursor < lineEnd && (dump[cursor] == 32 || dump[cursor] == 9)) {
+                    cursor = cursor + 1
+                }
+                val fieldBegin = cursor
+                while (cursor < lineEnd && dump[cursor] != 32 && dump[cursor] != 9) {
+                    cursor = cursor + 1
+                }
+                if (cursor > fieldBegin) {
+                    if (count == 0) {
+                        begin0 = fieldBegin
+                        end0 = cursor
+                    } else if (count == 1) {
+                        begin1 = fieldBegin
+                        end1 = cursor
+                    } else if (count == 2) {
+                        begin2 = fieldBegin
+                        end2 = cursor
+                    } else if (count == 3) {
+                        begin3 = fieldBegin
+                        end3 = cursor
+                    }
+                    if (cursor - fieldBegin == 12 &&
+                        bootstrapSourceMapStartsWith(dump, fieldBegin, cursor, "end_sequence")) {
+                        endSequence = true
+                    }
+                    count = count + 1
+                }
             }
-            if (fields.size >= 4 && !endSequence) {
-                val line = bootstrapSourceMapParseInt(
-                    fields[1], 0, fields[1].size
-                )
-                val file = bootstrapSourceMapParseInt(
-                    fields[3], 0, fields[3].size
-                )
+            if (count >= 4 && !endSequence) {
+                val line = bootstrapSourceMapParseInt(dump, begin1, end1)
+                val file = bootstrapSourceMapParseInt(dump, begin3, end3)
                 if (line > 0 && file < fileIndices.size &&
                     fileIndices[file] >= 0) {
-                    rows.addresses.append(bootstrapSourceMapParseHex(
-                        fields[0], 0, fields[0].size
-                    ))
+                    rows.addresses.append(bootstrapSourceMapParseHex(dump, begin0, end0))
                     rows.files.append(fileIndices[file])
                     rows.lines.append(line)
-                    rows.columns.append(bootstrapSourceMapParseInt(
-                        fields[2], 0, fields[2].size
-                    ))
+                    rows.columns.append(bootstrapSourceMapParseInt(dump, begin2, end2))
                 }
             }
         }
@@ -479,20 +514,22 @@ fun bootstrapWasmDebugArtifacts(modulePath: string, outputPath: string): int {
         status = 1
     }
     if (status == 0) {
+        // The two dumps read the same file and write their own: both run at once.
         val dump = linuxCommand("llvm-dwarfdump")
         dump.argument("--debug-line")
         dump.argument("-o")
         dump.argument(dumpPath)
         dump.argument(debugPath)
-        status = dump.run()
-    }
-    if (status == 0) {
         val info = linuxCommand("llvm-dwarfdump")
         info.argument("--debug-info")
         info.argument("-o")
         info.argument(infoPath)
         info.argument(debugPath)
-        status = info.run()
+        val dumping = dump.start().process
+        val informing = info.start().process
+        val dumped = if (dumping > 0) linuxWaitProcess(dumping).status else 127
+        val informed = if (informing > 0) linuxWaitProcess(informing).status else 127
+        status = if (dumped != 0) dumped else informed
     }
     if (status == 0) {
         var rows = bootstrapSourceMapReadLineTables(Path(dumpPath).readText())
