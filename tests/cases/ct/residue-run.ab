@@ -82,14 +82,48 @@ var entrySp = 0
     return size
 }
 
-// The password-based entries of abla/crypto/pbe: making the password, and opening an encrypted PKCS#8 or a PKCS#12
-// with the right password, a wrong one, an input cut in half and one with its last byte changed (a bad padding or MAC).
-@noinline trusted fun pbeEntries(which: int, data: string, password: string): int {
+// The password-based entries of abla/crypto/pbe. The strict rows measure the entry alone: the password owner is made in
+// the caller's frame (above the scanned region, and dropped after the scan), as is the result it hands back, and only
+// the entry's work, then its wipe, lies below. pbeOwnerEntry is `cryptoPassword` itself, handing the owner up.
+@noinline trusted fun pbeOwnerEntry(password: string): CryptoPassword {
+    val owner = cryptoPassword(password)
+    entrySp = stackPointer("movq %rsp, $0", "=r")
+    owner
+}
+
+@noinline trusted fun pbeEntries(which: int, data: string, owner: CryptoPassword): CryptoResult {
+    val result = when (which) {
+        1 -> pbeOpenPkcs8(data, owner)
+        else -> pbeOpenPkcs12(data, owner)
+    }
+    entrySp = stackPointer("movq %rsp, $0", "=r")
+    result
+}
+
+// The same entries with the owner as a temporary, as a caller writes them: the owner is dropped at the end of this
+// statement, after the entry's wipe, so its drop's frames lie in the scanned region (public addresses and counts).
+// These rows check that no password octet is left there (regionContains), not that the region is zero. The entries
+// are called from one place (pbeEntries): a second call site changes whether the compiler inlines them, and with it
+// how much of their own frame (public words) lies below the entry's stack pointer.
+@noinline trusted fun pbeTemporaryEntries(which: int, data: string, password: string): int {
     val size = when (which) {
         0 -> if (cryptoPassword(password).ok()) 1 else 0
-        1 -> pbeOpenPkcs8(data, cryptoPassword(password)).bytes.size
-        else -> pbeOpenPkcs12(data, cryptoPassword(password)).bytes.size
+        else -> pbeEntries(which, data, cryptoPassword(password)).bytes.size
     }
+    entrySp = stackPointer("movq %rsp, $0", "=r")
+    return size
+}
+
+// A test-only owner whose drop leaves a marker on the stack: used as a temporary it must be found by the scan, which
+// proves that a secret an owner's drop leaves in the caller's statement would not go unseen.
+resource class LeakyOwner(val id: int) {
+    fun drop(): void = leaky(5787763621429855564)
+}
+
+@noinline trusted fun touchLeaky(owner: LeakyOwner): int = owner.id
+
+@noinline trusted fun leakyTemporaryEntry(): int {
+    val size = touchLeaky(LeakyOwner(1))
     entrySp = stackPointer("movq %rsp, $0", "=r")
     return size
 }
@@ -135,6 +169,31 @@ var entrySp = 0
     }
 }
 
+// Whether the painted region holds `pattern` (a password's octets, or the bytes of a marker).
+@inline trusted fun regionContains(top: int, pattern: string): bool {
+    var at = top - region
+    while (at + pattern.size <= top) {
+        var same = true
+        var offset = 0
+        while (same && offset < pattern.size) {
+            if (ablaUnsafeLoadU8(nativePointerFromAddress(at + offset)) != pattern[offset]) same = false
+            offset = offset + 1
+        }
+        if (same) return true
+        at = at + 1
+    }
+    false
+}
+
+// A password as CryptoPassword also holds it: its first octets, and the same as big-endian UTF-16 (PKCS#12).
+fun passwordOctets(password: string): string = password.slice(0, 16)
+
+fun passwordUtf16(password: string): string {
+    var wide = ""
+    for (at in 0 until 8) wide = wide + "\x00" + password.slice(at, at + 1)
+    wide
+}
+
 @inline trusted fun checkPbe(top: int, data: string, which: int, label: string): void {
     val right = "PASSWORD-MARKER-0123456789"
     val flipped = data.slice(0, data.size - 1) + "\x00"
@@ -145,12 +204,30 @@ var entrySp = 0
             else -> data
         }
         val password = if (variant == 1) "WRONG-PASSWORD-MARKER" else right
-        pbeEntries(which, input, password)
+        // Strict: the entry alone, with the owner made outside the scanned frames.
+        if (which == 0) {
+            val warm = pbeOwnerEntry(password)
+            paint(top)
+            val owner = pbeOwnerEntry(password)
+            val depth = deepest(entrySp)
+            if (verbose()) println("pbe $label $variant: $depth")
+            record(depth == 0)
+        } else {
+            val owner = cryptoPassword(password)
+            val warm = pbeEntries(which, input, owner)
+            paint(top)
+            val result = pbeEntries(which, input, owner)
+            val depth = deepest(entrySp)
+            if (verbose()) println("pbe $label $variant: $depth")
+            record(depth == 0)
+        }
+        // The owner as a temporary, dropped after the entry's wipe: no password octet is left.
+        pbeTemporaryEntries(which, input, password)
         paint(top)
-        pbeEntries(which, input, password)
-        val depth = deepest(entrySp)
-        if (verbose()) println("pbe $label $variant: $depth")
-        record(depth == 0)
+        pbeTemporaryEntries(which, input, password)
+        val found = regionContains(top, passwordOctets(password)) || regionContains(top, passwordUtf16(password))
+        if (verbose()) println("pbe temporary $label $variant: password left $found")
+        record(!found)
     }
 }
 
@@ -162,6 +239,11 @@ trusted fun main: int {
     paint(top)
     leakyThenWiped(72623859790382856)
     record(deepest(top) == 0)
+    // A drop that leaves its marker in the caller's statement is found by the region search.
+    leakyTemporaryEntry()
+    paint(top)
+    leakyTemporaryEntry()
+    record(regionContains(top, "LEAKYDRP"))
 
     checkAes(top, "SECRETKEY0123456", "PLAINTEXT-MARKER")
     checkAes(top, "SECRETKEY0123456SECRETKE", "PLAINTEXT-MARKER")

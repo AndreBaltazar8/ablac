@@ -22,6 +22,7 @@ cp -R tests/cases/ct "$cases"
 # the generated fixture's own module, never through a public test hook.
 sed -n '/^\/\/ BEGIN RSA SECRET BIGNUM PRIMITIVES$/,/^\/\/ END RSA SECRET BIGNUM PRIMITIVES$/p' stdlib/abla/crypto/rsa/entry.ab >> "$cases/fixture.ab"
 sed -n '/^\/\/ BEGIN PBE SECRET CORES$/,/^\/\/ END PBE SECRET CORES$/p' stdlib/abla/crypto/pbe/entry.ab >> "$cases/fixture.ab"
+sed -n '/^\/\/ BEGIN PBE OWNER WIPE$/,/^\/\/ END PBE OWNER WIPE$/p' stdlib/abla/crypto/pbe/entry.ab >> "$cases/fixture.ab"
 # Source-generated coverage for loops around the previously checked primitives.
 # No production edits or call exemptions: see generator's scope guards.
 # The AES functions that touch a key, as written (their allocating wrappers stay outside, see the generator).
@@ -468,6 +469,25 @@ write_only_read() {
     echo "ok   write-only pointers: a store-only wipe passes, a wipe that reads (also by an atomic) is found, on x86-64, AArch64 and Xtensa"
 }
 
+# What a secret owner's drop does with the memory it wipes, read from the real wipes (fixture.ab, ct_owner_*): pbeWipe
+# (CryptoPassword and PbeHash), aesWipe (AesKey) and bnClear (RsaPrivateKey, through bnRelease), with the pointer
+# write-only (`@0!`): stores only. A temporary owner is dropped after the entry it was passed to has wiped its stack, so a
+# drop that loaded what it wipes would put the secret back. The twin that loads first must be found.
+owner_wipe_read() {
+    local arch=$1 object=$2
+    $check --follow-calls "$arch" "$object" ct_owner_pbe_wipe:@0! ct_owner_aes_wipe:@0! ct_owner_bn_clear:@0! \
+        > "$out/owner-wipe-$arch.log" 2>&1 || {
+        cat "$out/owner-wipe-$arch.log" >&2; echo "ct: an owner's wipe reads what it wipes on $arch" >&2; exit 1
+    }
+    if $check --follow-calls "$arch" "$object" ct_owner_reads:@0! > "$out/owner-wipe-$arch-reads.log" 2>&1; then
+        echo "ct: the wipe that loads before it stores was not found on $arch" >&2; exit 1
+    fi
+    grep -q 'reads the secret memory it may only overwrite' "$out/owner-wipe-$arch-reads.log" || {
+        cat "$out/owner-wipe-$arch-reads.log" >&2; exit 1
+    }
+    echo "ok   $arch owner wipes: pbeWipe, aesWipe and bnClear only store through their pointer (1 control)"
+}
+
 # A callee that writes a secret through an address of the caller's own frame (made by lea or by mov from rsp)
 # makes the caller's slots secret; a secret passed in a stack slot is found inside the callee. Hand-written assembly,
 # linked so that the calls resolve.
@@ -747,6 +767,7 @@ for mode in "" --fast; do
 done
 "$compiler" build "$cases/object-x86.ab" -o "$out/x86.o" --emit object --no-cache
 read_target x86_64 "$out/x86.o"
+owner_wipe_read x86_64 "$out/x86.o"
 # A --fast build keeps every Abla call as a call. The checker follows each one into its callee, which is
 # defined in the same object, with the argument secrecy the caller passes.
 # -g: the object is read for secret branches, and without debug information (tools/run-tests.sh builds
@@ -795,6 +816,7 @@ llvm-mc -triple aarch64-linux-gnu -filetype=obj tests/cases/simd/aarch64-start.s
 ld.lld -static --no-pie -z notext "$out/aarch64.o" "$out/aarch64-start.o" -o "$out/aarch64"
 qemu-aarch64 -cpu max "$out/aarch64" || { echo "ct aarch64: check $? failed" >&2; exit 1; }
 read_target aarch64 "$out/aarch64.o"
+owner_wipe_read aarch64 "$out/aarch64.o"
 # The allocation probe as an AArch64 object (built by the driver above): the same out-of-line check as x86-64.
 $check --expect-allocator aarch64 "$out/aarch64-alloc-probe.o" probe_bignum_allocate: probe_aes_expand: > "$out/alloc-probe-aarch64.log" 2>&1 || {
     cat "$out/alloc-probe-aarch64.log" >&2; echo "ct: the allocation entry is inlined or not called in an AArch64 object" >&2; exit 1
@@ -837,6 +859,7 @@ abla_xtensa_test_prepare "$tools_directory"
 abla_xtensa_test_build "$compiler" "$tools_directory" build "$cases/object.ab" -o "$out/xtensa.o" --no-cache \
     --target-triple xtensa-esp-unknown-elf --object-format elf --emit object
 read_target xtensa "$out/xtensa.o"
+owner_wipe_read xtensa "$out/xtensa.o"
 # The same probe for Xtensa, whose calls name the entry by relocation against its section.
 abla_xtensa_test_build "$compiler" "$tools_directory" build "$cases/alloc-probe.ab" -o "$out/alloc-probe-xtensa.o" --no-cache \
     --target-triple xtensa-esp-unknown-elf --object-format elf --emit object
