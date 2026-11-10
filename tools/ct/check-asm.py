@@ -43,11 +43,40 @@ def xtensa_literal_symbols(path):
     return XT_LITERALS[path]
 
 
+DISASSEMBLY = {}
+PREFETCHED = {}
+
+
+def disassembly(path, extra, names=()):
+    key = (path, tuple(extra), tuple(names))
+    if key not in DISASSEMBLY:
+        DISASSEMBLY[key] = subprocess.run(
+            [OBJDUMP, "-d", "--no-show-raw-insn", *(["--disassemble-symbols=" + ",".join(names)] if names else []),
+             *extra, *(["-r"] if not path.endswith(".wasm") else []), path],
+            capture_output=True, text=True, check=True).stdout
+    return DISASSEMBLY[key]
+
+
+def prefetch(path, extra, names):
+    """The functions a check is about to read, disassembled by one objdump run instead of one each (every run
+    parses the whole object; a dump of the whole object costs more than the few functions read)."""
+    if names:
+        PREFETCHED.setdefault((path, tuple(extra)), []).append(disassembly(path, extra, names))
+
+
 def disassemble(path, name, extra=()):
-    text = subprocess.run(
-        [OBJDUMP, "-d", "--no-show-raw-insn", "--disassemble-symbols=" + name, *extra,
-         *(["-r"] if not path.endswith(".wasm") else []), path],
-        capture_output=True, text=True, check=True).stdout
+    for candidate in PREFETCHED.get((path, tuple(extra)), []):
+        if f"<{name}>:\n" in candidate:
+            try:
+                return parse_disassembly(path, name, candidate)
+            except SystemExit:
+                # Names at one address print their headers together and the body under the last of them:
+                # ask for this name alone, as a check without a prefetch does.
+                break
+    return parse_disassembly(path, name, disassembly(path, extra, (name,)))
+
+
+def parse_disassembly(path, name, text):
     lines = []
     active = False
     for line in text.splitlines():
@@ -2315,6 +2344,8 @@ def main():
                 failed = 1
         print(f"     {arch}: {sum(sites.values())} direct call sites to the entry in {len(sites)} functions")
         sys.exit(failed)
+    if arch != "wasm":
+        prefetch(path, ["--mcpu=esp32"] if arch == "xtensa" else [], [parse_spec(spec)[0] for spec in specs])
     for spec in specs:
         name, secret, pointers = parse_spec(spec)
         if HEADERS.get(name) and arch not in HEADER_CHECKERS:

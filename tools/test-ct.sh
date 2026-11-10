@@ -235,6 +235,14 @@ header_allocator() {
     fi
     grep -q 'the allocation entry is given a secret' "$out/$file-alloc_secret_size.log" || { cat "$out/$file-alloc_secret_size.log" >&2; exit 1; }
     echo "ok   $arch checker: the allocation entry takes a public size and returns secret memory (1 clean, 2 controls)"
+    # Two names at one address in one check (the entry and the symbol the compiler gave it): a dump that lists
+    # them together prints the body under the last, and each must still be read.
+    if [[ $arch == x86_64 ]]; then
+        $check "$arch" "$out/$file" abla_ct_allocate: abla_fn_1234_5678_direct: > "$out/$file-aliases.log" 2>&1 || {
+            cat "$out/$file-aliases.log" >&2; echo "ct: two names at one address were not both read on $arch" >&2; exit 1
+        }
+        [[ $(grep -c '^ok' "$out/$file-aliases.log") -eq 2 ]] || { cat "$out/$file-aliases.log" >&2; exit 1; }
+    fi
 }
 
 # Secret residue: what a secret-handling call leaves in memory that nothing wipes. The register allocator spills
