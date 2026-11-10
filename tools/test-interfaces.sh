@@ -50,6 +50,7 @@ for mode in interp jit; do
     runs lift "shape of 12 21 true" "$mode"
     runs inheritance "45 24 cube of 8 shape of 9 cube of 8 cube true"$'\n'"45 24 cube of 8 shape of 9 cube of 8 cube true" "$mode"
     runs implementers " a1 a2 b2 b1 i4 i3 j3 i3 true"$'\n'" a1 a2 b2 b1 i4 i3 j3 i3 true" "$mode"
+    runs index-edits "15 #abla" "$mode"
     runs sealed "(2 + 3 * -4) = -10; square 2 round 9 none"$'\n'"(2 + 3 * -4) = -10; square 2 round 9 none" "$mode"
     runs direct-default $'shape of 9 18 shape of 9 18\nsolid of 6 shape of 1 x\nshape of 4 48 q' "$mode" 0
     runs api $'shape of 4\npoint\nsquare 3\n Shape Labeled | Square Point | area:method describe:default | area:extension describe:extension | false' "$mode" 0
