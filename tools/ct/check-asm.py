@@ -18,6 +18,7 @@ the function's jumps. It's conservative: whatever an instruction writes is secre
 anything it reads is. A call to anything but the listed helpers is a failure, because what it
 does isn't known. Loads through a public pointer are public unless `@` says otherwise.
 """
+import heapq
 import re
 import subprocess
 import sys
@@ -166,13 +167,18 @@ def fixpoint(lines, start, step, successors):
     """Forward taint: `step` returns the state after an instruction, raising on a violation."""
     index = {address: i for i, (address, _) in enumerate(lines)}
     states = {0: start}
+    # The lowest instruction first, each queued once: a loop's body is stepped again only after all that flows into
+    # it has, which needs a fraction of the steps of a stack (an unoptimised Xtensa function of 27,000 instructions
+    # took 282,000 steps that way, 42,000 this way).
     work = [0]
+    queued = {0}
     guard = 0
     while work:
         guard += 1
         if guard > 3000000:
             raise SystemExit("no fixed point")
-        i = work.pop()
+        i = heapq.heappop(work)
+        queued.discard(i)
         address, text = lines[i]
         out = step(states[i], text, address)
         for s in successors(text, i, index):
@@ -182,7 +188,9 @@ def fixpoint(lines, start, step, successors):
             new = out if old is None else (old | out)
             if new != old:
                 states[s] = new
-                work.append(s)
+                if s not in queued:
+                    queued.add(s)
+                    heapq.heappush(work, s)
     return states
 
 
@@ -1920,6 +1928,7 @@ def check_xtensa(lines, secret, pointers):
         results are public; a division by a secret or of one is a secret division, any other helper's results
         are as secret as its arguments. __muldi3 is constant-time where the core has the 32-bit multiplier (MUL32: the
         ESP32 and ESP32-S3 do), which is what the secret-operand propagation here relies on."""
+        tags = tags_of(state)
         state = set(state)
         arguments = [f"a{rotation + k}" for k in range(2, 6) if rotation + k <= 15]  # two 64-bit operands
         secret = any(a in state for a in arguments)
@@ -1933,8 +1942,7 @@ def check_xtensa(lines, secret, pointers):
         for r in range(rotation, 16):
             for tag in (f"a{r}", f"ptr:a{r}", f"stackbase:a{r}"):
                 state.discard(tag)
-            for tag in [x for x in state if x.startswith((f"sb:a{r}:", f"const:a{r}:"))]:
-                state.discard(tag)
+            drop_register(state, tags, f"a{r}")
         if secret:
             state.update(f"a{rotation + k}" for k in (2, 3) if rotation + k <= 15)
         return frozenset(state)
@@ -1943,6 +1951,7 @@ def check_xtensa(lines, secret, pointers):
         """The state after a windowed call to a function of the same object: its a2 to a7 are our a(rotation+2) up,
         checked as a function of its own on the arguments it reads; what it leaves in a2 and up comes back to
         a(rotation+2) and up, and our registers from a(rotation) on are the callee's window (dead)."""
+        held = tags_of(state)
         state = set(state)
         wipe = xt_scrub(name)
         if residue:
@@ -1964,8 +1973,7 @@ def check_xtensa(lines, secret, pointers):
             for r in range(rotation, 16):
                 for tag in (f"a{r}", f"ptr:a{r}", f"stackbase:a{r}"):
                     state.discard(tag)
-                for tag in [x for x in state if x.startswith((f"sb:a{r}:", f"const:a{r}:"))]:
-                    state.discard(tag)
+                drop_register(state, held, f"a{r}")
             return frozenset(state)
         inputs = callee_inputs_xtensa(name)
         tags = set()
@@ -1987,8 +1995,7 @@ def check_xtensa(lines, secret, pointers):
         for r in range(rotation, 16):
             for tag in (f"a{r}", f"ptr:a{r}", f"stackbase:a{r}"):
                 state.discard(tag)
-            for tag in [x for x in state if x.startswith((f"sb:a{r}:", f"const:a{r}:"))]:
-                state.discard(tag)
+            drop_register(state, held, f"a{r}")
         for k in range(2, 8):
             if rotation + k <= 15:
                 if f"a{k}" in out:
@@ -2001,21 +2008,44 @@ def check_xtensa(lines, secret, pointers):
             state.difference_update([x for x in state if x.startswith("fslot:")])
         return frozenset(state)
 
-    def frame_offset(state, register):
+    def frame_offset(tags, register):
         """How far `register` is above a1, when it is a1 itself or a copy of it plus a constant (an unoptimised
-        function addresses its frame through such a register), else None."""
+        function addresses its frame through such a register), else None. `tags` holds at least the state's sb: tags."""
         if register == "a1":
             return 0
-        values = [tag.split(":")[2] for tag in state if tag.startswith(f"sb:{register}:")]
+        values = [tag.split(":")[2] for tag in tags if tag.startswith(f"sb:{register}:")]
         return int(values[0]) if len(values) == 1 else None
 
+    # A state holds a tag per secret frame byte; the register tags a step reads (frame offsets, constants, header
+    # pointers, spilled frame addresses) are few. They are picked out once per state, not by a scan per question.
+    register_tags = {}
+
+    def tags_of(state):
+        if not isinstance(state, frozenset):
+            return [x for x in state if x.startswith(("sb:", "const:", "hdrp:", "fslot:"))]
+        found = register_tags.get(state)
+        if found is None:
+            if len(register_tags) > 20000:
+                register_tags.clear()
+            found = register_tags[state] = [x for x in state if x.startswith(("sb:", "const:", "hdrp:", "fslot:"))]
+        return found
+
+    def drop_register(state, tags, register, base=False):
+        """Forget what `register` held: its frame offset and constant (and, with `base`, that it is a frame address)."""
+        state.difference_update([x for x in tags if x.startswith((f"sb:{register}:", f"const:{register}:"))])
+        if base:
+            # As the prefix match before: stackbase:a1 also named a10 to a15.
+            state.difference_update([x for x in state if x.startswith(f"stackbase:{register}")]
+                                    if register == "a1" else [f"stackbase:{register}"])
+
     def step(state, text, address):
+        tags = tags_of(state)
         state = set(state)
         parts = text.split(None, 1)
         op = parts[0]
         ops = [o.strip() for o in parts[1].split(",")] if len(parts) > 1 else []
         t = lambda o: o in state
-        if any(item.startswith("hdrp:") for item in state):
+        if any(item.startswith("hdrp:") for item in tags):
             # A header-public pointer is one only while its register is never written: a call (the window moves and
             # the callee may write through it), or any instruction naming it first, other than a store or a branch.
             if op.startswith(("call", "callx")):
@@ -2039,8 +2069,7 @@ def check_xtensa(lines, secret, pointers):
             for r in range(rotation, 16):
                 for tag in (f"a{r}", f"ptr:a{r}", f"stackbase:a{r}", f"hdrp:a{r}"):
                     state.discard(tag)
-                for tag in [x for x in state if x.startswith((f"sb:a{r}:", f"const:a{r}:"))]:
-                    state.discard(tag)
+                drop_register(state, tags, f"a{r}")
                 state.add(f"lost:a{r}")
             state.discard("lost:" + pointer)
             state.add("ptr:" + pointer)
@@ -2054,9 +2083,9 @@ def check_xtensa(lines, secret, pointers):
         if ops and ops[0] == "a1" and op in ("addi", "addi.n", "add", "add.n", "addmi", "mov", "mov.n"):
             if any(item.startswith(("slot:", "ptrslot:")) for item in state):
                 state.add("stack-moved")
-            if any(item.startswith("fslot:") for item in state):
+            if any(item.startswith("fslot:") for item in tags):
                 state.add("xframeleak")
-                state.difference_update([x for x in state if x.startswith("fslot:")])
+                state.difference_update([x for x in tags if x.startswith("fslot:")])
         if op in ("quos", "quou", "rems", "remu") and any(t(o) for o in ops[1:]):
             raise Violation(f"secret division: {text}")
         m = re.match(r"^(l8ui|l16ui|l16si|l32i|l32i\.n)$", op)
@@ -2067,7 +2096,7 @@ def check_xtensa(lines, secret, pointers):
             if FOLLOW["write_only"] and "ptr:" + base in state:
                 raise Violation(f"reads the secret memory it may only overwrite: {text}")
             size = 1 if op.startswith("l8") else 2 if op.startswith("l16") else 4
-            at = frame_offset(state, base)
+            at = frame_offset(tags, base)
             slots = [f"slot:{at + int(offset, 0) + i}" for i in range(size)] if at is not None else []
             public_header = ("hdrp:" + base in state and "lost:" + base not in state and
                              re.fullmatch(r"-?(0x[0-9a-f]+|\d+)", offset) is not None and 0 <= int(offset, 0) < HEADER_BYTES)
@@ -2081,10 +2110,9 @@ def check_xtensa(lines, secret, pointers):
             (state.add if pointer else state.discard)("ptr:" + dest)
             # What was loaded is neither a frame address nor a known constant, whatever the register held before,
             # unless it is a frame address this function spilled to that slot (fslot).
-            for tag in [x for x in state if x.startswith((f"sb:{dest}:", f"const:{dest}:", f"stackbase:{dest}"))]:
-                state.discard(tag)
+            drop_register(state, tags, dest, base=True)
             if size == 4 and slots:
-                spilled = [x.split(":")[2] for x in state if x.startswith(f"fslot:{at + int(offset, 0)}:")]
+                spilled = [x.split(":")[2] for x in tags if x.startswith(f"fslot:{at + int(offset, 0)}:")]
                 state.update(f"sb:{dest}:{v}" for v in spilled)
                 if spilled:
                     state.add("stackbase:" + dest)
@@ -2097,23 +2125,23 @@ def check_xtensa(lines, secret, pointers):
             source, base, offset = ops[0], ops[1], ops[2] if len(ops) > 2 else "0"
             if t(base):
                 raise Violation(f"secret address: {text}")
-            at = frame_offset(state, base)
+            at = frame_offset(tags, base)
             size = 1 if op.startswith("s8") else 2 if op.startswith("s16") else 4
-            if any(item.startswith("hdrp:") for item in state) and t(source) and at is None:
+            if any(item.startswith("hdrp:") for item in tags) and t(source) and at is None:
                 raise Violation(f"secret stored through an object pointer or outside the frame: {text}")
             if at is None and t(source) and ("stackbase:" + base in state or "xframeleak" in state):
                 # Through a frame address whose offset is not known: any slot may hold the secret now.
                 state.add("frame-dirty")
             if at is not None:
                 where = at + int(offset, 0)
-                for tag in [x for x in state if x.startswith("fslot:")
+                for tag in [x for x in tags if x.startswith("fslot:")
                             if where < int(x.split(":")[1]) + 4 and int(x.split(":")[1]) < where + size]:
                     state.discard(tag)
             if "stackbase:" + source in state:
                 # A frame address spilled: to a placed slot it is remembered (a reload gives it back), anywhere else
                 # it is lost track of, and a secret stored through what is not placed may then be in the frame.
-                if at is not None and size == 4 and frame_offset(state, source) is not None:
-                    state.add(f"fslot:{at + int(offset, 0)}:{frame_offset(state, source)}")
+                if at is not None and size == 4 and frame_offset(tags, source) is not None:
+                    state.add(f"fslot:{at + int(offset, 0)}:{frame_offset(tags, source)}")
                 else:
                     state.add("xframeleak")
             if at is not None:
@@ -2136,8 +2164,7 @@ def check_xtensa(lines, secret, pointers):
         if op == "l32r":
             state.discard(ops[0])
             state.discard("ptr:" + ops[0])
-            for tag in [x for x in state if x.startswith((f"sb:{ops[0]}:", f"const:{ops[0]}:", f"stackbase:{ops[0]}"))]:
-                state.discard(tag)
+            drop_register(state, tags, ops[0], base=True)
             return frozenset(state)
         if not ops:
             return frozenset(state)
@@ -2150,35 +2177,36 @@ def check_xtensa(lines, secret, pointers):
         # Registers that are a1 plus a constant, or a constant (a big frame is addressed through `movi aN, 1440` and
         # `add.n aD, a7, aN`).
         # A constant only if the paths that meet here agree on it (states join by union, so two values may be there).
-        known = lambda register: [int(x.split(":")[2]) for x in state if x.startswith(f"const:{register}:")]
+        known = lambda register: [int(x.split(":")[2]) for x in tags if x.startswith(f"const:{register}:")]
         constant = lambda register: known(register)[0] if len(known(register)) == 1 else None
         fresh = []
         if op in ("movi", "movi.n") and len(ops) == 2:
             fresh.append(f"const:{dest}:{int(ops[1], 0)}")
         elif op in ("mov", "mov.n") and len(ops) == 2:
-            if frame_offset(state, ops[1]) is not None:
-                fresh.append(f"sb:{dest}:{frame_offset(state, ops[1])}")
+            if frame_offset(tags, ops[1]) is not None:
+                fresh.append(f"sb:{dest}:{frame_offset(tags, ops[1])}")
             if constant(ops[1]) is not None:
                 fresh.append(f"const:{dest}:{constant(ops[1])}")
         elif op in ("addi", "addi.n", "addmi") and len(ops) == 3:
             step_by = int(ops[2], 0) * (256 if op == "addmi" else 1)
-            if frame_offset(state, ops[1]) is not None:
-                fresh.append(f"sb:{dest}:{frame_offset(state, ops[1]) + step_by}")
+            if frame_offset(tags, ops[1]) is not None:
+                fresh.append(f"sb:{dest}:{frame_offset(tags, ops[1]) + step_by}")
             if constant(ops[1]) is not None:
                 fresh.append(f"const:{dest}:{constant(ops[1]) + step_by}")
         elif op in ("add", "add.n") and len(ops) == 3:
-            if frame_offset(state, ops[1]) is not None and constant(ops[2]) is not None:
-                fresh.append(f"sb:{dest}:{frame_offset(state, ops[1]) + constant(ops[2])}")
-            elif frame_offset(state, ops[2]) is not None and constant(ops[1]) is not None:
-                fresh.append(f"sb:{dest}:{frame_offset(state, ops[2]) + constant(ops[1])}")
+            if frame_offset(tags, ops[1]) is not None and constant(ops[2]) is not None:
+                fresh.append(f"sb:{dest}:{frame_offset(tags, ops[1]) + constant(ops[2])}")
+            elif frame_offset(tags, ops[2]) is not None and constant(ops[1]) is not None:
+                fresh.append(f"sb:{dest}:{frame_offset(tags, ops[2]) + constant(ops[1])}")
             if constant(ops[1]) is not None and constant(ops[2]) is not None:
                 fresh.append(f"const:{dest}:{constant(ops[1]) + constant(ops[2])}")
-        for tag in [x for x in state if x.startswith((f"sb:{dest}:", f"const:{dest}:"))]:
-            state.discard(tag)
+        drop_register(state, tags, dest)
         state.update(fresh)
+        # The register tags after this instruction: dest's replaced by what it holds now.
+        tags = [x for x in tags if not x.startswith((f"sb:{dest}:", f"const:{dest}:"))] + fresh
         if op in ("addi", "addi.n", "mov", "mov.n", "or", "add", "add.n", "addmi", "addx2", "addx4", "addx8"):
             # An address in this function's frame (a1 plus something): a callee given it may write through it.
-            if any(o == "a1" or "stackbase:" + o in state or frame_offset(state, o) is not None for o in ops[1:]):
+            if any(o == "a1" or "stackbase:" + o in state or frame_offset(tags, o) is not None for o in ops[1:]):
                 state.add("stackbase:" + dest)
                 state.add("frameaddr")
             else:
