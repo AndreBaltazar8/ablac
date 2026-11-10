@@ -200,6 +200,15 @@
   Eighth growth (branch `fuzz-grow9`): `abla/regex` capture groups (`hasGroup`, `groupStart`, `groupEnd`,
   `group`, `matchFull`, replacement templates `$1`, `${1}x`, `$9`, `$$1`); seeds 1201 to 1240 agree in all
   six modes.
+  Ninth growth (branch `fuzz-651`, ablac-e5): classes named `T`, `U`, `K` in the prelude beside every
+  generic whose type parameter has the same name, and a `clash_check` over them. It found #733's reach (a
+  flat `class T` broke the strict standard library's generics) and #742 (a class parameter bound to a class
+  of its own name held back a method's lambda, fixed). Open, same family, the other direction: a
+  parameter bound to a class named like a parameter still open, `class R(...)`,
+  `fun <T, R> viaOpen(a: T, f: (T) -> R): R`, `viaOpen(R(2)) { x -> ... }` gives
+  `generic.cannot-infer:viaOpen:R`, since the substituted type spells the open `R`; the fix is to
+  substitute through placeholders no source can spell, not the source spelling. The generator does not draw
+  it yet.
 
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 

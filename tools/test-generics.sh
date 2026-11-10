@@ -146,5 +146,12 @@ incremental $'second 1\n3'
 output=$(run "$output_directory/parameter-capture")
 [[ $output == $'3 10 5\nstatus 42' ]] ||
     { echo "generics, parameter named like a class: $output" >&2; exit 1; }
+# (A parameter nothing binds still is cannot-infer.)
+if "$compiler" build "$project_root/tests/cases/generic-type-parameter-capture/open.ab" \
+    -o "$output_directory/parameter-open" --no-cache > "$output_directory/parameter-open.err" 2>&1; then
+    echo "generics, an unbound parameter next to a lambda: the build succeeded" >&2; exit 1
+fi
+grep -qF 'generic.cannot-infer:both:R' "$output_directory/parameter-open.err" ||
+    { cat "$output_directory/parameter-open.err" >&2; echo "generics: no cannot-infer for R" >&2; exit 1; }
 
 echo "generics: generic functions, extensions and classes compute what they should (built and under ablac run), private and strict-imports generics resolve, the compiler API reads and makes instances, misuses are the errors they should be, and an edited generic rebuilds its instances"
