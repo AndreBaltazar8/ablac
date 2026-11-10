@@ -26,7 +26,7 @@ for mode in interp jit; do
     output=$("$output_directory/main-$mode")
     status=$?
     set -e
-    [[ $status -eq 42 && $output == "341 251 687 1279" ]] ||
+    [[ $status -eq 42 && $output == "341 251 687 1279 341" ]] ||
         fail "$mode: status $status, output: $output"
 done
 
