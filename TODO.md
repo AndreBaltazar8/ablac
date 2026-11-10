@@ -1923,3 +1923,10 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   `declarations[node].name == name` (a renamed or replaced slot falls back to the scan), and the
   test is a staged transform that annotates a class and one that drops an extension field
   followed by a conformance query through the index, compared with the scan's answer.
+  Prototype measured (branch iface-names, local, ablac-52, 2026-11-10): the `when` arm check, the
+  analyzer's `conformsTo` and the method-declaration defaults through the name index (a
+  per-node name check, size guard, scan fallback): NovaKind `--fast` build, sampled
+  instructions (×8M), alternating, one run per slot hold: `iface-index` 26,540 / 26,597 /
+  26,700, with the index 25,843 / 25,935 (a first run after a fresh build was 29,456 each time a
+  new compiler was first measured; excluded, it is a cold-cache run) = −2.7% of the whole build.
+  Under the ceiling above because the evaluator's and lowering's own scans remain.
