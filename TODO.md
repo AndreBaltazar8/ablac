@@ -968,6 +968,26 @@
   is a resource that closes its descriptor when dropped, so reusing one object needs a change to the resource rules;
   `HttpEventFrame` (3 fields) is a return object of a public function. Word-wise scans of the header block do not pay
   (above). So the remaining gap to Zig is spread over about 20 sites of 100 to 400 instructions each, with no single cut over 3%.
+  Where the event server's per-request objects live, and what the allocator costs (2026-11-10, #763, same setup, plaintext):
+  the no-escape path (`httpEventServerNoEscapeHandler`, what abla-web's `webNoEscapeRoute` routes use) runs the whole request
+  inside `processNoEscapeSlot`'s `region`, so the request, header, response and frame objects are bump-allocated and freed with
+  the region: 7,853 instructions and about 2,800 cycles per request. The escaping path (`httpEventServer` with a router, or
+  `httpEventServerHandler`) parses and dispatches outside a region, because the handler may keep the request or the response:
+  the same handler costs 13,348 instructions and 7,800 cycles (+70% and 2.8x in the first run; cycles later read 15,000 to
+  23,000 for both versions on a loaded machine, so quote instructions). Its profile (instructions, share of the request):
+  `memoryPromoteString` 15.8% (the response copied out of the response region one byte at a time through `value[index]`, about
+  2,100 instructions for 150 bytes; branch `promote-copy` copies it with one memory copy: 13,347 to 12,195, -8.5%),
+  `httpParseRequest` 11.4%, `ObjectBlock` 9.3% (4.7% on the no-escape path), the collector's pressure collections 6.6% plus its
+  page bitmaps 2.2%, `processSlot` 6.0%, `HttpEventServer.step` 4.4%. glibc `malloc` and `free` are under 1% of both paths
+  (`_int_malloc` 0.7%, `memmove` 2.3%, `memset` 1.2%). A plain loop that creates objects outside a region spends 43% in
+  `malloc`; that was measured, its cause was not. It fits a loop that frees nothing until a collection, so every object is
+  a fresh `malloc`, while the server's blocks come back through the collector's lists and `malloc` is rarely reached, but
+  that is an inference. So (1) the no-escape path has its objects in a region already; (2) the escaping path
+  pays for managed-heap objects and their collection, not for `malloc`; (3) running the escaping path's request inside a region
+  reset between requests would free objects a handler is allowed to retain (a stored `HttpRequest`, a response kept for a
+  retry), so it needs the handler's promise not to retain, which is the no-escape handler type that exists. The lever for
+  applications that use the router is therefore to give `HttpRouter.dispatch` a no-escape form (the route handlers of
+  abla-web already take it) and to keep the escaping path for handlers that really retain, not a hidden region.
 - [x] **`abla-compare` json-strings-4k, one worker, rechecked** (2026-11-10, master `7c706497`'s runtime, the setup of the
   headers-32 entry; the 2026-11-06 matrix had Abla 91,781 requests/s against Rust 120,887, -24.1%, and a profile of
   52.3% `jsonPlainStringEnd` + 25.2% `jsonStringIsPlain`): instructions per request, three runs each, Abla 64,308
