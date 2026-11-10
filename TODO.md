@@ -20,7 +20,7 @@
 
 ## Bugs seen
 
-- [ ] **A contract import does not carry a class its module reaches only through another module
+- [x] **A contract import does not carry a class its module reaches only through another module
   (NovaKind report 98, #698).** `import contract "api.ab"` where `api.ab` imports `mid.ab`, `mid.ab`
   imports `lib.ab`, and `lib.ab` declares `class Payload`, with `@server fun remote(): Payload` in `api.ab`:
   the client sees `Payload` as a nominal type (`compilerFindType` answers) but there is no declaration
@@ -42,6 +42,20 @@
   methods) before the app's ordinary import loads them in full. A fix has to load only the module that
   declares the class, skip modules the program loads in full anyway, and keep the contract-first and
   ordinary-first registration orders (tests/cases/contract-registration). The patch is not kept.
+  **Fixed** (2026-11-10, `loadContract` in src/module.ab): when the direct import is not required, the
+  module's plain imports are searched (`contractDeclarers`) for modules that declare a class the contract's
+  shape mentions, and only those are loaded for the contract, with an edge from the contract module to
+  each (not to the modules between). A contract module that is later loaded in full gets those extra edges
+  dropped (`dropContractLoad`; they would otherwise make a second contract copy of a module the program
+  also loads, `symbol.duplicate` on the standard library's json in NovaKind's app.ab), and the placeholders
+  are removed before the graph is parsed. Tests: `tests/cases/contract-transitive` (the class only through
+  another module, a module also imported in full in either order, the contract module imported in full
+  elsewhere, the standard library's `Json` behind a middle module), run by `tools/test-contract-imports.sh`.
+  NovaKind's `at-saft-client-state.ab` (3,312 errors) and `app.ab` build. Cost: a plain self-build
+  `--emit-llvm` 73.88 G against 73.96 G instructions, and NovaKind's `app.ab` (a 60-import client) 670.7 G
+  against 672.3 G (instructions:u, one build each, P-cores). Two classes of the same name in one closure is
+  still E_IMPORT_UNQUALIFIED_AMBIGUOUS before any contract logic; mention matching is by name, as the
+  direct rule's is.
 
 - [x] **Master's Linux job failed from e031754a to 66d3dfec (2026-11-07), two flakes.** (1)
   `tests/cases/run-limited/parent-death.py`: the worker wrote `parent` once `child` existed, but
