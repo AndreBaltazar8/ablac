@@ -310,9 +310,12 @@
     256·k bytes off. The immediate is now read from the instruction's third byte.
   - A load (or `l32r`) kept its destination register's frame-offset and constant tags, so a heap store through a
     register that had once held a frame address was placed in the frame. Loads now clear them, as calls do for the
-    callee's window.
+    callee's window. A frame address spilled to a placed slot is remembered there, so its reload is placed again
+    (the record goes with any store into those bytes, a move of a1 or a call given a frame address). A frame
+    address stored anywhere else, or lost that way, makes a later secret stored through an unplaced register dirty
+    the whole frame (review by ablac-19: controls `reload_same`, `reload_clean` and `reload_moved`).
   - On master both ways go wrong: a real secret branch on such a slot is missed, and a public neighbour is reported.
-    The four controls in `frame-place-xtensa.s` are each the reverse on master.
+    The first four controls in `frame-place-xtensa.s` are each the reverse on master.
   - With the slots placed, the largest --fast function (secret_inverse, 27,047 instructions) takes more than the old
     200,000 fixpoint steps, so the guard is now 3,000,000. A register's constant counts only where the paths that
     meet agree on it.

@@ -92,3 +92,60 @@ place_reload_heap:
 1:
 	retw.n
 	.size	place_reload_heap, .-place_reload_heap
+
+// A frame address spilled to a slot and reloaded is placed again (spec `:0`, a2 secret):
+//   reload_same    a7+16 spilled to a7+32, reloaded, the secret stored through it, a branch on a7+16: found
+//   reload_clean   the same, the branch on a7+48: clean
+//   reload_moved   the same, but a1 moves between the spill and the reload (the record is dropped, the reloaded
+//                  address is not placed): the secret stored through it may be anywhere in the frame, found
+	.section	.text.reload_same,"ax",@progbits
+	.align	4
+	.global	reload_same
+	.type	reload_same,@function
+reload_same:
+	entry	a1, 128
+	mov.n	a7, a1
+	addi	a8, a7, 16
+	s32i	a8, a7, 32
+	l32i	a8, a7, 32
+	s32i.n	a2, a8, 0
+	l32i.n	a11, a7, 16
+	beqz	a11, 1f
+1:
+	retw.n
+	.size	reload_same, .-reload_same
+
+	.section	.text.reload_clean,"ax",@progbits
+	.align	4
+	.global	reload_clean
+	.type	reload_clean,@function
+reload_clean:
+	entry	a1, 128
+	mov.n	a7, a1
+	addi	a8, a7, 16
+	s32i	a8, a7, 32
+	l32i	a8, a7, 32
+	s32i.n	a2, a8, 0
+	l32i.n	a11, a7, 48
+	beqz	a11, 1f
+1:
+	retw.n
+	.size	reload_clean, .-reload_clean
+
+	.section	.text.reload_moved,"ax",@progbits
+	.align	4
+	.global	reload_moved
+	.type	reload_moved,@function
+reload_moved:
+	entry	a1, 128
+	mov.n	a7, a1
+	addi	a8, a7, 16
+	s32i	a8, a7, 32
+	addi	a1, a1, -16
+	l32i	a8, a7, 32
+	s32i.n	a2, a8, 0
+	l32i.n	a11, a7, 16
+	beqz	a11, 1f
+1:
+	retw.n
+	.size	reload_moved, .-reload_moved

@@ -502,12 +502,18 @@ xtensa_place_read() {
         fi
         grep -q 'secret branch' "$out/xt-$entry.log" || { cat "$out/xt-$entry.log" >&2; exit 1; }
     done
-    for entry in place_addmi_other place_reload_heap; do
-        $check xtensa "$out/frame-place-xtensa.o" "$entry:0,@1" > "$out/xt-$entry.log" 2>&1 || {
-            cat "$out/xt-$entry.log" >&2; echo "ct: $entry was reported on xtensa" >&2; exit 1
+    for entry in reload_same reload_moved; do
+        if $check xtensa "$out/frame-place-xtensa.o" "$entry:0" > "$out/xt-$entry.log" 2>&1; then
+            echo "ct: missed $entry on xtensa" >&2; exit 1
+        fi
+        grep -q 'secret branch' "$out/xt-$entry.log" || { cat "$out/xt-$entry.log" >&2; exit 1; }
+    done
+    for entry in place_addmi_other:0,@1 place_reload_heap:0,@1 reload_clean:0; do
+        $check xtensa "$out/frame-place-xtensa.o" "$entry" > "$out/xt-${entry%%:*}.log" 2>&1 || {
+            cat "$out/xt-${entry%%:*}.log" >&2; echo "ct: ${entry%%:*} was reported on xtensa" >&2; exit 1
         }
     done
-    echo "ok   xtensa frame slots: addmi's immediate and reloaded registers placed, two secret slots found, two neighbours clean"
+    echo "ok   xtensa frame slots: addmi's immediate and reloaded registers placed, a spilled frame address reloaded, four secret slots found, three neighbours clean"
 }
 
 # A callee that writes a secret through an address of the caller's own frame (made by lea or by mov from rsp)

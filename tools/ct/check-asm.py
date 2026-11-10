@@ -1997,6 +1997,8 @@ def check_xtensa(lines, secret, pointers):
                     state.add(f"ptr:a{rotation + k}")
         if frame_address:
             state.add("frame-dirty")
+            # It may have overwritten a spilled frame address; what is reloaded is unplaced, and the frame is dirty.
+            state.difference_update([x for x in state if x.startswith("fslot:")])
         return frozenset(state)
 
     def frame_offset(state, register):
@@ -2052,6 +2054,9 @@ def check_xtensa(lines, secret, pointers):
         if ops and ops[0] == "a1" and op in ("addi", "addi.n", "add", "add.n", "addmi", "mov", "mov.n"):
             if any(item.startswith(("slot:", "ptrslot:")) for item in state):
                 state.add("stack-moved")
+            if any(item.startswith("fslot:") for item in state):
+                state.add("xframeleak")
+                state.difference_update([x for x in state if x.startswith("fslot:")])
         if op in ("quos", "quou", "rems", "remu") and any(t(o) for o in ops[1:]):
             raise Violation(f"secret division: {text}")
         m = re.match(r"^(l8ui|l16ui|l16si|l32i|l32i\.n)$", op)
@@ -2074,9 +2079,15 @@ def check_xtensa(lines, secret, pointers):
             )
             (state.add if value else state.discard)(dest)
             (state.add if pointer else state.discard)("ptr:" + dest)
-            # What was loaded is neither a frame address nor a known constant, whatever the register held before.
+            # What was loaded is neither a frame address nor a known constant, whatever the register held before,
+            # unless it is a frame address this function spilled to that slot (fslot).
             for tag in [x for x in state if x.startswith((f"sb:{dest}:", f"const:{dest}:", f"stackbase:{dest}"))]:
                 state.discard(tag)
+            if size == 4 and slots:
+                spilled = [x.split(":")[2] for x in state if x.startswith(f"fslot:{at + int(offset, 0)}:")]
+                state.update(f"sb:{dest}:{v}" for v in spilled)
+                if spilled:
+                    state.add("stackbase:" + dest)
             return frozenset(state)
         if FOLLOW["write_only"] and op == "s32c1i" and len(ops) > 1 and "ptr:" + ops[1] in state:
             # The compare-and-swap returns the old word in its first operand: a read of the memory.
@@ -2087,10 +2098,25 @@ def check_xtensa(lines, secret, pointers):
             if t(base):
                 raise Violation(f"secret address: {text}")
             at = frame_offset(state, base)
+            size = 1 if op.startswith("s8") else 2 if op.startswith("s16") else 4
             if any(item.startswith("hdrp:") for item in state) and t(source) and at is None:
                 raise Violation(f"secret stored through an object pointer or outside the frame: {text}")
+            if at is None and t(source) and ("stackbase:" + base in state or "xframeleak" in state):
+                # Through a frame address whose offset is not known: any slot may hold the secret now.
+                state.add("frame-dirty")
             if at is not None:
-                size = 1 if op.startswith("s8") else 2 if op.startswith("s16") else 4
+                where = at + int(offset, 0)
+                for tag in [x for x in state if x.startswith("fslot:")
+                            if where < int(x.split(":")[1]) + 4 and int(x.split(":")[1]) < where + size]:
+                    state.discard(tag)
+            if "stackbase:" + source in state:
+                # A frame address spilled: to a placed slot it is remembered (a reload gives it back), anywhere else
+                # it is lost track of, and a secret stored through what is not placed may then be in the frame.
+                if at is not None and size == 4 and frame_offset(state, source) is not None:
+                    state.add(f"fslot:{at + int(offset, 0)}:{frame_offset(state, source)}")
+                else:
+                    state.add("xframeleak")
+            if at is not None:
                 if residue and at + int(offset, 0) < 0:
                     # Under a1: a public value covers what a callee left there, a secret is left there itself. Only
                     # where a call has made the ABI guarantee the stack on every path to here.
