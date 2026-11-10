@@ -788,7 +788,7 @@ fun bootstrapLlvmEmitCtBarrier(backend: BootstrapLlvmBackend, value: i64*, lane:
 
 // ablaCtScrubStack<N>(): zeroes the N bytes below the stack pointer (docs/stdlib/ct.md; stdlib/abla/ct/scrub keeps it
 // in a @noinline function of its own, whose caller is then not a leaf and has no red zone), as `rep stosq` on
-// x86-64 and a store loop on AArch64; nothing elsewhere. Emitted here, per target, so that no other target's
+// x86-64 and a store loop on AArch64; nothing elsewhere (Xtensa: ablaCtScrubBoundedStack). Emitted here, per target, so that no other target's
 // assembly is ever in the module.
 fun bootstrapLlvmEmitCtScrubStack(backend: BootstrapLlvmBackend, name: string): bool {
     val bytes =
@@ -797,8 +797,26 @@ fun bootstrapLlvmEmitCtScrubStack(backend: BootstrapLlvmBackend, name: string): 
         else if (name == "ablaCtScrubStack2048") 2048
         else if (name == "ablaCtScrubStack4096") 4096
         else 0
-    if (bytes == 0) return false
     val arch = bootstrapLlvmSimdArch(backend.targetTriple)
+    if (name == "ablaCtScrubSaveAreas") {
+        // Inlined into the caller of the wipe, after it: the 32 bytes from a1-48 to a1-16 that the wipe function
+        // couldn't reach (its own frame and, under it, this function's a0-a3 save area while it ran). A callee's
+        // a4-a7 (call8) or a4-a11 (call12) go to the top 16 or 32 of these on an overflow. Below a1 and above a1-16
+        // (the save area of this function's caller), so nothing live is there between calls.
+        if (arch != BOOTSTRAP_SIMD_ARCH_XTENSA) return true
+        val clear =
+            "addi a9, a1, -48\nmovi a8, 0\ns32i a8, a9, 0\ns32i a8, a9, 4\ns32i a8, a9, 8\n" +
+            "s32i a8, a9, 12\ns32i a8, a9, 16\ns32i a8, a9, 20\ns32i a8, a9, 24\ns32i a8, a9, 28\nmovi a9, 0"
+        val clobbers = "~{a8},~{a9},~{memory}"
+        val clearType = bootstrapLlvmFunctionType(backend, backend.voidType, [])
+        bootstrapLlvmCallTyped(
+            backend, clearType,
+            LLVMGetInlineAsm(clearType, clear, clear.size, clobbers, clobbers.size, 1, 0, 0, 0),
+            [], ""
+        )
+        return true
+    }
+    if (bytes == 0) return false
     var assembly = ""
     var constraints = ""
     if (arch == BOOTSTRAP_SIMD_ARCH_X86_64) {
@@ -826,6 +844,71 @@ fun bootstrapLlvmEmitCtScrubStack(backend: BootstrapLlvmBackend, name: string): 
     true
 }
 
+// ablaCtScrubBoundedStack<N>(), Xtensa only (the other targets never call it: ablaCtScrubBounded): the wipe below
+// the stack pointer for a stack with no guard page under it. It stops at the address the image's
+// `abla_ct_stack_low()` returns (C ABI, external weak: absent, or returning 0, means no wipe; docs/stdlib/ct.md).
+// The symbol is chosen against a private stand-in returning 0 and called through the result (in a private function
+// of its own), so an image without it has no call to address 0 to relocate. Windowed ABI: the 16 bytes under a1 are where the caller's a0-a3 (its
+// return address and stack pointer) go on a window overflow, so the wipe starts under them; ablaCtScrubSaveAreas,
+// inlined in the caller after this returns, clears them and this function's own frame. Only live frames are ever
+// spilled, so what the work left in the register file can reach memory only through this function's a0-a7, which
+// go to those two places too. That needs this function's frame (`entry a1, N`) to be at most 32 bytes, the tail's
+// reach; tools/test-ct.sh reads N and fails otherwise.
+fun bootstrapLlvmEmitCtScrubBoundedStack(backend: BootstrapLlvmBackend, name: string): bool {
+    val bytes =
+        if (name == "ablaCtScrubBoundedStack512") 512
+        else if (name == "ablaCtScrubBoundedStack1024") 1024
+        else if (name == "ablaCtScrubBoundedStack2048") 2048
+        else if (name == "ablaCtScrubBoundedStack4096") 4096
+        else 0
+    if (bytes == 0) return false
+    if (bootstrapLlvmSimdArch(backend.targetTriple) != BOOTSTRAP_SIMD_ARCH_XTENSA) return true
+    val lowType = bootstrapLlvmFunctionType(backend, backend.i32Type, [])
+    var ask = LLVMGetNamedFunction(backend.module, "abla.ct.stack.low")
+    if (pointerIsNull(ask)) {
+        // One private function asks the image, so that the wipe's own frame stays the 32 bytes the tail reaches
+        // even unoptimised: it holds the select and the call through a register, the wipe only calls it.
+        var provided = LLVMGetNamedFunction(backend.module, "abla_ct_stack_low")
+        if (pointerIsNull(provided)) {
+            provided = LLVMAddFunction(backend.module, "abla_ct_stack_low", lowType)
+            LLVMSetLinkage(provided, llvmExternalWeakLinkage())
+        }
+        val resume = LLVMGetInsertBlock(backend.builder)
+        val none = LLVMAddFunction(backend.module, "abla.ct.stack.low.none", lowType)
+        LLVMSetLinkage(none, llvmPrivateLinkage())
+        LLVMPositionBuilderAtEnd(
+            backend.builder, LLVMAppendBasicBlockInContext(backend.context, none, "entry")
+        )
+        LLVMBuildRet(backend.builder, LLVMConstInt(backend.i32Type, 0, 0))
+        ask = LLVMAddFunction(backend.module, "abla.ct.stack.low", lowType)
+        LLVMSetLinkage(ask, llvmPrivateLinkage())
+        bootstrapLlvmAddFunctionAttribute(backend, ask, "noinline")
+        LLVMPositionBuilderAtEnd(
+            backend.builder, LLVMAppendBasicBlockInContext(backend.context, ask, "entry")
+        )
+        val absent = LLVMBuildICmp(
+            backend.builder, llvmIntEqual(), provided, LLVMConstNull(backend.pointerType), "absent"
+        )
+        val callee = LLVMBuildSelect(backend.builder, absent, none, provided, "function")
+        LLVMBuildRet(backend.builder, bootstrapLlvmCallTyped(backend, lowType, callee, [], "low"))
+        LLVMPositionBuilderAtEnd(backend.builder, resume)
+    }
+    val low = bootstrapLlvmCallTyped(backend, lowType, ask, [], "ct.stack.low")
+    // a8 walks down from a1-16 and a10 counts words; with a limit, the count is cut to the words above it.
+    val assembly =
+        "addi a8, a1, -16\nmovi a9, 0\nmovi a10, ${bytes / 4}\nbeqz \$0, 2f\nbgeu \$0, a8, 2f\n" +
+        "sub a11, a8, \$0\nsrli a11, a11, 2\nbeqz a11, 2f\nbgeu a11, a10, 1f\nmov a10, a11\n1:\n" +
+        "addi a8, a8, -4\ns32i a9, a8, 0\naddi a10, a10, -1\nbnez a10, 1b\n2:\nmovi a8, 0"
+    val constraints = "r,~{a8},~{a9},~{a10},~{a11},~{memory}"
+    val type = bootstrapLlvmFunctionType(backend, backend.voidType, [backend.i32Type])
+    bootstrapLlvmCallTyped(
+        backend, type,
+        LLVMGetInlineAsm(type, assembly, assembly.size, constraints, constraints.size, 1, 0, 0, 0),
+        [low], ""
+    )
+    true
+}
+
 // ablaCtSecret_<lane>(lane): the barrier; ablaCtBits_<lane>(secret): the same bits, public.
 fun bootstrapLlvmEmitCtIntrinsic(
     backend: BootstrapLlvmBackend,
@@ -842,7 +925,17 @@ fun bootstrapLlvmEmitCtIntrinsic(
         )
         return true
     }
-    if (name.startsWith("ablaCtScrubStack")) {
+    if (name == "ablaCtScrubBounded") {
+        // The targets whose wipe needs a limit from the image (no guard page under the stack): Xtensa.
+        val bounded = bootstrapLlvmSimdArch(backend.targetTriple) == BOOTSTRAP_SIMD_ARCH_XTENSA
+        val constant = LLVMConstInt(backend.i1Type, if (bounded) 1 else 0, 0)
+        bootstrapLlvmSetNativeValue(backend, storage, instruction.result, constant)
+        return true
+    }
+    if (name.startsWith("ablaCtScrubBoundedStack")) {
+        return bootstrapLlvmEmitCtScrubBoundedStack(backend, name)
+    }
+    if (name.startsWith("ablaCtScrubStack") || name == "ablaCtScrubSaveAreas") {
         return bootstrapLlvmEmitCtScrubStack(backend, name)
     }
     if (instruction.operands.size != 1) return false

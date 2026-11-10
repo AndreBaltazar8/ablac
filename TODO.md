@@ -232,14 +232,45 @@
   offsets the checker can't place, and what it loads from there reads as secret; those 16 are blind in the fast build,
   and their release read is the real check). Hand-written controls for all three:
   `follow-a64.s`, `follow-wasm.s`, `follow-xtensa.s`.
-- [ ] **Secret residue is checked for stack slots on x86-64 release only.** `--residue` fails an entry that returns with a
+- [ ] **Secret residue is checked for stack slots on x86-64 and AArch64 release and on Xtensa, not on Wasm.** `--residue` fails an entry that returns with a
   secret in a slot of its frame, or that gave a secret to a callee and didn't wipe the stack below it
   (`abla/ct/scrub`; the checker reads the callees' depth and the size of the wipe). Every fixture's residue entry
   (`@noinline` worker, then the wipe) passes, and `residue-known.txt` has no entries. The AES and RSA private entry
   points (including key reading, export and generation) and the password entries of `abla/crypto/pbe`
   (`cryptoPassword`, `pbeOpenPkcs8`, `pbeOpenPkcs12`) call the wipe and are run against it (the run scan reads an
   encrypted PKCS#8 (SHA-256 and SHA-1 PRF, AES-128 and -256, 3072- and 4096-bit keys) and a PKCS#12 (SHA-256 and SHA-1 MAC), each with the right password, a wrong one, a truncated input and a changed last byte; without the wipes the first three leave 704, 1,024 and 2,784 bytes). A panic inside an entry leaves the process and is not wiped. Not checked: registers (measured once: after `aesCbcEncryptPkcs7` returns, xmm0-15 hold only the constant masks 0x10, 0xff and 0x2f, no key or text bytes; the static checker can't read the real entries' registers, since they branch on secrets by design, and the fixtures return only their result in rax), the GC heap,
-  Wasm (no native stack to wipe) and Xtensa, and the `--fast` build. AArch64 is read like x86-64 (a secret left in a slot at `ret`, a callee's frames no wipe covered; the wipe is recognised only as exactly the `ctScrubStack` loop): 64 fixture entries clean and six hand controls in `residue-a64.s`; the real entry points are not run on AArch64. **Wasm** has a shadow stack in linear memory, but the release module of the real entries (AES-GCM/CBC, RSA sign/OAEP/key generation from DER and generated, PKCS#8/#12 opening; 88 functions, 2026-11-09) has no function that adjusts `__stack_pointer`: locals are Wasm locals and its arrays live on the heap, so there is no stack residue to read, and the constant-time fixtures' release module has none either (112 functions). The `--fast` module has frames only in runtime helpers (string and array growth, `to_string`) and `wasm.checks`. No Wasm residue check was built; what a browser's JS could read is the freed heap (collected arrays are not zeroed), a zeroization question for the allocator, not a stack wipe.
+  Wasm (no native stack to wipe), and the x86-64 and AArch64 `--fast` builds. AArch64 is read like x86-64 (a secret left in a slot at `ret`, a callee's frames no wipe covered; the wipe is recognised only as exactly the `ctScrubStack` loop): 64 fixture entries clean and six hand controls in `residue-a64.s`; the real entry points are not run on AArch64. **Wasm** has a shadow stack in linear memory, but the release module of the real entries (AES-GCM/CBC, RSA sign/OAEP/key generation from DER and generated, PKCS#8/#12 opening; 88 functions, 2026-11-09) has no function that adjusts `__stack_pointer`: locals are Wasm locals and its arrays live on the heap, so there is no stack residue to read, and the constant-time fixtures' release module has none either (112 functions). The `--fast` module has frames only in runtime helpers (string and array growth, `to_string`) and `wasm.checks`. No Wasm residue check was built; what a browser's JS could read is the freed heap (collected arrays are not zeroed), a zeroization question for the allocator, not a stack wipe.
+  **Xtensa** (2026-11-10, read, not run): `ctScrubStack*` was a no-op there; it is now a store loop bounded by the
+  image's stack limit. The windowed ABI
+  puts a frame's a0-a3, on a window overflow (a call chain deeper than the register file or any interrupt or task
+  switch, which spills every live frame), in the 16 bytes under its callee's stack pointer, and its a4-a7 in the 16
+  above those. A wipe function can't touch the 16 under its own a1 (the entry's a0-a3, reloaded on its return), and the
+  16 above are its own frame, so its loop runs from a1-16 down and each public `ctScrubStack*` is now `@inline`: after
+  the call it clears a1-48 to a1-16 from the entry (`ablaCtScrubSaveAreas`, nothing on the other targets; on
+  Xtensa, only in programs that wipe: 33 bytes at each call of a wipe, a 55-byte wipe function per size used, and 36
+  bytes once to ask the image for the limit). The checker reads it: a callee's depth is its
+  `entry a1, N` frames plus the 16-byte save area under each, an entry with a secret in a0-a3 at a call dirties the 16
+  bytes under that callee, the wipe is recognised only as exactly the emitted loop, and a public store under a1 cleans.
+  All 63 fixture entries are clean in release, and the 47 placeable ones in `--fast` except four whose unoptimised
+  work goes deeper than the fixtures' 1024-byte wipe (`residue-known-xtensa-fast.txt`), with sixteen hand controls in
+  `residue-xtensa.s`. Not covered: the entry's own a4-a7, which an overflow keeps in its caller's frame (the checker
+  takes every argument register of a secret entry as secret, so it can't say when; with call8 on the ESP32's 64
+  registers an entry is spilled by about seven frames of work under it, or by any interrupt), and an interrupt during
+  the wipe, which pushes the interrupted registers (the wipe's and the entry's) under a1 (assumed from the ABI, not
+  measured on a device). The tail reaches the wipe function's frame only while it is at most 32 bytes (a control with
+  48 is found), and its stores are checked to lie where a call has made the ABI guarantee the stack. An Xtensa stack has
+  no guard page, so the wipe stops at the address the image's `abla_ct_stack_low()` gives (C ABI, linked weakly: an
+  image without it links and doesn't wipe; 0 means don't wipe, e.g. in an interrupt). Every Xtensa entry is read with
+  it and without it (`--no-stack-low`: 32 of 63 release entries, and 32 of the 47 `--fast` ones, are then listed
+  unwiped; the others used no more than the 32 bytes the entry clears itself). No image defines it yet: abla-embedded's
+  FreeRTOS and boot runtimes are to (`pxTaskGetStackStart(NULL) + 64`, 0 in an interrupt; `__abla_boot_stack_low +
+  64`). The real entries are not built for Xtensa in `test-ct.sh`.
+  **x86-64 `--fast`** (2026-11-10): the checker now counts the 8 bytes a push of a public register wrote under a wipe
+  (a `--fast` `ctScrubStack*` pushes the caller's rbp first; the caller's own taint decides for its registers, with a
+  control that pushes a secret one). Read on a `--fast` object, the 64 residue entries then give: 11 clean; 27 that keep
+  their secret arguments in their own frame (an unoptimised entry spills its parameters, and a wipe below sp can't
+  reach them: clearing them would be the compiler's, a decision not taken); 26 behind the known `--fast` trap branch
+  (`fast-known.txt`). Not wired into `test-ct.sh`.
 - [x] **Secret arithmetic around the crypto fixtures:** source-generated AES-128/192/256
   schedule and byte/block I/O, CRT subtract/correction/recombination and wide-reduction glue,
   `bnFromBytes`, `bnToBytes` and `bnResidueSquare` have assembly fixtures and individual

@@ -67,11 +67,51 @@ does a listed fixture that comes out clean. Nothing in a `--fast` path is expect
 secret that release doesn't, but the release read is still the one that counts, so build secret code in
 release.
 
-**Residue.** `--residue` (x86-64 and AArch64 release objects) also fails an entry
+**Residue.** `--residue` (x86-64, AArch64 and Xtensa objects) also fails an entry
 that returns with a secret in a slot of its frame, or that gave a secret to a callee and did not wipe the
 stack below it (`abla/ct/scrub`: the checker reads the callees' depth and the size of the wipe). The AES and
 RSA private entry points and the password paths of `abla/crypto/pbe` wipe, and on x86-64 a run scan checks that
-nothing is left below them (AArch64 is read, not run). Registers, the GC heap, Wasm and Xtensa are not covered.
+nothing is left below them (AArch64 and Xtensa are read, not run). Registers, the GC heap and Wasm are not covered.
+
+On Xtensa the windowed ABI decides where a frame's registers go when the register file overflows (a deep call
+chain, or any interrupt or task switch, which spills every live frame): a function's a0-a3 to the 16 bytes under
+the stack pointer of the function it is calling, its a4-a7 (a4-a11 when it was called by `call12`) to the 16 (32)
+above those, at the bottom of its caller's callee area. So the wipe stops 16 bytes under its own stack pointer
+(those are the entry's a0-a3, which the return reloads), and the public `ctScrubStack*`, inlined into the entry, clears the 32 bytes above that from the entry
+after the wipe returns. That reaches the whole wipe function's frame only if it is at most 32 bytes; the checker
+reads the frame and finds the rest (a control with a 48-byte frame). The checker counts those save areas: a
+callee's depth includes the 16 bytes under its stack pointer, and an entry holding a secret in a0-a3 across any call leaves it under that callee unless something
+public is written over it. Not covered: an entry's own a4-a7 are kept, on an overflow, in its caller's frame, which
+no wipe below the entry reaches (the checker takes every argument register of a secret-taking entry as secret, so
+it can't tell when that matters); and an interrupt that arrives during the wipe pushes its frame under the
+stack pointer, possibly over bytes already zeroed, with the interrupted registers (the wipe's own and the
+entry's), not the work's, which had returned. That is assumed from the ABI, not measured on a device.
+
+**On Xtensa the wipe is off unless the image turns it on.** An Xtensa stack has no guard page under it (an ESP32
+FreeRTOS task has 3 to 8 KiB), so a wipe of its full size could run past the stack's end into whatever lies below.
+There the wipe stops at the lowest address the image says it may write, and an image that says nothing gets no wipe
+at all: the crypto entry points then leave their residue, with no error. The image gives the limit by defining, in C
+or as an exported Abla function:
+
+```c
+uint32_t abla_ct_stack_low(void);   /* lowest address of the running stack the wipe may zero; 0: don't wipe */
+```
+
+It is linked weakly: an image that doesn't define it links, and its wipes do nothing (what Xtensa did before). The
+wipe asks it once each time, from the task that wipes, so it can answer per task. For a FreeRTOS image: return 0
+when `xPortInIsrContext()` (an interrupt runs on the interrupt stack, which the task's limit doesn't describe), else
+`pxTaskGetStackStart(NULL) + 64`: the 64 bytes keep the wipe off the lowest bytes of the task's stack, where
+FreeRTOS's overflow check keeps its fill pattern and ESP-IDF its end-of-stack watchpoint, either of which a zero there
+would trip. For an image without a scheduler, its stack's low symbol (abla-embedded's ESP32-S3 boot:
+`__abla_boot_stack_low`) plus the same margin, and 0 while the stack pointer is outside that stack. The checker reads
+every Xtensa entry twice: as an image that defines it (`tests/cases/ct/residue-known-xtensa*.txt`) and as one that
+doesn't (`residue-known-xtensa*-no-low.txt`: 32 of the 63 release entries are then unwiped; the rest used no more
+than the 32 bytes the entry clears itself), so a clean read can't be taken for coverage an image doesn't have.
+A clamped wipe still covers what the work used, which ran on the same stack, as long as the work stayed above the
+limit: the stack needs the margin as headroom beyond its deepest use, or what lies in those last bytes stays. `--fast` objects are
+read too: some unoptimised work goes deeper than the fixtures' 1024-byte wipe
+(`tests/cases/ct/residue-known-xtensa-fast.txt`). The 32 bytes the entry clears itself are checked to lie within the
+16 bytes under the frame of a function it has already called on every path, which the ABI guarantees is stack.
 
 The fixtures are what is checked: `ctSelect`, `ctEq`, `ctLt`, `ctIsNonZero`, arithmetic and
 `ctDifferenceAddress`, at the widths listed in the script, and what `abla/crypto` builds on them: AES's

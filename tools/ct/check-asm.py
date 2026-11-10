@@ -1305,11 +1305,124 @@ XT_ARGS = [f"a{i}" for i in range(2, 8)]
 XT_PURE_LIBCALLS = {"__divdi3", "__udivdi3", "__moddi3", "__umoddi3", "__muldi3", "__ashldi3", "__lshrdi3", "__ashrdi3"}
 
 
+def xt_disassemble(name):
+    """disassemble() for a function the Xtensa checker reaches by a call: one the object doesn't define (or names only
+    by its section) is a Violation of the function that called it, not the end of the run."""
+    try:
+        return disassemble(FOLLOW["path"], name, ["--mcpu=esp32"])
+    except (SystemExit, subprocess.CalledProcessError):
+        raise Violation(f"call: {name} isn't defined in the object")
+
+
+XT_EXTENTS = {}
+
+
+def xt_frame_size(lines, name):
+    """The N of the function's `entry a1, N`, which must be its first instruction."""
+    m = re.fullmatch(r"entry\s+a1,\s*(\d+)", lines[0][1]) if lines else None
+    if not m:
+        raise Violation(f"call: {name} doesn't start with entry a1, N")
+    return int(m.group(1))
+
+
+def xt_stack_extent(name, seen=()):
+    """How far below its caller's stack pointer a function and what it calls can have written (windowed ABI): its
+    frame (`entry a1, N`, the top 16 bytes of which are the extra save area where a window overflow keeps its a4-a7),
+    the 16 bytes under its stack pointer where an overflow keeps its a0-a3 while it calls or is interrupted, and the
+    deepest callee below that. Growth it can't evaluate is a Violation, not a guess."""
+    if name in seen:
+        raise Violation(f"call: recursion into {name}")
+    if name in XT_EXTENTS:
+        return XT_EXTENTS[name]
+    lines = xt_disassemble(name)
+    frame = xt_frame_size(lines, name)
+    deepest = 0
+    for _, text in lines[1:]:
+        parts = text.split(None, 1)
+        ops = [o.strip() for o in parts[1].split(",")] if len(parts) > 1 else []
+        if parts[0] == "movsp" or (ops and ops[0] == "a1"):
+            raise Violation(f"call: the stack growth of {name} can't be evaluated: {text}")
+        call = re.match(r"^call(4|8|12)\s+\S+\s+<([^>+]+)>$", text)
+        if call:
+            if call.group(2) not in XT_PURE_LIBCALLS:
+                deepest = max(deepest, xt_stack_extent(call.group(2), seen + (name,)))
+        elif parts[0].startswith(("callx", "jx")):
+            raise Violation(f"call: the stack growth of {name} can't be evaluated: {text}")
+    XT_EXTENTS[name] = frame + 16 + deepest
+    return XT_EXTENTS[name]
+
+
+def xt_scrub(name):
+    """(frame, bytes) if a function is ctScrubStack's wipe on Xtensa (ablaCtScrubBoundedStack): the call that asks
+    the image's abla_ct_stack_low for the limit, its result moved into a register, then exactly the loop that zeroes
+    `bytes` under a1-16, cut to the words above that limit and skipped when it is 0; else None."""
+    body = [(address, text) for address, text in xt_disassemble(name)
+            if not re.fullmatch(r"nop(\.n)?", text)]
+    lines = [text for _, text in body]
+    entry = re.fullmatch(r"entry\s+a1,\s*(\d+)", lines[0]) if lines else None
+    start = next((i for i, text in enumerate(lines) if re.fullmatch(r"addi\s+a8,\s*a1,\s*-16", text)), None)
+    if not entry or start is None or len(lines) - start != 16:
+        return None
+    # The prefix is exactly the call of the private function that asks the image (its name has a `.L`, which no
+    # Abla function can take) and the move of its result into the limit register; a frame pointer may come first.
+    prefix = [text for text in lines[1:start] if not re.fullmatch(r"mov(\.n)?\s+a7,\s*a1", text)]
+    asked = re.fullmatch(r"call8\s+\S+\s+<\.Labla\.ct\.stack\.low>", prefix[0]) if len(prefix) == 2 else None
+    taken = re.fullmatch(r"mov(\.n)?\s+(a\d+),\s*a10", prefix[1]) if len(prefix) == 2 else None
+    if not asked or not taken:
+        return None
+    loop = lines[start:]
+    count = re.fullmatch(r"movi\s+a10,\s*(\d+)", loop[2])
+    zero_skip = re.fullmatch(r"beqz\s+(a\d+),\s*(?:0x)?([0-9a-f]+)\b.*", loop[3])
+    if not count or not zero_skip:
+        return None
+    low, done = zero_skip.group(1), int(zero_skip.group(2), 16)
+    if low != taken.group(2):
+        return None
+    expected = [
+        r"addi\s+a8,\s*a1,\s*-16", r"movi\s+a9,\s*0", r"movi\s+a10,\s*\d+",
+        rf"beqz\s+{low},\s*(?:0x)?{done:x}\b.*", rf"bgeu\s+{low},\s*a8,\s*(?:0x)?{done:x}\b.*",
+        rf"sub\s+a11,\s*a8,\s*{low}", r"srli\s+a11,\s*a11,\s*2", rf"beqz\s+a11,\s*(?:0x)?{done:x}\b.*",
+        rf"bgeu\s+a11,\s*a10,\s*(?:0x)?{body[start + 10][0]:x}\b.*", r"(mov(\.n)?\s+a10,\s*a11|or\s+a10,\s*a11,\s*a11)",
+        r"addi\s+a8,\s*a8,\s*-4", r"s32i\s+a9,\s*a8,\s*0", r"addi\s+a10,\s*a10,\s*-1",
+        rf"bnez\s+a10,\s*(?:0x)?{body[start + 10][0]:x}\b.*", r"movi\s+a8,\s*0", r"retw(\.n)?",
+    ]
+    if (low in ("a8", "a9", "a10", "a11") or body[start + 14][0] != done or
+            any(not re.fullmatch(pattern, text) for pattern, text in zip(expected, loop))):
+        return None
+    if int(count.group(1)) <= 0:
+        return None
+    return int(entry.group(1)), 4 * int(count.group(1))
+
+
+def xt_dirty(state, low, high):
+    """Adds [low, high) (offsets from the checked function's a1) to the dirty bytes under its stack, merged."""
+    for tag in [t for t in state if t.startswith("xdirty:")]:
+        _, a, b = tag.split(":")
+        if int(a) <= high and int(b) >= low:
+            state.discard(tag)
+            low, high = min(low, int(a)), max(high, int(b))
+    if low < high:
+        state.add(f"xdirty:{low}:{high}")
+
+
+def xt_clean(state, low, high):
+    """Takes [low, high) out of the dirty bytes: something public was written over it."""
+    for tag in [t for t in state if t.startswith("xdirty:")]:
+        _, a, b = tag.split(":")
+        a, b = int(a), int(b)
+        if a < high and b > low:
+            state.discard(tag)
+            if a < low:
+                state.add(f"xdirty:{a}:{low}")
+            if b > high:
+                state.add(f"xdirty:{high}:{b}")
+
+
 def callee_inputs_xtensa(name):
     """The argument registers (a2 to a7) a function may read before it writes them, as for the other targets."""
     written = set()
     read = set()
-    for _, text in disassemble(FOLLOW["path"], name, ["--mcpu=esp32"]):
+    for _, text in xt_disassemble(name):
         parts = text.split(None, 1)
         op = parts[0]
         ops = [o.strip() for o in parts[1].split(",")] if len(parts) > 1 else []
@@ -1339,7 +1452,7 @@ def follow_call_xtensa(name, tags, text):
     if name in FOLLOW["stack"]:
         raise Violation(f"call: recursion into {name}: {text}")
     try:
-        lines = disassemble(FOLLOW["path"], name, ["--mcpu=esp32"])
+        lines = xt_disassemble(name)
     except (SystemExit, subprocess.CalledProcessError):
         raise Violation(f"call: {name} isn't defined in the object: {text}")
     unread = [t for _, t in lines if "unknown" in t]
@@ -1361,6 +1474,9 @@ def check_xtensa(lines, secret, pointers):
     # parameter makes all the argument registers secret, and only pointer lists are exact.
     # (A pointer parameter is an `int`, so also a pair: the address is the low one.)
     returned = []
+    # Residue (--residue, the checked function itself, not a followed callee): what it leaves under its a1, as
+    # xdirty:<low>:<high> offsets from a1. Where the windowed ABI puts things: xt_stack_extent, docs/constant-time.md.
+    residue = FOLLOW["residue"] and not FOLLOW["stack"]
     header_args = FOLLOW.get("header_args", [])
     FOLLOW["header_args"] = []  # a followed callee has none
     if secret and isinstance(secret[0], str):
@@ -1411,6 +1527,27 @@ def check_xtensa(lines, secret, pointers):
         checked as a function of its own on the arguments it reads; what it leaves in a2 and up comes back to
         a(rotation+2) and up, and our registers from a(rotation) on are the callee's window (dead)."""
         state = set(state)
+        wipe = xt_scrub(name)
+        if residue:
+            callee_frame = xt_frame_size(xt_disassemble(name), name)
+            # While the callee runs, a window overflow keeps our a0-a3 in the 16 bytes under its stack pointer.
+            if any(f"a{r}" in state or f"ptr:a{r}" in state for r in range(4)):
+                xt_dirty(state, -callee_frame - 16, -callee_frame)
+            # A call makes the ABI guarantee the stack down to 16 bytes under the callee's frame (where an overflow
+            # keeps our a0-a3): what a store under a1 may reach (xreach, the shallowest over the paths that join).
+            state.discard("xnoreach")
+            state.add(f"xreach:{-callee_frame - 16}")
+            if wipe and FOLLOW["stack_low"]:
+                # Down to the image's limit, which lies under every frame the work had (it ran on this stack).
+                frame, size = wipe
+                xt_clean(state, -frame - 16 - size, -frame - 16)
+        if wipe:
+            # Not followed: it asks the image for the limit through a register (callx8). It is given nothing and
+            # leaves nothing but zeros; its window is dead after it.
+            for r in range(rotation, 16):
+                for tag in (f"a{r}", f"ptr:a{r}", f"stackbase:a{r}"):
+                    state.discard(tag)
+            return frozenset(state)
         inputs = callee_inputs_xtensa(name)
         tags = set()
         for k in range(2, 8):
@@ -1421,6 +1558,10 @@ def check_xtensa(lines, secret, pointers):
             elif f"ptr:a{rotation + k}" in state:
                 tags.add(f"ptr:a{k}")
         out = follow_call_xtensa(name, tags, text)
+        if residue and tags:
+            # Given a secret: everything it and its callees wrote under our a1 may hold one, down to its depth.
+            # The 16 bytes right under a1 are our caller's (its a0-a3 on an overflow), not the callee's.
+            xt_dirty(state, -xt_stack_extent(name), -16)
         # Once an address in this frame was made (anywhere before: it may have been spilled and reloaded) a callee
         # may have written through it.
         frame_address = "frameaddr" in state
@@ -1503,6 +1644,17 @@ def check_xtensa(lines, secret, pointers):
                 raise Violation(f"secret stored through an object pointer or outside the frame: {text}")
             if at is not None:
                 size = 1 if op.startswith("s8") else 2 if op.startswith("s16") else 4
+                if residue and at + int(offset, 0) < 0:
+                    # Under a1: a public value covers what a callee left there, a secret is left there itself. Only
+                    # where a call has made the ABI guarantee the stack on every path to here.
+                    where = at + int(offset, 0)
+                    reach = max((int(t.split(":")[1]) for t in state if t.startswith("xreach:")), default=0)
+                    if "xnoreach" in state or where < reach:
+                        raise Violation(f"a store under a1 below the stack a call guarantees: {text}")
+                    if t(source) or "ptr:" + source in state:
+                        xt_dirty(state, where, where + size)
+                    else:
+                        xt_clean(state, where, where + size)
                 for i in range(size):
                     slot = f"slot:{at + int(offset, 0) + i}"
                     (state.add if t(source) else state.discard)(slot)
@@ -1580,13 +1732,23 @@ def check_xtensa(lines, secret, pointers):
         out.append(i + 1)
         return out
 
+    if residue:
+        start = start | frozenset(["xnoreach"])
     states = fixpoint(lines, start, step, successors)
     # What the function leaves in its registers when it returns, for a caller that follows it.
     out = set()
     for i, (_, text) in enumerate(lines):
         if text.split()[0] in ("retw", "retw.n", "ret", "ret.n") and i in states:
             out |= states[i]
-    return frozenset(out)
+    if residue:
+        # A secret in a slot of its own frame, or under a1 where a callee (or a window overflow) left one and nothing
+        # public was written over it since.
+        left = sorted(item for item in out if item.startswith("slot:") and int(item.split(":")[1]) >= 0)
+        left += sorted(f"{int(b) - int(a)} bytes under a1 at {a}" for _, a, b in
+                       (item.split(":") for item in out if item.startswith("xdirty:")))
+        if left:
+            raise Violation(f"secret residue at return: {', '.join(left[:4])}")
+    return frozenset(item for item in out if not item.startswith("xdirty:"))
 
 
 # --- Wasm ----------------------------------------------------------------------------------
@@ -1974,10 +2136,15 @@ def parse_spec(spec, count_hint=8):
 def main():
     arguments = sys.argv[1:]
     if "--residue" in arguments:
-        # Checks x86-64 only. A callee followed from a checked function isn't checked for residue
+        # Checks x86-64, AArch64 and Xtensa. A callee followed from a checked function isn't checked for residue
         # itself: its caller's frame and registers are what remain.
         arguments.remove("--residue")
         FOLLOW["residue"] = True
+    FOLLOW["stack_low"] = True
+    if "--no-stack-low" in arguments:
+        # Xtensa: read the image as one that doesn't define abla_ct_stack_low, where the wipe does nothing.
+        arguments.remove("--no-stack-low")
+        FOLLOW["stack_low"] = False
     if "--follow-calls" in arguments:
         arguments.remove("--follow-calls")
         FOLLOW["path"] = arguments[1]

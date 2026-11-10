@@ -226,8 +226,8 @@ header_read() {
 # the stack pointer reached, fail. Controls, hand-written assembly: a spill that stays, a spill that is cleared,
 # a callee with no wipe after it, a wipe shorter than the callee's depth, and one that reaches it. Then every
 # fixture's residue entry is read. tests/cases/ct/residue-known.txt lists what stays unwiped, with a reason;
-# it is empty on x86-64. Wasm has no addressable native stack, AArch64 is wiped but not read, and Xtensa is
-# compiled, not run: the wipe is a no-op there.
+# it is empty on x86-64. Wasm has no addressable native stack; AArch64 (residue_a64_read) and Xtensa
+# (xtensa_residue_read) are read too.
 residue_read() {
     local entry object="$out/x86-residue.o"
     "$compiler" build "$out/residue-cases/object-x86.ab" -o "$object" --emit object --no-cache
@@ -297,6 +297,80 @@ residue_a64_read() {
         cat "$out/aarch64-residue.diff" >&2; echo "ct: the aarch64 residue findings changed (tests/cases/ct/residue-known-aarch64.txt)" >&2; exit 1
     fi
     echo "ok   aarch64 residue: ${#specs[@]} entries wipe what their work used, $(wc -l < "$out/aarch64-residue.found") unwiped, the eight controls told apart"
+}
+
+# Secret residue on Xtensa (windowed ABI), read, not run. An Xtensa stack has no guard page, so the wipe stops at the
+# limit the image's abla_ct_stack_low() gives, and does nothing in an image without it. It stores zeros from a1-16 down
+# (the 16 bytes under its a1 are its caller's a0-a3 on a window overflow), and the public wipe, inlined into the entry,
+# then clears the 32 bytes above that from the entry itself (ablaCtScrubSaveAreas). Hand controls first
+# (residue-xtensa.s), then every fixture's residue entry from a release object and from a --fast one, each read twice:
+# as an image that defines abla_ct_stack_low (what stays is listed in residue-known-xtensa*.txt) and as one that
+# doesn't (--no-stack-low: what stays then is listed in residue-known-xtensa*-no-low.txt, so a clean read above can't
+# be taken for coverage the image doesn't have; an entry clean in both used no more than the 32 bytes it clears
+# itself). The --fast fixtures this build can't place
+# (fast-known-xtensa.txt) are left out.
+xtensa_residue_read() {
+    local entry mode
+    llvm-mc -triple xtensa -mcpu=esp32 -filetype=obj "$cases/residue-xtensa.s" -o "$out/residue-xtensa.o"
+    for entry in residue_left residue_unwiped residue_short residue_no_tail residue_before residue_fake residue_kept \
+        residue_secret_tail residue_covered48 residue_unbounded residue_tail_deep residue_tail_first residue_constant; do
+        if $check --follow-calls --residue xtensa "$out/residue-xtensa.o" "$entry:0" > "$out/xt-$entry.log" 2>&1; then
+            echo "ct: missed $entry on xtensa" >&2; exit 1
+        fi
+        grep -Eq 'secret residue|below the stack a call guarantees|call: ' "$out/xt-$entry.log" || {
+            cat "$out/xt-$entry.log" >&2; exit 1
+        }
+    done
+    for entry in residue_wiped residue_covered residue_kept_wiped; do
+        $check --follow-calls --residue xtensa "$out/residue-xtensa.o" "$entry:0" > "$out/xt-$entry.log" 2>&1 || {
+            cat "$out/xt-$entry.log" >&2; echo "ct: $entry was reported on xtensa" >&2; exit 1
+        }
+    done
+    if $check --no-stack-low --follow-calls --residue xtensa "$out/residue-xtensa.o" residue_covered:0 \
+        > "$out/xt-residue_covered-no-low.log" 2>&1; then
+        echo "ct: residue_covered passed on xtensa without abla_ct_stack_low" >&2; exit 1
+    fi
+    local specs=() fast_specs=() spec name
+    for spec in "${fixtures[@]}"; do
+        name=${spec%%:*}
+        specs+=("ct_res_${name#ct_}:${spec#*:}")
+        grep -q "^$name " "$cases/fast-known-xtensa.txt" || fast_specs+=("ct_res_${name#ct_}:${spec#*:}")
+    done
+    for mode in release fast; do
+        local extra=() known="$cases/residue-known-xtensa.txt" read_specs=("${specs[@]}")
+        if [[ $mode == fast ]]; then
+            extra=(--fast); known="$cases/residue-known-xtensa-fast.txt"; read_specs=("${fast_specs[@]}")
+        fi
+        abla_xtensa_test_build "$compiler" "$tools_directory" build "$out/residue-cases/object.ab" \
+            -o "$out/xtensa-residue-$mode.o" --no-cache --target-triple xtensa-esp-unknown-elf --object-format elf \
+            --emit object "${extra[@]}"
+        $check --follow-calls --residue xtensa "$out/xtensa-residue-$mode.o" "${read_specs[@]}" \
+            > "$out/xtensa-residue-$mode.log" 2>&1 || true
+        if { grep '^LEAK' "$out/xtensa-residue-$mode.log" || true; } | grep -v 'secret residue'; then
+            echo "ct: a finding other than residue on xtensa ($mode)" >&2; exit 1
+        fi
+        { grep '^LEAK' "$out/xtensa-residue-$mode.log" || true; } | awk '{sub(":", "", $3); print $3}' | sort \
+            > "$out/xtensa-residue-$mode.found"
+        if ! diff -u <(grep -v '^#' "$known" | sort) "$out/xtensa-residue-$mode.found" > "$out/xtensa-residue-$mode.diff"; then
+            cat "$out/xtensa-residue-$mode.diff" >&2
+            echo "ct: the xtensa $mode residue findings changed (${known#"$cases"/})" >&2; exit 1
+        fi
+        local no_low="${known%.txt}-no-low.txt"
+        $check --no-stack-low --follow-calls --residue xtensa "$out/xtensa-residue-$mode.o" "${read_specs[@]}" \
+            > "$out/xtensa-residue-$mode-no-low.log" 2>&1 || true
+        { grep '^LEAK' "$out/xtensa-residue-$mode-no-low.log" || true; } | awk '{sub(":", "", $3); print $3}' | sort \
+            > "$out/xtensa-residue-$mode-no-low.found"
+        if ! diff -u <(grep -v '^#' "$no_low" | sort) "$out/xtensa-residue-$mode-no-low.found" \
+            > "$out/xtensa-residue-$mode-no-low.diff"; then
+            cat "$out/xtensa-residue-$mode-no-low.diff" >&2
+            echo "ct: the xtensa $mode residue findings without abla_ct_stack_low changed (${no_low#"$cases"/})" >&2; exit 1
+        fi
+        echo "ok   xtensa residue ($mode): with abla_ct_stack_low, ${#read_specs[@]} entries read," \
+            "$(wc -l < "$out/xtensa-residue-$mode.found") listed unwiped; without it," \
+            "$(wc -l < "$out/xtensa-residue-$mode-no-low.found") unwiped (listed), the rest's work within the 32 bytes" \
+            "the entry clears itself"
+    done
+    echo "ok   xtensa residue: the sixteen controls told apart, and the wipe credited only with abla_ct_stack_low"
 }
 
 # A callee that writes a secret through an address of the caller's own frame (made by lea or by mov from rsp)
@@ -624,6 +698,7 @@ worker_read "$out/xtensa.o" xtensa
 abla_xtensa_test_build "$compiler" "$tools_directory" build "$cases/object.ab" -o "$out/xtensa-fast.o" --no-cache \
     --target-triple xtensa-esp-unknown-elf --object-format elf --emit object --fast
 fast_read xtensa "$out/xtensa-fast.o" "" "" "$cases/fast-known-xtensa.txt"
+xtensa_residue_read
 
 # --- What the compiler refuses ----------------------------------------------------------
 for invalid in "$cases"/invalid-*.ab; do
