@@ -700,8 +700,8 @@ worker_read "$out/x86.o"
 division_read
 # The crypto allocation entry stays out of line in a release object: each export of the probe module, which reaches
 # the key and big-number allocations, calls the function in the section .text.abla_ct_allocate. (A function that
-# reaches no allocation must not pass, so the control is `main`.) x86-64 and Xtensa (below): AArch64's object comes
-# from its driver, and an unlinked Wasm module has no section to mark the entry.
+# reaches no allocation must not pass, so the control is `main`.) x86-64, AArch64 and Xtensa (below); an unlinked Wasm
+# module has no section to mark the entry.
 "$compiler" build "$cases/alloc-probe.ab" -o "$out/alloc-probe.o" --emit object --no-cache
 $check --expect-allocator x86_64 "$out/alloc-probe.o" probe_bignum_allocate: probe_aes_expand: > "$out/alloc-probe.log" 2>&1 || {
     cat "$out/alloc-probe.log" >&2; echo "ct: the allocation entry is inlined or not called in a release object" >&2; exit 1
@@ -725,6 +725,14 @@ llvm-mc -triple aarch64-linux-gnu -filetype=obj tests/cases/simd/aarch64-start.s
 ld.lld -static --no-pie -z notext "$out/aarch64.o" "$out/aarch64-start.o" -o "$out/aarch64"
 qemu-aarch64 -cpu max "$out/aarch64" || { echo "ct aarch64: check $? failed" >&2; exit 1; }
 read_target aarch64 "$out/aarch64.o"
+# The allocation probe as an AArch64 object (built by the driver above): the same out-of-line check as x86-64.
+$check --expect-allocator aarch64 "$out/aarch64-alloc-probe.o" probe_bignum_allocate: probe_aes_expand: > "$out/alloc-probe-aarch64.log" 2>&1 || {
+    cat "$out/alloc-probe-aarch64.log" >&2; echo "ct: the allocation entry is inlined or not called in an AArch64 object" >&2; exit 1
+}
+if $check --expect-allocator aarch64 "$out/aarch64-alloc-probe.o" main: > "$out/alloc-probe-aarch64-control.log" 2>&1; then
+    echo "ct: a function with no allocation was said to call the allocation entry on AArch64" >&2; exit 1
+fi
+echo "ok   aarch64 release object: the crypto allocation entry is called out of line by the key and big-number paths (1 control)"
 a64_follow_read
 residue_a64_read
 # The bignum routines and the AES key functions, read whole on AArch64 with their calls followed.
