@@ -12,12 +12,14 @@ project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 output_directory="$project_root/build/dns-async"
 mkdir -p "$output_directory"
 
+# Each run's budget is CPU time (ABLA_MAX_CPU_SECONDS), which load does not change; the wall-clock limit only
+# ends a hang.
 for name in dns-async http-async; do
     "$compiler" build "$project_root/tests/cases/modules/$name.ab" \
         -o "$output_directory/$name"
     set +e
     output=$(ABLA_TEST_DIRECTORY="$output_directory" \
-        ABLA_MAX_MEMORY_MB=256 ABLA_MAX_SECONDS=30 \
+        ABLA_MAX_MEMORY_MB=256 ABLA_MAX_SECONDS=900 \
         ABLA_MAX_CPU_SECONDS=30 \
         "$project_root/tools/run-limited.sh" "$output_directory/$name")
     status=$?
@@ -45,7 +47,7 @@ for ((round=1; round<=rounds; round++)); do
         (
             status=0
             output=$(ABLA_TEST_DIRECTORY="$directory" ABLA_MAX_MEMORY_MB=256 \
-                ABLA_MAX_SECONDS=30 ABLA_MAX_CPU_SECONDS=30 \
+                ABLA_MAX_SECONDS=900 ABLA_MAX_CPU_SECONDS=30 \
                 "$project_root/tools/run-limited.sh" "$output_directory/dns-async") || status=$?
             [[ $status -eq 42 && $output == "dns async: ok" ]] || {
                 echo "dns async stress: round $round worker $worker exited $status: $output" >&2
