@@ -52,7 +52,10 @@ build() {
     shift 4
     (
         cd "$directory"
+        # The limits are CPU time (a release build takes about 100 CPU seconds, the compiler's own about
+        # 200), which load does not change; the wall-clock one only ends a hang.
         HOME=$directory/home TMPDIR=$directory/tmp TZ=$zone LC_ALL=$locale \
+            ABLA_MAX_SECONDS=${ABLA_MAX_SECONDS:-7200} ABLA_MAX_CPU_SECONDS=${ABLA_MAX_CPU_SECONDS:-900} \
             ABLA_NATIVE_JOBS=$workers "$@"
     )
 }
