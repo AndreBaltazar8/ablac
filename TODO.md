@@ -217,6 +217,9 @@
   passed as a borrowed argument; the temporary is #736's case, so a campaign after #736 should show a
   changed log in every mode at once). Seeds 1200 to 1760 (post-#733 and #742 compilers, every generator
   drawn together) agree in all six modes; the only findings were #733 and #742.
+  After v0.2.53: seeds 1941 to 2200 (the published v0.2.53 compiler; 2041 to 2100 at 60 checks per seed) and
+  2201 to 2300 (batch 21's compiler: the interface index, the lowering type cache, the Wasm source map, the
+  JSON `\u` decoding) agree in all six modes; no new finding.
 
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
