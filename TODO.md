@@ -1845,3 +1845,25 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   carrying it, built once per declaration array, as `BootstrapDeclarationNameIndex` is),
   which is the screen already parked at −1.1% before the one-pass implementers; the ceiling
   now is about 4.8% of a NovaKind build, 0 on the self-build.
+
+- Design: a declaration-name index for the interface scans (ablac-52, 2026-11-10; no code,
+  waits for the src freeze). Where it lives: `BootstrapDeclarationNameIndex` already exists
+  per analyzer (`analyzer.declarationNames`, name -> the nodes of the declarations carrying it,
+  in declaration order) and is used guarded by `nodeDeclarations.size == declarations.size`,
+  else by a scan (sema.ab near the method-declaration lookups). The scans to replace take
+  `declarations` only: `bootstrapClassInterfaces` (find the class and `extend` declarations
+  named `name`), `bootstrapInterfaceIndexIn` (the first `interface` named `name`) and
+  `bootstrapInterfaceAncestors` (one IndexIn per hop). Plan: give the three an optional
+  `names: BootstrapDeclarationNameIndex?` (null = today's scan), pass `analyzer.declarationNames`
+  when its size guard holds, so a compile-time edit that appends declarations makes the index
+  stale-by-size and falls back to the scan (nothing is invalidated in place; the analyzer
+  builds a new index with its declarations). Call sites: analyzer `conformsTo` (sema ~7502),
+  the `when` arm check and sealed cover (~16204, 16294, 16298), Transactional classes (~16621),
+  method tables (~2945, 2979, 3150, 6890), `bootstrapMethodDeclarationIndex`; the evaluator's
+  (eval.ab ~8541, 10355, 10375) and lowering's (ir.ab ~3464, 3775, 5840) use their own
+  declaration arrays and keep the scan until they carry an index. The first cut is the `when`
+  arm check and `bootstrapMethodDeclarationIndex` (3.1% + 0.9% of a NovaKind build, the
+  analyzer's own array, whose index already exists), then the rest. Expected: about 4%
+  of a NovaKind `--fast` build on top of the one-pass implementers; 0 on the self-build;
+  output unchanged (the lists are built in the same order). Bars as for iface-index:
+  byte-identical binaries and IR, instructions by sampled alternating runs, RSS.
