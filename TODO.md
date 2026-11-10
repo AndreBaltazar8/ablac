@@ -1817,3 +1817,12 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   (`bootstrapEvaluateLocal` allocates an "uninitialized" value it overwrites and a
   one-element array for the escape check on every local, about one allocation pair
   per local declaration): worth doing only with a count of locals evaluated.
+
+- Compile-effects key and membership test (ablac-52, 2026-11-10): `bootstrapDelegatedCompileEffectsIn`
+  is 2.6% self in a `--fast` self-build profile; building the `name#arity` key only when
+  the name is bound (not for every call expression) and returning at the first match in
+  `bootstrapAffineNamesContain` gave the same binary (md5 equal) and no measurable change
+  in instructions (a `--fast` self-build, three alternating pairs: 182.4 / 134.0 / 130.9 G
+  before, 183.4 / 135.1 / 138.4 G after; the run-to-run spread, with cold-cache first runs,
+  is larger than 3%). Not pursued: the function's cost is its walk over every expression, not
+  the two strings.
