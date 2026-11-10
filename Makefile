@@ -344,6 +344,7 @@ test-serial: ablac
 	tools/test-math-v8.sh $(COMPILER)
 	tools/test-math-v8-no-node.sh $(COMPILER)
 	tools/test-interfaces.sh $(COMPILER)
+	tools/test-action-journal.sh $(COMPILER)
 	tools/test-managed-alias-files.sh $(COMPILER)
 	tools/test-delegated-properties.sh $(COMPILER)
 	tools/test-null-operators.sh $(COMPILER)
