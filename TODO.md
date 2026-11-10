@@ -1991,3 +1991,29 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   `when` coverage, -12.5% of a NovaKind `--fast` build, identical output) goes in the src batch
   after v0.2.53 with the one-pass `bootstrapInterfaceImplementers`, so "not landed" above
   means "not alone".
+
+- Staged-parser handlers in a NovaKind `--fast` build, counted (ablac-52, 2026-11-10, NovaKind repro tree 9c62c61b, a
+  counter on each handler invocation): 919 invocations of 6 handlers: `oneRemoteCallParse` 394,
+  `ablaJsonParseValue` 299, `oneRemoteDecodeParse` 214, `oneRemoteParse` 10, `oneThemeParse` 1,
+  `ablaJsonParseStringifiedValue` 1. The staged parse is 13.2% of the build's instructions
+  (about 3,000 samples of 20 M), so at most about 3.3 M instructions per invocation in the
+  interpreter, and 99% of the invocations are three handlers. `ABLA_COMPILE_EVAL=jit` changes
+  nothing for them: whole-build samples 23,124 / 23,082 interp against 23,550 / 23,503 jit
+  (+1.8%), and the trace lists only seven sites as interpreted ("reaches
+  `compilerApplyTransform`, which takes a function"); the handlers are not sites at all, since they
+  run before the slice exists. Break-even for a native handler path: one JIT generation per
+  handler (3 hot ones) against about 900 x 3.3 M = 3 G interpreter instructions per build
+  (13% of it); a generation (code generator + LLVM JIT of a slice with the handler's reachable
+  declarations) costs of the order of 100-300 M instructions, so the native path wins if the
+  handlers can be generated before parsing finishes and the slice is cached across builds by
+  the handler's fingerprint (the `ct_bridge.ab` entry scaffolding exists, unused). Expected
+  share: up to about 10 of the 13% of a `--fast` NovaKind build; not a rider, a project after
+  the batches. Design in short: (1) slice = the handler's reachable declarations from the
+  declarations parsed so far (handlers can only reach what the import graph has already parsed);
+  (2) entry from `ctBridgeEntrySource(..., "subparser")`, the cursor as a bridge handle; (3) anything
+  the bridge cannot take (a function argument, a capability provider written in Abla) keeps the
+  handler in the interpreter, as for sites; (4) test: the same syntax out, handler by handler,
+  interpreter against native, including the diagnostics; (5) cache key: the handler's declaration
+  fingerprint plus the compiler version. The 3.3 M per invocation is an upper bound (the 13.2%
+  also holds the generated modules and the import parse); a perf split of the handler
+  frames alone would sharpen it before the project starts.
