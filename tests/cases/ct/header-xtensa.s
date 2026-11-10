@@ -148,3 +148,52 @@ globstore:
 	.literal glob_address, glob
 	.data
 glob:	.long	0
+
+# The crypto allocation entry: exported as abla_ct_allocate and called by that name. The size is the callee's first
+# argument (a pair: call8 passes it in a10 and a11), the pointer comes back in a10, to secret memory (the block's own
+# header sits below it).
+	.text
+	.align	4
+	.global	abla_ct_allocate
+	.type	abla_ct_allocate,@function
+abla_ct_allocate:
+	entry	a1, 16
+	retw.n
+	.size	abla_ct_allocate, .-abla_ct_allocate
+
+	.align	4
+	.global	alloc_fill
+	.type	alloc_fill,@function
+alloc_fill:
+	entry	a1, 32
+	mov.n	a6, a4
+	movi.n	a10, 64
+	movi.n	a11, 0
+	call8	abla_ct_allocate
+	s32i	a6, a10, 8
+	retw.n
+	.size	alloc_fill, .-alloc_fill
+
+	.align	4
+	.global	alloc_read
+	.type	alloc_read,@function
+alloc_read:
+	entry	a1, 32
+	movi.n	a10, 64
+	movi.n	a11, 0
+	call8	abla_ct_allocate
+	l32i	a3, a10, 8
+	beqz	a3, 1f
+1:	retw.n
+	.size	alloc_read, .-alloc_read
+
+	.align	4
+	.global	alloc_secret_size
+	.type	alloc_secret_size,@function
+alloc_secret_size:
+	entry	a1, 32
+	mov.n	a10, a2
+	mov.n	a11, a3
+	call8	abla_ct_allocate
+	retw.n
+	.size	alloc_secret_size, .-alloc_secret_size

@@ -60,7 +60,7 @@ def disassemble(path, name, extra=()):
                 # A relocation of an x86-64 or AArch64 object. The only one read is a call to the crypto allocation
                 # entry, which sits in a section of its own, so an unlinked object names it by that section.
                 target = re.sub(r"[+-]0x[0-9a-f]+$", "", other.group(1))
-                if target == ALLOCATOR_SECTION and lines and re.match(r"^(call|jmp|bl|b)\w*\s", lines[-1][1]):
+                if target == ALLOCATOR_SECTION and lines and re.match(r"^(call\w*|jmp\w*|bl|b)\s", lines[-1][1]):
                     lines[-1] = (lines[-1][0], re.sub(r"<[^>]*>$", "", lines[-1][1]).rstrip() + f" <{target}>")
                 continue
             relocation = re.match(r"^\s*[0-9a-f]+:\s+R_XTENSA_\w+\s+(\S+)$", line)
@@ -276,7 +276,8 @@ def allocator_names(path):
             if ALLOCATOR in group:
                 names |= group
         if names:
-            names.add(ALLOCATOR_SECTION)  # an unlinked object's call names the entry by its section
+            # An unlinked object's call names the entry by its section (an Xtensa disassembly drops the `.text.`).
+            names.update([ALLOCATOR_SECTION, ALLOCATOR_SECTION[len(".text."):]])
         ALLOCATOR_NAMES[path] = names
     return ALLOCATOR_NAMES[path]
 
@@ -381,7 +382,8 @@ def check_x86(lines, secret, pointers):
             return frozenset(state)
         if is_allocator(name):
             # The crypto allocation entry: not read (it branches on the heap's state), so it must be given nothing
-            # secret, and it returns a pointer to an object whose first HEADER_BYTES are public.
+            # secret, and it returns a pointer to secret memory (the block's own header sits below the pointer, so
+            # none of what is at and above it is public).
             if "rdi" in state or "ptr:rdi" in state:  # its one argument, the size
                 raise Violation(f"call: the allocation entry is given a secret or a pointer to one: {text}")
             for r in ["rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11"] + [f"v{n}" for n in range(16)]:
@@ -390,7 +392,7 @@ def check_x86(lines, secret, pointers):
                 state.add("lost:" + r)
             state.discard("flags")
             state.discard("lost:rax")
-            state.update(["ptr:rax", "hdrp:rax"])
+            state.add("ptr:rax")
             if "frameaddr" in state:
                 state.add("pushed")
             return frozenset(state)
@@ -1172,7 +1174,7 @@ def check_aarch64(lines, secret, pointers):
                 raise Violation(f"call: {text}")
             if is_allocator(callee.group(1)):
                 # The crypto allocation entry (see check_x86): not read, the size in x0 must be public, the
-                # result in x0 is a pointer to an object with a public header, everything else caller-saved is lost.
+                # result in x0 is a pointer to secret memory, everything else caller-saved is lost.
                 if "x0" in state or "ptr:x0" in state:
                     raise Violation(f"call: the allocation entry is given a secret or a pointer to one: {text}")
                 for r in A64_CLOBBERED:
@@ -1181,7 +1183,7 @@ def check_aarch64(lines, secret, pointers):
                     state.add("lost:" + r)
                 state.discard("flags")
                 state.discard("lost:x0")
-                state.update(["ptr:x0", "hdrp:x0"])
+                state.add("ptr:x0")
                 if any(item.startswith(("stackbase:", "ptrslot:")) for item in state):
                     state.add("frame-dirty")
                 return frozenset(state)
@@ -1664,7 +1666,7 @@ def check_xtensa(lines, secret, pointers):
         op = parts[0]
         ops = [o.strip() for o in parts[1].split(",")] if len(parts) > 1 else []
         t = lambda o: o in state
-        if header_args:
+        if any(item.startswith("hdrp:") for item in state):
             # A header-public pointer is one only while its register is never written: a call (the window moves and
             # the callee may write through it), or any instruction naming it first, other than a store or a branch.
             if op.startswith(("call", "callx")):
@@ -1678,6 +1680,22 @@ def check_xtensa(lines, secret, pointers):
         if op in ("j", "j.n", "retw", "retw.n", "ret", "ret.n", "nop", "nop.n", "memw", "entry", "ill", "ill.n"):
             return frozenset(state)
         call = re.match(r"^call(4|8|12)\s+\S+\s+<([^>+]+)>$", text)
+        if call and is_allocator(call.group(2)):
+            # The crypto allocation entry (see check_x86). The size is the callee's first argument, a pair at
+            # a(rotation + 2) and the next register, and the pointer comes back in the low one.
+            rotation = int(call.group(1))
+            size, pointer = f"a{rotation + 2}", f"a{rotation + 2}"
+            if any(r in state or "ptr:" + r in state for r in (size, f"a{rotation + 3}")):
+                raise Violation(f"call: the allocation entry is given a secret or a pointer to one: {text}")
+            for r in range(rotation, 16):
+                for tag in (f"a{r}", f"ptr:a{r}", f"stackbase:a{r}", f"hdrp:a{r}"):
+                    state.discard(tag)
+                state.add(f"lost:a{r}")
+            state.discard("lost:" + pointer)
+            state.add("ptr:" + pointer)
+            if any(item.startswith(("slot:", "ptrslot:")) for item in state):
+                state.add("frame-dirty")
+            return frozenset(state)
         if call and FOLLOW["path"]:
             return after_call(state, int(call.group(1)), call.group(2), text)
         if op.startswith(("call", "callx", "jx")):
@@ -1712,7 +1730,7 @@ def check_xtensa(lines, secret, pointers):
             if t(base):
                 raise Violation(f"secret address: {text}")
             at = frame_offset(state, base)
-            if header_args and t(source) and at is None:
+            if any(item.startswith("hdrp:") for item in state) and t(source) and at is None:
                 raise Violation(f"secret stored through an object pointer or outside the frame: {text}")
             if at is not None:
                 size = 1 if op.startswith("s8") else 2 if op.startswith("s16") else 4
@@ -1983,8 +2001,8 @@ def check_wasm(lines, secret, pointers, results=0):
     # call (a callee could store a secret through it): locals are untouched by a call, memory is not.
     written = {int(t.split()[1]) for _, t in lines if t.split()[:1] in (["local.set"], ["local.tee"])}
     # The crypto allocation entry (exported as abla_ct_allocate) is not read: its size must be public and its result
-    # is a pointer to an object with a public header. A local that is written only by `local.set` right after a call
-    # to it holds such a pointer; with any other call in the function (a callee could store through it) none does.
+    # is a pointer to secret memory. Any other call in the function (a callee could store through a header pointer)
+    # ends the header-public parameters.
     alloc_index = None
     if FOLLOW["object"] and any(t.split()[:1] == ["call"] for _, t in lines):
         alloc_index = wasm_module(FOLLOW["object"])[4].get(ALLOCATOR)
@@ -1992,16 +2010,8 @@ def check_wasm(lines, secret, pointers, results=0):
     other_calls = any(t.split()[:1] and t.split()[0] in ("call", "call_indirect", "call_ref", "return_call",
                                                           "return_call_indirect", "return_call_ref") and
                       not is_alloc_call(t) for _, t in lines)
-    alloc_locals = set()
-    for k in {int(lines[n + 1][1].split()[1]) for n, (_, t) in enumerate(lines[:-1])
-              if is_alloc_call(t) and lines[n + 1][1].split()[:1] == ["local.set"]}:
-        sets = sum(1 for _, t in lines if t.split()[:2] in (["local.set", str(k)], ["local.tee", str(k)]))
-        after_alloc = sum(1 for n, (_, t) in enumerate(lines[:-1])
-                          if is_alloc_call(t) and lines[n + 1][1].split()[:2] == ["local.set", str(k)])
-        if sets == after_alloc:
-            alloc_locals.add(k)
-    header_locals = set() if other_calls else ({i for i in header_args if i not in written} | alloc_locals)
-    header_mode = bool(header_args or alloc_locals)
+    header_locals = set() if other_calls else {i for i in header_args if i not in written}
+    header_mode = bool(header_args)
     for _ in range(64):
         before = {k: (set(v[0]), set(v[1])) for k, v in heads.items()}
         returned = []
@@ -2249,9 +2259,10 @@ def main():
     FOLLOW["object"] = path
     failed = 0
     if expect_allocator:
-        # Each named function must call the crypto allocation entry (by any symbol at its address): the entry is
+        # Each named function must reach a call to the crypto allocation entry (directly or through functions of the object; a
+        # smoke test that the entry is called, not a proof that one function allocates through it): the entry is
         # out of line there. If it were inlined the call would vanish, and with it the point where the checker
-        # takes the result for a header-public pointer, so that is a failure rather than a pass.
+        # takes the call out of the read, so that is a failure rather than a pass.
         names = allocator_names(path)
         if not names:
             print(f"FAIL {arch}: no {ALLOCATOR} symbol in the object")

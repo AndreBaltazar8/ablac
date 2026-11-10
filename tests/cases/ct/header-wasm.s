@@ -147,36 +147,35 @@ header_offset:
 	end_if
 	end_function
 
-# The crypto allocation entry: exported as abla_ct_allocate. A call to it returns a pointer to an object with a public
-# header. (An alias is not needed here: the call names the function by index and the export names the same index.)
+# The crypto allocation entry: exported as abla_ct_allocate. A call to it returns a pointer to secret memory (the
+# block's own header sits below the returned pointer).
 	.globl	abla_ct_allocate
 abla_ct_allocate:
 	.functype	abla_ct_allocate (i32) -> (i32)
 	local.get	0
 	end_function
 
-	.globl	alloc_header
-alloc_header:
-	.functype	alloc_header () -> ()
+	.globl	alloc_fill
+alloc_fill:
+	.functype	alloc_fill (i32) -> ()
+	.local	i32
+	i32.const	64
+	call	abla_ct_allocate
+	local.set	1
+	local.get	1
+	local.get	0
+	i32.store	8
+	end_function
+
+	.globl	alloc_read
+alloc_read:
+	.functype	alloc_read () -> ()
 	.local	i32
 	i32.const	64
 	call	abla_ct_allocate
 	local.set	0
 	local.get	0
 	i32.load	8
-	if
-	end_if
-	end_function
-
-	.globl	alloc_payload
-alloc_payload:
-	.functype	alloc_payload () -> ()
-	.local	i32
-	i32.const	64
-	call	abla_ct_allocate
-	local.set	0
-	local.get	0
-	i32.load	32
 	if
 	end_if
 	end_function
@@ -187,54 +186,6 @@ alloc_secret_size:
 	local.get	0
 	call	abla_ct_allocate
 	drop
-	end_function
-
-	.globl	alloc_store_secret
-alloc_store_secret:
-	.functype	alloc_store_secret (i32) -> ()
-	.local	i32
-	i32.const	64
-	call	abla_ct_allocate
-	local.set	1
-	local.get	1
-	local.get	0
-	i32.store	8
-	local.get	1
-	i32.load	8
-	if
-	end_if
-	end_function
-
-	.globl	alloc_overwritten
-alloc_overwritten:
-	.functype	alloc_overwritten () -> ()
-	.local	i32
-	i32.const	64
-	call	abla_ct_allocate
-	local.set	0
-	local.get	0
-	i32.const	32
-	i32.add
-	local.set	0
-	local.get	0
-	i32.load	0
-	if
-	end_if
-	end_function
-
-	.globl	alloc_copied
-alloc_copied:
-	.functype	alloc_copied () -> ()
-	.local	i32, i32
-	i32.const	64
-	call	abla_ct_allocate
-	local.set	0
-	local.get	0
-	local.set	1
-	local.get	1
-	i32.load	8
-	if
-	end_if
 	end_function
 
 	.globl	straddle

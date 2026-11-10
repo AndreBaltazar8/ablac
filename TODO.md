@@ -324,14 +324,16 @@
   it for free: in a compiler object the entry is the function in that section (read from `llvm-objdump -t`), in a
   hand fixture (linked, sections merged) the exported `abla_ct_allocate` and every symbol at its address. It is one
   `@noinline` function in `abla/crypto/alloc`, used only by `aesAllocateMemory` and `bnAllocate` (behind `rsaCrt`). A
-  call to it is not followed, `rdi`/`x0` (the size) must be public, the result is a header-public pointer, every
-  other register is lost. Built: the rule and controls on x86-64, AArch64 and Wasm (a header read, a payload read, an
-  overwritten and a copied result, a secret size, a secret stored through the result; on Wasm the result local is
-  written only by the `local.set` after the call, in a function with no other call), the module and its use, and
-  `check-asm.py --expect-allocator` (a function must call the entry). Not built: Xtensa (each function sits in a
-  section of its own and callees are named by relocation: needs a real object); real Wasm modules (no section to
-  mark the entry; a marker such as a name-section entry is needed); `--expect-allocator` on real release objects in
-  test-ct.sh; the RSA key and `aesNewKey` plumbing read through the entry; the bars below.
+  call to it is not followed, `rdi`/`x0` (the size) must be public, the result is a pointer to secret memory (ablac-f3-2
+  caught that the collector's block header sits *below* the returned pointer, so nothing at or above it is public;
+  a public prefix would need the crypto code to reserve one itself, a separate design), every other register is lost.
+  Built: the rule and its controls (filling the block with a secret is clean, reading it is secret, a secret size is
+  refused) on x86-64, AArch64, Wasm and Xtensa as hand fixtures; the module and its use; `check-asm.py
+  --expect-allocator` (a smoke test that a function reaches a call to the entry, directly or through functions of the
+  object; not a proof that one function allocates through it), run by test-ct.sh on a real x86-64 release object.
+  Not built: the same on real AArch64, Wasm and Xtensa objects (Wasm has no section to mark the entry); reading the
+  RSA key and `aesNewKey` plumbing through the entry. The section is the mark, so an identical-code fold in a linked
+  final image could merge the entry with another function; only hand fixtures are linked here.
   Bars (ablac-d1): a program importing no crypto builds byte-identical (release and `--fast`, the usual benchmark
   set); crypto benchmarks and the TLS handshake path within +0.5% instructions; a crypto-using binary's stripped size
   within +0.2% (it now exports one more symbol).

@@ -75,30 +75,12 @@ header_offset:
 1:      ret
 
 // The crypto allocation entry: exported as abla_ct_allocate and called by the compiler's fingerprinted symbol at the
-// same address (an alias here).
-        .globl  abla_ct_allocate, alloc_header, alloc_payload, alloc_secret_size, alloc_store_secret
-        .globl  alloc_overwritten, alloc_copied
+// same address (an alias here). It is not read; it returns a pointer to secret memory (the block's own header sits
+// below the returned pointer).
+        .globl  abla_ct_allocate, alloc_fill, alloc_read, alloc_secret_size
 abla_ct_allocate:
         ret
         .set    abla_fn_1234_5678_direct, abla_ct_allocate
-
-alloc_header:
-        str     x30, [sp, #-16]!
-        mov     x0, #64
-        bl      abla_fn_1234_5678_direct
-        ldr     x30, [sp], #16
-        ldr     x2, [x0, #8]
-        cbnz    x2, 1f
-1:      ret
-
-alloc_payload:
-        str     x30, [sp, #-16]!
-        mov     x0, #64
-        bl      abla_fn_1234_5678_direct
-        ldr     x30, [sp], #16
-        ldr     x2, [x0, #32]
-        cbnz    x2, 1f
-1:      ret
 
 alloc_secret_size:              // x0 is secret
         str     x30, [sp, #-16]!
@@ -106,34 +88,21 @@ alloc_secret_size:              // x0 is secret
         ldr     x30, [sp], #16
         ret
 
-alloc_store_secret:             // x1 is secret, kept in x19 over the call
+alloc_fill:                     // x1 is secret, kept in x19 over the call, stored into the new block: clean
         stp     x30, x19, [sp, #-16]!
         mov     x19, x1
         mov     x0, #64
         bl      abla_fn_1234_5678_direct
         str     x19, [x0, #8]
-        ldr     x2, [x0, #8]
         ldp     x30, x19, [sp], #16
-        cbnz    x2, 1f
-1:      ret
+        ret
 
-alloc_overwritten:
+alloc_read:                     // a read of the new block is secret
         str     x30, [sp, #-16]!
         mov     x0, #64
         bl      abla_fn_1234_5678_direct
         ldr     x30, [sp], #16
-        add     x0, x0, #32
-        ldr     x2, [x0]
-        cbnz    x2, 1f
-1:      ret
-
-alloc_copied:                   // a copy of the pointer is not a header pointer
-        stp     x30, x19, [sp, #-16]!
-        mov     x0, #64
-        bl      abla_fn_1234_5678_direct
-        mov     x19, x0
-        ldr     x2, [x19, #8]
-        ldp     x30, x19, [sp], #16
+        ldr     x2, [x0, #8]
         cbnz    x2, 1f
 1:      ret
 
@@ -160,4 +129,5 @@ globstore:                      // x1 is secret
 1:      ret
 
         .data
+        .balign 8
 glob:   .quad   0
