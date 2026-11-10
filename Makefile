@@ -382,6 +382,7 @@ test-serial: ablac
 	tools/test-json-differential.sh $(COMPILER)
 	tools/test-fuzz-differential.sh $(COMPILER)
 	tools/test-subparser-site-key.sh $(COMPILER)
+	tools/test-subparser-named-arguments.sh $(COMPILER)
 	tools/test-stable-names.sh $(COMPILER)
 	tools/test-lambda-ordinal.sh $(COMPILER)
 	tools/test-lazy-root-frames.sh $(COMPILER)
