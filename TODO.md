@@ -266,7 +266,7 @@
   - Once past the tag checks, no fixture showed a real secret branch from unoptimised lowering. The three `jge`s and
     the secret addresses that appeared on the way (loop bounds in `pbePadBody`, `rsa_crt_recombine`, `aes_block_io`;
     `bnStore`'s address) were slots made secret by the old "a call may write any slot" rule.
-  - Divisions by a secret are strength-reduced in every fixture's `--fast` build now (none is listed). **AArch64** follows `bl` and tail calls (arguments
+  - No fixture fails on a division by a secret (the old list had none; `ct_leak_divide` is still found). **AArch64** follows `bl` and tail calls (arguments
   per x0 to x7 and v0 to v7, results in x0, x1 and the vector registers, x19 and up kept, a frame address passed makes the
   frame's slots secret after the call), names stack slots by their distance below the entry stack pointer so `sp`- and
   `x29`-relative accesses to one byte agree, and reads the `--fast` object with all 64 fixtures clean
