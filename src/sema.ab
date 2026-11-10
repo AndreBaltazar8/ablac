@@ -2885,6 +2885,118 @@ fun bootstrapInterfaceAncestorsAt(
     result
 }
 
+/** Whether `names` was built from exactly these `declarations` (an append or a
+ *  truncation shows in the count; a slot replaced by another name is caught
+ *  where the index is read). */
+fun bootstrapNamesCover(
+    declarations: array<BootstrapDeclaration>,
+    names: BootstrapDeclarationNameIndex
+): bool = names.nodeDeclarations.size == declarations.size
+
+/** `bootstrapInterfaceIndexIn` through the name index: the first `interface`
+ *  declaration named `name`. Any slot whose name is not `name` means the index
+ *  is stale: the scan answers instead. */
+fun bootstrapInterfaceIndexOf(
+    declarations: array<BootstrapDeclaration>,
+    names: BootstrapDeclarationNameIndex,
+    name: string
+): int {
+    if (!bootstrapNamesCover(declarations, names)) {
+        return bootstrapInterfaceIndexIn(declarations, name)
+    }
+    var node = names.first(name)
+    while (node >= 0) {
+        val index = names.nodeDeclarations[node]
+        if (declarations[index].name != name) return bootstrapInterfaceIndexIn(declarations, name)
+        if (declarations[index].kind == "interface") return index
+        node = names.nodeNexts[node]
+    }
+    -1
+}
+
+/** `bootstrapInterfaceAncestors` through the name index. */
+fun bootstrapInterfaceAncestorsOf(
+    declarations: array<BootstrapDeclaration>,
+    names: BootstrapDeclarationNameIndex,
+    name: string
+): array<string> {
+    val result: array<string> = []
+    var next = 0
+    var current = name
+    var more = true
+    while (more) {
+        val found = bootstrapInterfaceIndexOf(declarations, names, current)
+        if (found >= 0) {
+            for (parent in declarations[found].conformances) {
+                val parentName = bootstrapNormalizeType(parent)
+                var seen = parentName == name
+                for (previous in result) {
+                    if (previous == parentName) seen = true
+                }
+                if (!seen) result.append(parentName)
+            }
+        }
+        more = next < result.size
+        if (more) {
+            current = result[next]
+            next = next + 1
+        }
+    }
+    result
+}
+
+/** `bootstrapClassInterfaces` through the name index: only the declarations
+ *  named `name` are visited, in declaration order. */
+fun bootstrapClassInterfacesOf(
+    declarations: array<BootstrapDeclaration>,
+    names: BootstrapDeclarationNameIndex,
+    name: string
+): array<string> {
+    if (!bootstrapNamesCover(declarations, names)) {
+        return bootstrapClassInterfaces(declarations, name)
+    }
+    val result: array<string> = []
+    var node = names.first(name)
+    while (node >= 0) {
+        val declaration = declarations[names.nodeDeclarations[node]]
+        if (declaration.name != name) return bootstrapClassInterfaces(declarations, name)
+        if (declaration.kind == "class" || declaration.kind == "extend") {
+            for (conformance in declaration.conformances) {
+                bootstrapAppendInterfaceOnce(result, bootstrapNormalizeType(conformance))
+            }
+        }
+        node = names.nodeNexts[node]
+    }
+    val direct = result.size
+    var index = 0
+    while (index < direct) {
+        for (ancestor in bootstrapInterfaceAncestorsOf(declarations, names, result[index])) {
+            bootstrapAppendInterfaceOnce(result, ancestor)
+        }
+        index = index + 1
+    }
+    result
+}
+
+/** `bootstrapTypeConformsIn` through the name index. */
+fun bootstrapTypeConformsVia(
+    declarations: array<BootstrapDeclaration>,
+    names: BootstrapDeclarationNameIndex,
+    type: string,
+    interfaceName: string
+): bool {
+    if (type == interfaceName) {
+        return bootstrapInterfaceIndexOf(declarations, names, type) >= 0
+    }
+    val interfaces = if (bootstrapInterfaceIndexOf(declarations, names, type) >= 0)
+        bootstrapInterfaceAncestorsOf(declarations, names, type)
+        else bootstrapClassInterfacesOf(declarations, names, type)
+    for (candidate in interfaces) {
+        if (candidate == interfaceName) return true
+    }
+    false
+}
+
 fun bootstrapAppendInterfaceOnce(var names: array<string>, name: string): void {
     for (previous in names) {
         if (previous == name) return
@@ -6916,10 +7028,12 @@ fun bootstrapMethodDeclarationIndex(
     }
     if (defaulted) {
         var known = bootstrapStringSetOf(keys)
+        val declarationNames = bootstrapDeclarationNameIndex(declarations)
         for (candidate in declarations) {
             if (candidate.kind != "class") continue
             val owner = bootstrapNormalizeType(candidate.name)
-            for (interfaceName in bootstrapClassInterfaces(declarations, candidate.name)) {
+            for (interfaceName in bootstrapClassInterfacesOf(declarations, declarationNames,
+                candidate.name)) {
                 for (member in bootstrapInterfaceAllMembers(declarations, interfaceName)) {
                     val key = bootstrapMethodDeclarationKey(owner, member.name)
                     if (known.contains(key)) continue
@@ -7499,7 +7613,7 @@ class BootstrapAnalyzer(
         val declaration = this.declarations[found]
         if ((declaration.kind != "class" && declaration.kind != "interface") ||
             declaration.name != type) return false
-        bootstrapTypeConformsIn(this.declarations, type, interfaceName)
+        bootstrapTypeConformsVia(this.declarations, this.declarationNames, type, interfaceName)
     }
 
     /** A class value where an interface it conforms to is expected (and `C?`
@@ -16201,7 +16315,8 @@ fun bootstrapInferWhen(
         } else if (match.kind == "is") {
             val target = bootstrapNormalizeType(match.text)
             if (target == subjectElement ||
-                !bootstrapTypeConformsIn(analyzer.declarations, target, subjectElement)) {
+                !bootstrapTypeConformsVia(analyzer.declarations, analyzer.declarationNames, target,
+                    subjectElement)) {
                 analyzer.fail("when.is-type@${match.begin}:$subjectElement:$target")
             }
             if (bootstrapAffineNamesContain(isTargets, target)) {
