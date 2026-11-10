@@ -5949,6 +5949,10 @@ class BootstrapEvaluator(
         if (bootstrapEvalDepth == 0) {
             bootstrapEvalDepthReported = false
             bootstrapEvalFailedFrames = 0
+            if ((bootstrapActionJournalLines.size > 0 ||
+                bootstrapActionJournalUnreplayable != "") && !bootstrapActionJournalReplaying) {
+                bootstrapActionJournalFlush(this, expression)
+            }
         }
         if (!unwinding && this.errors > errorsBefore &&
             this.diagnostics.size == diagnosticsBefore) {
@@ -5989,6 +5993,7 @@ fun bootstrapEvaluateIntrinsicCall(
             evaluator, expression, targetName, result
         )
     }
+    val journaled = bootstrapActionJournalBegin(targetName)
     if (targetName.startsWith("compiler") ||
         targetName.startsWith("typed")) {
         result = bootstrapEvaluateCallReflection(
@@ -6012,6 +6017,8 @@ fun bootstrapEvaluateIntrinsicCall(
             evaluator, expression, targetName, result
         )
     }
+    if (journaled) bootstrapActionJournalEnd(evaluator, targetName, result,
+        expression.children.size)
     if (targetName.startsWith("parser")) {
         result = bootstrapEvaluateCallParser(
             evaluator, expression, targetName, result
@@ -6352,6 +6359,398 @@ fun bootstrapEvalDepthLimit(): int {
 
 // How many stack-depth stops have been reported, ever: a caller compares it
 // before and after an evaluation to tell whether one happened inside.
+
+// The action journal (docs: TODO "result cache for compile-time transforms and actions"): with
+// ABLA_ACTION_JOURNAL=1 every compiler-API call an evaluation makes is recorded as
+// `name(arguments)=answer`, in order; the extern is off the allow-list of pure queries and
+// replayable effects (bootstrapActionJournalAllowed) marks the evaluation unreplayable.
+// Off (the default) a call costs one test of a cached number.
+var bootstrapActionJournalMode: int = -1
+var bootstrapActionJournalLines: array<string> = []
+var bootstrapActionJournalNames: array<string> = []
+var bootstrapActionJournalCallArgs: array<string> = []
+var bootstrapActionJournalSources: array<string> = []
+var bootstrapActionJournalAnswers: array<string> = []
+var bootstrapActionJournalReplaying: bool = false
+var bootstrapActionJournalCheck: int = -1
+var bootstrapActionJournalArgs: array<string> = []
+var bootstrapActionJournalMarks: array<int> = []
+var bootstrapActionJournalCalls: array<string> = []
+var bootstrapActionJournalUnreplayable: string = ""
+
+fun bootstrapActionJournalOn(): bool {
+    if (bootstrapActionJournalMode < 0) {
+        val configured = linuxEnvironment("ABLA_ACTION_JOURNAL")
+        // Native compile-time code (jit, bridge) calls the API through a route whose argument reads
+        // would flush the journal mid-action: the journal is for the interpreter.
+        val route = linuxEnvironment("ABLA_COMPILE_EVAL")
+        val interpreted = !route.found || route.value == "" || route.value == "interp"
+        bootstrapActionJournalMode = if (!interpreted) 0
+            else if (configured.found && configured.value == "1") 1
+            else if (configured.found && configured.value == "check") 2
+            else if (configured.found && configured.value == "mutate") 3
+            else if (configured.found && configured.value == "shift") 4 else 0
+    }
+    bootstrapActionJournalMode > 0 && !bootstrapActionJournalReplaying
+}
+
+// The externs a record may contain: pure queries of the program, the environment, and the one
+// effect step (b) replays (compilerGenerateModule stages a module: the record then has to hold the
+// staged namespace and source). The prefixes were checked against the extern list: none covers a
+// mutating one.
+fun bootstrapActionJournalAllowed(name: string): bool =
+    name.startsWith("compilerFunction") || name.startsWith("compilerClass") ||
+        name.startsWith("compilerContract") ||
+        name.startsWith("compilerType") || name.startsWith("compilerBinding") ||
+        name.startsWith("compilerConformance") || name.startsWith("compilerImplementer") ||
+        name.startsWith("compilerGenericInstance") || name.startsWith("compilerFind") ||
+        name.startsWith("compilerWitness") || name.startsWith("compilerExtensionField") ||
+        name == "compilerFunctions" || name == "compilerEnvironment" ||
+        name == "compilerGenerateModule" || name == "compilerIsPrivate" ||
+        name == "compilerGeneratedModule" || name == "compilerGeneratedModuleSource"
+
+fun bootstrapActionJournalDigest(value: BootstrapEvalValue): string {
+    if (value.kind == "integer") return "i${value.integer}"
+    if (value.kind == "boolean") return if (value.boolean) "b1" else "b0"
+    if (value.kind == "void") return "v"
+    if (value.kind == "string") return "s${value.text.size}:${value.text}"
+    if (value.kind == "array") {
+        var text = "a${value.elements.size}["
+        for (element in value.elements) text = "$text${bootstrapActionJournalDigest(element)},"
+        return "$text]"
+    }
+    if (bootstrapActionJournalUnreplayable == "") bootstrapActionJournalUnreplayable =
+        "value of kind ${value.kind}"
+    "?${value.kind}"
+}
+
+// Function handles are positions in the declaration array: an edit before a function shifts them, so
+// the journal holds the canonical identity they denote (`h<size>:<identity>`), and replays a
+// literal as `compilerFindFunction(identity)`. An identity that does not find the same handle again
+// (overloads share a name) makes the record unreplayable.
+fun bootstrapActionJournalFunctionIdentity(var evaluator: BootstrapEvaluator, handle: int): string {
+    if (!evaluator.functionHandleValid(handle)) return ""
+    val owner = evaluator.functionHandleOwner(handle)
+    val method = evaluator.functionHandleMethod(handle)
+    var declaration = evaluator.declarations[handle]
+    if (owner >= 0) declaration = evaluator.declarations[owner].methods[method]
+    var identity = declaration.name
+    if (owner >= 0) {
+        identity = "${evaluator.declarations[owner].name}.${declaration.name}"
+    } else if (declaration.extensionOwner != "") {
+        identity = "${bootstrapNormalizeType(declaration.extensionOwner)}.${declaration.name}"
+    }
+    identity
+}
+
+fun bootstrapActionJournalHandleDigest(var evaluator: BootstrapEvaluator, handle: int): string {
+    val identity = bootstrapActionJournalFunctionIdentity(evaluator, handle)
+    var found = -2
+    if (identity != "") {
+        val was = bootstrapActionJournalReplaying
+        bootstrapActionJournalReplaying = true
+        found = evaluator.evaluate(BootstrapExpression(
+            "call", "compilerFindFunction", 0, 1,
+            [BootstrapExpression("string", identity, 0, 1, [])]
+        )).integer
+        bootstrapActionJournalReplaying = was
+    }
+    if (found != handle) {
+        if (bootstrapActionJournalUnreplayable == "") {
+            bootstrapActionJournalUnreplayable = "function handle $handle without a stable identity"
+        }
+        return "i$handle"
+    }
+    // The number is observable (an action can interpolate it, sort by it, key a map with it), so a hit
+    // needs the same one; the identity says which function it was.
+    "h${identity.size}:$identity#$handle"
+}
+
+fun bootstrapActionJournalTakesFunction(name: string): bool =
+    name.startsWith("compilerFunction") && name != "compilerFunctions" &&
+        name != "compilerFunctionsAnnotated"
+
+fun bootstrapActionJournalListsFunctions(name: string): bool =
+    name == "compilerFunctions" || name == "compilerFunctionsAnnotated" ||
+        name == "compilerContractFunctionsAnnotated"
+
+fun bootstrapActionJournalAnswerDigest(
+    var evaluator: BootstrapEvaluator,
+    name: string,
+    answer: BootstrapEvalValue
+): string {
+    if (name == "compilerFindFunction" && answer.kind == "integer" && answer.integer >= 0) {
+        return bootstrapActionJournalHandleDigest(evaluator, answer.integer)
+    }
+    if (bootstrapActionJournalListsFunctions(name) && answer.kind == "array") {
+        var text = "a${answer.elements.size}["
+        for (element in answer.elements) {
+            text = "$text${bootstrapActionJournalHandleDigest(evaluator, element.integer)},"
+        }
+        return "$text]"
+    }
+    bootstrapActionJournalDigest(answer)
+}
+
+// One evaluation is over (the outermost `evaluate` returned): its journal goes to the diagnostics
+// stream and starts again. (Step (a) prints; the record and its check mode come from here.)
+fun bootstrapActionJournalFlush(var evaluator: BootstrapEvaluator,
+    expression: BootstrapExpression): void {
+    if (bootstrapActionJournalMode >= 2) bootstrapActionJournalReplay(evaluator, expression)
+    linuxWriteStandardError("ACTION-JOURNAL ${expression.kind} ${expression.text} @${expression.begin} " +
+        "calls=${bootstrapActionJournalLines.size} replayable=${bootstrapActionJournalUnreplayable == ""} " +
+        "${bootstrapActionJournalUnreplayable}\n")
+    for (line in bootstrapActionJournalLines) linuxWriteStandardError("  $line\n")
+    bootstrapActionJournalLines = []
+    bootstrapActionJournalNames = []
+    bootstrapActionJournalCallArgs = []
+    bootstrapActionJournalSources = []
+    bootstrapActionJournalAnswers = []
+    bootstrapActionJournalUnreplayable = ""
+    return
+}
+
+// The arguments of a journaled call back as literal expressions (integers, booleans, strings; the
+// digests are self-delimiting). An empty array: the digest holds a kind a literal cannot spell.
+var bootstrapActionJournalMoved: bool = false
+
+fun bootstrapActionJournalLiterals(
+    var evaluator: BootstrapEvaluator,
+    text: string,
+    at: int
+): array<BootstrapExpression> {
+    val result: array<BootstrapExpression> = []
+    var index = 0
+    while (index < text.size) {
+        val kind = text[index]
+        if (kind == 105) {
+            var end = index + 1
+            while (end < text.size && (text[end] == 45 || (text[end] >= 48 && text[end] <=
+                57))) end = end + 1
+            result.append(BootstrapExpression("integer", text.slice(index + 1, end), at, at + 1,
+                []))
+            index = end
+        } else if (kind == 98) {
+            result.append(BootstrapExpression(if (text[index + 1] == 49) "true" else "false", "",
+                at, at + 1, []))
+            index = index + 2
+        } else if (kind == 104) {
+            var colon = index + 1
+            while (text[colon] != 58) colon = colon + 1
+            var size = 0
+            var digit = index + 1
+            while (digit < colon) {
+                size = size * 10 + (text[digit] - 48)
+                digit = digit + 1
+            }
+            val identity = text.slice(colon + 1, colon + 1 + size)
+            var end = colon + 2 + size
+            var number = 0
+            while (end < text.size && text[end] >= 48 && text[end] <= 57) {
+                number = number * 10 + (text[end] - 48)
+                end = end + 1
+            }
+            // The identity must still denote the handle the journal holds, or it is a miss.
+            val found = evaluator.evaluate(BootstrapExpression("call", "compilerFindFunction", at,
+                at + 1,
+                [BootstrapExpression("string", identity, at, at + 1, [])])).integer
+            if (found != number) bootstrapActionJournalMoved = true
+            result.append(BootstrapExpression("integer", "$number", at, at + 1, []))
+            index = end
+        } else if (kind == 115) {
+            var colon = index + 1
+            while (text[colon] != 58) colon = colon + 1
+            var size = 0
+            var digit = index + 1
+            while (digit < colon) {
+                size = size * 10 + (text[digit] - 48)
+                digit = digit + 1
+            }
+            result.append(BootstrapExpression("string", text.slice(colon + 1, colon + 1 + size), at,
+                at + 1, []))
+            index = colon + 1 + size
+        } else return []
+    }
+    result
+}
+
+// Mutate mode (=mutate) compares against each recorded answer changed by one byte: every comparison must
+// report a mismatch (the test that a miss is detected, per query kind, not only that a hit is).
+// Check mode (ABLA_ACTION_JOURNAL=check): the pure queries of the evaluation just finished are asked again
+// of the same program and must give the same answers. A mismatch is reported; none is a hole in
+// the journal (what is recorded does not determine what is answered).
+// The program the shift mode replays against: the first declaration moved to the end, so that every handle
+// but that one's moves by one place and no function is added, removed or renamed; what the answers say
+// about the others must not change. (The evaluation's own state is not copied: queries need only the
+// declarations.)
+fun bootstrapActionJournalShifted(evaluator: BootstrapEvaluator): BootstrapEvaluator {
+    val declarations: array<BootstrapDeclaration> = []
+    var index = 1
+    while (index < evaluator.declarations.size) {
+        declarations.append(evaluator.declarations[index])
+        index = index + 1
+    }
+    if (evaluator.declarations.size > 0) declarations.append(evaluator.declarations[0])
+    val context = bootstrapEvalContext(declarations)
+    val names: array<string> = []
+    val values: array<BootstrapEvalValue> = []
+    val mutable: array<bool> = []
+    val cursors: array<BootstrapSubparserCursor> = []
+    val syntax: array<BootstrapExpression> = []
+    val generatedDeclarations: array<BootstrapDeclaration> = []
+    val extensionRequests: array<BootstrapExtensionRequest> = []
+    val compileInputPaths: array<string> = []
+    val compileInputContents: array<string> = []
+    val globalKeys: array<string> = []
+    val globalValues: array<BootstrapEvalValue> = []
+    BootstrapEvaluator(
+        declarations,
+        context.affineTypes,
+        context,
+        names,
+        values,
+        mutable,
+        cursors,
+        syntax,
+        [],
+        [],
+        generatedDeclarations,
+        extensionRequests,
+        compileInputPaths,
+        compileInputContents,
+        globalKeys,
+        globalValues,
+        0,
+        0,
+        0,
+        ""
+    )
+}
+
+fun bootstrapActionJournalReplay(var original: BootstrapEvaluator,
+    expression: BootstrapExpression): void {
+    if (bootstrapActionJournalMode == 4) {
+        val shifted = bootstrapActionJournalShifted(original)
+        bootstrapActionJournalReplayOn(shifted, expression)
+    } else bootstrapActionJournalReplayOn(original, expression)
+    return
+}
+
+fun bootstrapActionJournalReplayOn(var evaluator: BootstrapEvaluator,
+    expression: BootstrapExpression): void {
+    bootstrapActionJournalReplaying = true
+    val sourceBeforeLoop = evaluator.sourceIdentity
+    var functionMismatched = 0
+    var checked = 0
+    var mismatched = 0
+    var index = 0
+    val total = bootstrapActionJournalNames.size
+    while (index < total) {
+        val name = bootstrapActionJournalNames[index]
+        if (name != "compilerGenerateModule" && bootstrapActionJournalAllowed(name)) {
+            evaluator.sourceIdentity = bootstrapActionJournalSources[index]
+            bootstrapActionJournalMoved = false
+            val arguments = bootstrapActionJournalLiterals(
+                evaluator, bootstrapActionJournalCallArgs[index], expression.begin
+            )
+            val spelled = bootstrapActionJournalCallArgs[index].size == 0 || arguments.size > 0
+            if (bootstrapActionJournalMoved) {
+                checked = checked + 1
+                mismatched = mismatched + 1
+                functionMismatched = functionMismatched + 1
+            } else if (spelled) {
+                val answer = evaluator.evaluate(BootstrapExpression(
+                    "call", name, expression.begin, expression.begin + 1, arguments
+                ))
+                checked = checked + 1
+                val expected = if (bootstrapActionJournalMode == 3)
+                    "${bootstrapActionJournalAnswers[index]}~"
+                    else bootstrapActionJournalAnswers[index]
+                if (bootstrapActionJournalAnswerDigest(evaluator, name, answer) != expected) {
+                    mismatched = mismatched + 1
+                    if (name.startsWith("compilerFunction") || name == "compilerFindFunction") {
+                        functionMismatched = functionMismatched + 1
+                    }
+                    if (mismatched <= 5) {
+                        linuxWriteStandardError("ACTION-JOURNAL-MISMATCH $name ${bootstrapActionJournalCallArgs[index]} was ${bootstrapActionJournalAnswers[index]} now ${bootstrapActionJournalAnswerDigest(evaluator, name, answer)}\n")
+                    }
+                }
+            }
+        }
+        evaluator.sourceIdentity = sourceBeforeLoop
+        index = index + 1
+    }
+    bootstrapActionJournalReplaying = false
+    linuxWriteStandardError("ACTION-JOURNAL-CHECK ${expression.text} checked=$checked mismatched=$mismatched functions=$functionMismatched\n")
+    return
+}
+
+fun bootstrapEvalJournalArg(
+    var evaluator: BootstrapEvaluator,
+    expression: BootstrapExpression,
+    index: int
+): BootstrapEvalValue {
+    val value = evaluator.evaluate(expression.children[index])
+    if (bootstrapActionJournalMarks.size > 0 && !bootstrapActionJournalReplaying) {
+        val top = bootstrapActionJournalCalls[bootstrapActionJournalCalls.size - 1]
+        if (index == 0 && bootstrapActionJournalTakesFunction(top) && value.kind == "integer") {
+            bootstrapActionJournalArgs.append(bootstrapActionJournalHandleDigest(evaluator,
+                value.integer))
+        } else bootstrapActionJournalArgs.append(bootstrapActionJournalDigest(value))
+    }
+    value
+}
+
+// True when this call is recorded: every compiler call, nested ones (an argument that is itself a query)
+// first, each with the digests of its own arguments.
+fun bootstrapActionJournalBegin(name: string): bool {
+    if (!bootstrapActionJournalOn()) return false
+    // Typed-program, parser and syntax externs observe state a record cannot replay.
+    if ((name.startsWith("typed") || name.startsWith("parser") || name.startsWith("syntax")) &&
+        bootstrapActionJournalUnreplayable == "") {
+        bootstrapActionJournalUnreplayable = "extern $name"
+    }
+    if (!name.startsWith("compiler")) return false
+    bootstrapActionJournalMarks.append(bootstrapActionJournalArgs.size)
+    bootstrapActionJournalCalls.append(name)
+    true
+}
+
+fun bootstrapActionJournalEnd(
+    var evaluator: BootstrapEvaluator,
+    name: string,
+    answer: BootstrapEvalValue,
+    arguments: int
+): void {
+    val mark = bootstrapActionJournalMarks[bootstrapActionJournalMarks.size - 1]
+    bootstrapActionJournalMarks.truncate(bootstrapActionJournalMarks.size - 1)
+    bootstrapActionJournalCalls.truncate(bootstrapActionJournalCalls.size - 1)
+    if (!bootstrapActionJournalAllowed(name) && bootstrapActionJournalUnreplayable == "") {
+        bootstrapActionJournalUnreplayable = "extern $name"
+    }
+    // An extern whose callee read its arguments some other way than bootstrapEvalJournalArg
+    // would be journaled with fewer arguments than it was called with: unreplayable.
+    if (bootstrapActionJournalArgs.size - mark != arguments && bootstrapActionJournalUnreplayable ==
+        "") {
+        bootstrapActionJournalUnreplayable = "arguments of $name not journaled"
+    }
+    var joined = ""
+    var argument = mark
+    while (argument < bootstrapActionJournalArgs.size) {
+        joined = "$joined${bootstrapActionJournalArgs[argument]}"
+        argument = argument + 1
+    }
+    bootstrapActionJournalArgs.truncate(mark)
+    val digest = bootstrapActionJournalAnswerDigest(evaluator, name, answer)
+    bootstrapActionJournalLines.append("$name|$joined=$digest")
+    bootstrapActionJournalNames.append(name)
+    bootstrapActionJournalCallArgs.append(joined)
+    // The calling module is an input of the private-name lookups (compilerFindFunction, compilerFindClass).
+    bootstrapActionJournalSources.append(evaluator.sourceIdentity)
+    bootstrapActionJournalAnswers.append(digest)
+    return
+}
+
 var bootstrapEvalDepthStops: int = 0
 
 /** The number of `error[` lines in `diagnostics`. */
@@ -8998,13 +9397,13 @@ fun bootstrapEvaluateCallReflection(
     // stable for one compilation and need no host state, so reflection
     // works identically in the self-hosted compile-time evaluator.
     if (targetName == "compilerFindType") {
-        val name = evaluator.evaluate(expression.children[0])
+        val name = bootstrapEvalJournalArg(evaluator, expression, 0)
         result = bootstrapEvalInteger(evaluator.reflectedTypeHandle(
             bootstrapEvalGenericSpelling(evaluator, name.text)
         ))
     }
     if (targetName == "typedExpressionTypeHandle") {
-        val syntaxHandle = evaluator.evaluate(expression.children[0]).integer
+        val syntaxHandle = bootstrapEvalJournalArg(evaluator, expression, 0).integer
         if (syntaxHandle >= 0 && syntaxHandle < evaluator.syntax.size) {
             val syntaxExpression = evaluator.syntax[syntaxHandle]
             val typed = evaluator.typedCallIndex(syntaxExpression)
@@ -9019,8 +9418,8 @@ fun bootstrapEvaluateCallReflection(
         } else evaluator.errors = evaluator.errors + 1
     }
     if (targetName == "compilerFunctionParameterTypeHandle") {
-        val handle = evaluator.evaluate(expression.children[0]).integer
-        val parameter = evaluator.evaluate(expression.children[1]).integer
+        val handle = bootstrapEvalJournalArg(evaluator, expression, 0).integer
+        val parameter = bootstrapEvalJournalArg(evaluator, expression, 1).integer
         val type = evaluator.functionHandleParameterType(handle, parameter)
         val typeHandle = evaluator.reflectedTypeHandle(type)
         if (evaluator.functionHandleValid(handle) && typeHandle >= 0) {
@@ -9028,7 +9427,7 @@ fun bootstrapEvaluateCallReflection(
         } else evaluator.errors = evaluator.errors + 1
     }
     if (targetName == "compilerFunctionResultTypeHandle") {
-        val handle = evaluator.evaluate(expression.children[0]).integer
+        val handle = bootstrapEvalJournalArg(evaluator, expression, 0).integer
         val typeHandle = evaluator.reflectedTypeHandle(
             evaluator.functionHandleResultType(handle)
         )
@@ -9037,8 +9436,8 @@ fun bootstrapEvaluateCallReflection(
         } else evaluator.errors = evaluator.errors + 1
     }
     if (targetName == "compilerClassFieldTypeHandle") {
-        val handle = evaluator.evaluate(expression.children[0]).integer
-        val field = evaluator.evaluate(expression.children[1]).integer
+        val handle = bootstrapEvalJournalArg(evaluator, expression, 0).integer
+        val field = bootstrapEvalJournalArg(evaluator, expression, 1).integer
         val typeHandle = evaluator.reflectedTypeHandle(
             evaluator.classFieldType(handle, field)
         )
@@ -9054,7 +9453,7 @@ fun bootstrapEvaluateCallReflection(
         targetName == "compilerTypeElement" ||
         targetName == "compilerTypeResult" ||
         targetName == "compilerTypeDeclaration") {
-        val handle = evaluator.evaluate(expression.children[0]).integer
+        val handle = bootstrapEvalJournalArg(evaluator, expression, 0).integer
         if (evaluator.reflectedTypeValid(handle)) {
             val type = evaluator.reflectedTypes[handle]
             val kind = evaluator.reflectedTypeKind(type)
@@ -9127,8 +9526,8 @@ fun bootstrapEvaluateCallReflection(
         } else evaluator.errors = evaluator.errors + 1
     }
     if (targetName == "compilerTypeArgument") {
-        val handle = evaluator.evaluate(expression.children[0]).integer
-        val argument = evaluator.evaluate(expression.children[1]).integer
+        val handle = bootstrapEvalJournalArg(evaluator, expression, 0).integer
+        val argument = bootstrapEvalJournalArg(evaluator, expression, 1).integer
         if (evaluator.reflectedTypeValid(handle)) {
             val type = evaluator.reflectedTypes[handle]
             var argumentType = "unknown"
@@ -9188,7 +9587,7 @@ fun bootstrapEvaluateCallReflection(
     if (targetName == "compilerFunctionsAnnotated" || targetName ==
         "compilerContractFunctionsAnnotated") {
         val contracts = targetName == "compilerContractFunctionsAnnotated"
-        val annotation = evaluator.evaluate(expression.children[0])
+        val annotation = bootstrapEvalJournalArg(evaluator, expression, 0)
         val handles: array<BootstrapEvalValue> = []
         if (annotation.kind == "string") {
             var declarationIndex = 0
@@ -9787,7 +10186,7 @@ fun bootstrapEvaluateCallCompiler(
 ): BootstrapEvalValue {
     var result = initial
     if (targetName == "compilerFindFunction") {
-        val written = evaluator.evaluate(expression.children[0])
+        val written = bootstrapEvalJournalArg(evaluator, expression, 0)
         // `first<int>`: the generic's instance.
         val name = bootstrapEvalString(bootstrapEvalGenericSpelling(evaluator, written.text))
         var handle = -1
@@ -9817,14 +10216,14 @@ fun bootstrapEvaluateCallCompiler(
         result = bootstrapEvalInteger(handle)
     }
     if (targetName == "compilerIsPrivate") {
-        val handle = evaluator.evaluate(expression.children[0]).integer
+        val handle = bootstrapEvalJournalArg(evaluator, expression, 0).integer
         result = bootstrapEvalBoolean(
             handle >= 0 && handle < evaluator.declarations.size &&
                 evaluator.declarations[handle].isPrivate
         )
     }
     if (targetName == "compilerFindBinding") {
-        val name = evaluator.evaluate(expression.children[0])
+        val name = bootstrapEvalJournalArg(evaluator, expression, 0)
         var handle = -1
         var declaration = 0
         while (declaration < evaluator.declarations.size) {
@@ -9845,7 +10244,7 @@ fun bootstrapEvaluateCallCompiler(
         targetName == "compilerBindingCanReplaceDelegate" ||
         targetName == "compilerBindingByBegin" ||
         targetName == "compilerBindingByEnd") {
-        val handle = evaluator.evaluate(expression.children[0]).integer
+        val handle = bootstrapEvalJournalArg(evaluator, expression, 0).integer
         if (evaluator.bindingHandleValid(handle)) {
             val declaration = evaluator.declarations[handle]
             val delegated = evaluator.bindingIsDelegated(handle)
@@ -9916,7 +10315,7 @@ fun bootstrapEvaluateCallCompiler(
         targetName == "compilerFunctionIsCompileOnly" ||
         targetName == "compilerFunctionIsTrusted" ||
         targetName == "compilerFunctionIsExternal") {
-        val handle = evaluator.evaluate(expression.children[0]).integer
+        val handle = bootstrapEvalJournalArg(evaluator, expression, 0).integer
         val validHandle = evaluator.functionHandleValid(handle)
         if (validHandle) {
             val owner = evaluator.functionHandleOwner(handle)
@@ -9969,9 +10368,7 @@ fun bootstrapEvaluateCallCompiler(
                 result = bootstrapEvalInteger(declaration.parameters.size)
             }
             if (targetName == "compilerFunctionParameterName") {
-                val parameter = evaluator.evaluate(
-                    expression.children[1]
-                ).integer
+                val parameter = bootstrapEvalJournalArg(evaluator, expression, 1).integer
                 if (parameter >= 0 &&
                     parameter < declaration.parameters.size) {
                     result = bootstrapEvalString(
@@ -9980,9 +10377,7 @@ fun bootstrapEvaluateCallCompiler(
                 } else evaluator.errors = evaluator.errors + 1
             }
             if (targetName == "compilerFunctionParameterType") {
-                val parameter = evaluator.evaluate(
-                    expression.children[1]
-                ).integer
+                val parameter = bootstrapEvalJournalArg(evaluator, expression, 1).integer
                 if (parameter >= 0 &&
                     parameter < declaration.parameterTypes.size) {
                     result = bootstrapEvalString(bootstrapSourceVisibleType(
@@ -10003,9 +10398,7 @@ fun bootstrapEvaluateCallCompiler(
                 result = bootstrapEvalInteger(declaration.annotations.size)
             }
             if (targetName == "compilerFunctionAnnotation") {
-                val annotation = evaluator.evaluate(
-                    expression.children[1]
-                ).integer
+                val annotation = bootstrapEvalJournalArg(evaluator, expression, 1).integer
                 if (annotation >= 0 &&
                     annotation < declaration.annotations.size) {
                     result = bootstrapEvalString(
@@ -10020,11 +10413,9 @@ fun bootstrapEvaluateCallCompiler(
                 targetName == "compilerFunctionAnnotationArgumentKind" ||
                 targetName == "compilerFunctionAnnotationArgumentText" ||
                 targetName == "compilerFunctionAnnotationArgument") {
-                val annotation = evaluator.evaluate(
-                    expression.children[1]
-                ).integer
+                val annotation = bootstrapEvalJournalArg(evaluator, expression, 1).integer
                 val argument = if (expression.children.size > 2) {
-                    evaluator.evaluate(expression.children[2]).integer
+                    bootstrapEvalJournalArg(evaluator, expression, 2).integer
                 } else 0
                 val present = annotation >= 0 &&
                     annotation < declaration.annotations.size &&
@@ -10075,7 +10466,7 @@ fun bootstrapEvaluateCallCompiler(
     if (targetName == "compilerFunctionGenericSubstitutionCount" ||
         targetName == "compilerFunctionGenericSubstitutionName" ||
         targetName == "compilerFunctionGenericSubstitutionTypeHandle") {
-        val handle = evaluator.evaluate(expression.children[0]).integer
+        val handle = bootstrapEvalJournalArg(evaluator, expression, 0).integer
         if (evaluator.functionHandleValid(handle)) {
             // An instance of a generic (or a method of one) carries its type
             // arguments; any other function has none.
@@ -10090,7 +10481,7 @@ fun bootstrapEvaluateCallCompiler(
                 "compilerFunctionGenericSubstitutionCount") {
                 result = bootstrapEvalInteger(names.size)
             } else {
-                val substitution = evaluator.evaluate(expression.children[1]).integer
+                val substitution = bootstrapEvalJournalArg(evaluator, expression, 1).integer
                 if (substitution < 0 || substitution >= names.size) {
                     evaluator.errors = evaluator.errors + 1
                 } else if (targetName == "compilerFunctionGenericSubstitutionName") {
@@ -10106,7 +10497,7 @@ fun bootstrapEvaluateCallCompiler(
     // (`Box<i64>`).
     if (targetName == "compilerGenericInstanceCount" ||
         targetName == "compilerGenericInstanceName") {
-        val generic = evaluator.evaluate(expression.children[0]).text
+        val generic = bootstrapEvalJournalArg(evaluator, expression, 0).text
         val names: array<string> = []
         for (declaration in evaluator.declarations) {
             if (bootstrapIsGenericInstanceName(declaration.name) &&
@@ -10119,7 +10510,7 @@ fun bootstrapEvaluateCallCompiler(
         if (targetName == "compilerGenericInstanceCount") {
             result = bootstrapEvalInteger(names.size)
         } else {
-            val wanted = evaluator.evaluate(expression.children[1]).integer
+            val wanted = bootstrapEvalJournalArg(evaluator, expression, 1).integer
             if (wanted < 0 || wanted >= names.size) {
                 evaluator.errors = evaluator.errors + 1
             } else result = bootstrapEvalString(names[wanted])
@@ -10129,7 +10520,7 @@ fun bootstrapEvaluateCallCompiler(
     // program's others (a generated declaration asks the generics pass for
     // it); elsewhere it must exist already. Either way, its name as written.
     if (targetName == "compilerInstantiate") {
-        val spelling = evaluator.evaluate(expression.children[0]).text
+        val spelling = bootstrapEvalJournalArg(evaluator, expression, 0).text
         // While a round of lowering runs, the generics themselves are in its
         // raw program (the analyzed one has only their instances).
         val known: array<BootstrapDeclaration> = []
@@ -10185,7 +10576,7 @@ fun bootstrapEvaluateCallCompiler(
     }
     if (targetName == "compilerFindClass") {
         val name = bootstrapEvalGenericSpelling(evaluator,
-            evaluator.evaluate(expression.children[0]).text)
+            bootstrapEvalJournalArg(evaluator, expression, 0).text)
         var handle = -1
         var declaration = 0
         while (declaration < evaluator.declarations.size) {
@@ -10200,14 +10591,14 @@ fun bootstrapEvaluateCallCompiler(
     }
     if (targetName == "compilerClassTypeParameterCount" ||
         targetName == "compilerClassTypeParameterName") {
-        val handle = evaluator.evaluate(expression.children[0]).integer
+        val handle = bootstrapEvalJournalArg(evaluator, expression, 0).integer
         val parameters = if (handle >= 0 && handle <
             evaluator.declarations.size) bootstrapGenericParameterNames(evaluator
                     .declarations[handle]) else []
         if (targetName == "compilerClassTypeParameterCount") {
             result = bootstrapEvalInteger(parameters.size)
         } else {
-            val index = evaluator.evaluate(expression.children[1]).integer
+            val index = bootstrapEvalJournalArg(evaluator, expression, 1).integer
             result = bootstrapEvalString(if (index >= 0 && index <
                 parameters.size) parameters[index] else "")
         }
@@ -10218,7 +10609,7 @@ fun bootstrapEvaluateCallCompiler(
         targetName == "compilerClassFieldIsMutable" ||
         targetName == "compilerClassFieldIsDelegated" ||
         targetName == "compilerClassFieldDelegateType") {
-        val handle = evaluator.evaluate(expression.children[0]).integer
+        val handle = bootstrapEvalJournalArg(evaluator, expression, 0).integer
         val valid = handle >= 0 && handle < evaluator.declarations.size &&
             evaluator.declarations[handle].kind == "class"
         if (valid) {
@@ -10235,9 +10626,7 @@ fun bootstrapEvaluateCallCompiler(
                 }
                 result = bootstrapEvalInteger(count)
             } else {
-                val wanted = evaluator.evaluate(
-                    expression.children[1]
-                ).integer
+                val wanted = bootstrapEvalJournalArg(evaluator, expression, 1).integer
                 var field = -1
                 var count = 0
                 var parameter = 0
@@ -10289,7 +10678,7 @@ fun bootstrapEvaluateCallCompiler(
         targetName == "compilerExtensionFieldName" ||
         targetName == "compilerExtensionFieldType" ||
         targetName == "compilerExtensionFieldIsMutable") {
-        val handle = evaluator.evaluate(expression.children[0]).integer
+        val handle = bootstrapEvalJournalArg(evaluator, expression, 0).integer
         val fields = if (handle >= 0 && handle < evaluator.declarations.size &&
             evaluator.declarations[handle].kind == "class")
             bootstrapEvalExtensionFields(evaluator.declarations,
@@ -10301,7 +10690,7 @@ fun bootstrapEvaluateCallCompiler(
         } else if (targetName == "compilerExtensionFieldCount") {
             result = bootstrapEvalInteger(fields.size)
         } else {
-            val wanted = evaluator.evaluate(expression.children[1]).integer
+            val wanted = bootstrapEvalJournalArg(evaluator, expression, 1).integer
             if (wanted < 0 || wanted >= fields.size) {
                 evaluator.errors = evaluator.errors + 1
             } else {
@@ -10322,11 +10711,11 @@ fun bootstrapEvaluateCallCompiler(
     // `var Owner.name: type = default` (`val` when not mutable), checked with
     // the complete candidate program as a written one is.
     if (targetName == "compilerAddExtensionField") {
-        val handle = evaluator.evaluate(expression.children[0]).integer
-        val name = evaluator.evaluate(expression.children[1])
-        val type = evaluator.evaluate(expression.children[2])
-        val initial = evaluator.evaluate(expression.children[3])
-        val mutable = evaluator.evaluate(expression.children[4])
+        val handle = bootstrapEvalJournalArg(evaluator, expression, 0).integer
+        val name = bootstrapEvalJournalArg(evaluator, expression, 1)
+        val type = bootstrapEvalJournalArg(evaluator, expression, 2)
+        val initial = bootstrapEvalJournalArg(evaluator, expression, 3)
+        val mutable = bootstrapEvalJournalArg(evaluator, expression, 4)
         val valid = handle >= 0 && handle < evaluator.declarations.size &&
             evaluator.declarations[handle].kind == "class" &&
             name.kind == "string" && type.kind == "string" &&
@@ -10348,7 +10737,7 @@ fun bootstrapEvaluateCallCompiler(
     // the class's witness for one (member by member).
     if (targetName == "compilerConformanceCount" ||
         targetName == "compilerConformanceName") {
-        val handle = evaluator.evaluate(expression.children[0]).integer
+        val handle = bootstrapEvalJournalArg(evaluator, expression, 0).integer
         if (handle < 0 || handle >= evaluator.declarations.size ||
             evaluator.declarations[handle].kind != "class") {
             evaluator.errors = evaluator.errors + 1
@@ -10359,7 +10748,7 @@ fun bootstrapEvaluateCallCompiler(
             if (targetName == "compilerConformanceCount") {
                 result = bootstrapEvalInteger(names.size)
             } else {
-                val wanted = evaluator.evaluate(expression.children[1]).integer
+                val wanted = bootstrapEvalJournalArg(evaluator, expression, 1).integer
                 if (wanted < 0 || wanted >= names.size) {
                     evaluator.errors = evaluator.errors + 1
                 } else result = bootstrapEvalString(bootstrapGenericVisible(names[wanted]))
@@ -10369,7 +10758,7 @@ fun bootstrapEvaluateCallCompiler(
     if (targetName == "compilerImplementerCount" ||
         targetName == "compilerImplementerName") {
         val name = bootstrapEvalGenericSpelling(evaluator,
-            evaluator.evaluate(expression.children[0]).text)
+            bootstrapEvalJournalArg(evaluator, expression, 0).text)
         val names: array<string> = []
         for (candidate in evaluator.declarations) {
             if (candidate.kind == "class") {
@@ -10383,7 +10772,7 @@ fun bootstrapEvaluateCallCompiler(
         if (targetName == "compilerImplementerCount") {
             result = bootstrapEvalInteger(names.size)
         } else {
-            val wanted = evaluator.evaluate(expression.children[1]).integer
+            val wanted = bootstrapEvalJournalArg(evaluator, expression, 1).integer
             if (wanted < 0 || wanted >= names.size) {
                 evaluator.errors = evaluator.errors + 1
             } else result = bootstrapEvalString(bootstrapGenericVisible(names[wanted]))
@@ -10391,8 +10780,8 @@ fun bootstrapEvaluateCallCompiler(
     }
     if (targetName == "compilerWitnessCount" ||
         targetName == "compilerWitnessEntry") {
-        val handle = evaluator.evaluate(expression.children[0]).integer
-        val name = evaluator.evaluate(expression.children[1]).text
+        val handle = bootstrapEvalJournalArg(evaluator, expression, 0).integer
+        val name = bootstrapEvalJournalArg(evaluator, expression, 1).text
         var interfaceIndex = -1
         var index = 0
         while (index < evaluator.declarations.size) {
@@ -10409,7 +10798,7 @@ fun bootstrapEvaluateCallCompiler(
             if (targetName == "compilerWitnessCount") {
                 result = bootstrapEvalInteger(members.size)
             } else {
-                val wanted = evaluator.evaluate(expression.children[2]).integer
+                val wanted = bootstrapEvalJournalArg(evaluator, expression, 2).integer
                 if (wanted < 0 || wanted >= members.size) {
                     evaluator.errors = evaluator.errors + 1
                 } else {
@@ -10428,9 +10817,9 @@ fun bootstrapEvaluateCallCompiler(
     }
     // From a transform: an interface, as a generated module.
     if (targetName == "compilerDeclareInterface") {
-        val name = evaluator.evaluate(expression.children[0])
-        val members = evaluator.evaluate(expression.children[1])
-        val parents = evaluator.evaluate(expression.children[2])
+        val name = bootstrapEvalJournalArg(evaluator, expression, 0)
+        val members = bootstrapEvalJournalArg(evaluator, expression, 1)
+        val parents = bootstrapEvalJournalArg(evaluator, expression, 2)
         val valid = name.kind == "string" && members.kind == "string" &&
             parents.kind == "string" && name.text.size > 0 &&
             bootstrapStageGeneratedModule(BootstrapGeneratedModuleRequest(
@@ -10449,9 +10838,9 @@ fun bootstrapEvaluateCallCompiler(
     // From a transform: `extend <class> : name`, its members as extension
     // functions of the class (each member's source starts a line with `fun`).
     if (targetName == "compilerAddConformance") {
-        val handle = evaluator.evaluate(expression.children[0]).integer
-        val name = evaluator.evaluate(expression.children[1])
-        val members = evaluator.evaluate(expression.children[2])
+        val handle = bootstrapEvalJournalArg(evaluator, expression, 0).integer
+        val name = bootstrapEvalJournalArg(evaluator, expression, 1)
+        val members = bootstrapEvalJournalArg(evaluator, expression, 2)
         var valid = handle >= 0 && handle < evaluator.declarations.size &&
             evaluator.declarations[handle].kind == "class" &&
             name.kind == "string" && name.text.size > 0 &&
@@ -10496,8 +10885,8 @@ fun bootstrapEvaluateCallCompiler(
     // Removes one of the transform's own module's extension fields (with its
     // default function) before analysis.
     if (targetName == "compilerRemoveExtensionField") {
-        val handle = evaluator.evaluate(expression.children[0]).integer
-        val name = evaluator.evaluate(expression.children[1])
+        val handle = bootstrapEvalJournalArg(evaluator, expression, 0).integer
+        val name = bootstrapEvalJournalArg(evaluator, expression, 1)
         var field = -1
         if (handle >= 0 && handle < evaluator.declarations.size &&
             evaluator.declarations[handle].kind == "class" && name.kind == "string") {
@@ -10552,7 +10941,7 @@ fun bootstrapEvaluateCallCompiler(
     if (targetName == "compilerRegisterSubparser") {
         var argument = 0
         while (argument < expression.children.size) {
-            evaluator.evaluate(expression.children[argument])
+            bootstrapEvalJournalArg(evaluator, expression, argument)
             argument = argument + 1
         }
         evaluator.recordEvaluatorDiagnostic(
@@ -10563,7 +10952,7 @@ fun bootstrapEvaluateCallCompiler(
         result = bootstrapEvalVoid()
     }
     if (targetName == "compilerGrant") {
-        evaluator.evaluate(expression.children[0])
+        bootstrapEvalJournalArg(evaluator, expression, 0)
         evaluator.recordEvaluatorDiagnostic(
             "E_COMPILE_GRANT_PHASE",
             "compilerGrant grants a capability only as a literal top-level action (`#compilerGrant(\"capability\")`), so that every grant is visible in source"
@@ -10572,8 +10961,8 @@ fun bootstrapEvaluateCallCompiler(
         result = bootstrapEvalVoid()
     }
     if (targetName == "compilerGenerateModule") {
-        val namespace = evaluator.evaluate(expression.children[0])
-        val source = evaluator.evaluate(expression.children[1])
+        val namespace = bootstrapEvalJournalArg(evaluator, expression, 0)
+        val source = bootstrapEvalJournalArg(evaluator, expression, 1)
         if (!bootstrapCompilerTransformActive) {
             evaluator.recordEvaluatorDiagnostic(
                 "E_EXT_GENERATED_MODULE_PHASE",
@@ -10593,8 +10982,8 @@ fun bootstrapEvaluateCallCompiler(
         result = bootstrapEvalVoid()
     }
     if (targetName == "compilerReplaceFunctionBody") {
-        val reflected = evaluator.evaluate(expression.children[0])
-        val body = evaluator.evaluate(expression.children[1])
+        val reflected = bootstrapEvalJournalArg(evaluator, expression, 0)
+        val body = bootstrapEvalJournalArg(evaluator, expression, 1)
         var valid = reflected.kind == "integer" &&
             body.kind == "string" &&
             evaluator.functionHandleValid(reflected.integer) &&
@@ -10647,8 +11036,8 @@ fun bootstrapEvaluateCallCompiler(
         }
     }
     if (targetName == "compilerAddFunctionAnnotation") {
-        val reflected = evaluator.evaluate(expression.children[0])
-        val annotation = evaluator.evaluate(expression.children[1])
+        val reflected = bootstrapEvalJournalArg(evaluator, expression, 0)
+        val annotation = bootstrapEvalJournalArg(evaluator, expression, 1)
         var valid = reflected.kind == "integer" &&
             annotation.kind == "string" &&
             evaluator.functionHandleValid(reflected.integer) &&
@@ -10698,14 +11087,14 @@ fun bootstrapEvaluateCallCompiler(
         result = bootstrapEvalBoolean(false)
     }
     if (targetName == "compilerContributeArtifactRoot") {
-        val name = evaluator.evaluate(expression.children[0])
-        val target = evaluator.evaluate(expression.children[1])
-        val artifact = evaluator.evaluate(expression.children[2])
-        val output = evaluator.evaluate(expression.children[3])
-        val reflected = evaluator.evaluate(expression.children[4])
-        val exportName = evaluator.evaluate(expression.children[5])
-        val fast = evaluator.evaluate(expression.children[6])
-        val cache = evaluator.evaluate(expression.children[7])
+        val name = bootstrapEvalJournalArg(evaluator, expression, 0)
+        val target = bootstrapEvalJournalArg(evaluator, expression, 1)
+        val artifact = bootstrapEvalJournalArg(evaluator, expression, 2)
+        val output = bootstrapEvalJournalArg(evaluator, expression, 3)
+        val reflected = bootstrapEvalJournalArg(evaluator, expression, 4)
+        val exportName = bootstrapEvalJournalArg(evaluator, expression, 5)
+        val fast = bootstrapEvalJournalArg(evaluator, expression, 6)
+        val cache = bootstrapEvalJournalArg(evaluator, expression, 7)
         var valid = name.kind == "string" && target.kind == "string" &&
             artifact.kind == "string" && output.kind == "string" &&
             reflected.kind == "integer" &&
@@ -10782,7 +11171,7 @@ fun bootstrapEvaluateCallCompiler(
         }
     }
     if (targetName == "compilerNewIndependentModule") {
-        val name = evaluator.evaluate(expression.children[0])
+        val name = bootstrapEvalJournalArg(evaluator, expression, 0)
         var handle = -1
         var valid = bootstrapArtifactSliceActive ||
             (name.kind == "string" &&
@@ -10817,11 +11206,11 @@ fun bootstrapEvaluateCallCompiler(
         }
     }
     if (targetName == "compilerIndependentModuleUse") {
-        val module = evaluator.evaluate(expression.children[0])
-        val reflected = evaluator.evaluate(expression.children[1])
-        val annotations = evaluator.evaluate(expression.children[2])
-        val exportName = evaluator.evaluate(expression.children[3])
-        val checkedExport = evaluator.evaluate(expression.children[4])
+        val module = bootstrapEvalJournalArg(evaluator, expression, 0)
+        val reflected = bootstrapEvalJournalArg(evaluator, expression, 1)
+        val annotations = bootstrapEvalJournalArg(evaluator, expression, 2)
+        val exportName = bootstrapEvalJournalArg(evaluator, expression, 3)
+        val checkedExport = bootstrapEvalJournalArg(evaluator, expression, 4)
         var valid = bootstrapArtifactSliceActive ||
             (module.kind == "integer" &&
              reflected.kind == "integer" &&
@@ -10915,10 +11304,10 @@ fun bootstrapEvaluateCallCompiler(
         }
     }
     if (targetName == "compilerIndependentModuleExport") {
-        val module = evaluator.evaluate(expression.children[0])
-        val sourceName = evaluator.evaluate(expression.children[1])
-        val exportName = evaluator.evaluate(expression.children[2])
-        val checked = evaluator.evaluate(expression.children[3])
+        val module = bootstrapEvalJournalArg(evaluator, expression, 0)
+        val sourceName = bootstrapEvalJournalArg(evaluator, expression, 1)
+        val exportName = bootstrapEvalJournalArg(evaluator, expression, 2)
+        val checked = bootstrapEvalJournalArg(evaluator, expression, 3)
         var valid = bootstrapArtifactSliceActive ||
             (module.kind == "integer" &&
              bootstrapIndependentModuleHandleValid(module.integer) &&
@@ -10955,8 +11344,8 @@ fun bootstrapEvaluateCallCompiler(
         }
     }
     if (targetName == "compilerIndependentModuleDeclare") {
-        val module = evaluator.evaluate(expression.children[0])
-        val declarations = evaluator.evaluate(expression.children[1])
+        val module = bootstrapEvalJournalArg(evaluator, expression, 0)
+        val declarations = bootstrapEvalJournalArg(evaluator, expression, 1)
         var valid = bootstrapArtifactSliceActive ||
             (module.kind == "integer" &&
              declarations.kind == "declaration.block" &&
@@ -10984,8 +11373,8 @@ fun bootstrapEvaluateCallCompiler(
         }
     }
     if (targetName == "compilerIndependentModuleDeclareGenerated") {
-        val module = evaluator.evaluate(expression.children[0])
-        val declarations = evaluator.evaluate(expression.children[1])
+        val module = bootstrapEvalJournalArg(evaluator, expression, 0)
+        val declarations = bootstrapEvalJournalArg(evaluator, expression, 1)
         var source = ""
         var valid = bootstrapArtifactSliceActive ||
             (module.kind == "integer" &&
@@ -11018,12 +11407,12 @@ fun bootstrapEvaluateCallCompiler(
         }
     }
     if (targetName == "compilerIndependentModuleEmit") {
-        val module = evaluator.evaluate(expression.children[0])
-        val output = evaluator.evaluate(expression.children[1])
-        val target = evaluator.evaluate(expression.children[2])
-        val artifact = evaluator.evaluate(expression.children[3])
-        val fast = evaluator.evaluate(expression.children[4])
-        val cache = evaluator.evaluate(expression.children[5])
+        val module = bootstrapEvalJournalArg(evaluator, expression, 0)
+        val output = bootstrapEvalJournalArg(evaluator, expression, 1)
+        val target = bootstrapEvalJournalArg(evaluator, expression, 2)
+        val artifact = bootstrapEvalJournalArg(evaluator, expression, 3)
+        val fast = bootstrapEvalJournalArg(evaluator, expression, 4)
+        val cache = bootstrapEvalJournalArg(evaluator, expression, 5)
         var valid = bootstrapArtifactSliceActive ||
             (module.kind == "integer" &&
              bootstrapIndependentModuleHandleValid(module.integer) &&
@@ -11151,13 +11540,13 @@ fun bootstrapEvaluateCallCompiler(
         }
     }
     if (targetName == "compilerBuildProgram") {
-        val name = evaluator.evaluate(expression.children[0])
-        val entry = evaluator.evaluate(expression.children[1])
-        val output = evaluator.evaluate(expression.children[2])
-        val target = evaluator.evaluate(expression.children[3])
-        val artifact = evaluator.evaluate(expression.children[4])
-        val fast = evaluator.evaluate(expression.children[5])
-        val cache = evaluator.evaluate(expression.children[6])
+        val name = bootstrapEvalJournalArg(evaluator, expression, 0)
+        val entry = bootstrapEvalJournalArg(evaluator, expression, 1)
+        val output = bootstrapEvalJournalArg(evaluator, expression, 2)
+        val target = bootstrapEvalJournalArg(evaluator, expression, 3)
+        val artifact = bootstrapEvalJournalArg(evaluator, expression, 4)
+        val fast = bootstrapEvalJournalArg(evaluator, expression, 5)
+        val cache = bootstrapEvalJournalArg(evaluator, expression, 6)
         var valid = name.kind == "string" && name.text.size > 0 &&
             name.text.size <= 128 && entry.kind == "string" &&
             bootstrapCompileOutputPathValid(entry.text) &&
@@ -11186,9 +11575,9 @@ fun bootstrapEvaluateCallCompiler(
         }
     }
     if (targetName == "compilerCreateXcframework") {
-        val output = evaluator.evaluate(expression.children[0])
-        val slices = evaluator.evaluate(expression.children[1])
-        val headers = evaluator.evaluate(expression.children[2])
+        val output = bootstrapEvalJournalArg(evaluator, expression, 0)
+        val slices = bootstrapEvalJournalArg(evaluator, expression, 1)
+        val headers = bootstrapEvalJournalArg(evaluator, expression, 2)
         var valid = output.kind == "string" && slices.kind == "array" &&
             headers.kind == "string" && slices.elements.size > 0 &&
             slices.elements.size <= 16
@@ -11218,8 +11607,8 @@ fun bootstrapEvaluateCallCompiler(
         result = bootstrapEvalBoolean(valid)
     }
     if (targetName == "compilerDefineTargetSdk") {
-        val name = evaluator.evaluate(expression.children[0])
-        val sdk = evaluator.evaluate(expression.children[1])
+        val name = bootstrapEvalJournalArg(evaluator, expression, 0)
+        val sdk = bootstrapEvalJournalArg(evaluator, expression, 1)
         var valid = name.kind == "string" && sdk.kind == "string"
         if (valid && !bootstrapArtifactSliceActive) {
             valid = bootstrapStageDefinedTargetSdk(name.text, sdk.text)
@@ -11233,13 +11622,13 @@ fun bootstrapEvaluateCallCompiler(
         result = bootstrapEvalBoolean(valid)
     }
     if (targetName == "compilerDefineTarget") {
-        val name = evaluator.evaluate(expression.children[0])
-        val triple = evaluator.evaluate(expression.children[1])
-        val format = evaluator.evaluate(expression.children[2])
-        val linker = evaluator.evaluate(expression.children[3])
-        val emulation = evaluator.evaluate(expression.children[4])
-        val hosted = evaluator.evaluate(expression.children[5])
-        val libcFree = evaluator.evaluate(expression.children[6])
+        val name = bootstrapEvalJournalArg(evaluator, expression, 0)
+        val triple = bootstrapEvalJournalArg(evaluator, expression, 1)
+        val format = bootstrapEvalJournalArg(evaluator, expression, 2)
+        val linker = bootstrapEvalJournalArg(evaluator, expression, 3)
+        val emulation = bootstrapEvalJournalArg(evaluator, expression, 4)
+        val hosted = bootstrapEvalJournalArg(evaluator, expression, 5)
+        val libcFree = bootstrapEvalJournalArg(evaluator, expression, 6)
         var valid = name.kind == "string" &&
             triple.kind == "string" && format.kind == "string" &&
             linker.kind == "string" && emulation.kind == "string" &&
@@ -11271,8 +11660,8 @@ fun bootstrapEvaluateCallCompiler(
         targetName == "compilerInternalFunction" ||
         targetName == "compilerRequiredInternalFunction" ||
         targetName == "compilerExportCheckedFunction") {
-        val reflected = evaluator.evaluate(expression.children[0])
-        val exportName = evaluator.evaluate(expression.children[1])
+        val reflected = bootstrapEvalJournalArg(evaluator, expression, 0)
+        val exportName = bootstrapEvalJournalArg(evaluator, expression, 1)
         var valid = reflected.kind == "integer" &&
             exportName.kind == "string" &&
             (if (targetName == "compilerInternalFunction" ||
@@ -11375,10 +11764,10 @@ fun bootstrapEvaluateCallCompiler(
     }
     if (targetName == "compilerRecordExtensionRequest" ||
         targetName == "compilerRecordGeneratedExtensionRequest") {
-        val namespace = evaluator.evaluate(expression.children[0])
-        val payload = evaluator.evaluate(expression.children[1])
-        val syntaxHandle = evaluator.evaluate(expression.children[2])
-        val finalizer = evaluator.evaluate(expression.children[3])
+        val namespace = bootstrapEvalJournalArg(evaluator, expression, 0)
+        val payload = bootstrapEvalJournalArg(evaluator, expression, 1)
+        val syntaxHandle = bootstrapEvalJournalArg(evaluator, expression, 2)
+        val finalizer = bootstrapEvalJournalArg(evaluator, expression, 3)
         var sourceIdentity = "<unknown>"
         if (evaluator.cursors.size > 0) {
             sourceIdentity = evaluator.cursors[0].sourceIdentity
@@ -11449,7 +11838,7 @@ fun bootstrapEvaluateCallHost(
     var result = initial
     if (targetName == "ablaHostReadFile") {
         if (bootstrapCompileEffectHas(evaluator.allowedCompileEffects, 4)) {
-            val path = evaluator.evaluate(expression.children[0])
+            val path = bootstrapEvalJournalArg(evaluator, expression, 0)
             // The compile-time file view (ct_native.ab): staged files too.
             val read = ctNativeViewRead(evaluator, path.text, true)
             result = bootstrapEvalString(if (read.succeeded) read.text else "")
@@ -11465,7 +11854,7 @@ fun bootstrapEvaluateCallHost(
         // A directory's entry names, sorted (bytewise) so a build sees the same order
         // on every host; [] when it doesn't exist.
         if (bootstrapCompileEffectHas(evaluator.allowedCompileEffects, 4)) {
-            val path = evaluator.evaluate(expression.children[0])
+            val path = bootstrapEvalJournalArg(evaluator, expression, 0)
             val names = bootstrapSortedNames(ctNativeViewEntries(evaluator, path.text))
             var listing = ""
             val elements: array<BootstrapEvalValue> = []
@@ -11483,8 +11872,8 @@ fun bootstrapEvaluateCallHost(
         }
     }
     if (targetName == "compilerWriteFile") {
-        val path = evaluator.evaluate(expression.children[0])
-        val contents = evaluator.evaluate(expression.children[1])
+        val path = bootstrapEvalJournalArg(evaluator, expression, 0)
+        val contents = bootstrapEvalJournalArg(evaluator, expression, 1)
         if (path.kind == "string" && contents.kind == "string" &&
             bootstrapCompileEffectHas(
                 evaluator.allowedCompileEffects,
@@ -11500,7 +11889,7 @@ fun bootstrapEvaluateCallHost(
         }
     }
     if (targetName == "compilerEnvironment") {
-        val name = evaluator.evaluate(expression.children[0])
+        val name = bootstrapEvalJournalArg(evaluator, expression, 0)
         var valid = name.kind == "string" && name.text.size > 0 &&
             name.text.size <= 256
         var index = 0
@@ -11538,7 +11927,7 @@ fun bootstrapEvaluateCallHost(
         }
     }
     if (targetName == "compilerRandomInteger") {
-        val maximum = evaluator.evaluate(expression.children[0])
+        val maximum = bootstrapEvalJournalArg(evaluator, expression, 0)
         if (maximum.kind == "integer" && maximum.integer > 0 &&
             bootstrapCompileEffectHas(
                 evaluator.allowedCompileEffects,
@@ -11553,7 +11942,7 @@ fun bootstrapEvaluateCallHost(
         }
     }
     if (targetName == "compilerRunProcess") {
-        val arguments = evaluator.evaluate(expression.children[0])
+        val arguments = bootstrapEvalJournalArg(evaluator, expression, 0)
         var valid = arguments.kind == "array" &&
             arguments.elements.size > 0 &&
             arguments.elements.size <= 128
@@ -11582,11 +11971,11 @@ fun bootstrapEvaluateCallHost(
         }
     }
     if (targetName == "compilerTcpExchange") {
-        val address = evaluator.evaluate(expression.children[0])
-        val port = evaluator.evaluate(expression.children[1])
-        val request = evaluator.evaluate(expression.children[2])
-        val maximum = evaluator.evaluate(expression.children[3])
-        val timeout = evaluator.evaluate(expression.children[4])
+        val address = bootstrapEvalJournalArg(evaluator, expression, 0)
+        val port = bootstrapEvalJournalArg(evaluator, expression, 1)
+        val request = bootstrapEvalJournalArg(evaluator, expression, 2)
+        val maximum = bootstrapEvalJournalArg(evaluator, expression, 3)
+        val timeout = bootstrapEvalJournalArg(evaluator, expression, 4)
         var valid = address.kind == "string" &&
             port.kind == "integer" && request.kind == "string" &&
             maximum.kind == "integer" && timeout.kind == "integer" &&
