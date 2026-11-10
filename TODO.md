@@ -214,6 +214,12 @@
   built as slices and concatenations (sizes, insertion order, `has`/`get` probes); string equality and
   ordering at lengths 0 to 65, at offsets 0 to 7 of a larger string and with one byte changed at the start,
   middle and end; seeds 1301 to 1340 agree in all six modes with the batch-15 compiler.
+  Eleventh growth (branch `fuzz-651`, ablac-e5): generic functions and a generic extension that take
+  lambdas (`twiceOf`, `applyTo`, `Box<T>.mapBox`, with captured locals and chained extension calls), and
+  resource classes whose `drop()` logs into a global (reassignment, `move`, block ends, loops, a temporary
+  passed as a borrowed argument; the temporary is #736's case, so a campaign after #736 should show a
+  changed log in every mode at once). Seeds 1200 to 1760 (post-#733 and #742 compilers, every generator
+  drawn together) agree in all six modes; the only findings were #733 and #742.
 
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
