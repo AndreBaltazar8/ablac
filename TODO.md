@@ -1988,3 +1988,9 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   `--fast` build from 29,609 / 29,455 / 29,465 to 27,645 / 27,568 / 27,715 samples (×20M
   instructions) with the one-pass rewrite alone at the same level (27,495 / 27,545):
   no further gain, so not kept (a cache with no effect is only a place for stale answers).
+
+- Status of the declaration-name index (ablac-52, 2026-11-10): the prototype records above
+  describe branch iface-names; its final form (analyzer sites, the evaluator's is-test and sealed
+  `when` coverage, -12.5% of a NovaKind `--fast` build, identical output) goes in the src batch
+  after v0.2.53 with the one-pass `bootstrapInterfaceImplementers`, so "not landed" above
+  means "not alone".
