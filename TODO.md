@@ -775,6 +775,23 @@
   JSON_SPANS_FULL=1): 83 to 32 CPU-seconds for the script here. Not done: the checker's inner loop (a state scan per
   step: `any(t.startswith("hdrp:") for t in state)` and the prefix scan in `write`) would take about 15 CPU-seconds more
   but changes what a security checker looks at; it needs ablac-19's read, not a drive-by edit.
+  What is specific to programs that import `abla/compiler` (2026-11-10, master compiler `build/ablac.bin` of batch 21,
+  instructions:u of `build --fast --no-cache`, ABLA_DEBUG=0, one pinned core): an empty program 1.300 G; with
+  `abla/compiler` only (tests/cases/extension-fields/api.ab) 1.506 G (+16%), ct-bridge/retry-argument.ab 1.512 G,
+  native-cstring/main.ab 1.594 G (+23%), compile-time-files/modes.ab (adds abla/fs and a compile-time action)
+  1.630 G (+25%). The import is three modules (compiler entry 1,007 lines, bridge 276, parser 561, plus
+  abla/unsafe), so about 110,000 instructions a line end to end. Sampling the empty and the modes build at 200,000
+  instructions (the compiler's `abla_fn_` names mapped through the `"abla.source"` attributes of its own `--emit-llvm`,
+  0 unmapped) and taking the difference, the added samples by phase: lexing and parsing 26% (`bootstrapLexWithTrivia`
+  alone 8%, the parser's `parsePrimary` and `parsePostfixOn` 5%), the module graph, import validation, declaration
+  indexes and name hashing 24% (`bootstrapValidateStrictImports`, `BootstrapModuleGraph.parse`,
+  `bootstrapDeclarationBoundNamesIn`, `FunctionDeclarationIndex.find`, `bootstrapHashNameBytes`), runtime helpers 30%
+  (array append, string equality, allocation: mostly what the two above call), sema and lowering 14%, libLLVM 5%
+  (the extra functions are mostly dropped before code generation), libc 2.5%. Compile-time evaluation does not show:
+  the action in modes.ab adds under 2.5%. So the extra cost is the module's source going through the frontend on every
+  build, not evaluation; the lever is loading less of it (a module read for its contract only already exists; a lazy
+  parse of the bodies of declarations nothing reaches would be the structural cut, and the staged-parse cache that
+  saved about 4% (#638, closed) is the measured bound on caching what the frontend produces). No cut proposed.
 - [x] **Tests run on every push to master and on PRs** ([CI](docs/ci.md)): the Linux suite and an
   arm64 macOS host/fixed-point job. Tests only; releases still start by hand.
 - [x] **Parser-derived formatter.** `ablac fmt` preserves comments and verbatim syntax,
