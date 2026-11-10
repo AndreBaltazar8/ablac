@@ -602,6 +602,15 @@
   or explicit modes), compiler-memory-peak 25.
   CI runs `make test`, so the release builds of the moved scripts run in the release process's `make test-full`
   gate (run by hand), not on every push, as for the 78 scripts already on the list.
+  Cold baseline on master `d0a750ed` (2026-11-10, a stage 1 built by the installed v0.2.52, `make test`, JOBS=30, one
+  slot hold, load average 22 to 38 from other work): 310 commands, all passed, 242 s wall, 2,656 CPU-seconds (the sum of
+  `results.tsv`; 4,036 s of summed command wall time). CPU per command: test-ct 165 (240 s wall), test-self-hosted 144,
+  test-reproducible-elsewhere 131, test-ct-bridge 125, test-json-ascii-spans 113 (138 s wall), test-doc-examples 96,
+  test-crypto-pure 67, test-gc-growth 65, test-bignum-secret 59, test-math-v8 56; none is over 6.2% of the CPU.
+  A cut tried and dropped: building test-json-ascii-spans' GC-stress program with `--fast` instead of release. The
+  release build is the cheap one, because the stress run collects at every safe point and the unoptimized program
+  spends far longer in them. Alternating pairs on 8 CPUs, user+sys CPU-seconds of the whole script: release 122 and
+  112, `--fast` 216 and 250.
 - [x] **Tests run on every push to master and on PRs** ([CI](docs/ci.md)): the Linux suite and an
   arm64 macOS host/fixed-point job. Tests only; releases still start by hand.
 - [x] **Parser-derived formatter.** `ablac fmt` preserves comments and verbatim syntax,
