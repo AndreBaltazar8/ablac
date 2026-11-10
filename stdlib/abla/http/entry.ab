@@ -414,6 +414,58 @@ fun httpFinalResponseOffset(input: string): int {
     offset
 }
 
+// Whether a Transfer-Encoding value is exactly the one coding "chunked" (spaces and tabs around it allowed).
+// Anything else (identity, gzip, "chunked, gzip", an unknown coding) is a body this server cannot frame.
+private fun httpTransferIsChunkedOnly(value: string): bool {
+    var left = 0
+    var right = value.size
+    while (left < right && (value[left] == 32 || value[left] == 9)) left = left + 1
+    while (right > left && (value[right - 1] == 32 || value[right - 1] == 9)) right = right - 1
+    right - left == 7 && httpAsciiEqualInsensitive(value.slice(left, right), "chunked")
+}
+
+/** How a request's body is framed: -1 when its framing is malformed and the request is to be refused (400, then
+ *  close, nothing of the buffer read again), -2 when it is chunked, else the Content-Length (0 when there is none).
+ *  Strict on purpose: a request read with a different length than its sender (or a proxy in front) meant makes the
+ *  bytes after it a different request. Refused: an empty or non-digit Content-Length or one over `maximumBody`; two
+ *  Content-Lengths that differ; Content-Length together with Transfer-Encoding; a Transfer-Encoding other than exactly
+ *  "chunked" (identity, gzip, "chunked, gzip", unknown) or given twice, and any in an HTTP/1.0 request; the look-alike
+ *  names Content_Length and Transfer_Encoding (some backends map the underscore to a hyphen); and, whatever the header is
+ *  named, whitespace before its colon or a folded line (RFC 9112 5.1, 6.1, 6.3). A refused request is a 400 on purpose,
+ *  not a 501 for a coding this server does not know: it closes the connection either way. */
+fun httpRequestFraming(request: HttpRequest, http10: bool, maximumBody: int): int {
+    var length = 0
+    var lengths = 0
+    var first = ""
+    var transfers = 0
+    for (header in request.headers) {
+        val name = header.name
+        val size = name.size
+        if (size == 0) return -1
+        val leading = name[0]
+        val trailing = name[size - 1]
+        if (leading == 32 || leading == 9 || trailing == 32 || trailing == 9) return -1
+        if (size == 14) {
+            if (httpAsciiEqualInsensitive(name, "Content-Length")) {
+                lengths = lengths + 1
+                if (lengths == 1) {
+                    first = header.value
+                    length = httpDecimalLength(first, maximumBody)
+                    if (length < 0) return -1
+                } else if (header.value != first) return -1
+            }
+            else if (httpAsciiEqualInsensitive(name, "Content_Length")) return -1
+        } else if (size == 17) {
+            if (httpAsciiEqualInsensitive(name, "Transfer-Encoding")) {
+                transfers = transfers + 1
+                if (transfers > 1 || !httpTransferIsChunkedOnly(header.value)) return -1
+            } else if (httpAsciiEqualInsensitive(name, "Transfer_Encoding")) return -1
+        }
+    }
+    if (transfers > 0 && (lengths > 0 || http10)) return -1
+    if (transfers > 0) -2 else length
+}
+
 fun httpDecimalLength(value: string, maximum: int): int {
     var result = 0
     var valid = value.size > 0
@@ -547,15 +599,12 @@ fun httpReadRequest(
 
     if (headerEnd >= 0) {
         val preliminary = httpParseRequest(input)
-        val encodedLength = preliminary.header("Content-Length")
-        val chunked = httpCoreHeaderTokenContains(
-            preliminary.header("Transfer-Encoding"), "chunked"
-        )
-        var contentLength = 0
-        if (encodedLength != "") {
-            contentLength = httpDecimalLength(encodedLength, maximumBody)
-        }
-        if (chunked) {
+        val framing = httpRequestFraming(preliminary, false, maximumBody)
+        val contentLength = framing
+        if (framing == -1) {
+            // Malformed framing: nothing of what was read is returned, so the request is refused.
+            input = ""
+        } else if (framing == -2) {
             var decoded = httpCoreDecodeChunked(
                 input.slice(headerEnd, input.size), maximumBody
             )
@@ -574,7 +623,7 @@ fun httpReadRequest(
             if (decoded.complete && decoded.valid) {
                 input = "${input.slice(0, headerEnd)}${decoded.body}"
             }
-        } else if (contentLength >= 0) {
+        } else {
             val expected = headerEnd + contentLength
             var readingBody = input.size < expected
             while (readingBody) {
@@ -604,42 +653,52 @@ private trusted fun httpParseRequestNative(input: string, peer: SocketPeerAddres
     var firstSpace = -1
     var secondSpace = -1
     var questionAt = -1
+    // A control byte (a bare LF, a CR without its LF, any byte under 32) in the request line: a peer may read a
+    // different request line (see httpMalformedLineHeader).
+    var lineMalformed = false
     var scan = 0
     // Each hot loop has a valid one-byte lookahead; handle a final lone
     // byte separately so partial inputs keep their original semantics.
     val last = sourceSize - 1
     while (scan < last) {
         val byte = ablaUnsafeLoadU8(nativePointerFromAddress(sourceData + scan))
-        if (byte == 13 &&
-            ablaUnsafeLoadU8(nativePointerFromAddress(sourceData + scan + 1)) == 10) {
-            requestLineEnd = scan
-            break
-        }
-        if (byte == 32) {
-            firstSpace = scan
-            scan = scan + 1
-            break
-        }
-        scan = scan + 1
-    }
-    if (firstSpace < 0 && requestLineEnd == sourceSize && scan < sourceSize) {
-        if (ablaUnsafeLoadU8(nativePointerFromAddress(sourceData + scan)) == 32) firstSpace = scan
-        scan = scan + 1
-    }
-    if (firstSpace >= 0) {
-        while (scan < last) {
-            val byte = ablaUnsafeLoadU8(nativePointerFromAddress(sourceData + scan))
+        if (byte < 33) {
+            if (byte == 32) {
+                firstSpace = scan
+                scan = scan + 1
+                break
+            }
             if (byte == 13 &&
                 ablaUnsafeLoadU8(nativePointerFromAddress(sourceData + scan + 1)) == 10) {
                 requestLineEnd = scan
                 break
             }
-            if (byte == 32) {
-                secondSpace = scan
-                scan = scan + 1
-                break
-            }
-            if (byte == 63) {
+            lineMalformed = true
+        }
+        scan = scan + 1
+    }
+    if (firstSpace < 0 && requestLineEnd == sourceSize && scan < sourceSize) {
+        val byte = ablaUnsafeLoadU8(nativePointerFromAddress(sourceData + scan))
+        if (byte == 32) firstSpace = scan
+        else if (byte < 32) lineMalformed = true
+        scan = scan + 1
+    }
+    if (firstSpace >= 0) {
+        while (scan < last) {
+            val byte = ablaUnsafeLoadU8(nativePointerFromAddress(sourceData + scan))
+            if (byte < 33) {
+                if (byte == 32) {
+                    secondSpace = scan
+                    scan = scan + 1
+                    break
+                }
+                if (byte == 13 &&
+                    ablaUnsafeLoadU8(nativePointerFromAddress(sourceData + scan + 1)) == 10) {
+                    requestLineEnd = scan
+                    break
+                }
+                lineMalformed = true
+            } else if (byte == 63) {
                 questionAt = scan
                 scan = scan + 1
                 break
@@ -651,15 +710,18 @@ private trusted fun httpParseRequestNative(input: string, peer: SocketPeerAddres
         // Once '?' is found, query bytes need only the space/CRLF tests.
         while (scan < last) {
             val byte = ablaUnsafeLoadU8(nativePointerFromAddress(sourceData + scan))
-            if (byte == 13 &&
-                ablaUnsafeLoadU8(nativePointerFromAddress(sourceData + scan + 1)) == 10) {
-                requestLineEnd = scan
-                break
-            }
-            if (byte == 32) {
-                secondSpace = scan
-                scan = scan + 1
-                break
+            if (byte < 33) {
+                if (byte == 32) {
+                    secondSpace = scan
+                    scan = scan + 1
+                    break
+                }
+                if (byte == 13 &&
+                    ablaUnsafeLoadU8(nativePointerFromAddress(sourceData + scan + 1)) == 10) {
+                    requestLineEnd = scan
+                    break
+                }
+                lineMalformed = true
             }
             scan = scan + 1
         }
@@ -669,18 +731,25 @@ private trusted fun httpParseRequestNative(input: string, peer: SocketPeerAddres
         val byte = ablaUnsafeLoadU8(nativePointerFromAddress(sourceData + scan))
         if (byte == 32) secondSpace = scan
         else if (byte == 63 && questionAt < 0) questionAt = scan
+        else if (byte < 32) lineMalformed = true
         scan = scan + 1
     }
     if (secondSpace >= 0) {
-        // Version contents remain ignored, exactly as in the checked parser.
+        // Version contents remain ignored, exactly as in the checked parser; a control byte in them is flagged.
         while (scan < last) {
-            if (ablaUnsafeLoadU8(nativePointerFromAddress(sourceData + scan)) == 13 &&
-                ablaUnsafeLoadU8(nativePointerFromAddress(sourceData + scan + 1)) == 10) {
-                requestLineEnd = scan
-                break
+            val byte = ablaUnsafeLoadU8(nativePointerFromAddress(sourceData + scan))
+            if (byte < 32) {
+                if (byte == 13 &&
+                    ablaUnsafeLoadU8(nativePointerFromAddress(sourceData + scan + 1)) == 10) {
+                    requestLineEnd = scan
+                    break
+                }
+                lineMalformed = true
             }
             scan = scan + 1
         }
+        if (requestLineEnd == sourceSize && scan < sourceSize &&
+            ablaUnsafeLoadU8(nativePointerFromAddress(sourceData + scan)) < 32) lineMalformed = true
     }
     var method = ""
     var target = "/"
@@ -698,27 +767,39 @@ private trusted fun httpParseRequestNative(input: string, peer: SocketPeerAddres
     }
 
     val headers: array<HttpHeader> = []
+    if (lineMalformed) headers.append(httpMalformedLineHeader())
     var cursor = requestLineEnd + 2
     var bodyBegin = input.size
     var more = cursor < input.size
     while (more) {
         // Acquire backing storage again after the previous header's allocations.
         // The raw scan ends before any call or header allocation.
+        // The table first: its first use may flatten it, an allocation that must not fall after `data` is taken.
+        val classes = ablaUnsafeStringAddress(httpNameClasses)
         val data = ablaUnsafeStringAddress(input)
         val size = input.size
         var end = size
         var colon = -1
+        // A line end that is not CR LF (a bare LF, or a CR without its LF) inside a line is read as a line end by some
+        // peers, and a byte that is not a token character in a name (a space, a control byte, a delimiter, a byte over
+        // 127) is skipped or mapped by some: the line is then malformed (see httpMalformedLineHeader).
+        var malformed = false
         var scan = cursor
         while (scan < size) {
             val byte = ablaUnsafeLoadU8(nativePointerFromAddress(data + scan))
-            if (byte == 58) {
-                colon = scan
-                break
-            }
-            if (byte == 13 && scan + 1 < size &&
-                ablaUnsafeLoadU8(nativePointerFromAddress(data + scan + 1)) == 10) {
-                end = scan
-                break
+            // The class table says at once: 0 a token byte, 1 the colon, 2 a CR, 3 any other byte (not valid in a name).
+            val kind = ablaUnsafeLoadU8(nativePointerFromAddress(classes + byte))
+            if (kind != 0) {
+                if (kind == 1) {
+                    colon = scan
+                    break
+                }
+                if (kind == 2 && scan + 1 < size &&
+                    ablaUnsafeLoadU8(nativePointerFromAddress(data + scan + 1)) == 10) {
+                    end = scan
+                    break
+                }
+                malformed = true
             }
             scan = scan + 1
         }
@@ -734,13 +815,20 @@ private trusted fun httpParseRequestNative(input: string, peer: SocketPeerAddres
             var probe = valueBegin
             var lineEnd = -1
             while (lineEnd < 0 && probe + 1 < probeLimit) {
-                if (ablaUnsafeLoadU8(nativePointerFromAddress(data + probe)) == 13 &&
-                    ablaUnsafeLoadU8(nativePointerFromAddress(data + probe + 1)) == 10) {
-                    lineEnd = probe
-                }
+                val byte = ablaUnsafeLoadU8(nativePointerFromAddress(data + probe))
+                if (byte == 13) {
+                    val next = ablaUnsafeLoadU8(nativePointerFromAddress(data + probe + 1))
+                    if (next == 10) lineEnd = probe
+                    else malformed = true
+                } else if (byte == 10) malformed = true
                 probe = probe + 1
             }
             end = if (lineEnd >= 0) lineEnd else httpLineEnd(input, probe)
+            // Past the window the bytes up to the line end are searched once, only by a long value.
+            if (lineEnd < 0 && end > probe) {
+                if (textFindByte(input, 10, probe, end) >= 0) malformed = true
+                else if (textFindByte(input, 13, probe, end) >= 0) malformed = true
+            }
         }
         if (end == cursor) {
             bodyBegin = end + 2
@@ -753,6 +841,7 @@ private trusted fun httpParseRequestNative(input: string, peer: SocketPeerAddres
                     input.slice(valueBegin, end)
                 ))
             }
+            if (colon <= cursor || malformed) headers.append(httpMalformedLineHeader())
             cursor = end + 2
             if (cursor >= input.size) more = false
             cursor = cursor
@@ -761,6 +850,55 @@ private trusted fun httpParseRequestNative(input: string, peer: SocketPeerAddres
     var body = ""
     if (bodyBegin < input.size) body = input.slice(bodyBegin, input.size)
     HttpRequest(method, path, query, headers, body, [], [], peer)
+}
+
+// The byte classes of a request head line's name scan: 0 a token byte, 1 the colon, 2 a CR, 3 any other byte.
+private fun httpNameClassTable(): string {
+    var table = ""
+    var byte = 0
+    while (byte < 256) {
+        val kind = if (byte == 58) 1 else if (byte == 13) 2 else if (httpTokenByte(byte)) 0 else 3
+        table = "$table${utf8Encode(kind)}"
+        byte = byte + 1
+    }
+    table
+}
+
+private val httpNameClasses = httpNameClassTable()
+
+/** Whether `byte` may be in a header name: a token character (RFC 9110 5.6.2). */
+fun httpTokenByte(byte: int): bool =
+    (byte >= 97 && byte <= 122) || (byte >= 65 && byte <= 90) || (byte >= 48 && byte <= 57) ||
+    byte == 45 || byte == 33 || (byte >= 35 && byte <= 39) || byte == 42 || byte == 43 ||
+    byte == 46 || (byte >= 94 && byte <= 96) || byte == 124 || byte == 126
+
+/** What a request head line that no reader can take as a header leaves in `request.headers`: a line without a colon or
+ *  with an empty name (a folded line is one), or one with a bare LF or CR in it or a byte in its name that is not a
+ *  token character (RFC 9112 2.2, 5.1, 5.2). The line is
+ *  dropped from the parse as before, but this marker (a name that begins with a space, which `httpRequestFraming`
+ *  refuses, and an empty value) says it was there, so a request with such a line is refused, not read two ways. */
+fun httpMalformedLineHeader(): HttpHeader = HttpHeader(" malformed line", "")
+
+/** Whether `input[begin, end)` has a byte under 32. */
+fun httpHasControlByte(input: string, begin: int, end: int): bool {
+    var at = begin
+    var found = false
+    while (!found && at < end) {
+        if (input[at] < 32) found = true
+        at = at + 1
+    }
+    found
+}
+
+/** Whether the header name in `input[begin, end)` has a byte that is not a token character. */
+fun httpNameHasNonToken(input: string, begin: int, end: int): bool {
+    var at = begin
+    var found = false
+    while (!found && at < end) {
+        if (!httpTokenByte(input[at])) found = true
+        at = at + 1
+    }
+    found
 }
 
 private fun httpParseRequestChecked(input: string, peer: SocketPeerAddress?): HttpRequest {
@@ -782,6 +920,8 @@ private fun httpParseRequestChecked(input: string, peer: SocketPeerAddress?): Ht
     }
 
     val headers: array<HttpHeader> = []
+    // The same rule as the native scan: no control byte in the request line.
+    if (httpHasControlByte(input, 0, requestLineEnd)) headers.append(httpMalformedLineHeader())
     var cursor = requestLineEnd + 2
     var bodyBegin = input.size
     var more = cursor < input.size
@@ -803,6 +943,9 @@ private fun httpParseRequestChecked(input: string, peer: SocketPeerAddress?): Ht
                     input.slice(valueBegin, end)
                 ))
             }
+            if (colon <= cursor || textFindByte(input, 10, cursor, end) >= 0 ||
+                textFindByte(input, 13, cursor, end) >= 0 ||
+                httpNameHasNonToken(input, cursor, colon)) headers.append(httpMalformedLineHeader())
             cursor = end + 2
             if (cursor >= input.size) more = false
             cursor = cursor
@@ -904,8 +1047,26 @@ private fun httpParseFinalResponseBounded(
     HttpClientResult(
         HttpResponse(status, headers, body),
         status >= 100,
-        complete
+        complete && !httpResponseLengthsDiffer(headers)
     )
+}
+
+// A response with two Content-Lengths that differ has two answers to where its body ends: it is an error, not a
+// guess (RFC 9112 6.3), so a reader stops at once and reports it instead of waiting for more. That holds for a HEAD,
+// 204 or 304 response too (ambiguous metadata). With a Transfer-Encoding the Content-Length is not used at all, so
+// that case needs no check.
+fun httpResponseLengthsDiffer(headers: array<HttpHeader>): bool {
+    var lengths = 0
+    var first = ""
+    var ambiguous = false
+    for (header in headers) {
+        if (header.name.size == 14 && httpAsciiEqualInsensitive(header.name, "Content-Length")) {
+            lengths = lengths + 1
+            if (lengths == 1) first = header.value
+            else if (header.value != first) ambiguous = true
+        }
+    }
+    ambiguous
 }
 
 fun httpParseResponse(input: string): HttpClientResult =
@@ -998,8 +1159,10 @@ private fun httpExchangeStream(
             else if (read.bytes.size > remaining) { succeeded = false; reading = false }
             else response = "$response${read.bytes}"
             // A peer that keeps the connection open has finished at its own framing.
-            if (httpParseResponseBounded(response, maximumResponseBytes,
-                httpRequestIsHead(request), false).complete) reading = false
+            val parsed = httpParseResponseBounded(response, maximumResponseBytes,
+                httpRequestIsHead(request), false)
+            val ambiguous = httpResponseLengthsDiffer(parsed.response.headers)
+            if (parsed.complete || ambiguous) reading = false
         }
     }
     if (connection.descriptor >= 0) connection.close()

@@ -304,24 +304,6 @@ private trusted fun httpEventVersionNative(
     version
 }
 
-// Two answers to where a request's body ends are refused, since a proxy in front may pick the other one: a
-// Content-Length together with Transfer-Encoding, two Content-Lengths that differ, and Transfer-Encoding in an
-// HTTP/1.0 request (RFC 9112 6.1 and 6.3).
-private fun httpEventAmbiguousFraming(request: HttpRequest, http10: bool): bool {
-    var lengths = 0
-    var first = ""
-    var ambiguous = false
-    for (header in request.headers) {
-        if (header.name.size == 14 && httpAsciiEqualInsensitive(header.name, "Content-Length")) {
-            lengths = lengths + 1
-            if (lengths == 1) first = header.value
-            else if (header.value != first) ambiguous = true
-        }
-    }
-    val transfer = request.header("Transfer-Encoding") != ""
-    ambiguous || (lengths > 0 && transfer) || (http10 && transfer)
-}
-
 // HTTP/1.1 keeps the connection unless the request says close; HTTP/1.0 closes unless it says keep-alive.
 private fun httpEventKeepAlive(request: HttpRequest, http10: bool): bool =
     if (http10) httpHeaderTokenContains(request.header("Connection"), "keep-alive") &&
@@ -339,26 +321,17 @@ fun httpEventRequestLength(
         headerEnd > maximumHeader) result = -1
     if (headerEnd >= 0 && headerEnd <= maximumHeader) {
         val request = httpParseRequest(input.slice(0, headerEnd))
-        val transfer = request.header("Transfer-Encoding")
-        val encoded = request.header("Content-Length")
-        if (httpEventRequestLineVersion(input, request, headerEnd) < 0 ||
-            ((transfer != "" || encoded != "") &&
-                httpEventAmbiguousFraming(request, false))) result = -1
-        else if (httpHeaderTokenContains(transfer, "chunked")) {
+        val version = httpEventRequestLineVersion(input, request, headerEnd)
+        val framing = httpRequestFraming(request, version == 0, maximumBody)
+        if (version < 0 || framing == -1) result = -1
+        else if (framing == -2) {
             val decoded = httpDecodeChunked(
                 input.slice(headerEnd, input.size), maximumBody
             )
             if (decoded.error != "") result = -1
             else if (decoded.complete) result = headerEnd + decoded.consumed
-        } else {
-            var length = 0
-            if (encoded != "") length = httpDecimalLength(
-                encoded, maximumBody
-            )
-            if (length < 0) result = -1
-            else if (input.size >= headerEnd + length) {
-                result = headerEnd + length
-            }
+        } else if (input.size >= headerEnd + framing) {
+            result = headerEnd + framing
         }
     }
     result
@@ -402,13 +375,11 @@ fun httpEventFrame(
         // event path parsed every complete request once to discover framing,
         // discarded that graph, then parsed the same bytes again.
         val request = httpParseRequestFrom(input, peer)
-        val transfer = request.header("Transfer-Encoding")
-        val encoded = request.header("Content-Length")
         val version = httpEventRequestLineVersion(input, request, headerEnd)
         http10 = version == 0
-        if (version < 0 || ((transfer != "" || encoded != "") &&
-            httpEventAmbiguousFraming(request, http10))) length = -1
-        else if (httpHeaderTokenContains(transfer, "chunked")) {
+        val framing = httpRequestFraming(request, http10, maximumBody)
+        if (version < 0 || framing == -1) length = -1
+        else if (framing == -2) {
             val decoded = httpDecodeChunked(
                 input.slice(headerEnd, input.size), maximumBody
             )
@@ -422,12 +393,8 @@ fun httpEventFrame(
                 )
             }
         } else {
-            var bodyLength = 0
-            if (encoded != "") {
-                bodyLength = httpDecimalLength(encoded, maximumBody)
-            }
-            if (bodyLength < 0) length = -1
-            else if (input.size >= headerEnd + bodyLength) {
+            val bodyLength = framing
+            if (input.size >= headerEnd + bodyLength) {
                 length = headerEnd + bodyLength
                 if (bodyLength == 0 && length == input.size) {
                     framedRequest = request

@@ -611,7 +611,15 @@ them differently. HTTP/1.1 connections persist unless the request says
 `Connection: keep-alive`. A request line that is not `method target HTTP/1.x`
 with a target starting `/` or `*`, a `Content-Length` together with
 `Transfer-Encoding` (RFC 9112 6.1), an invalid chunk, or a body over the limit
-is answered `400` and the connection closes. A body shorter than declared waits
+is answered `400` and the connection closes. So is any framing that two readers
+could read differently: an empty or non-numeric `Content-Length`, two that
+differ, a `Transfer-Encoding` other than exactly `chunked` (`identity`, `gzip`,
+`chunked, gzip`, or given twice), whitespace before a header's colon, a folded
+line, a line without a colon, a bare LF or CR in a head line, and a byte in a
+header name that is not a token character (`Content-Length\x0b:`,
+`Content_Length:`). One strict helper, `httpRequestFraming`, decides it for the
+event server, `httpReadRequest` and the WebSocket handshake. A client reading a
+response refuses two `Content-Length`s that differ and stops reading at once. A body shorter than declared waits
 for the rest and the idle timeout closes the connection without an answer; bytes
 after a body of the declared length are the next request, never part of this
 one. A blank line before the request line is not skipped (it is answered `400`). `tests/cases/modules/http-event.ab` runs each of these.

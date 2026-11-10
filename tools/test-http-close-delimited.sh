@@ -44,6 +44,10 @@ def handle(conn, secure):
             gate.clear()
             conn.sendall(head)
             gate.wait(3)
+        elif path in (b"/differ", b"/async-differ"):
+            # Two Content-Lengths that differ, then the connection stays open: a client must stop at once.
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Length: 5\r\n\r\nabc")
+            time.sleep(1.5)
         elif path in (b"/stall", b"/tls-stall"):
             conn.sendall(b"HTTP/1.0 200 OK\r\n\r\npartial")
             time.sleep(1.5)

@@ -299,7 +299,99 @@ fun framingClient(link: Mutex<EventLink>): int {
     if (failed == 0 && !(textContains(differ.response, " 400 ") && !textContains(differ.response, "abc") && differ.closed)) failed = 13
     val same = framingExchange(port, "POST /body HTTP/1.1\r\nHost: local\r\nContent-Length: 3\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc", 2000)
     if (failed == 0 && !(textContains(same.response, "abc") && !textContains(same.response, " 400 ") && same.closed)) failed = 14
+    // 10. Framing that two readers could read differently is refused with 400 and a close, and nothing after the
+    //     request is read as a request: each case ends in a GET that would answer "first" if it were reused.
+    val shapes = framingRefusedShapes()
+    var shape = 0
+    while (failed == 0 && shape < shapes.size) {
+        val refused = framingExchange(port, "${shapes[shape]}${get}", 2000)
+        if (!(textContains(refused.response, " 400 ") && !textContains(refused.response, "first") && refused.closed)) failed = 20 + shape
+        shape = shape + 1
+    }
+    //     ... and the chunked and the plain forms that are valid still work (the coding is "chunked", in any case).
+    val chunked = framingExchange(port, "POST /body HTTP/1.1\r\nHost: local\r\nTransfer-Encoding:  Chunked \r\nConnection: close\r\n\r\n3\r\nabc\r\n0\r\n\r\n", 2000)
+    if (failed == 0 && !(textContains(chunked.response, "abc") && !textContains(chunked.response, " 400 ") && chunked.closed)) failed = 15
     link.with(eventLinkFinish)
+    failed
+}
+
+// The five ways a request's framing can be read two ways, in the shapes a client or a proxy sends them.
+fun framingRefusedShapes(): array<string> {
+    val head = "POST /body HTTP/1.1\r\nHost: local\r\n"
+    [
+        "${head}Content-Length:\r\n\r\nabc",
+        "${head}Content-Length: \r\n\r\nabc",
+        "${head}Transfer-Encoding: identity\r\n\r\nabc",
+        "${head}Transfer-Encoding: gzip\r\n\r\nabc",
+        "${head}Transfer-Encoding: chunked, gzip\r\n\r\n3\r\nabc\r\n0\r\n\r\n",
+        "${head}Transfer-Encoding: gzip, chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n",
+        "${head}Transfer-Encoding: chunked\r\nTransfer-Encoding: identity\r\n\r\n3\r\nabc\r\n0\r\n\r\n",
+        "${head}Content-Length : 3\r\n\r\nabc",
+        "${head}Transfer-Encoding : chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n",
+        "${head}X-Any : value\r\nContent-Length: 3\r\n\r\nabc",
+        "${head}Content-Length:\r\n 3\r\n\r\nabc",
+        "${head}Transfer-Encoding: chunked\r\n , gzip\r\n\r\n3\r\nabc\r\n0\r\n\r\n",
+        "${head}X-Folded: a\r\n Content-Length: 3\r\n\r\nabc",
+        "${head}Content-Length: +3\r\n\r\nabc",
+        "${head}Content-Length: 3 4\r\n\r\nabc",
+        "${head}Content-Length: 3 \r\n\r\nabc",
+        "${head}Transfer-Encoding: chunked;ext\r\n\r\n3\r\nabc\r\n0\r\n\r\n",
+        "${head}X-A: a\nContent-Length: 3\r\n\r\nabc",
+        "${head}X-A: a\rTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n",
+        "${head}X-A: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nContent-Length: 3\r\n\r\nabc",
+        "${head}X-A: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\rContent-Length: 3\r\n\r\nabc",
+        "${head}X\nContent-Length: 3\r\n\r\nabc",
+        "${head}X\rContent-Length: 3\r\n\r\nabc",
+        "${head}garbage\r\nContent-Length: 3\r\n\r\nabc",
+        "${head}Content-Length 3\r\n\r\nabc",
+        "${head}: v\r\nContent-Length: 3\r\n\r\nabc",
+        "${head}Content-Length\x0b: 3\r\n\r\nabc",
+        "${head}Content-Length\x00: 3\r\n\r\nabc",
+        "${head}Content Length: 3\r\n\r\nabc",
+        "${head}Content_Length: 3\r\n\r\nabc",
+        "${head}Transfer_Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n",
+        "${head}Transfer-Encoding\x0c: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n",
+        "${head}X(A): v\r\nContent-Length: 3\r\n\r\nabc",
+        "POST /a\nb HTTP/1.1\r\nHost: local\r\nContent-Length: 3\r\n\r\nabc",
+        "POST /a\rb HTTP/1.1\r\nHost: local\r\nContent-Length: 3\r\n\r\nabc",
+        "POST /a?x\ny HTTP/1.1\r\nHost: local\r\nContent-Length: 3\r\n\r\nabc",
+        "POST /body HTTP/1.1\nContent-Length: 3\r\nHost: local\r\n\r\nabc",
+        "POST /body HTTP/1.1\rContent-Length: 3\r\nHost: local\r\n\r\nabc"
+    ]
+}
+
+// The same shapes through the framing functions themselves, without a socket.
+fun framingUnit(): int {
+    val shapes = framingRefusedShapes()
+    var index = 0
+    var failed = 0
+    while (failed == 0 && index < shapes.size) {
+        // httpReadRequest (the WebSocket handshake) decides with the parse plus httpRequestFraming alone.
+        if (httpEventFrame(shapes[index], 4096, 65536).length != -1 ||
+            httpEventRequestLength(shapes[index], 4096, 65536) != -1 ||
+            httpRequestFraming(httpParseRequest(shapes[index]), false, 65536) != -1) failed = index + 1
+        index = index + 1
+    }
+    val plain = "POST /body HTTP/1.1\r\nHost: local\r\nContent-Length: 3\r\n\r\nabc"
+    if (failed == 0 && (httpEventFrame(plain, 4096, 65536).length != plain.size ||
+        httpEventRequestLength(plain, 4096, 65536) != plain.size)) failed = 100
+    val chunked = "POST /body HTTP/1.1\r\nHost: local\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n"
+    if (failed == 0 && (httpEventFrame(chunked, 4096, 65536).length != chunked.size ||
+        httpEventRequestLength(chunked, 4096, 65536) != chunked.size)) failed = 101
+    // A Content-Length exactly at the body limit is framed; one over it is refused.
+    val atLimit = "POST /body HTTP/1.1\r\nHost: local\r\nContent-Length: 5\r\n\r\nabcde"
+    if (failed == 0 && (httpEventFrame(atLimit, 4096, 5).length != atLimit.size ||
+        httpEventRequestLength(atLimit, 4096, 5) != atLimit.size)) failed = 105
+    if (failed == 0 && (httpEventFrame(atLimit, 4096, 4).length != -1 ||
+        httpEventRequestLength(atLimit, 4096, 4) != -1)) failed = 106
+    // Two equal Content-Lengths are one.
+    val twice = "POST /body HTTP/1.1\r\nHost: local\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\nabc"
+    if (failed == 0 && httpEventFrame(twice, 4096, 65536).length != twice.size) failed = 107
+    // The client side: two Content-Lengths that differ are not a response (Transfer-Encoding wins over one, as before).
+    val responseHead = "HTTP/1.1 200 OK\r\n"
+    if (failed == 0 && httpParseResponse("${responseHead}Content-Length: 3\r\nContent-Length: 5\r\n\r\nabc").complete) failed = 102
+    if (failed == 0 && !httpParseResponse("${responseHead}Content-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n").complete) failed = 103
+    if (failed == 0 && !httpParseResponse("${responseHead}Content-Length: 3\r\nContent-Length: 3\r\n\r\nabc").complete) failed = 104
     failed
 }
 
@@ -328,6 +420,8 @@ fun main: int {
     val oversizedHead = "GET / HTTP/1.1\r\nHost: local\r\n\r\n"
     if (httpEventFrame(oversizedHead, 8, 100).length != -1 ||
         httpEventRequestLength(oversizedHead, 8, 100) != -1) return 8
+    val unit = framingUnit()
+    if (unit != 0) return 300 + unit
     val reusable = reusableEventListeners()
     val router = httpRouter()
     router.get("/one", eventOne)
