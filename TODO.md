@@ -946,6 +946,13 @@
   structural: a header is an object with two substrings, and the lookup walks objects. A lowercase-name index built
   on the first `header()` call costs about what the lookups it replaces cost at five lookups and more for fewer,
   so it is not worth it; per-header laziness would change what `HttpRequest.headers` exposes. Stopping here.
+- [x] **`abla-compare` json-strings-4k, one worker, rechecked** (2026-11-10, master `7c706497`'s runtime, the setup of the
+  headers-32 entry; the 2026-11-06 matrix had Abla 91,781 requests/s against Rust 120,887, -24.1%, and a profile of
+  52.3% `jsonPlainStringEnd` + 25.2% `jsonStringIsPlain`): instructions per request, three runs each, Abla 64,308
+  (64,297 to 64,321) against Rust 98,864 to 100,001 and Zig 225,619 (the 2026-11-06 diagnostic had Abla at 181,371), so the
+  ASCII word spans and the UTF-8 validator that landed since take Abla's cost per request to 35% below Rust's;
+  requests per second in this placement are too load-dependent to quote (Abla 62,947 to 137,679 over the runs). No
+  longer trails, nothing to cut.
 - [ ] **`abla-compare` one-worker parameter routing trails Zig** (2026-11-06):
   parameters measured 276,924 versus 308,076 requests/s. The locked abla-web
   `webNoEscapeRoute` and stdlib `HttpRouter` both use `httpMatchPath`; the
