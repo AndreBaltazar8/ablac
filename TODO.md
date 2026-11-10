@@ -1191,6 +1191,12 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   source map is the largest part of a dev build's wall time that does not depend on how fast the frontend gets, and
   it is byte-for-byte reproducible work: concurrent dwarfdump calls and a cheaper parse of their output would
   not change the map.
+  Done (branch `wasm-sourcemap`, src/sourcemap.ab): the two dwarfdump runs start together and the line-table parse makes no
+  substring per prefix test or field. Module, `.map` and `.debug.wasm` are byte-identical to the unchanged compiler's on
+  the same sysroot (cmp, three builds each). The gain is smaller than the `--fast -g` profile suggested: by the strace
+  timeline the dwarfdump phase goes from 0.451 s to 0.281 s and the tail after it from 0.29 to 0.25 s, about 0.2 s of a
+  9.5 s build (2%), and user instructions fall 0.25% (71.0 G to 70.9 G): the release compiler's parse was already
+  cheap, so a `--fast -g` compiler's profile overstates the source map's share.
 - [ ] **A release Wasm module is optimized four times** (`opt` O1, clang's O2 pre-link,
   wasm-ld's LTO O3, wasm-opt -O3; for a large game client about 28, 27, 70 and 35 s of a
   165 s build). Dropping a pre-link stage does not pay: its work moves into the later ones.
