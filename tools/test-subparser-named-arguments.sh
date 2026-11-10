@@ -74,12 +74,12 @@ expect_generated_error() {
             -o "$output_directory/error-$name" > "$log" 2>&1; then
             fail "$name ($mode): the build succeeded"
         fi
-        grep -q "$code" "$log" && grep -q 'E_EXT_GENERATED_SEMANTIC' "$log" ||
+        grep -q "$code" "$log" && grep -q "${3:-$code}" "$log" ||
             { cat "$log" >&2; fail "$name ($mode): wrong errors"; }
     done
 }
 
-expect_generated_error finalizer-nested E_NAMED_ARGUMENT_REQUIRED
+expect_generated_error finalizer-nested E_NAMED_ARGUMENT_REQUIRED E_EXT_GENERATED_SEMANTIC
 expect_generated_error target-unknown E_NAMED_ARGUMENT_UNKNOWN
-expect_generated_error target-nested E_NAMED_ARGUMENT_REQUIRED
+expect_generated_error target-nested E_NAMED_ARGUMENT_REQUIRED E_EXT_GENERATED_SEMANTIC
 echo "subparser named arguments: reordered, skipped and mixed calls; every error at the site"
