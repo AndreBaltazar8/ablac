@@ -1146,6 +1146,33 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   The 10K-function application behind the older figures was not found on this machine.
   Partitioning before `opt` loses cross-part inlining and needs that application (or one
   past ~50 MB of IR) and a size check (object within +1%) before anyone builds it.
+  Remeasured 2026-11-10 (#745; master `44eac47c` stage 2, Panda Trails' client as `game/scripts/build-client.sh` builds it in
+  dev mode: `ablac build .build-fast.ab -o out/builder --no-cache` in `game/src/client` over a read-only copy of
+  game/src/{client,shared} with the engine and abla-ui symlinked; 3.1 MB of Wasm, a 7 MB `.debug.wasm`):
+  8.8 s wall, 81.9 G user instructions, 955 MB peak (one run with `perf stat`; under `strace -f -tt` 10.8 s). By process,
+  `perf record -e instructions:u`: the compiler process 84% (its own code 38.3%, the in-process libLLVM 32.9%, libc malloc
+  and free 12.7%), the 9 code generation children (`exe`, libLLVM) 7.7%, `llvm-dwarfdump` 7.4%, `wasm-ld` 0.5%. By time
+  (strace): one serial compiler process from 0.0 to 9.4 s (87% of the wall: the frontend, lowering, IR emission, `opt`
+  and the bitcode for the units), then the 9 code generation children 9.46 to 9.82 s (0.36 s, 3%), two `wasm-ld`
+  runs 0.08 s, two `llvm-dwarfdump` runs one after the other, `--debug-line` 0.19 s then `--debug-info` 0.28 s
+  (0.47 s, 4.3%, for the source map), and 0.4 s more in the compiler process after them. Inside the in-process libLLVM
+  share (32.5% of the samples; flat, no symbol over 1%): the optimizer's passes and the inliner/cloning about 8.9 points
+  (27% of it, so about 1 s of the 9.4), bitcode writing 3.1, debug-info metadata 2.7, names, hashing and use lists 6.9,
+  IR building and the rest 10.9. So the cut this item is about, a parallel `opt`, is bounded by about 1 s of
+  8.8 (11%) even if perfect, below the 25% bar, as on game-glimpse; the units already take code generation
+  off the serial path. What would move the number: the compiler's own frontend, lowering and allocation (about 51% of
+  all instructions, the work the "Where a `--fast` build's CPU goes" item is about), and, for a small, certain
+  gain, running the two `llvm-dwarfdump` calls at the same time (-0.19 s, 2% of the wall) or producing the source map
+  without them.
+  Inclusive shares of the compiler process in a call-graph profile with a `--fast -g` compiler (slower than the release
+  one, so only the order is meaningful; `perf record --call-graph dwarf`): `bootstrapWasmDebugArtifacts` 8.9%
+  (`bootstrapSourceMapReadInlineCalls` 4.1%, `bootstrapSourceMapReadLineTables` 3.6%: they parse the text of the two
+  dwarfdump runs), which with the dwarfdump children (7.4% of all instructions) and the 0.4 s tail makes the dev build's
+  source map about 0.9 s of 10.8 (8%); `bootstrapEmitHeldWasmObject` 6.3%; `opt` (`runPasses`) 5.2%; lowering
+  (`lowerExpressionType` 11.8%) and inference (`BootstrapAnalyzer.infer` 7.3%) are the rest of the serial front. The
+  source map is the largest part of a dev build's wall time that does not depend on how fast the frontend gets, and
+  it is byte-for-byte reproducible work: concurrent dwarfdump calls and a cheaper parse of their output would
+  not change the map.
 - [ ] **A release Wasm module is optimized four times** (`opt` O1, clang's O2 pre-link,
   wasm-ld's LTO O3, wasm-opt -O3; for a large game client about 28, 27, 70 and 35 s of a
   165 s build). Dropping a pre-link stage does not pay: its work moves into the later ones.
