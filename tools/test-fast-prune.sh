@@ -23,6 +23,10 @@ run_both() {
     "$project_root/tools/run-limited.sh" "$output_directory/$name-full" >"$output_directory/$name-full.out" 2>&1
     status_full=$?
     set -e
+    if [[ $(uname -s) == Linux && $(stat -c %s "$output_directory/$name-pruned") -ge $(stat -c %s "$output_directory/$name-full") ]]; then
+        echo "fast-prune: $name is not smaller pruned than full (pruning did not happen)" >&2
+        exit 1
+    fi
     if [[ $status_pruned -ne $status_full ]] || ! cmp -s "$output_directory/$name-pruned.out" "$output_directory/$name-full.out"; then
         echo "fast-prune: $name differs between the pruned and the full runtime (exit $status_pruned vs $status_full)" >&2
         exit 1
