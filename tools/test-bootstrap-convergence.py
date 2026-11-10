@@ -37,6 +37,13 @@ LINEAGES = {
             "b": ("v0.2.51", "d8e24762f3657cfc90289a6bc93ddcb6aa7b9df8338c93d4090e5b06319f4d7d"),
         },
     },
+    "v0.2.53": {
+        "historical": "b9ed669ce148440cef09650dde9db4085358f0cd",
+        "seeds": {
+            "a": ("v0.2.53", "49e1141c4b7d5782ecc46a0cefde11e831e453af30cd74f808c1dcca2c09e341"),
+            "b": ("v0.2.52", "126d8355386c9a4b5e46ab9d14d99ebab66ed6dcb2c84832a94b58fcd6ceefb3"),
+        },
+    },
 }
 
 
