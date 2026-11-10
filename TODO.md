@@ -853,6 +853,26 @@
   liveness for non-root values would free under 1% of frame bytes and almost no code, below the
   bars (1% of size, 5% of peak stack); the switch is not kept and nothing changed. Roots, which hold
   most of the slots across blocks, are the part left, and need their frame entry cleared where they die.
+  Screened 2026-11-10 (master `85f5e3f3`, v0.2.52 seed, branch `root-slots` at `7f86a598`):
+  - No clearing is needed. Rooted values already share one `gc.block` array that a single memset
+    zeroes, so two roots whose accesses don't overlap can take the same entry. The collector then
+    scans a stale value, as it already does after a root dies.
+  - The switch `ABLA_ROOT_SLOTS` colours rooted values by their first-to-last access in instruction
+    order. Each interval is widened over every jump or branch back to an earlier label, repeated
+    until nothing changes.
+  - Results:
+    - The compiler: its 1,317 functions with a root block hold 3,359 rooted values (beside 7,678
+      rooted locals). Sharing puts the values in 2,113 entries. Frame bytes (`sub $n,%rsp`) go from
+      773,512 to 744,512 (−3.75%); stripped size from 7,676,608 to 7,671,376 (−0.07%).
+    - json-megabyte: frames −3.5%, size −0.05%. json-readers: frames −3.0%, size +0.24%.
+    - The websocket servers and event-http-server: within ±0.1%.
+    - The eight `perf/` benchmarks: byte-identical (after O2 they keep almost no root blocks).
+  - gc-stress, lazy-root-frames and local-root-liveness pass with the switch on.
+  - Below the bars (1% of size, 5% of peak stack), so the switch is not kept and nothing changed.
+  - Rooted locals, twice as many entries, are what's left. They are named by text across
+    `local.*`, `resource.peek` and `place.root`, and capture paths would need the same intervals.
+    Even sharing a similar fraction (about −9% frame bytes) moves no code or instructions: the block
+    is still one memset.
 
 Measured on a 10K-function Wasm application (86 MB of LLVM IR). Its dev build's compiler,
 collecting each time its heap grows by 256 MiB, peaks at about 1 GB and takes about 28 CPU
