@@ -66,17 +66,19 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# The server takes a moment to listen: retry for up to ten seconds.
+# The server takes a moment to listen (longer on a loaded machine): retry for as long as it runs.
+# (--max-time only ends a hung request.)
 first_response=""
-for _ in $(seq 1 100); do
-    if first_response=$(curl --fail --silent --request POST \
+deadline=$((SECONDS + 300))
+while kill -0 "$server_pid" 2>/dev/null && ((SECONDS < deadline)); do
+    if first_response=$(curl --fail --silent --max-time 60 --request POST \
         "http://127.0.0.1:$port/rpc/$action?current=40"); then
         break
     fi
     sleep 0.1
 done
-[[ $first_response == 41 ]] || exit 1
-second_response=$(curl --fail --silent --request POST \
+[[ $first_response == 41 ]] || { echo "Android RPC example: no answer from the server" >&2; exit 1; }
+second_response=$(curl --fail --silent --max-time 60 --request POST \
     "http://127.0.0.1:$port/rpc/$action?current=$first_response")
 [[ $second_response == 42 ]] || exit 1
 
