@@ -1492,12 +1492,14 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
 
   The hash body inlined at every map site is the largest step. Xtensa (xtensa-esp-unknown-elf object, the 23.1.3
   cohort): abla-embedded's `tests/package-import.ab` 144,824 B with every step (it uses neither maps nor string
-  compares); a small program with a `Map<string, int>` and a string `==` 30,904 B on master, 31,764 B with
-  `map-growth` (+860, the in-place bump and the rehash fast path apply on every target), +0 for `string-equal`
-  and `string-hash` (the word paths fold away behind `__ablaRuntimePlatformUnalignedWords()`), and +0 for
-  `bytes-equal` once its split is host-only (it was +300 with the split everywhere). Follow-up, not done: what in
-  `map-growth` costs 860 B at Xtensa's optimisation level (the rehash fast path repeating the slot rebuild?), and
-  whether sharing the rebuild with the general rehash keeps the hosted gain. The string hash is random-like
+  compares); a small program with a `Map<string, int>` and a string `==`: 30,904 B on master. `map-growth` split
+  (each part alone on master): the in-place count bump -268 B (30,636), the rehash fast path +1,080 B (31,984,
+  of which the dense-key shortcut about 140 B: the second copy of the rebuild loop and its 64-bit hash
+  arithmetic is large on a 32-bit core); both together +860 B. The fast path is now hosted-only
+  (`__ablaRuntimePlatformUnalignedWords()`), so Xtensa has the bump alone, 30,636 B (-268 B against master),
+  and `string-equal`, `string-hash` and the `bytes-equal` split add +0 there (the word paths fold away behind the
+  same predicate). Out-of-lining the hash (a noinline wrapper for the rehash) and the int finalizer
+  did not shrink it (31,804 B and 32,088 B), so they were not kept. The string hash is random-like
   (`docs/measurements/map-hash-2026-11-10.md`: about 1.3 probes at the table's load, a little worse than
   FNV-1a only where keys differ in their last bytes), unseeded as FNV-1a was.
 
