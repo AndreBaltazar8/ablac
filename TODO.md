@@ -1325,6 +1325,16 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   that stalls). It would touch the registry's entry format, the allocator's fast path (alloc-fast), the
   free-list accounting and the collector's mark; its win is in cycles, not instructions, so it needs the quiet
   benchmark window to be judged (instructions will not move).
+  Tried first, the cheap test of the same hypothesis (branch `sweep-prefetch`, an `ablaRuntimePrefetch`
+  intrinsic lowered to `llvm.prefetch` for write, and the sweep asking for the state-word line of the block N
+  registry entries ahead; instructions +1.0% on trees, one lookahead load and a prefetch per entry): `trees`,
+  release, one pinned P-core, nine alternating rounds a hold inside a four-slot window, cycles:u medians: N=16
+  4.473 G to 4.352 G (-2.7%), N=32 4.068 G to 4.014 G (-1.3%) (minimums -2.1% and -2.9%). A screen on a loaded
+  machine had read -7.5% (N=8) and -13.8% (N=16) with ±30% spread between rounds of one binary: that was noise.
+  Under the bar of -8% (and the padded second build was not run), so the prefetch is a no-go: the out-of-order
+  window already overlaps the sweep's misses, and the sweep's 31% of cycles is not mostly waiting that a hint
+  recovers. What remains open is touching fewer lines (the side-bitmap sketch above), which this does not
+  support or rule out.
 - [ ] **Name lookups in lowering.** Over a game server's `--emit-llvm` the method index's
   `find` was 200 of 3,552 samples, the declaration index's 148 and the name hashes 98 and
   76. Done: the method index hashes owner and name in place instead of a key string made
