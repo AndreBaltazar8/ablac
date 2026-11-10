@@ -1475,6 +1475,32 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   (-23.1%), json-readers 22.20 G to 20.14 G (-9.3%); the error code and byte offset of invalid input are
   unchanged (`tests/cases/json-utf8`, passing with both the old and the new check).
 
+- [ ] **Maps and string compares: what the batch bought and cost** (2026-11-10, release builds, instructions on one
+  pinned P-core; `map-growth`, `string-equal`, `string-hash`, `bytes-equal`). The `maps` benchmark 2,422 M to 1,980 M
+  (-18.3%: the live count bumped in place and a rehash with no removals keeping the entry arrays -11.5%, a string
+  compared eight bytes at a time -3.6%, a string hashed eight bytes at a time -1.9%, the rest from the leaf compare);
+  the compiler's own `--fast` self-build -1.4% (map-growth and string-equal), a further -2.5% (the leaf
+  compare, which stops saving four registers on every call), -0.2% (the hash); `strings`, `json-readers` 0.0%,
+  `json-megabyte` -1.0% (its count moves +-1% a run with where the collections land). Stripped bytes, cumulative:
+
+  | Program | master | + map-growth | + string-equal | + string-hash | + bytes-equal |
+  |---|---:|---:|---:|---:|---:|
+  | maps | 25,984 | 26,560 | 26,688 | 27,520 | 27,712 (+6.65%) |
+  | strings | 21,216 | 21,216 | 21,344 | 21,344 | 21,504 (+1.36%) |
+  | json-megabyte | 197,160 | 197,704 | 197,832 | 198,696 | 198,888 (+0.88%) |
+  | json-readers | 122,920 | 122,920 | 123,032 | 123,032 | 123,240 (+0.26%) |
+
+  The hash body inlined at every map site is the largest step. Xtensa (xtensa-esp-unknown-elf object, the 23.1.3
+  cohort): abla-embedded's `tests/package-import.ab` 144,824 B with every step (it uses neither maps nor string
+  compares); a small program with a `Map<string, int>` and a string `==` 30,904 B on master, 31,764 B with
+  `map-growth` (+860, the in-place bump and the rehash fast path apply on every target), +0 for `string-equal`
+  and `string-hash` (the word paths fold away behind `__ablaRuntimePlatformUnalignedWords()`), and +0 for
+  `bytes-equal` once its split is host-only (it was +300 with the split everywhere). Follow-up, not done: what in
+  `map-growth` costs 860 B at Xtensa's optimisation level (the rehash fast path repeating the slot rebuild?), and
+  whether sharing the rebuild with the general rehash keeps the hosted gain. The string hash is random-like
+  (`docs/measurements/map-hash-2026-11-10.md`: about 1.3 probes at the table's load, a little worse than
+  FNV-1a only where keys differ in their last bytes), unseeded as FNV-1a was.
+
 ## Tried, not pursued
 
 - **JSON ASCII word scans without a short-string fast path** (2026-11-06/07,
