@@ -2076,3 +2076,30 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   interpreter does (jit's analysis alone is +1.8%, and the in-process LLJIT generation is not
   measured), so B pays only together with a cache of its own: A first. Review: ablac-e5
   (evaluator), ablac-39 (cache keys).
+- Effects of the three NovaKind compile-time actions, from their sources (ablac-52, 2026-11-10; the key a result
+  cache would need; abla-one at the revision NovaKind's repro tree pins, locale files under `locales/`):
+  (1) `novakindServerLock` is a TRANSFORM (`#compiler.transform`, app.ab) running `oneServerLock("server.lock")`
+  (abla-one lock.ab): it walks `compiler.functionsAnnotated("server")` and, for every such
+  function, its name, each parameter's name and type and the result type, and through
+  `compilerFindClass` / `compilerClassField*` the fields of every class they reach; reads
+  `server.lock` (`Path.exists` / `readText`, `filesystem.read`), compares, and calls
+  `compiler.writeFile` only when the text differs (`filesystem.write`, which the app grants, so a
+  build that uses it is uncacheable by the capability rule even when nothing is written), and
+  may `generateModule("one_server_lock", ...)` for a problem. Depends on: the set and the
+  signatures of the `@server` functions and the field lists of the classes they reach, plus
+  the file. An edit to a screen file that touches none of those invalidates nothing.
+  (2) `oneRemoteGenerate` (abla-one remote.ab) walks the same `@server` functions and
+  `generateModule("one_remote_<part>", code)` for each part of the generated client, plus a
+  problems module; same reflection dependency (signatures and reachable classes), no file reads.
+  (3) `novakindCatalog` (`val novakindTranslations = #novakindCatalog()`, domain/i18n.ab): reads
+  `NOVAKIND_CATALOG_ENTRY` / `_ALSO` (environment), `locales/en.json`, `locales/pt-PT.json` and, when
+  the entry is set, the source files it lists; no reflection over the program; depends on those
+  inputs only. Honest key: (3) is exactly the journal the build cache already has
+  (`filesystem.read` + `environment`); (1) and (2) need the key to include a digest of the
+  reflected facts (the `@server` list, signatures, reachable class fields), which the action
+  itself defines by the compiler API calls it makes: record each reflective query's answer in the
+  journal and revalidate by replaying the queries on the new program (cheap against the action's
+  25 M and 20 M steps, which are mostly string building), so an edit to one screen invalidates
+  none of the three, and an edit to an `@server` signature invalidates (1) and (2) only. A catch:
+  the write grant makes the whole build uncacheable, so (1) must be split into "read and compare"
+  (cacheable) and "write" (only on a changed text, which is the invalidating case anyway).
