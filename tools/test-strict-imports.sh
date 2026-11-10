@@ -99,6 +99,14 @@ cd "$cases/nested/lib" && rejected ../main.ab "" \
 "$compiler" build "$cases/generic-types/main.ab" -o "$output_directory/generic-types" \
     --strict-imports
 runs "$output_directory/generic-types" "5 2 1 3"
+# A type parameter in scope wins over a flat program's class of the same name
+# (and over a standard-library type name); a class that is no type parameter
+# there still is E_NAME_NOT_IMPORTED.
+"$compiler" build "$cases/type-parameters/main.ab" -o "$output_directory/type-parameters"
+runs "$output_directory/type-parameters" "3 6 5 4 15 9
+15"
+rejected "$cases/type-parameters/bad-main.ab" "" \
+    'error[E_NAME_NOT_IMPORTED]: `Other` is declared in'
 # A library module's other file isn't API: a flat program's report names the
 # entry module that reaches it, and a strict program is told it's internal.
 "$compiler" build "$cases/internal.ab" -o "$output_directory/internal" \
