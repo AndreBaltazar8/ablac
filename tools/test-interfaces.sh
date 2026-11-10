@@ -49,6 +49,7 @@ for mode in interp jit; do
     runs extend " (1, 2)! #abla! true"$'\n'" (1, 2)! #abla! true" "$mode"
     runs lift "shape of 12 21 true" "$mode"
     runs inheritance "45 24 cube of 8 shape of 9 cube of 8 cube true"$'\n'"45 24 cube of 8 shape of 9 cube of 8 cube true" "$mode"
+    runs implementers " a1 a2 b2 b1 i4 i3 j3 i3 true"$'\n'" a1 a2 b2 b1 i4 i3 j3 i3 true" "$mode"
     runs sealed "(2 + 3 * -4) = -10; square 2 round 9 none"$'\n'"(2 + 3 * -4) = -10; square 2 round 9 none" "$mode"
     runs direct-default $'shape of 9 18 shape of 9 18\nsolid of 6 shape of 1 x\nshape of 4 48 q' "$mode" 0
     runs api $'shape of 4\npoint\nsquare 3\n Shape Labeled | Square Point | area:method describe:default | area:extension describe:extension | false' "$mode" 0
@@ -79,4 +80,4 @@ rejected not-conforming 'function.argument:measure@'
 rejected cast-impossible 'interface.cast@' ':Shape:Label' 'cast-impossible.ab:19:17'
 rejected extend-unknown 'interface.extend-unknown:Missing'
 rejected extend-missing 'interface.missing-member:Shape.area:Square' 'extend-missing.ab:7:1'
-echo "interfaces: conformance, extend, inheritance, resource interfaces, sealed + is, dispatch, defaults (through an interface and on a class value), as?, modules, # (both tiers), lift, compiler API, diagnostics"
+echo "interfaces: conformance, extend, inheritance, implementers (extend before/after the class, through an ancestor), resource interfaces, sealed + is, dispatch, defaults (through an interface and on a class value), as?, modules, # (both tiers), lift, compiler API, diagnostics"
