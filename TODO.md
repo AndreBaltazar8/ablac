@@ -557,6 +557,15 @@
   the self-build is 0.8% fewer instructions (66.78 G vs 67.29 G, five alternating runs), but the median
   peak rises 2.1%, the baseline's low mode being its best case, so the bar (median lower) is not met. Six
   runs an arm is thin: the gap is within the baseline's own 1.40/1.50 GB spread. A better fix would shorten what the overloads stage holds, not move the collection.
+  Tried 2026-11-10 (master `6b8bd966`, branch `gc-probe-scope`, patch not kept): the overload probe's analyzers
+  (`probe`, and the `full` check one) were locals of `bootstrapResolveOverloads`, so their state stayed rooted through
+  the declaration rewrite that follows. Moving the probe into its own function that returns only the resolutions,
+  the failure text and the check's difference (so both analyzers are out of scope when the rewrite allocates) left the
+  `--emit-llvm src/orc_main.ab` IR byte-identical and did not move the modes. Peak RSS, `taskset -c 0-7`,
+  alternating, 11 runs of the base and 10 of the change: base 1,468,828 and 1,473,696 KiB (2 runs) and nine from
+  1,562,972 to 1,573,004; change 1,462,208, 1,463,188 and 1,465,028 (3 runs) and seven from 1,557,584 to 1,571,036.
+  So the ~55 MB the high mode keeps is not the probe's dead state: it is live at the crossing, inside the stage's
+  own analysis, which a narrower scope cannot release.
 - **Peak RSS swings with where a collection falls in the program's phases, not with the trigger (#677,
   recorded as a no-go for a trigger or marking fix).** (2026-11-09, master `0eaf983e`, branch
   `gc-schedule`.) `tests/benchmarks/json-megabyte.ab` at 170000, same binary and input: 912 MB in
