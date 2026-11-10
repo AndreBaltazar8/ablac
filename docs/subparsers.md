@@ -129,6 +129,46 @@ is consumed when it is put into another node. A name given to
 the module that invokes the subparser, its `private` declarations included,
 not in the module that declares the handler.
 
+A call can name its arguments: `syntaxNamedArgument(name, value)` builds what
+`name = value` parses to in a call's argument list, and is valid only as an
+element of the argument array of `syntaxCall`, `syntaxCallTarget` or
+`syntaxMethodCallTarget`. The call then follows the ordinary rules of named
+arguments: the names may come in any order, defaults fill the parameters left
+out, positional arguments may precede the named ones, and a mistake is the
+same `E_NAMED_ARGUMENT_*` error as in source (an unknown name, a positional
+argument after a named one, too many arguments, a duplicate, a missing
+required parameter, a call with no function to match) reported at the
+subparser's `$name` site. A name that is not an identifier fails the
+subparser. A named argument anywhere else (as an element of `syntaxArray`, an
+operand, a result of its own, or the value of another named argument) fails
+the subparser with `E_SUBPARSER_NAMED_ARGUMENT`.
+
+```abla
+import "abla/io"
+import "abla/compiler/parser"
+
+fun makeBox(width: int, height: int, depth: int = 1): int = width * 100 + height * 10 + depth
+
+// `$box()` is `makeBox(height = 4, width = 3)`.
+compile fun parseBox(cursor: ParserCursor): SyntaxExpression {
+    parserExpect(cursor, "(")
+    parserExpect(cursor, ")")
+    val arguments: array<SyntaxExpression> = [
+        syntaxNamedArgument("height", syntaxInteger(4)),
+        syntaxNamedArgument("width", syntaxInteger(3))
+    ]
+    syntaxCall("makeBox", arguments)
+}
+
+#compilerRegisterSubparser("box", parseBox)
+
+fun main {
+    println($box())
+}
+// output:
+// 341
+```
+
 `parserFail(cursor, message)` reports an error at the cursor. The build
 stops with that message:
 
