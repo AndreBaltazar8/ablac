@@ -19,6 +19,8 @@ SEEDS = {
 # The pairs of routes the gate knows. A lineage names the tag whose source route B rebuilds (the "bridge"), the
 # route A seed (that tag's own release) and the route B seed (the release before it). The default is the first
 # pair the gate was built for; --lineage picks a newer one. Seeds are checksum-pinned release assets.
+# Where the candidate source sits; CI reserves this path, a local run names its own (configure(root=...)).
+CANONICAL_ROOT = "/build/source"
 LINEAGES = {
     "v0.2.45": {"historical": HISTORICAL, "seeds": dict(SEEDS)},
     "v0.2.51": {
@@ -26,6 +28,13 @@ LINEAGES = {
         "seeds": {
             "a": ("v0.2.51", "d8e24762f3657cfc90289a6bc93ddcb6aa7b9df8338c93d4090e5b06319f4d7d"),
             "b": ("v0.2.50", "aa40e582e66f40013571b7ef1311e9079582d0fbeffa7843d57707a18205b7a9"),
+        },
+    },
+    "v0.2.52": {
+        "historical": "0eaf983ef383d773896cb1e258918ca5b9304bbb",
+        "seeds": {
+            "a": ("v0.2.52", "126d8355386c9a4b5e46ab9d14d99ebab66ed6dcb2c84832a94b58fcd6ceefb3"),
+            "b": ("v0.2.51", "d8e24762f3657cfc90289a6bc93ddcb6aa7b9df8338c93d4090e5b06319f4d7d"),
         },
     },
 }
@@ -41,7 +50,6 @@ def configure(lineage, root=None):
     HISTORICAL = LINEAGES[lineage]["historical"]
     SEEDS = dict(LINEAGES[lineage]["seeds"])
     CANONICAL_ROOT = root if root is not None else "/build/source"
-CANONICAL_ROOT = "/build/source"
 # A command put in front of every build step (a shared machine's queue); empty in CI.
 WRAPPER = []
 ENTRY = "src/orc_main.ab"
@@ -267,7 +275,7 @@ def main():
     run = sub.add_parser("route")
     run.add_argument("--lineage", default="v0.2.45", choices=sorted(LINEAGES))
     run.add_argument("--root", help="absolute candidate source directory (default /build/source)")
-    run.add_argument("--wrap", default="", help="a command line put in front of every build step, such as a slot queue")
+    run.add_argument("--wrap", default="", help="a command line put in front of every build step, such as a slot queue; steps then run with no time limit of their own, so the wrapper must bound a stuck step (fair-flock does, with its hold limit)")
     run.add_argument("route", choices=["a", "b"])
     run.add_argument("output", type=Path)
     join = sub.add_parser("compare")

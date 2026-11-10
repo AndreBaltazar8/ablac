@@ -144,6 +144,11 @@ class LineageTests(unittest.TestCase):
             gate.configure("v9.9.9")
         self.assertEqual(gate.SEEDS["a"][0], "v0.2.51", "a refused lineage leaves the selection alone")
 
+    def test_lineages_chain(self):
+        # Route B of a release is the previous release: its seed is the previous lineage's route A.
+        self.assertEqual(gate.LINEAGES["v0.2.52"]["seeds"]["b"], gate.LINEAGES["v0.2.51"]["seeds"]["a"])
+        self.assertEqual(gate.LINEAGES["v0.2.51"]["seeds"]["b"][0], "v0.2.50")
+
     def test_root_defaults_and_is_selectable(self):
         self.assertEqual(gate.CANONICAL_ROOT, "/build/source")
         gate.configure("v0.2.45", "/scratch/build/source")
