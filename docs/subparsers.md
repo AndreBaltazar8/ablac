@@ -143,6 +143,10 @@ subparser. A named argument anywhere else (as an element of `syntaxArray`, an
 operand, a result of its own, or the value of another named argument) fails
 the subparser with `E_SUBPARSER_NAMED_ARGUMENT`.
 
+In a finalizer's generated function the same calls work. The handler's result is
+what the check above covers; a misplaced named argument in generated code is an
+ordinary error of the generated code, located at its origin.
+
 ```abla
 import "abla/io"
 import "abla/compiler/parser"

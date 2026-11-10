@@ -63,4 +63,15 @@ expect_error inarray E_SUBPARSER_NAMED_ARGUMENT
 expect_error bare E_SUBPARSER_NAMED_ARGUMENT
 expect_error nested E_SUBPARSER_NAMED_ARGUMENT
 expect_error badname E_EVAL_EXPRESSION
+# In a finalizer's generated function the misuse is an error of the generated code, located at
+# its origin, not at a `$name` site.
+for mode in interp jit; do
+    log="$output_directory/error-finalizer-nested.err"
+    if ABLA_COMPILE_EVAL=$mode "$compiler" build "$cases/error-finalizer-nested.ab" \
+        -o "$output_directory/error-finalizer-nested" > "$log" 2>&1; then
+        fail "finalizer-nested ($mode): the build succeeded"
+    fi
+    grep -q 'E_NAMED_ARGUMENT_REQUIRED' "$log" && grep -q 'E_EXT_GENERATED_SEMANTIC' "$log" ||
+        { cat "$log" >&2; fail "finalizer-nested ($mode): wrong errors"; }
+done
 echo "subparser named arguments: reordered, skipped and mixed calls; every error at the site"
