@@ -296,6 +296,21 @@ The rules:
   of an `if` without `else`. A block whose value is one of its own locals
   (`{ val t = issue(5); t }`) hands that local on with its value, so the block
   doesn't drop it too.
+- A new resource that is only a temporary is dropped at the end of the full statement it is part of (decided: not
+  right after the call that borrowed it): the receiver of a method (`issue(5).isValid()`), of a field read
+  (`issue(5).id`), or an argument to a borrowing parameter (`check(issue(5))`). If it is part of the condition of an
+  `if`, `while` or `do`/`while`, the subject of a `when`, or an operand of `&&` or `||` that may not run, it is
+  dropped at the end of that condition, subject or operand (a loop's condition on each pass), before the body.
+  Several are dropped newest first. A `return`, `break` or `continue` in the middle of the statement drops the ones
+  made so far. The same holds in the compile-time evaluator, in a global's initializer and in the body of a
+  lambda, a `defer` and a generator. A resource something takes (a constructor or `own` argument, a `move`) is not
+  one. Not covered, and still leaking as before (the resource's `drop` never runs, so a password or key it wipes is not wiped):
+  a temporary that is the receiver or an argument of an extension function (`fun Res.check()` called as
+  `make().check()`), of a call through an interface (dispatch) or an interface's default body, or of a built-in
+  container's method (`array.append(make())` hands it on, which is fine; `list.contains(make())` does not).
+  Bind such a resource to a `val` first, or give it to an `own` parameter, and it is dropped at the end of its
+  scope as before. A view of a temporary's field (`val d = make().data()`) that is kept
+  after the statement is accepted when the field is a managed object, and sees what the drop did.
 - Copying is rejected: `val b = a` must be `val b = move(a)`
   (`ownership.move-required`). Passing `a` to an `own` parameter also needs
   `move(a)`. A fresh value, like `refund(issue(5))`, needs no `move`.

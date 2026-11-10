@@ -392,6 +392,7 @@ test-serial: ablac
 	tools/test-lazy-root-frames.sh $(COMPILER)
 	tools/test-import-remap.sh $(COMPILER)
 	tools/test-ownership-precision.sh $(COMPILER)
+	tools/test-drop-temporaries.sh $(COMPILER)
 	tools/test-local-root-liveness.sh $(COMPILER)
 	tools/test-global-initializer-split.sh $(COMPILER)
 	tools/test-gc-growth.sh $(COMPILER)

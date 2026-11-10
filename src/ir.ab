@@ -326,6 +326,8 @@ var bootstrapIrLambdaOwnerFunctions: int = 0
 // lambda in it): a large array literal there computes its large elements in functions
 // of their own (bootstrapLowerArray).
 var bootstrapIrGlobalInitializer: bool = false
+// Decision #51 B: a temporary is dropped right after the call that borrowed it, not at the end of its statement.
+val bootstrapIrDropTemporariesAfterCall: bool = false
 
 fun bootstrapIrSourceFileIndex(identity: string): int {
     // An instance of a generic is in its generic's file (generics.ab).
@@ -5691,6 +5693,53 @@ class BootstrapLowerer(
         declaration.resultType == "inferred" && bootstrapIsAssignment(tail)
     }
 
+    /** A fresh resource that is only a temporary: the receiver of a method or
+     *  the argument of a borrowing parameter (`make().ok()`, `use(make())`).
+     *  Nothing else holds it, so it goes in a hidden local of the current
+     *  scope, which dropTemporaries (the end of the statement, the condition
+     *  or the operand being lowered) and a `return`, `break` or `continue`
+     *  leaving the scope drop, in the reverse of the order they were made. The
+     *  value to use in its place (a read of that local) is returned; the value
+     *  itself when `child` is not one (an identifier, a field, a constructor
+     *  of a plain class, a `move`, a borrowed or function-typed result). */
+    fun holdTemporary(child: BootstrapExpression, value: int): int {
+        if (value < 0 || (child.kind != "call" && child.kind != "member.call")) return value
+        if (child.text == "move" || this.callHandsOnAssignment(child)) return value
+        val type = this.lowerExpressionType(child)
+        if (bootstrapIsBorrowType(type) || bootstrapIsFunctionType(type) ||
+            !this.lowerTypeIsAffine(bootstrapNormalizeType(type))) return value
+        val name = "__abla_temporary_${this.allocateLabel()}"
+        val storage = "local_${this.nextValue}_$name"
+        this.locals.append(name)
+        this.localTypes.append(type)
+        this.localStorage.append(storage)
+        this.localScopes.append(this.currentScope)
+        this.localBorrowSources.append("")
+        this.emit("local.declare", value, -1, storage)
+        this.emit("local.load", -1, -1, storage)
+    }
+
+    /** Where a temporary goes (André's decision #51). A, the one built: at the end of its statement, condition, subject
+     *  or operand (dropTemporaries, called there). B: right after the call that borrowed it, which is this method
+     *  called with the mark taken before the call's arguments, once `bootstrapIrDropTemporariesAfterCall` is true;
+     *  the drop sites of A then find nothing left. */
+    fun callDone(mark: int) {
+        if (bootstrapIrDropTemporariesAfterCall) this.dropTemporaries(mark)
+    }
+
+    /** Drops the temporaries (holdTemporary) made since `mark`, newest first. */
+    fun dropTemporaries(mark: int) {
+        var index = this.locals.size
+        while (index > mark) {
+            index = index - 1
+            if (this.localTypes[index] != "void" &&
+                this.locals[index].startsWith("__abla_temporary_")) {
+                this.emitAffineDrop(this.localStorage[index], this.localTypes[index])
+                this.localTypes[index] = "void"
+            }
+        }
+    }
+
     fun emitAffineValueDrop(value: int, type: string) {
         val normalized = bootstrapNormalizeType(type)
         if (this.lowerTypeIsAffine(normalized)) {
@@ -8261,7 +8310,10 @@ class BootstrapLowerer(
             this.addNullableRefinements(
                 operands[operand - 1], operation == "&&"
             )
+            val operandMark = this.locals.size
             current = this.lowerExpression(operands[operand])
+            // Only evaluated on this path: its temporaries go before the join.
+            this.dropTemporaries(operandMark)
             operand = operand + 1
         }
         this.leaveLocalScope(previousLogicalScope)
@@ -8826,8 +8878,10 @@ class BootstrapLowerer(
             }
             defaultIndex = defaultIndex + 1
         }
+        val bodyMark = functionLowerer.locals.size
         val result = functionLowerer.lowerExpression(declaration.expression, true,
             bootstrapIrIsErasedType(functionLowerer.erasedReturnType))
+        functionLowerer.dropTemporaries(bodyMark)
         functionLowerer.emitOwnedParameterDrops()
         var functionName = declaration.name
         if (declaration.extensionOwner != "") {
@@ -9039,8 +9093,10 @@ class BootstrapLowerer(
             }
             defaultIndex = defaultIndex + 1
         }
+        val bodyMark = methodLowerer.locals.size
         val methodResult = methodLowerer.lowerExpression(method.expression, true,
             bootstrapIrIsErasedType(methodLowerer.erasedReturnType))
+        methodLowerer.dropTemporaries(bodyMark)
         methodLowerer.emitOwnedParameterDrops()
         val loweredMethod = bootstrapFinalizeIrFunction(
             "${owner.name}_${method.name}",
@@ -9481,7 +9537,9 @@ class BootstrapLowerer(
                             (declaration.expression.children.size > 2 &&
                              declaration.expression.children[2].kind != "missing")))
                 }
+                val temporaryMark = this.locals.size
                 val value = this.lowerExpression(declaration.expression, true, erase)
+                this.dropTemporaries(temporaryMark)
                 bootstrapIrGlobalInitializer = false
                 this.emit("global.store", value, -1, declaration.name)
                 bootstrapIrLambdaOwner = savedLambdaOwner
@@ -9923,7 +9981,9 @@ fun bootstrapLowerOutlinedElement(
         lowerer.inferredResults,
         classFieldPlaces = lowerer.classFieldPlaces
     )
+    val temporaryMark = elementLowerer.locals.size
     val value = elementLowerer.lowerExpression(expression, true, eraseResult)
+    elementLowerer.dropTemporaries(temporaryMark)
     lowerer.errors = elementLowerer.errors
     val name = "__bootstrap_globals_element_${lowerer.functions.size}"
     val function = bootstrapFinalizeIrFunction(
@@ -10329,8 +10389,10 @@ fun bootstrapLowerLambdaFunction(
         lambdaLowerer.erasedReturnType = "any"
     val enclosingGlobalInitializer = bootstrapIrGlobalInitializer
     bootstrapIrGlobalInitializer = false
+    val bodyMark = lambdaLowerer.locals.size
     val lambdaResult = lambdaLowerer.lowerExpression(body, true,
         bootstrapIrIsErasedType(lambdaLowerer.erasedReturnType))
+    lambdaLowerer.dropTemporaries(bodyMark)
     bootstrapIrGlobalInitializer = enclosingGlobalInitializer
     lambdaLowerer.emitOwnedParameterDrops()
     lowerer.errors = lambdaLowerer.errors
@@ -10459,11 +10521,13 @@ fun bootstrapLowerBlock(
     var statement = 0
     while (statement < expression.children.size) {
         val lowered = expression.children[statement]
+        val temporaryMark = lowerer.locals.size
         result = lowerer.lowerExpression(
             lowered, valueRequired && statement + 1 == expression.children.size,
             eraseResult && statement + 1 == expression.children.size
         )
         if (statement + 1 < expression.children.size) lowerer.dropDiscarded(result, lowered)
+        lowerer.dropTemporaries(temporaryMark)
         // (A branch ending in a call of type `never` leaves, as the
         // analyzer found: bootstrapInferIf.)
         val after = if (lowered.kind == "if" && lowered.children.size == 3)
@@ -11221,6 +11285,7 @@ fun bootstrapLowerCall(
     initial: int
 ): int {
     var result = initial
+    val temporaryMark = lowerer.locals.size
     var callableType = "unknown"
     if (lowerer.isParameter(expression.text)) callableType =
         lowerer.lowerParameterType(expression.text)
@@ -11245,7 +11310,12 @@ fun bootstrapLowerCall(
         if (classIndex >= 0 && argument < lowerer.declarations[classIndex].parameterTypes.size)
             expected = lowerer.declarations[classIndex].parameterTypes[argument]
         val value = lowerer.lowerExpression(child, true, bootstrapIrIsErasedType(expected))
-        arguments.append(value)
+        // A fresh resource given to a plain function's borrowing parameter is a temporary of the statement.
+        val borrowed = !localCallable && classIndex < 0 && !lowerer.isGlobal(expression.text) &&
+            !lowerer.isExternal(expression.text) && !bootstrapIsFunctionType(callableType) &&
+            lowerer.functionDeclarations.find(expression.text) >= 0 &&
+            lowerer.lowerFunctionParameterKind(expression.text, argument) == "parameter"
+        arguments.append(if (borrowed) lowerer.holdTemporary(child, value) else value)
         argument = argument + 1
     }
     argument = 0
@@ -11322,6 +11392,7 @@ fun bootstrapLowerCall(
                 expression.text
         } else bootstrapCanonicalDeclarationSourceName(expression.text)
     )
+    lowerer.callDone(temporaryMark)
     result
 }
 
@@ -11372,6 +11443,7 @@ fun bootstrapLowerMember(
     initial: int
 ): int {
     var result = initial
+    val temporaryMark = lowerer.locals.size
     val receiverType = bootstrapBorrowElementType(
         lowerer.lowerExpressionType(expression.children[0])
     )
@@ -11381,7 +11453,15 @@ fun bootstrapLowerMember(
     }
     val receiver = if (place != "") {
         lowerer.lowerPlaceProjection(expression.children[0])
-    } else lowerer.lowerExpression(expression.children[0])
+    } else {
+        val lowered = lowerer.lowerExpression(expression.children[0])
+        // `make().id`: a fresh resource read for a field that stays valid after it is dropped (a field that
+        // is itself a resource would move out of it) is a temporary of the statement.
+        if (lowerer.lowerTypeIsAffine(bootstrapNormalizeType(lowerer
+            .lowerExpressionType(expression))))
+            lowered
+        else lowerer.holdTemporary(expression.children[0], lowered)
+    }
     if (expression.text == "size" &&
         (receiverType == "string" ||
          bootstrapIsArrayType(receiverType) ||
@@ -11394,6 +11474,7 @@ fun bootstrapLowerMember(
     } else result = lowerer.emitFieldGet(
         receiver, receiverType, expression.text, expression
     )
+    lowerer.callDone(temporaryMark)
     result
 }
 
@@ -11475,6 +11556,7 @@ fun bootstrapLowerMemberCall(
     initial: int
 ): int {
     var result = initial
+    val temporaryMark = lowerer.locals.size
     val owner = bootstrapBorrowElementType(
         lowerer.lowerExpressionType(expression.children[0])
     )
@@ -11485,6 +11567,12 @@ fun bootstrapLowerMemberCall(
         )
     }
     val arguments: array<int> = []
+    // A user method (not a built-in container's, nor a runtime value's): a fresh resource that is its
+    // receiver or given to a borrowing parameter is a temporary of the statement.
+    val userMethod = lowerer.methodDeclarations.find(owner, expression.text) >= 0 &&
+        lowerer.runtimeValueMethod(owner, expression.text) == "" &&
+        !bootstrapIsArrayType(owner) && !bootstrapIsMapType(owner) && !bootstrapIsCellType(owner) &&
+        !bootstrapIsMutexType(owner) && !bootstrapIsSharedType(owner) && !bootstrapIsWeakType(owner)
     var argument = 0
     while (argument < expression.children.size) {
         val child = expression.children[argument]
@@ -11500,7 +11588,9 @@ fun bootstrapLowerMemberCall(
             if (argument == 2) expected = bootstrapMapValueType(owner)
         }
         val value = lowerer.lowerExpression(child, true, bootstrapIrIsErasedType(expected))
-        arguments.append(value)
+        val borrowed = userMethod && (argument == 0 ||
+            lowerer.lowerMethodParameterKind(owner, expression.text, argument - 1) == "parameter")
+        arguments.append(if (borrowed) lowerer.holdTemporary(child, value) else value)
         argument = argument + 1
     }
     if (((expression.text == "append" ||
@@ -11662,6 +11752,7 @@ fun bootstrapLowerMemberCall(
             "${lowerer.lowerInterfaceDeclaringOwner(methodOwner, expression.text)}_${expression.text}"
         )
     }
+    lowerer.callDone(temporaryMark)
     result
 }
 
@@ -11841,7 +11932,9 @@ fun bootstrapLowerIf(
     // arm, after its block cleanup, rather than boxing them into an unused join.
     val joinValue = valueRequired
     if (joinValue) lowerer.emitControl(zeroOpcode, -1, -1, -1, temporary)
+    val conditionMark = lowerer.locals.size
     val condition = lowerer.lowerExpression(expression.children[0])
+    lowerer.dropTemporaries(conditionMark)
     val thenLabel = lowerer.allocateLabel()
     val elseLabel = lowerer.allocateLabel()
     val mergeLabel = lowerer.allocateLabel()
@@ -11849,12 +11942,14 @@ fun bootstrapLowerIf(
     lowerer.emitControl("label", -1, thenLabel, -1, "")
     val previousThenScope = lowerer.enterLocalScope()
     lowerer.addNullableRefinements(expression.children[0], true)
+    val thenMark = lowerer.locals.size
     val thenValue = lowerer.lowerExpression(expression.children[1], joinValue,
         eraseResult && hasElse)
     // Missing-else value expressions retain their existing discard/drop path.
     if (!joinValue || !hasElse) {
         lowerer.dropDiscarded(thenValue, expression.children[1])
     }
+    lowerer.dropTemporaries(thenMark)
     lowerer.leaveLocalScope(previousThenScope)
     if (joinValue) lowerer.emitControl("local.set", thenValue, -1, -1, temporary)
     lowerer.emitControl("jump", -1, mergeLabel, -1, "")
@@ -11865,8 +11960,10 @@ fun bootstrapLowerIf(
     } else {
         val previousElseScope = lowerer.enterLocalScope()
         lowerer.addNullableRefinements(expression.children[0], false)
+        val elseMark = lowerer.locals.size
         elseValue = lowerer.lowerExpression(expression.children[2], joinValue, eraseResult)
         if (!joinValue) lowerer.dropDiscarded(elseValue, expression.children[2])
+        lowerer.dropTemporaries(elseMark)
         lowerer.leaveLocalScope(previousElseScope)
     }
     if (joinValue) lowerer.emitControl("local.set", elseValue, -1, -1, temporary)
@@ -11995,15 +12092,19 @@ fun bootstrapLowerWhile(
     lowerer.continueScope = lowerer.currentScope
     lowerer.emitControl("jump", -1, conditionLabel, -1, "")
     lowerer.emitControl("label", -1, conditionLabel, -1, "")
+    val conditionMark = lowerer.locals.size
     val condition = lowerer.lowerExpression(expression.children[0])
+    lowerer.dropTemporaries(conditionMark)
     lowerer.emitControl("branch", condition, bodyLabel, mergeLabel, "")
     lowerer.emitControl("label", -1, bodyLabel, -1, "")
     val labeled = bootstrapEnterLoopTarget(
         lowerer, expression, mergeLabel, conditionLabel, lowerer.currentScope
     )
+    val bodyMark = lowerer.locals.size
     lowerer.dropDiscarded(
         lowerer.lowerExpression(expression.children[1], false), expression.children[1]
     )
+    lowerer.dropTemporaries(bodyMark)
     bootstrapLeaveLoopTarget(lowerer, labeled)
     lowerer.emitControl("jump", -1, conditionLabel, -1, "")
     lowerer.breakLabel = previousBreakLabel
@@ -12038,13 +12139,17 @@ fun bootstrapLowerDoWhile(
     val labeled = bootstrapEnterLoopTarget(
         lowerer, expression, mergeLabel, conditionLabel, lowerer.currentScope
     )
+    val bodyMark = lowerer.locals.size
     lowerer.dropDiscarded(
         lowerer.lowerExpression(expression.children[0], false), expression.children[0]
     )
+    lowerer.dropTemporaries(bodyMark)
     bootstrapLeaveLoopTarget(lowerer, labeled)
     lowerer.emitControl("jump", -1, conditionLabel, -1, "")
     lowerer.emitControl("label", -1, conditionLabel, -1, "")
+    val conditionMark = lowerer.locals.size
     val condition = lowerer.lowerExpression(expression.children[1])
+    lowerer.dropTemporaries(conditionMark)
     lowerer.emitControl("branch", condition, bodyLabel, mergeLabel, "")
     lowerer.breakLabel = previousBreakLabel
     lowerer.continueLabel = previousContinueLabel
@@ -12245,9 +12350,11 @@ fun bootstrapLowerFor(
     val labeled = bootstrapEnterLoopTarget(
         lowerer, expression, mergeLabel, incrementLabel, loopScope
     )
+    val bodyMark = lowerer.locals.size
     lowerer.dropDiscarded(
         lowerer.lowerExpression(expression.children[1], false), expression.children[1]
     )
+    lowerer.dropTemporaries(bodyMark)
     bootstrapLeaveLoopTarget(lowerer, labeled)
     lowerer.emitControl("jump", -1, incrementLabel, -1, "")
     lowerer.breakLabel = previousBreakLabel
@@ -12295,7 +12402,9 @@ fun bootstrapLowerWhen(
         bootstrapIrLocalZeroOpcode("any") else bootstrapIrLocalZeroOpcode(joinType)
     val joinValue = valueRequired
     if (joinValue) lowerer.emitControl(zeroOpcode, -1, -1, -1, temporary)
+    val subjectMark = lowerer.locals.size
     val subject = lowerer.lowerExpression(expression.children[0])
+    lowerer.dropTemporaries(subjectMark)
     val mergeLabel = lowerer.allocateLabel()
     // The arms after the one matching `null` see the subject not null.
     val notNullFrom = bootstrapWhenNotNullFrom(expression)
@@ -12313,8 +12422,10 @@ fun bootstrapLowerWhen(
         val body = expression.children[branch + 1]
         if (match.kind == "missing") {
             hasElse = true
+            val armMark = lowerer.locals.size
             val bodyValue = lowerer.lowerExpression(body, joinValue, eraseResult)
             if (!joinValue) lowerer.dropDiscarded(bodyValue, body)
+            lowerer.dropTemporaries(armMark)
             if (joinValue) lowerer.emitControl(
                 "local.set",
                 bodyValue,
@@ -12368,8 +12479,10 @@ fun bootstrapLowerWhen(
                     bootstrapNormalizeType(expression.children[firstMatch].text)
                 )
             }
+            val armMark = lowerer.locals.size
             val bodyValue = lowerer.lowerExpression(body, joinValue, eraseResult)
             if (!joinValue) lowerer.dropDiscarded(bodyValue, body)
+            lowerer.dropTemporaries(armMark)
             if (tested) lowerer.leaveLocalScope(previousScope)
             if (joinValue) lowerer.emitControl(
                 "local.set",

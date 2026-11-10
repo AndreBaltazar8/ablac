@@ -299,6 +299,15 @@
   - The same 16 fixtures are clean in Xtensa release and on x86-64 and AArch64 `--fast`, so they are a checker limit
     (a1-plus-register frame indexing), not a lowering that leaks. Placing them needs a frame index the checker can
     bound (a public index into a frame array of known size), the Xtensa counterpart of the x86-64 frame views.
+- [ ] **Close the temporary-resource drop gaps (#736 follow-up).** A fresh resource that is only a temporary is dropped at the
+  end of its statement when it is the receiver of a class's own method or of a field read, or an argument to a plain
+  function or method (docs/ownership.md). Still leaking as before, so a secret in one (the password case:
+  `pbeOpenPkcs8(data, cryptoPassword(pw))` is covered; the same through an extension function is not) is not wiped: the
+  receiver and arguments of an extension function, of interface dispatch and default bodies, of generic instances' calls
+  that lower through other paths, and of the built-in container methods. Each needs the same `holdTemporary` at its call
+  site in `src/ir.ab` (and the evaluator's in `src/eval.ab`) and a case in tests/cases/drop-temporaries; the `own`/`var`
+  kinds and constructors stay out. Check first which of them a resource can reach (a resource cannot be an array
+  element's receiver, for example).
 - [ ] **Secret residue is checked for stack slots on x86-64 and AArch64 release and on Xtensa, not on Wasm.** `--residue` fails an entry that returns with a
   secret in a slot of its frame, or that gave a secret to a callee and didn't wipe the stack below it
   (`abla/ct/scrub`; the checker reads the callees' depth and the size of the wipe). Every fixture's residue entry
