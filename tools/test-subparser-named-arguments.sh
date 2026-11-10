@@ -26,7 +26,7 @@ for mode in interp jit; do
     output=$("$output_directory/main-$mode")
     status=$?
     set -e
-    [[ $status -eq 42 && $output == "341 251 687 1279 341" ]] ||
+    [[ $status -eq 42 && $output == "341 251 687 1279 341 341 5341" ]] ||
         fail "$mode: status $status, output: $output"
 done
 
@@ -64,14 +64,22 @@ expect_error bare E_SUBPARSER_NAMED_ARGUMENT
 expect_error nested E_SUBPARSER_NAMED_ARGUMENT
 expect_error badname E_EVAL_EXPRESSION
 # In a finalizer's generated function the misuse is an error of the generated code, located at
-# its origin, not at a `$name` site.
-for mode in interp jit; do
-    log="$output_directory/error-finalizer-nested.err"
-    if ABLA_COMPILE_EVAL=$mode "$compiler" build "$cases/error-finalizer-nested.ab" \
-        -o "$output_directory/error-finalizer-nested" > "$log" 2>&1; then
-        fail "finalizer-nested ($mode): the build succeeded"
-    fi
-    grep -q 'E_NAMED_ARGUMENT_REQUIRED' "$log" && grep -q 'E_EXT_GENERATED_SEMANTIC' "$log" ||
-        { cat "$log" >&2; fail "finalizer-nested ($mode): wrong errors"; }
-done
+# its origin, not at a `$name` site. The same holds when the call is built with a typed target
+# (syntaxCallTarget): the named-argument rules apply to a call bound to a declaration handle.
+expect_generated_error() {
+    local name=$1 code=$2 file="$cases/error-$1.ab"
+    local log="$output_directory/error-$name.err"
+    for mode in interp jit; do
+        if ABLA_COMPILE_EVAL=$mode "$compiler" build "$file" \
+            -o "$output_directory/error-$name" > "$log" 2>&1; then
+            fail "$name ($mode): the build succeeded"
+        fi
+        grep -q "$code" "$log" && grep -q 'E_EXT_GENERATED_SEMANTIC' "$log" ||
+            { cat "$log" >&2; fail "$name ($mode): wrong errors"; }
+    done
+}
+
+expect_generated_error finalizer-nested E_NAMED_ARGUMENT_REQUIRED
+expect_generated_error target-unknown E_NAMED_ARGUMENT_UNKNOWN
+expect_generated_error target-nested E_NAMED_ARGUMENT_REQUIRED
 echo "subparser named arguments: reordered, skipped and mixed calls; every error at the site"
