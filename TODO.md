@@ -1832,3 +1832,16 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   `bootstrapGenericOwnershipCall` was 5.5% of one process's cycles in a NovaKind `--fast` build
   (tree walks missing the cache). In instructions it is about 0.55% of the whole build, so a
   one-pass call-site index would be a sub-bar cut. Not pursued.
+
+- What is left of the interface scans after the one-pass implementers (ablac-52, 2026-11-10,
+  NovaKind `--fast`, instruction profile with the `iface-index` compiler): `bootstrapClassInterfaces`
+  is still 3.3% of the whole build (the scan inside `bootstrapTypeConformsIn`, 3.1% of it from
+  `bootstrapInferWhen`'s `is` arms, the rest from `bootstrapMethodDeclarationIndex`) and
+  `bootstrapInterfaceIndexIn` 1.5%. Remembering the answer per analyzer, including the `when`
+  arm check, did nothing (26,546 samples × 8M before against 26,650 after, one run in
+  six an outlier at 30,119): every arm asks a different (class, interface) pair, and a new
+  analyzer is built per generic instantiation and probe, so the memo starts cold. What would
+  work is an index that lives with the declarations (name -> the class and extend declarations
+  carrying it, built once per declaration array, as `BootstrapDeclarationNameIndex` is),
+  which is the screen already parked at −1.1% before the one-pass implementers; the ceiling
+  now is about 4.8% of a NovaKind build, 0 on the self-build.
