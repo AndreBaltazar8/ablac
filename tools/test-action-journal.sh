@@ -34,9 +34,42 @@ shifted=$(journal shift queries | grep '^ACTION-JOURNAL-CHECK')
 [[ $shifted == *"checked=$checked "* && $shifted != *"functions=0"* ]] ||
     { echo "action-journal: a moved function handle was not reported:"; echo "$shifted"; exit 1; }
 
-# Native compile-time routes (ABLA_COMPILE_EVAL=jit) call the API through the bridge: no journal there.
-[[ -z $(ABLA_COMPILE_EVAL=jit journal 1 queries) ]] ||
-    { echo "action-journal: journal output under ABLA_COMPILE_EVAL=jit"; exit 1; }
+# Native compile-time routes (ABLA_COMPILE_EVAL=jit, auto, bridge) call the API through the bridge: no
+# journal there, and the action still gives the interpreter's result.
+for route in jit auto bridge; do
+    [[ -z $(ABLA_COMPILE_EVAL=$route journal 1 queries) ]] ||
+        { echo "action-journal: journal output under ABLA_COMPILE_EVAL=$route"; exit 1; }
+done
+generated() { # $1 = route: the name the action built, as the emitted program holds it
+    ABLA_COMPILE_EVAL=$1 "$compiler" --emit-llvm "$cases/handle-number.ab" 2>/dev/null |
+        grep -o 'gen_[0-9]*_target' | head -1
+}
+interpreted=$(generated interp)
+[[ -n $interpreted && $(generated jit) == "$interpreted" ]] ||
+    { echo "action-journal: interp and jit disagree on the generated name: '$interpreted'"; exit 1; }
+
+# A handle's number reaches the action's result (`gen_<number>_target`): the record of the same
+# program with a function declared before `target` must differ, one declared after must not.
+handle_record() { # $1 = case: the compilerFindFunction line of the journal and the generated name
+    local line name
+    ABLA_ACTION_JOURNAL=1 "$compiler" --emit-llvm "$cases/$1.ab" \
+        >"$project_root/build/action-journal-$1.ll" 2>"$project_root/build/action-journal-$1.err"
+    line=$(grep -F 'compilerFindFunction|' "$project_root/build/action-journal-$1.err" | head -1)
+    name=$(grep -o 'gen_[0-9]*_target' "$project_root/build/action-journal-$1.ll" | head -1)
+    [[ -n $line && -n $name ]] ||
+        { echo "action-journal: no FindFunction record or generated name for $1: line='$line' name='$name'"; exit 1; }
+    echo "$line $name"
+}
+mkdir -p "$project_root/build"
+base=$(handle_record handle-number)
+before=$(handle_record handle-number-before)
+after=$(handle_record handle-number-after)
+[[ $before != "$base" ]] ||
+    { echo "action-journal: a function declared before the target left the record unchanged: $base"; exit 1; }
+[[ ${before##* } != "${base##* }" ]] ||
+    { echo "action-journal: the generated name did not move with the handle: $base / $before"; exit 1; }
+[[ $after == "$base" ]] ||
+    { echo "action-journal: a function declared after the target changed the record: $base / $after"; exit 1; }
 
 negative=$(journal 1 mutating)
 [[ $negative == *"replayable=false extern compilerAddFunctionAnnotation"* ]] ||
@@ -44,4 +77,4 @@ negative=$(journal 1 mutating)
 
 [[ -z $(journal 0 queries) ]] ||
     { echo "action-journal: output with the journal off"; exit 1; }
-echo "action-journal: record, check, mutate, shifted program, negative control, off"
+echo "action-journal: record, check, mutate, shifted program, native routes, handle numbers, negative control, off"
