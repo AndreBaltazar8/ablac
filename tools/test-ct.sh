@@ -706,9 +706,10 @@ division_read
 $check --expect-allocator x86_64 "$out/alloc-probe.o" probe_bignum_allocate: probe_aes_expand: > "$out/alloc-probe.log" 2>&1 || {
     cat "$out/alloc-probe.log" >&2; echo "ct: the allocation entry is inlined or not called in a release object" >&2; exit 1
 }
-if $check --expect-allocator x86_64 "$out/alloc-probe.o" main: > "$out/alloc-probe-control.log" 2>&1; then
-    echo "ct: a function with no allocation was said to call the allocation entry" >&2; exit 1
+if $check --expect-allocator x86_64 "$out/alloc-probe.o" main: > "$out/alloc-probe-control.log" 2>&1 || ! grep -q 'main: no call to the allocation entry' "$out/alloc-probe-control.log"; then
+    cat "$out/alloc-probe-control.log" >&2; echo "ct: the allocation-free control did not fail for the right reason" >&2; exit 1
 fi
+grep -q 'direct call sites to the entry in [2-9]' "$out/alloc-probe.log" || { cat "$out/alloc-probe.log" >&2; echo "ct: fewer than two functions call the allocation entry" >&2; exit 1; }
 echo "ok   x86_64 release object: the crypto allocation entry is called out of line by the key and big-number paths (1 control)"
 header_read x86_64 x86_64-linux-gnu header-x86 "straddle8 straddle16 repstos" globstore
 header_read aarch64 aarch64-linux-gnu header-a64 "straddle bfi_move" globstore
@@ -729,9 +730,10 @@ read_target aarch64 "$out/aarch64.o"
 $check --expect-allocator aarch64 "$out/aarch64-alloc-probe.o" probe_bignum_allocate: probe_aes_expand: > "$out/alloc-probe-aarch64.log" 2>&1 || {
     cat "$out/alloc-probe-aarch64.log" >&2; echo "ct: the allocation entry is inlined or not called in an AArch64 object" >&2; exit 1
 }
-if $check --expect-allocator aarch64 "$out/aarch64-alloc-probe.o" main: > "$out/alloc-probe-aarch64-control.log" 2>&1; then
-    echo "ct: a function with no allocation was said to call the allocation entry on AArch64" >&2; exit 1
+if $check --expect-allocator aarch64 "$out/aarch64-alloc-probe.o" main: > "$out/alloc-probe-aarch64-control.log" 2>&1 || ! grep -q 'main: no call to the allocation entry' "$out/alloc-probe-aarch64-control.log"; then
+    cat "$out/alloc-probe-aarch64-control.log" >&2; echo "ct: the allocation-free control did not fail for the right reason on AArch64" >&2; exit 1
 fi
+grep -q 'direct call sites to the entry in [2-9]' "$out/alloc-probe-aarch64.log" || { cat "$out/alloc-probe-aarch64.log" >&2; echo "ct: fewer than two functions call the allocation entry on AArch64" >&2; exit 1; }
 echo "ok   aarch64 release object: the crypto allocation entry is called out of line by the key and big-number paths (1 control)"
 a64_follow_read
 residue_a64_read
@@ -772,9 +774,10 @@ abla_xtensa_test_build "$compiler" "$tools_directory" build "$cases/alloc-probe.
 $check --expect-allocator xtensa "$out/alloc-probe-xtensa.o" probe_bignum_allocate: probe_aes_expand: > "$out/alloc-probe-xtensa.log" 2>&1 || {
     cat "$out/alloc-probe-xtensa.log" >&2; echo "ct: the allocation entry is inlined or not called in an Xtensa object" >&2; exit 1
 }
-if $check --expect-allocator xtensa "$out/alloc-probe-xtensa.o" main: > "$out/alloc-probe-xtensa-control.log" 2>&1; then
-    echo "ct: a function with no allocation was said to call the allocation entry on Xtensa" >&2; exit 1
+if $check --expect-allocator xtensa "$out/alloc-probe-xtensa.o" main: > "$out/alloc-probe-xtensa-control.log" 2>&1 || ! grep -q 'main: no call to the allocation entry' "$out/alloc-probe-xtensa-control.log"; then
+    cat "$out/alloc-probe-xtensa-control.log" >&2; echo "ct: the allocation-free control did not fail for the right reason on Xtensa" >&2; exit 1
 fi
+grep -q 'direct call sites to the entry in [2-9]' "$out/alloc-probe-xtensa.log" || { cat "$out/alloc-probe-xtensa.log" >&2; echo "ct: fewer than two functions call the allocation entry on Xtensa" >&2; exit 1; }
 echo "ok   xtensa release object: the crypto allocation entry is called out of line by the key and big-number paths (1 control)"
 xtensa_follow_read
 orchestration_read "$out/xtensa.o" xtensa

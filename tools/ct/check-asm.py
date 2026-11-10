@@ -2267,32 +2267,53 @@ def main():
         if not names:
             print(f"FAIL {arch}: no {ALLOCATOR} symbol in the object")
             sys.exit(1)
-        def reaches(name, seen):
-            """Whether the function, or one it calls directly in this object, calls the entry."""
+        sites = {}  # function -> number of direct calls to the entry, over everything walked
+
+        def reaches(name, seen, trail):
+            """The path from `name` to a function that calls the entry directly in this object, or None. A function the
+            object doesn't have raises SystemExit's message up as `missing`, so a control can't pass for that."""
             if name in seen or len(seen) > 64:
-                return False
+                return None
             seen.add(name)
             try:
                 lines = wasm_export_lines(path, name) if arch == "wasm" else disassemble(
                     path, name, ["--mcpu=esp32"] if arch == "xtensa" else [])
             except SystemExit:
-                return False
+                if not trail:
+                    raise
+                return None
             callees = []
+            direct = 0
             for _, text in lines:
                 m = re.match(r"^(?:call\w*|jmp\w*|bl|b|call(?:4|8|12))\s.*<([^>+]+)>$", text)
                 if m:
                     if m.group(1) in names:
-                        return True
-                    callees.append(m.group(1))
-            return any(reaches(callee, seen) for callee in callees)
+                        direct += 1
+                    else:
+                        callees.append(m.group(1))
+            if direct:
+                sites[name] = direct
+                return trail + [name]
+            for callee in callees:
+                found = reaches(callee, seen, trail + [name])
+                if found:
+                    return found
+            return None
 
         for spec in specs:
             name = spec.partition(":")[0]
-            if reaches(name, set()):
-                print(f"ok   {arch} {name} calls the allocation entry out of line")
+            try:
+                path_found = reaches(name, set(), [])
+            except SystemExit:
+                print(f"FAIL {arch} {name}: no such function in the object")
+                failed = 1
+                continue
+            if path_found:
+                print(f"ok   {arch} {name} calls the allocation entry out of line ({' -> '.join(path_found)} -> entry)")
             else:
                 print(f"FAIL {arch} {name}: no call to the allocation entry")
                 failed = 1
+        print(f"     {arch}: {sum(sites.values())} direct call sites to the entry in {len(sites)} functions")
         sys.exit(failed)
     for spec in specs:
         name, secret, pointers = parse_spec(spec)
