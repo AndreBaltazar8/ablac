@@ -163,7 +163,7 @@ compile fun parseBox(cursor: ParserCursor): SyntaxExpression {
 #compilerRegisterSubparser("box", parseBox)
 
 fun main {
-    println($box())
+    println("${$box()}")
 }
 // output:
 // 341
