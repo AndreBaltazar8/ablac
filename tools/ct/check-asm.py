@@ -244,20 +244,26 @@ FOLLOW = {"object": None, "path": None, "stack": [], "done": {}, "residue": Fals
 
 
 ALLOCATOR = "abla_ct_allocate"
+ALLOCATOR_SECTION = ".text.abla_ct_allocate"
 ALLOCATOR_NAMES = {}
 
 
 def allocator_names(path):
-    """The names a call can reach the crypto allocation entry by. The entry is exported under a stable symbol
-    (`abla_ct_allocate`, a @noinline @export function) and the compiler calls it by its fingerprinted internal symbol
-    at the same address, so every symbol sharing that address is the entry."""
+    """The names a call can reach the crypto allocation entry by. In a compiler object the entry is the function
+    placed in the section `.text.abla_ct_allocate` (the compiler names it by a fingerprint of its content, so the
+    section is its stable mark). A hand-written or linked fixture, whose sections are merged, exports a symbol
+    `abla_ct_allocate`, and every symbol sharing its address is the entry."""
     if path not in ALLOCATOR_NAMES:
         by_place = {}
-        for line in subprocess.run([OBJDUMP, "-t", path], capture_output=True, text=True, check=True).stdout.splitlines():
-            m = re.match(r"^([0-9a-f]+)\s+\S+\s+(?:\S+\s+)*?(\S+)\s+[0-9a-f]+\s+(\S+)$", line)
-            if m:
-                by_place.setdefault((m.group(2), int(m.group(1), 16)), set()).add(m.group(3))
         names = set()
+        for line in subprocess.run([OBJDUMP, "-t", path], capture_output=True, text=True, check=True).stdout.splitlines():
+            tokens = line.split()
+            if len(tokens) < 5 or not re.fullmatch(r"[0-9a-f]+", tokens[0]) or not re.fullmatch(r"[0-9a-f]+", tokens[-2]):
+                continue
+            address, flags, section, name = int(tokens[0], 16), tokens[1:-3], tokens[-3], tokens[-1]
+            if section == ALLOCATOR_SECTION and "F" in flags:
+                names.add(name)
+            by_place.setdefault((section, address), set()).add(name)
         for group in by_place.values():
             if ALLOCATOR in group:
                 names |= group

@@ -117,11 +117,10 @@ read too: some unoptimised work goes deeper than the fixtures' 1024-byte wipe
 public and whose payload is secret. The checker reads a header word at a constant offset as public, and anything else
 through the pointer as secret. The tag lasts only while the register is untouched: a write, a call, or a merge with a
 path that wrote it ends it, and storing a secret through any pointer in the function is refused. The crypto
-modules allocate through one out-of-line entry, `abla_ct_allocate` (`abla/crypto/alloc`), which the checker does not
-read (a release build inlines the ordinary allocator, whose branches depend on the heap's state): a call to it, by
-whatever symbol the compiler gave its address, must be given a public size and returns such a pointer. Both are the
+modules allocate through one out-of-line entry (`abla/crypto/alloc`, a function in the section `.text.abla_ct_allocate`), which the checker does not
+read (a release build inlines the ordinary allocator, whose branches depend on the heap's state): a call to it must be given a public size and returns such a pointer. Both are the
 mechanism and its hand-written controls (`tests/cases/ct/header-*.s`) for now, on x86-64, AArch64 and Wasm (the
-entry) and on those and Xtensa (the pointer); no real crypto entry is read through them yet, so they add no coverage
+entry) and on those and Xtensa (the pointer); real Wasm modules have no section to mark it yet; no real crypto entry is read through them yet, so they add no coverage
 to the table above.
 
 The fixtures are what is checked: `ctSelect`, `ctEq`, `ctLt`, `ctIsNonZero`, arithmetic and
