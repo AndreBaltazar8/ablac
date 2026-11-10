@@ -2030,3 +2030,21 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   stack's nearest named frame (the evaluator is entered through inlined code there), not a
   statement about generated modules. Next measurement: which top-level action or `#` expression
   the 20 M steps belong to (a step counter per action).
+- Where the compile-time evaluator's steps go in a NovaKind `--fast` build, per top-level evaluation (ablac-52,
+  2026-11-10, NovaKind repro tree 9c62c61b; a local counter around the outermost `evaluate`, 958 top-level
+  evaluations, 58.2 M evaluator steps): three calls are 97%: `novakindServerLock` (server.lock
+  check, source offset 952) 25.8 M steps, `oneRemoteGenerate` (generated remote client, offset
+  33,345) 20.2 M, and `novakindCatalog` (i18n.ab, offset 5,533) 10.6 M; the 919 handler calls
+  (`ablaJsonParseValue` 3-7 K steps each, `oneThemeParse` 36 K) are 1.6 M together. In the
+  `ABLA_COMPILE_EVAL=jit` trace of the same build the seven sites left interpreted include
+  offset 5,533 (the catalog, "reaches `compilerApplyTransform`"); the other two heavy sites
+  are not in the list, so they ran native. The two numbers fit as follows: at roughly 600-1,000
+  instructions per step (13.2% of the build's ~460 G instructions over 58 M steps) the two
+  native sites carried 46 M steps = 28-46 G instructions in the interpreter, and the jit
+  build is 8 G instructions slower overall, so its generation (code generator and in-process
+  LLVM JIT of the slice) costs about 36-54 G: as much as the interpreting it replaced. The
+  lever is therefore not the interpreter nor the routing but the generation: a cache of the
+  generation by fingerprint across builds (what `jit_cache.ab` does for the REPL/test
+  runner?) would make the jit tier a gain of up to 28-46 G of ~460 G (6-10% of a warm
+  `--fast` build) for these sites, plus the catalog if `compilerApplyTransform` is taken.
+  Not measured: the generation time itself (the trace prints no times).
