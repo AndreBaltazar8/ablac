@@ -18,9 +18,10 @@ if ! /usr/bin/env time --version >/dev/null 2>&1; then
     echo "compiler-memory-peak: needs GNU time (shell.nix has it)" >&2
     exit 1
 fi
+# The budget is CPU time (about 9 s of it), which load does not change; the wall-clock limit only ends a hang.
 peak=""
 for run in 1 2; do
-    ABLA_MAX_MEMORY_MB=4096 ABLA_MAX_SECONDS=120 /usr/bin/env time -f '%M' -o "$output_directory/peak.$run" \
+    ABLA_MAX_MEMORY_MB=4096 ABLA_MAX_SECONDS=1800 ABLA_MAX_CPU_SECONDS=120 /usr/bin/env time -f '%M' -o "$output_directory/peak.$run" \
         "$project_root/tools/run-limited.sh" "$compiler" --emit-llvm "$project_root/src/orc_main.ab" >"$output_directory/self.ll" 2>"$output_directory/self.err" || {
         echo "compiler-memory-peak: --emit-llvm src/orc_main.ab failed" >&2
         sed -n '1,20p' "$output_directory/self.err" >&2
