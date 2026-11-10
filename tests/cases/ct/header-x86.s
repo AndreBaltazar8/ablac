@@ -7,6 +7,58 @@
 
 helper: ret
 
+# The crypto allocation entry: exported as abla_ct_allocate, and called by the compiler's fingerprinted symbol at the
+# same address (an alias here). It is not read; it returns a pointer to an object with a public header.
+        .globl  abla_ct_allocate, alloc_header, alloc_payload, alloc_secret_size, alloc_store_secret
+        .globl  alloc_overwritten, alloc_copied
+abla_ct_allocate:
+        movq    %rdi, %rax
+        ret
+        .set    abla_fn_1234_5678_direct, abla_ct_allocate
+
+alloc_header:
+        movl    $64, %edi
+        callq   abla_fn_1234_5678_direct
+        cmpq    $16, 8(%rax)
+        jb      1f
+1:      ret
+
+alloc_payload:
+        movl    $64, %edi
+        callq   abla_fn_1234_5678_direct
+        cmpq    $0, 32(%rax)
+        jne     1f
+1:      ret
+
+alloc_secret_size:              # rdi is secret: the size is given to an entry that isn't read
+        callq   abla_fn_1234_5678_direct
+        ret
+
+alloc_store_secret:             # rsi is secret, kept in rbx over the call, stored into a header word and branched on
+        movq    %rsi, %rbx
+        movl    $64, %edi
+        callq   abla_fn_1234_5678_direct
+        movq    %rbx, 8(%rax)
+        cmpq    $0, 8(%rax)
+        jne     1f
+1:      ret
+
+alloc_overwritten:
+        movl    $64, %edi
+        callq   abla_fn_1234_5678_direct
+        leaq    32(%rax), %rax
+        cmpq    $0, (%rax)
+        jne     1f
+1:      ret
+
+alloc_copied:                   # a callee-saved copy of the pointer is not a header pointer
+        movl    $64, %edi
+        callq   abla_fn_1234_5678_direct
+        movq    %rax, %rbx
+        cmpq    $0, 8(%rbx)
+        jne     1f
+1:      ret
+
 hdr_branch:                     # the size word steers a branch
         cmpq    $16, 8(%rdi)
         jb      1f

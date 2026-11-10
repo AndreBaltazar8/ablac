@@ -113,6 +113,17 @@ read too: some unoptimised work goes deeper than the fixtures' 1024-byte wipe
 (`tests/cases/ct/residue-known-xtensa-fast.txt`). The 32 bytes the entry clears itself are checked to lie within the
 16 bytes under the frame of a function it has already called on every path, which the ABI guarantees is stack.
 
+**Object pointers.** A spec can mark a parameter `%n`: a pointer to an object whose first 32 bytes (the header) are
+public and whose payload is secret. The checker reads a header word at a constant offset as public, and anything else
+through the pointer as secret. The tag lasts only while the register is untouched: a write, a call, or a merge with a
+path that wrote it ends it, and storing a secret through any pointer in the function is refused. The crypto
+modules allocate through one out-of-line entry, `abla_ct_allocate` (`abla/crypto/alloc`), which the checker does not
+read (a release build inlines the ordinary allocator, whose branches depend on the heap's state): a call to it, by
+whatever symbol the compiler gave its address, must be given a public size and returns such a pointer. Both are the
+mechanism and its hand-written controls (`tests/cases/ct/header-*.s`) for now, on x86-64, AArch64 and Wasm (the
+entry) and on those and Xtensa (the pointer); no real crypto entry is read through them yet, so they add no coverage
+to the table above.
+
 The fixtures are what is checked: `ctSelect`, `ctEq`, `ctLt`, `ctIsNonZero`, arithmetic and
 `ctDifferenceAddress`, at the widths listed in the script, and what `abla/crypto` builds on them: AES's
 bitsliced rounds and padding check, software GHASH, Montgomery multiplication, the exponent table's lookup and

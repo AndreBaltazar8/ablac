@@ -317,6 +317,23 @@
   change: one call per allocation, tagged as returning a `%` pointer, its arguments required public) or public-global
   loads (rip-relative reads of runtime symbols that nothing secret is ever stored to), which the checker can't prove
   and so would be a trusted list. Neither is built; the second #734 branch starts with whichever ablac-d1 picks.
+  *Second branch (ablac-d1 chose the out-of-line entry, 2026-11-09):* a function's symbol is a fingerprint of its
+  content, so the checker can't name an allocator by a source name, but an `@export("abla_ct_allocate")` function
+  keeps a stable symbol at the same address as the fingerprinted one the compiler calls (checked: a `@noinline
+  @export` function in a scratch module is `T abla_ct_allocate` at the address `callq` targets). So no compiler change:
+  one `@noinline @export("abla_ct_allocate") trusted fun` in `abla/crypto`, used only by `aesAllocateMemory` and the
+  bignum allocation behind `rsaCrt`, and a checker that treats a call to any symbol at that address as the entry:
+  not followed, `rdi` (the size) must be public, the result is a header-public pointer, and every other register
+  is lost. Built: the rule and its controls on x86-64, AArch64 and Wasm (a header read, a payload read, an overwritten and a
+  copied result, a secret size, a secret stored through the result; on Wasm the result local is written only by the
+  `local.set` after the call, in a function with no other call), `abla/crypto/alloc` with the export, its use in
+  `aesAllocateMemory` and `bnAllocate`, and `check-asm.py --expect-allocator` (a function must call the entry by an
+  address-aliased symbol). Not built: Xtensa (its objects put each function in a section of its own and name callees
+  by relocation, so the alias lookup there needs a real object first); calling `--expect-allocator` on real release
+  objects in test-ct.sh; the RSA key and `aesNewKey` plumbing read through the entry; the bars below.
+  Bars (ablac-d1): a program importing no crypto builds byte-identical (release and `--fast`, the usual benchmark
+  set); crypto benchmarks and the TLS handshake path within +0.5% instructions; a crypto-using binary's stripped size
+  within +0.2% (it now exports one more symbol).
   *Review fixes (ablac-f3-2, 2026-11-10):* a header read counts only when offset plus access width is within the 32
   bytes (width from the mnemonic or register class; a vector move, string operation or unknown width is secret); the
   string operations also lose rdi, rsi (cpuid rbx) and `cmpxchg` isn't taken for a compare; AArch64 uses exact branch

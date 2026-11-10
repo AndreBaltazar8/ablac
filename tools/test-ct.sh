@@ -219,6 +219,30 @@ header_read() {
     echo "ok   $arch checker: header words of an object pointer are public (2 clean, $((9 + $(wc -w <<< "$extra_reads $extra_stores"))) controls)"
 }
 
+# The allocation entry (x86-64, AArch64 and Wasm): a call to `abla_ct_allocate`, by whichever symbol the compiler gave its address, is not
+# read, takes nothing secret, and returns a header-public pointer.
+header_allocator() {
+    local arch=$1 file=$2 secret=${3:-1} entry
+    $check "$arch" "$out/$file" alloc_header: > "$out/$file-alloc_header.log" 2>&1 || {
+        cat "$out/$file-alloc_header.log" >&2; echo "ct: the allocation entry's header was reported on $arch" >&2; exit 1
+    }
+    for entry in alloc_payload alloc_overwritten alloc_copied; do
+        if $check "$arch" "$out/$file" "$entry:" > "$out/$file-$entry.log" 2>&1; then
+            echo "ct: missed allocation control $entry on $arch" >&2; exit 1
+        fi
+        grep -q '^LEAK' "$out/$file-$entry.log" || { cat "$out/$file-$entry.log" >&2; exit 1; }
+    done
+    if $check "$arch" "$out/$file" alloc_secret_size:0 > "$out/$file-alloc_secret_size.log" 2>&1; then
+        echo "ct: missed a secret allocation size on $arch" >&2; exit 1
+    fi
+    grep -q 'the allocation entry is given a secret' "$out/$file-alloc_secret_size.log" || { cat "$out/$file-alloc_secret_size.log" >&2; exit 1; }
+    if $check "$arch" "$out/$file" "alloc_store_secret:$secret" > "$out/$file-alloc_store_secret.log" 2>&1; then
+        echo "ct: missed a secret stored into an allocated object on $arch" >&2; exit 1
+    fi
+    grep -q 'secret stored through an object pointer' "$out/$file-alloc_store_secret.log" || { cat "$out/$file-alloc_store_secret.log" >&2; exit 1; }
+    echo "ok   $arch checker: the allocation entry returns a header-public pointer (1 clean, 5 controls)"
+}
+
 # Secret residue: what a secret-handling call leaves in memory that nothing wipes. The register allocator spills
 # into the red zone and frames the compiler can't name, so the entry that called the work wipes the stack below
 # it afterwards (abla/ct/scrub), and the checker (--residue, with --follow-calls) requires that: a slot of the
@@ -648,6 +672,9 @@ header_read x86_64 x86_64-linux-gnu header-x86 "straddle8 straddle16 repstos" gl
 header_read aarch64 aarch64-linux-gnu header-a64 "straddle bfi_move" globstore
 header_read wasm wasm32 header-wasm straddle globstore
 header_read xtensa xtensa header-xtensa "" globstore
+header_allocator x86_64 header-x86
+header_allocator aarch64 header-a64
+header_allocator wasm header-wasm.wasm 0
 
 # --- AArch64 --------------------------------------------------------------------------
 "$compiler" build "$cases/aarch64-build.ab" -o "$out/aarch64-driver" --no-cache

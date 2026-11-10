@@ -240,7 +240,33 @@ def stack_extent(name, seen=()):
 # With --follow-calls, a call to a function defined in the same object (what a --fast build makes of
 # every Abla call) is checked as a function of its own, on the arguments the caller passes, instead of
 # failing. A call to anything not defined there, or a recursion, still fails.
-FOLLOW = {"path": None, "stack": [], "done": {}, "residue": False, "followed": set()}
+FOLLOW = {"object": None, "path": None, "stack": [], "done": {}, "residue": False, "followed": set()}
+
+
+ALLOCATOR = "abla_ct_allocate"
+ALLOCATOR_NAMES = {}
+
+
+def allocator_names(path):
+    """The names a call can reach the crypto allocation entry by. The entry is exported under a stable symbol
+    (`abla_ct_allocate`, a @noinline @export function) and the compiler calls it by its fingerprinted internal symbol
+    at the same address, so every symbol sharing that address is the entry."""
+    if path not in ALLOCATOR_NAMES:
+        by_place = {}
+        for line in subprocess.run([OBJDUMP, "-t", path], capture_output=True, text=True, check=True).stdout.splitlines():
+            m = re.match(r"^([0-9a-f]+)\s+\S+\s+(?:\S+\s+)*?(\S+)\s+[0-9a-f]+\s+(\S+)$", line)
+            if m:
+                by_place.setdefault((m.group(2), int(m.group(1), 16)), set()).add(m.group(3))
+        names = set()
+        for group in by_place.values():
+            if ALLOCATOR in group:
+                names |= group
+        ALLOCATOR_NAMES[path] = names
+    return ALLOCATOR_NAMES[path]
+
+
+def is_allocator(name):
+    return FOLLOW["object"] is not None and name in allocator_names(FOLLOW["object"])
 
 
 def follow_call(name, secret, pointers, text, check=None):
@@ -337,6 +363,21 @@ def check_x86(lines, secret, pointers):
             if "rdi" in state or "ptr:rdi" in state:  # its one argument, a message
                 raise Violation(f"call: a panic is given a secret or a pointer to one: {text}")
             return frozenset(state)
+        if is_allocator(name):
+            # The crypto allocation entry: not read (it branches on the heap's state), so it must be given nothing
+            # secret, and it returns a pointer to an object whose first HEADER_BYTES are public.
+            if "rdi" in state or "ptr:rdi" in state:  # its one argument, the size
+                raise Violation(f"call: the allocation entry is given a secret or a pointer to one: {text}")
+            for r in ["rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11"] + [f"v{n}" for n in range(16)]:
+                for tag in [t for t in state if t in (r, "ptr:" + r, "hdrp:" + r) or t.startswith(("rspoff:" + r + ":", "const:" + r + ":", "zero:" + r))]:
+                    state.discard(tag)
+                state.add("lost:" + r)
+            state.discard("flags")
+            state.discard("lost:rax")
+            state.update(["ptr:rax", "hdrp:rax"])
+            if "frameaddr" in state:
+                state.add("pushed")
+            return frozenset(state)
         inputs = callee_inputs(name)
         secret_arguments = [i for i, r in enumerate(X86_ARGS) if r in state and r in inputs]
         pointer_arguments = [i for i, r in enumerate(X86_ARGS) if "ptr:" + r in state and r not in state and r in inputs]
@@ -423,7 +464,7 @@ def check_x86(lines, secret, pointers):
             parts = parts[1].split(None, 1)
             op = parts[0]
         ops = x86_split(parts[1]) if len(parts) > 1 else []
-        if header_args:
+        if any(t.startswith("hdrp:") for t in state):
             mark_lost(state, op, ops)
         # Any instruction naming a register as its destination (AT&T: the last operand) may have changed it.
         if ops and ops[-1].startswith("%") and not op.startswith(("push", "cmp", "test")):
@@ -536,13 +577,12 @@ def check_x86(lines, secret, pointers):
                     if base and tainted(base) or idx and tainted(idx):
                         raise Violation(f"secret address: {text}")
                     slots = stack_slots(o)
-                    if header_args and value and (slots is None or (
+                    if value and any(t.startswith("hdrp:") for t in state) and (slots is None or (
                             (base and "ptr:" + x86_reg(base) in state) or (idx and "ptr:" + x86_reg(idx) in state))):
                         # A secret stored anywhere but this function's own frame could land in a header word the
                         # checker reads as public: through a pointer to the object, through a copy of it, or into
                         # static memory the object may be.
                         raise Violation(f"secret stored through an object pointer or outside the frame: {text}")
-                    slots = stack_slots(o)
                     if slots is not None:
                         for slot in slots:
                             (state.add if value else state.discard)("slot:" + slot)
@@ -565,7 +605,7 @@ def check_x86(lines, secret, pointers):
         if op.startswith("call"):
             target = ops[0] if ops else ""
             callee = re.search(r"<([^>+]+)>$", target)
-            if not FOLLOW["path"] or not callee:
+            if not callee or not (FOLLOW["path"] or is_allocator(callee.group(1))):
                 raise Violation(f"call: {text}")
             return after_call(state, callee.group(1), text)
         if op.startswith(("ret", "nop", "endbr", "ud2", "int3", "hlt")) or op == "":
@@ -1088,7 +1128,7 @@ def check_aarch64(lines, secret, pointers):
         ops = split(parts[1]) if len(parts) > 1 else []
         regs = lambda o: [a64_reg(r) for r in re.findall(r"\b[wxvbhsdq]\d+(?:\.\w+)?\b|\bsp\b", o)]
         t = lambda o: any(r in state for r in regs(o))
-        if header_args:
+        if any(item.startswith("hdrp:") for item in state):
             mark_lost(state, op, ops)
         if op.startswith("b.") or A64_BRANCH_REG.match(op):
             if op.startswith("b."):
@@ -1112,8 +1152,23 @@ def check_aarch64(lines, secret, pointers):
             return frozenset(state)
         if op == "bl":
             callee = re.search(r"<([^>+]+)>\s*$", text)
-            if not FOLLOW["path"] or not callee:
+            if not callee or not (FOLLOW["path"] or is_allocator(callee.group(1))):
                 raise Violation(f"call: {text}")
+            if is_allocator(callee.group(1)):
+                # The crypto allocation entry (see check_x86): not read, the size in x0 must be public, the
+                # result in x0 is a pointer to an object with a public header, everything else caller-saved is lost.
+                if "x0" in state or "ptr:x0" in state:
+                    raise Violation(f"call: the allocation entry is given a secret or a pointer to one: {text}")
+                for r in A64_CLOBBERED:
+                    for tag in (r, "ptr:" + r, "stackbase:" + r, "hdrp:" + r):
+                        state.discard(tag)
+                    state.add("lost:" + r)
+                state.discard("flags")
+                state.discard("lost:x0")
+                state.update(["ptr:x0", "hdrp:x0"])
+                if any(item.startswith(("stackbase:", "ptrslot:")) for item in state):
+                    state.add("frame-dirty")
+                return frozenset(state)
             return after_call(state, callee.group(1), text)
         if op in ("blr", "br"):
             raise Violation(f"call: {text}")
@@ -1166,7 +1221,8 @@ def check_aarch64(lines, secret, pointers):
             if any(r in state for r in inner):
                 raise Violation(f"secret address: {text}")
             sources = ops[:ops.index(memory)]
-            if header_args and any(t(source) for source in sources) and any("ptr:" + reg in state for reg in inner):
+            if any(item.startswith("hdrp:") for item in state) and any(t(source) for source in sources) and \
+                    any("ptr:" + reg in state for reg in inner):
                 raise Violation(f"secret stored through an object pointer: {text}")
             for i, source in enumerate(sources):
                 pointer_base = any("ptr:" + reg in state for reg in inner)
@@ -1910,9 +1966,26 @@ def check_wasm(lines, secret, pointers, results=0):
     # A header-public pointer is a parameter no instruction of the function ever writes, in a function that makes no
     # call (a callee could store a secret through it): locals are untouched by a call, memory is not.
     written = {int(t.split()[1]) for _, t in lines if t.split()[:1] in (["local.set"], ["local.tee"])}
-    calls = any(t.split()[:1] and t.split()[0] in ("call", "call_indirect", "call_ref", "return_call",
-                                                    "return_call_indirect", "return_call_ref") for _, t in lines)
-    header_locals = set() if calls else {i for i in header_args if i not in written}
+    # The crypto allocation entry (exported as abla_ct_allocate) is not read: its size must be public and its result
+    # is a pointer to an object with a public header. A local that is written only by `local.set` right after a call
+    # to it holds such a pointer; with any other call in the function (a callee could store through it) none does.
+    alloc_index = None
+    if FOLLOW["object"] and any(t.split()[:1] == ["call"] for _, t in lines):
+        alloc_index = wasm_module(FOLLOW["object"])[4].get(ALLOCATOR)
+    is_alloc_call = lambda t: alloc_index is not None and t.split()[:2] == ["call", str(alloc_index)]
+    other_calls = any(t.split()[:1] and t.split()[0] in ("call", "call_indirect", "call_ref", "return_call",
+                                                          "return_call_indirect", "return_call_ref") and
+                      not is_alloc_call(t) for _, t in lines)
+    alloc_locals = set()
+    for k in {int(lines[n + 1][1].split()[1]) for n, (_, t) in enumerate(lines[:-1])
+              if is_alloc_call(t) and lines[n + 1][1].split()[:1] == ["local.set"]}:
+        sets = sum(1 for _, t in lines if t.split()[:2] in (["local.set", str(k)], ["local.tee", str(k)]))
+        after_alloc = sum(1 for n, (_, t) in enumerate(lines[:-1])
+                          if is_alloc_call(t) and lines[n + 1][1].split()[:2] == ["local.set", str(k)])
+        if sets == after_alloc:
+            alloc_locals.add(k)
+    header_locals = set() if other_calls else ({i for i in header_args if i not in written} | alloc_locals)
+    header_mode = bool(header_args or alloc_locals)
     for _ in range(64):
         before = {k: (set(v[0]), set(v[1])) for k, v in heads.items()}
         returned = []
@@ -2047,12 +2120,12 @@ def check_wasm(lines, secret, pointers, results=0):
                                len(parts) > 1 and re.fullmatch(r"\d+", parts[1]) and wasm_load_width(op) and
                                int(parts[1]) + wasm_load_width(op) <= HEADER_BYTES)
                 stack.append((not header_word, False))
-            elif header_args and op in ("memory.copy", "memory.fill", "memory.init"):
+            elif header_mode and op in ("memory.copy", "memory.fill", "memory.init"):
                 raise Violation(f"a bulk memory write in a function with a header pointer: {text}")
             elif re.match(r"^(i32|i64|f32|f64|v128)\.store", op):
                 _value = stack.pop() if stack else (False, False)
                 address_value = stack.pop() if stack else (False, False)
-                if header_args and _value[0]:
+                if header_mode and _value[0]:
                     # Any linear-memory address could be the object (or its header); only a pointer proven to be
                     # elsewhere would be safe, and the checker has no such proof.
                     raise Violation(f"secret stored through an object pointer or outside the frame: {text}")
@@ -2067,6 +2140,11 @@ def check_wasm(lines, secret, pointers, results=0):
                 b = stack.pop() if stack else (False, False)
                 a = stack.pop() if stack else (False, False)
                 stack.append((a[0] or b[0] or c[0], a[1] or b[1]))
+            elif is_alloc_call(text):
+                size = stack.pop() if stack else (False, False)
+                if size[0] or size[1]:
+                    raise Violation(f"call: the allocation entry is given a secret or a pointer to one: {text}")
+                stack.append((False, True))
             elif op == "call" and FOLLOW["path"] and len(parts) > 1 and parts[1].isdigit():
                 index = int(parts[1])
                 types, functions, imports, _bodies, _exports = wasm_module(FOLLOW["path"])
@@ -2148,8 +2226,32 @@ def main():
     if "--follow-calls" in arguments:
         arguments.remove("--follow-calls")
         FOLLOW["path"] = arguments[1]
+    expect_allocator = "--expect-allocator" in arguments
+    if expect_allocator:
+        arguments.remove("--expect-allocator")
     arch, path, *specs = arguments
+    FOLLOW["object"] = path
     failed = 0
+    if expect_allocator:
+        # Each named function must call the crypto allocation entry (by any symbol at its address): the entry is
+        # out of line there. If it were inlined the call would vanish, and with it the point where the checker
+        # takes the result for a header-public pointer, so that is a failure rather than a pass.
+        names = allocator_names(path)
+        if not names:
+            print(f"FAIL {arch}: no {ALLOCATOR} symbol in the object")
+            sys.exit(1)
+        for spec in specs:
+            name = spec.partition(":")[0]
+            lines = wasm_export_lines(path, name) if arch == "wasm" else disassemble(
+                path, name, ["--mcpu=esp32"] if arch == "xtensa" else [])
+            calls = [text for _, text in lines if re.search(r"\b(call\w*|jmp\w*|bl|b|call[48]|call12)\b", text) and
+                     any(f"<{n}>" in text or f"<{n}+" in text or n in text.split() for n in names)]
+            if calls:
+                print(f"ok   {arch} {name} calls the allocation entry out of line")
+            else:
+                print(f"FAIL {arch} {name}: no call to the allocation entry")
+                failed = 1
+        sys.exit(failed)
     for spec in specs:
         name, secret, pointers = parse_spec(spec)
         if HEADERS.get(name) and arch not in HEADER_CHECKERS:

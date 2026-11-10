@@ -34,7 +34,7 @@ GUARDS = {
     'bnResidueSquare': '2bb8f304e7c5f1047e19dfdb5507ec2bedb6331b54384daab6d73a6dcaf91905',
     'bnFromBytes': 'eeebce423076a53fb063f21cbfb0397b5be468ad3d3ef283e2363eb3b35219c8',
     'aesSoftBlocks': '8ff73661c081f911087468327f77b4eef43a7cfea6b155f883861da35e242c60',
-    'aesWrappers': 'd2951fcd9ac1af4d3560dd97d0356b52be56f2322af65db80e98f512b7a3f441',
+    'aesWrappers': '874d6ee359015323b4ed600ab7f785e4293ad51636b08f570e581555165f08d9',
 }
 
 
