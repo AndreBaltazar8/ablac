@@ -23,6 +23,8 @@ openssl req -x509 -new -key "$output_directory/key.pem" -days 2 -subj /CN=localh
     -out "$output_directory/certificate.pem" 2>/dev/null || exit 2
 "$compiler" build tests/cases/tls-faults/faults.ab -o "$output_directory/faults" --fast || exit 2
 
+# The time limits here (`timeout`, the bounds in the programs) are hang guards, far above what the stages take: the
+# stages' own timeouts (a second or less) are what they test, and a loaded machine must not turn into a failure.
 # Each stage forks its own peers on ports of its own: most of each is waiting for
 # a limit, so they wait together.
 report() { # name rc
@@ -42,7 +44,7 @@ report() { # name rc
 # Every peer ends with its client (peer.ab): none may outlive the run.
 check_peers() {
     local left=() attempt process
-    for attempt in $(seq 1 50); do
+    for attempt in $(seq 1 1200); do
         left=()
         for process in /proc/[0-9]*; do
             case $(readlink "$process/exe" 2>/dev/null) in
@@ -67,7 +69,7 @@ stages=(mask
     async-reset-write async-stall async-retry)
 pids=()
 for stage in "${stages[@]}"; do
-    SSL_CERT_FILE="$output_directory/certificate.pem" timeout 40 \
+    SSL_CERT_FILE="$output_directory/certificate.pem" timeout 600 \
         "$output_directory/faults" "$output_directory/certificate.pem" "$output_directory/key.pem" "$stage" \
         > "$output_directory/$stage.log" 2>&1 &
     pids+=($!)
@@ -84,10 +86,10 @@ fi
 
 "$compiler" build tests/cases/tls-faults/timeouts.ab -o "$output_directory/timeouts" --fast || exit 2
 "$compiler" build tests/cases/tls-faults/deadlines.ab -o "$output_directory/deadlines" --fast || exit 2
-timeout 60 "$output_directory/timeouts" "$output_directory/certificate.pem" "$output_directory/key.pem" \
+timeout 600 "$output_directory/timeouts" "$output_directory/certificate.pem" "$output_directory/key.pem" \
     > "$output_directory/timeouts.log" 2>&1 &
 timeouts=$!
-SSL_CERT_FILE="$output_directory/certificate.pem" timeout 30 \
+SSL_CERT_FILE="$output_directory/certificate.pem" timeout 600 \
     "$output_directory/deadlines" "$output_directory/certificate.pem" "$output_directory/key.pem" \
     > "$output_directory/deadlines.log" 2>&1 &
 deadlines=$!
