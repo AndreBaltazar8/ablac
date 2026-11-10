@@ -758,6 +758,23 @@
   release build is the cheap one, because the stress run collects at every safe point and the unoptimized program
   spends far longer in them. Alternating pairs on 8 CPUs, user+sys CPU-seconds of the whole script: release 122 and
   112, `--fast` 216 and 250.
+  Where the CPU goes, by process (2026-11-10, per-process `perf` of each script cold, fast-list env as in the suite; 310
+  commands, 2,131 CPU-seconds in the gate run): test-ct 185 is python3 47% (the checker), llvm-objdump 29% (9,080 runs in 400
+  checker runs, one per function read) and the compiler 12%; test-json-ascii-spans 123 is 95% the test programs running
+  (GC stress ~70, `--fast` ~41, release ~6); test-self-hosted 113, test-ct-bridge 95 and test-doc-examples 72 are 78 to 93%
+  the compiler in `--fast` builds (frontend and `--fast` code generation, shared across the builds of programs that import
+  the compiler: a frontend-reuse item, not a script cut); test-reproducible-elsewhere 92 (opt 55%) and test-gc-growth 61
+  (99.7% the program itself) are what they test; test-crypto-pure 58 is the compiler 39%, qemu 21%, llc and opt 20%.
+  The bound: 2 minutes in the 8-CPU slot needs about 960 CPU-seconds (-55%), and test-level cuts give 5 to 6% of that
+  (the two below, about -26 and -50 CPU-seconds), so the lever is per-build compile cost; on a quiet 32-thread machine
+  the suite's CPU is about 91 s already. Cut: tools/ct/check-asm.py disassembles the functions of a check with one
+  llvm-objdump run (test-ct 136 to 110 CPU-seconds, 133 to 108 s wall, every build/ct/*.log byte-identical; a whole-object
+  dump per process was slower, 204, since 400 runs each parse a large object for the few functions they read). Cut:
+  test-json-ascii-spans' `--fast` and GC-stress passes run the boundary lengths (0 to 18 and four on each side of 128
+  and 256) and the full 72-length schedule in all three modes runs under `make test-full` (RUN_TESTS_FULL=1 or
+  JSON_SPANS_FULL=1): 83 to 32 CPU-seconds for the script here. Not done: the checker's inner loop (a state scan per
+  step: `any(t.startswith("hdrp:") for t in state)` and the prefix scan in `write`) would take about 15 CPU-seconds more
+  but changes what a security checker looks at; it needs ablac-19's read, not a drive-by edit.
 - [x] **Tests run on every push to master and on PRs** ([CI](docs/ci.md)): the Linux suite and an
   arm64 macOS host/fixed-point job. Tests only; releases still start by hand.
 - [x] **Parser-derived formatter.** `ablac fmt` preserves comments and verbatim syntax,
