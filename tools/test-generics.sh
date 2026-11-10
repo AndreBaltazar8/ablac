@@ -153,5 +153,18 @@ if "$compiler" build "$project_root/tests/cases/generic-type-parameter-capture/o
 fi
 grep -qF 'generic.cannot-infer:both:R' "$output_directory/parameter-open.err" ||
     { cat "$output_directory/parameter-open.err" >&2; echo "generics: no cannot-infer for R" >&2; exit 1; }
+# A parameter bound to a class named like a parameter that is still open, and the
+# open parameter that has a class of its name stays an error.
+"$compiler" build "$project_root/tests/cases/generic-type-parameter-capture/reverse.ab" \
+    -o "$output_directory/parameter-reverse" --no-cache
+output=$(run "$output_directory/parameter-reverse")
+[[ $output == $'3 10 5\nstatus 42' ]] ||
+    { echo "generics, a class named like an open parameter: $output" >&2; exit 1; }
+if "$compiler" build "$project_root/tests/cases/generic-type-parameter-capture/open-class.ab" \
+    -o "$output_directory/parameter-open-class" --no-cache > "$output_directory/parameter-open-class.err" 2>&1; then
+    echo "generics, an open parameter next to a class of its name: the build succeeded" >&2; exit 1
+fi
+grep -qF 'generic.cannot-infer:both:R' "$output_directory/parameter-open-class.err" ||
+    { cat "$output_directory/parameter-open-class.err" >&2; echo "generics: no cannot-infer for R next to class R" >&2; exit 1; }
 
 echo "generics: generic functions, extensions and classes compute what they should (built and under ablac run), private and strict-imports generics resolve, the compiler API reads and makes instances, misuses are the errors they should be, and an edited generic rebuilds its instances"

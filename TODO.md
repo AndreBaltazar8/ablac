@@ -203,12 +203,9 @@
   Ninth growth (branch `fuzz-651`, ablac-e5): classes named `T`, `U`, `K` in the prelude beside every
   generic whose type parameter has the same name, and a `clash_check` over them. It found #733's reach (a
   flat `class T` broke the strict standard library's generics) and #742 (a class parameter bound to a class
-  of its own name held back a method's lambda, fixed). Open, same family, the other direction: a
-  parameter bound to a class named like a parameter still open, `class R(...)`,
-  `fun <T, R> viaOpen(a: T, f: (T) -> R): R`, `viaOpen(R(2)) { x -> ... }` gives
-  `generic.cannot-infer:viaOpen:R`, since the substituted type spells the open `R`; the fix is to
-  substitute through placeholders no source can spell, not the source spelling. The generator does not draw
-  it yet.
+  of its own name held back a method's lambda, fixed) and its other direction (a parameter bound to a
+  class named like a parameter still open, `viaOpen(R(2)) { ... }` with `fun <T, R>` and a class `R`,
+  fixed: the lambda gate reads what is open from the pattern and no longer from the substituted type).
   Tenth growth (branch `fuzz-grow10`, aimed at the map growth in place and the word-wise string equality
   of batch 15): map inserts and removes by the hundred over keys that share prefixes and suffixes and are
   built as slices and concatenations (sizes, insertion order, `has`/`get` probes); string equality and
