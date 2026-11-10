@@ -488,6 +488,28 @@ owner_wipe_read() {
     echo "ok   $arch owner wipes: pbeWipe, aesWipe and bnClear only store through their pointer (1 control)"
 }
 
+# Frame slots an unoptimised Xtensa function reaches through a computed address (tests/cases/ct/frame-place-xtensa.s):
+# an addmi's immediate is read from the instruction's bytes (the disassembler prints it as 0), and a register that is
+# loaded no longer keeps the frame offset it held before. Found: a secret in a slot reached through addmi, and a secret
+# slot after a public store through a register that once addressed it but was reloaded with a heap pointer. Clean: the
+# neighbouring slot, and the secret stored through the reloaded heap pointer. Master's checker had all four backwards.
+xtensa_place_read() {
+    llvm-mc -triple xtensa -mcpu=esp32 -filetype=obj "$cases/frame-place-xtensa.s" -o "$out/frame-place-xtensa.o"
+    local entry
+    for entry in place_addmi place_reload_keeps; do
+        if $check xtensa "$out/frame-place-xtensa.o" "$entry:0,@1" > "$out/xt-$entry.log" 2>&1; then
+            echo "ct: missed $entry on xtensa" >&2; exit 1
+        fi
+        grep -q 'secret branch' "$out/xt-$entry.log" || { cat "$out/xt-$entry.log" >&2; exit 1; }
+    done
+    for entry in place_addmi_other place_reload_heap; do
+        $check xtensa "$out/frame-place-xtensa.o" "$entry:0,@1" > "$out/xt-$entry.log" 2>&1 || {
+            cat "$out/xt-$entry.log" >&2; echo "ct: $entry was reported on xtensa" >&2; exit 1
+        }
+    done
+    echo "ok   xtensa frame slots: addmi's immediate and reloaded registers placed, two secret slots found, two neighbours clean"
+}
+
 # A callee that writes a secret through an address of the caller's own frame (made by lea or by mov from rsp)
 # makes the caller's slots secret; a secret passed in a stack slot is found inside the callee. Hand-written assembly,
 # linked so that the calls resolve.
@@ -874,13 +896,13 @@ echo "ok   xtensa release object: the crypto allocation entry is called out of l
 xtensa_follow_read
 orchestration_read "$out/xtensa.o" xtensa
 worker_read "$out/xtensa.o" xtensa
-# The --fast object keeps every call, which the checker follows. 47 fixtures come out clean; the rest are in
-# fast-known-xtensa.txt (class unplaced, see fast_class). Those 16 are blind in this build: the real check of the same
-# source is the release read of the same fixtures above, and the 16 leak controls prove a leak is still found in
-# unoptimised code wherever the frame can be placed.
+# The --fast object keeps every call, which the checker follows: all 63 fixtures come out clean (fast-known-xtensa.txt
+# is empty; a fixture the checker can't place would be listed there, class unplaced, see fast_class), and the 16 leak
+# controls are still found in unoptimised code.
 abla_xtensa_test_build "$compiler" "$tools_directory" build "$cases/object.ab" -o "$out/xtensa-fast.o" --no-cache \
     --target-triple xtensa-esp-unknown-elf --object-format elf --emit object --fast
 fast_read xtensa "$out/xtensa-fast.o" "" "" "$cases/fast-known-xtensa.txt"
+xtensa_place_read
 xtensa_residue_read
 scrub_available_read
 write_only_read

@@ -123,6 +123,23 @@ def parse_disassembly(path, name, text):
         call = re.match(r"^callx(4|8|12)\s+(a\d+)$", lines[i][1])
         if load and call and load.group(1) == call.group(2):
             lines[i] = (lines[i][0], f"call{call.group(1)} 0x0 <{load.group(2)}>")
+    if "--mcpu=esp32" in extra and any(text.startswith("addmi") for _, text in lines):
+        # This LLVM's disassembler prints every addmi immediate as 0. Its value is the signed third byte (in units of
+        # 256, as the step function reads it), so take it from the instruction's bytes.
+        raw = subprocess.run([OBJDUMP, "-d", "--disassemble-symbols=" + name, *extra, path],
+                             capture_output=True, text=True, check=True).stdout
+        immediates = {}
+        for line in raw.splitlines():
+            m = re.match(r"^\s*([0-9a-f]+):\s+([0-9a-f]{2}) ([0-9a-f]{2}) ([0-9a-f]{2})\s+addmi\b", line)
+            if m:
+                byte = int(m.group(4), 16)
+                immediates[int(m.group(1), 16)] = byte - 256 if byte >= 128 else byte
+        for i, (address, text) in enumerate(lines):
+            if text.startswith("addmi"):
+                if address not in immediates:
+                    raise SystemExit(f"{name}: can't read the immediate of {text} at {address:#x}")
+                parts = [o.strip() for o in text.split(None, 1)[1].split(",")]
+                lines[i] = (address, f"addmi\t{parts[0]}, {parts[1]}, {immediates[address]}")
     if not lines:
         raise SystemExit(f"{name}: no such function in {path}")
     return lines
@@ -140,7 +157,7 @@ def fixpoint(lines, start, step, successors):
     guard = 0
     while work:
         guard += 1
-        if guard > 200000:
+        if guard > 3000000:
             raise SystemExit("no fixed point")
         i = work.pop()
         address, text = lines[i]
@@ -1903,6 +1920,8 @@ def check_xtensa(lines, secret, pointers):
         for r in range(rotation, 16):
             for tag in (f"a{r}", f"ptr:a{r}", f"stackbase:a{r}"):
                 state.discard(tag)
+            for tag in [x for x in state if x.startswith((f"sb:a{r}:", f"const:a{r}:"))]:
+                state.discard(tag)
         if secret:
             state.update(f"a{rotation + k}" for k in (2, 3) if rotation + k <= 15)
         return frozenset(state)
@@ -1932,6 +1951,8 @@ def check_xtensa(lines, secret, pointers):
             for r in range(rotation, 16):
                 for tag in (f"a{r}", f"ptr:a{r}", f"stackbase:a{r}"):
                     state.discard(tag)
+                for tag in [x for x in state if x.startswith((f"sb:a{r}:", f"const:a{r}:"))]:
+                    state.discard(tag)
             return frozenset(state)
         inputs = callee_inputs_xtensa(name)
         tags = set()
@@ -1952,6 +1973,8 @@ def check_xtensa(lines, secret, pointers):
         frame_address = "frameaddr" in state
         for r in range(rotation, 16):
             for tag in (f"a{r}", f"ptr:a{r}", f"stackbase:a{r}"):
+                state.discard(tag)
+            for tag in [x for x in state if x.startswith((f"sb:a{r}:", f"const:a{r}:"))]:
                 state.discard(tag)
         for k in range(2, 8):
             if rotation + k <= 15:
@@ -2000,6 +2023,8 @@ def check_xtensa(lines, secret, pointers):
                 raise Violation(f"call: the allocation entry is given a secret or a pointer to one: {text}")
             for r in range(rotation, 16):
                 for tag in (f"a{r}", f"ptr:a{r}", f"stackbase:a{r}", f"hdrp:a{r}"):
+                    state.discard(tag)
+                for tag in [x for x in state if x.startswith((f"sb:a{r}:", f"const:a{r}:"))]:
                     state.discard(tag)
                 state.add(f"lost:a{r}")
             state.discard("lost:" + pointer)
@@ -2085,7 +2110,9 @@ def check_xtensa(lines, secret, pointers):
             value = False
         # Registers that are a1 plus a constant, or a constant (a big frame is addressed through `movi aN, 1440` and
         # `add.n aD, a7, aN`).
-        constant = lambda register: next((int(x.split(":")[2]) for x in state if x.startswith(f"const:{register}:")), None)
+        # A constant only if the paths that meet here agree on it (states join by union, so two values may be there).
+        known = lambda register: [int(x.split(":")[2]) for x in state if x.startswith(f"const:{register}:")]
+        constant = lambda register: known(register)[0] if len(known(register)) == 1 else None
         fresh = []
         if op in ("movi", "movi.n") and len(ops) == 2:
             fresh.append(f"const:{dest}:{int(ops[1], 0)}")

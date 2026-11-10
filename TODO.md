@@ -304,14 +304,23 @@
   offsets the checker can't place, and what it loads from there reads as secret; those 16 are blind in the fast build,
   and their release read is the real check). Hand-written controls for all three:
   `follow-a64.s`, `follow-wasm.s`, `follow-xtensa.s`.
-  **Xtensa `--fast`, the 16 in `fast-known-xtensa.txt`** (measured 2026-11-10):
-  - 12 are a secret address and 4 a secret branch: `beq`/`blt`/`bltu` in the divsteps, gcd and inverse bodies at widths
-    1, 3 and 128, `wide`, and `pbe_hmac1`.
-  - Each follows a load from a frame address the checker can't place: unoptimised code indexes its frame arrays through
-    a1 plus a register.
-  - The same 16 fixtures are clean in Xtensa release and on x86-64 and AArch64 `--fast`, so they are a checker limit
-    (a1-plus-register frame indexing), not a lowering that leaks. Placing them needs a frame index the checker can
-    bound (a public index into a frame array of known size), the Xtensa counterpart of the x86-64 frame views.
+  **Xtensa `--fast`** (2026-11-10): all 63 fixtures read clean, and `fast-known-xtensa.txt` is empty. The 16 it
+  listed were two checker bugs, each unsound as well as noisy:
+  - This LLVM's disassembler prints every `addmi` immediate as 0, so a slot at a1 plus `movi`/`addmi`/`add` was placed
+    256·k bytes off. The immediate is now read from the instruction's third byte.
+  - A load (or `l32r`) kept its destination register's frame-offset and constant tags, so a heap store through a
+    register that had once held a frame address was placed in the frame. Loads now clear them, as calls do for the
+    callee's window.
+  - On master both ways go wrong: a real secret branch on such a slot is missed, and a public neighbour is reported.
+    The four controls in `frame-place-xtensa.s` are each the reverse on master.
+  - With the slots placed, the largest --fast function (secret_inverse, 27,047 instructions) takes more than the old
+    200,000 fixpoint steps, so the guard is now 3,000,000. A register's constant counts only where the paths that
+    meet agree on it.
+  - The Xtensa `--fast` residue lists grow with the 16 entries now read: their unoptimised work goes deeper than the
+    fixtures' 1024-byte wipe (`residue-known-xtensa-fast*.txt`), as the four already listed did.
+  - The release Xtensa reading is unchanged, byte for byte: identical logs from master's checker and this one on the
+    release object (63 fixtures and the 16 leaks, with and without `--follow-calls`) and on its residue entries.
+  - No real secret branch from unoptimised lowering showed on any target.
 - [ ] **Close the temporary-resource drop gaps (#736 follow-up).** A fresh resource that is only a temporary is dropped at the
   end of its statement when it is the receiver of a class's own method or of a field read, or an argument to a plain
   function or method (docs/ownership.md). Still leaking as before, so a secret in one (the password case:
