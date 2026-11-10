@@ -26,3 +26,9 @@ wipe_reads:
  jne 1b
 2:
  retq
+# wipe_xadd stores zero with a lock xadd, which also reads the old byte into al (found).
+.globl wipe_xadd
+wipe_xadd:
+ xorl %eax,%eax
+ lock xaddb %al,(%rdi)
+ retq

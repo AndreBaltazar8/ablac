@@ -24,3 +24,8 @@ wipe_reads:
  b.ne 1b
 2:
  ret
+// wipe_swp stores zero with swp, which also returns the old word in x2 (found).
+.globl wipe_swp
+wipe_swp:
+ swp xzr, x2, [x0]
+ ret

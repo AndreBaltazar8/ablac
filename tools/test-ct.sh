@@ -444,9 +444,14 @@ write_only_read() {
     local arch triple label
     for label in x86:x86_64:x86_64-linux-gnu a64:aarch64:aarch64-linux-gnu xtensa:xtensa:xtensa; do
         IFS=: read -r file arch triple <<< "$label"
-        local extra=()
-        [[ $arch == xtensa ]] && extra=(-mcpu=esp32)
+        local extra=() atomic=wipe_xadd
+        [[ $arch == xtensa ]] && extra=(-mcpu=esp32) && atomic=wipe_cas
+        [[ $arch == aarch64 ]] && extra=(-mattr=+lse) && atomic=wipe_swp
         llvm-mc -triple "$triple" "${extra[@]}" -filetype=obj "$cases/write-only-$file.s" -o "$out/write-only-$file.o"
+        # An atomic that writes the memory also reads it (xadd, swp, s32c1i return the old value).
+        if $check "$arch" "$out/write-only-$file.o" "$atomic:@0!" > "$out/write-only-$file-atomic.log" 2>&1; then
+            echo "ct: missed $atomic on $arch" >&2; exit 1
+        fi
         $check "$arch" "$out/write-only-$file.o" "wipe_only:@0!" > "$out/write-only-$file-clean.log" 2>&1 || {
             cat "$out/write-only-$file-clean.log" >&2; echo "ct: wipe_only was reported on $arch" >&2; exit 1
         }
@@ -460,7 +465,7 @@ write_only_read() {
             cat "$out/write-only-$file-plain.log" >&2; echo "ct: wipe_reads failed on $arch without the write-only flag" >&2; exit 1
         }
     done
-    echo "ok   write-only pointers: a store-only wipe passes and a wipe that reads is found, on x86-64, AArch64 and Xtensa"
+    echo "ok   write-only pointers: a store-only wipe passes, a wipe that reads (also by an atomic) is found, on x86-64, AArch64 and Xtensa"
 }
 
 # A callee that writes a secret through an address of the caller's own frame (made by lea or by mov from rsp)

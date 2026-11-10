@@ -612,6 +612,11 @@ def check_x86(lines, secret, pointers):
             parts = parts[1].split(None, 1)
             op = parts[0]
         ops = x86_split(parts[1]) if len(parts) > 1 else []
+        if FOLLOW["write_only"] and op.startswith(("xadd", "cmpxchg")) and ops:
+            # Read-modify-write atomics read the memory they change (the old value comes back in a register).
+            m = mem_parts(ops[-1])
+            if m and any(r and "ptr:" + x86_reg(r) in state for r in (m.group(2), m.group(3))):
+                raise Violation(f"reads the secret memory it may only overwrite: {text}")
         if any(t.startswith("hdrp:") for t in state):
             mark_lost(state, op, ops)
         # Any instruction naming a register as its destination (AT&T: the last operand) may have changed it.
@@ -1508,6 +1513,11 @@ def check_aarch64(lines, secret, pointers):
             ) for item in state)
         if op in ("sdiv", "udiv") and any(t(o) for o in ops[1:]):
             raise Violation(f"secret division: {text}")
+        if FOLLOW["write_only"] and op.startswith(("swp", "cas")):
+            # Swaps and compare-and-swaps return the old value: a read of the memory.
+            memory = next((o for o in ops if "[" in o), None)
+            if memory and any("ptr:" + reg in state for reg in regs(memory)):
+                raise Violation(f"reads the secret memory it may only overwrite: {text}")
         if op.startswith("ld"):
             memory = next(o for o in ops if "[" in o)
             inner = regs(memory)
@@ -2027,6 +2037,9 @@ def check_xtensa(lines, secret, pointers):
             (state.add if value else state.discard)(dest)
             (state.add if pointer else state.discard)("ptr:" + dest)
             return frozenset(state)
+        if FOLLOW["write_only"] and op == "s32c1i" and len(ops) > 1 and "ptr:" + ops[1] in state:
+            # The compare-and-swap returns the old word in its first operand: a read of the memory.
+            raise Violation(f"reads the secret memory it may only overwrite: {text}")
         m = re.match(r"^(s8i|s16i|s32i|s32i\.n)$", op)
         if m:
             source, base, offset = ops[0], ops[1], ops[2] if len(ops) > 2 else "0"

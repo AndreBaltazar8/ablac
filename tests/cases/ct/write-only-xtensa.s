@@ -34,3 +34,15 @@ wipe_reads:
 2:
 	retw.n
 	.size	wipe_reads, .-wipe_reads
+
+// wipe_cas stores zero with s32c1i, which also returns the old word in a8 (found).
+	.section	.text.wipe_cas,"ax",@progbits
+	.align	4
+	.global	wipe_cas
+	.type	wipe_cas,@function
+wipe_cas:
+	entry	a1, 32
+	movi	a8, 0
+	s32c1i	a8, a2, 0
+	retw.n
+	.size	wipe_cas, .-wipe_cas
