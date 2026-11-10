@@ -239,6 +239,29 @@
   on master) only with `--open-bugs` until those are fixed (ablac-f3-2 saw the same class as the `test-labeled-loops` segfault of #736's
   first gate).
 
+- **Evaluator: a jump on the right of `??` in a few more operand positions (#775 follow-up, ablac-52's review).**
+  The evaluator now returns the jump before it assigns or chooses in assignments (plain, field, element and its
+  index), unary `!`/`-`/`~`, the `if`/`while`/`do while` condition, the `when` subject, `||`, range ends, template
+  parts and array literals (tests/cases/ct-elvis-jump). Not covered, rarely written: the arguments of `truncate`
+  and `slice` in `bootstrapEvaluateMemberCall`, and the integer arguments the `compilerX` calls read. A jump there
+  is stored as an operand value instead of leaving. `break` and `continue` in a `while`/`do while` condition are
+  sema errors, so only `?? return` can stand there.
+
+- **Depth guard: a second, misleading error after `E_EVAL_STACK_DEPTH` at some stop points (found while landing #775).**
+  `tools/test-deep-json.sh` builds `deepest.ab` (`#$jsons` over 1000 nested `[` `]`) on a lowered stack and demands
+  exactly one error, the evaluator's depth guard. Where the guard stops the descent decides whether the unwinding
+  leaves a cascade: `error[E_SEMANTIC]: array.element-type` at deepest.ab:71:72 after the guard's own error. It is
+  reproducible without #775, on the #736 tree alone (stage 1 of tag d1-gated-736): `ulimit -s 7260; ulimit -H -s
+  7260; ABLA_MAX_STACK_KB=7260 ablac build deepest.ab` gives two errors (guard at 4888 levels); the same program
+  at 7200 to 7656 KB in steps of 12 gives one error everywhere else (a sweep of 39 sizes: 4840 to 5232 levels), and
+  at the test's four sizes 8192/7808/7424/6656 KB the guard stops at 5688/5360/5032/4376 levels with one error. A
+  tree whose recursive evaluator frames are 8 bytes larger per level (a draft of #775 with a live `condition` local in
+  `bootstrapEvaluateIf`) moved the 7424 KB stop to 5008 levels and hit the cascade there. So the test passes by the
+  stack sizes it happens to use, not because the unwinding is clean: the syntax a subparser builds from the evaluation
+  that the guard cut short still contains an array whose element type cannot be found. Not fixed (the evaluator's frame
+  size is therefore part of that test: keep the recursive frames of `if`/`while`/`do while` free of new live locals, as
+  `bootstrapEvalCondition` does).
+
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
 - [ ] **Abla-native Xtensa companion installer.** The explicit optional installer uses only the Python

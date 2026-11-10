@@ -7594,6 +7594,7 @@ fun bootstrapEvaluateNot(
 ): BootstrapEvalValue {
     var result = bootstrapEvalInvalid()
     val value = evaluator.evaluate(expression.children[0])
+    if (bootstrapEvalLeaves(value)) return value
     result = bootstrapEvalBoolean(!value.boolean)
     result
 }
@@ -7605,6 +7606,7 @@ fun bootstrapEvaluateComplement(
 ): BootstrapEvalValue {
     var result = bootstrapEvalInvalid()
     val value = evaluator.evaluate(expression.children[0])
+    if (bootstrapEvalLeaves(value)) return value
     result = bootstrapEvalScalar(bitNot(value.integer), value.owner, value.text)
     result
 }
@@ -7923,9 +7925,9 @@ fun bootstrapEvaluateTemplate(
     var text = ""
     var part = 0
     while (part < expression.children.size) {
-        text = "$text${evaluator.printable(evaluator.evaluate(
-            expression.children[part]
-        ))}"
+        val value = evaluator.evaluate(expression.children[part])
+        if (bootstrapEvalLeaves(value)) return value
+        text = "$text${evaluator.printable(value)}"
         part = part + 1
     }
     result = bootstrapEvalString(text)
@@ -8104,6 +8106,8 @@ fun bootstrapEvaluateAssign(
         val declaration = evaluator.declarations[evaluator.compileVar(expression.text)]
         val key = bootstrapCompileGlobalKey(declaration)
         val value = evaluator.evaluate(expression.children[0])
+        // `x = y ?? continue`: the jump leaves before anything is assigned.
+        if (bootstrapEvalLeaves(value)) return value
         var slot = -1
         var index = 0
         while (index < evaluator.globalKeys.size) {
@@ -8125,6 +8129,8 @@ fun bootstrapEvaluateAssign(
             evaluator.declarations[bootstrapRuntimeVar(evaluator, expression.text)]
         val key = bootstrapRuntimeGlobalKey(declaration)
         val value = evaluator.evaluate(expression.children[0])
+        // `x = y ?? continue`: the jump leaves before anything is assigned.
+        if (bootstrapEvalLeaves(value)) return value
         var slot = -1
         var index = 0
         while (index < evaluator.globalKeys.size) {
@@ -8144,6 +8150,8 @@ fun bootstrapEvaluateAssign(
         var global = bootstrapEvalInvalid()
         if (found < 0 && !field) global = evaluator.delegatedSlot(expression.text)
         val value = evaluator.evaluate(expression.children[0])
+        // `x = y ?? continue`: the jump leaves before anything is assigned.
+        if (bootstrapEvalLeaves(value)) return value
         var slot = bootstrapEvalInvalid()
         if (found >= 0) slot = evaluator.values[found]
         else if (global.kind == "delegate") slot = global
@@ -8254,7 +8262,9 @@ fun bootstrapEvaluateArrayLiteral(
     val elements: array<BootstrapEvalValue> = []
     var element = 0
     while (element < expression.children.size) {
-        elements.append(evaluator.evaluate(expression.children[element]))
+        val value = evaluator.evaluate(expression.children[element])
+        if (bootstrapEvalLeaves(value)) return value
+        elements.append(value)
         element = element + 1
     }
     result = bootstrapEvalArray(elements)
@@ -8267,8 +8277,12 @@ fun bootstrapEvaluateRange(
     expression: BootstrapExpression
 ): BootstrapEvalValue {
     var result = bootstrapEvalInvalid()
-    val begin = evaluator.evaluate(expression.children[0]).integer
-    val end = evaluator.evaluate(expression.children[1]).integer
+    val beginValue = evaluator.evaluate(expression.children[0])
+    if (bootstrapEvalLeaves(beginValue)) return beginValue
+    val begin = beginValue.integer
+    val endValue = evaluator.evaluate(expression.children[1])
+    if (bootstrapEvalLeaves(endValue)) return endValue
+    val end = endValue.integer
     val elements: array<BootstrapEvalValue> = []
     var current = begin
     var more = current < end
@@ -8362,7 +8376,10 @@ fun bootstrapEvaluateMemberAssign(
     val receiver = bootstrapEvalUnwrapBorrow(
         bootstrapEvaluatePlace(evaluator, expression.children[0])
     )
+    if (bootstrapEvalLeaves(receiver)) return receiver
     val value = evaluator.evaluate(expression.children[1])
+    // `box.value = x ?? continue`: the jump leaves before anything is assigned.
+    if (bootstrapEvalLeaves(value)) return value
     var assigned = false
     var field = 0
     while (field < receiver.fieldNames.size) {
@@ -8443,8 +8460,13 @@ fun bootstrapEvaluateIndexAssign(
     val receiver = bootstrapEvalUnwrapBorrow(
         bootstrapEvaluatePlace(evaluator, expression.children[0])
     )
-    val index = evaluator.evaluate(expression.children[1]).integer
+    if (bootstrapEvalLeaves(receiver)) return receiver
+    val indexValue = evaluator.evaluate(expression.children[1])
+    if (bootstrapEvalLeaves(indexValue)) return indexValue
+    val index = indexValue.integer
     val value = evaluator.evaluate(expression.children[2])
+    // `elements[i] = x ?? continue`: the jump leaves before anything is assigned.
+    if (bootstrapEvalLeaves(value)) return value
     if (receiver.kind == "array" && index >= 0 &&
         index < receiver.elements.size) {
         if (receiver.elements[index].kind != "uninitialized") {
@@ -8745,6 +8767,7 @@ fun bootstrapEvaluateNegate(
 ): BootstrapEvalValue {
     var result = bootstrapEvalInvalid()
     val value = evaluator.evaluate(expression.children[0])
+    if (bootstrapEvalLeaves(value)) return value
     var integer = value.integer
     if (expression.kind == "unary-") integer = -integer
     result = if (value.kind == "f64") {
@@ -8950,6 +8973,37 @@ fun bootstrapEvaluateAnd(
     result
 }
 
+// A condition that is a jump (`if (x ?? return)`) leaves before a branch is chosen. The test sits in
+// these helpers so that the recursive frames of `if`, `while` and `do while` keep the locals they had
+// (a compile-time recursion holds one such frame per level, and the stack depth guard counts on it).
+var bootstrapEvalConditionJumped: bool = false
+var bootstrapEvalConditionJump: array<BootstrapEvalValue> = []
+
+/** Whether the condition `expression` is true; a condition that is a jump is false, and the jump is
+ *  left for bootstrapEvalConditionTake. */
+@noinline
+fun bootstrapEvalCondition(
+    var evaluator: BootstrapEvaluator,
+    expression: BootstrapExpression
+): bool {
+    val condition = evaluator.evaluateFrame(expression)
+    if (bootstrapEvalLeaves(condition)) {
+        bootstrapEvalConditionJump = [condition]
+        bootstrapEvalConditionJumped = true
+        return false
+    }
+    condition.boolean
+}
+
+/** The jump a condition left (and forget it). */
+@noinline
+fun bootstrapEvalConditionTake(): BootstrapEvalValue {
+    val jump = bootstrapEvalConditionJump[0]
+    bootstrapEvalConditionJump = []
+    bootstrapEvalConditionJumped = false
+    jump
+}
+
 @noinline
 fun bootstrapEvaluateOr(
     var evaluator: BootstrapEvaluator,
@@ -8976,7 +9030,7 @@ fun bootstrapEvaluateOr(
     }
     var operand = 0
     result = bootstrapEvalBoolean(false)
-    while (!result.boolean && operand < operands.size) {
+    while (!result.boolean && !bootstrapEvalLeaves(result) && operand < operands.size) {
         result = if (operand == 0) evaluator.evaluate(operands[operand])
             else evaluator.evaluateFrame(operands[operand])
         operand = operand + 1
@@ -8997,12 +9051,15 @@ fun bootstrapEvaluateIf(
     var pending = true
     while (pending) {
         pending = false
-        if (evaluator.evaluateFrame(current.children[0]).boolean) {
+        if (bootstrapEvalCondition(evaluator, current.children[0])) {
             result = evaluator.evaluateFrame(current.children[1])
             // Without `else`, the branch's value is discarded.
             if (current.children[2].kind == "missing") {
                 bootstrapEvalDropDiscarded(evaluator, current.children[1], result)
             }
+        } else if (bootstrapEvalConditionJumped) {
+            // `if (x ?? continue)`: the jump leaves before a branch is chosen.
+            result = bootstrapEvalConditionTake()
         } else if (current.children[2].kind == "missing") {
             result = bootstrapEvalVoid()
         } else if (current.children[2].kind != "if") {
@@ -9025,6 +9082,7 @@ fun bootstrapEvaluateWhen(
 ): BootstrapEvalValue {
     var result = bootstrapEvalInvalid()
     val subject = evaluator.evaluateFrame(expression.children[0])
+    if (bootstrapEvalLeaves(subject)) return subject
     var selected = false
     var branch = 1
     while (!selected && branch + 1 < expression.children.size) {
@@ -9066,7 +9124,7 @@ fun bootstrapEvaluateWhile(
     // the next one would fail the same way, up to the step limit.
     val errorsBefore = evaluator.errors
     while (looping && evaluator.errors == errorsBefore &&
-           evaluator.evaluateFrame(expression.children[0]).boolean &&
+           bootstrapEvalCondition(evaluator, expression.children[0]) &&
            evaluator.steps <= evaluator.context.stepLimit) {
         result = evaluator.evaluateFrame(expression.children[1])
         bootstrapEvalDropDiscarded(evaluator, expression.children[1], result)
@@ -9087,6 +9145,8 @@ fun bootstrapEvaluateWhile(
             result = bootstrapEvalVoid()
         }
     }
+    // `while (x ?? return)`: the jump leaves before a turn starts.
+    if (bootstrapEvalConditionJumped) result = bootstrapEvalConditionTake()
     result
 }
 
@@ -9120,7 +9180,12 @@ fun bootstrapEvaluateDoWhile(
             result = bootstrapEvalVoid()
         }
         if (looping) {
-            more = evaluator.evaluateFrame(expression.children[1]).boolean
+            more = bootstrapEvalCondition(evaluator, expression.children[1])
+            if (bootstrapEvalConditionJumped) {
+                // `while (x ?? return)` after the body: the jump leaves before the test is read.
+                result = bootstrapEvalConditionTake()
+                looping = false
+            }
         }
     }
     result
