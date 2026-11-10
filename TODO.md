@@ -951,6 +951,23 @@
   body-1k 10,870 to 10,939, headers-32 40,665 to 41,305 (+1.6%). A request has a `\r` every 20 to 30 bytes, so most
   words contain the first byte and the word test is overhead; searching for the rarer last byte of the sequence
   (`\n`) would face the same density. Not kept.
+  Fixed cost of one keep-alive request in abla-compare's plaintext server (2026-11-10, master `9def8f6d`'s runtime, one pinned
+  worker, instructions:u per request, Abla 8,023 against Zig 3,877; #759): the stages measured alone, each call inside a `region`
+  as the server runs it (200,000 calls, minus the empty loop): `httpParseRequest` 1,922 (a two-header request), `httpEventFrame`
+  3,045 (the parse plus the header-block end search 449, two header lookups and the version check), `httpEventResponse` 1,145,
+  `httpText` 374, one `HttpHeader` object 149. Outside a region the same object costs 286 (glibc `malloc` is 43% of it), so
+  numbers taken from a plain loop overstate allocation by about 2x. Allocation counts per request (gdb hit counts, 1,000
+  requests over one connection): 15 object blocks, 4 array blocks, 4 string concatenations, 1 integer-to-text. Flat profile:
+  `httpParseRequest` 15.6%, `textFindSequence` 9.0%, `httpEventResponse` 8.7%, `HttpEventServer.step` 7.6%,
+  `processNoEscapeInputInRegion` 7.3%, the allocator 14.7% (`HostAllocateGeneral` 6.9, `ObjectBlock` 4.7, `ArrayBlock` 3.1),
+  `webNoEscapeRoute` 5.8%, `HttpRequest.header` 3.8%, `httpEventFrame` 3.6%. Cut 1 (branch `http-objects`): the request is built
+  with the accepted peer, not copied to attach it (one 8-field object per request): plaintext 8,023 to 7,834 (-2.4%),
+  parameters 12,057 to 11,884, headers-32 40,645 to 40,455. Left and why not: the header objects and their two substrings
+  are `HttpRequest.headers`' type; the two empty `parameterNames`/`parameterValues` arrays per request could be one shared
+  empty array only if no caller appends to them (an API promise, about 250 instructions); the per-write `TcpConnection`
+  is a resource that closes its descriptor when dropped, so reusing one object needs a change to the resource rules;
+  `HttpEventFrame` (3 fields) is a return object of a public function. Word-wise scans of the header block do not pay
+  (above). So the remaining gap to Zig is spread over about 20 sites of 100 to 400 instructions each, with no single cut over 3%.
 - [x] **`abla-compare` json-strings-4k, one worker, rechecked** (2026-11-10, master `7c706497`'s runtime, the setup of the
   headers-32 entry; the 2026-11-06 matrix had Abla 91,781 requests/s against Rust 120,887, -24.1%, and a profile of
   52.3% `jsonPlainStringEnd` + 25.2% `jsonStringIsPlain`): instructions per request, three runs each, Abla 64,308
