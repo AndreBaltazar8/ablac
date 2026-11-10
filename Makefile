@@ -310,6 +310,7 @@ test-serial: ablac
 	python3 tools/test-ios-availability.py $(COMPILER)
 	tools/test-json-native-paths.sh $(COMPILER)
 	tools/test-json-ascii-spans.sh $(COMPILER)
+	tools/test-json-hex-quad.sh $(COMPILER)
 	tools/test-json-utf8.sh $(COMPILER)
 	tools/test-transactional-native-output.sh $(COMPILER)
 	tools/test-typed-subparser-inspection.sh $(COMPILER)

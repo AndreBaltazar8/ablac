@@ -520,25 +520,23 @@ fun jsonSkipWhitespace(var state: JsonParserState): void {
 }
 
 private fun jsonHexValue(byte: int): int {
-    var value = -1
-    if (byte >= 48 && byte <= 57) value = byte - 48
-    if (byte >= 65 && byte <= 70) value = byte - 65 + 10
-    if (byte >= 97 && byte <= 102) value = byte - 97 + 10
-    value
+    val digit = byte - 48
+    if (digit >= 0 && digit <= 9) return digit
+    // Letters fold with `| 32` (A to F and a to f only: no other byte folds into 97 to 102).
+    val letter = (byte | 32) - 97
+    if (letter >= 0 && letter <= 5) letter + 10 else -1
 }
 
 private fun jsonHexQuad(source: string, offset: int): int {
-    var value = 0
-    var valid = offset >= 0 && offset + 4 <= source.size
-    val packed = if (valid) textReadU32LittleEndian(source, offset) else 0
-    var index = 0
-    while (valid && index < 4) {
-        val digit = jsonHexValue((packed >> (index * 8)) & 255)
-        if (digit < 0) valid = false
-        if (digit >= 0) value = value * 16 + digit
-        index = index + 1
-    }
-    if (valid) value else -1
+    if (offset < 0 || offset + 4 > source.size) return -1
+    val packed = textReadU32LittleEndian(source, offset)
+    val first = jsonHexValue(packed & 255)
+    val second = jsonHexValue((packed >> 8) & 255)
+    val third = jsonHexValue((packed >> 16) & 255)
+    val fourth = jsonHexValue((packed >> 24) & 255)
+    // A byte that is not a hex digit gives -1, which sets every bit of the or.
+    if ((first | second | third | fourth) < 0) -1
+    else (first << 12) | (second << 8) | (third << 4) | fourth
 }
 
 @noinline
@@ -684,6 +682,9 @@ trusted fun jsonParseEscapedNative(var state: JsonParserState, begin: int): stri
     var offset = begin
     var written = 0
     var valid = true
+    // The bits of the bytes copied as written (128 or more: one was from 128 up): escapes give valid
+    // UTF-8 by construction (no surrogate), and ASCII is valid, so only copied high bytes need the check.
+    var copiedBits = 0
     while (valid && offset < end) {
         val byte = ablaUnsafeLoadU8(nativePointerFromAddress(sourceAddress + offset))
         offset = offset + 1
@@ -744,11 +745,12 @@ trusted fun jsonParseEscapedNative(var state: JsonParserState, begin: int): stri
         else {
             ablaUnsafeStoreU8(nativePointerFromAddress(destination + written), byte)
             written = written + 1
+            copiedBits = copiedBits | byte
         }
     }
     if (valid) {
         val text = buffer.adoptString(written)
-        if (text.isValidUtf8()) {
+        if (copiedBits < 128 || text.isValidUtf8()) {
             state.offset = end + 1
             return text
         }
