@@ -1036,6 +1036,25 @@
   and its stripped executable grows 82%; NovaKind tool builds drop 53% (help smoke only).
   No single default wins: do not add a program heuristic. Worktree ablac-o1-codegen,
   build/codegen-lab/report.md has the raw build/run/size data.
+  Remeasured on v0.2.53 (2026-11-10, the published install, `--fast` runtime pruning on; one `ablac test <file>` per test
+  file of abla-qr 032dd0e and abla-pdf 68982d9; user instructions on one P-core, sampled, split by process into the
+  compiler's (build) and the test program's (run); cold = an empty cache, warm = the same cache again):
+  - Whole suites, build + run: QR `--o1` 266 G (20 s) cold and 189 G (11 s) warm, against `--fast` 1,922 G (154 s)
+    and about 1,880 G. PDF `--o1` 159 G (19 s) cold and 14.5 G (1.4 s) warm, against `--fast` 260 G (21 s) and 200 G
+    (13 s). `--o1` wins both suites cold and warm. QR's reader_test alone runs 1,719 G at `--fast` against 152 G.
+  - Builds: cold, an `--o1` bundle costs 2.1 to 2.3 times its `--fast` build (PDF 148 G against 63 G; QR without
+    reader_test 77 G against 37 G), dearer than the 65% of 2026-11-03, because pruning cut `--fast`. Warm, a bundle
+    builds in 0.26 to 0.44 G in either mode (the cache): the `--o1` premium is paid only after an edit.
+  - Where a cold `--o1` build goes (PDF reader_test, 37.6 G): libLLVM 67%, about 25 G, mostly machine code generation
+    (SelectionDAG instruction selection, greedy register allocation, live ranges; IR passes about 5%). ablac's own
+    frontend and lowering take 22%, about 8.4 G, the same as in its `--fast` build. libc takes 10%. In `--fast`, LLVM
+    is 3.9 G.
+  - Per file, `--fast` wins cold only on tests that run in under a gigainstruction: PDF reader 22 G saved, raster 21 G,
+    writer 10 G, crypt 3 G; QR png, render and tables 1 to 3.5 G. Picking `--fast` for those alone would save PDF's
+    cold suite about 36% (57 of 159 G) and QR's about 2%. It saves nothing warm.
+  - Not proposed: no default change (`--o1` wins every suite), and no per-bundle threshold. Which tests run short is
+    known only after running them, so it would need a record of past runs, and it would save only what one cold
+    rebuild of the short bundles costs.
 - [ ] **A map is built on boxed generic arrays.** maps spends 21% in `__ablaRuntimeMapEntry`, 12% in
   `abla_map_set`, 17% appending to and setting its parts' arrays (2026-11-02). Since string
   concatenation allocates out of line, maps runs 1.3% more instructions. 2026-11-08: the entry
