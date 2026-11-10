@@ -335,6 +335,33 @@
   header size is a runtime layout fact, so the spec must be generated from `runtime/` (not typed by hand) and a layout
   change must fail the generator; and the checker must still fail closed on a store of a secret into a header offset.
   Controls: a secret stored at offset 8, a secret-indexed header read, and a pointer spilled and reloaded.
+  *Object layout, measured (2026-11-10, release x86-64, a `resource class K(memory, size, rounds, hardware)`):* a
+  function that takes the object gets a box, not the object: `[rdi + 8]` is the object pointer (tested against 0
+  first), and the fields are at object `+0x10` (memory), `+0x18` (size), `+0x20` (rounds), `+0x28` (a byte), after two
+  header words that a constructor writes (`+0` the class, `+8` another word). So there are two public reads to
+  tell apart from secret ones: the box's pointer word, and the fields, which are public by the language's design
+  (nothing secret is a class field) but look like any load. The 32-byte `%n` window starts at the wrong place and is
+  the wrong size for them. A usable tag would be a pair: `%n` marks the box, a load of `[box + 8]` yields an object
+  pointer with a public length of 16 + 8 * fields (taken from the class by the test, not typed), and a load below that
+  length is public. Open: what the compiler's tag-check loads add, and whether the object pointer survives the
+  collector's moves between two reads (it can't move in a straight-line read, but a call can).
+  *No-go for the object plumbing (2026-11-10, #744).* Reading `aesNewKey`, the `AesKey` field reads and `rsaCrt`'s
+  `BnModulus` through the checker would need three things the compiler does not give a stable handle on. (1) A
+  constructor's allocation is a call to a runtime function shared by all classes (`__ablaRuntimeObjectBlock`, checked
+  by ablac-f3-2 on a release build with `-g`: the size-class test, free-list load, heap-lock test, zeroing and registry
+  append are inside it, the field stores follow at `+0x10..`), so the call could be treated like the byte
+  allocation's entry, but (a) in a build without `-g` its name is a fingerprint, so it would need a stable mark of
+  its own in the runtime (a change that touches every program), and (b) the constructor body around the call still
+  branches on the collector's pressure globals and on a class-layout tag (`cmpl $0xc6f9, ...(%rip)` with a `ud2`), which the
+  checker reads as unknown memory and so as secret branches; making those public is a trusted list of globals that
+  nothing proves secret-free, which is what option B refused. (2) A function that takes the object takes a box whose word at `+8` is the object pointer, so a field
+  read is two loads, and the compiler adds a null test and tag checks around them that move with its inlining. (3) A
+  field is public by the language's design, but nothing in the object file says which loads are fields, so a "public
+  length" would be typed by hand and checked against nothing. What stays instead: the type system keeps secrets out of
+  these functions (no branch, index or division from a secret, `declassify` the only way out), `crypto-source-fixtures.py`
+  hashes their text so a change there is a reviewed one and asserts there is no `declassify` in it, and the entry
+  above takes the allocation out of the part that is read. Revisit only if the constructor's pressure and layout checks move into the shared object-block function and that function gets a
+  stable mark for another reason.
   **No real entry uses `%n` yet:** what exists is the mechanism and its hand-written controls, not coverage of `aesNewKey`,
   `rsaCrt` or any other function of the crypto plumbing; those stay unread until the application below is done.
   *Finding against the allocator step (2026-11-09, release x86-64, a key-shaped `resource class` and an
