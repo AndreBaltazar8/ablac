@@ -66,16 +66,46 @@ def prefetch(path, extra, names):
         PREFETCHED.setdefault((path, tuple(extra)), []).append(disassembly(path, extra, names))
 
 
+ADDMI_IMMEDIATES = {}
+
+
+def xtensa_addmi_immediates(path, name, extra, lines):
+    """This LLVM's disassembler prints every Xtensa addmi immediate as 0. Its value is the signed third byte (in units
+    of 256, as the Xtensa step function reads it), so take it from the instruction's bytes."""
+    if "--mcpu=esp32" not in extra or not any(text.startswith("addmi") for _, text in lines):
+        return lines
+    key = (path, name, tuple(extra))
+    if key not in ADDMI_IMMEDIATES:
+        raw = subprocess.run([OBJDUMP, "-d", "--disassemble-symbols=" + name, *extra, path],
+                             capture_output=True, text=True, check=True).stdout
+        found = {}
+        for line in raw.splitlines():
+            m = re.match(r"^\s*([0-9a-f]+):\s+([0-9a-f]{2}) ([0-9a-f]{2}) ([0-9a-f]{2})\s+addmi\b", line)
+            if m:
+                byte = int(m.group(4), 16)
+                found[int(m.group(1), 16)] = byte - 256 if byte >= 128 else byte
+        ADDMI_IMMEDIATES[key] = found
+    immediates = ADDMI_IMMEDIATES[key]
+    lines = list(lines)
+    for i, (address, text) in enumerate(lines):
+        if text.startswith("addmi"):
+            if address not in immediates:
+                raise SystemExit(f"{name}: can't read the immediate of {text} at {address:#x}")
+            parts = [o.strip() for o in text.split(None, 1)[1].split(",")]
+            lines[i] = (address, f"addmi\t{parts[0]}, {parts[1]}, {immediates[address]}")
+    return lines
+
+
 def disassemble(path, name, extra=()):
     for candidate in PREFETCHED.get((path, tuple(extra)), []):
         if f"<{name}>:\n" in candidate:
             try:
-                return parse_disassembly(path, name, candidate)
+                return xtensa_addmi_immediates(path, name, extra, parse_disassembly(path, name, candidate))
             except SystemExit:
                 # Names at one address print their headers together and the body under the last of them:
                 # ask for this name alone, as a check without a prefetch does.
                 break
-    return parse_disassembly(path, name, disassembly(path, extra, (name,)))
+    return xtensa_addmi_immediates(path, name, extra, parse_disassembly(path, name, disassembly(path, extra, (name,))))
 
 
 def parse_disassembly(path, name, text):
@@ -123,23 +153,6 @@ def parse_disassembly(path, name, text):
         call = re.match(r"^callx(4|8|12)\s+(a\d+)$", lines[i][1])
         if load and call and load.group(1) == call.group(2):
             lines[i] = (lines[i][0], f"call{call.group(1)} 0x0 <{load.group(2)}>")
-    if "--mcpu=esp32" in extra and any(text.startswith("addmi") for _, text in lines):
-        # This LLVM's disassembler prints every addmi immediate as 0. Its value is the signed third byte (in units of
-        # 256, as the step function reads it), so take it from the instruction's bytes.
-        raw = subprocess.run([OBJDUMP, "-d", "--disassemble-symbols=" + name, *extra, path],
-                             capture_output=True, text=True, check=True).stdout
-        immediates = {}
-        for line in raw.splitlines():
-            m = re.match(r"^\s*([0-9a-f]+):\s+([0-9a-f]{2}) ([0-9a-f]{2}) ([0-9a-f]{2})\s+addmi\b", line)
-            if m:
-                byte = int(m.group(4), 16)
-                immediates[int(m.group(1), 16)] = byte - 256 if byte >= 128 else byte
-        for i, (address, text) in enumerate(lines):
-            if text.startswith("addmi"):
-                if address not in immediates:
-                    raise SystemExit(f"{name}: can't read the immediate of {text} at {address:#x}")
-                parts = [o.strip() for o in text.split(None, 1)[1].split(",")]
-                lines[i] = (address, f"addmi\t{parts[0]}, {parts[1]}, {immediates[address]}")
     if not lines:
         raise SystemExit(f"{name}: no such function in {path}")
     return lines
