@@ -2036,6 +2036,9 @@ def check_xtensa(lines, secret, pointers):
             )
             (state.add if value else state.discard)(dest)
             (state.add if pointer else state.discard)("ptr:" + dest)
+            # What was loaded is neither a frame address nor a known constant, whatever the register held before.
+            for tag in [x for x in state if x.startswith((f"sb:{dest}:", f"const:{dest}:", f"stackbase:{dest}"))]:
+                state.discard(tag)
             return frozenset(state)
         if FOLLOW["write_only"] and op == "s32c1i" and len(ops) > 1 and "ptr:" + ops[1] in state:
             # The compare-and-swap returns the old word in its first operand: a read of the memory.
@@ -2069,6 +2072,8 @@ def check_xtensa(lines, secret, pointers):
         if op == "l32r":
             state.discard(ops[0])
             state.discard("ptr:" + ops[0])
+            for tag in [x for x in state if x.startswith((f"sb:{ops[0]}:", f"const:{ops[0]}:", f"stackbase:{ops[0]}"))]:
+                state.discard(tag)
             return frozenset(state)
         if not ops:
             return frozenset(state)
