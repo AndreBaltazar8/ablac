@@ -62,5 +62,5 @@ expect_error notarget E_NAMED_ARGUMENT_TARGET
 expect_error inarray E_SUBPARSER_NAMED_ARGUMENT
 expect_error bare E_SUBPARSER_NAMED_ARGUMENT
 expect_error nested E_SUBPARSER_NAMED_ARGUMENT
-expect_error badname E_SUBPARSER_INVOCATION
+expect_error badname E_EVAL_EXPRESSION
 echo "subparser named arguments: reordered, skipped and mixed calls; every error at the site"
