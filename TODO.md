@@ -172,6 +172,9 @@
   Seeds 1011 to 1080 (every generator together, v0.2.52 compiler): no disagreement. Seventh growth (branch
   `fuzz-grow8`): `when` on ints (multi-value arms, `else`), strings and bools, nested `when`, and a subject
   with a side effect that must run once (`Acc.add`); seeds 1101 to 1140 agree in all six modes.
+  Eighth growth (branch `fuzz-grow9`): `abla/regex` capture groups (`hasGroup`, `groupStart`, `groupEnd`,
+  `group`, `matchFull`, replacement templates `$1`, `${1}x`, `$9`, `$$1`); seeds 1201 to 1240 agree in all
+  six modes.
 
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
