@@ -933,8 +933,19 @@
   rejects nothing and the case-folding comparison runs on nearly every candidate. The last-byte rejection filter
   the 2026-11-06 note tried (no clear throughput win at load 11) is a 10.4% cut in instructions per request here:
   `HttpRequest.header` compares `(last byte | 32)` first, 40,553 to 36,354 (parameters 12,055 to 12,005, plaintext
-  8,017 to 7,976), branch `http-header-filter` with `tests/cases/http-header-lookup`. The rest of the gap is the
-  parse (header objects and two substrings each) and the line-end search.
+  8,017 to 7,976), branch `http-header-filter` with `tests/cases/http-header-lookup`. A second cut, on branch
+  `http-parse`: a header value's line end is found by a loop over at most 48 bytes and by the shared search only
+  past it (the shared call costs about 150 instructions for a 12-byte value): headers-32 36,354 to 34,448
+  (-5.2%; -15.1% against master's 40,553 with the filter), parameters 12,012 to 11,903, plaintext 7,985 to
+  7,878 (alternating A/B, ±0.1% between runs), with the request-scan differential extended to line ends around
+  the 48-byte window. Profile after both: `httpParseRequest` 35.0% (now including that loop), `HttpRequest.header`
+  22.1% (about 47 instructions per candidate: array get, field loads and the size test, run for up to 32
+  candidates by five lookups), `textFindSequence` 10.4% (now the header-block end search in `httpEventFrame`, over
+  about 900 bytes), allocation about 12% (`HostAllocateGeneral` 7.1, `ObjectBlock` 3.4, `ArrayAppendGrowing`
+  2.0), `httpAsciiEqualInsensitive` 4.6% (the real matches and the filter's false positives). What is left is
+  structural: a header is an object with two substrings, and the lookup walks objects. A lowercase-name index built
+  on the first `header()` call costs about what the lookups it replaces cost at five lookups and more for fewer,
+  so it is not worth it; per-header laziness would change what `HttpRequest.headers` exposes. Stopping here.
 - [ ] **`abla-compare` one-worker parameter routing trails Zig** (2026-11-06):
   parameters measured 276,924 versus 308,076 requests/s. The locked abla-web
   `webNoEscapeRoute` and stdlib `HttpRouter` both use `httpMatchPath`; the
