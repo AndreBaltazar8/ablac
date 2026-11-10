@@ -668,6 +668,18 @@ real_entries_run
 orchestration_read "$out/x86.o"
 worker_read "$out/x86.o"
 division_read
+# The crypto allocation entry stays out of line in a release object: each export of the probe module, which reaches
+# the key and big-number allocations, calls the function in the section .text.abla_ct_allocate. (A function that
+# reaches no allocation must not pass, so the control is `main`.) x86-64 only: the other targets' objects come from
+# their drivers, and an unlinked Wasm module has no section to mark the entry.
+"$compiler" build "$cases/alloc-probe.ab" -o "$out/alloc-probe.o" --emit object --no-cache
+$check --expect-allocator x86_64 "$out/alloc-probe.o" probe_bignum_allocate: probe_aes_expand: > "$out/alloc-probe.log" 2>&1 || {
+    cat "$out/alloc-probe.log" >&2; echo "ct: the allocation entry is inlined or not called in a release object" >&2; exit 1
+}
+if $check --expect-allocator x86_64 "$out/alloc-probe.o" main: > "$out/alloc-probe-control.log" 2>&1; then
+    echo "ct: a function with no allocation was said to call the allocation entry" >&2; exit 1
+fi
+echo "ok   x86_64 release object: the crypto allocation entry is called out of line by the key and big-number paths (1 control)"
 header_read x86_64 x86_64-linux-gnu header-x86 "straddle8 straddle16 repstos" globstore
 header_read aarch64 aarch64-linux-gnu header-a64 "straddle bfi_move" globstore
 header_read wasm wasm32 header-wasm straddle globstore

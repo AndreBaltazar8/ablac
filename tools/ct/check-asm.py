@@ -46,7 +46,7 @@ def xtensa_literal_symbols(path):
 def disassemble(path, name, extra=()):
     text = subprocess.run(
         [OBJDUMP, "-d", "--no-show-raw-insn", "--disassemble-symbols=" + name, *extra,
-         *(["-r"] if "--mcpu=esp32" in extra else []), path],
+         *(["-r"] if not path.endswith(".wasm") else []), path],
         capture_output=True, text=True, check=True).stdout
     lines = []
     active = False
@@ -55,6 +55,14 @@ def disassemble(path, name, extra=()):
             active = line.endswith(f"<{name}>:")
             continue
         if active and line.strip():
+            other = re.match(r"^\s*[0-9a-f]+:\s+R_(?!XTENSA)\w+\s+(\S+)$", line)
+            if other:
+                # A relocation of an x86-64 or AArch64 object. The only one read is a call to the crypto allocation
+                # entry, which sits in a section of its own, so an unlinked object names it by that section.
+                target = re.sub(r"[+-]0x[0-9a-f]+$", "", other.group(1))
+                if target == ALLOCATOR_SECTION and lines and re.match(r"^(call|jmp|bl|b)\w*\s", lines[-1][1]):
+                    lines[-1] = (lines[-1][0], re.sub(r"<[^>]*>$", "", lines[-1][1]).rstrip() + f" <{target}>")
+                continue
             relocation = re.match(r"^\s*[0-9a-f]+:\s+R_XTENSA_\w+\s+(\S+)$", line)
             if relocation:
                 # A call in an unlinked Xtensa object names its callee by relocation, against the callee's section
@@ -267,6 +275,8 @@ def allocator_names(path):
         for group in by_place.values():
             if ALLOCATOR in group:
                 names |= group
+        if names:
+            names.add(ALLOCATOR_SECTION)  # an unlinked object's call names the entry by its section
         ALLOCATOR_NAMES[path] = names
     return ALLOCATOR_NAMES[path]
 
@@ -2246,13 +2256,28 @@ def main():
         if not names:
             print(f"FAIL {arch}: no {ALLOCATOR} symbol in the object")
             sys.exit(1)
+        def reaches(name, seen):
+            """Whether the function, or one it calls directly in this object, calls the entry."""
+            if name in seen or len(seen) > 64:
+                return False
+            seen.add(name)
+            try:
+                lines = wasm_export_lines(path, name) if arch == "wasm" else disassemble(
+                    path, name, ["--mcpu=esp32"] if arch == "xtensa" else [])
+            except SystemExit:
+                return False
+            callees = []
+            for _, text in lines:
+                m = re.match(r"^(?:call\w*|jmp\w*|bl|b|call(?:4|8|12))\s.*<([^>+]+)>$", text)
+                if m:
+                    if m.group(1) in names:
+                        return True
+                    callees.append(m.group(1))
+            return any(reaches(callee, seen) for callee in callees)
+
         for spec in specs:
             name = spec.partition(":")[0]
-            lines = wasm_export_lines(path, name) if arch == "wasm" else disassemble(
-                path, name, ["--mcpu=esp32"] if arch == "xtensa" else [])
-            calls = [text for _, text in lines if re.search(r"\b(call\w*|jmp\w*|bl|b|call[48]|call12)\b", text) and
-                     any(f"<{n}>" in text or f"<{n}+" in text or n in text.split() for n in names)]
-            if calls:
+            if reaches(name, set()):
                 print(f"ok   {arch} {name} calls the allocation entry out of line")
             else:
                 print(f"FAIL {arch} {name}: no call to the allocation entry")
