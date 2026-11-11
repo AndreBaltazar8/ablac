@@ -326,7 +326,7 @@
   (macOS, Wasm, Xtensa, libraries). **Libraries and objects (branch `coverage-android`):** a Linux shared library or object (no `main`) dumps from a
   private `.fini_array` entry (`llvm.global_dtors` is left as data by the library build) and exports a weak
   `abla_coverage_write(const char *path)` for a host that wants the list at a moment of its own (an Android app is
-  usually killed, never exits). A host with several flagged libraries asks each through `dlsym` on its own handle. Libc-free
+  usually killed, never exits). A host with several flagged libraries gets one list at process end through `ABLA_COVERAGE_OUT` (same pid, the last rename wins), so it calls each library's `abla_coverage_write` through `dlsym` on that library's own handle. The `.fini_array` entry is a constant pointer: drop `LLVMSetGlobalConstant` if a strict `-z text` Android link complains. The two-library test asserts only that they link and run. Libc-free
   targets are refused. **Open:** passing the flag through a nested `buildProgram` (abla-mobile builds NovaKind's Android
   object that way, so `--coverage-functions` on the outer command does not reach it): an `ABLA_COVERAGE_FUNCTIONS=1`
   environment variable or a `buildProgram` option, for abla-mobile and NovaKind to ask for; and the `abla.toml` key. Tests: `tools/test-coverage.sh`
