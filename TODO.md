@@ -238,6 +238,11 @@
   rounds and then appends 2000 strings to an array: segmentation fault. The drop check draws Generators only with `--open-bugs` until that is fixed (ablac-f3-2 saw the same class as the `test-labeled-loops` segfault of #736's
   first gate).
 
+  On master v0.2.55 after #736, focused resource-drop seeds 3041 to 3100 (24 checks each) agree in all six
+  modes. The generator also draws two borrowed temporaries passed to one call and a temporary in the right
+  side of a short-circuit condition; seeds 3101 to 3140 (24 checks each) agree in all six modes with those
+  additions. The recorded-case fuzzer suite passes with the same compiler.
+
 - **Evaluator: a jump on the right of `??` in a few more operand positions (#775 follow-up, ablac-52's review).**
   The evaluator now returns the jump before it assigns or chooses in assignments (plain, field, element and its
   index), unary `!`/`-`/`~`, the `if`/`while`/`do while` condition, the `when` subject, `||`, range ends, template
