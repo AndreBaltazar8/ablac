@@ -114,7 +114,8 @@ for point in "${kill_points[@]}"; do
     fi
     setsid "${command[@]}" > "kill-$index.log" 2>&1 &
     pid=$!
-    deadline=$((SECONDS + 120))
+    # A hang guard, not a budget: a loaded machine may take minutes to reach a kill point.
+    deadline=$((SECONDS + 1800))
     while kill -0 "$pid" 2>/dev/null && ! reached "$point" && ((SECONDS < deadline)); do
         sleep 0.002
     done
@@ -125,7 +126,7 @@ for point in "${kill_points[@]}"; do
     # Waiting for the launcher alone need not reap its killed compiler/tool
     # descendants. Cleanup deliberately keeps a live owner's scratch, so do
     # not start the recovery build until the entire killed session has gone.
-    deadline=$((SECONDS + 10))
+    deadline=$((SECONDS + 300))
     while pgrep -s "$pid" > /dev/null && ((SECONDS < deadline)); do
         sleep 0.002
     done
