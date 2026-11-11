@@ -267,6 +267,12 @@
   default-mix seeds 3521 to 3540 (24 checks each) agreed in all six modes on master 83d65574; the tool's
   test suite passed too. Nested generator-machine sources and temporary owners remain outside these shapes.
 
+  After #784, `nested_generator_check` draws a live owner's field or indexed generator inside an outer
+  generator, including conditional borrowed/fresh sources, inner breaks and outer drops while suspended.
+  Focused seeds 3601 to 3620 (480 checks) agree in all six modes on master fbd02092; the tool suite passes.
+  Temporary owner projections remain excluded pending #788. Before this addition, default seeds 3541 to
+  3580 (960 checks) agreed in all six modes on the same compiler.
+
 - **Evaluator: jumps on the right of `??` in operand positions (#775 follow-up).**
   `truncate` and both `slice` bounds propagate jumps, as do the covered compiler intrinsic argument reads, before
   the call can consume the value or evaluate a later argument. The action journal closes abandoned calls;
