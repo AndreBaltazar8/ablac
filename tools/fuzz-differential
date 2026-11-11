@@ -23,6 +23,7 @@ Exit status 0 when every mode agreed.
 """
 import argparse
 import concurrent.futures
+import json
 import os
 import re
 import random
@@ -418,6 +419,64 @@ class Gen:
         lines.append("    out")
         lines.append("}")
         return lines, f"c{index}()", "str"
+
+    def json_check(self, index):
+        """Python oracle: insertion order, compact UTF-8, integers only; no floats or lone surrogates."""
+        r = self.r
+
+        def value(depth):
+            if depth and r.random() < 0.55:
+                if r.choice([True, False]):
+                    return [value(depth - 1) for _ in range(r.randrange(4))]
+                keys = r.sample(["alpha", "z", "é", "q\"", "line"], r.randrange(4))
+                return {key: value(depth - 1) for key in keys}
+            return r.choice([None, True, False, r.randint(-1000000, 1000000),
+                             "", "hé😀", 'quote"slash\\', "line\n\t\x01", "$name"])
+
+        def literal(text):
+            # Abla string literal, preserving bytes and escaping interpolation.
+            out = '"'
+            for c in text:
+                if c in '\\"$': out += '\\' + c
+                elif ord(c) < 32: out += f'\\x{ord(c):02x}'
+                else: out += c
+            return out + '"'
+
+        def construct(v):
+            if v is None: return 'jsonNull()'
+            if isinstance(v, bool): return 'jsonBoolean(' + str(v).lower() + ')'
+            if isinstance(v, int): return f'jsonInteger({v})'
+            if isinstance(v, str): return 'jsonString(' + literal(v) + ')'
+            if isinstance(v, list): return 'jsonArray([' + ', '.join(construct(x) for x in v) + '])'
+            return ('jsonObject([' + ', '.join(literal(k) for k in v) + '], [' +
+                    ', '.join(construct(x) for x in v.values()) + '])')
+
+        v = value(2)
+        text = json.dumps(v, ensure_ascii=r.choice([True, False]), separators=(', ', ': '))
+        expected = json.dumps(json.loads(text), ensure_ascii=False, separators=(',', ':'))
+        # Root depth is 1: 63 nested arrays put the scalar at the default limit 64.
+        malformed = ['[1,', '"\\q"', '"\\uD800"', '"\\uDC00"', '{"a":1,"a":2}']
+        bad = r.choice(malformed + ['depth'])
+        lines = [f'fun c{index}(): string {{', f'    val parsed = jsonParse({literal(text)})',
+                 f'    val expected = {literal(expected)}',
+                 '    if (!parsed.succeeded || jsonStringify(parsed.value) != expected) return "FUZZ_ORACLE_FAILURE"',
+                 f'    val built = {construct(v)}',
+                 '    if (jsonStringify(built) != expected) return "FUZZ_ORACLE_FAILURE"']
+        if bad == 'depth':
+            at_limit = '[' * 63 + '0' + ']' * 63
+            over_limit = '[' * 64 + '0' + ']' * 64
+            depth_expected = json.dumps(json.loads(at_limit), ensure_ascii=False, separators=(',', ':'))
+            lines += [f'    val atLimit = jsonParse({literal(at_limit)})',
+                      f'    if (!atLimit.succeeded || jsonStringify(atLimit.value) != {literal(depth_expected)}) return "FUZZ_ORACLE_FAILURE"',
+                      f'    val invalid = jsonParse({literal(over_limit)})',
+                      '    if (invalid.succeeded || invalid.error.code != "depth_limit") return "FUZZ_ORACLE_FAILURE"']
+        else:
+            lines += [f'    val invalid = jsonParse({literal(bad)})',
+                      '    if (invalid.succeeded) return "FUZZ_ORACLE_FAILURE"']
+            if bad.startswith('{'):
+                lines.append('    if (invalid.error.code != "duplicate_key") return "FUZZ_ORACLE_FAILURE"')
+        lines += ['    "ok:" + expected', '}']
+        return lines, f'c{index}()', 'str'
 
     def gzip_check(self, index):
         """Check bounded gzip round trips and their exact output limit."""
@@ -967,6 +1026,7 @@ import "abla/regex"
 import "abla/text"
 import "abla/bytes"
 import "abla/compression/gzip"
+import "abla/json"
 import "abla/compiler"
 
 class Box<T>(var value: T) {
@@ -1475,7 +1535,8 @@ fun <T, U> crossed(a: T, b: U): Pair<U, T> = Pair(b, a)
             return r.choice([self.deep_generic_check, self.deep_iface_check, self.deep_nullable_check,
                              self.any_check, self.clash_check,
                              self.generic_lambda_check, self.resource_drop_check,
-                             self.elvis_member_check, self.gzip_check, self.nested_generator_check])(index)
+                             self.elvis_member_check, self.gzip_check, self.nested_generator_check,
+                             self.json_check])(index)
         extra = r.random()
         if extra < 0.30:
             return r.choice([self.conv_check, self.generic_check, self.iface_check,
@@ -1671,7 +1732,7 @@ def run_panic(runner, seed, keep):
         stdout, code, err = value
         if stdout != "before\n" or code != 101 or not (err and err[0].startswith("panic")):
             absolute.append(f"{mode}: stdout {stdout!r}, status {code}, stderr {err}")
-    bad = verdict({m: v[:2] for m, v in results.items()})
+    bad = verdict({m: v[:2] for m, v in results.items()}, allow_nonzero=True)
     if bad is None and absolute:
         bad = "all modes agree but do not panic as specified: " + "; ".join(absolute)
     if bad is None and not keep:
@@ -1679,12 +1740,14 @@ def run_panic(runner, seed, keep):
     return None if bad is None else f"panic ({name}), seed {seed}: {bad}"
 
 
-def verdict(results):
+def verdict(results, allow_nonzero=False):
     """None when every mode agrees, else a short description."""
     for mode, value in results.items():
+        if value[0] != "build-failed" and value[1] != 0 and not allow_nonzero:
+            return f"{mode}: exited with status {value[1]}"
         if value[0] != "build-failed" and any(line.partition("=")[2] == "FUZZ_ORACLE_FAILURE"
                                                for line in value[0].splitlines()):
-            return f"{mode}: round-trip oracle failed"
+            return f"{mode}: result oracle failed"
     distinct = {}
     for mode, value in results.items():
         distinct.setdefault(repr(value), []).append(mode)
@@ -1770,6 +1833,8 @@ def selftest():
     """The comparison itself: agreeing results pass, any difference is reported."""
     same = {m: ("c0=1\nc1=2\n", 0) for m in ("fast", "release", "ct", "wasm")}
     assert verdict(same) is None
+    crashed = {m: ("", 101) for m in same}
+    assert verdict(crashed) is not None and verdict(crashed, allow_nonzero=True) is None
     broken_roundtrip = {m: ("c0=FUZZ_ORACLE_FAILURE\n", 0) for m in same}
     assert verdict(broken_roundtrip) is not None and differing_lines(broken_roundtrip) == ["c0"]
     other = dict(same)

@@ -271,6 +271,14 @@
   Temporary owner projections remain excluded pending #788. Before this addition, default seeds 3541 to
   3580 (960 checks) agreed in all six modes on the same compiler.
 
+  `json_check` draws small nested values and tests both parse/stringify and directly built values against
+  Python-generated expectations. It preserves insertion order and uses compact UTF-8, integer-only JSON;
+  floats, non-finite numbers and lone surrogate values are excluded from valid inputs. It checks truncated
+  input, bad escapes, lone surrogates, duplicate keys (rejected by default), and depths 64 and 65. Focused
+  seeds 4321 to 4340 (8 checks each), focused seeds 4361 to 4362 (24 each), and default seeds 4341 to 4360
+  (24 each) agreed in all six modes on compiler fbd02092. The tool suite and wrong-expectation control passed;
+  unanimous nonzero exits now fail the comparison instead of masquerading as agreement.
+
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
 - [ ] **Abla-native Xtensa companion installer.** The explicit optional installer uses only the Python
