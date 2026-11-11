@@ -66,6 +66,18 @@ pad=$(printf './%.0s' $(seq 1 2040))
 "$compiler" build tests/cases/coverage/ct.ab -o "$out/ct" --fast --coverage-functions
 ABLA_COVERAGE_OUT="$out/ct.txt" ABLA_COVERAGE_TEST=1 "$out/ct" || true
 grep -qx 'tests/cases/coverage/ct.ab' "$out/ct.txt" || { echo "coverage: the compile-time fixture's list is wrong"; exit 1; }
+# A shared library: the host asks for the list through abla_coverage_write, and it also dumps when the process ends.
+"$compiler" build tests/cases/coverage-lib/lib.ab --emit shared-library -o "$out/libcov.so" --fast --coverage-functions
+clang tests/cases/coverage-lib/caller.c -L"$out" -lcov -Wl,-rpath,"$out" -o "$out/libcaller"
+"$out/libcaller" "$out/lib-write.txt"
+grep -qx 'tests/cases/coverage-lib/lib.ab' "$out/lib-write.txt" && grep -qx 'tests/cases/coverage-lib/sub/helper.ab' "$out/lib-write.txt" \
+    || { echo "coverage: the library's list is wrong"; cat "$out/lib-write.txt"; exit 1; }
+ABLA_COVERAGE_OUT="$out/lib-exit.txt" "$out/libcaller"
+grep -qx 'tests/cases/coverage-lib/sub/helper.ab' "$out/lib-exit.txt" || { echo "coverage: the library did not dump when the process ended"; exit 1; }
+# Two flagged libraries in one host: no duplicate symbols (only the weak writer is visible), both run.
+"$compiler" build tests/cases/coverage-lib/lib2.ab --emit shared-library -o "$out/libcovtwo.so" --fast --coverage-functions
+clang tests/cases/coverage-lib/caller2.c -L"$out" -lcov -lcovtwo -Wl,-rpath,"$out" -o "$out/libcaller2"
+"$out/libcaller2"
 # Refused where it does not apply.
 if "$compiler" build "$fixture" -o "$out/refused" --fast --coverage-functions --target-triple wasm32-unknown-unknown --object-format wasm --emit object > "$out/refused.log" 2>&1; then
     echo "coverage: wasm accepted the flag"; exit 1

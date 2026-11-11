@@ -323,8 +323,13 @@
   have, without a list). A fork without exec inherits the once flag, so the child dumps its own copy under its pid,
   which is what `%p` is for. The store is made before optimization, so an inlined body keeps it. Per file rather than per function: the consumer wants files, a per-function table would need a function-to-file table in every flagged binary, and the output (sorted, deduplicated paths) does not change if it becomes per-function later. `--coverage-functions`
   bypasses the build caches; any target but a hosted Linux executable is refused with `E_COVERAGE_TARGET`
-  (macOS, Wasm, Xtensa, libraries). **Not built: the Android shared library** (needs the `.fini_array` entry and an
-  exported dump; tracked as the remaining part of #756) and the `abla.toml` key. Tests: `tools/test-coverage.sh`
+  (macOS, Wasm, Xtensa, libraries). **Libraries and objects (branch `coverage-android`):** a Linux shared library or object (no `main`) dumps from a
+  private `.fini_array` entry (`llvm.global_dtors` is left as data by the library build) and exports a weak
+  `abla_coverage_write(const char *path)` for a host that wants the list at a moment of its own (an Android app is
+  usually killed, never exits). A host with several flagged libraries asks each through `dlsym` on its own handle. Libc-free
+  targets are refused. **Open:** passing the flag through a nested `buildProgram` (abla-mobile builds NovaKind's Android
+  object that way, so `--coverage-functions` on the outer command does not reach it): an `ABLA_COVERAGE_FUNCTIONS=1`
+  environment variable or a `buildProgram` option, for abla-mobile and NovaKind to ask for; and the `abla.toml` key. Tests: `tools/test-coverage.sh`
   (files at main's return, `exit(3)`, `panic`, `%p`, nothing when the variable is unset or the flag is off, SIGTERM 143,
   SIGKILL leaves neither file nor `.tmp`, macOS and raw Wasm refused). Flag off: `--emit-llvm` of fib, maps, trees and
   strings is identical to the base compiler's apart from the sysroot path inside `abla.source` attributes. Flag on

@@ -201,6 +201,9 @@ fun bootstrapLlvmCoverageEmitDump(backend: BootstrapLlvmBackend): void {
     val dumpType = bootstrapLlvmFunctionType(backend, backend.voidType, [])
     val dump = LLVMAddFunction(backend.module, "abla_coverage_dump", dumpType)
     LLVMSetLinkage(dump, llvmInternalLinkage())
+    val writerType = bootstrapLlvmFunctionType(backend, backend.voidType, [backend.pointerType])
+    val writer = LLVMAddFunction(backend.module, "abla_coverage_write", writerType)
+    LLVMSetLinkage(writer, llvmInternalLinkage())
     val done = LLVMAddGlobal(backend.module, backend.i32Type, "abla_coverage_done")
     LLVMSetInitializer(done, LLVMConstInt(backend.i32Type, 0, 0))
     LLVMSetLinkage(done, llvmInternalLinkage())
@@ -238,8 +241,6 @@ fun bootstrapLlvmCoverageEmitDump(backend: BootstrapLlvmBackend): void {
     LLVMPositionBuilderAtEnd(b, named)
     val bufferType = LLVMArrayType2(backend.i8Type, 4096)
     val buffer = LLVMBuildAlloca(b, bufferType, "cov.path")
-    val temporaryType = LLVMArrayType2(backend.i8Type, 4112)
-    val temporary = LLVMBuildAlloca(b, temporaryType, "cov.tmp")
     val marker = LLVMBuildGlobalStringPtr(b, "%p", "cov.marker")
     val found = bootstrapLlvmCoverageCall(backend, "strstr", ptr, [ptr, ptr], false, [out, marker])
     LLVMBuildCondBr(b, LLVMBuildICmp(b, llvmIntEqual(), found, LLVMConstNull(ptr), "cov.plain"),
@@ -270,40 +271,8 @@ fun bootstrapLlvmCoverageEmitDump(backend: BootstrapLlvmBackend): void {
         LLVMConstInt(i32,
             4096, 0), "cov.long.template"), leave, open)
     LLVMPositionBuilderAtEnd(b, open)
-    // The pid is in the temporary's name: two processes writing one path (no `%p`) never share a file.
-    val tmpFormat = LLVMBuildGlobalStringPtr(b, "%s.tmp.%d", "cov.tmp.format")
-    bootstrapLlvmCoverageCall(backend, "snprintf", i32, [ptr, i64, ptr], true, [
-        temporary, LLVMConstInt(i64, 4112, 0), tmpFormat, buffer,
-        bootstrapLlvmCoverageCall(backend, "getpid", i32, [], false, [])
-    ])
-    val descriptor = bootstrapLlvmCoverageCall(backend, "open", i32, [ptr, i32], true, [
-        temporary, LLVMConstInt(i32, 577, 0), LLVMConstInt(i32, 420, 0)
-    ])
-    val writeStart = LLVMAppendBasicBlockInContext(ctx, dump, "write.start")
-    LLVMBuildCondBr(b, LLVMBuildICmp(b, llvmIntSignedLessThan(), descriptor, LLVMConstInt(i32, 0,
-        0), "cov.nofile"), leave, writeStart)
-    LLVMPositionBuilderAtEnd(b, writeStart)
-    var slot = 0
-    while (slot < bootstrapLlvmCoverageNames.size) {
-        val line = "${bootstrapLlvmCoverageNames[slot]}\n"
-        val hit = LLVMBuildLoad2(b, backend.i8Type, bootstrapLlvmArrayElement(
-            backend, bootstrapLlvmCoverageHitsType, bootstrapLlvmCoverageHits, slot, "cov.read"
-        ), "cov.hit")
-        val writeBlock = LLVMAppendBasicBlockInContext(ctx, dump, "write")
-        val nextBlock = LLVMAppendBasicBlockInContext(ctx, dump, "next")
-        LLVMBuildCondBr(b, LLVMBuildICmp(b, llvmIntNotEqual(), hit, LLVMConstInt(backend.i8Type, 0,
-            0), "cov.ran"), writeBlock, nextBlock)
-        LLVMPositionBuilderAtEnd(b, writeBlock)
-        bootstrapLlvmCoverageCall(backend, "write", i64, [i64, ptr, i64], false, [
-            LLVMBuildSExt(b, descriptor, i64, "cov.fd"), LLVMBuildGlobalStringPtr(b, line,
-                "cov.path.text"), LLVMConstInt(i64, line.size, 0)
-        ])
-        LLVMBuildBr(b, nextBlock)
-        LLVMPositionBuilderAtEnd(b, nextBlock)
-        slot = slot + 1
-    }
-    bootstrapLlvmCoverageCall(backend, "close", i32, [i32], false, [descriptor])
-    bootstrapLlvmCoverageCall(backend, "rename", i32, [ptr, ptr], false, [temporary, buffer])
+    bootstrapLlvmCoverageCall(backend, "abla_coverage_write", backend.voidType, [ptr], false,
+        [buffer])
     LLVMBuildBr(b, leave)
     LLVMPositionBuilderAtEnd(b, leave)
     val release = LLVMBuildStore(b, LLVMConstInt(i32, 1, 0), finished)
@@ -341,6 +310,50 @@ fun bootstrapLlvmCoverageEmitDump(backend: BootstrapLlvmBackend): void {
     LLVMPositionBuilderAtEnd(b, loserExit)
     LLVMBuildRetVoid(b)
 
+    // The writer: the list to `<path>.tmp.<pid>`, then a rename over `<path>`. Callable on its own.
+    val writerEntry = LLVMAppendBasicBlockInContext(ctx, writer, "entry")
+    val writerLeave = LLVMAppendBasicBlockInContext(ctx, writer, "leave")
+    LLVMPositionBuilderAtEnd(b, writerEntry)
+    val target = LLVMGetParam(writer, i32(0))
+    val temporary = LLVMBuildAlloca(b, LLVMArrayType2(backend.i8Type, 4112), "cov.tmp")
+    // The pid is in the temporary's name: two processes writing one path (no `%p`) never share a file.
+    val tmpFormat = LLVMBuildGlobalStringPtr(b, "%s.tmp.%d", "cov.tmp.format")
+    bootstrapLlvmCoverageCall(backend, "snprintf", i32, [ptr, i64, ptr], true, [
+        temporary, LLVMConstInt(i64, 4112, 0), tmpFormat, target,
+        bootstrapLlvmCoverageCall(backend, "getpid", i32, [], false, [])
+    ])
+    val descriptor = bootstrapLlvmCoverageCall(backend, "open", i32, [ptr, i32], true, [
+        temporary, LLVMConstInt(i32, 577, 0), LLVMConstInt(i32, 420, 0)
+    ])
+    val writeStart = LLVMAppendBasicBlockInContext(ctx, writer, "write.start")
+    LLVMBuildCondBr(b, LLVMBuildICmp(b, llvmIntSignedLessThan(), descriptor, LLVMConstInt(i32, 0,
+        0), "cov.nofile"), writerLeave, writeStart)
+    LLVMPositionBuilderAtEnd(b, writeStart)
+    var slot = 0
+    while (slot < bootstrapLlvmCoverageNames.size) {
+        val line = "${bootstrapLlvmCoverageNames[slot]}\n"
+        val hit = LLVMBuildLoad2(b, backend.i8Type, bootstrapLlvmArrayElement(
+            backend, bootstrapLlvmCoverageHitsType, bootstrapLlvmCoverageHits, slot, "cov.read"
+        ), "cov.hit")
+        val writeBlock = LLVMAppendBasicBlockInContext(ctx, writer, "write")
+        val nextBlock = LLVMAppendBasicBlockInContext(ctx, writer, "next")
+        LLVMBuildCondBr(b, LLVMBuildICmp(b, llvmIntNotEqual(), hit, LLVMConstInt(backend.i8Type, 0,
+            0), "cov.ran"), writeBlock, nextBlock)
+        LLVMPositionBuilderAtEnd(b, writeBlock)
+        bootstrapLlvmCoverageCall(backend, "write", i64, [i64, ptr, i64], false, [
+            LLVMBuildSExt(b, descriptor, i64, "cov.fd"), LLVMBuildGlobalStringPtr(b, line,
+                "cov.path.text"), LLVMConstInt(i64, line.size, 0)
+        ])
+        LLVMBuildBr(b, nextBlock)
+        LLVMPositionBuilderAtEnd(b, nextBlock)
+        slot = slot + 1
+    }
+    bootstrapLlvmCoverageCall(backend, "close", i32, [i32], false, [descriptor])
+    bootstrapLlvmCoverageCall(backend, "rename", i32, [ptr, ptr], false, [temporary, target])
+    LLVMBuildBr(b, writerLeave)
+    LLVMPositionBuilderAtEnd(b, writerLeave)
+    LLVMBuildRetVoid(b)
+
     // The signal handler: dump, restore the default action, raise the signal again.
     val handlerType = bootstrapLlvmFunctionType(backend, backend.voidType, [i32])
     val handler = LLVMAddFunction(backend.module, "abla_coverage_signal", handlerType)
@@ -376,5 +389,33 @@ fun bootstrapLlvmCoverageCallDump(backend: BootstrapLlvmBackend): void {
         backend.builder, bootstrapLlvmFunctionType(backend, backend.voidType, []), dump,
         nativeNullPointer(), i32(0), ""
     )
+    return
+}
+
+/** A shared library or object has no `main` and no process exit of its own: the dump runs from its
+ *  destructors (a `.fini_array` entry: libc's `exit` and `dlclose`), and `abla_coverage_write(path)` is
+ *  exported for a host that wants the list at a moment of its own (an Android app is usually killed). */
+fun bootstrapLlvmCoverageRegisterLibrary(backend: BootstrapLlvmBackend): void {
+    if (!bootstrapLlvmCoverage) return
+    val dump = LLVMGetNamedFunction(backend.module, "abla_coverage_dump")
+    // Only the writer is visible, and weak: a host with two flagged objects links (the first one's list
+    // answers; a host with several flagged shared libraries asks each through dlsym on its own handle).
+    // The dump itself and its `.fini_array` entry stay private to their module.
+    LLVMSetLinkage(LLVMGetNamedFunction(backend.module, "abla_coverage_write"), i32(5))
+    // A pointer in `.fini_array`: libc's `exit` and `dlclose` run it. (An `llvm.global_dtors` table is
+    // left as data by the library build here, so the section is named directly.)
+    val entry = LLVMAddGlobal(backend.module, backend.pointerType, "abla_coverage_fini")
+    LLVMSetInitializer(entry, dump)
+    LLVMSetSection(entry, ".fini_array")
+    LLVMSetGlobalConstant(entry, i32(1))
+    LLVMSetLinkage(entry, llvmPrivateLinkage())
+    val used = llvmPointerVector(1)
+    used.set(0, entry)
+    val usedTable = LLVMAddGlobal(backend.module, LLVMArrayType2(backend.pointerType, 1),
+        "llvm.compiler.used")
+    LLVMSetInitializer(usedTable, LLVMConstArray2(backend.pointerType, used.pointer(), 1))
+    LLVMSetLinkage(usedTable, llvmAppendingLinkage())
+    LLVMSetSection(usedTable, "llvm.metadata")
+    used.drop()
     return
 }
