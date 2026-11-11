@@ -22,7 +22,11 @@ run_case() {
     [[ ! -e "$dir/temp-regular" && ! -e "$dir/temp-directory" ]]
 }
 dir=$(mktemp -d "$out/real.XXXXXXXX")
-trap 'rm -rf "$dir" "${memory_dir:-}"' EXIT
+cleanup() {
+    rm -rf "$dir"
+    if [[ -n ${memory_dir:-} ]]; then rm -rf "$memory_dir"; fi
+}
+trap cleanup EXIT
 run_case "$dir"
 if [[ $(uname -s) == Linux ]]; then
     [[ -d /dev/shm && -w /dev/shm ]] || { echo 'secure-fs: writable tmpfs /dev/shm required' >&2; exit 1; }
