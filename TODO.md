@@ -274,7 +274,12 @@
   (16.6x wall / 17.1x instructions); a 4,843,520-byte tar of ablac src (896,025-byte gzip -6) took 64.2 ms /
   1123.7M versus gzip 7.2 ms / 64.0M (8.9x / 17.5x). Wall medians are five process runs, instruction medians
   four `perf stat -e cpu_core/instructions/u` runs; both include process startup and reading input. Abla materializes
-  the result in memory while gzip writes to /dev/null. Tests: `tools/test-gzip-inflate.sh`.
+  the result in memory while gzip writes to /dev/null. Tests: `tools/test-gzip-inflate.sh`. The read-only
+  `abla/archive/tar` reader now checks bounded ustar files/directories, paths, checksums and file-ancestor
+  conflicts; links and PAX/GNU extensions are unsupported. On the SHA-verified Linux companion (30,720,987-byte
+  gzip, 72,366,080-byte tar, 18 entries), a host `--fast` gzipDecompress + tarRead test peaked at 182,836 KiB
+  RSS and took 32.08 s (`/usr/bin/time` equivalent; one run, 2026-11-11). The optional cached-archive test is
+  `ABLA_TEST_XTENSA_COMPANION=<archive> tools/test-tar-reader.sh`; actual extraction and installer remain open.
 - [x] `abla/yaml` provides bounded Core-schema parsing, checked emission and comment/format-preserving path edits;
       see [docs/stdlib/yaml.md](docs/stdlib/yaml.md) and the synthetic provision-mail fixture. NovaKind can adopt it after release.
 

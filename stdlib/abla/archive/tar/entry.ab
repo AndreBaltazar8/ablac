@@ -1,0 +1,114 @@
+// Read-only, bounded POSIX ustar. File data remains in the retained input.
+import "abla/text"
+
+class TarLimits(
+    val maxArchiveBytes: int,
+    val maxEntries: int,
+    val maxFileBytes: int,
+    val maxTotalFileBytes: int
+)
+class TarEntry(val path: string, val kind: string, val mode: int, val offset: int, val size: int)
+class TarReadResult(val input: string, val entries: array<TarEntry>, val error: string)
+
+private fun tarError(error: string): TarReadResult = TarReadResult("", [], error)
+
+// -1 indicates invalid octal, overflow, or non-padding characters.
+private fun tarOctal(input: string, start: int, width: int): int {
+    var result = 0
+    var i = start
+    val end = start + width
+    while (i < end && (input[i] == 0 || input[i] == 32)) i += 1
+    var seen = false
+    while (i < end && input[i] >= 48 && input[i] <= 55) {
+        val digit = input[i] - 48
+        if (result > (9223372036854775807 - digit) / 8) return -1
+        result = result * 8 + digit
+        seen = true
+        i += 1
+    }
+    while (i < end) {
+        if (input[i] != 0 && input[i] != 32) return -1
+        i += 1
+    }
+    if (seen) result else 0
+}
+
+private fun tarField(input: string, start: int, width: int): string {
+    var end = start
+    while (end < start + width && input[end] != 0) end += 1
+    input.slice(start, end)
+}
+
+// Empty or dot components collapse; absolute paths and every parent component are refused.
+private fun tarPath(path: string): string {
+    if (path.size == 0 || path[0] == 47) return ""
+    val parts: array<string> = []
+    for (part in path.split("/")) {
+        if (part == "..") return ""
+        if (part != "" && part != ".") parts.append(part)
+    }
+    if (parts.size == 0) "." else parts.join("/")
+}
+
+fun tarRead(input: string, limits: TarLimits): TarReadResult {
+    if (limits.maxArchiveBytes < 0 || limits.maxEntries < 0 || limits.maxFileBytes < 0 ||
+        limits.maxTotalFileBytes < 0) return tarError("invalid")
+    if (input.size > limits.maxArchiveBytes) return tarError("limit")
+    val entries: array<TarEntry> = []
+    var total = 0
+    var pos = 0
+    while (true) {
+        if (pos > input.size - 512) return tarError("invalid")
+        var zero = true
+        var i = 0
+        while (i < 512) { if (input[pos + i] != 0) zero = false; i += 1 }
+        if (zero) {
+            if (pos > input.size - 1024) return tarError("invalid")
+            i = pos + 512
+            while (i < input.size) { if (input[i] != 0) return tarError("invalid"); i += 1 }
+            if (input.size % 512 != 0) return tarError("invalid")
+            return TarReadResult(input, entries, "")
+        }
+        val expected = tarOctal(input, pos + 148, 8)
+        if (expected < 0) return tarError("invalid")
+        var sum = 0
+        i = 0
+        while (i < 512) {
+            sum += if (i >= 148 && i < 156) 32 else input[pos + i]
+            i += 1
+        }
+        if (sum != expected) return tarError("invalid")
+        if (input.slice(pos + 257, pos + 263) != "ustar\0" ||
+            input.slice(pos + 263, pos + 265) != "00") return tarError("unsupported")
+        val mode = tarOctal(input, pos + 100, 8)
+        val uid = tarOctal(input, pos + 108, 8)
+        val gid = tarOctal(input, pos + 116, 8)
+        val size = tarOctal(input, pos + 124, 12)
+        val modified = tarOctal(input, pos + 136, 12)
+        if (mode < 0 || uid < 0 || gid < 0 || size < 0 || modified < 0) return tarError("invalid")
+        val type = input[pos + 156]
+        if (type != 0 && type != 48 && type != 53) return tarError("unsupported")
+        val kind = if (type == 53) "directory" else "file"
+        if (kind == "directory" && size != 0) return tarError("invalid")
+        val name = tarField(input, pos, 100)
+        val prefix = tarField(input, pos + 345, 155)
+        val path = tarPath(if (prefix == "") name else "$prefix/$name")
+        if (path == "" || (path == "." && kind != "directory")) return tarError("invalid")
+        for (entry in entries) {
+            if (entry.path == path ||
+                (entry.kind == "file" && path.startsWith("${entry.path}/")) ||
+                (kind == "file" && entry.path.startsWith("$path/"))) return tarError("invalid")
+        }
+        if (entries.size >= limits.maxEntries || size > limits.maxFileBytes ||
+            size > limits.maxTotalFileBytes - total) return tarError("limit")
+        pos += 512
+        if (size > input.size - pos) return tarError("invalid")
+        val padding = (512 - size % 512) % 512
+        if (padding > input.size - pos - size) return tarError("invalid")
+        i = pos + size
+        while (i < pos + size + padding) { if (input[i] != 0) return tarError("invalid"); i += 1 }
+        entries.append(TarEntry(path, kind, mode, pos, size))
+        total += size
+        pos += size + padding
+    }
+}
