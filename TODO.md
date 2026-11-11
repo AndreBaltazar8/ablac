@@ -270,7 +270,14 @@
 
 - [ ] **Abla-native Xtensa companion installer.** The explicit optional installer uses only the Python
   standard library until `abla/compression` can inflate gzip and read tar with bounded, safe extraction.
-  Move it to Abla once those archive primitives exist; keep checksum and manifest verification.
+  Move it to Abla once those archive primitives exist; keep checksum and manifest verification. `gzipDecompress`
+  now inflates a single member with a mandatory caller-provided output limit and CRC/ISIZE checks; tar extraction
+  and the Abla installer remain open. On 2026-11-11, one P-core, release host build: a 4,420,000-byte repetitive
+  input (12,921-byte gzip -6) took median 28.2 ms / 589.0M instructions versus gzip -dc 1.7 ms / 34.4M
+  (16.6x wall / 17.1x instructions); a 4,843,520-byte tar of ablac src (896,025-byte gzip -6) took 64.2 ms /
+  1123.7M versus gzip 7.2 ms / 64.0M (8.9x / 17.5x). Wall medians are five process runs, instruction medians
+  four `perf stat -e cpu_core/instructions/u` runs; both include process startup and reading input. Abla materializes
+  the result in memory while gzip writes to /dev/null. Tests: `tools/test-gzip-inflate.sh`.
 - [x] `abla/yaml` provides bounded Core-schema parsing, checked emission and comment/format-preserving path edits;
       see [docs/stdlib/yaml.md](docs/stdlib/yaml.md) and the synthetic provision-mail fixture. NovaKind can adopt it after release.
 

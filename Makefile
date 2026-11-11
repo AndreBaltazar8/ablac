@@ -160,6 +160,7 @@ test-serial: ablac
 	tools/test-arrays-dense.sh $(COMPILER)
 	tools/test-json-limits.sh $(COMPILER)
 	tools/test-yaml.sh $(COMPILER)
+	tools/test-gzip-inflate.sh $(COMPILER)
 	tools/test-deep-json.sh $(COMPILER)
 	tools/test-json-expressions.sh $(COMPILER)
 	tools/test-json-literal-diagnostics.sh $(COMPILER)

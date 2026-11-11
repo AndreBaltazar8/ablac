@@ -79,7 +79,7 @@ Built into the language rather than imported: `string`, arrays, `Map`,
 | `abla/http/async` | nonblocking HTTP(S) client driven by a poll loop |
 | `abla/http/tls` | certificate-verified HTTPS client transport |
 | `abla/http/json` | adapters between JSON values and HTTP requests/responses |
-| `abla/compression/gzip` | RFC gzip framing, CRC-32, and fixed-Huffman DEFLATE compression |
+| `abla/compression/gzip` | gzip compression and bounded single-member decompression; `gzipDecompress(input, maxOutputBytes)` returns data and an empty error on success, `limit` when output exceeds the limit, or `invalid` for malformed input (including trailing or concatenated members) |
 | `abla/tls/hosted` | dynamically loaded OpenSSL client/listener transport with hostname and certificate verification |
 | `abla/websocket` | bounded RFC 6455 handshake, framing, connection lifecycle, and routed server helpers |
 | `abla/websocket/client` | client masking keys |

@@ -218,3 +218,228 @@ fun gzipCompress(input: string, searchLimit: int = 1024): string {
     gzipAppendU32Little(output, input.size)
     output.toText()
 }
+
+// Exactly one gzip member; `error` is empty, "invalid", or "limit".
+class GzipDecompressResult(val data: string, val error: string)
+
+private class InflateReader(val input: string, var pos: int, var bits: int = 0, var count: int = 0,
+    var failed: bool = false)
+private fun InflateReader.read(count: int): int {
+    while (this.count < count) {
+        if (this.pos >= this.input.size) { this.failed = true; return 0 }
+        this.bits = this.bits | (this.input[this.pos] << this.count)
+        this.pos += 1
+        this.count += 8
+    }
+    val value = this.bits & ((1 << count) - 1)
+    this.bits = this.bits >>> count
+    this.count -= count
+    value
+}
+
+private class InflateTree(val counts: array<int>, val symbols: array<int>, val valid: bool)
+private fun inflateTree(lengths: array<int>, allowEmpty: bool, allowSingle: bool): InflateTree {
+    val counts = filledArray(16, 0)
+    for (length in lengths) {
+        if (length < 0 || length > 15) return InflateTree([], [], false)
+        if (length > 0) counts[length] += 1
+    }
+    var left = 1
+    var bits = 1
+    while (bits <= 15) {
+        left = left * 2 - counts[bits]
+        if (left < 0) return InflateTree([], [], false)
+        bits += 1
+    }
+    var used = 0
+    for (count in counts) used += count
+    if (used == 0) return InflateTree(counts, [], allowEmpty)
+    if (left != 0 && !(allowSingle && used == 1 && counts[1] == 1)) return InflateTree([], [],
+        false)
+    val offsets = filledArray(16, 0)
+    bits = 1
+    while (bits < 15) { offsets[bits + 1] = offsets[bits] + counts[bits]; bits += 1 }
+    val symbols = filledArray(used, 0)
+    var symbol = 0
+    while (symbol < lengths.size) {
+        val length = lengths[symbol]
+        if (length > 0) { symbols[offsets[length]] = symbol; offsets[length] += 1 }
+        symbol += 1
+    }
+    InflateTree(counts, symbols, true)
+}
+
+private fun inflateSymbol(var reader: InflateReader, tree: InflateTree): int {
+    var code = 0
+    var first = 0
+    var index = 0
+    var length = 1
+    while (length <= 15) {
+        code = code | reader.read(1)
+        if (reader.failed) return -1
+        val count = tree.counts[length]
+        if (code >= first && code - first < count) return tree.symbols[index + code - first]
+        index += count
+        first = (first + count) << 1
+        code = code << 1
+        length += 1
+    }
+    reader.failed = true
+    -1
+}
+
+private fun inflateFixedLiteral(): InflateTree {
+    val lengths = filledArray(288, 8)
+    var i = 144
+    while (i < 256) { lengths[i] = 9; i += 1 }
+    while (i < 280) { lengths[i] = 7; i += 1 }
+    while (i < 288) { lengths[i] = 8; i += 1 }
+    inflateTree(lengths, false, false)
+}
+private fun inflateFixedDistance(): InflateTree = inflateTree(filledArray(32, 5), false, false)
+private class InflateTrees(val literal: InflateTree, val distance: InflateTree, val valid: bool)
+private fun inflateDynamic(var reader: InflateReader): InflateTrees {
+    val empty = InflateTree([], [], false)
+    val nl = reader.read(5) + 257
+    val nd = reader.read(5) + 1
+    val nc = reader.read(4) + 4
+    if (reader.failed || nl > 286 || nd > 32) return InflateTrees(empty, empty, false)
+    val order = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+    val codes = filledArray(19, 0)
+    var i = 0
+    while (i < nc) { codes[order[i]] = reader.read(3); i += 1 }
+    if (reader.failed) return InflateTrees(empty, empty, false)
+    val tree = inflateTree(codes, false, false)
+    if (!tree.valid) return InflateTrees(empty, empty, false)
+    val lengths: array<int> = []
+    while (lengths.size < nl + nd && !reader.failed) {
+        val value = inflateSymbol(reader, tree)
+        if (value < 0) break
+        if (value <= 15) lengths.append(value)
+        else {
+            var repeat = 0
+            var previous = 0
+            if (value == 16) {
+                if (lengths.size == 0) return InflateTrees(empty, empty, false)
+                previous = lengths[lengths.size - 1]
+                repeat = reader.read(2) + 3
+            } else if (value == 17) repeat = reader.read(3) + 3
+            else if (value == 18) repeat = reader.read(7) + 11
+            else return InflateTrees(empty, empty, false)
+            if (reader.failed || repeat > nl + nd - lengths.size) return InflateTrees(empty, empty,
+                false)
+            while (repeat > 0) { lengths.append(previous); repeat -= 1 }
+        }
+    }
+    if (reader.failed || lengths.size != nl + nd || lengths[256] == 0) return InflateTrees(empty,
+        empty, false)
+    val lit: array<int> = []
+    val dist: array<int> = []
+    i = 0
+    while (i < lengths.size) { if (i < nl) lit.append(lengths[i]) else dist.append(lengths[i]); i +=
+            1 }
+    val literal = inflateTree(lit, false, true)
+    val distance = inflateTree(dist, true, true)
+    InflateTrees(literal, distance, literal.valid && distance.valid)
+}
+
+private fun gzipInvalid(): GzipDecompressResult = GzipDecompressResult("", "invalid")
+private fun gzipLittle(input: string, pos: int): int = input[pos] | (input[pos + 1] << 8) |
+    (input[pos + 2] << 16) | (input[pos + 3] << 24)
+
+// Supports exactly one member. Concatenated members and trailing bytes are rejected.
+fun gzipDecompress(input: string, maxOutputBytes: int): GzipDecompressResult {
+    if (maxOutputBytes < 0 || input.size < 18 || input[0] != 31 || input[1] != 139 ||
+        input[2] != 8 || (input[3] & 224) != 0) return gzipInvalid()
+    val flags = input[3]
+    var pos = 10
+    if ((flags & 4) != 0) {
+        if (pos > input.size - 2) return gzipInvalid()
+        val extra = input[pos] | (input[pos + 1] << 8)
+        pos += 2
+        if (extra > input.size - pos) return gzipInvalid()
+        pos += extra
+    }
+    if ((flags & 8) != 0) {
+        while (pos < input.size && input[pos] != 0) pos += 1
+        if (pos >= input.size) return gzipInvalid()
+        pos += 1
+    }
+    if ((flags & 16) != 0) {
+        while (pos < input.size && input[pos] != 0) pos += 1
+        if (pos >= input.size) return gzipInvalid()
+        pos += 1
+    }
+    if ((flags & 2) != 0) {
+        if (pos > input.size - 2) return gzipInvalid()
+        val expected = input[pos] | (input[pos + 1] << 8)
+        if ((gzipCrc32(input.slice(0, pos)) & 65535) != expected) return gzipInvalid()
+        pos += 2
+    }
+    val reader = InflateReader(input, pos)
+    val output = byteBuffer()
+    val window = filledArray(32768, 0)
+    var done = false
+    while (!done && !reader.failed) {
+        done = reader.read(1) == 1
+        val kind = reader.read(2)
+        if (reader.failed || kind == 3) return gzipInvalid()
+        if (kind == 0) {
+            reader.bits = 0
+            reader.count = 0
+            val length = reader.read(16)
+            val inverse = reader.read(16)
+            if (reader.failed || (length ^ 65535) != inverse) return gzipInvalid()
+            if (length > maxOutputBytes - output.size()) return GzipDecompressResult("", "limit")
+            var i = 0
+            while (i < length) {
+                val value = reader.read(8)
+                if (reader.failed) return gzipInvalid()
+                window[output.size() & 32767] = value
+                output.appendByteValue(value)
+                i += 1
+            }
+        } else {
+            val trees = if (kind == 1) InflateTrees(inflateFixedLiteral(), inflateFixedDistance(),
+                true) else inflateDynamic(reader)
+            if (!trees.valid) return gzipInvalid()
+            var ended = false
+            while (!ended && !reader.failed) {
+                val symbol = inflateSymbol(reader, trees.literal)
+                if (reader.failed) return gzipInvalid()
+                if (symbol < 256) {
+                    if (output.size() >= maxOutputBytes) return GzipDecompressResult("", "limit")
+                    window[output.size() & 32767] = symbol
+                    output.appendByteValue(symbol)
+                } else if (symbol == 256) ended = true
+                else {
+                    if (symbol > 285) return gzipInvalid()
+                    val index = symbol - 257
+                    val length = deflateLengthBases[index] + reader.read(deflateLengthExtras[index])
+                    if (reader.failed || trees.distance.symbols.size == 0) return gzipInvalid()
+                    val distanceSymbol = inflateSymbol(reader, trees.distance)
+                    if (reader.failed || distanceSymbol < 0 || distanceSymbol >=
+                        30) return gzipInvalid()
+                    val distance = deflateDistanceBases[distanceSymbol] +
+                        reader.read(deflateDistanceExtras[distanceSymbol])
+                    if (reader.failed || distance > output.size()) return gzipInvalid()
+                    if (length > maxOutputBytes - output.size()) return GzipDecompressResult("",
+                        "limit")
+                    var i = 0
+                    while (i < length) {
+                        val value = window[(output.size() - distance) & 32767]
+                        window[output.size() & 32767] = value
+                        output.appendByteValue(value)
+                        i += 1
+                    }
+                }
+            }
+            if (!ended) return gzipInvalid()
+        }
+    }
+    if (reader.failed || reader.pos != input.size - 8) return gzipInvalid()
+    val data = output.toText()
+    if (gzipLittle(input, reader.pos) != gzipCrc32(data) ||
+        gzipLittle(input, reader.pos + 4) != (data.size & 4294967295)) return gzipInvalid()
+    GzipDecompressResult(data, "")
+}
