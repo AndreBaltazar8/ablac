@@ -1961,6 +1961,44 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
 
 ## Tried, not pursued
 
+- **#762 serving compile-time action results from a record: correct, but 8-9% where 15% was the bar**
+  (2026-11-11, branches `action-record` / `action-serve` local, rebased copy `action-serve-m` at `f52deee5` on master `b404276a`; the
+  journal itself, step (a), is on master). Design: (a) an ordered journal of every compiler-API call an evaluation
+  made, with digests of arguments and answers (function handles by canonical identity plus number); (b1) a record per
+  evaluation under `ABLA_ACTION_RECORDS` (code key = structural syntax digest of the call and of each body entered,
+  positions excluded; the journal; the inputs read, with presence; the result), and a verdict on every build (first, hit
+  agrees, miss: code / N answers / input changed, DISAGREE keeps both records, `ABLA_ACTION_RECORDS_STRICT=1` fails the
+  build); (b2) `ABLA_ACTION_SERVE=1`: a sealed record answers an evaluation before it runs when the compiler binary digest, the
+  grants, an order-dependent skeleton of all declarations (names, signatures, kinds: a handle means what it meant), the full
+  code of every module entered, the inputs and the replayed pure queries are unchanged; only `compiler.transform` handlers
+  are served (a hit re-stages the recorded modules and re-records the inputs), only evaluations that ran clean, asked their
+  queries before staging, and made no effect but reading (any other effect, a staged-file read, a compile var or an
+  unknown value kind makes one unservable). Records must be mode 0700/0600 or are not read or written. Correctness
+  evidence: served builds are byte-identical to unserved ones (NovaKind 9c62c61b copy: unchanged rebuild, body edit, locale
+  edit; small tests compare the executable and the build's diagnostics), 34 NovaKind builds with zero DISAGREE (30
+  unchanged, touched-identical files, an unrelated and a relevant environment variable), the corpus (27 evaluations) and the
+  edit matrix (body edit: hit; `@server` signature or a function added before: miss; locale edit: Catalog misses on
+  `locales/en.json`); damaged records (cut at 11 places, one byte changed, forged version and count with a valid seal, a
+  directory or record open to others, another compiler, two builds writing at once, unset vs empty) are misses. Two
+  bugs found on the way: a DISAGREE on Catalog was the input list taking the build's own reads between actions (fixed:
+  reset at each outermost evaluation), and an unreadable compiler image would have shared one key (now no key).
+  Timing (NovaKind app.ab frontend only, `--emit-llvm` in its pinned tree, sampled instructions, 20 M per sample, release
+  builds, slot 3): unserved 15,763 / 15,870 / 15,665 / 15,897 samples (mean 15.79 k); first (recording) build 16,297 and
+  16,063 (+2.7%); served, unchanged: 14,450 / 14,529 / 14,393 / 14,485 (mean 14.46 k, **-8.4%**); body edit unserved 15,668 /
+  15,876 against served 14,371 / 14,349 (**-9.1%**). Before the fixes below the recording build was +63% and the served one
+  +51%. What cost: each handle digest asked `compilerFindFunction`, a linear scan of every declaration building a string per
+  extension and method (thousands of handles x tens of thousands of declarations): an identity index built once per
+  evaluation took recording from +63% to +2.7% (appends joined once and the journal trace printed only on request did
+  not move it). Why it stops at 8-9%: in the plain frontend the evaluator's own symbols are about 13% of the
+  instructions, so even a free replay would not reach 15%; this build replays all 80,042 recorded queries of
+  `oneRemoteGenerate` on a hit, which costs about as much as asking them (the saving is the interpretation around the
+  queries). The other evaluations in the frontend are not servable (`parserAt` externs, value-returning `#` sites,
+  the lock write). Not measured: the switch-off path against master (instructions in noise was asked for). What would have to
+  change: a hit that trusts a digest of the reflected surface instead of replaying every query (every allowed query
+  would have to be shown a function of the skeleton plus annotation arguments, and `compilerBinding*` values of a module
+  that is not entered are not), and a larger share of the frontend inside served evaluations (the action's own file reads,
+  the JSON/parser evaluations). Nothing landed; the journal (a) stays.
+
 - **JSON ASCII word scans without a short-string fast path** (2026-11-06/07,
   published v0.2.48/v0.2.49). Scanning JSON strings a word at a time won 66-77%
   on json-strings-4k but cost short strings: an inlined scan lost 5.7% on
