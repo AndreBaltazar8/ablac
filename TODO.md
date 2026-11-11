@@ -354,9 +354,11 @@
   private `.fini_array` entry (`llvm.global_dtors` is left as data by the library build) and exports a weak
   `abla_coverage_write(const char *path)` for a host that wants the list at a moment of its own (an Android app is
   usually killed, never exits). A host with several flagged libraries gets one list at process end through `ABLA_COVERAGE_OUT` (same pid, the last rename wins), so it calls each library's `abla_coverage_write` through `dlsym` on that library's own handle. The `.fini_array` entry is a constant pointer: drop `LLVMSetGlobalConstant` if a strict `-z text` Android link complains. The two-library test asserts only that they link and run. Libc-free
-  targets are refused. **Open:** passing the flag through a nested `buildProgram` (abla-mobile builds NovaKind's Android
-  object that way, so `--coverage-functions` on the outer command does not reach it): an `ABLA_COVERAGE_FUNCTIONS=1`
-  environment variable or a `buildProgram` option, for abla-mobile and NovaKind to ask for; and the `abla.toml` key. Tests: `tools/test-coverage.sh`
+  targets are refused. **Nested builds (#781):** the outer `--coverage-functions` applies to supported recursive
+  `buildProgram` nodes, and bypasses each instrumented node's cache. An unsupported outer target is refused; an unsupported
+  child builds uninstrumented with a warning naming its program, target and artifact, because graphs may mix Android,
+  Wasm and host tools. Android hosts can call the object's weak `abla_coverage_write(path)` and retrieve the resulting file;
+  device retrieval still needs verification. The `abla.toml` key remains open. Tests: `tools/test-coverage.sh`
   (files at main's return, `exit(3)`, `panic`, `%p`, nothing when the variable is unset or the flag is off, SIGTERM 143,
   SIGKILL leaves neither file nor `.tmp`, macOS and raw Wasm refused). Flag off: `--emit-llvm` of fib, maps, trees and
   strings is identical to the base compiler's apart from the sysroot path inside `abla.source` attributes. Flag on

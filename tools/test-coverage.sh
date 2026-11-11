@@ -78,6 +78,24 @@ grep -qx 'tests/cases/coverage-lib/sub/helper.ab' "$out/lib-exit.txt" || { echo 
 "$compiler" build tests/cases/coverage-lib/lib2.ab --emit shared-library -o "$out/libcovtwo.so" --fast --coverage-functions
 clang tests/cases/coverage-lib/caller2.c -L"$out" -lcov -lcovtwo -Wl,-rpath,"$out" -o "$out/libcaller2"
 "$out/libcaller2"
+# A build graph mixes an object, a recursive host child and a Wasm module.
+# Build plain first to populate caches, then require coverage from every supported node.
+mkdir -p "$out/nested"
+"$compiler" build tests/cases/coverage-nested/outer.ab -o "$out/nested/plain" --fast > "$out/nested/plain.log" 2>&1
+clang tests/cases/coverage-lib/caller.c "$out/nested/libcov.o" -o "$out/nested/caller-plain" 2>/dev/null && { echo "coverage: unflagged library exported writer"; exit 1; }
+ABLA_COVERAGE_OUT="$out/nested/plain-child.txt" "$out/nested/child"
+[ ! -e "$out/nested/plain-child.txt" ] || { echo "coverage: unflagged child wrote a file"; exit 1; }
+"$compiler" build tests/cases/coverage-nested/outer.ab -o "$out/nested/flagged" --fast --coverage-functions > "$out/nested/flagged.log" 2>&1
+[ "$(grep -c 'warning\[W_COVERAGE_TARGET\].*coverage-wasm.*wasm32-module' "$out/nested/flagged.log")" = 1 ] || { cat "$out/nested/flagged.log"; echo "coverage: expected one child target warning"; exit 1; }
+nm "$out/nested/libcov.o" | grep -q " W abla_coverage_write$" || { echo "coverage: nested object missing weak writer"; exit 1; }
+clang tests/cases/coverage-lib/caller.c "$out/nested/libcov.o" -o "$out/nested/caller"
+"$out/nested/caller" "$out/nested/library.txt"
+grep -qx 'tests/cases/coverage-lib/sub/helper.ab' "$out/nested/library.txt" || { echo "coverage: nested library missing hits"; exit 1; }
+ABLA_COVERAGE_OUT="$out/nested/child.txt" "$out/nested/child"
+grep -qx 'tests/cases/coverage-nested/child.ab' "$out/nested/child.txt"
+ABLA_COVERAGE_OUT="$out/nested/grandchild.txt" "$out/nested/grandchild" return
+expect_ran "$out/nested/grandchild.txt"
+[ -s "$out/nested/host.wasm" ] || { echo "coverage: unsupported child not built"; exit 1; }
 # Refused where it does not apply.
 if "$compiler" build "$fixture" -o "$out/refused" --fast --coverage-functions --target-triple wasm32-unknown-unknown --object-format wasm --emit object > "$out/refused.log" 2>&1; then
     echo "coverage: wasm accepted the flag"; exit 1
