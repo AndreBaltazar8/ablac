@@ -1,0 +1,380 @@
+// Function coverage (`--coverage-functions`): which source files a program ran.
+//
+// A flagged hosted Linux executable gets one byte per source file that has an instrumented
+// function. Every such function stores 1 into its file's byte as its first act (a relaxed atomic
+// store: a plain `mov`, idempotent, safe from any thread; it is made before optimization, so an
+// inlined body keeps it). At exit the program writes the files whose byte is set, one path per
+// line in bytewise order, to the path `ABLA_COVERAGE_OUT` names (`%p` is the process id), through
+// `<path>.tmp` and a rename, so a reader never sees a partial file. Without the variable nothing
+// is written. The dump runs from `exit`, from the C `main`'s return and from SIGTERM, SIGINT and
+// SIGHUP; a program that blocks those signals (watchSignals) ends through its own `exit` or `main`
+// return. SIGKILL and an out-of-memory kill leave no file. A build without the flag contains none
+// of this.
+
+import "../../ir.ab"
+import "../../source_rewrite.ab"
+import "core.ab"
+import "analysis.ab"
+import "bindings.ab"
+import "abla/unsafe/memory/raw"
+import "abla/sys/linux/fs"
+
+var bootstrapLlvmCoverage: bool = false
+// The flag as the command line gave it, before the target decides whether it applies.
+var bootstrapLlvmCoverageRequested: bool = false
+// A raw source file index -> the byte slot of its path in the sorted table (-1: not covered).
+var bootstrapLlvmCoverageSlots: array<int> = []
+var bootstrapLlvmCoverageNames: array<string> = []
+var bootstrapLlvmCoverageHits: i64* = nativeNullPointer()
+var bootstrapLlvmCoverageHitsType: i64* = nativeNullPointer()
+
+/** `parts` without its last element (the compiler's own sources are built where `removeLast` is not available). */
+fun bootstrapLlvmCoverageWithoutLast(parts: array<string>): array<string> {
+    val shorter: array<string> = []
+    var at = 0
+    while (at + 1 < parts.size) {
+        shorter.append(parts[at])
+        at = at + 1
+    }
+    shorter
+}
+
+/** `path` as one stable name: no "./", no "x/../", the working directory's prefix dropped. */
+fun bootstrapLlvmCoverageName(path: string): string {
+    var text = path
+    val directory = currentDirectory().text
+    if (directory.size > 0 && text.size > directory.size + 1 &&
+        text.slice(0, directory.size) == directory && text[directory.size] == 47) {
+        text = text.slice(directory.size + 1, text.size)
+    }
+    var parts: array<string> = []
+    var start = 0
+    var index = 0
+    while (index <= text.size) {
+        if (index == text.size || text[index] == 47) {
+            val part = text.slice(start, index)
+            if (part == "..") {
+                if (parts.size > 0 && parts[parts.size - 1] != "..") parts =
+                    bootstrapLlvmCoverageWithoutLast(parts)
+                else parts.append(part)
+            } else if (part != "." && !(part == "" && index > 0 && parts.size >
+                0)) parts.append(part)
+            start = index + 1
+        }
+        index = index + 1
+    }
+    var result = ""
+    var part = 0
+    while (part < parts.size) {
+        result = if (part == 0) parts[part] else "$result/${parts[part]}"
+        part = part + 1
+    }
+    result
+}
+
+/** Decides the table: the files of the functions that carry a source position, sorted. */
+fun bootstrapLlvmCoveragePlan(program: BootstrapIrProgram): void {
+    val used: array<bool> = []
+    var file = 0
+    while (file < bootstrapIrSourceFiles.size) {
+        used.append(false)
+        file = file + 1
+    }
+    for (function in program.functions) {
+        val index = bootstrapIrSourcePositionFile(function.position)
+        if (index >= 0 && index < used.size && !function.naked && function.section == "" &&
+            !bootstrapLlvmRuntimeImplementation(function.name)) used[index] = true
+    }
+    val names: array<string> = []
+    file = 0
+    while (file < used.size) {
+        if (used[file]) {
+            val name = bootstrapLlvmCoverageName(bootstrapIrSourceFiles[file])
+            var known = false
+            for (existing in names) if (existing == name) known = true
+            if (!known) names.append(name)
+        }
+        file = file + 1
+    }
+    // Insertion sort by bytes (string < compares bytewise).
+    var next = 1
+    while (next < names.size) {
+        val value = names[next]
+        var at = next
+        while (at > 0 && value < names[at - 1]) {
+            names[at] = names[at - 1]
+            at = at - 1
+        }
+        names[at] = value
+        next = next + 1
+    }
+    bootstrapLlvmCoverageNames = names
+    val slots: array<int> = []
+    file = 0
+    while (file < used.size) {
+        var slot = -1
+        if (used[file]) {
+            val name = bootstrapLlvmCoverageName(bootstrapIrSourceFiles[file])
+            var at = 0
+            while (at < names.size) {
+                if (names[at] == name) slot = at
+                at = at + 1
+            }
+        }
+        slots.append(slot)
+        file = file + 1
+    }
+    bootstrapLlvmCoverageSlots = slots
+}
+
+fun bootstrapLlvmCoverageDeclareHits(backend: BootstrapLlvmBackend): void {
+    val count = if (bootstrapLlvmCoverageNames.size > 0) bootstrapLlvmCoverageNames.size else 1
+    bootstrapLlvmCoverageHitsType = LLVMArrayType2(backend.i8Type, count)
+    val hits = LLVMAddGlobal(backend.module, bootstrapLlvmCoverageHitsType, "abla_coverage_hits")
+    LLVMSetInitializer(hits, LLVMConstNull(bootstrapLlvmCoverageHitsType))
+    LLVMSetLinkage(hits, llvmInternalLinkage())
+    bootstrapLlvmCoverageHits = hits
+}
+
+/** The first act of an instrumented function (the builder is at its entry). */
+fun bootstrapLlvmCoverageMark(
+    backend: BootstrapLlvmBackend,
+    function: BootstrapIrFunction
+): void {
+    if (!bootstrapLlvmCoverage || function.naked || function.section != "") return
+    // The runtime's own functions (allocation, string equality, array growth) say nothing a consumer can use.
+    if (bootstrapLlvmRuntimeImplementation(function.name)) return
+    val file = bootstrapIrSourcePositionFile(function.position)
+    if (file < 0 || file >= bootstrapLlvmCoverageSlots.size) return
+    val slot = bootstrapLlvmCoverageSlots[file]
+    if (slot < 0) return
+    val address = bootstrapLlvmArrayElement(
+        backend, bootstrapLlvmCoverageHitsType, bootstrapLlvmCoverageHits, slot, "coverage.slot"
+    )
+    val store = LLVMBuildStore(backend.builder, LLVMConstInt(backend.i8Type, 1, 0), address)
+    LLVMSetAlignment(store, i32(1))
+    LLVMSetOrdering(store, i32(2))
+}
+
+fun bootstrapLlvmCoverageIsExit(function: BootstrapIrFunction): bool {
+    if (!bootstrapLlvmCoverage || function.name != "exit" || function.parameters.size !=
+        1) return false
+    val file = bootstrapIrSourcePositionFile(function.position)
+    if (file < 0 || file >= bootstrapIrSourceFiles.size) return false
+    val path = bootstrapIrSourceFiles[file]
+    return path.size >= 21 && path.slice(path.size - 21, path.size) == "process/exit/entry.ab"
+}
+
+fun bootstrapLlvmCoverageCall(
+    backend: BootstrapLlvmBackend,
+    name: string,
+    result: i64*,
+    parameters: array<i64*>,
+    variadic: bool,
+    arguments: array<i64*>
+): i64* {
+    val types = llvmPointerVector(parameters.size + 1)
+    var at = 0
+    while (at < parameters.size) {
+        types.set(at, parameters[at])
+        at = at + 1
+    }
+    val functionType = LLVMFunctionType(result, types.pointer(), i32(parameters.size),
+        if (variadic) i32(1) else i32(0))
+    types.drop()
+    var function = LLVMGetNamedFunction(backend.module, name)
+    if (pointerIsNull(function)) function = LLVMAddFunction(backend.module, name, functionType)
+    val values = llvmPointerVector(arguments.size + 1)
+    at = 0
+    while (at < arguments.size) {
+        values.set(at, arguments[at])
+        at = at + 1
+    }
+    val call = LLVMBuildCall2(
+        backend.builder, functionType, function, values.pointer(), i32(arguments.size), ""
+    )
+    values.drop()
+    call
+}
+
+fun bootstrapLlvmCoverageEmitDump(backend: BootstrapLlvmBackend): void {
+    val dumpType = bootstrapLlvmFunctionType(backend, backend.voidType, [])
+    val dump = LLVMAddFunction(backend.module, "abla_coverage_dump", dumpType)
+    LLVMSetLinkage(dump, llvmInternalLinkage())
+    val done = LLVMAddGlobal(backend.module, backend.i32Type, "abla_coverage_done")
+    LLVMSetInitializer(done, LLVMConstInt(backend.i32Type, 0, 0))
+    LLVMSetLinkage(done, llvmInternalLinkage())
+    val ctx = backend.context
+    val entry = LLVMAppendBasicBlockInContext(ctx, dump, "entry")
+    val first = LLVMAppendBasicBlockInContext(ctx, dump, "first")
+    val named = LLVMAppendBasicBlockInContext(ctx, dump, "named")
+    val templated = LLVMAppendBasicBlockInContext(ctx, dump, "templated")
+    val plain = LLVMAppendBasicBlockInContext(ctx, dump, "plain")
+    val open = LLVMAppendBasicBlockInContext(ctx, dump, "open")
+    val leave = LLVMAppendBasicBlockInContext(ctx, dump, "leave")
+    val loser = LLVMAppendBasicBlockInContext(ctx, dump, "loser")
+    val spin = LLVMAppendBasicBlockInContext(ctx, dump, "spin")
+    val loserWait = LLVMAppendBasicBlockInContext(ctx, dump, "loser.wait")
+    val loserExit = LLVMAppendBasicBlockInContext(ctx, dump, "loser.exit")
+    val inSignal = LLVMAddGlobal(backend.module, backend.i32Type, "abla_coverage_in_signal")
+    LLVMSetInitializer(inSignal, LLVMConstInt(backend.i32Type, 0, 0))
+    LLVMSetLinkage(inSignal, llvmInternalLinkage())
+    val finished = LLVMAddGlobal(backend.module, backend.i32Type, "abla_coverage_finished")
+    LLVMSetInitializer(finished, LLVMConstInt(backend.i32Type, 0, 0))
+    LLVMSetLinkage(finished, llvmInternalLinkage())
+    val b = backend.builder
+    val ptr = backend.pointerType
+    val i32 = backend.i32Type
+    val i64 = backend.i64Type
+    LLVMPositionBuilderAtEnd(b, entry)
+    val previous = LLVMBuildAtomicRMW(b, 0, done, LLVMConstInt(i32, 1, 0), 2, 0)
+    LLVMBuildCondBr(b, LLVMBuildICmp(b, llvmIntEqual(), previous, LLVMConstInt(i32, 0, 0),
+        "cov.first"), first, loser)
+    LLVMPositionBuilderAtEnd(b, first)
+    val variable = LLVMBuildGlobalStringPtr(b, "ABLA_COVERAGE_OUT", "cov.env")
+    val out = bootstrapLlvmCoverageCall(backend, "getenv", ptr, [ptr], false, [variable])
+    LLVMBuildCondBr(b, LLVMBuildICmp(b, llvmIntEqual(), out, LLVMConstNull(ptr), "cov.unset"),
+        leave, named)
+    LLVMPositionBuilderAtEnd(b, named)
+    val bufferType = LLVMArrayType2(backend.i8Type, 4096)
+    val buffer = LLVMBuildAlloca(b, bufferType, "cov.path")
+    val temporaryType = LLVMArrayType2(backend.i8Type, 4112)
+    val temporary = LLVMBuildAlloca(b, temporaryType, "cov.tmp")
+    val marker = LLVMBuildGlobalStringPtr(b, "%p", "cov.marker")
+    val found = bootstrapLlvmCoverageCall(backend, "strstr", ptr, [ptr, ptr], false, [out, marker])
+    LLVMBuildCondBr(b, LLVMBuildICmp(b, llvmIntEqual(), found, LLVMConstNull(ptr), "cov.plain"),
+        plain, templated)
+    LLVMPositionBuilderAtEnd(b, plain)
+    val plainFormat = LLVMBuildGlobalStringPtr(b, "%s", "cov.plain.format")
+    val plainLength = bootstrapLlvmCoverageCall(backend, "snprintf", i32, [ptr, i64, ptr], true, [
+        buffer, LLVMConstInt(i64, 4096, 0), plainFormat, out
+    ])
+    // A path that does not fit is refused, never truncated.
+    LLVMBuildCondBr(b, LLVMBuildICmp(b, llvmIntSignedGreaterOrEqual(), plainLength,
+        LLVMConstInt(i32,
+            4096, 0), "cov.long"), leave, open)
+    LLVMPositionBuilderAtEnd(b, templated)
+    val prefix = LLVMBuildTrunc(b, LLVMBuildSub(b, LLVMBuildPtrToInt(b, found, i64, "cov.found"),
+        LLVMBuildPtrToInt(b, out, i64, "cov.out"), "cov.prefix.i64"), i32, "cov.prefix")
+    val pid = bootstrapLlvmCoverageCall(backend, "getpid", i32, [], false, [])
+    val indices = llvmPointerVector(1)
+    indices.set(0, LLVMConstInt(i64, 2, 0))
+    val rest = LLVMBuildGEP2(b, backend.i8Type, found, indices.pointer(), 1, "cov.rest")
+    indices.drop()
+    val templateFormat = LLVMBuildGlobalStringPtr(b, "%.*s%d%s", "cov.template")
+    val templateLength = bootstrapLlvmCoverageCall(backend, "snprintf", i32, [ptr, i64, ptr], true,
+        [
+            buffer, LLVMConstInt(i64, 4096, 0), templateFormat, prefix, out, pid, rest
+        ])
+    LLVMBuildCondBr(b, LLVMBuildICmp(b, llvmIntSignedGreaterOrEqual(), templateLength,
+        LLVMConstInt(i32,
+            4096, 0), "cov.long.template"), leave, open)
+    LLVMPositionBuilderAtEnd(b, open)
+    // The pid is in the temporary's name: two processes writing one path (no `%p`) never share a file.
+    val tmpFormat = LLVMBuildGlobalStringPtr(b, "%s.tmp.%d", "cov.tmp.format")
+    bootstrapLlvmCoverageCall(backend, "snprintf", i32, [ptr, i64, ptr], true, [
+        temporary, LLVMConstInt(i64, 4112, 0), tmpFormat, buffer,
+        bootstrapLlvmCoverageCall(backend, "getpid", i32, [], false, [])
+    ])
+    val descriptor = bootstrapLlvmCoverageCall(backend, "open", i32, [ptr, i32], true, [
+        temporary, LLVMConstInt(i32, 577, 0), LLVMConstInt(i32, 420, 0)
+    ])
+    val writeStart = LLVMAppendBasicBlockInContext(ctx, dump, "write.start")
+    LLVMBuildCondBr(b, LLVMBuildICmp(b, llvmIntSignedLessThan(), descriptor, LLVMConstInt(i32, 0,
+        0), "cov.nofile"), leave, writeStart)
+    LLVMPositionBuilderAtEnd(b, writeStart)
+    var slot = 0
+    while (slot < bootstrapLlvmCoverageNames.size) {
+        val line = "${bootstrapLlvmCoverageNames[slot]}\n"
+        val hit = LLVMBuildLoad2(b, backend.i8Type, bootstrapLlvmArrayElement(
+            backend, bootstrapLlvmCoverageHitsType, bootstrapLlvmCoverageHits, slot, "cov.read"
+        ), "cov.hit")
+        val writeBlock = LLVMAppendBasicBlockInContext(ctx, dump, "write")
+        val nextBlock = LLVMAppendBasicBlockInContext(ctx, dump, "next")
+        LLVMBuildCondBr(b, LLVMBuildICmp(b, llvmIntNotEqual(), hit, LLVMConstInt(backend.i8Type, 0,
+            0), "cov.ran"), writeBlock, nextBlock)
+        LLVMPositionBuilderAtEnd(b, writeBlock)
+        bootstrapLlvmCoverageCall(backend, "write", i64, [i64, ptr, i64], false, [
+            LLVMBuildSExt(b, descriptor, i64, "cov.fd"), LLVMBuildGlobalStringPtr(b, line,
+                "cov.path.text"), LLVMConstInt(i64, line.size, 0)
+        ])
+        LLVMBuildBr(b, nextBlock)
+        LLVMPositionBuilderAtEnd(b, nextBlock)
+        slot = slot + 1
+    }
+    bootstrapLlvmCoverageCall(backend, "close", i32, [i32], false, [descriptor])
+    bootstrapLlvmCoverageCall(backend, "rename", i32, [ptr, ptr], false, [temporary, buffer])
+    LLVMBuildBr(b, leave)
+    LLVMPositionBuilderAtEnd(b, leave)
+    val release = LLVMBuildStore(b, LLVMConstInt(i32, 1, 0), finished)
+    LLVMSetOrdering(release, i32(5))
+    LLVMSetAlignment(release, i32(4))
+    LLVMBuildRetVoid(b)
+    // A thread that finds the dump under way waits (at most about five seconds) for it to finish, so a
+    // graceful multi-thread shutdown does not end the process before the winner has renamed the file.
+    // (Not from a signal handler: a handler that interrupted the winner on this thread would wait for a
+    // finish that only comes once the handler returns.)
+    LLVMPositionBuilderAtEnd(b, loser)
+    LLVMBuildCondBr(b, LLVMBuildICmp(b, llvmIntNotEqual(), LLVMBuildLoad2(b, i32, inSignal,
+        "cov.in.signal"),
+        LLVMConstInt(i32, 0, 0), "cov.from.signal"), loserExit, loserWait)
+    LLVMPositionBuilderAtEnd(b, loserWait)
+    val waited = LLVMBuildAlloca(b, i32, "cov.waited")
+    LLVMBuildStore(b, LLVMConstInt(i32, 0, 0), waited)
+    LLVMBuildBr(b, spin)
+    LLVMPositionBuilderAtEnd(b, spin)
+    val readFinished = LLVMBuildLoad2(b, i32, finished, "cov.finished")
+    LLVMSetOrdering(readFinished, i32(4))
+    LLVMSetAlignment(readFinished, i32(4))
+    val count = LLVMBuildLoad2(b, i32, waited, "cov.count")
+    val stop = LLVMBuildOr(b, LLVMBuildICmp(b, llvmIntNotEqual(), readFinished, LLVMConstInt(i32, 0,
+        0),
+        "cov.done"), LLVMBuildICmp(b, llvmIntSignedGreaterOrEqual(), count, LLVMConstInt(i32, 5000,
+            0),
+            "cov.patience"), "cov.stop")
+    val sleepBlock = LLVMAppendBasicBlockInContext(ctx, dump, "sleep")
+    LLVMBuildCondBr(b, stop, loserExit, sleepBlock)
+    LLVMPositionBuilderAtEnd(b, sleepBlock)
+    bootstrapLlvmCoverageCall(backend, "usleep", i32, [i32], false, [LLVMConstInt(i32, 1000, 0)])
+    LLVMBuildStore(b, LLVMBuildAdd(b, count, LLVMConstInt(i32, 1, 0), "cov.next"), waited)
+    LLVMBuildBr(b, spin)
+    LLVMPositionBuilderAtEnd(b, loserExit)
+    LLVMBuildRetVoid(b)
+
+    // The signal handler: dump, restore the default action, raise the signal again.
+    val handlerType = bootstrapLlvmFunctionType(backend, backend.voidType, [i32])
+    val handler = LLVMAddFunction(backend.module, "abla_coverage_signal", handlerType)
+    LLVMSetLinkage(handler, llvmInternalLinkage())
+    LLVMPositionBuilderAtEnd(b, LLVMAppendBasicBlockInContext(ctx, handler, "entry"))
+    LLVMBuildStore(b, LLVMConstInt(i32, 1, 0), inSignal)
+    LLVMBuildCall2(b, dumpType, dump, nativeNullPointer(), i32(0), "")
+    val number = LLVMBuildSExt(b, LLVMGetParam(handler, i32(0)), i64, "cov.signal")
+    bootstrapLlvmCoverageCall(backend, "signal", ptr, [i64, ptr], false, [number,
+        LLVMConstNull(ptr)])
+    bootstrapLlvmCoverageCall(backend, "raise", i32, [i64], false, [number])
+    LLVMBuildRetVoid(b)
+    return
+}
+
+/** In the C `main` before any Abla code: SIGTERM, SIGINT and SIGHUP dump first. */
+fun bootstrapLlvmCoverageInstallSignals(backend: BootstrapLlvmBackend): void {
+    if (!bootstrapLlvmCoverage) return
+    val handler = LLVMGetNamedFunction(backend.module, "abla_coverage_signal")
+    for (signal in [15, 2, 1]) {
+        bootstrapLlvmCoverageCall(backend, "signal", backend.pointerType, [backend.i64Type,
+            backend.pointerType], false, [
+                LLVMConstInt(backend.i64Type, signal, 0), handler
+            ])
+    }
+}
+
+/** Before a return from the C `main`, and at the top of `exit`. */
+fun bootstrapLlvmCoverageCallDump(backend: BootstrapLlvmBackend): void {
+    if (!bootstrapLlvmCoverage) return
+    val dump = LLVMGetNamedFunction(backend.module, "abla_coverage_dump")
+    LLVMBuildCall2(
+        backend.builder, bootstrapLlvmFunctionType(backend, backend.voidType, []), dump,
+        nativeNullPointer(), i32(0), ""
+    )
+    return
+}

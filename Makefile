@@ -87,6 +87,7 @@ test-wide-integers-full: ablac
 
 test-serial: ablac
 	tools/test-version.sh $(COMPILER)
+	tools/test-coverage.sh $(COMPILER)
 	tools/test-analysis-service.sh $(COMPILER)
 	tools/test-frontend-analysis.sh $(COMPILER)
 	tools/test-analysis-graph.sh $(COMPILER)

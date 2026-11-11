@@ -249,6 +249,90 @@
 
 ## Compiler and stdlib
 
+- [ ] **Function coverage: which source files a program ran (design only, 2026-11-10; asked for by NovaKind, todo 740,
+  backed by their lead; with André as a decision because it is a new public flag).** NovaKind wants, per test suite,
+  the list of `one/*.ab` files its live app executed, so that a change to one screen file selects only the suites
+  that ran it. File level is enough; no lines. Nothing like it exists (`docs/coverage.md` is documentation coverage; no
+  instrumentation, no LLVM profile runtime). Design:
+  - **Flag and names.** `ablac build --coverage-functions` (a build option; part of the whole-build and codegen-unit cache
+    keys, so a flagged and an unflagged build never share an object) and at run time `ABLA_COVERAGE_OUT=<path>` (`%p`
+    becomes the pid; default `abla-coverage.<pid>.txt` in the working directory), one file per process.
+    The hosted targets only (Linux x86-64 and AArch64, and the Android shared library below); Wasm, Xtensa and the macOS
+    targets refuse the flag with `E_COVERAGE_TARGET` in the first version.
+  - **Byte table.** In the LLVM backend's loop over `program.functions` (src/backend/llvm/backend.ab, where `abla.source`
+    is added), a flagged build gives every emitted function a slot in one internal global `abla_coverage_hits: [N x i8]`
+    (zero-initialised) and a `store atomic i8 1, ptr <slot> monotonic` as the first instruction of its entry block, before
+    optimisation, so an inlined body still carries it and a function LLVM drops as dead loses its store with it (a
+    function that never ran is correctly absent either way). A relaxed atomic store is a plain `mov`/`strb`: no fence,
+    idempotent, so threads need nothing more. The store is not `volatile`: LICM may hoist it out of a loop, which keeps
+    "ran at least once" true and costs less.
+  - **Function to file.** `abla.source` is the function's name, not its file, but `BootstrapIrFunction.position`
+    already maps to a source file: `debug.ab` builds `functionFiles` from `bootstrapIrSourceFiles` and the position,
+    and only when `-g` is on. The flagged build computes the same table without debug information: a constant
+    `[N x i16]` of file indexes (`-1` for functions with no position: compiler-generated wrappers and the runtime's own
+    glue, which are left out) and one constant string of the distinct file paths, sorted bytewise at compile time
+    (so the output order does not depend on module discovery order). Paths are the compiler's own spelling relative to the
+    entry's project directory when under it (`one/screens.ab`), else as-is (`stdlib/abla/json/entry.ab`); a generated
+    module is `<generated:name>`. To confirm before code: positions of functions restored from the lowered-function
+    cache (`BootstrapIrCacheState`) keep their file index across builds.
+  - **The dump.** A compiler-written `__ablaCoverageDump()` (the compiler already gives `__ablaDebugPrintStack` and
+    `__ablaPanicContain` bodies this way): walks the `N` slots, sets a bit per file index, writes the distinct paths
+    in table order, one per line, UTF-8, `\n`, no header, to `<path>.tmp.<pid>` and renames it over `<path>` (a reader
+    never sees half a file). Only `open`/`write`/`close`/`rename` and static buffers, no allocation, so it is safe from
+    a signal handler; the output path is read from the environment once at start-up into a static buffer. A once flag
+    (`cmpxchg`) makes the first caller dump and the rest return, so several threads ending the process do not race.
+    Called from: `exit()` (stdlib/abla/process/exit, before `exit_group`; `panic` reaches it through `exit(101)`), the
+    return path of the generated `main`, and an explicit `coverageDump(path)` in a new `abla/coverage` module for a test
+    hook (a debug endpoint, or a program that wants a dump before a long idle).
+  - **Signals.** Abla has no handler API (`abla/process/signal` is signalfd, read in the program's own time), so a
+    flagged build installs at start-up `rt_sigaction` handlers for SIGTERM, SIGINT and SIGHUP (and SIGSEGV, SIGBUS,
+    SIGABRT, SIGFPE: a crash is when a coverage list is most wanted) that call the dump, restore the default
+    disposition and re-raise, so the exit status is the usual 128+signal. A program that blocks those signals with
+    `watchSignals` never runs the handler and ends through its own `exit()`/`main` return, which dumps. NovaKind's
+    graceful shutdown is that second path. `SIGKILL` and an OOM kill cannot be caught: no file, and no `.tmp` is left
+    (the rename is the last step). A periodic flush is not in the first version (it needs a timer thread).
+  - **Android.** A shared library has no process exit of its own: the flagged build adds the dump to `.fini_array`
+    (runs from libc's `exit` and `dlclose`) and exports `abla_coverage_dump(const char *path)` for the host app to call at
+    the end of an instrumented test; the signal handlers are not installed there (the VM owns them). To confirm with
+    NovaKind mobile: that the app is reached from `exit` at the end of an instrumentation run.
+  - **Tests.** (1) A three-module fixture in which one function of module B is never called: the output is exactly
+    the files of `main` and of what it ran, sorted, twice the same. (2) Each end: return from `main`, `exit(3)`,
+    `panic` (101), SIGTERM with the default disposition (handler path, status 143), SIGTERM under `watchSignals`
+    (graceful path), SIGSEGV from a fixture. (3) Two threads running functions of different modules. (4) SIGKILL leaves
+    neither the file nor a `.tmp`. (5) A release build where LLVM inlines a small function: its file is still listed.
+    (6) The flag on Wasm/Xtensa/macOS gives `E_COVERAGE_TARGET`. (7) **Bit-identical when off:** the release stage 2
+    built from the change is `cmp`-equal to the stage 2 built from its base, and `--emit-llvm` of fib, maps and
+    `src/orc_main.ab` is identical with and without the code present (the flag off must not even create the global).
+    (8) **Cost when on**, instructions:u (`perf stat`, one P-core) and stripped size for fib, maps, trees,
+    json-megabyte and NovaKind's tool: the bar is not a number but that the instrumented app runs NovaKind's suites;
+    the expected shape is one store per call (fib, a call-bound program, is the worst case) and about 4 bytes per
+    function plus the path table of size, and no change in compile time beyond the store insertion.
+  Open for the owner (André) and NovaKind: the option name and whether it belongs in `abla.toml` as well, the path form
+  (project-relative as above, or absolute), and the default file name. Estimated size: one backend change (about 150
+  lines: table, stores, dump function, handlers), one stdlib module, one `.fini_array` entry for the library, a test
+  script and docs/targets.md rows; 1 to 2 days with the gate.
+  **Built (2026-11-10, branch `coverage-impl`; todo #756), where it differs from the design above.** The table is per
+  source file, not per function: every instrumented function stores 1 into its file's byte (the file of the function's
+  recorded position), so the dump needs no function-to-file table; files are the module-relative names, `./` and
+  `x/../` folded, sorted bytewise (stdlib files read `stdlib/abla/...`), deduplicated. The dump is written in IR in
+  `src/backend/llvm/coverage.ab` with libc (`getenv`, `strstr`, `snprintf`, `open`, `write`, `rename`): `exit`
+  (stdlib/abla/process/exit) calls it at its top when the flag is on, the C `main` before it returns, and SIGTERM,
+  SIGINT and SIGHUP handlers dump, restore the default action and re-raise (status 143 for SIGTERM). No crash
+  signals: the debug fault report and the stack guard own them. The handler runs `snprintf` and `open`, which are not
+  async-signal-safe; a signal that lands inside `malloc` can deadlock the dump (the process then ends as it would
+  have, without a list). A fork without exec inherits the once flag, so the child dumps its own copy under its pid,
+  which is what `%p` is for. The store is made before optimization, so an inlined body keeps it. Per file rather than per function: the consumer wants files, a per-function table would need a function-to-file table in every flagged binary, and the output (sorted, deduplicated paths) does not change if it becomes per-function later. `--coverage-functions`
+  bypasses the build caches; any target but a hosted Linux executable is refused with `E_COVERAGE_TARGET`
+  (macOS, Wasm, Xtensa, libraries). **Not built: the Android shared library** (needs the `.fini_array` entry and an
+  exported dump; tracked as the remaining part of #756) and the `abla.toml` key. Tests: `tools/test-coverage.sh`
+  (files at main's return, `exit(3)`, `panic`, `%p`, nothing when the variable is unset or the flag is off, SIGTERM 143,
+  SIGKILL leaves neither file nor `.tmp`, macOS and raw Wasm refused). Flag off: `--emit-llvm` of fib, maps, trees and
+  strings is identical to the base compiler's apart from the sysroot path inside `abla.source` attributes. Flag on
+  (release, one P-core, `instructions:u`, after the runtime's own functions stopped being marked): fib 8,774 M to 9,641 M
+  (+9.9%, a call-bound worst case: one store per user call), trees 8,923 M to 9,125 M (+2.3%); the binary grows 2.4 KB (fib)
+  and 2.7 KB (trees). Review fixes (ablac-e6): the temporary is `<path>.tmp.<pid>`; a path of 4096 bytes or more is refused;
+  compile-time slices are never instrumented; a thread that finds the dump under way waits (up to about 5 s) for the
+  winner to finish. Signal handlers still call `snprintf`/`getenv`, which are not async-signal-safe.
 - [x] **abla-pdf signs through the released `abla/crypto/rsa`** (since its 1a2c416, as abla-saft does). Its
   64c36d1 checks signatures against OpenSSL and against the old signer, byte for byte, on ablac 0.2.45.
 - [x] **Encrypted RSA key import:** pure PBES2/PBKDF2 SHA256/SHA1 + AES128/256-CBC PKCS#8 and MAC-verified DER PKCS#12 key bags, with owned passwords and bounded work. Legacy PBES1/RC2/DES and broader PFX formats remain unsupported; see [the scope and limits](docs/stdlib/encrypted-keys.md).
