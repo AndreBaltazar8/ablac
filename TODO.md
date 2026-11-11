@@ -153,9 +153,7 @@
   from arithmetic are unspecified, so bit equality was mode-dependent. Resolved by `any-eq-ieee`
   (erased floats of one kind compare as typed `==`); regression
   `tests/cases/fuzz-differential/any-nan-equality.ab` (also checks forms through array, field, `when`,
-  f32 versus its bits). (2) In a `compile fun`, `f32(1.5)` fails with `E_EVAL_EXPRESSION` (call `f32`),
-  and f32 `0.0 / 0.0` fails with `E_EVAL_DIVISION_BY_ZERO` where f64 gives NaN; both run natively
-  (found by ablac-45). Open: whatever later campaigns report is listed here with its minimised
+  f32 versus its bits). Open: whatever later campaigns report is listed here with its minimised
   program under `tests/cases/fuzz-differential/`. Campaign of seeds 13 to 20 (30 checks each, 6 modes):
   every disagreement was this one class, equality through `any` between a float and something else:
   `anyEq(-0.0, 0.0)` (native false, interpreter true), `anyEq(f64FromInt(1), 4607182418800017408)`
@@ -163,7 +161,7 @@
   itself and with a payload. They are decided (a float never equals an integer, bec6dfcf; same-kind floats compare as typed `==`,
   `any-eq-ieee`) and kept as `tests/cases/fuzz-differential/any-mixed-kinds.ab`.
   After both: seeds 21 to 28 and 29 to 40 (30 checks each, six modes, 600 checks) agree; the generator
-  does not yet draw `f32(literal)` conversions or f32 division by zero (the two open evaluator gaps above).
+  did not yet draw `f32(literal)` conversions or f32 division by zero (added below after their evaluator fixes).
   Grown 2026-11-08 (branch `fuzz-grow`): checks for integer conversions between every width pair and
   float-to-integer saturation, generics (`Box<T>`, `Pair<A, B>`, generic functions over int, f64, string,
   u8, i32), interfaces with a default method and dynamic dispatch, nullable chains (`?.`, `??`, `when` on
@@ -272,20 +270,6 @@
   Focused seeds 3601 to 3620 (480 checks) agree in all six modes on master fbd02092; the tool suite passes.
   Temporary owner projections remain excluded pending #788. Before this addition, default seeds 3541 to
   3580 (960 checks) agreed in all six modes on the same compiler.
-
-- **Evaluator: jumps on the right of `??` in operand positions (#775 follow-up).**
-  `truncate` and both `slice` bounds propagate jumps, as do the covered compiler intrinsic argument reads, before
-  the call can consume the value or evaluate a later argument. The action journal closes abandoned calls;
-  interp and jit regressions and the focused differential fuzzer cover these paths. Raw argument reads in
-  `syntax*` and `typed*` intrinsics also propagate jumps before validation and before later arguments;
-  `tests/cases/ct-elvis-jump/syntax-typed.ab` covers these paths, including invalid handles.
-
-- [x] **Depth guard follow-on error (#780).** A stack-depth stop inside a subparser could leave
-  partial syntax that triggered a misleading `array.element-type` error during semantic analysis.
-  The stopped subparser's source span is retained with the cached module parse so analysis can
-  suppress that follow-on while preserving genuine errors elsewhere. `tools/test-deep-json.sh`
-  covers the original 7260 KB stop, a deterministic 4879-level cap, and unrelated array errors
-  in both the same file and a different module.
 
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
