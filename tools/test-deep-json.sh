@@ -94,7 +94,7 @@ fun main: int {
     0
 }
 EOF
-for stack in 8192 7808 7424 6656; do
+for stack in 8192 7808 7424 7260 6656; do
     set +e
     (
         ulimit -s $stack
@@ -118,7 +118,7 @@ done
 # and at each of seven consecutive ones, which covers every point of one JSON
 # level), the levels it unwinds evaluate nothing more: one error, never a loop
 # that descends again until the step limit, nor a cascade from what was lost.
-for cap in 37 50 64 101 330 331 332 333 334 335 336; do
+for cap in 37 50 64 101 330 331 332 333 334 335 336 4879; do
     set +e
     ABLA_EVAL_DEPTH_LIMIT=$cap "$compiler" build "$output_directory/deepest.ab" \
         -o "$output_directory/capped" --no-cache > "$output_directory/capped-$cap.log" 2>&1
@@ -132,4 +132,62 @@ for cap in 37 50 64 101 330 331 332 333 334 335 336; do
         exit 1
     fi
 done
+# The JIT run frontend goes through the same staged parser and semantic analysis.
+set +e
+ABLA_EVAL_DEPTH_LIMIT=4879 "$compiler" run "$output_directory/deepest.ab" \
+    > "$output_directory/run.log" 2>&1
+run_status=$?
+set -e
+if [[ $run_status -eq 0 || $run_status -ge 100 ]] ||
+    [[ $(grep -c '^error\[E_EVAL_STACK_DEPTH\]' "$output_directory/run.log") -ne 1 ]] ||
+    [[ $(grep -c '^error\[' "$output_directory/run.log") -ne 1 ]]; then
+    printf 'deep json: JIT run guard status %s\n' "$run_status" >&2
+    grep '^error' "$output_directory/run.log" >&2 || true
+    exit 1
+fi
+# A genuine array error outside the abandoned subparser in the same file survives.
+{ cat "$output_directory/deepest.ab"; printf '\nfun badArray(): int { val invalid: array<int> = [true]; invalid.size }\n'; } > "$output_directory/same-file.ab"
+set +e
+ABLA_EVAL_DEPTH_LIMIT=4879 "$compiler" build "$output_directory/same-file.ab" \
+    -o "$output_directory/same-file" --no-cache > "$output_directory/same-file.log" 2>&1
+same_status=$?
+set -e
+if [[ $same_status -eq 0 || $same_status -ge 100 ]] ||
+    [[ $(grep -c '^error\[' "$output_directory/same-file.log") -ne 2 ]] ||
+    ! grep -q '^error\[E_EVAL_STACK_DEPTH\]' "$output_directory/same-file.log" ||
+    ! grep -q '^error\[E_SEMANTIC\]: array.element-type' "$output_directory/same-file.log"; then
+    printf 'deep json: same-file error lost or extra diagnostic, status %s\n' "$same_status" >&2
+    grep '^error' "$output_directory/same-file.log" >&2 || true
+    exit 1
+fi
+# A stopped subparser must not hide an unrelated error in another module.
+cat > "$output_directory/unrelated.ab" <<'EOF'
+fun unrelated(): int {
+    val invalid: array<int> = [true]
+    invalid.size
+}
+EOF
+{ printf 'import "unrelated.ab"\n'; cat "$output_directory/deepest.ab"; } > "$output_directory/multi.ab"
+set +e
+ABLA_EVAL_DEPTH_LIMIT=4879 "$compiler" build "$output_directory/multi.ab" \
+    -o "$output_directory/multi" --no-cache > "$output_directory/multi.log" 2>&1
+multi_status=$?
+set -e
+if [[ $multi_status -eq 0 || $multi_status -ge 100 ]] ||
+    [[ $(grep -c '^error\[' "$output_directory/multi.log") -ne 2 ]] ||
+    ! grep -q '^error\[E_EVAL_STACK_DEPTH\]' "$output_directory/multi.log" ||
+    ! grep -q '^error\[E_SEMANTIC\]: array.element-type' "$output_directory/multi.log" ||
+    ! grep -q "source\[semantic\]:.*unrelated.ab:" "$output_directory/multi.log"; then
+    printf 'deep json: unrelated module error lost or extra diagnostic, status %s\n' "$multi_status" >&2
+    grep '^error' "$output_directory/multi.log" >&2 || true
+    exit 1
+fi
+# A cached module parse retains the stopped span on a second graph build.
+"$compiler" build "$project_root/tests/cases/modules/module-depth-stop-cache.ab" \
+    --fast --no-cache -o "$output_directory/cache-test"
+cache_output=$(ABLA_EVAL_DEPTH_LIMIT=4879 "$output_directory/cache-test")
+if [[ $cache_output != 'cache depth stop: reused with one error' ]]; then
+    printf 'deep json: cached parse: %s\n' "$cache_output" >&2
+    exit 1
+fi
 echo "deep json: $depth levels compile on an 8 MB stack; the depth guard in #\$jsons is one error, and $deep levels never crash"

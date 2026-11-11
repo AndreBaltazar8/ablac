@@ -119,7 +119,8 @@ for cls, function, positions in [
     ('BootstrapExpression', 'bootstrapFormatExpressionEqual', {'begin', 'end'}),
     ('BootstrapDeclaration', 'bootstrapFormatDeclarationEqual',
      {'begin', 'end', 'generatedOriginBegin', 'generatedOriginEnd', 'annotationBegins', 'annotationEnds'}),
-    ('BootstrapParseResult', 'bootstrapFormatAstEqual', set()),
+    # Formatter parses syntax only; staged evaluation never sets this metadata.
+    ('BootstrapParseResult', 'bootstrapFormatAstEqual', {'stackDepthStoppedSources'}),
 ]:
     body = re.search(r'class ' + cls + r'\((.*?)\n\)', parser, re.S).group(1)
     fields = re.findall(r'^\s*(?:val|var)\s+(\w+):', body, re.M)

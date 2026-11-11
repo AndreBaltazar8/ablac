@@ -249,20 +249,12 @@
   interp and jit regressions and the focused differential fuzzer cover these paths. Remaining open: raw
   argument reads in `syntax*` and `typed*` intrinsics; those have not been audited for this jump pattern.
 
-- **Depth guard: a second, misleading error after `E_EVAL_STACK_DEPTH` at some stop points (found while landing #775).**
-  `tools/test-deep-json.sh` builds `deepest.ab` (`#$jsons` over 1000 nested `[` `]`) on a lowered stack and demands
-  exactly one error, the evaluator's depth guard. Where the guard stops the descent decides whether the unwinding
-  leaves a cascade: `error[E_SEMANTIC]: array.element-type` at deepest.ab:71:72 after the guard's own error. It is
-  reproducible without #775, on the #736 tree alone (stage 1 of tag d1-gated-736): `ulimit -s 7260; ulimit -H -s
-  7260; ABLA_MAX_STACK_KB=7260 ablac build deepest.ab` gives two errors (guard at 4888 levels); the same program
-  at 7200 to 7656 KB in steps of 12 gives one error everywhere else (a sweep of 39 sizes: 4840 to 5232 levels), and
-  at the test's four sizes 8192/7808/7424/6656 KB the guard stops at 5688/5360/5032/4376 levels with one error. A
-  tree whose recursive evaluator frames are 8 bytes larger per level (a draft of #775 with a live `condition` local in
-  `bootstrapEvaluateIf`) moved the 7424 KB stop to 5008 levels and hit the cascade there. So the test passes by the
-  stack sizes it happens to use, not because the unwinding is clean: the syntax a subparser builds from the evaluation
-  that the guard cut short still contains an array whose element type cannot be found. Not fixed (the evaluator's frame
-  size is therefore part of that test: keep the recursive frames of `if`/`while`/`do while` free of new live locals, as
-  `bootstrapEvalCondition` does).
+- [x] **Depth guard follow-on error (#780).** A stack-depth stop inside a subparser could leave
+  partial syntax that triggered a misleading `array.element-type` error during semantic analysis.
+  The stopped subparser's source span is retained with the cached module parse so analysis can
+  suppress that follow-on while preserving genuine errors elsewhere. `tools/test-deep-json.sh`
+  covers the original 7260 KB stop, a deterministic 4879-level cap, and unrelated array errors
+  in both the same file and a different module.
 
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
