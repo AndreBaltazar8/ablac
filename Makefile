@@ -248,6 +248,7 @@ test-serial: ablac
 	tools/test-path-home.sh $(COMPILER)
 	tools/test-path-directory-mode.sh $(COMPILER)
 	tools/test-path-file-mode.sh $(COMPILER)
+	tools/test-open-nofollow.sh $(COMPILER)
 	tools/test-process-pipeline.sh $(COMPILER)
 	tools/test-runtime-checks.sh $(COMPILER)
 	tools/test-float-integer-saturation.sh $(COMPILER)

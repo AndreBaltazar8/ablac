@@ -20,6 +20,11 @@
 
 ## Bugs seen
 
+- [x] Darwin's Linux-compatible `openat` shim dropped `O_NOFOLLOW` (131072), letting a
+  direct caller follow the final symlink despite asking not to. The shim maps it to Darwin
+  `O_NOFOLLOW`; `tools/test-open-nofollow.sh` checks file and directory links. Linux passes;
+  Darwin behavior needs the macOS CI gate.
+
 - [x] **A contract import does not carry a class its module reaches only through another module
   (NovaKind report 98, #698).** `import contract "api.ab"` where `api.ab` imports `mid.ab`, `mid.ab`
   imports `lib.ab`, and `lib.ab` declares `class Payload`, with `@server fun remote(): Payload` in `api.ab`:

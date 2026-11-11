@@ -115,6 +115,8 @@ static int darwin_open_flags(int64_t flags) {
     result |= O_NONBLOCK;
   if ((flags & 65536) != 0)
     result |= O_DIRECTORY;
+  if ((flags & 131072) != 0)
+    result |= O_NOFOLLOW;
   if ((flags & 524288) != 0)
     result |= O_CLOEXEC;
   return result;
