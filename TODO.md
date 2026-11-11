@@ -243,13 +243,11 @@
   side of a short-circuit condition; seeds 3101 to 3140 (24 checks each) agree in all six modes with those
   additions. The recorded-case fuzzer suite passes with the same compiler.
 
-- **Evaluator: a jump on the right of `??` in a few more operand positions (#775 follow-up, ablac-52's review).**
-  The evaluator now returns the jump before it assigns or chooses in assignments (plain, field, element and its
-  index), unary `!`/`-`/`~`, the `if`/`while`/`do while` condition, the `when` subject, `||`, range ends, template
-  parts and array literals (tests/cases/ct-elvis-jump). Not covered, rarely written: the arguments of `truncate`
-  and `slice` in `bootstrapEvaluateMemberCall`, and the integer arguments the `compilerX` calls read. A jump there
-  is stored as an operand value instead of leaving. `break` and `continue` in a `while`/`do while` condition are
-  sema errors, so only `?? return` can stand there.
+- **Evaluator: jumps on the right of `??` in operand positions (#775 follow-up).**
+  `truncate` and both `slice` bounds propagate jumps, as do the covered compiler intrinsic argument reads, before
+  the call can consume the value or evaluate a later argument. The action journal closes abandoned calls;
+  interp and jit regressions and the focused differential fuzzer cover these paths. Remaining open: raw
+  argument reads in `syntax*` and `typed*` intrinsics; those have not been audited for this jump pattern.
 
 - **Depth guard: a second, misleading error after `E_EVAL_STACK_DEPTH` at some stop points (found while landing #775).**
   `tools/test-deep-json.sh` builds `deepest.ab` (`#$jsons` over 1000 nested `[` `]`) on a lowered stack and demands
