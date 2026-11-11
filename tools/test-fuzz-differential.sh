@@ -11,6 +11,25 @@ compiler=${1:-build/ablac}
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$project_root"
 python3 tools/fuzz-differential --selftest
+python3 - "$compiler" <<'PY'
+import runpy, sys
+f = runpy.run_path('tools/fuzz-differential')
+lines, call, ty = f['Gen'](123).gzip_check(0)
+runner = f['Runner'](sys.argv[1], 120)
+def run(lines, name):
+    return runner.all_modes('build/fuzz-differential/' + name,
+                            (f['Gen'].PRELUDE, [(lines, call, ty, 0)]))
+good = run(lines, 'gzip-control-good')
+assert f['verdict'](good) is None, good
+# Corrupt the decoded value seen by the check, across every execution mode.
+broken = [s.replace('decoded.data != original', 'decoded.data + "x" != original') for s in lines]
+assert broken != lines
+bad = run(broken, 'gzip-control-broken')
+assert all(v[0] != 'build-failed' for v in bad.values()), bad
+assert all('c0=FUZZ_ORACLE_FAILURE' in v[0] for v in bad.values()), bad
+assert f['verdict'](bad) is not None and f['differing_lines'](bad) == ['c0'], bad
+print('fuzz differential: broken gzip round trip detected in all modes')
+PY
 python3 tools/fuzz-differential --compiler "$compiler" --seeds 1-2 --checks 16
 # The cases the fuzzer found stay as programs: every mode must print the same, and
 # a compile-time answer that differs from the run-time one prints MISMATCH.

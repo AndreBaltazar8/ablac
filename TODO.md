@@ -243,6 +243,13 @@
   side of a short-circuit condition; seeds 3101 to 3140 (24 checks each) agree in all six modes with those
   additions. The recorded-case fuzzer suite passes with the same compiler.
 
+  The default mix also draws bounded gzip round trips over empty, random, repetitive and mixed bytes, checks
+  the exact output bound and the one-byte-too-small limit, and prints a length and digest. Its oracle reports
+  a shared wrong answer as a failure; a deliberately corrupted decoded value tests that control. The Elvis
+  member check draws `?? return` and a compiler intrinsic argument, without a host dependency. Focused Elvis
+  seeds 3251 to 3260 (12 checks each) agreed in all six modes on master 05ec434d, as did the tool's test
+  suite. Default-mix seeds 3301 to 3320 (24 checks each) agreed in all six modes using master 26857d4a.
+
 - **Evaluator: jumps on the right of `??` in operand positions (#775 follow-up).**
   `truncate` and both `slice` bounds propagate jumps, as do the covered compiler intrinsic argument reads, before
   the call can consume the value or evaluate a later argument. The action journal closes abandoned calls;
