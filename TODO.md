@@ -262,6 +262,11 @@
   seeds 3251 to 3260 (12 checks each) agreed in all six modes on master 05ec434d, as did the tool's test
   suite. Default-mix seeds 3301 to 3320 (24 checks each) agreed in all six modes using master 26857d4a.
 
+  After #778, the resource-drop check also iterates generators from a live owner's field, a global, and a
+  borrowed parameter with early break, recording values and drop order. Focused seeds 3401 to 3420 and
+  default-mix seeds 3521 to 3540 (24 checks each) agreed in all six modes on master 83d65574; the tool's
+  test suite passed too. Nested generator-machine sources and temporary owners remain outside these shapes.
+
 - **Evaluator: jumps on the right of `??` in operand positions (#775 follow-up).**
   `truncate` and both `slice` bounds propagate jumps, as do the covered compiler intrinsic argument reads, before
   the call can consume the value or evaluate a later argument. The action journal closes abandoned calls;
