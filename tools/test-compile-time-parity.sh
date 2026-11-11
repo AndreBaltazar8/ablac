@@ -285,7 +285,7 @@ run_mode() { # kind name source mode
     local dir=$output/work/$name granted="" side_seconds=$seconds
     # A `#` side expected never to finish only needs to show that it doesn't,
     # and one expected past the interpreter's step limit to pass a lower one
-    # (ABLA_EVAL_STEP_LIMIT only lowers it): either way the status is the same.
+    # (ABLA_EVAL_STEP_LIMIT overrides it): either way the status is the same.
     case $(expected_status "$mode" "$name") in
         timeout | interp-threads) side_seconds=$known_timeout_seconds ;;
         interp-steps) local -x ABLA_EVAL_STEP_LIMIT=$known_step_limit ;;

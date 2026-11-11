@@ -590,15 +590,22 @@ checked against the manifest before they run.
 
 ## Limits
 
-Each compile-time evaluation may take at most 50,000,000 evaluation steps.
+Each compile-time evaluation may take 50,000,000 evaluation steps by default.
+The limit bounds accidental endless loops as well as finite computations.
 An endless loop stops with:
 
 ```text
-error[E_EVAL_STEP_LIMIT]: compile-time evaluation ran past 50000000 steps (an endless loop?)
+error[E_EVAL_STEP_LIMIT]: compile-time evaluation ran past 50000000 steps (an endless loop?); adjust ABLA_EVAL_STEP_LIMIT or try ABLA_COMPILE_EVAL=jit for heavy compile-time work (unsupported sites still use the evaluator)
 ```
 
-`ABLA_EVAL_STEP_LIMIT=<n>` lowers the limit for a build (it never raises
-it), which is useful in tests.
+`ABLA_EVAL_STEP_LIMIT=<n>` overrides the limit for a build, either raising it
+for heavier computations or lowering it in tests. It accepts a positive decimal
+integer of at most 18 digits; empty, zero, negative, malformed or longer values
+keep the default. For example, `ABLA_EVAL_STEP_LIMIT=200000000 ablac build app.ab`
+allows four times the default work per evaluation. Increasing the limit also lets
+an accidental endless loop run longer. `ABLA_COMPILE_EVAL=jit` can run eligible
+compile-time sites as native code; unsupported sites still use the evaluator and
+its step limit. The default evaluation tier is unchanged.
 
 Recursion at compile time is bounded by the compiler's own stack. The
 evaluator measures how much of that stack nested evaluation has used and stops
