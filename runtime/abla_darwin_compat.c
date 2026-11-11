@@ -1198,6 +1198,29 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     }
     break;
   }
+  case 258:
+    result = mkdirat((int)argument0, (const char *)(uintptr_t)argument1,
+                     (mode_t)argument2);
+    break;
+  case 263:
+    if (argument2 != 0 && argument2 != 512) { errno = ENOTSUP; break; }
+    result = unlinkat((int)argument0, (const char *)(uintptr_t)argument1,
+                      argument2 == 512 ? AT_REMOVEDIR : 0);
+    break;
+  case 264:
+    result = renameat((int)argument0, (const char *)(uintptr_t)argument1,
+                      (int)argument2, (const char *)(uintptr_t)argument3);
+    break;
+  case 266:
+    result = symlinkat((const char *)(uintptr_t)argument0, (int)argument1,
+                       (const char *)(uintptr_t)argument2);
+    break;
+  case 316:
+    if (argument4 != 1) { errno = ENOTSUP; break; }
+    result = renameatx_np((int)argument0, (const char *)(uintptr_t)argument1,
+                          (int)argument2, (const char *)(uintptr_t)argument3,
+                          RENAME_EXCL);
+    break;
   case 262: {
     struct stat information;
     char executable[PATH_MAX];

@@ -1,0 +1,110 @@
+// Descriptor-relative filesystem operations. Only the root path can contain
+// separators; every subsequent name is one component and opens never follow it.
+import "abla/sys/linux"
+import "abla/sys/linux/fs"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+resource class SecureDirectory(var descriptor: int) {
+    fun drop(): void {
+        if (this.descriptor >= 0) linuxSyscall1(3, this.descriptor)
+        this.descriptor = -1
+    }
+}
+resource class SecureFile(var descriptor: int) {
+    fun drop(): void {
+        if (this.descriptor >= 0) linuxSyscall1(3, this.descriptor)
+        this.descriptor = -1
+    }
+}
+
+private fun secureComponent(name: string): bool {
+    if (name == "" || name == "." || name == "..") return false
+    for (byte in name) if (byte == 0 || byte == 47) return false
+    true
+}
+
+// The caller chooses and trusts the path's parent; its final component is not followed.
+fun secureDirectory(path: string): SecureDirectory {
+    for (byte in path) if (byte == 0) return SecureDirectory(-22)
+    SecureDirectory(linuxOpen(path, 65536 | 131072 | 524288).descriptor)
+}
+
+fun SecureDirectory.openDirectory(name: string): SecureDirectory {
+    if (this.descriptor < 0 || !secureComponent(name)) return SecureDirectory(-22)
+    SecureDirectory(linuxSyscall4(257, this.descriptor, nativeCStringAddress(name),
+        65536 | 131072 | 524288, 0))
+}
+
+fun SecureDirectory.openFile(name: string): SecureFile {
+    if (this.descriptor < 0 || !secureComponent(name)) return SecureFile(-22)
+    SecureFile(linuxSyscall4(257, this.descriptor, nativeCStringAddress(name),
+        131072 | 524288, 0))
+}
+
+fun SecureDirectory.createFile(name: string, mode: int = 0o600): SecureFile {
+    if (this.descriptor < 0 || !secureComponent(name) || mode < 0 || mode >
+        0o777) return SecureFile(-22)
+    SecureFile(linuxSyscall4(257, this.descriptor, nativeCStringAddress(name),
+        1 | 64 | 128 | 131072 | 524288, mode))
+}
+
+fun SecureDirectory.createDirectory(name: string, mode: int = 0o700): bool {
+    if (this.descriptor < 0 || !secureComponent(name) || mode < 0 || mode > 0o777) return false
+    linuxSyscall3(258, this.descriptor, nativeCStringAddress(name), mode) == 0
+}
+
+// Returns zero or negative errno; unsupported platforms/filesystems fail closed.
+fun SecureDirectory.renameNoReplace(name: string, target: SecureDirectory, newName: string): int {
+    if (this.descriptor < 0 || target.descriptor < 0 || !secureComponent(name) ||
+        !secureComponent(newName)) return -22
+    linuxSyscall5(316, this.descriptor, nativeCStringAddress(name), target.descriptor,
+        nativeCStringAddress(newName), 1)
+}
+
+// Creates a new temporary link exclusively, then atomically replaces `name`.
+// A no-follow stat refuses an existing non-symlink. This check is not atomic
+// with the rename: the parent must be trusted and not writable by hostile actors.
+fun SecureDirectory.replaceSymlink(name: string, temporary: string, target: string): bool {
+    if (this.descriptor < 0 || !secureComponent(name) || !secureComponent(temporary) ||
+        !secureComponent(target) || name == temporary) return false
+    val stat = nativeByteBuffer(144)
+    val measured = linuxSyscall4(262, this.descriptor, nativeCStringAddress(name),
+        nativePointerAddress(stat.address), 256)
+    var isLink = false
+    if (measured == 0) isLink = ((stat.load(24) + stat.load(25) * 256) & 0o170000) == 0o120000
+    stat.close()
+    if ((measured == 0 && !isLink) || (measured != 0 && measured != -2)) return false
+    if (linuxSyscall3(266, nativeCStringAddress(target), this.descriptor,
+        nativeCStringAddress(temporary)) != 0) return false
+    val renamed = linuxSyscall4(264, this.descriptor, nativeCStringAddress(temporary),
+        this.descriptor, nativeCStringAddress(name)) == 0
+    if (!renamed) linuxSyscall3(263, this.descriptor, nativeCStringAddress(temporary), 0)
+    renamed
+}
+
+fun SecureDirectory.remove(name: string, directory: bool = false): bool {
+    if (this.descriptor < 0 || !secureComponent(name)) return false
+    linuxSyscall3(263, this.descriptor, nativeCStringAddress(name), if (directory) 512 else 0) == 0
+}
+fun SecureDirectory.sync(): bool = this.descriptor >= 0 && linuxSyscall1(74, this.descriptor) == 0
+fun SecureFile.sync(): bool = this.descriptor >= 0 && linuxSyscall1(74, this.descriptor) == 0
+fun SecureFile.write(contents: string): bool = this.descriptor >= 0 &&
+    linuxWriteAll(this.descriptor, contents)
+fun SecureFile.setPermissions(mode: int): bool = this.descriptor >= 0 && mode >= 0 && mode <=
+    0o777 && linuxSyscall2(91, this.descriptor, mode) == 0
+fun SecureDirectory.setPermissions(mode: int): bool = this.descriptor >= 0 && mode >= 0 && mode <=
+    0o777 && linuxSyscall2(91, this.descriptor, mode) == 0
+
+fun SecureFile.close(): bool {
+    if (this.descriptor < 0) return true
+    val status = linuxSyscall1(3, this.descriptor)
+    this.descriptor = -1
+    status == 0
+}
+fun SecureDirectory.close(): bool {
+    if (this.descriptor < 0) return true
+    val status = linuxSyscall1(3, this.descriptor)
+    this.descriptor = -1
+    status == 0
+}

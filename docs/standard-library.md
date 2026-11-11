@@ -81,6 +81,7 @@ Built into the language rather than imported: `string`, arrays, `Map`,
 | `abla/http/json` | adapters between JSON values and HTTP requests/responses |
 | `abla/compression/gzip` | gzip compression and bounded single-member decompression; `gzipDecompress(input, maxOutputBytes)` returns data and an empty error on success, `limit` when output exceeds the limit, or `invalid` for malformed input (including trailing or concatenated members) |
 | `abla/archive/tar` | Read bounded POSIX ustar files and directories; retains archive bytes and provides offsets, rejecting traversal, duplicates, unsupported entry types and malformed archives |
+| `abla/fs/secure` | Descriptor-relative file and directory operations with component validation, no-follow opens and no-replace rename. `replaceSymlink` requires a trusted parent; its non-symlink destination check is not atomic against a hostile writer. |
 | `abla/tls/hosted` | dynamically loaded OpenSSL client/listener transport with hostname and certificate verification |
 | `abla/websocket` | bounded RFC 6455 handshake, framing, connection lifecycle, and routed server helpers |
 | `abla/websocket/client` | client masking keys |
