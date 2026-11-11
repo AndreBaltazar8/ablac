@@ -235,8 +235,7 @@
   `fun counted(limit: int): Generator<int> = generator { for (i in 0 until limit) yield i }`,
   `fun drain(values: Generator<int>): int { var sum = 0; for (v in values) sum = sum + v; sum }`,
   `fun once(round: int): int { val g = counted(3 + round); drain(g) }`, and a `main` that calls `once` for 40
-  rounds and then appends 2000 strings to an array: segmentation fault. The drop check draws Generators (and `?? continue`, until #775 is
-  on master) only with `--open-bugs` until those are fixed (ablac-f3-2 saw the same class as the `test-labeled-loops` segfault of #736's
+  rounds and then appends 2000 strings to an array: segmentation fault. The drop check draws Generators only with `--open-bugs` until that is fixed (ablac-f3-2 saw the same class as the `test-labeled-loops` segfault of #736's
   first gate).
 
 - **Evaluator: a jump on the right of `??` in a few more operand positions (#775 follow-up, ablac-52's review).**
