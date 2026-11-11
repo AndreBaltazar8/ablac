@@ -245,12 +245,7 @@
   draws the Generator shapes by default again (ablac-f3-2 saw the same class as the `test-labeled-loops` segfault of
   #736's first gate).
 
-- **Generator-machine loop ownership (#784, open).** An outer generator iterating a generator held in a
-  field frees the inner generator and then its holder frees it again. Reproduce with
-  `build/ablac build tests/cases/generator-known-failures/nested-field.ab --fast -o /tmp/nested-field && /tmp/nested-field`;
-  the native program segfaults. A mixed borrowed/fresh source also segfaults: `build/ablac build
-  tests/cases/generator-known-failures/nested-mixed.ab --fast -o /tmp/nested-mixed && /tmp/nested-mixed`.
-  Ownership must be retained across yields. Separately, a temporary resource holder's `drop()` is skipped in ordinary and
+- **Temporary generator owners (open).** A temporary resource holder's `drop()` is skipped in ordinary and
   generator-machine loops: `build/ablac build tests/cases/generator-known-failures/temporary-holder-order.ab
   --fast -o /tmp/temporary-holder-order && /tmp/temporary-holder-order` prints no `holder` events. The holder
   should stay alive through the loop and drop after its generator closes. Design before implementation.

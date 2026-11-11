@@ -242,7 +242,7 @@ fun bootstrapGeneratorWrites(expression: BootstrapExpression, name: string): boo
          kind == "generator.suspend") && expression.text == name) return true
     if (kind == "generator.suspend" && expression.children.size > 1 &&
         expression.children[1].text == name) return true
-    if ((kind == "generator.drop" || kind == "generator.forinit" ||
+    if ((kind == "generator.drop" || kind == "generator.fordrop" || kind == "generator.forinit" ||
          kind == "generator.forstep" || kind == "generator.fornext") &&
         bootstrapGeneratorNames(expression, name)) return true
     // A call may move it or change it through a `var` parameter.
@@ -471,6 +471,41 @@ fun bootstrapLowerGeneratorDrop(
     lowerer.emit("const.void", -1, -1, "")
 }
 
+/** Close a borrowed loop source; drop an owned one, and empty the slot either way. */
+@noinline
+fun bootstrapLowerGeneratorForDrop(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression
+): int {
+    val name = expression.children[0].text
+    val type = bootstrapLowerSlotStorageType(lowerer, name)
+    if (!bootstrapIsGeneratorType(type)) return bootstrapLowerGeneratorDrop(lowerer, expression)
+    val value = if (bootstrapLowerIsCachedSlot(lowerer, name)) {
+        val storage = lowerer.storageFor(name)
+        val held = lowerer.emit("resource.peek", -1, -1, storage)
+        lowerer.emitControl("resource.clear", -1, -1, -1, storage)
+        held
+    } else bootstrapLowerTakeSlot(lowerer, name)
+    val nullValue = lowerer.emit("const.null", -1, -1, "")
+    val active = lowerer.emit("!=", value, nullValue, "")
+    val activeLabel = lowerer.allocateLabel()
+    val doneLabel = lowerer.allocateLabel()
+    val closeLabel = lowerer.allocateLabel()
+    val dropLabel = lowerer.allocateLabel()
+    lowerer.emitControl("branch", active, activeLabel, doneLabel, "")
+    lowerer.emitControl("label", -1, activeLabel, -1, "")
+    val borrowed = lowerer.lowerExpression(expression.children[1])
+    lowerer.emitControl("branch", borrowed, closeLabel, dropLabel, "")
+    lowerer.emitControl("label", -1, closeLabel, -1, "")
+    lowerer.emit("generator.close", value, -1, "")
+    lowerer.emitControl("jump", -1, doneLabel, -1, "")
+    lowerer.emitControl("label", -1, dropLabel, -1, "")
+    lowerer.emitAffineValueDrop(value, type)
+    lowerer.emitControl("jump", -1, doneLabel, -1, "")
+    lowerer.emitControl("label", -1, doneLabel, -1, "")
+    lowerer.emit("const.void", -1, -1, "")
+}
+
 /** A delegated local kept in a slot: its delegate, typed as the local. */
 @noinline
 fun bootstrapLowerGeneratorDeclare(
@@ -503,8 +538,23 @@ fun bootstrapLowerGeneratorForInit(
 ): int {
     val source = expression.children[0]
     val sourceType = bootstrapBorrowElementType(lowerer.lowerExpressionType(source))
-    val value = lowerer.lowerExpression(source)
-    if (bootstrapIsGeneratorType(sourceType)) lowerer.emitResultMove(source)
+    var value = -1
+    if (bootstrapIsGeneratorType(sourceType)) {
+        val flagStorage = "generator_for_borrowed_${lowerer.allocateLabel()}"
+        lowerer.emitControl("local.zero.bool", -1, -1, -1, flagStorage)
+        val mark = lowerer.generatorSourceLeaves.size
+        val leaves: array<BootstrapExpression> = []
+        lowerer.collectImplicitResults(source, leaves)
+        for (leaf in leaves) {
+            lowerer.generatorSourceLeaves.append(leaf)
+            lowerer.generatorSourceFlags.append(flagStorage)
+        }
+        value = lowerer.lowerExpression(source)
+        lowerer.generatorSourceLeaves.truncate(mark)
+        lowerer.generatorSourceFlags.truncate(mark)
+        val borrowed = lowerer.emit("local.load", -1, -1, flagStorage)
+        bootstrapLowerStoreSlot(lowerer, expression.children[4].text, borrowed, "bool")
+    } else value = lowerer.lowerExpression(source)
     bootstrapLowerStoreSlot(lowerer, expression.children[1].text, value, sourceType)
     if (!bootstrapIsGeneratorType(sourceType)) {
         val length = lowerer.emit(
@@ -642,6 +692,7 @@ fun bootstrapLowerGeneratorNode(
         return bootstrapLowerGeneratorLeave(lowerer, expression, expression.text == "true")
     }
     if (kind == "generator.drop") return bootstrapLowerGeneratorDrop(lowerer, expression)
+    if (kind == "generator.fordrop") return bootstrapLowerGeneratorForDrop(lowerer, expression)
     if (kind == "generator.declare") return bootstrapLowerGeneratorDeclare(lowerer, expression)
     if (kind == "generator.retype") {
         bootstrapLowerLearnSlotType(

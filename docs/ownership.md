@@ -282,6 +282,13 @@ What happened, line by line:
   field.
 - `taken` is dropped when `main` ends.
 
+A `for` over a generator closes it when the loop ends, including on `break`,
+`return`, or when an enclosing generator is dropped while suspended. If the
+source is borrowed, its owner retains the handle and drops it later; a fresh
+or moved source belongs to the loop and is dropped there. A field or index of
+an owner, a borrowed parameter, and a global are borrowed. Conditional sources
+follow the ownership of the branch actually selected, including across a `yield`.
+
 The rules:
 
 - `drop` takes no parameters and returns `void`. A second `drop`, or another
