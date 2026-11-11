@@ -1,5 +1,6 @@
 // Descriptor-relative filesystem operations. Only the root path can contain
 // separators; every subsequent name is one component and opens never follow it.
+import "abla/bytes"
 import "abla/sys/linux"
 import "abla/sys/linux/fs"
 import "abla/unsafe/memory"
@@ -107,4 +108,141 @@ fun SecureDirectory.close(): bool {
     val status = linuxSyscall1(3, this.descriptor)
     this.descriptor = -1
     status == 0
+}
+
+// Reads from the handle's current offset through EOF, with a caller-provided
+// byte limit. A one-byte probe detects overflow without trusting a stat size.
+class SecureReadResult(val data: string, val error: string)
+fun SecureFile.read(maxBytes: int): SecureReadResult {
+    if (this.descriptor < 0 || maxBytes < 0) return SecureReadResult("", "invalid")
+    val output = byteBuffer()
+    while (true) {
+        val remaining = maxBytes - output.size()
+        val count = if (remaining < 65536) remaining + 1 else 65536
+        val buffer = nativeByteBuffer(count + 1)
+        val amount = linuxSyscall3(0, this.descriptor, nativePointerAddress(buffer.address), count)
+        if (amount < 0) {
+            buffer.close()
+            if (amount != -4) return SecureReadResult("", "read")
+        } else if (amount == 0) {
+            buffer.close()
+            return SecureReadResult(output.toText(), "")
+        } else {
+            if (amount > remaining) { buffer.close(); return SecureReadResult("", "limit") }
+            output.appendText(buffer.adoptString(amount))
+        }
+    }
+}
+
+// A no-follow open followed by fstat of the opened descriptor. Nonblocking
+// avoids waiting on a planted FIFO before it can be rejected as non-regular.
+fun SecureDirectory.openRegularFile(name: string): SecureFile {
+    if (this.descriptor < 0 || !secureComponent(name)) return SecureFile(-22)
+    val descriptor = linuxSyscall4(257, this.descriptor, nativeCStringAddress(name),
+        131072 | 524288 | 2048, 0)
+    if (descriptor < 0) return SecureFile(descriptor)
+    val stat = nativeByteBuffer(144)
+    val measured = linuxSyscall2(5, descriptor, nativePointerAddress(stat.address))
+    var regular = false
+    if (measured == 0) regular = ((stat.load(24) + stat.load(25) * 256) & 0o170000) == 0o100000
+    stat.close()
+    if (!regular) { linuxSyscall1(3, descriptor); return SecureFile(-22) }
+    SecureFile(descriptor)
+}
+
+class SecureListResult(val names: array<string>, val error: string)
+// Opens an independent scan handle, so repeated calls do not consume the
+// caller's directory position. Errors never masquerade as an empty directory.
+fun SecureDirectory.list(maxEntries: int, maxNameBytes: int): SecureListResult {
+    if (this.descriptor < 0 || maxEntries < 0 || maxNameBytes < 0)
+        return SecureListResult([], "invalid")
+    // The fixed, internal "." is not a caller-supplied component and names
+    // this already-open directory; O_NOFOLLOW still applies to this open.
+    val scan = SecureDirectory(linuxSyscall4(257, this.descriptor, nativeCStringAddress("."),
+        65536 | 131072 | 524288, 0))
+    if (scan.descriptor < 0) return SecureListResult([], "read")
+    val names: array<string> = []
+    val buffer = nativeByteBuffer(65536)
+    while (true) {
+        val measured = linuxSyscall3(217, scan.descriptor, nativePointerAddress(buffer.address),
+            buffer.capacity)
+        if (measured < 0) {
+            if (measured == -4) continue
+            buffer.close()
+            return SecureListResult([], "read")
+        }
+        if (measured == 0) { buffer.close(); return SecureListResult(names, "") }
+        var offset = 0
+        while (offset < measured) {
+            if (measured - offset < 20) { buffer.close(); return SecureListResult([], "invalid") }
+            val length = buffer.load(offset + 16) + buffer.load(offset + 17) * 256
+            if (length < 20 || length > measured -
+                offset) { buffer.close(); return SecureListResult([], "invalid") }
+            val begin = offset + 19
+            var at = begin
+            val end = offset + length
+            while (at < end && buffer.load(at) != 0) at += 1
+            if (at == end) { buffer.close(); return SecureListResult([], "invalid") }
+            val nameLength = at - begin
+            val dot = nameLength == 1 && buffer.load(begin) == 46
+            val dotdot = nameLength == 2 && buffer.load(begin) == 46 && buffer.load(begin + 1) == 46
+            if (!dot && !dotdot) {
+                if (nameLength > maxNameBytes || names.size >= maxEntries) {
+                    buffer.close()
+                    return SecureListResult([], "limit")
+                }
+                val name = byteBuffer()
+                var index = begin
+                while (index < at) { name.appendByteValue(buffer.load(index)); index += 1 }
+                val text = name.toText()
+                if (!secureComponent(text)) { buffer.close(); return SecureListResult([],
+                    "invalid") }
+                names.append(text)
+            }
+            offset += length
+        }
+    }
+}
+
+// A no-follow snapshot only. Open the entry via openRegularFile/openDirectory
+// before using it, because the name may change after this check.
+fun SecureDirectory.entryKind(name: string): string {
+    if (this.descriptor < 0 || !secureComponent(name)) return "error"
+    val stat = nativeByteBuffer(144)
+    val measured = linuxSyscall4(262, this.descriptor, nativeCStringAddress(name),
+        nativePointerAddress(stat.address), 256)
+    var kind = "error"
+    if (measured == -2) kind = "missing"
+    else if (measured == 0) {
+        val mode = (stat.load(24) + stat.load(25) * 256) & 0o170000
+        if (mode == 0o100000) kind = "file"
+        else if (mode == 0o040000) kind = "directory"
+        else if (mode == 0o120000) kind = "symlink"
+        else kind = "other"
+    }
+    stat.close()
+    kind
+}
+
+// Returns permission and special bits of the opened file, or -1 on error.
+fun SecureFile.permissions(): int {
+    if (this.descriptor < 0) return -1
+    val stat = nativeByteBuffer(144)
+    val measured = linuxSyscall2(5, this.descriptor, nativePointerAddress(stat.address))
+    var mode = -1
+    if (measured == 0) mode = (stat.load(24) + stat.load(25) * 256) & 0o7777
+    stat.close()
+    mode
+}
+
+// The descriptor itself is checked, so replacing the original name cannot
+// turn this into a symlink-following check.
+fun SecureFile.isRegular(): bool {
+    if (this.descriptor < 0) return false
+    val stat = nativeByteBuffer(144)
+    val measured = linuxSyscall2(5, this.descriptor, nativePointerAddress(stat.address))
+    var regular = false
+    if (measured == 0) regular = ((stat.load(24) + stat.load(25) * 256) & 0o170000) == 0o100000
+    stat.close()
+    regular
 }

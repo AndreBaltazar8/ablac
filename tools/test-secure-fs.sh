@@ -10,6 +10,9 @@ run_case() {
     local dir=$1
     mkdir -p "$dir/dir"
     printf file > "$dir/existing"
+    chmod 640 "$dir/existing"
+    printf '\000\377' > "$dir/binary"
+    mkfifo "$dir/fifo"
     printf source > "$dir/source"
     printf destination > "$dir/destination"
     ln -s dir "$dir/directory-link"
