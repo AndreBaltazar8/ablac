@@ -4735,6 +4735,7 @@ fun bootstrapIrRuntimeOperationTable(): Map<string, string> {
     table.set("generator.value", "__ablaRuntimeGeneratorValue")
     table.set("generator.yield", "__ablaRuntimeGeneratorYield")
     table.set("generator.drop", "__ablaRuntimeGeneratorDrop")
+    table.set("generator.close", "__ablaRuntimeGeneratorClose")
     table.set("task.create", "__ablaRuntimeTaskCreate")
     table.set("task.drop", "__ablaRuntimeTaskDrop")
     table.set("thread.create", "__ablaRuntimeThreadCreate")
@@ -5418,7 +5419,9 @@ class BootstrapLowerer(
     // Descriptor field places, built once for this lowering graph and shared
     // by its child lowerers. The declaration index preserves duplicate names.
     val classFieldPlaces: Map<int, array<int>> = Map(),
-    var erasedReturnType: string = "unknown"
+    var erasedReturnType: string = "unknown",
+    val generatorSourceLeaves: array<BootstrapExpression> = [],
+    val generatorSourceFlags: array<string> = []
 ) {
     /** The newest visible local named `name` (with a type, when `typed`), or -1. */
     /** Every visible local named `name`, first declared first. */
@@ -5592,6 +5595,23 @@ class BootstrapLowerer(
         }
     }
 
+    /** Whether a loop source is held by somebody outside this loop. */
+    fun generatorSourceIsBorrowed(expression: BootstrapExpression): bool {
+        if (bootstrapIsBorrowType(this.lowerExpressionType(expression))) return true
+        if (expression.kind == "member" || expression.kind == "index" ||
+            expression.kind == "delegate.project") {
+            if (this.lowerPlacePath(expression) != "") return true
+            val root = bootstrapPlaceRootName(expression)
+            return root != "" && !this.isLocal(root) && !this.isParameter(root) &&
+                this.isGlobal(root)
+        }
+        if (expression.kind == "identifier" && !this.isLocal(expression.text) &&
+            this.isParameter(expression.text)) return !this.parameterIsOwned(expression.text)
+        if (expression.kind == "identifier" && !this.isLocal(expression.text) &&
+            !this.isParameter(expression.text) && this.isGlobal(expression.text)) return true
+        false
+    }
+
     fun parameterIsOwned(name: string): bool {
         var found = false
         var index = 0
@@ -5706,12 +5726,11 @@ class BootstrapLowerer(
         if (value < 0 || (child.kind != "call" && child.kind != "member.call")) return value
         if (child.text == "move" || this.callHandsOnAssignment(child)) return value
         val type = this.lowerExpressionType(child)
-        // Only a class instance (a resource, or a class holding one). A generator, a task, a thread, a shared or weak
-        // value and a once function have a consumer of their own (a `for` over a generator drops it, a call of a once
-        // function spends it): the callee may already have ended what the statement would end again.
+        // Keep class resources and generators owned by the caller until the statement ends.
+        // Tasks, threads, shared and weak values and once functions have their own consumers.
         if (bootstrapIsBorrowType(type) || bootstrapIsFunctionType(type) ||
-            !bootstrapAffineNamesContain(this.affineTypes,
-                bootstrapNormalizeType(type))) return value
+            (!bootstrapIsGeneratorType(type) && !bootstrapAffineNamesContain(this.affineTypes,
+                bootstrapNormalizeType(type)))) return value
         val name = "__abla_temporary_${this.allocateLabel()}"
         val storage = "local_${this.nextValue}_$name"
         this.locals.append(name)
@@ -5778,7 +5797,22 @@ class BootstrapLowerer(
                 (this.localStorage[index].size < 10 ||
                  this.localStorage[index].slice(0, 10) != "for_value_") &&
                 !bootstrapIsGeneratorSlotStorage(this.localStorage[index])) {
-                this.emitAffineDrop(
+                if (this.localStorage[index].startsWith("for_dynamic_generator_")) {
+                    val storage = this.localStorage[index]
+                    val borrowed = this.emit("local.load", -1, -1, "${storage}_borrowed")
+                    val closeLabel = this.allocateLabel()
+                    val dropLabel = this.allocateLabel()
+                    val doneLabel = this.allocateLabel()
+                    this.emitControl("branch", borrowed, closeLabel, dropLabel, "")
+                    this.emitControl("label", -1, closeLabel, -1, "")
+                    val value = this.emit("local.load", -1, -1, this.localStorage[index])
+                    this.emit("generator.close", value, -1, "")
+                    this.emitControl("jump", -1, doneLabel, -1, "")
+                    this.emitControl("label", -1, dropLabel, -1, "")
+                    this.emitAffineDrop(storage, this.localTypes[index])
+                    this.emitControl("jump", -1, doneLabel, -1, "")
+                    this.emitControl("label", -1, doneLabel, -1, "")
+                } else this.emitAffineDrop(
                     this.localStorage[index],
                     bootstrapDelegatedStorageOrSelf(this.localTypes[index])
                 )
@@ -8345,6 +8379,18 @@ class BootstrapLowerer(
             )
         }
         var result = this.lowerExpressionAt(expression, valueRequired, eraseResult)
+        var sourceLeaf = this.generatorSourceLeaves.size - 1
+        while (sourceLeaf >= 0) {
+            val leaf = this.generatorSourceLeaves[sourceLeaf]
+            if (leaf == expression) {
+                val borrowed = this.generatorSourceIsBorrowed(expression)
+                val flag = this.emit("const.bool", -1, -1, if (borrowed) "true" else "false")
+                this.emitControl("local.set", flag, -1, -1, this.generatorSourceFlags[sourceLeaf])
+                if (!borrowed) this.emitResultMove(expression)
+                break
+            }
+            sourceLeaf = sourceLeaf - 1
+        }
         if (eraseResult && valueRequired && expression.kind != "block" &&
             expression.kind != "if" && expression.kind != "when" && expression.kind != "return") {
             result = this.lowerEraseFloat(result, this.lowerExpressionType(expression), "any")
@@ -12247,6 +12293,8 @@ fun bootstrapLowerFor(
     var source = -1
     var length = -1
     var indexStorage = ""
+    var sourceStorage = ""
+    var sourceScope = -1
     if (range) {
         val begin = lowerer.lowerExpression(expression.children[0].children[0])
         length = lowerer.lowerExpression(expression.children[0].children[1])
@@ -12256,17 +12304,26 @@ fun bootstrapLowerFor(
         )
         lowerer.emitControl("local.set", begin, -1, -1, indexStorage)
     } else if (!literal) {
-        source = lowerer.lowerExpression(expression.children[0])
+        if (bootstrapIsGeneratorType(sourceType)) {
+            sourceScope = lowerer.enterLocalScope()
+            sourceStorage = "for_dynamic_generator_${lowerer.allocateLabel()}"
+            val flagStorage = "${sourceStorage}_borrowed"
+            lowerer.emitControl("local.zero.bool", -1, -1, -1, flagStorage)
+            val mark = lowerer.generatorSourceLeaves.size
+            val leaves: array<BootstrapExpression> = []
+            lowerer.collectImplicitResults(expression.children[0], leaves)
+            for (leaf in leaves) {
+                lowerer.generatorSourceLeaves.append(leaf)
+                lowerer.generatorSourceFlags.append(flagStorage)
+            }
+            source = lowerer.lowerExpression(expression.children[0])
+            lowerer.generatorSourceLeaves.truncate(mark)
+            lowerer.generatorSourceFlags.truncate(mark)
+        } else source = lowerer.lowerExpression(expression.children[0])
     }
-    // A generator iterated in place is the loop's: a local of a scope around
-    // the loop holds it, so leaving the loop any way (its end, `break`,
-    // `return`) drops it, closing the generator.
-    var sourceStorage = ""
-    var sourceScope = -1
+    // The loop closes its source on every exit. It drops an owned source and
+    // only closes a borrowed source, whose caller still owns the handle.
     if (bootstrapIsGeneratorType(sourceType)) {
-        lowerer.emitResultMove(expression.children[0])
-        sourceScope = lowerer.enterLocalScope()
-        sourceStorage = "for_source_${lowerer.nextValue}"
         lowerer.locals.append("")
         lowerer.localTypes.append(sourceType)
         lowerer.localStorage.append(sourceStorage)

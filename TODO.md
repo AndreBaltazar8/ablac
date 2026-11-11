@@ -228,15 +228,27 @@
   Then labeled `break`/`continue`, `?? continue`, a labeled `do` block and Generators were added to it, and the
   drop check found two bugs on seeds 2641 to 2700: (1) the evaluator left a jump on the right of `??` as a value
   (`total += x ?? continue` under `#`: E_COMPILE_RESULT_NOT_LIFTABLE), #775, fixed on branch `elvis-jump` for
-  assignments, unary operators and `if`/`while`/`do`/`when` operands; (2) OPEN, not #736's (batch 23's compiler
+  assignments, unary operators and `if`/`while`/`do`/`when` operands; (2) fixed, not #736's (batch 23's compiler
   crashes the same way): a local Generator that a `for` in a borrowing callee has ended is dropped again by the
   caller's scope, a silent double free that crashes native code (--fast and release; Wasm and the evaluator are
   fine) in a later free (`host.__ablaRuntimeHostUnregister`, via `__ablaRuntimeGeneratorDrop`). Smallest program:
   `fun counted(limit: int): Generator<int> = generator { for (i in 0 until limit) yield i }`,
   `fun drain(values: Generator<int>): int { var sum = 0; for (v in values) sum = sum + v; sum }`,
   `fun once(round: int): int { val g = counted(3 + round); drain(g) }`, and a `main` that calls `once` for 40
-  rounds and then appends 2000 strings to an array: segmentation fault. The drop check draws Generators only with `--open-bugs` until that is fixed (ablac-f3-2 saw the same class as the `test-labeled-loops` segfault of #736's
-  first gate).
+  rounds and then appends 2000 strings to an array: segmentation fault. A loop over a borrowed generator now closes it
+  without freeing the caller's handle; fresh generators given to borrowing calls remain caller-owned. The drop check
+  draws the Generator shapes by default again (ablac-f3-2 saw the same class as the `test-labeled-loops` segfault of
+  #736's first gate).
+
+- **Generator-machine loop ownership (#784, open).** An outer generator iterating a generator held in a
+  field frees the inner generator and then its holder frees it again. Reproduce with
+  `build/ablac build tests/cases/generator-known-failures/nested-field.ab --fast -o /tmp/nested-field && /tmp/nested-field`;
+  the native program segfaults. A mixed borrowed/fresh source also segfaults: `build/ablac build
+  tests/cases/generator-known-failures/nested-mixed.ab --fast -o /tmp/nested-mixed && /tmp/nested-mixed`.
+  Ownership must be retained across yields. Separately, a temporary resource holder's `drop()` is skipped in ordinary and
+  generator-machine loops: `build/ablac build tests/cases/generator-known-failures/temporary-holder-order.ab
+  --fast -o /tmp/temporary-holder-order && /tmp/temporary-holder-order` prints no `holder` events. The holder
+  should stay alive through the loop and drop after its generator closes. Design before implementation.
 
   On master v0.2.55 after #736, focused resource-drop seeds 3041 to 3100 (24 checks each) agree in all six
   modes. The generator also draws two borrowed temporaries passed to one call and a temporary in the right

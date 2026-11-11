@@ -20,6 +20,16 @@ check() {
     [[ $status -eq 0 && $output == "$2" ]] || { echo "$1: status $status, output '$output'"; exit 1; }
 }
 
+check_fast() {
+    "$compiler" build "$project_root/tests/cases/modules/$1.ab" --fast \
+        -o "$output_directory/$1-fast"
+    set +e
+    output=$("$output_directory/$1-fast")
+    status=$?
+    set -e
+    [[ $status -eq 0 && $output == "$2" ]] || { echo "$1 (--fast): status $status, output '$output'"; exit 1; }
+}
+
 # The same program through `ablac run` (the in-process JIT).
 check_run() {
     set +e
@@ -39,6 +49,27 @@ reject() {
 }
 
 check generator-nested 114
+check generator-borrowed-owner '12340 2000'
+check generator-borrowed-close 'close after-first close after-stop close after-temporary'
+check generator-borrowed-conditional '1000'
+check generator-borrowed-field '1000 2000'
+check generator-borrowed-global $'1\nother 1'
+check generator-borrowed-global-place $'field 1\nother field 1\nindex 1\nother index 1'
+check generator-borrowed-index '1000 2000'
+check_fast generator-borrowed-owner '12340 2000'
+check_fast generator-borrowed-close 'close after-first close after-stop close after-temporary'
+check_fast generator-borrowed-conditional '1000'
+check_fast generator-borrowed-field '1000 2000'
+check_fast generator-borrowed-global $'1\nother 1'
+check_fast generator-borrowed-global-place $'field 1\nother field 1\nindex 1\nother index 1'
+check_fast generator-borrowed-index '1000 2000'
+check_run generator-borrowed-owner '12340 2000'
+check_run generator-borrowed-close 'close after-first close after-stop close after-temporary'
+check_run generator-borrowed-conditional '1000'
+check_run generator-borrowed-field '1000 2000'
+check_run generator-borrowed-global $'1\nother 1'
+check_run generator-borrowed-global-place $'field 1\nother field 1\nindex 1\nother index 1'
+check_run generator-borrowed-index '1000 2000'
 check generator-lazy $'produce 0\ngot 0\nproduce 1\ngot 1\nproduce 2\ngot 2\ntotal 5050\nstart\nv 1\nclosed\n--\nstart\nv 1\nafter 1\nv 2\nafter 2\nclosed\n--\ndropping\na\nbb\nb!\nb!\nc\nu0\nu1\nu2\nc1\nc2\nzero\none\none!\nmany\no 10\nclose a\nclose r\nfirst 1\nlevel 0\nlevel 2\nlevel 4\nlevel 5\nend'
 check generator-affine $'got 7\ngot 8\ndrop 8\ndrop 7\n--\ngot 7\ngot 8\ngot 3\ndrop 8\ndrop 7\n--\ngot 1\ndefer sees 9\ndrop 9\ngot 2\n--\ngot 0\ngot 5\ndrop 5\n--\nend\ndrop 7'
 check task-array-move 6
