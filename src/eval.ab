@@ -1737,6 +1737,15 @@ val BOOTSTRAP_EVAL_REPORTED_INVALID: BootstrapEvalValue =
     BootstrapEvalValue("invalid", 0, false, "", BOOTSTRAP_EVAL_NO_ELEMENTS, "reported",
         BOOTSTRAP_EVAL_NO_FIELDS)
 
+// A step-limit stop leaves every enclosing operand without consuming its default payload.
+// Ordinary invalid values still mean an unsupported or failed expression, not control flow.
+val BOOTSTRAP_EVAL_STOPPED: BootstrapEvalValue =
+    BootstrapEvalValue("invalid", 0, false, "", BOOTSTRAP_EVAL_NO_ELEMENTS, "stopped",
+        BOOTSTRAP_EVAL_NO_FIELDS)
+
+fun bootstrapEvalStopped(value: BootstrapEvalValue): bool =
+    value.kind == "invalid" && value.owner == "stopped"
+
 fun bootstrapEvalInvalidReported(value: BootstrapEvalValue): bool =
     value.kind == "invalid" && value.owner == "reported"
 val BOOTSTRAP_EVAL_TRUE: BootstrapEvalValue =
@@ -1779,15 +1788,15 @@ fun bootstrapEvalScalar(value: int, width: string, nominal: string): BootstrapEv
  *  reached while evaluating an operand (`(x ?? return).size`), which then
  *  leaves the enclosing expression too, before its other operands. */
 fun bootstrapEvalLeaves(value: BootstrapEvalValue): bool =
-    value.kind == "return" || value.kind == "break" || value.kind == "continue"
+    value.kind == "return" || value.kind == "break" || value.kind == "continue" ||
+    bootstrapEvalStopped(value)
 
 /** The first of `values` that leaves its expression (a `return`, `break` or
  *  `continue` reached while evaluating an argument or initializer), or -1. */
 fun bootstrapEvalFirstEscape(values: array<BootstrapEvalValue>): int {
     var index = 0
     while (index < values.size) {
-        val kind = values[index].kind
-        if (kind == "return" || kind == "break" || kind == "continue") return index
+        if (bootstrapEvalLeaves(values[index])) return index
         index = index + 1
     }
     -1
@@ -5249,6 +5258,7 @@ class BootstrapEvaluator(
         if (target < 0 && result.kind == "invalid") {
             result = bootstrapEvalScalarConversion(this, expression, targetName)
         }
+        if (bootstrapEvalLeaves(result)) return result
         // An extern of a module imported under an alias keeps the module's
         // prefix (`__abla_module_<hex>__ablaF64Sqrt`); its intrinsic or host
         // provider knows it by its declared name, as the backend links it.
@@ -5265,12 +5275,13 @@ class BootstrapEvaluator(
         } else result = bootstrapEvaluateIntrinsicCall(
             this, expression, builtinName, result
         )
+        if (bootstrapEvalLeaves(result)) return result
         // A provider that failed (a denied capability, `panic`, `exit`) is the
         // call's outcome: its body, which would act on the host, never runs.
         if (result.kind == "invalid" && this.errors > errorsBefore &&
             ctNativeProviderName(builtinName)) return result
         var declarationIndexNode = this.firstNamed(targetName)
-        while (result.kind == "invalid" &&
+        while (result.kind == "invalid" && !bootstrapEvalStopped(result) &&
                declarationIndexNode >= 0) {
             val declarationIndex = this.namedDeclaration(declarationIndexNode)
             val declaration = this.declarations[declarationIndex]
@@ -5949,7 +5960,7 @@ class BootstrapEvaluator(
             // Past the limit nothing is evaluated: a loop the limit cut short
             // leaves values no later code expects (a slice out of range).
             bootstrapEvalStepLimitReached(this)
-            return bootstrapEvalInvalid()
+            return BOOTSTRAP_EVAL_STOPPED
         }
         // Each level of a nested evaluation holds frames on the compiler's own
         // stack: past the depth that stack can take, stop with a diagnostic
@@ -5996,7 +6007,11 @@ class BootstrapEvaluator(
             51 -> bootstrapEvaluateFor(this, expression)
             else -> bootstrapEvaluateUncommon(this, expression, form)
         }
-        if (result.kind == "invalid" && !bootstrapEvalStmRetrying) {
+        // A loop or helper may have no value after its child stopped. Preserve the stop
+        // through calls and cleanup instead of handing a partial value to its parent.
+        if (this.steps > this.context.stepLimit) result = BOOTSTRAP_EVAL_STOPPED
+        if (result.kind == "invalid" && !bootstrapEvalStmRetrying &&
+            !bootstrapEvalStopped(result)) {
             val reported = bootstrapEvalInvalidReported(result) && this.errors > 0
             if (!reported && this.errors == errorsBefore) {
                 this.errors = this.errors + 1
@@ -6008,7 +6023,7 @@ class BootstrapEvaluator(
         bootstrapEvalDepth = bootstrapEvalDepth - 1
         // While a stack-depth stop unwinds, the levels it passes through
         // failed because of it: it is the one diagnostic, not one per level.
-        val unwinding = bootstrapEvalDepthReported
+        val unwinding = bootstrapEvalDepthReported || this.steps > this.context.stepLimit
         if (bootstrapEvalDepth == 0) {
             bootstrapEvalDepthReported = false
             bootstrapEvalFailedFrames = 0
@@ -6073,6 +6088,11 @@ fun bootstrapEvaluateIntrinsicCall(
         result = bootstrapEvaluateCallText(
             evaluator, expression, targetName, result
         )
+        if (bootstrapEvalLeaves(result)) {
+            if (journaled) bootstrapActionJournalEnd(evaluator, targetName, result,
+                expression.children.size)
+            return result
+        }
     }
     if (targetName.startsWith("compiler")) {
         result = bootstrapEvaluateCallCompiler(
@@ -6101,6 +6121,7 @@ fun bootstrapEvaluateIntrinsicCall(
         result = bootstrapEvaluateCallParser(
             evaluator, expression, targetName, result
         )
+        if (bootstrapEvalLeaves(result)) return result
     }
     if (targetName.startsWith("syntax")) {
         result = bootstrapEvaluateCallSyntax(
@@ -6112,6 +6133,7 @@ fun bootstrapEvaluateIntrinsicCall(
         result = bootstrapEvaluateCallGenerated(
             evaluator, expression, targetName, result
         )
+        if (bootstrapEvalLeaves(result)) return result
     }
     if (targetName.startsWith("typed")) {
         result = bootstrapEvaluateCallTyped(
@@ -6121,10 +6143,12 @@ fun bootstrapEvaluateIntrinsicCall(
     }
     if (result.kind == "invalid" && ctNativeScalarConversion(targetName)) {
         result = ctNativeEvaluateScalarConversion(evaluator, expression, targetName)
+        if (bootstrapEvalLeaves(result)) return result
     }
     if (result.kind == "invalid" && ctNativeIntrinsicPrefix(targetName) &&
         ctNativeIntrinsic(targetName)) {
         result = ctNativeEvaluateIntrinsic(evaluator, expression, targetName)
+        if (bootstrapEvalLeaves(result)) return result
     }
     if (result.kind == "invalid" && ctNativeProviderName(targetName)) {
         val effect = ctNativeProviderTarget(evaluator, "", targetName)
@@ -6137,6 +6161,7 @@ fun bootstrapEvaluateIntrinsicCall(
     if (result.kind == "invalid" && targetName.startsWith("Path.") &&
         expression.children.size > 0) {
         val receiver = bootstrapEvalUnwrapBorrow(evaluator.evaluate(expression.children[0]))
+        if (bootstrapEvalLeaves(receiver)) return receiver
         val method = targetName.slice(5, targetName.size)
         val effect = ctNativePathProvider(evaluator, receiver, method)
         if (effect >= 0) {
@@ -6868,7 +6893,7 @@ fun bootstrapEvalStepLimitReached(var evaluator: BootstrapEvaluator): void {
     if (evaluator.steps == stepLimit + 1) {
         evaluator.recordEvaluatorDiagnostic(
             "E_EVAL_STEP_LIMIT",
-            "compile-time evaluation ran past $stepLimit steps (an endless loop?)"
+            "compile-time evaluation ran past $stepLimit steps (an endless loop?); for heavy compile-time work, try ABLA_COMPILE_EVAL=jit (unsupported sites still use the evaluator)"
         )
     }
 }
@@ -7735,7 +7760,7 @@ fun bootstrapEvaluateIdentifier(
             }
         }
         var declarationIndexNode = evaluator.firstNamed(expression.text)
-        while (result.kind == "invalid" &&
+        while (result.kind == "invalid" && !bootstrapEvalStopped(result) &&
                declarationIndexNode >= 0) {
             val declarationIndex = evaluator.namedDeclaration(declarationIndexNode)
             val declaration = evaluator.declarations[declarationIndex]
@@ -7865,8 +7890,10 @@ fun bootstrapEvaluateFilledArray(
     val count = if (expression.children.size == 2) {
         evaluator.evaluate(expression.children[0])
     } else bootstrapEvalInvalid()
+    if (bootstrapEvalLeaves(count)) return count
     if (count.kind == "integer" && count.integer >= 0) {
         val value = evaluator.evaluate(expression.children[1])
+        if (bootstrapEvalLeaves(value)) return value
         val elements: array<BootstrapEvalValue> = []
         var index = 0
         while (index < count.integer) {
@@ -8826,6 +8853,8 @@ fun bootstrapEvaluateArithmetic(
     } else if (bootstrapEvalF32Operand(leftValue, rightValue, expression.children[0])) {
         leftValue = evaluator.evaluate(bootstrapF32Literals(expression.children[0]))
     }
+    if (bootstrapEvalLeaves(leftValue)) return leftValue
+    if (bootstrapEvalLeaves(rightValue)) return rightValue
     result = if (expression.kind == "+" && leftValue.kind == "string" &&
         rightValue.kind == "string") {
         bootstrapEvalString("${leftValue.text}${rightValue.text}")
@@ -8908,6 +8937,8 @@ fun bootstrapEvaluateEquality(
                !bootstrapEvalErasedType(evaluator.staticSyntaxTypeAt(expression.children[1], 0))) {
         left = evaluator.evaluate(bootstrapF32Literals(expression.children[0]))
     }
+    if (bootstrapEvalLeaves(left)) return left
+    if (bootstrapEvalLeaves(right)) return right
     var equal = bootstrapEvalEqual(left, right)
     if (expression.kind == "!=") equal = !equal
     result = bootstrapEvalBoolean(equal)
@@ -8929,6 +8960,8 @@ fun bootstrapEvaluateComparison(
     } else if (bootstrapEvalF32Operand(leftValue, rightValue, expression.children[0])) {
         leftValue = evaluator.evaluate(bootstrapF32Literals(expression.children[0]))
     }
+    if (bootstrapEvalLeaves(leftValue)) return leftValue
+    if (bootstrapEvalLeaves(rightValue)) return rightValue
     val left = leftValue.integer
     val right = rightValue.integer
     var value = left < right
@@ -12357,82 +12390,106 @@ fun bootstrapEvaluateCallParser(
     var result = initial
     if (targetName == "parserExpect") {
         val cursor = evaluator.evaluate(expression.children[0])
+        if (bootstrapEvalLeaves(cursor)) return cursor
         val expected = evaluator.evaluate(expression.children[1])
+        if (bootstrapEvalLeaves(expected)) return expected
         evaluator.cursors[cursor.integer].expect(expected.text)
         result = bootstrapEvalVoid()
     }
     if (targetName == "parserAt") {
         val cursor = evaluator.evaluate(expression.children[0])
+        if (bootstrapEvalLeaves(cursor)) return cursor
         val expected = evaluator.evaluate(expression.children[1])
+        if (bootstrapEvalLeaves(expected)) return expected
         result = bootstrapEvalBoolean(
             evaluator.cursors[cursor.integer].at(expected.text)
         )
     }
     if (targetName == "parserConsume") {
         val cursor = evaluator.evaluate(expression.children[0])
+        if (bootstrapEvalLeaves(cursor)) return cursor
         val expected = evaluator.evaluate(expression.children[1])
+        if (bootstrapEvalLeaves(expected)) return expected
         result = bootstrapEvalBoolean(
             evaluator.cursors[cursor.integer].consume(expected.text)
         )
     }
     if (targetName == "parserCurrentText") {
         val cursor = evaluator.evaluate(expression.children[0])
+        if (bootstrapEvalLeaves(cursor)) return cursor
         result = bootstrapEvalString(
             evaluator.cursors[cursor.integer].currentText()
         )
     }
     if (targetName == "parserTextAhead") {
         val cursor = evaluator.evaluate(expression.children[0])
+        if (bootstrapEvalLeaves(cursor)) return cursor
         val ahead = evaluator.evaluate(expression.children[1])
+        if (bootstrapEvalLeaves(ahead)) return ahead
         result = bootstrapEvalString(
             evaluator.cursors[cursor.integer].textAhead(ahead.integer)
         )
     }
     if (targetName == "parserRawAt") {
         val cursor = evaluator.evaluate(expression.children[0])
+        if (bootstrapEvalLeaves(cursor)) return cursor
         val text = evaluator.evaluate(expression.children[1])
+        if (bootstrapEvalLeaves(text)) return text
         result = bootstrapEvalBoolean(
             evaluator.cursors[cursor.integer].rawAt(text.text)
         )
     }
     if (targetName == "parserRawConsume") {
         val cursor = evaluator.evaluate(expression.children[0])
+        if (bootstrapEvalLeaves(cursor)) return cursor
         val text = evaluator.evaluate(expression.children[1])
+        if (bootstrapEvalLeaves(text)) return text
         result = bootstrapEvalBoolean(
             evaluator.cursors[cursor.integer].rawConsume(text.text)
         )
     }
     if (targetName == "parserRawExpect") {
         val cursor = evaluator.evaluate(expression.children[0])
+        if (bootstrapEvalLeaves(cursor)) return cursor
         val text = evaluator.evaluate(expression.children[1])
+        if (bootstrapEvalLeaves(text)) return text
         evaluator.cursors[cursor.integer].rawExpect(text.text)
         result = bootstrapEvalVoid()
     }
     if (targetName == "parserRawTakeUntil") {
         val cursor = evaluator.evaluate(expression.children[0])
+        if (bootstrapEvalLeaves(cursor)) return cursor
         val delimiters = evaluator.evaluate(expression.children[1])
+        if (bootstrapEvalLeaves(delimiters)) return delimiters
         result = bootstrapEvalString(
             evaluator.cursors[cursor.integer].rawTakeUntil(delimiters.text)
         )
     }
     if (targetName == "parserRawTakeUntilText") {
         val cursor = evaluator.evaluate(expression.children[0])
+        if (bootstrapEvalLeaves(cursor)) return cursor
         val delimiter = evaluator.evaluate(expression.children[1])
+        if (bootstrapEvalLeaves(delimiter)) return delimiter
         result = bootstrapEvalString(
             evaluator.cursors[cursor.integer].rawTakeUntilText(delimiter.text)
         )
     }
     if (targetName == "parserRawLineRecordsValid") {
         val source = evaluator.evaluate(expression.children[0])
+        if (bootstrapEvalLeaves(source)) return source
         val directiveCatalog = evaluator.evaluate(expression.children[1])
+        if (bootstrapEvalLeaves(directiveCatalog)) return directiveCatalog
         result = bootstrapEvalBoolean(bootstrapRawLineRecordsValid(
             source.text, directiveCatalog.text
         ))
     }
     if (targetName == "parserRawInsertAfterTopLevelRecord") {
         val source = evaluator.evaluate(expression.children[0])
+        if (bootstrapEvalLeaves(source)) return source
         val record = evaluator.evaluate(expression.children[1])
+        if (bootstrapEvalLeaves(record)) return record
         val insertion = evaluator.evaluate(expression.children[2])
+        if (bootstrapEvalLeaves(insertion)) return insertion
         result = bootstrapEvalString(
             bootstrapRawInsertAfterTopLevelRecord(
                 source.text, record.text, insertion.text
@@ -12441,8 +12498,11 @@ fun bootstrapEvaluateCallParser(
     }
     if (targetName == "parserRawInsertBeforeTopLevelRecord") {
         val source = evaluator.evaluate(expression.children[0])
+        if (bootstrapEvalLeaves(source)) return source
         val record = evaluator.evaluate(expression.children[1])
+        if (bootstrapEvalLeaves(record)) return record
         val insertion = evaluator.evaluate(expression.children[2])
+        if (bootstrapEvalLeaves(insertion)) return insertion
         result = bootstrapEvalString(
             bootstrapRawInsertBeforeTopLevelRecord(
                 source.text, record.text, insertion.text
@@ -12451,9 +12511,13 @@ fun bootstrapEvaluateCallParser(
     }
     if (targetName == "parserRawGuardNestedEntries") {
         val source = evaluator.evaluate(expression.children[0])
+        if (bootstrapEvalLeaves(source)) return source
         val entryRecord = evaluator.evaluate(expression.children[1])
+        if (bootstrapEvalLeaves(entryRecord)) return entryRecord
         val beforeEntry = evaluator.evaluate(expression.children[2])
+        if (bootstrapEvalLeaves(beforeEntry)) return beforeEntry
         val afterEntry = evaluator.evaluate(expression.children[3])
+        if (bootstrapEvalLeaves(afterEntry)) return afterEntry
         result = bootstrapEvalString(
             bootstrapRawGuardNestedEntries(
                 source.text,
@@ -12465,9 +12529,13 @@ fun bootstrapEvaluateCallParser(
     }
     if (targetName == "parserRawWrapTopLevelRecord") {
         val source = evaluator.evaluate(expression.children[0])
+        if (bootstrapEvalLeaves(source)) return source
         val record = evaluator.evaluate(expression.children[1])
+        if (bootstrapEvalLeaves(record)) return record
         val beforeRecord = evaluator.evaluate(expression.children[2])
+        if (bootstrapEvalLeaves(beforeRecord)) return beforeRecord
         val afterRecord = evaluator.evaluate(expression.children[3])
+        if (bootstrapEvalLeaves(afterRecord)) return afterRecord
         result = bootstrapEvalString(
             bootstrapRawWrapTopLevelRecord(
                 source.text,
@@ -12479,39 +12547,46 @@ fun bootstrapEvaluateCallParser(
     }
     if (targetName == "parserRawTakeName") {
         val cursor = evaluator.evaluate(expression.children[0])
+        if (bootstrapEvalLeaves(cursor)) return cursor
         result = bootstrapEvalString(
             evaluator.cursors[cursor.integer].rawTakeName()
         )
     }
     if (targetName == "parserRawTakeSymbol") {
         val cursor = evaluator.evaluate(expression.children[0])
+        if (bootstrapEvalLeaves(cursor)) return cursor
         result = bootstrapEvalString(
             evaluator.cursors[cursor.integer].rawTakeSymbol()
         )
     }
     if (targetName == "parserRawSkipWhitespace") {
         val cursor = evaluator.evaluate(expression.children[0])
+        if (bootstrapEvalLeaves(cursor)) return cursor
         evaluator.cursors[cursor.integer].rawSkipWhitespace()
         result = bootstrapEvalVoid()
     }
     if (targetName == "parserRawEnd") {
         val cursor = evaluator.evaluate(expression.children[0])
+        if (bootstrapEvalLeaves(cursor)) return cursor
         result = bootstrapEvalBoolean(
             evaluator.cursors[cursor.integer].rawEnd()
         )
     }
     if (targetName == "parserRawPosition") {
         val cursor = evaluator.evaluate(expression.children[0])
+        if (bootstrapEvalLeaves(cursor)) return cursor
         result = bootstrapEvalInteger(
             evaluator.cursors[cursor.integer].rawPosition
         )
     }
     if (targetName == "parserSiteKey") {
         val cursor = evaluator.evaluate(expression.children[0])
+        if (bootstrapEvalLeaves(cursor)) return cursor
         result = bootstrapEvalString(evaluator.cursors[cursor.integer].site)
     }
     if (targetName == "parserSourceIdentity") {
         val cursor = evaluator.evaluate(expression.children[0])
+        if (bootstrapEvalLeaves(cursor)) return cursor
         result = bootstrapEvalString(
             evaluator.cursors[cursor.integer].sourceIdentity
         )
@@ -12522,7 +12597,9 @@ fun bootstrapEvaluateCallParser(
         result = bootstrapEvalVoid()
     } else if (targetName == "parserFail") {
         val cursor = evaluator.evaluate(expression.children[0])
+        if (bootstrapEvalLeaves(cursor)) return cursor
         val message = evaluator.evaluate(expression.children[1])
+        if (bootstrapEvalLeaves(message)) return message
         evaluator.recordEvaluatorDiagnostic(
             "E_SUBPARSER_FAILURE",
             if (message.kind == "string" && message.text != "")
@@ -12545,6 +12622,7 @@ fun bootstrapEvaluateCallParser(
         ))
     } else if (targetName == "parserParseAblaExpression") {
         val cursor = evaluator.evaluate(expression.children[0])
+        if (bootstrapEvalLeaves(cursor)) return cursor
         result = evaluator.syntaxValue(
             evaluator.cursors[cursor.integer].parseAblaExpression()
         )
@@ -14086,9 +14164,11 @@ fun bootstrapInvokeSubparserHandlerIn(
     bootstrapCompileGlobalsKeep(
         globalKeys, globalValues, evaluator.syntax, evaluator.declarations
     )
-    // After a stack-depth stop, what failed on the way out (each level's
-    // cursor or value) is that one stop: count the errors it reported.
-    val errors = if (bootstrapEvalDepthStops > stopsBefore)
+    // A depth or step stop leaves partial syntax: count only the diagnostics it
+    // reported and retain the stopped source span, so sema does not analyze the holes.
+    val stopped = bootstrapEvalDepthStops > stopsBefore ||
+        evaluator.steps > evaluator.context.stepLimit
+    val errors = if (stopped)
         bootstrapEvalErrorLines(evaluator.diagnostics)
         else evaluator.errors + cursor.errors
     BootstrapSubparserInvocation(
@@ -14098,7 +14178,7 @@ fun bootstrapInvokeSubparserHandlerIn(
         extensionRequests,
         compileInputPaths,
         compileInputContents,
-        bootstrapEvalDepthStops > stopsBefore
+        stopped
     )
 }
 
