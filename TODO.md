@@ -243,11 +243,6 @@
   draws the Generator shapes by default again (ablac-f3-2 saw the same class as the `test-labeled-loops` segfault of
   #736's first gate).
 
-- **Temporary generator owners (open).** A temporary resource holder's `drop()` is skipped in
-  generator-machine loops (ordinary loops are fixed on #788): `build/ablac build tests/cases/generator-known-failures/temporary-holder-order.ab
-  --fast -o /tmp/temporary-holder-order && /tmp/temporary-holder-order` prints no `holder` events. The holder
-  should stay alive through the loop and drop after its generator closes. Design before implementation.
-
 - **Temporary affine-field projection audit (#788).** On master 83d65574, with a temporary
   `Holder(Item(1)).item` whose holder and item have `drop()` methods:
 
@@ -266,8 +261,8 @@
 
   **Release note:** borrowing an affine field of a fresh temporary in an ordinary statement now drops the selected
   temporary owner at the statement boundary. Its `drop()` and owned fields' drops, previously skipped, now run; code
-  with observable destructors can therefore observe new cleanup. Ordinary generator loops retain the owner until
-  the source closes; suspended generator-machine loops are handled separately.
+  with observable destructors can therefore observe new cleanup. Generator loops, including suspended machines,
+  retain the owner until the source closes, then drop the owner.
 
   On master v0.2.55 after #736, focused resource-drop seeds 3041 to 3100 (24 checks each) agree in all six
   modes. The generator also draws two borrowed temporaries passed to one call and a temporary in the right

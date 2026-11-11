@@ -287,7 +287,8 @@ A `for` over a generator closes it when the loop ends, including on `break`,
 source is borrowed, its owner retains the handle and drops it later; a fresh
 or moved source belongs to the loop and is dropped there. A field or index of
 an owner, a borrowed parameter, and a global are borrowed. Conditional sources
-follow the ownership of the branch actually selected, including across a `yield`.
+follow the ownership of the branch actually selected, including across a `yield`. If the owner itself is a
+fresh temporary, the loop holds it until the source closes and then drops it.
 
 The rules:
 

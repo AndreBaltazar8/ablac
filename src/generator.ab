@@ -747,6 +747,33 @@ class BootstrapGeneratorMachine(
         return
     }
 
+    // Keep fresh owning roots of result projections in this loop's state.
+    fun collectForProjectionOwners(expression: BootstrapExpression,
+        var owners: array<BootstrapExpression>): void {
+        if (expression.kind == "block" && expression.children.size > 0) {
+            this.collectForProjectionOwners(expression.children[expression.children.size - 1],
+                owners)
+        } else if (expression.kind == "if") {
+            this.collectForProjectionOwners(expression.children[1], owners)
+            if (expression.children[2].kind != "missing") {
+                this.collectForProjectionOwners(expression.children[2], owners)
+            }
+        } else if (expression.kind == "when") {
+            var branch = 2
+            while (branch < expression.children.size) {
+                this.collectForProjectionOwners(expression.children[branch], owners)
+                branch = branch + 2
+            }
+        } else if ((expression.kind == "member" || expression.kind == "index" ||
+            expression.kind == "delegate.project") && expression.children.size > 0) {
+            val receiver = expression.children[0]
+            val fresh: array<BootstrapExpression> = []
+            bootstrapProjectionFreshLeaves(receiver, fresh)
+            if (fresh.size > 0) owners.append(receiver)
+            this.collectForProjectionOwners(receiver, owners)
+        }
+    }
+
     fun processFor(statement: BootstrapExpression): void {
         val previous = this.enterScope()
         val names = this.envNames.size
@@ -768,6 +795,15 @@ class BootstrapGeneratorMachine(
             this.emit(this.node("assign", limit, statement, [this.rewrite(source.children[1], 0,
                 false)]))
         } else {
+            val rewritten = this.rewrite(source, 0, false)
+            val owners: array<BootstrapExpression> = []
+            this.collectForProjectionOwners(rewritten, owners)
+            val descriptors: array<BootstrapExpression> = []
+            for (owner in owners) {
+                val slot = this.scopedSlot("sourceOwner", statement)
+                descriptors.append(this.node("generator.source.owner", "", statement,
+                    [owner, this.identifier(slot, statement)]))
+            }
             iterated = this.scopedSlot("source", statement)
             val borrowed = this.newSlot("sourceBorrowed", this.node("false", "false", statement,
                 []))
@@ -775,13 +811,15 @@ class BootstrapGeneratorMachine(
             this.forBorrowedFlags.append(borrowed)
             index = this.scopedSlot("index", statement)
             limit = this.scopedSlot("limit", statement)
-            this.emit(this.node("generator.forinit", "", statement, [
-                this.rewrite(source, 0, false),
+            val initializers: array<BootstrapExpression> = [
+                rewritten,
                 this.identifier(iterated, statement),
                 this.identifier(index, statement),
                 this.identifier(limit, statement),
                 this.identifier(borrowed, statement)
-            ]))
+            ]
+            for (descriptor in descriptors) initializers.append(descriptor)
+            this.emit(this.node("generator.forinit", "", statement, initializers))
         }
         val slots: array<BootstrapExpression> = [
             this.identifier(iterated, statement),
