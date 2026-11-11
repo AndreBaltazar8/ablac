@@ -979,6 +979,22 @@
   build, not evaluation; the lever is loading less of it (a module read for its contract only already exists; a lazy
   parse of the bodies of declarations nothing reaches would be the structural cut, and the staged-parse cache that
   saved about 4% (#638, closed) is the measured bound on caching what the frontend produces). No cut proposed.
+  Tests that failed under load (2026-11-10 to 11, ablac-e6; all eight handled, branch `load-stable-final`): the cause in
+  six was a wall-clock budget used as a test limit: `run-limited.sh`'s `ABLA_MAX_SECONDS` (test-http-server 15 s,
+  test-dns-async 30 s, test-compiler-memory-peak 120 s, test-reproducible-elsewhere the launcher's 600 s), a fixed
+  polling window (test-http-server's port line, 5 s; test-android-rpc-example's first request, 10 s; test-build-killed's
+  120 s and 10 s waits), or a bound on how long a stage took (test-tls-faults 20 s, test-dns-async's 9 s "fast"
+  bounds). The rule applied: a budget is CPU time (`ABLA_MAX_CPU_SECONDS`, prlimit, which load does not change) and the
+  wall-clock limit only ends a hang (minutes); a wait polls while the process lives; an assertion says which event ended a
+  wait (an NXDOMAIN answer, not "within 9 s"), not how fast. test-tls-unix's inherited-deadline and handshake checks used
+  250 ms and 3 s timeouts and a 2 s bound: the stalled peers now trickle for 40 s and sleep a minute, so an enforced
+  deadline (200 or 250 ms) and a missing one (40 s) are far apart and the bound sits between; its happy-path waits are a
+  minute. A trap met on the way: `unixConnect` and `tcpConnectIpv4` reject a timeout over 10 s (the connect fails at
+  once), the TLS upgrades take up to 600 s. Evidence (4x oversubscription: 32 busy loops on CPUs 0-7 next to the test,
+  each hold under 9 minutes in the full-then-build slot pattern): test-http-server 575 runs, test-tls-faults 34,
+  test-compiler-memory-peak 23, test-tls-unix 22, test-dns-async 22, test-build-killed 40, test-android-rpc-example 58,
+  test-reproducible-elsewhere 21 (three runs a hold), all passing. Before the changes the same load did not reproduce the failures (test-http-server 20 of 20 and
+  test-tls-faults 8 of 8 passed at 4x and 8x), so those fixes follow from the budgets, not from a failing run.
 - [x] **Tests run on every push to master and on PRs** ([CI](docs/ci.md)): the Linux suite and an
   arm64 macOS host/fixed-point job. Tests only; releases still start by hand.
 - [x] **Parser-derived formatter.** `ablac fmt` preserves comments and verbatim syntax,
