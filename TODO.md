@@ -248,6 +248,22 @@
   --fast -o /tmp/temporary-holder-order && /tmp/temporary-holder-order` prints no `holder` events. The holder
   should stay alive through the loop and drop after its generator closes. Design before implementation.
 
+- **Temporary affine-field projection audit (#788).** On master 83d65574, with a temporary
+  `Holder(Item(1)).item` whose holder and item have `drop()` methods:
+
+  | Use | Master result |
+  | --- | --- |
+  | `val x = Holder(Item(1)).item` | Rejected: `ownership.place-move-required:local.x` |
+  | `take(Holder(Item(1)).item)` with `own` parameter | Rejected: `ownership.place-move-required:argument.function.take` |
+  | `return Holder(Item(1)).item` | Rejected: `ownership.place-move-required:return` |
+  | `x = Holder(Item(1)).item` or assignment to a field | Rejected: `ownership.place-move-required` |
+  | `move(Holder(Item(1)).item)` | Rejected: `ownership.place-owner:` |
+  | `inspect(Holder(Item(1)).item)` with borrowed parameter | Accepted; `inspect` and following statement run, neither holder nor item is dropped |
+  | `for (v in Holder(generator { ... }).item)` | Accepted; generator closes, following statement runs, holder never drops |
+
+  Therefore no accepted move-out of a temporary field was found in these forms; the accepted uses borrow or iterate
+  the projection and leak its owner. #788 retains the owner without changing semantic acceptance.
+
   On master v0.2.55 after #736, focused resource-drop seeds 3041 to 3100 (24 checks each) agree in all six
   modes. The generator also draws two borrowed temporaries passed to one call and a temporary in the right
   side of a short-circuit condition; seeds 3101 to 3140 (24 checks each) agree in all six modes with those
