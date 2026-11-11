@@ -11,7 +11,7 @@ fixture="$project_root/tests/cases/ct-elvis-jump/main.ab"
 rm -rf "$out"
 mkdir -p "$out"
 
-for mode in interp jit; do
+for mode in interp jit bridge; do
     ABLA_COMPILE_EVAL=$mode "$compiler" build "$fixture" -o "$out/main-$mode" --fast --no-cache
     set +e
     text=$("$out/main-$mode")
@@ -24,9 +24,18 @@ for mode in interp jit; do
     compiler_status=$?
     set -e
     [[ $compiler_status -eq 42 ]] || { echo "ct-elvis-jump compiler operands ($mode): exit $compiler_status" >&2; exit 1; }
+    ABLA_COMPILE_EVAL=$mode "$compiler" build "$project_root/tests/cases/ct-elvis-jump/syntax-typed.ab" -o "$out/syntax-typed-$mode" --fast --no-cache
+    set +e
+    "$out/syntax-typed-$mode"
+    syntax_status=$?
+    set -e
+    [[ $syntax_status -eq 42 ]] || { echo "ct-elvis-jump syntax/typed operands ($mode): exit $syntax_status" >&2; exit 1; }
     [[ $text == *" | "* ]] || { echo "ct-elvis-jump ($mode): unexpected output: $text" >&2; exit 1; }
 done
 # An escaped intrinsic must close its journal frame before the next call.
 ABLA_ACTION_JOURNAL=1 ABLA_COMPILE_EVAL=interp "$compiler" build "$project_root/tests/cases/ct-elvis-jump/compiler.ab" -o "$out/journal" --fast --no-cache 2> "$out/journal.log"
 awk '/^ACTION-JOURNAL call loop / { found = ($0 ~ /calls=5 replayable=false value of kind continue/); active = 1; next } /^ACTION-JOURNAL / { active = 0 } active && /compilerIsPrivate\|\?continue=\?continue/ { escaped = 1; next } active && escaped && /compilerFindFunction\|/ { later = 1 } END { exit !(found && escaped && later) }' "$out/journal.log" || { cat "$out/journal.log" >&2; echo "ct-elvis-jump: journal lost the escaped call or the following call" >&2; exit 1; }
+# A typed intrinsic with a nested compiler query keeps that query's journal frame balanced.
+ABLA_ACTION_JOURNAL=1 ABLA_COMPILE_EVAL=interp "$compiler" build "$project_root/tests/cases/ct-elvis-jump/syntax-typed.ab" -o "$out/syntax-journal" --fast --no-cache 2> "$out/syntax-journal.log"
+awk '/^ACTION-JOURNAL call typedJournal / { found = ($0 ~ /calls=1 replayable=false/); active = 1; next } /^ACTION-JOURNAL / { active = 0 } active && /compilerFindFunction\|/ { nested = 1 } END { exit !(found && nested) }' "$out/syntax-journal.log" || { cat "$out/syntax-journal.log" >&2; echo "ct-elvis-jump: nested typed journal frame lost" >&2; exit 1; }
 echo "a jump on the right of ?? leaves its loop under # as in native code: $text"

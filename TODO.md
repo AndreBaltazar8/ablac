@@ -270,8 +270,9 @@
 - **Evaluator: jumps on the right of `??` in operand positions (#775 follow-up).**
   `truncate` and both `slice` bounds propagate jumps, as do the covered compiler intrinsic argument reads, before
   the call can consume the value or evaluate a later argument. The action journal closes abandoned calls;
-  interp and jit regressions and the focused differential fuzzer cover these paths. Remaining open: raw
-  argument reads in `syntax*` and `typed*` intrinsics; those have not been audited for this jump pattern.
+  interp and jit regressions and the focused differential fuzzer cover these paths. Raw argument reads in
+  `syntax*` and `typed*` intrinsics also propagate jumps before validation and before later arguments;
+  `tests/cases/ct-elvis-jump/syntax-typed.ab` covers these paths, including invalid handles.
 
 - [x] **Depth guard follow-on error (#780).** A stack-depth stop inside a subparser could leave
   partial syntax that triggered a misleading `array.element-type` error during semantic analysis.
