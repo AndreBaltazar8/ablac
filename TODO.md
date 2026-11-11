@@ -1231,8 +1231,14 @@
   pays for managed-heap objects and their collection, not for `malloc`; (3) running the escaping path's request inside a region
   reset between requests would free objects a handler is allowed to retain (a stored `HttpRequest`, a response kept for a
   retry), so it needs the handler's promise not to retain, which is the no-escape handler type that exists. The lever for
-  applications that use the router is therefore to give `HttpRouter.dispatch` a no-escape form (the route handlers of
-  abla-web already take it) and to keep the escaping path for handlers that really retain, not a hidden region.
+  applications that use the router would be a no-escape form of `HttpRouter.dispatch` (abla-web's `webNoEscapeRoute` handlers
+  already take that type), not a hidden region. Decided not to build it (ablac-d1, 2026-11-10): the servers that matter do not
+  fit it. abla-web's generated server template and NovaKind's gateway call `httpEventServerHandler` with an escaping closure
+  (middleware closures, per-request state), and NovaKind's main server hands `{ request -> novakindDispatch(router, request) }`
+  to abla-one's `oneLiveServer`, which runs its own event loop (`web_live.ab`, no region) and whose handlers reach Postgres,
+  sessions and files; none of them has been audited for a no-retention contract, and a type that forbids retention is not one
+  they can adopt. What that loop does repeat is a parse: `OneLiveServer.httpWithPeer` parses each request head once to read
+  Content-Length and again for the full request, then copies it to attach the peer.
 - [x] **`abla-compare` json-strings-4k, one worker, rechecked** (2026-11-10, master `7c706497`'s runtime, the setup of the
   headers-32 entry; the 2026-11-06 matrix had Abla 91,781 requests/s against Rust 120,887, -24.1%, and a profile of
   52.3% `jsonPlainStringEnd` + 25.2% `jsonStringIsPlain`): instructions per request, three runs each, Abla 64,308
@@ -1555,24 +1561,24 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   (strace): one serial compiler process from 0.0 to 9.4 s (87% of the wall: the frontend, lowering, IR emission, `opt`
   and the bitcode for the units), then the 9 code generation children 9.46 to 9.82 s (0.36 s, 3%), two `wasm-ld`
   runs 0.08 s, two `llvm-dwarfdump` runs one after the other, `--debug-line` 0.19 s then `--debug-info` 0.28 s
-  (0.47 s, 4.3%, for the source map), and 0.4 s more in the compiler process after them. Inside the in-process libLLVM
-  share (32.5% of the samples; flat, no symbol over 1%): the optimizer's passes and the inliner/cloning about 8.9 points
-  (27% of it, so about 1 s of the 9.4), bitcode writing 3.1, debug-info metadata 2.7, names, hashing and use lists 6.9,
-  IR building and the rest 10.9. So the cut this item is about, a parallel `opt`, is bounded by about 1 s of
-  8.8 (11%) even if perfect, below the 25% bar, as on game-glimpse; the units already take code generation
-  off the serial path. What would move the number: the compiler's own frontend, lowering and allocation (about 51% of
+  (0.47 s, 4.3%, for the source map), and 0.4 s more in the compiler process after them. The in-process libLLVM
+  share (32.5% of the samples) is flat by symbol; a grouping of it by symbol name put the optimizer at about 9 points,
+  which undercounts it (anonymous-namespace pass internals fell into "other"), so the call-graph profile below, with
+  a release compiler built with `-g`, is the one to read. What would move the number: the compiler's own frontend, lowering and allocation (about 51% of
   all instructions, the work the "Where a `--fast` build's CPU goes" item is about), and, for a small, certain
   gain, running the two `llvm-dwarfdump` calls at the same time (-0.19 s, 2% of the wall) or producing the source map
   without them.
-  Inclusive shares of the compiler process in a call-graph profile with a `--fast -g` compiler (slower than the release
-  one, so only the order is meaningful; `perf record --call-graph dwarf`): `bootstrapWasmDebugArtifacts` 8.9%
-  (`bootstrapSourceMapReadInlineCalls` 4.1%, `bootstrapSourceMapReadLineTables` 3.6%: they parse the text of the two
-  dwarfdump runs), which with the dwarfdump children (7.4% of all instructions) and the 0.4 s tail makes the dev build's
-  source map about 0.9 s of 10.8 (8%); `bootstrapEmitHeldWasmObject` 6.3%; `opt` (`runPasses`) 5.2%; lowering
-  (`lowerExpressionType` 11.8%) and inference (`BootstrapAnalyzer.infer` 7.3%) are the rest of the serial front. The
-  source map is the largest part of a dev build's wall time that does not depend on how fast the frontend gets, and
-  it is byte-for-byte reproducible work: concurrent dwarfdump calls and a cheaper parse of their output would
-  not change the map.
+  Inclusive shares in a call-graph profile with a release compiler built with `-g` (`perf record --call-graph dwarf`;
+  percentages of all samples of the build, the compiler process being 73.8% of them): `runPasses`, the in-process `opt`,
+  **23.4%** (the inliner 9.6, InstCombine 5.8, SROA 3.8, EarlyCSE 2.2, SimplifyCFG 1.2), so a perfect 4-way parallel
+  `opt` would take about three quarters of 23.4 / 73.8 of the serial process, roughly 2 s of 8.8 (22%): just under the
+  25% bar, and the cross-part inlining that a split before `opt` loses is the inliner's 9.6%;
+  `bootstrapEmitHeldWasmObject` 27.8% (that `opt` plus the unit cut: `bootstrapWriteCodegenUnits` 2.5%,
+  `LLVMWriteBitcodeToFile` 2.2%, `LLVMCloneModule` 1.5%); LLVM function emission (`bootstrapLlvmEmitFunction`) 4.5%;
+  `bootstrapPreSemanticPipeline` 7.6% (parse, modules); lowering (`BootstrapLowerer.lower`) 7.4%; `analyze` 5.4% and
+  `bootstrapCtAnalyze` 3.7%; `bootstrapInstantiateGenericsIn` 3.5%; the source map 3.7% in the compiler after the cut below
+  (the dwarfdump children are 6.3% on top). The source map is the part of a dev build's wall time that does not depend on how
+  fast the frontend gets, and it is byte-for-byte reproducible work.
   Done (branch `wasm-sourcemap`, src/sourcemap.ab): the two dwarfdump runs start together and the line-table parse makes no
   substring per prefix test or field. Module, `.map` and `.debug.wasm` are byte-identical to the unchanged compiler's on
   the same sysroot (cmp, three builds each). The gain is smaller than the `--fast -g` profile suggested: by the strace
