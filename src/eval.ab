@@ -2639,8 +2639,31 @@ class BootstrapEvaluator(
     var diagnostics: string,
     // The source of the code being evaluated, which an evaluation failure
     // names (bootstrapEvaluateFrom sets it for a declaration's body).
-    var sourceIdentity: string = ""
+    var sourceIdentity: string = "",
+    val projectionOwnerLeaves: array<BootstrapExpression> = [],
+    val projectionOwnerSlots: array<int> = [],
+    var suppressProjectionOwner: int = 0
 ) {
+    fun evaluateProjectionReceiver(expression: BootstrapExpression): BootstrapEvalValue {
+        if (this.suppressProjectionOwner > 0) return this.evaluate(expression)
+        val fresh: array<BootstrapExpression> = []
+        bootstrapProjectionFreshLeaves(expression, fresh)
+        if (fresh.size == 0) return this.evaluate(expression)
+        val slot = this.names.size
+        this.names.append("__abla_temporary_projection_${slot}")
+        this.values.append(this.uninitializedValue())
+        this.mutable.append(false)
+        val mark = this.projectionOwnerLeaves.size
+        for (leaf in fresh) {
+            this.projectionOwnerLeaves.append(leaf)
+            this.projectionOwnerSlots.append(slot)
+        }
+        val value = this.evaluate(expression)
+        this.projectionOwnerLeaves.truncate(mark)
+        this.projectionOwnerSlots.truncate(mark)
+        value
+    }
+
     /** Whether `name` is a field of the method receiver `this`. */
     fun receiverHasField(name: string): bool {
         val index = this.find("this")
@@ -3623,11 +3646,12 @@ class BootstrapEvaluator(
         var index = this.names.size
         while (index > mark) {
             index = index - 1
-            if (this.values[index].kind != "uninitialized" &&
-                this.names[index].startsWith("__abla_temporary_")) {
-                val value = this.values[index]
-                this.dropValue(value)
-                this.values[index] = this.uninitializedValue()
+            if (this.names[index].startsWith("__abla_temporary_")) {
+                if (this.values[index].kind != "uninitialized") {
+                    val value = this.values[index]
+                    this.dropValue(value)
+                    this.values[index] = this.uninitializedValue()
+                }
                 this.names[index] = ""
             }
         }
@@ -5914,12 +5938,13 @@ class BootstrapEvaluator(
         index: int
     ): BootstrapEvalValue {
         val declaration = this.declarations[index]
+        val coercedReceiver = bootstrapEvalCoerce(this, receiver, declaration.extensionOwner)
         val invocation = BootstrapEvaluator(
             this.declarations,
             this.affineTypes,
             this.context,
             ["this"],
-            [bootstrapEvalCoerce(this, receiver, declaration.extensionOwner)],
+            [coercedReceiver],
             [false],
             this.cursors,
             this.syntax,
@@ -6010,6 +6035,16 @@ class BootstrapEvaluator(
         // A loop or helper may have no value after its child stopped. Preserve the stop
         // through calls and cleanup instead of handing a partial value to its parent.
         if (this.steps > this.context.stepLimit) result = BOOTSTRAP_EVAL_STOPPED
+        var projectionLeaf = this.projectionOwnerLeaves.size - 1
+        while (projectionLeaf >= 0) {
+            if (this.projectionOwnerLeaves[projectionLeaf] == expression) {
+                if (this.valueIsAffine(result) && result.kind != "borrow") {
+                    this.values[this.projectionOwnerSlots[projectionLeaf]] = result
+                }
+                break
+            }
+            projectionLeaf = projectionLeaf - 1
+        }
         if (result.kind == "invalid" && !bootstrapEvalStmRetrying &&
             !bootstrapEvalStopped(result)) {
             val reported = bootstrapEvalInvalidReported(result) && this.errors > 0
@@ -8347,7 +8382,12 @@ fun bootstrapEvaluateMember(
     expression: BootstrapExpression
 ): BootstrapEvalValue {
     var result = bootstrapEvalInvalid()
-    val rawReceiver = evaluator.evaluate(expression.children[0])
+    val ownerMark = evaluator.names.size
+    val ownerLeaves: array<BootstrapExpression> = []
+    if (evaluator.suppressProjectionOwner == 0) {
+        bootstrapProjectionFreshLeaves(expression.children[0], ownerLeaves)
+    }
+    val rawReceiver = evaluator.evaluateProjectionReceiver(expression.children[0])
     if (bootstrapEvalLeaves(rawReceiver)) return rawReceiver
     val receiver = bootstrapEvalUnwrapBorrow(rawReceiver)
     // An object's own field named `size` (FileInfo.size) is a field read.
@@ -8366,12 +8406,17 @@ fun bootstrapEvaluateMember(
         }
     } else if (receiver.kind == "object") {
         result = evaluator.objectField(receiver, expression.text)
-        // `make().id`: a fresh resource read for a field that stays valid after it is dropped is a temporary.
-        if (rawReceiver.kind == "object" && bootstrapEvalMayBeTemporary(expression.children[0]) &&
-            !evaluator.valueIsAffine(result)) {
+    } else result = result
+    if (!evaluator.valueIsAffine(result)) {
+        if (ownerLeaves.size > 0 && ownerMark < evaluator.names.size &&
+            evaluator.names[ownerMark].startsWith("__abla_temporary_projection_")) {
+            evaluator.values[ownerMark] = evaluator.uninitializedValue()
+        }
+        // Keep #736's original call-receiver behavior for non-affine fields.
+        if (rawReceiver.kind == "object" && bootstrapEvalMayBeTemporary(expression.children[0])) {
             evaluator.holdTemporary(expression.children[0], rawReceiver)
         }
-    } else result = result
+    }
     if (rawReceiver.kind == "borrow" &&
         bootstrapEvalValueNeedsBorrow(result)) {
         result = bootstrapEvalBorrow(result)
@@ -8460,7 +8505,12 @@ fun bootstrapEvaluateIndex(
     expression: BootstrapExpression
 ): BootstrapEvalValue {
     var result = bootstrapEvalInvalid()
-    val rawReceiver = evaluator.evaluate(expression.children[0])
+    val ownerMark = evaluator.names.size
+    val ownerLeaves: array<BootstrapExpression> = []
+    if (evaluator.suppressProjectionOwner == 0) {
+        bootstrapProjectionFreshLeaves(expression.children[0], ownerLeaves)
+    }
+    val rawReceiver = evaluator.evaluateProjectionReceiver(expression.children[0])
     if (bootstrapEvalLeaves(rawReceiver)) return rawReceiver
     val receiver = bootstrapEvalUnwrapBorrow(rawReceiver)
     val indexValue = evaluator.evaluate(expression.children[1])
@@ -8486,6 +8536,11 @@ fun bootstrapEvaluateIndex(
     } else {
         evaluator.errors = evaluator.errors + 1
         result = result
+    }
+    if (!evaluator.valueIsAffine(result) && ownerLeaves.size > 0 &&
+        ownerMark < evaluator.names.size &&
+        evaluator.names[ownerMark].startsWith("__abla_temporary_projection_")) {
+        evaluator.values[ownerMark] = evaluator.uninitializedValue()
     }
     if (rawReceiver.kind == "borrow" &&
         bootstrapEvalValueNeedsBorrow(result)) {
@@ -9255,7 +9310,9 @@ fun bootstrapEvaluateFor(
 ): BootstrapEvalValue {
     var result = bootstrapEvalInvalid()
     // A borrowed array (a map's affine `values()`) iterates as the array.
+    evaluator.suppressProjectionOwner = evaluator.suppressProjectionOwner + 1
     var source = bootstrapEvalUnwrapBorrow(evaluator.evaluate(expression.children[0]))
+    evaluator.suppressProjectionOwner = evaluator.suppressProjectionOwner - 1
     val generated = bootstrapEvalIsGenerator(source)
     // A generator is iterated in place: the loop owns it, asks it for each
     // element as it needs one, and closes it however the loop ends.

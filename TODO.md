@@ -264,6 +264,10 @@
   Therefore no accepted move-out of a temporary field was found in these forms; the accepted uses borrow or iterate
   the projection and leak its owner. #788 retains the owner without changing semantic acceptance.
 
+  **Release note:** borrowing an affine field of a fresh temporary in an ordinary statement now drops the selected
+  temporary owner at the statement boundary. Its `drop()` and owned fields' drops, previously skipped, now run; code
+  with observable destructors can therefore observe new cleanup. Loop-source lifetimes are handled separately.
+
   On master v0.2.55 after #736, focused resource-drop seeds 3041 to 3100 (24 checks each) agree in all six
   modes. The generator also draws two borrowed temporaries passed to one call and a temporary in the right
   side of a short-circuit condition; seeds 3101 to 3140 (24 checks each) agree in all six modes with those
