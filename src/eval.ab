@@ -8667,11 +8667,28 @@ fun bootstrapEvaluateMemberCall(
     val mutates = expression.text == "append" || expression.text == "truncate" ||
         expression.text == "clear" || expression.text == "takeAt" || expression.text == "set" ||
         expression.text == "remove" || expression.text == "take"
+    val receiverExpression = expression.children[0]
+    val selectedReceiver = receiverExpression.kind == "if" ||
+        receiverExpression.kind == "when" || receiverExpression.kind == "block"
+    val ownerMark = evaluator.names.size
     val rawReceiver =
-        if (mutates) bootstrapEvaluatePlace(evaluator, expression.children[0])
+        if (selectedReceiver) evaluator.evaluateProjectionReceiver(receiverExpression)
+        else if (mutates) bootstrapEvaluatePlace(evaluator, expression.children[0])
         else evaluator.evaluate(expression.children[0])
     if (bootstrapEvalLeaves(rawReceiver)) return rawReceiver
     val receiver = bootstrapEvalUnwrapBorrow(rawReceiver)
+    if (selectedReceiver && (rawReceiver.kind != "object" ||
+        !bootstrapEvalClassHasMethodOrExtension(evaluator, receiver.owner, expression.text))) {
+        var owner = ownerMark
+        while (owner < evaluator.names.size) {
+            if (evaluator.names[owner].startsWith("__abla_temporary_projection_") &&
+                evaluator.values[owner] == rawReceiver) {
+                evaluator.values[owner] = evaluator.uninitializedValue()
+                break
+            }
+            owner = owner + 1
+        }
+    }
     val pathProvider = ctNativePathProvider(evaluator, receiver, expression.text)
     if (pathProvider >= 0) {
         result = ctNativeEvaluatePathMethod(
@@ -8782,15 +8799,17 @@ fun bootstrapEvalClassHasMethodOrExtension(evaluator: BootstrapEvaluator, owner:
         }
         if (indexed) named = evaluator.nextNamed(named) else scanned = scanned + 1
     }
-    var node = evaluator.firstNamed(owner)
-    while (node >= 0) {
-        val declaration = evaluator.declarations[evaluator.namedDeclaration(node)]
+    var node = if (indexed) evaluator.firstNamed(owner) else -1
+    scanned = 0
+    while ((indexed && node >= 0) || (!indexed && scanned < evaluator.declarations.size)) {
+        val index = if (indexed) evaluator.namedDeclaration(node) else scanned
+        val declaration = evaluator.declarations[index]
         if (declaration.kind == "class" && declaration.name == owner) {
             for (method in declaration.methods) {
                 if (method.name == name) return true
             }
         }
-        node = evaluator.nextNamed(node)
+        if (indexed) node = evaluator.nextNamed(node) else scanned = scanned + 1
     }
     false
 }

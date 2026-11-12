@@ -256,6 +256,8 @@
   draws the Generator shapes by default again (ablac-f3-2 saw the same class as the `test-labeled-loops` segfault of
   #736's first gate).
 
+- **Conditional method receivers (#800).** A fresh affine receiver selected by an `if`, `when`, or block is held
+  until its statement ends, in native and compile-time execution. Previously it leaked on both tiers.
 - **Compile-time operator operands (#800).** Fresh borrowed extension arguments, including the second operand of an
   operator, are now dropped during compile-time evaluation in the same newest-first order as native execution.
 - **Compile-time extension receivers (#800).** A fresh affine receiver of an extension call is now dropped at its
