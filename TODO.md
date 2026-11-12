@@ -256,6 +256,8 @@
   draws the Generator shapes by default again (ablac-f3-2 saw the same class as the `test-labeled-loops` segfault of
   #736's first gate).
 
+- **Compile-time extension receivers (#800).** A fresh affine receiver of an extension call is now dropped at its
+  statement boundary during compile-time evaluation, as it already was in native execution.
 - **When match resource values (#798).** A fresh affine match value is now dropped after its comparison; previously
   it leaked. A borrowed match value remains owned by its existing owner, including in a mixed conditional match.
 - **When condition temporary order (#798).** Each match condition now drops its temporary owners after comparison,

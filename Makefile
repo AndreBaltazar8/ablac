@@ -412,6 +412,7 @@ test-serial: ablac
 	tools/test-ownership-precision.sh $(COMPILER)
 	tools/test-drop-temporaries.sh $(COMPILER)
 	tools/test-exit-temporary-defer.sh $(COMPILER)
+	tools/test-extension-temporary-receiver.sh $(COMPILER)
 	tools/test-when-temporary-condition.sh $(COMPILER)
 	tools/test-when-affine-value.sh $(COMPILER)
 	tools/test-default-temporary-owner.sh $(COMPILER)
