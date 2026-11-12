@@ -116,6 +116,7 @@ test-serial: ablac
 	tools/test-compiler-memory-peak.sh $(COMPILER)
 	tools/test-borrow-lifetimes.sh $(COMPILER)
 	tools/test-lambda-borrow-return.sh $(COMPILER)
+	tools/test-inferred-affine-return.sh $(COMPILER)
 	tools/test-lambda-null.sh $(COMPILER)
 	tools/test-ownership-shadows-and-globals.sh $(COMPILER)
 	tools/test-wasm-export-extern.sh $(COMPILER)
