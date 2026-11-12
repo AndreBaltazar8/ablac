@@ -258,6 +258,9 @@
 
 - **Conditional method receivers (#800).** A fresh affine receiver selected by an `if`, `when`, or block is held
   until its statement ends, in native and compile-time execution. Previously it leaked on both tiers.
+- **Generator loops over borrowed containers (#801).** A generator loop no longer drops a borrowed array or its
+  borrowed elements; fresh selected array sources are dropped once when the loop ends. This fixes duplicate drops
+  during iteration and when a suspended generator is closed. The evaluator also iterates borrowed map values.
 - **Compile-time operator operands (#800).** Fresh borrowed extension arguments, including the second operand of an
   operator, are now dropped during compile-time evaluation in the same newest-first order as native execution.
 - **Compile-time extension receivers (#800).** A fresh affine receiver of an extension call is now dropped at its
