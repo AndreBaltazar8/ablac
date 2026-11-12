@@ -39,6 +39,40 @@ for mode in interp jit auto; do
     cp "$out/portable.wasm" "$out/portable-$mode.wasm"
     cp "$out/fallback.wasm" "$out/fallback-$mode.wasm"
 done
+# check_trace_sites LOG: each fallback.ab site is native or interpreted, as expected.
+check_trace_sites() {
+    local log=$1 source=tests/cases/compile-eval-cross-target/fallback.ab
+    local entry name tier found offset text marker rest trimmed expression hits
+    for entry in SKIPPED:native SELECTED:interpreted METHOD:interpreted RAW:interpreted QUERY:interpreted \
+                 PARSER:interpreted GLOBAL:interpreted FAKE:interpreted WHEN:interpreted; do
+        name=${entry%%:*}
+        tier=${entry##*:}
+        found=$(grep -boaE "\\bval[[:space:]]+$name[[:space:]]*=[[:space:]]*#" "$source" | head -n 1)
+        [[ -n $found ]] || { echo "cross-target: no site $name in fallback.ab" >&2; exit 1; }
+        offset=${found%%:*}
+        text=${found#*:}
+        marker=$((offset + ${#text} - 1))
+        rest=$(tail -c +$((marker + 2)) "$source" | head -c 64)
+        trimmed=${rest#"${rest%%[![:space:]]*}"}
+        expression=$((marker + 1 + ${#rest} - ${#trimmed}))
+        if [[ $tier == native ]]; then
+            awk -v tail="fallback.ab:$marker" 'index($0, "note[ct-jit]: native at ") == 1 && substr($0, length($0) - length(tail) + 1) == tail { found = 1 } END { exit !found }' "$log" \
+                || { cat "$log" >&2; echo "cross-target: $name is not native" >&2; exit 1; }
+            ! awk -v p="note[ct-jit]: interpreted at $expression:" 'index($0, p) == 1 { found = 1 } END { exit !found }' "$log" \
+                || { cat "$log" >&2; echo "cross-target: $name was interpreted" >&2; exit 1; }
+        else
+            hits=$(awk -v p="note[ct-jit]: interpreted at $expression: cross-target site reaches " 'index($0, p) == 1' "$log")
+            [[ -n $hits && $(printf '%s\n' "$hits" | wc -l) -eq 1 ]] \
+                || { cat "$log" >&2; echo "cross-target: $name needs exactly one interpreted note at $expression" >&2; exit 1; }
+            case $name in
+                SELECTED|METHOD|GLOBAL) [[ $hits == *'abs:'* ]] || { echo "cross-target: $name lacks abs:" >&2; exit 1; } ;;
+                QUERY) [[ $hits == *'compilerFindFunction:'* ]] || { echo "cross-target: $name lacks compilerFindFunction:" >&2; exit 1; } ;;
+                PARSER) [[ $hits == *'syntaxKind:'* ]] || { echo "cross-target: $name lacks syntaxKind:" >&2; exit 1; } ;;
+                FAKE) [[ $hits == *'expression float'* ]] || { echo "cross-target: $name lacks expression float" >&2; exit 1; } ;;
+            esac
+        fi
+    done
+}
 for mode in jit auto; do
     cmp "$out/portable-interp.wasm" "$out/portable-$mode.wasm"
     cmp "$out/fallback-interp.wasm" "$out/fallback-$mode.wasm"
@@ -58,27 +92,7 @@ for mode in jit auto; do
     grep -q 'interpreted at .*cross-target site reaches abs:' "$out/$mode.log"
     grep -Eq 'interpreted at .*cross-target site reaches .*(pointerIsNull|nativeNullPointer)' "$out/$mode.log"
     [[ $(grep -c 'native at' "$out/$mode.log") -ge 7 ]]
-    python3 - "$out/$mode.log" <<'PYTRACE'
-import pathlib, re, sys
-source = pathlib.Path('tests/cases/compile-eval-cross-target/fallback.ab').read_bytes()
-lines = pathlib.Path(sys.argv[1]).read_text().splitlines()
-for name, tier in [('SKIPPED', 'native'), ('SELECTED', 'interpreted'), ('METHOD', 'interpreted'), ('RAW', 'interpreted'), ('QUERY', 'interpreted'), ('PARSER', 'interpreted'), ('GLOBAL', 'interpreted'), ('FAKE', 'interpreted'), ('WHEN', 'interpreted')]:
-    match = re.search(rb'\bval\s+' + name.encode() + rb'\s*=\s*#', source)
-    assert match, name
-    marker = match.end() - 1
-    expression = marker + 1
-    while source[expression:expression+1].isspace(): expression += 1
-    if tier == 'native':
-        assert any(line.startswith('note[ct-jit]: native at ') and line.endswith(f'fallback.ab:{marker}') for line in lines), (name, lines)
-        assert not any(line.startswith(f'note[ct-jit]: interpreted at {expression}:') for line in lines), name
-    else:
-        hits = [line for line in lines if line.startswith(f'note[ct-jit]: interpreted at {expression}: cross-target site reaches ')]
-        assert len(hits) == 1, (name, expression, lines)
-        if name in ('SELECTED', 'METHOD', 'GLOBAL'): assert 'abs:' in hits[0], (name, hits)
-        if name == 'QUERY': assert 'compilerFindFunction:' in hits[0], (name, hits)
-        if name == 'PARSER': assert 'syntaxKind:' in hits[0], (name, hits)
-        if name == 'FAKE': assert 'expression float' in hits[0], (name, hits)
-PYTRACE
+    check_trace_sites "$out/$mode.log"
 done
 ABLA_COMPILE_EVAL=jit ABLA_COMPILE_EVAL_TRACE=1 "$compiler" build \
     tests/cases/compile-eval-cross-target/build-heavy.ab -o "$out/heavy-builder" --fast --no-cache \
