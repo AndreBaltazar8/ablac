@@ -165,8 +165,8 @@ fun bootstrapLlvmEmitAarch64Routines(backend: BootstrapLlvmBackend): void {
 fun bootstrapLlvmAarch64StartAssembly(): string {
     ".text\n.p2align 2\n" +
     ".pushsection .bss\n.p2align 3\n" +
-    ".globl abla_start_phdr\n.globl abla_start_phnum\n" +
-    "abla_start_phdr: .zero 8\nabla_start_phnum: .zero 8\n" +
+    ".globl abla_start_phdr\n.globl abla_start_phnum\n.globl abla_start_base\n" +
+    "abla_start_phdr: .zero 8\nabla_start_phnum: .zero 8\nabla_start_base: .zero 8\n" +
     ".popsection\n" +
     ".globl abla_start\n.hidden abla_start\n.type abla_start,@function\n" +
     "abla_start:\n" +
@@ -184,6 +184,31 @@ fun bootstrapLlvmAarch64StartAssembly(): string {
     "    b 2b\n" +
     "3:  adrp x9, abla_start_phdr\n    str x24, [x9, :lo12:abla_start_phdr]\n" +
     "    adrp x9, abla_start_phnum\n    str x25, [x9, :lo12:abla_start_phnum]\n" +
+    // A static-pie image moves: the load bias is the runtime address of the program headers
+    // less the PT_PHDR address the linker gave them (0 for a non-PIE image, whose headers
+    // have no PT_PHDR); PT_DYNAMIC (2) holds the relocations and the init_array.
+    "    mov x28, #0\n    mov x9, #0\n    mov x0, x24\n    mov x1, x25\n" +
+    "20: cbz x1, 23f\n    ldr w2, [x0]\n    cmp w2, #6\n    b.ne 21f\n    ldr x3, [x0, #16]\n    sub x28, x24, x3\n" +
+    "21: cmp w2, #2\n    b.ne 22f\n    ldr x9, [x0, #16]\n" +
+    "22: add x0, x0, #56\n    sub x1, x1, #1\n    b 20b\n" +
+    "23: adrp x10, abla_start_base\n    str x28, [x10, :lo12:abla_start_base]\n" +
+    "    mov x10, #0\n    mov x11, #0\n    mov x26, #0\n    mov x27, #0\n" +
+    "    cbz x9, 27f\n    add x9, x9, x28\n" +
+    "24: ldp x0, x1, [x9], #16\n    cbz x0, 25f\n" +
+    "    cmp x0, #7\n    csel x10, x1, x10, eq\n" +
+    "    cmp x0, #8\n    csel x11, x1, x11, eq\n" +
+    "    cmp x0, #25\n    csel x26, x1, x26, eq\n" +
+    "    cmp x0, #27\n    csel x27, x1, x27, eq\n" +
+    "    cmp x0, #36\n    b.eq 99f\n    cmp x0, #17\n    b.eq 99f\n" +
+    "    b 24b\n" +
+    // Only R_AARCH64_RELATIVE (1027): *(bias + offset) = bias + addend.
+    "25: cbz x10, 26f\n    add x10, x10, x28\n" +
+    "251: cbz x11, 26f\n    ldp x0, x1, [x10]\n    ldr x2, [x10, #16]\n    mov x3, #0x403\n    cmp x1, x3\n    b.ne 99f\n" +
+    "    add x0, x0, x28\n    add x2, x2, x28\n    str x2, [x0]\n    add x10, x10, #24\n    sub x11, x11, #24\n    b 251b\n" +
+    "26: add x26, x26, x28\n    add x27, x26, x27\n    b 28f\n" +
+    // No dynamic section: no relocations and no init_array.
+    "27:\n" +
+    "28:\n" +
     // The main thread's TLS block: mapped here, never unmapped.
     "    mov x0, x24\n    mov x1, x25\n    bl abla_tls_bytes\n" +
     "    tbnz x0, #63, 99f\n" +
@@ -191,15 +216,11 @@ fun bootstrapLlvmAarch64StartAssembly(): string {
     "    cmn x0, #4095\n    b.hs 99f\n" +
     "    mov x1, x24\n    mov x2, x25\n    bl abla_tls_init\n" +
     "    msr tpidr_el0, x0\n" +
-    // init_array, when the linker made one.
-    "    .weak __init_array_start\n    .weak __init_array_end\n" +
-    "    ldr x9, 12f\n    ldr x10, 13f\n" +
-    "10: cmp x9, x10\n    b.hs 11f\n    ldr x11, [x9], #8\n    stp x9, x10, [sp, #-16]!\n" +
-    "    mov x0, x20\n    mov x1, x21\n    mov x2, x22\n    blr x11\n    ldp x9, x10, [sp], #16\n    b 10b\n" +
+    "10: cmp x26, x27\n    b.hs 11f\n    ldr x11, [x26], #8\n" +
+    "    mov x0, x20\n    mov x1, x21\n    mov x2, x22\n    blr x11\n    b 10b\n" +
     "11: mov x0, x20\n    mov x1, x21\n    mov x2, x22\n    bl main\n" +
     "    mov x8, #94\n    svc #0\n" +
     "99: mov x0, #127\n    mov x8, #94\n    svc #0\n" +
-    ".p2align 3\n12: .quad __init_array_start\n13: .quad __init_array_end\n" +
     ".size abla_start, . - abla_start\n" +
     // abla_tls_bytes(phdr, phnum): the bytes of one thread's TLS block (a page for the thread
     // control block, the image after it at its alignment, rounded to a page), or -1.
@@ -223,7 +244,7 @@ fun bootstrapLlvmAarch64StartAssembly(): string {
     "2:  cbz x3, 9f\n" +
     "    mov x4, #16\n    ldr x5, [x3, #48]\n    cmp x5, x4\n    csel x4, x5, x4, hi\n" +
     "    sub x5, x4, #1\n    add x6, x5, #16\n    bic x6, x6, x5\n" +
-    "    ldr x10, [x3, #16]\n    ldr x11, [x3, #32]\n    add x12, x9, x6\n" +
+    "    ldr x10, [x3, #16]\n    adrp x14, abla_start_base\n    ldr x14, [x14, :lo12:abla_start_base]\n    add x10, x10, x14\n    ldr x11, [x3, #32]\n    add x12, x9, x6\n" +
     "3:  cbz x11, 9f\n    ldrb w13, [x10], #1\n    strb w13, [x12], #1\n    sub x11, x11, #1\n    b 3b\n" +
     "9:  mov x0, x9\n    ret\n" +
     ".size abla_tls_init, . - abla_tls_init\n"
