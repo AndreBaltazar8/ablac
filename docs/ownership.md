@@ -606,6 +606,16 @@ events = events + "C${box.b}|"
 // HI4C4|
 ```
 
+A helper forced by name shadowing drops its temporary before the called
+function and the next caller argument
+([test](../tests/cases/default-shadow-helper/main.ab)).
+
+```abla fragment
+val Holder = 5
+pair(value(tag = Holder), side())
+// HI5F5S|
+```
+
 **Exits and defers.** `return` computes its result first. For each scope left
 by `return`, `break` or `continue`, innermost first, the exiting statement's
 temporaries belonging to that scope drop, its defers run, and its locals drop.
@@ -722,8 +732,7 @@ drop effects; do not assume it extends the temporary owner's lifetime.
 These rules also apply to compile-time evaluation under `#`. There are still
 known gaps: temporary resources passed through interface calls,
 interface default bodies, and some built-in container methods can leak rather
-than drop. Bind the resource to a `val` or transfer it to `own` instead. A
-helper forced by name shadowing has no dedicated drop-order regression yet.
+than drop. Bind the resource to a `val` or transfer it to `own` instead.
 
 ## Collections of resources
 

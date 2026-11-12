@@ -424,6 +424,7 @@ test-serial: ablac
 	tools/test-when-temporary-condition.sh $(COMPILER)
 	tools/test-when-affine-value.sh $(COMPILER)
 	tools/test-default-temporary-owner.sh $(COMPILER)
+	tools/test-default-shadow-helper.sh $(COMPILER)
 	tools/test-local-root-liveness.sh $(COMPILER)
 	tools/test-global-initializer-split.sh $(COMPILER)
 	tools/test-gc-growth.sh $(COMPILER)
