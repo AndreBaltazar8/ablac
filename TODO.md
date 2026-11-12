@@ -143,6 +143,11 @@
       if an ARM64 tagged-heap host compiler ever ships.
 
 
+- [ ] **Differential fuzzer: cross-target compile-time tiers.** `--cross-target-tiers` builds a
+  generated Wasm child under interp, jit and auto; Python expectations and byte-identical modules
+  are checked, with trace-confirmed native sites and explicit float, pointer and target-probe
+  fallbacks. Seeds 6101–6107 passed on the c1a93ef7 compiler; the tool suite includes two seeds.
+
 - [ ] **Differential fuzzer: shared compile-time globals (#796).** `--shared-globals` compares
   Python-computed expectations in interp, jit and auto for array, map, object field, aliased array,
   called-function mutation and read-only controls; it stays outside the default mix until #796 lands.

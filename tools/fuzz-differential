@@ -21,6 +21,7 @@ tests/cases/fuzz-differential-<seed>-<check>/ (program.ab and expected outputs).
   tools/fuzz-differential --check-hostless-capabilities  # assert task/thread Wasm rejection
   tools/fuzz-differential --module-graphs --seeds 1-3  # strict module graphs and cache edits
   tools/fuzz-differential --subparser-graphs --seeds 1-3  # generated calls and provider edits
+  tools/fuzz-differential --cross-target-tiers --seeds 1-3  # wasm child compile-time parity
   tools/fuzz-differential --shared-globals --seeds 1-3  # known #796; interp/jit/auto
   tools/fuzz-differential --check-subparser-refusals  # expected diagnostics in interp/JIT
   tools/fuzz-differential --seed 7 --keep     # one seed, keep its directory
@@ -30,6 +31,7 @@ Exit status 0 when every mode agreed.
 import argparse
 import concurrent.futures
 import glob
+import hashlib
 import json
 import os
 import re
@@ -2441,6 +2443,117 @@ compile fun parseStop(cursor: ParserCursor): SyntaxExpression {
     return 0
 
 
+# Each generated site belongs to the Wasm child, not its native build driver.
+def cross_target_program(seed, data_path, data):
+    rng = random.Random(seed)
+    n = rng.randint(1, 1000)
+    shift = rng.randint(64, 80)
+    values = [rng.randint(1, 50) for _ in range(3)]
+    text = f'tier{seed}x{n}'
+    digest = hashlib.sha256(data.encode('ascii')).hexdigest()
+    wrapped = ((2**63 - 1 + n + 2**63) % 2**64) - 2**63
+    source = f'''import "abla/wasm/build"
+import "abla/compiler"
+import "abla/bytes"
+import "abla/crypto"
+import "abla/fs"
+import "abla/uint128"
+import "abla/unsafe/memory/raw"
+#compilerGrant("filesystem.read")
+#compilerGrant("trusted.native")
+class TierBox(var value: int)
+compile fun wrapping(): int {{ var x = 9223372036854775807; x += {n}; x }}
+compile fun sequence(): int {{ val xs: array<int> = [{values[0]}, {values[1]}]; xs.append({values[2]}); xs[0] + xs[1] + xs[2] }}
+compile fun boxed(): int {{ val box = TierBox({values[0]}); box.value += {values[1]}; box.value }}
+compile fun byteSum(): int {{ val b = byteBuffer(); b.appendByteValue({values[0]}); b.appendByteValue({values[1]}); val t = b.toText(); t[0] + t[1] }}
+trusted fun pointerCheck(): int = if (pointerIsNull(nativeNullPointer())) 42 else 1
+val WRAP = #wrapping()
+val SHIFT = #(1 << {shift})
+val TEXT = #"{text}".slice(1, {len(text) - 1})
+val ARRAY = #sequence()
+val CLASS = #boxed()
+val BYTES = #byteSum()
+val HASH = #hexEncode(sha256("{data}"))
+val FILE = #path("{data_path}").readText()
+val FLOAT = #(1.5 + 0.5)
+val POINTER = #pointerCheck()
+val TARGET = #ablaU128NarrowTarget()
+@export("run")
+fun run(): int {{
+    if (WRAP != {wrapped} || SHIFT != 0 || TEXT != "{text[1:-1]}") return 1
+    if (ARRAY != {sum(values)} || CLASS != {values[0] + values[1]} || BYTES != {values[0] + values[1]}) return 2
+    if (HASH != "{digest}" || FILE != "{data}") return 3
+    if (FLOAT != 2.0 || POINTER != 42 || TARGET) return 4
+    0
+}}
+'''
+    return source
+
+
+def run_cross_target_tiers(args, seed, runner):
+    directory = os.path.join(WORK, f'cross-target-tiers-{seed}')
+    absolute = os.path.join(ROOT, directory)
+    os.makedirs(absolute, exist_ok=True)
+    source = os.path.join(directory, 'child.ab')
+    data_path = os.path.join(directory, 'input.txt')
+    data = f'tier fixture {seed}\n'
+    # The generated literal itself contains no newline escapes.
+    data = data.rstrip('\n')
+    text = cross_target_program(seed, data_path, data)
+    for name, content in [('child.ab', text), ('input.txt', data),
+                          ('abla.toml', 'compileCapabilities = ["filesystem.read", "trusted.native"]\n')]:
+        with open(os.path.join(absolute, name), 'w', encoding='utf-8') as f:
+            f.write(content)
+    wasm = os.path.join(directory, 'child.wasm')
+    driver = os.path.join(directory, 'build.ab')
+    with open(os.path.join(ROOT, driver), 'w', encoding='utf-8') as f:
+        f.write(f'import "abla/wasm/build"\nval built = #wasmBuildModule("tier", "{source}", "{wasm}", true, false)\nfun main: int = if (built) 0 else 1\n')
+    artifacts = {}
+    tier_counts = {}
+    for mode in ('interp', 'jit', 'auto'):
+        cmd = [runner.compiler, 'build', driver, '--fast', '--no-cache', '-o', os.path.join(directory, 'builder')]
+        if os.path.exists(os.path.join(ROOT, wasm)):
+            os.unlink(os.path.join(ROOT, wasm))
+        rc, _, trace = runner.sh(cmd, {'ABLA_COMPILE_EVAL': mode, 'ABLA_COMPILE_EVAL_TRACE': '1'})
+        with open(os.path.join(absolute, mode + '.trace'), 'w', encoding='utf-8') as f:
+            f.write(trace)
+        if rc != 0 or not os.path.exists(os.path.join(ROOT, wasm)):
+            return f'cross-target seed {seed} {mode}: build failed ({rc}): {trace[-2000:]}; retained {directory}'
+        artifacts[mode] = open(os.path.join(ROOT, wasm), 'rb').read()
+        with open(os.path.join(absolute, mode + '.wasm'), 'wb') as f:
+            f.write(artifacts[mode])
+        build_rc, _, build_err = runner.sh([os.path.join(directory, 'builder')])
+        if build_rc != 0:
+            return f'cross-target seed {seed} {mode}: builder exited {build_rc}: {build_err}; retained {directory}'
+        rc, out, err = runner.sh(['node', os.path.join(ROOT, 'tools/fuzz-differential.mjs'), wasm])
+        if rc != 0 or out:
+            return f'cross-target seed {seed} {mode}: oracle failed status={rc} stdout={out!r} stderr={err!r}; retained {directory}'
+        if mode != 'interp':
+            native = []
+            for name in ('WRAP', 'SHIFT', 'TEXT', 'ARRAY', 'CLASS', 'BYTES', 'HASH', 'FILE'):
+                match = re.search(rb'\bval\s+' + name.encode() + rb'\s*=\s*#', text.encode())
+                marker = match.end() - 1
+                if any(line.startswith('note[ct-jit]: native at ') and line.endswith(f'child.ab:{marker}')
+                       for line in trace.splitlines()):
+                    native.append(name)
+            if not native:
+                return f'cross-target seed {seed} {mode}: vacuous (no native child sites); retained {directory}'
+            for name, reason in (('FLOAT', 'expression float'), ('POINTER', 'pointerIsNull'),
+                                 ('TARGET', 'ablaU128NarrowTarget')):
+                match = re.search(rb'\bval\s+' + name.encode() + rb'\s*=\s*#', text.encode())
+                expression = match.end()
+                while text.encode()[expression:expression+1].isspace() or text.encode()[expression:expression+1] == b'(': expression += 1
+                if not any(line.startswith(f'note[ct-jit]: interpreted at {expression}: cross-target site reaches ') and reason in line for line in trace.splitlines()):
+                    return f'cross-target seed {seed} {mode}: {name} not observed interpreted; retained {directory}'
+            tier_counts[mode] = native
+    if artifacts['interp'] != artifacts['jit'] or artifacts['interp'] != artifacts['auto']:
+        return f'cross-target seed {seed}: Wasm bytes differ between tiers; retained {directory}'
+    print(f'cross-target seed {seed}: byte-identical Wasm and Python oracle; native child sites {tier_counts}')
+    if not args.keep:
+        shutil.rmtree(absolute, ignore_errors=True)
+    return None
+
+
 # #796: independent programs keep a failing shape small and preserve site order.
 # Expected output comes from Python; a mismatch is a failure, never an expected pass.
 def shared_global_program(seed, kind):
@@ -2534,6 +2647,7 @@ def main():
     ap.add_argument("--panics", action="store_true", help="also run one panicking program per seed (native and Wasm)")
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--selftest", action="store_true", help="check the comparison on made-up results")
+    ap.add_argument("--cross-target-tiers", action="store_true", help="compare interp/jit/auto child Wasm bytes and Python oracles")
     ap.add_argument("--shared-globals", action="store_true", help="run known #796 compile-time shared-global campaign (interp/jit/auto)")
     ap.add_argument("--hosted-tasks", action="store_true", help="draw task/thread checks; compare only the four hosted modes")
     ap.add_argument("--module-graphs", action="store_true", help="check strict multi-module graphs and cache invalidation in all six modes")
@@ -2543,6 +2657,8 @@ def main():
     ap.add_argument("--show", action="store_true", help="with --program: print the output of the fast build")
     ap.add_argument("--program", help="run an existing .ab program (with @export(\"run\")) all ways")
     args = ap.parse_args()
+    if args.cross_target_tiers and (args.shared_globals or args.module_graphs or args.subparser_graphs or args.hosted_tasks or args.focus or args.panics or args.program or args.selftest or args.check_subparser_refusals or args.check_hostless_capabilities):
+        ap.error('--cross-target-tiers cannot be combined with other campaigns')
     if args.shared_globals and (args.module_graphs or args.subparser_graphs or args.hosted_tasks or args.focus or args.panics or args.program or args.selftest or args.check_subparser_refusals or args.check_hostless_capabilities):
         ap.error('--shared-globals cannot be combined with other campaigns')
     if args.module_graphs and (args.subparser_graphs or args.hosted_tasks or args.focus or args.panics or args.program):
@@ -2584,14 +2700,17 @@ def main():
         return 1 if bad else 0
     failures = 0
     for seed in seed_range(args.seed or args.seeds):
-        found = (run_shared_globals(args, seed, runner) if args.shared_globals else
+        found = (run_cross_target_tiers(args, seed, runner) if args.cross_target_tiers else
+                 run_shared_globals(args, seed, runner) if args.shared_globals else
                  run_module_graph(args, seed, runner) if args.module_graphs else
                  run_subparser_seed(args, seed, runner) if args.subparser_graphs else run_seed(args, seed, runner))
         if found:
             failures += 1
             print(found)
         else:
-            if args.shared_globals:
+            if args.cross_target_tiers:
+                continue  # run_cross_target_tiers reports native child sites
+            elif args.shared_globals:
                 print(f'shared globals seed {seed}: 6 shapes agree with Python oracle in interp/jit/auto')
             elif args.module_graphs:
                 print(f'graph seed {seed}: no-cache, cached cold/warm/discovery-hit and provider edits agree in all six modes')

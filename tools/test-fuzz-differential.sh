@@ -91,6 +91,7 @@ python3 tools/fuzz-differential --compiler "$compiler" --hosted-tasks --seeds 1-
 python3 tools/fuzz-differential --compiler "$compiler" --check-hostless-capabilities
 python3 tools/fuzz-differential --compiler "$compiler" --module-graphs --seeds 2
 python3 tools/fuzz-differential --compiler "$compiler" --subparser-graphs --seeds 1
+python3 tools/fuzz-differential --compiler "$compiler" --cross-target-tiers --seeds 1-2
 python3 tools/fuzz-differential --compiler "$compiler" --check-subparser-refusals
 # The cases the fuzzer found stay as programs: every mode must print the same, and
 # a compile-time answer that differs from the run-time one prints MISMATCH.
