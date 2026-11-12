@@ -9,10 +9,10 @@ mkdir -p "$out"
 cd "$root"
 compile() { (ulimit -s 131072; "$compiler" build "$@"); }
 compile tests/cases/yaml/probe.ab --fast --no-cache -o "$out/probe"
-python3 tests/cases/yaml/check.py "$out/probe" "$out"
+bash tests/cases/yaml/check.sh "$out/probe" "$out"
 compile tests/cases/yaml/edit-probe.ab --fast --no-cache -o "$out/edit-probe"
-python3 tests/cases/yaml/edit-check.py "$out/edit-probe" "$out"
-ABLA_GC_STRESS=1 python3 tests/cases/yaml/edit-check.py "$out/edit-probe" "$out"
+bash tests/cases/yaml/edit-check.sh "$out/edit-probe" "$out"
+ABLA_GC_STRESS=1 bash tests/cases/yaml/edit-check.sh "$out/edit-probe" "$out"
 for mode in interp jit; do
     ABLA_COMPILE_EVAL=$mode compile tests/cases/yaml/all-phases.ab --fast --no-cache -o "$out/phases-$mode"
     status=0
