@@ -362,6 +362,8 @@
   0.027 s including reading it, and concatenating file slices 0.052 s including reading/scanning. The optional
   cached-archive test is `ABLA_TEST_XTENSA_COMPANION=<archive> tools/test-xtensa-companion-offline.sh`; the
   release-packaged installer, download, activation and helper execution remain open.
+  The offline test previously left published 0555 directories in build/, preventing ordinary clean and
+  worktree removal; its exit trap restores owner write permission even when a case fails.
 - [x] `abla/yaml` provides bounded Core-schema parsing, checked emission and comment/format-preserving path edits;
       see [docs/stdlib/yaml.md](docs/stdlib/yaml.md) and the synthetic provision-mail fixture. NovaKind can adopt it after release.
 

@@ -5,6 +5,15 @@ compiler=${1:-$root/build/ablac}
 cd "$root"
 export ABLA_SYSROOT="$root"
 out="$root/build/xtensa-companion-offline"
+restore_output_permissions() {
+    local status=$?
+    if [[ -d $out && ! -L $out ]] && ! chmod -R u+w "$out"; then
+        printf 'failed to restore owner write permission under %s\n' "$out" >&2
+        if [[ $status -eq 0 ]]; then status=1; fi
+    fi
+    return "$status"
+}
+trap restore_output_permissions EXIT
 if [[ -d $out ]]; then chmod -R u+w "$out"; rm -rf "$out"; fi
 mkdir -p "$out/fixtures" "$out/target" "$out/negative" "$out/fault" "$out/concurrent" "$out/many" "$out/root-link"
 python3 tests/cases/xtensa-companion-offline/make-fixtures.py "$out/fixtures"
