@@ -1,0 +1,51 @@
+// epoll with x86-64's packed 12-byte epoll_event (4-byte events, 8-byte data): the same
+// bytes must go in and come out on every Linux target. AArch64's kernel event is 16 bytes,
+// so abla_x64_syscall converts (#811); this exits 42 natively and under qemu-aarch64.
+import "abla/sys/linux"
+import "abla/unsafe/memory"
+
+trusted fun word32(buffer: NativeByteBuffer, offset: int): int =
+    buffer.load(offset) + buffer.load(offset + 1) * 256 + buffer.load(offset + 2) * 65536 +
+    buffer.load(offset + 3) * 16777216
+
+trusted fun check(): int {
+    val pair = nativeByteBuffer(16)
+    // socketpair(AF_UNIX, SOCK_STREAM, 0, fds)
+    if (linuxSyscall4(53, 1, 1, 0, nativePointerAddress(pair.address)) != 0) return 1
+    val left = word32(pair, 0)
+    val right = word32(pair, 4)
+    val epoll = linuxSyscall1(291, 0)
+    if (epoll < 0) return 2
+    // EPOLLIN = 1 on `left`, data = 0x1122334455667788 (low word 0x55667788, high 0x11223344).
+    val event = nativeByteBuffer(16)
+    event.store(0, 1)
+    event.store(4, 0x88)
+    event.store(5, 0x77)
+    event.store(6, 0x66)
+    event.store(7, 0x55)
+    event.store(8, 0x44)
+    event.store(9, 0x33)
+    event.store(10, 0x22)
+    event.store(11, 0x11)
+    if (linuxSyscall4(233, epoll, 1, left, nativePointerAddress(event.address)) != 0) return 3
+    // Nothing to read yet.
+    val events = nativeByteBuffer(12 * 4)
+    if (linuxSyscall4(232, epoll, nativePointerAddress(events.address), 4, 0) != 0) return 4
+    pair.store(0, 120)
+    if (linuxSyscall3(1, right, nativePointerAddress(pair.address), 1) != 1) return 5
+    if (linuxSyscall4(232, epoll, nativePointerAddress(events.address), 4, 1000) != 1) return 6
+    if (events.load(0) % 2 != 1) return 7
+    if (word32(events, 4) != 0x55667788) return 8
+    if (word32(events, 8) != 0x11223344) return 9
+    // epoll_pwait, the same way (sigmask NULL, size 8), then remove the descriptor.
+    if (linuxSyscall6(281, epoll, nativePointerAddress(events.address), 4, 0, 0, 8) != 1) return 10
+    if (word32(events, 8) != 0x11223344) return 11
+    if (linuxSyscall4(233, epoll, 2, left, 0) != 0) return 12
+    if (linuxSyscall4(232, epoll, nativePointerAddress(events.address), 4, 0) != 0) return 13
+    0
+}
+
+fun main: int {
+    val result = check()
+    if (result == 0) 42 else result
+}

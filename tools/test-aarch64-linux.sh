@@ -17,7 +17,8 @@ command -v qemu-aarch64 > /dev/null || have_qemu=0
 programs='tests/cases/libc-imports/hello.ab tests/cases/libc-imports/float-remainder.ab
 tests/cases/libc-imports/strings-arrays.ab tests/cases/libc-imports/files.ab
 tests/cases/libc-imports/tasks.ab tests/cases/libc-imports/threads.ab'
-checks='tests/cases/linux-syscall/main.ab tests/cases/linux-syscall/legacy.ab'
+checks='tests/cases/linux-syscall/main.ab tests/cases/linux-syscall/legacy.ab tests/cases/linux-syscall/epoll.ab
+tests/cases/modules/http-client.ab'
 for source in $programs $checks; do
     name=$(basename "$source" .ab)-$(basename "$(dirname "$source")")
     for mode in release fast; do
