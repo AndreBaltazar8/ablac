@@ -20,6 +20,8 @@ tests/cases/fuzz-differential-<seed>-<check>/ (program.ab and expected outputs).
   tools/fuzz-differential --seeds 1-3 --hosted-tasks  # four hosted modes; Wasm unsupported
   tools/fuzz-differential --check-hostless-capabilities  # assert task/thread Wasm rejection
   tools/fuzz-differential --module-graphs --seeds 1-3  # strict module graphs and cache edits
+  tools/fuzz-differential --subparser-graphs --seeds 1-3  # generated calls and provider edits
+  tools/fuzz-differential --check-subparser-refusals  # expected diagnostics in interp/JIT
   tools/fuzz-differential --seed 7 --keep     # one seed, keep its directory
   tools/fuzz-differential --program x.ab      # run one existing program, all ways
 Exit status 0 when every mode agreed.
@@ -1970,6 +1972,131 @@ compile fun stage({signature}): int = n + base{suffix}
 '''
 
 
+def subparser_provider(style, extra, offset):
+    if style == 0:
+        arguments = '[syntaxNamedArgument("right", b), syntaxNamedArgument("left", a)]'
+    elif style == 1:
+        arguments = f'[a, syntaxNamedArgument("right", b), syntaxNamedArgument("extra", syntaxInteger({extra}))]'
+    else:
+        arguments = f'[syntaxNamedArgument("extra", syntaxInteger({extra})), syntaxNamedArgument("right", b), syntaxNamedArgument("left", a)]'
+    return f'''import "abla/compiler"
+import "abla/compiler/parser"
+compile fun parsePair(cursor: ParserCursor): SyntaxExpression {{
+    parserExpect(cursor, "(")
+    val a = parserParseAblaExpression(cursor)
+    parserExpect(cursor, ",")
+    val b = parserParseAblaExpression(cursor)
+    parserExpect(cursor, ")")
+    syntaxCall("combine", {arguments})
+}}
+compile fun parseItems(cursor: ParserCursor): SyntaxExpression {{
+    parserExpect(cursor, "(")
+    val a = parserParseAblaExpression(cursor)
+    parserExpect(cursor, ",")
+    val b = parserParseAblaExpression(cursor)
+    parserExpect(cursor, ")")
+    syntaxArray([a, b])
+}}
+compile fun parseEarly(cursor: ParserCursor): SyntaxExpression {{
+    parserExpect(cursor, "(")
+    parserExpect(cursor, ")")
+    val absent: int? = null
+    syntaxInteger(absent ?? return syntaxInteger({offset}))
+}}
+compile fun parseBonus(cursor: ParserCursor): SyntaxExpression {{
+    parserExpect(cursor, "(")
+    parserExpect(cursor, ")")
+    syntaxInteger({offset})
+}}
+#compilerRegisterSubparser("pair", parsePair)
+#compilerRegisterSubparser("items", parseItems)
+#compilerRegisterSubparser("early", parseEarly)
+#compilerRegisterSubparser("bonus", parseBonus)
+'''
+
+
+def subparser_write(directory, seed):
+    r = random.Random(seed)
+    a, b, extra, offset, delta = (r.randint(1, 8), r.randint(1, 9), r.randint(4, 9),
+                                   r.randint(10, 20), r.randint(1, 5))
+    style = seed % 3
+    os.makedirs(os.path.join(ROOT, directory), exist_ok=True)
+    with open(os.path.join(ROOT, directory, 'abla.toml'), 'w', encoding='utf-8') as f:
+        f.write('name = "fuzz-subparser"\nversion = "0.1.0"\nentry = "program.ab"\nvisibility = "imports"\n')
+    with open(os.path.join(ROOT, directory, 'provider.ab'), 'w', encoding='utf-8') as f:
+        f.write(subparser_provider(style, extra, offset))
+    with open(os.path.join(ROOT, directory, 'helper.ab'), 'w', encoding='utf-8') as f:
+        f.write('fun marker(): int = 42\n')
+    actual_extra = 3 if style == 0 else extra
+    value = (a + 1) * 100 + b * 10 + actual_extra
+    direct_extra = '' if style == 0 else f', extra = {extra}'
+    prelude = '''import "abla/io"
+import "./provider.ab"
+import "./helper.ab"
+fun combine(left: int, right: int, extra: int = 3): int = left * 100 + right * 10 + extra
+'''
+    lines = ['fun c0(): string {', f'    val got = $pair({a} + 1, {b})',
+             f'    val direct = combine(left = {a} + 1, right = {b}{direct_extra})',
+             '    var sum = 0', f'    for (v in $items({a} + 1, {b})) sum += v',
+             f'    val choice = when ($pair({a} + 1, {b})) {{ {value} -> 1; else -> 0 }}',
+             '    "$got:$direct:$sum:$choice:${$early()}:${$bonus()}:${marker()}"', '}']
+    return prelude, [(lines, 'c0()', 'str', 0)], (a, b, extra, offset, delta, style)
+
+
+def subparser_expected(data, offset):
+    a, b, extra, _, _, style = data
+    value = (a + 1) * 100 + b * 10 + (3 if style == 0 else extra)
+    return f'c0={value}:{value}:{a + 1 + b}:1:{offset}:{offset}:42\n'
+
+
+def run_subparser_seed(args, seed, runner):
+    directory = os.path.join(WORK, f'subparser{seed}')
+    shutil.rmtree(os.path.join(ROOT, directory), ignore_errors=True)
+    prelude, checks, data = subparser_write(directory, seed)
+    _, _, extra, offset, delta, style = data
+    results = runner.all_modes(directory, (prelude, checks))
+    expected = subparser_expected(data, offset)
+    bad = verdict(results)
+    if bad or any(v != (expected, 0) for v in results.values()):
+        return f'subparser seed {seed}, no-cache: {bad or "Python oracle mismatch"}; expected {expected!r}; results {results!r}; retained {directory}'
+    modes = ('fast', 'release', 'ct', 'ct-jit', 'wasm', 'wasm-dev')
+    for phase in ('cold', 'warm', 'discovery', 'provider-edit'):
+        if phase == 'provider-edit':
+            with open(os.path.join(ROOT, directory, 'provider.ab'), 'w', encoding='utf-8') as f:
+                f.write(subparser_provider(style, extra, offset + delta))
+        expected = subparser_expected(data, offset + delta if phase == 'provider-edit' else offset)
+        results = {}
+        for mode in modes:
+            cache = os.path.join(directory, 'cache-' + mode)
+            if phase == 'discovery':
+                for item in os.scandir(os.path.join(ROOT, cache)):
+                    if item.name.startswith('discovery-v1-'):
+                        continue
+                    if item.is_dir(follow_symlinks=False):
+                        shutil.rmtree(item.path)
+                    else:
+                        os.unlink(item.path)
+            if mode.startswith('wasm'):
+                result = graph_cached_wasm(runner, directory, mode, cache, trace=phase == 'discovery')
+            else:
+                source = os.path.join(directory, 'program-ct.ab' if mode.startswith('ct') else 'program.ab')
+                ct = 'interp' if mode == 'ct' else ('jit' if mode == 'ct-jit' else None)
+                result = runner.native(source, os.path.join(directory, 'cached-' + mode),
+                                       mode != 'release', ct, cache_dir=cache, trace=phase == 'discovery')
+            if phase == 'discovery' and result[0] != 'build-failed':
+                stdout, status, trace = result
+                if f'discovery.hit:{directory}/helper.ab' not in trace:
+                    return f'subparser seed {seed}, discovery: {mode} did not report helper cache hit; retained {directory}'
+                result = (stdout, status)
+            results[mode] = result
+        bad = verdict(results)
+        if bad or any(v != (expected, 0) for v in results.values()):
+            return f'subparser seed {seed}, {phase}: {bad or "Python oracle mismatch"}; expected {expected!r}; results {results!r}; retained {directory}'
+    if not args.keep:
+        shutil.rmtree(os.path.join(ROOT, directory), ignore_errors=True)
+    return None
+
+
 def graph_write(directory, seed):
     """Make a small strict graph: direct, facade or diamond with one visible clash."""
     r = random.Random(seed)
@@ -2214,6 +2341,72 @@ def check_hostless_capabilities(runner):
     return 0
 
 
+def check_subparser_refusals(runner):
+    """Expected refusals are diagnostic tests, not six-mode executions."""
+    directory = os.path.join(WORK, 'subparser-refusals')
+    shutil.rmtree(os.path.join(ROOT, directory), ignore_errors=True)
+    os.makedirs(os.path.join(ROOT, directory), exist_ok=True)
+    provider = '''import "abla/compiler"
+import "abla/compiler/parser"
+compile fun noArgs(cursor: ParserCursor): void { parserExpect(cursor, "("); parserExpect(cursor, ")"); return }
+compile fun named(name: string, value: int): SyntaxExpression = syntaxNamedArgument(name, syntaxInteger(value))
+compile fun parseUnknown(cursor: ParserCursor): SyntaxExpression {
+    noArgs(cursor)
+    syntaxCall("combine", [named("left", 2), named("right", 3), named("unknown", 1)])
+}
+compile fun parseDuplicate(cursor: ParserCursor): SyntaxExpression {
+    noArgs(cursor)
+    syntaxCall("combine", [named("left", 2), named("right", 3), named("left", 1)])
+}
+compile fun parseOrder(cursor: ParserCursor): SyntaxExpression {
+    noArgs(cursor)
+    syntaxCall("combine", [named("left", 2), syntaxInteger(3)])
+}
+compile fun parseEarlyBad(cursor: ParserCursor): SyntaxExpression {
+    noArgs(cursor)
+    val absent: int? = null
+    syntaxInteger(absent ?? return syntaxCall("combine", [named("left", 2), named("right", 3), named("unknown", 1)]))
+}
+compile fun parseStop(cursor: ParserCursor): SyntaxExpression {
+    noArgs(cursor)
+    var n = 0
+    while (n < 1000000) n += 1
+    syntaxInteger(n)
+}
+#compilerRegisterSubparser("unknown", parseUnknown)
+#compilerRegisterSubparser("duplicate", parseDuplicate)
+#compilerRegisterSubparser("order", parseOrder)
+#compilerRegisterSubparser("earlybad", parseEarlyBad)
+#compilerRegisterSubparser("stop", parseStop)
+'''
+    with open(os.path.join(ROOT, directory, 'provider.ab'), 'w', encoding='utf-8') as f:
+        f.write(provider)
+    for name, code, label in [('unknown', 'E_NAMED_ARGUMENT_UNKNOWN', 'named-argument'),
+                              ('duplicate', 'E_NAMED_ARGUMENT_DUPLICATE', 'named-argument'),
+                              ('order', 'E_NAMED_ARGUMENT_ORDER', 'named-argument'),
+                              ('earlybad', 'E_NAMED_ARGUMENT_UNKNOWN', 'named-argument'),
+                              ('stop', 'E_EVAL_STEP_LIMIT', 'extension-expression')]:
+        source = os.path.join(directory, name + '.ab')
+        text = f'import "./provider.ab"\nfun combine(left: int, right: int): int = left + right\nfun main(): int = ${name}()\n'
+        with open(os.path.join(ROOT, source), 'w', encoding='utf-8') as f:
+            f.write(text)
+        for mode in ('interp', 'jit'):
+            env = {'ABLA_COMPILE_EVAL': mode}
+            if name == 'stop':
+                env['ABLA_EVAL_STEP_LIMIT'] = '10000'
+            rc, _, err = runner.sh([runner.compiler, 'build', source, '--fast', '--no-cache',
+                                     '-o', os.path.join(directory, f'{name}-{mode}')], env)
+            errors = re.findall(r'^error\[[^]]+\]', err, re.MULTILINE)
+            span = re.search(rf'source\[{label}\]:[^\n]*:(\d+):(\d+)', err)
+            found_site = bool(span and f'${name}()'.encode() in text.encode()[int(span[1]):int(span[2])])
+            if rc == 0 or f'error[{code}]' not in errors or not found_site or (
+                    name in ('stop', 'earlybad') and len(errors) != 1):
+                print(f'{name} {mode}: unexpected diagnostic/status {rc}; errors={errors}; site={found_site}\n{err}')
+                return 1
+            print(f'{name} {mode}: expected {code} at call site ({len(errors)} error(s))')
+    return 0
+
+
 def seed_range(text):
     if "," in text:
         return [n for part in text.split(",") for n in seed_range(part)]
@@ -2237,12 +2430,16 @@ def main():
     ap.add_argument("--selftest", action="store_true", help="check the comparison on made-up results")
     ap.add_argument("--hosted-tasks", action="store_true", help="draw task/thread checks; compare only the four hosted modes")
     ap.add_argument("--module-graphs", action="store_true", help="check strict multi-module graphs and cache invalidation in all six modes")
+    ap.add_argument("--subparser-graphs", action="store_true", help="check generated provider calls in six modes, including provider cache edits")
+    ap.add_argument("--check-subparser-refusals", action="store_true", help="check subparser diagnostics in interp and JIT")
     ap.add_argument("--check-hostless-capabilities", action="store_true", help="assert tasks and threads are unsupported by each hostless Wasm builder")
     ap.add_argument("--show", action="store_true", help="with --program: print the output of the fast build")
     ap.add_argument("--program", help="run an existing .ab program (with @export(\"run\")) all ways")
     args = ap.parse_args()
-    if args.module_graphs and (args.hosted_tasks or args.focus or args.panics or args.program):
+    if args.module_graphs and (args.subparser_graphs or args.hosted_tasks or args.focus or args.panics or args.program):
         ap.error('--module-graphs cannot be combined with --hosted-tasks, --focus, --panics or --program')
+    if args.subparser_graphs and (args.hosted_tasks or args.focus or args.panics or args.program):
+        ap.error('--subparser-graphs cannot be combined with --hosted-tasks, --focus, --panics or --program')
     if args.hosted_tasks:
         if args.focus and args.focus != 'task_check':
             ap.error('--hosted-tasks requires task_check')
@@ -2258,6 +2455,8 @@ def main():
     runner = Runner(args.compiler, args.timeout)
     if args.check_hostless_capabilities:
         return check_hostless_capabilities(runner)
+    if args.check_subparser_refusals:
+        return check_subparser_refusals(runner)
     if args.program:
         directory = os.path.join(WORK, "program")
         os.makedirs(os.path.join(ROOT, directory), exist_ok=True)
@@ -2276,13 +2475,16 @@ def main():
         return 1 if bad else 0
     failures = 0
     for seed in seed_range(args.seed or args.seeds):
-        found = run_module_graph(args, seed, runner) if args.module_graphs else run_seed(args, seed, runner)
+        found = (run_module_graph(args, seed, runner) if args.module_graphs else
+                 run_subparser_seed(args, seed, runner) if args.subparser_graphs else run_seed(args, seed, runner))
         if found:
             failures += 1
             print(found)
         else:
             if args.module_graphs:
                 print(f'graph seed {seed}: no-cache, cached cold/warm/discovery-hit and provider edits agree in all six modes')
+            elif args.subparser_graphs:
+                print(f'subparser seed {seed}: no-cache, cached cold/warm/helper-hit and provider edit agree in all six modes')
             else:
                 modes = 'four hosted modes (Wasm unsupported)' if args.hosted_tasks else 'all six modes'
                 print(f"seed {seed}: {args.checks} checks agree in {modes}")

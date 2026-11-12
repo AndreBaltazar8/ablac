@@ -317,6 +317,13 @@
   and a signature/default edit. The entry sources stay unchanged during edits. Default seeds 5001 to 5040
   passed 960 checks in six modes with the 1210637a stdlib tree and e89d5e4e compiler payload.
 
+  `--subparser-graphs` generates a separate registered provider, named/default/mixed calls, and generated
+  expressions used as a loop source and a `when` subject. Python computes the expected output. It checks
+  no-cache and isolated cache cold/warm, a traced hit on a pure helper, and a provider edit; registration
+  providers themselves are not claimed as discovery-cache hits. Seeds 5411 to 5416 agreed in all six modes
+  on the e89d5e4e compiler and 89e4596d sysroot. The tool suite passed, including interpreter/JIT expected
+  refusals; the step-limit and `?? return` error controls each produced one diagnostic at the call site.
+
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
 - [ ] **Abla-native Xtensa companion installer.** The explicit optional installer uses only the Python
