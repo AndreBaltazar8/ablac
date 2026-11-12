@@ -39,6 +39,8 @@ pkgs.mkShell {
     binaryen
     nodejs
     openssl
+    # tests/cases/rsa-keygen/check.sh: independent arithmetic on a generated key.
+    bc
     # prlimit, for tools/run-limited.sh: an image may have none of its own.
     util-linux
     # tools/build-self-hosted-current.sh, for a compiler linked elsewhere.

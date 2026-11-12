@@ -20,7 +20,7 @@ for bits in "${sizes[@]}"; do
     timeout 600 "$out/test" "$bits" "$out/key-$bits.pem"
     openssl pkey -in "$out/key-$bits.pem" -check -noout >/dev/null
     openssl pkcs8 -topk8 -nocrypt -in "$out/key-$bits.pem" -outform DER -out "$out/key-$bits.der"
-    python3 -I "$root/tests/cases/rsa-keygen/check.py" "$bits" "$out/key-$bits.der"
+    bash "$root/tests/cases/rsa-keygen/check.sh" "$bits" "$out/key-$bits.der"
     openssl pkey -in "$out/key-$bits.pem" -pubout -out "$out/pub-$bits.pem" 2>/dev/null
     printf 'generated key interoperability' > "$out/message"
     openssl dgst -sha256 -sign "$out/key-$bits.pem" -out "$out/signature" "$out/message"
