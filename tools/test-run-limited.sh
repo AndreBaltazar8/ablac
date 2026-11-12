@@ -72,7 +72,7 @@ set -e
 [[ $invalid_output == *'must be a positive integer'* ]] || exit 1
 
 if [[ $(uname -s) == Linux ]]; then
-    python3 "$root/tests/cases/run-limited/parent-death.py" "$runner"
+    bash "$root/tests/cases/run-limited/parent-death.sh" "$runner"
 fi
 
 printf '%s\n' 'limited runner tests passed'
