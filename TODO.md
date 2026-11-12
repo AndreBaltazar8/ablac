@@ -28,6 +28,13 @@ parser-field and negative controls). Then port HTTP and event fixtures in
 ascending size; use Abla for socket protocol peers. The differential fuzzer
 and constant-time checker remain until their later ports.
 
+Left on the allow-list on purpose: `tests/cases/device-serial/session.py` (and
+`tools/test-device-serial.sh` with it) is a pty/termios oracle, independent of the
+library's own flag and layout code, with an interactive stdin/stdout protocol to the client,
+concurrent pty drains, a signal stream and rlimit set-up; it needs a raw-syscall Abla driver
+(ptmx, TIOCGPTN, TCGETS, fork/exec with pipes, setsid, setrlimit, kill, threads), built
+after the rest of #807.
+
 The following inventory is from the 1f1aea08 `test-serial` recipe. Counts are
 Python heredoc blocks and body lines, including blank and comment lines; all
 paths have the prefix `tools/test-` and suffix `.sh`.
