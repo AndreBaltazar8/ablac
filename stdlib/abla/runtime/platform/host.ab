@@ -117,10 +117,6 @@ trusted fun __ablaRuntimeFutexExchange(address: int, value: int): int {
 trusted fun __ablaRuntimeFutexLock(address: int): void {
     var state = ablaRuntimeAtomicCompareExchangeI64(address, 0, 1)
     if (state == 0) return
-    // Contended: in a forked child that is a holder that did not survive (#812), and the repair frees what it held.
-    __ablaRuntimeHostForkCheck()
-    state = ablaRuntimeAtomicCompareExchangeI64(address, 0, 1)
-    if (state == 0) return
     if (state != 2) state = __ablaRuntimeFutexExchange(address, 2)
     while (state != 0) {
         __ablaRuntimeFutexWait(address, 2)
@@ -350,15 +346,6 @@ trusted fun __ablaRuntimeHostHeapCachePut(base: int, length: int): bool {
     false
 }
 
-@inline
-trusted fun __ablaRuntimeHostForkCheck(): void {
-    if (ablaHostOwnsRuntime()) {
-        val page = __ablaRuntimeHostForkPage
-        if (page != 0 && ablaRuntimeLoadI64(page) == 0) __ablaRuntimeHostForkRepair()
-    }
-    return
-}
-
 // The heap's lock: a futex mutex of its own, one word in the static state (the same one the runtime's mutexes
 // are, above), so that the heap needs no pthread function nor libc. The holder is never preempted for long, but
 // a collection's merge can take a while: a waiter sleeps.
@@ -382,67 +369,10 @@ trusted fun __ablaRuntimeHostHeapZero(address: int, size: int): void {
     return
 }
 
-// A fork leaves only the forking thread in the child, so a lock another thread held stays held for ever (#812).
-// No fork hook is needed, and no system call on the allocation path: one page of its own holds a 1, and
-// MADV_WIPEONFORK (Linux 4.14) makes the kernel zero it in the child. The first lock the child takes looks at
-// that word, finds a 0, and repairs what the vanished threads may have left (below). Without the advice (an
-// older kernel) the word is never wiped and a fork with a lock held is not detected.
-var __ablaRuntimeHostForkPage: int = 0
-// Set in a child that found the heap's lock held: nothing parked or merged before the fork is trusted, so no
-// merge ever consults a block's header from before it (a free block's links may be half written).
-var __ablaRuntimeHostHeapNoMerge: bool = false
-
-trusted fun __ablaRuntimeHostForkArm(): void {
-    val page = __ablaRuntimeHostHeapMap(4096)
-    if (page == 0) return
-    ablaRuntimeStoreI64(page, 1)
-    ablaLinuxSyscall(28, page, 4096, 18, 0, 0, 0)
-    __ablaRuntimeHostForkPage = page
-    return
-}
-
-// In the child, by the first thread to take a runtime lock. Nothing else runs, so nothing here is locked.
-@noinline
-trusted fun __ablaRuntimeHostForkRepair(): void {
-    ablaRuntimeStoreI64(__ablaRuntimeHostForkPage, 1)
-    val state = __ablaRuntimeHostHeapState()
-    val lock = state + 1952
-    if (ablaRuntimeAtomicLoadI64(lock) != 0) {
-        // Held by a thread that is gone, possibly in the middle of a list update: the parked lists, the bins,
-        // the top and the cache of large mappings are dropped (their memory leaks) and nothing merges again.
-        var at = state
-        while (at < lock) {
-            ablaRuntimeStoreI64(at, 0)
-            at = at + 8
-        }
-        at = state + 2016
-        while (at < state + 2144) {
-            ablaRuntimeStoreI64(at, 0)
-            at = at + 8
-        }
-        __ablaRuntimeHostHeapCursor = 0
-        __ablaRuntimeHostHeapEnd = 0
-        __ablaRuntimeHostHeapClean = 0
-        __ablaRuntimeHostHeapParked = 0
-        __ablaRuntimeHostHeapBinned = 0
-        __ablaRuntimeHostHeapCached = 0
-        __ablaRuntimeHostHeapTrimming = false
-        __ablaRuntimeHostHeapNoMerge = true
-        ablaRuntimeAtomicStoreI64(lock, 0)
-    }
-    // The runtime's own mutex (the collector's registry and the thread count) is held by no one now, and no
-    // other thread runs.
-    val mutex = __ablaRuntimeHostHeapMutex
-    if (mutex != 0) ablaRuntimeAtomicStoreI64(mutex, 0)
-    __ablaRuntimeHostActiveThreads = 0
-    return
-}
-
 // From now on the heap is locked (once a second thread can touch it).
 trusted fun __ablaRuntimeHostHeapShare(): void {
     if (!__ablaRuntimeHostHeapShared) {
         ablaRuntimeAtomicStoreI64(__ablaRuntimeHostHeapLockAddress(), 0)
-        __ablaRuntimeHostForkArm()
         __ablaRuntimeHostHeapShared = true
     }
     return
@@ -603,7 +533,6 @@ trusted fun __ablaRuntimeHostHeapGiveBack(): void {
 // Merges every parked block.
 @noinline
 trusted fun __ablaRuntimeHostHeapConsolidate(): void {
-    if (__ablaRuntimeHostHeapNoMerge) return
     val state = __ablaRuntimeHostHeapState()
     var sizeClass = 0
     while (sizeClass < __ablaRuntimeHostHeapClasses) {
