@@ -1,6 +1,3 @@
-    'lld-dynamic-main-nolibsystem|lld:-platform_version macos 11.0 11.0 -e _start'
-    'lld-dynamic-main-nolibsystem-15|lld:-platform_version macos 15.0 15.0 -e _start'
-    'lld-static-unixthread|lld:-static -platform_version macos 11.0 11.0 -e _start'
 #!/usr/bin/env bash
 # Feasibility probe for a libSystem-free macOS executable (#811): does a program
 # that makes write and exit (and a thread) by direct system calls start, and
@@ -35,6 +32,9 @@ variants=(
     'nostdlib-e|-nostdlib -Wl,-e,_start'
     'nostdlib-static-e|-nostdlib -static -Wl,-e,_start'
     'nostdlib-static-pv15-e|-nostdlib -static -Wl,-e,_start -Wl,-platform_version,macos,15.0,15.0'
+    'lld-dynamic-main-nolibsystem|lld:-platform_version macos 11.0 11.0 -e _start'
+    'lld-dynamic-main-nolibsystem-15|lld:-platform_version macos 15.0 15.0 -e _start'
+    'lld-static-unixthread|lld:-static -platform_version macos 11.0 11.0 -e _start'
     'libsystem-listed-main|-nostdlib -lSystem'
     'libsystem-listed-e|-nostdlib -lSystem -Wl,-e,_start'
 )
