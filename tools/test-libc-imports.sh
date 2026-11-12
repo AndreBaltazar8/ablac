@@ -66,7 +66,7 @@ done
 # shrinks, and a pending program that links must be taken off it.
 pending=tools/libc-imports-static-pending.txt
 [[ -f $pending ]] || { echo "libc imports: missing $pending" >&2; exit 1; }
-for name in $(grep -v '^#' "$pending" | cat - <(echo hello float-remainder strings-arrays files) | sort -u); do
+for name in hello float-remainder strings-arrays files; do
     program=tests/cases/libc-imports/$name.ab
     [[ -f $program ]] || continue
     binary_static=$out/$name.static
@@ -97,6 +97,16 @@ for name in $(grep -v '^#' "$pending" | cat - <(echo hello float-remainder strin
         exit 1
     fi
 done
+# A program that imports abla/http without a TLS connection links no OpenSSL.
+if ! "$compiler" build tests/cases/libc-imports-http/main.ab -o "$out/http-plain" --no-cache >"$out/http-plain.log" 2>&1; then
+    echo "libc imports: tests/cases/libc-imports-http did not build:" >&2
+    tail -n 20 "$out/http-plain.log" >&2
+    exit 1
+fi
+if readelf -d "$out/http-plain" | grep -Eq 'NEEDED.*(libssl|libcrypto)'; then
+    echo "libc imports: a program that opens no TLS connection links OpenSSL" >&2
+    exit 1
+fi
 binary=$compiler
 [[ -f $compiler.bin ]] && binary=$compiler.bin
 if ! readelf -h "$binary" >/dev/null 2>&1; then

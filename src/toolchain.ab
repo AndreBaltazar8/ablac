@@ -4093,6 +4093,17 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         status = 147
         failureKind = "reported"
     }
+    // A program links OpenSSL only when its object imports it, not when its module graph merely
+    // holds a module that declares it.
+    if (status == 0 && linkOpenSsl && !macTarget) {
+        val openSslSources: array<string> = []
+        for (snapshot in orderedSnapshots) {
+            if (bootstrapTextContains(snapshot.source, "fun OpenSSL_version_num()")) {
+                openSslSources.append(snapshot.source)
+            }
+        }
+        linkOpenSsl = bootstrapObjectImportsOpenSsl(objectPath, openSslSources)
+    }
     if (status == 0 && bootstrapNoLibcRequested &&
         (!target.hosted || target.libcFree ||
          target.llvmTriple != "x86_64-unknown-linux-gnu" ||
@@ -5040,3 +5051,44 @@ fun bootstrapServeWithEmitter(
 // The symbols `--no-libc` defines in assembly (exports.ab); only LTO needs to know them.
 fun bootstrapFreestandingRoutineNames(): array<string> =
     ["_start", "abla_tls_bytes", "abla_tls_init", "abla_tls_set"]
+
+// The C functions the modules that declare the OpenSSL ABI import (`extern:"c" fun NAME(`).
+fun bootstrapOpenSslExternNames(source: string): array<string> {
+    val names: array<string> = []
+    val marker = "extern:\"c\" fun "
+    var index = 0
+    while (index + marker.size < source.size) {
+        if (source.slice(index, index + marker.size) == marker) {
+            var end = index + marker.size
+            while (end < source.size && source[end] != 40 && source[end] != 32) end = end + 1
+            names.append(source.slice(index + marker.size, end))
+            index = end
+        } else index = index + 1
+    }
+    names
+}
+
+// Whether the object imports any of those functions: only then does the program reach OpenSSL
+// (a program that imports `abla/http` without a TLS connection references none). An object that
+// cannot be listed counts as importing them.
+fun bootstrapObjectImportsOpenSsl(
+    objectPath: string,
+    sources: array<string>
+): bool {
+    if (!Path(objectPath).exists()) return true
+    val imported: Map<string, bool> = Map()
+    for (source in sources) {
+        for (name in bootstrapOpenSslExternNames(source)) imported.set(name, true)
+    }
+    val listing = linuxCommand("llvm-nm")
+    listing.argument("--undefined-only")
+    listing.argument(objectPath)
+    val text = listing.captureText()
+    if (text == "") return true
+    for (line in text.split("\n")) {
+        var start = line.size
+        while (start > 0 && line[start - 1] != 32) start = start - 1
+        if (start < line.size && imported.get(line.slice(start, line.size)) != null) return true
+    }
+    false
+}
