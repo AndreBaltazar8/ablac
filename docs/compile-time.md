@@ -845,7 +845,13 @@ modules remain those parsed for the target. Only encoded values cross back
 to the target program. A separate conservative reachability check permits scalar
 integer computations, strings, arrays and plain classes, with audited `abla/bytes`,
 `abla/crypto`, `abla/text` and filesystem declarations, plus known capability
-providers through their existing evaluator bridges. Compiler and parser queries
+providers through their existing evaluator bridges. A direct `compilerEnvironment(name)`
+read is also bridged: it requires the source grant and manifest authorization for
+`environment`, and the named value is journaled and revalidated on cache reuse.
+An environment read reached through another global's initializer remains
+interpreted; for example, `val ASSET_HOST = #assetHost()` followed by
+`#assetTable(ASSET_HOST)` cannot yet replace replay with the earlier value.
+The trace names that global. Other compiler and parser queries
 remain interpreted for cross-target sites. It rejects unknown constructs and dependencies, raw pointers
 and memory operations, native externs, target/CPU probes, SIMD, assembly, resources
 `when is` interface dispatch, floating-point computation, and unrecognised modules or annotations. Extension-field defaults are implicit

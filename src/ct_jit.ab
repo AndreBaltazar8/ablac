@@ -237,6 +237,18 @@ fun bootstrapCtCrossLiteralTable(declaration: BootstrapDeclaration): bool {
     declaration.expression.children.size > 0
 }
 
+// The compiler bridge performs the same named host read in either tier. Keep
+// this exception tied to the compiler-owned prototype, including its full ABI.
+fun bootstrapCtCrossEnvironment(declaration: BootstrapDeclaration): bool {
+    if (declaration.name != "compilerEnvironment" || declaration.sourceIdentity !=
+        "${bootstrapCompileProviderStandardLibrary()}/abla/compiler/entry.ab") return false
+    val expected = bootstrapParse(
+        "compile extern:\"compiler\" fun compilerEnvironment(name: string): string"
+    )
+    expected.errors == 0 && expected.declarations.size == 1 &&
+        bootstrapCtSameExtern(declaration, expected.declarations[0])
+}
+
 fun bootstrapCtCrossDeclarationReason(declaration: BootstrapDeclaration,
     owner: BootstrapDeclaration): string {
     val name = bootstrapCanonicalDeclarationSourceName(declaration.name)
@@ -250,7 +262,7 @@ fun bootstrapCtCrossDeclarationReason(declaration: BootstrapDeclaration,
     // inspect target-specific declarations, so keep them interpreted for now.
     val bridged = bootstrapCompileDeclarationProviderEffect(declaration) > 0
     var reason = ""
-    if (bridged) return ""
+    if (bridged || bootstrapCtCrossEnvironment(declaration)) return ""
     if (declaration.kind == "extern") {
         val portable = declaration.externalLibrary == "intrinsic" &&
             (((module == "abla/bytes/entry.ab" || module == "abla/crypto/entry.ab") &&
@@ -370,13 +382,15 @@ class BootstrapCtReach(
     val methodTargets: BootstrapResolvedMethodTargets = bootstrapResolvedMethodTargets(),
     val itemHandles: array<int> = [],
     val itemIdentities: array<string> = [],
-    val concreteReceivers: BootstrapIrNameTable = bootstrapIrNameTable(16)
+    val concreteReceivers: BootstrapIrNameTable = bootstrapIrNameTable(16),
+    val replayVisited: array<bool> = []
 ) {
     fun add(name: string, declaration: int, method: int, handle: int): void {
         this.itemDeclarations.append(declaration)
         this.itemMethods.append(method)
         this.itemNext.append(this.table.find(name, -1))
         this.visited.append(false)
+        this.replayVisited.append(false)
         this.itemHandles.append(handle)
         val owner = this.declarations[declaration]
         this.itemIdentities.append(if (!this.methodTargets.enabled) ""
@@ -416,6 +430,8 @@ class BootstrapCtReach(
         var pending: array<BootstrapExpression>,
         var pendingLibrary: array<bool>,
         var pendingSources: array<string>,
+        var pendingReplays: array<string>,
+        replay: string,
         library: bool
     ): void {
         // An extension's receiver is a type of it too (a method kept by name brings
@@ -435,6 +451,7 @@ class BootstrapCtReach(
                             "type", type.slice(begin, index), 0, 0, []
                         ))
                         pendingLibrary.append(library)
+                        pendingReplays.append(replay)
                         pendingSources.append(declaration.sourceIdentity)
                     }
                     begin = index + 1
@@ -449,6 +466,7 @@ class BootstrapCtReach(
         var item = 0
         while (item < this.visited.size) {
             this.visited[item] = false
+            this.replayVisited[item] = false
             item = item + 1
         }
     }
@@ -482,14 +500,17 @@ class BootstrapCtReach(
         val pending: array<BootstrapExpression> = [expression]
         val pendingLibrary: array<bool> = [fromLibrary]
         val pendingSources: array<string> = [source]
+        val pendingReplays: array<string> = [""]
         var reason = ""
         while (reason == "" && pending.size > 0) {
             val node = pending[pending.size - 1]
             val library = pendingLibrary[pendingLibrary.size - 1]
             val nodeSource = pendingSources[pendingSources.size - 1]
+            val replay = pendingReplays[pendingReplays.size - 1]
             pending.truncate(pending.size - 1)
             pendingLibrary.truncate(pendingLibrary.size - 1)
             pendingSources.truncate(pendingSources.size - 1)
+            pendingReplays.truncate(pendingReplays.size - 1)
             if (crossTarget && !bootstrapCtCrossNodeAllowed(node)) {
                 return "cross-target site reaches expression ${node.kind} `${node.text}`: not proven portable"
             }
@@ -500,6 +521,7 @@ class BootstrapCtReach(
             for (child in children) {
                 pending.append(child)
                 pendingLibrary.append(library)
+                pendingReplays.append(replay)
                 pendingSources.append(nodeSource)
             }
             val literal = node.kind == "string" || node.kind == "integer" ||
@@ -539,13 +561,25 @@ class BootstrapCtReach(
                     val names = selected && !bareMethod && (!valueItem ||
                         ((node.kind == "identifier" || node.kind == "assign" || callsValue) &&
                          (!library || ownerLibrary)))
-                    if (names && !this.visited[item]) {
-                        this.visited[item] = true
+                    // A replayed initializer is a separate proof context: a helper
+                    // already proved for a direct call must be checked again here.
+                    val nextReplay = if (crossTarget && valueItem && replay == "")
+                        owner.name else replay
+                    val replaying = crossTarget && nextReplay != ""
+                    val alreadyVisited = if (replaying) this.replayVisited[item]
+                        else this.visited[item]
+                    if (names && !alreadyVisited) {
+                        if (replaying) this.replayVisited[item] = true
+                        else this.visited[item] = true
                         this.kept[this.itemDeclarations[item]] = true
-                        this.pendTypes(owner, pending, pendingLibrary, pendingSources, ownerLibrary)
+                        this.pendTypes(owner, pending, pendingLibrary, pendingSources,
+                            pendingReplays, nextReplay, ownerLibrary)
                         val declaration = if (this.itemMethods[item] < 0) owner
                             else owner.methods[this.itemMethods[item]]
                         if (crossTarget) {
+                            if (replaying && bootstrapCtCrossEnvironment(declaration)) {
+                                return "cross-target site replays global $nextReplay initializer reaching compilerEnvironment: shared-global replay is not proven equivalent"
+                            }
                             reason = bootstrapCtCrossDeclarationReason(declaration, owner)
                             if (reason != "") return reason
                         }
@@ -572,6 +606,7 @@ class BootstrapCtReach(
                                 "call", "__ablaPanicContain", 0, 0, []
                             ))
                             pendingLibrary.append(true)
+                            pendingReplays.append(nextReplay)
                             pendingSources.append("")
                             follow = false
                         } else if (bootstrapCompileDeclarationProviderEffect(declaration) > 0) {
@@ -609,11 +644,13 @@ class BootstrapCtReach(
                         if (reason == "" && follow) {
                             pending.append(declaration.expression)
                             pendingLibrary.append(ownerLibrary)
+                            pendingReplays.append(nextReplay)
                             pendingSources.append(if (declaration.sourceIdentity != "")
                                 declaration.sourceIdentity else owner.sourceIdentity)
                             for (parameterDefault in declaration.parameterDefaults) {
                                 pending.append(parameterDefault)
                                 pendingLibrary.append(ownerLibrary)
+                                pendingReplays.append(nextReplay)
                                 pendingSources.append(if (declaration.sourceIdentity != "")
                                     declaration.sourceIdentity else owner.sourceIdentity)
                             }
@@ -622,16 +659,19 @@ class BootstrapCtReach(
                                 // to, so every method of it is reached.
                                 pending.append(BootstrapExpression("type", owner.name, 0, 0, []))
                                 pendingLibrary.append(ownerLibrary)
+                                pendingReplays.append(nextReplay)
                                 pendingSources.append(owner.sourceIdentity)
                             } else {
                                 for (method in declaration.methods) {
                                     pending.append(method.expression)
                                     pendingLibrary.append(ownerLibrary)
+                                    pendingReplays.append(nextReplay)
                                     pendingSources.append(if (method.sourceIdentity != "")
                                         method.sourceIdentity else owner.sourceIdentity)
                                     for (parameterDefault in method.parameterDefaults) {
                                         pending.append(parameterDefault)
                                         pendingLibrary.append(ownerLibrary)
+                                        pendingReplays.append(nextReplay)
                                         pendingSources.append(if (method.sourceIdentity != "")
                                             method.sourceIdentity else owner.sourceIdentity)
                                     }
