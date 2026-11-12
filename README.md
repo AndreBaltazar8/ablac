@@ -80,12 +80,13 @@ steps:
 The action supports Linux x86-64 and both Apple Silicon and Intel macOS. Pin it
 to a full commit SHA when an immutable action reference is required.
 
-The Linux toolchain archive bundles its LLVM tools; from v0.2.16
-it needs glibc 2.38 or later (for example, Ubuntu 24.04 or Debian 13).
-Ubuntu 22.04, Debian 12 and RHEL 9 have older glibc and cannot run the archive
-unmodified. The standalone `ablac-x86_64-linux` release binary is intended for
-bootstrapping; it also names a specific Nix-store dynamic loader and is not
-intended for direct use on other systems. Use the toolchain archive instead.
+The Linux toolchain archive bundles its LLVM tools. After v0.2.56 it
+needs glibc 2.34 or later (for example, Ubuntu 22.04, Debian 12 or RHEL 9);
+v0.2.16 to v0.2.56 needed glibc 2.38. The programs it builds need no libc at
+all unless they bring a C library (docs/toolchain.md). The standalone
+`ablac-x86_64-linux` release binary is intended for bootstrapping; it also
+names a specific Nix-store dynamic loader and is not intended for direct use
+on other systems. Use the toolchain archive instead.
 The optional Xtensa companion is installed explicitly with the packaged native
 `bin/abla-install-xtensa --version 23.1.3-1`. It does not support HTTP proxies;
 use `--archive PATH` with an archive downloaded by other means when needed.

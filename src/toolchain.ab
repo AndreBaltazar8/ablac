@@ -45,9 +45,9 @@ fun bootstrapCollectAndRelease(): void {
     return
 }
 
-// `--no-libc` (#806 step 6): link an x86-64 Linux executable without libc, with the
-// program'"'"'s own `_start` (backend/llvm/exports.ab). Off unless the build asks.
-var bootstrapNoLibcRequested: bool = false
+// `ablac build --verbose`: notes on how the build linked (#806: why an x86-64
+// Linux executable linked libc).
+var bootstrapBuildVerbose: bool = false
 
 class BootstrapTargetDescriptor(
     val name: string,
@@ -2123,9 +2123,7 @@ fun bootstrapOptimizeWholeProgram(
     val optimize = linuxCommand(bootstrapHostLlvmTool("opt"))
     val visible = bootstrapNativeAbiExportSymbols(abiManifest)
     visible.append("main")
-    if (bootstrapNoLibcRequested) {
-        for (name in bootstrapFreestandingRoutineNames()) visible.append(name)
-    }
+    for (name in bootstrapFreestandingRoutineNames()) visible.append(name)
     bootstrapLlvmAssemblyNames(Path(llvmPath).readText(), visible)
     var names = ""
     var index = 0
@@ -2192,9 +2190,7 @@ trusted fun bootstrapOptimizeHeldWholeProgram(
     val visible: Map<string, bool> = Map()
     for (symbol in bootstrapNativeAbiExportSymbols(abiManifest)) visible.set(symbol, true)
     visible.set("main", true)
-    if (bootstrapNoLibcRequested) {
-        for (name in bootstrapFreestandingRoutineNames()) visible.set(name, true)
-    }
+    for (name in bootstrapFreestandingRoutineNames()) visible.set(name, true)
     val assembled: array<string> = []
     for (assembly in bootstrapLlvmInlineAssembly) {
         bootstrapLlvmAssemblyNamesIn(assembly, 0, assembly.size, assembled)
@@ -3788,6 +3784,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         val enclosingInitializerChunk = bootstrapLlvmInitializerChunk
         val enclosingStackGuard = bootstrapLlvmStackGuard
         val enclosingOwnMemoryRoutines = bootstrapLlvmOwnMemoryRoutines
+        val enclosingFreestandingStart = bootstrapLlvmFreestandingStart
         val enclosingCoverage = bootstrapLlvmCoverage
         bootstrapLlvmCoverage = bootstrapLlvmCoverageRequested &&
             (artifact == "executable" || artifact == "shared-library" || artifact == "object") &&
@@ -3802,11 +3799,12 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         // A hosted executable reports a stack overflow (debug.ab).
         bootstrapLlvmStackGuard = target.hosted && artifact == "executable" &&
             target.objectFormat != "wasm"
-        bootstrapLlvmFreestandingStart = bootstrapNoLibcRequested
         // So does it define the memory routines itself on x86-64 Linux (#806;
-        // never a module ORC runs in process, which has the compiler's own).
+        // never a module ORC runs in process, which has the compiler's own),
+        // and its own entry and thread routines, for the libc-free link.
         bootstrapLlvmOwnMemoryRoutines = target.hosted && artifact == "executable" &&
             bootstrapLlvmTargetIsX8664Linux(target.llvmTriple)
+        bootstrapLlvmFreestandingStart = bootstrapLlvmOwnMemoryRoutines
         bootstrapLlvmInitializerChunk = if (cacheProfile == "cross-o2" ||
             cacheProfile == "raw-cross-o2") BOOTSTRAP_INITIALIZER_CHUNK else 0
         bootstrapLlvmBitcodePath = if (inProcessCodegen) "" else bitcodePath
@@ -3851,6 +3849,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         bootstrapLlvmInitializerChunk = enclosingInitializerChunk
         bootstrapLlvmStackGuard = enclosingStackGuard
         bootstrapLlvmOwnMemoryRoutines = enclosingOwnMemoryRoutines
+        bootstrapLlvmFreestandingStart = enclosingFreestandingStart
         bootstrapLlvmCoverage = enclosingCoverage
         bootstrapLlvmStoreBoxes = enclosingStoreBoxes
         bootstrapLlvmAllowBulkObjectZero = enclosingBulkObjectZero
@@ -4112,24 +4111,6 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         }
         linkOpenSsl = bootstrapObjectImportsOpenSsl(objectPath, openSslSources)
     }
-    if (status == 0 && bootstrapNoLibcRequested &&
-        (!target.hosted || target.libcFree ||
-         target.llvmTriple != "x86_64-unknown-linux-gnu" ||
-         artifact != "executable")) {
-        linuxPrintStandardError(
-            "error[E_BUILD_NO_LIBC]: --no-libc builds only an x86-64 Linux executable (target '${target.name}', artifact '$artifact')\n"
-        )
-        status = 152
-        failureKind = "reported"
-    }
-    if (status == 0 && bootstrapNoLibcRequested &&
-        (linkOpenSsl || linkLlvm || hostImports || nativeLibraries.size > 0)) {
-        linuxPrintStandardError(
-            "error[E_BUILD_NO_LIBC]: --no-libc cannot link a C library: this program uses ${if (linkOpenSsl) "OpenSSL (TLS)" else if (nativeLibraries.size > 0) "the manifest's nativeLibraries" else if (linkLlvm) "libLLVM (the LLVM bindings)" else "the compiler-host imports"}\n"
-        )
-        status = 152
-        failureKind = "reported"
-    }
     if (status == 0 && rawTarget && artifact != "executable") {
         linuxPrintStandardError(
             "error[E_BUILD_ARTIFACT_UNSUPPORTED]: target '${target.name}' currently supports only executable artifacts\n"
@@ -4317,137 +4298,177 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         }
     }
     if (status == 0 && target.hosted && artifact == "executable") {
-        val link = bootstrapLinkCommand(if (macTarget) macClang else "clang")
-        if (bootstrapNoLibcRequested) {
-            link.argument("-nostdlib")
-            link.argument("-static-pie")
-        } else link.argument("-pthread")
-        if (ltoEligible && !linkLlvm && !wholeProgram) {
-            link.argument("-O2")
-            link.argument("-flto")
-        }
-        if (macTarget) {
-            link.argument("--target=${target.llvmTriple}")
-            if (!ablaHostIsMacOS()) {
+        // An x86-64 Linux program links without libc (#806): a static-pie image
+        // entered at its own abla_start, its threads on abla_clone_create/join,
+        // with only the compiler's runtime library (-nolibc keeps it). It links the
+        // C library only when it brings one: an OpenSSL import, libLLVM, the
+        // manifest's nativeLibraries, extern "host" calls, or a C function the
+        // libc-free link can't resolve (lld names it; `--verbose` prints why).
+        var libcFree = !macTarget && bootstrapLlvmTargetIsX8664Linux(target.llvmTriple) &&
+        !target.libcFree && !linkOpenSsl && !linkLlvm && !hostImports &&
+        nativeLibraries.size == 0
+        var libcReason = if (macTarget || !bootstrapLlvmTargetIsX8664Linux(target.llvmTriple)) ""
+        else if (linkOpenSsl) "it imports OpenSSL (TLS)"
+        else if (linkLlvm) "it links libLLVM"
+        else if (nativeLibraries.size > 0) "the manifest names nativeLibraries"
+        else if (hostImports) "it calls extern \"host\" functions"
+        else ""
+        var linking = true
+        while (linking) {
+            val link = bootstrapLinkCommand(if (macTarget) macClang else "clang")
+            if (libcFree) {
+                link.argument("-nostartfiles")
+                link.argument("-nolibc")
+                link.argument("-static-pie")
+                link.argument("-Wl,-e,abla_start")
+                link.argument("-Wl,--defsym=pthread_create=abla_clone_create")
+                link.argument("-Wl,--defsym=pthread_join=abla_clone_join")
+            } else link.argument("-pthread")
+            if (ltoEligible && !linkLlvm && !wholeProgram) {
+                link.argument("-O2")
+                link.argument("-flto")
+            }
+            if (macTarget) {
+                link.argument("--target=${target.llvmTriple}")
+                if (!ablaHostIsMacOS()) {
+                    link.argument("-fuse-ld=lld")
+                    link.argument("-Wl,--threads=1")
+                }
+                link.argument("-isysroot")
+                link.argument(macSdkRoot)
+                link.argument("-Wl,-dead_strip")
+            }
+            else {
                 link.argument("-fuse-ld=lld")
                 link.argument("-Wl,--threads=1")
+                link.argument("-Wl,--gc-sections")
+                link.argument("-Wl,--error-limit=0")
             }
-            link.argument("-isysroot")
-            link.argument(macSdkRoot)
-            link.argument("-Wl,-dead_strip")
-        }
-        else {
-            link.argument("-fuse-ld=lld")
-            link.argument("-Wl,--threads=1")
-            link.argument("-Wl,--gc-sections")
-            link.argument("-Wl,--error-limit=0")
-        }
-        if (linkLlvm) {
-            link.argument(if (macTarget)
-                "-Wl,-export_dynamic"
-                else
-                "-Wl,--export-dynamic"
-            )
-            // ORC on Darwin lowers JIT'd thread-locals to emulated TLS: keep compiler-rt's
-            // ___emutls_get_address in the (exported) host image so `ablac run` resolves it.
-            if (macTarget) link.argument("-Wl,-u,___emutls_get_address")
-        }
-        if (!linkLlvm) {
-            val exportedSymbols = bootstrapNativeAbiExportSymbols(
-                abiManifest
-            )
-            var exportedSymbol = 0
-            while (exportedSymbol < exportedSymbols.size) {
+            if (linkLlvm) {
                 link.argument(if (macTarget)
-                    "-Wl,-exported_symbol,_${exportedSymbols[exportedSymbol]}"
+                    "-Wl,-export_dynamic"
                     else
-                    "-Wl,--export-dynamic-symbol=${exportedSymbols[exportedSymbol]}"
+                    "-Wl,--export-dynamic"
                 )
-                exportedSymbol = exportedSymbol + 1
+                // ORC on Darwin lowers JIT'd thread-locals to emulated TLS: keep compiler-rt's
+                // ___emutls_get_address in the (exported) host image so `ablac run` resolves it.
+                if (macTarget) link.argument("-Wl,-u,___emutls_get_address")
             }
-        }
-        if (linkLlvm) {
-            val configuredLlvm = linuxEnvironment("ABLA_MACOS_LLVM_LIB")
-            val llvmConfig = linuxCommand("llvm-config")
-            llvmConfig.argument("--libdir")
-            var llvmLibraryDirectory = if (macTarget &&
-                configuredLlvm.found && configuredLlvm.value != "") {
-                configuredLlvm.value
-            } else llvmConfig.captureText()
-            var end = llvmLibraryDirectory.size
-            while (end > 0 &&
-                (llvmLibraryDirectory[end - 1] == 10 ||
-                 llvmLibraryDirectory[end - 1] == 13)) end = end - 1
-            llvmLibraryDirectory = llvmLibraryDirectory.slice(0, end)
-            link.argument("-L$llvmLibraryDirectory")
-            if (!macTarget || !configuredLlvm.found ||
-                configuredLlvm.value == "") {
-                link.argument("-Wl,-rpath,$llvmLibraryDirectory")
+            if (!linkLlvm) {
+                val exportedSymbols = bootstrapNativeAbiExportSymbols(
+                    abiManifest
+                )
+                var exportedSymbol = 0
+                while (exportedSymbol < exportedSymbols.size) {
+                    link.argument(if (macTarget)
+                        "-Wl,-exported_symbol,_${exportedSymbols[exportedSymbol]}"
+                        else
+                        "-Wl,--export-dynamic-symbol=${exportedSymbols[exportedSymbol]}"
+                    )
+                    exportedSymbol = exportedSymbol + 1
+                }
             }
-            link.argument("-lLLVM")
-        }
-        // (An archive of code generation units is loaded whole; ld64 loads an object
-        // so named as it loads it plainly.)
-        val linkedObject = if (ltoEligible && !linkLlvm) ltoObjectPath else objectPath
-        if (nativeUnits && macTarget) link.argument("-Wl,-force_load,$objectPath")
-        else if (nativeUnits) {
-            link.argument("-Wl,--whole-archive")
-            link.argument(objectPath)
-            link.argument("-Wl,--no-whole-archive")
-        }
-        else link.argument(linkedObject)
-        if (macTarget) link.argument(hostPath)
-        // OpenSSL is not on Darwin's default library path, whether the graph
-        // links it for TLS or the manifest names it.
-        val openSslLibraryDirectory = bootstrapMacOpenSslLibraryDirectory(
-            macTarget
-        )
-        if (openSslLibraryDirectory != "" && (linkOpenSsl ||
-            bootstrapNamesOpenSsl(nativeLibraries))) {
-            link.argument("-L$openSslLibraryDirectory")
-        }
-        if (linkOpenSsl) {
-            link.argument("-lssl")
-            link.argument("-lcrypto")
-        }
-        nativeLibraryIndex = 0
-        while (nativeLibraryIndex < nativeLibraries.size) {
-            val nativeLibrary = nativeLibraries[nativeLibraryIndex]
-            link.argument("-l")
-            link.argument(nativeLibrary)
-            nativeLibraryIndex = nativeLibraryIndex + 1
-        }
-        // LLVM lowers floor/ceil/trunc/round intrinsics to libm calls on
-        // x86-64 without SSE4.1; Darwin's libSystem already carries libm.
-        // Only as needed: a program that calls none of it (float `%` is the
-        // runtime's own on x86-64 Linux) does not depend on libm (#806).
-        if (!macTarget && !bootstrapNoLibcRequested) {
-            link.argument("-Wl,--as-needed")
-            link.argument("-lm")
-            link.argument("-Wl,--no-as-needed")
-        }
-        link.argument("-o")
-        link.argument(publishPath)
-        status = if (macTarget) link.run()
+            if (linkLlvm) {
+                val configuredLlvm = linuxEnvironment("ABLA_MACOS_LLVM_LIB")
+                val llvmConfig = linuxCommand("llvm-config")
+                llvmConfig.argument("--libdir")
+                var llvmLibraryDirectory = if (macTarget &&
+                    configuredLlvm.found && configuredLlvm.value != "") {
+                    configuredLlvm.value
+                } else llvmConfig.captureText()
+                var end = llvmLibraryDirectory.size
+                while (end > 0 &&
+                    (llvmLibraryDirectory[end - 1] == 10 ||
+                        llvmLibraryDirectory[end - 1] == 13)) end = end - 1
+                llvmLibraryDirectory = llvmLibraryDirectory.slice(0, end)
+                link.argument("-L$llvmLibraryDirectory")
+                if (!macTarget || !configuredLlvm.found ||
+                    configuredLlvm.value == "") {
+                    link.argument("-Wl,-rpath,$llvmLibraryDirectory")
+                }
+                link.argument("-lLLVM")
+            }
+            // (An archive of code generation units is loaded whole; ld64 loads an object
+            // so named as it loads it plainly.)
+            val linkedObject = if (ltoEligible && !linkLlvm) ltoObjectPath else objectPath
+            if (nativeUnits && macTarget) link.argument("-Wl,-force_load,$objectPath")
+            else if (nativeUnits) {
+                link.argument("-Wl,--whole-archive")
+                link.argument(objectPath)
+                link.argument("-Wl,--no-whole-archive")
+            }
+            else link.argument(linkedObject)
+            if (macTarget) link.argument(hostPath)
+            // OpenSSL is not on Darwin's default library path, whether the graph
+            // links it for TLS or the manifest names it.
+            val openSslLibraryDirectory = bootstrapMacOpenSslLibraryDirectory(
+                macTarget
+            )
+            if (openSslLibraryDirectory != "" && (linkOpenSsl ||
+                bootstrapNamesOpenSsl(nativeLibraries))) {
+                link.argument("-L$openSslLibraryDirectory")
+            }
+            if (linkOpenSsl) {
+                link.argument("-lssl")
+                link.argument("-lcrypto")
+            }
+            nativeLibraryIndex = 0
+            while (nativeLibraryIndex < nativeLibraries.size) {
+                val nativeLibrary = nativeLibraries[nativeLibraryIndex]
+                link.argument("-l")
+                link.argument(nativeLibrary)
+                nativeLibraryIndex = nativeLibraryIndex + 1
+            }
+            // LLVM lowers floor/ceil/trunc/round intrinsics to libm calls on
+            // x86-64 without SSE4.1; Darwin's libSystem already carries libm.
+            // Only as needed: a program that calls none of it (float `%` is the
+            // runtime's own on x86-64 Linux) does not depend on libm (#806).
+            if (!macTarget && !libcFree) {
+                link.argument("-Wl,--as-needed")
+                link.argument("-lm")
+                link.argument("-Wl,--no-as-needed")
+            }
+            link.argument("-o")
+            link.argument(publishPath)
+            val failures = "$publishPath.libc-free-link"
+            if (libcFree) link.errors(failures)
+            status = if (macTarget) link.run()
             else bootstrapRunHostLink(link, linkedObject, publishPath)
-        if (status == 0 && bootstrapNoLibcRequested) {
-            // _start applies R_X86_64_RELATIVE relocations only; any other kind is an error here.
-            val relocations = linuxCommand("llvm-readelf")
-            relocations.argument("-rW")
-            relocations.argument(publishPath)
-            var unsupported = ""
-            for (line in relocations.captureText().split("\n")) {
-                if (bootstrapTextContains(line, "R_X86_64_") &&
-                    !bootstrapTextContains(line, "R_X86_64_RELATIVE")) unsupported = line
+            if (status == 0 && libcFree) {
+                // abla_start applies R_X86_64_RELATIVE relocations only.
+                val relocations = linuxCommand("llvm-readelf")
+                relocations.argument("-rW")
+                relocations.argument(publishPath)
+                for (line in relocations.captureText().split("\n")) {
+                    if (bootstrapTextContains(line, "R_X86_64_") &&
+                        !bootstrapTextContains(line, "R_X86_64_RELATIVE")) {
+                        libcReason =
+                            "its image needs a relocation abla_start does not apply: ${line.trim()}"
+                        status = 1
+                    }
+                }
             }
-            if (unsupported != "") {
-                linuxPrintStandardError(
-                    "error[E_BUILD_NO_LIBC]: the static-pie image has a relocation its start-up does not apply: $unsupported\n"
-                )
+            if (libcFree && status != 0) {
+                if (libcReason == "") {
+                    val undefined: array<string> = []
+                    for (line in Path(failures).readText().split("\n")) {
+                        val at = line.indexOf("undefined symbol: ")
+                        if (at >= 0 && undefined.size < 8) {
+                            undefined.append(line.slice(at + 18, line.size).trim())
+                        }
+                    }
+                    libcReason = if (undefined.size >
+                        0) "it calls C functions: ${undefined.join(", ")}"
+                    else "the libc-free link failed"
+                }
                 Path(publishPath).remove()
-                status = 152
-                failureKind = "reported"
-            }
+                libcFree = false
+                status = 0
+            } else linking = false
+            Path(failures).remove()
+        }
+        if (status == 0 && bootstrapBuildVerbose && libcReason != "") {
+            linuxPrintStandardError("note: $outputPath links libc: $libcReason\n")
         }
     }
     // The Abla runtime is part of the program LLVM unit, so its ordinary
@@ -5062,9 +5083,10 @@ fun bootstrapServeWithEmitter(
     0
 }
 
-// The symbols `--no-libc` defines in assembly (exports.ab); only LTO needs to know them.
+// The libc-free entry and thread block routines (exports.ab), which only the
+// libc-free link and the clone threads' module assembly reach: LTO must keep them.
 fun bootstrapFreestandingRoutineNames(): array<string> =
-    ["_start", "abla_tls_bytes", "abla_tls_init", "abla_tls_set"]
+    ["abla_start", "abla_tls_bytes", "abla_tls_init", "abla_tls_set"]
 
 // The C functions the modules that declare the OpenSSL ABI import (`extern:"c" fun NAME(`).
 fun bootstrapOpenSslExternNames(source: string): array<string> {

@@ -11,12 +11,11 @@ directory. Installed or custom layouts may override that root with
 override. Project inputs, outputs, and caches continue to use project or
 invocation-relative paths.
 
-The Linux x86-64 toolchain archive requires glibc 2.38 or later. Ubuntu 24.04
-and Debian 13 meet that requirement; stock Ubuntu 22.04, Debian 12 and RHEL 9
-have older glibc and cannot run the archive unmodified. The archive uses the
+The Linux x86-64 toolchain archive requires glibc 2.34 or later. Ubuntu 22.04,
+Debian 12, RHEL 9 and later meet that requirement. The archive uses the
 system dynamic loader and bundles LLVM and its other non-glibc dependencies.
 The standalone `ablac-x86_64-linux` release asset is intended for bootstrapping:
-it requires glibc 2.38 and a specific Nix-store dynamic loader, so it is not
+it requires glibc 2.34 and a specific Nix-store dynamic loader, so it is not
 intended for direct use on other systems. Use the toolchain archive for an
 installed toolchain.
 
@@ -82,6 +81,16 @@ typed IR, emits LLVM objects, and links the requested executable or library.
 artifact container; executable remains the default. Libraries without `main`
 must explicitly publish at least one supported foreign adapter through the
 compiler API; internal Abla symbols remain hidden.
+
+An x86-64 Linux executable links no C library. It is a static
+position-independent executable with its own entry point, memory routines,
+system calls and threads, and it imports nothing. The compiler links libc and
+the dynamic loader only when the program brings a C library itself: a TLS
+connection (OpenSSL), the manifest's `nativeLibraries`, `extern "host"` calls,
+or an `extern:"c"` function that the libc-free link cannot resolve. There is no
+option for it: the program decides. `ablac build --verbose` prints a note
+naming why a build linked libc. macOS executables link libSystem, and libraries
+and objects are unchanged.
 Programmable external targets can additionally request a generic `module`
 artifact. The current WebAssembly linker produces a no-entry module, preserves
 explicit foreign exports, retains unresolved symbols from explicit foreign

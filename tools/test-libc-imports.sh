@@ -7,7 +7,8 @@
 # a program and mode such as hello.release, or "compiler"; a needed shared
 # library is listed as needed:<soname>. The compiler's libLLVM C API calls
 # (versioned LLVM_*) are left out; its libraries are not.
-# Linux only: a macOS program keeps libSystem.
+# A program without a C library imports nothing at all: it is a static
+# executable (checked below). Linux only: a macOS program keeps libSystem.
 set -euo pipefail
 export LC_ALL=C
 compiler=${1:-build/ablac}
@@ -59,43 +60,33 @@ for program in tests/cases/libc-imports/*.ab; do
         imports "$name.$mode" "$out/$name.$mode" >>"$actual"
     done
 done
-# Programs built with --no-libc (static, our own _start; #806 step 6): no
-# interpreter, no dynamic section, no undefined symbols, and the run prints what the
-# dynamic build prints. A program in tools/libc-imports-static-pending.txt does not
-# link yet (the steps that remove its libc symbols have not landed); that list only
-# shrinks, and a pending program that links must be taken off it.
+# An x86-64 Linux program links no libc unless it brings a C library (#806): its
+# release and --fast builds have no interpreter, no dynamic section and no undefined
+# symbol. tools/libc-imports-static-pending.txt names the programs that still link
+# libc, each for a reason the file gives; it only shrinks, and a program on it that
+# no longer links libc must be taken off.
 pending=tools/libc-imports-static-pending.txt
 [[ -f $pending ]] || { echo "libc imports: missing $pending" >&2; exit 1; }
-for name in hello float-remainder strings-arrays files tasks threads; do
-    program=tests/cases/libc-imports/$name.ab
-    [[ -f $program ]] || continue
-    binary_static=$out/$name.static
-    if ! "$compiler" build "$program" -o "$binary_static" --no-libc --no-cache >"$out/$name.static.log" 2>&1; then
-        if grep -qx "$name" "$pending"; then
-            echo "libc imports: $name.static does not link yet (pending)"
-            continue
+for program in tests/cases/libc-imports/*.ab; do
+    name=$(basename "$program" .ab)
+    for mode in release fast; do
+        binary=$out/$name.$mode
+        static=1
+        if readelf -lW "$binary" | grep -q INTERP || readelf -dW "$binary" 2>/dev/null | grep -q NEEDED ||
+            [[ -n $("$nm" --undefined-only "$binary" 2>/dev/null) ]]; then
+            static=0
         fi
-        echo "libc imports: $program (--no-libc) did not build:" >&2
-        tail -n 20 "$out/$name.static.log" >&2
-        exit 1
-    fi
-    if grep -qx "$name" "$pending"; then
-        echo "libc imports: $name.static links now, remove it from $pending" >&2
-        exit 1
-    fi
-    if readelf -lW "$binary_static" | grep -q INTERP || readelf -dW "$binary_static" 2>/dev/null | grep -q NEEDED ||
-        [[ -n $("$nm" -D --undefined-only "$binary_static" 2>/dev/null) || -n $("$nm" --undefined-only "$binary_static" 2>/dev/null) ]]; then
-        echo "libc imports: $name.static is not a self-contained static executable" >&2
-        exit 1
-    fi
-    set +e
-    "$out/$name.release" >"$out/$name.release.out" 2>&1; expected=$?
-    "$binary_static" >"$out/$name.static.out" 2>&1; actual_status=$?
-    set -e
-    if [[ $expected != "$actual_status" ]] || ! cmp -s "$out/$name.release.out" "$out/$name.static.out"; then
-        echo "libc imports: $name.static runs differently from $name.release (status $actual_status, expected $expected)" >&2
-        exit 1
-    fi
+        if grep -qx "$name" "$pending"; then
+            if [[ $static == 1 ]]; then
+                echo "libc imports: $name.$mode links no libc now, remove $name from $pending" >&2
+                exit 1
+            fi
+        elif [[ $static == 0 ]]; then
+            echo "libc imports: $name.$mode links libc (it should not):" >&2
+            "$compiler" build "$program" -o "$out/$name.verbose" --no-cache --verbose 2>&1 | grep '^note:' >&2 || true
+            exit 1
+        fi
+    done
 done
 # A program that imports abla/http without a TLS connection links no OpenSSL.
 if ! "$compiler" build tests/cases/libc-imports-http/main.ab -o "$out/http-plain" --no-cache >"$out/http-plain.log" 2>&1; then

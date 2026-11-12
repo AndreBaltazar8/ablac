@@ -127,21 +127,19 @@ the runtime moved to Abla, and `docs/freestanding.md` said it returns when start
 and entry are written in Abla or intrinsics. Its plumbing is still in `src/toolchain.ab`
 (`rawTarget`, about 3354 and 4085-4098).
 
-Proposed order, smallest and safest first. Each step removes lines from the list:
-1. `memcpy`/`memmove`/`memset`/`memcmp` and float remainder in Abla on x86-64 Linux (the wasm32
-   path exists). Still dynamically linked.
-2. `ablaLinuxSyscall` as an inline `syscall`, plus the compact fatal path. This removes `syscall`
-   and `__errno_location`.
-3. `getenv` from envp, then `getpid`, `write`, `_exit`, `raise`, `getrlimit` and `signal` by
-   system calls (the `--fast` runtime and the compiler's uses).
-4. Signals: `rt_sigaction` with an Abla restorer, and `sigaltstack` by system call (the stack guard).
-5. An mmap allocator replacing malloc in `host.ab`, measured against glibc on NovaKind's benchmarks.
-6. `_start`, static TLS, `-nostdlib -static` for programs with no foreign libraries: the first
-   hello world without libc. It starts behind a flag and becomes the default after a release.
-7. Threads on `clone`, futex mutexes and condition variables, join.
-8. The `--fast` backtrace by frame-pointer walk, or dropped on this target.
-9. Programs that use OpenSSL or other native libraries keep libc until a pure-Abla TLS exists. The
-   compiler's own LLVM and OpenSSL are step C, for André.
+Done, 2026-11-12, in parallel (owner of the whole: ablac-c6): memory routines and float
+remainder (step 1), inline system calls (2), stack guard and `--fast` runtime by system calls
+(4, 8), futex locks (7a), the compiler's setitimer, link, utimes, fork, dlopen/dlsym and
+evaluator signals, the libc-free start-up and static-pie link (6), clone threads (7b). Then the
+default: an x86-64 Linux executable links libc only when the program brings a C library
+(OpenSSL, nativeLibraries, extern "host", an extern:"c" the libc-free link can't resolve);
+there is no option, and `ablac build --verbose` says why one linked libc. Still open: getenv
+and getpid (3), the allocator on mmap (5), the stdlib's own fork, signal and fcntl,
+_setjmp/_longjmp; until they land, programs fall back to the hosted link by themselves
+(tools/libc-imports-static-pending.txt lists the guard's). Findings: the runtime copies
+overlapping ranges with memcpy (all copies are llvm.memcpy; glibc's x86-64 memcpy is memmove,
+and ours is too); a raw clone thread can't run C library code, so clone threads only in
+libc-free images. The compiler links libLLVM and OpenSSL until step C, which is André's.
 
 macOS keeps libSystem for system calls, malloc, threads and signals. Only steps 1 and 5 (in its
 mmap form) apply there.
