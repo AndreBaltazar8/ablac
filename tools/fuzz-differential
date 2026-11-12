@@ -1634,6 +1634,136 @@ fun safeSlice(s: string, a: int, b: int): string {
                                '    actual', '}']
         return lines, f'c{index}()', 'str'
 
+    def fresh_select_check(self, index):
+        """#804: a fresh resource chosen by `??` as a borrowed or owned argument, a field projection
+        owner, a receiver and a loop source, and a fresh resource as a `when` subject (through the
+        selected arm, across return/break/defer and a yield). Python computes the drop log."""
+        r = self.r
+        n = r.randint(10, 90)
+        give = r.choice([True, False])
+        flag = str(give).lower()
+        kind = r.choice(['argument', 'field', 'receiver', 'loop', 'subject'])
+        definitions = []
+        chosen = n if give else n + 1
+        picked = f'maybeIssue({n}, {flag}) ?? issue({n + 1})'
+        if kind == 'argument':
+            call = r.choice(['plain', 'named', 'method', 'lambda', 'owned', 'owned-lambda'])
+            if call == 'plain':
+                action, events = f'fuzzTake({picked})', [2000 + chosen, chosen]
+            elif call == 'named':
+                action, events = f'fuzzTake(ticket = {picked})', [2000 + chosen, chosen]
+            elif call == 'method':
+                action, events = f'FuzzObserver().take({picked})', [2000 + chosen, chosen]
+            elif call == 'lambda':
+                definitions = [f'fun ownedBody{index}(): void {{',
+                               '    val f: (Ticket) -> int = { t: Ticket -> fuzzTake(t) }',
+                               f'    {"(if (true) f else f)" if r.choice([True, False]) else "f"}({picked})',
+                               '    dropLog.append(900)', '}']
+                action, events = f'ownedBody{index}()', [2000 + chosen, chosen, 900]
+            elif call == 'owned':
+                action, events = f'fuzzTakeOwned({picked})', [3000 + chosen, chosen]
+            else:
+                definitions = [f'fun ownedBody{index}(): void {{',
+                               '    val consume: (own: Ticket) -> int = fuzzTakeOwned',
+                               f'    consume({picked})', '    dropLog.append(900)', '}']
+                action, events = f'ownedBody{index}()', [3000 + chosen, chosen, 900]
+            if not definitions:
+                action += '; dropLog.append(900)'
+                events.append(900)
+        elif kind == 'field':
+            if r.choice([True, False]):
+                action = f'val seat = ({picked}).seat; dropLog.append(5000 + seat)'
+                events = [chosen, 5000 + chosen]
+            else:
+                owner = f'maybeOwner({n}, {n + 200}, {flag}) ?? TempTicketOwner(issue({n + 1}), {n + 201})'
+                action = f'fuzzTake(({owner}).ticket); dropLog.append(900)'
+                events = [2000 + chosen, chosen + 200, chosen, 900]
+        elif kind == 'receiver':
+            if r.choice([True, False]):
+                action, events = f'({picked}).fuzzLook(); dropLog.append(900)', [1000 + chosen, chosen, 900]
+            else:
+                action, events = f'val twice = ({picked}).twice(); dropLog.append(twice)', [chosen, 2 * chosen]
+        elif kind == 'loop':
+            machine = r.choice([True, False])
+            stop = r.choice([True, False])
+            borrowed = r.choice([True, False])
+            fresh = [n, n + 1] if give else ([n + 2, n + 3] if not borrowed else [])
+            alternative = 'owner' if borrowed else f'[issue({n + 2}), issue({n + 3})]'
+            body = [f'    val owner = [issue({n + 2}), issue({n + 3})]'] if borrowed else []
+            body += [f'    for (t in maybeTickets({n}, {flag}) ?? {alternative}) {{', '        t.fuzzLook()']
+            body += ['        yield t.seat'] if machine else []
+            body += ['        if (true) break'] if stop and not machine else []
+            body += ['    }', '    dropLog.append(900)']
+            if machine:
+                definitions = [f'fun ownedBody{index}(): Generator<int> = generator {{'] + body + ['}']
+                action = f'for (seat in ownedBody{index}()) {{ {"break" if stop else ""} }}'
+            else:
+                definitions = [f'fun ownedBody{index}(): void {{'] + body + ['}']
+                action = f'ownedBody{index}()'
+            seats = [n, n + 1] if give else [n + 2, n + 3]
+            visited = seats[:1] if stop else seats
+            events = []
+            for seat in visited:
+                events.append(1000 + seat)
+                if give or not borrowed: events.append(seat)
+            if stop and (give or not borrowed): events.append(seats[1])
+            if not (machine and stop): events.append(900)
+            if borrowed: events += [n + 2, n + 3]
+        else:
+            other = r.choice([True, False])
+            arm = 901 if other else 900
+            subject_kind = r.choice(['plain', 'computed', 'conditional', 'return', 'break', 'yield', 'repeat'])
+            selector = f'is FaceTicket -> {{ dropLog.append(900) }} else -> {{ dropLog.append(901) }}'
+            otext = str(other).lower()
+            if subject_kind == 'plain':
+                action, events = f'when (face({n}, {otext})) {{ {selector} }}; dropLog.append(902)', [arm, n, 902]
+            elif subject_kind == 'computed':
+                action = (f'when (face(TempTicketOwner(issue({n + 1}), {n + 200}).ticket.seat - 1, {otext})) '
+                          f'{{ {selector} }}; dropLog.append(902)')
+                events = [n + 200, n + 1, arm, n, 902]
+            elif subject_kind == 'conditional':
+                definitions = [f'fun ownedBody{index}(): void {{', f'    val held: FuzzFace = face({n + 5}, false)',
+                               f'    when (if ({flag}) face({n}, {otext}) else held) {{ {selector} }}',
+                               '    dropLog.append(902)', '}']
+                action = f'ownedBody{index}()'
+                events = ([arm, n] if give else [900]) + [902, n + 5]
+            elif subject_kind == 'return':
+                definitions = [f'fun ownedBody{index}(): int {{', f'    defer {{ dropLog.append({n + 300}) }}',
+                               f'    when (face({n}, {otext})) {{ is FaceTicket -> {{ dropLog.append(900); return 1 }} '
+                               'else -> dropLog.append(901) }', '    dropLog.append(902)', '    0', '}']
+                action = f'val result = ownedBody{index}()'
+                events = [900, n, n + 300] if not other else [901, n, 902, n + 300]
+            elif subject_kind == 'break':
+                definitions = [f'fun ownedBody{index}(): void {{', '    for (i in 0 until 2) {',
+                               f'        when (face({n} + i, {otext})) {{ is FaceTicket -> {{ dropLog.append(900); break }} '
+                               'else -> dropLog.append(901) }', '    }', '    dropLog.append(902)', '}']
+                action = f'ownedBody{index}()'
+                events = [900, n, 902] if not other else [901, n, 901, n + 1, 902]
+            elif subject_kind == 'yield':
+                stop = r.choice([True, False])
+                definitions = [f'fun ownedBody{index}(): Generator<int> = generator {{',
+                               f'    when (face({n}, {otext})) {{ is FaceTicket -> {{ dropLog.append(900); yield 1; '
+                               'dropLog.append(903) } else -> { dropLog.append(901); yield 2; dropLog.append(903) } }',
+                               '    dropLog.append(902)', '}']
+                action = f'for (v in ownedBody{index}()) {{ {"break" if stop else ""} }}'
+                events = [arm, n] if stop else [arm, 903, n, 902]
+            else:
+                stop = r.choice([True, False])
+                definitions = [f'fun ownedBody{index}(): Generator<int> = generator {{', '    for (i in 0 until 2) {',
+                               f'        when (face({n} + i, {otext})) {{ is FaceTicket -> {{ defer {{ dropLog.append({n + 300}) }}; '
+                               'dropLog.append(900); yield i } else -> { dropLog.append(901); yield i } }', '    }', '}']
+                action = f'for (v in ownedBody{index}()) {{ {"break" if stop else ""} }}'
+                events = []
+                for i in ([0] if stop else [0, 1]):
+                    events += [arm] + ([] if other else [n + 300]) + [n + i]
+        expected = ''.join(f'{event},' for event in events)
+        lines = definitions + [f'fun c{index}(): string {{', '    dropLog.clear()',
+                               f'    {action}', '    var actual = ""',
+                               '    for (event in dropLog) actual += "${event},"',
+                               f'    if (actual != "{expected}") return "FUZZ_ORACLE_FAILURE:" + actual',
+                               '    actual', '}']
+        return lines, f'c{index}()', 'str'
+
     def resource_drop_check(self, index):
         """Resource classes: `drop()` logs to a global, so reassignment, `move`, block ends and loops
         show the order and the number of drops; a fresh resource used as a receiver, a field read, in
@@ -1833,6 +1963,23 @@ fun fuzzTicketMap(n: int): Map<string, Ticket> {
     result.set("a", issue(n)); result.set("b", issue(n + 1))
     result
 }
+class FuzzObserver {
+    fun take(t: Ticket): int { dropLog.append(2000 + t.seat); t.seat }
+}
+fun fuzzTake(ticket: Ticket): int { dropLog.append(2000 + ticket.seat); ticket.seat }
+fun fuzzTakeOwned(own ticket: Ticket): int { dropLog.append(3000 + ticket.seat); ticket.seat }
+fun maybeOwner(seat: int, id: int, give: bool): TempTicketOwner? = if (give) TempTicketOwner(Ticket(seat), id) else null
+fun maybeTickets(seat: int, give: bool): array<Ticket>? = if (give) [Ticket(seat), Ticket(seat + 1)] else null
+resource interface FuzzFace { fun faceSeat(): int }
+resource class FaceTicket(val seat: int): FuzzFace {
+    fun faceSeat(): int = seat
+    fun drop(): void { dropLog.append(this.seat); return }
+}
+resource class OtherFace(val seat: int): FuzzFace {
+    fun faceSeat(): int = seat
+    fun drop(): void { dropLog.append(this.seat); return }
+}
+fun face(seat: int, other: bool): FuzzFace = if (other) OtherFace(seat) else FaceTicket(seat)
 fun drainGen(values: Generator<int>): int {
     var sum = 0
     for (v in values) sum = sum + v
@@ -1871,6 +2018,7 @@ fun <T, U> crossed(a: T, b: U): Pair<U, T> = Pair(b, a)
                              self.any_check, self.clash_check,
                              self.generic_lambda_check, self.resource_drop_check, self.default_owner_check,
                              self.ownership_lifetime_check,
+                             self.fresh_select_check,
                              self.elvis_member_check, self.gzip_check, self.nested_generator_check,
                              self.json_check, self.yaml_check])(index)
         extra = r.random()
