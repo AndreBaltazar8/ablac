@@ -19,31 +19,54 @@ import "lib.ab"
 fun main: int = answer()
 AB
 build() { "$compiler" build "$work/main.ab" -o "$work/program" --o1 "$@"; }
+# Little-endian binary helpers for the record bytes (od/dd only, no interpreter).
+u32_at() { od -An -tu1 -j "$2" -N4 "$1" | awk '{ print $1 + $2 * 256 + $3 * 65536 + $4 * 16777216 }'; }
+byte_at() { od -An -tu1 -j "$2" -N1 "$1" | tr -d ' '; }
+set_byte() { printf "\\$(printf '%03o' "$3")" | dd of="$1" bs=1 seek="$2" conv=notrunc 2> /dev/null; }
+# record_third_field FILE: the third length-prefixed field of a discovery record.
+record_third_field() {
+    local file=$1 cursor=0 i n
+    for i in 0 1; do n=$(u32_at "$file" "$cursor"); cursor=$((cursor + 4 + n)); done
+    n=$(u32_at "$file" "$cursor")
+    dd if="$file" bs=1 skip=$((cursor + 4)) count="$n" 2> /dev/null
+}
 objects_cold() {
-    python3 - "$ABLA_CACHE_DIR" <<'PY'
-import pathlib, shutil, sys
-for p in pathlib.Path(sys.argv[1]).iterdir():
-    if p.name.startswith('discovery-v1-'): continue
-    if p.is_dir(): shutil.rmtree(p)
-    else: p.unlink()
-PY
+    find "$ABLA_CACHE_DIR" -mindepth 1 -maxdepth 1 ! -name 'discovery-v1-*' -exec rm -rf {} +
+}
+find_record() {
+    local found= count=0 p
+    for p in "$ABLA_CACHE_DIR"/discovery-v1-*/*.discovery; do
+        [[ -e $p ]] || continue
+        record_third_field "$p" > "$work/field"
+        if [[ $(cat "$work/field") == "$work/lib.ab" ]]; then found=$p; count=$((count + 1)); fi
+    done
+    [[ $count -eq 1 ]] || fail "expected one discovery record for lib.ab, found $count"
+    printf '%s' "$found" > "$work/record-path"
+    cp "$found" "$work/pristine"
+}
+# mutate_record MODE: damage the pristine record in place at the recorded path.
+mutate_record() {
+    local record size n cursor
+    record=$(cat "$work/record-path")
+    cp "$work/pristine" "$record"
+    size=$(wc -c < "$record" | tr -d ' ')
+    case $1 in
+        corrupt) set_byte "$record" $((size - 1)) $(( $(byte_at "$record" $((size - 1))) ^ 1 )) ;;
+        truncated) dd if=/dev/null of="$record" bs=1 seek=$((size - 3)) 2> /dev/null ;;
+        version) set_byte "$record" $((4 + 16 - 1)) 57 ;;
+        image)
+            n=$(u32_at "$record" 0); cursor=$((4 + n))
+            [[ $(u32_at "$record" "$cursor") -gt 0 ]] || fail 'record image is empty'
+            set_byte "$record" $((cursor + 4)) $(( $(byte_at "$record" $((cursor + 4))) ^ 1 )) ;;
+        trailing) printf '!' >> "$record" ;;
+        oversized) : > "$record"; dd if=/dev/null of="$record" bs=1 seek=67108864 2> /dev/null ;;
+    esac
+    ! cmp -s "$record" "$work/pristine" || fail "$1 left the record unchanged"
 }
 build > "$work/cold.out" 2> "$work/cold.err" || { cat "$work/cold.err" >&2; fail 'cold build'; }
 cp "$work/program" "$work/reference"
 cp "$work/program.ll" "$work/reference.ll"
-python3 - "$ABLA_CACHE_DIR" "$work/lib.ab" "$work/record-path" "$work/pristine" <<'PY'
-import pathlib, struct, sys
-found = []
-for p in pathlib.Path(sys.argv[1]).glob('discovery-v1-*/*.discovery'):
-    b=p.read_bytes(); cursor=0; fields=[]
-    for i in range(3):
-        n=struct.unpack_from('<I',b,cursor)[0]; cursor+=4
-        fields.append(b[cursor:cursor+n]); cursor+=n
-    if fields[2]==sys.argv[2].encode(): found.append(p)
-assert len(found)==1,found
-pathlib.Path(sys.argv[3]).write_text(str(found[0]))
-pathlib.Path(sys.argv[4]).write_bytes(found[0].read_bytes())
-PY
+find_record
 objects_cold
 ABLA_COMPILER_MEMORY_TRACE=1 build > "$work/hit.out" 2> "$work/hit.err" || fail 'summary hit'
 grep -Fq "discovery.hit:$work/lib.ab" "$work/hit.err" || fail 'no raw summary hit'
@@ -61,21 +84,7 @@ set -e
 [[ $direct_result -eq 42 ]] || fail "no-cache returned $direct_result"
 cmp "$(cat "$work/record-path")" "$work/pristine"
 for mode in corrupt truncated version image trailing oversized; do
-    python3 - "$work/record-path" "$work/pristine" "$mode" <<'PY'
-import pathlib, struct, sys
-p=pathlib.Path(pathlib.Path(sys.argv[1]).read_text()); b=bytearray(pathlib.Path(sys.argv[2]).read_bytes()); mode=sys.argv[3]
-if mode=='corrupt': b[-1]^=1
-elif mode=='truncated': b=b[:-3]
-elif mode=='version': b[4+len('ABLA-DISCOVERY-1')-1]=ord('9')
-elif mode=='image':
-    n=struct.unpack_from('<I',b,0)[0]; cursor=4+n
-    assert struct.unpack_from('<I',b,cursor)[0]>0
-    b[cursor+4]^=1
-elif mode=='trailing': b+=b'!'
-if mode=='oversized':
-    with p.open('wb') as f: f.truncate(67108864)
-else: p.write_bytes(b)
-PY
+    mutate_record "$mode"
     objects_cold
     ABLA_COMPILER_MEMORY_TRACE=1 build > "$work/$mode.out" 2> "$work/$mode.err" || fail "$mode fallback"
     if grep -Fq "discovery.hit:$work/lib.ab" "$work/$mode.err"; then fail "$mode was accepted"; fi
@@ -84,12 +93,12 @@ PY
     cmp "$(cat "$work/record-path")" "$work/pristine"
 done
 # Neither source size nor mtime is a validity proof.
-python3 - "$work/lib.ab" <<'PY'
-import os,pathlib,sys
-p=pathlib.Path(sys.argv[1]); s=p.stat(); p.write_bytes(p.read_bytes().replace(b'42',b'43'))
-os.utime(p,ns=(s.st_atime_ns,s.st_mtime_ns))
-assert p.stat().st_size==s.st_size and p.stat().st_mtime_ns==s.st_mtime_ns
-PY
+size=$(wc -c < "$work/lib.ab"); mtime=$(stat -c %y "$work/lib.ab")
+touch -r "$work/lib.ab" "$work/lib.stamp"
+sed 's/42/43/g' "$work/lib.ab" > "$work/lib.edited" && cat "$work/lib.edited" > "$work/lib.ab"
+touch -r "$work/lib.stamp" "$work/lib.ab"
+[[ $(wc -c < "$work/lib.ab") -eq $size && $(stat -c %y "$work/lib.ab") == "$mtime" ]] || fail 'the edit changed the size or mtime'
+grep -q 43 "$work/lib.ab" || fail 'the edit did not change lib.ab'
 objects_cold
 build > "$work/edit.out" 2> "$work/edit.err" || fail 'restored-mtime edit'
 set +e
