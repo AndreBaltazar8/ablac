@@ -17,6 +17,8 @@ tests/cases/fuzz-differential-<seed>-<check>/ (program.ab and expected outputs).
 
   tools/fuzz-differential --seeds 1-3 [--checks 24] [--compiler build/ablac]
   tools/fuzz-differential --seeds 1-3 --focus resource_drop_check  # every check from one generator
+  tools/fuzz-differential --seeds 1-3 --hosted-tasks  # four hosted modes; Wasm unsupported
+  tools/fuzz-differential --check-hostless-capabilities  # assert task/thread Wasm rejection
   tools/fuzz-differential --seed 7 --keep     # one seed, keep its directory
   tools/fuzz-differential --program x.ab      # run one existing program, all ways
 Exit status 0 when every mode agreed.
@@ -419,6 +421,51 @@ class Gen:
         lines.append("    out")
         lines.append("}")
         return lines, f"c{index}()", "str"
+
+    def task_check(self, index):
+        """Hosted-only deterministic tasks and independent threads, with a Python oracle."""
+        r = self.r
+        a, b = r.randint(1, 90), r.randint(101, 190)
+        kind = r.choice(['unstarted', 'early', 'field', 'thread'])
+        lines = [f'fun c{index}(): string {{']
+        if kind == 'unstarted':
+            lines += ['    taskProbeLog.clear()', '    if (true) {',
+                      f'        val owned = TaskProbeTicket({a})',
+                      '        val pending = task { owned.id }', '    }',
+                      '    val actual = "${taskProbeLog.size}:${if (taskProbeLog.size > 0) taskProbeLog[0] else -1}"']
+            expected = f'1:{a}'
+        elif kind == 'early':
+            lines += ['    taskProbeLog.clear()', '    val outer = task {', '        val inner = task {',
+                      f'            val owned = TaskProbeTicket({a})',
+                      f'            defer {{ taskProbeLog.append({b}) }}',
+                      '            if (true) return owned.id', '            999', '        }',
+                      '        await inner', '    }', '    val result = await outer',
+                      '    val actual = "$result:${taskProbeLog.size}:${if (taskProbeLog.size > 0) taskProbeLog[0] else -1}:${if (taskProbeLog.size > 1) taskProbeLog[1] else -1}"']
+            expected = f'{a}:2:{b}:{a}'
+        elif kind == 'field':
+            lines += [f'    val box = TaskProbeBox(task {{ {a} }})',
+                      '    val first = await move(box.job)',
+                      f'    val local = task {{ {b} }}',
+                      '    val second = taskProbeConsume(move(local))',
+                      '    val actual = "$first:$second"']
+            expected = f'{a}:{b}'
+        else:
+            lines += [f'    val first = thread {{ val value = {a}; value * value + 1 }}',
+                      f'    val second = thread {{ val value = {b}; value * 2 + 3 }}',
+                      '    val two = await second', '    val one = await first',
+                      '    val actual = "$one:$two"']
+            expected = f'{a * a + 1}:{b * 2 + 3}'
+        lines += [f'    if (actual != "{expected}") return "FUZZ_ORACLE_FAILURE"', '    actual', '}']
+        return lines, f'c{index}()', 'str'
+
+    PRELUDE_TASK = '''import "abla/io"
+val taskProbeLog: array<int> = []
+resource class TaskProbeTicket(val id: int) {
+    fun drop(): void { taskProbeLog.append(this.id); return }
+}
+class TaskProbeBox(val job: Task<int>)
+fun taskProbeConsume(own job: Task<int>): int = await job
+'''
 
     def yaml_check(self, index):
         """Generate a YAML subset and a Python JSON semantic oracle without PyYAML."""
@@ -1771,7 +1818,7 @@ fun main: int = if (release && development) 0 else 1
             results[name] = (stdout, code, err.strip().splitlines()[:1]) if stderr else (stdout, code)
         return results
 
-    def all_modes(self, directory, prelude_checks):
+    def all_modes(self, directory, prelude_checks, include_wasm=True):
         """prelude_checks: (prelude, checks); returns {mode: (stdout, rc) | failure}."""
         prelude, checks = prelude_checks
         os.makedirs(os.path.join(ROOT, directory), exist_ok=True)
@@ -1786,8 +1833,9 @@ fun main: int = if (release && development) 0 else 1
             "release": lambda: self.native(plain, os.path.join(directory, "release"), False, False),
             "ct": lambda: self.native(ct, os.path.join(directory, "ct"), True, "interp"),
             "ct-jit": lambda: self.native(ct, os.path.join(directory, "ctjit"), True, "jit"),
-            "wasm": lambda: self.wasm(plain, directory),
         }
+        if include_wasm:
+            jobs["wasm"] = lambda: self.wasm(plain, directory)
         results = {}
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
             futures = {k: pool.submit(v) for k, v in jobs.items()}
@@ -1868,7 +1916,8 @@ def run_seed(args, seed, runner):
         lines, call, ty = gen.check(i)
         checks.append((lines, call, ty, i))
     directory = os.path.join(WORK, f"seed{seed}")
-    results = runner.all_modes(directory, (Gen.PRELUDE, checks))
+    prelude = Gen.PRELUDE_TASK if args.hosted_tasks else Gen.PRELUDE
+    results = runner.all_modes(directory, (prelude, checks), include_wasm=not args.hosted_tasks)
     bad = verdict(results)
     if bad is None:
         if not args.keep:
@@ -1891,7 +1940,9 @@ def minimise(args, seed, runner, checks, results, first):
 
         def still(candidate_lines, tag):
             trial = [(candidate_lines, check[1], check[2], check[3])]
-            got = runner.all_modes(os.path.join(WORK, f"min{seed}-{key}-{tag}"), (Gen.PRELUDE, trial))
+            prelude = Gen.PRELUDE_TASK if args.hosted_tasks else Gen.PRELUDE
+            got = runner.all_modes(os.path.join(WORK, f"min{seed}-{key}-{tag}"), (prelude, trial),
+                                   include_wasm=not args.hosted_tasks)
             # The same check must still differ, so a reduction cannot drift to another bug.
             ok = verdict(got) is not None and not any(v[0] == "build-failed" for v in got.values()) \
                 and key in differing_lines(got)
@@ -1942,6 +1993,33 @@ def selftest():
     return 0
 
 
+def check_hostless_capabilities(runner):
+    """Check each hostless builder rejects tasks/threads; do not count these as runs."""
+    directory = os.path.join(WORK, 'hostless-capabilities')
+    os.makedirs(os.path.join(ROOT, directory), exist_ok=True)
+    for kind in ('task', 'thread'):
+        source = os.path.join(directory, f'{kind}.ab')
+        text = f'import "abla/io"\n@export("run")\nfun run(): int {{ val t = {kind} {{ 7 }}; await t }}\nfun main(): int = run()\n'
+        with open(os.path.join(ROOT, source), 'w', encoding='utf-8') as f:
+            f.write(text)
+        for mode in ('wasm', 'wasm-dev'):
+            driver = os.path.join(directory, f'{kind}-{mode}-build.ab')
+            out = os.path.join(directory, f'{kind}-{mode}.wasm')
+            call = (f'wasmBuildModule("probe", "{source}", "{out}", false, false)'
+                    if mode == 'wasm' else
+                    f'buildProgram("probe", "{source}", "{out}", "wasm32-module", "module", true, false)')
+            with open(os.path.join(ROOT, driver), 'w', encoding='utf-8') as f:
+                registration = 'val target = #wasm32Target()\n' if mode == 'wasm-dev' else ''
+                f.write(f'import "abla/wasm/build"\n{registration}val built = #{call}\nfun main: int = if (built) 0 else 1\n')
+            rc, _, err = runner.sh([runner.compiler, 'build', driver, '-o',
+                                     os.path.join(directory, f'{kind}-{mode}-driver'), '--fast', '--no-cache'])
+            if rc == 0 or 'E_BUILD_TARGET_CAPABILITY' not in err:
+                print(f'{kind} {mode}: expected E_BUILD_TARGET_CAPABILITY, got status {rc}: {err[:1000]}')
+                return 1
+            print(f'{kind} {mode}: unsupported (E_BUILD_TARGET_CAPABILITY)')
+    return 0
+
+
 def seed_range(text):
     if "," in text:
         return [n for part in text.split(",") for n in seed_range(part)]
@@ -1963,14 +2041,26 @@ def main():
     ap.add_argument("--panics", action="store_true", help="also run one panicking program per seed (native and Wasm)")
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--selftest", action="store_true", help="check the comparison on made-up results")
+    ap.add_argument("--hosted-tasks", action="store_true", help="draw task/thread checks; compare only the four hosted modes")
+    ap.add_argument("--check-hostless-capabilities", action="store_true", help="assert tasks and threads are unsupported by each hostless Wasm builder")
     ap.add_argument("--show", action="store_true", help="with --program: print the output of the fast build")
     ap.add_argument("--program", help="run an existing .ab program (with @export(\"run\")) all ways")
     args = ap.parse_args()
+    if args.hosted_tasks:
+        if args.focus and args.focus != 'task_check':
+            ap.error('--hosted-tasks requires task_check')
+        if args.panics or args.program:
+            ap.error('--hosted-tasks cannot be combined with --panics or --program')
+        args.focus = 'task_check'
+    elif args.focus == 'task_check':
+        ap.error('task_check requires --hosted-tasks; it is not a hostless Wasm check')
     if args.focus and not (args.focus.endswith("_check") and callable(getattr(Gen, args.focus, None))):
         ap.error(f"--focus {args.focus}: no such generator (a Gen method named ..._check)")
     if args.selftest:
         return selftest()
     runner = Runner(args.compiler, args.timeout)
+    if args.check_hostless_capabilities:
+        return check_hostless_capabilities(runner)
     if args.program:
         directory = os.path.join(WORK, "program")
         os.makedirs(os.path.join(ROOT, directory), exist_ok=True)
@@ -1994,7 +2084,8 @@ def main():
             failures += 1
             print(found)
         else:
-            print(f"seed {seed}: {args.checks} checks agree in all modes")
+            modes = 'four hosted modes (Wasm unsupported)' if args.hosted_tasks else 'all six modes'
+            print(f"seed {seed}: {args.checks} checks agree in {modes}")
     return 1 if failures else 0
 
 

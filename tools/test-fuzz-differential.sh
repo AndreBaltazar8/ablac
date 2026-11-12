@@ -49,8 +49,23 @@ assert all(v[0] != 'build-failed' for v in bad.values()), bad
 assert all('c0=FUZZ_ORACLE_FAILURE' in v[0] for v in bad.values()), bad
 assert f['verdict'](bad) is not None and f['differing_lines'](bad) == ['c0'], bad
 print('fuzz differential: wrong YAML expectation detected in all modes')
+lines, call, ty = f['Gen'](1).task_check(0)
+def hosted(lines, name):
+    return runner.all_modes('build/fuzz-differential/' + name,
+                            (f['Gen'].PRELUDE_TASK, [(lines, call, ty, 0)]), include_wasm=False)
+good = hosted(lines, 'task-control-good')
+assert f['verdict'](good) is None, good
+broken = [s.replace('if (actual != ', 'if (actual + "x" != ') for s in lines]
+assert broken != lines
+bad = hosted(broken, 'task-control-broken')
+assert all(v[0] != 'build-failed' for v in bad.values()), bad
+assert all('c0=FUZZ_ORACLE_FAILURE' in v[0] for v in bad.values()), bad
+assert f['verdict'](bad) is not None and f['differing_lines'](bad) == ['c0'], bad
+print('fuzz differential: wrong task expectation detected in all four hosted modes')
 PY
 python3 tools/fuzz-differential --compiler "$compiler" --seeds 1-2 --checks 16
+python3 tools/fuzz-differential --compiler "$compiler" --hosted-tasks --seeds 1-2 --checks 8
+python3 tools/fuzz-differential --compiler "$compiler" --check-hostless-capabilities
 # The cases the fuzzer found stay as programs: every mode must print the same, and
 # a compile-time answer that differs from the run-time one prints MISMATCH.
 for program in tests/cases/fuzz-differential/*.ab; do

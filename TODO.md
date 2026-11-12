@@ -285,6 +285,13 @@
   Focused seeds 4421 to 4440 (8 checks each), 4461 to 4462 (24 each), and default seeds 4441 to 4460
   (24 each) agreed in all six modes on compiler fbd02092; the tool suite passed.
 
+  A separate `--hosted-tasks` campaign draws fixed-order task awaits, resource cleanup and independent
+  threads with Python-generated expectations. Native fast/release and CT interp/JIT are compared; task
+  and thread fixtures independently assert hostless Wasm release/dev capability rejection, reported as
+  unsupported rather than agreement. Hosted seeds 4521 to 4540 (8 checks each), the wrong-oracle control
+  and the tool suite passed on compiler 0f39df87. Default seeds 4601 to 4640 (24 checks each) agreed in
+  all six modes on the same compiler.
+
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
 - [ ] **Abla-native Xtensa companion installer.** The explicit optional installer uses only the Python
