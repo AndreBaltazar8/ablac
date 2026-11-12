@@ -348,7 +348,10 @@ arrays, maps, objects and closures preserve shared references and cycles,
 including references shared between ordinary and compile-time globals.
 Mutating an array through one global is therefore visible through another
 global that names the same array. A value that cannot be kept, such as a
-generator or task, is evaluated afresh on its next use.
+generator or task, is evaluated afresh on its next use. If a mutation makes an
+already-kept shared graph unpersistable, compilation stops before changing the
+journal and names the global and unsupported value kind. This prevents another
+alias from seeing an older copy of the shared value.
 
 The `jit` and `auto` tiers still have a known limitation when ordinary
 mutable globals are shared between compile-time sites. Use the default

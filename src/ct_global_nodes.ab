@@ -47,7 +47,9 @@ class BootstrapGlobalNodeWriter(
     val newValues: array<BootstrapEvalValue> = [],
     val ids: array<int> = [],
     val records: array<string> = [],
-    var problem: string = ""
+    var problem: string = "",
+    var unsupportedKind: string = "",
+    var forbiddenKeptKind: string = ""
 )
 class BootstrapGlobalRootSlot(val path: Path, val reference: string, val valid: bool)
 fun bootstrapGlobalNodeDirectory(): Path = Path("${bootstrapCompileGlobalRoot()}/nodes")
@@ -115,12 +117,14 @@ fun bootstrapGlobalNodeScalar(var writer: BootstrapGlobalNodeWriter,
     if (kind == "function") return "F${bootstrapLiftToken(value.text)}"
     if (bootstrapIsWideIntType(kind)) return "${bootstrapLiftWideTag(kind)}${bootstrapLiftToken(value.text)}"
     writer.problem = bootstrapLiftKindProblem(kind, "unknown")
+    writer.unsupportedKind = kind
     "!"
 }
 // The flat record avoids constructing temporary evaluator arrays just to
 // serialize another evaluator value. Scalars are inline; r<ID>; is an edge.
 fun bootstrapGlobalNodeReference(var writer: BootstrapGlobalNodeWriter,
     value: BootstrapEvalValue): string {
+    if (writer.problem != "") return "!"
     if (!bootstrapGlobalNodeComposite(value.kind)) return bootstrapGlobalNodeScalar(writer, value)
     val previous = writer.memo.identities.get(value)
     val id = if (previous != null) previous else bootstrapGlobalNodeAllocate(writer, value)
@@ -137,15 +141,27 @@ fun bootstrapGlobalNodeReference(var writer: BootstrapGlobalNodeWriter,
     for (child in value.elements) parts.append(bootstrapGlobalNodeReference(writer, child))
     var source = ""
     var tree = ""
-    if (value.kind == "closure") {
-        if (value.integer < 0 || value.integer >= writer.syntax.size) writer.problem =
-            "a closure lost its lambda"
+    if (value.kind == "closure" && writer.problem == "") {
+        if (value.integer < 0 || value.integer >= writer.syntax.size) {
+            writer.problem = "a closure lost its lambda"
+            writer.unsupportedKind = "closure"
+        }
         else {
             val lambda = writer.syntax[value.integer]
             val encoder = BootstrapLiftEncoder(writer.declarations, writer.syntax, [], [], "")
             source = bootstrapLiftEncodedLambdaSource(encoder, lambda)
             tree = bootstrapLiftEncode(bootstrapGlobalSyntaxValue(lambda), [], []).bytes
         }
+    }
+    if (writer.problem != "") {
+        // An unsupported new root can be re-evaluated. A mutated node that
+        // already has persisted aliases cannot silently retain its old bytes.
+        if (previous != null) {
+            val cached = writer.memo.nodeBytes.get(id)
+            val kept = if (cached != null) cached else bootstrapGlobalNodeFile(id).readText()
+            if (kept != "") writer.forbiddenKeptKind = writer.unsupportedKind
+        }
+        return reference
     }
     parts.append(bootstrapLiftToken(source)); parts.append(bootstrapLiftToken(tree))
     writer.ids.append(id); writer.records.append(textJoin(parts))
@@ -267,6 +283,7 @@ fun bootstrapGlobalNodeKeep(keys: array<string>, values: array<BootstrapEvalValu
         memo.nodeBytes.clear()
         memo.collectionEpoch = bootstrapGlobalNodeCollectionEpoch
     }
+    val callNextStart = bootstrapGlobalNodeNext
     val writer = BootstrapGlobalNodeWriter(memo, syntax, declarations)
     val roots: array<string> = []
     for (index in 0 until keys.size) {
@@ -283,7 +300,16 @@ fun bootstrapGlobalNodeKeep(keys: array<string>, values: array<BootstrapEvalValu
             while (undo > newMark) { undo -= 1; memo.identities.remove(writer.newValues[undo]) }
             writer.newValues.truncate(newMark)
             writer.ids.truncate(recordsMark); writer.records.truncate(recordsMark)
-            bootstrapGlobalNodeNext = idMark; writer.problem = ""; reference = "!"
+            bootstrapGlobalNodeNext = idMark
+            if (writer.forbiddenKeptKind != "") {
+                // No records have been published, including earlier roots of
+                // this call. The failed context cannot reuse its staged IDs.
+                bootstrapGlobalNodeNext = callNextStart
+                memo.problem =
+                    "kept global `${keys[index]}` gained unsupported value kind `${writer.forbiddenKeptKind}`; its shared graph cannot be kept safely"
+                return false
+            }
+            writer.problem = ""; writer.unsupportedKind = ""; reference = "!"
         }
         roots.append(reference)
     }

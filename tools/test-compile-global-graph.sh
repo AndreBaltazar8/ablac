@@ -32,6 +32,13 @@ for mode in interp; do
     actual=$("$out/round-retry-$mode")
     [[ $actual == '11,12' ]] || { printf 'graph retry mismatch (%s): %s\n' "$mode" "$actual" >&2; exit 1; }
 done
+if ABLA_COMPILE_EVAL=interp ABLA_EVAL_STEP_LIMIT=200 "$compiler" build \
+    tests/cases/compile-global-graph/stopped-mutation.ab -o "$out/stopped" --fast --no-cache \
+    >"$out/stopped.log" 2>&1; then
+    echo 'expected the mutation evaluation to stop' >&2; exit 1
+fi
+grep -Fq 'E_EVAL_STEP_LIMIT' "$out/stopped.log"
+[[ $(grep -c '^error\[' "$out/stopped.log") == 1 ]] || { cat "$out/stopped.log" >&2; exit 1; }
 "$compiler" build tests/cases/compile-global-graph/codec.ab \
     -o "$out/codec" --fast --no-cache >"$out/codec.log" 2>&1
 "$out/codec"
