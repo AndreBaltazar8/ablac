@@ -91,6 +91,16 @@ or an `extern:"c"` function that the libc-free link cannot resolve. There is no
 option for it: the program decides. `ablac build --verbose` prints a note
 naming why a build linked libc. macOS executables link libSystem, and libraries
 and objects are unchanged.
+
+The heap of such an executable is Abla code over the `mmap`, `munmap`, `mremap` and `madvise` system
+calls (`__ablaRuntimeHostHeap*` in `abla/runtime/platform/host.ab`); `runtimeMemoryRelease()` gives
+its free memory back to the system. Its lock is taken only once a second thread exists (an Abla
+thread or the background-free helper). A process that forks while another thread may be inside the
+allocator must not allocate in the child before `exec` or `_exit`: the standard library's process
+functions and the compiler's own capture already obey this (their children are made with the fork
+system call and prepared before it), and a program that calls `fork` through its own `extern:"c"`
+declaration while other threads exist has to do the same, as POSIX asks of any multithreaded process.
+
 Programmable external targets can additionally request a generic `module`
 artifact. The current WebAssembly linker produces a no-entry module, preserves
 explicit foreign exports, retains unresolved symbols from explicit foreign
