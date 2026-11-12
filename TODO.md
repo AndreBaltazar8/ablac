@@ -136,9 +136,10 @@ default: an x86-64 Linux executable links libc only when the program brings a C 
 there is no option, and `ablac build --verbose` says why one linked libc. Still open: getenv
 and getpid (3), the allocator on mmap (5), the stdlib's own fork, signal and fcntl,
 _setjmp/_longjmp; until they land, programs fall back to the hosted link by themselves
-(tools/libc-imports-static-pending.txt lists the guard's). Findings: the runtime copies
-overlapping ranges with memcpy (all copies are llvm.memcpy; glibc's x86-64 memcpy is memmove,
-and ours is too); a raw clone thread can't run C library code, so clone threads only in
+(tools/libc-imports-static-pending.txt lists the guard's). Findings: our memcpy is memmove, as
+glibc's x86-64 memcpy is, though no Abla runtime copy overlaps (#809: the stage builds and the
+suite ran with a memcpy that trapped on overlap; only the test that overlaps on purpose
+trapped); a raw clone thread can't run C library code, so clone threads only in
 libc-free images. The compiler links libLLVM and OpenSSL until step C, which is André's.
 
 Step 5, the heap (ablac-87, branch heap-806-step5): the runtime heap's malloc, calloc, realloc and
