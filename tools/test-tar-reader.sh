@@ -12,47 +12,16 @@ printf 'nested\n' > "$out/tree/root/sub/nested.txt"
 "$compiler" build tests/cases/tar-reader/probe.ab -o "$out/probe" --fast --no-cache
 "$compiler" build tests/cases/tar-reader/companion.ab -o "$out/companion" --fast --no-cache
 tar --format=ustar -cf "$out/gnu-ustar.tar" -C "$out/tree" root
-python3 - "$out" <<'PY'
-import io, os, sys, tarfile
-p=sys.argv[1]
-# The publisher's build.py uses tarfile.open(fileobj=zipped, mode="w").
-from pathlib import Path
-root=Path(p+'/tree/root')
-with tarfile.open(p+'/publisher.tar', 'w') as t:
-    for path in [root, *sorted(root.rglob('*'))]:
-        entry=t.gettarinfo(str(path),arcname=str(path.relative_to(root.parent)))
-        entry.uid=entry.gid=entry.mtime=0
-        entry.uname=entry.gname=''
-        entry.mode=0o755 if path.is_dir() or os.access(path,os.X_OK) else 0o644
-        if path.is_file():
-            with path.open('rb') as stream: t.addfile(entry,stream)
-        else: t.addfile(entry)
-
-def make(name, path='root/file.txt', kind=tarfile.REGTYPE, fmt=tarfile.USTAR_FORMAT, data=b'payload\n'):
-    with tarfile.open(p+'/'+name+'.tar','w',format=fmt) as t:
-        info=tarfile.TarInfo(path); info.type=kind
-        if kind==tarfile.SYMTYPE: info.linkname='file.txt'; info.size=0
-        else: info.size=len(data)
-        t.addfile(info,io.BytesIO(data) if info.size else None)
-make('raw','./root//file.txt')
-make('rawprefix','p'*90+'/'+'n'*20)
-make('pax','root/'+'x'*130,fmt=tarfile.PAX_FORMAT)
-make('gnu-long','root/'+'x'*130,fmt=tarfile.GNU_FORMAT)
-make('symlink','root/link',kind=tarfile.SYMTYPE)
-make('absolute','/etc/passwd')
-make('traversal','root/../escape')
-with tarfile.open(p+'/duplicate.tar','w',format=tarfile.USTAR_FORMAT) as t:
-    for _ in range(2):
-        info=tarfile.TarInfo('same'); info.size=1; t.addfile(info,io.BytesIO(b'x'))
-for name, paths in [('ancestor-first', ['a', 'a/b']), ('ancestor-last', ['a/b', 'a'])]:
-    with tarfile.open(p+'/'+name+'.tar','w',format=tarfile.USTAR_FORMAT) as t:
-        for path in paths:
-            info=tarfile.TarInfo(path); info.size=1; t.addfile(info,io.BytesIO(b'x'))
-good=open(p+'/gnu-ustar.tar','rb').read()
-open(p+'/bad-checksum.tar','wb').write(bytes([good[0]^1])+good[1:])
-open(p+'/bad-trailing.tar','wb').write(good+b'X'+bytes(511))
-open(p+'/bad-truncated.tar','wb').write(good[:100])
-PY
+tools/verify-fixture-manifest.sh tests/cases/tar-reader/fixtures
+cp tests/cases/tar-reader/fixtures/*.tar "$out/"
+# Archives damaged from the system tar's output: first byte flipped (header checksum),
+# one stray block after the end marker, and a cut inside the first header.
+cp "$out/gnu-ustar.tar" "$out/bad-checksum.tar"
+first=$(od -An -tu1 -N1 "$out/gnu-ustar.tar" | tr -d ' ')
+printf "\\$(printf '%03o' $((first ^ 1)))" | dd of="$out/bad-checksum.tar" bs=1 seek=0 conv=notrunc 2> /dev/null
+cmp -s "$out/gnu-ustar.tar" "$out/bad-checksum.tar" && { echo 'tar-reader: bad-checksum.tar was not damaged' >&2; exit 1; }
+{ cat "$out/gnu-ustar.tar"; printf X; head -c 511 /dev/zero; } > "$out/bad-trailing.tar"
+head -c 100 "$out/gnu-ustar.tar" > "$out/bad-truncated.tar"
 "$out/probe" "$out/gnu-ustar.tar" '' verify
 "$out/probe" "$out/publisher.tar" '' verify
 "$out/probe" "$out/raw.tar" '' raw
