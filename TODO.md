@@ -256,6 +256,8 @@
   draws the Generator shapes by default again (ablac-f3-2 saw the same class as the `test-labeled-loops` segfault of
   #736's first gate).
 
+- **When match resource values (#798).** A fresh affine match value is now dropped after its comparison; previously
+  it leaked. A borrowed match value remains owned by its existing owner, including in a mixed conditional match.
 - **When condition temporary order (#798).** Each match condition now drops its temporary owners after comparison,
   before the next condition or selected branch. Destructor effects can occur earlier in both native and compile-time
   execution; multiple temporary-bearing conditions also compile correctly.
