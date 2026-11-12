@@ -410,6 +410,73 @@ fun bootstrapLlvmEmitLinuxMemoryRoutines(backend: BootstrapLlvmBackend): void {
     return
 }
 
+// _setjmp and _longjmp, defined the same way (hidden module assembly of an
+// x86-64 Linux executable), in glibc's own jmp_buf format so that a buffer set
+// by one and left by the other still works: the compiler's native code is built
+// with these, but the code ORC JITs in its process resolves the C library's.
+// __jmp_buf is rbx, rbp, r12, r13, r14, r15, rsp, pc (words 0 to 7), with rbp,
+// rsp and pc mangled by the pointer guard (`xor %fs:0x30` then rotate left 17,
+// undone the other way round) and the mask-saved flag at offset 64 left 0: no
+// signal mask is saved or restored. rsp is the caller's stack pointer after the
+// return, pc the return address; _longjmp returns its value, or 1 for 0.
+fun bootstrapLlvmLinuxJumpRoutinesAssembly(): string {
+    ".text\n.p2align 4\n" +
+    bootstrapLlvmAssemblyHiddenFunction("_setjmp") +
+    "_setjmp:\n" +
+    "    movq %rbx, (%rdi)\n" +
+    "    movq %rbp, %rax\n" +
+    "    xorq %fs:0x30, %rax\n" +
+    "    rolq \$0x11, %rax\n" +
+    "    movq %rax, 8(%rdi)\n" +
+    "    movq %r12, 16(%rdi)\n" +
+    "    movq %r13, 24(%rdi)\n" +
+    "    movq %r14, 32(%rdi)\n" +
+    "    movq %r15, 40(%rdi)\n" +
+    "    leaq 8(%rsp), %rdx\n" +
+    "    xorq %fs:0x30, %rdx\n" +
+    "    rolq \$0x11, %rdx\n" +
+    "    movq %rdx, 48(%rdi)\n" +
+    "    movq (%rsp), %rax\n" +
+    "    xorq %fs:0x30, %rax\n" +
+    "    rolq \$0x11, %rax\n" +
+    "    movq %rax, 56(%rdi)\n" +
+    "    movl \$0, 64(%rdi)\n" +
+    "    xorl %eax, %eax\n" +
+    "    ret\n" +
+    ".size _setjmp, .-_setjmp\n" +
+    ".p2align 4\n" +
+    bootstrapLlvmAssemblyHiddenFunction("_longjmp") +
+    "_longjmp:\n" +
+    "    movq (%rdi), %rbx\n" +
+    "    movq 8(%rdi), %rbp\n" +
+    "    rorq \$0x11, %rbp\n" +
+    "    xorq %fs:0x30, %rbp\n" +
+    "    movq 16(%rdi), %r12\n" +
+    "    movq 24(%rdi), %r13\n" +
+    "    movq 32(%rdi), %r14\n" +
+    "    movq 40(%rdi), %r15\n" +
+    "    movq 48(%rdi), %rdx\n" +
+    "    rorq \$0x11, %rdx\n" +
+    "    xorq %fs:0x30, %rdx\n" +
+    "    movq 56(%rdi), %rcx\n" +
+    "    rorq \$0x11, %rcx\n" +
+    "    xorq %fs:0x30, %rcx\n" +
+    "    movl %esi, %eax\n" +
+    "    testl %eax, %eax\n" +
+    "    jne .Labla_jump_go\n" +
+    "    incl %eax\n" +
+    ".Labla_jump_go:\n" +
+    "    movq %rdx, %rsp\n" +
+    "    jmp *%rcx\n" +
+    ".size _longjmp, .-_longjmp\n"
+}
+
+fun bootstrapLlvmEmitLinuxJumpRoutines(backend: BootstrapLlvmBackend): void {
+    val assembly = bootstrapLlvmLinuxJumpRoutinesAssembly()
+    LLVMAppendModuleInlineAsm(backend.module, assembly, assembly.size)
+    return
+}
+
 fun BootstrapLlvmBackend.nativeSizeType(): i64* =
     if (bootstrapLlvmTargetUses32BitPointers(this.targetTriple)) {
     this.i32Type
