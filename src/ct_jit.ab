@@ -9,7 +9,7 @@
 // generation; ct_eval.ab calls the entries where the interpreter would have run.
 //
 // A site the tier cannot take yet (a result the value codec cannot carry, a compiler
-// API or capability provider call, a cross-target build) runs in the interpreter;
+// API or provider signature, a cross-target site not proven portable) runs in the interpreter;
 // ABLA_COMPILE_EVAL_TRACE=1 says why.
 
 import "backend/llvm/coverage.ab"
@@ -23,6 +23,7 @@ import "ir.ab"
 import "ct_bridge.ab"
 import "ct_native_effects.ab"
 import "ct_lift.ab"
+import "ct_portable_extern.ab"
 import "eval.ab"
 import "abla/sys/linux/process"
 import "abla/sys/linux/fs"
@@ -159,6 +160,201 @@ fun bootstrapCtAnalyze(
     analyzed
 }
 
+// Cross-target slices execute with host layout. Only this conservative portable
+// subset may cross that boundary; adding a construct requires evaluator parity.
+fun bootstrapCtCrossNodeAllowed(node: BootstrapExpression): bool {
+    val kind = node.kind
+    kind == "missing" || kind == "type" || kind == "integer" || kind == "string" || kind ==
+        "char" || kind == "true" ||
+        kind == "false" || kind == "null" || kind == "identifier" || kind == "call" ||
+        kind == "member.call" || kind == "member" || kind == "index" || kind == "array" ||
+        kind == "block" || kind == "local.val" || kind == "local.var" || kind == "assign" ||
+        kind == "member.assign" || kind == "index.assign" || kind == "return" ||
+        kind == "break" || kind == "continue" || kind == "if" || kind == "when" ||
+        kind == "while" || kind == "do.while" || kind == "for" ||
+        kind == "range.closed" || kind == "range.until" || kind == "string.template" ||
+        kind == "compile" || kind == "unary-" || kind == "unary+" || kind == "unary!" ||
+        kind == "unary~" || kind == "+" || kind == "-" || kind == "*" || kind == "/" ||
+        kind == "%" || kind == "&" || kind == "|" || kind == "^" || kind == "<<" ||
+        kind == ">>" || kind == ">>>" || kind == "==" || kind == "!=" || kind == "<" ||
+        kind == "<=" || kind == ">" || kind == ">=" || kind == "&&" || kind == "||"
+}
+
+fun bootstrapCtCrossBuiltin(node: BootstrapExpression): bool {
+    val name = node.text
+    if (node.kind == "call") {
+        return name == "filledArray" || name == "int" || name == "bool" ||
+            name == "i8" || name == "u8" ||
+            name == "i16" || name == "u16" || name == "i32" || name == "u32" ||
+            name == "i64" || name == "u64"
+    }
+    node.kind == "member.call" && (name == "append" || name == "slice" ||
+        name == "truncate" || name == "clear" || name == "removeAt" ||
+        name == "removeLast" || name == "takeAt")
+}
+
+// ablaAtCompileTime is true in the evaluator and in its native bridge shim.
+// Ignore only code neither tier executes; the ordinary reach walk still keeps
+// full bodies for slice analysis and lowering. No target probe is folded here.
+fun bootstrapCtCrossPhaseIf(node: BootstrapExpression): bool =
+    node.kind == "if" && node.children.size == 3 &&
+    node.children[0].kind == "call" && node.children[0].text == "ablaAtCompileTime" &&
+    node.children[0].children.size == 0
+
+fun bootstrapCtCrossReturns(node: BootstrapExpression): bool =
+    node.kind == "return" ||
+    (node.kind == "block" && node.children.size > 0 &&
+     bootstrapCtCrossReturns(node.children[node.children.size - 1]))
+
+fun bootstrapCtCrossChildren(node: BootstrapExpression): array<BootstrapExpression> {
+    if (bootstrapCtCrossPhaseIf(node)) return [node.children[0], node.children[1]]
+    val children: array<BootstrapExpression> = []
+    for (child in node.children) {
+        children.append(child)
+        if (node.kind == "block" && (bootstrapCtCrossReturns(child) ||
+            (bootstrapCtCrossPhaseIf(child) && bootstrapCtCrossReturns(child.children[1])))) {
+            return children
+        }
+    }
+    children
+}
+
+// Two compiler-owned formatter tables are portable literal data. Only
+// initializer validation may use this exception; a user's read still faces the
+// ordinary type/annotation checks. No callable initializer may inherit it.
+fun bootstrapCtCrossLiteralTable(declaration: BootstrapDeclaration): bool {
+    val source = "${bootstrapCompileProviderStandardLibrary()}/abla/float/text/entry.ab"
+    val floats = declaration.name == "F64_PARSE_TENS" ||
+        declaration.name.endsWith("__F64_PARSE_TENS")
+    val integers = declaration.name == "F64_PARSE_FIVES" ||
+        declaration.name.endsWith("__F64_PARSE_FIVES")
+    if (declaration.sourceIdentity != source || declaration.kind != "val" ||
+        (!floats && !integers) || declaration.expression.kind != "array") return false
+    for (element in declaration.expression.children) {
+        if (element.kind != (if (floats) "float" else "integer")) return false
+    }
+    declaration.expression.children.size > 0
+}
+
+fun bootstrapCtCrossDeclarationReason(declaration: BootstrapDeclaration,
+    owner: BootstrapDeclaration): string {
+    val name = bootstrapCanonicalDeclarationSourceName(declaration.name)
+    var source = declaration.sourceIdentity
+    if (source == "") source = owner.sourceIdentity
+    val root = bootstrapCompileProviderStandardLibrary()
+    val library = source.startsWith("$root/")
+    val module = if (library) source.slice(root.size + 1, source.size) else ""
+    // Only known capability providers are a portable boundary: their existing
+    // shim performs the evaluator's host operation. Compiler/parser queries may
+    // inspect target-specific declarations, so keep them interpreted for now.
+    val bridged = bootstrapCompileDeclarationProviderEffect(declaration) > 0
+    var reason = ""
+    if (bridged) return ""
+    if (declaration.kind == "extern") {
+        val portable = declaration.externalLibrary == "intrinsic" &&
+            (((module == "abla/bytes/entry.ab" || module == "abla/crypto/entry.ab") &&
+              (name == "ablaByteEncode" || name == "ablaByteChunksJoin" ||
+               name == "ablaBase64Encode" || name == "ablaBase64Decode")) ||
+             (module == "abla/text/entry.ab" && name == "ablaTextFindSequence"))
+        if (!portable) reason = "extern is not in the portable intrinsic allow-list"
+    } else if (declaration.kind != "fun" && declaration.kind != "compile.fun" &&
+        declaration.kind != "val" && declaration.kind != "var" &&
+        declaration.kind != "compile.val" && declaration.kind != "compile.var" &&
+        declaration.kind != "class") reason =
+        "declaration kind ${declaration.kind} is not proven portable"
+    if (reason == "" && library && module != "abla/bytes/entry.ab" &&
+        module != "abla/crypto/entry.ab" && module != "abla/text/entry.ab" &&
+        module != "abla/sys/linux/fs/entry.ab" &&
+        !(module == "abla/float/text/entry.ab" && bootstrapDeclarationIsValue(declaration.kind))) {
+        reason = "module $module is not in the portable library allow-list"
+    }
+    if (reason == "" && declaration.isResource) reason = "resource lifetime is not proven portable"
+    for (annotation in declaration.annotations) {
+        if (reason == "" && annotation != "inline" && annotation != "noinline" &&
+            annotation != "operator") reason = "annotation $annotation is not proven portable"
+    }
+    val types: array<string> = [declaration.resultType, declaration.extensionOwner]
+    for (type in declaration.parameterTypes) types.append(type)
+    for (type in types) {
+        if (reason == "" && bootstrapTextContains(type, "*")) {
+            reason = "pointer layout is not portable"
+        }
+        if (reason == "" &&
+            (bootstrapTextContains(type, "f32") || bootstrapTextContains(type, "f64"))) {
+            reason = "floating-point behavior is not proven bit-identical"
+        }
+    }
+    if (reason == "") "" else "cross-target site reaches $name: $reason"
+}
+
+// Match the public standard-library prototypes for these two compiler-owned
+// raw primitives. Their native effects remain enforced; `trusted` on the
+// hosted platform's private prototype must not invalidate ordinary syscall wrappers.
+fun bootstrapCtHostPrimitive(declaration: BootstrapDeclaration): BootstrapDeclaration {
+    if (declaration.kind != "extern" || declaration.externalLibrary != "intrinsic" ||
+        (declaration.name != "ablaLinuxSyscall" && declaration.name != "ablaSimdTargetArch")) {
+        return declaration
+    }
+    BootstrapDeclaration(
+        declaration.kind, declaration.name, declaration.begin, declaration.end,
+        declaration.expression, declaration.parameters, declaration.parameterTypes,
+        declaration.resultType, declaration.methods, declaration.parameterDefaults,
+        declaration.externalLibrary, declaration.parameterKinds, declaration.extensionOwner,
+        false, declaration.isResource, declaration.isNoEscape, declaration.generatedNamespace,
+        declaration.generatedOriginBegin, declaration.generatedOriginEnd, declaration.annotations,
+        declaration.annotationArguments, declaration.annotationBegins, declaration.annotationEnds,
+        declaration.sourceIdentity, declaration.conformances, declaration.isSealed,
+        declaration.isPrivate, declaration.typeParameters
+    )
+}
+
+// Cross-target source carries its target allocator/platform. A CT generation
+// needs the same hosted platform as a normal host JIT generation instead.
+// This parses compiler-owned support only, never reloads the user's modules.
+fun bootstrapCtHostPlatform(var declarations: array<BootstrapDeclaration>): string {
+    val root = bootstrapCompileProviderStandardLibrary()
+    val wasm = "$root/abla/runtime/platform/wasm.ab"
+    var replace = false
+    for (declaration in declarations) {
+        if (declaration.sourceIdentity == wasm) replace = true
+    }
+    if (!replace) return "cross-target Wasm platform runtime is unavailable"
+    val kept: array<BootstrapDeclaration> = []
+    for (declaration in declarations) {
+        if (declaration.sourceIdentity != wasm) kept.append(declaration)
+    }
+    val files = ["abla/runtime/platform/host.ab", "abla/unsafe/native/function-address/entry.ab",
+        "abla/unsafe/memory/raw/entry.ab"]
+    for (file in files) {
+        val path = "$root/$file"
+        if (!Path(path).exists()) return "cross-target host runtime file unavailable: $file"
+        val parsed = bootstrapParseWithIdentity(Path(path).readText(), path)
+        if (parsed.errors > 0 || parsed.declarations.size == 0) {
+            return "cross-target host runtime empty or invalid: $file"
+        }
+        for (original in parsed.declarations) {
+            if (file == "abla/unsafe/memory/raw/entry.ab" &&
+                original.name != "nativeThreadLocalBytes" && original.name !=
+                "nativeStaticAllocate") continue
+            val declaration = if (file == "abla/runtime/platform/host.ab")
+                bootstrapCtHostPrimitive(original) else original
+            var duplicate = false
+            for (existing in kept) {
+                if (existing.name == declaration.name &&
+                    existing.extensionOwner == declaration.extensionOwner) {
+                    val same = bootstrapCtSameExtern(existing, declaration)
+                    if (!same) return "cross-target host runtime declaration collision: ${declaration.name}"
+                    duplicate = true
+                }
+            }
+            if (!duplicate) kept.append(declaration)
+        }
+    }
+    declarations.clear()
+    for (declaration in kept) declarations.append(declaration)
+    ""
+}
+
 // --- reachability: what a site's code can reach, by name ---------------------
 
 class BootstrapCtReach(
@@ -224,8 +420,9 @@ class BootstrapCtReach(
     // The first construct `expression` reaches that the tier cannot run yet, or "".
     fun unsupported(
         expression: BootstrapExpression,
-        var globals: array<int>
-    ): string = this.walk(expression, globals, false, false)
+        var globals: array<int>,
+        crossTarget: bool = false
+    ): string = this.walk(expression, globals, false, false, crossTarget)
 
     // What the runtime's own declarations reach is part of every slice.
     fun keepFrom(expression: BootstrapExpression): void {
@@ -241,7 +438,8 @@ class BootstrapCtReach(
         expression: BootstrapExpression,
         var globals: array<int>,
         keepOnly: bool,
-        fromLibrary: bool
+        fromLibrary: bool,
+        crossTarget: bool = false
     ): string {
         val pending: array<BootstrapExpression> = [expression]
         val pendingLibrary: array<bool> = [fromLibrary]
@@ -251,7 +449,14 @@ class BootstrapCtReach(
             val library = pendingLibrary[pendingLibrary.size - 1]
             pending.truncate(pending.size - 1)
             pendingLibrary.truncate(pendingLibrary.size - 1)
-            for (child in node.children) {
+            if (crossTarget && !bootstrapCtCrossNodeAllowed(node)) {
+                return "cross-target site reaches expression ${node.kind} `${node.text}`: not proven portable"
+            }
+            if (crossTarget && node.kind == "type" && bootstrapTextContains(node.text, "*")) {
+                return "cross-target site reaches type ${node.text}: pointer layout is not portable"
+            }
+            val children = if (crossTarget) bootstrapCtCrossChildren(node) else node.children
+            for (child in children) {
                 pending.append(child)
                 pendingLibrary.append(library)
             }
@@ -259,6 +464,11 @@ class BootstrapCtReach(
                 node.kind == "float" || node.kind == "float32" || node.kind == "char"
             if (!literal && node.text != "") {
                 var item = this.table.find(node.text, -1)
+                if (crossTarget && item < 0 &&
+                    (node.kind == "call" || node.kind == "member.call") &&
+                    !bootstrapCtCrossBuiltin(node)) {
+                    return "cross-target site reaches callable `${node.text}`: not proven portable"
+                }
                 // A call names a value (a global holding a function) when no function
                 // or other declaration has that name.
                 var callsValue = node.kind == "call"
@@ -276,15 +486,25 @@ class BootstrapCtReach(
                     val valueItem = this.itemMethods[item] < 0 &&
                         bootstrapDeclarationIsValue(owner.kind)
                     val ownerLibrary = bootstrapCtLibraryDeclaration(owner)
-                    val names = !valueItem ||
+                    // Only callable/member syntax can denote a method; local
+                    // binding/assignment names and bare values cannot. Implicit
+                    // receiver members were rewritten before this pass.
+                    val bareMethod = crossTarget &&
+                        (this.itemMethods[item] >= 0 || owner.extensionOwner != "") &&
+                        node.kind != "call" && node.kind != "member.call" && node.kind != "member"
+                    val names = !bareMethod && (!valueItem ||
                         ((node.kind == "identifier" || node.kind == "assign" || callsValue) &&
-                         (!library || ownerLibrary))
+                         (!library || ownerLibrary)))
                     if (names && !this.visited[item]) {
                         this.visited[item] = true
                         this.kept[this.itemDeclarations[item]] = true
                         this.pendTypes(owner, pending, pendingLibrary, ownerLibrary)
                         val declaration = if (this.itemMethods[item] < 0) owner
                             else owner.methods[this.itemMethods[item]]
+                        if (crossTarget) {
+                            reason = bootstrapCtCrossDeclarationReason(declaration, owner)
+                            if (reason != "") return reason
+                        }
                         var follow = true
                         if (keepOnly) {
                             follow = declaration.kind != "extern"
@@ -719,7 +939,7 @@ fun bootstrapCtTripleFamily(triple: string): string {
     "$architecture:$system"
 }
 
-// Compile-time code runs on the host: only a host build's program can be its slice.
+// A host build needs no additional portability proof for its native slice.
 fun bootstrapCtTripleIsHost(triple: string): bool =
     bootstrapCtTripleFamily(triple) == bootstrapCtTripleFamily(llvmDefaultTargetTriple())
 
@@ -728,10 +948,26 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string): void
     for (site in bootstrapCtSites) {
         if (site.reason == BOOTSTRAP_CT_UNPREPARED) site.reason = ""
     }
-    if (!bootstrapCtTripleIsHost(targetTriple)) {
-        bootstrapCtFailReady("cross-target build (compile-time code runs on the host)")
+    val crossTarget = !bootstrapCtTripleIsHost(targetTriple)
+    var implicitReason = if (crossTarget && !targetTriple.startsWith("wasm32-"))
+        "cross-target triple $targetTriple is not in the portable JIT target allow-list" else ""
+    if (crossTarget) {
+        val runtimeRoot = "${bootstrapCompileProviderStandardLibrary()}/abla/runtime/"
+        for (declaration in parsed.declarations) {
+            if (implicitReason == "" && bootstrapCtRuntimeDeclaration(declaration) &&
+                !declaration.sourceIdentity.startsWith(runtimeRoot)) {
+                // Extension defaults join every slice, even if the site does not
+                // name them. Until these implicit roots have their own proof, no
+                // cross-target site may activate their initializers or bodies.
+                implicitReason =
+                    "cross-target implicit runtime dependency ${declaration.name}: not proven portable"
+            }
+        }
     }
     val reach = bootstrapCtReach(parsed.declarations)
+    // Separate visitation: proving only portable executed code must not prune the
+    // full declaration bodies the ordinary slice's analysis and lowering require.
+    val portable = if (crossTarget) bootstrapCtReach(parsed.declarations) else reach
     for (declaration in parsed.declarations) {
         if (bootstrapCtRuntimeDeclaration(declaration)) {
             reach.keepFrom(declaration.expression)
@@ -755,8 +991,26 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string): void
             reach.keepFrom(action)
         }
     }
+    if (crossTarget && implicitReason == "") {
+        val runtimeRoot = "${bootstrapCompileProviderStandardLibrary()}/abla/runtime/"
+        var value = 0
+        while (implicitReason == "" && value < parsed.declarations.size) {
+            val declaration = parsed.declarations[value]
+            if (reach.kept[value] && bootstrapDeclarationIsValue(declaration.kind) &&
+                !declaration.sourceIdentity.startsWith(runtimeRoot) &&
+                !bootstrapCtCrossLiteralTable(declaration)) {
+                portable.reset()
+                val ignoredGlobals: array<int> = []
+                implicitReason = portable.unsupported(BootstrapExpression(
+                    "identifier", declaration.name, declaration.begin, declaration.end, []
+                ), ignoredGlobals, true)
+            }
+            value = value + 1
+        }
+    }
     var ready = 0
     for (site in bootstrapCtSites) {
+        if (site.reason == "" && implicitReason != "") site.reason = implicitReason
         site.encodes = !site.action && site.type != "void" && site.type != "null"
         if (site.reason == "" && site.encodes) {
             val typeReason = bootstrapLiftTypeReasonIn(parsed.declarations,
@@ -771,7 +1025,31 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string): void
             val keptBefore: array<bool> = []
             for (kept in reach.kept) keptBefore.append(kept)
             val reached: array<int> = []
-            site.reason = reach.unsupported(site.expression, reached)
+            if (crossTarget) {
+                portable.reset()
+                val ignoredGlobals: array<int> = []
+                site.reason = portable.unsupported(site.expression, ignoredGlobals, true)
+            }
+            if (site.reason == "") site.reason = reach.unsupported(site.expression, reached)
+            if (crossTarget && site.reason == "") {
+                // Whole bodies are kept even where the phase proof skips an arm.
+                // A global reached only from that arm would nevertheless initialize
+                // when the native slice starts: prove every newly kept initializer too.
+                var global = 0
+                while (site.reason == "" && global < parsed.declarations.size) {
+                    val declaration = parsed.declarations[global]
+                    if (reach.kept[global] && !keptBefore[global] &&
+                        bootstrapDeclarationIsValue(declaration.kind) &&
+                        !bootstrapCtCrossLiteralTable(declaration)) {
+                        portable.reset()
+                        val ignoredGlobals: array<int> = []
+                        site.reason = portable.unsupported(BootstrapExpression(
+                            "identifier", declaration.name, declaration.begin, declaration.end, []
+                        ), ignoredGlobals, true)
+                    }
+                    global = global + 1
+                }
+            }
             if (site.reason != "") {
                 var restored = 0
                 while (restored < keptBefore.size) {
@@ -869,6 +1147,13 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string): void
         declarationIndex = declarationIndex + 1
     }
     for (helper in helpers) sliceDeclarations.append(helper)
+    if (crossTarget) {
+        val runtimeReason = bootstrapCtHostPlatform(sliceDeclarations)
+        if (runtimeReason != "") {
+            bootstrapCtFailReady(runtimeReason)
+            return
+        }
+    }
     val exports: array<BootstrapExportRequest> = []
     for (declaration in template.declarations) {
         var sourceIdentity = ""
@@ -939,9 +1224,15 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string): void
         parsed.compileInputPaths, parsed.compileInputContents, ""
     )
     val analyzingSlice = bootstrapCtAnalyzingSlice
+    val targetsWasm = bootstrapSemanticTargetsWasm
+    val wasmUnwinds = bootstrapSemanticWasmUnwinds
     bootstrapCtAnalyzingSlice = true
+    bootstrapSemanticTargetsWasm = false
+    bootstrapSemanticWasmUnwinds = false
     val analyzed = bootstrapAnalyzeParsed(slice)
     bootstrapCtAnalyzingSlice = analyzingSlice
+    bootstrapSemanticTargetsWasm = targetsWasm
+    bootstrapSemanticWasmUnwinds = wasmUnwinds
     val analysisDone = linuxMonotonicMilliseconds()
     if (analyzed.errors > 0) {
         bootstrapCtNote("slice analysis failed:\n${analyzed.diagnostics}")

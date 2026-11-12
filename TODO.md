@@ -324,6 +324,13 @@
   on the e89d5e4e compiler and 89e4596d sysroot. The tool suite passed, including interpreter/JIT expected
   refusals; the step-limit and `?? return` error controls each produced one diagnostic at the call site.
 
+- [ ] Extend cross-target compile-time JIT portability only with evaluator parity (#789).
+  The initial Wasm32-only allow-list covers integer/string/array/plain-class computations, SHA and known
+  capability providers. Compiler/parser queries, indirect calls, resources, raw memory,
+  `when is` interface dispatch, floating-point computation, target probes/SIMD/assembly,
+  unrecognised modules/annotations and modules with implicit extension-field roots keep the evaluator.
+  Prove those roots and their eager initializers before widening the rule; never emit the target platform runtime as host code.
+
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
 - [ ] **Abla-native Xtensa companion installer.** The explicit optional installer uses only the Python

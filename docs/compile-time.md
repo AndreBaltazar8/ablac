@@ -828,16 +828,34 @@ evaluator's, and compiler-owned values (syntax, cursors, builders) cross as
 handles.
 
 A site the native tier cannot take yet runs in the evaluator: code that passes
-a function to a compiler API call, code that calls a capability provider written
-in Abla (the `abla/fs` reads and writes, `abla/process/time`,
-`abla/platform/host`), which only the evaluator performs as described
-[above](#capabilities-files-environment-processes-network), staged and
-journaled, a compile global still holding a kept value
+a function to a compiler API call, a capability provider whose types the compiler
+bridge cannot carry, a compile global still holding a kept value
 native code can't take in (an object, a map, a nested array, or any value of a
 `compile val`), a result only the compiler can hold
 (a generator, task, thread, borrow, `Weak` or raw pointer), a cross-target
-build (compile-time code always runs on the host), the REPL, and a
-compilation that compile-time code starts (it runs inside the outer pass).
+site not proven portable, the REPL, and a compilation that compile-time code
+starts inside the active outer pass.
+
+With explicit `jit` or `auto`, a Wasm32 module (including a `wasmBuildModule`
+child) can run portable compile-time sites natively. Other cross-target families
+keep their existing evaluator fallback. The slice
+always uses the host's code generator and layout; a Wasm platform runtime is
+replaced by the compiler-owned hosted platform inside the slice, while user
+modules remain those parsed for the target. Only encoded values cross back
+to the target program. A separate conservative reachability check permits scalar
+integer computations, strings, arrays and plain classes, with audited `abla/bytes`,
+`abla/crypto`, `abla/text` and filesystem declarations, plus known capability
+providers through their existing evaluator bridges. Compiler and parser queries
+remain interpreted for cross-target sites. It rejects unknown constructs and dependencies, raw pointers
+and memory operations, native externs, target/CPU probes, SIMD, assembly, resources
+`when is` interface dispatch, floating-point computation, and unrecognised modules or annotations. Extension-field defaults are implicit
+roots of every native slice, so a module containing them also keeps cross-target
+sites interpreted until those roots have a portability proof. Such sites keep the evaluator's behavior;
+`ABLA_COMPILE_EVAL_TRACE=1` names the first dependency the proof refuses. The
+`ablaAtCompileTime()` branches used by byte buffers are true on both tiers, so
+unexecuted native staging paths do not make their portable SHA operations target
+dependent. This does not change the default tier or permit a genuinely reentrant
+compile pass to replace its outer pass's JIT state.
 
 - A runtime panic in native compile-time code is the evaluator's error for the
   same failure, with the same text (`E_EVAL_OUT_OF_BOUNDS`,
