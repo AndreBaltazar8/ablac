@@ -84,7 +84,7 @@ float-remainder, strings-arrays, files, tasks, threads and tls-http.
 | `malloc` `calloc` `realloc` `free` | all | all | yes | hosted runtime heap, pages and tables (`stdlib/abla/runtime/platform/host.ab:6-9`) |
 | `memcpy` `memset` | all | all (`--fast`: memcpy only) | yes | LLVM's own lowering of `llvm.memcpy`/`llvm.memset` (`src/backend/llvm/core.ab:611`) |
 | `syscall` `__errno_location` | all | all | yes | `ablaLinuxSyscall` lowered to libc `syscall()` plus errno (`src/backend/llvm/functions.ab:7140-7189`); the compact fatal path (`core.ab:428-457`) |
-| `sigaction` `sigaltstack` | all | all | yes | the stack-overflow guard in every hosted executable (`src/backend/llvm/debug.ab:734`, restore at 942-948) |
+| `sigaction` `sigaltstack` | none on x86-64 Linux (rt_sigaction/sigaltstack by system call, naked rt_sigreturn restorer, step 4) | none | yes (ct_eval) | the stack-overflow guard in every hosted executable (`src/backend/llvm/debug.ab:734`, restore at 942-948) |
 | `getenv` | all | all | yes | `ABLA_GC_LOOKUP`/`GROWTH`/`STRESS` (`host.ab:30`, 1015, 1946, 1969) |
 | `fmod` `fmodf` | float-remainder | float-remainder | yes | float `%` as `LLVMBuildFRem` (`functions.ab:1947`); wasm32 uses `__ablaRuntimeFloatRemainder` instead |
 | `pthread_create` `pthread_join` `pthread_mutex_init` | threads | threads (`--fast` tasks: join) | create, join | `host.ab:32-45`, 151, 167 |

@@ -122,6 +122,20 @@ for flags in "" "-g"; do
     [[ $("$out/stack") == "ok 500" ]] || fail "stack$flags without an overflow"
 done
 
+# x86-64 Linux installs the guard with the kernel's rt_sigaction and sigaltstack
+# (no libc): the handler, SA_RESTORER and the rt_sigreturn trampoline, and the
+# alternate stack, are read back from the kernel in every build mode. The
+# overflow above runs the handler on that stack; the SIGSEGV above returns
+# through the restorer before the default action ends the process.
+if [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]]; then
+    for flags in "" "-g" "--fast"; do
+        "$compiler" build "$cases/stack-guard.ab" -o "$out/stack-guard" $flags
+        status=0
+        "$out/stack-guard" || status=$?
+        [[ $status -eq 0 ]] || fail "stack guard kernel interface$flags: check $status"
+    done
+fi
+
 # Under `#`: positioned errors with the same text.
 set +e
 "$compiler" build "$cases/compile-time-panics.ab" -o "$out/compile-time-panics" \

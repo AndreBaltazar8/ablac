@@ -703,6 +703,51 @@ fun bootstrapLlvmStackGuardRuntime(backend: BootstrapLlvmBackend): bool =
 
 fun bootstrapLlvmSignalStackBytes(): int = 65536
 
+// x86-64 Linux (not x32): the stack guard talks to the kernel directly, with
+// sigaltstack and rt_sigaction (#806), so it needs neither libc's sigaction
+// nor its restorer.
+fun bootstrapLlvmStackGuardKernel(backend: BootstrapLlvmBackend): bool =
+    !backend.macOS &&
+    bootstrapTextContains(backend.targetTriple, "x86_64") &&
+    bootstrapTextContains(backend.targetTriple, "linux") &&
+    !bootstrapTextContains(backend.targetTriple, "gnux32")
+
+// The kernel's struct sigaction on x86-64: handler, flags (SA_SIGINFO |
+// SA_ONSTACK | SA_RESTORER), restorer, and an 8-byte signal mask.
+fun bootstrapLlvmStackGuardKernelAction(
+    backend: BootstrapLlvmBackend,
+    handler: i64*,
+    flags: int,
+    restorer: i64*,
+    name: string
+): i64* {
+    val actionType = LLVMArrayType2(backend.i8Type, 32)
+    val action = LLVMBuildAlloca(backend.builder, actionType, name)
+    LLVMBuildStore(backend.builder, LLVMConstNull(actionType), action)
+    LLVMBuildStore(backend.builder, handler, action)
+    LLVMBuildStore(
+        backend.builder, LLVMConstInt(backend.i64Type, flags, 0),
+        bootstrapLlvmByteAt(backend, action, 32, 8)
+    )
+    LLVMBuildStore(
+        backend.builder, restorer, bootstrapLlvmByteAt(backend, action, 32, 16)
+    )
+    action
+}
+
+// rt_sigaction(signal, action, NULL, sizeof the kernel's signal mask).
+fun bootstrapLlvmStackGuardKernelSigaction(
+    backend: BootstrapLlvmBackend,
+    signal: i64*,
+    action: i64*
+): void {
+    val zero = LLVMConstInt(backend.i64Type, 0, 0)
+    bootstrapLlvmLinuxX64Syscall(
+        backend, 13, [signal, action, zero, LLVMConstInt(backend.i64Type, 8, 0)]
+    )
+    return
+}
+
 // The address `offset` bytes into a byte buffer of `bytes` bytes.
 fun bootstrapLlvmByteAt(
     backend: BootstrapLlvmBackend,
@@ -762,11 +807,18 @@ fun bootstrapLlvmInstallStackGuard(backend: BootstrapLlvmBackend): void {
         LLVMConstInt(backend.i64Type, bootstrapLlvmSignalStackBytes(), 0),
         bootstrapLlvmByteAt(backend, stack, 32, if (mac) 8 else 16)
     )
-    bootstrapLlvmStackGuardCall(
-        backend, "sigaltstack", backend.i32Type,
-        [backend.pointerType, backend.pointerType],
-        [stack, LLVMConstNull(backend.pointerType)]
-    )
+    val kernel = bootstrapLlvmStackGuardKernel(backend)
+    if (kernel) {
+        bootstrapLlvmLinuxX64Syscall(
+            backend, 131, [stack, LLVMConstInt(backend.i64Type, 0, 0)]
+        )
+    } else {
+        bootstrapLlvmStackGuardCall(
+            backend, "sigaltstack", backend.i32Type,
+            [backend.pointerType, backend.pointerType],
+            [stack, LLVMConstNull(backend.pointerType)]
+        )
+    }
     // struct sigaction: the handler first; sa_flags at 12 (macOS) or 136
     // (Linux, after a 128-byte mask). SA_SIGINFO | SA_ONSTACK.
     val actionType = LLVMArrayType2(backend.i8Type, 160)
@@ -781,6 +833,23 @@ fun bootstrapLlvmInstallStackGuard(backend: BootstrapLlvmBackend): void {
     if (bootstrapLlvmCompactLinuxRuntime(backend)) {
         bootstrapLlvmAddFunctionAttribute(backend, handler, "optsize")
         bootstrapLlvmAddFunctionAttribute(backend, handler, "minsize")
+    }
+    if (kernel) {
+        // SA_SIGINFO (4) | SA_ONSTACK (0x08000000) | SA_RESTORER (0x04000000):
+        // the handler returns through abla_runtime_sigreturn, rt_sigreturn.
+        val restorer = bootstrapLlvmDeclare(
+            backend, "abla_runtime_sigreturn", backend.voidType, [], false, []
+        )
+        LLVMSetLinkage(restorer, llvmInternalLinkage())
+        val kernelAction = bootstrapLlvmStackGuardKernelAction(
+            backend, handler, 201326596, restorer, "signal.kernel.action"
+        )
+        for (signal in [11, 7]) {
+            bootstrapLlvmStackGuardKernelSigaction(
+                backend, LLVMConstInt(backend.i64Type, signal, 0), kernelAction
+            )
+        }
+        return
     }
     LLVMBuildStore(backend.builder, handler, action)
     LLVMBuildStore(
@@ -805,6 +874,26 @@ fun bootstrapLlvmEmitStackGuardHandler(backend: BootstrapLlvmBackend): void {
         backend.module, "abla_runtime_stack_fault"
     )
     if (pointerIsNull(handler) || LLVMIsDeclaration(handler) == 0) return
+    val restorer = LLVMGetNamedFunction(backend.module, "abla_runtime_sigreturn")
+    if (!pointerIsNull(restorer) && LLVMIsDeclaration(restorer) != 0) {
+        // The signal return trampoline the kernel jumps to when the handler
+        // returns: no frame, just rt_sigreturn (15).
+        LLVMPositionBuilderAtEnd(
+            backend.builder,
+            LLVMAppendBasicBlockInContext(backend.context, restorer, "entry")
+        )
+        bootstrapLlvmAddFunctionAttribute(backend, restorer, "naked")
+        bootstrapLlvmAddFunctionAttribute(backend, restorer, "noinline")
+        bootstrapLlvmAddFunctionAttribute(backend, restorer, "nounwind")
+        val restorerType = bootstrapLlvmFunctionType(backend, backend.voidType, [])
+        val trampoline = "movq $$15, %rax\n\tsyscall"
+        bootstrapLlvmCallTyped(
+            backend, restorerType,
+            LLVMGetInlineAsm(restorerType, trampoline, trampoline.size, "", 0, 1, 0, 0, 0),
+            [], ""
+        )
+        LLVMBuildUnreachable(backend.builder)
+    }
     val mac = backend.macOS
     val i64 = backend.i64Type
     LLVMPositionBuilderAtEnd(
@@ -939,16 +1028,11 @@ fun bootstrapLlvmEmitStackGuardHandler(backend: BootstrapLlvmBackend): void {
         LLVMSetLinkage(fault, llvmInternalLinkage())
         bootstrapLlvmCall(backend, fault, [signal], "", false, [])
     } else if (bootstrapLlvmCompactLinuxRuntime(backend)) {
-        // Keep libc sigaction (its restorer matters when this handler returns),
-        // but reuse that existing import to restore SIG_DFL.
-        val actionType = LLVMArrayType2(backend.i8Type, 160)
-        val action = LLVMBuildAlloca(backend.builder, actionType, "signal.default")
-        LLVMBuildStore(backend.builder, LLVMConstNull(actionType), action)
-        bootstrapLlvmStackGuardCall(
-            backend, "sigaction", backend.i32Type,
-            [backend.i32Type, backend.pointerType, backend.pointerType],
-            [LLVMGetParam(handler, 0), action, LLVMConstNull(backend.pointerType)]
-        )
+        // Restore SIG_DFL: rt_sigaction with an all-zero kernel struct.
+        val defaultType = LLVMArrayType2(backend.i8Type, 32)
+        val action = LLVMBuildAlloca(backend.builder, defaultType, "signal.default")
+        LLVMBuildStore(backend.builder, LLVMConstNull(defaultType), action)
+        bootstrapLlvmStackGuardKernelSigaction(backend, signal, action)
     } else {
         bootstrapLlvmStackGuardCall(
             backend, "signal", backend.pointerType,

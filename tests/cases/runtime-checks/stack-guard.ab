@@ -1,0 +1,50 @@
+// x86-64 Linux: the stack guard's kernel interface, read back with rt_sigaction
+// and sigaltstack (#806: no libc sigaction/sigaltstack). SIGSEGV and SIGBUS must
+// have a handler with SA_SIGINFO | SA_ONSTACK | SA_RESTORER whose restorer is
+// the rt_sigreturn trampoline (mov $15, %rax/%eax; syscall), and the alternate
+// signal stack must be set and enabled. tools/test-runtime-checks.sh also runs
+// the overflow (handler on that stack prints and exits 101) and a non-overflow
+// SIGSEGV (the handler returns through the restorer; the default action kills).
+import "abla/sys/linux"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+trusted fun byteAt(address: int): int = ablaUnsafeLoadU8(nativePointerFromAddress(address))
+
+// The trampoline is `movq $15, %rax` (48 c7 c0 0f 00 00 00) or its shorter
+// `movl $15, %eax` form (b8 0f 00 00 00), then `syscall` (0f 05).
+trusted fun isSigreturn(address: int): bool {
+    if (byteAt(address) == 184 && byteAt(address + 1) == 15 && byteAt(address + 2) == 0 &&
+        byteAt(address + 3) == 0 && byteAt(address + 4) == 0)
+        return byteAt(address + 5) == 15 && byteAt(address + 6) == 5
+    byteAt(address) == 72 && byteAt(address + 1) == 199 && byteAt(address + 2) == 192 &&
+        byteAt(address + 3) == 15 && byteAt(address + 4) == 0 && byteAt(address + 5) == 0 &&
+        byteAt(address + 6) == 0 && byteAt(address + 7) == 15 && byteAt(address + 8) == 5
+}
+
+trusted fun checkSignal(signal: int): int {
+    val old = nativeByteBuffer(32)
+    if (linuxSyscall4(13, signal, 0, nativePointerAddress(old.address), 8) != 0) return 1
+    val handler = old.loadI64(0)
+    val flags = old.loadI64(8)
+    val restorer = old.loadI64(16)
+    if (handler == 0) return 2
+    // SA_SIGINFO 0x4, SA_ONSTACK 0x08000000, SA_RESTORER 0x04000000.
+    if ((flags & 4) != 4 || (flags & 134217728) != 134217728 || (flags & 67108864) != 67108864) return 3
+    if (restorer == 0 || !isSigreturn(restorer)) return 4
+    0
+}
+
+trusted fun check(): int {
+    val segv = checkSignal(11)
+    if (segv != 0) return 10 + segv
+    val bus = checkSignal(7)
+    if (bus != 0) return 20 + bus
+    // stack_t { ss_sp, ss_flags, ss_size }; SS_DISABLE is 2.
+    val stack = nativeByteBuffer(24)
+    if (linuxSyscall2(131, 0, nativePointerAddress(stack.address)) != 0) return 30
+    if (stack.loadI64(0) == 0 || (stack.loadI64(8) & 2) != 0 || stack.loadI64(16) != 65536) return 31
+    0
+}
+
+fun main: int = check()
