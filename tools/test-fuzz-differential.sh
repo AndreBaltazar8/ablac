@@ -66,6 +66,7 @@ PY
 python3 tools/fuzz-differential --compiler "$compiler" --seeds 1-2 --checks 16
 python3 tools/fuzz-differential --compiler "$compiler" --hosted-tasks --seeds 1-2 --checks 8
 python3 tools/fuzz-differential --compiler "$compiler" --check-hostless-capabilities
+python3 tools/fuzz-differential --compiler "$compiler" --module-graphs --seeds 2
 # The cases the fuzzer found stay as programs: every mode must print the same, and
 # a compile-time answer that differs from the run-time one prints MISMATCH.
 for program in tests/cases/fuzz-differential/*.ab; do

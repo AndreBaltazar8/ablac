@@ -19,12 +19,14 @@ tests/cases/fuzz-differential-<seed>-<check>/ (program.ab and expected outputs).
   tools/fuzz-differential --seeds 1-3 --focus resource_drop_check  # every check from one generator
   tools/fuzz-differential --seeds 1-3 --hosted-tasks  # four hosted modes; Wasm unsupported
   tools/fuzz-differential --check-hostless-capabilities  # assert task/thread Wasm rejection
+  tools/fuzz-differential --module-graphs --seeds 1-3  # strict module graphs and cache edits
   tools/fuzz-differential --seed 7 --keep     # one seed, keep its directory
   tools/fuzz-differential --program x.ab      # run one existing program, all ways
 Exit status 0 when every mode agreed.
 """
 import argparse
 import concurrent.futures
+import glob
 import json
 import os
 import re
@@ -1448,14 +1450,27 @@ fun safeSlice(s: string, a: int, b: int): string {
         r = self.r
         seat = r.randint(10, 90)
         limit = r.randint(1, 5)
-        field = r.choice([True, False])
+        shape = r.choice(['field', 'index', 'tempfield', 'tempindex', 'tempmixed'])
         mixed = r.choice([True, False])
         choice = r.choice(["true", "false"])
         inner_stop = r.choice(["true", "false"])
         outer_stop = r.choice([0, 1, 2])
-        owner = (f"    val owner = GenHolder(ticketGen({seat}, {limit}))" if field else
-                 f"    val owner: array<Generator<int>> = [ticketGen({seat}, {limit})]")
-        place = "owner.gen" if field else "owner[0]"
+        if shape == 'field':
+            owner = f"    val owner = GenHolder(ticketGen({seat}, {limit}))"
+            place = 'owner.gen'
+        elif shape == 'index':
+            owner = f"    val owner: array<Generator<int>> = [ticketGen({seat}, {limit})]"
+            place = 'owner[0]'
+        elif shape == 'tempfield':
+            owner = ''
+            place = f'TempGenOwner(ticketGen({seat}, {limit}), {seat + 200}).gen'
+        elif shape == 'tempindex':
+            owner = ''
+            place = f'[TempGenOwner(ticketGen({seat}, {limit}), {seat + 200})][0].gen'
+        else:
+            owner = f'    val owner = TempGenOwner(ticketGen({seat}, {limit}), {seat + 200})'
+            owner_choice = r.choice(['true', 'false'])
+            place = f'(if ({owner_choice}) TempGenOwner(ticketGen({seat + 10}, {limit}), {seat + 210}) else owner).gen'
         source = f"if ({choice}) {place} else ticketGen({seat + 100}, {limit})" if mixed else place
         lines = [f"fun nested{index}(): Generator<int> = generator {{", owner,
                  "    yield 0", f"    for (value in {source}) {{", "        yield value",
@@ -1486,7 +1501,8 @@ fun safeSlice(s: string, a: int, b: int): string {
                      "field", "method", "branch", "maybe", "early", "breaker", "labeled",
                      "elvisloop", "doblock", "paircall", "shortcircuit",
                      "gendrain", "genearly", "genheld", "genlocal",
-                     "genfield", "genglobal", "genborrowearly"]
+                     "genfield", "genglobal", "genborrowearly", "tempgenfield", "tempgenindex",
+                     "tempgencase", "tempborrow"]
             kind = r.choice(kinds)
             if kind == "local":
                 lines.append(f"    val t{n} = issue({seat})")
@@ -1572,6 +1588,23 @@ fun safeSlice(s: string, a: int, b: int): string {
             elif kind == "genborrowearly":
                 lines.append(f"    val g{n} = ticketGen({seat}, {r.randint(1, 5)})")
                 lines.append(f"    total += drainGenEarly(g{n}, {seat + r.randint(0, 4)})")
+            elif kind in ("tempgenfield", "tempgenindex", "tempgencase"):
+                limit = r.randint(1, 5)
+                if kind == "tempgenfield":
+                    source = f'TempGenOwner(ticketGen({seat}, {limit}), {seat + 200}).gen'
+                elif kind == "tempgenindex":
+                    source = f'[TempGenOwner(ticketGen({seat}, {limit}), {seat + 200})][0].gen'
+                else:
+                    lines.append(f'    val owner{n} = TempGenOwner(ticketGen({seat}, {limit}), {seat + 200})')
+                    flag = r.choice(['true', 'false'])
+                    source = f'(if ({flag}) TempGenOwner(ticketGen({seat + 10}, {limit}), {seat + 210}) else owner{n}).gen'
+                lines.append(f'    for (v{n} in {source}) {{')
+                lines.append(f'        total += v{n}')
+                if r.choice([True, False]):
+                    lines.append(f'        if (v{n} >= {seat + r.randint(0, 4)}) break')
+                lines.append('    }')
+            elif kind == "tempborrow":
+                lines.append(f'    total += show(TempTicketOwner(issue({seat}), {seat + 200}).ticket)')
             elif kind == "breaker":
                 lines.append(f"    for (i{n} in 0 until {r.randint(2, 5)}) {{")
                 lines.append(f"        if (i{n} == {r.randint(0, 3)}) break")
@@ -1635,6 +1668,12 @@ fun ticketGen(seat: int, limit: int): Generator<int> = generator {
     for (i in 0 until limit) yield t.seat + i
 }
 class GenHolder(val gen: Generator<int>)
+resource class TempGenOwner(val gen: Generator<int>, val id: int) {
+    fun drop(): void { dropLog.append(this.id); return }
+}
+resource class TempTicketOwner(val ticket: Ticket, val id: int) {
+    fun drop(): void { dropLog.append(this.id); return }
+}
 fun drainGen(values: Generator<int>): int {
     var sum = 0
     for (v in values) sum = sum + v
@@ -1785,15 +1824,24 @@ class Runner:
         except subprocess.TimeoutExpired:
             return 124, "", "timeout"
 
-    def native(self, source, out, fast, ct, stderr=False):
-        env = {"ABLA_COMPILE_EVAL": ct} if ct else None
-        args = [self.compiler, "build", source, "-o", out, "--no-cache"]
+    def native(self, source, out, fast, ct, stderr=False, cache_dir=None, trace=False):
+        env = {"ABLA_COMPILE_EVAL": ct} if ct else {}
+        if cache_dir is not None:
+            env['ABLA_CACHE_DIR'] = os.path.abspath(cache_dir)
+        if trace:
+            env['ABLA_COMPILER_MEMORY_TRACE'] = '1'
+        args = [self.compiler, "build", source, "-o", out]
+        if cache_dir is None:
+            args.append("--no-cache")
         if fast:
             args.append("--fast")
         rc, _, err = self.sh(args, env)
         if rc != 0:
             return ("build-failed", err.strip().splitlines()[:6])
+        build_trace = err
         rc, stdout, err = self.sh([out])
+        if trace:
+            return (stdout, rc, build_trace)
         return (stdout, rc, err.strip().splitlines()[:1]) if stderr else (stdout, rc)
 
     def wasm(self, source, directory, stderr=False):
@@ -1801,6 +1849,7 @@ class Runner:
         driver = os.path.join(directory, "build-wasm.ab")
         with open(driver, "w", encoding="utf-8") as f:
             f.write(f'''import "abla/wasm/build"
+import "abla/build"
 
 val release = #wasmBuildModule("w", "{source}", "{stem}.wasm", false, false)
 val development = #buildProgram("w-dev", "{source}", "{stem}-dev.wasm", "wasm32-module", "module", true, false)
@@ -1907,6 +1956,151 @@ def differing_lines(results):
             key, _, text = line.partition("=")
             lines.setdefault(key, {}).setdefault(text, []).append(mode)
     return sorted(k for k, v in lines.items() if len(v) > 1 or "FUZZ_ORACLE_FAILURE" in v)
+
+
+def graph_provider(base, extra=None):
+    signature = 'n: int' if extra is None else f'n: int, extra: int = {extra}'
+    suffix = '' if extra is None else ' + extra'
+    return f'''val base = {base}
+class MBox<T>(val value: T)
+fun <T> mbox(value: T): MBox<T> = MBox(value)
+interface Measure {{ fun measure(): int }}
+class Meter(val n: int) : Measure {{ fun measure(): int = this.n + base }}
+compile fun stage({signature}): int = n + base{suffix}
+'''
+
+
+def graph_write(directory, seed):
+    """Make a small strict graph: direct, facade or diamond with one visible clash."""
+    r = random.Random(seed)
+    a, b, base, delta, extra = (r.randint(1, 9), r.randint(10, 19), r.randint(20, 40),
+                                r.randint(1, 9), r.randint(1, 9))
+    os.makedirs(os.path.join(ROOT, directory), exist_ok=True)
+    files = {
+        'abla.toml': 'name = "fuzz-modules"\nversion = "0.1.0"\nentry = "program.ab"\nvisibility = "imports"\n',
+        'provider.ab': graph_provider(base),
+    }
+    variant = seed % 3
+    if variant == 0:
+        files['provider.ab'] += '\nfun clash(): int = 7\n'
+        imports = 'import "./provider.ab"\n'
+        left, right = f'mbox({a}).value', f'mbox({b}).value'
+    else:
+        files['left.ab'] = f'export import "./provider.ab"\nfun leftValue(): int = mbox({a}).value\nfun clash(): int = 7\n'
+        imports = 'import "./left.ab"\n'
+        left = 'leftValue()'
+        if variant == 1:
+            right = f'mbox({b}).value'
+        else:
+            files['right.ab'] = f'import "./provider.ab"\nfun rightValue(): int = mbox({b}).value\nfun clash(): int = 100\n'
+            imports += 'import "./right.ab" as Right\n'
+            right = 'Right.rightValue()'
+    for name, text in files.items():
+        with open(os.path.join(ROOT, directory, name), 'w', encoding='utf-8') as f:
+            f.write(text)
+    prelude = 'import "abla/io"\n' + imports + 'val staged = #stage(5)\n'
+    lines = ['fun c0(): string {', '    val m: Measure = Meter(2)',
+             f'    "${{{left}}}:${{{right}}}:${{clash()}}:${{m.measure()}}:$staged"', '}']
+    return prelude, [(lines, 'c0()', 'str', 0)], (a, b, base, delta, extra, variant)
+
+
+def graph_expected(data, base, extra):
+    a, b, _, _, _, _ = data
+    return f'c0={a}:{b}:7:{2 + base}:{5 + base + extra}\n'
+
+
+def graph_cached_wasm(runner, directory, mode, cache_dir, trace=False):
+    source = os.path.join(directory, 'program.ab')
+    output = os.path.join(directory, f'graph-{mode}.wasm')
+    driver = os.path.join(directory, f'graph-{mode}-driver.ab')
+    registration = 'val target = #wasm32Target()\n' if mode == 'wasm-dev' else ''
+    call = (f'wasmBuildModule("graph", "{source}", "{output}", false, true)'
+            if mode == 'wasm' else
+            f'buildProgram("graph", "{source}", "{output}", "wasm32-module", "module", true, true)')
+    driver_path = os.path.join(ROOT, driver)
+    if not os.path.exists(driver_path):
+        with open(driver_path, 'w', encoding='utf-8') as f:
+            f.write(f'import "abla/wasm/build"\nimport "abla/build"\n{registration}val built = #{call}\nfun main: int = if (built) 0 else 1\n')
+    env = {'ABLA_CACHE_DIR': os.path.abspath(cache_dir)}
+    if trace:
+        env['ABLA_COMPILER_MEMORY_TRACE'] = '1'
+    rc, _, err = runner.sh([runner.compiler, 'build', driver, '-o',
+                             os.path.join(directory, f'graph-{mode}-driver'), '--fast'], env)
+    if rc != 0 or not os.path.exists(os.path.join(ROOT, output)):
+        return ('build-failed', err.strip().splitlines()[:6])
+    rc, stdout, _ = runner.sh(['node', os.path.join(ROOT, 'tools', 'fuzz-differential.mjs'), output])
+    return (stdout, rc, err) if trace else (stdout, rc)
+
+
+def run_module_graph(args, seed, runner):
+    directory = os.path.join(WORK, f'graph{seed}')
+    # A retry must begin cold, never reuse a partial cache or stale output.
+    shutil.rmtree(os.path.join(ROOT, directory), ignore_errors=True)
+    prelude, checks, data = graph_write(directory, seed)
+    a, b, base, delta, extra, variant = data
+    results = runner.all_modes(directory, (prelude, checks))
+    expected = graph_expected(data, base, 0)
+    bad = verdict(results)
+    if bad or any(v != (expected, 0) for v in results.values()):
+        return f'graph seed {seed}, no-cache: {bad or "Python oracle mismatch"}; expected {expected!r}; results {results!r}; retained {directory}'
+
+    modes = ('fast', 'release', 'ct', 'ct-jit', 'wasm', 'wasm-dev')
+    for phase in ('cold', 'warm', 'discovery', 'constant', 'signature'):
+        current_base = base if phase in ('cold', 'warm', 'discovery') else base + delta
+        current_extra = extra if phase == 'signature' else None
+        if phase in ('constant', 'signature'):
+            provider = graph_provider(current_base, current_extra)
+            if variant == 0:
+                provider += '\nfun clash(): int = 7\n'
+            with open(os.path.join(ROOT, directory, 'provider.ab'), 'w', encoding='utf-8') as f:
+                f.write(provider)
+        expected = graph_expected(data, current_base, current_extra or 0)
+        results = {}
+        for mode in modes:
+            cache = os.path.join(directory, 'cache-' + mode)
+            if phase == 'discovery':
+                # Force the frontend to run while preserving its populated raw
+                # discovery cache, as in tools/test-discovery-cache.sh.
+                for item in os.scandir(os.path.join(ROOT, cache)):
+                    if item.name.startswith('discovery-v1-'):
+                        continue
+                    if item.is_dir(follow_symlinks=False):
+                        shutil.rmtree(item.path)
+                    else:
+                        os.unlink(item.path)
+            if mode.startswith('wasm'):
+                result = graph_cached_wasm(runner, directory, mode, cache, trace=phase == 'discovery')
+            else:
+                source = os.path.join(directory, 'program-ct.ab' if mode.startswith('ct') else 'program.ab')
+                ct = 'interp' if mode == 'ct' else ('jit' if mode == 'ct-jit' else None)
+                result = runner.native(source, os.path.join(directory, 'cached-' + mode),
+                                       mode != 'release', ct, cache_dir=cache, trace=phase == 'discovery')
+            if phase == 'discovery' and result[0] != 'build-failed':
+                stdout, status, trace = result
+                if f'discovery.hit:{directory}/provider.ab' not in trace:
+                    return f'graph seed {seed}, discovery: {mode} did not report provider cache hit; retained {directory}'
+                result = (stdout, status)
+            results[mode] = result
+        bad = verdict(results)
+        if bad or any(v != (expected, 0) for v in results.values()):
+            return f'graph seed {seed}, {phase}: {bad or "Python oracle mismatch"}; expected {expected!r}; results {results!r}; retained {directory}'
+        if phase == 'cold':
+            provider_path = os.path.join(ROOT, directory, 'provider.ab')
+            with open(provider_path, 'rb') as f:
+                provider_source = f.read()
+            for mode in modes:
+                pattern = os.path.join(ROOT, directory, 'cache-' + mode, 'discovery-v1-*', '*.discovery')
+                found = False
+                for record in glob.glob(pattern):
+                    with open(record, 'rb') as f:
+                        if provider_source in f.read():
+                            found = True
+                            break
+                if not found:
+                    return f'graph seed {seed}, cold: {mode} has no provider discovery cache record; retained {directory}'
+    if not args.keep:
+        shutil.rmtree(os.path.join(ROOT, directory), ignore_errors=True)
+    return None
 
 
 def run_seed(args, seed, runner):
@@ -2042,10 +2236,13 @@ def main():
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--selftest", action="store_true", help="check the comparison on made-up results")
     ap.add_argument("--hosted-tasks", action="store_true", help="draw task/thread checks; compare only the four hosted modes")
+    ap.add_argument("--module-graphs", action="store_true", help="check strict multi-module graphs and cache invalidation in all six modes")
     ap.add_argument("--check-hostless-capabilities", action="store_true", help="assert tasks and threads are unsupported by each hostless Wasm builder")
     ap.add_argument("--show", action="store_true", help="with --program: print the output of the fast build")
     ap.add_argument("--program", help="run an existing .ab program (with @export(\"run\")) all ways")
     args = ap.parse_args()
+    if args.module_graphs and (args.hosted_tasks or args.focus or args.panics or args.program):
+        ap.error('--module-graphs cannot be combined with --hosted-tasks, --focus, --panics or --program')
     if args.hosted_tasks:
         if args.focus and args.focus != 'task_check':
             ap.error('--hosted-tasks requires task_check')
@@ -2079,13 +2276,16 @@ def main():
         return 1 if bad else 0
     failures = 0
     for seed in seed_range(args.seed or args.seeds):
-        found = run_seed(args, seed, runner)
+        found = run_module_graph(args, seed, runner) if args.module_graphs else run_seed(args, seed, runner)
         if found:
             failures += 1
             print(found)
         else:
-            modes = 'four hosted modes (Wasm unsupported)' if args.hosted_tasks else 'all six modes'
-            print(f"seed {seed}: {args.checks} checks agree in {modes}")
+            if args.module_graphs:
+                print(f'graph seed {seed}: no-cache, cached cold/warm/discovery-hit and provider edits agree in all six modes')
+            else:
+                modes = 'four hosted modes (Wasm unsupported)' if args.hosted_tasks else 'all six modes'
+                print(f"seed {seed}: {args.checks} checks agree in {modes}")
     return 1 if failures else 0
 
 

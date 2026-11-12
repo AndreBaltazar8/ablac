@@ -279,12 +279,12 @@
   After #778, the resource-drop check also iterates generators from a live owner's field, a global, and a
   borrowed parameter with early break, recording values and drop order. Focused seeds 3401 to 3420 and
   default-mix seeds 3521 to 3540 (24 checks each) agreed in all six modes on master 83d65574; the tool's
-  test suite passed too. Nested generator-machine sources and temporary owners remain outside these shapes.
+  test suite passed too. Nested generator-machine sources and temporary owners were covered separately later.
 
   After #784, `nested_generator_check` draws a live owner's field or indexed generator inside an outer
   generator, including conditional borrowed/fresh sources, inner breaks and outer drops while suspended.
   Focused seeds 3601 to 3620 (480 checks) agree in all six modes on master fbd02092; the tool suite passes.
-  Temporary owner projections remain excluded pending #788. Before this addition, default seeds 3541 to
+  Temporary owner projections were excluded until #788. Before this addition, default seeds 3541 to
   3580 (960 checks) agreed in all six modes on the same compiler.
 
   `json_check` draws small nested values and tests both parse/stringify and directly built values against
@@ -307,6 +307,15 @@
   unsupported rather than agreement. Hosted seeds 4521 to 4540 (8 checks each), the wrong-oracle control
   and the tool suite passed on compiler 0f39df87. Default seeds 4601 to 4640 (24 checks each) agreed in
   all six modes on the same compiler.
+
+  After #788, the resource-drop and nested-generator checks draw temporary field, index and conditional
+  owners and a temporary resource field passed to a borrowing callee, retaining drop logs. Focused seeds
+  4851 to 4870 and 4871 to 4890 each passed 480 checks in six modes on e89d5e4e; the tool suite passed.
+  `--module-graphs` generates strict direct, facade and diamond import graphs, duplicate names, cross-module
+  generics, interfaces and compile functions. Seeds 4731 to 4736 passed all six modes with Python expectations
+  in no-cache, isolated cold/warm and traced provider-discovery-hit builds, then after a provider constant edit
+  and a signature/default edit. The entry sources stay unchanged during edits. Default seeds 5001 to 5040
+  passed 960 checks in six modes with the 1210637a stdlib tree and e89d5e4e compiler payload.
 
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
