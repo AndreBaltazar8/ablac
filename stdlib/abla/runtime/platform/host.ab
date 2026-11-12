@@ -3089,15 +3089,19 @@ trusted fun __ablaRuntimeDarwinNamesImage(path: int): bool {
 // A Darwin `struct stat` (144 bytes, 64-bit inode) as the Linux-style record the
 // portable code reads: mode at 24, size at 48, mtime at 88 and 96, the rest zero.
 trusted fun __ablaRuntimeDarwinStat(native: int, output: int): void {
+    val mode = ablaRuntimeLoadI32(native + 4) & 65535
+    val size = ablaRuntimeLoadI64(native + 96)
+    val seconds = ablaRuntimeLoadI64(native + 48)
+    val nanoseconds = ablaRuntimeLoadI64(native + 56)
     var offset = 0
     while (offset < 144) {
         ablaRuntimeStoreI64(output + offset, 0)
         offset = offset + 8
     }
-    ablaRuntimeStoreI32(output + 24, ablaRuntimeLoadI32(native + 4) & 65535)
-    ablaRuntimeStoreI64(output + 48, ablaRuntimeLoadI64(native + 96))
-    ablaRuntimeStoreI64(output + 88, ablaRuntimeLoadI64(native + 48))
-    ablaRuntimeStoreI64(output + 96, ablaRuntimeLoadI64(native + 56))
+    ablaRuntimeStoreI32(output + 24, mode)
+    ablaRuntimeStoreI64(output + 48, size)
+    ablaRuntimeStoreI64(output + 88, seconds)
+    ablaRuntimeStoreI64(output + 96, nanoseconds)
     return
 }
 
@@ -3105,13 +3109,14 @@ trusted fun __ablaRuntimeDarwinStat(native: int, output: int): void {
 // name length, type, name) as Linux's (inode, offset, length, type, name, 8-aligned).
 trusted fun __ablaRuntimeDarwinGetdents(descriptor: int, output: int, capacity: int): int {
     if (output == 0 || capacity < 24) return -22
-    val native = ablaDarwinSyscall(197, 0, capacity, 3, 4098, -1, 0)
+    // The records and the 8-byte position (getdirentries64's base) share one mapping.
+    val native = ablaDarwinSyscall(197, 0, capacity + 16, 3, 4098, -1, 0)
     if (native < 0 && native > -4096) return __ablaRuntimeDarwinResult(native)
-    val position = nativeStackAllocate(8)
+    val position = native + ((capacity + 7) & -8)
     ablaRuntimeStoreI64(position, 0)
     val measured = ablaDarwinSyscall(344, descriptor, native, capacity, position, 0, 0)
     if (measured <= 0) {
-        ablaDarwinSyscall(73, native, capacity, 0, 0, 0, 0)
+        ablaDarwinSyscall(73, native, capacity + 16, 0, 0, 0, 0)
         return __ablaRuntimeDarwinResult(measured)
     }
     val base = ablaRuntimeLoadI64(position)
@@ -3149,7 +3154,7 @@ trusted fun __ablaRuntimeDarwinGetdents(descriptor: int, output: int, capacity: 
             }
         }
     }
-    ablaDarwinSyscall(73, native, capacity, 0, 0, 0, 0)
+    ablaDarwinSyscall(73, native, capacity + 16, 0, 0, 0, 0)
     if (failure != 0) failure else written
 }
 
@@ -3157,22 +3162,37 @@ trusted fun __ablaRuntimeDarwinGetdents(descriptor: int, output: int, capacity: 
 // (fcntl F_GETPATH, 50, into a PATH_MAX buffer), as libSystem does. Returns the
 // length including the terminator, like the Linux system call.
 trusted fun __ablaRuntimeDarwinGetcwd(output: int, size: int): int {
-    val dot = nativeStackAllocate(8)
-    ablaRuntimeStoreI64(dot, 46)
-    val descriptor = ablaDarwinSyscall(5, dot, 0, 0, 0, 0, 0)
+    // The caller's buffer holds the path "." for open (a name needs at least a byte and the
+    // terminator, so a buffer under 2 bytes is ERANGE anyway); the descriptor's path is read
+    // into a mapping of its own (no stack allocation: the compile-time JIT's runtime slice
+    // cannot resolve nativeStackAllocate).
+    if (size < 2) return -34
+    ablaRuntimeStoreU8(output, 46)
+    ablaRuntimeStoreU8(output + 1, 0)
+    val descriptor = ablaDarwinSyscall(5, output, 0, 0, 0, 0, 0)
     if (descriptor < 0) return __ablaRuntimeDarwinResult(descriptor)
-    val buffer = nativeStackAllocate(1024)
+    val buffer = ablaDarwinSyscall(197, 0, 1024, 3, 4098, -1, 0)
+    if (buffer < 0 && buffer > -4096) {
+        ablaDarwinSyscall(6, descriptor, 0, 0, 0, 0, 0)
+        return __ablaRuntimeDarwinResult(buffer)
+    }
     val status = ablaDarwinSyscall(92, descriptor, 50, buffer, 0, 0, 0)
     ablaDarwinSyscall(6, descriptor, 0, 0, 0, 0, 0)
-    if (status < 0) return __ablaRuntimeDarwinResult(status)
+    if (status < 0) {
+        ablaDarwinSyscall(73, buffer, 1024, 0, 0, 0, 0)
+        return __ablaRuntimeDarwinResult(status)
+    }
     var length = 0
     while (ablaRuntimeLoadU8(buffer + length) != 0) length = length + 1
-    if (length + 1 > size) return -34
     var copy = 0
-    while (copy <= length) {
-        ablaRuntimeStoreU8(output + copy, ablaRuntimeLoadU8(buffer + copy))
-        copy = copy + 1
+    if (length + 1 <= size) {
+        while (copy <= length) {
+            ablaRuntimeStoreU8(output + copy, ablaRuntimeLoadU8(buffer + copy))
+            copy = copy + 1
+        }
     }
+    ablaDarwinSyscall(73, buffer, 1024, 0, 0, 0, 0)
+    if (length + 1 > size) return -34
     length + 1
 }
 
@@ -3265,16 +3285,16 @@ trusted fun __ablaRuntimeDarwinSyscall(
     // The stat family, readlink, openat, getdents and getcwd. The running image's path
     // ("/proc/self/exe") stays with the C adapter, which holds its identity.
     if (number == 5) {
-        val native = nativeStackAllocate(144)
-        val raw = ablaDarwinSyscall(339, argument0, native, 0, 0, 0, 0)
-        if (raw == 0) __ablaRuntimeDarwinStat(native, argument1)
+        // The 144-byte Darwin record lands in the caller's 144-byte buffer and is rewritten in place.
+        val raw = ablaDarwinSyscall(339, argument0, argument1, 0, 0, 0, 0)
+        if (raw == 0) __ablaRuntimeDarwinStat(argument1, argument1)
         return __ablaRuntimeDarwinResult(raw)
     }
     if (number == 262 && !__ablaRuntimeDarwinNamesImage(argument1)) {
-        val native = nativeStackAllocate(144)
-        val raw = ablaDarwinSyscall(470, __ablaRuntimeDarwinDirectory(argument0), argument1, native,
+        val raw = ablaDarwinSyscall(470, __ablaRuntimeDarwinDirectory(argument0), argument1,
+            argument2,
             if ((argument3 & 256) != 0) 32 else 0, 0, 0)
-        if (raw == 0) __ablaRuntimeDarwinStat(native, argument2)
+        if (raw == 0) __ablaRuntimeDarwinStat(argument2, argument2)
         return __ablaRuntimeDarwinResult(raw)
     }
     if (number == 257 &&
