@@ -98,6 +98,27 @@ if readelf -d "$out/http-plain" | grep -Eq 'NEEDED.*(libssl|libcrypto)'; then
     echo "libc imports: a program that opens no TLS connection links OpenSSL" >&2
     exit 1
 fi
+# A libc-free executable is a static-pie that its start-up relocates: it has no interpreter and
+# no libc, and the image lands somewhere else on every run (unless the kernel's address-space
+# randomization is off).
+if ! "$compiler" build tests/cases/libc-imports-aslr/main.ab -o "$out/aslr" --no-cache >"$out/aslr.log" 2>&1; then
+    echo "libc imports: tests/cases/libc-imports-aslr did not build:" >&2
+    tail -n 20 "$out/aslr.log" >&2
+    exit 1
+fi
+if readelf -lW "$out/aslr" | grep -q INTERP || readelf -dW "$out/aslr" 2>/dev/null | grep -q NEEDED; then
+    echo "libc imports: the address program links libc" >&2
+    exit 1
+fi
+readelf -hW "$out/aslr" | grep -q 'Type: *DYN' ||
+    { echo "libc imports: the libc-free executable is not position independent" >&2; exit 1; }
+if [[ $(cat /proc/sys/kernel/randomize_va_space 2>/dev/null || echo 2) != 0 ]]; then
+    addresses=$(for _ in 1 2 3 4 5 6 7 8; do "$out/aslr"; done | sort -u | wc -l)
+    if [[ $addresses -lt 2 ]]; then
+        echo "libc imports: eight runs of a libc-free executable printed one function address: no image randomization" >&2
+        exit 1
+    fi
+fi
 binary=$compiler
 [[ -f $compiler.bin ]] && binary=$compiler.bin
 if ! readelf -h "$binary" >/dev/null 2>&1; then
