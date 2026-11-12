@@ -27,3 +27,19 @@ one iteration and an empty password. `keybag.p12` has unencrypted bags but a
 required MAC. `no-mac.p12` and `legacy.p12` are deliberate rejection fixtures.
 The Python oracle independently derives SHA1/SHA256 MAC keys and authenticates
 mutated containers; tests prove that MAC failure precedes cipher inspection.
+
+## corrupt/ and the known-answer checks
+
+`corrupt/` holds the corrupted and re-authenticated inputs (42 files) made once
+on 2026-11-12 with Python 3.14.7 from the fixtures above; MANIFEST lists each
+file's hash, size and recipe, and `tools/verify-fixture-manifest.sh` checks it.
+`tests/cases/crypto-encrypted-rsa/cases.txt` is the table of every probe (file,
+password, limits, expected outcome) that `check.sh` runs. A new case: add its
+file to `corrupt/` and MANIFEST and a row to cases.txt; the `.p12` ones need the
+MAC recomputed (PKCS#12 ID3 KDF over the 0x03-diversified, 64-byte-padded
+salt and password, then HMAC over the authSafe content; `openssl kdf
+PKCS12KDF` or `openssl pkcs12` can reproduce it).
+
+`tests/cases/crypto-encrypted-rsa/primitive-kats.inc` has the 50 SHA-1/SHA-256,
+PBKDF2 and PKCS#12-MAC-key answers, generated once with Python hashlib. They
+can be reproduced with `openssl dgst`, `openssl kdf` and the ID3 recipe above.

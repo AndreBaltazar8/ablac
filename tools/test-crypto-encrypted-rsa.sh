@@ -7,15 +7,25 @@ cd "$root"
 out=build/crypto-encrypted-rsa
 mkdir -p "$out"
 compile() { (ulimit -s 131072; "$compiler" build "$@"); }
-python3 tests/cases/crypto-encrypted-rsa/prepare.py "$out"
+cases=tests/cases/crypto-encrypted-rsa
+# The generated sources: the PBE library, its test helpers, the committed known-answer
+# checks, and build wrappers filled in from templates.
+{ cat stdlib/abla/crypto/pbe/entry.ab; echo; cat $cases/primitive-test.inc; echo; cat $cases/primitive-kats.inc; } > "$out/primitives.ab"
+fill() { sed -e "s|@SOURCE@|$2|" -e "s|@OUTPUT@|$3|" "$cases/$1" > "$out/$4"; }
+fill build-wasm.ab.in "$out/primitives.ab" "$out/primitives.wasm" wasm-build.ab
+fill build-arm.ab.in "$out/primitives.ab" "$out/primitives-arm.o" arm-build.ab
+fill build-wasm.ab.in "$out/reader.ab" "$out/reader.wasm" reader-wasm-build.ab
+fill build-arm.ab.in "$out/reader.ab" "$out/reader-arm.o" reader-arm-build.ab
+cp $cases/abla.toml "$out/abla.toml"
+p12hex=$(od -An -v -tx1 tests/vectors/crypto/encrypted-rsa/empty.p12 | tr -d ' \n')
+awk -v hex="$p12hex" '{ sub(/@P12HEX@/, hex); print }' $cases/reader.ab.in > "$out/reader.ab"
 for mode in "" --fast; do
     compile "$out/primitives.ab" -o "$out/primitives" --no-cache $mode
     "$out/primitives"
 done
 ABLA_GC_STRESS=1 "$out/primitives"
 compile tests/cases/crypto-encrypted-rsa/tool.ab -o "$out/tool" --no-cache
-python3 tests/cases/crypto-encrypted-rsa/check.py "$root/$out/tool" "$out"
-python3 tests/cases/crypto-encrypted-rsa/check-pfx.py "$root/$out/tool" "$out"
+bash $cases/check.sh "$root/$out/tool"
 compile "$out/wasm-build.ab" -o "$out/wasm-builder" --fast --no-cache
 "$out/wasm-builder"
 node --input-type=module - "$out/primitives.wasm" <<'JS'
