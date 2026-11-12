@@ -6,7 +6,7 @@ compiler=${1:-build/ablac}
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 out="$root/build/running-image-identity"
 mkdir -p "$out"
-program=$("$root/tools/compiler-api-test-program.py" "$compiler")
+program=$("$root/tools/compiler-api-test-program.sh" "$compiler")
 # Mutate separate executable copies, never the shared cached harness image.
 for tail in 0 1 2 3; do
     cp "$program" "$out/tail-$tail"

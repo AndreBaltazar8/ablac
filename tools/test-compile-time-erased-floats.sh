@@ -14,7 +14,7 @@ options=()
 mkdir -p "$out"
 # The wire client needs the normal compiler graph, not the representation inspector.
 # Prepare it before ABLA_STDLIB changes so other API tests share this cold build.
-program=$("$root/tools/compiler-api-test-program.py" "$compiler")
+program=$("$root/tools/compiler-api-test-program.sh" "$compiler")
 "$root/tools/runtime-fixture.sh" "$cases/inspect.ab" "$out" >/dev/null
 export ABLA_STDLIB="$out/stdlib"
 # Inspecting representations is runtime-only: the staged code does not call

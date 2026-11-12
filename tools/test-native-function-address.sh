@@ -3,7 +3,7 @@ set -euo pipefail
 
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 compiler=${1:-$project_root/build/ablac}
-program=$("$project_root/tools/compiler-api-test-program.py" "$compiler")
+program=$("$project_root/tools/compiler-api-test-program.sh" "$compiler")
 
 set +e
 ABLA_COMPILER_API_CASE=native-address "$program"

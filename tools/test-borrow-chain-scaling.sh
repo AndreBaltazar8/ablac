@@ -32,7 +32,7 @@ if ((large > 3 * small + 50)); then
     exit 1
 fi
 echo "borrow chain scaling: 20 calls ${small}cs, 40 calls ${large}cs"
-program=$("$root/tools/compiler-api-test-program.py" "$compiler")
+program=$("$root/tools/compiler-api-test-program.sh" "$compiler")
 status=0
 ABLA_COMPILER_API_CASE=borrow-refinement "$program" || status=$?
 [[ $status -eq 42 ]]

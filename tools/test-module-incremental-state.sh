@@ -3,7 +3,7 @@ set -euo pipefail
 
 compiler=${1:-build/ablac.bin}
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-output=$("$project_root/tools/compiler-api-test-program.py" "$compiler")
+output=$("$project_root/tools/compiler-api-test-program.sh" "$compiler")
 
 set +e
 ABLA_COMPILER_API_CASE=module-incremental-state ABLA_MAX_MEMORY_MB=256 ABLA_MAX_SECONDS=30 \

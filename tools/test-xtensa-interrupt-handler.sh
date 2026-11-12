@@ -3,7 +3,7 @@ set -euo pipefail
 
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 compiler=${1:-$project_root/build/ablac}
-program=$("$project_root/tools/compiler-api-test-program.py" "$compiler")
+program=$("$project_root/tools/compiler-api-test-program.sh" "$compiler")
 diagnostics=$project_root/build/xtensa-interrupt-handler-test.stderr
 
 set +e

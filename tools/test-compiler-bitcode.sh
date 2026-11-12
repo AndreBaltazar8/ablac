@@ -5,7 +5,7 @@ project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 cd "$project_root"
 output="$project_root/build/compiler-bitcode"
 mkdir -p "$output"
-program=$("$project_root/tools/compiler-api-test-program.py" "$compiler")
+program=$("$project_root/tools/compiler-api-test-program.sh" "$compiler")
 ABLA_COMPILER_API_CASE=prune "$program" tests/cases/compiler-bitcode/prune.ll "$output/text.ll" "$output/direct.bc"
 llvm-as "$output/text.ll" -o "$output/text.bc"
 # ModuleID is a display-only input filename assigned by llvm-dis.
