@@ -386,7 +386,11 @@ class BootstrapCtReach(
     val itemHandles: array<int> = [],
     val itemIdentities: array<string> = [],
     val concreteReceivers: BootstrapIrNameTable = bootstrapIrNameTable(16),
-    val replayVisited: array<bool> = []
+    val replayVisited: array<bool> = [],
+    // Globals whose initializer a native slice may replay although it reads the environment:
+    // an immutable scalar `val` no compile-time code can write (ct_state.ab), so the replay
+    // reads the same journaled environment value the evaluator saw.
+    val replaySafe: Map<string, bool> = Map()
 ) {
     fun add(name: string, declaration: int, method: int, handle: int): void {
         this.itemDeclarations.append(declaration)
@@ -580,7 +584,8 @@ class BootstrapCtReach(
                         val declaration = if (this.itemMethods[item] < 0) owner
                             else owner.methods[this.itemMethods[item]]
                         if (crossTarget) {
-                            if (replaying && bootstrapCtCrossEnvironment(declaration)) {
+                            if (replaying && bootstrapCtCrossEnvironment(declaration) &&
+                                (this.replaySafe.get(nextReplay) ?? false) != true) {
                                 return "cross-target site replays global $nextReplay initializer reaching compilerEnvironment: shared-global replay is not proven equivalent"
                             }
                             reason = bootstrapCtCrossDeclarationReason(declaration, owner)
@@ -1090,14 +1095,18 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string,
         libraryFlags.append(bootstrapCtLibraryDeclaration(declaration))
     }
     val siteExpressions: array<BootstrapExpression> = []
+    val siteNodes: array<BootstrapExpression> = []
+    val siteTypes: array<string> = []
     val siteSources: array<string> = []
     for (site in bootstrapCtSites) {
         siteExpressions.append(site.expression)
         siteSources.append(site.sourceIdentity)
+        siteNodes.append(site.node)
+        siteTypes.append(site.type)
     }
     val stateStarted = linuxMonotonicMilliseconds()
     val state = bootstrapCtStateAnalyze(
-        parsed.declarations, libraryFlags, siteExpressions, siteSources
+        parsed.declarations, libraryFlags, siteExpressions, siteSources, siteNodes, siteTypes
     )
     bootstrapCtNote("ordinary-global write analysis ${linuxMonotonicMilliseconds() - stateStarted} ms")
     var stateSite = 0
@@ -1121,6 +1130,20 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string,
     // Separate visitation: proving only portable executed code must not prune the
     // full declaration bodies the ordinary slice's analysis and lowering require.
     val portable = if (crossTarget) bootstrapCtReach(parsed.declarations, methodTargets) else reach
+    if (crossTarget) {
+        val named: Map<string, int> = Map()
+        for (declaration in parsed.declarations) {
+            named.set(declaration.name, (named.get(declaration.name) ?? 0) + 1)
+        }
+        var snapshotIndex = 0
+        while (snapshotIndex < parsed.declarations.size) {
+            val declaration = parsed.declarations[snapshotIndex]
+            if (state.snapshot[snapshotIndex] && (named.get(declaration.name) ?? 0) == 1) {
+                portable.replaySafe.set(declaration.name, true)
+            }
+            snapshotIndex = snapshotIndex + 1
+        }
+    }
     for (declaration in parsed.declarations) {
         if (bootstrapCtRuntimeDeclaration(declaration)) {
             reach.keepFrom(declaration.expression, declaration.sourceIdentity)

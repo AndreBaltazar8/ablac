@@ -28,12 +28,9 @@ check_environment_trace() {
     [[ $(dd if="$out/project/table.ab" bs=1 skip=$((pos + 1)) count=1 2> /dev/null) != '(' ]] || expression_pos=$((pos + 2))
     native=$(awk -v tail="table.ab:$pos" 'index($0, "note[ct-jit]: native at ") == 1 && substr($0, length($0) - length(tail) + 1) == tail' "$tag.log" | wc -l)
     fallback=$(awk -v p="note[ct-jit]: interpreted at $expression_pos:" 'index($0, p) == 1' "$tag.log")
-    if [[ $shape == direct ]]; then
-        [[ $native -eq $([[ $state == warm ]] && echo 0 || echo 1) && -z $fallback ]] || fail "$tag: wrong trace for the direct site"
-    elif [[ $state != warm ]]; then
-        [[ -n $fallback && $(printf '%s\n' "$fallback" | wc -l) -eq 1 && $fallback == *'global ASSET_HOST initializer reaching compilerEnvironment'* && $native -eq 0 ]] \
-            || fail "$tag: wrong trace for the global site"
-    fi
+    # The table site is native in every shape: a global argument the environment fills in is an
+    # immutable scalar no compile-time code writes, so replaying its initializer is safe (#797).
+    [[ $native -eq $([[ $state == warm ]] && echo 0 || echo 1) && -z $fallback ]] || fail "$tag: wrong trace for the $shape site"
 }
 "$compiler" build tests/cases/compile-eval-environment/facts.ab --fast --no-cache -o "$out/facts" >"$out/facts.log" 2>&1
 status=0
