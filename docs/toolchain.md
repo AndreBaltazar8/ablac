@@ -11,6 +11,15 @@ directory. Installed or custom layouts may override that root with
 override. Project inputs, outputs, and caches continue to use project or
 invocation-relative paths.
 
+The Linux x86-64 toolchain archive requires glibc 2.38 or later. Ubuntu 24.04
+and Debian 13 meet that requirement; stock Ubuntu 22.04, Debian 12 and RHEL 9
+have older glibc and cannot run the archive unmodified. The archive uses the
+system dynamic loader and bundles LLVM and its other non-glibc dependencies.
+The standalone `ablac-x86_64-linux` release asset is intended for bootstrapping:
+it requires glibc 2.38 and a specific Nix-store dynamic loader, so it is not
+intended for direct use on other systems. Use the toolchain archive for an
+installed toolchain.
+
 ```sh
 ablac build app.ab -o build/app
 ablac build app.ab -o build/app --fast
