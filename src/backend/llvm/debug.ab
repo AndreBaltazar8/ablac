@@ -603,6 +603,7 @@ fun bootstrapLlvmDebugFinish(
 
 fun bootstrapLlvmDebugHostedRuntime(backend: BootstrapLlvmBackend): bool =
     bootstrapLlvmDebugInfo &&
+    !bootstrapLlvmTargetIsAarch64Linux(backend.targetTriple) &&
     !bootstrapTextContains(backend.targetTriple, "wasm") &&
     (backend.macOS || bootstrapTextContains(backend.targetTriple, "linux"))
 
@@ -724,9 +725,10 @@ fun bootstrapLlvmSignalStackBytes(): int = 65536
 // nor its restorer.
 fun bootstrapLlvmStackGuardKernel(backend: BootstrapLlvmBackend): bool =
     !backend.macOS &&
-    bootstrapTextContains(backend.targetTriple, "x86_64") &&
-    bootstrapTextContains(backend.targetTriple, "linux") &&
-    !bootstrapTextContains(backend.targetTriple, "gnux32")
+    ((bootstrapTextContains(backend.targetTriple, "x86_64") &&
+      bootstrapTextContains(backend.targetTriple, "linux") &&
+      !bootstrapTextContains(backend.targetTriple, "gnux32")) ||
+     bootstrapLlvmTargetIsAarch64Linux(backend.targetTriple))
 
 // The kernel's struct sigaction on x86-64: handler, flags (SA_SIGINFO |
 // SA_ONSTACK | SA_RESTORER), restorer, and an 8-byte signal mask.
@@ -745,15 +747,22 @@ fun bootstrapLlvmStackGuardKernelAction(
         backend.builder, LLVMConstInt(backend.i64Type, flags, 0),
         bootstrapLlvmByteAt(backend, action, 32, 8)
     )
-    LLVMBuildStore(
-        backend.builder, restorer, bootstrapLlvmByteAt(backend, action, 32, 16)
-    )
+    // AArch64's kernel struct has no restorer (the kernel returns through the vdso): its mask
+    // follows the flags directly.
+    if (!bootstrapLlvmTargetIsAarch64Linux(backend.targetTriple)) {
+        LLVMBuildStore(
+            backend.builder, restorer, bootstrapLlvmByteAt(backend, action, 32, 16)
+        )
+    }
     action
 }
 
 // The rt_sigreturn trampoline an x86-64 Linux signal handler returns through
 // (the kernel's SA_RESTORER), declared on first use.
 fun bootstrapLlvmSigreturnRestorer(backend: BootstrapLlvmBackend): i64* {
+    if (bootstrapLlvmTargetIsAarch64Linux(backend.targetTriple)) {
+        return LLVMConstNull(backend.pointerType)
+    }
     var restorer = LLVMGetNamedFunction(backend.module, "abla_runtime_sigreturn")
     if (pointerIsNull(restorer)) {
         restorer = bootstrapLlvmDeclare(
@@ -912,7 +921,9 @@ fun bootstrapLlvmInstallStackGuard(backend: BootstrapLlvmBackend): void {
         // the handler returns through abla_runtime_sigreturn, rt_sigreturn.
         val restorer = bootstrapLlvmSigreturnRestorer(backend)
         val kernelAction = bootstrapLlvmStackGuardKernelAction(
-            backend, handler, 201326596, restorer, "signal.kernel.action"
+            backend, handler,
+            if (bootstrapLlvmTargetIsAarch64Linux(backend.targetTriple)) 134217732 else 201326596,
+            restorer, "signal.kernel.action"
         )
         for (signal in [11, 7]) {
             bootstrapLlvmStackGuardKernelSigaction(
