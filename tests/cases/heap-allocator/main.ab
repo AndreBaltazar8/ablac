@@ -1,0 +1,418 @@
+import "abla/io"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+import "abla/runtime/scalar"
+import "abla/runtime/self"
+
+// The runtime heap's allocator (host.ab: mmap/munmap/mremap on x86-64 Linux, libc's malloc elsewhere), driven
+// through its four entry points. Blocks are 16-byte aligned, never overlap, keep their bytes across
+// realloc growth and shrink, coalescing of freed neighbours and the return of whole chunks, calloc's are zero (also over memory that was freed dirty), large blocks give
+// their pages back, and threads allocating and freeing at once do not disturb each other.
+
+trusted fun allocate(size: int): int = ablaRuntimePointerAddress(__ablaRuntimeHostMalloc(size))
+trusted fun zeroed(size: int): int = ablaRuntimePointerAddress(__ablaRuntimeHostCalloc(1, size))
+trusted fun resize(address: int, size: int): int =
+    ablaRuntimePointerAddress(__ablaRuntimeHostRealloc(ablaRuntimePointerFromAddress(address),
+        size))
+trusted fun release(address: int): void =
+    __ablaRuntimeHostFree(ablaRuntimePointerFromAddress(address))
+
+// The byte a block's offset holds, for a block with this tag.
+fun pattern(tag: int, offset: int): int = (tag * 31 + offset * 7 + (offset >> 8)) & 255
+
+// Every byte of a block's first 8 KiB; past that every 61st, and the last 64 (the cost of checking megabytes byte by
+// byte). The offsets do not depend on the block's size, so a prefix kept by realloc can be checked on its own.
+fun stride(offset: int): int = if (offset < 8192) 1 else 61
+
+trusted fun fill(address: int, size: int, tag: int): void {
+    var offset = 0
+    while (offset < size) {
+        ablaRuntimeStoreU8(address + offset, pattern(tag, offset))
+        offset = offset + stride(offset)
+    }
+    offset = if (size > 64) size - 64 else 0
+    while (offset < size) {
+        ablaRuntimeStoreU8(address + offset, pattern(tag, offset))
+        offset = offset + 1
+    }
+}
+
+// The same for a block's first `kept` bytes only, after it was resized to another size (the last 64 bytes of the old
+// size were never written with the new one in mind).
+trusted fun wrongPrefix(address: int, kept: int, tag: int): int {
+    var offset = 0
+    while (offset < kept) {
+        if (ablaRuntimeLoadU8(address + offset) != pattern(tag, offset)) return offset
+        offset = offset + stride(offset)
+    }
+    -1
+}
+
+// The first offset whose byte is not the pattern's, or -1.
+trusted fun wrong(address: int, size: int, tag: int): int {
+    var offset = 0
+    while (offset < size) {
+        if (ablaRuntimeLoadU8(address + offset) != pattern(tag, offset)) return offset
+        offset = offset + stride(offset)
+    }
+    offset = if (size > 64) size - 64 else 0
+    while (offset < size) {
+        if (ablaRuntimeLoadU8(address + offset) != pattern(tag, offset)) return offset
+        offset = offset + 1
+    }
+    -1
+}
+
+trusted fun nonzero(address: int, size: int): int {
+    var offset = 0
+    while (offset < size) {
+        if (ablaRuntimeLoadU8(address + offset) != 0) return offset
+        offset = offset + 1
+    }
+    -1
+}
+
+fun fail(text: string): int {
+    println("FAIL: $text")
+    1
+}
+
+// Every size from 0 to 4096, kept alive together: aligned, disjoint, each holding its own pattern.
+trusted fun sizesAndOverlap(): int {
+    val count = 4097
+    val addresses: array<int> = []
+    for (size in 0 until count) {
+        val address = allocate(size)
+        if (address == 0) return fail("allocate($size) is null")
+        if ((address & 15) != 0) return fail("allocate($size) = $address is not 16-aligned")
+        fill(address, size, size)
+        addresses.append(address)
+    }
+    for (size in 0 until count) {
+        val bad = wrong(addresses[size], size, size)
+        if (bad >= 0) return fail("size $size: byte $bad was overwritten")
+    }
+    // No two live blocks share a byte, for the first 1100 sizes pairwise (a zero-byte request still has its own address); every size by its own pattern above.
+    for (first in 0 until 1100) {
+        val firstEnd = addresses[first] + (if (first == 0) 1 else first)
+        for (second in first + 1 until 1100) {
+            val secondEnd = addresses[second] + (if (second == 0) 1 else second)
+            if (addresses[first] < secondEnd && addresses[second] < firstEnd) {
+                return fail("blocks of $first and $second overlap")
+            }
+        }
+    }
+    // Free the odd ones and ask again: reused blocks must not disturb the even ones.
+    for (size in 0 until count) {
+        if ((size & 1) == 1) release(addresses[size])
+    }
+    val again: array<int> = []
+    for (size in 0 until count) {
+        if ((size & 1) == 1) {
+            val address = allocate(size)
+            if ((address & 15) != 0) return fail("reused $size is not aligned")
+            fill(address, size, size + 5000)
+            again.append(address)
+        }
+    }
+    for (size in 0 until count) {
+        if ((size & 1) == 0) {
+            val bad = wrong(addresses[size], size, size)
+            if (bad >= 0) return fail("size $size was disturbed at byte $bad by reuse")
+        }
+    }
+    var next = 0
+    for (size in 0 until count) {
+        if ((size & 1) == 1) {
+            val bad = wrong(again[next], size, size + 5000)
+            if (bad >= 0) return fail("reused size $size: byte $bad was overwritten")
+            next = next + 1
+            release(again[next - 1])
+        } else release(addresses[size])
+    }
+    0
+}
+
+// calloc over memory freed full of 0xAA, small and large.
+trusted fun zeroing(): int {
+    val sizes: array<int> = [1, 7, 8, 9, 15, 16, 24, 100, 255, 256, 257, 1000, 4096, 65536, 131056,
+        131064, 131072, 200000, 1048576]
+    for (size in sizes) {
+        for (round in 0 until 3) {
+            val dirty = allocate(size)
+            ablaUnsafeSetMemory(ablaRuntimePointerFromAddress(dirty), 170, size)
+            release(dirty)
+            val clean = zeroed(size)
+            if (clean == 0) return fail("calloc($size) is null")
+            if ((clean & 15) != 0) return fail("calloc($size) is not aligned")
+            val bad = nonzero(clean, size)
+            if (bad >= 0) return fail("calloc($size): byte $bad is not zero")
+            release(clean)
+        }
+    }
+    0
+}
+
+// realloc grows by steps from 1 byte to 12 MiB, across the small/large boundary, then shrinks back,
+// the prefix kept every time.
+trusted fun resizing(): int {
+    var size = 1
+    var address = allocate(size)
+    fill(address, size, 77)
+    while (size < 12582912) {
+        var bigger = size + size / 2 + 1
+        if (size < 131100 && bigger > 131070 && bigger < 131090) bigger = 131090
+        val moved = resize(address, bigger)
+        if (moved == 0) return fail("realloc to $bigger is null")
+        if ((moved & 15) != 0) return fail("realloc to $bigger is not aligned")
+        val bad = wrongPrefix(moved, size, 77)
+        if (bad >= 0) return fail("growing $size to $bigger lost byte $bad")
+        fill(moved, bigger, 77)
+        address = moved
+        size = bigger
+    }
+    while (size > 1) {
+        val smaller = size / 3 + 1
+        val moved = resize(address, smaller)
+        if (moved == 0) return fail("shrinking to $smaller is null")
+        if ((moved & 15) != 0) return fail("shrinking to $smaller is not aligned")
+        val bad = wrongPrefix(moved, smaller, 77)
+        if (bad >= 0) return fail("shrinking $size to $smaller lost byte $bad")
+        address = moved
+        size = smaller
+    }
+    release(address)
+    // realloc to 0 bytes: a block (this heap) or nothing and the old one freed (libc), never a crash.
+    val emptied = allocate(100)
+    fill(emptied, 100, 5)
+    val none = resize(emptied, 0)
+    if (none != 0) release(none)
+    // realloc of nothing is a malloc.
+    val fresh = resize(0, 40)
+    if (fresh == 0 || (fresh & 15) != 0) return fail("realloc(null, 40)")
+    release(fresh)
+    0
+}
+
+// A large block's pages go back to the system when it is freed (madvise on them then says ENOMEM).
+// Linux x86-64 only: elsewhere the heap is libc's, which may keep them.
+trusted fun giveBack(): int {
+    if (!__ablaRuntimeHostHeapNative()) return 0
+    val address = allocate(8388608)
+    if (address == 0) return fail("allocate(8 MiB) is null")
+    ablaRuntimeStoreU8(address, 1)
+    ablaRuntimeStoreU8(address + 8388607, 1)
+    if (ablaLinuxSyscall(28, address & -4096, 4096, 0, 0, 0,
+        0) != 0) return fail("a live block is not mapped")
+    release(address)
+    if (ablaLinuxSyscall(28, address & -4096, 4096, 0, 0, 0,
+        0) != -12) return fail("a freed large block is still mapped")
+    // And a shrunk one gives the tail back.
+    val grown = allocate(4194304)
+    val shrunk = resize(grown, 1048576)
+    if (shrunk != grown) return fail("a shrunk large block moved")
+    if (ablaLinuxSyscall(28, (grown + 3145728) & -4096, 4096, 0, 0, 0,
+        0) != -12) return fail("a shrunk block kept its tail")
+    release(shrunk)
+    0
+}
+
+// What the allocator says about itself must agree with its boundary tags (x86-64 Linux: elsewhere the heap
+// is libc's and there is nothing to check).
+trusted fun consistent(where: string): int {
+    if (!__ablaRuntimeHostHeapNative()) return 0
+    val code = __ablaRuntimeHostHeapVerify()
+    if (code != 0) return fail("the heap's lists and bins disagree $where (check $code)")
+    0
+}
+
+trusted fun trim(): void {
+    if (__ablaRuntimeHostHeapNative()) __ablaRuntimeHostHeapTrim()
+}
+
+// Freed blocks of one size serve requests of another, and whole chunks go back when they are free.
+trusted fun coalescing(): int {
+    if (!__ablaRuntimeHostHeapNative()) return 0
+    var bad = consistent("at the start")
+    if (bad != 0) return bad
+    val first: array<int> = []
+    for (index in 0 until 60000) {
+        val address = allocate(40 + (index * 7) % 260)
+        fill(address, 8, index)
+        first.append(address)
+    }
+    val peak = __ablaRuntimeHostHeapStat(0)
+    for (index in 0 until 60000) {
+        if (wrong(first[index], 8,
+            index) >= 0) return fail("a block of the first wave was overwritten")
+        release(first[index])
+    }
+    bad = consistent("after the first wave")
+    if (bad != 0) return bad
+    val before = __ablaRuntimeHostHeapStat(0)
+    val second: array<int> = []
+    for (index in 0 until 2500) {
+        val address = allocate(2500 + (index * 13) % 1000)
+        fill(address, 64, index + 3)
+        second.append(address)
+    }
+    val after = __ablaRuntimeHostHeapStat(0)
+    if (after > before + 3 * 1048576) {
+        return fail("the second wave did not reuse the first's memory: $before bytes mapped, then $after")
+    }
+    bad = consistent("after the second wave")
+    if (bad != 0) return bad
+    for (index in 0 until 2500) {
+        if (wrong(second[index], 64,
+            index + 3) >= 0) return fail("a block of the second wave was overwritten")
+        release(second[index])
+    }
+    trim()
+    bad = consistent("after the trim")
+    if (bad != 0) return bad
+    val trimmed = __ablaRuntimeHostHeapStat(0)
+    if (trimmed + 6 * 1048576 > peak) return fail("a trim kept $trimmed of $peak bytes of chunks")
+    0
+}
+
+// Random allocation, growth and freeing of a few thousand blocks of every size, the heap's tags checked
+// and every live block's bytes compared at each trim.
+trusted fun scramble(seed: int): int {
+    val slots = 3000
+    val held: array<int> = []
+    val sizes: array<int> = []
+    for (slot in 0 until slots) {
+        held.append(0)
+        sizes.append(0)
+    }
+    var state = seed * 2654435761 + 99
+    for (step in 0 until 60000) {
+        state = (state * 6364136223846793005 + 1442695040888963407) & 0x7fffffffffffffff
+        val slot = (state >> 20) % slots
+        val roll = (state >> 44) % 100
+        val kind = (state >> 8) % 100
+        val size = if (kind < 50) (state >> 30) % 200 else if (kind < 85) (state >> 30) % 5000
+            else if (kind < 99) (state >> 30) % 140000 else (state >> 30) % 1500000
+        if (held[slot] == 0) {
+            val address = if (roll % 3 == 0) zeroed(size) else allocate(size)
+            if (address == 0 || (address & 15) !=
+                0) return fail("scramble $seed: allocate($size) at step $step")
+            if (roll % 3 == 0 && nonzero(address,
+                size) >= 0) return fail("scramble $seed: calloc($size) not zero")
+            fill(address, size, seed + slot)
+            held[slot] = address
+            sizes[slot] = size
+        } else {
+            if (wrong(held[slot], sizes[slot], seed + slot) >= 0) {
+                return fail("scramble $seed: slot $slot lost a byte at step $step")
+            }
+            if (roll < 55) {
+                release(held[slot])
+                held[slot] = 0
+            } else {
+                val moved = resize(held[slot], size)
+                if (moved == 0 || (moved & 15) !=
+                    0) return fail("scramble $seed: resize($size) at step $step")
+                val kept = if (size < sizes[slot]) size else sizes[slot]
+                if (wrongPrefix(moved, kept,
+                    seed + slot) >=
+                    0) return fail("scramble $seed: resize lost a byte at step $step")
+                fill(moved, size, seed + slot)
+                held[slot] = moved
+                sizes[slot] = size
+            }
+        }
+        if (step % 20000 == 19999) {
+            trim()
+            val bad = consistent("in scramble $seed at step $step")
+            if (bad != 0) return bad
+            for (check in 0 until slots) {
+                if (held[check] != 0 && wrong(held[check], sizes[check], seed + check) >= 0) {
+                    return fail("scramble $seed: slot $check changed in a trim at step $step")
+                }
+            }
+        }
+    }
+    for (slot in 0 until slots) {
+        if (held[slot] != 0) {
+            if (wrong(held[slot], sizes[slot],
+                seed + slot) >= 0) return fail("scramble $seed: slot $slot at the end")
+            release(held[slot])
+        }
+    }
+    consistent("at the end of scramble $seed")
+}
+
+// One thread's churn: its own blocks of mixed sizes, allocated, checked, grown, freed, over and over.
+trusted fun churn(seed: int): int {
+    val slots = 64
+    val held: array<int> = []
+    val sizes: array<int> = []
+    for (slot in 0 until slots) {
+        held.append(0)
+        sizes.append(0)
+    }
+    var state = seed * 2654435761 + 12345
+    for (step in 0 until 40000) {
+        state = (state * 6364136223846793005 + 1442695040888963407) & 0x7fffffffffffffff
+        val slot = (state >> 20) % slots
+        val roll = (state >> 40) % 100
+        if (held[slot] != 0) {
+            val bad = wrong(held[slot], sizes[slot], seed * 1000 + slot)
+            if (bad >= 0) return 1 + step
+            if (roll < 40) {
+                release(held[slot])
+                held[slot] = 0
+            } else if (roll < 70) {
+                val bigger = sizes[slot] + (state >> 8) % 3000 + 1
+                val moved = resize(held[slot], bigger)
+                if (moved == 0 || (moved & 15) != 0) return 1 + step
+                val lost = wrongPrefix(moved, sizes[slot], seed * 1000 + slot)
+                if (lost >= 0) return 1 + step
+                fill(moved, bigger, seed * 1000 + slot)
+                held[slot] = moved
+                sizes[slot] = bigger
+            }
+        } else {
+            val size = if (roll < 90) (state >> 12) % 700 else (state >> 12) % 300000
+            val address = if (roll % 2 == 0) allocate(size) else zeroed(size)
+            if (address == 0 || (address & 15) != 0) return 1 + step
+            if (roll % 2 == 1 && nonzero(address, size) >= 0) return 1 + step
+            fill(address, size, seed * 1000 + slot)
+            held[slot] = address
+            sizes[slot] = size
+        }
+    }
+    for (slot in 0 until slots) {
+        if (held[slot] != 0) {
+            val bad = wrong(held[slot], sizes[slot], seed * 1000 + slot)
+            if (bad >= 0) return 9
+            release(held[slot])
+        }
+    }
+    0
+}
+
+fun main: int {
+    var failures = 0
+    failures = failures + sizesAndOverlap()
+    failures = failures + zeroing()
+    failures = failures + resizing()
+    failures = failures + giveBack()
+    failures = failures + coalescing()
+    failures = failures + scramble(1)
+    failures = failures + scramble(2)
+    val a = thread { churn(1) }
+    val b = thread { churn(2) }
+    val c = thread { churn(3) }
+    val mine = churn(4)
+    val left = await a
+    val middle = await b
+    val right = await c
+    if (left != 0 || middle != 0 || right != 0 || mine != 0) {
+        failures = failures + fail("threads: $left $middle $right $mine")
+    }
+    failures = failures + consistent("after the threads")
+    if (failures == 0) println("heap allocator ok")
+    failures
+}

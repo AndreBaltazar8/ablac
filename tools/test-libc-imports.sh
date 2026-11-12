@@ -106,9 +106,15 @@ if ! readelf -h "$binary" >/dev/null 2>&1; then
 fi
 imports compiler "$binary" >>"$actual"
 sort -u -o "$actual" "$actual"
-# Every subject must report its libraries: an empty listing would pass vacuously.
+# Every subject must report its libraries: an empty listing would pass vacuously. (A static program, checked
+# above, has none to report.)
 for subject in $(for program in tests/cases/libc-imports/*.ab; do
     name=$(basename "$program" .ab); echo "$name.release $name.fast"; done) compiler; do
+    if [[ $subject != compiler ]] && ! readelf -lW "$out/$subject" | grep -q INTERP &&
+        ! readelf -dW "$out/$subject" 2>/dev/null | grep -q NEEDED &&
+        [[ -z $("$nm" --undefined-only "$out/$subject" 2>/dev/null) ]]; then
+        continue
+    fi
     if ! grep -q "^$subject needed:" "$actual"; then
         echo "libc imports: no imports listed for $subject (is readelf working?)" >&2
         exit 1

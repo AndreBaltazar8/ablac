@@ -141,6 +141,32 @@ overlapping ranges with memcpy (all copies are llvm.memcpy; glibc's x86-64 memcp
 and ours is too); a raw clone thread can't run C library code, so clone threads only in
 libc-free images. The compiler links libLLVM and OpenSSL until step C, which is André's.
 
+Step 5, the heap (ablac-87, branch heap-806-step5): the runtime heap's malloc, calloc, realloc and
+free are Abla code over mmap, munmap, mremap and madvise on x86-64 Linux (`__ablaRuntimeHostHeap*`
+in `host.ab`); macOS and AArch64 Linux keep libc's. Blocks have glibc's geometry (a 16-byte aligned
+payload, an 8-byte header before it, t - 8 usable bytes) with boundary tags: a freed small block is a
+push on the list of its size class (16-byte steps to 1 KiB, eight a doubling to 128 KiB) and an
+allocation a pop; parked blocks are merged lazily (when allocation finds neither a parked nor a
+free block that fits, or a good share of the heap is parked) into free blocks in size bins, a whole
+free chunk is unmapped, a large free block gives its pages back (madvise), a merged block next to
+the unused tail of the newest chunk goes back into it. A request over 128 KiB is a mapping of its
+own (free unmaps it unless one of up to 16 recent mappings, at most 8 MiB each and 32 MiB in all,
+can be kept for the next request; realloc of one is mremap). One futex lock (the runtime's), taken
+only once a second thread (an Abla thread or the background-free helper) exists (a forked child
+allocates nothing before exec, as the process module has it). `runtimeMemoryRelease()` trims the
+heap like malloc_trim; the compiler calls it where libLLVM (glibc's malloc, no longer one
+pool with the runtime heap) starts building the module, and in `bootstrapCollectAndRelease`. A call
+site names libc only behind nested `ablaHostIsMacOS()` and `ablaSimdTargetArch()` tests (a helper
+function is not folded in a `--fast` build), so no program or the compiler imports malloc, calloc,
+realloc or free, release or `--fast`. Test: `tools/test-heap-allocator.sh` (every size 0 to 4096,
+alignment, overlap, calloc over reused blocks, realloc across the small/large boundary, coalescing
+and the return of chunks, a verifier of the boundary tags after random churn, four threads).
+Measured against the glibc heap (instructions:u on one P-core; wall time and cycles move 30% with
+the machine's load): perf trees +2.7%, strings -5.9%, maps -2.7%, json-megabyte +1.6% (peak RSS
+1,057 MB against 1,017-1,507 MB, page faults 950k against 570-690k), 200-500 KiB buffer churn
++5%; `--emit-llvm` of the compiler 68.0 G against 67.9-68.9 G instructions, peak 1.45-1.53 GB
+against 1.32-1.45 GB (tests/cases/memory-peak records the new level).
+
 macOS keeps libSystem for system calls, malloc, threads and signals. Only steps 1 and 5 (in its
 mmap form) apply there.
 

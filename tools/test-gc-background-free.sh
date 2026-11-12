@@ -20,7 +20,7 @@ fail() {
 
 pids=()
 for program in background inline fork; do
-    "$compiler" build "$cases/$program.ab" -o "$output_directory/$program" --no-cache &
+    ABLA_KEEP_LLVM_TEXT=1 "$compiler" build "$cases/$program.ab" -o "$output_directory/$program" --no-cache &
     pids+=("$!")
 done
 for pid in "${pids[@]}"; do wait "$pid"; done
@@ -44,12 +44,14 @@ wait "$inline_pid"
     fail "under ABLA_GC_STRESS=1 the outputs differ"
 # Both implementations must actually honor the requested three rounds.
 [[ $stressed == "790718635 6 true" ]] || fail "the stressed run did not do three rounds: '$stressed'"
-# The linked programs (--emit-llvm writes the unpruned runtime, threads and all).
-nm -u "$output_directory/inline" > "$output_directory/inline.symbols"
-! grep -q "pthread_create" "$output_directory/inline.symbols" ||
+# The linked programs' LLVM text (ABLA_KEEP_LLVM_TEXT=1 above): the helper's entry, the function the runtime hands to a
+# thread, is in the program that asks for background freeing and only there. (The symbols do not tell: a libc-free
+# program defines its clone routine whether it has a helper or not, and a hosted one that has any thread imports
+# pthread_create.)
+helper='"abla.source"="__ablaRuntimeHostFreeWorker"'
+! grep -q "$helper" "$output_directory/inline.ll" ||
     fail "a program without background freeing has the helper"
-nm -u "$output_directory/background" > "$output_directory/background.symbols"
-grep -q "pthread_create" "$output_directory/background.symbols" ||
+grep -q "$helper" "$output_directory/background.ll" ||
     fail "a program with background freeing has no helper"
 
 echo "gc background free: same output (and under stress), a child process meanwhile, freed memory returned to the allocator; only the program asking for it has the helper"
