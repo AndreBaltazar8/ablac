@@ -1,0 +1,53 @@
+// Raw socket peer for tools/test-http-close-delimited.sh: HTTP/1.0 close-delimited
+// bodies, bodyless responses held open, conflicting Content-Length, stalls and limits,
+// each a literal byte string chosen by the request path (see the case list below).
+// Arguments: <ready file> <certificate> <key> [wrong], where "wrong" answers /close with a different
+// body (a control: the client must then fail). Protocol bytes live only in this file;
+// tests/cases/peer-support/scheduler.ab moves them and keeps time.
+import "abla/process/arguments"
+import "../peer-support/scheduler.ab"
+
+fun main: int {
+    val wrong = processArgumentCount() > 3 && processArgument(3) == "wrong"
+    if (!peerListen(processArgument(0), processArgument(1), processArgument(2))) return 1
+    while (true) {
+        val request = peerNext()
+        val path = request.path
+        if (path == "/close" || path == "/tls-close" || path == "/async-close") {
+            val body = if (path == "/close") (if (wrong) "delayed bodX" else "delayed body")
+                else if (path == "/tls-close") "secure body" else "async body"
+            peerSend(request, 0, "HTTP/1.0 200 OK\r\n\r\n")
+            peerSend(request, 150, body)
+            peerClose(request, 150)
+        } else if (path == "/head" || path == "/tls-head" || path == "/async-head" ||
+            path == "/empty" || path == "/not-modified" || path == "/info") {
+            val head = if (path == "/head" || path == "/tls-head" || path == "/async-head")
+                "HTTP/1.1 200 OK\r\nContent-Length: 999\r\nConnection: close\r\n\r\n"
+                else if (path == "/empty") "HTTP/1.1 204 No Content\r\n\r\n"
+                else if (path == "/info") "HTTP/1.1 101 Switching Protocols\r\n\r\n"
+                else "HTTP/1.1 304 Not Modified\r\n\r\n"
+            peerSend(request, 0, head)
+            peerHold(request, 3000)
+        } else if (path == "/differ" || path == "/async-differ") {
+            // Two Content-Lengths that differ, then the connection stays open: a client must stop at once.
+            peerSend(request, 0, "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Length: 5\r\n\r\nabc")
+            peerClose(request, 1500)
+        } else if (path == "/stall" || path == "/tls-stall") {
+            peerSend(request, 0, "HTTP/1.0 200 OK\r\n\r\npartial")
+            peerClose(request, 1500)
+        } else if (path == "/over") {
+            peerSend(request, 0, "HTTP/1.0 200 OK\r\n\r\n" + "x".repeat(200))
+            peerClose(request, 0)
+        } else if (path == "/at-limit") {
+            peerSend(request, 0, "HTTP/1.0 200 OK\r\n\r\n" + "x".repeat(45))
+            peerClose(request, 0)
+        } else if (path == "/chunked") {
+            peerSend(request, 0, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nchunk\r\n0\r\n\r\n")
+            peerClose(request, 0)
+        } else {
+            peerSend(request, 0, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            peerClose(request, 0)
+        }
+    }
+    0
+}

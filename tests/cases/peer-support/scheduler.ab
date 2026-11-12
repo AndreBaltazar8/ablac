@@ -1,0 +1,173 @@
+// Support for the raw-socket test peers (tests/cases/*-peer/peer.ab): one thread
+// serves a plain TCP and a TLS listener on 127.0.0.1 and runs the replies as timed
+// events, so a connection that is stalling or held open never delays accepting the
+// next request. The peers write every protocol byte themselves as string literals;
+// this module only moves bytes and keeps time. The TLS side is the hosted OpenSSL
+// server (abla/tls/hosted).
+//
+// A peer calls peerListen(), then loops on peerNext(), answering each request with
+// peerSend / peerClose / peerHold (all delays are relative to now, in milliseconds).
+// Reading a request releases every connection held by an earlier peerHold, like a
+// gate that opens when the next request arrives.
+import "abla/fs"
+import "abla/net/hosted"
+import "abla/process/time"
+import "abla/sys/linux"
+import "abla/sys/linux/net"
+import "abla/sys/linux/process"
+import "abla/text"
+import "abla/tls/hosted"
+
+class PeerRequest(val secure: bool, val id: int, val text: string, val path: string)
+
+val PEER_PLAIN_LISTENER: array<int> = [-1]
+val PEER_TLS_LISTENER: array<int> = [-1]
+val PEER_SECURE: array<bool> = []
+val PEER_ID: array<int> = []
+val PEER_DUE: array<int> = []
+val PEER_BYTES: array<string> = []
+val PEER_CLOSE: array<bool> = []
+val PEER_HELD: array<bool> = []
+val PEER_DONE: array<bool> = []
+
+// Listens on 127.0.0.1 (plain and TLS, ports chosen by the system) and publishes
+// "<plain port> <tls port>" by renaming a file into place. Returns false on failure.
+fun peerListen(readyFile: string, certificate: string, key: string): bool {
+    linuxBrokenPipeHold()
+    var plain = hostedTcpListen("127.0.0.1", 0, 16, false)
+    var tls = tlsListen(certificate, key, "127.0.0.1", 0, 16, false)
+    val plainPort = plain.localPort()
+    val tlsPort = tls.localPort()
+    var ready = plainPort > 0 && tlsPort > 0 && plain.setNonblocking() &&
+        linuxSocketSetNonblocking(tlsControlInt(tls.handle, 8), true)
+    if (ready) ready = Path(readyFile).writeTextAtomic("$plainPort $tlsPort\n")
+    if (ready) {
+        PEER_PLAIN_LISTENER[0] = plain.descriptor
+        PEER_TLS_LISTENER[0] = tls.handle
+        // The listeners live for the process; keep their drops from closing them.
+        plain.descriptor = -1
+        tls.handle = -1
+    }
+    ready
+}
+
+private fun peerEvent(request: PeerRequest, delay: int, bytes: string, close: bool, held: bool): void {
+    PEER_SECURE.append(request.secure)
+    PEER_ID.append(request.id)
+    PEER_DUE.append(linuxMonotonicMilliseconds() + delay)
+    PEER_BYTES.append(bytes)
+    PEER_CLOSE.append(close)
+    PEER_HELD.append(held)
+    PEER_DONE.append(false)
+    return
+}
+
+fun peerSend(request: PeerRequest, delay: int, bytes: string): void =
+    peerEvent(request, delay, bytes, false, false)
+
+fun peerClose(request: PeerRequest, delay: int): void =
+    peerEvent(request, delay, "", true, false)
+
+// Closes the connection after `delay`, or as soon as another request is read.
+fun peerHold(request: PeerRequest, delay: int): void =
+    peerEvent(request, delay, "", true, true)
+
+private fun peerSendNow(secure: bool, id: int, bytes: string): void {
+    if (bytes.size == 0) return
+    if (secure) {
+        var connection = TlsConnection(id)
+        connection.write(bytes)
+        connection.handle = -1
+    } else {
+        var socket = TcpConnection(id)
+        socket.writeResult(bytes)
+        socket.descriptor = -1
+    }
+    return
+}
+
+private fun peerCloseNow(secure: bool, id: int): void {
+    if (secure) {
+        var connection = TlsConnection(id)
+        connection.close()
+        connection.handle = -1
+    } else linuxTcpCloseDescriptor(id)
+    return
+}
+
+private fun peerRunDue(): void {
+    val now = linuxMonotonicMilliseconds()
+    var index = 0
+    while (index < PEER_DUE.size) {
+        if (!PEER_DONE[index] && PEER_DUE[index] <= now) {
+            if (PEER_CLOSE[index]) peerCloseNow(PEER_SECURE[index], PEER_ID[index])
+            else peerSendNow(PEER_SECURE[index], PEER_ID[index], PEER_BYTES[index])
+            PEER_DONE[index] = true
+        }
+        index = index + 1
+    }
+    return
+}
+
+private fun peerReleaseHeld(): void {
+    val now = linuxMonotonicMilliseconds()
+    var index = 0
+    while (index < PEER_DUE.size) {
+        if (!PEER_DONE[index] && PEER_HELD[index] && PEER_DUE[index] > now) PEER_DUE[index] = now
+        index = index + 1
+    }
+    return
+}
+
+// Reads what the client sends next on a connection (up to 4 s); "" on timeout or EOF.
+fun peerRead(secure: bool, id: int): string {
+    var text = ""
+    if (secure) {
+        var connection = TlsConnection(id)
+        text = connection.read(65536)
+        connection.handle = -1
+    } else {
+        var socket = HostedTcpConnection(id)
+        val outcome = socket.readNetwork(65536, 4000)
+        if (outcome.hasData()) text = outcome.bytes
+        socket.descriptor = -1
+    }
+    text
+}
+
+// The second word of the request line: "GET /path HTTP/1.1" -> "/path".
+fun peerPath(text: string): string {
+    val first = text.indexOf(" ")
+    val second = if (first < 0) -1 else text.indexOf(" ", first + 1)
+    if (first < 0 || second < 0) "" else text.slice(first + 1, second)
+}
+
+private fun peerAccepted(secure: bool, id: int): PeerRequest {
+    val text = peerRead(secure, id)
+    if (text.size == 0) {
+        peerCloseNow(secure, id)
+        return PeerRequest(secure, -1, "", "")
+    }
+    peerReleaseHeld()
+    PeerRequest(secure, id, text, peerPath(text))
+}
+
+// Runs due events and accepts connections until a client sends a request line.
+fun peerNext(): PeerRequest {
+    var found = PeerRequest(false, -1, "", "")
+    while (found.id < 0) {
+        peerRunDue()
+        val plain = linuxTcpAcceptDescriptor(PEER_PLAIN_LISTENER[0])
+        if (plain >= 0) found = peerAccepted(false, plain)
+        if (found.id < 0) {
+            var listener = TlsListener(PEER_TLS_LISTENER[0])
+            var connection = listener.accept(5000, 4000)
+            listener.handle = -1
+            val handle = connection.handle
+            connection.handle = -1
+            if (handle != -1) found = peerAccepted(true, handle)
+        }
+        if (found.id < 0 && plain < 0) sleep(2)
+    }
+    found
+}
