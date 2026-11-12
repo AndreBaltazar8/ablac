@@ -10,7 +10,7 @@ mkdir -p "$out"
 status=0
 "$out/facts" || status=$?
 [[ $status == 42 ]] || { echo "method facts failed: $status" >&2; exit 1; }
-for name in unrelated selected interface generic default-interface default-safe; do
+for name in unrelated selected interface generic default-interface default-safe field-unrelated field-called; do
     for tier in interp jit auto; do
         ABLA_COMPILE_EVAL=$tier ABLA_COMPILE_EVAL_TRACE=1 "$compiler" build \
             "tests/cases/compile-eval-method-targets/build-$name.ab" -o "$out/builder" --fast --no-cache \
@@ -22,11 +22,11 @@ for name in unrelated selected interface generic default-interface default-safe;
     cmp "$out/$name-interp.wasm" "$out/$name-auto.wasm"
 done
 for tier in jit auto; do
-    for name in unrelated selected interface generic default-interface default-safe; do
+    for name in unrelated selected interface generic default-interface default-safe field-unrelated field-called; do
         # Byte offset just past `val H = ` is where the compile-time call starts.
         marker=$(( $(grep -boa 'val H = #' "tests/cases/compile-eval-method-targets/$name.ab" | head -n 1 | cut -d: -f1) + 8 ))
         log="$out/$name-$tier.log"
-        if [[ $name == unrelated ]]; then
+        if [[ $name == unrelated || $name == field-unrelated ]]; then
             awk -v tail="$name.ab:$marker" 'index($0, "note[ct-jit]: native at ") == 1 && substr($0, length($0) - length(tail) + 1) == tail { found = 1 } END { exit !found }' "$log" \
                 || { cat "$log" >&2; echo "method targets: $name $tier was not native at $marker" >&2; exit 1; }
             ! grep -qF 'interpreted at' "$log" || { cat "$log" >&2; echo "method targets: $name $tier interpreted" >&2; exit 1; }
@@ -37,6 +37,8 @@ for tier in jit auto; do
                 || { cat "$log" >&2; echo "method targets: $name $tier needs exactly one interpreted note at $((marker + 1))" >&2; exit 1; }
             case $name in selected|generic)
                 [[ $hits == *'adoptNativeString:'* ]] || { echo "method targets: $name $tier lacks adoptNativeString" >&2; exit 1; } ;;
+            field-called)
+                [[ $hits == *'ablaUnsafeCopyMemory:'* ]] || { echo "method targets: $name $tier lacks ablaUnsafeCopyMemory" >&2; exit 1; } ;;
             esac
         fi
     done
@@ -50,9 +52,15 @@ const e = instance.exports;
 let digest = '';
 for (let i = 0; i < Number(e.resultSize()); ++i) digest += String.fromCharCode(Number(e.resultByte(BigInt(i))));
 assert.equal(digest, 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
-for (const [name, size] of [['selected',0],['interface',4],['generic',0],['default-interface',0],['default-safe',4]]) {
+{
+    const {instance} = await WebAssembly.instantiate(fs.readFileSync(`${out}/field-unrelated-jit.wasm`));
+    let field = '';
+    for (let i = 0; i < Number(instance.exports.resultSize()); ++i) field += String.fromCharCode(Number(instance.exports.resultByte(BigInt(i))));
+    assert.equal(field, 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
+}
+for (const [name, size] of [['selected',0],['interface',4],['generic',0],['default-interface',0],['default-safe',4],['field-called',3]]) {
     const {instance} = await WebAssembly.instantiate(fs.readFileSync(`${out}/${name}-jit.wasm`));
     assert.equal(Number(instance.exports.resultSize()), size);
 }
 NODE
-echo 'compile-time method targets: precise concrete reach, conservative dynamic reach and three-tier Wasm parity passed'
+echo 'compile-time method targets: precise concrete reach, field reads apart from methods, conservative dynamic reach and three-tier Wasm parity passed'
