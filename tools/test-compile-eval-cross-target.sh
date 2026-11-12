@@ -81,7 +81,7 @@ for mode in jit auto; do
     cmp "$out/floats-interp.wasm" "$out/floats-$mode.wasm"
     [[ $(grep -c 'interpreted at' "$out/floats-$mode.log") -eq 7 ]]
     ! grep -q 'native at .*[/]floats.ab:' "$out/floats-$mode.log"
-    grep -q 'interpreted at .*cross-target host runtime declaration collision: getpid' "$out/collision-$mode.log"
+    grep -q 'interpreted at .*cross-target host runtime declaration collision: write' "$out/collision-$mode.log"
     grep -q 'interpreted at .*cross-target implicit runtime dependency' "$out/implicit-$mode.log"
     # The probe, indirect call, builtin-looking user method, selected native
     # arm and raw pointer operation fall back. The skipped native arm, file

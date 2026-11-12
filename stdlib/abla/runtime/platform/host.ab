@@ -27,8 +27,9 @@ trusted noescape extern:"intrinsic" fun ablaLinuxSyscall(
 trusted noescape extern:"intrinsic" fun ablaSimdTargetArch(): int
 trusted noescape extern:"c" fun _exit(status: int): void
 trusted noescape extern:"c" fun _longjmp(buffer: i64*, value: int): void
-trusted noescape extern:"c" fun getenv(name: i64*): i64*
-trusted noescape extern:"c" fun getpid(): i32
+// The environment block main received (abla_runtime_set_arguments stores it first thing), so
+// the runtime reads its own variables without libc getenv.
+trusted noescape extern:"intrinsic" fun ablaLinuxEnvironmentPointer(): i64*
 trusted noescape extern:"c" fun pthread_mutex_init(
     mutex: i64*,
     attributes: i64*
@@ -1095,6 +1096,35 @@ trusted fun __ablaRuntimeHostCollectionPagesGrow(table: int, capacity: int): int
     grown
 }
 
+// The value of the environment variable `name` (a NUL-terminated string), or null: the first
+// "name=value" entry of the environment vector. The variables read here are looked up at
+// start, before any program code could change the environment.
+@noinline
+trusted fun __ablaRuntimeHostGetenv(name: i64*): i64* {
+    val wanted = ablaRuntimePointerAddress(name)
+    var cursor = ablaRuntimePointerAddress(ablaLinuxEnvironmentPointer())
+    if (cursor == 0) return ablaRuntimePointerFromAddress(0)
+    var entry = ablaRuntimeLoadI64(cursor)
+    while (entry != 0) {
+        var at = 0
+        var letter = ablaRuntimeLoadU8(wanted)
+        while (letter != 0 && ablaRuntimeLoadU8(entry + at) == letter) {
+            at = at + 1
+            letter = ablaRuntimeLoadU8(wanted + at)
+        }
+        if (letter == 0 && ablaRuntimeLoadU8(entry + at) == 61) {
+            return ablaRuntimePointerFromAddress(entry + at + 1)
+        }
+        cursor = cursor + 8
+        entry = ablaRuntimeLoadI64(cursor)
+    }
+    ablaRuntimePointerFromAddress(0)
+}
+
+// The calling process's id, by system call (a forked child has its own).
+@inline
+trusted fun __ablaRuntimeHostGetpid(): int = ablaLinuxSyscall(39, 0, 0, 0, 0, 0, 0)
+
 // The value of a hexadecimal digit, or -1.
 @inline
 trusted fun __ablaRuntimeHostHexDigit(byte: int): int =
@@ -1105,7 +1135,7 @@ trusted fun __ablaRuntimeHostHexDigit(byte: int): int =
 
 @noinline
 trusted fun __ablaRuntimeHostCollectionForceConfigured(): int {
-    val value = ablaRuntimePointerAddress(getenv(ablaRuntimePointerFromAddress(
+    val value = ablaRuntimePointerAddress(__ablaRuntimeHostGetenv(ablaRuntimePointerFromAddress(
         __ablaRuntimeWord0("ABLA_GC_LOOKUP")
     )))
     if (value == 0) return 0
@@ -1803,7 +1833,7 @@ trusted fun __ablaRuntimeHostFreeWait(): void {
     val state = __ablaRuntimeHostFreeState()
     if (ablaRuntimeLoadI64(state + 16) == 0) return
     ablaRuntimeStoreI64(state + 16, 0)
-    if (int(getpid()) == ablaRuntimeLoadI64(state + 24)) {
+    if (__ablaRuntimeHostGetpid() == ablaRuntimeLoadI64(state + 24)) {
         pthread_join(ablaRuntimeLoadI64(state + 8), ablaRuntimePointerFromAddress(0))
     }
     return
@@ -1822,7 +1852,7 @@ trusted fun __ablaRuntimeHostFreeStart(): void {
         ablaRuntimePointerFromAddress(batch)
     ) == 0) {
         ablaRuntimeStoreI64(state + 16, 1)
-        ablaRuntimeStoreI64(state + 24, int(getpid()))
+        ablaRuntimeStoreI64(state + 24, __ablaRuntimeHostGetpid())
     } else __ablaRuntimeHostFreeWorker(batch)
     return
 }
@@ -2036,7 +2066,7 @@ trusted fun __ablaRuntimeRootsUnlink(frame: int): int {
 @noinline
 trusted fun __ablaRuntimeHostGcGrowthConfigured(): int {
     // A literal's data word is its bytes and a NUL (bootstrapLlvmConstStringPointer).
-    val value = ablaRuntimePointerAddress(getenv(ablaRuntimePointerFromAddress(
+    val value = ablaRuntimePointerAddress(__ablaRuntimeHostGetenv(ablaRuntimePointerFromAddress(
         __ablaRuntimeWord0("ABLA_GC_GROWTH")
     )))
     if (value == 0) return 67108864
@@ -2059,7 +2089,7 @@ trusted fun __ablaRuntimeHostGcGrowthConfigured(): int {
 @noinline
 trusted fun __ablaRuntimeHostGcStressConfigured(): bool {
     // A literal's data word is its bytes and a NUL (bootstrapLlvmConstStringPointer).
-    val value = ablaRuntimePointerAddress(getenv(ablaRuntimePointerFromAddress(
+    val value = ablaRuntimePointerAddress(__ablaRuntimeHostGetenv(ablaRuntimePointerFromAddress(
         __ablaRuntimeWord0("ABLA_GC_STRESS")
     )))
     val stress = value != 0 && ablaRuntimeLoadU8(value) == 49 &&
