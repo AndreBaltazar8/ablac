@@ -1,0 +1,98 @@
+// The x86-64 system calls and structures the stdlib relies on, checked the same way on
+// every Linux target: on AArch64 (no open, stat, poll, dup2, fork, pipe, rename, mkdir,
+// unlink, utimes ...) the backend's abla_x64_syscall translates them (#811), so this
+// program must exit 42 natively and under qemu-aarch64 alike.
+import "abla/sys/linux"
+import "abla/unsafe/memory"
+
+trusted fun word32(buffer: NativeByteBuffer, offset: int): int =
+    buffer.load(offset) + buffer.load(offset + 1) * 256 + buffer.load(offset + 2) * 65536 +
+    buffer.load(offset + 3) * 16777216
+
+trusted fun path(text: string): int = nativeCStringAddress(text)
+
+trusted fun check(): int {
+    val buffer = nativeByteBuffer(256)
+    val directory = path("legacy-syscall-directory")
+    val file = path("legacy-syscall-directory/file")
+    val moved = path("legacy-syscall-directory/moved")
+    // Clean up an earlier failed run.
+    linuxSyscall1(87, moved)
+    linuxSyscall1(87, file)
+    linuxSyscall1(84, directory)
+    if (linuxSyscall2(83, directory, 0o755) != 0) return 1
+    // O_DIRECTORY (0x10000) and O_NOFOLLOW (0x20000) are different bits on AArch64.
+    val directoryDescriptor = linuxSyscall3(2, directory, 0x10000, 0)
+    if (directoryDescriptor < 0) return 2
+    linuxSyscall1(3, directoryDescriptor)
+    if (linuxSyscall3(2, directory, 0x20000, 0) < 0) return 3
+    // A file: O_WRONLY | O_CREAT | O_TRUNC.
+    val descriptor = linuxSyscall3(2, file, 0x241, 0o644)
+    if (descriptor < 0) return 4
+    buffer.store(0, 104)
+    buffer.store(1, 105)
+    buffer.store(2, 33)
+    if (linuxSyscall3(1, descriptor, nativePointerAddress(buffer.address), 3) != 3) return 5
+    linuxSyscall1(3, descriptor)
+    // stat: the x86-64 layout (nlink at 16, mode at 24, size at 48).
+    if (linuxSyscall2(4, file, nativePointerAddress(buffer.address)) != 0) return 6
+    val mode = word32(buffer, 24)
+    if (mode / 4096 != 8) return 7
+    if (buffer.loadI64(16) != 1) return 8
+    if (buffer.loadI64(48) != 3) return 9
+    if (linuxSyscall2(6, directory, nativePointerAddress(buffer.address)) != 0) return 10
+    if (word32(buffer, 24) / 4096 != 4) return 11
+    val opened = linuxSyscall3(2, file, 0, 0)
+    if (linuxSyscall2(5, opened, nativePointerAddress(buffer.address)) != 0) return 12
+    if (buffer.loadI64(48) != 3) return 13
+    linuxSyscall1(3, opened)
+    // utimes(path, {atime, mtime}): whole seconds and microseconds.
+    buffer.storeI64(0, 1000000000)
+    buffer.storeI64(8, 5)
+    buffer.storeI64(16, 1500000000)
+    buffer.storeI64(24, 7)
+    if (linuxSyscall2(235, file, nativePointerAddress(buffer.address)) != 0) return 14
+    if (linuxSyscall2(4, file, nativePointerAddress(buffer.address)) != 0) return 15
+    if (buffer.loadI64(88) != 1500000000) return 16
+    // rename, access, unlink.
+    if (linuxSyscall2(82, file, moved) != 0) return 17
+    if (linuxSyscall2(4, file, nativePointerAddress(buffer.address)) != -2) return 18
+    if (linuxSyscall2(21, moved, 0) != 0) return 19
+    if (linuxSyscall3(89, moved, nativePointerAddress(buffer.address), 64) != -22) return 20
+    if (linuxSyscall1(87, moved) != 0) return 21
+    if (linuxSyscall1(84, directory) != 0) return 22
+    // pipe, dup2, poll.
+    if (linuxSyscall1(22, nativePointerAddress(buffer.address)) != 0) return 23
+    val reader = word32(buffer, 0)
+    val writer = word32(buffer, 4)
+    if (linuxSyscall2(33, reader, 100) != 100) return 24
+    if (linuxSyscall2(33, 100, 100) != 100) return 25
+    // pollfd {fd, events POLLIN, revents}: nothing to read, then one byte.
+    val fds = nativeByteBuffer(8)
+    fds.storeI64(0, 100 + 1 * 4294967296)
+    if (linuxSyscall3(7, nativePointerAddress(fds.address), 1, 0) != 0) return 26
+    buffer.store(0, 120)
+    if (linuxSyscall3(1, writer, nativePointerAddress(buffer.address), 1) != 1) return 27
+    if (linuxSyscall3(7, nativePointerAddress(fds.address), 1, 1000) != 1) return 28
+    if (fds.load(6) % 2 != 1) return 29
+    fds.close()
+    linuxSyscall1(3, 100)
+    linuxSyscall1(3, reader)
+    linuxSyscall1(3, writer)
+    // fork and wait4.
+    val child = linuxSyscall0(57)
+    if (child == 0) linuxSyscall1(60, 7)
+    if (child < 0) return 30
+    val status = nativeByteBuffer(8)
+    status.storeI64(0, 0)
+    if (linuxSyscall4(61, child, nativePointerAddress(status.address), 0, 0) != child) return 31
+    if (status.loadI64(0) != 7 * 256) return 32
+    status.close()
+    buffer.close()
+    0
+}
+
+fun main: int {
+    val result = check()
+    if (result == 0) 42 else result
+}
