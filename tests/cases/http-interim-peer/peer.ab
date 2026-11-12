@@ -1,0 +1,50 @@
+// Raw socket peer for tools/test-http-interim.sh: interim (1xx) responses, repeated
+// and split across writes, a final response after them, 101, a connection reused for
+// a second request, and a count of the /incomplete requests it has seen. Every HTTP
+// byte is a literal here; tests/cases/peer-support/scheduler.ab only moves them.
+// Arguments: <ready file> <certificate> <key> [wrong], where "wrong" reports one
+// request too many from /counts (a control: the client must then fail).
+import "abla/process/arguments"
+import "../peer-support/scheduler.ab"
+
+fun main: int {
+    val wrong = processArgumentCount() > 3 && processArgument(3) == "wrong"
+    if (!peerListen(processArgument(0), processArgument(1), processArgument(2))) return 1
+    var incomplete = 0
+    while (true) {
+        val request = peerNext()
+        val path = request.path
+        if (path == "/reuse") {
+            peerSend(request, 0, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            peerFlush()
+            val next = peerRead(request.secure, request.id)
+            if (peerPath(next) == "/incomplete") {
+                incomplete = incomplete + 1
+                peerSend(request, 0, "HTTP/1.1 100 Continue\r\n\r\n")
+            }
+            peerClose(request, 0)
+        } else if (path == "/switch") {
+            peerSend(request, 0, "HTTP/1.1 101 Switching Protocols\r\n\r\n")
+            peerClose(request, 0)
+        } else if (path == "/incomplete") {
+            incomplete = incomplete + 1
+            peerSend(request, 0, "HTTP/1.1 100 Continue\r\n\r\n")
+            peerClose(request, 0)
+        } else if (path == "/counts") {
+            val body = "${if (wrong) incomplete + 1 else incomplete}"
+            peerSend(request, 0, "HTTP/1.1 200 OK\r\nContent-Length: ${body.size}\r\n\r\n$body")
+            peerClose(request, 0)
+        } else {
+            peerSend(request, 0, "HTTP/1.1 100 Continue\r\n\r\n".repeat(20) + "HTTP/1.1 103 Early Hints\r\nX-")
+            peerSend(request, 100, "Second: yes\r\n\r\n")
+            if (path == "/head" || path == "/async-head") {
+                peerSend(request, 200, "HTTP/1.1 200 OK\r\nContent-Length: 999\r\nConnection: close\r\n\r\n")
+                peerClose(request, 1700)
+            } else {
+                peerSend(request, 200, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nfinal")
+                peerClose(request, 200)
+            }
+        }
+    }
+    0
+}
