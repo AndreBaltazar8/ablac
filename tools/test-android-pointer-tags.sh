@@ -10,7 +10,7 @@ sysroot=${ABLA_SYSROOT:-$root}
 cd "$root"
 out=${ABLA_TAGGED_POINTERS_OUT:-$root/build/android-pointer-tags}
 mkdir -p "$out"
-python3 -I tests/cases/android-pointer-tags/prepare.py "$root" "$sysroot" "$out"
+bash tests/cases/android-pointer-tags/prepare.sh "$root" "$sysroot" "$out"
 failures=0
 run_case() {
     local name=$1 expected=$2 status=0
