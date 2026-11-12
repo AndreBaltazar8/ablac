@@ -359,6 +359,13 @@
 
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
+- [ ] **Published Linux compiler portability.** The standalone x86-64 compiler assets in v0.2.54,
+  v0.2.55 and v0.2.56 require GLIBC_2.38 and request a specific `/nix/store/.../ld-linux-x86-64.so.2`
+  interpreter; the compiler in the v0.2.56 toolchain archive also requires GLIBC_2.38 but uses
+  `/lib64/ld-linux-x86-64.so.2`. README documents glibc 2.38 for the toolchain archive; it does not
+  explicitly state the standalone binary's Nix-store interpreter requirement. Investigate and document
+  standalone use and older Linux compatibility separately from the installer probe.
+
 - [ ] **Abla-native Xtensa companion installer.** The explicit optional installer uses only the Python
   standard library until `abla/compression` can inflate gzip and read tar with bounded, safe extraction.
   Move it to Abla once those archive primitives exist; keep checksum and manifest verification. `gzipDecompress`
@@ -400,6 +407,9 @@
   release-packaged installer, download, activation and helper execution remain open.
   The offline test previously left published 0555 directories in build/, preventing ordinary clean and
   worktree removal; its exit trap restores owner write permission even when a case fails.
+  The manual installed-toolchain probe used to exercise only the Python installer; its native matrix now
+  builds a candidate release package with the checksum-pinned published compiler and runs the same real
+  companion, codegen and tamper checks against the unchanged v0.2.48 integration parent.
 - [x] `abla/yaml` provides bounded Core-schema parsing, checked emission and comment/format-preserving path edits;
       see [docs/stdlib/yaml.md](docs/stdlib/yaml.md) and the synthetic provision-mail fixture. NovaKind can adopt it after release.
 

@@ -34,7 +34,11 @@ def main():
     parser.add_argument('output', type=Path)
     parser.add_argument('--unpublished-fixture', type=Path)
     parser.add_argument('--archive', type=Path)
+    parser.add_argument('--native', action='store_true', help='test the separately packaged native installer')
+    parser.add_argument('--native-package', type=Path, help='candidate toolchain archive built with the pinned compiler')
     args = parser.parse_args()
+    if args.native != bool(args.native_package):
+        parser.error('--native and --native-package must be supplied together')
     if bool(args.unpublished_fixture) != bool(args.archive):
         parser.error('--unpublished-fixture and --archive must be used together')
     output = args.output.absolute()
@@ -70,12 +74,23 @@ def main():
     roots[0].rename(root)
     originals = snapshot(root)
     run('bash', Path(__file__).with_name('package-xtensa-installer.sh'), root)
-    installer = root / 'bin/abla-install-xtensa'
+    if args.native:
+        candidate = output / 'native-package'
+        candidate.mkdir()
+        run('tar', '-xzf', args.native_package.absolute(), '-C', candidate)
+        candidates = list(candidate.iterdir())
+        if len(candidates) != 1 or not (candidates[0] / 'bin/abla-install-xtensa-native').is_file():
+            raise ValueError('unexpected candidate package layout')
+        installer = candidates[0] / 'bin/abla-install-xtensa-native'
+        command = [str(installer), '--toolchain-root', str(root)]
+    else:
+        installer = root / 'bin/abla-install-xtensa'
+        command = [sys.executable, str(installer)]
     version = '23.1.3-1'
     archive_args = ['--archive', str(args.archive.absolute())] if args.archive else []
-    run(sys.executable, installer, *catalog_args, '--version', version, *archive_args)
-    run(sys.executable, installer, *catalog_args, '--verify')
-    run(sys.executable, installer, *catalog_args, '--version', version, *archive_args)
+    run(*command, *catalog_args, '--version', version, *archive_args)
+    run(*command, *catalog_args, '--verify')
+    run(*command, *catalog_args, '--version', version, *archive_args)
     after = snapshot(root)
     for name, value in originals.items():
         if after.get(name) != value:
@@ -113,9 +128,10 @@ def main():
         os.utime(library, ns=(info.st_atime_ns, info.st_mtime_ns))
         assert library.stat().st_size == info.st_size
         assert library.stat().st_mtime_ns == info.st_mtime_ns
-        negative = subprocess.run([sys.executable, str(installer), *catalog_args, '--verify'],
+        negative = subprocess.run([*command, *catalog_args, '--verify'],
                                   capture_output=True, text=True, timeout=120)
-        if negative.returncode != 1 or 'file SHA-256 mismatch' not in negative.stderr:
+        expected_error = 'file_hash' if args.native else 'file SHA-256 mismatch'
+        if negative.returncode != 1 or expected_error not in negative.stderr:
             raise ValueError('stat-preserved DSO corruption was not rejected: ' + repr(negative))
         (output / 'tamper-negative.txt').write_text(negative.stderr)
     finally:
@@ -125,10 +141,12 @@ def main():
                 stream.write(original)
         os.utime(library, ns=(info.st_atime_ns, info.st_mtime_ns))
         library.chmod(info.st_mode & 0o777)
-    run(sys.executable, installer, *catalog_args, '--verify')
+    run(*command, *catalog_args, '--verify')
     if any(root.rglob('__pycache__')):
         raise ValueError('installer wrote Python caches into the toolchain')
-    report = {'platform': host, 'parentVersion': fixture['version'], 'version': version,
+    report = {'installer': 'native' if args.native else 'python',
+              'nativePackageSha256': companions.file_sha256(args.native_package) if args.native else None,
+              'platform': host, 'parentVersion': fixture['version'], 'version': version,
               'unchangedParentFiles': len(originals), 'statPreservedDsoTamperRejected': True,
               'codegen': actual, 'status': 'passed', 'unpublishedTestFixture': bool(args.unpublished_fixture)}
     (output / 'result.json').write_text(json.dumps(report, indent=2) + '\n')

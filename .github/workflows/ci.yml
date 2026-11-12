@@ -360,19 +360,19 @@ jobs:
 
   xtensa-companion-install:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.xtensa_companion_install_probe }}
-    name: Optional Xtensa installer (${{ matrix.runner }})
+    name: Optional Xtensa installer (${{ matrix.runner }}, ${{ matrix.installer }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-24.04
-            platform: x86_64-linux
-          - runner: macos-15
-            platform: arm64-macos
-          - runner: macos-15-intel
-            platform: x86_64-macos
+          - {runner: ubuntu-24.04, platform: x86_64-linux, installer: python}
+          - {runner: ubuntu-24.04, platform: x86_64-linux, installer: native}
+          - {runner: macos-15, platform: arm64-macos, installer: python}
+          - {runner: macos-15, platform: arm64-macos, installer: native}
+          - {runner: macos-15-intel, platform: x86_64-macos, installer: python}
+          - {runner: macos-15-intel, platform: x86_64-macos, installer: native}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 15
+    timeout-minutes: 40
     permissions:
       contents: read
       actions: read
@@ -384,6 +384,7 @@ jobs:
         run: |
           python3 tools/test-xtensa-catalog.py
           python3 tools/test-xtensa-installer.py
+          python3 tests/cases/xtensa-install-probe/report-test.py
       - name: Check the canonical catalog against published checksums
         if: ${{ !inputs.xtensa_companion_unpublished_fixture }}
         run: python3 tools/xtensa_companions.py --check
@@ -396,22 +397,41 @@ jobs:
           name: companion-${{ matrix.platform }}
           github-token: ${{ github.token }}
           path: build/UNPUBLISHED-cohort
+      - name: Install native build dependencies on macOS
+        if: ${{ matrix.installer == 'native' && runner.os == 'macOS' }}
+        run: |
+          brew update
+          brew install --force-bottle llvm@23 lld@23 openssl@3 binaryen
+          echo "$(brew --prefix llvm@23)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix lld@23)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
+      - name: Install native build dependencies on Linux
+        if: ${{ matrix.installer == 'native' && runner.os == 'Linux' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends patchelf libssl-dev gcc libc6-dev
+      - name: Build the native candidate with the pinned published compiler
+        if: ${{ matrix.installer == 'native' }}
+        run: tools/build-xtensa-native-probe-package.sh
       - name: Install into the published parent without replacing its LLVM or Clang
         env:
           USE_UNPUBLISHED: ${{ inputs.xtensa_companion_unpublished_fixture }}
+          INSTALLER: ${{ matrix.installer }}
         run: |
+          native=()
+          if [[ "$INSTALLER" == native ]]; then native=(--native --native-package build/native-probe-package/candidate.tar.gz); fi
           if [[ "$USE_UNPUBLISHED" == true ]]; then
-            python3 tools/test-xtensa-installed.py build/xtensa-installed \
+            python3 tools/test-xtensa-installed.py build/xtensa-installed "${native[@]}" \
               --unpublished-fixture tools/fixtures/xtensa-companion-unpublished.json \
               --archive "$(find build/UNPUBLISHED-cohort -maxdepth 1 -name '*.tar.gz' -print)"
           else
-            python3 tools/test-xtensa-installed.py build/xtensa-installed
+            python3 tools/test-xtensa-installed.py build/xtensa-installed "${native[@]}"
           fi
       - name: Retain exact codegen and installation results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: xtensa-installed-${{ matrix.runner }}
+          name: xtensa-installed-${{ matrix.runner }}-${{ matrix.installer }}
           path: |
             build/xtensa-installed/result.json
             build/xtensa-installed/tamper-negative.txt
@@ -419,6 +439,28 @@ jobs:
             build/xtensa-installed/*.o
           retention-days: 7
           if-no-files-found: ignore
+
+  xtensa-companion-install-report:
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.xtensa_companion_install_probe }}
+    needs: xtensa-companion-install
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
+        with:
+          pattern: xtensa-installed-*
+          path: build/xtensa-install-results
+      - name: Compare both installers on all three hosts
+        run: python3 tools/report-xtensa-install-probe.py build/xtensa-install-results build/xtensa-install-comparison.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: xtensa-installed-comparison
+          path: build/xtensa-install-comparison.json
+          retention-days: 7
+          if-no-files-found: warn
 
   xtensa-companion-routing:
     if: ${{ github.event_name == 'workflow_dispatch' && (inputs.xtensa_companion_routing_probe || inputs.xtensa_companion_embedded_probe) }}
