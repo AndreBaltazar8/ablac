@@ -8,6 +8,10 @@
 # comparison is byte for byte (diff), not a parse of either side.
 # Usage: check.sh PROBE OUTPUT-DIRECTORY
 set -euo pipefail
+# A hung probe must not stall the suite: run each under `timeout 5` where it
+# exists (Linux). macOS has no timeout and runs the probes unguarded.
+guard=()
+if command -v timeout >/dev/null 2>&1; then guard=(timeout 5); fi
 probe=$1
 output=$2
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -20,8 +24,9 @@ count=0
 while IFS= read -r name; do
     source=$here/corpus/$name.yaml
     count=$((count + 1))
-    out=$("$probe" "$source"; echo "status=$?")
+    out=$(${guard[@]+"${guard[@]}"} "$probe" "$source"; echo "status=$?")
     status=${out##*status=}; out=${out%status=*}
+    [[ $status != 124 ]] || { echo "probe timed out on $source" >&2; exit 1; }
     case $out in
     '["error",'*) [[ $status == 1 ]] && out=error ;;
     esac
@@ -32,8 +37,10 @@ while IFS= read -r name; do
     [[ $status == 0 ]] || out="exit $status: $out"
     printf '%s' "$out" >> "$output/actual.txt"
     for style in block flow; do
-        out=$("$probe" "$source" "$style"; echo "status=$?")
+        out=$(${guard[@]+"${guard[@]}"} "$probe" "$source" "$style"; echo "status=$?")
         status=${out##*status=}; out=${out%status=*}
+        [[ $status != 124 ]] || { echo "probe timed out on $source" >&2; exit 1; }
+    [[ $status != 124 ]] || { echo "probe timed out on $source" >&2; exit 1; }
         [[ $status == 0 ]] || out="exit $status: $out"
         printf '%s' "$out" >> "$output/actual-$style.txt"
     done

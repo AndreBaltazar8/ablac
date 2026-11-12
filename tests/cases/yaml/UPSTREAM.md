@@ -19,3 +19,17 @@ parse any JSON. edit/NNN.json are the editing specs and edit-expected.txt the
 canonical output of each (text and rollback cases from the former
 edit-fixtures.json; the `-value` cases and two plain ones also pin the output
 of the current editor).
+
+Regenerating or extending without Python: put the new source in
+corpus/NAME.yaml and add NAME to corpus.list; run `probe corpus/NAME.yaml`
+and, after checking the line against the upstream event stream (or write
+`error` for a case that must be rejected), insert it at the same position of
+expected.txt. For an edit case add edit/NNN.json (`{"name","source","ops"}`,
+one line, in the name order) and take its expected line(s) from
+`edit-probe edit/NNN.json` (add `value` as the second argument for a
+`NNN-value.json` case). Implementation goldens, not derived from upstream or
+from a stated text: every line for the `-value` specs (60: full text and
+value) and the two plain cases with no expected text (flow-comment-insert,
+root-empty-anchor). The other edit lines (text and rollback cases) are the
+text that the former fixtures stated. Check any regenerated line by hand
+before committing it.
