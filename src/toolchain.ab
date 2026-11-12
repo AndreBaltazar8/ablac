@@ -173,6 +173,22 @@ fun bootstrapLinkCommand(linker: string): LinuxCommand {
     command
 }
 
+// The NDK's compiler-rt builtins archive for aarch64 Android, or "": an Android library that has a thread-local
+// refers to __emutls_get_address (API 24 has no ELF TLS in a dlopen'd library), which bionic does not export and only
+// this archive defines. ABLA_ANDROID_BUILTINS names the archive itself; otherwise the NDK is looked for in
+// ABLA_ANDROID_NDK, ANDROID_NDK_ROOT, ANDROID_NDK_HOME and under ANDROID_HOME and ANDROID_SDK_ROOT (ndk/<version>,
+// ndk-bundle), the newest version winning.
+fun bootstrapAndroidBuiltins(): string {
+    val finder = linuxCommand("sh")
+    finder.argument("-c")
+    finder
+        .argument("if [ -n \"\$ABLA_ANDROID_BUILTINS\" ]; then [ -f \"\$ABLA_ANDROID_BUILTINS\" ] && echo \"\$ABLA_ANDROID_BUILTINS\"; exit 0; fi; for r in \"\$ABLA_ANDROID_NDK\" \"\$ANDROID_NDK_ROOT\" \"\$ANDROID_NDK_HOME\" \"\$ANDROID_HOME/ndk\" \"\$ANDROID_SDK_ROOT/ndk\" \"\$ANDROID_HOME/ndk-bundle\" \"\$ANDROID_SDK_ROOT/ndk-bundle\"; do [ -n \"\$r\" ] && [ -d \"\$r\" ] && find -L \"\$r\" -name libclang_rt.builtins-aarch64-android.a 2>/dev/null; done | sort -V | tail -n 1")
+    var text = finder.captureText()
+    var end = text.size
+    while (end > 0 && (text[end - 1] == 10 || text[end - 1] == 13)) end = end - 1
+    text.slice(0, end)
+}
+
 // A Linux link runs the `ld.lld` that clang would run, without clang. Through a Nix shell's
 // clang, a small program's link was 60 ms of 330: the wrapper's shell script and clang's own
 // start, ahead of 13 ms of linking. The first link asks clang (`-###`) for the command it
@@ -4572,6 +4588,18 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         linkShared.argument("-m")
         linkShared.argument(target.linkerEmulation)
         linkShared.argument(objectPath)
+        // An aarch64 Android library takes __emutls_get_address from the NDK's builtins (see above); the archive
+        // follows the object so that only the members the object needs are pulled.
+        if (bootstrapTextContains(target.llvmTriple, "aarch64") &&
+            bootstrapTextContains(target.llvmTriple, "android")) {
+            val builtins = bootstrapAndroidBuiltins()
+            if (builtins != "") linkShared.argument(builtins)
+            else if (bootstrapBuildVerbose) {
+                linuxPrintStandardError(
+                    "note: no Android NDK found (set ABLA_ANDROID_NDK): the library's thread-locals need __emutls_get_address from its compiler-rt builtins\n"
+                )
+            }
+        }
         linkShared.argument("-o")
         linkShared.argument(publishPath)
         status = linkShared.run()

@@ -357,6 +357,7 @@ test-serial: ablac
 	tools/test-wasm-export-roots.sh $(COMPILER)
 	tools/test-repl.sh $(COMPILER)
 	tools/test-android-extension.sh $(COMPILER)
+	tools/test-android-link.sh $(COMPILER)
 	tools/test-android-rpc-example.sh $(COMPILER)
 	tools/test-hot-reload.sh $(COMPILER)
 	tools/test-orc-session.sh $(COMPILER)
