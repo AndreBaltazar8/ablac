@@ -655,6 +655,7 @@ it to an `own` parameter or assigning it reports
 `ownership.place-owner` ([test](../tests/cases/drop-temporaries/affine-projection-refused.ab)).
 
 ```abla error
+resource class Item
 resource class Holder(val item: Item)
 fun bind(): void { val x = Holder(Item()).item }
 // error: ownership.place-move-required:local.x
@@ -664,6 +665,7 @@ Adding `move` does not make a temporary field a movable place
 ([same test](../tests/cases/drop-temporaries/affine-projection-refused.ab)).
 
 ```abla error
+resource class Item
 resource class Holder(val item: Item)
 fun moved(): void { val x = move(Holder(Item()).item) }
 // error: ownership.place-owner
@@ -688,6 +690,7 @@ escape is `ownership.borrow-escape`
 
 ```abla error
 resource class Item(val id: int)
+resource class Holder(val item: Item)
 fun view(x: Item = Holder(Item(1)).item): borrow(x) Item = x
 // error: ownership.borrow-return-source-default
 ```
@@ -696,6 +699,7 @@ Capturing that borrowed default parameter in a suspended generator is refused;
 the task form is checked too ([test](../tests/cases/default-temporary-owner/refused-capture.ab)).
 
 ```abla error
+resource class Item(val id: int)
 resource class Holder(val item: Item) { fun drop(): void {} }
 fun produce(x: Item = Holder(Item(1)).item): Generator<int> = generator { yield x.id }
 // error: ownership.borrow-capture
@@ -705,6 +709,8 @@ Storing it in an owning global array is refused
 ([test](../tests/cases/default-temporary-owner/refused-store.ab)).
 
 ```abla error
+resource class Item(val id: int)
+resource class Holder(val item: Item)
 var stored: array<Item> = []
 fun save(x: Item = Holder(Item(1)).item): void { stored.append(x) }
 // error: ownership.borrow-escape
