@@ -264,6 +264,8 @@
 
 - **Conditional method receivers (#800).** A fresh affine receiver selected by an `if`, `when`, or block is held
   until its statement ends, in native and compile-time execution. Previously it leaked on both tiers.
+- **Nullable borrowed arguments (#804).** A fresh resource selected by `??` and passed to a borrowing parameter
+  now drops at the end of the calling statement; previously either selected arm could leak.
 - **Discarded affine containers at compile time (#801).** A discarded fresh array or map containing resources is
   now dropped by the evaluator, matching native execution; its elements' destructors therefore run.
 - **Loops over temporary map views (#801).** A fresh or moved map behind `values()` or `keys()` is held until
