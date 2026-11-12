@@ -149,7 +149,8 @@ fun bootstrapLlvmAarch64OpenFlags(): string =
 fun bootstrapLlvmEmitAarch64Routines(backend: BootstrapLlvmBackend): void {
     val assembly = bootstrapLlvmAarch64SyscallAssembly() + bootstrapLlvmAarch64StartAssembly() +
         bootstrapLlvmAarch64JumpAssembly() +
-        bootstrapLlvmAarch64MemoryAssembly()
+        bootstrapLlvmAarch64MemoryAssembly() +
+        bootstrapLlvmAarch64ThreadAssembly()
     LLVMAppendModuleInlineAsm(backend.module, assembly, assembly.size)
     return
 }
@@ -163,6 +164,10 @@ fun bootstrapLlvmEmitAarch64Routines(backend: BootstrapLlvmBackend): void {
 // main(argc, argv, envp) and exits with its status.
 fun bootstrapLlvmAarch64StartAssembly(): string {
     ".text\n.p2align 2\n" +
+    ".pushsection .bss\n.p2align 3\n" +
+    ".globl abla_start_phdr\n.globl abla_start_phnum\n" +
+    "abla_start_phdr: .zero 8\nabla_start_phnum: .zero 8\n" +
+    ".popsection\n" +
     ".globl abla_start\n.hidden abla_start\n.type abla_start,@function\n" +
     "abla_start:\n" +
     "    mov x29, #0\n    mov x30, #0\n" +
@@ -177,24 +182,15 @@ fun bootstrapLlvmAarch64StartAssembly(): string {
     "    cmp x0, #3\n    csel x24, x1, x24, eq\n" +
     "    cmp x0, #5\n    csel x25, x1, x25, eq\n" +
     "    b 2b\n" +
-    // x26 = the PT_TLS program header, or 0.
-    "3:  mov x26, #0\n    mov x0, x24\n    mov x1, x25\n" +
-    "4:  cbz x1, 5f\n    ldr w2, [x0]\n    cmp w2, #7\n    csel x26, x0, x26, eq\n" +
-    "    add x0, x0, #56\n    sub x1, x1, #1\n    b 4b\n" +
-    // x27 = alignment (at least 16), x28 = offset of the image from the thread pointer.
-    "5:  mov x27, #16\n    cbz x26, 6f\n    ldr x2, [x26, #48]\n    cmp x2, x27\n    csel x27, x2, x27, hi\n" +
-    "6:  sub x9, x27, #1\n    add x28, x9, #16\n    bic x28, x28, x9\n" +
-    // mmap(0, offset + memsz + 4096 rounded up, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
-    "    mov x1, x28\n    cbz x26, 7f\n    ldr x2, [x26, #40]\n    add x1, x1, x2\n" +
-    "7:  add x1, x1, #4095\n    add x1, x1, #4096\n    lsr x1, x1, #12\n    lsl x1, x1, #12\n" +
-    "    mov x0, #0\n    mov x2, #3\n    mov x3, #0x22\n    mov x4, #-1\n    mov x5, #0\n    mov x8, #222\n    svc #0\n" +
+    "3:  adrp x9, abla_start_phdr\n    str x24, [x9, :lo12:abla_start_phdr]\n" +
+    "    adrp x9, abla_start_phnum\n    str x25, [x9, :lo12:abla_start_phnum]\n" +
+    // The main thread's TLS block: mapped here, never unmapped.
+    "    mov x0, x24\n    mov x1, x25\n    bl abla_tls_bytes\n" +
+    "    tbnz x0, #63, 99f\n" +
+    "    mov x1, x0\n    mov x0, #0\n    mov x2, #3\n    mov x3, #0x22\n    mov x4, #-1\n    mov x5, #0\n    mov x8, #222\n    svc #0\n" +
     "    cmn x0, #4095\n    b.hs 99f\n" +
-    "    mov x9, x0\n" +
-    // The block is page aligned: a larger alignment would need a bigger mapping.
-    "    cbz x26, 9f\n" +
-    "    ldr x10, [x26, #16]\n    ldr x11, [x26, #32]\n    add x12, x9, x28\n" +
-    "8:  cbz x11, 9f\n    ldrb w13, [x10], #1\n    strb w13, [x12], #1\n    sub x11, x11, #1\n    b 8b\n" +
-    "9:  msr tpidr_el0, x9\n" +
+    "    mov x1, x24\n    mov x2, x25\n    bl abla_tls_init\n" +
+    "    msr tpidr_el0, x0\n" +
     // init_array, when the linker made one.
     "    .weak __init_array_start\n    .weak __init_array_end\n" +
     "    ldr x9, 12f\n    ldr x10, 13f\n" +
@@ -204,7 +200,33 @@ fun bootstrapLlvmAarch64StartAssembly(): string {
     "    mov x8, #94\n    svc #0\n" +
     "99: mov x0, #127\n    mov x8, #94\n    svc #0\n" +
     ".p2align 3\n12: .quad __init_array_start\n13: .quad __init_array_end\n" +
-    ".size abla_start, . - abla_start\n"
+    ".size abla_start, . - abla_start\n" +
+    // abla_tls_bytes(phdr, phnum): the bytes of one thread's TLS block (a page for the thread
+    // control block, the image after it at its alignment, rounded to a page), or -1.
+    ".p2align 2\n.globl abla_tls_bytes\n.hidden abla_tls_bytes\n.type abla_tls_bytes,@function\n" +
+    "abla_tls_bytes:\n" +
+    "    mov x2, #0\n" +
+    "1:  cbz x1, 2f\n    ldr w3, [x0]\n    cmp w3, #7\n    csel x2, x0, x2, eq\n    add x0, x0, #56\n    sub x1, x1, #1\n    b 1b\n" +
+    "2:  mov x3, #16\n    mov x4, #0\n    cbz x2, 3f\n    ldr x5, [x2, #48]\n    cmp x5, x3\n    csel x3, x5, x3, hi\n    ldr x4, [x2, #40]\n" +
+    "3:  cmp x3, #4096\n    b.hi 4f\n" +
+    "    sub x5, x3, #1\n    add x6, x5, #16\n    bic x6, x6, x5\n" +
+    "    add x0, x6, x4\n    add x0, x0, #4095\n    add x0, x0, #4096\n    and x0, x0, #-4096\n    ret\n" +
+    "4:  mov x0, #-1\n    ret\n" +
+    ".size abla_tls_bytes, . - abla_tls_bytes\n" +
+    // abla_tls_init(buffer, phdr, phnum): the thread pointer for a zeroed, page-aligned buffer
+    // of abla_tls_bytes: the image is copied to the offset the linker laid out for it (the
+    // buffer itself is the 16-byte thread control block).
+    ".p2align 2\n.globl abla_tls_init\n.hidden abla_tls_init\n.type abla_tls_init,@function\n" +
+    "abla_tls_init:\n" +
+    "    mov x9, x0\n    mov x3, #0\n" +
+    "1:  cbz x2, 2f\n    ldr w4, [x1]\n    cmp w4, #7\n    csel x3, x1, x3, eq\n    add x1, x1, #56\n    sub x2, x2, #1\n    b 1b\n" +
+    "2:  cbz x3, 9f\n" +
+    "    mov x4, #16\n    ldr x5, [x3, #48]\n    cmp x5, x4\n    csel x4, x5, x4, hi\n" +
+    "    sub x5, x4, #1\n    add x6, x5, #16\n    bic x6, x6, x5\n" +
+    "    ldr x10, [x3, #16]\n    ldr x11, [x3, #32]\n    add x12, x9, x6\n" +
+    "3:  cbz x11, 9f\n    ldrb w13, [x10], #1\n    strb w13, [x12], #1\n    sub x11, x11, #1\n    b 3b\n" +
+    "9:  mov x0, x9\n    ret\n" +
+    ".size abla_tls_init, . - abla_tls_init\n"
 }
 
 // _setjmp and _longjmp for AArch64 Linux, in a format of their own (nothing else reads a
@@ -276,4 +298,67 @@ fun bootstrapLlvmAarch64MemoryAssembly(): string {
     "1:  ldrb w2, [x1], #1\n    cbnz w2, 1b\n" +
     "    sub x0, x1, x0\n    sub x0, x0, #1\n    ret\n" +
     ".size strlen, . - strlen\n"
+}
+
+// pthread_create and pthread_join as abla_clone_create/abla_clone_join (the link
+// defines the pthread names as these), the AArch64 twins of the x86-64 routines: one
+// mapping per thread, a guard page, the stack, 64 KiB for its alternate signal stack, its
+// TLS block and a control page at the very top holding {tid word (the kernel clears it
+// and wakes futex waiters when the thread exits), mapping base, mapping size, entry,
+// argument, stack top}. The stack size is the RLIMIT_STACK soft limit, 8 MiB when that
+// is unlimited or unreadable. abla_clone_create(handle*, attr, entry, argument) stores
+// the control page's address in *handle and returns 0, or an errno.
+fun bootstrapLlvmAarch64ThreadAssembly(): string {
+    ".text\n.p2align 2\n" +
+    bootstrapLlvmAssemblyHiddenFunction("abla_clone_create") +
+    "abla_clone_create:\n" +
+    "    stp x29, x30, [sp, #-96]!\n    mov x29, sp\n" +
+    "    stp x19, x20, [sp, #16]\n    stp x21, x22, [sp, #32]\n    stp x23, x24, [sp, #48]\n" +
+    "    stp x25, x26, [sp, #64]\n    str x27, [sp, #80]\n" +
+    "    mov x19, x0\n    mov x20, x2\n    mov x21, x3\n" +
+    // prlimit64(0, RLIMIT_STACK, NULL, &limit)
+    "    sub sp, sp, #16\n    mov x0, #0\n    mov x1, #3\n    mov x2, #0\n    mov x3, sp\n    mov x8, #261\n    svc #0\n" +
+    "    ldr x22, [sp]\n    add sp, sp, #16\n" +
+    "    cbnz x0, 1f\n    cmn x22, #1\n    b.eq 1f\n    cmp x22, #65536\n    b.hs 2f\n" +
+    "1:  mov x22, #0x800000\n" +
+    "2:  add x22, x22, #4095\n    and x22, x22, #-4096\n" +
+    "    adrp x0, abla_start_phdr\n    ldr x0, [x0, :lo12:abla_start_phdr]\n" +
+    "    adrp x1, abla_start_phnum\n    ldr x1, [x1, :lo12:abla_start_phnum]\n" +
+    "    bl abla_tls_bytes\n    tbnz x0, #63, 90f\n" +
+    "    add x23, x0, #4095\n    and x23, x23, #-4096\n" +
+    "    add x25, x22, x23\n    add x25, x25, #73728\n" +
+    // mmap(0, total, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_STACK, -1, 0)
+    "    mov x0, #0\n    mov x1, x25\n    mov x2, #3\n    mov x3, #0x22\n    movk x3, #2, lsl #16\n    mov x4, #-1\n    mov x5, #0\n    mov x8, #222\n    svc #0\n" +
+    "    cmn x0, #4095\n    b.hs 91f\n" +
+    "    mov x24, x0\n" +
+    "    mov x0, x24\n    mov x1, #4096\n    mov x2, #0\n    mov x8, #226\n    svc #0\n" +
+    "    add x26, x24, x25\n    sub x26, x26, #4096\n" +
+    "    add x9, x24, #4096\n    add x9, x9, x22\n" +
+    "    str xzr, [x26]\n    str x24, [x26, #8]\n    str x25, [x26, #16]\n    str x20, [x26, #24]\n    str x21, [x26, #32]\n    str x9, [x26, #40]\n" +
+    "    add x0, x9, #16, lsl #12\n" +
+    "    adrp x1, abla_start_phdr\n    ldr x1, [x1, :lo12:abla_start_phdr]\n" +
+    "    adrp x2, abla_start_phnum\n    ldr x2, [x2, :lo12:abla_start_phnum]\n" +
+    "    bl abla_tls_init\n    mov x27, x0\n" +
+    "    ldr x9, [x26, #40]\n" +
+    // clone(CLONE_VM|FS|FILES|SIGHAND|THREAD|SYSVSEM|SETTLS|PARENT_SETTID|CHILD_CLEARTID, stack, ptid, tls, ctid)
+    "    mov x0, #0x0f00\n    movk x0, #0x3d, lsl #16\n    sub x1, x9, #16\n    mov x2, x26\n    mov x3, x27\n    mov x4, x26\n    mov x8, #220\n    svc #0\n" +
+    "    cbz x0, 5f\n    tbnz x0, #63, 92f\n" +
+    "    str x26, [x19]\n    mov x0, #0\n    b 99f\n" +
+    // The thread: its own alternate signal stack above its stack, then entry(argument).
+    "5:  mov x29, #0\n    sub sp, sp, #32\n    ldr x9, [x26, #40]\n    str x9, [sp]\n    str xzr, [sp, #8]\n    mov x10, #65536\n    str x10, [sp, #16]\n" +
+    "    mov x0, sp\n    mov x1, #0\n    mov x8, #132\n    svc #0\n    add sp, sp, #32\n" +
+    "    ldr x0, [x26, #32]\n    ldr x1, [x26, #24]\n    blr x1\n" +
+    "6:  mov x0, #0\n    mov x8, #93\n    svc #0\n    b 6b\n" +
+    "92: neg x0, x0\n    mov x19, x0\n    mov x0, x24\n    mov x1, x25\n    mov x8, #215\n    svc #0\n    mov x0, x19\n    b 99f\n" +
+    "91: neg x0, x0\n    b 99f\n" +
+    "90: mov x0, #22\n" +
+    "99: ldp x19, x20, [sp, #16]\n    ldp x21, x22, [sp, #32]\n    ldp x23, x24, [sp, #48]\n" +
+    "    ldp x25, x26, [sp, #64]\n    ldr x27, [sp, #80]\n    ldp x29, x30, [sp], #96\n    ret\n" +
+    ".size abla_clone_create, . - abla_clone_create\n" +
+    bootstrapLlvmAssemblyHiddenFunction("abla_clone_join") +
+    "abla_clone_join:\n" +
+    "    mov x9, x0\n" +
+    "1:  ldr w2, [x9]\n    cbz w2, 2f\n    mov x0, x9\n    mov x1, #0\n    mov x3, #0\n    mov x8, #98\n    svc #0\n    b 1b\n" +
+    "2:  ldr x0, [x9, #8]\n    ldr x1, [x9, #16]\n    mov x8, #215\n    svc #0\n    mov x0, #0\n    ret\n" +
+    ".size abla_clone_join, . - abla_clone_join\n"
 }
