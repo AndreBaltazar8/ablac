@@ -21,22 +21,26 @@ for name in unrelated selected interface generic default-interface default-safe;
     cmp "$out/$name-interp.wasm" "$out/$name-jit.wasm"
     cmp "$out/$name-interp.wasm" "$out/$name-auto.wasm"
 done
-python3 - <<'PY'
-from pathlib import Path
-for tier in ['jit', 'auto']:
-    for name in ['unrelated', 'selected', 'interface', 'generic', 'default-interface', 'default-safe']:
-        source = Path(f'tests/cases/compile-eval-method-targets/{name}.ab').read_bytes()
-        marker = source.index(b'val H = #') + len(b'val H = ')
-        lines = Path(f'build/compile-eval-method-targets/{name}-{tier}.log').read_text().splitlines()
-        if name == 'unrelated':
-            assert any(s.startswith('note[ct-jit]: native at ') and s.endswith(f'{name}.ab:{marker}') for s in lines), lines
-            assert not any('interpreted at' in s for s in lines), lines
-        else:
-            hits = [s for s in lines if s.startswith(f'note[ct-jit]: interpreted at {marker + 1}:')]
-            assert len(hits) == 1, lines
-            if name in ['selected', 'generic']:
-                assert 'adoptNativeString:' in hits[0], hits
-PY
+for tier in jit auto; do
+    for name in unrelated selected interface generic default-interface default-safe; do
+        # Byte offset just past `val H = ` is where the compile-time call starts.
+        marker=$(( $(grep -boa 'val H = #' "tests/cases/compile-eval-method-targets/$name.ab" | head -n 1 | cut -d: -f1) + 8 ))
+        log="$out/$name-$tier.log"
+        if [[ $name == unrelated ]]; then
+            awk -v tail="$name.ab:$marker" 'index($0, "note[ct-jit]: native at ") == 1 && substr($0, length($0) - length(tail) + 1) == tail { found = 1 } END { exit !found }' "$log" \
+                || { cat "$log" >&2; echo "method targets: $name $tier was not native at $marker" >&2; exit 1; }
+            ! grep -qF 'interpreted at' "$log" || { cat "$log" >&2; echo "method targets: $name $tier interpreted" >&2; exit 1; }
+        else
+            prefix="note[ct-jit]: interpreted at $((marker + 1)):"
+            hits=$(awk -v p="$prefix" 'index($0, p) == 1' "$log")
+            [[ -n $hits && $(printf '%s\n' "$hits" | wc -l) -eq 1 ]] \
+                || { cat "$log" >&2; echo "method targets: $name $tier needs exactly one interpreted note at $((marker + 1))" >&2; exit 1; }
+            case $name in selected|generic)
+                [[ $hits == *'adoptNativeString:'* ]] || { echo "method targets: $name $tier lacks adoptNativeString" >&2; exit 1; } ;;
+            esac
+        fi
+    done
+done
 node --input-type=module - "$out" <<'NODE'
 import fs from 'node:fs';
 import assert from 'node:assert/strict';
