@@ -118,7 +118,9 @@ class BootstrapCtState(
     var editing: bool,
     var current: int,
     val scope: array<string>,
-    val lambdaValues: array<array<int>>
+    val lambdaValues: array<array<int>>,
+    // Locals bound by a delegate (`val x by D(...)`), keyed "item:name".
+    val delegatedLocals: Map<string, bool>
 ) {
     fun variable(name: string): array<int> =
         bootstrapCtStateCopy(this.variables.get("${this.current}:$name") ?? [])
@@ -270,6 +272,13 @@ class BootstrapCtState(
         if (kind == "assign") {
             val value = this.evaluate(children[0])
             if (this.bound(expression.text)) {
+                // A local bound by a delegate assigns through its setValue.
+                if ((this.delegatedLocals.get("${this.current}:${expression.text}") ?? false) ==
+                    true) {
+                    val place = this.variable(expression.text)
+                    this.write(place, expression)
+                    this.implicitCall("setValue", [place, value])
+                }
                 this.bind(expression.text, value)
             } else {
                 for (item in this.candidates(expression.text)) {
@@ -277,6 +286,11 @@ class BootstrapCtState(
                         this.isValue(this.declarations[item].kind)) {
                         this.noteGlobal(item)
                         if (this.ordinary[item]) this.write([item], expression)
+                        if (this.declarations[item].expression.kind == "delegate.initializer") {
+                            // A delegated global assigns through its setValue.
+                            this.implicitCall("setValue",
+                                [bootstrapCtStateCopy(this.globalTaint[item]), value])
+                        }
                         if (bootstrapCtStateMerge(this.globalTaint[item],
                             value)) this.changed = true
                     }
@@ -325,6 +339,11 @@ class BootstrapCtState(
             val value = if (children.size > 0) this.evaluate(children[0]) else []
             this.scope.append(expression.text)
             this.bind(expression.text, value)
+            if (children.size > 0 && children[0].kind == "delegate.initializer") {
+                this.delegatedLocals.set("${this.current}:${expression.text}", true)
+                // Reading it calls getValue; it is dropped with its scope.
+                this.implicitCall("getValue", [bootstrapCtStateCopy(value)])
+            }
             // A resource local is dropped at its scope's end (its drop is reached, not given a receiver).
             this.implicitCall("drop", [])
             return []
@@ -397,7 +416,14 @@ class BootstrapCtState(
 
     fun evaluateIdentifier(expression: BootstrapExpression): array<int> {
         val name = expression.text
-        if (this.bound(name)) return bootstrapCtStateCopy(this.variable(name))
+        if (this.bound(name)) {
+            val held = this.variable(name)
+            if ((this.delegatedLocals.get("${this.current}:$name") ?? false) == true) {
+                bootstrapCtStateMerge(held, this.implicitCall("getValue",
+                    [bootstrapCtStateCopy(held)]))
+            }
+            return held
+        }
         val result: array<int> = []
         for (item in this.candidates(name)) {
             if (item < this.declarations.size) {
@@ -406,6 +432,11 @@ class BootstrapCtState(
                     this.noteGlobal(item)
                     if (this.component[item]) bootstrapCtStateMerge(result, [item])
                     bootstrapCtStateMerge(result, this.globalTaint[item])
+                    if (declaration.expression.kind == "delegate.initializer") {
+                        // Reading a delegated global calls its getValue.
+                        bootstrapCtStateMerge(result, this.implicitCall("getValue",
+                            [bootstrapCtStateCopy(result)]))
+                    }
                 } else if (declaration.kind == "extern") {
                     if (bootstrapCtStateEditsDeclarations(declaration.name)) this.editing = true
                 } else if (declaration.kind == "fun" || declaration.kind == "compile.fun") {
@@ -693,7 +724,7 @@ fun bootstrapCtStateAnalyze(
     val state = BootstrapCtState(
         declarations, library, itemDeclaration, itemMethod, byName, itemSource,
         itemLibrary, reachedItems, itemGlobals, itemCallees, globalTaint, Map(), returns,
-        Map(), [], writers, ordinary, component, true, false, 0, [], []
+        Map(), [], writers, ordinary, component, true, false, 0, [], [], Map()
     )
     var passes = 0
     while (state.changed && passes < 64) {

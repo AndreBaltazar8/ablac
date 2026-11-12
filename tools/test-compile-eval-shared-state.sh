@@ -10,6 +10,8 @@ for source in "$cases"/*.ab; do
     name=${source##*/}; name=${name%.ab}
     case $name in
         readonly) expected=9 ;;
+        delegate-get|delegate-local) expected=1,1,1 ;;
+        delegate-set) expected=0,1,1 ;;
         *-forward) expected=1,1,1,2 ;;
         *-reverse) expected=0,1,2,2 ;;
         *-read-first) expected=0,0,1,2 ;;
@@ -56,8 +58,10 @@ NODE
                     grep '^note\[ct-jit\]: native at ' "$log" | grep -Fq "readonly.ab:$pos"
                 elif [[ $name == delegate-* ]]; then
                     # A delegated binding is rewritten before analysis, which moves the sites: count them.
-                    [[ $(grep -c "^note\[ct-jit\]: interpreted at .*ordinary mutable global counter may be written at " "$log") -eq 4 ]] ||
-                        { echo "$name: expected four interpreted sites" >&2; exit 1; }
+                    sites=4
+                    [[ $name == delegate-forward ]] || sites=3
+                    [[ $(grep -c "^note\[ct-jit\]: interpreted at .*ordinary mutable global " "$log") -eq $sites ]] ||
+                        { echo "$name: expected $sites interpreted sites" >&2; exit 1; }
                     ! grep -q "^note\[ct-jit\]: native at .*$name.ab" "$log"
                 else
                     for binding in A B D; do
