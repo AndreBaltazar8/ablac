@@ -314,36 +314,38 @@ network_ready="$output_directory/network-port"
 network_case="$output_directory/network"
 rm -rf -- "$network_ready" "$network_case"
 mkdir -p "$network_case"
-python3 -c 'import os, socket, sys
-s=socket.socket()
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(("127.0.0.1", 0))
-s.listen(1)
-open(sys.argv[1] + ".next", "w").write(str(s.getsockname()[1]))
-os.rename(sys.argv[1] + ".next", sys.argv[1])
-c,_=s.accept()
-if c.recv(4) == b"PING": c.sendall(b"PONG")
-c.close()
-s.close()' "$network_ready" &
-network_server_pid=$!
-for _ in $(seq 1 500); do
-    [[ -e $network_ready ]] && break
-    sleep 0.02
-done
-[[ -e $network_ready ]] || exit 1
+# The peer is an Abla program over a raw socket with literal PING/PONG bytes; the build
+# below is the client (a compile-time TCP exchange), so the two share no protocol code.
+"$compiler" build "$project_root/tests/cases/capabilities/network-peer.ab" -o "$output_directory/network-peer" --fast
 cp "$manifest" "$network_case/abla.toml"
-sed "s/39091/$(<"$network_ready")/" \
-    "$project_root/tests/cases/capabilities/network-live.ab" \
-    > "$network_case/network-live.ab"
-"$compiler" build \
-    "$network_case/network-live.ab" \
-    -o "$output_directory/network-live"
-wait "$network_server_pid"
-network_server_pid=''
-set +e
-"$project_root/tools/run-limited.sh" "$output_directory/network-live"
-network_live_status=$?
-set -e
+# run_network_case [wrong]: serve one exchange (under a hard timeout), build the case
+# against the port the peer published, and set network_live_status to the program's status.
+run_network_case() {
+    rm -f -- "$network_ready"
+    timeout 60 "$output_directory/network-peer" "$network_ready" "$@" &
+    network_server_pid=$!
+    for _ in $(seq 1 500); do
+        [[ -e $network_ready ]] && break
+        sleep 0.02
+    done
+    [[ -e $network_ready ]] || exit 1
+    sed "s/39091/$(<"$network_ready")/" \
+        "$project_root/tests/cases/capabilities/network-live.ab" \
+        > "$network_case/network-live.ab"
+    "$compiler" build \
+        "$network_case/network-live.ab" \
+        -o "$output_directory/network-live"
+    wait "$network_server_pid" || true
+    network_server_pid=''
+    set +e
+    "$project_root/tools/run-limited.sh" "$output_directory/network-live"
+    network_live_status=$?
+    set -e
+}
+# Control: a peer that answers NOPE must make the program fail.
+run_network_case wrong
+[[ $network_live_status -ne 42 ]] || { echo 'compile effects: the network case passed against a wrong peer' >&2; exit 1; }
+run_network_case
 [[ $network_live_status -eq 42 ]] || exit 1
 
 printf '%s\n' 'compileCapabilities = []' > "$manifest"
