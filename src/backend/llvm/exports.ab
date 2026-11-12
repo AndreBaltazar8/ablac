@@ -1775,13 +1775,31 @@ fun bootstrapLlvmEmitExports(
 }
 
 // `--no-libc` (#806 step 6): the program's own process entry on x86-64 Linux, in
-// place of crt1's `_start` and `__libc_start_main`. It reads argc, argv, envp and
-// the auxiliary vector from the initial stack, gives the main thread a thread
-// control block (and the PT_TLS image, if the executable has one) with
-// arch_prctl(ARCH_SET_FS), runs `.init_array`, calls `main(argc, argv, envp)`
-// and leaves with exit_group. A static non-PIE executable: nothing relocates itself.
-// A failed mmap or arch_prctl, or a TLS alignment over a page, exits 127.
+// place of crt1's `_start` and `__libc_start_main`. `_start` reads argc, argv, envp
+// and the auxiliary vector from the initial stack, gives the main thread a thread
+// block with arch_prctl(ARCH_SET_FS), runs `.init_array`, calls
+// `main(argc, argv, envp)` and leaves with exit_group. A static non-PIE
+// executable: nothing relocates itself. A failed mmap or arch_prctl, or a TLS
+// alignment over a page, exits 127.
+//
+// The thread block (x86-64 variant II) is shared with thread creation through three
+// C-ABI routines: abla_tls_bytes(phdr, phnum) is the bytes a block needs (the PT_TLS
+// memory size rounded to max(alignment, 64), plus a 4096-byte control block; -1 for
+// an alignment over a page); abla_tls_init(block, phdr, phnum, random) takes a zeroed
+// page-aligned block of that size, copies the .tdata image, writes the thread
+// pointer at offsets 0 and 16 and the stack canary (from AT_RANDOM bytes, if given)
+// at 40, and returns the thread pointer; abla_tls_set(tp) is arch_prctl(ARCH_SET_FS).
+// `_start` keeps AT_PHDR, AT_PHNUM and AT_RANDOM in abla_start_phdr, abla_start_phnum
+// and abla_start_random.
 fun bootstrapLlvmFreestandingStartAssembly(): string =
+    ".pushsection .bss\n" +
+    ".globl abla_start_phdr\n" +
+    ".globl abla_start_phnum\n" +
+    ".globl abla_start_random\n" +
+    "abla_start_phdr: .zero 8\n" +
+    "abla_start_phnum: .zero 8\n" +
+    "abla_start_random: .zero 8\n" +
+    ".popsection\n" +
     "xorl %ebp, %ebp\n" +
     "movq (%rsp), %r13\n" +
     "leaq 8(%rsp), %r14\n" +
@@ -1809,32 +1827,15 @@ fun bootstrapLlvmFreestandingStartAssembly(): string =
     "jne 2b\n" +
     "movq %rcx, %r10\n" +
     "jmp 2b\n" +
-    "5: xorl %r12d, %r12d\n" +
-    "6: testq %r9, %r9\n" +
-    "jz 8f\n" +
-    "cmpl \$\$7, (%r8)\n" +
-    "jne 7f\n" +
-    "movq %r8, %r12\n" +
-    "jmp 8f\n" +
-    "7: addq \$\$56, %r8\n" +
-    "decq %r9\n" +
-    "jmp 6b\n" +
-    "8: xorl %esi, %esi\n" +
-    "movl \$\$64, %ebx\n" +
-    "testq %r12, %r12\n" +
-    "jz 9f\n" +
-    "movq 48(%r12), %rax\n" +
-    "cmpq %rbx, %rax\n" +
-    "cmovaq %rax, %rbx\n" +
-    "cmpq \$\$4096, %rbx\n" +
-    "ja 99f\n" +
-    "movq 40(%r12), %rsi\n" +
-    "leaq -1(%rbx), %rax\n" +
-    "addq %rax, %rsi\n" +
-    "notq %rax\n" +
-    "andq %rax, %rsi\n" +
-    "9: movq %r10, %rbx\n" +
-    "leaq 4096(%rsi), %rsi\n" +
+    "5: movq %r8, abla_start_phdr(%rip)\n" +
+    "movq %r9, abla_start_phnum(%rip)\n" +
+    "movq %r10, abla_start_random(%rip)\n" +
+    "movq %r8, %rdi\n" +
+    "movq %r9, %rsi\n" +
+    "callq abla_tls_bytes\n" +
+    "cmpq \$\$-1, %rax\n" +
+    "je 99f\n" +
+    "leaq (%rax), %rsi\n" +
     "xorl %edi, %edi\n" +
     "movl \$\$3, %edx\n" +
     "movl \$\$34, %r10d\n" +
@@ -1844,23 +1845,13 @@ fun bootstrapLlvmFreestandingStartAssembly(): string =
     "syscall\n" +
     "cmpq \$\$-4095, %rax\n" +
     "jae 99f\n" +
-    "leaq -4096(%rax,%rsi), %rdx\n" +
-    "testq %r12, %r12\n" +
-    "jz 10f\n" +
     "movq %rax, %rdi\n" +
-    "movq 16(%r12), %rsi\n" +
-    "movq 32(%r12), %rcx\n" +
-    "rep movsb\n" +
-    "10: movq %rdx, (%rdx)\n" +
-    "movq %rdx, 16(%rdx)\n" +
-    "testq %rbx, %rbx\n" +
-    "jz 11f\n" +
-    "movq (%rbx), %rax\n" +
-    "movq %rax, 40(%rdx)\n" +
-    "11: movl \$\$0x1002, %edi\n" +
-    "movq %rdx, %rsi\n" +
-    "movl \$\$158, %eax\n" +
-    "syscall\n" +
+    "movq abla_start_phdr(%rip), %rsi\n" +
+    "movq abla_start_phnum(%rip), %rdx\n" +
+    "movq abla_start_random(%rip), %rcx\n" +
+    "callq abla_tls_init\n" +
+    "movq %rax, %rdi\n" +
+    "callq abla_tls_set\n" +
     "testq %rax, %rax\n" +
     "jnz 99f\n" +
     ".weak __init_array_start\n" +
@@ -1889,16 +1880,103 @@ fun bootstrapLlvmFreestandingStartAssembly(): string =
     "syscall\n" +
     "ud2\n"
 
-fun bootstrapLlvmEmitFreestandingStart(backend: BootstrapLlvmBackend): void {
-    val start = bootstrapLlvmDeclare(
-        backend, "_start", backend.voidType, [], false, []
+fun bootstrapLlvmTlsBytesAssembly(): string =
+    "1: testq %rsi, %rsi\n" +
+    "jz 4f\n" +
+    "cmpl \$\$7, (%rdi)\n" +
+    "je 2f\n" +
+    "addq \$\$56, %rdi\n" +
+    "decq %rsi\n" +
+    "jmp 1b\n" +
+    "2: movq 48(%rdi), %rcx\n" +
+    "movl \$\$64, %edx\n" +
+    "cmpq %rdx, %rcx\n" +
+    "cmovbq %rdx, %rcx\n" +
+    "cmpq \$\$4096, %rcx\n" +
+    "ja 5f\n" +
+    "movq 40(%rdi), %rax\n" +
+    "leaq -1(%rcx), %rdx\n" +
+    "addq %rdx, %rax\n" +
+    "notq %rdx\n" +
+    "andq %rdx, %rax\n" +
+    "addq \$\$4096, %rax\n" +
+    "ret\n" +
+    "4: movl \$\$4096, %eax\n" +
+    "ret\n" +
+    "5: movq \$\$-1, %rax\n" +
+    "ret\n"
+
+fun bootstrapLlvmTlsInitAssembly(): string =
+    "movq %rdi, %r8\n" +
+    "movq %rcx, %r9\n" +
+    "1: testq %rdx, %rdx\n" +
+    "jz 4f\n" +
+    "cmpl \$\$7, (%rsi)\n" +
+    "je 2f\n" +
+    "addq \$\$56, %rsi\n" +
+    "decq %rdx\n" +
+    "jmp 1b\n" +
+    "2: movq 48(%rsi), %rcx\n" +
+    "movl \$\$64, %eax\n" +
+    "cmpq %rax, %rcx\n" +
+    "cmovbq %rax, %rcx\n" +
+    "movq 40(%rsi), %rax\n" +
+    "leaq -1(%rcx), %r10\n" +
+    "addq %r10, %rax\n" +
+    "notq %r10\n" +
+    "andq %r10, %rax\n" +
+    "leaq (%r8,%rax), %r10\n" +
+    "movq %rsi, %r11\n" +
+    "movq %r8, %rdi\n" +
+    "movq 16(%r11), %rsi\n" +
+    "movq 32(%r11), %rcx\n" +
+    "rep movsb\n" +
+    "jmp 5f\n" +
+    "4: movq %r8, %r10\n" +
+    "5: movq %r10, (%r10)\n" +
+    "movq %r10, 16(%r10)\n" +
+    "testq %r9, %r9\n" +
+    "jz 6f\n" +
+    "movq (%r9), %rcx\n" +
+    "movq %rcx, 40(%r10)\n" +
+    "6: movq %r10, %rax\n" +
+    "ret\n"
+
+fun bootstrapLlvmTlsSetAssembly(): string =
+    "movq %rdi, %rsi\n" +
+    "movl \$\$0x1002, %edi\n" +
+    "movl \$\$158, %eax\n" +
+    "syscall\n" +
+    "ret\n"
+
+fun bootstrapLlvmEmitFreestandingRoutine(
+    backend: BootstrapLlvmBackend,
+    name: string,
+    assembly: string
+): void {
+    val routine = bootstrapLlvmDeclare(
+        backend, name, backend.i64Type, [], false, []
     )
     val entry = LLVMAppendBasicBlockInContext(
-        backend.context, start, "entry"
+        backend.context, routine, "entry"
     )
     LLVMPositionBuilderAtEnd(backend.builder, entry)
-    bootstrapLlvmEmitNakedAssemblyText(
-        backend, start, "~{memory}", bootstrapLlvmFreestandingStartAssembly()
+    bootstrapLlvmEmitNakedAssemblyText(backend, routine, "~{memory}", assembly)
+    return
+}
+
+fun bootstrapLlvmEmitFreestandingStart(backend: BootstrapLlvmBackend): void {
+    bootstrapLlvmEmitFreestandingRoutine(
+        backend, "_start", bootstrapLlvmFreestandingStartAssembly()
+    )
+    bootstrapLlvmEmitFreestandingRoutine(
+        backend, "abla_tls_bytes", bootstrapLlvmTlsBytesAssembly()
+    )
+    bootstrapLlvmEmitFreestandingRoutine(
+        backend, "abla_tls_init", bootstrapLlvmTlsInitAssembly()
+    )
+    bootstrapLlvmEmitFreestandingRoutine(
+        backend, "abla_tls_set", bootstrapLlvmTlsSetAssembly()
     )
     return
 }
