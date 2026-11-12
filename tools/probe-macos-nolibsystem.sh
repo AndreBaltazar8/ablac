@@ -25,8 +25,10 @@ summary=$out/summary.txt
 variants=(
     'nostdlib-e|-nostdlib -Wl,-e,_start'
     'nostdlib-static-e|-nostdlib -static -Wl,-e,_start'
+    'nostdlib-static-pv15-e|-nostdlib -static -Wl,-e,_start -Wl,-platform_version,macos,15.0,15.0'
+    'nostdlib-static-pv15-nouuid-e|-nostdlib -static -Wl,-e,_start -Wl,-platform_version,macos,15.0,15.0 -Wl,-no_uuid'
+    'nostdlib-static-pv15-pagezero-e|-nostdlib -static -Wl,-e,_start -Wl,-platform_version,macos,15.0,15.0 -Wl,-pagezero_size,0x100000000'
     'nostdlib-static-pagezero-e|-nostdlib -static -Wl,-e,_start -Wl,-pagezero_size,0x100000000'
-    'nostdlib-static-pagezero-platform-e|-nostdlib -static -Wl,-e,_start -Wl,-pagezero_size,0x100000000 -Wl,-platform_version,macos,11.0,11.0'
     'libsystem-listed-main|-nostdlib -lSystem'
     'libsystem-listed-e|-nostdlib -lSystem -Wl,-e,_start'
 )
@@ -44,6 +46,25 @@ execute() { # directory program: runs it for at most 20 s, sets EXECUTE_STATUS
     wait "$pid" 2>/dev/null; EXECUTE_STATUS=$?
 }
 
+diagnose() { # directory program: why the kernel killed it, as far as the system says
+    local dir=$1 program=$2 name stream
+    echo "full load commands:"; otool -l "$dir/$program" | head -150
+    echo "build version:"; otool -l "$dir/$program" | grep -A5 LC_BUILD_VERSION || echo "(no LC_BUILD_VERSION)"
+    # The unified log around a run, and lldb's and the crash reporter's view of it.
+    stream=$dir/log-stream.txt
+    log stream --style compact --predicate 'process == "kernel" OR process == "amfid" OR process == "taskgated" OR process == "ReportCrash" OR eventMessage CONTAINS[c] "AMFI"' > "$stream" 2>&1 &
+    local logpid=$!
+    sleep 3
+    echo "lldb:"; lldb -b -o run -o 'process status' -- "$dir/$program" 2>&1 | head -30
+    "$dir/$program" > /dev/null 2>&1
+    sleep 3; kill "$logpid" 2>/dev/null; wait "$logpid" 2>/dev/null
+    echo "log stream during the runs:"; grep -v "log run noninteractively" "$stream" | tail -25 | cut -c1-300
+    echo "crash reports:"
+    for name in $(ls -t "$HOME/Library/Logs/DiagnosticReports" 2>/dev/null | head -3); do
+        echo "-- $name"; head -40 "$HOME/Library/Logs/DiagnosticReports/$name"
+    done
+}
+
 try() { # variant program flags
     local name=$1 program=$2 flags=$3 dir=$out/$1-$2
     mkdir -p "$dir"
@@ -59,22 +80,28 @@ try() { # variant program flags
     fi
     [[ -s $dir/link.log ]] && { echo "linker said:"; cat "$dir/link.log"; }
     echo "load commands:"
-    otool -l "$dir/$program" | grep -E 'cmd LC_|^ *name |dylib|entryoff' | grep -v 'LC_BUILD_VERSION' | head -30
+    otool -l "$dir/$program" | grep -E 'cmd LC_|^ *name |dylib|entryoff|platform|minos' | head -30
     echo "dyld info:"; otool -L "$dir/$program" 2>&1 | head -5
     echo "signature:"; codesign -dv "$dir/$program" 2>&1 | grep -E 'Signature|flags|Identifier|not signed' | head -4
     local status
-    execute "$dir"  "$program"; status=$EXECUTE_STATUS
+    execute "$dir" "$program"; status=$EXECUTE_STATUS
     echo "run: status $status"; echo "stdout:"; cat "$dir/run.out"; echo "stderr:"; head -5 "$dir/run.err"
     local signed=""
     if [[ $status -eq 137 || $status -eq 9 ]]; then
-        # Killed: arm64 macOS refuses an unsigned image. Sign ad hoc and run again.
+        # Killed: arm64 macOS refuses this image. Find out why, sign ad hoc and run again,
+        # then sign with the hardened runtime and run again.
+        diagnose "$dir" "$program"
         codesign -s - --force "$dir/$program" 2>&1 | head -3
-        # Why the kernel killed it, when the unified log says (best effort).
-        log show --last 2m --style compact --predicate 'eventMessage CONTAINS[c] "code signature" OR eventMessage CONTAINS[c] "killed" OR process == "amfid"' 2>/dev/null | tail -8 | cut -c1-300
-        echo "signature after ad-hoc signing:"; codesign -dv "$dir/$program" 2>&1 | grep -E 'Signature|flags' | head -3
-        report "$name" "$program" "unsigned image killed (status $status); signing ad hoc and running again"
         execute "$dir" "$program"; status=$EXECUTE_STATUS; signed=" after ad-hoc codesign"
-        echo "run (signed): status $status"; echo "stdout:"; cat "$dir/run.out"; echo "stderr:"; head -5 "$dir/run.err"
+        echo "run (ad-hoc signed): status $status"
+        report "$name" "$program" "killed unsigned; after ad-hoc codesign status $status"
+        if [[ $status -eq 137 || $status -eq 9 ]]; then
+            codesign -s - --force -o runtime "$dir/$program" 2>&1 | head -3
+            codesign -dv "$dir/$program" 2>&1 | grep -E 'Signature|flags' | head -3
+            execute "$dir" "$program"; status=$EXECUTE_STATUS; signed=" after codesign -o runtime"
+            echo "run (hardened runtime): status $status"
+        fi
+        echo "stdout:"; cat "$dir/run.out"; echo "stderr:"; head -5 "$dir/run.err"
     fi
     local lc
     lc=$(otool -l "$dir/$program" | grep -oE 'LC_MAIN|LC_UNIXTHREAD|LC_LOAD_DYLINKER|LC_LOAD_DYLIB' | sort -u | tr '\n' ' ')
