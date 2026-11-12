@@ -1,6 +1,8 @@
 // Linux process entry information without the project C host adapter.
-// Hosted process creation uses libc fork so allocator locks held by runtime
-// helper threads are repaired in the child before its pre-exec allocations.
+// On x86-64 Linux a child is made with the fork system call and no libc, so a child
+// allocates nothing before exec or _exit: a thread that held the heap lock at the fork
+// would leave it held in the child. Everything a child needs is prepared before the
+// fork. Other targets keep libc fork (which repairs those locks).
 
 import "abla/sys/linux"
 import "abla/bytes"
@@ -9,6 +11,11 @@ import "abla/unsafe/memory"
 
 private noescape extern:"c" fun fork(): i32
 private noescape extern:"c" fun signal(number: int, handler: i64*): i64*
+private noescape extern:"intrinsic" fun ablaHostIsMacOS(): bool
+private noescape extern:"intrinsic" fun ablaSimdTargetArch(): int
+
+// Both are constants of the target being built: x86-64 Linux is architecture 1.
+private fun linuxDirectSyscalls(): bool = !ablaHostIsMacOS() && ablaSimdTargetArch() == 1
 
 noescape extern:"intrinsic" fun ablaLinuxArgumentCount(): int
 
@@ -154,12 +161,12 @@ fun linuxWaitProcess(process: int, noHang: bool = false): LinuxProcessResult {
 }
 
 private fun linuxExecPrepared(
-    executable: string,
+    executable: int,
     vector: NativeByteBuffer
 ): int {
     linuxSyscall3(
         59,
-        nativeCStringAddress(executable),
+        executable,
         nativePointerAddress(vector.address),
         nativePointerAddress(linuxEnvironmentPointer())
     )
@@ -351,14 +358,57 @@ trusted fun linuxSignalWatchSet(offset: int, value: int): void {
     return
 }
 
+// A child unblocks signals through the thread-local watch state: create it before the
+// fork, so the child does not allocate it.
+// A test seam (the process-pipeline test cannot interpose libc fork any more): the nth
+// fork after linuxFailForkNumber(n) fails as if the process limit were reached.
+var linuxForkFailureAt: int = 0
+var linuxForkCount: int = 0
+
+fun linuxFailForkNumber(number: int): void {
+    linuxForkCount = 0
+    linuxForkFailureAt = number
+    return
+}
+
+private fun linuxFork(): int {
+    linuxSignalWatchState()
+    if (linuxForkFailureAt > 0) {
+        linuxForkCount = linuxForkCount + 1
+        if (linuxForkCount == linuxForkFailureAt) return -11
+    }
+    if (linuxDirectSyscalls()) return linuxSyscall0(57)
+    int(fork())
+}
+
 private fun linuxExecUnblockSignals(): void {
     val state = linuxSignalWatchState()
     if (linuxSignalWatchGet(0) != 0) linuxSyscall4(14, 1, state, 0, 8)
     return
 }
 
-private fun linuxRedirect(path: string, flags: int, target: int): bool {
-    val opened = linuxOpen(path, flags, 0o666).descriptor
+// C-string addresses of what a child needs. nativeCStringAddress may copy a string that has no
+// NUL after it, which allocates: so they are all made before the fork, and a child only uses
+// these numbers (0 = none).
+class LinuxExecAddresses(
+    val executable: int,
+    val directory: int,
+    val input: int,
+    val output: int,
+    val error: int
+)
+
+private fun LinuxCommand.execAddresses(executable: string): LinuxExecAddresses = LinuxExecAddresses(
+    nativeCStringAddress(executable),
+    if (this.workingDirectory != "") nativeCStringAddress(this.workingDirectory) else 0,
+    if (this.inputPath != "") nativeCStringAddress(this.inputPath) else 0,
+    if (this.outputPath != "") nativeCStringAddress(this.outputPath) else 0,
+    if (this.errorPath != "") nativeCStringAddress(this.errorPath) else 0
+)
+
+private fun linuxRedirect(path: int, flags: int, target: int): bool {
+    // openat by system call: the child must not allocate the descriptor object.
+    val opened = linuxSyscall4(257, -100, path, flags, 0o666)
     var ready = opened >= 0
     if (ready) ready = linuxSyscall2(33, opened, target) >= 0
     if (opened > 2) linuxSyscall1(3, opened)
@@ -368,32 +418,29 @@ private fun linuxRedirect(path: string, flags: int, target: int): bool {
 // The working directory and redirects, then the exec. Only returns, with 127,
 // when one of them fails.
 private fun LinuxCommand.execPrepared(
-    executable: string,
+    addresses: LinuxExecAddresses,
     vector: NativeByteBuffer,
     environment: NativeByteBuffer
 ): int {
     var ready = true
     linuxExecUnblockSignals()
-    if (this.workingDirectory != "") {
-        ready = linuxSyscall1(
-            80,
-            nativeCStringAddress(this.workingDirectory)
-        ) == 0
+    if (addresses.directory != 0) {
+        ready = linuxSyscall1(80, addresses.directory) == 0
     }
-    if (ready && this.inputPath != "") {
-        ready = linuxRedirect(this.inputPath, 0, 0)
+    if (ready && addresses.input != 0) {
+        ready = linuxRedirect(addresses.input, 0, 0)
     }
     // O_WRONLY | O_CREAT | O_TRUNC.
-    if (ready && this.outputPath != "") {
-        ready = linuxRedirect(this.outputPath, 577, 1)
+    if (ready && addresses.output != 0) {
+        ready = linuxRedirect(addresses.output, 577, 1)
     }
-    if (ready && this.errorPath != "") {
-        ready = linuxRedirect(this.errorPath, 577, 2)
+    if (ready && addresses.error != 0) {
+        ready = linuxRedirect(addresses.error, 577, 2)
     }
     if (ready) {
         linuxSyscall3(
             59,
-            nativeCStringAddress(executable),
+            addresses.executable,
             nativePointerAddress(vector.address),
             nativePointerAddress(environment.address)
         )
@@ -405,11 +452,12 @@ fun LinuxCommand.run(): int {
     var result = 127
     if (this.arguments.size > 0) {
         val executable = linuxExecutablePath(this.arguments[0])
+        val addresses = this.execAddresses(executable)
         val vector = linuxArgumentVector(this.arguments)
         val environment = this.environmentVector()
-        val process = int(fork())
+        val process = linuxFork()
         if (process == 0) {
-            this.execPrepared(executable, vector, environment)
+            this.execPrepared(addresses, vector, environment)
             linuxSyscall1(60, 127)
         }
         if (process > 0) result = linuxWaitProcess(process).status
@@ -425,9 +473,10 @@ fun LinuxCommand.execute(): int {
     var result = 127
     if (this.arguments.size > 0) {
         val executable = linuxExecutablePath(this.arguments[0])
+        val addresses = this.execAddresses(executable)
         val vector = linuxArgumentVector(this.arguments)
         val environment = this.environmentVector()
-        result = this.execPrepared(executable, vector, environment)
+        result = this.execPrepared(addresses, vector, environment)
         environment.close()
         vector.close()
     }
@@ -438,6 +487,7 @@ fun LinuxCommand.capture(): LinuxProcessResult {
     var result = LinuxProcessResult(127, "")
     if (this.arguments.size > 0) {
         val executable = linuxExecutablePath(this.arguments[0])
+        val addresses = this.execAddresses(executable)
         val vector = linuxArgumentVector(this.arguments)
         val environment = this.environmentVector()
         val descriptors = nativeByteBuffer(8)
@@ -456,12 +506,12 @@ fun LinuxCommand.capture(): LinuxProcessResult {
                 descriptors.load(5) * 256 +
                 descriptors.load(6) * 65536 +
                 descriptors.load(7) * 16777216
-            val process = int(fork())
+            val process = linuxFork()
             if (process == 0) {
                 linuxSyscall1(3, readDescriptor)
                 linuxSyscall2(33, writeDescriptor, 1)
                 linuxSyscall1(3, writeDescriptor)
-                this.execPrepared(executable, vector, environment)
+                this.execPrepared(addresses, vector, environment)
                 linuxSyscall1(60, 127)
             }
             if (process > 0) {
@@ -493,11 +543,12 @@ fun LinuxCommand.start(): LinuxChildProcess {
     var process = -1
     if (this.arguments.size > 0) {
         val executable = linuxExecutablePath(this.arguments[0])
+        val addresses = this.execAddresses(executable)
         val vector = linuxArgumentVector(this.arguments)
         val environment = this.environmentVector()
-        process = int(fork())
+        process = linuxFork()
         if (process == 0) {
-            this.execPrepared(executable, vector, environment)
+            this.execPrepared(addresses, vector, environment)
             linuxSyscall1(60, 127)
         }
         environment.close()
@@ -542,21 +593,21 @@ fun linuxStartConfiguredProcess(
             executable = linuxExecutablePath(arguments[0])
         }
         val vector = linuxArgumentVector(launched)
-        process = int(fork())
+        val executableAddress = nativeCStringAddress(executable)
+        val directoryAddress = if (directory != "") nativeCStringAddress(directory) else 0
+        val outputAddress = if (outputPath != "") nativeCStringAddress(outputPath) else 0
+        process = linuxFork()
         if (process == 0) {
             // setpgid(0, 0): the whole test process tree can be terminated on
             // timeout without affecting the parent test runner.
             linuxSyscall2(109, 0, 0)
             linuxExecUnblockSignals()
             var ready = true
-            if (directory != "") {
-                ready = linuxSyscall1(
-                    80,
-                    nativeCStringAddress(directory)
-                ) == 0
+            if (directoryAddress != 0) {
+                ready = linuxSyscall1(80, directoryAddress) == 0
             }
-            if (ready && outputPath != "") {
-                val output = linuxOpen(outputPath, 577, 0o666).descriptor
+            if (ready && outputAddress != 0) {
+                val output = linuxSyscall4(257, -100, outputAddress, 577, 0o666)
                 ready = output >= 0
                 if (ready) {
                     ready = linuxSyscall2(33, output, 1) >= 0 &&
@@ -564,7 +615,7 @@ fun linuxStartConfiguredProcess(
                 }
                 if (output > 2) linuxSyscall1(3, output)
             }
-            if (ready) linuxExecPrepared(executable, vector)
+            if (ready) linuxExecPrepared(executableAddress, vector)
             linuxSyscall1(60, 127)
         }
         if (process > 0) linuxSyscall2(109, process, process)
@@ -906,12 +957,13 @@ class LinuxRunningPipeline(
 )
 
 // Restore SIGPIPE for programs, even when the caller ignores or blocks it.
-private fun linuxPipelineResetSigpipe(): void {
-    signal(13, nativeNullPointer())
-    val set = nativeByteBuffer(8)
-    set.storeI64(0, 4096)
-    linuxSyscall4(14, 1, nativePointerAddress(set.address), 0, 8)
-    set.close()
+// `action` is a zeroed kernel sigaction (32 bytes: handler SIG_DFL, no flags or mask) and
+// `unblock` a signal set holding SIGPIPE, both made before the fork so that the child
+// allocates nothing. Targets without direct system calls use libc signal().
+private fun linuxPipelineResetSigpipe(action: NativeByteBuffer, unblock: NativeByteBuffer): void {
+    if (linuxDirectSyscalls()) linuxSyscall4(13, 13, nativePointerAddress(action.address), 0, 8)
+    else signal(13, nativeNullPointer())
+    linuxSyscall4(14, 1, nativePointerAddress(unblock.address), 0, 8)
     return
 }
 
@@ -960,6 +1012,15 @@ fun linuxPipelineStart(commands: array<LinuxCommand>, grouped: bool, capture: bo
         index = index + 1
     }
     var group = -1
+    // What the children use, made before the first fork.
+    val resetAction = nativeByteBuffer(32)
+    resetAction.storeI64(0, 0)
+    resetAction.storeI64(8, 0)
+    resetAction.storeI64(16, 0)
+    resetAction.storeI64(24, 0)
+    val unblockSet = nativeByteBuffer(8)
+    unblockSet.storeI64(0, 4096)
+    val barrierRead = nativeByteBuffer(8)
     index = 0
     while (problem == "" && index < commands.size) {
         val command = commands[index]
@@ -967,7 +1028,8 @@ fun linuxPipelineStart(commands: array<LinuxCommand>, grouped: bool, capture: bo
             0) linuxExecutablePath(command.arguments[0]) else ""
         val vector = linuxArgumentVector(command.arguments)
         val environment = command.environmentVector()
-        val process = int(fork())
+        val addresses = if (executable != "") command.execAddresses(executable) else LinuxExecAddresses(0, 0, 0, 0, 0)
+        val process = linuxFork()
         if (process == 0) {
             var ready = true
             if (grouped) ready = linuxSyscall2(109, 0, if (group < 0) 0 else group) == 0
@@ -976,7 +1038,12 @@ fun linuxPipelineStart(commands: array<LinuxCommand>, grouped: bool, capture: bo
                 if (linuxSyscall2(33, pipes[index].output, 1) < 0) ready = false
             } else if (capture && linuxSyscall2(33, stdout.output, 1) < 0) ready = false
             if (captureErrors && linuxSyscall2(33, stderr.output, 2) < 0) ready = false
-            for (pipe in pipes) { linuxPipelineClose(pipe.input); linuxPipelineClose(pipe.output) }
+            var closing = 0
+            while (closing < pipes.size) {
+                linuxPipelineClose(pipes[closing].input)
+                linuxPipelineClose(pipes[closing].output)
+                closing = closing + 1
+            }
             linuxPipelineClose(stdout.input)
             linuxPipelineClose(stdout.output)
             linuxPipelineClose(stderr.input)
@@ -989,11 +1056,13 @@ fun linuxPipelineStart(commands: array<LinuxCommand>, grouped: bool, capture: bo
             }
             if (grouped) {
                 linuxPipelineClose(barrier.output)
-                linuxPipelineRead(barrier.input, 1)
+                // Blocks until the parent closes the barrier (read returns 0).
+                var waited = linuxSyscall3(0, barrier.input, nativePointerAddress(barrierRead.address), 1)
+                while (waited == -4) waited = linuxSyscall3(0, barrier.input, nativePointerAddress(barrierRead.address), 1)
                 linuxPipelineClose(barrier.input)
             }
-            linuxPipelineResetSigpipe()
-            if (ready && executable != "") command.execPrepared(executable, vector, environment)
+            linuxPipelineResetSigpipe(resetAction, unblockSet)
+            if (ready && addresses.executable != 0) command.execPrepared(addresses, vector, environment)
             linuxWrite(reports[index].output, "x")
             linuxSyscall1(60, 127)
         }
@@ -1009,6 +1078,9 @@ fun linuxPipelineStart(commands: array<LinuxCommand>, grouped: bool, capture: bo
         }
         index = index + 1
     }
+    resetAction.close()
+    unblockSet.close()
+    barrierRead.close()
     for (pipe in pipes) { linuxPipelineClose(pipe.input); linuxPipelineClose(pipe.output) }
     linuxPipelineClose(stdout.output)
     linuxPipelineClose(stderr.output)

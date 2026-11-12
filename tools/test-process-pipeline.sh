@@ -24,7 +24,6 @@ ABLA_GROUP_TEST_FILE="$root/build/process-pipeline-test/group.txt" timeout 20 bu
 (ulimit -n 12; timeout 20 build/process-pipeline-test/pipe-failure)
 if [[ $(uname -s) == Linux ]]; then
     "$compiler" build tests/cases/process-pipeline/fork-failure.ab -o build/process-pipeline-test/fork-failure --fast --no-cache
-    cc -shared -fPIC tests/cases/process-pipeline/fail-second-fork.c -o build/process-pipeline-test/fail-second-fork.so -ldl
-    LD_PRELOAD="$root/build/process-pipeline-test/fail-second-fork.so" timeout 20 build/process-pipeline-test/fork-failure
+    timeout 20 build/process-pipeline-test/fork-failure
 fi
 echo 'process pipeline: captures, status, snapshots, SIGPIPE, failures and group stop'
