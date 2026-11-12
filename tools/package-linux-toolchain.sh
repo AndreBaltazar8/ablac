@@ -29,7 +29,16 @@ for tool in clang ld.lld llc lld llvm-ar llvm-config llvm-extract llvm-split \
 done
 
 working=$(mktemp -d)
-trap 'rm -rf -- "$working"' EXIT
+cleanup() {
+    local status=$?
+    trap - EXIT
+    if ! chmod -R u+w -- "$working" || ! rm -rf -- "$working"; then
+        printf 'failed to clean temporary packaging directory: %s\n' "$working" >&2
+        if [[ $status -eq 0 ]]; then status=1; fi
+    fi
+    return "$status"
+}
+trap cleanup EXIT
 bundle="$working/abla-toolchain-x86_64-linux"
 mkdir -p "$bundle/bin" "$bundle/lib" "$bundle/libexec" \
     "$bundle/share/abla" "$bundle/share/licenses"

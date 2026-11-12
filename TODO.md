@@ -20,6 +20,12 @@
 
 ## Bugs seen
 
+- [x] Linux toolchain packaging could write its archive and then fail in its
+  EXIT cleanup when the copied Clang resource tree contained read-only
+  directories, as with the Nix resource directory. Restore owner write
+  permission on the private temporary tree before removing it, preserving
+  any earlier failure; `tools/test-package-linux-cleanup.sh` checks both a
+  successful package and an injected packaging failure with 0555 directories.
 - [x] Darwin's Linux-compatible `openat` shim dropped `O_NOFOLLOW` (131072), letting a
   direct caller follow the final symlink despite asking not to. The shim maps it to Darwin
   `O_NOFOLLOW`; `tools/test-open-nofollow.sh` checks file and directory links. Linux passes;
