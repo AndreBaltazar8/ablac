@@ -256,6 +256,9 @@
   draws the Generator shapes by default again (ablac-f3-2 saw the same class as the `test-labeled-loops` segfault of
   #736's first gate).
 
+- **When condition temporary order (#798).** Each match condition now drops its temporary owners after comparison,
+  before the next condition or selected branch. Destructor effects can occur earlier in both native and compile-time
+  execution; multiple temporary-bearing conditions also compile correctly.
 - **Exit statement temporary order (#798).** A `return`, `break`, or `continue` now drops the leaving statement's
   temporary resources before running the defers of the exited scope. Native execution previously ran the defers
   first while compile-time evaluation dropped the temporaries first; destructor effects can therefore change order.
