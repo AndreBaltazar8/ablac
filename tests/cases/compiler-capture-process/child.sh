@@ -5,8 +5,19 @@ set -eu
 
 case $1 in
 bytes)
-    # \0 \377 A repeated, cut to exactly ARGUMENT bytes.
-    while :; do printf '\000\377A'; done 2>/dev/null | head -c "$2"
+    # \0 \377 A repeated, cut to exactly ARGUMENT bytes. Built by doubling a file:
+    # a printf loop took over a second for 1 MiB and ran into the capture deadline
+    # under load and on macOS.
+    pattern=${TMPDIR:-/tmp}/abla-capture-bytes.$$
+    trap 'rm -f "$pattern" "$pattern.next"' EXIT
+    printf '\000\377A' > "$pattern"
+    size=3
+    while [ "$size" -lt "$2" ]; do
+        cat "$pattern" "$pattern" > "$pattern.next"
+        mv "$pattern.next" "$pattern"
+        size=$((size * 2))
+    done
+    head -c "$2" "$pattern"
     ;;
 exit)
     exit "$2"
