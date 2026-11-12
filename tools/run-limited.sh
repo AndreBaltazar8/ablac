@@ -59,7 +59,9 @@ bounded() {
 }
 
 started=$SECONDS
-if [[ $OSTYPE == darwin* ]]; then
+# ABLA_RUN_LIMITED_SUPERVISOR=shell selects the macOS shell supervisor on any host (the
+# tests exercise it on Linux); on macOS it is opt-in until the switch from Python.
+if [[ $OSTYPE == darwin* && ${ABLA_RUN_LIMITED_SUPERVISOR:-} != shell ]]; then
     ulimit -S -c 0
     ulimit -S -t "$cpu_seconds"
     if ! command -v python3 >/dev/null 2>&1; then
@@ -70,6 +72,18 @@ if [[ $OSTYPE == darwin* ]]; then
     set +e
     bounded python3 "$runner_directory/run-limited-darwin.py" \
         "$$" "$wall_seconds" "$kill_grace_seconds" "$@"
+    set -e
+elif [[ ${ABLA_RUN_LIMITED_SUPERVISOR:-} == shell ]]; then
+    ulimit -S -c 0
+    ulimit -S -t "$cpu_seconds"
+    runner_directory=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+    set +e
+    # Job control gives the supervisor a process group of its own, so a kill of this
+    # shell's group leaves it to stop the payload group.
+    set -m
+    bounded "$runner_directory/run-limited-darwin.sh" \
+        "$$" "$wall_seconds" "$kill_grace_seconds" "$@"
+    set +m
     set -e
 else
     # Leave one CPU second between SIGXCPU and the hard SIGKILL fallback so
