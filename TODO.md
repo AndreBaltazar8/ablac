@@ -385,6 +385,11 @@
   3.98G in bit reads, 4.33G in output/CRC, and 1.64G in the new byte-fetch helper. The actual source
   method ran about 469 times; the profile suggests per-bit source/reader rooting and byte-fetch calls
   as the first speed investigation. Outer-loop chunk/state costs cannot be separated in this profile.
+  Keeping the Huffman bit reservoir and input position local reduced paired release-build user instructions
+  (three runs on one P-core) from 42.689G to 28.072G on the 72 MB companion, from 850.712M to 848.709M
+  on the repetitive input, and from 1.665G to 1.326G on the src tar. These streaming runs collect output;
+  they include process startup and file reading. The companion result meets the instruction threshold for
+  considering the collecting wrapper after the separately measured table and output-write experiments.
   The read-only
   `abla/archive/tar` reader now checks bounded ustar files/directories, paths, checksums and file-ancestor
   conflicts; links and PAX/GNU extensions are unsupported. On the SHA-verified Linux companion (30,720,987-byte
