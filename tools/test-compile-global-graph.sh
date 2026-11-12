@@ -27,11 +27,13 @@ for refusal in refused-closure-edit refused-same-lambda; do
 done
 # A native closure kept across a compile-time edit would run the edited body (#796): a pass that
 # changes declarations interprets the sites that make closures.
-for mode in interp jit auto; do
-    ABLA_COMPILE_EVAL=$mode "$compiler" build tests/cases/compile-global-graph/round-retry.ab \
-        -o "$out/round-retry-$mode" --fast --no-cache >"$out/round-retry-$mode.log" 2>&1
-    actual=$("$out/round-retry-$mode")
-    [[ $actual == '11,12' ]] || { printf 'graph retry mismatch (%s): %s\n' "$mode" "$actual" >&2; exit 1; }
+for retry in round-retry round-retry-field; do
+    for mode in interp jit auto; do
+        ABLA_COMPILE_EVAL=$mode "$compiler" build "tests/cases/compile-global-graph/$retry.ab" \
+            -o "$out/$retry-$mode" --fast --no-cache >"$out/$retry-$mode.log" 2>&1
+        actual=$("$out/$retry-$mode")
+        [[ $actual == '11,12' ]] || { printf 'graph retry mismatch (%s, %s): %s\n' "$retry" "$mode" "$actual" >&2; exit 1; }
+    done
 done
 if ABLA_COMPILE_EVAL=interp ABLA_EVAL_STEP_LIMIT=200 "$compiler" build \
     tests/cases/compile-global-graph/stopped-mutation.ab -o "$out/stopped" --fast --no-cache \
