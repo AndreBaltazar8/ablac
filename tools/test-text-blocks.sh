@@ -6,10 +6,9 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 out="$root/build/text-blocks"
 mkdir -p "$out"
 cd "$root"
-python3 - "$root/tests/cases/text-blocks/main.ab" "$out/crlf.ab" <<'PY'
-import pathlib, sys
-pathlib.Path(sys.argv[2]).write_bytes(pathlib.Path(sys.argv[1]).read_bytes().replace(b'\n', b'\r\n'))
-PY
+# CRLF copy: every line ends in LF (checked below), so appending CR before it is exact.
+sed $'s/$/\r/' "$root/tests/cases/text-blocks/main.ab" > "$out/crlf.ab"
+[[ $(tr -cd '\r' < "$out/crlf.ab" | wc -c) -eq $(tr -cd '\n' < "$root/tests/cases/text-blocks/main.ab" | wc -c) ]] || { echo "text blocks: CRLF copy is not one CR per LF" >&2; exit 1; }
 for mode in fast release; do
     options=()
     [[ $mode == release ]] || options+=(--fast)
