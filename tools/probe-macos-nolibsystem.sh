@@ -1,3 +1,6 @@
+    'lld-dynamic-main-nolibsystem|lld:-platform_version macos 11.0 11.0 -e _start'
+    'lld-dynamic-main-nolibsystem-15|lld:-platform_version macos 15.0 15.0 -e _start'
+    'lld-static-unixthread|lld:-static -platform_version macos 11.0 11.0 -e _start'
 #!/usr/bin/env bash
 # Feasibility probe for a libSystem-free macOS executable (#811): does a program
 # that makes write and exit (and a thread) by direct system calls start, and
@@ -22,13 +25,16 @@ summary=$out/summary.txt
 : > "$summary"
 
 # name|link flags
+lld=$(command -v ld64.lld || true)
+for prefix in lld@23 lld; do
+    [[ -z $lld && -x $(brew --prefix $prefix 2>/dev/null)/bin/ld64.lld ]] && lld=$(brew --prefix $prefix)/bin/ld64.lld
+done
+echo "ld64.lld: ${lld:-not found}"
+
 variants=(
     'nostdlib-e|-nostdlib -Wl,-e,_start'
     'nostdlib-static-e|-nostdlib -static -Wl,-e,_start'
     'nostdlib-static-pv15-e|-nostdlib -static -Wl,-e,_start -Wl,-platform_version,macos,15.0,15.0'
-    'nostdlib-static-pv15-nouuid-e|-nostdlib -static -Wl,-e,_start -Wl,-platform_version,macos,15.0,15.0 -Wl,-no_uuid'
-    'nostdlib-static-pv15-pagezero-e|-nostdlib -static -Wl,-e,_start -Wl,-platform_version,macos,15.0,15.0 -Wl,-pagezero_size,0x100000000'
-    'nostdlib-static-pagezero-e|-nostdlib -static -Wl,-e,_start -Wl,-pagezero_size,0x100000000'
     'libsystem-listed-main|-nostdlib -lSystem'
     'libsystem-listed-e|-nostdlib -lSystem -Wl,-e,_start'
 )
@@ -72,8 +78,17 @@ try() { # variant program flags
     if ! xcrun clang -arch "$arch" -c "$src/$program-$arch.s" -o "$dir/$program.o" > "$dir/assemble.log" 2>&1; then
         cat "$dir/assemble.log"; report "$name" "$program" "assembler failed"; return
     fi
-    # shellcheck disable=SC2086
-    if ! xcrun clang -arch "$arch" $flags "$dir/$program.o" -o "$dir/$program" > "$dir/link.log" 2>&1; then
+    local linked=0
+    # A flags string starting with "lld:" links with LLVM's Mach-O linker instead of Apple's ld.
+    if [[ $flags == lld:* ]]; then
+        if [[ -z $lld ]]; then report "$name" "$program" "ld64.lld not installed"; return; fi
+        # shellcheck disable=SC2086
+        "$lld" -arch "$arch" ${flags#lld:} "$dir/$program.o" -o "$dir/$program" > "$dir/link.log" 2>&1 && linked=1
+    else
+        # shellcheck disable=SC2086
+        xcrun clang -arch "$arch" $flags "$dir/$program.o" -o "$dir/$program" > "$dir/link.log" 2>&1 && linked=1
+    fi
+    if [[ $linked -eq 0 ]]; then
         cat "$dir/link.log"
         report "$name" "$program" "link refused: $(grep -m1 -i 'error\|ld:' "$dir/link.log" | cut -c1-200)"
         return
