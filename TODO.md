@@ -279,6 +279,12 @@
   (24 each) agreed in all six modes on compiler fbd02092. The tool suite and wrong-expectation control passed;
   unanimous nonzero exits now fail the comparison instead of masquerading as agreement.
 
+  `yaml_check` generates small block/flow YAML and compares a semantic projection to Python's independent
+  value oracle. It covers quoted versus Core-resolved scalars, aliases at the expanded-node bound, block
+  chomping, malformed inputs and small limits; a wrong-expectation control detects a shared failure.
+  Focused seeds 4421 to 4440 (8 checks each), 4461 to 4462 (24 each), and default seeds 4441 to 4460
+  (24 each) agreed in all six modes on compiler fbd02092; the tool suite passed.
+
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
 - [ ] **Abla-native Xtensa companion installer.** The explicit optional installer uses only the Python

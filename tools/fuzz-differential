@@ -420,6 +420,80 @@ class Gen:
         lines.append("}")
         return lines, f"c{index}()", "str"
 
+    def yaml_check(self, index):
+        """Generate a YAML subset and a Python JSON semantic oracle without PyYAML."""
+        r = self.r
+
+        def literal(text):
+            out = '"'
+            for c in text:
+                if c in '\\"$': out += '\\' + c
+                elif ord(c) < 32: out += f'\\x{ord(c):02x}'
+                else: out += c
+            return out + '"'
+
+        def expected(value):
+            return literal(json.dumps(value, ensure_ascii=False, separators=(',', ':')))
+
+        def construct(v):
+            if v is None: return 'yamlNull()'
+            if isinstance(v, bool): return 'yamlBoolean(' + str(v).lower() + ')'
+            if isinstance(v, int): return f'yamlInteger({v})'
+            if isinstance(v, str): return 'yamlString(' + literal(v) + ')'
+            if isinstance(v, list): return 'yamlSequence([' + ', '.join(construct(x) for x in v) + '])'
+            return ('yamlObject([' + ', '.join(literal(k) for k in v) + '], [' +
+                    ', '.join(construct(x) for x in v.values()) + '])')
+
+        mode = r.choice(['tree', 'scalar', 'alias', 'block', 'malformed', 'limit'])
+        lines = [f'fun c{index}(): string {{']
+        if mode == 'tree':
+            v = {'name': r.choice(['true', 'null', '1e3', '~', '0x10', '', 'hé😀', 'a\nb']),
+                 'items': [r.randint(-100, 100), r.choice([True, False, None]), {'text': 'quoted'}]}
+            if r.choice([True, False]):
+                source = json.dumps(v, ensure_ascii=False, separators=(', ', ': '))
+            else:
+                source = ''.join(json.dumps(k, ensure_ascii=False) + ': ' +
+                                 json.dumps(x, ensure_ascii=False) + '\n' for k, x in v.items())
+            lines += [f'    val expected = {expected(v)}', f'    val parsed = yamlParse({literal(source)})',
+                      '    if (!parsed.succeeded || jsonStringify(fuzzYamlJson(parsed.value)) != expected) return "FUZZ_ORACLE_FAILURE"',
+                      f'    val emitted = yamlEmit({construct(v)})',
+                      '    if (!emitted.succeeded) return "FUZZ_ORACLE_FAILURE"',
+                      '    val again = yamlParse(emitted.text)',
+                      '    if (!again.succeeded || jsonStringify(fuzzYamlJson(again.value)) != expected) return "FUZZ_ORACLE_FAILURE"']
+        elif mode == 'scalar':
+            text, plain = r.choice([('true', True), ('null', None), ('1e3', 'FLOAT:1e3'),
+                                    ('~', None), ('0x10', 16), ('', None)])
+            quoted = json.dumps(text, ensure_ascii=False)
+            lines += [f'    val quoted = yamlParse({literal(quoted)})',
+                      f'    val plain = yamlParse({literal(text)})',
+                      f'    if (!quoted.succeeded || jsonStringify(fuzzYamlJson(quoted.value)) != {expected(text)}) return "FUZZ_ORACLE_FAILURE"',
+                      f'    if (!plain.succeeded || jsonStringify(fuzzYamlJson(plain.value)) != {expected(plain)}) return "FUZZ_ORACLE_FAILURE"']
+        elif mode == 'alias':
+            source = 'a: &v [1, 2]\nb: *v\nc: *v\n'
+            v = {'a': [1, 2], 'b': [1, 2], 'c': [1, 2]}
+            lines += [f'    val parsed = yamlParse({literal(source)}, YamlLimits(maximumExpandedNodes = 13))',
+                      f'    if (!parsed.succeeded || jsonStringify(fuzzYamlJson(parsed.value)) != {expected(v)}) return "FUZZ_ORACLE_FAILURE"',
+                      f'    val limited = yamlParse({literal(source)}, YamlLimits(maximumExpandedNodes = 12))',
+                      '    if (limited.succeeded || limited.error.code != "limit.expansion") return "FUZZ_ORACLE_FAILURE"']
+        elif mode == 'block':
+            indicator, ending = r.choice([('-', ''), ('', '\n'), ('+', '\n\n')])
+            source = 'key: |' + indicator + '\n  one\n  two\n\n'
+            lines += [f'    val parsed = yamlParse({literal(source)})',
+                      f'    if (!parsed.succeeded || jsonStringify(fuzzYamlJson(parsed.value)) != {expected({"key": "one\ntwo" + ending})}) return "FUZZ_ORACLE_FAILURE"']
+        elif mode == 'malformed':
+            source = r.choice(['a: 1\na: 2\n', 'x: "\\q"\n', 'x: !!str a\n',
+                               'x: *missing\n', '---\na\n---\nb\n', 'a:\n  b: 1\n c: 2\n'])
+            lines += [f'    val parsed = yamlParse({literal(source)})',
+                      '    if (parsed.succeeded) return "FUZZ_ORACLE_FAILURE"']
+        else:
+            source, limit, exact = r.choice([('abc', 'maximumBytes', 3), ('[a,b]', 'maximumNodes', 3),
+                                              ('[a,b]', 'maximumCollectionMembers', 2), ('[0]', 'maximumDepth', 2)])
+            lines += [f'    val atLimit = yamlParse({literal(source)}, YamlLimits({limit} = {exact}))',
+                      f'    val over = yamlParse({literal(source)}, YamlLimits({limit} = {exact - 1}))',
+                      '    if (!atLimit.succeeded || over.succeeded) return "FUZZ_ORACLE_FAILURE"']
+        lines += ['    "ok"', '}']
+        return lines, f'c{index}()', 'str'
+
     def json_check(self, index):
         """Python oracle: insertion order, compact UTF-8, integers only; no floats or lone surrogates."""
         r = self.r
@@ -1027,6 +1101,7 @@ import "abla/text"
 import "abla/bytes"
 import "abla/compression/gzip"
 import "abla/json"
+import "abla/yaml"
 import "abla/compiler"
 
 class Box<T>(var value: T) {
@@ -1088,6 +1163,21 @@ fun render(e: Expr): string = when (e) {
     is Mul -> "(${render(e.left)}*${render(e.right)})"
     is Neg -> "-${render(e.operand)}"
     is Pick -> "(${render(e.cond)}?${render(e.yes)}:${render(e.no)})"
+}
+fun fuzzYamlJson(value: Yaml): Json {
+    if (value.isNull()) return jsonNull()
+    if (value.isString()) return jsonString(value.asString())
+    if (value.isBoolean()) return jsonBoolean(value.asBoolean())
+    if (value.isNumber()) {
+        if (value.intAvailable()) return jsonInteger(value.asInt())
+        return jsonString("FLOAT:" + value.asNumber().text)
+    }
+    val values: array<Json> = []
+    for (item in value.values) values.append(fuzzYamlJson(item))
+    if (value.isSequence()) return jsonArray(values)
+    val keys: array<string> = []
+    for (key in value.keys) keys.append(key.asString())
+    jsonObject(keys, values)
 }
 fun fmtF(x: f64): string = if (x != x) "nan" else f64Text(x)
 fun anyEq(a: any, b: any): bool = a == b
@@ -1536,7 +1626,7 @@ fun <T, U> crossed(a: T, b: U): Pair<U, T> = Pair(b, a)
                              self.any_check, self.clash_check,
                              self.generic_lambda_check, self.resource_drop_check,
                              self.elvis_member_check, self.gzip_check, self.nested_generator_check,
-                             self.json_check])(index)
+                             self.json_check, self.yaml_check])(index)
         extra = r.random()
         if extra < 0.30:
             return r.choice([self.conv_check, self.generic_check, self.iface_check,

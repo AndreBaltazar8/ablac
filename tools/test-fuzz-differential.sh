@@ -39,6 +39,16 @@ assert all(v[0] != 'build-failed' for v in bad.values()), bad
 assert all('c0=FUZZ_ORACLE_FAILURE' in v[0] for v in bad.values()), bad
 assert f['verdict'](bad) is not None and f['differing_lines'](bad) == ['c0'], bad
 print('fuzz differential: wrong JSON expectation detected in all modes')
+lines, call, ty = f['Gen'](4405).yaml_check(0)
+good = run(lines, 'yaml-control-good')
+assert f['verdict'](good) is None, good
+broken = [s + ' + "x"' if s.startswith('    val expected = ') else s for s in lines]
+assert broken != lines
+bad = run(broken, 'yaml-control-broken')
+assert all(v[0] != 'build-failed' for v in bad.values()), bad
+assert all('c0=FUZZ_ORACLE_FAILURE' in v[0] for v in bad.values()), bad
+assert f['verdict'](bad) is not None and f['differing_lines'](bad) == ['c0'], bad
+print('fuzz differential: wrong YAML expectation detected in all modes')
 PY
 python3 tools/fuzz-differential --compiler "$compiler" --seeds 1-2 --checks 16
 # The cases the fuzzer found stay as programs: every mode must print the same, and
