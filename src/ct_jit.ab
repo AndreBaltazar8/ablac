@@ -24,6 +24,7 @@ import "ct_bridge.ab"
 import "ct_native_effects.ab"
 import "ct_lift.ab"
 import "ct_portable_extern.ab"
+import "call_targets.ab"
 import "eval.ab"
 import "abla/sys/linux/process"
 import "abla/sys/linux/fs"
@@ -143,7 +144,7 @@ fun bootstrapCtAnalyze(
         }
     }
     val analyzed = bootstrapAnalyzeRequestedSourceSpans(
-        parsed, begins, ends, kinds, sources
+        parsed, begins, ends, kinds, sources, !bootstrapCtTripleIsHost(targetTriple)
     )
     for (site in bootstrapCtSites) {
         if (!site.action) {
@@ -156,7 +157,7 @@ fun bootstrapCtAnalyze(
             }
         }
     }
-    if (analyzed.errors == 0) bootstrapCtPrepare(parsed, targetTriple)
+    if (analyzed.errors == 0) bootstrapCtPrepare(parsed, targetTriple, analyzed.methodTargets)
     analyzed
 }
 
@@ -365,14 +366,47 @@ class BootstrapCtReach(
     val itemNext: array<int>,
     val visited: array<bool>,
     // Every declaration some ready site reaches: the slice is these and the runtime.
-    val kept: array<bool>
+    val kept: array<bool>,
+    val methodTargets: BootstrapResolvedMethodTargets = bootstrapResolvedMethodTargets(),
+    val itemHandles: array<int> = [],
+    val itemIdentities: array<string> = [],
+    val concreteReceivers: BootstrapIrNameTable = bootstrapIrNameTable(16)
 ) {
-    fun add(name: string, declaration: int, method: int): void {
+    fun add(name: string, declaration: int, method: int, handle: int): void {
         this.itemDeclarations.append(declaration)
         this.itemMethods.append(method)
         this.itemNext.append(this.table.find(name, -1))
         this.visited.append(false)
+        this.itemHandles.append(handle)
+        val owner = this.declarations[declaration]
+        this.itemIdentities.append(if (!this.methodTargets.enabled) ""
+            else if (method < 0) bootstrapResolvedDeclarationIdentity(owner)
+            else bootstrapResolvedDeclarationIdentity(owner.methods[method], owner.sourceIdentity))
         this.table.put(name, this.itemDeclarations.size - 1)
+    }
+
+    fun exactMethodTarget(source: string, node: BootstrapExpression): int {
+        val fact = this.methodTargets.find(source, node)
+        if (fact < 0) return -1
+        val selected = this.methodTargets.targets[fact]
+        if (selected.target < 0 || selected.identity == "") return -1
+        // Class receivers have a single static implementation. Interface,
+        // generic, unknown and dynamic receivers keep every possible candidate.
+        val concrete = this.concreteReceivers.find(selected.receiver, -1) >= 0
+        if (!concrete) return -1
+        var candidate = this.table.find(node.text, -1)
+        while (candidate >= 0) {
+            if (this.itemHandles[candidate] == selected.target &&
+                this.itemIdentities[candidate] == selected.identity) {
+                val owner = this.declarations[this.itemDeclarations[candidate]]
+                val declaration = if (this.itemMethods[candidate] < 0) owner
+                    else owner.methods[this.itemMethods[candidate]]
+                if (declaration.typeParameters.size > 0) return -1
+                return selected.target
+            }
+            candidate = this.itemNext[candidate]
+        }
+        -1
     }
 
     // The names in a declaration's signature types (a class named only in a parameter
@@ -381,6 +415,7 @@ class BootstrapCtReach(
         declaration: BootstrapDeclaration,
         var pending: array<BootstrapExpression>,
         var pendingLibrary: array<bool>,
+        var pendingSources: array<string>,
         library: bool
     ): void {
         // An extension's receiver is a type of it too (a method kept by name brings
@@ -400,6 +435,7 @@ class BootstrapCtReach(
                             "type", type.slice(begin, index), 0, 0, []
                         ))
                         pendingLibrary.append(library)
+                        pendingSources.append(declaration.sourceIdentity)
                     }
                     begin = index + 1
                 }
@@ -421,13 +457,14 @@ class BootstrapCtReach(
     fun unsupported(
         expression: BootstrapExpression,
         var globals: array<int>,
-        crossTarget: bool = false
-    ): string = this.walk(expression, globals, false, false, crossTarget)
+        crossTarget: bool = false,
+        source: string = ""
+    ): string = this.walk(expression, globals, false, false, crossTarget, source)
 
     // What the runtime's own declarations reach is part of every slice.
-    fun keepFrom(expression: BootstrapExpression): void {
+    fun keepFrom(expression: BootstrapExpression, source: string = ""): void {
         val unused: array<int> = []
-        val ignored = this.walk(expression, unused, true, true)
+        val ignored = this.walk(expression, unused, true, true, false, source)
         return
     }
 
@@ -439,16 +476,20 @@ class BootstrapCtReach(
         var globals: array<int>,
         keepOnly: bool,
         fromLibrary: bool,
-        crossTarget: bool = false
+        crossTarget: bool = false,
+        source: string = ""
     ): string {
         val pending: array<BootstrapExpression> = [expression]
         val pendingLibrary: array<bool> = [fromLibrary]
+        val pendingSources: array<string> = [source]
         var reason = ""
         while (reason == "" && pending.size > 0) {
             val node = pending[pending.size - 1]
             val library = pendingLibrary[pendingLibrary.size - 1]
+            val nodeSource = pendingSources[pendingSources.size - 1]
             pending.truncate(pending.size - 1)
             pendingLibrary.truncate(pendingLibrary.size - 1)
+            pendingSources.truncate(pendingSources.size - 1)
             if (crossTarget && !bootstrapCtCrossNodeAllowed(node)) {
                 return "cross-target site reaches expression ${node.kind} `${node.text}`: not proven portable"
             }
@@ -459,11 +500,13 @@ class BootstrapCtReach(
             for (child in children) {
                 pending.append(child)
                 pendingLibrary.append(library)
+                pendingSources.append(nodeSource)
             }
             val literal = node.kind == "string" || node.kind == "integer" ||
                 node.kind == "float" || node.kind == "float32" || node.kind == "char"
             if (!literal && node.text != "") {
                 var item = this.table.find(node.text, -1)
+                val exactTarget = this.exactMethodTarget(nodeSource, node)
                 if (crossTarget && item < 0 &&
                     (node.kind == "call" || node.kind == "member.call") &&
                     !bootstrapCtCrossBuiltin(node)) {
@@ -492,13 +535,14 @@ class BootstrapCtReach(
                     val bareMethod = crossTarget &&
                         (this.itemMethods[item] >= 0 || owner.extensionOwner != "") &&
                         node.kind != "call" && node.kind != "member.call" && node.kind != "member"
-                    val names = !bareMethod && (!valueItem ||
+                    val selected = exactTarget < 0 || this.itemHandles[item] == exactTarget
+                    val names = selected && !bareMethod && (!valueItem ||
                         ((node.kind == "identifier" || node.kind == "assign" || callsValue) &&
                          (!library || ownerLibrary)))
                     if (names && !this.visited[item]) {
                         this.visited[item] = true
                         this.kept[this.itemDeclarations[item]] = true
-                        this.pendTypes(owner, pending, pendingLibrary, ownerLibrary)
+                        this.pendTypes(owner, pending, pendingLibrary, pendingSources, ownerLibrary)
                         val declaration = if (this.itemMethods[item] < 0) owner
                             else owner.methods[this.itemMethods[item]]
                         if (crossTarget) {
@@ -528,6 +572,7 @@ class BootstrapCtReach(
                                 "call", "__ablaPanicContain", 0, 0, []
                             ))
                             pendingLibrary.append(true)
+                            pendingSources.append("")
                             follow = false
                         } else if (bootstrapCompileDeclarationProviderEffect(declaration) > 0) {
                             // A capability provider (files, environment,
@@ -564,22 +609,31 @@ class BootstrapCtReach(
                         if (reason == "" && follow) {
                             pending.append(declaration.expression)
                             pendingLibrary.append(ownerLibrary)
+                            pendingSources.append(if (declaration.sourceIdentity != "")
+                                declaration.sourceIdentity else owner.sourceIdentity)
                             for (parameterDefault in declaration.parameterDefaults) {
                                 pending.append(parameterDefault)
                                 pendingLibrary.append(ownerLibrary)
+                                pendingSources.append(if (declaration.sourceIdentity != "")
+                                    declaration.sourceIdentity else owner.sourceIdentity)
                             }
                             if (this.itemMethods[item] >= 0) {
                                 // The slice carries the whole class a method belongs
                                 // to, so every method of it is reached.
                                 pending.append(BootstrapExpression("type", owner.name, 0, 0, []))
                                 pendingLibrary.append(ownerLibrary)
+                                pendingSources.append(owner.sourceIdentity)
                             } else {
                                 for (method in declaration.methods) {
                                     pending.append(method.expression)
                                     pendingLibrary.append(ownerLibrary)
+                                    pendingSources.append(if (method.sourceIdentity != "")
+                                        method.sourceIdentity else owner.sourceIdentity)
                                     for (parameterDefault in method.parameterDefaults) {
                                         pending.append(parameterDefault)
                                         pendingLibrary.append(ownerLibrary)
+                                        pendingSources.append(if (method.sourceIdentity != "")
+                                            method.sourceIdentity else owner.sourceIdentity)
                                     }
                                 }
                             }
@@ -687,20 +741,31 @@ fun bootstrapCtRuntimeDeclaration(declaration: BootstrapDeclaration): bool =
     (declaration.kind == "fun" && declaration.extensionOwner != "" &&
      declaration.name.startsWith(bootstrapExtensionFieldDefaultName("")))
 
-fun bootstrapCtReach(declarations: array<BootstrapDeclaration>): BootstrapCtReach {
+fun bootstrapCtReach(declarations: array<BootstrapDeclaration>,
+    methodTargets: BootstrapResolvedMethodTargets =
+    bootstrapResolvedMethodTargets()): BootstrapCtReach {
     var count = declarations.size
     for (declaration in declarations) count = count + declaration.methods.size
     val kept: array<bool> = []
     for (declaration in declarations) kept.append(false)
     val reach = BootstrapCtReach(
-        declarations, bootstrapIrNameTable(count), [], [], [], [], kept
+        declarations, bootstrapIrNameTable(count), [], [], [], [], kept, methodTargets,
+        [], [], bootstrapIrNameTable(declarations.size + 5)
     )
+    for (type in ["string", "i64", "bool", "f32", "f64"]) reach.concreteReceivers.put(type, 1)
+    for (declaration in declarations) {
+        if (declaration.kind == "class" && declaration.typeParameters.size == 0) {
+            reach.concreteReceivers.put(declaration.name, 1)
+        }
+    }
     var index = 0
+    var handle = declarations.size
     while (index < declarations.size) {
-        reach.add(declarations[index].name, index, -1)
+        reach.add(declarations[index].name, index, -1, index)
         var method = 0
         while (method < declarations[index].methods.size) {
-            reach.add(declarations[index].methods[method].name, index, method)
+            reach.add(declarations[index].methods[method].name, index, method, handle)
+            handle += 1
             method = method + 1
         }
         index = index + 1
@@ -943,7 +1008,8 @@ fun bootstrapCtTripleFamily(triple: string): string {
 fun bootstrapCtTripleIsHost(triple: string): bool =
     bootstrapCtTripleFamily(triple) == bootstrapCtTripleFamily(llvmDefaultTargetTriple())
 
-fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string): void {
+fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string,
+    methodTargets: BootstrapResolvedMethodTargets = bootstrapResolvedMethodTargets()): void {
     val started = linuxMonotonicMilliseconds()
     for (site in bootstrapCtSites) {
         if (site.reason == BOOTSTRAP_CT_UNPREPARED) site.reason = ""
@@ -964,14 +1030,16 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string): void
             }
         }
     }
-    val reach = bootstrapCtReach(parsed.declarations)
+    val reach = bootstrapCtReach(parsed.declarations, methodTargets)
     // Separate visitation: proving only portable executed code must not prune the
     // full declaration bodies the ordinary slice's analysis and lowering require.
-    val portable = if (crossTarget) bootstrapCtReach(parsed.declarations) else reach
+    val portable = if (crossTarget) bootstrapCtReach(parsed.declarations, methodTargets) else reach
     for (declaration in parsed.declarations) {
         if (bootstrapCtRuntimeDeclaration(declaration)) {
-            reach.keepFrom(declaration.expression)
-            for (method in declaration.methods) reach.keepFrom(method.expression)
+            reach.keepFrom(declaration.expression, declaration.sourceIdentity)
+            for (method in declaration.methods) reach.keepFrom(method.expression,
+                if (method.sourceIdentity !=
+                    "") method.sourceIdentity else declaration.sourceIdentity)
         }
     }
     // A float in a string template is written by abla/float/text's f64Text (an f32
@@ -1028,9 +1096,11 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string): void
             if (crossTarget) {
                 portable.reset()
                 val ignoredGlobals: array<int> = []
-                site.reason = portable.unsupported(site.expression, ignoredGlobals, true)
+                site.reason = portable.unsupported(site.expression, ignoredGlobals, true,
+                    site.sourceIdentity)
             }
-            if (site.reason == "") site.reason = reach.unsupported(site.expression, reached)
+            if (site.reason == "") site.reason = reach.unsupported(site.expression, reached, false,
+                site.sourceIdentity)
             if (crossTarget && site.reason == "") {
                 // Whole bodies are kept even where the phase proof skips an arm.
                 // A global reached only from that arm would nevertheless initialize

@@ -348,6 +348,15 @@
   unrecognised modules/annotations and modules with implicit extension-field roots keep the evaluator.
   Prove those roots and their eager initializers before widening the rule; never emit the target platform runtime as host code.
 
+- Cross-target JIT materialised global data (#797 part 2, deferred to #796):
+  `compile fun assetHost(): string = compilerEnvironment("ASSET_HOST")`;
+  `val ASSET_HOST: string = #assetHost()`;
+  `val ASSET_TABLE = #assetTable(ASSET_HOST)` currently pulls the host global's
+  initializer query into the hashing site's reach. A kept string/int/bool value
+  can replace that reach only after #796 proves no possible writer; preserve
+  the initializer's own eligibility and environment-input journal/cache checks.
+  Add this exact global-argument shape to #796's parity and mutation controls.
+
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
 - [ ] **Abla-native Xtensa companion installer.** The explicit optional installer uses only the Python

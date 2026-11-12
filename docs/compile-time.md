@@ -857,6 +857,12 @@ unexecuted native staging paths do not make their portable SHA operations target
 dependent. This does not change the default tier or permit a genuinely reentrant
 compile pass to replace its outer pass's JIT state.
 
+For a statically resolved method on a concrete receiver, the cross-target proof
+uses the type checker's selected method. An unrelated type's method with the
+same name does not become a dependency of that call. Unknown, ambiguous,
+generic or interface dispatch keeps the conservative candidate set; retained
+class bodies and eager global initializers still need their existing checks.
+
 - A runtime panic in native compile-time code is the evaluator's error for the
   same failure, with the same text (`E_EVAL_OUT_OF_BOUNDS`,
   `E_EVAL_DIVISION_BY_ZERO`, else `E_CT_PANIC`); an abort, a failed check or

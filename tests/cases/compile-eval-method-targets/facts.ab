@@ -1,0 +1,69 @@
+import "../../../src/parser.ab"
+import "../../../src/ct_jit.ab"
+import "../../../src/call_targets.ab"
+
+fun main: int {
+    val source =
+        "interface Choice { fun toText(): int }\nclass Good: Choice { fun toText(): int = 1 }\nclass Bad: Choice { fun toText(): int = abs(-1) }\nextern:\"c\" fun abs(x: int): int\n"
+    val parsed = bootstrapParseWithIdentity(source, "facts.ab")
+    if (parsed.errors != 0 || parsed.declarations.size != 4) return 1
+    val node = BootstrapExpression("member.call", "toText", 1000, 1010, [])
+    val facts = bootstrapResolvedMethodTargets(true)
+    val good = parsed.declarations.size + 1
+    facts.record(parsed.declarations, "facts.ab", node, "Good", good)
+    facts.record(parsed.declarations, "facts.ab", node, "Good", good)
+    val exact = bootstrapCtReach(parsed.declarations, facts)
+    if (exact.exactMethodTarget("facts.ab", node) != good) return 2
+    val globals: array<int> = []
+    val reason = exact.unsupported(node, globals, false, "facts.ab")
+    if (reason != "" || !exact.kept[1] || exact.kept[2] || exact.kept[3]) return 3
+    if (exact.exactMethodTarget("another.ab", node) >= 0) return 4
+    // A statically typed interface still admits every implementation candidate.
+    val dynamic = bootstrapResolvedMethodTargets(true)
+    dynamic.record(parsed.declarations, "facts.ab", node, "Choice", parsed.declarations.size)
+    val all = bootstrapCtReach(parsed.declarations, dynamic)
+    if (all.exactMethodTarget("facts.ab", node) >= 0) return 5
+    val allReason = all.unsupported(node, globals, false, "facts.ab")
+    if (allReason != "" || !all.kept[2] || !all.kept[3]) return 6
+    // Conflicting observations, unknown targets and stale handles fail closed.
+    facts.record(parsed.declarations, "facts.ab", node, "Bad", good + 1)
+    if (bootstrapCtReach(parsed.declarations, facts).exactMethodTarget("facts.ab", node) >= 0)
+        return 7
+    val unknown = bootstrapResolvedMethodTargets(true)
+    unknown.record(parsed.declarations, "facts.ab", node, "unknown", -1)
+    unknown.record(parsed.declarations, "facts.ab", node, "Good", good)
+    if (bootstrapCtReach(parsed.declarations, unknown).exactMethodTarget("facts.ab", node) >= 0)
+        return 8
+    val stale = bootstrapResolvedMethodTargets(true)
+    stale.record(parsed.declarations, "facts.ab", node, "Good", 9999)
+    if (bootstrapCtReach(parsed.declarations, stale).exactMethodTarget("facts.ab", node) >= 0)
+        return 9
+    val generic = bootstrapParseWithIdentity(
+        "class Plain { fun <T> toText(value: T): int = 1 }", "generic.ab")
+    if (generic.errors != 0 || generic.declarations[0].methods[0].typeParameters.size != 1)
+        return 10
+    val genericFacts = bootstrapResolvedMethodTargets(true)
+    genericFacts.record(generic.declarations, "generic.ab", node, "Plain",
+        generic.declarations.size)
+    if (bootstrapCtReach(generic.declarations, genericFacts)
+        .exactMethodTarget("generic.ab", node) >= 0) return 11
+    // A concrete outer call can enter an interface default. Dispatch on the
+    // default's interface-typed `this` must retain the unsafe implementation.
+    val defaults = bootstrapParseWithIdentity(
+        "interface Formatter { fun leaf(): int; fun toText(): int = this.leaf() }\nclass Good: Formatter { fun leaf(): int = 1 }\nclass Bad: Formatter { fun leaf(): int = abs(-1) }\nextern:\"c\" fun abs(x: int): int",
+        "defaults.ab")
+    if (defaults.errors != 0 || defaults.declarations.size != 4) return 12
+    val outer = BootstrapExpression("member.call", "toText", 2000, 2010, [])
+    val inherited = bootstrapResolvedMethodTargets(true)
+    inherited.record(defaults.declarations, "defaults.ab", outer, "Good",
+        defaults.declarations.size + 1)
+    inherited.record(defaults.declarations, "defaults.ab",
+        defaults.declarations[0].methods[1].expression,
+        "Formatter", defaults.declarations.size)
+    val inheritedReach = bootstrapCtReach(defaults.declarations, inherited)
+    if (inheritedReach.exactMethodTarget("defaults.ab", outer) != defaults.declarations.size + 1)
+        return 13
+    val inheritedReason = inheritedReach.unsupported(outer, globals, false, "defaults.ab")
+    if (inheritedReason != "" || !inheritedReach.kept[2] || !inheritedReach.kept[3]) return 14
+    42
+}

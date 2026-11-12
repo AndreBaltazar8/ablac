@@ -217,6 +217,7 @@ test-serial: ablac
 	tools/test-thread-globals.sh $(COMPILER)
 	tools/test-compile-eval-jit.sh $(COMPILER)
 	tools/test-compile-eval-cross-target.sh $(COMPILER)
+	tools/test-compile-eval-method-targets.sh $(COMPILER)
 	tools/test-compile-eval-directory.sh $(COMPILER)
 	tools/test-compile-native.sh $(COMPILER)
 	tools/test-xtensa-interrupt-handler.sh $(COMPILER)
