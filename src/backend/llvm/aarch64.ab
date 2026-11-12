@@ -148,7 +148,8 @@ fun bootstrapLlvmAarch64OpenFlags(): string =
 
 fun bootstrapLlvmEmitAarch64Routines(backend: BootstrapLlvmBackend): void {
     val assembly = bootstrapLlvmAarch64SyscallAssembly() + bootstrapLlvmAarch64StartAssembly() +
-        bootstrapLlvmAarch64JumpAssembly()
+        bootstrapLlvmAarch64JumpAssembly() +
+        bootstrapLlvmAarch64MemoryAssembly()
     LLVMAppendModuleInlineAsm(backend.module, assembly, assembly.size)
     return
 }
@@ -228,4 +229,51 @@ fun bootstrapLlvmAarch64JumpAssembly(): string {
     "    cmp w1, #0\n    mov w2, #1\n    csel w0, w2, w1, eq\n" +
     "    ret\n" +
     ".size _longjmp, . - _longjmp\n"
+}
+
+// memmove, memcpy, memset, memcmp, bcmp and strlen for AArch64 Linux, hidden module
+// assembly like the x86-64 ones (LLVM lowers llvm.memcpy and friends to calls of these
+// names): 16 bytes a step with ldp/stp, then bytes. memmove copies backwards when the
+// destination lies inside the source.
+fun bootstrapLlvmAarch64MemoryAssembly(): string {
+    ".text\n.p2align 2\n" +
+    bootstrapLlvmAssemblyHiddenFunction("memmove") +
+    "memmove:\n" +
+    "    cmp x0, x1\n    b.ls memcpy\n" +
+    "    add x3, x1, x2\n    cmp x0, x3\n    b.hs memcpy\n" +
+    "    add x4, x0, x2\n    add x5, x1, x2\n" +
+    "1:  cmp x2, #16\n    b.lo 3f\n    ldp x6, x7, [x5, #-16]!\n    stp x6, x7, [x4, #-16]!\n    sub x2, x2, #16\n    b 1b\n" +
+    "3:  cbz x2, 9f\n" +
+    "4:  ldrb w6, [x5, #-1]!\n    strb w6, [x4, #-1]!\n    subs x2, x2, #1\n    b.ne 4b\n" +
+    "9:  ret\n" +
+    ".size memmove, . - memmove\n" +
+    bootstrapLlvmAssemblyHiddenFunction("memcpy") +
+    "memcpy:\n" +
+    "    mov x4, x0\n" +
+    "1:  cmp x2, #16\n    b.lo 2f\n    ldp x6, x7, [x1], #16\n    stp x6, x7, [x4], #16\n    sub x2, x2, #16\n    b 1b\n" +
+    "2:  cbz x2, 9f\n" +
+    "3:  ldrb w6, [x1], #1\n    strb w6, [x4], #1\n    subs x2, x2, #1\n    b.ne 3b\n" +
+    "9:  ret\n" +
+    ".size memcpy, . - memcpy\n" +
+    bootstrapLlvmAssemblyHiddenFunction("memset") +
+    "memset:\n" +
+    "    and x1, x1, #0xff\n    mov x3, #0x0101010101010101\n    mul x3, x1, x3\n    mov x4, x0\n" +
+    "1:  cmp x2, #16\n    b.lo 2f\n    stp x3, x3, [x4], #16\n    sub x2, x2, #16\n    b 1b\n" +
+    "2:  cbz x2, 9f\n" +
+    "3:  strb w1, [x4], #1\n    subs x2, x2, #1\n    b.ne 3b\n" +
+    "9:  ret\n" +
+    ".size memset, . - memset\n" +
+    bootstrapLlvmAssemblyHiddenFunction("memcmp") +
+    bootstrapLlvmAssemblyHiddenFunction("bcmp") +
+    "memcmp:\nbcmp:\n" +
+    "1:  cbz x2, 2f\n    ldrb w3, [x0], #1\n    ldrb w4, [x1], #1\n    subs w3, w3, w4\n    b.ne 3f\n    sub x2, x2, #1\n    b 1b\n" +
+    "2:  mov w0, #0\n    ret\n" +
+    "3:  mov w0, w3\n    ret\n" +
+    ".size memcmp, . - memcmp\n.size bcmp, . - bcmp\n" +
+    bootstrapLlvmAssemblyHiddenFunction("strlen") +
+    "strlen:\n" +
+    "    mov x1, x0\n" +
+    "1:  ldrb w2, [x1], #1\n    cbnz w2, 1b\n" +
+    "    sub x0, x1, x0\n    sub x0, x0, #1\n    ret\n" +
+    ".size strlen, . - strlen\n"
 }
