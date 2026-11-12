@@ -18,6 +18,56 @@
 - Keep the measurements on performance items, and what was tried and dropped, so nobody
   repeats the work. Date them: they go stale.
 
+## Remove Python from the suite (#807)
+
+The tracked-use guard records the present paths in `tools/legacy-py-allowlist.txt`;
+remove an entry when the last use in that file is gone. First port, in order:
+`test-text-blocks.sh`, `test-running-image-identity.sh`, then
+`test-formatter.py` (149 lines; preserve its golden, byte-level, mode,
+parser-field and negative controls). Then port HTTP and event fixtures in
+ascending size; use Abla for socket protocol peers. The differential fuzzer
+and constant-time checker remain until their later ports.
+
+The following inventory is from the 1f1aea08 `test-serial` recipe. Counts are
+Python heredoc blocks and body lines, including blank and comment lines; all
+paths have the prefix `tools/test-` and suffix `.sh`.
+
+| Suite script | Blocks | Lines |
+|---|---:|---:|
+| `fuzz-differential` | 1 | 82 |
+| `http-close-delimited` | 1 | 65 |
+| `http-interim` | 1 | 63 |
+| `xtensa-companion-offline` | 8 | 63 |
+| `compile-eval-directory` | 3 | 54 |
+| `tar-reader` | 1 | 39 |
+| `event-shutdown` | 1 | 36 |
+| `discovery-cache` | 4 | 33 |
+| `resource-scope-drops` | 3 | 32 |
+| `gzip-inflate` | 1 | 31 |
+| `gzip-parity` | 1 | 30 |
+| `compile-eval-environment` | 1 | 27 |
+| `gzip-stream` | 1 | 24 |
+| `http-tls-deadline` | 1 | 24 |
+| `xtensa-http-stream` | 1 | 24 |
+| `global-initializer-split` | 1 | 23 |
+| `tar-stream` | 1 | 22 |
+| `http-client` | 1 | 21 |
+| `compile-eval-cross-target` | 1 | 19 |
+| `for-constant-array` | 1 | 16 |
+| `compiler-capture-process` | 1 | 15 |
+| `compile-eval-method-targets` | 1 | 14 |
+| `wrapper-demand` | 1 | 14 |
+| `arrays-dense` | 1 | 12 |
+| `ablac-test-bundle` | 3 | 9 |
+| `secure-fs` | 1 | 8 |
+| `running-image-identity` | 1 | 3 |
+| `text-blocks` | 1 | 2 |
+
+Seven additional `-c` snippets occur in `android-rpc-example` (4 lines),
+`compile-effects` (11 lines), `crypto-pure` (two one-liners), `crypto`,
+`process-pipeline`, and `wide-integers` (one line each). External `.py`
+helpers are separate from these inline counts.
+
 ## Bugs seen
 
 - [x] Linux toolchain packaging could write its archive and then fail in its
