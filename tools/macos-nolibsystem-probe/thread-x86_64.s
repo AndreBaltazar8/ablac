@@ -20,7 +20,7 @@ _main:
     jc fail_mmap
     movq %rax, %r12
     // bsdthread_register(threadstart, wqthread=0, flags=0, 0, 0, 0)
-    movq $0x2000172, %rax
+    movq $0x200016e, %rax
     leaq thread_start(%rip), %rdi
     xorl %esi, %esi
     xorl %edx, %edx
@@ -123,7 +123,7 @@ thread_main:
     movq $1, flag(%rip)
     retq
 
-    .section __TEXT,__cstring
+    .section __TEXT,__const
 m_ran:      .ascii "thread: ran and wrote ok       \n"
 m_never:    .ascii "thread: created, never ran     \n"
 m_mmap:     .ascii "thread: mmap failed, errno=    \n"

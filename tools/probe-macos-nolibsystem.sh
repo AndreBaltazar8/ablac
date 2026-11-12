@@ -25,8 +25,6 @@ summary=$out/summary.txt
 variants=(
     'nostdlib-e|-nostdlib -Wl,-e,_start'
     'nostdlib-static-e|-nostdlib -static -Wl,-e,_start'
-    'nostdlib-nopie-e|-nostdlib -Wl,-e,_start -Wl,-no_pie'
-    'nostdlib-nodyld-e|-nostdlib -Wl,-e,_start -Wl,-no_dyld_env_vars'
     'libsystem-listed-main|-nostdlib -lSystem'
     'libsystem-listed-e|-nostdlib -lSystem -Wl,-e,_start'
 )

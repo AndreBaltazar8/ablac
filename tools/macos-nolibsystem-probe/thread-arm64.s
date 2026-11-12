@@ -144,7 +144,7 @@ thread_main:
     stlr x2, [x1]
     ret
 
-    .section __TEXT,__cstring
+    .section __TEXT,__const
 m_ran:      .ascii "thread: ran and wrote ok       \n"
 m_never:    .ascii "thread: created, never ran     \n"
 m_mmap:     .ascii "thread: mmap failed, errno=    \n"
