@@ -9,6 +9,7 @@ export ABLA_SYSROOT="$root"
 out=build/gzip-parity
 mkdir -p "$out"
 "$compiler" build tests/cases/gzip-stream/parity.ab -o "$out/check" --fast --no-cache
+"$compiler" build tests/cases/gzip-stream/record.ab -o "$out/record" --fast --no-cache
 python3 - "$out" <<'PY'
 import gzip, random, sys, zlib
 p=sys.argv[1]
@@ -51,5 +52,7 @@ gzip -n -6 -c "$out/large" > "$out/large.gz"
 "$out/check" "$out/empty" "$out/empty.gz"
 "$out/check" "$out/optional.raw" "$out/optional.gz"
 for input in "$out"/bad-*; do "$out/check" "$out/raw" "$input" invalid; done
-"$out/check" "$out/raw" "$out/level6.gz" mutate
-printf '%s\n' 'gzip-parity: existing corpus and 4000 corruptions plus truncations agree'
+"$out/record" tests/cases/gzip-stream/fixtures/mutations.gz > "$out/mutations.actual"
+gzip -dc tests/cases/gzip-stream/fixtures/mutations.expected.gz > "$out/mutations.expected"
+cmp "$out/mutations.expected" "$out/mutations.actual"
+printf '%s\n' 'gzip-parity: corpus and old-decoder mutation transcript pass'

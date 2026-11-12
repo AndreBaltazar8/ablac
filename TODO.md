@@ -400,11 +400,10 @@
   `companionValidateArchive` retains its 128 MiB / 256 MiB in-memory limits. On the real Linux
   companion, three paired release runs on one P-core
   measured a zero-initialized byte-window prototype at 42.625G user instructions / 1.942 s versus
-  44.752G / 1.958 s with an `array<u8>` window. The existing non-streaming decoder remains unchanged:
+  44.752G / 1.958 s with an `array<u8>` window. The old non-streaming decoder was unchanged initially:
   paired builds before/after appending the streaming decoder measured 28,749,205,319 versus
-  28,749,205,379 instructions. Two decoders are temporary; switch
-  `gzipDecompress` to collect from `gzipStream` only after the wrapper is within 5% of the old decoder
-  on the real archive, repetitive input and source tar; the extra per-call and callback costs were profiled first.
+  28,749,205,379 instructions. The collecting wrapper was gated on reaching within 5% of the old decoder
+  on the real archive, repetitive input and source tar; its extra per-call and callback costs were profiled first.
   A 5M-instruction-period, unthrottled profile of the resource-source stream measured 42.686G instructions.
   Approximate self-instruction increases versus the original were 4.17G in Huffman symbol decoding,
   3.98G in bit reads, 4.33G in output/CRC, and 1.64G in the new byte-fetch helper. The actual source
@@ -418,10 +417,15 @@
   On 2026-11-12, batching matched bytes into a reserved output stage reduced paired streaming
   instructions (three release runs, median instructions:u, one P-core): real companion
   28.071G -> 19.389G, repetitive input 848.403M -> 108.615M, src tar 1.326G -> 589.001M.
-  The old collecting decoder remains until the wrapper is within 5% on all three inputs.
   A nine-bit Huffman prefix table, measured separately after batching, changed streaming
   instructions from 19.389G to 14.652G on the real companion, 108.615M to 109.708M on
   the repetitive input, and 589.001M to 469.980M on the src tar (same paired method).
+  Before those steps, the prototype wrapper was 28.813G -> 28.071G on the real archive,
+  593.392M -> 848.403M on the repetitive input and 1.128G -> 1.326G on the src tar.
+  With both optimizations, the final collecting wrapper takes 14.652G vs 28.813G on the real archive,
+  109.709M vs 593.392M on the repetitive input, and 469.981M vs 1.128G on the src tar
+  (three paired release runs, median instructions:u, one P-core). `gzipDecompress` now collects
+  `gzipStream`; a fixed transcript of the old decoder's mutation outcomes preserves parity coverage.
   The read-only
   `abla/archive/tar` reader now checks bounded ustar files/directories, paths, checksums and file-ancestor
   conflicts; links and PAX/GNU extensions are unsupported. On the SHA-verified Linux companion (30,720,987-byte
@@ -429,7 +433,7 @@
   183,952 KiB peak RSS (three runs, 2026-11-11); gzip alone took 1.563 s, tar scan over a cached plain tar
   0.027 s including reading it, and concatenating file slices 0.052 s including reading/scanning. The optional
   cached-archive test is `ABLA_TEST_XTENSA_COMPANION=<archive> tools/test-xtensa-companion-offline.sh`; the
-  separately packaged native command still awaits completion of the three-platform install probe.
+  separately packaged native command passed the three-platform install probe in run `43169366077`.
   Streaming extraction of the real archive matched the Python tree and took median 4.23 s / 87,560 KiB
   across three release runs including spooling, two inflates, writes and verification; the earlier
   1.553 s figure covers gzip + tar only. With 4 MiB GC growth the same extraction took median 4.33 s /
