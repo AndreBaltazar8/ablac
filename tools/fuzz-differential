@@ -21,6 +21,7 @@ tests/cases/fuzz-differential-<seed>-<check>/ (program.ab and expected outputs).
   tools/fuzz-differential --check-hostless-capabilities  # assert task/thread Wasm rejection
   tools/fuzz-differential --module-graphs --seeds 1-3  # strict module graphs and cache edits
   tools/fuzz-differential --subparser-graphs --seeds 1-3  # generated calls and provider edits
+  tools/fuzz-differential --shared-globals --seeds 1-3  # known #796; interp/jit/auto
   tools/fuzz-differential --check-subparser-refusals  # expected diagnostics in interp/JIT
   tools/fuzz-differential --seed 7 --keep     # one seed, keep its directory
   tools/fuzz-differential --program x.ab      # run one existing program, all ways
@@ -1487,6 +1488,39 @@ fun safeSlice(s: string, a: int, b: int): string {
                   '    for (seat in dropLog) out = out + "${seat},"', "    out", "}"]
         return lines, f"c{index}()", "str"
 
+    def default_owner_check(self, index):
+        """#790: default-argument and branch temporaries, with a Python drop-order oracle."""
+        r = self.r
+        seat = r.randint(10, 99)
+        kind = r.choice(['positional', 'named', 'constructor', 'if', 'when'])
+        definitions = []
+        if kind in ('positional', 'named'):
+            definitions.append(f'fun defaultOwner{index}(tag: int, value: int = TempTicketOwner(issue(tag), tag + 200).ticket.seat): int = value')
+            expr = f'defaultOwner{index}({seat})' if kind == 'positional' else f'defaultOwner{index}(tag = {seat})'
+            value, drops = seat, [seat + 200, seat]
+        elif kind == 'constructor':
+            definitions.append(f'class DefaultOwnerBox{index}(val tag: int, val value: int = TempTicketOwner(issue(tag), tag + 200).ticket.seat)')
+            expr = f'DefaultOwnerBox{index}({seat}).value'
+            value, drops = seat, [seat + 200, seat]
+        else:
+            flag = r.choice([True, False])
+            nested = f'TempTicketOwner(issue(TempTicketOwner(issue({seat}), {seat + 200}).ticket.seat + 1), {seat + 201})'
+            simple = f'TempTicketOwner(issue({seat + 2}), {seat + 202})'
+            if kind == 'if':
+                owner = f'if ({str(flag).lower()}) {nested} else {simple}'
+            else:
+                owner = f'when ({1 if flag else 0}) {{ 1 -> {nested} else -> {simple} }}'
+            expr = f'show(({owner}).ticket)'
+            value, drops = ((seat + 1, [seat + 201, seat + 1, seat + 200, seat]) if flag
+                            else (seat + 2, [seat + 202, seat + 2]))
+        expected = f'{value}:' + ''.join(f'{v},' for v in drops)
+        lines = definitions + [f'fun c{index}(): string {{', '    dropLog.clear()',
+                 f'    val result = {expr}', '    var actual = "${result}:"',
+                 '    for (seat in dropLog) actual = actual + "${seat},"',
+                 f'    if (actual != "{expected}") return "FUZZ_ORACLE_FAILURE"',
+                 '    actual', '}']
+        return lines, f'c{index}()', 'str'
+
     def resource_drop_check(self, index):
         """Resource classes: `drop()` logs to a global, so reassignment, `move`, block ends and loops
         show the order and the number of drops; a fresh resource used as a receiver, a field read, in
@@ -1712,7 +1746,7 @@ fun <T, U> crossed(a: T, b: U): Pair<U, T> = Pair(b, a)
         if r.random() < 0.10:
             return r.choice([self.deep_generic_check, self.deep_iface_check, self.deep_nullable_check,
                              self.any_check, self.clash_check,
-                             self.generic_lambda_check, self.resource_drop_check,
+                             self.generic_lambda_check, self.resource_drop_check, self.default_owner_check,
                              self.elvis_member_check, self.gzip_check, self.nested_generator_check,
                              self.json_check, self.yaml_check])(index)
         extra = r.random()
@@ -2407,6 +2441,78 @@ compile fun parseStop(cursor: ParserCursor): SyntaxExpression {
     return 0
 
 
+# #796: independent programs keep a failing shape small and preserve site order.
+# Expected output comes from Python; a mismatch is a failure, never an expected pass.
+def shared_global_program(seed, kind):
+    rng = random.Random(f"{seed}:{kind}")
+    a, b = rng.sample(range(2, 100), 2)
+    if kind == 'array':
+        decl, write1, read, write2 = ('val shared: array<int> = []', f'shared.append({a})',
+                                      'shared.size', f'shared.append({b})')
+        expected = (1, 1, 1, 2)
+    elif kind == 'alias':
+        decl, write1, read, write2 = ('val shared: array<int> = []\nval alias = shared',
+                                      f'shared.append({a})', 'alias.size', f'alias.append({b})')
+        expected = (1, 1, 1, 2)
+    elif kind == 'function':
+        decl = f'val shared: array<int> = []\ncompile fun helper(value: int): void {{ shared.append(value); return }}'
+        write1, read, write2 = f'helper({a})', 'shared.size', f'helper({b})'
+        expected = (1, 1, 1, 2)
+    elif kind == 'map':
+        decl, write1, read, write2 = ('val shared: Map<string, int> = Map()', f'shared.set("x", {a})',
+                                      '(shared.get("x") ?? 0)', f'shared.set("x", {b})')
+        expected = (a, a, a, b)
+    elif kind == 'object':
+        decl, write1, read, write2 = ('class Box(var value: int)\nval shared = Box(0)',
+                                      f'shared.value = {a}', 'shared.value', f'shared.value = {b}')
+        expected = (a, a, a, b)
+    elif kind == 'readonly':
+        decl, write1, read, write2 = (f'val shared: array<int> = [{a}, {b}]',
+                                      'val unused = 0', 'shared[0] + shared[1]', 'val unused = 0')
+        expected = (a + b,) * 4
+    else:
+        raise ValueError(kind)
+    text = f'''import "abla/compiler"
+import "abla/io"
+{decl}
+compile fun mutate(): int {{ {write1}; {read} }}
+compile fun observe(): int = {read}
+compile fun interpreted(): int {{
+    val ignored = compilerFindFunction("observe")
+    if (ignored < 0) compilerApplyTransform({{ }})
+    val before = {read}
+    {write2}
+    before
+}}
+val A = #mutate()
+val B = #observe()
+val C = #interpreted()
+val D = #observe()
+fun main: int {{ println("$A,$B,$C,$D"); 0 }}
+'''
+    return text, ','.join(map(str, expected)) + '\n'
+
+
+def run_shared_globals(args, seed, runner):
+    directory = os.path.join(WORK, f'shared-globals-{seed}')
+    os.makedirs(os.path.join(ROOT, directory), exist_ok=True)
+    failures = []
+    for kind in ('array', 'map', 'object', 'alias', 'function', 'readonly'):
+        source = os.path.join(directory, kind + '.ab')
+        text, expected = shared_global_program(seed, kind)
+        with open(os.path.join(ROOT, source), 'w', encoding='utf-8') as f:
+            f.write(text)
+        for mode in ('interp', 'jit', 'auto'):
+            result = runner.native(source, os.path.join(directory, f'{kind}-{mode}'), True, mode)
+            if result != (expected, 0):
+                failures.append(f'{kind}/{mode}: expected {(expected, 0)!r}, got {result!r}')
+    if failures:
+        return f'shared globals seed {seed} (sources in {directory}): ' + '; '.join(failures)
+    if not args.keep:
+        shutil.rmtree(os.path.join(ROOT, directory), ignore_errors=True)
+    return None
+
+
 def seed_range(text):
     if "," in text:
         return [n for part in text.split(",") for n in seed_range(part)]
@@ -2428,6 +2534,7 @@ def main():
     ap.add_argument("--panics", action="store_true", help="also run one panicking program per seed (native and Wasm)")
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--selftest", action="store_true", help="check the comparison on made-up results")
+    ap.add_argument("--shared-globals", action="store_true", help="run known #796 compile-time shared-global campaign (interp/jit/auto)")
     ap.add_argument("--hosted-tasks", action="store_true", help="draw task/thread checks; compare only the four hosted modes")
     ap.add_argument("--module-graphs", action="store_true", help="check strict multi-module graphs and cache invalidation in all six modes")
     ap.add_argument("--subparser-graphs", action="store_true", help="check generated provider calls in six modes, including provider cache edits")
@@ -2436,6 +2543,8 @@ def main():
     ap.add_argument("--show", action="store_true", help="with --program: print the output of the fast build")
     ap.add_argument("--program", help="run an existing .ab program (with @export(\"run\")) all ways")
     args = ap.parse_args()
+    if args.shared_globals and (args.module_graphs or args.subparser_graphs or args.hosted_tasks or args.focus or args.panics or args.program or args.selftest or args.check_subparser_refusals or args.check_hostless_capabilities):
+        ap.error('--shared-globals cannot be combined with other campaigns')
     if args.module_graphs and (args.subparser_graphs or args.hosted_tasks or args.focus or args.panics or args.program):
         ap.error('--module-graphs cannot be combined with --hosted-tasks, --focus, --panics or --program')
     if args.subparser_graphs and (args.hosted_tasks or args.focus or args.panics or args.program):
@@ -2475,13 +2584,16 @@ def main():
         return 1 if bad else 0
     failures = 0
     for seed in seed_range(args.seed or args.seeds):
-        found = (run_module_graph(args, seed, runner) if args.module_graphs else
+        found = (run_shared_globals(args, seed, runner) if args.shared_globals else
+                 run_module_graph(args, seed, runner) if args.module_graphs else
                  run_subparser_seed(args, seed, runner) if args.subparser_graphs else run_seed(args, seed, runner))
         if found:
             failures += 1
             print(found)
         else:
-            if args.module_graphs:
+            if args.shared_globals:
+                print(f'shared globals seed {seed}: 6 shapes agree with Python oracle in interp/jit/auto')
+            elif args.module_graphs:
                 print(f'graph seed {seed}: no-cache, cached cold/warm/discovery-hit and provider edits agree in all six modes')
             elif args.subparser_graphs:
                 print(f'subparser seed {seed}: no-cache, cached cold/warm/helper-hit and provider edit agree in all six modes')

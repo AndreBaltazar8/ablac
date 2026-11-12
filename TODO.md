@@ -143,6 +143,14 @@
       if an ARM64 tagged-heap host compiler ever ships.
 
 
+- [ ] **Differential fuzzer: shared compile-time globals (#796).** `--shared-globals` compares
+  Python-computed expectations in interp, jit and auto for array, map, object field, aliased array,
+  called-function mutation and read-only controls; it stays outside the default mix until #796 lands.
+  Seed 5901 exposes all five mutable cases in jit and auto while interp and the read-only control agree.
+  The default mix also exercises #790 temporary owners in positional/named/constructor defaults and
+  nested `if`/`when` arms, with Python-checked drop logs. On c1a93ef7, focused seeds 6002–6021
+  (240 checks) and default seeds 6022–6041 (480 checks) agreed across all six modes; the tool suite passed.
+
 - [ ] **`tools/fuzz-differential` findings** (2026-11-08; branch `fuzz-differential`). The fuzzer builds
   random well-typed programs (integers of every width with wrapping and shift edges, `f64`/`f32`,
   strings and interpolation, arrays, maps, classes, closures, `if`/`when`/loops, `any` erasure and
