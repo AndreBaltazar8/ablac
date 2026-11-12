@@ -783,6 +783,37 @@ private fun GzipStream.emit(var output: ByteBuffer, value: int): void {
     return
 }
 
+// A match is at most 258 bytes. Reserve its output once, but advance the
+// history one byte at a time so overlapping copies and window wrap work.
+private trusted fun GzipStream.emitMatch(var output: ByteBuffer, count: int): void {
+    if (ablaAtCompileTime()) {
+        var i = 0
+        while (i < count) {
+            this.emit(output, this.window.get((this.total - this.distance) & 32767))
+            i += 1
+        }
+        return
+    }
+    val destination = output.stageReserve(count)
+    val history = this.window.address
+    var total = this.total
+    var crc = this.crc
+    var i = 0
+    while (i < count) {
+        val value = ablaUnsafeLoadU8(nativePointerFromAddress(history + ((total - this.distance) &
+            32767)))
+        ablaUnsafeStoreU8(nativePointerFromAddress(history + (total & 32767)), value)
+        ablaUnsafeStoreU8(nativePointerFromAddress(destination + i), value)
+        crc = gzipCrcByte(crc, value)
+        total += 1
+        i += 1
+    }
+    output.staged += count
+    output.byteCount += count
+    this.total = total
+    this.crc = crc
+}
+
 private fun GzipStream.fail(): GzipStreamChunk {
     if (this.error == "") this.error = if (this.reader.error != "") this.reader.error else "invalid"
     GzipStreamChunk("", false, this.error)
@@ -854,9 +885,10 @@ fun GzipStream.read(var source: GzipSource, maxBytes: int): GzipStreamChunk {
         } else if (this.state == 3) {
             if (this.remaining == 0) this.state = 2
             else {
-                val value = this.window.get((this.total - this.distance) & 32767)
-                this.emit(output, value)
-                this.remaining -= 1
+                val room = cap - output.size()
+                val count = if (this.remaining < room) this.remaining else room
+                this.emitMatch(output, count)
+                this.remaining -= count
             }
         } else if (this.state == 4) {
             this.reader.bits = 0

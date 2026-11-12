@@ -34,6 +34,9 @@ open(p+'/optional.gz','wb').write(optional+valid[10:])
 long_raw=(b'window wrap 0123456789 abcdefghijklmnopqrstuvwxyz\n'*1500)
 open(p+'/long','wb').write(long_raw)
 open(p+'/long.gz','wb').write(gzip.compress(long_raw,mtime=0))
+repeat_raw=b'Z'*75000
+open(p+'/repeat','wb').write(repeat_raw)
+open(p+'/repeat.gz','wb').write(gzip.compress(repeat_raw,mtime=0))
 open(p+'/bad-magic','wb').write(b'X'+valid[1:])
 open(p+'/bad-type','wb').write(valid[:10]+b'\x07'+valid[11:])
 open(p+'/bad-isize','wb').write(valid[:-1]+bytes([valid[-1]^1]))
@@ -44,6 +47,7 @@ for input in "$out"/level*.gz "$out/fixed.gz"; do "$out/check" "$out/raw" "$inpu
 "$out/check" "$out/raw" "$out/optional.gz"
 "$out/check" "$out/raw" "$out/optional.gz" truncations
 "$out/check" "$out/long" "$out/long.gz" long
+"$out/check" "$out/repeat" "$out/repeat.gz" long
 "$out/check" "$out/empty" "$out/empty.gz"
 for input in "$out"/bad-*; do "$out/check" "$out/raw" "$input" invalid; done
 "$compiler" build tests/cases/gzip-stream/build.ab -o "$out/build" --fast --no-cache

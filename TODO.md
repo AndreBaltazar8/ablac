@@ -403,8 +403,8 @@
   44.752G / 1.958 s with an `array<u8>` window. The existing non-streaming decoder remains unchanged:
   paired builds before/after appending the streaming decoder measured 28,749,205,319 versus
   28,749,205,379 instructions. Two decoders are temporary; switch
-  `gzipDecompress` to collect from `gzipStream` only after the streaming decoder is within 5% of that
-  28.749G instruction baseline on the real archive, and profile its extra per-call and callback costs first.
+  `gzipDecompress` to collect from `gzipStream` only after the wrapper is within 5% of the old decoder
+  on the real archive, repetitive input and source tar; the extra per-call and callback costs were profiled first.
   A 5M-instruction-period, unthrottled profile of the resource-source stream measured 42.686G instructions.
   Approximate self-instruction increases versus the original were 4.17G in Huffman symbol decoding,
   3.98G in bit reads, 4.33G in output/CRC, and 1.64G in the new byte-fetch helper. The actual source
@@ -415,6 +415,10 @@
   on the repetitive input, and from 1.665G to 1.326G on the src tar. These streaming runs collect output;
   they include process startup and file reading. The companion result meets the instruction threshold for
   considering the collecting wrapper after the separately measured table and output-write experiments.
+  On 2026-11-12, batching matched bytes into a reserved output stage reduced paired streaming
+  instructions (three release runs, median instructions:u, one P-core): real companion
+  28.071G -> 19.389G, repetitive input 848.403M -> 108.615M, src tar 1.326G -> 589.001M.
+  The old collecting decoder remains until the wrapper is within 5% on all three inputs.
   The read-only
   `abla/archive/tar` reader now checks bounded ustar files/directories, paths, checksums and file-ancestor
   conflicts; links and PAX/GNU extensions are unsupported. On the SHA-verified Linux companion (30,720,987-byte
@@ -898,9 +902,9 @@
   [design and evidence](docs/design/xtensa-companion.md).
   #787 native installer: package the native command alongside the Python
   installer; Python remains the default in the next release. Probe run
-  `43163669836` passed both installers on Linux and both macOS hosts. Repeat the
-  same six-leg probe with the streaming native installer before proposing the
-  default switch to André for the following release. The native
+  `43163669836` passed both installers on Linux and both macOS hosts. The same
+  six-leg probe passed for the streaming native installer in run `43169366077`
+  on `f9c09e2e`. The default switch awaits André's decision. The native
   streaming limits are 512 MiB compressed and 1 GiB unpacked; the explicit
   in-memory archive validation helper retains its smaller 128 MiB / 256 MiB limits.
 - [ ] **v0.2.49 release-note draft: Xtensa migration (planned break).** Publish this
