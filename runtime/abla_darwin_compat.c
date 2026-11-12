@@ -889,10 +889,12 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     result = lseek((int)argument0, (off_t)argument1, (int)argument2);
     break;
 #endif
+#if !ABLA_DARWIN_SYSCALLS
   case 14:
     result = darwin_sigprocmask(argument0, (const void *)(uintptr_t)argument1,
                                 (void *)(uintptr_t)argument2, argument3);
     break;
+#endif
   case 289:
     result = darwin_signalfd(argument0, (const void *)(uintptr_t)argument1,
                              argument2, argument3);

@@ -3780,6 +3780,58 @@ trusted fun __ablaRuntimeDarwinKill(process: int, signal: int): int {
     __ablaRuntimeDarwinResult(ablaDarwinSyscall(37, process, darwin, 1, 0, 0, 0))
 }
 
+// ---- macOS signals (#811 group 6) ----
+// BSD numbers: __pthread_sigmask 329 (how, set, oldset: pointers to 32-bit sets). UNVERIFIED (from
+// memory of xnu's syscalls.master): the number, SIG_BLOCK 1, SIG_UNBLOCK 2, SIG_SETMASK 3, and that
+// Darwin's sigset_t is one 32-bit word with bit n-1 for signal n.
+
+// A Linux signal mask (64 bits, bit n-1 for signal n) as Darwin's 32-bit set: the signals both
+// have, by __ablaRuntimeDarwinSignal's table; the others are dropped.
+trusted fun __ablaRuntimeDarwinSignalMask(linux: int): int {
+    var mask = 0
+    var number = 1
+    while (number < 32) {
+        if (((linux >> (number - 1)) & 1) != 0) {
+            val darwin = __ablaRuntimeDarwinSignal(number)
+            if (darwin != 0) mask = mask | (1 << (darwin - 1))
+        }
+        number = number + 1
+    }
+    mask
+}
+
+// A Darwin signal set as Linux's 64-bit mask (the inverse, for the old mask).
+trusted fun __ablaRuntimeLinuxSignalMask(darwin: int): int {
+    var bits = 0
+    var number = 1
+    while (number < 32) {
+        val darwinNumber = __ablaRuntimeDarwinSignal(number)
+        if (darwinNumber != 0 && ((darwin >> (darwinNumber - 1)) & 1) != 0) {
+            bits = bits | (1 << (number - 1))
+        }
+        number = number + 1
+    }
+    bits
+}
+
+// rt_sigprocmask 14: Linux's how is 0/1/2 (block, unblock, set), its sets 8 bytes; the thread's
+// mask changes (the adapter used pthread_sigmask, which is this system call).
+trusted fun __ablaRuntimeDarwinSigprocmask(how: int, set: int, old: int, size: int): int {
+    if (size != 8 || (set != 0 && (how < 0 || how > 2))) return -22
+    val memory = __ablaRuntimeDarwinScratch(16)
+    if (__ablaRuntimeDarwinScratchFailed(memory)) return -12
+    if (set != 0) ablaRuntimeStoreI32(memory,
+        __ablaRuntimeDarwinSignalMask(ablaRuntimeLoadI64(set)))
+    val raw = ablaDarwinSyscall(329, if (set != 0) how + 1 else 1, if (set != 0) memory else 0,
+        if (old != 0) memory + 8 else 0, 0, 0, 0)
+    if (raw >= 0 && old != 0) {
+        ablaRuntimeStoreI64(old, __ablaRuntimeLinuxSignalMask(ablaRuntimeLoadI32(memory + 8) &
+            4294967295))
+    }
+    __ablaRuntimeDarwinScratchFree(memory, 16)
+    __ablaRuntimeDarwinResult(raw)
+}
+
 trusted fun __ablaRuntimeDarwinSyscall(
     number: int,
     argument0: int,
@@ -3926,6 +3978,9 @@ trusted fun __ablaRuntimeDarwinSyscall(
     if (number == 62) return __ablaRuntimeDarwinKill(argument0, argument1)
     if (number == 109) return __ablaRuntimeDarwinResult(
         ablaDarwinSyscall(82, argument0, argument1, 0, 0, 0, 0))
+    // Signals (#811 group 6): the section above the dispatcher.
+    if (number == 14) return __ablaRuntimeDarwinSigprocmask(
+        argument0, argument1, argument2, argument3)
     abla_darwin_linux_syscall(
         number, argument0, argument1, argument2, argument3, argument4, argument5)
 }

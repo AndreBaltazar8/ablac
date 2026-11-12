@@ -13,7 +13,7 @@ cd "$root"
 out=build/darwin-syscalls
 mkdir -p "$out"
 failed=0
-for program in main sockets kqueue process translate; do
+for program in main sockets kqueue process signals translate; do
     if ! "$compiler" build "tests/cases/darwin-syscalls/$program.ab" -o "$out/$program" --no-cache > "$out/$program.build.log" 2>&1; then
         echo "darwin syscalls: $program did not build:" >&2
         cat "$out/$program.build.log" >&2

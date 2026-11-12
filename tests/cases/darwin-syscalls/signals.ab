@@ -1,0 +1,57 @@
+import "abla/io"
+import "abla/sys/linux"
+import "abla/unsafe/memory"
+
+// The signal calls a macOS program issues by BSD system call (#811 group 6), through the portable
+// Linux-numbered surface; on Linux the same numbers are the kernel's, so the program prints the
+// same lines everywhere. Each line is "name: ok (value)"; exit status 7 when all are right.
+// rt_sigprocmask 14 (how 0 block, 1 unblock, 2 set; the sets are 8 bytes).
+
+trusted fun report(name: string, ok: bool, value: int): bool {
+    println("${name}: ${if (ok) "ok" else "FAIL"} ($value)")
+    ok
+}
+
+trusted fun main: int {
+    var good = true
+    val set = nativeStackAllocate(16)
+    val old = nativeStackAllocate(16)
+    // SIGUSR1 (10) and SIGUSR2 (12): Linux bits 9 and 11, other numbers on Darwin.
+    val usr = (1 << 9) | (1 << 11)
+    ablaRuntimeStoreI64(set, 0)
+    ablaRuntimeStoreI64(old, -1)
+    val queried = linuxSyscall4(14, 0, 0, old, 8)
+    val initial = ablaRuntimeLoadI64(old)
+    good = report("sigprocmask reads the mask", queried == 0 && (initial & usr) == 0,
+        initial) && good
+    ablaRuntimeStoreI64(set, usr)
+    val blocked = linuxSyscall4(14, 0, set, old, 8)
+    good = report("sigprocmask block", blocked == 0 && (ablaRuntimeLoadI64(old) & usr) == 0,
+        blocked) && good
+    ablaRuntimeStoreI64(old, 0)
+    val now = linuxSyscall4(14, 0, 0, old, 8)
+    good = report("sigprocmask sees the block", now == 0 && (ablaRuntimeLoadI64(old) & usr) == usr,
+        ablaRuntimeLoadI64(old)) && good
+    ablaRuntimeStoreI64(set, 1 << 9)
+    val released = linuxSyscall4(14, 1, set, old, 8)
+    good = report("sigprocmask unblock one",
+        released == 0 && (ablaRuntimeLoadI64(old) & usr) == usr,
+        released) && good
+    ablaRuntimeStoreI64(old, 0)
+    linuxSyscall4(14, 0, 0, old, 8)
+    good = report("sigprocmask after the unblock", (ablaRuntimeLoadI64(old) & usr) == (1 << 11),
+        ablaRuntimeLoadI64(old)) && good
+    ablaRuntimeStoreI64(set, initial)
+    val restored = linuxSyscall4(14, 2, set, old, 8)
+    good = report("sigprocmask set", restored == 0, restored) && good
+    ablaRuntimeStoreI64(old, -1)
+    linuxSyscall4(14, 0, 0, old, 8)
+    good = report("sigprocmask restored", (ablaRuntimeLoadI64(old) & usr) == 0,
+        ablaRuntimeLoadI64(old)) && good
+    val wrongSize = linuxSyscall4(14, 0, set, old, 4)
+    good = report("sigprocmask size", wrongSize == -22, wrongSize) && good
+    val wrongHow = linuxSyscall4(14, 7, set, old, 8)
+    good = report("sigprocmask how", wrongHow == -22, wrongHow) && good
+    if (good) return 7
+    1
+}
