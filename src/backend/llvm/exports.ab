@@ -1774,6 +1774,135 @@ fun bootstrapLlvmEmitExports(
     errors
 }
 
+// `--no-libc` (#806 step 6): the program's own process entry on x86-64 Linux, in
+// place of crt1's `_start` and `__libc_start_main`. It reads argc, argv, envp and
+// the auxiliary vector from the initial stack, gives the main thread a thread
+// control block (and the PT_TLS image, if the executable has one) with
+// arch_prctl(ARCH_SET_FS), runs `.init_array`, calls `main(argc, argv, envp)`
+// and leaves with exit_group. A static non-PIE executable: nothing relocates itself.
+// A failed mmap or arch_prctl, or a TLS alignment over a page, exits 127.
+fun bootstrapLlvmFreestandingStartAssembly(): string =
+    "xorl %ebp, %ebp\n" +
+    "movq (%rsp), %r13\n" +
+    "leaq 8(%rsp), %r14\n" +
+    "leaq 16(%rsp,%r13,8), %r15\n" +
+    "movq %r15, %rdx\n" +
+    "1: movq (%rdx), %rax\n" +
+    "addq \$\$8, %rdx\n" +
+    "testq %rax, %rax\n" +
+    "jnz 1b\n" +
+    "xorl %r8d, %r8d\n" +
+    "xorl %r9d, %r9d\n" +
+    "xorl %r10d, %r10d\n" +
+    "2: movq (%rdx), %rax\n" +
+    "movq 8(%rdx), %rcx\n" +
+    "addq \$\$16, %rdx\n" +
+    "testq %rax, %rax\n" +
+    "jz 5f\n" +
+    "cmpq \$\$3, %rax\n" +
+    "jne 3f\n" +
+    "movq %rcx, %r8\n" +
+    "3: cmpq \$\$5, %rax\n" +
+    "jne 4f\n" +
+    "movq %rcx, %r9\n" +
+    "4: cmpq \$\$25, %rax\n" +
+    "jne 2b\n" +
+    "movq %rcx, %r10\n" +
+    "jmp 2b\n" +
+    "5: xorl %r12d, %r12d\n" +
+    "6: testq %r9, %r9\n" +
+    "jz 8f\n" +
+    "cmpl \$\$7, (%r8)\n" +
+    "jne 7f\n" +
+    "movq %r8, %r12\n" +
+    "jmp 8f\n" +
+    "7: addq \$\$56, %r8\n" +
+    "decq %r9\n" +
+    "jmp 6b\n" +
+    "8: xorl %esi, %esi\n" +
+    "movl \$\$64, %ebx\n" +
+    "testq %r12, %r12\n" +
+    "jz 9f\n" +
+    "movq 48(%r12), %rax\n" +
+    "cmpq %rbx, %rax\n" +
+    "cmovaq %rax, %rbx\n" +
+    "cmpq \$\$4096, %rbx\n" +
+    "ja 99f\n" +
+    "movq 40(%r12), %rsi\n" +
+    "leaq -1(%rbx), %rax\n" +
+    "addq %rax, %rsi\n" +
+    "notq %rax\n" +
+    "andq %rax, %rsi\n" +
+    "9: movq %r10, %rbx\n" +
+    "leaq 4096(%rsi), %rsi\n" +
+    "xorl %edi, %edi\n" +
+    "movl \$\$3, %edx\n" +
+    "movl \$\$34, %r10d\n" +
+    "movq \$\$-1, %r8\n" +
+    "xorl %r9d, %r9d\n" +
+    "movl \$\$9, %eax\n" +
+    "syscall\n" +
+    "cmpq \$\$-4095, %rax\n" +
+    "jae 99f\n" +
+    "leaq -4096(%rax,%rsi), %rdx\n" +
+    "testq %r12, %r12\n" +
+    "jz 10f\n" +
+    "movq %rax, %rdi\n" +
+    "movq 16(%r12), %rsi\n" +
+    "movq 32(%r12), %rcx\n" +
+    "rep movsb\n" +
+    "10: movq %rdx, (%rdx)\n" +
+    "movq %rdx, 16(%rdx)\n" +
+    "testq %rbx, %rbx\n" +
+    "jz 11f\n" +
+    "movq (%rbx), %rax\n" +
+    "movq %rax, 40(%rdx)\n" +
+    "11: movl \$\$0x1002, %edi\n" +
+    "movq %rdx, %rsi\n" +
+    "movl \$\$158, %eax\n" +
+    "syscall\n" +
+    "testq %rax, %rax\n" +
+    "jnz 99f\n" +
+    ".weak __init_array_start\n" +
+    ".weak __init_array_end\n" +
+    "leaq __init_array_start(%rip), %rbx\n" +
+    "leaq __init_array_end(%rip), %r12\n" +
+    "12: cmpq %r12, %rbx\n" +
+    "jae 13f\n" +
+    "movq %r13, %rdi\n" +
+    "movq %r14, %rsi\n" +
+    "movq %r15, %rdx\n" +
+    "callq *(%rbx)\n" +
+    "addq \$\$8, %rbx\n" +
+    "jmp 12b\n" +
+    "13: andq \$\$-16, %rsp\n" +
+    "movq %r13, %rdi\n" +
+    "movq %r14, %rsi\n" +
+    "movq %r15, %rdx\n" +
+    "xorl %ebp, %ebp\n" +
+    "callq main\n" +
+    "movl %eax, %edi\n" +
+    "movl \$\$231, %eax\n" +
+    "syscall\n" +
+    "99: movl \$\$127, %edi\n" +
+    "movl \$\$231, %eax\n" +
+    "syscall\n" +
+    "ud2\n"
+
+fun bootstrapLlvmEmitFreestandingStart(backend: BootstrapLlvmBackend): void {
+    val start = bootstrapLlvmDeclare(
+        backend, "_start", backend.voidType, [], false, []
+    )
+    val entry = LLVMAppendBasicBlockInContext(
+        backend.context, start, "entry"
+    )
+    LLVMPositionBuilderAtEnd(backend.builder, entry)
+    bootstrapLlvmEmitNakedAssemblyText(
+        backend, start, "~{memory}", bootstrapLlvmFreestandingStartAssembly()
+    )
+    return
+}
+
 fun bootstrapLlvmEmitMain(
     backend: BootstrapLlvmBackend,
     program: BootstrapIrProgram,
@@ -1956,6 +2085,7 @@ fun bootstrapLlvmEmitMain(
                 backend.builder, status, backend.i32Type, "main.status"
             )
         )
+        if (bootstrapLlvmFreestandingStart) bootstrapLlvmEmitFreestandingStart(backend)
     }
     if (requireMain && mainId < 0 && exports.size == 0) {
         bootstrapStageDriverDiagnostic(

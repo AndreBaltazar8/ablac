@@ -45,6 +45,10 @@ fun bootstrapCollectAndRelease(): void {
     return
 }
 
+// `--no-libc` (#806 step 6): link an x86-64 Linux executable without libc, with the
+// program'"'"'s own `_start` (backend/llvm/exports.ab). Off unless the build asks.
+var bootstrapNoLibcRequested: bool = false
+
 class BootstrapTargetDescriptor(
     val name: string,
     val llvmTriple: string,
@@ -2119,6 +2123,7 @@ fun bootstrapOptimizeWholeProgram(
     val optimize = linuxCommand(bootstrapHostLlvmTool("opt"))
     val visible = bootstrapNativeAbiExportSymbols(abiManifest)
     visible.append("main")
+    if (bootstrapNoLibcRequested) visible.append("_start")
     bootstrapLlvmAssemblyNames(Path(llvmPath).readText(), visible)
     var names = ""
     var index = 0
@@ -2185,6 +2190,7 @@ trusted fun bootstrapOptimizeHeldWholeProgram(
     val visible: Map<string, bool> = Map()
     for (symbol in bootstrapNativeAbiExportSymbols(abiManifest)) visible.set(symbol, true)
     visible.set("main", true)
+    if (bootstrapNoLibcRequested) visible.set("_start", true)
     val assembled: array<string> = []
     for (assembly in bootstrapLlvmInlineAssembly) {
         bootstrapLlvmAssemblyNamesIn(assembly, 0, assembly.size, assembled)
@@ -3790,6 +3796,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         // A hosted executable reports a stack overflow (debug.ab).
         bootstrapLlvmStackGuard = target.hosted && artifact == "executable" &&
             target.objectFormat != "wasm"
+        bootstrapLlvmFreestandingStart = bootstrapNoLibcRequested
         bootstrapLlvmInitializerChunk = if (cacheProfile == "cross-o2" ||
             cacheProfile == "raw-cross-o2") BOOTSTRAP_INITIALIZER_CHUNK else 0
         bootstrapLlvmBitcodePath = if (inProcessCodegen) "" else bitcodePath
@@ -4082,6 +4089,24 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         status = 147
         failureKind = "reported"
     }
+    if (status == 0 && bootstrapNoLibcRequested &&
+        (!target.hosted || target.libcFree ||
+         target.llvmTriple != "x86_64-unknown-linux-gnu" ||
+         artifact != "executable")) {
+        linuxPrintStandardError(
+            "error[E_BUILD_NO_LIBC]: --no-libc builds only an x86-64 Linux executable (target '${target.name}', artifact '$artifact')\n"
+        )
+        status = 152
+        failureKind = "reported"
+    }
+    if (status == 0 && bootstrapNoLibcRequested &&
+        (linkOpenSsl || linkLlvm || linkHost || nativeLibraries.size > 0)) {
+        linuxPrintStandardError(
+            "error[E_BUILD_NO_LIBC]: --no-libc cannot link a C library: this program uses ${if (linkOpenSsl) "OpenSSL (TLS)" else if (nativeLibraries.size > 0) "the manifest's nativeLibraries" else "the compiler's own runtime imports"}\n"
+        )
+        status = 152
+        failureKind = "reported"
+    }
     if (status == 0 && rawTarget && artifact != "executable") {
         linuxPrintStandardError(
             "error[E_BUILD_ARTIFACT_UNSUPPORTED]: target '${target.name}' currently supports only executable artifacts\n"
@@ -4270,7 +4295,11 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     }
     if (status == 0 && target.hosted && artifact == "executable") {
         val link = bootstrapLinkCommand(if (macTarget) macClang else "clang")
-        link.argument("-pthread")
+        if (bootstrapNoLibcRequested) {
+            link.argument("-nostdlib")
+            link.argument("-static")
+            link.argument("-no-pie")
+        } else link.argument("-pthread")
         if (ltoEligible && !linkLlvm && !wholeProgram) {
             link.argument("-O2")
             link.argument("-flto")
@@ -4368,7 +4397,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         }
         // LLVM lowers floor/ceil/trunc/round intrinsics to libm calls on
         // x86-64 without SSE4.1; Darwin's libSystem already carries libm.
-        if (!macTarget) link.argument("-lm")
+        if (!macTarget && !bootstrapNoLibcRequested) link.argument("-lm")
         link.argument("-o")
         link.argument(publishPath)
         status = if (macTarget) link.run()

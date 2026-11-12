@@ -59,6 +59,44 @@ for program in tests/cases/libc-imports/*.ab; do
         imports "$name.$mode" "$out/$name.$mode" >>"$actual"
     done
 done
+# Programs built with --no-libc (static, our own _start; #806 step 6): no
+# interpreter, no dynamic section, no undefined symbols, and the run prints what the
+# dynamic build prints. A program in tools/libc-imports-static-pending.txt does not
+# link yet (the steps that remove its libc symbols have not landed); that list only
+# shrinks, and a pending program that links must be taken off it.
+pending=tools/libc-imports-static-pending.txt
+[[ -f $pending ]] || { echo "libc imports: missing $pending" >&2; exit 1; }
+for name in $(grep -v '^#' "$pending" | cat - <(echo hello float-remainder strings-arrays files) | sort -u); do
+    program=tests/cases/libc-imports/$name.ab
+    [[ -f $program ]] || continue
+    binary_static=$out/$name.static
+    if ! "$compiler" build "$program" -o "$binary_static" --no-libc --no-cache >"$out/$name.static.log" 2>&1; then
+        if grep -qx "$name" "$pending"; then
+            echo "libc imports: $name.static does not link yet (pending)"
+            continue
+        fi
+        echo "libc imports: $program (--no-libc) did not build:" >&2
+        tail -n 20 "$out/$name.static.log" >&2
+        exit 1
+    fi
+    if grep -qx "$name" "$pending"; then
+        echo "libc imports: $name.static links now, remove it from $pending" >&2
+        exit 1
+    fi
+    if readelf -lW "$binary_static" | grep -q INTERP || readelf -dW "$binary_static" 2>/dev/null | grep -q NEEDED ||
+        [[ -n $("$nm" -D --undefined-only "$binary_static" 2>/dev/null) || -n $("$nm" --undefined-only "$binary_static" 2>/dev/null) ]]; then
+        echo "libc imports: $name.static is not a self-contained static executable" >&2
+        exit 1
+    fi
+    set +e
+    "$out/$name.release" >"$out/$name.release.out" 2>&1; expected=$?
+    "$binary_static" >"$out/$name.static.out" 2>&1; actual_status=$?
+    set -e
+    if [[ $expected != "$actual_status" ]] || ! cmp -s "$out/$name.release.out" "$out/$name.static.out"; then
+        echo "libc imports: $name.static runs differently from $name.release (status $actual_status, expected $expected)" >&2
+        exit 1
+    fi
+done
 binary=$compiler
 [[ -f $compiler.bin ]] && binary=$compiler.bin
 if ! readelf -h "$binary" >/dev/null 2>&1; then
