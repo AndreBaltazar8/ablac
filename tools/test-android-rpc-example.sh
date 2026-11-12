@@ -54,10 +54,9 @@ set -e
 grep -q 'MissingAndroidRpcActionType' "$invalid_output.err"
 
 # A port the system picks (tests run in parallel, and 18080 may be taken).
-port=$(python3 -c 'import socket
-s = socket.socket()
-s.bind(("127.0.0.1", 0))
-print(s.getsockname()[1])')
+"$compiler" build "$project_root/tests/cases/android-rpc-example/free-port.ab" -o "$output_directory/free-port" --fast
+port=$("$output_directory/free-port")
+[[ $port =~ ^[0-9]+$ && $port -gt 0 && $port -lt 65536 ]] || { echo "Android RPC example: no free port ($port)" >&2; exit 1; }
 ABLA_RPC_PORT=$port "$server" &
 server_pid=$!
 cleanup() {
