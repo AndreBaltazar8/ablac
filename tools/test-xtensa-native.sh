@@ -4,6 +4,15 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 compiler=${1:-$root/build/ablac}
 export ABLA_SYSROOT="$root"
 out="$root/build/xtensa-native-test"
+restore_output_permissions() {
+    local status=$?
+    if [[ -d $out && ! -L $out ]] && ! chmod -R u+w "$out"; then
+        printf 'failed to restore owner write permission under %s\n' "$out" >&2
+        if [[ $status -eq 0 ]]; then status=1; fi
+    fi
+    return "$status"
+}
+trap restore_output_permissions EXIT
 if [[ -d $out ]]; then chmod -R u+w "$out"; rm -rf "$out"; fi
 mkdir -p "$out"
 "$compiler" build "$root/tools/xtensa-native/main.ab" --fast --no-cache -o "$out/installer"
