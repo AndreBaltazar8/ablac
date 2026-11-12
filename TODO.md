@@ -371,7 +371,8 @@
   the result in memory while gzip writes to /dev/null. Tests: `tools/test-gzip-inflate.sh`. Descriptor-relative
   no-follow and exclusive filesystem primitives are in `abla/fs/secure`, with Darwin exercised in macOS CI.
   The native offline library caps gzip input at 128 MiB and decoded tar at 256 MiB. `gzipStream`
-  now supports bounded input/output chunks; streaming tar, HTTPS and installer adoption are still needed
+  now supports bounded input/output chunks; `tarStream` reads bounded files without retaining the archive.
+  Streaming HTTPS and installer adoption are still needed
   to lift those in-memory limits. On the real Linux companion, three paired release runs on one P-core
   measured a zero-initialized byte-window prototype at 42.625G user instructions / 1.942 s versus
   44.752G / 1.958 s with an `array<u8>` window. The existing non-streaming decoder remains unchanged:

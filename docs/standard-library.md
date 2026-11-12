@@ -80,7 +80,7 @@ Built into the language rather than imported: `string`, arrays, `Map`,
 | `abla/http/tls` | certificate-verified HTTPS client transport |
 | `abla/http/json` | adapters between JSON values and HTTP requests/responses |
 | `abla/compression/gzip` | gzip compression and bounded single-member decompression; `gzipDecompress(input, maxOutputBytes)` collects the result, while `gzipStream` reads bounded chunks. Both reject malformed input and concatenated members. |
-| `abla/archive/tar` | Read bounded POSIX ustar files and directories; retains archive bytes and provides offsets, rejecting traversal, duplicates, unsupported entry types and malformed archives |
+| `abla/archive/tar` | Read bounded POSIX ustar files and directories from memory or a stream, rejecting traversal, duplicates, unsupported entry types and malformed archives |
 | `abla/xtensa/companion` | Installer-internal module, not a stable public API. Offline companion archive verification and descriptor-relative extraction; pinned archive, manifest and file hashes, with 128 MiB compressed and 256 MiB unpacked limits. It does not download, execute or activate tools. |
 | `abla/fs/secure` | Descriptor-relative operations with component validation, bounded handle reads and directory listings, no-follow opens and no-replace rename. `replaceSymlink` requires a trusted parent; its non-symlink destination check is not atomic against a hostile writer. |
 | `abla/tls/hosted` | dynamically loaded OpenSSL client/listener transport with hostname and certificate verification |
@@ -121,6 +121,17 @@ between calls. Output is provisional until `done` is true, after the CRC, ISIZE 
 end of the single member are checked. Errors are `invalid`, `limit` or
 `source`; abandoning the stream early does not validate it. The stream owns
 its history buffer and releases it when dropped.
+
+`tarStream(limits)` accepts a caller-owned `TarSource` on each `next(source)`
+and `readData(source, maxBytes)` call. Read the current file completely before
+requesting the next entry; data chunks are bounded to 64 KiB. Names, file sizes,
+entry count and archive bytes obey `TarLimits`, and streamed `TarEntry.offset`
+is always zero. File data and metadata are provisional until `next` reports
+`done`, after padding, terminal blocks and source EOF have been checked. Errors
+are `invalid`, `unsupported`, `limit`, or an error returned by the source;
+an empty non-EOF source response is `source`. The archive limit is enforced as
+bytes arrive, so malformed input that also exceeds the limit can report a
+different first error from the in-memory `tarRead`.
 
 There are no visibility modifiers, so a module's internal helpers are also
 importable. The functions named on the task pages are the supported API.

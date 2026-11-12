@@ -1,5 +1,6 @@
 // Read-only, bounded POSIX ustar. File data remains in the retained input.
 import "abla/text"
+import "abla/bytes"
 
 class TarLimits(
     val maxArchiveBytes: int,
@@ -113,4 +114,158 @@ fun tarRead(input: string, limits: TarLimits): TarReadResult {
         total += size
         pos += size + padding
     }
+}
+
+// The caller owns the source and passes the same source to every operation.
+// A source must return no more than maxBytes, and either data, EOF or an error.
+class TarInputChunk(val data: string, val eof: bool, val error: string = "")
+resource interface TarSource {
+    fun readChunk(maxBytes: int): TarInputChunk
+}
+class TarStreamNext(val entry: TarEntry, val done: bool, val error: string)
+class TarStreamData(val data: string, val done: bool, val error: string)
+
+class TarStream(
+    val limits: TarLimits,
+    val entries: array<TarEntry> = [],
+    var archiveBytes: int = 0,
+    var totalFileBytes: int = 0,
+    var remaining: int = 0,
+    var padding: int = 0,
+    var sourceEof: bool = false,
+    var finished: bool = false,
+    var error: string = ""
+)
+
+fun tarStream(limits: TarLimits): TarStream {
+    val stream = TarStream(limits)
+    if (limits.maxArchiveBytes < 0 || limits.maxEntries < 0 || limits.maxFileBytes < 0 ||
+        limits.maxTotalFileBytes < 0) stream.error = "invalid"
+    stream
+}
+
+// At most request bytes are retained. Ask for one extra at the limit so a
+// genuine EOF is distinguishable from input exceeding maxArchiveBytes.
+private fun TarStream.pull(var source: TarSource, request: int): TarInputChunk {
+    if (this.sourceEof) return TarInputChunk("", true)
+    val budget = this.limits.maxArchiveBytes - this.archiveBytes
+    val wanted = if (budget == 0) 1 else if (request < budget) request else budget
+    val chunk = source.readChunk(wanted)
+    if (chunk.error != "") { this.error = chunk.error; return TarInputChunk("", false) }
+    if (chunk.data.size > wanted || (chunk.data.size == 0 && !chunk.eof)) {
+        this.error = "source"
+        return TarInputChunk("", false)
+    }
+    if (chunk.data.size > budget) { this.error = "limit"; return TarInputChunk("", false) }
+    this.archiveBytes += chunk.data.size
+    this.sourceEof = chunk.eof
+    chunk
+}
+
+private fun TarStream.block(var source: TarSource, size: int): string {
+    val buffer = byteBuffer()
+    while (buffer.size() < size && this.error == "") {
+        val part = this.pull(source, size - buffer.size())
+        buffer.appendText(part.data)
+        if (part.eof && buffer.size() < size) this.error = "invalid"
+    }
+    buffer.toText()
+}
+
+private fun tarStreamNone(): TarEntry = TarEntry("", "", 0, 0, 0)
+private fun TarStream.nextError(): TarStreamNext = TarStreamNext(tarStreamNone(), false, this.error)
+
+// File bytes are provisional until next() reaches verified EOF. The current
+// file must be completely read before next(); its padding is checked there.
+fun TarStream.next(var source: TarSource): TarStreamNext {
+    if (this.error != "") return this.nextError()
+    if (this.finished) return TarStreamNext(tarStreamNone(), true, "")
+    if (this.remaining != 0) { this.error = "invalid"; return this.nextError() }
+    if (this.padding > 0) {
+        val pad = this.block(source, this.padding)
+        if (this.error != "") return this.nextError()
+        for (byte in pad) if (byte != 0) { this.error = "invalid"; return this.nextError() }
+        this.padding = 0
+    }
+    val header = this.block(source, 512)
+    if (this.error != "") return this.nextError()
+    var zero = true
+    for (byte in header) if (byte != 0) zero = false
+    if (zero) {
+        val second = this.block(source, 512)
+        if (this.error != "") return this.nextError()
+        for (byte in second) if (byte != 0) { this.error = "invalid"; return this.nextError() }
+        while (!this.sourceEof && this.error == "") {
+            val tail = this.pull(source, 65536)
+            for (byte in tail.data) if (byte != 0) { this.error =
+                    "invalid"; return this.nextError() }
+        }
+        if (this.error != "") return this.nextError()
+        if (this.archiveBytes % 512 != 0) { this.error = "invalid"; return this.nextError() }
+        this.finished = true
+        return TarStreamNext(tarStreamNone(), true, "")
+    }
+    val expected = tarOctal(header, 148, 8)
+    var sum = 0
+    var i = 0
+    while (i < 512) { sum += if (i >= 148 && i < 156) 32 else header[i]; i += 1 }
+    if (expected < 0 || sum != expected) { this.error = "invalid"; return this.nextError() }
+    if (header.slice(257, 263) != "ustar\0" || header.slice(263, 265) != "00") {
+        this.error = "unsupported"; return this.nextError()
+    }
+    val mode = tarOctal(header, 100, 8)
+    val uid = tarOctal(header, 108, 8)
+    val gid = tarOctal(header, 116, 8)
+    val size = tarOctal(header, 124, 12)
+    val modified = tarOctal(header, 136, 12)
+    if (mode < 0 || uid < 0 || gid < 0 || size < 0 || modified < 0) {
+        this.error = "invalid"; return this.nextError()
+    }
+    val type = header[156]
+    if (type != 0 && type != 48 && type != 53) { this.error =
+            "unsupported"; return this.nextError() }
+    val kind = if (type == 53) "directory" else "file"
+    if (kind == "directory" && size != 0) { this.error = "invalid"; return this.nextError() }
+    val name = tarField(header, 0, 100)
+    val prefix = tarField(header, 345, 155)
+    val rawPath = if (prefix == "") name else "$prefix/$name"
+    val path = tarPath(rawPath)
+    if (path == "" || (path == "." && kind != "directory")) {
+        this.error = "invalid"; return this.nextError()
+    }
+    for (entry in this.entries) {
+        if (entry.path == path || (entry.kind == "file" && path.startsWith("${entry.path}/")) ||
+            (kind == "file" && entry.path.startsWith("$path/"))) {
+            this.error = "invalid"; return this.nextError()
+        }
+    }
+    if (this.entries.size >= this.limits.maxEntries || size > this.limits.maxFileBytes ||
+        size > this.limits.maxTotalFileBytes - this.totalFileBytes) {
+        this.error = "limit"; return this.nextError()
+    }
+    val entry = TarEntry(path, kind, mode, 0, size, rawPath)
+    this.entries.append(entry)
+    this.totalFileBytes += size
+    this.remaining = size
+    this.padding = (512 - size % 512) % 512
+    TarStreamNext(entry, false, "")
+}
+
+// Each returned string is at most min(maxBytes, 65536). Empty files are done
+// immediately. An error invalidates all earlier entries and file bytes.
+fun TarStream.readData(var source: TarSource, maxBytes: int): TarStreamData {
+    if (this.error != "") return TarStreamData("", false, this.error)
+    if (maxBytes <= 0 || this.finished) {
+        this.error = "invalid"; return TarStreamData("", false, this.error)
+    }
+    if (this.remaining == 0) return TarStreamData("", true, "")
+    var wanted = if (maxBytes < 65536) maxBytes else 65536
+    if (wanted > this.remaining) wanted = this.remaining
+    val chunk = this.pull(source, wanted)
+    if (this.error != "") return TarStreamData("", false, this.error)
+    this.remaining -= chunk.data.size
+    if (chunk.eof && this.remaining > 0) {
+        this.error = "invalid"; return TarStreamData("", false, this.error)
+    }
+    TarStreamData(chunk.data, this.remaining == 0, "")
 }
