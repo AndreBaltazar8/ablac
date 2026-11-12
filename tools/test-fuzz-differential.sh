@@ -67,6 +67,15 @@ bad = run(broken, 'ownership-lifetime-control-broken')
 assert all(v[0] != 'build-failed' and 'c0=FUZZ_ORACLE_FAILURE' in v[0] for v in bad.values()), bad
 assert f['verdict'](bad) is not None, bad
 print('fuzz differential: wrong ownership-lifetime expectation detected in all modes')
+lines, call, ty = f['Gen'](8001).fresh_select_check(0)
+good = run(lines, 'fresh-select-control-good')
+assert f['verdict'](good) is None, good
+broken = [s.replace('if (actual != ', 'if (actual + "x" != ') for s in lines]
+assert broken != lines
+bad = run(broken, 'fresh-select-control-broken')
+assert all(v[0] != 'build-failed' and 'c0=FUZZ_ORACLE_FAILURE:' in v[0] for v in bad.values()), bad
+assert f['verdict'](bad) is not None, bad
+print('fuzz differential: wrong fresh-selection expectation detected in all modes')
 # Check the isolated shared-global campaign rejects an auto-only mismatch,
 # while accepting complete agreement, without depending on the open #796 bug.
 from types import SimpleNamespace
