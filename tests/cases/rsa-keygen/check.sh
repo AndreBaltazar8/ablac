@@ -4,6 +4,7 @@
 # shares code with the library that generated the key.
 # Usage: check.sh KEY-BITS PKCS8.der
 set -euo pipefail
+command -v bc >/dev/null 2>&1 || { echo "RSA key check: bc is required (POSIX; in shell.nix, preinstalled on macOS)" >&2; exit 1; }
 size=$1
 der=$2
 hex=$(od -An -v -tx1 "$der" | tr -d ' \n' | tr a-f A-F)
