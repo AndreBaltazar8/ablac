@@ -512,7 +512,8 @@ private fun StreamInflateReader.read(var source: GzipSource, count: int): int {
     value
 }
 
-private class StreamInflateTree(val counts: array<int>, val symbols: array<int>, val valid: bool)
+private class StreamInflateTree(val counts: array<int>, val symbols: array<int>, val valid: bool,
+    val fast: array<int> = [])
 private fun streamInflateTree(lengths: array<int>, allowEmpty: bool,
     allowSingle: bool): StreamInflateTree {
     val counts = filledArray(16, 0)
@@ -542,7 +543,33 @@ private fun streamInflateTree(lengths: array<int>, allowEmpty: bool,
         if (length > 0) { symbols[offsets[length]] = symbol; offsets[length] += 1 }
         symbol += 1
     }
-    StreamInflateTree(counts, symbols, true)
+    val next = filledArray(16, 0)
+    var code = 0
+    bits = 1
+    while (bits <= 15) {
+        code = (code + counts[bits - 1]) << 1
+        next[bits] = code
+        bits += 1
+    }
+    val fast = filledArray(512, 0)
+    symbol = 0
+    while (symbol < lengths.size) {
+        val length = lengths[symbol]
+        if (length > 0) {
+            val canonical = next[length]
+            next[length] += 1
+            if (length <= 9) {
+                var index = deflateReverseBits(canonical, length)
+                val step = 1 << length
+                while (index < 512) {
+                    fast[index] = (symbol << 4) | length
+                    index += step
+                }
+            }
+        }
+        symbol += 1
+    }
+    StreamInflateTree(counts, symbols, true, fast)
 }
 
 private fun streamInflateSymbol(var reader: StreamInflateReader,
@@ -557,6 +584,33 @@ private fun streamInflateSymbol(var reader: StreamInflateReader,
     var bits = reader.bits
     var available = reader.count
     var symbol = -1
+    // Peek only within the current source chunk. Consume no more bytes than
+    // this symbol needs, so byte-alignment cannot discard trailer bytes.
+    if (tree.fast.size != 0) {
+        var peek = bits
+        var peekCount = available
+        var peekPos = pos
+        while (peekCount < 9 && peekPos < input.size) {
+            peek = peek | (int(input[peekPos]) << peekCount)
+            peekPos += 1
+            peekCount += 8
+        }
+        if (peekCount >= 9) {
+            val entry = tree.fast[peek & 511]
+            val width = entry & 15
+            if (width != 0) {
+                while (available < width) {
+                    bits = bits | (int(input[pos]) << available)
+                    pos += 1
+                    available += 8
+                }
+                reader.bits = bits >>> width
+                reader.count = available - width
+                reader.pos = pos
+                return entry >>> 4
+            }
+        }
+    }
     while (length <= 15) {
         if (available == 0) {
             var value = 0

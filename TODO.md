@@ -419,6 +419,9 @@
   instructions (three release runs, median instructions:u, one P-core): real companion
   28.071G -> 19.389G, repetitive input 848.403M -> 108.615M, src tar 1.326G -> 589.001M.
   The old collecting decoder remains until the wrapper is within 5% on all three inputs.
+  A nine-bit Huffman prefix table, measured separately after batching, changed streaming
+  instructions from 19.389G to 14.652G on the real companion, 108.615M to 109.708M on
+  the repetitive input, and 589.001M to 469.980M on the src tar (same paired method).
   The read-only
   `abla/archive/tar` reader now checks bounded ustar files/directories, paths, checksums and file-ancestor
   conflicts; links and PAX/GNU extensions are unsupported. On the SHA-verified Linux companion (30,720,987-byte
