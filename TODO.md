@@ -264,6 +264,8 @@
 
 - **Conditional method receivers (#800).** A fresh affine receiver selected by an `if`, `when`, or block is held
   until its statement ends, in native and compile-time execution. Previously it leaked on both tiers.
+- **Nullable field owners (#804).** A fresh resource selected by `??` stays owned until the statement using its field
+  ends; previously scalar field projections could leak it.
 - **Nullable borrowed arguments (#804).** A fresh resource selected by `??` and passed to a borrowing parameter
   now drops at the end of the calling statement; previously either selected arm could leak.
 - **Discarded affine containers at compile time (#801).** A discarded fresh array or map containing resources is
