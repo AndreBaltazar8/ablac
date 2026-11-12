@@ -1778,9 +1778,10 @@ fun bootstrapLlvmEmitExports(
 // place of crt1's `_start` and `__libc_start_main`. `_start` reads argc, argv, envp
 // and the auxiliary vector from the initial stack, gives the main thread a thread
 // block with arch_prctl(ARCH_SET_FS), runs `.init_array`, calls
-// `main(argc, argv, envp)` and leaves with exit_group. A static non-PIE
-// executable: nothing relocates itself. A failed mmap or arch_prctl, or a TLS
-// alignment over a page, exits 127.
+// `main(argc, argv, envp)` and leaves with exit_group. A static-pie executable:
+// `_start` first applies its own R_X86_64_RELATIVE relocations (found through PT_PHDR and
+// PT_DYNAMIC); the toolchain refuses any other kind at link time. A failed mmap or
+// arch_prctl, a TLS alignment over a page, or an unexpected relocation format exits 127.
 //
 // The thread block (x86-64 variant II) is shared with thread creation through three
 // C-ABI routines: abla_tls_bytes(phdr, phnum) is the bytes a block needs (the PT_TLS
@@ -1830,8 +1831,81 @@ fun bootstrapLlvmFreestandingStartAssembly(): string =
     "5: movq %r8, abla_start_phdr(%rip)\n" +
     "movq %r9, abla_start_phnum(%rip)\n" +
     "movq %r10, abla_start_random(%rip)\n" +
-    "movq %r8, %rdi\n" +
-    "movq %r9, %rsi\n" +
+    "movq %r8, %rsi\n" +
+    "movq %r9, %rcx\n" +
+    "xorl %ebx, %ebx\n" +
+    "xorl %r12d, %r12d\n" +
+    "movq %rsi, %rdi\n" +
+    "movq %rcx, %rdx\n" +
+    "20: testq %rdx, %rdx\n" +
+    "jz 23f\n" +
+    "movl (%rdi), %eax\n" +
+    "cmpl \$\$6, %eax\n" +
+    "jne 21f\n" +
+    "movq %rsi, %rbx\n" +
+    "subq 16(%rdi), %rbx\n" +
+    "21: cmpl \$\$2, %eax\n" +
+    "jne 22f\n" +
+    "movq 16(%rdi), %r12\n" +
+    "22: addq \$\$56, %rdi\n" +
+    "decq %rdx\n" +
+    "jmp 20b\n" +
+    "23: testq %r12, %r12\n" +
+    "jz 30f\n" +
+    "addq %rbx, %r12\n" +
+    "xorl %r8d, %r8d\n" +
+    "xorl %r9d, %r9d\n" +
+    "xorl %r10d, %r10d\n" +
+    "xorl %r11d, %r11d\n" +
+    "24: movq (%r12), %rax\n" +
+    "movq 8(%r12), %rcx\n" +
+    "addq \$\$16, %r12\n" +
+    "testq %rax, %rax\n" +
+    "jz 25f\n" +
+    "cmpq \$\$7, %rax\n" +
+    "jne 241f\n" +
+    "movq %rcx, %r8\n" +
+    "jmp 24b\n" +
+    "241: cmpq \$\$8, %rax\n" +
+    "jne 242f\n" +
+    "movq %rcx, %r9\n" +
+    "jmp 24b\n" +
+    "242: cmpq \$\$25, %rax\n" +
+    "jne 243f\n" +
+    "movq %rcx, %r10\n" +
+    "jmp 24b\n" +
+    "243: cmpq \$\$27, %rax\n" +
+    "jne 244f\n" +
+    "movq %rcx, %r11\n" +
+    "jmp 24b\n" +
+    "244: cmpq \$\$36, %rax\n" +
+    "je 99f\n" +
+    "cmpq \$\$17, %rax\n" +
+    "je 99f\n" +
+    "jmp 24b\n" +
+    "25: testq %r9, %r9\n" +
+    "jz 28f\n" +
+    "addq %rbx, %r8\n" +
+    "27: cmpl \$\$8, 8(%r8)\n" +
+    "jne 99f\n" +
+    "movq (%r8), %rax\n" +
+    "movq 16(%r8), %rcx\n" +
+    "addq %rbx, %rcx\n" +
+    "movq %rcx, (%rax,%rbx)\n" +
+    "addq \$\$24, %r8\n" +
+    "subq \$\$24, %r9\n" +
+    "jnz 27b\n" +
+    "28: testq %r10, %r10\n" +
+    "jz 30f\n" +
+    "addq %rbx, %r10\n" +
+    "addq %r10, %r11\n" +
+    "movq %r10, %rbx\n" +
+    "movq %r11, %r12\n" +
+    "jmp 31f\n" +
+    "30: xorl %ebx, %ebx\n" +
+    "xorl %r12d, %r12d\n" +
+    "31: movq abla_start_phdr(%rip), %rdi\n" +
+    "movq abla_start_phnum(%rip), %rsi\n" +
     "callq abla_tls_bytes\n" +
     "cmpq \$\$-1, %rax\n" +
     "je 99f\n" +
@@ -1854,10 +1928,6 @@ fun bootstrapLlvmFreestandingStartAssembly(): string =
     "callq abla_tls_set\n" +
     "testq %rax, %rax\n" +
     "jnz 99f\n" +
-    ".weak __init_array_start\n" +
-    ".weak __init_array_end\n" +
-    "leaq __init_array_start(%rip), %rbx\n" +
-    "leaq __init_array_end(%rip), %r12\n" +
     "12: cmpq %r12, %rbx\n" +
     "jae 13f\n" +
     "movq %r13, %rdi\n" +
@@ -1909,6 +1979,19 @@ fun bootstrapLlvmTlsBytesAssembly(): string =
 fun bootstrapLlvmTlsInitAssembly(): string =
     "movq %rdi, %r8\n" +
     "movq %rcx, %r9\n" +
+    "movq %rsi, %r11\n" +
+    "movq %rdx, %rax\n" +
+    "xorl %r10d, %r10d\n" +
+    "7: testq %rax, %rax\n" +
+    "jz 8f\n" +
+    "cmpl \$\$6, (%rsi)\n" +
+    "jne 9f\n" +
+    "movq %r11, %r10\n" +
+    "subq 16(%rsi), %r10\n" +
+    "9: addq \$\$56, %rsi\n" +
+    "decq %rax\n" +
+    "jmp 7b\n" +
+    "8: movq %r11, %rsi\n" +
     "1: testq %rdx, %rdx\n" +
     "jz 4f\n" +
     "cmpl \$\$7, (%rsi)\n" +
@@ -1921,16 +2004,18 @@ fun bootstrapLlvmTlsInitAssembly(): string =
     "cmpq %rax, %rcx\n" +
     "cmovbq %rax, %rcx\n" +
     "movq 40(%rsi), %rax\n" +
-    "leaq -1(%rcx), %r10\n" +
-    "addq %r10, %rax\n" +
-    "notq %r10\n" +
-    "andq %r10, %rax\n" +
-    "leaq (%r8,%rax), %r10\n" +
-    "movq %rsi, %r11\n" +
+    "leaq -1(%rcx), %rdx\n" +
+    "addq %rdx, %rax\n" +
+    "notq %rdx\n" +
+    "andq %rdx, %rax\n" +
+    "leaq (%r8,%rax), %r11\n" +
     "movq %r8, %rdi\n" +
-    "movq 16(%r11), %rsi\n" +
-    "movq 32(%r11), %rcx\n" +
+    "movq 16(%rsi), %rdx\n" +
+    "addq %r10, %rdx\n" +
+    "movq 32(%rsi), %rcx\n" +
+    "movq %rdx, %rsi\n" +
     "rep movsb\n" +
+    "movq %r11, %r10\n" +
     "jmp 5f\n" +
     "4: movq %r8, %r10\n" +
     "5: movq %r10, (%r10)\n" +
