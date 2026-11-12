@@ -229,6 +229,7 @@ test-serial: ablac
 	tools/test-thread-globals.sh $(COMPILER)
 	tools/test-compile-global-graph.sh $(COMPILER)
 	tools/test-compile-eval-jit.sh $(COMPILER)
+	tools/test-compile-eval-shared-state.sh $(COMPILER)
 	tools/test-compile-eval-cross-target.sh $(COMPILER)
 	tools/test-compile-eval-method-targets.sh $(COMPILER)
 	tools/test-compile-eval-environment.sh $(COMPILER)
