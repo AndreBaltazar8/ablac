@@ -58,13 +58,27 @@ exec sleep 60
 WORKER
 
 # run_tree KIND MODE: KIND is group (kill the runner's whole group), term, hup, int or timeout.
+# A test started as a background job (the suite's runner does) has SIGINT ignored, and a shell
+# cannot take that back: the runner and its supervisor would ignore the INT this test sends.
+# GNU env resets it (macOS runs this test in the foreground, where INT is default); without
+# it the INT case is skipped with a message.
+int_prefix=()
+int_skipped=0
+case $(trap -p INT) in
+*"''"*)
+    if env --default-signal=INT true 2> /dev/null; then int_prefix=(env --default-signal=INT)
+    else int_skipped=1; fi ;;
+esac
+
 run_tree() {
     local kind=$1 mode=$2 name=$1-$2 marker seconds=60 expected status=0
     marker=$tmp/$name
     [[ $kind != timeout ]] || seconds=1
     set -m
+    local prefix=()
+    [[ $kind != int ]] || prefix=(${int_prefix[@]+"${int_prefix[@]}"})
     ABLA_MAX_SECONDS=$seconds ABLA_KILL_GRACE_SECONDS=1 \
-        "$runner" sh "$tmp/worker.sh" "$marker" "$mode" > /dev/null 2> "$tmp/$name.log" < /dev/null &
+        ${prefix[@]+"${prefix[@]}"} "$runner" sh "$tmp/worker.sh" "$marker" "$mode" > /dev/null 2> "$tmp/$name.log" < /dev/null &
     local proc=$!
     set +m
     cleanup_pids+=("$proc")
@@ -119,7 +133,11 @@ run_tree group normal
 run_tree group stubborn
 run_tree term normal
 run_tree hup normal
-run_tree int normal
+if [[ $int_skipped == 1 ]]; then
+    echo "Darwin runner: int-normal skipped (SIGINT is ignored here and env --default-signal is not available)"
+else
+    run_tree int normal
+fi
 run_tree timeout stubborn
 
 # Stop the supervisor's interpreter before it can check its caller. Killing only the
