@@ -1,0 +1,334 @@
+// The offline companion installer validates pinned archive bytes before any write.
+import "abla/archive/tar"
+import "abla/compression/gzip"
+import "abla/crypto"
+import "abla/fs/secure"
+import "abla/json"
+import "abla/text"
+import "abla/sys/linux/random"
+
+class CompanionPins(
+    val version: string,
+    val platform: string,
+    val llvmVersion: string,
+    val sourceCommit: string,
+    val sourceArchiveSha256: string,
+    val archiveSha256: string,
+    val manifestSha256: string
+)
+class CompanionArchiveResult(val archive: TarReadResult, val manifest: Json, val error: string)
+
+private fun companionError(message: string): CompanionArchiveResult =
+    CompanionArchiveResult(TarReadResult("", [], "invalid"), jsonNull(), message)
+
+private fun companionRawPathValid(raw: string): bool {
+    if (raw == "" || raw.startsWith("/")) return false
+    val name = if (raw.endsWith("/")) raw.slice(0, raw.size - 1) else raw
+    if (name == "") return false
+    for (part in name.split("/")) if (part == "" || part == "." || part == "..") return false
+    true
+}
+
+// Archive and manifest pins must already come from the validated catalog.
+fun companionValidateArchive(compressed: string, pins: CompanionPins): CompanionArchiveResult {
+    if (!companionPinsValid(pins)) return companionError("pins")
+    if (compressed.size > 134217728) return companionError("archive_limit")
+    if (hexEncode(sha256(compressed)) != pins.archiveSha256) return companionError("archive_hash")
+    val decoded = gzipDecompress(compressed, 268435456)
+    if (decoded.error != "") return companionError("gzip_${decoded.error}")
+    val archive = tarRead(decoded.data, TarLimits(268435456, 1024, 268435456, 268435456))
+    if (archive.error != "") return companionError("tar_${archive.error}")
+    val root = "abla-xtensa-llvm-${pins.version}-${pins.platform}"
+    var manifestIndex = -1
+    var i = 0
+    while (i < archive.entries.size) {
+        val entry = archive.entries[i]
+        if (!companionRawPathValid(entry.rawPath) ||
+            (entry.path != root &&
+                !entry.path.startsWith("$root/"))) return companionError("archive_path")
+        if (entry.path == root && entry.kind != "directory") return companionError("archive_root")
+        if (entry.path == "$root/manifest.json" && entry.kind == "file") manifestIndex = i
+        i += 1
+    }
+    if (manifestIndex < 0) return companionError("manifest_missing")
+    val manifestEntry = archive.entries[manifestIndex]
+    if (manifestEntry.size <= 0 || manifestEntry.size >
+        65536) return companionError("manifest_limit")
+    val raw = archive.input.slice(manifestEntry.offset, manifestEntry.offset + manifestEntry.size)
+    if (hexEncode(sha256(raw)) != pins.manifestSha256) return companionError("manifest_hash")
+    val parsed = jsonParse(raw, JsonLimits(65536, 32, 10000, 65536, 2048, true))
+    if (!parsed.succeeded || !parsed.value.isObject()) return companionError("manifest_json")
+    val manifest = parsed.value
+    if (manifest.getInt("schema") != 1 || manifest.getString("version") !=
+        "abla-xtensa-llvm-${pins.version}" ||
+        manifest.getString("platform") != pins.platform || manifest.getString("llvmVersion") !=
+        pins.llvmVersion ||
+        manifest.getString("sourceCommit") != pins.sourceCommit ||
+        manifest.getString("sourceArchiveSha256") !=
+        pins.sourceArchiveSha256) return companionError("manifest_identity")
+    val files = manifest.get("files")
+    if (!files.isObject() || !files.has("bin/opt") ||
+        !files.has("bin/llc")) return companionError("manifest_files")
+    var hasLibrary = false
+    for (key in files.keys) if (key.startsWith("lib/libLLVM")) hasLibrary = true
+    if (!hasLibrary) return companionError("manifest_files")
+    var count = 0
+    for (entry in archive.entries) {
+        if (entry.kind == "file" && entry.path != "$root/manifest.json") {
+            val name = entry.path.slice(root.size + 1, entry.path.size)
+            if (!files.has(name) || !files.get(name).isString()) return companionError("file_set")
+            val hash = files.getString(name)
+            if (hash.size != 64 || hexEncode(sha256(archive.input.slice(entry.offset,
+                entry.offset + entry.size))) != hash)
+                return companionError("file_hash")
+            if ((name == "bin/opt" || name == "bin/llc") && (entry.mode & 0o111) ==
+                0) return companionError("file_mode")
+            count += 1
+        }
+    }
+    if (count != files.size()) return companionError("file_set")
+    CompanionArchiveResult(archive, manifest, "")
+}
+
+class CompanionVerifyResult(val error: string)
+private class CompanionWalkState(var entries: int, var bytes: int, var files: int)
+
+// The directory handle is the verification authority; never reopen a path.
+private fun companionWalk(
+    directory: SecureDirectory, prefix: string, files: Json, var state: CompanionWalkState,
+    depth: int
+): string {
+    if (depth > 64) return "tree_depth"
+    val listing = directory.list(1024, 255)
+    if (listing.error != "") return "directory_${listing.error}"
+    for (name in listing.names) {
+        state.entries += 1
+        if (state.entries > 1024) return "tree_limit"
+        val relative = if (prefix == "") name else "$prefix/$name"
+        val kind = directory.entryKind(name)
+        if (kind == "directory") {
+            val child = directory.openDirectory(name)
+            if (child.descriptor < 0) return "directory_open"
+            val error = companionWalk(child, relative, files, state, depth + 1)
+            if (error != "") return error
+        } else if (kind == "file") {
+            val opened = directory.openRegularFile(name)
+            if (opened.descriptor < 0) return "file_open"
+            if (relative == "manifest.json") continue
+            if (!files.has(relative) || !files.get(relative).isString()) return "file_set"
+            val read = opened.read(268435456 - state.bytes)
+            if (read.error != "") return "file_${read.error}"
+            state.bytes += read.data.size
+            if (hexEncode(sha256(read.data)) != files.getString(relative)) return "file_hash"
+            val permissions = opened.permissions()
+            if (permissions < 0 || ((relative == "bin/opt" || relative == "bin/llc") &&
+                (permissions & 0o111) == 0)) return "file_mode"
+            state.files += 1
+        } else return "tree_type"
+    }
+    ""
+}
+
+fun verifyCompanion(directory: SecureDirectory, pins: CompanionPins): CompanionVerifyResult {
+    if (!companionPinsValid(pins)) return CompanionVerifyResult("pins")
+    if (directory.descriptor < 0) return CompanionVerifyResult("directory_open")
+    val manifestFile = directory.openRegularFile("manifest.json")
+    if (manifestFile.descriptor < 0) return CompanionVerifyResult("manifest_missing")
+    val read = manifestFile.read(65536)
+    if (read.error != "" || read.data.size == 0) return CompanionVerifyResult("manifest_limit")
+    if (hexEncode(sha256(read.data)) !=
+        pins.manifestSha256) return CompanionVerifyResult("manifest_hash")
+    val parsed = jsonParse(read.data, JsonLimits(65536, 32, 10000, 65536, 2048, true))
+    if (!parsed.succeeded || !parsed.value.isObject()) return CompanionVerifyResult("manifest_json")
+    val manifest = parsed.value
+    if (manifest.getInt("schema") != 1 || manifest.getString("version") !=
+        "abla-xtensa-llvm-${pins.version}" ||
+        manifest.getString("platform") != pins.platform || manifest.getString("llvmVersion") !=
+        pins.llvmVersion ||
+        manifest.getString("sourceCommit") != pins.sourceCommit ||
+        manifest.getString("sourceArchiveSha256") !=
+        pins.sourceArchiveSha256) return CompanionVerifyResult("manifest_identity")
+    val files = manifest.get("files")
+    if (!files.isObject() || !files.has("bin/opt") ||
+        !files.has("bin/llc")) return CompanionVerifyResult("manifest_files")
+    var library = false
+    for (key in files.keys) if (key.startsWith("lib/libLLVM")) library = true
+    if (!library) return CompanionVerifyResult("manifest_files")
+    val state = CompanionWalkState(0, read.data.size, 0)
+    val error = companionWalk(directory, "", files, state, 0)
+    if (error != "") return CompanionVerifyResult(error)
+    if (state.files != files.size()) return CompanionVerifyResult("file_set")
+    CompanionVerifyResult("")
+}
+
+class CompanionExtractResult(val error: string, val existing: bool, val leftoverStage: string = "")
+private class CompanionStage(val files: array<string>, val dirs: array<string>)
+
+private fun companionDigits(value: string): bool {
+    if (value == "") return false
+    for (byte in value) if (byte < 48 || byte > 57) return false
+    true
+}
+private fun companionHex(value: string, length: int): bool {
+    if (value.size != length) return false
+    for (byte in value) if (!((byte >= 48 && byte <= 57) || (byte >= 97 && byte <=
+        102))) return false
+    true
+}
+private fun companionRevisionValid(version: string): bool {
+    if (version.size > 64) return false
+    val halves = version.split("-")
+    if (halves.size != 2 || !companionDigits(halves[1]) || halves[1][0] == 48) return false
+    val numbers = halves[0].split(".")
+    if (numbers.size != 3) return false
+    for (number in numbers) if (!companionDigits(number)) return false
+    true
+}
+private fun companionPlatformValid(platform: string): bool = platform == "x86_64-linux" ||
+    platform == "x86_64-macos" || platform == "arm64-macos"
+private fun companionPinsValid(pins: CompanionPins): bool {
+    if (!companionRevisionValid(pins.version) ||
+        !companionPlatformValid(pins.platform)) return false
+    val halves = pins.version.split("-")
+    pins.llvmVersion == halves[0] && companionHex(pins.sourceCommit, 40) &&
+        companionHex(pins.sourceArchiveSha256, 64) && companionHex(pins.archiveSha256, 64) &&
+        companionHex(pins.manifestSha256, 64)
+}
+
+// Walks one checked component at a time, creating missing directories in the
+// private stage and recording every creation for rollback.
+private fun companionStageEntry(
+    parent: SecureDirectory, parts: array<string>, index: int, prefix: string,
+    entry: TarEntry, contents: string, var stage: CompanionStage
+): bool {
+    val name = parts[index]
+    val path = if (prefix == "") name else "$prefix/$name"
+    if (index + 1 < parts.size || entry.kind == "directory") {
+        if (parent.createDirectory(name, 0o700)) stage.dirs.append(path)
+        val child = parent.openDirectory(name)
+        if (child.descriptor < 0 || !child.setPermissions(0o700)) return false
+        if (index + 1 == parts.size) return true
+        return companionStageEntry(child, parts, index + 1, path, entry, contents, stage)
+    }
+    val file = parent.createFile(name, 0o600)
+    if (file.descriptor < 0) return false
+    stage.files.append(path)
+    if (!file.write(contents) || !file.sync()) return false
+    if (!file.setPermissions(if ((entry.mode & 0o111) != 0) 0o555 else 0o444)) return false
+    file.close()
+}
+
+private fun companionStageMode(parent: SecureDirectory, parts: array<string>, index: int,
+    mode: int): bool {
+    val child = parent.openDirectory(parts[index])
+    if (child.descriptor < 0) return false
+    if (index + 1 == parts.size) return child.setPermissions(mode)
+    companionStageMode(child, parts, index + 1, mode)
+}
+private fun companionStageRemove(
+    parent: SecureDirectory, parts: array<string>, index: int, directory: bool
+): bool {
+    if (index + 1 == parts.size) return parent.remove(parts[index], directory)
+    val child = parent.openDirectory(parts[index])
+    if (child.descriptor < 0) return false
+    companionStageRemove(child, parts, index + 1, directory)
+}
+private fun companionStageCleanup(parent: SecureDirectory, stageName: string,
+    var stage: CompanionStage): bool {
+    val root = parent.openDirectory(stageName)
+    if (root.descriptor < 0) return false
+    var ok = root.setPermissions(0o700)
+    for (path in stage.dirs) if (!companionStageMode(root, path.split("/"), 0, 0o700)) ok = false
+    var i = stage.files.size
+    while (i > 0) {
+        i -= 1
+        if (!companionStageRemove(root, stage.files[i].split("/"), 0, false)) ok = false
+    }
+    i = stage.dirs.size
+    while (i > 0) {
+        i -= 1
+        if (!companionStageRemove(root, stage.dirs[i].split("/"), 0, true)) ok = false
+    }
+    if (!root.close()) ok = false
+    if (!parent.remove(stageName, true)) ok = false
+    ok
+}
+
+// Offline only; `parent` is the trusted managed directory next to the final
+// version. This function does not run helper executables or activate a link.
+fun extractCompanion(parent: SecureDirectory, archiveFile: SecureFile,
+    pins: CompanionPins): CompanionExtractResult {
+    if (parent.descriptor < 0 || !companionPinsValid(pins)) return CompanionExtractResult("invalid",
+        false)
+    val currentKind = parent.entryKind(pins.version)
+    if (currentKind == "directory") {
+        val current = parent.openDirectory(pins.version)
+        val checked = verifyCompanion(current, pins)
+        if (checked.error != "") return CompanionExtractResult("existing_${checked.error}", false)
+        return CompanionExtractResult("", true)
+    }
+    if (currentKind != "missing") return CompanionExtractResult("existing_type", false)
+    if (archiveFile.descriptor < 0 ||
+        !archiveFile.isRegular()) return CompanionExtractResult("archive_open", false)
+    val compressed = archiveFile.read(134217728)
+    if (compressed.error != "") return CompanionExtractResult("archive_${compressed.error}", false)
+    val verified = companionValidateArchive(compressed.data, pins)
+    if (verified.error != "") return CompanionExtractResult(verified.error, false)
+    val random = secureRandomBytes(16)
+    if (!random.succeeded) return CompanionExtractResult("random", false)
+    val stageName = ".install-${pins.version}-${hexEncode(random.bytes)}"
+    if (!parent.createDirectory(stageName, 0o700)) return CompanionExtractResult("stage_create",
+        false)
+    val stage = CompanionStage([], [])
+    val root = parent.openDirectory(stageName)
+    if (root.descriptor < 0) {
+        if (!parent.remove(stageName, true)) return CompanionExtractResult("cleanup", false,
+            stageName)
+        return CompanionExtractResult("stage_open", false)
+    }
+    var error = ""
+    if (!root.setPermissions(0o700)) error = "stage_open"
+    val archiveRoot = "abla-xtensa-llvm-${pins.version}-${pins.platform}"
+    if (error == "") {
+        for (entry in verified.archive.entries) {
+            if (entry.path != archiveRoot) {
+                val name = entry.path.slice(archiveRoot.size + 1, entry.path.size)
+                val contents = if (entry.kind == "file") verified.archive.input.slice(entry.offset,
+                    entry.offset + entry.size) else ""
+                if (!companionStageEntry(root, name.split("/"), 0, "", entry, contents, stage)) {
+                    error = "stage_write"
+                    break
+                }
+            }
+        }
+    }
+    if (error == "") {
+        val checkRoot = parent.openDirectory(stageName)
+        val checked = verifyCompanion(checkRoot, pins)
+        if (checked.error != "") error = "verify_${checked.error}"
+    }
+    if (error == "") {
+        var i = stage.dirs.size
+        while (i > 0) {
+            i -= 1
+            if (!companionStageMode(root, stage.dirs[i].split("/"), 0,
+                0o555)) { error = "stage_mode"; break }
+        }
+        if (error == "" && (!root.setPermissions(0o555) || !root.sync())) error = "stage_mode"
+    }
+    if (!root.close() && error == "") error = "stage_close"
+    if (error != "") {
+        if (!companionStageCleanup(parent, stageName,
+            stage)) return CompanionExtractResult("cleanup", false, stageName)
+        return CompanionExtractResult(error, false)
+    }
+    val published = parent.renameNoReplace(stageName, parent, pins.version)
+    if (published == 0) return CompanionExtractResult("", false)
+    if (!companionStageCleanup(parent, stageName, stage)) return CompanionExtractResult("cleanup",
+        false, stageName)
+    if (published != -17) return CompanionExtractResult("publish", false)
+    val winner = parent.openDirectory(pins.version)
+    val checked = verifyCompanion(winner, pins)
+    if (checked.error != "") return CompanionExtractResult("existing_${checked.error}", false)
+    CompanionExtractResult("", true)
+}

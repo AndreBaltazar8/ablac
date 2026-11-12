@@ -61,7 +61,10 @@ backend. No Abla build downloads a companion implicitly.
 
 ### Explicit installation
 
-The installer requires Python 3.9 or newer and its standard library; it uses no pip packages.
+The shipped installer requires Python 3.9 or newer and its standard library; it uses no pip packages.
+The native offline extraction library is not yet the packaged installer. It caps compressed
+input at 128 MiB and unpacked tar at 256 MiB; streaming decompression is needed before those
+limits can be raised without holding the archive in memory.
 The Abla toolchain packagers include `bin/abla-install-xtensa`. From an existing
 source checkout the equivalent command is:
 

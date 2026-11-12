@@ -251,6 +251,7 @@ test-serial: ablac
 	tools/test-path-file-mode.sh $(COMPILER)
 	tools/test-open-nofollow.sh $(COMPILER)
 	tools/test-secure-fs.sh $(COMPILER)
+	tools/test-xtensa-companion-offline.sh $(COMPILER)
 	tools/test-process-pipeline.sh $(COMPILER)
 	tools/test-runtime-checks.sh $(COMPILER)
 	tools/test-float-integer-saturation.sh $(COMPILER)

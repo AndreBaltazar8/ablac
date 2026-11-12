@@ -313,20 +313,23 @@
 - [ ] **Abla-native Xtensa companion installer.** The explicit optional installer uses only the Python
   standard library until `abla/compression` can inflate gzip and read tar with bounded, safe extraction.
   Move it to Abla once those archive primitives exist; keep checksum and manifest verification. `gzipDecompress`
-  now inflates a single member with a mandatory caller-provided output limit and CRC/ISIZE checks; tar extraction
-  and the Abla installer remain open. On 2026-11-11, one P-core, release host build: a 4,420,000-byte repetitive
+  now inflates a single member with a mandatory caller-provided output limit and CRC/ISIZE checks; the offline
+  extraction and verification library is available, while the packaged Abla installer remains open. On 2026-11-11, one P-core, release host build: a 4,420,000-byte repetitive
   input (12,921-byte gzip -6) took median 28.2 ms / 589.0M instructions versus gzip -dc 1.7 ms / 34.4M
   (16.6x wall / 17.1x instructions); a 4,843,520-byte tar of ablac src (896,025-byte gzip -6) took 64.2 ms /
   1123.7M versus gzip 7.2 ms / 64.0M (8.9x / 17.5x). Wall medians are five process runs, instruction medians
   four `perf stat -e cpu_core/instructions/u` runs; both include process startup and reading input. Abla materializes
   the result in memory while gzip writes to /dev/null. Tests: `tools/test-gzip-inflate.sh`. Descriptor-relative
-  no-follow and exclusive filesystem primitives are in `abla/fs/secure`; their Darwin translations need macOS
-  CI validation before the native installer can use them. The read-only
+  no-follow and exclusive filesystem primitives are in `abla/fs/secure`, with Darwin exercised in macOS CI.
+  The native offline library caps gzip input at 128 MiB and decoded tar at 256 MiB; streaming inflate is needed
+  to lift those in-memory limits. The read-only
   `abla/archive/tar` reader now checks bounded ustar files/directories, paths, checksums and file-ancestor
   conflicts; links and PAX/GNU extensions are unsupported. On the SHA-verified Linux companion (30,720,987-byte
-  gzip, 72,366,080-byte tar, 18 entries), a host `--fast` gzipDecompress + tarRead test peaked at 182,836 KiB
-  RSS and took 32.08 s (`/usr/bin/time` equivalent; one run, 2026-11-11). The optional cached-archive test is
-  `ABLA_TEST_XTENSA_COMPANION=<archive> tools/test-tar-reader.sh`; actual extraction and installer remain open.
+  gzip, 72,366,080-byte tar, 18 entries), a release gzipDecompress + tarRead test took median 1.553 s and
+  183,952 KiB peak RSS (three runs, 2026-11-11); gzip alone took 1.563 s, tar scan over a cached plain tar
+  0.027 s including reading it, and concatenating file slices 0.052 s including reading/scanning. The optional
+  cached-archive test is `ABLA_TEST_XTENSA_COMPANION=<archive> tools/test-xtensa-companion-offline.sh`; the
+  release-packaged installer, download, activation and helper execution remain open.
 - [x] `abla/yaml` provides bounded Core-schema parsing, checked emission and comment/format-preserving path edits;
       see [docs/stdlib/yaml.md](docs/stdlib/yaml.md) and the synthetic provision-mail fixture. NovaKind can adopt it after release.
 

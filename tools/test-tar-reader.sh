@@ -35,6 +35,7 @@ def make(name, path='root/file.txt', kind=tarfile.REGTYPE, fmt=tarfile.USTAR_FOR
         else: info.size=len(data)
         t.addfile(info,io.BytesIO(data) if info.size else None)
 make('raw','./root//file.txt')
+make('rawprefix','p'*90+'/'+'n'*20)
 make('pax','root/'+'x'*130,fmt=tarfile.PAX_FORMAT)
 make('gnu-long','root/'+'x'*130,fmt=tarfile.GNU_FORMAT)
 make('symlink','root/link',kind=tarfile.SYMTYPE)
@@ -55,6 +56,7 @@ PY
 "$out/probe" "$out/gnu-ustar.tar" '' verify
 "$out/probe" "$out/publisher.tar" '' verify
 "$out/probe" "$out/raw.tar" '' raw
+"$out/probe" "$out/rawprefix.tar" '' rawprefix
 for test in pax gnu-long symlink; do "$out/probe" "$out/$test.tar" unsupported; done
 for test in absolute traversal duplicate ancestor-first ancestor-last bad-checksum bad-trailing bad-truncated; do "$out/probe" "$out/$test.tar" invalid; done
 "$out/probe" "$out/gnu-ustar.tar" '' mutate
