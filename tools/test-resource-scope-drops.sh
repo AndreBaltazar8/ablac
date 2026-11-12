@@ -8,6 +8,12 @@ project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 output_directory="$project_root/build/resource-scope-drops"
 mkdir -p "$output_directory"
 
+# ir_guard IR NAMES FORBIDDEN MAXSLOTS: see tools/llvm-define-guard.awk.
+ir_guard() {
+    awk -v names="$2" -v forbidden="$3" -v maxslots="$4" -f "$project_root/tools/llvm-define-guard.awk" "$1" "$1" \
+        || { echo "resource scope drops: IR guard failed for $1" >&2; exit 1; }
+}
+
 "$compiler" build "$project_root/tests/cases/modules/resource-short-name-drop.ab" \
     -o "$output_directory/program"
 output=$("$output_directory/program")
@@ -47,49 +53,14 @@ done
 
 "$compiler" --emit-llvm "$project_root/tests/cases/bootstrap/discarded-secret-joins.ab" \
     > "$output_directory/discarded-secret-joins.ll"
-python3 - "$output_directory/discarded-secret-joins.ll" <<'PYSECRET'
-import re, sys
-text = open(sys.argv[1]).read()
-attrs = dict(re.findall(r'attributes #(\d+) = .*?"abla.source"="([^"]+)"', text))
-expected = {'discardedSecretIf', 'discardedSecretWhen', 'discardedSecretNested'}
-for match in re.finditer(r'^define [^\n]+ #(\d+)[^\n]*\{\n.*?^\}', text, re.M | re.S):
-    name = attrs.get(match[1])
-    if name in expected:
-        assert '@abla_i64(' not in match[0], 'secret boxed into discarded join: ' + name
-        assert '%gc.block' not in match[0], 'discarded join rooted in GC frame: ' + name
-        expected.remove(name)
-assert not expected, expected
-PYSECRET
+ir_guard "$output_directory/discarded-secret-joins.ll" 'discardedSecretIf discardedSecretWhen discardedSecretNested' '@abla_i64( %gc.block' -1
 
 "$compiler" --emit-llvm "$project_root/tests/cases/bootstrap/discarded-if.ab" \
     > "$output_directory/discarded-if.ll"
-python3 - "$output_directory/discarded-if.ll" <<'PY'
-import re, sys
-text = open(sys.argv[1]).read()
-attrs = dict(re.findall(r'attributes #(\d+) = .*?"abla.source"="([^"]+)"', text))
-for match in re.finditer(r'^define [^\n]+ #(\d+)[^\n]*\{\n.*?^\}', text, re.M | re.S):
-    if attrs.get(match[1]) == 'discardedIfScalar':
-        # A scalar-only statement if needs no boxed join. One unused void
-        # literal remains permitted; the old lowering allocates four values.
-        assert len(re.findall(r'alloca %AblaValue\b', match[0])) <= 1, 'boxed discarded-if join'
-        break
-else:
-    raise AssertionError('missing scalar fixture')
-PY
+ir_guard "$output_directory/discarded-if.ll" discardedIfScalar '' 1
 
 "$compiler" --emit-llvm "$project_root/tests/cases/bootstrap/discarded-joins.ab" \
     > "$output_directory/discarded-joins.ll"
-python3 - "$output_directory/discarded-joins.ll" <<'PYGUARD'
-import re, sys
-text = open(sys.argv[1]).read()
-attrs = dict(re.findall(r'attributes #(\d+) = .*?"abla.source"="([^"]+)"', text))
-expected = {'discardedJoinIf', 'discardedJoinWhen'}
-for match in re.finditer(r'^define [^\n]+ #(\d+)[^\n]*\{\n.*?^\}', text, re.M | re.S):
-    name = attrs.get(match[1])
-    if name in expected:
-        assert len(re.findall(r'alloca %AblaValue\b', match[0])) <= 1, name
-        expected.remove(name)
-assert not expected, expected
-PYGUARD
+ir_guard "$output_directory/discarded-joins.ll" 'discardedJoinIf discardedJoinWhen' '' 1
 
 echo "discarded if: arm drops, loop control, refinements and affine joins are preserved"
