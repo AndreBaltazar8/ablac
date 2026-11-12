@@ -150,4 +150,27 @@ gone=$(comm -13 "$actual" "$allow")
 if [[ -n $gone ]]; then
     printf 'libc imports: no longer imported, remove from %s:\n%s\n' "$allow" "$gone"
 fi
+# A shared library of the default x86-64 Linux target has its own memory and jump routines and makes its own
+# system calls: it names no C library and leaves undefined only the dynamic loader's __tls_get_addr (its thread-locals),
+# and a host process that loads it gets the right answer (the host's memcpy is not replaced).
+if ! "$compiler" build tests/cases/libc-imports-library/main.ab --emit shared-library -o "$out/library.so" --no-cache >"$out/library.log" 2>&1; then
+    echo "libc imports: tests/cases/libc-imports-library did not build:" >&2
+    tail -n 20 "$out/library.log" >&2
+    exit 1
+fi
+if readelf -d "$out/library.so" | grep -Eq 'NEEDED.*(lib(c|pthread|ssl|crypto)\.so)'; then
+    echo "libc imports: a shared library that brings no C library names one" >&2
+    readelf -d "$out/library.so" | grep NEEDED >&2
+    exit 1
+fi
+library_unexpected=$("$nm" -D --undefined-only "$out/library.so" | awk '{ s = $NF; sub(/@.*/, "", s); print s }' |
+    grep -vx '__tls_get_addr' | grep -vx '_ITM_[a-zA-Z]*TMCloneTable\|__gmon_start__\|__cxa_finalize' || true)
+if [[ -n $library_unexpected ]]; then
+    printf 'libc imports: the shared library leaves undefined:\n%s\n' "$library_unexpected" >&2
+    exit 1
+fi
+if command -v clang >/dev/null; then
+    clang tests/cases/libc-imports-library/host.c -o "$out/library-host" -ldl
+    [[ $("$out/library-host" "$PWD/$out/library.so") == 290 ]] || { echo 'libc imports: the shared library gave a wrong answer' >&2; exit 1; }
+fi
 printf 'libc imports: %d imports, all within the allowed list\n' "$(wc -l <"$actual")"

@@ -189,6 +189,14 @@ fun bootstrapAndroidBuiltins(): string {
     text.slice(0, end)
 }
 
+// Whether clang's library search finds `name` (a bare name comes back when it does not).
+fun bootstrapClangHasFile(name: string): bool {
+    val finder = linuxCommand("clang")
+    finder.argument("-print-file-name=$name")
+    val text = finder.captureText()
+    text.size > 0 && text[0] == 47
+}
+
 // A Linux link runs the `ld.lld` that clang would run, without clang. Through a Nix shell's
 // clang, a small program's link was 60 ms of 330: the wrapper's shell script and clang's own
 // start, ahead of 13 ms of linking. The first link asks clang (`-###`) for the command it
@@ -3859,6 +3867,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         val enclosingInitializerChunk = bootstrapLlvmInitializerChunk
         val enclosingStackGuard = bootstrapLlvmStackGuard
         val enclosingOwnMemoryRoutines = bootstrapLlvmOwnMemoryRoutines
+        val enclosingLibraryRoutines = bootstrapLlvmLibraryRoutines
         val enclosingFreestandingStart = bootstrapLlvmFreestandingStart
         val enclosingAarch64Hosted = bootstrapLlvmAarch64Hosted
         val enclosingCoverage = bootstrapLlvmCoverage
@@ -3883,6 +3892,9 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         bootstrapLlvmFreestandingStart = bootstrapLlvmOwnMemoryRoutines
         bootstrapLlvmAarch64Hosted = target.hosted && artifact == "executable" &&
             bootstrapLlvmTargetIsAarch64Linux(target.llvmTriple)
+        // A shared library defines the memory and jump routines too, but not the entry or thread routines.
+        bootstrapLlvmLibraryRoutines = target.hosted && artifact == "shared-library" &&
+            bootstrapLlvmTargetIsX8664Linux(target.llvmTriple)
         bootstrapLlvmInitializerChunk = if (cacheProfile == "cross-o2" ||
             cacheProfile == "raw-cross-o2") BOOTSTRAP_INITIALIZER_CHUNK else 0
         bootstrapLlvmBitcodePath = if (inProcessCodegen) "" else bitcodePath
@@ -3927,6 +3939,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         bootstrapLlvmInitializerChunk = enclosingInitializerChunk
         bootstrapLlvmStackGuard = enclosingStackGuard
         bootstrapLlvmOwnMemoryRoutines = enclosingOwnMemoryRoutines
+        bootstrapLlvmLibraryRoutines = enclosingLibraryRoutines
         bootstrapLlvmFreestandingStart = enclosingFreestandingStart
         bootstrapLlvmAarch64Hosted = enclosingAarch64Hosted
         bootstrapLlvmCoverage = enclosingCoverage
@@ -4619,7 +4632,17 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     }
     if (status == 0 && target.hosted && artifact == "shared-library") {
         val linkShared = bootstrapLinkCommand(if (macTarget) macClang else "clang")
-        linkShared.argument("-pthread")
+        // An x86-64 Linux library carries its own memory and jump routines and makes its system calls itself (#806). It
+        // names a library only for a symbol it leaves undefined: the loader (ld-linux) for __tls_get_addr, which a
+        // dlmopen namespace needs named too, libc or libpthread for a C function or a thread it uses (as needed).
+        val x64Library = !macTarget && bootstrapLlvmTargetIsX8664Linux(target.llvmTriple) &&
+            !linkOpenSsl && !linkLlvm && !hostImports && nativeLibraries.size == 0 &&
+            bootstrapClangHasFile("ld-linux-x86-64.so.2") && bootstrapClangHasFile("libc.so.6") &&
+            bootstrapClangHasFile("libpthread.so.0")
+        if (x64Library) {
+            linkShared.argument("-nostartfiles")
+            linkShared.argument("-nolibc")
+        } else linkShared.argument("-pthread")
         if (macTarget) {
             linkShared.argument("--target=${target.llvmTriple}")
             if (!ablaHostIsMacOS()) {
@@ -4683,7 +4706,17 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             linkShared.argument(nativeLibrary)
             nativeLibraryIndex = nativeLibraryIndex + 1
         }
-        if (!macTarget) linkShared.argument("-lm")
+        if (!macTarget) {
+            // As needed: a library that calls no libm function does not depend on it.
+            if (x64Library) {
+                // Named one by one, as needed: the default -lc is a linker script whose libc.so.6 is not as-needed.
+                linkShared.argument("-Wl,--as-needed")
+                linkShared.argument("-l:ld-linux-x86-64.so.2")
+                linkShared.argument("-l:libc.so.6")
+                linkShared.argument("-l:libpthread.so.0")
+            }
+            linkShared.argument("-lm")
+        }
         linkShared.argument("-o")
         linkShared.argument(publishPath)
         status = linkShared.run()
