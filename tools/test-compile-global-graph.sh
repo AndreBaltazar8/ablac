@@ -25,8 +25,9 @@ for refusal in refused-closure-edit refused-same-lambda; do
     fi
     grep -Fq 'this kept closure predates a later compile-time transform; its original captured layout is no longer known' "$out/$refusal.log"
 done
-# Native complex-global hydration across transforms is tracked by #796.
-for mode in interp; do
+# A native closure kept across a compile-time edit would run the edited body (#796): a pass that
+# changes declarations interprets the sites that make closures.
+for mode in interp jit auto; do
     ABLA_COMPILE_EVAL=$mode "$compiler" build tests/cases/compile-global-graph/round-retry.ab \
         -o "$out/round-retry-$mode" --fast --no-cache >"$out/round-retry-$mode.log" 2>&1
     actual=$("$out/round-retry-$mode")
