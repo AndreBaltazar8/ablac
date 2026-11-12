@@ -33,5 +33,9 @@ docker run --rm --network none -v "$root:/opt/abla:ro" "$image" bash -ceu '
     fi
     cat needs-libc.log >&2
     grep -F "links the C library because it calls C functions: getpid, and this machine has no C development files" needs-libc.log >/dev/null
+    printf "import \"abla/build\"\n@export(\"abla_app_answer\")\nfun answer: int = 42\n" > library.ab
+    ablac build library.ab --emit shared-library -o library.so --no-cache
+    test -s library.so
+    test "$(head -c 4 library.so | od -An -c | tr -d ' ')" = "177ELF"
 '
-echo 'toolchain without C development files: a libc-free program builds and runs; one needing libc names what is missing'
+echo 'toolchain without C development files: a libc-free program builds and runs, so does a shared library; one needing libc names what is missing'
