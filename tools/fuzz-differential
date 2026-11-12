@@ -1523,6 +1523,117 @@ fun safeSlice(s: string, a: int, b: int): string {
                  '    actual', '}']
         return lines, f'c{index}()', 'str'
 
+    def ownership_lifetime_check(self, index):
+        """Exit, match, receiver and container lifetime order, checked by Python."""
+        r = self.r
+        n = r.randint(10, 90)
+        kind = r.choice(['return', 'break', 'continue', 'when', 'match', 'extension',
+                         'operator', 'receiver', 'array', 'map'])
+        definitions = []
+        if kind == 'return':
+            nested = r.choice([True, False])
+            definitions = [f'fun ownedBody{index}(): int {{',
+                           f'    defer {{ dropLog.append({n + 300}) }}']
+            if nested:
+                definitions += ['    if (true) {', f'        defer {{ dropLog.append({n + 301}) }}',
+                                f'        return TempTicketOwner(issue({n}), {n + 200}).ticket.seat',
+                                '    }', '    0']
+            else:
+                definitions += [f'    return TempTicketOwner(issue({n}), {n + 200}).ticket.seat']
+            definitions += ['}']
+            action = f'val result = ownedBody{index}()'
+            events = [n + 200, n] + ([n + 301] if nested else []) + [n + 300]
+        elif kind in ('break', 'continue'):
+            jump = kind
+            definitions = [f'fun ownedBody{index}(): void {{', '    for (i in 0 until 1) {',
+                           f'        defer {{ dropLog.append({n + 300}) }}',
+                           f'        showPair(TempTicketOwner(issue({n}), {n + 200}).ticket, if (true) {{ {jump} }} else issue(1))',
+                           '    }', '}']
+            action, events = f'ownedBody{index}()', [n + 200, n, n + 300]
+        elif kind == 'when':
+            action = (f'when ({n + 1}) {{ TempTicketOwner(issue({n}), {n + 200}).ticket.seat -> dropLog.append(900) '
+                      f'TempTicketOwner(issue({n + 1}), {n + 201}).ticket.seat -> dropLog.append(901) else -> dropLog.append(902) }}')
+            events = [n + 200, n, n + 201, n + 1, 901]
+        elif kind == 'match':
+            definitions = [f'fun ownedBody{index}(): void {{', f'    val held = issue({n})',
+                           f'    when (held) {{ issue({n + 1}) -> dropLog.append(900) else -> dropLog.append(901) }}', '}']
+            action, events = f'ownedBody{index}()', [n + 1, 901, n]
+        elif kind == 'extension':
+            action, events = f'issue({n}).fuzzLook()', [1000 + n, n]
+        elif kind == 'operator':
+            action, events = f'val result = issue({n}) + issue({n + 1})', [800, n + 1, n]
+        elif kind == 'receiver':
+            fresh = r.choice([True, False])
+            flag = str(fresh).lower()
+            receiver = r.choice([f'if ({flag}) issue({n}) else held',
+                                 f'when ({flag}) {{ true -> issue({n}) else -> held }}',
+                                 f'if (true) (if ({flag}) issue({n}) else held) else held',
+                                 f'if ({flag}) {{ val result = issue({n}); result }} else held'])
+            extension = r.choice([True, False])
+            method = 'fuzzLook' if extension else 'twice'
+            definitions = [f'fun ownedBody{index}(): void {{', f'    val held = issue({n + 1})',
+                           f'    ({receiver}).{method}()',
+                           '    return', '}']
+            action = f'ownedBody{index}()'
+            events = ([1000 + (n if fresh else n + 1)] if extension else [])
+            if fresh: events.append(n)
+            events.append(n + 1)
+        else:
+            mode = r.choice(['fresh', 'borrowed', 'temporary'])
+            machine = r.choice([True, False])
+            stop = r.choice([True, False])
+            outer_stop = machine and r.choice([True, False])
+            keys = kind == 'map' and r.choice([True, False])
+            body = []
+            if kind == 'array':
+                if mode == 'borrowed':
+                    body += [f'    val owner = [issue({n}), issue({n + 1})]']
+                    source = 'owner'
+                elif mode == 'temporary':
+                    source = f'FuzzTicketOwner([issue({n}), issue({n + 1})], {n + 200}).items'
+                else:
+                    if r.choice([True, False]):
+                        body += [f'    val owner = [issue({n}), issue({n + 1})]']
+                        source = 'move(owner)'
+                    else:
+                        source = f'[issue({n}), issue({n + 1})]'
+            else:
+                # A map's values are borrowed; a temporary map is retained by the loop.
+                if mode == 'fresh':
+                    source = f'fuzzTicketMap({n}).{"keys" if keys else "values"}()'
+                else:
+                    body += [f'    val owner = fuzzTicketMap({n})']
+                    source = ('move(owner)' if mode == 'temporary' else 'owner') + ('.keys()' if keys else '.values()')
+                mode = 'temporary' if mode != 'borrowed' else mode
+            body += [f'    for (item in {source}) {{',
+                     f'        dropLog.append(if (item == "a") {1000 + n} else {1001 + n})' if keys
+                     else '        item.fuzzLook()']
+            if machine:
+                body += ['        yield 1' if keys else '        yield item.seat']
+            if stop:
+                body += ['        break']
+            body += ['    }']
+            header = f'fun ownedBody{index}(): Generator<int> = generator {{' if machine else f'fun ownedBody{index}(): void {{'
+            definitions = [header] + body + ['}']
+            action = (f'for (item in ownedBody{index}()) {{ {"break" if outer_stop else ""} }}'
+                      if machine else f'ownedBody{index}()')
+            stopped = stop or outer_stop
+            visited = [n] if stopped else [n, n + 1]
+            events = []
+            for value in visited:
+                events.append(1000 + value)
+                if mode == 'fresh': events.append(value)
+            if kind == 'array' and mode == 'temporary': events.append(n + 200)
+            if mode != 'fresh': events += [n, n + 1]
+            elif stopped: events.append(n + 1)
+        expected = ''.join(f'{event},' for event in events)
+        lines = definitions + [f'fun c{index}(): string {{', '    dropLog.clear()',
+                               f'    {action}', '    var actual = ""',
+                               '    for (event in dropLog) actual += "${event},"',
+                               f'    if (actual != "{expected}") return "FUZZ_ORACLE_FAILURE"',
+                               '    actual', '}']
+        return lines, f'c{index}()', 'str'
+
     def resource_drop_check(self, index):
         """Resource classes: `drop()` logs to a global, so reassignment, `move`, block ends and loops
         show the order and the number of drops; a fresh resource used as a receiver, a field read, in
@@ -1712,6 +1823,16 @@ resource class TempGenOwner(val gen: Generator<int>, val id: int) {
 resource class TempTicketOwner(val ticket: Ticket, val id: int) {
     fun drop(): void { dropLog.append(this.id); return }
 }
+resource class FuzzTicketOwner(val items: array<Ticket>, val id: int) {
+    fun drop(): void { dropLog.append(this.id); return }
+}
+fun Ticket.fuzzLook(): int { dropLog.append(1000 + this.seat); this.seat }
+operator fun Ticket.plus(other: Ticket): int { dropLog.append(800); this.seat + other.seat }
+fun fuzzTicketMap(n: int): Map<string, Ticket> {
+    val result: Map<string, Ticket> = Map()
+    result.set("a", issue(n)); result.set("b", issue(n + 1))
+    result
+}
 fun drainGen(values: Generator<int>): int {
     var sum = 0
     for (v in values) sum = sum + v
@@ -1749,6 +1870,7 @@ fun <T, U> crossed(a: T, b: U): Pair<U, T> = Pair(b, a)
             return r.choice([self.deep_generic_check, self.deep_iface_check, self.deep_nullable_check,
                              self.any_check, self.clash_check,
                              self.generic_lambda_check, self.resource_drop_check, self.default_owner_check,
+                             self.ownership_lifetime_check,
                              self.elvis_member_check, self.gzip_check, self.nested_generator_check,
                              self.json_check, self.yaml_check])(index)
         extra = r.random()
