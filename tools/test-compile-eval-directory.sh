@@ -8,6 +8,57 @@ mkdir -p "$out/project" "$out/input"
 cp tests/cases/compile-eval-directory/lookup.ab "$out/project/lookup.ab"
 printf 'compileCapabilities = ["filesystem.read"]\n' > "$out/project/abla.toml"
 rm -f "$out/input/"*
+fail() { echo "compile-eval-directory: $1" >&2; exit 1; }
+# apply_state STATE: mutate the watched directory and write the expected table bytes.
+apply_state() {
+    local d="$out/input" name
+    case $1 in
+        initial)
+            # Create in reverse order, including a non-ASCII filename/content.
+            printf zz > "$d/z.txt"; printf π > "$d/α.txt"; printf aa > "$d/a.txt" ;;
+        create) printf mm > "$d/m.txt" ;;
+        remove) rm "$d/z.txt" ;;
+        rename) mv "$d/m.txt" "$d/n.txt" ;;
+        content)
+            # Same byte length and modification time.
+            touch -r "$d/a.txt" "$out/a.stamp"
+            printf bb > "$d/a.txt"
+            touch -r "$out/a.stamp" "$d/a.txt"
+            rm "$out/a.stamp" ;;
+    esac
+    : > "$out/expected.txt"
+    for name in $(cd "$d" && LC_ALL=C ls); do
+        printf '%s:%s\n' "$name" "$(cat "$d/$name")" >> "$out/expected.txt"
+    done
+}
+# check_journal STATE MODE: the input journal names the directory and its entries, is a
+# single file across states, is reused as is by a warm build and changes otherwise.
+check_journal() {
+    local state=$1 mode=$2 journals previous tag="$out/$1-$2-journal"
+    journals=$(find "$out/cache-$mode" -name 'native-wasm32-module-*.inputs')
+    [[ -n $journals && $(printf '%s\n' "$journals" | wc -l) -eq 1 ]] || fail "$tag: expected one journal, found: $journals"
+    grep -qaF 'abla-input:entries:build/compile-eval-directory/input' "$journals" || fail "$tag: no directory input"
+    grep -qaF 'build/compile-eval-directory/input/a.txt' "$journals" || fail "$tag: no entry input"
+    { printf '%s\n' "$journals"; stat -c %y "$journals"; sha256sum "$journals" | cut -d' ' -f1; } > "$tag.snap"
+    [[ $state != initial ]] || return 0
+    case $state in warm) previous=initial ;; create) previous=warm ;; remove) previous=create ;;
+        rename) previous=remove ;; content) previous=rename ;; esac
+    [[ $(sed -n 1p "$tag.snap") == $(sed -n 1p "$out/$previous-$mode-journal.snap") ]] || fail "$tag: the journal path changed"
+    if [[ $state == warm ]]; then
+        cmp -s "$tag.snap" "$out/$previous-$mode-journal.snap" || fail "$tag: a warm build did not reuse the journal"
+    else
+        [[ $(sed -n 3p "$tag.snap") != $(sed -n 3p "$out/$previous-$mode-journal.snap") ]] || fail "$tag: the journal did not change"
+    fi
+}
+# check_native_trace STATE LOG: the lookup site is native on every build but a warm one,
+# and nothing is interpreted.
+check_native_trace() {
+    local position native
+    position=$(grep -boa '#lookup()' "$out/project/lookup.ab" | head -n 1 | cut -d: -f1)
+    native=$(awk -v tail="lookup.ab:$position" 'index($0, "note[ct-jit]: native at ") == 1 && substr($0, length($0) - length(tail) + 1) == tail' "$2" | wc -l)
+    [[ $native -eq $([[ $1 == warm ]] && echo 0 || echo 1) ]] || fail "$2: $native native notes for $1"
+    ! grep -qF 'interpreted at' "$2" || fail "$2: a site was interpreted"
+}
 # Each mode has a separate cache; every mutation reuses that mode's source,
 # output and cache paths. Do not add --no-cache to these builds.
 for mode in interp jit auto; do
@@ -15,30 +66,7 @@ for mode in interp jit auto; do
 done
 
 for state in initial warm create remove rename content; do
-    python3 - "$state" <<'PYINPUT'
-from pathlib import Path
-import os
-import sys
-p = Path('build/compile-eval-directory/input')
-state = sys.argv[1]
-if state == 'initial':
-    # Create in reverse order, including a non-ASCII filename/content.
-    for name, value in [('z.txt', 'zz'), ('α.txt', 'π'), ('a.txt', 'aa')]:
-        (p/name).write_text(value)
-elif state == 'create':
-    (p/'m.txt').write_text('mm')
-elif state == 'remove':
-    (p/'z.txt').unlink()
-elif state == 'rename':
-    (p/'m.txt').rename(p/'n.txt')
-elif state == 'content':
-    target = p/'a.txt'
-    before = target.stat()
-    target.write_text('bb')  # same byte length and modification time
-    os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
-expected = ''.join(f'{entry.name}:{entry.read_text()}\n' for entry in sorted(p.iterdir()))
-Path('build/compile-eval-directory/expected.txt').write_text(expected)
-PYINPUT
+    apply_state "$state"
     for mode in interp jit auto; do
         ABLA_COMPILE_EVAL=$mode ABLA_COMPILE_EVAL_TRACE=1 \
             ABLA_CACHE_DIR="$root/$out/cache-$mode" "$compiler" build \
@@ -55,43 +83,9 @@ const bytes = Buffer.alloc(Number(e.tableSize()));
 for (let i = 0; i < bytes.length; ++i) bytes[i] = Number(e.tableByte(BigInt(i)));
 assert.deepEqual(bytes, fs.readFileSync(process.argv[3]));
 NODE
-        python3 - "$state" "$mode" <<'PYJOURNAL'
-from pathlib import Path
-import hashlib
-import json
-import sys
-state, mode = sys.argv[1:]
-out = Path('build/compile-eval-directory')
-journals = list((out/f'cache-{mode}').glob('native-wasm32-module-*.inputs'))
-assert len(journals) == 1, journals
-journal = journals[0]
-data = journal.read_bytes()
-assert b'abla-input:entries:build/compile-eval-directory/input' in data
-assert b'build/compile-eval-directory/input/a.txt' in data
-snapshot = {'path': str(journal), 'mtime': journal.stat().st_mtime_ns,
-            'hash': hashlib.sha256(data).hexdigest()}
-if state != 'initial':
-    previous = {'warm': 'initial', 'create': 'warm', 'remove': 'create',
-                'rename': 'remove', 'content': 'rename'}[state]
-    before = json.loads((out/f'{previous}-{mode}-journal.json').read_text())
-    assert snapshot['path'] == before['path']
-    if state == 'warm':
-        assert snapshot == before, (snapshot, before)  # actual cache reuse
-    else:
-        assert snapshot['hash'] != before['hash'], (state, snapshot, before)
-(out/f'{state}-{mode}-journal.json').write_text(json.dumps(snapshot))
-PYJOURNAL
+        check_journal "$state" "$mode"
         if [[ $mode != interp ]]; then
-            python3 - "$out/$state-$mode.log" "$out/project/lookup.ab" "$state" <<'PYTRACE'
-from pathlib import Path
-import sys
-source = Path(sys.argv[2]).read_bytes()
-position = source.index(b'#lookup()')
-lines = Path(sys.argv[1]).read_text().splitlines()
-native = [line for line in lines if line.startswith('note[ct-jit]: native at ') and line.endswith(f'lookup.ab:{position}')]
-assert (len(native) == 0 if sys.argv[3] == 'warm' else len(native) == 1), lines
-assert not any('interpreted at' in line for line in lines), lines
-PYTRACE
+            check_native_trace "$state" "$out/$state-$mode.log"
         fi
     done
     cmp "$out/$state-interp.wasm" "$out/$state-jit.wasm"
