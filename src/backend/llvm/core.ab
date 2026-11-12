@@ -404,6 +404,182 @@ fun bootstrapLlvmLinuxMemoryRoutinesAssembly(): string {
 // the compiler process has the C library's).
 var bootstrapLlvmOwnMemoryRoutines = false
 
+// A --no-libc x86-64 Linux executable (#806 step 7) creates and joins its
+// threads itself, under the names the runtime calls (platform/host.ab), as
+// hidden module assembly like the memory routines; its locks are futexes
+// already. pthread_create(handle, attributes ignored, entry, argument) maps,
+// in one region: a guard page, a stack the size of the soft stack limit
+// (prlimit64; 8 MiB when unlimited or under 64 KiB), a 64 KiB alternate signal
+// stack, the TLS block (step 6's abla_tls_bytes/abla_tls_init from the saved
+// program headers) and a control page: tid word, region base and size, entry,
+// argument, signal stack. clone with CLONE_VM|FS|FILES|SIGHAND|THREAD|SYSVSEM|
+// SETTLS|PARENT_SETTID|CHILD_CLEARTID: the child installs its signal stack,
+// calls entry(argument) and exits that thread only. *handle is the control
+// page. pthread_join waits on the tid word, which the kernel clears (and
+// wakes) when the thread has left its stack, then unmaps the region. Both
+// return 0 or a positive errno, as libpthread's.
+fun bootstrapLlvmLinuxThreadRoutinesAssembly(): string =
+    ".text\n.p2align 4\n" +
+    bootstrapLlvmAssemblyHiddenFunction("pthread_create") +
+    "pthread_create:\n" +
+    "    pushq %rbx\n" +
+    "    pushq %rbp\n" +
+    "    pushq %r12\n" +
+    "    pushq %r13\n" +
+    "    pushq %r14\n" +
+    "    pushq %r15\n" +
+    "    subq \$24, %rsp\n" +
+    "    movq %rdi, %r12\n" +
+    "    movq %rdx, %r13\n" +
+    "    movq %rcx, %r14\n" +
+    "    xorl %edi, %edi\n" +
+    "    movl \$3, %esi\n" +
+    "    xorl %edx, %edx\n" +
+    "    movq %rsp, %r10\n" +
+    "    movl \$302, %eax\n" +
+    "    syscall\n" +
+    "    movq (%rsp), %rbx\n" +
+    "    testq %rax, %rax\n" +
+    "    jnz .Labla_thread_default\n" +
+    "    cmpq \$-1, %rbx\n" +
+    "    je .Labla_thread_default\n" +
+    "    cmpq \$65536, %rbx\n" +
+    "    jae .Labla_thread_sized\n" +
+    ".Labla_thread_default:\n" +
+    "    movl \$8388608, %ebx\n" +
+    ".Labla_thread_sized:\n" +
+    "    addq \$4095, %rbx\n" +
+    "    andq \$-4096, %rbx\n" +
+    "    movq abla_start_phdr(%rip), %rdi\n" +
+    "    movq abla_start_phnum(%rip), %rsi\n" +
+    "    callq abla_tls_bytes\n" +
+    "    testq %rax, %rax\n" +
+    "    js .Labla_thread_invalid\n" +
+    "    addq \$4095, %rax\n" +
+    "    andq \$-4096, %rax\n" +
+    "    movq %rax, %r15\n" +
+    "    leaq (%rbx,%r15), %rsi\n" +
+    "    addq \$73728, %rsi\n" +
+    "    movq %rsi, 8(%rsp)\n" +
+    "    xorl %edi, %edi\n" +
+    "    movl \$3, %edx\n" +
+    "    movl \$131106, %r10d\n" +
+    "    movq \$-1, %r8\n" +
+    "    xorl %r9d, %r9d\n" +
+    "    movl \$9, %eax\n" +
+    "    syscall\n" +
+    "    cmpq \$-4095, %rax\n" +
+    "    jae .Labla_thread_errno\n" +
+    "    movq %rax, %rbp\n" +
+    "    movq %rbp, %rdi\n" +
+    "    movl \$4096, %esi\n" +
+    "    xorl %edx, %edx\n" +
+    "    movl \$10, %eax\n" +
+    "    syscall\n" +
+    "    movq 8(%rsp), %rax\n" +
+    "    leaq -4096(%rbp,%rax), %rcx\n" +
+    "    movq %rbp, 8(%rcx)\n" +
+    "    movq %rax, 16(%rcx)\n" +
+    "    movq %r13, 24(%rcx)\n" +
+    "    movq %r14, 32(%rcx)\n" +
+    "    leaq 4096(%rbp,%rbx), %rdx\n" +
+    "    movq %rdx, 40(%rcx)\n" +
+    "    movq %rcx, %r13\n" +
+    "    leaq 65536(%rdx), %rdi\n" +
+    "    movq abla_start_phdr(%rip), %rsi\n" +
+    "    movq abla_start_phnum(%rip), %rdx\n" +
+    "    movq abla_start_random(%rip), %rcx\n" +
+    "    callq abla_tls_init\n" +
+    "    movq %rax, %r8\n" +
+    "    leaq 4096(%rbp,%rbx), %rsi\n" +
+    "    subq \$16, %rsi\n" +
+    "    movq %r13, (%rsi)\n" +
+    "    movl \$4001536, %edi\n" +
+    "    movq %r13, %rdx\n" +
+    "    movq %r13, %r10\n" +
+    "    movl \$56, %eax\n" +
+    "    syscall\n" +
+    "    testq %rax, %rax\n" +
+    "    jz .Labla_thread_child\n" +
+    "    js .Labla_thread_clone_failed\n" +
+    "    movq %r13, (%r12)\n" +
+    "    xorl %eax, %eax\n" +
+    "    jmp .Labla_thread_return\n" +
+    ".Labla_thread_child:\n" +
+    "    xorl %ebp, %ebp\n" +
+    "    movq (%rsp), %rbx\n" +
+    "    subq \$32, %rsp\n" +
+    "    movq 40(%rbx), %rax\n" +
+    "    movq %rax, (%rsp)\n" +
+    "    movq \$0, 8(%rsp)\n" +
+    "    movq \$65536, 16(%rsp)\n" +
+    "    movq %rsp, %rdi\n" +
+    "    xorl %esi, %esi\n" +
+    "    movl \$131, %eax\n" +
+    "    syscall\n" +
+    "    addq \$32, %rsp\n" +
+    "    movq 32(%rbx), %rdi\n" +
+    "    callq *24(%rbx)\n" +
+    ".Labla_thread_exit:\n" +
+    "    xorl %edi, %edi\n" +
+    "    movl \$60, %eax\n" +
+    "    syscall\n" +
+    "    jmp .Labla_thread_exit\n" +
+    ".Labla_thread_clone_failed:\n" +
+    "    negq %rax\n" +
+    "    movq %rax, %r12\n" +
+    "    movq %rbp, %rdi\n" +
+    "    movq 8(%rsp), %rsi\n" +
+    "    movl \$11, %eax\n" +
+    "    syscall\n" +
+    "    movq %r12, %rax\n" +
+    "    jmp .Labla_thread_return\n" +
+    ".Labla_thread_errno:\n" +
+    "    negq %rax\n" +
+    "    jmp .Labla_thread_return\n" +
+    ".Labla_thread_invalid:\n" +
+    "    movl \$22, %eax\n" +
+    ".Labla_thread_return:\n" +
+    "    addq \$24, %rsp\n" +
+    "    popq %r15\n" +
+    "    popq %r14\n" +
+    "    popq %r13\n" +
+    "    popq %r12\n" +
+    "    popq %rbp\n" +
+    "    popq %rbx\n" +
+    "    ret\n" +
+    ".size pthread_create, .-pthread_create\n" +
+    ".p2align 4\n" +
+    bootstrapLlvmAssemblyHiddenFunction("pthread_join") +
+    "pthread_join:\n" +
+    "    pushq %rbx\n" +
+    "    movq %rdi, %rbx\n" +
+    ".Labla_join_wait:\n" +
+    "    movl (%rbx), %edx\n" +
+    "    testl %edx, %edx\n" +
+    "    jz .Labla_join_done\n" +
+    "    movq %rbx, %rdi\n" +
+    "    xorl %esi, %esi\n" +
+    "    xorl %r10d, %r10d\n" +
+    "    movl \$202, %eax\n" +
+    "    syscall\n" +
+    "    jmp .Labla_join_wait\n" +
+    ".Labla_join_done:\n" +
+    "    movq 8(%rbx), %rdi\n" +
+    "    movq 16(%rbx), %rsi\n" +
+    "    movl \$11, %eax\n" +
+    "    syscall\n" +
+    "    xorl %eax, %eax\n" +
+    "    popq %rbx\n" +
+    "    ret\n" +
+    ".size pthread_join, .-pthread_join\n"
+
+fun bootstrapLlvmEmitLinuxThreadRoutines(backend: BootstrapLlvmBackend): void {
+    val assembly = bootstrapLlvmLinuxThreadRoutinesAssembly()
+    LLVMAppendModuleInlineAsm(backend.module, assembly, assembly.size)
+    return
+}
+
 fun bootstrapLlvmEmitLinuxMemoryRoutines(backend: BootstrapLlvmBackend): void {
     val assembly = bootstrapLlvmLinuxMemoryRoutinesAssembly()
     LLVMAppendModuleInlineAsm(backend.module, assembly, assembly.size)

@@ -66,7 +66,7 @@ done
 # shrinks, and a pending program that links must be taken off it.
 pending=tools/libc-imports-static-pending.txt
 [[ -f $pending ]] || { echo "libc imports: missing $pending" >&2; exit 1; }
-for name in hello float-remainder strings-arrays files; do
+for name in hello float-remainder strings-arrays files tasks threads; do
     program=tests/cases/libc-imports/$name.ab
     [[ -f $program ]] || continue
     binary_static=$out/$name.static
