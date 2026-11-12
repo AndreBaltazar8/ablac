@@ -295,7 +295,12 @@ fun main {
   Copy what you need into the program with `#`.
 - Between evaluations the value is kept whole: data, objects (shared
   references and cycles stay as they are) and closures with what they
-  captured. A global that holds something that exists only while one
+  captured. A kept closure retains the lambda body it was created with, even
+  if a later transform replaces that body; a newly created closure uses the
+  replacement. A closure kept before a later compile-time transform cannot
+  currently be lifted into the run-time program: its original captured layout
+  is no longer known. Calls in the interpreter still use its original body.
+  A global that holds something that exists only while one
   evaluation runs (a generator, a task) is evaluated afresh for each
   evaluation.
 - A module that the native object cache skips runs no handlers. A provider
@@ -338,9 +343,16 @@ fun main {
 An initializer reads the other globals' initial values, as the program
 initializes every global before code changes any: `val doubled = count * 2`
 read after `count` changed still starts from `count`'s initializer. Between
-evaluations the values are kept as data (integers, booleans, strings, null,
-arrays and objects, without cycles); a global holding anything else is made
-afresh by the next evaluation.
+evaluations the interpreter keeps supported globals together in one graph:
+arrays, maps, objects and closures preserve shared references and cycles,
+including references shared between ordinary and compile-time globals.
+Mutating an array through one global is therefore visible through another
+global that names the same array. A value that cannot be kept, such as a
+generator or task, is evaluated afresh on its next use.
+
+The `jit` and `auto` tiers still have a known limitation when ordinary
+mutable globals are shared between compile-time sites. Use the default
+interpreter tier for such state until the tier-sharing fix is available.
 
 ## Capabilities: files, environment, processes, network
 

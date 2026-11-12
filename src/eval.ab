@@ -28,6 +28,8 @@ import "parser.ab"
 import "generic_types.ab"
 import "abla/sys/linux"
 import "ct_lift.ab"
+import "ct_global_graph.ab"
+import "ct_global_nodes.ab"
 import "subparser.ab"
 import "ct_infer.ab"
 import "staged_parser.ab"
@@ -43,6 +45,8 @@ var bootstrapCompileOutputBytes: int = 0
 // Compile-time globals kept between evaluations (bootstrapCompileGlobalsKeep): how many
 // the per-process journal holds.
 var bootstrapCompileGlobalCount: int = 0
+// Closure layout provenance; monotonic while kept values survive.
+var bootstrapCompileDeclarationEpoch: int = 0
 // Lowering errors already explained by a staged driver diagnostic (a failed
 // compile-time evaluation or lift): the driver neither emits nor reports
 // them again as IR failures.
@@ -185,6 +189,7 @@ fun bootstrapStageCompileRoundEdit(
             raw.kind == target.kind) target = raw
     }
     if (bootstrapRuntimeModuleSource(target.sourceIdentity)) return false
+    bootstrapCompileDeclarationEpoch += 1
     bootstrapCompileRoundEdits.append(BootstrapDeclarationEdit(
         kind,
         target.sourceIdentity,
@@ -1189,6 +1194,7 @@ fun bootstrapCompileOutputRoot(): string =
 
 /** A compilation starts: no outputs staged, no compile-time globals kept. */
 fun bootstrapBeginCompileOutputs(): void {
+    bootstrapCompileDeclarationEpoch = 0
     bootstrapClearCompileOutputs()
     bootstrapForgetCompileGlobals()
     bootstrapSemanticUnit()
@@ -1228,109 +1234,6 @@ fun bootstrapCompileGlobalRoot(): string =
 
 fun bootstrapCompileGlobalKey(declaration: BootstrapDeclaration): string =
     "${declaration.sourceIdentity}:${declaration.name}"
-
-fun bootstrapForgetCompileGlobals(): void {
-    val root = bootstrapCompileGlobalRoot()
-    var index = 0
-    while (index < bootstrapCompileGlobalCount) {
-        Path("$root/$index.key").remove()
-        Path("$root/$index.value").remove()
-        index = index + 1
-    }
-    Path(root).remove()
-    bootstrapCompileGlobalCount = 0
-    bootstrapSemanticUnit()
-}
-
-fun bootstrapCompileGlobalSlot(key: string): int {
-    val root = bootstrapCompileGlobalRoot()
-    var found = -1
-    var index = 0
-    while (found < 0 && index < bootstrapCompileGlobalCount) {
-        if (Path("$root/$index.key").readText() == key) found = index
-        index = index + 1
-    }
-    found
-}
-
-/** What an earlier evaluation kept under `key` (invalid when none); a kept
- *  closure's lambda joins `syntax`. */
-fun bootstrapCompileGlobalLoad(
-    key: string,
-    declarations: array<BootstrapDeclaration>,
-    syntax: array<BootstrapExpression>
-): BootstrapEvalValue {
-    val slot = bootstrapCompileGlobalSlot(key)
-    if (slot < 0) return bootstrapEvalInvalid()
-    val text = Path("${bootstrapCompileGlobalRoot()}/$slot.value").readText()
-    if (text == "") return bootstrapEvalInvalid()
-    val decoded = bootstrapLiftDecode(text, declarations, syntax)
-    if (decoded.problem != "") return bootstrapEvalInvalid()
-    decoded.value
-}
-
-/** Keep the globals an evaluation read (and possibly changed) for the next
- *  ones, in the lift codec (shared and cyclic values, closures). */
-fun bootstrapCompileGlobalsKeep(
-    keys: array<string>,
-    values: array<BootstrapEvalValue>,
-    syntax: array<BootstrapExpression>,
-    declarations: array<BootstrapDeclaration>
-): void {
-    val root = bootstrapCompileGlobalRoot()
-    var index = 0
-    while (index < keys.size) {
-        val encoded = bootstrapLiftEncode(
-            values[index], syntax, declarations
-        ).bytes
-        var slot = bootstrapCompileGlobalSlot(keys[index])
-        if (encoded == "") {
-            if (slot >= 0) Path("$root/$slot.value").writeText("")
-        } else {
-            var written = true
-            if (slot < 0) {
-                slot = bootstrapCompileGlobalCount
-                written = Path(root).createDirectories() &&
-                    Path("$root/$slot.key").writeText(keys[index])
-                if (written) bootstrapCompileGlobalCount = slot + 1
-            }
-            if (written) Path("$root/$slot.value").writeText(encoded)
-        }
-        index = index + 1
-    }
-    bootstrapSemanticUnit()
-}
-
-/** The compile globals' kept values as they are now ("key", "value" pairs),
- *  for a round of lowering that runs again to start from them. */
-fun bootstrapSnapshotCompileGlobals(): array<string> {
-    val root = bootstrapCompileGlobalRoot()
-    val pairs: array<string> = []
-    var index = 0
-    while (index < bootstrapCompileGlobalCount) {
-        pairs.append(Path("$root/$index.key").readText())
-        pairs.append(Path("$root/$index.value").readText())
-        index = index + 1
-    }
-    pairs
-}
-
-/** Puts back what bootstrapSnapshotCompileGlobals took. */
-fun bootstrapRestoreCompileGlobals(pairs: array<string>): void {
-    bootstrapForgetCompileGlobals()
-    val root = bootstrapCompileGlobalRoot()
-    var index = 0
-    while (index + 1 < pairs.size) {
-        val slot = bootstrapCompileGlobalCount
-        if (Path(root).createDirectories() &&
-            Path("$root/$slot.key").writeText(pairs[index]) &&
-            Path("$root/$slot.value").writeText(pairs[index + 1])) {
-            bootstrapCompileGlobalCount = slot + 1
-        }
-        index = index + 2
-    }
-    return
-}
 
 fun bootstrapCompileGlobalToken(text: string): string = "${text.size}:$text"
 
@@ -2282,11 +2185,19 @@ fun bootstrapEvalClosure(
     "closure",
     expression,
     family == "once",
-    "",
+    "epoch:$bootstrapCompileDeclarationEpoch",
     captures,
     family,
     names
 )
+
+fun bootstrapEvalClosurePositional(value: BootstrapEvalValue): bool =
+    value.kind == "closure" && (value.text == "positional" || value.text.startsWith("positional:"))
+fun bootstrapEvalClosureEpoch(value: BootstrapEvalValue): int =
+    if (value.kind == "closure" && value.text.startsWith("epoch:"))
+        bootstrapDecimalIndex(value.text.slice(6, value.text.size))
+    else if (bootstrapEvalClosurePositional(value) && value.text.startsWith("positional:"))
+        bootstrapDecimalIndex(value.text.slice(11, value.text.size)) else -1
 
 fun bootstrapEvalArray(
     elements: array<BootstrapEvalValue>
@@ -2646,7 +2557,8 @@ class BootstrapEvaluator(
     var suppressProjectionOwner: int = 0,
     val containerSourceLeaves: array<BootstrapExpression> = [],
     val containerSourceFlags: array<int> = [],
-    val loopMapViews: array<BootstrapExpression> = []
+    val loopMapViews: array<BootstrapExpression> = [],
+    val globalGraph: BootstrapGlobalNodeMemo = BootstrapGlobalNodeMemo()
 ) {
     fun evaluateProjectionReceiver(expression: BootstrapExpression,
         holdMoved: bool = false): BootstrapEvalValue {
@@ -3813,13 +3725,12 @@ class BootstrapEvaluator(
      *  reference evaluates its initializer (or takes what an earlier evaluation kept);
      *  changes through it last for every later evaluation. */
     fun compileGlobal(declaration: BootstrapDeclaration): BootstrapEvalValue {
+        if (!bootstrapRestoreEvaluatorGlobals(this)) return BOOTSTRAP_EVAL_STOPPED
         val key = bootstrapCompileGlobalKey(declaration)
-        var index = 0
-        while (index < this.globalKeys.size) {
-            if (this.globalKeys[index] == key) return this.globalValues[index]
-            index = index + 1
-        }
-        var value = bootstrapCompileGlobalLoad(key, this.declarations, this.syntax)
+        val slot = bootstrapEvalGlobalSlot(this, key)
+        if (slot >= 0) return this.globalValues[slot]
+        var value = bootstrapLoadEvaluatorGlobal(this, key)
+        if (bootstrapEvalLeaves(value)) return value
         if (value.kind == "invalid") value = this.evaluateFrame(declaration.expression)
         this.globalKeys.append(key)
         this.globalValues.append(value)
@@ -3949,19 +3860,17 @@ class BootstrapEvaluator(
                 if (bootstrapDeclarationIsValue(candidate.kind) &&
                     candidate.name == name &&
                     candidate.expression.kind == "delegate.initializer") {
+                    if (!bootstrapRestoreEvaluatorGlobals(this)) return BOOTSTRAP_EVAL_STOPPED
                     val key = if (candidate.kind == "compile.val" ||
                         candidate.kind == "compile.var")
                         bootstrapCompileGlobalKey(candidate)
                         else "runtime:${bootstrapCompileGlobalKey(candidate)}"
-                    var index = 0
-                    while (result.kind == "invalid" && index < this.globalKeys.size) {
-                        if (this.globalKeys[index] == key) result = this.globalValues[index]
-                        index = index + 1
-                    }
+                    val keptSlot = bootstrapEvalGlobalSlot(this, key)
+                    if (result.kind == "invalid" && keptSlot >= 0) result =
+                        this.globalValues[keptSlot]
                     if (result.kind == "invalid") {
-                        result = bootstrapCompileGlobalLoad(
-                            key, this.declarations, this.syntax
-                        )
+                        result = bootstrapLoadEvaluatorGlobal(this, key)
+                        if (bootstrapEvalLeaves(result)) return result
                         if (result.kind == "invalid") {
                             result = this.evaluate(candidate.expression)
                         }
@@ -5305,6 +5214,7 @@ class BootstrapEvaluator(
             ))
         }
         if (target < 0) callable = bootstrapEvalGlobalCallable(this, expression.text)
+        if (bootstrapEvalLeaves(callable)) return callable
         if (callable.kind == "function") targetName = callable.text
         if (callable.kind == "closure") {
             result = bootstrapEvaluateClosureCall(
@@ -5664,7 +5574,8 @@ class BootstrapEvaluator(
                     this.errors,
                     this.steps,
                     this.diagnostics,
-                    this.sourceIdentity
+                    this.sourceIdentity,
+                    globalGraph = this.globalGraph
                 )
                 val escaped = bootstrapEvalFirstEscape(extensionValues)
                 val defaultMark = invocation.names.size
@@ -5753,7 +5664,8 @@ class BootstrapEvaluator(
                             this.errors,
                             this.steps,
                             this.diagnostics,
-                            this.sourceIdentity
+                            this.sourceIdentity,
+                            globalGraph = this.globalGraph
                         )
                         val escaped = bootstrapEvalFirstEscape(methodValues)
                         val defaultMark = invocation.names.size
@@ -5983,7 +5895,8 @@ class BootstrapEvaluator(
             this.errors,
             this.steps,
             this.diagnostics,
-            this.sourceIdentity
+            this.sourceIdentity,
+            globalGraph = this.globalGraph
         )
         var result = bootstrapEvaluateFrom(
             invocation, declaration.sourceIdentity, declaration.expression
@@ -6261,9 +6174,15 @@ fun bootstrapEvalGlobalCallable(
         val declaration = evaluator.declarations[global]
         if (bootstrapDeclarationIsValue(declaration.kind) &&
             declaration.name == name) {
-            callable = bootstrapEvaluateFrom(
-                evaluator, declaration.sourceIdentity, declaration.expression
-            )
+            if (declaration.expression.kind == "delegate.initializer") {
+                callable = evaluator.delegatedSlot(name)
+                if (callable.kind == "delegate" && callable.elements.size == 1)
+                    callable = evaluator.invokeDelegateMethod(callable.elements[0],
+                        "getValue", bootstrapEvalVoid(), false, declaration.begin, declaration.end)
+            } else if (declaration.kind == "compile.val" || declaration.kind == "compile.var")
+                callable = evaluator.compileGlobal(declaration)
+            else callable = bootstrapRuntimeGlobal(evaluator, declaration)
+            if (bootstrapEvalLeaves(callable)) return callable
         }
         globalNode = evaluator.nextNamed(globalNode)
     }
@@ -6468,8 +6387,9 @@ fun bootstrapEvalInvocation(
     evaluator.errors,
     evaluator.steps,
     evaluator.diagnostics,
-    evaluator.sourceIdentity
-)
+    evaluator.sourceIdentity,
+        globalGraph = evaluator.globalGraph
+    )
 
 /** A default argument, evaluated with the parameters bound before it. */
 @noinline
@@ -7071,13 +6991,23 @@ fun bootstrapEvaluateFrom(
 fun bootstrapRuntimeGlobalKey(declaration: BootstrapDeclaration): string =
     "runtime:${bootstrapCompileGlobalKey(declaration)}"
 
-fun bootstrapEvalGlobalSlot(evaluator: BootstrapEvaluator, key: string): int {
-    var index = 0
-    while (index < evaluator.globalKeys.size) {
-        if (evaluator.globalKeys[index] == key) return index
-        index = index + 1
+fun bootstrapEvalIndexGlobals(var evaluator: BootstrapEvaluator): void {
+    while (evaluator.globalGraph.indexedRoots < evaluator.globalKeys.size) {
+        val index = evaluator.globalGraph.indexedRoots
+        val key = evaluator.globalKeys[index]
+        if (evaluator.globalGraph.firstSlots.get(key) == null)
+            evaluator.globalGraph.firstSlots.set(key, index)
+        evaluator.globalGraph.lastSlots.set(key, index)
+        evaluator.globalGraph.indexedRoots += 1
     }
-    -1
+}
+fun bootstrapEvalGlobalSlot(var evaluator: BootstrapEvaluator, key: string): int {
+    bootstrapEvalIndexGlobals(evaluator)
+    evaluator.globalGraph.firstSlots.get(key) ?? -1
+}
+fun bootstrapEvalGlobalLastSlot(var evaluator: BootstrapEvaluator, key: string): int {
+    bootstrapEvalIndexGlobals(evaluator)
+    evaluator.globalGraph.lastSlots.get(key) ?? -1
 }
 
 @noinline
@@ -7085,6 +7015,7 @@ fun bootstrapRuntimeGlobal(
     var evaluator: BootstrapEvaluator,
     declaration: BootstrapDeclaration
 ): BootstrapEvalValue {
+    if (!bootstrapRestoreEvaluatorGlobals(evaluator)) return BOOTSTRAP_EVAL_STOPPED
     var initializing = false
     var binding = evaluator.names.size
     while (!initializing && binding > 0) {
@@ -7095,9 +7026,8 @@ fun bootstrapRuntimeGlobal(
         else bootstrapRuntimeGlobalKey(declaration)
     val slot = bootstrapEvalGlobalSlot(evaluator, key)
     if (slot >= 0) return evaluator.globalValues[slot]
-    var value = bootstrapCompileGlobalLoad(
-        key, evaluator.declarations, evaluator.syntax
-    )
+    var value = bootstrapLoadEvaluatorGlobal(evaluator, key)
+    if (bootstrapEvalLeaves(value)) return value
     if (value.kind == "invalid" && !initializing) {
         value = bootstrapRuntimeGlobalInitial(evaluator, declaration)
     } else if (value.kind == "invalid") {
@@ -8268,18 +8198,14 @@ fun bootstrapEvaluateAssign(
         evaluator.compileVar(expression.text) >= 0 &&
         evaluator.declarations[evaluator.compileVar(expression.text)].expression.kind !=
             "delegate.initializer") {
+        if (!bootstrapRestoreEvaluatorGlobals(evaluator)) return BOOTSTRAP_EVAL_STOPPED
         // A `compile var` takes the new value for the rest of the compilation.
         val declaration = evaluator.declarations[evaluator.compileVar(expression.text)]
         val key = bootstrapCompileGlobalKey(declaration)
         val value = evaluator.evaluate(expression.children[0])
         // `x = y ?? continue`: the jump leaves before anything is assigned.
         if (bootstrapEvalLeaves(value)) return value
-        var slot = -1
-        var index = 0
-        while (index < evaluator.globalKeys.size) {
-            if (evaluator.globalKeys[index] == key) slot = index
-            index = index + 1
-        }
+        val slot = bootstrapEvalGlobalLastSlot(evaluator, key)
         if (slot >= 0) evaluator.globalValues[slot] = value
         else {
             evaluator.globalKeys.append(key)
@@ -8289,6 +8215,7 @@ fun bootstrapEvaluateAssign(
     } else if (expression.kind == "assign" && evaluator.find(expression.text) < 0 &&
         !field && evaluator.delegatedSlot(expression.text).kind != "delegate" &&
         bootstrapRuntimeVar(evaluator, expression.text) >= 0) {
+        if (!bootstrapRestoreEvaluatorGlobals(evaluator)) return BOOTSTRAP_EVAL_STOPPED
         // A program `var` assigned by compile-time code: its value for the rest
         // of the compilation (bootstrapRuntimeGlobal).
         val declaration =
@@ -8297,12 +8224,7 @@ fun bootstrapEvaluateAssign(
         val value = evaluator.evaluate(expression.children[0])
         // `x = y ?? continue`: the jump leaves before anything is assigned.
         if (bootstrapEvalLeaves(value)) return value
-        var slot = -1
-        var index = 0
-        while (index < evaluator.globalKeys.size) {
-            if (evaluator.globalKeys[index] == key) slot = index
-            index = index + 1
-        }
+        val slot = bootstrapEvalGlobalLastSlot(evaluator, key)
         if (slot >= 0) evaluator.globalValues[slot] = value
         else {
             evaluator.globalKeys.append(key)
@@ -9636,7 +9558,8 @@ fun bootstrapEvaluateClosureCall(
         evaluator.errors,
         evaluator.steps,
         evaluator.diagnostics,
-        evaluator.sourceIdentity
+        evaluator.sourceIdentity,
+        globalGraph = evaluator.globalGraph
     )
     result = invocation.evaluateFrame(
         lambda.children[lambda.children.size - 1]
@@ -14332,9 +14255,7 @@ fun bootstrapEvaluateWithEffectsIn(
         source
     )
     val result = evaluator.evaluate(expression)
-    bootstrapCompileGlobalsKeep(
-        globalKeys, globalValues, evaluator.syntax, evaluator.declarations
-    )
+    bootstrapKeepEvaluatorGlobals(evaluator)
     BootstrapEvalResult(
         result,
         evaluator.errors,
@@ -14466,9 +14387,7 @@ fun bootstrapInvokeSubparserHandlerIn(
         evaluator.diagnostics =
             "${evaluator.diagnostics}error[E_SUBPARSER_NAMED_ARGUMENT]: a named argument is valid only in the argument list of a call\n"
     }
-    bootstrapCompileGlobalsKeep(
-        globalKeys, globalValues, evaluator.syntax, evaluator.declarations
-    )
+    bootstrapKeepEvaluatorGlobals(evaluator)
     // A depth or step stop leaves partial syntax: count only the diagnostics it
     // reported and retain the stopped source span, so sema does not analyze the holes.
     val stopped = bootstrapEvalDepthStops > stopsBefore ||
@@ -14583,9 +14502,7 @@ fun bootstrapInvokeExtensionFinalizerIn(
             )
         ]
     ))
-    bootstrapCompileGlobalsKeep(
-        globalKeys, globalValues, evaluator.syntax, evaluator.declarations
-    )
+    bootstrapKeepEvaluatorGlobals(evaluator)
     BootstrapEvalResult(
         result,
         evaluator.errors,
@@ -14650,9 +14567,10 @@ fun bootstrapInvokeCompilerTransformIn(
         []
     ))
     bootstrapCompilerTransformActive = false
-    bootstrapCompileGlobalsKeep(
-        globalKeys, globalValues, evaluator.syntax, evaluator.declarations
-    )
+    // Even an unchanged lambda tree may now have different enclosing bindings.
+    // No saved typed owner layout is retained, so old closures cannot be lifted.
+    bootstrapCompileDeclarationEpoch += 1
+    bootstrapKeepEvaluatorGlobals(evaluator)
     BootstrapEvalResult(
         result,
         evaluator.errors,

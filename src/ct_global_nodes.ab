@@ -1,0 +1,380 @@
+// Stable, per-build graph IDs, assigned in root/child order. Hashes only
+// accelerate transient lookup or choose checked filename buckets.
+import "eval.ab"
+import "ct_lift.ab"
+import "ct_identity.ab"
+import "ct_global_graph.ab"
+import "parser.ab"
+import "sema.ab"
+import "simd_types.ab"
+import "abla/sys/linux/fs"
+import "abla/text"
+
+var bootstrapGlobalNodeNext: int = 1
+var bootstrapGlobalNodeCollected: int = 1
+var bootstrapGlobalNodeCollectionSpan: int = 4096
+var bootstrapGlobalNodeCollectionEpoch: int = 0
+var bootstrapGlobalJournalGeneration: int = 0
+class BootstrapGlobalNodeMemo(
+    val decoded: Map<int, BootstrapEvalValue> = Map(),
+    val identities: BootstrapIdentityMap = BootstrapIdentityMap(),
+    var problem: string = "",
+    val nodeBytes: Map<int, string> = Map(),
+    val rootRefs: Map<string, string> = Map(),
+    val rootFiles: Map<string, string> = Map(),
+    val firstSlots: Map<string, int> = Map(),
+    val lastSlots: Map<string, int> = Map(),
+    var indexedRoots: int = 0,
+    var directoriesReady: bool = false,
+    var collectionEpoch: int = bootstrapGlobalNodeCollectionEpoch,
+    val journalGeneration: int = bootstrapGlobalJournalGeneration
+)
+fun bootstrapGlobalMemoValid(var memo: BootstrapGlobalNodeMemo): bool {
+    if (memo.problem != "") return false
+    if (memo.journalGeneration != bootstrapGlobalJournalGeneration) {
+        memo.problem =
+            "the evaluation context predates a compile-time journal reset or rollback; restart the evaluation"
+        return false
+    }
+    true
+}
+class BootstrapGlobalNodeWriter(
+    val memo: BootstrapGlobalNodeMemo,
+    val syntax: array<BootstrapExpression>,
+    val declarations: array<BootstrapDeclaration>,
+    val seen: BootstrapIdentityMap = BootstrapIdentityMap(),
+    val visited: array<BootstrapEvalValue> = [],
+    val newValues: array<BootstrapEvalValue> = [],
+    val ids: array<int> = [],
+    val records: array<string> = [],
+    var problem: string = ""
+)
+class BootstrapGlobalRootSlot(val path: Path, val reference: string, val valid: bool)
+fun bootstrapGlobalNodeDirectory(): Path = Path("${bootstrapCompileGlobalRoot()}/nodes")
+fun bootstrapGlobalRootDirectory(): Path = Path("${bootstrapCompileGlobalRoot()}/roots")
+fun bootstrapGlobalNodeFile(id: int): Path = Path("${bootstrapGlobalNodeDirectory().text}/$id")
+
+// Hash equality is not key equality. Probe collisions in deterministic order
+// and verify the complete key in every occupied slot.
+fun bootstrapGlobalRootSlot(key: string): BootstrapGlobalRootSlot {
+    val hash = bootstrapFunctionDeclarationHash(key)
+    var probe = 0
+    while (true) {
+        val path = Path("${bootstrapGlobalRootDirectory().text}/$hash-$probe")
+        val bytes = path.readText()
+        if (bytes == "") return BootstrapGlobalRootSlot(path, "!", !path.exists())
+        val reader = BootstrapLiftDecoder(bytes, 0, [], [], [], "")
+        val found = reader.token()
+        if (reader.problem != "" || reader.at >= bytes.size)
+            return BootstrapGlobalRootSlot(path, "", false)
+        if (found == key) return BootstrapGlobalRootSlot(path, bytes.slice(reader.at, bytes.size),
+            true)
+        probe += 1
+    }
+    BootstrapGlobalRootSlot(Path(""), "", false)
+}
+fun bootstrapGlobalMemoRoot(var memo: BootstrapGlobalNodeMemo, key: string): string {
+    val previous = memo.rootRefs.get(key)
+    if (previous != null) return previous
+    val slot = bootstrapGlobalRootSlot(key)
+    if (!slot.valid) { memo.problem = "invalid global root"; return "!" }
+    memo.rootFiles.set(key, slot.path.text)
+    if (slot.reference != "!") memo.directoriesReady = true
+    memo.rootRefs.set(key, slot.reference)
+    slot.reference
+}
+fun bootstrapGlobalWriteRecord(path: Path, bytes: string): bool {
+    val temporary = Path("${path.text}.next")
+    if (!temporary.writeText(bytes) || !temporary.moveTo(path)) {
+        temporary.remove(); return false
+    }
+    true
+}
+fun bootstrapGlobalNodeComposite(kind: string): bool =
+    kind == "array" || kind == "map" || kind == "object" || kind == "cell" ||
+    kind == "slot" || kind == "delegate" || kind == "shared" ||
+    kind == "shared.control" || kind == "closure"
+fun bootstrapGlobalNodeAllocate(var writer: BootstrapGlobalNodeWriter,
+    value: BootstrapEvalValue): int {
+    val id = bootstrapGlobalNodeNext
+    bootstrapGlobalNodeNext += 1
+    writer.memo.identities.set(value, id)
+    writer.newValues.append(value)
+    id
+}
+fun bootstrapGlobalNodeScalar(var writer: BootstrapGlobalNodeWriter,
+    value: BootstrapEvalValue): string {
+    val kind = value.kind
+    if (kind == "integer") return "i${value.integer};"
+    if (kind == "f64") return "d${value.integer};"
+    if (kind == "f32") return "f${value.integer};"
+    if (kind == "boolean") return if (value.boolean) "b1" else "b0"
+    if (kind == "string") return "s${bootstrapLiftToken(value.text)}"
+    if (kind == "null") return "n"
+    if (kind == "void") return "v"
+    if (kind == "function") return "F${bootstrapLiftToken(value.text)}"
+    if (bootstrapIsWideIntType(kind)) return "${bootstrapLiftWideTag(kind)}${bootstrapLiftToken(value.text)}"
+    writer.problem = bootstrapLiftKindProblem(kind, "unknown")
+    "!"
+}
+// The flat record avoids constructing temporary evaluator arrays just to
+// serialize another evaluator value. Scalars are inline; r<ID>; is an edge.
+fun bootstrapGlobalNodeReference(var writer: BootstrapGlobalNodeWriter,
+    value: BootstrapEvalValue): string {
+    if (!bootstrapGlobalNodeComposite(value.kind)) return bootstrapGlobalNodeScalar(writer, value)
+    val previous = writer.memo.identities.get(value)
+    val id = if (previous != null) previous else bootstrapGlobalNodeAllocate(writer, value)
+    val reference = "r$id;"
+    if (writer.seen.get(value) != null) return reference
+    writer.seen.set(value, 1)
+    writer.visited.append(value)
+    val parts: array<string> = [bootstrapLiftToken(value.kind),
+        "${if (value.kind == "closure") 0 else value.integer};",
+        if (value.boolean) "1" else "0", bootstrapLiftToken(value.text),
+        bootstrapLiftToken(value.owner), "${value.fieldNames.size};"]
+    for (field in value.fieldNames) parts.append(bootstrapLiftToken(field))
+    parts.append("${value.elements.size};")
+    for (child in value.elements) parts.append(bootstrapGlobalNodeReference(writer, child))
+    var source = ""
+    var tree = ""
+    if (value.kind == "closure") {
+        if (value.integer < 0 || value.integer >= writer.syntax.size) writer.problem =
+            "a closure lost its lambda"
+        else {
+            val lambda = writer.syntax[value.integer]
+            val encoder = BootstrapLiftEncoder(writer.declarations, writer.syntax, [], [], "")
+            source = bootstrapLiftEncodedLambdaSource(encoder, lambda)
+            tree = bootstrapLiftEncode(bootstrapGlobalSyntaxValue(lambda), [], []).bytes
+        }
+    }
+    parts.append(bootstrapLiftToken(source)); parts.append(bootstrapLiftToken(tree))
+    writer.ids.append(id); writer.records.append(textJoin(parts))
+    reference
+}
+fun bootstrapGlobalNodeReadReference(var memo: BootstrapGlobalNodeMemo,
+    var reader: BootstrapLiftDecoder): BootstrapEvalValue {
+    if (reader.at >= reader.bytes.size) return reader.fail("missing global reference")
+    if (reader.bytes[reader.at] == 114) {
+        reader.at += 1
+        val id = reader.number(59)
+        if (id <= 0) return reader.fail("invalid global ID")
+        return bootstrapGlobalNodeDecode(memo, id, reader.declarations, reader.syntax)
+    }
+    if (reader.bytes[reader.at] == 33) return reader.fail("unsupported global child")
+    val tag = reader.bytes[reader.at]
+    // Compound values are always node references, never nested lift graphs.
+    if (tag == 97 || tag == 109 || tag == 111 || tag == 99 || tag == 107 ||
+        tag == 104 || tag == 68 || tag == 76 || tag == 74)
+        return reader.fail("inline composite in global node")
+    bootstrapLiftDecodeValue(reader)
+}
+fun bootstrapGlobalNodeDecode(var memo: BootstrapGlobalNodeMemo, id: int,
+    declarations: array<BootstrapDeclaration>,
+    var syntax: array<BootstrapExpression>): BootstrapEvalValue {
+    val previous = memo.decoded.get(id)
+    if (previous != null) return previous
+    val bytes = bootstrapGlobalNodeFile(id).readText()
+    memo.nodeBytes.set(id, bytes)
+    val reader = BootstrapLiftDecoder(bytes, 0, declarations, syntax, [], "")
+    val kind = reader.token()
+    var integer = reader.number(59)
+    val bit = if (reader.at < bytes.size) bytes[reader.at] else 0
+    reader.at += 1
+    val text = reader.token()
+    val owner = reader.token()
+    if (!bootstrapGlobalNodeComposite(kind) || (bit != 48 && bit !=
+        49)) reader.fail("invalid global node header")
+    val fields: array<string> = []
+    var count = reader.number(59)
+    if (count < 0 || count > bytes.size) reader.fail("invalid global field count")
+    while (reader.problem == "" && count > 0) { fields.append(reader.token()); count -= 1 }
+    val children = reader.number(59)
+    if (children < 0 || children > bytes.size) reader.fail("invalid global child count")
+    val childrenAt = reader.at
+    var metadataAt = -1
+    if (kind == "closure") {
+        // Closure handles must be fixed before captures can point back to them.
+        // Other nodes are decoded in one pass.
+        var remaining = children
+        while (reader.problem == "" && remaining > 0) {
+            if (reader.at < bytes.size && bytes[reader.at] == 114) {
+                reader.at += 1
+                val ignored = reader.number(59)
+            } else { val ignored = bootstrapLiftDecodeValue(reader) }
+            remaining -= 1
+        }
+        metadataAt = reader.at
+        val source = reader.token()
+        val treeBytes = reader.token()
+        if (reader.problem != "" || reader.at != bytes.size) {
+            memo.problem = "invalid global node $id: ${reader.problem}"
+            return bootstrapEvalInvalid()
+        }
+        val tree = bootstrapLiftDecode(treeBytes, [], [])
+        val saved = bootstrapGlobalSyntaxRead(tree.value)
+        if (tree.problem != "" || (saved.kind != "lambda" && saved.kind != "lambda.move" &&
+            saved.kind != "lambda.generator")) {
+            memo.problem = "invalid saved global lambda"; return bootstrapEvalInvalid()
+        }
+        val declared = bootstrapLiftFindDeclaredLambda(declarations, source, saved.begin, saved.end)
+        val lambda = if (declared != null && bootstrapLiftSameSyntax(declared,
+            saved)) declared else saved
+        integer = syntax.size
+        syntax.append(lambda)
+        syntax.append(BootstrapExpression("global.journal.lambda", source, lambda.begin, lambda.end,
+            [lambda]))
+    }
+    val value = BootstrapEvalValue(kind, integer, bit == 49, text, [], owner, fields)
+    memo.decoded.set(id, value); memo.identities.set(value, id)
+    val childReader = if (kind == "closure") BootstrapLiftDecoder(bytes, childrenAt, declarations,
+        syntax, [], "") else reader
+    var remaining = children
+    while (childReader.problem == "" && memo.problem == "" && remaining > 0) {
+        value.elements.append(bootstrapGlobalNodeReadReference(memo, childReader))
+        remaining -= 1
+    }
+    if (kind != "closure") {
+        val source = childReader.token()
+        val treeBytes = childReader.token()
+        metadataAt = bytes.size
+    }
+    if (childReader.problem != "" || childReader.at != metadataAt) {
+        if (memo.problem == "") memo.problem = "invalid global children: ${childReader.problem}"
+        return bootstrapEvalInvalid()
+    }
+    value
+}
+
+fun bootstrapGlobalNodeLoad(key: string, declarations: array<BootstrapDeclaration>,
+    var syntax: array<BootstrapExpression>, var memo: BootstrapGlobalNodeMemo): BootstrapEvalValue {
+    if (!bootstrapGlobalMemoValid(memo)) return bootstrapEvalInvalid()
+    val reference = bootstrapGlobalMemoRoot(memo, key)
+    if (memo.problem != "" || reference == "!") return bootstrapEvalInvalid()
+    val reader = BootstrapLiftDecoder(reference, 0, declarations, syntax, [], "")
+    val value = bootstrapGlobalNodeReadReference(memo, reader)
+    if (reader.problem != "" || reader.at != reference.size) memo.problem =
+        "invalid global root: ${reader.problem}"
+    value
+}
+fun bootstrapGlobalNodeKeep(keys: array<string>, values: array<BootstrapEvalValue>,
+    syntax: array<BootstrapExpression>, declarations: array<BootstrapDeclaration>,
+    var memo: BootstrapGlobalNodeMemo): bool {
+    if (keys.size != values.size || !bootstrapGlobalMemoValid(memo)) return false
+    if (keys.size == 0) return true
+    // A retained object may be re-rooted after collection removed its file.
+    // Revalidate bytes lazily; never let an old memo hide a missing node.
+    if (memo.collectionEpoch != bootstrapGlobalNodeCollectionEpoch) {
+        memo.nodeBytes.clear()
+        memo.collectionEpoch = bootstrapGlobalNodeCollectionEpoch
+    }
+    val writer = BootstrapGlobalNodeWriter(memo, syntax, declarations)
+    val roots: array<string> = []
+    for (index in 0 until keys.size) {
+        val recordsMark = writer.records.size
+        val visitsMark = writer.visited.size
+        val newMark = writer.newValues.size
+        val idMark = bootstrapGlobalNodeNext
+        var reference = bootstrapGlobalNodeReference(writer, values[index])
+        if (writer.problem != "") {
+            var undo = writer.visited.size
+            while (undo > visitsMark) { undo -= 1; writer.seen.remove(writer.visited[undo]) }
+            writer.visited.truncate(visitsMark)
+            undo = writer.newValues.size
+            while (undo > newMark) { undo -= 1; memo.identities.remove(writer.newValues[undo]) }
+            writer.newValues.truncate(newMark)
+            writer.ids.truncate(recordsMark); writer.records.truncate(recordsMark)
+            bootstrapGlobalNodeNext = idMark; writer.problem = ""; reference = "!"
+        }
+        roots.append(reference)
+    }
+    var changed = false
+    for (index in 0 until writer.ids.size) {
+        val id = writer.ids[index]
+        if (memo.nodeBytes.get(id) == null) {
+            val bytes = bootstrapGlobalNodeFile(id).readText()
+            if (bytes != "") memo.nodeBytes.set(id, bytes)
+        }
+        if (memo.nodeBytes.get(id) != writer.records[index]) changed = true
+    }
+    for (index in 0 until keys.size) {
+        if (bootstrapGlobalMemoRoot(memo, keys[index]) != roots[index]) changed = true
+    }
+    if (memo.problem != "") return false
+    // The common read-only site performs no filesystem operations on keep.
+    if (!changed) return true
+    if (!memo.directoriesReady) {
+        if (!bootstrapGlobalNodeDirectory().createDirectories() ||
+            !bootstrapGlobalRootDirectory().createDirectories()) return false
+        memo.directoriesReady = true
+    }
+    for (index in 0 until writer.ids.size) {
+        val id = writer.ids[index]
+        val bytes = writer.records[index]
+        if (memo.nodeBytes.get(id) != bytes &&
+            !bootstrapGlobalWriteRecord(bootstrapGlobalNodeFile(id), bytes)) return false
+        memo.nodeBytes.set(id, bytes)
+    }
+    for (index in 0 until keys.size) {
+        val previous = bootstrapGlobalMemoRoot(memo, keys[index])
+        if (memo.problem != "") return false
+        if (previous != roots[index]) {
+            // Recheck the bucket after earlier new roots were published: two
+            // initially absent colliding keys must not overwrite each other.
+            val slot = bootstrapGlobalRootSlot(keys[index])
+            if (!slot.valid || !bootstrapGlobalWriteRecord(slot.path,
+                "${bootstrapLiftToken(keys[index])}${roots[index]}")) return false
+            memo.rootFiles.set(keys[index], slot.path.text)
+        }
+        memo.rootRefs.set(keys[index], roots[index])
+    }
+    bootstrapGlobalNodeCollect()
+    true
+}
+// Parse edges without materializing the referenced objects.
+fun bootstrapGlobalCollectReference(var reader: BootstrapLiftDecoder,
+    var pending: array<int>): void {
+    if (reader.at >= reader.bytes.size) { reader.fail("missing graph edge"); return }
+    if (reader.bytes[reader.at] == 114) { reader.at += 1; pending.append(reader.number(59)) }
+    else if (reader.bytes[reader.at] == 33) reader.at += 1
+    else { val ignored = bootstrapLiftDecodeValue(reader) }
+}
+// Retain at most the previous live graph plus max(previous live, 4096)
+// subsequent allocations; collection removes unreachable files, never reuses IDs.
+fun bootstrapGlobalNodeCollect(): void {
+    if (bootstrapGlobalNodeNext - bootstrapGlobalNodeCollected <
+        bootstrapGlobalNodeCollectionSpan) return
+    val live: Map<int, bool> = Map()
+    val pending: array<int> = []
+    for (file in bootstrapGlobalRootDirectory().entries()) {
+        val reader = BootstrapLiftDecoder(file.readText(), 0, [], [], [], "")
+        val key = reader.token()
+        bootstrapGlobalCollectReference(reader, pending)
+        if (reader.problem != "") return
+    }
+    var index = 0
+    while (index < pending.size) {
+        val id = pending[index]; index += 1
+        if (id > 0 && live.get(id) == null) {
+            live.set(id, true)
+            val reader = BootstrapLiftDecoder(bootstrapGlobalNodeFile(id).readText(), 0, [], [], [],
+                "")
+            val kind = reader.token(); val integer = reader.number(59); reader.at += 1
+            val text = reader.token(); val owner = reader.token()
+            var count = reader.number(59)
+            while (reader.problem == "" && count > 0) { val field = reader.token(); count -= 1 }
+            count = reader.number(59)
+            while (reader.problem == "" && count > 0) { bootstrapGlobalCollectReference(reader,
+                pending); count -= 1 }
+            if (reader.problem != "") return
+        }
+    }
+    for (file in bootstrapGlobalNodeDirectory().entries()) {
+        var id = 0
+        for (byte in file.name()) { if (byte < 48 || byte > 57) { id = -1; break }; id = id * 10 +
+                byte - 48 }
+        if (id > 0 && live.get(id) == null) file.remove()
+    }
+    bootstrapGlobalNodeCollectionEpoch += 1
+    bootstrapGlobalNodeCollected = bootstrapGlobalNodeNext
+    bootstrapGlobalNodeCollectionSpan = if (live.size > 4096) live.size else 4096
+}

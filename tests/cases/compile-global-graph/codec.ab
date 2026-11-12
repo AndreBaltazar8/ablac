@@ -1,0 +1,196 @@
+import "../../../src/eval.ab"
+import "../../../src/parser.ab"
+import "../../../src/ct_global_graph.ab"
+import "../../../src/ct_global_nodes.ab"
+import "../../../src/ct_lift.ab"
+import "abla/io"
+import "abla/sys/linux/process"
+import "abla/sys/linux/fs"
+
+fun fresh(declarations: array<BootstrapDeclaration>): BootstrapEvaluator {
+    val context = bootstrapEvalContext(declarations)
+    BootstrapEvaluator(declarations, context.affineTypes, context,
+        [], [], [], [], [], [], [], [], [], [], [], [], [], 0, 0, 0, "")
+}
+fun globalValue(var evaluator: BootstrapEvaluator, key: string): BootstrapEvalValue {
+    val index = bootstrapEvalGlobalSlot(evaluator, key)
+    if (index >= 0) return evaluator.globalValues[index]
+    val value = bootstrapLoadEvaluatorGlobal(evaluator, key)
+    if (value.kind != "invalid") {
+        evaluator.globalKeys.append(key); evaluator.globalValues.append(value)
+    }
+    value
+}
+fun call(var evaluator: BootstrapEvaluator, name: string): int {
+    evaluator.evaluate(BootstrapExpression("call", name, 0, 0,
+        [BootstrapExpression("integer", "10", 0, 0, [])])).integer
+}
+fun main: int {
+    bootstrapForgetCompileGlobals()
+    val shared = bootstrapEvalArray([bootstrapEvalInteger(1)])
+    if (!bootstrapCompileGlobalsKeep(["ordinary", "compile"], [shared, shared], [], [])) return 1
+    val old = bootstrapParseWithIdentity(
+        "fun factory(): (int) -> int = { x: int -> x + 1 }", "same.ab")
+    val newer = bootstrapParseWithIdentity(
+        "fun factory(): (int) -> int = { x: int -> x + 2 }", "same.ab")
+    if (old.errors != 0 || newer.errors != 0) return 2
+    if (old.declarations[0].expression.begin != newer.declarations[0].expression.begin ||
+        old.declarations[0].expression.end != newer.declarations[0].expression.end) return 3
+    val first = fresh(old.declarations)
+    val before = first.evaluate(BootstrapExpression("call", "factory", 0, 0, []))
+    if (before.kind != "closure") return 4
+    val encodedBeforeEdit = bootstrapLiftEncode(before, first.syntax, old.declarations)
+    val createdAt = bootstrapEvalClosureEpoch(before)
+    val nativeLambda = first.syntax[before.integer]
+    val nativeName = "lambda_${nativeLambda.begin}_${nativeLambda.end}_0"
+    val oldFunctions = BootstrapCtFunctionTable([42], [nativeName], ["same.ab"])
+    bootstrapCompileDeclarationEpoch += 1
+    val decodedAfterEdit = bootstrapLiftDecode(encodedBeforeEdit.bytes, newer.declarations, [])
+    if (decodedAfterEdit.problem != "" || bootstrapEvalClosureEpoch(decodedAfterEdit.value) !=
+        createdAt)
+        return 27
+    val staleNative = bootstrapCtLiftDecode("V${BOOTSTRAP_CT_LIFT_WIRE_VERSION};F42;0;",
+        "function:(i64)->i64", newer.declarations, oldFunctions)
+    if (staleNative.ok ||
+        !staleNative.diagnostic.contains("predates a later compile-time transform"))
+        return 28
+    val newFunctions = BootstrapCtFunctionTable([42], [nativeName], ["same.ab"])
+    val freshNative = bootstrapCtLiftDecode("V${BOOTSTRAP_CT_LIFT_WIRE_VERSION};F42;0;",
+        "function:(i64)->i64", newer.declarations, newFunctions)
+    if (!freshNative.ok || !bootstrapEvalClosurePositional(freshNative.value) ||
+        bootstrapEvalClosureEpoch(freshNative.value) != bootstrapCompileDeclarationEpoch) return 29
+    val nativeBytes = bootstrapLiftEncode(freshNative.value, freshNative.syntax, newer.declarations)
+    bootstrapCompileDeclarationEpoch += 1
+    val nativeAfterEdit = bootstrapLiftDecode(nativeBytes.bytes, newer.declarations, [])
+    if (nativeAfterEdit.problem != "" || !bootstrapEvalClosurePositional(nativeAfterEdit.value) ||
+        bootstrapEvalClosureEpoch(nativeAfterEdit.value) != newFunctions.epoch) return 30
+    if (!bootstrapCompileGlobalsKeep(["old"], [before], first.syntax, old.declarations)) return 5
+    val second = fresh(newer.declarations)
+    if (!bootstrapRestoreEvaluatorGlobals(second)) return 6
+    val kept = globalValue(second, "old")
+    val after = second.evaluate(BootstrapExpression("call", "factory", 0, 0, []))
+    second.names.append("previous"); second.values.append(kept); second.mutable.append(false)
+    second.names.append("current"); second.values.append(after); second.mutable.append(false)
+    if (call(second, "previous") != 11 || call(second, "current") != 12) return 7
+    second.globalKeys.append("new"); second.globalValues.append(after)
+    val one = globalValue(second, "ordinary")
+    val two = globalValue(second, "compile")
+    if (one != two) return 8
+    second.globalValues[bootstrapGlobalGraphIndex(second.globalKeys,
+        "ordinary")].elements.append(bootstrapEvalInteger(2))
+    bootstrapKeepEvaluatorGlobals(second)
+    if (second.errors != 0) return 9
+    // Both versions at the same source/span survive, even with no owner present.
+    val missing = fresh([])
+    if (!bootstrapRestoreEvaluatorGlobals(missing)) return 10
+    missing.names.append("previous"); missing.values.append(globalValue(missing,
+        "old")); missing.mutable.append(false)
+    missing.names.append("current"); missing.values.append(globalValue(missing,
+        "new")); missing.mutable.append(false)
+    if (call(missing, "previous") != 11 || call(missing, "current") != 12) return 11
+    if (globalValue(missing, "ordinary").elements.size != 2 ||
+        globalValue(missing, "ordinary") != globalValue(missing, "compile")) return 12
+    // A failed root opens shared nodes before failing. Rollback must remove
+    // those memo entries so the next supported roots still form a valid graph.
+    val freshArray = bootstrapEvalArray([bootstrapEvalInteger(99)])
+    val bad = bootstrapEvalArray([freshArray, bootstrapEvalInvalid()])
+    if (!bootstrapCompileGlobalsKeep(["bad", "good", "good-alias"],
+        [bad, freshArray, freshArray], missing.syntax, [])) return 13
+    val restored = fresh(old.declarations)
+    if (!bootstrapRestoreEvaluatorGlobals(restored)) return 14
+    if (globalValue(restored, "bad").kind != "invalid" ||
+        globalValue(restored, "good") != globalValue(restored, "good-alias")) return 15
+    restored.names.append("previous"); restored.values.append(globalValue(restored,
+        "old")); restored.mutable.append(false)
+    restored.names.append("current"); restored.values.append(globalValue(restored,
+        "new")); restored.mutable.append(false)
+    if (call(restored, "previous") != 11 || call(restored, "current") != 12) return 16
+    val snapshot = bootstrapSnapshotCompileGlobals()
+    if (!bootstrapCompileGlobalsKeep(["ordinary"], [bootstrapEvalArray([])], restored.syntax,
+        old.declarations)) return 17
+    bootstrapRestoreCompileGlobals(snapshot)
+    val retry = fresh(old.declarations)
+    if (!bootstrapRestoreEvaluatorGlobals(retry) ||
+        globalValue(retry, "ordinary") != globalValue(retry, "compile") ||
+        globalValue(retry, "ordinary").elements.size != 2) return 18
+    // Reset/rollback invalidates whole evaluation contexts. Clearing only
+    // byte caches would leave local aliases bound to the discarded graph.
+    val liveMemo = fresh([])
+    val oldValue = globalValue(liveMemo, "good")
+    val rollback = bootstrapSnapshotCompileGlobals()
+    val oldSlot = bootstrapEvalGlobalSlot(liveMemo, "good")
+    liveMemo.globalValues[oldSlot].elements.append(bootstrapEvalInteger(5))
+    bootstrapKeepEvaluatorGlobals(liveMemo)
+    bootstrapRestoreCompileGlobals(rollback)
+    val staleRead = bootstrapLoadEvaluatorGlobal(liveMemo, "good")
+    if (!bootstrapEvalStopped(staleRead) || liveMemo.errors != 1) return 36
+    if (bootstrapRestoreEvaluatorGlobals(liveMemo) || liveMemo.errors != 1) return 37
+    // A stale context that goes straight to keep reports the same cause once.
+    val staleKeep = fresh([])
+    val remembered = globalValue(staleKeep, "good")
+    bootstrapRestoreCompileGlobals(rollback)
+    bootstrapKeepEvaluatorGlobals(staleKeep)
+    if (staleKeep.errors != 1 ||
+        !staleKeep.diagnostics.contains("journal reset or rollback")) return 39
+    bootstrapKeepEvaluatorGlobals(staleKeep)
+    if (staleKeep.errors != 1) return 40
+    val afterRollback = fresh([])
+    if (globalValue(afterRollback, "good").elements.size != 1) return 38
+    // Unchanged keeps perform no file writes, including root metadata.
+    val readOnly = fresh([])
+    val stable = globalValue(readOnly, "good")
+    val stableId = readOnly.globalGraph.identities.get(stable) ?? -1
+    if (stableId < 0) return 31
+    val nodeRevision = bootstrapGlobalNodeFile(stableId).info().revision
+    val rootPath = bootstrapGlobalRootSlot("good").path
+    val rootRevision = rootPath.info().revision
+    for (iteration in 0 until 100) bootstrapKeepEvaluatorGlobals(readOnly)
+    if (readOnly.errors != 0 || bootstrapGlobalNodeFile(stableId).info().revision != nodeRevision ||
+        rootPath.info().revision != rootRevision) return 32
+    // The same memo keeps a retained object alive after its last root is
+    // removed. Re-rooting after GC must recreate its file under the same ID.
+    if (!bootstrapCompileGlobalsKeep(["resurrect"],
+        [bootstrapEvalArray([bootstrapEvalInteger(77)])], [], [])) return 33
+    val reused = fresh([])
+    val held = globalValue(reused, "resurrect")
+    val heldId = reused.globalGraph.identities.get(held) ?? -1
+    val heldSlot = bootstrapEvalGlobalSlot(reused, "resurrect")
+    reused.globalValues[heldSlot] = bootstrapEvalArray([])
+    bootstrapGlobalNodeCollectionSpan = 1
+    bootstrapKeepEvaluatorGlobals(reused)
+    if (reused.errors != 0 || heldId < 0 || bootstrapGlobalNodeFile(heldId).exists()) return 34
+    reused.globalValues[heldSlot] = held
+    bootstrapKeepEvaluatorGlobals(reused)
+    val afterCollection = fresh([])
+    if (reused.errors != 0 || globalValue(afterCollection,
+        "resurrect").elements[0].integer != 77) return 35
+    // A collection may discard unreachable nodes, but a snapshot keeps its
+    // own complete graph and restores those IDs and aliases afterwards.
+    val garbage: array<BootstrapEvalValue> = []
+    for (index in 0 until 4100) garbage.append(bootstrapEvalArray([bootstrapEvalInteger(index)]))
+    if (!bootstrapCompileGlobalsKeep(["garbage"], [bootstrapEvalArray(garbage)], [], [])) return 19
+    val large = bootstrapSnapshotCompileGlobals()
+    val filesBefore = bootstrapGlobalNodeDirectory().entries().size
+    bootstrapGlobalNodeCollectionSpan = 1
+    if (!bootstrapCompileGlobalsKeep(["garbage"], [bootstrapEvalArray([])], [], [])) return 20
+    if (bootstrapGlobalNodeDirectory().entries().size >= filesBefore - 4090) return 21
+    bootstrapRestoreCompileGlobals(large)
+    val recovered = fresh([])
+    if (globalValue(recovered, "garbage").elements.size != 4100 ||
+        globalValue(recovered, "ordinary") != globalValue(recovered, "compile")) return 22
+    bootstrapForgetCompileGlobals()
+    val same = bootstrapEvalArray([bootstrapEvalInteger(42)])
+    if (!bootstrapCompileGlobalsKeep(["a", "b"], [same, same], [], [])) return 23
+    val firstBytes = bootstrapSnapshotCompileGlobals()
+    bootstrapForgetCompileGlobals()
+    // Distinct allocation addresses and hash buckets must not change the IDs
+    // or any file bytes produced for the same root and child order.
+    val again = bootstrapEvalArray([bootstrapEvalInteger(42)])
+    if (!bootstrapCompileGlobalsKeep(["a", "b"], [again, again], [], [])) return 24
+    val secondBytes = bootstrapSnapshotCompileGlobals()
+    if (firstBytes.size != secondBytes.size) return 25
+    for (index in 0 until firstBytes.size) if (firstBytes[index] != secondBytes[index]) return 26
+    bootstrapForgetCompileGlobals()
+    println("global graph codec: versions, missing owners, aliases, unsupported roots and snapshots")
+    0
+}

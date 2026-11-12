@@ -1,3 +1,5 @@
+import "ct_global_graph.ab"
+import "ct_identity.ab"
 // Lifting: a value computed during compilation becomes part of the program.
 //
 // A `#expression` result is rebuilt by instructions at the place it is used,
@@ -583,7 +585,7 @@ fun bootstrapLiftCodecBindings(
         if (seen[index] == value) return copies[index]
         index = index + 1
     }
-    val positional = value.kind == "closure" && value.text == "positional"
+    val positional = bootstrapEvalClosurePositional(value)
     var layoutIndex = -1
     if (positional) {
         if (value.integer < 0 || value.integer >= state.syntax.size) return bootstrapLiftRetypeFail(
@@ -601,7 +603,9 @@ fun bootstrapLiftCodecBindings(
             )
     }
     val copy = BootstrapEvalValue(
-        value.kind, value.integer, value.boolean, if (positional) "" else value.text,
+        value.kind, value.integer, value.boolean,
+        if (positional) "epoch:${if (bootstrapEvalClosureEpoch(value) >= 0) bootstrapEvalClosureEpoch(value) else bootstrapCompileDeclarationEpoch}" else value
+        .text,
         [], value.owner,
         if (positional) state.layouts[layoutIndex].captureNames else value.fieldNames
     )
@@ -654,6 +658,11 @@ fun bootstrapLiftEmitClosure(
             "a compile-time closure of type `${bootstrapLiftTypeText(type)}` lost its lambda"
         )
     }
+    val epoch = bootstrapEvalClosureEpoch(value)
+    if (epoch >= 0 && epoch != bootstrapCompileDeclarationEpoch) {
+        return bootstrapLiftFail(lowerer, state,
+            "this kept closure predates a later compile-time transform; its original captured layout is no longer known, so it cannot become a run-time value")
+    }
     val lambda = state.syntax[value.integer]
     val layoutIndex = bootstrapLiftLambdaLayoutOf(lowerer, state, lambda)
     if (layoutIndex < 0) {
@@ -665,7 +674,7 @@ fun bootstrapLiftEmitClosure(
     val layout = state.layouts[layoutIndex]
     // A closure from native code lists its captures in lowering's order,
     // still untyped.
-    val positional = value.text == "positional"
+    val positional = bootstrapEvalClosurePositional(value)
     if (positional && value.elements.size != layout.captureNames.size) {
         return bootstrapLiftFail(
             lowerer, state,
@@ -937,7 +946,9 @@ class BootstrapLiftEncoder(
     val syntax: array<BootstrapExpression>,
     val parts: array<string>,
     val opened: array<BootstrapEvalValue>,
-    var problem: string
+    var problem: string,
+    val keepLambdaSyntax: bool = false,
+    val openedIndices: BootstrapIdentityMap = BootstrapIdentityMap()
 )
 
 fun bootstrapLiftToken(text: string): string = "${text.size}:$text"
@@ -1059,16 +1070,37 @@ fun bootstrapLiftEncodeOpen(
     var encoder: BootstrapLiftEncoder,
     value: BootstrapEvalValue
 ): bool {
-    var index = 0
-    while (index < encoder.opened.size) {
-        if (encoder.opened[index] == value) {
-            encoder.parts.append("r$index;")
-            return false
-        }
-        index = index + 1
+    val previous = encoder.openedIndices.get(value)
+    if (previous != null) {
+        encoder.parts.append("r$previous;")
+        return false
     }
+    encoder.openedIndices.set(value, encoder.opened.size)
     encoder.opened.append(value)
     true
+}
+
+fun bootstrapLiftSameSyntax(left: BootstrapExpression, right: BootstrapExpression): bool {
+    if (left.kind != right.kind || left.text != right.text || left.begin != right.begin ||
+        left.end != right.end || left.children.size != right.children.size) return false
+    var index = 0
+    while (index < left.children.size) {
+        if (!bootstrapLiftSameSyntax(left.children[index], right.children[index])) return false
+        index += 1
+    }
+    true
+}
+
+// Journal-restored lambdas may belong to a declaration removed by an edit.
+fun bootstrapLiftEncodedLambdaSource(encoder: BootstrapLiftEncoder,
+    lambda: BootstrapExpression): string {
+    val source = bootstrapLiftLambdaSource(encoder.declarations, lambda)
+    if (source != "") return source
+    for (metadata in encoder.syntax) {
+        if (metadata.kind == "global.journal.lambda" && metadata.children.size == 1 &&
+            metadata.children[0] == lambda) return metadata.text
+    }
+    ""
 }
 
 fun bootstrapLiftEncodeValue(
@@ -1145,10 +1177,14 @@ fun bootstrapLiftEncodeValue(
                 return
             }
             val lambda = encoder.syntax[value.integer]
-            val source = bootstrapLiftLambdaSource(encoder.declarations, lambda)
-            encoder.parts.append(
-                "L${bootstrapLiftToken(source)}${lambda.begin};${lambda.end};${value.fieldNames.size};"
-            )
+            val source = bootstrapLiftEncodedLambdaSource(encoder, lambda)
+            // A codec value may survive a later edit even when its declaration
+            // matches now. Always retain syntax and creation provenance.
+            val tree = bootstrapLiftEncode(bootstrapGlobalSyntaxValue(lambda), [], []).bytes
+            val text = if (value.text ==
+                "") "epoch:$bootstrapCompileDeclarationEpoch" else value.text
+            encoder.parts
+                .append("J${bootstrapLiftToken(source)}${bootstrapLiftToken(value.owner)}${bootstrapLiftToken(text)}${if (value.boolean) 1 else 0}${bootstrapLiftToken(tree)}${value.fieldNames.size};")
             var capture = 0
             while (capture < value.fieldNames.size) {
                 encoder.parts.append(bootstrapLiftToken(value.fieldNames[capture]))
@@ -1299,6 +1335,7 @@ fun bootstrapLiftDecodeValue(var decoder: BootstrapLiftDecoder): BootstrapEvalVa
         return delegate
     }
     if (tag == 76) return bootstrapLiftDecodeClosure(decoder)
+    if (tag == 74) return bootstrapLiftDecodeSavedClosure(decoder)
     decoder.fail("unknown tag $tag")
 }
 
@@ -1387,26 +1424,41 @@ fun bootstrapLiftFindDeclaredLambda(
     null
 }
 
-fun bootstrapLiftDecodeClosure(var decoder: BootstrapLiftDecoder): BootstrapEvalValue {
+// Legacy anchor-only closures cannot prove their original body/layout after
+// an edit. Current encoders always write self-contained J records instead.
+fun bootstrapLiftDecodeClosure(var decoder: BootstrapLiftDecoder): BootstrapEvalValue =
+    decoder.fail("legacy closure encoding has no saved lambda or captured-layout provenance")
+
+// Journal closures retain the body that created them, even after an edit at
+// the same source/span. Reuse an identical parsed AST for normal lifting names.
+fun bootstrapLiftDecodeSavedClosure(var decoder: BootstrapLiftDecoder): BootstrapEvalValue {
     val source = decoder.token()
-    val begin = decoder.number(59)
-    val end = decoder.number(59)
-    val found = bootstrapLiftFindDeclaredLambda(
-        decoder.declarations, source, begin, end
-    )
-    var family = "fn"
-    if (found != null) {
-        decoder.syntax.append(found)
-        if (found.kind == "lambda.move") family = "once"
-    } else return decoder.fail("no lambda at $source:$begin:$end")
-    val closure = decoder.open(bootstrapEvalClosure(
-        decoder.syntax.size - 1, family, [], []
-    ))
+    val family = decoder.token()
+    val text = decoder.token()
+    val bit = if (decoder.at < decoder.bytes.size) decoder.bytes[decoder.at] else 0
+    decoder.at += 1
+    if (bit != 48 && bit != 49) return decoder.fail("invalid saved closure flag")
+    val tree = bootstrapLiftDecode(decoder.token(), [], [])
+    if (tree.problem != "") return decoder.fail(tree.problem)
+    val saved = bootstrapGlobalSyntaxRead(tree.value)
+    if (saved.kind != "lambda" && saved.kind != "lambda.move" &&
+        saved.kind != "lambda.generator") return decoder.fail("invalid saved lambda")
+    val declared = bootstrapLiftFindDeclaredLambda(decoder.declarations, source,
+        saved.begin, saved.end)
+    val lambda = if (declared != null && bootstrapLiftSameSyntax(declared, saved)) declared
+        else saved
+    val index = decoder.syntax.size
+    decoder.syntax.append(lambda)
+    decoder.syntax.append(BootstrapExpression("global.journal.lambda", source,
+        lambda.begin, lambda.end, [lambda]))
+    val closure = decoder.open(BootstrapEvalValue("closure", index, bit == 49,
+        text, [], family, []))
     var count = decoder.number(59)
+    if (count < 0) return decoder.fail("invalid saved closure captures")
     while (decoder.problem == "" && count > 0) {
         closure.fieldNames.append(decoder.token())
         closure.elements.append(bootstrapLiftDecodeValue(decoder))
-        count = count - 1
+        count -= 1
     }
     closure
 }
@@ -1448,7 +1500,8 @@ class BootstrapCtEncoder(
 class BootstrapCtFunctionTable(
     val ids: array<int>,
     val names: array<string>,
-    val sources: array<string>
+    val sources: array<string>,
+    val epoch: int = bootstrapCompileDeclarationEpoch
 )
 
 fun bootstrapCtNoFunctions(): BootstrapCtFunctionTable =
@@ -1775,7 +1828,7 @@ fun bootstrapLiftRawValue(var reader: BootstrapLiftRawReader): BootstrapEvalValu
         }
         if (name == "") return reader.fail("unknown function id $id")
         val function = BootstrapEvalValue(
-            "raw.function", reader.opened.size, false, name, [], source, []
+            "raw.function", reader.functions.epoch, false, name, [], source, []
         )
         if (count > 0) reader.open(function)
         var remaining = count
@@ -2111,6 +2164,9 @@ fun bootstrapLiftRetypeFunction(
         }
         return bootstrapLiftRetypeRemember(retyper, raw, bootstrapEvalFunction(name))
     }
+    if (raw.integer != bootstrapCompileDeclarationEpoch)
+        return bootstrapLiftRetypeFail(retyper,
+            "this native closure predates a later compile-time transform; its original captured layout is no longer known")
     // The span is the owner's (the name ends with it), else the file's.
     val owner = if (span[2] < raw.text.size) bootstrapLiftLambdaOwnerNamed(
         retyper.declarations, raw.owner, raw.text.slice(span[2], raw.text.size)
@@ -2128,7 +2184,7 @@ fun bootstrapLiftRetypeFunction(
     }
     // Captures stay raw, in lowering's order, until the lift knows their types.
     val closure = bootstrapLiftRetypeRemember(retyper, raw, BootstrapEvalValue(
-        "closure", retyper.syntax.size - 1, family == "once", "positional",
+        "closure", retyper.syntax.size - 1, family == "once", "positional:${raw.integer}",
         [], family, []
     ))
     for (capture in raw.elements) closure.elements.append(capture)

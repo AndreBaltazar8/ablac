@@ -2799,3 +2799,32 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   none of the three, and an edit to an `@server` signature invalidates (1) and (2) only. A catch:
   the write grant makes the whole build uncacheable, so (1) must be split into "read and compare"
   (cacheable) and "write" (only on a changed text, which is the invalidating case anyway).
+
+- Kept closures retain their original body for later interpreted calls, but cannot yet be lifted to run time after a later compile-time transform. Preserve the original typed owner/capture layout before admitting this case; identical lambda text alone is insufficient when an enclosing binding changes type. (#803)
+
+- #796 also covers kept callable compile globals across a lowering edit: `tests/cases/compile-global-graph/round-retry.ab` gives `11,12` under interp but `12,12` under jit/auto because native complex-global hydration replays the initializer. Extend the retry control to all tiers after fixing exchange/fallback; #803 deliberately changes no native getters/setters.
+
+### #803 kept-global graph cost (2026-11-12)
+
+Synthetic graph: N ordinary roots each hold an array sharing a two-element
+array, plus one scalar field. Timings below are total keep + restore milliseconds
+per site, with initial seeding excluded. The one-root cases use the first root
+(the old codec's best case), 200 sites; all-root changes use 10 sites. The batch
+prototype restores/re-encodes the whole graph. The node store materializes only
+reached nodes, keeps stable IDs, and writes no files for unchanged keeps.
+
+| Roots | Site work | Old root codec | Batch prototype | Node store |
+| ---: | --- | ---: | ---: | ---: |
+| 128 | read one root | 0.033 | 2.1 | 0.046 |
+| 512 | read one root | 0.033 | 13.8 | 0.046 |
+| 2048 | read one root | 0.034 | 143.1 | 0.046 |
+| 128 | change one root | 0.034 | 2.3 | 0.068 |
+| 512 | change one root | 0.031 | 13.9 | 0.076 |
+| 2048 | change one root | 0.033 | 142.1 | 0.083 |
+| 128 | change every root | 49.7 | 2.5 | 6.3 |
+| 512 | change every root | 790.0 | 17.5 | 29.3 |
+| 2048 | change every root | 13130.7 | 200.3 | 122.2 |
+
+These are local Linux measurements, not NovaKind timings. Single-root reads
+stay below twice the old best-case cost and constant in unrelated roots;
+whole-graph work grows linearly. There is no persistent bundle cache.

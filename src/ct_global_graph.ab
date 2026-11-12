@@ -1,0 +1,138 @@
+// Kept globals form one identity-preserving graph, loaded lazily by root.
+import "eval.ab"
+import "parser.ab"
+import "sema.ab"
+import "ct_lift.ab"
+import "ct_global_nodes.ab"
+import "abla/sys/linux/fs"
+
+fun bootstrapGlobalGraphIndex(keys: array<string>, key: string): int {
+    var index = 0
+    while (index < keys.size) {
+        if (keys[index] == key) return index
+        index += 1
+    }
+    -1
+}
+
+// Closure syntax is metadata, not another independently encoded value root.
+// Keep it so an unrelated root remains readable when a previous lambda's owner
+// is absent from the current parsed declarations (for example after an edit).
+fun bootstrapGlobalSyntaxValue(expression: BootstrapExpression): BootstrapEvalValue {
+    val children: array<BootstrapEvalValue> = []
+    for (child in expression.children) children.append(bootstrapGlobalSyntaxValue(child))
+    bootstrapEvalArray([bootstrapEvalString(expression.kind), bootstrapEvalString(expression.text),
+        bootstrapEvalInteger(expression.begin), bootstrapEvalInteger(expression.end),
+        bootstrapEvalArray(children)])
+}
+fun bootstrapGlobalSyntaxRead(value: BootstrapEvalValue): BootstrapExpression {
+    if (value.kind != "array" || value.elements.size != 5 ||
+        value.elements[0].kind != "string" || value.elements[1].kind != "string" ||
+        value.elements[2].kind != "integer" || value.elements[3].kind != "integer" ||
+        value.elements[4].kind != "array") return BootstrapExpression(
+            "global.journal.invalid", "", 0, 0, [])
+    val children: array<BootstrapExpression> = []
+    for (child in value.elements[4].elements) {
+        val decoded = bootstrapGlobalSyntaxRead(child)
+        if (decoded.kind == "global.journal.invalid") return decoded
+        children.append(decoded)
+    }
+    BootstrapExpression(value.elements[0].text, value.elements[1].text,
+        value.elements[2].integer, value.elements[3].integer, children)
+}
+
+fun bootstrapForgetCompileGlobals(): void {
+    bootstrapGlobalJournalGeneration += 1
+    for (file in bootstrapGlobalRootDirectory().entries()) file.remove()
+    for (file in bootstrapGlobalNodeDirectory().entries()) file.remove()
+    bootstrapGlobalRootDirectory().remove()
+    bootstrapGlobalNodeDirectory().remove()
+    Path(bootstrapCompileGlobalRoot()).remove()
+    bootstrapGlobalNodeNext = 1
+    bootstrapGlobalNodeCollected = 1
+    bootstrapGlobalNodeCollectionSpan = 4096
+    bootstrapCompileGlobalCount = 0
+    bootstrapSemanticUnit()
+}
+fun bootstrapCompileGlobalLoad(key: string, declarations: array<BootstrapDeclaration>,
+    syntax: array<BootstrapExpression>): BootstrapEvalValue {
+    val memo = BootstrapGlobalNodeMemo()
+    val decoder = BootstrapLiftDecoder("", 0, declarations, syntax, [], "")
+    bootstrapGlobalNodeLoad(key, declarations, decoder.syntax, memo)
+}
+fun bootstrapCompileGlobalsKeep(keys: array<string>, values: array<BootstrapEvalValue>,
+    syntax: array<BootstrapExpression>, declarations: array<BootstrapDeclaration>): bool {
+    val memo = BootstrapGlobalNodeMemo()
+    bootstrapGlobalNodeKeep(keys, values, syntax, declarations, memo)
+}
+
+// Snapshots are opaque path/byte pairs. They include all graph nodes, keeping
+// retry restore independent of ID assignment and node garbage collection.
+fun bootstrapSnapshotCompileGlobals(): array<string> {
+    val snapshot: array<string> = ["nodes-1", "$bootstrapGlobalNodeNext"]
+    val paths: array<string> = []
+    for (file in bootstrapGlobalRootDirectory().entries()) paths.append("roots/${file.name()}")
+    for (file in bootstrapGlobalNodeDirectory().entries()) paths.append("nodes/${file.name()}")
+    var index = 1
+    while (index < paths.size) {
+        val selected = paths[index]
+        var before = index
+        while (before > 0 && bootstrapTextBefore(selected, paths[before - 1])) {
+            paths[before] = paths[before - 1]
+            before -= 1
+        }
+        paths[before] = selected
+        index += 1
+    }
+    for (path in paths) {
+        snapshot.append(path)
+        snapshot.append(Path("${bootstrapCompileGlobalRoot()}/$path").readText())
+    }
+    snapshot
+}
+fun bootstrapRestoreCompileGlobals(snapshot: array<string>): void {
+    bootstrapForgetCompileGlobals()
+    if (snapshot.size < 2 || snapshot[0] != "nodes-1") return
+    var next = 0
+    for (byte in snapshot[1]) next = next * 10 + byte - 48
+    bootstrapGlobalNodeNext = next
+    bootstrapGlobalRootDirectory().createDirectories()
+    bootstrapGlobalNodeDirectory().createDirectories()
+    var index = 2
+    while (index + 1 < snapshot.size) {
+        if (!Path("${bootstrapCompileGlobalRoot()}/${snapshot[index]}").writeText(snapshot[index +
+            1]))
+            bootstrapStageDriverDiagnostic("error[E_EVAL_GLOBAL_GRAPH]: cannot restore compile-time globals\n")
+        index += 2
+    }
+}
+fun bootstrapRestoreEvaluatorGlobals(var evaluator: BootstrapEvaluator): bool {
+    if (evaluator.globalGraph.problem != "") return false
+    if (!bootstrapGlobalMemoValid(evaluator.globalGraph)) {
+        evaluator.recordEvaluatorDiagnostic("E_EVAL_GLOBAL_GRAPH", evaluator.globalGraph.problem)
+        evaluator.errors += 1
+        return false
+    }
+    true
+}
+fun bootstrapLoadEvaluatorGlobal(var evaluator: BootstrapEvaluator,
+    key: string): BootstrapEvalValue {
+    val result = bootstrapGlobalNodeLoad(key, evaluator.declarations, evaluator.syntax,
+        evaluator.globalGraph)
+    if (evaluator.globalGraph.problem != "") {
+        evaluator.recordEvaluatorDiagnostic("E_EVAL_GLOBAL_GRAPH", evaluator.globalGraph.problem)
+        evaluator.errors += 1
+        return BOOTSTRAP_EVAL_STOPPED
+    }
+    result
+}
+fun bootstrapKeepEvaluatorGlobals(var evaluator: BootstrapEvaluator): void {
+    if (evaluator.globalGraph.problem != "") return
+    if (!bootstrapGlobalNodeKeep(evaluator.globalKeys, evaluator.globalValues,
+        evaluator.syntax, evaluator.declarations, evaluator.globalGraph)) {
+        evaluator.recordEvaluatorDiagnostic("E_EVAL_GLOBAL_GRAPH",
+            if (evaluator.globalGraph.problem != "") evaluator.globalGraph.problem
+            else "cannot keep compile-time globals")
+        evaluator.errors += 1
+    }
+}
