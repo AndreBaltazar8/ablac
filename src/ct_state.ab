@@ -22,6 +22,7 @@
 // writes no global even when that function also reads one.
 import "parser.ab"
 import "sema.ab"
+import "call_targets.ab"
 import "abla/text"
 
 class BootstrapCtStateResult(
@@ -120,7 +121,11 @@ class BootstrapCtState(
     val scope: array<string>,
     val lambdaValues: array<array<int>>,
     // Locals bound by a delegate (`val x by D(...)`), keyed "item:name".
-    val delegatedLocals: Map<string, bool>
+    val delegatedLocals: Map<string, bool>,
+    // The type checker's resolved targets of member calls on a class receiver, and the
+    // receiver types with a single static implementation (as ct_jit.ab's reach uses them).
+    val methodTargets: BootstrapResolvedMethodTargets,
+    val concrete: Map<string, bool>
 ) {
     fun variable(name: string): array<int> =
         bootstrapCtStateCopy(this.variables.get("${this.current}:$name") ?? [])
@@ -195,6 +200,30 @@ class BootstrapCtState(
             if (declaration >= 0 && this.library[declaration]) visible.append(item)
         }
         visible
+    }
+
+    // The one item a member call resolves to by the checker's facts (a class receiver, a
+    // non-generic target present among `known`), else -1: every candidate stays.
+    fun exactTarget(expression: BootstrapExpression, known: array<int>): int {
+        val fact = this.methodTargets.find(this.itemSource[this.current], expression)
+        if (fact < 0) return -1
+        val selected = this.methodTargets.targets[fact]
+        if (selected.target < 0 || selected.identity == "") return -1
+        if (!(this.concrete.get(selected.receiver) ?? false)) return -1
+        for (item in known) {
+            if (item == selected.target) {
+                val declaration = this.itemDeclaration[item]
+                if (declaration < 0) return -1
+                val owner = this.declarations[declaration]
+                val method = this.itemMethod[item]
+                val target = if (method < 0) owner else owner.methods[method]
+                val identity = if (method < 0) bootstrapResolvedDeclarationIdentity(owner)
+                    else bootstrapResolvedDeclarationIdentity(target, owner.sourceIdentity)
+                if (target.typeParameters.size > 0 || identity != selected.identity) return -1
+                return item
+            }
+        }
+        -1
     }
 
     // The methods and extension functions of a name, from any module: a member call, an operator
@@ -439,7 +468,8 @@ class BootstrapCtState(
                     }
                 } else if (declaration.kind == "extern") {
                     if (bootstrapCtStateEditsDeclarations(declaration.name)) this.editing = true
-                } else if (declaration.kind == "fun" || declaration.kind == "compile.fun") {
+                } else if ((declaration.kind == "fun" || declaration.kind == "compile.fun") &&
+                    declaration.extensionOwner == "") {
                     // A function used as a value is called by code this analysis
                     // does not connect to it: its body is part of the pass.
                     this.reach(item)
@@ -511,7 +541,9 @@ class BootstrapCtState(
     fun evaluateMemberCall(expression: BootstrapExpression): array<int> {
         val receiver = this.evaluate(expression.children[0])
         val name = expression.text
-        val known = this.methodCandidates(name)
+        var known = this.methodCandidates(name)
+        val exact = this.exactTarget(expression, known)
+        if (exact >= 0) known = [exact]
         val spread = bootstrapCtStateCopy(receiver)
         bootstrapCtStateMerge(spread, this.elements)
         val mutator = bootstrapCtStateMutator(name)
@@ -632,7 +664,8 @@ fun bootstrapCtStateAnalyze(
     siteExpressions: array<BootstrapExpression>,
     siteSources: array<string>,
     siteNodes: array<BootstrapExpression>,
-    siteTypes: array<string>
+    siteTypes: array<string>,
+    methodTargets: BootstrapResolvedMethodTargets = bootstrapResolvedMethodTargets()
 ): BootstrapCtStateResult {
     val itemDeclaration: array<int> = []
     val itemMethod: array<int> = []
@@ -721,10 +754,18 @@ fun bootstrapCtStateAnalyze(
         globalTaint.append([])
         index = index + 1
     }
+    val concrete: Map<string, bool> = Map()
+    for (type in ["string", "i64", "bool", "f32", "f64"]) concrete.set(type, true)
+    for (declaration in declarations) {
+        if (declaration.kind == "class" && declaration.typeParameters.size == 0) {
+            concrete.set(declaration.name, true)
+        }
+    }
     val state = BootstrapCtState(
         declarations, library, itemDeclaration, itemMethod, byName, itemSource,
         itemLibrary, reachedItems, itemGlobals, itemCallees, globalTaint, Map(), returns,
-        Map(), [], writers, ordinary, component, true, false, 0, [], [], Map()
+        Map(), [], writers, ordinary, component, true, false, 0, [], [], Map(),
+        methodTargets, concrete
     )
     var passes = 0
     while (state.changed && passes < 64) {
