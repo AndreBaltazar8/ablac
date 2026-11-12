@@ -1,0 +1,197 @@
+// Compiler-owned bounded subprocess capture. Only called after process.io and
+// argument validation; the child inherits the build environment unchanged.
+import "abla/sys/linux"
+import "abla/sys/linux/io"
+import "abla/sys/linux/process"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+private noescape extern:"c" fun fork(): i32
+
+class BootstrapProcessCapture(
+    val exitCode: int,
+    val stdout: string,
+    val failure: string,
+    val bytesRead: int
+)
+
+trusted fun bootstrapProcessCapture(arguments: array<string>, maximum: int,
+    timeout: int): BootstrapProcessCapture {
+    val started = linuxMonotonicMilliseconds()
+    val executable = linuxExecutablePath(arguments[0])
+    val table = (arguments.size + 1) * 8
+    var bytes = table
+    for (argument in arguments) bytes += argument.size + 1
+    val vector = nativeByteBuffer(bytes)
+    var offset = table
+    var index = 0
+    for (argument in arguments) {
+        vector.storePointer(index * 8, vector.pointerAt(offset))
+        for (byte in argument) {
+            vector.store(offset, byte)
+            offset += 1
+        }
+        vector.store(offset, 0)
+        offset += 1
+        index += 1
+    }
+    vector.storePointer(arguments.size * 8, nativeNullPointer())
+    val pipes = nativeByteBuffer(16)
+    val first = linuxSyscall2(293, nativePointerAddress(pipes.address), 524288)
+    val second = if (first == 0)
+        linuxSyscall2(293, nativePointerAddress(pipes.pointerAt(8)), 524288) else -1
+    if (second != 0) {
+        if (first == 0) {
+            linuxSyscall1(3, (pipes.loadI64(0) & 4294967295))
+            linuxSyscall1(3, (pipes.loadI64(0) >> 32))
+        }
+        pipes.close()
+        vector.close()
+        return BootstrapProcessCapture(-1, "", "launch", 0)
+    }
+    val descriptors: array<int> = [pipes.loadI64(0) & 4294967295,
+        pipes.loadI64(0) >> 32, pipes.loadI64(8) & 4294967295, pipes.loadI64(8) >> 32]
+    // Keep pipes away from stdio even when the compiler was started with a
+    // closed standard descriptor. dup2(fd, fd) would retain CLOEXEC.
+    var descriptorIndex = 0
+    var configured = true
+    while (configured && descriptorIndex < descriptors.size) {
+        if (descriptors[descriptorIndex] < 3) {
+            val duplicate = linuxSyscall3(72, descriptors[descriptorIndex], 0, 3)
+            if (duplicate < 0) configured = false
+            else {
+                linuxSyscall1(3, descriptors[descriptorIndex])
+                descriptors[descriptorIndex] = duplicate
+                if (linuxSyscall3(72, duplicate, 2, 1) < 0) configured = false
+            }
+        }
+        descriptorIndex += 1
+    }
+    if (!configured) {
+        for (descriptor in descriptors) linuxSyscall1(3, descriptor)
+        pipes.close()
+        vector.close()
+        return BootstrapProcessCapture(-1, "", "launch", 0)
+    }
+    val output = descriptors[0]
+    val writer = descriptors[1]
+    val error = descriptors[2]
+    val errorWriter = descriptors[3]
+    val setup = nativeByteBuffer(8)
+    setup.storeI64(0, 0)
+    val process = int(fork())
+    if (process == 0) {
+        linuxSyscall1(3, output)
+        linuxSyscall1(3, error)
+        var ready = linuxSyscall2(109, 0, 0) == 0
+        // Restore an empty signal mask before exec; do not change environment.
+        if (linuxSyscall4(14, 2, nativePointerAddress(setup.address), 0, 8) < 0) ready = false
+        val input = linuxOpen("/dev/null").descriptor
+        if (input < 0) ready = false
+        if (ready && linuxSyscall2(33, input, 0) < 0) ready = false
+        if (ready && linuxSyscall2(33, writer, 1) < 0) ready = false
+        if (input > 2) linuxSyscall1(3, input)
+        if (writer > 2) linuxSyscall1(3, writer)
+        if (ready) {
+            linuxSyscall3(59, nativeCStringAddress(executable),
+                nativePointerAddress(vector.address),
+                nativePointerAddress(linuxEnvironmentPointer()))
+        }
+        // CLOEXEC closes this pipe on success, distinguishing exec failure from
+        // a successfully launched program which itself exits with status 127.
+        setup.storeI64(0, 1)
+        linuxSyscall3(1, errorWriter, nativePointerAddress(setup.address), 8)
+        linuxSyscall1(60, 127)
+    }
+    vector.close()
+    pipes.close()
+    linuxSyscall1(3, writer)
+    linuxSyscall1(3, errorWriter)
+    if (process < 0) {
+        linuxSyscall1(3, output)
+        linuxSyscall1(3, error)
+        setup.close()
+        return BootstrapProcessCapture(-1, "", "launch", 0)
+    }
+    // Also establish the group in the parent, closing the fork/setup race.
+    linuxSyscall2(109, process, process)
+    var failure = ""
+    if (linuxSyscall3(72, output, 4, 2048) < 0 ||
+        linuxSyscall3(72, error, 4, 2048) < 0) failure = "launch"
+    val buffer = nativeByteBuffer(maximum + 1)
+    val polling = nativeByteBuffer(16)
+    polling.storeI64(0, output | (1 << 32))
+    polling.storeI64(8, error | (1 << 32))
+    var measured = 0
+    var ended = false
+    var reaped = false
+    var status = -1
+    while (failure == "" && (!ended || !reaped)) {
+        if (linuxMonotonicMilliseconds() - started >= timeout) {
+            failure = "timeout"
+        } else {
+            if (!ended) {
+                val amount = linuxSyscall3(0, output,
+                    nativePointerAddress(buffer.pointerAt(measured)), maximum + 1 - measured)
+                if (amount > 0) {
+                    measured += amount
+                    if (measured > maximum) failure = "output-limit"
+                } else if (amount == 0) {
+                    ended = true
+                    polling.storeI64(0, -1)
+                }
+                else if (amount != -11 && amount != -4) failure = "read"
+            }
+            val launch = linuxSyscall3(0, error, nativePointerAddress(setup.address), 8)
+            if (launch > 0) failure = "launch"
+            else if (launch == 0) polling.storeI64(8, -1)
+            else if (launch < 0 && launch != -11 && launch != -4) failure = "read"
+            if (!reaped) {
+                val waited = linuxSyscall4(61, process, nativePointerAddress(setup.address), 1, 0)
+                if (waited == process) {
+                    val encoded = setup.loadI64(0)
+                    val signal = encoded & 127
+                    status = if (signal == 0) (encoded >> 8) & 255 else 128 + signal
+                    reaped = true
+                    if (signal != 0 && failure == "") failure = "signal"
+                } else if (waited < 0 && waited != -4) failure = "wait"
+            }
+            if (failure == "" && (!ended || !reaped)) {
+                val remaining = timeout - (linuxMonotonicMilliseconds() - started)
+                if (remaining > 0) {
+                    val polled = linuxSyscall3(7, nativePointerAddress(polling.address),
+                        2, if (remaining < 10) remaining else 10)
+                    if (polled < 0 && polled != -4) failure = "read"
+                }
+            }
+        }
+    }
+    // A failed setup can close stdout before writing its launch status. Check
+    // again after observing exit so that race cannot look like a normal 127.
+    val launch = if (failure == "")
+        linuxSyscall3(0, error, nativePointerAddress(setup.address), 8) else 0
+    if (failure == "" && launch > 0) failure = "launch"
+    if (failure != "") {
+        // Kill even when the leader was already reaped: a descendant may still
+        // hold stdout open. SIGKILL leaves no grace period outside the deadline.
+        linuxSyscall2(62, 0 - process, 9)
+        if (!reaped) {
+            var waited = -4
+            while (waited == -4) {
+                waited = linuxSyscall4(61, process, nativePointerAddress(setup.address), 0, 0)
+            }
+            if (waited == process) {
+                val encoded = setup.loadI64(0)
+                val signal = encoded & 127
+                status = if (signal == 0) (encoded >> 8) & 255 else 128 + signal
+            }
+        }
+    }
+    linuxSyscall1(3, output)
+    linuxSyscall1(3, error)
+    setup.close()
+    polling.close()
+    val text = if (failure == "") buffer.adoptString(measured) else ""
+    buffer.close()
+    BootstrapProcessCapture(status, text, failure, measured)
+}

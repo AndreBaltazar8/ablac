@@ -668,6 +668,34 @@ deliberately opts out of hermetic caching. They require `clock`, `random`, and
 `process.io` respectively; process argument count and size are evaluator
 bounded, while the compiler watchdog bounds time and memory.
 
+`compilerCaptureProcess(arguments, maxStdoutBytes = 1048576,
+timeoutMilliseconds = 10000)` runs an argument vector and captures stdout.
+It requires `process.io` in both the manifest and the source grant, checked
+before starting the child. It inherits the build's environment unchanged,
+working directory and stderr; stdin is closed through `/dev/null`. No shell
+is inserted. Executables without a slash are resolved through the build's
+`PATH`. The existing `compilerRunProcess` still returns only an exit code.
+
+The byte cap must be 1 through 1 MiB and the timeout 1 through 10,000 ms;
+the existing maximum of 128 arguments, each at most 4096 bytes, also applies.
+Embedded NUL bytes in arguments are rejected. `CompilerProcessResult` contains
+`exitCode`, byte-preserving `stdout`, `failure`, and `bytesRead`. An empty
+`failure` means the process exited normally, including a nonzero exit code.
+Failures are `launch`, `timeout`, `output-limit`, `signal`, `read` or `wait`;
+failed captures return empty stdout. On `output-limit`, `bytesRead` is the
+requested cap plus one: at least that many bytes were produced, rather than a
+total-output measurement. A caller can report that count and ask for a larger
+cap, up to 1 MiB. A timeout or overflow kills the child process group and
+reaps the direct child, including when a descendant holds stdout open after
+the direct child exits. The deadline covers launch and reading as well as
+waiting for exit.
+
+Process capture is ambient and disables cache reuse just like other
+`process.io` operations. The compiler does not assume a command is
+deterministic from its arguments or output hash: its executable, environment,
+files and network may change. Cacheable deterministic subprocesses would need
+a separate contract declaring and restricting those inputs.
+
 `compilerGenerateModule(namespace, source)` submits a bounded deterministic
 virtual module. Generated declarations are parsed and validated together with
 the complete candidate; failure publishes nothing. Subparsers can instead call
