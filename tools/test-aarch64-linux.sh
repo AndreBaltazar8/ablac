@@ -46,10 +46,11 @@ for source in $programs $checks; do
 done
 if [[ $have_qemu -eq 1 ]]; then
     # A bad access in a --fast build: the fault report, then the default action (SIGSEGV).
-    "$compiler" build tests/cases/linux-syscall/fault.ab --target aarch64-linux -o "$out/fault" --fast --no-cache > /dev/null 2>&1 || fail "the fault program did not build"
+    # The debug runtime needs debug information, which the suite turns off (ABLA_DEBUG=0).
+    ABLA_DEBUG=1 "$compiler" build tests/cases/linux-syscall/fault.ab --target aarch64-linux -o "$out/fault" --fast --no-cache > /dev/null 2>&1 || fail "the fault program did not build"
     status=0
     (ulimit -c 0; timeout 300 qemu-aarch64 "$out/fault" < /dev/null > /dev/null 2> "$out/fault.err") || status=$?
-    [[ $status -eq 139 ]] && grep -q "^fatal signal" "$out/fault.err" || fail "fault report: status $status, $(cat "$out/fault.err")"
+    [[ $status -eq 139 ]] && grep -q "^fatal signal" "$out/fault.err" && grep -q "^0x" "$out/fault.err" || fail "fault report: status $status, $(cat "$out/fault.err")"
     for mode in "" --fast; do
         # shellcheck disable=SC2086
         "$compiler" build tests/cases/linux-syscall/stack-overflow.ab --target aarch64-linux -o "$out/overflow" --no-cache $mode > /dev/null 2>&1 || fail "the stack overflow program did not build"

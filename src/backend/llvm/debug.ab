@@ -1254,11 +1254,48 @@ fun bootstrapLlvmEmitFramePointerWalk(
         bootstrapLlvmByteAt(backend, iov, 32, 16), LLVMConstInt(i64, 1, 0),
         LLVMConstInt(i64, 0, 0)
     ])
+    // Without process_vm_readv (qemu-user, a seccomp filter: ENOSYS) the record is read directly,
+    // but only from the thread's own stack: between this function's frame and the recorded top.
+    val stackTop = LLVMGetNamedGlobal(backend.module, "abla_runtime_stack_top")
+    val direct = LLVMAppendBasicBlockInContext(backend.context, printStack, "direct")
+    val fallback = LLVMAppendBasicBlockInContext(backend.context, printStack, "fallback")
     LLVMBuildCondBr(
         backend.builder,
         LLVMBuildICmp(backend.builder, 32, got, LLVMConstInt(i64, 16, 0), ""),
-        take, done
+        take, fallback
     )
+    LLVMPositionBuilderAtEnd(backend.builder, fallback)
+    if (pointerIsNull(stackTop)) LLVMBuildBr(backend.builder, done)
+    else {
+        val first = LLVMBuildPtrToInt(backend.builder, frame, i64, "")
+        val top = LLVMBuildLoad2(backend.builder, i64, stackTop, "")
+        val inside = LLVMBuildAnd(
+            backend.builder,
+            LLVMBuildICmp(backend.builder, 32, got, LLVMConstInt(i64, -38, 1), ""),
+            LLVMBuildICmp(
+                backend.builder, 36, LLVMBuildSub(backend.builder, current, first, ""),
+                LLVMBuildSub(backend.builder, top, first, ""), ""
+            ),
+            ""
+        )
+        LLVMBuildCondBr(backend.builder, inside, direct, done)
+    }
+    LLVMPositionBuilderAtEnd(backend.builder, direct)
+    val savedFrame = LLVMBuildLoad2(
+        backend.builder, i64, LLVMBuildIntToPtr(backend.builder, current, backend.pointerType, ""),
+        ""
+    )
+    val savedReturn = LLVMBuildLoad2(
+        backend.builder, i64,
+        LLVMBuildIntToPtr(
+            backend.builder, LLVMBuildAdd(backend.builder, current, LLVMConstInt(i64, 8, 0), ""),
+            backend.pointerType, ""
+        ),
+        ""
+    )
+    LLVMBuildStore(backend.builder, savedFrame, record)
+    LLVMBuildStore(backend.builder, savedReturn, bootstrapLlvmByteAt(backend, record, 16, 8))
+    LLVMBuildBr(backend.builder, take)
     LLVMPositionBuilderAtEnd(backend.builder, take)
     val next = LLVMBuildLoad2(backend.builder, i64, record, "")
     val returnAddress = LLVMBuildLoad2(
