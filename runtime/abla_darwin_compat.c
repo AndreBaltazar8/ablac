@@ -913,10 +913,12 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     result = dup2((int)argument0, (int)argument1);
     break;
 #endif
+#if !ABLA_DARWIN_SYSCALLS
   case 35:
     result = nanosleep((const struct timespec *)(uintptr_t)argument0,
                        (struct timespec *)(uintptr_t)argument1);
     break;
+#endif
 #if !ABLA_DARWIN_SYSCALLS
   case 39:
     result = getpid();
@@ -1328,11 +1330,13 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     }
     break;
   }
+#if !ABLA_DARWIN_SYSCALLS
   case 278:
   case 318:
     arc4random_buf((void *)(uintptr_t)argument0, (size_t)argument1);
     result = argument1;
     break;
+#endif
   default:
     errno = ENOSYS;
     break;
