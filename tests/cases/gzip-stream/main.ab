@@ -1,0 +1,122 @@
+import "abla/compression/gzip"
+import "abla/bytes"
+import "abla/fs"
+import "abla/process/arguments"
+import "abla/sys/linux"
+
+resource class Source(val data: string, val piece: int, val finalWithData: bool, var pos: int = 0,
+    var fault: bool = false, var stall: bool = false, var oversized: bool = false,
+    var failAt: int = -1): GzipSource {
+    fun readChunk(request: int): GzipInputChunk {
+        if (this.fault || (this.failAt >= 0 && this.pos >= this.failAt)) return GzipInputChunk("",
+            false, "io")
+        if (this.stall) return GzipInputChunk("", false)
+        if (this.oversized) return GzipInputChunk("xx", false)
+        val available = this.data.size - this.pos
+        var size = if (available < this.piece) available else this.piece
+        if (size > request) size = request
+        val text = this.data.slice(this.pos, this.pos + size)
+        this.pos += size
+        GzipInputChunk(text, this.pos == this.data.size && (this.finalWithData || size == 0))
+    }
+}
+
+fun check(packed: string, raw: string, inputPiece: int, outputPiece: int,
+    maxInput: int, maxOutput: int, expected: string, finalWithData: bool): int {
+    val source = Source(packed, inputPiece, finalWithData)
+    val stream = gzipStream(source, maxInput, maxOutput)
+    val output = byteBuffer()
+    var rounds = 0
+    while (rounds <= raw.size + packed.size + 100) {
+        val chunk = stream.read(source, outputPiece)
+        if (chunk.error != "") {
+            if (chunk.error != expected) {
+                linuxWriteStandardError("unexpected error: ${chunk.error}; expected $expected\n")
+                return 1
+            }
+            return 0
+        }
+        if (chunk.data.size > outputPiece || chunk.data.size > 65536) return 2
+        output.appendText(chunk.data)
+        if (chunk.done) {
+            if (expected != "" || output.toText() != raw) return 3
+            val again = stream.read(source, outputPiece)
+            if (!again.done || again.data != "" || again.error != "") return 4
+            return 0
+        }
+        if (chunk.data.size == 0) return 5
+        rounds += 1
+    }
+    6
+}
+
+fun main(): int {
+    val raw = Path(processArgument(0)).readText()
+    val packed = Path(processArgument(1)).readText()
+    if (processArgumentCount() > 2 && processArgument(2) == "truncations") {
+        var end = 0
+        while (end < packed.size) {
+            if (check(packed.slice(0, end), raw, 1, 17, end, raw.size, "invalid",
+                false) != 0) return 16
+            end += 1
+        }
+        return 0
+    }
+    if (processArgumentCount() > 2 && processArgument(2) == "long") {
+        if (check(packed, raw, 13, 7, packed.size, raw.size, "", false) != 0) return 17
+        if (check(packed, raw, 13, 100000, packed.size, raw.size, "", false) != 0) return 18
+        return 0
+    }
+    if (processArgumentCount() > 2 && processArgument(2) == "invalid") {
+        if (check(packed, raw, 1, 17, packed.size, raw.size, "invalid", false) != 0) return 12
+        return 0
+    }
+    for (inputPiece in [1, 2, 3, 7, 31, 512, 65536]) {
+        for (outputPiece in [1, 7, 258, 4096, 65536]) {
+            if (check(packed, raw, inputPiece, outputPiece, packed.size, raw.size, "",
+                false) != 0) return 1
+            if (check(packed, raw, inputPiece, outputPiece, packed.size, raw.size, "",
+                true) != 0) return 2
+        }
+    }
+    if (check(packed, raw, 7, 17, packed.size - 1, raw.size, "limit", false) != 0) return 3
+    if (raw.size > 0 && check(packed, raw, 7, 17, packed.size, raw.size - 1, "limit",
+        false) != 0) return 4
+    if (check(packed + "x", raw, 7, 17, packed.size + 1, raw.size, "invalid", false) != 0) return 5
+    if (check(packed + packed, raw, 7, 17, packed.size * 2, raw.size, "invalid",
+        false) != 0) return 6
+    if (check(packed.slice(0, packed.size - 1), raw, 1, 17, packed.size, raw.size, "invalid",
+        false) != 0) return 7
+    val broken = packed.slice(0,
+        packed.size - 8) + byteEncode(packed[packed.size - 8] ^ 1) + packed.slice(packed.size - 7,
+            packed.size)
+    if (check(broken, raw, 3, 17, broken.size, raw.size, "invalid", false) != 0) return 8
+    val source = Source(packed, 1, false, 0, true)
+    val stream = gzipStream(source, packed.size, raw.size)
+    if (stream.read(source, 1).error != "source") return 9
+    val zeroSource = Source(packed, 7, false)
+    val zeroStream = gzipStream(zeroSource, packed.size, raw.size)
+    if (zeroStream.read(zeroSource, 0).error != "invalid") return 19
+    val stalled = Source(packed, 1, false, 0, false, true)
+    val stalledStream = gzipStream(stalled, packed.size, raw.size)
+    if (stalledStream.read(stalled, 1).error != "source") return 10
+    val over = Source(packed, 1, false, 0, false, false, true)
+    val overStream = gzipStream(over, 1, raw.size)
+    if (overStream.read(over, 1).error != "source") return 11
+    if (raw.size > 0) {
+        val late = Source(packed, 1, false, failAt = packed.size - 8)
+        val lateStream = gzipStream(late, packed.size, raw.size)
+        var sawData = false
+        var stopped = false
+        while (!stopped) {
+            val part = lateStream.read(late, 17)
+            if (part.data != "") sawData = true
+            if (part.error != "") {
+                if (part.error != "source" || !sawData) return 13
+                if (lateStream.read(late, 1).error != "source") return 14
+                stopped = true
+            } else if (part.done) return 15
+        }
+    }
+    0
+}

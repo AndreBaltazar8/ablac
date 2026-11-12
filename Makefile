@@ -163,6 +163,8 @@ test-serial: ablac
 	tools/test-json-limits.sh $(COMPILER)
 	tools/test-yaml.sh $(COMPILER)
 	tools/test-gzip-inflate.sh $(COMPILER)
+	tools/test-gzip-stream.sh $(COMPILER)
+	tools/test-gzip-parity.sh $(COMPILER)
 	tools/test-tar-reader.sh $(COMPILER)
 	tools/test-deep-json.sh $(COMPILER)
 	tools/test-json-expressions.sh $(COMPILER)

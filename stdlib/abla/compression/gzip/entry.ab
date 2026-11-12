@@ -443,3 +443,406 @@ fun gzipDecompress(input: string, maxOutputBytes: int): GzipDecompressResult {
         gzipLittle(input, reader.pos + 4) != (data.size & 4294967295)) return gzipInvalid()
     GzipDecompressResult(data, "")
 }
+
+// A source may return data and EOF together. Empty data without EOF is an error;
+// an error from the source is reported as "source" by the decoder.
+class GzipInputChunk(val data: string, val eof: bool, val error: string = "")
+class GzipStreamChunk(val data: string, val done: bool, val error: string)
+
+resource interface GzipSource {
+    fun readChunk(maxBytes: int): GzipInputChunk
+}
+
+private class StreamInflateReader(
+    val maxInputBytes: int,
+    var input: string = "",
+    var pos: int = 0,
+    var total: int = 0,
+    var eof: bool = false,
+    var bits: int = 0,
+    var count: int = 0,
+    var failed: bool = false,
+    var error: string = ""
+)
+
+// -1 is clean EOF; errors are recorded separately.
+private fun StreamInflateReader.byte(var source: GzipSource): int {
+    if (this.failed) return -1
+    if (this.pos == this.input.size) {
+        if (this.eof) return -1
+        val remaining = this.maxInputBytes - this.total
+        val requested = if (remaining <= 0) 1 else if (remaining < 65536) remaining else 65536
+        val chunk = source.readChunk(requested)
+        if (chunk.error != "" || chunk.data.size > requested || (chunk.data.size == 0 &&
+            !chunk.eof)) {
+            this.failed = true
+            this.error = "source"
+            return -1
+        }
+        if (chunk.data.size > remaining) {
+            this.failed = true
+            this.error = "limit"
+            return -1
+        }
+        this.input = chunk.data
+        this.pos = 0
+        this.total += chunk.data.size
+        this.eof = chunk.eof
+        if (this.input.size == 0) return -1
+    }
+    val result = int(this.input[this.pos])
+    this.pos += 1
+    result
+}
+
+private fun StreamInflateReader.read(var source: GzipSource, count: int): int {
+    while (this.count < count) {
+        val value = this.byte(source)
+        if (value < 0) {
+            this.failed = true
+            if (this.error == "") this.error = "invalid"
+            return 0
+        }
+        this.bits = this.bits | (value << this.count)
+        this.count += 8
+    }
+    val value = this.bits & ((1 << count) - 1)
+    this.bits = this.bits >>> count
+    this.count -= count
+    value
+}
+
+private class StreamInflateTree(val counts: array<int>, val symbols: array<int>, val valid: bool)
+private fun streamInflateTree(lengths: array<int>, allowEmpty: bool,
+    allowSingle: bool): StreamInflateTree {
+    val counts = filledArray(16, 0)
+    for (length in lengths) {
+        if (length < 0 || length > 15) return StreamInflateTree([], [], false)
+        if (length > 0) counts[length] += 1
+    }
+    var left = 1
+    var bits = 1
+    while (bits <= 15) {
+        left = left * 2 - counts[bits]
+        if (left < 0) return StreamInflateTree([], [], false)
+        bits += 1
+    }
+    var used = 0
+    for (count in counts) used += count
+    if (used == 0) return StreamInflateTree(counts, [], allowEmpty)
+    if (left != 0 && !(allowSingle && used == 1 && counts[1] == 1)) return StreamInflateTree([], [],
+        false)
+    val offsets = filledArray(16, 0)
+    bits = 1
+    while (bits < 15) { offsets[bits + 1] = offsets[bits] + counts[bits]; bits += 1 }
+    val symbols = filledArray(used, 0)
+    var symbol = 0
+    while (symbol < lengths.size) {
+        val length = lengths[symbol]
+        if (length > 0) { symbols[offsets[length]] = symbol; offsets[length] += 1 }
+        symbol += 1
+    }
+    StreamInflateTree(counts, symbols, true)
+}
+
+private fun streamInflateSymbol(var reader: StreamInflateReader,
+    var source: GzipSource,
+    tree: StreamInflateTree): int {
+    var code = 0
+    var first = 0
+    var index = 0
+    var length = 1
+    while (length <= 15) {
+        code = code | reader.read(source, 1)
+        if (reader.failed) return -1
+        val count = tree.counts[length]
+        if (code >= first && code - first < count) return tree.symbols[index + code - first]
+        index += count
+        first = (first + count) << 1
+        code = code << 1
+        length += 1
+    }
+    reader.failed = true
+    -1
+}
+
+private fun streamInflateFixedLiteral(): StreamInflateTree {
+    val lengths = filledArray(288, 8)
+    var i = 144
+    while (i < 256) { lengths[i] = 9; i += 1 }
+    while (i < 280) { lengths[i] = 7; i += 1 }
+    while (i < 288) { lengths[i] = 8; i += 1 }
+    streamInflateTree(lengths, false, false)
+}
+private fun streamInflateFixedDistance(): StreamInflateTree = streamInflateTree(filledArray(32, 5),
+    false, false)
+private class StreamInflateTrees(val literal: StreamInflateTree, val distance: StreamInflateTree,
+    val valid: bool)
+private fun streamInflateDynamic(var reader: StreamInflateReader,
+    var source: GzipSource): StreamInflateTrees {
+    val empty = StreamInflateTree([], [], false)
+    val nl = reader.read(source, 5) + 257
+    val nd = reader.read(source, 5) + 1
+    val nc = reader.read(source, 4) + 4
+    if (reader.failed || nl > 286 || nd > 32) return StreamInflateTrees(empty, empty, false)
+    val order = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+    val codes = filledArray(19, 0)
+    var i = 0
+    while (i < nc) { codes[order[i]] = reader.read(source, 3); i += 1 }
+    if (reader.failed) return StreamInflateTrees(empty, empty, false)
+    val tree = streamInflateTree(codes, false, false)
+    if (!tree.valid) return StreamInflateTrees(empty, empty, false)
+    val lengths: array<int> = []
+    while (lengths.size < nl + nd && !reader.failed) {
+        val value = streamInflateSymbol(reader, source, tree)
+        if (value < 0) break
+        if (value <= 15) lengths.append(value)
+        else {
+            var repeat = 0
+            var previous = 0
+            if (value == 16) {
+                if (lengths.size == 0) return StreamInflateTrees(empty, empty, false)
+                previous = lengths[lengths.size - 1]
+                repeat = reader.read(source, 2) + 3
+            } else if (value == 17) repeat = reader.read(source, 3) + 3
+            else if (value == 18) repeat = reader.read(source, 7) + 11
+            else return StreamInflateTrees(empty, empty, false)
+            if (reader.failed || repeat > nl + nd - lengths.size) return StreamInflateTrees(empty,
+                empty,
+                false)
+            while (repeat > 0) { lengths.append(previous); repeat -= 1 }
+        }
+    }
+    if (reader.failed || lengths.size != nl + nd || lengths[256] ==
+        0) return StreamInflateTrees(empty,
+            empty, false)
+    val lit: array<int> = []
+    val dist: array<int> = []
+    i = 0
+    while (i < lengths.size) { if (i < nl) lit.append(lengths[i]) else dist.append(lengths[i]); i +=
+            1 }
+    val literal = streamInflateTree(lit, false, true)
+    val distance = streamInflateTree(dist, true, true)
+    StreamInflateTrees(literal, distance, literal.valid && distance.valid)
+}
+
+// A native byte allocation is owned by the window and released with it.
+// The evaluator uses a scalar fallback instead of unsafe-memory intrinsics.
+private class StreamInflateWindow(val storage: NativeByteBuffer?, val address: int,
+    val interpreted: array<int>)
+private trusted fun streamInflateNativeWindow(): StreamInflateWindow {
+    val buffer = nativeByteBuffer(32768)
+    ablaUnsafeSetMemory(buffer.address, 0, 32768)
+    val address = nativePointerAddress(buffer.address)
+    StreamInflateWindow(move(buffer), address, [])
+}
+private fun streamInflateWindow(): StreamInflateWindow = if (ablaAtCompileTime())
+    StreamInflateWindow(null, 0, filledArray(32768, 0)) else streamInflateNativeWindow()
+private trusted fun StreamInflateWindow.set(index: int, value: int): void {
+    if (ablaAtCompileTime()) this.interpreted[index] = value
+    else ablaUnsafeStoreU8(nativePointerFromAddress(this.address + index), value)
+    return
+}
+private trusted fun StreamInflateWindow.get(index: int): int = if (ablaAtCompileTime())
+    this.interpreted[index] else ablaUnsafeLoadU8(nativePointerFromAddress(this.address + index))
+
+// The stream owns its decoder state, and no output is final until done=true.
+// Error is "invalid", "limit", or "source". At most 65536 output bytes are
+// returned per read. Exactly one member is accepted, including its trailer.
+// Pass the same source object to the constructor and every read; the caller
+// keeps ownership of the source and its resources.
+class GzipStream(
+    val reader: StreamInflateReader,
+    val maxOutputBytes: int,
+    val window: StreamInflateWindow,
+    var total: int = 0,
+    var crc: int = 4294967295,
+    var state: int = 0,
+    var finalBlock: bool = false,
+    var remaining: int = 0,
+    var distance: int = 0,
+    var trees: StreamInflateTrees = StreamInflateTrees(StreamInflateTree([], [], false),
+        StreamInflateTree([], [], false),
+        false),
+    var error: string = ""
+)
+
+private fun gzipCrcByte(previous: int, value: int): int {
+    var crc = previous ^ value
+    var bit = 0
+    while (bit < 8) {
+        if ((crc & 1) != 0) crc = (crc >>> 1) ^ 3988292384
+        else crc = crc >>> 1
+        bit += 1
+    }
+    crc
+}
+
+// Validates the header incrementally without retaining untrusted optional fields.
+fun gzipStream(var source: GzipSource, maxInputBytes: int,
+    maxOutputBytes: int): GzipStream {
+    val reader = StreamInflateReader(maxInputBytes)
+    val stream = GzipStream(reader, maxOutputBytes, streamInflateWindow())
+    if (maxInputBytes < 0 || maxOutputBytes < 0) { stream.error = "invalid"; return stream }
+    // A gzip member needs at least ten header bytes and an eight-byte
+    // trailer. Match gzipDecompress's invalid-before-output-limit rule for
+    // shorter inputs without retaining more than one bounded input chunk.
+    val prefix = byteBuffer()
+    while (prefix.size() < 18) {
+        val value = reader.byte(source)
+        if (value < 0) {
+            stream.error = if (reader.error != "") reader.error else "invalid"
+            return stream
+        }
+        prefix.appendByteValue(value)
+    }
+    reader.input = prefix.toText() + reader.input.slice(reader.pos, reader.input.size)
+    reader.pos = 0
+    var headerCrc = 4294967295
+    var flags = 0
+    var i = 0
+    while (i < 10) {
+        val value = reader.read(source, 8)
+        if (reader.failed) { stream.error = reader.error; return stream }
+        if ((i == 0 && value != 31) || (i == 1 && value != 139) ||
+            (i == 2 && value != 8) || (i == 3 && (value & 224) != 0)) {
+            stream.error = "invalid"
+            return stream
+        }
+        if (i == 3) flags = value
+        headerCrc = gzipCrcByte(headerCrc, value)
+        i += 1
+    }
+    if ((flags & 4) != 0) {
+        val low = reader.read(source, 8)
+        val high = reader.read(source, 8)
+        if (reader.failed) { stream.error = reader.error; return stream }
+        headerCrc = gzipCrcByte(gzipCrcByte(headerCrc, low), high)
+        var extra = low + (high << 8)
+        while (extra > 0) {
+            val value = reader.read(source, 8)
+            if (reader.failed) { stream.error = reader.error; return stream }
+            headerCrc = gzipCrcByte(headerCrc, value)
+            extra -= 1
+        }
+    }
+    for (flag in [8, 16]) if ((flags & flag) != 0) {
+        var value = 1
+        while (value != 0) {
+            value = reader.read(source, 8)
+            if (reader.failed) { stream.error = reader.error; return stream }
+            headerCrc = gzipCrcByte(headerCrc, value)
+        }
+    }
+    if ((flags & 2) != 0) {
+        val expected = reader.read(source, 16)
+        if (reader.failed) { stream.error = reader.error; return stream }
+        if (expected != ((headerCrc ^ 4294967295) & 65535)) stream.error = "invalid"
+    }
+    stream
+}
+
+private fun GzipStream.emit(var output: ByteBuffer, value: int): void {
+    this.window.set(this.total & 32767, value)
+    this.total += 1
+    this.crc = gzipCrcByte(this.crc, value)
+    output.appendByteValue(value)
+    return
+}
+
+private fun GzipStream.fail(): GzipStreamChunk {
+    if (this.error == "") this.error = if (this.reader.error != "") this.reader.error else "invalid"
+    GzipStreamChunk("", false, this.error)
+}
+
+// Bytes produced before done=true are provisional: the trailer and end of
+// source may still fail validation. maxBytes must be positive.
+fun GzipStream.read(var source: GzipSource, maxBytes: int): GzipStreamChunk {
+    if (this.error != "") return GzipStreamChunk("", false, this.error)
+    if (maxBytes <= 0) return GzipStreamChunk("", false, "invalid")
+    if (this.state == 5) return GzipStreamChunk("", true, "")
+    val cap = if (maxBytes < 65536) maxBytes else 65536
+    val output = byteBuffer()
+    while (output.size() < cap) {
+        if (this.state == 0) {
+            this.finalBlock = this.reader.read(source, 1) == 1
+            val kind = this.reader.read(source, 2)
+            if (this.reader.failed || kind == 3) return this.fail()
+            if (kind == 0) {
+                this.reader.bits = 0
+                this.reader.count = 0
+                val length = this.reader.read(source, 16)
+                val inverse = this.reader.read(source, 16)
+                if (this.reader.failed || (length ^ 65535) != inverse) return this.fail()
+                if (length > this.maxOutputBytes - this.total) { this.error =
+                        "limit"; return this.fail() }
+                this.remaining = length
+                this.state = 1
+            } else {
+                this.trees = if (kind == 1) StreamInflateTrees(streamInflateFixedLiteral(),
+                    streamInflateFixedDistance(), true) else streamInflateDynamic(this.reader,
+                        source)
+                if (!this.trees.valid || this.reader.failed) return this.fail()
+                this.state = 2
+            }
+        } else if (this.state == 1) {
+            if (this.remaining == 0) this.state = if (this.finalBlock) 4 else 0
+            else {
+                val value = this.reader.read(source, 8)
+                if (this.reader.failed) return this.fail()
+                this.emit(output, value)
+                this.remaining -= 1
+            }
+        } else if (this.state == 2) {
+            val symbol = streamInflateSymbol(this.reader, source, this.trees.literal)
+            if (this.reader.failed || symbol < 0) return this.fail()
+            if (symbol < 256) {
+                if (this.total >= this.maxOutputBytes) { this.error = "limit"; return this.fail() }
+                this.emit(output, symbol)
+            } else if (symbol == 256) this.state = if (this.finalBlock) 4 else 0
+            else {
+                if (symbol > 285) return this.fail()
+                val index = symbol - 257
+                val length = deflateLengthBases[index] + this.reader.read(source,
+                    deflateLengthExtras[index])
+                if (this.reader.failed || this.trees.distance.symbols.size == 0) return this.fail()
+                val distanceSymbol = streamInflateSymbol(this.reader, source, this.trees.distance)
+                if (this.reader.failed || distanceSymbol < 0 || distanceSymbol >=
+                    30) return this.fail()
+                val distance = deflateDistanceBases[distanceSymbol] + this.reader.read(source,
+                    deflateDistanceExtras[distanceSymbol])
+                if (this.reader.failed || distance > this.total) return this.fail()
+                if (length > this.maxOutputBytes - this.total) { this.error =
+                        "limit"; return this.fail() }
+                this.remaining = length
+                this.distance = distance
+                this.state = 3
+            }
+        } else if (this.state == 3) {
+            if (this.remaining == 0) this.state = 2
+            else {
+                val value = this.window.get((this.total - this.distance) & 32767)
+                this.emit(output, value)
+                this.remaining -= 1
+            }
+        } else if (this.state == 4) {
+            this.reader.bits = 0
+            this.reader.count = 0
+            var expectedCrc = 0
+            var expectedSize = 0
+            var i = 0
+            while (i < 4) { expectedCrc = expectedCrc | (this.reader.read(source,
+                8) << (8 * i)); i += 1 }
+            i = 0
+            while (i < 4) { expectedSize = expectedSize | (this.reader.read(source,
+                8) << (8 * i)); i += 1 }
+            if (this.reader.failed || expectedCrc != (this.crc ^ 4294967295) || expectedSize !=
+                (this.total & 4294967295)) return this.fail()
+            val trailing = this.reader.byte(source)
+            if (this.reader.failed || trailing >= 0) return this.fail()
+            this.state = 5
+            return GzipStreamChunk(output.toText(), true, "")
+        } else return this.fail()
+    }
+    GzipStreamChunk(output.toText(), false, "")
+}

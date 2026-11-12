@@ -1,0 +1,78 @@
+import "abla/compression/gzip"
+import "abla/bytes"
+
+class Counter(var drops: int = 0)
+resource class Token(val counter: Counter) {
+    fun drop(): void { this.counter.drops += 1; return }
+}
+resource class OwnedSource(val token: Token, val data: string, var pos: int = 0): GzipSource {
+    fun readChunk(maximum: int): GzipInputChunk {
+        val remaining = this.data.size - this.pos
+        var count = if (remaining < maximum) remaining else maximum
+        if (count > 3) count = 3
+        val data = this.data.slice(this.pos, this.pos + count)
+        this.pos += count
+        GzipInputChunk(data, this.pos == this.data.size)
+    }
+}
+fun decode(var source: GzipSource, inputSize: int, raw: string): bool {
+    val stream = gzipStream(source, inputSize, raw.size)
+    val output = byteBuffer()
+    while (true) {
+        val part = stream.read(source, 7)
+        if (part.error != "") return false
+        output.appendText(part.data)
+        if (part.done) return output.toText() == raw
+    }
+}
+fun exercise(counter: Counter): bool {
+    val raw = "owned source stays alive across reads"
+    val compressed = gzipCompress(raw)
+    val source = OwnedSource(Token(counter), compressed)
+    if (!decode(source, compressed.size, raw)) return false
+    if (counter.drops != 0) return false
+    val end = source.readChunk(1)
+    end.eof && end.data == "" && counter.drops == 0
+}
+fun partial(var source: GzipSource, inputSize: int, outputSize: int): bool {
+    val stream = gzipStream(source, inputSize, outputSize)
+    val part = stream.read(source, 1)
+    part.error == "" && !part.done && part.data.size == 1
+}
+fun exerciseAbandon(counter: Counter): bool {
+    val raw = "owned source remains alive after abandoning a stream"
+    val compressed = gzipCompress(raw)
+    val source = OwnedSource(Token(counter), compressed)
+    if (!partial(source, compressed.size, raw.size)) return false
+    if (counter.drops != 1) return false
+    source.readChunk(1)
+    counter.drops == 1
+}
+fun rejected(var source: GzipSource, inputSize: int, outputSize: int): bool {
+    val stream = gzipStream(source, inputSize, outputSize)
+    while (true) {
+        val part = stream.read(source, 7)
+        if (part.error != "") return part.error == "invalid"
+        if (part.done) return false
+    }
+}
+fun exerciseError(counter: Counter): bool {
+    val raw = "owned source remains alive after a late error"
+    val complete = gzipCompress(raw)
+    val truncated = complete.slice(0, complete.size - 1)
+    val source = OwnedSource(Token(counter), truncated)
+    if (!rejected(source, truncated.size, raw.size)) return false
+    if (counter.drops != 2) return false
+    val end = source.readChunk(1)
+    end.eof && counter.drops == 2
+}
+fun main(): int {
+    val counter = Counter()
+    if (!exercise(counter)) return 1
+    if (counter.drops != 1) return 2
+    if (!exerciseAbandon(counter)) return 3
+    if (counter.drops != 2) return 4
+    if (!exerciseError(counter)) return 5
+    if (counter.drops != 3) return 6
+    0
+}

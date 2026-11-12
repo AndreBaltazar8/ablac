@@ -353,8 +353,21 @@
   four `perf stat -e cpu_core/instructions/u` runs; both include process startup and reading input. Abla materializes
   the result in memory while gzip writes to /dev/null. Tests: `tools/test-gzip-inflate.sh`. Descriptor-relative
   no-follow and exclusive filesystem primitives are in `abla/fs/secure`, with Darwin exercised in macOS CI.
-  The native offline library caps gzip input at 128 MiB and decoded tar at 256 MiB; streaming inflate is needed
-  to lift those in-memory limits. The read-only
+  The native offline library caps gzip input at 128 MiB and decoded tar at 256 MiB. `gzipStream`
+  now supports bounded input/output chunks; streaming tar, HTTPS and installer adoption are still needed
+  to lift those in-memory limits. On the real Linux companion, three paired release runs on one P-core
+  measured a zero-initialized byte-window prototype at 42.625G user instructions / 1.942 s versus
+  44.752G / 1.958 s with an `array<u8>` window. The existing non-streaming decoder remains unchanged:
+  paired builds before/after appending the streaming decoder measured 28,749,205,319 versus
+  28,749,205,379 instructions. Two decoders are temporary; switch
+  `gzipDecompress` to collect from `gzipStream` only after the streaming decoder is within 5% of that
+  28.749G instruction baseline on the real archive, and profile its extra per-call and callback costs first.
+  A 5M-instruction-period, unthrottled profile of the resource-source stream measured 42.686G instructions.
+  Approximate self-instruction increases versus the original were 4.17G in Huffman symbol decoding,
+  3.98G in bit reads, 4.33G in output/CRC, and 1.64G in the new byte-fetch helper. The actual source
+  method ran about 469 times; the profile suggests per-bit source/reader rooting and byte-fetch calls
+  as the first speed investigation. Outer-loop chunk/state costs cannot be separated in this profile.
+  The read-only
   `abla/archive/tar` reader now checks bounded ustar files/directories, paths, checksums and file-ancestor
   conflicts; links and PAX/GNU extensions are unsupported. On the SHA-verified Linux companion (30,720,987-byte
   gzip, 72,366,080-byte tar, 18 entries), a release gzipDecompress + tarRead test took median 1.553 s and

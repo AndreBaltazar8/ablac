@@ -79,7 +79,7 @@ Built into the language rather than imported: `string`, arrays, `Map`,
 | `abla/http/async` | nonblocking HTTP(S) client driven by a poll loop |
 | `abla/http/tls` | certificate-verified HTTPS client transport |
 | `abla/http/json` | adapters between JSON values and HTTP requests/responses |
-| `abla/compression/gzip` | gzip compression and bounded single-member decompression; `gzipDecompress(input, maxOutputBytes)` returns data and an empty error on success, `limit` when output exceeds the limit, or `invalid` for malformed input (including trailing or concatenated members) |
+| `abla/compression/gzip` | gzip compression and bounded single-member decompression; `gzipDecompress(input, maxOutputBytes)` collects the result, while `gzipStream` reads bounded chunks. Both reject malformed input and concatenated members. |
 | `abla/archive/tar` | Read bounded POSIX ustar files and directories; retains archive bytes and provides offsets, rejecting traversal, duplicates, unsupported entry types and malformed archives |
 | `abla/xtensa/companion` | Installer-internal module, not a stable public API. Offline companion archive verification and descriptor-relative extraction; pinned archive, manifest and file hashes, with 128 MiB compressed and 256 MiB unpacked limits. It does not download, execute or activate tools. |
 | `abla/fs/secure` | Descriptor-relative operations with component validation, bounded handle reads and directory listings, no-follow opens and no-replace rename. `replaceSymlink` requires a trusted parent; its non-symlink destination check is not atomic against a hostile writer. |
@@ -112,6 +112,15 @@ An interrupted companion publication can leave its version directory at mode
 0700. Verification waits briefly and reports `publication_in_progress` without
 changing it. To reinstall, first ensure no installer is running, then remove
 the named version directory and rerun installation.
+
+`gzipStream(source, maxInputBytes, maxOutputBytes)` reads from a caller-owned
+`GzipSource` resource. Pass that same source to each `read(source, maxBytes)` call. Each
+returned chunk is at most 64 KiB; an empty source chunk must mark EOF or report
+an error. The decoder can read ahead, so do not consume or reposition the source
+between calls. Output is provisional until `done` is true, after the CRC, ISIZE and
+end of the single member are checked. Errors are `invalid`, `limit` or
+`source`; abandoning the stream early does not validate it. The stream owns
+its history buffer and releases it when dropped.
 
 There are no visibility modifiers, so a module's internal helpers are also
 importable. The functions named on the task pages are the supported API.

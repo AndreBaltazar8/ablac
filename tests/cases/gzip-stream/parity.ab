@@ -1,0 +1,66 @@
+import "abla/compression/gzip"
+import "abla/bytes"
+import "abla/fs"
+import "abla/process/arguments"
+import "abla/sys/linux"
+
+resource class ParitySource(val input: string, var position: int = 0): GzipSource {
+    fun readChunk(maximum: int): GzipInputChunk {
+        val remaining = this.input.size - this.position
+        val amount = if (remaining < maximum) remaining else maximum
+        val data = this.input.slice(this.position, this.position + amount)
+        this.position += amount
+        GzipInputChunk(data, this.position == this.input.size)
+    }
+}
+fun streamResult(input: string, limit: int): GzipDecompressResult {
+    val reader = ParitySource(input)
+    val stream = gzipStream(reader, input.size, limit)
+    val output = byteBuffer()
+    while (true) {
+        val chunk = stream.read(reader, 65536)
+        if (chunk.error != "") return GzipDecompressResult("", chunk.error)
+        output.appendText(chunk.data)
+        if (chunk.done) return GzipDecompressResult(output.toText(), "")
+    }
+}
+fun equal(input: string, limit: int): bool {
+    val original = gzipDecompress(input, limit)
+    val streamed = streamResult(input, limit)
+    if (original.error != streamed.error || original.data != streamed.data) {
+        linuxWriteStandardError("parity mismatch: original=${original.error}, streaming=${streamed.error}, input=${input.size}, limit=$limit\n")
+        return false
+    }
+    true
+}
+fun main(): int {
+    val raw = Path(processArgument(0)).readText()
+    val packed = Path(processArgument(1)).readText()
+    // A short, truncated member must be invalid even with a zero output limit.
+    val short = byteBuffer()
+    for (value in [31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 203, 72]) short.appendByteValue(value)
+    if (streamResult(short.toText(), 0).error != "invalid" || !equal(short.toText(), 0)) return 7
+    if (processArgumentCount() > 2 && processArgument(2) == "invalid") {
+        if (!equal(packed, 100000)) return 6
+        return 0
+    }
+    if (!equal(packed, raw.size) || !equal(packed, -1) || !equal("", 0)) return 1
+    if (raw.size > 0 && !equal(packed, raw.size - 1)) return 2
+    if (!equal(packed + "x", raw.size) || !equal(packed + packed, raw.size)) return 3
+    if (processArgumentCount() > 2 && processArgument(2) == "mutate") {
+        var i = 0
+        while (i < 4000) {
+            val at = (i * 7919) % packed.size
+            val changed = packed.slice(0,
+                at) + byteEncode(packed[at] ^ (1 << (i % 8))) + packed.slice(at + 1, packed.size)
+            val truncated = packed.slice(0, at)
+            for (limit in [0, 1, 16, raw.size]) {
+                if (!equal(changed, limit) || !equal(truncated, limit)) return 4
+            }
+            i += 1
+        }
+    }
+    val sample = "own compressor parity: abcabcabc"
+    if (!equal(gzipCompress(sample), sample.size)) return 5
+    0
+}
