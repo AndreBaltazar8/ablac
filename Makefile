@@ -88,6 +88,7 @@ test-wide-integers-full: ablac
 test-serial: ablac
 	tools/test-repo-language-guard.sh
 	tools/test-repo-language-guard-selftest.sh
+	tools/test-libc-imports.sh $(COMPILER)
 	tools/test-version.sh $(COMPILER)
 	tools/test-coverage.sh $(COMPILER)
 	tools/test-analysis-service.sh $(COMPILER)

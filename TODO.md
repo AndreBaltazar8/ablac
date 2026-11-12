@@ -68,6 +68,79 @@ Seven additional `-c` snippets occur in `android-rpc-example` (4 lines),
 `process-pipeline`, and `wide-integers` (one line each). External `.py`
 helpers are separate from these inline counts.
 
+## Abla without libc (#806)
+
+André, 2026-11-12: Abla should never require libc. `tools/test-libc-imports.sh` (in the suite)
+builds the programs in `tests/cases/libc-imports/` release and `--fast`, lists their dynamic imports
+and the compiler's, and fails on one not in `tools/libc-imports-allowlist.txt`; the list is today's
+set and only shrinks. Linux only: macOS keeps libSystem (its system calls are not a stable ABI).
+
+Inventory on master b1d218e5, compiler 195f43b9's stage 2. Every program needs libc.so.6, libm.so.6
+and libpthread.so.0; tls-http also needs libssl.so.3 and libcrypto.so.3. The programs are hello,
+float-remainder, strings-arrays, files, tasks, threads and tls-http.
+
+| Import | Release | `--fast` | Compiler | Emitted by |
+|---|---|---|---|---|
+| `__libc_start_main` | all | all | yes | crt1 from the clang link (`src/toolchain.ab:4272`); the backend writes a C `main` (`src/backend/llvm/exports.ab:1786`) |
+| `malloc` `calloc` `realloc` `free` | all | all | yes | hosted runtime heap, pages and tables (`stdlib/abla/runtime/platform/host.ab:6-9`) |
+| `memcpy` `memset` | all | all (`--fast`: memcpy only) | yes | LLVM's own lowering of `llvm.memcpy`/`llvm.memset` (`src/backend/llvm/core.ab:611`) |
+| `syscall` `__errno_location` | all | all | yes | `ablaLinuxSyscall` lowered to libc `syscall()` plus errno (`src/backend/llvm/functions.ab:7140-7189`); the compact fatal path (`core.ab:428-457`) |
+| `sigaction` `sigaltstack` | all | all | yes | the stack-overflow guard in every hosted executable (`src/backend/llvm/debug.ab:734`, restore at 942-948) |
+| `getenv` | all | all | yes | `ABLA_GC_LOOKUP`/`GROWTH`/`STRESS` (`host.ab:30`, 1015, 1946, 1969) |
+| `fmod` `fmodf` | float-remainder | float-remainder | yes | float `%` as `LLVMBuildFRem` (`functions.ab:1947`); wasm32 uses `__ablaRuntimeFloatRemainder` instead |
+| `pthread_create` `pthread_join` `pthread_mutex_init` | threads | threads (`--fast` tasks: join) | create, join | `host.ab:32-45`, 151, 167 |
+| `pthread_mutex_lock` `pthread_mutex_unlock` | threads | all | | the heap lock (`host.ab:36-37`); release drops it from single-threaded programs |
+| `backtrace` `backtrace_symbols_fd` `write` | | all | | `--fast` debug runtime (`debug.ab:1052`, 1079, 1141) |
+| `signal` `raise` `getrlimit` `_exit` | | all | | `--fast` fault handlers and stack-guard handler (`debug.ab:643`, 803, 858, 925, 968) |
+| `OpenSSL_version_num` (+ the SSL_* a connection uses) | tls-http | tls-http | yes, 27 | `stdlib/abla/tls/hosted/openssl.ab`; link trigger `src/toolchain.ab:3469-3480`, `-lssl -lcrypto` at 4358 |
+| `dlopen` `dlsym` | | | yes | compile-time native calls (`src/ct_native.ab:36-37`) |
+| `fork` | | | yes | compile-time processes (`src/ct_process.ab:9`); also `stdlib/abla/sys/linux/process:10` |
+| `setitimer` | | | yes | evaluator time limit (`src/ct_eval.ab:534-536`, also its sigaction and sigaltstack) |
+| `link` `utimes` | | | yes | codegen unit cache (`src/codegen_units.ab:44-45`) |
+| `malloc_trim` | | | yes | `src/toolchain.ab:37` |
+| `_longjmp` `getpid` | | | yes | recovery and the background free helper (`host.ab:29`, 31, 269, 1713) |
+| `strlen` | | | yes | argv decoding (`functions.ab:5529`, 7106) |
+
+Link flags: `-pthread` (`src/toolchain.ab:4273`), `-lm` always (4371; LLVM lowers floor, ceil,
+trunc and round to libm without SSE4.1). Coverage builds add `strstr`, `snprintf`, `open` and
+`rename` (`src/backend/llvm/coverage.ab`). Not yet covered by the test: the native `-l` libraries a
+program names, and `abla/crypto/hosted` (libcrypto EVP through the manifest's nativeLibraries).
+
+The compiler links libssl and libcrypto only because the compile-time evaluator can open TLS
+connections (`src/ct_native.ab:28` imports `abla/platform/host/tls`, since c70e83c6). It links
+libLLVM for code generation and the ORC JIT; libLLVM in turn needs libstdc++, libz, libxml2, libffi.
+
+What the libc-free runtime (Wasm and microcontrollers) lacks for a static x86-64 Linux executable:
+a `_start` (argc, argv, envp, auxv, stack alignment, static TLS image and `arch_prctl`), the
+`syscall` instruction for `ablaLinuxSyscall` (inline assembly already exists in the backend),
+a 64-bit mmap-backed allocator (`platform/wasm.ab`'s allocator assumes 32-bit pointers),
+`memcpy`/`memmove`/`memset`/`memcmp`/`bcmp` and `fmod`/`floor` in Abla, `rt_sigaction` with its
+own restorer, `_setjmp`/`_longjmp`, and threads on `clone` and futexes with per-thread TLS.
+The old `--target x86_64-linux-raw` (removed in 93ce196a, 17 Aug) had a C/assembly `_start`, one mmap
+per allocation and inline `syscall`, and refused threads, TLS, signals and imports; it went because
+the runtime moved to Abla, and `docs/freestanding.md` said it returns when start-up, allocation, panic
+and entry are written in Abla or intrinsics. Its plumbing is still in `src/toolchain.ab`
+(`rawTarget`, about 3354 and 4085-4098).
+
+Proposed order, smallest and safest first. Each step removes lines from the list:
+1. `memcpy`/`memmove`/`memset`/`memcmp` and float remainder in Abla on x86-64 Linux (the wasm32
+   path exists). Still dynamically linked.
+2. `ablaLinuxSyscall` as an inline `syscall`, plus the compact fatal path. This removes `syscall`
+   and `__errno_location`.
+3. `getenv` from envp, then `getpid`, `write`, `_exit`, `raise`, `getrlimit` and `signal` by
+   system calls (the `--fast` runtime and the compiler's uses).
+4. Signals: `rt_sigaction` with an Abla restorer, and `sigaltstack` by system call (the stack guard).
+5. An mmap allocator replacing malloc in `host.ab`, measured against glibc on NovaKind's benchmarks.
+6. `_start`, static TLS, `-nostdlib -static` for programs with no foreign libraries: the first
+   hello world without libc. It starts behind a flag and becomes the default after a release.
+7. Threads on `clone`, futex mutexes and condition variables, join.
+8. The `--fast` backtrace by frame-pointer walk, or dropped on this target.
+9. Programs that use OpenSSL or other native libraries keep libc until a pure-Abla TLS exists. The
+   compiler's own LLVM and OpenSSL are step C, for André.
+
+macOS keeps libSystem for system calls, malloc, threads and signals. Only steps 1 and 5 (in its
+mmap form) apply there.
+
 ## Bugs seen
 
 - [x] Linux toolchain packaging could write its archive and then fail in its
