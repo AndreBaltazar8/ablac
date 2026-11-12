@@ -405,14 +405,25 @@ log = log + "V$y|"
 **Conditions and subjects.** A temporary in an `if`, `while` or `do`-`while`
 condition drops after that evaluation and before its body or the next
 statement. A loop condition is evaluated and cleaned up on each pass. A
-`when` subject finishes before the first match condition. In this checked
-example `make(6)` drops before the arm appends `six`
+`when` subject finishes before the first match condition: temporaries used to
+compute its value drop at that boundary. In this checked example `make(6)`
+drops before the arm appends `six`
 ([test](../tests/cases/drop-temporaries/positions.ab)).
 
 ```abla fragment
 mark("when subject")
 when (make(6).id) { 6 -> order = order + " six" else -> order = order + " other" }
 // |when subject 6 six
+```
+
+If the subject value itself is a fresh resource, the `when` owns it through
+the match conditions and selected arm, then drops it before the next statement
+([test](../tests/cases/when-subject-owner/main.ab)).
+
+```abla fragment
+when (face(1)) { is Item -> log += "Y" else -> log += "N" }
+log += "|"
+// YI1|
 ```
 
 The same boundary applies to an `if` condition: the drop precedes its body

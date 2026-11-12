@@ -2650,6 +2650,12 @@ class BootstrapEvaluator(
 ) {
     fun evaluateProjectionReceiver(expression: BootstrapExpression,
         holdMoved: bool = false): BootstrapEvalValue {
+        val owners: array<int> = []
+        this.evaluateProjectionReceiverTracked(expression, holdMoved, owners)
+    }
+
+    fun evaluateProjectionReceiverTracked(expression: BootstrapExpression,
+        holdMoved: bool, var ownerSlots: array<int>): BootstrapEvalValue {
         if (this.suppressProjectionOwner > 0) return this.evaluate(expression)
         val fresh: array<BootstrapExpression> = []
         bootstrapProjectionFreshLeaves(expression, fresh)
@@ -2684,6 +2690,7 @@ class BootstrapEvaluator(
             this.values[index] = owner
             this.mutable[index] = isMutable
         }
+        ownerSlots.append(this.names.size - 1)
         value
     }
 
@@ -9333,8 +9340,18 @@ fun bootstrapEvaluateWhen(
     expression: BootstrapExpression
 ): BootstrapEvalValue {
     var result = bootstrapEvalInvalid()
-    val subject = evaluator.evaluateFrame(expression.children[0])
-    if (bootstrapEvalLeaves(subject)) return subject
+    val subjectMark = evaluator.names.size
+    val owners: array<int> = []
+    val suppressed = evaluator.suppressProjectionOwner
+    evaluator.suppressProjectionOwner = 0
+    val subject = evaluator.evaluateProjectionReceiverTracked(expression.children[0], false, owners)
+    evaluator.suppressProjectionOwner = suppressed
+    if (owners.size > 0) evaluator.names[owners[0]] = "__abla_when_subject"
+    evaluator.dropTemporaries(subjectMark)
+    if (bootstrapEvalLeaves(subject)) {
+        bootstrapEvalDropWhenSubject(evaluator, owners)
+        return subject
+    }
     var selected = false
     var branch = 1
     while (!selected && branch + 1 < expression.children.size) {
@@ -9353,7 +9370,10 @@ fun bootstrapEvaluateWhen(
             val value = evaluator.evaluateProjectionReceiver(match)
             if (!bootstrapEvalLeaves(value)) matches = bootstrapEvalEqual(subject, value)
             evaluator.dropTemporaries(mark)
-            if (bootstrapEvalLeaves(value)) return value
+            if (bootstrapEvalLeaves(value)) {
+                bootstrapEvalDropWhenSubject(evaluator, owners)
+                return value
+            }
         }
         if (matches) {
             result = evaluator.evaluate(expression.children[branch + 1])
@@ -9365,7 +9385,19 @@ fun bootstrapEvaluateWhen(
         evaluator.errors = evaluator.errors + 1
         result = bootstrapEvalInvalid()
     }
+    bootstrapEvalDropWhenSubject(evaluator, owners)
     result
+}
+
+fun bootstrapEvalDropWhenSubject(var evaluator: BootstrapEvaluator, owners: array<int>): void {
+    if (owners.size == 0) return
+    val slot = owners[0]
+    if (slot < evaluator.names.size && evaluator.values[slot].kind != "uninitialized") {
+        val value = evaluator.values[slot]
+        evaluator.dropValue(value)
+        evaluator.values[slot] = evaluator.uninitializedValue()
+    }
+    if (slot < evaluator.names.size) evaluator.names[slot] = ""
 }
 
 @noinline

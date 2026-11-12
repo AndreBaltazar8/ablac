@@ -4916,6 +4916,12 @@ fun bootstrapCollectLoweredOpcodeTargets(
         bootstrapMarkIrRuntimeDeclaration(
             "__ablaRuntimeArrayLengthI64", targets, reachable, pending
         )
+        // An affine interface drop dispatches to its concrete implementation.
+        // That helper is generated after this reachability walk.
+        bootstrapMarkIrRuntimeDeclaration("__ablaRuntimeObjectIs", targets, reachable, pending)
+        bootstrapMarkIrRuntimeDeclaration("__ablaRuntimeInterfaceNoWitness", targets, reachable,
+            pending)
+        bootstrapMarkIrRuntimeDeclaration("__ablaRuntimeStringStatic", targets, reachable, pending)
         // A drop that walks an object's overflow (its affine extension fields).
         if (bootstrapIrAffineExtensionFields) {
             for (name in [
@@ -5575,6 +5581,12 @@ class BootstrapLowerer(
     // Retain the selected fresh receiver of an affine projection until its frame ends.
     fun lowerAffineProjectionReceiver(expression: BootstrapExpression,
         holdMoved: bool = false): int {
+        val owners: array<string> = []
+        this.lowerAffineProjectionReceiverTracked(expression, holdMoved, owners)
+    }
+
+    fun lowerAffineProjectionReceiverTracked(expression: BootstrapExpression,
+        holdMoved: bool, var ownerStorage: array<string>): int {
         if (this.suppressProjectionOwner > 0) return this.lowerExpression(expression)
         val type = this.lowerExpressionType(expression)
         if (bootstrapIsBorrowType(type) || !this.lowerTypeIsAffine(type)) {
@@ -5631,6 +5643,7 @@ class BootstrapLowerer(
             this.localScopes[index] = ownerScope
             this.localBorrowSources[index] = ownerBorrow
         }
+        ownerStorage.append(storage)
         value
     }
 
@@ -12848,12 +12861,30 @@ fun bootstrapLowerWhen(
         bootstrapIrLocalZeroOpcode("any") else bootstrapIrLocalZeroOpcode(joinType)
     val joinValue = valueRequired
     if (joinValue) lowerer.emitControl(zeroOpcode, -1, -1, -1, temporary)
+    val outerScope = lowerer.currentScope
+    val subjectScope = lowerer.enterLocalScope()
     val subjectMark = lowerer.locals.size
-    val subject = lowerer.lowerExpression(expression.children[0])
+    val subjectOwner: array<string> = []
+    // A source owner may suppress its own projection captures. A `when`
+    // subject is a distinct inner lifetime, including its own temporaries.
+    val suppressed = lowerer.suppressProjectionOwner
+    lowerer.suppressProjectionOwner = 0
+    val subject = lowerer.lowerAffineProjectionReceiverTracked(expression.children[0], false,
+        subjectOwner)
+    lowerer.suppressProjectionOwner = suppressed
+    // The selected subject lives through the matched arm; temporaries used to
+    // compute it still end here. Its scope also handles return/break/continue.
+    if (subjectOwner.size > 0) {
+        var owner = subjectMark
+        while (owner < lowerer.locals.size) {
+            if (lowerer.localStorage[owner] == subjectOwner[0]) lowerer.locals[owner] = ""
+            owner = owner + 1
+        }
+    }
     lowerer.dropTemporaries(subjectMark)
     val branchMark = lowerer.locals.size
     val branchInstructions = lowerer.instructions.size
-    val enclosingScope = lowerer.currentScope
+    val enclosingScope = outerScope
     val mergeLabel = lowerer.allocateLabel()
     // The arms after the one matching `null` see the subject not null.
     val notNullFrom = bootstrapWhenNotNullFrom(expression)
@@ -12960,6 +12991,8 @@ fun bootstrapLowerWhen(
     lowerer.emitControl("label", -1, mergeLabel, -1, "")
     result = if (joinValue) lowerer.emit("local.load", -1, -1, temporary) else -1
     if (joinValue) lowerer.initializeTemporaries(branchMark, branchInstructions)
+    lowerer.emitScopeDrops(lowerer.currentScope)
+    lowerer.leaveLocalScope(subjectScope)
     result
 }
 
