@@ -2661,6 +2661,23 @@ class BootstrapEvaluator(
         val value = this.evaluate(expression)
         this.projectionOwnerLeaves.truncate(mark)
         this.projectionOwnerSlots.truncate(mark)
+        // The owning root is made after any temporaries in its constructor
+        // arguments. Its reserved slot is ordered last for reverse cleanup.
+        if (slot + 1 < this.names.size) {
+            val name = this.names[slot]
+            val owner = this.values[slot]
+            val isMutable = this.mutable[slot]
+            var index = slot
+            while (index + 1 < this.names.size) {
+                this.names[index] = this.names[index + 1]
+                this.values[index] = this.values[index + 1]
+                this.mutable[index] = this.mutable[index + 1]
+                index = index + 1
+            }
+            this.names[index] = name
+            this.values[index] = owner
+            this.mutable[index] = isMutable
+        }
         value
     }
 
@@ -8443,9 +8460,16 @@ fun bootstrapEvaluateMember(
         result = evaluator.objectField(receiver, expression.text)
     } else result = result
     if (!evaluator.valueIsAffine(result)) {
-        if (ownerLeaves.size > 0 && ownerMark < evaluator.names.size &&
-            evaluator.names[ownerMark].startsWith("__abla_temporary_projection_")) {
-            evaluator.values[ownerMark] = evaluator.uninitializedValue()
+        if (ownerLeaves.size > 0) {
+            var owner = ownerMark
+            while (owner < evaluator.names.size) {
+                if (evaluator.names[owner].startsWith("__abla_temporary_projection_") &&
+                    evaluator.values[owner] == rawReceiver) {
+                    evaluator.values[owner] = evaluator.uninitializedValue()
+                    break
+                }
+                owner = owner + 1
+            }
         }
         // Keep #736's original call-receiver behavior for non-affine fields.
         if (rawReceiver.kind == "object" && bootstrapEvalMayBeTemporary(expression.children[0])) {
@@ -8572,10 +8596,16 @@ fun bootstrapEvaluateIndex(
         evaluator.errors = evaluator.errors + 1
         result = result
     }
-    if (!evaluator.valueIsAffine(result) && ownerLeaves.size > 0 &&
-        ownerMark < evaluator.names.size &&
-        evaluator.names[ownerMark].startsWith("__abla_temporary_projection_")) {
-        evaluator.values[ownerMark] = evaluator.uninitializedValue()
+    if (!evaluator.valueIsAffine(result) && ownerLeaves.size > 0) {
+        var owner = ownerMark
+        while (owner < evaluator.names.size) {
+            if (evaluator.names[owner].startsWith("__abla_temporary_projection_") &&
+                evaluator.values[owner] == rawReceiver) {
+                evaluator.values[owner] = evaluator.uninitializedValue()
+                break
+            }
+            owner = owner + 1
+        }
     }
     if (rawReceiver.kind == "borrow" &&
         bootstrapEvalValueNeedsBorrow(result)) {
@@ -9199,7 +9229,7 @@ fun bootstrapEvaluateIf(
     while (pending) {
         pending = false
         if (bootstrapEvalCondition(evaluator, current.children[0])) {
-            result = evaluator.evaluateFrame(current.children[1])
+            result = evaluator.evaluate(current.children[1])
             // Without `else`, the branch's value is discarded.
             if (current.children[2].kind == "missing") {
                 bootstrapEvalDropDiscarded(evaluator, current.children[1], result)
@@ -9210,7 +9240,7 @@ fun bootstrapEvaluateIf(
         } else if (current.children[2].kind == "missing") {
             result = bootstrapEvalVoid()
         } else if (current.children[2].kind != "if") {
-            result = evaluator.evaluateFrame(current.children[2])
+            result = evaluator.evaluate(current.children[2])
         } else {
             current = current.children[2]
             evaluator.steps = evaluator.steps + 1
@@ -9247,7 +9277,7 @@ fun bootstrapEvaluateWhen(
                 subject,
                 evaluator.evaluate(match)
             ))) {
-            result = evaluator.evaluateFrame(expression.children[branch + 1])
+            result = evaluator.evaluate(expression.children[branch + 1])
             selected = true
         }
         branch = branch + 2

@@ -248,6 +248,10 @@
   constructor and named defaults. Their destructors previously leaked or ran before a named call. This changes
   observable drop effects. Resource borrows cannot escape as returned values, stored values, or generator/task
   captures; a retained managed field remains valid and observes its owner's drop effects.
+- **Nested temporary drop order (#790).** Temporaries within one statement now drop newest first even when an owner
+  is built using another temporary or selected by an `if`/`when` expression. The previous inner-first destruction
+  was observable in destructors. Conditions, subjects, short-circuit operands and explicit block statements keep
+  their own boundaries.
 - **Temporary affine-field projection audit (#788).** On master 83d65574, with a temporary
   `Holder(Item(1)).item` whose holder and item have `drop()` methods:
 

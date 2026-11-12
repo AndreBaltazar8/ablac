@@ -57,6 +57,7 @@ runs loops ' |bare body 0 1 2 |no pass |source item20 item21 20 |array |end'
 runs labeled ' |nested 0 100 1 10 110 11 111 12 20 120 |or break 200 201 |do continue 310 311 320 321 |generator argument 401 402 403 |end'
 runs alias '0'
 runs evaluator 'true'
+runs nested-order $'B2HI2HI1|B4HI4HI3|B6HI6HI5|B8HI8HI7|B10HI10HI9Y1|F12HI12HI11|B14HI14HI13|B19HI19,B18HI18HI17,|\nB2HI2HI1|B4HI4HI3|B6HI6HI5|B8HI8HI7|B10HI10HI9Y1|F12HI12HI11|B14HI14HI13|B19HI19,B18HI18HI17,|'
 runs affine-projection $'BHI|BHI|BHI|BHI|B|BHI|BHI|HI\nBHI|BHI|BHI|BHI|B|BHI|BHI|HI'
 
 if "$compiler" build "$cases/affine-projection-refused.ab" -o "$output_directory/affine-refused" --no-cache > "$output_directory/affine-refused.err" 2>&1; then

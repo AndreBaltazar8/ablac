@@ -5583,6 +5583,7 @@ class BootstrapLowerer(
         val storage = "local_${this.nextValue}___abla_temporary_${this.allocateLabel()}"
         val empty = this.emit("const.null", -1, -1, "")
         this.emit("local.declare", empty, -1, storage)
+        val ownerIndex = this.locals.size
         this.locals.append("__abla_temporary_${this.allocateLabel()}")
         this.localTypes.append(type)
         this.localStorage.append(storage)
@@ -5596,6 +5597,31 @@ class BootstrapLowerer(
         val value = this.lowerExpression(expression)
         this.projectionOwnerLeaves.truncate(mark)
         this.projectionOwnerStorage.truncate(mark)
+        // The slot must exist before any branch or early exit, but its owner
+        // is created only after its arguments. Register it after the inner
+        // temporaries, so the newest value goes first.
+        if (ownerIndex + 1 < this.locals.size) {
+            this.localNames.rewind(this.locals, ownerIndex)
+            val name = this.locals[ownerIndex]
+            val ownerType = this.localTypes[ownerIndex]
+            val ownerStorage = this.localStorage[ownerIndex]
+            val ownerScope = this.localScopes[ownerIndex]
+            val ownerBorrow = this.localBorrowSources[ownerIndex]
+            var index = ownerIndex
+            while (index + 1 < this.locals.size) {
+                this.locals[index] = this.locals[index + 1]
+                this.localTypes[index] = this.localTypes[index + 1]
+                this.localStorage[index] = this.localStorage[index + 1]
+                this.localScopes[index] = this.localScopes[index + 1]
+                this.localBorrowSources[index] = this.localBorrowSources[index + 1]
+                index = index + 1
+            }
+            this.locals[index] = name
+            this.localTypes[index] = ownerType
+            this.localStorage[index] = ownerStorage
+            this.localScopes[index] = ownerScope
+            this.localBorrowSources[index] = ownerBorrow
+        }
         value
     }
 
@@ -5796,9 +5822,8 @@ class BootstrapLowerer(
         }
     }
 
-    // Default expressions are conditional on an argument being missing. Their
-    // retained owners must be empty on every other path, including early exits.
-    fun initializeDefaultTemporaries(mark: int): void {
+    // Retained conditional owners must be empty on paths that skip them.
+    fun initializeTemporaries(mark: int, insertion: int): void {
         val storage: array<string> = []
         var local = mark
         while (local < this.locals.size) {
@@ -5810,11 +5835,15 @@ class BootstrapLowerer(
         val original: array<BootstrapInstruction> = []
         for (instruction in this.instructions) original.append(instruction)
         this.instructions.clear()
-        for (name in storage) {
-            val empty = this.emit("const.null", -1, -1, "")
-            this.emit("local.declare", empty, -1, name)
-        }
-        for (instruction in original) {
+        var position = 0
+        while (position < original.size) {
+            if (position == insertion) {
+                for (name in storage) {
+                    val empty = this.emit("const.null", -1, -1, "")
+                    this.emit("local.declare", empty, -1, name)
+                }
+            }
+            val instruction = original[position]
             var retained = false
             for (name in storage) if (instruction.text == name) retained = true
             if (retained && instruction.opcode == "local.declare") {
@@ -5824,6 +5853,16 @@ class BootstrapLowerer(
                     instruction.texts, instruction.position
                 ))
             } else this.instructions.append(instruction)
+            position = position + 1
+        }
+    }
+
+    fun promoteTemporaries(mark: int, scope: int): void {
+        var local = mark
+        while (local < this.locals.size) {
+            if (this.locals[local].startsWith("__abla_temporary_") &&
+                this.localTypes[local] != "void") this.localScopes[local] = scope
+            local = local + 1
         }
     }
 
@@ -9015,7 +9054,7 @@ class BootstrapLowerer(
             }
             defaultIndex = defaultIndex + 1
         }
-        functionLowerer.initializeDefaultTemporaries(defaultMark)
+        functionLowerer.initializeTemporaries(defaultMark, 0)
         val bodyMark = functionLowerer.locals.size
         val result = functionLowerer.lowerExpression(declaration.expression, true,
             bootstrapIrIsErasedType(functionLowerer.erasedReturnType))
@@ -9240,7 +9279,7 @@ class BootstrapLowerer(
             }
             defaultIndex = defaultIndex + 1
         }
-        methodLowerer.initializeDefaultTemporaries(defaultMark)
+        methodLowerer.initializeTemporaries(defaultMark, 0)
         val bodyMark = methodLowerer.locals.size
         val methodResult = methodLowerer.lowerExpression(method.expression, true,
             bootstrapIrIsErasedType(methodLowerer.erasedReturnType))
@@ -12126,6 +12165,9 @@ fun bootstrapLowerIf(
     val conditionMark = lowerer.locals.size
     val condition = lowerer.lowerExpression(expression.children[0])
     lowerer.dropTemporaries(conditionMark)
+    val branchMark = lowerer.locals.size
+    val branchInstructions = lowerer.instructions.size
+    val enclosingScope = lowerer.currentScope
     val thenLabel = lowerer.allocateLabel()
     val elseLabel = lowerer.allocateLabel()
     val mergeLabel = lowerer.allocateLabel()
@@ -12140,7 +12182,8 @@ fun bootstrapLowerIf(
     if (!joinValue || !hasElse) {
         lowerer.dropDiscarded(thenValue, expression.children[1])
     }
-    lowerer.dropTemporaries(thenMark)
+    if (joinValue) lowerer.promoteTemporaries(thenMark, enclosingScope)
+    else lowerer.dropTemporaries(thenMark)
     lowerer.leaveLocalScope(previousThenScope)
     if (joinValue) lowerer.emitControl("local.set", thenValue, -1, -1, temporary)
     lowerer.emitControl("jump", -1, mergeLabel, -1, "")
@@ -12154,13 +12197,15 @@ fun bootstrapLowerIf(
         val elseMark = lowerer.locals.size
         elseValue = lowerer.lowerExpression(expression.children[2], joinValue, eraseResult)
         if (!joinValue) lowerer.dropDiscarded(elseValue, expression.children[2])
-        lowerer.dropTemporaries(elseMark)
+        if (joinValue) lowerer.promoteTemporaries(elseMark, enclosingScope)
+        else lowerer.dropTemporaries(elseMark)
         lowerer.leaveLocalScope(previousElseScope)
     }
     if (joinValue) lowerer.emitControl("local.set", elseValue, -1, -1, temporary)
     lowerer.emitControl("jump", -1, mergeLabel, -1, "")
     lowerer.emitControl("label", -1, mergeLabel, -1, "")
     result = if (joinValue) lowerer.emit("local.load", -1, -1, temporary) else -1
+    if (joinValue) lowerer.initializeTemporaries(branchMark, branchInstructions)
     result
 }
 
@@ -12607,6 +12652,9 @@ fun bootstrapLowerWhen(
     val subjectMark = lowerer.locals.size
     val subject = lowerer.lowerExpression(expression.children[0])
     lowerer.dropTemporaries(subjectMark)
+    val branchMark = lowerer.locals.size
+    val branchInstructions = lowerer.instructions.size
+    val enclosingScope = lowerer.currentScope
     val mergeLabel = lowerer.allocateLabel()
     // The arms after the one matching `null` see the subject not null.
     val notNullFrom = bootstrapWhenNotNullFrom(expression)
@@ -12627,7 +12675,8 @@ fun bootstrapLowerWhen(
             val armMark = lowerer.locals.size
             val bodyValue = lowerer.lowerExpression(body, joinValue, eraseResult)
             if (!joinValue) lowerer.dropDiscarded(bodyValue, body)
-            lowerer.dropTemporaries(armMark)
+            if (joinValue) lowerer.promoteTemporaries(armMark, enclosingScope)
+            else lowerer.dropTemporaries(armMark)
             if (joinValue) lowerer.emitControl(
                 "local.set",
                 bodyValue,
@@ -12684,7 +12733,8 @@ fun bootstrapLowerWhen(
             val armMark = lowerer.locals.size
             val bodyValue = lowerer.lowerExpression(body, joinValue, eraseResult)
             if (!joinValue) lowerer.dropDiscarded(bodyValue, body)
-            lowerer.dropTemporaries(armMark)
+            if (joinValue) lowerer.promoteTemporaries(armMark, enclosingScope)
+            else lowerer.dropTemporaries(armMark)
             if (tested) lowerer.leaveLocalScope(previousScope)
             if (joinValue) lowerer.emitControl(
                 "local.set",
@@ -12704,6 +12754,7 @@ fun bootstrapLowerWhen(
     }
     lowerer.emitControl("label", -1, mergeLabel, -1, "")
     result = if (joinValue) lowerer.emit("local.load", -1, -1, temporary) else -1
+    if (joinValue) lowerer.initializeTemporaries(branchMark, branchInstructions)
     result
 }
 
