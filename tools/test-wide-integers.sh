@@ -35,7 +35,7 @@ python3 tools/wide-integers/gen-cases.py 1 3000 --type "$type" --abla > "$out/sr
 full=${WIDE_FULL:-${RUN_TESTS_FULL:-}}
 count=16000
 if [[ -n $full ]]; then count=60000; fi
-seed=${WIDE_SEED:-$(python3 -c 'import random; print(random.getrandbits(48))')}
+seed=${WIDE_SEED:-$(( (RANDOM << 33) | (RANDOM << 18) | (RANDOM << 3) | (RANDOM & 7) ))}  # 48 random bits
 python3 tools/wide-integers/gen-cases.py "$seed" "$count" --type "$type" > "$out/random.txt"
 modes=(--fast)
 [[ -z $full ]] || modes=("--fast -g" --fast "")

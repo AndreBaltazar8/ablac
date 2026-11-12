@@ -18,6 +18,8 @@ cd "$project_root"
 
 status=0
 fail() { echo "FAIL $*"; status=1; }
+# unhex HEXFILE OUT: write the bytes a hex string (whitespace ignored) spells.
+unhex() { printf "$(tr -d '[:space:]' < "$1" | sed 's/\(..\)/\\x\1/g')" > "$2"; }
 hex() { od -An -vtx1 "$1" | tr -d ' \n'; }
 random_hex() { head -c "$1" /dev/urandom | od -An -vtx1 | tr -d ' \n'; }
 
@@ -118,8 +120,7 @@ for ((round = 0; round < rounds; round++)); do
             -in "$work/secret" -out "$work/theirs" 2>/dev/null
         compare "decrypt-$padding" "$("$tool" "decrypt-$padding" "$keys/k2048.pem" "$work/theirs")" "$(hex "$work/secret")"
         "$tool" "encrypt-$padding" "$keys/k2048-spki.pem" "$work/secret" > "$work/ours.hex"
-        python3 -Ic "import sys;open(sys.argv[2],'wb').write(bytes.fromhex(open(sys.argv[1]).read()))" \
-            "$work/ours.hex" "$work/ours"
+        unhex "$work/ours.hex" "$work/ours"
         openssl pkeyutl -decrypt -inkey "$keys/k2048.pem" "${options[@]}" -in "$work/ours" -out "$work/back" 2>/dev/null ||
             fail "openssl refused our $padding"
         compare "encrypt-$padding" "$(hex "$work/back")" "$(hex "$work/secret")"

@@ -19,6 +19,8 @@ cases=tests/cases/crypto-pure
 
 status=0
 fail() { echo "FAIL $*"; status=1; }
+# unhex HEXFILE OUT: write the bytes a hex string (whitespace ignored) spells.
+unhex() { printf "$(tr -d '[:space:]' < "$1" | sed 's/\(..\)/\\x\1/g')" > "$2"; }
 hex() { od -An -vtx1 "$1" | tr -d ' \n'; }
 random_hex() { head -c "$1" /dev/urandom | od -An -vtx1 | tr -d ' \n'; }
 
@@ -119,8 +121,7 @@ for ((round = 0; round < rounds; round++)); do
         options=(-pkeyopt "$first" -pkeyopt "$second")
         [[ $padding != oaep-sha256 ]] || options+=(-pkeyopt rsa_mgf1_md:sha256)
         "$tool" "encrypt-$padding" - "$keys/k2048-spki.pem" "$work/secret" > "$work/ours.hex"
-        python3 -Ic "import sys;open(sys.argv[2],'wb').write(bytes.fromhex(open(sys.argv[1]).read()))" \
-            "$work/ours.hex" "$work/ours"
+        unhex "$work/ours.hex" "$work/ours"
         openssl pkeyutl -decrypt -inkey "$keys/k2048.pem" "${options[@]}" -in "$work/ours" -out "$work/back" 2>/dev/null ||
             fail "openssl refused our $padding"
         compare "encrypt-$padding" "$(hex "$work/back")" "$(hex "$work/secret")"
@@ -134,7 +135,8 @@ done
 openssl_version=$(openssl version | awk '{print $2}')
 if [[ $(printf '%s\n' 3.2.0 "$openssl_version" | sort -V | head -1) == 3.2.0 ]]; then
     for number in 0 1 2 3 7; do
-        python3 -Ic 'import sys;open(sys.argv[1], "wb").write(int(sys.argv[2]).to_bytes(256, "big"))' "$work/implicit" "$number"
+        # The number as 256 big-endian bytes (all the numbers here fit in one byte).
+        { head -c 255 /dev/zero; printf "\\$(printf '%03o' "$number")"; } > "$work/implicit"
         openssl pkeyutl -decrypt -inkey "$keys/k2048.pem" -pkeyopt rsa_padding_mode:pkcs1 -in "$work/implicit" -out "$work/implicit-openssl" 2>/dev/null || fail "openssl implicit reject $number"
         actual=$("$tool" decrypt-pkcs1 - "$keys/k2048.pem" "$work/implicit")
         compare "implicit reject $number" "$actual" "$(hex "$work/implicit-openssl")"
