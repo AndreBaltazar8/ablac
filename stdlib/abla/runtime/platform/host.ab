@@ -391,6 +391,9 @@ var __ablaRuntimeHostForkPage: int = 0
 // Set in a child that found the heap's lock held: nothing parked or merged before the fork is trusted, so no
 // merge ever consults a block's header from before it (a free block's links may be half written).
 var __ablaRuntimeHostHeapNoMerge: bool = false
+// Set in a child that found the runtime mutex or the heap lock held: a thread that did not survive may have been in
+// the middle of registering an allocation, so the collector never walks the registry in that child.
+var __ablaRuntimeHostForkNoCollect: bool = false
 
 trusted fun __ablaRuntimeHostForkArm(): void {
     val page = __ablaRuntimeHostHeapMap(4096)
@@ -407,6 +410,10 @@ trusted fun __ablaRuntimeHostForkRepair(): void {
     ablaRuntimeStoreI64(__ablaRuntimeHostForkPage, 1)
     val state = __ablaRuntimeHostHeapState()
     val lock = state + 1952
+    val mutexWord = __ablaRuntimeHostHeapMutex
+    var held = ablaRuntimeAtomicLoadI64(lock) != 0
+    if (mutexWord != 0 && ablaRuntimeAtomicLoadI64(mutexWord) != 0) held = true
+    if (held) __ablaRuntimeHostForkNoCollect = true
     if (ablaRuntimeAtomicLoadI64(lock) != 0) {
         // Held by a thread that is gone, possibly in the middle of a list update: the parked lists, the bins,
         // the top and the cache of large mappings are dropped (their memory leaks) and nothing merges again.
@@ -432,9 +439,8 @@ trusted fun __ablaRuntimeHostForkRepair(): void {
     }
     // The runtime's own mutex (the collector's registry and the thread count) is held by no one now, and no
     // other thread runs.
-    val mutex = __ablaRuntimeHostHeapMutex
-    if (mutex != 0) ablaRuntimeAtomicStoreI64(mutex, 0)
-    __ablaRuntimeHostActiveThreads = 0
+    if (mutexWord != 0) ablaRuntimeAtomicStoreI64(mutexWord, 0)
+    if (!held) __ablaRuntimeHostActiveThreads = 0
     return
 }
 
@@ -2618,7 +2624,7 @@ trusted fun __ablaRuntimePlatformMemoryCollect(): int {
     // when compiler-published stack/global roots are sufficient.
     val mutex = __ablaRuntimeHostHeapLock()
     if (__ablaRuntimeHostRegionLoad() != 0 ||
-        __ablaRuntimeHostActiveThreads != 0) {
+        __ablaRuntimeHostActiveThreads != 0 || __ablaRuntimeHostForkNoCollect) {
         __ablaRuntimeHostHeapUnlock(mutex)
         return 0
     }
@@ -2699,7 +2705,7 @@ trusted fun __ablaRuntimeHostBackgroundMemoryCollect(): int {
     // when compiler-published stack/global roots are sufficient.
     val mutex = __ablaRuntimeHostHeapLock()
     if (__ablaRuntimeHostRegionLoad() != 0 ||
-        __ablaRuntimeHostActiveThreads != 0) {
+        __ablaRuntimeHostActiveThreads != 0 || __ablaRuntimeHostForkNoCollect) {
         __ablaRuntimeHostHeapUnlock(mutex)
         return 0
     }
