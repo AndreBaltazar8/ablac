@@ -109,6 +109,12 @@ The compiler links libssl and libcrypto only because the compile-time evaluator 
 connections (`src/ct_native.ab:28` imports `abla/platform/host/tls`, since c70e83c6). It links
 libLLVM for code generation and the ORC JIT; libLLVM in turn needs libstdc++, libz, libxml2, libffi.
 
+Status (compiler only): setitimer, link and utimes are system calls on x86-64 Linux (the compile-time
+process capture also forks by system call), and the compile-time symbol lookup asks LLVM instead of
+calling dlopen/dlsym, so the compiler imports none of them itself. libLLVM still imports dlopen and
+dlsym, so the compiler process keeps libc (and libdl) until the compiler stops linking libLLVM
+(step C).
+
 What the libc-free runtime (Wasm and microcontrollers) lacks for a static x86-64 Linux executable:
 a `_start` (argc, argv, envp, auxv, stack alignment, static TLS image and `arch_prctl`), the
 `syscall` instruction for `ablaLinuxSyscall` (inline assembly already exists in the backend),
