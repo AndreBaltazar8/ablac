@@ -13,7 +13,11 @@ for source in "$cases"/*.ab; do
         delegate-get|delegate-local) expected=1,1,1 ;;
         delegate-set) expected=0,1,1 ;;
         member-unrelated|member-generic) expected=5,7 ;;
-        operator-builtin) expected=5,3 ;;
+        operator-builtin|operator-compound) expected=5,3 ;;
+        operator-scalar) expected=6,6 ;;
+        operator-generic) expected=3,3 ;;
+        operator-unary) expected=-3,-4 ;;
+        operator-string) expected=ab,1x ;;
         *-forward) expected=1,1,1,2 ;;
         *-reverse) expected=0,1,2,2 ;;
         *-read-first) expected=0,0,1,2 ;;
@@ -58,7 +62,7 @@ NODE
                 if [[ $name == readonly ]]; then
                     pos=$(offset '#lookup()')
                     grep '^note\[ct-jit\]: native at ' "$log" | grep -Fq "readonly.ab:$pos"
-                elif [[ $name == member-* || $name == operator-builtin ]]; then
+                elif [[ $name == member-* || $name == operator-builtin || $name == operator-scalar || $name == operator-generic || $name == operator-compound || $name == operator-unary || $name == operator-string ]]; then
                     # X (a call of B.touch; the sum of two ints) and Y (a call of A.touch or of Box.plus: a write
                     # of `shared`).
                     # A Wasm slice carries the checker's resolved targets, so X reaches B.touch
@@ -71,7 +75,7 @@ NODE
                         { echo "$name $target $tier: Y was not interpreted" >&2; exit 1; }
                     grep -F "note[ct-jit]: interpreted at $((posY+1)):" "$log" | grep -q 'ordinary mutable global shared may be written at ' ||
                         { echo "$name $target $tier: Y was not interpreted for the write" >&2; exit 1; }
-                    if [[ $name != member-generic && $target == wasm ]]; then
+                    if [[ $name != member-generic && $name != operator-generic && $target == wasm ]]; then
                         grep '^note\[ct-jit\]: native at ' "$log" | grep -Fq "$name.ab:$posX" ||
                             { echo "$name $target $tier: X was not native" >&2; exit 1; }
                     else
