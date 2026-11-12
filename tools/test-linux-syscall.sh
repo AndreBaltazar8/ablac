@@ -20,4 +20,8 @@ if [[ $(uname -m) == x86_64 ]] && nm -D --undefined-only "$out/program" | awk '{
     echo 'linux syscall: the program still imports syscall or __errno_location' >&2
     exit 1
 fi
+"$compiler" build tests/cases/linux-syscall/owns-runtime.ab -o "$out/owns-runtime" --no-cache
+status=0
+"$out/owns-runtime" || status=$?
+[[ $status -eq 42 ]] || { echo "linux syscall: ablaHostOwnsRuntime returned $status" >&2; exit 1; }
 echo 'linux syscall: -errno results, six arguments and no libc syscall/errno passed'
