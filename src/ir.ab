@@ -5431,7 +5431,8 @@ class BootstrapLowerer(
     val statementTemporaryStorages: array<string> = [],
     val loopOwnerTemporaryStorages: array<string> = [],
     val containerIteratorStorages: array<string> = [],
-    val containerIteratorFlags: array<string> = []
+    val containerIteratorFlags: array<string> = [],
+    val loopMapViews: array<BootstrapExpression> = []
 ) {
     /** The newest visible local named `name` (with a type, when `typed`), or -1. */
     /** Every visible local named `name`, first declared first. */
@@ -5572,7 +5573,8 @@ class BootstrapLowerer(
     }
 
     // Retain the selected fresh receiver of an affine projection until its frame ends.
-    fun lowerAffineProjectionReceiver(expression: BootstrapExpression): int {
+    fun lowerAffineProjectionReceiver(expression: BootstrapExpression,
+        holdMoved: bool = false): int {
         if (this.suppressProjectionOwner > 0) return this.lowerExpression(expression)
         val type = this.lowerExpressionType(expression)
         if (bootstrapIsBorrowType(type) || !this.lowerTypeIsAffine(type)) {
@@ -5580,6 +5582,7 @@ class BootstrapLowerer(
         }
         val leaves: array<BootstrapExpression> = []
         bootstrapProjectionFreshLeaves(expression, leaves)
+        if (holdMoved) bootstrapCollectMovedLoopLeaves(expression, leaves)
         val fresh: array<BootstrapExpression> = []
         for (leaf in leaves) {
             if (!this.callHandsOnAssignment(leaf)) fresh.append(leaf)
@@ -11923,7 +11926,12 @@ fun bootstrapLowerMemberCall(
         val selectedReceiver = argument == 0 && userMethod &&
             (child.kind == "if" || child.kind == "when" || child.kind == "block") &&
             lowerer.lowerTypeIsAffine(lowerer.lowerExpressionType(child))
-        val value = if (selectedReceiver) lowerer.lowerAffineProjectionReceiver(child)
+        var mapView = false
+        if (argument == 0 && bootstrapIsMapType(owner)) {
+            for (candidate in lowerer.loopMapViews) if (candidate == expression) mapView = true
+        }
+        val value = if (mapView) lowerer.lowerAffineProjectionReceiver(child, true)
+            else if (selectedReceiver) lowerer.lowerAffineProjectionReceiver(child)
             else lowerer.lowerExpression(child, true, bootstrapIrIsErasedType(expected))
         val borrowed = userMethod && (argument == 0 ||
             lowerer.lowerMethodParameterKind(owner, expression.text, argument - 1) == "parameter")
@@ -12590,6 +12598,10 @@ fun bootstrapLowerFor(
     var sourceScope = -1
     val affineArray = !range && !literal && bootstrapIsArrayType(sourceType) &&
         lowerer.lowerTypeIsAffine(sourceType)
+    val mapViews: array<BootstrapExpression> = []
+    if (!range && !literal) bootstrapCollectLoopMapViews(expression.children[0], mapViews)
+    val mapViewMark = lowerer.loopMapViews.size
+    for (view in mapViews) lowerer.loopMapViews.append(view)
     var arrayFlag = ""
     if (range) {
         val begin = lowerer.lowerExpression(expression.children[0].children[0])
@@ -12650,8 +12662,13 @@ fun bootstrapLowerFor(
             lowerer.generatorSourceLeaves.truncate(mark)
             lowerer.generatorSourceFlags.truncate(mark)
             lowerer.emitControl("local.set", source, -1, -1, sourceStorage)
-        } else source = lowerer.lowerExpression(expression.children[0])
+        } else {
+            if (bootstrapIsArrayType(sourceType) && mapViews.size > 0)
+                sourceScope = lowerer.enterLocalScope()
+            source = lowerer.lowerExpression(expression.children[0])
+        }
     }
+    lowerer.loopMapViews.truncate(mapViewMark)
     // The loop closes its source on every exit. It drops an owned source and
     // only closes a borrowed source, whose caller still owns the handle.
     if (bootstrapIsGeneratorType(sourceType)) {
@@ -12790,7 +12807,7 @@ fun bootstrapLowerFor(
     }
     lowerer.emitControl("jump", -1, conditionLabel, -1, "")
     lowerer.emitControl("label", -1, mergeLabel, -1, "")
-    if (bootstrapIsGeneratorType(sourceType) || affineArray) {
+    if (sourceScope >= 0) {
         lowerer.emitScopeDrops(lowerer.currentScope)
         lowerer.leaveLocalScope(sourceScope)
     }

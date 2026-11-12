@@ -258,6 +258,8 @@
 
 - **Conditional method receivers (#800).** A fresh affine receiver selected by an `if`, `when`, or block is held
   until its statement ends, in native and compile-time execution. Previously it leaked on both tiers.
+- **Loops over temporary map views (#801).** A fresh or moved map behind `values()` or `keys()` is held until
+  the loop ends, then drops its values once. `values()` lends its elements; it does not transfer them to the loop.
 - **Loops over owned containers (#801).** A loop takes and drops each element of a fresh or moved array per
   iteration and drops remaining elements on exit. A mixed borrowed/fresh source now refuses moving or awaiting its
   iterator: such code was accepted before but could drop the borrowed owner's element twice.

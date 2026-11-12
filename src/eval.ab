@@ -2645,12 +2645,15 @@ class BootstrapEvaluator(
     val projectionOwnerSlots: array<int> = [],
     var suppressProjectionOwner: int = 0,
     val containerSourceLeaves: array<BootstrapExpression> = [],
-    val containerSourceFlags: array<int> = []
+    val containerSourceFlags: array<int> = [],
+    val loopMapViews: array<BootstrapExpression> = []
 ) {
-    fun evaluateProjectionReceiver(expression: BootstrapExpression): BootstrapEvalValue {
+    fun evaluateProjectionReceiver(expression: BootstrapExpression,
+        holdMoved: bool = false): BootstrapEvalValue {
         if (this.suppressProjectionOwner > 0) return this.evaluate(expression)
         val fresh: array<BootstrapExpression> = []
         bootstrapProjectionFreshLeaves(expression, fresh)
+        if (holdMoved) bootstrapCollectMovedLoopLeaves(expression, fresh)
         if (fresh.size == 0) return this.evaluate(expression)
         val slot = this.names.size
         this.names.append("__abla_temporary_projection_${slot}")
@@ -8691,17 +8694,23 @@ fun bootstrapEvaluateMemberCall(
         expression.text == "clear" || expression.text == "takeAt" || expression.text == "set" ||
         expression.text == "remove" || expression.text == "take"
     val receiverExpression = expression.children[0]
+    var loopMapView = false
+    for (candidate in evaluator.loopMapViews) if (candidate == expression) loopMapView = true
     val selectedReceiver = receiverExpression.kind == "if" ||
         receiverExpression.kind == "when" || receiverExpression.kind == "block"
     val ownerMark = evaluator.names.size
     val rawReceiver =
-        if (selectedReceiver) evaluator.evaluateProjectionReceiver(receiverExpression)
+        if (loopMapView) evaluator.evaluateProjectionReceiver(receiverExpression, true)
+        else if (selectedReceiver) evaluator.evaluateProjectionReceiver(receiverExpression)
         else if (mutates) bootstrapEvaluatePlace(evaluator, expression.children[0])
         else evaluator.evaluate(expression.children[0])
     if (bootstrapEvalLeaves(rawReceiver)) return rawReceiver
     val receiver = bootstrapEvalUnwrapBorrow(rawReceiver)
-    if (selectedReceiver && (rawReceiver.kind != "object" ||
-        !bootstrapEvalClassHasMethodOrExtension(evaluator, receiver.owner, expression.text))) {
+    if ((loopMapView && receiver.kind != "map" && (!selectedReceiver ||
+        rawReceiver.kind != "object" || !bootstrapEvalClassHasMethodOrExtension(evaluator,
+            receiver.owner, expression.text))) ||
+        (!loopMapView && selectedReceiver && (rawReceiver.kind != "object" ||
+            !bootstrapEvalClassHasMethodOrExtension(evaluator, receiver.owner, expression.text)))) {
         var owner = ownerMark
         while (owner < evaluator.names.size) {
             if (evaluator.names[owner].startsWith("__abla_temporary_projection_") &&
@@ -9438,6 +9447,11 @@ fun bootstrapEvaluateFor(
     expression: BootstrapExpression
 ): BootstrapEvalValue {
     var result = bootstrapEvalInvalid()
+    val sourceMark = evaluator.names.size
+    val mapMark = evaluator.loopMapViews.size
+    val mapViews: array<BootstrapExpression> = []
+    bootstrapCollectLoopMapViews(expression.children[0], mapViews)
+    for (view in mapViews) evaluator.loopMapViews.append(view)
     // The chosen fresh or moved arm transfers its elements to the loop; an
     // identifier, field, or borrowed result leaves them with its owner.
     val flag = evaluator.names.size
@@ -9447,17 +9461,19 @@ fun bootstrapEvaluateFor(
     val leafMark = evaluator.containerSourceLeaves.size
     val leaves: array<BootstrapExpression> = []
     bootstrapProjectionFreshLeaves(expression.children[0], leaves)
-    bootstrapEvalCollectMovedLoopLeaves(expression.children[0], leaves)
+    bootstrapCollectMovedLoopLeaves(expression.children[0], leaves)
     for (leaf in leaves) {
         evaluator.containerSourceLeaves.append(leaf)
         evaluator.containerSourceFlags.append(flag)
     }
     val rawSource = evaluator.evaluate(expression.children[0])
+    evaluator.loopMapViews.truncate(mapMark)
     evaluator.containerSourceLeaves.truncate(leafMark)
     evaluator.containerSourceFlags.truncate(leafMark)
     if (bootstrapEvalLeaves(rawSource)) {
         evaluator.names[flag] = ""
         evaluator.values[flag] = evaluator.uninitializedValue()
+        evaluator.dropTemporaries(sourceMark)
         return rawSource
     }
     // A borrowed array (a map's affine `values()`) iterates as the array.
@@ -9520,6 +9536,7 @@ fun bootstrapEvaluateFor(
     else if (ownedArray) evaluator.dropValue(source)
     evaluator.names[flag] = ""
     evaluator.values[flag] = evaluator.uninitializedValue()
+    evaluator.dropTemporaries(sourceMark)
     result
 }
 
