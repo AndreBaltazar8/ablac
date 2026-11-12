@@ -1,0 +1,264 @@
+import "abla/io"
+import "abla/sys/linux"
+import "abla/unsafe/memory"
+
+// The socket calls a macOS program issues by BSD system call (#811 group 4), through the portable
+// Linux-numbered surface; on Linux the same numbers are the kernel's, so the program prints the
+// same lines everywhere. Each line is "name: ok (value)"; exit status 7 when all are right.
+
+trusted fun report(name: string, ok: bool, value: int): bool {
+    println("${name}: ${if (ok) "ok" else "FAIL"} ($value)")
+    ok
+}
+
+trusted fun clear(address: int, count: int): void {
+    var index = 0
+    while (index < count) {
+        ablaRuntimeStoreU8(address + index, 0)
+        index = index + 1
+    }
+    return
+}
+
+trusted fun byteAt(address: int, offset: int): int = ablaRuntimeLoadU8(address + offset)
+
+// A sockaddr_in for 127.0.0.1 and the port (high and low byte, network order).
+trusted fun inetAddress(address: int, high: int, low: int): void {
+    clear(address, 128)
+    ablaRuntimeStoreU8(address, 2)
+    ablaRuntimeStoreU8(address + 2, high)
+    ablaRuntimeStoreU8(address + 3, low)
+    ablaRuntimeStoreU8(address + 4, 127)
+    ablaRuntimeStoreU8(address + 7, 1)
+    return
+}
+
+// A sockaddr_un for `path`; its length.
+trusted fun unixAddress(address: int, path: string): int {
+    clear(address, 128)
+    ablaRuntimeStoreU8(address, 1)
+    var index = 0
+    while (index < path.size) {
+        ablaRuntimeStoreU8(address + 2 + index, path[index])
+        index = index + 1
+    }
+    2 + path.size + 1
+}
+
+// A listening TCP socket on 127.0.0.1 and an ephemeral port: its descriptor and (in `port`
+// words at `ports`) the port bytes; -1 on failure.
+trusted fun inetListener(ports: int): int {
+    val server = linuxSyscall3(41, 2, 1, 0)
+    if (server < 0) return -1
+    val on = nativeStackAllocate(8)
+    ablaRuntimeStoreI32(on, 1)
+    linuxSyscall5(54, server, 1, 2, on, 4)
+    val address = nativeStackAllocate(128)
+    inetAddress(address, 0, 0)
+    if (linuxSyscall3(49, server, address, 16) != 0) return -1
+    if (linuxSyscall2(50, server, 4) != 0) return -1
+    val length = nativeStackAllocate(8)
+    ablaRuntimeStoreI32(length, 128)
+    if (linuxSyscall3(51, server, address, length) != 0) return -1
+    ablaRuntimeStoreI64(ports, byteAt(address, 2) * 256 + byteAt(address, 3))
+    server
+}
+
+trusted fun main: int {
+    var good = true
+    // ---- AF_UNIX stream ----
+    val path = "build/darwin-syscalls/s.sock"
+    linuxSyscall1(87, nativeCStringAddress(path))
+    val server = linuxSyscall3(41, 1, 1, 0)
+    good = report("socket unix", server >= 3, server) && good
+    val address = nativeStackAllocate(128)
+    val size = unixAddress(address, path)
+    val bound = linuxSyscall3(49, server, address, size)
+    good = report("bind unix", bound == 0, bound) && good
+    val rebound = linuxSyscall3(49, linuxSyscall3(41, 1, 1, 0), address, size)
+    good = report("bind in use", rebound == -98, rebound) && good
+    val listened = linuxSyscall2(50, server, 4)
+    good = report("listen", listened == 0, listened) && good
+    val name = nativeStackAllocate(128)
+    val nameLength = nativeStackAllocate(8)
+    ablaRuntimeStoreI32(nameLength, 128)
+    val named = linuxSyscall3(51, server, name, nameLength)
+    good = report("getsockname unix", named == 0 && byteAt(name, 0) == 1 && byteAt(name, 1) == 0 &&
+        byteAt(name, 2) == 98 && ablaRuntimeLoadI32(nameLength) >= 3,
+        ablaRuntimeLoadI32(nameLength)) && good
+    val client = linuxSyscall3(41, 1, 1 | 524288, 0)
+    val connected = linuxSyscall3(42, client, address, size)
+    good = report("connect unix", connected == 0, connected) && good
+    val accepted = linuxSyscall4(288, server, 0, 0, 2048 | 524288)
+    good = report("accept4 unix", accepted >= 3, accepted) && good
+    val status = linuxSyscall3(72, accepted, 3, 0)
+    good = report("accept4 nonblocking", status >= 0 && (status & 2048) != 0, status) && good
+    val descriptorFlags = linuxSyscall3(72, accepted, 1, 0)
+    good = report("accept4 close-on-exec", descriptorFlags >= 0 && (descriptorFlags & 1) == 1,
+        descriptorFlags) && good
+    val greeting = "hello"
+    val sent = linuxSyscall6(44, client, nativeCStringAddress(greeting), 5, 0, 0, 0)
+    good = report("sendto", sent == 5, sent) && good
+    val inbox = nativeStackAllocate(64)
+    clear(inbox, 64)
+    val received = linuxSyscall6(45, accepted, inbox, 64, 0, 0, 0)
+    good = report("recvfrom", received == 5 && byteAt(inbox, 0) == 104 && byteAt(inbox, 4) == 111,
+        received) && good
+    val empty = linuxSyscall6(45, accepted, inbox, 64, 0, 0, 0)
+    good = report("recvfrom would block", empty == -11, empty) && good
+    // ---- options ----
+    val on = nativeStackAllocate(8)
+    ablaRuntimeStoreI32(on, 1)
+    val reuse = linuxSyscall5(54, server, 1, 2, on, 4)
+    good = report("setsockopt SO_REUSEADDR", reuse == 0, reuse) && good
+    val optionValue = nativeStackAllocate(8)
+    val optionLength = nativeStackAllocate(8)
+    ablaRuntimeStoreI64(optionValue, 0)
+    ablaRuntimeStoreI32(optionLength, 4)
+    val reuseBack = linuxSyscall5(55, server, 1, 2, optionValue, optionLength)
+    good = report("getsockopt SO_REUSEADDR", reuseBack == 0 && ablaRuntimeLoadI32(optionValue) != 0,
+        ablaRuntimeLoadI32(optionValue)) && good
+    ablaRuntimeStoreI32(optionValue, 77)
+    ablaRuntimeStoreI32(optionLength, 4)
+    val failureBack = linuxSyscall5(55, server, 1, 4, optionValue, optionLength)
+    good = report("getsockopt SO_ERROR", failureBack == 0 && ablaRuntimeLoadI32(optionValue) == 0,
+        ablaRuntimeLoadI32(optionValue)) && good
+    ablaRuntimeStoreI32(optionLength, 4)
+    val typeBack = linuxSyscall5(55, server, 1, 3, optionValue, optionLength)
+    good = report("getsockopt SO_TYPE", typeBack == 0 && ablaRuntimeLoadI32(optionValue) == 1,
+        ablaRuntimeLoadI32(optionValue)) && good
+    // ---- AF_INET stream ----
+    val ports = nativeStackAllocate(8)
+    val listener = inetListener(ports)
+    val port = ablaRuntimeLoadI64(ports)
+    good = report("inet listener on an ephemeral port", listener >= 3 && port > 0, port) && good
+    val tcpClient = linuxSyscall3(41, 2, 1, 0)
+    inetAddress(address, port / 256, port % 256)
+    val tcpConnected = linuxSyscall3(42, tcpClient, address, 16)
+    good = report("connect inet", tcpConnected == 0, tcpConnected) && good
+    val peerAddress = nativeStackAllocate(128)
+    val peerLength = nativeStackAllocate(8)
+    ablaRuntimeStoreI32(peerLength, 128)
+    val tcpAccepted = linuxSyscall4(288, listener, peerAddress, peerLength, 0)
+    good = report("accept4 inet with the peer address", tcpAccepted >= 3 && byteAt(peerAddress,
+        0) == 2 &&
+        byteAt(peerAddress, 4) == 127 && byteAt(peerAddress,
+            7) == 1 && ablaRuntimeLoadI32(peerLength) == 16,
+        ablaRuntimeLoadI32(peerLength)) && good
+    ablaRuntimeStoreI32(peerLength, 128)
+    clear(peerAddress, 128)
+    val peered = linuxSyscall3(52, tcpAccepted, peerAddress, peerLength)
+    good = report("getpeername inet", peered == 0 && byteAt(peerAddress, 0) == 2 &&
+        byteAt(peerAddress, 4) == 127 && ablaRuntimeLoadI32(peerLength) == 16, peered) && good
+    // sendmsg with two buffers (Linux's msghdr: name 0, namelen 8, iov 16, iovlen 24, control 32,
+    // controllen 40, flags 48; an iovec is base and length).
+    val partOne = "ab"
+    val partTwo = "cd"
+    val vectors = nativeStackAllocate(32)
+    ablaRuntimeStoreI64(vectors, nativeCStringAddress(partOne))
+    ablaRuntimeStoreI64(vectors + 8, 2)
+    ablaRuntimeStoreI64(vectors + 16, nativeCStringAddress(partTwo))
+    ablaRuntimeStoreI64(vectors + 24, 2)
+    val header = nativeStackAllocate(64)
+    clear(header, 64)
+    ablaRuntimeStoreI64(header + 16, vectors)
+    ablaRuntimeStoreI64(header + 24, 2)
+    val messaged = linuxSyscall3(46, tcpClient, header, 0)
+    good = report("sendmsg", messaged == 4, messaged) && good
+    // poll: readable once the data is there.
+    val pollEntry = nativeStackAllocate(8)
+    clear(pollEntry, 8)
+    ablaRuntimeStoreI32(pollEntry, tcpAccepted)
+    ablaRuntimeStoreU8(pollEntry + 4, 1)
+    val polled = linuxSyscall3(7, pollEntry, 1, 2000)
+    good = report("poll readable", polled == 1 && (byteAt(pollEntry, 6) & 1) == 1, polled) && good
+    clear(inbox, 64)
+    val joined = linuxSyscall6(45, tcpAccepted, inbox, 64, 0, 0, 0)
+    good = report("recvfrom of a sendmsg", joined == 4 && byteAt(inbox, 0) == 97 && byteAt(inbox,
+        3) == 100,
+        joined) && good
+    clear(pollEntry, 8)
+    ablaRuntimeStoreI32(pollEntry, tcpAccepted)
+    ablaRuntimeStoreU8(pollEntry + 4, 4)
+    val writable = linuxSyscall3(7, pollEntry, 1, 0)
+    good = report("poll writable", writable == 1 && (byteAt(pollEntry, 6) & 4) == 4,
+        writable) && good
+    clear(pollEntry, 8)
+    ablaRuntimeStoreI32(pollEntry, tcpAccepted)
+    ablaRuntimeStoreU8(pollEntry + 4, 1)
+    val quiet = linuxSyscall3(7, pollEntry, 1, 0)
+    good = report("poll not readable", quiet == 0, quiet) && good
+    // a refused connection and an error number in Linux's numbering.
+    val refusedClient = linuxSyscall3(41, 2, 1, 0)
+    inetAddress(address, 0, 1)
+    val refused = linuxSyscall3(42, refusedClient, address, 16)
+    good = report("connect refused", refused == -111, refused) && good
+    // ---- AF_INET datagram with a source address ----
+    val receiver = linuxSyscall3(41, 2, 2, 0)
+    inetAddress(address, 0, 0)
+    val receiverBound = linuxSyscall3(49, receiver, address, 16)
+    ablaRuntimeStoreI32(peerLength, 128)
+    val receiverNamed = linuxSyscall3(51, receiver, address, peerLength)
+    val datagramPort = byteAt(address, 2) * 256 + byteAt(address, 3)
+    good = report("udp bind and getsockname",
+        receiverBound == 0 && receiverNamed == 0 && datagramPort > 0,
+        datagramPort) && good
+    val sender = linuxSyscall3(41, 2, 2, 0)
+    val ping = "ping"
+    val datagramSent = linuxSyscall6(44, sender, nativeCStringAddress(ping), 4, 0, address, 16)
+    good = report("sendto with an address", datagramSent == 4, datagramSent) && good
+    val source = nativeStackAllocate(128)
+    val sourceLength = nativeStackAllocate(8)
+    ablaRuntimeStoreI32(sourceLength, 128)
+    clear(inbox, 64)
+    val datagram = linuxSyscall6(45, receiver, inbox, 64, 0, source, sourceLength)
+    good = report("recvfrom with the source address", datagram == 4 && byteAt(inbox, 0) == 112 &&
+        byteAt(source, 0) == 2 && byteAt(source,
+            4) == 127 && ablaRuntimeLoadI32(sourceLength) == 16,
+        datagram) && good
+    // ---- descriptors above FD_SETSIZE (1024): poll on a socket, and on a character device (on
+    // macOS the latter goes through select, whose masks are sized by the descriptor) ----
+    val highSocket = linuxSyscall2(33, tcpAccepted, 1100)
+    if (highSocket == 1100) {
+        clear(pollEntry, 8)
+        ablaRuntimeStoreI32(pollEntry, 1100)
+        ablaRuntimeStoreU8(pollEntry + 4, 4)
+        val highPolled = linuxSyscall3(7, pollEntry, 1, 0)
+        good = report("poll a socket above 1024", highPolled == 1 && (byteAt(pollEntry,
+            6) & 4) == 4,
+            highPolled) && good
+        linuxSyscall1(3, 1100)
+    } else {
+        good = report("poll a socket above 1024 (no descriptor room: skipped)", highSocket < 0,
+            highSocket) && good
+    }
+    val nullDevice = linuxSyscall4(257, -100, nativeCStringAddress("/dev/null"), 2, 0)
+    val highNull = if (nullDevice >= 0) linuxSyscall2(33, nullDevice, 1101) else -1
+    if (highNull == 1101) {
+        clear(pollEntry, 8)
+        ablaRuntimeStoreI32(pollEntry, 1101)
+        ablaRuntimeStoreU8(pollEntry + 4, 5)
+        val nullPolled = linuxSyscall3(7, pollEntry, 1, 0)
+        good = report("poll /dev/null above 1024", nullPolled == 1 && (byteAt(pollEntry,
+            6) & 4) == 4,
+            nullPolled) && good
+        linuxSyscall1(3, 1101)
+    } else {
+        good = report("poll /dev/null above 1024 (no descriptor room: skipped)", highNull < 0,
+            highNull) && good
+    }
+    if (nullDevice >= 0) linuxSyscall1(3, nullDevice)
+    // ---- clean up ----
+    linuxSyscall1(3, receiver)
+    linuxSyscall1(3, sender)
+    linuxSyscall1(3, tcpAccepted)
+    linuxSyscall1(3, tcpClient)
+    linuxSyscall1(3, refusedClient)
+    linuxSyscall1(3, listener)
+    linuxSyscall1(3, accepted)
+    linuxSyscall1(3, client)
+    linuxSyscall1(3, server)
+    linuxSyscall1(87, nativeCStringAddress(path))
+    if (good) return 7
+    1
+}
