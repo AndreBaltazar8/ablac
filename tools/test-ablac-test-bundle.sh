@@ -98,21 +98,23 @@ echo "test bundle: bundled results match --each (duplicate names, extension clas
 # the old discovery state across those executions.
 mutation="$work/mutation"
 mkdir -p "$mutation"
-cat > "$mutation/change.py" <<'PY'
-import os, pathlib, sys
-p = pathlib.Path(sys.argv[1])
-before = p.stat()
-p.write_text('fun secondValue(): int = 2\n')
-os.utime(p, ns=(before.st_atime_ns, before.st_mtime_ns))
-assert p.stat().st_size == before.st_size
-assert p.stat().st_mtime_ns == before.st_mtime_ns
-PY
+cat > "$mutation/change.sh" <<'SH'
+# Rewrite a file to different content of the same size and the same mtime (ns).
+p=$1
+size=$(wc -c < "$p")
+before=$(stat -c %y "$p")
+touch -r "$p" "$p.stamp"
+printf 'fun secondValue(): int = 2\n' > "$p"
+touch -r "$p.stamp" "$p"
+rm -f "$p.stamp"
+[ "$(wc -c < "$p")" = "$size" ] && [ "$(stat -c %y "$p")" = "$before" ]
+SH
 cat > "$mutation/first.ab" <<EOF
 import "abla/sys/linux/process"
 fun string.discoveryClash(): int = 1
 fun firstMutation(): int {
-    val command = linuxCommand("python3")
-    command.argument("$mutation/change.py")
+    val command = linuxCommand("bash")
+    command.argument("$mutation/change.sh")
     command.argument("$mutation/value.ab")
     command.run()
 }
@@ -155,23 +157,13 @@ done
 stable_output=$(paths "$work/stable-first.out")
 [[ -n $stable_output && $(printf '%s\n' "$stable_output" | wc -l) -eq 1 ]] || fail 'one stable bundle'
 stable_root="$stable_output.ab"
-python3 - "$stable_root" "$work/stable-state.json" <<'PY'
-import hashlib, json, pathlib, sys
-p = pathlib.Path(sys.argv[1]); s = p.stat()
-pathlib.Path(sys.argv[2]).write_text(json.dumps([s.st_dev, s.st_ino, s.st_mtime_ns, hashlib.sha256(p.read_bytes()).hexdigest()]))
-PY
+stable_state() { stat -c '%d %i %y' "$stable_root"; sha256sum "$stable_root" | cut -d' ' -f1; }
+stable_state > "$work/stable-state.txt"
 "$compiler" test -v "$stable" > "$work/stable-again.out" 2> "$work/stable-again.err" || fail 'unchanged stable bundle'
-python3 - "$stable_root" "$work/stable-state.json" <<'PY'
-import hashlib, json, pathlib, sys
-p = pathlib.Path(sys.argv[1]); s = p.stat()
-assert [s.st_dev, s.st_ino, s.st_mtime_ns, hashlib.sha256(p.read_bytes()).hexdigest()] == json.loads(pathlib.Path(sys.argv[2]).read_text()), 'unchanged generated bundle was rewritten'
-p.write_text('invalid generated input\n')
-PY
+[[ $(stable_state) == $(cat "$work/stable-state.txt") ]] || fail 'unchanged generated bundle was rewritten'
+printf 'invalid generated input\n' > "$stable_root"
 "$compiler" test -v "$stable" > "$work/stable-repair.out" 2> "$work/stable-repair.err" || fail 'repaired stable bundle'
-python3 - "$stable_root" "$work/stable-state.json" <<'PY'
-import hashlib, json, pathlib, sys
-assert hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest() == json.loads(pathlib.Path(sys.argv[2]).read_text())[3], 'generated bundle was not repaired'
-PY
+[[ $(sha256sum "$stable_root" | cut -d' ' -f1) == $(tail -n 1 "$work/stable-state.txt") ]] || fail 'generated bundle was not repaired'
 for run in first again repair; do
     grep -qx '2 passed, 0 failed' "$work/stable-$run.out" || fail "stable bundle results ($run)"
 done

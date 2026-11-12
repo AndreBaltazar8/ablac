@@ -39,17 +39,7 @@ if [[ $(uname -s) == Linux ]]; then
         "$compiler" build tests/cases/secure-fs/fault.ab -o "$out/fault" --fast --no-cache
         printf payload > "$out/read-input"
         strace -qq -yy -e trace=read -o "$out/read.trace" "$out/fault" "$out/read-input" read
-        read_ordinal=$(python3 - "$out/read.trace" <<'PY'
-import sys
-count = 0
-for line in open(sys.argv[1]):
-    if line.startswith('read('):
-        count += 1
-        if '/read-input>' in line:
-            print(count); break
-else: raise SystemExit('missing fixture read')
-PY
-        )
+        read_ordinal=$(awk '/^read\(/ { count++; if (index($0, "/read-input>")) { print count; found = 1; exit } } END { if (!found) exit 1 }' "$out/read.trace") || { echo "secure fs: missing fixture read" >&2; exit 1; }
         strace -qq -e "inject=read:error=EINTR:when=$read_ordinal" -o "$out/read-interrupted.trace" \
             "$out/fault" "$out/read-input" read
         : > "$out/interrupted"
