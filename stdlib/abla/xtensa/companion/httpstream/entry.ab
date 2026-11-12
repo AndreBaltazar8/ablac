@@ -1,0 +1,243 @@
+// Installer-only bounded HTTP/1.1 response framing over any chunk source.
+import "abla/bytes"
+import "abla/http"
+import "abla/tls/hosted"
+import "abla/fs/secure"
+
+class InstallerHttpChunk(val data: string, val eof: bool, val error: string = "")
+resource interface InstallerHttpSource {
+    fun readChunk(maximum: int): InstallerHttpChunk
+}
+class InstallerHttpResult(val status: int, val location: string, val error: string)
+private class InstallerHttpCursor(var input: string = "", var position: int = 0,
+    var eof: bool = false, var error: string = "")
+
+private fun InstallerHttpCursor.fill(var source: InstallerHttpSource): bool {
+    if (this.position < this.input.size) return true
+    if (this.eof || this.error != "") return false
+    val part = source.readChunk(65536)
+    if (part.error != "") { this.error = part.error; return false }
+    if (part.data.size > 65536 || (part.data.size == 0 && !part.eof)) {
+        this.error = "source"
+        return false
+    }
+    this.input = part.data
+    this.position = 0
+    this.eof = part.eof
+    part.data.size > 0
+}
+private fun InstallerHttpCursor.byte(var source: InstallerHttpSource): int {
+    if (!this.fill(source)) return -1
+    val result = int(this.input[this.position])
+    this.position += 1
+    result
+}
+private fun InstallerHttpCursor.take(var source: InstallerHttpSource, maximum: int): string {
+    if (!this.fill(source)) return ""
+    var count = this.input.size - this.position
+    if (count > maximum) count = maximum
+    val result = this.input.slice(this.position, this.position + count)
+    this.position += count
+    result
+}
+private fun InstallerHttpCursor.line(var source: InstallerHttpSource, maximum: int): string {
+    val out = byteBuffer()
+    while (true) {
+        val byte = this.byte(source)
+        if (byte < 0) { if (this.error == "") this.error = "invalid"; return "" }
+        if (byte == 13) {
+            val next = this.byte(source)
+            if (next != 10 && this.error == "") this.error = "invalid"
+            return out.toText()
+        }
+        if (byte == 10 || out.size() >= maximum) { this.error = "invalid"; return "" }
+        out.appendByteValue(byte)
+    }
+}
+private fun installerTrim(value: string): string {
+    var left = 0
+    var right = value.size
+    while (left < right && (value[left] == 32 || value[left] == 9)) left += 1
+    while (right > left && (value[right - 1] == 32 || value[right - 1] == 9)) right -= 1
+    value.slice(left, right)
+}
+private fun installerDecimalLength(text: string): int {
+    if (text == "") return -1
+    var result = 0
+    for (byte in text) {
+        if (byte < 48 || byte > 57) return -1
+        val digit = byte - 48
+        if (result > (9223372036854775807 - digit) / 10) return -1
+        result = result * 10 + digit
+    }
+    result
+}
+private fun installerChunkLength(line: string, maximum: int): int {
+    var value = 0
+    var i = 0
+    while (i < line.size && line[i] != 59) {
+        val byte = line[i]
+        var digit = -1
+        if (byte >= 48 && byte <= 57) digit = byte - 48
+        else if (byte >= 65 && byte <= 70) digit = byte - 55
+        else if (byte >= 97 && byte <= 102) digit = byte - 87
+        if (digit < 0 || value > (maximum - digit) / 16) return -1
+        value = value * 16 + digit
+        i += 1
+    }
+    if (i == 0 || value > maximum) return -1
+    while (i < line.size) { if (line[i] < 32 || line[i] == 127) return -1; i += 1 }
+    value
+}
+private fun installerWriteBody(var cursor: InstallerHttpCursor, var source: InstallerHttpSource,
+    output: SecureFile, count: int): string {
+    var left = count
+    while (left > 0) {
+        val part = cursor.take(source, if (left < 65536) left else 65536)
+        if (part.size == 0) return if (cursor.error == "") "invalid" else cursor.error
+        val error = output.writeChecked(part)
+        if (error != "") return error
+        left -= part.size
+    }
+    ""
+}
+
+// Writes only a successful 200 response body; redirects return their Location
+// without writing. All framing and the maximum apply before accepting bytes.
+fun installerHttpResponse(var source: InstallerHttpSource, output: SecureFile,
+    maximumBody: int): InstallerHttpResult {
+    if (maximumBody < 0 || output.descriptor < 0) return InstallerHttpResult(0, "", "invalid")
+    val cursor = InstallerHttpCursor()
+    var status = 0
+    var location = ""
+    var length = -1
+    var transfer = ""
+    var headersSize = 0
+    var interim = 0
+    while (true) {
+        val first = cursor.line(source, 8192)
+        if (cursor.error != "") return InstallerHttpResult(0, "", cursor.error)
+        if ((!first.startsWith("HTTP/1.1 ") &&
+            !first.startsWith("HTTP/1.0 "))) return InstallerHttpResult(0, "", "invalid")
+        status = httpResponseStatusAt(first + "\r\n", 0)
+        if (status < 100 || status > 599) return InstallerHttpResult(0, "", "invalid")
+        length = -1
+        transfer = ""
+        location = ""
+        var hasLength = false
+        while (true) {
+            val line = cursor.line(source, 8192)
+            if (cursor.error != "") return InstallerHttpResult(0, "", cursor.error)
+            headersSize += line.size + 2
+            if (headersSize > 65536) return InstallerHttpResult(0, "", "invalid")
+            if (line == "") break
+            val colon = line.indexOf(":", 0)
+            if (colon <= 0 || httpNameHasNonToken(line, 0, colon)) return InstallerHttpResult(0, "",
+                "invalid")
+            val name = line.slice(0, colon)
+            val value = installerTrim(line.slice(colon + 1, line.size))
+            for (byte in value) if ((byte < 32 && byte != 9) || byte ==
+                127) return InstallerHttpResult(0, "", "invalid")
+            if (httpAsciiEqualInsensitive(name, "Content-Length")) {
+                val parsed = installerDecimalLength(value)
+                if (parsed < 0 || (hasLength && parsed != length)) return InstallerHttpResult(0, "",
+                    "invalid")
+                if (parsed > maximumBody) return InstallerHttpResult(0, "", "limit")
+                length = parsed
+                hasLength = true
+            } else if (httpAsciiEqualInsensitive(name, "Transfer-Encoding")) {
+                if (transfer != "" || !httpAsciiEqualInsensitive(value, "chunked"))
+                    return InstallerHttpResult(0, "", "invalid")
+                transfer = "chunked"
+            } else if (httpAsciiEqualInsensitive(name, "Location")) {
+                if (location != "") return InstallerHttpResult(0, "", "invalid")
+                location = value
+            }
+        }
+        if (length >= 0 && transfer != "") return InstallerHttpResult(0, "", "invalid")
+        if (status >= 100 && status < 200 && status != 101) {
+            interim += 1
+            if (interim > 8) return InstallerHttpResult(0, "", "invalid")
+        } else break
+    }
+    if (status != 200) return InstallerHttpResult(status, location, "")
+    var total = 0
+    if (transfer == "chunked") {
+        while (true) {
+            val line = cursor.line(source, 8192)
+            if (cursor.error != "") return InstallerHttpResult(status, location, cursor.error)
+            val count = installerChunkLength(line, 9223372036854775807)
+            if (count < 0) return InstallerHttpResult(status, location, "invalid")
+            if (count > maximumBody - total) return InstallerHttpResult(status, location, "limit")
+            if (count == 0) {
+                var trailers = 0
+                while (true) {
+                    val trailer = cursor.line(source, 8192)
+                    if (cursor.error != "") return InstallerHttpResult(status, location,
+                        cursor.error)
+                    trailers += trailer.size + 2
+                    if (trailers > 65536) return InstallerHttpResult(status, location, "invalid")
+                    if (trailer == "") break
+                    val colon = trailer.indexOf(":", 0)
+                    if (colon <= 0 || httpNameHasNonToken(trailer, 0, colon) ||
+                        httpHasControlByte(trailer, colon + 1,
+                            trailer.size)) return InstallerHttpResult(status,
+                                location, "invalid")
+                }
+                break
+            }
+            val error = installerWriteBody(cursor, source, output, count)
+            if (error != "") return InstallerHttpResult(status, location, error)
+            total += count
+            if (cursor.byte(source) != 13 || cursor.byte(source) != 10)
+                return InstallerHttpResult(status, location,
+                    if (cursor.error != "") cursor.error else "invalid")
+        }
+    } else if (length >= 0) {
+        val error = installerWriteBody(cursor, source, output, length)
+        if (error != "") return InstallerHttpResult(status, location, error)
+    } else {
+        while (true) {
+            val part = cursor.take(source, 65536)
+            if (cursor.error != "") return InstallerHttpResult(status, location, cursor.error)
+            if (part.size == 0) break
+            if (part.size > maximumBody - total) return InstallerHttpResult(status, location,
+                "limit")
+            total += part.size
+            val error = output.writeChecked(part)
+            if (error != "") return InstallerHttpResult(status, location, error)
+        }
+    }
+    InstallerHttpResult(status, location, "")
+}
+
+private resource class InstallerTlsInput(val connection: TlsConnection, val timeout: int,
+    val deadline: int): InstallerHttpSource {
+    fun readChunk(maximum: int): InstallerHttpChunk {
+        val wait = httpExchangeWait(this.deadline, this.timeout)
+        if (wait <= 0 || !this.connection.setTimeouts(wait, wait)) return InstallerHttpChunk("",
+            false,
+            "timeout")
+        val data = this.connection.read(maximum)
+        if (data == "" && tlsLastError() != "") return InstallerHttpChunk("", false, "source")
+        InstallerHttpChunk(data, data == "")
+    }
+}
+
+// The production caller supplies no custom CA. A custom CA and port also
+// permit a loopback TLS fixture to exercise framing without public network.
+fun installerHttpsResponse(host: string, target: string, output: SecureFile, maximumBody: int,
+    timeout: int, deadline: int, caPath: string = "", port: int = 443): InstallerHttpResult {
+    val wait = httpExchangeWait(deadline, timeout)
+    if (wait <= 0) return InstallerHttpResult(0, "", "timeout")
+    val connection = if (caPath == "") tlsConnect(host, port, wait, wait, deadline) else
+        tlsConnectWithCa(host, caPath, port, wait, wait)
+    if (connection.handle == -1) return InstallerHttpResult(0, "", "source")
+    val request = httpGet(target, [HttpHeader("User-Agent",
+        "abla-install-xtensa")]).renderForClient(host)
+    val writing = httpExchangeWait(deadline, timeout)
+    if (writing <= 0 || !connection.setTimeouts(writing, writing) ||
+        connection.write(request) != request.size) return InstallerHttpResult(0, "", "source")
+    val source = InstallerTlsInput(move(connection), timeout, deadline)
+    installerHttpResponse(source, output, maximumBody)
+}

@@ -73,6 +73,7 @@ expect_status_42 "$output_directory/uuid"
 "$project_root/tools/test-xtensa-companion-offline.sh" "$compiler"
 "$project_root/tools/test-compiler-capture-process.sh" "$compiler"
 "$project_root/tools/test-xtensa-native.sh" "$compiler"
+"$project_root/tools/test-xtensa-http-stream.sh" "$compiler"
 "$project_root/tools/test-tls-unix.sh" "$compiler"
 
 "$compiler" build "$project_root/tests/cases/modules/filesystem.ab" \

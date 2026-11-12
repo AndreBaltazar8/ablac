@@ -81,7 +81,7 @@ Built into the language rather than imported: `string`, arrays, `Map`,
 | `abla/http/json` | adapters between JSON values and HTTP requests/responses |
 | `abla/compression/gzip` | gzip compression and bounded single-member decompression; `gzipDecompress(input, maxOutputBytes)` collects the result, while `gzipStream` reads bounded chunks. Both reject malformed input and concatenated members. |
 | `abla/archive/tar` | Read bounded POSIX ustar files and directories from memory or a stream, rejecting traversal, duplicates, unsupported entry types and malformed archives |
-| `abla/xtensa/companion` | Installer-internal module, not a stable public API. Offline companion archive verification and descriptor-relative extraction; pinned archive, manifest and file hashes, with 128 MiB compressed and 256 MiB unpacked limits. It does not download, execute or activate tools. |
+| `abla/xtensa/companion` | Installer-internal module, not a stable public API. Offline descriptor-relative extraction spools and validates before writing payloads; limits are 512 MiB compressed and 1 GiB unpacked. The in-memory `companionValidateArchive` retains its 128 MiB / 256 MiB limits. |
 | `abla/fs/secure` | Descriptor-relative operations with component validation, bounded handle reads and directory listings, no-follow opens and no-replace rename. `replaceSymlink` requires a trusted parent; its non-symlink destination check is not atomic against a hostile writer. |
 | `abla/tls/hosted` | dynamically loaded OpenSSL client/listener transport with hostname and certificate verification |
 | `abla/websocket` | bounded RFC 6455 handshake, framing, connection lifecycle, and routed server helpers |

@@ -1,0 +1,83 @@
+import "abla/xtensa/companion/httpstream"
+import "abla/fs/secure"
+import "abla/fs"
+import "abla/sys/linux/process"
+
+resource class Input(val data: string, val piece: int, val stall: bool = false,
+    var pos: int = 0, val failAt: int = -1): InstallerHttpSource {
+    fun readChunk(maximum: int): InstallerHttpChunk {
+        if (this.stall) return InstallerHttpChunk("", false)
+        if (this.failAt >= 0 && this.pos >= this.failAt) return InstallerHttpChunk("", false,
+            "source")
+        var size = this.data.size - this.pos
+        if (size > this.piece) size = this.piece
+        if (size > maximum) size = maximum
+        val part = this.data.slice(this.pos, this.pos + size)
+        this.pos += size
+        InstallerHttpChunk(part, this.pos == this.data.size)
+    }
+}
+fun check(parent: SecureDirectory, root: string, name: string, text: string, piece: int,
+    limit: int, expectedStatus: int, expectedError: string, expectedBody: string,
+    expectedLocation: string = "", stall: bool = false, failAt: int = -1): bool {
+    val output = parent.createFile(name)
+    if (output.descriptor < 0) return false
+    val source = Input(text, piece, stall, 0, failAt)
+    val result = installerHttpResponse(source, output, limit)
+    if (!output.close()) return false
+    val body = Path("$root/$name").readText()
+    if (!parent.remove(name)) return false
+    result.status == expectedStatus && result.error == expectedError &&
+        (expectedBody == "<any>" || body == expectedBody) &&
+        result.location == expectedLocation
+}
+fun main(): int {
+    val root = linuxEnvironment("ABLA_HTTP_STREAM_ROOT").value
+    val parent = secureDirectory(root)
+    for (size in [1, 2, 7, 65536]) {
+        if (!check(parent, root, "a", "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello", size, 5,
+            200, "", "hello")) return 1
+        if (!check(parent, root, "b",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhe\r\n3;x=y\r\nllo\r\n0\r\nX-End: yes\r\n\r\n",
+            size, 5, 200, "", "hello")) return 2
+        if (!check(parent, root, "c", "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nhello", size, 5,
+            200, "", "hello")) return 3
+        if (!check(parent, root, "d",
+            "HTTP/1.1 302 Found\r\nLocation: https://github.com/a\r\nContent-Length: 0\r\n\r\n",
+            size, 5, 302, "", "", "https://github.com/a")) return 4
+        if (!check(parent, root, "e", "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhi", size, 5,
+            200, "invalid", "hi")) return 5
+        if (!check(parent, root, "f",
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n", size, 5,
+            0, "invalid", "")) return 6
+        if (!check(parent, root, "g", "HTTP/1.1 200 OK\r\n\r\nhello", size, 4, 200, "limit",
+            "<any>")) return 7
+        if (!check(parent, root, "h", "", size, 5, 0, "source", "", "", true)) return 8
+        if (!check(parent, root, "i",
+            "HTTP/1.1 200 OK\r\nContent-Length: 9223372036854775807\r\n\r\n", size, 5, 0, "limit",
+            "")) return 9
+        if (!check(parent, root, "j",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n7fffffffffffffff\r\n", size, 5,
+            200, "limit", "")) return 10
+        if (!check(parent, root, "k",
+            "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\n", size, 5, 0,
+            "invalid", "")) return 11
+        if (!check(parent, root, "l",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhiX\n", size, 5, 200,
+            "invalid", "hi")) return 12
+        if (!check(parent, root, "m",
+            "HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551616\r\n\r\n", size, 5, 0,
+            "invalid", "")) return 13
+        if (!check(parent, root, "n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 9223372036854775808\r\n\r\n", size, 5, 0, "invalid",
+            "")) return 14
+    }
+    if (!check(parent, root, "o", "HTTP/1.1 200 OK\r\n\r\n", 1, 5, 0, "source", "", "", false,
+        16)) return 15
+    val chunkPrefix = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi"
+    if (!check(parent, root, "p", chunkPrefix + "\r\n0\r\n\r\n", 1, 5, 200, "source", "hi",
+        "", false, chunkPrefix.size)) return 16
+    if (!check(parent, root, "q", chunkPrefix + "\r\n0\r\n\r\n", 1, 5, 200, "source", "hi",
+        "", false, chunkPrefix.size + 1)) return 17
+    0
+}

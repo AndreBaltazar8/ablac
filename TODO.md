@@ -396,10 +396,9 @@
   four `perf stat -e cpu_core/instructions/u` runs; both include process startup and reading input. Abla materializes
   the result in memory while gzip writes to /dev/null. Tests: `tools/test-gzip-inflate.sh`. Descriptor-relative
   no-follow and exclusive filesystem primitives are in `abla/fs/secure`, with Darwin exercised in macOS CI.
-  The native offline library caps gzip input at 128 MiB and decoded tar at 256 MiB. `gzipStream`
-  now supports bounded input/output chunks; `tarStream` reads bounded files without retaining the archive.
-  Streaming HTTPS and installer adoption are still needed
-  to lift those in-memory limits. On the real Linux companion, three paired release runs on one P-core
+  Native streamed extraction and download cap gzip input at 512 MiB and decoded tar at 1 GiB;
+  `companionValidateArchive` retains its 128 MiB / 256 MiB in-memory limits. On the real Linux
+  companion, three paired release runs on one P-core
   measured a zero-initialized byte-window prototype at 42.625G user instructions / 1.942 s versus
   44.752G / 1.958 s with an `array<u8>` window. The existing non-streaming decoder remains unchanged:
   paired builds before/after appending the streaming decoder measured 28,749,205,319 versus
@@ -423,7 +422,14 @@
   183,952 KiB peak RSS (three runs, 2026-11-11); gzip alone took 1.563 s, tar scan over a cached plain tar
   0.027 s including reading it, and concatenating file slices 0.052 s including reading/scanning. The optional
   cached-archive test is `ABLA_TEST_XTENSA_COMPANION=<archive> tools/test-xtensa-companion-offline.sh`; the
-  release-packaged installer, download, activation and helper execution remain open.
+  separately packaged native command still awaits completion of the three-platform install probe.
+  Streaming extraction of the real archive matched the Python tree and took median 4.23 s / 87,560 KiB
+  across three release runs including spooling, two inflates, writes and verification; the earlier
+  1.553 s figure covers gzip + tar only. With 4 MiB GC growth the same extraction took median 4.33 s /
+  8,680 KiB; the native CLI uses that growth unless the user supplies a GC growth or stress setting.
+  The complete release CLI, including real helper checks and activation in Ubuntu 24.04, took median
+  4.40 s / 29,112 KiB peak RSS over three runs of one build; GNU time may include a waited-for helper's peak.
+  A 300 MiB synthetic file installed at 96,796 KiB peak under the default GC settings.
   The offline test previously left published 0555 directories in build/, preventing ordinary clean and
   worktree removal; its exit trap restores owner write permission even when a case fails.
   The manual installed-toolchain probe used to exercise only the Python installer; its native matrix now
@@ -891,10 +897,12 @@
   cohort before/after. v0.2.48 does not contain routing. See
   [design and evidence](docs/design/xtensa-companion.md).
   #787 native installer: package the native command alongside the Python
-  installer; keep Python as the default until the native install probe passes
-  on Linux and both macOS hosts and the release switch is approved. The native
-  in-memory limits are 128 MiB compressed and 256 MiB unpacked; streaming
-  inflate remains needed to lift them.
+  installer; Python remains the default in the next release. Probe run
+  `43163669836` passed both installers on Linux and both macOS hosts. Repeat the
+  same six-leg probe with the streaming native installer before proposing the
+  default switch to André for the following release. The native
+  streaming limits are 512 MiB compressed and 1 GiB unpacked; the explicit
+  in-memory archive validation helper retains its smaller 128 MiB / 256 MiB limits.
 - [ ] **v0.2.49 release-note draft: Xtensa migration (planned break).** Publish this
   with the release; v0.2.48 does not implement the new routing:
 

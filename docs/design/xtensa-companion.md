@@ -47,8 +47,9 @@ python3 tools/install-xtensa-llvm.py --toolchain-root /path/to/abla-toolchain \
 ```
 
 Packages also include the experimental `bin/abla-install-xtensa-native` with
-the same flags and catalog. It limits compressed archives to 128 MiB and
-unpacked contents to 256 MiB while held in memory. The Python command remains
+the same flags and catalog. It limits compressed archives to 512 MiB and
+unpacked contents to 1 GiB, using a private spool and two validation passes
+before publication. The Python command remains
 the default until the native installer has passed the install probe on all
 three supported hosts.
 

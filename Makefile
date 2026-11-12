@@ -262,6 +262,7 @@ test-serial: ablac
 	tools/test-secure-fs.sh $(COMPILER)
 	tools/test-xtensa-companion-offline.sh $(COMPILER)
 	tools/test-xtensa-native.sh $(COMPILER)
+	tools/test-xtensa-http-stream.sh $(COMPILER)
 	tools/test-process-pipeline.sh $(COMPILER)
 	tools/test-runtime-checks.sh $(COMPILER)
 	tools/test-float-integer-saturation.sh $(COMPILER)

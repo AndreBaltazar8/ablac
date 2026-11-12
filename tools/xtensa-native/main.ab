@@ -3,10 +3,12 @@ import "abla/xtensa/companion/native"
 import "abla/fs"
 import "abla/fs/secure"
 import "abla/crypto"
+import "abla/memory"
 import "abla/platform/host"
 import "abla/process/arguments"
 import "abla/simd/target"
 import "abla/sys/linux"
+import "abla/sys/linux/process"
 import "abla/sys/linux/random"
 
 private fun fail(message: string): int {
@@ -25,7 +27,8 @@ private fun activate(parent: SecureDirectory, version: string): bool {
     if (!random.succeeded) return false
     parent.replaceSymlink("current", ".current-${hexEncode(random.bytes)}", version)
 }
-private fun cleanupDownload(parent: SecureDirectory, var directory: SecureDirectory, name: string): bool {
+private fun cleanupDownload(parent: SecureDirectory, var directory: SecureDirectory,
+    name: string): bool {
     var ok = true
     if (directory.descriptor >= 0) {
         val kind = directory.entryKind("archive.tar.gz")
@@ -59,6 +62,10 @@ private fun imageRoot(): string {
 }
 
 fun main(): int {
+    // Keep discarded streaming chunks from accumulating to the normal 64 MiB
+    // growth threshold. Preserve an explicit user-selected GC policy.
+    if (!linuxEnvironment("ABLA_GC_GROWTH").found && !linuxEnvironment("ABLA_GC_STRESS").found)
+        memorySetCollectionGrowth(4194304)
     var root = imageRoot()
     var catalog = ""
     var version = ""
@@ -74,12 +81,14 @@ fun main(): int {
             if (equals >= 0) return fail("unexpected value for $arg")
             linuxWriteStandardOutput("usage: abla-install-xtensa-native [--toolchain-root PATH] [--catalog PATH] [--version VERSION] [--archive PATH] [--verify]\n")
             return 0
-        } else if (arg == "--toolchain-root" || arg == "--catalog" || arg == "--version" || arg == "--archive") {
+        } else if (arg == "--toolchain-root" || arg == "--catalog" || arg == "--version" || arg ==
+            "--archive") {
             var value = ""
             if (equals >= 0) value = argument.slice(equals + 1, argument.size)
             else {
                 i += 1
-                if (i >= processArgumentCount() || processArgument(i).startsWith("--")) return fail("missing value for $arg")
+                if (i >= processArgumentCount() ||
+                    processArgument(i).startsWith("--")) return fail("missing value for $arg")
                 value = processArgument(i)
             }
             if (value == "") return fail("missing value for $arg")
@@ -101,11 +110,13 @@ fun main(): int {
     val host = hostName()
     if (host == "") return fail("unsupported host")
     val parentPath = "$root/lib/abla/xtensa-llvm"
-    if (!verify && !Path(parentPath).createDirectories(0o755)) return fail("cannot create companion directory")
+    if (!verify &&
+        !Path(parentPath).createDirectories(0o755)) return fail("cannot create companion directory")
     val parent = secureDirectory(parentPath)
     if (parent.descriptor < 0) return fail("cannot open companion directory")
     val currentKind = parent.entryKind("current")
-    if (!verify && currentKind != "missing" && currentKind != "symlink") return fail("current is not a symlink")
+    if (!verify && currentKind != "missing" && currentKind !=
+        "symlink") return fail("current is not a symlink")
     if (verify && version == "") {
         if (currentKind != "symlink") return fail("no active companion")
         version = Path("$parentPath/current").linkTarget()
@@ -138,42 +149,53 @@ fun main(): int {
     var temporary = ""
     var downloadDirectory = SecureDirectory(-1)
     if (archivePath == "") {
-        val downloaded = nativeDownload(selection.url)
-        if (downloaded.error != "") return fail(downloaded.error)
-        if (hexEncode(sha256(downloaded.bytes)) != pins.archiveSha256) return fail("archive hash mismatch")
         val random = secureRandomBytes(16)
         if (!random.succeeded) return fail("random")
         temporary = ".download-${hexEncode(random.bytes)}"
-        if (!parent.createDirectory(temporary, 0o700)) return fail("download temporary directory")
+        val made = parent.createDirectoryStatus(temporary, 0o700)
+        if (made == -28 || made == -122) return fail("disk_full")
+        if (made != 0) return fail("download temporary directory")
         downloadDirectory = parent.openDirectory(temporary)
-        if (downloadDirectory.descriptor < 0 || !downloadDirectory.setPermissions(0o700)) {
-            if (!cleanupDownload(parent, downloadDirectory, temporary)) return fail("download cleanup: $temporary")
-            return fail("download temporary directory")
+        val mode = downloadDirectory.setPermissionsChecked(0o700)
+        if (mode != "") {
+            if (!cleanupDownload(parent, downloadDirectory,
+                temporary)) return fail("download cleanup: $temporary; $mode")
+            return fail(if (mode == "disk_full") "disk_full" else "download temporary directory")
         }
         val output = downloadDirectory.createFile("archive.tar.gz", 0o600)
-        var wrote = output.descriptor >= 0
-        if (wrote && !output.write(downloaded.bytes)) wrote = false
-        if (wrote && !output.sync()) wrote = false
-        if (!output.close()) wrote = false
-        if (!wrote) {
-            if (!cleanupDownload(parent, downloadDirectory, temporary)) return fail("download cleanup: $temporary")
-            return fail("download temporary write")
+        var downloadError = ""
+        if (output.descriptor == -28 || output.descriptor == -122) downloadError = "disk_full"
+        else if (output.descriptor < 0) downloadError = "download temporary write"
+        if (downloadError == "") downloadError = nativeDownloadTo(selection.url, output)
+        if (downloadError == "") {
+            val synced = output.syncChecked()
+            if (synced != "") downloadError = if (synced ==
+                "disk_full") "disk_full" else "download temporary write"
+        }
+        if (!output.close() && downloadError == "") downloadError = "download temporary write"
+        if (downloadError != "") {
+            if (!cleanupDownload(parent, downloadDirectory,
+                temporary)) return fail("download cleanup: $temporary; $downloadError")
+            return fail(downloadError)
         }
         archivePath = "$parentPath/$temporary/archive.tar.gz"
     }
     val archive = Path(archivePath)
     val archiveParent = secureDirectory(archive.parent().text)
     val archiveFile = archiveParent.openRegularFile(archive.name())
-    val installed = extractCompanionChecked(parent, archiveFile, pins, { name: string ->
+    val check = { name: string ->
         nativeCheckTools("$parentPath/$name", pins.llvmVersion)
-    })
+    }
+    val installed = if (temporary != "") extractSpooledCompanionChecked(parent, archiveFile, pins,
+        check) else extractCompanionChecked(parent, archiveFile, pins, check)
     if (temporary != "") {
         archiveFile.close()
-        if (!cleanupDownload(parent, downloadDirectory, temporary)) return fail("download cleanup: $temporary")
+        if (!cleanupDownload(parent, downloadDirectory, temporary)) {
+            return fail(nativeDownloadCleanupError(temporary, installed))
+        }
     }
     if (installed.error != "") {
-        if (installed.leftoverStage != "") return fail("${installed.error}: ${installed.leftoverStage}")
-        return fail(installed.error)
+        return fail(nativeInstallError(installed))
     }
     if (!activate(parent, version)) return fail("activation failed")
     linuxWriteStandardOutput("Xtensa companion installed and selected: $parentPath/$version\n")

@@ -2,6 +2,7 @@
 import "abla/xtensa/companion"
 import "abla/http"
 import "abla/http/tls"
+import "abla/xtensa/companion/httpstream"
 import "abla/json"
 import "abla/text"
 import "abla/sys/linux/process"
@@ -15,6 +16,25 @@ import "abla/sys/linux/random"
 class NativeSelection(val pins: CompanionPins, val url: string, val error: string)
 class NativeDownload(val bytes: string, val error: string)
 class NativeUrl(val host: string, val target: string, val error: string)
+fun nativeDownloadCleanupError(temporary: string, installed: CompanionExtractResult): string {
+    var details = "download cleanup: $temporary"
+    if (installed.leftoverStage != "") details = "$details, ${installed.leftoverStage}"
+    if (installed.leftoverSpool != "") details = "$details, ${installed.leftoverSpool}"
+    if (installed.error != "") details = "$details; ${installed.error}"
+    if (installed.cause != "") details = "$details; ${installed.cause}"
+    if (installed.operation != "") details =
+        "$details; ${installed.operation}: ${installed.errorNumber}"
+    details
+}
+fun nativeInstallError(installed: CompanionExtractResult): string {
+    var details = installed.error
+    if (installed.leftoverStage != "") details = "$details: ${installed.leftoverStage}"
+    if (installed.leftoverSpool != "") details = "$details: ${installed.leftoverSpool}"
+    if (installed.cause != "") details = "$details; ${installed.cause}"
+    if (installed.operation != "") details =
+        "$details; ${installed.operation}: ${installed.errorNumber}"
+    details
+}
 private fun nativeEmptyPins(): CompanionPins = CompanionPins("", "", "", "", "", "", "")
 private fun nativeSelectionError(error: string): NativeSelection =
     NativeSelection(nativeEmptyPins(), "", error)
@@ -198,4 +218,35 @@ fun nativeCheckTools(tree: string, llvmVersion: string, timeoutMilliseconds: int
     directory.close()
     if (!parent.remove(name, true)) error = "helper cleanup: $name"
     error
+}
+
+// Streams an HTTPS response into an already private file. Only a 200 body is
+// written; redirect targets are rechecked against the fixed host allow-list.
+fun nativeDownloadTo(url: string, output: SecureFile, timeoutMilliseconds: int = 30000): string {
+    if (timeoutMilliseconds <= 0 || timeoutMilliseconds > 600000) return "invalid timeout"
+    if (output.descriptor < 0) return "spool_open"
+    val deadline = linuxMonotonicMilliseconds() + timeoutMilliseconds
+    var current = url
+    var redirects = 0
+    while (redirects <= 5) {
+        val parsed = nativeDownloadUrl(current, redirects == 0)
+        if (parsed.error != "") return parsed.error
+        val remaining = deadline - linuxMonotonicMilliseconds()
+        if (remaining <= 0) return "download timeout"
+        val result = installerHttpsResponse(parsed.host, parsed.target, output, 536870912,
+            if (remaining < 5000) remaining else 5000, deadline)
+        if (result.error != "") {
+            if (result.error == "disk_full") return "disk_full"
+            if (result.error == "timeout") return "download timeout"
+            if (result.error == "limit") return "download limit"
+            return "download failed"
+        }
+        if (result.status == 200) return ""
+        if (result.status != 301 && result.status != 302 && result.status != 303 &&
+            result.status != 307 && result.status != 308) return "HTTP ${result.status}"
+        current = result.location
+        if (current == "") return "redirect missing location"
+        redirects += 1
+    }
+    "too many redirects"
 }
