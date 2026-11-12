@@ -405,7 +405,7 @@ test-serial: ablac
 	tools/test-frontend-locals-scaling.sh $(COMPILER)
 	tools/test-stm-wasm-unwinding.sh $(COMPILER)
 	tools/test-sysroot-path-symbols.sh $(COMPILER)
-	python3 tools/test-project-path-symbols.py $(COMPILER)
+	tools/test-project-path-symbols.sh $(COMPILER)
 	tools/test-frontend-call-chain-scaling.sh $(COMPILER)
 	tools/test-recursive-class-types.sh $(COMPILER)
 	tools/test-compiler-memory-budget.sh $(COMPILER_PAYLOAD)
