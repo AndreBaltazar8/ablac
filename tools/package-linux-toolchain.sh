@@ -83,13 +83,6 @@ exec "$root/libexec/ablac.bin" "$@"
 SH
 chmod 0755 "$bundle/bin/ablac"
 
-# Build before dependency collection so the native installer receives the same
-# loader and bundled libraries as the other toolchain executables.
-mkdir -p "$working/native-build"
-"$bundle/bin/ablac" build "$abla_root/tools/xtensa-native/main.ab" --no-cache \
-    -o "$working/native-build/installer"
-cp "$working/native-build/installer" "$bundle/libexec/abla-install-xtensa-native"
-
 copy_dependencies() {
     local executable=$1
     local dependency
@@ -120,6 +113,26 @@ for executable in "$bundle/libexec/ablac.bin" "$bundle"/libexec/*; do
         patchelf --set-rpath '$ORIGIN/../lib' "$executable"
     fi
 done
+for library in "$bundle"/lib/*.so*; do
+    # shellcheck disable=SC2016
+    patchelf --set-rpath '$ORIGIN' "$library"
+done
+
+# Build the native installer with the packaged compiler only now: before the
+# loops above, libexec/ablac.bin still names the build host's loader and cannot
+# start here. Then give the installer the same loader and bundled libraries.
+mkdir -p "$working/native-build"
+"$bundle/bin/ablac" build "$abla_root/tools/xtensa-native/main.ab" --no-cache \
+    -o "$working/native-build/installer"
+installer="$bundle/libexec/abla-install-xtensa-native"
+cp "$working/native-build/installer" "$installer"
+chmod 0755 "$installer"
+copy_dependencies "$installer"
+if patchelf --print-interpreter "$installer" >/dev/null 2>&1; then
+    patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 "$installer"
+    # shellcheck disable=SC2016
+    patchelf --set-rpath '$ORIGIN/../lib' "$installer"
+fi
 for library in "$bundle"/lib/*.so*; do
     # shellcheck disable=SC2016
     patchelf --set-rpath '$ORIGIN' "$library"
