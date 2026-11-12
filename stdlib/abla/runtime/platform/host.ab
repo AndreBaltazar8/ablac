@@ -3780,6 +3780,33 @@ trusted fun __ablaRuntimeDarwinKill(process: int, signal: int): int {
     __ablaRuntimeDarwinResult(ablaDarwinSyscall(37, process, darwin, 1, 0, 0, 0))
 }
 
+// nanosleep (35) over __semwait_signal (334), which libSystem's nanosleep uses: no condition
+// or mutex semaphore, a relative timeout in seconds and nanoseconds. Elapsing the timeout is
+// reported as ETIMEDOUT (60), which is success here; an interruption is EINTR (4) and leaves
+// the remaining time unset (the caller gets -4 and retries with the same request).
+trusted fun __ablaRuntimeDarwinNanosleep(request: int): int {
+    if (request == 0) return -14
+    val seconds = ablaRuntimeLoadI64(request)
+    val nanoseconds = ablaRuntimeLoadI64(request + 8)
+    if (seconds < 0 || nanoseconds < 0 || nanoseconds >= 1000000000) return -22
+    val raw = ablaDarwinSyscall(334, 0, 0, 1, 1, seconds, nanoseconds)
+    if (raw == -60 || raw == 0) return 0
+    __ablaRuntimeDarwinResult(raw)
+}
+
+// getrandom (278, 318) over getentropy (500), which takes at most 256 bytes a call.
+trusted fun __ablaRuntimeDarwinGetrandom(buffer: int, length: int): int {
+    if (length < 0) return -22
+    var done = 0
+    while (done < length) {
+        val chunk = if (length - done > 256) 256 else length - done
+        val raw = ablaDarwinSyscall(500, buffer + done, chunk, 0, 0, 0, 0)
+        if (raw < 0) return __ablaRuntimeDarwinResult(raw)
+        done = done + chunk
+    }
+    length
+}
+
 trusted fun __ablaRuntimeDarwinSyscall(
     number: int,
     argument0: int,
@@ -3866,6 +3893,10 @@ trusted fun __ablaRuntimeDarwinSyscall(
         if (raw >= 0 && argument1 == 3) return __ablaRuntimeLinuxOpenFlags(raw)
         return __ablaRuntimeDarwinResult(raw)
     }
+    // Time and random (#811 group 7): nanosleep, getrandom. clock_gettime stays with the adapter:
+    // CLOCK_MONOTONIC has no system call (libSystem reads the commpage).
+    if (number == 35) return __ablaRuntimeDarwinNanosleep(argument0)
+    if (number == 278 || number == 318) return __ablaRuntimeDarwinGetrandom(argument0, argument1)
     // The stat family, readlink, openat, getdents and getcwd. The running image's path
     // ("/proc/self/exe") stays with the C adapter, which holds its identity.
     if (number == 5) {
