@@ -51,8 +51,13 @@ fun SecureDirectory.createFile(name: string, mode: int = 0o600): SecureFile {
 }
 
 fun SecureDirectory.createDirectory(name: string, mode: int = 0o700): bool {
-    if (this.descriptor < 0 || !secureComponent(name) || mode < 0 || mode > 0o777) return false
-    linuxSyscall3(258, this.descriptor, nativeCStringAddress(name), mode) == 0
+    this.createDirectoryStatus(name, mode) == 0
+}
+
+// Zero on success, otherwise a negative errno.
+fun SecureDirectory.createDirectoryStatus(name: string, mode: int = 0o700): int {
+    if (this.descriptor < 0 || !secureComponent(name) || mode < 0 || mode > 0o777) return -22
+    linuxSyscall3(258, this.descriptor, nativeCStringAddress(name), mode)
 }
 
 // Returns zero or negative errno; unsupported platforms/filesystems fail closed.
@@ -89,13 +94,47 @@ fun SecureDirectory.remove(name: string, directory: bool = false): bool {
     linuxSyscall3(263, this.descriptor, nativeCStringAddress(name), if (directory) 512 else 0) == 0
 }
 fun SecureDirectory.sync(): bool = this.descriptor >= 0 && linuxSyscall1(74, this.descriptor) == 0
+fun SecureDirectory.syncChecked(): string {
+    if (this.descriptor < 0) return "invalid"
+    val status = linuxSyscall1(74, this.descriptor)
+    if (status == 0) "" else if (status == -28 || status == -122) "disk_full" else "sync"
+}
 fun SecureFile.sync(): bool = this.descriptor >= 0 && linuxSyscall1(74, this.descriptor) == 0
+fun SecureFile.syncChecked(): string {
+    if (this.descriptor < 0) return "invalid"
+    val status = linuxSyscall1(74, this.descriptor)
+    if (status == 0) "" else if (status == -28 || status == -122) "disk_full" else "sync"
+}
 fun SecureFile.write(contents: string): bool = this.descriptor >= 0 &&
     linuxWriteAll(this.descriptor, contents)
+// An empty result means success; disk-full includes quota exhaustion.
+fun SecureFile.writeChecked(contents: string): string {
+    if (this.descriptor < 0) return "invalid"
+    val address = nativeStringDataAddress(contents)
+    var written = 0
+    while (written < contents.size) {
+        val count = linuxSyscall3(1, this.descriptor, address + written, contents.size - written)
+        if (count == -4) continue
+        if (count == -28 || count == -122) return "disk_full"
+        if (count <= 0) return "write"
+        written += count
+    }
+    ""
+}
 fun SecureFile.setPermissions(mode: int): bool = this.descriptor >= 0 && mode >= 0 && mode <=
     0o777 && linuxSyscall2(91, this.descriptor, mode) == 0
 fun SecureDirectory.setPermissions(mode: int): bool = this.descriptor >= 0 && mode >= 0 && mode <=
     0o777 && linuxSyscall2(91, this.descriptor, mode) == 0
+fun SecureFile.setPermissionsChecked(mode: int): string {
+    if (this.descriptor < 0 || mode < 0 || mode > 0o777) return "invalid"
+    val status = linuxSyscall2(91, this.descriptor, mode)
+    if (status == 0) "" else if (status == -28 || status == -122) "disk_full" else "permissions"
+}
+fun SecureDirectory.setPermissionsChecked(mode: int): string {
+    if (this.descriptor < 0 || mode < 0 || mode > 0o777) return "invalid"
+    val status = linuxSyscall2(91, this.descriptor, mode)
+    if (status == 0) "" else if (status == -28 || status == -122) "disk_full" else "permissions"
+}
 
 fun SecureFile.close(): bool {
     if (this.descriptor < 0) return true
@@ -113,6 +152,27 @@ fun SecureDirectory.close(): bool {
 // Reads from the handle's current offset through EOF, with a caller-provided
 // byte limit. A one-byte probe detects overflow without trusting a stat size.
 class SecureReadResult(val data: string, val error: string)
+class SecureChunkResult(val data: string, val eof: bool, val error: string)
+
+// A bounded read advances the open handle; EOF is reported on a zero-byte read.
+fun SecureFile.readChunk(maxBytes: int): SecureChunkResult {
+    if (this.descriptor < 0 || maxBytes <= 0) return SecureChunkResult("", false, "invalid")
+    val maximum = if (maxBytes < 65536) maxBytes else 65536
+    val buffer = nativeByteBuffer(maximum + 1)
+    var count = linuxSyscall3(0, this.descriptor, nativePointerAddress(buffer.address), maximum)
+    while (count == -4) count = linuxSyscall3(0, this.descriptor,
+        nativePointerAddress(buffer.address), maximum)
+    if (count < 0) { buffer.close(); return SecureChunkResult("", false, "read") }
+    if (count == 0) { buffer.close(); return SecureChunkResult("", true, "") }
+    SecureChunkResult(buffer.adoptString(count), false, "")
+}
+
+fun SecureFile.rewind(): bool = this.descriptor >= 0 && linuxSyscall3(8, this.descriptor, 0, 0) == 0
+
+// The duplicate has its own lifetime and close-on-exec, but shares the file offset.
+fun SecureFile.duplicate(): SecureFile = if (this.descriptor < 0) SecureFile(-22) else
+    SecureFile(linuxSyscall3(72, this.descriptor, 1030, 0))
+
 fun SecureFile.read(maxBytes: int): SecureReadResult {
     if (this.descriptor < 0 || maxBytes < 0) return SecureReadResult("", "invalid")
     val output = byteBuffer()
@@ -222,6 +282,16 @@ fun SecureDirectory.entryKind(name: string): string {
     }
     stat.close()
     kind
+}
+
+// This is only a snapshot; callers must still enforce limits while reading.
+fun SecureFile.size(): int {
+    if (this.descriptor < 0) return -1
+    val stat = nativeByteBuffer(144)
+    val measured = linuxSyscall2(5, this.descriptor, nativePointerAddress(stat.address))
+    val result = if (measured == 0) stat.loadI64(48) else -1
+    stat.close()
+    result
 }
 
 // Returns permission and special bits of the opened file, or -1 on error.

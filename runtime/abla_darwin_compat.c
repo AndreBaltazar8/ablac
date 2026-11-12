@@ -60,6 +60,8 @@ static int linux_errno(int value) {
   switch (value) {
   case EAGAIN:
     return 11;
+  case EDQUOT:
+    return 122;
   case ENOTSUP:
 #if EOPNOTSUPP != ENOTSUP
   case EOPNOTSUPP:
@@ -870,6 +872,9 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     result = darwin_poll((struct pollfd *)(uintptr_t)argument0, (nfds_t)argument1,
                   (int)argument2);
     break;
+  case 8:
+    result = lseek((int)argument0, (off_t)argument1, (int)argument2);
+    break;
   case 14:
     result = darwin_sigprocmask(argument0, (const void *)(uintptr_t)argument1,
                                 (void *)(uintptr_t)argument2, argument3);
@@ -1056,7 +1061,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
 #endif
     break;
   case 72:
-    result = fcntl((int)argument0, (int)argument1,
+    result = fcntl((int)argument0, argument1 == 1030 ? F_DUPFD_CLOEXEC : (int)argument1,
                    argument1 == F_SETFL ? darwin_open_flags(argument2)
                                         : (int)argument2);
     if (result >= 0 && argument1 == F_GETFL)

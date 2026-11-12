@@ -35,5 +35,42 @@ if [[ $(uname -s) == Linux ]]; then
     [[ -d /dev/shm && -w /dev/shm ]] || { echo 'secure-fs: writable tmpfs /dev/shm required' >&2; exit 1; }
     memory_dir=$(mktemp -d /dev/shm/abla-secure-fs.XXXXXXXX)
     run_case "$memory_dir"
+    if command -v strace >/dev/null; then
+        "$compiler" build tests/cases/secure-fs/fault.ab -o "$out/fault" --fast --no-cache
+        printf payload > "$out/read-input"
+        strace -qq -yy -e trace=read -o "$out/read.trace" "$out/fault" "$out/read-input" read
+        read_ordinal=$(python3 - "$out/read.trace" <<'PY'
+import sys
+count = 0
+for line in open(sys.argv[1]):
+    if line.startswith('read('):
+        count += 1
+        if '/read-input>' in line:
+            print(count); break
+else: raise SystemExit('missing fixture read')
+PY
+        )
+        strace -qq -e "inject=read:error=EINTR:when=$read_ordinal" -o "$out/read-interrupted.trace" \
+            "$out/fault" "$out/read-input" read
+        : > "$out/interrupted"
+        strace -qq -e inject=write:error=EINTR:when=1 -o "$out/interrupted.trace" \
+            "$out/fault" "$out/interrupted" ''
+        [[ $(cat "$out/interrupted") == payload ]]
+        # A simulated two-byte successful write is skipped by strace; seed
+        # those bytes so the real retry proves the subsequent offset is right.
+        printf pa > "$out/short"
+        strace -qq -e inject=write:retval=2:when=1 -o "$out/short.trace" \
+            "$out/fault" "$out/short" ''
+        [[ $(cat "$out/short") == payload ]]
+        for error in ENOSPC EDQUOT; do
+            : > "$out/full"
+            strace -qq -e "inject=write:error=$error:when=1" -o "$out/$error.trace" \
+                "$out/fault" "$out/full" disk_full
+            [[ ! -s "$out/full" ]]
+        done
+        echo 'secure-fs: interrupted reads/writes, short writes and disk-full errors passed'
+    else
+        echo 'secure-fs: syscall fault injection unavailable; skipped'
+    fi
 fi
 echo 'secure-fs: nofollow, exclusive creation, no-replace rename, atomic symlink, sync and descriptor drops'
