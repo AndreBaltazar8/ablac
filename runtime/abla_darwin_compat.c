@@ -863,6 +863,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
   case 3:
     result = darwin_close((int)argument0);
     break;
+#if !ABLA_DARWIN_SYSCALLS
   case 5: {
     struct stat information;
     result = fstat((int)argument0, &information);
@@ -876,6 +877,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     }
     break;
   }
+#endif
   case 7:
     result = darwin_poll((struct pollfd *)(uintptr_t)argument0, (nfds_t)argument1,
                   (int)argument2);
@@ -1095,12 +1097,14 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     result = fsync((int)argument0);
     break;
 #endif
+#if !ABLA_DARWIN_SYSCALLS
   case 79: {
     char *output = (char *)(uintptr_t)argument0;
     if (getcwd(output, (size_t)argument1) != NULL)
       result = (long)strlen(output) + 1;
     break;
   }
+#endif
 #if !ABLA_DARWIN_SYSCALLS
   case 80:
     result = chdir((const char *)(uintptr_t)argument0);
@@ -1166,11 +1170,13 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
   case 109:
     result = setpgid((pid_t)argument0, (pid_t)argument1);
     break;
+#if !ABLA_DARWIN_SYSCALLS
   case 217:
     result =
         darwin_getdents((int)argument0, (unsigned char *)(uintptr_t)argument1,
                         (size_t)argument2);
     break;
+#endif
   case 97:
   case 160: {
     // getrlimit/setrlimit of RLIMIT_STACK (3 on both); Linux writes an
