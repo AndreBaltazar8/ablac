@@ -90,6 +90,7 @@ test-serial: ablac
 	tools/test-repo-language-guard-selftest.sh
 	tools/test-libc-imports.sh $(COMPILER)
 	tools/test-libc-memory-routines.sh $(COMPILER)
+	tools/test-futex-locks.sh $(COMPILER)
 	tools/test-version.sh $(COMPILER)
 	tools/test-coverage.sh $(COMPILER)
 	tools/test-analysis-service.sh $(COMPILER)
