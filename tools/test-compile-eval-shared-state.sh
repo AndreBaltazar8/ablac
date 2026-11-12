@@ -13,6 +13,7 @@ for source in "$cases"/*.ab; do
         delegate-get|delegate-local) expected=1,1,1 ;;
         delegate-set) expected=0,1,1 ;;
         member-unrelated|member-generic) expected=5,7 ;;
+        operator-builtin) expected=5,3 ;;
         *-forward) expected=1,1,1,2 ;;
         *-reverse) expected=0,1,2,2 ;;
         *-read-first) expected=0,0,1,2 ;;
@@ -57,8 +58,9 @@ NODE
                 if [[ $name == readonly ]]; then
                     pos=$(offset '#lookup()')
                     grep '^note\[ct-jit\]: native at ' "$log" | grep -Fq "readonly.ab:$pos"
-                elif [[ $name == member-* ]]; then
-                    # X (a call of B.touch) and Y (a call of A.touch, which writes `shared`).
+                elif [[ $name == member-* || $name == operator-builtin ]]; then
+                    # X (a call of B.touch; the sum of two ints) and Y (a call of A.touch or of Box.plus: a write
+                    # of `shared`).
                     # A Wasm slice carries the checker's resolved targets, so X reaches B.touch
                     # alone and stays native; a host slice keeps every `touch`, and a generic
                     # body is one copy per instantiation (go<B>, go<A>) whose class's interface a
@@ -67,9 +69,9 @@ NODE
                     posY=$(( $(offset 'val Y = #') + 8 ))
                     grep -Fq "note[ct-jit]: interpreted at $((posY+1)):" "$log" ||
                         { echo "$name $target $tier: Y was not interpreted" >&2; exit 1; }
-                    grep -F "note[ct-jit]: interpreted at $((posY+1)):" "$log" | grep -q 'ordinary mutable global shared may be written at A.touch' ||
+                    grep -F "note[ct-jit]: interpreted at $((posY+1)):" "$log" | grep -q 'ordinary mutable global shared may be written at ' ||
                         { echo "$name $target $tier: Y was not interpreted for the write" >&2; exit 1; }
-                    if [[ $name == member-unrelated && $target == wasm ]]; then
+                    if [[ $name != member-generic && $target == wasm ]]; then
                         grep '^note\[ct-jit\]: native at ' "$log" | grep -Fq "$name.ab:$posX" ||
                             { echo "$name $target $tier: X was not native" >&2; exit 1; }
                     else
