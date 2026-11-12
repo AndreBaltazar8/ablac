@@ -439,7 +439,7 @@ test-serial: ablac
 	tools/test-gc-lookup.sh $(COMPILER)
 	tools/test-object-layout.sh $(COMPILER)
 	tools/test-cache-layout-version.sh $(COMPILER)
-	python3 tools/test-held-o1.py $(COMPILER)
+	tools/test-held-o1.sh $(COMPILER)
 	tools/test-codegen-units.sh $(COMPILER)
 	tools/test-codegen-cache.sh $(COMPILER)
 	tools/test-codegen-cache-race.sh $(COMPILER)
