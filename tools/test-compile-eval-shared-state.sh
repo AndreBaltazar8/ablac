@@ -12,6 +12,7 @@ for source in "$cases"/*.ab; do
         readonly) expected=9 ;;
         delegate-get|delegate-local) expected=1,1,1 ;;
         delegate-set) expected=0,1,1 ;;
+        member-unrelated|member-generic) expected=5,7 ;;
         *-forward) expected=1,1,1,2 ;;
         *-reverse) expected=0,1,2,2 ;;
         *-read-first) expected=0,0,1,2 ;;
@@ -56,6 +57,25 @@ NODE
                 if [[ $name == readonly ]]; then
                     pos=$(offset '#lookup()')
                     grep '^note\[ct-jit\]: native at ' "$log" | grep -Fq "readonly.ab:$pos"
+                elif [[ $name == member-* ]]; then
+                    # X (a call of B.touch) and Y (a call of A.touch, which writes `shared`).
+                    # A Wasm slice carries the checker's resolved targets, so X reaches B.touch
+                    # alone and stays native; a host slice keeps every `touch`, and a generic
+                    # body is one copy per instantiation (go<B>, go<A>) whose class's interface a
+                    # slice cannot carry: those sites run in the interpreter. Y always does.
+                    posX=$(( $(offset 'val X = #') + 8 ))
+                    posY=$(( $(offset 'val Y = #') + 8 ))
+                    grep -Fq "note[ct-jit]: interpreted at $((posY+1)):" "$log" ||
+                        { echo "$name $target $tier: Y was not interpreted" >&2; exit 1; }
+                    grep -F "note[ct-jit]: interpreted at $((posY+1)):" "$log" | grep -q 'ordinary mutable global shared may be written at A.touch' ||
+                        { echo "$name $target $tier: Y was not interpreted for the write" >&2; exit 1; }
+                    if [[ $name == member-unrelated && $target == wasm ]]; then
+                        grep '^note\[ct-jit\]: native at ' "$log" | grep -Fq "$name.ab:$posX" ||
+                            { echo "$name $target $tier: X was not native" >&2; exit 1; }
+                    else
+                        grep -Fq "note[ct-jit]: interpreted at $((posX+1)):" "$log" ||
+                            { echo "$name $target $tier: X was not interpreted" >&2; exit 1; }
+                    fi
                 elif [[ $name == delegate-* ]]; then
                     # A delegated binding is rewritten before analysis, which moves the sites: count them.
                     sites=4
