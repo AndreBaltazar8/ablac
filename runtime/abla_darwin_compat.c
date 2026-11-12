@@ -897,9 +897,11 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     result =
         darwin_ioctl((int)argument0, argument1, (void *)(uintptr_t)argument2);
     break;
+#if !ABLA_DARWIN_SYSCALLS
   case 21:
     result = access((const char *)(uintptr_t)argument0, (int)argument1);
     break;
+#endif
 #if !ABLA_DARWIN_SYSCALLS
   case 33:
     result = dup2((int)argument0, (int)argument1);
@@ -1076,6 +1078,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     result = kill((pid_t)argument0, (int)argument1);
 #endif
     break;
+#if !ABLA_DARWIN_SYSCALLS
   case 72:
     result = fcntl((int)argument0, argument1 == 1030 ? F_DUPFD_CLOEXEC : (int)argument1,
                    argument1 == F_SETFL ? darwin_open_flags(argument2)
@@ -1086,6 +1089,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
   case 73:
     result = flock((int)argument0, (int)argument1);
     break;
+#endif
 #if !ABLA_DARWIN_SYSCALLS
   case 74:
     result = fsync((int)argument0);
@@ -1102,6 +1106,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     result = chdir((const char *)(uintptr_t)argument0);
     break;
 #endif
+#if !ABLA_DARWIN_SYSCALLS
   case 82:
     result = rename((const char *)(uintptr_t)argument0,
                     (const char *)(uintptr_t)argument1);
@@ -1119,6 +1124,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     result = symlink((const char *)(uintptr_t)argument0,
                      (const char *)(uintptr_t)argument1);
     break;
+#endif
   case 89: {
     // Like Linux, the byte count without a terminator. The virtual image
     // link follows the same recorded-image check as open/stat; ordinary
@@ -1144,12 +1150,14 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     }
     break;
   }
+#if !ABLA_DARWIN_SYSCALLS
   case 90:
     result = chmod((const char *)(uintptr_t)argument0, (mode_t)argument1);
     break;
   case 91:
     result = fchmod((int)argument0, (mode_t)argument1);
     break;
+#endif
 #if !ABLA_DARWIN_SYSCALLS
   case 95:
     result = umask((mode_t)argument0);
@@ -1225,6 +1233,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     }
     break;
   }
+#if !ABLA_DARWIN_SYSCALLS
   case 258:
     result = mkdirat((int)argument0, (const char *)(uintptr_t)argument1,
                      (mode_t)argument2);
@@ -1248,6 +1257,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
                           (int)argument2, (const char *)(uintptr_t)argument3,
                           RENAME_EXCL);
     break;
+#endif
   case 262: {
     struct stat information;
     char executable[PATH_MAX];
