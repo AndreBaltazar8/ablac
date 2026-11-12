@@ -671,6 +671,34 @@ fun bootstrapLlvmCompactLinuxRuntime(backend: BootstrapLlvmBackend): bool =
     bootstrapTextContains(backend.targetTriple, "linux") &&
     !bootstrapTextContains(backend.targetTriple, "gnux32")
 
+// x86-64 Linux (not the x32 ABI) issues system calls with the `syscall`
+// instruction itself, so a program needs neither libc's syscall() nor its errno:
+// the kernel's result comes back as is, and a failure is -errno (-4095..-1).
+fun bootstrapLlvmInlineLinuxSyscallTarget(backend: BootstrapLlvmBackend): bool =
+    !backend.macOS &&
+    bootstrapTextContains(backend.targetTriple, "x86_64") &&
+    bootstrapTextContains(backend.targetTriple, "linux") &&
+    !bootstrapTextContains(backend.targetTriple, "gnux32")
+
+// `values` are the system call number and its six arguments, all i64.
+fun bootstrapLlvmInlineLinuxSyscall(
+    backend: BootstrapLlvmBackend,
+    values: array<i64*>,
+    name: string
+): i64* {
+    val types: array<i64*> = []
+    while (types.size < 7) types.append(backend.i64Type)
+    val type = bootstrapLlvmFunctionType(backend, backend.i64Type, types)
+    val assembly = "syscall"
+    val constraints =
+        "={ax},{ax},{di},{si},{dx},{r10},{r8},{r9},~{rcx},~{r11},~{memory},~{dirflag},~{fpsr},~{flags}"
+    bootstrapLlvmCallTyped(
+        backend, type,
+        LLVMGetInlineAsm(type, assembly, assembly.size, constraints, constraints.size, 1, 0, 0, 0),
+        values, name
+    )
+}
+
 fun bootstrapLlvmLinuxX64Syscall(
     backend: BootstrapLlvmBackend,
     number: int,
@@ -687,6 +715,10 @@ fun bootstrapLlvmLinuxX64Syscall(
             else if (LLVMGetIntTypeWidth(type) < 64) {
                 LLVMBuildZExt(backend.builder, argument, backend.i64Type, "syscall.integer")
             } else LLVMBuildTrunc(backend.builder, argument, backend.i64Type, "syscall.integer"))
+    }
+    if (bootstrapLlvmInlineLinuxSyscallTarget(backend)) {
+        while (values.size < 7) values.append(LLVMConstInt(backend.i64Type, 0, 0))
+        return bootstrapLlvmInlineLinuxSyscall(backend, values, "linux.runtime.syscall")
     }
     var function = LLVMGetNamedFunction(backend.module, "syscall")
     if (pointerIsNull(function)) function = bootstrapLlvmDeclare(
