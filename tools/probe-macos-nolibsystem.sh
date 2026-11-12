@@ -25,6 +25,8 @@ summary=$out/summary.txt
 variants=(
     'nostdlib-e|-nostdlib -Wl,-e,_start'
     'nostdlib-static-e|-nostdlib -static -Wl,-e,_start'
+    'nostdlib-static-pagezero-e|-nostdlib -static -Wl,-e,_start -Wl,-pagezero_size,0x100000000'
+    'nostdlib-static-pagezero-platform-e|-nostdlib -static -Wl,-e,_start -Wl,-pagezero_size,0x100000000 -Wl,-platform_version,macos,11.0,11.0'
     'libsystem-listed-main|-nostdlib -lSystem'
     'libsystem-listed-e|-nostdlib -lSystem -Wl,-e,_start'
 )
@@ -67,6 +69,8 @@ try() { # variant program flags
     if [[ $status -eq 137 || $status -eq 9 ]]; then
         # Killed: arm64 macOS refuses an unsigned image. Sign ad hoc and run again.
         codesign -s - --force "$dir/$program" 2>&1 | head -3
+        # Why the kernel killed it, when the unified log says (best effort).
+        log show --last 2m --style compact --predicate 'eventMessage CONTAINS[c] "code signature" OR eventMessage CONTAINS[c] "killed" OR process == "amfid"' 2>/dev/null | tail -8 | cut -c1-300
         echo "signature after ad-hoc signing:"; codesign -dv "$dir/$program" 2>&1 | grep -E 'Signature|flags' | head -3
         report "$name" "$program" "unsigned image killed (status $status); signing ad hoc and running again"
         execute "$dir" "$program"; status=$EXECUTE_STATUS; signed=" after ad-hoc codesign"

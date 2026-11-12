@@ -39,7 +39,7 @@ _main:
     mov x1, #77
     mov x2, x20
     mov x3, x20
-    mov x4, #0
+    movz x4, #0x100, lsl #16
     mov x16, #360
     svc #0x80
     b.cs fail_create

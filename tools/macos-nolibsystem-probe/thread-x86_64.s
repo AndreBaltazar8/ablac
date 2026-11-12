@@ -36,7 +36,7 @@ _main:
     movq $77, %rsi
     movq %r13, %rdx
     movq %r13, %r10
-    xorl %r8d, %r8d
+    movl $0x01000000, %r8d
     syscall
     jc fail_create
     movq $10000000, %rcx
