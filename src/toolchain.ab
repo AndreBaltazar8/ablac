@@ -225,6 +225,50 @@ fun bootstrapRunHostLink(link: LinuxCommand, objectPath: string, outputPath: str
     link.run()
 }
 
+// The compiler runtime a libc-free x86-64 Linux link takes (#806): compiler-rt's builtins
+// archive in the resource directory of the toolchain's clang, or else the system's libgcc,
+// or "" when neither is there (a program that needs a builtin then falls back to the C
+// library's link, which names it). Never libgcc_s or an unwinder: Abla does not unwind.
+fun bootstrapLibcFreeRuntimeLibrary(): string {
+    for (runtime in ["compiler-rt", "libgcc"]) {
+        val query = linuxCommand("clang")
+        query.argument("--rtlib=$runtime")
+        query.argument("-print-libgcc-file-name")
+        val path = query.captureText().trim()
+        if (path.startsWith("/") && Path(path).info().isFile()) return path
+    }
+    ""
+}
+
+// What a failed link of the C library reports missing from the machine's C development
+// files (start files, libc, libgcc), as a list, or "" when it names none.
+fun bootstrapMissingCDevelopmentFiles(report: string): string {
+    val missing: array<string> = []
+    for (line in report.split("\n")) {
+        var name = ""
+        val opened = line.indexOf("cannot open ")
+        val library = line.indexOf("unable to find library ")
+        if (opened >= 0) {
+            val rest = line.slice(opened + 12, line.size)
+            val colon = rest.indexOf(":")
+            name = if (colon >= 0) rest.slice(0, colon) else rest.trim()
+            if (!(name.startsWith("crt") || name.startsWith("Scrt") || name.startsWith("gcrt") ||
+                  name.startsWith("rcrt") || name.startsWith("crtbegin") ||
+                  name.startsWith("crtend"))) name = ""
+        } else if (library >= 0) {
+            name = line.slice(library + 23, line.size).trim()
+            if (name != "-lc" && name != "-lm" && name != "-lgcc" && name != "-lgcc_s" &&
+                name != "-lgcc_eh" && name != "-lpthread") name = ""
+        }
+        var known = false
+        for (seen in missing) {
+            if (seen == name) known = true
+        }
+        if (name != "" && !known) missing.append(name)
+    }
+    missing.join(", ")
+}
+
 // A kept argument with its placeholder put back.
 fun bootstrapLinkProbeArgument(argument: string, objectPath: string, outputPath: string): string =
     if (argument == "\x01object") objectPath
@@ -4338,7 +4382,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     if (status == 0 && target.hosted && artifact == "executable") {
         // An x86-64 Linux program links without libc (#806): a static-pie image
         // entered at its own abla_start, its threads on abla_clone_create/join,
-        // with only the compiler's runtime library (-nolibc keeps it). It links the
+        // with only the builtins of the toolchain's clang (-nostdlib). It links the
         // C library only when it brings one: an OpenSSL import, libLLVM, the
         // manifest's nativeLibraries, extern "host" calls, or a C function the
         // libc-free link can't resolve (lld names it; `--verbose` prints why).
@@ -4352,6 +4396,10 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         else if (hostImports) "it calls extern \"host\" functions"
         else ""
         val aarch64Linux = !macTarget && bootstrapLlvmTargetIsAarch64Linux(target.llvmTriple)
+        // The libc-free link takes nothing from the system: not its start files, not
+        // libgcc (a machine without C development files has none), only the builtins
+        // of the toolchain's own clang (#806).
+        val runtimeLibrary = if (libcFree) bootstrapLibcFreeRuntimeLibrary() else ""
         var linking = true
         while (linking) {
             val link = bootstrapLinkCommand(if (macTarget) macClang else "clang")
@@ -4366,8 +4414,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                 link.argument("-Wl,--defsym=pthread_create=abla_clone_create")
                 link.argument("-Wl,--defsym=pthread_join=abla_clone_join")
             } else if (libcFree) {
-                link.argument("-nostartfiles")
-                link.argument("-nolibc")
+                link.argument("-nostdlib")
                 link.argument("-static-pie")
                 link.argument("-Wl,-e,abla_start")
                 link.argument("-Wl,--defsym=pthread_create=abla_clone_create")
@@ -4477,12 +4524,29 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                 link.argument("-lm")
                 link.argument("-Wl,--no-as-needed")
             }
+            if (libcFree && runtimeLibrary != "") link.argument(runtimeLibrary)
             link.argument("-o")
             link.argument(publishPath)
             val failures = "$publishPath.libc-free-link"
+            val hostedFailures = "$publishPath.link-errors"
+            val explainHosted = !libcFree && libcReason != ""
             if (libcFree) link.errors(failures)
+            else if (explainHosted) link.errors(hostedFailures)
             status = if (macTarget) link.run()
             else bootstrapRunHostLink(link, linkedObject, publishPath)
+            if (explainHosted) {
+                // The linker's own report stays as it was; a link that needs the C
+                // library's development files where there are none also says so.
+                val reported = Path(hostedFailures).readText()
+                if (reported != "") linuxPrintStandardError(reported)
+                val missing = if (status != 0) bootstrapMissingCDevelopmentFiles(reported) else ""
+                if (missing != "") {
+                    linuxPrintStandardError(
+                        "error: $outputPath links the C library because $libcReason, and this machine has no C development files ($missing). Install them (Debian/Ubuntu: `apt install gcc libc6-dev`), or build a program that brings no C library: such a program links with the Abla toolchain alone.\n"
+                    )
+                }
+                Path(hostedFailures).remove()
+            }
             if (status == 0 && libcFree) {
                 // abla_start applies R_X86_64_RELATIVE relocations only.
                 val relocations = linuxCommand("llvm-readelf")

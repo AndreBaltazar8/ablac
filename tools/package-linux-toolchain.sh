@@ -20,7 +20,7 @@ for directory in "$abla_root/runtime" "$abla_root/stdlib"; do
         exit 1
     }
 done
-for tool in clang ld.lld llc lld llvm-ar llvm-config llvm-extract llvm-split \
+for tool in clang ld.lld llc lld llvm-ar llvm-config llvm-extract llvm-readelf llvm-split \
     opt patchelf wasm-ld wasm-opt; do
     command -v "$tool" >/dev/null 2>&1 || {
         printf 'missing packaging tool: %s\n' "$tool" >&2
@@ -44,7 +44,7 @@ mkdir -p "$bundle/bin" "$bundle/lib" "$bundle/libexec" \
     "$bundle/share/abla" "$bundle/share/licenses"
 
 cp "$compiler_binary" "$bundle/libexec/ablac.bin"
-for tool in clang ld.lld llc lld llvm-ar llvm-config llvm-extract llvm-split \
+for tool in clang ld.lld llc lld llvm-ar llvm-config llvm-extract llvm-readelf llvm-split \
     opt wasm-ld wasm-opt; do
     cp "$(realpath "$(command -v "$tool")")" "$bundle/libexec/$tool"
     ln -s "../libexec/$tool" "$bundle/bin/$tool"
@@ -118,6 +118,23 @@ for library in "$bundle"/lib/*.so*; do
     patchelf --set-rpath '$ORIGIN' "$library"
 done
 
+# clang's resource directory, beside its executable's ../lib: its compiler-rt builtins are
+# the only runtime a program that brings no C library links (#806), so a machine without C
+# development files (no libgcc) builds it.
+resource_dir=$(clang -print-resource-dir)
+resource_version=$(basename "$resource_dir")
+mkdir -p "$bundle/lib/clang"
+cp -R "$resource_dir" "$bundle/lib/clang/$resource_version"
+builtins=$(clang --rtlib=compiler-rt -print-libgcc-file-name)
+[[ -f $builtins ]] || {
+    printf 'missing compiler-rt builtins (libclang-rt-23-dev): %s\n' "$builtins" >&2
+    exit 1
+}
+[[ -f $bundle/lib/clang/$resource_version/${builtins#"$resource_dir"/} ]] || {
+    printf 'the packaged resource directory lacks %s\n' "${builtins#"$resource_dir"/}" >&2
+    exit 1
+}
+
 # Build the native installer with the packaged compiler only now: before the
 # loops above, libexec/ablac.bin still names the build host's loader and cannot
 # start here. Then give the installer the same loader and bundled libraries.
@@ -138,14 +155,7 @@ for library in "$bundle"/lib/*.so*; do
     patchelf --set-rpath '$ORIGIN' "$library"
 done
 
-resource_dir=$(clang -print-resource-dir)
-if [[ -d $resource_dir ]]; then
-    resource_version=$(basename "$resource_dir")
-    mkdir -p "$bundle/lib/clang"
-    cp -R "$resource_dir" "$bundle/lib/clang/$resource_version"
-fi
-
-for package in binaryen clang-23 libbsd0 libedit2 libffi8 libgcc-s1 \
+for package in binaryen clang-23 libbsd0 libclang-rt-23-dev libedit2 libffi8 libgcc-s1 \
     libicu70 libllvm23 liblzma5 libmd0 libssl3 libstdc++6 libtinfo6 \
     libxml2 libzstd1 zlib1g; do
     copyright="/usr/share/doc/$package/copyright"
