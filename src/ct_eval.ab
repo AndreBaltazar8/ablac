@@ -22,6 +22,7 @@ import "abla/sys/linux"
 import "abla/sys/linux/process"
 import "abla/sys/linux/io"
 import "abla/unsafe/memory/raw"
+import "abla/unsafe/native/function-address"
 import "ct_native_effects.ab"
 import "ct_bridge.ab"
 import "sema.ab"
@@ -547,6 +548,39 @@ trusted fun bootstrapCtSetTimer(value: int): bool =
     else linuxSyscall3(38, 0, value, 0) == 0
 noescape extern:"c" fun sigaltstack(stack: i64*, previous: i64*): i32
 
+// x86-64 Linux talks to the kernel (#806): rt_sigaction (13) with the kernel's struct
+// {handler, flags, restorer, mask} and sigaltstack (131), so the compiler needs no
+// libc sigaction/sigaltstack there; macOS keeps libSystem's.
+trusted noescape extern:"inline-assembly" fun bootstrapCtSigreturnAssembly(
+    template: string,
+    constraints: string
+): void
+
+// The trampoline a returning handler goes through (SA_RESTORER): rt_sigreturn.
+@naked
+trusted fun bootstrapCtSigreturn(): void =
+    bootstrapCtSigreturnAssembly("movq $$15, %rax\n\tsyscall", "")
+
+// The kernel's struct sigaction (a zeroed 160-byte buffer) for `handler` and `flags`
+// (SA_RESTORER added); the handler returns through bootstrapCtSigreturn.
+trusted fun bootstrapCtKernelAction(handler: int, flags: int): int {
+    val action = bootstrapCtZeroed(160)
+    ablaRuntimeStoreI64(action, handler)
+    ablaRuntimeStoreI64(action + 8, flags + 67108864)
+    ablaRuntimeStoreI64(action + 16, nativeFunctionAddress(bootstrapCtSigreturn))
+    action
+}
+
+trusted fun bootstrapCtSigaction(signal: int, action: int, previous: int): bool =
+    if (ablaHostIsMacOS()) sigaction(i32(signal), ablaRuntimePointerFromAddress(action),
+        ablaRuntimePointerFromAddress(previous)) == 0
+    else linuxSyscall4(13, signal, action, previous, 8) == 0
+
+trusted fun bootstrapCtSigaltstack(stack: int): bool =
+    if (ablaHostIsMacOS()) sigaltstack(ablaRuntimePointerFromAddress(stack),
+        nativeNullPointer()) == 0
+    else linuxSyscall2(131, stack, 0) == 0
+
 // ABLA_COMPILE_EVAL_TIME_LIMIT: seconds one native evaluation may run (default 600;
 // 0: no limit). The interpreter's bound is its step limit; native code has no steps.
 var bootstrapCtTimeLimitValue: int = -1
@@ -585,11 +619,13 @@ trusted fun bootstrapCtZeroed(size: int): int {
 // after `seconds`. struct sigaction: Darwin {handler, mask u32, flags i32}; Linux
 // {handler, mask[128], flags i32, restorer}.
 trusted fun bootstrapCtArmAlarm(handler: int, seconds: int): bool {
-    val action = bootstrapCtZeroed(160)
-    ablaRuntimeStoreI64(action, handler)
-    if (bootstrapCtHostIsDarwin) ablaRuntimeStoreI64(action + 8, 16 * 4294967296)
-    else ablaRuntimeStoreI64(action + 136, 1073741824)
-    val installed = sigaction(14, ablaRuntimePointerFromAddress(action), nativeNullPointer()) == 0
+    var action = 0
+    if (bootstrapCtHostIsDarwin) {
+        action = bootstrapCtZeroed(160)
+        ablaRuntimeStoreI64(action, handler)
+        ablaRuntimeStoreI64(action + 8, 16 * 4294967296)
+    } else action = bootstrapCtKernelAction(handler, 1073741824)
+    val installed = bootstrapCtSigaction(14, action, 0)
     __ablaRuntimeFree(action)
     var armed = false
     if (installed) {
@@ -607,7 +643,7 @@ trusted fun bootstrapCtDisarmAlarm(): void {
     __ablaRuntimeFree(timer)
     // Back to the default action, so no handler of a removed generation stays.
     val action = bootstrapCtZeroed(160)
-    val restored = sigaction(14, ablaRuntimePointerFromAddress(action), nativeNullPointer())
+    val restored = bootstrapCtSigaction(14, action, 0)
     __ablaRuntimeFree(action)
     return
 }
@@ -634,7 +670,7 @@ trusted fun bootstrapCtArmFaults(handler: int): bool {
         val stack = bootstrapCtZeroed(32)
         ablaRuntimeStoreI64(stack, memory)
         if (darwin) ablaRuntimeStoreI64(stack + 8, size) else ablaRuntimeStoreI64(stack + 16, size)
-        if (sigaltstack(ablaRuntimePointerFromAddress(stack), nativeNullPointer()) == 0) {
+        if (bootstrapCtSigaltstack(stack)) {
             bootstrapCtSignalStack = memory
         }
         __ablaRuntimeFree(stack)
@@ -642,23 +678,20 @@ trusted fun bootstrapCtArmFaults(handler: int): bool {
     }
     if (bootstrapCtSavedSegv == 0) bootstrapCtSavedSegv = bootstrapCtZeroed(160)
     if (bootstrapCtSavedBus == 0) bootstrapCtSavedBus = bootstrapCtZeroed(160)
-    val action = bootstrapCtZeroed(160)
-    ablaRuntimeStoreI64(action, handler)
-    if (darwin) ablaRuntimeStoreI64(action + 8, 17 * 4294967296)
-    else ablaRuntimeStoreI64(action + 136, 1073741824 + 134217728)
-    val segv = sigaction(11, ablaRuntimePointerFromAddress(action),
-        ablaRuntimePointerFromAddress(bootstrapCtSavedSegv)) == 0
-    val bus = sigaction(i32(bootstrapCtBusSignal()), ablaRuntimePointerFromAddress(action),
-        ablaRuntimePointerFromAddress(bootstrapCtSavedBus)) == 0
+    var action = 0
+    if (darwin) {
+        action = bootstrapCtZeroed(160)
+        ablaRuntimeStoreI64(action, handler)
+        ablaRuntimeStoreI64(action + 8, 17 * 4294967296)
+    } else action = bootstrapCtKernelAction(handler, 1073741824 + 134217728)
+    val segv = bootstrapCtSigaction(11, action, bootstrapCtSavedSegv)
+    val bus = bootstrapCtSigaction(bootstrapCtBusSignal(), action, bootstrapCtSavedBus)
     __ablaRuntimeFree(action)
     segv && bus
 }
 
 trusted fun bootstrapCtDisarmFaults(): void {
-    val segv = sigaction(11, ablaRuntimePointerFromAddress(bootstrapCtSavedSegv),
-        nativeNullPointer())
-    val bus = sigaction(i32(bootstrapCtBusSignal()),
-        ablaRuntimePointerFromAddress(bootstrapCtSavedBus),
-        nativeNullPointer())
+    val segv = bootstrapCtSigaction(11, bootstrapCtSavedSegv, 0)
+    val bus = bootstrapCtSigaction(bootstrapCtBusSignal(), bootstrapCtSavedBus, 0)
     return
 }
