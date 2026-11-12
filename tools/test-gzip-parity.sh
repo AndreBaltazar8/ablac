@@ -25,6 +25,7 @@ gzip -n -6 -c "$out/large" > "$out/large.gz"
 "$out/check" "$out/empty" "$fixtures/empty.gz"
 "$out/check" "$out/optional.raw" "$fixtures/optional.gz"
 for input in "$fixtures"/bad-*; do "$out/check" "$fixtures/raw" "$input" invalid; done
+tools/verify-fixture-manifest.sh tests/cases/gzip-stream/fixtures
 "$out/record" tests/cases/gzip-stream/fixtures/mutations.gz > "$out/mutations.actual"
 gzip -dc tests/cases/gzip-stream/fixtures/mutations.expected.gz > "$out/mutations.expected"
 cmp "$out/mutations.expected" "$out/mutations.actual"
