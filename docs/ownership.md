@@ -727,8 +727,31 @@ helper forced by name shadowing has no dedicated drop-order regression yet.
 
 ## Collections of resources
 
-An array of resources owns its elements. Iterating over it borrows each
-element; iterating over `move(array)` takes each element out:
+An array of resources owns its elements. A loop's source determines who owns
+each element:
+
+- A fresh array or `move(array)` belongs to the loop. Each iteration takes
+  its element: if the body does not consume it, it drops when that iteration
+  ends. On `break` or `return`, the current element drops, then the remaining
+  elements drop in array order. A full loop logging each item `B` and each
+  drop `I` prints `B1I1B2I2|`; breaking after the first prints `B1I1I2|`.
+- A borrowed array (a local, parameter, global, field, or index) stays with
+  its owner. Its iterator is a borrow and cannot be moved or awaited. Its
+  owner drops the elements later, so a full loop with the same markers prints
+  `B1B2I1I2|` when the owner then leaves scope.
+- An array borrowed from a temporary owner, such as `mapping().values()` or
+  `Holder(items()).items`, is also borrowed by the loop. The temporary owner
+  stays until the loop ends and then drops its elements once; the full-loop
+  trace is `B1B2I1I2|`.
+
+An `if` or `when` source follows the selected arm. If any arm may be borrowed,
+the iterator must be treated as borrowed in the body: moving or awaiting it
+is rejected, even if another arm is fresh. To transfer the elements, use a
+fresh container or `move(...)` on the container. These rules apply in ordinary
+functions and in generators, including across suspension
+([test](../tests/cases/owned-container-loop/main.ab)).
+
+For example, iterating over `move(array)` takes each element out:
 
 ```abla
 import "abla/io"

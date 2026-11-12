@@ -172,6 +172,7 @@ test-serial: ablac
 	tools/test-json-literal-diagnostics.sh $(COMPILER)
 	tools/test-generators-tasks.sh $(COMPILER)
 	tools/test-generator-borrowed-container.sh $(COMPILER)
+	tools/test-owned-container-loop.sh $(COMPILER)
 	tools/test-resource-scope-drops.sh $(COMPILER)
 	tools/test-shadowed-branch-types.sh $(COMPILER)
 	tools/test-run-built.sh $(COMPILER)

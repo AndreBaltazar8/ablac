@@ -5429,7 +5429,9 @@ class BootstrapLowerer(
     val namedBorrowedStorages: array<string> = [],
     val defaultTemporaryStorages: array<string> = [],
     val statementTemporaryStorages: array<string> = [],
-    val loopOwnerTemporaryStorages: array<string> = []
+    val loopOwnerTemporaryStorages: array<string> = [],
+    val containerIteratorStorages: array<string> = [],
+    val containerIteratorFlags: array<string> = []
 ) {
     /** The newest visible local named `name` (with a type, when `typed`), or -1. */
     /** Every visible local named `name`, first declared first. */
@@ -5673,6 +5675,39 @@ class BootstrapLowerer(
         if (expression.kind == "identifier" && !this.isLocal(expression.text) &&
             !this.isParameter(expression.text) && this.isGlobal(expression.text)) return true
         false
+    }
+
+    fun containerSourceIsBorrowed(expression: BootstrapExpression): bool {
+        if (bootstrapIsBorrowType(this.lowerExpressionType(expression))) return true
+        if (expression.kind == "identifier" || expression.kind == "member" ||
+            expression.kind == "index" || expression.kind == "delegate.project") return true
+        if (expression.kind == "call" && expression.text == "move") return false
+        this.callHandsOnAssignment(expression)
+    }
+
+    fun containerIteratorFlag(storage: string): string {
+        var index = this.containerIteratorStorages.size
+        while (index > 0) {
+            index = index - 1
+            if (this.containerIteratorStorages[index] == storage)
+                return this.containerIteratorFlags[index]
+        }
+        ""
+    }
+
+    fun emitContainerDrop(storage: string, type: string, flagStorage: string): void {
+        val borrowed = this.emit("local.load", -1, -1, flagStorage)
+        val clear = this.allocateLabel()
+        val drop = this.allocateLabel()
+        val done = this.allocateLabel()
+        this.emitControl("branch", borrowed, clear, drop, "")
+        this.emitControl("label", -1, drop, -1, "")
+        this.emitAffineDrop(storage, type)
+        this.emitControl("jump", -1, done, -1, "")
+        this.emitControl("label", -1, clear, -1, "")
+        this.emitControl("resource.clear", -1, -1, -1, storage)
+        this.emitControl("jump", -1, done, -1, "")
+        this.emitControl("label", -1, done, -1, "")
     }
 
     fun parameterIsOwned(name: string): bool {
@@ -5925,9 +5960,17 @@ class BootstrapLowerer(
                 !(this.localTypes[index].size >= 5 &&
                   this.localTypes[index].slice(0, 5) == "cell:") &&
                 (this.localStorage[index].size < 10 ||
-                 this.localStorage[index].slice(0, 10) != "for_value_") &&
+                 this.localStorage[index].slice(0, 10) != "for_value_" ||
+                 this.containerIteratorFlag(this.localStorage[index]) != "") &&
                 !bootstrapIsGeneratorSlotStorage(this.localStorage[index])) {
-                if (this.localStorage[index].startsWith("for_dynamic_generator_")) {
+                val containerFlag = this.containerIteratorFlag(this.localStorage[index])
+                if (containerFlag != "") {
+                    this.emitContainerDrop(this.localStorage[index], this.localTypes[index],
+                        containerFlag)
+                } else if (this.localStorage[index].startsWith("for_container_source_")) {
+                    this.emitContainerDrop(this.localStorage[index], this.localTypes[index],
+                        "${this.localStorage[index]}_borrowed")
+                } else if (this.localStorage[index].startsWith("for_dynamic_generator_")) {
                     val storage = this.localStorage[index]
                     val borrowed = this.emit("local.load", -1, -1, "${storage}_borrowed")
                     val closeLabel = this.allocateLabel()
@@ -8527,7 +8570,11 @@ class BootstrapLowerer(
         while (sourceLeaf >= 0) {
             val leaf = this.generatorSourceLeaves[sourceLeaf]
             if (leaf == expression) {
-                val borrowed = this.generatorSourceIsBorrowed(expression)
+                val sourceFlag = this.generatorSourceFlags[sourceLeaf]
+                val borrowed = if (sourceFlag.startsWith("for_container_source_") ||
+                    sourceFlag.startsWith("generator_for_array_"))
+                    this.containerSourceIsBorrowed(expression)
+                    else this.generatorSourceIsBorrowed(expression)
                 val flag = this.emit("const.bool", -1, -1, if (borrowed) "true" else "false")
                 this.emitControl("local.set", flag, -1, -1, this.generatorSourceFlags[sourceLeaf])
                 if (!borrowed) this.emitResultMove(expression)
@@ -12541,6 +12588,9 @@ fun bootstrapLowerFor(
     var indexStorage = ""
     var sourceStorage = ""
     var sourceScope = -1
+    val affineArray = !range && !literal && bootstrapIsArrayType(sourceType) &&
+        lowerer.lowerTypeIsAffine(sourceType)
+    var arrayFlag = ""
     if (range) {
         val begin = lowerer.lowerExpression(expression.children[0].children[0])
         length = lowerer.lowerExpression(expression.children[0].children[1])
@@ -12575,6 +12625,31 @@ fun bootstrapLowerFor(
             }
             lowerer.generatorSourceLeaves.truncate(mark)
             lowerer.generatorSourceFlags.truncate(mark)
+        } else if (affineArray) {
+            sourceScope = lowerer.enterLocalScope()
+            sourceStorage = "for_container_source_${lowerer.allocateLabel()}"
+            arrayFlag = "${sourceStorage}_borrowed"
+            lowerer.emitControl("local.zero.bool", -1, -1, -1, arrayFlag)
+            val yes = lowerer.emit("const.bool", -1, -1, "true")
+            lowerer.emitControl("local.set", yes, -1, -1, arrayFlag)
+            val empty = lowerer.emit("const.null", -1, -1, "")
+            lowerer.emit("local.declare", empty, -1, sourceStorage)
+            lowerer.locals.append("")
+            lowerer.localTypes.append(sourceType)
+            lowerer.localStorage.append(sourceStorage)
+            lowerer.localScopes.append(lowerer.currentScope)
+            lowerer.localBorrowSources.append("")
+            val mark = lowerer.generatorSourceLeaves.size
+            val leaves: array<BootstrapExpression> = []
+            lowerer.collectImplicitResults(expression.children[0], leaves)
+            for (leaf in leaves) {
+                lowerer.generatorSourceLeaves.append(leaf)
+                lowerer.generatorSourceFlags.append(arrayFlag)
+            }
+            source = lowerer.lowerExpression(expression.children[0])
+            lowerer.generatorSourceLeaves.truncate(mark)
+            lowerer.generatorSourceFlags.truncate(mark)
+            lowerer.emitControl("local.set", source, -1, -1, sourceStorage)
         } else source = lowerer.lowerExpression(expression.children[0])
     }
     // The loop closes its source on every exit. It drops an owned source and
@@ -12628,6 +12703,10 @@ fun bootstrapLowerFor(
     lowerer.localStorage.append(iteratorStorage)
     lowerer.localScopes.append(lowerer.currentScope)
     lowerer.localBorrowSources.append("")
+    if (affineArray && !iteratorCaptured) {
+        lowerer.containerIteratorStorages.append(iteratorStorage)
+        lowerer.containerIteratorFlags.append(arrayFlag)
+    }
     lowerer.emitControl("jump", -1, conditionLabel, -1, "")
     lowerer.emitControl("label", -1, conditionLabel, -1, "")
     var index = -1
@@ -12659,6 +12738,20 @@ fun bootstrapLowerFor(
         lowerer.emit("string.get", source, index, "")
     // Typed element read (array.get.f64/i64/bool/f32), as for `values[i]`.
     else lowerer.emit(lowerer.lowerIndexGetOpcode(sourceType), source, index, "")
+    if (affineArray) {
+        val borrowed = lowerer.emit("local.load", -1, -1, arrayFlag)
+        val keep = lowerer.allocateLabel()
+        val take = lowerer.allocateLabel()
+        val joined = lowerer.allocateLabel()
+        lowerer.emitControl("branch", borrowed, keep, take, "")
+        lowerer.emitControl("label", -1, take, -1, "")
+        val empty = lowerer.emit("const.null", -1, -1, "")
+        lowerer.emitMany("index.set", [source, index, empty], "")
+        lowerer.emitControl("jump", -1, joined, -1, "")
+        lowerer.emitControl("label", -1, keep, -1, "")
+        lowerer.emitControl("jump", -1, joined, -1, "")
+        lowerer.emitControl("label", -1, joined, -1, "")
+    }
     var iteratorValue = value
     if (iteratorCaptured) {
         iteratorValue = lowerer.emit("cell.create", value, -1, "")
@@ -12672,6 +12765,8 @@ fun bootstrapLowerFor(
         lowerer.lowerExpression(expression.children[1], false), expression.children[1]
     )
     lowerer.dropTemporaries(bodyMark)
+    if (affineArray && !iteratorCaptured)
+        lowerer.emitContainerDrop(iteratorStorage, elementType, arrayFlag)
     bootstrapLeaveLoopTarget(lowerer, labeled)
     lowerer.emitControl("jump", -1, incrementLabel, -1, "")
     lowerer.breakLabel = previousBreakLabel
@@ -12695,7 +12790,7 @@ fun bootstrapLowerFor(
     }
     lowerer.emitControl("jump", -1, conditionLabel, -1, "")
     lowerer.emitControl("label", -1, mergeLabel, -1, "")
-    if (bootstrapIsGeneratorType(sourceType)) {
+    if (bootstrapIsGeneratorType(sourceType) || affineArray) {
         lowerer.emitScopeDrops(lowerer.currentScope)
         lowerer.leaveLocalScope(sourceScope)
     }

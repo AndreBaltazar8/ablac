@@ -142,6 +142,27 @@ fun bootstrapEvalSlotWrite(
     return
 }
 
+// Add moved result arms, which the projection collector intentionally omits.
+fun bootstrapEvalCollectMovedLoopLeaves(expression: BootstrapExpression,
+    var leaves: array<BootstrapExpression>): void {
+    if (expression.kind == "block" && expression.children.size > 0) {
+        bootstrapEvalCollectMovedLoopLeaves(expression.children[expression.children.size - 1],
+            leaves)
+    } else if (expression.kind == "if" && expression.children.size > 2) {
+        bootstrapEvalCollectMovedLoopLeaves(expression.children[1], leaves)
+        if (expression.children[2].kind != "missing")
+            bootstrapEvalCollectMovedLoopLeaves(expression.children[2], leaves)
+    } else if (expression.kind == "when") {
+        var arm = 2
+        while (arm < expression.children.size) {
+            bootstrapEvalCollectMovedLoopLeaves(expression.children[arm], leaves)
+            arm = arm + 2
+        }
+    } else if (expression.kind == "call" && expression.text == "move") {
+        leaves.append(expression)
+    }
+}
+
 /** A `for` source moved into the loop: an identifier's binding is left
  *  empty, as lowering moves a generator iterated in place. */
 fun bootstrapEvalMoveForSource(
@@ -222,7 +243,19 @@ fun bootstrapEvaluateGeneratorFor(
     val kind = expression.kind
     if (kind == "generator.forinit") {
         val ownerMark = evaluator.projectionOwnerLeaves.size
-        val arrayOwnerMark = evaluator.projectionArrayOwnerSlots.size
+        val containerMark = evaluator.containerSourceLeaves.size
+        val flagSlot = evaluator.find(expression.children[4].text)
+        if (flagSlot >= 0) {
+            bootstrapEvalSlotWrite(evaluator, expression.children[4].text,
+                bootstrapEvalBoolean(true))
+            val sourceLeaves: array<BootstrapExpression> = []
+            bootstrapProjectionFreshLeaves(expression.children[0], sourceLeaves)
+            bootstrapEvalCollectMovedLoopLeaves(expression.children[0], sourceLeaves)
+            for (leaf in sourceLeaves) {
+                evaluator.containerSourceLeaves.append(leaf)
+                evaluator.containerSourceFlags.append(-flagSlot - 1)
+            }
+        }
         var owner = 5
         while (owner < expression.children.size) {
             val descriptor = expression.children[owner]
@@ -230,8 +263,6 @@ fun bootstrapEvaluateGeneratorFor(
             val leaves: array<BootstrapExpression> = []
             bootstrapProjectionFreshLeaves(descriptor.children[0], leaves)
             if (slot >= 0) {
-                if (descriptor.kind == "generator.source.array.owner")
-                    evaluator.projectionArrayOwnerSlots.append(-slot - 1)
                 for (leaf in leaves) {
                     evaluator.projectionOwnerLeaves.append(leaf)
                     evaluator.projectionOwnerSlots.append(-slot - 1)
@@ -244,13 +275,8 @@ fun bootstrapEvaluateGeneratorFor(
         evaluator.suppressProjectionOwner = evaluator.suppressProjectionOwner - 1
         evaluator.projectionOwnerLeaves.truncate(ownerMark)
         evaluator.projectionOwnerSlots.truncate(ownerMark)
-        evaluator.projectionArrayOwnerSlots.truncate(arrayOwnerMark)
-        if (bootstrapEvalUnwrapBorrow(source).kind == "array") {
-            val sourceExpression = expression.children[0]
-            val isMove = sourceExpression.kind == "call" && sourceExpression.text == "move"
-            bootstrapEvalSlotWrite(evaluator, expression.children[4].text,
-                bootstrapEvalBoolean(!isMove))
-        }
+        evaluator.containerSourceLeaves.truncate(containerMark)
+        evaluator.containerSourceFlags.truncate(containerMark)
         bootstrapEvalMoveForSource(evaluator, expression.children[0], source)
         bootstrapEvalSlotWrite(evaluator, expression.children[1].text, source)
         var count = source.elements.size
@@ -272,7 +298,13 @@ fun bootstrapEvaluateGeneratorFor(
     if (kind == "generator.forvalue") {
         if (bootstrapEvalIsGenerator(source)) return source.elements[1]
         if (source.kind == "string") return bootstrapEvalInteger(source.text[index])
-        if (index >= 0 && index < source.elements.size) return source.elements[index]
+        if (index >= 0 && index < source.elements.size) {
+            val value = source.elements[index]
+            if (source.kind == "array" && evaluator.valueIsAffine(source) &&
+                !bootstrapEvalSlotRead(evaluator, expression.children[3].text).boolean)
+                source.elements[index] = evaluator.uninitializedValue()
+            return value
+        }
         evaluator.errors = evaluator.errors + 1
         return bootstrapEvalInvalid()
     }
@@ -347,6 +379,17 @@ fun bootstrapEvaluateGeneratorNode(
     if (kind == "generator.suspend") return bootstrapEvaluateGeneratorSuspend(evaluator, expression)
     if (kind == "generator.return") {
         return bootstrapEvalReturn(bootstrapEvalBoolean(expression.text == "true"))
+    }
+    if (kind == "generator.foriterdrop") {
+        val cell = bootstrapEvalSlotCell(evaluator, expression.children[0].text)
+        val held = cell.elements[0]
+        cell.elements[0] = evaluator.uninitializedValue()
+        val source = bootstrapEvalUnwrapBorrow(bootstrapEvalSlotRead(evaluator,
+            expression.children[2].text))
+        if (source.kind == "array" && !bootstrapEvalSlotRead(evaluator,
+            expression.children[1].text).boolean &&
+            held.kind != "uninitialized" && held.kind != "invalid") evaluator.dropValue(held)
+        return bootstrapEvalVoid()
     }
     if (kind == "generator.drop" || kind == "generator.fordrop") {
         // Evaluator values are managed: close and drop both close the generator,

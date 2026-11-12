@@ -258,6 +258,9 @@
 
 - **Conditional method receivers (#800).** A fresh affine receiver selected by an `if`, `when`, or block is held
   until its statement ends, in native and compile-time execution. Previously it leaked on both tiers.
+- **Loops over owned containers (#801).** A loop takes and drops each element of a fresh or moved array per
+  iteration and drops remaining elements on exit. A mixed borrowed/fresh source now refuses moving or awaiting its
+  iterator: such code was accepted before but could drop the borrowed owner's element twice.
 - **Generator loops over borrowed containers (#801).** A generator loop no longer drops a borrowed array or its
   borrowed elements; fresh selected array sources are dropped once when the loop ends. This fixes duplicate drops
   during iteration and when a suspended generator is closed. The evaluator also iterates borrowed map values.

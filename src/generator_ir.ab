@@ -242,7 +242,8 @@ fun bootstrapGeneratorWrites(expression: BootstrapExpression, name: string): boo
          kind == "generator.suspend") && expression.text == name) return true
     if (kind == "generator.suspend" && expression.children.size > 1 &&
         expression.children[1].text == name) return true
-    if ((kind == "generator.drop" || kind == "generator.fordrop" || kind == "generator.forinit" ||
+    if ((kind == "generator.drop" || kind == "generator.fordrop" || kind ==
+        "generator.foriterdrop" || kind == "generator.forinit" ||
          kind == "generator.forstep" || kind == "generator.fornext") &&
         bootstrapGeneratorNames(expression, name)) return true
     // A call may move it or change it through a `var` parameter.
@@ -543,11 +544,6 @@ fun bootstrapLowerGeneratorForInit(
     var owner = 5
     while (owner < expression.children.size) {
         val descriptor = expression.children[owner]
-        if (descriptor.kind == "generator.source.array.owner" &&
-            !bootstrapIsArrayType(sourceType)) {
-            owner = owner + 1
-            continue
-        }
         val leaves: array<BootstrapExpression> = []
         bootstrapProjectionFreshLeaves(descriptor.children[0], leaves)
         for (leaf in leaves) {
@@ -561,9 +557,15 @@ fun bootstrapLowerGeneratorForInit(
     }
     lowerer.suppressProjectionOwner = lowerer.suppressProjectionOwner + 1
     var value = -1
-    if (bootstrapIsGeneratorType(sourceType)) {
-        val flagStorage = "generator_for_borrowed_${lowerer.allocateLabel()}"
+    if (bootstrapIsGeneratorType(sourceType) || bootstrapIsArrayType(sourceType)) {
+        val flagStorage = if (bootstrapIsArrayType(sourceType))
+            "generator_for_array_${lowerer.allocateLabel()}" else
+            "generator_for_borrowed_${lowerer.allocateLabel()}"
         lowerer.emitControl("local.zero.bool", -1, -1, -1, flagStorage)
+        if (bootstrapIsArrayType(sourceType)) {
+            val yes = lowerer.emit("const.bool", -1, -1, "true")
+            lowerer.emitControl("local.set", yes, -1, -1, flagStorage)
+        }
         val mark = lowerer.generatorSourceLeaves.size
         val leaves: array<BootstrapExpression> = []
         lowerer.collectImplicitResults(source, leaves)
@@ -576,14 +578,7 @@ fun bootstrapLowerGeneratorForInit(
         lowerer.generatorSourceFlags.truncate(mark)
         val borrowed = lowerer.emit("local.load", -1, -1, flagStorage)
         bootstrapLowerStoreSlot(lowerer, expression.children[4].text, borrowed, "bool")
-    } else {
-        value = lowerer.lowerExpression(source)
-        if (bootstrapIsArrayType(sourceType)) {
-            val isMove = source.kind == "call" && source.text == "move"
-            val borrowed = lowerer.emit("const.bool", -1, -1, if (isMove) "false" else "true")
-            bootstrapLowerStoreSlot(lowerer, expression.children[4].text, borrowed, "bool")
-        }
-    }
+    } else value = lowerer.lowerExpression(source)
     lowerer.suppressProjectionOwner = lowerer.suppressProjectionOwner - 1
     lowerer.projectionOwnerLeaves.truncate(ownerMark)
     lowerer.projectionOwnerStorage.truncate(ownerMark)
@@ -628,7 +623,46 @@ fun bootstrapLowerGeneratorForValue(
     }
     val index = lowerer.lowerExpression(expression.children[1])
     if (sourceType == "string") return lowerer.emit("string.get", source, index, "")
-    lowerer.emit(lowerer.lowerIndexGetOpcode(sourceType), source, index, "")
+    val value = lowerer.emit(lowerer.lowerIndexGetOpcode(sourceType), source, index, "")
+    if (bootstrapIsArrayType(sourceType) && lowerer.lowerTypeIsAffine(sourceType)) {
+        val borrowed = lowerer.lowerExpression(expression.children[3])
+        val keep = lowerer.allocateLabel()
+        val take = lowerer.allocateLabel()
+        val done = lowerer.allocateLabel()
+        lowerer.emitControl("branch", borrowed, keep, take, "")
+        lowerer.emitControl("label", -1, take, -1, "")
+        val empty = lowerer.emit("const.null", -1, -1, "")
+        lowerer.emitMany("index.set", [source, index, empty], "")
+        lowerer.emitControl("jump", -1, done, -1, "")
+        lowerer.emitControl("label", -1, keep, -1, "")
+        lowerer.emitControl("jump", -1, done, -1, "")
+        lowerer.emitControl("label", -1, done, -1, "")
+    }
+    value
+}
+
+fun bootstrapLowerGeneratorForIteratorDrop(var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression): int {
+    val name = expression.children[0].text
+    val sourceType = bootstrapBorrowElementType(
+        bootstrapLowerSlotType(lowerer, expression.children[2].text))
+    if (bootstrapIsArrayType(sourceType) && lowerer.lowerTypeIsAffine(sourceType)) {
+        val borrowed = lowerer.lowerExpression(expression.children[1])
+        val clear = lowerer.allocateLabel()
+        val drop = lowerer.allocateLabel()
+        val done = lowerer.allocateLabel()
+        lowerer.emitControl("branch", borrowed, clear, drop, "")
+        lowerer.emitControl("label", -1, drop, -1, "")
+        bootstrapLowerGeneratorDrop(lowerer, expression)
+        lowerer.emitControl("jump", -1, done, -1, "")
+        lowerer.emitControl("label", -1, clear, -1, "")
+        if (bootstrapLowerIsCachedSlot(lowerer, name))
+            lowerer.emitControl("resource.clear", -1, -1, -1, lowerer.storageFor(name))
+        else bootstrapLowerEmptySlot(lowerer, name)
+        lowerer.emitControl("jump", -1, done, -1, "")
+        lowerer.emitControl("label", -1, done, -1, "")
+    }
+    lowerer.emit("const.void", -1, -1, "")
 }
 
 @noinline
@@ -726,6 +760,8 @@ fun bootstrapLowerGeneratorNode(
     }
     if (kind == "generator.drop") return bootstrapLowerGeneratorDrop(lowerer, expression)
     if (kind == "generator.fordrop") return bootstrapLowerGeneratorForDrop(lowerer, expression)
+    if (kind == "generator.foriterdrop") return bootstrapLowerGeneratorForIteratorDrop(lowerer,
+        expression)
     if (kind == "generator.declare") return bootstrapLowerGeneratorDeclare(lowerer, expression)
     if (kind == "generator.retype") {
         bootstrapLowerLearnSlotType(

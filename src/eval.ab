@@ -2644,7 +2644,8 @@ class BootstrapEvaluator(
     val projectionOwnerLeaves: array<BootstrapExpression> = [],
     val projectionOwnerSlots: array<int> = [],
     var suppressProjectionOwner: int = 0,
-    val projectionArrayOwnerSlots: array<int> = []
+    val containerSourceLeaves: array<BootstrapExpression> = [],
+    val containerSourceFlags: array<int> = []
 ) {
     fun evaluateProjectionReceiver(expression: BootstrapExpression): BootstrapEvalValue {
         if (this.suppressProjectionOwner > 0) return this.evaluate(expression)
@@ -6045,13 +6046,7 @@ class BootstrapEvaluator(
         var projectionLeaf = this.projectionOwnerLeaves.size - 1
         while (projectionLeaf >= 0) {
             if (this.projectionOwnerLeaves[projectionLeaf] == expression) {
-                val candidateSlot = this.projectionOwnerSlots[projectionLeaf]
-                var arrayOnly = false
-                for (arraySlot in this.projectionArrayOwnerSlots) {
-                    if (arraySlot == candidateSlot) arrayOnly = true
-                }
-                if (this.valueIsAffine(result) && result.kind != "borrow" &&
-                    (!arrayOnly || result.kind == "array")) {
+                if (this.valueIsAffine(result) && result.kind != "borrow") {
                     val slot = this.projectionOwnerSlots[projectionLeaf]
                     if (slot < 0) {
                         val cell = this.values[-slot - 1]
@@ -6061,6 +6056,19 @@ class BootstrapEvaluator(
                 break
             }
             projectionLeaf = projectionLeaf - 1
+        }
+        var containerLeaf = this.containerSourceLeaves.size - 1
+        while (containerLeaf >= 0) {
+            if (this.containerSourceLeaves[containerLeaf] == expression) {
+                if (result.kind != "borrow" && this.valueIsAffine(result)) {
+                    val slot = this.containerSourceFlags[containerLeaf]
+                    if (slot < 0) bootstrapEvalSlotWrite(this, this.names[-slot - 1],
+                        bootstrapEvalBoolean(false))
+                    else this.values[slot] = bootstrapEvalBoolean(false)
+                }
+                break
+            }
+            containerLeaf = containerLeaf - 1
         }
         if (result.kind == "invalid" && !bootstrapEvalStmRetrying &&
             !bootstrapEvalStopped(result)) {
@@ -9430,8 +9438,32 @@ fun bootstrapEvaluateFor(
     expression: BootstrapExpression
 ): BootstrapEvalValue {
     var result = bootstrapEvalInvalid()
+    // The chosen fresh or moved arm transfers its elements to the loop; an
+    // identifier, field, or borrowed result leaves them with its owner.
+    val flag = evaluator.names.size
+    evaluator.names.append("__abla_for_container_borrowed")
+    evaluator.values.append(bootstrapEvalBoolean(true))
+    evaluator.mutable.append(false)
+    val leafMark = evaluator.containerSourceLeaves.size
+    val leaves: array<BootstrapExpression> = []
+    bootstrapProjectionFreshLeaves(expression.children[0], leaves)
+    bootstrapEvalCollectMovedLoopLeaves(expression.children[0], leaves)
+    for (leaf in leaves) {
+        evaluator.containerSourceLeaves.append(leaf)
+        evaluator.containerSourceFlags.append(flag)
+    }
+    val rawSource = evaluator.evaluate(expression.children[0])
+    evaluator.containerSourceLeaves.truncate(leafMark)
+    evaluator.containerSourceFlags.truncate(leafMark)
+    if (bootstrapEvalLeaves(rawSource)) {
+        evaluator.names[flag] = ""
+        evaluator.values[flag] = evaluator.uninitializedValue()
+        return rawSource
+    }
     // A borrowed array (a map's affine `values()`) iterates as the array.
-    var source = bootstrapEvalUnwrapBorrow(evaluator.evaluate(expression.children[0]))
+    var source = bootstrapEvalUnwrapBorrow(rawSource)
+    val ownedArray = source.kind == "array" && evaluator.valueIsAffine(source) &&
+        !evaluator.values[flag].boolean
     val generated = bootstrapEvalIsGenerator(source)
     // A generator is iterated in place: the loop owns it, asks it for each
     // element as it needs one, and closes it however the loop ends.
@@ -9456,9 +9488,15 @@ fun bootstrapEvaluateFor(
             )
         } else {
             evaluator.values[iteratorIndex] = source.elements[element]
+            if (ownedArray) source.elements[element] = evaluator.uninitializedValue()
         }
         result = evaluator.evaluateFrame(expression.children[1])
         bootstrapEvalDropDiscarded(evaluator, expression.children[1], result)
+        if (ownedArray && evaluator.values[iteratorIndex].kind != "uninitialized") {
+            val held = evaluator.values[iteratorIndex]
+            evaluator.values[iteratorIndex] = evaluator.uninitializedValue()
+            evaluator.dropValue(held)
+        }
         // A stack-depth stop unwinding through the loop ends it: another turn
         // would only descend into the stop again.
         if (bootstrapEvalDepthReported) looping = false
@@ -9479,6 +9517,9 @@ fun bootstrapEvaluateFor(
     evaluator.values[iteratorIndex] = evaluator.uninitializedValue()
     evaluator.names[iteratorIndex] = ""
     if (generated) bootstrapEvalGeneratorDrop(evaluator, source)
+    else if (ownedArray) evaluator.dropValue(source)
+    evaluator.names[flag] = ""
+    evaluator.values[flag] = evaluator.uninitializedValue()
     result
 }
 
