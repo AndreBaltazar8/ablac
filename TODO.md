@@ -54,7 +54,6 @@ paths have the prefix `tools/test-` and suffix `.sh`.
 | `http-client` | 1 | 21 |
 | `compile-eval-cross-target` | 1 | 19 |
 | `for-constant-array` | 1 | 16 |
-| `compiler-capture-process` | 1 | 15 |
 | `compile-eval-method-targets` | 1 | 14 |
 | `wrapper-demand` | 1 | 14 |
 | `arrays-dense` | 1 | 12 |

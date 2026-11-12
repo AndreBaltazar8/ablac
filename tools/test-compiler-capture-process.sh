@@ -43,23 +43,26 @@ for value in first second; do
     [[ $("$out/environment") == "$value" ]]
 done
 
-python3 - <<'PY'
-from pathlib import Path
-p = Path('build/compiler-capture-process')
-call = 'compilerCaptureProcess(["python3", "tests/cases/compiler-capture-process/child.py", "mark", "build/compiler-capture-process/spawned"]'
-prefix = 'import "abla/compiler"\n#compilerGrant("process.io")\n'
-for name, cap, timeout in [('zero', '0', '10'), ('negative', '-1', '10'),
-                           ('large', '1048577', '10'), ('timeout-zero', '1', '0'),
-                           ('timeout-large', '1', '10001')]:
-    (p/'authorized'/f'{name}.ab').write_text(prefix + f'val RESULT = #{call}, {cap}, {timeout})\nfun main: int = 0\n')
-(p/'denied'/'manifest.ab').write_text(prefix + f'val RESULT = #{call})\nfun main: int = 0\n')
-(p/'authorized'/'grant.ab').write_text('import "abla/compiler"\n' + f'val RESULT = #{call})\nfun main: int = 0\n')
-(p/'authorized'/'nul.ab').write_text(prefix + 'val RESULT = #compilerCaptureProcess(["python3", "bad\\u0000argument"])\nfun main: int = 0\n')
-(p/'authorized'/'empty.ab').write_text(prefix + 'val RESULT = #compilerCaptureProcess([])\nfun main: int = 0\n')
-(p/'authorized'/'many.ab').write_text(prefix + 'val RESULT = #compilerCaptureProcess(filledArray(129, "true"))\nfun main: int = 0\n')
-(p/'authorized'/'long.ab').write_text(prefix + 'val RESULT = #compilerCaptureProcess(["x" * 4097])\nfun main: int = 0\n')
-(p/'authorized'/'revoked.ab').write_text(prefix + f'val RESULT = #{call})\nfun main: int = 0\n')
-PY
+call='compilerCaptureProcess(["sh", "tests/cases/compiler-capture-process/child.sh", "mark", "build/compiler-capture-process/spawned"]'
+prefix='import "abla/compiler"
+#compilerGrant("process.io")
+'
+trailer='fun main: int = 0'
+for entry in zero:0:10 negative:-1:10 large:1048577:10 timeout-zero:1:0 timeout-large:1:10001; do
+    IFS=: read -r name cap timeout <<< "$entry"
+    printf '%sval RESULT = #%s, %s, %s)\n%s\n' "$prefix" "$call" "$cap" "$timeout" "$trailer" \
+        > "$out/authorized/$name.ab"
+done
+printf '%sval RESULT = #%s)\n%s\n' "$prefix" "$call" "$trailer" > "$out/denied/manifest.ab"
+printf 'import "abla/compiler"\nval RESULT = #%s)\n%s\n' "$call" "$trailer" > "$out/authorized/grant.ab"
+printf '%sval RESULT = #compilerCaptureProcess(["sh", "bad\\u0000argument"])\n%s\n' "$prefix" "$trailer" \
+    > "$out/authorized/nul.ab"
+printf '%sval RESULT = #compilerCaptureProcess([])\n%s\n' "$prefix" "$trailer" > "$out/authorized/empty.ab"
+printf '%sval RESULT = #compilerCaptureProcess(filledArray(129, "true"))\n%s\n' "$prefix" "$trailer" \
+    > "$out/authorized/many.ab"
+printf '%sval RESULT = #compilerCaptureProcess(["x" * 4097])\n%s\n' "$prefix" "$trailer" \
+    > "$out/authorized/long.ab"
+printf '%sval RESULT = #%s)\n%s\n' "$prefix" "$call" "$trailer" > "$out/authorized/revoked.ab"
 # Revoke the same source's authorization after a successful cached-path build.
 "$compiler" build "$out/authorized/revoked.ab" -o "$out/revoked" --fast \
     > "$out/revoked-granted.log" 2>&1
