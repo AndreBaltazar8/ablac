@@ -415,6 +415,7 @@ test-serial: ablac
 	tools/test-extension-temporary-receiver.sh $(COMPILER)
 	tools/test-operator-temporary-operands.sh $(COMPILER)
 	tools/test-conditional-method-temporary.sh $(COMPILER)
+	tools/test-ownership-doc-lifetimes.sh $(COMPILER)
 	tools/test-when-temporary-condition.sh $(COMPILER)
 	tools/test-when-affine-value.sh $(COMPILER)
 	tools/test-default-temporary-owner.sh $(COMPILER)

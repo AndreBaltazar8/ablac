@@ -10,6 +10,7 @@ for it with `Shared`.
 - [Parameters: borrow, `var` and `own`](#parameters-borrow-var-and-own)
 - [Changing objects through references](#changing-objects-through-references)
 - [Resources: values with one owner](#resources-values-with-one-owner)
+- [Temporary lifetimes and loop sources](#temporary-lifetimes-and-loop-sources)
 - [Collections of resources](#collections-of-resources)
 - [Borrowed views and `borrow(...)` results](#borrowed-views-and-borrow-results)
 - [Sharing: `Cell`, `Shared`, `Weak`, `Mutex`](#sharing-cell-shared-weak-mutex)
@@ -213,16 +214,15 @@ val shared = Counter(0)
 
 fun fresh(start: int): Counter = Counter(start)     // fine: new
 fun current(): Counter = shared                     // fine: rooted in a global
-fun same(counter: Counter): Counter = counter       // rejected
+fun same(counter: Counter): Counter = counter       // inferred borrow(counter)
 ```
 
-Returning a parameter or `this` as a plain result is rejected
-(`ownership.managed-return-borrow-contract`, whose `help:` names the
-contract to declare): the caller would get a second, unchecked name for its
-own object; so is a place under one, such as an entry of a parameter's
-`Map`. To return a view of it, declare the result `borrow(name) T`
-([below](#borrowed-views-and-borrow-results)); otherwise build and return a
-new value, or return nothing and let the caller keep its own reference.
+A result rooted in one parameter or `this` can carry an inferred borrow
+contract, as `same` does above. If the compiler cannot infer one source,
+returning a borrowed reference as an unrestricted result is rejected
+(`ownership.managed-return-borrow-contract`). Declare `borrow(name) T`
+([below](#borrowed-views-and-borrow-results)), build a new value, or let the
+caller keep its own reference.
 
 ## Resources: values with one owner
 
@@ -282,14 +282,6 @@ What happened, line by line:
   field.
 - `taken` is dropped when `main` ends.
 
-A `for` over a generator closes it when the loop ends, including on `break`,
-`return`, or when an enclosing generator is dropped while suspended. If the
-source is borrowed, its owner retains the handle and drops it later; a fresh
-or moved source belongs to the loop and is dropped there. A field or index of
-an owner, a borrowed parameter, and a global are borrowed. Conditional sources
-follow the ownership of the branch actually selected, including across a `yield`. If the owner itself is a
-fresh temporary, the loop holds it until the source closes and then drops it.
-
 The rules:
 
 - `drop` takes no parameters and returns `void`. A second `drop`, or another
@@ -304,27 +296,8 @@ The rules:
   of an `if` without `else`. A block whose value is one of its own locals
   (`{ val t = issue(5); t }`) hands that local on with its value, so the block
   doesn't drop it too.
-- A new resource that is only a temporary is dropped at the end of the full statement it is part of (decided: not
-  right after the call that borrowed it): the receiver of a method (`issue(5).isValid()`), of a field read
-  (`issue(5).id`), or an argument to a borrowing parameter (`check(issue(5))`). If it is part of the condition of an
-  `if`, `while` or `do`/`while`, the subject of a `when`, or an operand of `&&` or `||` that may not run, it is
-  dropped at the end of that condition, subject or operand (a loop's condition on each pass), before the body.
-  Each `when` match condition finishes and drops its temporaries before the next condition or selected branch.
-  Several are dropped newest first. A `return`, `break` or `continue` in the middle of a statement first drops its
-  temporaries made so far, then runs the defers and drops the locals of each scope it leaves, innermost first.
-  For a return, the return value is computed before these drops; each scope's defers run before its locals drop.
-  The same holds in the compile-time evaluator, in a global's initializer and in the body of a
-  lambda, a `defer` and a generator. A resource something takes (a constructor or `own` argument, a `move`) is not
-  one. A temporary in a default argument evaluated in a function or method's prologue is dropped when that callee
-  returns, after its locals, newest first. A default evaluated at the caller (a constructor or named call) holds its
-  temporaries until the end of the calling statement. When name shadowing requires a generated helper to evaluate a
-  default, its temporaries instead follow the helper's lifetime. Not covered, and still leaking as before (the resource's `drop` never runs, so a password or key it wipes is not wiped):
-  a temporary that is the receiver or an argument of an extension function (`fun Res.check()` called as
-  `make().check()`), of a call through an interface (dispatch) or an interface's default body, or of a built-in
-  container's method (`array.append(make())` hands it on, which is fine; `list.contains(make())` does not).
-  Bind such a resource to a `val` first, or give it to an `own` parameter, and it is dropped at the end of its
-  scope as before. A view of a temporary's field (`val d = make().data()`) that is kept
-  after the statement is accepted when the field is a managed object, and sees what the drop did.
+- A temporary has a shorter lifetime than a bound owner. Its precise boundary and examples are
+  [below](#temporary-lifetimes-and-loop-sources).
 - Copying is rejected: `val b = a` must be `val b = move(a)`
   (`ownership.move-required`). Passing `a` to an `own` parameter also needs
   `move(a)`. A fresh value, like `refund(issue(5))`, needs no `move`.
@@ -375,6 +348,376 @@ fun main: int {
 | `ownership.partial-move:<owner>` | an owner is used whole after one of its parts was moved out and not put back on every path |
 | `ownership.once-called-again:<callback>` | a `move { ... }` closure may already have run |
 | `assignment.unassigned:<name>` | a variable declared without a value is read before every path assigns it |
+
+## Temporary lifetimes and loop sources
+
+The examples in this section are excerpts from the linked tests. Their helper
+resources append their drop events to a log; the comments give the checked
+part of that log. The test names contain the complete declarations and expected
+output. An owned value handed into a constructor, an `own` parameter, a local,
+or `move` is no longer a temporary owned by the enclosing statement.
+
+**Statements and nested owners.** A fresh value borrowed by a call or used as
+an affine projection receiver is held until the whole statement finishes.
+Fresh owners created by one statement drop newest first, including nested
+constructor arguments. The selected root is held once: for an array projection
+it is the array, not both the array and its element. The following checked
+excerpt logs the call `B2`, then the outer holder/item `HI2`, then the inner
+holder/item `HI1` ([test](../tests/cases/drop-temporaries/nested-order.ab)).
+
+```abla fragment
+inspect(Holder(Item(Holder(Item(1)).item.id + 1)).item)
+events = events + "|"
+// B2HI2HI1|
+```
+
+This includes extension-method receivers. `look` logs `B1`, then the
+temporary drops at the end of the statement
+([test](../tests/cases/extension-temporary-receiver/main.ab)).
+
+```abla fragment
+Item(1).look()
+log = log + "|"
+// B1I1|
+```
+
+An `if` or `when` receiver holds only its selected fresh arm; it leaves a
+selected borrowed arm to its existing owner. These two calls print the
+fresh-path drop before the marker and the existing owner's drop after it
+([test](../tests/cases/conditional-method-temporary/main.ab)).
+
+```abla fragment
+extension(true)
+extension(false)
+// B1I1|I2B2|I2
+```
+
+Both fresh operands of an operator method remain alive through the call and
+drop newest first after it. Here `P` is the operator body and `V5` the
+following statement ([test](../tests/cases/operator-temporary-operands/main.ab)).
+
+```abla fragment
+val y = Item(2) + Item(3)
+log = log + "V$y|"
+// PI3I2V5|
+```
+
+**Conditions and subjects.** A temporary in an `if`, `while` or `do`-`while`
+condition drops after that evaluation and before its body or the next
+statement. A loop condition is evaluated and cleaned up on each pass. A
+`when` subject finishes before the first match condition. In this checked
+example `make(6)` drops before the arm appends `six`
+([test](../tests/cases/drop-temporaries/positions.ab)).
+
+```abla fragment
+mark("when subject")
+when (make(6).id) { 6 -> order = order + " six" else -> order = order + " other" }
+// |when subject 6 six
+```
+
+The same boundary applies to an `if` condition: the drop precedes its body
+([test](../tests/cases/drop-temporaries/positions.ab)).
+
+```abla fragment
+mark("if condition")
+if (make(4).ok()) order = order + " then"
+// |if condition 4 then
+```
+
+The `while` condition below runs four times: three times for its body and once to
+stop ([test](../tests/cases/drop-temporaries/branches.ab)).
+
+```abla fragment
+mark("condition each pass"); var i = 0
+while (make(20 + i).ok() && i < 3) { i = i + 1 }
+// |condition each pass 20 21 22 23
+```
+
+The final `23` comes from the left operand on the stopping pass, after the
+three increments. The checked `do`-`while` example drops after each condition
+([same test](../tests/cases/drop-temporaries/branches.ab)).
+
+```abla fragment
+mark("do while"); var k = 0
+do { k = k + 1 } while (make(40 + k).ok() && k < 2)
+// |do while 41 42
+```
+
+A short-circuit right operand has its own boundary; an operand that is skipped
+creates and drops nothing. Here the left temporary is held through the right
+operand, and their temporaries drop newest first at the join
+([test](../tests/cases/drop-temporaries/branches.ab)).
+
+```abla fragment
+mark("left operand")
+val e = make(5).ok() && make(6).ok()
+// |left operand 6 5
+```
+
+No `1` is logged when the right operand is skipped
+([same test](../tests/cases/drop-temporaries/branches.ab)).
+
+```abla fragment
+mark("and skipped")
+val a = false && make(1).ok()
+// |and skipped
+```
+
+Each `when` match condition is compared before its temporaries drop; they drop
+before the next match is evaluated or the matching arm runs. A fresh affine
+match value is also dropped after comparison; a borrowed match value remains
+owned by its owner. The first and second matches below each drop a holder and
+item before `B` ([test](../tests/cases/when-temporary-condition/main.ab)).
+
+```abla fragment
+when (2) { Holder(Item(1)).item.id -> log = log + "A"
+    Holder(Item(2)).item.id -> log = log + "B"; else -> log = log + "C" }
+// HI1HI2B
+```
+
+A conditional match can choose a fresh value or a borrowed one. On the fresh
+path `I2` precedes the arm; on the borrowed path the existing owner drops
+after the marker ([test](../tests/cases/when-affine-value/main.ab)).
+
+```abla fragment
+choose(true)
+choose(false)
+// I2N|I1M|I1
+```
+
+**Loop sources.** A generator loop closes its source on exhaustion, `break`,
+`return`, or when an enclosing generator is dropped while suspended. It frees
+the generator only if the loop owns it. A borrowed parameter, global, or field
+or index of an owner is borrowed; a fresh or moved generator is owned. An
+`if` or `when` source follows the selected arm, including across a `yield`.
+When a field comes from a fresh temporary owner, the loop holds the selected
+root through the loop: it closes the generator first, then drops that owner.
+The following excerpt logs `generator holder break` in native and `#`
+([test](../tests/cases/modules/generator-temporary-holder-order.ab)).
+
+```abla fragment
+for (value in Holder(numbers()).gen) break
+events = events + "break | "
+// generator holder break |
+```
+
+A `for` range bound is part of the loop statement: its temporary owner stays
+through the loop body and drops when the loop ends
+([test](../tests/cases/ownership-doc-lifetimes/main.ab)).
+
+```abla fragment
+for (i in 0 until Holder(Item(2)).item.id) { log = log + "B$i" }
+log = log + "|"
+// B0B1HI2|
+```
+
+A borrowed generator's owner retains its handle after the loop has closed it;
+the later owner drop does not close it a second time. Here `first` returns from
+its loop, and the caller continues with the owner still in scope
+([test](../tests/cases/modules/generator-borrowed-close.ab)).
+
+```abla fragment
+val one = sequence()
+first(one); events = events + "after-first "
+// close after-first
+```
+
+A global generator is also borrowed: a second loop sees it already closed,
+while an independently owned generator still yields
+([test](../tests/cases/modules/generator-borrowed-global.ab)).
+
+```abla fragment
+for (value in global) println("$value")
+for (value in global) println("bad $value")
+// 1; the second loop prints nothing
+```
+
+The same rule applies to indexed sources and mixed conditional sources. The
+following checked loop chooses the borrowed parameter or a fresh generator;
+the enclosing test repeats both paths and prints `1000`
+([test](../tests/cases/modules/generator-borrowed-conditional.ab)).
+
+```abla fragment
+var total = 0
+for (value in if (choose) values else numbers()) total = total + value
+// enclosing test: 1000
+```
+
+A fresh generator passed directly to a borrowing function remains owned by the
+caller until that calling statement ends. The loop closes it and the later
+drop does not close it again ([same test](../tests/cases/modules/generator-borrowed-close.ab)).
+
+```abla fragment
+first(sequence())
+events = events + "after-temporary"
+// close after-temporary
+```
+
+The fresh generator returned by `outer()` is owned by the outer loop; dropping
+it while suspended closes its inner borrowed source before that source's
+temporary holder is dropped ([test](../tests/cases/modules/generator-temporary-holder-order.ab)).
+
+```abla fragment
+for (value in outer()) break
+events = events + "outer-drop"
+// generator holder outer-drop
+```
+
+**Default arguments.** A default evaluated in an ordinary function or method
+prologue owns its temporary until the callee returns, after its locals and in
+newest-first order. An omitted constructor default or caller-side named default
+is evaluated at the caller and holds its temporary until the calling statement
+ends. If a generated helper is needed to preserve name resolution, its
+non-escaping temporaries instead follow that helper's lifetime. In this test
+`F1` is the body, `L` its local, then `HI1` the default owner and field
+([test](../tests/cases/default-temporary-owner/main.ab)).
+
+```abla fragment
+value(1)
+events = events + "|"
+// F1LHI1|
+```
+
+Methods use the same prologue rule: `M3` is the body, `L` its local, and
+`HI3` the default's owner ([same test](../tests/cases/default-temporary-owner/main.ab)).
+
+```abla fragment
+Methods().value(3)
+events = events + "|"
+// M3LHI3|
+```
+
+The caller-side named case keeps its owner across evaluation of the next
+argument `side()`, which appends `S` ([same test](../tests/cases/default-temporary-owner/main.ab)).
+
+```abla fragment
+pair(value(a = 15), side())
+events = events + "|"
+// F15LSHI15|
+```
+
+An omitted constructor default is caller-side as well. Its holder drops after
+the constructor call and before the following `C4` marker
+([same test](../tests/cases/default-temporary-owner/main.ab)).
+
+```abla fragment
+val box = Box(4)
+events = events + "C${box.b}|"
+// HI4C4|
+```
+
+**Exits and defers.** `return` computes its result first. For each scope left
+by `return`, `break` or `continue`, innermost first, the exiting statement's
+temporaries belonging to that scope drop, its defers run, and its locals drop.
+An enclosing statement's older temporary remains until its own scope is left.
+A prologue default owner remains until after the callee's locals. Here `HI1`
+precedes defer `D` ([test](../tests/cases/exit-temporary-defer/main.ab)).
+
+```abla fragment
+returned()
+log = log + "|"
+// HI1D|
+```
+
+`break` and `continue` follow the same rule. The test's two iterations clean
+`HI4` and `HI5` before the respective `D0` and `D1` defers
+([same test](../tests/cases/exit-temporary-defer/main.ab)).
+
+```abla fragment
+loop()
+log = log + "|"
+// HI4D0HI5D1|
+```
+
+Nested scopes run their own defers in order, innermost first
+([same test](../tests/cases/exit-temporary-defer/main.ab)).
+
+```abla fragment
+nested()
+log = log + "|"
+// HI2NO|
+```
+
+An inner argument block can defer before the enclosing statement's older
+temporary is dropped: the checked trace is `NHI7O`
+([same test](../tests/cases/exit-temporary-defer/main.ab)).
+
+```abla fragment
+nestedArgument()
+log = log + "|"
+// NHI7O|
+```
+
+**Refused transfers and escaping views.** The compiler does not allow moving an
+affine field out of a fresh temporary owner. Binding it, returning it, passing
+it to an `own` parameter or assigning it reports
+`ownership.place-move-required`; an explicit `move` of that field reports
+`ownership.place-owner` ([test](../tests/cases/drop-temporaries/affine-projection-refused.ab)).
+
+```abla error
+resource class Holder(val item: Item)
+fun bind(): void { val x = Holder(Item()).item }
+// error: ownership.place-move-required:local.x
+```
+
+Adding `move` does not make a temporary field a movable place
+([same test](../tests/cases/drop-temporaries/affine-projection-refused.ab)).
+
+```abla error
+resource class Holder(val item: Item)
+fun moved(): void { val x = move(Holder(Item()).item) }
+// error: ownership.place-owner
+```
+
+A borrowed resource parameter cannot be returned as an owned result, even
+when the function's result type is inferred
+([test](../tests/cases/inferred-affine-return/function.ab)).
+
+```abla error
+resource class Item(val id: int) { fun drop(): void {} }
+fun view(x: Item) = x
+// error: ownership.borrow-escape
+```
+
+A borrowed result contract cannot name a defaulted parameter
+(`ownership.borrow-return-source-default`); capturing a borrowed parameter in
+a closure or task is `ownership.borrow-capture`, and storing one where it can
+escape is `ownership.borrow-escape`
+([tests](../tests/cases/default-temporary-owner/)). For example
+([test](../tests/cases/default-temporary-owner/refused-return.ab)):
+
+```abla error
+resource class Item(val id: int)
+fun view(x: Item = Holder(Item(1)).item): borrow(x) Item = x
+// error: ownership.borrow-return-source-default
+```
+
+Capturing that borrowed default parameter in a suspended generator is refused;
+the task form is checked too ([test](../tests/cases/default-temporary-owner/refused-capture.ab)).
+
+```abla error
+resource class Holder(val item: Item) { fun drop(): void {} }
+fun produce(x: Item = Holder(Item(1)).item): Generator<int> = generator { yield x.id }
+// error: ownership.borrow-capture
+```
+
+Storing it in an owning global array is refused
+([test](../tests/cases/default-temporary-owner/refused-store.ab)).
+
+```abla error
+var stored: array<Item> = []
+fun save(x: Item = Holder(Item(1)).item): void { stored.append(x) }
+// error: ownership.borrow-escape
+```
+
+A managed field view of a temporary can currently be kept after the statement and observes its owner's
+drop effects; do not assume it extends the temporary owner's lifetime.
+
+These rules also apply to compile-time evaluation under `#`. There are still
+known gaps: temporary resources passed through interface calls,
+interface default bodies, and some built-in container methods can leak rather
+than drop. Bind the resource to a `val` or transfer it to `own` instead. A
+helper forced by name shadowing has no dedicated drop-order regression yet.
 
 ## Collections of resources
 
@@ -771,7 +1114,7 @@ to `consume`, and the value is `ticket`.
 | `ownership.borrow-capture` | A closure captures a borrowed value | capture the owner or a copy |
 | `ownership.borrow-mutable-local` | A borrow or alias is bound to a `var` | use `val` |
 | `ownership.borrow-source` | `if`/`when` chooses between views of different owners | view one owner |
-| `ownership.managed-return-borrow-contract` | A parameter or `this` is returned as a plain result | declare the result `borrow(name) T`, or return a new object |
+| `ownership.managed-return-borrow-contract` | A managed borrowed result has no valid inferred or explicit contract | declare `borrow(name) T`, or return a new object |
 | `ownership.borrow-return-source` | A `borrow(name) T` result returns something not rooted at `name` | return a place of `name`, or a new value |
 | `ownership.use-after-move`, `ownership.use-after-conditional-move`, `ownership.partial-move`, `ownership.once-called-again`, `assignment.unassigned` | See [resources](#resources-values-with-one-owner) | use the value before moving it, or assign it again |
 | `ownership.capture-move-required` | A plain closure captures a resource | `move { ... }` |
