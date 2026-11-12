@@ -43,6 +43,19 @@ import "backend/llvm/debug.ab"
 // creates a name that a concurrent eviction has just removed.
 noescape extern:"c" fun link(existing: cstring, destination: cstring): i32
 noescape extern:"c" fun utimes(path: cstring, times: i64*): i32
+private noescape extern:"intrinsic" fun ablaHostIsMacOS(): bool
+
+// x86-64 Linux uses the system calls (link 86, utimes 235), so the compiler needs
+// no libc link or utimes there (#806); macOS keeps libSystem's.
+fun bootstrapCodegenLink(existing: string, destination: string): bool =
+    if (ablaHostIsMacOS()) link(existing, destination) == i32(0)
+    else linuxSyscall2(86, nativeCStringAddress(existing), nativeCStringAddress(destination)) == 0
+
+fun bootstrapCodegenTouch(path: string): void {
+    if (ablaHostIsMacOS()) utimes(path, nativeNullPointer())
+    else linuxSyscall2(235, nativeCStringAddress(path), 0)
+    return
+}
 
 noescape extern:"c" fun LLVMGetFirstGlobal(module: i64*): i64*
 noescape extern:"c" fun LLVMGetNextGlobal(global: i64*): i64*
@@ -684,14 +697,14 @@ fun bootstrapCodegenMaterializeHit(entry: string, part: string): bool {
     if (evict.found && evict.value == "1") Path(entry).remove()
     Path(part).remove()
     val copy = linuxEnvironment("ABLA_CODEGEN_TEST_COPY_HITS")
-    if (!(copy.found && copy.value == "1") && link(entry, part) == i32(0)) {
-        utimes(part, nativeNullPointer())
+    if (!(copy.found && copy.value == "1") && bootstrapCodegenLink(entry, part)) {
+        bootstrapCodegenTouch(part)
         return true
     }
     // This also covers EXDEV and file systems that forbid hard links. If a
     // sweep unlinks the source after cp opens it, its descriptor keeps it alive.
     if (Path(entry).info().isFile() && bootstrapCodegenCopy(entry, part, true) == 0) {
-        utimes(entry, nativeNullPointer())
+        bootstrapCodegenTouch(entry)
         return true
     }
     Path(part).remove()
@@ -705,7 +718,7 @@ fun bootstrapCodegenPublish(entry: string, part: string): bool {
     Path(temporary).remove()
     // Neither the child nor the parent writes a completed part again: llvm-ar
     // and wasm-ld only read it. Share its inode when the cache is on this volume.
-    val ready = link(part, temporary) == i32(0) ||
+    val ready = bootstrapCodegenLink(part, temporary) ||
         bootstrapCodegenCopy(part, temporary, true) == 0
     val published = ready && Path(temporary).moveTo(Path(entry))
     Path(temporary).remove()

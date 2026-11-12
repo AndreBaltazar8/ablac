@@ -7,6 +7,14 @@ import "abla/unsafe/memory"
 import "abla/unsafe/memory/raw"
 
 private noescape extern:"c" fun fork(): i32
+private noescape extern:"intrinsic" fun ablaHostIsMacOS(): bool
+
+// x86-64 Linux forks with the system call, so the compiler needs no libc fork
+// there (#806). The child allocates nothing before exec or _exit: a thread
+// holding the heap lock at the fork would stay locked in the child, which libc
+// fork used to repair. macOS keeps libSystem's fork.
+private fun processFork(): int =
+    if (ablaHostIsMacOS()) int(fork()) else linuxSyscall0(57)
 
 class BootstrapProcessCapture(
     val exitCode: int,
@@ -79,34 +87,39 @@ trusted fun bootstrapProcessCapture(arguments: array<string>, maximum: int,
     val errorWriter = descriptors[3]
     val setup = nativeByteBuffer(8)
     setup.storeI64(0, 0)
-    val process = int(fork())
+    // All the child needs is computed here: it must not allocate.
+    val executableAddress = nativeCStringAddress(executable)
+    val vectorAddress = nativePointerAddress(vector.address)
+    val environmentAddress = nativePointerAddress(linuxEnvironmentPointer())
+    val setupAddress = nativePointerAddress(setup.address)
+    val input = linuxOpen("/dev/null", 524288).descriptor
+    val process = processFork()
     if (process == 0) {
         linuxSyscall1(3, output)
         linuxSyscall1(3, error)
-        var ready = linuxSyscall2(109, 0, 0) == 0
+        var ready = input >= 0 && linuxSyscall2(109, 0, 0) == 0
         // Restore an empty signal mask before exec; do not change environment.
-        if (linuxSyscall4(14, 2, nativePointerAddress(setup.address), 0, 8) < 0) ready = false
-        val input = linuxOpen("/dev/null").descriptor
-        if (input < 0) ready = false
+        if (linuxSyscall4(14, 2, setupAddress, 0, 8) < 0) ready = false
+        // dup2(fd, fd) keeps CLOEXEC, which exec would then honour.
+        if (ready && input == 0 && linuxSyscall3(72, 0, 2, 0) < 0) ready = false
         if (ready && linuxSyscall2(33, input, 0) < 0) ready = false
         if (ready && linuxSyscall2(33, writer, 1) < 0) ready = false
         if (input > 2) linuxSyscall1(3, input)
         if (writer > 2) linuxSyscall1(3, writer)
         if (ready) {
-            linuxSyscall3(59, nativeCStringAddress(executable),
-                nativePointerAddress(vector.address),
-                nativePointerAddress(linuxEnvironmentPointer()))
+            linuxSyscall3(59, executableAddress, vectorAddress, environmentAddress)
         }
         // CLOEXEC closes this pipe on success, distinguishing exec failure from
         // a successfully launched program which itself exits with status 127.
         setup.storeI64(0, 1)
-        linuxSyscall3(1, errorWriter, nativePointerAddress(setup.address), 8)
+        linuxSyscall3(1, errorWriter, setupAddress, 8)
         linuxSyscall1(60, 127)
     }
     vector.close()
     pipes.close()
     linuxSyscall1(3, writer)
     linuxSyscall1(3, errorWriter)
+    if (input >= 0) linuxSyscall1(3, input)
     if (process < 0) {
         linuxSyscall1(3, output)
         linuxSyscall1(3, error)
