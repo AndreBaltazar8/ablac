@@ -10,7 +10,7 @@ mkdir -p "$out"
 status=0
 "$out/facts" || status=$?
 [[ $status == 42 ]] || { echo "method facts failed: $status" >&2; exit 1; }
-for name in unrelated selected interface generic default-interface default-safe field-unrelated field-called; do
+for name in unrelated selected interface generic default-interface default-safe field-unrelated field-called field-default field-delegate; do
     for tier in interp jit auto; do
         ABLA_COMPILE_EVAL=$tier ABLA_COMPILE_EVAL_TRACE=1 "$compiler" build \
             "tests/cases/compile-eval-method-targets/build-$name.ab" -o "$out/builder" --fast --no-cache \
@@ -22,7 +22,7 @@ for name in unrelated selected interface generic default-interface default-safe 
     cmp "$out/$name-interp.wasm" "$out/$name-auto.wasm"
 done
 for tier in jit auto; do
-    for name in unrelated selected interface generic default-interface default-safe field-unrelated field-called; do
+    for name in unrelated selected interface generic default-interface default-safe field-unrelated field-called field-default field-delegate; do
         # Byte offset just past `val H = ` is where the compile-time call starts.
         marker=$(( $(grep -boa 'val H = #' "tests/cases/compile-eval-method-targets/$name.ab" | head -n 1 | cut -d: -f1) + 8 ))
         log="$out/$name-$tier.log"
@@ -37,8 +37,13 @@ for tier in jit auto; do
                 || { cat "$log" >&2; echo "method targets: $name $tier needs exactly one interpreted note at $((marker + 1))" >&2; exit 1; }
             case $name in selected|generic)
                 [[ $hits == *'adoptNativeString:'* ]] || { echo "method targets: $name $tier lacks adoptNativeString" >&2; exit 1; } ;;
-            field-called)
+            field-called|field-delegate)
                 [[ $hits == *'ablaUnsafeCopyMemory:'* ]] || { echo "method targets: $name $tier lacks ablaUnsafeCopyMemory" >&2; exit 1; } ;;
+            # Today every cross-target site of a program with an extension default
+            # interprets (bootstrapCtPrepare); once that has its own proof, the walk
+            # must still reach the default's native copy.
+            field-default)
+                [[ $hits == *'ablaUnsafeCopyMemory:'* || $hits == *'implicit runtime dependency text:'* ]] || { echo "method targets: $name $tier reached neither the default nor the implicit-root guard" >&2; exit 1; } ;;
             esac
         fi
     done
@@ -58,9 +63,9 @@ assert.equal(digest, 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f2
     for (let i = 0; i < Number(instance.exports.resultSize()); ++i) field += String.fromCharCode(Number(instance.exports.resultByte(BigInt(i))));
     assert.equal(field, 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
 }
-for (const [name, size] of [['selected',0],['interface',4],['generic',0],['default-interface',0],['default-safe',4],['field-called',3]]) {
+for (const [name, size] of [['selected',0],['interface',4],['generic',0],['default-interface',0],['default-safe',4],['field-called',3],['field-default',3],['field-delegate',3]]) {
     const {instance} = await WebAssembly.instantiate(fs.readFileSync(`${out}/${name}-jit.wasm`));
     assert.equal(Number(instance.exports.resultSize()), size);
 }
 NODE
-echo 'compile-time method targets: precise concrete reach, field reads apart from methods, conservative dynamic reach and three-tier Wasm parity passed'
+echo 'compile-time method targets: precise concrete reach, field reads apart from methods, defaults and delegates still reached, conservative dynamic reach and three-tier Wasm parity passed'
