@@ -2838,7 +2838,7 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
 
 - Kept closures retain their original body for later interpreted calls, but cannot yet be lifted to run time after a later compile-time transform. Preserve the original typed owner/capture layout before admitting this case; identical lambda text alone is insufficient when an enclosing binding changes type. (#803)
 
-- #796 also covers kept callable compile globals across a lowering edit: `tests/cases/compile-global-graph/round-retry.ab` gives `11,12` under interp but `12,12` under jit/auto because native complex-global hydration replays the initializer. Extend the retry control to all tiers after fixing exchange/fallback; #803 deliberately changes no native getters/setters.
+- #796 (fixed): kept callable compile globals across a lowering edit: `tests/cases/compile-global-graph/round-retry.ab` gave `11,12` under interp but `12,12` under jit/auto (a native closure is positional and ran the edited body). A pass that changes declarations now interprets a site that makes a closure or reaches a compile global that may hold one (`ct_jit.ab`); the retry control runs in interp, jit and auto.
 
 ### #803 kept-global graph cost (2026-11-12)
 
