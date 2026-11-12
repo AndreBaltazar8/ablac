@@ -44,6 +44,13 @@ for source in $programs $checks; do
     done
 done
 if [[ $have_qemu -eq 1 ]]; then
+    for mode in "" --fast; do
+        # shellcheck disable=SC2086
+        "$compiler" build tests/cases/linux-syscall/stack-overflow.ab --target aarch64-linux -o "$out/overflow" --no-cache $mode > /dev/null 2>&1 || fail "the stack overflow program did not build"
+        status=0
+        timeout 300 qemu-aarch64 "$out/overflow" < /dev/null > /dev/null 2> "$out/overflow.err" || status=$?
+        [[ $status -eq 101 ]] && grep -qx "panic: stack overflow" "$out/overflow.err" || fail "stack overflow: status $status, $(cat "$out/overflow.err")"
+    done
     echo 'aarch64 linux: static libc-free builds run under qemu-aarch64 like the x86-64 ones'
 else
     echo 'aarch64 linux: static libc-free builds made; no qemu-aarch64, not run'
