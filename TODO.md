@@ -256,6 +256,8 @@
   draws the Generator shapes by default again (ablac-f3-2 saw the same class as the `test-labeled-loops` segfault of
   #736's first gate).
 
+- **Compile-time operator operands (#800).** Fresh borrowed extension arguments, including the second operand of an
+  operator, are now dropped during compile-time evaluation in the same newest-first order as native execution.
 - **Compile-time extension receivers (#800).** A fresh affine receiver of an extension call is now dropped at its
   statement boundary during compile-time evaluation, as it already was in native execution.
 - **When match resource values (#798).** A fresh affine match value is now dropped after its comparison; previously
