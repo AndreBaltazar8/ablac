@@ -1,0 +1,201 @@
+// Installer implementation, not a stable public API.
+import "abla/xtensa/companion"
+import "abla/http"
+import "abla/http/tls"
+import "abla/json"
+import "abla/text"
+import "abla/sys/linux/process"
+import "abla/process/supervisor"
+import "abla/fs"
+import "abla/fs/secure"
+import "abla/platform/host"
+import "abla/crypto"
+import "abla/sys/linux/random"
+
+class NativeSelection(val pins: CompanionPins, val url: string, val error: string)
+class NativeDownload(val bytes: string, val error: string)
+class NativeUrl(val host: string, val target: string, val error: string)
+private fun nativeEmptyPins(): CompanionPins = CompanionPins("", "", "", "", "", "", "")
+private fun nativeSelectionError(error: string): NativeSelection =
+    NativeSelection(nativeEmptyPins(), "", error)
+private fun nativeDigits(text: string): bool {
+    if (text == "") return false
+    for (byte in text) if (byte < 48 || byte > 57) return false
+    true
+}
+private fun nativeHex(text: string, size: int): bool {
+    if (text.size != size) return false
+    for (byte in text) if (!((byte >= 48 && byte <= 57) || (byte >= 97 && byte <=
+        102))) return false
+    true
+}
+private fun nativeVersion(version: string): bool {
+    if (version.size > 64) return false
+    val halves = version.split("-")
+    if (halves.size != 2 || !nativeDigits(halves[1]) || halves[1][0] == 48) return false
+    val nums = halves[0].split(".")
+    if (nums.size != 3) return false
+    for (num in nums) if (!nativeDigits(num)) return false
+    true
+}
+
+// Validate all catalog records, including ones other than the selected release.
+fun nativeSelectCatalog(text: string, version: string, host: string): NativeSelection {
+    val parsed = jsonParse(text, JsonLimits(1048576, 32, 20000, 1048576, 4096, true))
+    if (!parsed.succeeded || !parsed.value.isObject() || parsed.value.getInt("schema") != 1)
+        return nativeSelectionError("catalog schema")
+    val releases = parsed.value.get("releases")
+    if (!releases.isObject() || releases.size() ==
+        0) return nativeSelectionError("catalog releases")
+    val hosts = ["x86_64-linux", "arm64-macos", "x86_64-macos"]
+    var selection = nativeSelectionError("unknown version")
+    for (revision in releases.keys) {
+        if (!nativeVersion(revision)) return nativeSelectionError("catalog version")
+        val release = releases.get(revision)
+        val llvm = revision.split("-")[0]
+        val commit = release.getString("sourceCommit")
+        val source = release.getString("sourceArchiveSha256")
+        val platforms = release.get("platforms")
+        if (!release.isObject() || release.getString("status") != "published" ||
+            release.getString("llvmVersion") != llvm || !nativeHex(commit, 40) || !nativeHex(source,
+                64) ||
+            !platforms.isObject() || platforms.size() !=
+            3) return nativeSelectionError("catalog release")
+        for (platform in hosts) {
+            val entry = platforms.get(platform)
+            val archiveHash = entry.getString("sha256")
+            val manifestHash = entry.getString("manifestSha256")
+            val tag = "abla-xtensa-llvm-$revision"
+            val expected =
+                "https://github.com/AndreBaltazar8/llvm-project/releases/download/$tag/$tag-$platform.tar.gz"
+            if (!entry.isObject() || entry.getString("url") != expected ||
+                !nativeHex(archiveHash, 64) || !nativeHex(manifestHash,
+                    64)) return nativeSelectionError("catalog platform")
+            if (revision == version && platform == host) selection = NativeSelection(
+                CompanionPins(revision, platform, llvm, commit, source, archiveHash, manifestHash),
+                expected, ""
+            )
+        }
+    }
+    selection
+}
+
+// The first host is fixed by the pinned catalog URL. Redirects may only land
+// on GitHub's release or asset hosts. No credentials, ports or fragments.
+fun nativeDownloadUrl(url: string, first: bool): NativeUrl {
+    if (url.size > 8192) return NativeUrl("", "", "URL exceeds limit")
+    if (!url.startsWith("https://")) return NativeUrl("", "", "https required")
+    for (byte in url) if (byte <= 32 || byte >= 127 || byte == 35 || byte ==
+        92) return NativeUrl("", "", "invalid URL")
+    val slash = url.indexOf("/", 8)
+    if (slash < 0) return NativeUrl("", "", "invalid URL")
+    val host = url.slice(8, slash)
+    if (host != "github.com" && (first || (host != "release-assets.githubusercontent.com" &&
+        host != "objects.githubusercontent.com"))) return NativeUrl(host, "",
+            "redirect host: $host")
+    NativeUrl(host, url.slice(slash, url.size), "")
+}
+
+fun nativeDownload(url: string, timeoutMilliseconds: int = 30000): NativeDownload {
+    if (timeoutMilliseconds <= 0 || timeoutMilliseconds > 600000) return NativeDownload("",
+        "invalid timeout")
+    val deadline = linuxMonotonicMilliseconds() + timeoutMilliseconds
+    var current = url
+    var redirects = 0
+    while (redirects <= 5) {
+        val parsed = nativeDownloadUrl(current, redirects == 0)
+        if (parsed.error != "") return NativeDownload("", parsed.error)
+        val remaining = deadline - linuxMonotonicMilliseconds()
+        if (remaining <= 0) return NativeDownload("", "download timeout")
+        val client = httpsClient(parsed.host, maximumResponseBytes = 134217728,
+            timeoutMilliseconds = if (remaining < 5000) remaining else 5000,
+            deadlineMilliseconds = remaining)
+        val result = client.send(httpGet(parsed.target, [HttpHeader("User-Agent",
+            "abla-install-xtensa")]))
+        if (!result.succeeded || !result.complete) return NativeDownload("",
+            "download failed or exceeds limit")
+        val status = result.response.status
+        if (status == 200) {
+            if (result.response.body.size > 134217728) return NativeDownload("",
+                "download exceeds limit")
+            return NativeDownload(result.response.body, "")
+        }
+        if (status != 301 && status != 302 && status != 303 && status != 307 && status != 308)
+            return NativeDownload("", "HTTP $status")
+        current = result.response.header("Location")
+        if (current == "") return NativeDownload("", "redirect missing location")
+        redirects += 1
+    }
+    NativeDownload("", "too many redirects")
+}
+
+private fun nativeVersionLine(output: string, version: string): bool {
+    val needle = "LLVM version $version"
+    var start = 0
+    while (start < output.size) {
+        val at = output.indexOf(needle, start)
+        if (at < 0) return false
+        val end = at + needle.size
+        if (end == output.size || output[end] == 32 || output[end] == 9 || output[end] == 10 ||
+            output[end] == 13)
+            return true
+        start = end
+    }
+    false
+}
+
+// Helpers have already passed the pinned file hash. Output is captured in a
+// private directory; size polling is best-effort between observations.
+fun nativeCheckTools(tree: string, llvmVersion: string, timeoutMilliseconds: int = 30000): string {
+    if (timeoutMilliseconds <= 0 || timeoutMilliseconds > 600000) return "invalid helper timeout"
+    val tempRoot = if (ablaHostIsMacOS()) "/private/tmp" else "/tmp"
+    val parent = secureDirectory(tempRoot)
+    if (parent.descriptor < 0) return "temporary directory"
+    val random = secureRandomBytes(16)
+    if (!random.succeeded) return "random"
+    val name = ".abla-xtensa-check-${hexEncode(random.bytes)}"
+    if (!parent.createDirectory(name, 0o700)) return "temporary directory"
+    val directory = parent.openDirectory(name)
+    var error = ""
+    if (directory.descriptor < 0 || !directory.setPermissions(0o700)) error = "temporary directory"
+    if (error == "") {
+        for (tool in ["opt", "llc"]) {
+            val outputPath = "$tempRoot/$name/$tool.log"
+            val names = if (ablaHostIsMacOS()) ["DYLD_LIBRARY_PATH"] else []
+            val values = if (ablaHostIsMacOS()) ["$tree/lib"] else []
+            val child = startSupervisedProcess("", ["$tree/bin/$tool", "--version"], names, values,
+                outputPath)
+            if (child.identifier <= 0) { error = "helper launch: $tool"; break }
+            val deadline = processMonotonicMilliseconds() + timeoutMilliseconds
+            var status = -1
+            var reason = ""
+            while (status == -1 && reason == "") {
+                val size = Path(outputPath).info().size
+                if (size > 1048576) reason = "helper output limit: $tool"
+                else if (processMonotonicMilliseconds() >= deadline) reason =
+                    "helper timeout: $tool"
+                else {
+                    status = child.poll()
+                    if (status == -1) linuxSleep(10)
+                }
+            }
+            if (reason != "") { child.stop(100); error = reason; break }
+            if (status != 0) { error = "helper exit: $tool"; break }
+            val output = directory.openRegularFile("$tool.log")
+            val read = output.read(1048576)
+            if (read.error != "" || !nativeVersionLine(read.data, llvmVersion) ||
+                (tool == "llc" && !read.data.lowercase().contains("xtensa"))) {
+                error = "helper output: $tool"
+                break
+            }
+        }
+    }
+    // The private directory contains only the two names this function created.
+    for (tool in ["opt", "llc"]) {
+        val kind = directory.entryKind("$tool.log")
+        if (kind != "missing" && !directory.remove("$tool.log")) error = "helper cleanup: $name"
+    }
+    directory.close()
+    if (!parent.remove(name, true)) error = "helper cleanup: $name"
+    error
+}

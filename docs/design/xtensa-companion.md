@@ -46,6 +46,12 @@ python3 tools/install-xtensa-llvm.py --toolchain-root /path/to/abla-toolchain \
     --version 23.1.3-1
 ```
 
+Packages also include the experimental `bin/abla-install-xtensa-native` with
+the same flags and catalog. It limits compressed archives to 128 MiB and
+unpacked contents to 256 MiB while held in memory. The Python command remains
+the default until the native installer has passed the install probe on all
+three supported hosts.
+
 No `ablac build`, analysis, staging or compiler startup downloads anything.
 There is no PATH modification or replacement of `bin/opt`, `bin/llc`, Clang,
 the parent's LLVM library or SDK tools. Updating setup-abla is optional follow-up;

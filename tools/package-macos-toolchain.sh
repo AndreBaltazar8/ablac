@@ -118,6 +118,13 @@ SH
 } > "$bundle/bin/ablac"
 chmod 0755 "$bundle/bin/ablac"
 
+# Use the launcher so this build uses the LLVM version paired with ablac.
+mkdir -p "$working/native-build"
+"$bundle/bin/ablac" build "$abla_root/tools/xtensa-native/main.ab" --no-cache \
+    -o "$working/native-build/installer"
+cp "$working/native-build/installer" "$bundle/libexec/abla-install-xtensa-native"
+ln -s ../libexec/abla-install-xtensa-native "$bundle/bin/abla-install-xtensa-native"
+
 # Add the optional installer after the executable/dependency loops above.
 "$(dirname -- "${BASH_SOURCE[0]}")/package-xtensa-installer.sh" "$bundle"
 

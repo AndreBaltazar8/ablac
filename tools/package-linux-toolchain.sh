@@ -74,6 +74,14 @@ exec "$root/libexec/ablac.bin" "$@"
 SH
 chmod 0755 "$bundle/bin/ablac"
 
+# Build before dependency collection so the native installer receives the same
+# loader and bundled libraries as the other toolchain executables.
+mkdir -p "$working/native-build"
+"$bundle/bin/ablac" build "$abla_root/tools/xtensa-native/main.ab" --no-cache \
+    -o "$working/native-build/installer"
+cp "$working/native-build/installer" "$bundle/libexec/abla-install-xtensa-native"
+ln -s ../libexec/abla-install-xtensa-native "$bundle/bin/abla-install-xtensa-native"
+
 copy_dependencies() {
     local executable=$1
     local dependency

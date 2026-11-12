@@ -820,6 +820,11 @@
   package-import build (3,137,848 KiB); both use the 4 GiB launcher and verify the
   cohort before/after. v0.2.48 does not contain routing. See
   [design and evidence](docs/design/xtensa-companion.md).
+  #787 native installer: package the native command alongside the Python
+  installer; keep Python as the default until the native install probe passes
+  on Linux and both macOS hosts and the release switch is approved. The native
+  in-memory limits are 128 MiB compressed and 256 MiB unpacked; streaming
+  inflate remains needed to lift them.
 - [ ] **v0.2.49 release-note draft: Xtensa migration (planned break).** Publish this
   with the release; v0.2.48 does not implement the new routing:
 

@@ -40,6 +40,8 @@ for name in ('ABLA_ESP_CPU', 'ABLA_XTENSA_DIRECT_CALLS', 'ABLA_XTENSA_NARROW_BRA
 originals = snapshot(prefix)
 run(sys.executable, prefix / 'bin/abla-install-xtensa', '--version', '23.1.3-1', env=env)
 run(sys.executable, prefix / 'bin/abla-install-xtensa', '--verify', env=env)
+# Also exercise the separately packaged native verifier on the real tree.
+run(prefix / 'bin/abla-install-xtensa-native', '--verify', env=env)
 reference = json.loads((project / 'tests/cases/xtensa-routing/nix-objects.json').read_text())
 results = []
 for entry in reference['objects']:
