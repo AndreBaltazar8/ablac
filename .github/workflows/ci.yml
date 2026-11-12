@@ -32,6 +32,11 @@ on:
         type: boolean
         required: false
         default: false
+      macos_nolibsystem_probe:
+        description: Only probe a libSystem-free macOS executable (direct system calls, threads) and list the Darwin libSystem imports
+        type: boolean
+        required: false
+        default: false
       android_pointer_tags_control:
         description: Also prove the tagged-pointer regression fails with the v0.2.47 stdlib
         type: boolean
@@ -73,7 +78,7 @@ defaults:
 
 jobs:
   linux:
-    if: ${{ !inputs.xtensa_companion_routing_probe && !inputs.xtensa_companion_embedded_probe && !inputs.xtensa_companion_install_probe && !inputs.macos_published_rebuild && !inputs.macos_runtime_bench && !inputs.android_pointer_tags_control }}
+    if: ${{ !inputs.xtensa_companion_routing_probe && !inputs.xtensa_companion_embedded_probe && !inputs.xtensa_companion_install_probe && !inputs.macos_published_rebuild && !inputs.macos_runtime_bench && !inputs.android_pointer_tags_control && !inputs.macos_nolibsystem_probe }}
     name: Linux suite (8 jobs)
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -142,7 +147,7 @@ jobs:
           if-no-files-found: ignore
 
   macos:
-    if: ${{ !inputs.xtensa_compiler_memory_probe && !inputs.xtensa_companion_routing_probe && !inputs.xtensa_companion_embedded_probe && !inputs.xtensa_companion_install_probe && !inputs.macos_published_rebuild && !inputs.macos_runtime_bench && !inputs.android_pointer_tags_control }}
+    if: ${{ !inputs.xtensa_compiler_memory_probe && !inputs.xtensa_companion_routing_probe && !inputs.xtensa_companion_embedded_probe && !inputs.xtensa_companion_install_probe && !inputs.macos_published_rebuild && !inputs.macos_runtime_bench && !inputs.android_pointer_tags_control && !inputs.macos_nolibsystem_probe }}
     name: macOS host and compiler fixed point
     # One standard arm64 runner; Intel remains part of the release matrix.
     runs-on: macos-15
@@ -545,5 +550,65 @@ jobs:
             build/xtensa-stock/embedded-check-time.json
             build/xtensa-stock/*.o
             build/xtensa-stock/*.o.ll
+          retention-days: 7
+          if-no-files-found: ignore
+
+  macos-nolibsystem-probe:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.macos_nolibsystem_probe }}
+    name: libSystem-free macOS probe (${{ matrix.architecture }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            architecture: arm64
+          - runner: macos-15-intel
+            architecture: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    env:
+      JOBS: '2'
+      ABLA_NATIVE_JOBS: '2'
+      ABLA_CODEGEN_JOBS: '2'
+      ABLA_RELEASE_SELFHOST_BUILD_SECONDS: '1200'
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Probe programs that make system calls directly, with and without libSystem
+        run: |
+          mkdir -p build/ci-logs
+          tools/probe-macos-nolibsystem.sh build/macos-nolibsystem-probe \
+            2>&1 | tee build/ci-logs/nolibsystem-probe.log
+      - name: Install the bottled native toolchain
+        run: |
+          brew update
+          brew install --force-bottle llvm@23 lld@23 openssl@3 binaryen
+          {
+            echo "$(brew --prefix llvm@23)/bin"
+            echo "$(brew --prefix lld@23)/bin"
+            echo "$(brew --prefix openssl@3)/bin"
+          } >> "$GITHUB_PATH"
+      - name: Build the current compiler from the checksum-pinned bootstrap
+        run: |
+          tools/bootstrap-compiler.sh build/ci/bootstrap-ablac
+          tools/build-self-hosted-current.sh \
+            build/ci/bootstrap-ablac build/ci/ablac-stage1 \
+            2>&1 | tee build/ci-logs/stage1.log
+      - name: List the libSystem imports of the test programs and of the compiler
+        run: |
+          ABLA_DEBUG=0 tools/macos-libsystem-inventory.sh build/ci/ablac-stage1 \
+            build/macos-libsystem-inventory 2>&1 | tee build/ci-logs/inventory.log
+      - name: Keep the probe results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-nolibsystem-${{ matrix.architecture }}
+          path: |
+            build/ci-logs/
+            build/macos-nolibsystem-probe/
+            build/macos-libsystem-inventory/actual.txt
           retention-days: 7
           if-no-files-found: ignore
