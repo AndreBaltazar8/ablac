@@ -174,6 +174,242 @@ fun bootstrapLlvmTargetIsBareWasm(targetTriple: string): bool =
     bootstrapTextContains(targetTriple, "wasm32") &&
     !bootstrapTextContains(targetTriple, "wasi")
 
+// An x86-64 Linux executable defines the C library's memory and string
+// routines itself (#806: Abla should not require libc): LLVM lowers its
+// memcpy/memmove/memset intrinsics, and comparisons it recognizes, to calls
+// of these names, and the runtime reads argv and environment strings with
+// strlen. They are module assembly, so LLVM's idiom recognition never sees a
+// loop it could turn back into a call of the same name, and hidden, so they
+// bind inside the executable only: shared libraries (libLLVM, OpenSSL) keep
+// the C library's. Each is the C function's contract. memcpy is memmove, as
+// glibc's is on x86-64: code that copies overlapping ranges with memcpy (the
+// runtime has some) keeps working. Up to 64 bytes every byte is loaded before
+// one is stored; a larger forward copy and a large fill use the string
+// instructions (`rep movsb`/`rep stosb`; the direction flag is clear on entry
+// by the ABI), a copy onto a later overlapping range goes backward in 32-byte
+// blocks. Unit 0 alone keeps a split module's assembly
+// (bootstrapCodegenUnitStrip), so each is defined once.
+fun bootstrapLlvmTargetIsX8664Linux(targetTriple: string): bool =
+    bootstrapTextContains(targetTriple, "x86_64") &&
+    bootstrapTextContains(targetTriple, "linux")
+
+fun bootstrapLlvmAssemblyHiddenFunction(name: string): string =
+    ".globl $name\n.hidden $name\n.type $name,@function\n"
+
+fun bootstrapLlvmLinuxMemoryRoutinesAssembly(): string {
+    ".text\n.p2align 4\n" +
+    bootstrapLlvmAssemblyHiddenFunction("memmove") +
+    bootstrapLlvmAssemblyHiddenFunction("memcpy") +
+    "memmove:\n" +
+    "memcpy:\n" +
+    "    movq %rdi, %rax\n" +
+    "    cmpq \$64, %rdx\n" +
+    "    jbe .Labla_mem_small\n" +
+    "    movq %rdi, %rcx\n" +
+    "    subq %rsi, %rcx\n" +
+    "    cmpq %rdx, %rcx\n" +
+    "    jae .Labla_mem_forward\n" +
+    // The destination starts inside the source: 32-byte blocks from the end
+    // (each loaded before it is stored, above every block still to load),
+    // then the first 32 bytes, loaded before any store.
+    "    movups (%rsi), %xmm4\n" +
+    "    movups 16(%rsi), %xmm5\n" +
+    "    leaq (%rsi,%rdx), %rsi\n" +
+    "    leaq (%rdi,%rdx), %rcx\n" +
+    ".Labla_mem_backward:\n" +
+    "    movups -32(%rsi), %xmm0\n" +
+    "    movups -16(%rsi), %xmm1\n" +
+    "    movups %xmm0, -32(%rcx)\n" +
+    "    movups %xmm1, -16(%rcx)\n" +
+    "    subq \$32, %rsi\n" +
+    "    subq \$32, %rcx\n" +
+    "    subq \$32, %rdx\n" +
+    "    cmpq \$32, %rdx\n" +
+    "    ja .Labla_mem_backward\n" +
+    "    movups %xmm4, (%rdi)\n" +
+    "    movups %xmm5, 16(%rdi)\n" +
+    "    ret\n" +
+    ".Labla_mem_small:\n" +
+    "    cmpq \$16, %rdx\n" +
+    "    ja .Labla_mem_17\n" +
+    "    cmpq \$8, %rdx\n" +
+    "    jb .Labla_mem_lt8\n" +
+    "    movq (%rsi), %rcx\n" +
+    "    movq -8(%rsi,%rdx), %r8\n" +
+    "    movq %rcx, (%rdi)\n" +
+    "    movq %r8, -8(%rdi,%rdx)\n" +
+    "    ret\n" +
+    ".Labla_mem_lt8:\n" +
+    "    cmpq \$4, %rdx\n" +
+    "    jb .Labla_mem_lt4\n" +
+    "    movl (%rsi), %ecx\n" +
+    "    movl -4(%rsi,%rdx), %r8d\n" +
+    "    movl %ecx, (%rdi)\n" +
+    "    movl %r8d, -4(%rdi,%rdx)\n" +
+    "    ret\n" +
+    ".Labla_mem_lt4:\n" +
+    "    testq %rdx, %rdx\n" +
+    "    je .Labla_mem_done\n" +
+    "    movq %rdx, %r9\n" +
+    "    shrq %r9\n" +
+    "    movzbl (%rsi), %ecx\n" +
+    "    movzbl -1(%rsi,%rdx), %r8d\n" +
+    "    movzbl (%rsi,%r9), %r10d\n" +
+    "    movb %cl, (%rdi)\n" +
+    "    movb %r8b, -1(%rdi,%rdx)\n" +
+    "    movb %r10b, (%rdi,%r9)\n" +
+    ".Labla_mem_done:\n" +
+    "    ret\n" +
+    ".Labla_mem_17:\n" +
+    "    cmpq \$32, %rdx\n" +
+    "    ja .Labla_mem_33\n" +
+    "    movups (%rsi), %xmm0\n" +
+    "    movups -16(%rsi,%rdx), %xmm1\n" +
+    "    movups %xmm0, (%rdi)\n" +
+    "    movups %xmm1, -16(%rdi,%rdx)\n" +
+    "    ret\n" +
+    ".Labla_mem_33:\n" +
+    "    movups (%rsi), %xmm0\n" +
+    "    movups 16(%rsi), %xmm1\n" +
+    "    movups -32(%rsi,%rdx), %xmm2\n" +
+    "    movups -16(%rsi,%rdx), %xmm3\n" +
+    "    movups %xmm0, (%rdi)\n" +
+    "    movups %xmm1, 16(%rdi)\n" +
+    "    movups %xmm2, -32(%rdi,%rdx)\n" +
+    "    movups %xmm3, -16(%rdi,%rdx)\n" +
+    "    ret\n" +
+    ".Labla_mem_forward:\n" +
+    "    movq %rdx, %rcx\n" +
+    "    rep movsb\n" +
+    "    ret\n" +
+    ".size memmove, .-memmove\n" +
+    ".size memcpy, .-memcpy\n" +
+    ".p2align 4\n" +
+    bootstrapLlvmAssemblyHiddenFunction("memset") +
+    "memset:\n" +
+    "    movq %rdi, %rax\n" +
+    "    movzbl %sil, %ecx\n" +
+    "    movabsq \$0x0101010101010101, %r8\n" +
+    "    imulq %r8, %rcx\n" +
+    "    cmpq \$16, %rdx\n" +
+    "    ja .Labla_set_17\n" +
+    "    cmpq \$8, %rdx\n" +
+    "    jb .Labla_set_lt8\n" +
+    "    movq %rcx, (%rdi)\n" +
+    "    movq %rcx, -8(%rdi,%rdx)\n" +
+    "    ret\n" +
+    ".Labla_set_lt8:\n" +
+    "    cmpq \$4, %rdx\n" +
+    "    jb .Labla_set_lt4\n" +
+    "    movl %ecx, (%rdi)\n" +
+    "    movl %ecx, -4(%rdi,%rdx)\n" +
+    "    ret\n" +
+    ".Labla_set_lt4:\n" +
+    "    testq %rdx, %rdx\n" +
+    "    je .Labla_set_done\n" +
+    "    movq %rdx, %r9\n" +
+    "    shrq %r9\n" +
+    "    movb %cl, (%rdi)\n" +
+    "    movb %cl, -1(%rdi,%rdx)\n" +
+    "    movb %cl, (%rdi,%r9)\n" +
+    ".Labla_set_done:\n" +
+    "    ret\n" +
+    ".Labla_set_17:\n" +
+    "    movq %rcx, %xmm0\n" +
+    "    punpcklqdq %xmm0, %xmm0\n" +
+    "    cmpq \$32, %rdx\n" +
+    "    ja .Labla_set_33\n" +
+    "    movups %xmm0, (%rdi)\n" +
+    "    movups %xmm0, -16(%rdi,%rdx)\n" +
+    "    ret\n" +
+    ".Labla_set_33:\n" +
+    "    cmpq \$64, %rdx\n" +
+    "    ja .Labla_set_large\n" +
+    "    movups %xmm0, (%rdi)\n" +
+    "    movups %xmm0, 16(%rdi)\n" +
+    "    movups %xmm0, -32(%rdi,%rdx)\n" +
+    "    movups %xmm0, -16(%rdi,%rdx)\n" +
+    "    ret\n" +
+    ".Labla_set_large:\n" +
+    "    movq %rdi, %r9\n" +
+    "    movl %ecx, %eax\n" +
+    "    movq %rdx, %rcx\n" +
+    "    rep stosb\n" +
+    "    movq %r9, %rax\n" +
+    "    ret\n" +
+    ".size memset, .-memset\n" +
+    ".p2align 4\n" +
+    bootstrapLlvmAssemblyHiddenFunction("memcmp") +
+    bootstrapLlvmAssemblyHiddenFunction("bcmp") +
+    "memcmp:\n" +
+    "bcmp:\n" +
+    "    cmpq \$8, %rdx\n" +
+    "    jb .Labla_cmp_bytes\n" +
+    ".Labla_cmp_words:\n" +
+    "    movq (%rdi), %rax\n" +
+    "    movq (%rsi), %rcx\n" +
+    "    cmpq %rcx, %rax\n" +
+    "    jne .Labla_cmp_word_differs\n" +
+    "    addq \$8, %rdi\n" +
+    "    addq \$8, %rsi\n" +
+    "    subq \$8, %rdx\n" +
+    "    cmpq \$8, %rdx\n" +
+    "    jae .Labla_cmp_words\n" +
+    ".Labla_cmp_bytes:\n" +
+    "    testq %rdx, %rdx\n" +
+    "    je .Labla_cmp_equal\n" +
+    ".Labla_cmp_byte:\n" +
+    "    movzbl (%rdi), %eax\n" +
+    "    movzbl (%rsi), %ecx\n" +
+    "    subl %ecx, %eax\n" +
+    "    jne .Labla_cmp_done\n" +
+    "    incq %rdi\n" +
+    "    incq %rsi\n" +
+    "    decq %rdx\n" +
+    "    jne .Labla_cmp_byte\n" +
+    ".Labla_cmp_equal:\n" +
+    "    xorl %eax, %eax\n" +
+    ".Labla_cmp_done:\n" +
+    "    ret\n" +
+    // The first differing byte is the lowest differing one (little endian);
+    // the result is the difference of those bytes, as glibc's.
+    ".Labla_cmp_word_differs:\n" +
+    "    xorq %rax, %rcx\n" +
+    "    bsfq %rcx, %rcx\n" +
+    "    shrq \$3, %rcx\n" +
+    "    movzbl (%rdi,%rcx), %eax\n" +
+    "    movzbl (%rsi,%rcx), %edx\n" +
+    "    subl %edx, %eax\n" +
+    "    ret\n" +
+    ".size memcmp, .-memcmp\n" +
+    ".size bcmp, .-bcmp\n" +
+    ".p2align 4\n" +
+    bootstrapLlvmAssemblyHiddenFunction("strlen") +
+    "strlen:\n" +
+    "    movq %rdi, %rax\n" +
+    ".Labla_strlen_byte:\n" +
+    "    cmpb \$0, (%rax)\n" +
+    "    je .Labla_strlen_done\n" +
+    "    incq %rax\n" +
+    "    jmp .Labla_strlen_byte\n" +
+    ".Labla_strlen_done:\n" +
+    "    subq %rdi, %rax\n" +
+    "    ret\n" +
+    ".size strlen, .-strlen\n"
+}
+
+// Set by the toolchain while it builds a hosted x86-64 Linux executable
+// (bootstrapNativeBuildWithEmitterStateCache), and only then: a module ORC JITs in process must
+// not define them (LLJIT refuses definitions its IR does not declare, and
+// the compiler process has the C library's).
+var bootstrapLlvmOwnMemoryRoutines = false
+
+fun bootstrapLlvmEmitLinuxMemoryRoutines(backend: BootstrapLlvmBackend): void {
+    val assembly = bootstrapLlvmLinuxMemoryRoutinesAssembly()
+    LLVMAppendModuleInlineAsm(backend.module, assembly, assembly.size)
+    return
+}
+
 fun BootstrapLlvmBackend.nativeSizeType(): i64* =
     if (bootstrapLlvmTargetUses32BitPointers(this.targetTriple)) {
     this.i32Type

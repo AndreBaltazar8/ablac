@@ -1,0 +1,206 @@
+// The memory and string routines an x86-64 Linux executable defines itself
+// (#806, bootstrapLlvmLinuxMemoryRoutinesAssembly): every length 0 to 80 at
+// every source and destination offset 0 to 7, overlap both ways, larger sizes
+// on both sides of each path boundary, against a byte formula (never another
+// copy, which LLVM could turn back into a call). memcpy must tolerate overlap
+// as glibc's does. tools/test-libc-memory-routines.sh.
+import "abla/io"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+import "abla/process/arguments"
+
+trusted noescape extern:"c" fun memcpy(destination: i64*, source: i64*, size: int): i64*
+trusted noescape extern:"c" fun memmove(destination: i64*, source: i64*, size: int): i64*
+trusted noescape extern:"c" fun memset(destination: i64*, value: i32, size: int): i64*
+trusted noescape extern:"c" fun memcmp(left: i64*, right: i64*, size: int): i32
+trusted noescape extern:"c" fun bcmp(left: i64*, right: i64*, size: int): i32
+trusted noescape extern:"c" fun strlen(text: i64*): int
+
+val capacity = 280000
+var failures = 0
+var checks = 0
+
+fun pattern(index: int): int = (index * 131 + 7) % 256
+
+fun fail(message: string): void {
+    if (failures < 20) println("FAIL $message")
+    failures = failures + 1
+    return
+}
+
+trusted fun at(base: i64*, index: int): i64* = ablaUnsafePointerOffset(base, index)
+
+trusted fun fill(base: i64*, from: int, to: int): void {
+    var index = from
+    while (index < to) {
+        ablaUnsafeStoreU8(at(base, index), pattern(index))
+        index = index + 1
+    }
+    return
+}
+
+// Bytes [low, high) of base hold pattern(i), except [from, from + count),
+// which holds pattern(source + i - from) (or `value` when source < 0).
+trusted fun verify(base: i64*, low: int, high: int, from: int, count: int, source: int, value: int, what: string): void {
+    checks = checks + 1
+    var index = low
+    while (index < high) {
+        val inside = index >= from && index < from + count
+        val expected = if (!inside) pattern(index)
+            else if (source < 0) value else pattern(source + index - from)
+        val actual = ablaUnsafeLoadU8(at(base, index))
+        if (actual != expected) {
+            fail("$what: byte $index is $actual, expected $expected")
+            return
+        }
+        index = index + 1
+    }
+    return
+}
+
+fun lengths(): array<int> {
+    val result: array<int> = []
+    for (n in 0 until 81) result.append(n)
+    for (n in [127, 128, 129, 255, 256, 257, 1000, 4095, 4096, 4097, 65539]) result.append(n)
+    result
+}
+
+trusted fun checkCopy(buffer: i64*, zero: int): void {
+    val window = 70000
+    fill(buffer, window, capacity)
+    for (n in lengths()) {
+        val offsets = if (n <= 80) 8 else 2
+        for (sourceOffset in 0 until offsets) {
+            for (destinationOffset in 0 until offsets) {
+                // Source in the upper half, destination in the lower: no overlap.
+                val source = window + sourceOffset + zero
+                val destination = 16 + destinationOffset + zero
+                fill(buffer, 0, destination + n + 64)
+                val result = memcpy(at(buffer, destination), at(buffer, source), n + zero)
+                if (ablaUnsafePointerAddress(result) != ablaUnsafePointerAddress(at(buffer, destination)))
+                    fail("memcpy $n: wrong result pointer")
+                verify(buffer, 0, destination + n + 64, destination, n, source, 0, "memcpy n=$n s=$sourceOffset d=$destinationOffset")
+                fill(buffer, 0, destination + n + 64)
+                memmove(at(buffer, destination), at(buffer, source), n + zero)
+                verify(buffer, 0, destination + n + 64, destination, n, source, 0, "memmove apart n=$n")
+            }
+        }
+    }
+    return
+}
+
+trusted fun checkOverlap(buffer: i64*, zero: int): void {
+    for (n in lengths()) {
+        val distances: array<int> = []
+        if (n <= 80) {
+            for (d in 0 until 82) { distances.append(d); distances.append(0 - d) }
+        } else {
+            for (d in [0, 1, 7, 8, 63, 64, 65, n - 1, n, n + 1]) { distances.append(d); distances.append(0 - d) }
+        }
+        for (distance in distances) {
+            val source = 70000 + zero
+            val destination = source + distance
+            val low = source - n - 128
+            val high = source + 2 * n + 128
+            fill(buffer, low, high)
+            val result = memmove(at(buffer, destination), at(buffer, source), n + zero)
+            if (ablaUnsafePointerAddress(result) != ablaUnsafePointerAddress(at(buffer, destination)))
+                fail("memmove $n: wrong result pointer")
+            verify(buffer, low, high, destination, n, source, 0, "memmove n=$n distance=$distance")
+            // memcpy too: the runtime copies overlapping ranges with it, as
+            // glibc's memcpy (its memmove on x86-64) allows.
+            fill(buffer, low, high)
+            memcpy(at(buffer, destination), at(buffer, source), n + zero)
+            verify(buffer, low, high, destination, n, source, 0, "memcpy overlap n=$n distance=$distance")
+        }
+    }
+    return
+}
+
+trusted fun checkSet(buffer: i64*, zero: int): void {
+    for (n in lengths()) {
+        val offsets = if (n <= 80) 8 else 2
+        for (offset in 0 until offsets) {
+            for (value in [0, 1, 127, 128, 255, 256 + 90, -1]) {
+                val destination = 32 + offset + zero
+                fill(buffer, 0, n + 128)
+                val result = memset(at(buffer, destination), i32(value), n + zero)
+                if (ablaUnsafePointerAddress(result) != ablaUnsafePointerAddress(at(buffer, destination)))
+                    fail("memset $n: wrong result pointer")
+                verify(buffer, 0, n + 128, destination, n, -1, value & 255, "memset n=$n offset=$offset value=$value")
+            }
+        }
+    }
+    return
+}
+
+fun sign(value: int): int = if (value < 0) -1 else if (value > 0) 1 else 0
+
+trusted fun checkCompare(left: i64*, right: i64*, zero: int): void {
+    for (n in lengths()) {
+        val offset = n % 8
+        fill(left, 0, n + 16)
+        fill(right, 0, n + 16)
+        // Differences past the end must not count.
+        ablaUnsafeStoreU8(at(right, offset + n), pattern(offset + n) ^ 1)
+        checks = checks + 1
+        if (memcmp(at(left, offset), at(right, offset), n + zero) != i32(0)) fail("memcmp $n: equal ranges differ")
+        if (bcmp(at(left, offset), at(right, offset), n + zero) != i32(0)) fail("bcmp $n: equal ranges differ")
+        val positions: array<int> = []
+        if (n <= 80) { for (p in 0 until n) positions.append(p) }
+        else { for (p in [0, 1, 7, 8, 9, n / 2, n - 9, n - 8, n - 1]) positions.append(p) }
+        for (position in positions) {
+            for (other in [0, 1, 127, 128, 255]) {
+                val original = pattern(offset + position)
+                if (other == original) continue
+                ablaUnsafeStoreU8(at(right, offset + position), other)
+                checks = checks + 1
+                // The difference of the first differing bytes, as glibc returns.
+                val expected = original - other
+                val actual = int(memcmp(at(left, offset), at(right, offset), n + zero))
+                if (actual != expected) fail("memcmp n=$n at $position: $actual, expected $expected")
+                if (bcmp(at(left, offset), at(right, offset), n + zero) == i32(0)) fail("bcmp n=$n at $position: no difference")
+                val reverse = sign(int(memcmp(at(right, offset), at(left, offset), n + zero)))
+                if (reverse != sign(0 - expected)) fail("memcmp reversed n=$n at $position")
+                ablaUnsafeStoreU8(at(right, offset + position), original)
+            }
+        }
+    }
+    return
+}
+
+trusted fun checkLength(buffer: i64*, zero: int): void {
+    for (n in lengths()) {
+        for (offset in 0 until 8) {
+            var index = 0
+            while (index < offset + n) {
+                ablaUnsafeStoreU8(at(buffer, index), (index * 7) % 255 + 1)
+                index = index + 1
+            }
+            ablaUnsafeStoreU8(at(buffer, offset + n), 0)
+            checks = checks + 1
+            val actual = strlen(at(buffer, offset + zero))
+            if (actual != n) fail("strlen n=$n offset=$offset: $actual")
+        }
+    }
+    return
+}
+
+trusted fun main: int {
+    val zero = processArgumentCount()
+    val buffer = ablaUnsafeAllocate(capacity + 64)
+    val other = ablaUnsafeAllocate(capacity + 64)
+    checkCopy(buffer, zero)
+    checkOverlap(buffer, zero)
+    checkSet(buffer, zero)
+    checkCompare(buffer, other, zero)
+    checkLength(buffer, zero)
+    ablaUnsafeFree(buffer)
+    ablaUnsafeFree(other)
+    if (failures > 0) {
+        println("libc memory routines: $failures failures in $checks checks")
+        return 1
+    }
+    println("libc memory routines: $checks checks agree")
+    0
+}
