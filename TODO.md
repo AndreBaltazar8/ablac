@@ -429,6 +429,9 @@
   The manual installed-toolchain probe used to exercise only the Python installer; its native matrix now
   builds a candidate release package with the checksum-pinned published compiler and runs the same real
   companion, codegen and tamper checks against the unchanged v0.2.48 integration parent.
+  The first six-leg probe exposed a Homebrew Intel setup failure before native installation: current
+  llvm 23.1.5 has no Intel bottle. The probe now uses the release workflow's checksum-pinned 23.1.0
+  Intel bottles; its macOS Intel native leg still needs a rerun.
 - [x] `abla/yaml` provides bounded Core-schema parsing, checked emission and comment/format-preserving path edits;
       see [docs/stdlib/yaml.md](docs/stdlib/yaml.md) and the synthetic provision-mail fixture. NovaKind can adopt it after release.
 

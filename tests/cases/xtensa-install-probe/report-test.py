@@ -7,6 +7,19 @@ import tempfile
 
 root = Path(__file__).resolve().parents[3]
 reporter = root / 'tools/report-xtensa-install-probe.py'
+release = (root / '.github/workflows/release.yml').read_text()
+ci = (root / '.github/workflows/ci.yml').read_text()
+release_start = release.index('        run: |\n', release.index('        name: Install the native toolchain'))
+release_end = release.index('      - name: Prepare the bootstrap compiler', release_start)
+probe_start = ci.index('        run: |\n', ci.index('      - name: Install native build dependencies on macOS'))
+probe_end = ci.index('      - name: Install native build dependencies on Linux', probe_start)
+release_setup = release[release_start:release_end].replace(
+    "'${{ matrix.architecture }}' == x86_64", "'${{ matrix.platform }}' == x86_64-macos")
+probe_setup = ci[probe_start:probe_end]
+assert probe_setup == release_setup, 'probe macOS setup differs from release setup'
+assert probe_setup.replace('23.1.0', '23.1.5') != release_setup
+shell = '\n'.join(line[10:] for line in probe_setup.splitlines()[1:]) + '\n'
+assert subprocess.run(['bash', '-n'], input=shell, text=True).returncode == 0
 with tempfile.TemporaryDirectory(prefix='xtensa-probe-report-') as td:
     base = Path(td)
     artifacts = base / 'artifacts'
