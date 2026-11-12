@@ -136,6 +136,26 @@ if [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]]; then
     done
 fi
 
+# A debug build's fault handler returns (through rt_sigreturn on x86-64 Linux,
+# on its own stack frame chain) and restores the default action: the first
+# SIGABRT prints the report and execution continues, the second ends the process.
+if [[ $(uname -s) == Linux ]]; then
+    # -g, not --fast: under ABLA_DEBUG=0 (the suite's setting) a --fast build has no debug runtime.
+    for flags in "-g"; do
+        "$compiler" build "$cases/fault-return.ab" -o "$out/fault-return" $flags
+        set +e
+        "$out/fault-return" > "$out/fault-return.out" 2> "$out/fault-return.err"
+        status=$?
+        set -e
+        [[ $status -eq 134 ]] || fail "debug fault$flags exited $status"
+        [[ $(cat "$out/fault-return.out") == $'before\nafter the first' ]] ||
+            fail "debug fault$flags: output $(cat "$out/fault-return.out")"
+        [[ $(grep -c '^fatal signal' "$out/fault-return.err") -eq 1 ]] ||
+            fail "debug fault$flags: one report expected: $(head -3 "$out/fault-return.err")"
+        grep -q '^stack ' "$out/fault-return.err" || fail "debug fault$flags printed no stack"
+    done
+fi
+
 # Under `#`: positioned errors with the same text.
 set +e
 "$compiler" build "$cases/compile-time-panics.ab" -o "$out/compile-time-panics" \

@@ -89,8 +89,8 @@ float-remainder, strings-arrays, files, tasks, threads and tls-http.
 | `fmod` `fmodf` | float-remainder | float-remainder | yes | float `%` as `LLVMBuildFRem` (`functions.ab:1947`); wasm32 uses `__ablaRuntimeFloatRemainder` instead |
 | `pthread_create` `pthread_join` `pthread_mutex_init` | threads | threads (`--fast` tasks: join) | create, join | `host.ab:32-45`, 151, 167 |
 | `pthread_mutex_lock` `pthread_mutex_unlock` | threads | all | | the heap lock (`host.ab:36-37`); release drops it from single-threaded programs |
-| `backtrace` `backtrace_symbols_fd` `write` | | all | | `--fast` debug runtime (`debug.ab:1052`, 1079, 1141) |
-| `signal` `raise` `getrlimit` `_exit` | | all | | `--fast` fault handlers and stack-guard handler (`debug.ab:643`, 803, 858, 925, 968) |
+| `backtrace` `backtrace_symbols_fd` `write` | | none on x86-64 Linux (frame-pointer walk with process_vm_readv, write by system call, step 8) | | `--fast` debug runtime (`debug.ab:1052`, 1079, 1141) |
+| `signal` `raise` `getrlimit` `_exit` | | none on x86-64 Linux (rt_sigaction, tgkill, prlimit64, exit_group, step 8) | | `--fast` fault handlers and stack-guard handler (`debug.ab:643`, 803, 858, 925, 968) |
 | `OpenSSL_version_num` (+ the SSL_* a connection uses) | tls-http | tls-http | yes, 27 | `stdlib/abla/tls/hosted/openssl.ab`; link trigger `src/toolchain.ab:3469-3480`, `-lssl -lcrypto` at 4358 |
 | `dlopen` `dlsym` | | | yes | compile-time native calls (`src/ct_native.ab:36-37`) |
 | `fork` | | | yes | compile-time processes (`src/ct_process.ab:9`); also `stdlib/abla/sys/linux/process:10` |

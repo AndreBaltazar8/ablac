@@ -649,6 +649,18 @@ fun bootstrapLlvmDebugInstallFaultHandlers(
         false, []
     )
     LLVMSetLinkage(fault, llvmInternalLinkage())
+    if (bootstrapLlvmStackGuardKernel(backend)) {
+        // signal()'s BSD semantics by rt_sigaction: SA_RESTART | SA_RESTORER.
+        val action = bootstrapLlvmStackGuardKernelAction(
+            backend, fault, 335544320, bootstrapLlvmSigreturnRestorer(backend), "fault.action"
+        )
+        for (signal in bootstrapLlvmDebugFaultSignals(backend)) {
+            bootstrapLlvmStackGuardKernelSigaction(
+                backend, LLVMConstInt(backend.i64Type, signal, 0), action
+            )
+        }
+        return
+    }
     for (signal in bootstrapLlvmDebugFaultSignals(backend)) {
         bootstrapLlvmDebugCall(
             backend, "signal", backend.pointerType,
@@ -733,6 +745,63 @@ fun bootstrapLlvmStackGuardKernelAction(
         backend.builder, restorer, bootstrapLlvmByteAt(backend, action, 32, 16)
     )
     action
+}
+
+// The rt_sigreturn trampoline an x86-64 Linux signal handler returns through
+// (the kernel's SA_RESTORER), declared on first use.
+fun bootstrapLlvmSigreturnRestorer(backend: BootstrapLlvmBackend): i64* {
+    var restorer = LLVMGetNamedFunction(backend.module, "abla_runtime_sigreturn")
+    if (pointerIsNull(restorer)) {
+        restorer = bootstrapLlvmDeclare(
+            backend, "abla_runtime_sigreturn", backend.voidType, [], false, []
+        )
+        LLVMSetLinkage(restorer, llvmInternalLinkage())
+    }
+    restorer
+}
+
+// Defines the trampoline when something took its address: no frame, just
+// rt_sigreturn (15).
+fun bootstrapLlvmEmitSigreturnRestorer(backend: BootstrapLlvmBackend): void {
+    val restorer = LLVMGetNamedFunction(backend.module, "abla_runtime_sigreturn")
+    if (pointerIsNull(restorer) || LLVMIsDeclaration(restorer) == 0) return
+    LLVMPositionBuilderAtEnd(
+        backend.builder,
+        LLVMAppendBasicBlockInContext(backend.context, restorer, "entry")
+    )
+    bootstrapLlvmAddFunctionAttribute(backend, restorer, "naked")
+    bootstrapLlvmAddFunctionAttribute(backend, restorer, "noinline")
+    bootstrapLlvmAddFunctionAttribute(backend, restorer, "nounwind")
+    val restorerType = bootstrapLlvmFunctionType(backend, backend.voidType, [])
+    val trampoline = "movq $$15, %rax\n\tsyscall"
+    bootstrapLlvmCallTyped(
+        backend, restorerType,
+        LLVMGetInlineAsm(restorerType, trampoline, trampoline.size, "", 0, 1, 0, 0, 0),
+        [], ""
+    )
+    LLVMBuildUnreachable(backend.builder)
+    return
+}
+
+// write(descriptor, text, size) on standard error or another descriptor: the
+// system call on x86-64 Linux, libc's write elsewhere.
+fun bootstrapLlvmRuntimeWrite(
+    backend: BootstrapLlvmBackend,
+    descriptor: int,
+    text: i64*,
+    size: i64*
+): void {
+    val fd = LLVMConstInt(backend.i64Type, descriptor, 0)
+    if (bootstrapLlvmStackGuardKernel(backend)) {
+        bootstrapLlvmLinuxX64Syscall(backend, 1, [fd, text, size])
+    } else {
+        bootstrapLlvmDebugCall(
+            backend, "write", backend.i64Type,
+            [backend.i64Type, backend.pointerType, backend.i64Type],
+            [fd, text, size]
+        )
+    }
+    return
 }
 
 // rt_sigaction(signal, action, NULL, sizeof the kernel's signal mask).
@@ -837,10 +906,7 @@ fun bootstrapLlvmInstallStackGuard(backend: BootstrapLlvmBackend): void {
     if (kernel) {
         // SA_SIGINFO (4) | SA_ONSTACK (0x08000000) | SA_RESTORER (0x04000000):
         // the handler returns through abla_runtime_sigreturn, rt_sigreturn.
-        val restorer = bootstrapLlvmDeclare(
-            backend, "abla_runtime_sigreturn", backend.voidType, [], false, []
-        )
-        LLVMSetLinkage(restorer, llvmInternalLinkage())
+        val restorer = bootstrapLlvmSigreturnRestorer(backend)
         val kernelAction = bootstrapLlvmStackGuardKernelAction(
             backend, handler, 201326596, restorer, "signal.kernel.action"
         )
@@ -874,26 +940,7 @@ fun bootstrapLlvmEmitStackGuardHandler(backend: BootstrapLlvmBackend): void {
         backend.module, "abla_runtime_stack_fault"
     )
     if (pointerIsNull(handler) || LLVMIsDeclaration(handler) == 0) return
-    val restorer = LLVMGetNamedFunction(backend.module, "abla_runtime_sigreturn")
-    if (!pointerIsNull(restorer) && LLVMIsDeclaration(restorer) != 0) {
-        // The signal return trampoline the kernel jumps to when the handler
-        // returns: no frame, just rt_sigreturn (15).
-        LLVMPositionBuilderAtEnd(
-            backend.builder,
-            LLVMAppendBasicBlockInContext(backend.context, restorer, "entry")
-        )
-        bootstrapLlvmAddFunctionAttribute(backend, restorer, "naked")
-        bootstrapLlvmAddFunctionAttribute(backend, restorer, "noinline")
-        bootstrapLlvmAddFunctionAttribute(backend, restorer, "nounwind")
-        val restorerType = bootstrapLlvmFunctionType(backend, backend.voidType, [])
-        val trampoline = "movq $$15, %rax\n\tsyscall"
-        bootstrapLlvmCallTyped(
-            backend, restorerType,
-            LLVMGetInlineAsm(restorerType, trampoline, trampoline.size, "", 0, 1, 0, 0, 0),
-            [], ""
-        )
-        LLVMBuildUnreachable(backend.builder)
-    }
+    bootstrapLlvmEmitSigreturnRestorer(backend)
     val mac = backend.macOS
     val i64 = backend.i64Type
     LLVMPositionBuilderAtEnd(
@@ -935,7 +982,7 @@ fun bootstrapLlvmEmitStackGuardHandler(backend: BootstrapLlvmBackend): void {
         // ones) counts as 64 GiB.
         val limitType = LLVMArrayType2(backend.i8Type, 16)
         val limit = LLVMBuildAlloca(backend.builder, limitType, "stack.limit")
-        if (bootstrapLlvmCompactLinuxRuntime(backend)) {
+        if (bootstrapLlvmStackGuardKernel(backend)) {
             // prlimit64(0, RLIMIT_STACK, NULL, &limit), the operation libc's
             // getrlimit uses on modern Linux; its two limits are 64-bit.
             bootstrapLlvmLinuxX64Syscall(backend, 302, [
@@ -993,19 +1040,13 @@ fun bootstrapLlvmEmitStackGuardHandler(backend: BootstrapLlvmBackend): void {
     val messageArguments = [LLVMConstInt(i64, 2, 0),
         bootstrapLlvmGlobalStringPointer(backend, message, "abla.stack.overflow"),
         LLVMConstInt(i64, message.size, 0)]
-    if (bootstrapLlvmCompactLinuxRuntime(backend)) {
-        bootstrapLlvmLinuxX64Syscall(backend, 1, messageArguments)
-    } else {
-        bootstrapLlvmStackGuardCall(
-            backend, "write", i64, [i64, backend.pointerType, i64], messageArguments
-        )
-    }
+    bootstrapLlvmRuntimeWrite(backend, 2, messageArguments[1], messageArguments[2])
     if (bootstrapLlvmDebugHostedRuntime(backend)) {
         bootstrapLlvmStackGuardCall(
             backend, "abla_runtime_print_stack", backend.voidType, [], []
         )
     }
-    if (bootstrapLlvmCompactLinuxRuntime(backend)) {
+    if (bootstrapLlvmStackGuardKernel(backend)) {
         // exit_group, as libc _exit: terminate the entire process, not just
         // the thread handling the fault.
         bootstrapLlvmLinuxX64Syscall(backend, 231, [LLVMConstInt(i64, 101, 0)])
@@ -1027,7 +1068,7 @@ fun bootstrapLlvmEmitStackGuardHandler(backend: BootstrapLlvmBackend): void {
         )
         LLVMSetLinkage(fault, llvmInternalLinkage())
         bootstrapLlvmCall(backend, fault, [signal], "", false, [])
-    } else if (bootstrapLlvmCompactLinuxRuntime(backend)) {
+    } else if (bootstrapLlvmStackGuardKernel(backend)) {
         // Restore SIG_DFL: rt_sigaction with an all-zero kernel struct.
         val defaultType = LLVMArrayType2(backend.i8Type, 32)
         val action = LLVMBuildAlloca(backend.builder, defaultType, "signal.default")
@@ -1043,7 +1084,7 @@ fun bootstrapLlvmEmitStackGuardHandler(backend: BootstrapLlvmBackend): void {
     // Back to the default action: the signal raised again (delivered once
     // the handler returns) or the faulting instruction run again ends the
     // process as before.
-    if (bootstrapLlvmCompactLinuxRuntime(backend)) {
+    if (bootstrapLlvmStackGuardKernel(backend)) {
         val process = bootstrapLlvmLinuxX64Syscall(backend, 39, [])
         val threadId = bootstrapLlvmLinuxX64Syscall(backend, 186, [])
         bootstrapLlvmLinuxX64Syscall(backend, 234, [process, threadId, signal])
@@ -1062,12 +1103,9 @@ fun bootstrapLlvmDebugWrite(
     text: string,
     name: string
 ): void {
-    bootstrapLlvmDebugCall(
-        backend, "write", backend.i64Type,
-        [backend.i64Type, backend.pointerType, backend.i64Type],
-        [LLVMConstInt(backend.i64Type, 2, 0),
-         bootstrapLlvmGlobalStringPointer(backend, text, name),
-         LLVMConstInt(backend.i64Type, text.size, 0)]
+    bootstrapLlvmRuntimeWrite(
+        backend, 2, bootstrapLlvmGlobalStringPointer(backend, text, name),
+        LLVMConstInt(backend.i64Type, text.size, 0)
     )
     return
 }
@@ -1121,12 +1159,120 @@ fun bootstrapLlvmDebugWriteHex(
         )
         digit = digit + 1
     }
-    bootstrapLlvmDebugCall(
-        backend, "write", backend.i64Type,
-        [backend.i64Type, backend.pointerType, backend.i64Type],
-        [LLVMConstInt(backend.i64Type, 2, 0), buffer,
-         LLVMConstInt(backend.i64Type, 18, 0)]
+    bootstrapLlvmRuntimeWrite(
+        backend, 2, buffer, LLVMConstInt(backend.i64Type, 18, 0)
     )
+    return
+}
+
+// The stack on x86-64 Linux without libc's backtrace: walk the frame-pointer
+// chain (a debug build keeps it in every function) and print each return
+// address, less one so it falls inside the call, as 0x and sixteen hex digits,
+// then the executable's load address (__ehdr_start) for a position-independent
+// executable. Every frame is read with process_vm_readv on this process, which
+// fails with EFAULT instead of faulting where the chain ends or is not a chain
+// (a signal interrupted code without frame pointers), and the walk stops at 64
+// frames, a null or misaligned frame, or one that does not move up the stack.
+fun bootstrapLlvmEmitFramePointerWalk(
+    backend: BootstrapLlvmBackend,
+    printStack: i64*
+): void {
+    val i64 = backend.i64Type
+    bootstrapLlvmDebugWrite(
+        backend,
+        "stack (return addresses: subtract the load address, then addr2line or gdb on the program gives file:line):\n",
+        "abla.stack.header"
+    )
+    val frame = bootstrapLlvmStackGuardCall(
+        backend, "llvm.frameaddress.p0", backend.pointerType,
+        [backend.i32Type], [LLVMConstInt(backend.i32Type, 0, 0)]
+    )
+    val cursor = LLVMBuildAlloca(backend.builder, i64, "fp")
+    LLVMBuildStore(
+        backend.builder, LLVMBuildPtrToInt(backend.builder, frame, i64, ""), cursor
+    )
+    val counter = LLVMBuildAlloca(backend.builder, i64, "n")
+    LLVMBuildStore(backend.builder, LLVMConstInt(i64, 0, 0), counter)
+    val record = LLVMBuildAlloca(backend.builder, LLVMArrayType2(backend.i8Type, 16), "record")
+    val iov = LLVMBuildAlloca(backend.builder, LLVMArrayType2(backend.i8Type, 32), "iov")
+    val process = bootstrapLlvmLinuxX64Syscall(backend, 39, [])
+    val loop = LLVMAppendBasicBlockInContext(backend.context, printStack, "walk")
+    val read = LLVMAppendBasicBlockInContext(backend.context, printStack, "read")
+    val take = LLVMAppendBasicBlockInContext(backend.context, printStack, "take")
+    val show = LLVMAppendBasicBlockInContext(backend.context, printStack, "show")
+    val done = LLVMAppendBasicBlockInContext(backend.context, printStack, "walked")
+    LLVMBuildBr(backend.builder, loop)
+    LLVMPositionBuilderAtEnd(backend.builder, loop)
+    val count = LLVMBuildLoad2(backend.builder, i64, counter, "")
+    val current = LLVMBuildLoad2(backend.builder, i64, cursor, "")
+    // ULT (36), NE (33), EQ (32).
+    val inRange = LLVMBuildICmp(
+        backend.builder, 36, count, LLVMConstInt(i64, 64, 0), ""
+    )
+    val present = LLVMBuildICmp(backend.builder, 33, current, LLVMConstInt(i64, 0, 0), "")
+    val aligned = LLVMBuildICmp(
+        backend.builder, 32,
+        LLVMBuildAnd(backend.builder, current, LLVMConstInt(i64, 7, 0), ""),
+        LLVMConstInt(i64, 0, 0), ""
+    )
+    LLVMBuildCondBr(
+        backend.builder,
+        LLVMBuildAnd(
+            backend.builder, LLVMBuildAnd(backend.builder, inRange, present, ""), aligned, ""
+        ),
+        read, done
+    )
+    LLVMPositionBuilderAtEnd(backend.builder, read)
+    // process_vm_readv(pid, &local, 1, &remote, 1, 0): the 16 bytes at the frame
+    // (saved frame pointer, return address) into `record`.
+    LLVMBuildStore(backend.builder, record, iov)
+    LLVMBuildStore(
+        backend.builder, LLVMConstInt(i64, 16, 0), bootstrapLlvmByteAt(backend, iov, 32, 8)
+    )
+    LLVMBuildStore(backend.builder, current, bootstrapLlvmByteAt(backend, iov, 32, 16))
+    LLVMBuildStore(
+        backend.builder, LLVMConstInt(i64, 16, 0), bootstrapLlvmByteAt(backend, iov, 32, 24)
+    )
+    val got = bootstrapLlvmLinuxX64Syscall(backend, 310, [
+        process, iov, LLVMConstInt(i64, 1, 0),
+        bootstrapLlvmByteAt(backend, iov, 32, 16), LLVMConstInt(i64, 1, 0),
+        LLVMConstInt(i64, 0, 0)
+    ])
+    LLVMBuildCondBr(
+        backend.builder,
+        LLVMBuildICmp(backend.builder, 32, got, LLVMConstInt(i64, 16, 0), ""),
+        take, done
+    )
+    LLVMPositionBuilderAtEnd(backend.builder, take)
+    val next = LLVMBuildLoad2(backend.builder, i64, record, "")
+    val returnAddress = LLVMBuildLoad2(
+        backend.builder, i64, bootstrapLlvmByteAt(backend, record, 16, 8), ""
+    )
+    LLVMBuildCondBr(
+        backend.builder,
+        LLVMBuildICmp(backend.builder, 33, returnAddress, LLVMConstInt(i64, 0, 0), ""),
+        show, done
+    )
+    LLVMPositionBuilderAtEnd(backend.builder, show)
+    bootstrapLlvmDebugWriteHex(
+        backend, LLVMBuildSub(backend.builder, returnAddress, LLVMConstInt(i64, 1, 0), "")
+    )
+    bootstrapLlvmDebugWrite(backend, "\n", "abla.stack.end")
+    LLVMBuildStore(
+        backend.builder, LLVMBuildAdd(backend.builder, count, LLVMConstInt(i64, 1, 0), ""),
+        counter
+    )
+    LLVMBuildStore(backend.builder, next, cursor)
+    // Keep going only while the chain moves up (ULE (37): next <= current stops).
+    LLVMBuildCondBr(
+        backend.builder, LLVMBuildICmp(backend.builder, 37, next, current, ""), done, loop
+    )
+    LLVMPositionBuilderAtEnd(backend.builder, done)
+    bootstrapLlvmDebugWrite(backend, "load address ", "abla.stack.load")
+    var base = LLVMGetNamedGlobal(backend.module, "__ehdr_start")
+    if (pointerIsNull(base)) base = LLVMAddGlobal(backend.module, backend.i8Type, "__ehdr_start")
+    bootstrapLlvmDebugWriteHex(backend, LLVMBuildPtrToInt(backend.builder, base, i64, ""))
+    bootstrapLlvmDebugWrite(backend, "\n", "abla.stack.end")
     return
 }
 
@@ -1134,6 +1280,7 @@ fun bootstrapLlvmDebugWriteHex(
 // build needs it) and, in a debug build of a hosted executable,
 // abla_runtime_fault. Runs after every other body is emitted.
 fun bootstrapLlvmEmitDebugRuntime(backend: BootstrapLlvmBackend): void {
+    bootstrapLlvmEmitSigreturnRestorer(backend)
     val hosted = bootstrapLlvmDebugHostedRuntime(backend)
     var printStack = LLVMGetNamedFunction(
         backend.module, "abla_runtime_print_stack"
@@ -1151,7 +1298,9 @@ fun bootstrapLlvmEmitDebugRuntime(backend: BootstrapLlvmBackend): void {
             backend.builder,
             LLVMAppendBasicBlockInContext(backend.context, printStack, "entry")
         )
-        if (hosted) {
+        if (hosted && bootstrapLlvmStackGuardKernel(backend)) {
+            bootstrapLlvmEmitFramePointerWalk(backend, printStack)
+        } else if (hosted) {
             val framesType = LLVMArrayType2(backend.pointerType, 64)
             val frames = LLVMBuildAlloca(backend.builder, framesType, "frames")
             bootstrapLlvmDebugWrite(
@@ -1258,11 +1407,18 @@ fun bootstrapLlvmEmitDebugRuntime(backend: BootstrapLlvmBackend): void {
         bootstrapLlvmCall(backend, printStack, [], "", false, [])
         // Back to the default action: returning re-runs the faulting
         // instruction (or abort raises again), which now ends the process.
-        bootstrapLlvmDebugCall(
-            backend, "signal", backend.pointerType,
-            [backend.i64Type, backend.pointerType],
-            [LLVMGetParam(fault, 0), LLVMConstNull(backend.pointerType)]
-        )
+        if (bootstrapLlvmStackGuardKernel(backend)) {
+            val defaultType = LLVMArrayType2(backend.i8Type, 32)
+            val action = LLVMBuildAlloca(backend.builder, defaultType, "fault.default")
+            LLVMBuildStore(backend.builder, LLVMConstNull(defaultType), action)
+            bootstrapLlvmStackGuardKernelSigaction(backend, LLVMGetParam(fault, 0), action)
+        } else {
+            bootstrapLlvmDebugCall(
+                backend, "signal", backend.pointerType,
+                [backend.i64Type, backend.pointerType],
+                [LLVMGetParam(fault, 0), LLVMConstNull(backend.pointerType)]
+            )
+        }
         LLVMBuildRetVoid(backend.builder)
     }
     return
