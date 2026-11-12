@@ -19,6 +19,19 @@ ln -s nowhere "$out/root-link/23.1.3-1"
 run good "$out/root-link" existing_type
 [[ $(readlink "$out/root-link/23.1.3-1") == nowhere ]]
 run good "$out/target" '' existing
+# 0700 denotes an incomplete publication. A verifier and an installer wait
+# for a live publisher; a crashed publisher is never silently repaired.
+incomplete='publication_in_progress: directory 23.1.3-1; ensure no installer is running, remove this directory, and rerun'
+chmod 0700 "$out/target/23.1.3-1"
+run good "$out/target" "$incomplete" verify
+run good "$out/target" "$incomplete"
+(sleep 0.1; chmod 0555 "$out/target/23.1.3-1") & publisher=$!
+run good "$out/target" '' verify
+wait "$publisher"
+chmod 0700 "$out/target/23.1.3-1"
+chmod -R u+w "$out/target/23.1.3-1"
+rm -rf "$out/target/23.1.3-1"
+run good "$out/target" '' new
 # An already installed tree is verified without hashing the supplied archive.
 run archivehash "$out/target" '' existing
 "$out/test" "$out/fixtures/good.json" "$out/target" "$out/fixtures" missing.tar.gz '' existing
@@ -49,6 +62,7 @@ for case in link extra missing manifest; do
         missing) rm "$out/$case/23.1.3-1/bin/opt"; expected=existing_file_set ;;
         manifest) printf bad > "$out/$case/23.1.3-1/manifest.json"; expected=existing_manifest_hash ;;
     esac
+    chmod 555 "$out/$case/23.1.3-1"
     run good "$out/$case" "$expected"
     [[ -z $(find "$out/$case" -name '.install-*' -print) ]]
 done
@@ -62,6 +76,38 @@ cmp "$out/concurrent-expected.txt" "$out/concurrent-actual.txt"
 [[ -z $(find "$out/concurrent" -name '.install-*' -print) ]]
 # Linux-only syscall fault injection validates rollback at several stages.
 if [[ $(uname -s) == Linux ]] && command -v strace >/dev/null; then
+    # Observe actual chmod/rename order on the staging directory. The old
+    # order (0555 before rename) fails this check even on permissive Linux.
+    mkdir "$out/order"
+    strace -qq -yy -e trace=fchmod,renameat2,fsync -o "$out/order.trace" \
+        "$out/test" "$out/fixtures/good.json" "$out/order" "$out/fixtures" good.tar.gz '' new
+    python3 - "$out/order.trace" <<'PY'
+import re, sys
+lines = open(sys.argv[1]).read().splitlines()
+rename = next(i for i, line in enumerate(lines) if line.startswith('renameat2(') and ' = 0' in line)
+root_modes = [(i, line) for i, line in enumerate(lines) if re.search(r'fchmod\(\d+<[^>]*(?:/\.install-[^/>]+|/23\.1\.3-1)>, 0?555\)', line)]
+assert len(root_modes) == 1 and root_modes[0][0] > rename, (rename, root_modes)
+PY
+    ordinal=$(python3 - "$out/order.trace" <<'PY'
+import re, sys
+count = 0
+for line in open(sys.argv[1]):
+    if line.startswith('fchmod('):
+        count += 1
+        if re.search(r'fchmod\(\d+<[^>]*/23\.1\.3-1>, 0?555\)', line):
+            print(count)
+            break
+else:
+    raise SystemExit('missing final root chmod')
+PY
+    )
+    mkdir "$out/final-mode-fault"
+    strace -qq -e "inject=fchmod:error=EIO:when=$ordinal" -o "$out/final-mode.trace" \
+        "$out/test" "$out/fixtures/good.json" "$out/final-mode-fault" "$out/fixtures" good.tar.gz "$incomplete" new
+    run good "$out/final-mode-fault" "$incomplete" verify
+    chmod -R u+w "$out/final-mode-fault/23.1.3-1"
+    rm -rf "$out/final-mode-fault/23.1.3-1"
+    run good "$out/final-mode-fault" '' new
     for item in write:stage_write fsync:stage_write fchmod:stage_open renameat2:publish; do
         call=${item%:*}; expected=${item#*:}
         strace -qq -e "inject=$call:error=EIO:when=1" -o "$out/$call.trace" "$out/test" "$out/fixtures/good.json" "$out/fault" "$out/fixtures" good.tar.gz "$expected"

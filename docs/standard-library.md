@@ -108,6 +108,11 @@ Built into the language rather than imported: `string`, arrays, `Map`,
 | `abla/platform/host` | the hosted runtime's `ablaHost*` functions; portable code uses the modules above instead |
 | `abla/runtime/*` | the runtime itself, linked automatically; internal (its address intrinsics are callable only from it: `native.runtime-internal`) |
 
+An interrupted companion publication can leave its version directory at mode
+0700. Verification waits briefly and reports `publication_in_progress` without
+changing it. To reinstall, first ensure no installer is running, then remove
+the named version directory and rerun installation.
+
 There are no visibility modifiers, so a module's internal helpers are also
 importable. The functions named on the task pages are the supported API.
 

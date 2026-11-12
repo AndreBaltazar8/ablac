@@ -6,6 +6,7 @@ import "abla/fs/secure"
 import "abla/json"
 import "abla/text"
 import "abla/sys/linux/random"
+import "abla/sys/linux/process"
 
 class CompanionPins(
     val version: string,
@@ -129,7 +130,8 @@ private fun companionWalk(
     ""
 }
 
-fun verifyCompanion(directory: SecureDirectory, pins: CompanionPins): CompanionVerifyResult {
+private fun companionVerifyTree(directory: SecureDirectory,
+    pins: CompanionPins): CompanionVerifyResult {
     if (!companionPinsValid(pins)) return CompanionVerifyResult("pins")
     if (directory.descriptor < 0) return CompanionVerifyResult("directory_open")
     val manifestFile = directory.openRegularFile("manifest.json")
@@ -159,6 +161,24 @@ fun verifyCompanion(directory: SecureDirectory, pins: CompanionPins): CompanionV
     if (error != "") return CompanionVerifyResult(error)
     if (state.files != files.size()) return CompanionVerifyResult("file_set")
     CompanionVerifyResult("")
+}
+
+// 0700 is the marker for a publish that has not reached its final chmod.
+// A crashed publisher is never repaired or removed by verification.
+fun verifyCompanion(directory: SecureDirectory, pins: CompanionPins): CompanionVerifyResult {
+    if (!companionPinsValid(pins)) return CompanionVerifyResult("pins")
+    if (directory.descriptor < 0) return CompanionVerifyResult("directory_open")
+    var mode = directory.permissions()
+    var waits = 0
+    while (mode == 0o700 && waits < 50) {
+        linuxSleep(20)
+        mode = directory.permissions()
+        waits += 1
+    }
+    if (mode ==
+        0o700) return CompanionVerifyResult("publication_in_progress: directory ${pins.version}; ensure no installer is running, remove this directory, and rerun")
+    if (mode != 0o555) return CompanionVerifyResult("directory_mode")
+    companionVerifyTree(directory, pins)
 }
 
 class CompanionExtractResult(val error: string, val existing: bool, val leftoverStage: string = "",
@@ -265,6 +285,9 @@ fun extractCompanion(parent: SecureDirectory, archiveFile: SecureFile,
     if (currentKind == "directory") {
         val current = parent.openDirectory(pins.version)
         val checked = verifyCompanion(current, pins)
+        if (checked.error.startsWith("publication_in_progress:")) return CompanionExtractResult(
+            checked.error, false
+        )
         if (checked.error != "") return CompanionExtractResult("existing_${checked.error}", false)
         return CompanionExtractResult("", true)
     }
@@ -305,7 +328,7 @@ fun extractCompanion(parent: SecureDirectory, archiveFile: SecureFile,
     }
     if (error == "") {
         val checkRoot = parent.openDirectory(stageName)
-        val checked = verifyCompanion(checkRoot, pins)
+        val checked = companionVerifyTree(checkRoot, pins)
         if (checked.error != "") error = "verify_${checked.error}"
     }
     if (error == "") {
@@ -315,22 +338,35 @@ fun extractCompanion(parent: SecureDirectory, archiveFile: SecureFile,
             if (!companionStageMode(root, stage.dirs[i].split("/"), 0,
                 0o555)) { error = "stage_mode"; break }
         }
-        if (error == "" && (!root.setPermissions(0o555) || !root.sync())) error = "stage_mode"
+        if (error == "" && !root.sync()) error = "stage_mode"
     }
-    if (!root.close() && error == "") error = "stage_close"
     if (error != "") {
+        root.close()
         if (!companionStageCleanup(parent, stageName,
             stage)) return CompanionExtractResult("cleanup", false, stageName)
         return CompanionExtractResult(error, false)
     }
     val published = parent.renameNoReplace(stageName, parent, pins.version)
-    if (published == 0) return CompanionExtractResult("", false)
+    if (published == 0) {
+        if (!root.setPermissions(0o555)) {
+            root.close()
+            return CompanionExtractResult("publication_in_progress: directory ${pins.version}; ensure no installer is running, remove this directory, and rerun",
+                false)
+        }
+        if (!root.close()) return CompanionExtractResult("publish_close", false)
+        if (!parent.sync()) return CompanionExtractResult("publish_sync", false)
+        return CompanionExtractResult("", false)
+    }
+    root.close()
     if (!companionStageCleanup(parent, stageName, stage)) return CompanionExtractResult("cleanup",
         false, stageName, "rename_no_replace", -published)
     if (published != -17) return CompanionExtractResult("publish", false, "",
         "rename_no_replace", -published)
     val winner = parent.openDirectory(pins.version)
     val checked = verifyCompanion(winner, pins)
+    if (checked.error.startsWith("publication_in_progress:")) return CompanionExtractResult(
+        checked.error, false
+    )
     if (checked.error != "") return CompanionExtractResult("existing_${checked.error}", false)
     CompanionExtractResult("", true)
 }
