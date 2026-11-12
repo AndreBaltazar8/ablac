@@ -101,10 +101,8 @@ fork, through a page of its own that the kernel zeroes in the child (`MADV_WIPEO
 system call and no hook on the allocation path), frees both locks, and, when the heap's lock was held, drops
 the free lists, bins and cache of large mappings (their memory leaks) and never merges blocks again in that
 child, since a list the other thread was updating may be half written. A kernel without that advice does not
-detect it. Only the runtime's own locks are repaired: a user `Mutex` or `Shared` that a vanished thread
-held stays held, as POSIX has it. When the runtime mutex or the heap lock was found held, the thread that held
-it may have been halfway through registering an allocation, so collection stays off in that child for good
-(`memoryCollect()` returns 0; allocation goes on). An Abla thread pool does not survive a fork (its workers are gone); the standard library's
+detect it. What the collector's own bookkeeping (its registry and byte counts) held at that instant is not
+repaired, and an Abla thread pool does not survive a fork (its workers are gone); the standard library's
 process functions and the compiler's own capture still prepare everything before the fork and allocate
 nothing in the child, which stays the safest way to run a program after a fork, as POSIX asks of any
 multithreaded process.
