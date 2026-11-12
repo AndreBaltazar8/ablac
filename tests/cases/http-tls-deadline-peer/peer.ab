@@ -1,0 +1,90 @@
+// Raw socket peer for tools/test-http-tls-deadline.sh: a TCP server that never
+// completes a TLS handshake, written with literal bytes and no TLS library. It listens
+// on 127.0.0.1 on a port the system picks and publishes the port by renaming a file
+// into place. It reads each client's first flight (the ClientHello) and then:
+//   * the first connection: says nothing and closes after 3 s;
+//   * every later connection: trickles the five bytes of a partial TLS record header
+//     (16 03 03 01 00) 160 ms apart, which a per-read timeout alone cannot cut off
+//     while the peer keeps sending, and closes 3 s after the last byte.
+// One thread serves everyone: connections are scheduled events, so a stalled
+// connection never delays accepting the next one. Arguments: <ready file> [immediate], where "immediate" closes every connection at once (a control:
+// the client must then fail the test, which expects the deadline to cut the exchange short).
+import "abla/fs"
+import "abla/net/hosted"
+import "abla/process/arguments"
+import "abla/process/time"
+import "abla/sys/linux/net"
+import "abla/sys/linux/process"
+
+val DESCRIPTORS: array<int> = []
+val DUE: array<int> = []
+val BYTES: array<string> = []
+val CLOSE: array<bool> = []
+val DONE: array<bool> = []
+
+fun schedule(descriptor: int, due: int, bytes: string, close: bool): void {
+    DESCRIPTORS.append(descriptor)
+    DUE.append(due)
+    BYTES.append(bytes)
+    CLOSE.append(close)
+    DONE.append(false)
+    return
+}
+
+fun send(descriptor: int, bytes: string): void {
+    var socket = TcpConnection(descriptor)
+    socket.writeResult(bytes)
+    socket.descriptor = -1
+    return
+}
+
+fun runDue(now: int): void {
+    var index = 0
+    while (index < DUE.size) {
+        if (!DONE[index] && DUE[index] <= now) {
+            if (CLOSE[index]) linuxTcpCloseDescriptor(DESCRIPTORS[index])
+            else send(DESCRIPTORS[index], BYTES[index])
+            DONE[index] = true
+        }
+        index = index + 1
+    }
+    return
+}
+
+fun main: int {
+    linuxBrokenPipeHold()
+    val listener = hostedTcpListen("127.0.0.1", 0, 8, false)
+    val port = listener.localPort()
+    if (port <= 0) return 1
+    if (!listener.setNonblocking()) return 2
+    if (!Path(processArgument(0)).writeTextAtomic("$port")) return 3
+    val immediate = processArgumentCount() > 1 && processArgument(1) == "immediate"
+    var count = 0
+    while (true) {
+        val descriptor = linuxTcpAcceptDescriptor(listener.descriptor)
+        if (descriptor >= 0) {
+            var client = HostedTcpConnection(descriptor)
+            client.readNetwork(4096, 1000)
+            client.descriptor = -1
+            val now = linuxMonotonicMilliseconds()
+            if (immediate) {
+                schedule(descriptor, now, "", true)
+            } else if (count == 0) {
+                schedule(descriptor, now + 3000, "", true)
+            } else {
+                val header = "\u0016\u0003\u0003\u0001\u0000"
+                var position = 0
+                while (position < 5) {
+                    schedule(descriptor, now + 160 * (position + 1), header.slice(position, position + 1), false)
+                    position = position + 1
+                }
+                schedule(descriptor, now + 160 * 5 + 3000, "", true)
+            }
+            count = count + 1
+        } else {
+            runDue(linuxMonotonicMilliseconds())
+            sleep(2)
+        }
+    }
+    0
+}

@@ -10,42 +10,34 @@ openssl req -x509 -new -key "$out/key.pem" -days 2 -subj /CN=localhost \
     -out "$out/cert.pem" 2>/dev/null
 openssl pkcs12 -export -inkey "$out/key.pem" -in "$out/cert.pem" \
     -passout pass:test -out "$out/identity.p12" 2>/dev/null
-python3 - "$out/ready" <<'PY' &
-import os, socket, sys, threading, time
-server = socket.socket(); server.bind(("127.0.0.1", 0)); server.listen(8)
-with open(sys.argv[1] + ".next", "w") as ready:
-    ready.write(str(server.getsockname()[1]))
-os.rename(sys.argv[1] + ".next", sys.argv[1])
-def stall(conn, silent):
-    try:
-        conn.recv(4096)
-        if silent:
-            time.sleep(3)
-            return
-        # A partial TLS record trickles in; a per-read timeout alone cannot
-        # enforce the exchange deadline while the peer continues sending.
-        for byte in b'\x16\x03\x03\x01\x00':
-            time.sleep(.16)
-            conn.sendall(bytes([byte]))
-        time.sleep(3)
-    except OSError: pass
-    finally: conn.close()
-count = 0
-while True:
-    conn, _ = server.accept()
-    threading.Thread(target=stall, args=(conn, count == 0), daemon=True).start()
-    count += 1
-PY
-pid=$!
-trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
-for _ in $(seq 1 500); do [[ -e $out/ready ]] && break; sleep 0.02; done
-[[ -e $out/ready ]]
-port=$(cat "$out/ready")
-sed -e "s|CERTFILE|$out/cert.pem|g" -e "s|KEYFILE|$out/key.pem|g" \
-    -e "s|P12FILE|$out/identity.p12|g" -e "s/39093/$port/g" \
-    "$root/tests/cases/http-tls-deadline/main.ab" > "$out/main.ab"
-"$compiler" build "$out/main.ab" -o "$out/main" --fast --no-cache
-status=0
-"$out/main" || status=$?
+# The peer is an Abla program over a raw TCP socket (no TLS library, no shared code with
+# the client): it never completes a handshake, stalling or trickling bytes. The client
+# under test is the hosted (OpenSSL) HTTPS client of abla/http/tls with a 250 ms deadline.
+"$compiler" build "$root/tests/cases/http-tls-deadline-peer/peer.ab" -o "$out/peer" --fast --no-cache
+peer_pid=
+trap 'if [[ -n $peer_pid ]]; then kill "$peer_pid" 2>/dev/null || true; wait "$peer_pid" 2>/dev/null || true; fi' EXIT
+# run_client [peer argument]: start a peer (hard timeout 60 s), build the client for its
+# port and set status to the client's exit status; the peer is stopped afterwards.
+run_client() {
+    rm -f "$out/ready"
+    timeout 60 "$out/peer" "$out/ready" "$@" &
+    peer_pid=$!
+    for _ in $(seq 1 500); do [[ -e $out/ready ]] && break; sleep 0.02; done
+    [[ -e $out/ready ]] || { echo 'HTTPS handshake deadline: the peer did not publish its port' >&2; exit 1; }
+    port=$(cat "$out/ready")
+    sed -e "s|CERTFILE|$out/cert.pem|g" -e "s|KEYFILE|$out/key.pem|g" \
+        -e "s|P12FILE|$out/identity.p12|g" -e "s/39093/$port/g" \
+        "$root/tests/cases/http-tls-deadline/main.ab" > "$out/main.ab"
+    "$compiler" build "$out/main.ab" -o "$out/main" --fast --no-cache
+    status=0
+    "$out/main" || status=$?
+    kill "$peer_pid" 2>/dev/null || true
+    wait "$peer_pid" 2>/dev/null || true
+    peer_pid=
+}
+# Control: a peer that closes at once ends every exchange far inside the expected window.
+run_client immediate
+[[ $status -ne 42 ]] || { echo 'HTTPS handshake deadline: the client passed against a peer that closes at once' >&2; exit 1; }
+run_client
 [[ $status -eq 42 ]]
 echo 'HTTPS handshake deadline: plain, PEM and PKCS12 passed'
