@@ -86,6 +86,11 @@ Ubuntu 22.04, Debian 12 and RHEL 9 have older glibc and cannot run the archive
 unmodified. The standalone `ablac-x86_64-linux` release binary is intended for
 bootstrapping; it also names a specific Nix-store dynamic loader and is not
 intended for direct use on other systems. Use the toolchain archive instead.
+The optional Xtensa companion is installed explicitly with the packaged native
+`bin/abla-install-xtensa --version 23.1.3-1`. It does not support HTTP proxies;
+use `--archive PATH` with an archive downloaded by other means when needed.
+See [Xtensa installation](docs/llvm-xtensa.md#explicit-installation).
+
 A macOS archive runs with
 Homebrew's, which must be the LLVM its compiler links, since the compiler reads
 `opt`'s bitcode back with its own libLLVM. From v0.2.16, install

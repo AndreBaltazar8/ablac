@@ -75,7 +75,7 @@ subprocess.run([str(compiler), 'build', str(entry), '--target-triple', 'xtensa-e
                 '--object-format', 'elf', '--emit', 'object', '--no-cache', '-o', str(wide)],
                cwd=embedded, env=dict(env, ABLA_XTENSA_NARROW='0'), check=True, timeout=600)
 objects.append(verify(wide, 'wide'))
-subprocess.run([sys.executable, str(prefix / 'bin/abla-install-xtensa'), '--verify'], env=env, check=True, timeout=120)
+subprocess.run([str(prefix / 'bin/abla-install-xtensa'), '--verify'], env=env, check=True, timeout=120)
 result = json.loads((out / 'result.json').read_text())
 result['embedded'] = dict(status='passed', revision=actual, limitMiB=4096,
                           peakMetric='GNU time %M: largest single process, not summed children',

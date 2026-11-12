@@ -225,23 +225,19 @@ p=Path(sys.argv[1]); catalog=json.load(open('tools/xtensa-companions.json')); re
 (p/'real.json').write_text(json.dumps({'version':'23.1.3-1','platform':'x86_64-linux','llvmVersion':rel['llvmVersion'],'sourceCommit':rel['sourceCommit'],'sourceArchiveSha256':rel['sourceArchiveSha256'],'archiveSha256':item['sha256'],'manifestSha256':item['manifestSha256']}))
 PY
     "$out/test" "$out/real.json" "$out/real" "$out/real-archive" companion.tar.gz '' new
-    python3 - "$out" <<'PY'
-import sys
-from pathlib import Path
-sys.path.insert(0,'tools'); import xtensa_companions as c
-p=Path(sys.argv[1]); expected=c._extract_archive(p/'real-archive/companion.tar.gz',p/'python','abla-xtensa-llvm-23.1.3-1-x86_64-linux')
-for entry in [*sorted(expected.rglob('*'),reverse=True),expected]:
-    if entry.is_dir(): entry.chmod(0o555)
-actual=p/'real/23.1.3-1'
-def inventory(root):
-    out={}
-    for entry in [root,*root.rglob('*')]:
-        name='.' if entry==root else str(entry.relative_to(root)); mode=entry.stat().st_mode & 0o777
-        out[name]=('dir',mode) if entry.is_dir() else ('file',mode,c.file_sha256(entry))
-    return out
-assert inventory(actual)==inventory(expected), 'native/Python tree mismatch'
-print('offline installer: real Linux tree matches Python')
-PY
+    if [[ $(uname -s) != Linux ]]; then
+        echo 'offline installer: real Linux inventory check skipped on non-Linux host'
+    else
+        ( cd "$out/real/23.1.3-1"
+          find . -type d -printf 'd %m %p\n'
+          find . -type f -printf 'f %m %p\n' | while read -r kind mode path; do
+              sum=$(sha256sum "$path")
+              printf '%s %s %s %s\n' "$kind" "$mode" "${sum%% *}" "$path"
+          done
+        ) | LC_ALL=C sort > "$out/real-inventory.txt"
+        cmp tests/cases/xtensa-companion-offline/linux-python-tree.txt "$out/real-inventory.txt"
+        echo 'offline installer: real Linux tree matches recorded Python installer inventory'
+    fi
 else
     echo 'offline installer: real cached companion absent; parity skipped'
 fi

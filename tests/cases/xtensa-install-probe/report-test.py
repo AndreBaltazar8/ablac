@@ -23,22 +23,23 @@ assert subprocess.run(['bash', '-n'], input=shell, text=True).returncode == 0
 with tempfile.TemporaryDirectory(prefix='xtensa-probe-report-') as td:
     base = Path(td)
     artifacts = base / 'artifacts'
+    codegen = {'patches.s': 'b860145a355d1b750c82c45903a8dfa5be685112dd444b9320ef0d109f5ce791',
+               'patches.o': '528285e41bb3339affe60bf2cb324602bbed246fc147a5799be27c294150e4d1',
+               'optimized.o': '8a12b98e9e44d332e9be540e5941a75b41dd3d9cf12068c20d251c72d4622672'}
     for runner, platform in [('ubuntu-24.04', 'x86_64-linux'), ('macos-15', 'arm64-macos'),
                              ('macos-15-intel', 'x86_64-macos')]:
-        for mode in ('python', 'native'):
-            directory = artifacts / f'xtensa-installed-{runner}-{mode}'
-            directory.mkdir(parents=True)
-            record = dict(installer=mode, platform=platform, status='passed', parentVersion='v0.2.48',
-                          version='23.1.3-1', codegen={'a.o': 'hash'}, unpublishedTestFixture=False,
-                          statPreservedDsoTamperRejected=True,
-                          nativePackageSha256='pin' if mode == 'native' else None)
-            (directory / 'result.json').write_text(json.dumps(record))
+        directory = artifacts / f'xtensa-installed-{runner}-native'
+        directory.mkdir(parents=True)
+        record = dict(installer='native', platform=platform, status='passed', parentVersion='v0.2.48',
+                      version='23.1.3-1', codegen=codegen, unpublishedTestFixture=False,
+                      statPreservedDsoTamperRejected=True, nativePackageSha256='pin')
+        (directory / 'result.json').write_text(json.dumps(record))
     output = base / 'comparison.json'
     cmd = [sys.executable, reporter, artifacts, output]
     assert subprocess.run(cmd, stdout=subprocess.DEVNULL).returncode == 0
     path = artifacts / 'xtensa-installed-ubuntu-24.04-native/result.json'
     record = json.loads(path.read_text())
-    record['codegen']['a.o'] = 'wrong'
+    record['codegen']['patches.o'] = 'wrong'
     path.write_text(json.dumps(record))
     assert subprocess.run(cmd, stdout=subprocess.DEVNULL).returncode != 0
     assert json.loads(output.read_text())['status'] == 'failed'

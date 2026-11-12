@@ -123,10 +123,10 @@ mkdir -p "$working/native-build"
 "$bundle/bin/ablac" build "$abla_root/tools/xtensa-native/main.ab" --no-cache \
     -o "$working/native-build/installer"
 cp "$working/native-build/installer" "$bundle/libexec/abla-install-xtensa-native"
-ln -s ../libexec/abla-install-xtensa-native "$bundle/bin/abla-install-xtensa-native"
 
 # Add the optional installer after the executable/dependency loops above.
 "$(dirname -- "${BASH_SOURCE[0]}")/package-xtensa-installer.sh" "$bundle"
+ln -s ../libexec/abla-install-xtensa-native "$bundle/bin/abla-install-xtensa"
 
 tar -C "$working" -czf "$output" "abla-toolchain-$architecture-macos"
 (

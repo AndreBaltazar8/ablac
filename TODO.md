@@ -592,6 +592,13 @@ mmap form) apply there.
   The manual installed-toolchain probe used to exercise only the Python installer; its native matrix now
   builds a candidate release package with the checksum-pinned published compiler and runs the same real
   companion, codegen and tamper checks against the unchanged v0.2.48 integration parent.
+  #807 installer follow-up after v0.2.57: add HTTP CONNECT through an `http://` proxy without
+  credentials, with `NO_PROXY` and proxy selection on each redirect plus a local proxy test;
+  add proxy authentication and HTTPS-to-proxy only if André asks. Until then, configured proxies
+  are refused and the installer directs users to download separately and use `--archive`.
+  The manual installed-toolchain probe and report still use Python for test orchestration;
+  port those as part of the broader Python removal, without losing their three-platform,
+  tamper and exact-codegen checks.
   The first six-leg probe exposed a Homebrew Intel setup failure before native installation: current
   llvm 23.1.5 has no Intel bottle. The probe now uses the release workflow's checksum-pinned 23.1.0
   Intel bottles; its macOS Intel native leg still needs a rerun.
@@ -1053,11 +1060,10 @@ mmap form) apply there.
   package-import build (3,137,848 KiB); both use the 4 GiB launcher and verify the
   cohort before/after. v0.2.48 does not contain routing. See
   [design and evidence](docs/design/xtensa-companion.md).
-  #787 native installer: package the native command alongside the Python
-  installer; Python remains the default in the next release. Probe run
+  #787 native installer: package the native command as the only installer. Probe run
   `43163669836` passed both installers on Linux and both macOS hosts. The same
   six-leg probe passed for the streaming native installer in run `43169366077`
-  on `f9c09e2e`. The default switch awaits André's decision. The native
+  on `f9c09e2e`. The native
   streaming limits are 512 MiB compressed and 1 GiB unpacked; the explicit
   in-memory archive validation helper retains its smaller 128 MiB / 256 MiB limits.
 - [ ] **v0.2.49 release-note draft: Xtensa migration (planned break).** Publish this
@@ -1083,8 +1089,8 @@ mmap form) apply there.
     companion installed next to its actual compiler image, or export
     `ABLA_XTENSA_LLVM_ROOT` to the manifested cohort before invoking Abla.
     If a Makefile runs the installer, make it an explicit setup target, never
-    an automatic download in a build recipe. A source checkout can run
-    `python3 <ablac>/tools/install-xtensa-llvm.py --toolchain-root <prefix> --version 23.1.3-1`
+    an automatic download in a build recipe. A user can run
+    `<prefix>/bin/abla-install-xtensa --version 23.1.3-1`
     and export `<prefix>/lib/abla/xtensa-llvm/current` as the cohort root.
   - Preserve the existing per-example `ABLA_ESP_CPU` selection in
     `tools/build-example`; export any feature mask and `ABLA_XTENSA_NARROW`

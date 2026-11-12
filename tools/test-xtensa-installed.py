@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Opt-in real published-toolchain installation probe; no LLVM source builds."""
 import argparse
+import hashlib
 import json
 import os
+import platform
 from pathlib import Path
 import shutil
 import subprocess
@@ -10,7 +12,44 @@ import sys
 import urllib.request
 
 sys.dont_write_bytecode = True
-import xtensa_companions as companions
+
+CATALOG = Path(__file__).with_name('xtensa-companions.json')
+HOSTS = {('Linux', 'x86_64'): 'x86_64-linux', ('Darwin', 'arm64'): 'arm64-macos',
+         ('Darwin', 'x86_64'): 'x86_64-macos'}
+
+def host_platform():
+    host = HOSTS.get((platform.system(), platform.machine()))
+    if host is None:
+        raise ValueError('unsupported probe host')
+    return host
+
+def file_sha256(path):
+    result = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            result.update(chunk)
+    return result.hexdigest()
+
+def load_catalog(path=CATALOG):
+    # The native installer and native catalog checker validate the schema and pins.
+    return json.loads(Path(path).read_text())
+
+def copy_archive(source, destination, expected):
+    digest = hashlib.sha256()
+    total = 0
+    with Path(destination).open('wb') as out:
+        while True:
+            chunk = source.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > 512 * 1024 * 1024:
+                raise ValueError('probe parent archive exceeds limit')
+            digest.update(chunk)
+            out.write(chunk)
+    if digest.hexdigest() != expected:
+        raise ValueError('probe parent archive SHA-256 mismatch')
+
 
 
 def run(*args):
@@ -25,7 +64,7 @@ def snapshot(root):
         if path.is_symlink():
             result[name] = ('link', str(path.readlink()))
         elif path.is_file():
-            result[name] = ('file', companions.file_sha256(path), path.stat().st_mode)
+            result[name] = ('file', file_sha256(path), path.stat().st_mode)
     return result
 
 
@@ -34,11 +73,8 @@ def main():
     parser.add_argument('output', type=Path)
     parser.add_argument('--unpublished-fixture', type=Path)
     parser.add_argument('--archive', type=Path)
-    parser.add_argument('--native', action='store_true', help='test the separately packaged native installer')
-    parser.add_argument('--native-package', type=Path, help='candidate toolchain archive built with the pinned compiler')
+    parser.add_argument('--native-package', type=Path, required=True, help='candidate toolchain archive built with the pinned compiler')
     args = parser.parse_args()
-    if args.native != bool(args.native_package):
-        parser.error('--native and --native-package must be supplied together')
     if bool(args.unpublished_fixture) != bool(args.archive):
         parser.error('--unpublished-fixture and --archive must be used together')
     output = args.output.absolute()
@@ -51,17 +87,17 @@ def main():
         print('UNPUBLISHED TEST FIXTURE: offline dry-run archive; not a published companion', flush=True)
         local_catalog = output / 'UNPUBLISHED-test-catalog.json'
         local_catalog.write_text(json.dumps(fixture['catalog'], indent=2) + '\n')
-        catalog = companions.load_catalog(local_catalog)
-        catalog['integrationToolchain'] = json.loads(companions.CATALOG.read_text())['integrationToolchain']
+        catalog = load_catalog(local_catalog)
+        catalog['integrationToolchain'] = json.loads(CATALOG.read_text())['integrationToolchain']
         catalog_args = ['--catalog', str(local_catalog)]
     else:
-        catalog = companions.load_catalog()
-    host = companions.host_platform()
+        catalog = load_catalog()
+    host = host_platform()
     fixture = catalog['integrationToolchain']
     base = fixture['platforms'][host]
     archive = output / 'parent.tar.gz'
     with urllib.request.urlopen(base['url'], timeout=30) as stream:
-        companions._copy_archive(stream, archive, base['sha256'])
+        copy_archive(stream, archive, base['sha256'])
     # The published parent has legitimate launcher symlinks. Its complete archive
     # is hash-pinned before the native tar reads it into an empty owned directory.
     unpacked = output / 'parent'
@@ -73,19 +109,17 @@ def main():
     root = output / 'relocated Abla toolchain'
     roots[0].rename(root)
     originals = snapshot(root)
+    # The published integration parent predates the companion catalog.
+    # Add only the current catalog; the helper no longer installs any script.
     run('bash', Path(__file__).with_name('package-xtensa-installer.sh'), root)
-    if args.native:
-        candidate = output / 'native-package'
-        candidate.mkdir()
-        run('tar', '-xzf', args.native_package.absolute(), '-C', candidate)
-        candidates = list(candidate.iterdir())
-        if len(candidates) != 1 or not (candidates[0] / 'bin/abla-install-xtensa-native').is_file():
-            raise ValueError('unexpected candidate package layout')
-        installer = candidates[0] / 'bin/abla-install-xtensa-native'
-        command = [str(installer), '--toolchain-root', str(root)]
-    else:
-        installer = root / 'bin/abla-install-xtensa'
-        command = [sys.executable, str(installer)]
+    candidate = output / 'native-package'
+    candidate.mkdir()
+    run('tar', '-xzf', args.native_package.absolute(), '-C', candidate)
+    candidates = list(candidate.iterdir())
+    if len(candidates) != 1 or not (candidates[0] / 'bin/abla-install-xtensa').is_file():
+        raise ValueError('unexpected candidate package layout')
+    installer = candidates[0] / 'bin/abla-install-xtensa'
+    command = [str(installer), '--toolchain-root', str(root)]
     version = '23.1.3-1'
     archive_args = ['--archive', str(args.archive.absolute())] if args.archive else []
     run(*command, *catalog_args, '--version', version, *archive_args)
@@ -95,7 +129,8 @@ def main():
     for name, value in originals.items():
         if after.get(name) != value:
             raise ValueError('installer modified parent file: ' + name)
-    tree = companions.verify_installed(root, catalog, version)
+    tree = root / 'lib/abla/xtensa-llvm' / version
+    if not tree.is_dir(): raise ValueError('verified companion is missing')
     llc, opt = tree / 'bin/llc', tree / 'bin/opt'
     fixture_ir = tree / 'patches.ll'
     options = ['-mcpu=esp32', '-relocation-model=static', '-O2']
@@ -108,7 +143,7 @@ def main():
         'patches.s': 'b860145a355d1b750c82c45903a8dfa5be685112dd444b9320ef0d109f5ce791',
         'patches.o': '528285e41bb3339affe60bf2cb324602bbed246fc147a5799be27c294150e4d1',
         'optimized.o': '8a12b98e9e44d332e9be540e5941a75b41dd3d9cf12068c20d251c72d4622672'}
-    actual = {name: companions.file_sha256(output / name) for name in expected}
+    actual = {name: file_sha256(output / name) for name in expected}
     if actual != expected:
         raise ValueError('installed code generation differs from Nix: ' + repr(actual))
     # Exercise the actual DSO as well as the offline fake-file control. Restore
@@ -130,7 +165,7 @@ def main():
         assert library.stat().st_mtime_ns == info.st_mtime_ns
         negative = subprocess.run([*command, *catalog_args, '--verify'],
                                   capture_output=True, text=True, timeout=120)
-        expected_error = 'file_hash' if args.native else 'file SHA-256 mismatch'
+        expected_error = 'file_hash'
         if negative.returncode != 1 or expected_error not in negative.stderr:
             raise ValueError('stat-preserved DSO corruption was not rejected: ' + repr(negative))
         (output / 'tamper-negative.txt').write_text(negative.stderr)
@@ -144,8 +179,8 @@ def main():
     run(*command, *catalog_args, '--verify')
     if any(root.rglob('__pycache__')):
         raise ValueError('installer wrote Python caches into the toolchain')
-    report = {'installer': 'native' if args.native else 'python',
-              'nativePackageSha256': companions.file_sha256(args.native_package) if args.native else None,
+    report = {'installer': 'native',
+              'nativePackageSha256': file_sha256(args.native_package),
               'platform': host, 'parentVersion': fixture['version'], 'version': version,
               'unchangedParentFiles': len(originals), 'statPreservedDsoTamperRejected': True,
               'codegen': actual, 'status': 'passed', 'unpublishedTestFixture': bool(args.unpublished_fixture)}

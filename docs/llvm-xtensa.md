@@ -61,17 +61,8 @@ backend. No Abla build downloads a companion implicitly.
 
 ### Explicit installation
 
-The shipped installer requires Python 3.9 or newer and its standard library; it uses no pip packages.
-The native offline extraction library is not yet the packaged installer. It caps compressed
-input at 128 MiB and unpacked tar at 256 MiB; streaming decompression is needed before those
-limits can be raised without holding the archive in memory.
-The Abla toolchain packagers include `bin/abla-install-xtensa`. From an existing
-source checkout the equivalent command is:
-
-```sh
-python3 tools/install-xtensa-llvm.py --toolchain-root /path/to/abla-toolchain \
-    --version 23.1.3-1
-```
+The packaged installer is native. It bounds compressed archives at 512 MiB
+and unpacked data at 1 GiB. Use the packaged `bin/abla-install-xtensa` command.
 
 From a packaged toolchain use its absolute path, without adding the companion's
 `bin` directory to `PATH`:
@@ -81,7 +72,9 @@ From a packaged toolchain use its absolute path, without adding the companion's
 /path/to/abla-toolchain/bin/abla-install-xtensa --verify
 ```
 
-For an offline install add `--archive /path/to/the-host-archive.tar.gz`. The
+HTTP proxies are not supported. If `HTTPS_PROXY`, `https_proxy` or `ALL_PROXY`
+is set, download the host archive by other means and add
+`--archive /path/to/the-host-archive.tar.gz`. The
 archive still has to match the checked-in catalog. Installation never changes
 Clang, the parent LLVM, or the compiler binary. The source compiler now routes
 Xtensa through the selected companion. Releases

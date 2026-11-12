@@ -31,7 +31,8 @@ export ABLA_SYSROOT="$root" PATH="$bundle/bin:$PATH"
 "$bundle/libexec/ablac.bin" build "$root/tools/xtensa-native/main.ab" --no-cache -o "$out/native-installer"
 mkdir -p "$bundle/bin" "$bundle/libexec" "$bundle/share/abla"
 cp "$out/native-installer" "$bundle/libexec/abla-install-xtensa-native"
-ln -s ../libexec/abla-install-xtensa-native "$bundle/bin/abla-install-xtensa-native"
+rm -f "$bundle/bin/abla-install-xtensa" "$bundle/libexec/abla/"*
+ln -s ../libexec/abla-install-xtensa-native "$bundle/bin/abla-install-xtensa"
 cp "$root/tools/xtensa-companions.json" "$bundle/share/abla/xtensa-companions.json"
 if [[ $(uname -s) == Linux ]]; then
     # Match package-linux-toolchain.sh's dependency and loader handling.

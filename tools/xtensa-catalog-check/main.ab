@@ -1,0 +1,142 @@
+// Published companion metadata checker; network fetch is performed by its test driver.
+import "abla/json"
+import "abla/text"
+import "abla/bytes"
+import "abla/crypto"
+import "abla/fs"
+import "abla/io"
+import "abla/process/arguments"
+import "abla/xtensa/companion/native"
+
+fun indent(n: int): string {
+    var out = ""
+    var i = 0
+    while (i < n) { out = out + "  "; i += 1 }
+    out
+}
+// The release producer hashes json.dumps(value, indent=2, sort_keys=True) + newline.
+// Published metadata is printable ASCII. Reject other strings rather than
+// silently hashing a serialization with different Unicode escaping rules.
+fun printable(text: string): bool {
+    for (c in text) if (c < 32 || c > 126) return false
+    true
+}
+fun canonical(value: Json, depth: int): string {
+    if (depth > 32) return ""
+    if (value.isString()) {
+        if (!printable(value.asString())) return ""
+        return jsonStringify(value)
+    }
+    if (value.isObject()) {
+        if (value.size() == 0) return "{}"
+        val keys: array<string> = []
+        for (key in value.keys) {
+            if (!printable(key)) return ""
+            keys.append(key)
+        }
+        var i = 1
+        while (i < keys.size) {
+            var j = i
+            while (j > 0 && keys[j] < keys[j - 1]) {
+                val old = keys[j]; keys[j] = keys[j - 1]; keys[j - 1] = old; j -= 1
+            }
+            i += 1
+        }
+        var out = "{\n"
+        i = 0
+        while (i < keys.size) {
+            val encoded = canonical(value.get(keys[i]), depth + 1)
+            if (encoded == "") return ""
+            out = out + indent(depth + 1) + jsonStringify(jsonString(keys[i])) + ": " + encoded
+            if (i + 1 < keys.size) out = out + ","
+            out = out + "\n"
+            i += 1
+        }
+        return out + indent(depth) + "}"
+    }
+    if (value.isArray()) {
+        if (value.size() == 0) return "[]"
+        var out = "[\n"
+        var i = 0
+        while (i < value.size()) {
+            val encoded = canonical(value.at(i), depth + 1)
+            if (encoded == "") return ""
+            out = out + indent(depth + 1) + encoded
+            if (i + 1 < value.size()) out = out + ","
+            out = out + "\n"
+            i += 1
+        }
+        return out + indent(depth) + "]"
+    }
+    jsonStringify(value)
+}
+fun failure(message: string): int { eprintln(message); 1 }
+fun main(): int {
+    if (processArgumentCount() !=
+        3) return failure("usage: catalog-check urls|check catalog metadata-dir")
+    val mode = processArgument(0)
+    val catalogText = Path(processArgument(1)).readText()
+    val parsed = jsonParse(catalogText, JsonLimits(1048576, 32, 20000, 1048576, 4096, true))
+    if (!parsed.succeeded) return failure("catalog JSON")
+    if (mode == "fixture") {
+        if (parsed.value.getString("status") != "UNPUBLISHED_TEST_FIXTURE" ||
+            parsed.value.getInt("sourceRun") != 42214578962 ||
+            parsed.value.getString("purpose").indexOf("never packaged", 0) < 0)
+            return failure("unpublished fixture marker")
+        val embedded = jsonStringify(parsed.value.get("catalog"))
+        if (nativeSelectCatalog(embedded, "23.1.3-1", "x86_64-linux").error != "")
+            return failure("unpublished fixture catalog")
+        return 0
+    }
+    val releases = parsed.value.get("releases")
+    if (!releases.isObject() || releases.size() == 0) return failure("catalog releases")
+    val hosts = ["x86_64-linux", "arm64-macos", "x86_64-macos"]
+    val dir = processArgument(2)
+    for (revision in releases.keys) {
+        // This validates every release and all three URL/pin entries.
+        if (nativeSelectCatalog(catalogText, revision,
+            hosts[0]).error != "") return failure("catalog schema")
+        val release = releases.get(revision)
+        val tag = "abla-xtensa-llvm-$revision"
+        val base = "https://github.com/AndreBaltazar8/llvm-project/releases/download/$tag"
+        if (mode == "urls") {
+            println("$revision.index $base/manifest.json")
+            for (host in hosts) println("$revision.$host $base/$tag-$host.tar.gz.sha256")
+        } else if (mode == "check") {
+            val index = jsonParse(Path("$dir/$revision.index").readText(), JsonLimits(1048576, 32,
+                20000, 1048576, 4096, true))
+            if (!index.succeeded || !index.value.isArray() || index.value.size() !=
+                3) return failure("release index")
+            val seen: array<string> = []
+            for (row in index.value.values) {
+                val host = row.getString("platform")
+                if (host != hosts[0] && host != hosts[1] && host !=
+                    hosts[2]) return failure("index platform")
+                for (old in seen) if (old == host) return failure("duplicate platform")
+                seen.append(host)
+                val pin = release.get("platforms").get(host)
+                val name = "$tag-$host.tar.gz"
+                val hash = pin.getString("sha256")
+                if (row.getString("archive") != name || row.getString("sha256") !=
+                    hash) return failure("index archive")
+                val sidecar = Path("$dir/$revision.$host").readText().trim().split(" ")
+                val words: array<string> = []
+                for (word in sidecar) if (word != "") words.append(word)
+                if (words.size != 2 || words[0] != hash || words[1] !=
+                    name) return failure("published checksum")
+                val manifest = row.get("manifest")
+                if (!manifest.isObject() || manifest.getInt("schema") != 1 ||
+                    manifest.getString("version") != tag || manifest.getString("platform") !=
+                    host ||
+                    manifest.getString("llvmVersion") != release.getString("llvmVersion") ||
+                    manifest.getString("sourceCommit") != release.getString("sourceCommit") ||
+                    manifest.getString("sourceArchiveSha256") !=
+                    release.getString("sourceArchiveSha256")) return failure("manifest identity")
+                val text = canonical(manifest, 0)
+                if (text == "" || hexEncode(sha256(text + "\n")) !=
+                    pin.getString("manifestSha256")) return failure("manifest hash")
+            }
+        } else return failure("unknown mode")
+    }
+    0
+}

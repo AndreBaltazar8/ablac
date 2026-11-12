@@ -145,8 +145,7 @@ test-serial: ablac
 	tools/test-xtensa-test-tools.sh
 	tools/test-xtensa-routing.sh $(COMPILER)
 	tools/test-xtensa-assembly.sh $(COMPILER)
-	python3 tools/test-xtensa-catalog.py
-	python3 tools/test-xtensa-installer.py
+	tools/test-xtensa-catalog.sh $(COMPILER)
 	tools/test-simd.sh $(COMPILER)
 	tools/test-ct.sh $(COMPILER)
 	python3 tools/ct-timing/test-stats.py

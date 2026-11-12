@@ -35,23 +35,15 @@ sizes and evidence are reported before any publication.
 
 ## Phase 2: explicit verified installation
 
-Add a Python 3 installer, `tools/install-xtensa-llvm.py`, and ship it as
-`bin/abla-install-xtensa` in future toolchain packages. The documented command
+The packaged native installer is `bin/abla-install-xtensa`. The command
 is explicit, for example:
 
 ```sh
 /path/to/abla-toolchain/bin/abla-install-xtensa --version 23.1.3-1
-# From a source checkout, against an existing toolchain:
-python3 tools/install-xtensa-llvm.py --toolchain-root /path/to/abla-toolchain \
-    --version 23.1.3-1
 ```
 
-Packages also include the experimental `bin/abla-install-xtensa-native` with
-the same flags and catalog. It limits compressed archives to 512 MiB and
-unpacked contents to 1 GiB, using a private spool and two validation passes
-before publication. The Python command remains
-the default until the native installer has passed the install probe on all
-three supported hosts.
+The native command limits compressed archives to 512 MiB and unpacked contents
+to 1 GiB, using a private spool and two validation passes before publication.
 
 No `ablac build`, analysis, staging or compiler startup downloads anything.
 There is no PATH modification or replacement of `bin/opt`, `bin/llc`, Clang,
@@ -74,8 +66,9 @@ staging directory under the destination filesystem. A final rename installs
 selects it. Compiler invocations resolve that selection to the immutable version
 directory once, so an activation between opt and llc cannot mix cohorts. Existing matching versions are idempotent; existing different bytes
 are refused rather than overwritten. The previous selection remains usable if
-validation or installation fails. Python 3 and network access are requirements
-of this explicit installer, not of compiled programs.
+validation or installation fails. Network access is needed for downloads; offline
+archives require none. HTTP proxies are not supported; use `--archive` with a
+file downloaded by other means when a proxy is needed.
 
 ## Phase 3: target-specific resolution and code generation
 
@@ -137,7 +130,7 @@ the requested gates, report it before expanding the compiler API.
 The catalog also pins the per-platform manifest hash. Full file-content checks
 run before install/activation and on every explicit `abla-install-xtensa
 --verify` call, even when sizes and mtimes have not changed. Verification is
-streaming in Python and uses its standard library only. It never trusts an
+streaming in the native implementation. It never trusts an
 unchanged size/mtime as a substitute for the manifest's content hashes. The
 same-size/same-mtime DSO mutation regression must fail this check; changing the
 manifest to match the damaged DSO must fail its catalog-pinned manifest hash.
@@ -164,7 +157,7 @@ Do not silently change the source pin to include that independent fix.
    normal CI or Abla releases.
 2. Phase 2: explicit network/offline install, checksum/tamper/traversal controls,
    relocation, idempotence and atomic selection; original toolchain files
-   unchanged. The install command is documented with its Python requirement.
+   unchanged. The native install command and offline path are documented.
 3. Phase 3: a toolchain with stock parent LLVM and Clang, no patched tools on
    PATH, emits the existing fixtures through the installed companion. Compare
    objects byte-for-byte with the Nix cohort using the same resolved target

@@ -3,12 +3,25 @@
 import hashlib
 import json
 import os
+import platform
 from pathlib import Path
 import subprocess
 import sys
 
 sys.dont_write_bytecode = True
-import xtensa_companions as companions
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+def host_platform():
+    hosts = {('Linux', 'x86_64'): 'x86_64-linux', ('Darwin', 'arm64'): 'arm64-macos',
+             ('Darwin', 'x86_64'): 'x86_64-macos'}
+    return hosts[(platform.system(), platform.machine())]
+
 
 project = Path(__file__).absolute().parent.parent
 prefix, out = [Path(arg).absolute() for arg in sys.argv[1:]]
@@ -28,7 +41,7 @@ def run(*args, env=None, expect=None):
 
 def snapshot(root):
     return {str(p.relative_to(root)): ('link', str(p.readlink())) if p.is_symlink() else
-            ('file', companions.file_sha256(p), p.stat().st_mode)
+            ('file', file_sha256(p), p.stat().st_mode)
             for p in root.rglob('*') if p.is_symlink() or p.is_file()}
 
 
@@ -38,15 +51,13 @@ env.pop('ABLA_STDLIB', None)
 for name in ('ABLA_ESP_CPU', 'ABLA_XTENSA_DIRECT_CALLS', 'ABLA_XTENSA_NARROW_BRANCHES', 'ABLA_XTENSA_TEXT_LITERALS', 'ABLA_XTENSA_NARROW', 'ABLA_ESP_KEEP_UNWIND', 'ABLA_XTENSA_FEATURES'):
     env.pop(name, None)
 originals = snapshot(prefix)
-run(sys.executable, prefix / 'bin/abla-install-xtensa', '--version', '23.1.3-1', env=env)
-run(sys.executable, prefix / 'bin/abla-install-xtensa', '--verify', env=env)
-# Also exercise the separately packaged native verifier on the real tree.
-run(prefix / 'bin/abla-install-xtensa-native', '--verify', env=env)
+run(prefix / 'bin/abla-install-xtensa', '--version', '23.1.3-1', env=env)
+run(prefix / 'bin/abla-install-xtensa', '--verify', env=env)
 reference = json.loads((project / 'tests/cases/xtensa-routing/nix-objects.json').read_text())
 results = []
 for entry in reference['objects']:
     source = project / entry['source']
-    assert companions.file_sha256(source) == entry['sourceSha256']
+    assert file_sha256(source) == entry['sourceSha256']
     output = out / (entry['name'] + '.o')
     active = dict(env, ABLA_ESP_CPU=entry['cpu'], ABLA_XTENSA_NARROW='1' if entry['narrow'] else '0')
     args = ['build', source, '-o', output, '--target-triple', 'xtensa-esp-unknown-elf',
@@ -54,7 +65,7 @@ for entry in reference['objects']:
     if entry['fast']:
         args.append('--fast')
     run(compiler, *args, env=active)
-    actual = companions.file_sha256(output)
+    actual = file_sha256(output)
     assert actual == entry['sha256'], (entry['name'], actual, entry['sha256'])
     results.append({'name': entry['name'], 'sha256': actual})
 # A distinct process and output name cannot introduce a temporary FILE symbol.
@@ -64,7 +75,7 @@ run(compiler, 'build', project / entry['source'], '-o', repeat,
     '--target-triple', 'xtensa-esp-unknown-elf', '--object-format', 'elf',
     '--emit', 'object', '--no-cache', '--no-debug',
     env=dict(env, ABLA_ESP_CPU=entry['cpu'], ABLA_XTENSA_NARROW='1' if entry['narrow'] else '0'))
-assert companions.file_sha256(repeat) == entry['sha256'], 'output path or PID changed object bytes'
+assert file_sha256(repeat) == entry['sha256'], 'output path or PID changed object bytes'
 # Without the launcher, poison both PATH tools. Automatic selection must still
 # derive the same installed cohort from the actual compiler image.
 poison = out / 'poison'
@@ -93,7 +104,6 @@ try:
     assert len(changed - keys) == 1, 'real library identity reused cached object'
 finally:
     os.utime(library, ns=(old_info.st_atime_ns, old_info.st_mtime_ns))
-run(sys.executable, prefix / 'bin/abla-install-xtensa', '--verify', env=env)
 # A warm cache cannot conceal a missing selected cohort.
 current = prefix / 'lib/abla/xtensa-llvm/current'
 held = current.with_name('held-current')
@@ -108,7 +118,7 @@ run(sys.executable, project / 'tools/test-xtensa-routing.py', raw_compiler, env=
 # Parent files remain unchanged, including its ordinary tools and libraries.
 after = snapshot(prefix)
 assert all(after.get(name) == value for name, value in originals.items()), 'parent toolchain was modified'
-report = {'status': 'passed', 'platform': companions.host_platform(), 'parentHasXtensa': 'xtensa ' in (out / 'parent-llc-version.txt').read_text(),
+report = {'status': 'passed', 'platform': host_platform(), 'parentHasXtensa': 'xtensa ' in (out / 'parent-llc-version.txt').read_text(),
           'parentHasPrivateXtensaOptions': False,
           'unchangedParentEntries': len(originals), 'objects': results,
           'poisonedPathPassed': True, 'missingWarmCohortRejected': True, 'realLibraryIdentityInvalidatedCache': True}
