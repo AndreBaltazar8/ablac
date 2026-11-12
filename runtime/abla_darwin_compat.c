@@ -1,5 +1,9 @@
 #define _DARWIN_C_SOURCE
 
+// On macOS the cases marked "#if TARGET_OS_IOS" below are served by the Abla
+// dispatcher over BSD system calls (__ablaRuntimeDarwinSyscall in
+// stdlib/abla/runtime/platform/host.ab); they stay here for iOS (#811).
+
 // Abla exposes one stable Linux-style syscall surface to its portable hosted
 // standard library. Darwin does not share Linux syscall numbers, socket
 // layouts, or epoll, so Mach-O programs link this deliberately small adapter.
@@ -848,10 +852,12 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
                               (size_t)argument2);
     break;
   }
+#if TARGET_OS_IOS
   case 1:
     result = write((int)argument0, (const void *)(uintptr_t)argument1,
                    (size_t)argument2);
     break;
+#endif
   case 3:
     result = darwin_close((int)argument0);
     break;
@@ -872,9 +878,11 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     result = darwin_poll((struct pollfd *)(uintptr_t)argument0, (nfds_t)argument1,
                   (int)argument2);
     break;
+#if TARGET_OS_IOS
   case 8:
     result = lseek((int)argument0, (off_t)argument1, (int)argument2);
     break;
+#endif
   case 14:
     result = darwin_sigprocmask(argument0, (const void *)(uintptr_t)argument1,
                                 (void *)(uintptr_t)argument2, argument3);
@@ -890,16 +898,20 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
   case 21:
     result = access((const char *)(uintptr_t)argument0, (int)argument1);
     break;
+#if TARGET_OS_IOS
   case 33:
     result = dup2((int)argument0, (int)argument1);
     break;
+#endif
   case 35:
     result = nanosleep((const struct timespec *)(uintptr_t)argument0,
                        (struct timespec *)(uintptr_t)argument1);
     break;
+#if TARGET_OS_IOS
   case 39:
     result = getpid();
     break;
+#endif
   case 41: {
     const int descriptor =
         socket(darwin_socket_domain(argument0), darwin_socket_type(argument1),
@@ -1040,9 +1052,11 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
 #endif
     break;
   }
+#if TARGET_OS_IOS
   case 60:
   case 231:
     _exit((int)argument0);
+#endif
   case 61:
 #if TARGET_OS_IOS
     errno = ENOTSUP;
@@ -1070,18 +1084,22 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
   case 73:
     result = flock((int)argument0, (int)argument1);
     break;
+#if TARGET_OS_IOS
   case 74:
     result = fsync((int)argument0);
     break;
+#endif
   case 79: {
     char *output = (char *)(uintptr_t)argument0;
     if (getcwd(output, (size_t)argument1) != NULL)
       result = (long)strlen(output) + 1;
     break;
   }
+#if TARGET_OS_IOS
   case 80:
     result = chdir((const char *)(uintptr_t)argument0);
     break;
+#endif
   case 82:
     result = rename((const char *)(uintptr_t)argument0,
                     (const char *)(uintptr_t)argument1);
@@ -1130,9 +1148,11 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
   case 91:
     result = fchmod((int)argument0, (mode_t)argument1);
     break;
+#if TARGET_OS_IOS
   case 95:
     result = umask((mode_t)argument0);
     break;
+#endif
   case 109:
     result = setpgid((pid_t)argument0, (pid_t)argument1);
     break;

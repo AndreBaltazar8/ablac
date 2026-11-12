@@ -947,6 +947,50 @@ fun bootstrapLlvmInlineLinuxSyscall(
     )
 }
 
+// A macOS (not iOS) program issues BSD system calls with the instruction itself
+// (#811): arm64 `svc #0x80` with the number in x16, x86-64 `syscall` with the
+// number in rax or'ed with the 0x2000000 BSD class here. The kernel signals
+// failure with the carry flag and a positive errno in the result register; this
+// returns -errno then, like the Linux form. The second result register (x1, rdx:
+// fork's child flag, pipe's second descriptor) is declared as an output so the
+// compiler knows it changes; only the first is used.
+fun bootstrapLlvmDarwinSyscallTarget(backend: BootstrapLlvmBackend): bool =
+    backend.macOS && bootstrapTextContains(backend.targetTriple, "macosx") &&
+    (bootstrapTextContains(backend.targetTriple, "arm64") ||
+     bootstrapTextContains(backend.targetTriple, "aarch64") ||
+     bootstrapTextContains(backend.targetTriple, "x86_64"))
+
+// `values` are the BSD system call number and its six arguments, all i64.
+fun bootstrapLlvmInlineDarwinSyscall(
+    backend: BootstrapLlvmBackend,
+    values: array<i64*>,
+    name: string
+): i64* {
+    val types: array<i64*> = []
+    while (types.size < 7) types.append(backend.i64Type)
+    val elements = bootstrapLlvmPointerArguments(backend, [backend.i64Type, backend.i64Type])
+    val pair = LLVMStructTypeInContext(backend.context, elements, i32(2), i32(0))
+    bootstrapLlvmDropPointerArguments(backend, elements)
+    val type = bootstrapLlvmFunctionType(backend, pair, types)
+    val arm = !bootstrapTextContains(backend.targetTriple, "x86_64")
+    val assembly = if (arm) "svc #0x80\n\tb.cc 1f\n\tneg x0, x0\n1:"
+        else "syscall\n\tjnc 1f\n\tnegq %rax\n1:"
+    val constraints = if (arm)
+        "={x0},={x1},{x16},{x0},{x1},{x2},{x3},{x4},{x5},~{memory},~{cc}"
+        else "={ax},={dx},{ax},{di},{si},{dx},{r10},{r8},{r9},~{rcx},~{r11},~{memory},~{dirflag},~{fpsr},~{flags}"
+    val arguments: array<i64*> = []
+    for (value in values) arguments.append(value)
+    if (!arm) arguments[0] = LLVMBuildOr(
+        backend.builder, values[0], LLVMConstInt(backend.i64Type, 33554432, 0), "$name.class"
+    )
+    val pairValue = bootstrapLlvmCallTyped(
+        backend, type,
+        LLVMGetInlineAsm(type, assembly, assembly.size, constraints, constraints.size, 1, 0, 0, 0),
+        arguments, name
+    )
+    LLVMBuildExtractValue(backend.builder, pairValue, i32(0), "$name.result")
+}
+
 fun bootstrapLlvmLinuxX64Syscall(
     backend: BootstrapLlvmBackend,
     number: int,
