@@ -312,7 +312,10 @@ The rules:
   Several are dropped newest first. A `return`, `break` or `continue` in the middle of the statement drops the ones
   made so far. The same holds in the compile-time evaluator, in a global's initializer and in the body of a
   lambda, a `defer` and a generator. A resource something takes (a constructor or `own` argument, a `move`) is not
-  one. Not covered, and still leaking as before (the resource's `drop` never runs, so a password or key it wipes is not wiped):
+  one. A temporary in a default argument evaluated in a function or method's prologue is dropped when that callee
+  returns, after its locals, newest first. A default evaluated at the caller (a constructor or named call) holds its
+  temporaries until the end of the calling statement. When name shadowing requires a generated helper to evaluate a
+  default, its temporaries instead follow the helper's lifetime. Not covered, and still leaking as before (the resource's `drop` never runs, so a password or key it wipes is not wiped):
   a temporary that is the receiver or an argument of an extension function (`fun Res.check()` called as
   `make().check()`), of a call through an interface (dispatch) or an interface's default body, or of a built-in
   container's method (`array.append(make())` hands it on, which is fine; `list.contains(make())` does not).

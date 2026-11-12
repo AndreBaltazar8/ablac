@@ -243,6 +243,11 @@
   draws the Generator shapes by default again (ablac-f3-2 saw the same class as the `test-labeled-loops` segfault of
   #736's first gate).
 
+- **Default-argument temporary owners (#790).** Temporary owners created while evaluating omitted defaults are now
+  dropped: after callee locals for function and method prologue defaults, or at the caller's statement boundary for
+  constructor and named defaults. Their destructors previously leaked or ran before a named call. This changes
+  observable drop effects. Resource borrows cannot escape as returned values, stored values, or generator/task
+  captures; a retained managed field remains valid and observes its owner's drop effects.
 - **Temporary affine-field projection audit (#788).** On master 83d65574, with a temporary
   `Holder(Item(1)).item` whose holder and item have `drop()` methods:
 
