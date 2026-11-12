@@ -85,10 +85,18 @@ cmp "$out/concurrent-expected.txt" "$out/concurrent-actual.txt"
 [[ -z $(find "$out/concurrent" -name '.install-*' -print) ]]
 # Linux-only syscall fault injection validates rollback at several stages.
 if [[ $(uname -s) == Linux ]] && command -v strace >/dev/null; then
+    # Invalid manifest data must be rejected before a payload stage exists.
+    strace -qq -e trace=mkdirat -o "$out/prevalidate.trace" \
+        "$out/test" "$out/fixtures/manifesthash.json" "$out/fault" "$out/fixtures" \
+        manifesthash.tar.gz manifest_hash
+    if grep -q '\.install-' "$out/prevalidate.trace"; then
+        echo 'payload stage created before archive validation' >&2; exit 1
+    fi
+    [[ -z $(ls -A "$out/fault") ]]
     # Observe actual chmod/rename order on the staging directory. The old
     # order (0555 before rename) fails this check even on permissive Linux.
     mkdir "$out/order"
-    strace -qq -yy -e trace=fchmod,renameat2,fsync -o "$out/order.trace" \
+    strace -qq -yy -e trace=fchmod,renameat2,fsync,write,openat -o "$out/order.trace" \
         "$out/test" "$out/fixtures/good.json" "$out/order" "$out/fixtures" good.tar.gz '' new
     python3 - "$out/order.trace" <<'PY'
 import re, sys
@@ -117,16 +125,80 @@ PY
     chmod -R u+w "$out/final-mode-fault/23.1.3-1"
     rm -rf "$out/final-mode-fault/23.1.3-1"
     run good "$out/final-mode-fault" '' new
-    for item in write:stage_write fsync:stage_write fchmod:stage_open renameat2:publish; do
+    for item in write:spool_write fsync:spool_write fchmod:spool_open renameat2:publish; do
         call=${item%:*}; expected=${item#*:}
         strace -qq -e "inject=$call:error=EIO:when=1" -o "$out/$call.trace" "$out/test" "$out/fixtures/good.json" "$out/fault" "$out/fixtures" good.tar.gz "$expected"
         [[ -z $(ls -A "$out/fault") ]]
     done
+    for call in mkdirat write fsync fchmod renameat2; do
+        strace -qq -e "inject=$call:error=ENOSPC:when=1" -o "$out/full-$call.trace" \
+            "$out/test" "$out/fixtures/good.json" "$out/fault" "$out/fixtures" good.tar.gz disk_full
+        [[ -z $(ls -A "$out/fault") ]]
+    done
+    for call in write fsync; do
+        ordinal=$(python3 - "$out/order.trace" "$call" <<'PY'
+import sys
+count = 0
+for line in open(sys.argv[1]):
+    if line.startswith(sys.argv[2] + '('):
+        count += 1
+        if '/.install-' in line:
+            print(count)
+            break
+else:
+    raise SystemExit('missing payload ' + sys.argv[2])
+PY
+        )
+        strace -qq -e "inject=$call:error=EIO:when=$ordinal" -o "$out/stage-$call.trace" \
+            "$out/test" "$out/fixtures/good.json" "$out/fault" "$out/fixtures" good.tar.gz stage_write
+        [[ -z $(ls -A "$out/fault") ]]
+    done
+    stage_write=$(python3 - "$out/order.trace" <<'PY'
+import sys
+count = 0
+for line in open(sys.argv[1]):
+    if line.startswith('write('):
+        count += 1
+        if '/.install-' in line:
+            print(count); break
+else: raise SystemExit('missing stage write')
+PY
+    )
+    strace -qq -e "inject=write:error=ENOSPC:when=$stage_write" -o "$out/full-stage-write.trace" \
+        "$out/test" "$out/fixtures/good.json" "$out/fault" "$out/fixtures" good.tar.gz disk_full
+    [[ -z $(ls -A "$out/fault") ]]
+    strace -qq -e "inject=write:error=EIO:when=$stage_write" -e inject=unlinkat:error=EIO:when=1+ \
+        -o "$out/stage-cleanup.trace" "$out/test" "$out/fixtures/good.json" "$out/fault" \
+        "$out/fixtures" good.tar.gz cleanup stage-cleanup
+    chmod -R u+w "$out/fault"; rm -rf "$out/fault"; mkdir "$out/fault"
+    spool_open=$(python3 - "$out/order.trace" <<'PY'
+import sys
+count = 0
+for line in open(sys.argv[1]):
+    if line.startswith('openat('):
+        count += 1
+        if '".spool-' in line:
+            print(count); break
+else: raise SystemExit('missing spool open')
+PY
+    )
+    strace -qq -e "inject=openat:error=EIO:when=$spool_open" -e inject=unlinkat:error=EIO:when=1 \
+        -o "$out/spool-open-cleanup.trace" "$out/test" "$out/fixtures/good.json" "$out/fault" \
+        "$out/fixtures" good.tar.gz cleanup spool-open-cleanup
+    chmod -R u+w "$out/fault"; rm -rf "$out/fault"; mkdir "$out/fault"
     # If the OS itself refuses rollback, return the leftover stage name rather
     # than claiming cleanup succeeded.
     strace -qq -e inject=write:error=EIO:when=1 -e inject=unlinkat:error=EIO:when=1 \
         -o "$out/cleanup.trace" "$out/test" "$out/fixtures/good.json" "$out/fault" "$out/fixtures" good.tar.gz cleanup
     [[ -n $(ls -A "$out/fault") ]]
+    chmod -R u+w "$out/fault"; rm -rf "$out/fault"; mkdir "$out/fault"
+    # Both the stage and spool removals fail; both names and the original
+    # rename error must survive in the result.
+    strace -qq -e inject=renameat2:error=EIO:when=1 -e inject=unlinkat:error=EIO:when=1+ \
+        -o "$out/both-cleanup.trace" "$out/test" "$out/fixtures/good.json" "$out/fault" \
+        "$out/fixtures" good.tar.gz cleanup both-cleanup
+    [[ -n $(find "$out/fault" -maxdepth 1 -name '.install-*' -print) ]]
+    [[ -n $(find "$out/fault" -maxdepth 1 -name '.spool-*' -print) ]]
     chmod -R u+w "$out/fault"; rm -rf "$out/fault"; mkdir "$out/fault"
     strace -qq -e inject=renameat2:error=EIO:when=1 -e inject=unlinkat:error=EIO:when=1 \
         -o "$out/publish-cleanup.trace" "$out/test" "$out/fixtures/good.json" "$out/fault" "$out/fixtures" good.tar.gz cleanup
@@ -134,6 +206,13 @@ PY
     chmod -R u+w "$out/fault"; rm -rf "$out/fault"; mkdir "$out/fault"
 else
     echo 'offline installer: syscall fault injection unavailable; skipped'
+fi
+# Optional size regression: stored gzip data exceeds the previous 128 MiB cap.
+if [[ ${ABLA_TEST_XTENSA_LARGE:-0} == 1 ]]; then
+    mkdir "$out/large"
+    python3 tests/cases/xtensa-companion-offline/make-large.py "$out/fixtures"
+    run large "$out/large" '' new
+    echo 'offline installer: compressed input above 128 MiB accepted'
 fi
 # The cached real release is optional; the suite never downloads it.
 if [[ -n ${ABLA_TEST_XTENSA_COMPANION:-} && -f $ABLA_TEST_XTENSA_COMPANION ]]; then

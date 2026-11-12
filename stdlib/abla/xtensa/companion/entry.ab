@@ -1,5 +1,6 @@
 // The offline companion installer validates pinned archive bytes before any write.
 import "abla/archive/tar"
+import "abla/bytes"
 import "abla/compression/gzip"
 import "abla/crypto"
 import "abla/fs/secure"
@@ -117,10 +118,16 @@ private fun companionWalk(
             if (opened.descriptor < 0) return "file_open"
             if (relative == "manifest.json") continue
             if (!files.has(relative) || !files.get(relative).isString()) return "file_set"
-            val read = opened.read(268435456 - state.bytes)
-            if (read.error != "") return "file_${read.error}"
-            state.bytes += read.data.size
-            if (hexEncode(sha256(read.data)) != files.getString(relative)) return "file_hash"
+            val hash = sha256Stream()
+            while (true) {
+                val read = opened.readChunk(65536)
+                if (read.error != "") return "file_${read.error}"
+                if (read.data.size > 1073741824 - state.bytes) return "file_limit"
+                state.bytes += read.data.size
+                hash.update(read.data)
+                if (read.eof) break
+            }
+            if (hexEncode(hash.finish()) != files.getString(relative)) return "file_hash"
             val permissions = opened.permissions()
             if (permissions < 0 || ((relative == "bin/opt" || relative == "bin/llc") &&
                 (permissions & 0o111) == 0)) return "file_mode"
@@ -182,7 +189,8 @@ fun verifyCompanion(directory: SecureDirectory, pins: CompanionPins): CompanionV
 }
 
 class CompanionExtractResult(val error: string, val existing: bool, val leftoverStage: string = "",
-    val operation: string = "", val errorNumber: int = 0)
+    val operation: string = "", val errorNumber: int = 0, val leftoverSpool: string = "",
+    val cause: string = "")
 private class CompanionStage(val files: array<string>, val dirs: array<string>)
 
 private fun companionDigits(value: string): bool {
@@ -246,6 +254,16 @@ private fun companionStageMode(parent: SecureDirectory, parts: array<string>, in
     if (index + 1 == parts.size) return child.setPermissions(mode)
     companionStageMode(child, parts, index + 1, mode)
 }
+private fun companionStageModeChecked(parent: SecureDirectory, parts: array<string>, index: int,
+    mode: int): string {
+    val child = parent.openDirectory(parts[index])
+    if (child.descriptor < 0) return "stage_mode"
+    if (index + 1 == parts.size) {
+        val status = child.setPermissionsChecked(mode)
+        return if (status == "disk_full") "disk_full" else if (status != "") "stage_mode" else ""
+    }
+    companionStageModeChecked(child, parts, index + 1, mode)
+}
 private fun companionStageRemove(
     parent: SecureDirectory, parts: array<string>, index: int, directory: bool
 ): bool {
@@ -284,7 +302,7 @@ fun extractCompanion(parent: SecureDirectory, archiveFile: SecureFile,
 
 // `check` runs after verification, while a new private stage is unpublished;
 // existing winners are also checked before they are returned.
-fun extractCompanionChecked(parent: SecureDirectory, archiveFile: SecureFile,
+private fun companionExtractFromSpool(parent: SecureDirectory, archiveFile: SecureFile,
     pins: CompanionPins, check: (string) -> string): CompanionExtractResult {
     if (parent.descriptor < 0 || !companionPinsValid(pins)) return CompanionExtractResult("invalid",
         false)
@@ -303,15 +321,14 @@ fun extractCompanionChecked(parent: SecureDirectory, archiveFile: SecureFile,
     if (currentKind != "missing") return CompanionExtractResult("existing_type", false)
     if (archiveFile.descriptor < 0 ||
         !archiveFile.isRegular()) return CompanionExtractResult("archive_open", false)
-    val compressed = archiveFile.read(134217728)
-    if (compressed.error != "") return CompanionExtractResult("archive_${compressed.error}", false)
-    val verified = companionValidateArchive(compressed.data, pins)
+    val verified = companionStreamValidate(archiveFile, pins)
     if (verified.error != "") return CompanionExtractResult(verified.error, false)
     val random = secureRandomBytes(16)
     if (!random.succeeded) return CompanionExtractResult("random", false)
     val stageName = ".install-${pins.version}-${hexEncode(random.bytes)}"
-    if (!parent.createDirectory(stageName, 0o700)) return CompanionExtractResult("stage_create",
-        false)
+    val stageMade = parent.createDirectoryStatus(stageName, 0o700)
+    if (stageMade == -28 || stageMade == -122) return CompanionExtractResult("disk_full", false)
+    if (stageMade != 0) return CompanionExtractResult("stage_create", false)
     val stage = CompanionStage([], [])
     val root = parent.openDirectory(stageName)
     if (root.descriptor < 0) {
@@ -320,21 +337,9 @@ fun extractCompanionChecked(parent: SecureDirectory, archiveFile: SecureFile,
         return CompanionExtractResult("stage_open", false)
     }
     var error = ""
-    if (!root.setPermissions(0o700)) error = "stage_open"
-    val archiveRoot = "abla-xtensa-llvm-${pins.version}-${pins.platform}"
-    if (error == "") {
-        for (entry in verified.archive.entries) {
-            if (entry.path != archiveRoot) {
-                val name = entry.path.slice(archiveRoot.size + 1, entry.path.size)
-                val contents = if (entry.kind == "file") verified.archive.input.slice(entry.offset,
-                    entry.offset + entry.size) else ""
-                if (!companionStageEntry(root, name.split("/"), 0, "", entry, contents, stage)) {
-                    error = "stage_write"
-                    break
-                }
-            }
-        }
-    }
+    val rootMode = root.setPermissionsChecked(0o700)
+    if (rootMode != "") error = if (rootMode == "disk_full") "disk_full" else "stage_open"
+    if (error == "") error = companionStreamStage(archiveFile, root, pins, verified, stage)
     if (error == "") {
         val checkRoot = parent.openDirectory(stageName)
         val checked = companionVerifyTree(checkRoot, pins)
@@ -348,31 +353,40 @@ fun extractCompanionChecked(parent: SecureDirectory, archiveFile: SecureFile,
         var i = stage.dirs.size
         while (i > 0) {
             i -= 1
-            if (!companionStageMode(root, stage.dirs[i].split("/"), 0,
-                0o555)) { error = "stage_mode"; break }
+            error = companionStageModeChecked(root, stage.dirs[i].split("/"), 0, 0o555)
+            if (error != "") break
         }
-        if (error == "" && !root.sync()) error = "stage_mode"
+        if (error == "") {
+            val synced = root.syncChecked()
+            if (synced != "") error = if (synced == "disk_full") "disk_full" else "stage_mode"
+        }
     }
     if (error != "") {
         root.close()
         if (!companionStageCleanup(parent, stageName,
-            stage)) return CompanionExtractResult("cleanup", false, stageName)
+            stage)) return CompanionExtractResult("cleanup", false, stageName, "", 0, "", error)
         return CompanionExtractResult(error, false)
     }
     val published = parent.renameNoReplace(stageName, parent, pins.version)
     if (published == 0) {
-        if (!root.setPermissions(0o555)) {
+        val finalMode = root.setPermissionsChecked(0o555)
+        if (finalMode != "") {
             root.close()
-            return CompanionExtractResult("publication_in_progress: directory ${pins.version}; ensure no installer is running, remove this directory, and rerun",
+            val details = if (finalMode == "disk_full") "; disk_full" else ""
+            return CompanionExtractResult("publication_in_progress: directory ${pins.version}; ensure no installer is running, remove this directory, and rerun$details",
                 false)
         }
         if (!root.close()) return CompanionExtractResult("publish_close", false)
-        if (!parent.sync()) return CompanionExtractResult("publish_sync", false)
+        val synced = parent.syncChecked()
+        if (synced != "") return CompanionExtractResult(if (synced ==
+            "disk_full") "disk_full" else "publish_sync", false)
         return CompanionExtractResult("", false)
     }
     root.close()
     if (!companionStageCleanup(parent, stageName, stage)) return CompanionExtractResult("cleanup",
-        false, stageName, "rename_no_replace", -published)
+        false, stageName, "rename_no_replace", -published, "",
+        if (published == -28 || published == -122) "disk_full" else "publish")
+    if (published == -28 || published == -122) return CompanionExtractResult("disk_full", false)
     if (published != -17) return CompanionExtractResult("publish", false, "",
         "rename_no_replace", -published)
     val winner = parent.openDirectory(pins.version)
@@ -384,4 +398,291 @@ fun extractCompanionChecked(parent: SecureDirectory, archiveFile: SecureFile,
     val helperError = check(pins.version)
     if (helperError != "") return CompanionExtractResult("helper: $helperError", false)
     CompanionExtractResult("", true)
+}
+
+// The caller must own a private spool inaccessible to other writers. This
+// avoids copying a download that has already been written to such a spool.
+fun extractSpooledCompanionChecked(parent: SecureDirectory, archiveFile: SecureFile,
+    pins: CompanionPins, check: (string) -> string): CompanionExtractResult =
+    companionExtractFromSpool(parent, archiveFile, pins, check)
+
+// Each adapter owns a close-on-exec duplicate of the caller's archive handle.
+// Duplicates share the offset, so the caller must not seek or read concurrently.
+private resource class CompanionGzipSource(val file: SecureFile,
+    val hash: Sha256Stream): GzipSource {
+    fun readChunk(maxBytes: int): GzipInputChunk {
+        val chunk = this.file.readChunk(maxBytes)
+        if (chunk.error != "") return GzipInputChunk("", false, chunk.error)
+        this.hash.update(chunk.data)
+        GzipInputChunk(chunk.data, chunk.eof)
+    }
+}
+private resource class CompanionTarSource(val input: CompanionGzipSource,
+    val gzip: GzipStream): TarSource {
+    fun readChunk(maxBytes: int): TarInputChunk {
+        val part = this.gzip.read(this.input, maxBytes)
+        TarInputChunk(part.data, part.done, if (part.error == "") "" else "gzip_${part.error}")
+    }
+}
+private class CompanionStreamEntry(val entry: TarEntry, val hash: string)
+private class CompanionStreamResult(val entries: array<CompanionStreamEntry>, val manifest: Json,
+    val error: string)
+private fun companionStreamError(error: string): CompanionStreamResult =
+    CompanionStreamResult([], jsonNull(), error)
+
+// Hash the entire compressed input before invoking gzip, without trusting a
+// length field or retaining the input. The caller retains and owns the handle.
+private fun companionArchiveHash(file: SecureFile, maximum: int): string {
+    if (!file.rewind()) return "archive_read"
+    val hash = sha256Stream()
+    var total = 0
+    while (true) {
+        val part = file.readChunk(65536)
+        if (part.error != "") return "archive_read"
+        if (part.data.size > maximum - total) return "archive_limit"
+        total += part.data.size
+        hash.update(part.data)
+        if (part.eof) break
+    }
+    hexEncode(hash.finish())
+}
+
+private fun companionStreamValidate(file: SecureFile, pins: CompanionPins): CompanionStreamResult {
+    if (!companionPinsValid(pins)) return companionStreamError("pins")
+    if (file.descriptor < 0 || !file.isRegular()) return companionStreamError("archive_open")
+    val inputHash = companionArchiveHash(file, 536870912)
+    if (inputHash == "archive_read" || inputHash ==
+        "archive_limit") return companionStreamError(inputHash)
+    if (inputHash != pins.archiveSha256) return companionStreamError("archive_hash")
+    if (!file.rewind()) return companionStreamError("archive_read")
+    val duplicate = file.duplicate()
+    if (duplicate.descriptor < 0) return companionStreamError("archive_read")
+    val input = CompanionGzipSource(move(duplicate), sha256Stream())
+    val gzip = gzipStream(input, 536870912, 1073741824)
+    val source = CompanionTarSource(move(input), move(gzip))
+    val tar = tarStream(TarLimits(1073741824, 1024, 1073741824, 1073741824))
+    val entries: array<CompanionStreamEntry> = []
+    val root = "abla-xtensa-llvm-${pins.version}-${pins.platform}"
+    var manifestRaw = ""
+    var foundManifest = false
+    while (true) {
+        val next = tar.next(source)
+        if (next.error != "") return companionStreamError(if (next.error.startsWith("gzip_"))
+            next.error else "tar_${next.error}")
+        if (next.done) break
+        val entry = next.entry
+        if (!companionRawPathValid(entry.rawPath) ||
+            (entry.path != root &&
+                !entry.path.startsWith("$root/"))) return companionStreamError("archive_path")
+        if (entry.path == root && entry.kind !=
+            "directory") return companionStreamError("archive_root")
+        val isManifest = entry.path == "$root/manifest.json" && entry.kind == "file"
+        if (isManifest && (entry.size <= 0 || entry.size >
+            65536)) return companionStreamError("manifest_limit")
+        val hash = sha256Stream()
+        val manifestData = byteBuffer()
+        while (true) {
+            val part = tar.readData(source, 65536)
+            if (part.error != "") return companionStreamError(if (part.error.startsWith("gzip_"))
+                part.error else "tar_${part.error}")
+            hash.update(part.data)
+            if (isManifest) manifestData.appendText(part.data)
+            if (part.done) break
+        }
+        if (isManifest) { manifestRaw = manifestData.toText(); foundManifest = true }
+        entries.append(CompanionStreamEntry(entry, hexEncode(hash.finish())))
+    }
+    if (hexEncode(source.input.hash.finish()) !=
+        pins.archiveSha256) return companionStreamError("archive_hash")
+    if (!foundManifest) return companionStreamError("manifest_missing")
+    if (hexEncode(sha256(manifestRaw)) !=
+        pins.manifestSha256) return companionStreamError("manifest_hash")
+    val parsed = jsonParse(manifestRaw, JsonLimits(65536, 32, 10000, 65536, 2048, true))
+    if (!parsed.succeeded || !parsed.value.isObject()) return companionStreamError("manifest_json")
+    val manifest = parsed.value
+    if (manifest.getInt("schema") != 1 || manifest.getString("version") !=
+        "abla-xtensa-llvm-${pins.version}" || manifest.getString("platform") != pins.platform ||
+        manifest.getString("llvmVersion") != pins.llvmVersion ||
+        manifest.getString("sourceCommit") != pins.sourceCommit ||
+        manifest.getString("sourceArchiveSha256") != pins.sourceArchiveSha256)
+        return companionStreamError("manifest_identity")
+    val files = manifest.get("files")
+    if (!files.isObject() || !files.has("bin/opt") ||
+        !files.has("bin/llc")) return companionStreamError("manifest_files")
+    var library = false
+    for (key in files.keys) if (key.startsWith("lib/libLLVM")) library = true
+    if (!library) return companionStreamError("manifest_files")
+    var count = 0
+    for (item in entries) {
+        val entry = item.entry
+        if (entry.kind == "file" && entry.path != "$root/manifest.json") {
+            val name = entry.path.slice(root.size + 1, entry.path.size)
+            if (!files.has(name) ||
+                !files.get(name).isString()) return companionStreamError("file_set")
+            if (files.getString(name).size != 64 || item.hash != files.getString(name))
+                return companionStreamError("file_hash")
+            if ((name == "bin/opt" || name == "bin/llc") && (entry.mode & 0o111) == 0)
+                return companionStreamError("file_mode")
+            count += 1
+        }
+    }
+    if (count != files.size()) return companionStreamError("file_set")
+    CompanionStreamResult(entries, manifest, "")
+}
+
+// Writes one previously validated entry into a private stage; every created
+// path is recorded before another operation so rollback can remove it.
+private fun companionStreamStageEntry(parent: SecureDirectory, parts: array<string>, index: int,
+    prefix: string, expected: CompanionStreamEntry, var tar: TarStream,
+    var source: CompanionTarSource, var stage: CompanionStage): string {
+    val name = parts[index]
+    val path = if (prefix == "") name else "$prefix/$name"
+    if (index + 1 < parts.size || expected.entry.kind == "directory") {
+        val made = parent.createDirectoryStatus(name, 0o700)
+        if (made == 0) stage.dirs.append(path)
+        else if (made == -28 || made == -122) return "disk_full"
+        else if (made != -17) return "stage_write"
+        val child = parent.openDirectory(name)
+        if (child.descriptor < 0) return "stage_write"
+        val mode = child.setPermissionsChecked(0o700)
+        if (mode != "") return if (mode == "disk_full") "disk_full" else "stage_write"
+        if (index + 1 < parts.size) return companionStreamStageEntry(child, parts, index + 1,
+            path, expected, tar, source, stage)
+        val empty = tar.readData(source, 65536)
+        if (empty.error !=
+            "") return if (empty.error.startsWith("gzip_")) empty.error else "tar_${empty.error}"
+        if (!empty.done || empty.data != "") return "tar_invalid"
+        return ""
+    }
+    val file = parent.createFile(name, 0o600)
+    if (file.descriptor == -28 || file.descriptor == -122) return "disk_full"
+    if (file.descriptor < 0) return "stage_write"
+    stage.files.append(path)
+    val hash = sha256Stream()
+    while (true) {
+        val part = tar.readData(source, 65536)
+        if (part.error !=
+            "") return if (part.error.startsWith("gzip_")) part.error else "tar_${part.error}"
+        hash.update(part.data)
+        val written = file.writeChecked(part.data)
+        if (written == "disk_full") return "disk_full"
+        if (written != "") return "stage_write"
+        if (part.done) break
+    }
+    if (hexEncode(hash.finish()) != expected.hash) return "file_hash"
+    val synced = file.syncChecked()
+    if (synced == "disk_full") return "disk_full"
+    if (synced != "") return "stage_write"
+    val mode = file.setPermissionsChecked(if ((expected.entry.mode & 0o111) != 0) 0o555 else 0o444)
+    if (mode != "") return if (mode == "disk_full") "disk_full" else "stage_write"
+    if (!file.close()) return "stage_write"
+    ""
+}
+
+private fun companionStreamStage(file: SecureFile, root: SecureDirectory, pins: CompanionPins,
+    verified: CompanionStreamResult, var stage: CompanionStage): string {
+    if (!file.rewind()) return "archive_read"
+    val duplicate = file.duplicate()
+    if (duplicate.descriptor < 0) return "archive_read"
+    val input = CompanionGzipSource(move(duplicate), sha256Stream())
+    val gzip = gzipStream(input, 536870912, 1073741824)
+    val source = CompanionTarSource(move(input), move(gzip))
+    val tar = tarStream(TarLimits(1073741824, 1024, 1073741824, 1073741824))
+    val archiveRoot = "abla-xtensa-llvm-${pins.version}-${pins.platform}"
+    var i = 0
+    while (true) {
+        val next = tar.next(source)
+        if (next.error !=
+            "") return if (next.error.startsWith("gzip_")) next.error else "tar_${next.error}"
+        if (next.done) break
+        if (i >= verified.entries.size) return "archive_changed"
+        val expected = verified.entries[i]
+        val entry = next.entry
+        if (entry.path != expected.entry.path || entry.rawPath != expected.entry.rawPath ||
+            entry.kind != expected.entry.kind || entry.size != expected.entry.size ||
+            entry.mode != expected.entry.mode) return "archive_changed"
+        if (entry.path == archiveRoot) {
+            val empty = tar.readData(source, 65536)
+            if (empty.error != "" || !empty.done || empty.data != "") return "archive_changed"
+        } else {
+            val relative = entry.path.slice(archiveRoot.size + 1, entry.path.size)
+            val error = companionStreamStageEntry(root, relative.split("/"), 0, "", expected,
+                tar, source, stage)
+            if (error != "") return error
+        }
+        i += 1
+    }
+    if (i != verified.entries.size || hexEncode(source.input.hash.finish()) != pins.archiveSha256)
+        return "archive_changed"
+    ""
+}
+
+// Copies an offline input into a private spool before either validation pass.
+// No payload file exists until the complete compressed and decoded archive,
+// manifest, and every file digest have been validated from that spool.
+fun extractCompanionChecked(parent: SecureDirectory, archiveFile: SecureFile,
+    pins: CompanionPins, check: (string) -> string): CompanionExtractResult {
+    if (parent.descriptor < 0 || !companionPinsValid(pins)) return CompanionExtractResult("invalid",
+        false)
+    if (parent.entryKind(pins.version) != "missing")
+        return companionExtractFromSpool(parent, archiveFile, pins, check)
+    if (archiveFile.descriptor < 0 ||
+        !archiveFile.isRegular()) return CompanionExtractResult("archive_open", false)
+    if (archiveFile.size() > 536870912) return CompanionExtractResult("archive_limit", false)
+    val random = secureRandomBytes(16)
+    if (!random.succeeded) return CompanionExtractResult("random", false)
+    val name = ".spool-${hexEncode(random.bytes)}"
+    val made = parent.createDirectoryStatus(name, 0o700)
+    if (made == -28 || made == -122) return CompanionExtractResult("disk_full", false)
+    if (made != 0) return CompanionExtractResult("spool_create", false)
+    val directory = parent.openDirectory(name)
+    if (directory.descriptor < 0) {
+        if (!parent.remove(name, true)) return CompanionExtractResult("cleanup", false, "", "", 0,
+            name, "spool_open")
+        return CompanionExtractResult("spool_open", false)
+    }
+    var error = ""
+    val spoolMode = directory.setPermissionsChecked(0o700)
+    if (spoolMode != "") error = if (spoolMode == "disk_full") "disk_full" else "spool_open"
+    else if (!archiveFile.rewind()) error = "archive_read"
+    val output = directory.createFile("archive", 0o600)
+    var created = output.descriptor >= 0
+    if (!created) {
+        if (output.descriptor == -28 || output.descriptor == -122) error = "disk_full"
+        else if (error == "") error = "spool_open"
+    }
+    var total = 0
+    while (error == "") {
+        val part = archiveFile.readChunk(65536)
+        if (part.error != "") { error = "archive_read"; break }
+        if (part.data.size > 536870912 - total) { error = "archive_limit"; break }
+        total += part.data.size
+        val written = output.writeChecked(part.data)
+        if (written != "") { error = if (written ==
+            "disk_full") "disk_full" else "spool_write"; break }
+        if (part.eof) break
+    }
+    if (error == "") {
+        val synced = output.syncChecked()
+        if (synced != "") error = if (synced == "disk_full") "disk_full" else "spool_write"
+    }
+    if (!output.close() && error == "") error = "spool_write"
+    var result = CompanionExtractResult(error, false)
+    if (error == "") {
+        val input = directory.openRegularFile("archive")
+        if (input.descriptor < 0) result = CompanionExtractResult("spool_open", false)
+        else {
+            result = companionExtractFromSpool(parent, input, pins, check)
+            if (!input.close() && result.error == "") result = CompanionExtractResult("spool_close",
+                false)
+        }
+    }
+    var clean = true
+    if (created && !directory.remove("archive")) clean = false
+    if (!directory.close()) clean = false
+    if (!parent.remove(name, true)) clean = false
+    if (!clean) return CompanionExtractResult("cleanup", false, result.leftoverStage,
+        result.operation, result.errorNumber, name,
+        if (result.cause != "") result.cause else result.error)
+    result
 }

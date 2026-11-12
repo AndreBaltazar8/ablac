@@ -27,4 +27,4 @@ def make(name, change=None):
  (p/(name+'.tar.gz')).write_bytes(archive); (p/(name+'.json')).write_text(json.dumps(cfg))
 for n in ['good','identity','extra','filehash','rawpath','mode','archivehash','manifesthash','many','gzipbad','tarbad','wrongroot']: make(n,None if n=='good' else n)
 
-with (p/'oversize.tar.gz').open('wb') as output: output.truncate(134217729)
+with (p/'oversize.tar.gz').open('wb') as output: output.truncate(536870913)
