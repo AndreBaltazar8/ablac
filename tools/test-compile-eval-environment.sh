@@ -5,6 +5,36 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
 out=build/compile-eval-environment
 mkdir -p "$out/project"
+fail() { echo "compile-eval-environment: $1" >&2; exit 1; }
+# check_environment_trace SHAPE STATE TIER: the input sidecar records the environment
+# variable, a warm build leaves it untouched, a changed value rewrites it, and the
+# JIT trace says native or interpreted for the table site as expected.
+check_environment_trace() {
+    local shape=$1 state=$2 tier=$3 sidecars pos native fallback expression_pos
+    local tag="$out/$shape-$state-$tier" first="$out/$shape-first-$tier.snap"
+    sidecars=$(find "$out/cache-$tier" -name 'native-wasm32-module-*.inputs')
+    [[ -n $sidecars && $(printf '%s\n' "$sidecars" | wc -l) -eq 1 ]] || fail "$tag: expected one input sidecar, found: $sidecars"
+    grep -qaF 'abla-input:environment:ABLA_CT_ENV_TEST' "$sidecars" || fail "$tag: sidecar lacks the environment input"
+    { printf '%s\n' "$sidecars"; stat -c %y "$sidecars"; sha256sum "$sidecars" | cut -d' ' -f1; } > "$tag.snap"
+    if [[ $state == warm ]]; then
+        cmp -s "$tag.snap" "$first" || fail "$tag: a warm build rewrote the sidecar"
+    elif [[ $state == changed ]]; then
+        [[ $(sed -n 1p "$tag.snap") == $(sed -n 1p "$first") && $(sed -n 3p "$tag.snap") != $(sed -n 3p "$first") ]] \
+            || fail "$tag: a changed value did not rewrite the same sidecar"
+    fi
+    [[ $tier != interp ]] || return 0
+    pos=$(( $(grep -boa 'val TABLE = #' "$out/project/table.ab" | head -n 1 | cut -d: -f1) + 12 ))
+    expression_pos=$((pos + 1))
+    [[ $(dd if="$out/project/table.ab" bs=1 skip=$((pos + 1)) count=1 2> /dev/null) != '(' ]] || expression_pos=$((pos + 2))
+    native=$(awk -v tail="table.ab:$pos" 'index($0, "note[ct-jit]: native at ") == 1 && substr($0, length($0) - length(tail) + 1) == tail' "$tag.log" | wc -l)
+    fallback=$(awk -v p="note[ct-jit]: interpreted at $expression_pos:" 'index($0, p) == 1' "$tag.log")
+    if [[ $shape == direct ]]; then
+        [[ $native -eq $([[ $state == warm ]] && echo 0 || echo 1) && -z $fallback ]] || fail "$tag: wrong trace for the direct site"
+    elif [[ $state != warm ]]; then
+        [[ -n $fallback && $(printf '%s\n' "$fallback" | wc -l) -eq 1 && $fallback == *'global ASSET_HOST initializer reaching compilerEnvironment'* && $native -eq 0 ]] \
+            || fail "$tag: wrong trace for the global site"
+    fi
+}
 "$compiler" build tests/cases/compile-eval-environment/facts.ab --fast --no-cache -o "$out/facts" >"$out/facts.log" 2>&1
 status=0
 "$out/facts" || status=$?
@@ -23,35 +53,7 @@ for shape in direct global global-first; do
                 >"$out/$shape-$state-$tier.log" 2>&1
             "$out/builder"
             cp "$out/table.wasm" "$out/$shape-$state-$tier.wasm"
-            python3 - "$shape" "$state" "$tier" <<'PYCHECK'
-from pathlib import Path
-import hashlib, json, sys
-shape, state, tier = sys.argv[1:]
-out = Path('build/compile-eval-environment')
-sidecars = list((out/f'cache-{tier}').glob('native-wasm32-module-*.inputs'))
-assert len(sidecars) == 1, sidecars
-p = sidecars[0]; data = p.read_bytes()
-assert b'abla-input:environment:ABLA_CT_ENV_TEST' in data, data
-snapshot = [str(p), p.stat().st_mtime_ns, hashlib.sha256(data).hexdigest()]
-if state != 'first':
-    before = json.loads((out/f'{shape}-first-{tier}.json').read_text())
-    if state == 'warm': assert snapshot == before, (snapshot, before)
-    else: assert snapshot[0] == before[0] and snapshot[2] != before[2], (snapshot, before)
-(out/f'{shape}-{state}-{tier}.json').write_text(json.dumps(snapshot))
-if tier != 'interp':
-    source = (out/'project/table.ab').read_bytes()
-    lines = (out/f'{shape}-{state}-{tier}.log').read_text().splitlines()
-    pos = source.index(b'val TABLE = #') + len(b'val TABLE = ')
-    native = [s for s in lines if s.startswith('note[ct-jit]: native at ') and s.endswith(f'table.ab:{pos}')]
-    expression_pos = pos + 1 + (source[pos+1:pos+2] == b'(')
-    fallback = [s for s in lines if s.startswith(f'note[ct-jit]: interpreted at {expression_pos}:')]
-    if shape == 'direct':
-        assert len(native) == (0 if state == 'warm' else 1), lines
-        assert not fallback, lines
-    elif state != 'warm':
-        assert len(fallback) == 1 and 'global ASSET_HOST initializer reaching compilerEnvironment' in fallback[0], lines
-        assert not native, lines
-PYCHECK
+            check_environment_trace "$shape" "$state" "$tier"
         done
         cmp "$out/$shape-$state-interp.wasm" "$out/$shape-$state-jit.wasm"
         cmp "$out/$shape-$state-interp.wasm" "$out/$shape-$state-auto.wasm"
