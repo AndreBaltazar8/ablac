@@ -878,10 +878,12 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     break;
   }
 #endif
+#if !ABLA_DARWIN_SYSCALLS
   case 7:
     result = darwin_poll((struct pollfd *)(uintptr_t)argument0, (nfds_t)argument1,
                   (int)argument2);
     break;
+#endif
 #if !ABLA_DARWIN_SYSCALLS
   case 8:
     result = lseek((int)argument0, (off_t)argument1, (int)argument2);
@@ -918,6 +920,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     result = getpid();
     break;
 #endif
+#if !ABLA_DARWIN_SYSCALLS
   case 41: {
     const int descriptor =
         socket(darwin_socket_domain(argument0), darwin_socket_type(argument1),
@@ -1036,6 +1039,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     }
     break;
   }
+#endif
   case 57:
 #if TARGET_OS_IOS
     errno = ENOTSUP;
@@ -1063,6 +1067,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
   case 231:
     _exit((int)argument0);
 #endif
+#if !ABLA_DARWIN_SYSCALLS
   case 61:
 #if TARGET_OS_IOS
     errno = ENOTSUP;
@@ -1080,6 +1085,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     result = kill((pid_t)argument0, (int)argument1);
 #endif
     break;
+#endif
 #if !ABLA_DARWIN_SYSCALLS
   case 72:
     result = fcntl((int)argument0, argument1 == 1030 ? F_DUPFD_CLOEXEC : (int)argument1,
@@ -1167,9 +1173,11 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     result = umask((mode_t)argument0);
     break;
 #endif
+#if !ABLA_DARWIN_SYSCALLS
   case 109:
     result = setpgid((pid_t)argument0, (pid_t)argument1);
     break;
+#endif
 #if !ABLA_DARWIN_SYSCALLS
   case 217:
     result =
@@ -1209,6 +1217,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     result = clock_gettime(argument0 == 1 ? CLOCK_MONOTONIC : CLOCK_REALTIME,
                            (struct timespec *)(uintptr_t)argument1);
     break;
+#if !ABLA_DARWIN_SYSCALLS
   case 232:
     result =
         darwin_epoll_wait((int)argument0, (unsigned char *)(uintptr_t)argument1,
@@ -1219,6 +1228,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
         darwin_epoll_control((int)argument0, (int)argument1, (int)argument2,
                              (const void *)(uintptr_t)argument3);
     break;
+#endif
   case 257: {
     char executable[PATH_MAX];
     const char *requested = (const char *)(uintptr_t)argument1;
@@ -1284,6 +1294,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     }
     break;
   }
+#if !ABLA_DARWIN_SYSCALLS
   case 288: {
     struct sockaddr_storage address;
     socklen_t length = sizeof(address);
@@ -1305,6 +1316,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     result = descriptor;
     break;
   }
+#endif
   case 293: {
     int *descriptors = (int *)(uintptr_t)argument0;
     result = pipe(descriptors);

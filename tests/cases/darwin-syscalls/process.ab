@@ -1,0 +1,97 @@
+import "abla/io"
+import "abla/sys/linux"
+import "abla/unsafe/memory"
+
+// The process calls a macOS program issues by BSD system call (#811 group 5), through the portable
+// Linux-numbered surface (fork 57, execve 59, wait4 61, kill 62, setpgid 109); on Linux the same
+// numbers are the kernel's, so the program prints the same lines everywhere. Each line is
+// "name: ok (value)"; exit status 7 when all are right. The children run /bin/sh.
+
+trusted fun report(name: string, ok: bool, value: int): bool {
+    println("${name}: ${if (ok) "ok" else "FAIL"} ($value)")
+    ok
+}
+
+// The strings the children are started with are globals, so the collector keeps them where
+// their C addresses (taken before the fork) stay valid.
+val SHELL_PATH = "/bin/sh"
+val SHELL_NAME = "sh"
+val SHELL_OPTION = "-c"
+val EXIT_SCRIPT = "exit 3"
+val SLEEP_SCRIPT = "sleep 30"
+
+// argv for `sh -c <script>`, as pointers ending in a null, written into the caller's 32 bytes.
+trusted fun shellArguments(argv: int, script: string): void {
+    ablaRuntimeStoreI64(argv, nativeCStringAddress(SHELL_NAME))
+    ablaRuntimeStoreI64(argv + 8, nativeCStringAddress(SHELL_OPTION))
+    ablaRuntimeStoreI64(argv + 16, nativeCStringAddress(script))
+    ablaRuntimeStoreI64(argv + 24, 0)
+    return
+}
+
+// Starts /bin/sh with the script: the child's code is system calls alone (it allocates nothing).
+trusted fun spawn(script: string): int {
+    val shell = nativeCStringAddress(SHELL_PATH)
+    val argv = nativeStackAllocate(32)
+    shellArguments(argv, script)
+    val environment = nativeStackAllocate(8)
+    ablaRuntimeStoreI64(environment, 0)
+    val pid = linuxSyscall0(57)
+    if (pid == 0) {
+        linuxSyscall3(59, shell, argv, environment)
+        linuxSyscall1(231, 127)
+    }
+    pid
+}
+
+trusted fun main: int {
+    var good = true
+    val status = nativeStackAllocate(8)
+    // A child that exits with a status.
+    val first = spawn(EXIT_SCRIPT)
+    good = report("fork and execve", first > 0, first) && good
+    ablaRuntimeStoreI32(status, -1)
+    val reaped = linuxSyscall4(61, first, status, 0, 0)
+    val code = ablaRuntimeLoadI32(status)
+    good = report("wait4 exit status",
+        reaped == first && ((code >> 8) & 255) == 3 && (code & 127) == 0,
+        code) && good
+    // A running child: probed, not yet waited for, then ended by a signal.
+    val sleeper = spawn(SLEEP_SCRIPT)
+    val probe = linuxSyscall2(62, sleeper, 0)
+    good = report("kill 0 probes a process", probe == 0, probe) && good
+    ablaRuntimeStoreI32(status, -1)
+    val running = linuxSyscall4(61, sleeper, status, 1, 0)
+    good = report("wait4 WNOHANG of a running child", running == 0, running) && good
+    val killed = linuxSyscall2(62, sleeper, 15)
+    good = report("kill SIGTERM", killed == 0, killed) && good
+    ablaRuntimeStoreI32(status, -1)
+    val ended = linuxSyscall4(61, sleeper, status, 0, 0)
+    val signalled = ablaRuntimeLoadI32(status)
+    good = report("wait4 of a terminated child", ended == sleeper && (signalled & 127) == 15,
+        signalled) && good
+    // SIGKILL.
+    val doomed = spawn(SLEEP_SCRIPT)
+    linuxSyscall2(62, doomed, 9)
+    ablaRuntimeStoreI32(status, -1)
+    linuxSyscall4(61, doomed, status, 0, 0)
+    good = report("kill SIGKILL", (ablaRuntimeLoadI32(status) & 127) == 9,
+        ablaRuntimeLoadI32(status)) && good
+    // setpgid in a child: it leaves the group of this program's own process.
+    val grouped = linuxSyscall0(57)
+    if (grouped == 0) {
+        val result = linuxSyscall2(109, 0, 0)
+        linuxSyscall1(231, if (result == 0) 11 else 12)
+    }
+    ablaRuntimeStoreI32(status, -1)
+    linuxSyscall4(61, grouped, status, 0, 0)
+    good = report("setpgid", ((ablaRuntimeLoadI32(status) >> 8) & 255) == 11,
+        ablaRuntimeLoadI32(status)) && good
+    // Errors in Linux's numbering.
+    val nobody = linuxSyscall2(62, 2147483646, 0)
+    good = report("kill of no process", nobody == -3, nobody) && good
+    val none = linuxSyscall4(61, -1, status, 0, 0)
+    good = report("wait4 without children", none == -10, none) && good
+    if (good) return 7
+    1
+}

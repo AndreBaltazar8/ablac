@@ -3273,6 +3273,478 @@ trusted fun __ablaRuntimeDarwinGetcwd(output: int, size: int): int {
     length + 1
 }
 
+// ---- macOS sockets and readiness (#811 group 4) ----
+// BSD numbers: socket 97, connect 98, bind 104, listen 106, accept 30, sendto 133, recvfrom 29,
+// sendmsg 28, getsockname 32, getpeername 31, setsockopt 105, getsockopt 118, fcntl 92, poll 230,
+// select 93, kqueue 362, kevent 363, mmap 197, munmap 73. UNVERIFIED (from memory of xnu's
+// bsd/kern/syscalls.master and the headers, no macOS machine here): every number and constant in
+// this section; the macOS job's tools/test-darwin-syscalls.sh names the call that is wrong.
+// No stack allocation here (the compile-time JIT's runtime slice cannot resolve
+// nativeStackAllocate): a Linux sockaddr is rewritten in the caller's own buffer (only its first
+// two bytes differ from Darwin's) for the call and put back, a Darwin one the kernel wrote there is
+// rewritten the same way; where a record of another shape is needed (kevents, the select masks)
+// the call takes an anonymous mapping.
+
+// A scratch mapping (anonymous, read-write); negative (-errno) when none could be made.
+trusted fun __ablaRuntimeDarwinScratch(size: int): int =
+    ablaDarwinSyscall(197, 0, size, 3, 4098, -1, 0)
+
+trusted fun __ablaRuntimeDarwinScratchFailed(address: int): bool = address < 0 && address > -4096
+
+trusted fun __ablaRuntimeDarwinScratchFree(address: int, size: int): void {
+    ablaDarwinSyscall(73, address, size, 0, 0, 0, 0)
+    return
+}
+
+// Linux's address family as Darwin's: AF_UNIX 1 and AF_INET 2 agree, AF_INET6 is 10 and 30.
+trusted fun __ablaRuntimeDarwinSocketDomain(domain: int): int = if (domain == 10) 30 else domain
+
+// The socket type without Linux's SOCK_NONBLOCK (2048) and SOCK_CLOEXEC (524288): stream 1,
+// datagram 2 and raw 3 agree.
+trusted fun __ablaRuntimeDarwinSocketType(type: int): int = type & 15
+
+// Linux MSG_NOSIGNAL (0x4000) has no Darwin bit (SO_NOSIGPIPE takes its place); the rest pass on.
+trusted fun __ablaRuntimeDarwinMessageFlags(flags: int): int = flags & -16385
+
+// A new socket (or kqueue): SO_NOSIGPIPE (0x1022 at SOL_SOCKET 0xffff), then the close-on-exec
+// and nonblocking flags the Linux call took (the adapter's configure_descriptor).
+trusted fun __ablaRuntimeDarwinConfigureDescriptor(descriptor: int, flags: int): void {
+    if (descriptor < 0) return
+    val enabled = __ablaRuntimeDarwinScratch(16)
+    if (!__ablaRuntimeDarwinScratchFailed(enabled)) {
+        ablaRuntimeStoreI32(enabled, 1)
+        ablaDarwinSyscall(105, descriptor, 65535, 4130, enabled, 4, 0)
+        __ablaRuntimeDarwinScratchFree(enabled, 16)
+    }
+    if ((flags & 524288) != 0) ablaDarwinSyscall(92, descriptor, 2, 1, 0, 0, 0)
+    if ((flags & 2048) != 0) {
+        val current = ablaDarwinSyscall(92, descriptor, 3, 0, 0, 0, 0)
+        if (current >= 0) ablaDarwinSyscall(92, descriptor, 4, current | 4, 0, 0, 0)
+    }
+    return
+}
+
+// The Darwin length of the Linux sockaddr at `address` (`size` bytes): AF_UNIX (a leading NUL, an
+// abstract name, has no Darwin form) is the size itself, AF_INET 16, AF_INET6 28; or -errno
+// (EINVAL 22, ENAMETOOLONG 36, EAFNOSUPPORT 97). Nothing is written.
+trusted fun __ablaRuntimeDarwinSockaddrLength(address: int, size: int): int {
+    if (address == 0 || size < 3) return -22
+    val family = ablaRuntimeLoadU8(address) + ablaRuntimeLoadU8(address + 1) * 256
+    if (family == 1) {
+        if (ablaRuntimeLoadU8(address + 2) == 0) return -97
+        val pathLength = size - 2
+        if (pathLength > 104) return -36
+        if (ablaRuntimeLoadU8(address + size - 1) != 0) return -22
+        var scan = 0
+        while (scan < pathLength - 1) {
+            if (ablaRuntimeLoadU8(address + 2 + scan) == 0) return -22
+            scan = scan + 1
+        }
+        return size
+    }
+    if (family == 2 && size >= 16) return 16
+    if (family == 10 && size >= 28) return 28
+    -97
+}
+
+// The Linux sockaddr at `address` as Darwin's in place, for `length` bytes: a length byte, then
+// the family byte (AF_INET6 is 30) where Linux has a 16-bit family; every other byte is the
+// same. The two bytes it overwrote, as a word, for __ablaRuntimeDarwinSockaddrRestore.
+trusted fun __ablaRuntimeDarwinSockaddrMark(address: int, length: int): int {
+    val first = ablaRuntimeLoadU8(address)
+    val second = ablaRuntimeLoadU8(address + 1)
+    ablaRuntimeStoreU8(address, length)
+    ablaRuntimeStoreU8(address + 1, if (first == 10) 30 else first)
+    first + second * 256
+}
+
+trusted fun __ablaRuntimeDarwinSockaddrRestore(address: int, saved: int): void {
+    ablaRuntimeStoreU8(address, saved & 255)
+    ablaRuntimeStoreU8(address + 1, (saved >> 8) & 255)
+    return
+}
+
+// A Darwin sockaddr the kernel wrote at `address` (into `room` bytes) as Linux's, in place: the
+// family byte becomes a 16-bit family (AF_INET6 is 10); a family it does not know stays as it is.
+trusted fun __ablaRuntimeLinuxSockaddr(address: int, room: int): void {
+    if (address == 0 || room < 2) return
+    val family = ablaRuntimeLoadU8(address + 1)
+    var linux = family
+    if (family == 30) linux = 10
+    if (family == 1 || family == 2 || family == 30) {
+        ablaRuntimeStoreU8(address, linux)
+        ablaRuntimeStoreU8(address + 1, 0)
+    }
+    return
+}
+
+// Linux socket option numbers as Darwin's (the adapter's darwin_socket_option), by Darwin level:
+// SOL_SOCKET 0xffff, IPPROTO_TCP 6, IPPROTO_IP 0, IPPROTO_IPV6 41. One that has no Darwin
+// counterpart passes through and fails there.
+trusted fun __ablaRuntimeDarwinSocketOption(level: int, option: int): int {
+    if (level == 65535) {
+        if (option == 1) return 1
+        if (option == 2) return 4
+        if (option == 3) return 4104
+        if (option == 4) return 4103
+        if (option == 5) return 16
+        if (option == 6) return 32
+        if (option == 7) return 4097
+        if (option == 8) return 4098
+        if (option == 9) return 8
+        if (option == 10) return 256
+        if (option == 13) return 128
+        if (option == 15) return 512
+        if (option == 18) return 4100
+        if (option == 19) return 4099
+        if (option == 20) return 4102
+        if (option == 21) return 4101
+        if (option == 30) return 2
+    }
+    if (level == 6) {
+        if (option == 4) return 16
+        if (option == 5) return 257
+        if (option == 6) return 258
+    }
+    if (level == 0) {
+        if (option == 1) return 3
+        if (option == 2) return 4
+        if (option == 32) return 9
+        if (option == 33) return 10
+        if (option == 34) return 11
+        if (option == 35) return 12
+        if (option == 36) return 13
+    }
+    if (level == 41) {
+        if (option == 16) return 4
+        if (option == 17) return 9
+        if (option == 18) return 10
+        if (option == 19) return 11
+        if (option == 20) return 12
+        if (option == 21) return 13
+        if (option == 26) return 27
+    }
+    option
+}
+
+// socket 41.
+trusted fun __ablaRuntimeDarwinSocket(domain: int, type: int, protocol: int): int {
+    val descriptor = ablaDarwinSyscall(97, __ablaRuntimeDarwinSocketDomain(domain),
+        __ablaRuntimeDarwinSocketType(type), protocol, 0, 0, 0)
+    __ablaRuntimeDarwinConfigureDescriptor(descriptor, type)
+    __ablaRuntimeDarwinResult(descriptor)
+}
+
+// connect 42 and bind 49.
+trusted fun __ablaRuntimeDarwinAddressCall(number: int, descriptor: int, address: int,
+    size: int): int {
+    val length = __ablaRuntimeDarwinSockaddrLength(address, size)
+    if (length < 0) return length
+    val saved = __ablaRuntimeDarwinSockaddrMark(address, length)
+    val raw = ablaDarwinSyscall(if (number == 42) 98 else 104, descriptor, address, length, 0, 0, 0)
+    __ablaRuntimeDarwinSockaddrRestore(address, saved)
+    __ablaRuntimeDarwinResult(raw)
+}
+
+// sendto 44: the destination address (argument4, length argument5) is optional.
+trusted fun __ablaRuntimeDarwinSendto(
+    descriptor: int,
+    buffer: int,
+    length: int,
+    flags: int,
+    address: int,
+    size: int
+): int {
+    if (address != 0 && size > 0) {
+        val converted = __ablaRuntimeDarwinSockaddrLength(address, size)
+        if (converted < 0) return converted
+        val saved = __ablaRuntimeDarwinSockaddrMark(address, converted)
+        val raw = ablaDarwinSyscall(133, descriptor, buffer, length,
+            __ablaRuntimeDarwinMessageFlags(flags), address, converted)
+        __ablaRuntimeDarwinSockaddrRestore(address, saved)
+        return __ablaRuntimeDarwinResult(raw)
+    }
+    __ablaRuntimeDarwinResult(ablaDarwinSyscall(133, descriptor, buffer, length,
+        __ablaRuntimeDarwinMessageFlags(flags), 0, 0))
+}
+
+// recvfrom 45: the kernel writes the source address into the caller's buffer (length word
+// `lengthAddress`), which then becomes Linux's layout.
+trusted fun __ablaRuntimeDarwinRecvfrom(
+    descriptor: int,
+    buffer: int,
+    length: int,
+    flags: int,
+    address: int,
+    lengthAddress: int
+): int {
+    if (address == 0 || lengthAddress == 0) {
+        return __ablaRuntimeDarwinResult(ablaDarwinSyscall(29, descriptor, buffer, length, flags,
+            0, 0))
+    }
+    val room = ablaRuntimeLoadI32(lengthAddress) & 4294967295
+    val received = ablaDarwinSyscall(29, descriptor, buffer, length, flags, address, lengthAddress)
+    if (received >= 0) __ablaRuntimeLinuxSockaddr(address, room)
+    __ablaRuntimeDarwinResult(received)
+}
+
+// sendmsg 46: Linux's msghdr (name 0, namelen 8, iov 16, iovlen 24, control 32, controllen 40) is
+// Darwin's for a send in everything but the name: iovlen and controllen are 64-bit words whose
+// low halves sit where Darwin's 32-bit fields do, and msg_flags is not read. The name is a Linux
+// sockaddr: rewritten in place for the call (with its length) and put back.
+trusted fun __ablaRuntimeDarwinSendmsg(descriptor: int, header: int, flags: int): int {
+    if (header == 0) return -22
+    val name = ablaRuntimeLoadI64(header)
+    val nameLength = ablaRuntimeLoadI32(header + 8) & 4294967295
+    if (name == 0 || nameLength == 0) {
+        return __ablaRuntimeDarwinResult(ablaDarwinSyscall(28, descriptor, header,
+            __ablaRuntimeDarwinMessageFlags(flags), 0, 0, 0))
+    }
+    val converted = __ablaRuntimeDarwinSockaddrLength(name, nameLength)
+    if (converted < 0) return converted
+    val saved = __ablaRuntimeDarwinSockaddrMark(name, converted)
+    ablaRuntimeStoreI32(header + 8, converted)
+    val raw = ablaDarwinSyscall(28, descriptor, header, __ablaRuntimeDarwinMessageFlags(flags), 0,
+        0,
+        0)
+    ablaRuntimeStoreI32(header + 8, nameLength)
+    __ablaRuntimeDarwinSockaddrRestore(name, saved)
+    __ablaRuntimeDarwinResult(raw)
+}
+
+// getsockname 51 (BSD 32) and getpeername 52 (BSD 31): the kernel fills the caller's buffer.
+trusted fun __ablaRuntimeDarwinSocketName(
+    number: int,
+    descriptor: int,
+    address: int,
+    lengthAddress: int
+): int {
+    if (address == 0 || lengthAddress == 0) return -22
+    val room = ablaRuntimeLoadI32(lengthAddress) & 4294967295
+    val raw = ablaDarwinSyscall(if (number == 51) 32 else 31, descriptor, address, lengthAddress, 0,
+        0, 0)
+    if (raw == 0) __ablaRuntimeLinuxSockaddr(address, room)
+    __ablaRuntimeDarwinResult(raw)
+}
+
+// setsockopt 54 and getsockopt 55. SO_ERROR comes back as a Linux errno; a timeval's 4 bytes of
+// padding after Darwin's 32-bit tv_usec are cleared (Linux reads a 64-bit one).
+trusted fun __ablaRuntimeDarwinSocketOptionCall(
+    number: int,
+    descriptor: int,
+    level: int,
+    option: int,
+    value: int,
+    length: int
+): int {
+    val darwinLevel = if (level == 1) 65535 else level
+    val darwinOption = __ablaRuntimeDarwinSocketOption(darwinLevel, option)
+    if (number == 54) {
+        return __ablaRuntimeDarwinResult(ablaDarwinSyscall(105, descriptor, darwinLevel,
+            darwinOption, value, length, 0))
+    }
+    val raw = ablaDarwinSyscall(118, descriptor, darwinLevel, darwinOption, value, length, 0)
+    if (raw < 0) return __ablaRuntimeDarwinResult(raw)
+    if (darwinLevel == 65535 && darwinOption == 4103 && value != 0) {
+        ablaRuntimeStoreI32(value, __ablaRuntimeDarwinErrno(ablaRuntimeLoadI32(value)))
+    }
+    if (darwinLevel == 65535 && (darwinOption == 4102 || darwinOption == 4101) && value != 0 &&
+        length != 0 && (ablaRuntimeLoadI32(length) & 4294967295) >= 16) {
+        ablaRuntimeStoreI32(value + 12, 0)
+    }
+    raw
+}
+
+// accept4 288 over accept (30): the flags set up the new descriptor; the peer address, if
+// asked for, is written by the kernel into the caller's buffer and becomes Linux's.
+trusted fun __ablaRuntimeDarwinAccept(
+    descriptor: int,
+    address: int,
+    lengthAddress: int,
+    flags: int
+): int {
+    if (address == 0 || lengthAddress == 0) {
+        val accepted = ablaDarwinSyscall(30, descriptor, 0, 0, 0, 0, 0)
+        __ablaRuntimeDarwinConfigureDescriptor(accepted, flags)
+        return __ablaRuntimeDarwinResult(accepted)
+    }
+    val room = ablaRuntimeLoadI32(lengthAddress) & 4294967295
+    val accepted = ablaDarwinSyscall(30, descriptor, address, lengthAddress, 0, 0, 0)
+    __ablaRuntimeDarwinConfigureDescriptor(accepted, flags)
+    if (accepted >= 0) __ablaRuntimeLinuxSockaddr(address, room)
+    __ablaRuntimeDarwinResult(accepted)
+}
+
+// poll 7 -> BSD poll 230 (struct pollfd and its event bits agree). Darwin's poll rejects
+// character devices (POLLNVAL): for a single such descriptor wait with select 93 as the adapter
+// does (a descriptor below 1024: a 128-byte mask per direction).
+trusted fun __ablaRuntimeDarwinPoll(fds: int, count: int, timeout: int): int {
+    val raw = ablaDarwinSyscall(230, fds, count, timeout, 0, 0, 0)
+    if (raw <= 0 || count != 1 || fds == 0) return __ablaRuntimeDarwinResult(raw)
+    val descriptor = ablaRuntimeLoadI32(fds)
+    val events = ablaRuntimeLoadU8(fds + 4) + ablaRuntimeLoadU8(fds + 5) * 256
+    val returned = ablaRuntimeLoadU8(fds + 6) + ablaRuntimeLoadU8(fds + 7) * 256
+    if ((returned & 32) == 0 || descriptor < 0 || descriptor >= 1024 || (events & -6) !=
+        0) return raw
+    // One mapping: the stat record (144 bytes), the two masks (128 each) and the timeval (16).
+    val memory = __ablaRuntimeDarwinScratch(544)
+    if (__ablaRuntimeDarwinScratchFailed(memory)) return raw
+    val information = memory
+    val reads = memory + 144
+    val writes = memory + 272
+    val duration = memory + 400
+    var result = raw
+    if (ablaDarwinSyscall(339, descriptor, information, 0, 0, 0, 0) >= 0 &&
+        (ablaRuntimeLoadI32(information + 4) & 61440) == 8192) {
+        val word = descriptor / 32 * 4
+        val bit = 1 << (descriptor % 32)
+        if ((events & 1) != 0) ablaRuntimeStoreI32(reads + word, bit)
+        if ((events & 4) != 0) ablaRuntimeStoreI32(writes + word, bit)
+        ablaRuntimeStoreI64(duration, if (timeout < 0) 0 else timeout / 1000)
+        ablaRuntimeStoreI64(duration + 8, if (timeout < 0) 0 else timeout % 1000 * 1000)
+        val ready = ablaDarwinSyscall(93, descriptor + 1, reads, writes, 0,
+            if (timeout < 0) 0 else duration, 0)
+        if (ready < 0) {
+            result = __ablaRuntimeDarwinResult(ready)
+        } else {
+            var revents = 0
+            if ((ablaRuntimeLoadI32(reads + word) & bit) != 0) revents = revents | 1
+            if ((ablaRuntimeLoadI32(writes + word) & bit) != 0) revents = revents | 4
+            ablaRuntimeStoreU8(fds + 6, revents & 255)
+            ablaRuntimeStoreU8(fds + 7, revents / 256)
+            result = if (revents != 0) 1 else 0
+        }
+    }
+    __ablaRuntimeDarwinScratchFree(memory, 544)
+    result
+}
+
+// A Darwin `struct kevent` (32 bytes: ident 0, filter 8 as an int16, flags 10 as a uint16,
+// fflags 12, data 16, udata 24).
+trusted fun __ablaRuntimeDarwinKevent(
+    address: int,
+    ident: int,
+    filter: int,
+    flags: int,
+    udata: int
+): void {
+    ablaRuntimeStoreI64(address, ident)
+    ablaRuntimeStoreU8(address + 8, filter & 255)
+    ablaRuntimeStoreU8(address + 9, (filter >> 8) & 255)
+    ablaRuntimeStoreU8(address + 10, flags & 255)
+    ablaRuntimeStoreU8(address + 11, (flags >> 8) & 255)
+    ablaRuntimeStoreI32(address + 12, 0)
+    ablaRuntimeStoreI64(address + 16, 0)
+    ablaRuntimeStoreI64(address + 24, udata)
+    return
+}
+
+// epoll_ctl 233 over a kqueue (BSD kevent 363, EVFILT_READ -1, EVFILT_WRITE -2, EV_ADD 1,
+// EV_DELETE 2, EV_ENABLE 4): operation 1 adds, 2 deletes, 3 modifies (delete both filters, add).
+// The event word is Linux's (EPOLLIN 1, EPOLLOUT 4); the descriptor is the user data.
+trusted fun __ablaRuntimeDarwinEpollControl(
+    queue: int,
+    operation: int,
+    target: int,
+    encoded: int
+): int {
+    if (encoded == 0 && operation != 2) return -22
+    val events = if (encoded != 0) ablaRuntimeLoadI32(encoded) else 0
+    val changes = __ablaRuntimeDarwinScratch(128)
+    if (__ablaRuntimeDarwinScratchFailed(changes)) return -12
+    var count = 0
+    if (operation == 3) {
+        __ablaRuntimeDarwinKevent(changes, target, -1, 2, 0)
+        __ablaRuntimeDarwinKevent(changes + 32, target, -2, 2, 0)
+        ablaDarwinSyscall(363, queue, changes, 2, 0, 0, 0)
+    }
+    val flags = if (operation == 2) 2 else 5
+    if ((events & 1) != 0 || operation == 2) {
+        __ablaRuntimeDarwinKevent(changes + count * 32, target, -1, flags, target)
+        count = count + 1
+    }
+    if ((events & 4) != 0 || operation == 2) {
+        __ablaRuntimeDarwinKevent(changes + count * 32, target, -2, flags, target)
+        count = count + 1
+    }
+    var result = ablaDarwinSyscall(363, queue, changes, count, 0, 0, 0)
+    if (result == -2 && operation == 2) result = 0
+    __ablaRuntimeDarwinScratchFree(changes, 128)
+    __ablaRuntimeDarwinResult(result)
+}
+
+// epoll_wait 232 over kevent: at most 64 events per call (a caller asking for more gets fewer, as
+// epoll allows), written as Linux's packed 12-byte records (events, the descriptor, zero).
+trusted fun __ablaRuntimeDarwinEpollWait(queue: int, output: int, maximum: int, timeout: int): int {
+    if (output == 0 || maximum <= 0) return -22
+    val capacity = if (maximum > 64) 64 else maximum
+    // One mapping: the kevents (32 bytes each) and the timespec (16).
+    val size = capacity * 32 + 16
+    val memory = __ablaRuntimeDarwinScratch(size)
+    if (__ablaRuntimeDarwinScratchFailed(memory)) return -12
+    val events = memory
+    val duration = memory + capacity * 32
+    ablaRuntimeStoreI64(duration, if (timeout < 0) 0 else timeout / 1000)
+    ablaRuntimeStoreI64(duration + 8, if (timeout < 0) 0 else timeout % 1000 * 1000000)
+    var measured = ablaDarwinSyscall(363, queue, 0, 0, events, capacity,
+        if (timeout < 0) 0 else duration)
+    while (measured == -4) {
+        measured = ablaDarwinSyscall(363, queue, 0, 0, events, capacity,
+            if (timeout < 0) 0 else duration)
+    }
+    if (measured < 0) {
+        __ablaRuntimeDarwinScratchFree(memory, size)
+        return __ablaRuntimeDarwinResult(measured)
+    }
+    var index = 0
+    while (index < measured) {
+        val event = events + index * 32
+        val filter = ablaRuntimeLoadU8(event + 8)
+        val flags = ablaRuntimeLoadU8(event + 10) + ablaRuntimeLoadU8(event + 11) * 256
+        var bits = 0
+        if (filter == 255) bits = bits | 1
+        if (filter == 254) bits = bits | 4
+        if ((flags & 32768) != 0) bits = bits | 16
+        if ((flags & 16384) != 0) bits = bits | 8
+        val record = output + index * 12
+        ablaRuntimeStoreI32(record, bits)
+        ablaRuntimeStoreI32(record + 4, ablaRuntimeLoadI64(event + 24))
+        ablaRuntimeStoreI32(record + 8, 0)
+        index = index + 1
+    }
+    __ablaRuntimeDarwinScratchFree(memory, size)
+    measured
+}
+
+// ---- macOS processes (#811 group 5) ----
+// BSD numbers: execve 59, wait4 7, kill 37 (pid, signal, posix = 1), setpgid 82. UNVERIFIED:
+// every number in this section (from memory of xnu's syscalls.master).
+
+// A Linux signal number as Darwin's, 0 where Darwin has none: the adapter's darwin_signals table.
+trusted fun __ablaRuntimeDarwinSignal(signal: int): int {
+    if (signal <= 0 || signal > 31) return signal
+    if (signal == 7) return 10
+    if (signal == 10) return 30
+    if (signal == 12) return 31
+    if (signal == 16) return 0
+    if (signal == 17) return 20
+    if (signal == 18) return 19
+    if (signal == 19) return 17
+    if (signal == 20) return 18
+    if (signal == 23) return 16
+    if (signal == 29) return 23
+    if (signal == 30) return 0
+    if (signal == 31) return 12
+    signal
+}
+
+// kill 62: signal 0 only probes; a signal Darwin does not have is refused (EINVAL 22).
+trusted fun __ablaRuntimeDarwinKill(process: int, signal: int): int {
+    val darwin = __ablaRuntimeDarwinSignal(signal)
+    if (signal != 0 && darwin == 0) return -22
+    __ablaRuntimeDarwinResult(ablaDarwinSyscall(37, process, darwin, 1, 0, 0, 0))
+}
+
 trusted fun __ablaRuntimeDarwinSyscall(
     number: int,
     argument0: int,
@@ -3382,6 +3854,43 @@ trusted fun __ablaRuntimeDarwinSyscall(
         ablaDarwinSyscall(58, argument0, argument1, argument2, 0, 0, 0))
     if (number == 217) return __ablaRuntimeDarwinGetdents(argument0, argument1, argument2)
     if (number == 79) return __ablaRuntimeDarwinGetcwd(argument0, argument1)
+    // Sockets and readiness (#811 group 4): see the section above the dispatcher.
+    if (number == 41) return __ablaRuntimeDarwinSocket(argument0, argument1, argument2)
+    if (number == 42 || number == 49) return __ablaRuntimeDarwinAddressCall(
+        number, argument0, argument1, argument2)
+    if (number == 44) return __ablaRuntimeDarwinSendto(
+        argument0, argument1, argument2, argument3, argument4, argument5)
+    if (number == 45) return __ablaRuntimeDarwinRecvfrom(
+        argument0, argument1, argument2, argument3, argument4, argument5)
+    if (number == 46) return __ablaRuntimeDarwinSendmsg(argument0, argument1, argument2)
+    if (number == 50) return __ablaRuntimeDarwinResult(
+        ablaDarwinSyscall(106, argument0, argument1, 0, 0, 0, 0))
+    if (number == 51 || number == 52) return __ablaRuntimeDarwinSocketName(
+        number, argument0, argument1, argument2)
+    if (number == 54 || number == 55) return __ablaRuntimeDarwinSocketOptionCall(
+        number, argument0, argument1, argument2, argument3, argument4)
+    if (number == 288) return __ablaRuntimeDarwinAccept(
+        argument0, argument1, argument2, argument3)
+    if (number == 7) return __ablaRuntimeDarwinPoll(argument0, argument1, argument2)
+    if (number == 232) return __ablaRuntimeDarwinEpollWait(
+        argument0, argument1, argument2, argument3)
+    if (number == 233) return __ablaRuntimeDarwinEpollControl(
+        argument0, argument1, argument2, argument3)
+    if (number == 291) {
+        val queue = ablaDarwinSyscall(362, 0, 0, 0, 0, 0, 0)
+        __ablaRuntimeDarwinConfigureDescriptor(queue, argument0)
+        return __ablaRuntimeDarwinResult(queue)
+    }
+    // Processes (#811 group 5): the section above the dispatcher. execve of the running image's
+    // own name stays with the C adapter, which holds its identity; wait4 passes no rusage (a
+    // Linux buffer is not Darwin's layout).
+    if (number == 59 && !__ablaRuntimeDarwinNamesImage(argument0)) return __ablaRuntimeDarwinResult(
+        ablaDarwinSyscall(59, argument0, argument1, argument2, 0, 0, 0))
+    if (number == 61) return __ablaRuntimeDarwinResult(
+        ablaDarwinSyscall(7, argument0, argument1, argument2, 0, 0, 0))
+    if (number == 62) return __ablaRuntimeDarwinKill(argument0, argument1)
+    if (number == 109) return __ablaRuntimeDarwinResult(
+        ablaDarwinSyscall(82, argument0, argument1, 0, 0, 0, 0))
     abla_darwin_linux_syscall(
         number, argument0, argument1, argument2, argument3, argument4, argument5)
 }
