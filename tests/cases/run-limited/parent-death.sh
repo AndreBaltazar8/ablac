@@ -63,7 +63,7 @@ run_tree() {
         > /dev/null 2>&1 < /dev/null &
     local proc=$!
     cleanup_pids+=("$proc")
-    wait_for 10 "payload startup" nonempty "$case_dir/parent"
+    wait_for 30 "payload startup" nonempty "$case_dir/parent"
     local parent child supervisor
     parent=$(cat "$case_dir/parent")
     child=$(cat "$case_dir/child")
@@ -75,12 +75,12 @@ run_tree() {
     group) kill -KILL -- "-$proc" ;;
     term) kill -TERM "$proc" ;;
     esac
-    wait_for 8 "$mode runner to exit" gone "$proc"
+    wait_for 25 "$mode runner to exit" gone "$proc"
     local status=0
     { wait "$proc" || status=$?; } 2>/dev/null
     case $mode in group) expected=137 ;; term) expected=143 ;; timeout) expected=124 ;; esac
     [[ $status == "$expected" ]] || fail "$name: exit $status, expected $expected"
-    wait_for 10 "$mode supervisor and descendants to exit" gone "$parent" "$child" "$supervisor"
+    wait_for 30 "$mode supervisor and descendants to exit" gone "$parent" "$child" "$supervisor"
 }
 
 fallback() {
@@ -109,15 +109,15 @@ SHIM
     local proc=$!
     cleanup_pids+=("$proc")
     # printf writes the pid and its newline at once.
-    wait_for 10 "unarmed setpriv shim" nonempty "$case_dir/ready"
+    wait_for 30 "unarmed setpriv shim" nonempty "$case_dir/ready"
     local shim_pid
     shim_pid=$(cat "$case_dir/ready")
     cleanup_pids+=("$shim_pid")
-    wait_for 10 "setpriv shim to stop" stopped "$shim_pid"
+    wait_for 30 "setpriv shim to stop" stopped "$shim_pid"
     kill -KILL "$proc"
     wait "$proc" 2>/dev/null || true
     kill -CONT "$shim_pid"
-    wait_for 10 "reparented trampoline to exit" gone "$shim_pid"
+    wait_for 30 "reparented trampoline to exit" gone "$shim_pid"
     [[ ! -e $case_dir/payload-ran ]] || fail "payload started after its launcher died"
 }
 

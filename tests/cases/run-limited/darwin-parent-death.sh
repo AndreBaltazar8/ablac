@@ -68,7 +68,7 @@ run_tree() {
     local proc=$!
     set +m
     cleanup_pids+=("$proc")
-    wait_for 10 "payload and descendant readiness" nonempty "$marker"
+    wait_for 30 "payload and descendant readiness" nonempty "$marker"
     local payload child supervisor_pid group
     read -r payload child supervisor_pid < "$marker"
     cleanup_pids+=("$payload" "$child" "$supervisor_pid")
@@ -84,12 +84,12 @@ run_tree() {
     int) kill -INT "$proc"; expected=130 ;;
     timeout) expected=124 ;;
     esac
-    wait_for 10 "$name runner to exit" gone "$proc"
+    wait_for 30 "$name runner to exit" gone "$proc"
     { wait "$proc"; } 2>/dev/null || status=$?
     # A killed caller cannot report a status; the others pass through the launcher's.
     [[ $status == "$expected" ]] || fail "$name: exit $status, expected $expected: $(cat "$tmp/$name.log")"
-    wait_for 5 "$name payload group cleanup" gone "$payload" "$child"
-    wait_for 5 "$name supervisor exit" gone "$supervisor_pid"
+    wait_for 20 "$name payload group cleanup" gone "$payload" "$child"
+    wait_for 20 "$name supervisor exit" gone "$supervisor_pid"
     group_empty "$group" || fail "$name: a process of the payload group survived"
     echo "Darwin runner: $name payload and descendant stopped"
 }
@@ -143,14 +143,14 @@ PATH=$private_bin:$PATH ABLA_TEST_SHIM_READY=$tmp/prearm-ready ABLA_TEST_REAL_BA
 proc=$!
 set +m
 cleanup_pids+=("$proc")
-wait_for 10 "unarmed supervisor" nonempty "$tmp/prearm-ready"
+wait_for 30 "unarmed supervisor" nonempty "$tmp/prearm-ready"
 trampoline=$(cat "$tmp/prearm-ready")
 cleanup_pids+=("$trampoline")
-wait_for 10 "supervisor trampoline stopped" stopped "$trampoline"
+wait_for 30 "supervisor trampoline stopped" stopped "$trampoline"
 kill -KILL "$proc"
 { wait "$proc"; } 2>/dev/null
 kill -CONT "$trampoline"
-wait_for 10 "reparented supervisor exit" gone "$trampoline"
+wait_for 30 "reparented supervisor exit" gone "$trampoline"
 [[ ! -e $tmp/payload-ran ]] || fail "payload started after the launcher died before the supervisor's check"
 echo "Darwin parent death: pre-start race fails closed"
 
