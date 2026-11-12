@@ -772,6 +772,8 @@
   stock LLVM and the macOS jobs use Homebrew's, without the private Xtensa patches. The old Nix-built one needs Nix's glibc 2.44; a separate glibc 2.35 companion
   and native companions for both Macs are now published. Target-specific source routing is
   validated; release packaging with that compiler is still pending.
+  #787: the macOS offline-installer test on 1210637a failed at publication;
+  record the rename operation and translated errno so CI can identify the cause.
   #575 phases 1–2 (2026-11-06): [optional revision 23.1.3-1 is published](https://github.com/AndreBaltazar8/llvm-project/releases/tag/abla-xtensa-llvm-23.1.3-1)
   for Linux and both Macs; branch `feat-xtensa-companion` implements explicit verified installation.
   Source is `a2549329`; all three builds and clean Ubuntu 22.04 pass the Nix assembly/direct/optimized
