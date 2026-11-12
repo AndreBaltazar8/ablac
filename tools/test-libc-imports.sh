@@ -11,6 +11,12 @@
 set -euo pipefail
 export LC_ALL=C
 compiler=${1:-build/ablac}
+# The list was taken with ABLA_DEBUG and ABLA_TEST_FAST_BUILDS unset (--fast
+# builds carry debug information; release builds are release). The suite
+# sets ABLA_DEBUG=0, under which a --fast build's FastISel also calls memset,
+# and may set ABLA_TEST_FAST_BUILDS=1, which makes every build --fast. Build
+# the same way whoever runs it.
+unset ABLA_DEBUG ABLA_TEST_FAST_BUILDS
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
 if [[ $(uname -s) != Linux ]]; then
