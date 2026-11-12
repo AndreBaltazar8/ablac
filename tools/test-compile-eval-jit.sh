@@ -64,9 +64,11 @@ native=$(grep -c '^note\[ct-jit\]: native at' "$output_directory/delegates-jit.t
 grep -q 'interpreted at .*: compile global .*counted changed in an interpreted evaluation' \
     "$output_directory/delegates-jit.trace"
 
-# Native code collects as a hosted program does: globals are roots, and allocation
-# pressure collects by default (the interpreter has no heap to measure).
+# Native compile-time code retains local roots across explicit collections, and
+# allocation pressure collects by default (the interpreter has no heap to measure).
 run_case jit memory 42
+# The ordinary-global root oracle has no compile-time sites; exercise it at runtime.
+run_case jit memory-global-runtime 42
 native=$(grep -c '^note\[ct-jit\]: native at' "$output_directory/memory-jit.trace" || true)
 [[ $native -eq 2 ]] || { echo "compile-eval-jit: $native native sites in memory.ab, expected 2" >&2; cat "$output_directory/memory-jit.trace" >&2; exit 1; }
 

@@ -1,0 +1,649 @@
+// Which ordinary globals compile-time code can write (#796).
+//
+// A native compile-time slice has its own copy of every ordinary global (`val` and
+// `var` that are not `compile val`/`compile var`), made by its initializer, and the
+// interpreter has another. Nothing exchanges a change to one with the other, so a
+// site that reads a global some site (or code it reaches) may write must run in the
+// interpreter, every site that reaches it, whatever their order or number: a
+// syntactic site can run again through a compile function, a generic instantiation
+// or a rebuilt module. A global nothing can write (a table) stays native.
+//
+// The analysis is flow-insensitive and conservative. It follows which globals a value
+// may alias: an expression's *origins* are the ordinary globals whose heap it may be
+// part of. A read keeps the origins of what it reads from (containment: writing
+// `g.f` writes `g`), a store into a field or element adds the stored origins to that
+// field name or to the elements (field-based, so `Json(keys, ...)` taints `.keys`),
+// a call binds arguments to the parameters of every callable of that name and
+// returns what those return, and a local keeps the union of what is assigned to it.
+// A write is an assignment to a `var` global, a store into a field or element, one
+// of the built-in mutators, or a value handed to code the analysis cannot follow (an
+// extern, a closure called as a value). Whatever it writes through is the origins of
+// the place. Fresh values have none, so writing a container a function made itself
+// writes no global even when that function also reads one.
+import "parser.ab"
+import "sema.ab"
+import "abla/text"
+
+class BootstrapCtStateResult(
+    // Per site: the ordinary globals (declaration indexes) its code can reach.
+    val reached: array<array<int>>,
+    // Per declaration: "" when nothing in the pass's compile-time code can write
+    // it, else where something can (`name at source:begin`).
+    val writers: array<string>
+)
+
+fun bootstrapCtStateMerge(var target: array<int>, source: array<int>): bool {
+    var changed = false
+    for (value in source) {
+        var present = false
+        for (existing in target) {
+            if (existing == value) present = true
+        }
+        if (!present) {
+            target.append(value)
+            changed = true
+        }
+    }
+    changed
+}
+
+fun bootstrapCtStateCopy(values: array<int>): array<int> {
+    val result: array<int> = []
+    for (value in values) result.append(value)
+    result
+}
+
+// Whether a global of this type (or, when it is inferred, with this initializer) holds a
+// scalar or string: a value that cannot be aliased or written in place.
+fun bootstrapCtStateImmutable(type: string, initializer: BootstrapExpression): bool {
+    val kind = initializer.kind
+    if (type == "int" || type == "bool" || type == "string" || type == "char" ||
+        type == "f32" || type == "f64" || type == "i8" || type == "u8" || type == "i16" ||
+        type == "u16" || type == "i32" || type == "u32" || type == "i64" || type ==
+        "u64") return true
+    (type == "" || type == "inferred") &&
+        (kind == "integer" || kind == "string" || kind == "float" || kind == "float32" ||
+         kind == "char" || kind == "true" || kind == "false" || kind == "string.template")
+}
+
+fun bootstrapCtStateMutator(name: string): bool =
+    name == "append" || name == "takeAt" || name == "truncate" || name == "clear" ||
+    name == "set" || name == "remove" || name == "take" || name == "removeAt" ||
+    name == "removeLast" || name == "removeFirst" || name == "insert" || name == "push" ||
+    name == "pop" || name == "sort" || name == "reverse" || name == "fill" ||
+    name == "swap" || name == "addAll" || name == "extend" || name == "put" ||
+    name == "delete" || name == "retain" || name == "removeIf" || name == "sortBy" ||
+    name == "shuffle" || name == "setAt" || name == "resize" || name == "replace"
+
+class BootstrapCtState(
+    val declarations: array<BootstrapDeclaration>,
+    // Per declaration: whether it is the standard library's.
+    val library: array<bool>,
+    // Items: 0..declarations.size-1 are the declarations (a value's item is its
+    // initializer), then every method, then one per site.
+    val itemDeclaration: array<int>,
+    val itemMethod: array<int>,
+    val byName: Map<string, array<int>>,
+    val itemSource: array<string>,
+    val itemLibrary: array<bool>,
+    val reachedItems: array<bool>,
+    val itemGlobals: array<array<int>>,
+    val itemCallees: array<array<int>>,
+    val globalTaint: array<array<int>>,
+    val variables: Map<string, array<int>>,
+    val returns: array<array<int>>,
+    val fields: Map<string, array<int>>,
+    val elements: array<int>,
+    val writers: array<string>,
+    val ordinary: array<bool>,
+    // Per declaration: whether a value of its type can alias heap (not a scalar or string).
+    val component: array<bool>,
+    var changed: bool,
+    var current: int,
+    val scope: array<string>,
+    val lambdaValues: array<array<int>>
+) {
+    fun variable(name: string): array<int> =
+        bootstrapCtStateCopy(this.variables.get("${this.current}:$name") ?? [])
+
+    fun bind(name: string, taint: array<int>): void {
+        val key = "${this.current}:$name"
+        val existing = this.variables.get(key) ?? []
+        if (bootstrapCtStateMerge(existing, taint)) this.changed = true
+        this.variables.set(key, existing)
+        return
+    }
+
+    fun bound(name: string): bool {
+        var index = this.scope.size
+        while (index > 0) {
+            index = index - 1
+            if (this.scope[index] == name) return true
+        }
+        false
+    }
+
+    fun reach(item: int): void {
+        if (!this.reachedItems[item]) {
+            this.reachedItems[item] = true
+            this.changed = true
+        }
+        bootstrapCtStateMerge(this.itemCallees[this.current], [item])
+        return
+    }
+
+    fun field(name: string): array<int> = bootstrapCtStateCopy(this.fields.get(name) ?? [])
+
+    fun storeField(name: string, taint: array<int>): void {
+        val existing = this.fields.get(name) ?? []
+        if (bootstrapCtStateMerge(existing, taint)) this.changed = true
+        this.fields.set(name, existing)
+        return
+    }
+
+    fun storeElement(taint: array<int>): void {
+        if (bootstrapCtStateMerge(this.elements, taint)) this.changed = true
+        return
+    }
+
+    fun write(origins: array<int>, node: BootstrapExpression): void {
+        for (global in origins) {
+            if (global >= 0 && global < this.writers.size && this.writers[global] == "") {
+                this.writers[global] =
+                    "${this.itemName(this.current)} at ${this.itemSource[this.current]}:${node.begin}"
+                this.changed = true
+            }
+        }
+        return
+    }
+
+    fun itemName(item: int): string {
+        if (item < this.declarations.size) return this.declarations[item].name
+        val declaration = this.itemDeclaration[item]
+        if (declaration < 0) return "compile-time site"
+        val method = this.itemMethod[item]
+        if (method < 0) this.declarations[declaration].name
+        else "${this.declarations[declaration].name}.${this.declarations[declaration].methods[method].name}"
+    }
+
+    // The items a name can denote as a callable or value, visible from the current body.
+    fun candidates(name: string): array<int> {
+        val found = bootstrapCtStateCopy(this.byName.get(name) ?? [])
+        if (!this.itemLibrary[this.current]) return found
+        val visible: array<int> = []
+        for (item in found) {
+            val declaration = this.itemDeclaration[item]
+            if (declaration >= 0 && this.library[declaration]) visible.append(item)
+        }
+        visible
+    }
+
+    fun parameterName(item: int, index: int): string {
+        val declaration = this.itemDeclaration[item]
+        if (declaration < 0) return ""
+        val owner = this.declarations[declaration]
+        val method = this.itemMethod[item]
+        val target = if (method < 0) owner else owner.methods[method]
+        if (index < target.parameters.size) target.parameters[index] else ""
+    }
+
+    fun bindArguments(item: int, taints: array<array<int>>, from: int): void {
+        var index = 0
+        while (from + index < taints.size) {
+            val name = this.parameterName(item, index)
+            if (name != "") {
+                val key = "$item:$name"
+                val existing = this.variables.get(key) ?? []
+                if (bootstrapCtStateMerge(existing, taints[from + index])) this.changed = true
+                this.variables.set(key, existing)
+            }
+            index = index + 1
+        }
+        return
+    }
+
+    fun union(taints: array<array<int>>): array<int> {
+        val result: array<int> = []
+        for (taint in taints) bootstrapCtStateMerge(result, taint)
+        result
+    }
+
+    fun isValue(kind: string): bool = bootstrapDeclarationIsValue(kind)
+
+    // What `expression` may alias; its writes and stores are recorded as it goes.
+    fun evaluate(expression: BootstrapExpression): array<int> {
+        val kind = expression.kind
+        val children = expression.children
+        if (kind == "identifier") return this.evaluateIdentifier(expression)
+        if (kind == "string" || kind == "integer" || kind == "float" || kind == "float32" ||
+            kind == "char" || kind == "true" || kind == "false" || kind == "null" ||
+            kind == "type" || kind == "missing" || kind == "invalid") return []
+        if (kind == "assign") {
+            val value = this.evaluate(children[0])
+            if (this.bound(expression.text)) {
+                this.bind(expression.text, value)
+            } else {
+                for (item in this.candidates(expression.text)) {
+                    if (item < this.declarations.size &&
+                        this.isValue(this.declarations[item].kind)) {
+                        this.noteGlobal(item)
+                        if (this.ordinary[item]) this.write([item], expression)
+                        if (bootstrapCtStateMerge(this.globalTaint[item],
+                            value)) this.changed = true
+                    }
+                }
+            }
+            return []
+        }
+        if (kind == "member" && children.size > 0) {
+            val result = this.evaluate(children[0])
+            bootstrapCtStateMerge(result, this.field(expression.text))
+            return result
+        }
+        if (kind == "member.assign" && children.size > 1) {
+            val receiver = this.evaluate(children[0])
+            val value = this.evaluate(children[1])
+            this.write(receiver, expression)
+            this.storeField(expression.text, value)
+            return []
+        }
+        if (kind == "index" && children.size > 1) {
+            val result = this.evaluate(children[0])
+            this.evaluate(children[1])
+            bootstrapCtStateMerge(result, this.elements)
+            return result
+        }
+        if (kind == "index.assign" && children.size > 2) {
+            val base = this.evaluate(children[0])
+            this.evaluate(children[1])
+            val value = this.evaluate(children[2])
+            this.write(base, expression)
+            this.storeElement(value)
+            return []
+        }
+        if (kind == "member.call" && children.size > 0) return this.evaluateMemberCall(expression)
+        if (kind == "call") return this.evaluateCall(expression)
+        if (kind == "call.value") return this.evaluateValueCall(expression)
+        if (kind == "lambda") return this.evaluateLambda(expression, [])
+        if (kind == "block") {
+            val mark = this.scope.size
+            var value: array<int> = []
+            for (statement in children) value = this.evaluate(statement)
+            this.scope.truncate(mark)
+            return bootstrapCtStateCopy(value)
+        }
+        if (kind == "local.val" || kind == "local.var") {
+            val value = if (children.size > 0) this.evaluate(children[0]) else []
+            this.scope.append(expression.text)
+            this.bind(expression.text, value)
+            return []
+        }
+        if (kind == "for" && children.size > 1) {
+            val source = this.evaluate(children[0])
+            val mark = this.scope.size
+            val name = bootstrapForName(expression)
+            this.scope.append(name)
+            val element = bootstrapCtStateCopy(source)
+            bootstrapCtStateMerge(element, this.elements)
+            this.bind(name, element)
+            this.evaluate(children[1])
+            this.scope.truncate(mark)
+            return []
+        }
+        if (kind == "return") {
+            val value = if (children.size > 0) this.evaluate(children[0]) else []
+            if (this.lambdaValues.size > 0) {
+                bootstrapCtStateMerge(this.lambdaValues[this.lambdaValues.size - 1], value)
+            } else if (bootstrapCtStateMerge(this.returns[this.current], value)) {
+                this.changed = true
+            }
+            return []
+        }
+        if (kind == "string.template") {
+            for (child in children) this.evaluate(child)
+            return []
+        }
+        if (kind == "array") {
+            val elements: array<int> = []
+            for (child in children) bootstrapCtStateMerge(elements, this.evaluate(child))
+            this.storeElement(elements)
+            return []
+        }
+        // Anything else: the union of its parts (a value may alias any of them), with
+        // each part's own writes recorded.
+        val result: array<int> = []
+        for (child in children) bootstrapCtStateMerge(result, this.evaluate(child))
+        result
+    }
+
+    fun noteGlobal(declaration: int): void {
+        bootstrapCtStateMerge(this.itemGlobals[this.current], [declaration])
+        this.reach(declaration)
+        return
+    }
+
+    fun evaluateIdentifier(expression: BootstrapExpression): array<int> {
+        val name = expression.text
+        if (this.bound(name)) return bootstrapCtStateCopy(this.variable(name))
+        val result: array<int> = []
+        for (item in this.candidates(name)) {
+            if (item < this.declarations.size) {
+                val declaration = this.declarations[item]
+                if (this.isValue(declaration.kind)) {
+                    this.noteGlobal(item)
+                    if (this.component[item]) bootstrapCtStateMerge(result, [item])
+                    bootstrapCtStateMerge(result, this.globalTaint[item])
+                } else if (declaration.kind == "fun" || declaration.kind == "compile.fun") {
+                    // A function used as a value is called by code this analysis
+                    // does not connect to it: its body is part of the pass.
+                    this.reach(item)
+                }
+            }
+        }
+        result
+    }
+
+    fun evaluateArguments(expression: BootstrapExpression, from: int): array<array<int>> {
+        val taints: array<array<int>> = []
+        var index = from
+        while (index < expression.children.size) {
+            taints.append(this.evaluate(expression.children[index]))
+            index = index + 1
+        }
+        taints
+    }
+
+    fun lambdaArgument(expression: BootstrapExpression, from: int): bool {
+        var index = from
+        while (index < expression.children.size) {
+            if (expression.children[index].kind == "lambda") return true
+            index = index + 1
+        }
+        false
+    }
+
+    fun evaluateLambda(expression: BootstrapExpression, parameters: array<int>): array<int> {
+        val mark = this.scope.size
+        val values: array<int> = []
+        this.lambdaValues.append(values)
+        var value: array<int> = []
+        var index = 0
+        while (index < expression.children.size) {
+            val child = expression.children[index]
+            if (index == expression.children.size - 1) {
+                value = this.evaluate(child)
+            } else {
+                this.scope.append(child.text)
+                this.bind(child.text, parameters)
+            }
+            index = index + 1
+        }
+        this.lambdaValues.truncate(this.lambdaValues.size - 1)
+        this.scope.truncate(mark)
+        bootstrapCtStateMerge(value, values)
+        bootstrapCtStateCopy(value)
+    }
+
+    // A lambda handed to a call this analysis cannot follow is called with whatever
+    // the call's other values reach.
+    fun evaluateArgumentsWith(
+        expression: BootstrapExpression,
+        from: int,
+        parameters: array<int>
+    ): array<array<int>> {
+        val taints: array<array<int>> = []
+        var index = from
+        while (index < expression.children.size) {
+            val child = expression.children[index]
+            taints.append(if (child.kind == "lambda") this.evaluateLambda(child, parameters)
+                else this.evaluate(child))
+            index = index + 1
+        }
+        taints
+    }
+
+    fun evaluateMemberCall(expression: BootstrapExpression): array<int> {
+        val receiver = this.evaluate(expression.children[0])
+        val name = expression.text
+        val known: array<int> = []
+        for (item in this.candidates(name)) {
+            if (item >= this.declarations.size ||
+                this.declarations[item].extensionOwner != "") known.append(item)
+        }
+        val spread = bootstrapCtStateCopy(receiver)
+        bootstrapCtStateMerge(spread, this.elements)
+        val mutator = bootstrapCtStateMutator(name)
+        val taints = if (known.size == 0 || mutator)
+            this.evaluateArgumentsWith(expression, 1, spread)
+            else this.evaluateArguments(expression, 1)
+        val result = bootstrapCtStateCopy(spread)
+        if (mutator) {
+            this.write(receiver, expression)
+            this.storeElement(this.union(taints))
+        }
+        if (known.size == 0 || mutator) bootstrapCtStateMerge(result, this.union(taints))
+        for (item in known) {
+            this.reach(item)
+            val self = "$item:this"
+            val existing = this.variables.get(self) ?? []
+            if (bootstrapCtStateMerge(existing, receiver)) this.changed = true
+            this.variables.set(self, existing)
+            this.bindArguments(item, taints, 0)
+            bootstrapCtStateMerge(result, this.returns[item])
+        }
+        result
+    }
+
+    fun evaluateCall(expression: BootstrapExpression): array<int> {
+        val name = expression.text
+        val children = expression.children
+        if (this.bound(name)) {
+            // A closure held in a local, called by value.
+            val callee = bootstrapCtStateCopy(this.variable(name))
+            val taints = this.evaluateArguments(expression, 0)
+            val arguments = this.union(taints)
+            this.write(arguments, expression)
+            bootstrapCtStateMerge(callee, arguments)
+            return callee
+        }
+        val callables: array<int> = []
+        var constructor = -1
+        var foreign = false
+        for (item in this.candidates(name)) {
+            if (item < this.declarations.size) {
+                val declaration = this.declarations[item]
+                if (declaration.kind == "class") constructor = item
+                else if (declaration.kind == "extern") foreign = true
+                else if ((declaration.kind == "fun" || declaration.kind == "compile.fun") &&
+                    declaration.extensionOwner == "") callables.append(item)
+                else if (this.isValue(declaration.kind)) {
+                    // A global holding a function, called by value.
+                    this.noteGlobal(item)
+                }
+            }
+        }
+        val taints = this.evaluateArguments(expression, 0)
+        val arguments = this.union(taints)
+        val result: array<int> = []
+        if (constructor >= 0) {
+            this.reach(constructor)
+            var index = 0
+            while (index < taints.size) {
+                val field = this.parameterName(constructor, index)
+                if (field != "") this.storeField(field, taints[index])
+                index = index + 1
+            }
+        }
+        for (item in callables) {
+            this.reach(item)
+            this.bindArguments(item, taints, 0)
+            bootstrapCtStateMerge(result, this.returns[item])
+        }
+        if (foreign || (constructor < 0 && callables.size == 0)) {
+            // A foreign or built-in function: it may write what it is given, and
+            // its result may be part of it.
+            if (foreign) this.write(arguments, expression)
+            bootstrapCtStateMerge(result, arguments)
+        }
+        result
+    }
+
+    fun evaluateValueCall(expression: BootstrapExpression): array<int> {
+        val callee = if (expression.children.size > 0) this.evaluate(expression.children[0]) else []
+        val taints = this.evaluateArguments(expression, 1)
+        val arguments = this.union(taints)
+        this.write(arguments, expression)
+        bootstrapCtStateMerge(callee, arguments)
+        callee
+    }
+
+    // Walks one item's body: its parameters (and `this`) are the names it binds.
+    fun walk(item: int, body: BootstrapExpression): void {
+        this.current = item
+        this.scope.truncate(0)
+        val declaration = this.itemDeclaration[item]
+        if (declaration >= 0) {
+            val owner = this.declarations[declaration]
+            val method = this.itemMethod[item]
+            val target = if (method < 0) owner else owner.methods[method]
+            if (method >= 0 || owner.extensionOwner != "") this.scope.append("this")
+            for (name in target.parameters) this.scope.append(name)
+            for (parameterDefault in target.parameterDefaults) this.evaluate(parameterDefault)
+        }
+        val value = this.evaluate(body)
+        if (item < this.declarations.size && this.isValue(this.declarations[item].kind)) {
+            if (bootstrapCtStateMerge(this.globalTaint[item], value)) this.changed = true
+        } else if (bootstrapCtStateMerge(this.returns[item], value)) {
+            this.changed = true
+        }
+        return
+    }
+}
+
+fun bootstrapCtStateAnalyze(
+    declarations: array<BootstrapDeclaration>,
+    library: array<bool>,
+    siteExpressions: array<BootstrapExpression>,
+    siteSources: array<string>
+): BootstrapCtStateResult {
+    val itemDeclaration: array<int> = []
+    val itemMethod: array<int> = []
+    val byName: Map<string, array<int>> = Map()
+    val itemBody: array<BootstrapExpression> = []
+    val itemSource: array<string> = []
+    val itemLibrary: array<bool> = []
+    val ordinary: array<bool> = []
+    val component: array<bool> = []
+    val writers: array<string> = []
+    var index = 0
+    while (index < declarations.size) {
+        val declaration = declarations[index]
+        itemDeclaration.append(index)
+        itemMethod.append(-1)
+        itemBody.append(declaration.expression)
+        itemSource.append(declaration.sourceIdentity)
+        itemLibrary.append(library[index])
+        ordinary.append((declaration.kind == "val" || declaration.kind == "var") &&
+            !bootstrapTextContains(declaration.sourceIdentity, "/abla/runtime/"))
+        component.append(ordinary[index] &&
+            !bootstrapCtStateImmutable(declaration.resultType, declaration.expression))
+        writers.append("")
+        val list = byName.get(declaration.name) ?? []
+        list.append(index)
+        byName.set(declaration.name, list)
+        index = index + 1
+    }
+    index = 0
+    while (index < declarations.size) {
+        var method = 0
+        while (method < declarations[index].methods.size) {
+            val found = declarations[index].methods[method]
+            val item = itemDeclaration.size
+            itemDeclaration.append(index)
+            itemMethod.append(method)
+            itemBody.append(found.expression)
+            itemSource.append(if (found.sourceIdentity != "") found.sourceIdentity
+                else declarations[index].sourceIdentity)
+            itemLibrary.append(library[index])
+            val list = byName.get(found.name) ?? []
+            list.append(item)
+            byName.set(found.name, list)
+            method = method + 1
+        }
+        index = index + 1
+    }
+    val siteBase = itemDeclaration.size
+    var site = 0
+    while (site < siteExpressions.size) {
+        itemDeclaration.append(-1)
+        itemMethod.append(-1)
+        itemBody.append(siteExpressions[site])
+        itemSource.append(siteSources[site])
+        itemLibrary.append(false)
+        site = site + 1
+    }
+    val count = itemDeclaration.size
+    val reachedItems: array<bool> = []
+    val itemGlobals: array<array<int>> = []
+    val itemCallees: array<array<int>> = []
+    val returns: array<array<int>> = []
+    val globalTaint: array<array<int>> = []
+    index = 0
+    while (index < count) {
+        reachedItems.append(index >= siteBase)
+        itemGlobals.append([])
+        itemCallees.append([])
+        returns.append([])
+        index = index + 1
+    }
+    index = 0
+    while (index < declarations.size) {
+        globalTaint.append([])
+        index = index + 1
+    }
+    val state = BootstrapCtState(
+        declarations, library, itemDeclaration, itemMethod, byName, itemSource,
+        itemLibrary, reachedItems, itemGlobals, itemCallees, globalTaint, Map(), returns,
+        Map(), [], writers, ordinary, component, true, 0, [], []
+    )
+    var passes = 0
+    while (state.changed && passes < 64) {
+        state.changed = false
+        var item = 0
+        while (item < count) {
+            if (state.reachedItems[item]) state.walk(item, itemBody[item])
+            item = item + 1
+        }
+        passes = passes + 1
+    }
+    // What each site reaches: the closure of its references and callees.
+    val reached: array<array<int>> = []
+    site = 0
+    while (site < siteExpressions.size) {
+        val seen: array<bool> = []
+        index = 0
+        while (index < count) {
+            seen.append(false)
+            index = index + 1
+        }
+        val pending: array<int> = [siteBase + site]
+        seen[siteBase + site] = true
+        val globals: array<int> = []
+        while (pending.size > 0) {
+            val item = pending[pending.size - 1]
+            pending.truncate(pending.size - 1)
+            for (global in state.itemGlobals[item]) {
+                if (state.ordinary[global]) bootstrapCtStateMerge(globals, [global])
+            }
+            for (callee in state.itemCallees[item]) {
+                if (!seen[callee]) {
+                    seen[callee] = true
+                    pending.append(callee)
+                }
+            }
+        }
+        reached.append(globals)
+        site = site + 1
+    }
+    BootstrapCtStateResult(reached, state.writers)
+}
