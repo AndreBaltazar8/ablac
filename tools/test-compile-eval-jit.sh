@@ -36,6 +36,26 @@ for mode in interp jit; do
     run_case "$mode" delegates 42
 done
 
+# A bare compiler payload run from the repository root has no ABLA_SYSROOT, so the standard
+# library's modules are "stdlib/..." with a relative root: the library must still be recognized,
+# else a compile-time global initializer ran twice (#810: globals.ab exited 1, silently).
+payload=$compiler
+[[ -x $compiler.bin ]] && payload=$compiler.bin
+if [[ $("$payload" --version 2>/dev/null) == ablac* ]]; then
+    (
+        cd "$project_root"
+        unset ABLA_SYSROOT
+        ABLA_COMPILE_EVAL=jit "$payload" build "$cases/globals.ab" \
+            -o "$output_directory/globals-bare" --no-cache 2> "$output_directory/globals-bare.trace"
+    )
+    bare_status=0
+    "$output_directory/globals-bare" || bare_status=$?
+    [[ $bare_status -eq 42 ]] || {
+        echo "compile-eval-jit: globals under jit without ABLA_SYSROOT exited $bare_status, expected 42" >&2
+        exit 1
+    }
+fi
+
 # A delegated compile global is kept as its delegate on both tiers: the native sites
 # (six, one of them the seed global's initializer) see each other's changes, and the interpreted one's change, which no setter
 # can pass in, leaves the last site interpreted.
