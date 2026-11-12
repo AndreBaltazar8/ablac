@@ -21,7 +21,7 @@ output_directory="$project_root/build/macos-host-test"
 mkdir -p "$output_directory"
 
 # Run before compiler-dependent checks so limiter failures are reported directly.
-python3 "$project_root/tests/cases/run-limited/darwin-parent-death.py" \
+bash "$project_root/tests/cases/run-limited/darwin-parent-death.sh" \
     "$project_root/tools/run-limited.sh"
 "$project_root/tools/test-run-limited.sh"
 

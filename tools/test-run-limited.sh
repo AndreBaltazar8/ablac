@@ -74,5 +74,8 @@ set -e
 if [[ $(uname -s) == Linux ]]; then
     bash "$root/tests/cases/run-limited/parent-death.sh" "$runner"
 fi
+# The macOS supervisor (a shell script) runs on every host, so Linux exercises it too: its
+# process-group, signal, deadline and start-up-race cases, and every exit code.
+bash "$root/tests/cases/run-limited/darwin-parent-death.sh" "$runner"
 
 printf '%s\n' 'limited runner tests passed'

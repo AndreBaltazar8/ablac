@@ -59,21 +59,10 @@ bounded() {
 }
 
 started=$SECONDS
-# ABLA_RUN_LIMITED_SUPERVISOR=shell selects the macOS shell supervisor on any host (the
-# tests exercise it on Linux); on macOS it is opt-in until the switch from Python.
-if [[ $OSTYPE == darwin* && ${ABLA_RUN_LIMITED_SUPERVISOR:-} != shell ]]; then
-    ulimit -S -c 0
-    ulimit -S -t "$cpu_seconds"
-    if ! command -v python3 >/dev/null 2>&1; then
-        printf '%s\n' '[abla-limit] macOS development runner requires Python 3 (python3 on PATH)' >&2
-        exit 127
-    fi
-    runner_directory=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-    set +e
-    bounded python3 "$runner_directory/run-limited-darwin.py" \
-        "$$" "$wall_seconds" "$kill_grace_seconds" "$@"
-    set -e
-elif [[ ${ABLA_RUN_LIMITED_SUPERVISOR:-} == shell ]]; then
+# macOS has no setpriv/timeout/prlimit: tools/run-limited-darwin.sh supervises the payload group
+# and this shell's lifetime. ABLA_RUN_LIMITED_SUPERVISOR=shell selects it on any host (the tests
+# exercise it on Linux).
+if [[ $OSTYPE == darwin* || ${ABLA_RUN_LIMITED_SUPERVISOR:-} == shell ]]; then
     ulimit -S -c 0
     ulimit -S -t "$cpu_seconds"
     runner_directory=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
