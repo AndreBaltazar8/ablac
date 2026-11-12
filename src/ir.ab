@@ -5426,7 +5426,10 @@ class BootstrapLowerer(
     val projectionOwnerLeaves: array<BootstrapExpression> = [],
     val projectionOwnerStorage: array<string> = [],
     var suppressProjectionOwner: int = 0,
-    val namedBorrowedStorages: array<string> = []
+    val namedBorrowedStorages: array<string> = [],
+    val defaultTemporaryStorages: array<string> = [],
+    val statementTemporaryStorages: array<string> = [],
+    val loopOwnerTemporaryStorages: array<string> = []
 ) {
     /** The newest visible local named `name` (with a type, when `typed`), or -1. */
     /** Every visible local named `name`, first declared first. */
@@ -5587,6 +5590,7 @@ class BootstrapLowerer(
         this.locals.append("__abla_temporary_${this.allocateLabel()}")
         this.localTypes.append(type)
         this.localStorage.append(storage)
+        this.statementTemporaryStorages.append(storage)
         this.localScopes.append(this.currentScope)
         this.localBorrowSources.append("")
         val mark = this.projectionOwnerLeaves.size
@@ -5795,6 +5799,7 @@ class BootstrapLowerer(
         this.locals.append(name)
         this.localTypes.append(type)
         this.localStorage.append(storage)
+        this.statementTemporaryStorages.append(storage)
         this.localScopes.append(this.currentScope)
         this.localBorrowSources.append("")
         this.emit("local.declare", value, -1, storage)
@@ -5874,6 +5879,21 @@ class BootstrapLowerer(
     }
 
     fun emitScopeDrops(scope: int) {
+        // A leaving statement finishes before the scope's defers. Defaults
+        // evaluated in the callee prologue instead live through its locals.
+        var temporary = this.locals.size
+        while (temporary > 0) {
+            temporary = temporary - 1
+            if (this.localScopes[temporary] == scope &&
+                bootstrapReceiverNameIn(this.statementTemporaryStorages,
+                    this.localStorage[temporary]) &&
+                !bootstrapReceiverNameIn(this.defaultTemporaryStorages,
+                    this.localStorage[temporary]) &&
+                !bootstrapReceiverNameIn(this.loopOwnerTemporaryStorages,
+                    this.localStorage[temporary])) {
+                this.emitAffineDrop(this.localStorage[temporary], this.localTypes[temporary])
+            }
+        }
         var deferred = this.deferredScopes.size
         while (deferred > 0) {
             deferred = deferred - 1
@@ -5894,6 +5914,12 @@ class BootstrapLowerer(
             // Every local but a cell (whose payload its owner drops), whatever its
             // type's name: a short one like `File` used to skip the drop.
             if (this.localScopes[index] == scope &&
+                (!bootstrapReceiverNameIn(this.statementTemporaryStorages,
+                    this.localStorage[index]) ||
+                 bootstrapReceiverNameIn(this.defaultTemporaryStorages,
+                     this.localStorage[index]) ||
+                 bootstrapReceiverNameIn(this.loopOwnerTemporaryStorages,
+                     this.localStorage[index])) &&
                 !bootstrapReceiverNameIn(this.namedBorrowedStorages, this.localStorage[index]) &&
                 !bootstrapIsCaptureCellType(this.localTypes[index]) &&
                 !(this.localTypes[index].size >= 5 &&
@@ -9055,6 +9081,16 @@ class BootstrapLowerer(
             defaultIndex = defaultIndex + 1
         }
         functionLowerer.initializeTemporaries(defaultMark, 0)
+        var defaultLocal = defaultMark
+        while (defaultLocal < functionLowerer.locals.size) {
+            if (bootstrapReceiverNameIn(functionLowerer.statementTemporaryStorages,
+                functionLowerer.localStorage[defaultLocal]) &&
+                functionLowerer.localTypes[defaultLocal] != "void") {
+                functionLowerer.defaultTemporaryStorages.append(functionLowerer
+                    .localStorage[defaultLocal])
+            }
+            defaultLocal = defaultLocal + 1
+        }
         val bodyMark = functionLowerer.locals.size
         val result = functionLowerer.lowerExpression(declaration.expression, true,
             bootstrapIrIsErasedType(functionLowerer.erasedReturnType))
@@ -9280,6 +9316,16 @@ class BootstrapLowerer(
             defaultIndex = defaultIndex + 1
         }
         methodLowerer.initializeTemporaries(defaultMark, 0)
+        var defaultLocal = defaultMark
+        while (defaultLocal < methodLowerer.locals.size) {
+            if (bootstrapReceiverNameIn(methodLowerer.statementTemporaryStorages,
+                methodLowerer.localStorage[defaultLocal]) &&
+                methodLowerer.localTypes[defaultLocal] != "void") {
+                methodLowerer.defaultTemporaryStorages.append(methodLowerer
+                    .localStorage[defaultLocal])
+            }
+            defaultLocal = defaultLocal + 1
+        }
         val bodyMark = methodLowerer.locals.size
         val methodResult = methodLowerer.lowerExpression(method.expression, true,
             bootstrapIrIsErasedType(methodLowerer.erasedReturnType))
@@ -12495,6 +12541,7 @@ fun bootstrapLowerFor(
             sourceStorage = "for_dynamic_generator_${lowerer.allocateLabel()}"
             val flagStorage = "${sourceStorage}_borrowed"
             lowerer.emitControl("local.zero.bool", -1, -1, -1, flagStorage)
+            val sourceTemporaryMark = lowerer.locals.size
             val mark = lowerer.generatorSourceLeaves.size
             val leaves: array<BootstrapExpression> = []
             lowerer.collectImplicitResults(expression.children[0], leaves)
@@ -12503,6 +12550,15 @@ fun bootstrapLowerFor(
                 lowerer.generatorSourceFlags.append(flagStorage)
             }
             source = lowerer.lowerExpression(expression.children[0])
+            var sourceLocal = sourceTemporaryMark
+            while (sourceLocal < lowerer.locals.size) {
+                if (bootstrapReceiverNameIn(lowerer.statementTemporaryStorages,
+                    lowerer.localStorage[sourceLocal]) && lowerer.localTypes[sourceLocal] !=
+                    "void") {
+                    lowerer.loopOwnerTemporaryStorages.append(lowerer.localStorage[sourceLocal])
+                }
+                sourceLocal = sourceLocal + 1
+            }
             lowerer.generatorSourceLeaves.truncate(mark)
             lowerer.generatorSourceFlags.truncate(mark)
         } else source = lowerer.lowerExpression(expression.children[0])

@@ -256,6 +256,9 @@
   draws the Generator shapes by default again (ablac-f3-2 saw the same class as the `test-labeled-loops` segfault of
   #736's first gate).
 
+- **Exit statement temporary order (#798).** A `return`, `break`, or `continue` now drops the leaving statement's
+  temporary resources before running the defers of the exited scope. Native execution previously ran the defers
+  first while compile-time evaluation dropped the temporaries first; destructor effects can therefore change order.
 - **Default-argument temporary owners (#790).** Temporary owners created while evaluating omitted defaults are now
   dropped: after callee locals for function and method prologue defaults, or at the caller's statement boundary for
   constructor and named defaults. Their destructors previously leaked or ran before a named call. This changes

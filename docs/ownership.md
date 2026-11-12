@@ -309,8 +309,10 @@ The rules:
   (`issue(5).id`), or an argument to a borrowing parameter (`check(issue(5))`). If it is part of the condition of an
   `if`, `while` or `do`/`while`, the subject of a `when`, or an operand of `&&` or `||` that may not run, it is
   dropped at the end of that condition, subject or operand (a loop's condition on each pass), before the body.
-  Several are dropped newest first. A `return`, `break` or `continue` in the middle of the statement drops the ones
-  made so far. The same holds in the compile-time evaluator, in a global's initializer and in the body of a
+  Several are dropped newest first. A `return`, `break` or `continue` in the middle of a statement first drops its
+  temporaries made so far, then runs the defers and drops the locals of each scope it leaves, innermost first.
+  For a return, the return value is computed before these drops; each scope's defers run before its locals drop.
+  The same holds in the compile-time evaluator, in a global's initializer and in the body of a
   lambda, a `defer` and a generator. A resource something takes (a constructor or `own` argument, a `move`) is not
   one. A temporary in a default argument evaluated in a function or method's prologue is dropped when that callee
   returns, after its locals, newest first. A default evaluated at the caller (a constructor or named call) holds its
