@@ -95,11 +95,17 @@ and objects are unchanged.
 The heap of such an executable is Abla code over the `mmap`, `munmap`, `mremap` and `madvise` system
 calls (`__ablaRuntimeHostHeap*` in `abla/runtime/platform/host.ab`); `runtimeMemoryRelease()` gives
 its free memory back to the system. Its lock is taken only once a second thread exists (an Abla
-thread or the background-free helper). A process that forks while another thread may be inside the
-allocator must not allocate in the child before `exec` or `_exit`: the standard library's process
-functions and the compiler's own capture already obey this (their children are made with the fork
-system call and prepared before it), and a program that calls `fork` through its own `extern:"c"`
-declaration while other threads exist has to do the same, as POSIX asks of any multithreaded process.
+thread or the background-free helper). A fork while another thread holds the heap lock (or the runtime's
+own mutex) does not leave the child locked for ever: the first runtime lock the child finds held notices the
+fork, through a page of its own that the kernel zeroes in the child (`MADV_WIPEONFORK`, Linux 4.14, so no
+system call and no hook on the allocation path), frees both locks, and, when the heap's lock was held, drops
+the free lists, bins and cache of large mappings (their memory leaks) and never merges blocks again in that
+child, since a list the other thread was updating may be half written. A kernel without that advice does not
+detect it. What the collector's own bookkeeping (its registry and byte counts) held at that instant is not
+repaired, and an Abla thread pool does not survive a fork (its workers are gone); the standard library's
+process functions and the compiler's own capture still prepare everything before the fork and allocate
+nothing in the child, which stays the safest way to run a program after a fork, as POSIX asks of any
+multithreaded process.
 
 Programmable external targets can additionally request a generic `module`
 artifact. The current WebAssembly linker produces a no-entry module, preserves
