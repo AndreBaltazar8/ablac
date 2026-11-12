@@ -171,6 +171,19 @@ rm "$directory/ablac-x86_64-macos.sha256"
 expect_fail "a missing .sha256" "$pin" v9.9.9 --dir "$directory" --root "$root"
 [[ $(snapshot) == "$before" ]] || fail "a refused pin changed the checkout"
 expect_fail "a bad tag" "$pin" 9.9.9 --dir "$release" --root "$root"
+# A bootstrap-compiler.sh the rewrite cannot place (no version line; a platform without its sha256)
+# is refused and left as it was.
+good=$(cat "$root/tools/bootstrap-compiler.sh")
+sed '/^version=/d' <<<"$good" >"$root/tools/bootstrap-compiler.sh"
+broken=$(cat "$root/tools/bootstrap-compiler.sh")
+expect_fail "a bootstrap-compiler.sh without a version line" "$pin" v9.9.9 --dir "$release" --root "$root"
+[[ $(cat "$root/tools/bootstrap-compiler.sh") == "$broken" ]] || fail "a refused rewrite changed bootstrap-compiler.sh"
+sed '/platform_sha256=2222/d' <<<"$good" >"$root/tools/bootstrap-compiler.sh"
+broken=$(cat "$root/tools/bootstrap-compiler.sh")
+expect_fail "a bootstrap-compiler.sh without the Intel macOS sha256" "$pin" v9.9.9 --dir "$release" --root "$root"
+[[ $(cat "$root/tools/bootstrap-compiler.sh") == "$broken" ]] || fail "a refused rewrite changed bootstrap-compiler.sh"
+printf '%s\n' "$good" >"$root/tools/bootstrap-compiler.sh"
+[[ $(snapshot) == "$before" ]] || fail "the fixture was not restored"
 
 # The good release pins.
 "$pin" v9.9.9 --dir "$release" --root "$root" >"$work/out.txt" 2>&1 || { cat "$work/out.txt" >&2; fail "release-pin refused a good release"; }

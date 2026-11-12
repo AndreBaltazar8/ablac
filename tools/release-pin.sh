@@ -10,7 +10,7 @@
 #   README.md                     every mention of the version being replaced
 #   docs/bootstrap.md             every mention of the version being replaced
 # and prints the diff stat. Nothing is committed. Writes nothing when a check fails.
-# Needs bash, curl (or --dir), python3 and perl (a minimal CI image may lack the last two).
+# Needs bash, curl (or --dir), awk and perl (a minimal CI image may lack perl).
 # Afterwards verify the pin the way the release process says: build master from the pinned
 # bootstrap (tools/bootstrap-compiler.sh build/bootstrap-ablac, then the stages) and cmp.
 #
@@ -122,20 +122,31 @@ for artifact in "${artifacts[@]}"; do
 done
 
 # Rewrite bootstrap-compiler.sh: the version and, in each platform's case block, its sha256.
-python3 - "$script" "$tag" "$sum_linux" "$sum_intel" "$sum_arm" <<'PY' || exit 1
-import re, sys
-path, tag, linux, intel, arm = sys.argv[1:]
-text = open(path).read()
-text, n = re.subn(r'^version=v[0-9.]+$', 'version=' + tag, text, count=1, flags=re.M)
-if n != 1:
-    sys.exit('release-pin: no version= line')
-for artifact, sha in (('ablac-x86_64-linux', linux), ('ablac-x86_64-macos', intel), ('ablac-arm64-macos', arm)):
-    pattern = r'(artifact=%s\n\s*platform_sha256=)[0-9a-f]{64}' % re.escape(artifact)
-    text, n = re.subn(pattern, r'\g<1>' + sha, text, count=1)
-    if n != 1:
-        sys.exit('release-pin: no platform_sha256 for ' + artifact)
-open(path, 'w').write(text)
-PY
+pinned=$work/bootstrap-compiler.sh
+awk -v tag="$tag" -v linux="$sum_linux" -v intel="$sum_intel" -v arm="$sum_arm" '
+    BEGIN { sha["ablac-x86_64-linux"] = linux; sha["ablac-x86_64-macos"] = intel; sha["ablac-arm64-macos"] = arm }
+    !versions && /^version=v[0-9.]+$/ { print "version=" tag; versions = 1; next }
+    /^[ \t]*artifact=[^ \t]+$/ { current = substr($0, index($0, "=") + 1); print; next }
+    # The platform_sha256= line right after an artifact= line, once per artifact.
+    current != "" && /^[ \t]*platform_sha256=[0-9a-f]+$/ {
+        at = index($0, "=")
+        old = substr($0, at + 1)
+        if ((current in sha) && length(old) >= 64 && !(current in done)) {
+            print substr($0, 1, at) sha[current] substr(old, 65)
+            done[current] = 1
+            current = ""
+            next
+        }
+    }
+    { current = ""; print }
+    END {
+        if (!versions) { print "release-pin: no version= line" > "/dev/stderr"; exit 1 }
+        for (name in sha) if (!(name in done)) {
+            print "release-pin: no platform_sha256 for " name > "/dev/stderr"; exit 1
+        }
+    }
+' "$script" > "$pinned" || exit 1
+cat "$pinned" > "$script"
 
 # README.md and docs/bootstrap.md: every mention of the version being replaced.
 # (A mention is the version followed by neither a letter, a digit nor `.digit`, so v0.2.49 leaves v0.2.490 alone.)
