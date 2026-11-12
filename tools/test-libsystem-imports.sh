@@ -2,7 +2,7 @@
 # The macOS counterpart of tools/test-libc-imports.sh (#811): lists the libSystem
 # imports of the programs in tests/cases/libc-imports (release and --fast) and of
 # the compiler, and fails on one that tools/libsystem-imports-allowlist.txt does
-# not hold. The list was taken from CI's Apple Silicon runner (tools/macos-libsystem-
+# not hold. The list is the union of CI's Apple Silicon and Intel runners (tools/macos-libsystem-
 # inventory.sh) and may only shrink: remove a line when its import goes away. A
 # line is "<subject> <symbol>"; a needed library is "needed:<install name>". An
 # import that only the other architecture has is fine: stale lines are reported,
