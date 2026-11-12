@@ -33,6 +33,15 @@ report() { # variant program line
     echo "RESULT [$arch] $1 $2: $3" | tee -a "$summary"
 }
 
+execute() { # directory program: runs it for at most 20 s, sets EXECUTE_STATUS
+    local dir=$1 program=$2
+    "$dir/$program" > "$dir/run.out" 2> "$dir/run.err" &
+    local pid=$! waited=0
+    while kill -0 "$pid" 2>/dev/null && [[ $waited -lt 20 ]]; do sleep 1; waited=$((waited + 1)); done
+    if kill -0 "$pid" 2>/dev/null; then kill -9 "$pid" 2>/dev/null; echo "(killed after 20 s)" >> "$dir/run.err"; fi
+    wait "$pid" 2>/dev/null; EXECUTE_STATUS=$?
+}
+
 try() { # variant program flags
     local name=$1 program=$2 flags=$3 dir=$out/$1-$2
     mkdir -p "$dir"
@@ -51,15 +60,21 @@ try() { # variant program flags
     otool -l "$dir/$program" | grep -E 'cmd LC_|^ *name |dylib|entryoff' | grep -v 'LC_BUILD_VERSION' | head -30
     echo "dyld info:"; otool -L "$dir/$program" 2>&1 | head -5
     echo "signature:"; codesign -dv "$dir/$program" 2>&1 | grep -E 'Signature|flags|Identifier|not signed' | head -4
-    "$dir/$program" > "$dir/run.out" 2> "$dir/run.err" &
-    local pid=$! waited=0 status
-    while kill -0 "$pid" 2>/dev/null && [[ $waited -lt 20 ]]; do sleep 1; waited=$((waited + 1)); done
-    if kill -0 "$pid" 2>/dev/null; then kill -9 "$pid" 2>/dev/null; echo "(killed after 20 s)" >> "$dir/run.err"; fi
-    wait "$pid" 2>/dev/null; status=$?
+    local status
+    execute "$dir"  "$program"; status=$EXECUTE_STATUS
     echo "run: status $status"; echo "stdout:"; cat "$dir/run.out"; echo "stderr:"; head -5 "$dir/run.err"
+    local signed=""
+    if [[ $status -eq 137 || $status -eq 9 ]]; then
+        # Killed: arm64 macOS refuses an unsigned image. Sign ad hoc and run again.
+        codesign -s - --force "$dir/$program" 2>&1 | head -3
+        echo "signature after ad-hoc signing:"; codesign -dv "$dir/$program" 2>&1 | grep -E 'Signature|flags' | head -3
+        report "$name" "$program" "unsigned image killed (status $status); signing ad hoc and running again"
+        execute "$dir" "$program"; status=$EXECUTE_STATUS; signed=" after ad-hoc codesign"
+        echo "run (signed): status $status"; echo "stdout:"; cat "$dir/run.out"; echo "stderr:"; head -5 "$dir/run.err"
+    fi
     local lc
     lc=$(otool -l "$dir/$program" | grep -oE 'LC_MAIN|LC_UNIXTHREAD|LC_LOAD_DYLINKER|LC_LOAD_DYLIB' | sort -u | tr '\n' ' ')
-    report "$name" "$program" "linked ($lc), status $status, output: $(tr '\n' '|' < "$dir/run.out" | cut -c1-120), stderr: $(head -c 120 "$dir/run.err" | tr '\n' '|')"
+    report "$name" "$program" "linked ($lc)$signed, status $status, output: $(tr '\n' '|' < "$dir/run.out" | cut -c1-120), stderr: $(head -c 120 "$dir/run.err" | tr '\n' '|')"
 }
 
 for entry in "${variants[@]}"; do
