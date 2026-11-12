@@ -18,8 +18,16 @@ fail() {
     echo "global initializer split: $1" >&2
     exit 1
 }
-python3 "$project_root/tests/cases/global-initializer-split/generate.py" \
-    "$output_directory/tables.ab" "$output_directory/native.ab"
+awk -f "$project_root/tests/cases/global-initializer-split/generate.awk" > "$output_directory/body.ab"
+{
+    cat "$output_directory/body.ab"
+    printf '\n@export("checksum")\nfun exportedChecksum(): int = checksum()\n'
+} > "$output_directory/tables.ab"
+{
+    printf 'import "abla/io"\n'
+    cat "$output_directory/body.ab"
+    printf '\nfun main: int {\n    println("${checksum()}")\n    0\n}\n'
+} > "$output_directory/native.ab"
 "$compiler" build "$output_directory/native.ab" -o "$output_directory/native" \
     --fast --no-cache
 native=$("$output_directory/native")
@@ -46,32 +54,16 @@ grep -q '"abla.source"="__bootstrap_globals_0"' "$output_directory/tables.wasm.l
 grep -q '"abla.source"="__bootstrap_globals_element_' "$output_directory/tables.wasm.ll" ||
     fail "the table's items were not computed by functions of their own"
 # The largest function body in the module's code section.
-largest=$(python3 - "$output_directory/tables.wasm" <<'READER'
-import sys
-data = open(sys.argv[1], "rb").read()
-def leb(at):
-    result = shift = 0
-    while True:
-        byte = data[at]
-        at += 1
-        result |= (byte & 0x7f) << shift
-        shift += 7
-        if byte < 0x80:
-            return result, at
-at, largest = 8, 0
-while at < len(data):
-    section = data[at]
-    size, at = leb(at + 1)
-    if section == 10:
-        count, body = leb(at)
-        for _ in range(count):
-            length, body = leb(body)
-            largest = max(largest, length)
-            body += length
-    at += size
-print(largest)
-READER
-)
+# The reader is checked first on a module built by hand: bodies of 2, 300 and 1 bytes
+# in a code section followed by another section.
+reader="$project_root/tests/cases/global-initializer-split/largest-function.awk"
+sample=$(awk 'BEGIN {
+    printf "0 97 115 109 1 0 0 0  1 2 0 0  10 180 2 3  2 0 0  172 2"
+    for (i = 0; i < 300; i++) printf " 0"
+    print "  1 0  0 3 0 0 0"
+}' | awk -f "$reader")
+[[ $sample == 300 ]] || fail "the section reader found $sample for a module whose largest body is 300"
+largest=$(od -An -v -tu1 -w32 "$output_directory/tables.wasm" | awk -f "$reader")
 (( largest < 2000000 )) || fail "a function body of $largest bytes"
 wasm=$(node -e '
 const bytes = require("fs").readFileSync(process.argv[1]);
