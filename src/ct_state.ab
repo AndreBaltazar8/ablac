@@ -77,7 +77,10 @@ fun bootstrapCtStateEditsDeclarations(name: string): bool =
     name == "compilerReplaceFunctionBody" || name == "compilerApplyTransform" ||
     name == "compilerAddFunctionAnnotation" || name == "compilerAddExtensionField" ||
     name == "compilerRemoveExtensionField" || name == "compilerDeclareInterface" ||
-    name == "compilerAddConformance"
+    name == "compilerAddConformance" || name == "compilerExportFunction" ||
+    name == "compilerInternalFunction" || name == "compilerRequiredInternalFunction" ||
+    name == "compilerExportCheckedFunction" || name == "compilerInstantiate" ||
+    name == "compilerGenerateModule"
 
 fun bootstrapCtStateMutator(name: string): bool =
     name == "append" || name == "takeAt" || name == "truncate" || name == "clear" ||
@@ -192,6 +195,38 @@ class BootstrapCtState(
         visible
     }
 
+    // The methods and extension functions of a name, from any module: a member call, an operator
+    // or a drop reaches a user type's implementation even when library code makes the call (a
+    // generic bound, a callback by name).
+    fun methodCandidates(name: string): array<int> {
+        val found: array<int> = []
+        for (item in this.byName.get(name) ?? []) {
+            if (item >= this.declarations.size || this.declarations[item].extensionOwner != "") {
+                found.append(item)
+            }
+        }
+        found
+    }
+
+    // A call the source does not write as one (an operator function, an index or delegate
+    // accessor, a drop): every implementation of `name`, with the operands as its receiver and
+    // arguments.
+    fun implicitCall(name: string, taints: array<array<int>>): array<int> {
+        val result: array<int> = []
+        for (item in this.methodCandidates(name)) {
+            this.reach(item)
+            if (taints.size > 0) {
+                val self = "$item:this"
+                val existing = this.variables.get(self) ?? []
+                if (bootstrapCtStateMerge(existing, taints[0])) this.changed = true
+                this.variables.set(self, existing)
+            }
+            this.bindArguments(item, taints, 1)
+            bootstrapCtStateMerge(result, this.returns[item])
+        }
+        result
+    }
+
     fun parameterName(item: int, index: int): string {
         val declaration = this.itemDeclaration[item]
         if (declaration < 0) return ""
@@ -290,6 +325,8 @@ class BootstrapCtState(
             val value = if (children.size > 0) this.evaluate(children[0]) else []
             this.scope.append(expression.text)
             this.bind(expression.text, value)
+            // A resource local is dropped at its scope's end (its drop is reached, not given a receiver).
+            this.implicitCall("drop", [])
             return []
         }
         if (kind == "for" && children.size > 1) {
@@ -316,6 +353,28 @@ class BootstrapCtState(
         if (kind == "string.template") {
             for (child in children) this.evaluate(child)
             return []
+        }
+        // Operator functions, and delegate reads and writes, are calls the source does not write.
+        val operator = bootstrapOperatorFunctionName(kind)
+        if (operator != "") {
+            val operands: array<array<int>> = []
+            for (child in children) operands.append(this.evaluate(child))
+            val result = this.union(operands)
+            bootstrapCtStateMerge(result, this.implicitCall(operator, operands))
+            return result
+        }
+        if (kind == "delegate.assign" && children.size > 1) {
+            val place = this.evaluate(children[0])
+            val value = this.evaluate(children[1])
+            this.write(place, expression)
+            this.implicitCall("setValue", [place, value])
+            return []
+        }
+        if (kind == "delegate.project" && children.size > 0) {
+            val place = this.evaluate(children[0])
+            val result = bootstrapCtStateCopy(place)
+            bootstrapCtStateMerge(result, this.implicitCall("getValue", [place]))
+            return result
         }
         if (kind == "array") {
             val elements: array<int> = []
@@ -347,6 +406,8 @@ class BootstrapCtState(
                     this.noteGlobal(item)
                     if (this.component[item]) bootstrapCtStateMerge(result, [item])
                     bootstrapCtStateMerge(result, this.globalTaint[item])
+                } else if (declaration.kind == "extern") {
+                    if (bootstrapCtStateEditsDeclarations(declaration.name)) this.editing = true
                 } else if (declaration.kind == "fun" || declaration.kind == "compile.fun") {
                     // A function used as a value is called by code this analysis
                     // does not connect to it: its body is part of the pass.
@@ -419,11 +480,7 @@ class BootstrapCtState(
     fun evaluateMemberCall(expression: BootstrapExpression): array<int> {
         val receiver = this.evaluate(expression.children[0])
         val name = expression.text
-        val known: array<int> = []
-        for (item in this.candidates(name)) {
-            if (item >= this.declarations.size ||
-                this.declarations[item].extensionOwner != "") known.append(item)
-        }
+        val known = this.methodCandidates(name)
         val spread = bootstrapCtStateCopy(receiver)
         bootstrapCtStateMerge(spread, this.elements)
         val mutator = bootstrapCtStateMutator(name)
@@ -484,6 +541,7 @@ class BootstrapCtState(
         val result: array<int> = []
         if (constructor >= 0) {
             this.reach(constructor)
+            if (this.declarations[constructor].isResource) this.implicitCall("drop", [[]])
             var index = 0
             while (index < taints.size) {
                 val field = this.parameterName(constructor, index)
@@ -576,7 +634,8 @@ fun bootstrapCtStateAnalyze(
             }
         }
         component.append(ordinary[index] &&
-            !bootstrapCtStateImmutable(declaredType, declaration.expression))
+            (declaration.expression.kind == "delegate.initializer" ||
+             !bootstrapCtStateImmutable(declaredType, declaration.expression)))
         writers.append("")
         val list = byName.get(declaration.name) ?? []
         list.append(index)
@@ -646,6 +705,16 @@ fun bootstrapCtStateAnalyze(
         }
         passes = passes + 1
     }
+    // Not converged: no write is ruled out.
+    if (state.changed) {
+        var unconverged = 0
+        while (unconverged < declarations.size) {
+            if (ordinary[unconverged] && writers[unconverged] == "") {
+                writers[unconverged] = "the write analysis did not converge"
+            }
+            unconverged = unconverged + 1
+        }
+    }
     // What each site reaches: the closure of its references and callees.
     val reached: array<array<int>> = []
     site = 0
@@ -683,4 +752,53 @@ fun bootstrapCtStateAnalyze(
         index = index + 1
     }
     BootstrapCtStateResult(reached, state.writers, state.editing, snapshot)
+}
+
+// Whether a value of `type` may hold a closure: a function type, an unknown or `any` type, an
+// interface, or a class with a field that may (searched through constructor parameter types,
+// array/map/nullable wrappers, to a fixed depth). Scalars, strings and arrays of them cannot.
+fun bootstrapCtStateMayHoldClosure(
+    declarations: array<BootstrapDeclaration>,
+    type: string,
+    depth: int = 0
+): bool {
+    val normalized = bootstrapNormalizeType(type)
+    if (normalized == "" || normalized == "inferred" || normalized == "any" ||
+        normalized == "unknown") return true
+    if (bootstrapTextContains(normalized, "->")) return true
+    if (depth > 6) return true
+    var begin = 0
+    var index = 0
+    while (index <= normalized.size) {
+        val byte = if (index < normalized.size) normalized[index] else 32
+        val word = (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) ||
+            (byte >= 48 && byte <= 57) || byte == 95
+        if (!word) {
+            if (index > begin) {
+                val name = normalized.slice(begin, index)
+                val scalar = name == "int" || name == "bool" || name == "string" || name ==
+                    "char" ||
+                    name == "f32" || name == "f64" || name == "i8" || name == "u8" ||
+                    name == "i16" || name == "u16" || name == "i32" || name == "u32" ||
+                    name == "i64" || name == "u64" || name == "void" || name == "null" ||
+                    name == "array" || name == "map" || name == "set"
+                if (!scalar) {
+                    for (declaration in declarations) {
+                        if (declaration.name == name) {
+                            if (declaration.kind == "interface") return true
+                            if (declaration.kind == "class") {
+                                for (field in declaration.parameterTypes) {
+                                    if (bootstrapCtStateMayHoldClosure(declarations, field,
+                                        depth + 1)) return true
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            begin = index + 1
+        }
+        index = index + 1
+    }
+    false
 }

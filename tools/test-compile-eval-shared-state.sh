@@ -54,6 +54,11 @@ NODE
                 if [[ $name == readonly ]]; then
                     pos=$(offset '#lookup()')
                     grep '^note\[ct-jit\]: native at ' "$log" | grep -Fq "readonly.ab:$pos"
+                elif [[ $name == delegate-* ]]; then
+                    # A delegated binding is rewritten before analysis, which moves the sites: count them.
+                    [[ $(grep -c "^note\[ct-jit\]: interpreted at .*ordinary mutable global counter may be written at " "$log") -eq 4 ]] ||
+                        { echo "$name: expected four interpreted sites" >&2; exit 1; }
+                    ! grep -q "^note\[ct-jit\]: native at .*$name.ab" "$log"
                 else
                     for binding in A B D; do
                         pos=$(offset "val $binding = #")
