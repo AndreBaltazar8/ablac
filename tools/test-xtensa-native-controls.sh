@@ -41,9 +41,14 @@ chmod 0444 "$manifest"
 if run "$root" "$catalog" --verify --version "$version" > "$base/manifest.out" 2>&1; then echo 'edited manifest accepted' >&2; exit 1; fi
 grep -q 'manifest_hash' "$base/manifest.out"
 chmod u+w "$manifest"; cp -p "$base/original-manifest" "$manifest"; chmod 0444 "$manifest"
+# The directory name must differ even on a case-insensitive file system (macOS):
+# HTTPS_PROXY and https_proxy would share one, and the second run would then find
+# the first one's installed companion and succeed without looking at the proxy.
+proxy_index=0
 for var in HTTPS_PROXY https_proxy ALL_PROXY; do
-    target="$base/proxy-$var"; mkdir -p "$target/libexec"; : > "$target/libexec/ablac.bin"
-    if env -u HTTPS_PROXY -u https_proxy -u ALL_PROXY "$var=http://private:secret@127.0.0.1:1" "$binary" --toolchain-root "$target" --catalog "$catalog" --version "$version" > "$base/proxy.out" 2>&1; then echo 'proxy was ignored' >&2; exit 1; fi
+    proxy_index=$((proxy_index + 1))
+    target="$base/proxy-$proxy_index"; mkdir -p "$target/libexec"; : > "$target/libexec/ablac.bin"
+    if env -u HTTPS_PROXY -u https_proxy -u ALL_PROXY "$var=http://private:secret@127.0.0.1:1" "$binary" --toolchain-root "$target" --catalog "$catalog" --version "$version" > "$base/proxy.out" 2>&1; then echo "proxy $var was ignored; the installer printed:" >&2; cat "$base/proxy.out" >&2; exit 1; fi
     grep -Fq "$var is set" "$base/proxy.out"
     grep -q 'proxies are not supported' "$base/proxy.out"
     grep -q -- '--archive PATH' "$base/proxy.out"
