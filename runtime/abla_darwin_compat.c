@@ -1189,6 +1189,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
                         (size_t)argument2);
     break;
 #endif
+#if !ABLA_DARWIN_SYSCALLS
   case 97:
   case 160: {
     // getrlimit/setrlimit of RLIMIT_STACK (3 on both); Linux writes an
@@ -1217,6 +1218,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     }
     break;
   }
+#endif
   case 228:
     result = clock_gettime(argument0 == 1 ? CLOCK_MONOTONIC : CLOCK_REALTIME,
                            (struct timespec *)(uintptr_t)argument1);
