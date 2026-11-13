@@ -4023,6 +4023,132 @@ trusted fun __ablaRuntimeDarwinImageReadlink(buffer: int, capacity: int): int {
     count
 }
 
+// ---- ioctl and the serial settings (#811) ----
+// Darwin's `struct termios` (72 bytes, unsigned long fields): c_iflag 0, c_oflag 8, c_cflag 16,
+// c_lflag 24, c_cc[20] at 32 (VMIN 16, VTIME 17), c_ispeed 56, c_ospeed 64. tcgetattr is
+// ioctl TIOCGETA 0x40487413 and tcsetattr(TCSANOW) TIOCSETA 0x80487414. UNVERIFIED from memory of
+// <termios.h>/<sys/ttycom.h>: every flag value below; the pty checks of device-serial are the judge.
+
+// A zeroed 256-byte mapping (two termios blocks), or a negative errno.
+trusted fun __ablaRuntimeDarwinTermiosPair(): int {
+    val memory = ablaDarwinSyscall(197, 0, 256, 3, 4098, -1, 0)
+    if (memory < 0 && memory > -4096) return memory
+    memory
+}
+
+// cfmakeraw on the termios block at `block`, as libSystem's does.
+trusted fun __ablaRuntimeDarwinMakeRaw(block: int): void {
+    val input = ablaRuntimeLoadI64(block)
+    ablaRuntimeStoreI64(block,
+        (input & ~(8192 | 1024 | 16 | 2 | 8 | 32 | 64 | 128 | 256 | 512 | 4)) | 1)
+    ablaRuntimeStoreI64(block + 8, ablaRuntimeLoadI64(block + 8) & ~1)
+    ablaRuntimeStoreI64(
+        block + 24,
+        ablaRuntimeLoadI64(block + 24) & ~(2 | 4 | 8 | 16 | 256 | 128 | 1024 | 2147483648 |
+            4194304 | 536870912))
+    ablaRuntimeStoreI64(block + 16, (ablaRuntimeLoadI64(block + 16) & ~(768 | 4096)) | 768 | 2048)
+    return
+}
+
+// The serial request of abla/serial (0x41424c53): six integer settings (baud, data bits, parity
+// 0/1/2, stop bits, raw, hardware flow) applied to the terminal and read back; ENOTSUP when the
+// device did not take them.
+trusted fun __ablaRuntimeDarwinSerial(descriptor: int, settings: int): int {
+    if (settings == 0) return -22
+    val baud = ablaRuntimeLoadI64(settings)
+    val bauds = baud == 50 || baud == 75 || baud == 110 || baud == 134 || baud == 150 || baud ==
+        200 ||
+        baud == 300 || baud == 600 || baud == 1200 || baud == 1800 || baud == 2400 || baud ==
+        4800 ||
+        baud == 9600 || baud == 19200 || baud == 38400 || baud == 57600 || baud == 115200 || baud ==
+        230400
+    if (!bauds) return -22
+    val bits = ablaRuntimeLoadI64(settings + 8)
+    val parity = ablaRuntimeLoadI64(settings + 16)
+    val stops = ablaRuntimeLoadI64(settings + 24)
+    val rawFlag = ablaRuntimeLoadI64(settings + 32)
+    val flow = ablaRuntimeLoadI64(settings + 40)
+    if (bits < 5 || bits > 8 || parity < 0 || parity > 2 || (stops != 1 && stops != 2) ||
+        (rawFlag != 0 && rawFlag != 1) || (flow != 0 && flow != 1)) return -22
+    val desired = __ablaRuntimeDarwinTermiosPair()
+    if (desired < 0 && desired > -4096) return __ablaRuntimeDarwinResult(desired)
+    val actual = desired + 128
+    var result = 0
+    val got = ablaDarwinSyscall(54, descriptor, 1078490131, desired, 0, 0, 0)
+    if (got != 0) result = __ablaRuntimeDarwinResult(got)
+    else {
+        val raw = rawFlag != 0
+        if (raw) {
+            __ablaRuntimeDarwinMakeRaw(desired)
+            ablaRuntimeStoreU8(desired + 32 + 16, 1)
+            ablaRuntimeStoreU8(desired + 32 + 17, 0)
+        }
+        // CSIZE | CSTOPB | PARENB | PARODD | CLOCAL | CREAD | CRTSCTS | CDTR_IFLOW | CDSR_OFLOW | CCAR_OFLOW
+        val controlled = 768 | 1024 | 4096 | 8192 | 32768 | 2048 | 196608 | 262144 | 524288 |
+            1048576
+        var control = ablaRuntimeLoadI64(desired + 16) & ~controlled
+        control = control | (if (bits == 5) 0 else if (bits == 6) 256 else if (bits ==
+            7) 512 else 768)
+        control = control | 32768 | 2048
+        if (parity != 0) control = control | 4096
+        if (parity == 2) control = control | 8192
+        if (stops == 2) control = control | 1024
+        if (flow != 0) control = control | 196608
+        ablaRuntimeStoreI64(desired + 16, control)
+        ablaRuntimeStoreI64(desired, ablaRuntimeLoadI64(desired) & ~(512 | 1024 | 2048))
+        ablaRuntimeStoreI64(desired + 56, baud)
+        ablaRuntimeStoreI64(desired + 64, baud)
+        val set = ablaDarwinSyscall(54, descriptor, 2152231956, desired, 0, 0, 0)
+        if (set != 0) result = __ablaRuntimeDarwinResult(set)
+        else {
+            val read = ablaDarwinSyscall(54, descriptor, 1078490131, actual, 0, 0, 0)
+            if (read != 0) result = __ablaRuntimeDarwinResult(read)
+            else {
+                var inputMask = 512 | 1024 | 2048
+                if (raw) inputMask = inputMask | 1 | 2 | 8 | 32 | 64 | 128 | 256
+                var different = ((ablaRuntimeLoadI64(actual + 16) ^ ablaRuntimeLoadI64(desired +
+                    16)) & controlled) != 0 ||
+                    ablaRuntimeLoadI64(actual + 56) != baud || ablaRuntimeLoadI64(actual + 64) !=
+                    baud ||
+                    ((ablaRuntimeLoadI64(actual) ^ ablaRuntimeLoadI64(desired)) & inputMask) != 0
+                if (raw && (((ablaRuntimeLoadI64(actual + 8) ^ ablaRuntimeLoadI64(desired + 8)) &
+                    1) != 0 ||
+                    ((ablaRuntimeLoadI64(actual + 24) ^ ablaRuntimeLoadI64(desired + 24)) & (8 |
+                        16 | 256 | 128 | 1024)) != 0 ||
+                    ablaRuntimeLoadU8(actual + 48) != 1 || ablaRuntimeLoadU8(actual + 49) !=
+                    0)) different = true
+                if (different) result = -95
+            }
+        }
+    }
+    ablaDarwinSyscall(73, desired, 256, 0, 0, 0, 0)
+    result
+}
+
+// ioctl 16: the serial request and Linux's TCGETS/TCSETS (21505/21506: only the local flags, a
+// 32-bit word at offset 12 of Linux's struct termios), any other request unchanged.
+trusted fun __ablaRuntimeDarwinIoctl(descriptor: int, request: int, argument: int): int {
+    if (request == 1094863955) return __ablaRuntimeDarwinSerial(descriptor, argument)
+    if (request != 21505 && request != 21506) return __ablaRuntimeDarwinResult(
+        ablaDarwinSyscall(54, descriptor, request, argument, 0, 0, 0))
+    val memory = __ablaRuntimeDarwinTermiosPair()
+    if (memory < 0 && memory > -4096) return __ablaRuntimeDarwinResult(memory)
+    var result = __ablaRuntimeDarwinResult(ablaDarwinSyscall(54, descriptor, 1078490131, memory, 0,
+        0, 0))
+    if (result == 0 && argument != 0) {
+        if (request == 21505) {
+            val flags = ablaRuntimeLoadI64(memory + 24) & 4294967295
+            ablaRuntimeStoreI32(argument + 12, flags)
+        } else {
+            ablaRuntimeStoreI64(memory + 24, ablaRuntimeLoadI32(argument + 12) & 4294967295)
+            result = __ablaRuntimeDarwinResult(ablaDarwinSyscall(54, descriptor, 2152231956, memory,
+                0, 0, 0))
+        }
+    }
+    ablaDarwinSyscall(73, memory, 256, 0, 0, 0, 0)
+    result
+}
+
 trusted fun __ablaRuntimeDarwinSyscall(
     number: int,
     argument0: int,
@@ -4112,6 +4238,7 @@ trusted fun __ablaRuntimeDarwinSyscall(
     // getrlimit and setrlimit of the stack (the only resource the portable code asks for).
     if (number == 97 || number == 160) return __ablaRuntimeDarwinRlimit(number, argument0,
         argument1)
+    if (number == 16) return __ablaRuntimeDarwinIoctl(argument0, argument1, argument2)
     // Time and random (#811 group 7): nanosleep, getrandom. clock_gettime stays with the adapter:
     // CLOCK_MONOTONIC has no system call (libSystem reads the commpage).
     if (number == 35) return __ablaRuntimeDarwinNanosleep(argument0)

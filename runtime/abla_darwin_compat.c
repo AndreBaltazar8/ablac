@@ -901,10 +901,12 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     result = darwin_signalfd(argument0, (const void *)(uintptr_t)argument1,
                              argument2, argument3);
     break;
+#if !ABLA_DARWIN_SYSCALLS
   case 16:
     result =
         darwin_ioctl((int)argument0, argument1, (void *)(uintptr_t)argument2);
     break;
+#endif
 #if !ABLA_DARWIN_SYSCALLS
   case 21:
     result = access((const char *)(uintptr_t)argument0, (int)argument1);
