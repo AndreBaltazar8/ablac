@@ -17,7 +17,9 @@ cd "$project_root"
 # reads NIX_SSL_CERT_FILE before it, and a Nix install sets that to the system
 # bundle (CI does), so it would not see the certificate.
 unset NIX_SSL_CERT_FILE
-cp tests/vectors/crypto/test-keys/tls-server.pem "$output_directory/key.pem"
+# (An Ed25519 key: the pure TLS server signs the handshake with it in a --fast build in well under the stages' 300 ms
+# limits; an RSA-2048 key takes about 300 ms there.)
+openssl genpkey -algorithm ED25519 -out "$output_directory/key.pem" || exit 2
 openssl req -x509 -new -key "$output_directory/key.pem" -days 2 -subj /CN=localhost \
     -addext subjectAltName=DNS:localhost,IP:127.0.0.1 \
     -out "$output_directory/certificate.pem" 2>/dev/null || exit 2
