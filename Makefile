@@ -93,6 +93,7 @@ test-serial: ablac
 	tools/test-libsystem-imports.sh $(COMPILER)
 	tools/test-libc-memory-routines.sh $(COMPILER)
 	tools/test-darwin-syscalls.sh $(COMPILER)
+	tools/test-darwin-routines.sh $(COMPILER)
 	tools/test-futex-locks.sh $(COMPILER)
 	tools/test-libc-jump-routines.sh $(COMPILER)
 	tools/test-version.sh $(COMPILER)
