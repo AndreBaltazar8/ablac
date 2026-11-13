@@ -1,0 +1,662 @@
+// NIST P-256 (secp256r1) with no OpenSSL: ECDH, and ECDSA with SHA-256 and RFC 6979 nonces, on the constant-time
+// big-number arithmetic of abla/crypto/bignum (Montgomery, 32-bit limbs, 8 per field element or scalar).
+//
+// What is secret and how it is handled:
+//  - Point addition and doubling are the complete formulas of Renes, Costello and Batina (ePrint 2015/1060,
+//    algorithms 4 and 6 for a = -3): the same instructions for every input, the point at infinity and equal
+//    points included, so there is no exceptional case to branch on.
+//  - A scalar multiplication walks all 64 four-bit windows of the scalar, doubles four times and adds once per
+//    window, the added point read from a table of sixteen by looking at every entry (bnLookup).
+//  - Inversions (a field element, k mod n) are Fermat's, by exponents that are public (bnExpPublic).
+//  - A private key or nonce is rejected when it is not in 1..n-1; that outcome, and a rejected RFC 6979
+//    candidate (probability about 2^-32), are public.
+//  - Verification works on public values only and is not claimed to be constant time.
+// A private key is a `string` of 32 big-endian bytes, as every key and secret in abla/crypto is passed: a string
+// cannot be wiped, so a caller that must not leave a key in memory keeps it elsewhere. The limbs, the nonce and
+// the table made here are wiped when the call ends.
+//
+// Public points are 65 bytes, 0x04 || X || Y; compressed points are refused. A public key is checked to be on the
+// curve (the group has cofactor 1, so that is all that is needed).
+
+import "abla/bytes"
+import "abla/ct"
+import "abla/ct/scrub"
+import "abla/crypto"
+import "abla/crypto/bignum"
+import "abla/crypto/rsa"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+export import "abla/crypto/result"
+
+private val P256_PRIME = "ffffffff00000001000000000000000000000000ffffffffffffffffffffffff"
+private val P256_PRIME_MINUS_TWO = "ffffffff00000001000000000000000000000000fffffffffffffffffffffffd"
+private val P256_ORDER = "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"
+private val P256_ORDER_MINUS_TWO = "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc63254f"
+private val P256_B = "5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b"
+private val P256_GX = "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296"
+private val P256_GY = "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"
+
+
+/** The two moduli and the work area of one operation: made for it and released at its end. */
+class P256Curve(val field: BnModulus, val order: BnModulus, val work: int)
+
+trusted fun p256Open(): P256Curve {
+    val prime = hexDecode(P256_PRIME)
+    val order = hexDecode(P256_ORDER)
+    val field = bnModulusFrom(ablaUnsafeStringAddress(prime), 32, P256_WORDS)
+    val scalar = bnModulusFrom(ablaUnsafeStringAddress(order), 32, P256_WORDS)
+    val work = bnAllocate(P256_WORK_WORDS)
+    val plainB = bnAllocate(P256_WORDS)
+    val b = hexDecode(P256_B)
+    bnFromBytes(plainB, P256_WORDS, ablaUnsafeStringAddress(b), 32)
+    bnEncode(field, work + P256_B_AT, plainB)
+    bnRelease(plainB, P256_WORDS)
+    P256Curve(field, scalar, work)
+}
+
+trusted fun p256Close(curve: P256Curve): void {
+    bnModulusRelease(curve.field)
+    bnModulusRelease(curve.order)
+    bnRelease(curve.work, P256_WORK_WORDS)
+}
+
+// --- Modular addition and subtraction (any odd modulus of eight limbs, operands below it) ----------------------
+
+// BEGIN P256 SECRET CORES
+private val P256_WORDS = 8
+// Byte offsets inside a curve's work area: five temporaries, the accumulator, the sum, the entry read from the table,
+// the table of sixteen points (three field elements each, X, Y, Z in Montgomery form), and b.
+private val P256_TEMPS = 0
+private val P256_ACCUMULATOR = 160
+private val P256_SUM = 256
+private val P256_ENTRY = 352
+private val P256_TABLE = 448
+private val P256_B_AT = 1984
+private val P256_WORK_WORDS = 504
+
+// Where a BnModulus (abla/crypto/bignum) keeps what the arithmetic reads, for eight limbs.
+@inline fun p256Inverse(m: int): int = m + 32
+@inline fun p256One(m: int): int = m + 68
+@inline fun p256Scratch(m: int): int = m + 100
+
+/** `out` = `a` * `b` / 2^256 mod the modulus at `m`. */
+@inline trusted fun p256Multiply(m: int, out: int, a: int, b: int): void =
+    bnMontgomeryMultiply(out, a, b, m, p256Inverse(m), P256_WORDS, p256Scratch(m))
+
+/** `out` = `a` + `b` mod the modulus. `out` may be either. Uses the modulus's scratch. */
+trusted fun p256Add(m: int, out: int, a: int, b: int): void {
+    val t = p256Scratch(m)
+    var carry = secretU32(u32(0))
+    for (j in 0 until P256_WORDS) {
+        val sum = bnLoad(a + j * 4).widen() + bnLoad(b + j * 4).widen() + carry.widen()
+        bnStore(t + j * 4, sum.low())
+        carry = sum.high()
+    }
+    bnConditionalSubtractBody(out, t, carry, m, P256_WORDS, t + (P256_WORDS + 2) * 4)
+}
+
+/** `out` = `a` - `b` mod the modulus. `out` may be either. Uses the modulus's scratch. */
+trusted fun p256Subtract(m: int, out: int, a: int, b: int): void {
+    val t = p256Scratch(m)
+    var borrow = secretU32(u32(0))
+    for (j in 0 until P256_WORDS) {
+        val x = bnLoad(a + j * 4)
+        val y = bnLoad(b + j * 4)
+        val difference = x - y - borrow
+        borrow = ((~x & y) | ((~x | y) & difference)) >> 31
+        bnStore(t + j * 4, difference)
+    }
+    val mask = secretU32(u32(0)) - borrow
+    var carry = secretU32(u32(0))
+    for (j in 0 until P256_WORDS) {
+        val sum = bnLoad(t + j * 4).widen() + (bnLoad(m + j * 4) & mask).widen() + carry.widen()
+        bnStore(out + j * 4, sum.low())
+        carry = sum.high()
+    }
+}
+
+// --- The curve: complete addition and doubling (a = -3) ---------------------------------------------------------
+
+/** `out` = `p` + `q`, projective points in Montgomery form; `out` is neither. Renes-Costello-Batina, algorithm 4. */
+trusted fun p256PointAdd(f: int, work: int, out: int, p: int, q: int): void {
+    val t0 = work + P256_TEMPS
+    val t1 = t0 + 32
+    val t2 = t1 + 32
+    val t3 = t2 + 32
+    val t4 = t3 + 32
+    val b = work + P256_B_AT
+    val x1 = p
+    val y1 = p + 32
+    val z1 = p + 64
+    val x2 = q
+    val y2 = q + 32
+    val z2 = q + 64
+    val x3 = out
+    val y3 = out + 32
+    val z3 = out + 64
+    p256Multiply(f, t0, x1, x2)
+    p256Multiply(f, t1, y1, y2)
+    p256Multiply(f, t2, z1, z2)
+    p256Add(f, t3, x1, y1)
+    p256Add(f, t4, x2, y2)
+    p256Multiply(f, t3, t3, t4)
+    p256Add(f, t4, t0, t1)
+    p256Subtract(f, t3, t3, t4)
+    p256Add(f, t4, y1, z1)
+    p256Add(f, x3, y2, z2)
+    p256Multiply(f, t4, t4, x3)
+    p256Add(f, x3, t1, t2)
+    p256Subtract(f, t4, t4, x3)
+    p256Add(f, x3, x1, z1)
+    p256Add(f, y3, x2, z2)
+    p256Multiply(f, x3, x3, y3)
+    p256Add(f, y3, t0, t2)
+    p256Subtract(f, y3, x3, y3)
+    p256Multiply(f, z3, b, t2)
+    p256Subtract(f, x3, y3, z3)
+    p256Add(f, z3, x3, x3)
+    p256Add(f, x3, x3, z3)
+    p256Subtract(f, z3, t1, x3)
+    p256Add(f, x3, t1, x3)
+    p256Multiply(f, y3, b, y3)
+    p256Add(f, t1, t2, t2)
+    p256Add(f, t2, t1, t2)
+    p256Subtract(f, y3, y3, t2)
+    p256Subtract(f, y3, y3, t0)
+    p256Add(f, t1, y3, y3)
+    p256Add(f, y3, t1, y3)
+    p256Add(f, t1, t0, t0)
+    p256Add(f, t0, t1, t0)
+    p256Subtract(f, t0, t0, t2)
+    p256Multiply(f, t1, t4, y3)
+    p256Multiply(f, t2, t0, y3)
+    p256Multiply(f, y3, x3, z3)
+    p256Add(f, y3, y3, t2)
+    p256Multiply(f, x3, t3, x3)
+    p256Subtract(f, x3, x3, t1)
+    p256Multiply(f, z3, t4, z3)
+    p256Multiply(f, t1, t3, t0)
+    p256Add(f, z3, z3, t1)
+}
+
+/** `out` = 2 `p`; `out` is not `p`. Renes-Costello-Batina, algorithm 6. */
+trusted fun p256PointDouble(f: int, work: int, out: int, p: int): void {
+    val t0 = work + P256_TEMPS
+    val t1 = t0 + 32
+    val t2 = t1 + 32
+    val t3 = t2 + 32
+    val b = work + P256_B_AT
+    val x = p
+    val y = p + 32
+    val z = p + 64
+    val x3 = out
+    val y3 = out + 32
+    val z3 = out + 64
+    p256Multiply(f, t0, x, x)
+    p256Multiply(f, t1, y, y)
+    p256Multiply(f, t2, z, z)
+    p256Multiply(f, t3, x, y)
+    p256Add(f, t3, t3, t3)
+    p256Multiply(f, z3, x, z)
+    p256Add(f, z3, z3, z3)
+    p256Multiply(f, y3, b, t2)
+    p256Subtract(f, y3, y3, z3)
+    p256Add(f, x3, y3, y3)
+    p256Add(f, y3, x3, y3)
+    p256Subtract(f, x3, t1, y3)
+    p256Add(f, y3, t1, y3)
+    p256Multiply(f, y3, x3, y3)
+    p256Multiply(f, x3, x3, t3)
+    p256Add(f, t3, t2, t2)
+    p256Add(f, t2, t2, t3)
+    p256Multiply(f, z3, b, z3)
+    p256Subtract(f, z3, z3, t2)
+    p256Subtract(f, z3, z3, t0)
+    p256Add(f, t3, z3, z3)
+    p256Add(f, z3, z3, t3)
+    p256Add(f, t3, t0, t0)
+    p256Add(f, t0, t3, t0)
+    p256Subtract(f, t0, t0, t2)
+    p256Multiply(f, t0, t0, z3)
+    p256Add(f, y3, y3, t0)
+    p256Multiply(f, t0, y, z)
+    p256Add(f, t0, t0, t0)
+    p256Multiply(f, z3, t0, z3)
+    p256Subtract(f, x3, x3, z3)
+    p256Multiply(f, z3, t0, t1)
+    p256Add(f, z3, z3, z3)
+    p256Add(f, z3, z3, z3)
+}
+
+/** `out` = `scalar` * `point`: `scalar` is eight plain limbs (secret), `point` projective in Montgomery form, and
+ *  `out` is neither. Every window of four bits does the same four doublings, one addition and a read of the whole
+ *  table of sixteen multiples. */
+trusted fun p256ScalarMultiply(f: int, work: int, out: int, point: int, scalar: int): void {
+    val accumulator = work + P256_ACCUMULATOR
+    val sum = work + P256_SUM
+    val entry = work + P256_ENTRY
+    val table = work + P256_TABLE
+    // Entry 0 is the point at infinity, (0 : 1 : 0).
+    for (j in 0 until 24) ablaUnsafeStoreU32(bnPointer(table + j * 4), 0)
+    bnCopy(table + 32, p256One(f), P256_WORDS)
+    bnCopy(table + 96, point, 24)
+    for (i in 2 until 16) p256PointAdd(f, work, table + i * 96, table + (i - 1) * 96, point)
+    bnCopy(accumulator, table, 24)
+    var window = 63
+    while (window >= 0) {
+        for (i in 0 until 4) {
+            p256PointDouble(f, work, sum, accumulator)
+            bnCopy(accumulator, sum, 24)
+        }
+        val position = window * 4
+        val digit = (bnLoad(scalar + (position / 32) * 4) >> (position % 32)) & secretU32(u32(15))
+        bnLookup(entry, table, 16, 24, digit)
+        p256PointAdd(f, work, sum, accumulator, entry)
+        bnCopy(accumulator, sum, 24)
+        window = window - 1
+    }
+    bnCopy(out, accumulator, 24)
+}
+// END P256 SECRET CORES
+
+// --- Conversions -------------------------------------------------------------------------------------------------
+
+/** The `count` bytes at `limbs` as a string, most significant first. */
+trusted fun p256Bytes(limbs: int, count: int): string {
+    val out = nativeByteBuffer(count + 1)
+    bnToBytes(ablaUnsafePointerAddress(out.pointerAt(0)), count, limbs)
+    out.adoptString(count)
+}
+
+/** `out` = `a` * `b` mod the modulus, all plain. */
+trusted fun p256MultiplyPlain(m: BnModulus, out: int, a: int, b: int): void {
+    val encoded = bnAllocate(P256_WORDS)
+    bnEncode(m, encoded, a)
+    bnMultiply(m, out, encoded, b)
+    bnRelease(encoded, P256_WORDS)
+}
+
+/** Whether the eight limbs are zero (for a decision that is public: a rejected key or point). */
+trusted fun p256IsZero(value: int): bool {
+    var any = secretU32(u32(0))
+    for (j in 0 until P256_WORDS) any = any | bnLoad(value + j * 4)
+    ctIsZero(any).declassify() != u32(0)
+}
+
+/** The point at `point` (projective, Montgomery) as plain affine x and y, or false for the point at infinity. */
+trusted fun p256ToAffine(c: P256Curve, point: int, x: int, y: int): bool {
+    val f = c.field
+    val z = bnAllocate(P256_WORDS)
+    val inverse = bnAllocate(P256_WORDS)
+    bnDecode(f, z, point + 64)
+    val infinity = p256IsZero(z)
+    bnExpPublic(f, inverse, z, hexDecode(P256_PRIME_MINUS_TWO))
+    bnDecode(f, x, point)
+    bnDecode(f, y, point + 32)
+    p256MultiplyPlain(f, x, x, inverse)
+    p256MultiplyPlain(f, y, y, inverse)
+    bnRelease(z, P256_WORDS)
+    bnRelease(inverse, P256_WORDS)
+    !infinity
+}
+
+/** The generator, projective in Montgomery form, at `out` (24 limbs). */
+trusted fun p256Generator(c: P256Curve, out: int): void {
+    val plain = bnAllocate(P256_WORDS)
+    val gx = hexDecode(P256_GX)
+    bnFromBytes(plain, P256_WORDS, ablaUnsafeStringAddress(gx), 32)
+    bnEncode(c.field, out, plain)
+    val gy = hexDecode(P256_GY)
+    bnFromBytes(plain, P256_WORDS, ablaUnsafeStringAddress(gy), 32)
+    bnEncode(c.field, out + 32, plain)
+    bnCopy(out + 64, c.field.one(), P256_WORDS)
+    bnRelease(plain, P256_WORDS)
+}
+
+/** `out` (24 limbs) the public point `encoded` (0x04 || X || Y) in Montgomery form, if it is a point of the curve. */
+trusted fun p256ParsePoint(c: P256Curve, encoded: string, out: int): bool {
+    if (encoded.size != 65 || encoded[0] != 4) return false
+    val f = c.field
+    val x = bnAllocate(P256_WORDS)
+    val y = bnAllocate(P256_WORDS)
+    bnFromBytes(x, P256_WORDS, ablaUnsafeStringAddress(encoded) + 1, 32)
+    bnFromBytes(y, P256_WORDS, ablaUnsafeStringAddress(encoded) + 33, 32)
+    var ok = bnLessPublic(x, f.value(), P256_WORDS) && bnLessPublic(y, f.value(), P256_WORDS)
+    if (ok) {
+        val xm = out
+        val ym = out + 32
+        bnEncode(f, xm, x)
+        bnEncode(f, ym, y)
+        bnCopy(out + 64, f.one(), P256_WORDS)
+        // y^2 = x^3 - 3x + b
+        val left = bnAllocate(P256_WORDS)
+        val right = bnAllocate(P256_WORDS)
+        bnMultiply(f, left, ym, ym)
+        bnMultiply(f, right, xm, xm)
+        bnMultiply(f, right, right, xm)
+        for (i in 0 until 3) p256Subtract(f.memory, right, right, xm)
+        p256Add(f.memory, right, right, c.work + P256_B_AT)
+        ok = bnEqual(left, right, P256_WORDS)
+        bnRelease(left, P256_WORDS)
+        bnRelease(right, P256_WORDS)
+    }
+    bnRelease(x, P256_WORDS)
+    bnRelease(y, P256_WORDS)
+    ok
+}
+
+/** The 32 bytes at `key` as a private scalar in `out` (eight limbs), if it is in 1..n-1. */
+trusted fun p256ParseScalar(c: P256Curve, key: string, out: int): bool {
+    if (key.size != 32) return false
+    bnFromBytes(out, P256_WORDS, ablaUnsafeStringAddress(key), 32)
+    !p256IsZero(out) && bnLessPublic(out, c.order.value(), P256_WORDS)
+}
+
+/** `out` = the digest's leftmost 256 bits as a number, reduced mod n (it is below 2 n). */
+trusted fun p256DigestScalar(c: P256Curve, digest: string, out: int): void {
+    val size = if (digest.size > 32) 32 else digest.size
+    bnFromBytes(out, P256_WORDS, ablaUnsafeStringAddress(digest), size)
+    bnConditionalSubtractBody(out, out, secretU32(u32(0)), c.order.value(), P256_WORDS, c.order.scratch())
+}
+
+private fun p256Failed(error: string): CryptoResult = cryptoFailed(error)
+
+// --- Keys and ECDH -----------------------------------------------------------------------------------------------
+
+/** The public key, 65 bytes (0x04 || X || Y), of a private key of 32 bytes. */
+trusted fun p256PublicKey(privateKey: string): CryptoResult {
+    val result = p256PublicKeyWork(privateKey)
+    ctScrubStack4096()
+    return result
+}
+
+private @noinline trusted fun p256PublicKeyWork(privateKey: string): CryptoResult {
+    val c = p256Open()
+    val scalar = bnAllocate(P256_WORDS)
+    var result = p256Failed("the private key is not a number from 1 to n-1 in 32 bytes")
+    if (p256ParseScalar(c, privateKey, scalar)) {
+        val g = bnAllocate(24)
+        val point = bnAllocate(24)
+        val x = bnAllocate(P256_WORDS)
+        val y = bnAllocate(P256_WORDS)
+        p256Generator(c, g)
+        p256ScalarMultiply(c.field.memory, c.work, point, g, scalar)
+        if (p256ToAffine(c, point, x, y)) {
+            result = CryptoResult("\x04" + p256Bytes(x, 32) + p256Bytes(y, 32), true, "")
+        }
+        bnRelease(g, 24)
+        bnRelease(point, 24)
+        bnRelease(x, P256_WORDS)
+        bnRelease(y, P256_WORDS)
+    }
+    bnRelease(scalar, P256_WORDS)
+    p256Close(c)
+    result
+}
+
+/** Whether `encoded` is an uncompressed point of the curve (and so a valid public key). */
+trusted fun p256IsValidPublicKey(encoded: string): bool {
+    val c = p256Open()
+    val point = bnAllocate(24)
+    val ok = p256ParsePoint(c, encoded, point)
+    bnRelease(point, 24)
+    p256Close(c)
+    ok
+}
+
+/** ECDH: the x coordinate, 32 bytes, of `privateKey` times the peer's public point. The peer's point is checked;
+ *  a private key out of range is refused. */
+trusted fun p256Ecdh(privateKey: string, peerPublicKey: string): CryptoResult {
+    val result = p256EcdhWork(privateKey, peerPublicKey)
+    ctScrubStack4096()
+    return result
+}
+
+private @noinline trusted fun p256EcdhWork(privateKey: string, peerPublicKey: string): CryptoResult {
+    val c = p256Open()
+    val scalar = bnAllocate(P256_WORDS)
+    var result = p256Failed("the private key is not a number from 1 to n-1 in 32 bytes")
+    if (p256ParseScalar(c, privateKey, scalar)) {
+        val peer = bnAllocate(24)
+        result = p256Failed("the public key is not a point of P-256")
+        if (p256ParsePoint(c, peerPublicKey, peer)) {
+            val point = bnAllocate(24)
+            val x = bnAllocate(P256_WORDS)
+            val y = bnAllocate(P256_WORDS)
+            p256ScalarMultiply(c.field.memory, c.work, point, peer, scalar)
+            if (p256ToAffine(c, point, x, y)) result = CryptoResult(p256Bytes(x, 32), true, "")
+            bnRelease(point, 24)
+            bnRelease(x, P256_WORDS)
+            bnRelease(y, P256_WORDS)
+        }
+        bnRelease(peer, 24)
+    }
+    bnRelease(scalar, P256_WORDS)
+    p256Close(c)
+    result
+}
+
+/** A random private key of 32 bytes, or a failure if there is no random source (see cryptoSetRandom). */
+trusted fun p256GeneratePrivateKey(): CryptoResult {
+    val c = p256Open()
+    val scalar = bnAllocate(P256_WORDS)
+    var result = p256Failed("no random source here: call cryptoSetRandom")
+    var tries = 0
+    while (tries < 64) {
+        val bytes = cryptoRandomBytes(32)
+        if (bytes.size != 32) break
+        if (p256ParseScalar(c, bytes, scalar)) {
+            result = CryptoResult(bytes, true, "")
+            break
+        }
+        tries = tries + 1
+    }
+    bnRelease(scalar, P256_WORDS)
+    p256Close(c)
+    result
+}
+
+// --- ECDSA ---------------------------------------------------------------------------------------------------------
+
+/** RFC 6979's nonce for SHA-256 and the private key `key` (32 bytes) for the message hash `h1`, or "" if no
+ *  candidate falls in 1..n-1 in 100 tries (it always does). `reduced` is h1 mod n as bytes. */
+trusted fun p256Nonce(c: P256Curve, key: string, reduced: string): string {
+    var v = "\x01".repeat(32)
+    var k = "\x00".repeat(32)
+    k = hmacSha256(k, v + "\x00" + key + reduced)
+    v = hmacSha256(k, v)
+    k = hmacSha256(k, v + "\x01" + key + reduced)
+    v = hmacSha256(k, v)
+    val candidate = bnAllocate(P256_WORDS)
+    var found = ""
+    var tries = 0
+    while (tries < 100) {
+        v = hmacSha256(k, v)
+        bnFromBytes(candidate, P256_WORDS, ablaUnsafeStringAddress(v), 32)
+        if (!p256IsZero(candidate) && bnLessPublic(candidate, c.order.value(), P256_WORDS)) {
+            found = v
+            break
+        }
+        k = hmacSha256(k, v + "\x00")
+        v = hmacSha256(k, v)
+        tries = tries + 1
+    }
+    bnRelease(candidate, P256_WORDS)
+    found
+}
+
+/** ECDSA over SHA-256 (RFC 6979 nonce, so a message always gets the same signature): the 64 bytes r || s. */
+trusted fun p256EcdsaSignRaw(privateKey: string, message: string): CryptoResult {
+    val result = p256EcdsaSignWork(privateKey, message)
+    ctScrubStack4096()
+    return result
+}
+
+private @noinline trusted fun p256EcdsaSignWork(privateKey: string, message: string): CryptoResult {
+    val c = p256Open()
+    val d = bnAllocate(P256_WORDS)
+    var result = p256Failed("the private key is not a number from 1 to n-1 in 32 bytes")
+    if (p256ParseScalar(c, privateKey, d)) {
+        val order = c.order
+        val digest = sha256(message)
+        val e = bnAllocate(P256_WORDS)
+        p256DigestScalar(c, digest, e)
+        val nonce = p256Nonce(c, privateKey, p256Bytes(e, 32))
+        result = p256Failed("no usable nonce")
+        if (nonce.size == 32) {
+            val k = bnAllocate(P256_WORDS)
+            val g = bnAllocate(24)
+            val point = bnAllocate(24)
+            val x = bnAllocate(P256_WORDS)
+            val y = bnAllocate(P256_WORDS)
+            val inverse = bnAllocate(P256_WORDS)
+            val product = bnAllocate(P256_WORDS)
+            bnFromBytes(k, P256_WORDS, ablaUnsafeStringAddress(nonce), 32)
+            p256Generator(c, g)
+            p256ScalarMultiply(c.field.memory, c.work, point, g, k)
+            p256ToAffine(c, point, x, y)
+            // r = x mod n (x is below p, which is below 2 n); s = k^-1 (e + r d) mod n.
+            bnConditionalSubtractBody(x, x, secretU32(u32(0)), order.value(), P256_WORDS, order.scratch())
+            bnExpPublic(order, inverse, k, hexDecode(P256_ORDER_MINUS_TWO))
+            p256MultiplyPlain(order, product, x, d)
+            p256Add(order.memory, product, product, e)
+            p256MultiplyPlain(order, product, product, inverse)
+            if (!p256IsZero(x) && !p256IsZero(product)) {
+                result = CryptoResult(p256Bytes(x, 32) + p256Bytes(product, 32), true, "")
+            }
+            bnRelease(k, P256_WORDS)
+            bnRelease(g, 24)
+            bnRelease(point, 24)
+            bnRelease(x, P256_WORDS)
+            bnRelease(y, P256_WORDS)
+            bnRelease(inverse, P256_WORDS)
+            bnRelease(product, P256_WORDS)
+        }
+        bnRelease(e, P256_WORDS)
+    }
+    bnRelease(d, P256_WORDS)
+    p256Close(c)
+    result
+}
+
+// An INTEGER of a DER signature for a 32-byte value: minimal, positive.
+private fun p256DerInteger(value: string): string {
+    var start = 0
+    while (start < 31 && value[start] == 0) start = start + 1
+    val body = value.slice(start, 32)
+    val padded = if (body[0] >= 128) "\x00" + body else body
+    "\x02" + byteEncode(padded.size) + padded
+}
+
+/** The signature r || s (64 bytes) as DER, the form X.509 and TLS carry. */
+fun p256SignatureToDer(raw: string): string {
+    if (raw.size != 64) return ""
+    val body = p256DerInteger(raw.slice(0, 32)) + p256DerInteger(raw.slice(32, 64))
+    "\x30" + byteEncode(body.size) + body
+}
+
+/** One DER INTEGER at `at` of `text` below `limit`, strict (short length, minimal, positive), as 32 bytes: "" if it is not one
+ *  or does not fit in 32 bytes. */
+private fun p256DerReadInteger(text: string, at: int, limit: int): string {
+    if (at + 2 > limit || text[at] != 2) return ""
+    val length = text[at + 1]
+    if (length == 0 || length >= 128 || at + 2 + length > limit) return ""
+    val first = text[at + 2]
+    if (first >= 128) return ""
+    if (length > 1 && first == 0 && text[at + 3] < 128) return ""
+    var bytes = text.slice(at + 2, at + 2 + length)
+    if (first == 0 && length > 1) bytes = bytes.slice(1, length)
+    if (bytes.size > 32) return ""
+    "\x00".repeat(32 - bytes.size) + bytes
+}
+
+/** r || s (64 bytes) from a strict DER signature, or "". */
+fun p256SignatureFromDer(der: string): string {
+    if (der.size < 8 || der[0] != 48 || der[1] >= 128 || der[1] + 2 != der.size) return ""
+    val rLength = der[3]
+    val r = p256DerReadInteger(der, 2, der.size)
+    if (r == "") return ""
+    val next = 2 + 2 + rLength
+    val s = p256DerReadInteger(der, next, der.size)
+    if (s == "" || next + 2 + der[next + 1] != der.size) return ""
+    r + s
+}
+
+/** ECDSA over SHA-256, the signature as DER. */
+trusted fun p256EcdsaSign(privateKey: string, message: string): CryptoResult {
+    val raw = p256EcdsaSignRaw(privateKey, message)
+    if (!raw.ok) return raw
+    CryptoResult(p256SignatureToDer(raw.bytes), true, "")
+}
+
+/** Verifies `signature` (64 bytes, r || s) over a message digest (SHA-256 normally; a longer digest is cut to its
+ *  leftmost 256 bits, as ECDSA says) by the public key. Public inputs: not constant time. */
+trusted fun p256EcdsaVerifyDigestRaw(publicKey: string, digest: string, signature: string): bool {
+    if (signature.size != 64 || digest.size == 0) return false
+    val c = p256Open()
+    val order = c.order
+    val q = bnAllocate(24)
+    var valid = false
+    if (p256ParsePoint(c, publicKey, q)) {
+        val r = bnAllocate(P256_WORDS)
+        val s = bnAllocate(P256_WORDS)
+        bnFromBytes(r, P256_WORDS, ablaUnsafeStringAddress(signature), 32)
+        bnFromBytes(s, P256_WORDS, ablaUnsafeStringAddress(signature) + 32, 32)
+        if (!p256IsZero(r) && !p256IsZero(s) && bnLessPublic(r, order.value(), P256_WORDS) &&
+            bnLessPublic(s, order.value(), P256_WORDS)) {
+            val e = bnAllocate(P256_WORDS)
+            val w = bnAllocate(P256_WORDS)
+            val u1 = bnAllocate(P256_WORDS)
+            val u2 = bnAllocate(P256_WORDS)
+            val g = bnAllocate(24)
+            val first = bnAllocate(24)
+            val second = bnAllocate(24)
+            val total = bnAllocate(24)
+            val x = bnAllocate(P256_WORDS)
+            val y = bnAllocate(P256_WORDS)
+            p256DigestScalar(c, digest, e)
+            bnExpPublic(order, w, s, hexDecode(P256_ORDER_MINUS_TWO))
+            p256MultiplyPlain(order, u1, e, w)
+            p256MultiplyPlain(order, u2, r, w)
+            p256Generator(c, g)
+            p256ScalarMultiply(c.field.memory, c.work, first, g, u1)
+            p256ScalarMultiply(c.field.memory, c.work, second, q, u2)
+            p256PointAdd(c.field.memory, c.work, total, first, second)
+            if (p256ToAffine(c, total, x, y)) {
+                bnConditionalSubtractBody(x, x, secretU32(u32(0)), order.value(), P256_WORDS, order.scratch())
+                valid = bnEqual(x, r, P256_WORDS)
+            }
+            bnRelease(e, P256_WORDS)
+            bnRelease(w, P256_WORDS)
+            bnRelease(u1, P256_WORDS)
+            bnRelease(u2, P256_WORDS)
+            bnRelease(g, 24)
+            bnRelease(first, 24)
+            bnRelease(second, 24)
+            bnRelease(total, 24)
+            bnRelease(x, P256_WORDS)
+            bnRelease(y, P256_WORDS)
+        }
+        bnRelease(r, P256_WORDS)
+        bnRelease(s, P256_WORDS)
+    }
+    bnRelease(q, 24)
+    p256Close(c)
+    valid
+}
+
+/** ECDSA over SHA-256, the signature as r || s (64 bytes). */
+trusted fun p256EcdsaVerifyRaw(publicKey: string, message: string, signature: string): bool =
+    p256EcdsaVerifyDigestRaw(publicKey, sha256(message), signature)
+
+/** ECDSA over SHA-256, the signature as strict DER. */
+trusted fun p256EcdsaVerify(publicKey: string, message: string, signature: string): bool {
+    val raw = p256SignatureFromDer(signature)
+    raw != "" && p256EcdsaVerifyRaw(publicKey, message, raw)
+}
+
+/** ECDSA over SHA-384 (TLS 1.2's ecdsa_secp256r1 with a longer hash; the digest is cut to 256 bits). */
+trusted fun p256EcdsaVerifySha384(publicKey: string, message: string, signature: string): bool {
+    val raw = p256SignatureFromDer(signature)
+    raw != "" && p256EcdsaVerifyDigestRaw(publicKey, sha384(message), raw)
+}

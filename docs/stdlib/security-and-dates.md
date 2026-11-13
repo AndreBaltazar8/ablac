@@ -4,6 +4,7 @@
 |---|---|
 | `abla/crypto` | SHA-512, SHA-384, SHA-256, SHA-1, MD5, HMAC, PBKDF2, Base64, hexadecimal, constant-time comparison |
 | `abla/crypto/aes`, `abla/crypto/rsa`, `abla/crypto/pure` | AES (GCM, CBC, ECB), RSA signing, verifying and encryption, key parsing: in Abla, on every target |
+| `abla/crypto/p256` | NIST P-256: ECDH and ECDSA (SHA-256, RFC 6979 nonces), in Abla, on every target |
 | `abla/crypto/hosted` | the same and more, through OpenSSL |
 | `abla/random` | a cryptographically secure source (`getrandom(2)`) |
 | `abla/date` | UTC calendar dates, ISO 8601 and HTTP dates |
@@ -198,6 +199,35 @@ arithmetic; DER/PEM encoding is variable-time. The random source must be cryptog
 responsibility when using `cryptoSetRandom`. Prime candidates, intermediate key strings, and
 exported PEM/DER are ordinary strings and cannot be wiped. The private key's raw allocation is
 wiped when dropped. Protect the generated unencrypted export as private key material.
+
+## `abla/crypto/p256`
+
+NIST P-256 (secp256r1) with no OpenSSL, on the same constant-time big-number arithmetic as RSA. Keys are `string`s: a
+private key is its 32 big-endian bytes, a public key the 65-byte uncompressed point `0x04 || X || Y` (compressed points are
+refused). A failure comes back as a `CryptoResult` with `error` set.
+
+| | |
+|---|---|
+| `p256GeneratePrivateKey()` | a random private key in 1..n-1; needs a random source like RSA's (`cryptoSetRandom`) |
+| `p256PublicKey(privateKey)` | the public point of a private key |
+| `p256IsValidPublicKey(point)` | whether it is an uncompressed point on the curve |
+| `p256Ecdh(privateKey, peerPublicKey)` | ECDH: the shared x coordinate, 32 bytes. The peer's point is checked to be on the curve (P-256 has cofactor 1) |
+| `p256EcdsaSign(privateKey, message)`, `p256EcdsaSignRaw` | ECDSA over SHA-256 with the RFC 6979 nonce, so one message always gets one signature: as DER, or as `r || s` (64 bytes) |
+| `p256EcdsaVerify(publicKey, message, signature)`, `p256EcdsaVerifyRaw`, `p256EcdsaVerifySha384`, `p256EcdsaVerifyDigestRaw` | verification of a strict DER signature (no BER, no padding, no negative or oversized integers) or of `r || s`; the digest forms take any hash, cut to its leftmost 256 bits |
+| `p256SignatureToDer(raw)`, `p256SignatureFromDer(der)` | between the two forms |
+
+Point addition and doubling are the complete formulas of Renes, Costello and Batina, so no input (the point at infinity
+included) takes another path. A scalar multiplication always does 64 windows of four doublings and one addition, reading the
+whole table of sixteen multiples each time; inversions are Fermat's, by public exponents. A private key out of range is
+refused, and so is an RFC 6979 candidate nonce out of range (it happens about once in 2^32 signatures): both outcomes are
+public. `tools/test-ct.sh` reads the field, point and scalar-multiplication routines (the `P256 SECRET CORES` of the source) for a
+secret reaching a branch or an address on each target, with a planted table read and a planted branch that it must find.
+Verification works on public values and is variable-time. A private key, a nonce, its HMAC chain and the exported bytes are strings
+and cannot be wiped; the limbs and table made inside a call are, and so is the stack it used.
+
+It is checked against Wycheproof's ECDSA (484 vectors) and ECDH (355 point-encoded vectors, `tests/cases/p256/vectors`), RFC 6979
+appendix A.2.5, itself, and the `openssl` command line in both directions (`tools/test-p256.sh`). Wycheproof's compressed-point
+cases, which it marks acceptable, are refused.
 
 ### What timing protection each has, and hasn't
 

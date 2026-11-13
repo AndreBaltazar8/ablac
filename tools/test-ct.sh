@@ -22,6 +22,7 @@ cp -R tests/cases/ct "$cases"
 # the generated fixture's own module, never through a public test hook.
 sed -n '/^\/\/ BEGIN RSA SECRET BIGNUM PRIMITIVES$/,/^\/\/ END RSA SECRET BIGNUM PRIMITIVES$/p' stdlib/abla/crypto/rsa/entry.ab >> "$cases/fixture.ab"
 sed -n '/^\/\/ BEGIN PBE SECRET CORES$/,/^\/\/ END PBE SECRET CORES$/p' stdlib/abla/crypto/pbe/entry.ab >> "$cases/fixture.ab"
+sed -n '/^\/\/ BEGIN P256 SECRET CORES$/,/^\/\/ END P256 SECRET CORES$/p' stdlib/abla/crypto/p256/entry.ab >> "$cases/fixture.ab"
 sed -n '/^\/\/ BEGIN PBE OWNER WIPE$/,/^\/\/ END PBE OWNER WIPE$/p' stdlib/abla/crypto/pbe/entry.ab >> "$cases/fixture.ab"
 # Source-generated coverage for loops around the previously checked primitives.
 # No production edits or call exemptions: see generator's scope guards.
@@ -160,6 +161,25 @@ worker_read() { # object, architecture (default x86_64), how many of the reads m
         }
     done
     echo "ok   $arch key functions: ${#specs[@]} read with their calls followed, ${#leaks_follow[@]} leaks after them caught, refused without following"
+}
+
+# P-256's secret cores (abla/crypto/p256): read whole, their calls (the Montgomery multiplication, the table read) followed;
+# refused without following. Each leak twin (a table read at a secret digit, a branch on a scalar bit) must be found.
+p256_read() { # object, architecture (default x86_64)
+    local object=$1 arch=${2:-x86_64}
+    local specs=(ct_p256_add:@0,@1,@2,@3 ct_p256_subtract:@0,@1,@2,@3 ct_p256_point_add:@0,@1,@2,@3,@4
+        ct_p256_point_double:@0,@1,@2,@3 ct_p256_scalar_multiply:@0,@1,@2,@3,@4)
+    $check --follow-calls "$arch" "$object" "${specs[@]}" > "$out/$arch-p256.log" 2>&1 || {
+        cat "$out/$arch-p256.log" >&2; echo "ct: a secret reached a branch or an address in the P-256 cores on $arch" >&2; exit 1
+    }
+    local spec
+    for spec in ct_p256_leak_window:@0,@1,@2 ct_p256_leak_branch:@0,@1,@2,@3,@4; do
+        if $check --follow-calls "$arch" "$object" "$spec" > "$out/$arch-p256-leak.log" 2>&1; then
+            echo "ct: the checker missed $spec on $arch" >&2; exit 1
+        fi
+        grep -q '^LEAK' "$out/$arch-p256-leak.log" || { cat "$out/$arch-p256-leak.log" >&2; exit 1; }
+    done
+    echo "ok   $arch P-256 cores: ${#specs[@]} read with their calls followed, 2 leaks caught"
 }
 
 # Two rules of the checker, with hand-written controls: cqto defines rdx from rax (a secret left in rdx is not a secret
@@ -815,6 +835,7 @@ residue_read
 real_entries_run
 orchestration_read "$out/x86.o"
 worker_read "$out/x86.o"
+p256_read "$out/x86.o"
 division_read
 # The crypto allocation entry stays out of line in a release object: each export of the probe module, which reaches
 # the key and big-number allocations, calls the function in the section .text.abla_ct_allocate. (A function that
@@ -859,6 +880,7 @@ residue_a64_read
 # The bignum routines and the AES key functions, read whole on AArch64 with their calls followed.
 orchestration_read "$out/aarch64.o" aarch64
 worker_read "$out/aarch64.o" aarch64
+p256_read "$out/aarch64.o" aarch64
 # A --fast build keeps every call: the checker follows each into its callee, defined in the same object.
 fast_read aarch64 "$out/aarch64-fast.o" "" "" "$cases/fast-known-aarch64.txt"
 
@@ -872,6 +894,7 @@ wasm_follow_read
 # in this module: the hardware paths have no body to call on Wasm).
 orchestration_read "$out/ct.wasm" wasm
 worker_read "$out/ct.wasm" wasm 5
+p256_read "$out/ct.wasm" wasm
 # The --fast module keeps every call. Its inline assembly (the barrier of the constant-time primitives) builds on the
 # default in-process route since the WebAssembly asm parser is registered there (tools/test-wasm-ct-barrier.sh);
 # ABLA_KEEP_LLVM_TEXT is unset so that a developer shell with it set cannot hide a regression.
@@ -902,6 +925,7 @@ echo "ok   xtensa release object: the crypto allocation entry is called out of l
 xtensa_follow_read
 orchestration_read "$out/xtensa.o" xtensa
 worker_read "$out/xtensa.o" xtensa
+p256_read "$out/xtensa.o" xtensa
 # The --fast object keeps every call, which the checker follows: all 63 fixtures come out clean (fast-known-xtensa.txt
 # is empty; a fixture the checker can't place would be listed there, class unplaced, see fast_class), and the 16 leak
 # controls are still found in unoptimised code.

@@ -1,0 +1,206 @@
+// P-256 against Wycheproof (ECDSA verify, ECDH with encoded points: committed in vectors/), RFC 6979's A.2.5 signatures,
+// and the operations against each other. The directory of the vector files is argument 0.
+import "abla/crypto"
+import "abla/crypto/p256"
+import "abla/fs"
+import "abla/io"
+import "abla/json"
+import "abla/process/arguments"
+
+var failures = 0
+var counter = 0
+
+fun fail(what: string): void {
+    println("p256: FAIL $what")
+    failures = failures + 1
+    return
+}
+
+fun check(ok: bool, what: string): void {
+    if (!ok) fail(what)
+    return
+}
+
+/** The private key of 32 bytes a Wycheproof hex integer stands for (its sign byte stripped, zeros in front). */
+fun scalarBytes(text: string): string {
+    var bytes = hexDecode(if (text.size % 2 == 1) "0" + text else text)
+    var start = 0
+    while (start < bytes.size - 1 && bytes[start] == 0) start = start + 1
+    bytes = bytes.slice(start, bytes.size)
+    if (bytes.size < 32) bytes = "\x00".repeat(32 - bytes.size) + bytes
+    bytes
+}
+
+fun load(path: string): Json {
+    val text = path(path).readText()
+    val parsed = jsonParse(text)
+    if (!parsed.succeeded) {
+        println("p256: cannot read $path")
+        return jsonNull()
+    }
+    parsed.value
+}
+
+fun ecdsaVectors(directory: string): void {
+    val root = load(directory + "/ecdsa_secp256r1_sha256_test.json")
+    val groups = root.get("testGroups")
+    var count = 0
+    var accepted = 0
+    for (g in 0 until groups.size()) {
+        val group = groups.at(g)
+        val key = hexDecode(group.get("publicKey").getString("uncompressed"))
+        val tests = group.get("tests")
+        for (t in 0 until tests.size()) {
+            val test = tests.at(t)
+            val id = test.getInt("tcId")
+            val message = hexDecode(test.getString("msg"))
+            val signature = hexDecode(test.getString("sig"))
+            val verdict = test.getString("result")
+            val ok = p256EcdsaVerify(key, message, signature)
+            count = count + 1
+            if (ok) accepted = accepted + 1
+            if (verdict == "valid" && !ok) fail("ECDSA tcId $id (valid) was refused")
+            if (verdict == "invalid" && ok) fail("ECDSA tcId $id (invalid) was accepted")
+        }
+    }
+    check(count > 400, "ECDSA: read only $count vectors")
+    println("p256: ECDSA Wycheproof $count vectors, $accepted accepted")
+    return
+}
+
+fun ecdhVectors(directory: string): void {
+    val root = load(directory + "/ecdh_secp256r1_ecpoint_test.json")
+    val groups = root.get("testGroups")
+    var count = 0
+    var accepted = 0
+    for (g in 0 until groups.size()) {
+        val tests = groups.at(g).get("tests")
+        for (t in 0 until tests.size()) {
+            val test = tests.at(t)
+            val id = test.getInt("tcId")
+            val peer = hexDecode(test.getString("public"))
+            val secret = scalarBytes(test.getString("private"))
+            val shared = hexDecode(test.getString("shared"))
+            val verdict = test.getString("result")
+            val got = p256Ecdh(secret, peer)
+            count = count + 1
+            if (got.ok) accepted = accepted + 1
+            if (verdict == "valid") {
+                if (!got.ok) fail("ECDH tcId $id (valid) was refused: ${got.error}")
+                else if (got.bytes != shared) fail("ECDH tcId $id (valid) gave another secret")
+            }
+            if (verdict == "invalid" && got.ok) fail("ECDH tcId $id (invalid) was accepted")
+            if (verdict == "acceptable" && got.ok && got.bytes != shared) fail("ECDH tcId $id gave another secret")
+            if (got.ok != p256IsValidPublicKey(peer) && secret.size == 32) {
+                // A key out of range is refused for the key, not the point: only the point is compared here.
+                if (got.error == "the public key is not a point of P-256" || got.ok) {
+                    fail("ECDH tcId $id: p256IsValidPublicKey disagrees")
+                }
+            }
+        }
+    }
+    check(count > 300, "ECDH: read only $count vectors")
+    println("p256: ECDH Wycheproof $count vectors, $accepted accepted")
+    return
+}
+
+/** RFC 6979, A.2.5: P-256 with SHA-256. */
+fun rfc6979(): void {
+    val key = hexDecode("c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721")
+    val expectedPublic = "04" + "60fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb6" +
+        "7903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299"
+    val pub = p256PublicKey(key)
+    check(pub.ok && hexEncode(pub.bytes) == expectedPublic, "RFC 6979 public key")
+    val sample = p256EcdsaSignRaw(key, "sample")
+    check(sample.ok && hexEncode(sample.bytes) ==
+        "efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716" +
+        "f7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda8", "RFC 6979 signature of sample")
+    val test = p256EcdsaSignRaw(key, "test")
+    check(test.ok && hexEncode(test.bytes) ==
+        "f1abb023518351cd71d881567b1ea663ed3efcf6c5132b354f28d3b0b7d38367" +
+        "019f4113742a2b14bd25926b49c649155f267e60d3814b4c0cc84250e46f0083", "RFC 6979 signature of test")
+    check(p256EcdsaVerifyRaw(hexDecode(expectedPublic), "sample", sample.bytes), "RFC 6979 sample verifies")
+    println("p256: RFC 6979 A.2.5 signatures")
+    return
+}
+
+fun roundTrips(): void {
+    cryptoSetRandom({ count: int ->
+        counter = counter + 1
+        var out = ""
+        var i = 0
+        while (i < count) {
+            out = out + byteEncode((counter * 37 + i * 101 + 7) % 256)
+            i = i + 1
+        }
+        out
+    })
+    for (round in 0 until 6) {
+        val a = p256GeneratePrivateKey()
+        val b = p256GeneratePrivateKey()
+        check(a.ok && b.ok, "key generation")
+        val pa = p256PublicKey(a.bytes)
+        val pb = p256PublicKey(b.bytes)
+        check(pa.ok && pb.ok && p256IsValidPublicKey(pa.bytes), "public keys")
+        val ab = p256Ecdh(a.bytes, pb.bytes)
+        val ba = p256Ecdh(b.bytes, pa.bytes)
+        check(ab.ok && ba.ok && ab.bytes == ba.bytes && ab.bytes.size == 32, "ECDH agrees in round $round")
+        val message = "round $round of the message"
+        val signature = p256EcdsaSign(a.bytes, message)
+        check(signature.ok && p256EcdsaVerify(pa.bytes, message, signature.bytes), "sign and verify $round")
+        check(!p256EcdsaVerify(pa.bytes, message + "!", signature.bytes), "another message fails $round")
+        check(!p256EcdsaVerify(pb.bytes, message, signature.bytes), "another key fails $round")
+        check(signature.bytes == p256EcdsaSign(a.bytes, message).bytes, "deterministic $round")
+        val raw = p256SignatureFromDer(signature.bytes)
+        check(raw.size == 64 && p256SignatureToDer(raw) == signature.bytes, "DER round trip $round")
+    }
+    // Out of range keys.
+    check(!p256PublicKey("\x00".repeat(32)).ok, "zero key refused")
+    check(!p256PublicKey(hexDecode("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551")).ok,
+        "key n refused")
+    check(p256PublicKey(hexDecode("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632550")).ok,
+        "key n-1 accepted")
+    check(!p256PublicKey("short").ok, "short key refused")
+    println("p256: round trips")
+    return
+}
+
+fun interop(mode: string): int {
+    // Files of raw bytes, for tools/test-p256.sh to hand to and take from the openssl command line.
+    if (mode == "key") {
+        val key = p256GeneratePrivateKey()
+        if (!key.ok) return 1
+        val pub = p256PublicKey(key.bytes)
+        if (!pub.ok) return 2
+        return if (path(processArgument(1)).writeText(key.bytes) && path(processArgument(2)).writeText(pub.bytes)) 0 else 3
+    }
+    if (mode == "sign") {
+        val signature = p256EcdsaSign(path(processArgument(1)).readText(), path(processArgument(2)).readText())
+        return if (signature.ok && path(processArgument(3)).writeText(signature.bytes)) 0 else 1
+    }
+    if (mode == "verify") {
+        return if (p256EcdsaVerify(path(processArgument(1)).readText(), path(processArgument(2)).readText(),
+            path(processArgument(3)).readText())) 0 else 1
+    }
+    if (mode == "ecdh") {
+        val shared = p256Ecdh(path(processArgument(1)).readText(), path(processArgument(2)).readText())
+        return if (shared.ok && path(processArgument(3)).writeText(shared.bytes)) 0 else 1
+    }
+    64
+}
+
+fun main: int {
+    val mode = processArgument(0)
+    if (mode != "vectors") return interop(mode)
+    val directory = processArgument(1)
+    rfc6979()
+    roundTrips()
+    ecdsaVectors(directory)
+    ecdhVectors(directory)
+    if (failures != 0) {
+        println("p256: $failures failure(s)")
+        return 1
+    }
+    println("p256: ok")
+    0
+}
