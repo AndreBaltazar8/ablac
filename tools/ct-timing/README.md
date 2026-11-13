@@ -17,7 +17,7 @@ taskset -c 0,2,6,14 tools/ct-timing/run --compiler build/ablac \
   --cpu 6 --confirm-cpu 2 --samples 1000000 --timeout 14400 --reuse
 # Seconds: the deliberately leaky control only. No crypto pass is claimed.
 tools/ct-timing/run --compiler build/ablac --cpu 6 --confirm-cpu 2 --smoke --reuse
-python3 tools/ct-timing/test-stats.py
+tools/test-ct-timing-stats.sh build/ablac
 # Expected exit 1: exercise the candidate-confirmation path with the known leak.
 tools/ct-timing/run --compiler build/ablac --cpu 6 --confirm-cpu 2 \
   --targets leaky-compare --reuse
@@ -76,15 +76,15 @@ and fault verification. A public-exponent round-trip validates the CRT fixture
 before timing; an AES known-answer test checks both available implementations.
 These are operand-class tests with fixed keys, **not** tests of different secret
 keys or all input distributions. Eight-limb bignum tests do not cover every
-supported width or the inverse's even-modulus case. P-256 and X25519 are explicitly
-unavailable: the current `abla/crypto` has no implementation.
+supported width or the inverse's even-modulus case. P-256 and X25519 exist in
+`abla/crypto` now but are not measured here yet (the report lists them as not measured).
 
 Private cores are extracted verbatim from RSA's marked production source block
-by `generate.py` for every driver build, as in the static CT fixtures. Public
+by the runner (`binding.ab`) for every driver build, as in the static CT fixtures. Public
 routines are imported normally. No hand-maintained crypto implementation is used.
 `--reuse` checks compiler-payload and all stdlib/driver source hashes before
 reusing the binary. Build always uses `--no-cache`, including the native-library
-manifest and `LIBRARY_PATH` setup. Python preserves a supplied launcher path;
+manifest and `LIBRARY_PATH` setup. The runner preserves a supplied launcher path;
 `build/ablac` is not resolved to its underlying script.
 
 ## Statistics and artifacts

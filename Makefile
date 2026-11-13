@@ -155,7 +155,7 @@ test-serial: ablac
 	tools/test-xtensa-catalog.sh $(COMPILER)
 	tools/test-simd.sh $(COMPILER)
 	tools/test-ct.sh $(COMPILER)
-	python3 tools/ct-timing/test-stats.py
+	tools/test-ct-timing-stats.sh $(COMPILER)
 	tools/test-bignum-secret.sh $(COMPILER)
 	tools/test-wide-integers.sh $(COMPILER)
 	tools/test-wide-integers.sh $(COMPILER) int256

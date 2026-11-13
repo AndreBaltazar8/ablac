@@ -1,0 +1,158 @@
+// The timing statistics, the sampler reader, the source binding and the host check (#817: the Abla port of
+// tools/ct-timing/test-stats.py). Exit 0 when every case holds.
+import "abla/io"
+import "abla/math"
+import "abla/float/text"
+import "abla/bytes"
+import "abla/float"
+import "./stats.ab"
+import "./binding.ab"
+
+var failures = 0
+
+fun expect(condition: bool, what: string): void {
+    if (!condition) {
+        eprintln("FAIL $what")
+        failures = failures + 1
+    }
+    return
+}
+
+fun close(a: f64, b: f64): bool {
+    val difference = a - b
+    (if (difference < 0.0) -difference else difference) < 0.00000005
+}
+
+fun rows(ticks: array<int>, classes: array<int>): CtRows {
+    val t: array<int> = []
+    val c: array<int> = []
+    for (x in ticks) t.append(x)
+    for (x in classes) c.append(x)
+    CtRows(t, c)
+}
+
+fun le64(value: int): string {
+    var out = ""
+    var rest = value
+    var i = 0
+    while (i < 8) {
+        out = out + byteEncode(rest % 256)
+        rest = rest / 256
+        i = i + 1
+    }
+    out
+}
+
+fun main: int {
+    // Welch's t.
+    val a = ctMoments()
+    val b = ctMoments()
+    for (x in [1, 2, 3, 4]) a.push(f64FromInt(x))
+    for (x in [2, 4, 6, 8]) b.push(f64FromInt(x))
+    val t = ctWelch(a, b) ?? 0.0
+    expect(close(t, -2.5 / sqrt((5.0 / 3.0) / 4.0 + (20.0 / 3.0) / 4.0)), "welch")
+
+    // Zero variance: equal means give 0, different ones an infinity of the difference's sign.
+    val same0 = ctMoments()
+    val same1 = ctMoments()
+    var k = 0
+    while (k < 5) {
+        same0.push(10.0)
+        same1.push(10.0)
+        k = k + 1
+    }
+    expect((ctWelch(same0, same1) ?? 1.0) == 0.0, "zero variance, equal means")
+    val different = ctMoments()
+    k = 0
+    while (k < 5) {
+        different.push(11.0)
+        k = k + 1
+    }
+    expect((ctWelch(same0, different) ?? 0.0) == -ctInfinity(), "zero variance, different means")
+    same1.push(11.0)
+    expect((ctWelch(same0, same1) ?? 0.0) < 0.0, "one class varies")
+
+    // A deliberate difference is found, the same whichever class is which, with the same crops.
+    val ticks: array<int> = []
+    val classes: array<int> = []
+    var i = 0
+    while (i < 100) {
+        ticks.append(100 + i % 50)
+        classes.append(i % 2)
+        i = i + 1
+    }
+    i = 0
+    while (i < 4000) {
+        ticks.append(100 + (i % 2) * 1000 + i % 7)
+        classes.append(i % 2)
+        i = i + 1
+    }
+    val leaky = ctAnalyze(rows(ticks, classes), 0, 100, 100)
+    expect(leaky.status == "leak detected", "control found")
+    expect((leaky.maxAbsT ?? 0.0) > 10.0, "control above the threshold")
+    expect(ctjRender(leaky.record.json(), -1).contains("\"samples_valid\": 4000"),
+        "control valid samples")
+    val flipped: array<int> = []
+    for (c in classes) flipped.append(1 - c)
+    val swapped = ctAnalyze(rows(ticks, flipped), 0, 100, 100)
+    expect(close(leaky.maxAbsT ?? 0.0, swapped.maxAbsT ?? 1.0), "classes swapped: the same |t|")
+    expect(cutsOf(leaky) == cutsOf(swapped), "classes swapped: the same crops")
+
+    // Balanced classes: nothing found, the rejected sample counted, too few for the minimum.
+    val balancedTicks: array<int> = []
+    val balancedClasses: array<int> = []
+    i = 0
+    while (i < 2050) {
+        for (c in [0, 1]) {
+            balancedTicks.append(100 + i % 7)
+            balancedClasses.append(c)
+        }
+        i = i + 1
+    }
+    balancedTicks.append(1)
+    balancedClasses.append(2)
+    val balanced = ctAnalyze(rows(balancedTicks, balancedClasses), 0, 100, 100)
+    expect(balanced.status == "no leak detected", "balanced: nothing found")
+    expect(ctjRender(balanced.record.json(), -1).contains("\"samples_rejected\": 1"),
+        "balanced: one rejected")
+    expect(ctAnalyze(rows(balancedTicks, balancedClasses), 0, 100,
+        10000).status == "insufficient samples",
+        "balanced: too few for the minimum")
+
+    // The driver is bound to the source's real core, and a lost marker is refused.
+    val source =
+        "before// BEGIN RSA SECRET BIGNUM PRIMITIVES\nsecret core\n// END RSA SECRET BIGNUM PRIMITIVESafter"
+    expect(ctTimingGenerate("driver", source).text == "driver\n\nsecret core\n", "binding")
+    expect(ctTimingGenerate("driver", source.replace("secret core",
+        "changed core")).text.contains("changed core"),
+        "binding follows the source")
+    expect(ctTimingGenerate("driver", source.replace("BEGIN RSA", "LOST RSA")).error != "",
+        "lost marker refused")
+
+    // Another host is told the experiment is unavailable.
+    expect(ctTimingUnavailable("Linux", "aarch64", "rdtscp").contains("unavailable"),
+        "unsupported host")
+
+    // The sampler's records.
+    val one = "ABLATSC1" + le64(1) + le64(15) + le64(1)
+    val read = ctReadSamples(one)
+    expect(read.error == "" && read.rows.ticks.size == 1 && read.rows.ticks[0] == 15 &&
+        read.rows.classes[0] == 1,
+        "reader")
+    expect(ctReadSamples(one.slice(0, one.size - 1)).error != "", "truncated records refused")
+    if (failures > 0) return 1
+    println("ok   ct-timing statistics, sampler reader, source binding and host check")
+    0
+}
+
+fun cutsOf(analysis: CtAnalysis): string {
+    val text = ctjRender(analysis.record.json(), -1)
+    var out = ""
+    var at = text.indexOf("\"cut_below_ticks\": ")
+    while (at >= 0) {
+        val end = text.indexOf(",", at)
+        out = out + text.slice(at, end) + ";"
+        at = text.indexOf("\"cut_below_ticks\": ", end)
+    }
+    out
+}

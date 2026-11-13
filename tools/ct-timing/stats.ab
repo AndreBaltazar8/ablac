@@ -1,0 +1,323 @@
+// Welch first-order tests, uncropped and with dudect's class-blind pilot crops (#817: the Abla port of
+// tools/ct-timing/stats.py). Not a constant-time proof or a calibrated multi-test p-value.
+import "abla/text"
+import "abla/math"
+import "abla/float/text"
+import "abla/float"
+import "abla/fs"
+
+// --- JSON as Python's json.dumps writes it (indent 2, or one line) ---------------------------------------------------
+// kind: 0 a rendered scalar (`text`), 1 an object (`keys`, `items`), 2 an array (`items`).
+class CtJson(val kind: int, val text: string, val keys: array<string>, val items: array<CtJson>)
+
+fun ctjRaw(text: string): CtJson = CtJson(0, text, [], [])
+fun ctjInt(value: int): CtJson = ctjRaw("$value")
+fun ctjBool(value: bool): CtJson = ctjRaw(if (value) "true" else "false")
+fun ctjNull(): CtJson = ctjRaw("null")
+
+fun ctjString(value: string): CtJson {
+    var out = "\""
+    var at = 0
+    while (at < value.size) {
+        val byte = value[at]
+        out = out + (if (byte == 34) "\\\"" else if (byte == 92) "\\\\" else if (byte == 10) "\\n"
+            else if (byte == 13) "\\r" else if (byte == 9) "\\t"
+            else if (byte < 32) "\\u00" + "0123456789abcdef".slice(byte / 16, byte / 16 + 1) +
+                "0123456789abcdef".slice(byte % 16, byte % 16 + 1)
+            else value.slice(at, at + 1))
+        at = at + 1
+    }
+    ctjRaw(out + "\"")
+}
+
+/** A float as Python's repr writes it: shortest round trip, `.0` on an integral value; finite_json's "inf"/"-inf" for
+ *  the infinities (strings, as the report has them). */
+fun ctjFloat(value: f64): CtJson {
+    if (!isFinite(value)) return ctjString(if (value > 0.0) "inf" else "-inf")
+    var text = "$value"
+    if (!text.contains(".") && !text.contains("e") && !text.contains("E") &&
+        !text.contains("n")) text = text + ".0"
+    ctjRaw(text)
+}
+
+fun ctjFloatOrNull(value: f64?): CtJson = if (value == null) ctjNull() else ctjFloat(value)
+
+class CtjObject(val keys: array<string>, val items: array<CtJson>) {
+    fun put(key: string, value: CtJson): void {
+        var i = 0
+        while (i < this.keys.size) {
+            if (this.keys[i] == key) {
+                this.items[i] = value
+                return
+            }
+            i = i + 1
+        }
+        this.keys.append(key)
+        this.items.append(value)
+        return
+    }
+    fun json(): CtJson {
+        val keys: array<string> = []
+        val items: array<CtJson> = []
+        for (key in this.keys) keys.append(key)
+        for (item in this.items) items.append(item)
+        CtJson(1, "", keys, items)
+    }
+}
+
+fun ctjObject(): CtjObject = CtjObject([], [])
+
+fun ctjArray(items: array<CtJson>): CtJson {
+    val copy: array<CtJson> = []
+    for (item in items) copy.append(item)
+    CtJson(2, "", [], copy)
+}
+
+/** json.dumps(value, indent=indent) (indent < 0: one line, the default separators). */
+fun ctjRender(value: CtJson, indent: int, depth: int = 0): string {
+    if (value.kind == 0) return value.text
+    if (value.items.size == 0) return if (value.kind == 1) "{}" else "[]"
+    val open = if (value.kind == 1) "{" else "["
+    val close = if (value.kind == 1) "}" else "]"
+    val parts: array<string> = []
+    var i = 0
+    while (i < value.items.size) {
+        val rendered = ctjRender(value.items[i], indent, depth + 1)
+        parts.append(if (value.kind == 1) ctjString(value.keys[i]).text + ": " +
+            rendered else rendered)
+        i = i + 1
+    }
+    if (indent < 0) return open + textJoin(parts, ", ") + close
+    val inner = "\n" + " ".repeat(indent * (depth + 1))
+    open + inner + textJoin(parts, "," + inner) + "\n" + " ".repeat(indent * depth) + close
+}
+
+// --- Statistics --------------------------------------------------------------------------------------------------------
+class CtMoments(var n: int, var mean: f64, var m2: f64) {
+    fun push(x: f64): void {
+        this.n = this.n + 1
+        val delta = x - this.mean
+        this.mean = this.mean + delta / f64FromInt(this.n)
+        this.m2 = this.m2 + delta * (x - this.mean)
+        return
+    }
+    fun record(): CtJson {
+        val o = ctjObject()
+        o.put("n", ctjInt(this.n))
+        o.put("mean", ctjFloat(this.mean))
+        o.put("variance", if (this.n > 1) ctjFloat(this.m2 / f64FromInt(this.n - 1)) else ctjNull())
+        o.json()
+    }
+}
+
+fun ctMoments(): CtMoments = CtMoments(0, 0.0, 0.0)
+
+fun ctInfinity(): f64 = 1e300 * 1e300
+
+/** Welch's t of two classes, or null with fewer than two in either. */
+fun ctWelch(a: CtMoments, b: CtMoments): f64? {
+    if (a.n < 2 || b.n < 2) return null
+    val variance = a.m2 / f64FromInt(a.n - 1) / f64FromInt(a.n) + b.m2 / f64FromInt(b.n - 1) /
+        f64FromInt(b.n)
+    val denominator = sqrt(if (variance > 0.0) variance else 0.0)
+    if (denominator != 0.0) return (a.mean - b.mean) / denominator
+    if (a.mean == b.mean) 0.0 else if (a.mean > b.mean) ctInfinity() else -ctInfinity()
+}
+
+/** A sample: its ticks and its class (0, 1, or 2 for one the sampler rejected). */
+class CtRows(val ticks: array<int>, val classes: array<int>)
+
+/** The sampler's records, or the reason they can't be read ("" when they can). */
+class CtRead(val rows: CtRows, val error: string)
+
+fun ctReadU64(raw: string, at: int): int {
+    var value = 0
+    var i = 7
+    while (i >= 0) {
+        value = value * 256 + raw[at + i]
+        i = i - 1
+    }
+    value
+}
+
+fun ctReadSamples(raw: string): CtRead {
+    val empty = CtRows([], [])
+    if (raw.size < 16 || raw.slice(0, 8) != "ABLATSC1") return CtRead(empty,
+        "missing sampler header")
+    val n = ctReadU64(raw, 8)
+    if (n < 0 || raw.size != 16 + 16 * n) return CtRead(empty, "truncated sampler records")
+    val rows = CtRows([], [])
+    var i = 0
+    while (i < n) {
+        val c = ctReadU64(raw, 24 + 16 * i)
+        if (c != 0 && c != 1 && c != 2) return CtRead(empty, "invalid class")
+        rows.ticks.append(ctReadU64(raw, 16 + 16 * i))
+        rows.classes.append(c)
+        i = i + 1
+    }
+    CtRead(rows, "")
+}
+
+fun ctReadSamplesFile(path: string): CtRead = ctReadSamples(Path(path).readText())
+
+/** A tick count Python reads as 0 < x < 2^63 (a u64 read into an int is negative from 2^63 on). */
+fun ctValidTicks(x: int): bool = x > 0
+
+/** Sorts (ticks, class) pairs by ticks, then class (a stable merge sort, each pass merged into a buffer and copied back). */
+fun ctSortPairs(var ticks: array<int>, var classes: array<int>): void {
+    val n = ticks.size
+    val bufferTicks: array<int> = []
+    val bufferClasses: array<int> = []
+    for (x in ticks) bufferTicks.append(x)
+    for (x in classes) bufferClasses.append(x)
+    var width = 1
+    while (width < n) {
+        var start = 0
+        while (start < n) {
+            val middle = if (start + width < n) start + width else n
+            val end = if (start + 2 * width < n) start + 2 * width else n
+            var i = start
+            var j = middle
+            var k = start
+            while (k < end) {
+                val takeLeft = j >= end || (i < middle && (ticks[i] < ticks[j] ||
+                    (ticks[i] == ticks[j] && classes[i] <= classes[j])))
+                if (takeLeft) {
+                    bufferTicks[k] = ticks[i]
+                    bufferClasses[k] = classes[i]
+                    i = i + 1
+                } else {
+                    bufferTicks[k] = ticks[j]
+                    bufferClasses[k] = classes[j]
+                    j = j + 1
+                }
+                k = k + 1
+            }
+            start = start + 2 * width
+        }
+        var copy = 0
+        while (copy < n) {
+            ticks[copy] = bufferTicks[copy]
+            classes[copy] = bufferClasses[copy]
+            copy = copy + 1
+        }
+        width = width * 2
+    }
+    return
+}
+
+fun ctSortInts(var values: array<int>): void {
+    val classes: array<int> = []
+    for (x in values) classes.append(0)
+    ctSortPairs(values, classes)
+    return
+}
+
+/** dudect's exponential percentiles of the sorted pilot: the distinct cut values, ascending. */
+fun ctCuts(pilot: array<int>): array<int> {
+    val picked: array<int> = []
+    var i = 0
+    while (i < 100) {
+        val fraction = 1.0 - pow(0.5, f64FromInt(10 * (i + 1)) / 100.0)
+        var index = f64ToInt(f64FromInt(pilot.size) * fraction)
+        if (index > pilot.size - 1) index = pilot.size - 1
+        picked.append(pilot[index])
+        i = i + 1
+    }
+    ctSortInts(picked)
+    val cuts: array<int> = []
+    for (value in picked) {
+        if (cuts.size == 0 || cuts[cuts.size - 1] != value) cuts.append(value)
+    }
+    cuts
+}
+
+/** analyze() of stats.py: the report record, or the reason the rows can't be analyzed. */
+class CtAnalysis(val record: CtjObject, val status: string, val maxAbsT: f64?, val error: string)
+
+fun ctAnalyze(
+    rows: CtRows,
+    warmup: int = 128,
+    pilot: int = 4096,
+    minimum: int = 10000,
+    threshold: f64 = 10.0
+): CtAnalysis {
+    if (rows.ticks.size < warmup + pilot + 4) {
+        return CtAnalysis(ctjObject(), "", null, "not enough records for independent pilot")
+    }
+    var pilotRows: array<int> = []
+    var i = warmup
+    while (i < warmup + pilot) {
+        if (rows.classes[i] < 2 && ctValidTicks(rows.ticks[i])) pilotRows.append(rows.ticks[i])
+        i = i + 1
+    }
+    if (pilotRows.size < 2) return CtAnalysis(ctjObject(), "", null, "pilot has no valid timings")
+    ctSortInts(pilotRows)
+    // Same exponential percentiles as dudect, fitted only to the pilot, pooled across classes. Keep the uncut test
+    // regardless of any crop.
+    val cuts = ctCuts(pilotRows)
+    var validTicks: array<int> = []
+    var validClasses: array<int> = []
+    val measured = rows.ticks.size - warmup - pilot
+    i = warmup + pilot
+    while (i < rows.ticks.size) {
+        if (rows.classes[i] < 2 && ctValidTicks(rows.ticks[i])) {
+            validTicks.append(rows.ticks[i])
+            validClasses.append(rows.classes[i])
+        }
+        i = i + 1
+    }
+    ctSortPairs(validTicks, validClasses)
+    val contexts: array<CtJson> = []
+    val moments = [ctMoments(), ctMoments()]
+    var strongest = -1
+    var strongestT = 0.0
+    var strongestCut: CtJson = ctjNull()
+    var lastT: f64? = null
+    var cursor = 0
+    var index = 0
+    while (index <= cuts.size) {
+        val cut = if (index < cuts.size) cuts[index] else -1
+        while (cursor < validTicks.size && (cut < 0 || validTicks[cursor] < cut)) {
+            moments[validClasses[cursor]].push(f64FromInt(validTicks[cursor]))
+            cursor = cursor + 1
+        }
+        val t = ctWelch(moments[0], moments[1])
+        val eligible = (if (moments[0].n < moments[1].n) moments[0].n else moments[1].n) >= minimum
+        val context = ctjObject()
+        context.put("cut_below_ticks", if (cut < 0) ctjNull() else ctjInt(cut))
+        context.put("class0", moments[0].record())
+        context.put("class1", moments[1].record())
+        context.put("eligible", ctjBool(eligible))
+        context.put("t", ctjFloatOrNull(t))
+        contexts.append(context.json())
+        // max() keeps the first of equal values.
+        if (eligible && t != null) {
+            val absolute = if (t < 0.0) -t else t
+            if (strongest < 0 || absolute > strongestT) {
+                strongest = index
+                strongestT = absolute
+                strongestCut = if (cut < 0) ctjNull() else ctjInt(cut)
+            }
+        }
+        lastT = t
+        index = index + 1
+    }
+    val maxT: f64? = if (strongest < 0) null else strongestT
+    val status = if (maxT == null) "insufficient samples" else if (maxT >
+        threshold) "leak detected" else "no leak detected"
+    val record = ctjObject()
+    record.put("status", ctjString(status))
+    record.put("samples_requested", ctjInt(measured))
+    record.put("samples_valid", ctjInt(validTicks.size))
+    record.put("samples_rejected", ctjInt(measured - validTicks.size))
+    record.put("warmup", ctjInt(warmup))
+    record.put("pilot", ctjInt(pilot))
+    record.put("minimum_per_class", ctjInt(minimum))
+    record.put("threshold", ctjFloat(threshold))
+    record.put("max_abs_t", ctjFloatOrNull(maxT))
+    record.put("strongest_crop", if (strongest < 0) ctjNull() else strongestCut)
+    record.put("raw_t", ctjFloatOrNull(lastT))
+    record.put("tests", ctjArray(contexts))
+    CtAnalysis(record, status, maxT, "")
+}

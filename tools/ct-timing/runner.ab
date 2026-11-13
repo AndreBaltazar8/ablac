@@ -1,0 +1,524 @@
+// The opt-in Linux x86-64 timing experiment (#817: the Abla port of tools/ct-timing/run, same options, report and exit
+// status). tools/ct-timing/run builds this and runs it inside nix-shell shell.nix, with ABLA_CT_TIMING_ROOT the
+// repository. Exit 0: no candidate crossed |t| > 10 (or the host can't measure); 1: one did; 2: invalid input, too few
+// observations, a build or measurement failure, or a control that failed.
+import "abla/io"
+import "abla/text"
+import "abla/integer"
+import "abla/crypto"
+import "abla/fs"
+import "abla/date"
+import "abla/float"
+import "abla/process/arguments"
+import "abla/process/environment"
+import "abla/process/time"
+import "abla/sys/linux/process"
+import "./stats.ab"
+import "./binding.ab"
+
+val CT_TARGETS: array<string> = ["aes-software", "aes-hardware", "compare", "rsa-crt",
+    "bn-from-bytes", "bn-to-bytes",
+    "bn-residue-square", "bn-montgomery", "bn-divide", "bn-reduce", "bn-exact", "bn-divsteps",
+    "bn-gcd", "bn-inverse"]
+
+// The first error: printed as `ct-timing: <it>` on standard error, exit 2 (the Python's ValueError, OSError and
+// SubprocessError).
+var ctError = ""
+
+fun ctRaise(message: string): void {
+    if (ctError == "") ctError = message
+    return
+}
+
+fun ctDigest(path: string): string = hexEncode(sha256(Path(path).readText()))
+
+fun ctIsFile(path: string): bool = Path(path).info().isFile()
+
+fun ctPad(value: int, width: int): string = "$value".padStart(width, "0")
+
+class CtOptions(
+    var compiler: string,
+    var cpu: int,
+    var confirmCpu: int,
+    var samples: int,
+    var pilot: int,
+    var seed: int,
+    val targets: array<string>,
+    var output: string,
+    var timeout: int,
+    var reuse: bool,
+    var smoke: bool
+)
+
+fun ctAbsolute(path: string): string {
+    if (path.startsWith("/")) return path
+    val base = currentDirectory().text
+    // os.path.abspath: joined and normalized, `.` and `..` resolved by name.
+    val parts: array<string> = []
+    for (part in "$base/$path".split("/")) {
+        if (part == "" || part == ".") continue
+        if (part == "..") {
+            if (parts.size > 0) parts.truncate(parts.size - 1)
+        } else {
+            parts.append(part)
+        }
+    }
+    "/" + textJoin(parts, "/")
+}
+
+/** The CPUs this process may run on (sched_getaffinity), from /proc/self/status. */
+fun ctAffinity(): array<int> {
+    val cpus: array<int> = []
+    for (line in Path("/proc/self/status").readText().split("\n")) {
+        if (line.startsWith("Cpus_allowed_list:")) {
+            for (range in line.slice(18, line.size).trim().split(",")) {
+                val dash = range.indexOf("-")
+                val low = (if (dash >= 0) range.slice(0, dash) else range).trim().parseInt() ?? -1
+                val high = (if (dash >= 0) range.slice(dash + 1,
+                    range.size) else range).trim().parseInt() ?? -1
+                var cpu = low
+                while (cpu >= 0 && cpu <= high) {
+                    cpus.append(cpu)
+                    cpu = cpu + 1
+                }
+            }
+        }
+    }
+    cpus
+}
+
+fun ctHas(values: array<int>, value: int): bool {
+    for (item in values) {
+        if (item == value) return true
+    }
+    false
+}
+
+/** A CPU's physical core: its package and core ids. */
+fun ctCore(cpu: int): string {
+    val base = "/sys/devices/system/cpu/cpu$cpu/topology"
+    Path("$base/physical_package_id").readText().trim() + "/" +
+        Path("$base/core_id").readText().trim()
+}
+
+fun ctCommandOutput(executable: string, arguments: array<string>): string {
+    val command = linuxCommand(executable)
+    for (argument in arguments) command.argument(argument)
+    val result = command.capture()
+    if (result.status !=
+        0) ctRaise("Command '$executable ${textJoin(arguments, " ")}' returned non-zero exit status ${result.status}.")
+    result.output
+}
+
+fun ctRunChecked(executable: string, arguments: array<string>): void {
+    val command = linuxCommand(executable)
+    for (argument in arguments) command.argument(argument)
+    val status = command.run()
+    if (status !=
+        0) ctRaise("Command '$executable ${textJoin(arguments, " ")}' returned non-zero exit status $status.")
+    return
+}
+
+/** The environment's NAME=value entries, as the process has them. */
+fun ctEnvironmentEntries(): array<string> {
+    val entries: array<string> = []
+    for (entry in Path("/proc/self/environ").readText().split("\x00")) {
+        if (entry.contains("=")) entries.append(entry)
+    }
+    entries
+}
+
+// The build's metadata (build.json), for the report.
+var ctBuildInfo: CtJson = ctjNull()
+
+/** Builds the driver (or reuses it when nothing it is made of changed): its path, "" after an error. */
+fun ctBuild(root: string, options: CtOptions, out: string): string {
+    val compiler = ctAbsolute(options.compiler) // Preserve the launcher's invocation name.
+    if (!ctIsFile(compiler)) {
+        ctRaise("compiler missing: build ablac first or pass --compiler")
+        return ""
+    }
+    val payload = processEnvironment("ABLA_COMPILER_PAYLOAD") ?? "$compiler.bin"
+    val identity = ctDigest(if (ctIsFile(payload)) payload else compiler)
+    val sources: array<string> = []
+    for (line in ctCommandOutput("find", ["$root/stdlib", "-name", "*.ab", "-type",
+        "f"]).split("\n")) {
+        if (line != "") sources.append(line.slice(root.size + 1, line.size))
+    }
+    for (name in ["driver.ab", "sampler.c", "binding.ab",
+        "runner.ab"]) sources.append("tools/ct-timing/$name")
+    var joined = ""
+    for (source in sortedStrings(sources)) joined = joined + source + ctDigest("$root/$source")
+    val sourceHash = hexEncode(sha256(joined))
+    val environment = ctjObject()
+    for (entry in sortedStrings(ctEnvironmentEntries())) {
+        val equals = entry.indexOf("=")
+        val name = entry.slice(0, equals)
+        if (name.startsWith("ABLA_") || name == "PATH" || name == "LIBRARY_PATH" || name ==
+            "LD_LIBRARY_PATH") {
+            environment.put(name, ctjString(entry.slice(equals + 1, entry.size)))
+        }
+    }
+    val metadata = ctjObject()
+    metadata.put("compiler_sha256", ctjString(identity))
+    metadata.put("sources_sha256", ctjString(sourceHash))
+    metadata.put("clang_version", ctjString(ctCommandOutput("clang", ["--version"]).trim()))
+    metadata.put("build_environment_sha256",
+        ctjString(hexEncode(sha256(ctjRender(environment.json(), -1)))))
+    if (ctError != "") return ""
+    ctBuildInfo = metadata.json()
+    val stampText = ctjRender(metadata.json(), 2) + "\n"
+    val stamp = "$out/build.json"
+    val binary = "$out/driver"
+    if (options.reuse && ctIsFile(stamp) && ctIsFile(binary) && Path(stamp).readText() ==
+        stampText) return binary
+    val bound = ctTimingGenerate(Path("$root/tools/ct-timing/driver.ab").readText(),
+        Path("$root/stdlib/abla/crypto/rsa/entry.ab").readText())
+    if (bound.error != "") {
+        ctRaise(bound.error)
+        return ""
+    }
+    Path("$out/main.ab").writeText(bound.text)
+    Path("$out/abla.toml")
+        .writeText("name = \"ct-timing\"\nentry = \"main.ab\"\nnativeLibraries = [\"cttiming\"]\n")
+    ctRunChecked("clang", ["-O2", "-Wall", "-Wextra", "-Werror", "-c",
+        "$root/tools/ct-timing/sampler.c", "-o",
+        "$out/sampler.o"])
+    ctRunChecked("ar", ["rcs", "$out/libcttiming.a", "$out/sampler.o"])
+    if (ctError != "") return ""
+    val allowed = ctAffinity()
+    val first: array<string> = []
+    for (cpu in allowed) {
+        if (first.size < 4) first.append("$cpu")
+    }
+    val libraryPath = processEnvironment("LIBRARY_PATH") ?? ""
+    val build = linuxCommand("taskset")
+    build.argument("-c")
+    build.argument(textJoin(first, ","))
+    build.argument(compiler)
+    build.argument("build")
+    build.argument("$out/main.ab")
+    build.argument("-o")
+    build.argument(binary)
+    build.argument("--no-cache")
+    build.directory(root)
+    build.environment("ABLA_SYSROOT", root)
+    build.environment("ABLA_LINK_DIRECT", "0")
+    build.environment("ABLA_NATIVE_JOBS", "4")
+    build.environment("JOBS", "4")
+    build.environment("LIBRARY_PATH", if (libraryPath != "") "$out:$libraryPath" else out)
+    build.output("$out/build.log")
+    build.errors("$out/build.log")
+    if (build.run() != 0) {
+        ctRaise("build failed; see $out/build.log")
+        return ""
+    }
+    Path(stamp).writeText(stampText)
+    binary
+}
+
+class CtRunner(
+    val root: string,
+    val pilot: int,
+    val timeout: int,
+    val smoke: bool,
+    val binary: string,
+    val out: string,
+    val report: CtjObject,
+    val runs: array<CtJson>
+) {
+    fun save(): void {
+        this.report.put("runs", ctjArray(this.runs))
+        Path("${this.out}/report.json").writeText(ctjRender(this.report.json(), 2) + "\n")
+        return
+    }
+
+    /** One measurement and its analysis: its record and status ("" after an error). */
+    fun run(target: string, cpu: int, seed: int, n: int, tag: string): CtRunResult {
+        val raw = "${this.out}/$tag.raw"
+        val start = monotonicMilliseconds()
+        val limit = if (target == "leaky-compare" && this.timeout > 60) 60 else this.timeout
+        val command = linuxCommand("timeout")
+        command.argument("$limit")
+        command.argument("taskset")
+        command.argument("-c")
+        command.argument("$cpu")
+        command.argument(this.binary)
+        command.argument(target)
+        command.argument("${n + 128 + this.pilot}")
+        command.argument("$seed")
+        command.argument("${this.root}/tests/vectors/crypto/rsa-implicit-key.pem")
+        command.directory(this.root)
+        command.output(raw)
+        command.errors("${this.out}/$tag.stderr")
+        val status = command.run()
+        val wall = ctjFloat(f64FromInt(monotonicMilliseconds() - start) / 1000.0)
+        if (status == 124) {
+            val record = ctjObject()
+            record.put("target", ctjString(target))
+            record.put("cpu", ctjInt(cpu))
+            record.put("seed", ctjInt(seed))
+            record.put("status", ctjString("measurement timeout"))
+            record.put("raw_file", ctjString(raw))
+            record.put("wall_s", wall)
+            this.runs.append(record.json())
+            this.save()
+            ctRaise("Command '${target}' timed out after $limit seconds")
+            return CtRunResult("", null)
+        }
+        if (status == 3 && target == "aes-hardware") {
+            val record = ctjObject()
+            record.put("target", ctjString(target))
+            record.put("status", ctjString("unavailable: AES CPU feature absent"))
+            record.put("cpu", ctjInt(cpu))
+            this.runs.append(record.json())
+            this.save()
+            println(ctjRender(record.json(), -1))
+            return CtRunResult("unavailable: AES CPU feature absent", null)
+        }
+        if (status != 0) {
+            val record = ctjObject()
+            record.put("target", ctjString(target))
+            record.put("cpu", ctjInt(cpu))
+            record.put("seed", ctjInt(seed))
+            record.put("status", ctjString("measurement failed"))
+            record.put("exit_code", ctjInt(status))
+            record.put("raw_file", ctjString(raw))
+            this.runs.append(record.json())
+            this.save()
+            ctRaise("$target returned $status; see ${this.out}/$tag.stderr")
+            return CtRunResult("", null)
+        }
+        val read = ctReadSamplesFile(raw)
+        if (read.error != "") {
+            ctRaise(read.error)
+            return CtRunResult("", null)
+        }
+        val analysis = ctAnalyze(read.rows, 128, this.pilot, if (this.smoke) 1000 else 10000)
+        if (analysis.error != "") {
+            ctRaise(analysis.error)
+            return CtRunResult("", null)
+        }
+        val record = analysis.record
+        record.put("target", ctjString(target))
+        record.put("cpu", ctjInt(cpu))
+        record.put("seed", ctjInt(seed))
+        record.put("wall_s", wall)
+        record.put("raw_file", ctjString(raw))
+        record.put("raw_sha256", ctjString(ctDigest(raw)))
+        this.runs.append(record.json())
+        this.save()
+        // The line printed leaves the tests out.
+        val shown = ctjObject()
+        val full = record.json()
+        var i = 0
+        while (i < full.keys.size) {
+            if (full.keys[i] != "tests") shown.put(full.keys[i], full.items[i])
+            i = i + 1
+        }
+        println(ctjRender(shown.json(), -1))
+        CtRunResult(analysis.status, analysis.maxAbsT)
+    }
+}
+
+class CtRunResult(val status: string, val maxAbsT: f64?)
+
+fun ctUsage(): string =
+    "usage: run [-h] [--compiler COMPILER] --cpu CPU [--confirm-cpu CONFIRM_CPU] [--samples SAMPLES] [--pilot PILOT] " +
+    "[--seed SEED] [--targets {${textJoin(CT_TARGETS, ",")},leaky-compare} ...] [--output OUTPUT] [--timeout TIMEOUT] " +
+    "[--reuse] [--smoke]"
+
+/** argparse's error: the usage and the message on standard error, exit 2. */
+fun ctArgumentError(message: string): int {
+    eprintln(ctUsage())
+    eprintln("run: error: $message")
+    2
+}
+
+fun ctMain(): int {
+    val root = processEnvironment("ABLA_CT_TIMING_ROOT") ?? ""
+    if (root == "") {
+        eprintln("ct-timing: ABLA_CT_TIMING_ROOT is not set (run tools/ct-timing/run)")
+        return 2
+    }
+    val options = CtOptions("$root/build/ablac", -1, -1, 40000, 4096, 1129599049, [],
+        "$root/build/ct-timing", 1800,
+        false, false)
+    var explicitTargets = false
+    var index = 0
+    val count = processArgumentCount()
+    while (index < count) {
+        val argument = processArgument(index)
+        val value = if (index + 1 < count) processArgument(index + 1) else ""
+        if (argument == "-h" || argument == "--help") {
+            println(ctUsage())
+            return 0
+        }
+        if (argument == "--reuse") {
+            options.reuse = true
+        } else if (argument == "--smoke") {
+            options.smoke = true
+        } else if (argument == "--targets") {
+            explicitTargets = true
+            index = index + 1
+            while (index < count && !processArgument(index).startsWith("--")) {
+                val target = processArgument(index)
+                var known = target == "leaky-compare"
+                for (name in CT_TARGETS) {
+                    if (name == target) known = true
+                }
+                if (!known) return ctArgumentError("argument --targets: invalid choice: '$target'")
+                options.targets.append(target)
+                index = index + 1
+            }
+            if (options.targets.size ==
+                0) return ctArgumentError("argument --targets: expected at least one argument")
+            continue
+        } else if (argument == "--compiler" || argument == "--output" || argument == "--cpu" ||
+            argument == "--confirm-cpu" || argument == "--samples" || argument == "--pilot" ||
+            argument == "--seed" ||
+            argument == "--timeout") {
+            if (index + 1 >=
+                count) return ctArgumentError("argument $argument: expected one argument")
+            if (argument == "--compiler") {
+                options.compiler = value
+            } else if (argument == "--output") {
+                options.output = value
+            } else {
+                val number = value.parseInt()
+                if (number ==
+                    null) return ctArgumentError("argument $argument: invalid int value: '$value'")
+                if (argument == "--cpu") options.cpu = number
+                else if (argument == "--confirm-cpu") options.confirmCpu = number
+                else if (argument == "--samples") options.samples = number
+                else if (argument == "--pilot") options.pilot = number
+                else if (argument == "--seed") options.seed = number
+                else options.timeout = number
+            }
+            index = index + 1
+        } else {
+            return ctArgumentError("unrecognized arguments: $argument")
+        }
+        index = index + 1
+    }
+    if (options.cpu < 0) return ctArgumentError("the following arguments are required: --cpu")
+    if (!explicitTargets) {
+        for (target in CT_TARGETS) options.targets.append(target)
+    }
+    val system = ctCommandOutput("uname", ["-s"]).trim()
+    val machine = ctCommandOutput("uname", ["-m"]).trim()
+    val cpuinfo = Path("/proc/cpuinfo").readText()
+    val unavailable = ctTimingUnavailable(system, machine, cpuinfo)
+    if (unavailable != "") {
+        println(unavailable)
+        return 0
+    }
+    val allowed = ctAffinity()
+    if (!ctHas(allowed, options.cpu) || (options.confirmCpu >= 0 && !ctHas(allowed,
+        options.confirmCpu))) {
+        ctRaise("requested CPU is outside the current affinity mask")
+        return 2
+    }
+    if (options.confirmCpu < 0) {
+        for (cpu in allowed) {
+            if (options.confirmCpu < 0 && ctCore(cpu) != ctCore(options.cpu)) options.confirmCpu =
+                cpu
+        }
+    }
+    if (options.confirmCpu < 0 || ctCore(options.confirmCpu) == ctCore(options.cpu)) {
+        ctRaise("confirmation requires a different available physical core, not its SMT sibling")
+        return 2
+    }
+    if (options.samples < 4 || options.samples % 2 != 0 || !(2 <= options.pilot && options.pilot <=
+        100000) ||
+        options.pilot % 2 != 0 || options.seed <= 0 || options.seed >= 9223372036854675707 ||
+        options.timeout < 1) {
+        ctRaise("samples and pilot must be positive even budgets; seed must fit signed 63 bits")
+        return 2
+    }
+    if (options.samples + options.pilot + 128 > 10000000) {
+        ctRaise("total sample budget exceeds 10000000")
+        return 2
+    }
+    val output = ctAbsolute(options.output)
+    Path(output).createDirectories()
+    val binary = ctBuild(root, options, output)
+    if (ctError != "") return 2
+    val now = utcNow()
+    val pid = Path("/proc/self/stat").readText().split(" ")[0]
+    val out =
+        "$output/runs/${ctPad(now.year, 4)}${ctPad(now.month, 2)}${ctPad(now.day, 2)}T${ctPad(now.hour, 2)}" +
+        "${ctPad(now.minute, 2)}${ctPad(now.second, 2)}Z-$pid"
+    if (Path(out).exists()) {
+        ctRaise("[Errno 17] File exists: '$out'")
+        return 2
+    }
+    Path(out).createDirectories()
+    println("report: $out/report.json")
+    var model = ""
+    for (line in cpuinfo.split("\n")) {
+        if (model == "" && line.startsWith("model name")) model = line.slice(line.indexOf(":") + 1,
+            line.size).trim()
+    }
+    var runner = CtRunner(root, options.pilot, options.timeout, options.smoke, binary, out,
+        ctjObject(), [])
+    val report = runner.report
+    report.put("platform", ctjString("$system-${ctCommandOutput("uname", ["-r"]).trim()}-$machine"))
+    report.put("cpu", ctjInt(options.cpu))
+    report.put("confirmation_cpu", ctjInt(options.confirmCpu))
+    report.put("cpu_model", ctjString(model))
+    val planned: array<CtJson> = []
+    if (!options.smoke) {
+        for (target in options.targets) planned.append(ctjString(target))
+    }
+    report.put("planned_targets", ctjArray(planned))
+    report.put("smoke", ctjBool(options.smoke))
+    report.put("rsa_fixture_sha256",
+        ctjString(ctDigest("$root/tests/vectors/crypto/rsa-implicit-key.pem")))
+    report.put("statistics_sha256", ctjString(ctDigest("$root/tools/ct-timing/stats.ab")))
+    report.put("driver_sha256", ctjString(ctDigest(binary)))
+    report.put("build", ctBuildInfo)
+    report.put("counter", ctjString("serialized TSC ticks, not core cycles"))
+    report.put("constant_tsc_advertised", ctjBool(cpuinfo.contains("constant_tsc")))
+    report.put("threshold", ctjInt(10))
+    report.put("unavailable", ctjArray([ctjString("P-256: not measured here"),
+        ctjString("X25519: not measured here")]))
+    runner.save()
+    val control = runner.run("leaky-compare", options.cpu, options.seed,
+        if (options.smoke) 20000 else 40000, "control")
+    if (ctError != "") return 2
+    if (control.status != "leak detected") {
+        ctRaise("negative control did not exceed |t|>10 within its fixed sample/time budget; run is invalid")
+        return 2
+    }
+    if (options.smoke) return 0
+    var i = 0
+    while (i < options.targets.size) {
+        val target = options.targets[i]
+        val result = runner.run(target, options.cpu, options.seed + 2 * i + 1, options.samples,
+            target)
+        if (ctError != "") return 2
+        if (result.status == "leak detected") {
+            runner.run(target, options.confirmCpu, options.seed + 100003 + 2 * i, options.samples,
+                "$target-confirmation")
+            if (ctError != "") return 2
+            eprintln("Candidate crossed |t|>10. Both runs retained; STOP without changing crypto.")
+            return 1
+        }
+        if (result.status == "insufficient samples") {
+            ctRaise("not enough samples in either class; no no-leak result can be reported")
+            return 2
+        }
+        i = i + 1
+    }
+    0
+}
+
+fun main: int {
+    val status = ctMain()
+    if (ctError != "") {
+        eprintln("ct-timing: $ctError")
+        return 2
+    }
+    status
+}
