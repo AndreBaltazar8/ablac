@@ -12,9 +12,9 @@ new version. Direct mode is untouched.
 
 ## Correctness
 
-`stm-hybrid-clock-model.py` (three TVars, two clocks; transactions that stay on one clock, that move to the
+`stm-hybrid-clock-model.mjs` (three TVars, two clocks; transactions that stay on one clock, that move to the
 second, and readers; every set of values an attempt has read, also one that aborts, must lie in one committed
-state, and the final state is serial). `python3 stm-hybrid-clock-model.py hybrid 200000` (5 specs, 1,000,000
+state, and the final state is serial). `node stm-hybrid-clock-model.mjs hybrid 200000` (5 specs, 1,000,000
 schedules): 0 violations. Negative controls with 40,000 schedules a spec (200,000): `resample` (moving to the
 second clock samples the first one again instead of keeping the snapshot) 2,417 violations; `nosample` (no
 revalidation at a new clock's first read) 50; `broken` (no revalidation when a snapshot is moved up) 7,072;

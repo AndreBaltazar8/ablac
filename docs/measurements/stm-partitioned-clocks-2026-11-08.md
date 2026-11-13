@@ -33,12 +33,12 @@ validates unless every partition it read or wrote is exactly where its snapshot 
 releases each TVar at its own partition's version. Direct mode, retry, `orElse` and the serial lock are
 unchanged. Descriptors grow from 512 to 1,024 bytes.
 
-`stm-partitioned-clock-model.py` models first-read sampling and the move of a snapshot (extension) over random
+`stm-partitioned-clock-model.mjs` models first-read sampling and the move of a snapshot (extension) over random
 interleavings of 2 to 3 transactions (atomic steps: each load, compare-and-swap and store): every pair of
 values any attempt reads is a committed state, and the final state is serial. Its commit always validates and
 its clocks add one: the "clocks unmoved since the snapshot, skip the validation" shortcut and GV4's sharing of a
 version are not modelled here (the hybrid model has the shortcut; sharing is covered only by `test-stm`).
-`python3 stm-partitioned-clock-model.py lazy 300000` (4 specs, 1,200,000 schedules): 0 violations, as for the
+`node stm-partitioned-clock-model.mjs lazy 300000` (4 specs, 1,200,000 schedules): 0 violations, as for the
 single-clock control `old`. Negative controls: `broken 100000` (no revalidation when a snapshot is moved up)
 519 of 400,000 schedules violate; `nosample 100000` (no revalidation at a partition's first read) 1,444 of
 400,000.
