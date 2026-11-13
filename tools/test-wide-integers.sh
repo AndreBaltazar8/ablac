@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# abla/uint256, int256, uint128 and int128 against Python's integers (tools/wide-integers/gen-cases.py), on each target
+# abla/uint256, int256, uint128 and int128 against JavaScript BigInt (tools/wide-integers/gen-cases.mjs), on each target
 # ablac has. test-wide-integers.sh COMPILER [TYPE]: TYPE is one of them, uint256 by default:
 #   run:      x86-64 (release and --fast, on a fresh random seed each run), Wasm under Node, AArch64,
 #             RISC-V 64 and 32 (no M extension) and Xtensa under qemu, with a start of their own and no
@@ -27,16 +27,16 @@ out=build/$type
 cd "$project_root"
 rm -rf "$out"
 mkdir -p "$out/src"
-python3 tools/wide-integers/stage.py "$type" tests/cases/wide-integers "$out/cases"
+node tools/wide-integers/stage.mjs "$type" tests/cases/wide-integers "$out/cases"
 cases=$out/cases
 cp "$cases"/checks.ab "$cases"/object.ab "$cases"/wasm.ab "$out/src/"
-python3 tools/wide-integers/gen-cases.py 1 3000 --type "$type" --abla > "$out/src/cases.ab"
+node tools/wide-integers/gen-cases.mjs 1 3000 --type "$type" --abla > "$out/src/cases.ab"
 
 full=${WIDE_FULL:-${RUN_TESTS_FULL:-}}
 count=16000
 if [[ -n $full ]]; then count=60000; fi
 seed=${WIDE_SEED:-$(( (RANDOM << 33) | (RANDOM << 18) | (RANDOM << 3) | (RANDOM & 7) ))}  # 48 random bits
-python3 tools/wide-integers/gen-cases.py "$seed" "$count" --type "$type" > "$out/random.txt"
+node tools/wide-integers/gen-cases.mjs "$seed" "$count" --type "$type" > "$out/random.txt"
 modes=(--fast)
 [[ -z $full ]] || modes=("--fast -g" --fast "")
 for mode in "${modes[@]}"; do
@@ -178,10 +178,10 @@ echo "ok   under #, as at run time; a type of its own name"
 
 # Decimal formatting has an independent oracle, including each power of ten through 10^77,
 # its neighbors, the integer edges and random widths. Exercise both # and native formatting.
-python3 tools/wide-integers/gen-cases.py "$seed" 64 --type "$type" --decimal-abla > "$out/src/decimal.ab"
+node tools/wide-integers/gen-cases.mjs "$seed" 64 --type "$type" --decimal-abla > "$out/src/decimal.ab"
 "$compiler" build "$out/src/decimal.ab" -o "$out/decimal" --no-cache --fast
 "$out/decimal" || { echo "$type decimal text: seed $seed" >&2; exit 1; }
-echo "ok   decimal text: compile-time and native agree with Python"
+echo "ok   decimal text: compile-time and native agree with BigInt"
 
 if [[ -n $full || $type == uint256 ]]; then
 for invalid in "$cases"/invalid-*.ab; do
@@ -221,4 +221,4 @@ EOF
 ! grep -qE "i256|i128|$type" "$out/hello.ll" || { echo "hello has a $type in it" >&2; exit 1; }
 echo "ok   hello: no trace of it"
 fi
-echo "$type: all targets above agree with Python"
+echo "$type: all targets above agree with BigInt"
