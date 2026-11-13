@@ -37,4 +37,22 @@ for suite in TLS_AES_128_GCM_SHA256 TLS_AES_256_GCM_SHA384; do
     wait "$server_pid" 2> /dev/null || true
     server_pid=
 done
+# A bulk transfer: a 6 MB file, many records; size and SHA-256 must match.
+"$compiler" build tests/cases/tls-pure/bulk.ab -o "$out/bulk" --no-cache
+mkdir -p "$out/www"
+head -c 6291456 /dev/urandom > "$out/www/big.bin"
+expected=$(sha256sum "$out/www/big.bin" | cut -d' ' -f1)
+port=$(( 20000 + RANDOM % 20000 ))
+(cd "$out/www" && exec openssl s_server -accept "$port" -cert ../cert.pem -key ../key.pem -tls1_3 -HTTP -groups X25519 > ../server-bulk.log 2>&1) &
+server_pid=$!
+for _ in $(seq 50); do
+    grep -q ACCEPT "$out/server-bulk.log" 2> /dev/null && break
+    sleep 0.1
+done
+result=$("$root/tools/run-limited.sh" "$out/bulk" "$port" "$public" /big.bin 6291456 "$expected") || { echo "tls-pure bulk: $result" >&2; head -5 "$out/server-bulk.log" >&2; exit 1; }
+[[ $result == 'tls-pure bulk ok'* ]] || { echo "tls-pure bulk: $result" >&2; exit 1; }
+echo "$result"
+kill "$server_pid" 2> /dev/null || true
+wait "$server_pid" 2> /dev/null || true
+server_pid=
 echo 'tls-pure interop ok'

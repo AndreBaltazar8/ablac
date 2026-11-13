@@ -1,0 +1,69 @@
+// A bulk transfer over abla/tls/pure against `openssl s_server -tls1_3 -HTTP` (tools/test-tls-pure-interop.sh):
+// the client downloads a file of several megabytes (s_server -HTTP sends the file as is: many records) and checks
+// its size and SHA-256. Arguments: the port, the
+// certificate's public key (hex), the path to fetch, the expected size, the expected SHA-256 (hex).
+// Prints "tls-pure bulk ok (N bytes, S ms)".
+import "abla/io"
+import "abla/crypto"
+import "abla/crypto/ed25519"
+import "abla/process/arguments"
+import "abla/process/time"
+import "abla/tls/pure/client"
+import "abla/tls/pure/connection"
+import "abla/tls/pure/handshake"
+
+var publicKey = ""
+
+fun verifier(chain: array<string>, host: string, scheme: int, content: string, signature: string): string {
+    if (scheme != TLS_SIG_ED25519) return "unexpected signature scheme $scheme"
+    if (!ed25519Verify(hexDecode(publicKey), content, signature)) return "bad Ed25519 CertificateVerify"
+    ""
+}
+
+fun decimal(text: string): int {
+    var value = 0
+    for (i in 0 until text.size) value = value * 10 + (text[i] - 48)
+    value
+}
+
+fun main: int {
+    val port = decimal(processArgument(0))
+    publicKey = processArgument(1)
+    val path = processArgument(2)
+    val expectedSize = decimal(processArgument(3))
+    val expectedHash = processArgument(4)
+    val started = realtimeMilliseconds()
+    var connection = tlsPureConnect(tlsClientConfig("localhost", verifier, tlsPureRandom), port, 5000, 30000)
+    if (!connection.ok()) {
+        println("FAIL connect: ${connection.lastError}")
+        return 1
+    }
+    if (connection.write("GET $path HTTP/1.0\r\n\r\n") < 0) {
+        println("FAIL write: ${connection.lastError}")
+        return 1
+    }
+    val hasher = sha256Stream()
+    var total = 0
+    var chunk = connection.read(65536)
+    while (chunk.size > 0) {
+        hasher.update(chunk)
+        total = total + chunk.size
+        chunk = connection.read(65536)
+    }
+    if (connection.lastError != "") {
+        println("FAIL read: ${connection.lastError} after $total bytes")
+        return 1
+    }
+    connection.close()
+    val digest = hexEncode(hasher.finish())
+    if (total != expectedSize) {
+        println("FAIL size $total != $expectedSize")
+        return 1
+    }
+    if (digest != expectedHash) {
+        println("FAIL checksum $digest != $expectedHash")
+        return 1
+    }
+    println("tls-pure bulk ok ($total bytes, ${realtimeMilliseconds() - started} ms)")
+    0
+}
