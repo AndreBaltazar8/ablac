@@ -26,5 +26,5 @@ for profile in fast release; do
     flags=()
     if [[ $profile == fast ]]; then flags+=(--fast); fi
     "$compiler" build tests/cases/tls-unix/main.ab -o "$out/$profile" --no-cache ${flags[@]+"${flags[@]}"}
-    python3 tools/test-tls-unix.py "$out/$profile" "$out/cert.pem" "$out/key.pem" "$out/identity.p12" "$scratch"
+    node tests/cases/tls-unix/peer.mjs "$out/$profile" "$out/cert.pem" "$out/key.pem" "$out/identity.p12" "$scratch"
 done
