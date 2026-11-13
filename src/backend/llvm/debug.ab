@@ -661,6 +661,15 @@ fun bootstrapLlvmDebugInstallFaultHandlers(
         }
         return
     }
+    if (bootstrapLlvmFaultDarwin(backend)) {
+        // signal()'s BSD semantics: SA_RESTART (2).
+        for (signal in bootstrapLlvmDebugFaultSignals(backend)) {
+            bootstrapLlvmDarwinSigaction(
+                backend, LLVMConstInt(backend.i64Type, signal, 0), fault, 2
+            )
+        }
+        return
+    }
     for (signal in bootstrapLlvmDebugFaultSignals(backend)) {
         bootstrapLlvmDebugCall(
             backend, "signal", backend.pointerType,
@@ -777,6 +786,7 @@ fun bootstrapLlvmSigreturnRestorer(backend: BootstrapLlvmBackend): i64* {
 // Defines the trampoline when something took its address: no frame, just
 // rt_sigreturn (15).
 fun bootstrapLlvmEmitSigreturnRestorer(backend: BootstrapLlvmBackend): void {
+    bootstrapLlvmEmitDarwinSigtramp(backend)
     val restorer = LLVMGetNamedFunction(backend.module, "abla_runtime_sigreturn")
     if (pointerIsNull(restorer) || LLVMIsDeclaration(restorer) == 0) return
     LLVMPositionBuilderAtEnd(
@@ -827,6 +837,97 @@ fun bootstrapLlvmStackGuardKernelSigaction(
     val zero = LLVMConstInt(backend.i64Type, 0, 0)
     bootstrapLlvmLinuxX64Syscall(
         backend, 13, [signal, action, zero, LLVMConstInt(backend.i64Type, 8, 0)]
+    )
+    return
+}
+
+// macOS (#811 group 6): the fault handlers are installed by the BSD system calls
+// sigaltstack (53) and sigaction (46), with the program's own signal trampoline
+// instead of libSystem's. The kernel's struct __sigaction is {handler (8), trampoline
+// (8), mask (4), flags (4)}; the trampoline is entered with the handler, the
+// info style, the signal, the siginfo and the ucontext, calls handler(signal,
+// info, ucontext) and returns through sigreturn (184) with the ucontext and
+// the style. Unverified until the macOS job runs: those numbers, that layout and the
+// trampoline's register use.
+fun bootstrapLlvmFaultDarwin(backend: BootstrapLlvmBackend): bool =
+    bootstrapLlvmDarwinSyscallTarget(backend)
+
+fun bootstrapLlvmDarwinSyscallBy(
+    backend: BootstrapLlvmBackend,
+    number: int,
+    arguments: array<i64*>
+): i64* {
+    val values: array<i64*> = [LLVMConstInt(backend.i64Type, number, 0)]
+    for (argument in arguments) {
+        values.append(if (LLVMTypeOf(argument) == backend.pointerType) {
+            LLVMBuildPtrToInt(backend.builder, argument, backend.i64Type, "syscall.pointer")
+        } else argument)
+    }
+    while (values.size < 7) values.append(LLVMConstInt(backend.i64Type, 0, 0))
+    bootstrapLlvmInlineDarwinSyscall(backend, values, "darwin.fault.syscall")
+}
+
+// The trampoline's address, declared on first use.
+fun bootstrapLlvmDarwinSigtramp(backend: BootstrapLlvmBackend): i64* {
+    var tramp = LLVMGetNamedFunction(backend.module, "abla_runtime_sigtramp")
+    if (pointerIsNull(tramp)) {
+        tramp = bootstrapLlvmDeclare(
+            backend, "abla_runtime_sigtramp", backend.voidType, [], false, []
+        )
+        LLVMSetLinkage(tramp, llvmInternalLinkage())
+    }
+    tramp
+}
+
+// Defines the trampoline when something took its address. arm64 receives
+// x0 handler, x1 style, x2 signal, x3 info, x4 ucontext; x86-64 rdi, esi, edx,
+// rcx, r8. Neither returns, so the registers it keeps across the handler call are
+// free to clobber.
+fun bootstrapLlvmEmitDarwinSigtramp(backend: BootstrapLlvmBackend): void {
+    val tramp = LLVMGetNamedFunction(backend.module, "abla_runtime_sigtramp")
+    if (pointerIsNull(tramp) || LLVMIsDeclaration(tramp) == 0) return
+    LLVMPositionBuilderAtEnd(
+        backend.builder,
+        LLVMAppendBasicBlockInContext(backend.context, tramp, "entry")
+    )
+    bootstrapLlvmAddFunctionAttribute(backend, tramp, "naked")
+    bootstrapLlvmAddFunctionAttribute(backend, tramp, "noinline")
+    bootstrapLlvmAddFunctionAttribute(backend, tramp, "nounwind")
+    val type = bootstrapLlvmFunctionType(backend, backend.voidType, [])
+    val arm = !bootstrapTextContains(backend.targetTriple, "x86_64")
+    val code = if (arm)
+        "mov x19, x4\n\tmov x20, x1\n\tmov x5, x0\n\tmov x0, x2\n\tmov x1, x3\n\tmov x2, x4\n\tblr x5\n\tmov x0, x19\n\tmov x1, x20\n\tmov x16, #184\n\tsvc #0x80\n\tbrk #1"
+        else "movq %r8, %r12\n\tmovl %esi, %r13d\n\tmovq %rdi, %rax\n\tmovl %edx, %edi\n\tmovq %rcx, %rsi\n\tmovq %r12, %rdx\n\tandq $$-16, %rsp\n\tcallq *%rax\n\tmovq %r12, %rdi\n\tmovl %r13d, %esi\n\tmovl $$33554616, %eax\n\tsyscall\n\tud2"
+    bootstrapLlvmCallTyped(
+        backend, type,
+        LLVMGetInlineAsm(type, code, code.size, "", 0, 1, 0, 0, 0),
+        [], ""
+    )
+    LLVMBuildUnreachable(backend.builder)
+    return
+}
+
+// sigaction(signal, {handler, trampoline, mask 0, flags}, NULL).
+fun bootstrapLlvmDarwinSigaction(
+    backend: BootstrapLlvmBackend,
+    signal: i64*,
+    handler: i64*,
+    flags: int
+): void {
+    val actionType = LLVMArrayType2(backend.i8Type, 24)
+    val action = LLVMBuildAlloca(backend.builder, actionType, "darwin.action")
+    LLVMBuildStore(backend.builder, LLVMConstNull(actionType), action)
+    LLVMBuildStore(backend.builder, handler, action)
+    LLVMBuildStore(
+        backend.builder, bootstrapLlvmDarwinSigtramp(backend),
+        bootstrapLlvmByteAt(backend, action, 24, 8)
+    )
+    LLVMBuildStore(
+        backend.builder, LLVMConstInt(backend.i32Type, flags, 0),
+        bootstrapLlvmByteAt(backend, action, 24, 20)
+    )
+    bootstrapLlvmDarwinSyscallBy(
+        backend, 46, [signal, action, LLVMConstInt(backend.i64Type, 0, 0)]
     )
     return
 }
@@ -895,6 +996,10 @@ fun bootstrapLlvmInstallStackGuard(backend: BootstrapLlvmBackend): void {
         bootstrapLlvmLinuxX64Syscall(
             backend, 131, [stack, LLVMConstInt(backend.i64Type, 0, 0)]
         )
+    } else if (bootstrapLlvmFaultDarwin(backend)) {
+        bootstrapLlvmDarwinSyscallBy(
+            backend, 53, [stack, LLVMConstInt(backend.i64Type, 0, 0)]
+        )
     } else {
         bootstrapLlvmStackGuardCall(
             backend, "sigaltstack", backend.i32Type,
@@ -929,6 +1034,15 @@ fun bootstrapLlvmInstallStackGuard(backend: BootstrapLlvmBackend): void {
         for (signal in [11, 7]) {
             bootstrapLlvmStackGuardKernelSigaction(
                 backend, LLVMConstInt(backend.i64Type, signal, 0), kernelAction
+            )
+        }
+        return
+    }
+    if (bootstrapLlvmFaultDarwin(backend)) {
+        // SA_SIGINFO (0x40) | SA_ONSTACK (1).
+        for (signal in [11, 10]) {
+            bootstrapLlvmDarwinSigaction(
+                backend, LLVMConstInt(backend.i64Type, signal, 0), handler, 65
             )
         }
         return
