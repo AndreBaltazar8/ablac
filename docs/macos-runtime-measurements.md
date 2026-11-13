@@ -130,7 +130,7 @@ gh workflow run ci.yml --ref master -f macos_runtime_bench=true
 
 The normal Linux/Mac suite jobs are skipped for that opt-in dispatch; their
 ordinary push/PR/default-dispatch behavior is unchanged. The harness is
-`tools/bench-macos-runtime.sh` plus `tools/bench-macos-runtime.py`.
+`tools/bench-macos-runtime.sh` plus `tools/bench-macos-runtime.mjs`.
 
 ## v0.2.47 versus v0.2.51 (2026-11-09)
 

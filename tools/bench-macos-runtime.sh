@@ -6,7 +6,7 @@ set -euo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 old=$(cd -- "$1" && pwd)
 new=$(cd -- "$2" && pwd)
-report=$(python3 -c 'import os,sys;print(os.path.abspath(sys.argv[1]))' "$3")
+report=$(node -e 'console.log(require("path").resolve(process.argv[1]))' "$3")
 old_version=${4:-v0.2.45}
 new_version=${5:-v0.2.47}
 # The release tag's commit and the published compiler's SHA-256, per version and architecture.
@@ -63,7 +63,7 @@ done
     strip -V 2>&1 || true
     uptime
 } > "$report/provenance.txt" 2>&1
-python3 "$root/tools/bench-macos-runtime.py" \
+node "$root/tools/bench-macos-runtime.mjs" \
     --old-root "$old" --new-root "$new" \
     --old-compiler "$report/$old_version.bin" --new-compiler "$report/$new_version.bin" \
     --old-version "$old_version" --new-version "$new_version" \

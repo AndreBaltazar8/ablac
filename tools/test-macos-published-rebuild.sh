@@ -9,7 +9,7 @@ fi
 [[ $(uname -s) == Darwin ]] || { echo 'published Mach-O rebuild requires Darwin' >&2; exit 2; }
 driver_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 source_root=$(cd -- "$1" && pwd)
-report=$(python3 -c 'import os,sys;print(os.path.abspath(sys.argv[1]))' "$2")
+report=$(node -e 'console.log(require("path").resolve(process.argv[1]))' "$2")
 mkdir -p "$(dirname -- "$report")"
 mkdir "$report"  # Refuse stale artifacts instead of deleting them.
 case $(uname -m) in
@@ -48,7 +48,7 @@ curl --fail --location --retry 3 \
     -o "$report/published"
 printf '%s  %s\n' "$expected" "$report/published" | shasum -a 256 --check
 chmod +x "$report/published"
-python3 "$driver_root/tools/test-macos-binary-comparison.py" "$report/published" \
+node "$driver_root/tools/test-macos-binary-comparison.mjs" "$report/published" \
     > "$report/comparator-controls.log" 2>&1
 # Use the SOURCE TAG's pin (v0.2.46), not the driver's current moving pin.
 unset ABLA_BOOTSTRAP_URL ABLA_BOOTSTRAP_SHA256 ABLA_SYSROOT ABLA_STDLIB ABLA_COMPILER_PAYLOAD
@@ -88,6 +88,6 @@ for label in published rebuilt; do
             >> "$report/$label.codesign.txt" 2>&1
     fi
 done
-python3 "$driver_root/tools/compare-macos-binaries.py" \
+node "$driver_root/tools/compare-macos-binaries.mjs" \
     "$report/published" "$report/rebuilt" "$report/comparison" \
     | tee "$report/comparison.log"
