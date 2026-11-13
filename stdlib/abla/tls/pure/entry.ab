@@ -228,6 +228,31 @@ fun TlsConnection.close(): bool {
     this.inner.close()
 }
 
+/** The socket of an open connection (what the handle is while it is open), or -1: for a poller, a socket option, a
+ *  fault test. Reading or writing it directly corrupts the TLS stream. */
+fun TlsConnection.descriptor(): int = if (this.handle == -1) -1 else this.inner.tcp.descriptor
+
+/** Gives the socket back without a close_notify and without closing it: the TLS state is dropped, the peer sees
+ *  whatever the caller then does with the descriptor (a reset after SO_LINGER 0, a held-open stall). The connection
+ *  is closed afterwards (handle -1). Returns the descriptor, or -1 for a connection that was not open. */
+fun TlsConnection.detach(): int {
+    if (this.handle == -1) return -1
+    val descriptor = this.inner.tcp.descriptor
+    this.inner.tcp.descriptor = -1
+    this.handle = -1
+    descriptor
+}
+
+/** A connection that is not open (handle -1), the value to return where a call has nothing to return. It sets no
+ *  error and has no socket. */
+fun tlsFailedConnection(): TlsConnection {
+    val failed = tlsPureFailedConnection(pureTlsConfig("", X509TrustStore([])), "no connection", 0)
+    TlsConnection(-1, move(failed))
+}
+
+/** Whether the last failure on this thread was a read, write or handshake timeout. */
+trusted fun tlsLastErrorTimedOut(): bool = ablaUnsafeLoadI64(pureTlsErrorSlot()) == 13
+
 // ---- the server side: tlsListen, TlsListener, tlsServerUpgrade ----
 private fun pureTlsServerConfig(certificatePath: string, privateKeyPath: string): TlsServerConfig? {
     val identity = tlsClientIdentityFromPem(linuxReadFile(certificatePath, 1048576), linuxReadFile(privateKeyPath, 1048576))
@@ -289,6 +314,9 @@ private fun pureTlsNoSignature(scheme: int, content: string): string = ""
 
 fun TlsListener.localPort(): int = if (this.handle != -1) this.listener.localPort() else -1
 
+/** The listening socket, for a poller (readable when a connection waits to be accepted), or -1. */
+fun TlsListener.descriptor(): int = if (this.handle != -1) this.listener.descriptor else -1
+
 /** Accepts one connection and runs its handshake; a client that connects and says nothing costs one handshake
  *  timeout. Check `handle != -1` of the result. */
 fun TlsListener.accept(handshakeTimeoutMilliseconds: int = 5000,
@@ -333,4 +361,67 @@ fun tlsServerUpgrade(var connection: UnixConnection, certificatePath: string, pr
     connection.descriptor = -1
     tlsServerUpgrade(stream, certificatePath, privateKeyPath, handshakeTimeoutMilliseconds,
         readWriteTimeoutMilliseconds, deadline)
+}
+
+// ---- handles: a connection addressed by an int, for code that keeps only an int (a closure, a table of descriptors) ----
+// The hosted module let a program build `TlsConnection(handle)` around an OpenSSL pointer's number. Here the state lives
+// in the connection object, so the connection is moved into a process-wide table and addressed by its descriptor.
+// The table is a mutable global, so these calls are for one thread (the compiler refuses to reach them from `thread {}`).
+
+private var pureTlsHandleTable: array<TlsConnection> = []
+
+private fun pureTlsHandleIndex(handle: int): int {
+    var at = 0
+    while (at < pureTlsHandleTable.size) {
+        if (pureTlsHandleTable[at].handle == handle) return at
+        at = at + 1
+    }
+    -1
+}
+
+/** Moves an open connection into the handle table and returns its handle (its descriptor); -1, with nothing kept,
+ *  for a connection that is not open. `tlsClaim(handle)` takes it back, `tlsCloseHandle(handle)` closes it. */
+fun tlsRelease(own connection: TlsConnection): int {
+    if (connection.handle == -1) return -1
+    val handle = connection.handle
+    pureTlsHandleTable.append(move(connection))
+    handle
+}
+
+/** Takes the connection of a handle out of the table (a not-open connection if there is none). */
+fun tlsClaim(handle: int): TlsConnection {
+    val at = pureTlsHandleIndex(handle)
+    if (at < 0) return tlsFailedConnection()
+    pureTlsHandleTable.takeAt(at)
+}
+
+/** Whether the table holds an open connection under `handle`. */
+fun tlsHandleOpen(handle: int): bool = pureTlsHandleIndex(handle) >= 0
+
+/** As TlsConnection.read on the connection of a handle ("" with tlsLastError() empty at the end of the stream; "" too
+ *  for an unknown handle). */
+fun tlsReadHandle(handle: int, maximum: int = 65536): string {
+    val at = pureTlsHandleIndex(handle)
+    if (at < 0) return ""
+    pureTlsHandleTable[at].read(maximum)
+}
+
+fun tlsWriteHandle(handle: int, contents: string): int {
+    val at = pureTlsHandleIndex(handle)
+    if (at < 0) return -1
+    pureTlsHandleTable[at].write(contents)
+}
+
+fun tlsSetTimeoutsHandle(handle: int, readMilliseconds: int, writeMilliseconds: int): bool {
+    val at = pureTlsHandleIndex(handle)
+    if (at < 0) return false
+    pureTlsHandleTable[at].setTimeouts(readMilliseconds, writeMilliseconds)
+}
+
+/** Closes the connection of a handle (close_notify, then the socket) and forgets it. True for an unknown handle too. */
+fun tlsCloseHandle(handle: int): bool {
+    val at = pureTlsHandleIndex(handle)
+    if (at < 0) return true
+    var connection = pureTlsHandleTable.takeAt(at)
+    connection.close()
 }

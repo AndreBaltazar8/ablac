@@ -1,0 +1,103 @@
+// abla/tls/pure: a connection addressed by an int (tlsRelease, tlsReadHandle, tlsWriteHandle, tlsSetTimeoutsHandle, tlsClaim,
+// tlsCloseHandle), descriptor() and detach(), tlsFailedConnection, tlsLastErrorTimedOut. tools/test-tls-handles.sh runs it
+// against openssl:
+//   handles fetch PORT CERT        tlsConnect to localhost:PORT (CERT is the CA); everything after goes through the handle
+//   handles serve CERT KEY PORTFILE   listens on a free port (written to PORTFILE), serves one request through the handle
+//   handles reset CERT KEY PORTFILE   accepts one connection, detaches it and resets the socket (SO_LINGER 0)
+//   handles expect-reset PORT CERT    connects, sends, and expects the read to fail with a reset (not a clean end)
+//   handles timeout PORT CERT         connects, reads with a 200 ms timeout from a silent peer: tlsLastErrorTimedOut()
+import "abla/fs"
+import "abla/io"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/sys/linux/net"
+import "abla/tls/pure"
+import "abla/unsafe/memory"
+
+fun fail(what: string): int {
+    println("FAIL $what (${tlsLastError()})")
+    1
+}
+
+fun main: int {
+    val mode = processArgument(0)
+    if (mode == "fetch") {
+        val connection = tlsConnectWithCa("localhost", processArgument(2), toPort(processArgument(1)), 5000, 5000)
+        if (connection.handle == -1) return fail("connect: " + connection.detail())
+        val socket = connection.descriptor()
+        if (socket != connection.handle || socket < 3) return fail("descriptor $socket of handle ${connection.handle}")
+        val handle = tlsRelease(move(connection))
+        if (handle != socket || !tlsHandleOpen(handle)) return fail("release")
+        if (tlsRelease(tlsFailedConnection()) != -1) return fail("a failed connection was kept")
+        if (!tlsSetTimeoutsHandle(handle, 4000, 4000)) return fail("timeouts")
+        if (tlsWriteHandle(handle, "GET /handles HTTP/1.0\r\n\r\n") < 0) return fail("write")
+        var response = tlsReadHandle(handle, 4096)
+        if (response == "") return fail("read")
+        var claimed = tlsClaim(handle)
+        if (claimed.handle != handle || tlsHandleOpen(handle)) return fail("claim")
+        var more = claimed.read(4096)
+        while (more.size > 0) {
+            response = response + more
+            more = claimed.read(4096)
+        }
+        if (!response.contains("HTTP/1.0 200")) return fail("response [$response]")
+        claimed.close()
+        // After the close nothing is left under the number, and the calls say so.
+        if (tlsReadHandle(handle) != "" || tlsWriteHandle(handle, "x") != -1 || tlsHandleOpen(handle)) return fail("closed handle")
+        if (!tlsCloseHandle(handle)) return fail("closing an unknown handle")
+        println("tls-pure handles fetch ok (${response.size} bytes)")
+        return 0
+    }
+    if (mode == "serve" || mode == "reset") {
+        val listener = tlsListen(processArgument(1), processArgument(2), "::", 0)
+        if (listener.handle == -1) return fail("listen")
+        if (listener.descriptor() < 3) return fail("listener descriptor")
+        path(processArgument(3)).writeText("${listener.localPort()}")
+        var connection = listener.accept(5000, 5000)
+        if (connection.handle == -1) return fail("accept")
+        if (mode == "reset") {
+            val socket = connection.detach()
+            if (socket < 3 || connection.handle != -1 || connection.descriptor() != -1 || connection.detach() != -1) return fail("detach")
+            val request = nativeByteBuffer(8)
+            request.storeI64(0, 1)
+            // l_onoff 1, l_linger 0: the close is a reset.
+            linuxSyscall5(54, socket, 1, 13, nativePointerAddress(request.address), 8)
+            request.close()
+            linuxTcpCloseDescriptor(socket)
+            println("tls-pure handles reset ok")
+            return 0
+        }
+        val handle = tlsRelease(move(connection))
+        if (handle < 3) return fail("release")
+        val request = tlsReadHandle(handle, 4096)
+        if (!request.startsWith("GET /handles")) return fail("request [$request]")
+        if (tlsWriteHandle(handle, "HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok") < 0) return fail("write")
+        if (!tlsCloseHandle(handle) || tlsHandleOpen(handle)) return fail("close")
+        println("tls-pure handles serve ok")
+        return 0
+    }
+    if (mode == "expect-reset") {
+        var connection = tlsConnectWithCa("localhost", processArgument(2), toPort(processArgument(1)), 5000, 5000)
+        if (connection.handle == -1) return fail("connect: " + connection.detail())
+        connection.write("GET / HTTP/1.0\r\n\r\n")
+        val got = connection.read(4096)
+        if (got != "" || tlsLastError() == "") return fail("a reset read as a clean end: [$got]")
+        println("tls-pure handles expect-reset ok (${tlsLastError()})")
+        return 0
+    }
+    if (mode == "timeout") {
+        var connection = tlsConnectWithCa("localhost", processArgument(2), toPort(processArgument(1)), 5000, 200)
+        if (connection.handle == -1) return fail("connect: " + connection.detail())
+        val got = connection.read(4096)
+        if (got != "" || !tlsLastErrorTimedOut()) return fail("no timeout")
+        println("tls-pure handles timeout ok")
+        return 0
+    }
+    1
+}
+
+fun toPort(text: string): int {
+    var value = 0
+    for (at in 0 until text.size) value = value * 10 + int(text[at]) - 48
+    value
+}

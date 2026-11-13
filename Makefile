@@ -340,6 +340,7 @@ test-serial: ablac
 	tools/test-rsa-keygen.sh $(COMPILER)
 	tools/test-rsa-unbalanced.sh $(COMPILER)
 	tools/test-p256.sh $(COMPILER)
+	tools/test-tls-handles.sh $(COMPILER)
 	tools/test-x509.sh $(COMPILER)
 	tools/test-import-aliases.sh $(COMPILER)
 	tools/test-linux-arguments.sh $(COMPILER)
