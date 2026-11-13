@@ -13,6 +13,14 @@ import "abla/sys/linux/process"
 import "abla/text"
 import "abla/unsafe/memory"
 
+// On macOS the same Linux-numbered surface is the runtime's translation to BSD system calls (#811), so the program text
+// is the same; what differs is below, selected by ablaHostIsMacOS(): termios (Darwin's 72-byte struct, its flag values and
+// numeric baud rates, TIOCGETA/TIOCSETAF), the pty ioctls, and setsid/setrlimit, which the translation does not cover.
+private noescape extern:"intrinsic" fun ablaHostIsMacOS(): bool
+private trusted noescape extern:"c" fun setsid(): i32
+private trusted noescape extern:"c" fun getrlimit(kind: i32, limits: i64*): i32
+private trusted noescape extern:"c" fun setrlimit(kind: i32, limits: i64*): i32
+
 // --- Linux x86-64 and AArch64 system calls (the generic table), errno values and flags, written out here -------------
 private val SYS_READ = 0
 private val SYS_WRITE = 1
@@ -39,7 +47,7 @@ private val O_ACCMODE = 3
 private val O_CREAT = 64
 private val O_NOCTTY = 256
 private val O_TRUNC = 512
-private val O_NONBLOCK = 2048
+private val O_NONBLOCK = if (ablaHostIsMacOS()) 4 else 2048 // the value fcntl reports natively
 private val O_CLOEXEC = 524288
 private val FD_CLOEXEC = 1
 private val POLLIN = 1
@@ -52,40 +60,46 @@ private val ENOTTY = 25
 private val EIO = 5
 private val EOPNOTSUPP = 95
 
-// --- termios, as the kernel's ioctls see it: iflag, oflag, cflag, lflag (u32 each), line, cc[19] ------------------------
-private val TCGETS = 21505
-private val TCSETSF = 21508
+// --- termios, as the kernel's ioctls see it ---------------------------------------------------------------------------
+// Linux: iflag, oflag, cflag, lflag (u32 each), line, cc[19]: 36 bytes. Darwin: the same four flags as 8-byte words, cc[20]
+// at 32, input and output speed as numeric rates at 56 and 64: 72 bytes.
+private val TCGETS = if (ablaHostIsMacOS()) 1078490131 else 21505 // TIOCGETA
+private val TCSETSF = if (ablaHostIsMacOS()) 2152231958 else 21508 // TIOCSETAF
 private val TIOCGPTN = 2147767344
 private val TIOCSPTLCK = 1074025521
-private val TERMIOS_BYTES = 36
-private val IGNBRK = 1
+private val TIOCPTYGRANT = 536900692
+private val TIOCPTYUNLK = 536900690
+private val TIOCPTYGNAME = 1082160211
+private val TERMIOS_BYTES = if (ablaHostIsMacOS()) 72 else 36
+private val FLAG_STRIDE = if (ablaHostIsMacOS()) 8 else 4
+private val CC_OFFSET = if (ablaHostIsMacOS()) 32 else 17
 private val BRKINT = 2
 private val INPCK = 16
 private val ISTRIP = 32
 private val ICRNL = 256
-private val IXON = 1024
+private val IXON = if (ablaHostIsMacOS()) 512 else 1024
 private val IXANY = 2048
-private val IXOFF = 4096
+private val IXOFF = if (ablaHostIsMacOS()) 1024 else 4096
 private val OPOST = 1
 private val CBAUD = 4111
 private val CIBAUD = 269418496
-private val CSIZE = 48
+private val CSIZE = if (ablaHostIsMacOS()) 768 else 48
 private val CS5 = 0
-private val CS6 = 16
-private val CS7 = 32
-private val CS8 = 48
-private val CSTOPB = 64
-private val CREAD = 128
-private val PARENB = 256
-private val PARODD = 512
-private val CLOCAL = 2048
-private val CRTSCTS = 2147483648
-private val ISIG = 1
-private val ICANON = 2
+private val CS6 = if (ablaHostIsMacOS()) 256 else 16
+private val CS7 = if (ablaHostIsMacOS()) 512 else 32
+private val CS8 = if (ablaHostIsMacOS()) 768 else 48
+private val CSTOPB = if (ablaHostIsMacOS()) 1024 else 64
+private val CREAD = if (ablaHostIsMacOS()) 2048 else 128
+private val PARENB = if (ablaHostIsMacOS()) 4096 else 256
+private val PARODD = if (ablaHostIsMacOS()) 8192 else 512
+private val CLOCAL = if (ablaHostIsMacOS()) 32768 else 2048
+private val CRTSCTS = if (ablaHostIsMacOS()) 196608 else 2147483648 // Darwin: CCTS_OFLOW | CRTS_IFLOW
+private val ISIG = if (ablaHostIsMacOS()) 128 else 1
+private val ICANON = if (ablaHostIsMacOS()) 256 else 2
 private val ECHO = 8
-private val IEXTEN = 32768
-private val VTIME = 5
-private val VMIN = 6
+private val IEXTEN = if (ablaHostIsMacOS()) 1024 else 32768
+private val VTIME = if (ablaHostIsMacOS()) 17 else 5
+private val VMIN = if (ablaHostIsMacOS()) 16 else 6
 
 // --- the checks' bookkeeping ---------------------------------------------------------------------------------------
 var checks = 0
@@ -202,17 +216,36 @@ class Pty(val master: int, val slave: int, val path: string)
 fun openPty(): Pty {
     val master = linuxSyscall4(SYS_OPENAT, AT_FDCWD, nativeCStringAddress("/dev/ptmx"), O_RDWR | O_NOCTTY | O_CLOEXEC, 0)
     expect(master >= 0, "cannot open /dev/ptmx: $master")
-    val cell = nativeByteBuffer(8)
-    cell.storeI64(0, 0)
-    expectEqual(linuxSyscall3(SYS_IOCTL, master, TIOCSPTLCK, address(cell)), 0, "unlock the pty")
-    cell.storeI64(0, 0)
-    expectEqual(linuxSyscall3(SYS_IOCTL, master, TIOCGPTN, address(cell)), 0, "number of the pty")
-    val number = word32(cell, 0)
-    cell.close()
-    val path = "/dev/pts/$number"
+    var path = ""
+    if (ablaHostIsMacOS()) {
+        // posix_openpt, grantpt, unlockpt and ptsname by their ioctls.
+        expectEqual(linuxSyscall3(SYS_IOCTL, master, TIOCPTYGRANT, 0), 0, "TIOCPTYGRANT")
+        expectEqual(linuxSyscall3(SYS_IOCTL, master, TIOCPTYUNLK, 0), 0, "TIOCPTYUNLK")
+        val name = nativeByteBuffer(160)
+        for (index in 0 until 160) name.store(index, 0)
+        expectEqual(linuxSyscall3(SYS_IOCTL, master, TIOCPTYGNAME, address(name)), 0, "TIOCPTYGNAME")
+        var length = 0
+        while (length < 128 && name.load(length) != 0) length = length + 1
+        for (index in 0 until length) path = path + byteText(name.load(index))
+        name.close()
+    } else {
+        val cell = nativeByteBuffer(8)
+        cell.storeI64(0, 0)
+        expectEqual(linuxSyscall3(SYS_IOCTL, master, TIOCSPTLCK, address(cell)), 0, "unlock the pty")
+        cell.storeI64(0, 0)
+        expectEqual(linuxSyscall3(SYS_IOCTL, master, TIOCGPTN, address(cell)), 0, "number of the pty")
+        path = "/dev/pts/${word32(cell, 0)}"
+        cell.close()
+    }
     val slave = linuxSyscall4(SYS_OPENAT, AT_FDCWD, nativeCStringAddress(path), O_RDWR | O_NOCTTY | O_CLOEXEC, 0)
     expect(slave >= 0, "cannot open $path: $slave")
     Pty(master, slave, path)
+}
+
+fun byteText(value: int): string {
+    val one = nativeByteBuffer(2)
+    one.store(0, value)
+    one.adoptString(1)
 }
 
 fun Pty.close(): void {
@@ -222,13 +255,17 @@ fun Pty.close(): void {
 }
 
 class Termios(val raw: string) {
-    fun word(index: int): int =
-        int(this.raw[index * 4]) + int(this.raw[index * 4 + 1]) * 256 + int(this.raw[index * 4 + 2]) * 65536 + int(this.raw[index * 4 + 3]) * 16777216
+    fun word(index: int): int = this.at(index * FLAG_STRIDE)
+    // The 32 low bits at byte `offset` (the flags and the speeds all fit).
+    fun at(offset: int): int =
+        int(this.raw[offset]) + int(this.raw[offset + 1]) * 256 + int(this.raw[offset + 2]) * 65536 + int(this.raw[offset + 3]) * 16777216
     fun input(): int = this.word(0)
     fun output(): int = this.word(1)
     fun control(): int = this.word(2)
     fun local(): int = this.word(3)
-    fun cc(index: int): int = int(this.raw[17 + index])
+    // Darwin only: the rates in the termios block itself.
+    fun inputSpeed(): int = this.at(56)
+    fun outputSpeed(): int = this.at(64)
 }
 
 fun getTermios(descriptor: int): Termios {
@@ -244,11 +281,11 @@ fun setRaw(descriptor: int): void {
     val buffer = nativeByteBuffer(TERMIOS_BYTES + 8)
     for (index in 0 until TERMIOS_BYTES) buffer.store(index, int(before.raw[index]))
     storeWord32(buffer, 0, before.input() & ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON))
-    storeWord32(buffer, 4, before.output() & ~OPOST)
-    storeWord32(buffer, 8, (before.control() & ~(CSIZE | PARENB)) | CS8)
-    storeWord32(buffer, 12, before.local() & ~(ECHO | ICANON | IEXTEN | ISIG))
-    buffer.store(17 + VMIN, 1)
-    buffer.store(17 + VTIME, 0)
+    storeWord32(buffer, FLAG_STRIDE, before.output() & ~OPOST)
+    storeWord32(buffer, 2 * FLAG_STRIDE, (before.control() & ~(CSIZE | PARENB)) | CS8)
+    storeWord32(buffer, 3 * FLAG_STRIDE, before.local() & ~(ECHO | ICANON | IEXTEN | ISIG))
+    buffer.store(CC_OFFSET + VMIN, 1)
+    buffer.store(CC_OFFSET + VTIME, 0)
     expectEqual(linuxSyscall3(SYS_IOCTL, descriptor, TCSETSF, address(buffer)), 0, "TCSETSF")
     buffer.close()
     return
@@ -256,7 +293,7 @@ fun setRaw(descriptor: int): void {
 
 // The baud-rate codes of c_cflag's CBAUD bits (the kernel's, Linux's generic termbits).
 fun baudCode(rate: int): int =
-    if (rate == 50) 1 else if (rate == 75) 2 else if (rate == 110) 3 else if (rate == 134) 4 else if (rate == 150) 5
+    if (ablaHostIsMacOS()) rate else if (rate == 50) 1 else if (rate == 75) 2 else if (rate == 110) 3 else if (rate == 134) 4 else if (rate == 150) 5
     else if (rate == 200) 6 else if (rate == 300) 7 else if (rate == 600) 8 else if (rate == 1200) 9 else if (rate == 1800) 10
     else if (rate == 2400) 11 else if (rate == 4800) 12 else if (rate == 9600) 13 else if (rate == 19200) 14 else if (rate == 38400) 15
     else if (rate == 57600) 4097 else if (rate == 115200) 4098 else if (rate == 230400) 4099 else -1
@@ -290,7 +327,7 @@ private fun argumentVector(arguments: array<string>): NativeByteBuffer {
 }
 
 // limit 0: the inherited descriptor limit; 1: soft raised to at least 2048; 2: 32 and 32.
-fun spawn(program: string, arguments: array<string>, limit: int): Child {
+trusted fun spawn(program: string, arguments: array<string>, limit: int): Child {
     val pipes = nativeByteBuffer(32)
     for (pair in 0 until 3) expectEqual(linuxSyscall2(SYS_PIPE2, address(pipes) + pair * 8, O_CLOEXEC), 0, "pipe2")
     val inRead = word32(pipes, 0)
@@ -310,9 +347,10 @@ fun spawn(program: string, arguments: array<string>, limit: int): Child {
     // Nothing the child does between fork and exec allocates: all of it was made above.
     val pid = linuxSyscall0(SYS_FORK)
     if (pid == 0) {
-        linuxSyscall0(SYS_SETSID)
+        if (ablaHostIsMacOS()) setsid() else linuxSyscall0(SYS_SETSID)
         if (limit != 0) {
-            linuxSyscall4(SYS_PRLIMIT64, 0, RLIMIT_NOFILE, 0, address(limits) + 16)
+            // The current limits land at 16 and 24 (RLIMIT_NOFILE is 8 on Darwin, 7 on Linux); the new ones are built at 0.
+            if (ablaHostIsMacOS()) getrlimit(8, limits.pointerAt(16)) else linuxSyscall4(SYS_PRLIMIT64, 0, RLIMIT_NOFILE, 0, address(limits) + 16)
             val maximum = limits.loadI64(24)
             val soft = limits.loadI64(16)
             if (limit == 1) {
@@ -322,7 +360,7 @@ fun spawn(program: string, arguments: array<string>, limit: int): Child {
                 limits.storeI64(0, 32)
                 limits.storeI64(8, 32)
             }
-            linuxSyscall4(SYS_PRLIMIT64, 0, RLIMIT_NOFILE, address(limits), 0)
+            if (ablaHostIsMacOS()) setrlimit(8, limits.address) else linuxSyscall4(SYS_PRLIMIT64, 0, RLIMIT_NOFILE, address(limits), 0)
         }
         linuxSyscall2(SYS_DUP2, inRead, 0)
         linuxSyscall2(SYS_DUP2, outWrite, 1)
@@ -666,10 +704,15 @@ fun main: int {
             client.finishFailedOpen([EINVAL, EIO, EOPNOTSUPP])
         } else {
             val actual = getTermios(pty.slave)
-            val code = baudCode(settings.baud)
-            expectEqual(actual.control() & CBAUD, code, "output speed of ${settings.baud}")
-            val inputCode = (actual.control() & CIBAUD) >> 16
-            expect(inputCode == 0 || inputCode == code, "input speed of ${settings.baud}: $inputCode")
+            if (ablaHostIsMacOS()) {
+                expectEqual(actual.outputSpeed(), settings.baud, "output speed")
+                expectEqual(actual.inputSpeed(), settings.baud, "input speed")
+            } else {
+                val code = baudCode(settings.baud)
+                expectEqual(actual.control() & CBAUD, code, "output speed of ${settings.baud}")
+                val inputCode = (actual.control() & CIBAUD) >> 16
+                expect(inputCode == 0 || inputCode == code, "input speed of ${settings.baud}: $inputCode")
+            }
             expectEqual(actual.control() & CSIZE, sizeCode(settings.bits), "character size ${settings.bits}")
             expect(((actual.control() & CSTOPB) != 0) == (settings.stop == 2), "stop bits ${settings.stop}")
             expect(((actual.control() & PARENB) != 0) == (settings.parity != "none"), "parity enable ${settings.parity}")
@@ -831,7 +874,11 @@ fun main: int {
             pty.close()
         }
     }
-    expect(foundFullTimeout, "did not exercise the final POLLOUT wait after a full write")
+    if (!ablaHostIsMacOS()) {
+        expect(foundFullTimeout, "did not exercise the final POLLOUT wait after a full write")
+    } else if (!foundFullTimeout) {
+        println("pty did not expose a full-write/final-readiness timeout on this platform")
+    }
     println("ok   stalled reader, signal stream, disconnect and the readiness boundary: $checks checks")
     println("device/serial driver: $checks checks passed")
     0

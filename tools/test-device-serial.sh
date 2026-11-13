@@ -13,13 +13,12 @@ if [[ $(uname -s) == Linux ]]; then
     fi
 fi
 python3 "$root/tests/cases/device-serial/session.py" "$out/main"
-# The same client, driven by an Abla program on raw system calls (own termios constants, own flag decoding).
-if [[ $(uname -s) == Linux ]]; then
-    "$compiler" build "$root/tests/cases/device-serial/driver.ab" -o "$out/driver" --fast --no-cache
-    rm -rf "$out/driver-scratch"
-    mkdir -p "$out/driver-scratch"
-    "$out/driver" "$out/main" "$out/driver-scratch"
-fi
+# The same client, driven by an Abla program on raw system calls (own termios constants, own flag decoding), on Linux and
+# on macOS (where the runtime translates the Linux-numbered calls to BSD ones).
+"$compiler" build "$root/tests/cases/device-serial/driver.ab" -o "$out/driver" --fast --no-cache
+rm -rf "$out/driver-scratch"
+mkdir -p "$out/driver-scratch"
+"$out/driver" "$out/main" "$out/driver-scratch"
 # Device handles are native runtime effects, not implicit compile-time I/O.
 for evaluator in interp jit; do
     status=0
