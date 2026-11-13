@@ -15,6 +15,8 @@ import "abla/tls/pure/handshake"
 import "abla/tls/pure/identity"
 import "abla/tls/pure/record"
 import "abla/tls/pure/server"
+import "abla/tls/pure/tls12"
+import "abla/text"
 import "abla/tls/pure/verify"
 
 var failures = 0
@@ -110,9 +112,95 @@ fun main: int {
         }
     }
 
-    // ALPN: the server's order wins; none in common is fatal; the client offering none is fine.
     val ed = tlsClientIdentityFromPem(read("$directory/ed25519.pem"), read("$directory/ed25519.key"))
     val edStore = trusting("$directory/ed25519.pem")
+    // TLS 1.2 (the modern subset), every key kind x every suite whose key type matches x both ways of being 1.2:
+    // a default client against a TLS 1.2-only server, and a TLS 1.2-only client against a default server (which says
+    // so in its random: the downgrade sentinel).
+    for (kind in ["ed25519", "p256", "rsa"]) {
+        val identity12 = tlsClientIdentityFromPem(read("$directory/$kind.pem"), read("$directory/$kind.key"))
+        val store12 = trusting("$directory/$kind.pem")
+        val rsaKey = kind == "rsa"
+        for (code in [TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256, TLS12_ECDHE_ECDSA_AES_256_GCM_SHA384, TLS12_ECDHE_ECDSA_CHACHA20_POLY1305_SHA256,
+            TLS12_ECDHE_RSA_AES_128_GCM_SHA256, TLS12_ECDHE_RSA_AES_256_GCM_SHA384, TLS12_ECDHE_RSA_CHACHA20_POLY1305_SHA256]) {
+            val suite12 = tls12Suite(code) ?? return 1
+            if (suite12.ecdsa == rsaKey) continue
+            for (groups in [[TLS_GROUP_X25519], [TLS_GROUP_SECP256R1]]) {
+                val name = "TLS 1.2 $kind suite $code groups ${groups[0]}"
+                // A default client, a TLS 1.2-only server.
+                var oldServerConfig = TlsServerConfig(identity12, [], groups, [], random, false, false, acceptAny, [code])
+                var newClient = clientFor(store12, "localhost")
+                var oldServer = tlsServerNew(oldServerConfig)
+                pump(newClient, oldServer)
+                if (!newClient.connected() || !oldServer.connected() || !newClient.v12 || !oldServer.v12 || newClient.suite != code) {
+                    fail("$name (old server): [${newClient.error}] [${oldServer.error}] v12 ${newClient.v12} suite ${newClient.suite}")
+                    continue
+                }
+                val data = random(40000)
+                newClient.send(data)
+                oldServer.send("reply")
+                pump(newClient, oldServer)
+                if (oldServer.takeApplicationData() != data || newClient.takeApplicationData() != "reply") fail("$name: data")
+                newClient.close()
+                pump(newClient, oldServer)
+                if (!oldServer.closed()) fail("$name: close_notify")
+                // A TLS 1.2-only client, a default server.
+                var oldClientConfig = TlsClientConfig("localhost", [], [TLS_SIG_ECDSA_SECP256R1_SHA256, TLS_SIG_RSA_PSS_RSAE_SHA256,
+                    TLS_SIG_ED25519, TLS_SIG_RSA_PKCS1_SHA256], [], tlsX509Verifier(store12, now), random, tlsPatchClientHello, [code])
+                var newServerConfig = TlsServerConfig(identity12, [TLS_SUITE_AES_128_GCM_SHA256], groups, [], random, false, false, acceptAny)
+                var oldClient = tlsClientNew(oldClientConfig)
+                var newServer = tlsServerNew(newServerConfig)
+                pump(oldClient, newServer)
+                if (!oldClient.connected() || !newServer.connected() || !newServer.v12) {
+                    fail("$name (old client): [${oldClient.error}] [${newServer.error}]")
+                    continue
+                }
+                if (newServer.serverRandom.slice(24, 32) != "DOWNGRD" + tlsU8(1)) fail("$name: no downgrade sentinel")
+                oldClient.send("from the old client")
+                pump(oldClient, newServer)
+                if (newServer.takeApplicationData() != "from the old client") fail("$name: old client data")
+            }
+        }
+    }
+    // The downgrade protection: a TLS 1.3 client given a TLS 1.2 ServerHello with the sentinel refuses it.
+    val dgClientConfig = TlsClientConfig("localhost", [], [TLS_SIG_ED25519], [], tlsX509Verifier(edStore, now), random,
+        tlsPatchClientHello, [TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256])
+    var dgOldClient = tlsClientNew(dgClientConfig)
+    var dgServer = tlsServerNew(TlsServerConfig(ed, [TLS_SUITE_AES_128_GCM_SHA256], [TLS_GROUP_X25519], [], random, false, false, acceptAny))
+    dgServer.feed(dgOldClient.takeOutput())
+    val dgFlight = dgServer.takeOutput()
+    var dgNewClient = clientFor(edStore, "localhost")
+    dgNewClient.takeOutput()
+    dgNewClient.feed(dgFlight)
+    if (!dgNewClient.failed() || !dgNewClient.error.contains("downgrade")) fail("a downgrade was not detected: [${dgNewClient.error}]")
+    // A TLS 1.2 client hello without the extended master secret is refused by the server.
+    val noEms = tlsHandshakeMessage(TLS_CLIENT_HELLO, tlsU16(771) + random(32) + tlsVec8("") +
+        tlsVec16(tlsU16(TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256) + tlsU16(255)) + tlsVec8(tlsU8(0)) +
+        tlsVec16(tlsExtension(TLS_EXT_SUPPORTED_GROUPS, tlsVec16(tlsU16(TLS_GROUP_X25519))) +
+        tlsExtension(TLS_EXT_SIGNATURE_ALGORITHMS, tlsVec16(tlsU16(TLS_SIG_ED25519)))))
+    var emsServer = tlsServerNew(TlsServerConfig(ed, [], [TLS_GROUP_X25519], [], random, false, false, acceptAny, [TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256]))
+    emsServer.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, noEms))
+    if (!emsServer.failed() || !emsServer.error.contains("extended master secret")) fail("a client without the extended master secret was accepted: [${emsServer.error}]")
+    // TLS 1.2 with client certificates, RSA and P-256 client keys.
+    for (clientKind in ["p256", "rsa"]) {
+        val clientIdentity12 = tlsClientIdentityFromPem(read("$directory/client-$clientKind.pem"), read("$directory/client-$clientKind.key"))
+        val clientStore12 = trusting("$directory/client-$clientKind.pem")
+        val serverConfig12 = TlsServerConfig(ed, [], [TLS_GROUP_X25519], [], random, true, true, trustClient(clientStore12),
+            [TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256])
+        var authClient12 = clientFor(edStore, "localhost")
+        authClient12.useIdentity(clientIdentity12)
+        var authServer12 = tlsServerNew(serverConfig12)
+        pump(authClient12, authServer12)
+        if (!authClient12.connected() || !authServer12.connected() || !authServer12.clientCertificateVerified()) {
+            fail("TLS 1.2 client certificate ($clientKind): [${authClient12.error}] [${authServer12.error}]")
+        }
+        var anon12 = clientFor(edStore, "localhost")
+        var required12 = tlsServerNew(serverConfig12)
+        pump(anon12, required12)
+        if (!required12.failed()) fail("TLS 1.2: a required client certificate was not required")
+    }
+
+    // ALPN: the server's order wins; none in common is fatal; the client offering none is fine.
     var alpnConfig = TlsServerConfig(ed, [TLS_SUITE_AES_128_GCM_SHA256], [TLS_GROUP_X25519], ["h2", "http/1.1"], random,
         false, false, acceptAny)
     var alpnClientConfig = TlsClientConfig("localhost", [TLS_SUITE_AES_128_GCM_SHA256],

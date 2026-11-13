@@ -196,7 +196,7 @@ start_serve() {   # the serve.ab arguments; sets serve_port
     [[ -n $serve_port ]] || { echo "tls-pure serve: no port: $(head -3 "$out/serve.log")" >&2; exit 1; }
 }
 s_client() {   # the s_client options after the address; prints what the server sent
-    printf 'GET /pure HTTP/1.0\r\n\r\n' | timeout 15 openssl s_client -connect "[::1]:$serve_port" -tls1_3 -servername localhost -quiet "$@" 2> "$out/s_client.err" || true
+    printf 'GET /pure HTTP/1.0\r\n\r\n' | timeout 15 openssl s_client -connect "[::1]:$serve_port" ${s_tls:--tls1_3} -servername localhost -quiet "$@" 2> "$out/s_client.err" || true
 }
 served=0
 for kind in ed25519 p256 rsa; do
@@ -215,6 +215,34 @@ for kind in ed25519 p256 rsa; do
     stop_serve
 done
 echo "pure server: $served openssl s_client handshakes (3 key kinds x 3 suites x 2 groups) and the pure client, each key kind"
+# The same server speaks TLS 1.2 to openssl s_client -tls1_2: every key kind x its suites x X25519 / P-256, then a client certificate.
+served12=0
+for kind in ed25519 p256 rsa; do
+    start_serve plain "$out/$kind.pem" "$out/$kind.key"
+    if [[ $kind == rsa ]]; then
+        suites12="ECDHE-RSA-AES128-GCM-SHA256 ECDHE-RSA-AES256-GCM-SHA384 ECDHE-RSA-CHACHA20-POLY1305"
+    else
+        suites12="ECDHE-ECDSA-AES128-GCM-SHA256 ECDHE-ECDSA-AES256-GCM-SHA384 ECDHE-ECDSA-CHACHA20-POLY1305"
+    fi
+    for suite in $suites12; do
+        for group in X25519 P-256; do
+            # (A TLS 1.2 client must offer the certificate's curve: P-256 for the P-256 key, so X25519 is offered beside it.)
+            offered=$group
+            [[ $kind == p256 && $group == X25519 ]] && offered=X25519:P-256
+            answer=$(s_tls=-tls1_2 s_client -cipher "$suite" -groups "$offered" -CAfile "$out/$kind.pem" -verify_return_error -verify_hostname localhost)
+            [[ $answer == *'pure server: GET /pure'* ]] || { echo "tls-pure server TLS 1.2 ($kind $suite $group): [$answer] $(head -3 "$out/s_client.err") $(head -3 "$out/serve.log")" >&2; exit 1; }
+            served12=$((served12 + 1))
+        done
+    done
+    stop_serve
+done
+start_serve auth "$out/ed25519.pem" "$out/ed25519.key" "$out/client-p256.pem"
+answer=$(s_tls=-tls1_2 s_client -CAfile "$out/ed25519.pem" -cert "$out/client-p256.pem" -key "$out/client-p256.key")
+[[ $answer == *'client=true'* ]] || { echo "tls-pure server TLS 1.2 client certificate: [$answer] $(head -3 "$out/s_client.err") $(head -3 "$out/serve.log")" >&2; exit 1; }
+answer=$(s_tls=-tls1_2 s_client -CAfile "$out/ed25519.pem")
+[[ $answer != *'pure server'* ]] || { echo "tls-pure server TLS 1.2: a client with no certificate was served: [$answer]" >&2; exit 1; }
+stop_serve
+echo "pure server: $served12 openssl s_client -tls1_2 handshakes (3 key kinds x 3 suites x 2 groups) and a required client certificate"
 start_serve alpn "$out/ed25519.pem" "$out/ed25519.key"
 answer=$(s_client -CAfile "$out/ed25519.pem" -alpn http/1.1,h2)
 [[ $answer == *'alpn=h2'* ]] || { echo "tls-pure server ALPN: [$answer] $(head -3 "$out/s_client.err")" >&2; exit 1; }
