@@ -93,7 +93,12 @@ class TlsServer(
     var v12Keys: Tls12Keys,
     var v12Pair: TlsKeyPair,
     var serverRandom: string,
-    var master: string
+    var master: string,
+    /** Records in a row that carried nothing (empty application data, ChangeCipherSpec), KeyUpdates in a row, and a
+     *  KeyUpdate the peer asked for that is still to be answered (once per batch of input). */
+    var emptyRun: int = 0,
+    var keyUpdateRun: int = 0,
+    var keyUpdateOwed: bool = false
 )
 
 private fun tlsServerEmptyProtection(): TlsRecordProtection = tlsRecordProtection(TLS_AEAD_AES_128_GCM, "", "")
@@ -447,13 +452,24 @@ private fun TlsServer.handleKeyUpdate(body: string): void {
         this.fail(TLS_ALERT_DECODE_ERROR, "tls: a malformed KeyUpdate")
         return
     }
+    this.keyUpdateRun = this.keyUpdateRun + 1
+    if (this.keyUpdateRun > TLS_MAX_EMPTY_RUN) {
+        this.fail(TLS_ALERT_UNEXPECTED_MESSAGE, "tls: too many KeyUpdates in a row")
+        return
+    }
     this.clientApplicationSecret = tlsNextTrafficSecret(this.hash, this.clientApplicationSecret)
     this.setKeys(this.clientApplicationSecret, false)
-    if (body[0] == 1) {
-        this.queueRecord(TLS_HANDSHAKE, tlsHandshakeMessage(TLS_KEY_UPDATE, tlsU8(0)))
-        this.serverApplicationSecret = tlsNextTrafficSecret(this.hash, this.serverApplicationSecret)
-        this.setKeys(this.serverApplicationSecret, true)
-    }
+    // One answer for a batch of requests: it goes out before the next application data (section 4.6.3).
+    if (body[0] == 1) this.keyUpdateOwed = true
+    return
+}
+
+private fun TlsServer.answerKeyUpdate(): void {
+    if (!this.keyUpdateOwed || this.state != TLS_SERVER_CONNECTED) return
+    this.keyUpdateOwed = false
+    this.queueRecord(TLS_HANDSHAKE, tlsHandshakeMessage(TLS_KEY_UPDATE, tlsU8(0)))
+    this.serverApplicationSecret = tlsNextTrafficSecret(this.hash, this.serverApplicationSecret)
+    this.setKeys(this.serverApplicationSecret, true)
     return
 }
 
@@ -522,6 +538,11 @@ private fun TlsServer.handleRecord(record: string, header: TlsRecordHeader): voi
     }
     if (header.type == TLS_CHANGE_CIPHER_SPEC) {
         // Compatibility mode: one 0x01 byte, ignored, once a ClientHello has been answered.
+        this.emptyRun = this.emptyRun + 1
+        if (this.emptyRun > TLS_MAX_EMPTY_RUN) {
+            this.fail(TLS_ALERT_UNEXPECTED_MESSAGE, "tls: too many empty records")
+            return
+        }
         if (this.state == TLS_SERVER_CONNECTED || record.size != 6 || record[5] != 1 ||
             (this.state == TLS_SERVER_WAIT_CLIENT_HELLO && !this.retried)) {
             this.fail(TLS_ALERT_UNEXPECTED_MESSAGE, "tls: an unexpected ChangeCipherSpec")
@@ -549,6 +570,17 @@ private fun TlsServer.handleRecord(record: string, header: TlsRecordHeader): voi
             return
         }
         content = record.slice(5, record.size)
+    }
+    if (content.size == 0) {
+        // An empty record carries nothing: a run of them is refused (as BoringSSL does, 32 in a row).
+        this.emptyRun = this.emptyRun + 1
+        if (this.emptyRun > TLS_MAX_EMPTY_RUN) {
+            this.fail(TLS_ALERT_UNEXPECTED_MESSAGE, "tls: too many empty records")
+            return
+        }
+    } else {
+        this.emptyRun = 0
+        if (type == TLS_APPLICATION_DATA) this.keyUpdateRun = 0
     }
     if (type == TLS_HANDSHAKE) {
         if (content.size == 0) {
@@ -591,6 +623,9 @@ fun TlsServer.feed(data: string): void {
 fun TlsServer.send(data: string): bool {
     if (this.state != TLS_SERVER_CONNECTED) return false
     if (this.v12) return this.send12(data)
+    // RFC 8446 section 4.6.3: the answer to the KeyUpdates received (one for the batch) goes out before the next
+    // application data.
+    this.answerKeyUpdate()
     var offset = 0
     while (offset < data.size && this.state == TLS_SERVER_CONNECTED) {
         val end = if (data.size - offset > TLS_MAX_PLAINTEXT) offset + TLS_MAX_PLAINTEXT else data.size
