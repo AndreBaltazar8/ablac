@@ -67,6 +67,7 @@ expect_status_42 "$output_directory/uuid"
 
 "$project_root/tools/test-device-serial.sh" "$compiler"
 "$project_root/tools/test-path-file-mode.sh" "$compiler"
+"$project_root/tools/test-proc-self-exe.sh" "$compiler"
 # Exercise the Darwin openat/no-follow and descriptor-relative filesystem shims.
 "$project_root/tools/test-open-nofollow.sh" "$compiler"
 "$project_root/tools/test-secure-fs.sh" "$compiler"

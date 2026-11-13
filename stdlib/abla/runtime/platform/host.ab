@@ -3976,38 +3976,59 @@ trusted fun __ablaRuntimeDarwinImageState(): int = nativeStaticAllocate(48)
 trusted fun __ablaRuntimeDarwinStatPath(path: int, block: int): int =
     ablaDarwinSyscall(338, path, block, 0, 0, 0, 0)
 
-trusted fun __ablaRuntimeDarwinRecordImage(): void {
-    if (!ablaHostIsMacOS()) return
-    val state = __ablaRuntimeDarwinImageState()
-    if (ablaRuntimeLoadI64(state) != 0) return
-    ablaRuntimeStoreI64(state, 2)
+// The image's path from the kernel's apple[0] string ("executable_path=...", after the environment's terminator),
+// copied NUL-terminated into `memory`: its length, or 0 where the environment is not known (the compile-time
+// JIT's is the compiler's only under the `environment` grant).
+trusted fun __ablaRuntimeDarwinImageFromApple(memory: int): int {
     val environment = ablaUnsafePointerAddress(ablaLinuxEnvironmentPointer())
-    if (environment == 0) return
+    if (environment == 0) return 0
     var cursor = environment
     while (ablaRuntimeLoadI64(cursor) != 0) cursor = cursor + 8
     val entry = ablaRuntimeLoadI64(cursor + 8)
-    if (entry == 0) return
+    if (entry == 0) return 0
     // "executable_path=" is 16 bytes, little endian in two words.
     var index = 0
     while (index < 16) {
         val word = if (index < 8) 7089075335985461349 else 4424914595737462124
         val shift = if (index < 8) index * 8 else (index - 8) * 8
-        if (ablaRuntimeLoadU8(entry + index) != ((word >> shift) & 255)) return
+        if (ablaRuntimeLoadU8(entry + index) != ((word >> shift) & 255)) return 0
         index = index + 1
     }
     val path = entry + 16
     var length = 0
     while (ablaRuntimeLoadU8(path + length) != 0) length = length + 1
-    if (length == 0 || length >= 1024) return
-    val memory = ablaDarwinSyscall(197, 0, 1280, 3, 4098, -1, 0)
-    if (memory < 0 && memory > -4096) return
+    if (length == 0 || length >= 1024) return 0
     var copy = 0
     while (copy <= length) {
         ablaRuntimeStoreU8(memory + copy, ablaRuntimeLoadU8(path + copy))
         copy = copy + 1
     }
+    length
+}
+
+// The same path from the kernel's process information (proc_info 336: call 2 PIDINFO, flavor 11 PIDPATHINFO,
+// what libproc's proc_pidpath asks), for a module without the environment.
+trusted fun __ablaRuntimeDarwinImageFromKernel(memory: int): int {
+    val result = ablaDarwinSyscall(336, 2, ablaDarwinSyscall(20, 0, 0, 0, 0, 0, 0), 11, 0, memory,
+        1024)
+    if (result <= 0) return 0
+    var length = 0
+    while (length < 1023 && ablaRuntimeLoadU8(memory + length) != 0) length = length + 1
+    ablaRuntimeStoreU8(memory + length, 0)
+    length
+}
+
+trusted fun __ablaRuntimeDarwinRecordImage(): void {
+    if (!ablaHostIsMacOS()) return
+    val state = __ablaRuntimeDarwinImageState()
+    if (ablaRuntimeLoadI64(state) != 0) return
+    ablaRuntimeStoreI64(state, 2)
+    val memory = ablaDarwinSyscall(197, 0, 1280, 3, 4098, -1, 0)
+    if (memory < 0 && memory > -4096) return
+    var length = __ablaRuntimeDarwinImageFromApple(memory)
+    if (length == 0) length = __ablaRuntimeDarwinImageFromKernel(memory)
     val block = memory + 1024
-    if (__ablaRuntimeDarwinStatPath(memory, block) != 0) {
+    if (length == 0 || __ablaRuntimeDarwinStatPath(memory, block) != 0) {
         ablaDarwinSyscall(73, memory, 1280, 0, 0, 0, 0)
         return
     }

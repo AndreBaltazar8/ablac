@@ -26,3 +26,20 @@ printf 'not the program\n' > "$output_directory/replacement" || exit 1
 "$output_directory/replaced-run" "$output_directory/replaced-run" \
     "$output_directory/replacement" || exit 1
 echo "proc self exe: the program reads its own $size-byte image, never a replacement"
+
+# Compile-time code reads the compiler's own image under both evaluators (the JIT
+# module has no program entry to learn its image from). The compiler may be a
+# launcher script, so the size is not compared with $compiler's: both evaluators
+# must read the same, real image (a compiler is far larger than any program here).
+sizes=()
+for evaluator in interp jit; do
+    ABLA_COMPILE_EVAL=$evaluator "$compiler" build \
+        "$project_root/tests/cases/proc-self-exe-compile-time/main.ab" \
+        -o "$output_directory/compile-time-$evaluator" --no-cache || exit 1
+    sizes+=("$("$output_directory/compile-time-$evaluator")")
+done
+[[ ${sizes[0]} == "${sizes[1]}" && ${sizes[0]} -gt 1000000 ]] || {
+    echo "compile-time /proc/self/exe: interp read ${sizes[0]} bytes, jit ${sizes[1]}" >&2
+    exit 1
+}
+echo "proc self exe: compile-time code reads the compiler's ${sizes[0]}-byte image (interp and jit)"
