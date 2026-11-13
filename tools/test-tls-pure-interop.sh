@@ -113,7 +113,7 @@ result=$("$root/tools/run-limited.sh" "$out/api" "$port" "$out/ed25519.pem" "$ou
 echo "$result"
 stop_server
 # Client identities from PEM (every key kind and encoding), then mutual TLS: s_server -Verify trusting one client
-# certificate; that client is accepted, one with no identity and one with another certificate are refused.
+# certificate; that client is accepted, one with no identity and one with another certificate are refused. (TLS 1.2 needs the client certificate's curve in the server's groups: hence X25519:P-256.)
 openssl rsa -in "$out/rsa.key" -traditional -out "$out/rsa-alt.key" 2> /dev/null
 openssl ec -in "$out/p256.key" -out "$out/p256-alt.key" 2> /dev/null
 openssl pkcs8 -topk8 -v2 aes-256-cbc -iter 2000 -in "$out/rsa.key" -passout pass:secret -out "$out/rsa-enc.key" 2> /dev/null
@@ -128,9 +128,10 @@ openssl genpkey -algorithm ED25519 -out "$out/client-ed25519.key" 2> /dev/null
 for kind in rsa p256 ed25519; do
     openssl req -x509 -new -key "$out/client-$kind.key" -out "$out/client-$kind.pem" -subj /CN=client-$kind -days 2 2> /dev/null
 done
+for version in tls1_3 tls1_2; do
 for kind in rsa p256 ed25519; do
     other=$([[ $kind == rsa ]] && echo p256 || echo rsa)
-    start_server ed25519 -www -groups X25519 -Verify 1 -CAfile "$out/client-$kind.pem" -verify_return_error
+    tls_flag=-$version start_server ed25519 -www -groups X25519:P-256 -Verify 1 -CAfile "$out/client-$kind.pem" -verify_return_error
     for case in "accepted:client-$kind" "refused:none" "refused:client-$other"; do
         expect=${case%%:*}
         who=${case#*:}
@@ -140,8 +141,17 @@ for kind in rsa p256 ed25519; do
         [[ $result == "tls-pure mtls ok ($expect)" ]] || { echo "tls-pure mtls ($kind trusted, $who): $result" >&2; exit 1; }
     done
     stop_server
-    echo "mtls $kind: accepted, refused without an identity, refused with another"
+    echo "mtls $version $kind: accepted, refused without an identity, refused with another"
 done
+done
+# A TLS 1.2 server without the extended master secret is refused (the subset requires it).
+tls_flag=-tls1_2 start_server rsa -www -no_ems -cipher ECDHE-RSA-AES128-GCM-SHA256
+if result=$("$root/tools/run-limited.sh" "$out/interop" "$port" "$out/rsa.pem" 49199 "$out/p256.pem" 2>&1); then
+    echo "tls-pure TLS 1.2: a server without the extended master secret was accepted: $result" >&2; exit 1
+fi
+[[ $result == *'extended master secret'* ]] || { echo "tls-pure TLS 1.2: refused for another reason: $result" >&2; exit 1; }
+stop_server
+echo 'TLS 1.2: a server without the extended master secret is refused'
 # TLS 1.2 building blocks: the PRF against `openssl kdf TLS1-PRF` (random secrets and seeds, SHA-256 and SHA-384, the
 # labels TLS 1.2 uses), the key block, the AEAD record layer for three suites, the message codecs.
 "$compiler" build tests/cases/tls-pure/tls12prf.ab -o "$out/tls12prf" --no-cache
