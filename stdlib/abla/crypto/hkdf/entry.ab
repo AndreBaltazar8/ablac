@@ -1,0 +1,83 @@
+// HKDF (RFC 5869) over HMAC-SHA-1, -256, -384 and -512, and TLS 1.3's HKDF-Expand-Label and
+// Derive-Secret (RFC 8446 section 7.1). Keys, salts and secrets are byte strings. Everything secret
+// passes through abla/crypto's HMAC and nothing here branches or indexes on it: the lengths, the
+// labels and the contexts are public.
+//
+// An Expand with a length of more than 255 hash lengths (RFC 5869 section 2.3), or below zero, has no
+// output: the result's `ok` is false. So does an Expand-Label whose label or context does not fit its
+// length byte, or whose length does not fit 16 bits.
+
+import "abla/crypto"
+import "abla/crypto/result"
+
+val HKDF_SHA1 = 1
+val HKDF_SHA256 = 2
+val HKDF_SHA384 = 3
+val HKDF_SHA512 = 4
+
+private fun hkdfHashLength(hash: int): int =
+    if (hash == HKDF_SHA1) 20 else if (hash == HKDF_SHA256) 32 else if (hash == HKDF_SHA384) 48 else 64
+
+private fun hkdfHmac(hash: int, key: string, message: string): string =
+    if (hash == HKDF_SHA1) hmacSha1(key, message)
+    else if (hash == HKDF_SHA256) hmacSha256(key, message)
+    else if (hash == HKDF_SHA384) hmacSha384(key, message)
+    else hmacSha512(key, message)
+
+private fun hkdfZeros(count: int): string {
+    val bytes: array<int> = []
+    var index = 0
+    while (index < count) {
+        bytes.append(0)
+        index = index + 1
+    }
+    cryptoByteString(bytes)
+}
+
+/** HKDF-Extract: the pseudorandom key from the input keying material. An empty salt is a string of
+ *  hash-length zeros. `hash` is one of HKDF_SHA1, HKDF_SHA256, HKDF_SHA384, HKDF_SHA512. */
+fun hkdfExtract(hash: int, salt: string, ikm: string): string =
+    hkdfHmac(hash, if (salt.size == 0) hkdfZeros(hkdfHashLength(hash)) else salt, ikm)
+
+/** HKDF-Expand: `length` bytes of output keying material from a pseudorandom key and context
+ *  information. */
+fun hkdfExpand(hash: int, prk: string, info: string, length: int): CryptoResult {
+    val hashLength = hkdfHashLength(hash)
+    if (length < 0 || length > 255 * hashLength) return cryptoFailed("hkdf: length out of range")
+    var output = ""
+    var block = ""
+    var counter = 1
+    while (output.size < length) {
+        block = hkdfHmac(hash, prk, block + info + cryptoByteString([counter]))
+        output = output + block
+        counter = counter + 1
+    }
+    CryptoResult(output.slice(0, length), true, "")
+}
+
+/** Extract and Expand together, RFC 5869 section 2. */
+fun hkdf(hash: int, salt: string, ikm: string, info: string, length: int): CryptoResult =
+    hkdfExpand(hash, hkdfExtract(hash, salt, ikm), info, length)
+
+// Public data: the structure TLS 1.3 hashes into its labels (RFC 8446 section 7.1).
+private fun hkdfLabel(label: string, context: string, length: int): string {
+    val full = "tls13 " + label
+    cryptoByteString([(length >> 8) & 255, length & 255, full.size]) + full +
+        cryptoByteString([context.size]) + context
+}
+
+/** HKDF-Expand-Label(Secret, Label, Context, Length) of TLS 1.3: `label` is written without its
+ *  "tls13 " prefix. */
+fun tls13ExpandLabel(hash: int, secret: string, label: string, context: string,
+    length: int): CryptoResult {
+    if (length < 0 || length > 65535) return cryptoFailed("hkdf: length out of range")
+    if (label.size < 1 || label.size > 249) return cryptoFailed("hkdf: label length out of range")
+    if (context.size > 255) return cryptoFailed("hkdf: context too long")
+    hkdfExpand(hash, secret, hkdfLabel(label, context, length), length)
+}
+
+/** Derive-Secret(Secret, Label, Messages): Expand-Label with the transcript hash as the context and
+ *  the hash's length as the output size. `transcriptHash` is the hash of the messages (of the empty
+ *  string for none), which the caller computes. */
+fun tls13DeriveSecret(hash: int, secret: string, label: string, transcriptHash: string): CryptoResult =
+    tls13ExpandLabel(hash, secret, label, transcriptHash, hkdfHashLength(hash))

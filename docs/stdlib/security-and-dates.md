@@ -59,6 +59,24 @@ and an ordinary loop at compile time. Different lengths are unequal at once.
 `hexEncode`, `hexDecode` and the Base64 functions aren't constant-time at all. Nothing
 here wipes memory: a secret in a string stays there until the memory is reused.
 
+## `abla/crypto/hkdf`
+
+HKDF ([RFC 5869](https://www.rfc-editor.org/rfc/rfc5869)) over HMAC-SHA-1, -256, -384 and -512, and TLS 1.3's
+HKDF-Expand-Label and Derive-Secret ([RFC 8446](https://www.rfc-editor.org/rfc/rfc8446) section 7.1). The hash is
+`HKDF_SHA1`, `HKDF_SHA256`, `HKDF_SHA384` or `HKDF_SHA512`.
+
+| Function | Result |
+|---|---|
+| `hkdfExtract(hash, salt, ikm)` | the pseudorandom key (an empty salt is hash-length zeros) |
+| `hkdfExpand(hash, prk, info, length)` | a `CryptoResult` of `length` bytes; `ok` is false past 255 hash lengths or below 0 |
+| `hkdf(hash, salt, ikm, info, length)` | Extract then Expand |
+| `tls13ExpandLabel(hash, secret, label, context, length)` | HKDF-Expand-Label (`label` without its `"tls13 "` prefix); `ok` is false for a label of 0 or more than 249 bytes, a context over 255 or a length over 65535 |
+| `tls13DeriveSecret(hash, secret, label, transcriptHash)` | Expand-Label with the transcript hash as context and the hash's length as output |
+
+Secrets only pass through `hmacSha1`/`hmacSha256`/`hmacSha384`/`hmacSha512` (the paragraph above applies); the
+lengths, labels and contexts are public. Tested against all seven RFC 5869 vectors and the RFC 8448 early and derived
+secrets (`tools/test-hkdf.sh`).
+
 ## `abla/crypto/hosted`
 
 AES and RSA through OpenSSL's libcrypto, the provider `abla/tls/hosted` already uses, 1.1.1

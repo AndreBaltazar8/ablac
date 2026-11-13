@@ -323,6 +323,7 @@ test-serial: ablac
 	tools/test-tls-faults.sh $(COMPILER)
 	tools/test-tls-unix.sh $(COMPILER)
 	tools/test-crypto.sh $(COMPILER)
+	tools/test-hkdf.sh $(COMPILER)
 	tools/test-crypto-pure.sh $(COMPILER)
 	tools/test-crypto-hosted-keygen.sh $(COMPILER)
 	tools/test-crypto-encrypted-rsa.sh $(COMPILER)
