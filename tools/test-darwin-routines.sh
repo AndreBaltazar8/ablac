@@ -19,9 +19,16 @@ for mode in release fast; do
     flags=(--no-cache)
     [[ $mode == fast ]] && flags+=(--fast)
     "$compiler" build tests/cases/libc-memory-routines/main.ab -o "$out/$mode" "${flags[@]}"
-    actual=$("$out/$mode")
-    [[ $actual == 'libc memory routines: '*' checks agree' ]] || {
-        printf 'darwin routines (%s): %s\n' "$mode" "$actual" >&2; exit 1; }
+    # Outside a command substitution, so a failure shows its output and how the program ended.
+    status=0
+    "$out/$mode" > "$out/$mode.out" 2> "$out/$mode.err" || status=$?
+    actual=$(tail -n 1 "$out/$mode.out")
+    if [[ $status -ne 0 || $actual != 'libc memory routines: '*' checks agree' ]]; then
+        printf 'darwin routines (%s): exit status %s (128 + n is signal n)\n' "$mode" "$status" >&2
+        head -n 40 "$out/$mode.out" >&2
+        head -n 10 "$out/$mode.err" >&2
+        exit 1
+    fi
     imported=$(nm -u "$out/$mode" | awk '{print $NF}' | grep -xE '_(memcpy|memmove|memset|memcmp|bcmp|strlen|strcmp|memchr|bzero|__bzero)' || true)
     if [[ -n $imported ]]; then
         printf 'darwin routines (%s): imported from libSystem: %s\n' "$mode" "$imported" >&2
