@@ -35,6 +35,14 @@ concurrent pty drains, a signal stream and rlimit set-up; it needs a raw-syscall
 (ptmx, TIOCGPTN, TCGETS, fork/exec with pipes, setsid, setrlimit, kill, threads), built
 after the rest of #807.
 
+Kept as documented exceptions (lead's decision under "no Python if possible", 2026-11-13; the allow-list is
+sorted lines with no comments, so the reasons live here):
+- `tools/fuzz-regex` and `tools/test-regex.sh`: the oracle is Python's `re`, the semantics abla's regex is checked
+  against; a JavaScript oracle would test something else. Revisit only if abla's regex gets semantics of its own
+  written down, or a second oracle independent of Abla.
+- `tools/test-xtensa-assembly.py`, `tools/test-xtensa-assembly.sh` and `tests/cases/xtensa-routing/sdk-narrow.py`: the
+  oracle is Espressif's own SDK script, pinned by sha256 (`assembly-provenance.json`); a port would not be that script.
+
 The following inventory is from the 1f1aea08 `test-serial` recipe. Counts are
 Python heredoc blocks and body lines, including blank and comment lines; all
 paths have the prefix `tools/test-` and suffix `.sh`.
