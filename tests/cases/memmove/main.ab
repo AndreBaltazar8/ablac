@@ -1,0 +1,99 @@
+// ablaUnsafeCopyMemory is llvm.memmove, so a copy of overlapping ranges, forward or backward, whatever its size,
+// gives what a copy through a buffer gives (#809). Small constant sizes (which LLVM expands inline, once the helper is
+// inlined) and variable ones, every overlap, and a range copied onto itself. The program returns the number of
+// failures, as `checks` for Wasm (tools/test-memmove.sh runs it natively, on AArch64 under qemu and on Wasm under node).
+import "abla/io"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+val ARENA = 1024
+
+trusted fun first(): int = nativeStaticAllocate(1024)
+trusted fun second(): int = nativeStaticAllocate(1024)
+
+trusted fun fill(base: int): void {
+    for (at in 0 until ARENA) ablaUnsafeStoreU8(nativePointerFromAddress(base + at), (at * 7 + 3) & 255)
+}
+
+// What a copy through a buffer leaves: the source bytes read first, then written.
+trusted fun reference(base: int, to: int, from: int, size: int): void {
+    val copy: array<int> = []
+    for (at in 0 until size) copy.append(ablaUnsafeLoadU8(nativePointerFromAddress(base + from + at)))
+    for (at in 0 until size) ablaUnsafeStoreU8(nativePointerFromAddress(base + to + at), copy[at])
+}
+
+var failures = 0
+
+@inline
+trusted fun check(to: int, from: int, size: int): void {
+    val a = first()
+    val b = second()
+    fill(a)
+    fill(b)
+    ablaUnsafeCopyMemory(a + to, a + from, size)
+    reference(b, to, from, size)
+    for (at in 0 until ARENA) {
+        if (ablaUnsafeLoadU8(nativePointerFromAddress(a + at)) != ablaUnsafeLoadU8(nativePointerFromAddress(b + at))) {
+            failures = failures + 1
+            if (failures < 20) println("FAIL: copy of $size bytes from $from to $to differs at $at")
+            return
+        }
+    }
+}
+
+// The same sizes as literals: after inlining, LLVM sees a constant size and may expand the copy.
+@inline
+trusted fun constantSize(size: int): void {
+    check(200 + 1, 200, size)
+    check(200, 200 + 1, size)
+    check(200 + size / 2, 200, size)
+    check(200, 200 + size / 2, size)
+    check(200 + size - 1, 200, size)
+    check(200, 200 + size - 1, size)
+    check(200, 200, size)
+}
+
+trusted fun checks(): int {
+    failures = 0
+    constantSize(1)
+    constantSize(2)
+    constantSize(3)
+    constantSize(4)
+    constantSize(5)
+    constantSize(7)
+    constantSize(8)
+    constantSize(9)
+    constantSize(12)
+    constantSize(15)
+    constantSize(16)
+    constantSize(17)
+    constantSize(24)
+    constantSize(31)
+    constantSize(32)
+    constantSize(33)
+    constantSize(48)
+    constantSize(63)
+    constantSize(64)
+    constantSize(65)
+    constantSize(100)
+    constantSize(128)
+    constantSize(129)
+    constantSize(255)
+    // Variable sizes with every offset up to a block and a bit, the destination above and below the source.
+    for (size in 0 until 140) {
+        for (offset in 1 until 70) {
+            check(200 + offset, 200, size)
+            check(200, 200 + offset, size)
+        }
+    }
+    failures
+}
+
+@export("checks")
+fun checksExport(): int = checks()
+
+fun main: int {
+    val failed = checks()
+    if (failed == 0) println("memmove ok") else println("memmove: $failed failures")
+    failed
+}
