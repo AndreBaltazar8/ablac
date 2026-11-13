@@ -81,6 +81,7 @@ function parseArguments(argv) {
 async function main() {
     const args = parseArguments(process.argv.slice(2));
     const output = path.resolve(args.output);
+    fs.mkdirSync(path.dirname(output), { recursive: true }); // parents, like the Python mkdir(parents=True)
     fs.mkdirSync(output); // not recursive-existing: a leftover output directory is an error
     let catalogArgs = [];
     let catalog;

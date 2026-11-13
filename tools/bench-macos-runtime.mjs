@@ -69,6 +69,7 @@ function run(args) {
     const short = VERSIONS.map((version) => version.replaceAll('v0.2.', 'v0').replaceAll('.', ''));
     if (process.platform !== 'darwin') { console.error('macOS runtime measurement requires Darwin (no work performed)'); process.exit(1); }
     const output = path.resolve(args.output);
+    fs.mkdirSync(path.dirname(output), { recursive: true }); // parents, like the Python mkdir(parents=True)
     fs.mkdirSync(output); // not recursive-existing
     const roots = { [VERSIONS[0]]: path.resolve(args.oldRoot), [VERSIONS[1]]: path.resolve(args.newRoot) };
     const compilers = { [VERSIONS[0]]: path.resolve(args.oldCompiler), [VERSIONS[1]]: path.resolve(args.newCompiler) };

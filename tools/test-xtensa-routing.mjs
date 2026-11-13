@@ -83,7 +83,7 @@ process.exit(result.status === null ? 128 : result.status);
         const active = { ...env, ...changes };
         const command = ['build', source, '-o', path.join(root, label + '.o'), '--target-triple', 'xtensa-esp-unknown-elf',
             '--object-format', 'elf', '--emit', 'object', ...extra];
-        const result = spawnSync(compiler, command, { env: active, encoding: 'utf8', timeout: 180000 });
+        const result = spawnSync(compiler, command, { env: active, encoding: 'utf8', timeout: 180000, maxBuffer: 1 << 28 });
         if (expected) assert.ok(result.status !== 0 && result.stderr.includes(expected), `${label}: ${result.status}\n${result.stdout}${result.stderr}`);
         else assert.equal(result.status, 0, `${label}\n${result.stdout}${result.stderr}`);
         assert.ok(!result.stderr.includes('PATH_POISON_WAS_EXECUTED'), result.stderr);

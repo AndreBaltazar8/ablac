@@ -39,7 +39,7 @@ function snapshot(root) {
     walk(root);
     return result;
 }
-const natives = () => new Set(fs.readdirSync(path.join(out, 'cache')).filter((name) => name.startsWith('native-') && name.endsWith('.o')));
+const natives = () => new Set((fs.existsSync(path.join(out, 'cache')) ? fs.readdirSync(path.join(out, 'cache')) : []).filter((name) => name.startsWith('native-') && name.endsWith('.o')));
 
 const env = { ...process.env, ABLA_CACHE_DIR: path.join(out, 'cache') };
 for (const name of ['ABLA_XTENSA_LLVM_ROOT', 'ABLA_STDLIB', 'ABLA_ESP_CPU', 'ABLA_XTENSA_DIRECT_CALLS', 'ABLA_XTENSA_NARROW_BRANCHES',
