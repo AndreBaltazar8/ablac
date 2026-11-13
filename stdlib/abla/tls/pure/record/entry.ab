@@ -3,12 +3,12 @@
 // header that is the additional data, a nonce of the per-direction IV xor the 64-bit record
 // sequence). Sans-IO: a protection state is a key, an IV and a sequence number; records are strings.
 //
-// AES-128-GCM and AES-256-GCM (abla/crypto/aes) here; ChaCha20-Poly1305 joins as a third AEAD when
-// abla/crypto/chacha20poly1305 lands. A state that fails to open a record is finished: the caller
+// AES-128-GCM and AES-256-GCM (abla/crypto/aes) and ChaCha20-Poly1305 (abla/crypto/chacha20poly1305). A state that fails to open a record is finished: the caller
 // closes the connection (a bad record is fatal in TLS 1.3), so the sequence only advances on success.
 
 import "abla/crypto"
 import "abla/crypto/aes"
+import "abla/crypto/chacha20poly1305"
 import "abla/crypto/result"
 
 val TLS_CHANGE_CIPHER_SPEC = 20
@@ -18,6 +18,7 @@ val TLS_APPLICATION_DATA = 23
 
 val TLS_AEAD_AES_128_GCM = 1
 val TLS_AEAD_AES_256_GCM = 2
+val TLS_AEAD_CHACHA20_POLY1305 = 3
 
 /** The most plaintext one record carries (section 5.1), and the most a protected record's payload
  *  (ciphertext with its tag) may be (section 5.2). */
@@ -30,9 +31,18 @@ class TlsRecordProtection(val aead: int, val key: string, val iv: string, var se
 fun tlsRecordProtection(aead: int, key: string, iv: string): TlsRecordProtection =
     TlsRecordProtection(aead, key, iv, 0)
 
+private fun tlsSeal(aead: int, key: string, nonce: string, plaintext: string, aad: string): CryptoResult =
+    if (aead == TLS_AEAD_CHACHA20_POLY1305) chaCha20Poly1305Seal(key, nonce, plaintext, aad)
+    else aesGcmEncrypt(key, nonce, plaintext, aad)
+
+private fun tlsOpen(aead: int, key: string, nonce: string, sealed: string, aad: string): CryptoResult =
+    if (aead == TLS_AEAD_CHACHA20_POLY1305) chaCha20Poly1305Open(key, nonce, sealed, aad)
+    else aesGcmDecrypt(key, nonce, sealed, aad)
+
 /** The key length of an AEAD, 0 for one this layer does not know. */
 fun tlsAeadKeyLength(aead: int): int =
-    if (aead == TLS_AEAD_AES_128_GCM) 16 else if (aead == TLS_AEAD_AES_256_GCM) 32 else 0
+    if (aead == TLS_AEAD_AES_128_GCM) 16
+    else if (aead == TLS_AEAD_AES_256_GCM || aead == TLS_AEAD_CHACHA20_POLY1305) 32 else 0
 
 /** The per-record nonce: the IV with the sequence number (big-endian, left-padded to 12 bytes) xored in. */
 fun tlsRecordNonce(iv: string, sequence: int): string {
@@ -84,7 +94,7 @@ fun tlsProtectRecord(var protection: TlsRecordProtection, contentType: int, cont
     while (zeros.size < padding) zeros.append(0)
     val inner = content + cryptoByteString([contentType]) + cryptoByteString(zeros)
     val header = tlsHeaderBytes(TLS_APPLICATION_DATA, 771, inner.size + 16)
-    val sealed = aesGcmEncrypt(protection.key, tlsRecordNonce(protection.iv, protection.sequence),
+    val sealed = tlsSeal(protection.aead, protection.key, tlsRecordNonce(protection.iv, protection.sequence),
         inner, header)
     if (!sealed.ok) return sealed
     protection.sequence = protection.sequence + 1
@@ -104,7 +114,7 @@ fun tlsOpenRecord(var protection: TlsRecordProtection, record: string): TlsOpene
     if (header.length > TLS_MAX_CIPHERTEXT) return tlsOpenFailed("tls: record overflow")
     if (header.length != record.size - 5) return tlsOpenFailed("tls: the record length does not match")
     if (header.length < 17) return tlsOpenFailed("tls: a protected record shorter than its tag and type")
-    val opened = aesGcmDecrypt(protection.key, tlsRecordNonce(protection.iv, protection.sequence),
+    val opened = tlsOpen(protection.aead, protection.key, tlsRecordNonce(protection.iv, protection.sequence),
         record.slice(5, record.size), record.slice(0, 5))
     if (!opened.ok) return tlsOpenFailed("tls: bad record MAC")
     protection.sequence = protection.sequence + 1

@@ -220,6 +220,29 @@ fun main: int {
     check("nonce for sequence 1", tlsRecordNonce(hexDecode("5d313eb2671276ee13000b30"), 1), "5d313eb2671276ee13000b31")
     check("nonce for a long sequence", tlsRecordNonce(hexDecode("000000000000000000000000"), 258), "000000000000000000000102")
 
+    // ChaCha20-Poly1305 records (32-byte key): a round trip with padding, then a bit flipped.
+    val chachaKey = tlsTrafficKey(h, application.serverTraffic, 32)
+    val chachaIv = tlsTrafficIv(h, application.serverTraffic)
+    if (chachaKey.size != 32 || tlsAeadKeyLength(TLS_AEAD_CHACHA20_POLY1305) != 32) fail("ChaCha20 key length")
+    val chachaWriter = tlsRecordProtection(TLS_AEAD_CHACHA20_POLY1305, chachaKey, chachaIv)
+    val chachaReader = tlsRecordProtection(TLS_AEAD_CHACHA20_POLY1305, chachaKey, chachaIv)
+    val chachaRecord = tlsProtectRecord(chachaWriter, TLS_APPLICATION_DATA, "hello over chacha", 5)
+    if (!chachaRecord.ok) fail("ChaCha20 seal: ${chachaRecord.error}")
+    val chachaOpened = tlsOpenRecord(chachaReader, chachaRecord.bytes)
+    if (!chachaOpened.ok || chachaOpened.content != "hello over chacha" || chachaOpened.type != TLS_APPLICATION_DATA) {
+        fail("ChaCha20 open: ${chachaOpened.error}")
+    }
+    val chachaBytes: array<int> = []
+    for (i in 0 until chachaRecord.bytes.size) {
+        chachaBytes.append(if (i == chachaRecord.bytes.size - 1) chachaRecord.bytes[i] ^ 1 else chachaRecord.bytes[i])
+    }
+    if (tlsOpenRecord(tlsRecordProtection(TLS_AEAD_CHACHA20_POLY1305, chachaKey, chachaIv),
+        cryptoByteString(chachaBytes)).ok) fail("a ChaCha20 record with a flipped bit opened")
+    // The AES record sealed under the same key and IV differs: the AEAD is part of the record.
+    val aesRecord = tlsProtectRecord(tlsRecordProtection(TLS_AEAD_AES_256_GCM, chachaKey, chachaIv),
+        TLS_APPLICATION_DATA, "hello over chacha", 5)
+    if (aesRecord.bytes == chachaRecord.bytes) fail("ChaCha20 and AES-GCM records are equal")
+
     if (failures > 0) {
         println("tls-pure keysched: $failures failures")
         return 1

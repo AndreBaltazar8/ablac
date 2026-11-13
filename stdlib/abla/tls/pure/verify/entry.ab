@@ -1,0 +1,67 @@
+// The certificate check of a TLS 1.3 client (RFC 8446 section 4.4.2.2 and 4.4.3): the chain the server sent
+// must lead to a trusted root and be valid for the host at the current time (abla/crypto/x509), and the
+// CertificateVerify signature must verify under the end-entity certificate's key with the scheme it names,
+// which must suit the key (an ECDSA scheme needs an EC key on that curve, RSA-PSS an RSA key, Ed25519 an
+// Ed25519 key). The result is "" for success, else the reason. Plugs into abla/tls/pure/client as the
+// configured verifier.
+
+import "abla/crypto/ed25519"
+import "abla/crypto/p256"
+import "abla/crypto/p384"
+import "abla/crypto/rsa"
+import "abla/crypto/rsapss"
+import "abla/crypto/x509"
+import "abla/tls/pure/handshake"
+
+val TLS_OID_EC_PUBLIC_KEY = "1.2.840.10045.2.1"
+val TLS_OID_RSA_ENCRYPTION = "1.2.840.113549.1.1.1"
+val TLS_OID_ED25519 = "1.3.101.112"
+
+// The named-curve parameters x509 reports for prime256v1 and secp384r1 ("x" and the OID's DER).
+private val TLS_CURVE_P256 = "x\x06\x08\x2a\x86\x48\xce\x3d\x03\x01\x07"
+private val TLS_CURVE_P384 = "x\x06\x05\x2b\x81\x04\x00\x22"
+
+/** Checks `signature` over `content` with the end-entity certificate's key for a TLS signature scheme. */
+fun tlsVerifySignature(leaf: X509Certificate, scheme: int, content: string, signature: string): string {
+    if (scheme == TLS_SIG_ECDSA_SECP256R1_SHA256) {
+        if (leaf.keyOid != TLS_OID_EC_PUBLIC_KEY || leaf.keyParameters != TLS_CURVE_P256) {
+            return "the certificate's key is not a P-256 key"
+        }
+        return if (p256EcdsaVerify(leaf.keyBits, content, signature)) "" else "the CertificateVerify signature is not valid"
+    }
+    if (scheme == TLS_SIG_ECDSA_SECP384R1_SHA384) {
+        if (leaf.keyOid != TLS_OID_EC_PUBLIC_KEY || leaf.keyParameters != TLS_CURVE_P384) {
+            return "the certificate's key is not a P-384 key"
+        }
+        return if (p384EcdsaVerify(leaf.keyBits, content, signature)) "" else "the CertificateVerify signature is not valid"
+    }
+    if (scheme == TLS_SIG_RSA_PSS_RSAE_SHA256 || scheme == TLS_SIG_RSA_PSS_RSAE_SHA384 ||
+        scheme == TLS_SIG_RSA_PSS_RSAE_SHA512) {
+        if (leaf.keyOid != TLS_OID_RSA_ENCRYPTION) return "the certificate's key is not an RSA key"
+        val key = rsaPublicKeyFromDer(leaf.spki)
+        if (!key.ok()) return "the certificate's RSA key is unreadable"
+        val bits = if (scheme == TLS_SIG_RSA_PSS_RSAE_SHA256) 256 else if (scheme == TLS_SIG_RSA_PSS_RSAE_SHA384) 384 else 512
+        // The salt is as long as the hash (RFC 8446 section 4.2.3), rsaPssVerify's default.
+        return if (rsaPssVerify(key, bits, content, signature)) "" else "the CertificateVerify signature is not valid"
+    }
+    if (scheme == TLS_SIG_ED25519) {
+        if (leaf.keyOid != TLS_OID_ED25519) return "the certificate's key is not an Ed25519 key"
+        return if (ed25519Verify(leaf.keyBits, content, signature)) "" else "the CertificateVerify signature is not valid"
+    }
+    "unsupported signature scheme $scheme"
+}
+
+/** The whole check: the chain against `store` for `host` at `now` (seconds since 1970), then the signature. */
+fun tlsVerifyServerCertificate(chain: array<string>, host: string, scheme: int, content: string,
+    signature: string, store: X509TrustStore, now: int): string {
+    val verification = x509Verify(chain, store, X509Options(host, now))
+    if (!verification.ok) return "certificate: ${verification.error}"
+    if (verification.path.size == 0) return "certificate: no path"
+    tlsVerifySignature(verification.path[0], scheme, content, signature)
+}
+
+/** A verifier for TlsClientConfig that trusts `store`, with the time from `now` (called once per handshake). */
+fun tlsX509Verifier(store: X509TrustStore, now: () -> int): (array<string>, string, int, string, string) -> string =
+    { chain: array<string>, host: string, scheme: int, content: string, signature: string ->
+        tlsVerifyServerCertificate(chain, host, scheme, content, signature, store, now())
+    }

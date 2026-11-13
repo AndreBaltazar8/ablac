@@ -1,0 +1,157 @@
+// HelloRetryRequest through abla/tls/pure against RFC 8448 section 5: the client offers an X25519 share, the
+// server's HelloRetryRequest (with a cookie) asks for P-256, the client answers with a second ClientHello that
+// must carry the P-256 share made from the trace's private key and echo the cookie, then the ServerHello with a
+// P-256 share, the encrypted flight (the key schedule over the restarted transcript: message_hash of the first
+// ClientHello, the HelloRetryRequest, the second ClientHello) and the client's Finished, whose record must be
+// the RFC's. Also: a second HelloRetryRequest, one that selects an unoffered or the already-offered group, are
+// refused; tlsPatchClientHello changes only the key_share and the cookie. Prints "tls-pure retry ok".
+// Vectors: tests/vectors/tls/rfc8448-section5.txt (the first argument).
+import "abla/io"
+import "abla/crypto"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/text"
+import "abla/tls/pure/client"
+import "abla/tls/pure/handshake"
+import "abla/tls/pure/record"
+
+var failures = 0
+var lines: array<string> = []
+var privateKeyForRetry = ""
+var secondHelloCalls = 0
+var seenShare = ""
+var seenCookie = ""
+var secondHelloAnswer = ""
+
+fun fail(what: string): void {
+    failures = failures + 1
+    if (failures < 40) println("FAIL $what")
+    return
+}
+
+fun check(name: string, actual: string, expected: string): void {
+    if (hexEncode(actual) != expected) fail("$name: ${hexEncode(actual)} != $expected")
+    return
+}
+
+fun vector(heading: string, name: string, occurrence: int = 1): string {
+    var seen = 0
+    for (line in lines) {
+        val parts = line.split("|")
+        if (parts.size == 3 && parts[0] == heading && parts[1] == name) {
+            seen = seen + 1
+            if (seen == occurrence) return parts[2]
+        }
+    }
+    fail("no vector $heading / $name #$occurrence")
+    ""
+}
+
+fun raw(heading: string, name: string, occurrence: int = 1): string = hexDecode(vector(heading, name, occurrence))
+
+fun verifier(chain: array<string>, host: string, scheme: int, content: string, signature: string): string = ""
+fun random(count: int): string = privateKeyForRetry
+
+// The test's second-ClientHello builder: the RFC's own (NSS pads it), after checking what it was asked for.
+fun secondHello(first: string, share: TlsKeyShare, cookie: string): string {
+    secondHelloCalls = secondHelloCalls + 1
+    seenShare = share.publicKey
+    seenCookie = cookie
+    secondHelloAnswer
+}
+
+fun newClient(): TlsClient {
+    val hello = raw("{client}  construct a ClientHello handshake message", "ClientHello", 1)
+    val config = TlsClientConfig("server", [TLS_SUITE_AES_128_GCM_SHA256, TLS_SUITE_CHACHA20_POLY1305_SHA256,
+        TLS_SUITE_AES_256_GCM_SHA384], [TLS_SIG_RSA_PSS_RSAE_SHA256, TLS_SIG_ED25519], [], verifier, random,
+        secondHello)
+    tlsClientStartWith(config, hello, hello.slice(6, 38), "",
+        [TlsKeyPair(TLS_GROUP_X25519, raw("{client}  create an ephemeral x25519 key pair", "public key"),
+            raw("{client}  create an ephemeral x25519 key pair", "private key"))], 769)
+}
+
+fun main: int {
+    lines = linuxReadFile("${processArgument(0)}/rfc8448-section5.txt", 4194304).split("\n")
+    privateKeyForRetry = raw("{client}  create an ephemeral P-256 key pair", "private key")
+    secondHelloAnswer = raw("{client}  construct a ClientHello handshake message", "ClientHello", 2)
+    val retryRequest = raw("{server}  construct a ServerHello handshake message", "ServerHello", 1)
+    val parsed = tlsParseServerHello(retryRequest.slice(4, retryRequest.size))
+    if (!parsed.ok || !parsed.retryRequest || parsed.shareGroup != TLS_GROUP_SECP256R1 || parsed.cookie.size != 114) {
+        fail("the HelloRetryRequest did not parse as one: ${parsed.error}")
+    }
+
+    // The whole trace.
+    var client = newClient()
+    check("first ClientHello record", client.takeOutput(), vector("{client}  send handshake record", "complete record", 1))
+    client.feed(raw("{server}  send handshake record", "complete record", 1))
+    if (client.failed()) fail("HelloRetryRequest: ${client.error}")
+    if (secondHelloCalls != 1) fail("the second ClientHello was built $secondHelloCalls times")
+    check("the retry's key share", seenShare, vector("{client}  create an ephemeral P-256 key pair", "public key"))
+    check("the retry's cookie", seenCookie, hexEncode(parsed.cookie))
+    check("second ClientHello record", client.takeOutput(), vector("{client}  send handshake record", "complete record", 2))
+    client.feed(raw("{server}  send handshake record", "complete record", 2))
+    if (client.failed()) fail("ServerHello after the retry: ${client.error}")
+    client.feed(raw("{server}  send handshake record", "complete record", 3))
+    if (client.failed() || !client.connected()) fail("flight after the retry: ${client.error}")
+    check("client Finished record", client.takeOutput(), vector("{client}  send handshake record", "complete record", 3))
+
+    // A second HelloRetryRequest is refused.
+    client = newClient()
+    client.takeOutput()
+    client.feed(raw("{server}  send handshake record", "complete record", 1))
+    client.takeOutput()
+    client.feed(raw("{server}  send handshake record", "complete record", 1))
+    if (!client.failed()) fail("a second HelloRetryRequest was accepted")
+
+    // A retry that selects the group already offered, or one never offered, is refused.
+    val sameGroup = tlsHandshakeMessage(TLS_SERVER_HELLO, tlsU16(771) + tlsHelloRetryRandom() + tlsVec8("") +
+        tlsU16(TLS_SUITE_AES_128_GCM_SHA256) + tlsU8(0) + tlsVec16(
+        tlsExtension(TLS_EXT_SUPPORTED_VERSIONS, tlsU16(772)) + tlsExtension(TLS_EXT_KEY_SHARE, tlsU16(TLS_GROUP_X25519))))
+    client = newClient()
+    client.takeOutput()
+    client.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, sameGroup))
+    if (!client.failed()) fail("a retry for the group already offered was accepted")
+    val strange = tlsHandshakeMessage(TLS_SERVER_HELLO, tlsU16(771) + tlsHelloRetryRandom() + tlsVec8("") +
+        tlsU16(TLS_SUITE_AES_128_GCM_SHA256) + tlsU8(0) + tlsVec16(
+        tlsExtension(TLS_EXT_SUPPORTED_VERSIONS, tlsU16(772)) + tlsExtension(TLS_EXT_KEY_SHARE, tlsU16(9999))))
+    client = newClient()
+    client.takeOutput()
+    client.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, strange))
+    if (!client.failed()) fail("a retry for an unoffered group was accepted")
+
+    // The standard second ClientHello changes only the key_share and adds the cookie.
+    val first = raw("{client}  construct a ClientHello handshake message", "ClientHello", 1)
+    val patched = tlsPatchClientHello(first, TlsKeyShare(TLS_GROUP_SECP256R1, hexDecode(vector("{client}  create an ephemeral P-256 key pair", "public key"))), parsed.cookie)
+    val expected = raw("{client}  construct a ClientHello handshake message", "ClientHello", 2)
+    // RFC 8448's second hello also carries NSS's padding extension and puts the cookie before the
+    // PSK modes: compare the extension sets instead of the bytes.
+    val patchedExtensions = tlsParseExtensions(tlsReaderAfterHello(patched))
+    val expectedExtensions = tlsParseExtensions(tlsReaderAfterHello(expected))
+    if (!patchedExtensions.ok || !expectedExtensions.ok) fail("the hellos' extensions did not parse")
+    for (extension in expectedExtensions.list) {
+        if (extension.type == 21) continue
+        var matched = false
+        for (candidate in patchedExtensions.list) {
+            if (candidate.type == extension.type && candidate.data == extension.data) matched = true
+        }
+        if (!matched) fail("extension ${extension.type} differs between the RFC's second hello and the patched first")
+    }
+    if (tlsPatchClientHello("", TlsKeyShare(TLS_GROUP_SECP256R1, ""), "").size != 0) fail("an empty hello was patched")
+
+    if (failures > 0) {
+        println("tls-pure retry: $failures failures")
+        return 1
+    }
+    println("tls-pure retry ok")
+    0
+}
+
+fun tlsReaderAfterHello(hello: string): TlsReader {
+    val reader = tlsReader(hello.slice(4, hello.size))
+    reader.u16()
+    reader.bytes(32)
+    reader.vec8()
+    reader.vec16()
+    reader.vec8()
+    reader
+}

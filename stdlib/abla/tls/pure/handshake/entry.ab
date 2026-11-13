@@ -343,3 +343,55 @@ fun tlsParseNewSessionTicket(body: string): TlsNewSessionTicket {
     val extensions = tlsParseExtensions(reader)
     TlsNewSessionTicket(reader.finished() && extensions.ok && ticket.size > 0, lifetime, ageAdd, nonce, ticket)
 }
+
+// ---- the second ClientHello after a HelloRetryRequest ----
+/** The ClientHello a HelloRetryRequest asks for (RFC 8446 section 4.1.2): the first one with its
+ *  key_share replaced by `share` and, when the server sent one, its cookie added at the end of the
+ *  extensions. Everything else stays byte for byte, as the transcript rules require. `first` is the whole
+ *  message (header included); an empty string comes back when it does not parse. */
+fun tlsPatchClientHello(first: string, share: TlsKeyShare, cookie: string): string {
+    if (first.size < 4) return ""
+    val reader = tlsReader(first.slice(4, first.size))
+    val version = reader.u16()
+    val random = reader.bytes(32)
+    val sessionId = reader.vec8()
+    val suites = reader.vec16()
+    val compression = reader.vec8()
+    val extensions = tlsParseExtensions(reader)
+    if (!reader.finished() || !extensions.ok) return ""
+    var rebuilt = ""
+    var replaced = false
+    for (extension in extensions.list) {
+        if (extension.type == TLS_EXT_KEY_SHARE) {
+            rebuilt = rebuilt + tlsExtension(TLS_EXT_KEY_SHARE, tlsVec16(tlsU16(share.group) + tlsVec16(share.publicKey)))
+            replaced = true
+        } else if (extension.type != TLS_EXT_COOKIE) {
+            rebuilt = rebuilt + tlsExtension(extension.type, extension.data)
+        }
+    }
+    if (!replaced) return ""
+    if (cookie.size > 0) rebuilt = rebuilt + tlsExtension(TLS_EXT_COOKIE, tlsVec16(cookie))
+    tlsHandshakeMessage(TLS_CLIENT_HELLO, tlsU16(version) + random + tlsVec8(sessionId) + tlsVec16(suites) +
+        tlsVec8(compression) + tlsVec16(rebuilt))
+}
+
+/** The groups a ClientHello message lists in supported_groups. */
+fun tlsClientHelloGroups(hello: string): array<int> {
+    val groups: array<int> = []
+    if (hello.size < 4) return groups
+    val reader = tlsReader(hello.slice(4, hello.size))
+    reader.u16()
+    reader.bytes(32)
+    reader.vec8()
+    reader.vec16()
+    reader.vec8()
+    val extensions = tlsParseExtensions(reader)
+    if (!reader.ok || !extensions.ok) return groups
+    val found = tlsFindExtension(extensions.list, TLS_EXT_SUPPORTED_GROUPS)
+    if (found != null) {
+        val outer = tlsReader(found.data)
+        val list = tlsReader(outer.vec16())
+        while (list.remaining() > 1 && list.ok) groups.append(list.u16())
+    }
+    groups
+}
