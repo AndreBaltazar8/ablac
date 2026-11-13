@@ -272,6 +272,27 @@ answer=$(s_client -CAfile "$out/ed25519.pem" -cert "$out/client-rsa.pem" -key "$
 [[ $answer != *'pure server'* ]] || { echo "tls-pure server: an untrusted client certificate was served: [$answer]" >&2; exit 1; }
 stop_serve
 echo "pure server: ALPN (server order, none in common refused) and a required client certificate (accepted, absent and untrusted refused)"
+# Unix stream sockets: the pure client over `openssl s_server -unix`, and the pure server over a Unix listener against
+# `openssl s_client -unix`.
+"$compiler" build tests/cases/tls-pure/unix.ab -o "$out/unix" --no-cache
+socket="$out/tls.sock"
+rm -f "$socket"
+openssl s_server -unix "$socket" -unlink -cert "$out/ed25519.pem" -key "$out/ed25519.key" -tls1_3 -www > "$out/unix-server.log" 2>&1 &
+server_pid=$!
+for _ in $(seq 50); do [[ -S $socket ]] && break; sleep 0.1; done
+result=$("$root/tools/run-limited.sh" "$out/unix" client "$socket" "$out/ed25519.pem") || { echo "tls-pure unix client: $result" >&2; head -5 "$out/unix-server.log" >&2; exit 1; }
+[[ $result == 'tls-pure unix client ok'* ]] || { echo "tls-pure unix client: $result" >&2; exit 1; }
+stop_server
+rm -f "$socket"
+"$out/unix" server "$socket" "$out/ed25519.pem" "$out/ed25519.key" > "$out/unix-serve.log" 2>&1 &
+serve_pid=$!
+for _ in $(seq 50); do [[ -S $socket ]] && break; sleep 0.1; done
+answer=$(printf 'GET /unix HTTP/1.0\r\n\r\n' | timeout 15 openssl s_client -unix "$socket" -tls1_3 -servername localhost -CAfile "$out/ed25519.pem" -verify_return_error -verify_hostname localhost -quiet 2> "$out/s_client.err" || true)
+[[ $answer == *'unix pure server:'* ]] || { echo "tls-pure unix server: [$answer] $(head -3 "$out/s_client.err") $(head -3 "$out/unix-serve.log")" >&2; exit 1; }
+wait "$serve_pid" 2> /dev/null || true
+serve_pid=
+rm -f "$socket"
+echo 'tls-pure unix: the client over s_server -unix and the server for s_client -unix'
 # A bulk transfer: a 6 MB file, many records; size and SHA-256 must match (Ed25519, checked in the program).
 "$compiler" build tests/cases/tls-pure/bulk.ab -o "$out/bulk" --no-cache
 mkdir -p "$out/www"

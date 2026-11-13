@@ -6,8 +6,7 @@
 //
 // Differences from the hosted module, for now: TLS 1.2 only in its modern subset (ECDHE with X25519 or P-256, AEAD
 // ciphers, the extended master secret required: a server without those fails the handshake; no CBC, no RSA key
-// exchange, no renegotiation), no session resumption, no
-// Unix-socket upgrade. Client certificates: tlsConnectWithIdentity with tlsClientIdentityFromPem (RSA, ECDSA P-256
+// exchange, no renegotiation), no session resumption. Client certificates: tlsConnectWithIdentity with tlsClientIdentityFromPem (RSA, ECDSA P-256
 // and Ed25519 keys) and tlsClientIdentityFromPkcs12 (PBES2 containers); the server side: tlsListen, TlsListener,
 // tlsServerUpgrade. The last error is a stage, as there:
 // "TLS failed at handshake", "TLS failed at certificate_verification", "TLS read or write timed out";
@@ -136,9 +135,8 @@ fun tlsConnectWithCa(host: string, caPath: string, port: int = 443, timeoutMilli
     readWriteTimeoutMilliseconds: int = tlsDefaultReadWriteTimeoutMilliseconds): TlsConnection =
     pureTlsOpen(host, caPath, port, timeoutMilliseconds, readWriteTimeoutMilliseconds, 0)
 
-/** Takes ownership of an established TCP socket, including on failure; verification is as in tlsConnect. */
-fun tlsUpgrade(var connection: TcpConnection, host: string, caPath: string = "", timeoutMilliseconds: int = 5000,
-    readWriteTimeoutMilliseconds: int = tlsDefaultReadWriteTimeoutMilliseconds): TlsConnection {
+private fun pureTlsUpgrade(var connection: TcpConnection, host: string, caPath: string, timeoutMilliseconds: int,
+    readWriteTimeoutMilliseconds: int, deadline: int, identity: TlsClientIdentity?): TlsConnection {
     val store = pureTlsStore(caPath)
     if (store == null) {
         pureTlsSetError(4)
@@ -146,10 +144,44 @@ fun tlsUpgrade(var connection: TcpConnection, host: string, caPath: string = "",
         return pureTlsFailed(host, 4)
     }
     val inner = tlsPureUpgrade(connection, pureTlsConfig(host, store), timeoutMilliseconds,
-        readWriteTimeoutMilliseconds, 0)
+        readWriteTimeoutMilliseconds, deadline, identity)
     pureTlsSetError(inner.stage)
     val handle = if (inner.ok()) inner.tcp.descriptor else -1
     TlsConnection(handle, move(inner))
+}
+
+/** Takes ownership of an established TCP socket, including on failure; verification is as in tlsConnect. */
+fun tlsUpgrade(var connection: TcpConnection, host: string, caPath: string = "", timeoutMilliseconds: int = 5000,
+    readWriteTimeoutMilliseconds: int = tlsDefaultReadWriteTimeoutMilliseconds): TlsConnection =
+    pureTlsUpgrade(connection, host, caPath, timeoutMilliseconds, readWriteTimeoutMilliseconds, 0, null)
+
+/** As tlsUpgrade over a Unix stream socket (the descriptor is what matters). `host` names the certificate and the
+ *  server name, not the socket's path. */
+fun tlsUpgrade(var connection: UnixConnection, host: string, caPath: string = "", timeoutMilliseconds: int = 5000,
+    readWriteTimeoutMilliseconds: int = tlsDefaultReadWriteTimeoutMilliseconds): TlsConnection {
+    var stream = TcpConnection(connection.descriptor)
+    connection.descriptor = -1
+    pureTlsUpgrade(stream, host, caPath, timeoutMilliseconds, readWriteTimeoutMilliseconds, 0, null)
+}
+
+/** Mutual TLS over an established socket: as tlsUpgrade, presenting `identity` when the server asks (error stage 14
+ *  for an unusable one, with the socket closed). */
+fun tlsUpgradeWithIdentity(var connection: TcpConnection, host: string, identity: TlsClientIdentity, caPath: string = "",
+    timeoutMilliseconds: int = 5000, readWriteTimeoutMilliseconds: int = tlsDefaultReadWriteTimeoutMilliseconds,
+    deadline: int = 0): TlsConnection {
+    if (!identity.ok()) {
+        connection.close()
+        return pureTlsFailed(host, 14)
+    }
+    pureTlsUpgrade(connection, host, caPath, timeoutMilliseconds, readWriteTimeoutMilliseconds, deadline, identity)
+}
+
+fun tlsUpgradeWithIdentity(var connection: UnixConnection, host: string, identity: TlsClientIdentity, caPath: string = "",
+    timeoutMilliseconds: int = 5000, readWriteTimeoutMilliseconds: int = tlsDefaultReadWriteTimeoutMilliseconds,
+    deadline: int = 0): TlsConnection {
+    var stream = TcpConnection(connection.descriptor)
+    connection.descriptor = -1
+    tlsUpgradeWithIdentity(stream, host, identity, caPath, timeoutMilliseconds, readWriteTimeoutMilliseconds, deadline)
 }
 
 /** Up to `maximum` bytes. "" with `tlsLastError()` empty is the end of the stream; "" with an error is a
@@ -254,4 +286,14 @@ fun tlsServerUpgrade(var connection: TcpConnection, certificatePath: string, pri
     pureTlsSetError(if (inner.ok()) 0 else if (inner.stage == 13) 13 else 12)
     val handle = if (inner.ok()) inner.tcp.descriptor else -1
     TlsConnection(handle, move(inner))
+}
+
+/** As tlsServerUpgrade over a Unix stream socket. */
+fun tlsServerUpgrade(var connection: UnixConnection, certificatePath: string, privateKeyPath: string,
+    handshakeTimeoutMilliseconds: int = 5000,
+    readWriteTimeoutMilliseconds: int = tlsDefaultReadWriteTimeoutMilliseconds, deadline: int = 0): TlsConnection {
+    var stream = TcpConnection(connection.descriptor)
+    connection.descriptor = -1
+    tlsServerUpgrade(stream, certificatePath, privateKeyPath, handshakeTimeoutMilliseconds,
+        readWriteTimeoutMilliseconds, deadline)
 }

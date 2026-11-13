@@ -1,0 +1,64 @@
+// abla/tls/pure over Unix stream sockets (tools/test-tls-pure-interop.sh runs it against openssl s_server -unix and
+// openssl s_client -unix).
+//   unix client SOCKET CERT          connects to SOCKET, upgrades with tlsUpgrade(UnixConnection, "localhost", CERT as
+//                                    the CA), sends a request and checks the answer; prints "tls-pure unix client ok"
+//   unix server SOCKET CERT KEY      listens on SOCKET, prints "listening", accepts one connection, upgrades it with
+//                                    tlsServerUpgrade(UnixConnection, CERT, KEY), answers the request, exits
+import "abla/io"
+import "abla/process/arguments"
+import "abla/sys/linux/net"
+import "abla/tls/pure"
+
+fun main: int {
+    val mode = processArgument(0)
+    val path = processArgument(1)
+    if (mode == "client") {
+        val stream = unixConnect(unixSocketAddress(path), 5000)
+        if (stream.descriptor < 0) {
+            println("FAIL connect")
+            return 1
+        }
+        var tls = tlsUpgrade(stream, "localhost", processArgument(2), 5000, 5000)
+        if (tls.handle == -1) {
+            println("FAIL upgrade: ${tlsLastError()}")
+            return 1
+        }
+        if (stream.descriptor != -1) {
+            println("FAIL the Unix connection was not taken")
+            return 1
+        }
+        if (tls.write("GET / HTTP/1.0\r\n\r\n") < 0) {
+            println("FAIL write: ${tlsLastError()}")
+            return 1
+        }
+        var response = ""
+        var chunk = tls.read(4096)
+        while (chunk.size > 0) {
+            response = response + chunk
+            chunk = tls.read(4096)
+        }
+        tls.close()
+        if (response.size == 0 || tlsLastError() != "") {
+            println("FAIL response: [$response] ${tlsLastError()}")
+            return 1
+        }
+        println("tls-pure unix client ok (${response.size} bytes)")
+        return 0
+    }
+    val listener = unixListen(unixSocketAddress(path), 4)
+    if (listener.descriptor < 0) {
+        println("FAIL listen")
+        return 1
+    }
+    println("listening")
+    val accepted = listener.accept()
+    var tls = tlsServerUpgrade(accepted, processArgument(2), processArgument(3), 5000, 5000)
+    if (tls.handle == -1) {
+        println("FAIL server upgrade: ${tlsLastError()}")
+        return 1
+    }
+    val request = tls.read(1024)
+    tls.write("unix pure server: ${request.size} bytes\n")
+    tls.close()
+    0
+}
