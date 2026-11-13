@@ -1,0 +1,143 @@
+// A TLS client identity (a certificate chain and its private key) for mutual TLS, from PEM: the certificates
+// leaf first (then any intermediates), and the key as PKCS#8 (RSA, ECDSA P-256 or Ed25519), PKCS#1 (RSA), SEC1 (ECDSA
+// P-256) or encrypted PKCS#8 (PBES2) with a passphrase. The key must belong to the first certificate. The
+// signing function (abla/tls/pure/client's TlsClientIdentity.sign) re-reads the key bytes on each call and keeps
+// no key object alive, so an identity is plain data.
+
+import "abla/crypto"
+import "abla/crypto/der"
+import "abla/crypto/ed25519"
+import "abla/crypto/p256"
+import "abla/crypto/pbe"
+import "abla/crypto/result"
+import "abla/crypto/rsa"
+import "abla/crypto/rsapss"
+import "abla/crypto/x509"
+import "abla/tls/pure/client"
+import "abla/tls/pure/handshake"
+
+private fun tlsIdentityFailed(error: string): TlsClientIdentity =
+    TlsClientIdentity([], [], tlsNoSignature, error)
+
+private fun tlsNoSignature(scheme: int, content: string): string = ""
+
+private fun tlsPadLeft(value: string, size: int): string {
+    if (value.size >= size) return value.slice(value.size - size, value.size)
+    val bytes: array<int> = []
+    while (bytes.size < size - value.size) bytes.append(0)
+    cryptoByteString(bytes) + value
+}
+
+// ---- the three key kinds as signing functions over plain data ----
+private fun tlsRsaSigner(der: string): (int, string) -> string =
+    { scheme: int, content: string ->
+        val key = rsaPrivateKeyFromDer(der)
+        val bits = if (scheme == TLS_SIG_RSA_PSS_RSAE_SHA256) 256 else if (scheme == TLS_SIG_RSA_PSS_RSAE_SHA384) 384
+            else if (scheme == TLS_SIG_RSA_PSS_RSAE_SHA512) 512 else 0
+        if (!key.ok() || bits == 0) "" else {
+            val signature = rsaPssSign(key, bits, content)
+            if (signature.ok) signature.bytes else ""
+        }
+    }
+
+private fun tlsEcSigner(scalar: string): (int, string) -> string =
+    { scheme: int, content: string ->
+        if (scheme != TLS_SIG_ECDSA_SECP256R1_SHA256) "" else {
+            val signature = p256EcdsaSign(scalar, content)
+            if (signature.ok) signature.bytes else ""
+        }
+    }
+
+private fun tlsEdSigner(seed: string): (int, string) -> string =
+    { scheme: int, content: string ->
+        if (scheme != TLS_SIG_ED25519) "" else {
+            val signature = ed25519Sign(seed, content)
+            if (signature.ok) signature.bytes else ""
+        }
+    }
+
+private val TLS_RSA_SCHEMES: array<int> = [TLS_SIG_RSA_PSS_RSAE_SHA256, TLS_SIG_RSA_PSS_RSAE_SHA384, TLS_SIG_RSA_PSS_RSAE_SHA512]
+
+/** The scalar of an ECPrivateKey (RFC 5915) at `item` of `der`: "" if it is not a P-256 key's. */
+private fun tlsEcScalar(der: string, item: DerItem): string {
+    if (!item.ok || item.tag != 48) return ""
+    val version = derItem(der, item.start, item.end)
+    val octets = derItem(der, version.end, item.end)
+    if (!version.ok || !octets.ok || octets.tag != 4) return ""
+    tlsPadLeft(der.slice(octets.start, octets.end), 32)
+}
+
+/** Reads the key and returns the identity for `chain`; `error` is set when it cannot. */
+private fun tlsIdentityFromKey(chain: array<string>, keyDer: string, label: string): TlsClientIdentity {
+    val leaf = x509ParseDer(chain[0])
+    if (!leaf.ok) return tlsIdentityFailed("the client certificate does not parse: ${leaf.error}")
+    if (label == "RSA PRIVATE KEY") {
+        val key = rsaPrivateKeyFromDer(keyDer)
+        if (!key.ok()) return tlsIdentityFailed("not a readable RSA private key")
+        val pub = rsaPublicKeyFromDer(leaf.spki)
+        if (!pub.ok() || pub.modulus != key.modulus) return tlsIdentityFailed("the private key is not the client certificate's")
+        return TlsClientIdentity(chain, TLS_RSA_SCHEMES, tlsRsaSigner(keyDer))
+    }
+    if (label == "EC PRIVATE KEY") {
+        val scalar = tlsEcScalar(keyDer, derItem(keyDer, 0, keyDer.size))
+        return tlsIdentityFromEc(chain, leaf, scalar)
+    }
+    // PKCS#8: version, the algorithm, the key in an OCTET STRING.
+    val root = derItem(keyDer, 0, keyDer.size)
+    if (!root.ok || root.tag != 48) return tlsIdentityFailed("not a readable private key")
+    val version = derItem(keyDer, root.start, root.end)
+    val algorithm = derItem(keyDer, version.end, root.end)
+    val inner = derItem(keyDer, algorithm.end, root.end)
+    val oid = derItem(keyDer, algorithm.start, algorithm.end)
+    if (!version.ok || !algorithm.ok || !inner.ok || inner.tag != 4 || !oid.ok) return tlsIdentityFailed("not a readable private key")
+    val algorithmOid = x509OidText(keyDer, oid)
+    val body = keyDer.slice(inner.start, inner.end)
+    if (algorithmOid == "1.2.840.113549.1.1.1") {
+        val key = rsaPrivateKeyFromDer(keyDer)
+        if (!key.ok()) return tlsIdentityFailed("not a readable RSA private key")
+        val pub = rsaPublicKeyFromDer(leaf.spki)
+        if (!pub.ok() || pub.modulus != key.modulus) return tlsIdentityFailed("the private key is not the client certificate's")
+        return TlsClientIdentity(chain, TLS_RSA_SCHEMES, tlsRsaSigner(keyDer))
+    }
+    if (algorithmOid == "1.2.840.10045.2.1") {
+        return tlsIdentityFromEc(chain, leaf, tlsEcScalar(body, derItem(body, 0, body.size)))
+    }
+    if (algorithmOid == "1.3.101.112") {
+        val seed = derItem(body, 0, body.size)
+        if (!seed.ok || seed.tag != 4 || seed.end - seed.start != 32) return tlsIdentityFailed("not a readable Ed25519 private key")
+        val seedBytes = body.slice(seed.start, seed.end)
+        val pub = ed25519PublicKey(seedBytes)
+        if (!pub.ok || pub.bytes != leaf.keyBits) return tlsIdentityFailed("the private key is not the client certificate's")
+        return TlsClientIdentity(chain, [TLS_SIG_ED25519], tlsEdSigner(seedBytes))
+    }
+    tlsIdentityFailed("an unsupported private key type ($algorithmOid)")
+}
+
+private fun tlsIdentityFromEc(chain: array<string>, leaf: X509Certificate, scalar: string): TlsClientIdentity {
+    if (scalar.size != 32) return tlsIdentityFailed("not a readable P-256 private key")
+    val pub = p256PublicKey(scalar)
+    if (!pub.ok) return tlsIdentityFailed("not a valid P-256 private key")
+    if (pub.bytes != leaf.keyBits) return tlsIdentityFailed("the private key is not the client certificate's")
+    TlsClientIdentity(chain, [TLS_SIG_ECDSA_SECP256R1_SHA256], tlsEcSigner(scalar))
+}
+
+/** The identity of a certificate PEM (the leaf first, then intermediates) and a private key PEM; `passphrase`
+ *  opens an encrypted PKCS#8 key. Check `error` (empty on success). */
+trusted fun tlsClientIdentityFromPem(certificatePem: string, keyPem: string,
+    passphrase: string = ""): TlsClientIdentity {
+    val certificates = x509ParsePem(certificatePem)
+    if (certificates.certificates.size == 0) return tlsIdentityFailed("not a readable certificate in PEM")
+    val chain: array<string> = []
+    for (certificate in certificates.certificates) chain.append(certificate.der)
+    var label = pemLabel(keyPem)
+    if (label == "") return tlsIdentityFailed("not a readable private key in PEM")
+    var keyDer = pemBase64Decode(pemBody(keyPem, label))
+    if (keyDer.size == 0) return tlsIdentityFailed("not a readable private key in PEM")
+    if (label == "ENCRYPTED PRIVATE KEY") {
+        val opened = pbeOpenPkcs8(keyDer, cryptoPassword(passphrase))
+        if (!opened.ok) return tlsIdentityFailed("not a readable private key in PEM, or a wrong passphrase")
+        keyDer = opened.bytes
+        label = "PRIVATE KEY"
+    }
+    tlsIdentityFromKey(chain, keyDer, label)
+}

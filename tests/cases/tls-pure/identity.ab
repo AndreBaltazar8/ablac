@@ -1,0 +1,65 @@
+// abla/tls/pure/identity: client identities from PEM, certificate and key made by openssl (given as the arguments by
+// tools/test-tls-pure-interop.sh): RSA (PKCS#8 and PKCS#1), ECDSA P-256 (PKCS#8 and SEC1), Ed25519, an encrypted
+// PKCS#8, a certificate with a key of another certificate, and garbage. Each identity must sign for the schemes it
+// offers, and the signature must verify under the certificate's key through abla/tls/pure/verify. Prints
+// "tls-pure identity ok". Arguments: a directory with <kind>.pem (certificate), <kind>.key (PKCS#8),
+// <kind>-alt.key (the other encoding, rsa and p256 only), <kind>-enc.key with passphrase "secret" (rsa).
+import "abla/io"
+import "abla/crypto/x509"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/tls/pure/client"
+import "abla/tls/pure/handshake"
+import "abla/tls/pure/identity"
+import "abla/tls/pure/verify"
+
+var failures = 0
+
+fun fail(what: string): void {
+    failures = failures + 1
+    println("FAIL $what")
+    return
+}
+
+fun read(path: string): string = linuxReadFile(path, 1048576)
+
+fun exercise(name: string, identity: TlsClientIdentity): void {
+    if (!identity.ok()) {
+        fail("$name: ${identity.error}")
+        return
+    }
+    val leaf = x509ParseDer(identity.chain[0])
+    for (scheme in identity.schemes) {
+        val content = "content to sign for scheme $scheme"
+        val signature = identity.sign(scheme, content)
+        if (signature.size == 0) fail("$name: no signature for scheme $scheme")
+        else if (tlsVerifySignature(leaf, scheme, content, signature) != "") {
+            fail("$name: the signature for scheme $scheme does not verify: ${tlsVerifySignature(leaf, scheme, content, signature)}")
+        }
+    }
+    if (identity.sign(0, "x") != "") fail("$name: signed with scheme 0")
+    return
+}
+
+fun main: int {
+    val directory = processArgument(0)
+    for (kind in ["rsa", "p256", "ed25519"]) {
+        val certificate = read("$directory/$kind.pem")
+        exercise(kind, tlsClientIdentityFromPem(certificate, read("$directory/$kind.key")))
+    }
+    exercise("rsa pkcs1", tlsClientIdentityFromPem(read("$directory/rsa.pem"), read("$directory/rsa-alt.key")))
+    exercise("p256 sec1", tlsClientIdentityFromPem(read("$directory/p256.pem"), read("$directory/p256-alt.key")))
+    exercise("rsa encrypted", tlsClientIdentityFromPem(read("$directory/rsa.pem"), read("$directory/rsa-enc.key"), "secret"))
+    val wrongPassphrase = tlsClientIdentityFromPem(read("$directory/rsa.pem"), read("$directory/rsa-enc.key"), "wrong")
+    if (wrongPassphrase.ok()) fail("an encrypted key opened with a wrong passphrase")
+    val mismatch = tlsClientIdentityFromPem(read("$directory/rsa.pem"), read("$directory/p256.key"))
+    if (mismatch.ok()) fail("a key of another certificate was accepted")
+    val mismatchRsa = tlsClientIdentityFromPem(read("$directory/p256.pem"), read("$directory/rsa.key"))
+    if (mismatchRsa.ok()) fail("an RSA key for an EC certificate was accepted")
+    if (tlsClientIdentityFromPem("", read("$directory/rsa.key")).ok()) fail("no certificate was accepted")
+    if (tlsClientIdentityFromPem(read("$directory/rsa.pem"), "not a key").ok()) fail("garbage was accepted as a key")
+    if (tlsClientIdentityFromPem(read("$directory/rsa.pem"), "").ok()) fail("no key was accepted")
+    if (failures > 0) return 1
+    println("tls-pure identity ok")
+    0
+}

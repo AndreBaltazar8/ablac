@@ -61,6 +61,14 @@ class TlsClientConfig(
 /** An ephemeral key pair offered in the key_share extension. */
 class TlsKeyPair(val group: int, val publicKey: string, val privateKey: string)
 
+/** A client certificate for mutual TLS: the chain (DER, end entity first), the signature schemes its key can
+ *  make, and the signing function (scheme and the content to sign give the signature, "" on failure). */
+class TlsClientIdentity(val chain: array<string>, val schemes: array<int>, val sign: (int, string) -> string,
+    val error: string = "") {
+    /** True for an identity with a certificate and a key that signs. */
+    fun ok(): bool = this.error == "" && this.chain.size > 0
+}
+
 class TlsClient(
     val config: TlsClientConfig,
     var state: int,
@@ -96,7 +104,13 @@ class TlsClient(
     var peerClosed: bool,
     var sentClose: bool,
     /** True when the handshake failed in the certificate check (the verifier's answer). */
-    var certificateRejected: bool
+    var certificateRejected: bool,
+    /** The identity to present when the server asks for a certificate; null presents none. */
+    var identity: TlsClientIdentity?,
+    /** The certificate request's context and schemes, once the server has sent one. */
+    var requested: bool,
+    var requestContext: string,
+    var requestSchemes: array<int>
 )
 
 fun tlsAeadFor(suite: int): int =
@@ -152,7 +166,7 @@ fun tlsClientStartWith(config: TlsClientConfig, clientHello: string, helloRandom
     val client = TlsClient(config, TLS_CLIENT_WAIT_SERVER_HELLO, "", "", "", "", "", tlsTranscript(),
         HKDF_SHA256, 0, 16, TLS_AEAD_AES_128_GCM, helloRandom, sessionId, clientHello, keyPairs, false, 0,
         false, false, tlsEmptyProtection(), tlsEmptyProtection(), "", "", "", "", "", "", [], "", false,
-        false, false, false)
+        false, false, false, null, false, "", [])
     client.transcript.add(clientHello)
     client.outbox = tlsPlaintextRecord(TLS_HANDSHAKE, recordVersion, clientHello)
     client
@@ -192,6 +206,12 @@ fun TlsClient.takeApplicationData(): string {
     val data = this.applicationData
     this.applicationData = ""
     data
+}
+
+/** Sets the certificate to present if the server asks for one (before the first `feed`). */
+fun TlsClient.useIdentity(identity: TlsClientIdentity): void {
+    this.identity = identity
+    return
 }
 
 /** The ALPN protocol the server chose ("" for none). */
@@ -422,6 +442,49 @@ private fun TlsClient.handleCertificateVerify(message: string, body: string): vo
     return
 }
 
+/** The client's Certificate (empty when it has no identity or none of its keys fits the server's schemes) and,
+ *  with one, its CertificateVerify; both go into the transcript. */
+private fun TlsClient.clientAuthenticationMessages(): string {
+    val identity = this.identity
+    var scheme = 0
+    if (identity != null && identity.chain.size > 0) {
+        for (candidate in identity.schemes) {
+            for (accepted in this.requestSchemes) {
+                if (scheme == 0 && candidate == accepted) scheme = candidate
+            }
+        }
+    }
+    if (identity == null || scheme == 0) {
+        val empty = tlsBuildCertificate(this.requestContext, [])
+        this.transcript.add(empty)
+        return empty
+    }
+    val certificate = tlsBuildCertificate(this.requestContext, identity.chain)
+    this.transcript.add(certificate)
+    val content = tlsCertificateVerifyContent(false, this.transcript.hash(this.hash))
+    val signature = identity.sign(scheme, content)
+    if (signature.size == 0) {
+        this.fail(TLS_ALERT_INTERNAL_ERROR, "tls: the client certificate's key could not sign")
+        return ""
+    }
+    val verify = tlsBuildCertificateVerify(scheme, signature)
+    this.transcript.add(verify)
+    certificate + verify
+}
+
+private fun TlsClient.handleCertificateRequest(message: string, body: string): void {
+    val request = tlsParseCertificateRequest(body)
+    if (!request.ok) {
+        this.fail(TLS_ALERT_DECODE_ERROR, "tls: a malformed CertificateRequest")
+        return
+    }
+    this.requested = true
+    this.requestContext = request.context
+    this.requestSchemes = request.signatureAlgorithms
+    this.transcript.add(message)
+    return
+}
+
 private fun TlsClient.handleFinished(message: string, body: string): void {
     if (body.size != tlsHashLength(this.hash)) {
         this.fail(TLS_ALERT_DECODE_ERROR, "tls: a Finished of the wrong length")
@@ -446,9 +509,15 @@ private fun TlsClient.handleFinished(message: string, body: string): void {
     // client handshake keys, then everything after is application traffic.
     this.sendCompatibilityChangeCipherSpec()
     this.setKeys(this.clientHandshakeSecret, true)
-    val verify = tlsFinishedVerifyData(this.hash, this.clientHandshakeSecret, serverFinishedHash)
+    // With client authentication, its Certificate and CertificateVerify come first, in the same record.
+    var flight = ""
+    if (this.requested) {
+        flight = this.clientAuthenticationMessages()
+        if (this.state == TLS_CLIENT_FAILED) return
+    }
+    val verify = tlsFinishedVerifyData(this.hash, this.clientHandshakeSecret, this.transcript.hash(this.hash))
     val finished = tlsHandshakeMessage(TLS_FINISHED, verify)
-    this.queueRecord(TLS_HANDSHAKE, finished)
+    this.queueRecord(TLS_HANDSHAKE, flight + finished)
     this.transcript.add(finished)
     this.setKeys(application.clientTraffic, true)
     this.setKeys(application.serverTraffic, false)
@@ -480,6 +549,7 @@ private fun TlsClient.handleMessage(type: int, message: string, body: string): v
         else this.fail(TLS_ALERT_UNEXPECTED_MESSAGE, "tls: expected EncryptedExtensions")
     } else if (this.state == TLS_CLIENT_WAIT_CERTIFICATE) {
         if (type == TLS_CERTIFICATE) this.handleCertificate(message, body)
+        else if (type == TLS_CERTIFICATE_REQUEST && !this.requested) this.handleCertificateRequest(message, body)
         else this.fail(TLS_ALERT_UNEXPECTED_MESSAGE, "tls: expected a Certificate")
     } else if (this.state == TLS_CLIENT_WAIT_CERTIFICATE_VERIFY) {
         if (type == TLS_CERTIFICATE_VERIFY) this.handleCertificateVerify(message, body)

@@ -67,6 +67,36 @@ result=$("$root/tools/run-limited.sh" "$out/api" "$port" "$out/ed25519.pem" "$ou
 [[ $result == 'tls-pure api ok' ]] || { echo "tls-pure api: $result" >&2; exit 1; }
 echo "$result"
 stop_server
+# Client identities from PEM (every key kind and encoding), then mutual TLS: s_server -Verify trusting one client
+# certificate; that client is accepted, one with no identity and one with another certificate are refused.
+openssl rsa -in "$out/rsa.key" -traditional -out "$out/rsa-alt.key" 2> /dev/null
+openssl ec -in "$out/p256.key" -out "$out/p256-alt.key" 2> /dev/null
+openssl pkcs8 -topk8 -v2 aes-256-cbc -iter 2000 -in "$out/rsa.key" -passout pass:secret -out "$out/rsa-enc.key" 2> /dev/null
+"$compiler" build tests/cases/tls-pure/identity.ab -o "$out/identity" --no-cache
+result=$("$root/tools/run-limited.sh" "$out/identity" "$out") || { echo "tls-pure identity: $result" >&2; exit 1; }
+[[ $result == 'tls-pure identity ok' ]] || { echo "tls-pure identity: $result" >&2; exit 1; }
+echo "$result"
+"$compiler" build tests/cases/tls-pure/mtls.ab -o "$out/mtls" --no-cache
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$out/client-rsa.key" 2> /dev/null
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$out/client-p256.key" 2> /dev/null
+openssl genpkey -algorithm ED25519 -out "$out/client-ed25519.key" 2> /dev/null
+for kind in rsa p256 ed25519; do
+    openssl req -x509 -new -key "$out/client-$kind.key" -out "$out/client-$kind.pem" -subj /CN=client-$kind -days 2 2> /dev/null
+done
+for kind in rsa p256 ed25519; do
+    other=$([[ $kind == rsa ]] && echo p256 || echo rsa)
+    start_server ed25519 -www -groups X25519 -Verify 1 -CAfile "$out/client-$kind.pem" -verify_return_error
+    for case in "accepted:client-$kind" "refused:none" "refused:client-$other"; do
+        expect=${case%%:*}
+        who=${case#*:}
+        certificate=$([[ $who == none ]] && echo none || echo "$out/$who.pem")
+        result=$("$root/tools/run-limited.sh" "$out/mtls" "$port" "$out/ed25519.pem" "$certificate" "$out/$who.key" "$expect") || {
+            echo "tls-pure mtls ($kind trusted, $who): $result" >&2; head -5 "$out/server.log" >&2; exit 1; }
+        [[ $result == "tls-pure mtls ok ($expect)" ]] || { echo "tls-pure mtls ($kind trusted, $who): $result" >&2; exit 1; }
+    done
+    stop_server
+    echo "mtls $kind: accepted, refused without an identity, refused with another"
+done
 # A bulk transfer: a 6 MB file, many records; size and SHA-256 must match (Ed25519, checked in the program).
 "$compiler" build tests/cases/tls-pure/bulk.ab -o "$out/bulk" --no-cache
 mkdir -p "$out/www"

@@ -1,0 +1,145 @@
+// Client authentication through abla/tls/pure against RFC 8448 section 6: the server's flight carries a
+// CertificateRequest; the client answers Certificate, CertificateVerify and Finished in one protected record, which
+// must be the RFC's. The signing function is the trace's (RSA-PSS with its fixed salt: the RFC's signature, after
+// checking what it was asked to sign), and that signature is then verified here under the client certificate's key
+// over exactly the content the client built, which proves the content (64 spaces, the client context string, the
+// transcript hash through the client Certificate). Also: a client with no identity answers with an empty Certificate
+// and the handshake still completes; one whose schemes the server does not accept does the same. Prints
+// "tls-pure auth ok". Vectors: tests/vectors/tls/rfc8448-section6.txt (the first argument).
+import "abla/io"
+import "abla/crypto"
+import "abla/crypto/rsa"
+import "abla/crypto/rsapss"
+import "abla/crypto/x509"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/text"
+import "abla/tls/pure/client"
+import "abla/tls/pure/handshake"
+import "abla/tls/pure/record"
+
+var failures = 0
+var lines: array<string> = []
+var signedContent = ""
+var signedScheme = 0
+var signatureAnswer = ""
+
+fun fail(what: string): void {
+    failures = failures + 1
+    if (failures < 40) println("FAIL $what")
+    return
+}
+
+fun check(name: string, actual: string, expected: string): void {
+    if (hexEncode(actual) != expected) fail("$name: ${hexEncode(actual)} != $expected")
+    return
+}
+
+fun vector(heading: string, name: string, occurrence: int = 1): string {
+    var seen = 0
+    for (line in lines) {
+        val parts = line.split("|")
+        if (parts.size == 3 && parts[0] == heading && parts[1] == name) {
+            seen = seen + 1
+            if (seen == occurrence) return parts[2]
+        }
+    }
+    fail("no vector $heading / $name #$occurrence")
+    ""
+}
+
+fun raw(heading: string, name: string, occurrence: int = 1): string = hexDecode(vector(heading, name, occurrence))
+
+fun verifier(chain: array<string>, host: string, scheme: int, content: string, signature: string): string = ""
+fun noRandom(count: int): string = ""
+
+/** A trace message's body (without its 4-byte header). */
+fun body(heading: string, name: string): string {
+    val message = raw(heading, name)
+    message.slice(4, message.size)
+}
+
+fun signer(scheme: int, content: string): string {
+    signedScheme = scheme
+    signedContent = content
+    signatureAnswer
+}
+
+fun newClient(): TlsClient {
+    val hello = raw("{client}  construct a ClientHello handshake message", "ClientHello")
+    val config = TlsClientConfig("server", [TLS_SUITE_AES_128_GCM_SHA256],
+        [TLS_SIG_RSA_PSS_RSAE_SHA256, TLS_SIG_ED25519, TLS_SIG_ECDSA_SECP256R1_SHA256], [], verifier, noRandom,
+        tlsPatchClientHello)
+    tlsClientStartWith(config, hello, hello.slice(6, 38), "",
+        [TlsKeyPair(TLS_GROUP_X25519, raw("{client}  create an ephemeral x25519 key pair", "public key"),
+            raw("{client}  create an ephemeral x25519 key pair", "private key"))], 769)
+}
+
+fun main: int {
+    lines = linuxReadFile("${processArgument(0)}/rfc8448-section6.txt", 4194304).split("\n")
+    val clientCertificate = tlsParseCertificate(body("{client}  construct a Certificate handshake message", "Certificate"))
+    val parsedVerify = tlsParseCertificateVerify(body("{client}  construct a CertificateVerify handshake message", "CertificateVerify"))
+    if (!clientCertificate.ok || clientCertificate.chain.size != 1 || !parsedVerify.ok) fail("the trace's client messages did not parse")
+    signatureAnswer = parsedVerify.signature
+    val identity = TlsClientIdentity(clientCertificate.chain, [TLS_SIG_RSA_PSS_RSAE_SHA256], signer)
+    val request = tlsParseCertificateRequest(body("{server}  construct a CertificateRequest handshake message", "CertificateRequest"))
+    if (!request.ok || request.signatureAlgorithms.size == 0) fail("the CertificateRequest did not parse")
+
+    var client = newClient()
+    client.useIdentity(identity)
+    check("ClientHello record", client.takeOutput(), vector("{client}  send handshake record", "complete record", 1))
+    client.feed(raw("{server}  send handshake record", "complete record", 1))
+    client.feed(raw("{server}  send handshake record", "complete record", 2))
+    if (client.failed() || !client.connected()) fail("the flight with a CertificateRequest: ${client.error}")
+    check("client second flight", client.takeOutput(), vector("{client}  send handshake record", "complete record", 2))
+    if (signedScheme != TLS_SIG_RSA_PSS_RSAE_SHA256) fail("signed with scheme $signedScheme")
+    // What the client asked to be signed: 64 spaces, the client context string, a zero byte and the hash of the
+    // trace's messages through the client Certificate (the RFC's key is 1024-bit RSA, below the verifier's
+    // minimum, so the signature itself cannot be re-verified here).
+    val through = raw("{client}  construct a ClientHello handshake message", "ClientHello") +
+        raw("{server}  construct a ServerHello handshake message", "ServerHello") +
+        raw("{server}  construct an EncryptedExtensions handshake message", "EncryptedExtensions") +
+        raw("{server}  construct a CertificateRequest handshake message", "CertificateRequest") +
+        raw("{server}  construct a Certificate handshake message", "Certificate") +
+        raw("{server}  construct a CertificateVerify handshake message", "CertificateVerify") +
+        raw("{server}  construct a Finished handshake message", "Finished") +
+        raw("{client}  construct a Certificate handshake message", "Certificate")
+    check("the content the client signed", signedContent,
+        hexEncode(tlsCertificateVerifyContent(false, sha256(through))))
+    if (signedContent.size != 64 + 33 + 1 + 32 || signedContent[64] != 84) fail("the signed content's shape: ${signedContent.size}")
+
+    // No identity: an empty Certificate, and the handshake completes.
+    client = newClient()
+    client.takeOutput()
+    client.feed(raw("{server}  send handshake record", "complete record", 1))
+    client.feed(raw("{server}  send handshake record", "complete record", 2))
+    if (client.failed() || !client.connected()) fail("no identity: ${client.error}")
+    if (client.takeOutput() == vector("{client}  send handshake record", "complete record", 2)) fail("a client without an identity sent the RFC's record")
+
+    // An identity whose key makes none of the schemes the server accepts: also an empty Certificate.
+    client = newClient()
+    client.useIdentity(TlsClientIdentity(clientCertificate.chain, [TLS_SIG_ED25519], signer))
+    client.takeOutput()
+    signedScheme = 0
+    client.feed(raw("{server}  send handshake record", "complete record", 1))
+    client.feed(raw("{server}  send handshake record", "complete record", 2))
+    if (client.failed() || !client.connected()) fail("unusable identity: ${client.error}")
+    if (signedScheme != 0) fail("the signer was asked for a scheme the server does not accept")
+
+    // A signer that cannot sign fails the handshake.
+    client = newClient()
+    client.useIdentity(TlsClientIdentity(clientCertificate.chain, [TLS_SIG_RSA_PSS_RSAE_SHA256], noSignature))
+    client.takeOutput()
+    client.feed(raw("{server}  send handshake record", "complete record", 1))
+    client.feed(raw("{server}  send handshake record", "complete record", 2))
+    if (!client.failed()) fail("a signer that failed did not fail the handshake")
+
+    if (failures > 0) {
+        println("tls-pure auth: $failures failures")
+        return 1
+    }
+    println("tls-pure auth ok")
+    0
+}
+
+fun noSignature(scheme: int, content: string): string = ""

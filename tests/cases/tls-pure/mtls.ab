@@ -1,0 +1,72 @@
+// Mutual TLS through abla/tls/pure against `openssl s_server -Verify` (tools/test-tls-pure-interop.sh): the
+// port, the server's certificate (the trust anchor), the client certificate and key (PEM), and the outcome the server
+// should produce: "accepted" (the handshake completes and a request is answered) or "refused" (the connection
+// fails: the client sent none, or one the server does not trust). A "none" certificate argument means no identity.
+// Prints "tls-pure mtls ok (accepted)" or "(refused)".
+import "abla/io"
+import "abla/crypto/x509"
+import "abla/process/arguments"
+import "abla/process/time"
+import "abla/sys/linux"
+import "abla/tls/pure/client"
+import "abla/tls/pure/connection"
+import "abla/tls/pure/identity"
+import "abla/tls/pure/verify"
+
+fun decimal(text: string): int {
+    var value = 0
+    for (i in 0 until text.size) value = value * 10 + (text[i] - 48)
+    value
+}
+
+fun now(): int = realtimeMilliseconds() / 1000
+
+fun main: int {
+    val port = decimal(processArgument(0))
+    val store = x509TrustStoreFromPem(linuxReadFile(processArgument(1), 1048576))
+    val expect = processArgument(4)
+    var identity = TlsClientIdentity([], [], noSignature)
+    if (processArgument(2) != "none") {
+        identity = tlsClientIdentityFromPem(linuxReadFile(processArgument(2), 1048576), linuxReadFile(processArgument(3), 1048576))
+        if (!identity.ok()) {
+            println("FAIL identity: ${identity.error}")
+            return 1
+        }
+    }
+    val config = tlsClientConfig("localhost", tlsX509Verifier(store, now), tlsPureRandom)
+    var connection = tlsPureConnect(config, port, 5000, 5000, 0, if (processArgument(2) == "none") null else identity)
+    if (expect == "refused") {
+        // Under TLS 1.3 the server's refusal can arrive after the handshake: a failing first read.
+        var failed = !connection.ok()
+        if (!failed) {
+            connection.write("GET / HTTP/1.0\r\n\r\n")
+            val data = connection.read(4096)
+            failed = data.size == 0 && connection.lastError != ""
+            if (!failed && data.size == 0) failed = true
+        }
+        if (!failed) {
+            println("FAIL the server accepted a client it should have refused")
+            return 1
+        }
+        println("tls-pure mtls ok (refused)")
+        return 0
+    }
+    if (!connection.ok()) {
+        println("FAIL connect: ${connection.lastError}")
+        return 1
+    }
+    if (connection.write("GET / HTTP/1.0\r\n\r\n") < 0) {
+        println("FAIL write: ${connection.lastError}")
+        return 1
+    }
+    val response = connection.read(8192)
+    if (response.size == 0 || connection.lastError != "") {
+        println("FAIL read: [${response}] ${connection.lastError}")
+        return 1
+    }
+    connection.close()
+    println("tls-pure mtls ok (accepted)")
+    0
+}
+
+fun noSignature(scheme: int, content: string): string = ""
