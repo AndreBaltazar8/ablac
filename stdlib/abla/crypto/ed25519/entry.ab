@@ -1,0 +1,524 @@
+// Ed25519 (RFC 8032 section 5.1) in Abla, with no OpenSSL, on every target: key generation, deterministic signing and
+// verification over the field of abla/crypto/x25519 (32 limbs of 8 bits in secretU32).
+//
+// What is constant-time: the scalar multiplications that take a secret (the key's scalar in the public key and in
+// the signature, the nonce in R) run 256 steps of a doubling, an addition and a masked select of the whole point, and
+// the arithmetic modulo the group order L is bit by bit with masked selects, so no branch, memory index or division
+// depends on a secret. The Edwards addition is the unified, complete one (add-2008-hwcd-3: no exceptional cases).
+// Verification takes public data only; it uses the same code for both products, so it is not faster than signing.
+// What is not covered: the hashes (abla/crypto's SHA-512 over strings) and the strings that hold a secret scalar
+// between steps; tools/test-ct.sh reads neither, and a secret in a string stays in memory until it is reused.
+//
+// tools/test-ct.sh reads the core below (between the BEGIN and END lines) as written.
+
+import "abla/crypto"
+import "abla/crypto/alloc"
+import "abla/crypto/x25519"
+import "abla/ct"
+import "abla/ct/scrub"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+import "abla/unsafe/mmio"
+export import "abla/crypto/result"
+
+// BEGIN ED25519 SECRET CORE
+// A point is four field elements (X, Y, Z, T) of 128 bytes each, x = X/Z, y = Y/Z, xy = T/Z. The work area:
+//   +0     the scalar, 32 bytes as given (bit 0 first)       +3456  zero, an element
+//   +128   the point P                                      +3584  2d, an element
+//   +640   the accumulator R                                +3712  x, y, zinv: three elements (to +4096)
+//   +1152  the sum Q                                        +4096  the inverse's four elements (to +4608)
+//   +1664  twelve elements of scratch (to +3200)            +4608  the pack's two elements (to +4864)
+//   +3200  the multiplication's scratch, 64 words           +4864  the encoded point, 32 bytes; +4896 the x's bytes
+@inline trusted fun ed25519Pointer(address: int): i64* =
+    ablaUnsafePointerOffset(ablaUnsafeNullPointer(), address)
+@inline trusted fun ed25519Load(address: int): secretU32 =
+    secretU32(u32(ablaUnsafeLoadU32(ed25519Pointer(address))))
+@inline trusted fun ed25519Store(address: int, value: secretU32): void =
+    ablaUnsafeStoreU32(ed25519Pointer(address), int(value.declassify()))
+
+fun ed25519WorkSize(): int = 5120
+
+/** `out` = `p` + `q`, the unified addition of the extended coordinates (a = -1): nine multiplications. `out` may be either
+ *  operand. `w` is the work area. */
+@noinline trusted fun ed25519Add(out: int, p: int, q: int, w: int): void {
+    val t0 = w + 1664
+    val t1 = t0 + 128
+    val t2 = t0 + 256
+    val t3 = t0 + 384
+    val t4 = t0 + 512
+    val t5 = t0 + 640
+    val t6 = t0 + 768
+    val t7 = t0 + 896
+    val m = w + 3200
+    x25519Sub(t0, p + 128, p)
+    x25519Sub(t1, q + 128, q)
+    x25519Multiply(t0, t0, t1, m)                  // A = (Y1 - X1) (Y2 - X2)
+    x25519Add(t1, p + 128, p)
+    x25519Add(t2, q + 128, q)
+    x25519Multiply(t1, t1, t2, m)                  // B = (Y1 + X1) (Y2 + X2)
+    x25519Multiply(t2, p + 384, q + 384, m)
+    x25519Multiply(t2, t2, w + 3584, m)            // C = T1 2d T2
+    x25519Multiply(t3, p + 256, q + 256, m)
+    x25519Add(t3, t3, t3)                          // D = 2 Z1 Z2
+    x25519Sub(t4, t1, t0)                          // E = B - A
+    x25519Add(t5, t1, t0)                          // H = B + A
+    x25519Sub(t6, t3, t2)                          // F = D - C
+    x25519Add(t7, t3, t2)                          // G = D + C
+    x25519Multiply(out, t4, t6, m)                 // X3 = E F
+    x25519Multiply(out + 128, t7, t5, m)           // Y3 = G H
+    x25519Multiply(out + 384, t4, t5, m)           // T3 = E H
+    x25519Multiply(out + 256, t6, t7, m)           // Z3 = F G
+}
+
+/** `out` = 2 `p` (dbl-2008-hwcd, a = -1). `out` may be `p`. */
+@noinline trusted fun ed25519Double(out: int, p: int, w: int): void {
+    val t0 = w + 1664
+    val t1 = t0 + 128
+    val t2 = t0 + 256
+    val t3 = t0 + 384
+    val t4 = t0 + 512
+    val t5 = t0 + 640
+    val t6 = t0 + 768
+    val t7 = t0 + 896
+    val m = w + 3200
+    x25519Multiply(t0, p, p, m)                    // A = X1^2
+    x25519Multiply(t1, p + 128, p + 128, m)        // B = Y1^2
+    x25519Multiply(t2, p + 256, p + 256, m)
+    x25519Add(t2, t2, t2)                          // C = 2 Z1^2
+    x25519Sub(t3, w + 3456, t0)                    // D = -A
+    x25519Add(t4, p, p + 128)
+    x25519Multiply(t4, t4, t4, m)
+    x25519Sub(t4, t4, t0)
+    x25519Sub(t4, t4, t1)                          // E = (X1 + Y1)^2 - A - B
+    x25519Add(t5, t3, t1)                          // G = D + B
+    x25519Sub(t6, t5, t2)                          // F = G - C
+    x25519Sub(t7, t3, t1)                          // H = D - B
+    x25519Multiply(out, t4, t6, m)                 // X3 = E F
+    x25519Multiply(out + 128, t5, t7, m)           // Y3 = G H
+    x25519Multiply(out + 384, t4, t7, m)           // T3 = E H
+    x25519Multiply(out + 256, t6, t5, m)           // Z3 = F G
+}
+
+/** Copies the point at `source` over the one at `target` where `mask` has ones: all 128 words, whatever the mask is. */
+@inline trusted fun ed25519SelectBody(mask: secretU32, target: int, source: int): void {
+    for (i in 0 until 128) {
+        val old = ed25519Load(target + i * 4)
+        val replacement = ed25519Load(source + i * 4)
+        ed25519Store(target + i * 4, old ^ ((old ^ replacement) & mask))
+    }
+}
+
+@noinline trusted fun ed25519Select(mask: secretU32, target: int, source: int): void =
+    ed25519SelectBody(mask, target, source)
+
+/** R = scalar * P: 256 steps from bit 255, each a doubling, an addition and a masked select. The scalar is at `w`, the
+ *  point at `w + 128`, the result at `w + 640`. */
+@noinline trusted fun ed25519ScalarMultiply(w: int): void {
+    val r = w + 640
+    val q = w + 1152
+    for (i in 0 until 128) ed25519Store(r + i * 4, secretU32(u32(0)))
+    // The identity (0, 1, 1, 0).
+    ed25519Store(r + 128, secretU32(u32(1)))
+    ed25519Store(r + 256, secretU32(u32(1)))
+    for (step in 0 until 256) {
+        val position = 255 - step
+        val bit = (secretU32(u32(ablaUnsafeLoadU8(ed25519Pointer(w + (position >> 3))))) >> (position & 7)) &
+            secretU32(u32(1))
+        ed25519Double(r, r, w)
+        ed25519Add(q, r, w + 128, w)
+        ed25519Select(ctFromLowBit(bit), r, q)
+    }
+}
+
+/** The 32-byte encoding of the point at `point` at `out`: y, with the low bit of x in bit 255. */
+@noinline trusted fun ed25519Encode(w: int, point: int, out: int): void {
+    val x = w + 3712
+    val y = w + 3840
+    val zinv = w + 3968
+    val m = w + 3200
+    x25519Invert(zinv, point + 256, w + 4096, m)
+    x25519Multiply(x, point, zinv, m)
+    x25519Multiply(y, point + 128, zinv, m)
+    x25519Pack(out, y, w + 4608, w + 4736)
+    x25519Pack(w + 4896, x, w + 4608, w + 4736)
+    val parity = secretU32(u32(ablaUnsafeLoadU8(ed25519Pointer(w + 4896)))) & secretU32(u32(1))
+    val top = secretU32(u32(ablaUnsafeLoadU8(ed25519Pointer(out + 31))))
+    ablaUnsafeStoreU8(ed25519Pointer(out + 31), int((top | (parity << 7)).declassify()))
+}
+
+/** The scalar times the point, encoded, at `w + 4864`: the scalar (32 bytes) is at `w`, the point's four elements at
+ *  `w + 128`, and 2d and zero are at `w + 3584` and `w + 3456`. */
+@noinline trusted fun ed25519Multiply(w: int): void {
+    ed25519ScalarMultiply(w)
+    ed25519Encode(w, w + 640, w + 4864)
+}
+
+// --- The scalars modulo L = 2^252 + 27742317777372353535851937790883648493, bit by bit ----------------------------------
+// A scalar is 32 limbs of 8 bits, one per word, little endian. Each step doubles or adds modulo L with a masked
+// select, so its time does not depend on the value.
+
+/** Byte `i` of L (little endian): a public index, computed from its two low words and not looked up or switched on (a jump
+ *  table is an indirect jump, which the constant-time check refuses). */
+@inline trusted fun ed25519OrderByte(i: int): int {
+    val shifted: int = if (i < 8) (0x5812631a5cf5d3ed >> (8 * i)) else if (i < 16) (0x14def9dea2f79cd6 >> (8 * (i - 8)))
+        else if (i == 31) 16 else 0
+    shifted & 255
+}
+
+/** `out` = (`a` + `b`) mod L for `a` and `b` below L: the sum, the sum minus L, and a masked choice of one. `tmp` has 64
+ *  words. `out` may be `a` or `b`. */
+@inline trusted fun ed25519ScAddBody(out: int, a: int, b: int, tmp: int): void {
+    val mask = secretU32(u32(255))
+    var carry = secretU32(u32(0))
+    for (i in 0 until 32) {
+        val value = ed25519Load(a + i * 4) + ed25519Load(b + i * 4) + carry
+        ed25519Store(tmp + i * 4, value & mask)
+        carry = value >> 8
+    }
+    var borrow = secretU32(u32(0))
+    for (i in 0 until 32) {
+        val value = ed25519Load(tmp + i * 4) + secretU32(u32(256 - ed25519OrderByte(i))) - borrow
+        ed25519Store(tmp + (32 + i) * 4, value & mask)
+        borrow = ((value >> 8) ^ secretU32(u32(1))) & secretU32(u32(1))
+    }
+    val keep = ctFromLowBit(borrow)
+    for (i in 0 until 32) {
+        ed25519Store(out + i * 4, ctSelect(keep, ed25519Load(tmp + i * 4), ed25519Load(tmp + (32 + i) * 4)))
+    }
+}
+
+@noinline trusted fun ed25519ScAdd(out: int, a: int, b: int, tmp: int): void = ed25519ScAddBody(out, a, b, tmp)
+
+/** The 32 bytes at `bytes` as the 32 limbs at `limbs`. */
+@noinline trusted fun ed25519ScLoad(limbs: int, bytes: int): void {
+    for (i in 0 until 32) {
+        ed25519Store(limbs + i * 4, secretU32(u32(ablaUnsafeLoadU8(ed25519Pointer(bytes + i)))))
+    }
+}
+
+/** The limbs at `limbs` as 32 bytes at `bytes`. */
+@noinline trusted fun ed25519ScStore(bytes: int, limbs: int): void {
+    for (i in 0 until 32) {
+        ablaUnsafeStoreU8(ed25519Pointer(bytes + i), int(ed25519Load(limbs + i * 4).declassify()))
+    }
+}
+
+/** `out` (limbs) = the 64 bytes at `hash`, as a little-endian number, mod L: 512 steps of a doubling and the next bit. `s` has
+ *  512 bytes: the accumulator, a limb vector of the bit, and the add's scratch. */
+@noinline trusted fun ed25519ScReduce(out: int, hash: int, s: int): void {
+    val accumulator = s
+    val bitVector = s + 128
+    val tmp = s + 256
+    for (i in 0 until 64) {
+        ed25519Store(accumulator + i * 4, secretU32(u32(0)))
+    }
+    for (step in 0 until 512) {
+        val position = 511 - step
+        val bit = (secretU32(u32(ablaUnsafeLoadU8(ed25519Pointer(hash + (position >> 3))))) >> (position & 7)) &
+            secretU32(u32(1))
+        ed25519ScAdd(accumulator, accumulator, accumulator, tmp)
+        ed25519Store(bitVector, bit)
+        ed25519ScAdd(accumulator, accumulator, bitVector, tmp)
+    }
+    for (i in 0 until 32) ed25519Store(out + i * 4, ed25519Load(accumulator + i * 4))
+}
+
+/** `out` = `r` + `k` * `a` mod L for the limbs `k` and `r` below L and the 32 bytes at `a` (any number below 2^256): 256
+ *  steps of a doubling, an addition of `k` and a masked select. `s` has 512 bytes as for the reduction. */
+@noinline trusted fun ed25519ScMultiplyAdd(out: int, k: int, a: int, r: int, s: int): void {
+    val accumulator = s
+    val sum = s + 128
+    val tmp = s + 256
+    for (i in 0 until 32) {
+        ed25519Store(accumulator + i * 4, secretU32(u32(0)))
+    }
+    for (step in 0 until 256) {
+        val position = 255 - step
+        val bit = (secretU32(u32(ablaUnsafeLoadU8(ed25519Pointer(a + (position >> 3))))) >> (position & 7)) &
+            secretU32(u32(1))
+        ed25519ScAdd(accumulator, accumulator, accumulator, tmp)
+        ed25519ScAdd(sum, accumulator, k, tmp)
+        val mask = ctFromLowBit(bit)
+        for (i in 0 until 32) {
+            ed25519Store(accumulator + i * 4,
+                ctSelect(mask, ed25519Load(sum + i * 4), ed25519Load(accumulator + i * 4)))
+        }
+    }
+    ed25519ScAdd(out, accumulator, r, tmp)
+}
+// END ED25519 SECRET CORE
+
+// --- What is public below: lengths, the checks of a verification, and the constants. Nothing here is read by tools/test-ct.sh.
+private trusted fun ed25519Wipe(address: int, size: int): void {
+    for (at in 0 until size) ablaUnsafeVolatileStoreU8(address + at, 0)
+}
+
+private fun ed25519Hex(text: string): string = hexDecode(text)
+
+/** The 32 bytes of `bytes` as limbs at `address`. */
+private trusted fun ed25519SetElement(address: int, bytes: string): void {
+    val source = ablaUnsafeStringAddress(bytes)
+    for (i in 0 until 32) {
+        ablaUnsafeStoreU32(ed25519Pointer(address + i * 4), ablaUnsafeLoadU8(ed25519Pointer(source + i)))
+    }
+}
+
+// Constants, as little-endian bytes (RFC 8032 section 5.1; derived from the definitions and checked by the tests).
+private fun ed25519TwoD(): string = ed25519Hex("59f1b226949bd6eb56b183829a14e00030d1f3eef2808e19e7fcdf56dcd90624")
+private fun ed25519D(): string = ed25519Hex("a3785913ca4deb75abd841414d0a700098e879777940c78c73fe6f2bee6c0352")
+private fun ed25519SqrtMinusOne(): string = ed25519Hex("b0a00e4a271beec478e42fad0618432fa7d7fb3d99004d2b0bdfc14f8024832b")
+private fun ed25519BaseX(): string = ed25519Hex("1ad5258f602d56c9b2a7259560c72c695cdcd6fd31e2a4c0fe536ecdd3366921")
+private fun ed25519BaseY(): string = ed25519Hex("5866666666666666666666666666666666666666666666666666666666666666")
+private fun ed25519BaseT(): string = ed25519Hex("a3ddb7a5b38ade6df5525177809ff0207de3ab648e4eea6665768bd70f5f8767")
+private fun ed25519OrderBytes(): string = ed25519Hex("edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010")
+
+private fun ed25519One(): string = ed25519Hex("0100000000000000000000000000000000000000000000000000000000000000")
+
+/** Sets the point at `address` to (x, y, 1, t) from three 32-byte strings. */
+private trusted fun ed25519SetPoint(address: int, x: string, y: string, t: string): void {
+    ed25519SetElement(address, x)
+    ed25519SetElement(address + 128, y)
+    ed25519SetElement(address + 256, ed25519One())
+    ed25519SetElement(address + 384, t)
+}
+
+private val ED25519_WORK = 7680
+
+/** A wiped work area with 2d in it. */
+private trusted fun ed25519Allocate(): int {
+    val w = cryptoAllocate(ED25519_WORK)
+    ed25519Wipe(w, ED25519_WORK)
+    ed25519SetElement(w + 3584, ed25519TwoD())
+    ed25519SetElement(w + 6784, ed25519D())
+    ed25519SetElement(w + 6912, ed25519SqrtMinusOne())
+    w
+}
+
+private trusted fun ed25519Release(w: int): void {
+    ed25519Wipe(w, ED25519_WORK)
+    ablaUnsafeFree(ablaUnsafePointerOffset(ablaUnsafeNullPointer(), w))
+}
+
+private trusted fun ed25519ReadBytes(address: int, count: int): string {
+    val bytes: array<int> = []
+    for (i in 0 until count) bytes.append(ablaUnsafeLoadU8(ed25519Pointer(address + i)))
+    cryptoByteString(bytes)
+}
+
+/** The 32 bytes of the encoded product of `scalar` (32 bytes) and the base point. */
+private @noinline trusted fun ed25519MultiplyBase(scalar: string): string {
+    val w = ed25519Allocate()
+    ablaUnsafeCopyMemory(w, ablaUnsafeStringAddress(scalar), 32)
+    ed25519SetPoint(w + 128, ed25519BaseX(), ed25519BaseY(), ed25519BaseT())
+    ed25519Multiply(w)
+    val result = ed25519ReadBytes(w + 4864, 32)
+    ed25519Release(w)
+    result
+}
+
+/** The 64 bytes of `hash` reduced mod L, as 32 bytes. */
+private @noinline trusted fun ed25519ReduceHash(hash: string): string {
+    val w = cryptoAllocate(1152)
+    ed25519Wipe(w, 1152)
+    ablaUnsafeCopyMemory(w + 512, ablaUnsafeStringAddress(hash), 64)
+    ed25519ScReduce(w + 896, w + 512, w)
+    ed25519ScStore(w + 1024, w + 896)
+    val result = ed25519ReadBytes(w + 1024, 32)
+    ed25519Wipe(w, 1152)
+    ablaUnsafeFree(ablaUnsafePointerOffset(ablaUnsafeNullPointer(), w))
+    result
+}
+
+/** `r` + `k` * `a` mod L, the three given as 32 bytes (k and r below L). */
+private @noinline trusted fun ed25519MultiplyAdd(k: string, a: string, r: string): string {
+    val w = cryptoAllocate(1152)
+    ed25519Wipe(w, 1152)
+    ablaUnsafeCopyMemory(w + 576, ablaUnsafeStringAddress(a), 32)
+    ablaUnsafeCopyMemory(w + 1056, ablaUnsafeStringAddress(k), 32)
+    ablaUnsafeCopyMemory(w + 1088, ablaUnsafeStringAddress(r), 32)
+    ed25519ScLoad(w + 640, w + 1056)
+    ed25519ScLoad(w + 768, w + 1088)
+    ed25519ScMultiplyAdd(w + 896, w + 640, w + 576, w + 768, w)
+    ed25519ScStore(w + 1024, w + 896)
+    val result = ed25519ReadBytes(w + 1024, 32)
+    ed25519Wipe(w, 1152)
+    ablaUnsafeFree(ablaUnsafePointerOffset(ablaUnsafeNullPointer(), w))
+    result
+}
+
+/** The clamped scalar of RFC 8032 section 5.1.5, from the first half of the seed's hash. */
+private fun ed25519Clamp(hash: string): string {
+    val bytes: array<int> = []
+    for (i in 0 until 32) bytes.append(hash[i])
+    bytes[0] = bytes[0] & 248
+    bytes[31] = (bytes[31] & 127) | 64
+    cryptoByteString(bytes)
+}
+
+/** The public key (32 bytes) of a private key (a 32-byte seed): RFC 8032 section 5.1.5. */
+fun ed25519PublicKey(seed: string): CryptoResult {
+    if (seed.size != 32) return cryptoFailed("ed25519: the seed is 32 bytes")
+    val result = CryptoResult(ed25519MultiplyBase(ed25519Clamp(sha512(seed))), true, "")
+    ctScrubStack2048()
+    return result
+}
+
+/** The signature (64 bytes) of `message` under the private key `seed` (32 bytes): RFC 8032 section 5.1.6. Deterministic:
+ *  the same seed and message give the same signature. */
+fun ed25519Sign(seed: string, message: string): CryptoResult {
+    if (seed.size != 32) return cryptoFailed("ed25519: the seed is 32 bytes")
+    val hash = sha512(seed)
+    val scalar = ed25519Clamp(hash)
+    val publicKey = ed25519MultiplyBase(scalar)
+    val nonce = ed25519ReduceHash(sha512(hash.slice(32, 64) + message))
+    val r = ed25519MultiplyBase(nonce)
+    val k = ed25519ReduceHash(sha512(r + publicKey + message))
+    val s = ed25519MultiplyAdd(k, scalar, nonce)
+    ctScrubStack2048()
+    return CryptoResult(r + s, true, "")
+}
+
+/** Whether the 32 bytes are a number below L (public). */
+private fun ed25519BelowOrder(bytes: string): bool {
+    val order = ed25519OrderBytes()
+    var i = 31
+    while (i >= 0) {
+        if (bytes[i] < order[i]) return true
+        if (bytes[i] > order[i]) return false
+        i = i - 1
+    }
+    false
+}
+
+/** Whether the 32 bytes are a number below p = 2^255 - 19 once bit 255 is cleared (public). */
+private fun ed25519BelowPrime(bytes: string): bool {
+    if ((bytes[31] & 127) != 127) return true
+    for (i in 1 until 31) if (bytes[i] != 255) return true
+    bytes[0] < 237
+}
+
+/** z^(2^252 - 3) into `out` (RFC 8032's "(p - 5) / 8" power), by the chain of the inverse. `f` has four elements, `m` is the
+ *  multiplication's scratch. */
+private trusted fun ed25519Pow2523(out: int, z: int, f: int, m: int): void {
+    val t0 = f
+    val t1 = f + 128
+    val t2 = f + 256
+    val t3 = f + 384
+    x25519Multiply(t0, z, z, m)
+    x25519Copy(t1, t0)
+    x25519SquareTimes(t1, 2, m)
+    x25519Multiply(t1, z, t1, m)
+    x25519Multiply(t0, t0, t1, m)
+    x25519Multiply(t2, t0, t0, m)
+    x25519Multiply(t1, t1, t2, m)
+    x25519Copy(t2, t1)
+    x25519SquareTimes(t2, 5, m)
+    x25519Multiply(t1, t2, t1, m)
+    x25519Copy(t2, t1)
+    x25519SquareTimes(t2, 10, m)
+    x25519Multiply(t2, t2, t1, m)
+    x25519Copy(t3, t2)
+    x25519SquareTimes(t3, 20, m)
+    x25519Multiply(t2, t3, t2, m)
+    x25519SquareTimes(t2, 10, m)
+    x25519Multiply(t1, t2, t1, m)
+    x25519Copy(t2, t1)
+    x25519SquareTimes(t2, 50, m)
+    x25519Multiply(t2, t2, t1, m)
+    x25519Copy(t3, t2)
+    x25519SquareTimes(t3, 100, m)
+    x25519Multiply(t2, t3, t2, m)
+    x25519SquareTimes(t2, 50, m)
+    x25519Multiply(t1, t2, t1, m)              // z^(2^250 - 1)
+    x25519SquareTimes(t1, 2, m)                // z^(2^252 - 4)
+    x25519Multiply(out, t1, z, m)              // z^(2^252 - 3)
+}
+
+/** The 32 bytes the element at `a` packs to. */
+private trusted fun ed25519PackBytes(w: int, a: int): string {
+    x25519Pack(w + 7552, a, w + 4608, w + 4736)
+    ed25519ReadBytes(w + 7552, 32)
+}
+
+/** Decodes the 32-byte `encoded` point (RFC 8032 section 5.1.3) into the point at `point` with its x negated (what
+ *  verification adds), or says it is not a point. Public input: the work is not constant-time. */
+private trusted fun ed25519DecodeNegated(w: int, encoded: string, point: int): bool {
+    if (!ed25519BelowPrime(encoded)) return false
+    val sign = (encoded[31] >> 7) & 1
+    val bytes: array<int> = []
+    for (i in 0 until 31) bytes.append(encoded[i])
+    bytes.append(encoded[31] & 127)
+    val y = w + 5632
+    val y2 = y + 128
+    val u = y + 256
+    val v = y + 384
+    val v3 = y + 512
+    val v7 = y + 640
+    val x = y + 768
+    val check = y + 896
+    val one = y + 1024
+    val m = w + 3200
+    ed25519SetElement(y, cryptoByteString(bytes))
+    ed25519SetElement(one, ed25519One())
+    x25519Multiply(y2, y, y, m)
+    x25519Sub(u, y2, one)                        // u = y^2 - 1
+    x25519Multiply(v, y2, w + 6784, m)
+    x25519Add(v, v, one)                         // v = d y^2 + 1
+    x25519Multiply(v3, v, v, m)
+    x25519Multiply(v3, v3, v, m)                 // v^3
+    x25519Multiply(v7, v3, v3, m)
+    x25519Multiply(v7, v7, v, m)
+    x25519Multiply(v7, v7, u, m)                 // u v^7
+    ed25519Pow2523(x, v7, w + 7040, m)
+    x25519Multiply(x, x, v3, m)
+    x25519Multiply(x, x, u, m)                   // x = u v^3 (u v^7)^((p - 5) / 8)
+    x25519Multiply(check, x, x, m)
+    x25519Multiply(check, check, v, m)           // v x^2
+    val checked = ed25519PackBytes(w, check)
+    if (checked != ed25519PackBytes(w, u)) {
+        // Not u: it must be -u, and then x is times the square root of -1.
+        x25519Sub(check, w + 3456, u)
+        if (checked != ed25519PackBytes(w, check)) return false
+        x25519Multiply(x, x, w + 6912, m)
+    }
+    val xBytes = ed25519PackBytes(w, x)
+    var zero = true
+    for (i in 0 until 32) if (xBytes[i] != 0) zero = false
+    if (zero && sign == 1) return false
+    // The point is (-x, y) when x has the sign asked for, else (x, y): x with the other sign is -x of the first.
+    if ((xBytes[0] & 1) == sign) x25519Sub(x, w + 3456, x)
+    x25519Copy(point, x)
+    x25519Copy(point + 128, y)
+    for (i in 0 until 32) {
+        ablaUnsafeStoreU32(ed25519Pointer(point + 256 + i * 4), if (i == 0) 1 else 0)
+    }
+    x25519Multiply(point + 384, x, y, m)
+    true
+}
+
+/** Whether `signature` (64 bytes) is `publicKey`'s signature of `message`: RFC 8032 section 5.1.7. The check is the strict
+ *  one: S is below L, the public key is a point with a canonical encoding, and the encoding of [S]B - [k]A is R's bytes
+ *  (so R is canonical and the cofactor is not cleared). Everything here is public, and it is as slow as signing. */
+trusted fun ed25519Verify(publicKey: string, message: string, signature: string): bool {
+    if (publicKey.size != 32 || signature.size != 64) return false
+    val r = signature.slice(0, 32)
+    val s = signature.slice(32, 64)
+    if (!ed25519BelowOrder(s)) return false
+    val k = ed25519ReduceHash(sha512(r + publicKey + message))
+    val w = ed25519Allocate()
+    var result = false
+    if (ed25519DecodeNegated(w, publicKey, w + 128)) {
+        // [k](-A) into the sum point at w + 5120, then [S]B added to it.
+        ablaUnsafeCopyMemory(w, ablaUnsafeStringAddress(k), 32)
+        ed25519ScalarMultiply(w)
+        ablaUnsafeCopyMemory(w + 5120, w + 640, 512)
+        ablaUnsafeCopyMemory(w, ablaUnsafeStringAddress(s), 32)
+        ed25519SetPoint(w + 128, ed25519BaseX(), ed25519BaseY(), ed25519BaseT())
+        ed25519ScalarMultiply(w)
+        ed25519Add(w + 640, w + 640, w + 5120, w)
+        ed25519Encode(w, w + 640, w + 4864)
+        result = ed25519ReadBytes(w + 4864, 32) == r
+    }
+    ed25519Release(w)
+    result
+}

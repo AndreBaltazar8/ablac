@@ -99,6 +99,31 @@ there). Speed: about 1.4 ms per product on a current x86-64 core. Tested against
 iterated function after 1, 1,000 and, with `X25519_MILLION=1`, 1,000,000 rounds; section 6.1's Alice and Bob), the
 refusal of the small-order points, and random scalars and points against the `openssl` CLI (`tools/test-x25519.sh`).
 
+## `abla/crypto/ed25519`
+
+Ed25519 ([RFC 8032](https://www.rfc-editor.org/rfc/rfc8032) section 5.1) in Abla, no OpenSSL, on every target, over the
+field of `abla/crypto/x25519`.
+
+| Function | Result |
+|---|---|
+| `ed25519PublicKey(seed)` | the 32-byte public key of a 32-byte private seed |
+| `ed25519Sign(seed, message)` | the 64-byte signature (R, then S), deterministic |
+| `ed25519Verify(publicKey, message, signature)` | whether it verifies; `false` for any wrong length |
+
+Verification is the strict one: S is below L, the public key is a point with a canonical encoding, and the encoding of
+[S]B - [k]A is R's bytes (so a non-canonical R, or S + L, is refused). The key, the nonce and S are secret; the message,
+the public key and R are public.
+
+Constant-time: the scalar multiplications that take a secret run 256 steps of a doubling, an addition (the unified,
+complete Edwards formula) and a masked select of the whole point, and the arithmetic modulo L is bit by bit with masked
+selects, so no branch, memory index or division depends on a secret. `tools/test-ct.sh` reads the core (`BEGIN ED25519
+SECRET CORE` in `abla/crypto/ed25519/entry.ab`) on x86-64, AArch64, Wasm and Xtensa, with deliberate leaks it has to catch.
+What it does not cover: the SHA-512 over strings (the seed's hash and the nonce's pass through ordinary strings, which
+are not wiped) and, as for X25519, a seed the caller holds in a string. Verification uses the same constant-time code for
+both products, so it is not faster than signing. Speed: about 8 ms to sign and 8 ms to verify on a current x86-64 core (a whole process run).
+Tested against RFC 8032 section 7.1's vectors, Wycheproof's 210 verification cases (`tests/vectors/crypto/wycheproof-ed25519.json`),
+and random seeds and messages against the `openssl` CLI both ways (`tools/test-ed25519.sh`).
+
 ## `abla/crypto/hosted`
 
 AES and RSA through OpenSSL's libcrypto, the provider `abla/tls/hosted` already uses, 1.1.1

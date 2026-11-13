@@ -49,6 +49,7 @@ Built into the language rather than imported: `string`, arrays, `Map`,
 | `abla/crypto` | SHA-512, SHA-384, SHA-256, SHA-1, MD5, HMAC, PBKDF2, Base64, hexadecimal, constant-time comparison |
 | `abla/crypto/hkdf` | HKDF (RFC 5869) and TLS 1.3 HKDF-Expand-Label / Derive-Secret |
 | `abla/crypto/x25519` | X25519 (RFC 7748), constant-time, on every target |
+| `abla/crypto/ed25519` | Ed25519 (RFC 8032): keys, signatures, verification; constant-time on the secret paths |
 | `abla/crypto/aes`, `abla/crypto/rsa`, `abla/crypto/pure` | AES and RSA in Abla, no OpenSSL, on every target; what timing protection each has is documented |
 | `abla/crypto/hosted` | AES-GCM, AES-CBC, AES-ECB, RSA signatures and encryption, PEM, DER, X.509 and PKCS#12 keys, through OpenSSL |
 | `abla/date` | UTC calendar dates, ISO 8601 and HTTP dates |

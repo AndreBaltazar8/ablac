@@ -1,0 +1,112 @@
+// Ed25519 (RFC 8032): section 7.1's vectors (the empty message, one byte, two bytes, and SHA-512("abc")), refusals
+// (S at or above L, a flipped bit, wrong lengths, a public key that is not a point), a round trip, and Wycheproof's
+// 210 verification cases (tests/vectors/crypto/wycheproof-ed25519.json, given as the first argument): "valid" must verify,
+// "invalid" must not, and "acceptable" (the ones whose answer the standard leaves open) may do either. Prints
+// "ed25519 ok"; tools/test-ed25519.sh runs it and compares the rest with openssl.
+import "abla/io"
+import "abla/crypto"
+import "abla/crypto/ed25519"
+import "abla/json"
+import "abla/process/arguments"
+import "abla/sys/linux"
+
+var failures = 0
+
+fun fail(what: string): void {
+    failures = failures + 1
+    if (failures < 40) println("FAIL $what")
+    return
+}
+
+fun vector(name: string, seed: string, publicKey: string, message: string, signature: string): void {
+    val s = hexDecode(seed)
+    val m = hexDecode(message)
+    val pk = ed25519PublicKey(s)
+    if (!pk.ok || hexEncode(pk.bytes) != publicKey) fail("$name: public key ${hexEncode(pk.bytes)}")
+    val sig = ed25519Sign(s, m)
+    if (!sig.ok || hexEncode(sig.bytes) != signature) fail("$name: signature ${hexEncode(sig.bytes)}")
+    if (!ed25519Verify(hexDecode(publicKey), m, hexDecode(signature))) fail("$name: verification failed")
+    if (m.size > 0 && ed25519Verify(hexDecode(publicKey), m.slice(1, m.size), hexDecode(signature))) {
+        fail("$name: a shortened message verified")
+    }
+    if (ed25519Verify(hexDecode(publicKey), m + "x", hexDecode(signature))) fail("$name: a longer message verified")
+}
+
+fun flip(text: string, index: int): string {
+    val bytes: array<int> = []
+    for (i in 0 until text.size) bytes.append(if (i == index) text[i] ^ 1 else text[i])
+    cryptoByteString(bytes)
+}
+
+fun wycheproof(path: string): int {
+    val parsed = jsonParse(linuxReadFile(path, 16777216))
+    if (!parsed.succeeded) {
+        fail("the Wycheproof file did not parse")
+        return 0
+    }
+    var count = 0
+    val groups = parsed.value.get("testGroups")
+    for (g in 0 until groups.size()) {
+        val group = groups.at(g)
+        val publicKey = hexDecode(group.get("publicKey").getString("pk"))
+        val tests = group.get("tests")
+        for (t in 0 until tests.size()) {
+            val test = tests.at(t)
+            val result = test.getString("result")
+            val verified = ed25519Verify(publicKey, hexDecode(test.getString("msg")), hexDecode(test.getString("sig")))
+            val id = test.getInt("tcId")
+            if (result == "valid" && !verified) fail("Wycheproof $id (${test.getString("comment")}): a valid signature was refused")
+            if (result == "invalid" && verified) fail("Wycheproof $id (${test.getString("comment")}): an invalid signature was accepted")
+            count = count + 1
+        }
+    }
+    count
+}
+
+fun main: int {
+    vector("RFC 8032 test 1", "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+        "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a", "",
+        "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b")
+    vector("RFC 8032 test 2", "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+        "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c", "72",
+        "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00")
+    vector("RFC 8032 test 3", "c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7",
+        "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025", "af82",
+        "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a")
+    vector("RFC 8032 SHA(abc)", "833fe62409237b9d62ec77587520911e9a759cec1d19755b7da901b96dca3d42",
+        "ec172b93ad5e563bf4932c70e1245034c35467ef2efd4d64ebf819683467e2bf",
+        "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f",
+        "dc2a4459e7369633a52b1bf277839a00201009a3efbf3ecb69bea2186c26b58909351fc9ac90b3ecfdfbc7c66431e0303dca179c138ac17ad9bef1177331a704")
+    // Refusals.
+    val seed = hexDecode("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+    val publicKey = ed25519PublicKey(seed).bytes
+    val signature = ed25519Sign(seed, "message").bytes
+    if (!ed25519Verify(publicKey, "message", signature)) fail("a round trip")
+    for (index in [0, 31, 32, 63]) {
+        if (ed25519Verify(publicKey, "message", flip(signature, index))) fail("a signature with byte $index changed verified")
+    }
+    if (ed25519Verify(flip(publicKey, 5), "message", signature)) fail("another public key verified")
+    // S + L is the same signature mod L, and is refused (malleability).
+    val order = hexDecode("edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010")
+    val sBytes = signature.slice(32, 64)
+    var carry = 0
+    val malleable: array<int> = []
+    for (i in 0 until 32) {
+        val sum = sBytes[i] + order[i] + carry
+        malleable.append(sum & 255)
+        carry = sum >> 8
+    }
+    if (carry == 0 && ed25519Verify(publicKey, "message", signature.slice(0, 32) + cryptoByteString(malleable))) {
+        fail("S + L was accepted")
+    }
+    if (ed25519Verify(publicKey, "message", signature.slice(0, 63))) fail("a short signature was accepted")
+    if (ed25519Verify(publicKey.slice(0, 31), "message", signature)) fail("a short public key was accepted")
+    if (ed25519PublicKey("short").ok || ed25519Sign("short", "m").ok) fail("a wrong seed length was accepted")
+    // y = 2 is not on the curve (2^2 - 1 over d 2^2 + 1 is not a square): not a public key.
+    val offCurve = hexDecode("0200000000000000000000000000000000000000000000000000000000000000")
+    if (ed25519Verify(offCurve, "message", signature)) fail("a public key that is not a point verified")
+    var cases = 0
+    if (processArgumentCount() > 0) cases = wycheproof("${processArgument(0)}/wycheproof-ed25519.json")
+    if (failures == 0) println("ed25519 ok ($cases Wycheproof cases)")
+    failures
+}

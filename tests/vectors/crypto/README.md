@@ -12,3 +12,6 @@ published test keys. Fetched 2026-10-31.
   `aes_cbc_pkcs5`, `aes_gcm` (96-bit IV), `hmac_sha1/256/384/512`, `rsa_pkcs1_1024_sig_gen` (SHA-1),
   `rsa_pkcs1_2048_sig_gen` (SHA-256), `rsa_signature_2048_sha256`, `rsa_pkcs1_2048`, `rsa_oaep_2048_sha1_mgf1sha1`,
   `rsa_oaep_2048_sha256_mgf1sha256` (empty labels).
+- Wycheproof (Apache-2.0), C2SP/wycheproof `testvectors_v1/ed25519_test.json` (the last commit that touched it, a3d5d1423f2592d6646836a45a21a1b209da9f4d, fetched
+  2026-11-13), kept as the original JSON in `wycheproof-ed25519.json` (210 verification cases: valid, invalid and acceptable); read by
+  `tests/cases/ed25519/main.ab` through abla/json, run by `tools/test-ed25519.sh`.
