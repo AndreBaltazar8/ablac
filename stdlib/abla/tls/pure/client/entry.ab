@@ -43,6 +43,7 @@ val TLS_ALERT_DECRYPT_ERROR = 51
 val TLS_ALERT_PROTOCOL_VERSION = 70
 val TLS_ALERT_INTERNAL_ERROR = 80
 val TLS_ALERT_MISSING_EXTENSION = 109
+val TLS_ALERT_UNSUPPORTED_EXTENSION = 110
 
 /** The certificate check: the chain (DER, end entity first), the host name, the signature scheme of
  *  the CertificateVerify, the content that was signed and the signature. Returns "" when the chain is
@@ -327,6 +328,10 @@ private fun TlsClient.handleServerHello(message: string, body: string): void {
         this.fail(TLS_ALERT_ILLEGAL_PARAMETER, "tls: the ServerHello does not echo the session id")
         return
     }
+    if (hello.unlisted != -1) {
+        this.fail(TLS_ALERT_UNSUPPORTED_EXTENSION, "tls: the ServerHello carries an extension that was not asked for (${hello.unlisted})")
+        return
+    }
     var offered = false
     for (suite in this.config.suites) {
         if (suite == hello.cipherSuite) offered = true
@@ -425,6 +430,21 @@ private fun TlsClient.handleEncryptedExtensions(message: string, body: string): 
         this.fail(TLS_ALERT_DECODE_ERROR, parsed.error)
         return
     }
+    // RFC 8446 section 4.2: only extensions the ClientHello offered (or that answer it) come back, and only those
+    // allowed in EncryptedExtensions: the server_name acknowledgement (when a name was sent), supported_groups, ALPN.
+    // (max_fragment_length 1, record_size_limit 28 are answered when offered.)
+    val offeredTypes = tlsClientHelloExtensionTypes(this.firstHello)
+    val allowedHere: array<int> = [TLS_EXT_SUPPORTED_GROUPS]
+    for (candidate in [TLS_EXT_SERVER_NAME, 1, TLS_EXT_ALPN, 28]) {
+        for (offeredType in offeredTypes) {
+            if (offeredType == candidate) allowedHere.append(candidate)
+        }
+    }
+    val unlisted = tlsFirstUnlisted(parsed.extensions, allowedHere)
+    if (unlisted != -1) {
+        this.fail(TLS_ALERT_UNSUPPORTED_EXTENSION, "tls: EncryptedExtensions carries an extension that was not asked for ($unlisted)")
+        return
+    }
     if (parsed.alpn.size > 0) {
         var known = false
         for (name in this.config.alpn) {
@@ -445,6 +465,10 @@ private fun TlsClient.handleCertificate(message: string, body: string): void {
     val parsed = tlsParseCertificate(body)
     if (!parsed.ok) {
         this.fail(TLS_ALERT_DECODE_ERROR, parsed.error)
+        return
+    }
+    if (parsed.entryExtension != -1) {
+        this.fail(TLS_ALERT_UNSUPPORTED_EXTENSION, "tls: a certificate entry carries an extension that was not asked for (${parsed.entryExtension})")
         return
     }
     if (parsed.context.size != 0 || parsed.chain.size == 0) {
@@ -805,6 +829,23 @@ private fun TlsClient.startV12(message: string, body: string): void {
     // The subset needs the extended master secret and refuses renegotiation: a server without them is refused.
     if (!hello.extendedMasterSecret || !hello.secureRenegotiation) {
         this.fail(TLS_ALERT_HANDSHAKE_FAILURE, "tls: the server does not support the extended master secret")
+        return
+    }
+    // Only the extensions the ClientHello carried may answer it (RFC 5246 section 7.4.1.4); the subset needs no other.
+    // (supported_groups: some TLS 1.2 servers echo it in the ServerHello; it is ignored.)
+    val allowed12: array<int> = [23, 65281, 11, TLS_EXT_SUPPORTED_GROUPS]
+    if (tlsIsDnsName(this.config.host)) allowed12.append(TLS_EXT_SERVER_NAME)
+    if (this.config.alpn.size > 0) allowed12.append(TLS_EXT_ALPN)
+    var unlisted12 = -1
+    for (type in hello.extensionTypes) {
+        var known12 = false
+        for (candidate in allowed12) {
+            if (candidate == type) known12 = true
+        }
+        if (!known12 && unlisted12 == -1) unlisted12 = type
+    }
+    if (unlisted12 != -1) {
+        this.fail(TLS_ALERT_UNSUPPORTED_EXTENSION, "tls: the ServerHello carries an extension that was not asked for ($unlisted12)")
         return
     }
     // ALPN (RFC 7301): the server may name one of the protocols the client offered, nothing else.

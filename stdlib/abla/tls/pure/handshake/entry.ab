@@ -234,6 +234,18 @@ fun tlsBuildClientHello(random: string, sessionId: string, suites: array<int>, h
     tlsHandshakeMessage(TLS_CLIENT_HELLO, body)
 }
 
+/** The type of the first extension of `list` that is not among `allowed` (the ones the peer may send here), or -1. */
+fun tlsFirstUnlisted(list: array<TlsExtension>, allowed: array<int>): int {
+    for (extension in list) {
+        var known = false
+        for (type in allowed) {
+            if (type == extension.type) known = true
+        }
+        if (!known) return extension.type
+    }
+    -1
+}
+
 // ---- ServerHello and HelloRetryRequest ----
 /** The special random of a HelloRetryRequest (RFC 8446 section 4.1.3, SHA-256 of "HelloRetryRequest"). */
 fun tlsHelloRetryRandom(): string =
@@ -241,7 +253,10 @@ fun tlsHelloRetryRandom(): string =
 
 class TlsServerHello(val ok: bool, val error: string, val random: string, val sessionId: string,
     val cipherSuite: int, val retryRequest: bool, val selectedVersion: int, val shareGroup: int,
-    val shareKey: string, val cookie: string)
+    val shareKey: string, val cookie: string,
+    /** The first extension that a ServerHello (supported_versions, key_share) or a HelloRetryRequest (and cookie) may
+     *  not carry (RFC 8446 section 4.2), or -1. */
+    val unlisted: int = -1)
 
 private fun tlsBadServerHello(error: string): TlsServerHello =
     TlsServerHello(false, error, "", "", 0, false, 0, 0, "", "")
@@ -284,7 +299,9 @@ fun tlsParseServerHello(body: string): TlsServerHello {
         cookie = cookieReader.vec16()
         if (!cookieReader.finished() || cookie.size == 0) return tlsBadServerHello("tls: malformed cookie")
     }
-    TlsServerHello(true, "", random, sessionId, suite, retry, version, group, key, cookie)
+    val unlisted = tlsFirstUnlisted(extensions.list, if (retry) [TLS_EXT_SUPPORTED_VERSIONS, TLS_EXT_KEY_SHARE, TLS_EXT_COOKIE]
+        else [TLS_EXT_SUPPORTED_VERSIONS, TLS_EXT_KEY_SHARE])
+    TlsServerHello(true, "", random, sessionId, suite, retry, version, group, key, cookie, unlisted)
 }
 
 // ---- the encrypted flight ----
@@ -313,21 +330,26 @@ fun tlsParseEncryptedExtensions(body: string): TlsEncryptedExtensions {
 
 /** A Certificate message's chain, end entity first, as DER strings. `context` is the request context
  *  (empty from a server). */
-class TlsCertificateMessage(val ok: bool, val error: string, val context: string, val chain: array<string>)
+class TlsCertificateMessage(val ok: bool, val error: string, val context: string, val chain: array<string>,
+    /** The type of the first extension in a certificate entry (status_request, signed_certificate_timestamp, ...), or
+     *  -1: none was asked for, so one is unsolicited (RFC 8446 section 4.4.2). */
+    val entryExtension: int = -1)
 
 fun tlsParseCertificate(body: string): TlsCertificateMessage {
     val reader = tlsReader(body)
     val context = reader.vec8()
     val list = tlsReader(reader.vec24())
     val chain: array<string> = []
+    var entryExtension = -1
     while (list.remaining() > 0 && list.ok) {
         val der = list.vec24()
         val extensions = tlsParseExtensions(list)
         if (!list.ok || !extensions.ok) return TlsCertificateMessage(false, "tls: malformed Certificate", "", chain)
+        if (entryExtension == -1 && extensions.list.size > 0) entryExtension = extensions.list[0].type
         chain.append(der)
     }
     if (!reader.finished() || !list.ok) return TlsCertificateMessage(false, "tls: malformed Certificate", "", chain)
-    TlsCertificateMessage(true, "", context, chain)
+    TlsCertificateMessage(true, "", context, chain, entryExtension)
 }
 
 /** CertificateVerify: the signature scheme and the signature. */
@@ -413,6 +435,22 @@ fun tlsClientHelloGroups(hello: string): array<int> {
         while (list.remaining() > 1 && list.ok) groups.append(list.u16())
     }
     groups
+}
+
+/** The types of the extensions a ClientHello message carries. */
+fun tlsClientHelloExtensionTypes(hello: string): array<int> {
+    val types: array<int> = []
+    if (hello.size < 4) return types
+    val reader = tlsReader(hello.slice(4, hello.size))
+    reader.u16()
+    reader.bytes(32)
+    reader.vec8()
+    reader.vec16()
+    reader.vec8()
+    val extensions = tlsParseExtensions(reader)
+    if (!reader.ok || !extensions.ok) return types
+    for (extension in extensions.list) types.append(extension.type)
+    types
 }
 
 // ---- client authentication ----
