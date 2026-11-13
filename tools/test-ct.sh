@@ -24,6 +24,7 @@ sed -n '/^\/\/ BEGIN RSA SECRET BIGNUM PRIMITIVES$/,/^\/\/ END RSA SECRET BIGNUM
 sed -n '/^\/\/ BEGIN PBE SECRET CORES$/,/^\/\/ END PBE SECRET CORES$/p' stdlib/abla/crypto/pbe/entry.ab >> "$cases/fixture.ab"
 sed -n '/^\/\/ BEGIN P256 SECRET CORES$/,/^\/\/ END P256 SECRET CORES$/p' stdlib/abla/crypto/p256/entry.ab >> "$cases/fixture.ab"
 sed -n '/^\/\/ BEGIN PBE OWNER WIPE$/,/^\/\/ END PBE OWNER WIPE$/p' stdlib/abla/crypto/pbe/entry.ab >> "$cases/fixture.ab"
+sed -n '/^\/\/ BEGIN X25519 SECRET CORE$/,/^\/\/ END X25519 SECRET CORE$/p' stdlib/abla/crypto/x25519/entry.ab >> "$cases/fixture.ab"
 # Source-generated coverage for loops around the previously checked primitives.
 # No production edits or call exemptions: see generator's scope guards.
 # The AES functions that touch a key, as written (their allocating wrappers stay outside, see the generator).
@@ -58,6 +59,8 @@ fixtures=(
     ct_pbe_sha1:@0,@1,@2 ct_pbe_sha256:@0,@1,@2
     ct_pbe_hmac1:@0 ct_pbe_hmac256:@0 ct_pbe_xor1:@0 ct_pbe_xor256:@0
     ct_pbe_password_pad:@0,@1 ct_pbe_mac_compare:@0,@1
+    ct_fix_x25519_add:@0,@1,@2 ct_fix_x25519_sub:@0,@1,@2 ct_fix_x25519_mul:@0,@1,@2,@3
+    ct_fix_x25519_mul_constant:@0,@1 ct_fix_x25519_swap:0,@1,@2
 )
 for width in 1 3 128; do
     fixtures+=("ct_fix_inverse_$width:@0,@1" "ct_fix_gcd_$width:@0,@1"
@@ -67,7 +70,7 @@ while IFS= read -r spec; do fixtures+=("$spec"); done < "$cases/crypto-generated
 # Xtensa passes later pointer parameters on the stack; its checker cannot yet
 # taint those parameters, so this separate-pointer shape is read on these ABIs.
 host_fixtures=(ct_fix_wide_separate:@0,@1,@2,@3,@5)
-leaks=(ct_leak_branch:0 ct_leak_callee:0 ct_leak_callee_store:0 ct_leak_index:0 ct_leak_trap:0 ct_leak_compare:@0,@1 ct_leak_divide:0,1 ct_pbe_leak:@0)
+leaks=(ct_leak_branch:0 ct_leak_callee:0 ct_leak_callee_store:0 ct_leak_index:0 ct_leak_trap:0 ct_leak_compare:@0,@1 ct_leak_divide:0,1 ct_pbe_leak:@0 ct_x25519_leak_branch:0,@1,@2 ct_x25519_leak_index:@0,@1)
 while IFS= read -r spec; do leaks+=("$spec"); done < "$cases/crypto-generated.leaks"
 
 # Hand-written spill regressions ensure the test includes the actual assembly pattern.
@@ -180,6 +183,22 @@ p256_read() { # object, architecture (default x86_64)
         grep -q '^LEAK' "$out/$arch-p256-leak.log" || { cat "$out/$arch-p256-leak.log" >&2; exit 1; }
     done
     echo "ok   $arch P-256 cores: ${#specs[@]} read with their calls followed, 2 leaks caught"
+}
+
+# X25519: the ladder, the inverse, the pack and the whole scalar multiplication call the field routines, which stay
+# calls; they are read with those calls followed, and refused without following (the calls are what is covered).
+x25519_read() { # object, architecture (default x86_64)
+    local object=$1 arch=${2:-x86_64} specs=(ct_x25519_ladder:@0 ct_x25519_compute:@0 ct_x25519_invert:@0,@1,@2,@3 ct_x25519_pack:@0,@1,@2,@3)
+    $check --follow-calls "$arch" "$object" "${specs[@]}" > "$out/$arch-x25519.log" 2>&1 || {
+        cat "$out/$arch-x25519.log" >&2; echo "ct: a secret reached a branch or an address in X25519" >&2; exit 1
+    }
+    [[ $(grep -c '^ok.*following [1-9]' "$out/$arch-x25519.log") == ${#specs[@]} ]] || {
+        cat "$out/$arch-x25519.log" >&2; echo "ct: an X25519 read followed no call" >&2; exit 1
+    }
+    if $check "$arch" "$object" "${specs[@]}" > "$out/$arch-x25519-nofollow.log" 2>&1; then
+        echo "ct: the X25519 fixtures didn't need following their calls" >&2; exit 1
+    fi
+    echo "ok   $arch X25519: ${#specs[@]} entries read with their calls followed"
 }
 
 # Two rules of the checker, with hand-written controls: cqto defines rdx from rax (a secret left in rdx is not a secret
@@ -836,6 +855,8 @@ real_entries_run
 orchestration_read "$out/x86.o"
 worker_read "$out/x86.o"
 p256_read "$out/x86.o"
+
+x25519_read "$out/x86.o"
 division_read
 # The crypto allocation entry stays out of line in a release object: each export of the probe module, which reaches
 # the key and big-number allocations, calls the function in the section .text.abla_ct_allocate. (A function that
@@ -881,6 +902,8 @@ residue_a64_read
 orchestration_read "$out/aarch64.o" aarch64
 worker_read "$out/aarch64.o" aarch64
 p256_read "$out/aarch64.o" aarch64
+
+x25519_read "$out/aarch64.o" aarch64
 # A --fast build keeps every call: the checker follows each into its callee, defined in the same object.
 fast_read aarch64 "$out/aarch64-fast.o" "" "" "$cases/fast-known-aarch64.txt"
 
@@ -895,6 +918,8 @@ wasm_follow_read
 orchestration_read "$out/ct.wasm" wasm
 worker_read "$out/ct.wasm" wasm 5
 p256_read "$out/ct.wasm" wasm
+
+x25519_read "$out/ct.wasm" wasm
 # The --fast module keeps every call. Its inline assembly (the barrier of the constant-time primitives) builds on the
 # default in-process route since the WebAssembly asm parser is registered there (tools/test-wasm-ct-barrier.sh);
 # ABLA_KEEP_LLVM_TEXT is unset so that a developer shell with it set cannot hide a regression.
@@ -926,6 +951,8 @@ xtensa_follow_read
 orchestration_read "$out/xtensa.o" xtensa
 worker_read "$out/xtensa.o" xtensa
 p256_read "$out/xtensa.o" xtensa
+
+x25519_read "$out/xtensa.o" xtensa
 # The --fast object keeps every call, which the checker follows: all 63 fixtures come out clean (fast-known-xtensa.txt
 # is empty; a fixture the checker can't place would be listed there, class unplaced, see fast_class), and the 16 leak
 # controls are still found in unoptimised code.

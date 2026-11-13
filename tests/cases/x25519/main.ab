@@ -1,0 +1,92 @@
+// X25519 (RFC 7748): the two vectors of section 5.2, the iterated function of 5.2 after 1 and 1,000 rounds
+// (and 1,000,000 when run with the argument `million`), the Diffie-Hellman example of section 6.1, the
+// refusal of all-zero results, the input forms (a point with bit 255 set, a non-canonical point), and
+// a run against the openssl CLI is in tools/test-x25519.sh. Expected: "x25519 ok".
+import "abla/io"
+import "abla/sys/linux/process"
+import "abla/crypto"
+import "abla/crypto/x25519"
+
+var failures = 0
+
+fun check(name: string, actual: CryptoResult, expected: string): void {
+    if (!actual.ok) {
+        println("FAIL $name: ${actual.error}")
+        failures = failures + 1
+    } else if (hexEncode(actual.bytes) != expected) {
+        println("FAIL $name: ${hexEncode(actual.bytes)} != $expected")
+        failures = failures + 1
+    }
+}
+
+fun fromHex(text: string): string = hexDecode(text)
+
+fun iterate(rounds: int): string {
+    var k = fromHex("0900000000000000000000000000000000000000000000000000000000000000")
+    var u = k
+    for (i in 0 until rounds) {
+        val next = x25519(k, u)
+        u = k
+        k = next.bytes
+    }
+    k
+}
+
+fun main: int {
+    check("RFC 7748 5.2 vector 1",
+        x25519(fromHex("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4"),
+            fromHex("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c")),
+        "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552")
+    check("RFC 7748 5.2 vector 2",
+        x25519(fromHex("4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d"),
+            fromHex("e5210f12786811d3f4b7959d0538ae2c31dbe7106fc03c3efc4cd549c715a493")),
+        "95cbde9476e8907d7aade45cb4b873f88b595a68799fa152e6f8f7647aac7957")
+    val alice = fromHex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
+    val bob = fromHex("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb")
+    val alicePublic = "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"
+    val bobPublic = "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f"
+    check("RFC 7748 6.1 Alice's public key", x25519PublicKey(alice), alicePublic)
+    check("RFC 7748 6.1 Bob's public key", x25519PublicKey(bob), bobPublic)
+    check("RFC 7748 6.1 shared secret (Alice)", x25519(alice, fromHex(bobPublic)),
+        "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742")
+    check("RFC 7748 6.1 shared secret (Bob)", x25519(bob, fromHex(alicePublic)),
+        "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742")
+    if (hexEncode(iterate(1)) != "422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079") {
+        println("FAIL iterated 1: ${hexEncode(iterate(1))}")
+        failures = failures + 1
+    }
+    if (hexEncode(iterate(1000)) != "684cf59ba83309552800ef566f2f4d3c1c3887c49360e3875f2eb94d99532c51") {
+        println("FAIL iterated 1000: ${hexEncode(iterate(1000))}")
+        failures = failures + 1
+    }
+    if (linuxArgumentCount() > 0 && hexEncode(iterate(1000000)) !=
+        "7c3911e0ab2586fd864497297e575e6f3bc601c0883c30df5f4dd2d24f665424") {
+        println("FAIL iterated 1000000")
+        failures = failures + 1
+    }
+    // Bit 255 of the point is ignored, and a point of 2^255 - 19 and above is taken mod p: u = p + 9 is 9.
+    val nine = fromHex("0900000000000000000000000000000000000000000000000000000000000000")
+    val expected = x25519(alice, nine)
+    check("bit 255 ignored", x25519(alice, fromHex("0900000000000000000000000000000000000000000000000000000000000080")),
+        hexEncode(expected.bytes))
+    check("u = p + 9 is 9", x25519(alice, fromHex("f6ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f")),
+        hexEncode(expected.bytes))
+    // Small-order points give an all-zero secret: refused.
+    val zero = fromHex("0000000000000000000000000000000000000000000000000000000000000000")
+    val one = fromHex("0100000000000000000000000000000000000000000000000000000000000000")
+    val order8 = fromHex("e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800")
+    val order8b = fromHex("5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157")
+    val prime = fromHex("edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f")
+    for (point in [zero, one, order8, order8b, prime]) {
+        if (x25519(alice, point).ok) {
+            println("FAIL: a small-order point was accepted: ${hexEncode(point)}")
+            failures = failures + 1
+        }
+    }
+    if (x25519(alice, "short").ok || x25519("short", nine).ok) {
+        println("FAIL: a wrong length was accepted")
+        failures = failures + 1
+    }
+    if (failures == 0) println("x25519 ok")
+    failures
+}

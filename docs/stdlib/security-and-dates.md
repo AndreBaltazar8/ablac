@@ -77,6 +77,28 @@ Secrets only pass through `hmacSha1`/`hmacSha256`/`hmacSha384`/`hmacSha512` (the
 lengths, labels and contexts are public. Tested against all seven RFC 5869 vectors and the RFC 8448 early and derived
 secrets (`tools/test-hkdf.sh`).
 
+## `abla/crypto/x25519`
+
+X25519 ([RFC 7748](https://www.rfc-editor.org/rfc/rfc7748) section 5): Diffie-Hellman on Curve25519, in Abla, no
+OpenSSL, on every target.
+
+| Function | Result |
+|---|---|
+| `x25519(scalar, point)` | a `CryptoResult` of the 32-byte product; `ok` is false for a wrong length and for an all-zero result (a point of small order; TLS 1.3 aborts then) |
+| `x25519PublicKey(scalar)` | the public key of a private key: `x25519` of it and the base point 9 |
+
+A private key is any 32 random bytes; the function clamps it as the RFC says. Bit 255 of a point is ignored and a
+point at or above 2^255 - 19 is taken mod p, as the RFC says.
+
+It is constant-time: the Montgomery ladder runs its 255 steps and swaps by a mask on every bit, the field arithmetic
+(32 limbs of 8 bits in `secretU32`, so nothing wider than 32 bits is needed on any target) has no branch, memory index or
+division on a value, and the inverse is Fermat's. `tools/test-ct.sh` reads the core (`BEGIN X25519 SECRET CORE` in
+`abla/crypto/x25519/entry.ab`) on x86-64, AArch64, Wasm and Xtensa, with deliberate leaks that it has to catch. The wrapper wipes its
+memory and the stack below it (2,048 bytes) after each call, and nothing else (the scalar a caller holds in a string stays
+there). Speed: about 1.4 ms per product on a current x86-64 core. Tested against RFC 7748 (section 5.2's two vectors, the
+iterated function after 1, 1,000 and, with `X25519_MILLION=1`, 1,000,000 rounds; section 6.1's Alice and Bob), the
+refusal of the small-order points, and random scalars and points against the `openssl` CLI (`tools/test-x25519.sh`).
+
 ## `abla/crypto/hosted`
 
 AES and RSA through OpenSSL's libcrypto, the provider `abla/tls/hosted` already uses, 1.1.1
