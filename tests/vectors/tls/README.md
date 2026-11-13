@@ -6,3 +6,7 @@
   (fetched 2026-11-13 from https://www.rfc-editor.org/rfc/rfc8448.txt) by `tools/tls/extract-rfc8448.sh`; read
   by `tests/cases/tls-pure/keysched.ab`, run by `tools/test-tls-pure.sh`. The traces' keys are the RFC's published
   test keys.
+- `rfc8448-section5.txt`, `-section6.txt`, `-section7.txt`: the same extraction (`tools/tls/extract-rfc8448.sh rfc8448.txt N`)
+  of section 5 (HelloRetryRequest), 6 (Client Authentication) and 7 (Compatibility Mode: a 32-byte session id and
+  ChangeCipherSpec records). Section 7 is used by `tests/cases/tls-pure/client.ab`; 5 and 6 are kept for the
+  HelloRetryRequest and client-certificate tests (they need P-256 and the signature primitives).

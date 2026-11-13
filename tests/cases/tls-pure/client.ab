@@ -67,12 +67,13 @@ fun noRandom(count: int): string = ""
 
 fun newClient(): TlsClient {
     val hello = raw("{client}  construct a ClientHello handshake message", "ClientHello")
-    val config = TlsClientConfig("server", [TLS_SUITE_AES_128_GCM_SHA256, TLS_SUITE_CHACHA20_POLY1305_SHA256,
+    val sessionLength = hello[38]
+    val config =TlsClientConfig("server", [TLS_SUITE_AES_128_GCM_SHA256, TLS_SUITE_CHACHA20_POLY1305_SHA256,
         TLS_SUITE_AES_256_GCM_SHA384],
         [TLS_SIG_ECDSA_SECP256R1_SHA256, TLS_SIG_RSA_PSS_RSAE_SHA256, TLS_SIG_RSA_PSS_RSAE_SHA384,
          TLS_SIG_RSA_PSS_RSAE_SHA512, TLS_SIG_ED25519, TLS_SIG_ECDSA_SECP384R1_SHA384],
         [], verifier, noRandom)
-    tlsClientStartWith(config, hello, hello.slice(6, 38), "",
+    tlsClientStartWith(config, hello, hello.slice(6, 38), hello.slice(39, 39 + sessionLength),
         [TlsKeyPair(TLS_GROUP_X25519, raw("{client}  create an ephemeral x25519 key pair", "public key"),
             raw("{client}  create an ephemeral x25519 key pair", "private key"))], 769)
 }
@@ -183,6 +184,28 @@ fun main: int {
     client.takeOutput()
     client.feed(tlsPlaintextRecord(TLS_ALERT, 771, tlsU8(2) + tlsU8(40)))
     if (!client.failed() || client.error != "tls: the server sent alert 40") fail("a fatal alert: ${client.error}")
+
+    // Compatibility mode (section 7): a 32-byte session id; the server's ChangeCipherSpec after its
+    // ServerHello is ignored, and the client sends its own before its Finished.
+    lines = linuxReadFile("${processArgument(0)}/rfc8448-section7.txt", 4194304).split("\n")
+    client = newClient()
+    check("compat ClientHello record", client.takeOutput(), vector("{client}  send handshake record", "complete record", 1))
+    client.feed(raw("{server}  send handshake record", "complete record", 1))
+    client.feed(raw("{server}  send change_cipher_spec record", "complete record"))
+    if (client.failed()) fail("compat ServerHello or ChangeCipherSpec: ${client.error}")
+    client.feed(raw("{server}  send handshake record", "complete record", 2))
+    if (client.failed() || !client.connected()) fail("compat flight: ${client.error}")
+    check("compat second flight", client.takeOutput(),
+        vector("{client}  send change_cipher_spec record", "complete record") +
+        vector("{client}  send handshake record", "complete record", 2))
+    client.feed(raw("{server}  send alert record", "complete record"))
+    if (!client.closed()) fail("compat close_notify did not close")
+    check("compat client close_notify", client.takeOutput(), vector("{client}  send alert record", "complete record"))
+    // A ChangeCipherSpec right after the ClientHello (before any ServerHello) is refused.
+    client = newClient()
+    client.takeOutput()
+    client.feed(tlsPlaintextRecord(TLS_CHANGE_CIPHER_SPEC, 771, tlsU8(1)))
+    if (!client.failed()) fail("a ChangeCipherSpec before the ServerHello was accepted")
 
     if (failures > 0) {
         println("tls-pure client: $failures failures")
