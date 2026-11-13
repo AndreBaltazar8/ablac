@@ -335,6 +335,7 @@ test-serial: ablac
 	tools/test-crypto-encrypted-rsa.sh $(COMPILER)
 	tools/test-rsa-export.sh $(COMPILER)
 	tools/test-rsa-keygen.sh $(COMPILER)
+	tools/test-rsa-unbalanced.sh $(COMPILER)
 	tools/test-p256.sh $(COMPILER)
 	tools/test-x509.sh $(COMPILER)
 	tools/test-import-aliases.sh $(COMPILER)
