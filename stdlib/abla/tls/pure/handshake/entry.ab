@@ -144,18 +144,13 @@ fun tlsParseExtensions(var reader: TlsReader): TlsExtensions {
     val block = tlsReader(reader.vec16())
     val list: array<TlsExtension> = []
     if (!reader.ok) return TlsExtensions(false, list, "tls: truncated extensions")
-    // Which types were seen: one bit per 16-bit type (a duplicate check that costs the same for 15 000 extensions as
-    // for 15).
-    val seen: array<int> = []
-    while (seen.size < 1024) seen.append(0)
     while (block.remaining() > 0 && block.ok) {
         val type = block.u16()
         val data = block.vec16()
         if (!block.ok) return TlsExtensions(false, list, "tls: truncated extension")
-        val word = type >> 6
-        val bit = 1 << (type & 63)
-        if ((seen[word] & bit) != 0) return TlsExtensions(false, list, "tls: duplicate extension $type")
-        seen[word] = seen[word] | bit
+        for (seen in list) {
+            if (seen.type == type) return TlsExtensions(false, list, "tls: duplicate extension $type")
+        }
         list.append(TlsExtension(type, data))
     }
     TlsExtensions(block.ok, list, if (block.ok) "" else "tls: truncated extensions")
@@ -561,58 +556,3 @@ fun tlsBuildCertificateRequest(context: string, schemes: array<int>): string {
 /** The RSA PKCS#1 v1.5 signature schemes: valid for certificate signatures and in TLS 1.2, never in a TLS 1.3
  *  CertificateVerify (RFC 8446 section 4.2.3). */
 fun tlsSchemeIsPkcs1(scheme: int): bool = scheme == 1025 || scheme == 1281 || scheme == 1537
-
-// ---- reassembling handshake messages from records, bounded ----
-/** The most body a handshake message may have, by type, checked as soon as its header is read (before the body is
- *  buffered): hellos 2^17, Certificate 2^16, everything else 2^14. A peer that is not authenticated yet cannot make
- *  the buffer grow beyond that. */
-fun tlsMessageLimit(type: int): int =
-    if (type == TLS_CLIENT_HELLO || type == TLS_SERVER_HELLO) 131072
-    else if (type == TLS_CERTIFICATE) 65536 else 16384
-
-/** The handshake bytes received and not yet taken as messages, kept as the pieces they came in: a message split over
- *  many records is joined once, when it is whole, not once per record (a chain of one-byte records would otherwise cost
- *  quadratic copying). */
-class TlsHandshakeBuffer(var parts: array<string>, var size: int)
-
-fun TlsHandshakeBuffer.add(data: string): void {
-    if (data.size == 0) return
-    this.parts.append(data)
-    this.size = this.size + data.size
-    return
-}
-
-fun TlsHandshakeBuffer.empty(): bool = this.size == 0
-
-/** The header of the first message, read from the first four bytes without joining the pieces; `complete` says whether
- *  the whole message is buffered. Fewer than four bytes: `ok` true, `complete` false, nothing known. */
-fun TlsHandshakeBuffer.header(): TlsMessageHeader {
-    if (this.size < 4) return TlsMessageHeader(true, false, 0, 0, 0)
-    var head = ""
-    var index = 0
-    while (head.size < 4 && index < this.parts.size) {
-        val piece = this.parts[index]
-        val wanted = 4 - head.size
-        head = head + (if (piece.size > wanted) piece.slice(0, wanted) else piece)
-        index = index + 1
-    }
-    val length = head[1] * 65536 + head[2] * 256 + head[3]
-    TlsMessageHeader(true, this.size >= 4 + length, head[0], length, 4 + length)
-}
-
-/** The first `total` bytes (a whole message, as `header()` said), joining the pieces; what follows stays buffered. */
-fun TlsHandshakeBuffer.take(total: int): string {
-    var joined = ""
-    if (this.parts.size == 1) joined = this.parts[0]
-    else {
-        var pieces = ""
-        for (piece in this.parts) pieces = pieces + piece
-        joined = pieces
-    }
-    val message = joined.slice(0, total)
-    val rest = joined.slice(total, joined.size)
-    this.parts = []
-    if (rest.size > 0) this.parts.append(rest)
-    this.size = rest.size
-    message
-}
