@@ -60,6 +60,13 @@ for kind in ed25519 p256 p384 rsa; do
     echo "$kind: ok"
 done
 echo "$runs handshakes (4 certificate types x 3 suites x 2 groups, the P-256 ones through a HelloRetryRequest)"
+# The hosted-API-compatible surface (abla/tls/pure: tlsConnectWithCa, TlsConnection, tlsLastError ...).
+"$compiler" build tests/cases/tls-pure/api.ab -o "$out/api" --no-cache
+start_server ed25519 -www -groups X25519
+result=$("$root/tools/run-limited.sh" "$out/api" "$port" "$out/ed25519.pem" "$out/rsa.pem") || { echo "tls-pure api: $result" >&2; head -5 "$out/server.log" >&2; exit 1; }
+[[ $result == 'tls-pure api ok' ]] || { echo "tls-pure api: $result" >&2; exit 1; }
+echo "$result"
+stop_server
 # A bulk transfer: a 6 MB file, many records; size and SHA-256 must match (Ed25519, checked in the program).
 "$compiler" build tests/cases/tls-pure/bulk.ab -o "$out/bulk" --no-cache
 mkdir -p "$out/www"

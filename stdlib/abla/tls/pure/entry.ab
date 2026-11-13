@@ -1,0 +1,164 @@
+// TLS 1.3 in Abla, with the calls of abla/tls/hosted (the OpenSSL-backed module): `tlsConnect`,
+// `tlsConnectWithCa`, `tlsUpgrade`, `TlsConnection` with `handle`, `read`, `write`, `setTimeouts`, `close`,
+// `tlsLastError` and `tlsAvailable`, so a program (and abla/http/tls, abla/websocket/tls) switches by changing
+// its import. No OpenSSL, no libc: abla/tls/pure/client over the socket of abla/sys/linux/net, the system trust
+// store (or a CA file) and abla/crypto/x509 for the certificate check.
+//
+// Differences from the hosted module, for now: TLS 1.3 only (a server that speaks only TLS 1.2 fails the
+// handshake), no client certificates (tlsConnectWithIdentity, TlsClientIdentity), no server side
+// (tlsListen, tlsServerUpgrade), no Unix-socket upgrade. The last error is a stage, as there: "TLS failed at
+// handshake", "TLS failed at certificate_verification", "TLS read or write timed out"; `TlsConnection.detail`
+// has the specific reason of the last failure on that connection.
+
+import "abla/crypto/x509"
+import "abla/process/time"
+import "abla/sys/linux/net"
+import "abla/tls/pure/client"
+import "abla/tls/pure/connection"
+import "abla/tls/pure/verify"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+// The calling thread's last error, a stage code in thread-local storage (as in abla/tls/hosted).
+@inline
+trusted fun pureTlsErrorSlot(): i64* =
+    nativePointerFromAddress(nativeThreadLocalBytes("\x00\x00\x00\x00\x00\x00\x00\x00"))
+
+trusted fun pureTlsSetError(code: int): void {
+    ablaUnsafeStoreI64(pureTlsErrorSlot(), code)
+    return
+}
+
+private fun pureTlsErrorText(code: int): string = when (code) {
+    0 -> ""
+    1 -> "TLS failed at configuration"
+    2 -> "TLS failed at tcp_connect"
+    4 -> "TLS failed at trust_store"
+    8 -> "TLS failed at socket_attach"
+    9 -> "TLS failed at handshake"
+    10 -> "TLS failed at certificate_verification"
+    13 -> "TLS read or write timed out"
+    else -> "TLS failed"
+}
+
+fun tlsAvailable(): bool = true
+
+trusted fun tlsLastError(): string = pureTlsErrorText(ablaUnsafeLoadI64(pureTlsErrorSlot()))
+
+private val tlsDefaultReadWriteTimeoutMilliseconds = 30000
+
+// The system trust store, loaded on first use (parsing the bundle is not free) and kept.
+private var pureTlsSystemStoreLoaded = false
+private var pureTlsSystemStoreValue = X509TrustStore([])
+
+private fun pureTlsSystemStore(): X509TrustStore {
+    if (!pureTlsSystemStoreLoaded) {
+        pureTlsSystemStoreValue = x509SystemTrustStore()
+        pureTlsSystemStoreLoaded = true
+    }
+    pureTlsSystemStoreValue
+}
+
+private fun pureTlsNow(): int = realtimeMilliseconds() / 1000
+
+/** A TLS connection. `handle` is -1 for a connection that failed or was closed (tlsLastError says why). */
+resource class TlsConnection(var handle: int, var inner: TlsPureConnection) {
+    fun drop(): void {
+        this.handle = -1
+        return
+    }
+}
+
+private fun TlsConnection.record(): void {
+    pureTlsSetError(this.inner.stage)
+    return
+}
+
+private fun pureTlsStore(caPath: string): X509TrustStore? {
+    if (caPath == "") return pureTlsSystemStore()
+    val store = x509TrustStoreFromFile(caPath)
+    if (store == null || store.certificates.size == 0) return null
+    store
+}
+
+private fun pureTlsConfig(host: string, store: X509TrustStore): TlsClientConfig =
+    tlsClientConfig(host, tlsX509Verifier(store, pureTlsNow), tlsPureRandom)
+
+private fun pureTlsFailed(host: string, stage: int): TlsConnection {
+    val failed = TlsPureConnection(TcpConnection(-1), tlsClientNew(pureTlsConfig(host, X509TrustStore([]))),
+        pureTlsErrorText(stage), stage)
+    pureTlsSetError(stage)
+    TlsConnection(-1, move(failed))
+}
+
+private fun pureTlsOpen(host: string, caPath: string, port: int, timeoutMilliseconds: int,
+    readWriteTimeoutMilliseconds: int, deadline: int): TlsConnection {
+    if (port <= 0 || port > 65535 || timeoutMilliseconds <= 0 || timeoutMilliseconds > 600000) {
+        return pureTlsFailed(host, 1)
+    }
+    val store = pureTlsStore(caPath)
+    if (store == null) return pureTlsFailed(host, 4)
+    val inner = tlsPureConnect(pureTlsConfig(host, store), port, timeoutMilliseconds,
+        readWriteTimeoutMilliseconds, deadline)
+    pureTlsSetError(inner.stage)
+    val handle = if (inner.ok()) inner.tcp.descriptor else -1
+    TlsConnection(handle, move(inner))
+}
+
+/** Connects to host:port over TLS 1.3, verifying the certificate chain against the system trust store and
+ *  the host name. Check `handle != -1`; `tlsLastError()` says why not. */
+fun tlsConnect(host: string, port: int = 443, timeoutMilliseconds: int = 5000,
+    readWriteTimeoutMilliseconds: int = tlsDefaultReadWriteTimeoutMilliseconds,
+    deadline: int = 0): TlsConnection =
+    pureTlsOpen(host, "", port, timeoutMilliseconds, readWriteTimeoutMilliseconds, deadline)
+
+/** As tlsConnect, trusting the CA file at `caPath` (PEM, one or more certificates) instead of the system store. */
+fun tlsConnectWithCa(host: string, caPath: string, port: int = 443, timeoutMilliseconds: int = 5000,
+    readWriteTimeoutMilliseconds: int = tlsDefaultReadWriteTimeoutMilliseconds): TlsConnection =
+    pureTlsOpen(host, caPath, port, timeoutMilliseconds, readWriteTimeoutMilliseconds, 0)
+
+/** Takes ownership of an established TCP socket, including on failure; verification is as in tlsConnect. */
+fun tlsUpgrade(var connection: TcpConnection, host: string, caPath: string = "", timeoutMilliseconds: int = 5000,
+    readWriteTimeoutMilliseconds: int = tlsDefaultReadWriteTimeoutMilliseconds): TlsConnection {
+    val store = pureTlsStore(caPath)
+    if (store == null) {
+        pureTlsSetError(4)
+        connection.close()
+        return pureTlsFailed(host, 4)
+    }
+    val inner = tlsPureUpgrade(connection, pureTlsConfig(host, store), timeoutMilliseconds,
+        readWriteTimeoutMilliseconds, 0)
+    pureTlsSetError(inner.stage)
+    val handle = if (inner.ok()) inner.tcp.descriptor else -1
+    TlsConnection(handle, move(inner))
+}
+
+/** Up to `maximum` bytes. "" with `tlsLastError()` empty is the end of the stream; "" with an error is a
+ *  timeout (the read can be repeated) or a failure. */
+fun TlsConnection.read(maximum: int = 65536): string {
+    if (this.handle == -1) return ""
+    val data = this.inner.read(maximum)
+    this.record()
+    data
+}
+
+/** Sends `contents`; the bytes taken, or -1. A write that times out leaves the connection unusable. */
+fun TlsConnection.write(contents: string): int {
+    if (this.handle == -1) return -1
+    val written = this.inner.write(contents)
+    this.record()
+    written
+}
+
+/** Replaces the limits on one read and one write; 0 waits as long as it takes. */
+fun TlsConnection.setTimeouts(readMilliseconds: int, writeMilliseconds: int): bool =
+    this.handle != -1 && this.inner.tcp.setTimeouts(readMilliseconds, writeMilliseconds)
+
+/** The specific reason of the connection's last failure, "" if none. */
+fun TlsConnection.detail(): string = this.inner.lastError
+
+fun TlsConnection.close(): bool {
+    if (this.handle == -1) return true
+    this.handle = -1
+    this.inner.close()
+}

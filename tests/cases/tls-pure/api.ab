@@ -1,0 +1,76 @@
+// The hosted-API-compatible surface of abla/tls/pure (tlsConnect, tlsConnectWithCa, TlsConnection, tlsLastError)
+// against `openssl s_server -tls1_3 -www` (tools/test-tls-pure-interop.sh): the port, the server certificate (PEM),
+// and another certificate that does not match. A request and its response and the end of the stream
+// (read returns "" with no error), a read that times out and can be repeated, a connection to a closed port, a wrong
+// trust anchor, a wrong host name, a refused configuration, and close twice. Prints "tls-pure api ok".
+import "abla/io"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/tls/pure"
+
+var failures = 0
+
+fun fail(what: string): void {
+    failures = failures + 1
+    println("FAIL $what")
+    return
+}
+
+fun decimal(text: string): int {
+    var value = 0
+    for (i in 0 until text.size) value = value * 10 + (text[i] - 48)
+    value
+}
+
+fun main: int {
+    val port = decimal(processArgument(0))
+    val ca = processArgument(1)
+    val other = processArgument(2)
+    if (!tlsAvailable()) fail("tlsAvailable")
+
+    var connection = tlsConnectWithCa("localhost", ca, port, 5000, 5000)
+    if (connection.handle == -1) {
+        println("FAIL connect: ${tlsLastError()}")
+        return 1
+    }
+    // A read before any request times out, with the stage text, and can be repeated.
+    if (!connection.setTimeouts(200, 5000)) fail("setTimeouts")
+    val early = connection.read(100)
+    if (early != "" || tlsLastError() != "TLS read or write timed out") fail("a timed-out read: [$early] ${tlsLastError()}")
+    if (connection.handle == -1) fail("the handle closed on a read timeout")
+    connection.setTimeouts(5000, 5000)
+    val request = "GET / HTTP/1.0\r\n\r\n"
+    if (connection.write(request) != request.size) fail("write: ${tlsLastError()}")
+    var response = ""
+    var chunk = connection.read(1024)
+    while (chunk.size > 0) {
+        response = response + chunk
+        chunk = connection.read(1024)
+    }
+    if (tlsLastError() != "") fail("the end of the stream is not a clean one: ${tlsLastError()}")
+    if (response.size == 0) fail("no response")
+    if (!connection.close()) fail("close")
+    if (!connection.close()) fail("a second close")
+    if (connection.handle != -1) fail("the handle after close")
+    if (connection.read(10) != "" || connection.write("x") != -1) fail("use after close")
+
+    // Failures, each with its stage.
+    val untrusted = tlsConnectWithCa("localhost", other, port, 5000, 5000)
+    if (untrusted.handle != -1 || tlsLastError() != "TLS failed at certificate_verification") {
+        fail("an untrusted certificate: handle ${untrusted.handle} ${tlsLastError()}")
+    }
+    val wrongName = tlsConnectWithCa("example.invalid", ca, port, 5000, 5000)
+    if (wrongName.handle != -1) fail("a wrong host name was accepted")
+    val closedPort = tlsConnectWithCa("localhost", ca, 1, 2000, 2000)
+    if (closedPort.handle != -1 || tlsLastError() != "TLS failed at tcp_connect") {
+        fail("a closed port: handle ${closedPort.handle} ${tlsLastError()}")
+    }
+    val badPort = tlsConnectWithCa("localhost", ca, 70000, 2000, 2000)
+    if (badPort.handle != -1 || tlsLastError() != "TLS failed at configuration") fail("a bad port: ${tlsLastError()}")
+    val noCa = tlsConnectWithCa("localhost", "/nonexistent/ca.pem", port, 2000, 2000)
+    if (noCa.handle != -1 || tlsLastError() != "TLS failed at trust_store") fail("a missing CA file: ${tlsLastError()}")
+
+    if (failures > 0) return 1
+    println("tls-pure api ok")
+    0
+}
