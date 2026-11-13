@@ -1,0 +1,176 @@
+// Robustness of the abla/tls/pure codec and client against damaged input, deterministic (a fixed-seed
+// generator): the parsers get random bytes and mutated and truncated real messages and must return a
+// result (never read outside their input); the client is fed the RFC 8448 section 3 trace with bytes
+// flipped, truncated, inserted, repeated and re-chunked, and must end failed, still waiting, or (for
+// harmless changes) connected, never crash, hang or connect on a flight whose protected bytes changed.
+// Prints "tls-pure codec ok". Vectors: tests/vectors/tls/rfc8448-section3.txt (the first argument).
+import "abla/io"
+import "abla/crypto"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/text"
+import "abla/tls/pure/client"
+import "abla/tls/pure/handshake"
+import "abla/tls/pure/record"
+
+var failures = 0
+var lines: array<string> = []
+var seed = 12345
+
+fun fail(what: string): void {
+    failures = failures + 1
+    if (failures < 40) println("FAIL $what")
+    return
+}
+
+fun next(limit: int): int {
+    seed = (seed * 1103515245 + 12345) & 2147483647
+    (seed >> 8) % limit
+}
+
+fun vector(heading: string, name: string, occurrence: int = 1): string {
+    var seen = 0
+    for (line in lines) {
+        val parts = line.split("|")
+        if (parts.size == 3 && parts[0] == heading && parts[1] == name) {
+            seen = seen + 1
+            if (seen == occurrence) return hexDecode(parts[2])
+        }
+    }
+    fail("no vector $heading / $name #$occurrence")
+    ""
+}
+
+fun randomBytes(count: int): string {
+    val bytes: array<int> = []
+    for (i in 0 until count) bytes.append(next(256))
+    cryptoByteString(bytes)
+}
+
+fun mutate(text: string): string {
+    if (text.size == 0) return text
+    val kind = next(5)
+    val at = next(text.size)
+    if (kind == 0) return text.slice(0, at)
+    if (kind == 1) return text.slice(0, at) + randomBytes(1 + next(8)) + text.slice(at, text.size)
+    if (kind == 2) return text.slice(0, at) + text.slice(at + 1 + next(8) % (text.size - at), text.size)
+    if (kind == 3) return text + text.slice(0, at)
+    val bytes: array<int> = []
+    for (i in 0 until text.size) bytes.append(if (i == at) text[i] ^ (1 << next(8)) else text[i])
+    cryptoByteString(bytes)
+}
+
+fun verifier(chain: array<string>, host: string, scheme: int, content: string, signature: string): string = ""
+fun noRandom(count: int): string = ""
+
+fun newClient(): TlsClient {
+    val hello = vector("{client}  construct a ClientHello handshake message", "ClientHello")
+    val config = TlsClientConfig("server", [TLS_SUITE_AES_128_GCM_SHA256, TLS_SUITE_AES_256_GCM_SHA384],
+        [TLS_SIG_RSA_PSS_RSAE_SHA256, TLS_SIG_ED25519], [], verifier, noRandom)
+    tlsClientStartWith(config, hello, hello.slice(6, 38), "",
+        [TlsKeyPair(TLS_GROUP_X25519, vector("{client}  create an ephemeral x25519 key pair", "public key"),
+            vector("{client}  create an ephemeral x25519 key pair", "private key"))], 769)
+}
+
+fun feedChunked(var client: TlsClient, data: string): void {
+    var offset = 0
+    while (offset < data.size && !client.failed()) {
+        var end = offset + 1 + next(700)
+        if (end > data.size) end = data.size
+        client.feed(data.slice(offset, end))
+        offset = end
+    }
+    return
+}
+
+fun main: int {
+    lines = linuxReadFile("${processArgument(0)}/rfc8448-section3.txt", 4194304).split("\n")
+    val serverHello = vector("{server}  construct a ServerHello handshake message", "ServerHello")
+    val encrypted = vector("{server}  construct an EncryptedExtensions handshake message", "EncryptedExtensions")
+    val certificate = vector("{server}  construct a Certificate handshake message", "Certificate")
+    val certificateVerify = vector("{server}  construct a CertificateVerify handshake message", "CertificateVerify")
+    val ticket = vector("{server}  construct a NewSessionTicket handshake message", "NewSessionTicket")
+    val hello = vector("{client}  construct a ClientHello handshake message", "ClientHello")
+    val helloRecord = vector("{server}  send handshake record", "complete record", 1)
+    val flightRecord = vector("{server}  send handshake record", "complete record", 2)
+
+    // The parsers on random bytes and on damaged real messages: they must return.
+    for (round in 0 until 3000) {
+        val sample = randomBytes(next(300))
+        tlsParseServerHello(sample)
+        tlsParseEncryptedExtensions(sample)
+        tlsParseCertificate(sample)
+        tlsParseCertificateVerify(sample)
+        tlsParseNewSessionTicket(sample)
+        tlsParseExtensions(tlsReader(sample))
+        tlsParseMessageHeader(sample, next(10))
+        tlsParseRecordHeader(sample, next(10))
+    }
+    for (round in 0 until 3000) {
+        tlsParseServerHello(mutate(serverHello.slice(4, serverHello.size)))
+        tlsParseEncryptedExtensions(mutate(encrypted.slice(4, encrypted.size)))
+        tlsParseCertificate(mutate(certificate.slice(4, certificate.size)))
+        tlsParseCertificateVerify(mutate(certificateVerify.slice(4, certificateVerify.size)))
+        tlsParseNewSessionTicket(mutate(ticket.slice(4, ticket.size)))
+    }
+    // The undamaged messages parse.
+    if (!tlsParseServerHello(serverHello.slice(4, serverHello.size)).ok) fail("the real ServerHello did not parse")
+    if (!tlsParseCertificate(certificate.slice(4, certificate.size)).ok) fail("the real Certificate did not parse")
+    if (!tlsParseEncryptedExtensions(encrypted.slice(4, encrypted.size)).ok) fail("the real EncryptedExtensions did not parse")
+    // Our own ClientHello round trip: the fields come back out of the encoding.
+    val built = tlsBuildClientHello(randomBytes(32), randomBytes(32), [TLS_SUITE_AES_128_GCM_SHA256], "example.com",
+        [TLS_GROUP_X25519], [TlsKeyShare(TLS_GROUP_X25519, randomBytes(32))], [TLS_SIG_ED25519], ["h2", "http/1.1"], "")
+    val builtHeader = tlsParseMessageHeader(built, 0)
+    if (!builtHeader.ok || !builtHeader.complete || builtHeader.type != TLS_CLIENT_HELLO || builtHeader.total != built.size) {
+        fail("a built ClientHello does not frame")
+    }
+    if (tlsIsDnsName("127.0.0.1") || tlsIsDnsName("::1") || !tlsIsDnsName("example.com") || tlsIsDnsName("")) fail("tlsIsDnsName")
+
+    // The client on the trace with damage: it must stay up (no crash, no hang) and never connect on a
+    // changed protected flight.
+    var connectedOnDamage = 0
+    for (round in 0 until 600) {
+        val client = newClient()
+        client.takeOutput()
+        val damaged = mutate(flightRecord)
+        feedChunked(client, helloRecord)
+        feedChunked(client, damaged)
+        // Bytes appended after the whole record are the start of another record: not damage to it.
+        val intact = damaged.size >= flightRecord.size && damaged.slice(0, flightRecord.size) == flightRecord
+        if (client.connected() && !intact) connectedOnDamage = connectedOnDamage + 1
+        if (intact && !client.connected() && damaged.size == flightRecord.size) fail("the intact flight did not connect")
+    }
+    if (connectedOnDamage > 0) fail("$connectedOnDamage damaged flights connected")
+    for (round in 0 until 600) {
+        val client = newClient()
+        client.takeOutput()
+        feedChunked(client, mutate(helloRecord))
+        feedChunked(client, flightRecord)
+        if (client.connected() && !client.failed() && client.state != TLS_CLIENT_CONNECTED) fail("state")
+    }
+    // Random bytes at every stage, and the real flight in random chunks (which must connect).
+    for (round in 0 until 300) {
+        val client = newClient()
+        client.takeOutput()
+        feedChunked(client, randomBytes(next(2000)))
+        if (client.connected()) fail("random bytes connected")
+    }
+    for (round in 0 until 200) {
+        val client = newClient()
+        client.takeOutput()
+        feedChunked(client, helloRecord + flightRecord)
+        if (!client.connected()) fail("the real flight in random chunks did not connect: ${client.error}")
+    }
+    // A record header that claims more than 2^14 + 256 is refused at once, without waiting for the body.
+    val overflow = newClient()
+    overflow.takeOutput()
+    overflow.feed(cryptoByteString([22, 3, 3, 255, 255]))
+    if (!overflow.failed()) fail("an oversized record header was not refused")
+
+    if (failures > 0) {
+        println("tls-pure codec: $failures failures")
+        return 1
+    }
+    println("tls-pure codec ok")
+    0
+}

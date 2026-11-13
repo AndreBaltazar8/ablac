@@ -14,7 +14,7 @@ mkdir -p "$out/broken"
 for mode in release fast; do
     flags=(--no-cache)
     [[ $mode == fast ]] && flags+=(--fast)
-    for program in keysched client; do
+    for program in keysched client codec; do
         "$compiler" build "tests/cases/tls-pure/$program.ab" -o "$out/$program.$mode" "${flags[@]}"
         result=$("$root/tools/run-limited.sh" "$out/$program.$mode" tests/vectors/tls) || { echo "tls-pure $program ($mode): $result" >&2; exit 1; }
         [[ $result == "tls-pure $program ok" ]] || { echo "tls-pure $program ($mode): $result" >&2; exit 1; }
