@@ -36,6 +36,6 @@ docker run --rm --network none -v "$root:/opt/abla:ro" "$image" bash -ceu '
     printf "import \"abla/build\"\n@export(\"abla_app_answer\")\nfun answer: int = 42\n" > library.ab
     ablac build library.ab --emit shared-library -o library.so --no-cache
     test -s library.so
-    test "$(head -c 4 library.so | od -An -c | tr -d ' ')" = "177ELF"
+    test "$(head -c 4 library.so | od -An -c | tr -d "[:space:]")" = "177ELF"
 '
 echo 'toolchain without C development files: a libc-free program builds and runs, so does a shared library; one needing libc names what is missing'
