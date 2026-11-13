@@ -13,6 +13,7 @@ for source in "$cases"/*.ab; do
         delegate-get|delegate-local) expected=1,1,1 ;;
         delegate-set) expected=0,1,1 ;;
         member-unrelated|member-generic) expected=5,7 ;;
+        interface-class) expected=5,2 ;;
         operator-builtin|operator-compound) expected=5,3 ;;
         operator-scalar) expected=6,6 ;;
         operator-generic) expected=3,3 ;;
@@ -62,7 +63,7 @@ NODE
                 if [[ $name == readonly ]]; then
                     pos=$(offset '#lookup()')
                     grep '^note\[ct-jit\]: native at ' "$log" | grep -Fq "readonly.ab:$pos"
-                elif [[ $name == member-* || $name == operator-builtin || $name == operator-scalar || $name == operator-generic || $name == operator-compound || $name == operator-unary || $name == operator-string ]]; then
+                elif [[ $name == member-* || $name == interface-* || $name == operator-builtin || $name == operator-scalar || $name == operator-generic || $name == operator-compound || $name == operator-unary || $name == operator-string ]]; then
                     # X (a call of B.touch; the sum of two ints) and Y (a call of A.touch or of Box.plus: a write
                     # of `shared`).
                     # A Wasm slice carries the checker's resolved targets, so X reaches B.touch
