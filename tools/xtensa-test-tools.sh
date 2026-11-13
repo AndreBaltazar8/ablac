@@ -18,13 +18,18 @@ EOF_SHIM
 }
 
 abla_xtensa_test_build() (
-    local compiler=$1 tools_directory=$2 resolved root
+    local compiler=$1 tools_directory=$2 resolved root target
     shift 2
     # Installed launchers prepend their bundled LLVM after our PATH change.
     # For their Xtensa build only, run the same payload with the same installed
     # sysroot, leaving the test shim first. Other builds keep using the launcher.
     resolved=$(command -v "$compiler")
-    resolved=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$resolved")
+    # realpath without Python (macOS before 13 has no realpath, nor readlink -f): follow the file's links, then its directory's.
+    while [[ -L $resolved ]]; do
+        target=$(readlink "$resolved")
+        if [[ $target == /* ]]; then resolved=$target; else resolved=$(dirname "$resolved")/$target; fi
+    done
+    resolved=$(cd "$(dirname "$resolved")" && pwd -P)/$(basename "$resolved")
     root=$(dirname "$(dirname "$resolved")")
     if [[ -x $root/libexec/ablac.bin && -d $root/share/abla/stdlib && $resolved == "$root/bin/ablac" ]]; then
         compiler="$root/libexec/ablac.bin"

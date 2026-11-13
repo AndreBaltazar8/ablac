@@ -19,7 +19,7 @@ if [[ "$(uname -m)" == x86_64 ]]; then
     bottle="$RUNNER_TEMP/$formula--23.1.0.sonoma.bottle.tar.gz"
     token=$(curl -fsSL --retry 3 \
       "https://ghcr.io/token?service=ghcr.io&scope=repository:homebrew/core/$formula:pull" |
-      /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+      sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
     curl -fL --retry 3 -H "Authorization: Bearer $token" \
       "https://ghcr.io/v2/homebrew/core/$formula/blobs/sha256:$checksum" -o "$bottle"
     printf '%s  %s\n' "$checksum" "$bottle" | shasum -a 256 --check

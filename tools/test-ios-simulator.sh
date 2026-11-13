@@ -18,16 +18,13 @@ export ABLA_APPLE_SDK_IPHONESIMULATOR=${ABLA_APPLE_SDK_IPHONESIMULATOR:-$(xcrun 
 
 # Prove the package step runs after the child builds: no old archives or
 # framework may make an incorrectly ordered implementation pass.
-python3 - "$directory" <<'CLEAN'
-from pathlib import Path
-import shutil, sys
-root = Path(sys.argv[1])
-assert root.name == 'ios-target-test' and root.parent.name == 'build'
-for name in ['device', 'simulator', 'App.xcframework']:
-    path = root / name
-    if path.is_symlink(): path.unlink()
-    elif path.is_dir(): shutil.rmtree(path)
-    elif path.exists(): path.unlink()
+node - "$directory" <<'CLEAN'
+const fs = require("fs"), path = require("path");
+const root = process.argv[2];
+if (path.basename(root) !== "ios-target-test" || path.basename(path.dirname(root)) !== "build") throw new Error("unexpected directory " + root);
+for (const name of ["device", "simulator", "App.xcframework"]) {
+  fs.rmSync(path.join(root, name), { recursive: true, force: true });
+}
 CLEAN
 "$compiler" build tests/cases/ios-target/archives-package.ab \
     -o "$directory/archive-driver" --fast --no-cache
@@ -50,17 +47,18 @@ for slice in device simulator; do
     fi
 done
 plutil -convert json -o "$directory/xcframework.json" "$directory/App.xcframework/Info.plist"
-python3 - "$directory/xcframework.json" <<'PLIST'
-import json, sys
-libraries = json.load(open(sys.argv[1]))['AvailableLibraries']
-assert len(libraries) == 2, libraries
-assert {item.get('SupportedPlatformVariant', '') for item in libraries} == {'', 'simulator'}, libraries
-for item in libraries:
-    assert item['SupportedPlatform'] == 'ios', item
-    assert item['SupportedArchitectures'] == ['arm64'], item
-    assert item['LibraryPath'].endswith('.a'), item
-    assert item['HeadersPath'], item
-print('iOS XCFramework: separate arm64 device and Simulator libraries with headers')
+node - "$directory/xcframework.json" <<'PLIST'
+const assert = require("assert");
+const libraries = JSON.parse(require("fs").readFileSync(process.argv[2], "utf8")).AvailableLibraries;
+assert.strictEqual(libraries.length, 2, JSON.stringify(libraries));
+assert.deepStrictEqual(new Set(libraries.map((item) => item.SupportedPlatformVariant || "")), new Set(["", "simulator"]), JSON.stringify(libraries));
+for (const item of libraries) {
+  assert.strictEqual(item.SupportedPlatform, "ios", JSON.stringify(item));
+  assert.deepStrictEqual(item.SupportedArchitectures, ["arm64"], JSON.stringify(item));
+  assert.ok(item.LibraryPath.endsWith(".a"), JSON.stringify(item));
+  assert.ok(item.HeadersPath, JSON.stringify(item));
+}
+console.log("iOS XCFramework: separate arm64 device and Simulator libraries with headers");
 PLIST
 xcrun --sdk iphonesimulator clang \
     --target=arm64-apple-ios17.0-simulator \
@@ -81,46 +79,48 @@ codesign --force --sign - "$directory/ios-caller"
 codesign --force --sign - "$directory/ios-baseline"
 codesign --force --sign - "$directory/ios-deadline-negative"
 xcrun simctl list devices available --json > "$directory/simulators.json"
-python3 - "$directory/simulators.json" "$directory/ios-caller" "$directory/ios-baseline" "$directory/ios-deadline-negative" <<'SIM'
-import json, subprocess, sys
-from pathlib import Path
-all_devices = json.load(open(sys.argv[1]))['devices']
-devices = [device for runtime, group in all_devices.items()
-           if '.iOS-' in runtime for device in group if device.get('isAvailable')]
-assert devices, 'No available iOS Simulator runtime; this gate does not download one'
-devices.sort(key=lambda item: (item['state'] != 'Booted', item['name'], item['udid']))
-device = devices[0]
-udid = device['udid']
-booted_here = device['state'] != 'Booted'
-print('iOS Simulator:', device['name'], udid, flush=True)
-try:
-    if booted_here:
-        subprocess.run(['xcrun', 'simctl', 'boot', udid], check=True, timeout=60)
-    subprocess.run(['xcrun', 'simctl', 'bootstatus', udid, '-b'], check=True, timeout=240)
-    # A C-only process separates launch-service readiness from Abla startup.
-    print('iOS Simulator: launch pure C baseline', flush=True)
-    baseline = subprocess.run(['xcrun', 'simctl', 'spawn', udid, str(Path(sys.argv[3]).absolute())],
-                              check=True, text=True, stdout=subprocess.PIPE, timeout=120)
-    print(baseline.stdout, end='', flush=True)
-    assert 'pure C baseline ready' in baseline.stdout
-    print('iOS Simulator: deliberate execution-deadline control', flush=True)
-    negative = subprocess.run(['xcrun', 'simctl', 'spawn', udid, str(Path(sys.argv[4]).absolute())],
-                              text=True, capture_output=True, timeout=120)
-    print(negative.stdout, end='', flush=True)
-    print(negative.stderr, end='', file=sys.stderr, flush=True)
-    assert 'ios-deadline-control: waiting for SIGALRM' in negative.stderr
-    assert negative.returncode in (-14, 14, 142), negative.returncode
-    print('iOS Simulator: stalled C process stopped by SIGALRM', flush=True)
-    for attempt in range(3):
-        print('iOS Simulator: fresh Abla process', attempt + 1, flush=True)
-        # Launch may be slow before C main; the C watchdog bounds execution
-        # to 15 s. Keep stderr live to identify the last entered export.
-        result = subprocess.run(['xcrun', 'simctl', 'spawn', udid, str(Path(sys.argv[2]).absolute())],
-                                check=True, text=True, stdout=subprocess.PIPE, timeout=120)
-        print(result.stdout, end='', flush=True)
-        assert 'Abla C export returned 42' in result.stdout
-
-finally:
-    if booted_here:
-        subprocess.run(['xcrun', 'simctl', 'shutdown', udid], timeout=60, check=False)
+node - "$directory/simulators.json" "$directory/ios-caller" "$directory/ios-baseline" "$directory/ios-deadline-negative" <<'SIM'
+const assert = require("assert");
+const { spawnSync } = require("child_process");
+const fs = require("fs"), path = require("path");
+const [simulators, caller, baseline, negative] = process.argv.slice(2);
+const allDevices = JSON.parse(fs.readFileSync(simulators, "utf8")).devices;
+const devices = Object.entries(allDevices).filter(([runtime]) => runtime.includes(".iOS-"))
+  .flatMap(([, group]) => group.filter((device) => device.isAvailable));
+assert.ok(devices.length, "No available iOS Simulator runtime; this gate does not download one");
+const rank = (device) => (device.state !== "Booted" ? 1 : 0);
+devices.sort((a, b) => rank(a) - rank(b) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0) || (a.udid < b.udid ? -1 : a.udid > b.udid ? 1 : 0));
+const device = devices[0];
+const udid = device.udid;
+const bootedHere = device.state !== "Booted";
+console.log("iOS Simulator:", device.name, udid);
+const simctl = (args, options) => spawnSync("xcrun", ["simctl", ...args], { encoding: "utf8", ...options });
+const checked = (result, what) => { assert.strictEqual(result.status, 0, what + ": " + (result.status === null ? result.signal : result.status) + " " + (result.stderr || "")); return result; };
+try {
+  if (bootedHere) checked(simctl(["boot", udid], { timeout: 60000 }), "boot");
+  checked(simctl(["bootstatus", udid, "-b"], { timeout: 240000, stdio: "inherit" }), "bootstatus");
+  // A C-only process separates launch-service readiness from Abla startup.
+  console.log("iOS Simulator: launch pure C baseline");
+  const base = checked(simctl(["spawn", udid, path.resolve(baseline)], { timeout: 120000, stdio: ["ignore", "pipe", "inherit"] }), "baseline");
+  process.stdout.write(base.stdout);
+  assert.ok(base.stdout.includes("pure C baseline ready"));
+  console.log("iOS Simulator: deliberate execution-deadline control");
+  const control = simctl(["spawn", udid, path.resolve(negative)], { timeout: 120000 });
+  process.stdout.write(control.stdout || "");
+  process.stderr.write(control.stderr || "");
+  assert.ok((control.stderr || "").includes("ios-deadline-control: waiting for SIGALRM"));
+  // Killed by SIGALRM (Python's -14), or simctl reporting it as 14 or 142.
+  assert.ok(control.signal === "SIGALRM" || [14, 142].includes(control.status), String(control.status) + " " + control.signal);
+  console.log("iOS Simulator: stalled C process stopped by SIGALRM");
+  for (let attempt = 0; attempt < 3; attempt++) {
+    console.log("iOS Simulator: fresh Abla process", attempt + 1);
+    // Launch may be slow before C main; the C watchdog bounds execution to 15 s. Keep stderr live to identify the last
+    // entered export.
+    const result = checked(simctl(["spawn", udid, path.resolve(caller)], { timeout: 120000, stdio: ["ignore", "pipe", "inherit"] }), "abla caller");
+    process.stdout.write(result.stdout);
+    assert.ok(result.stdout.includes("Abla C export returned 42"));
+  }
+} finally {
+  if (bootedHere) simctl(["shutdown", udid], { timeout: 60000 });
+}
 SIM
