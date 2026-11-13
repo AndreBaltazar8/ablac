@@ -873,7 +873,6 @@ real_entries_run
 orchestration_read "$out/x86.o"
 worker_read "$out/x86.o"
 p256_read "$out/x86.o"
-
 x25519_read "$out/x86.o"
 ed25519_read "$out/x86.o"
 division_read
@@ -921,7 +920,6 @@ residue_a64_read
 orchestration_read "$out/aarch64.o" aarch64
 worker_read "$out/aarch64.o" aarch64
 p256_read "$out/aarch64.o" aarch64
-
 x25519_read "$out/aarch64.o" aarch64
 ed25519_read "$out/aarch64.o" aarch64
 # A --fast build keeps every call: the checker follows each into its callee, defined in the same object.
@@ -938,7 +936,6 @@ wasm_follow_read
 orchestration_read "$out/ct.wasm" wasm
 worker_read "$out/ct.wasm" wasm 5
 p256_read "$out/ct.wasm" wasm
-
 x25519_read "$out/ct.wasm" wasm
 ed25519_read "$out/ct.wasm" wasm
 # The --fast module keeps every call. Its inline assembly (the barrier of the constant-time primitives) builds on the
@@ -972,7 +969,6 @@ xtensa_follow_read
 orchestration_read "$out/xtensa.o" xtensa
 worker_read "$out/xtensa.o" xtensa
 p256_read "$out/xtensa.o" xtensa
-
 x25519_read "$out/xtensa.o" xtensa
 ed25519_read "$out/xtensa.o" xtensa
 # The --fast object keeps every call, which the checker follows: all 63 fixtures come out clean (fast-known-xtensa.txt
