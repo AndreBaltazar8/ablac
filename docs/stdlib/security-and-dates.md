@@ -470,9 +470,8 @@ the purpose and has the host name among its subjectAltName entries (the common n
 whole left label of a name with at least three labels and matches exactly one label; IP addresses match iPAddress entries byte for
 byte); name constraints (DNS, IP, directory name) of each CA apply to the names below it, a wildcard that covers an excluded name
 is refused, and e-mail or URI names and other name forms under constraints are refused as unchecked. Signatures: RSA PKCS#1 v1.5 and
-ECDSA with SHA-256, -384 or -512 on RSA, P-256 and P-384 keys; SHA-1 and MD5 signatures are refused, and RSASSA-PSS and Ed25519 are
-reported as unsupported until their verifiers exist. RSA keys under 2048 bits and unusual EC curves in a leaf or an intermediate
-are refused. Not done: revocation, certificate policies, the common name, the public suffix list, Ed25519/PSS signatures.
+ECDSA with SHA-256, -384 or -512 on RSA, P-256 and P-384 keys; RSASSA-PSS (SHA-2, MGF1 of the same hash, an explicit salt length; the issuer's key rsaEncryption) and Ed25519; SHA-1 and MD5 signatures are refused. RSA keys under 2048 bits and unusual EC curves in a leaf or an intermediate
+are refused. Not done: revocation, certificate policies, the common name, the public suffix list, id-RSASSA-PSS public keys.
 
 `abla/crypto/p384` has ECDSA verification on P-384 only (variable time, on public values), checked against Wycheproof's 504
 secp384r1/SHA-384 vectors. Tests (`tools/test-x509.sh`): the chains committed in `tests/cases/x509/chains` (made with `openssl` by

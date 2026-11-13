@@ -21,16 +21,20 @@ issue() {
         ec) openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$name.key" 2>/dev/null ;;
         ec384) openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-384 -out "$name.key" 2>/dev/null ;;
         rsa) openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$name.key" 2>/dev/null ;;
+        ed25519) openssl genpkey -algorithm ED25519 -out "$name.key" 2>/dev/null ;;
     esac
+    local hashflag="-$hash" sigopts=()
+    if [[ $key == ed25519 || $hash == none ]]; then hashflag=; fi
+    if [[ $hash == pss256 ]]; then hashflag=-sha256; sigopts=(-sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:32 -sigopt rsa_mgf1_md:sha256); fi
     openssl req -new -key "$name.key" -subj "$subject" -out "$name.csr"
     printf '[ext]\n%s\n' "$ext" > "$name.ext"
     serial=$((serial + 1))
     if [[ $issuer == self ]]; then
         openssl x509 -req -in "$name.csr" -signkey "$name.key" -extfile "$name.ext" -extensions ext -set_serial $serial \
-            -not_before "$from" -not_after "$to" -"$hash" -out "$name.pem" 2>/dev/null
+            -not_before "$from" -not_after "$to" $hashflag "${sigopts[@]}" -out "$name.pem" 2>/dev/null
     else
         openssl x509 -req -in "$name.csr" -CA "$issuer.pem" -CAkey "$issuer.key" -extfile "$name.ext" -extensions ext \
-            -set_serial $serial -not_before "$from" -not_after "$to" -"$hash" -out "$name.pem" 2>/dev/null
+            -set_serial $serial -not_before "$from" -not_after "$to" $hashflag "${sigopts[@]}" -out "$name.pem" 2>/dev/null
     fi
 }
 
@@ -49,6 +53,13 @@ issue inter-rsa "/CN=Test Intermediate RSA" rsa root-rsa "$CA"
 issue leaf-rsa "/CN=example.com" rsa inter-rsa "$SERVER"
 issue inter-ec-under-rsa "/CN=Test Intermediate EC under RSA" ec root-rsa "$CA"
 issue leaf-mixed "/CN=example.com" ec inter-ec-under-rsa "$SERVER"
+issue root-ed "/CN=Test Root Ed25519" ed25519 self "$CA"
+issue inter-ed "/CN=Test Intermediate Ed25519" ed25519 root-ed "$CA"
+issue leaf-ed "/CN=example.com" ed25519 inter-ed "$SERVER"
+issue leaf-ec-under-ed "/CN=example.com" ec inter-ed "$SERVER"
+issue root-pss "/CN=Test Root PSS" rsa self "$CA" "$FROM" "$TO" pss256
+issue inter-pss "/CN=Test Intermediate PSS" rsa root-pss "$CA" "$FROM" "$TO" pss256
+issue leaf-pss "/CN=example.com" ec inter-pss "$SERVER" "$FROM" "$TO" pss256
 issue root-ec384 "/CN=Test Root P-384" ec384 self "$CA"
 issue inter-ec384 "/CN=Test Intermediate P-384" ec384 root-ec384 "$CA" "$FROM" "$TO" sha384
 issue leaf-ec384 "/CN=example.com" ec384 inter-ec384 "$SERVER" "$FROM" "$TO" sha384
@@ -126,6 +137,9 @@ printf 'good-rsa\texample.com\t%s\tok\tleaf-rsa.pem\tinter-rsa.pem\troot-rsa.pem
 printf 'good-mixed\texample.com\t%s\tok\tleaf-mixed.pem\tinter-ec-under-rsa.pem\troot-rsa.pem\n' $NOW
 printf 'good-p384\texample.com\t%s\tok\tleaf-ec384.pem\tinter-ec384.pem\troot-ec384.pem\n' $NOW
 printf 'good-p256-under-p384\texample.com\t%s\tok\tleaf-ec-under-ec384.pem\tinter-ec384.pem\troot-ec384.pem\n' $NOW
+printf 'good-ed25519\texample.com\t%s\tok\tleaf-ed.pem\tinter-ed.pem\troot-ed.pem\n' $NOW
+printf 'good-ec-under-ed25519\texample.com\t%s\tok\tleaf-ec-under-ed.pem\tinter-ed.pem\troot-ed.pem\n' $NOW
+printf 'good-rsa-pss\texample.com\t%s\tok\tleaf-pss.pem\tinter-pss.pem\troot-pss.pem\n' $NOW
 printf 'good-noisy-chain\texample.com\t%s\tok\tleaf-ec.pem\tnoise-chain.pem\troot-ec.pem\n' $NOW
 printf 'wrong-host\tother.com\t%s\tnot valid for the host name\tleaf-ec.pem\tinter-ec.pem\troot-ec.pem\n' $NOW
 printf 'wildcard-match\ta.wild.example.com\t%s\tok\tleaf-ec.pem\tinter-ec.pem\troot-ec.pem\n' $NOW

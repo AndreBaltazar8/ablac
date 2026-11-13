@@ -12,16 +12,18 @@
 //   if (!result.ok) println(result.error)
 //
 // What is not done: revocation (CRL, OCSP), certificate policies (the extensions are read as present and ignored, also when
-// critical, as most TLS clients do), the common name as a host name (only subjectAltName names are matched), Ed25519 and
-// RSASSA-PSS signatures (a signature in either is reported as unsupported until their verifiers exist here), and ECDSA keys on
+// critical, as most TLS clients do), the common name as a host name (only subjectAltName names are matched), RSASSA-PSS
+// keys (id-RSASSA-PSS in a SubjectPublicKeyInfo; PSS signatures by an rsaEncryption key are checked), and ECDSA keys on
 // curves other than P-256 and P-384.
 
 import "abla/bytes"
 import "abla/crypto"
 import "abla/crypto/der"
+import "abla/crypto/ed25519"
 import "abla/crypto/p256"
 import "abla/crypto/p384"
 import "abla/crypto/rsa"
+import "abla/crypto/rsapss"
 import "abla/fs"
 
 // --- Names -------------------------------------------------------------------------------------------------------
@@ -650,6 +652,64 @@ private val X509_DIGEST_INFO_SHA512 = "\x30\x51\x30\x0d\x06\x09\x60\x86\x48\x01\
 private val X509_CURVE_P256 = "x\x06\x08\x2a\x86\x48\xce\x3d\x03\x01\x07"
 private val X509_CURVE_P384 = "x\x06\x05\x2b\x81\x04\x00\x22"
 
+/** The hash size in bits of a SHA-2 AlgorithmIdentifier at `item` (parameters NULL or absent), or 0. */
+private fun x509PssHash(der: string, item: DerItem): int {
+    if (!item.ok || item.tag != DER_SEQUENCE) return 0
+    val oid = derItem(der, item.start, item.end)
+    val text = x509OidText(der, oid)
+    if (oid.end != item.end) {
+        val parameters = derItem(der, oid.end, item.end)
+        if (!parameters.ok || parameters.tag != 5 || parameters.start != parameters.end || parameters.end != item.end) return 0
+    }
+    if (text == "2.16.840.1.101.3.4.2.1") return 256
+    if (text == "2.16.840.1.101.3.4.2.2") return 384
+    if (text == "2.16.840.1.101.3.4.2.3") return 512
+    0
+}
+
+/** RSASSA-PSS (RFC 4055): SHA-2 with MGF1 of the same hash and an explicit salt length; the SHA-1 defaults are refused. */
+private fun x509CheckPss(cert: X509Certificate, issuer: X509Certificate): string {
+    val bad = "unsupported RSASSA-PSS parameters"
+    if (cert.signatureParameters.size < 3) return bad
+    val der = cert.signatureParameters.slice(1, cert.signatureParameters.size)
+    val outer = derItem(der, 0, der.size)
+    if (!outer.ok || outer.tag != DER_SEQUENCE || outer.end != der.size) return bad
+    var at = outer.start
+    var hash = 0
+    var mask = 0
+    var salt = -1
+    var item = derItem(der, at, outer.end)
+    if (item.ok && item.tag == 160) {
+        hash = x509PssHash(der, derItem(der, item.start, item.end))
+        at = item.end
+        item = derItem(der, at, outer.end)
+    }
+    if (item.ok && item.tag == 161) {
+        val algorithm = derItem(der, item.start, item.end)
+        val oid = derItem(der, algorithm.start, algorithm.end)
+        if (!algorithm.ok || x509OidText(der, oid) != "1.2.840.113549.1.1.8") return bad
+        mask = x509PssHash(der, derItem(der, oid.end, algorithm.end))
+        at = item.end
+        item = derItem(der, at, outer.end)
+    }
+    if (item.ok && item.tag == 162) {
+        val number = derItem(der, item.start, item.end)
+        salt = x509SmallInteger(der, number)
+        at = item.end
+        item = derItem(der, at, outer.end)
+    }
+    if (item.ok && item.tag == 163) {
+        val trailer = derItem(der, item.start, item.end)
+        if (x509SmallInteger(der, trailer) != 1) return bad
+        at = item.end
+    }
+    if (at != outer.end || hash == 0 || mask != hash || salt < 0) return bad
+    if (issuer.keyOid != "1.2.840.113549.1.1.1") return "the issuer's key is not an RSA key"
+    val key = rsaPublicKeyFromDer(issuer.spki)
+    if (!key.ok()) return "the issuer's RSA key is unreadable"
+    if (rsaPssVerify(key, hash, cert.tbs, cert.signature, salt)) "" else "the signature is not valid"
+}
+
 /** The reason `cert`'s signature does not verify under the public key of `issuer`, or "" if it does. */
 fun x509CheckSignature(cert: X509Certificate, issuer: X509Certificate): string {
     val oid = cert.signatureOid
@@ -664,9 +724,12 @@ fun x509CheckSignature(cert: X509Certificate, issuer: X509Certificate): string {
     else if (oid == "1.2.840.10045.4.3.4") { ecdsa = true; hash = 512 }
     else if (oid == "1.2.840.113549.1.1.5" || oid == "1.2.840.10045.4.1" || oid == "1.2.840.113549.1.1.4") {
         return "the signature uses SHA-1 or MD5, which is not accepted"
-    } else if (oid == "1.2.840.113549.1.1.10") return "RSASSA-PSS signatures are not supported yet"
-    else if (oid == "1.3.101.112") return "Ed25519 signatures are not supported yet"
-    else return "unsupported signature algorithm $oid"
+    } else if (oid == "1.2.840.113549.1.1.10") return x509CheckPss(cert, issuer)
+    else if (oid == "1.3.101.112") {
+        if (cert.signatureParameters != "") return "bad signature algorithm parameters"
+        if (issuer.keyOid != "1.3.101.112" || issuer.keyBits.size != 32) return "the issuer's key is not an Ed25519 key"
+        return if (ed25519Verify(issuer.keyBits, cert.tbs, cert.signature)) "" else "the signature is not valid"
+    } else return "unsupported signature algorithm $oid"
     val digest = if (hash == 256) sha256(cert.tbs) else if (hash == 384) sha384(cert.tbs) else sha512(cert.tbs)
     if (rsa) {
         if (cert.signatureParameters != "" && cert.signatureParameters != "x\x05\x00") return "bad signature algorithm parameters"
