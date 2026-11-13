@@ -13,9 +13,11 @@
 
 import "abla/crypto/x509"
 import "abla/process/time"
+import "abla/sys/linux"
 import "abla/sys/linux/net"
 import "abla/tls/pure/client"
 import "abla/tls/pure/connection"
+import "abla/tls/pure/server"
 export import "abla/tls/pure/identity"
 import "abla/tls/pure/verify"
 import "abla/unsafe/memory"
@@ -39,6 +41,8 @@ private fun pureTlsErrorText(code: int): string = when (code) {
     8 -> "TLS failed at socket_attach"
     9 -> "TLS failed at handshake"
     10 -> "TLS failed at certificate_verification"
+    11 -> "TLS certificate, private key, or listener failed"
+    12 -> "TLS server handshake failed"
     13 -> "TLS read or write timed out"
     14 -> "TLS failed at client_identity: no usable client certificate and key"
     else -> "TLS failed"
@@ -88,8 +92,7 @@ private fun pureTlsConfig(host: string, store: X509TrustStore): TlsClientConfig 
     tlsClientConfig(host, tlsX509Verifier(store, pureTlsNow), tlsPureRandom)
 
 private fun pureTlsFailed(host: string, stage: int): TlsConnection {
-    val failed = TlsPureConnection(TcpConnection(-1), tlsClientNew(pureTlsConfig(host, X509TrustStore([]))),
-        pureTlsErrorText(stage), stage)
+    val failed = tlsPureFailedConnection(pureTlsConfig(host, X509TrustStore([])), pureTlsErrorText(stage), stage)
     pureTlsSetError(stage)
     TlsConnection(-1, move(failed))
 }
@@ -174,4 +177,78 @@ fun TlsConnection.close(): bool {
     if (this.handle == -1) return true
     this.handle = -1
     this.inner.close()
+}
+
+// ---- the server side: tlsListen, TlsListener, tlsServerUpgrade ----
+private fun pureTlsServerConfig(certificatePath: string, privateKeyPath: string): TlsServerConfig? {
+    val identity = tlsClientIdentityFromPem(linuxReadFile(certificatePath, 1048576), linuxReadFile(privateKeyPath, 1048576))
+    if (!identity.ok()) return null
+    tlsServerConfig(identity, tlsPureRandom)
+}
+
+/** A TLS server socket: connections are accepted with `accept` and handshaken with the listener's certificate. */
+resource class TlsListener(var handle: int, var listener: TcpListener, var config: TlsServerConfig) {
+    fun drop(): void {
+        this.handle = -1
+        return
+    }
+}
+
+/** Listens on host:port (an IPv6 or IPv4 address, "::" by default, with `dualStack` for both) with the certificate
+ *  chain (PEM, the leaf first) and private key (PEM) from the two files. Check `handle != -1`; `tlsLastError()` says
+ *  why not. Port 0 takes a free port (`localPort()`). */
+fun tlsListen(certificatePath: string, privateKeyPath: string, host: string = "::", port: int = 443,
+    backlog: int = 128, dualStack: bool = true): TlsListener {
+    val config = pureTlsServerConfig(certificatePath, privateKeyPath)
+    var listener = TcpListener(-1)
+    if (config != null && port >= 0 && port <= 65535 && backlog > 0 && backlog <= 4096) {
+        listener = if (linuxIpv6Words(host).size == 8) tcpListenIpv6(ipv6SocketAddress(host, port), backlog, dualStack)
+            else tcpListenAddress(ipv4SocketAddress(host, port), backlog)
+    }
+    if (config == null || listener.descriptor < 0) {
+        pureTlsSetError(11)
+        return TlsListener(-1, TcpListener(-1), tlsServerConfig(TlsClientIdentity([], [], pureTlsNoSignature), tlsPureRandom))
+    }
+    pureTlsSetError(0)
+    TlsListener(1, move(listener), config)
+}
+
+private fun pureTlsNoSignature(scheme: int, content: string): string = ""
+
+fun TlsListener.localPort(): int = if (this.handle != -1) this.listener.localPort() else -1
+
+/** Accepts one connection and runs its handshake; a client that connects and says nothing costs one handshake
+ *  timeout. Check `handle != -1` of the result. */
+fun TlsListener.accept(handshakeTimeoutMilliseconds: int = 5000,
+    readWriteTimeoutMilliseconds: int = tlsDefaultReadWriteTimeoutMilliseconds): TlsConnection {
+    if (this.handle == -1) return pureTlsFailed("", 12)
+    var tcp = this.listener.accept()
+    if (tcp.descriptor < 0) return pureTlsFailed("", 12)
+    val inner = tlsPureServerUpgrade(tcp, this.config, handshakeTimeoutMilliseconds, readWriteTimeoutMilliseconds, 0)
+    pureTlsSetError(if (inner.ok()) 0 else if (inner.stage == 13) 13 else 12)
+    val handle = if (inner.ok()) inner.tcp.descriptor else -1
+    TlsConnection(handle, move(inner))
+}
+
+fun TlsListener.close(): bool {
+    if (this.handle == -1) return true
+    this.handle = -1
+    this.listener.close()
+}
+
+/** Runs the server handshake on an established (accepted) TCP socket with the certificate and key from the files;
+ *  takes the socket, including on failure. */
+fun tlsServerUpgrade(var connection: TcpConnection, certificatePath: string, privateKeyPath: string,
+    handshakeTimeoutMilliseconds: int = 5000,
+    readWriteTimeoutMilliseconds: int = tlsDefaultReadWriteTimeoutMilliseconds, deadline: int = 0): TlsConnection {
+    val config = pureTlsServerConfig(certificatePath, privateKeyPath)
+    if (connection.descriptor < 0 || handshakeTimeoutMilliseconds <= 0 || handshakeTimeoutMilliseconds > 600000 ||
+        config == null) {
+        connection.close()
+        return pureTlsFailed("", 11)
+    }
+    val inner = tlsPureServerUpgrade(connection, config, handshakeTimeoutMilliseconds, readWriteTimeoutMilliseconds, deadline)
+    pureTlsSetError(if (inner.ok()) 0 else if (inner.stage == 13) 13 else 12)
+    val handle = if (inner.ok()) inner.tcp.descriptor else -1
+    TlsConnection(handle, move(inner))
 }

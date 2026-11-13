@@ -1,0 +1,232 @@
+// abla/tls/pure's server against abla/tls/pure's client, in one process with no sockets (bytes moved between the two
+// state machines), over certificates made by openssl (tools/test-tls-pure-interop.sh passes the directory with
+// <kind>.pem / <kind>.key for rsa, p256, ed25519 and client-<kind>.pem / .key): every key kind x every cipher
+// suite x a client that has an X25519 share and a server that wants X25519 or only P-256 (a HelloRetryRequest);
+// application data both ways in many records; ALPN; client certificates (accepted, absent and optional, absent and
+// required, rejected by the verifier); a client without TLS 1.3, no suite or group in common; close_notify;
+// KeyUpdate; damaged input to the server. Prints "tls-pure server ok".
+import "abla/io"
+import "abla/crypto"
+import "abla/crypto/x509"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/tls/pure/client"
+import "abla/tls/pure/handshake"
+import "abla/tls/pure/identity"
+import "abla/tls/pure/record"
+import "abla/tls/pure/server"
+import "abla/tls/pure/verify"
+
+var failures = 0
+var seed = 99
+
+fun fail(what: string): void {
+    failures = failures + 1
+    if (failures < 40) println("FAIL $what")
+    return
+}
+
+fun random(count: int): string {
+    val bytes: array<int> = []
+    for (i in 0 until count) {
+        seed = (seed * 1103515245 + 12345) & 2147483647
+        bytes.append((seed >> 8) & 255)
+    }
+    cryptoByteString(bytes)
+}
+
+fun read(path: string): string = linuxReadFile(path, 1048576)
+fun now(): int = 1794600000
+
+// Moves bytes between the two until neither has anything to say.
+fun pump(var client: TlsClient, var server: TlsServer): void {
+    var rounds = 0
+    while (rounds < 50) {
+        val toServer = client.takeOutput()
+        if (toServer.size > 0) server.feed(toServer)
+        val toClient = server.takeOutput()
+        if (toClient.size > 0) client.feed(toClient)
+        if (toServer.size == 0 && toClient.size == 0) return
+        rounds = rounds + 1
+    }
+    return
+}
+
+fun clientFor(store: X509TrustStore, host: string): TlsClient {
+    val config = tlsClientConfig(host, tlsX509Verifier(store, now), random)
+    tlsClientNew(config)
+}
+
+fun trusting(path: string): X509TrustStore = x509TrustStoreFromPem(read(path))
+
+fun acceptAny(chain: array<string>, scheme: int, content: string, signature: string): string = ""
+
+fun trustClient(store: X509TrustStore): (array<string>, int, string, string) -> string =
+    { chain: array<string>, scheme: int, content: string, signature: string ->
+        val verification = x509Verify(chain, store, X509Options("", now(), 8, 1))
+        if (!verification.ok) "client certificate: ${verification.error}"
+        else tlsVerifySignature(verification.path[0], scheme, content, signature)
+    }
+
+fun main: int {
+    val directory = processArgument(0)
+    // Every key kind x every suite x X25519 / HelloRetryRequest.
+    for (kind in ["ed25519", "p256", "rsa"]) {
+        val identity = tlsClientIdentityFromPem(read("$directory/$kind.pem"), read("$directory/$kind.key"))
+        if (!identity.ok()) {
+            fail("$kind identity: ${identity.error}")
+            continue
+        }
+        val store = trusting("$directory/$kind.pem")
+        for (suite in [TLS_SUITE_AES_128_GCM_SHA256, TLS_SUITE_AES_256_GCM_SHA384, TLS_SUITE_CHACHA20_POLY1305_SHA256]) {
+            for (groups in [[TLS_GROUP_X25519], [TLS_GROUP_SECP256R1]]) {
+                val name = "$kind suite $suite groups ${groups[0]}"
+                val config = TlsServerConfig(identity, [suite], groups, [], random, false, false, acceptAny)
+                var client = clientFor(store, "localhost")
+                var server = tlsServerNew(config)
+                pump(client, server)
+                if (client.failed() || server.failed()) {
+                    fail("$name: client [${client.error}] server [${server.error}]")
+                    continue
+                }
+                if (!client.connected() || !server.connected()) {
+                    fail("$name: not connected")
+                    continue
+                }
+                if (client.suite != suite) fail("$name: suite ${client.suite}")
+                if (groups[0] == TLS_GROUP_SECP256R1 && !client.retried) fail("$name: no HelloRetryRequest")
+                if (groups[0] == TLS_GROUP_X25519 && client.retried) fail("$name: an unneeded HelloRetryRequest")
+                // Application data both ways, a lot of it (many records).
+                val big = random(70000)
+                if (!client.send(big) || !server.send("hello from the server")) fail("$name: send refused")
+                pump(client, server)
+                if (server.takeApplicationData() != big) fail("$name: the server did not get the client's data")
+                if (client.takeApplicationData() != "hello from the server") fail("$name: the client did not get the server's data")
+                // close_notify both ways.
+                client.close()
+                pump(client, server)
+                if (!server.closed()) fail("$name: the server did not see close_notify")
+            }
+        }
+    }
+
+    // ALPN: the server's order wins; none in common is fatal; the client offering none is fine.
+    val ed = tlsClientIdentityFromPem(read("$directory/ed25519.pem"), read("$directory/ed25519.key"))
+    val edStore = trusting("$directory/ed25519.pem")
+    var alpnConfig = TlsServerConfig(ed, [TLS_SUITE_AES_128_GCM_SHA256], [TLS_GROUP_X25519], ["h2", "http/1.1"], random,
+        false, false, acceptAny)
+    var alpnClientConfig = TlsClientConfig("localhost", [TLS_SUITE_AES_128_GCM_SHA256],
+        [TLS_SIG_ED25519], ["http/1.1", "h2"], tlsX509Verifier(edStore, now), random, tlsPatchClientHello)
+    var alpnClient = tlsClientNew(alpnClientConfig)
+    var alpnServer = tlsServerNew(alpnConfig)
+    pump(alpnClient, alpnServer)
+    if (!alpnClient.connected() || alpnClient.alpn() != "h2" || alpnServer.alpn() != "h2") {
+        fail("ALPN: [${alpnClient.alpn()}] [${alpnServer.alpn()}] ${alpnClient.error} ${alpnServer.error}")
+    }
+    if (alpnServer.serverNameIndication() != "localhost") fail("server name [${alpnServer.serverNameIndication()}]")
+    var noAlpnClient = tlsClientNew(TlsClientConfig("localhost", [TLS_SUITE_AES_128_GCM_SHA256], [TLS_SIG_ED25519],
+        ["spdy"], tlsX509Verifier(edStore, now), random, tlsPatchClientHello))
+    var noAlpnServer = tlsServerNew(alpnConfig)
+    pump(noAlpnClient, noAlpnServer)
+    if (!noAlpnServer.failed() || !noAlpnClient.failed()) fail("no ALPN in common did not fail")
+
+    // Client certificates.
+    val clientIdentity = tlsClientIdentityFromPem(read("$directory/client-p256.pem"), read("$directory/client-p256.key"))
+    val clientStore = trusting("$directory/client-p256.pem")
+    val baseConfig = TlsServerConfig(ed, [TLS_SUITE_AES_128_GCM_SHA256], [TLS_GROUP_X25519], [], random, true, true,
+        trustClient(clientStore))
+    var authClient = clientFor(edStore, "localhost")
+    authClient.useIdentity(clientIdentity)
+    var authServer = tlsServerNew(baseConfig)
+    pump(authClient, authServer)
+    if (!authClient.connected() || !authServer.connected() || !authServer.clientCertificateVerified()) {
+        fail("a trusted client certificate: [${authClient.error}] [${authServer.error}]")
+    }
+    var anonClient = clientFor(edStore, "localhost")
+    var requiredServer = tlsServerNew(baseConfig)
+    pump(anonClient, requiredServer)
+    if (!requiredServer.failed()) fail("a required client certificate was not required")
+    val optionalConfig = TlsServerConfig(ed, [TLS_SUITE_AES_128_GCM_SHA256], [TLS_GROUP_X25519], [], random, true, false,
+        trustClient(clientStore))
+    var optionalClient = clientFor(edStore, "localhost")
+    var optionalServer = tlsServerNew(optionalConfig)
+    pump(optionalClient, optionalServer)
+    if (!optionalServer.connected() || optionalServer.clientCertificateVerified() || !optionalClient.connected()) {
+        fail("an optional client certificate: [${optionalServer.error}]")
+    }
+    val strangerStore = trusting("$directory/client-rsa.pem")
+    var strictServer = tlsServerNew(TlsServerConfig(ed, [TLS_SUITE_AES_128_GCM_SHA256], [TLS_GROUP_X25519], [], random,
+        true, true, trustClient(strangerStore)))
+    var strictClient = clientFor(edStore, "localhost")
+    strictClient.useIdentity(clientIdentity)
+    pump(strictClient, strictServer)
+    if (!strictServer.failed()) fail("a client certificate the server does not trust was accepted")
+
+    // KeyUpdate from the client side: send one by hand (the machine itself only answers); both sides keep working.
+    var kuClient = clientFor(edStore, "localhost")
+    var kuServer = tlsServerNew(TlsServerConfig(ed, [TLS_SUITE_AES_128_GCM_SHA256], [TLS_GROUP_X25519], [], random,
+        false, false, acceptAny))
+    pump(kuClient, kuServer)
+    kuServer.feed("")
+    // The server asks the client to update: a KeyUpdate(update_requested) record under the server's keys.
+    val update = tlsProtectRecord(kuServer.write, TLS_HANDSHAKE, tlsHandshakeMessage(TLS_KEY_UPDATE, tlsU8(1)))
+    kuServer.serverApplicationSecret = tlsNextTrafficSecretFor(kuServer)
+    kuServer.write = tlsRecordProtection(kuServer.aead, tlsTrafficKey(kuServer.hash, kuServer.serverApplicationSecret, kuServer.keyLength),
+        tlsTrafficIv(kuServer.hash, kuServer.serverApplicationSecret))
+    kuClient.feed(update.bytes)
+    pump(kuClient, kuServer)
+    if (kuClient.failed() || kuServer.failed()) fail("KeyUpdate: [${kuClient.error}] [${kuServer.error}]")
+    kuClient.send("after the update")
+    pump(kuClient, kuServer)
+    if (kuServer.takeApplicationData() != "after the update") fail("data after a KeyUpdate")
+
+    // Refusals by the server: a ClientHello without TLS 1.3, no common suite, a garbled hello.
+    val plainHello = tlsBuildClientHello(random(32), "", [TLS_SUITE_AES_128_GCM_SHA256], "localhost", [TLS_GROUP_X25519],
+        [TlsKeyShare(TLS_GROUP_X25519, random(32))], [TLS_SIG_ED25519], [], "")
+    var tooOld = tlsServerNew(baseConfig)
+    tooOld.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, tlsHandshakeMessage(TLS_CLIENT_HELLO, "garbage")))
+    if (!tooOld.failed()) fail("a garbled ClientHello was accepted")
+    // A well-formed ClientHello that does not offer TLS 1.3 (no supported_versions): protocol_version.
+    val noVersions = tlsHandshakeMessage(TLS_CLIENT_HELLO, tlsU16(771) + random(32) + tlsVec8("") +
+        tlsVec16(tlsU16(TLS_SUITE_AES_128_GCM_SHA256)) + tlsVec8(tlsU8(0)) + tlsVec16(""))
+    var tls12Only = tlsServerNew(baseConfig)
+    tls12Only.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, noVersions))
+    if (!tls12Only.failed() || tls12Only.takeOutput().size == 0) fail("a hello without TLS 1.3 did not fail with an alert")
+    var noSuite = tlsServerNew(TlsServerConfig(ed, [TLS_SUITE_CHACHA20_POLY1305_SHA256], [TLS_GROUP_X25519], [], random,
+        false, false, acceptAny))
+    var noSuiteClient = tlsClientNew(TlsClientConfig("localhost", [TLS_SUITE_AES_128_GCM_SHA256], [TLS_SIG_ED25519], [],
+        tlsX509Verifier(edStore, now), random, tlsPatchClientHello))
+    pump(noSuiteClient, noSuite)
+    if (!noSuite.failed() || !noSuiteClient.failed()) fail("no common cipher suite did not fail")
+    var noGroup = tlsServerNew(TlsServerConfig(ed, [TLS_SUITE_AES_128_GCM_SHA256], [TLS_GROUP_SECP384R1], [], random,
+        false, false, acceptAny))
+    var noGroupClient = clientFor(edStore, "localhost")
+    pump(noGroupClient, noGroup)
+    if (!noGroup.failed()) fail("no common group did not fail")
+    var noScheme = tlsServerNew(TlsServerConfig(ed, [TLS_SUITE_AES_128_GCM_SHA256], [TLS_GROUP_X25519], [], random,
+        false, false, acceptAny))
+    var noSchemeClient = tlsClientNew(TlsClientConfig("localhost", [TLS_SUITE_AES_128_GCM_SHA256],
+        [TLS_SIG_RSA_PSS_RSAE_SHA256], [], tlsX509Verifier(edStore, now), random, tlsPatchClientHello))
+    pump(noSchemeClient, noScheme)
+    if (!noScheme.failed()) fail("no common signature scheme did not fail")
+
+    // Damaged input to a server mid-handshake never crashes it and never connects it.
+    for (round in 0 until 300) {
+        var fuzzClient = clientFor(edStore, "localhost")
+        var fuzzServer = tlsServerNew(baseConfig)
+        val hello = fuzzClient.takeOutput()
+        val bytes: array<int> = []
+        val at = hello.size - 1 - (round % hello.size)
+        for (i in 0 until hello.size) bytes.append(if (i == at) hello[i] ^ (1 << (round % 8)) else hello[i])
+        fuzzServer.feed(cryptoByteString(bytes))
+        pump(fuzzClient, fuzzServer)
+        if (fuzzServer.connected() && !fuzzServer.failed() && !fuzzClient.connected()) fail("a damaged hello connected only the server")
+    }
+
+    if (failures > 0) return 1
+    println("tls-pure server ok")
+    0
+}
+
+fun tlsNextTrafficSecretFor(server: TlsServer): string =
+    tlsNextTrafficSecret(server.hash, server.serverApplicationSecret)

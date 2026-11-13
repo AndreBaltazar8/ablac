@@ -1,0 +1,566 @@
+// A TLS 1.3 server as a sans-IO state machine (RFC 8446), the counterpart of abla/tls/pure/client: bytes received
+// go in with `feed`, bytes to send come out of `takeOutput`, decrypted application data out of
+// `takeApplicationData`, and `send`/`close` queue records.
+//
+// What it does: reads a ClientHello, picks the cipher suite (the server's order), the key-exchange group (X25519,
+// P-256: the first of the server's that the client sent a share for, else a single HelloRetryRequest), the
+// signature scheme (the identity's, among the client's) and the ALPN protocol, answers with ServerHello,
+// EncryptedExtensions, an optional CertificateRequest, Certificate, CertificateVerify and Finished, verifies the
+// client's Finished (and, when it asked, its Certificate and CertificateVerify through a configured verifier),
+// then carries application data. NewSessionTicket is not sent (no resumption). Refuses a client that does not
+// offer TLS 1.3, no common suite, group or signature scheme, a bad Finished, wrong message order, bad records.
+
+import "abla/crypto"
+import "abla/crypto/hkdf"
+import "abla/tls/pure/client"
+import "abla/tls/pure/handshake"
+import "abla/tls/pure/keysched"
+import "abla/tls/pure/record"
+
+val TLS_SERVER_WAIT_CLIENT_HELLO = 0
+val TLS_SERVER_WAIT_SECOND_HELLO = 1
+val TLS_SERVER_WAIT_CERTIFICATE = 2
+val TLS_SERVER_WAIT_CERTIFICATE_VERIFY = 3
+val TLS_SERVER_WAIT_FINISHED = 4
+val TLS_SERVER_CONNECTED = 5
+val TLS_SERVER_CLOSED = 6
+val TLS_SERVER_FAILED = 7
+
+val TLS_ALERT_NO_APPLICATION_PROTOCOL = 120
+val TLS_ALERT_CERTIFICATE_REQUIRED = 116
+
+/** The server's configuration: the identity (certificate chain and signing function), the cipher suites and
+ *  groups in the server's order, the ALPN protocols in the server's order ([] for none), a random source, and
+ *  whether to ask the client for a certificate (`requestClientCertificate`; `requireClientCertificate` refuses one
+ *  that sends none) with `clientVerifier(chain, scheme, signed content, signature)` returning "" for a client it
+ *  trusts, else the reason. */
+class TlsServerConfig(
+    val identity: TlsClientIdentity,
+    val suites: array<int>,
+    val groups: array<int>,
+    val alpn: array<string>,
+    val random: (int) -> string,
+    val requestClientCertificate: bool,
+    val requireClientCertificate: bool,
+    val clientVerifier: (array<string>, int, string, string) -> string
+)
+
+class TlsServer(
+    val config: TlsServerConfig,
+    var state: int,
+    var error: string,
+    var inbox: string,
+    var handshakeBuffer: string,
+    var outbox: string,
+    var applicationData: string,
+    val transcript: TlsTranscript,
+    var hash: int,
+    var suite: int,
+    var keyLength: int,
+    var aead: int,
+    var clientRandom: string,
+    var sessionId: string,
+    var retried: bool,
+    var retryGroup: int,
+    var retrySuite: int,
+    var readEncrypted: bool,
+    var writeEncrypted: bool,
+    var read: TlsRecordProtection,
+    var write: TlsRecordProtection,
+    var handshakeSecret: string,
+    var clientHandshakeSecret: string,
+    var serverHandshakeSecret: string,
+    var clientApplicationSecret: string,
+    var serverApplicationSecret: string,
+    var clientChain: array<string>,
+    var negotiatedAlpn: string,
+    var serverName: string,
+    var sentCompatibilityChangeCipherSpec: bool,
+    var peerClosed: bool,
+    var sentClose: bool,
+    var clientAuthenticated: bool
+)
+
+private fun tlsServerEmptyProtection(): TlsRecordProtection = tlsRecordProtection(TLS_AEAD_AES_128_GCM, "", "")
+
+/** A TLS 1.3 server connection waiting for its ClientHello. */
+fun tlsServerNew(config: TlsServerConfig): TlsServer =
+    TlsServer(config, TLS_SERVER_WAIT_CLIENT_HELLO, "", "", "", "", "", tlsTranscript(), HKDF_SHA256, 0, 16,
+        TLS_AEAD_AES_128_GCM, "", "", false, 0, 0, false, false, tlsServerEmptyProtection(),
+        tlsServerEmptyProtection(), "", "", "", "", "", [], "", "", false, false, false, false)
+
+/** The usual configuration: the given identity, AES-GCM and ChaCha20 suites, X25519 then P-256, no ALPN, no client
+ *  certificate. */
+fun tlsServerConfig(identity: TlsClientIdentity, random: (int) -> string): TlsServerConfig =
+    TlsServerConfig(identity, [TLS_SUITE_AES_128_GCM_SHA256, TLS_SUITE_AES_256_GCM_SHA384,
+        TLS_SUITE_CHACHA20_POLY1305_SHA256], [TLS_GROUP_X25519, TLS_GROUP_SECP256R1], [], random, false, false,
+        tlsServerRefuseClients)
+
+/** The client verifier of a server that asks for no certificate: it trusts none. */
+fun tlsServerRefuseClients(chain: array<string>, scheme: int, content: string, signature: string): string =
+    "client certificates are not accepted"
+
+fun TlsServer.failed(): bool = this.state == TLS_SERVER_FAILED
+fun TlsServer.connected(): bool = this.state == TLS_SERVER_CONNECTED
+fun TlsServer.closed(): bool = this.peerClosed
+
+/** The bytes to send to the peer; empties the queue. */
+fun TlsServer.takeOutput(): string {
+    val data = this.outbox
+    this.outbox = ""
+    data
+}
+
+/** The application data received so far; empties the buffer. */
+fun TlsServer.takeApplicationData(): string {
+    val data = this.applicationData
+    this.applicationData = ""
+    data
+}
+
+/** The ALPN protocol chosen ("" for none) and the server name the client asked for ("" for none). */
+fun TlsServer.alpn(): string = this.negotiatedAlpn
+fun TlsServer.serverNameIndication(): string = this.serverName
+
+private fun TlsServer.queueAlert(description: int): void {
+    val body = cryptoByteString([if (description == TLS_ALERT_CLOSE_NOTIFY) 1 else 2, description])
+    if (this.writeEncrypted) {
+        val sealed = tlsProtectRecord(this.write, TLS_ALERT, body)
+        if (sealed.ok) this.outbox = this.outbox + sealed.bytes
+    } else {
+        this.outbox = this.outbox + tlsPlaintextRecord(TLS_ALERT, 771, body)
+    }
+    return
+}
+
+private fun TlsServer.fail(description: int, message: string): void {
+    if (this.state == TLS_SERVER_FAILED || this.state == TLS_SERVER_CLOSED) return
+    this.queueAlert(description)
+    this.state = TLS_SERVER_FAILED
+    this.error = message
+    return
+}
+
+private fun TlsServer.queueRecord(type: int, content: string): void {
+    var offset = 0
+    while (offset < content.size || offset == 0) {
+        val end = if (content.size - offset > TLS_MAX_PLAINTEXT) offset + TLS_MAX_PLAINTEXT else content.size
+        val sealed = tlsProtectRecord(this.write, type, content.slice(offset, end))
+        if (!sealed.ok) {
+            this.fail(TLS_ALERT_INTERNAL_ERROR, sealed.error)
+            return
+        }
+        this.outbox = this.outbox + sealed.bytes
+        offset = end
+        if (content.size == 0) return
+    }
+    return
+}
+
+private fun TlsServer.setKeys(secret: string, forWrite: bool): void {
+    val protection = tlsRecordProtection(this.aead, tlsTrafficKey(this.hash, secret, this.keyLength),
+        tlsTrafficIv(this.hash, secret))
+    if (forWrite) {
+        this.write = protection
+        this.writeEncrypted = true
+    } else {
+        this.read = protection
+        this.readEncrypted = true
+    }
+    return
+}
+
+private fun TlsServer.sendCompatibilityChangeCipherSpec(): void {
+    if (this.sessionId.size == 0 || this.sentCompatibilityChangeCipherSpec) return
+    this.sentCompatibilityChangeCipherSpec = true
+    this.outbox = this.outbox + tlsPlaintextRecord(TLS_CHANGE_CIPHER_SPEC, 771, tlsU8(1))
+    return
+}
+
+private fun tlsServerListHas(list: array<int>, value: int): bool {
+    for (item in list) {
+        if (item == value) return true
+    }
+    false
+}
+
+private fun tlsServerShareFor(shares: array<TlsKeyShare>, group: int): TlsKeyShare? {
+    for (share in shares) {
+        if (share.group == group) return share
+    }
+    null
+}
+
+private fun TlsServer.handleClientHello(message: string, body: string): void {
+    val hello = tlsParseClientHello(body)
+    if (!hello.ok) {
+        this.fail(TLS_ALERT_DECODE_ERROR, hello.error)
+        return
+    }
+    if (!tlsServerListHas(hello.versions, 772)) {
+        this.fail(TLS_ALERT_PROTOCOL_VERSION, "tls: the client does not offer TLS 1.3")
+        return
+    }
+    if (this.retried && (hello.random != this.clientRandom || hello.sessionId != this.sessionId)) {
+        this.fail(TLS_ALERT_ILLEGAL_PARAMETER, "tls: the second ClientHello changed its random or session id")
+        return
+    }
+    // The cipher suite: the server's first that the client offers.
+    var suite = 0
+    for (candidate in this.config.suites) {
+        if (suite == 0 && tlsServerListHas(hello.suites, candidate) && tlsAeadFor(candidate) != 0) suite = candidate
+    }
+    if (suite == 0) {
+        this.fail(TLS_ALERT_HANDSHAKE_FAILURE, "tls: no cipher suite in common")
+        return
+    }
+    if (this.retried && suite != this.retrySuite) {
+        this.fail(TLS_ALERT_ILLEGAL_PARAMETER, "tls: the cipher suite changed after HelloRetryRequest")
+        return
+    }
+    // The signature scheme: the identity's first that the client accepts.
+    var scheme = 0
+    for (candidate in this.config.identity.schemes) {
+        if (scheme == 0 && tlsServerListHas(hello.schemes, candidate)) scheme = candidate
+    }
+    if (scheme == 0 || this.config.identity.chain.size == 0) {
+        this.fail(TLS_ALERT_HANDSHAKE_FAILURE, "tls: no signature scheme in common")
+        return
+    }
+    // The ALPN protocol: the server's first that the client lists; none in common is fatal.
+    var alpn = ""
+    if (hello.alpn.size > 0 && this.config.alpn.size > 0) {
+        for (candidate in this.config.alpn) {
+            var listed = false
+            for (offered in hello.alpn) {
+                if (offered == candidate) listed = true
+            }
+            if (alpn == "" && listed) alpn = candidate
+        }
+        if (alpn == "") {
+            this.fail(TLS_ALERT_NO_APPLICATION_PROTOCOL, "tls: no application protocol in common")
+            return
+        }
+    }
+    // The group: the server's first that the client has a share for, else retry on its first common group.
+    var chosen: TlsKeyShare? = null
+    var retryGroup = 0
+    for (group in this.config.groups) {
+        if (chosen == null && tlsServerListHas(hello.groups, group)) {
+            val share = tlsServerShareFor(hello.shares, group)
+            if (share != null) chosen = share
+            else if (retryGroup == 0) retryGroup = group
+        }
+    }
+    this.hash = tlsSuiteHash(suite)
+    this.aead = tlsAeadFor(suite)
+    this.keyLength = tlsAeadKeyLength(this.aead)
+    this.suite = suite
+    if (chosen == null) {
+        if (retryGroup == 0 || this.retried) {
+            this.fail(TLS_ALERT_HANDSHAKE_FAILURE, "tls: no key exchange group in common")
+            return
+        }
+        // HelloRetryRequest: the transcript restarts with a synthetic message_hash of this ClientHello.
+        this.clientRandom = hello.random
+        this.sessionId = hello.sessionId
+        this.retried = true
+        this.retryGroup = retryGroup
+        this.retrySuite = suite
+        this.transcript.messages = tlsHandshakeMessage(TLS_MESSAGE_HASH, tlsHashOf(this.hash, message))
+        val request = tlsBuildHelloRetryRequest(hello.sessionId, suite, retryGroup, "")
+        this.transcript.add(request)
+        this.outbox = this.outbox + tlsPlaintextRecord(TLS_HANDSHAKE, 771, request)
+        this.sendCompatibilityChangeCipherSpec()
+        this.state = TLS_SERVER_WAIT_SECOND_HELLO
+        return
+    }
+    val selected = chosen ?? return
+    val pair = tlsGenerateKeyPair(selected.group, this.config.random)
+    if (pair == null) {
+        this.fail(TLS_ALERT_INTERNAL_ERROR, "tls: the server could not make a key share")
+        return
+    }
+    val shared = tlsAgree(pair, selected.publicKey)
+    if (!shared.ok) {
+        this.fail(TLS_ALERT_ILLEGAL_PARAMETER, "tls: the client's key share is not valid")
+        return
+    }
+    this.clientRandom = hello.random
+    this.sessionId = hello.sessionId
+    this.serverName = hello.serverName
+    this.negotiatedAlpn = alpn
+    this.transcript.add(message)
+    // ServerHello (plaintext), then the key schedule and the encrypted flight.
+    val serverHello = tlsBuildServerHello(this.config.random(32), hello.sessionId, suite,
+        TlsKeyShare(pair.group, pair.publicKey))
+    this.transcript.add(serverHello)
+    this.outbox = this.outbox + tlsPlaintextRecord(TLS_HANDSHAKE, 771, serverHello)
+    this.sendCompatibilityChangeCipherSpec()
+    val early = tlsEarlySecret(this.hash, "")
+    val secrets = tlsDeriveHandshakeSecrets(this.hash, early, shared.bytes, this.transcript.hash(this.hash))
+    this.handshakeSecret = secrets.handshakeSecret
+    this.clientHandshakeSecret = secrets.clientTraffic
+    this.serverHandshakeSecret = secrets.serverTraffic
+    this.setKeys(secrets.serverTraffic, true)
+    this.setKeys(secrets.clientTraffic, false)
+    this.sendFlight(scheme)
+    return
+}
+
+private fun TlsServer.sendFlight(scheme: int): void {
+    var flight = tlsBuildEncryptedExtensions(this.negotiatedAlpn)
+    this.transcript.add(flight)
+    if (this.config.requestClientCertificate) {
+        val request = tlsBuildCertificateRequest("", [TLS_SIG_ECDSA_SECP256R1_SHA256, TLS_SIG_RSA_PSS_RSAE_SHA256,
+            TLS_SIG_RSA_PSS_RSAE_SHA384, TLS_SIG_RSA_PSS_RSAE_SHA512, TLS_SIG_ED25519, TLS_SIG_ECDSA_SECP384R1_SHA384])
+        this.transcript.add(request)
+        flight = flight + request
+    }
+    val certificate = tlsBuildCertificate("", this.config.identity.chain)
+    this.transcript.add(certificate)
+    val content = tlsCertificateVerifyContent(true, this.transcript.hash(this.hash))
+    val signature = this.config.identity.sign(scheme, content)
+    if (signature.size == 0) {
+        this.fail(TLS_ALERT_INTERNAL_ERROR, "tls: the server certificate's key could not sign")
+        return
+    }
+    val verify = tlsBuildCertificateVerify(scheme, signature)
+    this.transcript.add(verify)
+    val finished = tlsHandshakeMessage(TLS_FINISHED,
+        tlsFinishedVerifyData(this.hash, this.serverHandshakeSecret, this.transcript.hash(this.hash)))
+    this.transcript.add(finished)
+    this.queueRecord(TLS_HANDSHAKE, flight + certificate + verify + finished)
+    // Application keys: derived through the server's Finished; the server may write under them at once, and
+    // reads the client's last flight under the handshake keys until its Finished arrives.
+    val application = tlsDeriveApplicationSecrets(this.hash, this.handshakeSecret, this.transcript.hash(this.hash))
+    this.clientApplicationSecret = application.clientTraffic
+    this.serverApplicationSecret = application.serverTraffic
+    this.setKeys(application.serverTraffic, true)
+    this.state = if (this.config.requestClientCertificate) TLS_SERVER_WAIT_CERTIFICATE else TLS_SERVER_WAIT_FINISHED
+    return
+}
+
+private fun TlsServer.handleClientCertificate(message: string, body: string): void {
+    val parsed = tlsParseCertificate(body)
+    if (!parsed.ok) {
+        this.fail(TLS_ALERT_DECODE_ERROR, parsed.error)
+        return
+    }
+    if (parsed.context.size != 0) {
+        this.fail(TLS_ALERT_ILLEGAL_PARAMETER, "tls: the client's Certificate echoes another request context")
+        return
+    }
+    this.transcript.add(message)
+    if (parsed.chain.size == 0) {
+        if (this.config.requireClientCertificate) {
+            this.fail(TLS_ALERT_CERTIFICATE_REQUIRED, "tls: the client sent no certificate")
+            return
+        }
+        this.state = TLS_SERVER_WAIT_FINISHED
+        return
+    }
+    this.clientChain = parsed.chain
+    this.state = TLS_SERVER_WAIT_CERTIFICATE_VERIFY
+    return
+}
+
+private fun TlsServer.handleClientCertificateVerify(message: string, body: string): void {
+    val parsed = tlsParseCertificateVerify(body)
+    if (!parsed.ok) {
+        this.fail(TLS_ALERT_DECODE_ERROR, "tls: malformed CertificateVerify")
+        return
+    }
+    val content = tlsCertificateVerifyContent(false, this.transcript.hash(this.hash))
+    val verdict = this.config.clientVerifier(this.clientChain, parsed.scheme, content, parsed.signature)
+    if (verdict.size > 0) {
+        this.fail(TLS_ALERT_BAD_CERTIFICATE, verdict)
+        return
+    }
+    this.clientAuthenticated = true
+    this.transcript.add(message)
+    this.state = TLS_SERVER_WAIT_FINISHED
+    return
+}
+
+private fun TlsServer.handleClientFinished(message: string, body: string): void {
+    if (body.size != tlsHashLength(this.hash)) {
+        this.fail(TLS_ALERT_DECODE_ERROR, "tls: a Finished of the wrong length")
+        return
+    }
+    val expected = tlsFinishedVerifyData(this.hash, this.clientHandshakeSecret, this.transcript.hash(this.hash))
+    if (!constantTimeEquals(expected, body)) {
+        this.fail(TLS_ALERT_DECRYPT_ERROR, "tls: the client's Finished does not verify")
+        return
+    }
+    if (this.handshakeBuffer.size != 0) {
+        this.fail(TLS_ALERT_UNEXPECTED_MESSAGE, "tls: data after the client's Finished in its record")
+        return
+    }
+    this.transcript.add(message)
+    this.setKeys(this.clientApplicationSecret, false)
+    this.state = TLS_SERVER_CONNECTED
+    return
+}
+
+private fun TlsServer.handleKeyUpdate(body: string): void {
+    if (body.size != 1 || body[0] > 1) {
+        this.fail(TLS_ALERT_DECODE_ERROR, "tls: a malformed KeyUpdate")
+        return
+    }
+    this.clientApplicationSecret = tlsNextTrafficSecret(this.hash, this.clientApplicationSecret)
+    this.setKeys(this.clientApplicationSecret, false)
+    if (body[0] == 1) {
+        this.queueRecord(TLS_HANDSHAKE, tlsHandshakeMessage(TLS_KEY_UPDATE, tlsU8(0)))
+        this.serverApplicationSecret = tlsNextTrafficSecret(this.hash, this.serverApplicationSecret)
+        this.setKeys(this.serverApplicationSecret, true)
+    }
+    return
+}
+
+private fun TlsServer.handleMessage(type: int, message: string, body: string): void {
+    if (this.state == TLS_SERVER_WAIT_CLIENT_HELLO || this.state == TLS_SERVER_WAIT_SECOND_HELLO) {
+        if (type == TLS_CLIENT_HELLO) this.handleClientHello(message, body)
+        else this.fail(TLS_ALERT_UNEXPECTED_MESSAGE, "tls: expected a ClientHello")
+    } else if (this.state == TLS_SERVER_WAIT_CERTIFICATE) {
+        if (type == TLS_CERTIFICATE) this.handleClientCertificate(message, body)
+        else this.fail(TLS_ALERT_UNEXPECTED_MESSAGE, "tls: expected the client's Certificate")
+    } else if (this.state == TLS_SERVER_WAIT_CERTIFICATE_VERIFY) {
+        if (type == TLS_CERTIFICATE_VERIFY) this.handleClientCertificateVerify(message, body)
+        else this.fail(TLS_ALERT_UNEXPECTED_MESSAGE, "tls: expected the client's CertificateVerify")
+    } else if (this.state == TLS_SERVER_WAIT_FINISHED) {
+        if (type == TLS_FINISHED) this.handleClientFinished(message, body)
+        else this.fail(TLS_ALERT_UNEXPECTED_MESSAGE, "tls: expected the client's Finished")
+    } else if (this.state == TLS_SERVER_CONNECTED) {
+        if (type == TLS_KEY_UPDATE) this.handleKeyUpdate(body)
+        else this.fail(TLS_ALERT_UNEXPECTED_MESSAGE, "tls: an unexpected handshake message")
+    }
+    return
+}
+
+private fun TlsServer.processHandshake(): void {
+    while (this.state != TLS_SERVER_FAILED && this.state != TLS_SERVER_CLOSED) {
+        val header = tlsParseMessageHeader(this.handshakeBuffer, 0)
+        if (!header.complete) return
+        val message = this.handshakeBuffer.slice(0, header.total)
+        this.handshakeBuffer = this.handshakeBuffer.slice(header.total, this.handshakeBuffer.size)
+        this.handleMessage(header.type, message, message.slice(4, message.size))
+        // A ClientHello must be alone in its record before the keys change.
+        if (this.handshakeBuffer.size > 0 && (this.state == TLS_SERVER_WAIT_SECOND_HELLO ||
+            this.state == TLS_SERVER_WAIT_CERTIFICATE || this.state == TLS_SERVER_WAIT_FINISHED) && !this.readEncrypted) {
+            this.fail(TLS_ALERT_UNEXPECTED_MESSAGE, "tls: handshake data after the ClientHello in its record")
+            return
+        }
+    }
+    return
+}
+
+private fun TlsServer.handleAlert(content: string): void {
+    if (content.size != 2) {
+        this.fail(TLS_ALERT_DECODE_ERROR, "tls: a malformed alert")
+        return
+    }
+    if (content[1] == TLS_ALERT_CLOSE_NOTIFY) {
+        this.peerClosed = true
+        if (!this.sentClose) this.queueAlert(TLS_ALERT_CLOSE_NOTIFY)
+        this.sentClose = true
+        this.state = TLS_SERVER_CLOSED
+        return
+    }
+    this.state = TLS_SERVER_FAILED
+    this.error = "tls: the client sent alert ${content[1]}"
+    return
+}
+
+private fun TlsServer.handleRecord(record: string, header: TlsRecordHeader): void {
+    if (header.type == TLS_CHANGE_CIPHER_SPEC) {
+        // Compatibility mode: one 0x01 byte, ignored, once a ClientHello has been answered.
+        if (this.state == TLS_SERVER_CONNECTED || record.size != 6 || record[5] != 1 ||
+            (this.state == TLS_SERVER_WAIT_CLIENT_HELLO && !this.retried)) {
+            this.fail(TLS_ALERT_UNEXPECTED_MESSAGE, "tls: an unexpected ChangeCipherSpec")
+        }
+        return
+    }
+    var type = header.type
+    var content = ""
+    if (this.readEncrypted) {
+        if (header.type != TLS_APPLICATION_DATA) {
+            this.fail(TLS_ALERT_UNEXPECTED_MESSAGE, "tls: an unprotected record after the keys were set")
+            return
+        }
+        val opened = tlsOpenRecord(this.read, record)
+        if (!opened.ok) {
+            this.fail(if (opened.error == "tls: record overflow") TLS_ALERT_RECORD_OVERFLOW else TLS_ALERT_BAD_RECORD_MAC,
+                opened.error)
+            return
+        }
+        type = opened.type
+        content = opened.content
+    } else {
+        if (header.length > TLS_MAX_PLAINTEXT) {
+            this.fail(TLS_ALERT_RECORD_OVERFLOW, "tls: record overflow")
+            return
+        }
+        content = record.slice(5, record.size)
+    }
+    if (type == TLS_HANDSHAKE) {
+        if (content.size == 0) {
+            this.fail(TLS_ALERT_UNEXPECTED_MESSAGE, "tls: an empty handshake record")
+            return
+        }
+        this.handshakeBuffer = this.handshakeBuffer + content
+        this.processHandshake()
+    } else if (type == TLS_ALERT) {
+        this.handleAlert(content)
+    } else if (type == TLS_APPLICATION_DATA && this.readEncrypted && this.state == TLS_SERVER_CONNECTED) {
+        this.applicationData = this.applicationData + content
+    } else {
+        this.fail(TLS_ALERT_UNEXPECTED_MESSAGE, "tls: an unexpected record type $type")
+    }
+    return
+}
+
+/** Feeds bytes received from the peer: every complete record in them is processed. */
+fun TlsServer.feed(data: string): void {
+    if (this.state == TLS_SERVER_FAILED || this.state == TLS_SERVER_CLOSED) return
+    this.inbox = this.inbox + data
+    while (this.state != TLS_SERVER_FAILED && this.state != TLS_SERVER_CLOSED) {
+        val header = tlsParseRecordHeader(this.inbox, 0)
+        if (!header.ok) return
+        if (header.length > TLS_MAX_CIPHERTEXT) {
+            this.fail(TLS_ALERT_RECORD_OVERFLOW, "tls: record overflow")
+            return
+        }
+        if (this.inbox.size < 5 + header.length) return
+        val record = this.inbox.slice(0, 5 + header.length)
+        this.inbox = this.inbox.slice(5 + header.length, this.inbox.size)
+        this.handleRecord(record, header)
+    }
+    return
+}
+
+/** Queues application data (any length) as records. False when the connection is not open. The server may
+ *  write as soon as its own Finished is out; the client has not authenticated itself until `connected()`. */
+fun TlsServer.send(data: string): bool {
+    if (this.state != TLS_SERVER_CONNECTED) return false
+    var offset = 0
+    while (offset < data.size && this.state == TLS_SERVER_CONNECTED) {
+        val end = if (data.size - offset > TLS_MAX_PLAINTEXT) offset + TLS_MAX_PLAINTEXT else data.size
+        this.queueRecord(TLS_APPLICATION_DATA, data.slice(offset, end))
+        offset = end
+    }
+    this.state == TLS_SERVER_CONNECTED
+}
+
+/** Queues close_notify; the connection takes no more application data. */
+fun TlsServer.close(): void {
+    if (this.state == TLS_SERVER_CONNECTED && !this.sentClose) {
+        this.queueAlert(TLS_ALERT_CLOSE_NOTIFY)
+        this.sentClose = true
+        this.state = TLS_SERVER_CLOSED
+    }
+    return
+}
+
+/** True when the client presented a certificate that the configured verifier accepted. */
+fun TlsServer.clientCertificateVerified(): bool = this.clientAuthenticated

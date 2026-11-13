@@ -1,42 +1,100 @@
-// A TLS 1.3 client connection over a TCP socket: abla/tls/pure/client driven by the socket. `read` returns ""
-// at the end of the stream with an empty `lastError`, and "" with the reason on a timeout or failure; `write`
-// returns the bytes taken or -1. The certificate check is the configuration's (abla/tls/pure/verify). The
-// hosted-API-compatible calls (tlsConnect and the rest) are in abla/tls/pure.
+// A TLS 1.3 connection over a TCP socket: abla/tls/pure/client or abla/tls/pure/server driven by the socket. `read`
+// returns "" at the end of the stream with an empty `lastError`, and "" with the reason on a timeout or failure;
+// `write` returns the bytes taken or -1. The certificate check of a client is its configuration's
+// (abla/tls/pure/verify). The hosted-API-compatible calls (tlsConnect, tlsListen and the rest) are in abla/tls/pure.
 
 import "abla/dns"
 import "abla/random"
 import "abla/sys/linux/net"
 import "abla/sys/linux/process"
 import "abla/tls/pure/client"
+import "abla/tls/pure/server"
 
-/** Secure random bytes for the handshake (the client's random, its session id, its key shares). */
+/** Secure random bytes for the handshake (the random, the session id, the key shares). */
 fun tlsPureRandom(count: int): string {
     val result = secureRandomBytes(count)
     if (result.succeeded) result.bytes else ""
 }
 
-/** Why a connection is not usable, as a stage: what the hosted API calls them (1 configuration, 2 tcp_connect,
- *  9 handshake, 10 certificate_verification, 13 timed out), or 0 for none. */
-class TlsPureStatus(val stage: int, val message: string)
+private fun tlsPureNoVerify(chain: array<string>, host: string, scheme: int, content: string, signature: string): string = ""
+private fun tlsPureNoSignature(scheme: int, content: string): string = ""
 
-resource class TlsPureConnection(var tcp: TcpConnection, var client: TlsClient, var lastError: string,
-    var stage: int) {
+/** The state machine nobody uses in a connection of the other kind: cheap, no key generation. */
+private fun tlsPurePlaceholderClient(): TlsClient =
+    tlsClientStartWith(tlsClientConfig("", tlsPureNoVerify, tlsPureRandom), "", "", "", [], 769)
+
+private fun tlsPurePlaceholderServer(): TlsServer =
+    tlsServerNew(tlsServerConfig(TlsClientIdentity([], [], tlsPureNoSignature), tlsPureRandom))
+
+/** A connection: a socket and the state machine that speaks TLS on it, a client's or a server's (the other is an
+ *  unused placeholder; `isServer` says which). `stage` is why it is unusable, as the hosted API numbers them: 0 none,
+ *  1 configuration, 2 tcp_connect, 8 socket_attach, 9 handshake, 10 certificate_verification, 12 server handshake,
+ *  13 timed out. */
+resource class TlsPureConnection(var tcp: TcpConnection, var client: TlsClient, var server: TlsServer,
+    var isServer: bool, var lastError: string, var stage: int) {
     fun drop(): void {
         if (this.tcp.descriptor >= 0) {
-            this.client.close()
+            this.closeMachine()
             this.tcp.close()
         }
         return
     }
 }
 
+// ---- the machine behind the connection, whichever kind ----
+private fun TlsPureConnection.takeOutput(): string = if (this.isServer) this.server.takeOutput() else this.client.takeOutput()
+
+private fun TlsPureConnection.feedMachine(data: string): void {
+    if (this.isServer) this.server.feed(data) else this.client.feed(data)
+    return
+}
+
+private fun TlsPureConnection.pending(): string =
+    if (this.isServer) this.server.applicationData else this.client.applicationData
+
+private fun TlsPureConnection.takePending(): string =
+    if (this.isServer) this.server.takeApplicationData() else this.client.takeApplicationData()
+
+private fun TlsPureConnection.setPending(data: string): void {
+    if (this.isServer) this.server.applicationData = data else this.client.applicationData = data
+    return
+}
+
+private fun TlsPureConnection.sendData(data: string): bool =
+    if (this.isServer) this.server.send(data) else this.client.send(data)
+
+private fun TlsPureConnection.closeMachine(): void {
+    if (this.isServer) this.server.close() else this.client.close()
+    return
+}
+
+fun TlsPureConnection.connected(): bool = if (this.isServer) this.server.connected() else this.client.connected()
+fun TlsPureConnection.machineFailed(): bool = if (this.isServer) this.server.failed() else this.client.failed()
+fun TlsPureConnection.machineError(): string = if (this.isServer) this.server.error else this.client.error
+fun TlsPureConnection.machineClosed(): bool = if (this.isServer) this.server.closed() else this.client.closed()
+
+private fun TlsPureConnection.machineEnded(): bool =
+    if (this.isServer) this.server.state == TLS_SERVER_CLOSED else this.client.state == TLS_CLIENT_CLOSED
+
+private fun TlsPureConnection.certificateRejected(): bool = !this.isServer && this.client.certificateRejected
+
+/** The cipher suite negotiated (0 before the handshake ends). */
+fun TlsPureConnection.suite(): int = if (this.isServer) this.server.suite else this.client.suite
+
+/** The negotiated ALPN protocol, "" for none. */
+fun TlsPureConnection.alpn(): string = if (this.isServer) this.server.alpn() else this.client.alpn()
+
+/** True when a client certificate was presented and accepted (a server connection). */
+fun TlsPureConnection.clientCertificateVerified(): bool = this.isServer && this.server.clientCertificateVerified()
+
 private fun TlsPureConnection.flush(): bool {
-    val data = this.client.takeOutput()
+    val data = this.takeOutput()
     if (data.size == 0) return true
     val result = this.tcp.writeResult(data)
     if (!result.succeeded()) {
-        this.lastError = if ((result.timedOut() || result.errorCode == 11)) "TLS read or write timed out" else "TLS write failed"
-        this.stage = if ((result.timedOut() || result.errorCode == 11)) 13 else 9
+        val timedOut = result.timedOut() || result.errorCode == 11
+        this.lastError = if (timedOut) "TLS read or write timed out" else "TLS write failed"
+        this.stage = if (timedOut) 13 else 9
         return false
     }
     true
@@ -48,53 +106,65 @@ private fun tlsPureDeadlineWait(deadline: int, timeout: int): int {
     if (left <= 0) 0 else if (timeout < left) timeout else left
 }
 
-/** Runs the handshake over a connected socket, whose ownership passes in (it is closed on failure).
- *  `timeoutMilliseconds` bounds each wait of the handshake, `deadline` (an absolute monotonic millisecond
- *  time, 0 for none) the whole of it; afterwards reads and writes wait up to `readWriteTimeoutMilliseconds`
- *  (0 waits as long as it takes). Check `ok()`: on failure `lastError` and `stage` say why. */
+/** The socket's ownership passes to the connection: the caller's handle is emptied. */
+private fun tlsPureTake(var tcp: TcpConnection): TcpConnection {
+    val owned = TcpConnection(tcp.descriptor)
+    tcp.descriptor = -1
+    owned
+}
+
+/** Runs the handshake until the machine is connected or failed. `timeoutMilliseconds` bounds each wait, `deadline`
+ *  (an absolute monotonic millisecond time, 0 for none) the whole of it; the failure stage is `failStage` for a
+ *  handshake error (9 for a client, 12 for a server). */
+private fun TlsPureConnection.handshake(timeoutMilliseconds: int, deadline: int, failStage: int): void {
+    var running = this.flush()
+    while (running && !this.connected() && !this.machineFailed()) {
+        val wait = tlsPureDeadlineWait(deadline, timeoutMilliseconds)
+        if (wait <= 0) {
+            this.lastError = "TLS read or write timed out"
+            this.stage = 13
+            running = false
+        } else {
+            this.tcp.setTimeouts(wait, wait)
+            val received = this.tcp.readResult(16384)
+            if (received.hasData()) {
+                this.feedMachine(received.bytes)
+                running = this.flush()
+            } else {
+                val timedOut = received.timedOut() || received.errorCode == 11
+                this.lastError = if (timedOut) "TLS read or write timed out"
+                    else if (received.reachedEof()) "TLS failed at handshake: the connection closed"
+                    else "TLS failed at handshake"
+                this.stage = if (timedOut) 13 else failStage
+                running = false
+            }
+        }
+    }
+    if (this.machineFailed()) {
+        this.flush()
+        this.lastError = this.machineError()
+        this.stage = if (this.certificateRejected()) 10 else failStage
+    }
+    return
+}
+
+/** Runs a client handshake over a connected socket, whose ownership passes in (it is closed on failure). Check
+ *  `ok()`: on failure `lastError` and `stage` say why. */
 fun tlsPureUpgrade(var tcp: TcpConnection, config: TlsClientConfig, timeoutMilliseconds: int = 5000,
     readWriteTimeoutMilliseconds: int = 30000, deadline: int = 0,
     identity: TlsClientIdentity? = null): TlsPureConnection {
-    // The socket's ownership passes to the connection: the caller's handle is emptied.
-    val owned = TcpConnection(tcp.descriptor)
-    tcp.descriptor = -1
-    var connection = TlsPureConnection(move(owned), tlsClientNew(config), "", 0)
-    var running = connection.tcp.descriptor >= 0
-    if (!running) {
+    val owned = tlsPureTake(tcp)
+    var connection = TlsPureConnection(move(owned), tlsClientNew(config), tlsPurePlaceholderServer(),
+        false, "", 0)
+    if (connection.tcp.descriptor < 0) {
         connection.lastError = "TLS failed at socket_attach"
         connection.stage = 8
         return connection
     }
     if (identity != null) connection.client.useIdentity(identity)
     connection.tcp.setTimeouts(timeoutMilliseconds, timeoutMilliseconds)
-    running = connection.flush()
-    while (running && !connection.client.connected() && !connection.client.failed()) {
-        val wait = tlsPureDeadlineWait(deadline, timeoutMilliseconds)
-        if (wait <= 0) {
-            connection.lastError = "TLS read or write timed out"
-            connection.stage = 13
-            running = false
-        } else {
-            connection.tcp.setTimeouts(wait, wait)
-            val received = connection.tcp.readResult(16384)
-            if (received.hasData()) {
-                connection.client.feed(received.bytes)
-                running = connection.flush()
-            } else {
-                connection.lastError = if ((received.timedOut() || received.errorCode == 11)) "TLS read or write timed out"
-                    else if (received.reachedEof()) "TLS failed at handshake: the connection closed"
-                    else "TLS failed at handshake"
-                connection.stage = if ((received.timedOut() || received.errorCode == 11)) 13 else 9
-                running = false
-            }
-        }
-    }
-    if (connection.client.failed()) {
-        connection.flush()
-        connection.lastError = connection.client.error
-        connection.stage = if (connection.client.certificateRejected) 10 else 9
-    }
-    if (!connection.client.connected()) {
+    connection.handshake(timeoutMilliseconds, deadline, 9)
+    if (!connection.connected()) {
         connection.tcp.close()
     } else {
         connection.tcp.setTimeouts(readWriteTimeoutMilliseconds, readWriteTimeoutMilliseconds)
@@ -112,13 +182,36 @@ fun tlsPureConnect(config: TlsClientConfig, port: int = 443, timeoutMilliseconds
         else if (config.host == "localhost") tcpConnectIpv6(ipv6Loopback(port), connectTimeout)
         else tcpConnectHost(config.host, port, connectTimeout, deadline)
     if (tcp.descriptor < 0) {
-        val failed = TlsPureConnection(TcpConnection(-1), tlsClientNew(config), "TLS failed at tcp_connect", 2)
+        val failed = TlsPureConnection(TcpConnection(-1), tlsClientNew(config), tlsPurePlaceholderServer(), false,
+            "TLS failed at tcp_connect", 2)
         return failed
     }
     tlsPureUpgrade(tcp, config, timeoutMilliseconds, readWriteTimeoutMilliseconds, deadline, identity)
 }
 
-fun TlsPureConnection.ok(): bool = this.tcp.descriptor >= 0 && this.client.connected()
+/** Runs a server handshake over an accepted socket, whose ownership passes in (it is closed on failure). A client
+ *  that connects and says nothing costs one handshake timeout. */
+fun tlsPureServerUpgrade(var tcp: TcpConnection, config: TlsServerConfig, timeoutMilliseconds: int = 5000,
+    readWriteTimeoutMilliseconds: int = 30000, deadline: int = 0): TlsPureConnection {
+    val owned = tlsPureTake(tcp)
+    var connection = TlsPureConnection(move(owned), tlsPurePlaceholderClient(), tlsServerNew(config),
+        true, "", 0)
+    if (connection.tcp.descriptor < 0) {
+        connection.lastError = "TLS failed at socket_attach"
+        connection.stage = 8
+        return connection
+    }
+    connection.tcp.setTimeouts(timeoutMilliseconds, timeoutMilliseconds)
+    connection.handshake(timeoutMilliseconds, deadline, 12)
+    if (!connection.connected()) {
+        connection.tcp.close()
+    } else {
+        connection.tcp.setTimeouts(readWriteTimeoutMilliseconds, readWriteTimeoutMilliseconds)
+    }
+    connection
+}
+
+fun TlsPureConnection.ok(): bool = this.tcp.descriptor >= 0 && this.connected()
 
 /** Up to `maximum` bytes of application data; "" at the end of the stream (`lastError` is "") or on a
  *  timeout or failure (`lastError` says why; a timed-out read can be repeated). */
@@ -126,33 +219,34 @@ fun TlsPureConnection.read(maximum: int = 65536): string {
     this.lastError = ""
     this.stage = 0
     while (true) {
-        val buffered = this.client.applicationData
+        val buffered = this.pending()
         if (buffered.size > 0) {
-            if (buffered.size <= maximum) return this.client.takeApplicationData()
-            this.client.applicationData = buffered.slice(maximum, buffered.size)
+            if (buffered.size <= maximum) return this.takePending()
+            this.setPending(buffered.slice(maximum, buffered.size))
             return buffered.slice(0, maximum)
         }
-        if (this.client.closed() || this.client.state == TLS_CLIENT_CLOSED) return ""
-        if (this.client.failed()) {
-            this.lastError = this.client.error
+        if (this.machineClosed() || this.machineEnded()) return ""
+        if (this.machineFailed()) {
+            this.lastError = this.machineError()
             this.stage = 9
             return ""
         }
         if (this.tcp.descriptor < 0) return ""
         val received = this.tcp.readResult(16384)
         if (received.hasData()) {
-            this.client.feed(received.bytes)
+            this.feedMachine(received.bytes)
             this.flush()
         } else if (received.reachedEof()) {
             // The peer closed the stream without close_notify: a truncation, not a clean end.
-            if (!this.client.closed()) {
+            if (!this.machineClosed()) {
                 this.lastError = "TLS connection closed without close_notify"
                 this.stage = 9
             }
             return ""
         } else {
-            this.lastError = if ((received.timedOut() || received.errorCode == 11)) "TLS read or write timed out" else "TLS read failed"
-            this.stage = if ((received.timedOut() || received.errorCode == 11)) 13 else 9
+            val timedOut = received.timedOut() || received.errorCode == 11
+            this.lastError = if (timedOut) "TLS read or write timed out" else "TLS read failed"
+            this.stage = if (timedOut) 13 else 9
             return ""
         }
     }
@@ -161,16 +255,20 @@ fun TlsPureConnection.read(maximum: int = 65536): string {
 
 /** Sends all of `contents`; the bytes taken, or -1 on failure. */
 fun TlsPureConnection.write(contents: string): int {
-    if (!this.client.send(contents)) return -1
+    if (!this.sendData(contents)) return -1
     if (!this.flush()) return -1
     contents.size
 }
 
 fun TlsPureConnection.close(): bool {
     if (this.tcp.descriptor >= 0) {
-        this.client.close()
+        this.closeMachine()
         this.flush()
         return this.tcp.close()
     }
     true
 }
+
+/** A failed client connection that never had a socket (a configuration or trust-store problem), for the API layer. */
+fun tlsPureFailedConnection(config: TlsClientConfig, message: string, stage: int): TlsPureConnection =
+    TlsPureConnection(TcpConnection(-1), tlsClientNew(config), tlsPurePlaceholderServer(), false, message, stage)

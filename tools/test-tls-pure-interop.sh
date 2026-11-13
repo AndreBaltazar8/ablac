@@ -113,6 +113,68 @@ for kind in rsa p256 ed25519; do
     stop_server
     echo "mtls $kind: accepted, refused without an identity, refused with another"
 done
+# The sans-IO server against the sans-IO client in one process (tests/cases/tls-pure/server.ab): every key kind x suite x
+# group (HelloRetryRequest), 70 KB each way, ALPN, client certificates, KeyUpdate, refusals, damaged input.
+"$compiler" build tests/cases/tls-pure/server.ab -o "$out/server" --no-cache
+result=$("$root/tools/run-limited.sh" "$out/server" "$out") || { echo "tls-pure server (in process): $result" >&2; exit 1; }
+[[ $result == 'tls-pure server ok' ]] || { echo "tls-pure server (in process): $result" >&2; exit 1; }
+echo "$result"
+# abla/tls/pure as the SERVER: tests/cases/tls-pure/serve.ab (listening on ::1 on a free port) against openssl s_client
+# (every key kind x cipher suite x group, so the P-256 ones through a HelloRetryRequest), against the pure client,
+# with ALPN, and requiring a client certificate.
+"$compiler" build tests/cases/tls-pure/serve.ab -o "$out/serve" --no-cache
+serve_pid=
+stop_serve() {
+    [[ -z $serve_pid ]] || { kill "$serve_pid" 2> /dev/null || true; wait "$serve_pid" 2> /dev/null || true; }
+    serve_pid=
+}
+trap 'stop_serve; [[ -z $server_pid ]] || kill "$server_pid" 2> /dev/null || true' EXIT
+start_serve() {   # the serve.ab arguments; sets serve_port
+    "$out/serve" "$@" > "$out/serve.log" 2>&1 &
+    serve_pid=$!
+    for _ in $(seq 100); do
+        grep -q '^listening ' "$out/serve.log" 2> /dev/null && break
+        kill -0 "$serve_pid" 2> /dev/null || { echo "tls-pure serve: did not start: $(head -3 "$out/serve.log")" >&2; exit 1; }
+        sleep 0.1
+    done
+    serve_port=$(sed -n 's/^listening //p' "$out/serve.log" | head -1)
+    [[ -n $serve_port ]] || { echo "tls-pure serve: no port: $(head -3 "$out/serve.log")" >&2; exit 1; }
+}
+s_client() {   # the s_client options after the address; prints what the server sent
+    printf 'GET /pure HTTP/1.0\r\n\r\n' | timeout 15 openssl s_client -connect "[::1]:$serve_port" -tls1_3 -servername localhost -quiet "$@" 2> "$out/s_client.err" || true
+}
+served=0
+for kind in ed25519 p256 rsa; do
+    start_serve plain "$out/$kind.pem" "$out/$kind.key"
+    for suite in TLS_AES_128_GCM_SHA256 TLS_AES_256_GCM_SHA384 TLS_CHACHA20_POLY1305_SHA256; do
+        for group in X25519 P-256; do
+            answer=$(s_client -ciphersuites "$suite" -groups "$group" -CAfile "$out/$kind.pem" -verify_return_error -verify_hostname localhost)
+            [[ $answer == *'pure server: GET /pure'* ]] || { echo "tls-pure server ($kind $suite $group): [$answer] $(head -3 "$out/s_client.err") $(head -3 "$out/serve.log")" >&2; exit 1; }
+            served=$((served + 1))
+        done
+    done
+    # The pure client against it (one good connection, a wrong host name, an untrusted anchor).
+    result=$("$root/tools/run-limited.sh" "$out/interop" "$serve_port" "$out/$kind.pem" 4865 "$out/$([[ $kind == p256 ]] && echo rsa || echo p256).pem") || {
+        echo "tls-pure client vs pure server ($kind): $result" >&2; head -3 "$out/serve.log" >&2; exit 1; }
+    [[ $result == 'tls-pure interop ok'* ]] || { echo "tls-pure client vs pure server ($kind): $result" >&2; exit 1; }
+    stop_serve
+done
+echo "pure server: $served openssl s_client handshakes (3 key kinds x 3 suites x 2 groups) and the pure client, each key kind"
+start_serve alpn "$out/ed25519.pem" "$out/ed25519.key"
+answer=$(s_client -CAfile "$out/ed25519.pem" -alpn http/1.1,h2)
+[[ $answer == *'alpn=h2'* ]] || { echo "tls-pure server ALPN: [$answer] $(head -3 "$out/s_client.err")" >&2; exit 1; }
+answer=$(s_client -CAfile "$out/ed25519.pem" -alpn spdy)
+[[ $answer != *'pure server'* ]] || { echo "tls-pure server ALPN: a client with no protocol in common was served: [$answer]" >&2; exit 1; }
+stop_serve
+start_serve auth "$out/ed25519.pem" "$out/ed25519.key" "$out/client-p256.pem"
+answer=$(s_client -CAfile "$out/ed25519.pem" -cert "$out/client-p256.pem" -key "$out/client-p256.key")
+[[ $answer == *'client=true'* ]] || { echo "tls-pure server client certificate: [$answer] $(head -3 "$out/s_client.err") $(head -3 "$out/serve.log")" >&2; exit 1; }
+answer=$(s_client -CAfile "$out/ed25519.pem")
+[[ $answer != *'pure server'* ]] || { echo "tls-pure server: a client with no certificate was served: [$answer]" >&2; exit 1; }
+answer=$(s_client -CAfile "$out/ed25519.pem" -cert "$out/client-rsa.pem" -key "$out/client-rsa.key")
+[[ $answer != *'pure server'* ]] || { echo "tls-pure server: an untrusted client certificate was served: [$answer]" >&2; exit 1; }
+stop_serve
+echo "pure server: ALPN (server order, none in common refused) and a required client certificate (accepted, absent and untrusted refused)"
 # A bulk transfer: a 6 MB file, many records; size and SHA-256 must match (Ed25519, checked in the program).
 "$compiler" build tests/cases/tls-pure/bulk.ab -o "$out/bulk" --no-cache
 mkdir -p "$out/www"

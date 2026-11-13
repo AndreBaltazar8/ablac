@@ -427,3 +427,111 @@ fun tlsBuildCertificate(context: string, chain: array<string>): string {
 /** A CertificateVerify message from the scheme and the signature. */
 fun tlsBuildCertificateVerify(scheme: int, signature: string): string =
     tlsHandshakeMessage(TLS_CERTIFICATE_VERIFY, tlsU16(scheme) + tlsVec16(signature))
+
+// ---- the server's side: ClientHello in, the server's messages out ----
+/** What a ClientHello offers (RFC 8446 section 4.1.2): `versions` from supported_versions (empty when the
+ *  extension is absent), the key shares in the order sent, the host name, ALPN protocols. */
+class TlsClientHello(val ok: bool, val error: string, val random: string, val sessionId: string,
+    val suites: array<int>, val versions: array<int>, val groups: array<int>, val shares: array<TlsKeyShare>,
+    val schemes: array<int>, val alpn: array<string>, val serverName: string, val cookie: string)
+
+private fun tlsBadClientHello(error: string): TlsClientHello {
+    val none: array<int> = []
+    val noShares: array<TlsKeyShare> = []
+    val noNames: array<string> = []
+    TlsClientHello(false, error, "", "", none, none, none, noShares, none, noNames, "", "")
+}
+
+/** Parses a ClientHello body (without its 4-byte header). */
+fun tlsParseClientHello(body: string): TlsClientHello {
+    val reader = tlsReader(body)
+    val legacyVersion = reader.u16()
+    val random = reader.bytes(32)
+    val sessionId = reader.vec8()
+    val suiteBytes = tlsReader(reader.vec16())
+    val compression = reader.vec8()
+    val extensions = tlsParseExtensions(reader)
+    if (!reader.finished() || !extensions.ok) return tlsBadClientHello("tls: malformed ClientHello")
+    if (sessionId.size > 32) return tlsBadClientHello("tls: a session id longer than 32 bytes")
+    if (compression != tlsU8(0)) return tlsBadClientHello("tls: the ClientHello does not offer null compression only")
+    val suites: array<int> = []
+    while (suiteBytes.remaining() > 1 && suiteBytes.ok) suites.append(suiteBytes.u16())
+    if (!suiteBytes.finished() || suites.size == 0) return tlsBadClientHello("tls: malformed cipher suites")
+    val versions: array<int> = []
+    val groups: array<int> = []
+    val shares: array<TlsKeyShare> = []
+    val schemes: array<int> = []
+    val alpn: array<string> = []
+    var serverName = ""
+    var cookie = ""
+    for (extension in extensions.list) {
+        val data = tlsReader(extension.data)
+        if (extension.type == TLS_EXT_SUPPORTED_VERSIONS) {
+            val list = tlsReader(data.vec8())
+            while (list.remaining() > 1 && list.ok) versions.append(list.u16())
+            if (!data.finished() || !list.finished()) return tlsBadClientHello("tls: malformed supported_versions")
+        } else if (extension.type == TLS_EXT_SUPPORTED_GROUPS) {
+            val list = tlsReader(data.vec16())
+            while (list.remaining() > 1 && list.ok) groups.append(list.u16())
+            if (!data.finished() || !list.finished()) return tlsBadClientHello("tls: malformed supported_groups")
+        } else if (extension.type == TLS_EXT_SIGNATURE_ALGORITHMS) {
+            val list = tlsReader(data.vec16())
+            while (list.remaining() > 1 && list.ok) schemes.append(list.u16())
+            if (!data.finished() || !list.finished()) return tlsBadClientHello("tls: malformed signature_algorithms")
+        } else if (extension.type == TLS_EXT_KEY_SHARE) {
+            val list = tlsReader(data.vec16())
+            while (list.remaining() > 3 && list.ok) {
+                val group = list.u16()
+                val key = list.vec16()
+                shares.append(TlsKeyShare(group, key))
+            }
+            if (!data.finished() || !list.finished()) return tlsBadClientHello("tls: malformed key_share")
+        } else if (extension.type == TLS_EXT_SERVER_NAME) {
+            val list = tlsReader(data.vec16())
+            while (list.remaining() > 2 && list.ok) {
+                val type = list.u8()
+                val name = list.vec16()
+                if (type == 0 && serverName == "") serverName = name
+            }
+            if (!data.finished() || !list.finished()) return tlsBadClientHello("tls: malformed server_name")
+        } else if (extension.type == TLS_EXT_ALPN) {
+            val list = tlsReader(data.vec16())
+            while (list.remaining() > 0 && list.ok) alpn.append(list.vec8())
+            if (!data.finished() || !list.finished()) return tlsBadClientHello("tls: malformed ALPN")
+        } else if (extension.type == TLS_EXT_COOKIE) {
+            cookie = data.vec16()
+            if (!data.finished()) return tlsBadClientHello("tls: malformed cookie")
+        }
+    }
+    TlsClientHello(true, "", random, sessionId, suites, versions, groups, shares, schemes, alpn, serverName, cookie)
+}
+
+/** A ServerHello message: the echo of the session id, the suite, and the server's key share. */
+fun tlsBuildServerHello(random: string, sessionId: string, suite: int, share: TlsKeyShare): string =
+    tlsHandshakeMessage(TLS_SERVER_HELLO, tlsU16(771) + random + tlsVec8(sessionId) + tlsU16(suite) + tlsU8(0) +
+        tlsVec16(tlsExtension(TLS_EXT_SUPPORTED_VERSIONS, tlsU16(772)) +
+        tlsExtension(TLS_EXT_KEY_SHARE, tlsU16(share.group) + tlsVec16(share.publicKey))))
+
+/** A HelloRetryRequest: the special random, the suite, the group to retry with (and a cookie, if any). */
+fun tlsBuildHelloRetryRequest(sessionId: string, suite: int, group: int, cookie: string): string {
+    var extensions = tlsExtension(TLS_EXT_SUPPORTED_VERSIONS, tlsU16(772)) +
+        tlsExtension(TLS_EXT_KEY_SHARE, tlsU16(group))
+    if (cookie.size > 0) extensions = extensions + tlsExtension(TLS_EXT_COOKIE, tlsVec16(cookie))
+    tlsHandshakeMessage(TLS_SERVER_HELLO, tlsU16(771) + tlsHelloRetryRandom() + tlsVec8(sessionId) + tlsU16(suite) +
+        tlsU8(0) + tlsVec16(extensions))
+}
+
+/** EncryptedExtensions carrying the chosen ALPN protocol, if any. */
+fun tlsBuildEncryptedExtensions(alpn: string): string {
+    var extensions = ""
+    if (alpn.size > 0) extensions = tlsExtension(TLS_EXT_ALPN, tlsVec16(tlsVec8(alpn)))
+    tlsHandshakeMessage(TLS_ENCRYPTED_EXTENSIONS, tlsVec16(extensions))
+}
+
+/** A CertificateRequest with the schemes the server accepts. */
+fun tlsBuildCertificateRequest(context: string, schemes: array<int>): string {
+    var list = ""
+    for (scheme in schemes) list = list + tlsU16(scheme)
+    tlsHandshakeMessage(TLS_CERTIFICATE_REQUEST,
+        tlsVec8(context) + tlsVec16(tlsExtension(TLS_EXT_SIGNATURE_ALGORITHMS, tlsVec16(list))))
+}
