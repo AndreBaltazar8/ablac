@@ -1,0 +1,110 @@
+// RSASSA-PSS (RFC 8017 section 8.1, EMSA-PSS of 9.1) with MGF1 over the same hash, on abla/crypto/rsa's keys: what
+// TLS 1.3's rsa_pss_rsae_sha256, _sha384 and _sha512 and X.509's RSASSA-PSS use. The encoding and the check take no
+// secret (the message, the salt and the signature are public once sent), so they are plain code; the private
+// operation is rsa's own (blinded, CRT, in constant time, and checked with the public exponent before it returns).
+// Keys under 2048 bits are refused, as everywhere in abla/crypto/rsa.
+
+import "abla/bytes"
+import "abla/crypto"
+import "abla/ct/scrub"
+import "abla/crypto/rsa"
+
+private val PSS_MINIMUM_BITS = 2048
+
+class RsaPssHash(val size: int, val hash: (string) -> string)
+
+/** SHA-256, SHA-384 or SHA-512 by its bit length, or null. */
+fun rsaPssHash(bits: int): RsaPssHash? =
+    if (bits == 256) RsaPssHash(32, { data: string -> sha256(data) })
+    else if (bits == 384) RsaPssHash(48, { data: string -> sha384(data) })
+    else if (bits == 512) RsaPssHash(64, { data: string -> sha512(data) })
+    else null
+
+/** EMSA-PSS-ENCODE: the encoded message of `emBits` bits (the modulus's length less one) for `mHash` and `salt`, or
+ *  "" when the key is too small for this hash and salt. */
+fun rsaPssEncode(emBits: int, mHash: string, salt: string, hash: (string) -> string, hashSize: int): string {
+    val emLen = (emBits + 7) / 8
+    if (emLen < hashSize + salt.size + 2) return ""
+    val h = hash("\x00".repeat(8) + mHash + salt)
+    val db = "\x00".repeat(emLen - salt.size - hashSize - 2) + "\x01" + salt
+    val masked = binaryXor(db, rsaMgf1(h, emLen - hashSize - 1, hash))
+    val keep = 255 >> (8 * emLen - emBits)
+    byteEncode(masked[0] & keep) + masked.slice(1, masked.size) + h + "\xbc"
+}
+
+/** EMSA-PSS-VERIFY on the `emLen` bytes `em`. */
+fun rsaPssCheck(emBits: int, em: string, mHash: string, saltLength: int, hash: (string) -> string,
+    hashSize: int): bool {
+    val emLen = (emBits + 7) / 8
+    if (em.size != emLen || emLen < hashSize + saltLength + 2) return false
+    if (em[emLen - 1] != 188) return false
+    val dbSize = emLen - hashSize - 1
+    val maskedDb = em.slice(0, dbSize)
+    val h = em.slice(dbSize, dbSize + hashSize)
+    val unused = 8 * emLen - emBits
+    if (unused > 0 && (maskedDb[0] >> (8 - unused)) != 0) return false
+    val db = binaryXor(maskedDb, rsaMgf1(h, dbSize, hash))
+    val zeros = dbSize - saltLength - 1
+    val first = db[0] & (255 >> unused)
+    if (zeros > 0 && first != 0) return false
+    for (i in 1 until zeros) if (db[i] != 0) return false
+    val marker = if (zeros == 0) first else db[zeros]
+    if (marker != 1) return false
+    val salt = db.slice(zeros + 1, dbSize)
+    hash("\x00".repeat(8) + mHash + salt) == h
+}
+
+/** The signature of `message` under `key` with the salt given (fresh random bytes, the hash's length for TLS 1.3). It
+ *  is here for known-answer tests; use signPss* for a random one. */
+trusted fun rsaPssSignWithSalt(key: RsaPrivateKey, hashBits: int, message: string, salt: string): CryptoResult {
+    val result = rsaPssSignWork(key, hashBits, message, salt)
+    ctScrubStack4096()
+    return result
+}
+
+private @noinline trusted fun rsaPssSignWork(key: RsaPrivateKey, hashBits: int, message: string,
+    salt: string): CryptoResult {
+    if (!key.ok()) return cryptoFailed(key.error)
+    if (key.bits < PSS_MINIMUM_BITS) return cryptoFailed("the key has under 2048 bits")
+    val hashed = rsaPssHash(hashBits) ?? return cryptoFailed("the hash is SHA-256, SHA-384 or SHA-512")
+    val emBits = key.bits - 1
+    val em = rsaPssEncode(emBits, hashed.hash(message), salt, hashed.hash, hashed.size)
+    if (em == "") return cryptoFailed("the key is too small for this hash and salt")
+    rsaPrivateOperation(key, "\x00".repeat(key.modulus.size - em.size) + em)
+}
+
+/** RSASSA-PSS with a random salt of `saltLength` bytes (the hash's length when null) and SHA-256, -384 or -512. */
+trusted fun rsaPssSign(key: RsaPrivateKey, hashBits: int, message: string, saltLength: int? = null): CryptoResult {
+    val hashed = rsaPssHash(hashBits) ?? return cryptoFailed("the hash is SHA-256, SHA-384 or SHA-512")
+    val length = saltLength ?? hashed.size
+    if (length < 0 || length > 1024) return cryptoFailed("the salt length is out of range")
+    val salt = if (length == 0) "" else cryptoRandomBytes(length)
+    if (length > 0 && salt.size != length) return cryptoFailed("no random source here: call cryptoSetRandom")
+    rsaPssSignWithSalt(key, hashBits, message, salt)
+}
+
+trusted fun RsaPrivateKey.signPssSha256(message: string): CryptoResult = rsaPssSign(this, 256, message)
+trusted fun RsaPrivateKey.signPssSha384(message: string): CryptoResult = rsaPssSign(this, 384, message)
+trusted fun RsaPrivateKey.signPssSha512(message: string): CryptoResult = rsaPssSign(this, 512, message)
+
+/** Whether `signature` is a valid RSASSA-PSS signature of `message`: the hash and MGF1's are the same, and the salt
+ *  has `saltLength` bytes (the hash's length when null). Verification is public and takes variable time. */
+fun rsaPssVerify(key: RsaPublicKey, hashBits: int, message: string, signature: string, saltLength: int? = null): bool {
+    if (!key.ok() || key.bits < PSS_MINIMUM_BITS) return false
+    val hashed = rsaPssHash(hashBits) ?? return false
+    val length = saltLength ?? hashed.size
+    if (length < 0) return false
+    val size = key.modulus.size
+    if (signature.size != size) return false
+    val recovered = rsaPublicOperation(key, signature)
+    if (recovered == "") return false
+    val emBits = key.bits - 1
+    val emLen = (emBits + 7) / 8
+    // With a modulus of 8k+1 bits the encoded message is one byte shorter than the signature, and that byte is 0.
+    for (i in 0 until size - emLen) if (recovered[i] != 0) return false
+    rsaPssCheck(emBits, recovered.slice(size - emLen, size), hashed.hash(message), length, hashed.hash, hashed.size)
+}
+
+fun RsaPublicKey.verifyPssSha256(message: string, signature: string): bool = rsaPssVerify(this, 256, message, signature)
+fun RsaPublicKey.verifyPssSha384(message: string, signature: string): bool = rsaPssVerify(this, 384, message, signature)
+fun RsaPublicKey.verifyPssSha512(message: string, signature: string): bool = rsaPssVerify(this, 512, message, signature)

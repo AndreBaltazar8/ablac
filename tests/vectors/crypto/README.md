@@ -15,3 +15,10 @@ published test keys. Fetched 2026-10-31.
 - Wycheproof (Apache-2.0), C2SP/wycheproof `testvectors_v1/ed25519_test.json` (the last commit that touched it, a3d5d1423f2592d6646836a45a21a1b209da9f4d, fetched
   2026-11-13), kept as the original JSON in `wycheproof-ed25519.json` (210 verification cases: valid, invalid and acceptable); read by
   `tests/cases/ed25519/main.ab` through abla/json, run by `tools/test-ed25519.sh`.
+
+## wycheproof/ (JSON, as published)
+
+Wycheproof (Apache-2.0), C2SP/wycheproof `testvectors_v1` at 65ca494727a52944c204441c860b039e6786b99b (master when fetched), fetched 2026-11-13: `chacha20_poly1305_test.json`
+(read by `tests/cases/crypto-chacha/wycheproof.ab`, `tools/test-crypto-chacha.sh`) and `rsa_pss_{2048_sha256_mgf1_32,
+2048_sha256_mgf1_0,3072_sha256_mgf1_32,4096_sha512_mgf1_32}_test.json` (read by `tests/cases/crypto-pss/vectors.ab`,
+`tools/test-crypto-pss.sh`). Parsed with abla/json, not converted.

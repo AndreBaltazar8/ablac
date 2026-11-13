@@ -8,6 +8,7 @@
 | `abla/crypto/p384` | NIST P-384 ECDSA verification (for certificates), in Abla |
 | `abla/crypto/x509` | X.509 certificates: parsing, chain building and validation (RFC 5280), host names (RFC 6125), a trust store, in Abla |
 | `abla/crypto/chacha20poly1305` | ChaCha20, Poly1305 and the RFC 8439 AEAD: in Abla, on every target |
+| `abla/crypto/rsapss` | RSASSA-PSS (SHA-256, -384, -512; MGF1 over the same hash) on `abla/crypto/rsa` keys: in Abla, on every target |
 | `abla/crypto/hosted` | the same and more, through OpenSSL |
 | `abla/random` | a cryptographically secure source (`getrandom(2)`) |
 | `abla/date` | UTC calendar dates, ISO 8601 and HTTP dates |
@@ -224,6 +225,16 @@ nonce 12 (never reuse a nonce under a key). `chaCha20Xor(key, counter, nonce, da
 `poly1305(key, message)` the bare one-time authenticator, for protocols that build on them (TLS 1.3 uses the AEAD). The secret-handling
 cores are read in the generated code of x86-64, AArch64, Wasm and Xtensa by `tools/test-ct.sh`, with a leaking twin of each kind that
 the check must catch. Tests: RFC 8439's vectors on every target, and every message length from 0 to 200 against Node.
+
+## `abla/crypto/rsapss`
+
+RSASSA-PSS (RFC 8017) over `abla/crypto/rsa`'s keys, for TLS 1.3's `rsa_pss_rsae_*` and X.509: `key.signPssSha256(message)` (also
+`signPssSha384`, `signPssSha512`) signs with a random salt of the hash's length; `publicKey.verifyPssSha256(message, signature)`
+(and the others) checks one. `rsaPssSign(key, hashBits, message, saltLength)` and `rsaPssVerify(key, hashBits, message, signature,
+saltLength)` take another salt length (0 is common); `rsaPssSignWithSalt` signs with a salt you give, for known-answer tests. Keys
+under 2048 bits are refused. The private operation is `abla/crypto/rsa`'s (blinded, CRT, constant time); the encoding and the
+check hold nothing secret and take variable time. Tests: Wycheproof's RSA-PSS vectors (2048, 3072, 4096 bits, SHA-256 and -512, salt
+lengths 32 and 0), and signing and verifying against Node, including a given salt byte for byte.
 
 ## `abla/crypto/aes` and `abla/crypto/rsa`
 
