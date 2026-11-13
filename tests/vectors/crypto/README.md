@@ -22,3 +22,10 @@ Wycheproof (Apache-2.0), C2SP/wycheproof `testvectors_v1` at 65ca494727a52944c20
 (read by `tests/cases/crypto-chacha/wycheproof.ab`, `tools/test-crypto-chacha.sh`) and `rsa_pss_{2048_sha256_mgf1_32,
 2048_sha256_mgf1_0,3072_sha256_mgf1_32,4096_sha512_mgf1_32}_test.json` (read by `tests/cases/crypto-pss/vectors.ab`,
 `tools/test-crypto-pss.sh`). Parsed with abla/json, not converted.
+
+Also from C2SP/wycheproof `testvectors_v1` at 65ca494727a52944c204441c860b039e6786b99b, fetched 2026-11-13, for the
+primitives abla/tls/pure uses that had no Wycheproof test: `x25519_test.json`, `ecdh_secp256r1_ecpoint_test.json`,
+`ecdsa_secp256r1_sha256_test.json`, `ecdsa_secp384r1_sha384_test.json` (DER signatures), `hkdf_sha256_test.json`,
+`hkdf_sha384_test.json`, `hmac_sha256_test.json`, `hmac_sha384_test.json`, `rsa_signature_2048_sha384_test.json`,
+`rsa_signature_2048_sha512_test.json` and `rsa_pss_2048_sha384_mgf1_48_test.json` (read by
+`tests/cases/crypto-pure/wycheproof-tls.ab`, `tools/test-crypto-pure.sh`).

@@ -1,0 +1,248 @@
+// Wycheproof (tests/vectors/crypto/wycheproof, JSON as published) for the primitives abla/tls/pure uses that had no
+// Wycheproof test yet: X25519, P-256 ECDH (uncompressed points, as TLS sends them), ECDSA P-256/SHA-256 and
+// P-384/SHA-384 (DER signatures, as TLS sends them), HKDF-SHA256/384, HMAC-SHA256/384, RSA PKCS#1 v1.5 with SHA-384 and
+// SHA-512 and RSA-PSS with SHA-384. (AES-GCM, ChaCha20-Poly1305, Ed25519, RSA-PSS SHA-256/512 and PKCS#1 SHA-256 have
+// their own Wycheproof tests.) "valid" must succeed with the expected output, "invalid" must fail (or, for a MAC or a
+// key exchange, give another output), "acceptable" may do either but a success must give the expected output.
+// Prints a count per file and the acceptable cases each primitive accepted; exit 1 on any failure.
+// Usage: wycheproof-tls VECTORS_DIRECTORY
+import "abla/io"
+import "abla/crypto"
+import "abla/crypto/hkdf"
+import "abla/crypto/p256"
+import "abla/crypto/p384"
+import "abla/crypto/rsa"
+import "abla/crypto/rsapss"
+import "abla/crypto/x25519"
+import "abla/integer"
+import "abla/json"
+import "abla/process/arguments"
+import "abla/sys/linux"
+
+var failures = 0
+var acceptedAcceptable = 0
+
+fun fail(file: string, number: int, why: string): void {
+    failures = failures + 1
+    if (failures < 60) println("FAIL $file test $number: $why")
+    return
+}
+
+fun load(directory: string, name: string): Json? {
+    val parsed = jsonParse(linuxReadFile("$directory/wycheproof/$name", 16777216))
+    if (!parsed.succeeded) {
+        fail(name, 0, "the JSON did not parse: ${parsed.error.message}")
+        return null
+    }
+    parsed.value
+}
+
+/** The scalar as 32 bytes: Wycheproof writes P-256 private keys as DER integers (a leading zero when the top bit is
+ *  set, sometimes shorter). */
+fun scalar32(hex: string): string {
+    var bytes = hexDecode(hex)
+    while (bytes.size > 32 && bytes[0] == 0) bytes = bytes.slice(1, bytes.size)
+    while (bytes.size < 32) bytes = cryptoByteString([0]) + bytes
+    bytes
+}
+
+/** Checks one outcome: `succeeded` with `output` against the case's result and `expected`. */
+fun judge(name: string, number: int, result: string, comment: string, succeeded: bool, output: string,
+    expected: string): void {
+    if (result == "valid") {
+        if (!succeeded) fail(name, number, "a valid case failed: $comment")
+        else if (output != expected) fail(name, number, "a valid case gave another output: $comment")
+    } else if (result == "invalid") {
+        if (succeeded && output == expected) fail(name, number, "an invalid case succeeded: $comment")
+    } else if (result == "acceptable") {
+        if (succeeded) {
+            acceptedAcceptable = acceptedAcceptable + 1
+            if (output != expected) fail(name, number, "an acceptable case gave another output: $comment")
+        }
+    } else fail(name, number, "result $result")
+    return
+}
+
+fun judgeVerify(name: string, number: int, result: string, comment: string, accepted: bool): void {
+    if (result == "valid" && !accepted) fail(name, number, "a valid signature was refused: $comment")
+    else if (result == "invalid" && accepted) fail(name, number, "an invalid signature was accepted: $comment")
+    else if (result == "acceptable" && accepted) acceptedAcceptable = acceptedAcceptable + 1
+    return
+}
+
+fun x25519File(directory: string, name: string): int {
+    val root = load(directory, name)
+    if (root == null) return 0
+    var count = 0
+    var zeroRefused = 0
+    var zeroTotal = 0
+    val zero = cryptoByteString([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    val groups = root.get("testGroups")
+    for (g in 0 until groups.size()) {
+        val tests = groups.at(g).get("tests")
+        for (t in 0 until tests.size()) {
+            val test = tests.at(t)
+            val expected = hexDecode(test.getString("shared"))
+            val outcome = x25519(hexDecode(test.getString("private")), hexDecode(test.getString("public")))
+            if (expected == zero) {
+                zeroTotal = zeroTotal + 1
+                if (!outcome.ok) zeroRefused = zeroRefused + 1
+            }
+            judge(name, test.getInt("tcId"), test.getString("result"), test.getString("comment"), outcome.ok,
+                if (outcome.ok) outcome.bytes else "", expected)
+            count = count + 1
+        }
+    }
+    println("x25519: $zeroRefused of $zeroTotal all-zero shared secrets refused by the primitive")
+    count
+}
+
+fun ecdhFile(directory: string, name: string): int {
+    val root = load(directory, name)
+    if (root == null) return 0
+    var count = 0
+    val groups = root.get("testGroups")
+    for (g in 0 until groups.size()) {
+        val tests = groups.at(g).get("tests")
+        for (t in 0 until tests.size()) {
+            val test = tests.at(t)
+            val outcome = p256Ecdh(scalar32(test.getString("private")), hexDecode(test.getString("public")))
+            judge(name, test.getInt("tcId"), test.getString("result"), test.getString("comment"), outcome.ok,
+                if (outcome.ok) outcome.bytes else "", hexDecode(test.getString("shared")))
+            count = count + 1
+        }
+    }
+    count
+}
+
+fun ecdsaFile(directory: string, name: string, p384: bool): int {
+    val root = load(directory, name)
+    if (root == null) return 0
+    var count = 0
+    val groups = root.get("testGroups")
+    for (g in 0 until groups.size()) {
+        val group = groups.at(g)
+        val key = hexDecode(group.get("publicKey").getString("uncompressed"))
+        val tests = group.get("tests")
+        for (t in 0 until tests.size()) {
+            val test = tests.at(t)
+            val message = hexDecode(test.getString("msg"))
+            val signature = hexDecode(test.getString("sig"))
+            val accepted = if (p384) p384EcdsaVerify(key, message, signature) else p256EcdsaVerify(key, message, signature)
+            judgeVerify(name, test.getInt("tcId"), test.getString("result"), test.getString("comment"), accepted)
+            count = count + 1
+        }
+    }
+    count
+}
+
+fun hkdfFile(directory: string, name: string, hash: int): int {
+    val root = load(directory, name)
+    if (root == null) return 0
+    var count = 0
+    val groups = root.get("testGroups")
+    for (g in 0 until groups.size()) {
+        val tests = groups.at(g).get("tests")
+        for (t in 0 until tests.size()) {
+            val test = tests.at(t)
+            val outcome = hkdf(hash, hexDecode(test.getString("salt")), hexDecode(test.getString("ikm")),
+                hexDecode(test.getString("info")), test.getInt("size"))
+            judge(name, test.getInt("tcId"), test.getString("result"), test.getString("comment"), outcome.ok,
+                if (outcome.ok) outcome.bytes else "", hexDecode(test.getString("okm")))
+            count = count + 1
+        }
+    }
+    count
+}
+
+fun hmacFile(directory: string, name: string, sha384: bool): int {
+    val root = load(directory, name)
+    if (root == null) return 0
+    var count = 0
+    val groups = root.get("testGroups")
+    for (g in 0 until groups.size()) {
+        val group = groups.at(g)
+        val tagBytes = group.getInt("tagSize") / 8
+        val tests = group.get("tests")
+        for (t in 0 until tests.size()) {
+            val test = tests.at(t)
+            val key = hexDecode(test.getString("key"))
+            val message = hexDecode(test.getString("msg"))
+            val full = if (sha384) hmacSha384(key, message) else hmacSha256(key, message)
+            judge(name, test.getInt("tcId"), test.getString("result"), test.getString("comment"), true,
+                full.slice(0, tagBytes), hexDecode(test.getString("tag")))
+            count = count + 1
+        }
+    }
+    count
+}
+
+private val DIGEST_INFO_SHA384 = "\x30\x41\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x02\x05\x00\x04\x30"
+private val DIGEST_INFO_SHA512 = "\x30\x51\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x03\x05\x00\x04\x40"
+
+fun rsaFile(directory: string, name: string, sha512: bool): int {
+    val root = load(directory, name)
+    if (root == null) return 0
+    var count = 0
+    val groups = root.get("testGroups")
+    for (g in 0 until groups.size()) {
+        val group = groups.at(g)
+        val key = rsaPublicKeyFromDer(hexDecode(group.getString("publicKeyDer")))
+        if (!key.ok()) {
+            fail(name, 0, "the key did not parse: ${key.error}")
+            continue
+        }
+        val tests = group.get("tests")
+        for (t in 0 until tests.size()) {
+            val test = tests.at(t)
+            val message = hexDecode(test.getString("msg"))
+            val accepted = if (sha512) rsaVerifyWith(key, DIGEST_INFO_SHA512, sha512(message), hexDecode(test.getString("sig")))
+                else rsaVerifyWith(key, DIGEST_INFO_SHA384, sha384(message), hexDecode(test.getString("sig")))
+            judgeVerify(name, test.getInt("tcId"), test.getString("result"), test.getString("comment"), accepted)
+            count = count + 1
+        }
+    }
+    count
+}
+
+fun pssFile(directory: string, name: string): int {
+    val root = load(directory, name)
+    if (root == null) return 0
+    var count = 0
+    val groups = root.get("testGroups")
+    for (g in 0 until groups.size()) {
+        val group = groups.at(g)
+        val key = rsaPublicKeyFromDer(hexDecode(group.getString("publicKeyDer")))
+        if (!key.ok()) {
+            fail(name, 0, "the key did not parse: ${key.error}")
+            continue
+        }
+        val saltLength = group.getInt("sLen")
+        val tests = group.get("tests")
+        for (t in 0 until tests.size()) {
+            val test = tests.at(t)
+            val accepted = rsaPssVerify(key, 384, hexDecode(test.getString("msg")), hexDecode(test.getString("sig")), saltLength)
+            judgeVerify(name, test.getInt("tcId"), test.getString("result"), test.getString("comment"), accepted)
+            count = count + 1
+        }
+    }
+    count
+}
+
+fun main: int {
+    val directory = processArgument(0)
+    println("x25519_test.json ${x25519File(directory, "x25519_test.json")}")
+    println("ecdh_secp256r1_ecpoint_test.json ${ecdhFile(directory, "ecdh_secp256r1_ecpoint_test.json")}")
+    println("ecdsa_secp256r1_sha256_test.json ${ecdsaFile(directory, "ecdsa_secp256r1_sha256_test.json", false)}")
+    println("ecdsa_secp384r1_sha384_test.json ${ecdsaFile(directory, "ecdsa_secp384r1_sha384_test.json", true)}")
+    println("hkdf_sha256_test.json ${hkdfFile(directory, "hkdf_sha256_test.json", HKDF_SHA256)}")
+    println("hkdf_sha384_test.json ${hkdfFile(directory, "hkdf_sha384_test.json", HKDF_SHA384)}")
+    println("hmac_sha256_test.json ${hmacFile(directory, "hmac_sha256_test.json", false)}")
+    println("hmac_sha384_test.json ${hmacFile(directory, "hmac_sha384_test.json", true)}")
+    println("rsa_signature_2048_sha384_test.json ${rsaFile(directory, "rsa_signature_2048_sha384_test.json", false)}")
+    println("rsa_signature_2048_sha512_test.json ${rsaFile(directory, "rsa_signature_2048_sha512_test.json", true)}")
+    println("rsa_pss_2048_sha384_mgf1_48_test.json ${pssFile(directory, "rsa_pss_2048_sha384_mgf1_48_test.json")}")
+    println("acceptable cases accepted $acceptedAcceptable")
+    println("failures $failures")
+    if (failures == 0) 0 else 1
+}

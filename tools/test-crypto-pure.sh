@@ -3,6 +3,7 @@
 # hardware and software paths, on this CPU and on one with no AES (qemu64); refusals; random inputs against
 # abla/crypto/hosted and the openssl CLI; known answers run on AArch64 under qemu and Wasm under Node, and
 # compiled for Xtensa; and that neither links OpenSSL. What's read of the code is in tools/test-ct.sh.
+# Wycheproof for X25519, P-256 ECDH, ECDSA, HKDF, HMAC and RSA SHA-384/512 (wycheproof-tls.ab).
 # CRYPTO_ROUNDS sets random rounds (default 30). The 2048-bit key is freshly generated; weak/PSS keys are fixtures.
 set -uo pipefail
 
@@ -26,7 +27,7 @@ random_hex() { head -c "$1" /dev/urandom | od -An -vtx1 | tr -d ' \n'; }
 
 # (At once: each writes only its own files.)
 pids=()
-programs=(vectors edge tool against-hosted both kat-native)
+programs=(vectors edge tool against-hosted both kat-native wycheproof-tls)
 for program in "${programs[@]}"; do
     "$compiler" build "$cases/$program.ab" -o "$out/$program" --no-cache \
         > "$out/$program.build.log" 2>&1 &
@@ -48,6 +49,13 @@ if qemu-x86_64 -cpu qemu64 "$out/vectors" tests/vectors/crypto > "$out/vectors-q
     echo "ok   vectors under qemu64, no AES or CLMUL: $(grep -v failures "$out/vectors-qemu.log" | head -1)"
 else
     fail "vectors under qemu64"; tail -20 "$out/vectors-qemu.log"
+fi
+
+# Wycheproof for the other primitives TLS uses (X25519, P-256 ECDH, ECDSA P-256/P-384, HKDF, HMAC, RSA SHA-384/512, PSS-384).
+if "$out/wycheproof-tls" tests/vectors/crypto > "$out/wycheproof-tls.log" 2>&1; then
+    echo "ok   wycheproof (TLS primitives): $(grep "_test.json" "$out/wycheproof-tls.log" | awk '{ n += $2 } END { print n " tests" }'), $(grep "^x25519:" "$out/wycheproof-tls.log")"
+else
+    fail wycheproof-tls; tail -20 "$out/wycheproof-tls.log"
 fi
 
 # --- Keys, refusals ------------------------------------------------------------------------
