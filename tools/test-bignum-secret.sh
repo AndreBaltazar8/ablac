@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fixed-width secret arithmetic against Python's arbitrary-precision integer oracle.
+# Fixed-width secret arithmetic against a BigInt oracle.
 set -euo pipefail
 compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
@@ -24,15 +24,15 @@ echo "ok   private bignum helpers are inaccessible"
 for mode in --fast ''; do
     label=${mode:---release}
     "$compiler" build "$out/run.ab" -o "$out/oracle" --no-cache $mode
-    python3 -I tests/cases/crypto-bignum-secret/oracle.py "$PWD/$out/oracle" "$PWD/$out"
+    node tests/cases/crypto-bignum-secret/oracle.mjs "$PWD/$out/oracle" "$PWD/$out"
     "$compiler" build "$out/alias.ab" -o "$out/alias" --no-cache $mode
     "$out/alias" || { echo "overlap guard failed" >&2; exit 1; }
     echo "ok   overlap guards reject aliased buffers"
     echo "ok   bignum secret $label"
 done
-# Cross-target numeric oracle: Python supplies the expected integers, and the
+# Cross-target numeric oracle: BigInt supplies the expected integers, and the
 # static no-libc executable runs under qemu-aarch64 without a network or files.
-python3 -I tests/cases/crypto-bignum-secret/aarch64-kat.py "$out/aarch64-kat.ab"
+node tests/cases/crypto-bignum-secret/aarch64-kat.mjs "$out/aarch64-kat.ab"
 sed -n '/^\/\/ BEGIN RSA SECRET BIGNUM PRIMITIVES$/,/^\/\/ END RSA SECRET BIGNUM PRIMITIVES$/p' stdlib/abla/crypto/rsa/entry.ab >> "$out/aarch64-kat.ab"
 "$compiler" build tests/cases/crypto-bignum-secret/aarch64-build.ab -o "$out/aarch64-driver" --no-cache
 llvm-mc -triple aarch64-linux-gnu -filetype=obj tests/cases/simd/aarch64-start.s -o "$out/aarch64-start.o"
