@@ -798,6 +798,7 @@ static long darwin_signalfd_read(int slot, int descriptor,
 // The image's identity is therefore recorded before main, and a path that no
 // longer names that image (an install renamed a new file over it) does not
 // resolve: the caller sees ENOENT instead of another program's bytes.
+#if !ABLA_DARWIN_SYSCALLS
 static int darwin_image_known;
 static dev_t darwin_image_device;
 static ino_t darwin_image_inode;
@@ -837,6 +838,7 @@ static const char *darwin_linux_path(const char *path, char *buffer) {
   }
   return buffer;
 }
+#endif
 
 int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
                                   int64_t argument1, int64_t argument2,
@@ -1052,6 +1054,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     result = fork();
 #endif
     break;
+#if !ABLA_DARWIN_SYSCALLS
   case 59: {
 #if TARGET_OS_IOS
     errno = ENOTSUP;
@@ -1066,6 +1069,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
 #endif
     break;
   }
+#endif
 #if !ABLA_DARWIN_SYSCALLS
   case 60:
   case 231:
@@ -1139,6 +1143,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
                      (const char *)(uintptr_t)argument1);
     break;
 #endif
+#if !ABLA_DARWIN_SYSCALLS
   case 89: {
     // Like Linux, the byte count without a terminator. The virtual image
     // link follows the same recorded-image check as open/stat; ordinary
@@ -1164,6 +1169,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     }
     break;
   }
+#endif
 #if !ABLA_DARWIN_SYSCALLS
   case 90:
     result = chmod((const char *)(uintptr_t)argument0, (mode_t)argument1);
@@ -1235,6 +1241,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
                              (const void *)(uintptr_t)argument3);
     break;
 #endif
+#if !ABLA_DARWIN_SYSCALLS
   case 257: {
     char executable[PATH_MAX];
     const char *requested = (const char *)(uintptr_t)argument1;
@@ -1255,6 +1262,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     }
     break;
   }
+#endif
 #if !ABLA_DARWIN_SYSCALLS
   case 258:
     result = mkdirat((int)argument0, (const char *)(uintptr_t)argument1,
@@ -1280,6 +1288,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
                           RENAME_EXCL);
     break;
 #endif
+#if !ABLA_DARWIN_SYSCALLS
   case 262: {
     struct stat information;
     char executable[PATH_MAX];
@@ -1300,6 +1309,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     }
     break;
   }
+#endif
 #if !ABLA_DARWIN_SYSCALLS
   case 288: {
     struct sockaddr_storage address;

@@ -75,6 +75,7 @@ trusted fun __ablaRuntimePlatformMutexBytes(): int = 64
 // module and abla/platform/host must not see two (and the cross-target
 // merge, bootstrapCtSameIntrinsic, takes them as one).
 private noescape extern:"intrinsic" fun ablaHostIsMacOS(): bool
+private noescape extern:"intrinsic" fun ablaLinuxEnvironmentPointer(): i64*
 private noescape extern:"intrinsic" fun ablaHostIsIOS(): bool
 private noescape extern:"intrinsic" fun ablaHostOwnsRuntime(): bool
 
@@ -3906,6 +3907,121 @@ trusted fun __ablaRuntimeDarwinRlimit(number: int, which: int, limits: int): int
     __ablaRuntimeDarwinResult(raw)
 }
 
+// ---- the running image's path, "/proc/self/exe" (#811) ----
+// A macOS program's image is known by the path the kernel passed in apple[0]
+// ("executable_path=..."), and by the (device, inode) the file had when the program started
+// (recorded first thing in main by __ablaRuntimeDarwinRecordImage; a program built by a
+// compiler without that hook records at its first use). A path that no longer names that file (an
+// install renamed another over it) does not resolve: the caller sees ENOENT, never another
+// program's bytes. State words: +0 0 not recorded yet, 1 recorded, 2 unknown (no path or no
+// stat); +8 device, +16 inode, +24 path address (a mapping), +32 path length.
+trusted fun __ablaRuntimeDarwinImageState(): int = nativeStaticAllocate(48)
+
+// The Darwin `struct stat64` of `path` into the 144-byte block at `block`: 0 or a negative errno.
+trusted fun __ablaRuntimeDarwinStatPath(path: int, block: int): int =
+    ablaDarwinSyscall(338, path, block, 0, 0, 0, 0)
+
+trusted fun __ablaRuntimeDarwinRecordImage(): void {
+    if (!ablaHostIsMacOS()) return
+    val state = __ablaRuntimeDarwinImageState()
+    if (ablaRuntimeLoadI64(state) != 0) return
+    ablaRuntimeStoreI64(state, 2)
+    val environment = nativePointerAddress(ablaLinuxEnvironmentPointer())
+    if (environment == 0) return
+    var cursor = environment
+    while (ablaRuntimeLoadI64(cursor) != 0) cursor = cursor + 8
+    val entry = ablaRuntimeLoadI64(cursor + 8)
+    if (entry == 0) return
+    // "executable_path=" is 16 bytes, little endian in two words.
+    var index = 0
+    while (index < 16) {
+        val word = if (index < 8) 7089075335985461349 else 4424914595737462124
+        val shift = if (index < 8) index * 8 else (index - 8) * 8
+        if (ablaRuntimeLoadU8(entry + index) != ((word >> shift) & 255)) return
+        index = index + 1
+    }
+    val path = entry + 16
+    var length = 0
+    while (ablaRuntimeLoadU8(path + length) != 0) length = length + 1
+    if (length == 0 || length >= 1024) return
+    val memory = ablaDarwinSyscall(197, 0, 1280, 3, 4098, -1, 0)
+    if (memory < 0 && memory > -4096) return
+    var copy = 0
+    while (copy <= length) {
+        ablaRuntimeStoreU8(memory + copy, ablaRuntimeLoadU8(path + copy))
+        copy = copy + 1
+    }
+    val block = memory + 1024
+    if (__ablaRuntimeDarwinStatPath(memory, block) != 0) {
+        ablaDarwinSyscall(73, memory, 1280, 0, 0, 0, 0)
+        return
+    }
+    ablaRuntimeStoreI64(state + 8, ablaRuntimeLoadI32(block))
+    ablaRuntimeStoreI64(state + 16, ablaRuntimeLoadI64(block + 8))
+    ablaRuntimeStoreI64(state + 24, memory)
+    ablaRuntimeStoreI64(state + 32, length)
+    ablaRuntimeStoreI64(state, 1)
+    return
+}
+
+// The recorded path of the running image (a NUL-terminated address) while it still names the
+// recorded file, 0 otherwise.
+trusted fun __ablaRuntimeDarwinImagePath(): int {
+    val state = __ablaRuntimeDarwinImageState()
+    if (ablaRuntimeLoadI64(state) == 0) __ablaRuntimeDarwinRecordImage()
+    if (ablaRuntimeLoadI64(state) != 1) return 0
+    val path = ablaRuntimeLoadI64(state + 24)
+    val block = ablaDarwinSyscall(197, 0, 144, 3, 4098, -1, 0)
+    if (block < 0 && block > -4096) return 0
+    val same = __ablaRuntimeDarwinStatPath(path, block) == 0 &&
+        ablaRuntimeLoadI32(block) == ablaRuntimeLoadI64(state + 8) &&
+        ablaRuntimeLoadI64(block + 8) == ablaRuntimeLoadI64(state + 16)
+    ablaDarwinSyscall(73, block, 144, 0, 0, 0, 0)
+    if (same) path else 0
+}
+
+// True when the descriptor's file is the recorded image.
+trusted fun __ablaRuntimeDarwinDescriptorIsImage(descriptor: int): bool {
+    val state = __ablaRuntimeDarwinImageState()
+    val block = ablaDarwinSyscall(197, 0, 144, 3, 4098, -1, 0)
+    if (block < 0 && block > -4096) return false
+    val same = ablaDarwinSyscall(339, descriptor, block, 0, 0, 0, 0) == 0 &&
+        ablaRuntimeLoadI32(block) == ablaRuntimeLoadI64(state + 8) &&
+        ablaRuntimeLoadI64(block + 8) == ablaRuntimeLoadI64(state + 16)
+    ablaDarwinSyscall(73, block, 144, 0, 0, 0, 0)
+    same
+}
+
+trusted fun __ablaRuntimeDarwinImageOpen(directory: int, flags: int, mode: int): int {
+    val path = __ablaRuntimeDarwinImagePath()
+    if (path == 0) return -2
+    val descriptor = ablaDarwinSyscall(
+        463, __ablaRuntimeDarwinDirectory(directory), path, __ablaRuntimeDarwinOpenFlags(flags),
+        mode, 0, 0)
+    if (descriptor < 0) return __ablaRuntimeDarwinResult(descriptor)
+    // The file opened is the one checked: a rename between the path check and the open must not
+    // hand out the replacement's bytes.
+    if (!__ablaRuntimeDarwinDescriptorIsImage(descriptor)) {
+        ablaDarwinSyscall(6, descriptor, 0, 0, 0, 0, 0)
+        return -2
+    }
+    descriptor
+}
+
+trusted fun __ablaRuntimeDarwinImageReadlink(buffer: int, capacity: int): int {
+    if (capacity <= 0) return -22
+    val path = __ablaRuntimeDarwinImagePath()
+    if (path == 0) return -2
+    val length = ablaRuntimeLoadI64(__ablaRuntimeDarwinImageState() + 32)
+    val count = if (length > capacity) capacity else length
+    var copy = 0
+    while (copy < count) {
+        ablaRuntimeStoreU8(buffer + copy, ablaRuntimeLoadU8(path + copy))
+        copy = copy + 1
+    }
+    count
+}
+
 trusted fun __ablaRuntimeDarwinSyscall(
     number: int,
     argument0: int,
@@ -4000,26 +4116,36 @@ trusted fun __ablaRuntimeDarwinSyscall(
     if (number == 35) return __ablaRuntimeDarwinNanosleep(argument0)
     if (number == 278 || number == 318) return __ablaRuntimeDarwinGetrandom(argument0, argument1)
     // The stat family, readlink, openat, getdents and getcwd. The running image's path
-    // ("/proc/self/exe") stays with the C adapter, which holds its identity.
+    // ("/proc/self/exe") resolves to the recorded executable path, checked against its identity.
     if (number == 5) {
         // The 144-byte Darwin record lands in the caller's 144-byte buffer and is rewritten in place.
         val raw = ablaDarwinSyscall(339, argument0, argument1, 0, 0, 0, 0)
         if (raw == 0) __ablaRuntimeDarwinStat(argument1, argument1)
         return __ablaRuntimeDarwinResult(raw)
     }
-    if (number == 262 && !__ablaRuntimeDarwinNamesImage(argument1)) {
-        val raw = ablaDarwinSyscall(470, __ablaRuntimeDarwinDirectory(argument0), argument1,
+    if (number == 262) {
+        val named =
+            if (__ablaRuntimeDarwinNamesImage(argument1)) __ablaRuntimeDarwinImagePath() else argument1
+        if (named == 0) return -2
+        val raw = ablaDarwinSyscall(470, __ablaRuntimeDarwinDirectory(argument0), named,
             argument2,
             if ((argument3 & 256) != 0) 32 else 0, 0, 0)
         if (raw == 0) __ablaRuntimeDarwinStat(argument2, argument2)
         return __ablaRuntimeDarwinResult(raw)
     }
-    if (number == 257 &&
-        !__ablaRuntimeDarwinNamesImage(argument1)) return __ablaRuntimeDarwinResult(
+    if (number == 257) {
+        if (__ablaRuntimeDarwinNamesImage(argument1)) return __ablaRuntimeDarwinImageOpen(
+            argument0, argument2, argument3)
+        return __ablaRuntimeDarwinResult(
             ablaDarwinSyscall(463, __ablaRuntimeDarwinDirectory(argument0), argument1,
                 __ablaRuntimeDarwinOpenFlags(argument2), argument3, 0, 0))
-    if (number == 89 && !__ablaRuntimeDarwinNamesImage(argument0)) return __ablaRuntimeDarwinResult(
-        ablaDarwinSyscall(58, argument0, argument1, argument2, 0, 0, 0))
+    }
+    if (number == 89) {
+        if (__ablaRuntimeDarwinNamesImage(argument0)) return __ablaRuntimeDarwinImageReadlink(
+            argument1, argument2)
+        return __ablaRuntimeDarwinResult(
+            ablaDarwinSyscall(58, argument0, argument1, argument2, 0, 0, 0))
+    }
     if (number == 217) return __ablaRuntimeDarwinGetdents(argument0, argument1, argument2)
     if (number == 79) return __ablaRuntimeDarwinGetcwd(argument0, argument1)
     // Sockets and readiness (#811 group 4): see the section above the dispatcher.
@@ -4050,10 +4176,14 @@ trusted fun __ablaRuntimeDarwinSyscall(
         return __ablaRuntimeDarwinResult(queue)
     }
     // Processes (#811 group 5): the section above the dispatcher. execve of the running image's
-    // own name stays with the C adapter, which holds its identity; wait4 passes no rusage (a
-    // Linux buffer is not Darwin's layout).
-    if (number == 59 && !__ablaRuntimeDarwinNamesImage(argument0)) return __ablaRuntimeDarwinResult(
-        ablaDarwinSyscall(59, argument0, argument1, argument2, 0, 0, 0))
+    // own name runs the recorded path; wait4 passes no rusage (a Linux buffer is not Darwin's layout).
+    if (number == 59) {
+        val program =
+            if (__ablaRuntimeDarwinNamesImage(argument0)) __ablaRuntimeDarwinImagePath() else argument0
+        if (program == 0) return -2
+        return __ablaRuntimeDarwinResult(ablaDarwinSyscall(59, program, argument1, argument2, 0, 0,
+            0))
+    }
     if (number == 61) return __ablaRuntimeDarwinResult(
         ablaDarwinSyscall(7, argument0, argument1, argument2, 0, 0, 0))
     if (number == 62) return __ablaRuntimeDarwinKill(argument0, argument1)
