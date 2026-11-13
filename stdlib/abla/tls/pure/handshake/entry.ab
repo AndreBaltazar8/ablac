@@ -1,0 +1,345 @@
+// TLS 1.3 handshake messages (RFC 8446 section 4): a bounds-checked reader, the encoders for the
+// messages a client sends, and the parsers for the ones it receives. Sans-IO: strings in, strings
+// out. A parser never reads outside its input and never trusts a length: a message that is too short,
+// has bytes left over, repeats an extension, or breaks a length gives `ok` false and an error.
+
+import "abla/crypto"
+
+// ---- handshake message types and code points ----
+val TLS_CLIENT_HELLO = 1
+val TLS_SERVER_HELLO = 2
+val TLS_NEW_SESSION_TICKET = 4
+val TLS_END_OF_EARLY_DATA = 5
+val TLS_ENCRYPTED_EXTENSIONS = 8
+val TLS_CERTIFICATE = 11
+val TLS_CERTIFICATE_REQUEST = 13
+val TLS_CERTIFICATE_VERIFY = 15
+val TLS_FINISHED = 20
+val TLS_KEY_UPDATE = 24
+val TLS_MESSAGE_HASH = 254
+
+val TLS_SUITE_AES_128_GCM_SHA256 = 4865
+val TLS_SUITE_AES_256_GCM_SHA384 = 4866
+val TLS_SUITE_CHACHA20_POLY1305_SHA256 = 4867
+
+val TLS_GROUP_SECP256R1 = 23
+val TLS_GROUP_SECP384R1 = 24
+val TLS_GROUP_X25519 = 29
+
+val TLS_EXT_SERVER_NAME = 0
+val TLS_EXT_SUPPORTED_GROUPS = 10
+val TLS_EXT_SIGNATURE_ALGORITHMS = 13
+val TLS_EXT_ALPN = 16
+val TLS_EXT_PSK_KEY_EXCHANGE_MODES = 45
+val TLS_EXT_SUPPORTED_VERSIONS = 43
+val TLS_EXT_COOKIE = 44
+val TLS_EXT_KEY_SHARE = 51
+
+val TLS_SIG_ECDSA_SECP256R1_SHA256 = 1027
+val TLS_SIG_ECDSA_SECP384R1_SHA384 = 1283
+val TLS_SIG_RSA_PSS_RSAE_SHA256 = 2052
+val TLS_SIG_RSA_PSS_RSAE_SHA384 = 2053
+val TLS_SIG_RSA_PSS_RSAE_SHA512 = 2054
+val TLS_SIG_ED25519 = 2055
+
+// ---- writing ----
+fun tlsU8(value: int): string = cryptoByteString([value & 255])
+fun tlsU16(value: int): string = cryptoByteString([(value >> 8) & 255, value & 255])
+fun tlsU24(value: int): string = cryptoByteString([(value >> 16) & 255, (value >> 8) & 255, value & 255])
+fun tlsU32(value: int): string =
+    cryptoByteString([(value >> 24) & 255, (value >> 16) & 255, (value >> 8) & 255, value & 255])
+
+/** `data` with a one-, two- or three-byte length in front. */
+fun tlsVec8(data: string): string = tlsU8(data.size) + data
+fun tlsVec16(data: string): string = tlsU16(data.size) + data
+fun tlsVec24(data: string): string = tlsU24(data.size) + data
+
+/** A handshake message: type, three-byte length, body. */
+fun tlsHandshakeMessage(type: int, body: string): string = tlsU8(type) + tlsU24(body.size) + body
+
+/** An extension: type, two-byte length, data. */
+fun tlsExtension(type: int, data: string): string = tlsU16(type) + tlsVec16(data)
+
+// ---- reading ----
+class TlsReader(val data: string, var position: int, var ok: bool)
+
+fun tlsReader(data: string): TlsReader = TlsReader(data, 0, true)
+
+fun TlsReader.remaining(): int = this.data.size - this.position
+
+fun TlsReader.u8(): int {
+    if (!this.ok || this.remaining() < 1) {
+        this.ok = false
+        return 0
+    }
+    val value = this.data[this.position]
+    this.position = this.position + 1
+    value
+}
+
+fun TlsReader.u16(): int {
+    val high = this.u8()
+    val low = this.u8()
+    high * 256 + low
+}
+
+fun TlsReader.u24(): int {
+    val high = this.u8()
+    val rest = this.u16()
+    high * 65536 + rest
+}
+
+fun TlsReader.u32(): int {
+    val high = this.u16()
+    val low = this.u16()
+    high * 65536 + low
+}
+
+fun TlsReader.bytes(count: int): string {
+    if (!this.ok || count < 0 || this.remaining() < count) {
+        this.ok = false
+        return ""
+    }
+    val value = this.data.slice(this.position, this.position + count)
+    this.position = this.position + count
+    value
+}
+
+fun TlsReader.vec8(): string {
+    val count = this.u8()
+    this.bytes(count)
+}
+
+fun TlsReader.vec16(): string {
+    val count = this.u16()
+    this.bytes(count)
+}
+
+fun TlsReader.vec24(): string {
+    val count = this.u24()
+    this.bytes(count)
+}
+
+/** True when the reader is intact and everything was consumed. */
+fun TlsReader.finished(): bool = this.ok && this.remaining() == 0
+
+// ---- framing ----
+/** The header of the handshake message at `offset` of a buffer of handshake bytes. `complete` is false
+ *  while fewer bytes than header and body are there (`ok` is still true); `total` is the whole message's size. */
+class TlsMessageHeader(val ok: bool, val complete: bool, val type: int, val bodyLength: int, val total: int)
+
+fun tlsParseMessageHeader(buffer: string, offset: int): TlsMessageHeader {
+    if (buffer.size - offset < 4) return TlsMessageHeader(true, false, 0, 0, 0)
+    val length = buffer[offset + 1] * 65536 + buffer[offset + 2] * 256 + buffer[offset + 3]
+    TlsMessageHeader(true, buffer.size - offset >= 4 + length, buffer[offset], length, 4 + length)
+}
+
+// ---- extensions ----
+class TlsExtension(val type: int, val data: string)
+
+/** The extensions of a two-byte-length-prefixed list; `ok` false on a truncated list or a repeated type. */
+class TlsExtensions(val ok: bool, val list: array<TlsExtension>, val error: string)
+
+fun tlsParseExtensions(var reader: TlsReader): TlsExtensions {
+    val block = tlsReader(reader.vec16())
+    val list: array<TlsExtension> = []
+    if (!reader.ok) return TlsExtensions(false, list, "tls: truncated extensions")
+    while (block.remaining() > 0 && block.ok) {
+        val type = block.u16()
+        val data = block.vec16()
+        if (!block.ok) return TlsExtensions(false, list, "tls: truncated extension")
+        for (seen in list) {
+            if (seen.type == type) return TlsExtensions(false, list, "tls: duplicate extension $type")
+        }
+        list.append(TlsExtension(type, data))
+    }
+    TlsExtensions(block.ok, list, if (block.ok) "" else "tls: truncated extensions")
+}
+
+/** The data of extension `type`, and whether it is there. */
+fun tlsFindExtension(list: array<TlsExtension>, type: int): TlsExtension? {
+    for (extension in list) {
+        if (extension.type == type) return extension
+    }
+    null
+}
+
+// ---- ClientHello ----
+/** One offered key share: the group and the client's public value. */
+class TlsKeyShare(val group: int, val publicKey: string)
+
+/** A DNS host name (not an address literal), for server_name (RFC 6066: no literal addresses). */
+fun tlsIsDnsName(host: string): bool {
+    if (host.size == 0 || host.size > 253) return false
+    var digitsAndDots = true
+    var index = 0
+    while (index < host.size) {
+        val character = host[index]
+        if (character == 58) return false
+        if (!((character >= 48 && character <= 57) || character == 46)) digitsAndDots = false
+        index = index + 1
+    }
+    !digitsAndDots
+}
+
+/** A ClientHello message (with its 4-byte header). `sessionId` is the 32 random bytes of middlebox
+ *  compatibility mode (RFC 8446 appendix D.4) or empty; `cookie` repeats a HelloRetryRequest's cookie. */
+fun tlsBuildClientHello(random: string, sessionId: string, suites: array<int>, host: string,
+    groups: array<int>, shares: array<TlsKeyShare>, signatureAlgorithms: array<int>,
+    alpn: array<string>, cookie: string): string {
+    var suiteBytes = ""
+    for (suite in suites) suiteBytes = suiteBytes + tlsU16(suite)
+    var extensions = ""
+    if (tlsIsDnsName(host)) {
+        extensions = extensions + tlsExtension(TLS_EXT_SERVER_NAME,
+            tlsVec16(tlsU8(0) + tlsVec16(host)))
+    }
+    var groupBytes = ""
+    for (group in groups) groupBytes = groupBytes + tlsU16(group)
+    extensions = extensions + tlsExtension(TLS_EXT_SUPPORTED_GROUPS, tlsVec16(groupBytes))
+    var algorithmBytes = ""
+    for (algorithm in signatureAlgorithms) algorithmBytes = algorithmBytes + tlsU16(algorithm)
+    extensions = extensions + tlsExtension(TLS_EXT_SIGNATURE_ALGORITHMS, tlsVec16(algorithmBytes))
+    extensions = extensions + tlsExtension(TLS_EXT_SUPPORTED_VERSIONS, tlsVec8(tlsU16(772)))
+    var shareBytes = ""
+    for (share in shares) shareBytes = shareBytes + tlsU16(share.group) + tlsVec16(share.publicKey)
+    extensions = extensions + tlsExtension(TLS_EXT_KEY_SHARE, tlsVec16(shareBytes))
+    if (alpn.size > 0) {
+        var names = ""
+        for (name in alpn) names = names + tlsVec8(name)
+        extensions = extensions + tlsExtension(TLS_EXT_ALPN, tlsVec16(names))
+    }
+    if (cookie.size > 0) extensions = extensions + tlsExtension(TLS_EXT_COOKIE, tlsVec16(cookie))
+    val body = tlsU16(771) + random + tlsVec8(sessionId) + tlsVec16(suiteBytes) + tlsVec8(tlsU8(0)) +
+        tlsVec16(extensions)
+    tlsHandshakeMessage(TLS_CLIENT_HELLO, body)
+}
+
+// ---- ServerHello and HelloRetryRequest ----
+/** The special random of a HelloRetryRequest (RFC 8446 section 4.1.3, SHA-256 of "HelloRetryRequest"). */
+fun tlsHelloRetryRandom(): string =
+    hexDecode("cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c")
+
+class TlsServerHello(val ok: bool, val error: string, val random: string, val sessionId: string,
+    val cipherSuite: int, val retryRequest: bool, val selectedVersion: int, val shareGroup: int,
+    val shareKey: string, val cookie: string)
+
+private fun tlsBadServerHello(error: string): TlsServerHello =
+    TlsServerHello(false, error, "", "", 0, false, 0, 0, "", "")
+
+/** Parses a ServerHello or HelloRetryRequest body (without the 4-byte header). In a HelloRetryRequest
+ *  the key_share extension holds only the selected group (`shareKey` empty). */
+fun tlsParseServerHello(body: string): TlsServerHello {
+    val reader = tlsReader(body)
+    val legacyVersion = reader.u16()
+    val random = reader.bytes(32)
+    val sessionId = reader.vec8()
+    val suite = reader.u16()
+    val compression = reader.u8()
+    val extensions = tlsParseExtensions(reader)
+    if (!reader.finished()) return tlsBadServerHello("tls: malformed ServerHello")
+    if (!extensions.ok) return tlsBadServerHello(extensions.error)
+    if (legacyVersion != 771) return tlsBadServerHello("tls: unexpected legacy_version")
+    if (compression != 0) return tlsBadServerHello("tls: a ServerHello with compression")
+    val retry = random == tlsHelloRetryRandom()
+    var version = 0
+    val versionExtension = tlsFindExtension(extensions.list, TLS_EXT_SUPPORTED_VERSIONS)
+    if (versionExtension != null) {
+        val versionReader = tlsReader(versionExtension.data)
+        version = versionReader.u16()
+        if (!versionReader.finished()) return tlsBadServerHello("tls: malformed supported_versions")
+    }
+    var group = 0
+    var key = ""
+    val shareExtension = tlsFindExtension(extensions.list, TLS_EXT_KEY_SHARE)
+    if (shareExtension != null) {
+        val shareReader = tlsReader(shareExtension.data)
+        group = shareReader.u16()
+        if (!retry) key = shareReader.vec16()
+        if (!shareReader.finished()) return tlsBadServerHello("tls: malformed key_share")
+    }
+    var cookie = ""
+    val cookieExtension = tlsFindExtension(extensions.list, TLS_EXT_COOKIE)
+    if (cookieExtension != null) {
+        val cookieReader = tlsReader(cookieExtension.data)
+        cookie = cookieReader.vec16()
+        if (!cookieReader.finished() || cookie.size == 0) return tlsBadServerHello("tls: malformed cookie")
+    }
+    TlsServerHello(true, "", random, sessionId, suite, retry, version, group, key, cookie)
+}
+
+// ---- the encrypted flight ----
+/** EncryptedExtensions: the negotiated ALPN protocol ("" if none) and whether every extension parsed. */
+class TlsEncryptedExtensions(val ok: bool, val error: string, val alpn: string, val extensions: array<TlsExtension>)
+
+fun tlsParseEncryptedExtensions(body: string): TlsEncryptedExtensions {
+    val reader = tlsReader(body)
+    val extensions = tlsParseExtensions(reader)
+    val none: array<TlsExtension> = []
+    if (!reader.finished() || !extensions.ok) {
+        return TlsEncryptedExtensions(false, "tls: malformed EncryptedExtensions", "", none)
+    }
+    var alpn = ""
+    val alpnExtension = tlsFindExtension(extensions.list, TLS_EXT_ALPN)
+    if (alpnExtension != null) {
+        val outer = tlsReader(alpnExtension.data)
+        val names = tlsReader(outer.vec16())
+        alpn = names.vec8()
+        if (!outer.finished() || !names.finished() || alpn.size == 0) {
+            return TlsEncryptedExtensions(false, "tls: malformed ALPN", "", none)
+        }
+    }
+    TlsEncryptedExtensions(true, "", alpn, extensions.list)
+}
+
+/** A Certificate message's chain, end entity first, as DER strings. `context` is the request context
+ *  (empty from a server). */
+class TlsCertificateMessage(val ok: bool, val error: string, val context: string, val chain: array<string>)
+
+fun tlsParseCertificate(body: string): TlsCertificateMessage {
+    val reader = tlsReader(body)
+    val context = reader.vec8()
+    val list = tlsReader(reader.vec24())
+    val chain: array<string> = []
+    while (list.remaining() > 0 && list.ok) {
+        val der = list.vec24()
+        val extensions = tlsParseExtensions(list)
+        if (!list.ok || !extensions.ok) return TlsCertificateMessage(false, "tls: malformed Certificate", "", chain)
+        chain.append(der)
+    }
+    if (!reader.finished() || !list.ok) return TlsCertificateMessage(false, "tls: malformed Certificate", "", chain)
+    TlsCertificateMessage(true, "", context, chain)
+}
+
+/** CertificateVerify: the signature scheme and the signature. */
+class TlsCertificateVerify(val ok: bool, val scheme: int, val signature: string)
+
+fun tlsParseCertificateVerify(body: string): TlsCertificateVerify {
+    val reader = tlsReader(body)
+    val scheme = reader.u16()
+    val signature = reader.vec16()
+    TlsCertificateVerify(reader.finished(), scheme, signature)
+}
+
+/** The content a CertificateVerify signs: 64 spaces, the context string, a zero byte, the transcript hash
+ *  (RFC 8446 section 4.4.3). `server` selects the server's context string. */
+fun tlsCertificateVerifyContent(server: bool, transcriptHash: string): string {
+    val spaces: array<int> = []
+    while (spaces.size < 64) spaces.append(32)
+    cryptoByteString(spaces) +
+        (if (server) "TLS 1.3, server CertificateVerify" else "TLS 1.3, client CertificateVerify") +
+        tlsU8(0) + transcriptHash
+}
+
+/** A NewSessionTicket (parsed only to validate it). */
+class TlsNewSessionTicket(val ok: bool, val lifetime: int, val ageAdd: int, val nonce: string, val ticket: string)
+
+fun tlsParseNewSessionTicket(body: string): TlsNewSessionTicket {
+    val reader = tlsReader(body)
+    val lifetime = reader.u32()
+    val ageAdd = reader.u32()
+    val nonce = reader.vec8()
+    val ticket = reader.vec16()
+    val extensions = tlsParseExtensions(reader)
+    TlsNewSessionTicket(reader.finished() && extensions.ok && ticket.size > 0, lifetime, ageAdd, nonce, ticket)
+}

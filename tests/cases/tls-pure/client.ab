@@ -1,0 +1,193 @@
+// The abla/tls/pure client state machine against RFC 8448 section 3: the trace's own ClientHello is the
+// client's first flight, the server's records (ServerHello; the encrypted EncryptedExtensions, Certificate,
+// CertificateVerify and Finished; the NewSessionTicket; application data; the close_notify) are fed in, and
+// every byte the client queues back must be the RFC's (its ClientHello record, its Finished record, its
+// application data and its close_notify). The certificate check is a callback: here it records what it was
+// given (the chain, the scheme, the signed content, the signature) and accepts. Then the same trace is fed
+// one byte at a time, and the refusals: a flipped bit in the server flight, records in the wrong order, a
+// verifier that rejects, a server that answers with an unsupported version. Prints "tls-pure client ok";
+// tools/test-tls-pure.sh runs it. Vectors: tests/vectors/tls/rfc8448-section3.txt (the first argument).
+import "abla/io"
+import "abla/crypto"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/text"
+import "abla/tls/pure/client"
+import "abla/tls/pure/handshake"
+import "abla/tls/pure/keysched"
+import "abla/tls/pure/record"
+
+var failures = 0
+var lines: array<string> = []
+var verifierCalls = 0
+var verifierChain: array<string> = []
+var verifierHost = ""
+var verifierScheme = 0
+var verifierContent = ""
+var verifierSignature = ""
+var verifierAnswer = ""
+
+fun fail(what: string): void {
+    failures = failures + 1
+    if (failures < 40) println("FAIL $what")
+    return
+}
+
+fun check(name: string, actual: string, expected: string): void {
+    if (hexEncode(actual) != expected) fail("$name: ${hexEncode(actual)} != $expected")
+    return
+}
+
+fun vector(heading: string, name: string, occurrence: int = 1): string {
+    var seen = 0
+    for (line in lines) {
+        val parts = line.split("|")
+        if (parts.size == 3 && parts[0] == heading && parts[1] == name) {
+            seen = seen + 1
+            if (seen == occurrence) return parts[2]
+        }
+    }
+    fail("no vector $heading / $name #$occurrence")
+    ""
+}
+
+fun raw(heading: string, name: string, occurrence: int = 1): string = hexDecode(vector(heading, name, occurrence))
+
+fun verifier(chain: array<string>, host: string, scheme: int, content: string, signature: string): string {
+    verifierCalls = verifierCalls + 1
+    verifierChain = chain
+    verifierHost = host
+    verifierScheme = scheme
+    verifierContent = content
+    verifierSignature = signature
+    verifierAnswer
+}
+
+fun noRandom(count: int): string = ""
+
+fun newClient(): TlsClient {
+    val hello = raw("{client}  construct a ClientHello handshake message", "ClientHello")
+    val config = TlsClientConfig("server", [TLS_SUITE_AES_128_GCM_SHA256, TLS_SUITE_CHACHA20_POLY1305_SHA256,
+        TLS_SUITE_AES_256_GCM_SHA384],
+        [TLS_SIG_ECDSA_SECP256R1_SHA256, TLS_SIG_RSA_PSS_RSAE_SHA256, TLS_SIG_RSA_PSS_RSAE_SHA384,
+         TLS_SIG_RSA_PSS_RSAE_SHA512, TLS_SIG_ED25519, TLS_SIG_ECDSA_SECP384R1_SHA384],
+        [], verifier, noRandom)
+    tlsClientStartWith(config, hello, hello.slice(6, 38), "",
+        [TlsKeyPair(TLS_GROUP_X25519, raw("{client}  create an ephemeral x25519 key pair", "public key"),
+            raw("{client}  create an ephemeral x25519 key pair", "private key"))], 769)
+}
+
+fun serverHello(): string = raw("{server}  send handshake record", "complete record", 1)
+fun serverFlight(): string = raw("{server}  send handshake record", "complete record", 2)
+fun ticket(): string = raw("{server}  send handshake record", "complete record", 3)
+fun serverData(): string = raw("{server}  send application_data record", "complete record")
+fun serverAlert(): string = raw("{server}  send alert record", "complete record")
+
+fun flip(text: string, index: int): string {
+    val bytes: array<int> = []
+    for (i in 0 until text.size) bytes.append(if (i == index) text[i] ^ 1 else text[i])
+    cryptoByteString(bytes)
+}
+
+fun main: int {
+    lines = linuxReadFile("${processArgument(0)}/rfc8448-section3.txt", 4194304).split("\n")
+
+    // The whole trace, record by record.
+    var client = newClient()
+    check("ClientHello record", client.takeOutput(), vector("{client}  send handshake record", "complete record", 1))
+    client.feed(serverHello())
+    if (client.failed()) fail("ServerHello: ${client.error}")
+    check("no output after the ServerHello", client.takeOutput(), "")
+    client.feed(serverFlight())
+    if (client.failed()) fail("server flight: ${client.error}")
+    if (!client.connected()) fail("not connected after the server's Finished")
+    check("client Finished record", client.takeOutput(), vector("{client}  send handshake record", "complete record", 2))
+    if (verifierCalls != 1) fail("the verifier ran $verifierCalls times")
+    if (verifierHost != "server") fail("verifier host $verifierHost")
+    if (verifierScheme != TLS_SIG_RSA_PSS_RSAE_SHA256) fail("verifier scheme $verifierScheme")
+    if (verifierChain.size != 1) fail("verifier chain size ${verifierChain.size}")
+    else {
+        val certificate = raw("{server}  construct a Certificate handshake message", "Certificate")
+        // The message is type, length, context (empty), list length, then each certificate with its extensions.
+        if (verifierChain[0] != certificate.slice(11, 11 + 432)) fail("the verifier's certificate is not the trace's")
+    }
+    // The signed content: 64 spaces, the context string, 0, and the hash through the Certificate message.
+    val signed = verifierContent
+    if (signed.size != 64 + 33 + 1 + 32) fail("signed content size ${signed.size}")
+    check("signed content prefix", signed.slice(0, 98), hexEncode(tlsCertificateVerifyContent(true, "").slice(0, 98)))
+    check("CertificateVerify signature", verifierSignature,
+        vector("{server}  construct a CertificateVerify handshake message", "CertificateVerify").slice(16, 16 + 256))
+    client.feed(ticket())
+    if (client.failed() || !client.connected()) fail("NewSessionTicket: ${client.error}")
+    if (!client.send(raw("{client}  send application_data record", "payload"))) fail("send refused")
+    check("client application data record", client.takeOutput(),
+        vector("{client}  send application_data record", "complete record"))
+    client.feed(serverData())
+    check("application data received", client.takeApplicationData(),
+        vector("{server}  send application_data record", "payload"))
+    client.feed(serverAlert())
+    if (!client.closed()) fail("close_notify did not close")
+    check("client close_notify", client.takeOutput(), vector("{client}  send alert record", "complete record"))
+    if (client.send("late")) fail("send after close accepted")
+
+    // The same trace one byte at a time, and in two chunks.
+    client = newClient()
+    client.takeOutput()
+    val everything = serverHello() + serverFlight() + ticket() + serverData()
+    for (i in 0 until everything.size) client.feed(everything.slice(i, i + 1))
+    if (client.failed() || !client.connected()) fail("byte at a time: ${client.error}")
+    check("byte at a time: client Finished", client.takeOutput(),
+        vector("{client}  send handshake record", "complete record", 2))
+    check("byte at a time: application data", client.takeApplicationData(),
+        vector("{server}  send application_data record", "payload"))
+
+    // Refusals.
+    client = newClient()
+    client.takeOutput()
+    client.feed(serverHello())
+    client.feed(flip(serverFlight(), 100))
+    if (!client.failed()) fail("a flipped bit in the server flight was accepted")
+    if (client.connected()) fail("connected after a bad record")
+    val alert = client.takeOutput()
+    if (alert.size == 0 || alert[0] != TLS_ALERT) fail("no alert after a bad record")
+
+    client = newClient()
+    client.takeOutput()
+    client.feed(serverFlight())
+    if (!client.failed()) fail("the server flight before the ServerHello was accepted")
+
+    client = newClient()
+    client.takeOutput()
+    client.feed(serverHello())
+    client.feed(serverHello())
+    if (!client.failed()) fail("two ServerHellos were accepted")
+
+    verifierAnswer = "tls: untrusted certificate"
+    client = newClient()
+    client.takeOutput()
+    client.feed(serverHello())
+    client.feed(serverFlight())
+    if (!client.failed() || client.error != "tls: untrusted certificate") fail("a rejecting verifier: ${client.error}")
+    verifierAnswer = ""
+
+    // A ServerHello for TLS 1.2 (no supported_versions) is refused.
+    client = newClient()
+    client.takeOutput()
+    val hello12 = tlsHandshakeMessage(TLS_SERVER_HELLO, tlsU16(771) + hexDecode(vector("{client}  construct a ClientHello handshake message",
+        "ClientHello")).slice(6, 38) + tlsVec8("") + tlsU16(4865) + tlsU8(0) + tlsU16(0))
+    client.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, hello12))
+    if (!client.failed()) fail("a TLS 1.2 ServerHello was accepted")
+
+    // An alert from the server ends the connection with its description.
+    client = newClient()
+    client.takeOutput()
+    client.feed(tlsPlaintextRecord(TLS_ALERT, 771, tlsU8(2) + tlsU8(40)))
+    if (!client.failed() || client.error != "tls: the server sent alert 40") fail("a fatal alert: ${client.error}")
+
+    if (failures > 0) {
+        println("tls-pure client: $failures failures")
+        return 1
+    }
+    println("tls-pure client ok")
+    0
+}
