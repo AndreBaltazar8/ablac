@@ -1,0 +1,116 @@
+// The TLS 1.3 record layer (RFC 8446 section 5): plaintext records before the keys exist, and
+// AEAD-protected records after (TLSInnerPlaintext = content || content type || zero padding, a 5-byte
+// header that is the additional data, a nonce of the per-direction IV xor the 64-bit record
+// sequence). Sans-IO: a protection state is a key, an IV and a sequence number; records are strings.
+//
+// AES-128-GCM and AES-256-GCM (abla/crypto/aes) here; ChaCha20-Poly1305 joins as a third AEAD when
+// abla/crypto/chacha20poly1305 lands. A state that fails to open a record is finished: the caller
+// closes the connection (a bad record is fatal in TLS 1.3), so the sequence only advances on success.
+
+import "abla/crypto"
+import "abla/crypto/aes"
+import "abla/crypto/result"
+
+val TLS_CHANGE_CIPHER_SPEC = 20
+val TLS_ALERT = 21
+val TLS_HANDSHAKE = 22
+val TLS_APPLICATION_DATA = 23
+
+val TLS_AEAD_AES_128_GCM = 1
+val TLS_AEAD_AES_256_GCM = 2
+
+/** The most plaintext one record carries (section 5.1), and the most a protected record's payload
+ *  (ciphertext with its tag) may be (section 5.2). */
+val TLS_MAX_PLAINTEXT = 16384
+val TLS_MAX_CIPHERTEXT = 16640
+
+/** One direction's protection: the traffic key, the IV (12 bytes) and the next record's sequence number. */
+class TlsRecordProtection(val aead: int, val key: string, val iv: string, var sequence: int)
+
+fun tlsRecordProtection(aead: int, key: string, iv: string): TlsRecordProtection =
+    TlsRecordProtection(aead, key, iv, 0)
+
+/** The key length of an AEAD, 0 for one this layer does not know. */
+fun tlsAeadKeyLength(aead: int): int =
+    if (aead == TLS_AEAD_AES_128_GCM) 16 else if (aead == TLS_AEAD_AES_256_GCM) 32 else 0
+
+/** The per-record nonce: the IV with the sequence number (big-endian, left-padded to 12 bytes) xored in. */
+fun tlsRecordNonce(iv: string, sequence: int): string {
+    val bytes: array<int> = []
+    var index = 0
+    while (index < iv.size) {
+        val shift = (iv.size - 1 - index) * 8
+        val sequenceByte = if (shift < 64) (sequence >>> shift) & 255 else 0
+        bytes.append(iv[index] ^ sequenceByte)
+        index = index + 1
+    }
+    cryptoByteString(bytes)
+}
+
+/** A record header: type, legacy version, payload length. */
+class TlsRecordHeader(val ok: bool, val type: int, val version: int, val length: int)
+
+private fun tlsHeaderBytes(type: int, version: int, length: int): string =
+    cryptoByteString([type, (version >> 8) & 255, version & 255, (length >> 8) & 255, length & 255])
+
+/** A plaintext record (used before the handshake keys exist): a header with the legacy version
+ *  (0x0301 on a first ClientHello for compatibility, else 0x0303), then the content as is. */
+fun tlsPlaintextRecord(type: int, version: int, content: string): string =
+    tlsHeaderBytes(type, version, content.size) + content
+
+/** Reads the 5-byte header at `offset` of `data`. `ok` is false when fewer than five bytes remain. */
+fun tlsParseRecordHeader(data: string, offset: int): TlsRecordHeader {
+    if (data.size - offset < 5) return TlsRecordHeader(false, 0, 0, 0)
+    TlsRecordHeader(true, data[offset], data[offset + 1] * 256 + data[offset + 2],
+        data[offset + 3] * 256 + data[offset + 4])
+}
+
+/** The result of opening one record: the inner content type and the content. */
+class TlsOpenedRecord(val ok: bool, val type: int, val content: string, val error: string)
+
+private fun tlsOpenFailed(error: string): TlsOpenedRecord = TlsOpenedRecord(false, 0, "", error)
+
+/** Protects one record's content: the 5-byte header (application_data, 0x0303), then the AEAD of
+ *  content || type || `padding` zero bytes. The result's bytes are the whole record; `ok` is false
+ *  for a content longer than 2^14 or an unusable key. */
+fun tlsProtectRecord(var protection: TlsRecordProtection, contentType: int, content: string,
+    padding: int = 0): CryptoResult {
+    if (content.size > TLS_MAX_PLAINTEXT) return cryptoFailed("tls: record content longer than 2^14")
+    // The payload (content, type, padding, tag) is at most 2^14 + 256 bytes (section 5.2).
+    if (padding < 0 || content.size + 1 + padding + 16 > TLS_MAX_CIPHERTEXT) {
+        return cryptoFailed("tls: record padding out of range")
+    }
+    val zeros: array<int> = []
+    while (zeros.size < padding) zeros.append(0)
+    val inner = content + cryptoByteString([contentType]) + cryptoByteString(zeros)
+    val header = tlsHeaderBytes(TLS_APPLICATION_DATA, 771, inner.size + 16)
+    val sealed = aesGcmEncrypt(protection.key, tlsRecordNonce(protection.iv, protection.sequence),
+        inner, header)
+    if (!sealed.ok) return sealed
+    protection.sequence = protection.sequence + 1
+    CryptoResult(header + sealed.bytes, true, "")
+}
+
+/** Opens one whole record (header included) that `protection` protected: checks the header (type
+ *  application_data, version 0x0303, a length that matches `record` and is at most 2^14 + 256),
+ *  authenticates and decrypts, strips the zero padding and the content type. A record that is all
+ *  zeros inside, or whose content exceeds 2^14, is refused. */
+fun tlsOpenRecord(var protection: TlsRecordProtection, record: string): TlsOpenedRecord {
+    val header = tlsParseRecordHeader(record, 0)
+    if (!header.ok) return tlsOpenFailed("tls: a record shorter than its header")
+    if (header.type != TLS_APPLICATION_DATA || header.version != 771) {
+        return tlsOpenFailed("tls: not a protected record (type ${header.type}, version ${header.version})")
+    }
+    if (header.length > TLS_MAX_CIPHERTEXT) return tlsOpenFailed("tls: record overflow")
+    if (header.length != record.size - 5) return tlsOpenFailed("tls: the record length does not match")
+    if (header.length < 17) return tlsOpenFailed("tls: a protected record shorter than its tag and type")
+    val opened = aesGcmDecrypt(protection.key, tlsRecordNonce(protection.iv, protection.sequence),
+        record.slice(5, record.size), record.slice(0, 5))
+    if (!opened.ok) return tlsOpenFailed("tls: bad record MAC")
+    protection.sequence = protection.sequence + 1
+    var end = opened.bytes.size
+    while (end > 0 && opened.bytes[end - 1] == 0) end = end - 1
+    if (end == 0) return tlsOpenFailed("tls: a record with no content type")
+    if (end - 1 > TLS_MAX_PLAINTEXT) return tlsOpenFailed("tls: record overflow")
+    TlsOpenedRecord(true, opened.bytes[end - 1], opened.bytes.slice(0, end - 1), "")
+}

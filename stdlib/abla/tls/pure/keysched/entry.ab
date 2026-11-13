@@ -1,0 +1,111 @@
+// The TLS 1.3 key schedule (RFC 8446 section 7.1) over abla/crypto/hkdf, for the SHA-256 and SHA-384
+// cipher suites, and the Finished computation (section 4.4.4). Sans-IO: strings in, strings out.
+//
+//   early secret      = HKDF-Extract(0, PSK or hash-length zeros)
+//   handshake secret  = HKDF-Extract(Derive-Secret(early, "derived", ""), (EC)DHE shared secret)
+//   master secret     = HKDF-Extract(Derive-Secret(handshake, "derived", ""), hash-length zeros)
+//
+// `hash` is HKDF_SHA256 or HKDF_SHA384 (abla/crypto/hkdf). Transcript hashes are the caller's
+// (tlsTranscriptHash). Secrets are strings here, as everywhere in abla/crypto's HMAC layer: they are
+// not scrubbed on drop (a later step of the plan moves them into wiped buffers).
+
+import "abla/crypto"
+import "abla/crypto/hkdf"
+import "abla/crypto/result"
+
+/** The hash's output length in bytes (32 for SHA-256, 48 for SHA-384). */
+fun tlsHashLength(hash: int): int = if (hash == HKDF_SHA384) 48 else 32
+
+/** The hash of `data` with the suite's hash. */
+fun tlsHashOf(hash: int, data: string): string = if (hash == HKDF_SHA384) sha384(data) else sha256(data)
+
+private fun tlsZeros(hash: int): string {
+    val bytes: array<int> = []
+    while (bytes.size < tlsHashLength(hash)) bytes.append(0)
+    cryptoByteString(bytes)
+}
+
+private fun tlsOrEmpty(result: CryptoResult): string = if (result.ok) result.bytes else ""
+
+/** Derive-Secret(secret, label, transcript hash): `label` without the "tls13 " prefix. */
+fun tlsDeriveSecret(hash: int, secret: string, label: string, transcriptHash: string): string =
+    tlsOrEmpty(tls13DeriveSecret(hash, secret, label, transcriptHash))
+
+/** The early secret: Extract with an all-zero salt over the pre-shared key, or over hash-length zeros
+ *  when there is none (`psk` empty). */
+fun tlsEarlySecret(hash: int, psk: string): string =
+    hkdfExtract(hash, tlsZeros(hash), if (psk.size == 0) tlsZeros(hash) else psk)
+
+/** The handshake secret from the early secret and the (EC)DHE shared secret. */
+fun tlsHandshakeSecret(hash: int, earlySecret: string, sharedSecret: string): string =
+    hkdfExtract(hash, tlsDeriveSecret(hash, earlySecret, "derived", tlsHashOf(hash, "")), sharedSecret)
+
+/** The master secret from the handshake secret. */
+fun tlsMasterSecret(hash: int, handshakeSecret: string): string =
+    hkdfExtract(hash, tlsDeriveSecret(hash, handshakeSecret, "derived", tlsHashOf(hash, "")), tlsZeros(hash))
+
+/** The traffic key of a traffic secret, `length` bytes (16 for AES-128-GCM, 32 for AES-256-GCM and
+ *  ChaCha20-Poly1305). */
+fun tlsTrafficKey(hash: int, trafficSecret: string, length: int): string =
+    tlsOrEmpty(tls13ExpandLabel(hash, trafficSecret, "key", "", length))
+
+/** The traffic IV of a traffic secret: 12 bytes. */
+fun tlsTrafficIv(hash: int, trafficSecret: string): string =
+    tlsOrEmpty(tls13ExpandLabel(hash, trafficSecret, "iv", "", 12))
+
+/** The next application traffic secret of a KeyUpdate (section 7.2). */
+fun tlsNextTrafficSecret(hash: int, trafficSecret: string): string =
+    tlsOrEmpty(tls13ExpandLabel(hash, trafficSecret, "traffic upd", "", tlsHashLength(hash)))
+
+/** The finished_key of a handshake traffic secret (section 4.4.4). */
+fun tlsFinishedKey(hash: int, baseKey: string): string =
+    tlsOrEmpty(tls13ExpandLabel(hash, baseKey, "finished", "", tlsHashLength(hash)))
+
+/** verify_data = HMAC(finished_key, Transcript-Hash(messages up to the Finished)). */
+fun tlsFinishedVerifyData(hash: int, baseKey: string, transcriptHash: string): string {
+    val key = tlsFinishedKey(hash, baseKey)
+    if (hash == HKDF_SHA384) hmacSha384(key, transcriptHash) else hmacSha256(key, transcriptHash)
+}
+
+/** Everything derived from the handshake secret once the ServerHello is hashed: the two handshake
+ *  traffic secrets. `helloHash` is the transcript hash through the ServerHello. */
+class TlsHandshakeSecrets(val handshakeSecret: string, val clientTraffic: string, val serverTraffic: string)
+
+fun tlsDeriveHandshakeSecrets(hash: int, earlySecret: string, sharedSecret: string,
+    helloHash: string): TlsHandshakeSecrets {
+    val handshake = tlsHandshakeSecret(hash, earlySecret, sharedSecret)
+    TlsHandshakeSecrets(handshake, tlsDeriveSecret(hash, handshake, "c hs traffic", helloHash),
+        tlsDeriveSecret(hash, handshake, "s hs traffic", helloHash))
+}
+
+/** The application traffic secrets, the exporter master secret, and (later, once the client Finished
+ *  is hashed) the resumption master secret. `serverFinishedHash` is the transcript hash through the
+ *  server Finished. */
+class TlsApplicationSecrets(val masterSecret: string, val clientTraffic: string, val serverTraffic: string,
+    val exporter: string)
+
+fun tlsDeriveApplicationSecrets(hash: int, handshakeSecret: string,
+    serverFinishedHash: string): TlsApplicationSecrets {
+    val master = tlsMasterSecret(hash, handshakeSecret)
+    TlsApplicationSecrets(master, tlsDeriveSecret(hash, master, "c ap traffic", serverFinishedHash),
+        tlsDeriveSecret(hash, master, "s ap traffic", serverFinishedHash),
+        tlsDeriveSecret(hash, master, "exp master", serverFinishedHash))
+}
+
+/** The resumption master secret; `clientFinishedHash` is the transcript hash through the client
+ *  Finished. */
+fun tlsResumptionMasterSecret(hash: int, masterSecret: string, clientFinishedHash: string): string =
+    tlsDeriveSecret(hash, masterSecret, "res master", clientFinishedHash)
+
+/** The transcript: the handshake messages (each with its 4-byte header) so far, in order. The hash
+ *  is taken at the points the key schedule names, over everything added until then. */
+class TlsTranscript(var messages: string)
+
+fun tlsTranscript(): TlsTranscript = TlsTranscript("")
+
+fun TlsTranscript.add(message: string): void {
+    this.messages = this.messages + message
+    return
+}
+
+fun TlsTranscript.hash(hash: int): string = tlsHashOf(hash, this.messages)
