@@ -73,6 +73,10 @@ before measurement. Each observation has separate storage.
 | `hkdf-expand` | `hkdfExpand` (HMAC-SHA256) of a TLS 1.3 key label from a zero vs random 32-byte PRK |
 | `x25519` | `x25519` of a zero vs random scalar (clamped by the function) with a fixed peer share |
 | `p256-ecdh` | `p256Ecdh` of a scalar whose top byte is 0x7f in both classes, with a fixed peer point |
+| `p256-sign` | `p256EcdsaSign` (RFC 6979 nonce) of a fixed message with a key whose top byte is 0x7f in both classes, zero vs random below it |
+| `p256-sign-nonce` | `p256EcdsaSign` with a fixed key of a zero vs random 64-byte message: the message is public, the nonce it sets is not |
+| `ed25519-sign` | `ed25519Sign` of a fixed message with a zero vs random seed |
+| `ed25519-sign-nonce` | `ed25519Sign` with a fixed seed of a zero vs random 64-byte message (the secret nonce follows) |
 | `leaky-compare` | Deliberately early-exiting 256-byte Abla comparison; mandatory detection control |
 
 AES key expansion is outside these encryption tests. RSA CRT includes the
@@ -82,8 +86,7 @@ and fault verification. A public-exponent round-trip validates the CRT fixture
 before timing; an AES known-answer test checks both available implementations.
 These are operand-class tests with fixed keys, **not** tests of different secret
 keys or all input distributions. Eight-limb bignum tests do not cover every
-supported width or the inverse's even-modulus case. X25519 and P-256 ECDH are measured as TLS uses them; Ed25519 and P-256 signing are not measured here yet (the report
-lists them).
+supported width or the inverse's even-modulus case. X25519 and P-256 ECDH, and Ed25519 and P-256 ECDSA signing, are measured as TLS uses them.
 
 Private cores are extracted verbatim from RSA's marked production source block
 by the runner (`binding.ab`) for every driver build, as in the static CT fixtures. Public

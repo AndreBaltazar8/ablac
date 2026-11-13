@@ -81,3 +81,14 @@ valid, 4,096 pilot and 128 warmups.
 | hkdf-expand | 2.095 | 2.684 | No leak detected at 40,000 samples |
 | x25519 | 0.809 | 1.377 | No leak detected at 40,000 samples |
 | p256-ecdh | 0.776 | 2.778 | No leak detected at 40,000 samples |
+
+Signing, the same machine, CPU 10, the same compiler: ECDSA P-256 with its RFC 6979 nonce and Ed25519, each with a
+zero vs random key (fixed message) and with a fixed key over a zero vs random message (which sets the secret nonce).
+
+| Primitive | Raw abs(t) | Max abs(t) | Observation |
+| --- | ---: | ---: | --- |
+| Control: early exit | 54.711 | 1663.264 | Leak detected (required control) |
+| p256-sign | 0.819 | 1.382 | No leak detected at 40,000 samples |
+| p256-sign-nonce | 0.338 | 1.528 | No leak detected at 40,000 samples |
+| ed25519-sign | 0.033 | 1.709 | No leak detected at 40,000 samples |
+| ed25519-sign-nonce | 0.53 | 1.817 | No leak detected at 40,000 samples |
