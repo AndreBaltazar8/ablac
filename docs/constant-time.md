@@ -30,7 +30,7 @@ and `ctIsNonZero` work in 32-bit halves in plain arithmetic instead.
 ## What the test checks
 
 `tools/test-ct.sh` builds `tests/cases/ct/fixture.ab` for each target and runs
-`tools/ct/check-asm.py` over its disassembly: a forward dataflow from the secret parameters through
+`tools/ct/check` (an Abla program) over its disassembly: a forward dataflow from the secret parameters through
 registers and stack slots, to a fixed point over the jumps. It fails on a conditional branch whose
 condition is secret, a load or store whose address is, a division of one, a call it can't read (see
 below), on Wasm a `select` on a secret, and code the disassembler can't read. The same script builds

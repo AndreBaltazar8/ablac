@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # abla/ct: what its operations compute, and what they compile to. The check that matters reads the
-# generated code of each fixture (tests/cases/ct/fixture.ab) on each target with tools/ct/check-asm.py:
+# generated code of each fixture (tests/cases/ct/fixture.ab) on each target with tools/ct/check (an Abla program):
 # no conditional branch, memory index or division from a secret, and the deliberate leaks must be
 # caught, on each target too.
 #   run and read: x86-64 (release) and Wasm (the final module, under Node).
@@ -13,10 +13,18 @@ compiler=${1:-build/ablac}
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cases=build/ct/cases
 out=build/ct
-check="python3 -I tools/ct/check-asm.py"
 cd "$project_root"
 rm -rf "$out"
 mkdir -p "$out"
+# The checker, its fixture generators and their self-tests are Abla programs (tools/ct/check, tools/ct/fixtures).
+tools_out=$out/tools
+mkdir -p "$tools_out"
+for tool in check/main:check check/selftest:selftest fixtures/source:source-fixtures fixtures/residue:residue-entries \
+    fixtures/test-source:test-source-fixtures; do
+    "$compiler" build "tools/ct/${tool%%:*}.ab" -o "$tools_out/${tool##*:}" --fast > "$tools_out/${tool##*:}.log" 2>&1 ||
+        { cat "$tools_out/${tool##*:}.log" >&2; echo "ct: tools/ct/${tool%%:*}.ab did not build" >&2; exit 1; }
+done
+check="$tools_out/check"
 cp -R tests/cases/ct "$cases"
 # Keep the private implementation private: test the exact production source in
 # the generated fixture's own module, never through a public test hook.
@@ -31,19 +39,19 @@ sed -n '/^\/\/ BEGIN ED25519 SECRET CORE$/,/^\/\/ END ED25519 SECRET CORE$/p' st
 # The AES functions that touch a key, as written (their allocating wrappers stay outside, see the generator).
 sed -n '/^\/\/ BEGIN AES KEY EXPANSION$/,/^\/\/ END AES KEY EXPANSION$/p' stdlib/abla/crypto/aes/entry.ab >> "$cases/fixture.ab"
 sed -n '/^\/\/ BEGIN CHACHA20 POLY1305 SECRET CORES$/,/^\/\/ END CHACHA20 POLY1305 SECRET CORES$/p' stdlib/abla/crypto/chacha20poly1305/entry.ab >> "$cases/fixture.ab"
-python3 "$cases/crypto-source-fixtures.py" "$cases/crypto-generated.ab"
+"$tools_out/source-fixtures" "$project_root" "$cases/crypto-generated.ab"
 cat "$cases/crypto-generated.ab" >> "$cases/fixture.ab"
 # Every fixture also gets a residue entry: a @noinline copy as a worker, and an export that calls it and then
 # wipes the stack below it (abla/ct/scrub), the shape of a public entry point. They are read for residue below.
 mkdir -p "$out/residue-cases"
 cp "$cases"/*.ab "$cases"/abla.toml "$out/residue-cases/" 2>/dev/null || true
 sed -i 's|^import "abla/ct"$|import "abla/ct"\nimport "abla/ct/scrub"|' "$out/residue-cases/fixture.ab"
-python3 "$cases/residue-entries.py" "$out/residue-cases/fixture.ab" ctScrubStack1024 "$out/residue-cases/fixture.ab" \
+"$tools_out/residue-entries" "$out/residue-cases/fixture.ab" ctScrubStack1024 "$out/residue-cases/fixture.ab" \
     "$cases/crypto-generated.follow" > "$out/residue-entries.txt"
 # Staged build drivers need the scratch fixture paths as well.
 sed -i 's@tests/cases/ct/@build/ct/cases/@g' "$cases/build.ab" "$cases/build-fast.ab" "$cases/aarch64-build.ab"
-python3 -I tools/ct/test-check-asm.py
-python3 -I tools/ct/test-source-fixtures.py
+"$tools_out/selftest"
+"$tools_out/test-source-fixtures" "$tools_out/source-fixtures" "$project_root" "$PWD/$out/source-test"
 
 fixtures=(
     ct_fix_select_u32:0,1,2 ct_fix_select_u64:0,1,2 ct_fix_select_u8:0,1,2
