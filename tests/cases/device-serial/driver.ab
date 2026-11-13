@@ -1,0 +1,716 @@
+// A pty/termios driver for tests/cases/device-serial/main.ab, in Abla on raw Linux system calls. It is independent of
+// the library it checks: it imports nothing from abla/device or abla/serial, and has its own termios constants and its
+// own flag decoding. The client program is spawned with pipes for its standard streams and a session of its own;
+// ptys come from /dev/ptmx; every wait is a poll(2) over the client's output and the pty master, so the master is
+// drained while the driver waits for a line, with no threads.
+// Usage: driver CLIENT_PROGRAM SCRATCH_DIRECTORY
+import "abla/io"
+import "abla/integer"
+import "abla/process/exit"
+import "abla/process/time"
+import "abla/sys/linux"
+import "abla/sys/linux/process"
+import "abla/text"
+import "abla/unsafe/memory"
+
+// --- Linux x86-64 and AArch64 system calls (the generic table), errno values and flags, written out here -------------
+private val SYS_READ = 0
+private val SYS_WRITE = 1
+private val SYS_CLOSE = 3
+private val SYS_POLL = 7
+private val SYS_SIGPROCMASK = 14
+private val SYS_IOCTL = 16
+private val SYS_DUP2 = 33
+private val SYS_FORK = 57
+private val SYS_EXECVE = 59
+private val SYS_EXIT_GROUP = 231
+private val SYS_WAIT4 = 61
+private val SYS_KILL = 62
+private val SYS_SYMLINK = 88
+private val SYS_MKDIR = 83
+private val SYS_SETSID = 112
+private val SYS_OPENAT = 257
+private val SYS_PIPE2 = 293
+private val SYS_PRLIMIT64 = 302
+private val AT_FDCWD = -100
+private val O_WRONLY = 1
+private val O_RDWR = 2
+private val O_ACCMODE = 3
+private val O_CREAT = 64
+private val O_NOCTTY = 256
+private val O_TRUNC = 512
+private val O_NONBLOCK = 2048
+private val O_CLOEXEC = 524288
+private val FD_CLOEXEC = 1
+private val POLLIN = 1
+private val POLLOUT = 4
+private val RLIMIT_NOFILE = 7
+private val ENOENT = 2
+private val EINVAL = 22
+private val ENODEV = 19
+private val ENOTTY = 25
+private val EIO = 5
+private val EOPNOTSUPP = 95
+
+// --- termios, as the kernel's ioctls see it: iflag, oflag, cflag, lflag (u32 each), line, cc[19] ------------------------
+private val TCGETS = 21505
+private val TCSETSF = 21508
+private val TIOCGPTN = 2147767344
+private val TIOCSPTLCK = 1074025521
+private val TERMIOS_BYTES = 36
+private val IGNBRK = 1
+private val BRKINT = 2
+private val INPCK = 16
+private val ISTRIP = 32
+private val ICRNL = 256
+private val IXON = 1024
+private val IXANY = 2048
+private val IXOFF = 4096
+private val OPOST = 1
+private val CBAUD = 4111
+private val CIBAUD = 269418496
+private val CSIZE = 48
+private val CS5 = 0
+private val CS6 = 16
+private val CS7 = 32
+private val CS8 = 48
+private val CSTOPB = 64
+private val CREAD = 128
+private val PARENB = 256
+private val PARODD = 512
+private val CLOCAL = 2048
+private val CRTSCTS = 2147483648
+private val ISIG = 1
+private val ICANON = 2
+private val ECHO = 8
+private val IEXTEN = 32768
+private val VTIME = 5
+private val VMIN = 6
+
+// --- the checks' bookkeeping ---------------------------------------------------------------------------------------
+var checks = 0
+
+fun fail(message: string): never {
+    println("FAIL: $message")
+    exit(1)
+}
+
+fun expect(ok: bool, message: string): void {
+    if (!ok) fail(message)
+    return
+}
+
+fun expectEqual(actual: int, wanted: int, message: string): void {
+    if (actual != wanted) fail("$message: $actual, wanted $wanted")
+    return
+}
+
+fun passed(): void {
+    checks = checks + 1
+    return
+}
+
+// --- native buffers and their words -----------------------------------------------------------------------------------
+fun address(buffer: NativeByteBuffer): int = nativePointerAddress(buffer.address)
+
+fun word32(buffer: NativeByteBuffer, offset: int): int =
+    buffer.load(offset) + buffer.load(offset + 1) * 256 + buffer.load(offset + 2) * 65536 + buffer.load(offset + 3) * 16777216
+
+fun storeWord32(var buffer: NativeByteBuffer, offset: int, value: int): void {
+    buffer.store(offset, value & 255)
+    buffer.store(offset + 1, (value >> 8) & 255)
+    buffer.store(offset + 2, (value >> 16) & 255)
+    buffer.store(offset + 3, (value >> 24) & 255)
+    return
+}
+
+// --- files in the scratch directory -------------------------------------------------------------------------------------
+fun writeFile(path: string, contents: string): void {
+    val descriptor = linuxSyscall4(SYS_OPENAT, AT_FDCWD, nativeCStringAddress(path), O_WRONLY | O_CREAT | O_TRUNC, 420)
+    expect(descriptor >= 0, "cannot create $path: $descriptor")
+    var done = 0
+    while (done < contents.size) {
+        val count = linuxSyscall3(SYS_WRITE, descriptor, nativeStringDataAddress(contents) + done, contents.size - done)
+        expect(count > 0, "cannot write $path: $count")
+        done = done + count
+    }
+    linuxSyscall1(SYS_CLOSE, descriptor)
+    return
+}
+
+fun readFile(path: string): string {
+    val descriptor = linuxSyscall4(SYS_OPENAT, AT_FDCWD, nativeCStringAddress(path), 0, 0)
+    expect(descriptor >= 0, "cannot open $path: $descriptor")
+    var contents = ""
+    var reading = true
+    while (reading) {
+        val chunk = LinuxFileDescriptor(descriptor).read(65536)
+        if (chunk.size == 0) reading = false else contents = contents + chunk
+    }
+    linuxSyscall1(SYS_CLOSE, descriptor)
+    contents
+}
+
+fun exists(path: string): bool {
+    val descriptor = linuxSyscall4(SYS_OPENAT, AT_FDCWD, nativeCStringAddress(path), 0, 0)
+    if (descriptor >= 0) linuxSyscall1(SYS_CLOSE, descriptor)
+    descriptor >= 0
+}
+
+// A fixed pseudorandom stream (xorshift64*): the payloads are the same on every run.
+fun randomBytes(seed: int, count: int): string {
+    val buffer = nativeByteBuffer(count + 1)
+    var state = seed
+    for (index in 0 until count) {
+        state = state ^ (state >> 12)
+        state = state ^ (state << 25)
+        state = state ^ (state >> 27)
+        buffer.store(index, ((state * 2685821657736338717) >> 56) & 255)
+    }
+    buffer.adoptString(count)
+}
+
+// --- time and polling ---------------------------------------------------------------------------------------------
+fun now(): int = monotonicMilliseconds()
+
+// poll(2) on up to two descriptors: the revents of each (0 when the descriptor is -1), after at most `milliseconds`.
+class Ready(val first: int, val second: int)
+
+fun pollTwo(first: int, firstEvents: int, second: int, secondEvents: int, milliseconds: int): Ready {
+    val fds = nativeByteBuffer(16)
+    storeWord32(fds, 0, first)
+    fds.store(4, firstEvents & 255)
+    fds.store(5, 0)
+    fds.store(6, 0)
+    fds.store(7, 0)
+    storeWord32(fds, 8, second)
+    fds.store(12, secondEvents & 255)
+    fds.store(13, 0)
+    fds.store(14, 0)
+    fds.store(15, 0)
+    var count = linuxSyscall3(SYS_POLL, address(fds), 2, milliseconds)
+    while (count == -4) count = linuxSyscall3(SYS_POLL, address(fds), 2, milliseconds)
+    expect(count >= 0, "poll failed: $count")
+    val result = Ready(fds.load(6) + fds.load(7) * 256, fds.load(14) + fds.load(15) * 256)
+    fds.close()
+    result
+}
+
+// --- ptys and termios ---------------------------------------------------------------------------------------------------
+class Pty(val master: int, val slave: int, val path: string)
+
+fun openPty(): Pty {
+    val master = linuxSyscall4(SYS_OPENAT, AT_FDCWD, nativeCStringAddress("/dev/ptmx"), O_RDWR | O_NOCTTY | O_CLOEXEC, 0)
+    expect(master >= 0, "cannot open /dev/ptmx: $master")
+    val cell = nativeByteBuffer(8)
+    cell.storeI64(0, 0)
+    expectEqual(linuxSyscall3(SYS_IOCTL, master, TIOCSPTLCK, address(cell)), 0, "unlock the pty")
+    cell.storeI64(0, 0)
+    expectEqual(linuxSyscall3(SYS_IOCTL, master, TIOCGPTN, address(cell)), 0, "number of the pty")
+    val number = word32(cell, 0)
+    cell.close()
+    val path = "/dev/pts/$number"
+    val slave = linuxSyscall4(SYS_OPENAT, AT_FDCWD, nativeCStringAddress(path), O_RDWR | O_NOCTTY | O_CLOEXEC, 0)
+    expect(slave >= 0, "cannot open $path: $slave")
+    Pty(master, slave, path)
+}
+
+fun Pty.close(): void {
+    linuxSyscall1(SYS_CLOSE, this.master)
+    linuxSyscall1(SYS_CLOSE, this.slave)
+    return
+}
+
+class Termios(val raw: string) {
+    fun word(index: int): int =
+        int(this.raw[index * 4]) + int(this.raw[index * 4 + 1]) * 256 + int(this.raw[index * 4 + 2]) * 65536 + int(this.raw[index * 4 + 3]) * 16777216
+    fun input(): int = this.word(0)
+    fun output(): int = this.word(1)
+    fun control(): int = this.word(2)
+    fun local(): int = this.word(3)
+    fun cc(index: int): int = int(this.raw[17 + index])
+}
+
+fun getTermios(descriptor: int): Termios {
+    val buffer = nativeByteBuffer(TERMIOS_BYTES + 8)
+    expectEqual(linuxSyscall3(SYS_IOCTL, descriptor, TCGETS, address(buffer)), 0, "TCGETS")
+    Termios(buffer.adoptString(TERMIOS_BYTES))
+}
+
+// tty.setraw: no input translation or flow control, no output processing, 8 bits with no parity, no echo, no line
+// editing, no signals, a read returns once a byte arrives; applied after the output drains (TCSETSF).
+fun setRaw(descriptor: int): void {
+    val before = getTermios(descriptor)
+    val buffer = nativeByteBuffer(TERMIOS_BYTES + 8)
+    for (index in 0 until TERMIOS_BYTES) buffer.store(index, int(before.raw[index]))
+    storeWord32(buffer, 0, before.input() & ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON))
+    storeWord32(buffer, 4, before.output() & ~OPOST)
+    storeWord32(buffer, 8, (before.control() & ~(CSIZE | PARENB)) | CS8)
+    storeWord32(buffer, 12, before.local() & ~(ECHO | ICANON | IEXTEN | ISIG))
+    buffer.store(17 + VMIN, 1)
+    buffer.store(17 + VTIME, 0)
+    expectEqual(linuxSyscall3(SYS_IOCTL, descriptor, TCSETSF, address(buffer)), 0, "TCSETSF")
+    buffer.close()
+    return
+}
+
+// The baud-rate codes of c_cflag's CBAUD bits (the kernel's, Linux's generic termbits).
+fun baudCode(rate: int): int =
+    if (rate == 50) 1 else if (rate == 75) 2 else if (rate == 110) 3 else if (rate == 134) 4 else if (rate == 150) 5
+    else if (rate == 200) 6 else if (rate == 300) 7 else if (rate == 600) 8 else if (rate == 1200) 9 else if (rate == 1800) 10
+    else if (rate == 2400) 11 else if (rate == 4800) 12 else if (rate == 9600) 13 else if (rate == 19200) 14 else if (rate == 38400) 15
+    else if (rate == 57600) 4097 else if (rate == 115200) 4098 else if (rate == 230400) 4099 else -1
+
+fun sizeCode(bits: int): int = if (bits == 5) CS5 else if (bits == 6) CS6 else if (bits == 7) CS7 else CS8
+
+// --- the client process ---------------------------------------------------------------------------------------------------
+class Child(val pid: int, val input: int, val output: int, val errors: int)
+
+private fun argumentVector(arguments: array<string>): NativeByteBuffer {
+    val table = (arguments.size + 1) * 8
+    var bytes = 0
+    for (argument in arguments) bytes = bytes + argument.size + 1
+    val vector = nativeByteBuffer(table + bytes)
+    var offset = table
+    var index = 0
+    while (index < arguments.size) {
+        val argument = arguments[index]
+        vector.storePointer(index * 8, vector.pointerAt(offset))
+        var byte = 0
+        while (byte < argument.size) {
+            vector.store(offset + byte, argument[byte])
+            byte = byte + 1
+        }
+        vector.store(offset + argument.size, 0)
+        offset = offset + argument.size + 1
+        index = index + 1
+    }
+    vector.storePointer(arguments.size * 8, nativeNullPointer())
+    vector
+}
+
+// limit 0: the inherited descriptor limit; 1: soft raised to at least 2048; 2: 32 and 32.
+fun spawn(program: string, arguments: array<string>, limit: int): Child {
+    val pipes = nativeByteBuffer(32)
+    for (pair in 0 until 3) expectEqual(linuxSyscall2(SYS_PIPE2, address(pipes) + pair * 8, O_CLOEXEC), 0, "pipe2")
+    val inRead = word32(pipes, 0)
+    val inWrite = word32(pipes, 4)
+    val outRead = word32(pipes, 8)
+    val outWrite = word32(pipes, 12)
+    val errRead = word32(pipes, 16)
+    val errWrite = word32(pipes, 20)
+    pipes.close()
+    val everything: array<string> = [program]
+    for (argument in arguments) everything.append(argument)
+    val vector = argumentVector(everything)
+    val path = nativeCStringAddress(program)
+    val limits = nativeByteBuffer(40)
+    val mask = nativeByteBuffer(16)
+    mask.storeI64(0, 0)
+    // Nothing the child does between fork and exec allocates: all of it was made above.
+    val pid = linuxSyscall0(SYS_FORK)
+    if (pid == 0) {
+        linuxSyscall0(SYS_SETSID)
+        if (limit != 0) {
+            linuxSyscall4(SYS_PRLIMIT64, 0, RLIMIT_NOFILE, 0, address(limits) + 16)
+            val maximum = limits.loadI64(24)
+            val soft = limits.loadI64(16)
+            if (limit == 1) {
+                limits.storeI64(0, if (soft > 2048) soft else 2048)
+                limits.storeI64(8, maximum)
+            } else {
+                limits.storeI64(0, 32)
+                limits.storeI64(8, 32)
+            }
+            linuxSyscall4(SYS_PRLIMIT64, 0, RLIMIT_NOFILE, address(limits), 0)
+        }
+        linuxSyscall2(SYS_DUP2, inRead, 0)
+        linuxSyscall2(SYS_DUP2, outWrite, 1)
+        linuxSyscall2(SYS_DUP2, errWrite, 2)
+        // SIG_SETMASK with an empty set: the child starts with nothing blocked.
+        linuxSyscall4(SYS_SIGPROCMASK, 2, address(mask), 0, 8)
+        linuxSyscall3(SYS_EXECVE, path, address(vector), nativePointerAddress(linuxEnvironmentPointer()))
+        linuxSyscall1(SYS_EXIT_GROUP, 127)
+    }
+    expect(pid > 0, "fork failed: $pid")
+    linuxSyscall1(SYS_CLOSE, inRead)
+    linuxSyscall1(SYS_CLOSE, outWrite)
+    linuxSyscall1(SYS_CLOSE, errWrite)
+    vector.close()
+    limits.close()
+    mask.close()
+    Child(pid, inWrite, outRead, errRead)
+}
+
+// The exit status, or 128 plus the signal that ended the child: -1 if it has not ended within `milliseconds`.
+fun Child.waitExit(milliseconds: int): int {
+    val status = nativeByteBuffer(8)
+    val deadline = now() + milliseconds
+    var result = -1
+    var waiting = true
+    while (waiting) {
+        status.storeI64(0, 0)
+        val waited = linuxSyscall4(SYS_WAIT4, this.pid, address(status), 1, 0)
+        if (waited == this.pid) {
+            val encoded = word32(status, 0)
+            result = if ((encoded & 127) == 0) (encoded >> 8) & 255 else 128 + (encoded & 127)
+            waiting = false
+        } else if (waited < 0 && waited != -4) {
+            waiting = false
+        } else if (now() >= deadline) {
+            waiting = false
+        } else linuxSleep(5)
+    }
+    status.close()
+    result
+}
+
+fun Child.send(text: string): void {
+    expectEqual(linuxSyscall3(SYS_WRITE, this.input, nativeStringDataAddress(text), text.size), text.size, "write to the client")
+    return
+}
+
+fun Child.kill(): void {
+    linuxSyscall2(SYS_KILL, this.pid, 9)
+    this.waitExit(5000)
+    return
+}
+
+fun Child.release(): void {
+    linuxSyscall1(SYS_CLOSE, this.input)
+    linuxSyscall1(SYS_CLOSE, this.output)
+    linuxSyscall1(SYS_CLOSE, this.errors)
+    return
+}
+
+// What reaches the master: kept in a native buffer, so a 4 MiB payload is not copied around.
+class Sink(val master: int, val capacity: int, val buffer: NativeByteBuffer, var count: int)
+
+fun newSink(master: int, capacity: int): Sink = Sink(master, capacity, nativeByteBuffer(capacity + 1), 0)
+
+// What waits use when there is no pty to drain.
+var nothing: Sink = newSink(-1, 1)
+
+// Everything now readable from the master (a pty with no data, or a closed far end, reads as nothing).
+fun Sink.drain(): void {
+    var reading = this.master >= 0
+    while (reading) {
+        val ready = pollTwo(this.master, POLLIN, -1, 0, 0)
+        if ((ready.first & POLLIN) == 0 || this.count >= this.capacity) {
+            reading = false
+        } else {
+            val count = linuxSyscall3(SYS_READ, this.master, address(this.buffer) + this.count, this.capacity - this.count)
+            if (count > 0) this.count = this.count + count else reading = false
+        }
+    }
+    return
+}
+
+fun Sink.matches(wanted: string, length: int): bool {
+    var same = this.count >= length
+    var index = 0
+    while (same && index < length) {
+        if (this.buffer.load(index) != int(wanted[index])) same = false
+        index = index + 1
+    }
+    same
+}
+
+// Lines from the client's standard output, split as they arrive.
+class Lines(val child: Child, var pending: string)
+
+fun newLines(child: Child): Lines = Lines(child, "")
+
+// The next line, waiting at most `milliseconds` (and draining `sink` meanwhile, if there is one): "" on a timeout.
+fun Lines.next(milliseconds: int, var sink: Sink): string {
+    val deadline = now() + milliseconds
+    var line = ""
+    var waiting = true
+    while (waiting) {
+        val newline = this.pending.indexOf("\n")
+        if (newline >= 0) {
+            line = this.pending.slice(0, newline)
+            this.pending = this.pending.slice(newline + 1, this.pending.size)
+            waiting = false
+        } else {
+            val remaining = deadline - now()
+            if (remaining <= 0) {
+                waiting = false
+            } else {
+                val ready = pollTwo(this.child.output, POLLIN, sink.master, POLLIN, if (remaining > 20) 20 else remaining)
+                sink.drain()
+                if ((ready.first & POLLIN) != 0) {
+                    val chunk = LinuxFileDescriptor(this.child.output).read(4096)
+                    if (chunk.size == 0) waiting = false else this.pending = this.pending + chunk
+                }
+            }
+        }
+    }
+    line
+}
+
+// A line that starts with `prefix` and a space: its fields after the prefix.
+fun Lines.expect(prefix: string, var sink: Sink): array<string> {
+    val text = this.next(10000, sink)
+    expect(text.startsWith(prefix + " "), "expected $prefix, got '$text'")
+    val parts = text.split(" ")
+    val fields: array<string> = []
+    for (index in 1 until parts.size) fields.append(parts[index])
+    fields
+}
+
+fun number(text: string): int = text.parseInt() ?? -1
+
+// --- one client -----------------------------------------------------------------------------------------------------------
+class Settings(
+    val timeout: int = 1000,
+    val baud: int = 9600,
+    val bits: int = 8,
+    val parity: string = "none",
+    val stop: int = 1,
+    val raw: bool = true,
+    val flow: string = "none",
+    val readWrite: bool = false,
+    val limit: int = 0
+)
+
+class Client(val program: string, val child: Child, var lines: Lines, val ready: array<string>, val readWrite: bool)
+
+fun startClient(program: string, mode: string, path: string, payload: string, settings: Settings): Client {
+    val arguments: array<string> = [mode, path, payload, "${settings.timeout}", "${settings.baud}", "${settings.bits}", settings.parity,
+        "${settings.stop}", if (settings.raw) "true" else "false", settings.flow, if (settings.readWrite) "rw" else "w"]
+    val child = spawn(program, arguments, if (mode == "high-fd") 1 else settings.limit)
+    var lines = newLines(child)
+    val ready = lines.expect("READY", nothing)
+    if (ready[0] == "true") {
+        val flags = number(ready[2])
+        val fdFlags = number(ready[3])
+        expect((flags & O_NONBLOCK) != 0, "the device is not O_NONBLOCK")
+        expectEqual(flags & O_ACCMODE, if (settings.readWrite) O_RDWR else O_WRONLY, "access mode")
+        expect((fdFlags & FD_CLOEXEC) != 0, "the device is not close-on-exec")
+        expect(ready[4] == "false", "device open acquired a controlling terminal")
+    }
+    Client(program, child, lines, ready, settings.readWrite)
+}
+
+fun Client.send(text: string): void {
+    this.child.send(text)
+    return
+}
+
+// The RESULT line: state, written, error, elapsed.
+fun Client.write(var sink: Sink): array<int> {
+    this.send("G")
+    val fields = this.lines.expect("RESULT", sink)
+    [number(fields[0]), number(fields[1]), number(fields[2]), number(fields[3])]
+}
+
+fun Client.close(): void {
+    this.send("C")
+    val fields = this.lines.expect("CLOSED", nothing)
+    expect(fields.size == 8, "CLOSED has ${fields.size} fields")
+    val wanted = ["true", "true", "false", "6", "0", "9", "-9", "9"]
+    for (index in 0 until 8) expect(fields[index] == wanted[index], "CLOSED field $index is ${fields[index]}, wanted ${wanted[index]}")
+    expectEqual(this.child.waitExit(5000), 0, "client exit")
+    return
+}
+
+fun Client.finishFailedOpen(codes: array<int>): void {
+    expect(this.ready[0] == "false", "the open was meant to fail: ${this.ready[0]}")
+    var found = false
+    for (code in codes) if (number(this.ready[1]) == code) found = true
+    expect(found, "open error ${this.ready[1]} is not one of the wanted codes")
+    expectEqual(this.child.waitExit(5000), 0, "failed-open exit")
+    return
+}
+
+fun Client.clean(): void {
+    if (this.child.waitExit(0) < 0) this.child.kill()
+    this.child.release()
+    return
+}
+
+// --- the checks -------------------------------------------------------------------------------------------------------------
+fun rejected(program: string, mode: string, path: string, empty: string, codes: array<int>, settings: Settings): void {
+    var client = startClient(program, mode, path, empty, settings)
+    client.finishFailedOpen(codes)
+    client.clean()
+    passed()
+    return
+}
+
+fun main: int {
+    val program = linuxArgument(0)
+    val scratch = linuxArgument(1)
+    expect(program != "" && scratch != "", "usage: driver CLIENT SCRATCH_DIRECTORY")
+    val empty = "$scratch/empty"
+    writeFile(empty, "")
+    val smallBytes = randomBytes(11, 256) + "\u001b@receipt\u0000\r\n"
+    val small = "$scratch/small"
+    writeFile(small, smallBytes)
+    val defaults = Settings()
+
+    // Opens that must be refused, and leave the files alone.
+    rejected(program, "device", "$scratch/missing", empty, [ENOENT], defaults)
+    expect(!exists("$scratch/missing"), "a refused open created the file")
+    rejected(program, "device", "", empty, [EINVAL], defaults)
+    val regular = "$scratch/regular"
+    writeFile(regular, "unchanged")
+    rejected(program, "device", regular, empty, [EINVAL], defaults)
+    expect(readFile(regular) == "unchanged", "a refused open changed the file")
+    val link = "$scratch/regular-link"
+    linuxSyscall2(SYS_SYMLINK, nativeCStringAddress(regular), nativeCStringAddress(link))
+    rejected(program, "device", link, empty, [EINVAL], defaults)
+    rejected(program, "serial", "/dev/null", empty, [ENOTTY, ENODEV], defaults)
+    for (settings in [Settings(baud = 0), Settings(baud = 12345), Settings(bits = 4), Settings(bits = 9),
+        Settings(parity = "mark"), Settings(stop = 3), Settings(flow = "xon-xoff")]) {
+        rejected(program, "serial", "/dev/null", empty, [EINVAL], settings)
+    }
+    println("ok   open refusals: $checks checks")
+
+    // A write to /dev/null, by the plain name and from a descriptor above 1024.
+    for (mode in ["device", "high-fd"]) {
+        var client = startClient(program, mode, "/dev/null", small, defaults)
+        val outcome = client.write(nothing)
+        expect(outcome[0] == 1 && outcome[1] == smallBytes.size && outcome[2] == 0, "$mode wrote ${outcome[0]} ${outcome[1]} ${outcome[2]}")
+        client.close()
+        client.clean()
+        passed()
+    }
+    println("ok   /dev/null writes: $checks checks")
+
+    // Open descriptors do not leak: 256 refused serial opens and accepted device opens under a limit of 32.
+    val leaker = spawn(program, ["leaks"], 2)
+    expectEqual(leaker.waitExit(10000), 42, "leak check exit")
+    expect(LinuxFileDescriptor(leaker.output).read(4096).contains("LEAKS pass"), "the leak check did not print LEAKS pass")
+    leaker.release()
+    passed()
+
+    // A serial setting the driver rejects after the open leaves the terminal as it was, and the device usable.
+    var invalid = openPty()
+    setRaw(invalid.slave)
+    val rawBefore = getTermios(invalid.slave)
+    var invalidClient = startClient(program, "invalid-config", invalid.path, empty, defaults)
+    invalidClient.send("G")
+    val configured = invalidClient.lines.expect("CONFIGURED", nothing)
+    expect(configured[0] == "22", "an invalid serial configuration answered ${configured[0]}")
+    expect(getTermios(invalid.slave).raw == rawBefore.raw, "a refused configuration changed the terminal")
+    val configuredWrite = invalidClient.write(nothing)
+    expect(configuredWrite[0] == 1 && configuredWrite[1] == 0 && configuredWrite[2] == 0, "write after a refused configuration")
+    invalidClient.close()
+    invalidClient.clean()
+    invalid.close()
+    passed()
+
+    // A descriptor made blocking is refused, not written to.
+    val large = "$scratch/large"
+    writeFile(large, randomBytes(507, 4 * 1024 * 1024))
+    var blocking = openPty()
+    setRaw(blocking.slave)
+    var blockingClient = startClient(program, "blocking", blocking.path, large, defaults)
+    val blocked = blockingClient.write(nothing)
+    expect(blocked[0] == 6 && blocked[1] == 0 && blocked[2] == EINVAL, "a blocking descriptor: ${blocked[0]} ${blocked[1]} ${blocked[2]}")
+    expect((pollTwo(blocking.master, POLLIN, -1, 0, 0).first & POLLIN) == 0, "bytes reached a blocking descriptor's far end")
+    blockingClient.close()
+    blockingClient.clean()
+    blocking.close()
+    passed()
+
+    // The deadline at the integer extremes: the smallest is already past, the largest is no limit.
+    for (mode in ["min-deadline", "min-timeout", "max-timeout"]) {
+        var client = startClient(program, mode, "/dev/null", small, defaults)
+        val outcome = client.write(nothing)
+        if (mode == "max-timeout") {
+            expect(outcome[0] == 1 && outcome[1] == smallBytes.size && outcome[2] == 0, "$mode: ${outcome[0]} ${outcome[1]} ${outcome[2]}")
+        } else {
+            expect(outcome[0] == 3 && outcome[1] == 0 && outcome[2] == 110, "$mode: ${outcome[0]} ${outcome[1]} ${outcome[2]}")
+        }
+        client.close()
+        client.clean()
+        passed()
+    }
+    println("ok   descriptors, refused configuration, blocking and deadline extremes: $checks checks")
+
+    // The serial settings, read back from the terminal driver by the driver's own TCGETS and decoding.
+    val rates = [50, 75, 110, 134, 150, 200, 300, 600, 1200, 1800, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400]
+    val cases: array<Settings> = []
+    for (rate in rates) cases.append(Settings(baud = rate))
+    for (bits in [5, 6, 7]) cases.append(Settings(bits = bits))
+    cases.append(Settings(parity = "even"))
+    cases.append(Settings(parity = "odd"))
+    cases.append(Settings(stop = 2))
+    cases.append(Settings(flow = "rts-cts"))
+    cases.append(Settings(raw = false))
+    cases.append(Settings(readWrite = true))
+    for (settings in cases) {
+        var pty = openPty()
+        val before = getTermios(pty.slave)
+        var client = startClient(program, "serial", pty.path, empty, settings)
+        if (client.ready[0] == "false") {
+            // A pty driver may refuse framing it cannot represent.
+            expect(settings.bits != 8 || settings.parity != "none", "a refused open for settings that are always representable")
+            client.finishFailedOpen([EINVAL, EIO, EOPNOTSUPP])
+        } else {
+            val actual = getTermios(pty.slave)
+            val code = baudCode(settings.baud)
+            expectEqual(actual.control() & CBAUD, code, "output speed of ${settings.baud}")
+            val inputCode = (actual.control() & CIBAUD) >> 16
+            expect(inputCode == 0 || inputCode == code, "input speed of ${settings.baud}: $inputCode")
+            expectEqual(actual.control() & CSIZE, sizeCode(settings.bits), "character size ${settings.bits}")
+            expect(((actual.control() & CSTOPB) != 0) == (settings.stop == 2), "stop bits ${settings.stop}")
+            expect(((actual.control() & PARENB) != 0) == (settings.parity != "none"), "parity enable ${settings.parity}")
+            expect(((actual.control() & PARODD) != 0) == (settings.parity == "odd"), "parity sense ${settings.parity}")
+            expect(((actual.control() & CRTSCTS) != 0) == (settings.flow == "rts-cts"), "hardware flow control ${settings.flow}")
+            expect((actual.control() & CLOCAL) != 0 && (actual.control() & CREAD) != 0, "CLOCAL and CREAD")
+            expect((actual.input() & (IXON | IXOFF | IXANY)) == 0, "software flow control left on")
+            if (settings.raw) {
+                expect((actual.output() & OPOST) == 0, "output processing left on")
+                expect((actual.local() & (ICANON | ECHO | ISIG | IEXTEN)) == 0, "line discipline left on")
+            } else {
+                expect(actual.local() == before.local() && actual.output() == before.output(), "the raw=false settings touched the line discipline")
+            }
+            val outcome = client.write(nothing)
+            expect(outcome[0] == 1 && outcome[1] == 0 && outcome[2] == 0, "an empty write: ${outcome[0]} ${outcome[1]} ${outcome[2]}")
+            client.close()
+        }
+        client.clean()
+        pty.close()
+        passed()
+    }
+    println("ok   serial settings read back from the terminal: $checks checks")
+
+    // Byte-exact output, including NUL, high bytes, ESC and untranslated CR/LF; read concurrently.
+    for (mode in ["device", "serial"]) {
+        var pty = openPty()
+        setRaw(pty.slave)
+        var sink = newSink(pty.master, smallBytes.size + 64)
+        var client = startClient(program, mode, pty.path, small, defaults)
+        val outcome = client.write(sink)
+        expect(outcome[0] == 1 && outcome[1] == smallBytes.size && outcome[2] == 0, "$mode byte-exact: ${outcome[0]} ${outcome[1]} ${outcome[2]}")
+        val deadline = now() + 3000
+        while (sink.count < smallBytes.size && now() < deadline) {
+            sink.drain()
+            linuxSleep(5)
+        }
+        expect(sink.count == smallBytes.size && sink.matches(smallBytes, smallBytes.size), "$mode: the far end received ${sink.count} bytes, not the same")
+        client.close()
+        client.clean()
+        pty.close()
+        passed()
+    }
+
+    // A timeout of zero: nothing is written, and nothing reaches the far end.
+    var zero = openPty()
+    setRaw(zero.slave)
+    var zeroClient = startClient(program, "device", zero.path, small, Settings(timeout = 0))
+    val zeroed = zeroClient.write(nothing)
+    expect(zeroed[0] == 3 && zeroed[1] == 0 && zeroed[2] == 110, "timeout 0: ${zeroed[0]} ${zeroed[1]} ${zeroed[2]}")
+    expect((pollTwo(zero.master, POLLIN, -1, 0, 0).first & POLLIN) == 0, "bytes reached the far end with a zero timeout")
+    zeroClient.close()
+    zeroClient.clean()
+    zero.close()
+    passed()
+    println("ok   byte-exact output and zero timeout: $checks checks")
+    println("device/serial driver: $checks checks passed")
+    0
+}
