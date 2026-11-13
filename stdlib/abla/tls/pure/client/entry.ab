@@ -381,11 +381,13 @@ private fun TlsClient.handleRetryRequest(message: string, hello: TlsServerHello)
         this.fail(TLS_ALERT_UNEXPECTED_MESSAGE, "tls: a second HelloRetryRequest")
         return
     }
-    if (this.keyPairFor(hello.shareGroup) != null || hello.shareGroup == 0) {
+    // RFC 8446 section 4.1.4: a HelloRetryRequest must change the ClientHello: a group that has no share yet, a cookie, or both.
+    val cookieOnly = hello.shareGroup == 0 && hello.cookie.size > 0 && this.keyPairs.size > 0
+    if (!cookieOnly && (this.keyPairFor(hello.shareGroup) != null || hello.shareGroup == 0)) {
         this.fail(TLS_ALERT_ILLEGAL_PARAMETER, "tls: the HelloRetryRequest selects no new group")
         return
     }
-    var offered = false
+    var offered = cookieOnly
     for (group in tlsClientHelloGroups(this.firstHello)) {
         if (group == hello.shareGroup) offered = true
     }
@@ -393,7 +395,8 @@ private fun TlsClient.handleRetryRequest(message: string, hello: TlsServerHello)
         this.fail(TLS_ALERT_ILLEGAL_PARAMETER, "tls: the HelloRetryRequest selects a group that was not offered")
         return
     }
-    val pair = tlsGenerateKeyPair(hello.shareGroup, this.config.random)
+    // With a cookie alone the share already sent stands.
+    val pair = if (cookieOnly) this.keyPairs[0] else tlsGenerateKeyPair(hello.shareGroup, this.config.random)
     if (pair == null) {
         this.fail(TLS_ALERT_HANDSHAKE_FAILURE, "tls: the server asks for a group this client does not support")
         return
@@ -804,6 +807,18 @@ private fun TlsClient.startV12(message: string, body: string): void {
         this.fail(TLS_ALERT_HANDSHAKE_FAILURE, "tls: the server does not support the extended master secret")
         return
     }
+    // ALPN (RFC 7301): the server may name one of the protocols the client offered, nothing else.
+    if (hello.alpn.size > 0) {
+        var known = false
+        for (name in this.config.alpn) {
+            if (name == hello.alpn) known = true
+        }
+        if (!known) {
+            this.fail(TLS_ALERT_ILLEGAL_PARAMETER, "tls: the server chose an ALPN protocol that was not offered")
+            return
+        }
+    }
+    this.negotiatedAlpn = hello.alpn
     this.v12 = true
     this.v12Suite = hello.suite
     this.suite = hello.suite
@@ -852,6 +867,13 @@ private fun TlsClient.handleServerKeyExchange12(message: string, body: string): 
     }
     if (!offeredGroup || !offeredScheme) {
         this.fail(TLS_ALERT_ILLEGAL_PARAMETER, "tls: a key exchange group or signature scheme that was not offered")
+        return
+    }
+    // The key behind the signature must be of the type the suite names (ECDHE_ECDSA or ECDHE_RSA).
+    val suiteInfo = tls12Suite(this.v12Suite)
+    if (suiteInfo != null && suiteInfo.ecdsa != tlsSchemeIsEcKey(parsed.scheme)) {
+        this.certificateRejected = true
+        this.fail(TLS_VERDICT_UNSUPPORTED_CERTIFICATE, "tls: the certificate's key type does not match the cipher suite")
         return
     }
     val signed = tls12SignedParams(this.helloRandom, this.serverRandom, parsed.params)

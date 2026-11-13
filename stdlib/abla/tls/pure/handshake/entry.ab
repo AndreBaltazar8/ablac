@@ -4,6 +4,7 @@
 // has bytes left over, repeats an extension, or breaks a length gives `ok` false and an error.
 
 import "abla/crypto"
+import "abla/text"
 
 // ---- handshake message types and code points ----
 val TLS_CLIENT_HELLO = 1
@@ -456,7 +457,7 @@ class TlsClientHello(val ok: bool, val error: string, val random: string, val se
      *  TLS_EMPTY_RENEGOTIATION_INFO_SCSV (0x00FF) was (RFC 5746). */
     val legacyVersion: int = 0, val extendedMasterSecret: bool = false, val secureRenegotiation: bool = false,
     /** Whether the key_share extension was present at all (an empty list is a request for a HelloRetryRequest). */
-    val hasKeyShare: bool = false)
+    val hasKeyShare: bool = false, val compression: string = "\x00")
 
 private fun tlsBadClientHello(error: string): TlsClientHello {
     val none: array<int> = []
@@ -476,7 +477,8 @@ fun tlsParseClientHello(body: string): TlsClientHello {
     val extensions = tlsParseExtensions(reader)
     if (!reader.finished() || !extensions.ok) return tlsBadClientHello("tls: malformed ClientHello")
     if (sessionId.size > 32) return tlsBadClientHello("tls: a session id longer than 32 bytes")
-    if (compression != tlsU8(0)) return tlsBadClientHello("tls: the ClientHello does not offer null compression only")
+    // TLS 1.2 lists the methods it supports, null among them (RFC 5246 section 7.4.1.2); TLS 1.3 sends null only (the server checks).
+    if (!compression.contains(tlsU8(0))) return tlsBadClientHello("tls: the ClientHello does not offer null compression")
     val suites: array<int> = []
     while (suiteBytes.remaining() > 1 && suiteBytes.ok) suites.append(suiteBytes.u16())
     if (!suiteBytes.finished() || suites.size == 0) return tlsBadClientHello("tls: malformed cipher suites")
@@ -528,7 +530,11 @@ fun tlsParseClientHello(body: string): TlsClientHello {
             if (!data.finished() || !list.finished()) return tlsBadClientHello("tls: malformed server_name")
         } else if (extension.type == TLS_EXT_ALPN) {
             val list = tlsReader(data.vec16())
-            while (list.remaining() > 0 && list.ok) alpn.append(list.vec8())
+            while (list.remaining() > 0 && list.ok) {
+                val name = list.vec8()
+                if (name.size == 0) return tlsBadClientHello("tls: an empty ALPN protocol name")
+                alpn.append(name)
+            }
             if (!data.finished() || !list.finished()) return tlsBadClientHello("tls: malformed ALPN")
         } else if (extension.type == TLS_EXT_COOKIE) {
             cookie = data.vec16()
@@ -536,7 +542,7 @@ fun tlsParseClientHello(body: string): TlsClientHello {
         }
     }
     TlsClientHello(true, "", random, sessionId, suites, versions, groups, shares, schemes, alpn, serverName, cookie,
-        legacyVersion, ems, renegotiation, hasKeyShare)
+        legacyVersion, ems, renegotiation, hasKeyShare, compression)
 }
 
 /** A ServerHello message: the echo of the session id, the suite, and the server's key share. */
@@ -643,3 +649,7 @@ fun tlsAccepted(): TlsVerdict = TlsVerdict(0, "")
 fun tlsRefused(alert: int, text: string): TlsVerdict = TlsVerdict(alert, text)
 
 fun TlsVerdict.accepted(): bool = this.text.size == 0
+
+/** True for the signature schemes of an ECDSA or Ed25519 key (the ECDHE_ECDSA suites of TLS 1.2), false for RSA's. */
+fun tlsSchemeIsEcKey(scheme: int): bool = scheme == TLS_SIG_ECDSA_SECP256R1_SHA256 ||
+    scheme == TLS_SIG_ECDSA_SECP384R1_SHA384 || scheme == 1539 || scheme == TLS_SIG_ED25519
