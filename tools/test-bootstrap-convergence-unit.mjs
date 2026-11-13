@@ -133,6 +133,9 @@ describe('lineages: the pairs of routes the gate knows, selected by --lineage', 
         assert.deepEqual(gate.LINEAGES['v0.2.52'].seeds.b, gate.LINEAGES['v0.2.51'].seeds.a);
         assert.deepEqual(gate.LINEAGES['v0.2.53'].seeds.b, gate.LINEAGES['v0.2.52'].seeds.a);
         assert.equal(gate.LINEAGES['v0.2.51'].seeds.b[0], 'v0.2.50');
+        // v0.2.58: route B's seed is the release before it, which has no lineage of its own (v0.2.53 cannot build today's source).
+        assert.equal(gate.LINEAGES['v0.2.58'].seeds.a[0], 'v0.2.58');
+        assert.equal(gate.LINEAGES['v0.2.58'].seeds.b[0], 'v0.2.57');
     });
     test('the root defaults and is selectable', () => {
         assert.equal(gate.CANONICAL_ROOT, '/build/source');

@@ -46,6 +46,15 @@ export const LINEAGES = {
             b: ['v0.2.52', '126d8355386c9a4b5e46ab9d14d99ebab66ed6dcb2c84832a94b58fcd6ceefb3'],
         },
     },
+    // The first lineage today's source can build: v0.2.53 cannot (the intrinsic ablaHostOwnsRuntime arrived in v0.2.57), so route A
+    // starts from the v0.2.58 release and route B from v0.2.57, which rebuilds v0.2.58's source (the tag's commit) first.
+    'v0.2.58': {
+        historical: '6663f29084c0b2f6b90255b2aa12a7ec84ce5a55',
+        seeds: {
+            a: ['v0.2.58', '3de95d4e46fc43010319cfe619104e683d304e0ffcfb4239b8618de891c4e09e'],
+            b: ['v0.2.57', '8f7fad343a2171d694d6632c5268e7b3e2c8d5b4d916d2da1381cbf332fd1278'],
+        },
+    },
 };
 
 /** Select the pair of routes (the module-level HISTORICAL and SEEDS the rest of the gate reads), and where the candidate
@@ -308,7 +317,7 @@ export function compare(a, b, output, expectedRevision = null) {
 function main(argv) {
     const [mode, ...rest] = argv;
     if (mode !== 'route' && mode !== 'compare') { console.error('usage: test-bootstrap-convergence.mjs route|compare ...'); process.exit(2); }
-    const options = { lineage: 'v0.2.45', root: null, wrap: '' };
+    const options = { lineage: 'v0.2.58', root: null, wrap: '' };
     const positional = [];
     for (let i = 0; i < rest.length; i++) {
         if (rest[i] === '--lineage' || rest[i] === '--root' || rest[i] === '--wrap') options[rest[i].slice(2)] = rest[++i];
