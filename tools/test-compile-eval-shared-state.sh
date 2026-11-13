@@ -68,16 +68,16 @@ NODE
                     # X (a call of B.touch; the sum of two ints) and Y (a call of A.touch or of Box.plus: a write
                     # of `shared`).
                     # A Wasm slice carries the checker's resolved targets, so X reaches B.touch
-                    # alone and stays native; a host slice keeps every `touch`, and a generic
-                    # body is one copy per instantiation (go<B>, go<A>) whose class's interface a
-                    # slice cannot carry: those sites run in the interpreter. Y always does.
+                    # alone and stays native (a generic body is one copy per instantiation, go<B> and go<A>, each with its
+                    # own fact; the slice carries the classes' interface, #813); a host slice keeps every `touch`, and
+                    # operator-generic's copies are not narrowed on a built-in fact. Y always runs in the interpreter.
                     posX=$(( $(offset 'val X = #') + 8 ))
                     posY=$(( $(offset 'val Y = #') + 8 ))
                     grep -Fq "note[ct-jit]: interpreted at $((posY+1)):" "$log" ||
                         { echo "$name $target $tier: Y was not interpreted" >&2; exit 1; }
                     grep -F "note[ct-jit]: interpreted at $((posY+1)):" "$log" | grep -q 'ordinary mutable global shared may be written at ' ||
                         { echo "$name $target $tier: Y was not interpreted for the write" >&2; exit 1; }
-                    if [[ $name != member-generic && $name != operator-generic && $target == wasm ]]; then
+                    if [[ $name != operator-generic && $target == wasm ]]; then
                         grep '^note\[ct-jit\]: native at ' "$log" | grep -Fq "$name.ab:$posX" ||
                             { echo "$name $target $tier: X was not native" >&2; exit 1; }
                     else

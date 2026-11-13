@@ -26,7 +26,7 @@ for tier in jit auto; do
         # Byte offset just past `val H = ` is where the compile-time call starts.
         marker=$(( $(grep -boa 'val H = #' "tests/cases/compile-eval-method-targets/$name.ab" | head -n 1 | cut -d: -f1) + 8 ))
         log="$out/$name-$tier.log"
-        if [[ $name == unrelated || $name == field-unrelated || $name == name-unrelated || $name == free-unrelated || $name == library-unrelated ]]; then
+        if [[ $name == unrelated || $name == field-unrelated || $name == name-unrelated || $name == free-unrelated || $name == library-unrelated || $name == default-safe ]]; then
             awk -v tail="$name.ab:$marker" 'index($0, "note[ct-jit]: native at ") == 1 && substr($0, length($0) - length(tail) + 1) == tail { found = 1 } END { exit !found }' "$log" \
                 || { cat "$log" >&2; echo "method targets: $name $tier was not native at $marker" >&2; exit 1; }
             ! grep -qF 'interpreted at' "$log" || { cat "$log" >&2; echo "method targets: $name $tier interpreted" >&2; exit 1; }
