@@ -1,0 +1,113 @@
+// TLS 1.2 building blocks (abla/tls/pure/tls12): the PRF against `openssl kdf TLS1-PRF` for SHA-256 and SHA-384 (the
+// script passes: hash secret-hex label seed-hex length expected-hex, repeated in groups of six arguments), the master
+// secret and key block shapes, the record layer for AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 (round trips with
+// many records, sequence numbers, tampering, wrong sequence, truncation, overflow), and the message codecs.
+// Prints "tls-pure tls12 ok".
+import "abla/io"
+import "abla/crypto"
+import "abla/crypto/hkdf"
+import "abla/process/arguments"
+import "abla/tls/pure/handshake"
+import "abla/tls/pure/record"
+import "abla/tls/pure/tls12"
+
+var failures = 0
+
+fun fail(what: string): void {
+    failures = failures + 1
+    if (failures < 40) println("FAIL $what")
+    return
+}
+
+fun bytes(count: int, start: int): string {
+    val values: array<int> = []
+    for (i in 0 until count) values.append((start + i * 7) & 255)
+    cryptoByteString(values)
+}
+
+fun main: int {
+    var cases = 0
+    var index = 0
+    while (index + 5 < processArgumentCount()) {
+        val hash = if (processArgument(index) == "SHA384") HKDF_SHA384 else HKDF_SHA256
+        val got = tls12Prf(hash, hexDecode(processArgument(index + 1)), processArgument(index + 2),
+            hexDecode(processArgument(index + 3)), 0 + decimal(processArgument(index + 4)))
+        if (hexEncode(got) != processArgument(index + 5)) fail("PRF case $cases: ${hexEncode(got)} != ${processArgument(index + 5)}")
+        cases = cases + 1
+        index = index + 6
+    }
+    if (cases == 0) fail("no PRF cases given")
+
+    // Key block shapes: lengths per suite.
+    for (code in [TLS12_ECDHE_RSA_AES_128_GCM_SHA256, TLS12_ECDHE_ECDSA_AES_256_GCM_SHA384, TLS12_ECDHE_RSA_CHACHA20_POLY1305_SHA256]) {
+        val suite = tls12Suite(code) ?? return 1
+        val keys = tls12DeriveKeys(suite, bytes(48, 1), bytes(32, 2), bytes(32, 3))
+        if (keys.clientKey.size != suite.keyLength || keys.serverKey.size != suite.keyLength ||
+            keys.clientIv.size != suite.ivLength || keys.serverIv.size != suite.ivLength) fail("key block of $code")
+        if (keys.clientKey == keys.serverKey || keys.clientIv == keys.serverIv) fail("key block parts equal for $code")
+        // Records both ways, many, under each suite.
+        val writer = tls12Protection(suite, keys.clientKey, keys.clientIv)
+        val reader = tls12Protection(suite, keys.clientKey, keys.clientIv)
+        for (n in 0 until 300) {
+            val text = bytes(n * 3 % 997, n)
+            val sealed = tls12Protect(writer, if (n % 2 == 0) TLS_APPLICATION_DATA else TLS_HANDSHAKE, text)
+            if (!sealed.ok) {
+                fail("$code seal $n: ${sealed.error}")
+                continue
+            }
+            val opened = tls12Open(reader, sealed.bytes)
+            if (!opened.ok || opened.content != text || opened.type != (if (n % 2 == 0) TLS_APPLICATION_DATA else TLS_HANDSHAKE)) {
+                fail("$code open $n: ${opened.error}")
+            }
+        }
+        // The maximum record, over the maximum, tampering, replay, truncation.
+        val full = bytes(16384, 5)
+        val fullSealed = tls12Protect(writer, TLS_APPLICATION_DATA, full)
+        if (!fullSealed.ok || !tls12Open(reader, fullSealed.bytes).ok) fail("$code a full record")
+        if (tls12Protect(writer, TLS_APPLICATION_DATA, bytes(16385, 5)).ok) fail("$code sealed over 2^14")
+        val one = tls12Protect(writer, TLS_APPLICATION_DATA, "hello")
+        val tampered: array<int> = []
+        for (i in 0 until one.bytes.size) tampered.append(if (i == one.bytes.size - 3) one.bytes[i] ^ 1 else one.bytes[i])
+        val before = reader.sequence
+        if (tls12Open(reader, cryptoByteString(tampered)).ok) fail("$code a flipped bit opened")
+        if (reader.sequence != before) fail("$code the sequence moved on a failure")
+        if (tls12Open(reader, one.bytes.slice(0, one.bytes.size - 1)).ok) fail("$code a truncated record opened")
+        if (tls12Open(reader, "").ok) fail("$code an empty record opened")
+        if (!tls12Open(reader, one.bytes).ok) fail("$code the untampered record did not open after failures")
+        if (tls12Open(reader, one.bytes).ok) fail("$code a replayed record opened")
+        // A header type change is detected (it is authenticated).
+        val typed = tls12Protect(writer, TLS_APPLICATION_DATA, "typed")
+        val retyped: array<int> = []
+        for (i in 0 until typed.bytes.size) retyped.append(if (i == 0) TLS_HANDSHAKE else typed.bytes[i])
+        if (tls12Open(reader, cryptoByteString(retyped)).ok) fail("$code a retyped record opened")
+    }
+
+    // The codecs.
+    val keyExchange = tls12BuildServerKeyExchange(TLS_GROUP_X25519, bytes(32, 9), TLS_SIG_ED25519, bytes(64, 4))
+    val parsed = tls12ParseServerKeyExchange(keyExchange.slice(4, keyExchange.size))
+    if (!parsed.ok || parsed.group != TLS_GROUP_X25519 || parsed.point != bytes(32, 9) || parsed.scheme != TLS_SIG_ED25519 ||
+        parsed.signature != bytes(64, 4) || parsed.params != tls12EcdheParams(TLS_GROUP_X25519, bytes(32, 9))) fail("ServerKeyExchange round trip")
+    if (tls12ParseServerKeyExchange("garbage").ok) fail("garbage ServerKeyExchange parsed")
+    if (tls12ParseClientKeyExchange(tls12BuildClientKeyExchange(bytes(65, 1)).slice(4, 4 + 66)) != bytes(65, 1)) fail("ClientKeyExchange")
+    val chain = [bytes(300, 1), bytes(40, 2)]
+    val certificate = tls12ParseCertificate(tls12BuildCertificate(chain).slice(4, 4 + 3 + 303 + 43))
+    if (!certificate.ok || certificate.chain.size != 2 || certificate.chain[0] != chain[0]) fail("Certificate round trip")
+    val request = tls12BuildCertificateRequest([TLS_SIG_ECDSA_SECP256R1_SHA256, TLS_SIG_RSA_PKCS1_SHA256])
+    val schemes = tls12ParseCertificateRequest(request.slice(4, request.size))
+    if (schemes.size != 2 || schemes[1] != TLS_SIG_RSA_PKCS1_SHA256) fail("CertificateRequest")
+    val hello = tls12BuildServerHello(bytes(32, 1), "", TLS12_ECDHE_RSA_AES_128_GCM_SHA256)
+    val parsedHello = tls12ParseServerHello(hello.slice(4, hello.size))
+    if (!parsedHello.ok || !parsedHello.extendedMasterSecret || !parsedHello.secureRenegotiation || parsedHello.suite != TLS12_ECDHE_RSA_AES_128_GCM_SHA256) {
+        fail("ServerHello round trip: ${parsedHello.error}")
+    }
+
+    if (failures > 0) return 1
+    println("tls-pure tls12 ok ($cases PRF cases)")
+    0
+}
+
+fun decimal(text: string): int {
+    var value = 0
+    for (i in 0 until text.size) value = value * 10 + (text[i] - 48)
+    value
+}

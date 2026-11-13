@@ -113,6 +113,22 @@ for kind in rsa p256 ed25519; do
     stop_server
     echo "mtls $kind: accepted, refused without an identity, refused with another"
 done
+# TLS 1.2 building blocks: the PRF against `openssl kdf TLS1-PRF` (random secrets and seeds, SHA-256 and SHA-384, the
+# labels TLS 1.2 uses), the key block, the AEAD record layer for three suites, the message codecs.
+"$compiler" build tests/cases/tls-pure/tls12prf.ab -o "$out/tls12prf" --no-cache
+hex() { od -An -vtx1 | tr -d ' \n'; }
+prf_args=()
+for spec in "SHA256 48 master secret" "SHA256 12 client finished" "SHA384 104 key expansion" "SHA384 12 server finished" "SHA256 104 key expansion" "SHA384 48 extended master secret"; do
+    set -- $spec
+    digest=$1; length=$2; shift 2; label="$*"
+    secret=$(head -c 48 /dev/urandom | hex); seed=$(head -c 64 /dev/urandom | hex)
+    expected=$(openssl kdf -keylen "$length" -kdfopt digest:"$digest" -kdfopt hexsecret:"$secret" -kdfopt hexseed:"$(printf %s "$label" | hex)$seed" TLS1-PRF 2> /dev/null | tr -d ':' | tr 'A-F' 'a-f') || expected=
+    if [[ -z $expected ]]; then echo 'tls-pure tls12: this openssl has no kdf TLS1-PRF; the PRF is not compared'; prf_args=(); break; fi
+    prf_args+=("$digest" "$secret" "$label" "$seed" "$length" "$expected")
+done
+result=$("$root/tools/run-limited.sh" "$out/tls12prf" "${prf_args[@]}") || { echo "tls-pure tls12 blocks: $result" >&2; exit 1; }
+[[ $result == 'tls-pure tls12 ok'* ]] || { echo "tls-pure tls12 blocks: $result" >&2; exit 1; }
+echo "$result"
 # The sans-IO server against the sans-IO client in one process (tests/cases/tls-pure/server.ab): every key kind x suite x
 # group (HelloRetryRequest), 70 KB each way, ALPN, client certificates, KeyUpdate, refusals, damaged input.
 "$compiler" build tests/cases/tls-pure/server.ab -o "$out/server" --no-cache
