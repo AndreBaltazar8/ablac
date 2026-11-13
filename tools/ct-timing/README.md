@@ -67,6 +67,12 @@ before measurement. Each observation has separate storage.
 | `bn-montgomery` | `bnMontgomeryMultiply`, eight limbs, fixed p=2^255−19, operands below 2^254; inverse-word setup outside timing |
 | `bn-divide`, `bn-reduce`, `bn-exact` | Fixed-step private secret cores, 16-limb numerator vs fixed eight-limb nonzero p; zero is an exact-division success, random values generally are not |
 | `bn-divsteps`, `bn-gcd`, `bn-inverse` | Private secret cores, eight-limb fixed odd p and zero vs random value |
+| `gcm-tag` | `aesGcmDecrypt` of a 64-byte TLS record (5-byte header as associated data, fixed key and nonce) whose tag is wrong in its last byte (zero class) or in nearly every byte (random class): both refused; the time must not say how much of the tag matched |
+| `gcm-key` | `aesGcmDecrypt` of a fixed record under a zero vs random key: refused under both, after the key expansion, GHASH and the tag |
+| `chacha-tag` | `chaCha20Poly1305Open`, as `gcm-tag` |
+| `hkdf-expand` | `hkdfExpand` (HMAC-SHA256) of a TLS 1.3 key label from a zero vs random 32-byte PRK |
+| `x25519` | `x25519` of a zero vs random scalar (clamped by the function) with a fixed peer share |
+| `p256-ecdh` | `p256Ecdh` of a scalar whose top byte is 0x7f in both classes, with a fixed peer point |
 | `leaky-compare` | Deliberately early-exiting 256-byte Abla comparison; mandatory detection control |
 
 AES key expansion is outside these encryption tests. RSA CRT includes the
@@ -76,8 +82,8 @@ and fault verification. A public-exponent round-trip validates the CRT fixture
 before timing; an AES known-answer test checks both available implementations.
 These are operand-class tests with fixed keys, **not** tests of different secret
 keys or all input distributions. Eight-limb bignum tests do not cover every
-supported width or the inverse's even-modulus case. P-256 and X25519 exist in
-`abla/crypto` now but are not measured here yet (the report lists them as not measured).
+supported width or the inverse's even-modulus case. X25519 and P-256 ECDH are measured as TLS uses them; Ed25519 and P-256 signing are not measured here yet (the report
+lists them).
 
 Private cores are extracted verbatim from RSA's marked production source block
 by the runner (`binding.ab`) for every driver build, as in the static CT fixtures. Public

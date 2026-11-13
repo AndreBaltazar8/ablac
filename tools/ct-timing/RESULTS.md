@@ -65,3 +65,19 @@ its clock interval. The final driver moves that dispatch outside.
 Limits: fixed keys, specific operand distributions/lengths, first-order tests,
 one machine/compiler and a finite sample budget. Timing noise, a passing static
 assembly check and a nondetection do not establish absence of timing leakage.
+
+## TLS paths (#821)
+
+2026-11-13, the same machine (i9-13900K), taskset CPU 10, confirmation CPU 14. Compiler: master 325a442a's
+(`6321c08f`), with branch tls-hardening-821's stdlib. The same method: 40,000 measurement observations per row, all
+valid, 4,096 pilot and 128 warmups.
+
+| Primitive | Raw abs(t) | Max abs(t) | Observation |
+| --- | ---: | ---: | --- |
+| Control: early exit | 297.112 | 1780.87 | Leak detected (required control) |
+| gcm-tag | 1.076 | 1.843 | No leak detected at 40,000 samples |
+| gcm-key | 1.057 | 1.901 | No leak detected at 40,000 samples |
+| chacha-tag | 1.161 | 1.573 | No leak detected at 40,000 samples |
+| hkdf-expand | 2.095 | 2.684 | No leak detected at 40,000 samples |
+| x25519 | 0.809 | 1.377 | No leak detected at 40,000 samples |
+| p256-ecdh | 0.776 | 2.778 | No leak detected at 40,000 samples |
