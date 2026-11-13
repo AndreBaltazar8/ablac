@@ -96,7 +96,12 @@ bytes out with `takeOutput`, so they can run over any transport and are tested a
 socket. `connection` drives them over a TCP or Unix socket; `verify` is the certificate check; `identity` loads client
 certificates and keys. Tests: `tools/test-tls-pure.sh` (RFC 8448 sections 3, 5, 6 and 7 byte for byte, fuzzed input) and
 `tools/test-tls-pure-interop.sh` (live handshakes against `openssl s_server` and `openssl s_client` for every certificate
-type, suite, group and TLS version, mutual TLS, ALPN, Unix sockets, a 6 MB transfer).
+type, suite, group and TLS version, mutual TLS, ALPN, Unix sockets, a 6 MB transfer). Hardening:
+`tools/test-tls-fuzz.sh` (a client and a server with an attacker between them that changes one handshake record per run:
+harmless changes must still connect, harmful ones must not, none may be slow), `tools/test-crypto-pure.sh` (Wycheproof for
+every primitive TLS uses) and, opt-in, `tools/test-tls-bogo.sh` (BoringSSL's BoGo suite through `tools/tls-bogo/shim.ab`,
+the runner fetched at a pinned commit; needs Go and network access; `tools/tls-bogo/expected-failures.txt` is the
+list of what fails today and why).
 
 ## TlsSession: a client over a socket you poll yourself
 

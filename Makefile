@@ -334,6 +334,7 @@ test-serial: ablac
 	tools/test-tls-accept-deadline.sh $(COMPILER)
 	tools/test-tls-trust-cache.sh $(COMPILER)
 	tools/test-tls-session.sh $(COMPILER)
+	tools/test-tls-fuzz.sh $(COMPILER)
 	tools/test-crypto-pure.sh $(COMPILER)
 	tools/test-crypto-chacha.sh $(COMPILER)
 	tools/test-crypto-pss.sh $(COMPILER)

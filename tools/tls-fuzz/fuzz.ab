@@ -1,0 +1,528 @@
+// Structure-aware fuzzing of abla/tls/pure's client and server state machines, in one process with no sockets: a
+// client and a server shake hands with an attacker in the middle that changes one thing in the handshake, chosen by the
+// seed. Every run picks a key kind (Ed25519, P-256, RSA), TLS 1.3 or 1.2, a HelloRetryRequest or not, a client
+// certificate or not and ALPN or not; then one mutation of one record in flight:
+//   chunk      the record delivered in pieces of 1..7 bytes                       harmless: the handshake must succeed
+//   split      a plaintext handshake record cut into several records             harmless
+//   coalesce   a plaintext handshake record joined with the next one             harmless
+//   version    a plaintext record's legacy version changed                      harmless
+//   flip       one byte of the record (header type/length or body) changed       must not connect (a header length
+//                                                                                  change may only stall)
+//   truncate   the record shortened, its length fixed                            must not connect
+//   drop       the record removed                                                must not connect
+//   duplicate  the record sent twice                                             must not connect
+//   swap       the record and the next one exchanged                             must not connect
+//   alert      an alert record (any level, any description) inserted before it   must not connect
+//   message    in a plaintext handshake record: one handshake message's body changed by structure (a vector's length,
+//              an extension removed, duplicated or added, bytes inserted, cut or replaced), the outer lengths kept
+//              consistent                                                         must not connect
+// A finding is: a harmful mutation after which both sides connect and exchange data, a harmless one after which they
+// do not, a run that takes too long (quadratic cost), or a crash (a panic ends the program: the seed is printed
+// before each run with --verbose). Usage: fuzz <certificate directory> <first seed> <count> [--verbose]
+// The directory holds ed25519/p256/rsa .pem and .key (CN and SAN localhost).
+import "abla/io"
+import "abla/crypto"
+import "abla/crypto/x509"
+import "abla/integer"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/sys/linux/process"
+import "abla/tls/pure/client"
+import "abla/tls/pure/handshake"
+import "abla/tls/pure/identity"
+import "abla/tls/pure/server"
+import "abla/tls/pure/tls12"
+import "abla/tls/pure/verify"
+
+// ---- deterministic randomness: one stream for the fuzzer's choices, one for the TLS machines ----
+var choiceState = 1
+var tlsState = 1
+
+fun nextChoice(): int {
+    choiceState = (choiceState * 6364136223846793005 + 1442695040888963407)
+    (choiceState >> 33) & 2147483647
+}
+
+fun below(limit: int): int = if (limit <= 0) 0 else nextChoice() % limit
+
+fun tlsRandom(count: int): string {
+    val bytes: array<int> = []
+    for (i in 0 until count) {
+        tlsState = (tlsState * 6364136223846793005 + 1442695040888963407)
+        bytes.append((tlsState >> 40) & 255)
+    }
+    cryptoByteString(bytes)
+}
+
+fun byteString(value: int): string = cryptoByteString([value & 255])
+fun be16(value: int): string = cryptoByteString([(value >> 8) & 255, value & 255])
+fun be24(value: int): string = cryptoByteString([(value >> 16) & 255, (value >> 8) & 255, value & 255])
+
+fun now(): int = 1794600000
+
+// ---- the identities ----
+class Kind(val name: string, val identity: TlsIdentity, val store: X509TrustStore)
+
+fun loadKind(directory: string, name: string): Kind {
+    val pem = linuxReadFile("$directory/$name.pem", 1048576)
+    val key = linuxReadFile("$directory/$name.key", 1048576)
+    Kind(name, tlsIdentityFromPem(pem, key), x509TrustStoreFromPem(pem))
+}
+
+fun clientVerifierFor(store: X509TrustStore): (array<string>, int, string, string) -> string =
+    { chain: array<string>, scheme: int, content: string, signature: string ->
+        val verification = x509Verify(chain, store, X509Options("", now(), 8, 1))
+        if (!verification.ok) "client certificate: ${verification.error}"
+        else tlsVerifySignature(verification.path[0], scheme, content, signature)
+    }
+
+// ---- records ----
+class Record(val type: int, val version: int, val body: string)
+
+fun Record.bytes(): string = byteString(this.type) + be16(this.version) + be16(this.body.size) + this.body
+
+/** The whole records in `data`; a tail that is not a whole record is returned as a record of type -1. */
+fun splitRecords(data: string): array<Record> {
+    val records: array<Record> = []
+    var at = 0
+    while (at + 5 <= data.size) {
+        val length = data[at + 3] * 256 + data[at + 4]
+        if (at + 5 + length > data.size) break
+        records.append(Record(data[at], data[at + 1] * 256 + data[at + 2], data.slice(at + 5, at + 5 + length)))
+        at = at + 5 + length
+    }
+    if (at < data.size) records.append(Record(-1, 0, data.slice(at, data.size)))
+    records
+}
+
+fun Record.raw(): string = if (this.type < 0) this.body else this.bytes()
+
+// ---- the mutations ----
+val MUTATIONS = ["chunk", "split", "coalesce", "version", "flip", "truncate", "drop", "duplicate", "swap", "alert",
+    "message", "message", "message", "message"]
+
+fun harmless(mutation: string): bool =
+    mutation == "chunk" || mutation == "split" || mutation == "coalesce" || mutation == "version"
+
+class Plan(
+    val kind: int,
+    val tls12: bool,
+    val retry: bool,
+    val clientCertificate: bool,
+    val alpn: bool,
+    val target: int,
+    val mutation: string,
+    var applied: bool,
+    var note: string,
+    var stalling: bool,
+    var recordType: int
+)
+
+/** A plaintext handshake record: one the mutations that keep the handshake valid may change (before either side
+ *  encrypts, which a CCS or, in TLS 1.3, an application-data record type announces). */
+fun plaintextHandshake(record: Record, encrypted: bool): bool = record.type == 22 && !encrypted
+
+/** One handshake message's body changed by structure: the body is read as vectors and extensions where it looks like
+ *  them, else bytes are changed at random. The message header and the record length are rebuilt. */
+fun mutateMessage(body: string, var plan: Plan): string {
+    // The record holds whole messages (4-byte headers); pick one.
+    val starts: array<int> = []
+    var at = 0
+    while (at + 4 <= body.size) {
+        starts.append(at)
+        at = at + 4 + body[at + 1] * 65536 + body[at + 2] * 256 + body[at + 3]
+    }
+    if (starts.size == 0 || at != body.size) {
+        plan.note = "message: not whole messages, flipped"
+        return flipByte(body, plan)
+    }
+    val start = starts[below(starts.size)]
+    val type = body[start]
+    val length = body[start + 1] * 65536 + body[start + 2] * 256 + body[start + 3]
+    val message = body.slice(start + 4, start + 4 + length)
+    val changed = mutateBody(message, plan)
+    plan.note = "message type $type: ${plan.note}"
+    body.slice(0, start) + byteString(type) + be24(changed.size) + changed + body.slice(start + 4 + length, body.size)
+}
+
+fun flipByte(data: string, var plan: Plan): string {
+    if (data.size == 0) return data
+    val index = below(data.size)
+    val value = 1 + below(255)
+    plan.note = "${plan.note} byte $index ^ $value"
+    data.slice(0, index) + byteString(data[index] ^ value) + data.slice(index + 1, data.size)
+}
+
+/** The extensions block of a ClientHello or ServerHello body, found by walking the fixed fields: its start (the two
+ *  length bytes) or -1. */
+fun extensionsAt(type: int, message: string): int {
+    if (message.size < 38) return -1
+    var at = 34
+    val session = message[at]
+    at = at + 1 + session
+    if (type == 1) {
+        if (at + 2 > message.size) return -1
+        at = at + 2 + message[at] * 256 + message[at + 1]
+        if (at + 1 > message.size) return -1
+        at = at + 1 + message[at]
+    } else if (type == 2) {
+        at = at + 3
+    } else {
+        return -1
+    }
+    if (at + 2 > message.size) return -1
+    if (at + 2 + message[at] * 256 + message[at + 1] != message.size) return -1
+    at
+}
+
+fun mutateBody(message: string, var plan: Plan): string {
+    val choice = below(10)
+    if (choice == 0 || message.size == 0) {
+        val index = below(message.size + 1)
+        val count = 1 + below(64)
+        plan.note = "inserted $count bytes at $index"
+        return message.slice(0, index) + tlsRandomChoice(count) + message.slice(index, message.size)
+    }
+    if (choice == 1 && message.size > 0) {
+        val index = below(message.size)
+        val count = 1 + below(message.size - index)
+        plan.note = "cut $count bytes at $index"
+        return message.slice(0, index) + message.slice(index + count, message.size)
+    }
+    if (choice == 2) {
+        plan.note = "truncated"
+        return message.slice(0, below(message.size + 1))
+    }
+    if (choice == 3 && message.size >= 2) {
+        // A two-byte value set to an edge (a length field, most likely).
+        val index = below(message.size - 1)
+        val edges = [0, 1, 255, 256, 65535, message.size - index, message.size - index - 2]
+        val value = edges[below(edges.size)]
+        plan.note = "u16 at $index = $value"
+        return message.slice(0, index) + be16(value) + message.slice(index + 2, message.size)
+    }
+    if (choice == 4 && message.size >= 1) {
+        val index = below(message.size)
+        val edges = [0, 1, 127, 128, 255]
+        val value = edges[below(edges.size)]
+        plan.note = "u8 at $index = $value"
+        return message.slice(0, index) + byteString(value) + message.slice(index + 1, message.size)
+    }
+    // The extensions of a hello, by structure.
+    var type = 1
+    var extensions = extensionsAt(1, message)
+    if (extensions < 0) {
+        type = 2
+        extensions = extensionsAt(2, message)
+    }
+    if (extensions < 0) {
+        plan.note = "flipped"
+        return flipByte(message, plan)
+    }
+    val list: array<string> = []
+    var at = extensions + 2
+    while (at + 4 <= message.size) {
+        val size = message[at + 2] * 256 + message[at + 3]
+        if (at + 4 + size > message.size) break
+        list.append(message.slice(at, at + 4 + size))
+        at = at + 4 + size
+    }
+    if (list.size == 0) {
+        plan.note = "flipped (no extensions)"
+        return flipByte(message, plan)
+    }
+    val pick = below(list.size)
+    val ext = list[pick]
+    val extType = ext[0] * 256 + ext[1]
+    val action = below(6)
+    val result: array<string> = []
+    if (action == 0) {
+        plan.note = "extension $extType removed"
+        for (i in 0 until list.size) if (i != pick) result.append(list[i])
+    } else if (action == 1) {
+        plan.note = "extension $extType duplicated"
+        for (item in list) result.append(item)
+        result.append(ext)
+    } else if (action == 2) {
+        val newType = [0, 10, 13, 16, 41, 42, 43, 44, 45, 51, 65281, 2570, below(65536)][below(13)]
+        val data = tlsRandomChoice(below(40))
+        plan.note = "extension $newType added (${data.size} bytes)"
+        val added = insertAt(list, below(list.size + 1), be16(newType) + be16(data.size) + data)
+        for (item in added) result.append(item)
+    } else if (action == 3) {
+        // The extension's inner data changed by a byte, its own lengths left as they were.
+        val inner = ext.slice(4, ext.size)
+        plan.note = "extension $extType data"
+        val changed = if (inner.size == 0) tlsRandomChoice(1 + below(4)) else flipByte(inner, plan)
+        for (i in 0 until list.size) result.append(if (i == pick) ext.slice(0, 2) + be16(changed.size) + changed else list[i])
+    } else if (action == 4) {
+        plan.note = "extension $extType inner length"
+        val inner = ext.slice(4, ext.size)
+        val changed = if (inner.size >= 2) be16(inner.size - 2 + [-2, -1, 1, 2][below(4)]) + inner.slice(2, inner.size)
+            else inner + byteString(0)
+        for (i in 0 until list.size) result.append(if (i == pick) ext.slice(0, 2) + be16(changed.size) + changed else list[i])
+    } else {
+        plan.note = "extensions reordered"
+        var shuffled: array<string> = []
+        for (item in list) shuffled = insertAt(shuffled, below(shuffled.size + 1), item)
+        for (item in shuffled) result.append(item)
+    }
+    var joined = ""
+    for (item in result) joined = joined + item
+    if (type == 0) return message
+    message.slice(0, extensions) + be16(joined.size) + joined
+}
+
+fun insertAt(list: array<string>, index: int, item: string): array<string> {
+    val result: array<string> = []
+    for (i in 0 until list.size) {
+        if (i == index) result.append(item)
+        result.append(list[i])
+    }
+    if (index >= list.size) result.append(item)
+    result
+}
+
+fun tlsRandomChoice(count: int): string {
+    val bytes: array<int> = []
+    for (i in 0 until count) bytes.append(below(256))
+    cryptoByteString(bytes)
+}
+
+// ---- one run ----
+class Wire(var events: int, var clientEncrypted: bool, var serverEncrypted: bool, var pendingNext: Record?,
+    var tls13: bool)
+
+/** Delivers `data` from one side to the other through the attacker. Returns the bytes as they arrive, in the pieces
+ *  they arrive in. */
+fun intercept(data: string, fromClient: bool, var wire: Wire, var plan: Plan): array<string> {
+    val pieces: array<string> = []
+    if (data.size == 0) return pieces
+    val records = splitRecords(data)
+    var index = 0
+    while (index < records.size) {
+        val record = records[index]
+        val encrypted = if (fromClient) wire.clientEncrypted else wire.serverEncrypted
+        val event = wire.events
+        wire.events = wire.events + 1
+        var out = record.raw()
+        if (!plan.applied && event == plan.target && record.type >= 0) {
+            plan.applied = true
+            plan.recordType = record.type
+            val mutation = plan.mutation
+            if (mutation == "chunk") {
+                var at = 0
+                while (at < out.size) {
+                    val size = 1 + below(7)
+                    val end = if (at + size > out.size) out.size else at + size
+                    pieces.append(out.slice(at, end))
+                    at = end
+                }
+                out = ""
+            } else if (mutation == "split") {
+                if (plaintextHandshake(record, encrypted) && record.body.size > 1) {
+                    var split = ""
+                    var at = 0
+                    while (at < record.body.size) {
+                        val size = 1 + below(record.body.size)
+                        val end = if (at + size > record.body.size) record.body.size else at + size
+                        split = split + Record(record.type, record.version, record.body.slice(at, end)).bytes()
+                        at = end
+                    }
+                    out = split
+                } else plan.note = "not applicable"
+            } else if (mutation == "coalesce") {
+                if (plaintextHandshake(record, encrypted) && index + 1 < records.size &&
+                    plaintextHandshake(records[index + 1], encrypted) &&
+                    record.body.size + records[index + 1].body.size <= 16384) {
+                    out = Record(22, record.version, record.body + records[index + 1].body).bytes()
+                    index = index + 1
+                    wire.events = wire.events + 1
+                } else plan.note = "not applicable"
+            } else if (mutation == "version") {
+                if (!encrypted && record.type != 23) {
+                    val version = [768, 769, 770, 771, 772, 0, 65535][below(7)]
+                    plan.note = "version $version"
+                    out = Record(record.type, version, record.body).bytes()
+                } else plan.note = "not applicable"
+            } else if (mutation == "flip") {
+                val choice = below(4)
+                if (choice == 0) {
+                    val type = [20, 21, 22, 23, 24, 0, 255][below(7)]
+                    plan.note = "type ${record.type} -> $type"
+                    if (type == record.type) plan.note = "not applicable"
+                    out = Record(type, record.version, record.body).bytes()
+                } else if (choice == 1) {
+                    // The length: the record's bytes stay, so the reader is misaligned or stalls.
+                    plan.stalling = true
+                    val delta = [1, -1, 2, -2, 1000, -100][below(6)]
+                    plan.note = "length + $delta"
+                    val length = record.body.size + delta
+                    out = byteString(record.type) + be16(record.version) + be16(if (length < 0) 0 else length) + record.body
+                } else {
+                    if (record.body.size == 0) plan.note = "not applicable"
+                    out = Record(record.type, record.version, flipByte(record.body, plan)).bytes()
+                }
+            } else if (mutation == "truncate") {
+                if (record.body.size == 0) plan.note = "not applicable"
+                else {
+                    val keep = below(record.body.size)
+                    plan.note = "kept $keep of ${record.body.size}"
+                    out = Record(record.type, record.version, record.body.slice(0, keep)).bytes()
+                }
+            } else if (mutation == "drop") {
+                plan.stalling = true
+                out = ""
+            } else if (mutation == "duplicate") {
+                out = out + out
+            } else if (mutation == "swap") {
+                if (index + 1 < records.size) {
+                    out = records[index + 1].raw() + out
+                    index = index + 1
+                    wire.events = wire.events + 1
+                } else plan.note = "not applicable"
+            } else if (mutation == "alert") {
+                val level = [1, 2, 0, 3][below(4)]
+                val description = [0, 10, 20, 40, 42, 47, 50, 70, 80, 90, 100, 109, 110, 112, 116, 255][below(16)]
+                plan.note = "alert $level/$description"
+                out = Record(21, 771, byteString(level) + byteString(description)).bytes() + out
+            } else if (mutation == "message") {
+                if (plaintextHandshake(record, encrypted)) {
+                    out = Record(22, record.version, mutateMessage(record.body, plan)).bytes()
+                } else plan.note = "not applicable"
+            }
+        }
+        if (plan.applied && event == plan.target && plan.mutation != "chunk" && plan.mutation != "drop" &&
+            plan.mutation != "duplicate" && out == record.raw()) plan.note = "not applicable"
+        // Encryption starts after a CCS (TLS 1.2, either side; TLS 1.3 sends one only for compatibility) or, in TLS
+        // 1.3, with the first application-data record.
+        if (record.type == 23 || (record.type == 20 && !wire.tls13)) {
+            if (fromClient) wire.clientEncrypted = true else wire.serverEncrypted = true
+        }
+        if (out.size > 0) pieces.append(out)
+        index = index + 1
+    }
+    pieces
+}
+
+class Outcome(val clientConnected: bool, val serverConnected: bool, val dataOk: bool, val milliseconds: int,
+    val clientError: string, val serverError: string)
+
+fun runOne(seed: int, kinds: array<Kind>, var plan: Plan): Outcome {
+    tlsState = seed * 7919 + 17
+    val kind = kinds[plan.kind]
+    val suites13 = [TLS_SUITE_AES_128_GCM_SHA256, TLS_SUITE_AES_256_GCM_SHA384, TLS_SUITE_CHACHA20_POLY1305_SHA256]
+    val serverSuites = if (plan.tls12) [] else suites13
+    val groups = if (plan.retry) [TLS_GROUP_SECP256R1] else [TLS_GROUP_X25519, TLS_GROUP_SECP256R1]
+    val alpn: array<string> = if (plan.alpn) ["h2", "http/1.1"] else []
+    val serverConfig = TlsServerConfig(kind.identity, serverSuites, groups, alpn, tlsRandom, plan.clientCertificate,
+        plan.clientCertificate, clientVerifierFor(kinds[0].store))
+    var server = tlsServerNew(serverConfig)
+    val clientConfig = TlsClientConfig("localhost", suites13,
+        [TLS_SIG_ECDSA_SECP256R1_SHA256, TLS_SIG_RSA_PSS_RSAE_SHA256, TLS_SIG_RSA_PSS_RSAE_SHA384, TLS_SIG_RSA_PSS_RSAE_SHA512,
+         TLS_SIG_ED25519, TLS_SIG_RSA_PKCS1_SHA256, TLS_SIG_RSA_PKCS1_SHA384],
+        if (plan.alpn) ["http/1.1"] else [], tlsX509Verifier(kind.store, now), tlsRandom, tlsPatchClientHello)
+    var client = tlsClientNew(clientConfig)
+    if (plan.clientCertificate) client.useIdentity(kinds[0].identity)
+    var wire = Wire(0, false, false, null, !plan.tls12)
+    val started = linuxMonotonicMilliseconds()
+    var rounds = 0
+    while (rounds < 60) {
+        val toServer = client.takeOutput()
+        for (piece in intercept(toServer, true, wire, plan)) server.feed(piece)
+        val toClient = server.takeOutput()
+        for (piece in intercept(toClient, false, wire, plan)) client.feed(piece)
+        if (toServer.size == 0 && toClient.size == 0) break
+        rounds = rounds + 1
+    }
+    var dataOk = false
+    if (client.connected() && server.connected()) {
+        val message = tlsRandomChoice(1 + below(3000))
+        client.send(message)
+        server.feed(client.takeOutput())
+        val got = server.takeApplicationData()
+        server.send(message + "!")
+        client.feed(server.takeOutput())
+        dataOk = got == message && client.takeApplicationData() == message + "!"
+    }
+    Outcome(client.connected(), server.connected(), dataOk, linuxMonotonicMilliseconds() - started, client.error,
+        server.error)
+}
+
+fun planFor(seed: int, count: int): Plan {
+    choiceState = seed * 1000003 + 12345
+    nextChoice()
+    val tls12 = below(3) == 0
+    // A full handshake has about 4 to 12 records in flight; aim at all of them.
+    Plan(below(count), tls12, !tls12 && below(3) == 0, below(4) == 0, below(2) == 0, below(8),
+        MUTATIONS[below(MUTATIONS.size)], false, "", false, -1)
+}
+
+fun main: int {
+    if (processArgumentCount() < 3) {
+        println("usage: fuzz <certificate directory> <first seed> <count> [--verbose]")
+        return 2
+    }
+    val directory = processArgument(0)
+    val first = processArgument(1).parseInt()
+    val count = processArgument(2).parseInt()
+    if (first == null || count == null) return 2
+    val verbose = processArgumentCount() > 3 && processArgument(3) == "--verbose"
+    val kinds = [loadKind(directory, "ed25519"), loadKind(directory, "p256"), loadKind(directory, "rsa")]
+    for (kind in kinds) {
+        if (!kind.identity.ok()) {
+            println("fuzz: ${kind.name}: ${kind.identity.error}")
+            return 2
+        }
+    }
+    var findings = 0
+    var slowest = 0
+    var slowestSeed = 0
+    var accepted = 0
+    var refused = 0
+    var notApplicable = 0
+    for (seed in first until first + count) {
+        var plan = planFor(seed, kinds.size)
+        if (verbose) eprintln("seed $seed: ${plan.mutation} at ${plan.target} ${kinds[plan.kind].name} 1.2=${plan.tls12} hrr=${plan.retry}")
+        val outcome = runOne(seed, kinds, plan)
+        if (outcome.milliseconds > slowest) {
+            slowest = outcome.milliseconds
+            slowestSeed = seed
+        }
+        val both = outcome.clientConnected && outcome.serverConnected && outcome.dataOk
+        if (both) accepted = accepted + 1 else refused = refused + 1
+        val what = "seed $seed: ${plan.mutation} (${plan.note}) at record ${plan.target} (type ${plan.recordType}), ${kinds[plan.kind].name}" +
+            "${if (plan.tls12) ", TLS 1.2" else ""}${if (plan.retry) ", HRR" else ""}" +
+            "${if (plan.clientCertificate) ", client certificate" else ""}${if (plan.alpn) ", ALPN" else ""}"
+        if (!plan.applied || plan.note == "not applicable") {
+            notApplicable = notApplicable + 1
+            if (!both) {
+                findings = findings + 1
+                println("FINDING (an unmutated handshake failed) $what: client '${outcome.clientError}' server '${outcome.serverError}'")
+            }
+        } else if (!plan.tls12 && plan.recordType == 20 && (plan.mutation == "drop" || plan.mutation == "duplicate" ||
+            plan.mutation == "swap" || plan.mutation == "chunk" || plan.mutation == "version")) {
+            // TLS 1.3's compatibility CCS: RFC 8446 section 5 says to drop it wherever it comes before the peer's Finished.
+            if (verbose && !both) println("note: a CCS change refused: $what")
+        } else if (harmless(plan.mutation)) {
+            if (!both) {
+                findings = findings + 1
+                println("FINDING (a harmless change refused) $what: client '${outcome.clientError}' server '${outcome.serverError}'")
+            }
+        } else if (both) {
+            findings = findings + 1
+            println("FINDING (a harmful change accepted) $what")
+        } else if (outcome.clientConnected != outcome.serverConnected && !plan.stalling && plan.mutation != "drop") {
+            // One side connected and the other did not: allowed when the last flight was damaged (the side that sent
+            // it is done); noted for review in verbose mode.
+            if (verbose) println("note: one side connected: $what")
+        }
+        if (outcome.milliseconds > 3000) {
+            findings = findings + 1
+            println("FINDING (slow: ${outcome.milliseconds} ms) $what")
+        }
+    }
+    println("fuzz: seeds $first..${first + count - 1}: $accepted connected, $refused refused, $notApplicable unmutated, " +
+        "$findings findings, slowest $slowest ms (seed $slowestSeed)")
+    if (findings == 0) 0 else 1
+}
