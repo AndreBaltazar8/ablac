@@ -49,6 +49,15 @@ for flags in "" "-g"; do
     else
         echo "darwin syscalls: segv$flags: exit $segv (139 expected)" >&2; failed=1
     fi
+    : # A debug build reports a fault that is no overflow (write by system call), then the
+    # default action ends the process by the signal (restore + raise by system call).
+    if [[ -n $flags ]]; then
+        if grep -q '^fatal signal' "$out/stack-segv.err"; then
+            echo "fault report$flags: ok"
+        else
+            echo "darwin syscalls: fault report$flags: no 'fatal signal' line: $(head -3 "$out/stack-segv.err")" >&2; failed=1
+        fi
+    fi
 done
 [[ $failed -eq 0 ]] || exit 1
 echo 'darwin syscalls: every call agrees'

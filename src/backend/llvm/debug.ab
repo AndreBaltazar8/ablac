@@ -818,6 +818,8 @@ fun bootstrapLlvmRuntimeWrite(
     val fd = LLVMConstInt(backend.i64Type, descriptor, 0)
     if (bootstrapLlvmStackGuardKernel(backend)) {
         bootstrapLlvmLinuxX64Syscall(backend, 1, [fd, text, size])
+    } else if (bootstrapLlvmFaultDarwin(backend)) {
+        bootstrapLlvmDarwinSyscallBy(backend, 4, [fd, text, size])
     } else {
         bootstrapLlvmDebugCall(
             backend, "write", backend.i64Type,
@@ -926,6 +928,17 @@ fun bootstrapLlvmDarwinSigaction(
         backend.builder, LLVMConstInt(backend.i32Type, flags, 0),
         bootstrapLlvmByteAt(backend, action, 24, 20)
     )
+    bootstrapLlvmDarwinSyscallBy(
+        backend, 46, [signal, action, LLVMConstInt(backend.i64Type, 0, 0)]
+    )
+    return
+}
+
+// signal(signal, SIG_DFL) by sigaction: an all-zero struct.
+fun bootstrapLlvmDarwinSigDefault(backend: BootstrapLlvmBackend, signal: i64*): void {
+    val actionType = LLVMArrayType2(backend.i8Type, 24)
+    val action = LLVMBuildAlloca(backend.builder, actionType, "darwin.default")
+    LLVMBuildStore(backend.builder, LLVMConstNull(actionType), action)
     bootstrapLlvmDarwinSyscallBy(
         backend, 46, [signal, action, LLVMConstInt(backend.i64Type, 0, 0)]
     )
@@ -1180,6 +1193,9 @@ fun bootstrapLlvmEmitStackGuardHandler(backend: BootstrapLlvmBackend): void {
         // exit_group, as libc _exit: terminate the entire process, not just
         // the thread handling the fault.
         bootstrapLlvmLinuxX64Syscall(backend, 231, [LLVMConstInt(i64, 101, 0)])
+    } else if (bootstrapLlvmFaultDarwin(backend)) {
+        // exit (1) ends the process, as libSystem's _exit.
+        bootstrapLlvmDarwinSyscallBy(backend, 1, [LLVMConstInt(i64, 101, 0)])
     } else {
         bootstrapLlvmStackGuardCall(
             backend, "_exit", backend.voidType, [backend.i64Type],
@@ -1204,6 +1220,8 @@ fun bootstrapLlvmEmitStackGuardHandler(backend: BootstrapLlvmBackend): void {
         val action = LLVMBuildAlloca(backend.builder, defaultType, "signal.default")
         LLVMBuildStore(backend.builder, LLVMConstNull(defaultType), action)
         bootstrapLlvmStackGuardKernelSigaction(backend, signal, action)
+    } else if (bootstrapLlvmFaultDarwin(backend)) {
+        bootstrapLlvmDarwinSigDefault(backend, signal)
     } else {
         bootstrapLlvmStackGuardCall(
             backend, "signal", backend.pointerType,
@@ -1218,6 +1236,11 @@ fun bootstrapLlvmEmitStackGuardHandler(backend: BootstrapLlvmBackend): void {
         val process = bootstrapLlvmLinuxX64Syscall(backend, 39, [])
         val threadId = bootstrapLlvmLinuxX64Syscall(backend, 186, [])
         bootstrapLlvmLinuxX64Syscall(backend, 234, [process, threadId, signal])
+    } else if (bootstrapLlvmFaultDarwin(backend)) {
+        // kill(getpid(), signal): raise's process-directed form; the default action it
+        // meets ends the process by the signal as before.
+        val process = bootstrapLlvmDarwinSyscallBy(backend, 20, [])
+        bootstrapLlvmDarwinSyscallBy(backend, 37, [process, signal, LLVMConstInt(i64, 1, 0)])
     } else {
         bootstrapLlvmStackGuardCall(
             backend, "raise", backend.i32Type, [backend.i32Type],
@@ -1579,6 +1602,8 @@ fun bootstrapLlvmEmitDebugRuntime(backend: BootstrapLlvmBackend): void {
             val action = LLVMBuildAlloca(backend.builder, defaultType, "fault.default")
             LLVMBuildStore(backend.builder, LLVMConstNull(defaultType), action)
             bootstrapLlvmStackGuardKernelSigaction(backend, LLVMGetParam(fault, 0), action)
+        } else if (bootstrapLlvmFaultDarwin(backend)) {
+            bootstrapLlvmDarwinSigDefault(backend, LLVMGetParam(fault, 0))
         } else {
             bootstrapLlvmDebugCall(
                 backend, "signal", backend.pointerType,
