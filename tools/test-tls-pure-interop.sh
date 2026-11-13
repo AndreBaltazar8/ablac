@@ -39,7 +39,7 @@ start_server() {
         port=$(( 20000 + RANDOM % 20000 ))
         # (A test hook: TLS_PURE_FIRST_PORT forces the first attempt of each start onto a port, to exercise the retry.)
         [[ $attempt -eq 1 && -n ${TLS_PURE_FIRST_PORT:-} ]] && port=$TLS_PURE_FIRST_PORT
-        (cd "${server_directory:-.}" && exec openssl s_server -accept "$port" -cert "$root/$out/$kind.pem" -key "$root/$out/$kind.key" -tls1_3 "$@") > "$out/server.log" 2>&1 &
+        (cd "${server_directory:-.}" && exec openssl s_server -accept "$port" -cert "$root/$out/$kind.pem" -key "$root/$out/$kind.key" ${tls_flag:--tls1_3} "$@") > "$out/server.log" 2>&1 &
         server_pid=$!
         local started=0
         for _ in $(seq 50); do
@@ -76,6 +76,35 @@ for kind in ed25519 p256 p384 rsa; do
     echo "$kind: ok"
 done
 echo "$runs handshakes (4 certificate types x 3 suites x 2 groups, the P-256 ones through a HelloRetryRequest)"
+# TLS 1.2 (the modern subset): the pure client against `openssl s_server -tls1_2`: RSA, P-256 and Ed25519 certificates x their six
+# ECDHE suites x X25519 and P-256, and RSA with PKCS#1 v1.5 signatures only; a TLS 1.2 server without the extended
+# master secret is refused.
+runs12=0
+# (No P-384 certificate: TLS 1.2 servers require the certificate's curve in the client's supported_groups, and the
+# client has no P-384 key exchange to offer it with; TLS 1.3 has no such rule.)
+for kind in rsa p256 ed25519; do
+    if [[ $kind == rsa ]]; then
+        suites12="ECDHE-RSA-AES128-GCM-SHA256:49199 ECDHE-RSA-AES256-GCM-SHA384:49200 ECDHE-RSA-CHACHA20-POLY1305:52392"
+    else
+        suites12="ECDHE-ECDSA-AES128-GCM-SHA256:49195 ECDHE-ECDSA-AES256-GCM-SHA384:49196 ECDHE-ECDSA-CHACHA20-POLY1305:52393"
+    fi
+    for suite in $suites12; do
+        for group in X25519 P-256; do
+            tls_flag=-tls1_2 start_server "$kind" -www -cipher "${suite%:*}" -groups "$group"
+            result=$("$root/tools/run-limited.sh" "$out/interop" "$port" "$out/$kind.pem" "${suite#*:}" "$out/$([[ $kind == p256 ]] && echo rsa || echo p256).pem") || {
+                echo "tls-pure TLS 1.2 ($kind ${suite%:*} $group): $result" >&2; head -5 "$out/server.log" >&2; exit 1; }
+            [[ $result == 'tls-pure interop ok'* ]] || { echo "tls-pure TLS 1.2 ($kind ${suite%:*} $group): $result" >&2; exit 1; }
+            stop_server
+            runs12=$((runs12 + 1))
+        done
+    done
+done
+tls_flag=-tls1_2 start_server rsa -www -cipher ECDHE-RSA-AES128-GCM-SHA256 -groups X25519
+result=$("$root/tools/run-limited.sh" "$out/interop" "$port" "$out/rsa.pem" 49199 "$out/p256.pem" pkcs1) || { echo "tls-pure TLS 1.2 (RSA PKCS#1): $result" >&2; head -5 "$out/server.log" >&2; exit 1; }
+[[ $result == 'tls-pure interop ok'* ]] || { echo "tls-pure TLS 1.2 (RSA PKCS#1): $result" >&2; exit 1; }
+stop_server
+runs12=$((runs12 + 1))
+echo "TLS 1.2: $runs12 handshakes (3 certificate types x 3 suites x 2 groups, and RSA with PKCS#1 v1.5)"
 # The hosted-API-compatible surface (abla/tls/pure: tlsConnectWithCa, TlsConnection, tlsLastError ...).
 "$compiler" build tests/cases/tls-pure/api.ab -o "$out/api" --no-cache
 start_server ed25519 -www -groups X25519
