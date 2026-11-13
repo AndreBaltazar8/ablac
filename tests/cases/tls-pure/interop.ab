@@ -1,0 +1,65 @@
+// abla/tls/pure against a live TLS 1.3 server (tools/test-tls-pure.sh starts `openssl s_server` with an
+// Ed25519 certificate on a port given as the first argument, the certificate's public key (hex) the second):
+// connect, the full handshake with X25519 and AES-GCM, the Ed25519 CertificateVerify checked here with
+// abla/crypto/ed25519 against the certificate's key, then a request/response over the connection and
+// close_notify. Prints "tls-pure interop ok".
+import "abla/io"
+import "abla/crypto"
+import "abla/crypto/ed25519"
+import "abla/process/arguments"
+import "abla/tls/pure/client"
+import "abla/tls/pure/connection"
+import "abla/tls/pure/handshake"
+
+var publicKey = ""
+var failures = 0
+
+fun fail(what: string): void {
+    failures = failures + 1
+    println("FAIL $what")
+    return
+}
+
+// The test's own certificate check: the leaf's SubjectPublicKeyInfo ends with the 32-byte Ed25519 key,
+// which must be the one given; the CertificateVerify is an Ed25519 signature over the signed content.
+fun verifier(chain: array<string>, host: string, scheme: int, content: string, signature: string): string {
+    if (scheme != TLS_SIG_ED25519) return "unexpected signature scheme $scheme"
+    val leaf = chain[0]
+    var found = false
+    for (i in 0 until leaf.size - 32) {
+        if (hexEncode(leaf.slice(i, i + 32)) == publicKey) found = true
+    }
+    if (!found) return "the certificate does not carry the expected public key"
+    if (!ed25519Verify(hexDecode(publicKey), content, signature)) return "bad Ed25519 CertificateVerify"
+    ""
+}
+
+fun decimal(text: string): int {
+    var value = 0
+    for (i in 0 until text.size) value = value * 10 + (text[i] - 48)
+    value
+}
+
+fun main: int {
+    val port = decimal(processArgument(0))
+    publicKey = processArgument(1)
+    val config = tlsClientConfig("localhost", verifier, tlsPureRandom)
+    var connection = tlsPureConnect(config, port, 5000, 5000)
+    if (!connection.ok()) {
+        println("FAIL connect: ${connection.lastError}")
+        return 1
+    }
+    if (connection.write("GET / HTTP/1.0\r\n\r\n") < 0) fail("write: ${connection.lastError}")
+    var response = ""
+    var chunk = connection.read(4096)
+    while (chunk.size > 0) {
+        response = response + chunk
+        chunk = connection.read(4096)
+    }
+    if (connection.lastError != "") fail("read: ${connection.lastError}")
+    if (response.size == 0) fail("no response")
+    connection.close()
+    if (failures > 0) return 1
+    println("tls-pure interop ok (${response.size} bytes)")
+    0
+}

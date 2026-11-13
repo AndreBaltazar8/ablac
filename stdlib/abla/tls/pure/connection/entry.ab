@@ -1,0 +1,122 @@
+// A TLS 1.3 client connection over a TCP socket: abla/tls/pure/client driven by the socket. The
+// calls follow abla/tls/hosted's connection (`read` returns "" at end of stream with an empty
+// `lastError`, and "" with the reason on a timeout or failure; `write` returns the bytes taken or
+// -1), so the stdlib's users can switch by import. The certificate check is the caller's (the x509
+// layer provides the default).
+
+import "abla/dns"
+import "abla/random"
+import "abla/sys/linux/net"
+import "abla/tls/pure/client"
+
+/** Secure random bytes for the handshake (the client's random, its session id, its key shares). */
+fun tlsPureRandom(count: int): string {
+    val result = secureRandomBytes(count)
+    if (result.succeeded) result.bytes else ""
+}
+
+resource class TlsPureConnection(var tcp: TcpConnection, var client: TlsClient, var lastError: string) {
+    fun drop(): void {
+        if (this.tcp.descriptor >= 0) {
+            this.client.close()
+            this.tcp.close()
+        }
+        return
+    }
+}
+
+private fun TlsPureConnection.flush(): bool {
+    val data = this.client.takeOutput()
+    if (data.size == 0) return true
+    val result = this.tcp.writeResult(data)
+    if (!result.succeeded()) {
+        this.lastError = if (result.timedOut()) "TLS read or write timed out" else "TLS write failed"
+        return false
+    }
+    true
+}
+
+/** Connects, runs the handshake and returns the connection; check `ok()`: on failure `lastError` says
+ *  why and the socket is closed. */
+fun tlsPureConnect(config: TlsClientConfig, port: int = 443, timeoutMilliseconds: int = 5000,
+    readWriteTimeoutMilliseconds: int = 30000, deadline: int = 0): TlsPureConnection {
+    var connection = TlsPureConnection(tcpConnectHost(config.host, port, timeoutMilliseconds, deadline),
+        tlsClientNew(config), "")
+    if (connection.tcp.descriptor < 0) {
+        connection.lastError = "TLS failed at tcp_connect"
+        return connection
+    }
+    connection.tcp.setTimeouts(readWriteTimeoutMilliseconds, readWriteTimeoutMilliseconds)
+    var running = connection.flush()
+    while (running && !connection.client.connected() && !connection.client.failed()) {
+        val received = connection.tcp.readResult(16384)
+        if (received.hasData()) {
+            connection.client.feed(received.bytes)
+            running = connection.flush()
+        } else {
+            connection.lastError = if (received.timedOut()) "TLS read or write timed out"
+                else if (received.reachedEof()) "TLS failed at handshake: the connection closed"
+                else "TLS failed at handshake"
+            running = false
+        }
+    }
+    if (connection.client.failed()) {
+        connection.flush()
+        connection.lastError = connection.client.error
+    }
+    if (!connection.client.connected()) {
+        connection.tcp.close()
+    }
+    connection
+}
+
+fun TlsPureConnection.ok(): bool = this.tcp.descriptor >= 0 && this.client.connected()
+
+/** Up to `maximum` bytes of application data; "" at the end of the stream (`lastError` is "") or on a
+ *  timeout or failure (`lastError` says why; a timed-out read can be repeated). */
+fun TlsPureConnection.read(maximum: int = 65536): string {
+    this.lastError = ""
+    while (true) {
+        val buffered = this.client.applicationData
+        if (buffered.size > 0) {
+            if (buffered.size <= maximum) return this.client.takeApplicationData()
+            this.client.applicationData = buffered.slice(maximum, buffered.size)
+            return buffered.slice(0, maximum)
+        }
+        if (this.client.closed() || this.client.state == TLS_CLIENT_CLOSED) return ""
+        if (this.client.failed()) {
+            this.lastError = this.client.error
+            return ""
+        }
+        if (this.tcp.descriptor < 0) return ""
+        val received = this.tcp.readResult(16384)
+        if (received.hasData()) {
+            this.client.feed(received.bytes)
+            this.flush()
+        } else if (received.reachedEof()) {
+            // The peer closed the stream without close_notify: a truncation, not a clean end.
+            if (!this.client.closed()) this.lastError = "TLS connection closed without close_notify"
+            return ""
+        } else {
+            this.lastError = if (received.timedOut()) "TLS read or write timed out" else "TLS read failed"
+            return ""
+        }
+    }
+    ""
+}
+
+/** Sends all of `contents`; the bytes taken, or -1 on failure. */
+fun TlsPureConnection.write(contents: string): int {
+    if (!this.client.send(contents)) return -1
+    if (!this.flush()) return -1
+    contents.size
+}
+
+fun TlsPureConnection.close(): bool {
+    if (this.tcp.descriptor >= 0) {
+        this.client.close()
+        this.flush()
+        return this.tcp.close()
+    }
+    true
+}
