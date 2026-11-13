@@ -329,6 +329,7 @@ test-serial: ablac
 	tools/test-ed25519.sh $(COMPILER)
 	tools/test-tls-pure.sh $(COMPILER)
 	tools/test-tls-pure-interop.sh $(COMPILER)
+	tools/test-tls-client-ca.sh $(COMPILER)
 	tools/test-crypto-pure.sh $(COMPILER)
 	tools/test-crypto-chacha.sh $(COMPILER)
 	tools/test-crypto-pss.sh $(COMPILER)

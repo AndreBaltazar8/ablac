@@ -78,6 +78,20 @@ resource class TlsConnection(var handle: int, var inner: TlsPureConnection) {
     }
 }
 
+/** The peer's certificate chain (DER, end entity first): the client's on a connection a listener with
+ *  `tlsListenWithClientCa` accepted (empty when it sent none), the server's on one this side opened.  After a failed handshake it is the chain that was refused. */
+fun TlsConnection.peerChain(): array<string> = this.inner.peerChain()
+
+/** The DER of the peer's end-entity certificate, or "" when it sent none. */
+fun TlsConnection.peerCertificate(): string {
+    val chain = this.inner.peerChain()
+    if (chain.size == 0) "" else chain[0]
+}
+
+/** Whether the peer presented a certificate and it verified: the client's against the listener's client CA, the server's
+ *  against the trust store. A connection that failed, or whose client sent none, is false. */
+fun TlsConnection.peerCertificateVerified(): bool = this.handle != -1 && this.inner.peerVerified()
+
 private fun TlsConnection.record(): void {
     pureTlsSetError(this.inner.stage)
     return
@@ -233,8 +247,31 @@ resource class TlsListener(var handle: int, var listener: TcpListener, var confi
  *  chain (PEM, the leaf first) and private key (PEM) from the two files. Check `handle != -1`; `tlsLastError()` says
  *  why not. Port 0 takes a free port (`localPort()`). */
 fun tlsListen(certificatePath: string, privateKeyPath: string, host: string = "::", port: int = 443,
-    backlog: int = 128, dualStack: bool = true): TlsListener {
-    val config = pureTlsServerConfig(certificatePath, privateKeyPath)
+    backlog: int = 128, dualStack: bool = true): TlsListener =
+    pureTlsListen(pureTlsServerConfig(certificatePath, privateKeyPath), host, port, backlog, dualStack)
+
+// The server configuration that also asks for client certificates: they must chain to a CA of the PEM file `clientCaPath`
+// (and be valid for client authentication). A missing file or one without a certificate gives no configuration.
+private fun pureTlsServerConfigWithClientCa(certificatePath: string, privateKeyPath: string, clientCaPath: string,
+    required: bool): TlsServerConfig? {
+    val identity = tlsClientIdentityFromPem(linuxReadFile(certificatePath, 1048576), linuxReadFile(privateKeyPath, 1048576))
+    if (!identity.ok()) return null
+    val store = x509TrustStoreFromFile(clientCaPath)
+    if (store == null || store.certificates.size == 0) return null
+    tlsServerConfigWithClientCertificates(identity, tlsPureRandom, required, tlsX509ClientVerifier(store, pureTlsNow))
+}
+
+/** As tlsListen, and asks every client for a certificate: it must chain to one of the CA certificates in the PEM file
+ *  `clientCaPath`, be valid for client authentication and prove it holds the key. A client that sends none is refused
+ *  unless `required` is false, and a certificate that does not verify always fails the handshake. After `accept`, the
+ *  connection's `peerCertificate()`, `peerChain()` and `peerCertificateVerified()` say who connected. Check `handle != -1`
+ *  (a missing or empty CA file fails like a missing certificate: error 11). */
+fun tlsListenWithClientCa(certificatePath: string, privateKeyPath: string, clientCaPath: string, host: string = "::",
+    port: int = 443, backlog: int = 128, dualStack: bool = true, required: bool = true): TlsListener =
+    pureTlsListen(pureTlsServerConfigWithClientCa(certificatePath, privateKeyPath, clientCaPath, required), host, port,
+        backlog, dualStack)
+
+private fun pureTlsListen(config: TlsServerConfig?, host: string, port: int, backlog: int, dualStack: bool): TlsListener {
     var listener = TcpListener(-1)
     if (config != null && port >= 0 && port <= 65535 && backlog > 0 && backlog <= 4096) {
         listener = if (linuxIpv6Words(host).size == 8) tcpListenIpv6(ipv6SocketAddress(host, port), backlog, dualStack)

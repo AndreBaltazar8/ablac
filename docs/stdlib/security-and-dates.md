@@ -481,3 +481,20 @@ an unknown critical extension), the system bundle's certificates, and [x509-limb
 cases and every 25th of BetterTLS's 9,491 name-constraint cases (`tests/cases/x509/limbo`): the cases this code answers
 differently from the suite are listed in `known.tsv` with the reason (CA/Browser Forum profile rules, key identifiers, policies,
 the trust anchor's own fields, the public suffix list), and the test fails when one is missing from it or no longer differs.
+
+## `abla/tls/pure`: a listener that asks for client certificates
+
+`abla/tls/pure` (TLS 1.3 and the modern subset of 1.2 in Abla, no OpenSSL, no libc) has `tlsListen` as `abla/tls/hosted`
+does, and one call more for mutual TLS:
+
+| Function | Result |
+|---|---|
+| `tlsListenWithClientCa(certificatePath, privateKeyPath, clientCaPath, host = "::", port = 443, backlog = 128, dualStack = true, required = true)` | a `TlsListener` that asks every client for a certificate, which must chain to a CA certificate in the PEM file `clientCaPath`, be valid for client authentication (extended key usage `clientAuth`, or none) and prove it holds the key. A client that sends none is refused unless `required` is false; one that sends a certificate that does not verify is always refused. A missing CA file, or one with no certificate, gives `handle == -1` (`tlsLastError()` 11) |
+| `connection.peerCertificate()` | the DER of the peer's end-entity certificate, or `""` when it sent none |
+| `connection.peerChain()` | the peer's certificates (DER, the end entity first); on a connection a listener accepted, the client's |
+| `connection.peerCertificateVerified()` | whether the peer presented a certificate and it verified (false for a client that sent none, and for a failed connection) |
+
+After a failed handshake `peerChain()` is the chain that was refused. The subject comes from `abla/crypto/x509`:
+`x509ParseDer(connection.peerCertificate()).subject.commonName`. Tested against `openssl s_client` with a good
+certificate, none, a certificate from another CA and one without the client usage, under TLS 1.3 and 1.2
+(`tools/test-tls-client-ca.sh`).
