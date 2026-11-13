@@ -26,7 +26,7 @@ tool=$out/tool
 if command -v openssl > /dev/null && openssl genpkey -algorithm ED25519 -out "$out/probe.pem" 2> /dev/null; then
     for ((round = 0; round < rounds; round++)); do
         seed=$(random_hex 32)
-        length=$(( RANDOM % 300 ))
+        length=$(( RANDOM % 300 + 1 )) # openssl pkeyutl refuses a 0-byte one-shot input
         message=$(random_hex "$length")
         # A raw seed as DER: the PKCS#8 prefix of Ed25519 (RFC 8410), and the SubjectPublicKeyInfo one for the key.
         unhex "302e020100300506032b657004220420$seed" > "$out/private.der"
