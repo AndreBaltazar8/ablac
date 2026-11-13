@@ -1,0 +1,393 @@
+// NIST P-384 (secp384r1) ECDSA verification and public key checks, in Abla, for certificate chains and TLS: the same complete
+// point formulas as abla/crypto/p256 (a = -3 here too) on the big-number arithmetic of abla/crypto/bignum, 12 limbs.
+// Everything here works on public values (a public key, a message digest, a signature), so the scalar multiplication
+// is a plain binary one and nothing is claimed to be constant time. Signing and key agreement on P-384 are not here.
+//
+// A public key is 97 bytes, 0x04 || X || Y; compressed points are refused.
+
+import "abla/bytes"
+import "abla/ct"
+import "abla/crypto"
+import "abla/crypto/bignum"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+private val P384_WORDS = 12
+private val P384_PRIME = "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffff"
+private val P384_PRIME_MINUS_TWO = "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000fffffffd"
+private val P384_ORDER = "ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196accc52973"
+private val P384_ORDER_MINUS_TWO = "ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196accc52971"
+private val P384_B = "b3312fa7e23ee7e4988e056be3f82d19181d9c6efe8141120314088f5013875ac656398d8a2ed19d2a85c8edd3ec2aef"
+private val P384_GX = "aa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a385502f25dbf55296c3a545e3872760ab7"
+private val P384_GY = "3617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c00a60b1ce1d7e819d7a431d7c90ea0e5f"
+
+// Work area, in bytes: five temporaries of 48 bytes, then b.
+private val P384_TEMPS = 0
+private val P384_B_AT = 240
+private val P384_WORK_WORDS = 72
+
+// Where a BnModulus keeps what the arithmetic reads, for twelve limbs.
+private @inline fun p384Inverse(m: int): int = m + 48
+private @inline fun p384One(m: int): int = m + 100
+private @inline fun p384Scratch(m: int): int = m + 148
+
+private @inline trusted fun p384Multiply(m: int, out: int, a: int, b: int): void =
+    bnMontgomeryMultiply(out, a, b, m, p384Inverse(m), P384_WORDS, p384Scratch(m))
+
+/** `out` = `a` + `b` mod the modulus. `out` may be either. Uses the modulus's scratch. */
+private trusted fun p384Add(m: int, out: int, a: int, b: int): void {
+    val t = p384Scratch(m)
+    var carry = secretU32(u32(0))
+    for (j in 0 until P384_WORDS) {
+        val sum = bnLoad(a + j * 4).widen() + bnLoad(b + j * 4).widen() + carry.widen()
+        bnStore(t + j * 4, sum.low())
+        carry = sum.high()
+    }
+    bnConditionalSubtractBody(out, t, carry, m, P384_WORDS, t + (P384_WORDS + 2) * 4)
+}
+
+/** `out` = `a` - `b` mod the modulus. `out` may be either. Uses the modulus's scratch. */
+private trusted fun p384Subtract(m: int, out: int, a: int, b: int): void {
+    val t = p384Scratch(m)
+    var borrow = secretU32(u32(0))
+    for (j in 0 until P384_WORDS) {
+        val x = bnLoad(a + j * 4)
+        val y = bnLoad(b + j * 4)
+        val difference = x - y - borrow
+        borrow = ((~x & y) | ((~x | y) & difference)) >> 31
+        bnStore(t + j * 4, difference)
+    }
+    val mask = secretU32(u32(0)) - borrow
+    var carry = secretU32(u32(0))
+    for (j in 0 until P384_WORDS) {
+        val sum = bnLoad(t + j * 4).widen() + (bnLoad(m + j * 4) & mask).widen() + carry.widen()
+        bnStore(out + j * 4, sum.low())
+        carry = sum.high()
+    }
+}
+
+// --- The curve: complete addition and doubling (a = -3) ---------------------------------------------------------
+
+/** `out` = `p` + `q`, projective points in Montgomery form; `out` is neither. Renes-Costello-Batina, algorithm 4. */
+private trusted fun p384PointAdd(f: int, work: int, out: int, p: int, q: int): void {
+    val t0 = work + P384_TEMPS
+    val t1 = t0 + 48
+    val t2 = t1 + 48
+    val t3 = t2 + 48
+    val t4 = t3 + 48
+    val b = work + P384_B_AT
+    val x1 = p
+    val y1 = p + 48
+    val z1 = p + 96
+    val x2 = q
+    val y2 = q + 48
+    val z2 = q + 96
+    val x3 = out
+    val y3 = out + 48
+    val z3 = out + 96
+    p384Multiply(f, t0, x1, x2)
+    p384Multiply(f, t1, y1, y2)
+    p384Multiply(f, t2, z1, z2)
+    p384Add(f, t3, x1, y1)
+    p384Add(f, t4, x2, y2)
+    p384Multiply(f, t3, t3, t4)
+    p384Add(f, t4, t0, t1)
+    p384Subtract(f, t3, t3, t4)
+    p384Add(f, t4, y1, z1)
+    p384Add(f, x3, y2, z2)
+    p384Multiply(f, t4, t4, x3)
+    p384Add(f, x3, t1, t2)
+    p384Subtract(f, t4, t4, x3)
+    p384Add(f, x3, x1, z1)
+    p384Add(f, y3, x2, z2)
+    p384Multiply(f, x3, x3, y3)
+    p384Add(f, y3, t0, t2)
+    p384Subtract(f, y3, x3, y3)
+    p384Multiply(f, z3, b, t2)
+    p384Subtract(f, x3, y3, z3)
+    p384Add(f, z3, x3, x3)
+    p384Add(f, x3, x3, z3)
+    p384Subtract(f, z3, t1, x3)
+    p384Add(f, x3, t1, x3)
+    p384Multiply(f, y3, b, y3)
+    p384Add(f, t1, t2, t2)
+    p384Add(f, t2, t1, t2)
+    p384Subtract(f, y3, y3, t2)
+    p384Subtract(f, y3, y3, t0)
+    p384Add(f, t1, y3, y3)
+    p384Add(f, y3, t1, y3)
+    p384Add(f, t1, t0, t0)
+    p384Add(f, t0, t1, t0)
+    p384Subtract(f, t0, t0, t2)
+    p384Multiply(f, t1, t4, y3)
+    p384Multiply(f, t2, t0, y3)
+    p384Multiply(f, y3, x3, z3)
+    p384Add(f, y3, y3, t2)
+    p384Multiply(f, x3, t3, x3)
+    p384Subtract(f, x3, x3, t1)
+    p384Multiply(f, z3, t4, z3)
+    p384Multiply(f, t1, t3, t0)
+    p384Add(f, z3, z3, t1)
+}
+
+/** `out` = 2 `p`; `out` is not `p`. Renes-Costello-Batina, algorithm 6. */
+private trusted fun p384PointDouble(f: int, work: int, out: int, p: int): void {
+    val t0 = work + P384_TEMPS
+    val t1 = t0 + 48
+    val t2 = t1 + 48
+    val t3 = t2 + 48
+    val b = work + P384_B_AT
+    val x = p
+    val y = p + 48
+    val z = p + 96
+    val x3 = out
+    val y3 = out + 48
+    val z3 = out + 96
+    p384Multiply(f, t0, x, x)
+    p384Multiply(f, t1, y, y)
+    p384Multiply(f, t2, z, z)
+    p384Multiply(f, t3, x, y)
+    p384Add(f, t3, t3, t3)
+    p384Multiply(f, z3, x, z)
+    p384Add(f, z3, z3, z3)
+    p384Multiply(f, y3, b, t2)
+    p384Subtract(f, y3, y3, z3)
+    p384Add(f, x3, y3, y3)
+    p384Add(f, y3, x3, y3)
+    p384Subtract(f, x3, t1, y3)
+    p384Add(f, y3, t1, y3)
+    p384Multiply(f, y3, x3, y3)
+    p384Multiply(f, x3, x3, t3)
+    p384Add(f, t3, t2, t2)
+    p384Add(f, t2, t2, t3)
+    p384Multiply(f, z3, b, z3)
+    p384Subtract(f, z3, z3, t2)
+    p384Subtract(f, z3, z3, t0)
+    p384Add(f, t3, z3, z3)
+    p384Add(f, z3, z3, t3)
+    p384Add(f, t3, t0, t0)
+    p384Add(f, t0, t3, t0)
+    p384Subtract(f, t0, t0, t2)
+    p384Multiply(f, t0, t0, z3)
+    p384Add(f, y3, y3, t0)
+    p384Multiply(f, t0, y, z)
+    p384Add(f, t0, t0, t0)
+    p384Multiply(f, z3, t0, z3)
+    p384Subtract(f, x3, x3, z3)
+    p384Multiply(f, z3, t0, t1)
+    p384Add(f, z3, z3, z3)
+    p384Add(f, z3, z3, z3)
+}
+
+
+class P384Curve(val field: BnModulus, val order: BnModulus, val work: int)
+
+private trusted fun p384Open(): P384Curve {
+    val prime = hexDecode(P384_PRIME)
+    val order = hexDecode(P384_ORDER)
+    val field = bnModulusFrom(ablaUnsafeStringAddress(prime), 48, P384_WORDS)
+    val scalar = bnModulusFrom(ablaUnsafeStringAddress(order), 48, P384_WORDS)
+    val work = bnAllocate(P384_WORK_WORDS)
+    val plainB = bnAllocate(P384_WORDS)
+    val b = hexDecode(P384_B)
+    bnFromBytes(plainB, P384_WORDS, ablaUnsafeStringAddress(b), 48)
+    bnEncode(field, work + P384_B_AT, plainB)
+    bnRelease(plainB, P384_WORDS)
+    P384Curve(field, scalar, work)
+}
+
+private trusted fun p384Close(curve: P384Curve): void {
+    bnModulusRelease(curve.field)
+    bnModulusRelease(curve.order)
+    bnRelease(curve.work, P384_WORK_WORDS)
+}
+
+private trusted fun p384IsZero(value: int): bool {
+    for (j in 0 until P384_WORDS) if (ablaUnsafeLoadU32(bnPointer(value + j * 4)) != 0) return false
+    true
+}
+
+private trusted fun p384MultiplyPlain(m: BnModulus, out: int, a: int, b: int): void {
+    val encoded = bnAllocate(P384_WORDS)
+    bnEncode(m, encoded, a)
+    bnMultiply(m, out, encoded, b)
+    bnRelease(encoded, P384_WORDS)
+}
+
+/** `out` = `scalar` * `point` (public scalar of twelve plain limbs; `point` projective, Montgomery), `out` is neither. */
+private trusted fun p384ScalarMultiply(c: P384Curve, out: int, point: int, scalar: int): void {
+    val f = c.field.memory
+    val work = c.work
+    val accumulator = bnAllocate(36)
+    val sum = bnAllocate(36)
+    // The point at infinity, (0 : 1 : 0).
+    bnCopy(accumulator + 48, p384One(f), P384_WORDS)
+    var bit = 383
+    while (bit >= 0) {
+        p384PointDouble(f, work, sum, accumulator)
+        bnCopy(accumulator, sum, 36)
+        if (((ablaUnsafeLoadU32(bnPointer(scalar + (bit / 32) * 4)) >> (bit % 32)) & 1) == 1) {
+            p384PointAdd(f, work, sum, accumulator, point)
+            bnCopy(accumulator, sum, 36)
+        }
+        bit = bit - 1
+    }
+    bnCopy(out, accumulator, 36)
+    bnRelease(accumulator, 36)
+    bnRelease(sum, 36)
+}
+
+private trusted fun p384Generator(c: P384Curve, out: int): void {
+    val plain = bnAllocate(P384_WORDS)
+    val gx = hexDecode(P384_GX)
+    bnFromBytes(plain, P384_WORDS, ablaUnsafeStringAddress(gx), 48)
+    bnEncode(c.field, out, plain)
+    val gy = hexDecode(P384_GY)
+    bnFromBytes(plain, P384_WORDS, ablaUnsafeStringAddress(gy), 48)
+    bnEncode(c.field, out + 48, plain)
+    bnCopy(out + 96, c.field.one(), P384_WORDS)
+    bnRelease(plain, P384_WORDS)
+}
+
+/** `out` (36 limbs) the point `encoded` (0x04 || X || Y) in Montgomery form, if it is on the curve. */
+private trusted fun p384ParsePoint(c: P384Curve, encoded: string, out: int): bool {
+    if (encoded.size != 97 || encoded[0] != 4) return false
+    val f = c.field
+    val x = bnAllocate(P384_WORDS)
+    val y = bnAllocate(P384_WORDS)
+    bnFromBytes(x, P384_WORDS, ablaUnsafeStringAddress(encoded) + 1, 48)
+    bnFromBytes(y, P384_WORDS, ablaUnsafeStringAddress(encoded) + 49, 48)
+    var ok = bnLessPublic(x, f.value(), P384_WORDS) && bnLessPublic(y, f.value(), P384_WORDS)
+    if (ok) {
+        bnEncode(f, out, x)
+        bnEncode(f, out + 48, y)
+        bnCopy(out + 96, f.one(), P384_WORDS)
+        // y^2 = x^3 - 3x + b
+        val left = bnAllocate(P384_WORDS)
+        val right = bnAllocate(P384_WORDS)
+        bnMultiply(f, left, out + 48, out + 48)
+        bnMultiply(f, right, out, out)
+        bnMultiply(f, right, right, out)
+        for (i in 0 until 3) p384Subtract(f.memory, right, right, out)
+        p384Add(f.memory, right, right, c.work + P384_B_AT)
+        ok = bnEqual(left, right, P384_WORDS)
+        bnRelease(left, P384_WORDS)
+        bnRelease(right, P384_WORDS)
+    }
+    bnRelease(x, P384_WORDS)
+    bnRelease(y, P384_WORDS)
+    ok
+}
+
+/** The plain affine x of a projective point, or false at infinity. */
+private trusted fun p384AffineX(c: P384Curve, point: int, x: int): bool {
+    val f = c.field
+    val z = bnAllocate(P384_WORDS)
+    val inverse = bnAllocate(P384_WORDS)
+    bnDecode(f, z, point + 96)
+    val infinity = p384IsZero(z)
+    bnExpPublic(f, inverse, z, hexDecode(P384_PRIME_MINUS_TWO))
+    bnDecode(f, x, point)
+    p384MultiplyPlain(f, x, x, inverse)
+    bnRelease(z, P384_WORDS)
+    bnRelease(inverse, P384_WORDS)
+    !infinity
+}
+
+/** Whether `encoded` is an uncompressed point of the curve. */
+trusted fun p384IsValidPublicKey(encoded: string): bool {
+    val c = p384Open()
+    val point = bnAllocate(36)
+    val ok = p384ParsePoint(c, encoded, point)
+    bnRelease(point, 36)
+    p384Close(c)
+    ok
+}
+
+/** Verifies the signature `r || s` (96 bytes) of a message digest (the leftmost 384 bits of a longer one count) under the
+ *  public key (97 bytes). */
+trusted fun p384EcdsaVerifyDigestRaw(publicKey: string, digest: string, signature: string): bool {
+    if (signature.size != 96 || digest.size == 0) return false
+    val c = p384Open()
+    val order = c.order
+    val q = bnAllocate(36)
+    var valid = false
+    if (p384ParsePoint(c, publicKey, q)) {
+        val r = bnAllocate(P384_WORDS)
+        val s = bnAllocate(P384_WORDS)
+        bnFromBytes(r, P384_WORDS, ablaUnsafeStringAddress(signature), 48)
+        bnFromBytes(s, P384_WORDS, ablaUnsafeStringAddress(signature) + 48, 48)
+        if (!p384IsZero(r) && !p384IsZero(s) && bnLessPublic(r, order.value(), P384_WORDS) &&
+            bnLessPublic(s, order.value(), P384_WORDS)) {
+            val e = bnAllocate(P384_WORDS)
+            val w = bnAllocate(P384_WORDS)
+            val u1 = bnAllocate(P384_WORDS)
+            val u2 = bnAllocate(P384_WORDS)
+            val g = bnAllocate(36)
+            val first = bnAllocate(36)
+            val second = bnAllocate(36)
+            val total = bnAllocate(36)
+            val x = bnAllocate(P384_WORDS)
+            val size = if (digest.size > 48) 48 else digest.size
+            bnFromBytes(e, P384_WORDS, ablaUnsafeStringAddress(digest), size)
+            bnConditionalSubtractBody(e, e, secretU32(u32(0)), order.value(), P384_WORDS, order.scratch())
+            bnExpPublic(order, w, s, hexDecode(P384_ORDER_MINUS_TWO))
+            p384MultiplyPlain(order, u1, e, w)
+            p384MultiplyPlain(order, u2, r, w)
+            p384Generator(c, g)
+            p384ScalarMultiply(c, first, g, u1)
+            p384ScalarMultiply(c, second, q, u2)
+            p384PointAdd(c.field.memory, c.work, total, first, second)
+            if (p384AffineX(c, total, x)) {
+                bnConditionalSubtractBody(x, x, secretU32(u32(0)), order.value(), P384_WORDS, order.scratch())
+                valid = bnEqual(x, r, P384_WORDS)
+            }
+            bnRelease(e, P384_WORDS)
+            bnRelease(w, P384_WORDS)
+            bnRelease(u1, P384_WORDS)
+            bnRelease(u2, P384_WORDS)
+            bnRelease(g, 36)
+            bnRelease(first, 36)
+            bnRelease(second, 36)
+            bnRelease(total, 36)
+            bnRelease(x, P384_WORDS)
+        }
+        bnRelease(r, P384_WORDS)
+        bnRelease(s, P384_WORDS)
+    }
+    bnRelease(q, 36)
+    p384Close(c)
+    valid
+}
+
+/** One strict DER INTEGER at `at` as 48 bytes, or "". */
+private fun p384DerInteger(text: string, at: int, limit: int): string {
+    if (at + 2 > limit || text[at] != 2) return ""
+    val length = text[at + 1]
+    if (length == 0 || length >= 128 || at + 2 + length > limit) return ""
+    val first = text[at + 2]
+    if (first >= 128) return ""
+    if (length > 1 && first == 0 && text[at + 3] < 128) return ""
+    var bytes = text.slice(at + 2, at + 2 + length)
+    if (first == 0 && length > 1) bytes = bytes.slice(1, length)
+    if (bytes.size > 48) return ""
+    "\x00".repeat(48 - bytes.size) + bytes
+}
+
+/** r || s (96 bytes) from a strict DER ECDSA signature, or "". */
+fun p384SignatureFromDer(der: string): string {
+    if (der.size < 8 || der[0] != 48 || der[1] >= 128 || der[1] + 2 != der.size) return ""
+    val rLength = der[3]
+    val r = p384DerInteger(der, 2, der.size)
+    if (r == "") return ""
+    val next = 2 + 2 + rLength
+    val s = p384DerInteger(der, next, der.size)
+    if (s == "" || next + 2 + der[next + 1] != der.size) return ""
+    r + s
+}
+
+/** ECDSA over SHA-384 with a strict DER signature. */
+trusted fun p384EcdsaVerify(publicKey: string, message: string, signature: string): bool {
+    val raw = p384SignatureFromDer(signature)
+    raw != "" && p384EcdsaVerifyDigestRaw(publicKey, sha384(message), raw)
+}

@@ -1,0 +1,80 @@
+// The server-validation cases of x509-limbo and BetterTLS (C2SP/x509-limbo, as JSON data in tests/cases/x509/limbo, cut down by
+// tools/gen-x509-limbo.sh): each case says whether the chain must validate for a name at a time. The cases this code
+// answers differently from the expectation are listed with the reason in known.tsv; a case missing from it that differs,
+// and a case in it that no longer differs, both fail. Arguments: the cases file, the known file.
+import "abla/crypto"
+import "abla/crypto/der"
+import "abla/crypto/x509"
+import "abla/date"
+import "abla/fs"
+import "abla/io"
+import "abla/json"
+import "abla/process/arguments"
+
+fun certificates(list: Json): array<string> {
+    val out: array<string> = []
+    for (i in 0 until list.size()) {
+        for (c in x509ParsePem(list.at(i).asString()).certificates) out.append(c.der)
+    }
+    out
+}
+
+fun main: int {
+    val parsed = jsonParse(path(processArgument(0)).readText(), jsonPermissiveLimits)
+    if (!parsed.succeeded) {
+        println("limbo: cannot read ${processArgument(0)}: ${parsed.error.message}")
+        return 2
+    }
+    val known = path(processArgument(1)).readText()
+    val cases = parsed.value.get("testcases")
+    var total = 0
+    var agreed = 0
+    var knownDifferences = 0
+    var failures = 0
+    for (i in 0 until cases.size()) {
+        val test = cases.at(i)
+        val id = test.getString("id")
+        val peer = test.get("expected_peer_name")
+        if (peer.get("kind").asString() != "DNS" && peer.get("kind").asString() != "IP") continue
+        total = total + 1
+        var now = 1794574000
+        if (test.get("validation_time").isString()) {
+            val milliseconds = utcIso8601Parse(test.getString("validation_time").slice(0, 19) + "Z")
+            if (milliseconds == null) {
+                println("limbo: FAIL $id: unreadable time ${test.getString("validation_time")}")
+                failures = failures + 1
+                continue
+            }
+            now = milliseconds / 1000
+        }
+        val leaf = x509ParsePem(test.getString("peer_certificate")).certificates
+        val chain: array<string> = []
+        if (leaf.size > 0) chain.append(leaf[0].der)
+        for (der in certificates(test.get("untrusted_intermediates"))) chain.append(der)
+        val roots: array<X509Certificate> = []
+        for (i2 in 0 until test.get("trusted_certs").size()) {
+            for (c in x509ParsePem(test.get("trusted_certs").at(i2).asString()).certificates) roots.append(c)
+        }
+        var maximum = 8
+        if (test.get("max_chain_depth").isNumber()) maximum = test.getInt("max_chain_depth") + 2
+        val result = if (chain.size == 0) X509Verification(false, "no leaf", []) else
+            x509Verify(chain, X509TrustStore(roots), X509Options(peer.getString("value"), now, maximum))
+        val expected = test.getString("expected_result") == "SUCCESS"
+        val differs = result.ok != expected
+        val listed = pemFind(known, id + "\t", 0) == 0 || pemFind(known, "\n" + id + "\t", 0) >= 0
+        if (differs && !listed) {
+            println("limbo: FAIL $id: ${if (result.ok) "accepted, expected failure" else "refused (${result.error}), expected success"}")
+            failures = failures + 1
+        } else if (!differs && listed) {
+            println("limbo: FAIL $id agrees now: remove it from known.tsv")
+            failures = failures + 1
+        } else if (differs) knownDifferences = knownDifferences + 1
+        else agreed = agreed + 1
+    }
+    println("limbo: ${processArgument(0)}: $total cases, $agreed agree, $knownDifferences known differences")
+    if (failures != 0 || total == 0) {
+        println("limbo: $failures failure(s)")
+        return 1
+    }
+    0
+}

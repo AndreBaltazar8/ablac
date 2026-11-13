@@ -1,0 +1,1096 @@
+// X.509 certificates for TLS clients, in Abla: strict DER parsing of a certificate (names, validity, the public key,
+// the extensions a server chain needs), signature checks with what abla/crypto has, path building and validation
+// against a trust store (RFC 5280, section 6.1, for a server chain), and the host name match of RFC 6125.
+//
+// Everything here is public input, so nothing is constant time; what it must be is robust: a certificate is read once,
+// by a fixed schema with no recursion, every length checked against its parent, and anything unexpected is an error in the
+// returned value, never a panic. A chain is at most `maximumDepth` certificates and the search for a path signs at most
+// `X509_MAXIMUM_SIGNATURE_CHECKS` times.
+//
+//   val store = x509SystemTrustStore()
+//   val result = x509Verify([leafDer, intermediateDer], store, X509Options("example.com", now))
+//   if (!result.ok) println(result.error)
+//
+// What is not done: revocation (CRL, OCSP), certificate policies (the extensions are read as present and ignored, also when
+// critical, as most TLS clients do), the common name as a host name (only subjectAltName names are matched), Ed25519 and
+// RSASSA-PSS signatures (a signature in either is reported as unsupported until their verifiers exist here), and ECDSA keys on
+// curves other than P-256 and P-384.
+
+import "abla/bytes"
+import "abla/crypto"
+import "abla/crypto/der"
+import "abla/crypto/p256"
+import "abla/crypto/p384"
+import "abla/crypto/rsa"
+import "abla/fs"
+
+// --- Names -------------------------------------------------------------------------------------------------------
+
+class X509Attribute(val oid: string, val tag: int, val value: string)
+
+/** A distinguished name: its DER, its relative distinguished names (each a set of attributes), and a canonical form
+ *  that two names have in common exactly when RFC 5280 (7.1) says they match (case and spaces ignored in text). */
+class X509Name(
+    val der: string,
+    val rdns: array<array<X509Attribute>>,
+    val canonical: string,
+    val commonName: string
+)
+
+fun x509EmptyName(): X509Name {
+    val rdns: array<array<X509Attribute>> = []
+    X509Name("", rdns, "", "")
+}
+
+/** One GeneralName: `kind` is its context tag number (1 e-mail, 2 DNS, 4 directory, 6 URI, 7 IP address, 0 other), `value`
+ *  the name as text, the address bytes (a constraint's, address then mask), or a directory name's canonical form. */
+class X509GeneralName(val kind: int, val value: string, val name: X509Name)
+
+// --- A certificate -----------------------------------------------------------------------------------------------
+
+class X509Certificate(
+    val ok: bool,
+    val error: string,
+    val der: string,
+    val tbs: string,
+    val version: int,
+    val serial: string,
+    val signatureOid: string,
+    val signatureParameters: string,
+    val signature: string,
+    val issuer: X509Name,
+    val subject: X509Name,
+    /** Seconds since 1970-01-01 UTC. */
+    val notBefore: int,
+    val notAfter: int,
+    val keyOid: string,
+    val keyParameters: string,
+    val keyBits: string,
+    val spki: string,
+    val hasBasicConstraints: bool,
+    val isCa: bool,
+    /** The pathLenConstraint, or -1. */
+    val pathLength: int,
+    /** The keyUsage bits (bit n of the BIT STRING as 1 << n), or -1 with no extension. */
+    val keyUsage: int,
+    val hasExtendedKeyUsage: bool,
+    val extendedKeyUsage: array<string>,
+    val hasAltNames: bool,
+    val altNamesCritical: bool,
+    val altNames: array<X509GeneralName>,
+    val hasNameConstraints: bool,
+    val permitted: array<X509GeneralName>,
+    val excluded: array<X509GeneralName>,
+    val subjectKeyId: string,
+    val authorityKeyId: string,
+    /** The OID of the first critical extension this code does not know, or "". */
+    val unknownCritical: string
+) {
+    fun selfIssued(): bool = this.subject.canonical == this.issuer.canonical
+}
+
+val X509_KEY_DIGITAL_SIGNATURE = 1
+val X509_KEY_NON_REPUDIATION = 2
+val X509_KEY_ENCIPHERMENT = 4
+val X509_KEY_DATA_ENCIPHERMENT = 8
+val X509_KEY_AGREEMENT = 16
+val X509_KEY_CERT_SIGN = 32
+val X509_KEY_CRL_SIGN = 64
+
+val X509_OID_SERVER_AUTH = "1.3.6.1.5.5.7.3.1"
+val X509_OID_CLIENT_AUTH = "1.3.6.1.5.5.7.3.2"
+val X509_OID_ANY_EKU = "2.5.29.37.0"
+
+private val X509_NO_STRINGS: array<string> = []
+
+fun x509Failed(error: string): X509Certificate {
+    val names: array<X509GeneralName> = []
+    X509Certificate(false, error, "", "", 0, "", "", "", "", x509EmptyName(), x509EmptyName(), 0, 0, "", "", "", "",
+        false, false, -1, -1, false, X509_NO_STRINGS, false, false, names, false, names, names, "", "", "")
+}
+
+// --- DER helpers -------------------------------------------------------------------------------------------------
+
+/** An OID's dotted text, or "" if its bytes are not a well formed one. */
+fun x509OidText(der: string, item: DerItem): string {
+    if (!item.ok || item.tag != DER_OID || item.end == item.start) return ""
+    val first = int(der[item.start])
+    var text = ""
+    var value = 0
+    var count = 0
+    var starting = true
+    for (at in item.start until item.end) {
+        val byte = int(der[at])
+        if (starting && byte == 128) return ""
+        starting = false
+        count = count + 1
+        if (count > 8) return ""
+        value = (value << 7) | (byte & 127)
+        if (byte < 128) {
+            if (text == "") {
+                val a = if (value < 40) 0 else if (value < 80) 1 else 2
+                text = "$a.${value - a * 40}"
+            } else text = text + "." + "${value}"
+            value = 0
+            count = 0
+            starting = true
+        }
+    }
+    if (!starting) return ""
+    text
+}
+
+/** The positive or zero INTEGER of at most 31 bits at `item`, or -1. */
+private fun x509SmallInteger(der: string, item: DerItem): int {
+    if (!item.ok || item.tag != DER_INTEGER || item.end == item.start || item.end - item.start > 5) return -1
+    if (int(der[item.start]) >= 128) return -1
+    if (item.end - item.start > 1 && int(der[item.start]) == 0 && int(der[item.start + 1]) < 128) return -1
+    var value = 0
+    for (at in item.start until item.end) value = (value << 8) | int(der[at])
+    if (value > 2147483647) -1 else value
+}
+
+private fun x509Lower(byte: int): int = if (byte >= 65 && byte <= 90) byte + 32 else byte
+
+private fun x509LowerText(text: string): string {
+    var out = byteBuffer()
+    for (at in 0 until text.size) out.appendByteValue(x509Lower(int(text[at])))
+    out.toText()
+}
+
+/** A string attribute value as compared by RFC 5280 (7.1): ASCII case folded, leading and trailing spaces dropped, runs
+ *  of spaces one. */
+private fun x509NormalText(text: string): string {
+    var out = byteBuffer()
+    var pendingSpace = false
+    var any = false
+    for (at in 0 until text.size) {
+        val byte = int(text[at])
+        if (byte == 32 || byte == 9 || byte == 10 || byte == 13) {
+            pendingSpace = any
+            continue
+        }
+        if (pendingSpace) out.appendByteValue(32)
+        pendingSpace = false
+        any = true
+        out.appendByteValue(x509Lower(byte))
+    }
+    out.toText()
+}
+
+private fun x509IsTextTag(tag: int): bool = tag == 12 || tag == 19 || tag == 22 || tag == 20 || tag == 18 || tag == 25 || tag == 26
+
+/** A Name at `item` (a SEQUENCE), or an empty one with `ok` false. */
+private class X509NameResult(val name: X509Name, val ok: bool)
+
+private fun x509ParseName(der: string, item: DerItem): X509NameResult {
+    val rdns: array<array<X509Attribute>> = []
+    val none = X509NameResult(x509EmptyName(), false)
+    if (!item.ok || item.tag != DER_SEQUENCE) return none
+    var canonical = ""
+    var common = ""
+    var at = item.start
+    while (at < item.end) {
+        val set = derItem(der, at, item.end)
+        if (!set.ok || set.tag != 49 || set.end == set.start) return none
+        val attributes: array<X509Attribute> = []
+        var inner = set.start
+        while (inner < set.end) {
+            val pair = derItem(der, inner, set.end)
+            if (!pair.ok || pair.tag != DER_SEQUENCE) return none
+            val oid = derItem(der, pair.start, pair.end)
+            val oidText = x509OidText(der, oid)
+            if (oidText == "") return none
+            val value = derItem(der, oid.end, pair.end)
+            if (!value.ok || value.end != pair.end) return none
+            val text = der.slice(value.start, value.end)
+            attributes.append(X509Attribute(oidText, value.tag, text))
+            if (oidText == "2.5.4.3" && common == "") common = text
+            inner = pair.end
+        }
+        // Canonical: the attributes in oid order.
+        var pieces: array<string> = []
+        for (a in attributes) {
+            val normal = if (x509IsTextTag(a.tag)) x509NormalText(a.value) else a.value
+            val piece = a.oid + "=${normal.size}:" + normal + "+"
+            var sorted: array<string> = []
+            var placed = false
+            for (other in pieces) {
+                if (!placed && piece < other) {
+                    sorted.append(piece)
+                    placed = true
+                }
+                sorted.append(other)
+            }
+            if (!placed) sorted.append(piece)
+            pieces = sorted
+        }
+        var part = ""
+        for (piece in pieces) part = part + piece
+        canonical = canonical + part + "\n"
+        rdns.append(attributes)
+        at = set.end
+    }
+    X509NameResult(X509Name(der.slice(item.start - x509HeaderSize(item), item.end), rdns, canonical, common), true)
+}
+
+/** The bytes a DER item's tag and length take (DER lengths are minimal, so the content length says). */
+private fun x509HeaderSize(item: DerItem): int {
+    val length = item.end - item.start
+    if (length < 128) return 2
+    if (length < 256) return 3
+    if (length < 65536) return 4
+    if (length < 16777216) return 5
+    6
+}
+
+// --- Time ----------------------------------------------------------------------------------------------------------
+
+/** Days from 1970-01-01 to a civil date (Howard Hinnant's algorithm). */
+private fun x509Days(year: int, month: int, day: int): int {
+    val y = if (month <= 2) year - 1 else year
+    val era = (if (y >= 0) y else y - 399) / 400
+    val yearOfEra = y - era * 400
+    val shifted = if (month > 2) month - 3 else month + 9
+    val dayOfYear = (153 * shifted + 2) / 5 + day - 1
+    val dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear
+    era * 146097 + dayOfEra - 719468
+}
+
+private fun x509Digits(text: string, at: int, count: int): int {
+    var value = 0
+    for (i in 0 until count) {
+        val byte = int(text[at + i])
+        if (byte < 48 || byte > 57) return -1
+        value = value * 10 + byte - 48
+    }
+    value
+}
+
+/** A UTCTime or GeneralizedTime (in the forms RFC 5280 allows: Zulu, with seconds) as seconds since 1970, or -1 << 40
+ *  for anything else. */
+private fun x509Time(der: string, item: DerItem): int {
+    val bad = -1099511627776
+    if (!item.ok) return bad
+    val text = der.slice(item.start, item.end)
+    var year = 0
+    var at = 0
+    if (item.tag == 23) {
+        if (text.size != 13) return bad
+        val yy = x509Digits(text, 0, 2)
+        if (yy < 0) return bad
+        year = if (yy >= 50) 1900 + yy else 2000 + yy
+        at = 2
+    } else if (item.tag == 24) {
+        if (text.size != 15) return bad
+        year = x509Digits(text, 0, 4)
+        if (year < 2050) return bad
+        at = 4
+    } else return bad
+    val month = x509Digits(text, at, 2)
+    val day = x509Digits(text, at + 2, 2)
+    val hour = x509Digits(text, at + 4, 2)
+    val minute = x509Digits(text, at + 6, 2)
+    val second = x509Digits(text, at + 8, 2)
+    if (int(text[text.size - 1]) != 90) return bad
+    if (year < 0 || month < 1 || month > 12 || day < 1 || hour < 0 || hour > 23 || minute < 0 || minute > 59 ||
+        second < 0 || second > 60) return bad
+    val leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+    val limit = if (month == 2) (if (leap) 29 else 28) else if (month == 4 || month == 6 || month == 9 || month == 11) 30 else 31
+    if (day > limit) return bad
+    x509Days(year, month, day) * 86400 + hour * 3600 + minute * 60 + second
+}
+
+// --- Parsing a certificate ---------------------------------------------------------------------------------------------
+
+private fun x509AlgorithmOid(der: string, item: DerItem): string {
+    if (!item.ok || item.tag != DER_SEQUENCE) return ""
+    x509OidText(der, derItem(der, item.start, item.end))
+}
+
+private fun x509AlgorithmParameters(der: string, item: DerItem): string {
+    val oid = derItem(der, item.start, item.end)
+    if (oid.end == item.end) return ""
+    "x" + der.slice(oid.end, item.end)
+}
+
+/** A GeneralName at `at` (to `limit`), or a failure. */
+private class X509GeneralResult(val name: X509GeneralName, val end: int, val ok: bool)
+
+private fun x509ParseGeneralName(der: string, at: int, limit: int, constraint: bool): X509GeneralResult {
+    val item = derItem(der, at, limit)
+    val none = X509GeneralResult(X509GeneralName(0, "", x509EmptyName()), 0, false)
+    if (!item.ok) return none
+    val content = der.slice(item.start, item.end)
+    if (item.tag == 130 || item.tag == 129 || item.tag == 134) {
+        // dNSName, rfc822Name, URI: IA5String, ASCII with no control characters.
+        for (i in 0 until content.size) {
+            val b = int(content[i])
+            if (b < 32 || b > 126) return none
+        }
+        val kind = if (item.tag == 130) 2 else if (item.tag == 129) 1 else 6
+        val text = if (kind == 2) x509LowerText(content) else content
+        return X509GeneralResult(X509GeneralName(kind, text, x509EmptyName()), item.end, true)
+    }
+    if (item.tag == 135) {
+        val size = content.size
+        if (constraint) { if (size != 8 && size != 32) return none } else if (size != 4 && size != 16) return none
+        return X509GeneralResult(X509GeneralName(7, content, x509EmptyName()), item.end, true)
+    }
+    if (item.tag == 164) {
+        val inner = derItem(der, item.start, item.end)
+        if (!inner.ok || inner.end != item.end) return none
+        val parsed = x509ParseName(der, inner)
+        if (!parsed.ok) return none
+        return X509GeneralResult(X509GeneralName(4, parsed.name.canonical, parsed.name), item.end, true)
+    }
+    X509GeneralResult(X509GeneralName(0, "", x509EmptyName()), item.end, true)
+}
+
+private fun x509ParseSubtrees(der: string, item: DerItem): array<X509GeneralName>? {
+    val out: array<X509GeneralName> = []
+    var at = item.start
+    while (at < item.end) {
+        val subtree = derItem(der, at, item.end)
+        if (!subtree.ok || subtree.tag != DER_SEQUENCE) return null
+        val base = x509ParseGeneralName(der, subtree.start, subtree.end, true)
+        if (!base.ok) return null
+        // minimum must be absent or 0, maximum absent (RFC 5280, 4.2.1.10).
+        var rest = base.end
+        while (rest < subtree.end) {
+            val extra = derItem(der, rest, subtree.end)
+            if (!extra.ok) return null
+            if (extra.tag == 128) {
+                if (extra.end - extra.start != 1 || int(der[extra.start]) != 0) return null
+            } else return null
+            rest = extra.end
+        }
+        out.append(base.name)
+        at = subtree.end
+    }
+    out
+}
+
+/** The certificate in `der`: check `ok` and `error`. */
+fun x509ParseDer(der: string): X509Certificate {
+    val outer = derItem(der, 0, der.size)
+    if (!outer.ok || outer.tag != DER_SEQUENCE || outer.end != der.size) return x509Failed("not a certificate: bad outer structure")
+    val tbsItem = derItem(der, outer.start, outer.end)
+    if (!tbsItem.ok || tbsItem.tag != DER_SEQUENCE) return x509Failed("not a certificate: bad tbsCertificate")
+    val outerAlgorithm = derItem(der, tbsItem.end, outer.end)
+    if (!outerAlgorithm.ok || outerAlgorithm.tag != DER_SEQUENCE) return x509Failed("not a certificate: bad signatureAlgorithm")
+    val signatureItem = derItem(der, outerAlgorithm.end, outer.end)
+    if (!signatureItem.ok || signatureItem.tag != DER_BIT_STRING || signatureItem.end != outer.end ||
+        signatureItem.end - signatureItem.start < 1 || int(der[signatureItem.start]) != 0) {
+        return x509Failed("not a certificate: bad signatureValue")
+    }
+    val tbsStart = tbsItem.start - (x509HeaderSize(tbsItem))
+    var at = tbsItem.start
+    var version = 1
+    var item = derItem(der, at, tbsItem.end)
+    if (item.ok && item.tag == 160) {
+        val v = derItem(der, item.start, item.end)
+        val value = x509SmallInteger(der, v)
+        if (!v.ok || v.end != item.end || value < 1 || value > 2) return x509Failed("unsupported certificate version")
+        version = value + 1
+        at = item.end
+        item = derItem(der, at, tbsItem.end)
+    }
+    val serialItem = item
+    if (!serialItem.ok || serialItem.tag != DER_INTEGER || serialItem.end == serialItem.start ||
+        serialItem.end - serialItem.start > 21) return x509Failed("bad serial number")
+    val serial = der.slice(serialItem.start, serialItem.end)
+    val innerAlgorithm = derItem(der, serialItem.end, tbsItem.end)
+    if (!innerAlgorithm.ok || innerAlgorithm.tag != DER_SEQUENCE) return x509Failed("bad signature algorithm")
+    if (der.slice(innerAlgorithm.start - x509HeaderSize(innerAlgorithm), innerAlgorithm.end) !=
+        der.slice(outerAlgorithm.start - x509HeaderSize(outerAlgorithm), outerAlgorithm.end) &&
+        (x509AlgorithmOid(der, innerAlgorithm) != x509AlgorithmOid(der, outerAlgorithm) ||
+         x509AlgorithmParameters(der, innerAlgorithm) != x509AlgorithmParameters(der, outerAlgorithm))) {
+        return x509Failed("the two signature algorithms of the certificate differ")
+    }
+    val issuerItem = derItem(der, innerAlgorithm.end, tbsItem.end)
+    val issuer = x509ParseName(der, issuerItem)
+    if (!issuer.ok || issuer.name.rdns.size == 0) return x509Failed("bad issuer name")
+    val validity = derItem(der, issuerItem.end, tbsItem.end)
+    if (!validity.ok || validity.tag != DER_SEQUENCE) return x509Failed("bad validity")
+    val first = derItem(der, validity.start, validity.end)
+    val second = derItem(der, first.end, validity.end)
+    val notBefore = x509Time(der, first)
+    val notAfter = x509Time(der, second)
+    if (!first.ok || !second.ok || second.end != validity.end || notBefore == -1099511627776 || notAfter == -1099511627776) {
+        return x509Failed("bad validity times")
+    }
+    val subjectItem = derItem(der, validity.end, tbsItem.end)
+    val subject = x509ParseName(der, subjectItem)
+    if (!subject.ok) return x509Failed("bad subject name")
+    val spkiItem = derItem(der, subjectItem.end, tbsItem.end)
+    if (!spkiItem.ok || spkiItem.tag != DER_SEQUENCE) return x509Failed("bad subjectPublicKeyInfo")
+    val keyAlgorithm = derItem(der, spkiItem.start, spkiItem.end)
+    val keyBitsItem = derItem(der, keyAlgorithm.end, spkiItem.end)
+    if (!keyAlgorithm.ok || keyAlgorithm.tag != DER_SEQUENCE || !keyBitsItem.ok || keyBitsItem.tag != DER_BIT_STRING ||
+        keyBitsItem.end != spkiItem.end || keyBitsItem.end == keyBitsItem.start || int(der[keyBitsItem.start]) != 0) {
+        return x509Failed("bad subjectPublicKeyInfo")
+    }
+    val keyOid = x509AlgorithmOid(der, keyAlgorithm)
+    if (keyOid == "") return x509Failed("bad public key algorithm")
+    val spki = der.slice(spkiItem.start - x509HeaderSize(spkiItem), spkiItem.end)
+    at = spkiItem.end
+    // Unique IDs (v2 and v3) then extensions (v3).
+    var extensionsItem = derItem(der, at, tbsItem.end)
+    while (at < tbsItem.end && extensionsItem.ok && (extensionsItem.tag == 129 || extensionsItem.tag == 130)) {
+        if (version < 2) return x509Failed("unique identifiers in a version 1 certificate")
+        at = extensionsItem.end
+        extensionsItem = derItem(der, at, tbsItem.end)
+    }
+    var hasBasic = false
+    var isCa = false
+    var pathLength = -1
+    var keyUsage = -1
+    var hasEku = false
+    val eku: array<string> = []
+    var hasAlt = false
+    var altCritical = false
+    val alt: array<X509GeneralName> = []
+    var hasConstraints = false
+    var permitted: array<X509GeneralName> = []
+    var excluded: array<X509GeneralName> = []
+    var subjectKeyId = ""
+    var authorityKeyId = ""
+    var unknownCritical = ""
+    if (at < tbsItem.end) {
+        if (!extensionsItem.ok || extensionsItem.tag != 163 || extensionsItem.end != tbsItem.end) return x509Failed("bad extensions")
+        if (version != 3) return x509Failed("extensions in a certificate that is not version 3")
+        val list = derItem(der, extensionsItem.start, extensionsItem.end)
+        if (!list.ok || list.tag != DER_SEQUENCE || list.end != extensionsItem.end || list.end == list.start) {
+            return x509Failed("bad extensions")
+        }
+        val seen: array<string> = []
+        var position = list.start
+        while (position < list.end) {
+            val extension = derItem(der, position, list.end)
+            if (!extension.ok || extension.tag != DER_SEQUENCE) return x509Failed("bad extension")
+            position = extension.end
+            val oidItem = derItem(der, extension.start, extension.end)
+            val oid = x509OidText(der, oidItem)
+            if (oid == "") return x509Failed("bad extension identifier")
+            for (s in seen) if (s == oid) return x509Failed("extension $oid appears twice")
+            seen.append(oid)
+            var next = oidItem.end
+            var critical = false
+            var valueItem = derItem(der, next, extension.end)
+            if (valueItem.ok && valueItem.tag == 1) {
+                if (valueItem.end - valueItem.start != 1 || int(der[valueItem.start]) != 255) return x509Failed("bad critical flag")
+                critical = true
+                next = valueItem.end
+                valueItem = derItem(der, next, extension.end)
+            }
+            if (!valueItem.ok || valueItem.tag != DER_OCTET_STRING || valueItem.end != extension.end) return x509Failed("bad extension value")
+            val body = derItem(der, valueItem.start, valueItem.end)
+            if (oid == "2.5.29.19") {
+                if (!body.ok || body.tag != DER_SEQUENCE || body.end != valueItem.end) return x509Failed("bad basicConstraints")
+                var inner = body.start
+                var part = derItem(der, inner, body.end)
+                hasBasic = true
+                if (part.ok && part.tag == 1) {
+                    if (part.end - part.start != 1 || int(der[part.start]) != 255) return x509Failed("bad basicConstraints")
+                    isCa = true
+                    inner = part.end
+                    part = derItem(der, inner, body.end)
+                }
+                if (inner < body.end) {
+                    val limit = x509SmallInteger(der, part)
+                    if (limit < 0 || part.end != body.end) return x509Failed("bad basicConstraints")
+                    if (!isCa) return x509Failed("a path length without cA in basicConstraints")
+                    pathLength = limit
+                }
+            } else if (oid == "2.5.29.15") {
+                if (!body.ok || body.tag != DER_BIT_STRING || body.end != valueItem.end || body.end - body.start < 2) {
+                    return x509Failed("bad keyUsage")
+                }
+                val unused = int(der[body.start])
+                if (unused > 7) return x509Failed("bad keyUsage")
+                var bits = 0
+                for (i in body.start + 1 until body.end) {
+                    val b = int(der[i])
+                    val index = i - body.start - 1
+                    for (j in 0 until 8) if ((b & (128 >> j)) != 0 && index * 8 + j < 16) bits = bits | (1 << (index * 8 + j))
+                }
+                keyUsage = bits
+            } else if (oid == "2.5.29.37") {
+                if (!body.ok || body.tag != DER_SEQUENCE || body.end != valueItem.end || body.end == body.start) {
+                    return x509Failed("bad extendedKeyUsage")
+                }
+                hasEku = true
+                var o = body.start
+                while (o < body.end) {
+                    val purpose = derItem(der, o, body.end)
+                    val text = x509OidText(der, purpose)
+                    if (text == "") return x509Failed("bad extendedKeyUsage")
+                    eku.append(text)
+                    o = purpose.end
+                }
+            } else if (oid == "2.5.29.17") {
+                if (!body.ok || body.tag != DER_SEQUENCE || body.end != valueItem.end || body.end == body.start) {
+                    return x509Failed("bad subjectAltName")
+                }
+                hasAlt = true
+                altCritical = critical
+                var o = body.start
+                while (o < body.end) {
+                    val parsed = x509ParseGeneralName(der, o, body.end, false)
+                    if (!parsed.ok) return x509Failed("bad subjectAltName")
+                    alt.append(parsed.name)
+                    o = parsed.end
+                }
+            } else if (oid == "2.5.29.30") {
+                if (!body.ok || body.tag != DER_SEQUENCE || body.end != valueItem.end || body.end == body.start) {
+                    return x509Failed("bad nameConstraints")
+                }
+                hasConstraints = true
+                var o = body.start
+                while (o < body.end) {
+                    val group = derItem(der, o, body.end)
+                    if (!group.ok || (group.tag != 160 && group.tag != 161) || group.end == group.start) {
+                        return x509Failed("bad nameConstraints")
+                    }
+                    val subtrees = x509ParseSubtrees(der, group)
+                    if (subtrees == null) return x509Failed("bad nameConstraints")
+                    if (group.tag == 160) permitted = subtrees else excluded = subtrees
+                    o = group.end
+                }
+            } else if (oid == "2.5.29.14") {
+                if (!body.ok || body.tag != DER_OCTET_STRING || body.end != valueItem.end) return x509Failed("bad subjectKeyIdentifier")
+                subjectKeyId = der.slice(body.start, body.end)
+            } else if (oid == "2.5.29.35") {
+                if (!body.ok || body.tag != DER_SEQUENCE || body.end != valueItem.end) return x509Failed("bad authorityKeyIdentifier")
+                val id = derItem(der, body.start, body.end)
+                if (id.ok && id.tag == 128) authorityKeyId = der.slice(id.start, id.end)
+            } else if (critical && !x509KnownIgnorable(oid) && unknownCritical == "") {
+                unknownCritical = oid
+            }
+        }
+    }
+    X509Certificate(
+        true, "", der, der.slice(tbsStart, tbsItem.end), version, serial,
+        x509AlgorithmOid(der, outerAlgorithm), x509AlgorithmParameters(der, outerAlgorithm),
+        der.slice(signatureItem.start + 1, signatureItem.end), issuer.name, subject.name, notBefore, notAfter,
+        keyOid, x509AlgorithmParameters(der, keyAlgorithm), der.slice(keyBitsItem.start + 1, keyBitsItem.end), spki,
+        hasBasic, isCa, pathLength, keyUsage, hasEku, eku, hasAlt, altCritical, alt, hasConstraints, permitted, excluded,
+        subjectKeyId, authorityKeyId, unknownCritical
+    )
+}
+
+/** Extensions that may be critical and are read without being acted on: policies (not evaluated here), the inhibit
+ *  extensions, and the ones that only carry pointers. */
+private fun x509KnownIgnorable(oid: string): bool =
+    oid == "2.5.29.32" || oid == "2.5.29.33" || oid == "2.5.29.36" || oid == "2.5.29.54" || oid == "2.5.29.31" ||
+    oid == "2.5.29.46" || oid == "1.3.6.1.5.5.7.1.1" || oid == "1.3.6.1.5.5.7.1.11" || oid == "2.5.29.18" ||
+    oid == "2.5.29.9"
+
+/** All the certificates in a PEM text; the ones that do not parse are left out, and counted in the second result. */
+class X509PemResult(val certificates: array<X509Certificate>, val skipped: int)
+
+fun x509ParsePem(text: string): X509PemResult {
+    val out: array<X509Certificate> = []
+    var skipped = 0
+    val begin = "-----BEGIN CERTIFICATE-----"
+    val end = "-----END CERTIFICATE-----"
+    var at = 0
+    while (true) {
+        val start = pemFind(text, begin, at)
+        if (start < 0) break
+        val finish = pemFind(text, end, start + begin.size)
+        if (finish < 0) break
+        val body = pemBase64Decode(text.slice(start + begin.size, finish))
+        at = finish + end.size
+        if (body == "") {
+            skipped = skipped + 1
+            continue
+        }
+        val certificate = x509ParseDer(body)
+        if (certificate.ok) out.append(certificate) else skipped = skipped + 1
+    }
+    X509PemResult(out, skipped)
+}
+
+// --- Trust store -------------------------------------------------------------------------------------------------
+
+class X509TrustStore(val certificates: array<X509Certificate>)
+
+fun x509TrustStoreFromPem(text: string): X509TrustStore = X509TrustStore(x509ParsePem(text).certificates)
+
+fun x509TrustStoreFromFile(path: string): X509TrustStore? {
+    val file = path(path)
+    if (!file.exists()) return null
+    X509TrustStore(x509ParsePem(file.readText()).certificates)
+}
+
+/** Where the system keeps its CA bundle: the usual places of Debian, Red Hat, SUSE, Alpine, FreeBSD and macOS. */
+fun x509SystemBundlePaths(): array<string> = [
+    "/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/ca-bundle.pem",
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", "/etc/ssl/cert.pem", "/usr/local/share/certs/ca-root-nss.crt",
+    "/etc/ssl/certs/ca-bundle.crt"
+]
+
+/** The first system bundle that exists and holds a certificate, or an empty store. */
+fun x509SystemTrustStore(): X509TrustStore {
+    for (bundle in x509SystemBundlePaths()) {
+        val store = x509TrustStoreFromFile(bundle)
+        if (store != null && store.certificates.size > 0) return store
+    }
+    X509TrustStore([])
+}
+
+// --- Signatures --------------------------------------------------------------------------------------------------
+
+private val X509_DIGEST_INFO_SHA256 = "\x30\x31\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x01\x05\x00\x04\x20"
+private val X509_DIGEST_INFO_SHA384 = "\x30\x41\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x02\x05\x00\x04\x30"
+private val X509_DIGEST_INFO_SHA512 = "\x30\x51\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x03\x05\x00\x04\x40"
+// The parameters of an EC key: its named curve, as x509AlgorithmParameters keeps them ("x" and the OID's DER).
+private val X509_CURVE_P256 = "x\x06\x08\x2a\x86\x48\xce\x3d\x03\x01\x07"
+private val X509_CURVE_P384 = "x\x06\x05\x2b\x81\x04\x00\x22"
+
+/** The reason `cert`'s signature does not verify under the public key of `issuer`, or "" if it does. */
+fun x509CheckSignature(cert: X509Certificate, issuer: X509Certificate): string {
+    val oid = cert.signatureOid
+    var hash = 0
+    var rsa = false
+    var ecdsa = false
+    if (oid == "1.2.840.113549.1.1.11") { rsa = true; hash = 256 }
+    else if (oid == "1.2.840.113549.1.1.12") { rsa = true; hash = 384 }
+    else if (oid == "1.2.840.113549.1.1.13") { rsa = true; hash = 512 }
+    else if (oid == "1.2.840.10045.4.3.2") { ecdsa = true; hash = 256 }
+    else if (oid == "1.2.840.10045.4.3.3") { ecdsa = true; hash = 384 }
+    else if (oid == "1.2.840.10045.4.3.4") { ecdsa = true; hash = 512 }
+    else if (oid == "1.2.840.113549.1.1.5" || oid == "1.2.840.10045.4.1" || oid == "1.2.840.113549.1.1.4") {
+        return "the signature uses SHA-1 or MD5, which is not accepted"
+    } else if (oid == "1.2.840.113549.1.1.10") return "RSASSA-PSS signatures are not supported yet"
+    else if (oid == "1.3.101.112") return "Ed25519 signatures are not supported yet"
+    else return "unsupported signature algorithm $oid"
+    val digest = if (hash == 256) sha256(cert.tbs) else if (hash == 384) sha384(cert.tbs) else sha512(cert.tbs)
+    if (rsa) {
+        if (cert.signatureParameters != "" && cert.signatureParameters != "x\x05\x00") return "bad signature algorithm parameters"
+        if (issuer.keyOid != "1.2.840.113549.1.1.1") return "the issuer's key is not an RSA key"
+        val key = rsaPublicKeyFromDer(issuer.spki)
+        if (!key.ok()) return "the issuer's RSA key is unreadable"
+        val info = if (hash == 256) X509_DIGEST_INFO_SHA256 else if (hash == 384) X509_DIGEST_INFO_SHA384 else X509_DIGEST_INFO_SHA512
+        return if (rsaVerifyWith(key, info, digest, cert.signature)) "" else "the signature is not valid"
+    }
+    if (cert.signatureParameters != "") return "bad signature algorithm parameters"
+    if (issuer.keyOid != "1.2.840.10045.2.1") return "the issuer's key is not an EC key"
+    if (issuer.keyParameters == X509_CURVE_P256) {
+        val raw = p256SignatureFromDer(cert.signature)
+        if (raw == "") return "the signature is not valid"
+        return if (p256EcdsaVerifyDigestRaw(issuer.keyBits, digest, raw)) "" else "the signature is not valid"
+    }
+    if (issuer.keyParameters == X509_CURVE_P384) {
+        val raw = p384SignatureFromDer(cert.signature)
+        if (raw == "") return "the signature is not valid"
+        return if (p384EcdsaVerifyDigestRaw(issuer.keyBits, digest, raw)) "" else "the signature is not valid"
+    }
+    "the issuer's EC curve is not supported"
+}
+
+// --- Host names (RFC 6125) -------------------------------------------------------------------------------------------
+
+private fun x509Labels(name: string): array<string> {
+    val out: array<string> = []
+    var start = 0
+    for (at in 0 until name.size) {
+        if (int(name[at]) == 46) {
+            out.append(name.slice(start, at))
+            start = at + 1
+        }
+    }
+    out.append(name.slice(start, name.size))
+    out
+}
+
+/** The bytes of an IPv4 dotted quad or an IPv6 address in text, or "" if `host` is not an IP address. */
+fun x509IpBytes(host: string): string {
+    var dots = 0
+    var colons = 0
+    var other = false
+    for (at in 0 until host.size) {
+        val b = int(host[at])
+        if (b == 46) dots = dots + 1
+        else if (b == 58) colons = colons + 1
+        else if (!((b >= 48 && b <= 57) || (b >= 97 && b <= 102) || (b >= 65 && b <= 70))) other = true
+    }
+    if (other) return ""
+    if (colons == 0 && dots == 3) {
+        val parts = x509Labels(host)
+        var out = ""
+        for (part in parts) {
+            if (part.size == 0 || part.size > 3 || (part.size > 1 && int(part[0]) == 48)) return ""
+            val n = x509Digits(part, 0, part.size)
+            if (n < 0 || n > 255) return ""
+            out = out + byteEncode(n)
+        }
+        return out
+    }
+    if (colons >= 2) return x509Ipv6(host)
+    ""
+}
+
+private fun x509HexValue(b: int): int {
+    if (b >= 48 && b <= 57) return b - 48
+    if (b >= 97 && b <= 102) return b - 87
+    if (b >= 65 && b <= 70) return b - 55
+    -1
+}
+
+private fun x509Ipv6(host: string): string {
+    // Groups of up to four hex digits, one "::" at most; an embedded IPv4 tail is not handled.
+    val words: array<int> = []
+    var gap = -1
+    var at = 0
+    if (host.size >= 2 && int(host[0]) == 58 && int(host[1]) == 58) {
+        gap = 0
+        at = 2
+    } else if (int(host[0]) == 58) return ""
+    var value = 0
+    var digits = 0
+    var colonBefore = false
+    while (at <= host.size) {
+        val b = if (at < host.size) int(host[at]) else 58
+        if (b == 58 || at == host.size) {
+            if (at == host.size && colonBefore && digits == 0) { at = at + 1; continue }
+            if (digits == 0) {
+                if (at < host.size && gap >= 0) return ""
+                gap = words.size
+            } else {
+                words.append(value)
+                value = 0
+                digits = 0
+            }
+            colonBefore = at < host.size
+            at = at + 1
+            continue
+        }
+        val v = x509HexValue(b)
+        if (v < 0) return ""
+        digits = digits + 1
+        if (digits > 4) return ""
+        value = value * 16 + v
+        colonBefore = false
+        at = at + 1
+    }
+    if (words.size > 8 || (gap < 0 && words.size != 8) || (gap >= 0 && words.size > 7)) return ""
+    var out = ""
+    for (i in 0 until 8) {
+        var w = 0
+        if (gap < 0 || i < gap) w = if (i < words.size) words[i] else 0
+        else {
+            val fill = 8 - words.size
+            if (i >= gap + fill) w = words[i - fill]
+        }
+        out = out + byteEncode(w >> 8) + byteEncode(w & 255)
+    }
+    out
+}
+
+/** Whether a dNSName `pattern` of a certificate (lower case) matches the lower case `host`: labels equal, the
+ *  pattern's first label may be a lone `*`, which stands for exactly one label, and only when the pattern has at
+ *  least three labels (no `*.com`). */
+fun x509DnsMatches(pattern: string, host: string): bool {
+    if (pattern.size == 0 || host.size == 0) return false
+    val p = x509Labels(pattern)
+    val h = x509Labels(host)
+    if (p.size != h.size) return false
+    for (i in 0 until p.size) if (p[i].size == 0 || h[i].size == 0) return false
+    val wildcard = p[0] == "*"
+    if (wildcard && p.size < 3) return false
+    for (i in 0 until p.size) {
+        if (i == 0 && wildcard) continue
+        for (c in 0 until p[i].size) if (int(p[i][c]) == 42) return false
+        if (p[i] != h[i]) return false
+    }
+    true
+}
+
+/** Whether the certificate is valid for `host` (a DNS name or an IP address): only the subjectAltName counts. */
+fun x509MatchesHost(cert: X509Certificate, host: string): bool {
+    var name = x509LowerText(host)
+    if (name.size > 1 && int(name[name.size - 1]) == 46) name = name.slice(0, name.size - 1)
+    val ip = x509IpBytes(name)
+    if (ip != "") {
+        for (n in cert.altNames) if (n.kind == 7 && n.value == ip) return true
+        return false
+    }
+    for (n in cert.altNames) if (n.kind == 2 && x509DnsMatches(n.value, name)) return true
+    false
+}
+
+// --- Name constraints (RFC 5280, 4.2.1.10) -----------------------------------------------------------------------------
+
+private fun x509ConstraintMatches(constraint: X509GeneralName, name: X509GeneralName): bool {
+    if (constraint.kind != name.kind) return false
+    if (name.kind == 2) {
+        val base = constraint.value
+        if (base == "") return true
+        if (name.value == base) return true
+        val dotted = if (int(base[0]) == 46) base else "." + base
+        return name.value.size > dotted.size && name.value.slice(name.value.size - dotted.size, name.value.size) == dotted
+    }
+    if (name.kind == 7) {
+        val half = constraint.value.size / 2
+        if (name.value.size != half) return false
+        for (i in 0 until half) {
+            if ((int(name.value[i]) & int(constraint.value[half + i])) != (int(constraint.value[i]) & int(constraint.value[half + i]))) return false
+        }
+        return true
+    }
+    if (name.kind == 4) {
+        return name.value.size >= constraint.value.size && name.value.slice(0, constraint.value.size) == constraint.value
+    }
+    false
+}
+
+/** The reason `cert`'s names break the constraints of `ca`, or "". */
+private fun x509NameConstraintError(ca: X509Certificate, cert: X509Certificate): string {
+    val names: array<X509GeneralName> = []
+    for (n in cert.altNames) names.append(n)
+    if (cert.subject.rdns.size > 0) names.append(X509GeneralName(4, cert.subject.canonical, cert.subject))
+    for (name in names) {
+        var anyPermitted = false
+        var matched = false
+        for (c in ca.permitted) if (c.kind == name.kind) {
+            anyPermitted = true
+            if (x509ConstraintMatches(c, name)) matched = true
+        }
+        if (anyPermitted && !matched) return "a name is not within the name constraints of ${ca.subject.commonName}"
+        for (c in ca.excluded) if (c.kind == name.kind && x509ConstraintMatches(c, name)) {
+            return "a name is excluded by the name constraints of ${ca.subject.commonName}"
+        }
+        // A wildcard stands for every name one label deep: an exclusion inside it takes something from it (CVE-2025-61727).
+        if (name.kind == 2 && name.value.size > 2 && name.value.slice(0, 2) == "*.") {
+            val base = name.value.slice(1, name.value.size)
+            for (c in ca.excluded) if (c.kind == 2 && c.value.size > base.size && c.value.slice(c.value.size - base.size, c.value.size) == base) {
+                return "a wildcard name covers a name excluded by the name constraints of ${ca.subject.commonName}"
+            }
+        }
+        if (name.kind == 0) {
+            for (c in ca.permitted) if (c.kind == 0) return "a name of a kind that cannot be checked is under name constraints"
+            for (c in ca.excluded) if (c.kind == 0) return "a name of a kind that cannot be checked is under name constraints"
+        }
+        if ((name.kind == 1 || name.kind == 6) && (anyPermitted || ca.excluded.size > 0)) {
+            return "an e-mail or URI name under name constraints cannot be checked"
+        }
+    }
+    ""
+}
+
+/** Whether a lower case dNSName holds only letters, digits, hyphens and dots (and a `*` as the whole first label). */
+private fun x509DnsNameIsValid(name: string): bool {
+    for (at in 0 until name.size) {
+        val b = int(name[at])
+        val letter = b >= 97 && b <= 122
+        val digit = b >= 48 && b <= 57
+        if (!(letter || digit || b == 45 || b == 46 || (b == 42 && at == 0 && name.size > 1 && int(name[1]) == 46))) return false
+    }
+    true
+}
+
+/** Why the certificate's public key is not acceptable (a weak or unsupported one), or "". */
+private fun x509KeyProblem(cert: X509Certificate): string {
+    if (cert.keyOid == "1.2.840.113549.1.1.1") {
+        val key = rsaPublicKeyFromDer(cert.spki)
+        if (!key.ok()) return "the RSA key is unreadable"
+        if (key.bits < 2048) return "the RSA key has fewer than 2048 bits"
+        if (key.bits % 8 != 0) return "the RSA key's size is not a multiple of 8 bits"
+        return ""
+    }
+    if (cert.keyOid == "1.2.840.10045.2.1") {
+        if (cert.keyParameters == X509_CURVE_P256 || cert.keyParameters == X509_CURVE_P384 ||
+            cert.keyParameters == "x\x06\x05\x2b\x81\x04\x00\x23") return ""
+        return "the EC key is on an unsupported curve"
+    }
+    if (cert.keyOid == "1.3.101.112" || cert.keyOid == "1.3.101.113") return ""
+    "the key type ${cert.keyOid} is not supported"
+}
+
+// --- Validation ----------------------------------------------------------------------------------------------------
+
+class X509Options(
+    /** The host name the leaf must be valid for; "" skips the check. */
+    val hostname: string,
+    /** The time of validation, seconds since 1970. Required: this module reads no clock. */
+    val now: int,
+    /** The longest path, leaf and trust anchor included. */
+    val maximumDepth: int = 8,
+    /** 0: a server's certificate (extended key usage serverAuth), 1: a client's. */
+    val usage: int = 0
+)
+
+class X509Verification(val ok: bool, val error: string, val path: array<X509Certificate>)
+
+private val X509_MAXIMUM_SIGNATURE_CHECKS = 64
+
+private fun x509HasPurpose(cert: X509Certificate, purpose: string): bool {
+    if (!cert.hasExtendedKeyUsage) return true
+    for (p in cert.extendedKeyUsage) if (p == purpose || p == X509_OID_ANY_EKU) return true
+    false
+}
+
+/** The reason the path (leaf first, trust anchor last) is not valid, or "". Signatures are checked as it is built. */
+fun x509ValidatePath(path: array<X509Certificate>, options: X509Options): string {
+    val n = path.size
+    if (n == 0) return "no certificate"
+    val purpose = if (options.usage == 1) X509_OID_CLIENT_AUTH else X509_OID_SERVER_AUTH
+    for (i in 0 until n) {
+        val cert = path[i]
+        val who = if (cert.subject.commonName == "") "certificate $i" else cert.subject.commonName
+        if (cert.unknownCritical != "") return "$who has an unrecognised critical extension ${cert.unknownCritical}"
+        if (options.now < cert.notBefore) return "$who is not yet valid"
+        if (options.now > cert.notAfter) return "$who has expired"
+        if (i < n - 1 || i == 0) {
+            // RFC 5280 4.1.2.2: a serial number is a positive integer.
+            val first = int(cert.serial[0])
+            if (first >= 128 || (cert.serial.size == 1 && first == 0)) return "$who's serial number is not positive"
+            val weak = x509KeyProblem(cert)
+            if (weak != "") return "$who: $weak"
+        }
+        if (cert.hasNameConstraints && !cert.isCa) return "$who has name constraints but is not a CA"
+        if ((cert.keyUsage & X509_KEY_CERT_SIGN) != 0 && cert.keyUsage != -1 && !cert.isCa) {
+            return "$who's key usage allows signing certificates but it is not a CA"
+        }
+        if (i == 0) {
+            if (!x509HasPurpose(cert, purpose)) return "$who is not valid for this purpose (extended key usage)"
+            if (cert.subject.rdns.size == 0 && !(cert.hasAltNames && cert.altNamesCritical)) {
+                return "$who has an empty subject and no critical subjectAltName"
+            }
+            for (name in cert.altNames) if (name.kind == 2 && !x509DnsNameIsValid(name.value)) {
+                return "$who has a dNSName that is not a valid host name"
+            }
+            if (options.hostname != "" && !x509MatchesHost(cert, options.hostname)) {
+                return "$who is not valid for the host name ${options.hostname}"
+            }
+        } else {
+            val anchor = i == n - 1
+            if (!anchor && !(cert.hasBasicConstraints && cert.isCa)) return "$who is not a CA certificate"
+            if (anchor && cert.hasBasicConstraints && !cert.isCa) return "$who is a trust anchor that is not a CA"
+            if (cert.keyUsage != -1 && (cert.keyUsage & X509_KEY_CERT_SIGN) == 0) return "$who may not sign certificates (key usage)"
+            if (!anchor && !x509HasPurpose(cert, purpose)) return "$who is not valid for this purpose (extended key usage)"
+            if (cert.pathLength >= 0) {
+                var below = 0
+                for (j in 1 until i) if (!path[j].selfIssued()) below = below + 1
+                if (below > cert.pathLength) return "$who's path length constraint is exceeded"
+            }
+            if (cert.hasNameConstraints) {
+                for (c in cert.permitted) if (c.kind == 2 && c.value.size > 0 && int(c.value[0]) == 46) {
+                    return "$who has a name constraint with a leading period"
+                }
+                for (c in cert.excluded) if (c.kind == 2 && c.value.size > 0 && int(c.value[0]) == 46) {
+                    return "$who has a name constraint with a leading period"
+                }
+                for (j in 0 until i) {
+                    if (j > 0 && path[j].selfIssued()) continue
+                    val problem = x509NameConstraintError(cert, path[j])
+                    if (problem != "") return problem
+                }
+            }
+        }
+    }
+    ""
+}
+
+private class X509Search(var checks: int, var error: string)
+
+private fun x509Note(var search: X509Search, error: string): void {
+    if (search.error == "") search.error = error
+    return
+}
+
+private fun x509KeyIdsAgree(cert: X509Certificate, issuer: X509Certificate): bool =
+    cert.authorityKeyId == "" || issuer.subjectKeyId == "" || cert.authorityKeyId == issuer.subjectKeyId
+
+private fun x509InPath(path: array<X509Certificate>, cert: X509Certificate): bool {
+    for (p in path) if (p.der == cert.der) return true
+    false
+}
+
+private fun x509CopyPath(path: array<X509Certificate>): array<X509Certificate> {
+    val copy: array<X509Certificate> = []
+    for (p in path) copy.append(p)
+    copy
+}
+
+private fun x509Extend(
+    var search: X509Search,
+    path: array<X509Certificate>,
+    pool: array<X509Certificate>,
+    store: X509TrustStore,
+    options: X509Options
+): array<X509Certificate>? {
+    val current = path[path.size - 1]
+    for (anchor in store.certificates) {
+        if (anchor.der == current.der) {
+            val problem = x509ValidatePath(path, options)
+            if (problem == "") return x509CopyPath(path)
+            x509Note(search, problem)
+        }
+    }
+    // Self-issued certificates in the middle of a path (a key rollover) do not lengthen it (RFC 5280, 6.1.3).
+    var length = 1
+    for (j in 1 until path.size) if (!path[j].selfIssued()) length = length + 1
+    if (length >= options.maximumDepth) {
+        x509Note(search, "the certificate chain is too long")
+        return null
+    }
+    for (anchor in store.certificates) {
+        if (anchor.subject.canonical != current.issuer.canonical || !x509KeyIdsAgree(current, anchor)) continue
+        if (search.checks >= X509_MAXIMUM_SIGNATURE_CHECKS) return null
+        search.checks = search.checks + 1
+        val bad = x509CheckSignature(current, anchor)
+        if (bad != "") {
+            x509Note(search, bad)
+            continue
+        }
+        val full: array<X509Certificate> = []
+        for (p in path) full.append(p)
+        full.append(anchor)
+        val problem = x509ValidatePath(full, options)
+        if (problem == "") return x509CopyPath(full)
+        x509Note(search, problem)
+    }
+    for (candidate in pool) {
+        if (candidate.subject.canonical != current.issuer.canonical || !x509KeyIdsAgree(current, candidate)) continue
+        if (x509InPath(path, candidate)) continue
+        if (search.checks >= X509_MAXIMUM_SIGNATURE_CHECKS) return null
+        search.checks = search.checks + 1
+        val bad = x509CheckSignature(current, candidate)
+        if (bad != "") {
+            x509Note(search, bad)
+            continue
+        }
+        val longer: array<X509Certificate> = []
+        for (p in path) longer.append(p)
+        longer.append(candidate)
+        val found = x509Extend(search, longer, pool, store, options)
+        if (found != null) return x509CopyPath(found)
+    }
+    null
+}
+
+/** Validates a server's chain (DER certificates, the leaf first; the others in any order, extras ignored): builds a
+ *  path to a certificate in `store`, checks it and the leaf's host name. */
+fun x509Verify(chain: array<string>, store: X509TrustStore, options: X509Options): X509Verification {
+    val none: array<X509Certificate> = []
+    if (chain.size == 0) return X509Verification(false, "no certificate was sent", none)
+    if (options.now <= 0) return X509Verification(false, "no current time was given", none)
+    val leaf = x509ParseDer(chain[0])
+    if (!leaf.ok) return X509Verification(false, leaf.error, none)
+    val pool: array<X509Certificate> = []
+    for (i in 1 until chain.size) {
+        val parsed = x509ParseDer(chain[i])
+        if (parsed.ok) pool.append(parsed)
+    }
+    val search = X509Search(0, "")
+    val first: array<X509Certificate> = [leaf]
+    val found = x509Extend(search, first, pool, store, options)
+    if (found == null) {
+        return X509Verification(false, if (search.error == "") "the certificate is signed by an unknown authority" else search.error, none)
+    }
+    X509Verification(true, "", found)
+}

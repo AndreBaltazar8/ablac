@@ -5,6 +5,8 @@
 | `abla/crypto` | SHA-512, SHA-384, SHA-256, SHA-1, MD5, HMAC, PBKDF2, Base64, hexadecimal, constant-time comparison |
 | `abla/crypto/aes`, `abla/crypto/rsa`, `abla/crypto/pure` | AES (GCM, CBC, ECB), RSA signing, verifying and encryption, key parsing: in Abla, on every target |
 | `abla/crypto/p256` | NIST P-256: ECDH and ECDSA (SHA-256, RFC 6979 nonces), in Abla, on every target |
+| `abla/crypto/p384` | NIST P-384 ECDSA verification (for certificates), in Abla |
+| `abla/crypto/x509` | X.509 certificates: parsing, chain building and validation (RFC 5280), host names (RFC 6125), a trust store, in Abla |
 | `abla/crypto/hosted` | the same and more, through OpenSSL |
 | `abla/random` | a cryptographically secure source (`getrandom(2)`) |
 | `abla/date` | UTC calendar dates, ISO 8601 and HTTP dates |
@@ -351,3 +353,45 @@ sockets. A Unix peer has no IP `peerAddress` (`socketPeerAddress` returns null).
 Closing a TLS connection or listener does not unlink a Unix pathname: the caller
 still owns that cleanup. Existing TCP upgrade signatures and behavior are
 unchanged; overload selection uses the connection's type, including named calls.
+
+## `abla/crypto/x509`
+
+Certificate parsing and server-chain validation with no OpenSSL, for the TLS that is written in Abla. All of it is public input:
+the parser reads a certificate once by a fixed schema (strict DER: minimal lengths, no trailing bytes, one-byte tags, UTCTime and
+GeneralizedTime only in their RFC 5280 forms), with no recursion, and answers `ok = false` with an `error` for anything else;
+tests feed it every truncation and byte change of a certificate.
+
+```
+val store = x509SystemTrustStore()                      // or x509TrustStoreFromPem(text), x509TrustStoreFromFile(path)
+val result = x509Verify([leafDer, intermediateDer], store, X509Options("example.com", nowSeconds))
+if (!result.ok) println(result.error)                   // result.path is the validated chain, leaf first, anchor last
+```
+
+| | |
+|---|---|
+| `x509ParseDer(der)`, `x509ParsePem(text)` | an `X509Certificate`: `subject`, `issuer` (`X509Name`: DER, relative distinguished names, a canonical form to compare them), `notBefore` and `notAfter` in seconds since 1970, `serial`, `spki` with `keyOid`, `keyParameters` and `keyBits`, and the extensions basicConstraints (`isCa`, `pathLength`), keyUsage (a bit mask), extendedKeyUsage, subjectAltName (`altNames`: DNS, IP address, e-mail, URI, directory names), nameConstraints (`permitted`, `excluded`), the key identifiers, and the first critical extension not known (`unknownCritical`) |
+| `x509Verify(chain, store, options)` | builds a path from the leaf (the first DER of `chain`; the others are candidate intermediates in any order, extras and unparsable ones are ignored) to a certificate of the trust store, depth-first, with at most 64 signature checks, and validates it |
+| `X509Options(hostname, now, maximumDepth = 8, usage = 0)` | the host name or IP address to match ("" skips the check), the time in seconds since 1970 (required: this module reads no clock, so a TLS layer passes its own), the longest path, and 0 for server authentication (1 for client) |
+| `x509MatchesHost(cert, host)`, `x509DnsMatches(pattern, host)`, `x509IpBytes(text)` | the RFC 6125 rules on their own |
+| `x509CheckSignature(cert, issuer)`, `x509ValidatePath(path, options)` | the pieces: one signature, and the checks of a built path |
+| `x509TrustStoreFromPem`, `x509TrustStoreFromFile`, `x509SystemTrustStore()` | the store; the system one is the first of the usual bundle files (`x509SystemBundlePaths()`: Debian, Red Hat, SUSE, Alpine, FreeBSD, macOS) that holds a certificate |
+
+What a path must satisfy: every certificate is within its validity and has no critical extension this code does not know; every
+issuer is a CA (basicConstraints cA, and keyCertSign in its keyUsage if it has one), within its path length constraint (self-issued
+intermediates not counted), and, unless it is the anchor, allows server authentication in its extended key usage; the leaf allows
+the purpose and has the host name among its subjectAltName entries (the common name is never used; a wildcard is a lone `*` as the
+whole left label of a name with at least three labels and matches exactly one label; IP addresses match iPAddress entries byte for
+byte); name constraints (DNS, IP, directory name) of each CA apply to the names below it, a wildcard that covers an excluded name
+is refused, and e-mail or URI names and other name forms under constraints are refused as unchecked. Signatures: RSA PKCS#1 v1.5 and
+ECDSA with SHA-256, -384 or -512 on RSA, P-256 and P-384 keys; SHA-1 and MD5 signatures are refused, and RSASSA-PSS and Ed25519 are
+reported as unsupported until their verifiers exist. RSA keys under 2048 bits and unusual EC curves in a leaf or an intermediate
+are refused. Not done: revocation, certificate policies, the common name, the public suffix list, Ed25519/PSS signatures.
+
+`abla/crypto/p384` has ECDSA verification on P-384 only (variable time, on public values), checked against Wycheproof's 504
+secp384r1/SHA-384 vectors. Tests (`tools/test-x509.sh`): the chains committed in `tests/cases/x509/chains` (made with `openssl` by
+`tools/gen-x509-fixtures.sh`: good RSA, P-256 and P-384 chains, expired, not yet valid, wrong name, wildcard and IP names, wrong
+usage, missing intermediate, unknown root, self-signed, tampered signature, name constraints, path length, a CA that is not one,
+an unknown critical extension), the system bundle's certificates, and [x509-limbo](https://github.com/C2SP/x509-limbo)'s 270 server
+cases and every 25th of BetterTLS's 9,491 name-constraint cases (`tests/cases/x509/limbo`): the cases this code answers
+differently from the suite are listed in `known.tsv` with the reason (CA/Browser Forum profile rules, key identifiers, policies,
+the trust anchor's own fields, the public suffix list), and the test fails when one is missing from it or no longer differs.

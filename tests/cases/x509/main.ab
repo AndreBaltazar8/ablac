@@ -1,0 +1,180 @@
+// abla/crypto/x509: the committed chains (tests/cases/x509/chains, made by tools/gen-x509-fixtures.sh) with what each must
+// give, the host name rules, and certificates damaged in every way a byte or a truncation can: parsing must answer, never
+// stop. Argument 0 is the directory of the chains.
+import "abla/crypto"
+import "abla/crypto/der"
+import "abla/crypto/x509"
+import "abla/fs"
+import "abla/integer"
+import "abla/io"
+import "abla/process/arguments"
+
+var failures = 0
+
+fun fail(what: string): void {
+    println("x509: FAIL $what")
+    failures = failures + 1
+    return
+}
+
+fun check(ok: bool, what: string): void {
+    if (!ok) fail(what)
+    return
+}
+
+fun split(text: string, separator: int): array<string> {
+    val out: array<string> = []
+    var start = 0
+    for (at in 0 until text.size) {
+        if (int(text[at]) == separator) {
+            out.append(text.slice(start, at))
+            start = at + 1
+        }
+    }
+    out.append(text.slice(start, text.size))
+    out
+}
+
+fun readCertificates(directory: string, names: string): array<X509Certificate> {
+    val out: array<X509Certificate> = []
+    for (name in split(names, 44)) {
+        if (name == "") continue
+        val parsed = x509ParsePem(path(directory + "/" + name).readText())
+        if (parsed.skipped > 0 || parsed.certificates.size == 0) fail("$name does not parse")
+        for (c in parsed.certificates) out.append(c)
+    }
+    out
+}
+
+fun chains(directory: string): void {
+    val lines = split(path(directory + "/cases.tsv").readText(), 10)
+    var count = 0
+    var accepted = 0
+    for (line in lines) {
+        if (line == "") continue
+        val fields = split(line, 9)
+        if (fields.size != 7) {
+            fail("cases.tsv line has ${fields.size} fields: $line")
+            continue
+        }
+        val name = fields[0]
+        val host = fields[1]
+        val now = fields[2].parseInt() ?? 0
+        val expect = fields[3]
+        val leaf = readCertificates(directory, fields[4])
+        val extra = readCertificates(directory, fields[5])
+        val roots = readCertificates(directory, fields[6])
+        if (leaf.size == 0) {
+            fail("$name: no leaf")
+            continue
+        }
+        val chain: array<string> = [leaf[0].der]
+        for (c in extra) chain.append(c.der)
+        val result = x509Verify(chain, X509TrustStore(roots), X509Options(host, now))
+        count = count + 1
+        if (result.ok) accepted = accepted + 1
+        if (expect == "ok") {
+            if (!result.ok) fail("$name: refused: ${result.error}")
+            else if (result.path.size < 1) fail("$name: no path")
+        } else {
+            if (result.ok) fail("$name: accepted, wanted an error with '$expect'")
+            else if (pemFind(result.error, expect, 0) < 0) fail("$name: error '${result.error}' lacks '$expect'")
+        }
+    }
+    check(count >= 40, "only $count chains were read")
+    println("x509: $count chains, $accepted accepted")
+    return
+}
+
+fun hosts(): void {
+    check(x509DnsMatches("example.com", "example.com"), "plain match")
+    check(!x509DnsMatches("example.com", "www.example.com"), "plain mismatch")
+    check(x509DnsMatches("*.example.com", "a.example.com"), "wildcard")
+    check(!x509DnsMatches("*.example.com", "example.com"), "wildcard needs a label")
+    check(!x509DnsMatches("*.example.com", "a.b.example.com"), "wildcard is one label")
+    check(!x509DnsMatches("*.com", "example.com"), "no wildcard on a top level domain")
+    check(!x509DnsMatches("a*.example.com", "ab.example.com"), "no partial wildcard")
+    check(!x509DnsMatches("www.*.example.com", "www.a.example.com"), "wildcard only first")
+    check(!x509DnsMatches("*.example.com", ".example.com"), "empty label")
+    check(!x509DnsMatches("", ""), "empty")
+    check(hexEncode(x509IpBytes("192.0.2.7")) == "c0000207", "IPv4")
+    check(x509IpBytes("192.0.2") == "" && x509IpBytes("256.0.0.1") == "" && x509IpBytes("01.2.3.4") == "", "bad IPv4")
+    check(hexEncode(x509IpBytes("2001:db8::1")) == "20010db8000000000000000000000001", "IPv6")
+    check(hexEncode(x509IpBytes("::1")) == "00000000000000000000000000000001", "::1")
+    check(hexEncode(x509IpBytes("::")) == "00000000000000000000000000000000", "::")
+    check(hexEncode(x509IpBytes("1:2:3:4:5:6:7:8")) == "00010002000300040005000600070008", "full IPv6")
+    check(x509IpBytes("1:2:3:4:5:6:7") == "" && x509IpBytes("1::2::3") == "" && x509IpBytes("12345::") == "", "bad IPv6")
+    check(x509IpBytes("example.com") == "", "a name is not an address")
+    println("x509: host names")
+    return
+}
+
+/** Parses every truncation of a certificate and every version of it with one byte changed. */
+fun damage(directory: string): void {
+    val good = x509ParsePem(path(directory + "/leaf-ec.pem").readText()).certificates[0].der
+    check(x509ParseDer(good).ok, "the certificate parses")
+    var parsed = 0
+    for (size in 0 until good.size) {
+        if (x509ParseDer(good.slice(0, size)).ok) fail("a truncation to $size bytes parsed")
+        parsed = parsed + 1
+    }
+    check(!x509ParseDer(good + "\x00").ok, "trailing byte")
+    check(!x509ParseDer("").ok, "empty")
+    for (at in 0 until good.size) {
+        for (change in [1, 128, 255]) {
+            val damaged = good.slice(0, at) + byteEncode(int(good[at]) ^ change) + good.slice(at + 1, good.size)
+            val result = x509ParseDer(damaged)
+            parsed = parsed + 1
+            if (result.ok) {
+                // A change in a value, not in the structure, still parses (a serial, a key byte). Verification must still answer.
+                x509Verify([damaged], X509TrustStore([]), X509Options("example.com", 1893456000))
+            }
+        }
+    }
+    println("x509: $parsed damaged certificates answered")
+    return
+}
+
+/** The system's CA bundle, when this machine has one: its certificates are real ones, of every age and generator. */
+fun system(): void {
+    val store = x509SystemTrustStore()
+    if (store.certificates.size == 0) {
+        println("x509: no system CA bundle here")
+        return
+    }
+    var anchors = 0
+    for (c in store.certificates) if (c.hasBasicConstraints && c.isCa) anchors = anchors + 1
+    check(store.certificates.size > 50, "the system bundle has only ${store.certificates.size} certificates that parse")
+    println("x509: system bundle: ${store.certificates.size} certificates parse, $anchors with cA")
+    // The bundle's parse count against the PEM blocks it holds.
+    for (bundle in x509SystemBundlePaths()) {
+        val file = path(bundle)
+        if (!file.exists()) continue
+        val text = file.readText()
+        var blocks = 0
+        var at = 0
+        while (true) {
+            val found = pemFind(text, "-----BEGIN CERTIFICATE-----", at)
+            if (found < 0) break
+            blocks = blocks + 1
+            at = found + 10
+        }
+        check(blocks - store.certificates.size <= blocks / 20, "$bundle: only ${store.certificates.size} of $blocks certificates parse")
+        break
+    }
+    return
+}
+
+fun main: int {
+    val directory = processArgument(0)
+    system()
+    hosts()
+    chains(directory)
+    damage(directory)
+    if (failures != 0) {
+        println("x509: $failures failure(s)")
+        return 1
+    }
+    println("x509: ok")
+    0
+}
