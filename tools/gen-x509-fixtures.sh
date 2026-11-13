@@ -154,7 +154,7 @@ printf 'not-yet-valid\texample.com\t%s\tnot yet valid\tleaf-early.pem\tinter-ec.
 printf 'before-validity\texample.com\t1500000000\tnot yet valid\tleaf-ec.pem\tinter-ec.pem\troot-ec.pem\n'
 printf 'wrong-usage\texample.com\t%s\tnot valid for this purpose\tleaf-client-only.pem\tinter-ec.pem\troot-ec.pem\n' $NOW
 printf 'wrong-key-usage\texample.com\t%s\tkey usage\tleaf-key-usage.pem\tinter-ec.pem\troot-ec.pem\n' $NOW
-printf 'no-san\texample.com\t%s\thas no subjectAltName for example.com\tleaf-no-san.pem\tinter-ec.pem\troot-ec.pem\n' $NOW
+printf 'no-san\texample.com\t%s\tnot valid for the host name\tleaf-no-san.pem\tinter-ec.pem\troot-ec.pem\n' $NOW
 printf 'unknown-critical-extension\texample.com\t%s\tcritical extension\tleaf-unknown-critical.pem\tinter-ec.pem\troot-ec.pem\n' $NOW
 printf 'missing-intermediate\texample.com\t%s\tunknown authority\tleaf-ec.pem\t\troot-ec.pem\n' $NOW
 printf 'wrong-root\texample.com\t%s\tunknown authority\tleaf-ec.pem\tinter-ec.pem\troot-rsa.pem\n' $NOW
