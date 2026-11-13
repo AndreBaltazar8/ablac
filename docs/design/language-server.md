@@ -253,7 +253,7 @@ copy/read-only originals, max four CPUs and targeted tests during the release.
 
 ## Scripted JSON-RPC test plan
 
-A Python session driver starts `ablac lsp --stdio`, sends actual framed bytes and
+A scripted session driver (Node, not Python) starts `ablac lsp --stdio`, sends actual framed bytes and
 asserts responses/notifications from fixture projects. Use per-session private
 caches and deterministic event barriers, not arbitrary sleeps. Reuse the analysis
 service and formatter fixtures and retain their independent tests.

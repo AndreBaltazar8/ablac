@@ -46,7 +46,7 @@ normalization has been applied.
   each round. Warmups are retained but excluded from summaries. There is no
   cache reset between runtime processes; startup and ordinary allocator/GC
   work are included. No allocator environment overrides are applied.
-- Wall time is Python's monotonic interval around `/usr/bin/time -l -p` and
+- Wall time is a monotonic interval (the Node driver's clock, formerly Python's) around `/usr/bin/time -l -p` and
   one program process. The native tool's coarser real/user/system times are
   also retained. Darwin peak RSS is **bytes**, per process, not compiler RSS
   or a sum over children. The ~11 ms arm64 websocket run is especially

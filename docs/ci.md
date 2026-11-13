@@ -29,10 +29,10 @@ adapter/program object and runs a newly compiled child. It exercises the
 relative/absolute compiler-entry paths that exposed the private-symbol release
 regression. The native host script covers Mach-O/IO, filesystem/home, process
 pipelines/capture, Unix sockets, HTTP peer metadata, UUID and JIT paths. This is
-a targeted macOS gate, not the full Linux suite. The development runner requires
-Python 3 on `PATH` on macOS. Its standard-library kqueue supervisor watches the
+a targeted macOS gate, not the full Linux suite. The development runner needs only bash, `ps`,
+awk and `sleep` on macOS. Its shell supervisor (`tools/run-limited-darwin.sh`) polls the
 runner shell's lifetime and stops the detached payload group even if the caller's
-whole process group is killed. Python is not added to released compiler packages.
+whole process group is killed. It is not added to released compiler packages.
 The host gate tests caller-group SIGKILL with both ordinary and TERM-ignoring
 descendants. Intel macOS, all packaging,
 release publication and the broader platform matrix remain in release CI.

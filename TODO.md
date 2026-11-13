@@ -577,11 +577,11 @@ mmap form) apply there.
   explicitly state the standalone binary's Nix-store interpreter requirement. Investigate and document
   standalone use and older Linux compatibility separately from the installer probe.
 
-- [ ] **Abla-native Xtensa companion installer.** The explicit optional installer uses only the Python
-  standard library until `abla/compression` can inflate gzip and read tar with bounded, safe extraction.
-  Move it to Abla once those archive primitives exist; keep checksum and manifest verification. `gzipDecompress`
+- [ ] **Abla-native Xtensa companion installer.** The explicit optional installer used only the Python
+  standard library until `abla/compression` could inflate gzip and read tar with bounded, safe extraction. It is Abla now
+  (`tools/xtensa-native`, packaged as `abla-install-xtensa`), with checksum and manifest verification kept. `gzipDecompress`
   now inflates a single member with a mandatory caller-provided output limit and CRC/ISIZE checks; the offline
-  extraction and verification library is available, while the packaged Abla installer remains open. On 2026-11-11, one P-core, release host build: a 4,420,000-byte repetitive
+  extraction and verification library is available, and the packaged Abla installer is tools/xtensa-native. On 2026-11-11, one P-core, release host build: a 4,420,000-byte repetitive
   input (12,921-byte gzip -6) took median 28.2 ms / 589.0M instructions versus gzip -dc 1.7 ms / 34.4M
   (16.6x wall / 17.1x instructions); a 4,843,520-byte tar of ablac src (896,025-byte gzip -6) took 64.2 ms /
   1123.7M versus gzip 7.2 ms / 64.0M (8.9x / 17.5x). Wall medians are five process runs, instruction medians
@@ -642,9 +642,9 @@ mmap form) apply there.
   credentials, with `NO_PROXY` and proxy selection on each redirect plus a local proxy test;
   add proxy authentication and HTTPS-to-proxy only if André asks. Until then, configured proxies
   are refused and the installer directs users to download separately and use `--archive`.
-  The manual installed-toolchain probe and report still use Python for test orchestration;
-  port those as part of the broader Python removal, without losing their three-platform,
-  tamper and exact-codegen checks.
+  The manual installed-toolchain probe and report were Python for test orchestration; #807 ported
+  them to Node (tools/test-xtensa-installed.mjs, tools/report-xtensa-install-probe.mjs) with their three-platform,
+  tamper and exact-codegen checks kept.
   The first six-leg probe exposed a Homebrew Intel setup failure before native installation: current
   llvm 23.1.5 has no Intel bottle. The probe now uses the release workflow's checksum-pinned 23.1.0
   Intel bottles; its macOS Intel native leg still needs a rerun.

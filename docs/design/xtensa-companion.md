@@ -376,7 +376,7 @@ leaves the same 5,211-byte gap across 199 firmware sections. The isolated
 `a2fd95380faf9c54d500cfed1795cad53c557fabd031df31c008e324db2a10c3`.
 Its offline test uses the real firmware assembly and operand edges, requires
 exact text, preserves verbatim regions, and covers density and unwind options.
-Python is used only in this test. The production stage is compiled Abla, followed
+Espressif's Python SDK script is used only as this test's oracle. The production stage is compiled Abla, followed
 by the same selected llc's integrated assembler; no objcopy or GNU tool lookup.
 
 Freestanding functions are `nounwind` by default, including fast builds, so no

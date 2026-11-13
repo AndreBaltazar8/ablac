@@ -78,7 +78,7 @@ for byte. Its name is `uint256` because that's what's asked of it and what Solid
 
 ## On each target
 
-`WIDE_FULL=1 tools/test-wide-integers.sh` (`make test-wide-integers-full`; `make test` runs a quick version) runs it against Python's integers on fresh random values and edge values each
+`WIDE_FULL=1 tools/test-wide-integers.sh` (`make test-wide-integers-full`; `make test` runs a quick version) runs it against JavaScript's BigInt on fresh random values and edge values each
 time, without a C library:
 
 | Target | How it's run | What it calls |
