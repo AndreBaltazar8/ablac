@@ -16,7 +16,7 @@ restore_output_permissions() {
 trap restore_output_permissions EXIT
 if [[ -d $out ]]; then chmod -R u+w "$out"; rm -rf "$out"; fi
 mkdir -p "$out/fixtures" "$out/target" "$out/negative" "$out/fault" "$out/concurrent" "$out/many" "$out/root-link"
-python3 tests/cases/xtensa-companion-offline/make-fixtures.py "$out/fixtures"
+node tests/cases/xtensa-companion-offline/make-fixtures.mjs "$out/fixtures"
 "$compiler" build tests/cases/xtensa-companion-offline/main.ab -o "$out/test" --fast --no-cache
 run() { "$out/test" "$out/fixtures/$1.json" "$2" "$out/fixtures" "$1.tar.gz" "$3" "${4:-new}"; }
 ln -s old "$out/target/current"
@@ -51,11 +51,12 @@ done
 "$out/test" "$out/fixtures/good.json" "$out/negative" "$out/fixtures" oversize.tar.gz archive_limit
 [[ -z $(ls -A "$out/negative") ]]
 # Same-size, same-mtime modification must not pass existing-tree verification.
-python3 - "$out/target/23.1.3-1/bin/opt" <<'PY'
-import os,sys
-from pathlib import Path
-p=Path(sys.argv[1]); info=p.stat(); p.chmod(0o644); p.write_bytes(b'bad'); os.utime(p,ns=(info.st_atime_ns,info.st_mtime_ns)); p.chmod(0o555)
-PY
+bin_opt="$out/target/23.1.3-1/bin/opt"
+touch -r "$bin_opt" "$out/opt.mtime"
+chmod 644 "$bin_opt"
+printf bad > "$bin_opt"
+touch -r "$out/opt.mtime" "$bin_opt"
+chmod 555 "$bin_opt"
 run good "$out/target" existing_file_hash
 [[ -z $(find "$out/target" -name '.install-*' -print) ]]
 # Refuse links, unexpected files, missing files and a changed manifest in an existing tree.
@@ -98,26 +99,8 @@ if [[ $(uname -s) == Linux ]] && command -v strace >/dev/null; then
     mkdir "$out/order"
     strace -qq -yy -e trace=fchmod,renameat2,fsync,write,openat -o "$out/order.trace" \
         "$out/test" "$out/fixtures/good.json" "$out/order" "$out/fixtures" good.tar.gz '' new
-    python3 - "$out/order.trace" <<'PY'
-import re, sys
-lines = open(sys.argv[1]).read().splitlines()
-rename = next(i for i, line in enumerate(lines) if line.startswith('renameat2(') and ' = 0' in line)
-root_modes = [(i, line) for i, line in enumerate(lines) if re.search(r'fchmod\(\d+<[^>]*(?:/\.install-[^/>]+|/23\.1\.3-1)>, 0?555\)', line)]
-assert len(root_modes) == 1 and root_modes[0][0] > rename, (rename, root_modes)
-PY
-    ordinal=$(python3 - "$out/order.trace" <<'PY'
-import re, sys
-count = 0
-for line in open(sys.argv[1]):
-    if line.startswith('fchmod('):
-        count += 1
-        if re.search(r'fchmod\(\d+<[^>]*/23\.1\.3-1>, 0?555\)', line):
-            print(count)
-            break
-else:
-    raise SystemExit('missing final root chmod')
-PY
-    )
+    node tests/cases/xtensa-companion-offline/trace.mjs root-order "$out/order.trace"
+    ordinal=$(node tests/cases/xtensa-companion-offline/trace.mjs final-chmod "$out/order.trace")
     mkdir "$out/final-mode-fault"
     strace -qq -e "inject=fchmod:error=EIO:when=$ordinal" -o "$out/final-mode.trace" \
         "$out/test" "$out/fixtures/good.json" "$out/final-mode-fault" "$out/fixtures" good.tar.gz "$incomplete" new
@@ -136,34 +119,12 @@ PY
         [[ -z $(ls -A "$out/fault") ]]
     done
     for call in write fsync; do
-        ordinal=$(python3 - "$out/order.trace" "$call" <<'PY'
-import sys
-count = 0
-for line in open(sys.argv[1]):
-    if line.startswith(sys.argv[2] + '('):
-        count += 1
-        if '/.install-' in line:
-            print(count)
-            break
-else:
-    raise SystemExit('missing payload ' + sys.argv[2])
-PY
-        )
+        ordinal=$(node tests/cases/xtensa-companion-offline/trace.mjs payload "$call" "$out/order.trace")
         strace -qq -e "inject=$call:error=EIO:when=$ordinal" -o "$out/stage-$call.trace" \
             "$out/test" "$out/fixtures/good.json" "$out/fault" "$out/fixtures" good.tar.gz stage_write
         [[ -z $(ls -A "$out/fault") ]]
     done
-    stage_write=$(python3 - "$out/order.trace" <<'PY'
-import sys
-count = 0
-for line in open(sys.argv[1]):
-    if line.startswith('write('):
-        count += 1
-        if '/.install-' in line:
-            print(count); break
-else: raise SystemExit('missing stage write')
-PY
-    )
+    stage_write=$(node tests/cases/xtensa-companion-offline/trace.mjs payload write "$out/order.trace")
     strace -qq -e "inject=write:error=ENOSPC:when=$stage_write" -o "$out/full-stage-write.trace" \
         "$out/test" "$out/fixtures/good.json" "$out/fault" "$out/fixtures" good.tar.gz disk_full
     [[ -z $(ls -A "$out/fault") ]]
@@ -171,17 +132,7 @@ PY
         -o "$out/stage-cleanup.trace" "$out/test" "$out/fixtures/good.json" "$out/fault" \
         "$out/fixtures" good.tar.gz cleanup stage-cleanup
     chmod -R u+w "$out/fault"; rm -rf "$out/fault"; mkdir "$out/fault"
-    spool_open=$(python3 - "$out/order.trace" <<'PY'
-import sys
-count = 0
-for line in open(sys.argv[1]):
-    if line.startswith('openat('):
-        count += 1
-        if '".spool-' in line:
-            print(count); break
-else: raise SystemExit('missing spool open')
-PY
-    )
+    spool_open=$(node tests/cases/xtensa-companion-offline/trace.mjs spool-open "$out/order.trace")
     strace -qq -e "inject=openat:error=EIO:when=$spool_open" -e inject=unlinkat:error=EIO:when=1 \
         -o "$out/spool-open-cleanup.trace" "$out/test" "$out/fixtures/good.json" "$out/fault" \
         "$out/fixtures" good.tar.gz cleanup spool-open-cleanup
@@ -210,20 +161,15 @@ fi
 # Optional size regression: stored gzip data exceeds the previous 128 MiB cap.
 if [[ ${ABLA_TEST_XTENSA_LARGE:-0} == 1 ]]; then
     mkdir "$out/large"
-    python3 tests/cases/xtensa-companion-offline/make-large.py "$out/fixtures"
+    node tests/cases/xtensa-companion-offline/make-large.mjs "$out/fixtures"
     run large "$out/large" '' new
     echo 'offline installer: compressed input above 128 MiB accepted'
 fi
 # The cached real release is optional; the suite never downloads it.
 if [[ -n ${ABLA_TEST_XTENSA_COMPANION:-} && -f $ABLA_TEST_XTENSA_COMPANION ]]; then
-    mkdir -p "$out/real" "$out/real-archive" "$out/python"
+    mkdir -p "$out/real" "$out/real-archive"
     cp "$ABLA_TEST_XTENSA_COMPANION" "$out/real-archive/companion.tar.gz"
-    python3 - "$out" <<'PY'
-import json,sys
-from pathlib import Path
-p=Path(sys.argv[1]); catalog=json.load(open('tools/xtensa-companions.json')); rel=catalog['releases']['23.1.3-1']; item=rel['platforms']['x86_64-linux']
-(p/'real.json').write_text(json.dumps({'version':'23.1.3-1','platform':'x86_64-linux','llvmVersion':rel['llvmVersion'],'sourceCommit':rel['sourceCommit'],'sourceArchiveSha256':rel['sourceArchiveSha256'],'archiveSha256':item['sha256'],'manifestSha256':item['manifestSha256']}))
-PY
+    node tests/cases/xtensa-companion-offline/real-config.mjs "$out"
     "$out/test" "$out/real.json" "$out/real" "$out/real-archive" companion.tar.gz '' new
     if [[ $(uname -s) != Linux ]]; then
         echo 'offline installer: real Linux inventory check skipped on non-Linux host'
@@ -235,8 +181,8 @@ PY
               printf '%s %s %s %s\n' "$kind" "$mode" "${sum%% *}" "$path"
           done
         ) | LC_ALL=C sort > "$out/real-inventory.txt"
-        cmp tests/cases/xtensa-companion-offline/linux-python-tree.txt "$out/real-inventory.txt"
-        echo 'offline installer: real Linux tree matches recorded Python installer inventory'
+        cmp tests/cases/xtensa-companion-offline/linux-tree.txt "$out/real-inventory.txt"
+        echo 'offline installer: real Linux tree matches recorded installer inventory'
     fi
 else
     echo 'offline installer: real cached companion absent; parity skipped'
