@@ -552,7 +552,7 @@ private trusted fun pbePkcs12CheckMac(data: string, safe: string, item: DerItem,
 }
 
 private class PbeSafeWalk(val limits: RsaKeyReadLimits, var bags: int = 0,
-    var keys: int = 0, var key: string = "", var error: string = "")
+    var keys: int = 0, var key: string = "", var error: string = "", var certificates: array<string> = [])
 private fun PbeSafeWalk.fail(error: string): void {
     if (this.error == "") this.error = error
 }
@@ -628,6 +628,7 @@ private trusted fun PbeSafeWalk.contents(data: string, password: CryptoPassword,
             if (!explicit.ok || explicit.tag != 160 || explicit.end != payload.end ||
                 !certificate.ok || certificate.tag != DER_OCTET_STRING || certificate.end !=
                 explicit.end) { this.fail("wrong password or corrupt key"); return }
+            this.certificates.append(data.slice(certificate.start, certificate.end))
         } else if (pbeOid(data, oid, "\x2a\x86\x48\x86\xf7\x0d\x01\x0c\x0a\x01\x06")) {
             this.contents(data.slice(value.start, value.end), password, budget, depth + 1)
         } else { this.fail("unsupported PKCS#12 bag type"); return }
@@ -731,4 +732,72 @@ private @noinline trusted fun pbeOpenPkcs12Work(data: string, password: CryptoPa
     if (walk.error != "") return cryptoFailed(walk.error)
     if (walk.keys != 1) return cryptoFailed("PKCS#12 contains no private key")
     CryptoResult(walk.key, true, "")
+}
+
+/** What a PKCS#12 holds: its one private key (PKCS#8 DER) and its certificates (DER) in bag order. */
+class Pkcs12Contents(val ok: bool, val error: string, val key: string, val certificates: array<string>)
+
+private fun pkcs12Failed(error: string): Pkcs12Contents {
+    val none: array<string> = []
+    Pkcs12Contents(false, error, "", none)
+}
+
+/** As pbeOpenPkcs12, with the certificates too: the same MAC check before anything is read or decrypted, the same
+ * limits, exactly one private key; the certificates come back as found (a TLS identity picks the one that matches
+ * the key and orders the chain: abla/tls/pure/identity). Its stack residue is not part of the ct residue checks. */
+trusted fun pbeOpenPkcs12Contents(data: string, password: CryptoPassword,
+    limits: RsaKeyReadLimits = rsaKeyReadLimits()): Pkcs12Contents {
+    val result = pbeOpenPkcs12ContentsWork(data, password, limits)
+    ctScrubStack4096()
+    return result
+}
+private @noinline trusted fun pbeOpenPkcs12ContentsWork(data: string, password: CryptoPassword,
+    limits: RsaKeyReadLimits): Pkcs12Contents {
+    if (!rsaKeyReadLimitsValid(limits)) return pkcs12Failed("invalid RSA key read limits")
+    if (!password.ok()) return pkcs12Failed(password.error())
+    if (password.passwordBmpError != "") return pkcs12Failed(password.passwordBmpError)
+    if (data.size > limits.maximumDerBytes) return pkcs12Failed("PKCS#12 DER byte limit exceeded")
+    val malformed = "invalid PKCS#12 DER container"
+    val root = derItem(data, 0, data.size)
+    if (!root.ok || root.tag != DER_SEQUENCE || root.end !=
+        data.size) return pkcs12Failed(malformed)
+    val version = derItem(data, root.start, root.end)
+    if (!version.ok || version.tag != DER_INTEGER || data.slice(version.start,
+        version.end) != "\x03") return pkcs12Failed("unsupported PKCS#12 version (PFXv3 required)")
+    val authSafe = derItem(data, version.end, root.end)
+    if (!authSafe.ok || authSafe.tag != DER_SEQUENCE) return pkcs12Failed(malformed)
+    val oid = derItem(data, authSafe.start, authSafe.end)
+    if (!pbeOid(data, oid,
+        "\x2a\x86\x48\x86\xf7\x0d\x01\x07\x01")) return pkcs12Failed("unsupported PKCS#12 authSafe (password integrity required)")
+    val explicit = derItem(data, oid.end, authSafe.end)
+    if (!explicit.ok || explicit.tag != 160 || explicit.end !=
+        authSafe.end) return pkcs12Failed(malformed)
+    val encoded = derItem(data, explicit.start, explicit.end)
+    if (!encoded.ok || encoded.tag != DER_OCTET_STRING || encoded.end !=
+        explicit.end) return pkcs12Failed("unsupported PKCS#12 authSafe encoding (DER required)")
+    if (authSafe.end == root.end) return pkcs12Failed("PKCS#12 MacData is required")
+    val mac = derItem(data, authSafe.end, root.end)
+    if (!mac.ok || mac.end != root.end) return pkcs12Failed(malformed)
+    val safe = data.slice(encoded.start, encoded.end)
+    val budget = PbeBudget(limits)
+    val verified = pbePkcs12CheckMac(data, safe, mac, password, budget)
+    if (verified != "") return pkcs12Failed(verified)
+    // No safe traversal or AES decrypt occurs before the MAC check above.
+    val sequence = derItem(safe, 0, safe.size)
+    if (!sequence.ok || sequence.tag != DER_SEQUENCE || sequence.end !=
+        safe.size) return pkcs12Failed("wrong password or corrupt key")
+    val walk = PbeSafeWalk(limits)
+    var at = sequence.start
+    var count = 0
+    while (at < sequence.end && walk.error == "") {
+        count += 1
+        if (count > limits.maximumBags) return pkcs12Failed("PKCS#12 content count limit exceeded")
+        val info = derItem(safe, at, sequence.end)
+        if (!info.ok) return pkcs12Failed("wrong password or corrupt key")
+        walk.contentInfo(safe, info, password, budget)
+        at = info.end
+    }
+    if (walk.error != "") return pkcs12Failed(walk.error)
+    if (walk.keys != 1) return pkcs12Failed("PKCS#12 contains no private key")
+    Pkcs12Contents(true, "", walk.key, walk.certificates)
 }

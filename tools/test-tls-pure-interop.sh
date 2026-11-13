@@ -117,6 +117,15 @@ stop_server
 openssl rsa -in "$out/rsa.key" -traditional -out "$out/rsa-alt.key" 2> /dev/null
 openssl ec -in "$out/p256.key" -out "$out/p256-alt.key" 2> /dev/null
 openssl pkcs8 -topk8 -v2 aes-256-cbc -iter 2000 -in "$out/rsa.key" -passout pass:secret -out "$out/rsa-enc.key" 2> /dev/null
+# PKCS#12 containers (OpenSSL 3's defaults: PBES2 AES-256-CBC, SHA-256 MAC) for the identity test and one mutual-TLS run:
+# one per key kind (the server certificates), the client certificates, and a chain (a CA and a leaf it signed).
+for kind in rsa p256 ed25519; do
+    openssl pkcs12 -export -inkey "$out/$kind.key" -in "$out/$kind.pem" -out "$out/$kind.p12" -passout pass:secret 2> /dev/null
+done
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$out/chain-ca.key" -out "$out/chain-ca.pem" -subj /CN=chain-ca -days 2 2> /dev/null
+openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$out/chain-leaf.key" -out "$out/chain-leaf.csr" -subj /CN=chain-leaf 2> /dev/null
+openssl x509 -req -in "$out/chain-leaf.csr" -CA "$out/chain-ca.pem" -CAkey "$out/chain-ca.key" -CAcreateserial -out "$out/chain-leaf.pem" -days 2 2> /dev/null
+openssl pkcs12 -export -inkey "$out/chain-leaf.key" -in "$out/chain-leaf.pem" -certfile "$out/chain-ca.pem" -out "$out/chain.p12" -passout pass:secret 2> /dev/null
 "$compiler" build tests/cases/tls-pure/identity.ab -o "$out/identity" --no-cache
 result=$("$root/tools/run-limited.sh" "$out/identity" "$out") || { echo "tls-pure identity: $result" >&2; exit 1; }
 [[ $result == 'tls-pure identity ok' ]] || { echo "tls-pure identity: $result" >&2; exit 1; }
@@ -127,6 +136,7 @@ openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$out/client
 openssl genpkey -algorithm ED25519 -out "$out/client-ed25519.key" 2> /dev/null
 for kind in rsa p256 ed25519; do
     openssl req -x509 -new -key "$out/client-$kind.key" -out "$out/client-$kind.pem" -subj /CN=client-$kind -days 2 2> /dev/null
+    openssl pkcs12 -export -inkey "$out/client-$kind.key" -in "$out/client-$kind.pem" -out "$out/client-$kind.p12" -passout pass:secret 2> /dev/null
 done
 for version in tls1_3 tls1_2; do
 for kind in rsa p256 ed25519; do
@@ -140,8 +150,12 @@ for kind in rsa p256 ed25519; do
             echo "tls-pure mtls ($kind trusted, $who): $result" >&2; head -5 "$out/server.log" >&2; exit 1; }
         [[ $result == "tls-pure mtls ok ($expect)" ]] || { echo "tls-pure mtls ($kind trusted, $who): $result" >&2; exit 1; }
     done
+    # The same client as a PKCS#12 identity.
+    result=$("$root/tools/run-limited.sh" "$out/mtls" "$port" "$out/ed25519.pem" "$out/client-$kind.p12" none accepted) || {
+        echo "tls-pure mtls (PKCS#12 $kind): $result" >&2; head -5 "$out/server.log" >&2; exit 1; }
+    [[ $result == "tls-pure mtls ok (accepted)" ]] || { echo "tls-pure mtls (PKCS#12 $kind): $result" >&2; exit 1; }
     stop_server
-    echo "mtls $version $kind: accepted, refused without an identity, refused with another"
+    echo "mtls $version $kind: accepted, refused without an identity, refused with another, accepted as PKCS#12"
 done
 done
 # A TLS 1.2 server without the extended master secret is refused (the subset requires it).

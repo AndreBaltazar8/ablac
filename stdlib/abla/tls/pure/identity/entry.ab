@@ -153,3 +153,47 @@ trusted fun tlsClientIdentityFromPem(certificatePem: string, keyPem: string,
     }
     tlsIdentityFromKey(chain, keyDer, label)
 }
+
+/** The identity of a PKCS#12 container (PFXv3 with a password MAC, PBES2 encryption: what OpenSSL 3 and current
+ *  tools write): its private key and its certificate chain, the leaf first. The leaf is the certificate whose key is
+ *  the private key; the rest follow in issuer order (certificates that do not chain are left out). `password` is
+ *  the container's. Check `error` (empty on success). */
+trusted fun tlsClientIdentityFromPkcs12(der: string, password: string): TlsClientIdentity {
+    val contents = pbeOpenPkcs12Contents(der, cryptoPassword(password))
+    if (!contents.ok) return tlsIdentityFailed("not a readable PKCS#12 identity, or a wrong password")
+    if (contents.certificates.size == 0) return tlsIdentityFailed("the PKCS#12 has no certificate")
+    // The leaf: the certificate that the key belongs to.
+    var leafIndex = -1
+    var identity = tlsIdentityFailed("the private key is not the PKCS#12's certificate's")
+    var index = 0
+    while (index < contents.certificates.size && leafIndex < 0) {
+        val attempt = tlsIdentityFromKey([contents.certificates[index]], contents.key, "PRIVATE KEY")
+        if (attempt.ok()) {
+            leafIndex = index
+            identity = attempt
+        }
+        index = index + 1
+    }
+    if (leafIndex < 0) return identity
+    // The chain: from the leaf, the certificate whose subject is the current one's issuer, until none.
+    val chain: array<string> = [contents.certificates[leafIndex]]
+    val used: array<bool> = []
+    for (i in 0 until contents.certificates.size) used.append(i == leafIndex)
+    var current = x509ParseDer(contents.certificates[leafIndex])
+    var extending = true
+    while (extending && !current.selfIssued()) {
+        extending = false
+        for (i in 0 until contents.certificates.size) {
+            if (!extending && !used[i]) {
+                val candidate = x509ParseDer(contents.certificates[i])
+                if (candidate.ok && candidate.subject.canonical == current.issuer.canonical) {
+                    chain.append(contents.certificates[i])
+                    used[i] = true
+                    current = candidate
+                    extending = true
+                }
+            }
+        }
+    }
+    TlsClientIdentity(chain, identity.schemes, identity.sign)
+}
