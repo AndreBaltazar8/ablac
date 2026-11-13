@@ -1,6 +1,17 @@
 import "abla/crypto/rsa"
 import "abla/fs"
+import "abla/io"
 import "abla/process/arguments"
+import "abla/sys/linux/random"
+
+// Draws the "tail" mode answers with a value below the prime floor, one for each candidate the generator tries.
+var lowDraws = 0
+
+// A failed check says which one and what it saw (a rare CI failure once ended this program with only an exit status).
+fun fail(code: int, what: string): int {
+    println("rsa keygen: check $code failed: $what")
+    code
+}
 
 fun main: int {
     val mode = processArgument(0)
@@ -10,24 +21,42 @@ fun main: int {
         cryptoSetRandom({ count: int -> "" })
         val noRandom = rsaGeneratePrivateKey(2048)
         if (noRandom.ok()) 2 else 0
+    } else if (mode == "tail") {
+        // The unlucky tail of the prime search (#816): 15,000 draws that are all below the floor, more than the generator once
+        // allowed in all (10 * 1024) and a fraction of what it allows now, then real randomness. The key must still come.
+        cryptoSetRandom({ count: int ->
+            if (lowDraws < 15000) {
+                lowDraws = lowDraws + 1
+                "\x01".repeat(count)
+            } else secureRandomBytes(count).bytes
+        })
+        val key = rsaGeneratePrivateKey(2048)
+        if (!key.ok()) fail(3,
+            "after ${lowDraws} unlucky draws the key is not ok: ${key.error}") else 0
     } else {
         val bits = if (mode == "3072") 3072 else if (mode == "4096") 4096 else 2048
         val key = rsaGeneratePrivateKey(bits)
-        if (!key.ok() || key.bits != bits) return 3
+        if (!key.ok()) return fail(3, "the generated key is not ok: ${key.error}")
+        if (key.bits != bits) return fail(3, "the key has ${key.bits} bits, wanted $bits")
         val der = key.toPkcs8Der()
         val pem = key.toPkcs8Pem()
-        if (!der.ok || !pem.ok) return 4
+        if (!der.ok) return fail(4, "PKCS#8 DER export: ${der.error}")
+        if (!pem.ok) return fail(4, "PKCS#8 PEM export: ${pem.error}")
         val imported = rsaPrivateKeyFromPem(pem.bytes)
-        if (!imported.ok() || imported.modulus != key.modulus) return 5
+        if (!imported.ok()) return fail(5, "re-importing the PEM: ${imported.error}")
+        if (imported.modulus != key.modulus) return fail(5, "the re-imported modulus differs")
         val public = rsaPublicFromNumbers(key.modulus, key.publicExponent, "bad key")
         val message = "RSA key generation pairwise test"
         val signed = key.signPkcs1Sha256(message)
-        if (!signed.ok || !public.verifyPkcs1Sha256(message, signed.bytes)) return 6
+        if (!signed.ok) return fail(6, "signing: ${signed.error}")
+        if (!public.verifyPkcs1Sha256(message, signed.bytes)) return fail(6,
+            "the signature does not verify")
         val encrypted = public.encryptOaepSha256(message)
-        if (!encrypted.ok) return 7
+        if (!encrypted.ok) return fail(7, "OAEP encryption: ${encrypted.error}")
         val decrypted = key.decryptOaepSha256(encrypted.bytes)
-        if (!decrypted.ok || decrypted.bytes != message) return 8
-        if (!path(processArgument(1)).writeText(pem.bytes)) return 9
+        if (!decrypted.ok) return fail(8, "OAEP decryption: ${decrypted.error}")
+        if (decrypted.bytes != message) return fail(8, "the decrypted message differs")
+        if (!path(processArgument(1)).writeText(pem.bytes)) return fail(9, "writing the PEM")
         0
     }
 }

@@ -14,6 +14,7 @@ cp "$root/tests/cases/rsa-keygen/primality.ab" "$out/primality.ab"
 "$out/primality"
 "$compiler" build "$root/tests/cases/rsa-keygen/main.ab" -o "$out/test" --fast --no-cache
 "$out/test" invalid
+"$out/test" tail
 sizes=(2048)
 if [[ ${ABLA_RSA_SLOW_TESTS:-0} == 1 ]]; then sizes+=(3072 4096); fi
 for bits in "${sizes[@]}"; do
