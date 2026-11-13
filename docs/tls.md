@@ -25,7 +25,7 @@ an empty read with an empty `tlsLastError`; a timed-out read can be repeated; a 
 | Certificates | X.509 chains to the system trust store or a CA file, with name, validity, key-usage, basic-constraints, name-constraints and signature checks (`abla/crypto/x509`); client certificates (RSA, P-256, Ed25519) from PEM (PKCS#8, PKCS#1, SEC1, encrypted PKCS#8) or PKCS#12 (PBES2) |
 | Other | ALPN, SNI, KeyUpdate, close_notify, middlebox-compatibility ChangeCipherSpec, the TLS 1.3 downgrade sentinel, deadlines |
 
-The system trust store is `NIX_SSL_CERT_FILE` or `SSL_CERT_FILE` if set, else `SSL_CERT_DIR` if set, else the first
+The system trust store is `NIX_SSL_CERT_FILE` or `SSL_CERT_FILE` if set, else `SSL_CERT_DIR` if set (a variable that is set is the whole trust, see below), else the first
 bundle found among the usual system locations; it is read when the server's certificate arrives, not when the
 connection starts.
 
@@ -49,6 +49,27 @@ and works); RSA keys under 2048 bits for PSS verification.
   build and about 300 ms in a `--fast` build; ECDSA and Ed25519 are far cheaper. Parsing a system bundle of 145
   certificates takes about 6 ms in a release build and 90 ms in a `--fast` build.
 - Server side: one certificate, no SNI selection.
+
+## Together with `abla/tls/hosted`
+
+`abla/http/tls`, `abla/websocket/tls` and the Xtensa installer import `abla/tls/pure` under an alias, so a program
+that imports `abla/tls/hosted` itself (for OpenSSL's handles and internals: `tlsControlPointer`, `tlsAllocateConnection`,
+`TlsConnection(handle)` views of a handle, as NovaKind's abla-s3 and abla-postgres do) and also imports `abla/http` compiles
+and runs: the two modules' public names do not collide, because the pure ones are reached through the alias inside the
+stdlib. A program that imports `abla/tls/pure` directly and `abla/tls/hosted` in the same program gets a name clash and
+must alias one of them. (A type that the stdlib hands out, such as `TlsWebSocketConnection.stream`, is the pure module's
+`TlsConnection`.)
+
+## Checks that refuse by default
+
+- An empty host name is refused (`TLS failed at configuration`) by `tlsConnect*` and `tlsUpgrade*`, and by the verifier
+  (`tlsVerifyServerCertificate` takes `allowAnyHost = true` for the caller that really wants a certificate for any name):
+  `abla/crypto/x509` reads an empty name as "do not check the name".
+- A handshake message is capped by its type as soon as its four-byte header arrives, before the body is buffered: hellos
+  at 2^17 bytes, a Certificate at 2^16, anything else at 2^14; a peer that declares more is sent `illegal_parameter`.
+  Fragments are joined once, when a message is whole.
+- If `NIX_SSL_CERT_FILE`, `SSL_CERT_FILE` or `SSL_CERT_DIR` is set, it is the whole trust: a missing file or one with no
+  certificate gives a store in which nothing verifies, not the system bundle.
 
 ## Layers
 
