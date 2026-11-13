@@ -3,6 +3,7 @@
 # under qemu and on Wasm under Node, and compiled for Xtensa; and every message length from 0 to 200 (and a few
 # longer) against Node's ChaCha20-Poly1305 and ChaCha20 (OpenSSL), sealing, opening, refusing a changed tag and the
 # raw stream at a random counter. What is read of the code is in tools/test-ct.sh.
+# Wycheproof's chacha20_poly1305_test.json (tests/vectors/crypto/wycheproof) is checked too.
 # CHACHA_ROUNDS sets the random rounds of the peer check (default 2).
 set -uo pipefail
 
@@ -20,7 +21,7 @@ status=0
 fail() { echo "FAIL $*"; status=1; }
 
 pids=()
-programs=(vectors tool)
+programs=(vectors tool wycheproof)
 for program in "${programs[@]}"; do
     "$compiler" build "$cases/$program.ab" -o "$out/$program" --no-cache > "$out/$program.build.log" 2>&1 &
     pids+=("$!")
@@ -33,6 +34,12 @@ if "$out/vectors" > "$out/vectors.log" 2>&1; then
     echo "ok   vectors: $(cat "$out/vectors.log")"
 else
     fail vectors; cat "$out/vectors.log"
+fi
+
+if "$out/wycheproof" tests/vectors/crypto > "$out/wycheproof.log" 2>&1; then
+    echo "ok   $(cat "$out/wycheproof.log")"
+else
+    fail wycheproof; tail -20 "$out/wycheproof.log"
 fi
 
 if node "$cases/peer.mjs" "$out/tool" "$rounds" > "$out/peer.log" 2>&1; then
