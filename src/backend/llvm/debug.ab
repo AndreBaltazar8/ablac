@@ -1466,6 +1466,117 @@ fun bootstrapLlvmEmitFramePointerWalk(
     return
 }
 
+// The stack on macOS without libSystem's backtrace (#811 group 6): the same frame-pointer
+// walk as Linux's, reading each frame record (saved frame pointer, return address) directly.
+// arm64 and x86-64 both lay the record out so, and a debug build keeps the frame pointer in
+// every function. A frame is read only when it is aligned and lies between this function's
+// frame and the stack top main recorded; the chain ends at a null or non-rising frame pointer
+// and after 64 frames. The executable's load address is the Mach header, the linker's
+// _mh_execute_header (Mach-O symbol __mh_execute_header) (atos -o <program> -l <load address> <address>). UNVERIFIED on macOS: that
+// symbol, that the chain ends in a null frame pointer, and that a thread other than main's
+// stops at the first frame outside [this frame, main's stack top).
+fun bootstrapLlvmEmitDarwinFramePointerWalk(
+    backend: BootstrapLlvmBackend,
+    printStack: i64*
+): void {
+    val i64 = backend.i64Type
+    bootstrapLlvmDebugWrite(
+        backend,
+        "stack (return addresses: atos -o <program> -l <load address> gives file:line):\n",
+        "abla.stack.header"
+    )
+    val frame = bootstrapLlvmStackGuardCall(
+        backend, "llvm.frameaddress.p0", backend.pointerType,
+        [backend.i32Type], [LLVMConstInt(backend.i32Type, 0, 0)]
+    )
+    val first = LLVMBuildPtrToInt(backend.builder, frame, i64, "")
+    val stackTop = LLVMGetNamedGlobal(backend.module, "abla_runtime_stack_top")
+    val cursor = LLVMBuildAlloca(backend.builder, i64, "fp")
+    LLVMBuildStore(backend.builder, first, cursor)
+    val counter = LLVMBuildAlloca(backend.builder, i64, "n")
+    LLVMBuildStore(backend.builder, LLVMConstInt(i64, 0, 0), counter)
+    val loop = LLVMAppendBasicBlockInContext(backend.context, printStack, "walk")
+    val read = LLVMAppendBasicBlockInContext(backend.context, printStack, "read")
+    val show = LLVMAppendBasicBlockInContext(backend.context, printStack, "show")
+    val done = LLVMAppendBasicBlockInContext(backend.context, printStack, "walked")
+    LLVMBuildBr(backend.builder, loop)
+    LLVMPositionBuilderAtEnd(backend.builder, loop)
+    val count = LLVMBuildLoad2(backend.builder, i64, counter, "")
+    val current = LLVMBuildLoad2(backend.builder, i64, cursor, "")
+    // ULT (36), NE (33), EQ (32).
+    var ok = LLVMBuildAnd(
+        backend.builder,
+        LLVMBuildICmp(backend.builder, 36, count, LLVMConstInt(i64, 64, 0), ""),
+        LLVMBuildICmp(
+            backend.builder, 32,
+            LLVMBuildAnd(backend.builder, current, LLVMConstInt(i64, 7, 0), ""),
+            LLVMConstInt(i64, 0, 0), ""
+        ),
+        ""
+    )
+    ok = LLVMBuildAnd(
+        backend.builder, ok,
+        LLVMBuildICmp(backend.builder, 33, current, LLVMConstInt(i64, 0, 0), ""), ""
+    )
+    if (!pointerIsNull(stackTop)) {
+        val top = LLVMBuildLoad2(backend.builder, i64, stackTop, "")
+        ok = LLVMBuildAnd(
+            backend.builder, ok,
+            LLVMBuildICmp(
+                backend.builder, 36, LLVMBuildSub(backend.builder, current, first, ""),
+                LLVMBuildSub(backend.builder, top, first, ""), ""
+            ),
+            ""
+        )
+    } else {
+        // Without the recorded top only this frame itself is known to be readable.
+        ok = LLVMBuildAnd(
+            backend.builder, ok,
+            LLVMBuildICmp(backend.builder, 32, count, LLVMConstInt(i64, 0, 0), ""), ""
+        )
+    }
+    LLVMBuildCondBr(backend.builder, ok, read, done)
+    LLVMPositionBuilderAtEnd(backend.builder, read)
+    val next = LLVMBuildLoad2(
+        backend.builder, i64, LLVMBuildIntToPtr(backend.builder, current, backend.pointerType, ""), ""
+    )
+    val returnAddress = LLVMBuildLoad2(
+        backend.builder, i64,
+        LLVMBuildIntToPtr(
+            backend.builder, LLVMBuildAdd(backend.builder, current, LLVMConstInt(i64, 8, 0), ""),
+            backend.pointerType, ""
+        ),
+        ""
+    )
+    LLVMBuildCondBr(
+        backend.builder,
+        LLVMBuildICmp(backend.builder, 33, returnAddress, LLVMConstInt(i64, 0, 0), ""),
+        show, done
+    )
+    LLVMPositionBuilderAtEnd(backend.builder, show)
+    // The return address less one falls inside the call.
+    bootstrapLlvmDebugWriteHex(
+        backend, LLVMBuildSub(backend.builder, returnAddress, LLVMConstInt(i64, 1, 0), "")
+    )
+    bootstrapLlvmDebugWrite(backend, "\n", "abla.stack.end")
+    LLVMBuildStore(
+        backend.builder, LLVMBuildAdd(backend.builder, count, LLVMConstInt(i64, 1, 0), ""),
+        counter
+    )
+    LLVMBuildStore(backend.builder, next, cursor)
+    // Keep going only while the chain moves up (ULE (37): next <= current stops).
+    LLVMBuildCondBr(
+        backend.builder, LLVMBuildICmp(backend.builder, 37, next, current, ""), done, loop
+    )
+    LLVMPositionBuilderAtEnd(backend.builder, done)
+    bootstrapLlvmDebugWrite(backend, "load address ", "abla.stack.load")
+    var base = LLVMGetNamedGlobal(backend.module, "_mh_execute_header")
+    if (pointerIsNull(base)) base = LLVMAddGlobal(backend.module, backend.i8Type, "_mh_execute_header")
+    bootstrapLlvmDebugWriteHex(backend, LLVMBuildPtrToInt(backend.builder, base, i64, ""))
+    bootstrapLlvmDebugWrite(backend, "\n", "abla.stack.end")
+    return
+}
+
 // Defines abla_runtime_print_stack (when the program calls it or a debug
 // build needs it) and, in a debug build of a hosted executable,
 // abla_runtime_fault. Runs after every other body is emitted.
@@ -1490,6 +1601,8 @@ fun bootstrapLlvmEmitDebugRuntime(backend: BootstrapLlvmBackend): void {
         )
         if (hosted && bootstrapLlvmStackGuardKernel(backend)) {
             bootstrapLlvmEmitFramePointerWalk(backend, printStack)
+        } else if (hosted && bootstrapLlvmFaultDarwin(backend)) {
+            bootstrapLlvmEmitDarwinFramePointerWalk(backend, printStack)
         } else if (hosted) {
             val framesType = LLVMArrayType2(backend.pointerType, 64)
             val frames = LLVMBuildAlloca(backend.builder, framesType, "frames")

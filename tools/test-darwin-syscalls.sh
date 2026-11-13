@@ -58,6 +58,18 @@ for flags in "" "-g"; do
             echo "darwin syscalls: fault report$flags: no 'fatal signal' line: $(head -3 "$out/stack-segv.err")" >&2; failed=1
         fi
     fi
+    # A debug build's stack report (the frame-pointer walk, no libSystem backtrace on macOS):
+    # a header, return addresses as 0x and sixteen hex digits (the overflowed recursion gives
+    # many), and the load address.
+    if [[ -n $flags ]]; then
+        frames=$(grep -c '^0x[0-9a-f]\{16\}$' "$out/stack-overflow.err")
+        if [[ $frames -ge 3 ]] && grep -q '^stack (' "$out/stack-overflow.err" &&
+            grep -q '^load address 0x[0-9a-f]\{16\}$' "$out/stack-overflow.err"; then
+            echo "fault backtrace$flags: ok ($frames frames)"
+        else
+            echo "darwin syscalls: backtrace$flags: $frames frames, no header or load address: $(head -4 "$out/stack-overflow.err")" >&2; failed=1
+        fi
+    fi
 done
 [[ $failed -eq 0 ]] || exit 1
 echo 'darwin syscalls: every call agrees'
