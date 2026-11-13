@@ -1,0 +1,429 @@
+// ChaCha20, Poly1305 and the ChaCha20-Poly1305 AEAD of RFC 8439, in Abla, with no OpenSSL and no table: the
+// cipher is add, rotate and xor on 32-bit words; the authenticator is 26-bit limbs in 64-bit products, its final
+// reduction a mask, not a branch. Neither has a secret-dependent branch or memory index, which tools/test-ct.sh
+// reads in the generated code (the region between BEGIN and END below). Lengths, counters and the number of
+// blocks are public. Open checks the tag, in constant time, before any plaintext exists.
+
+import "abla/crypto/alloc"
+import "abla/ct"
+import "abla/ct/scrub"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+import "abla/unsafe/mmio"
+export import "abla/crypto/result"
+
+// --- Memory: raw words and bytes, little-endian whatever the target ----------------------------
+@inline trusted fun ccPointer(address: int): i64* =
+    ablaUnsafePointerOffset(ablaUnsafeNullPointer(), address)
+
+@inline trusted fun ccLoad(address: int): secretU32 =
+    secretU32(u32(ablaUnsafeLoadU32(ccPointer(address))))
+
+@inline trusted fun ccStore(address: int, value: secretU32): void =
+    ablaUnsafeStoreU32(ccPointer(address), int(value.declassify()))
+
+@inline trusted fun ccLoadBytes(address: int): secretU32 {
+    val b0 = u32(ablaUnsafeLoadU8(ccPointer(address)))
+    val b1 = u32(ablaUnsafeLoadU8(ccPointer(address + 1)))
+    val b2 = u32(ablaUnsafeLoadU8(ccPointer(address + 2)))
+    val b3 = u32(ablaUnsafeLoadU8(ccPointer(address + 3)))
+    secretU32(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
+}
+
+@inline trusted fun ccStoreBytes(address: int, value: secretU32): void {
+    val bits = value.declassify()
+    ablaUnsafeStoreU8(ccPointer(address), int(bits & u32(255)))
+    ablaUnsafeStoreU8(ccPointer(address + 1), int((bits >> 8) & u32(255)))
+    ablaUnsafeStoreU8(ccPointer(address + 2), int((bits >> 16) & u32(255)))
+    ablaUnsafeStoreU8(ccPointer(address + 3), int(bits >> 24))
+}
+
+trusted fun ccWipe(address: int, size: int): void {
+    for (at in 0 until size) ablaUnsafeVolatileStoreU8(address + at, 0)
+}
+
+// BEGIN CHACHA20 POLY1305 SECRET CORES
+// The Body functions are inlined into whatever calls them: the fixtures read them as written, on every target, and the
+// out-of-line wrappers after END are what the AEAD calls.
+// What touches a key or a message, in functions of plain integers (addresses, counts and public flags) that call
+// nothing but each other and allocate nothing: tools/test-ct.sh reads this region as written, in a module of its
+// own. What allocates is below, given the memory these work in.
+
+// ChaCha20 state, 16 words at `state`: the constants, the key (8), the block counter, the nonce (3).
+// `work` is 64 bytes the block's keystream is left in.
+private @inline trusted fun ccQuarter(x: int, a: int, b: int, c: int, d: int): void {
+    var va = ccLoad(x + a * 4)
+    var vb = ccLoad(x + b * 4)
+    var vc = ccLoad(x + c * 4)
+    var vd = ccLoad(x + d * 4)
+    va = va + vb
+    vd = (vd ^ va).rotl(16)
+    vc = vc + vd
+    vb = (vb ^ vc).rotl(12)
+    va = va + vb
+    vd = (vd ^ va).rotl(8)
+    vc = vc + vd
+    vb = (vb ^ vc).rotl(7)
+    ccStore(x + a * 4, va)
+    ccStore(x + b * 4, vb)
+    ccStore(x + c * 4, vc)
+    ccStore(x + d * 4, vd)
+}
+
+/** The state of the key, nonce and first block counter: `key` and `nonce` are 32 and 12 bytes. */
+private @inline trusted fun ccSetStateBody(state: int, key: int, counter: int, nonce: int): void {
+    ccStore(state, secretU32(u32(1634760805)))
+    ccStore(state + 4, secretU32(u32(857760878)))
+    ccStore(state + 8, secretU32(u32(2036477234)))
+    ccStore(state + 12, secretU32(u32(1797285236)))
+    for (i in 0 until 8) ccStore(state + 16 + i * 4, ccLoadBytes(key + i * 4))
+    ccStore(state + 48, secretU32(u32(counter)))
+    for (i in 0 until 3) ccStore(state + 52 + i * 4, ccLoadBytes(nonce + i * 4))
+}
+
+/** One block: 20 rounds on a copy of the state, the state added back, as 64 little-endian bytes in `work`. */
+private @inline trusted fun ccBlockBody(state: int, work: int): void {
+    for (i in 0 until 16) ccStore(work + i * 4, ccLoad(state + i * 4))
+    for (round in 0 until 10) {
+        ccQuarter(work, 0, 4, 8, 12)
+        ccQuarter(work, 1, 5, 9, 13)
+        ccQuarter(work, 2, 6, 10, 14)
+        ccQuarter(work, 3, 7, 11, 15)
+        ccQuarter(work, 0, 5, 10, 15)
+        ccQuarter(work, 1, 6, 11, 12)
+        ccQuarter(work, 2, 7, 8, 13)
+        ccQuarter(work, 3, 4, 9, 14)
+    }
+    for (i in 0 until 16) ccStoreBytes(work + i * 4, ccLoad(work + i * 4) + ccLoad(state + i * 4))
+}
+
+/** `size` bytes of `input` xor the keystream from the state's counter on, into `output` (the same memory is fine).
+ *  The counter advances once per block begun. */
+private @inline trusted fun ccXorBody(state: int, input: int, output: int, size: int, work: int): void {
+    var at = 0
+    while (at < size) {
+        ccBlockBody(state, work)
+        ccStore(state + 48, ccLoad(state + 48) + secretU32(u32(1)))
+        val take = if (size - at < 64) size - at else 64
+        for (i in 0 until take) {
+            ablaUnsafeStoreU8(
+                ccPointer(output + at + i),
+                ablaUnsafeLoadU8(ccPointer(input + at + i)) ^ ablaUnsafeLoadU8(ccPointer(work + i))
+            )
+        }
+        at = at + take
+    }
+}
+
+// Poly1305, state at `p`: the accumulator h (5 limbs of 26 bits), the clamped r (5 limbs), s (4 words): 56 bytes.
+private @inline trusted fun polyLimb(p: int, index: int): secretU64 = ccLoad(p + index * 4).widen()
+
+private val POLY_MASK = 67108863
+
+private @inline trusted fun polyInitBody(p: int, key: int): void {
+    val t0 = ccLoadBytes(key)
+    val t1 = ccLoadBytes(key + 4)
+    val t2 = ccLoadBytes(key + 8)
+    val t3 = ccLoadBytes(key + 12)
+    val mask = secretU32(u32(POLY_MASK))
+    for (i in 0 until 5) ccStore(p + i * 4, secretU32(u32(0)))
+    ccStore(p + 20, t0 & mask)
+    ccStore(p + 24, ((t0 >> 26) | (t1 << 6)) & secretU32(u32(67108611)))
+    ccStore(p + 28, ((t1 >> 20) | (t2 << 12)) & secretU32(u32(67092735)))
+    ccStore(p + 32, ((t2 >> 14) | (t3 << 18)) & secretU32(u32(66076671)))
+    ccStore(p + 36, (t3 >> 8) & secretU32(u32(1048575)))
+    for (i in 0 until 4) ccStore(p + 40 + i * 4, ccLoadBytes(key + 16 + i * 4))
+}
+
+/** `count` whole 16-byte blocks of `m` into the accumulator; `hibit` is 16777216 for a message block and 0 for
+ *  the padded last block of a message that ends mid-block. */
+private @inline trusted fun polyBlocksBody(p: int, m: int, count: int, hibit: int): void {
+    val mask = secretU32(u32(POLY_MASK))
+    val r0 = polyLimb(p, 5)
+    val r1 = polyLimb(p, 6)
+    val r2 = polyLimb(p, 7)
+    val r3 = polyLimb(p, 8)
+    val r4 = polyLimb(p, 9)
+    val five = secretU64(u64(5))
+    val s1 = r1 * five
+    val s2 = r2 * five
+    val s3 = r3 * five
+    val s4 = r4 * five
+    for (block in 0 until count) {
+        val at = m + block * 16
+        val t0 = ccLoadBytes(at)
+        val t1 = ccLoadBytes(at + 4)
+        val t2 = ccLoadBytes(at + 8)
+        val t3 = ccLoadBytes(at + 12)
+        val h0 = (ccLoad(p) + (t0 & mask)).widen()
+        val h1 = (ccLoad(p + 4) + (((t0 >> 26) | (t1 << 6)) & mask)).widen()
+        val h2 = (ccLoad(p + 8) + (((t1 >> 20) | (t2 << 12)) & mask)).widen()
+        val h3 = (ccLoad(p + 12) + (((t2 >> 14) | (t3 << 18)) & mask)).widen()
+        val h4 = (ccLoad(p + 16) + ((t3 >> 8) | secretU32(u32(hibit)))).widen()
+        var d0 = h0 * r0 + h1 * s4 + h2 * s3 + h3 * s2 + h4 * s1
+        var d1 = h0 * r1 + h1 * r0 + h2 * s4 + h3 * s3 + h4 * s2
+        var d2 = h0 * r2 + h1 * r1 + h2 * r0 + h3 * s4 + h4 * s3
+        var d3 = h0 * r3 + h1 * r2 + h2 * r1 + h3 * r0 + h4 * s4
+        var d4 = h0 * r4 + h1 * r3 + h2 * r2 + h3 * r1 + h4 * r0
+        val m64 = secretU64(u64(POLY_MASK))
+        var c = d0 >> 26
+        d0 = d0 & m64
+        d1 = d1 + c
+        c = d1 >> 26
+        d1 = d1 & m64
+        d2 = d2 + c
+        c = d2 >> 26
+        d2 = d2 & m64
+        d3 = d3 + c
+        c = d3 >> 26
+        d3 = d3 & m64
+        d4 = d4 + c
+        c = d4 >> 26
+        d4 = d4 & m64
+        d0 = d0 + c * five
+        c = d0 >> 26
+        d0 = d0 & m64
+        d1 = d1 + c
+        ccStore(p, d0.low())
+        ccStore(p + 4, d1.low())
+        ccStore(p + 8, d2.low())
+        ccStore(p + 12, d3.low())
+        ccStore(p + 16, d4.low())
+    }
+}
+
+/** The bytes of `m` (`size` of them, fewer than 16, public) as one last block into `buffer` (16 bytes): zero padded
+ *  and counted as a whole block when `pad16`; otherwise a 1 byte after them and no high bit (RFC 8439 §2.5). */
+private @inline trusted fun polyTailBody(p: int, m: int, size: int, buffer: int, pad16: bool): void {
+    for (i in 0 until 16) ablaUnsafeStoreU8(ccPointer(buffer + i), 0)
+    for (i in 0 until size) ablaUnsafeStoreU8(ccPointer(buffer + i), ablaUnsafeLoadU8(ccPointer(m + i)))
+    if (pad16) polyBlocksBody(p, buffer, 1, 16777216)
+    else {
+        ablaUnsafeStoreU8(ccPointer(buffer + size), 1)
+        polyBlocksBody(p, buffer, 1, 0)
+    }
+}
+
+/** Every byte of `m`: whole blocks, then the tail if there is one. */
+private @inline trusted fun polyUpdateBody(p: int, m: int, size: int, buffer: int, pad16: bool): void {
+    val whole = size / 16
+    polyBlocksBody(p, m, whole, 16777216)
+    if (size % 16 != 0) polyTailBody(p, m + whole * 16, size % 16, buffer, pad16)
+}
+
+/** The tag: the accumulator reduced fully (the subtraction of 2^130 - 5 chosen by a mask), plus s, 16 bytes. */
+private @inline trusted fun polyFinishBody(p: int, tag: int): void {
+    val mask = secretU32(u32(POLY_MASK))
+    var h0 = ccLoad(p)
+    var h1 = ccLoad(p + 4)
+    var h2 = ccLoad(p + 8)
+    var h3 = ccLoad(p + 12)
+    var h4 = ccLoad(p + 16)
+    var c = h1 >> 26
+    h1 = h1 & mask
+    h2 = h2 + c
+    c = h2 >> 26
+    h2 = h2 & mask
+    h3 = h3 + c
+    c = h3 >> 26
+    h3 = h3 & mask
+    h4 = h4 + c
+    c = h4 >> 26
+    h4 = h4 & mask
+    h0 = h0 + c * secretU32(u32(5))
+    c = h0 >> 26
+    h0 = h0 & mask
+    h1 = h1 + c
+    // g = h + 5 - 2^130: if it didn't borrow, h >= 2^130 - 5 and g is the reduced value.
+    var g0 = h0 + secretU32(u32(5))
+    c = g0 >> 26
+    g0 = g0 & mask
+    var g1 = h1 + c
+    c = g1 >> 26
+    g1 = g1 & mask
+    var g2 = h2 + c
+    c = g2 >> 26
+    g2 = g2 & mask
+    var g3 = h3 + c
+    c = g3 >> 26
+    g3 = g3 & mask
+    val g4 = h4 + c - secretU32(u32(67108864))
+    val keepG = (g4 >> 31) - secretU32(u32(1))
+    val keepH = ~keepG
+    h0 = (h0 & keepH) | (g0 & keepG)
+    h1 = (h1 & keepH) | (g1 & keepG)
+    h2 = (h2 & keepH) | (g2 & keepG)
+    h3 = (h3 & keepH) | (g3 & keepG)
+    h4 = (h4 & keepH) | (g4 & keepG)
+    // h mod 2^128, then plus s.
+    val w0 = (h0 | (h1 << 26)).widen()
+    val w1 = ((h1 >> 6) | (h2 << 20)).widen()
+    val w2 = ((h2 >> 12) | (h3 << 14)).widen()
+    val w3 = ((h3 >> 18) | (h4 << 8)).widen()
+    var f = w0 + polyLimb(p, 10)
+    ccStoreBytes(tag, f.low())
+    f = w1 + polyLimb(p, 11) + (f >> 32)
+    ccStoreBytes(tag + 4, f.low())
+    f = w2 + polyLimb(p, 12) + (f >> 32)
+    ccStoreBytes(tag + 8, f.low())
+    f = w3 + polyLimb(p, 13) + (f >> 32)
+    ccStoreBytes(tag + 12, f.low())
+}
+// END CHACHA20 POLY1305 SECRET CORES
+
+private @noinline trusted fun ccSetState(state: int, key: int, counter: int, nonce: int): void =
+    ccSetStateBody(state, key, counter, nonce)
+private @noinline trusted fun ccBlock(state: int, work: int): void = ccBlockBody(state, work)
+private @noinline trusted fun ccXor(state: int, input: int, output: int, size: int, work: int): void =
+    ccXorBody(state, input, output, size, work)
+private @noinline trusted fun polyInit(p: int, key: int): void = polyInitBody(p, key)
+private @noinline trusted fun polyBlocks(p: int, m: int, count: int, hibit: int): void =
+    polyBlocksBody(p, m, count, hibit)
+private @noinline trusted fun polyUpdate(p: int, m: int, size: int, buffer: int, pad16: bool): void =
+    polyUpdateBody(p, m, size, buffer, pad16)
+private @noinline trusted fun polyFinish(p: int, tag: int): void = polyFinishBody(p, tag)
+
+// --- The AEAD's memory: allocated and wiped here, around the cores ----------------------------
+// One block of memory per call: the ChaCha state (64), the keystream (64), Poly1305's state (56 and 8 spare),
+// a 16-byte block buffer, the tag (16) and the length block (16).
+private val CC_STATE = 0
+private val CC_WORK = 64
+private val CC_POLY = 128
+private val CC_BUFFER = 192
+private val CC_TAG = 208
+private val CC_LENGTHS = 224
+private val CC_MEMORY = 240
+
+private @noinline trusted fun ccStoreLength(address: int, count: int): void {
+    for (i in 0 until 8) ablaUnsafeStoreU8(ccPointer(address + i), (count >> (i * 8)) & 255)
+}
+
+/** The Poly1305 tag of RFC 8439 §2.8 over `aad` and the ciphertext at `text`, into `memory + CC_TAG`. The one-time
+ *  key is the first 32 bytes of the block at counter 0, which `state` has when this is called; the state's counter
+ *  is left at 1. */
+private @noinline trusted fun ccAeadTag(memory: int, aad: int, aadSize: int, text: int, textSize: int): void {
+    ccBlock(memory + CC_STATE, memory + CC_WORK)
+    polyInit(memory + CC_POLY, memory + CC_WORK)
+    ccStore(memory + CC_STATE + 48, ccLoad(memory + CC_STATE + 48) + secretU32(u32(1)))
+    polyUpdate(memory + CC_POLY, aad, aadSize, memory + CC_BUFFER, true)
+    polyUpdate(memory + CC_POLY, text, textSize, memory + CC_BUFFER, true)
+    ccStoreLength(memory + CC_LENGTHS, aadSize)
+    ccStoreLength(memory + CC_LENGTHS + 8, textSize)
+    polyBlocks(memory + CC_POLY, memory + CC_LENGTHS, 1, 16777216)
+    polyFinish(memory + CC_POLY, memory + CC_TAG)
+}
+
+private fun ccKeyError(key: string, nonce: string): string =
+    if (key.size != 32) "a ChaCha20 key has 32 bytes"
+    else if (nonce.size != 12) "a ChaCha20 nonce has 12 bytes"
+    else ""
+
+private val CC_MAX_SIZE = 274877906880 // 64 * (2^32 - 1) - 64: the block counter must not wrap (RFC 8439 §2.8).
+
+/** RFC 8439 §2.8's AEAD: the ciphertext and then the 16-byte tag. */
+trusted fun chaCha20Poly1305Seal(key: string, nonce: string, plaintext: string,
+    associatedData: string = ""): CryptoResult {
+    val result = chaCha20Poly1305SealWork(key, nonce, plaintext, associatedData)
+    ctScrubStack2048()
+    return result
+}
+
+private @noinline trusted fun chaCha20Poly1305SealWork(key: string, nonce: string, plaintext: string,
+    associatedData: string): CryptoResult {
+    val keyError = ccKeyError(key, nonce)
+    if (keyError != "") return cryptoFailed(keyError)
+    if (plaintext.size > CC_MAX_SIZE) return cryptoFailed("the plaintext is too long for one nonce")
+    val memory = cryptoAllocate(CC_MEMORY)
+    ccSetState(memory + CC_STATE, ablaUnsafeStringAddress(key), 0, ablaUnsafeStringAddress(nonce))
+    val buffer = nativeByteBuffer(plaintext.size + 17)
+    val address = ablaUnsafePointerAddress(buffer.pointerAt(0))
+    // The text is encrypted from counter 1; the tag's key is the block at counter 0, so the counter goes back.
+    ccStore(memory + CC_STATE + 48, secretU32(u32(1)))
+    ccXor(memory + CC_STATE, ablaUnsafeStringAddress(plaintext), address, plaintext.size, memory + CC_WORK)
+    ccStore(memory + CC_STATE + 48, secretU32(u32(0)))
+    ccAeadTag(memory, ablaUnsafeStringAddress(associatedData), associatedData.size, address, plaintext.size)
+    ablaUnsafeCopyMemory(address + plaintext.size, memory + CC_TAG, 16)
+    ccWipe(memory, CC_MEMORY)
+    ablaUnsafeFree(ccPointer(memory))
+    CryptoResult(buffer.adoptString(plaintext.size + 16), true, "")
+}
+
+/** Opens what Seal made: the plaintext, or a failure that says nothing of which part was wrong. */
+trusted fun chaCha20Poly1305Open(key: string, nonce: string, sealed: string,
+    associatedData: string = ""): CryptoResult {
+    val result = chaCha20Poly1305OpenWork(key, nonce, sealed, associatedData)
+    ctScrubStack2048()
+    return result
+}
+
+private @noinline trusted fun chaCha20Poly1305OpenWork(key: string, nonce: string, sealed: string,
+    associatedData: string): CryptoResult {
+    val keyError = ccKeyError(key, nonce)
+    if (keyError != "") return cryptoFailed(keyError)
+    if (sealed.size < 16) return cryptoFailed("the ciphertext is shorter than its tag")
+    val size = sealed.size - 16
+    if (size > CC_MAX_SIZE) return cryptoFailed("the ciphertext is too long for one nonce")
+    val memory = cryptoAllocate(CC_MEMORY)
+    ccSetState(memory + CC_STATE, ablaUnsafeStringAddress(key), 0, ablaUnsafeStringAddress(nonce))
+    val input = ablaUnsafeStringAddress(sealed)
+    ccAeadTag(memory, ablaUnsafeStringAddress(associatedData), associatedData.size, input, size)
+    // The tag is checked before any plaintext exists, and in constant time.
+    val different = ctDifferenceAddress(memory + CC_TAG, input + size, 16).declassify()
+    if (different != u8(0)) {
+        ccWipe(memory, CC_MEMORY)
+        ablaUnsafeFree(ccPointer(memory))
+        return cryptoFailed("authentication failed: the data, key, nonce or associated data is wrong")
+    }
+    val buffer = nativeByteBuffer(size + 1)
+    val address = ablaUnsafePointerAddress(buffer.pointerAt(0))
+    ccXor(memory + CC_STATE, input, address, size, memory + CC_WORK)
+    ccWipe(memory, CC_MEMORY)
+    ablaUnsafeFree(ccPointer(memory))
+    CryptoResult(buffer.adoptString(size), true, "")
+}
+
+// --- The pieces alone, for protocols that build on them (and for RFC 8439's own vectors) ---------
+
+/** ChaCha20 (RFC 8439 §2.4): `data` xor the keystream, block counter `counter` for the first block. */
+trusted fun chaCha20Xor(key: string, counter: int, nonce: string, data: string): CryptoResult {
+    val result = chaCha20XorWork(key, counter, nonce, data)
+    ctScrubStack2048()
+    return result
+}
+
+private @noinline trusted fun chaCha20XorWork(key: string, counter: int, nonce: string, data: string): CryptoResult {
+    val keyError = ccKeyError(key, nonce)
+    if (keyError != "") return cryptoFailed(keyError)
+    if (counter < 0 || counter > 4294967295) return cryptoFailed("the block counter is 32 bits")
+    if (data.size > CC_MAX_SIZE || (data.size + 63) / 64 + counter > 4294967296) {
+        return cryptoFailed("the data is too long for the counter")
+    }
+    val memory = cryptoAllocate(CC_MEMORY)
+    ccSetState(memory + CC_STATE, ablaUnsafeStringAddress(key), counter, ablaUnsafeStringAddress(nonce))
+    val buffer = nativeByteBuffer(data.size + 1)
+    val address = ablaUnsafePointerAddress(buffer.pointerAt(0))
+    ccXor(memory + CC_STATE, ablaUnsafeStringAddress(data), address, data.size, memory + CC_WORK)
+    ccWipe(memory, CC_MEMORY)
+    ablaUnsafeFree(ccPointer(memory))
+    CryptoResult(buffer.adoptString(data.size), true, "")
+}
+
+/** Poly1305 (RFC 8439 §2.5): the 16-byte tag of `message` under the 32-byte one-time `key`. */
+trusted fun poly1305(key: string, message: string): CryptoResult {
+    val result = poly1305Work(key, message)
+    ctScrubStack2048()
+    return result
+}
+
+private @noinline trusted fun poly1305Work(key: string, message: string): CryptoResult {
+    if (key.size != 32) return cryptoFailed("a Poly1305 key has 32 bytes")
+    val memory = cryptoAllocate(CC_MEMORY)
+    polyInit(memory + CC_POLY, ablaUnsafeStringAddress(key))
+    polyUpdate(memory + CC_POLY, ablaUnsafeStringAddress(message), message.size, memory + CC_BUFFER, false)
+    polyFinish(memory + CC_POLY, memory + CC_TAG)
+    val buffer = nativeByteBuffer(17)
+    ablaUnsafeCopyMemory(ablaUnsafePointerAddress(buffer.pointerAt(0)), memory + CC_TAG, 16)
+    ccWipe(memory, CC_MEMORY)
+    ablaUnsafeFree(ccPointer(memory))
+    CryptoResult(buffer.adoptString(16), true, "")
+}

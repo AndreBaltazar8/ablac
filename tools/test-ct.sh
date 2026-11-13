@@ -30,6 +30,7 @@ sed -n '/^\/\/ BEGIN ED25519 SECRET CORE$/,/^\/\/ END ED25519 SECRET CORE$/p' st
 # No production edits or call exemptions: see generator's scope guards.
 # The AES functions that touch a key, as written (their allocating wrappers stay outside, see the generator).
 sed -n '/^\/\/ BEGIN AES KEY EXPANSION$/,/^\/\/ END AES KEY EXPANSION$/p' stdlib/abla/crypto/aes/entry.ab >> "$cases/fixture.ab"
+sed -n '/^\/\/ BEGIN CHACHA20 POLY1305 SECRET CORES$/,/^\/\/ END CHACHA20 POLY1305 SECRET CORES$/p' stdlib/abla/crypto/chacha20poly1305/entry.ab >> "$cases/fixture.ab"
 python3 "$cases/crypto-source-fixtures.py" "$cases/crypto-generated.ab"
 cat "$cases/crypto-generated.ab" >> "$cases/fixture.ab"
 # Every fixture also gets a residue entry: a @noinline copy as a worker, and an export that calls it and then
@@ -50,6 +51,8 @@ fixtures=(
     ct_fix_arithmetic_u32:0,1 ct_fix_add_u64:0,1 ct_fix_sub_u64:0,1 ct_fix_mul_u64:0,1 ct_fix_nonzero_u64:0
     ct_fix_mul_wide_u32:0,1
     ct_fix_equals:@0,@1
+    ct_fix_chacha_state:@1,@3 ct_fix_chacha_block:@0,@1 ct_fix_chacha_xor:@0,@1,@4
+    ct_fix_poly_init:@1 ct_fix_poly_blocks:@0,@1 ct_fix_poly_update:@0,@1 ct_fix_poly_finish:@0
     ct_fix_aes_encrypt:@0,@1 ct_fix_aes_decrypt:@0,@1 ct_fix_aes_padding:@0 ct_fix_ghash:@0,@1
     ct_fix_montgomery:@0,@1,@2,@3 ct_fix_add_multiple:0,@1,@2 ct_fix_lookup:0,@1,@2
     ct_fix_rsa_pkcs1:@0 ct_fix_rsa_oaep:@0,@2
@@ -72,7 +75,7 @@ while IFS= read -r spec; do fixtures+=("$spec"); done < "$cases/crypto-generated
 # Xtensa passes later pointer parameters on the stack; its checker cannot yet
 # taint those parameters, so this separate-pointer shape is read on these ABIs.
 host_fixtures=(ct_fix_wide_separate:@0,@1,@2,@3,@5)
-leaks=(ct_leak_branch:0 ct_leak_callee:0 ct_leak_callee_store:0 ct_leak_index:0 ct_leak_trap:0 ct_leak_compare:@0,@1 ct_leak_divide:0,1 ct_pbe_leak:@0 ct_x25519_leak_branch:0,@1,@2 ct_x25519_leak_index:@0,@1 ct_ed25519_leak_branch:0,@1,@2 ct_ed25519_leak_index:@0,@1)
+leaks=(ct_leak_branch:0 ct_leak_callee:0 ct_leak_callee_store:0 ct_leak_index:0 ct_leak_trap:0 ct_leak_compare:@0,@1 ct_leak_divide:0,1 ct_pbe_leak:@0 ct_x25519_leak_branch:0,@1,@2 ct_x25519_leak_index:@0,@1 ct_ed25519_leak_branch:0,@1,@2 ct_ed25519_leak_index:@0,@1 ct_leak_chacha_index:@0,@1 ct_leak_poly_branch:@0,@1)
 while IFS= read -r spec; do leaks+=("$spec"); done < "$cases/crypto-generated.leaks"
 
 # Hand-written spill regressions ensure the test includes the actual assembly pattern.

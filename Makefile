@@ -327,6 +327,7 @@ test-serial: ablac
 	tools/test-x25519.sh $(COMPILER)
 	tools/test-ed25519.sh $(COMPILER)
 	tools/test-crypto-pure.sh $(COMPILER)
+	tools/test-crypto-chacha.sh $(COMPILER)
 	tools/test-crypto-hosted-keygen.sh $(COMPILER)
 	tools/test-crypto-encrypted-rsa.sh $(COMPILER)
 	tools/test-rsa-export.sh $(COMPILER)
