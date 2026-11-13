@@ -37,7 +37,7 @@ normalization has been applied.
 - Use the same frozen v0.2.47 benchmark sources for both. `git diff` confirms
   all `tests/benchmarks`, `event-http-server.ab` and `https-client.ab` sources
   are unchanged between those tags.
-- Build the 13 programs from `tools/bench-compare.py` in release mode with
+- Build the 13 programs of `tests/benchmarks` (the list `tools/bench-compare.py` had, see git history at a8e65b35) in release mode with
   `--no-cache`, a private cache per build, and four build jobs. Both versions
   use the same installed LLVM/SDK on a given runner. `dispatch` exercises
   interfaces, lambdas and small objects.
@@ -58,7 +58,7 @@ normalization has been applied.
   and stripped sizes/hashes. Binary size is measured once per deterministic
   build, not sampled five times.
 - `event-http-server` is persistent and `https-client` requires the public
-  network. Like `bench-compare.py`, they have size/build data only: **no server
+  network. Like `bench-compare.py` before it, they have size/build data only: **no server
   throughput, TLS/network performance or latency claim**.
 - These hosted runners are not CPU-pinned or isolated. arm64 is a three-vCPU
   Apple M1 VM with 7 GiB RAM (macOS 15.8.2, LLVM 23.1.5); Intel is four vCPUs

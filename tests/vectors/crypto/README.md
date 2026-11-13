@@ -1,6 +1,6 @@
 # Crypto test vectors
 
-Converted by `tools/crypto/convert-vectors.py` into one record per line; read by
+Converted by a script (`tools/crypto/convert-vectors.py`, removed with the repository's Python: see git history at a8e65b35) into one record per line; read by
 `tests/cases/crypto/vectors.ab`, run by `tools/test-crypto.sh`. All keys are the sources'
 published test keys. Fetched 2026-10-31.
 

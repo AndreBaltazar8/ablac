@@ -151,14 +151,14 @@ Outputs identical across versions: yes
 - [tools/wasm-bench/run.mjs](../tools/wasm-bench/run.mjs) instantiates a module with the four `abla_host`
   imports and nothing else, calls `main`, and reports the run time of that call (instantiation apart), the
   program's output and the final size of its linear memory (its peak, memory never shrinks).
-- One round is not kept as a warmup (`bench.py run --warmup N`; the first run's JSON files used one), then nine
+- One round is not kept as a warmup (`bench.mjs run --warmup N`; the first run's JSON files used one), then nine
   (first run) or 25 fresh Node processes per version, pinned to one CPU, with the order of versions alternating each
-  round. Every sample is kept. `report.py --skip 0.2` drops the first fifth of them before taking the median, because
+  round. Every sample is kept. `report.mjs --skip 0.2` drops the first fifth of them before taking the median, because
   the early rounds of a long run on this shared machine are a slower phase for every version; the minimum and the
   min-to-max range use all of them. Judge a difference by median and minimum together.
-- The program's output must be the same in every round and in every version; a mismatch aborts `bench.py run`
+- The program's output must be the same in every round and in every version; a mismatch aborts `bench.mjs run`
   (the first run's files were checked across versions and on each version's first round only).
 - Size is exact (one deterministic build) and is the module as built, with no `wasm-opt` pass.
 
-Reproduce with `tools/wasm-bench/bench.py build RELEASES OUT`, then `bench.py run OUT --json result.json`
-and `report.py result.json --skip 0.2` (see their headers).
+Reproduce with `node tools/wasm-bench/bench.mjs build RELEASES OUT`, then `bench.mjs run OUT --json result.json`
+and `node tools/wasm-bench/report.mjs result.json --skip 0.2` (see their headers).

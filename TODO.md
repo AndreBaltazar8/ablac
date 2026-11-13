@@ -1726,7 +1726,7 @@ mmap form) apply there.
   I did not run the servers under load (the websocket harness needs its Bun client); their sites are the
   unprovable kind.
 - [ ] **A benchmark's cycles can move 20% with the code unchanged.** `fib` at 2026-11-01 is byte-identical machine
-  code at another address and takes 20% more cycles. `tools/bench-compare.py` reports instructions for that reason.
+  code at another address and takes 20% more cycles. `tools/bench-compare.py` (removed in #807, see git history at a8e65b35) reported instructions for that reason.
   Reproduced 2026-11-04 with string bulk copies: the new `memcpy` import moves fib's
   unchanged recursive body from 0x1de0 to 0x1e40 (start mod64 32 to 0, loop mod64 0 to32).
   Cycles rise 13.3% in five pairs and 18.6% in seven more, with unchanged instructions.

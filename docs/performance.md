@@ -16,8 +16,9 @@ build; the former covers parsing, semantic analysis, lowering, and LLVM text
 emission, while the latter additionally includes LLVM optimization, parallel
 object emission, and linking.
 
-Compare two compilers with `tools/bench-compare.py` (compile instructions, stripped size,
-run cycles and instructions, on `tests/benchmarks`).
+Two compilers were compared with `tools/bench-compare.py` (compile instructions, stripped size,
+run cycles and instructions, on `tests/benchmarks`, under `perf`); it was removed with the repository's Python (see git history at a8e65b35), and
+the CI macOS runtime benchmark and `tools/wasm-bench` are what runs today.
 
 ## Faster builds, smaller and faster programs, ten times faster tests (2026-11-03)
 
