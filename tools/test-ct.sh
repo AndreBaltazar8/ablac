@@ -150,6 +150,25 @@ orchestration_read() { # object, architecture (default x86_64)
     echo "ok   $arch orchestration: bnFromBytes and bnResidueSquare read whole, their calls followed"
 }
 
+# The carry-less GHASH multiply (tests/cases/ct/fixture.ab ct_fix_ghash_clmul), read with its call followed where it
+# has a body (x86-64 and AArch64; Wasm and Xtensa have no CLMUL), and its twin, which leaks H through an address.
+clmul_read() { # object, architecture
+    local object=$1 arch=$2
+    $check --follow-calls "$arch" "$object" ct_fix_ghash_clmul:@0,@1 > "$out/$arch-clmul.log" 2>&1 || {
+        cat "$out/$arch-clmul.log" >&2; echo "ct: a secret reached a branch or an address in the CLMUL GHASH multiply" >&2; exit 1
+    }
+    grep -q '^ok.*following [1-9]' "$out/$arch-clmul.log" || {
+        cat "$out/$arch-clmul.log" >&2; echo "ct: the CLMUL GHASH read followed no call" >&2; exit 1
+    }
+    if $check --follow-calls "$arch" "$object" ct_leak_ghash_clmul:@0,@1 > "$out/$arch-clmul-leak.log" 2>&1; then
+        echo "ct: the checker missed the CLMUL GHASH leak" >&2; exit 1
+    fi
+    grep -Eq 'secret (address|memory|index)' "$out/$arch-clmul-leak.log" || {
+        cat "$out/$arch-clmul-leak.log" >&2; echo "ct: the CLMUL GHASH leak was refused for another reason" >&2; exit 1
+    }
+    echo "ok   $arch CLMUL GHASH multiply: clean with its call followed (1 control)"
+}
+
 # The key-handling functions of AES (the schedule, the hardware decryption keys, the hardware block loops), which are
 # functions of plain integers that stay calls. They are read whole with their calls followed: x86-64 only. The same
 # specs must be refused without following (the calls are what is covered), and each has a twin with a secret-indexed
@@ -883,6 +902,7 @@ residue_read
 real_entries_run
 orchestration_read "$out/x86.o"
 worker_read "$out/x86.o"
+clmul_read "$out/x86.o" x86_64
 p256_read "$out/x86.o"
 x25519_read "$out/x86.o"
 ed25519_read "$out/x86.o"
@@ -930,6 +950,7 @@ residue_a64_read
 # The bignum routines and the AES key functions, read whole on AArch64 with their calls followed.
 orchestration_read "$out/aarch64.o" aarch64
 worker_read "$out/aarch64.o" aarch64
+clmul_read "$out/aarch64.o" aarch64
 p256_read "$out/aarch64.o" aarch64
 x25519_read "$out/aarch64.o" aarch64
 ed25519_read "$out/aarch64.o" aarch64
