@@ -1,0 +1,264 @@
+// Generates intraprocedural constant-time fixtures from production crypto, never stale copies (#817: the Abla port of
+// tests/cases/ct/crypto-source-fixtures.py, same output files and messages).
+//
+//     ct-source-fixtures <repository root> <output.ab>
+//
+// Only public metadata and address adapters are hand-written. Allocation, clear/copy, free and out-of-line calls can't
+// be followed by the checker. Hash guards on all excluded text require a coverage review if that scaffolding changes.
+// Each generated function has a twin with a secret-indexed volatile store. Writes <output>.ab, and .good, .leaks,
+// .follow and .followleaks (spec lists) beside it.
+import "abla/io"
+import "abla/text"
+import "abla/crypto"
+import "abla/fs"
+import "abla/process/arguments"
+
+// A failed assertion: the message on standard error, as Python's AssertionError, then exit 1.
+var sourceFailure = ""
+
+fun sourceAssert(condition: bool, message: string): void {
+    if (!condition && sourceFailure == "") sourceFailure = message
+    return
+}
+
+fun sourceCount(text: string, needle: string): int {
+    var count = 0
+    var at = text.indexOf(needle)
+    while (at >= 0) {
+        count = count + 1
+        at = text.indexOf(needle, at + needle.size)
+    }
+    count
+}
+
+fun sourceWordByte(byte: int): bool =
+    (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) ||
+    byte == 95
+
+/** The start of the first line holding `fun <name>(` after a word boundary (Python's `^.*\bfun name\(`, re.M), or
+ *  -1. */
+fun sourceFunLine(source: string, name: string): int {
+    val needle = "fun $name("
+    var at = source.indexOf(needle)
+    while (at >= 0) {
+        if (at == 0 || !sourceWordByte(source[at - 1])) {
+            var line = at
+            while (line > 0 && source[line - 1] != 10) line = line - 1
+            return line
+        }
+        at = source.indexOf(needle, at + 1)
+    }
+    -1
+}
+
+/** A function's body: from after its first `{` to before the next line that is `}`. */
+fun sourceBody(source: string, name: string): string {
+    val line = sourceFunLine(source, name)
+    sourceAssert(line >= 0, name)
+    if (line < 0) return ""
+    val start = source.indexOf("{", line) + 1
+    val end = source.indexOf("\n}", start)
+    source.slice(start, end)
+}
+
+/** A function written as one expression: from its line to the next blank line. */
+fun sourceChunk(source: string, name: string): string {
+    val line = sourceFunLine(source, name)
+    sourceAssert(line >= 0, name)
+    if (line < 0) return ""
+    val end = source.indexOf("\n\n", source.indexOf("fun $name(", line))
+    source.slice(line, end)
+}
+
+// These guards cover ONLY text left outside the generated fixtures, not their tested bodies. Regenerating a fixture
+// must never silently miss a new branch added to one of the excluded allocation/dispatch sections.
+fun sourceGuardHash(name: string): string =
+    if (name == "rsaReduceWide") "70cb36939027e8908938b0c85604f47cd4cb76d03d51a3abd0b2ca973e52120e"
+    else if (name == "rsaCrt") "ec3addee5a5fd74adebecd24260bbc8f67efcabc64d421633d3a44467254dd65"
+    else if (name ==
+        "bnResidueSquare") "2bb8f304e7c5f1047e19dfdb5507ec2bedb6331b54384daab6d73a6dcaf91905"
+    else if (name ==
+        "bnFromBytes") "eeebce423076a53fb063f21cbfb0397b5be468ad3d3ef283e2363eb3b35219c8"
+    else if (name ==
+        "aesSoftBlocks") "8ff73661c081f911087468327f77b4eef43a7cfea6b155f883861da35e242c60"
+    else if (name ==
+        "aesWrappers") "874d6ee359015323b4ed600ab7f785e4293ad51636b08f570e581555165f08d9"
+    else ""
+
+fun sourceGuard(name: string, pieces: array<string>): void {
+    val actual = hexEncode(sha256(textJoin(pieces, "\x00")))
+    val expected = sourceGuardHash(name)
+    if (expected == "") sourceAssert(false, "missing source guard $name: $actual")
+    else sourceAssert(expected == actual,
+        "$name: excluded source changed; review CT coverage (now $actual)")
+    return
+}
+
+class SourceSection(val inside: string, val before: string, val after: string)
+
+fun sourceSection(text: string, begin: string, end: string): SourceSection {
+    sourceAssert(sourceCount(text, begin) == 1, begin)
+    sourceAssert(text.contains(end), end)
+    val at = text.indexOf(begin)
+    val stop = if (at >= 0) text.indexOf(end, at) else -1
+    if (at < 0 || stop < 0) return SourceSection("", "", "")
+    SourceSection(text.slice(at, stop), text.slice(0, at), text.slice(stop, text.size))
+}
+
+class SourceOut(
+    val out: array<string>,
+    val specs: array<string>,
+    val leaks: array<string>,
+    val followSpecs: array<string>,
+    val followLeaks: array<string>
+)
+
+// Leak controls run the same generated body before a genuine secret-indexed volatile store; a missed call is NOT
+// accepted as detecting this leak. `follow`: the body calls private functions that stay calls, so only the x86-64
+// checker that follows calls reads it, and it is listed apart.
+fun sourceFixture(var o: SourceOut, name: string, args: string, setup: string, actual: string,
+    taints: string,
+    leakAddress: string = "work", follow: bool = false): void {
+    for (bad in [false, true]) {
+        val exported = "ct_" + (if (bad) "leak_" else "fix_") + name
+        val extra =
+            if (bad) "\n    ablaUnsafeVolatileStoreU8(work + int(bnLoad($leakAddress).declassify() & u32(255)), 1)\n"
+            else ""
+        o.out
+            .append("\n@inline @export(\"$exported\")\ntrusted fun $exported($args): void {\n$setup\n$actual$extra\n}\n")
+        val spec = "$exported:$taints"
+        if (bad && follow) o.followLeaks.append(spec)
+        else if (bad) o.leaks.append(spec)
+        else if (follow) o.followSpecs.append(spec)
+        else o.specs.append(spec)
+    }
+    return
+}
+
+fun sourceWithSuffix(path: string, suffix: string): string {
+    val slash = path.lastIndexOf("/")
+    val dot = path.lastIndexOf(".")
+    if (dot > slash) path.slice(0, dot) + suffix else path + suffix
+}
+
+fun main: int {
+    if (processArgumentCount() < 2) {
+        eprintln("usage: ct-source-fixtures <repository root> <output.ab>")
+        return 2
+    }
+    val root = processArgument(0)
+    val output = processArgument(1)
+    val aes = Path("$root/stdlib/abla/crypto/aes/entry.ab").readText()
+    val bn = Path("$root/stdlib/abla/crypto/bignum/entry.ab").readText()
+    val rsa = Path("$root/stdlib/abla/crypto/rsa/entry.ab").readText()
+    var o = SourceOut([], [], [], [], [])
+
+    // The wrappers, and the public entries that choose which addresses and how many rounds reach the read workers.
+    var wrappers = ""
+    for (name in ["aesKeyBytes", "aesAllocateMemory", "aesNewKey", "aesStringAddress",
+        "aesExpandBytes"]) {
+        wrappers = wrappers + sourceBody(aes, name)
+    }
+    for (name in ["AesKey.schedule", "AesKey.decryption", "aesHardwareEncrypt",
+        "aesHardwareDecrypt"]) {
+        wrappers = wrappers + sourceChunk(aes, name)
+    }
+    sourceGuard("aesWrappers", [wrappers])
+    // A secret never becomes a public integer in the text the checker doesn't read.
+    sourceAssert(!wrappers.contains("declassify"), "an allocation wrapper declassifies")
+    for (count in [16, 24, 32]) {
+        sourceFixture(o, "aes_expand_${count * 8}", "work: int, source: int, hardware: bool", "",
+            "    aesExpandSchedule(work, source, $count, hardware)", "@0,@1", "source", true)
+    }
+    sourceFixture(o, "aes_expand_variable", "work: int, source: int, count: int, hardware: bool",
+        "",
+        "    aesExpandSchedule(work, source, count, hardware)", "@0,@1", "source", true)
+    sourceFixture(o, "aes_decryption_keys", "schedule: int, out: int, rounds: int, work: int", "",
+        "    aesDecryptionKeys(schedule, out, rounds)", "@0,@1", "schedule", true)
+    sourceFixture(o, "aes_hardware_encrypt",
+        "schedule: int, rounds: int, input: int, output: int, count: int, work: int",
+        "", "    aesHardwareEncryptAt(schedule, rounds, input, output, count)", "@0,@2,@3",
+        "schedule", true)
+    sourceFixture(o, "aes_hardware_decrypt",
+        "keys: int, rounds: int, input: int, output: int, count: int, work: int", "",
+        "    aesHardwareDecryptAt(keys, rounds, input, output, count)", "@0,@2,@3", "keys", true)
+
+    // Exact byte-loader body (unaligned source), writing all four loaded bytes.
+    val load = sourceBody(aes, "aesLoadBytes")
+    val last = "    secretU32(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))"
+    sourceAssert(load.endsWith(last), "")
+    sourceFixture(o, "aes_load_bytes", "work: int", "    val address = work",
+        load.slice(0, load.size - last.size) + "    aesStore(work + 8, " + last.trim() + ")", "@0")
+
+    // The complete input/output loops around the already-checked bitsliced rounds.
+    val blocks = sourceBody(aes, "aesSoftBlocks")
+    val loading = sourceSection(blocks, "        val second =", "        aesOrthogonalize(q)")
+    val storing = sourceSection(loading.after, "        for (i in 0 until 4)",
+        "        block = block + 2")
+    sourceGuard("aesSoftBlocks", [loading.before, storing.before, storing.after])
+    sourceFixture(o, "aes_block_io", "work: int, count: int",
+        "    val q = work\n    val input = work + 32\n    val output = input + count * 16\n    var block = 0",
+        "    while (block < count) {\n" + loading.inside + storing.inside +
+        "        block = block + 2\n    }", "@0")
+
+    // Only the initial public-length bnClear call is excluded, not any secret work.
+    for (name in ["bnFromBytes", "bnResidueSquare"]) {
+        val source = sourceBody(bn, name)
+        val clear = "\n    bnClear(" + (if (name == "bnFromBytes") "to" else "out") + ", words)\n"
+        sourceAssert(source.startsWith(clear), name)
+        sourceGuard(name, [clear])
+        val actual = source.slice(clear.size, source.size)
+        if (name == "bnFromBytes") {
+            sourceFixture(o, "bn_from_bytes", "work: int, count: int",
+                "    val to = work\n    val data = work + ((count + 3) / 4) * 4", actual, "@0")
+        } else {
+            sourceFixture(o, "bn_residue_square", "work: int, words: int",
+                "    val out = work\n    val modulus = work + words * 4\n    val t = work + words * 8",
+                actual, "@0")
+        }
+    }
+    sourceFixture(o, "bn_to_bytes", "work: int, count: int",
+        "    val from = work\n    val to = work + ((count + 3) / 4) * 4", sourceBody(bn,
+            "bnToBytes"), "@0")
+
+    val crt = sourceBody(rsa, "rsaCrt")
+    val correction = sourceSection(crt, "    var borrow =",
+        "    rsaMultiplyPlain(p, h, h, key.inverseQ())")
+    val recombine = sourceSection(correction.after, "    carry = secretU32",
+        "    bnCopy(out, padded, nWords)")
+    sourceGuard("rsaCrt", [correction.before, recombine.before, recombine.after])
+    for (name in ["rsaCrt", "rsaModulusFromLimbs", "rsaReduceWide"]) {
+        sourceAssert(!sourceBody(rsa, name).contains("declassify"),
+            "$name declassifies: its text is read only by the type system")
+    }
+    sourceAssert(sourceCount(correction.inside, "p.value()") == 1, "")
+    sourceFixture(o, "rsa_crt_correction", "work: int, words: int",
+        "    val m1 = work\n    val m2p = work + words * 4\n    val h = work + words * 8\n    val prime = work + words * 12",
+        correction.inside.replace("p.value()", "prime"), "@0")
+    sourceFixture(o, "rsa_crt_recombine", "work: int, words: int",
+        "    val wide = words * 2\n    val padded = work\n    val m2 = work + wide * 4\n    var carry = secretU32(u32(0))",
+        recombine.inside, "@0")
+
+    // Wide reduction's carry/add/subtract glue is part of rsaCrt's reduction path.
+    val reduction = sourceSection(sourceBody(rsa, "rsaReduceWide"), "    var carry =",
+        "    bnRelease(high, words)")
+    sourceGuard("rsaReduceWide", [reduction.before, reduction.after])
+    sourceAssert(sourceCount(reduction.inside, "modulus.value()") == 1 &&
+        sourceCount(reduction.inside, "modulus.scratch()") == 1, "")
+    sourceFixture(o, "rsa_reduce_wide", "work: int, words: int",
+        "    val out = work\n    val high = work + words * 4\n    val prime = work + words * 8\n    val scratch = work + words * 12",
+        reduction.inside.replace("modulus.value()", "prime").replace("modulus.scratch()",
+            "scratch"), "@0")
+
+    if (sourceFailure != "") {
+        eprintln("AssertionError: $sourceFailure")
+        return 1
+    }
+    Path(output).writeText(textJoin(o.out, ""))
+    Path(sourceWithSuffix(output, ".good")).writeText(textJoin(o.specs, "\n") + "\n")
+    Path(sourceWithSuffix(output, ".leaks")).writeText(textJoin(o.leaks, "\n") + "\n")
+    Path(sourceWithSuffix(output, ".follow")).writeText(textJoin(o.followSpecs, "\n") + "\n")
+    Path(sourceWithSuffix(output, ".followleaks")).writeText(textJoin(o.followLeaks, "\n") + "\n")
+    println("crypto source fixtures: ${o.specs.size} paths with ${o.leaks.size} secret-index controls, ${o.followSpecs.size} read by following calls with ${o.followLeaks.size}")
+    0
+}

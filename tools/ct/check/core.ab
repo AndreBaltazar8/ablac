@@ -1,0 +1,480 @@
+// The constant-time checker's shared pieces (#817): taint states, the violation that ends a
+// check, the helpers its readers share and the forward fixpoint over a function's jumps.
+// A port of tools/ct/check-asm.py; each piece keeps that file's behaviour, so the two give the
+// same verdict on every fixture until the Python one is removed.
+import "abla/io"
+import "abla/text"
+import "abla/regex"
+import "abla/process/exit"
+
+// A taint state: the set of tags check-asm.py keeps as a frozenset ("rax", "ptr:rdi", "slot:rbp:-8", ...), kept as a
+// sorted array: a copy copies references without hashing, a union is a merge, and the tags with a prefix are one run
+// found by binary search. `items` may be read (in sorted order) but is changed only through these methods.
+class CtTags(val items: array<string>) {
+    /** The index of the first tag not below `key`. */
+    fun lowerBound(key: string): int {
+        var low = 0
+        var high = this.items.size
+        while (low < high) {
+            val middle = (low + high) / 2
+            if (this.items[middle] < key) low = middle + 1 else high = middle
+        }
+        low
+    }
+    fun has(tag: string): bool {
+        val at = this.lowerBound(tag)
+        at < this.items.size && this.items[at] == tag
+    }
+    fun add(tag: string): void {
+        val at = this.lowerBound(tag)
+        if (at < this.items.size && this.items[at] == tag) return
+        this.items.append(tag)
+        var i = this.items.size - 1
+        while (i > at) {
+            this.items[i] = this.items[i - 1]
+            i = i - 1
+        }
+        this.items[at] = tag
+        return
+    }
+    /** Removes the `count` tags from index `at` on. */
+    fun removeRun(at: int, count: int): void {
+        if (count <= 0) return
+        var i = at
+        while (i + count < this.items.size) {
+            this.items[i] = this.items[i + count]
+            i = i + 1
+        }
+        this.items.truncate(this.items.size - count)
+        return
+    }
+    fun discard(tag: string): void {
+        val at = this.lowerBound(tag)
+        if (at < this.items.size && this.items[at] == tag) this.removeRun(at, 1)
+        return
+    }
+    fun keys(): array<string> {
+        val result: array<string> = []
+        for (key in this.items) result.append(key)
+        result
+    }
+    fun size(): int = this.items.size
+    fun copy(): CtTags {
+        val result: array<string> = []
+        for (key in this.items) result.append(key)
+        CtTags(result)
+    }
+    fun union(other: CtTags): CtTags {
+        val result: array<string> = []
+        var i = 0
+        var j = 0
+        while (i < this.items.size && j < other.items.size) {
+            val a = this.items[i]
+            val b = other.items[j]
+            if (a == b) {
+                result.append(a)
+                i = i + 1
+                j = j + 1
+            } else if (a < b) {
+                result.append(a)
+                i = i + 1
+            } else {
+                result.append(b)
+                j = j + 1
+            }
+        }
+        while (i < this.items.size) {
+            result.append(this.items[i])
+            i = i + 1
+        }
+        while (j < other.items.size) {
+            result.append(other.items[j])
+            j = j + 1
+        }
+        CtTags(result)
+    }
+    fun addAll(other: CtTags): void {
+        val merged = this.union(other)
+        this.items.truncate(0)
+        for (key in merged.items) this.items.append(key)
+        return
+    }
+    fun sameAs(other: CtTags): bool {
+        if (this.items.size != other.items.size) return false
+        var i = 0
+        while (i < this.items.size) {
+            if (this.items[i] != other.items[i]) return false
+            i = i + 1
+        }
+        true
+    }
+    /** The end of the run of tags that start with `prefix`, from `start` (its first). */
+    fun prefixEnd(prefix: string, start: int): int {
+        var end = start
+        while (end < this.items.size && this.items[end].startsWith(prefix)) end = end + 1
+        end
+    }
+    /** Whether a tag starts with `prefix`. */
+    fun anyPrefix(prefix: string): bool {
+        val at = this.lowerBound(prefix)
+        at < this.items.size && this.items[at].startsWith(prefix)
+    }
+    /** The tags that start with `prefix`, in sorted order. */
+    fun withPrefix(prefix: string): array<string> {
+        val found: array<string> = []
+        var at = this.lowerBound(prefix)
+        while (at < this.items.size && this.items[at].startsWith(prefix)) {
+            found.append(this.items[at])
+            at = at + 1
+        }
+        found
+    }
+    /** Whether a tag starts with one of `prefixes`. */
+    fun anyPrefixOf(prefixes: array<string>): bool {
+        for (prefix in prefixes) {
+            if (this.anyPrefix(prefix)) return true
+        }
+        false
+    }
+    /** The tags that start with one of `prefixes`, each once. */
+    fun withPrefixes(prefixes: array<string>): array<string> {
+        val found: array<string> = []
+        for (prefix in prefixes) {
+            for (tag in this.withPrefix(prefix)) {
+                var seen = false
+                for (other in found) {
+                    if (other == tag) seen = true
+                }
+                if (!seen) found.append(tag)
+            }
+        }
+        found
+    }
+    fun discardPrefix(prefix: string): void {
+        val at = this.lowerBound(prefix)
+        this.removeRun(at, this.prefixEnd(prefix, at) - at)
+        return
+    }
+    fun sorted(): array<string> = this.keys()
+}
+
+fun ctTags(): CtTags = CtTags([])
+
+fun ctTagsOf(tags: array<string>): CtTags {
+    val result = ctTags()
+    for (tag in tags) result.add(tag)
+    result
+}
+
+// --- Violations -------------------------------------------------------------------------------------------------
+// check-asm.py raises Violation and SystemExit; here the first one is kept, and every loop that could go on stops
+// once one is set. ctFatal is SystemExit's message (a check that can't run at all), ctViolation a Violation's.
+var ctViolation = ""
+var ctFatal = ""
+
+fun ctFail(message: string): void {
+    if (ctViolation == "" && ctFatal == "") ctViolation = message
+    return
+}
+
+fun ctStop(message: string): void {
+    if (ctFatal == "") ctFatal = message
+    return
+}
+
+fun ctFailed(): bool = ctViolation != "" || ctFatal != ""
+
+// --- Text -------------------------------------------------------------------------------------------------------
+fun ctIsSpace(byte: int): bool = byte == 32 || byte == 9 || byte == 10 || byte == 13 || byte ==
+    11 || byte == 12
+
+/** Python's `text.split(None, limit)`: words separated by whitespace, at most `limit` splits (-1: no limit). */
+fun ctWords(text: string, limit: int = -1): array<string> {
+    val words: array<string> = []
+    var at = 0
+    while (at < text.size && ctIsSpace(text[at])) at = at + 1
+    while (at < text.size) {
+        if (limit >= 0 && words.size == limit) {
+            var end = text.size
+            while (end > at && ctIsSpace(text[end - 1])) end = end - 1
+            words.append(text.slice(at, end))
+            return words
+        }
+        var end = at
+        while (end < text.size && !ctIsSpace(text[end])) end = end + 1
+        words.append(text.slice(at, end))
+        at = end
+        while (at < text.size && ctIsSpace(text[at])) at = at + 1
+    }
+    words
+}
+
+fun ctFirstWord(text: string): string {
+    val words = ctWords(text, 1)
+    if (words.size == 0) "" else words[0]
+}
+
+fun ctStartsWithAny(text: string, prefixes: array<string>): bool {
+    for (prefix in prefixes) {
+        if (text.startsWith(prefix)) return true
+    }
+    false
+}
+
+fun ctDigit(byte: int, base: int): int {
+    val value = if (byte >= 48 && byte <= 57) byte - 48
+        else if (byte >= 97 && byte <= 122) byte - 87
+        else if (byte >= 65 && byte <= 90) byte - 55
+        else 99
+    if (value < base) value else -1
+}
+
+/** Python's `int(text, 0)`: an optional sign, then 0x/0o/0b with digits of that base or decimal digits (no
+ *  leading zero but "0"), `_` between digits; null where Python raises ValueError. */
+fun ctParseInt(text: string): int? {
+    val trimmed = text.trim()
+    var at = 0
+    var negative = false
+    if (at < trimmed.size && (trimmed[at] == 45 || trimmed[at] == 43)) {
+        negative = trimmed[at] == 45
+        at = at + 1
+    }
+    var base = 10
+    if (at + 1 < trimmed.size && trimmed[at] == 48) {
+        val marker = trimmed[at + 1]
+        if (marker == 120 || marker == 88) base = 16
+        else if (marker == 111 || marker == 79) base = 8
+        else if (marker == 98 || marker == 66) base = 2
+        if (base != 10) at = at + 2
+    }
+    if (at >= trimmed.size) return null
+    if (base == 10 && trimmed[at] == 48) {
+        // Decimal with a leading zero is only zeros.
+        var index = at
+        while (index < trimmed.size) {
+            if (trimmed[index] != 48 && trimmed[index] != 95) return null
+            index = index + 1
+        }
+        return 0
+    }
+    var value = 0
+    var digits = 0
+    var previousUnderscore = base != 10
+    while (at < trimmed.size) {
+        val byte = trimmed[at]
+        if (byte == 95) {
+            if (previousUnderscore && digits > 0) return null
+            previousUnderscore = true
+        } else {
+            val digit = ctDigit(byte, base)
+            if (digit < 0) return null
+            value = value * base + digit
+            digits = digits + 1
+            previousUnderscore = false
+        }
+        at = at + 1
+    }
+    if (digits == 0 || previousUnderscore && trimmed[trimmed.size - 1] == 95) return null
+    if (negative) -value else value
+}
+
+/** `int(text, 16)` of a run of hex digits (what the disassembly's addresses are); null if it isn't one. */
+fun ctParseHex(text: string): int? {
+    if (text.size == 0) return null
+    var value = 0
+    for (byte in text) {
+        val digit = ctDigit(byte, 16)
+        if (digit < 0) return null
+        value = value * 16 + digit
+    }
+    value
+}
+
+/** A parsed number that must be one (check-asm.py lets a ValueError end the check there). */
+fun ctInt(text: string): int {
+    val value = ctParseInt(text)
+    if (value == null) {
+        ctStop("invalid literal for int(): '$text'")
+        return 0
+    }
+    value
+}
+
+fun ctIntOrZero(displacement: string): int = if (displacement == "" || displacement ==
+    "-") 0 else ctInt(displacement)
+
+// --- Regular expressions ------------------------------------------------------------------------------------------
+// Compiled once each. `ctMatch` is Python's re.match (anchored at the start), `ctSearch` re.search, `ctFull`
+// re.fullmatch.
+val ctPatterns: Map<string, Regex> = Map()
+
+fun ctRegex(pattern: string): Regex {
+    val known = ctPatterns.get(pattern)
+    if (known != null) return known
+    val compiled = regexCompile(pattern)
+    if (!compiled.succeeded) {
+        println("check-asm: bad pattern $pattern: ${compiled.error.message}")
+        exit(2)
+    }
+    ctPatterns.set(pattern, compiled.regex)
+    compiled.regex
+}
+
+// Every answer is remembered per pattern and text: a fixpoint steps the same instruction texts again and again, and a
+// match never changes. A RegexMatch is only read.
+val ctMemoHits: Map<string, RegexMatch> = Map()
+val ctMemoMisses: Map<string, bool> = Map()
+
+fun ctMemoGet(key: string): RegexMatch? = ctMemoHits.get(key)
+
+fun ctMemoPut(key: string, found: RegexMatch?): RegexMatch? {
+    if (found == null) ctMemoMisses.set(key, true) else ctMemoHits.set(key, found)
+    found
+}
+
+fun ctMatch(pattern: string, text: string): RegexMatch? {
+    val key = "m\n$pattern\n$text"
+    if (ctMemoMisses.has(key)) return null
+    val known = ctMemoGet(key)
+    if (known != null) return known
+    val found = ctRegex(pattern).find(text, 0)
+    ctMemoPut(key, if (found == null || found.start() != 0) null else found)
+}
+
+fun ctSearch(pattern: string, text: string): RegexMatch? {
+    val key = "s\n$pattern\n$text"
+    if (ctMemoMisses.has(key)) return null
+    val known = ctMemoGet(key)
+    if (known != null) return known
+    ctMemoPut(key, ctRegex(pattern).find(text, 0))
+}
+
+// ctMatch's answer alone, remembered per pattern and text: for the few distinct short texts (a mnemonic) a step
+// function classifies over and over.
+val ctMatchMemo: Map<string, bool> = Map()
+
+fun ctMatches(pattern: string, text: string): bool {
+    val key = "$pattern\n$text"
+    val known = ctMatchMemo.get(key)
+    if (known != null) return known
+    val answer = ctMatch(pattern, text) != null
+    ctMatchMemo.set(key, answer)
+    answer
+}
+
+fun ctFull(pattern: string, text: string): RegexMatch? {
+    val key = "f\n$pattern\n$text"
+    if (ctMemoMisses.has(key)) return null
+    val known = ctMemoGet(key)
+    if (known != null) return known
+    ctMemoPut(key, ctRegex(pattern).matchFull(text))
+}
+
+fun ctGroup(found: RegexMatch, index: int): string = found.group(index) ?? ""
+
+/** Every match of `pattern` (re.findall of a pattern without groups). */
+fun ctFindAll(pattern: string, text: string): array<string> {
+    val result: array<string> = []
+    for (found in ctRegex(pattern).findAll(text)) result.append(found.text0())
+    result
+}
+
+// --- The disassembly ------------------------------------------------------------------------------------------------
+class CtLine(val address: int, val text: string)
+
+// --- Fixpoint -------------------------------------------------------------------------------------------------------
+interface CtFlow {
+    /** The state after the instruction, as check-asm.py's step (null once a violation is set). */
+    fun step(state: CtTags, text: string, address: int): CtTags
+    /** The instruction indexes control can go to next. */
+    fun successors(text: string, i: int, index: Map<int, int>): array<int>
+}
+
+class CtHeap(val items: array<int>) {
+    fun push(value: int): void {
+        this.items.append(value)
+        var at = this.items.size - 1
+        while (at > 0) {
+            val parent = (at - 1) / 2
+            if (this.items[parent] <= this.items[at]) return
+            val swap = this.items[parent]
+            this.items[parent] = this.items[at]
+            this.items[at] = swap
+            at = parent
+        }
+        return
+    }
+    fun pop(): int {
+        val top = this.items[0]
+        val last = this.items[this.items.size - 1]
+        this.items.truncate(this.items.size - 1)
+        if (this.items.size > 0) {
+            this.items[0] = last
+            var at = 0
+            var done = false
+            while (!done) {
+                val left = at * 2 + 1
+                val right = left + 1
+                var smallest = at
+                if (left < this.items.size && this.items[left] < this.items[smallest]) smallest =
+                    left
+                if (right < this.items.size && this.items[right] < this.items[smallest]) smallest =
+                    right
+                if (smallest == at) {
+                    done = true
+                } else {
+                    val swap = this.items[smallest]
+                    this.items[smallest] = this.items[at]
+                    this.items[at] = swap
+                    at = smallest
+                }
+            }
+        }
+        top
+    }
+}
+
+/** Forward taint from `start` at the first instruction, the lowest queued instruction first. The states by
+ *  instruction index; a violation ends it early (the caller reads ctViolation). */
+fun ctFixpoint(lines: array<CtLine>, start: CtTags, flow: CtFlow): Map<int, CtTags> {
+    val index: Map<int, int> = Map()
+    var position = 0
+    while (position < lines.size) {
+        index.set(lines[position].address, position)
+        position = position + 1
+    }
+    val states: Map<int, CtTags> = Map()
+    states.set(0, start)
+    val work = CtHeap([])
+    work.push(0)
+    val queued: Map<int, bool> = Map()
+    queued.set(0, true)
+    var guard = 0
+    while (work.items.size > 0 && !ctFailed()) {
+        guard = guard + 1
+        if (guard > 3000000) {
+            ctStop("no fixed point")
+            return states
+        }
+        val i = work.pop()
+        queued.remove(i)
+        val line = lines[i]
+        val current = states.get(i) ?? ctTags()
+        val out = flow.step(current, line.text, line.address)
+        if (ctFailed()) return states
+        for (s in flow.successors(line.text, i, index)) {
+            if (s < lines.size) {
+                val old = states.get(s)
+                val next = if (old == null) out else old.union(out)
+                if (old == null || !next.sameAs(old)) {
+                    states.set(s, next)
+                    if (!queued.has(s)) {
+                        queued.set(s, true)
+                        work.push(s)
+                    }
+                }
+            }
+        }
+    }
+    states
+}

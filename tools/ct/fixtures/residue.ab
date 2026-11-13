@@ -1,0 +1,117 @@
+// Rewrites a fixture file for the residue read (#817: the Abla port of tests/cases/ct/residue-entries.py, same output):
+// each fixture becomes a @noinline worker with its body, and an exported `ct_res_<name>` that calls the worker and then
+// wipes the stack below it (abla/ct/scrub), the shape of a public entry point of the crypto code. The original exports
+// are dropped, so the two copies of a body are never in one object (LLVM would merge identical functions into a
+// jump). tools/test-ct.sh reads the result for secret residue.
+//
+//     ct-residue-entries <fixture.ab> <wipe-function> <output.ab> [skip-list ...]
+//
+// Prints the entry names. A skip list names fixtures read some other way (by following calls), one spec a line.
+import "abla/io"
+import "abla/text"
+import "abla/regex"
+import "abla/fs"
+import "abla/process/arguments"
+
+/** The end of the declaration that begins at `start`: its closing brace, or the end of its expression. */
+fun residueFunctionEnd(text: string, start: int): int {
+    val brace = text.indexOf("{", start)
+    val newline = text.indexOf("\n", start)
+    val equals = text.indexOf("=", start)
+    if (brace != -1 && (equals == -1 || brace < equals || (newline != -1 && brace < newline))) {
+        var depth = 0
+        var at = brace
+        while (at < text.size) {
+            if (text[at] == 123) {
+                depth = depth + 1
+            } else if (text[at] == 125) {
+                depth = depth - 1
+                if (depth == 0) return at + 1
+            }
+            at = at + 1
+        }
+        return text.size
+    }
+    // An expression body: it ends where a line does not continue with indentation.
+    var at = text.indexOf("\n", start)
+    while (at != -1 && at + 1 < text.size && (text[at + 1] == 32 || text[at + 1] == 9)) {
+        at = text.indexOf("\n", at + 1)
+    }
+    if (at == -1) text.size else at
+}
+
+fun main: int {
+    if (processArgumentCount() < 3) {
+        eprintln("usage: ct-residue-entries <fixture.ab> <wipe-function> <output.ab> [skip-list ...]")
+        return 2
+    }
+    val path = processArgument(0)
+    val wipe = processArgument(1)
+    val output = processArgument(2)
+    val skip: Map<string, bool> = Map()
+    var listing = 3
+    while (listing < processArgumentCount()) {
+        val file = Path(processArgument(listing))
+        if (file.exists()) {
+            for (line in file.readText().split("\n")) {
+                if (line.trim() != "") {
+                    val colon = line.indexOf(":")
+                    skip.set(if (colon >= 0) line.slice(0, colon) else line, true)
+                }
+            }
+        }
+        listing = listing + 1
+    }
+    val source = Path(path).readText()
+    val compiled = regexCompile(
+        "@inline @export\\(\"(ct_(?:fix|pbe)_[A-Za-z0-9_]+)\"\\)\\n((trusted )?fun (\\w+)\\(([^)]*)\\)(?:: (\\w+))?)"
+    )
+    if (!compiled.succeeded) {
+        eprintln("ct-residue-entries: ${compiled.error.message}")
+        return 2
+    }
+    val pieces: array<string> = []
+    var last = 0
+    for (m in compiled.regex.findAll(source)) {
+        // Python's `^` with re.M: a match counts only at the start of a line.
+        if (m.start() != 0 && source[m.start() - 1] != 10) continue
+        val exported = m.group(1) ?? ""
+        val trustedPrefix = m.group(3) ?? ""
+        val function = m.group(4) ?? ""
+        val parameters = m.group(5) ?? ""
+        val returns = m.group(6) ?? ""
+        if (skip.has(exported) || skip.has(exported.replace("ct_fix_", "ct_leak_"))) continue
+        val signatureStart = m.groupStart(2)
+        val end = residueFunctionEnd(source, signatureStart)
+        val body = source.slice(signatureStart, end)
+        val worker = function + "Work"
+        val argumentNames: array<string> = []
+        for (parameter in parameters.split(",")) {
+            if (parameter.trim() != "") {
+                val colon = parameter.indexOf(":")
+                argumentNames.append((if (colon >= 0) parameter.slice(0,
+                    colon) else parameter).trim())
+            }
+        }
+        val arguments = textJoin(argumentNames, ", ")
+        val renameAt = body.indexOf("fun $function(")
+        val renamed = if (renameAt >= 0)
+            body.slice(0, renameAt) + "fun $worker(" + body.slice(renameAt + "fun $function(".size,
+                body.size)
+        else body
+        val copy = "@noinline " + renamed
+        val entryName = "ct_res_" + exported.slice(3, exported.size)
+        val call = "$worker($arguments)"
+        val entry = if (returns != "" && returns !=
+            "void") "val result = $call\n    $wipe()\n    return result"
+            else "$call\n    $wipe()\n    return"
+        pieces.append(source.slice(last, m.start()))
+        pieces
+            .append("$copy\n\n@inline @export(\"$entryName\")\n${trustedPrefix}fun ${function}Res($parameters): ${if (returns != "") returns else "void"} {\n    $entry\n}")
+        last = end
+        println(entryName)
+    }
+    pieces.append(source.slice(last, source.size))
+    Path(output).writeText(textJoin(pieces, ""))
+    0
+}

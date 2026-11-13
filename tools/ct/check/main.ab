@@ -1,0 +1,231 @@
+// Reads a target's disassembly of named functions and says whether a secret reaches a conditional branch, a memory
+// address or a division (#817: the Abla port of tools/ct/check-asm.py, same arguments, output and exit status).
+//
+//     check-asm [--follow-calls] [--residue] [--no-stack-low] [--expect-allocator] <arch> <object> <spec> ...
+//
+// spec: `function:roles`, roles a comma list of parameter positions (0-based) holding secrets, `*` for all, `@n` a
+// public pointer to secret memory (`@n!` write-only), `%n` a pointer to an object whose first 32 bytes are public.
+// See check-asm.py's docstring for what is checked; this file is that file's main().
+import "abla/io"
+import "abla/text"
+import "abla/process/arguments"
+import "./core.ab"
+import "./objdump.ab"
+import "./follow.ab"
+import "./x86.ab"
+import "./aarch64.ab"
+import "./xtensa.ab"
+import "./wasm.ab"
+
+// function name -> the positions of its header-public pointers (`%n`).
+val ctHeaders: Map<string, array<int>> = Map()
+
+class CtSpec(val name: string, val secret: array<int>, val pointers: array<int>, val roles: string)
+
+fun ctParseSpec(spec: string, countHint: int = 8): CtSpec {
+    val colon = spec.indexOf(":")
+    val name = if (colon >= 0) spec.slice(0, colon) else spec
+    val roles = if (colon >= 0) spec.slice(colon + 1, spec.size) else ""
+    val secret: array<int> = []
+    val pointers: array<int> = []
+    val headers: array<int> = []
+    if (roles == "*") {
+        var i = 0
+        while (i < countHint) {
+            secret.append(i)
+            i = i + 1
+        }
+    } else if (roles != "") {
+        for (role in roles.split(",")) {
+            if (role.startsWith("@")) {
+                var trimmed = role
+                while (trimmed.endsWith("!")) trimmed = trimmed.slice(0, trimmed.size - 1)
+                pointers.append(ctInt(trimmed.slice(1, trimmed.size)))
+            } else if (role.startsWith("%")) {
+                val position = ctInt(role.slice(1, role.size))
+                pointers.append(position)
+                headers.append(position)
+            } else {
+                secret.append(ctInt(role))
+            }
+        }
+    }
+    ctHeaders.set(name, headers)
+    CtSpec(name, secret, pointers, roles)
+}
+
+fun ctCheck(arch: string, lines: array<CtLine>, secret: array<int>, pointers: array<int>): CtTags =
+    if (arch == "x86_64") ctCheckX86(lines, secret, pointers)
+    else if (arch == "aarch64") ctCheckAarch64(lines, secret, pointers)
+    else if (arch == "xtensa") ctCheckXtensa(lines, secret, pointers)
+    else ctCheckWasm(lines, secret, pointers, 0)
+
+fun ctExtra(arch: string): array<string> = if (arch == "xtensa") ["--mcpu=esp32"] else []
+
+/** check-asm.py's SystemExit: the message on standard error, status 1. */
+fun ctExitFatal(message: string): int {
+    eprintln(message)
+    1
+}
+
+// --expect-allocator: function -> the number of direct calls to the entry, over everything walked.
+val ctAllocatorSites: Map<string, int> = Map()
+
+/** The path from `name` to a function that calls the allocation entry directly, or null. `missing` is set when the
+ *  first function isn't in the object. */
+var ctReachMissing = false
+
+fun ctReaches(arch: string, path: string, names: Map<string, bool>, name: string,
+    var seen: Map<string, bool>,
+    trail: array<string>): array<string>? {
+    if (seen.has(name) || seen.size > 64) return null
+    seen.set(name, true)
+    val lines = if (arch == "wasm") ctWasmExportLines(path, name) else ctDisassemble(path, name,
+        ctExtra(arch))
+    if (lines == null) {
+        if (trail.size == 0) ctReachMissing = true
+        return null
+    }
+    val callees: array<string> = []
+    var direct = 0
+    for (line in lines) {
+        val m = ctMatch("^(?:call\\w*|jmp\\w*|bl|b|call(?:4|8|12))\\s.*<([^>+]+)>$", line.text)
+        if (m != null) {
+            if (names.has(ctGroup(m, 1))) direct = direct + 1
+            else callees.append(ctGroup(m, 1))
+        }
+    }
+    val here: array<string> = []
+    for (step in trail) here.append(step)
+    here.append(name)
+    if (direct > 0) {
+        ctAllocatorSites.set(name, direct)
+        return here
+    }
+    for (callee in callees) {
+        val found = ctReaches(arch, path, names, callee, seen, here)
+        if (found != null) {
+            val copy: array<string> = []
+            for (step in found) copy.append(step)
+            return copy
+        }
+    }
+    null
+}
+
+fun main: int {
+    val arguments: array<string> = []
+    var index = 0
+    while (index < processArgumentCount()) {
+        arguments.append(processArgument(index))
+        index = index + 1
+    }
+    val rest: array<string> = []
+    var followCalls = false
+    var expectAllocator = false
+    for (argument in arguments) {
+        if (argument == "--residue") ctFollow.residue = true
+        else if (argument == "--no-stack-low") ctFollow.stackLow = false
+        else if (argument == "--follow-calls") followCalls = true
+        else if (argument == "--expect-allocator") expectAllocator = true
+        else rest.append(argument)
+    }
+    if (rest.size < 2) {
+        eprintln("usage: check-asm [--follow-calls] [--residue] <arch> <object> <spec> ...")
+        return 2
+    }
+    val arch = rest[0]
+    val path = rest[1]
+    val specs: array<string> = []
+    var specIndex = 2
+    while (specIndex < rest.size) {
+        specs.append(rest[specIndex])
+        specIndex = specIndex + 1
+    }
+    if (followCalls) ctFollow.path = path
+    ctFollow.objectPath = path
+    var failed = 0
+    if (expectAllocator) {
+        // Each named function must reach a call to the crypto allocation entry (directly or through functions of
+        // the object): the entry is out of line there.
+        val names = ctAllocatorNames(path)
+        if (ctFatal != "") return ctExitFatal(ctFatal)
+        if (names.size == 0) {
+            println("FAIL $arch: no $CT_ALLOCATOR symbol in the object")
+            return 1
+        }
+        for (spec in specs) {
+            val colon = spec.indexOf(":")
+            val name = if (colon >= 0) spec.slice(0, colon) else spec
+            ctReachMissing = false
+            var seen: Map<string, bool> = Map()
+            val found = ctReaches(arch, path, names, name, seen, [])
+            if (ctFatal != "") return ctExitFatal(ctFatal)
+            if (ctReachMissing) {
+                println("FAIL $arch $name: no such function in the object")
+                failed = 1
+            } else if (found != null) {
+                println("ok   $arch $name calls the allocation entry out of line (${textJoin(found, " -> ")} -> entry)")
+            } else {
+                println("FAIL $arch $name: no call to the allocation entry")
+                failed = 1
+            }
+        }
+        var sites = 0
+        for (count in ctAllocatorSites.values()) sites = sites + count
+        println("     $arch: $sites direct call sites to the entry in ${ctAllocatorSites.size} functions")
+        return failed
+    }
+    if (arch != "wasm") {
+        val names: array<string> = []
+        for (spec in specs) names.append(ctParseSpec(spec).name)
+        ctPrefetch(path, ctExtra(arch), names)
+        if (ctFatal != "") return ctExitFatal(ctFatal)
+    }
+    for (spec in specs) {
+        val parsed = ctParseSpec(spec)
+        if (ctFatal != "") return ctExitFatal(ctFatal)
+        val name = parsed.name
+        val headers = ctHeaders.get(name) ?? []
+        if (headers.size > 0 && arch != "x86_64" && arch != "aarch64" && arch != "wasm" && arch !=
+            "xtensa") {
+            println("LEAK $arch $name: a header-public pointer (%) isn't read on $arch")
+            failed = 1
+            continue
+        }
+        val found = if (arch == "wasm") ctWasmExportLines(path, name) else ctDisassemble(path, name,
+            ctExtra(arch))
+        if (ctFatal != "") return ctExitFatal(ctFatal)
+        if (found == null) return ctExitFatal(ctMissing)
+        val lines: array<CtLine> = found
+        // What the disassembler can't read could be anything: a pass over it would mean nothing.
+        var unread = ""
+        for (line in lines) {
+            if (unread == "" && line.text.contains("unknown")) unread = line.text
+        }
+        if (unread != "") {
+            println("LEAK $arch $name: the disassembler can't read: $unread")
+            failed = 1
+            continue
+        }
+        ctFollow.followed.clear()
+        var writeOnly = false
+        for (role in parsed.roles.split(",")) {
+            if (role.startsWith("@") && role.endsWith("!")) writeOnly = true
+        }
+        ctFollow.writeOnly = writeOnly
+        ctFollow.headerArgs = headers
+        ctViolation = ""
+        ctCheck(arch, lines, parsed.secret, parsed.pointers)
+        if (ctFatal != "") return ctExitFatal(ctFatal)
+        if (ctViolation != "") {
+            println("LEAK $arch $name: $ctViolation")
+            failed = 1
+        } else {
+            val following = if (ctFollow.followed.size >
+                0) ", following ${ctFollow.followed.size}" else ""
+            println("ok   $arch $name (${lines.size} instructions$following)")
+        }
+    }
+    failed
+}

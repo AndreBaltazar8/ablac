@@ -1,0 +1,907 @@
+// AArch64: check-asm.py's check_aarch64 and its helpers (#817), rule for rule.
+import "abla/text"
+import "./core.ab"
+import "./objdump.ab"
+import "./follow.ab"
+
+val CT_A64_HEADER_BYTES = 32
+// A followed call passes register tags; ctFollowCall takes numbers: xN is N, vN is CT_A64_VECTOR + N.
+val CT_A64_VECTOR = 1000000
+
+val CT_A64_ARGS: array<string> = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "v0", "v1", "v2",
+    "v3", "v4", "v5", "v6", "v7"]
+// Registers a call may change (the AAPCS64 caller-saved ones: x0 to x18, v0 to v7 and v16 to v31); x19 to x30 and the
+// low halves of v8 to v15 are the callee's to restore.
+val CT_A64_CLOBBERED: array<string> = ctA64Clobbered()
+
+fun ctA64Clobbered(): array<string> {
+    val result: array<string> = []
+    var i = 0
+    while (i < 19) {
+        result.append("x$i")
+        i = i + 1
+    }
+    i = 0
+    while (i < 32) {
+        if (i < 8 || i >= 16) result.append("v$i")
+        i = i + 1
+    }
+    result
+}
+
+val CT_A64_FLAGS: array<string> = ["adds", "subs", "ands", "bics", "cmp", "cmn", "tst", "ccmp",
+    "ccmn", "adcs", "sbcs", "fcmp", "negs"]
+val CT_A64_BRANCH_REG: array<string> = ["cbz", "cbnz", "tbz", "tbnz"]
+val CT_A64_REGISTER = "\\b[wxvbhsdq]\\d+(?:\\.\\w+)?\\b"
+val CT_A64_READS_ALL: array<string> = ["cmp", "cmn", "tst", "ccmp", "ccmn", "fcmp", "fccmp", "cbz",
+    "cbnz", "tbz", "tbnz", "st", "prfm", "prfum"]
+val CT_A64_READS_DEST: array<string> = ["movk", "bfi", "bfxil", "bfm", "ins", "bsl", "bit", "bif",
+    "sli", "sri", "aese", "aesd", "aesmc", "aesimc", "mla", "mls", "fmla", "fmls", "usra", "ssra",
+    "umlal", "smlal", "fmadd"]
+val CT_A64_STORES: array<string> = ["str", "stur", "strb", "strh", "sturb", "sturh", "stp", "stnp"]
+// Instructions that write no general register (a store's status-writing forms, such as stxr, are not among them).
+val CT_A64_NO_REGISTER_WRITE: array<string> = ["str", "stur", "strb", "strh", "sturb", "sturh",
+    "stp", "stnp", "cmp", "cmn", "tst", "ccmp", "ccmn", "fcmp", "b", "br", "ret", "cbz", "cbnz",
+    "tbz", "tbnz", "nop", "hint", "bti"]
+
+fun ctA64Has(values: array<string>, value: string): bool {
+    for (item in values) {
+        if (item == value) return true
+    }
+    false
+}
+
+fun ctA64Add(var values: array<string>, value: string): void {
+    if (!ctA64Has(values, value)) values.append(value)
+    return
+}
+
+/** tag.split(":")[n], or "" past the end. */
+fun ctA64Field(tag: string, n: int): string {
+    val parts = tag.split(":")
+    if (n < parts.size) parts[n] else ""
+}
+
+/** The first byte of `text.strip().lower()`, as a one-letter string ("" if there is none). */
+fun ctA64Kind(text: string): string {
+    val trimmed = text.trim()
+    if (trimmed.size == 0) return ""
+    val byte = trimmed[0]
+    val lower = trimmed.slice(0, 1)
+    if (byte >= 65 && byte <= 90) {
+        val letters = "abcdefghijklmnopqrstuvwxyz"
+        return letters.slice(byte - 65, byte - 64)
+    }
+    lower
+}
+
+fun ctA64Reg(raw: string): string {
+    var name = raw.trim()
+    val dot = name.indexOf(".")
+    if (dot >= 0) name = name.slice(0, dot)
+    var at = 0
+    while (at < name.size && name[at] == 35) at = at + 1
+    name = name.slice(at, name.size)
+    val general = ctMatch("^[wx](\\d+)$", name)
+    if (general != null) return "x" + ctGroup(general, 1)
+    val vector = ctMatch("^[bhsdqv](\\d+)$", name)
+    if (vector != null) return "v" + ctGroup(vector, 1)
+    name
+}
+
+/** The operands of an instruction: commas outside brackets and braces separate them. */
+fun ctA64Split(ops: string): array<string> {
+    val parts: array<string> = []
+    var depth = 0
+    var current = ""
+    var at = 0
+    while (at < ops.size) {
+        val c = ops[at]
+        if (c == 91 || c == 123) depth = depth + 1
+        if (c == 93 || c == 125) depth = depth - 1
+        if (c == 44 && depth == 0) {
+            parts.append(current.trim())
+            current = ""
+        } else {
+            current = current + ops.slice(at, at + 1)
+        }
+        at = at + 1
+    }
+    if (current.trim() != "") parts.append(current.trim())
+    parts
+}
+
+fun ctA64Op(text: string): string {
+    val parts = ctWords(text, 1)
+    if (parts.size > 0) parts[0] else ""
+}
+
+fun ctA64Ops(text: string): array<string> {
+    val parts = ctWords(text, 1)
+    if (parts.size > 1) ctA64Split(parts[1]) else []
+}
+
+/** The argument registers (x0 to x7, v0 to v7) a function may read before it writes them. */
+fun ctA64CalleeInputs(name: string): array<string> {
+    val written: array<string> = []
+    val read: array<string> = []
+    val lines = ctDisassemble(ctFollow.path, name)
+    if (lines == null) {
+        ctStop(ctMissing)
+        return read
+    }
+    for (line in lines) {
+        val op = ctA64Op(line.text)
+        val ops = ctA64Ops(line.text)
+        val regs: array<array<string>> = []
+        for (o in ops) {
+            val found: array<string> = []
+            for (r in ctFindAll(CT_A64_REGISTER, o)) found.append(ctA64Reg(r))
+            regs.append(found)
+        }
+        val branchReg = ctA64Has(CT_A64_BRANCH_REG, op)
+        if (branchReg && regs.size > 0) {
+            for (r in regs[0]) {
+                if (!ctA64Has(written, r)) ctA64Add(read, r)
+            }
+        }
+        if (op == "ret") return read
+        if (op == "b" || op == "bl" || op == "blr" || op == "br" || op.startsWith("b.") ||
+            branchReg) {
+            for (r in CT_A64_ARGS) {
+                if (!ctA64Has(written, r)) ctA64Add(read, r)
+            }
+            return read
+        }
+        val loads = ctStartsWithAny(op, ["ldr", "ldur", "ldp", "ldnp", "ldx", "ldar", "ld1", "ld2",
+            "ld3", "ld4"])
+        var memory = -1
+        var position = 0
+        while (position < ops.size) {
+            if (memory < 0 && ops[position].contains("[")) memory = position
+            position = position + 1
+        }
+        val zeroing = op == "eor" && ops.size == 3 && ops[1] == ops[2]
+        val destinations = if (ctStartsWithAny(op, CT_A64_READS_ALL) && !loads) 0
+            else if (loads && memory >= 0) memory
+            else 1
+        val readsDest = ctStartsWithAny(op, CT_A64_READS_DEST)
+        var index = 0
+        while (index < regs.size) {
+            val skip = index < destinations && !(readsDest && index == 0)
+            if (!skip && !zeroing) {
+                for (r in regs[index]) {
+                    if (!ctA64Has(written, r)) ctA64Add(read, r)
+                }
+            }
+            index = index + 1
+        }
+        index = 0
+        while (index < regs.size && index < destinations) {
+            for (r in regs[index]) ctA64Add(written, r)
+            index = index + 1
+        }
+    }
+    for (r in CT_A64_ARGS) {
+        if (!ctA64Has(written, r)) ctA64Add(read, r)
+    }
+    read
+}
+
+/** The value of `#4096` or `#1, lsl #12`, or null. */
+fun ctA64Immediate(text: string): int? {
+    val m = ctFull("#(-?(?:0x[0-9a-f]+|[0-9]+))(?:,\\s*lsl #(\\d+))?", text.trim())
+    if (m == null) return null
+    val shift = if (m.hasGroup(2) && ctGroup(m, 2) != "") ctInt(ctGroup(m, 2)) else 0
+    ctInt(ctGroup(m, 1)) << shift
+}
+
+val ctA64Extents: Map<string, int> = Map()
+
+/** How many bytes below its caller's stack pointer a function and what it calls can have written. */
+fun ctA64StackExtent(name: string, seen: array<string>): int {
+    if (ctA64Has(seen, name)) {
+        ctFail("call: recursion into $name")
+        return 0
+    }
+    val known = ctA64Extents.get(name)
+    if (known != null) return known
+    val lines = ctDisassemble(ctFollow.path, name)
+    if (lines == null) {
+        ctStop(ctMissing)
+        return 0
+    }
+    var growth = 0
+    var redZone = 0
+    var deepest = 0
+    for (line in lines) {
+        val text = line.text
+        val op = ctA64Op(text)
+        val ops = ctA64Ops(text)
+        if (ops.size > 0 && ops[0] == "sp" && !ctA64Has(["str", "stp", "ldr", "ldp"], op)) {
+            if (op == "sub" && ops.size >= 3 && ops[1] == "sp") {
+                val rest: array<string> = []
+                var k = 2
+                while (k < ops.size) {
+                    rest.append(ops[k])
+                    k = k + 1
+                }
+                val value = ctA64Immediate(textJoin(rest, ", "))
+                if (value == null) {
+                    ctFail("call: the stack growth of $name can't be evaluated: $text")
+                    return 0
+                }
+                growth = growth + value
+            } else if (op == "add" && ops.size == 3 && ops[1] == "sp" && ctA64Immediate(ops[2]) !=
+                null) {
+                // an epilogue: the stack gets shallower
+            } else if ((op == "mov" && ops.size == 2 && ops[1] == "x29") || (op == "add" &&
+                ops.size == 3 && ops[1] == "x29")) {
+                // sp restored from the frame register
+            } else {
+                ctFail("call: the stack growth of $name can't be evaluated: $text")
+                return 0
+            }
+        }
+        var index = 0
+        while (index < ops.size) {
+            val operand = ops[index]
+            val pre = ctFull("\\[sp,\\s*#(-(?:0x[0-9a-f]+|[0-9]+))\\]!", operand)
+            if (pre != null) growth = growth - ctInt(ctGroup(pre, 1))
+            if (operand == "[sp]" && index + 1 < ops.size) {
+                val post = ctA64Immediate(ops[index + 1])
+                if (post != null && post < 0) growth = growth - post
+            }
+            val plain = ctFull("\\[sp,\\s*#(-(?:0x[0-9a-f]+|[0-9]+))\\]", operand)
+            if (plain != null) {
+                val depth = -ctInt(ctGroup(plain, 1))
+                if (depth > redZone) redZone = depth
+            }
+            index = index + 1
+        }
+        val target = ctFull("(?:bl|b)\\s+(?:0x)?[0-9a-f]+ <([^>+]+)>", text)
+        if (target != null && ctGroup(target, 1) != name) {
+            val inner: array<string> = []
+            for (item in seen) inner.append(item)
+            inner.append(name)
+            val extent = ctA64StackExtent(ctGroup(target, 1), inner)
+            if (ctFailed()) return 0
+            if (extent > deepest) deepest = extent
+        }
+    }
+    ctA64Extents.set(name, growth + redZone + deepest)
+    growth + redZone + deepest
+}
+
+/** How many bytes below sp a function wipes if it is exactly what ctScrubStack emits, else null. */
+fun ctA64ScrubBytes(name: string): int? {
+    val lines = ctDisassemble(ctFollow.path, name)
+    if (lines == null) {
+        ctStop(ctMissing)
+        return null
+    }
+    val body: array<CtLine> = []
+    for (line in lines) {
+        if (!ctA64Has(["paciasp", "autiasp", "bti", "hint", "nop"], ctA64Op(line.text))) {
+            body.append(line)
+        }
+    }
+    if (body.size != 6) return null
+    val first = ctFull("sub\\s+x9,\\s*sp,\\s*(#.*)", body[0].text)
+    val size = if (first != null) ctA64Immediate(ctGroup(first, 1)) else null
+    val branch = ctFull("b\\.ne\\s+(?:0x)?([0-9a-f]+)\\b.*", body[4].text)
+    if (size == null || size <= 0 || ctFull("mov\\s+x10,\\s*sp", body[1].text) == null) return null
+    if (ctFull("stp\\s+xzr,\\s*xzr,\\s*\\[x9\\],\\s*#(?:16|0x10)",
+        body[2].text) == null) return null
+    if (ctFull("cmp\\s+x9,\\s*x10", body[3].text) == null || branch == null) return null
+    if ((ctParseHex(ctGroup(branch, 1)) ?? -1) != body[2].address) return null
+    if (body[5].text != "ret" || size % 16 != 0) return null
+    size
+}
+
+/** The bytes a plain load into `destination` touches; 0 if the instruction is anything else. */
+fun ctA64AccessWidth(op: string, destination: string): int {
+    if (op == "ldr" || op == "ldur") {
+        val kind = ctA64Kind(destination)
+        return if (kind == "w") 4 else if (kind == "x") 8 else if (kind == "b") 1
+            else if (kind == "h") 2 else if (kind == "s") 4 else if (kind == "d") 8
+            else if (kind == "q") 16 else 0
+    }
+    if (op == "ldrb" || op == "ldurb" || op == "ldrsb" || op == "ldursb") return 1
+    if (op == "ldrh" || op == "ldurh" || op == "ldrsh" || op == "ldursh") return 2
+    if (op == "ldrsw" || op == "ldursw") return 4
+    0
+}
+
+fun ctA64TagValue(state: CtTags, prefix: string): int? {
+    val values = state.withPrefix(prefix)
+    if (values.size != 1) return null
+    val value = ctA64Field(values[0], 1)
+    if (value == "?") null else ctInt(value)
+}
+
+fun ctA64SetTag(var state: CtTags, prefix: string, value: int?): void {
+    state.discardPrefix(prefix)
+    state.add(prefix + (if (value == null) "?" else "$value"))
+    return
+}
+
+/** `#n` as a number, or null. */
+fun ctA64Number(o: string): int? {
+    if (ctFull("#-?(?:0x[0-9a-f]+|[0-9]+)", o) == null) return null
+    var at = 0
+    while (at < o.size && o[at] == 35) at = at + 1
+    ctInt(o.slice(at, o.size))
+}
+
+fun ctA64ArgTag(i: int): string = if (i >= CT_A64_VECTOR) "v${i - CT_A64_VECTOR}" else "x$i"
+
+fun ctA64ArgCode(r: string): int {
+    val number = ctInt(r.slice(1, r.size))
+    if (r.startsWith("v")) CT_A64_VECTOR + number else number
+}
+
+fun ctA64FirstMemory(ops: array<string>): int {
+    var i = 0
+    while (i < ops.size) {
+        if (ops[i].contains("[")) return i
+        i = i + 1
+    }
+    -1
+}
+
+class CtA64Flow(
+    val functionAddresses: Map<int, bool>,
+    val returned: array<CtTags>,
+    val headerArgs: array<int>
+): CtFlow {
+    fun regs(o: string): array<string> {
+        val result: array<string> = []
+        for (r in ctFindAll("\\b[wxvbhsdq]\\d+(?:\\.\\w+)?\\b|\\bsp\\b", o)) result
+            .append(ctA64Reg(r))
+        result
+    }
+
+    fun t(state: CtTags, o: string): bool {
+        for (r in this.regs(o)) {
+            if (state.has(r)) return true
+        }
+        false
+    }
+
+    fun anyPointer(state: CtTags, registers: array<string>): bool {
+        for (r in registers) {
+            if (state.has("ptr:$r")) return true
+        }
+        false
+    }
+
+    /** A header-public pointer is one only while its register is never written. */
+    fun markLost(var state: CtTags, op: string, ops: array<string>): void {
+        if (op == "bl" || op == "blr") {
+            var i = 0
+            while (i < 19) {
+                state.add("lost:x$i")
+                i = i + 1
+            }
+            return
+        }
+        if (ctA64Has(CT_A64_NO_REGISTER_WRITE, op) || op.startsWith("b.")) {
+            for (o in ops) {
+                if (o.contains("[") && (o.contains("!") || (o != ops[ops.size - 1] && ctA64Has(
+                    CT_A64_STORES, op)))) {
+                    for (r in ctFindAll("\\b[xw]\\d+\\b", o)) state.add("lost:" + ctA64Reg(r))
+                }
+            }
+            return
+        }
+        var k = 0
+        while (k < ops.size) {
+            val o = ops[k]
+            if (o.contains("[")) {
+                if (o.contains("!") || k != ops.size - 1) {
+                    for (r in ctFindAll("\\b[xw]\\d+\\b", o)) state.add("lost:" + ctA64Reg(r))
+                }
+            } else {
+                for (r in ctFindAll("\\b[xwvbhsdq]\\d+\\b", o)) state.add("lost:" + ctA64Reg(r))
+            }
+            k = k + 1
+        }
+        return
+    }
+
+    /** The state after a call to a function of the same object, checked as a function of its own. */
+    fun afterCall(start: CtTags, name: string, text: string): CtTags {
+        var state = start.copy()
+        if (name == "abla_platform_panic") {
+            // A panic ends the program; it is reached only on a branch already required to be public.
+            if (state.has("x0") || state.has("ptr:x0")) {
+                ctFail("call: a panic is given a secret or a pointer to one: $text")
+            }
+            return state
+        }
+        val inputs = ctA64CalleeInputs(name)
+        if (ctFailed()) return state
+        val passed: array<int> = []
+        val pointed: array<int> = []
+        for (r in CT_A64_ARGS) {
+            if (state.has(r) && ctA64Has(inputs, r)) passed.append(ctA64ArgCode(r))
+        }
+        for (r in CT_A64_ARGS) {
+            if (state.has("ptr:$r") && !state.has(r) && ctA64Has(inputs, r)) pointed
+                .append(ctA64ArgCode(r))
+        }
+        val views: Map<int, string> = Map()
+        val out = ctFollowCall(name, passed, pointed, text, "check_aarch64", ctCheckAarch64, views)
+        if (ctFailed()) return state
+        val here = ctA64TagValue(state, "spd:")
+        val wiped = if (ctFollow.residue) ctA64ScrubBytes(name) else null
+        if (ctFailed()) return state
+        if (wiped != null && wiped != 0) {
+            // The callee zeroes [sp - wiped, sp) of the stack pointer it was called with.
+            for (tag in state.withPrefix("dirty:")) {
+                val atCall = ctA64Field(tag, 1)
+                val depth = ctA64Field(tag, 2)
+                if (here != null && atCall != "?") {
+                    if (here <= ctInt(atCall) && here + wiped >= ctInt(atCall) + ctInt(depth)) {
+                        state.discard(tag)
+                    }
+                }
+            }
+        } else if (ctFollow.residue && (passed.size > 0 || pointed.size > 0)) {
+            // Whatever the callee wrote below our stack pointer may hold a secret; a wipe has to reach it.
+            val extent = ctA64StackExtent(name, [])
+            if (ctFailed()) return state
+            val at = if (here == null) "?" else "$here"
+            state.add("dirty:$at:$extent")
+        }
+        val frameAddress = state.anyPrefix("stackbase:") || state.anyPrefix("ptrslot:")
+        for (r in CT_A64_CLOBBERED) {
+            state.discard(r)
+            state.discard("ptr:$r")
+            state.discard("stackbase:$r")
+            if (out.has(r)) state.add(r)
+            if (out.has("ptr:$r")) state.add("ptr:$r")
+        }
+        state.discard("flags")
+        // Once the function has made an address in its own frame, every slot read after a call is secret.
+        if (frameAddress) state.add("frame-dirty")
+        state
+    }
+
+    fun stackBytes(memory: string, register: string, op: string, index: int,
+        state: CtTags): array<string>? {
+        val m = ctFull("\\[(sp|x29)(?:,\\s*#(-?(?:0x[0-9a-f]+|[0-9]+)))?\\]!?", memory)
+        if (m == null) return null
+        var offset = if (m.hasGroup(2) && ctGroup(m, 2) != "") ctInt(ctGroup(m, 2)) else 0
+        val kind = ctA64Kind(register)
+        var size = if (kind == "q") 16 else if (kind == "x" || kind == "d") 8
+            else if (kind == "w" || kind == "s") 4 else if (kind == "h") 2 else 1
+        if (ctStartsWithAny(op, ["ldrb", "ldrsb", "ldurb", "ldursb", "strb", "sturb"])) size = 1
+        else if (ctStartsWithAny(op, ["ldrh", "ldrsh", "ldurh", "ldursh", "strh",
+            "sturh"])) size = 2
+        else if (ctStartsWithAny(op, ["ldrsw", "ldursw"])) size = 4
+        offset = offset + index * size
+        // While sp and x29 are known distances below the stack pointer at entry, a slot is named by its distance from
+        // that point; otherwise by its base register.
+        val below = if (ctGroup(m, 1) == "sp") ctA64TagValue(state,
+            "spd:") else ctA64TagValue(state,
+                "fpd:")
+        val slots: array<string> = []
+        var i = 0
+        while (i < size) {
+            if (below != null) slots.append("slot:f:${offset - below + i}")
+            else slots.append("slot:${ctGroup(m, 1)}:${offset + i}")
+            i = i + 1
+        }
+        slots
+    }
+
+    fun tagged(state: CtTags, slots: array<string>, prefix: string): bool {
+        for (slot in slots) {
+            if (state.has(prefix + slot)) return true
+        }
+        val base = ctA64Field(slots[0], 1)
+        for (item in state.keys()) {
+            if (item.startsWith(prefix + "slot:") && (state.has("stack-moved") ||
+                !item.startsWith(prefix + "slot:" + base + ":"))) return true
+        }
+        false
+    }
+
+    fun rawStep(start: CtTags, text: string, address: int): CtTags {
+        var state = start.copy()
+        val op = ctA64Op(text)
+        val ops = ctA64Ops(text)
+        if (state.anyPrefix("hdrp:")) this.markLost(state, op, ops)
+        if (op.startsWith("b.") || ctA64Has(CT_A64_BRANCH_REG, op)) {
+            if (op.startsWith("b.")) {
+                if (state.has("flags")) ctFail("secret branch: $text")
+            } else if (ops.size > 0 && this.t(state, ops[0])) {
+                ctFail("secret branch: $text")
+            }
+            return state
+        }
+        if (op == "b") {
+            // A jump out of the function is a call that returns for us (a tail call).
+            val target = ctSearch("0x([0-9a-f]+)\\s*<([^>+]+)>", text)
+            if (target != null) {
+                if (!this.functionAddresses.has(ctParseHex(ctGroup(target, 1)) ?? -1)) {
+                    if (ctFollow.path == "") {
+                        ctFail("call: $text")
+                        return state
+                    }
+                    this.returned.append(this.afterCall(state, ctGroup(target, 2), text))
+                }
+            } else {
+                val plain = ctSearch("0x([0-9a-f]+)", text)
+                if (plain != null && !this.functionAddresses.has(ctParseHex(ctGroup(plain,
+                    1)) ?? -1)) ctFail("call: $text")
+            }
+            return state
+        }
+        if (ctA64Has(["ret", "nop", "brk", "hint", "bti", "paciasp", "autiasp", "udf", "dmb"],
+            op)) return state
+        if (op == "bl") {
+            val callee = ctSearch("<([^>+]+)>\\s*$", text)
+            if (callee == null || !(ctFollow.path != "" || ctIsAllocator(ctGroup(callee, 1)))) {
+                ctFail("call: $text")
+                return state
+            }
+            val name = ctGroup(callee, 1)
+            if (ctIsAllocator(name)) {
+                // The crypto allocation entry: not read, the size in x0 must be public, the result in x0 is a pointer
+                // to secret memory, everything else caller-saved is lost.
+                if (state.has("x0") || state.has("ptr:x0")) {
+                    ctFail("call: the allocation entry is given a secret or a pointer to one: $text")
+                    return state
+                }
+                for (r in CT_A64_CLOBBERED) {
+                    state.discard(r)
+                    state.discard("ptr:$r")
+                    state.discard("stackbase:$r")
+                    state.discard("hdrp:$r")
+                    state.add("lost:$r")
+                }
+                state.discard("flags")
+                state.discard("lost:x0")
+                state.add("ptr:x0")
+                if (state.anyPrefix("stackbase:") || state.anyPrefix("ptrslot:")) state.add(
+                    "frame-dirty")
+                return state
+            }
+            return this.afterCall(state, name, text)
+        }
+        if (op == "blr" || op == "br") {
+            ctFail("call: $text")
+            return state
+        }
+        var stackChange = (op == "add" || op == "sub" || op == "mov") && ops.size > 0 && ops[0] ==
+            "sp"
+        if (!stackChange && ctStartsWithAny(op, ["ldr", "ldp", "str", "stp"])) {
+            for (operand in ops) {
+                if (operand.contains("[sp") && (operand.contains("!") || ops.size >
+                    ctA64IndexOf(ops,
+                        operand) + 1)) stackChange = true
+            }
+        }
+        if (stackChange && ctA64TagValue(state, "spd:") == null) {
+            var moved = state.anyPrefix("slot:") || state.anyPrefix("ptrslot:")
+            var k = 0
+            while (!moved && k < ops.size && k < 2) {
+                if (state.has("ptr:" + ctA64Reg(ops[k])) || this.t(state, ops[k])) moved = true
+                k = k + 1
+            }
+            if (moved) state.add("stack-moved")
+        }
+        if (op == "sdiv" || op == "udiv") {
+            var k = 1
+            while (k < ops.size) {
+                if (this.t(state, ops[k])) {
+                    ctFail("secret division: $text")
+                    return state
+                }
+                k = k + 1
+            }
+        }
+        if (ctFollow.writeOnly && ctStartsWithAny(op, ["swp", "cas"])) {
+            // Swaps and compare-and-swaps return the old value: a read of the memory.
+            val at = ctA64FirstMemory(ops)
+            if (at >= 0 && this.anyPointer(state, this.regs(ops[at]))) {
+                ctFail("reads the secret memory it may only overwrite: $text")
+                return state
+            }
+        }
+        if (op.startsWith("ld")) {
+            val at = ctA64FirstMemory(ops)
+            if (at < 0) {
+                ctStop("StopIteration: $text")
+                return state
+            }
+            val memory = ops[at]
+            val inner = this.regs(memory)
+            for (r in inner) {
+                if (state.has(r)) {
+                    ctFail("secret address: $text")
+                    return state
+                }
+            }
+            if (ctFollow.writeOnly && this.anyPointer(state, inner)) {
+                ctFail("reads the secret memory it may only overwrite: $text")
+                return state
+            }
+            val header = ctFull("\\[(x\\d+)(?:,\\s*#(0x[0-9a-f]+|\\d+))?\\]", memory)
+            val width = if (at == 1) ctA64AccessWidth(op, ops[0]) else 0
+            var publicHeader = false
+            if (header != null && width != 0) {
+                val base = ctA64Reg(ctGroup(header, 1))
+                if (state.has("hdrp:$base") && !state.has("lost:$base")) {
+                    val displacement = if (header.hasGroup(2) && ctGroup(header, 2) != "") ctGroup(
+                        header, 2) else "0"
+                    publicHeader = ctInt(displacement) + width <= CT_A64_HEADER_BYTES
+                }
+            }
+            var i = 0
+            while (i < at) {
+                val d = ops[i]
+                val r = ctA64Reg(d)
+                val pointerBase = this.anyPointer(state, inner)
+                val frame = inner.size == 0 || inner[0] != "x29" || state.has("stackbase:x29")
+                val slots = if (pointerBase || !frame) null else this.stackBytes(memory, d, op, i,
+                    state)
+                val value = if (slots != null) this.tagged(state, slots, "") || state.has(
+                    "frame-dirty") else !publicHeader
+                val pointer = slots != null && this.tagged(state, slots, "ptr")
+                if (value) state.add(r) else state.discard(r)
+                if (pointer) state.add("ptr:$r") else state.discard("ptr:$r")
+                state.discard("stackbase:$r")
+                i = i + 1
+            }
+            return state
+        }
+        if (op.startsWith("st")) {
+            val at = ctA64FirstMemory(ops)
+            if (at < 0) {
+                ctStop("StopIteration: $text")
+                return state
+            }
+            val memory = ops[at]
+            val inner = this.regs(memory)
+            for (r in inner) {
+                if (state.has(r)) {
+                    ctFail("secret address: $text")
+                    return state
+                }
+            }
+            if (state.anyPrefix("hdrp:") && this.anyPointer(state, inner)) {
+                var secretSource = false
+                var k = 0
+                while (k < at) {
+                    if (this.t(state, ops[k])) secretSource = true
+                    k = k + 1
+                }
+                if (secretSource) {
+                    ctFail("secret stored through an object pointer: $text")
+                    return state
+                }
+            }
+            var i = 0
+            while (i < at) {
+                val source = ops[i]
+                val pointerBase = this.anyPointer(state, inner)
+                val frame = inner.size == 0 || inner[0] != "x29" || state.has("stackbase:x29")
+                val slots = if (pointerBase || !frame) null else this.stackBytes(memory, source, op,
+                    i, state)
+                val secretValue = this.t(state, source)
+                if (this.headerArgs.size > 0 && secretValue && slots == null) {
+                    // Not this function's own frame: static memory could be the object whose header is read as public.
+                    ctFail("secret stored through an object pointer or outside the frame: $text")
+                    return state
+                }
+                if (slots != null) {
+                    val pointer = state.has("ptr:" + ctA64Reg(source))
+                    for (slot in slots) {
+                        if (secretValue) state.add(slot) else state.discard(slot)
+                        if (pointer) state.add("ptr$slot") else state.discard("ptr$slot")
+                    }
+                }
+                i = i + 1
+            }
+            return state
+        }
+        if (ctA64Has(["cmp", "cmn", "tst", "fcmp", "ccmp", "ccmn"], op)) {
+            var value = false
+            for (o in ops) {
+                if (this.t(state, o)) value = true
+            }
+            if (op.startsWith("cc") && state.has("flags")) value = true
+            if (value) state.add("flags") else state.discard("flags")
+            return state
+        }
+        if (ops.size == 0) return state
+        val dest = ctA64Reg(ops[0])
+        var value = false
+        var k = 1
+        while (k < ops.size) {
+            if (this.t(state, ops[k])) value = true
+            k = k + 1
+        }
+        if (ctStartsWithAny(op, ["csel", "csinc", "csinv", "csneg", "cset", "csetm", "adc", "sbc",
+            "cinc", "cinv", "cneg"]) && state.has("flags")) value = true
+        // Vector instructions that keep part of what they write.
+        if (ctA64Has(["ins", "mov", "aese", "aesd", "aesmc", "aesimc", "bsl", "bit", "bif", "sli",
+            "sri"], op) && ops[0].contains(".")) value = value || state.has(dest)
+        // What a pointer to secrets becomes through moves and offsets stays one.
+        val src = if (ops.size > 1) ctA64Reg(ops[1]) else ""
+        var pointerSource = false
+        k = 1
+        while (k < ops.size) {
+            if (state.has("ptr:" + ctA64Reg(ops[k]))) pointerSource = true
+            k = k + 1
+        }
+        val moves = op == "mov" || op == "add" || op == "sub"
+        if (moves && pointerSource && dest != "sp") {
+            state.add("ptr:$dest")
+            state.discard("stackbase:$dest")
+            if (value) state.add(dest) else state.discard(dest)
+            return state
+        }
+        if (moves && (src == "sp" || state.has("stackbase:$src")) && dest != "sp") {
+            state.add("stackbase:$dest")
+            state.discard("ptr:$dest")
+            if (value) state.add(dest) else state.discard(dest)
+            return state
+        }
+        // A zeroing idiom.
+        if (op == "eor" && ops.size == 3 && ops[1] == ops[2]) value = false
+        if (value) state.add(dest) else state.discard(dest)
+        state.discard("ptr:$dest")
+        state.discard("stackbase:$dest")
+        if (ctStartsWithAny(op, CT_A64_FLAGS)) {
+            if (value) state.add("flags") else state.discard("flags")
+        }
+        state
+    }
+
+    /** rawStep, then the new distances of sp and x29 below the stack pointer at entry (spd, fpd). */
+    fun step(stateIn: CtTags, text: string, address: int): CtTags {
+        var out = this.rawStep(stateIn, text, address)
+        if (ctFailed()) return out
+        val op = ctA64Op(text)
+        val ops = ctA64Ops(text)
+        val spd = ctA64TagValue(stateIn, "spd:")
+        val fpd = if (stateIn.has("stackbase:x29")) ctA64TagValue(stateIn, "fpd:") else null
+        var newSp = spd
+        if (ops.size > 0 && ops[0] == "sp" && (op == "add" || op == "sub" || op == "mov")) {
+            val third = if (ops.size == 3) ctA64Number(ops[2]) else null
+            if ((op == "add" || op == "sub") && ops.size == 3 && ops[1] == "sp" && third != null) {
+                newSp = if (spd == null) null else spd + (if (op == "sub") third else -third)
+            } else if (op == "mov" && ops.size == 2 && ops[1] == "x29") {
+                newSp = fpd
+            } else if (op == "add" && ops.size == 3 && ops[1] == "x29" && third != null) {
+                newSp = if (fpd == null) null else fpd - third
+            } else {
+                newSp = null
+            }
+        }
+        var index = 0
+        while (index < ops.size) {
+            val operand = ops[index]
+            val pre = ctFull("\\[sp,\\s*#(-?(?:0x[0-9a-f]+|[0-9]+))\\]!", operand)
+            val next = if (index + 1 < ops.size) ctA64Number(ops[index + 1]) else null
+            if (pre != null && ctStartsWithAny(op, ["ldr", "ldp", "str", "stp"])) {
+                val current = newSp
+                newSp = if (current == null) null else current - ctInt(ctGroup(pre, 1))
+            } else if (operand == "[sp]" && next != null) {
+                val current = newSp
+                newSp = if (current == null) null else current - next
+            }
+            index = index + 1
+        }
+        ctA64SetTag(out, "spd:", newSp)
+        if (newSp == null && spd != null && (out.anyPrefix("slot:") || out.anyPrefix("ptrslot:"))) {
+            out.add("stack-moved")
+        }
+        // x29: a frame address (x29 = sp + n), or anything else written to it.
+        val written: array<string> = []
+        if (ctStartsWithAny(op, ["ldp", "ldnp"])) {
+            var k = 0
+            while (k < ops.size && k < 2) {
+                written.append(ctA64Reg(ops[k]))
+                k = k + 1
+            }
+        } else if (ops.size > 0 && !ctStartsWithAny(op, ["str", "stp", "stur", "cmp", "cmn", "tst",
+            "b", "cb", "tb"])) {
+            written.append(ctA64Reg(ops[0]))
+        }
+        if (ctA64Has(written, "x29")) {
+            if ((op == "add" || op == "mov") && ops.size > 1 && ops[1] == "sp" && spd != null) {
+                val third = if (ops.size > 2) ctA64Number(ops[2]) else null
+                if (ops.size == 2 || third != null) {
+                    val offset = if (ops.size == 3 && third != null) third else 0
+                    ctA64SetTag(out, "fpd:", spd - offset)
+                } else {
+                    ctA64SetTag(out, "fpd:", null)
+                }
+            } else {
+                ctA64SetTag(out, "fpd:", null)
+            }
+        } else if (!out.anyPrefix("fpd:") && stateIn.anyPrefix("fpd:")) {
+            ctA64SetTag(out, "fpd:", ctA64TagValue(stateIn, "fpd:"))
+        }
+        out
+    }
+
+    fun successors(text: string, i: int, index: Map<int, int>): array<int> {
+        val op = ctA64Op(text)
+        val out: array<int> = []
+        if (op == "ret" || op == "udf" || op == "brk") return out
+        if (op == "b" || op.startsWith("b.") || ctA64Has(CT_A64_BRANCH_REG, op)) {
+            val m = ctSearch("0x([0-9a-f]+)\\s*(<|$)", text) ?? ctSearch("([0-9a-f]+) <", text)
+            if (m != null) {
+                val target = index.get(ctParseHex(ctGroup(m, 1)) ?? -1)
+                if (target != null) out.append(target)
+            }
+            if (op == "b") return out
+        }
+        out.append(i + 1)
+        out
+    }
+}
+
+fun ctA64IndexOf(values: array<string>, value: string): int {
+    var i = 0
+    while (i < values.size) {
+        if (values[i] == value) return i
+        i = i + 1
+    }
+    -1
+}
+
+fun ctCheckAarch64(lines: array<CtLine>, secret: array<int>, pointers: array<int>): CtTags {
+    val functionAddresses: Map<int, bool> = Map()
+    for (line in lines) functionAddresses.set(line.address, true)
+    val headerArgs: array<int> = []
+    for (i in ctFollow.headerArgs) headerArgs.append(i)
+    // A followed callee has none.
+    ctFollow.headerArgs = []
+    // A spec gives argument numbers; a followed call gives the register tags it passes (x0, v1, ptr:x2).
+    val start = ctTags()
+    for (i in secret) start.add(ctA64ArgTag(i))
+    for (i in pointers) start.add("ptr:" + ctA64ArgTag(i))
+    start.add("spd:0")
+    for (i in headerArgs) start.add("hdrp:x$i")
+    val flow = CtA64Flow(functionAddresses, [], headerArgs)
+    val states = ctFixpoint(lines, start, flow)
+    if (ctFailed()) return ctTags()
+    // What the function leaves in its registers when it returns, for a caller that follows it.
+    val out = ctTags()
+    var i = 0
+    while (i < lines.size) {
+        val path = states.get(i)
+        if (ctFirstWord(lines[i].text) == "ret" && path != null) out.addAll(path)
+        i = i + 1
+    }
+    for (path in flow.returned) out.addAll(path)
+    if (ctFollow.residue && ctFollow.stack.size == 0) {
+        // A secret in a slot of the entry's frame is a copy in memory that nothing wipes, and so are the frames of a
+        // callee it gave a secret to, unless a wipe below sp covered them.
+        val residue: array<string> = []
+        for (item in sortedStrings(out.withPrefix("slot:"))) residue.append(item)
+        val callee: array<string> = []
+        for (item in out.withPrefix("dirty:")) callee.append("${ctA64Field(item,
+            2)} bytes of callee frames")
+        for (item in sortedStrings(callee)) residue.append(item)
+        if (residue.size > 0) {
+            val shown: array<string> = []
+            var n = 0
+            while (n < residue.size && n < 4) {
+                shown.append(residue[n])
+                n = n + 1
+            }
+            ctFail("secret residue at return: ${textJoin(shown, ", ")}")
+            return ctTags()
+        }
+    }
+    out
+}

@@ -1,0 +1,1025 @@
+// Xtensa (windowed ABI: arguments in a2 up): check-asm.py's check_xtensa and its helpers (#817), rule for rule.
+import "abla/text"
+import "./core.ab"
+import "./objdump.ab"
+
+val CT_XT_ARGS: array<string> = ["a2", "a3", "a4", "a5", "a6", "a7"]
+val CT_XT_HEADER_BYTES = 32
+val CT_XT_BRANCHES: Map<string, bool> = ctXtNameSet(
+    "beq bne bge blt bgeu bltu bany bnone ball bnall bbc bbs beqz bnez bgez bltz beqi bnei bgei blti bgeui bltui bbci bbsi")
+val CT_XT_PURE_LIBCALLS: Map<string, bool> = ctXtNameSet(
+    "__divdi3 __udivdi3 __moddi3 __umoddi3 __muldi3 __ashldi3 __lshrdi3 __ashrdi3")
+val CT_XT_CALL = "^call(4|8|12)\\s+\\S+\\s+<([^>+]+)>$"
+
+fun ctXtNameSet(names: string): Map<string, bool> {
+    val result: Map<string, bool> = Map()
+    for (name in ctWords(names)) result.set(name, true)
+    result
+}
+
+/** XT_BRANCH: a conditional branch, with or without `.n`. */
+fun ctXtIsBranch(op: string): bool {
+    if (CT_XT_BRANCHES.has(op)) return true
+    op.endsWith(".n") && CT_XT_BRANCHES.has(op.slice(0, op.size - 2))
+}
+
+fun ctXtIsCondMove(op: string): bool = ctStartsWithAny(op, ["moveqz", "movnez", "movltz", "movgez"])
+
+/** re.fullmatch(r"a\d+", text) */
+fun ctXtIsReg(text: string): bool {
+    if (text.size < 2 || text[0] != 97) return false
+    var at = 1
+    while (at < text.size) {
+        if (text[at] < 48 || text[at] > 57) return false
+        at = at + 1
+    }
+    true
+}
+
+/** `[o.strip() for o in parts[1].split(",")] if len(parts) > 1 else []` of `text.split(None, 1)`. */
+fun ctXtOps(text: string): array<string> {
+    val parts = ctWords(text, 1)
+    val ops: array<string> = []
+    if (parts.size > 1) {
+        for (o in parts[1].split(",")) ops.append(o.trim())
+    }
+    ops
+}
+
+/** tag.split(":")[n] */
+fun ctXtField(tag: string, n: int): string {
+    val parts = tag.split(":")
+    if (n < parts.size) parts[n] else ""
+}
+
+fun ctXtHas(values: array<string>, value: string): bool {
+    for (item in values) {
+        if (item == value) return true
+    }
+    false
+}
+
+// --- Reading the callees ----------------------------------------------------------------------------------------
+val ctXtLinesCache: Map<string, array<CtLine>> = Map()
+
+/** xt_disassemble: a function the checker reaches by a call that the object doesn't define is a violation of the
+ *  function that called it, not the end of the run. Null with the violation set. */
+fun ctXtDisassemble(name: string): array<CtLine>? {
+    val key = "${ctFollow.path}\n$name"
+    val known = ctXtLinesCache.get(key)
+    if (known != null) return known
+    val before = ctFatal
+    val lines = ctDisassemble(ctFollow.path, name, ["--mcpu=esp32"])
+    if (lines == null) {
+        ctFatal = before
+        ctFail("call: $name isn't defined in the object")
+        return null
+    }
+    ctXtLinesCache.set(key, lines)
+    lines
+}
+
+/** The N of the function's `entry a1, N`, which must be its first instruction (-1 with the violation set). */
+fun ctXtFrameSize(lines: array<CtLine>, name: string): int {
+    val m = if (lines.size > 0) ctFull("entry\\s+a1,\\s*(\\d+)", lines[0].text) else null
+    if (m == null) {
+        ctFail("call: $name doesn't start with entry a1, N")
+        return -1
+    }
+    ctInt(ctGroup(m, 1))
+}
+
+val ctXtExtents: Map<string, int> = Map()
+
+/** xt_stack_extent: how far below its caller's stack pointer a function and what it calls can have written. */
+fun ctXtStackExtent(name: string, seen: array<string>): int {
+    if (ctXtHas(seen, name)) {
+        ctFail("call: recursion into $name")
+        return 0
+    }
+    val known = ctXtExtents.get(name)
+    if (known != null) return known
+    val lines = ctXtDisassemble(name)
+    if (lines == null) return 0
+    val frame = ctXtFrameSize(lines, name)
+    if (ctFailed()) return 0
+    var deepest = 0
+    var i = 1
+    while (i < lines.size) {
+        val text = lines[i].text
+        i = i + 1
+        val first = ctFirstWord(text)
+        val ops = ctXtOps(text)
+        if (first == "movsp" || (ops.size > 0 && ops[0] == "a1")) {
+            ctFail("call: the stack growth of $name can't be evaluated: $text")
+            return 0
+        }
+        val call = ctMatch(CT_XT_CALL, text)
+        if (call != null) {
+            val callee = ctGroup(call, 2)
+            if (!CT_XT_PURE_LIBCALLS.has(callee)) {
+                val deeper: array<string> = []
+                for (item in seen) deeper.append(item)
+                deeper.append(name)
+                val extent = ctXtStackExtent(callee, deeper)
+                if (ctFailed()) return 0
+                if (extent > deepest) deepest = extent
+            }
+        } else if (first.startsWith("callx") || first.startsWith("jx")) {
+            ctFail("call: the stack growth of $name can't be evaluated: $text")
+            return 0
+        }
+    }
+    ctXtExtents.set(name, frame + 16 + deepest)
+    frame + 16 + deepest
+}
+
+class CtXtScrub(val frame: int, val size: int)
+
+val ctXtScrubChecked: Map<string, bool> = Map()
+val ctXtScrubFound: Map<string, CtXtScrub> = Map()
+
+/** xt_scrub: (frame, bytes) if a function is ctScrubStack's wipe on Xtensa (ablaCtScrubBoundedStack), else null. */
+fun ctXtScrub(name: string): CtXtScrub? {
+    if (ctXtScrubChecked.has(name)) return ctXtScrubFound.get(name)
+    val found = ctXtScrubRead(name)
+    if (ctFailed()) return null
+    ctXtScrubChecked.set(name, true)
+    if (found != null) ctXtScrubFound.set(name, found)
+    found
+}
+
+fun ctXtScrubRead(name: string): CtXtScrub? {
+    val all = ctXtDisassemble(name)
+    if (all == null) return null
+    val body: array<CtLine> = []
+    for (line in all) {
+        if (ctFull("nop(\\.n)?", line.text) == null) body.append(line)
+    }
+    val lines: array<string> = []
+    for (line in body) lines.append(line.text)
+    val entry = if (lines.size > 0) ctFull("entry\\s+a1,\\s*(\\d+)", lines[0]) else null
+    var start = -1
+    var i = 0
+    while (i < lines.size && start < 0) {
+        if (ctFull("addi\\s+a8,\\s*a1,\\s*-16", lines[i]) != null) start = i
+        i = i + 1
+    }
+    if (entry == null || start < 0 || lines.size - start != 16) return null
+    // The prefix is exactly the call of the private function that asks the image and the move of its result into
+    // the limit register; a frame pointer may come first.
+    val prefix: array<string> = []
+    i = 1
+    while (i < start) {
+        if (ctFull("mov(\\.n)?\\s+a7,\\s*a1", lines[i]) == null) prefix.append(lines[i])
+        i = i + 1
+    }
+    if (prefix.size != 2) return null
+    val asked = ctFull("call8\\s+\\S+\\s+<\\.Labla\\.ct\\.stack\\.low>", prefix[0])
+    val taken = ctFull("mov(\\.n)?\\s+(a\\d+),\\s*a10", prefix[1])
+    if (asked == null || taken == null) return null
+    val loop: array<string> = []
+    i = start
+    while (i < lines.size) {
+        loop.append(lines[i])
+        i = i + 1
+    }
+    val count = ctFull("movi\\s+a10,\\s*(\\d+)", loop[2])
+    val zeroSkip = ctFull("beqz\\s+(a\\d+),\\s*(?:0x)?([0-9a-f]+)\\b.*", loop[3])
+    if (count == null || zeroSkip == null) return null
+    val low = ctGroup(zeroSkip, 1)
+    val done = ctParseHex(ctGroup(zeroSkip, 2)) ?? 0
+    if (low != ctGroup(taken, 2)) return null
+    val doneHex = ctHex(done)
+    val back = ctHex(body[start + 10].address)
+    val expected: array<string> = [
+        "addi\\s+a8,\\s*a1,\\s*-16", "movi\\s+a9,\\s*0", "movi\\s+a10,\\s*\\d+",
+        "beqz\\s+$low,\\s*(?:0x)?$doneHex\\b.*", "bgeu\\s+$low,\\s*a8,\\s*(?:0x)?$doneHex\\b.*",
+        "sub\\s+a11,\\s*a8,\\s*$low", "srli\\s+a11,\\s*a11,\\s*2",
+        "beqz\\s+a11,\\s*(?:0x)?$doneHex\\b.*",
+        "bgeu\\s+a11,\\s*a10,\\s*(?:0x)?$back\\b.*",
+        "(mov(\\.n)?\\s+a10,\\s*a11|or\\s+a10,\\s*a11,\\s*a11)",
+        "addi\\s+a8,\\s*a8,\\s*-4", "s32i\\s+a9,\\s*a8,\\s*0", "addi\\s+a10,\\s*a10,\\s*-1",
+        "bnez\\s+a10,\\s*(?:0x)?$back\\b.*", "movi\\s+a8,\\s*0", "retw(\\.n)?"
+    ]
+    if (low == "a8" || low == "a9" || low == "a10" || low == "a11" || body[start + 14].address !=
+        done) return null
+    i = 0
+    while (i < expected.size) {
+        if (ctFull(expected[i], loop[i]) == null) return null
+        i = i + 1
+    }
+    val words = ctInt(ctGroup(count, 1))
+    if (words <= 0) return null
+    CtXtScrub(ctInt(ctGroup(entry, 1)), 4 * words)
+}
+
+/** A state being stepped: the state it started from, copied only once something in it changes. */
+class CtXtState(var tags: CtTags, var owned: bool) {
+    fun has(tag: string): bool = this.tags.has(tag)
+    fun own(): void {
+        if (!this.owned) {
+            this.tags = this.tags.copy()
+            this.owned = true
+        }
+        return
+    }
+    fun add(tag: string): void {
+        if (!this.tags.has(tag)) {
+            this.own()
+            this.tags.add(tag)
+        }
+        return
+    }
+    fun discard(tag: string): void {
+        if (this.tags.has(tag)) {
+            this.own()
+            this.tags.discard(tag)
+        }
+        return
+    }
+    fun anyPrefix(prefix: string): bool = this.tags.anyPrefix(prefix)
+    fun withPrefix(prefix: string): array<string> = this.tags.withPrefix(prefix)
+    fun discardPrefix(prefix: string): void {
+        if (this.tags.anyPrefix(prefix)) {
+            this.own()
+            this.tags.discardPrefix(prefix)
+        }
+        return
+    }
+}
+
+/** xt_dirty: adds [low, high) (offsets from the checked function's a1) to the dirty bytes under its stack, merged. */
+fun ctXtDirty(var state: CtXtState, from: int, to: int): void {
+    var low = from
+    var high = to
+    for (tag in state.withPrefix("xdirty:")) {
+        val a = ctInt(ctXtField(tag, 1))
+        val b = ctInt(ctXtField(tag, 2))
+        if (a <= high && b >= low) {
+            state.discard(tag)
+            if (a < low) low = a
+            if (b > high) high = b
+        }
+    }
+    if (low < high) state.add("xdirty:$low:$high")
+    return
+}
+
+/** xt_clean: takes [low, high) out of the dirty bytes: something public was written over it. */
+fun ctXtClean(var state: CtXtState, low: int, high: int): void {
+    for (tag in state.withPrefix("xdirty:")) {
+        val a = ctInt(ctXtField(tag, 1))
+        val b = ctInt(ctXtField(tag, 2))
+        if (a < high && b > low) {
+            state.discard(tag)
+            if (a < low) state.add("xdirty:$a:$low")
+            if (b > high) state.add("xdirty:$high:$b")
+        }
+    }
+    return
+}
+
+fun ctXtAddUnwritten(var read: CtTags, written: CtTags): void {
+    for (r in CT_XT_ARGS) {
+        if (!written.has(r)) read.add(r)
+    }
+    return
+}
+
+/** callee_inputs_xtensa: the argument registers (a2 to a7) a function may read before it writes them. */
+fun ctXtCalleeInputs(name: string): CtTags? {
+    var written = ctTags()
+    var read = ctTags()
+    val lines = ctXtDisassemble(name)
+    if (lines == null) return null
+    for (line in lines) {
+        val op = ctFirstWord(line.text)
+        val ops = ctXtOps(line.text)
+        if (op == "retw" || op == "retw.n") return read
+        if (ctXtIsBranch(op)) {
+            var k = 0
+            while (k + 1 < ops.size) {
+                if (ctXtIsReg(ops[k]) && !written.has(ops[k])) read.add(ops[k])
+                k = k + 1
+            }
+            ctXtAddUnwritten(read, written)
+            return read
+        }
+        if (op == "j" || op == "j.n" || op.startsWith("call") || op.startsWith("jx")) {
+            ctXtAddUnwritten(read, written)
+            return read
+        }
+        val stores = op == "s8i" || op == "s16i" || op == "s32i" || op == "s32i.n" || op ==
+            "s32c1i" || op ==
+            "s32ri"
+        var index = 0
+        while (index < ops.size) {
+            val operand = ops[index]
+            if (ctXtIsReg(operand) && (stores || index > 0)) {
+                if (!(op == "xor" && ops[1] == ops[2])) {
+                    if (!written.has(operand)) read.add(operand)
+                }
+            }
+            index = index + 1
+        }
+        if (ops.size > 0 && !stores && ctXtIsReg(ops[0]) && op != "entry" && op !=
+            "memw") written.add(ops[0])
+    }
+    ctXtAddUnwritten(read, written)
+    read
+}
+
+/** follow_call_xtensa: the callee starts with exactly these register tags (its a2 to a7). */
+fun ctXtFollowCall(name: string, tags: CtTags, text: string): CtTags {
+    ctFollow.followed.set(name, true)
+    val key = "xtensa\n$name\n${textJoin(tags.sorted(), ",")}"
+    val known = ctFollow.done.get(key)
+    if (known != null) return known
+    if (ctXtHas(ctFollow.stack, name)) {
+        ctFail("call: recursion into $name: $text")
+        return ctTags()
+    }
+    val lines = ctXtDisassemble(name)
+    if (lines == null) return ctTags()
+    for (line in lines) {
+        if (line.text.contains("unknown")) {
+            ctFail("call: the disassembler can't read $name: ${line.text}")
+            return ctTags()
+        }
+    }
+    ctFollow.stack.append(name)
+    val returned = ctXtCheck(lines, tags, [], [])
+    ctFollow.stack.truncate(ctFollow.stack.size - 1)
+    if (ctViolation != "") {
+        ctViolation = "in $name: $ctViolation"
+        return ctTags()
+    }
+    if (ctFatal != "") return ctTags()
+    ctFollow.done.set(key, returned)
+    returned
+}
+
+// --- The checker ------------------------------------------------------------------------------------------------
+class CtXtFlow(val residue: bool): CtFlow {
+    /** tags_of: the register tags a step reads (frame offsets, constants, header pointers, spilled frame addresses). */
+    fun tagsOf(state: CtTags): array<string> {
+        val found: array<string> = []
+        for (x in state.items) {
+            if (ctXtIsRegisterTag(x)) {
+                found.append(x)
+            }
+        }
+        found
+    }
+
+    /** How far `register` is above a1, when it is a1 itself or a copy of it plus a constant, else null. */
+    fun frameOffset(tags: array<string>, register: string): int? {
+        if (register == "a1") return 0
+        val prefix = "sb:$register:"
+        val values: array<string> = []
+        for (tag in tags) {
+            if (tag.startsWith(prefix)) values.append(ctXtField(tag, 2))
+        }
+        if (values.size == 1 && values[0] != "?") ctInt(values[0]) else null
+    }
+
+    /** drop_register: forget what `register` held (and, with `base`, that it is a frame address). */
+    fun dropRegister(var state: CtXtState, tags: array<string>, register: string,
+        base: bool): void {
+        // The step's snapshot of register tags is sorted (a filter of a sorted state): each prefix is one run of it.
+        for (prefix in ["sb:$register:", "const:$register:"]) {
+            var at = ctXtLowerBound(tags, prefix)
+            while (at < tags.size && tags[at].startsWith(prefix)) {
+                state.discard(tags[at])
+                at = at + 1
+            }
+        }
+        if (base) {
+            // As the prefix match before: stackbase:a1 also named a10 to a15.
+            if (register ==
+                "a1") state.discardPrefix("stackbase:a1") else state.discard("stackbase:$register")
+        }
+        return
+    }
+
+    fun dropWindow(var state: CtXtState, tags: array<string>, rotation: int): void {
+        var r = rotation
+        while (r < 16) {
+            state.discard("a$r")
+            state.discard("ptr:a$r")
+            state.discard("stackbase:a$r")
+            this.dropRegister(state, tags, "a$r", false)
+            r = r + 1
+        }
+        return
+    }
+
+    fun known(tags: array<string>, register: string): array<string> {
+        val prefix = "const:$register:"
+        val values: array<string> = []
+        for (x in tags) {
+            if (x.startsWith(prefix)) values.append(ctXtField(x, 2))
+        }
+        values
+    }
+
+    fun constant(tags: array<string>, register: string): int? {
+        val values = this.known(tags, register)
+        if (values.size == 1 && values[0] != "?") ctInt(values[0]) else null
+    }
+
+    fun unsureBase(tags: array<string>, register: string): bool {
+        if (this.frameOffset(tags, register) != null) return false
+        val prefix = "sb:$register:"
+        for (x in tags) {
+            if (x.startsWith(prefix)) return true
+        }
+        false
+    }
+
+    fun unsureConstant(tags: array<string>, register: string): bool = this.constant(tags,
+        register) == null && this.known(tags, register).size > 0
+
+    fun afterCall(state: CtTags, rotation: int, name: string, text: string): CtTags {
+        if (CT_XT_PURE_LIBCALLS.has(name)) return this.pureLibcall(state, rotation, name, text)
+        this.afterFollowedCall(state, rotation, name, text)
+    }
+
+    /** A compiler-rt arithmetic helper: with public arguments its results are public; a division by a secret or
+     *  of one is a secret division, any other helper's results are as secret as its arguments. */
+    fun pureLibcall(given: CtTags, rotation: int, name: string, text: string): CtTags {
+        val tags = this.tagsOf(given)
+        var state = CtXtState(given, false)
+        var secret = false
+        var pointer = false
+        var k = 2
+        while (k < 6) {
+            if (rotation + k <= 15) {
+                if (state.has("a${rotation + k}")) secret = true
+                if (state.has("ptr:a${rotation + k}")) pointer = true
+            }
+            k = k + 1
+        }
+        if (pointer) {
+            ctFail("call: $name is given a pointer to a secret: $text")
+            return ctTags()
+        }
+        if (secret && ctStartsWithAny(name, ["__div", "__mod", "__udiv", "__umod"])) {
+            ctFail("secret division: $text")
+            return ctTags()
+        }
+        if ((name == "__ashldi3" || name == "__lshrdi3" || name == "__ashrdi3") &&
+            state.has("a${rotation + 4}")) {
+            // The count is the third argument word (a4 of the callee); the helpers branch on count >= 32.
+            ctFail("secret shift count: $text")
+            return ctTags()
+        }
+        this.dropWindow(state, tags, rotation)
+        if (secret) {
+            for (j in [2, 3]) {
+                if (rotation + j <= 15) state.add("a${rotation + j}")
+            }
+        }
+        state.tags
+    }
+
+    /** The state after a windowed call to a function of the same object, checked as a function of its own. */
+    fun afterFollowedCall(given: CtTags, rotation: int, name: string, text: string): CtTags {
+        val held = this.tagsOf(given)
+        var state = CtXtState(given, false)
+        val wipe = ctXtScrub(name)
+        if (ctFailed()) return ctTags()
+        if (this.residue) {
+            val lines = ctXtDisassemble(name)
+            if (lines == null) return ctTags()
+            val calleeFrame = ctXtFrameSize(lines, name)
+            if (ctFailed()) return ctTags()
+            // While the callee runs, a window overflow keeps our a0-a3 in the 16 bytes under its stack pointer.
+            var low = false
+            for (r in [0, 1, 2, 3]) {
+                if (state.has("a$r") || state.has("ptr:a$r")) low = true
+            }
+            if (low) ctXtDirty(state, -calleeFrame - 16, -calleeFrame)
+            state.discard("xnoreach")
+            state.add("xreach:${-calleeFrame - 16}")
+            if (wipe != null && ctFollow.stackLow) {
+                ctXtClean(state, -wipe.frame - 16 - wipe.size, -wipe.frame - 16)
+            }
+        }
+        if (wipe != null) {
+            // Not followed: it is given nothing and leaves nothing but zeros; its window is dead after it.
+            this.dropWindow(state, held, rotation)
+            return state.tags
+        }
+        val inputs = ctXtCalleeInputs(name)
+        if (inputs == null) return ctTags()
+        val tags = ctTags()
+        var k = 2
+        while (k < 8) {
+            if (rotation + k <= 15 && inputs.has("a$k")) {
+                if (state.has("a${rotation + k}")) tags.add("a$k")
+                else if (state.has("ptr:a${rotation + k}")) tags.add("ptr:a$k")
+            }
+            k = k + 1
+        }
+        val out = ctXtFollowCall(name, tags, text)
+        if (ctFailed()) return ctTags()
+        if (this.residue && tags.size() > 0) {
+            // Given a secret: everything it and its callees wrote under our a1 may hold one, down to its depth.
+            val extent = ctXtStackExtent(name, [])
+            if (ctFailed()) return ctTags()
+            ctXtDirty(state, -extent, -16)
+        }
+        val frameAddress = state.has("frameaddr")
+        this.dropWindow(state, held, rotation)
+        k = 2
+        while (k < 8) {
+            if (rotation + k <= 15) {
+                if (out.has("a$k")) state.add("a${rotation + k}")
+                if (out.has("ptr:a$k")) state.add("ptr:a${rotation + k}")
+            }
+            k = k + 1
+        }
+        if (frameAddress) {
+            state.add("frame-dirty")
+            state.discardPrefix("fslot:")
+        }
+        state.tags
+    }
+
+    fun anySlot(state: CtXtState): bool = state.anyPrefix("slot:") || state.anyPrefix("ptrslot:")
+
+    fun step(given: CtTags, text: string, address: int): CtTags {
+        var tags = this.tagsOf(given)
+        var state = CtXtState(given, false)
+        val op = ctFirstWord(text)
+        val ops = ctXtOps(text)
+        var headerPointer = false
+        for (item in tags) {
+            if (item.startsWith("hdrp:")) headerPointer = true
+        }
+        if (headerPointer) {
+            // A header-public pointer is one only while its register is never written.
+            if (op.startsWith("call")) {
+                var i = 0
+                while (i < 16) {
+                    state.add("lost:a$i")
+                    i = i + 1
+                }
+            } else if (ops.size > 0 && !ctXtIsBranch(op) && !ctStartsWithAny(op, ["s8i", "s16i",
+                "s32i", "j", "ret",
+                "nop", "memw"])) {
+                state.add("lost:" + ops[0])
+            }
+        }
+        if (ctXtIsBranch(op)) {
+            var k = 0
+            while (k + 1 < ops.size) {
+                if (state.has(ops[k])) {
+                    ctFail("secret branch: $text")
+                    return ctTags()
+                }
+                k = k + 1
+            }
+            return state.tags
+        }
+        if (op == "j" || op == "j.n" || op == "retw" || op == "retw.n" || op == "ret" || op ==
+            "ret.n" || op ==
+            "nop" || op == "nop.n" || op == "memw" || op == "entry" || op == "ill" || op ==
+            "ill.n") return state.tags
+        val call = ctMatch(CT_XT_CALL, text)
+        if (call != null && ctIsAllocator(ctGroup(call, 2))) {
+            // The crypto allocation entry: the size is the callee's first argument, a pair at a(rotation + 2) and
+            // the next register, and the pointer comes back in the low one.
+            val rotation = ctInt(ctGroup(call, 1))
+            val pointer = "a${rotation + 2}"
+            for (r in [pointer, "a${rotation + 3}"]) {
+                if (state.has(r) || state.has("ptr:" + r)) {
+                    ctFail("call: the allocation entry is given a secret or a pointer to one: $text")
+                    return ctTags()
+                }
+            }
+            var r = rotation
+            while (r < 16) {
+                state.discard("a$r")
+                state.discard("ptr:a$r")
+                state.discard("stackbase:a$r")
+                state.discard("hdrp:a$r")
+                this.dropRegister(state, tags, "a$r", false)
+                state.add("lost:a$r")
+                r = r + 1
+            }
+            state.discard("lost:" + pointer)
+            state.add("ptr:" + pointer)
+            if (this.anySlot(state)) state.add("frame-dirty")
+            return state.tags
+        }
+        if (call != null && ctFollow.path != "") {
+            return this.afterCall(state.tags, ctInt(ctGroup(call, 1)), ctGroup(call, 2), text)
+        }
+        if (op.startsWith("call") || op.startsWith("jx")) {
+            ctFail("call: $text")
+            return ctTags()
+        }
+        if (ops.size > 0 && ops[0] == "a1" && (op == "addi" || op == "addi.n" || op == "add" ||
+            op == "add.n" ||
+            op == "addmi" || op == "mov" || op == "mov.n")) {
+            if (this.anySlot(state)) state.add("stack-moved")
+            var spilled = false
+            for (x in tags) {
+                if (x.startsWith("fslot:")) {
+                    spilled = true
+                    state.discard(x)
+                }
+            }
+            if (spilled) state.add("xframeleak")
+        }
+        if ((op == "quos" || op == "quou" || op == "rems" || op == "remu")) {
+            var k = 1
+            while (k < ops.size) {
+                if (state.has(ops[k])) {
+                    ctFail("secret division: $text")
+                    return ctTags()
+                }
+                k = k + 1
+            }
+        }
+        if (op == "l8ui" || op == "l16ui" || op == "l16si" || op == "l32i" || op == "l32i.n") {
+            return this.load(state, tags, op, ops, text)
+        }
+        if (ctFollow.writeOnly && op == "s32c1i" && ops.size > 1 && state.has("ptr:" + ops[1])) {
+            // The compare-and-swap returns the old word in its first operand: a read of the memory.
+            ctFail("reads the secret memory it may only overwrite: $text")
+            return ctTags()
+        }
+        if (op == "s8i" || op == "s16i" || op == "s32i" || op == "s32i.n") {
+            return this.store(state, tags, op, ops, text)
+        }
+        if (op == "l32r") {
+            state.discard(ops[0])
+            state.discard("ptr:" + ops[0])
+            this.dropRegister(state, tags, ops[0], true)
+            return state.tags
+        }
+        if (ops.size == 0) return state.tags
+        val dest = ops[0]
+        var value = false
+        var k = 1
+        while (k < ops.size) {
+            if (state.has(ops[k])) value = true
+            k = k + 1
+        }
+        if (ctXtIsCondMove(op)) value = value || state.has(dest)
+        if (op == "xor" && ops[1] == ops[2]) value = false
+        // Registers that are a1 plus a constant, or a constant; only if the paths that meet here agree on it.
+        val fresh: array<string> = []
+        if ((op == "mov" || op == "mov.n" || op == "addi" || op == "addi.n" || op == "addmi") &&
+            ops.size >= 2) {
+            if (this.unsureBase(tags, ops[1])) fresh.append("sb:$dest:?")
+            if (this.unsureConstant(tags, ops[1])) fresh.append("const:$dest:?")
+        } else if ((op == "add" || op == "add.n") && ops.size == 3) {
+            val a = ops[1]
+            val b = ops[2]
+            if (this.unsureBase(tags, a) || this.unsureBase(tags, b) ||
+                (this.frameOffset(tags, a) != null && this.unsureConstant(tags, b)) ||
+                (this.frameOffset(tags, b) != null && this.unsureConstant(tags,
+                    a))) fresh.append("sb:$dest:?")
+            if (this.unsureConstant(tags, a) || this.unsureConstant(tags,
+                b)) fresh.append("const:$dest:?")
+        }
+        if ((op == "movi" || op == "movi.n") && ops.size == 2) {
+            fresh.append("const:$dest:${ctInt(ops[1])}")
+        } else if ((op == "mov" || op == "mov.n") && ops.size == 2) {
+            val offset = this.frameOffset(tags, ops[1])
+            if (offset != null) fresh.append("sb:$dest:$offset")
+            val c = this.constant(tags, ops[1])
+            if (c != null) fresh.append("const:$dest:$c")
+        } else if ((op == "addi" || op == "addi.n" || op == "addmi") && ops.size == 3) {
+            val stepBy = ctInt(ops[2]) * (if (op == "addmi") 256 else 1)
+            val offset = this.frameOffset(tags, ops[1])
+            if (offset != null) fresh.append("sb:$dest:${offset + stepBy}")
+            val c = this.constant(tags, ops[1])
+            if (c != null) fresh.append("const:$dest:${c + stepBy}")
+        } else if ((op == "add" || op == "add.n") && ops.size == 3) {
+            val offsetA = this.frameOffset(tags, ops[1])
+            val offsetB = this.frameOffset(tags, ops[2])
+            val constantA = this.constant(tags, ops[1])
+            val constantB = this.constant(tags, ops[2])
+            if (offsetA != null && constantB !=
+                null) fresh.append("sb:$dest:${offsetA + constantB}")
+            else if (offsetB != null && constantA !=
+                null) fresh.append("sb:$dest:${offsetB + constantA}")
+            if (constantA != null && constantB !=
+                null) fresh.append("const:$dest:${constantA + constantB}")
+        }
+        this.dropRegister(state, tags, dest, false)
+        for (x in fresh) state.add(x)
+        // The register tags after this instruction: dest's replaced by what it holds now.
+        val after: array<string> = []
+        for (x in tags) {
+            if (!x.startsWith("sb:$dest:") && !x.startsWith("const:$dest:")) after.append(x)
+        }
+        for (x in fresh) after.append(x)
+        tags = after
+        val addressing = op == "addi" || op == "addi.n" || op == "mov" || op == "mov.n" || op ==
+            "or" || op ==
+            "add" || op == "add.n" || op == "addmi" || op == "addx2" || op == "addx4" || op ==
+            "addx8"
+        if (addressing) {
+            // An address in this function's frame (a1 plus something): a callee given it may write through it.
+            var frame = false
+            k = 1
+            while (k < ops.size) {
+                val o = ops[k]
+                if (o == "a1" || state.has("stackbase:" + o) || this.frameOffset(tags,
+                    o) != null) frame = true
+                k = k + 1
+            }
+            if (frame) {
+                state.add("stackbase:" + dest)
+                state.add("frameaddr")
+            } else {
+                state.discard("stackbase:" + dest)
+            }
+        } else {
+            state.discard("stackbase:" + dest)
+        }
+        if (addressing) {
+            var pointer = false
+            k = 1
+            while (k < ops.size) {
+                if (state.has("ptr:" + ops[k])) pointer = true
+                k = k + 1
+            }
+            if (pointer) {
+                state.add("ptr:" + dest)
+                if (value) state.add(dest) else state.discard(dest)
+                return state.tags
+            }
+        }
+        if (value) state.add(dest) else state.discard(dest)
+        state.discard("ptr:" + dest)
+        state.tags
+    }
+
+    fun load(var state: CtXtState, tags: array<string>, op: string, ops: array<string>,
+        text: string): CtTags {
+        val dest = ops[0]
+        val base = ops[1]
+        val offset = if (ops.size > 2) ops[2] else "0"
+        if (state.has(base)) {
+            ctFail("secret address: $text")
+            return ctTags()
+        }
+        if (ctFollow.writeOnly && state.has("ptr:" + base)) {
+            ctFail("reads the secret memory it may only overwrite: $text")
+            return ctTags()
+        }
+        val size = if (op.startsWith("l8")) 1 else if (op.startsWith("l16")) 2 else 4
+        val at = this.frameOffset(tags, base)
+        val slots: array<string> = []
+        if (at != null) {
+            val first = at + ctInt(offset)
+            var i = 0
+            while (i < size) {
+                slots.append("slot:${first + i}")
+                i = i + 1
+            }
+        }
+        var value = false
+        if (slots.size > 0) {
+            for (slot in slots) {
+                if (state.has(slot)) value = true
+            }
+            if (state.has("frame-dirty")) value = true
+            if (state.has("stack-moved") && state.anyPrefix("slot:")) value = true
+        } else {
+            var publicHeader = state.has("hdrp:" + base) && !state.has("lost:" + base) &&
+                ctFull("-?(0x[0-9a-f]+|\\d+)", offset) != null
+            if (publicHeader) {
+                val n = ctInt(offset)
+                publicHeader = 0 <= n && n < CT_XT_HEADER_BYTES
+            }
+            value = !publicHeader
+        }
+        var pointer = false
+        for (slot in slots) {
+            if (state.has("ptr" + slot)) pointer = true
+        }
+        if (slots.size > 0 && state.has("stack-moved") && state.anyPrefix("ptrslot:")) pointer =
+            true
+        if (value) state.add(dest) else state.discard(dest)
+        if (pointer) state.add("ptr:" + dest) else state.discard("ptr:" + dest)
+        // What was loaded is neither a frame address nor a known constant, unless it is a frame address this
+        // function spilled to that slot (fslot).
+        this.dropRegister(state, tags, dest, true)
+        if (size == 4 && at != null) {
+            val prefix = "fslot:${at + ctInt(offset)}:"
+            var spilled = false
+            for (x in tags) {
+                if (x.startsWith(prefix)) {
+                    state.add("sb:$dest:${ctXtField(x, 2)}")
+                    spilled = true
+                }
+            }
+            if (spilled) state.add("stackbase:" + dest)
+        }
+        state.tags
+    }
+
+    fun store(var state: CtXtState, tags: array<string>, op: string, ops: array<string>,
+        text: string): CtTags {
+        val source = ops[0]
+        val base = ops[1]
+        val offset = if (ops.size > 2) ops[2] else "0"
+        if (state.has(base)) {
+            ctFail("secret address: $text")
+            return ctTags()
+        }
+        val at = this.frameOffset(tags, base)
+        val size = if (op.startsWith("s8")) 1 else if (op.startsWith("s16")) 2 else 4
+        var headerPointer = false
+        for (item in tags) {
+            if (item.startsWith("hdrp:")) headerPointer = true
+        }
+        if (headerPointer && state.has(source) && at == null) {
+            ctFail("secret stored through an object pointer or outside the frame: $text")
+            return ctTags()
+        }
+        if (at == null && state.has(source) && (state.has("stackbase:" + base) ||
+            state.has("xframeleak"))) {
+            // Through a frame address whose offset is not known: any slot may hold the secret now.
+            state.add("frame-dirty")
+        }
+        if (at != null) {
+            val where = at + ctInt(offset)
+            for (x in tags) {
+                if (x.startsWith("fslot:")) {
+                    val slot = ctInt(ctXtField(x, 1))
+                    if (where < slot + 4 && slot < where + size) state.discard(x)
+                }
+            }
+        }
+        if (state.has("stackbase:" + source)) {
+            // A frame address spilled: to a placed slot it is remembered (a reload gives it back), anywhere else it
+            // is lost track of.
+            val sourceOffset = this.frameOffset(tags, source)
+            if (at != null && size == 4 && sourceOffset != null) {
+                state.add("fslot:${at + ctInt(offset)}:$sourceOffset")
+            } else {
+                state.add("xframeleak")
+            }
+        }
+        if (at != null) {
+            val where = at + ctInt(offset)
+            if (this.residue && where < 0) {
+                // Under a1: a public value covers what a callee left there, a secret is left there itself. Only
+                // where a call has made the ABI guarantee the stack on every path to here.
+                var reach = 0
+                var first = true
+                for (x in state.withPrefix("xreach:")) {
+                    val value = ctInt(ctXtField(x, 1))
+                    if (first || value > reach) reach = value
+                    first = false
+                }
+                if (state.has("xnoreach") || where < reach) {
+                    ctFail("a store under a1 below the stack a call guarantees: $text")
+                    return ctTags()
+                }
+                if (state.has(source) || state.has("ptr:" + source)) ctXtDirty(state, where,
+                    where + size)
+                else ctXtClean(state, where, where + size)
+            }
+            var i = 0
+            while (i < size) {
+                val slot = "slot:${where + i}"
+                if (state.has(source)) state.add(slot) else state.discard(slot)
+                if (state.has("ptr:" + source)) state.add("ptr" + slot) else state.discard("ptr" +
+                    slot)
+                i = i + 1
+            }
+        }
+        state.tags
+    }
+
+    fun successors(text: string, i: int, index: Map<int, int>): array<int> {
+        val parts = ctWords(text, 1)
+        val op = if (parts.size > 0) parts[0] else ""
+        val out: array<int> = []
+        if (op == "retw" || op == "retw.n" || op == "ret" || op == "ret.n" || op == "ill" || op ==
+            "ill.n") return out
+        if (ctXtIsBranch(op) || op == "j" || op == "j.n") {
+            val m = ctSearch("(?:0x)?([0-9a-f]+)(?:\\s*<[^>]*>)?\\s*$",
+                if (parts.size > 1) parts[1] else "")
+            if (m != null) {
+                val target = index.get(ctParseHex(ctGroup(m, 1)) ?? -1)
+                if (target != null) out.append(target)
+            }
+            if (op == "j" || op == "j.n") return out
+        }
+        out.append(i + 1)
+        out
+    }
+}
+
+/** check_xtensa. `given`: the register tags a followed callee starts with (check-asm.py passes them as `secret`). */
+fun ctXtCheck(lines: array<CtLine>, given: CtTags?, secret: array<int>,
+    pointers: array<int>): CtTags {
+    // A u64 takes an aligned pair of registers, so positions don't map one to one: any secret parameter makes all
+    // the argument registers secret, and only pointer lists are exact.
+    val residue = ctFollow.residue && ctFollow.stack.size == 0
+    val headerArgs = ctFollow.headerArgs
+    ctFollow.headerArgs = []
+    val start = ctTags()
+    val fromTags = given != null && given.size() > 0
+    if (given != null && fromTags) {
+        start.addAll(given)
+    } else {
+        for (i in pointers) start.add("ptr:a${2 + 2 * i}")
+    }
+    for (i in headerArgs) start.add("hdrp:a${2 + 2 * i}")
+    if (!fromTags && secret.size > 0 && pointers.size == 0) {
+        for (r in CT_XT_ARGS) start.add(r)
+    } else if (!fromTags && secret.size > 0) {
+        // Past the pointers' pairs, a u32 parameter lands at the next register, or on the stack if there's none
+        // left, and then this checker can't see it: refuse rather than pass it.
+        for (i in secret) {
+            val at = 2 + 2 * i
+            if (at > 7) {
+                ctStop("a secret past the argument registers isn't read here")
+                return ctTags()
+            }
+            start.add("a$at")
+        }
+    }
+    if (residue) start.add("xnoreach")
+    val flow = CtXtFlow(residue)
+    val states = ctFixpoint(lines, start, flow)
+    if (ctFailed()) return ctTags()
+    // What the function leaves in its registers when it returns, for a caller that follows it.
+    val out = ctTags()
+    var i = 0
+    while (i < lines.size) {
+        val op = ctFirstWord(lines[i].text)
+        val path = states.get(i)
+        if ((op == "retw" || op == "retw.n" || op == "ret" || op == "ret.n") && path !=
+            null) out.addAll(path)
+        i = i + 1
+    }
+    if (residue) {
+        // A secret in a slot of its own frame, or under a1 where a callee (or a window overflow) left one and
+        // nothing public was written over it since.
+        val slots: array<string> = []
+        for (item in out.withPrefix("slot:")) {
+            if (ctInt(ctXtField(item, 1)) >= 0) slots.append(item)
+        }
+        val left: array<string> = []
+        for (item in sortedStrings(slots)) left.append(item)
+        val under: array<string> = []
+        for (item in out.withPrefix("xdirty:")) {
+            val a = ctInt(ctXtField(item, 1))
+            val b = ctInt(ctXtField(item, 2))
+            under.append("${b - a} bytes under a1 at ${ctXtField(item, 1)}")
+        }
+        for (item in sortedStrings(under)) left.append(item)
+        if (left.size > 0) {
+            val shown: array<string> = []
+            var n = 0
+            while (n < left.size && n < 4) {
+                shown.append(left[n])
+                n = n + 1
+            }
+            ctFail("secret residue at return: ${textJoin(shown, ", ")}")
+            return ctTags()
+        }
+    }
+    out.discardPrefix("xdirty:")
+    out
+}
+
+fun ctCheckXtensa(lines: array<CtLine>, secret: array<int>,
+    pointers: array<int>): CtTags = ctXtCheck(lines,
+        null, secret, pointers)
+
+/** tags_of's test: a tag that starts with sb:, const:, hdrp: or fslot:. */
+fun ctXtIsRegisterTag(x: string): bool {
+    if (x.size < 3) return false
+    val c = x[0]
+    if (c == 115) return x[1] == 98 && x[2] == 58
+    if (c == 99) return x.startsWith("const:")
+    if (c == 104) return x.startsWith("hdrp:")
+    if (c == 102) return x.startsWith("fslot:")
+    false
+}
+
+/** The index of the first of the sorted `tags` not below `key`. */
+fun ctXtLowerBound(tags: array<string>, key: string): int {
+    var low = 0
+    var high = tags.size
+    while (low < high) {
+        val middle = (low + high) / 2
+        if (tags[middle] < key) low = middle + 1 else high = middle
+    }
+    low
+}

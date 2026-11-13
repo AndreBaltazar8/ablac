@@ -1,0 +1,141 @@
+// Fail closed on unreviewed scaffolding; never check stale arithmetic copies (#817: the Abla port of
+// tools/ct/test-source-fixtures.py).
+//
+//     ct-test-source-fixtures <ct-source-fixtures binary> <repository root> <scratch directory>
+//
+// Runs the fixtureGenerator on a copy of the crypto sources in the scratch directory: the key functions must lie in the region
+// the fixtures read, a call out of that region must be to a helper the checker reads, and an edit to the allocation
+// wrappers (even a comment) or to a public entry must be refused by the fixtureGenerator's source guard.
+import "abla/io"
+import "abla/text"
+import "abla/regex"
+import "abla/fs"
+import "abla/process/arguments"
+import "abla/sys/linux/process"
+
+var testFailure = ""
+
+fun testAssert(condition: bool, message: string): void {
+    if (!condition && testFailure == "") testFailure = message
+    return
+}
+
+class TestRun(val status: int, val errors: string)
+
+fun testRun(fixtureGenerator: string, root: string): TestRun {
+    val errors = "$root/fixtureGenerator.err"
+    val command = linuxCommand(fixtureGenerator)
+    command.argument(root)
+    command.argument("$root/fixture.ab")
+    command.errors(errors)
+    val result = command.capture()
+    TestRun(result.status, Path(errors).readText())
+}
+
+fun testCount(text: string, needle: string): int {
+    var count = 0
+    var at = text.indexOf(needle)
+    while (at >= 0) {
+        count = count + 1
+        at = text.indexOf(needle, at + needle.size)
+    }
+    count
+}
+
+fun testNames(pattern: string, text: string): Map<string, bool> {
+    val names: Map<string, bool> = Map()
+    val compiled = regexCompile(pattern)
+    for (m in compiled.regex.findAll(text)) names.set(m.group(1) ?? "", true)
+    names
+}
+
+fun testReplaceFirst(text: string, old: string, replacement: string): string {
+    val at = text.indexOf(old)
+    if (at < 0) text else text.slice(0, at) + replacement + text.slice(at + old.size, text.size)
+}
+
+fun main: int {
+    if (processArgumentCount() < 3) {
+        eprintln("usage: ct-test-source-fixtures <ct-source-fixtures> <repository root> <scratch directory>")
+        return 2
+    }
+    val fixtureGenerator = processArgument(0)
+    val root = processArgument(1)
+    val copied = processArgument(2)
+    Path(copied).removeTree()
+    val files = ["stdlib/abla/crypto/aes/entry.ab", "stdlib/abla/crypto/bignum/entry.ab",
+        "stdlib/abla/crypto/rsa/entry.ab"]
+    for (file in files) {
+        val target = "$copied/$file"
+        Path(target.slice(0, target.lastIndexOf("/"))).createDirectories()
+        Path(target).writeText(Path("$root/$file").readText())
+    }
+    val aesPath = "$copied/stdlib/abla/crypto/aes/entry.ab"
+    val baseline = testRun(fixtureGenerator, copied)
+    testAssert(baseline.status == 0, baseline.errors)
+    val original = Path("$copied/fixture.ab").readText()
+    val source = Path(aesPath).readText()
+
+    // What touches a key is read from the production source itself: every function the fixtures call must lie in the
+    // region between BEGIN/END AES KEY EXPANSION, which tools/test-ct.sh appends to the fixture module.
+    val beginMarker = "// BEGIN AES KEY EXPANSION\n"
+    val endMarker = "// END AES KEY EXPANSION\n"
+    testAssert(testCount(source, beginMarker) == 1 && testCount(source, endMarker) == 1, "")
+    val begin = source.indexOf(beginMarker)
+    val end = source.indexOf(endMarker)
+    val region = if (begin >= 0 && end >= begin) source.slice(begin, end) else ""
+    for (name in ["aesExpandSchedule", "aesSubWord", "aesDecryptionKeys", "aesHardwareEncryptAt",
+        "aesHardwareDecryptAt"]) {
+        testAssert(region.contains("fun $name("), "$name is outside the region the fixtures read")
+        testAssert(name == "aesSubWord" || original.contains("$name("), "no fixture calls $name")
+    }
+    // A call out of the region must be to a helper the checker reads or an intrinsic.
+    val allowed = ["GF", "aesDecLastRound", "aesDecRound", "aesEncLastRound", "aesEncRound",
+        "aesInvMixColumns", "aesLoad",
+        "aesLoadBytes", "aesOrthogonalize", "aesStore", "aesSubBytes", "rotr", "secretU32",
+        "storeAddress", "target", "u32",
+        "u8x16LoadAddress"]
+    val defined = testNames("\\bfun (?:\\w+\\.)?(\\w+)\\(", region)
+    val outside: array<string> = []
+    for (name in testNames("\\b([A-Za-z_]\\w*)\\(", region).keys()) {
+        var listed = defined.has(name)
+        for (allowedName in allowed) {
+            if (allowedName == name) listed = true
+        }
+        if (!listed) outside.append(name)
+    }
+    testAssert(outside.size == 0,
+        "the region calls ${textJoin(sortedStrings(outside), ", ")}, which the fixtures do not read; list it or move it out")
+    for (name in ["aesKeyBytes", "aesAllocateMemory", "aesNewKey", "aesStringAddress",
+        "aesExpandBytes"]) {
+        testAssert(source.contains("fun $name(") && !region.contains("fun $name("),
+            "$name must stay outside the region")
+    }
+
+    // Even a comment in the allocation wrappers, which the checker does not read, requires an explicit review. The same
+    // goes for the public entries that pick the addresses and rounds the read workers get.
+    for (marker in ["    val total = 4 * (count / 4 + 7)\n",
+        "    aesHardwareDecryptAt(key.decryption(), key.rounds, input, output, count)"]) {
+        testAssert(testCount(source, marker) == 1, marker)
+        val edited = if (marker.startsWith("    val")) testReplaceFirst(source, marker,
+            "    // unreviewed scaffold\n" + marker)
+            else source.replace(marker, marker.replace("key.decryption()", "key.schedule()"))
+        Path(aesPath).writeText(edited)
+        val changed = testRun(fixtureGenerator, copied)
+        testAssert(changed.status != 0, marker)
+        testAssert(changed.errors.contains("aesWrappers: excluded source changed"), marker)
+        Path(aesPath).writeText(source)
+    }
+
+    // Orthogonalization uses the actual imported helper: no fixture-only substitution remains.
+    testAssert(region.contains("aesOrthogonalize("), "")
+    testAssert(!original.contains("ctSourceOrthogonalize") &&
+        !region.contains("ctSourceOrthogonalize"), "")
+    Path(copied).removeTree()
+    if (testFailure != "") {
+        eprintln("AssertionError: $testFailure")
+        return 1
+    }
+    println("ok   crypto fixture generation: the key functions lie in the region the fixtures read, a wrapper edit is refused, actual orthogonalization imported")
+    0
+}

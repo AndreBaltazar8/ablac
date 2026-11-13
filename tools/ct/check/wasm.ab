@@ -1,0 +1,719 @@
+// WebAssembly: check-asm.py's check_wasm, follow_wasm and wasm_export_lines (#817), rule for rule. The module's
+// binary is read here (types, imports, functions, exports); the instructions come from llvm-objdump.
+import "abla/text"
+import "abla/fs"
+import "./core.ab"
+import "./objdump.ab"
+import "./follow.ab"
+
+val CT_WASM_HEADER_BYTES = 32
+val CT_WASM_BINARY =
+    "^(i32|i64|f32|f64|v128|i8x16|i16x8|i32x4|i64x2|f32x4|f64x2)\\.(add|sub|mul|and|or|xor|shl|shr_s|shr_u|rotl|rotr|eq|ne|lt_s|lt_u|gt_s|gt_u|le_s|le_u|ge_s|ge_u|div|min|max|lt|gt|le|ge|copysign|andnot|add_sat_s|add_sat_u|sub_sat_s|sub_sat_u)$"
+val CT_WASM_UNARY =
+    "^(i32|i64|f32|f64|v128|i8x16|i16x8|i32x4|i64x2|f32x4|f64x2)\\.(eqz|clz|ctz|popcnt|wrap_i64|extend\\w*|trunc\\w*|convert\\w*|reinterpret\\w*|promote\\w*|demote\\w*|not|neg|abs|sqrt|splat|any_true|all_true|bitmask|extract_lane\\w*)\\b"
+
+// A stack value: bit 1 a secret, bit 2 a pointer to secret memory (check-asm.py's (secret, pointer) pairs).
+val CT_WASM_SECRET = 1
+val CT_WASM_POINTER = 2
+
+fun ctWasmValue(secret: bool,
+    pointer: bool): int = (if (secret) CT_WASM_SECRET else 0) + (if (pointer)
+        CT_WASM_POINTER else 0)
+
+fun ctWasmSecret(value: int): bool = value % 2 == 1
+
+fun ctWasmPointer(value: int): bool = value / 2 % 2 == 1
+
+/** What a call needs of a linked module (check-asm.py's wasm_module tuple). */
+class CtWasmModule(
+    val typeParams: array<int>,
+    val typeResults: array<int>,
+    // the type of each defined function
+    val functions: array<int>,
+    // how many functions are imports (they come first in the index space)
+    val imports: int,
+    val bodies: array<array<CtLine>>,
+    val exports: Map<string, int>
+)
+
+/** A cursor over the module's bytes; `leb` is wasm_leb. */
+class CtWasmReader(val data: string, var at: int) {
+    fun byte(): int {
+        val value = if (this.at < this.data.size) this.data[this.at] else 0
+        this.at = this.at + 1
+        value
+    }
+    fun leb(): int {
+        var value = 0
+        var shift = 0
+        while (this.at <= this.data.size) {
+            val byte = this.byte()
+            value = value + (byte % 128) * ctWasmPower(shift)
+            shift = shift + 7
+            if (byte < 128) return value
+        }
+        value
+    }
+}
+
+fun ctWasmPower(shift: int): int {
+    var result = 1
+    var left = shift
+    while (left > 0) {
+        result = result * 2
+        left = left - 1
+    }
+    result
+}
+
+val ctWasmModules: Map<string, CtWasmModule> = Map()
+
+/** The module at `path`, or null with a violation set (its functions and disassembled bodies don't match). */
+fun ctWasmModule(path: string): CtWasmModule? {
+    val known = ctWasmModules.get(path)
+    if (known != null) return known
+    val data = Path(path).readText()
+    val typeParams: array<int> = []
+    val typeResults: array<int> = []
+    val functions: array<int> = []
+    var imports = 0
+    val exports: Map<string, int> = Map()
+    var at = 8
+    while (at < data.size) {
+        val section = data[at]
+        val reader = CtWasmReader(data, at + 1)
+        val size = reader.leb()
+        val end = reader.at + size
+        if (section == 1) {
+            var count = reader.leb()
+            while (count > 0) {
+                reader.at = reader.at + 1 // 0x60
+                val params = reader.leb()
+                reader.at = reader.at + params // one byte a value type
+                val results = reader.leb()
+                reader.at = reader.at + results
+                typeParams.append(params)
+                typeResults.append(results)
+                count = count - 1
+            }
+        } else if (section == 2) {
+            var count = reader.leb()
+            while (count > 0) {
+                var names = 0
+                while (names < 2) {
+                    // module and field names
+                    val length = reader.leb()
+                    reader.at = reader.at + length
+                    names = names + 1
+                }
+                val kind = reader.byte()
+                if (kind == 0) {
+                    reader.leb()
+                    imports = imports + 1
+                } else if (kind == 1) {
+                    reader.at = reader.at + 1
+                    val flag = reader.byte()
+                    reader.leb()
+                    if (flag % 2 == 1) reader.leb()
+                } else if (kind == 2) {
+                    val flag = reader.byte()
+                    reader.leb()
+                    if (flag % 2 == 1) reader.leb()
+                } else if (kind == 3) {
+                    reader.at = reader.at + 2
+                } else {
+                    reader.at = reader.at + 1
+                    reader.leb()
+                }
+                count = count - 1
+            }
+        } else if (section == 3) {
+            var count = reader.leb()
+            while (count > 0) {
+                functions.append(reader.leb())
+                count = count - 1
+            }
+        } else if (section == 7) {
+            var count = reader.leb()
+            while (count > 0) {
+                val length = reader.leb()
+                val start = if (reader.at < data.size) reader.at else data.size
+                val stop = if (reader.at + length < data.size) reader.at + length else data.size
+                val name = data.slice(start, stop)
+                reader.at = reader.at + length
+                val kind = reader.byte()
+                val index = reader.leb()
+                if (kind == 0) exports.set(name, index)
+                count = count - 1
+            }
+        }
+        at = end
+    }
+    val text = ctRun(["-d", "--no-show-raw-insn", path])
+    if (ctFatal != "") return null
+    val bodies: array<array<CtLine>> = []
+    for (line in text.split("\n")) {
+        if (line.endsWith(">:") && ctMatch("^[0-9a-f]+ <.*>:$", line) != null) {
+            bodies.append([])
+        } else if (bodies.size > 0) {
+            val m = ctAddressLine(line)
+            if (m != null) {
+                val body = m.text
+                val comment = body.indexOf("//")
+                val instruction = (if (comment >= 0) body.slice(0, comment) else body).trim()
+                bodies[bodies.size - 1].append(CtLine(m.address, instruction))
+            }
+        }
+    }
+    // The first header is the CODE section itself.
+    val defined: array<array<CtLine>> = []
+    var b = 1
+    while (b < bodies.size) {
+        defined.append(bodies[b])
+        b = b + 1
+    }
+    if (defined.size != functions.size) {
+        ctFail("call: $path has ${functions.size} functions but ${defined.size} disassembled")
+        return null
+    }
+    val module = CtWasmModule(typeParams, typeResults, functions, imports, defined, exports)
+    ctWasmModules.set(path, module)
+    module
+}
+
+/** The instructions of the function a module exports under `name`; when it exports none by that name, the
+ *  disassembly of the symbol (check-asm.py's main falls back to disassemble). Null when neither exists (the message
+ *  in ctMissing). */
+fun ctWasmExportLines(path: string, name: string): array<CtLine>? {
+    val module = ctWasmModule(path)
+    if (module == null) {
+        if (ctFatal == "") ctStop(ctViolation)
+        return null
+    }
+    val index = module.exports.get(name)
+    if (index == null || index < module.imports) return ctDisassemble(path, name)
+    val lines: array<CtLine> = []
+    for (line in module.bodies[index - module.imports]) lines.append(line)
+    lines
+}
+
+// ("wasm", index, secret, pointers) -> what the function returns, per result (FOLLOW["done"]'s Wasm entries).
+val ctWasmDone: Map<string, array<array<int>>> = Map()
+
+fun ctWasmCopyRows(rows: array<array<int>>): array<array<int>> {
+    val copy: array<array<int>> = []
+    for (row in rows) {
+        val values: array<int> = []
+        for (value in row) values.append(value)
+        copy.append(values)
+    }
+    copy
+}
+
+/** Check the function `index` of the module on the arguments the caller passes; what it returns, per result. */
+fun ctFollowWasm(index: int, secret: array<int>, pointers: array<int>,
+    text: string): array<array<int>> {
+    val module = ctWasmModule(ctFollow.path)
+    if (module == null) return []
+    ctFollow.followed.set("function $index", true)
+    if (index < module.imports) {
+        ctFail("call: function $index is an import: $text")
+        return []
+    }
+    if (index - module.imports >= module.functions.size) {
+        ctFail("call: no function $index in the module: $text")
+        return []
+    }
+    val key = "$index\n${ctIntList(secret)}\n${ctIntList(pointers)}"
+    val known = ctWasmDone.get(key)
+    if (known != null) return ctWasmCopyRows(known)
+    val active = "wasm\n$index"
+    for (entry in ctFollow.stack) {
+        if (entry == active) {
+            ctFail("call: recursion into function $index: $text")
+            return []
+        }
+    }
+    val lines = module.bodies[index - module.imports]
+    val results = module.typeResults[module.functions[index - module.imports]]
+    ctFollow.stack.append(active)
+    val returned = ctCheckWasmResults(lines, secret, pointers, results)
+    ctFollow.stack.truncate(ctFollow.stack.size - 1)
+    if (ctViolation != "") {
+        ctViolation = "in function $index: $ctViolation"
+        return []
+    }
+    if (ctFatal != "") return []
+    ctWasmDone.set(key, ctWasmCopyRows(returned))
+    returned
+}
+
+/** The bytes a plain Wasm load reads; 0 for anything else (a splat, an extending vector load, a lane load). */
+val ctWasmLoadWidths: Map<string, int> = Map()
+
+fun ctWasmLoadWidth(op: string): int {
+    val known = ctWasmLoadWidths.get(op)
+    if (known != null) return known
+    val width = ctWasmLoadWidthOf(op)
+    ctWasmLoadWidths.set(op, width)
+    width
+}
+
+fun ctWasmLoadWidthOf(op: string): int {
+    val m = ctFull("(i32|i64|f32|f64|v128)\\.load(\\d+)?(_[su])?", op)
+    if (m == null) return 0
+    val kind = ctGroup(m, 1)
+    val bits = ctGroup(m, 2)
+    if (bits != "") return if (kind == "i32" || kind == "i64") ctInt(bits) / 8 else 0
+    if (kind == "i32" || kind == "f32") 4 else if (kind == "v128") 16 else 8
+}
+
+fun ctWasmIsDigits(text: string): bool {
+    if (text.size == 0) return false
+    for (byte in text) {
+        if (byte < 48 || byte > 57) return false
+    }
+    true
+}
+
+fun ctWasmIntTags(values: array<int>): CtTags {
+    val tags = ctTags()
+    for (value in values) tags.add("$value")
+    tags
+}
+
+/** A loop head: the locals its back edges bring in. */
+class CtWasmHead(val tainted: CtTags, val pointers: CtTags)
+
+/** A block, loop or if open at the instruction being read. */
+class CtWasmControl(
+    val kind: string,
+    val at: int,
+    val height: int,
+    val results: bool,
+    var secret: bool,
+    var pointer: bool,
+    val dead: bool,
+    val startTainted: CtTags,
+    val startPointer: CtTags,
+    val exitTainted: CtTags,
+    val exitPointer: CtTags,
+    var hasElse: bool
+)
+
+/** One pass over the function: the locals, the value stack, the open blocks. */
+class CtWasmPass(
+    var tainted: CtTags,
+    var pointers: CtTags,
+    val stack: array<int>,
+    val control: array<CtWasmControl>,
+    var unreachable: bool,
+    val heads: Map<int, CtWasmHead>,
+    val returned: array<array<int>>,
+    val results: int
+) {
+    /** A pass's start: the function's entry, with the loop heads kept. */
+    fun reset(secret: array<int>, pointers: array<int>): void {
+        this.tainted = ctWasmIntTags(secret)
+        this.pointers = ctWasmIntTags(pointers)
+        this.stack.truncate(0)
+        this.control.truncate(0)
+        this.unreachable = false
+        this.returned.truncate(0)
+        return
+    }
+    fun pop(): int {
+        if (this.stack.size == 0) return 0
+        val value = this.stack[this.stack.size - 1]
+        this.stack.truncate(this.stack.size - 1)
+        value
+    }
+    fun top(): int = if (this.stack.size > 0) this.stack[this.stack.size - 1] else 0
+    /** The top `results` values of the stack, as the caller of a followed function receives them. */
+    fun recordReturn(): void {
+        val row: array<int> = []
+        if (this.results > 0 && this.stack.size >= this.results) {
+            var at = this.stack.size - this.results
+            while (at < this.stack.size) {
+                row.append(this.stack[at])
+                at = at + 1
+            }
+        } else {
+            var n = 0
+            while (n < this.results) {
+                row.append(CT_WASM_SECRET)
+                n = n + 1
+            }
+        }
+        this.returned.append(row)
+        return
+    }
+    fun branchTo(depth: int): void {
+        if (depth >= this.control.size) {
+            // The function's own outermost label: a branch to it returns.
+            if (!this.unreachable) this.recordReturn()
+            return
+        }
+        val target = this.control.size - 1 - depth
+        if (this.control[target].kind == "loop") {
+            val at = this.control[target].at
+            val known = this.heads.get(at)
+            if (known != null) {
+                this.heads.set(at, CtWasmHead(known.tainted.union(this.tainted),
+                    known.pointers.union(this.pointers)))
+            } else {
+                this.heads.set(at, CtWasmHead(this.tainted.copy(), this.pointers.copy()))
+            }
+            return
+        }
+        this.control[target].exitTainted.addAll(this.tainted)
+        this.control[target].exitPointer.addAll(this.pointers)
+        if (this.control[target].results && this.stack.size > 0) {
+            val value = this.top()
+            if (ctWasmSecret(value)) this.control[target].secret = true
+            if (ctWasmPointer(value)) this.control[target].pointer = true
+        }
+        return
+    }
+}
+
+fun ctWasmSnapshot(heads: Map<int, CtWasmHead>): Map<int, CtWasmHead> {
+    val copy: Map<int, CtWasmHead> = Map()
+    for (key in heads.keys()) {
+        val head = heads.get(key)
+        if (head != null) copy.set(key, CtWasmHead(head.tainted.copy(), head.pointers.copy()))
+    }
+    copy
+}
+
+fun ctWasmSameHeads(a: Map<int, CtWasmHead>, b: Map<int, CtWasmHead>): bool {
+    if (a.size != b.size) return false
+    for (key in a.keys()) {
+        val left = a.get(key)
+        val right = b.get(key)
+        if (left == null || right == null) return false
+        if (!left.tainted.sameAs(right.tainted) ||
+            !left.pointers.sameAs(right.pointers)) return false
+    }
+    true
+}
+
+val CT_WASM_CALLS: array<string> = ["call", "call_indirect", "call_ref", "return_call",
+    "return_call_indirect", "return_call_ref"]
+
+fun ctCheckWasm(lines: array<CtLine>, secret: array<int>, pointers: array<int>,
+    results: int): CtTags {
+    ctCheckWasmResults(lines, secret, pointers, results)
+    ctTags()
+}
+
+/** check_wasm: what the function returns, one row per way out (the top `results` stack values). Function parameters
+ *  are locals. The stack's shape follows from each instruction, and the lines are visited in order several times to
+ *  carry what locals pick up around loops. Each pass starts at the function's entry; a loop's head joins what its
+ *  back edges brought in the pass before, and a block's end what branches out of it did, until nothing changes. */
+fun ctCheckWasmResults(lines: array<CtLine>, secret: array<int>, pointers: array<int>,
+    results: int): array<array<int>> {
+    val headerArgs: array<int> = []
+    for (arg in ctFollow.headerArgs) headerArgs.append(arg)
+    ctFollow.headerArgs = [] // a followed callee has none
+    // A header-public pointer is a parameter no instruction of the function ever writes, in a function that makes
+    // no call (a callee could store a secret through it): locals are untouched by a call, memory is not.
+    val written = ctTags()
+    var anyCall = false
+    for (line in lines) {
+        val words = ctWords(line.text)
+        if (words.size > 0 && (words[0] == "local.set" || words[0] == "local.tee")) {
+            written.add("${ctInt(if (words.size > 1) words[1] else "")}")
+        }
+        if (words.size > 0 && words[0] == "call") anyCall = true
+    }
+    if (ctFailed()) return []
+    // The crypto allocation entry (exported as abla_ct_allocate) is not read: its size must be public and its
+    // result is a pointer to secret memory. Any other call in the function (a callee could store through a header
+    // pointer) ends the header-public parameters.
+    var allocIndex = -1
+    if (ctFollow.objectPath != "" && anyCall) {
+        val module = ctWasmModule(ctFollow.objectPath)
+        if (module == null) return []
+        allocIndex = module.exports.get(CT_ALLOCATOR) ?? -1
+    }
+    var otherCalls = false
+    for (line in lines) {
+        val words = ctWords(line.text)
+        if (words.size > 0 && ctWasmIn(words[0], CT_WASM_CALLS) && !ctWasmIsAllocCall(line.text,
+            allocIndex)) otherCalls = true
+    }
+    val headerLocals = ctTags()
+    if (!otherCalls) {
+        for (arg in headerArgs) {
+            if (!written.has("$arg")) headerLocals.add("$arg")
+        }
+    }
+    val headerMode = headerArgs.size > 0
+    var state = CtWasmPass(ctTags(), ctTags(), [], [], false, Map(), [], results)
+    var pass = 0
+    while (pass < 64) {
+        val before = ctWasmSnapshot(state.heads)
+        state.reset(secret, pointers)
+        var at = 0
+        while (at < lines.size) {
+            ctWasmStep(state, lines, at, allocIndex, headerLocals, headerMode)
+            if (ctFailed()) return []
+            at = at + 1
+        }
+        if (ctWasmSameHeads(state.heads, before)) return ctWasmCopyRows(state.returned)
+        pass = pass + 1
+    }
+    ctStop("no fixed point")
+    []
+}
+
+fun ctWasmIn(value: string, values: array<string>): bool {
+    for (item in values) {
+        if (item == value) return true
+    }
+    false
+}
+
+fun ctWasmIsAllocCall(text: string, allocIndex: int): bool {
+    if (allocIndex < 0) return false
+    val words = ctWords(text)
+    words.size >= 2 && words[0] == "call" && words[1] == "$allocIndex"
+}
+
+/** One instruction of a pass. */
+fun ctWasmStep(var state: CtWasmPass, lines: array<CtLine>, at: int, allocIndex: int,
+    headerLocals: CtTags, headerMode: bool): void {
+    val text = lines[at].text
+    val parts = ctWords(text)
+    if (parts.size == 0 || parts[0] == "local") return
+    val op = parts[0]
+    if (op == "block" || op == "loop" || op == "if") {
+        if (op == "if" && !state.unreachable) {
+            if (ctWasmSecret(state.pop())) {
+                ctFail("secret branch: $text")
+                return
+            }
+        }
+        if (op == "loop") {
+            val head = state.heads.get(at)
+            if (head != null) {
+                state.tainted.addAll(head.tainted)
+                state.pointers.addAll(head.pointers)
+            }
+        }
+        state.control.append(CtWasmControl(op, at, state.stack.size, parts.size > 1 && parts[1] !=
+            "#", false, false, state.unreachable, state.tainted.copy(), state.pointers.copy(),
+            ctTags(), ctTags(), false))
+        return
+    }
+    if (op == "else" || op == "end") {
+        if (state.control.size == 0) {
+            if (!state.unreachable) state.recordReturn()
+            return // the function's own end
+        }
+        val last = state.control.size - 1
+        if (!state.unreachable) {
+            state.control[last].exitTainted.addAll(state.tainted)
+            state.control[last].exitPointer.addAll(state.pointers)
+            if (state.control[last].results && state.stack.size > 0) {
+                val value = state.top()
+                if (ctWasmSecret(value)) state.control[last].secret = true
+                if (ctWasmPointer(value)) state.control[last].pointer = true
+            }
+        }
+        val height = state.control[last].height
+        if (state.stack.size > height) state.stack.truncate(height)
+        state.unreachable = state.control[last].dead
+        if (op == "else") {
+            // The entry stays open for the else arm.
+            state.control[last].hasElse = true
+            state.tainted = state.control[last].startTainted.copy()
+            state.pointers = state.control[last].startPointer.copy()
+        } else {
+            val bare = state.control[last].kind == "if" && !state.control[last].hasElse
+            state.tainted = state.control[last].exitTainted.copy()
+            state.pointers = state.control[last].exitPointer.copy()
+            if (bare) {
+                state.tainted.addAll(state.control[last].startTainted)
+                state.pointers.addAll(state.control[last].startPointer)
+            }
+            if (state.control[last].results) state.stack.append(ctWasmValue(state.control[last]
+                .secret,
+                state.control[last].pointer))
+            state.control.truncate(last)
+        }
+        return
+    }
+    if (state.unreachable) return
+    if (op == "nop" || op == "drop" || op.startsWith("end_")) {
+        if (op == "drop") state.pop()
+        return
+    }
+    if (op == "return" || op == "unreachable") {
+        if (op == "return") state.recordReturn()
+        state.unreachable = true
+        return
+    }
+    val argument = if (parts.size > 1) parts[1] else ""
+    if (op == "br") {
+        val depth = ctInt(argument)
+        if (ctFailed()) return
+        state.branchTo(depth)
+        state.unreachable = true
+        return
+    }
+    if (op == "br_if" || op == "br_table") {
+        if (ctWasmSecret(state.pop())) {
+            ctFail("secret branch: $text")
+            return
+        }
+        if (op == "br_if") {
+            val depth = ctInt(argument)
+            if (ctFailed()) return
+            state.branchTo(depth)
+        } else {
+            // The last is the function's own label: a return.
+            val labels = state.control.size + 1
+            var depth = 0
+            while (depth < labels) {
+                state.branchTo(depth)
+                depth = depth + 1
+            }
+            state.unreachable = true
+        }
+        return
+    }
+    if (op == "local.get") {
+        val n = ctInt(argument)
+        state.stack.append(ctWasmValue(state.tainted.has("$n"), state.pointers.has("$n")))
+    } else if (op == "local.set" || op == "local.tee") {
+        val n = ctInt(argument)
+        val value = state.top()
+        if (op == "local.set") state.pop()
+        if (ctWasmSecret(value)) state.tainted.add("$n") else state.tainted.discard("$n")
+        if (ctWasmPointer(value)) state.pointers.add("$n") else state.pointers.discard("$n")
+    } else if (op == "global.get" || ctMatches("^(i32|i64|f32|f64)\\.const$", op) || op ==
+        "v128.const") {
+        state.stack.append(0)
+    } else if (op == "global.set") {
+        if (state.pop() != 0) ctFail("secret or secret-pointer global store: $text")
+    } else if (ctMatches("^(i32|i64|f32|f64|v128)\\.load", op)) {
+        if (ctWasmSecret(state.pop())) {
+            ctFail("secret address: $text")
+            return
+        }
+        // Linear-memory aliases cannot be distinguished here; treating every load as secret also fails closed if
+        // a pointer was spilled there.
+        val previous = if (at > 0) ctWords(lines[at - 1].text) else []
+        var headerWord = false
+        if (headerLocals.size() > 0 && previous.size > 0 && previous[0] == "local.get") {
+            val local = ctInt(if (previous.size > 1) previous[1] else "")
+            if (ctFailed()) return
+            if (headerLocals.has("$local") && parts.size > 1 && ctFull("\\d+", parts[1]) != null) {
+                val width = ctWasmLoadWidth(op)
+                if (width != 0 && ctInt(parts[1]) + width <= CT_WASM_HEADER_BYTES) headerWord = true
+            }
+        }
+        state.stack.append(if (headerWord) 0 else CT_WASM_SECRET)
+    } else if (headerMode && (op == "memory.copy" || op == "memory.fill" || op == "memory.init")) {
+        ctFail("a bulk memory write in a function with a header pointer: $text")
+    } else if (ctMatches("^(i32|i64|f32|f64|v128)\\.store", op)) {
+        val value = state.pop()
+        val address = state.pop()
+        if (headerMode && ctWasmSecret(value)) {
+            // Any linear-memory address could be the object (or its header); only a pointer proven to be elsewhere
+            // would be safe, and the checker has no such proof.
+            ctFail("secret stored through an object pointer or outside the frame: $text")
+        } else if (ctWasmSecret(address)) {
+            ctFail("secret address: $text")
+        }
+    } else if (op == "select" || op == "f32.select") {
+        // (llvm-objdump prints the untyped select as f32.select.) It's data in the language, but what an engine
+        // makes of it is its own business.
+        val c = state.pop()
+        if (ctWasmSecret(c)) {
+            ctFail("secret select, which an engine may branch on: $text")
+            return
+        }
+        val b = state.pop()
+        val a = state.pop()
+        state.stack.append(ctWasmValue(ctWasmSecret(a) || ctWasmSecret(b) || ctWasmSecret(c),
+            ctWasmPointer(a) || ctWasmPointer(b)))
+    } else if (ctWasmIsAllocCall(text, allocIndex)) {
+        if (state.pop() != 0) {
+            ctFail("call: the allocation entry is given a secret or a pointer to one: $text")
+            return
+        }
+        state.stack.append(CT_WASM_POINTER)
+    } else if (op == "call" && ctFollow.path != "" && parts.size > 1 && ctWasmIsDigits(parts[1])) {
+        val index = ctInt(parts[1])
+        val module = ctWasmModule(ctFollow.path)
+        if (module == null) return
+        if (index < module.imports || index - module.imports >= module.functions.size) {
+            ctFail("call: $text")
+            return
+        }
+        val type = module.functions[index - module.imports]
+        val params = module.typeParams[type]
+        val outputs = module.typeResults[type]
+        val popped: array<int> = []
+        var n = 0
+        while (n < params) {
+            popped.append(state.pop())
+            n = n + 1
+        }
+        val passed: array<int> = []
+        val pointed: array<int> = []
+        var position = 0
+        while (position < params) {
+            val value = popped[params - 1 - position]
+            if (ctWasmSecret(value)) passed.append(position)
+            else if (ctWasmPointer(value)) pointed.append(position)
+            position = position + 1
+        }
+        val out = ctFollowWasm(index, passed, pointed, text)
+        if (ctFailed()) return
+        var column = 0
+        while (column < outputs) {
+            var anySecret = false
+            var anyPointer = false
+            for (row in out) {
+                if (row.size > column) {
+                    if (ctWasmSecret(row[column])) anySecret = true
+                    if (ctWasmPointer(row[column])) anyPointer = true
+                }
+            }
+            state.stack.append(ctWasmValue(anySecret, anyPointer))
+            column = column + 1
+        }
+    } else if (op == "call" || op == "call_indirect") {
+        ctFail("call: $text")
+    } else if (ctMatches("^(i32|i64)\\.(div|rem)_", op)) {
+        val b = state.pop()
+        val a = state.pop()
+        if (ctWasmSecret(a) || ctWasmSecret(b)) {
+            ctFail("secret division: $text")
+            return
+        }
+        state.stack.append(0)
+    } else if (ctMatches(CT_WASM_BINARY,
+        op) || op.contains("shuffle") || op.contains(".replace_lane") ||
+        op.contains("bitselect")) {
+        val b = state.pop()
+        val a = state.pop()
+        var c = 0
+        if (op.contains("bitselect") && state.stack.size > 0) c = state.pop()
+        val secretIn = ctWasmSecret(a) || ctWasmSecret(b)
+        state.stack.append(ctWasmValue(secretIn || ctWasmSecret(c), (ctWasmPointer(a) ||
+            ctWasmPointer(b)) && !secretIn))
+    } else if (ctMatches(CT_WASM_UNARY, op)) {
+        val a = state.pop()
+        // A pointer stays one through a change of width (an int's address is an i64).
+        state.stack.append(ctWasmValue(ctWasmSecret(a), ctWasmPointer(a) && (op.contains("wrap") ||
+            op.contains("extend"))))
+    } else {
+        ctFail("instruction this checker doesn't know: $text")
+    }
+    return
+}

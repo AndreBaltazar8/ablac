@@ -1,0 +1,1344 @@
+// x86-64 (AT&T syntax): check-asm.py's check_x86 and its helpers (#817), rule for rule.
+import "abla/text"
+import "./core.ab"
+import "./objdump.ab"
+import "./follow.ab"
+
+val CT_X86_ARGS: array<string> = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
+// Registers a function gets from its caller unchanged (SysV).
+val CT_X86_CALLEE_SAVED: array<string> = ["rbx", "rbp", "r12", "r13", "r14", "r15"]
+val CT_X86_CLOBBERED: array<string> = ["rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11",
+    "v0", "v1", "v2",
+    "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15"]
+val CT_VIEW_BYTES = 64
+val CT_HEADER_BYTES = 32
+
+val ctX86Alias: Map<string, string> = ctX86Aliases()
+
+fun ctX86Aliases(): Map<string, string> {
+    val alias: Map<string, string> = Map()
+    val groups: array<array<string>> = [
+        ["rax", "eax ax al ah"], ["rbx", "ebx bx bl bh"], ["rcx", "ecx cx cl ch"], ["rdx",
+            "edx dx dl dh"],
+        ["rsi", "esi si sil"], ["rdi", "edi di dil"], ["rbp", "ebp bp bpl"], ["rsp", "esp sp spl"]
+    ]
+    for (group in groups) {
+        for (name in ctWords(group[1])) alias.set(name, group[0])
+    }
+    var n = 8
+    while (n < 16) {
+        alias.set("r${n}d", "r$n")
+        alias.set("r${n}w", "r$n")
+        alias.set("r${n}b", "r$n")
+        n = n + 1
+    }
+    alias
+}
+
+fun ctLstrip(text: string, byte: int): string {
+    var at = 0
+    while (at < text.size && text[at] == byte) at = at + 1
+    text.slice(at, text.size)
+}
+
+fun ctX86Reg(raw: string): string {
+    val name = ctLstrip(raw, 37)
+    if (ctMatch("[xyz]mm\\d+", name) != null) {
+        var digits = ""
+        for (byte in name) {
+            if (byte >= 48 && byte <= 57) digits = digits + name.slice(0, 0) + ctByteText(byte)
+        }
+        return "v$digits"
+    }
+    ctX86Alias.get(name) ?? name
+}
+
+fun ctByteText(byte: int): string {
+    val digits = "0123456789"
+    if (byte >= 48 && byte <= 57) digits.slice(byte - 48, byte - 47) else ""
+}
+
+/** The operands of an AT&T instruction: commas outside parentheses separate them. */
+fun ctX86Split(ops: string): array<string> {
+    val parts: array<string> = []
+    var depth = 0
+    var start = 0
+    var at = 0
+    while (at < ops.size) {
+        val c = ops[at]
+        if (c == 40) depth = depth + 1
+        if (c == 41) depth = depth - 1
+        if (c == 44 && depth == 0) {
+            parts.append(ops.slice(start, at).trim())
+            start = at + 1
+        }
+        at = at + 1
+    }
+    val last = ops.slice(start, ops.size).trim()
+    if (last != "") parts.append(last)
+    parts
+}
+
+val CT_X86_FLAGLESS =
+    "^(mov|lea|cmov|set|vmov|vpxor|pxor|movz|movs|bswap|not|push|pop|nop|cdq|cqo|cltq|cwt|ret|jmp|call|xchg|rorx|rolx|shlx|shrx|sarx|andn|pand|por|padd|psub|pshuf|punpck|psll|psrl|psra|vp|movdq|movap|movup|movd|movq|ud2|endbr)"
+val CT_X86_READWRITE =
+    "^(add|adc|sub|sbb|and|or|xor|imul|shl|sal|shr|sar|rol|ror|neg|not|inc|dec|pand|por|pxor|pandn|padd|psub|psll|psrl|psra|pmul|punpck|pshufb|bswap|shld|shrd|cmov|aes|pclmul|andn|xchg)"
+
+/** An instruction's mnemonic and operands, after the prefixes `prefixes` names. */
+class CtX86Instruction(val op: string, val ops: array<string>, val repeated: bool)
+
+fun ctX86Parse(text: string, prefixes: array<string>): CtX86Instruction {
+    var parts = ctWords(text, 1)
+    var op = if (parts.size > 0) parts[0] else ""
+    val repeated = op == "rep"
+    var prefixed = false
+    for (prefix in prefixes) {
+        if (op == prefix) prefixed = true
+    }
+    if (prefixed && parts.size > 1) {
+        parts = ctWords(parts[1], 1)
+        op = parts[0]
+    }
+    CtX86Instruction(op, if (parts.size > 1) ctX86Split(parts[1]) else [], repeated)
+}
+
+fun ctSetHas(values: array<string>, value: string): bool {
+    for (item in values) {
+        if (item == value) return true
+    }
+    false
+}
+
+fun ctSetAdd(var values: array<string>, value: string): void {
+    if (!ctSetHas(values, value)) values.append(value)
+    return
+}
+
+/** The argument registers a function may read before writing them (check-asm.py's callee_inputs). */
+val ctCalleeInputsMemo: Map<string, array<string>> = Map()
+
+fun ctCalleeInputs(name: string): array<string> {
+    val known = ctCalleeInputsMemo.get(name)
+    if (known != null) {
+        val copy: array<string> = []
+        for (r in known) copy.append(r)
+        return copy
+    }
+    val found = ctCalleeInputsOf(name)
+    if (ctFatal == "") ctCalleeInputsMemo.set(name, found)
+    val copy: array<string> = []
+    for (r in found) copy.append(r)
+    copy
+}
+
+fun ctCalleeInputsOf(name: string): array<string> {
+    val written: array<string> = []
+    val read: array<string> = []
+    val lines = ctDisassemble(ctFollow.path, name)
+    if (lines == null) {
+        ctStop(ctMissing)
+        return read
+    }
+    for (line in lines) {
+        val instruction = ctX86Parse(line.text, ["rep", "lock", "notrack"])
+        val op = instruction.op
+        val ops = instruction.ops
+        if (ctStartsWithAny(op, ["j", "call", "ret"]) || op.startsWith("loop")) {
+            if (op.startsWith("ret")) return read
+            for (r in CT_X86_ARGS) {
+                if (!ctSetHas(written, r)) ctSetAdd(read, r)
+            }
+            return read
+        }
+        val zeroing = ctStartsWithAny(op, ["xor", "sub",
+            "pxor"]) && ops.size == 2 && ops[0] == ops[1]
+        val stringOp = ctStartsWithAny(op, ["stos", "movs", "scas", "cmps", "lods"])
+        var position = 0
+        while (position < ops.size) {
+            val isDestination = position == ops.size - 1 && ops.size >= 2
+            val skip = ops[position].startsWith("%") && isDestination && ctMatch(CT_X86_READWRITE,
+                op) == null &&
+                !ctStartsWithAny(op, ["cmp", "test"])
+            if (!skip && !zeroing) {
+                for (found in ctFindAll("%\\w+", ops[position])) {
+                    val r = ctX86Reg(found)
+                    if (!ctSetHas(written, r)) ctSetAdd(read, r)
+                }
+            }
+            position = position + 1
+        }
+        if (stringOp) {
+            val used: array<string> = if (op.startsWith("stos")) ["rdi", "rcx", "rax"]
+                else if (op.startsWith("movs")) ["rdi", "rcx", "rsi"]
+                else ["rdi", "rcx", "rax", "rsi"]
+            for (r in used) {
+                if (!ctSetHas(written, r)) ctSetAdd(read, r)
+            }
+        }
+        if (ops.size > 0 && ops[ops.size - 1].startsWith("%")) ctSetAdd(written,
+            ctX86Reg(ops[ops.size - 1]))
+    }
+    for (r in CT_X86_ARGS) {
+        if (!ctSetHas(written, r)) ctSetAdd(read, r)
+    }
+    read
+}
+
+val ctExtents: Map<string, int> = Map()
+
+/** How many bytes below its caller's stack pointer a function and what it calls can have written. */
+fun ctStackExtent(name: string, seen: array<string>): int {
+    if (ctSetHas(seen, name)) {
+        ctFail("call: recursion into $name")
+        return 0
+    }
+    val known = ctExtents.get(name)
+    if (known != null) return known
+    val lines = ctDisassemble(ctFollow.path, name)
+    if (lines == null) {
+        ctStop(ctMissing)
+        return 0
+    }
+    var growth = 8
+    var redZone = 0
+    var deepest = 0
+    for (line in lines) {
+        val text = line.text
+        val instruction = ctX86Parse(text, [])
+        val op = instruction.op
+        val ops = instruction.ops
+        if (op.startsWith("push")) {
+            growth = growth + 8
+        } else if (ops.size > 0 && (ops[ops.size - 1] == "%rsp" || ops[ops.size - 1] == "%esp")) {
+            val lea = ctMatch("^(-?(?:0x)?[0-9a-f]+)\\(%rsp\\)$", ops[0])
+            if (ctStartsWithAny(op, ["sub", "add"]) && ops[0].startsWith("$")) {
+                val value = ctInt(ops[0].slice(1, ops[0].size))
+                growth = growth + (if (op.startsWith("sub")) value else if (value <
+                    0) -value else 0)
+            } else if (op.startsWith("and") && ops[0].startsWith("$")) {
+                growth = growth + 15
+            } else if (op.startsWith("lea") && lea != null) {
+                val delta = -ctInt(ctGroup(lea, 1))
+                growth = growth + (if (delta > 0) delta else 0)
+            } else if (ctStartsWithAny(op, ["add",
+                "lea"]) || op.startsWith("mov") && ops[0] == "%rbp") {
+                // an epilogue: the stack gets shallower
+            } else {
+                ctFail("call: the stack growth of $name can't be evaluated: $text")
+                return 0
+            }
+        }
+        for (found in ctRegex("(-(?:0x)?[0-9a-f]+)\\(%rsp\\)").findAll(text)) {
+            val depth = -ctInt(ctGroup(found, 1))
+            if (depth > redZone) redZone = depth
+        }
+        val target = ctSearch("^(?:call\\w*|jmp\\w*)\\s+(?:0x)?[0-9a-f]+ <([^>+]+)>$", text)
+        if (target != null && ctGroup(target, 1) != name) {
+            val inner: array<string> = []
+            for (item in seen) inner.append(item)
+            inner.append(name)
+            val extent = ctStackExtent(ctGroup(target, 1), inner)
+            if (ctFailed()) return 0
+            if (extent > deepest) deepest = extent
+        }
+    }
+    ctExtents.set(name, growth + redZone + deepest)
+    growth + redZone + deepest
+}
+
+fun ctX86RegisterWidth(o: string): int {
+    val name = ctLstrip(o, 37)
+    for (n in ["al", "bl", "cl", "dl", "sil", "dil", "bpl", "spl", "ah", "bh", "ch", "dh"]) {
+        if (name == n) return 1
+    }
+    for (n in ["ax", "bx", "cx", "dx", "si", "di", "bp", "sp"]) {
+        if (name == n) return 2
+    }
+    for (n in ["eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp"]) {
+        if (name == n) return 4
+    }
+    if (ctFull("r(8|9|1[0-5])b", name) != null) return 1
+    if (ctFull("r(8|9|1[0-5])w", name) != null) return 2
+    if (ctFull("r(8|9|1[0-5])d", name) != null) return 4
+    if (ctFull("r[a-z0-9]+", name) != null) return 8
+    0
+}
+
+fun ctSizeLetter(letter: string): int =
+    if (letter == "b") 1 else if (letter == "w") 2 else if (letter == "l") 4 else if (letter ==
+        "q") 8 else 0
+
+/** The bytes a plain integer move, compare or test touches in its memory operand; 0 if it isn't one of those. */
+fun ctX86AccessWidth(op: string, ops: array<string>): int {
+    val m = ctFull("(mov|cmp|test)([bwlq]?)", op)
+    if (m != null) {
+        if (ctGroup(m, 2) != "") return ctSizeLetter(ctGroup(m, 2))
+        val registers: array<int> = []
+        for (o in ops) {
+            if (o.startsWith("%")) registers.append(ctX86RegisterWidth(o))
+        }
+        return if (registers.size == 1) registers[0] else 0
+    }
+    val extend = ctFull("mov[zs]([bwl])[wlq]", op)
+    if (extend != null) return ctSizeLetter(ctGroup(extend, 1))
+    0
+}
+
+class CtMem(val displacement: string, val base: string, val index: string)
+
+fun ctX86Mem(op: string): CtMem? {
+    val m = ctMatch("^(-?(?:0x)?[0-9a-f]*)\\((%\\w+)?(?:,(%\\w+)(?:,\\d+)?)?\\)$", op)
+    if (m == null) return null
+    CtMem(ctGroup(m, 1), if (m.hasGroup(2)) ctGroup(m, 2) else "", if (m.hasGroup(3)) ctGroup(m,
+        3) else "")
+}
+
+fun ctIsDisplacement(text: string): bool = ctMatch("^-?(?:0x)?[0-9a-f]*$", text) != null
+
+/** The text of a byte position after splitting `tag` on ":" (Python's tag.split(":")[n]). */
+fun ctField(tag: string, n: int): string {
+    val parts = tag.split(":")
+    if (n < parts.size) parts[n] else ""
+}
+
+/** tag.split(":", 2)[2]: everything after the second colon. */
+fun ctRestAfter(tag: string, colons: int): string {
+    var count = 0
+    var at = 0
+    while (at < tag.size) {
+        if (tag[at] == 58) {
+            count = count + 1
+            if (count == colons) return tag.slice(at + 1, tag.size)
+        }
+        at = at + 1
+    }
+    ""
+}
+
+fun ctOnes(count: int): string = "1".repeat(count)
+
+class CtPlace(val base: string, val at: int)
+
+class CtX86Flow(
+    val indexOfLines: Map<int, bool>,
+    val returned: array<CtTags>,
+    val textsAt: Map<int, string>,
+    // The instruction being stepped (check-asm.py's step closure variables).
+    var text: string,
+    var op: string,
+    var ops: array<string>
+): CtFlow {
+    fun viewIndex(state: CtTags, r: string): int? {
+        val found = state.withPrefix("vreg:$r:")
+        if (found.size == 1) ctParseInt(ctField(found[0], 2)) else null
+    }
+
+    fun viewMask(state: CtTags, i: int): string {
+        val found = state.withPrefix("vmem:$i:")
+        if (found.size == 1) ctRestAfter(found[0], 2) else ctOnes(CT_VIEW_BYTES)
+    }
+
+    fun setViewMask(var state: CtTags, i: int, mask: string): void {
+        state.discardPrefix("vmem:$i:")
+        state.add("vmem:$i:$mask")
+        return
+    }
+
+    fun rspDelta(state: CtTags): string {
+        val deltas = state.withPrefix("rspd:")
+        if (deltas.size == 1) ctField(deltas[0], 1) else "?"
+    }
+
+    /** Move rsp by `change` (null: by an unknown amount). */
+    fun moveRsp(var state: CtTags, change: int?): void {
+        val before = this.rspDelta(state)
+        state.discardPrefix("rspd:")
+        state.discardPrefix("rspoff:")
+        state.add("rspd:" + (if (before != "?" && change !=
+            null) "${ctInt(before) + change}" else "?"))
+        return
+    }
+
+    fun framePlace(state: CtTags, r: string): CtPlace? {
+        val fromRbp = state.withPrefix("rbpoff:$r:")
+        if (fromRbp.size == 1 && state.has("stackbase:rbp")) return CtPlace("rbp",
+            ctInt(ctField(fromRbp[0], 2)))
+        val fromRsp = state.withPrefix("rspoff:$r:")
+        if (fromRsp.size == 1 && !state.has("stack-moved")) return CtPlace("rsp",
+            ctInt(ctField(fromRsp[0], 2)))
+        null
+    }
+
+    fun frameView(state: CtTags, r: string): string? {
+        val place = this.framePlace(state, r)
+        if (place == null) return null
+        val unknown = state.has("pushed") || state.has("stack-moved")
+        var mask = ""
+        var i = 0
+        while (i < CT_VIEW_BYTES) {
+            val at = place.at + i
+            mask = mask + (if (unknown || state.has("slot:${place.base}:$at") ||
+                state.has("ptrslot:${place.base}:$at"))
+                "1" else "0")
+            i = i + 1
+        }
+        mask
+    }
+
+    fun afterCall(start: CtTags, name: string, text: string): CtTags {
+        var state = start.copy()
+        if (name == "abla_platform_panic") {
+            // A panic ends the program; it is reached only on a branch already required to be public.
+            if (state.has("rdi") || state.has("ptr:rdi")) {
+                ctFail("call: a panic is given a secret or a pointer to one: $text")
+            }
+            return state
+        }
+        if (ctIsAllocator(name)) {
+            // The crypto allocation entry: not read, given nothing secret, returns a pointer to secret memory.
+            if (state.has("rdi") || state.has("ptr:rdi")) {
+                ctFail("call: the allocation entry is given a secret or a pointer to one: $text")
+                return state
+            }
+            for (r in CT_X86_CLOBBERED) {
+                state.discard(r)
+                state.discard("ptr:$r")
+                state.discard("hdrp:$r")
+                state.discardPrefix("rspoff:$r:")
+                state.discardPrefix("const:$r:")
+                state.discardPrefix("zero:$r")
+                state.add("lost:$r")
+            }
+            state.discard("flags")
+            state.discard("lost:rax")
+            state.add("ptr:rax")
+            if (state.has("frameaddr")) state.add("pushed")
+            return state
+        }
+        val inputs = ctCalleeInputs(name)
+        if (ctFailed()) return state
+        val secretArguments: array<int> = []
+        val pointerArguments: array<int> = []
+        var i = 0
+        while (i < CT_X86_ARGS.size) {
+            val r = CT_X86_ARGS[i]
+            if (state.has(r) && ctSetHas(inputs, r)) secretArguments.append(i)
+            if (state.has("ptr:$r") && !state.has(r) && ctSetHas(inputs,
+                r)) pointerArguments.append(i)
+            i = i + 1
+        }
+        val views: Map<int, string> = Map()
+        val forwarded: Map<int, int> = Map()
+        val ownViews: Map<int, CtPlace> = Map()
+        i = 0
+        while (i < CT_X86_ARGS.size) {
+            val r = CT_X86_ARGS[i]
+            if (ctSetHas(inputs, r) && !ctIntHas(secretArguments, i) && !ctIntHas(pointerArguments,
+                i)) {
+                val given = this.viewIndex(state, r)
+                if (given != null) {
+                    views.set(i, this.viewMask(state, given))
+                    forwarded.set(i, given)
+                } else {
+                    val mask = this.frameView(state, r)
+                    if (mask != null) {
+                        views.set(i, mask)
+                        ownViews.set(i, this.framePlace(state, r) ?? CtPlace("", 0))
+                    }
+                }
+            }
+            i = i + 1
+        }
+        var out = ctFollowCall(name, secretArguments, pointerArguments, text, "check_x86",
+            ctCheckX86, views)
+        if (ctFailed()) return state
+        val passedTags: Map<int, array<string>> = Map()
+        i = 0
+        while (i < CT_X86_ARGS.size) {
+            val r = CT_X86_ARGS[i]
+            passedTags.set(i, state.withPrefixes(["stackaddr:$r", "stackbase:$r", "rbpoff:$r:",
+                "rspoff:$r:",
+                "vreg:$r:"]))
+            i = i + 1
+        }
+        val returnedViews: Map<string, int> = Map()
+        for (tag in out.withPrefix("retview:")) returnedViews.set(ctField(tag, 1),
+            ctInt(ctField(tag, 2)))
+        for (given in returnedViews.values()) {
+            if (!views.has(given)) {
+                out = out.copy()
+                out.add("escape")
+            }
+        }
+        // What the callee left in the memory it was given a view of: back into the view, or into this frame's slots.
+        val returnedMasks: Map<int, string> = Map()
+        for (index in views.keys()) {
+            val found = out.withPrefix("vmem:$index:")
+            returnedMasks.set(index, if (found.size > 0) ctRestAfter(found[0],
+                2) else ctOnes(CT_VIEW_BYTES))
+        }
+        for (index in forwarded.keys()) {
+            this.setViewMask(state, forwarded.get(index) ?? 0,
+                returnedMasks.get(index) ?? ctOnes(CT_VIEW_BYTES))
+        }
+        for (index in ownViews.keys()) {
+            val place = ownViews.get(index) ?? CtPlace("", 0)
+            val mask = returnedMasks.get(index) ?? ctOnes(CT_VIEW_BYTES)
+            var j = 0
+            while (j < mask.size) {
+                val slot = "slot:${place.base}:${place.at + j}"
+                if (mask[j] == 49) state.add(slot) else state.discard(slot)
+                state.discard("ptrslot:${place.base}:${place.at + j}")
+                j = j + 1
+            }
+        }
+        // The callee ran on exactly these arguments: what it returns is what its own analysis found.
+        for (r in CT_X86_CLOBBERED) {
+            state.discard(r)
+            state.discard("ptr:$r")
+            state.discardPrefix("rspoff:$r:")
+            state.discardPrefix("const:$r:")
+            state.discardPrefix("zero:$r")
+            if (out.has(r)) state.add(r)
+            if (out.has("ptr:$r")) state.add("ptr:$r")
+        }
+        state.discard("flags")
+        for (r in returnedViews.keys()) {
+            // The callee returned the address it was given for argument i: the register is that address again.
+            val given = returnedViews.get(r) ?? 0
+            val argument = CT_X86_ARGS[given]
+            for (tag in passedTags.get(given) ?? []) {
+                state.add(if (tag.contains(":")) ctReplaceFirst(tag, ":$argument", ":$r") else tag)
+            }
+        }
+        // Memory it was given may now hold secrets, unless the call is clean.
+        val passedFrame: array<string> = []
+        for (r in CT_X86_ARGS) {
+            if (ctSetHas(inputs, r) && state.anyPrefixOf(["stackaddr:$r", "stackbase:$r",
+                "rbpoff:$r:", "rspoff:$r:",
+                "vreg:$r:"])) passedFrame.append(r)
+        }
+        val frameAddressRegs: array<string> = []
+        for (tag in state.withPrefixes(["stackaddr:", "stackbase:", "rspoff:", "rbpoff:"])) {
+            val r = ctField(tag, 1)
+            if (r != "rsp" && r != "rbp") ctSetAdd(frameAddressRegs, r)
+        }
+        var uncovered = false
+        for (r in frameAddressRegs) {
+            val position = ctIndexOf(CT_X86_ARGS, r)
+            if (!(position >= 0 && views.has(position))) uncovered = true
+        }
+        var allViewed = true
+        for (r in passedFrame) {
+            if (!views.has(ctIndexOf(CT_X86_ARGS, r))) allViewed = false
+        }
+        val clean = allViewed && !out.has("wroteout") && !out.has("escape") &&
+            !state.has("frameleak") && !uncovered
+        if (out.has("wroteout")) state.add("wroteout")
+        if (out.has("escape")) state.add("escape")
+        if (state.has("frameaddr") && !clean) state.add("pushed")
+        val here = this.rspDelta(state)
+        for (wipe in out.withPrefix("wipe:")) {
+            // A callee that wiped the stack below itself: its stack pointer is 8 below ours (the return address).
+            val fields = wipe.split(":")
+            val low = ctInt(fields[1])
+            val high = ctInt(fields[2])
+            var skip = false
+            if (fields.size > 3) {
+                for (r in fields[3].split("+")) {
+                    if (state.has(r) || state.has("ptr:$r")) skip = true
+                }
+            }
+            if (!skip) {
+                for (tag in state.withPrefix("dirty:")) {
+                    val atCall = ctField(tag, 1)
+                    val depth = ctField(tag, 2)
+                    if (here != "?" && atCall != "?") {
+                        if (-ctInt(here) - 8 + low <= -ctInt(atCall) - ctInt(depth) &&
+                            -ctInt(here) - 8 + high >= -ctInt(atCall) - 8) state.discard(tag)
+                    }
+                }
+            }
+        }
+        if (ctFollow.residue && (secretArguments.size > 0 || pointerArguments.size > 0)) {
+            // Whatever the callee wrote below our stack pointer may hold a secret; a wipe has to reach it.
+            val extent = ctStackExtent(name, [])
+            if (ctFailed()) return state
+            state.add("dirty:${this.rspDelta(state)}:$extent")
+        }
+        state
+    }
+
+    fun trapNote(text: string): string {
+        val m = ctMatch("^\\S+\\s+(?:0x)?([0-9a-f]+)", text)
+        val target = if (m != null) this.textsAt.get(ctParseHex(ctGroup(m, 1)) ?? -1) ?? "" else ""
+        if (ctFirstWord(target) == "ud2") " (to trap)" else ""
+    }
+
+    fun markLost(var state: CtTags, op: string, ops: array<string>): void {
+        if (ctStartsWithAny(op, ["call", "syscall"])) {
+            for (r in ["rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10",
+                "r11"]) state.add("lost:$r")
+            return
+        }
+        if (ctFull("cmp[bwlq]?|test[bwlq]?|j\\w+|push[wlq]?|nop\\w*|endbr\\w*|ret\\w*",
+            op) != null) return
+        if (ctStartsWithAny(op, ["mul", "imul", "div", "idiv", "cqo", "cltd", "cdq", "cltq", "cwt",
+            "cbw", "xchg",
+            "cmpxchg", "xadd", "rep", "movs", "stos", "scas", "cmps", "lods", "cpuid", "rdtsc",
+            "rdrand", "rdseed",
+            "sh", "sa", "ro", "rc", "pop"])) {
+            for (r in ["rax", "rcx", "rdx"]) state.add("lost:$r")
+        }
+        if (ctStartsWithAny(op, ["movs", "stos", "scas", "cmps", "lods", "cmpxchg", "cpuid"])) {
+            for (r in ["rsi", "rdi", "rbx"]) state.add("lost:$r")
+        }
+        var i = 0
+        while (i < ops.size) {
+            val o = ops[i]
+            if (o.startsWith("%")) {
+                val skip = (op.startsWith("mov") && !ctStartsWithAny(op, ["movs", "movz"]) ||
+                    ctStartsWithAny(op, ["movz", "lea"])) && i != ops.size - 1
+                if (!skip) state.add("lost:" + ctX86Reg(o))
+            }
+            i = i + 1
+        }
+        return
+    }
+
+    fun tainted(state: CtTags, r: string): bool = state.has(ctX86Reg(r))
+
+    /** The stack slots ("rbp:-8", ...) memory operand `o` names, or null. */
+    fun stackSlots(state: CtTags, o: string): array<string>? {
+        val m = ctX86Mem(o)
+        if (m == null || m.base == "" || m.index != "") return null
+        var base = ctX86Reg(m.base)
+        val relative = state.withPrefix("rbpoff:$base:")
+        val fromRsp = state.withPrefix("rspoff:$base:")
+        var shift = 0
+        if (base != "rsp" && base != "rbp" && relative.size == 1 && state.has("stackbase:rbp")) {
+            shift = ctInt(ctField(relative[0], 2))
+            base = "rbp"
+        } else if (base != "rsp" && base != "rbp" && fromRsp.size == 1 &&
+            !state.has("stack-moved")) {
+            shift = ctInt(ctField(fromRsp[0], 2))
+            base = "rsp"
+        } else if (base != "rsp" && (base != "rbp" || !state.has("stackbase:rbp"))) {
+            return null
+        }
+        if (state.has("ptr:$base")) return null
+        val offset = ctIntOrZero(m.displacement) + shift
+        val op = this.op
+        val size = if (ctMatch("^mov[zs]b", op) != null) 1
+            else if (ctMatch("^mov[zs]w", op) != null) 2
+            else if (ctMatch("^movs[lq]", op) != null) 4
+            else if (op.endsWith("b")) 1
+            else if (op.endsWith("w")) 2
+            else if (op.endsWith("l")) 4
+            else if (op.endsWith("q")) 8
+            else 16
+        val slots: array<string> = []
+        var i = 0
+        while (i < size) {
+            slots.append("$base:${offset + i}")
+            i = i + 1
+        }
+        slots
+    }
+
+    fun stackTagged(state: CtTags, slots: array<string>, prefix: string): bool {
+        for (slot in slots) {
+            if (state.has(prefix + slot)) return true
+        }
+        val base = slots[0].slice(0, slots[0].indexOf(":"))
+        val moved = state.has("stack-moved")
+        for (item in state.withPrefix(prefix)) {
+            if (moved || !item.startsWith("$prefix$base:")) return true
+        }
+        false
+    }
+
+    fun readPointer(state: CtTags, o: string): bool {
+        if (o.startsWith("%")) return state.has("ptr:" + ctX86Reg(o))
+        val slots = this.stackSlots(state, o)
+        slots != null && (state.has("pushed_ptr") || this.stackTagged(state, slots, "ptrslot:"))
+    }
+
+    fun read(var state: CtTags, o: string): bool {
+        if (o.startsWith("%")) return this.tainted(state, o)
+        if (o.startsWith("$")) return false
+        val m = ctX86Mem(o)
+        if (m == null) return false
+        val op = this.op
+        val base = m.base
+        val idx = m.index
+        if ((base != "" && this.tainted(state, base)) || (idx != "" && this.tainted(state, idx))) {
+            if (!op.startsWith("lea")) {
+                ctFail("secret address: ${this.text}")
+            }
+            return true
+        }
+        if (base != "" && idx == "" && state.has("hdrp:" + ctX86Reg(base)) && !state.has("lost:" +
+            ctX86Reg(base)) &&
+            ctIsDisplacement(m.displacement)) {
+            val start = ctIntOrZero(m.displacement)
+            val width = ctX86AccessWidth(op, this.ops)
+            if (width > 0 && 0 <= start && start + width <= CT_HEADER_BYTES) return false
+        }
+        if ((base != "" && state.has("ptr:" + ctX86Reg(base))) || (idx != "" && state.has("ptr:" +
+            ctX86Reg(idx)))) {
+            if (ctFollow.writeOnly) {
+                ctFail("reads the secret memory it may only overwrite: ${this.text}")
+            }
+            return true
+        }
+        val viewed = if (base != "") this.viewIndex(state, ctX86Reg(base)) else null
+        if (viewed != null && idx == "" && ctIsDisplacement(m.displacement)) {
+            val at = ctIntOrZero(m.displacement)
+            val width = ctX86AccessWidth(op, this.ops)
+            val mask = this.viewMask(state, viewed)
+            if (width > 0 && 0 <= at && at + width <= CT_VIEW_BYTES) return mask.slice(at,
+                at + width).contains("1")
+            return true
+        }
+        val slots = this.stackSlots(state, o)
+        if (slots != null) return state.has("pushed") || this.stackTagged(state, slots, "slot:")
+        // Unknown memory might alias secret storage; fail closed on its value.
+        !op.startsWith("lea")
+    }
+
+    fun write(var state: CtTags, o: string, value: bool, pointer: bool): void {
+        if (o.startsWith("%")) {
+            val r = ctX86Reg(o)
+            state.discard("entry:$r")
+            state.discardPrefix("vreg:$r:")
+            state.discardPrefix("rbpoff:$r:")
+            if (value) state.add(r) else state.discard(r)
+            if (pointer) state.add("ptr:$r") else state.discard("ptr:$r")
+            state.discard("stackaddr:$r")
+            state.discardPrefix("rspoff:$r:")
+            state.discardPrefix("const:$r:")
+            state.discardPrefix("zero:$r")
+            if (r != "rsp") state.discard("stackbase:$r")
+            return
+        }
+        val m = ctX86Mem(o)
+        if (m == null) return
+        val base = m.base
+        val idx = m.index
+        if (base != "" && this.tainted(state, base) || idx != "" && this.tainted(state, idx)) {
+            ctFail("secret address: ${this.text}")
+            return
+        }
+        val slots = this.stackSlots(state, o)
+        if (value && state.anyPrefix("hdrp:") && (slots == null ||
+            ((base != "" && state.has("ptr:" + ctX86Reg(base))) || (idx != "" && state.has("ptr:" +
+                ctX86Reg(idx)))))) {
+            ctFail("secret stored through an object pointer or outside the frame: ${this.text}")
+            return
+        }
+        if (slots != null) {
+            for (slot in slots) {
+                if (value) state.add("slot:$slot") else state.discard("slot:$slot")
+                if (pointer) state.add("ptrslot:$slot") else state.discard("ptrslot:$slot")
+            }
+        } else if ((value || pointer) && base != "" && (state.has("stackbase:" + ctX86Reg(base)) ||
+            state.has("stackaddr:" + ctX86Reg(base)) || (idx != "" && state.has("stackbase:" +
+                ctX86Reg(idx))))) {
+            state.add("pushed")
+        }
+        val viewed = if (base != "") this.viewIndex(state, ctX86Reg(base)) else null
+        if (viewed != null && idx == "") {
+            val current = this.viewMask(state, viewed)
+            val mask: array<string> = []
+            for (byte in current) mask.append(if (byte == 49) "1" else "0")
+            val at = if (m.displacement == "" || m.displacement ==
+                "-") 0 else ctParseInt(m.displacement)
+            val width = ctX86AccessWidth(this.op, this.ops)
+            var whole = false
+            if (at == null || width == 0) {
+                whole = true
+            } else {
+                var i = at
+                while (i < at + width) {
+                    if (0 <= i && i < CT_VIEW_BYTES) mask[i] = if (value || pointer) "1" else "0"
+                    i = i + 1
+                }
+            }
+            if (at != null && width > 0 && !(0 <= at && at <= CT_VIEW_BYTES - width)) {
+                whole = true
+                state.add("wroteout")
+            }
+            this.setViewMask(state, viewed, if (whole) ctOnes(CT_VIEW_BYTES) else textJoin(mask,
+                ""))
+        } else if (slots == null && (value || pointer)) {
+            for (tag in state.withPrefix("vmem:")) this.setViewMask(state, ctInt(ctField(tag, 1)),
+                ctOnes(CT_VIEW_BYTES))
+        }
+        return
+    }
+
+    fun rawStep(start: CtTags, text: string, address: int): CtTags {
+        var state = start.copy()
+        val instruction = ctX86Parse(text, ["lock", "rep", "notrack", "data16", "cs"])
+        val op = instruction.op
+        val ops = instruction.ops
+        val repeated = instruction.repeated
+        this.text = text
+        this.op = op
+        val copied: array<string> = []
+        for (operand in ops) copied.append(operand)
+        this.ops = copied
+        val last = if (ops.size > 0) ops[ops.size - 1] else ""
+        if (ctFollow.writeOnly && ctStartsWithAny(op, ["xadd", "cmpxchg"]) && ops.size > 0) {
+            val m = ctX86Mem(last)
+            if (m != null && ((m.base != "" && state.has("ptr:" + ctX86Reg(m.base))) ||
+                (m.index != "" && state.has("ptr:" + ctX86Reg(m.index))))) {
+                ctFail("reads the secret memory it may only overwrite: $text")
+                return state
+            }
+        }
+        if (state.anyPrefix("hdrp:")) this.markLost(state, op, ops)
+        if (ops.size > 0 && last.startsWith("%") && !ctStartsWithAny(op, ["push", "cmp", "test"])) {
+            state.discard("entry:" + ctX86Reg(last))
+        }
+        if (op.startsWith("push")) {
+            this.moveRsp(state, 8)
+        } else if (op.startsWith("pop")) {
+            this.moveRsp(state, -8)
+        } else if (ops.size > 0 && (last == "%rsp" || last == "%esp") && !ctStartsWithAny(op,
+            ["cmp", "test"])) {
+            val lea = ctMatch("^(-?(?:0x)?[0-9a-f]+)\\(%rsp\\)$", ops[0])
+            if (ctStartsWithAny(op, ["sub", "add"]) && ops[0].startsWith("$")) {
+                this.moveRsp(state, ctInt(ops[0].slice(1,
+                    ops[0].size)) * (if (op.startsWith("sub")) 1 else -1))
+            } else if (op.startsWith("lea") && lea != null) {
+                this.moveRsp(state, -ctInt(ctGroup(lea, 1)))
+            } else {
+                this.moveRsp(state, null)
+            }
+        }
+        if (ctFailed()) return state
+        if (op.startsWith("j") && op != "jmp" && op != "jmpq") {
+            if (state.has("flags")) ctFail("secret branch${this.trapNote(text)}: $text")
+            return state
+        }
+        if (op.startsWith("jmp")) {
+            if (ops.size > 0 && ops[0].startsWith("*")) {
+                ctFail("indirect jump: $text")
+                return state
+            }
+            val tail = if (ops.size > 0) ctMatch("^(?:0x)?([0-9a-f]+) <([^>+]+)>$",
+                ops[0]) else null
+            if (tail != null && !this.indexOfLines.has(ctParseHex(ctGroup(tail, 1)) ?? -1)) {
+                // A jump out of the function: a call that returns for us.
+                if (ctFollow.path == "") {
+                    ctFail("call: $text")
+                    return state
+                }
+                this.returned.append(this.afterCall(state, ctGroup(tail, 2), text))
+            }
+            return state
+        }
+        if (op.startsWith("call")) {
+            val target = if (ops.size > 0) ops[0] else ""
+            val callee = ctSearch("<([^>+]+)>$", target)
+            if (callee == null || !(ctFollow.path != "" || ctIsAllocator(ctGroup(callee, 1)))) {
+                ctFail("call: $text")
+                return state
+            }
+            return this.afterCall(state, ctGroup(callee, 1), text)
+        }
+        if (ctStartsWithAny(op, ["ret", "nop", "endbr", "ud2", "int3",
+            "hlt"]) || op == "") return state
+        if (op == "cqto" || op == "cqo" || op == "cltd" || op == "cdq" || op == "cwtd" || op ==
+            "cwd") {
+            // Sign-extends rax into rdx: rdx is a function of rax alone, whatever it held.
+            if (state.has("rax")) state.add("rdx") else state.discard("rdx")
+            return state
+        }
+        if (ctMatch("^(i?div)[bwlq]?$", op) != null) {
+            var secretOperand = false
+            for (o in ops) {
+                if (!secretOperand && this.read(state, o)) secretOperand = true
+                if (ctFailed()) return state
+            }
+            if (secretOperand || state.has("rax") || state.has("rdx")) {
+                ctFail("secret division: $text")
+                return state
+            }
+        }
+        // Once a tagged slot exists, a later stack-pointer adjustment makes stack aliases unknown.
+        val changesSp = ctStartsWithAny(op, ["push", "pop"]) ||
+            (ops.size > 0 && (last == "%rsp" || last == "%esp") && ctStartsWithAny(op, ["add",
+                "sub", "lea", "mov"]))
+        if (changesSp && (state.anyPrefix("slot:") ||
+            state.anyPrefix("ptrslot:"))) state.add("stack-moved")
+        if (op.startsWith("push")) {
+            if (this.tainted(state, ops[0])) state.add("pushed")
+            if (this.readPointer(state, ops[0])) state.add("pushed_ptr")
+            val here = this.rspDelta(state)
+            if (here != "?") {
+                val depth = -ctInt(here)
+                state.discardPrefix("pubpush:$depth")
+                state.discardPrefix("entrypush:$depth:")
+                if (ops[0].startsWith("%") && state.has("entry:" + ctX86Reg(ops[0]))) {
+                    state.add("entrypush:$depth:${ctX86Reg(ops[0])}")
+                } else if (ops[0].startsWith("%") && !this.tainted(state,
+                    ops[0]) && !this.readPointer(state, ops[0])) {
+                    state.add("pubpush:$depth")
+                }
+            }
+            return state
+        }
+        if (op.startsWith("pop")) {
+            for (tag in state.withPrefixes(["pubpush:", "entrypush:"])) {
+                val delta = this.rspDelta(state)
+                if (delta == "?" || ctInt(ctField(tag, 1)) < -ctInt(delta)) state.discard(tag)
+            }
+            this.write(state, ops[0], state.has("pushed"), state.has("pushed_ptr"))
+            return state
+        }
+        if (ops.size > 0 && !last.startsWith("%") && !last.startsWith("$") &&
+            !ctStartsWithAny(op, ["cmp", "test", "j", "call",
+                "nop"]) && !(repeated && op.startsWith("stos"))) {
+            state.discardPrefix("pubpush:")
+            state.discardPrefix("entrypush:")
+        }
+        if (ctStartsWithAny(op, ["cmp", "test", "vptest", "ptest", "bt", "ucomis", "comis"])) {
+            var any = false
+            for (o in ops) {
+                if (!any && this.read(state, o)) any = true
+                if (ctFailed()) return state
+            }
+            if (any) state.add("flags") else state.discard("flags")
+            return state
+        }
+        if (op.startsWith("lea")) {
+            val parts = ctX86Mem(ops[0])
+            val base = if (parts != null && parts.base != "") ctX86Reg(parts.base) else ""
+            val index = if (parts != null && parts.index != "") ctX86Reg(parts.index) else ""
+            val value = state.has(base) || state.has(index)
+            val pointerInput = state.has("ptr:$base") || state.has("ptr:$index")
+            val stackBase = base == "rsp" || state.has("stackbase:$base")
+            this.write(state, ops[1], value, pointerInput)
+            if (ctFailed()) return state
+            if (base == "rsp" && index == "" && ops[1].startsWith("%")) {
+                state.add("rspoff:${ctX86Reg(ops[1])}:${ctIntOrZero(parts?.displacement ?? "")}")
+            }
+            if (base == "rbp" && index == "" && state.has("stackbase:rbp") &&
+                ops[1].startsWith("%")) {
+                state.add("rbpoff:${ctX86Reg(ops[1])}:${ctIntOrZero(parts?.displacement ?? "")}")
+            }
+            if (stackBase && ops[1].startsWith("%")) {
+                state.add("stackbase:" + ctX86Reg(ops[1]))
+                state.add("stackaddr:" + ctX86Reg(ops[1]))
+            }
+            if (stackBase) state.add("frameaddr")
+            return state
+        }
+        // A zeroing idiom forgets what it wrote over.
+        if (ctStartsWithAny(op, ["xor", "pxor", "vpxor", "sub", "xorp"]) && ops.size >= 2 &&
+            ctX86Reg(ops[0]) == ctX86Reg(ops[1]) && ops[0].startsWith("%")) {
+            this.write(state, last, false, false)
+            state.add("zero:" + ctX86Reg(last))
+            state.discard("flags")
+            return state
+        }
+        if (repeated && op.startsWith("stos") && state.has("zero:rax") && !this.tainted(state,
+            "%rax")) {
+            // `rep stos` of zero over a constant number of elements from a constant offset from rsp: a frame wipe.
+            val width = ctSizeLetter(op.slice(op.size - 1, op.size))
+            val starts = state.withPrefix("rspoff:rdi:")
+            val counts = state.withPrefix("const:rcx:")
+            if (width > 0 && starts.size > 0 && counts.size > 0) {
+                val start = ctInt(ctField(starts[0], 2))
+                val count = ctInt(ctField(counts[0], 2))
+                for (tag in state.withPrefixes(["slot:rsp:", "ptrslot:rsp:"])) {
+                    val slot = ctRestAfter(tag, 1)
+                    val offset = ctParseInt(slot.slice(4, slot.size))
+                    if (offset != null && offset >= start && offset < start + width *
+                        count) state.discard(tag)
+                }
+                if (start + width * count > 0) {
+                    ctFail("a wipe reaches above the stack pointer: $text")
+                    return state
+                }
+                val here = this.rspDelta(state)
+                for (tag in state.withPrefix("dirty:")) {
+                    val atCall = ctField(tag, 1)
+                    val depth = ctField(tag, 2)
+                    if (here != "?" && atCall != "?") {
+                        val low = ctInt(here) * -1 + start
+                        val high = ctInt(here) * -1 + start + width * count
+                        if (low <= -ctInt(atCall) - ctInt(depth) && high >= -ctInt(atCall) -
+                            8) state.discard(tag)
+                    }
+                }
+                if (here != "?") {
+                    val low = -ctInt(here) + start
+                    var high = low + width * count
+                    state.add("wipe:$low:$high")
+                    val regs: array<string> = []
+                    var more = true
+                    while (more) {
+                        if (state.has("pubpush:$high")) {
+                            high = high + 8
+                        } else {
+                            val pushed = state.withPrefix("entrypush:$high:")
+                            if (pushed.size == 0) {
+                                more = false
+                            } else {
+                                regs.append(ctField(pushed[0], 2))
+                                high = high + 8
+                            }
+                        }
+                    }
+                    if (high != low + width * count) {
+                        val unique: array<string> = []
+                        for (r in regs) ctSetAdd(unique, r)
+                        state.add("wipe:$low:$high" + (if (unique.size > 0) ":" +
+                            textJoin(sortedStrings(unique), "+") else ""))
+                    }
+                }
+                state.discard("rdi")
+                state.discard("rcx")
+                return state
+            }
+        }
+        if (op.startsWith("mov") && ops.size == 2 && ops[0].startsWith("$") &&
+            ops[1].startsWith("%")) {
+            this.write(state, ops[1], false, false)
+            val constant = ctParseInt(ops[0].slice(1, ops[0].size))
+            if (constant != null) state.add("const:${ctX86Reg(ops[1])}:$constant")
+            return state
+        }
+        if (op.startsWith("mov") && ops.size == 2) {
+            val pointer = this.readPointer(state, ops[0])
+            val value = this.read(state, ops[0])
+            if (ctFailed()) return state
+            val source = if (ops[0].startsWith("%")) ctX86Reg(ops[0]) else ""
+            val stackBase = source == "rsp" || state.has("stackbase:$source")
+            val fromStackAddress = state.has("stackaddr:$source")
+            this.write(state, ops[1], value, pointer)
+            if (ctFailed()) return state
+            if (stackBase && ops[1].startsWith("%")) state.add("stackbase:" + ctX86Reg(ops[1]))
+            if ((stackBase || fromStackAddress) && ops[1].startsWith("%")) state.add("stackaddr:" +
+                ctX86Reg(ops[1]))
+            // mov %rsp, %rbp sets up the frame pointer; it isn't an address given away.
+            if ((stackBase || fromStackAddress) && !(source == "rsp" && ops[1] ==
+                "%rbp")) state.add("frameaddr")
+            return state
+        }
+        var inputs = false
+        var position = 0
+        while (position < ops.size - 1) {
+            if (!inputs && this.read(state, ops[position])) inputs = true
+            if (ctFailed()) return state
+            position = position + 1
+        }
+        // Three-operand IMUL overwrites its destination; unlike the two-operand form it doesn't read it.
+        if (ops.size > 0 && ctMatch(CT_X86_READWRITE,
+            op) != null && !(op.startsWith("imul") && ops.size == 3)) {
+            inputs = inputs || this.read(state, last)
+            if (ctFailed()) return state
+        }
+        if (ctStartsWithAny(op, ["mul", "imul"]) && ops.size == 1) {
+            inputs = this.read(state, ops[0]) || state.has("rax")
+            if (ctFailed()) return state
+            this.write(state, "%rax", inputs, false)
+            this.write(state, "%rdx", inputs, false)
+            if (inputs) state.add("flags")
+            return state
+        }
+        if (ctStartsWithAny(op, ["cmov", "adc", "sbb", "set", "rcl",
+            "rcr"]) && state.has("flags")) inputs = true
+        if (op == "cltq" || op == "cqto" || op == "cltd" || op == "cqo" || op == "cdq" || op ==
+            "cdqe" || op == "cwtl") {
+            inputs = state.has("rax")
+            if (inputs) state.add("rdx")
+            return state
+        }
+        if (ops.size > 0) {
+            // Adding to or subtracting from a pointer is still a pointer.
+            var movesPointer = false
+            if (ctStartsWithAny(op, ["add", "sub"]) && ops.size == 2 && !inputs) {
+                movesPointer = this.readPointer(state, last) || this.readPointer(state, ops[0])
+            }
+            val destination = if (last.startsWith("%")) ctX86Reg(last) else ""
+            // A register that holds an address in our own frame stays one when a constant is added.
+            val stackAddress = destination != "" && ctStartsWithAny(op, ["add", "sub"]) &&
+                state.has("stackaddr:$destination")
+            this.write(state, last, inputs, movesPointer)
+            if (ctFailed()) return state
+            if (destination != "") {
+                state.discard("stackaddr:$destination")
+                if (stackAddress) state.add("stackaddr:$destination")
+            }
+        }
+        if (ctMatch(CT_X86_FLAGLESS, op) == null) {
+            if (inputs) state.add("flags") else state.discard("flags")
+        }
+        state
+    }
+
+    fun successors(text: string, i: int, index: Map<int, int>): array<int> {
+        val parts = ctWords(text)
+        val op = if (parts.size > 0) parts[0] else ""
+        val out: array<int> = []
+        if (op.startsWith("ret") || op == "ud2" || op == "hlt") return out
+        if (op.startsWith("j") && parts.size > 1) {
+            val m = ctMatch("^(?:0x)?([0-9a-f]+)", parts[1])
+            if (m != null) {
+                val target = index.get(ctParseHex(ctGroup(m, 1)) ?? -1)
+                if (target != null) out.append(target)
+            }
+            if (op.startsWith("jmp")) return out
+        }
+        out.append(i + 1)
+        out
+    }
+
+    fun derived(before: CtTags,
+        r: string): bool = before.has("vd:$r") || before.anyPrefix("vreg:$r:")
+
+    /** step, plus what a caller needs to trust its own frame: `wroteout`, `vd:<reg>`, `escape`. */
+    fun step(before: CtTags, text: string, address: int): CtTags {
+        val after = this.rawStep(before, text, address)
+        if (ctFailed()) return after
+        val instruction = ctX86Parse(text, ["lock", "rep", "notrack", "data16", "cs"])
+        val op = instruction.op
+        val ops = instruction.ops
+        val last = if (ops.size > 0) ops[ops.size - 1] else ""
+        val sources: array<string> = []
+        val sourceOperands = if (ops.size > 1) ops.size - 1 else ops.size
+        var position = 0
+        while (position < sourceOperands) {
+            if (ops[position].startsWith("%")) sources.append(ctX86Reg(ops[position]))
+            position = position + 1
+        }
+        if (op.startsWith("lea") && ops.size > 0) {
+            for (found in ctFindAll("%\\w+", ops[0])) sources.append(ctX86Reg(found))
+        }
+        var stores = ops.size > 0 && !last.startsWith("%") && !last.startsWith("$") &&
+            !last.startsWith("*") &&
+            last.contains("(") && !ctStartsWithAny(op, ["cmp", "test", "j", "call", "nop", "lea",
+                "prefetch", "bt"]) &&
+            op != "push"
+        if (op.startsWith("stos") || op.startsWith("movs")) stores = true
+        if (stores) {
+            val m = if (!ctStartsWithAny(op, ["stos", "movs"])) ctX86Mem(last) else null
+            var own = false
+            if (m != null && m.index == "") {
+                val base = if (m.base != "") ctX86Reg(m.base) else ""
+                val at = if (m.displacement == "" || m.displacement ==
+                    "-") 0 else ctParseInt(m.displacement)
+                val accessWidth = ctX86AccessWidth(op, ops)
+                val width = if (accessWidth != 0) accessWidth else 16
+                val here = this.rspDelta(before)
+                if (at != null && base == "rbp" && before.has("stackbase:rbp") && at + width <=
+                    0) own = true
+                else if (at != null && base == "rsp" && here != "?" && at + width <=
+                    ctInt(here)) own = true
+            }
+            if (op.startsWith("stos")) {
+                val start = before.withPrefix("rspoff:rdi:")
+                val count = before.withPrefix("const:rcx:")
+                val width = ctSizeLetter(op.slice(op.size - 1, op.size))
+                val here = this.rspDelta(before)
+                own = start.size == 1 && count.size == 1 && width > 0 && here != "?" &&
+                    ctInt(ctField(start[0], 2)) + width * ctInt(ctField(count[0], 2)) <= ctInt(here)
+            }
+            val throughView = m != null && m.index == "" && m.base != "" && this.viewIndex(before,
+                ctX86Reg(m.base)) != null
+            val bases: array<string> = []
+            if (m != null) {
+                for (found in ctFindAll("%\\w+", last)) bases.append(ctX86Reg(found))
+            }
+            var stackReached = ctStartsWithAny(op, ["stos", "movs"])
+            for (b in bases) {
+                if (b == "rsp" || b == "rbp" || this.derived(before,
+                    b) || before.has("stackbase:$b") ||
+                    before.has("stackaddr:$b")) stackReached = true
+            }
+            if (!own && !throughView && stackReached) after.add("wroteout")
+            val spilled: array<int> = []
+            for (r in sources) {
+                val view = this.viewIndex(before, r)
+                if (view != null) spilled.append(view)
+            }
+            val slotBase = if (m != null && m.base != "") ctX86Reg(m.base) else ""
+            var anyDerived = false
+            for (r in sources) {
+                if (this.derived(before, r)) anyDerived = true
+            }
+            if (own && (slotBase == "rbp" || slotBase == "rsp")) {
+                val at = ctIntOrZero(m?.displacement ?? "")
+                after.discardPrefix("vslot:$slotBase:$at:")
+                if (spilled.size > 0) after.add("vslot:$slotBase:$at:${spilled[0]}")
+            } else if (anyDerived) {
+                after.add("escape")
+            }
+            var leaked = false
+            for (r in sources) {
+                if (r != "rsp" && r != "rbp" &&
+                    before.anyPrefixOf(["stackaddr:$r", "stackbase:$r", "rspoff:$r:",
+                        "rbpoff:$r:"])) leaked = true
+            }
+            if (leaked) after.add("frameleak")
+        } else if (op == "push" && ops.size > 0 && ops[0].startsWith("%") && this.derived(before,
+            ctX86Reg(ops[0]))) {
+            after.add("escape")
+        }
+        if (op == "push" && ops.size > 0 && ops[0].startsWith("%")) {
+            val r = ctX86Reg(ops[0])
+            if (r != "rsp" && r != "rbp" &&
+                before.anyPrefixOf(["stackaddr:$r", "stackbase:$r", "rspoff:$r:",
+                    "rbpoff:$r:"])) after.add("frameleak")
+        }
+        if (ops.size > 0 && last.startsWith("%") && !ctStartsWithAny(op, ["cmp", "test", "push"])) {
+            val dest = ctX86Reg(last)
+            var fromOther = false
+            for (r in sources) {
+                if (r != dest && this.derived(before, r)) fromOther = true
+            }
+            val selfDerived = this.derived(before,
+                dest) && op != "mov" && op != "movq" && op != "movl" && op != "lea" &&
+                op != "leaq" && !op.startsWith("xor")
+            if (fromOther || selfDerived) {
+                after.add("vd:$dest")
+            } else if (!after.anyPrefix("vreg:$dest:")) {
+                after.discard("vd:$dest")
+            }
+            // A register copy of a view's register points at the same view, and so does a reload of its spill.
+            val spillSource = if (ops.size == 2) ctX86Mem(ops[0]) else null
+            if (op.startsWith("mov") && ops.size == 2 && ops[0].startsWith("%") &&
+                !ops[0].contains("(")) {
+                val source = this.viewIndex(before, ctX86Reg(ops[0]))
+                if (source != null) {
+                    after.add("vreg:$dest:$source")
+                    after.discard("vd:$dest")
+                }
+            } else if ((op == "mov" || op == "movq") && ops.size == 2 && spillSource != null &&
+                spillSource.index == "" && spillSource.base != "" &&
+                (ctX86Reg(spillSource.base) == "rbp" || ctX86Reg(spillSource.base) == "rsp")) {
+                val at = ctIntOrZero(spillSource.displacement)
+                val spill = before.withPrefix("vslot:${ctX86Reg(spillSource.base)}:$at:")
+                if (spill.size > 0) after.add("vreg:$dest:${ctField(spill[0], 3)}")
+            }
+        }
+        // rsp-relative spills name other slots once rsp moves.
+        if (ops.size > 0 && (last == "%rsp" || last == "%esp") || ctStartsWithAny(op, ["push",
+            "pop"])) {
+            after.discardPrefix("vslot:rsp:")
+        }
+        if (op.startsWith("ret") && (this.derived(before, "rax") || this.derived(before,
+            "rdx"))) after.add("escape")
+        after
+    }
+}
+
+fun ctIntHas(values: array<int>, value: int): bool {
+    for (item in values) {
+        if (item == value) return true
+    }
+    false
+}
+
+fun ctIndexOf(values: array<string>, value: string): int {
+    var i = 0
+    while (i < values.size) {
+        if (values[i] == value) return i
+        i = i + 1
+    }
+    -1
+}
+
+fun ctReplaceFirst(text: string, old: string, replacement: string): string {
+    val at = text.indexOf(old)
+    if (at < 0) text else text.slice(0, at) + replacement + text.slice(at + old.size, text.size)
+}
+
+fun ctIntersection(sets: array<array<string>>): array<string> {
+    if (sets.size == 0) return []
+    val result: array<string> = []
+    for (item in sets[0]) {
+        var everywhere = true
+        for (other in sets) {
+            if (!ctSetHas(other, item)) everywhere = false
+        }
+        if (everywhere) ctSetAdd(result, item)
+    }
+    result
+}
+
+fun ctCheckX86(lines: array<CtLine>, secret: array<int>, pointers: array<int>): CtTags {
+    val indexOfLines: Map<int, bool> = Map()
+    val textsAt: Map<int, string> = Map()
+    for (line in lines) {
+        indexOfLines.set(line.address, true)
+        textsAt.set(line.address, line.text)
+    }
+    val headerArgs = ctFollow.headerArgs
+    ctFollow.headerArgs = []
+    val views = ctFollow.views
+    ctFollow.views = Map()
+    val start = ctTags()
+    for (i in secret) start.add(CT_X86_ARGS[i])
+    for (i in pointers) start.add("ptr:" + CT_X86_ARGS[i])
+    start.add("rspd:0")
+    for (i in headerArgs) start.add("hdrp:" + CT_X86_ARGS[i])
+    for (r in CT_X86_CALLEE_SAVED) start.add("entry:$r")
+    for (i in views.keys()) {
+        start.add("vmem:$i:${views.get(i) ?? ""}")
+        start.add("vreg:${CT_X86_ARGS[i]}:$i")
+    }
+    val flow = CtX86Flow(indexOfLines, [], textsAt, "", "", [])
+    val states = ctFixpoint(lines, start, flow)
+    if (ctFailed()) return ctTags()
+    // What the function can leave in its registers when it returns, for a caller that follows it.
+    val out = ctTags()
+    val paths: array<CtTags> = []
+    var i = 0
+    while (i < lines.size) {
+        val path = states.get(i)
+        if (ctFirstWord(lines[i].text).startsWith("ret") && path != null) paths.append(path)
+        i = i + 1
+    }
+    for (path in flow.returned) paths.append(path)
+    val wipes: array<array<string>> = []
+    for (path in paths) {
+        val pathWipes: array<string> = []
+        for (tag in path.keys()) {
+            if (tag.startsWith("wipe:")) pathWipes.append(tag) else out.add(tag)
+        }
+        wipes.append(pathWipes)
+        if (path.has("vd:rax") || path.has("vd:rdx")) out.add("escape")
+        for (r in ["rax", "rdx"]) {
+            val given = path.withPrefix("vreg:$r:")
+            if (given.size > 0) out.add("retview:$r:${ctField(given[0], 2)}")
+        }
+    }
+    // A wipe counts for a caller only if it happened on every path to a return.
+    for (wipe in ctIntersection(wipes)) out.add(wipe)
+    if (ctFollow.residue && ctFollow.stack.size == 0) {
+        // A secret in a stack slot of its frame is a copy in memory nothing wipes.
+        val residue: array<string> = []
+        for (item in sortedStrings(out.withPrefix("slot:"))) residue.append(item)
+        val callee: array<string> = []
+        for (item in out.withPrefix("dirty:")) callee
+            .append("${ctField(item, 2)} bytes of callee frames")
+        for (item in sortedStrings(callee)) residue.append(item)
+        if (residue.size > 0) {
+            val shown: array<string> = []
+            var n = 0
+            while (n < residue.size && n < 4) {
+                shown.append(residue[n])
+                n = n + 1
+            }
+            ctFail("secret residue at return: ${textJoin(shown, ", ")}")
+            return ctTags()
+        }
+    }
+    out
+}

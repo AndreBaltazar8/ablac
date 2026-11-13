@@ -1,0 +1,338 @@
+// Reading an object with llvm-objdump (#817): a function's instructions, the callee names its relocations give,
+// Xtensa's literal symbols and addmi immediates, and the names of the crypto allocation entry. As check-asm.py.
+import "abla/text"
+import "abla/sys/linux/process"
+import "./core.ab"
+
+val CT_OBJDUMP = "llvm-objdump"
+val CT_ALLOCATOR = "abla_ct_allocate"
+val CT_ALLOCATOR_SECTION = ".text.abla_ct_allocate"
+
+fun ctRun(arguments: array<string>): string {
+    val command = linuxCommand(CT_OBJDUMP)
+    for (argument in arguments) command.argument(argument)
+    // Its warnings are not the checker's output (check-asm.py captures them).
+    command.errors("/dev/null")
+    val result = command.capture()
+    if (result.status != 0) {
+        ctStop("$CT_OBJDUMP ${textJoin(arguments, " ")} exited with ${result.status}")
+        return ""
+    }
+    result.output
+}
+
+// (literal section + "\n" + offset) -> the symbol an R_XTENSA_32 relocation puts there: the address a `l32r` loads.
+val ctLiteralTables: Map<string, Map<string, string>> = Map()
+
+fun ctXtensaLiteralSymbols(path: string): Map<string, string> {
+    val known = ctLiteralTables.get(path)
+    if (known != null) return known
+    val table: Map<string, string> = Map()
+    var section = ""
+    for (line in ctRun(["-r", path]).split("\n")) {
+        val header =
+            if (line.startsWith("RELOCATION")) ctMatch("^RELOCATION RECORDS FOR \\[(.*)\\]:",
+                line) else null
+        if (header != null) {
+            section = ctGroup(header, 1)
+        } else {
+            val entry =
+                if (line.contains("R_XTENSA_32")) ctMatch("^([0-9a-f]+)\\s+R_XTENSA_32\\s+(\\S+)$",
+                    line) else null
+            if (entry != null && section != "") {
+                table.set("$section\n${ctParseHex(ctGroup(entry, 1)) ?? 0}", ctGroup(entry, 2))
+            }
+        }
+    }
+    ctLiteralTables.set(path, table)
+    table
+}
+
+val ctDisassemblies: Map<string, string> = Map()
+// (path + "\n" + extra) -> the dumps a prefetch made.
+val ctPrefetched: Map<string, array<string>> = Map()
+
+fun ctDisassembly(path: string, extra: array<string>, names: array<string>): string {
+    val key = "$path\n${textJoin(extra, " ")}\n${textJoin(names, ",")}"
+    val known = ctDisassemblies.get(key)
+    if (known != null) return known
+    val arguments: array<string> = ["-d", "--no-show-raw-insn"]
+    if (names.size > 0) arguments.append("--disassemble-symbols=${textJoin(names, ",")}")
+    for (argument in extra) arguments.append(argument)
+    if (!path.endsWith(".wasm")) arguments.append("-r")
+    arguments.append(path)
+    val text = ctRun(arguments)
+    ctDisassemblies.set(key, text)
+    text
+}
+
+/** The functions a check is about to read, disassembled by one objdump run instead of one each. */
+fun ctPrefetch(path: string, extra: array<string>, names: array<string>): void {
+    if (names.size == 0) return
+    val key = "$path\n${textJoin(extra, " ")}"
+    val list = ctPrefetched.get(key) ?? []
+    list.append(ctDisassembly(path, extra, names))
+    ctPrefetched.set(key, list)
+    return
+}
+
+// (path, name, extra) -> address -> the addmi immediate.
+val ctAddmiTables: Map<string, Map<int, int>> = Map()
+
+/** This LLVM's disassembler prints every Xtensa addmi immediate as 0: take it from the instruction's bytes (the signed
+ *  third byte). Null (with ctFatal set) if one can't be read. */
+fun ctXtensaAddmiImmediates(path: string, name: string, extra: array<string>,
+    lines: array<CtLine>): array<CtLine>? {
+    var esp32 = false
+    for (argument in extra) {
+        if (argument == "--mcpu=esp32") esp32 = true
+    }
+    var any = false
+    for (line in lines) {
+        if (line.text.startsWith("addmi")) any = true
+    }
+    if (!esp32 || !any) {
+        val same: array<CtLine> = []
+        for (line in lines) same.append(line)
+        return same
+    }
+    val key = "$path\n$name\n${textJoin(extra, " ")}"
+    if (!ctAddmiTables.has(key)) {
+        val found: Map<int, int> = Map()
+        val arguments: array<string> = ["-d", "--disassemble-symbols=$name"]
+        for (argument in extra) arguments.append(argument)
+        arguments.append(path)
+        for (line in ctRun(arguments).split("\n")) {
+            val m = if (!line.contains("addmi")) null
+                else ctMatch("^\\s*([0-9a-f]+):\\s+([0-9a-f]{2}) ([0-9a-f]{2}) ([0-9a-f]{2})\\s+addmi\\b",
+                    line)
+            if (m != null) {
+                val byte = ctParseHex(ctGroup(m, 4)) ?? 0
+                found.set(ctParseHex(ctGroup(m, 1)) ?? 0, if (byte >= 128) byte - 256 else byte)
+            }
+        }
+        ctAddmiTables.set(key, found)
+    }
+    val immediates = ctAddmiTables.get(key)
+    if (immediates == null) return null
+    val result: array<CtLine> = []
+    for (line in lines) {
+        if (line.text.startsWith("addmi")) {
+            val immediate = immediates.get(line.address)
+            if (immediate == null) {
+                ctStop("$name: can't read the immediate of ${line.text} at 0x${ctHex(line.address)}")
+                return null
+            }
+            val parts = ctWords(line.text, 1)[1].split(",")
+            result.append(CtLine(line.address,
+                "addmi\t${parts[0].trim()}, ${parts[1].trim()}, $immediate"))
+        } else {
+            result.append(line)
+        }
+    }
+    result
+}
+
+fun ctHex(value: int): string {
+    if (value == 0) return "0"
+    var text = ""
+    var rest = value
+    val digits = "0123456789abcdef"
+    while (rest > 0) {
+        text = digits.slice(rest % 16, rest % 16 + 1) + text
+        rest = rest / 16
+    }
+    text
+}
+
+/** A function's instructions, or null when the object has no such function (check-asm.py's SystemExit; the message
+ *  is in ctMissing). */
+var ctMissing = ""
+
+fun ctDisassemble(path: string, name: string, extra: array<string> = []): array<CtLine>? {
+    val key = "$path\n${textJoin(extra, " ")}"
+    for (candidate in ctPrefetched.get(key) ?? []) {
+        if (candidate.contains("<$name>:\n")) {
+            val parsed = ctParseDisassembly(path, name, candidate)
+            if (parsed != null) {
+                val fixed = ctXtensaAddmiImmediates(path, name, extra, parsed)
+                if (fixed != null) return fixed
+                ctFatal = ""
+            }
+            // Names at one address print their headers together and the body under the last of them: ask for this
+            // name alone, as a check without a prefetch does.
+            break
+        }
+    }
+    val parsed = ctParseDisassembly(path, name, ctDisassembly(path, extra, [name]))
+    if (parsed == null) return null
+    ctXtensaAddmiImmediates(path, name, extra, parsed)
+}
+
+fun ctParseDisassembly(path: string, name: string, text: string): array<CtLine>? {
+    val lines: array<CtLine> = []
+    var active = false
+    for (line in text.split("\n")) {
+        if (line.endsWith(">:") && ctMatch("^[0-9a-f]+ <.*>:$", line) != null) {
+            active = line.endsWith("<$name>:")
+            continue
+        }
+        if (!active || line.trim() == "") continue
+        val mayRelocate = line.contains("R_")
+        val other = if (mayRelocate) ctMatch("^\\s*[0-9a-f]+:\\s+R_(\\w+)\\s+(\\S+)$",
+            line) else null
+        if (other != null && !ctGroup(other, 1).startsWith("XTENSA")) {
+            // A relocation of an x86-64 or AArch64 object. The only one read is a call to the crypto allocation
+            // entry, which sits in a section of its own, so an unlinked object names it by that section.
+            val target = ctRegex("[+-]0x[0-9a-f]+$").replace(ctGroup(other, 2), "")
+            if (target == CT_ALLOCATOR_SECTION && lines.size > 0 &&
+                ctMatch("^(call\\w*|jmp\\w*|bl|b)\\s", lines[lines.size - 1].text) != null) {
+                val last = lines[lines.size - 1]
+                lines[lines.size - 1] = CtLine(last.address,
+                    ctRegex("<[^>]*>$").replace(last.text, "").trimEnd() + " <$target>")
+            }
+            continue
+        }
+        val relocation = if (mayRelocate) ctMatch("^\\s*[0-9a-f]+:\\s+R_XTENSA_\\w+\\s+(\\S+)$",
+            line) else null
+        if (relocation != null) {
+            // A call in an unlinked Xtensa object names its callee by relocation, against the callee's section (one
+            // function a section): put it where an x86 disassembly puts `<name>`.
+            var target = ctGroup(relocation, 1)
+            if (lines.size > 0) {
+                val last = lines[lines.size - 1]
+                val first = ctFirstWord(last.text)
+                if (first.startsWith("call") && !last.text.contains("<")) {
+                    if (target.startsWith(".text.")) target = target.slice(6, target.size)
+                    lines[lines.size - 1] = CtLine(last.address, "${last.text} <$target>")
+                } else if (first == "l32r") {
+                    // A literal's address: the symbol its own relocation names, in the next call if it is a callx.
+                    val literal = ctMatch("^(\\.literal\\.\\S+?)(?:\\+0x([0-9a-f]+))?$", target)
+                    if (literal != null) {
+                        val offset = if (literal.hasGroup(2)) ctParseHex(ctGroup(literal,
+                            2)) ?? 0 else 0
+                        val symbol =
+                            ctXtensaLiteralSymbols(path).get("${ctGroup(literal, 1)}\n$offset")
+                        if (symbol != null) lines[lines.size - 1] = CtLine(last.address,
+                            "${last.text} <$symbol>")
+                    }
+                }
+            }
+            continue
+        }
+        val parsed = ctAddressLine(line)
+        if (parsed != null) {
+            // AArch64 uses # for immediates, including stack offsets; only a whitespace-delimited # comment is an
+            // x86 disassembly comment.
+            val body = parsed.text
+            val comment = body.indexOf("//")
+            var instruction = if (comment >= 0) body.slice(0, comment) else body
+            if (instruction.contains("#")) instruction =
+                ctRegex("\\s+#\\s+.*$").replace(instruction, "")
+            instruction = instruction.trim()
+            lines.append(CtLine(parsed.address, instruction))
+        }
+    }
+    var i = 1
+    while (i < lines.size) {
+        // `l32r aN, <literal> <sym>` straight before `callxK aN`: a call to sym (the long-call form).
+        if (!lines[i - 1].text.startsWith("l32r") || !lines[i].text.startsWith("callx")) {
+            i = i + 1
+            continue
+        }
+        val load = ctMatch("^l32r\\s+(a\\d+),\\s*\\S+\\s+<([^>]+)>$", lines[i - 1].text)
+        val call = ctMatch("^callx(4|8|12)\\s+(a\\d+)$", lines[i].text)
+        if (load != null && call != null && ctGroup(load, 1) == ctGroup(call, 2)) {
+            lines[i] = CtLine(lines[i].address, "call${ctGroup(call, 1)} 0x0 <${ctGroup(load, 2)}>")
+        }
+        i = i + 1
+    }
+    if (lines.size == 0) {
+        ctMissing = "$name: no such function in $path"
+        return null
+    }
+    lines
+}
+
+// --- Calls followed -----------------------------------------------------------------------------------------------
+// With --follow-calls, a call to a function defined in the same object is checked as a function of its own, on the
+// arguments the caller passes, instead of failing. check-asm.py's FOLLOW dictionary.
+class CtFollow(
+    var objectPath: string,
+    var path: string,
+    val stack: array<string>,
+    val done: Map<string, CtTags>,
+    var residue: bool,
+    val followed: Map<string, bool>,
+    var writeOnly: bool,
+    var stackLow: bool,
+    var headerArgs: array<int>,
+    // argument index -> view mask, for the callee about to be checked (FOLLOW["views"])
+    var views: Map<int, string>
+)
+
+val ctFollow = CtFollow("", "", [], Map(), false, Map(), false, true, [], Map())
+
+val ctAllocatorTables: Map<string, Map<string, bool>> = Map()
+
+/** The names a call can reach the crypto allocation entry by: the functions in the section `.text.abla_ct_allocate`,
+ *  or every symbol sharing the address of an exported `abla_ct_allocate`, plus the section's own names. */
+fun ctAllocatorNames(path: string): Map<string, bool> {
+    val known = ctAllocatorTables.get(path)
+    if (known != null) return known
+    val byPlace: Map<string, array<string>> = Map()
+    val names: Map<string, bool> = Map()
+    for (line in ctRun(["-t", path]).split("\n")) {
+        val tokens = ctWords(line)
+        if (tokens.size < 5 || ctFull("[0-9a-f]+", tokens[0]) == null ||
+            ctFull("[0-9a-f]+", tokens[tokens.size - 2]) == null) continue
+        val address = ctParseHex(tokens[0]) ?? 0
+        val section = tokens[tokens.size - 3]
+        val name = tokens[tokens.size - 1]
+        var function = false
+        var flag = 1
+        while (flag < tokens.size - 3) {
+            if (tokens[flag] == "F") function = true
+            flag = flag + 1
+        }
+        if (section == CT_ALLOCATOR_SECTION && function) names.set(name, true)
+        val place = "$section\n$address"
+        val group = byPlace.get(place) ?? []
+        group.append(name)
+        byPlace.set(place, group)
+    }
+    for (group in byPlace.values()) {
+        var entry = false
+        for (name in group) {
+            if (name == CT_ALLOCATOR) entry = true
+        }
+        if (entry) {
+            for (name in group) names.set(name, true)
+        }
+    }
+    if (names.size > 0) {
+        // An unlinked object's call names the entry by its section (an Xtensa disassembly drops the `.text.`).
+        names.set(CT_ALLOCATOR_SECTION, true)
+        names.set(CT_ALLOCATOR_SECTION.slice(6, CT_ALLOCATOR_SECTION.size), true)
+    }
+    ctAllocatorTables.set(path, names)
+    names
+}
+
+fun ctIsAllocator(name: string): bool = ctFollow.objectPath != "" &&
+    ctAllocatorNames(ctFollow.objectPath).has(name)
+
+/** Python's `^\s*([0-9a-f]+):\s*(.*)$` on one line, by hand (the regex is the cost of reading a large function): the
+ *  address and the rest of the line, or null. */
+fun ctAddressLine(line: string): CtLine? {
+    var at = 0
+    while (at < line.size && ctIsSpace(line[at])) at = at + 1
+    val start = at
+    while (at < line.size && ((line[at] >= 48 && line[at] <= 57) || (line[at] >= 97 && line[at] <=
+        102))) at = at + 1
+    if (at == start || at >= line.size || line[at] != 58) return null
+    val address = ctParseHex(line.slice(start, at)) ?? 0
+    at = at + 1
+    while (at < line.size && ctIsSpace(line[at])) at = at + 1
+    CtLine(address, line.slice(at, line.size))
+}
