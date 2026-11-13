@@ -14,6 +14,7 @@ for source in "$cases"/*.ab; do
         delegate-set) expected=0,1,1 ;;
         member-unrelated|member-generic) expected=5,7 ;;
         interface-class) expected=5,2 ;;
+        member-drop-unrelated) expected=5,2 ;;
         operator-builtin|operator-compound) expected=5,3 ;;
         operator-scalar) expected=6,6 ;;
         operator-generic) expected=3,3 ;;
