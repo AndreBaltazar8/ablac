@@ -293,6 +293,11 @@ without teaching the compiler any platform name. It does not export or retain
 the function by itself, so internal functions remain eligible for inlining and
 dead-code elimination.
 
+On a Mach-O target (macOS, iOS) a section is named by segment and section, so an ELF-style name maps by one
+rule: `.text.NAME` becomes `__TEXT,__NAME,regular,pure_instructions`, any other `.kind.NAME` `__DATA,__NAME`;
+dots in NAME become underscores and NAME is cut to 14 characters (a Mach-O section name is 16 with its `__`).
+A name that already has a comma is taken as a Mach-O specifier. ELF targets use the name as written.
+
 The `build/ablac run` path drives LLVM ORC in-process through the typed
 C ABI. It resolves the exported Abla runtime, looks up `main`, and invokes it
 without AOT object emission or linking. The bootstrap compiler uses the same
