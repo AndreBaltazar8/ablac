@@ -8,7 +8,7 @@ compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
-out=build/tls-client-ca
+out=${TLS_CLIENT_CA_OUTPUT:-build/tls-client-ca}
 rm -rf "$out"
 mkdir -p "$out"
 if ! command -v openssl > /dev/null; then
@@ -41,7 +41,7 @@ server_pid=
 trap '[[ -z $server_pid ]] || kill "$server_pid" 2> /dev/null || true' EXIT
 start() { # required count: sets $port, $log
     log="$out/server-$1.log"
-    "$out/server" "$out/server.pem" "$out/server.key" "$out/ca.pem" "$1" "$2" > "$log" 2>&1 &
+    "$out/server" "$out/server.pem" "$out/server.key" "$out/ca.pem" "$1" "$2" > "$log" 2> "$log.err" &
     server_pid=$!
     for _ in $(seq 100); do
         grep -q '^port ' "$log" 2> /dev/null && break
@@ -51,14 +51,14 @@ start() { # required count: sets $port, $log
     [[ -n $port ]] || { cat "$log" >&2; echo 'tls client CA: the server did not listen' >&2; exit 1; }
 }
 connect() { # version certificate-name-or-none
-    local arguments=(-connect "127.0.0.1:$port" "-$1")
+    local arguments=(-connect "127.0.0.1:$port" "-$1" -ign_eof)
     [[ $2 == none ]] || arguments+=(-cert "$out/$2.pem" -key "$out/$2.key")
     timeout 15 openssl s_client "${arguments[@]}" < /dev/null > "$out/client.log" 2>&1 || true
 }
-expect() { # log line-number expected
+expect() { # log line-number expected (the server's stderr says why a connection was refused)
     local line
     line=$(sed -n "$(( $2 + 1 ))p" "$1")
-    [[ $line == "$3" ]] || { cat "$1" >&2; echo "tls client CA: connection $2 said '$line', expected '$3'" >&2; exit 1; }
+    [[ $line == "$3" ]] || { cat "$1" "$1.err" >&2; echo "tls client CA: connection $2 said '$line', expected '$3'" >&2; exit 1; }
 }
 # Required.
 start 1 5
