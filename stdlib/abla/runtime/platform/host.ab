@@ -140,7 +140,7 @@ trusted fun __ablaRuntimeFutexUnlock(address: int): void {
 }
 
 trusted fun __ablaRuntimePlatformMutexInitialize(address: int): void {
-    if (ablaHostOwnsRuntime() || (ablaHostIsMacOS() && !ablaHostIsIOS())) {
+    if (ablaHostOwnsRuntime()) {
         ablaRuntimeAtomicStoreI64(address, 0)
         return
     }
@@ -151,7 +151,7 @@ trusted fun __ablaRuntimePlatformMutexInitialize(address: int): void {
 }
 
 trusted fun __ablaRuntimePlatformMutexLock(address: int): void {
-    if (ablaHostOwnsRuntime() || (ablaHostIsMacOS() && !ablaHostIsIOS())) {
+    if (ablaHostOwnsRuntime()) {
         __ablaRuntimeFutexLock(address)
         return
     }
@@ -161,7 +161,7 @@ trusted fun __ablaRuntimePlatformMutexLock(address: int): void {
 }
 
 trusted fun __ablaRuntimePlatformMutexUnlock(address: int): void {
-    if (ablaHostOwnsRuntime() || (ablaHostIsMacOS() && !ablaHostIsIOS())) {
+    if (ablaHostOwnsRuntime()) {
         __ablaRuntimeFutexUnlock(address)
         return
     }
@@ -171,7 +171,7 @@ trusted fun __ablaRuntimePlatformMutexUnlock(address: int): void {
 }
 
 trusted fun __ablaRuntimePlatformMutexDestroy(address: int): void {
-    if (ablaHostOwnsRuntime() || (ablaHostIsMacOS() && !ablaHostIsIOS())) return
+    if (ablaHostOwnsRuntime()) return
     if (pthread_mutex_destroy(
         ablaRuntimePointerFromAddress(address)
     ) != 0) ablaRuntimeTrap()
@@ -234,12 +234,11 @@ var __ablaRuntimeHostHeapCached: int = 0
 val __ablaRuntimeHostHeapCacheEach: int = 8388608
 val __ablaRuntimeHostHeapCacheTotal: int = 33554432
 
-// Whether this host's heap is the one below: x86-64 and AArch64 Linux, and macOS (not iOS) over its BSD system
-// calls and ulock locks (#811) (a constant the backend folds, so the other
+// Whether this host's heap is the one below (a constant the backend folds, so the other
 // hosts keep libc's functions and this target none).
 @inline
 trusted fun __ablaRuntimeHostHeapNative(): bool =
-    ablaHostOwnsRuntime() || (ablaHostIsMacOS() && !ablaHostIsIOS())
+    ablaHostOwnsRuntime()
 
 @inline
 trusted fun __ablaRuntimeHostHeapState(): int = nativeStaticAllocate(2176)
@@ -290,16 +289,6 @@ trusted fun __ablaRuntimeHostHeapMap(bytes: int): int {
 trusted fun __ablaRuntimeHostHeapUnmap(address: int, bytes: int): void {
     ablaLinuxSyscall(11, address, bytes, 0, 0, 0, 0)
     return
-}
-
-// A mapping resized where there is no mremap: new pages, the smaller of the two lengths copied, the old pages
-// unmapped. The new base, or a negative errno.
-trusted fun __ablaRuntimeHostHeapRemapCopy(base: int, before: int, after: int): int {
-    val moved = __ablaRuntimeHostHeapMap(after)
-    if (moved == 0) return -12
-    ablaUnsafeCopyMemory(moved, base, if (before < after) before else after)
-    __ablaRuntimeHostHeapUnmap(base, before)
-    moved
 }
 
 // A cached mapping that holds `mapped` bytes (its base), or 0.
@@ -409,9 +398,6 @@ var __ablaRuntimeHostHeapNoMerge: bool = false
 var __ablaRuntimeHostForkNoCollect: bool = false
 
 trusted fun __ablaRuntimeHostForkArm(): void {
-    // Darwin has no MADV_WIPEONFORK: a macOS child that finds the heap lock held by a thread that did not
-    // survive the fork is not detected (#812 is Linux only).
-    if (ablaHostIsMacOS()) return
     val page = __ablaRuntimeHostHeapMap(4096)
     if (page == 0) return
     ablaRuntimeStoreI64(page, 1)
@@ -786,10 +772,8 @@ trusted fun __ablaRuntimeHostHeapResize(address: int, size: int): int {
         if (size + 8 > __ablaRuntimeHostHeapSmallMaximum) {
             val mapped = (size + 16 + 4095) & -4096
             if (mapped == mappedBefore) return address
-            // MREMAP_MAYMOVE; macOS has no mremap: a new mapping, the old bytes copied, the old one unmapped.
-            val moved = if (ablaHostIsMacOS()) __ablaRuntimeHostHeapRemapCopy(address - 16,
-                mappedBefore, mapped)
-                else ablaLinuxSyscall(25, address - 16, mappedBefore, mapped, 1, 0, 0)
+            // MREMAP_MAYMOVE
+            val moved = ablaLinuxSyscall(25, address - 16, mappedBefore, mapped, 1, 0, 0)
             if (moved < 0) return 0
             ablaRuntimeStoreI64(moved + 8, mapped | 2)
             return moved + 16
@@ -811,16 +795,14 @@ trusted fun __ablaRuntimeHostHeapResize(address: int, size: int): int {
 
 @inline
 trusted fun __ablaRuntimeHostMalloc(size: int): i64* =
-    if (ablaHostOwnsRuntime() || (ablaHostIsMacOS() &&
-        !ablaHostIsIOS())) ablaRuntimePointerFromAddress(__ablaRuntimeHostHeapAllocate(size,
-            false))
+    if (ablaHostOwnsRuntime()) ablaRuntimePointerFromAddress(__ablaRuntimeHostHeapAllocate(size,
+        false))
     else malloc(size)
 
 // The platform's release of free memory to the system (runtimeMemoryRelease): this heap's Trim. Other hosts have libc's
 // allocator, which a caller trims with malloc_trim itself (the compiler does).
 trusted fun __ablaRuntimePlatformMemoryRelease(): void {
-    if (ablaHostOwnsRuntime() || (ablaHostIsMacOS() &&
-        !ablaHostIsIOS())) __ablaRuntimeHostHeapTrim()
+    if (ablaHostOwnsRuntime()) __ablaRuntimeHostHeapTrim()
     return
 }
 
@@ -934,21 +916,18 @@ trusted fun __ablaRuntimeHostHeapCallocate(count: int, size: int): i64* {
 // nested as in these four (a test through __ablaRuntimeHostHeapNative() is not folded, and a --fast
 // build would keep the imports): an x86-64 Linux program then names none of them, release or --fast.
 trusted fun __ablaRuntimeHostCalloc(count: int, size: int): i64* =
-    if (ablaHostOwnsRuntime() || (ablaHostIsMacOS() &&
-        !ablaHostIsIOS())) __ablaRuntimeHostHeapCallocate(count, size)
+    if (ablaHostOwnsRuntime()) __ablaRuntimeHostHeapCallocate(count, size)
     else calloc(count, size)
 
 trusted fun __ablaRuntimeHostRealloc(pointer: i64*, size: int): i64* =
-    if (ablaHostOwnsRuntime() || (ablaHostIsMacOS() &&
-        !ablaHostIsIOS())) ablaRuntimePointerFromAddress(
-            __ablaRuntimeHostHeapResize(ablaRuntimePointerAddress(pointer), size)
-        )
+    if (ablaHostOwnsRuntime()) ablaRuntimePointerFromAddress(
+        __ablaRuntimeHostHeapResize(ablaRuntimePointerAddress(pointer), size)
+    )
     else realloc(pointer, size)
 
 @inline
 trusted fun __ablaRuntimeHostFree(pointer: i64*): void {
-    if (ablaHostOwnsRuntime() || (ablaHostIsMacOS() &&
-        !ablaHostIsIOS())) __ablaRuntimeHostHeapFree(ablaRuntimePointerAddress(pointer))
+    if (ablaHostOwnsRuntime()) __ablaRuntimeHostHeapFree(ablaRuntimePointerAddress(pointer))
     else free(pointer)
     return
 }
@@ -1042,7 +1021,7 @@ trusted fun __ablaRuntimePlatformConditionBytes(): int = 64
 // and sleeps while it is unchanged; a broadcast advances it and wakes every
 // sleeper. Spurious wakeups are allowed, as with pthread_cond_wait.
 trusted fun __ablaRuntimePlatformConditionInitialize(address: int): void {
-    if (ablaHostOwnsRuntime() || (ablaHostIsMacOS() && !ablaHostIsIOS())) {
+    if (ablaHostOwnsRuntime()) {
         ablaRuntimeAtomicStoreI64(address, 0)
         return
     }
@@ -1053,7 +1032,7 @@ trusted fun __ablaRuntimePlatformConditionInitialize(address: int): void {
 }
 
 trusted fun __ablaRuntimePlatformConditionWait(condition: int, mutex: int): void {
-    if (ablaHostOwnsRuntime() || (ablaHostIsMacOS() && !ablaHostIsIOS())) {
+    if (ablaHostOwnsRuntime()) {
         val sequence = ablaRuntimeAtomicLoadI64(condition)
         __ablaRuntimeFutexUnlock(mutex)
         __ablaRuntimeFutexWait(condition, sequence)
@@ -1067,7 +1046,7 @@ trusted fun __ablaRuntimePlatformConditionWait(condition: int, mutex: int): void
 }
 
 trusted fun __ablaRuntimePlatformConditionBroadcast(condition: int): void {
-    if (ablaHostOwnsRuntime() || (ablaHostIsMacOS() && !ablaHostIsIOS())) {
+    if (ablaHostOwnsRuntime()) {
         ablaRuntimeAtomicFetchAddI64(condition, 1)
         __ablaRuntimeFutexWake(condition, 2147483647)
         return
@@ -4260,34 +4239,6 @@ trusted fun __ablaRuntimeDarwinSyscall(
     if (number == 97 || number == 160) return __ablaRuntimeDarwinRlimit(number, argument0,
         argument1)
     if (number == 16) return __ablaRuntimeDarwinIoctl(argument0, argument1, argument2)
-    // The heap's own system calls (#811): mmap 9, munmap 11, madvise 28 and the futex 202 its locks wait on.
-    // mmap: PROT bits are the same; Linux MAP_SHARED 1, MAP_PRIVATE 2, MAP_FIXED 0x10, MAP_ANONYMOUS 0x20 become
-    // Darwin's 1, 2, 0x10 and 0x1000. madvise: Linux MADV_DONTNEED (4) is Darwin's MADV_FREE (5); anything else
-    // is refused (EINVAL), as is MADV_WIPEONFORK (18), which Darwin has no counterpart of.
-    if (number == 9) {
-        val flags = (argument3 & 19) | (if ((argument3 & 32) != 0) 4096 else 0)
-        return __ablaRuntimeDarwinResult(ablaDarwinSyscall(197, argument0, argument1, argument2,
-            flags,
-            argument4, argument5))
-    }
-    if (number == 11) return __ablaRuntimeDarwinResult(
-        ablaDarwinSyscall(73, argument0, argument1, 0, 0, 0, 0))
-    if (number == 28) {
-        if (argument2 != 4) return -22
-        return __ablaRuntimeDarwinResult(ablaDarwinSyscall(75, argument0, argument1, 5, 0, 0, 0))
-    }
-    // futex 202 (private wait 128 / wake 129) over __ulock_wait (515, UL_COMPARE_AND_WAIT 1: sleep while the
-    // 32-bit word still holds the value, no timeout) and __ulock_wake (516; ULF_WAKE_ALL 0x100 for a count above one).
-    if (number == 202) {
-        val operation = argument1 & 127
-        if (operation == 0) return __ablaRuntimeDarwinResult(
-            ablaDarwinSyscall(515, 1, argument0, argument2 & 4294967295, 0, 0, 0))
-        if (operation == 1) {
-            ablaDarwinSyscall(516, if (argument2 > 1) 257 else 1, argument0, 0, 0, 0, 0)
-            return 0
-        }
-        return -22
-    }
     // Time and random (#811 group 7): nanosleep, getrandom. clock_gettime stays with the adapter:
     // CLOCK_MONOTONIC has no system call (libSystem reads the commpage).
     if (number == 35) return __ablaRuntimeDarwinNanosleep(argument0)
