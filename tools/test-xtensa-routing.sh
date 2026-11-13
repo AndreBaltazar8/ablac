@@ -9,4 +9,4 @@ if [[ -z ${ABLA_XTENSA_LLVM_ROOT:-} ]]; then
     echo 'Xtensa routing skipped: no optional cohort configured (the manual stock-parent CI gate installs one)'
     exit 0
 fi
-python3 "$root/tools/test-xtensa-routing.py" "$1"
+node "$root/tools/test-xtensa-routing.mjs" "$1"
