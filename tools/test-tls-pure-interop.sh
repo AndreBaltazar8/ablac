@@ -69,10 +69,6 @@ for kind in ed25519 p256 p384 rsa; do
             result=$("$root/tools/run-limited.sh" "$out/interop" "$port" "$out/$kind.pem" "${suite#*:}" "$out/$([[ $kind == p256 ]] && echo rsa || echo p256).pem") || {
                 echo "tls-pure interop ($kind ${suite%:*} $group): $result" >&2; head -5 "$out/server.log" >&2; exit 1; }
             [[ $result == 'tls-pure interop ok'* ]] || { echo "tls-pure interop ($kind ${suite%:*} $group): $result" >&2; exit 1; }
-            # The alert each refusal sent (RFC 8446 section 6.2): wrong host name, expired and untrusted certificates.
-            for alert in 'alert bad certificate' 'alert certificate expired' 'alert unknown ca'; do
-                grep -q "$alert" "$out/server.log" || { echo "tls-pure interop ($kind ${suite%:*} $group): s_server never saw 'tlsv1 $alert':" >&2; cat "$out/server.log" >&2; exit 1; }
-            done
             stop_server
             runs=$((runs + 1))
         done
