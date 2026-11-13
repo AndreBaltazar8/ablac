@@ -159,6 +159,7 @@ function route(which, repo, output) {
     const historical = path.join(path.dirname(root), 'historical');
     // Never clean an existing checkout, even when it belongs to the caller.
     if (fs.existsSync(root) || fs.existsSync(historical)) throw new Error(`requires fresh ${root} and ${historical}; refusing to replace either`);
+    fs.mkdirSync(path.dirname(output), { recursive: true }); // parents, like the Python mkdir(parents=True)
     fs.mkdirSync(output); // not recursive-existing: a leftover output is an error
     const revision = git(['rev-parse', 'HEAD'], repo);
     const tree = git(['rev-parse', 'HEAD^{tree}'], repo);
@@ -259,6 +260,7 @@ function route(which, repo, output) {
 const jsonEqual = (x, y) => JSON.stringify(sortKeys(x)) === JSON.stringify(sortKeys(y));
 
 export function compare(a, b, output, expectedRevision = null) {
+    fs.mkdirSync(path.dirname(output), { recursive: true });
     fs.mkdirSync(output); // not recursive-existing
     try {
         const manifests = [];
