@@ -89,8 +89,36 @@ the dynamic loader only when the program brings a C library itself: a TLS
 connection (OpenSSL), the manifest's `nativeLibraries`, `extern "host"` calls,
 or an `extern:"c"` function that the libc-free link cannot resolve. There is no
 option for it: the program decides. `ablac build --verbose` prints a note
-naming why a build linked libc. macOS executables link libSystem, and libraries
+naming why a build linked libc. macOS executables link libSystem (below), and libraries
 and objects are unchanged.
+
+A macOS executable is an ordinary dynamic image that names `libSystem.B.dylib`: Apple's linker
+refuses a dynamic image without it, and an arm64 static image is killed by the kernel (CI probes, #811; an
+Intel static image runs). What a program calls out of it shrinks with the work in #811. The portable standard
+library's system calls (files, directories, `stat`, `getdents`, descriptors, sockets, `poll` and `epoll` on
+kqueue, process creation and waiting, signal masks, time and random numbers, resource limits, terminals)
+are BSD system calls issued by the program itself (`__ablaRuntimeDarwinSyscall` in
+`abla/runtime/platform/host.ab`, the inline `svc #0x80` / `syscall` of the `ablaDarwinSyscall` intrinsic),
+and so are the runtime's panic output, exit and its fault handlers. `tools/libsystem-imports-allowlist.txt`
+lists what a program, release and `--fast`, and the compiler still import; `tools/test-libsystem-imports.sh`
+runs in the macOS CI job, and the list may only shrink.
+
+What stays in libSystem, and why:
+
+- `pthread_create`, `pthread_join` and what a pthread needs (`pthread_self`, `pthread_get_stackaddr_np`,
+  `pthread_get_stacksize_np` for the stack bounds of a thread, the mutex and condition calls): a Mach thread
+  that libSystem does not know has none of its per-thread state, and the kernel's thread registration
+  (`bsdthread_register`) is refused once libSystem has made it, which it has by the time `main` runs.
+- the thread-local bootstrap `__tlv_bootstrap`: Mach-O thread locals are descriptors that dyld's
+  bootstrap resolves.
+- `clock_gettime` for `CLOCK_MONOTONIC` (and the wall clock where it shares the call): libSystem reads
+  the commpage; there is no system call.
+- the compiler itself: libLLVM, OpenSSL, `dlopen`/`dlsym` for compile-time native calls, and its
+  threads.
+
+The BSD system call numbers and structure layouts in the dispatcher are not checked on Linux: the macOS CI
+job runs `tools/test-darwin-syscalls.sh` (one line per call, the same program that runs on Linux with Linux's own
+numbers) before building stage 2, and that run is what judges each one.
 
 The heap of such an executable is Abla code over the `mmap`, `munmap`, `mremap` and `madvise` system
 calls (`__ablaRuntimeHostHeap*` in `abla/runtime/platform/host.ab`); `runtimeMemoryRelease()` gives
