@@ -533,19 +533,15 @@ that way, from its one poller.
 
 `abla/http/tls`'s `httpsClientWithIdentityPem(host, certificatePem, keyPem, passphrase = "", caPath = "", port = 443, ...)` and `httpsClientWithIdentityPkcs12(host, der, password, caPath = "", port = 443, ...)` are `httpsClient` with mutual TLS. They keep the identity's bytes in the client and open them for each connection.
 
-`abla/http/tls`, `abla/websocket/tls` and the Xtensa installer's HTTPS stream use `abla/tls/pure`, TLS written in
-Abla with no OpenSSL and no libc: what it supports and refuses is in [TLS in Abla](tls.md). The rest of this section
-describes the calls, which `abla/tls/pure` and `abla/tls/hosted` share.
-
-Client connections of both modules enable peer verification, system trust, SNI, and hostname checks. An explicit
-CA-file connector and certificate/private-key listener support local and private PKI deployments. `abla/http/tls` and
-`abla/websocket/tls` provide the HTTPS and WSS client transports, over `abla/tls/pure`.
-
-`abla/tls/hosted` dynamically loads OpenSSL 1.1 or 3 only when imported (the server modules that still use it, such
-as `abla/websocket/server/tls`, and a program that imports it directly). `ablac build` links OpenSSL for a program
-that imports it on its own; a program built with `--emit object` and linked by hand (for example with `gcc` for
-x86_64-linux) needs `-lssl -lcrypto` on the link line. Hosted secure random is supplied by `abla/random/hosted` on
-Linux and macOS.
+`abla/tls/hosted` dynamically loads OpenSSL 1.1 or 3 only when imported. Client
+connections enable peer verification, system trust, SNI, and hostname checks.
+An explicit CA-file connector and certificate/private-key listener support
+local and private PKI deployments. `abla/http/tls` and `abla/websocket/tls`
+provide HTTPS and WSS client transports. `ablac build` links OpenSSL for these
+modules on its own; a program built with `--emit object` and linked by hand
+(for example with `gcc` for x86_64-linux) needs `-lssl -lcrypto` on the link
+line. Hosted secure random is supplied by
+`abla/random/hosted` on Linux and macOS.
 
 | Function | Result |
 |---|---|

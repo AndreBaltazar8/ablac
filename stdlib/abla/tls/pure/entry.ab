@@ -14,9 +14,7 @@
 // has the specific reason of the last failure on that connection.
 
 import "abla/crypto/x509"
-import "abla/process/environment"
 import "abla/process/time"
-import "abla/sys/linux/fs"
 import "abla/sys/linux"
 import "abla/sys/linux/net"
 import "abla/tls/pure/client"
@@ -62,36 +60,9 @@ private val tlsDefaultReadWriteTimeoutMilliseconds = 30000
 private var pureTlsSystemStoreLoaded = false
 private var pureTlsSystemStoreValue = X509TrustStore([])
 
-// What OpenSSL honours (so the programs and tests that point it at a certificate keep working): NIX_SSL_CERT_FILE and
-// SSL_CERT_FILE name a bundle that replaces the system one, SSL_CERT_DIR a directory of certificate files; else the
-// system bundle.
-private fun pureTlsLoadTrust(): X509TrustStore {
-    for (name in ["NIX_SSL_CERT_FILE", "SSL_CERT_FILE"]) {
-        val variable = processEnvironment(name)
-        if (variable != null && variable != "") {
-            val store = x509TrustStoreFromFile(variable)
-            if (store != null && store.certificates.size > 0) return store
-        }
-    }
-    val directory = processEnvironment("SSL_CERT_DIR")
-    if (directory != null && directory != "") {
-        val certificates: array<X509Certificate> = []
-        for (entry in path(directory).entries()) {
-            if (certificates.size < 4096) {
-                val store = x509TrustStoreFromFile(entry.text)
-                if (store != null) {
-                    for (certificate in store.certificates) certificates.append(certificate)
-                }
-            }
-        }
-        if (certificates.size > 0) return X509TrustStore(certificates)
-    }
-    x509SystemTrustStore()
-}
-
 private fun pureTlsSystemStore(): X509TrustStore {
     if (!pureTlsSystemStoreLoaded) {
-        pureTlsSystemStoreValue = pureTlsLoadTrust()
+        pureTlsSystemStoreValue = x509SystemTrustStore()
         pureTlsSystemStoreLoaded = true
     }
     pureTlsSystemStoreValue
@@ -102,9 +73,6 @@ private fun pureTlsNow(): int = realtimeMilliseconds() / 1000
 /** A TLS connection. `handle` is -1 for a connection that failed or was closed (tlsLastError says why). */
 resource class TlsConnection(var handle: int, var inner: TlsPureConnection) {
     fun drop(): void {
-        // A connection whose handle was set to -1 by its owner is detached (the hosted module's idiom for handing the
-        // socket to someone else, or holding it open): it is not closed here.
-        if (this.handle == -1) this.inner.tcp.descriptor = -1
         this.handle = -1
         return
     }
@@ -113,14 +81,6 @@ resource class TlsConnection(var handle: int, var inner: TlsPureConnection) {
 private fun TlsConnection.record(): void {
     pureTlsSetError(this.inner.stage)
     return
-}
-
-// The client configuration for a CA file (read now: a missing file is a trust_store failure before any connection) or
-// the system store (read when the server's certificate arrives).
-private fun pureTlsConfigFor(host: string, caPath: string): TlsClientConfig? {
-    if (caPath == "") return pureTlsConfigSystem(host)
-    val store = pureTlsStore(caPath) ?? return null
-    pureTlsConfig(host, store)
 }
 
 private fun pureTlsStore(caPath: string): X509TrustStore? {
@@ -133,10 +93,6 @@ private fun pureTlsStore(caPath: string): X509TrustStore? {
 private fun pureTlsConfig(host: string, store: X509TrustStore): TlsClientConfig =
     tlsClientConfig(host, tlsX509Verifier(store, pureTlsNow), tlsPureRandom)
 
-// The system store is parsed when a certificate arrives, not when the connection starts.
-private fun pureTlsConfigSystem(host: string): TlsClientConfig =
-    tlsClientConfig(host, tlsX509VerifierLazy(pureTlsSystemStore, pureTlsNow), tlsPureRandom)
-
 private fun pureTlsFailed(host: string, stage: int): TlsConnection {
     val failed = tlsPureFailedConnection(pureTlsConfig(host, X509TrustStore([])), pureTlsErrorText(stage), stage)
     pureTlsSetError(stage)
@@ -148,9 +104,9 @@ private fun pureTlsOpen(host: string, caPath: string, port: int, timeoutMillisec
     if (port <= 0 || port > 65535 || timeoutMilliseconds <= 0 || timeoutMilliseconds > 600000) {
         return pureTlsFailed(host, 1)
     }
-    val config = pureTlsConfigFor(host, caPath)
-    if (config == null) return pureTlsFailed(host, 4)
-    val inner = tlsPureConnect(config, port, timeoutMilliseconds,
+    val store = pureTlsStore(caPath)
+    if (store == null) return pureTlsFailed(host, 4)
+    val inner = tlsPureConnect(pureTlsConfig(host, store), port, timeoutMilliseconds,
         readWriteTimeoutMilliseconds, deadline, identity)
     pureTlsSetError(inner.stage)
     val handle = if (inner.ok()) inner.tcp.descriptor else -1
@@ -181,13 +137,13 @@ fun tlsConnectWithCa(host: string, caPath: string, port: int = 443, timeoutMilli
 
 private fun pureTlsUpgrade(var connection: TcpConnection, host: string, caPath: string, timeoutMilliseconds: int,
     readWriteTimeoutMilliseconds: int, deadline: int, identity: TlsClientIdentity?): TlsConnection {
-    val config = pureTlsConfigFor(host, caPath)
-    if (config == null) {
+    val store = pureTlsStore(caPath)
+    if (store == null) {
         pureTlsSetError(4)
         connection.close()
         return pureTlsFailed(host, 4)
     }
-    val inner = tlsPureUpgrade(connection, config, timeoutMilliseconds,
+    val inner = tlsPureUpgrade(connection, pureTlsConfig(host, store), timeoutMilliseconds,
         readWriteTimeoutMilliseconds, deadline, identity)
     pureTlsSetError(inner.stage)
     val handle = if (inner.ok()) inner.tcp.descriptor else -1
