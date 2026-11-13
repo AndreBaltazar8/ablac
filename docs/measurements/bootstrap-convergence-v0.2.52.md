@@ -1,6 +1,6 @@
 # Clean-bootstrap convergence, v0.2.52 lineage, 2026-11-10
 
-The gate of [bootstrap.md](../bootstrap.md) (`tools/test-bootstrap-convergence.py`, lineage `v0.2.52`) on master
+The gate of [bootstrap.md](../bootstrap.md) (`tools/test-bootstrap-convergence.mjs`, lineage `v0.2.52`) on master
 `0de1b8ec` (tree `f4741303`), run locally with the candidate at one absolute path (`--root`). Follows
 [the v0.2.51 run](bootstrap-convergence-v0.2.51.md).
 

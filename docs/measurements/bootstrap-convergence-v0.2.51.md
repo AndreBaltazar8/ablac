@@ -1,6 +1,6 @@
 # Clean-bootstrap convergence, v0.2.51 lineage, 2026-11-10
 
-The gate of [bootstrap.md](../bootstrap.md) (`tools/test-bootstrap-convergence.py`, lineage `v0.2.51`), run locally on
+The gate of [bootstrap.md](../bootstrap.md) (`tools/test-bootstrap-convergence.mjs`, lineage `v0.2.51`), run locally on
 the newest seed pair with the candidate at `2617a727` (tree `db773b21`; the hashes of the branch before it was rebased onto master). The IR carries source paths, so both
 routes and the comparison ran with the candidate at the same absolute path (`--root`).
 
@@ -32,7 +32,7 @@ off whenever `--wrap` is used. The comparison step refuses a source revision oth
 it ran from a detached checkout of `2617a727`; the branch has since gained only that timeout change and the release
 step of the docs.
 
-Reproduce: `python3 tools/test-bootstrap-convergence.py route --lineage v0.2.51 --root <abs>/build/source a|b <out>`
+Reproduce: `node tools/test-bootstrap-convergence.mjs route --lineage v0.2.51 --root <abs>/build/source a|b <out>`
 for each route, then `compare --lineage v0.2.51 --root <abs>/build/source <out-a> <out-b> <out-cmp>`; or dispatch
 the workflow with `lineage=v0.2.51`. A `v0.2.52` lineage (A: v0.2.52, B: v0.2.51, historical `0eaf983e`) is
 recorded for the next run.

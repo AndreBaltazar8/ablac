@@ -120,7 +120,7 @@ pin:
   own bootstrap pin is v0.2.44.
 
 A newer pair is chosen with `--lineage` (and the workflow's `lineage` input); `LINEAGES` in
-`tools/test-bootstrap-convergence.py` lists them. `v0.2.51`: route A starts from the checksum-pinned v0.2.51
+`tools/test-bootstrap-convergence.mjs` lists them. `v0.2.51`: route A starts from the checksum-pinned v0.2.51
 and route B from v0.2.50, rebuilding the v0.2.51 sources (`1758d94e64b0e7f31f22107f8556fd63dc4351c6`) twice; the
 The same shape for `v0.2.52` and `v0.2.53` (the latter: A the v0.2.53 pin, B v0.2.52, sources `b9ed669ce148440cef09650dde9db4085358f0cd`). The
 default stays the v0.2.45 pair above. Adding a lineage is adding its two seed checksums and the bridge commit.
