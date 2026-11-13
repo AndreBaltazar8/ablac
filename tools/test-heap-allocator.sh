@@ -7,11 +7,14 @@ compiler=${1:-build/ablac}
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 out="$project_root/build/heap-allocator"
 mkdir -p "$out"
+# run-limited.sh sets ulimit -v, which macOS does not honour: run the program itself there.
+runner=("$project_root/tools/run-limited.sh")
+[[ $(uname -s) == Darwin ]] && runner=()
 for mode in release fast; do
     flags=(--no-cache)
     [[ $mode == fast ]] && flags+=(--fast)
     "$compiler" build "$project_root/tests/cases/heap-allocator/main.ab" -o "$out/main.$mode" "${flags[@]}"
-    result=$("$project_root/tools/run-limited.sh" "$out/main.$mode") || {
+    result=$(${runner[@]+"${runner[@]}"} "$out/main.$mode") || {
         echo "heap allocator ($mode): $result" >&2
         exit 1
     }
