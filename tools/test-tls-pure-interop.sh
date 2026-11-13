@@ -28,17 +28,33 @@ done
 "$compiler" build tests/cases/tls-pure/interop.ab -o "$out/interop" --no-cache
 server_pid=
 trap '[[ -z $server_pid ]] || kill "$server_pid" 2> /dev/null || true' EXIT
-start_server() {   # key kind, then the s_server options
+# Starts s_server for the key kind with the given options on a free port (in $port), in $server_directory
+# (default the current one). A port someone else (a parallel suite) took in between makes the bind fail:
+# pick another and try again, a few times.
+start_server() {
     local kind=$1
     shift
-    port=$(( 20000 + RANDOM % 20000 ))
-    openssl s_server -accept "$port" -cert "$out/$kind.pem" -key "$out/$kind.key" -tls1_3 "$@" > "$out/server.log" 2>&1 &
-    server_pid=$!
-    for _ in $(seq 50); do
-        grep -q ACCEPT "$out/server.log" 2> /dev/null && break
-        kill -0 "$server_pid" 2> /dev/null || { echo "tls-pure interop: s_server did not start: $(head -3 "$out/server.log")" >&2; exit 1; }
-        sleep 0.1
+    local attempt
+    for attempt in 1 2 3 4 5 6 7 8; do
+        port=$(( 20000 + RANDOM % 20000 ))
+        # (A test hook: TLS_PURE_FIRST_PORT forces the first attempt of each start onto a port, to exercise the retry.)
+        [[ $attempt -eq 1 && -n ${TLS_PURE_FIRST_PORT:-} ]] && port=$TLS_PURE_FIRST_PORT
+        (cd "${server_directory:-.}" && exec openssl s_server -accept "$port" -cert "$root/$out/$kind.pem" -key "$root/$out/$kind.key" -tls1_3 "$@") > "$out/server.log" 2>&1 &
+        server_pid=$!
+        local started=0
+        for _ in $(seq 50); do
+            if grep -q ACCEPT "$out/server.log" 2> /dev/null; then started=1; break; fi
+            kill -0 "$server_pid" 2> /dev/null || break
+            sleep 0.1
+        done
+        [[ $started -eq 1 ]] && return 0
+        kill "$server_pid" 2> /dev/null || true
+        wait "$server_pid" 2> /dev/null || true
+        server_pid=
+        grep -q 'Address already in use' "$out/server.log" || break
     done
+    echo "tls-pure interop: s_server did not start on port $port after $attempt attempt(s): $(head -3 "$out/server.log")" >&2
+    exit 1
 }
 stop_server() {
     kill "$server_pid" 2> /dev/null || true
@@ -103,14 +119,8 @@ mkdir -p "$out/www"
 head -c 6291456 /dev/urandom > "$out/www/big.bin"
 expected=$(sha256sum "$out/www/big.bin" | cut -d' ' -f1)
 public=$(openssl pkey -in "$out/ed25519.key" -pubout -outform DER | tail -c 32 | od -An -vtx1 | tr -d ' \n')
-port=$(( 20000 + RANDOM % 20000 ))
-(cd "$out/www" && exec openssl s_server -accept "$port" -cert ../ed25519.pem -key ../ed25519.key -tls1_3 -HTTP -groups X25519 > ../server-bulk.log 2>&1) &
-server_pid=$!
-for _ in $(seq 50); do
-    grep -q ACCEPT "$out/server-bulk.log" 2> /dev/null && break
-    sleep 0.1
-done
-result=$("$root/tools/run-limited.sh" "$out/bulk" "$port" "$public" /big.bin 6291456 "$expected") || { echo "tls-pure bulk: $result" >&2; head -5 "$out/server-bulk.log" >&2; exit 1; }
+server_directory="$out/www" start_server ed25519 -HTTP -groups X25519
+result=$("$root/tools/run-limited.sh" "$out/bulk" "$port" "$public" /big.bin 6291456 "$expected") || { echo "tls-pure bulk: $result" >&2; head -5 "$out/server.log" >&2; exit 1; }
 [[ $result == 'tls-pure bulk ok'* ]] || { echo "tls-pure bulk: $result" >&2; exit 1; }
 echo "$result"
 stop_server
