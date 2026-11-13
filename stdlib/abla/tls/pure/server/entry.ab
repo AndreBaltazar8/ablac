@@ -98,7 +98,9 @@ class TlsServer(
      *  KeyUpdate the peer asked for that is still to be answered (once per batch of input). */
     var emptyRun: int = 0,
     var keyUpdateRun: int = 0,
-    var keyUpdateOwed: bool = false
+    var keyUpdateOwed: bool = false,
+    /** Warning alerts in a row (ignored up to four, as BoringSSL does). */
+    var warningRun: int = 0
 )
 
 private fun tlsServerEmptyProtection(): TlsRecordProtection = tlsRecordProtection(TLS_AEAD_AES_128_GCM, "", "")
@@ -541,11 +543,27 @@ private fun TlsServer.handleAlert(content: string): void {
         this.fail(TLS_ALERT_DECODE_ERROR, "tls: a malformed alert")
         return
     }
+    val level = content[0]
+    if (level != 1 && level != 2) {
+        this.fail(TLS_ALERT_ILLEGAL_PARAMETER, "tls: an alert of an unknown level")
+        return
+    }
     if (content[1] == TLS_ALERT_CLOSE_NOTIFY) {
         this.peerClosed = true
         if (!this.sentClose) this.queueAlert(TLS_ALERT_CLOSE_NOTIFY)
         this.sentClose = true
         this.state = TLS_SERVER_CLOSED
+        return
+    }
+    if (level == 1) {
+        // A warning alert: TLS 1.2 ignores the ones it does not know and so does TLS 1.3 for user_canceled (RFC 8446
+        // section 6.1); any other warning in TLS 1.3 is an error. Four in a row at most.
+        if (!this.v12 && content[1] != 90 && this.state != TLS_SERVER_WAIT_CLIENT_HELLO) {
+            this.fail(TLS_ALERT_DECODE_ERROR, "tls: a warning alert")
+            return
+        }
+        this.warningRun = this.warningRun + 1
+        if (this.warningRun > 4) this.fail(TLS_ALERT_UNEXPECTED_MESSAGE, "tls: too many warning alerts")
         return
     }
     this.state = TLS_SERVER_FAILED
@@ -601,8 +619,9 @@ private fun TlsServer.handleRecord(record: string, header: TlsRecordHeader): voi
             return
         }
     } else {
-        this.emptyRun = 0
+        if (type != TLS_ALERT) this.emptyRun = 0
         if (type == TLS_APPLICATION_DATA) this.keyUpdateRun = 0
+        if (type != TLS_ALERT) this.warningRun = 0
     }
     if (type == TLS_HANDSHAKE) {
         if (content.size == 0) {
@@ -630,6 +649,10 @@ fun TlsServer.feed(data: string): void {
         if (!header.ok) return
         if (header.length > TLS_MAX_CIPHERTEXT) {
             this.fail(TLS_ALERT_RECORD_OVERFLOW, "tls: record overflow")
+            return
+        }
+        if ((header.version >> 8) != 3) {
+            this.fail(TLS_ALERT_PROTOCOL_VERSION, "tls: a record with the version ${header.version}")
             return
         }
         if (this.inbox.size < 5 + header.length) return
@@ -945,6 +968,16 @@ private fun TlsServer.handleRecord12(record: string, header: TlsRecordHeader): v
             return
         }
         content = record.slice(5, record.size)
+    }
+    if (content.size == 0) {
+        this.emptyRun = this.emptyRun + 1
+        if (this.emptyRun > TLS_MAX_EMPTY_RUN) {
+            this.fail(TLS_ALERT_UNEXPECTED_MESSAGE, "tls: too many empty records")
+            return
+        }
+    } else {
+        if (type != TLS_ALERT) this.emptyRun = 0
+        if (type != TLS_ALERT) this.warningRun = 0
     }
     if (type == TLS_HANDSHAKE) {
         if (content.size == 0) {
