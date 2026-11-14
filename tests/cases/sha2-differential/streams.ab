@@ -1,0 +1,94 @@
+// SHA-2 and HMAC against an independent implementation (tools/test-sha2-differential.sh, Node's crypto as the oracle in
+// check.mjs): per seed, data from a xorshift32 generator (the same in check.mjs) of 0 to MAXIMUM bytes, mostly near block
+// edges, hashed as a Sha256Stream fed in random chunks (empty updates and partial blocks included) with garbage made
+// between updates, one-shot over the joined string (a rope when large) and over a slice at an offset into a parent, plus
+// SHA-384, SHA-512 and HMAC-SHA256/384/512 with random keys. The seeds are hashed directly, in two `thread {}`s and in a
+// `task {}`; the four results must be equal. Prints one line per seed. Usage: streams FIRST COUNT MAXIMUM
+// The program has a copied generic call (two instances of Box, whose property delegates to a generic): the compiler
+// then drops copy marks (byte 0x1e) from the whole program, which once cut the SHA-256 constant table at its 0x1e.
+import "abla/io"
+import "abla/crypto"
+import "abla/integer"
+import "abla/process/arguments"
+
+class Slot<T>(var value: T) { fun getValue(): T = value }
+class Box<T>(val item: T, val saved: T by Slot(item))
+
+class Gen(var state: int)
+
+fun Gen.next(): int {
+    var x = this.state
+    x = (x ^ (x << 13)) & 4294967295
+    x = x ^ (x >>> 17)
+    x = (x ^ (x << 5)) & 4294967295
+    this.state = x
+    x
+}
+
+fun Gen.below(limit: int): int = if (limit <= 0) 0 else this.next() % limit
+
+fun Gen.bytesOf(count: int): string {
+    val bytes: array<int> = []
+    for (i in 0 until count) bytes.append(this.next() & 255)
+    cryptoByteString(bytes)
+}
+
+fun line(seed: int, maximum: int): string {
+    val g = Gen(seed * 2654435761 % 4294967291 + 1)
+    val kind = g.below(4)
+    val size = if (kind == 0) g.below(200) else if (kind == 1) g.below(5000) else if (kind == 2) 64 * g.below(100) + g.below(3) - 1 else g.below(maximum)
+    val total = if (size < 0) 0 else size
+    val stream = sha256Stream()
+    var joined = ""
+    var made = 0
+    var updates = 0
+    var junk: array<string> = []
+    while (made < total) {
+        val want = if (g.below(8) == 0) 0 else 1 + g.below(if (g.below(3) == 0) 70000 else 130)
+        val take = if (made + want > total) total - made else want
+        val chunk = g.bytesOf(take)
+        stream.update(chunk)
+        joined = joined + chunk
+        made = made + take
+        updates = updates + 1
+        // Garbage between updates: collections run while the stream holds its state.
+        for (k in 0 until 20) junk.append("junk $k ${made}")
+        if (junk.size > 2000) junk = []
+    }
+    val streamed = hexEncode(stream.finish())
+    val pad = g.below(7)
+    val parent = g.bytesOf(pad) + joined + g.bytesOf(3)
+    val view = parent.slice(pad, pad + joined.size)
+    val key = g.bytesOf(g.below(200))
+    "$seed ${joined.size} $updates $pad ${key.size} $streamed ${hexEncode(sha256(joined))} ${hexEncode(sha256(view))} " +
+        "${hexEncode(hmacSha256(key, joined))} ${hexEncode(sha384(joined))} ${hexEncode(sha512(view))} " +
+        "${hexEncode(hmacSha384(key, view))} ${hexEncode(hmacSha512(key, joined))}"
+}
+
+fun batch(first: int, count: int, maximum: int): string {
+    var out = ""
+    for (seed in first until first + count) out = out + line(seed, maximum) + "\n"
+    out
+}
+
+val FIRST = processArgument(0).parseInt() ?? 1
+val COUNT = processArgument(1).parseInt() ?? 10
+val MAXIMUM = processArgument(2).parseInt() ?? 1000000
+
+fun main: int {
+    val copies = "${Box<string>("x").saved}${Box<int>(1).saved}"
+    if (copies != "x1") return 1
+    val direct = batch(FIRST, COUNT, MAXIMUM)
+    val a = thread { batch(FIRST, COUNT, MAXIMUM) }
+    val b = thread { batch(FIRST, COUNT, MAXIMUM) }
+    val t = task { batch(FIRST, COUNT, MAXIMUM) }
+    val inTask = await t
+    val inA = await a
+    val inB = await b
+    print(direct)
+    if (inA != direct || inB != direct || inTask != direct) {
+        eprintln("a thread or task result differs from the direct one")
+        return 1
+    }
+    0
+}
