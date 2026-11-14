@@ -51,6 +51,7 @@ Built into the language rather than imported: `string`, arrays, `Map`,
 | `abla/crypto/x25519` | X25519 (RFC 7748), constant-time, on every target |
 | `abla/crypto/ed25519` | Ed25519 (RFC 8032): keys, signatures, verification; constant-time on the secret paths |
 | `abla/crypto/aes`, `abla/crypto/rsa`, `abla/crypto/pure` | AES and RSA in Abla, no OpenSSL, on every target; what timing protection each has is documented |
+| `abla/crypto/legacy` | 3DES-CBC and RC2-CBC, decrypt only, to read old PKCS#12 files (not constant time; no OpenSSL) |
 | `abla/crypto/hosted` | AES-GCM, AES-CBC, AES-ECB, RSA signatures and encryption, PEM, DER, X.509 and PKCS#12 keys, through OpenSSL |
 | `abla/date` | UTC calendar dates, ISO 8601 and HTTP dates |
 | `abla/test` | checks for test programs run by `ablac test` |

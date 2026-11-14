@@ -1,0 +1,217 @@
+// The block ciphers of old PKCS#12 files, to READ them: 3DES-CBC (pbeWithSHA1And3-KeyTripleDES-CBC, and the two-key form) and
+// RC2-CBC (pbeWithSHA1And40BitRC2-CBC, pbeWithSHA1And128BitRC2-CBC), decrypt only. Nothing here encrypts: abla/crypto/pbe
+// writes nothing and the container writers of this repository use PBES2 with AES. These ciphers are in the files that OpenSSL
+// 1.x, Windows, macOS and Java wrote for years (the tax authority's own test certificate is one), so a reader that refuses them
+// refuses real users' keys; they are not a choice for new data.
+//
+// NOT constant time: DES and RC2 look up S-boxes and tables by secret-dependent indexes. That is acceptable here only because
+// the password-protected container is decrypted once, from a file, by its owner; the AES and PBKDF2 paths of abla/crypto/pbe
+// keep their constant-time cores, and this module is no model for new code. The key schedule lives in native memory that is
+// overwritten before it is freed, and the key buffer stays the caller's to wipe.
+import "abla/crypto/result"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+import "abla/unsafe/mmio"
+
+@inline trusted fun legacyPointer(address: int): i64* = ablaUnsafePointerOffset(ablaUnsafeNullPointer(), address)
+@inline trusted fun legacyLoad(address: int): int = ablaUnsafeLoadU8(legacyPointer(address))
+@inline trusted fun legacyStore(address: int, value: int): void = ablaUnsafeStoreU8(legacyPointer(address), value & 255)
+
+private @noinline trusted fun legacyWipe(address: int, size: int): void {
+    for (i in 0 until size) ablaUnsafeVolatileStoreU8(address + i, 0)
+}
+
+// DES tables: IP 0, FP 64, E 128, P 176, PC1 208, PC2 264, key shifts 312, S-boxes 328 (eight of 64, row-major).
+private @inline trusted fun desTables(): int = nativeStaticBytes("\x3a\x32\x2a\x22\x1a\x12\x0a\x02\x3c\x34\x2c\x24\x1c\x14\x0c\x04\x3e\x36\x2e\x26\x1e\x16\x0e\x06\x40\x38\x30\x28\x20\x18\x10\x08\x39\x31\x29\x21\x19\x11\x09\x01\x3b\x33\x2b\x23\x1b\x13\x0b\x03\x3d\x35\x2d\x25\x1d\x15\x0d\x05\x3f\x37\x2f\x27\x1f\x17\x0f\x07\x28\x08\x30\x10\x38\x18\x40\x20\x27\x07\x2f\x0f\x37\x17\x3f\x1f\x26\x06\x2e\x0e\x36\x16\x3e\x1e\x25\x05\x2d\x0d\x35\x15\x3d\x1d\x24\x04\x2c\x0c\x34\x14\x3c\x1c\x23\x03\x2b\x0b\x33\x13\x3b\x1b\x22\x02\x2a\x0a\x32\x12\x3a\x1a\x21\x01\x29\x09\x31\x11\x39\x19\x20\x01\x02\x03\x04\x05\x04\x05\x06\x07\x08\x09\x08\x09\x0a\x0b\x0c\x0d\x0c\x0d\x0e\x0f\x10\x11\x10\x11\x12\x13\x14\x15\x14\x15\x16\x17\x18\x19\x18\x19\x1a\x1b\x1c\x1d\x1c\x1d\x1e\x1f\x20\x01\x10\x07\x14\x15\x1d\x0c\x1c\x11\x01\x0f\x17\x1a\x05\x12\x1f\x0a\x02\x08\x18\x0e\x20\x1b\x03\x09\x13\x0d\x1e\x06\x16\x0b\x04\x19\x39\x31\x29\x21\x19\x11\x09\x01\x3a\x32\x2a\x22\x1a\x12\x0a\x02\x3b\x33\x2b\x23\x1b\x13\x0b\x03\x3c\x34\x2c\x24\x3f\x37\x2f\x27\x1f\x17\x0f\x07\x3e\x36\x2e\x26\x1e\x16\x0e\x06\x3d\x35\x2d\x25\x1d\x15\x0d\x05\x1c\x14\x0c\x04\x0e\x11\x0b\x18\x01\x05\x03\x1c\x0f\x06\x15\x0a\x17\x13\x0c\x04\x1a\x08\x10\x07\x1b\x14\x0d\x02\x29\x34\x1f\x25\x2f\x37\x1e\x28\x33\x2d\x21\x30\x2c\x31\x27\x38\x22\x35\x2e\x2a\x32\x24\x1d\x20\x01\x01\x02\x02\x02\x02\x02\x02\x01\x02\x02\x02\x02\x02\x02\x01\x0e\x04\x0d\x01\x02\x0f\x0b\x08\x03\x0a\x06\x0c\x05\x09\x00\x07\x00\x0f\x07\x04\x0e\x02\x0d\x01\x0a\x06\x0c\x0b\x09\x05\x03\x08\x04\x01\x0e\x08\x0d\x06\x02\x0b\x0f\x0c\x09\x07\x03\x0a\x05\x00\x0f\x0c\x08\x02\x04\x09\x01\x07\x05\x0b\x03\x0e\x0a\x00\x06\x0d\x0f\x01\x08\x0e\x06\x0b\x03\x04\x09\x07\x02\x0d\x0c\x00\x05\x0a\x03\x0d\x04\x07\x0f\x02\x08\x0e\x0c\x00\x01\x0a\x06\x09\x0b\x05\x00\x0e\x07\x0b\x0a\x04\x0d\x01\x05\x08\x0c\x06\x09\x03\x02\x0f\x0d\x08\x0a\x01\x03\x0f\x04\x02\x0b\x06\x07\x0c\x00\x05\x0e\x09\x0a\x00\x09\x0e\x06\x03\x0f\x05\x01\x0d\x0c\x07\x0b\x04\x02\x08\x0d\x07\x00\x09\x03\x04\x06\x0a\x02\x08\x05\x0e\x0c\x0b\x0f\x01\x0d\x06\x04\x09\x08\x0f\x03\x00\x0b\x01\x02\x0c\x05\x0a\x0e\x07\x01\x0a\x0d\x00\x06\x09\x08\x07\x04\x0f\x0e\x03\x0b\x05\x02\x0c\x07\x0d\x0e\x03\x00\x06\x09\x0a\x01\x02\x08\x05\x0b\x0c\x04\x0f\x0d\x08\x0b\x05\x06\x0f\x00\x03\x04\x07\x02\x0c\x01\x0a\x0e\x09\x0a\x06\x09\x00\x0c\x0b\x07\x0d\x0f\x01\x03\x0e\x05\x02\x08\x04\x03\x0f\x00\x06\x0a\x01\x0d\x08\x09\x04\x05\x0b\x0c\x07\x02\x0e\x02\x0c\x04\x01\x07\x0a\x0b\x06\x08\x05\x03\x0f\x0d\x00\x0e\x09\x0e\x0b\x02\x0c\x04\x07\x0d\x01\x05\x00\x0f\x0a\x03\x09\x08\x06\x04\x02\x01\x0b\x0a\x0d\x07\x08\x0f\x09\x0c\x05\x06\x03\x00\x0e\x0b\x08\x0c\x07\x01\x0e\x02\x0d\x06\x0f\x00\x09\x0a\x04\x05\x03\x0c\x01\x0a\x0f\x09\x02\x06\x08\x00\x0d\x03\x04\x0e\x07\x05\x0b\x0a\x0f\x04\x02\x07\x0c\x09\x05\x06\x01\x0d\x0e\x00\x0b\x03\x08\x09\x0e\x0f\x05\x02\x08\x0c\x03\x07\x00\x04\x0a\x01\x0d\x0b\x06\x04\x03\x02\x0c\x09\x05\x0f\x0a\x0b\x0e\x01\x07\x06\x00\x08\x0d\x04\x0b\x02\x0e\x0f\x00\x08\x0d\x03\x0c\x09\x07\x05\x0a\x06\x01\x0d\x00\x0b\x07\x04\x09\x01\x0a\x0e\x03\x05\x0c\x02\x0f\x08\x06\x01\x04\x0b\x0d\x0c\x03\x07\x0e\x0a\x0f\x06\x08\x00\x05\x09\x02\x06\x0b\x0d\x08\x01\x04\x0a\x07\x09\x05\x00\x0f\x0e\x02\x03\x0c\x0d\x02\x08\x04\x06\x0f\x0b\x01\x0a\x09\x03\x0e\x05\x00\x0c\x07\x01\x0f\x0d\x08\x0a\x03\x07\x04\x0c\x05\x06\x0b\x00\x0e\x09\x02\x07\x0b\x04\x01\x09\x0c\x0e\x02\x00\x06\x0a\x0d\x0f\x03\x05\x08\x02\x01\x0e\x07\x04\x0a\x08\x0d\x0f\x0c\x09\x00\x03\x05\x06\x0b")
+// RC2's PITABLE (RFC 2268, the digits-of-pi permutation).
+private @inline trusted fun rc2Table(): int = nativeStaticBytes("\xd9\x78\xf9\xc4\x19\xdd\xb5\xed\x28\xe9\xfd\x79\x4a\xa0\xd8\x9d\xc6\x7e\x37\x83\x2b\x76\x53\x8e\x62\x4c\x64\x88\x44\x8b\xfb\xa2\x17\x9a\x59\xf5\x87\xb3\x4f\x13\x61\x45\x6d\x8d\x09\x81\x7d\x32\xbd\x8f\x40\xeb\x86\xb7\x7b\x0b\xf0\x95\x21\x22\x5c\x6b\x4e\x82\x54\xd6\x65\x93\xce\x60\xb2\x1c\x73\x56\xc0\x14\xa7\x8c\xf1\xdc\x12\x75\xca\x1f\x3b\xbe\xe4\xd1\x42\x3d\xd4\x30\xa3\x3c\xb6\x26\x6f\xbf\x0e\xda\x46\x69\x07\x57\x27\xf2\x1d\x9b\xbc\x94\x43\x03\xf8\x11\xc7\xf6\x90\xef\x3e\xe7\x06\xc3\xd5\x2f\xc8\x66\x1e\xd7\x08\xe8\xea\xde\x80\x52\xee\xf7\x84\xaa\x72\xac\x35\x4d\x6a\x2a\x96\x1a\xd2\x71\x5a\x15\x49\x74\x4b\x9f\xd0\x5e\x04\x18\xa4\xec\xc2\xe0\x41\x6e\x0f\x51\xcb\xcc\x24\x91\xaf\x50\xa1\xf4\x70\x39\x99\x7c\x3a\x85\x23\xb8\xb4\x7a\xfc\x02\x36\x5b\x25\x55\x97\x31\x2d\x5d\xfa\x98\xe3\x8a\x92\xae\x05\xdf\x29\x10\x67\x6c\xba\xc9\xd3\x00\xe6\xcf\xe1\x9e\xa8\x2c\x63\x16\x01\x3f\x58\xe2\x89\xa9\x0d\x38\x34\x1b\xab\x33\xff\xb0\xbb\x48\x0c\x5f\xb9\xb1\xcd\x2e\xc5\xf3\xdb\x47\xe5\xa5\x9c\x77\x0a\xa6\x20\x68\xfe\x7f\xc1\xad")
+
+// ---- DES ----------------------------------------------------------------------------------------------------------
+
+// The bits of `value` (width bits, the most significant is bit 1) chosen by `count` table entries from `table`.
+private trusted fun desPermute(table: int, count: int, value: int, width: int): int {
+    var out = 0
+    for (i in 0 until count) out = (out << 1) | ((value >>> (width - legacyLoad(table + i))) & 1)
+    out
+}
+
+private trusted fun desBig(address: int): int {
+    var value = 0
+    for (i in 0 until 8) value = (value << 8) | legacyLoad(address + i)
+    value
+}
+
+private trusted fun desStoreBig(address: int, value: int): void {
+    for (i in 0 until 8) legacyStore(address + i, value >>> (56 - 8 * i))
+}
+
+// The 16 round keys of an 8-byte DES key (the parity bits are ignored), as 16 eight-byte values at `out`.
+private trusted fun desSchedule(key: int, out: int): void {
+    val tables = desTables()
+    val cd = desPermute(tables + 208, 56, desBig(key), 64)
+    var c = (cd >>> 28) & 268435455
+    var d = cd & 268435455
+    for (round in 0 until 16) {
+        val shift = legacyLoad(tables + 312 + round)
+        c = ((c << shift) | (c >>> (28 - shift))) & 268435455
+        d = ((d << shift) | (d >>> (28 - shift))) & 268435455
+        desStoreBig(out + round * 8, desPermute(tables + 264, 48, (c << 28) | d, 56))
+    }
+}
+
+private trusted fun desRound(right: int, subkey: int): int {
+    val tables = desTables()
+    val mixed = desPermute(tables + 128, 48, right, 32) ^ subkey
+    var s = 0
+    for (box in 0 until 8) {
+        val six = (mixed >>> (42 - 6 * box)) & 63
+        val row = ((six >>> 4) & 2) | (six & 1)
+        val column = (six >>> 1) & 15
+        s = (s << 4) | legacyLoad(tables + 328 + box * 64 + row * 16 + column)
+    }
+    desPermute(tables + 176, 32, s, 32)
+}
+
+private trusted fun desBlock(schedule: int, block: int, decrypt: bool): int {
+    val tables = desTables()
+    val permuted = desPermute(tables, 64, block, 64)
+    var left = (permuted >>> 32) & 4294967295
+    var right = permuted & 4294967295
+    for (round in 0 until 16) {
+        val subkey = desBig(schedule + (if (decrypt) 15 - round else round) * 8)
+        val next = left ^ desRound(right, subkey)
+        left = right
+        right = next
+    }
+    desPermute(tables + 64, 64, (right << 32) | left, 64)
+}
+
+// PKCS#7 padding of a block cipher with `block`-byte blocks: the plaintext without it, or "" with ok false.
+private trusted fun legacyUnpad(var buffer: NativeByteBuffer, address: int, size: int, block: int): CryptoResult {
+    val pad = legacyLoad(address + size - 1)
+    var good = pad >= 1 && pad <= block && pad <= size
+    if (good) {
+        for (i in 0 until pad) if (legacyLoad(address + size - 1 - i) != pad) good = false
+    }
+    if (!good) {
+        legacyWipe(address, size)
+        buffer.close()
+        return cryptoFailed("wrong password or corrupt key")
+    }
+    legacyWipe(address + size - pad, pad)
+    CryptoResult(buffer.adoptString(size - pad), true, "")
+}
+
+/** Decrypts `ciphertext` (whole 8-byte blocks) with 3DES in CBC mode: `key` is 24 bytes (three keys) or 16 (two keys, the
+ *  first again as the third), in a native buffer that stays the caller's; the PKCS#7 padding is removed. A bad padding is
+ *  "wrong password or corrupt key". */
+trusted fun legacyDes3CbcDecrypt(key: NativeByteBuffer, iv: string, ciphertext: string): CryptoResult {
+    if (key.closed || (key.capacity != 24 && key.capacity != 16)) return cryptoFailed("a 3DES key has 16 or 24 bytes")
+    if (iv.size != 8) return cryptoFailed("a 3DES-CBC IV has 8 bytes")
+    if (ciphertext.size == 0 || ciphertext.size % 8 != 0) return cryptoFailed("the ciphertext isn't a whole number of 8-byte blocks")
+    val schedules = nativeByteBuffer(3 * 128)
+    val keys = ablaUnsafePointerAddress(key.address)
+    val s = ablaUnsafePointerAddress(schedules.address)
+    desSchedule(keys, s)
+    desSchedule(keys + 8, s + 128)
+    desSchedule(keys + (if (key.capacity == 24) 16 else 0), s + 256)
+    val buffer = nativeByteBuffer(ciphertext.size + 1)
+    val out = ablaUnsafePointerAddress(buffer.address)
+    val input = ablaUnsafeStringAddress(ciphertext)
+    var previous = desBig(ablaUnsafeStringAddress(iv))
+    var at = 0
+    while (at < ciphertext.size) {
+        val block = desBig(input + at)
+        // Decryption is D(K1, E(K2, D(K3, block))).
+        var middle = desBlock(s + 256, block, true)
+        middle = desBlock(s + 128, middle, false)
+        desStoreBig(out + at, desBlock(s, middle, true) ^ previous)
+        previous = block
+        at += 8
+    }
+    legacyWipe(s, 3 * 128)
+    schedules.close()
+    legacyUnpad(buffer, out, ciphertext.size, 8)
+}
+
+// ---- RC2 (RFC 2268) -----------------------------------------------------------------------------------------------
+
+// The 64 sixteen-bit subkeys of `key` (`size` bytes) with `bits` effective key bits, as 128 bytes at `out`.
+private trusted fun rc2Schedule(key: int, size: int, bits: int, out: int): void {
+    val table = rc2Table()
+    val bytes = (bits + 7) / 8
+    val mask = 255 >>> (8 * bytes - bits)
+    for (i in 0 until size) legacyStore(out + i, legacyLoad(key + i))
+    for (i in size until 128) legacyStore(out + i, legacyLoad(table + ((legacyLoad(out + i - 1) + legacyLoad(out + i - size)) & 255)))
+    legacyStore(out + 128 - bytes, legacyLoad(table + (legacyLoad(out + 128 - bytes) & mask)))
+    var i = 127 - bytes
+    while (i >= 0) {
+        legacyStore(out + i, legacyLoad(table + (legacyLoad(out + i + 1) ^ legacyLoad(out + i + bytes))))
+        i -= 1
+    }
+}
+
+private trusted fun rc2Word(address: int, index: int): int = legacyLoad(address + 2 * index) | (legacyLoad(address + 2 * index + 1) << 8)
+
+private @inline fun rc2Rotate(value: int, by: int): int = ((value << by) | (value >>> (16 - by))) & 65535
+
+private trusted fun rc2Decrypt(subkeys: int, block: int, out: int): void {
+    var r0 = legacyLoad(block) | (legacyLoad(block + 1) << 8)
+    var r1 = legacyLoad(block + 2) | (legacyLoad(block + 3) << 8)
+    var r2 = legacyLoad(block + 4) | (legacyLoad(block + 5) << 8)
+    var r3 = legacyLoad(block + 6) | (legacyLoad(block + 7) << 8)
+    var j = 63
+    // Five reverse mixing rounds, a reverse mash, six, a mash, five (the encryption's order, backwards).
+    for (step in 0 until 16) {
+        if (step == 5 || step == 11) {
+            r3 = (r3 - rc2Word(subkeys, r2 & 63)) & 65535
+            r2 = (r2 - rc2Word(subkeys, r1 & 63)) & 65535
+            r1 = (r1 - rc2Word(subkeys, r0 & 63)) & 65535
+            r0 = (r0 - rc2Word(subkeys, r3 & 63)) & 65535
+        }
+        r3 = rc2Rotate(r3, 16 - 5)
+        r3 = (r3 - rc2Word(subkeys, j) - (r2 & r1) - (~r2 & r0)) & 65535
+        j -= 1
+        r2 = rc2Rotate(r2, 16 - 3)
+        r2 = (r2 - rc2Word(subkeys, j) - (r1 & r0) - (~r1 & r3)) & 65535
+        j -= 1
+        r1 = rc2Rotate(r1, 16 - 2)
+        r1 = (r1 - rc2Word(subkeys, j) - (r0 & r3) - (~r0 & r2)) & 65535
+        j -= 1
+        r0 = rc2Rotate(r0, 16 - 1)
+        r0 = (r0 - rc2Word(subkeys, j) - (r3 & r2) - (~r3 & r1)) & 65535
+        j -= 1
+    }
+    legacyStore(out, r0); legacyStore(out + 1, r0 >>> 8)
+    legacyStore(out + 2, r1); legacyStore(out + 3, r1 >>> 8)
+    legacyStore(out + 4, r2); legacyStore(out + 5, r2 >>> 8)
+    legacyStore(out + 6, r3); legacyStore(out + 7, r3 >>> 8)
+}
+
+/** Decrypts `ciphertext` (whole 8-byte blocks) with RC2 in CBC mode: `key` is 1 to 128 bytes in a native buffer that stays
+ *  the caller's, `effectiveBits` the effective key length (40 for pbeWithSHA1And40BitRC2-CBC, 128 for the 128-bit form);
+ *  the PKCS#7 padding is removed. */
+trusted fun legacyRc2CbcDecrypt(key: NativeByteBuffer, effectiveBits: int, iv: string, ciphertext: string): CryptoResult {
+    if (key.closed || key.capacity < 1 || key.capacity > 128) return cryptoFailed("an RC2 key has 1 to 128 bytes")
+    if (effectiveBits < 1 || effectiveBits > 1024) return cryptoFailed("RC2 effective key bits are 1 to 1024")
+    if (iv.size != 8) return cryptoFailed("an RC2-CBC IV has 8 bytes")
+    if (ciphertext.size == 0 || ciphertext.size % 8 != 0) return cryptoFailed("the ciphertext isn't a whole number of 8-byte blocks")
+    val schedule = nativeByteBuffer(128)
+    val s = ablaUnsafePointerAddress(schedule.address)
+    rc2Schedule(ablaUnsafePointerAddress(key.address), key.capacity, effectiveBits, s)
+    val buffer = nativeByteBuffer(ciphertext.size + 1)
+    val out = ablaUnsafePointerAddress(buffer.address)
+    val input = ablaUnsafeStringAddress(ciphertext)
+    var at = 0
+    while (at < ciphertext.size) {
+        rc2Decrypt(s, input + at, out + at)
+        for (i in 0 until 8) {
+            val chain = if (at == 0) legacyLoad(ablaUnsafeStringAddress(iv) + i) else legacyLoad(input + at - 8 + i)
+            legacyStore(out + at + i, legacyLoad(out + at + i) ^ chain)
+        }
+        at += 8
+    }
+    legacyWipe(s, 128)
+    schedule.close()
+    legacyUnpad(buffer, out, ciphertext.size, 8)
+}

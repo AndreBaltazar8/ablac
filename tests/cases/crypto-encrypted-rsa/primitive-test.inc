@@ -40,11 +40,23 @@ trusted fun pbeTestLeak(memory: int): int = ablaUnsafeLoadU8(aesPointer(memory +
 @inline @export("ct_pbe_password_pad")
 trusted fun pbeTestPasswordPad(out: int, password: int, size: int): void = pbePadBody(out, password, size, 54)
 
+// Any ID and output length of the PKCS#12 KDF (RFC 7292 B.2), as hex-able bytes.
+trusted fun pbeTestPkcs12Kdf(text: string, salt: string, count: int, id: int, sha1: bool, length: int): string {
+    val password = cryptoPassword(text)
+    val output = nativeByteBuffer(length)
+    val budget = PbeBudget(RsaKeyReadLimits())
+    val ok = pbePkcs12Derive(password, salt, count, id, sha1, output, budget)
+    val public = byteBuffer()
+    if (ok) for (i in 0 until output.capacity) public.appendText(byteEncode(output.load(i)))
+    pbeWipe(ablaUnsafePointerAddress(output.address), output.capacity)
+    public.toText()
+}
+
 trusted fun pbeTestMacKey(text: string, salt: string, count: int, sha1: bool): string {
     val password = cryptoPassword(text)
     val output = nativeByteBuffer(if (sha1) 20 else 32)
     val budget = PbeBudget(RsaKeyReadLimits())
-    val ok = pbePkcs12MacKey(password, salt, count, sha1, output, budget)
+    val ok = pbePkcs12Derive(password, salt, count, 3, sha1, output, budget)
     val public = byteBuffer()
     if (ok) for (i in 0 until output.capacity) public.appendText(byteEncode(output.load(i)))
     pbeWipe(ablaUnsafePointerAddress(output.address), output.capacity)

@@ -22,7 +22,7 @@ an empty read with an empty `tlsLastError`; a timed-out read can be repeated; a 
 | TLS 1.2 suites | `TLS_ECDHE_{ECDSA,RSA}_WITH_AES_128_GCM_SHA256`, `..._AES_256_GCM_SHA384`, `..._CHACHA20_POLY1305_SHA256` |
 | Key exchange | X25519 and secp256r1 (P-256); a HelloRetryRequest when the server wants a group the client has no share for |
 | Signatures | ECDSA P-256 (SHA-256), ECDSA P-384 (SHA-384, TLS 1.3 only), RSA-PSS (rsae, SHA-256/384/512), Ed25519; RSA PKCS#1 v1.5 (SHA-256/384) in TLS 1.2 only |
-| Certificates | X.509 chains to the system trust store or a CA file, with name, validity, key-usage, basic-constraints, name-constraints and signature checks (`abla/crypto/x509`); client certificates (RSA, P-256, Ed25519) from PEM (PKCS#8, PKCS#1, SEC1, encrypted PKCS#8) or PKCS#12 (PBES2) |
+| Certificates | X.509 chains to the system trust store or a CA file, with name, validity, key-usage, basic-constraints, name-constraints and signature checks (`abla/crypto/x509`); client certificates (RSA, P-256, Ed25519) from PEM (PKCS#8, PKCS#1, SEC1, encrypted PKCS#8) or PKCS#12 (PBES2 with AES or 3DES, and the legacy RC2/3DES encodings, read only: see [PKCS#12 client certificates](pkcs12-client-certificates.md)) |
 | Other | ALPN, SNI, KeyUpdate, close_notify, middlebox-compatibility ChangeCipherSpec, the TLS 1.3 downgrade sentinel, deadlines |
 
 The system trust store is `NIX_SSL_CERT_FILE` or `SSL_CERT_FILE` if set, else `SSL_CERT_DIR` if set (a variable that is set is the whole trust, see below), else the first
@@ -43,8 +43,10 @@ and works); RSA keys under 2048 bits for PSS verification.
 
 - The certificate's host name must be in its subjectAltName (no Common Name fallback).
 - Legacy encrypted PEM private keys (`Proc-Type: 4,ENCRYPTED`) are not read; encrypted PKCS#8 is.
-- PKCS#12 containers must use PBES2 and a SHA-1 or SHA-256 MAC (what OpenSSL 3 and current tools write), not the
-  RC2/3DES-era PKCS#12 key derivation.
+- PKCS#12 containers are read in the encodings that real tools write: PBES2 (AES-128/192/256, 3DES) and the RC2/3DES
+  PKCS#12 key derivation of OpenSSL 1.x, Windows, macOS and Java 8, with a SHA-1 or SHA-256 MAC (read only; our writers use
+  PBES2). A MAC is required, and RC4, single DES, SHA-224/384/512 and PBMAC1 MACs are refused:
+  [PKCS#12 client certificates](pkcs12-client-certificates.md).
 - Speed: an RSA-2048 signature (a server with an RSA certificate, or a client certificate) takes about 8 ms in a release
   build and about 300 ms in a `--fast` build; ECDSA and Ed25519 are far cheaper. Parsing a system bundle of 145
   certificates takes about 6 ms in a release build and 90 ms in a `--fast` build.

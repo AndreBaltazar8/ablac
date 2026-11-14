@@ -3,6 +3,7 @@ import "abla/ct/scrub"
 import "abla/text"
 import "abla/crypto/aes"
 import "abla/crypto/der"
+import "abla/crypto/legacy"
 import "abla/unsafe/memory"
 import "abla/unsafe/memory/raw"
 import "abla/unsafe/mmio"
@@ -334,8 +335,10 @@ private trusted fun pbeDerive(password: CryptoPassword, salt: string, iterations
     budget.error == ""
 }
 
+// `scheme`: 0 PBES2 with AES-CBC, 1 PBES2 with 3DES-CBC, 2 PKCS#12 3-key 3DES, 3 PKCS#12 2-key 3DES, 4 PKCS#12 RC2-128, 5 PKCS#12 RC2-40.
+// The PKCS#12 schemes (read only: nothing here writes them) derive their key and IV with the PKCS#12 SHA-1 KDF.
 private class PbeCipher(val salt: string, val iterations: int, val sha1: bool,
-    val keyBytes: int, val iv: string, val ciphertext: string, val error: string)
+    val keyBytes: int, val iv: string, val ciphertext: string, val error: string, val scheme: int = 0)
 private fun pbeFailed(error: string): PbeCipher = PbeCipher("", 0, false, 0, "", "", error)
 private fun pbeOid(data: string, item: DerItem, oid: string): bool =
     item.ok && item.tag == DER_OID && data.slice(item.start, item.end) == oid
@@ -356,12 +359,37 @@ private fun pbeAlgorithmError(oid: string): string {
         "\x2a\x86\x48\x86\xf7\x0d\x01\x0c\x01") return "unsupported legacy PKCS#12 encryption (RC2/DES)"
     "unsupported password encryption scheme (only PBES2 is supported)"
 }
+// pbeWithSHA1And... of PKCS#12 (1.2.840.113549.1.12.1.N): the parameters are { salt OCTET STRING, iterations INTEGER }. Read
+// only. 3-key and 2-key 3DES and RC2 with 128 and 40 effective bits are read; RC4 (N 1 and 2) is refused: no tool writes it
+// any more, and a stream cipher with a password-derived key buys nothing over the others for a file that is read once.
+private fun pbeLegacyParameters(data: string, algorithm: DerItem, oid: DerItem, ciphertext: string,
+    limits: RsaKeyReadLimits): PbeCipher {
+    val malformed = "invalid encrypted private key parameters"
+    val kind = int(data[oid.end - 1])
+    if (kind == 1 || kind == 2) return pbeFailed("unsupported PKCS#12 RC4 encryption")
+    if (kind < 3 || kind > 6) return pbeFailed("unsupported legacy PKCS#12 encryption")
+    val params = derItem(data, oid.end, algorithm.end)
+    if (!params.ok || params.tag != DER_SEQUENCE || params.end != algorithm.end) return pbeFailed(malformed)
+    val salt = derItem(data, params.start, params.end)
+    if (!salt.ok || salt.tag != DER_OCTET_STRING) return pbeFailed(malformed)
+    if (salt.end - salt.start > limits.maximumSaltBytes) return pbeFailed("PKCS#12 salt byte limit exceeded")
+    val rounds = derItem(data, salt.end, params.end)
+    if (!rounds.ok || rounds.end != params.end) return pbeFailed(malformed)
+    val count = pbeCount(data, rounds, limits.maximumIterations)
+    if (count == -2) return pbeFailed("PKCS#12 iteration limit exceeded")
+    if (count <= 0) return pbeFailed("invalid PKCS#12 iteration count")
+    if (ciphertext.size == 0 || ciphertext.size % 8 != 0) return pbeFailed("invalid 8-byte-block ciphertext length")
+    // N: 3 = 3-key 3DES (24 bytes), 4 = 2-key 3DES (16), 5 = RC2 128 bit (16), 6 = RC2 40 bit (5).
+    val keyBytes = if (kind == 3) 24 else if (kind == 4 || kind == 5) 16 else 5
+    PbeCipher(data.slice(salt.start, salt.end), count, true, keyBytes, "", ciphertext, "", kind - 1)
+}
 private fun pbeParameters(data: string, algorithm: DerItem, ciphertext: string,
     limits: RsaKeyReadLimits): PbeCipher {
     val malformed = "invalid encrypted private key parameters"
     if (!algorithm.ok || algorithm.tag != DER_SEQUENCE) return pbeFailed(malformed)
     val oid = derItem(data, algorithm.start, algorithm.end)
     if (!oid.ok || oid.tag != DER_OID) return pbeFailed(malformed)
+    if (oid.end - oid.start == 10 && data.slice(oid.start, oid.end - 1) == "\x2a\x86\x48\x86\xf7\x0d\x01\x0c\x01") return pbeLegacyParameters(data, algorithm, oid, ciphertext, limits)
     if (!pbeOid(data, oid,
         "\x2a\x86\x48\x86\xf7\x0d\x01\x05\x0d")) return pbeFailed(pbeAlgorithmError(data.slice(oid
                 .start, oid.end)))
@@ -413,22 +441,26 @@ private fun pbeParameters(data: string, algorithm: DerItem, ciphertext: string,
         params.end) return pbeFailed(malformed)
     val cipherOid = derItem(data, cipher.start, cipher.end)
     var bytes = 0
+    var scheme = 0
     if (pbeOid(data, cipherOid, "\x60\x86\x48\x01\x65\x03\x04\x01\x02")) bytes = 16
+    else if (pbeOid(data, cipherOid, "\x60\x86\x48\x01\x65\x03\x04\x01\x16")) bytes = 24
     else if (pbeOid(data, cipherOid, "\x60\x86\x48\x01\x65\x03\x04\x01\x2a")) bytes = 32
     else if (pbeOid(data, cipherOid,
         "\x2a\x86\x48\x86\xf7\x0d\x03\x02")) return pbeFailed("unsupported RC2 encryption")
-    else if (pbeOid(data, cipherOid, "\x2a\x86\x48\x86\xf7\x0d\x03\x07") || pbeOid(data, cipherOid,
-        "\x2b\x0e\x03\x02\x07")) return pbeFailed("unsupported DES/3DES encryption")
-    else return pbeFailed("unsupported PBES2 cipher (only AES-128/256-CBC are supported)")
+    else if (pbeOid(data, cipherOid, "\x2a\x86\x48\x86\xf7\x0d\x03\x07")) { bytes = 24; scheme = 1 }
+    else if (pbeOid(data, cipherOid,
+        "\x2b\x0e\x03\x02\x07")) return pbeFailed("unsupported DES encryption (single DES, 56 bits)")
+    else return pbeFailed("unsupported PBES2 cipher (only AES-128/192/256-CBC and 3DES-CBC are supported)")
     if (keyLength != 0 && keyLength !=
-        bytes) return pbeFailed("PBKDF2 keyLength does not match AES cipher")
+        bytes) return pbeFailed("PBKDF2 keyLength does not match the cipher")
+    val blockSize = if (scheme == 1) 8 else 16
     val iv = derItem(data, cipherOid.end, cipher.end)
-    if (!iv.ok || iv.tag != DER_OCTET_STRING || iv.end - iv.start != 16 || iv.end !=
-        cipher.end) return pbeFailed("invalid AES-CBC IV (expected16 bytes)")
-    if (ciphertext.size == 0 || ciphertext.size % 16 !=
-        0) return pbeFailed("invalid AES-CBC ciphertext length")
+    if (!iv.ok || iv.tag != DER_OCTET_STRING || iv.end - iv.start != blockSize || iv.end !=
+        cipher.end) return pbeFailed(if (scheme == 1) "invalid 3DES-CBC IV (expected 8 bytes)" else "invalid AES-CBC IV (expected16 bytes)")
+    if (ciphertext.size == 0 || ciphertext.size % blockSize !=
+        0) return pbeFailed(if (scheme == 1) "invalid 3DES-CBC ciphertext length" else "invalid AES-CBC ciphertext length")
     PbeCipher(data.slice(saltItem.start, saltItem.end), count, sha1, bytes, data.slice(iv.start,
-        iv.end), ciphertext, "")
+        iv.end), ciphertext, "", scheme)
 }
 private fun pbeEncryptedInfo(data: string, limits: RsaKeyReadLimits): PbeCipher {
     if (data.size > limits.maximumDerBytes) return pbeFailed("encrypted DER byte limit exceeded")
@@ -446,8 +478,27 @@ private trusted fun pbeDecrypt(cipher: PbeCipher, password: CryptoPassword,
     var budget: PbeBudget): CryptoResult {
     val derived = nativeByteBuffer(cipher.keyBytes)
     var result = cryptoFailed("wrong password or corrupt key")
-    if (pbeDerive(password, cipher.salt, cipher.iterations, cipher.sha1, derived, budget)) {
-        val opened = aesCbcDecryptPkcs7BufferKey(derived, cipher.iv, cipher.ciphertext)
+    if (cipher.scheme >= 2) {
+        // A PKCS#12 scheme: the key (ID 1) and the 8-byte IV (ID 2) come from the PKCS#12 KDF over the BMP password.
+        if (password.passwordBmpError != "") result = cryptoFailed(password.passwordBmpError)
+        else {
+            var ivBuffer = nativeByteBuffer(8)
+            if (pbePkcs12Derive(password, cipher.salt, cipher.iterations, 1, true, derived, budget) &&
+                pbePkcs12Derive(password, cipher.salt, cipher.iterations, 2, true, ivBuffer, budget)) {
+                var ivText = nativeByteBuffer(9)
+                pbeCopy(ablaUnsafePointerAddress(ivText.address), ablaUnsafePointerAddress(ivBuffer.address), 8)
+                val iv = ivText.adoptString(8)
+                val opened = if (cipher.scheme == 2) legacyDes3CbcDecrypt(derived, iv, cipher.ciphertext)
+                    else if (cipher.scheme == 3) legacyDes3CbcDecrypt(derived, iv, cipher.ciphertext)
+                    else legacyRc2CbcDecrypt(derived, if (cipher.scheme == 4) 128 else 40, iv, cipher.ciphertext)
+                if (opened.ok) result = opened
+            } else result = cryptoFailed(budget.error)
+            pbeWipe(ablaUnsafePointerAddress(ivBuffer.address), ivBuffer.capacity)
+            ivBuffer.close()
+        }
+    } else if (pbeDerive(password, cipher.salt, cipher.iterations, cipher.sha1, derived, budget)) {
+        val opened = if (cipher.scheme == 1) legacyDes3CbcDecrypt(derived, cipher.iv, cipher.ciphertext)
+            else aesCbcDecryptPkcs7BufferKey(derived, cipher.iv, cipher.ciphertext)
         if (opened.ok) result = opened
     } else result = cryptoFailed(budget.error)
     pbeWipe(ablaUnsafePointerAddress(derived.address), derived.capacity)
@@ -471,27 +522,56 @@ private @noinline trusted fun pbeOpenPkcs8Work(data: string, password: CryptoPas
     pbeDecrypt(cipher, password, budget)
 }
 
-// PKCS#12 Appendix B, ID3 only. The MAC key is exactly one hash output block;
-// legacy cipher/IV derivation and its multi-output carry update are not needed.
-private trusted fun pbePkcs12MacKey(password: CryptoPassword, salt: string,
-    rounds: int, sha1: bool, var output: NativeByteBuffer, var budget: PbeBudget): bool {
+// PKCS#12 Appendix B: the key (ID 1), IV (ID 2) and MAC key (ID 3) derivation of the container, with SHA-1 or SHA-256, for any
+// output length. One hash block (the MAC key, and every key or IV of at most one block) needs no carry update; a longer
+// output (a 24-byte 3DES key from SHA-1's 20-byte blocks) adds B+1 into each 64-byte piece of I between blocks, as the RFC says.
+private trusted fun pbePkcs12Derive(password: CryptoPassword, salt: string,
+    rounds: int, id: int, sha1: bool, var output: NativeByteBuffer, var budget: PbeBudget): bool {
     val hash = pbeHash(sha1)
-    val saltBytes = ((salt.size + 63) / 64) * 64
+    val digest = if (sha1) 20 else 32
+    val saltBytes = if (salt.size == 0) 0 else ((salt.size + 63) / 64) * 64
     val passwordBytes = ((password.passwordBmpSize + 63) / 64) * 64
-    val input = nativeByteBuffer(64 + saltBytes + passwordBytes)
+    val inputSize = saltBytes + passwordBytes
+    // D (64 bytes), I (S then P), B (64 bytes) and the running hash A.
+    val input = nativeByteBuffer(64 + inputSize + 64 + 32)
     val address = ablaUnsafePointerAddress(input.address)
-    for (i in 0 until 64) pbeByteStore(address + i, secretU32(u32(3)))
-    for (i in 0 until saltBytes) pbeByteStore(address + 64 + i, secretU32(u32(salt[i % salt.size])))
-    for (i in 0 until passwordBytes) pbeByteStore(address + 64 + saltBytes + i,
-        pbeByte(password.passwordBmpMemory + i % password.passwordBmpSize))
-    hash.update(address, input.capacity, budget)
-    hash.finish(ablaUnsafePointerAddress(output.address), budget)
-    var round = 1
-    while (round < rounds && budget.error == "") {
+    val i = address + 64
+    val b = address + 64 + inputSize
+    val a = b + 64
+    for (at in 0 until 64) pbeByteStore(address + at, secretU32(u32(id)))
+    for (at in 0 until saltBytes) pbeByteStore(i + at, secretU32(u32(salt[at % salt.size])))
+    for (at in 0 until passwordBytes) pbeByteStore(i + saltBytes + at,
+        pbeByte(password.passwordBmpMemory + at % password.passwordBmpSize))
+    var produced = 0
+    while (produced < output.capacity && budget.error == "") {
         hash.reset()
-        hash.update(ablaUnsafePointerAddress(output.address), output.capacity, budget)
-        hash.finish(ablaUnsafePointerAddress(output.address), budget)
-        round += 1
+        hash.update(address, 64 + inputSize, budget)
+        hash.finish(a, budget)
+        var round = 1
+        while (round < rounds && budget.error == "") {
+            hash.reset()
+            hash.update(a, digest, budget)
+            hash.finish(a, budget)
+            round += 1
+        }
+        val take = if (output.capacity - produced < digest) output.capacity - produced else digest
+        pbeCopy(ablaUnsafePointerAddress(output.address) + produced, a, take)
+        produced += take
+        if (produced < output.capacity) {
+            for (at in 0 until 64) pbeByteStore(b + at, pbeByte(a + at % digest))
+            var piece = 0
+            while (piece < inputSize) {
+                var carry = secretU32(u32(1))
+                var at = 63
+                while (at >= 0) {
+                    val sum = pbeByte(i + piece + at) + pbeByte(b + at) + carry
+                    pbeByteStore(i + piece + at, sum)
+                    carry = sum >> 8
+                    at -= 1
+                }
+                piece += 64
+            }
+        }
     }
     pbeWipe(address, input.capacity)
     budget.error == ""
@@ -535,7 +615,7 @@ private trusted fun pbePkcs12CheckMac(data: string, safe: string, item: DerItem,
     }
     val key = nativeByteBuffer(digestSize)
     var result = "wrong password or corrupt key"
-    if (pbePkcs12MacKey(password, data.slice(salt.start, salt.end), rounds, sha1, key, budget)) {
+    if (pbePkcs12Derive(password, data.slice(salt.start, salt.end), rounds, 3, sha1, key, budget)) {
         val hash = pbeHash(sha1)
         hash.prepareHmacAddress(ablaUnsafePointerAddress(key.address), key.capacity, budget)
         hash.hmac(ablaUnsafeStringAddress(safe), safe.size, budget)

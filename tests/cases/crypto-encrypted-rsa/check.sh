@@ -29,8 +29,14 @@ while IFS='|' read -r file password mode iterations work size bags depth want; d
     status=0
     output=$(${guard[@]+"${guard[@]}"} "$tool" "$path" "$password" "$mode" "$iterations" "$work" "$size" "$bags" "$depth" 2>&1) || status=$?
     checks=$((checks + 1))
-    if [[ $want == OK ]]; then
-        [[ $status == 0 && $output == "$expected" ]] ||
+    if [[ $want == OK || $want == OK:* ]]; then
+        # OK:FILE names another fixture key (the 4096-bit one), whose modulus hash is what the tool must print.
+        wanted=$expected
+        if [[ $want == OK:* ]]; then
+            other=$(openssl rsa -in "$vectors/${want#OK:}" -modulus -noout | sed 's/^Modulus=//')
+            wanted=$(printf '%b' "$(printf '%s' "$other" | sed 's/../\\x&/g')" | openssl dgst -sha256 | sed 's/^.*= //')
+        fi
+        [[ $status == 0 && $output == "$wanted" ]] ||
             { echo "encrypted RSA: $file ($password, $mode): wanted the key, got status $status: $output" >&2; exit 1; }
     else
         [[ $status == 1 ]] || { echo "encrypted RSA: $file: wanted error '$want', exit status $status: $output" >&2; exit 1; }

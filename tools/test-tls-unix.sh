@@ -19,6 +19,11 @@ fi
 "$openssl" pkcs12 -export -inkey "$out/key.pem" -in "$out/cert.pem" \
     -keypbe AES-256-CBC -certpbe AES-256-CBC -macalg sha256 \
     -passout pass:test -out "$out/identity.p12" 2>/dev/null
+# The same client identity in the legacy PKCS#12 encoding that the tax authority's own test certificate has (3DES for key and
+# certificates, a SHA-1 MAC, 2000 rounds; OpenSSL 1.x and many tools write it): the mutual-TLS handshake must work from it too (#822).
+"$openssl" pkcs12 -export -inkey "$out/key.pem" -in "$out/cert.pem" \
+    -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1 -iter 2000 \
+    -passout pass:test -out "$out/identity-legacy.p12" 2>/dev/null
 # Keep pathnames below sockaddr_un's limit even in a deeply nested checkout.
 scratch=$(mktemp -d /tmp/abla-tls-unix.XXXXXX)
 trap 'rm -rf "$scratch"' EXIT
@@ -28,3 +33,4 @@ for profile in fast release; do
     "$compiler" build tests/cases/tls-unix/main.ab -o "$out/$profile" --no-cache ${flags[@]+"${flags[@]}"}
     node tests/cases/tls-unix/peer.mjs "$out/$profile" "$out/cert.pem" "$out/key.pem" "$out/identity.p12" "$scratch"
 done
+node tests/cases/tls-unix/peer.mjs "$out/release" "$out/cert.pem" "$out/key.pem" "$out/identity-legacy.p12" "$scratch"

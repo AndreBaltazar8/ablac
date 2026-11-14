@@ -49,6 +49,17 @@ fun pbePrimitiveChecks(): int {
     if (hexEncode(pbeTestMacKey("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "\x73\x61\x6c\x74", 17, false)) != "46589bbc6686a2d2087edc4fb9620c3ee25fa2d119d7175cab95a60d39d92f9e") return 48
     if (hexEncode(pbeTestMacKey("test-only-password", "\x70\x75\x62\x6c\x69\x63\x2d\x73\x61\x6c\x74", 2048, true)) != "8ad3ba508567a5d590716d1b27be6c306da7d48f") return 49
     if (hexEncode(pbeTestMacKey("test-only-password", "\x70\x75\x62\x6c\x69\x63\x2d\x73\x61\x6c\x74", 2048, false)) != "acbea81552a8390dcfecc4e34084e5473e712c7238cd883cb2234ad97a016c43") return 50
+    // The PKCS#12 key (ID 1) and IV (ID 2) derivations of the legacy encryptions, from `openssl kdf PKCS12KDF` (SHA-1: a 24-byte 3DES
+    // key and a 40-byte output cross a block boundary, so the B+1 carry update of the RFC is checked).
+    if (hexEncode(pbeTestPkcs12Kdf("password", "\x73\x61\x6c\x74", 1, 1, true, 24)) != "e6b5a23a3e9c293665a75eaa16c127ca4b03ac4c788196f2") return 51
+    if (hexEncode(pbeTestPkcs12Kdf("password", "\x73\x61\x6c\x74", 1, 2, true, 8)) != "54afecd051808bc0") return 52
+    if (hexEncode(pbeTestPkcs12Kdf("password", "\x73\x61\x6c\x74", 1, 1, true, 40)) != "e6b5a23a3e9c293665a75eaa16c127ca4b03ac4c788196f249139e6e9cb87f951b934428f55ea13a") return 53
+    if (hexEncode(pbeTestPkcs12Kdf("test-only-password", "\x00\x01\x02\x03\x04\x05\x06\x07", 2048, 1, true, 24)) != "8796871801b5891c3028773af6ce4edd883e00de60d36462") return 54
+    if (hexEncode(pbeTestPkcs12Kdf("test-only-password", "\x00\x01\x02\x03\x04\x05\x06\x07", 2048, 2, true, 8)) != "bbb174ed51e369a3") return 55
+    if (hexEncode(pbeTestPkcs12Kdf("t\u00e9st-only-password", "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13", 17, 1, true, 16)) != "19a2b8f777b60a5dca60c595c7c8a813") return 56
+    if (hexEncode(pbeTestPkcs12Kdf("t\u00e9st-only-password", "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13", 17, 1, true, 5)) != "19a2b8f777") return 57
+    if (hexEncode(pbeTestPkcs12Kdf("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13", 17, 1, true, 24)) != "7950d458e416d56f6016d8aff92d45af1108082833690a96") return 58
+    if (hexEncode(pbeTestPkcs12Kdf("x", "\x73\x61\x6c\x74", 3, 1, false, 80)) != "0872fc060380f12a2a5e958cfc77c48d3a8e12f89dd5696cd5d575291e0f5a52da8285306e5607dfcc686eee18892b4e8be9a58f557c8fe4de7c12a1848dc9eedb990d4fd2a87189cce5477e83f985e4") return 59
     val nulPassword = cryptoPassword("a\x00b")
     if (pbeOpenPkcs12("", nulPassword).error != "PKCS#12 password contains NUL") return 90
     val astralPassword = cryptoPassword("\xf0\x9f\x98\x80")
