@@ -16,9 +16,11 @@ cd "$project_root"
 expect=tests/cases/parity/expected-pass.txt
 size=${PARITY_SAMPLE_SIZE:-12}
 
-# Always run, in jit: rows that guard fixes (#828 jwt and lambda-inferred-result, #829 thread-local-bytes, http-event and
-# a stale-row status).
-fixed=(thread-local-bytes http-event jwt lambda-inferred-result scoped-region)
+# Always run: rows that guard fixes. In jit: #828 jwt and lambda-inferred-result, #829 http-event and a stale-row status;
+# in interp and jit: #829 thread-local-bytes, and the cases whose own checks were wrong (generator-nested-*, the
+# compilation's one value of a global; compile-time-f32-parity, a NaN's unspecified bits).
+fixed=(http-event jwt lambda-inferred-result scoped-region)
+fixedBoth=(thread-local-bytes generator-nested-borrowed generator-nested-index compile-time-f32-parity)
 # Never sampled: rows whose expected status never finishes (they take their known timeout), and rows that depend on
 # the machine (loopback networking, the OpenSSL tools, process and filesystem behaviour under `#`; todo #829 B-D).
 skip=" filesystem linux-process process-capture tls websocket-live http-server signal-watch network-advanced "
@@ -45,7 +47,7 @@ fi
 selected=()
 for (( index = 0; index < size && index < count; index++ )); do
     row=${candidates[$(( (offset + index) % count ))]}
-    [[ " ${selected[*]} ${fixed[*]} " == *" $row "* ]] || selected+=("$row")
+    [[ " ${selected[*]} ${fixed[*]} ${fixedBoth[*]} " == *" $row "* ]] || selected+=("$row")
 done
 run() { # modes output names...
     local modes=$1 output=$2
@@ -57,5 +59,5 @@ run() { # modes output names...
 }
 echo "parity sample: fixed (jit): ${fixed[*]}"
 run jit build/compile-time-parity-sample-fixed "${fixed[@]}"
-echo "parity sample: offset $offset of $count rows (PARITY_SAMPLE_OFFSET=$offset reruns it), interp and jit: ${selected[*]}"
-run "interp jit" build/compile-time-parity-sample "${selected[@]}"
+echo "parity sample: offset $offset of $count rows (PARITY_SAMPLE_OFFSET=$offset reruns it), interp and jit: ${fixedBoth[*]} ${selected[*]}"
+run "interp jit" build/compile-time-parity-sample "${fixedBoth[@]}" "${selected[@]}"
