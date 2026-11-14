@@ -159,6 +159,7 @@ they don't stop you declassifying.
   moves, which is fine for timing, and is one more copy.
 - **Code outside the types.** A `string` or `u32` holding a secret has none of this. `.declassify()` ends it
   by design. The types are only as good as the code that puts a secret in them right away.
+- **Compile time.** Under `#` nothing is protected from timing: a secret computed at compile time is a constant of the build.
 - **Compiler bugs.** The barrier stops LLVM reasoning about values. A pass that changes timing without
   reasoning about them, such as a future backend pass making a carry out of a branch as Xtensa's does,
   isn't stopped by it, only caught when it reaches a fixture.
