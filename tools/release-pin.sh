@@ -164,7 +164,7 @@ if grep -q "'$old_plain'" "$root/README.md" 2>/dev/null; then
 fi
 if git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
     git -C "$root" diff --stat -- tools/bootstrap-compiler.sh README.md docs/bootstrap.md
-    git -C "$root" diff -U0 -- tools/bootstrap-compiler.sh README.md docs/bootstrap.md | grep '^[-+][^-+]' | head -40
+    git -C "$root" diff -U0 -- tools/bootstrap-compiler.sh README.md docs/bootstrap.md | grep '^[-+][^-+]' | sed -n '1,40p'
     echo "review 'git diff': a mention of $old that is history, not the pin, should stay"
 fi
 echo "pinned to $tag (not committed)"
