@@ -22,6 +22,7 @@ import "abla/sys/linux/net"
 import "abla/sys/linux/process"
 import "abla/tls/pure/client"
 import "abla/tls/pure/connection"
+import "abla/tls/pure/handshake"
 import "abla/tls/pure/server"
 import "abla/tls/pure/identity"
 import "abla/tls/pure/verify"
@@ -503,3 +504,231 @@ fun tlsClientIdentityFromPem(certificatePem: string, keyPem: string, passphrase:
 
 /** A client identity from a PKCS#12 container (PBES2, SHA-1 or SHA-256 MAC). */
 fun tlsClientIdentityFromPkcs12(der: string, password: string): TlsIdentity = tlsIdentityFromPkcs12(der, password)
+
+// ---- TlsSession: a client over a descriptor the caller owns and keeps non-blocking ----
+//
+// For a caller that polls itself (a database driver that did its own SSLRequest exchange on the socket first, say): no call
+// here blocks or sets a timeout. `handshake`, `readReady` and `writeReady` do what the socket allows now and say what they
+// wait for (want-read 2, want-write 3) when it does not allow more; the caller polls the descriptor for that and calls again.
+// The descriptor stays the caller's: `close` sends close_notify at best and shuts the connection down, it does not close it.
+// Writes use MSG_NOSIGNAL, so no SIGPIPE is raised.
+
+/** What the peer's certificate must satisfy: nothing (the traffic is encrypted, the signature of the handshake is
+ *  checked, the chain is not), a chain to a trusted root, or the chain and the host name (a DNS name or an IP address,
+ *  by subjectAltName only). The server name is sent in every mode unless `host` is an IP address. */
+val TLS_VERIFY_NONE = 0
+val TLS_VERIFY_CHAIN = 1
+val TLS_VERIFY_HOST = 2
+
+/** The status of handshake, readReady and writeReady: 1 progress or done, 2 wants the socket readable, 3 wants it
+ *  writable, 0 the peer closed the stream cleanly (reads), -1 failed (`detail` says why). */
+val TLS_IO_DONE = 1
+val TLS_IO_WANT_READ = 2
+val TLS_IO_WANT_WRITE = 3
+val TLS_IO_CLOSED = 0
+val TLS_IO_FAILED = -1
+
+/** `bytes` are what a read returned, `written` how many bytes of a write are through to the socket. */
+class TlsIo(val bytes: string, val written: int, val status: int)
+
+class TlsSession(var client: TlsClient, var descriptor: int, var pending: string, var inflight: int, var received: string,
+    var failure: string, var finished: bool)
+
+private fun pureTlsSessionStore(caPath: string): X509TrustStore {
+    if (caPath == "" || caPath == "system") return pureTlsSystemStore()
+    val store = x509TrustStoreFromFile(caPath)
+    if (store == null) X509TrustStore([]) else store
+}
+
+private fun pureTlsSessionVerifier(mode: int, caPath: string): (array<string>, string, int, string, string) -> TlsVerdict {
+    if (mode == TLS_VERIFY_HOST) return tlsX509VerifierLazy({ pureTlsSessionStore(caPath) }, pureTlsNow)
+    if (mode == TLS_VERIFY_CHAIN) {
+        return { chain: array<string>, host: string, scheme: int, content: string, signature: string ->
+            tlsVerifyServerCertificate(chain, "", scheme, content, signature, pureTlsSessionStore(caPath), pureTlsNow(), true)
+        }
+    }
+    { chain: array<string>, host: string, scheme: int, content: string, signature: string ->
+        if (chain.size == 0) tlsRefused(TLS_VERDICT_BAD_CERTIFICATE, "no certificate") else {
+            val leaf = x509ParseDer(chain[0])
+            if (!leaf.ok) tlsRefused(TLS_VERDICT_DECODE_ERROR, "certificate: ${leaf.error}")
+            else tlsCheckSignature(leaf, scheme, content, signature)
+        }
+    }
+}
+
+/** Starts a TLS client on `descriptor` (made non-blocking by the caller, connected, and already past any plaintext
+ *  exchange): the ClientHello is queued, `handshake` sends it. `caPath` names a PEM file of roots ("" or "system": the
+ *  system bundle, or what SSL_CERT_FILE and its friends name). A session that could not start is failed (`ok()` is false,
+ *  `detail()` says why). */
+fun tlsSessionClient(descriptor: int, host: string, mode: int, caPath: string = ""): TlsSession {
+    val config = tlsClientConfig(host, pureTlsSessionVerifier(mode, caPath), tlsPureRandom)
+    val client = tlsClientNew(config)
+    val session = TlsSession(client, descriptor, "", 0, "", "", false)
+    if (descriptor < 0 || host == "" || mode < TLS_VERIFY_NONE || mode > TLS_VERIFY_HOST) {
+        session.failure = "TLS failed at configuration"
+        session.finished = true
+    }
+    session
+}
+
+fun TlsSession.ok(): bool = !this.finished && this.failure == ""
+
+fun TlsSession.descriptor(): int = this.descriptor
+
+/** The reason of the last failure ("" if none). */
+fun TlsSession.detail(): string = this.failure
+
+private fun TlsSession.fail(reason: string): void {
+    if (this.failure == "") this.failure = reason
+    this.finished = true
+    return
+}
+
+/** One send that never blocks and never raises SIGPIPE; the bytes sent, or -11 (EAGAIN) or another -errno. */
+private trusted fun pureTlsSessionSend(descriptor: int, data: string): int {
+    var result = -4
+    while (result == -4) {
+        result = linuxSyscall6(44, descriptor, nativeStringDataAddress(data), data.size, 16448, 0, 0)
+    }
+    result
+}
+
+/** One read that never blocks; the bytes, "" with `eof` or a negative errno in `code`. */
+private class PureTlsSessionRead(val bytes: string, val code: int)
+
+private trusted fun pureTlsSessionRecv(descriptor: int, maximum: int): PureTlsSessionRead {
+    val buffer = nativeByteBuffer(maximum + 1)
+    var count = linuxSyscall3(0, descriptor, nativePointerAddress(buffer.address), maximum)
+    while (count == -4) count = linuxSyscall3(0, descriptor, nativePointerAddress(buffer.address), maximum)
+    if (count > 0) return PureTlsSessionRead(buffer.adoptString(count), 0)
+    buffer.close()
+    PureTlsSessionRead("", if (count == 0) 1 else count)
+}
+
+/** Moves what the machine queued to the pending output and sends what the socket takes: 1 all sent, 3 the socket is full,
+ *  -1 failed. */
+private fun TlsSession.flush(): int {
+    this.pending = this.pending + this.client.takeOutput()
+    while (this.pending.size > 0) {
+        val sent = pureTlsSessionSend(this.descriptor, this.pending)
+        if (sent > 0) {
+            this.pending = this.pending.slice(sent, this.pending.size)
+        } else if (sent == -11) {
+            return 3
+        } else {
+            this.fail("TLS write failed")
+            return -1
+        }
+    }
+    1
+}
+
+/** Reads what the socket has and gives it to the machine: 2 the socket has nothing now, 1 something was processed,
+ *  0 the peer closed the stream, -1 failed. */
+private fun TlsSession.pull(): int {
+    val read = pureTlsSessionRecv(this.descriptor, 16384)
+    if (read.bytes.size > 0) {
+        this.client.feed(read.bytes)
+        return 1
+    }
+    if (read.code == -11) return 2
+    if (read.code == 1) return 0
+    this.fail("TLS read failed")
+    -1
+}
+
+/** Drives the handshake as far as the socket allows: 1 done, 2 wants the socket readable, 3 writable, -1 failed. */
+fun TlsSession.handshake(): int {
+    if (this.finished) return -1
+    var status = 0
+    while (status == 0) {
+        val sent = this.flush()
+        if (sent < 0) return -1
+        if (this.client.failed()) {
+            // The alert the machine queued has been offered to the socket above; the failure is final.
+            this.fail(this.client.error)
+            return -1
+        }
+        if (this.client.connected()) return if (sent == 3) 3 else 1
+        if (sent == 3) {
+            status = 3
+        } else {
+            val pulled = this.pull()
+            if (pulled == 2) status = 2
+            else if (pulled == 0) {
+                this.fail("TLS failed at handshake: the connection closed")
+                return -1
+            } else if (pulled < 0) return -1
+        }
+    }
+    status
+}
+
+/** Up to `maximum` bytes of application data: status 1 with the bytes, 2 or 3 when the socket must become readable
+ *  or writable first, 0 when the peer closed the stream cleanly, -1 failed. */
+fun TlsSession.readReady(maximum: int): TlsIo {
+    if (maximum <= 0 || this.finished) return TlsIo("", 0, -1)
+    while (true) {
+        if (this.received.size == 0) this.received = this.client.takeApplicationData()
+        if (this.received.size > 0) {
+            val count = if (this.received.size > maximum) maximum else this.received.size
+            val chunk = this.received.slice(0, count)
+            this.received = this.received.slice(count, this.received.size)
+            return TlsIo(chunk, 0, 1)
+        }
+        if (this.client.failed()) {
+            this.flush()
+            this.fail(this.client.error)
+            return TlsIo("", 0, -1)
+        }
+        if (this.client.closed()) {
+            this.flush()
+            return TlsIo("", 0, 0)
+        }
+        // A KeyUpdate answer or an alert the machine queued goes out when the socket allows; a full socket does not stop a read.
+        if (this.flush() < 0) return TlsIo("", 0, -1)
+        val pulled = this.pull()
+        if (pulled == 2) return TlsIo("", 0, 2)
+        if (pulled == 0) {
+            this.fail("TLS read failed: the connection closed without close_notify")
+            return TlsIo("", 0, -1)
+        }
+        if (pulled < 0) return TlsIo("", 0, -1)
+    }
+    TlsIo("", 0, -1)
+}
+
+/** Writes from `bytes` at `offset`: status 1 with `written` bytes that are through to the socket (0 only when
+ *  `offset` is at the end), 3 when the socket must become writable first (a partial send is kept: call again with the
+ *  same arguments), -1 failed. */
+fun TlsSession.writeReady(bytes: string, offset: int): TlsIo {
+    if (this.finished || offset < 0) return TlsIo("", 0, -1)
+    if (offset >= bytes.size && this.inflight == 0) return TlsIo("", 0, 1)
+    if (this.inflight == 0) {
+        val remaining = bytes.size - offset
+        val count = if (remaining > 16384) 16384 else remaining
+        if (!this.client.send(bytes.slice(offset, offset + count))) {
+            this.fail(if (this.client.error == "") "TLS write failed: the session is not open" else this.client.error)
+            return TlsIo("", 0, -1)
+        }
+        this.inflight = count
+    }
+    val sent = this.flush()
+    if (sent < 0) return TlsIo("", 0, -1)
+    if (sent == 3) return TlsIo("", 0, 3)
+    val count = this.inflight
+    this.inflight = 0
+    TlsIo("", count, 1)
+}
+
+/** Best effort and never blocking: queues close_notify, offers it to the socket once and shuts the connection down in
+ *  both directions. The descriptor is not closed. */
+fun TlsSession.close(): void {
+    if (this.descriptor >= 0 && !this.finished) {
+        this.client.close()
+        this.flush()
+        linuxSyscall3(48, this.descriptor, 2, 0)
+    }
+    this.finished = true
+    return
+}

@@ -1,0 +1,123 @@
+// TlsSession (abla/tls/pure): a client over a non-blocking socket the program polls itself.
+// Usage: session <mode: none|chain|host> <host> <port> <ca file> <family: 4|6> <action: get|flood|silent> [server pid for flood]
+//   get:    handshake, send a request, read the response to the end, print "result ok <bytes> <wantRead> <wantWrite>".
+//   flood:  handshake, write 16 MB the server does not read: it must see want-write, then a failure; prints
+//           "result flood wantWrite=<n> written=<bytes>".
+//   silent: handshake only (the server never answers): prints how many want-read the poll loop saw.
+// A handshake that fails prints "result failed <detail>". The poll loop is the caller's: the session never blocks.
+import "abla/io"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/sys/linux/net"
+import "abla/tls/pure"
+
+fun decimal(text: string): int {
+    var value = 0
+    for (i in 0 until text.size) value = value * 10 + (text[i] - 48)
+    value
+}
+
+fun main: int {
+    val modeName = processArgument(0)
+    val host = processArgument(1)
+    val port = decimal(processArgument(2))
+    val ca = processArgument(3)
+    val family = processArgument(4)
+    val action = processArgument(5)
+    val stopPid = if (action == "flood") decimal(processArgument(6)) else 0
+    val mode = if (modeName == "none") TLS_VERIFY_NONE else if (modeName == "chain") TLS_VERIFY_CHAIN else TLS_VERIFY_HOST
+    var tcp = if (family == "4") tcpConnectIpv4("127.0.0.1", port, 5000) else tcpConnectIpv6(ipv6Loopback(port), 5000)
+    if (tcp.descriptor < 0) {
+        println("result failed connect")
+        return 1
+    }
+    tcp.setNonblocking(true)
+    val descriptor = tcp.descriptor
+    val session = tlsSessionClient(descriptor, host, mode, ca)
+    var wantRead = 0
+    var wantWrite = 0
+    var status = session.handshake()
+    var rounds = 0
+    while ((status == 2 || status == 3) && rounds < 5000) {
+        if (status == 2) wantRead = wantRead + 1 else wantWrite = wantWrite + 1
+        val polled = linuxPollSocket(descriptor, status == 2, status == 3, 2000)
+        if (polled.timedOut || polled.errorCode != 0) {
+            println("result failed poll timed out ($status)")
+            return 1
+        }
+        status = session.handshake()
+        rounds = rounds + 1
+    }
+    if (status != 1) {
+        println("result failed ${session.detail()}")
+        return 0
+    }
+    if (action == "silent") {
+        println("result handshake wantRead=$wantRead")
+        session.close()
+        return 0
+    }
+    if (action == "flood") {
+        // The server stops reading: a stopped process (SIGSTOP) fills the socket buffers.
+        linuxSyscall2(62, stopPid, 19)
+        val block = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        var body = ""
+        for (i in 0 until 1024) body = body + block
+        var total = 0
+        var offset = 0
+        var floodWantWrite = 0
+        var stalls = 0
+        // 16 MB in 64 KB pieces: a server that never reads fills the socket buffers and the session must say so.
+        while (total < 16 * 1048576 && stalls < 3 && session.ok()) {
+            val written = session.writeReady(body, offset)
+            if (written.status == 1) {
+                total = total + written.written
+                offset = offset + written.written
+                if (offset >= body.size) offset = 0
+            } else if (written.status == 3) {
+                floodWantWrite = floodWantWrite + 1
+                val polled = linuxPollSocket(descriptor, false, true, 300)
+                if (polled.timedOut) stalls = stalls + 1
+            } else {
+                stalls = 99
+            }
+        }
+        linuxSyscall2(62, stopPid, 18)
+        println("result flood wantWrite=$floodWantWrite written=$total")
+        session.close()
+        return 0
+    }
+    val request = "GET / HTTP/1.0\r\n\r\n"
+    var offset = 0
+    while (offset < request.size) {
+        val written = session.writeReady(request, offset)
+        if (written.status == 1) offset = offset + written.written
+        else if (written.status == 3) linuxPollSocket(descriptor, false, true, 2000)
+        else {
+            println("result failed write ${session.detail()}")
+            return 0
+        }
+    }
+    var received = 0
+    var done = false
+    var failure = ""
+    while (!done) {
+        val read = session.readReady(65536)
+        if (read.status == 1) received = received + read.bytes.size
+        else if (read.status == 2) {
+            wantRead = wantRead + 1
+            val polled = linuxPollSocket(descriptor, true, false, 2000)
+            if (polled.timedOut) {
+                failure = "read timed out"
+                done = true
+            }
+        } else if (read.status == 3) linuxPollSocket(descriptor, false, true, 2000)
+        else {
+            if (read.status < 0) failure = session.detail()
+            done = true
+        }
+    }
+    if (failure != "") println("result failed $failure") else println("result ok $received wantRead=$wantRead wantWrite=$wantWrite")
+    session.close()
+    0
+}

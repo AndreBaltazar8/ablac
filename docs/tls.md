@@ -79,3 +79,31 @@ socket. `connection` drives them over a TCP or Unix socket; `verify` is the cert
 certificates and keys. Tests: `tools/test-tls-pure.sh` (RFC 8448 sections 3, 5, 6 and 7 byte for byte, fuzzed input) and
 `tools/test-tls-pure-interop.sh` (live handshakes against `openssl s_server` and `openssl s_client` for every certificate
 type, suite, group and TLS version, mutual TLS, ALPN, Unix sockets, a 6 MB transfer).
+
+## TlsSession: a client over a socket you poll yourself
+
+`abla/tls/pure` also has `TlsSession`, for a program that owns the descriptor and its event loop (a database
+driver that has done its own plaintext exchange on the socket first, such as PostgreSQL's SSLRequest). Nothing in it
+blocks or sets a timeout; it tells you what it needs from the socket:
+
+```abla
+import "abla/tls/pure"
+
+val session = tlsSessionClient(descriptor, "db.example.com", TLS_VERIFY_HOST, "")   // descriptor: connected, non-blocking
+var status = session.handshake()
+while (status == TLS_IO_WANT_READ || status == TLS_IO_WANT_WRITE) {
+    poll(descriptor, status == TLS_IO_WANT_READ, status == TLS_IO_WANT_WRITE)        // your event loop
+    status = session.handshake()
+}
+// status 1: connected; -1: failed, session.detail() says why.
+```
+
+- `handshake()` returns 1 (done), 2 (wait for the socket to be readable), 3 (writable) or -1.
+- `readReady(max)` returns a `TlsIo`: status 1 with `bytes`, 2/3 as above, 0 when the peer closed the stream cleanly, -1.
+- `writeReady(bytes, offset)` takes at most 16 KiB from `offset` and reports `written` only when those bytes are through to
+  the socket; on 3, call again with the same arguments once the socket is writable. A write never raises SIGPIPE.
+- `close()` sends close_notify once without blocking and shuts the connection down; the descriptor stays yours.
+- Verification: `TLS_VERIFY_NONE` encrypts only (the handshake signature is still checked), `TLS_VERIFY_CHAIN` requires a
+  chain to a root in `caPath` ("" or "system": the system bundle, or what `SSL_CERT_FILE` names), `TLS_VERIFY_HOST` also
+  requires the host (a DNS name, or an IP address matched against the certificate's IP entries). The server name is sent in
+  every mode unless the host is an IP address. A CN without a subjectAltName is not accepted in any host check.
