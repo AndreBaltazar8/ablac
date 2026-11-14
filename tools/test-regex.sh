@@ -14,8 +14,8 @@ for mode in --fast release; do
     [[ $mode == release ]] || options+=(--fast)
     "$compiler" build "$root/tests/cases/regex/main.ab" -o "$out/main-$mode" --no-cache "${options[@]}"
     # The pathological patterns must finish quickly: that is linear time.
-    timeout 60 "$out/main-$mode" | grep -qx ok
+    timeout 60 "$out/main-$mode" | grep -x ok >/dev/null
 done
-ABLA_GC_STRESS=1 timeout 300 "$out/main-release" | grep -qx ok
+ABLA_GC_STRESS=1 timeout 300 "$out/main-release" | grep -x ok >/dev/null
 python3 tools/fuzz-regex --compiler "$compiler" --seeds 1 --cases 120
 echo "regex: ok"

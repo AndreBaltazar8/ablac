@@ -46,7 +46,7 @@ for entry in 'single|xs.invalidPop()|0' 'shared|xs.invalidPop()|2' 'shared-two|x
     found=0
     for block in "$out"/block.*; do
         [[ -e $block ]] || continue
-        head -n 1 "$block" | grep -qF ': ownership.' || continue
+        head -n 1 "$block" | grep -F ': ownership.' >/dev/null || continue
         found=1
         grep -qF -e "$expected" "$block" || { cat "$block" >&2; fail "$name: the caller site is missing: $expected"; }
         grep -qF -e "source[generic-helper]:$helper:" "$block" || fail "$name: no generic-helper source"

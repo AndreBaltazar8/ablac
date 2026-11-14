@@ -40,7 +40,7 @@ expect_status_42() {
 "$compiler" build "$project_root/tests/cases/bootstrap/block.ab" \
     --fast -o "$output_directory/block"
 file "$output_directory/block" |
-    grep -q "Mach-O 64-bit executable $expected_architecture"
+    grep "Mach-O 64-bit executable $expected_architecture" >/dev/null
 expect_status_42 "$output_directory/block"
 
 "$compiler" build "$project_root/tests/cases/modules/portable-io.ab" \

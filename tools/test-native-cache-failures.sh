@@ -39,7 +39,7 @@ status=0
 PATH="$work/shims:$PATH" ABLA_LINK_DIRECT=0 ABLA_CACHE_DIR="$work/failed-cache" \
     "$compiler" build "$program" -o "$work/failed" > "$work/failed.log" 2>&1 || status=$?
 [[ $status == 127 ]] || fail "injected linker failure returned $status"
-! find "$work/failed-cache" -name '*.source' -print -quit | grep -q . ||
+! find "$work/failed-cache" -name '*.source' -print -quit | grep . >/dev/null ||
     fail 'failed build left a committed native cache record'
 
 ABLA_CACHE_DIR="$work/good-cache" "$compiler" build "$program" -o "$work/cold"

@@ -47,7 +47,7 @@ wait_for "$test_directory/two/stdout.txt" 'two-a'
 # What a generation ran is waited for when it ends, not when the next replaces it.
 sleep 1
 for server in "${servers[@]}"; do
-    if ps --no-headers -o stat= -s "$server" 2>/dev/null | grep -q Z; then
+    if ps --no-headers -o stat= -s "$server" 2>/dev/null | grep Z >/dev/null; then
         echo 'serve outputs: a finished program stays a zombie' >&2
         exit 1
     fi

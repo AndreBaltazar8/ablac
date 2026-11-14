@@ -31,7 +31,7 @@ for source in $programs $checks; do
             > "$out/$name-$mode.log" 2>&1 || { cat "$out/$name-$mode.log" >&2; fail "$name $mode did not build"; }
         file_kind=$(readelf -h "$out/$name-$mode" | awk '/Machine:/ { print $2 }')
         [[ $file_kind == AArch64 ]] || fail "$name $mode is not an AArch64 executable ($file_kind)"
-        if readelf -d "$out/$name-$mode" 2> /dev/null | grep -q NEEDED || readelf -l "$out/$name-$mode" | grep -q INTERP; then
+        if readelf -d "$out/$name-$mode" 2> /dev/null | grep NEEDED >/dev/null || readelf -l "$out/$name-$mode" | grep INTERP >/dev/null; then
             fail "$name $mode needs a shared library or a loader"
         fi
         [[ $have_qemu -eq 1 ]] || continue

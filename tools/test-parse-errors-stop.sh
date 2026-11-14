@@ -20,7 +20,7 @@ check() { # file count (count = expected `error[` lines, 0 = any)
     set -e
     [[ $status -ne 0 ]] || { echo "$file: built"; exit 1; }
     [[ $status -ne 124 ]] || { echo "$file: parser recovery hung"; exit 1; }
-    if grep '^error\[' <<<"$diagnostics" | grep -qv '^error\[E_PARSE_'; then
+    if grep '^error\[' <<<"$diagnostics" | grep -v '^error\[E_PARSE_' >/dev/null; then
         echo "$file: errors after the parse errors"; echo "$diagnostics"; exit 1
     fi
     errors=$(grep -c '^error\[E_PARSE_' <<<"$diagnostics" || true)

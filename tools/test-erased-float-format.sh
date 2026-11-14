@@ -24,7 +24,7 @@ done
 "$out/staged"
 "$compiler" build "$root/tests/cases/erased-float-format/staged-integer.ab" -o "$out/staged-integer" --fast --no-cache
 "$out/staged-integer"
-if llvm-nm "$out/staged-integer" | grep -q ' abla_erased_to_string$'; then
+if llvm-nm "$out/staged-integer" | grep ' abla_erased_to_string$' >/dev/null; then
     echo 'a staged program without erased floats retained the float formatter' >&2
     exit 1
 fi

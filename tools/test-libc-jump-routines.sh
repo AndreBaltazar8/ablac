@@ -23,10 +23,10 @@ for mode in release fast; do
     [[ $status == 42 && $actual == 'libc jump routines: 50 of 50 rounds agree' ]] || {
         printf 'libc jump routines (%s): status %s: %s\n' "$mode" "$status" "$actual" >&2; exit 1; }
     for routine in _setjmp _longjmp; do
-        if nm -D --undefined-only "$out/$mode" | awk '{print $NF}' | sed 's/@.*//' | grep -qx "$routine"; then
+        if nm -D --undefined-only "$out/$mode" | awk '{print $NF}' | sed 's/@.*//' | grep -x "$routine" >/dev/null; then
             echo "libc jump routines ($mode): $routine is imported" >&2; exit 1
         fi
-        nm "$out/$mode" | grep -qE " t $routine\$" || {
+        nm "$out/$mode" | grep -E " t $routine\$" >/dev/null || {
             echo "libc jump routines ($mode): $routine is not a local definition" >&2; exit 1; }
     done
 done

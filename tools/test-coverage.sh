@@ -87,7 +87,7 @@ ABLA_COVERAGE_OUT="$out/nested/plain-child.txt" "$out/nested/child"
 [ ! -e "$out/nested/plain-child.txt" ] || { echo "coverage: unflagged child wrote a file"; exit 1; }
 "$compiler" build tests/cases/coverage-nested/outer.ab -o "$out/nested/flagged" --fast --coverage-functions > "$out/nested/flagged.log" 2>&1
 [ "$(grep -c 'warning\[W_COVERAGE_TARGET\].*coverage-wasm.*wasm32-module' "$out/nested/flagged.log")" = 1 ] || { cat "$out/nested/flagged.log"; echo "coverage: expected one child target warning"; exit 1; }
-nm "$out/nested/libcov.o" | grep -q " W abla_coverage_write$" || { echo "coverage: nested object missing weak writer"; exit 1; }
+nm "$out/nested/libcov.o" | grep " W abla_coverage_write$" >/dev/null || { echo "coverage: nested object missing weak writer"; exit 1; }
 clang tests/cases/coverage-lib/caller.c "$out/nested/libcov.o" -o "$out/nested/caller"
 "$out/nested/caller" "$out/nested/library.txt"
 grep -qx 'tests/cases/coverage-lib/sub/helper.ab' "$out/nested/library.txt" || { echo "coverage: nested library missing hits"; exit 1; }

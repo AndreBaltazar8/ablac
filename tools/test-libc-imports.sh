@@ -72,7 +72,7 @@ for program in tests/cases/libc-imports/*.ab; do
     for mode in release fast; do
         binary=$out/$name.$mode
         static=1
-        if readelf -lW "$binary" | grep -q INTERP || readelf -dW "$binary" 2>/dev/null | grep -q NEEDED ||
+        if readelf -lW "$binary" | grep INTERP >/dev/null || readelf -dW "$binary" 2>/dev/null | grep NEEDED >/dev/null ||
             [[ -n $("$nm" --undefined-only "$binary" 2>/dev/null) ]]; then
             static=0
         fi
@@ -94,7 +94,7 @@ if ! "$compiler" build tests/cases/libc-imports-http/main.ab -o "$out/http-plain
     tail -n 20 "$out/http-plain.log" >&2
     exit 1
 fi
-if readelf -d "$out/http-plain" | grep -Eq 'NEEDED.*(libssl|libcrypto)'; then
+if readelf -d "$out/http-plain" | grep -E 'NEEDED.*(libssl|libcrypto)' >/dev/null; then
     echo "libc imports: a program that opens no TLS connection links OpenSSL" >&2
     exit 1
 fi
@@ -106,11 +106,11 @@ if ! "$compiler" build tests/cases/libc-imports-aslr/main.ab -o "$out/aslr" --no
     tail -n 20 "$out/aslr.log" >&2
     exit 1
 fi
-if readelf -lW "$out/aslr" | grep -q INTERP || readelf -dW "$out/aslr" 2>/dev/null | grep -q NEEDED; then
+if readelf -lW "$out/aslr" | grep INTERP >/dev/null || readelf -dW "$out/aslr" 2>/dev/null | grep NEEDED >/dev/null; then
     echo "libc imports: the address program links libc" >&2
     exit 1
 fi
-readelf -hW "$out/aslr" | grep -q 'Type: *DYN' ||
+readelf -hW "$out/aslr" | grep 'Type: *DYN' >/dev/null ||
     { echo "libc imports: the libc-free executable is not position independent" >&2; exit 1; }
 if [[ $(cat /proc/sys/kernel/randomize_va_space 2>/dev/null || echo 2) != 0 ]]; then
     addresses=$(for _ in 1 2 3 4 5 6 7 8; do "$out/aslr"; done | sort -u | wc -l)
@@ -131,8 +131,8 @@ sort -u -o "$actual" "$actual"
 # above, has none to report.)
 for subject in $(for program in tests/cases/libc-imports/*.ab; do
     name=$(basename "$program" .ab); echo "$name.release $name.fast"; done) compiler; do
-    if [[ $subject != compiler ]] && ! readelf -lW "$out/$subject" | grep -q INTERP &&
-        ! readelf -dW "$out/$subject" 2>/dev/null | grep -q NEEDED &&
+    if [[ $subject != compiler ]] && ! readelf -lW "$out/$subject" | grep INTERP >/dev/null &&
+        ! readelf -dW "$out/$subject" 2>/dev/null | grep NEEDED >/dev/null &&
         [[ -z $("$nm" --undefined-only "$out/$subject" 2>/dev/null) ]]; then
         continue
     fi
@@ -158,7 +158,7 @@ if ! "$compiler" build tests/cases/libc-imports-library/main.ab --emit shared-li
     tail -n 20 "$out/library.log" >&2
     exit 1
 fi
-if readelf -d "$out/library.so" | grep -Eq 'NEEDED.*(lib(c|pthread|ssl|crypto)\.so)'; then
+if readelf -d "$out/library.so" | grep -E 'NEEDED.*(lib(c|pthread|ssl|crypto)\.so)' >/dev/null; then
     echo "libc imports: a shared library that brings no C library names one" >&2
     readelf -d "$out/library.so" | grep NEEDED >&2
     exit 1

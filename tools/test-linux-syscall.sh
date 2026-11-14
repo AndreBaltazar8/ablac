@@ -16,7 +16,7 @@ for mode in "" --fast; do
     [[ $status -eq 42 ]] || { echo "linux syscall ${mode:-release}: returned $status" >&2; exit 1; }
 done
 # On x86-64 Linux neither libc's syscall() nor its errno may be imported.
-if [[ $(uname -m) == x86_64 ]] && nm -D --undefined-only "$out/program" | awk '{ print $NF }' | grep -qE '^(syscall|__errno_location)(@|$)'; then
+if [[ $(uname -m) == x86_64 ]] && nm -D --undefined-only "$out/program" | awk '{ print $NF }' | grep -E '^(syscall|__errno_location)(@|$)' >/dev/null; then
     echo 'linux syscall: the program still imports syscall or __errno_location' >&2
     exit 1
 fi

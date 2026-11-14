@@ -17,7 +17,7 @@ rm -rf "$out"
 mkdir -p "$out"
 cases=tests/cases/x64-library
 needs() { # library pattern: whether its dynamic section names a library matching the pattern
-    readelf -d "$1" | grep -Eq "NEEDED.*$2"
+    readelf -d "$1" | grep -E "NEEDED.*$2" >/dev/null
 }
 for mode in release fast; do
     flags=(--no-cache)

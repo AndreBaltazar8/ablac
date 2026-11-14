@@ -216,7 +216,7 @@ import "abla/io"
 fun main { println("hello") }
 EOF
 "$compiler" build "$out/src/hello.ab" -o "$out/hello" --no-cache
-! llvm-nm "$out/hello" 2>/dev/null | grep -qE '__multi3' || { echo "hello has __multi3" >&2; exit 1; }
+! llvm-nm "$out/hello" 2>/dev/null | grep -E '__multi3' >/dev/null || { echo "hello has __multi3" >&2; exit 1; }
 "$compiler" --emit-llvm "$out/src/hello.ab" > "$out/hello.ll" 2>/dev/null
 ! grep -qE "i256|i128|$type" "$out/hello.ll" || { echo "hello has a $type in it" >&2; exit 1; }
 echo "ok   hello: no trace of it"

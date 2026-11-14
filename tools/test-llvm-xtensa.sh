@@ -12,7 +12,7 @@ project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 out=$(mktemp -d)
 trap 'rm -rf -- "$out"' EXIT
 
-llc --version | grep -q 'xtensa '
+llc --version | grep 'xtensa ' >/dev/null
 hidden_options=$(llc --help-hidden)
 for option in xtensa-direct-calls xtensa-narrow-branches xtensa-text-section-literals; do
     grep -q -- "--$option" <<<"$hidden_options"
@@ -75,7 +75,7 @@ chmod +x "$out/tools/llc"
 PATH="$out/tools:$PATH" "$compiler" build \
     "$project_root/tests/cases/f32/xtensa.ab" -o "$out/fixture.o" --no-cache \
     --target-triple xtensa-esp-unknown-elf --object-format elf --emit object
-llvm-readobj --file-headers "$out/fixture.o" | grep -q 'Machine: EM_XTENSA'
+llvm-readobj --file-headers "$out/fixture.o" | grep 'Machine: EM_XTENSA' >/dev/null
 
 # The intrinsics whose inline assembly the compiler writes: LLVM's Xtensa backend
 # takes `r` for an address register and rejects `a`.

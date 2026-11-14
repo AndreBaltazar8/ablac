@@ -189,7 +189,7 @@ printf '%s\n' "$good" >"$root/tools/bootstrap-compiler.sh"
 "$pin" v9.9.9 --dir "$release" --root "$root" >"$work/out.txt" 2>&1 || { cat "$work/out.txt" >&2; fail "release-pin refused a good release"; }
 grep -q '^version=v9.9.9$' "$root/tools/bootstrap-compiler.sh" || fail "the version was not moved"
 for platform in x86_64-linux x86_64-macos arm64-macos; do
-    grep -A1 "artifact=ablac-$platform$" "$root/tools/bootstrap-compiler.sh" | grep -q "platform_sha256=$(sha "$release/ablac-$platform")$" ||
+    grep -A1 "artifact=ablac-$platform$" "$root/tools/bootstrap-compiler.sh" | grep "platform_sha256=$(sha "$release/ablac-$platform")$" >/dev/null ||
         fail "the $platform sha256 was not pinned"
 done
 grep -q 'from `v9.9.9`' "$root/README.md" || fail "README.md was not moved"

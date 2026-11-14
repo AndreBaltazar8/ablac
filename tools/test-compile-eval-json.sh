@@ -97,7 +97,7 @@ for target in host wasm; do
         ABLA_COMPILE_EVAL=$tier "$compiler" build "$input" -o "$out/program" --fast --no-cache >"$out/intrinsics-$target-$tier.log" 2>&1 ||
             { cat "$out/intrinsics-$target-$tier.log" >&2; fail "intrinsics $target $tier: the build failed"; }
         if [[ $target == host ]]; then
-            "$out/program" | grep -q '^json intrinsics ok ' || fail "intrinsics $target $tier: the digests differ"
+            "$out/program" | grep '^json intrinsics ok ' >/dev/null || fail "intrinsics $target $tier: the digests differ"
         else
             "$out/program"
             node --input-type=module - "$out/intrinsics.wasm" <<'NODE'

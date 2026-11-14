@@ -199,8 +199,8 @@ import "abla/crypto"
 fun main: int = if (sha512("abc").size == 64) 0 else 1
 PROGRAM
 "$compiler" build "$out/portable.ab" -o "$out/portable" --fast --no-cache > "$out/portable.log" 2>&1 || fail "portable build"
-if readelf -d "$out/portable" 2>/dev/null | grep -q -E 'libcrypto|libssl'; then fail "abla/crypto alone links OpenSSL"; else echo "ok   abla/crypto alone doesn't link OpenSSL"; fi
-readelf -d "$tool" | grep -q libcrypto && echo "ok   abla/crypto/hosted links OpenSSL" || fail "abla/crypto/hosted doesn't link OpenSSL"
+if readelf -d "$out/portable" 2>/dev/null | grep -E 'libcrypto|libssl' >/dev/null; then fail "abla/crypto alone links OpenSSL"; else echo "ok   abla/crypto alone doesn't link OpenSSL"; fi
+readelf -d "$tool" | grep libcrypto >/dev/null && echo "ok   abla/crypto/hosted links OpenSSL" || fail "abla/crypto/hosted doesn't link OpenSSL"
 
 key_text=$(sed -n 2p "$keys/k1024.pem")
 if grep -l -F "$key_text" "$out"/*.log > /dev/null 2>&1; then fail "a log holds key material"; else echo "ok   no key material in the logs"; fi

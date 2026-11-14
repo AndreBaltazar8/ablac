@@ -184,7 +184,7 @@ else
 fi
 
 # --- What links what --------------------------------------------------------------------------
-if readelf -d "$tool" 2>/dev/null | grep -q -E 'libcrypto|libssl'; then fail "abla/crypto/rsa links OpenSSL"; else echo "ok   no OpenSSL linked"; fi
+if readelf -d "$tool" 2>/dev/null | grep -E 'libcrypto|libssl' >/dev/null; then fail "abla/crypto/rsa links OpenSSL"; else echo "ok   no OpenSSL linked"; fi
 key_text=$(sed -n 2p "$keys/k1024.pem")
 if grep -l -F "$key_text" "$out"/*.log > /dev/null 2>&1; then fail "a log holds key material"; fi
 

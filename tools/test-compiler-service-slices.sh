@@ -49,7 +49,7 @@ for (const entry of WebAssembly.Module.exports(new WebAssembly.Module(readFileSy
 # Whether the module has a function named `$2` (an extended regex) at all: its
 # name section names functions `<module>.<function>`.
 wasm_has_function() {
-    llvm-readobj --symbols "$1" | grep -Eq "Name: ([^ ]*\.)?($2)\$"
+    llvm-readobj --symbols "$1" | grep -E "Name: ([^ ]*\.)?($2)\$" >/dev/null
 }
 
 build_slice() {

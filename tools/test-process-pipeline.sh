@@ -26,7 +26,7 @@ if [[ $(uname -s) == Linux ]]; then
     # A --fast build does not inline, so the choice of fork must be folded away before code is
     # emitted: on x86-64 Linux the program must not import libc fork or signal at all.
     "$compiler" build tests/cases/process-pipeline/main.ab -o build/process-pipeline-test/main-fast --fast --no-cache
-    if [[ $(uname -m) == x86_64 ]] && nm -D --undefined-only build/process-pipeline-test/main-fast 2>/dev/null | awk '{ print $NF }' | grep -qE '^(fork|signal)(@|$)'; then
+    if [[ $(uname -m) == x86_64 ]] && nm -D --undefined-only build/process-pipeline-test/main-fast 2>/dev/null | awk '{ print $NF }' | grep -E '^(fork|signal)(@|$)' >/dev/null; then
         echo 'process pipeline: a --fast program still imports libc fork or signal' >&2
         exit 1
     fi

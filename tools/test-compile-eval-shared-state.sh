@@ -63,7 +63,7 @@ NODE
                 }
                 if [[ $name == readonly ]]; then
                     pos=$(offset '#lookup()')
-                    grep '^note\[ct-jit\]: native at ' "$log" | grep -Fq "readonly.ab:$pos"
+                    grep '^note\[ct-jit\]: native at ' "$log" | grep -F "readonly.ab:$pos" >/dev/null
                 elif [[ $name == member-* || $name == interface-* || $name == operator-builtin || $name == operator-scalar || $name == operator-generic || $name == operator-compound || $name == operator-unary || $name == operator-string ]]; then
                     # X (a call of B.touch; the sum of two ints) and Y (a call of A.touch or of Box.plus: a write
                     # of `shared`).
@@ -75,10 +75,10 @@ NODE
                     posY=$(( $(offset 'val Y = #') + 8 ))
                     grep -Fq "note[ct-jit]: interpreted at $((posY+1)):" "$log" ||
                         { echo "$name $target $tier: Y was not interpreted" >&2; exit 1; }
-                    grep -F "note[ct-jit]: interpreted at $((posY+1)):" "$log" | grep -q 'ordinary mutable global shared may be written at ' ||
+                    grep -F "note[ct-jit]: interpreted at $((posY+1)):" "$log" | grep 'ordinary mutable global shared may be written at ' >/dev/null ||
                         { echo "$name $target $tier: Y was not interpreted for the write" >&2; exit 1; }
                     if [[ $name != operator-generic && $target == wasm ]]; then
-                        grep '^note\[ct-jit\]: native at ' "$log" | grep -Fq "$name.ab:$posX" ||
+                        grep '^note\[ct-jit\]: native at ' "$log" | grep -F "$name.ab:$posX" >/dev/null ||
                             { echo "$name $target $tier: X was not native" >&2; exit 1; }
                     else
                         grep -Fq "note[ct-jit]: interpreted at $((posX+1)):" "$log" ||
@@ -95,7 +95,7 @@ NODE
                     for binding in A B D; do
                         pos=$(offset "val $binding = #")
                         pos=$((pos + 8))
-                        if grep '^note\[ct-jit\]: native at ' "$log" | grep -Fq "$name.ab:$pos"; then
+                        if grep '^note\[ct-jit\]: native at ' "$log" | grep -F "$name.ab:$pos" >/dev/null; then
                             echo "mutable site unexpectedly native: $name:$pos" >&2; exit 1
                         fi
                         fallback=$(grep -F "note[ct-jit]: interpreted at $((pos+1)):" "$log")

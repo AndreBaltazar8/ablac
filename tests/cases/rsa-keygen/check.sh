@@ -87,7 +87,7 @@ lam = l(p - 1, q - 1)
 BC
 } | bc)
 count=$(printf '%s\n' "$results" | grep -c ' 1$' || true)
-if [[ $count != 17 ]] || printf '%s\n' "$results" | grep -q ' 0$'; then
+if [[ $count != 17 ]] || printf '%s\n' "$results" | grep ' 0$' >/dev/null; then
     echo "RSA $size key failed the parameter checks:" >&2
     printf '%s\n' "$results" >&2
     exit 1

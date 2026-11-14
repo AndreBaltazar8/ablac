@@ -21,11 +21,11 @@ for triple in x86_64-unknown-linux-gnu i386-unknown-linux-gnu; do
     if [[ -n $alias_target ]]; then symbol=$alias_target; fi
     body=$(sed -n "/^define .*@$symbol(/,/^}/p" "$output-$triple.opt.ll")
     test -n "$body"
-    if printf '%s\n' "$body" | grep -Eq 'alloca|\bcall\b|\binvoke\b|load|store'; then
+    if printf '%s\n' "$body" | grep -E 'alloca|\bcall\b|\binvoke\b|load|store' >/dev/null; then
         printf '%s\n' "$body" >&2
         echo "scalar default unboxing retained runtime machinery on $triple" >&2
         exit 1
     fi
-    printf '%s\n' "$body" | grep -Eq 'add( (nuw|nsw))* i32 .*[, ]2$'
+    printf '%s\n' "$body" | grep -E 'add( (nuw|nsw))* i32 .*[, ]2$' >/dev/null
 done
 echo 'PASS: scalar defaults eliminate boxes on 32/64-bit LLVM; pointer byte offsets and wrapping execute correctly'

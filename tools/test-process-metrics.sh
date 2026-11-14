@@ -24,7 +24,7 @@ for mode in "" --fast; do
     "$compiler" build "$project_root/tests/cases/modules/process-metrics.ab" \
         --target x86_64-linux --emit object $mode \
         -o "$output_directory/linux$mode.o" 2>/dev/null
-    if nm -u "$output_directory/linux$mode.o" | grep -q proc_pidinfo; then
+    if nm -u "$output_directory/linux$mode.o" | grep proc_pidinfo >/dev/null; then
         echo "process metrics: the x86_64-linux object$mode references proc_pidinfo"
         exit 1
     fi
