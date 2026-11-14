@@ -1,0 +1,508 @@
+// Batch C of the port: the ownership families of tools/fuzz-differential. Resource classes whose drop() logs to the
+// prelude's global `dropLog` show the order and number of drops; nested_generator and resource_drop compare that log
+// across the modes, while default_owner, ownership_lifetime and fresh_select also compute the expected log here
+// (as the Python did) and print FUZZ_ORACLE_FAILURE when a mode's log differs from it.
+import "abla/text"
+import "./prng.ab"
+import "./gen.ab"
+import "./gen_types.ab"
+
+fun fuzzBool(value: bool): string = if (value) "true" else "false"
+
+/** The drop log as the checks print it: every event followed by a comma. */
+fun fuzzEvents(events: array<int>): string {
+    var text = ""
+    for (event in events) text = text + "$event,"
+    text
+}
+
+fun fuzzWith(values: array<string>, more: array<string>): array<string> {
+    val all: array<string> = []
+    for (value in values) all.append(value)
+    for (value in more) all.append(value)
+    all
+}
+
+/** The check function that runs `action` and compares the drop log with `expected`; `detail` adds what it saw. */
+fun fuzzOracleLines(definitions: array<string>, index: int, action: string, expected: string, detail: bool): array<string> {
+    val failure = if (detail) "\"FUZZ_ORACLE_FAILURE:\" + actual" else "\"FUZZ_ORACLE_FAILURE\""
+    fuzzWith(definitions, ["fun c$index(): string {", "    dropLog.clear()", "    $action", "    var actual = \"\"",
+        "    for (event in dropLog) actual += \"\${event},\"", "    if (actual != \"$expected\") return $failure",
+        "    actual", "}"])
+}
+
+/** Loop over a live owner's generator across an outer generator's yields. */
+fun FuzzGen.nestedGeneratorCheck(index: int): FuzzCheck {
+    val seat = this.r.range(10, 90)
+    val limit = this.r.range(1, 5)
+    val shape = this.r.pick(["field", "index", "tempfield", "tempindex", "tempmixed"])
+    val mixed = this.r.chance(0.5)
+    val choice = this.r.pick(["true", "false"])
+    val innerStop = this.r.pick(["true", "false"])
+    val outerStop = this.r.below(3)
+    var owner = ""
+    var place = ""
+    if (shape == "field") {
+        owner = "    val owner = GenHolder(ticketGen($seat, $limit))"
+        place = "owner.gen"
+    } else if (shape == "index") {
+        owner = "    val owner: array<Generator<int>> = [ticketGen($seat, $limit)]"
+        place = "owner[0]"
+    } else if (shape == "tempfield") {
+        place = "TempGenOwner(ticketGen($seat, $limit), ${seat + 200}).gen"
+    } else if (shape == "tempindex") {
+        place = "[TempGenOwner(ticketGen($seat, $limit), ${seat + 200})][0].gen"
+    } else {
+        owner = "    val owner = TempGenOwner(ticketGen($seat, $limit), ${seat + 200})"
+        val ownerChoice = this.r.pick(["true", "false"])
+        place = "(if ($ownerChoice) TempGenOwner(ticketGen(${seat + 10}, $limit), ${seat + 210}) else owner).gen"
+    }
+    val source = if (mixed) "if ($choice) $place else ticketGen(${seat + 100}, $limit)" else place
+    val lines: array<string> = ["fun nested$index(): Generator<int> = generator {", owner,
+        "    yield 0", "    for (value in $source) {", "        yield value",
+        "        if ($innerStop) break", "    }", "}", "",
+        "fun c$index(): string {", "    dropLog.clear()", "    var total = 0",
+        "    for (value in nested$index()) {", "        total += value"]
+    if (outerStop == 0) {
+        lines.append("        break")
+    } else if (outerStop == 1) {
+        lines.append("        if (value != 0) break")
+    }
+    for (line in ["    }", "    var out = \"\${total}:\"", "    for (seat in dropLog) out = out + \"\${seat},\"", "    out",
+        "}"]) lines.append(line)
+    FuzzCheck(lines, "c$index()", "str", index)
+}
+
+/** #790: default-argument and branch temporaries, with a drop-order oracle. */
+fun FuzzGen.defaultOwnerCheck(index: int): FuzzCheck {
+    val seat = this.r.range(10, 99)
+    val kind = this.r.pick(["positional", "named", "constructor", "if", "when"])
+    val definitions: array<string> = []
+    var expression = ""
+    var value = seat
+    var drops: array<int> = [seat + 200, seat]
+    if (kind == "positional" || kind == "named") {
+        definitions.append("fun defaultOwner$index(tag: int, value: int = TempTicketOwner(issue(tag), tag + 200).ticket.seat): int = value")
+        expression = if (kind == "positional") "defaultOwner$index($seat)" else "defaultOwner$index(tag = $seat)"
+    } else if (kind == "constructor") {
+        definitions.append("class DefaultOwnerBox$index(val tag: int, val value: int = TempTicketOwner(issue(tag), tag + 200).ticket.seat)")
+        expression = "DefaultOwnerBox$index($seat).value"
+    } else {
+        val flag = this.r.chance(0.5)
+        val nested = "TempTicketOwner(issue(TempTicketOwner(issue($seat), ${seat + 200}).ticket.seat + 1), ${seat + 201})"
+        val simple = "TempTicketOwner(issue(${seat + 2}), ${seat + 202})"
+        val owner = if (kind == "if") "if (${fuzzBool(flag)}) $nested else $simple" else
+            "when (${if (flag) 1 else 0}) { 1 -> $nested else -> $simple }"
+        expression = "show(($owner).ticket)"
+        if (flag) {
+            value = seat + 1
+            drops = [seat + 201, seat + 1, seat + 200, seat]
+        } else {
+            value = seat + 2
+            drops = [seat + 202, seat + 2]
+        }
+    }
+    val expected = "$value:" + fuzzEvents(drops)
+    val lines = fuzzWith(definitions, ["fun c$index(): string {", "    dropLog.clear()",
+        "    val result = $expression", "    var actual = \"\${result}:\"",
+        "    for (seat in dropLog) actual = actual + \"\${seat},\"",
+        "    if (actual != \"$expected\") return \"FUZZ_ORACLE_FAILURE\"", "    actual", "}"])
+    FuzzCheck(lines, "c$index()", "str", index)
+}
+
+/** Exit, match, receiver and container lifetime order, with a drop-order oracle. */
+fun FuzzGen.ownershipLifetimeCheck(index: int): FuzzCheck {
+    val n = this.r.range(10, 90)
+    val kind = this.r.pick(["return", "break", "continue", "when", "match", "extension", "operator", "receiver", "array",
+        "map"])
+    var definitions: array<string> = []
+    var action = ""
+    val events: array<int> = []
+    if (kind == "return") {
+        val nested = this.r.chance(0.5)
+        definitions = ["fun ownedBody$index(): int {", "    defer { dropLog.append(${n + 300}) }"]
+        if (nested) {
+            for (line in ["    if (true) {", "        defer { dropLog.append(${n + 301}) }",
+                "        return TempTicketOwner(issue($n), ${n + 200}).ticket.seat", "    }", "    0"]) definitions.append(line)
+        } else {
+            definitions.append("    return TempTicketOwner(issue($n), ${n + 200}).ticket.seat")
+        }
+        definitions.append("}")
+        action = "val result = ownedBody$index()"
+        events.append(n + 200)
+        events.append(n)
+        if (nested) events.append(n + 301)
+        events.append(n + 300)
+    } else if (kind == "break" || kind == "continue") {
+        definitions = ["fun ownedBody$index(): void {", "    for (i in 0 until 1) {",
+            "        defer { dropLog.append(${n + 300}) }",
+            "        showPair(TempTicketOwner(issue($n), ${n + 200}).ticket, if (true) { $kind } else issue(1))",
+            "    }", "}"]
+        action = "ownedBody$index()"
+        for (event in [n + 200, n, n + 300]) events.append(event)
+    } else if (kind == "when") {
+        action = "when (${n + 1}) { TempTicketOwner(issue($n), ${n + 200}).ticket.seat -> dropLog.append(900) " +
+            "TempTicketOwner(issue(${n + 1}), ${n + 201}).ticket.seat -> dropLog.append(901) else -> dropLog.append(902) }"
+        for (event in [n + 200, n, n + 201, n + 1, 901]) events.append(event)
+    } else if (kind == "match") {
+        definitions = ["fun ownedBody$index(): void {", "    val held = issue($n)",
+            "    when (held) { issue(${n + 1}) -> dropLog.append(900) else -> dropLog.append(901) }", "}"]
+        action = "ownedBody$index()"
+        for (event in [n + 1, 901, n]) events.append(event)
+    } else if (kind == "extension") {
+        action = "issue($n).fuzzLook()"
+        for (event in [1000 + n, n]) events.append(event)
+    } else if (kind == "operator") {
+        action = "val result = issue($n) + issue(${n + 1})"
+        for (event in [800, n + 1, n]) events.append(event)
+    } else if (kind == "receiver") {
+        val fresh = this.r.chance(0.5)
+        val flag = fuzzBool(fresh)
+        val receiver = this.r.pick(["if ($flag) issue($n) else held", "when ($flag) { true -> issue($n) else -> held }",
+            "if (true) (if ($flag) issue($n) else held) else held",
+            "if ($flag) { val result = issue($n); result } else held"])
+        val extension = this.r.chance(0.5)
+        val method = if (extension) "fuzzLook" else "twice"
+        definitions = ["fun ownedBody$index(): void {", "    val held = issue(${n + 1})", "    ($receiver).$method()",
+            "    return", "}"]
+        action = "ownedBody$index()"
+        if (extension) events.append(1000 + (if (fresh) n else n + 1))
+        if (fresh) events.append(n)
+        events.append(n + 1)
+    } else {
+        var mode = this.r.pick(["fresh", "borrowed", "temporary"])
+        val machine = this.r.chance(0.5)
+        val stop = this.r.chance(0.5)
+        val outerStop = machine && this.r.chance(0.5)
+        val keys = kind == "map" && this.r.chance(0.5)
+        val body: array<string> = []
+        var source = ""
+        if (kind == "array") {
+            if (mode == "borrowed") {
+                body.append("    val owner = [issue($n), issue(${n + 1})]")
+                source = "owner"
+            } else if (mode == "temporary") {
+                source = "FuzzTicketOwner([issue($n), issue(${n + 1})], ${n + 200}).items"
+            } else if (this.r.chance(0.5)) {
+                body.append("    val owner = [issue($n), issue(${n + 1})]")
+                source = "move(owner)"
+            } else {
+                source = "[issue($n), issue(${n + 1})]"
+            }
+        } else {
+            // A map's values are borrowed; a temporary map is retained by the loop.
+            val view = if (keys) "keys" else "values"
+            if (mode == "fresh") {
+                source = "fuzzTicketMap($n).$view()"
+            } else {
+                body.append("    val owner = fuzzTicketMap($n)")
+                source = (if (mode == "temporary") "move(owner)" else "owner") + ".$view()"
+            }
+            if (mode != "borrowed") mode = "temporary"
+        }
+        body.append("    for (item in $source) {")
+        body.append(if (keys) "        dropLog.append(if (item == \"a\") ${1000 + n} else ${1001 + n})" else "        item.fuzzLook()")
+        if (machine) body.append(if (keys) "        yield 1" else "        yield item.seat")
+        if (stop) body.append("        break")
+        body.append("    }")
+        val header = if (machine) "fun ownedBody$index(): Generator<int> = generator {" else "fun ownedBody$index(): void {"
+        definitions = fuzzWith(fuzzWith([header], body), ["}"])
+        action = if (machine) "for (item in ownedBody$index()) { ${if (outerStop) "break" else ""} }" else "ownedBody$index()"
+        val stopped = stop || outerStop
+        val visited: array<int> = if (stopped) [n] else [n, n + 1]
+        for (value in visited) {
+            events.append(1000 + value)
+            if (mode == "fresh") events.append(value)
+        }
+        if (kind == "array" && mode == "temporary") events.append(n + 200)
+        if (mode != "fresh") {
+            events.append(n)
+            events.append(n + 1)
+        } else if (stopped) {
+            events.append(n + 1)
+        }
+    }
+    FuzzCheck(fuzzOracleLines(definitions, index, action, fuzzEvents(events), false), "c$index()", "str", index)
+}
+
+/** #804: a fresh resource chosen by `??` as a borrowed or owned argument, a field projection owner, a receiver and a
+ * loop source, and a fresh resource as a `when` subject (through the selected arm, across return/break/defer and a
+ * yield), with a drop-order oracle. */
+fun FuzzGen.freshSelectCheck(index: int): FuzzCheck {
+    val n = this.r.range(10, 90)
+    val give = this.r.chance(0.5)
+    val flag = fuzzBool(give)
+    val kind = this.r.pick(["argument", "field", "receiver", "loop", "subject"])
+    var definitions: array<string> = []
+    var action = ""
+    var events: array<int> = []
+    val chosen = if (give) n else n + 1
+    val picked = "maybeIssue($n, $flag) ?? issue(${n + 1})"
+    if (kind == "argument") {
+        val call = this.r.pick(["plain", "named", "method", "lambda", "owned", "owned-lambda"])
+        if (call == "plain") {
+            action = "fuzzTake($picked)"
+            events = [2000 + chosen, chosen]
+        } else if (call == "named") {
+            action = "fuzzTake(ticket = $picked)"
+            events = [2000 + chosen, chosen]
+        } else if (call == "method") {
+            action = "FuzzObserver().take($picked)"
+            events = [2000 + chosen, chosen]
+        } else if (call == "lambda") {
+            val callee = if (this.r.chance(0.5)) "(if (true) f else f)" else "f"
+            definitions = ["fun ownedBody$index(): void {", "    val f: (Ticket) -> int = { t: Ticket -> fuzzTake(t) }",
+                "    $callee($picked)", "    dropLog.append(900)", "}"]
+            action = "ownedBody$index()"
+            events = [2000 + chosen, chosen, 900]
+        } else if (call == "owned") {
+            action = "fuzzTakeOwned($picked)"
+            events = [3000 + chosen, chosen]
+        } else {
+            definitions = ["fun ownedBody$index(): void {", "    val consume: (own: Ticket) -> int = fuzzTakeOwned",
+                "    consume($picked)", "    dropLog.append(900)", "}"]
+            action = "ownedBody$index()"
+            events = [3000 + chosen, chosen, 900]
+        }
+        if (definitions.size == 0) {
+            action = action + "; dropLog.append(900)"
+            events.append(900)
+        }
+    } else if (kind == "field") {
+        if (this.r.chance(0.5)) {
+            action = "val seat = ($picked).seat; dropLog.append(5000 + seat)"
+            events = [chosen, 5000 + chosen]
+        } else {
+            val owner = "maybeOwner($n, ${n + 200}, $flag) ?? TempTicketOwner(issue(${n + 1}), ${n + 201})"
+            action = "fuzzTake(($owner).ticket); dropLog.append(900)"
+            events = [2000 + chosen, chosen + 200, chosen, 900]
+        }
+    } else if (kind == "receiver") {
+        if (this.r.chance(0.5)) {
+            action = "($picked).fuzzLook(); dropLog.append(900)"
+            events = [1000 + chosen, chosen, 900]
+        } else {
+            action = "val twice = ($picked).twice(); dropLog.append(twice)"
+            events = [chosen, 2 * chosen]
+        }
+    } else if (kind == "loop") {
+        val machine = this.r.chance(0.5)
+        val stop = this.r.chance(0.5)
+        val borrowed = this.r.chance(0.5)
+        val alternative = if (borrowed) "owner" else "[issue(${n + 2}), issue(${n + 3})]"
+        val body: array<string> = []
+        if (borrowed) body.append("    val owner = [issue(${n + 2}), issue(${n + 3})]")
+        body.append("    for (t in maybeTickets($n, $flag) ?? $alternative) {")
+        body.append("        t.fuzzLook()")
+        if (machine) body.append("        yield t.seat")
+        if (stop && !machine) body.append("        if (true) break")
+        body.append("    }")
+        body.append("    dropLog.append(900)")
+        if (machine) {
+            definitions = fuzzWith(fuzzWith(["fun ownedBody$index(): Generator<int> = generator {"], body), ["}"])
+            action = "for (seat in ownedBody$index()) { ${if (stop) "break" else ""} }"
+        } else {
+            definitions = fuzzWith(fuzzWith(["fun ownedBody$index(): void {"], body), ["}"])
+            action = "ownedBody$index()"
+        }
+        val seats: array<int> = if (give) [n, n + 1] else [n + 2, n + 3]
+        val visited: array<int> = if (stop) [seats[0]] else seats
+        for (seat in visited) {
+            events.append(1000 + seat)
+            if (give || !borrowed) events.append(seat)
+        }
+        if (stop && (give || !borrowed)) events.append(seats[1])
+        if (!(machine && stop)) events.append(900)
+        if (borrowed) {
+            events.append(n + 2)
+            events.append(n + 3)
+        }
+    } else {
+        val other = this.r.chance(0.5)
+        val arm = if (other) 901 else 900
+        val subjectKind = this.r.pick(["plain", "computed", "conditional", "return", "break", "yield", "repeat"])
+        val selector = "is FaceTicket -> { dropLog.append(900) } else -> { dropLog.append(901) }"
+        val otext = fuzzBool(other)
+        if (subjectKind == "plain") {
+            action = "when (face($n, $otext)) { $selector }; dropLog.append(902)"
+            events = [arm, n, 902]
+        } else if (subjectKind == "computed") {
+            action = "when (face(TempTicketOwner(issue(${n + 1}), ${n + 200}).ticket.seat - 1, $otext)) " +
+                "{ $selector }; dropLog.append(902)"
+            events = [n + 200, n + 1, arm, n, 902]
+        } else if (subjectKind == "conditional") {
+            definitions = ["fun ownedBody$index(): void {", "    val held: FuzzFace = face(${n + 5}, false)",
+                "    when (if ($flag) face($n, $otext) else held) { $selector }", "    dropLog.append(902)", "}"]
+            action = "ownedBody$index()"
+            events = if (give) [arm, n, 902, n + 5] else [900, 902, n + 5]
+        } else if (subjectKind == "return") {
+            definitions = ["fun ownedBody$index(): int {", "    defer { dropLog.append(${n + 300}) }",
+                "    when (face($n, $otext)) { is FaceTicket -> { dropLog.append(900); return 1 } " +
+                "else -> dropLog.append(901) }", "    dropLog.append(902)", "    0", "}"]
+            action = "val result = ownedBody$index()"
+            events = if (!other) [900, n, n + 300] else [901, n, 902, n + 300]
+        } else if (subjectKind == "break") {
+            definitions = ["fun ownedBody$index(): void {", "    for (i in 0 until 2) {",
+                "        when (face($n + i, $otext)) { is FaceTicket -> { dropLog.append(900); break } " +
+                "else -> dropLog.append(901) }", "    }", "    dropLog.append(902)", "}"]
+            action = "ownedBody$index()"
+            events = if (!other) [900, n, 902] else [901, n, 901, n + 1, 902]
+        } else if (subjectKind == "yield") {
+            val stop = this.r.chance(0.5)
+            definitions = ["fun ownedBody$index(): Generator<int> = generator {",
+                "    when (face($n, $otext)) { is FaceTicket -> { dropLog.append(900); yield 1; " +
+                "dropLog.append(903) } else -> { dropLog.append(901); yield 2; dropLog.append(903) } }",
+                "    dropLog.append(902)", "}"]
+            action = "for (v in ownedBody$index()) { ${if (stop) "break" else ""} }"
+            events = if (stop) [arm, n] else [arm, 903, n, 902]
+        } else {
+            val stop = this.r.chance(0.5)
+            definitions = ["fun ownedBody$index(): Generator<int> = generator {", "    for (i in 0 until 2) {",
+                "        when (face($n + i, $otext)) { is FaceTicket -> { defer { dropLog.append(${n + 300}) }; " +
+                "dropLog.append(900); yield i } else -> { dropLog.append(901); yield i } }", "    }", "}"]
+            action = "for (v in ownedBody$index()) { ${if (stop) "break" else ""} }"
+            val rounds = if (stop) 1 else 2
+            for (i in 0 until rounds) {
+                events.append(arm)
+                if (!other) events.append(n + 300)
+                events.append(n + i)
+            }
+        }
+    }
+    FuzzCheck(fuzzOracleLines(definitions, index, action, fuzzEvents(events), true), "c$index()", "str", index)
+}
+
+/** Resource classes: `drop()` logs to a global, so reassignment, `move`, block ends and loops show the order and the
+ * number of drops; a fresh resource used as a receiver, a field read, in an `if` branch, behind `?.`, across `return`
+ * and across `break` is a temporary dropped at the end of its statement. */
+fun FuzzGen.resourceDropCheck(index: int): FuzzCheck {
+    val env = fuzzEnv()
+    val globals: array<string> = []
+    val lines: array<string> = ["fun h$index(): int {", "    var total = 0", "    var cur = issue(${this.r.range(1, 9)})"]
+    var live = true
+    val count = this.r.range(3, 9)
+    for (n in 0 until count) {
+        val seat = this.r.range(10, 99)
+        val kind = this.r.pick(["local", "assign", "refund", "revive", "block", "loop", "call",
+            "field", "method", "branch", "maybe", "early", "breaker", "labeled",
+            "elvisloop", "doblock", "paircall", "shortcircuit",
+            "gendrain", "genearly", "genheld", "genlocal",
+            "genfield", "genglobal", "genborrowearly", "tempgenfield", "tempgenindex",
+            "tempgencase", "tempborrow"])
+        if (kind == "local") {
+            lines.append("    val t$n = issue($seat)")
+            lines.append("    total += t$n.seat")
+        } else if (kind == "assign") {
+            if (live) lines.append("    cur = issue($seat)")
+        } else if (kind == "refund") {
+            if (live) {
+                lines.append("    total += refund(move(cur))")
+                live = false
+            }
+        } else if (kind == "revive") {
+            if (!live) {
+                lines.append("    cur = issue($seat)")
+                live = true
+            }
+        } else if (kind == "block") {
+            lines.append("    if ((${this.intExpr("int", 1, env)}) % 2 == 0) {")
+            lines.append("        val inner$n = issue($seat)")
+            lines.append("        total += inner$n.seat")
+            lines.append("    }")
+        } else if (kind == "loop") {
+            lines.append("    for (i$n in 0 until ${this.r.range(1, 4)}) {")
+            lines.append("        val l$n = issue($seat + i$n)")
+            lines.append("        total += l$n.seat")
+            lines.append("    }")
+        } else if (kind == "call") {
+            lines.append("    total += show(issue($seat))")
+        } else if (kind == "paircall") {
+            lines.append("    total += showPair(issue($seat), issue(${seat + 1}))")
+        } else if (kind == "shortcircuit") {
+            lines.append("    if ((${this.intExpr("int", 1, env)}) % 2 == 0 && show(issue($seat)) > 0) total += 1")
+        } else if (kind == "field") {
+            lines.append("    total += issue($seat).seat")
+        } else if (kind == "method") {
+            lines.append("    total += issue($seat).twice()")
+        } else if (kind == "branch") {
+            lines.append("    total += if ((${this.intExpr("int", 1, env)}) % 2 == 0) show(issue($seat)) else issue(${seat + 1}).seat")
+        } else if (kind == "maybe") {
+            lines.append("    total += maybeIssue($seat, (${this.intExpr("int", 1, env)}) % 2 == 0)?.seat ?? 0")
+        } else if (kind == "early") {
+            lines.append("    total += early((${this.intExpr("int", 1, env)}) % 2 == 0, $seat, ${seat + 1})")
+        } else if (kind == "labeled") {
+            lines.append("    L$n@ for (i$n in 0 until ${this.r.range(2, 4)}) {")
+            lines.append("        for (j$n in 0 until ${this.r.range(2, 4)}) {")
+            lines.append("            if (j$n == ${this.r.range(0, 2)}) continue@L$n")
+            lines.append("            total += show(issue($seat + i$n + j$n))")
+            lines.append("            if (i$n == ${this.r.range(0, 3)}) break@L$n")
+            lines.append("        }")
+            lines.append("        total += issue(${seat + 50}).seat")
+            lines.append("    }")
+        } else if (kind == "elvisloop") {
+            lines.append("    for (i$n in 0 until ${this.r.range(2, 5)}) {")
+            lines.append("        total += maybeIssue($seat + i$n, i$n % 2 == ${this.r.range(0, 1)})?.seat ?? continue")
+            lines.append("        total += issue(${seat + 50} + i$n).seat")
+            lines.append("    }")
+        } else if (kind == "doblock") {
+            lines.append("    D$n@ do {")
+            lines.append("        total += show(issue($seat))")
+            lines.append("        if ((${this.intExpr("int", 1, env)}) % 2 == 0) break@D$n")
+            lines.append("        total += issue(${seat + 50}).seat")
+            lines.append("    } while (false)")
+        } else if (kind == "gendrain") {
+            lines.append("    total += drainGen(countedGen(${this.r.range(0, 5)}))")
+        } else if (kind == "genearly") {
+            lines.append("    total += drainGenEarly(countedGen(${this.r.range(1, 6)}), ${this.r.range(0, 4)})")
+        } else if (kind == "genheld") {
+            lines.append("    total += drainGenEarly(ticketGen($seat, ${this.r.range(1, 5)}), ${seat + this.r.range(0, 4)})")
+        } else if (kind == "genlocal") {
+            lines.append("    val g$n = ticketGen($seat, ${this.r.range(1, 4)})")
+            lines.append("    total += drainGen(g$n)")
+        } else if (kind == "genfield") {
+            lines.append("    val owner$n = GenHolder(ticketGen($seat, ${this.r.range(1, 5)}))")
+            lines.append("    for (v$n in owner$n.gen) {")
+            lines.append("        total += v$n")
+            if (this.r.chance(0.5)) lines.append("        if (v$n >= ${seat + this.r.range(0, 4)}) break")
+            lines.append("    }")
+        } else if (kind == "genglobal") {
+            val name = "globalGen${index}x$n"
+            globals.append("val $name = ticketGen($seat, ${this.r.range(1, 5)})")
+            lines.append("    for (v$n in $name) {")
+            lines.append("        total += v$n")
+            if (this.r.chance(0.5)) lines.append("        if (v$n >= ${seat + this.r.range(0, 4)}) break")
+            lines.append("    }")
+        } else if (kind == "genborrowearly") {
+            lines.append("    val g$n = ticketGen($seat, ${this.r.range(1, 5)})")
+            lines.append("    total += drainGenEarly(g$n, ${seat + this.r.range(0, 4)})")
+        } else if (kind == "tempgenfield" || kind == "tempgenindex" || kind == "tempgencase") {
+            val limit = this.r.range(1, 5)
+            var source = ""
+            if (kind == "tempgenfield") {
+                source = "TempGenOwner(ticketGen($seat, $limit), ${seat + 200}).gen"
+            } else if (kind == "tempgenindex") {
+                source = "[TempGenOwner(ticketGen($seat, $limit), ${seat + 200})][0].gen"
+            } else {
+                lines.append("    val owner$n = TempGenOwner(ticketGen($seat, $limit), ${seat + 200})")
+                val flag = this.r.pick(["true", "false"])
+                source = "(if ($flag) TempGenOwner(ticketGen(${seat + 10}, $limit), ${seat + 210}) else owner$n).gen"
+            }
+            lines.append("    for (v$n in $source) {")
+            lines.append("        total += v$n")
+            if (this.r.chance(0.5)) lines.append("        if (v$n >= ${seat + this.r.range(0, 4)}) break")
+            lines.append("    }")
+        } else if (kind == "tempborrow") {
+            lines.append("    total += show(TempTicketOwner(issue($seat), ${seat + 200}).ticket)")
+        } else if (kind == "breaker") {
+            lines.append("    for (i$n in 0 until ${this.r.range(2, 5)}) {")
+            lines.append("        if (i$n == ${this.r.range(0, 3)}) break")
+            lines.append("        total += show(issue($seat + i$n))")
+            lines.append("    }")
+        }
+    }
+    for (line in ["    total", "}", "", "fun c$index(): string {", "    dropLog.clear()", "    val total = h$index()",
+        "    var out = \"\${total}:\"", "    for (seat in dropLog) out = out + \"\${seat},\"", "    out", "}"]) {
+        lines.append(line)
+    }
+    FuzzCheck(fuzzWith(globals, lines), "c$index()", "str", index)
+}

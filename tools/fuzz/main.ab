@@ -9,7 +9,7 @@
 //   tools/fuzz/run --replay                   every tests/cases/fuzz-differential/*.ab, and no MISMATCH line
 //   tools/fuzz/run --selftest                 the PRNG's reference vectors and the comparison
 //
-// Ported so far: the generator core, the plain random check, the type families and the collection and text families
+// Ported so far: the generator core, the plain random check, the type, collection and text, and ownership families
 // (FUZZ_FAMILIES in families.ab);
 // tools/fuzz-differential (Python) keeps the other families and campaigns until they are ported.
 // Seeds are not shared with it: this PRNG is xoshiro256**, so seed N here is not the Python's seed N. Use seeds
@@ -37,7 +37,8 @@ class FuzzOptions(
     var replay: bool,
     var selftest: bool,
     var noAny: bool,
-    var controlMinimise: bool
+    var controlMinimise: bool,
+    var controlOracle: string
 )
 
 val FUZZ_WORK = "build/fuzz-abla"
@@ -70,7 +71,7 @@ fun fuzzSeedRange(text: string, var into: array<int>): void {
 }
 
 fun fuzzOptions(root: string): FuzzOptions {
-    val options = FuzzOptions([], 24, "$root/build/ablac", 120, "", false, "", false, false, false, false, false)
+    val options = FuzzOptions([], 24, "$root/build/ablac", 120, "", false, "", false, false, false, false, false, "")
     var seedText = "1"
     var index = 0
     val count = processArgumentCount()
@@ -90,6 +91,8 @@ fun fuzzOptions(root: string): FuzzOptions {
             options.focus = value
         } else if (argument == "--program") {
             options.program = value
+        } else if (argument == "--control-oracle") {
+            options.controlOracle = value
         } else {
             takes = false
             if (argument == "--keep") {
@@ -278,6 +281,43 @@ fun fuzzControlMinimise(runner: FuzzRunner, options: FuzzOptions, prelude: strin
     0
 }
 
+/** A family's oracle on its own check: the check as generated agrees in every mode, and with its expectation changed
+ * (`actual + "x"` compared) every mode prints FUZZ_ORACLE_FAILURE for it. 0 when both hold. */
+fun fuzzControlOracle(runner: FuzzRunner, family: string, prelude: string): int {
+    val gen = fuzzGen(100000, true, family)
+    val check = gen.check(0)
+    val good = runner.allModes("$FUZZ_WORK/control-oracle-good", prelude, [check], true)
+    val goodVerdict = fuzzVerdict(good)
+    if (goodVerdict != "") {
+        eprintln("fuzz: $family control: the check as generated does not agree: $goodVerdict")
+        return 1
+    }
+    val broken: array<string> = []
+    var changed = false
+    for (line in check.lines) {
+        if (line.contains("if (actual != ")) changed = true
+        broken.append(line.replace("if (actual != ", "if (actual + \"x\" != "))
+    }
+    if (!changed) {
+        eprintln("fuzz: $family control: the check has no `if (actual != ` oracle")
+        return 1
+    }
+    val bad = runner.allModes("$FUZZ_WORK/control-oracle-bad", prelude, [FuzzCheck(broken, check.call, check.ty, 0)], true)
+    for (result in bad) {
+        if (!result.built || !result.output.contains("c0=FUZZ_ORACLE_FAILURE")) {
+            eprintln("fuzz: $family control: ${result.mode} did not report the wrong expectation: ${result.describe()}")
+            return 1
+        }
+    }
+    val differing = fuzzDifferingLines(bad)
+    if (fuzzVerdict(bad) == "" || differing.size != 1 || differing[0] != "c0") {
+        eprintln("fuzz: $family control: the comparison did not single out c0")
+        return 1
+    }
+    println("fuzz: a wrong $family expectation is reported in all six modes")
+    0
+}
+
 fun fuzzAbsolute(path: string): string {
     if (path.startsWith("/")) return path
     val here = processEnvironment("PWD") ?? ""
@@ -323,6 +363,13 @@ fun main: int {
     }
     val prelude = fuzzPrelude(root)
     if (options.controlMinimise) return fuzzControlMinimise(runner, options, prelude)
+    if (options.controlOracle != "") {
+        if (!fuzzHasFamily(options.controlOracle)) {
+            eprintln("fuzz: --control-oracle ${options.controlOracle}: no such generator")
+            return 2
+        }
+        return fuzzControlOracle(runner, options.controlOracle, prelude)
+    }
     var failures = 0
     for (seed in options.seeds) {
         val found = fuzzRunSeed(runner, options, prelude, seed)

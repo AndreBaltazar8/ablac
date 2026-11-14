@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The Abla port of the differential fuzzer (tools/fuzz), kept short for the suite: the PRNG's reference vectors and
 # the comparison self-test, a planted disagreement that the minimiser must find and reduce, a check's own oracle
-# failure and a shared non-zero exit through the real six-way runner, two fixed seeds, and the recorded cases. Long
+# failure and a shared non-zero exit through the real six-way runner, two fixed seeds, the recorded cases, and a
+# wrong expectation that each drop-order oracle must report in every mode. Long
 # campaigns run outside the suite (tools/fuzz/run --seeds ...).
 set -euo pipefail
 
@@ -34,3 +35,6 @@ echo "fuzz: an oracle failure and a non-zero exit are reported through every mod
 
 fuzz --seeds 100000-100001 --checks 12
 fuzz --replay
+for family in default_owner_check ownership_lifetime_check fresh_select_check; do
+    fuzz --control-oracle "$family"
+done
