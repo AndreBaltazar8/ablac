@@ -70,7 +70,10 @@ for kind in ed25519 p256 p384 rsa; do
                 echo "tls-pure interop ($kind ${suite%:*} $group): $result" >&2; head -5 "$out/server.log" >&2; exit 1; }
             [[ $result == 'tls-pure interop ok'* ]] || { echo "tls-pure interop ($kind ${suite%:*} $group): $result" >&2; exit 1; }
             # The alert each refusal sent (RFC 8446 section 6.2): wrong host name, expired and untrusted certificates.
+            # s_server logs a connection's alert when it gets to it, after the client program has exited (the expired case
+            # is the client's last connection): wait for each line, up to 20 s, rather than look once.
             for alert in 'alert bad certificate' 'alert certificate expired' 'alert unknown ca'; do
+                for _ in $(seq 200); do grep -q "$alert" "$out/server.log" && break; sleep 0.1; done
                 grep -q "$alert" "$out/server.log" || { echo "tls-pure interop ($kind ${suite%:*} $group): s_server never saw 'tlsv1 $alert':" >&2; cat "$out/server.log" >&2; exit 1; }
             done
             stop_server
