@@ -1,8 +1,10 @@
 name: Probe macOS stage 1
 
-# A hang in the pinned bootstrap's native arm64 build of the current sources (runs 43588375980, 43594346734) is
-# bisected by variant: the intrinsic's declaration in host.ab alone, its lowering in the compiler alone, both (the reverted change) and neither.
-# Each leg builds stage 1 under a watchdog that samples the stuck processes. Dispatch only; nothing else runs.
+# A hang in the pinned bootstrap's native arm64 build of the current sources (ci.yml runs 43588375980 and
+# 43594346734, with the pair intrinsic) did not reproduce in the first probe (43601581323). This one runs ci.yml's own
+# stage 1 step (foreground, `2>&1 | tee`, its logs directory) three times with the intrinsic ("both") and once without,
+# so intermittency shows; a sampler in the same step samples and stops a build that runs past `seconds`.
+# Dispatch only; nothing else runs.
 on:
   workflow_dispatch:
     inputs:
@@ -13,13 +15,17 @@ on:
 
 jobs:
   probe:
-    name: stage 1 (${{ matrix.variant }})
+    name: stage 1 (${{ matrix.variant }} ${{ matrix.run }})
     runs-on: macos-15
     timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        variant: [none, declaration, compiler, both]
+        include:
+          - {variant: both, run: 1}
+          - {variant: both, run: 2}
+          - {variant: both, run: 3}
+          - {variant: none, run: 1}
     env:
       JOBS: '2'
       ABLA_NATIVE_JOBS: '2'
@@ -34,6 +40,7 @@ jobs:
       - name: Install the bottled native toolchain
         run: |
           brew update
+          # Fail rather than compile LLVM from source if a bottle is missing.
           brew install --force-bottle llvm@23 lld@23 openssl@3 binaryen
           {
             echo "$(brew --prefix llvm@23)/bin"
@@ -45,18 +52,23 @@ jobs:
       - name: Apply the variant
         run: |
           case '${{ matrix.variant }}' in
-            declaration) git apply tools/probe/pair-declaration.patch ;;
-            compiler) git apply tools/probe/pair-compiler.patch ;;
             both) git apply tools/probe/pair-declaration.patch tools/probe/pair-compiler.patch ;;
           esac
           git diff --stat
-      - name: Build stage 1 under the watchdog
-        run: tools/probe/stage1-watchdog.sh '${{ inputs.seconds }}' build/ci/bootstrap-ablac build/ci/ablac-stage1
+      - name: Build stage 1 from current sources (ci.yml's step, with a sampler)
+        run: |
+          tools/probe/sampler.sh '${{ inputs.seconds }}' &
+          mkdir -p build/ci-logs
+          tools/build-self-hosted-current.sh \
+            build/ci/bootstrap-ablac build/ci/ablac-stage1 \
+            2>&1 | tee build/ci-logs/macos-stage1.log
       - name: Keep the samples
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: probe-stage1-${{ matrix.variant }}
-          path: build/probe/
+          name: probe-stage1-${{ matrix.variant }}-${{ matrix.run }}
+          path: |
+            build/probe/
+            build/ci-logs/
           retention-days: 3
           if-no-files-found: ignore
