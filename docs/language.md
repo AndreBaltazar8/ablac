@@ -1082,6 +1082,12 @@ fun main {
 - A lambda captures variables, not copies: `count` above changes the outer
   `calls`. Captures outlive the call that created them, and `this` is
   captured the same way.
+- Braces alone are a lambda, not a block: `{ println("x") }` where a statement
+  goes makes a lambda that nothing calls, and its body never runs. The compiler
+  refuses one whose value is dropped (`E_PARSE_DISCARDED_LAMBDA`): before another
+  statement, or last in a loop body, a `defer` or a `: void` function. To run
+  statements in a scope of their own, write `if (true) { ... }`. A lambda last
+  in any other block is that block's value (a function may return one).
 - A function name is a function value (`apply(5, double)`).
 - Any expression of function type can be called: `adder(2)(3)`,
   `handlers[0]()`, `(pick())(x)`. `button.onClick(event)` calls a method

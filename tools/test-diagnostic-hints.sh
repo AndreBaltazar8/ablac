@@ -2,7 +2,8 @@
 # One mistake, one error, with the fix named: an unknown method is
 # method.unknown (with the import that declares it), `?.` on a value that is
 # never null and Kotlin's `?:` get one error each, and a defer body may end in
-# an assignment.
+# an assignment. A `{ ... }` statement whose value is dropped is an error (#824); a
+# lambda that is a block's value is not.
 set -euo pipefail
 
 compiler=${1:-build/ablac.bin}
@@ -31,6 +32,8 @@ check invalid-method-unknown-template 1 "method.unknown:C.fooBar"
 check invalid-safe-call 1 "safe-call.non-null:M"
 check invalid-unknown-in-arithmetic 1 "identifier:x"
 check invalid-elvis-template 1 "E_PARSE_ELVIS" "Abla writes Kotlin's \`?:\` as \`??\`"
+# A `{ ... }` statement whose value is dropped never runs (#824): one error each, with the fix named.
+check invalid-discarded-lambda 6 "E_PARSE_DISCARDED_LAMBDA" 'help: to run the statements here, write `if (true) { ... }`'
 
 "$compiler" build "$cases/defer-assignment-tail.ab" -o "$output_directory/defer-assignment-tail" >/dev/null
 actual=$("$output_directory/defer-assignment-tail")
@@ -38,4 +41,7 @@ actual=$("$output_directory/defer-assignment-tail")
 "$compiler" build "$cases/trailing-lambda-member-call.ab" -o "$output_directory/trailing-lambda-member-call" >/dev/null
 actual=$("$output_directory/trailing-lambda-member-call")
 [[ $actual == "30 11 101 0" ]] || { echo "trailing-lambda-member-call: '$actual'"; exit 1; }
-echo "diagnostic hints: method.unknown (+ import), ?. and ?:, defer ending in an assignment, trailing lambda after a member call"
+"$compiler" build "$cases/lambda-block-values.ab" -o "$output_directory/lambda-block-values" >/dev/null
+actual=$("$output_directory/lambda-block-values")
+[[ $actual == "21 second inner 1" ]] || { echo "lambda-block-values: '$actual'"; exit 1; }
+echo "diagnostic hints: method.unknown (+ import), ?. and ?:, defer ending in an assignment, trailing lambda after a member call, a dropped { ... } statement"

@@ -644,6 +644,29 @@ class BootstrapParser(
             "${this.diagnostics}source[parser]:${this.sourceIdentity}:$begin:$end\n"
     }
 
+    // A `{ ... }` where a statement goes is a lambda literal: nothing calls it, so its body never runs. Reported when
+    // its value is dropped for certain: before another statement of its block, as the last statement of a loop's body,
+    // of a `defer`, or of a function declared `: void`. (A lambda as the last expression of any other block is that
+    // block's value, as when a function returns one.)
+    fun failDiscardedLambda(statement: BootstrapExpression) {
+        this.errors = this.errors + 1
+        this.diagnostics =
+            "${this.diagnostics}error[E_PARSE_DISCARDED_LAMBDA]: this `{ ... }` is a lambda that nothing calls, so its body never runs\n" +
+            "help: to run the statements here, write `if (true) { ... }`; to keep the lambda, name it (`val step = { ... }`) or call it (`{ ... }()`)\n" +
+            "source[parser]:${this.sourceIdentity}:${statement.begin}:${statement.end}\n"
+    }
+
+    fun isLambdaStatement(statement: BootstrapExpression): bool =
+        statement.kind == "lambda" || statement.kind == "lambda.move"
+
+    // The last statement of `block`, when the block's value is dropped.
+    fun checkDiscardedLast(block: BootstrapExpression) {
+        if (block.kind == "block" && block.children.size > 0 &&
+            this.isLambdaStatement(block.children[block.children.size - 1])) {
+            this.failDiscardedLambda(block.children[block.children.size - 1])
+        }
+    }
+
     // Reports the first malformed escape in a string literal's text.
     fun checkEscapes(token: BootstrapToken, raw: string) {
         val offset = bootstrapInvalidEscapeOffset(raw)
@@ -1047,6 +1070,9 @@ class BootstrapParser(
             } else if (this.at(BOOTSTRAP_TOKEN_BREAK) || this.at(BOOTSTRAP_TOKEN_CONTINUE)) {
                 statements.append(this.parseLoopControl())
             } else statements.append(this.parseExpression())
+            if (statements.size >= 2 && this.isLambdaStatement(statements[statements.size - 2])) {
+                this.failDiscardedLambda(statements[statements.size - 2])
+            }
             if (this.position == before) {
                 this.fail(
                     "LAMBDA_PROGRESS",
@@ -1236,6 +1262,10 @@ class BootstrapParser(
             } else if (this.at(BOOTSTRAP_TOKEN_BREAK) || this.at(BOOTSTRAP_TOKEN_CONTINUE)) {
                 statements.append(this.parseLoopControl())
             } else statements.append(this.parseExpression())
+            // A statement after a lambda statement: that lambda's value is dropped.
+            if (statements.size >= 2 && this.isLambdaStatement(statements[statements.size - 2])) {
+                this.failDiscardedLambda(statements[statements.size - 2])
+            }
             if (this.position == before) {
                 this.fail(
                     "BLOCK_PROGRESS",
@@ -1283,6 +1313,7 @@ class BootstrapParser(
             ])
         } else {
             var body = this.parseBlock()
+            this.checkDiscardedLast(body)
             // A deferred block runs for its effects, so a trailing
             // assignment (`defer { n += 1 }`) is a statement, as at the end
             // of a void function: an empty block after it makes it void.
@@ -1445,6 +1476,7 @@ class BootstrapParser(
         this.expect(BOOTSTRAP_TOKEN_RPAREN)
         this.skipSeparators()
         val body = this.parseControlBody()
+        this.checkDiscardedLast(body)
         BootstrapExpression(
             "while",
             "",
@@ -1459,6 +1491,7 @@ class BootstrapParser(
         this.expect(BOOTSTRAP_TOKEN_DO)
         this.skipSeparators()
         val body = this.parseControlBody()
+        this.checkDiscardedLast(body)
         this.skipSeparators()
         this.expect(BOOTSTRAP_TOKEN_WHILE)
         this.expect(BOOTSTRAP_TOKEN_LPAREN)
@@ -1492,6 +1525,7 @@ class BootstrapParser(
         val bindings = this.bindingNames.size
         this.declareBinding(bootstrapTokenText(this.source, name), true)
         val body = this.parseControlBody()
+        this.checkDiscardedLast(body)
         this.leaveBindings(bindings)
         BootstrapExpression(
             "for",
@@ -2833,7 +2867,10 @@ class BootstrapParser(
                 expression = this.parseExpression()
                 this.skipToDeclarationEnd()
             }
-            else if (this.at(BOOTSTRAP_TOKEN_LBRACE)) expression = this.parseBlock()
+            else if (this.at(BOOTSTRAP_TOKEN_LBRACE)) {
+                expression = this.parseBlock()
+                if (resultType == "void") this.checkDiscardedLast(expression)
+            }
         } else if (kind == "class" || kind == "interface") {
             // `class Box<T>`, `interface Source<T>`: a generic class or interface.
             if (this.at(BOOTSTRAP_TOKEN_LESS)) typeParameters = this.parseTypeParameters()
