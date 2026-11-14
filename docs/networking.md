@@ -376,8 +376,8 @@ below; `ablac build` adds them on its own.
 
 `abla/http/async` issues HTTP/1.1 and HTTPS requests from an event loop.
 `request(method, url, headers, body, timeoutMilliseconds)` returns an id;
-DNS (cached A records through `DnsAsyncResolver`, below), TCP connect, the OpenSSL
-handshake with peer/SNI/hostname verification, writes, and reads advance only
+DNS (cached A records through `DnsAsyncResolver`, below), TCP connect, the abla/tls/pure
+TLS session (peer, SNI and name verification, no OpenSSL), writes, and reads advance only
 inside `step`, and finished requests come back from `takeCompletions` as
 `HttpAsyncCompletion(id, status, headers, body, error, elapsedMilliseconds)`.
 Connections are kept alive and pooled per scheme, host, and port up to

@@ -11,20 +11,19 @@
 //     val done = http.takeCompletions()   // HttpAsyncCompletion(id, status, ...)
 //
 // DNS (A records through abla/dns's DnsAsyncResolver, cached), TCP connect,
-// the TLS handshake (OpenSSL with peer, SNI, and hostname verification),
+// the TLS handshake (abla/tls/pure, with peer, SNI and name verification),
 // request writes, and response reads are all nonblocking state machines over
 // one poller. Connections are kept alive and pooled per scheme/host/port; a
 // request that finds a pooled connection already closed by the peer is retried
 // once on a fresh connection.
 
-import "openssl-nonblocking.ab"
 import "abla/dns"
 import "abla/dns/async"
 import "abla/http"
 import "abla/net"
 import "abla/random"
 import "abla/text"
-import "../../tls/hosted/openssl.ab"
+import "abla/tls/pure"
 import "abla/unsafe/memory/raw"
 import "abla/sys/linux"
 import "abla/unsafe/memory"
@@ -95,7 +94,6 @@ private val httpAsyncConnectionIdle = 6
 resource class HttpAsyncClient(
     val poller: SocketPoller,
     val options: HttpAsyncOptions,
-    var sslContext: int,
     val resolver: DnsAsyncResolver,
     val reader: HttpAsyncRead,
     // requests
@@ -114,6 +112,7 @@ resource class HttpAsyncClient(
     // connections
     val connectionDescriptors: array<int>,
     val connectionSessions: array<int>,
+    val connectionTls: array<TlsSession>,
     val connectionKeys: array<string>,
     val connectionHosts: array<string>,
     val connectionPorts: array<int>,
@@ -146,20 +145,13 @@ resource class HttpAsyncClient(
         var slot = 0
         while (slot < this.connectionStates.size) {
             if (this.connectionStates[slot] != 0) {
-                if (this.connectionSessions[slot] != 0) {
-                    SSL_free(nativePointerFromAddress(this.connectionSessions[slot]))
-                    this.connectionSessions[slot] = 0
-                }
+                this.tlsFree(slot)
                 if (this.connectionDescriptors[slot] >= 0) {
                     linuxTcpCloseDescriptor(this.connectionDescriptors[slot])
                 }
                 this.connectionStates[slot] = 0
             }
             slot = slot + 1
-        }
-        if (this.sslContext != 0) {
-            SSL_CTX_free(nativePointerFromAddress(this.sslContext))
-            this.sslContext = 0
         }
         this.resolver.close()
         this.poller.close()
@@ -169,7 +161,7 @@ resource class HttpAsyncClient(
 
 fun httpAsyncClient(options: HttpAsyncOptions = HttpAsyncOptions()): HttpAsyncClient =
     HttpAsyncClient(
-        socketPoller(), options, 0,
+        socketPoller(), options,
         dnsAsyncResolver(DnsAsyncOptions(
             options.dnsTimeoutMilliseconds, 1000, options.nameserver,
             options.nameserverPort, options.dnsConfigurationPath,
@@ -177,7 +169,7 @@ fun httpAsyncClient(options: HttpAsyncOptions = HttpAsyncOptions()): HttpAsyncCl
         )),
         HttpAsyncRead("", 0),
         [], [], [], [], [], [], [], [], [], [], [], 0,
-        [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], 0,
+        [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], 0,
         [], [], [], [], [], 1, 0, 0
     )
 
@@ -305,89 +297,47 @@ trusted fun httpAsyncPlainRead(descriptor: int, var result: HttpAsyncRead): void
     return
 }
 
-// Status > 0: bytes read. Otherwise -(SSL_get_error) so 2 = want read,
-// 3 = want write, 6 = clean close, other values are failures.
-trusted fun httpAsyncTlsRead(session: int, var result: HttpAsyncRead): void {
-    val stack = nativeStackAllocate(16384)
-    val pointer = nativePointerFromAddress(session)
-    val held = linuxBrokenPipeHold()
-    val measured: int = SSL_read(pointer, nativePointerFromAddress(stack), 16384)
-    linuxBrokenPipeRelease(held)
-    if (measured > 0) {
-        val target = nativeByteBuffer(measured + 1)
-        ablaUnsafeCopyMemory(nativePointerAddress(target.address), stack, measured)
-        result.text = target.adoptString(measured)
-        result.status = measured
+// The TLS of a connection is a TlsSession of abla/tls/pure over its socket. A slot without TLS holds a failed placeholder.
+fun httpAsyncNoSession(): TlsSession = tlsSessionClient(-1, "", TLS_VERIFY_NONE)
+
+// Status > 0: bytes read. Otherwise -2 = want read, -3 = want write, -6 = clean close, -1 = failure.
+fun HttpAsyncClient.tlsRead(slot: int): void {
+    val read = this.connectionTls[slot].readReady(16384)
+    if (read.status == 1 && read.bytes.size > 0) {
+        this.reader.text = read.bytes
+        this.reader.status = read.bytes.size
     } else {
-        result.text = ""
-        val code: int = SSL_get_error(pointer, i32(measured))
-        result.status = -code
+        this.reader.text = ""
+        this.reader.status = if (read.status == 2) -2 else if (read.status == 3) -3 else if (read.status == 0) -6 else -1
     }
     return
 }
 
-// Returns bytes written, or -(SSL_get_error).
-trusted fun httpAsyncTlsWrite(session: int, contents: string, offset: int): int {
-    val pointer = nativePointerFromAddress(session)
-    val length = contents.size - offset
-    val held = linuxBrokenPipeHold()
-    val written: int = SSL_write(pointer, contents.slice(offset, contents.size), length)
-    linuxBrokenPipeRelease(held)
-    if (written > 0) written
-    else {
-        val code: int = SSL_get_error(pointer, i32(written))
-        0 - code
-    }
+// Returns bytes written, -2 or -3 for a socket that must become readable or writable first, -1 for a failure.
+fun HttpAsyncClient.tlsWrite(slot: int, contents: string, offset: int): int {
+    val sent = this.connectionTls[slot].writeReady(contents, offset)
+    if (sent.status == 1 && sent.written > 0) sent.written
+    else if (sent.status == 3) -3
+    else if (sent.status == 2) -2
+    else -1
 }
 
-// Returns 1 when complete, -(SSL_get_error) while in progress or failed.
-trusted fun httpAsyncTlsHandshake(session: int): int {
-    val pointer = nativePointerFromAddress(session)
-    val held = linuxBrokenPipeHold()
-    val result: int = SSL_connect(pointer)
-    linuxBrokenPipeRelease(held)
-    if (result == 1) {
-        if (SSL_get_verify_result(pointer) == 0) 1 else -100
-    } else {
-        val code: int = SSL_get_error(pointer, i32(result))
-        0 - code
-    }
+// Returns 1 when complete, -2 or -3 while the socket must become readable or writable, -100 when the certificate was refused,
+// -1 for any other failure.
+fun HttpAsyncClient.tlsHandshake(slot: int): int {
+    val status = this.connectionTls[slot].handshake()
+    if (status == 1) return 1
+    if (status == 2) return -2
+    if (status == 3) return -3
+    val client = this.connectionTls[slot].client
+    if (client.chain.size > 0 && !client.connected()) -100 else -1
 }
 
-trusted fun httpAsyncTlsSession(context: int, host: string, descriptor: int): int {
-    val session = SSL_new(nativePointerFromAddress(context))
-    if (pointerIsNull(session)) return 0
-    var ready = SSL_ctrl(session, 55, 0, host) == 1 &&
-        SSL_set1_host(session, host) == i32(1) &&
-        SSL_set_fd(session, descriptor) == i32(1)
-    // SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER
-    if (ready) SSL_ctrl(session, 33, 3, "")
-    if (!ready) {
-        SSL_free(session)
-        0
-    } else nativePointerAddress(session)
-}
-
-trusted fun httpAsyncTlsContext(caPath: string): int {
-    val context = SSL_CTX_new(TLS_client_method())
-    if (pointerIsNull(context)) return 0
-    SSL_CTX_set_verify(context, 1, nativeNullPointer())
-    val loaded = if (caPath != "")
-        SSL_CTX_load_verify_locations(context, caPath, nativeNullPointer()) == i32(1)
-    else SSL_CTX_set_default_verify_paths(context) == i32(1)
-    if (!loaded) {
-        SSL_CTX_free(context)
-        0
-    } else nativePointerAddress(context)
-}
-
-trusted fun httpAsyncTlsFree(session: int): void {
-    if (session != 0) {
-        val pointer = nativePointerFromAddress(session)
-        val held = linuxBrokenPipeHold()
-        SSL_shutdown(pointer)
-        linuxBrokenPipeRelease(held)
-        SSL_free(pointer)
+// close_notify is offered once, the socket is shut down; the descriptor is closed by the caller.
+fun HttpAsyncClient.tlsFree(slot: int): void {
+    if (this.connectionSessions[slot] != 0) {
+        this.connectionTls[slot].close()
+        this.connectionSessions[slot] = 0
     }
     return
 }
@@ -431,8 +381,7 @@ fun HttpAsyncClient.complete(
 
 fun HttpAsyncClient.closeConnection(slot: int): void {
     if (slot >= 0 && this.connectionStates[slot] != 0) {
-        httpAsyncTlsFree(this.connectionSessions[slot])
-        this.connectionSessions[slot] = 0
+        this.tlsFree(slot)
         val descriptor = this.connectionDescriptors[slot]
         if (descriptor >= 0) {
             this.poller.unwatchDescriptor(descriptor)
@@ -491,6 +440,7 @@ fun HttpAsyncClient.allocateConnection(request: int): int {
         slot = this.connectionStates.size
         this.connectionDescriptors.append(-1)
         this.connectionSessions.append(0)
+        this.connectionTls.append(httpAsyncNoSession())
         this.connectionKeys.append("")
         this.connectionHosts.append("")
         this.connectionPorts.append(0)
@@ -643,17 +593,14 @@ fun HttpAsyncClient.startConnect(slot: int, address: string): void {
 
 fun HttpAsyncClient.connected(slot: int): void {
     if (this.connectionSecure[slot]) {
-        if (this.sslContext == 0) {
-            this.sslContext = httpAsyncTlsContext(this.options.caPath)
-        }
-        val session = if (this.sslContext == 0) 0 else httpAsyncTlsSession(
-            this.sslContext, this.connectionHosts[slot], this.connectionDescriptors[slot]
-        )
-        if (session == 0) {
+        // An empty caPath is the system trust store. The name is checked (a DNS name or an IP address, by subjectAltName).
+        val session = tlsSessionClient(this.connectionDescriptors[slot], this.connectionHosts[slot], TLS_VERIFY_HOST, this.options.caPath)
+        if (!session.ok()) {
             this.fail(slot, "tls setup failed")
             return
         }
-        this.connectionSessions[slot] = session
+        this.connectionTls[slot] = session
+        this.connectionSessions[slot] = 1
         this.connectionStates[slot] = httpAsyncConnectionHandshaking
         this.handshake(slot)
     } else this.beginWrite(slot)
@@ -661,7 +608,7 @@ fun HttpAsyncClient.connected(slot: int): void {
 }
 
 fun HttpAsyncClient.handshake(slot: int): void {
-    val result = httpAsyncTlsHandshake(this.connectionSessions[slot])
+    val result = this.tlsHandshake(slot)
     if (result == 1) this.beginWrite(slot)
     else if (result == -2) this.interest(slot, false)
     else if (result == -3) this.interest(slot, true)
@@ -700,7 +647,7 @@ fun HttpAsyncClient.writeReady(slot: int): void {
             this.interest(slot, false)
             writing = false
         } else if (this.connectionSecure[slot]) {
-            val written = httpAsyncTlsWrite(this.connectionSessions[slot], output, offset)
+            val written = this.tlsWrite(slot, output, offset)
             if (written > 0) this.connectionOutputOffsets[slot] = offset + written
             else if (written == -3 || written == -2) {
                 this.interest(slot, written == -3)
@@ -813,7 +760,7 @@ fun HttpAsyncClient.readReady(slot: int): void {
     var reading = true
     while (reading && this.connectionStates[slot] != 0) {
         if (this.connectionSecure[slot]) {
-            httpAsyncTlsRead(this.connectionSessions[slot], this.reader)
+            this.tlsRead(slot)
         } else httpAsyncPlainRead(this.connectionDescriptors[slot], this.reader)
         val status = this.reader.status
         val chunk = this.reader.text
