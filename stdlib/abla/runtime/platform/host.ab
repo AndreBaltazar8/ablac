@@ -614,12 +614,40 @@ trusted fun __ablaRuntimeHostHeapMerge(block: int): void {
     return
 }
 
-// Gives back the whole pages inside [from, to): rounded inward to the host's page, which is 16 KiB on Apple
-// Silicon. Darwin's madvise rounds the start down and the end up to its page, so a range only 4 KiB aligned
+// The host's page size: 16 KiB on macOS (Apple Silicon's; Intel's 4 KiB pages are also covered by it), on Linux the
+// auxiliary vector's AT_PAGESZ (6), which follows the environment vector's NULL (4 KiB on x86-64, 4, 16 or 64 KiB
+// on AArch64; read only where the program owns its start, so the vector is where the environment ends). Elsewhere
+// the largest, 64 KiB: rounding inward to more than
+// the page only gives back less. Kept after the first call.
+var __ablaRuntimeHostHeapPage: int = 0
+
+trusted fun __ablaRuntimeHostHeapPageSize(): int {
+    if (ablaHostIsMacOS()) return 16384
+    var page = __ablaRuntimeHostHeapPage
+    if (page != 0) return page
+    page = 65536
+    var cursor = ablaRuntimePointerAddress(ablaLinuxEnvironmentPointer())
+    if (cursor != 0 && ablaHostOwnsRuntime()) {
+        while (ablaRuntimeLoadI64(cursor) != 0) cursor = cursor + 8
+        cursor = cursor + 8
+        var type = ablaRuntimeLoadI64(cursor)
+        while (type != 0) {
+            val value = ablaRuntimeLoadI64(cursor + 8)
+            if (type == 6 && value >= 4096 && value <= 65536 && (value & (value - 1)) == 0) page = value
+            cursor = cursor + 16
+            type = ablaRuntimeLoadI64(cursor)
+        }
+    }
+    __ablaRuntimeHostHeapPage = page
+    page
+}
+
+// Gives back the whole pages inside [from, to): rounded inward to the host's page (16 KiB on Apple Silicon).
+// Darwin's madvise rounds the start down and the end up to its page, so a range only 4 KiB aligned
 // would also discard the live data around it (the free block's own header and links, the block before it):
 // the intermittent heap corruption behind the arm64 macOS compiler hangs of v0.2.59.
 trusted fun __ablaRuntimeHostHeapDiscard(from: int, to: int): void {
-    val page = if (ablaHostIsMacOS()) 16384 else 4096
+    val page = __ablaRuntimeHostHeapPageSize()
     val low = (from + page - 1) & -page
     val high = to & -page
     if (high > low) ablaLinuxSyscall(28, low, high - low, 4, 0, 0, 0)
