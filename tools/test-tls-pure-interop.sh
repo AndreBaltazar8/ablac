@@ -235,7 +235,7 @@ start_serve() {   # the serve.ab arguments; sets serve_port
         sleep 0.1
     done
     serve_port=$(sed -n 's/^listening //p' "$out/serve.log" | head -1)
-    [[ -n $serve_port ]] || { echo "tls-pure serve: no port after 120 s (process $(kill -0 "$serve_pid" 2> /dev/null && echo alive || echo gone), state $(sed -n 's/^State:\s*//p' "/proc/$serve_pid/status" 2> /dev/null | head -1), wchan $(cat "/proc/$serve_pid/wchan" 2> /dev/null), load $(cut -d" " -f1-3 /proc/loadavg)): $(head -3 "$out/serve.log")" >&2; exit 1; }
+    [[ -n $serve_port ]] || { echo "tls-pure serve: no port after 120 s (process $(kill -0 "$serve_pid" 2> /dev/null && echo alive || echo gone), state $(sed -n 's/^State:\s*//p' "/proc/$serve_pid/status" 2> /dev/null | head -1), wchan $(cat "/proc/$serve_pid/wchan" 2> /dev/null), CPU used and time waiting in the run queue (ns) $(cat "/proc/$serve_pid/schedstat" 2> /dev/null), utime/stime ticks $(cut -d" " -f14,15 "/proc/$serve_pid/stat" 2> /dev/null), context switches $(grep ctxt_switches "/proc/$serve_pid/status" 2> /dev/null | tr -s "\n\t " " "), load $(cut -d" " -f1-3 /proc/loadavg)): $(head -3 "$out/serve.log")" >&2; exit 1; }
 }
 s_client() {   # the s_client options after the address; prints what the server sent
     printf 'GET /pure HTTP/1.0\r\n\r\n' | timeout 15 openssl s_client -connect "[::1]:$serve_port" ${s_tls:--tls1_3} -servername localhost -quiet "$@" 2> "$out/s_client.err" || true
