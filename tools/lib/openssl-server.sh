@@ -21,6 +21,10 @@ openssl_server_start() {
     for attempt in 1 2 3 4 5 6 7 8; do
         use=$bind
         [[ $attempt -eq 1 && -n ${OPENSSL_SERVER_FIRST_BIND:-} ]] && use=$OPENSSL_SERVER_FIRST_BIND
+        # Empty the log HERE, before the child starts: a log that is truncated only by the child's own redirection still holds the
+        # previous server's ACCEPT line until that process gets to run, and on a loaded machine the grep below can run first
+        # and return the previous server's (closed) port.
+        : > "$log"
         if [[ -n ${OPENSSL_SERVER_INHERIT_STDIN:-} ]]; then
             (cd "${OPENSSL_SERVER_DIR:-.}" && exec openssl s_server -accept "$use" "$@") 0<&0 > "$log" 2>&1 &
         else
@@ -43,4 +47,11 @@ openssl_server_start() {
     done
     echo "openssl s_server did not start (bind $use): $(head -3 "$log" 2> /dev/null)" >&2
     return 1
+}
+
+# openssl_server_show PORT: for a failure that says tcp_connect, what the kernel knows about the port and the log's head.
+openssl_server_show() {
+    command -v ss > /dev/null || return 0
+    echo "sockets on port $1 (ss -tanp), s_server pid ${openssl_server_pid:-none}:" >&2
+    ss -tanp "( sport = :$1 or dport = :$1 )" 2>&1 | head -12 >&2
 }

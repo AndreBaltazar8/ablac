@@ -53,12 +53,12 @@ serve() {
 stop() { kill "$server_pid" 2> /dev/null || true; wait "$server_pid" 2> /dev/null || true; server_pid=; }
 expect_ok() { # description, host, ca
     local result
-    result=$("$out/handles" get "$2" "$port" "$3" 2>&1) || { echo "tls-chains: $1: $result" >&2; exit 1; }
+    result=$("$out/handles" get "$2" "$port" "$3" 2>&1) || { echo "tls-chains: $1: $result" >&2; openssl_server_show "$port"; exit 1; }
 }
 expect_refused() { # description, host, ca, text the reason holds
     local result
-    result=$("$out/handles" refuse "$2" "$port" "$3" 2>&1) || { echo "tls-chains: $1 was not refused: $result" >&2; exit 1; }
-    [[ $result == *"$4"* ]] || { echo "tls-chains: $1: refused with '$result', wanted '$4'" >&2; exit 1; }
+    result=$("$out/handles" refuse "$2" "$port" "$3" 2>&1) || { echo "tls-chains: $1 was not refused: $result" >&2; openssl_server_show "$port"; exit 1; }
+    [[ $result == *"$4"* ]] || { echo "tls-chains: $1: refused with '$result', wanted '$4'" >&2; openssl_server_show "$port"; exit 1; }
 }
 
 for kind in rsa ec; do
