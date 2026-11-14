@@ -9,6 +9,7 @@ compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
+. "$root/tools/lib/openssl-server.sh"
 out=build/tls-session
 rm -rf "$out"
 mkdir -p "$out"
@@ -22,30 +23,13 @@ make_cert() {   # name, subjectAltName
 make_cert good "DNS:localhost,IP:127.0.0.1,IP:::1"
 make_cert other "DNS:localhost,IP:127.0.0.1,IP:::1"
 make_cert dnsonly "DNS:localhost"
-start_server() {   # certificate name, then s_server options; sets port
-    local name=$1 attempt
+start_server() {   # certificate name, then s_server options; sets port and server_pid
+    local name=$1
     shift
-    for attempt in 1 2 3 4 5 6 7 8; do
-        # The kernel picks the port (0, dual-stack: the IPv4 and IPv6 checks both connect to it) and s_server reports it.
-        openssl s_server -accept 0 -cert "$out/$name.pem" -key "$out/$name.key" "$@" > "$out/server.log" 2>&1 &
-        server_pid=$!
-        local started=0
-        for _ in $(seq 300); do
-            if grep -q ACCEPT "$out/server.log" 2> /dev/null; then started=1; break; fi
-            kill -0 "$server_pid" 2> /dev/null || break
-            sleep 0.1
-        done
-        if [[ $started -eq 1 ]]; then
-            port=$(sed -n 's/^ACCEPT .*:\([0-9][0-9]*\)$/\1/p' "$out/server.log" | head -1)
-            [[ -n $port ]] && return 0
-        fi
-        kill "$server_pid" 2> /dev/null || true
-        wait "$server_pid" 2> /dev/null || true
-        server_pid=
-        grep -q 'Address already in use' "$out/server.log" || break
-    done
-    echo "tls-session: s_server did not start: $(head -3 "$out/server.log")" >&2
-    exit 1
+    # Dual-stack (the IPv4 and IPv6 checks both connect to it) on a port the kernel picks.
+    openssl_server_start "$out/server.log" 0 -cert "$out/$name.pem" -key "$out/$name.key" "$@" || { echo "tls-session: s_server did not start" >&2; exit 1; }
+    port=$openssl_server_port
+    server_pid=$openssl_server_pid
 }
 stop_server() {
     kill -CONT "$server_pid" 2> /dev/null || true

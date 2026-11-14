@@ -9,6 +9,7 @@ compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
+. "$root/tools/lib/openssl-server.sh"
 out=build/tls-chains
 rm -rf "$out"
 mkdir -p "$out"
@@ -42,18 +43,12 @@ server_pid=
 trap '[[ -z $server_pid ]] || kill "$server_pid" 2> /dev/null || true' EXIT
 # serve LEAF KEY TLSFLAG [s_server options...]: starts s_server on a free port ($port)
 serve() {
-    local leaf=$1 key=$2 flag=$3 attempt
+    local leaf=$1 key=$2 flag=$3
     shift 3
-    for attempt in 1 2 3 4 5 6 7 8; do
-        port=$(( 20000 + RANDOM % 20000 ))
-        openssl s_server -accept "$port" -cert "$leaf" -key "$key" "$flag" -www "$@" > "$out/server.log" 2>&1 &
-        server_pid=$!
-        for _ in $(seq 100); do grep -q ACCEPT "$out/server.log" 2> /dev/null && return 0; sleep 0.1; done
-        kill "$server_pid" 2> /dev/null || true
-        server_pid=
-    done
-    echo "tls-chains: s_server did not start: $(head -3 "$out/server.log")" >&2
-    exit 1
+    # (Dual-stack, kernel-chosen port: the host-name check connects to 127.0.0.1, the others to localhost.)
+    openssl_server_start "$out/server.log" 0 -cert "$leaf" -key "$key" "$flag" -www "$@" || { echo "tls-chains: s_server did not start" >&2; exit 1; }
+    port=$openssl_server_port
+    server_pid=$openssl_server_pid
 }
 stop() { kill "$server_pid" 2> /dev/null || true; wait "$server_pid" 2> /dev/null || true; server_pid=; }
 expect_ok() { # description, host, ca

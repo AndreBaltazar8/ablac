@@ -8,6 +8,7 @@ compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
+. "$root/tools/lib/openssl-server.sh"
 out=build/tls-handles
 rm -rf "$out"
 mkdir -p "$out"
@@ -20,17 +21,10 @@ openssl req -x509 -new -key "$out/key.pem" -out "$out/cert.pem" -subj /CN=localh
 pids=()
 trap 'for p in "${pids[@]:-}"; do [[ -z $p ]] || kill "$p" 2> /dev/null || true; done' EXIT
 
-free_port() { echo $(( 20000 + RANDOM % 20000 )); }
-
 # 1. The pure client, through a handle, against openssl s_server.
-for attempt in 1 2 3 4 5 6; do
-    port=$(free_port)
-    openssl s_server -accept "$port" -cert "$out/cert.pem" -key "$out/key.pem" -www -tls1_3 > "$out/server.log" 2>&1 &
-    pids+=("$!")
-    for _ in $(seq 100); do grep -q ACCEPT "$out/server.log" 2> /dev/null && break; sleep 0.1; done
-    grep -q ACCEPT "$out/server.log" && break
-    kill "${pids[-1]}" 2> /dev/null || true
-done
+openssl_server_start "$out/server.log" 0 -cert "$out/cert.pem" -key "$out/key.pem" -www -tls1_3 || { echo "tls-handles: s_server did not start" >&2; exit 1; }
+pids+=("$openssl_server_pid")
+port=$openssl_server_port
 result=$("$out/handles" fetch "$port" "$out/cert.pem" 2>&1) || { echo "tls-handles fetch: $result" >&2; exit 1; }
 echo "ok   $result"
 kill "${pids[-1]}" 2> /dev/null || true
@@ -57,9 +51,8 @@ grep -q 'reset ok' "$out/reset.log"
 echo "ok   $result"
 
 # 4. A silent peer: the read times out and tlsLastErrorTimedOut says so.
-port=$(free_port)
-openssl s_server -accept "$port" -cert "$out/cert.pem" -key "$out/key.pem" -tls1_3 -quiet > "$out/silent.log" 2>&1 < <(sleep 30) &
-pids+=("$!")
-sleep 1
+OPENSSL_SERVER_INHERIT_STDIN=1 openssl_server_start "$out/silent.log" 0 -cert "$out/cert.pem" -key "$out/key.pem" -tls1_3 < <(sleep 30) || { echo "tls-handles: s_server did not start" >&2; exit 1; }
+pids+=("$openssl_server_pid")
+port=$openssl_server_port
 result=$("$out/handles" timeout "$port" "$out/cert.pem" 2>&1) || { echo "tls-handles timeout: $result" >&2; exit 1; }
 echo "ok   $result"

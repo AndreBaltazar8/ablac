@@ -8,6 +8,7 @@ compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
+. "$root/tools/lib/openssl-server.sh"
 out=build/tls-trust-env
 rm -rf "$out"
 mkdir -p "$out/empty-dir" "$out/cert-dir"
@@ -50,14 +51,9 @@ echo "ok   trust stores: a set variable is the whole trust (12 settings); with n
 
 pids=()
 trap 'for p in "${pids[@]:-}"; do [[ -z $p ]] || kill "$p" 2> /dev/null || true; done' EXIT
-for attempt in 1 2 3 4 5 6; do
-    port=$(( 20000 + RANDOM % 20000 ))
-    openssl s_server -accept "$port" -cert "$out/cert.pem" -key "$out/key.pem" -www -tls1_3 > "$out/server.log" 2>&1 &
-    pids+=("$!")
-    for _ in $(seq 100); do grep -q ACCEPT "$out/server.log" 2> /dev/null && break; sleep 0.1; done
-    grep -q ACCEPT "$out/server.log" && break
-    kill "${pids[-1]}" 2> /dev/null || true
-done
+openssl_server_start "$out/server.log" 0 -cert "$out/cert.pem" -key "$out/key.pem" -www -tls1_3 || { echo "tls-trust-env: s_server did not start" >&2; exit 1; }
+pids+=("$openssl_server_pid")
+port=$openssl_server_port
 expect_connect() { # expected (connected | refused) settings...
     local expected=$1 actual; shift
     actual=$(run "$@" -- connect "$port")
