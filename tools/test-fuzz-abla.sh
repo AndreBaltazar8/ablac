@@ -35,6 +35,4 @@ echo "fuzz: an oracle failure and a non-zero exit are reported through every mod
 
 fuzz --seeds 100000-100001 --checks 12
 fuzz --replay
-for family in default_owner_check ownership_lifetime_check fresh_select_check; do
-    fuzz --control-oracle "$family"
-done
+fuzz --control-oracle default_owner_check,ownership_lifetime_check,fresh_select_check,json_check,yaml_check,gzip_check
