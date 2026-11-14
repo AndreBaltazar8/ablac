@@ -123,12 +123,14 @@ fun webServe(port: int): int {
     0
 }
 
-var failures = 0
+// Counted in a value passed along, not a module-level variable: a program that writes a global stays out of the native compile-time
+// tier (#822).
+class Tally(var failures: int)
 
-fun expect(name: string, ok: bool): void {
+fun expect(var tally: Tally, name: string, ok: bool): void {
     if (!ok) {
         println("dns async: $name failed")
-        failures = failures + 1
+        tally.failures = tally.failures + 1
     }
     return
 }
@@ -162,53 +164,54 @@ fun resolveOne(var dns: DnsAsyncResolver, host: string, recordType: int): DnsAsy
 
 // The configuration parser, the candidate order and the hosts file, as pure
 // functions.
-fun checkConfiguration(): void {
+fun checkConfiguration(var tally: Tally): void {
     val configuration = dnsParseConfiguration(
         "# generated\nnameserver 10.0.0.2\nnameserver ::1\n" +
         "nameserver\t10.0.0.3 ; second\ndomain old.example\n" +
         "search ns.svc.cluster.local svc.cluster.local.\n" +
         "options timeout:2 ndots:5 attempts:3\n"
     )
-    expect("configuration", configuration.nameservers.size == 2 &&
+    expect(tally, "configuration", configuration.nameservers.size == 2 &&
         configuration.nameservers[1] == "10.0.0.3" &&
         configuration.search.size == 2 &&
         configuration.search[1] == "svc.cluster.local" &&
         configuration.ndots == 5)
     val fallback = dnsParseConfiguration("domain corp.example\noptions ndots:99\n")
-    expect("configuration defaults", fallback.nameservers.size == 0 &&
+    expect(tally, "configuration defaults", fallback.nameservers.size == 0 &&
         fallback.search.size == 1 && fallback.search[0] == "corp.example" &&
         fallback.ndots == 15 && dnsChooseServer("", fallback) == "127.0.0.53" &&
         dnsChooseServer("10.1.1.1", configuration) == "10.1.1.1" &&
         dnsChooseServer("", configuration) == "10.0.0.2" &&
         dnsParseConfiguration("").ndots == 1)
     val short = dnsCandidates("redis", configuration)
-    expect("candidates below ndots", short.size == 3 &&
+    expect(tally, "candidates below ndots", short.size == 3 &&
         short[0] == "redis.ns.svc.cluster.local" &&
         short[1] == "redis.svc.cluster.local" && short[2] == "redis")
     val one = DnsConfiguration([], ["corp.example"], 1)
     val dotted = dnsCandidates("api.example.com", one)
-    expect("candidates at ndots", dotted.size == 2 &&
+    expect(tally, "candidates at ndots", dotted.size == 2 &&
         dotted[0] == "api.example.com" && dotted[1] == "api.example.com.corp.example")
     val absolute = dnsCandidates("api.example.com.", configuration)
-    expect("absolute candidate", absolute.size == 1 && absolute[0] == "api.example.com")
-    expect("no candidates", dnsCandidates("a..b", configuration).size == 0)
+    expect(tally, "absolute candidate", absolute.size == 1 && absolute[0] == "api.example.com")
+    expect(tally, "no candidates", dnsCandidates("a..b", configuration).size == 0)
     val hosts = "127.0.0.1 localhost\n# 10.0.0.9 commented\n" +
         "10.7.7.7\tPinned.Test pinned # alias\n::7 pinned.test\n10.7.7.8 pinned.test\n"
     val listed = dnsHostsLookup(hosts, "pinned.test", 1)
-    expect("hosts A", listed.size == 2 && listed[0].address == "10.7.7.7" &&
+    expect(tally, "hosts A", listed.size == 2 && listed[0].address == "10.7.7.7" &&
         listed[1].address == "10.7.7.8" && listed[0].family == 4)
     val listed6 = dnsHostsLookup(hosts, "PINNED", 28)
-    expect("hosts AAAA alias", listed6.size == 0)
+    expect(tally, "hosts AAAA alias", listed6.size == 0)
     val listed6b = dnsHostsLookup(hosts, "pinned.test.", 28)
-    expect("hosts AAAA", listed6b.size == 1 && listed6b[0].address == "::7" &&
+    expect(tally, "hosts AAAA", listed6b.size == 1 && listed6b[0].address == "::7" &&
         listed6b[0].family == 6)
-    expect("hosts miss", dnsHostsLookup(hosts, "commented", 1).size == 0 &&
+    expect(tally, "hosts miss", dnsHostsLookup(hosts, "commented", 1).size == 0 &&
         dnsHostsLookup(hosts, "10.0.0.9", 1).size == 0)
     return
 }
 
 fun main: int {
-    checkConfiguration()
+    var tally = Tally(0)
+    checkConfiguration(tally)
     var mock = udpBind(ipv4Loopback(0))
     var other = udpBind(ipv4Loopback(0))
     val dnsPort = mock.localPort()
@@ -219,7 +222,7 @@ fun main: int {
     val stray = other.sendTo(mockReply(42, "a.test", 1, 0, [10, 1, 2, 3]),
         ipv4Loopback(dnsPort))
     val echoed = other.receiveFromWithTimeout(4096, 100)
-    expect("mock ignores replies", stray.succeeded() && echoed.timedOut)
+    expect(tally, "mock ignores replies", stray.succeeded() && echoed.timedOut)
     other.close()
     var probe = tcpListenAddress(ipv4Loopback(0))
     val webPort = probe.localPort()
@@ -260,17 +263,17 @@ fun main: int {
     val literal6 = dns.start("::1", 28)
     val mismatched = dns.start("10.0.0.1", 28)
     val invalid = dns.start("a..b", 1)
-    expect("literals done", dns.done(literal4) && dns.done(literal6) &&
+    expect(tally, "literals done", dns.done(literal4) && dns.done(literal6) &&
         dns.done(mismatched) && dns.done(invalid) && dns.pending() == 0 &&
         dns.descriptorOf(literal4) == -1 && dns.descriptors().size == 0)
-    expect("literal A", firstAddress(dns.take(literal4)) == "10.0.0.1")
-    expect("literal AAAA", firstAddress(dns.take(literal6)) == "::1")
+    expect(tally, "literal A", firstAddress(dns.take(literal4)) == "10.0.0.1")
+    expect(tally, "literal AAAA", firstAddress(dns.take(literal6)) == "::1")
     val mixed = dns.take(mismatched)
-    expect("mismatched literal", mixed != null && mixed.succeeded() &&
+    expect(tally, "mismatched literal", mixed != null && mixed.succeeded() &&
         mixed.resolution.addresses.size == 0)
     val bad = dns.take(invalid)
-    expect("invalid host", bad != null && bad.error == "dns invalid host")
-    expect("taken once", dns.take(literal4) == null)
+    expect(tally, "invalid host", bad != null && bad.error == "dns invalid host")
+    expect(tally, "taken once", dns.take(literal4) == null)
 
     // Concurrent queries: answers, the resend, stray replies, a cancel.
     val a = dns.start("a.test", 1)
@@ -280,34 +283,34 @@ fun main: int {
     val spoof = dns.start("spoofnx.test")
     val source = dns.start("wrongsource.test")
     val cancelled = dns.start("silent.test")
-    expect("in flight", dns.pending() == 7 && dns.descriptors().size == 7 &&
+    expect(tally, "in flight", dns.pending() == 7 && dns.descriptors().size == 7 &&
         dns.descriptorOf(a) >= 0 && !dns.done(a))
     dns.cancel(cancelled)
-    expect("cancel", dns.pending() == 6 && dns.descriptorOf(cancelled) == -1)
+    expect(tally, "cancel", dns.pending() == 6 && dns.descriptorOf(cancelled) == -1)
     settle(dns)
     val results = dns.takeResults()
-    expect("concurrent queries: all finished", results.size == 6 && dns.pending() == 0)
+    expect(tally, "concurrent queries: all finished", results.size == 6 && dns.pending() == 0)
     for (result in results) {
         if (result.id == a) {
-            expect("A", firstAddress(result) == "10.1.2.3" &&
+            expect(tally, "A", firstAddress(result) == "10.1.2.3" &&
                 result.resolution.addresses[0].ttlSeconds == 30 &&
                 result.host == "a.test" && result.recordType == 1)
         } else if (result.id == aaaa) {
-            expect("AAAA", firstAddress(result) == "fd00:0:0:0:0:0:0:1" &&
+            expect(tally, "AAAA", firstAddress(result) == "fd00:0:0:0:0:0:0:1" &&
                 result.resolution.addresses[0].family == 6)
         } else if (result.id == resend) {
-            expect("resend", firstAddress(result) == "10.9.9.9")
+            expect(tally, "resend", firstAddress(result) == "10.9.9.9")
         } else if (result.id == noise) {
-            expect("stray reply ignored", firstAddress(result) == "10.4.4.4")
+            expect(tally, "stray reply ignored", firstAddress(result) == "10.4.4.4")
         } else if (result.id == spoof) {
-            expect("NXDOMAIN for another question ignored",
+            expect(tally, "NXDOMAIN for another question ignored",
                 firstAddress(result) == "10.5.5.5")
         } else if (result.id == source) {
-            expect("NXDOMAIN from another port ignored",
+            expect(tally, "NXDOMAIN from another port ignored",
                 firstAddress(result) == "10.6.6.6")
-        } else expect("unexpected result ${result.id}", false)
+        } else expect(tally, "unexpected result ${result.id}", false)
     }
-    expect("sockets released", dns.descriptors().size == 0 &&
+    expect(tally, "sockets released", dns.descriptors().size == 0 &&
         dns.descriptorOf(a) == -1)
 
     // Server errors and silence run to the deadline, which a stalled test can
@@ -318,27 +321,27 @@ fun main: int {
     settle(deadlines)
     val elapsed = linuxMonotonicMilliseconds() - began
     val timedOut = deadlines.takeResults()
-    expect("all timed out", timedOut.size == 2 && deadlines.pending() == 0)
+    expect(tally, "all timed out", timedOut.size == 2 && deadlines.pending() == 0)
     for (result in timedOut) {
         if (result.id == servfail) {
-            expect("SERVFAIL ignored until the deadline",
+            expect(tally, "SERVFAIL ignored until the deadline",
                 result.error == "dns timeout" && result.resolution.timedOut)
         } else if (result.id == silent) {
-            expect("timeout", result.error == "dns timeout" &&
+            expect(tally, "timeout", result.error == "dns timeout" &&
                 !result.resolution.succeeded && result.resolution.timedOut)
-        } else expect("unexpected result ${result.id}", false)
+        } else expect(tally, "unexpected result ${result.id}", false)
     }
-    expect("deadline kept", elapsed >= 550)
-    expect("deadline sockets released", deadlines.descriptors().size == 0)
+    expect(tally, "deadline kept", elapsed >= 550)
+    expect(tally, "deadline sockets released", deadlines.descriptors().size == 0)
     deadlines.close()
 
     // NXDOMAIN fails at once: by the answer, not by the deadline (a deadline would say "dns timeout"), which no wall-clock
     // bound needs to say.
     val nx = resolveOne(dns, "nx.test", 1)
-    expect("NXDOMAIN fails fast", nx != null && nx.error == "dns name not found" &&
+    expect(tally, "NXDOMAIN fails fast", nx != null && nx.error == "dns name not found" &&
         nx.resolution.nameNotFound && nx.resolution.errorCode == 2)
     val nodata = resolveOne(dns, "v6only.test", 1)
-    expect("no records", nodata != null && nodata.succeeded() &&
+    expect(tally, "no records", nodata != null && nodata.succeeded() &&
         nodata.resolution.addresses.size == 0)
 
     // An outside loop: poll the descriptors itself, then receive and sweep.
@@ -353,7 +356,7 @@ fun main: int {
         dns.sweep()
         loops = loops + 1
     }
-    expect("outside loop", firstAddress(dns.take(outside)) == "10.1.2.3")
+    expect(tally, "outside loop", firstAddress(dns.take(outside)) == "10.1.2.3")
     dns.close()
 
     // Search domains, ndots and the hosts file.
@@ -362,19 +365,19 @@ fun main: int {
         nameserverPort = dnsPort, configurationPath = searchConfiguration,
         hostsPath = hostsFile
     ))
-    expect("search: first domain",
+    expect(tally, "search: first domain",
         firstAddress(resolveOne(searching, "redis", 1)) == "10.2.2.2")
-    expect("search: second domain",
+    expect(tally, "search: second domain",
         firstAddress(resolveOne(searching, "api", 1)) == "10.3.3.3")
-    expect("search: absolute name",
+    expect(tally, "search: absolute name",
         firstAddress(resolveOne(searching, "redis.ns.svc.cluster.local.", 1)) == "10.2.2.2")
-    expect("search: below ndots, as written last",
+    expect(tally, "search: below ndots, as written last",
         firstAddress(resolveOne(searching, "a.test", 1)) == "10.1.2.3")
     val searchNx = resolveOne(searching, "nx.test", 1)
-    expect("search: NXDOMAIN for every candidate",
+    expect(tally, "search: NXDOMAIN for every candidate",
         searchNx != null && searchNx.error == "dns name not found")
     val searchNodata = resolveOne(searching, "v6only.test", 1)
-    expect("search: no records after NXDOMAIN", searchNodata != null &&
+    expect(tally, "search: no records after NXDOMAIN", searchNodata != null &&
         searchNodata.succeeded() && searchNodata.resolution.addresses.size == 0)
     val searchingBriefly = dnsAsyncResolver(DnsAsyncOptions(
         timeoutMilliseconds = 600, resendMilliseconds = 150,
@@ -383,48 +386,48 @@ fun main: int {
     ))
     val searchSilent = resolveOne(searchingBriefly, "silent", 1)
     searchingBriefly.close()
-    expect("search: a timeout ends the search", searchSilent != null &&
+    expect(tally, "search: a timeout ends the search", searchSilent != null &&
         searchSilent.error == "dns timeout")
     val pinned = searching.start("pinned", 1)
-    expect("hosts: at once", searching.done(pinned) &&
+    expect(tally, "hosts: at once", searching.done(pinned) &&
         firstAddress(searching.take(pinned)) == "10.7.7.7")
-    expect("hosts: AAAA",
+    expect(tally, "hosts: AAAA",
         firstAddress(resolveOne(searching, "pinned.test", 28)) == "::7")
     searching.close()
 
     // The blocking resolver resolves the same way.
     val blockingNx = dnsResolveType("nx.test", 1, answeredDeadline, "", dnsPort,
         searchConfiguration, hostsFile)
-    expect("blocking: NXDOMAIN", !blockingNx.succeeded && blockingNx.nameNotFound &&
+    expect(tally, "blocking: NXDOMAIN", !blockingNx.succeeded && blockingNx.nameNotFound &&
         blockingNx.errorCode == 2 && !blockingNx.timedOut)
-    expect("blocking: search", firstResolved(dnsResolveType("redis", 1, answeredDeadline, "",
+    expect(tally, "blocking: search", firstResolved(dnsResolveType("redis", 1, answeredDeadline, "",
         dnsPort, searchConfiguration, hostsFile)) == "10.2.2.2")
-    expect("blocking: second domain", firstResolved(dnsResolveType("api", 1, answeredDeadline,
+    expect(tally, "blocking: second domain", firstResolved(dnsResolveType("api", 1, answeredDeadline,
         "", dnsPort, searchConfiguration, hostsFile)) == "10.3.3.3")
-    expect("blocking: hosts", firstResolved(dnsResolveType("pinned", 1, answeredDeadline, "",
+    expect(tally, "blocking: hosts", firstResolved(dnsResolveType("pinned", 1, answeredDeadline, "",
         dnsPort, searchConfiguration, hostsFile)) == "10.7.7.7")
-    expect("blocking: literal", firstResolved(dnsResolveType("10.0.0.1", 1, answeredDeadline,
+    expect(tally, "blocking: literal", firstResolved(dnsResolveType("10.0.0.1", 1, answeredDeadline,
         "", dnsPort, searchConfiguration, hostsFile)) == "10.0.0.1")
     val blockingNodata = dnsResolveType("v6only.test", 1, answeredDeadline, "", dnsPort,
         searchConfiguration, hostsFile)
-    expect("blocking: no records", blockingNodata.succeeded &&
+    expect(tally, "blocking: no records", blockingNodata.succeeded &&
         blockingNodata.addresses.size == 0)
     val both = dnsResolve("v6only.test", answeredDeadline, "", dnsPort, searchConfiguration,
         hostsFile)
-    expect("blocking: both families", both.succeeded && both.addresses.size == 1 &&
+    expect(tally, "blocking: both families", both.succeeded && both.addresses.size == 1 &&
         both.addresses[0].family == 6)
     val bothNx = dnsResolve("nx.test", answeredDeadline, "", dnsPort, searchConfiguration,
         hostsFile)
-    expect("blocking: both not found", !bothNx.succeeded && bothNx.nameNotFound)
+    expect(tally, "blocking: both not found", !bothNx.succeeded && bothNx.nameNotFound)
     val blockingSilent = dnsResolveType("silent", 1, 300, "", dnsPort,
         searchConfiguration, hostsFile)
-    expect("blocking: timeout", !blockingSilent.succeeded && blockingSilent.timedOut)
+    expect(tally, "blocking: timeout", !blockingSilent.succeeded && blockingSilent.timedOut)
 
     val deadlineStart = linuxMonotonicMilliseconds()
     val bounded = dnsResolve("silent", 2000, "", dnsPort,
         searchConfiguration, hostsFile, deadlineStart + 150)
     val deadlineElapsed = linuxMonotonicMilliseconds() - deadlineStart
-    expect("blocking: shared deadline across families", !bounded.succeeded &&
+    expect(tally, "blocking: shared deadline across families", !bounded.succeeded &&
         deadlineElapsed >= 70 && deadlineElapsed < 1200)
 
     // HttpAsyncClient resolves through the same resolver.
@@ -469,14 +472,14 @@ fun main: int {
         }
         loops = loops + 1
     }
-    expect("http timeout: $missingError", missingError == "dns timeout")
-    expect("http outcomes: $outcomes",
+    expect(tally, "http timeout: $missingError", missingError == "dns timeout")
+    expect(tally, "http outcomes: $outcomes",
         textContains(outcomes, "web=200 world:/hello;") &&
         textContains(outcomes, "short=200 world:/short;") &&
         textContains(outcomes, "listed=200 world:/listed;") &&
         textContains(outcomes, "unknown=dns name not found;") &&
         textContains(outcomes, "v6only=dns: no IPv4 address for v6only.test;"))
-    expect("http NXDOMAIN fast", unknownMilliseconds >= 0)
+    expect(tally, "http NXDOMAIN fast", unknownMilliseconds >= 0)
     // The cached address: no query, the pooled connection.
     val again = client.get("http://web.test:$webPort/again")
     var cached = false
@@ -489,13 +492,13 @@ fun main: int {
         }
         loops = loops + 1
     }
-    expect("http cached", cached && client.pending() == 0)
+    expect(tally, "http cached", cached && client.pending() == 0)
 
     linuxSyscall2(62, mockChild, 9)
     linuxWaitProcess(mockChild)
     linuxSyscall2(62, webChild, 9)
     linuxWaitProcess(webChild)
-    if (failures == 0) {
+    if (tally.failures == 0) {
         println("dns async: ok")
         42
     } else 1
