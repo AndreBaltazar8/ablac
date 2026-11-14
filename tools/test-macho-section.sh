@@ -36,5 +36,10 @@ for target in arm64-macos x86_64-macos; do
     llvm-objdump -h "$out/$target.o" | grep -q '__abla_ct_alloca' || {
         echo "macho section ($target): no section __abla_ct_alloca in the object" >&2; exit 1
     }
+    # The hidden memory routines' labels are assembler-private ("L"), not symbols a linker may dead-strip as atoms.
+    if llvm-nm "$out/$target.o" | grep -q ' [tT] \.Labla_'; then
+        echo "macho section ($target): a routine label is a symbol (.Labla_...)" >&2; exit 1
+    fi
+    llvm-nm "$out/$target.o" | grep -q ' _memcpy$' || { echo "macho section ($target): no _memcpy of its own" >&2; exit 1; }
 done
 echo 'macho section: both Mac targets assemble, the allocation entry in __TEXT,__abla_ct_alloca'
