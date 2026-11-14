@@ -104,6 +104,7 @@ fun ctNativeIntrinsicPrefix(name: string): bool =
 // abla/unsafe/memory, abla/unsafe/native and abla/sys/linux, and the runtime's
 // allocation entry points they reach).
 fun ctNativeIntrinsic(name: string): bool =
+    name.startsWith("ablaUnsafeVolatileLoadU") || name.startsWith("ablaUnsafeVolatileStoreU") ||
     name == "ablaUnsafeLoadU8" || name == "ablaUnsafeLoadU16" ||
     name == "ablaUnsafeLoadU32" || name == "ablaUnsafeLoadI64" ||
     name == "ablaUnsafeLoadPointer" ||
@@ -133,6 +134,85 @@ fun ctNativeIntrinsic(name: string): bool =
     name == "ablaLinuxEnvironmentPointer" ||
     name == "ablaHostIsMacOS" || name == "ablaHostIsIOS" || name == "ablaHostOwnsRuntime" || name ==
     "ablaHostValueArgumentsIndirect"
+
+// The build's target, as numbers (a string kept here would not outlive a region): what the interpreter answers for the
+// target queries of abla/simd/target (the architecture) and abla/ct (32-bit pointers), so that compile-time code sees the
+// target it is compiled for, as run-time code does, and not the host the compiler runs on (#822). -1: no build has set it
+// (the compiler's own host).
+var ctNativeBuildArch: int = -1
+var ctNativeBuildNarrow: int = -1
+
+// The architecture number of abla/simd/target: 1 x86-64, 2 AArch64, 3 Wasm, 4 Xtensa, 0 other.
+fun ctNativeArchOfTriple(triple: string): int =
+    if (bootstrapTextContains(triple, "x86_64")) 1
+    else if (bootstrapTextContains(triple, "aarch64") || bootstrapTextContains(triple, "arm64")) 2
+    else if (bootstrapTextContains(triple, "wasm32")) 3
+    else if (bootstrapTextContains(triple, "xtensa")) 4
+    else 0
+
+// Pointers of 32 bits (Wasm excepted: its constant-time code has its own layout), as the backend's ablaCtNarrowTarget.
+fun ctNativeNarrowOfTriple(triple: string): bool =
+    (bootstrapTextContains(triple, "xtensa") || bootstrapTextContains(triple, "riscv32") ||
+     bootstrapTextContains(triple, "thumb") || bootstrapTextContains(triple, "i386") ||
+     bootstrapTextContains(triple, "i486") || bootstrapTextContains(triple, "i586") ||
+     bootstrapTextContains(triple, "i686")) && !bootstrapTextContains(triple, "wasm32")
+
+fun ctNativeSetBuildTarget(triple: string): void {
+    ctNativeBuildArch = ctNativeArchOfTriple(triple)
+    ctNativeBuildNarrow = if (ctNativeNarrowOfTriple(triple)) 1 else 0
+    return
+}
+
+// The constant-time primitives (abla/ct: a secret integer is the integer itself under `#`, whose values are neither secret nor
+// timed), the target queries, and the stack wipes (an interpreter frame has no native stack to wipe, as on Wasm). The CPU probe
+// answers "no feature" (0): compile-time code takes the portable software path, whose answers the hardware paths must equal.
+fun ctNativePrimitive(name: string): bool =
+    name == "ablaCtNarrowTarget" || name == "ablaSimdTargetArch" || name == "ablaSimdCpuProbe" ||
+    name.startsWith("ablaCtSecret_") || name.startsWith("ablaCtBits_") ||
+    name == "ablaCtScrubSaveAreas" ||
+    name.startsWith("ablaCtScrubStack") || name.startsWith("ablaCtScrubBoundedStack")
+
+fun ctNativeEvaluatePrimitive(
+    var evaluator: BootstrapEvaluator,
+    expression: BootstrapExpression,
+    name: string
+): BootstrapEvalValue {
+    if (name.startsWith("ablaCtSecret_") || name.startsWith("ablaCtBits_")) {
+        if (expression.children.size == 0) return bootstrapEvalInvalid()
+        val operand = evaluator.evaluate(expression.children[0])
+        if (bootstrapEvalLeaves(operand)) return operand
+        // ablaCtSecret_u32 makes a secretU32 of a u32 and ablaCtBits_u32 the u32 of a secretU32: the same bits, the other type,
+        // which is what finds the operators of secretU32 for a value (an integer carries its type).
+        val secret = name.startsWith("ablaCtSecret_")
+        val width = if (name.endsWith("_u8")) "u8" else if (name.endsWith("_u16")) "u16"
+            else if (name.endsWith("_u32")) "u32" else "u64"
+        val nominal = if (!secret) "" else if (width == "u8") "secretU8" else if (width == "u16") "secretU16"
+            else if (width == "u32") "secretU32" else "secretU64"
+        return bootstrapEvalScalar(operand.integer, width, nominal)
+    }
+    if (name == "ablaCtNarrowTarget") {
+        val narrow = if (ctNativeBuildNarrow >= 0) ctNativeBuildNarrow == 1
+            else ctNativeNarrowOfTriple(llvmDefaultTargetTriple())
+        return bootstrapEvalBoolean(narrow)
+    }
+    if (name == "ablaSimdTargetArch") {
+        return bootstrapEvalInteger(if (ctNativeBuildArch >= 0) ctNativeBuildArch
+            else ctNativeArchOfTriple(llvmDefaultTargetTriple()))
+    }
+    if (name == "ablaSimdCpuProbe") return bootstrapEvalInteger(0)
+    bootstrapEvalVoid()
+}
+
+// A volatile access is an ordinary one for the interpreter (no other thread, no device): ablaUnsafeVolatileLoadU32 is
+// ablaUnsafeLoadU32, and the 64-bit ones are the I64 ones.
+fun ctNativeNonVolatileName(name: string): string {
+    val kind = if (name.startsWith("ablaUnsafeVolatileLoad")) "Load" else "Store"
+    val width = name.slice(name.size - 3, name.size)
+    if (width == "U64") "ablaUnsafe" + kind + "I64"
+    else if (width == "U16") "ablaUnsafe" + kind + "U16"
+    else if (width == "U32") "ablaUnsafe" + kind + "U32"
+    else "ablaUnsafe" + kind + "U8"
+}
 
 // The compile capability an intrinsic needs (the effect bit the semantic
 // analysis gives its declaration).
@@ -289,6 +369,9 @@ trusted fun ctNativeEvaluateIntrinsic(
     expression: BootstrapExpression,
     name: string
 ): BootstrapEvalValue {
+    if (name.startsWith("ablaUnsafeVolatile")) {
+        return ctNativeEvaluateIntrinsic(evaluator, expression, ctNativeNonVolatileName(name))
+    }
     val effect = ctNativeIntrinsicEffect(name)
     val contained = ctNativeRawContext == 1 && ctNativeRawOperation(name)
     if (!contained && !ctNativeAllowed(evaluator, effect)) {
