@@ -1,0 +1,498 @@
+// Batch E2 of the port: tools/fuzz-differential's multi-file campaigns. Module graphs (a provider imported directly,
+// through a re-exporting facade, or by two modules in a diamond) and subparser graphs (a provider's subparsers build
+// named, defaulted and mixed calls, loop sources and `when` subjects) run in all six modes without a cache, then
+// with a cache per mode: cold, warm, discovery (everything but the discovery cache removed, and the build must
+// report a discovery hit) and after provider edits. The expected line is computed here. Subparser refusals check
+// the diagnostics that generated calls must produce in interp and JIT, and cross-target tiers build one Wasm child
+// at compile time under interp, jit and auto: identical bytes, the child's own checks pass, and the trace shows
+// which sites ran natively and which fell back to the interpreter.
+import "abla/io"
+import "abla/text"
+import "abla/fs"
+import "abla/crypto"
+import "abla/integer"
+import "./prng.ab"
+import "./gen.ab"
+import "./modes.ab"
+import "./verdict.ab"
+
+val FUZZ_MODES: array<string> = ["fast", "release", "ct", "ct-jit", "wasm", "wasm-dev"]
+
+/** A Wasm module built at compile time with a cache, then run by node. Paths are relative to the root. */
+fun fuzzCachedWasmJob(runner: FuzzRunner, directory: string, mode: string, cacheDir: string, trace: bool): FuzzJob {
+    val source = "$directory/program.ab"
+    val output = "$directory/graph-$mode.wasm"
+    val driver = "${runner.root}/$directory/graph-$mode-driver.ab"
+    val registration = if (mode == "wasm-dev") "val target = #wasm32Target()\n" else ""
+    val call = if (mode == "wasm") "wasmBuildModule(\"graph\", \"$source\", \"$output\", false, true)" else
+        "buildProgram(\"graph\", \"$source\", \"$output\", \"wasm32-module\", \"module\", true, true)"
+    if (!Path(driver).exists()) {
+        Path(driver).writeText("import \"abla/wasm/build\"\nimport \"abla/build\"\n${registration}val built = #$call\n" +
+            "fun main: int = if (built) 0 else 1\n")
+    }
+    val names: array<string> = ["ABLA_CACHE_DIR"]
+    val values: array<string> = [cacheDir]
+    if (trace) {
+        names.append("ABLA_COMPILER_MEMORY_TRACE")
+        values.append("1")
+    }
+    val log = "${runner.root}/$directory/cached-$mode"
+    Path("${runner.root}/$output").remove()
+    val build = runner.step([runner.compiler, "build", driver, "-o", "${runner.root}/$directory/graph-$mode-driver", "--fast"],
+        names, values, "$log.build.out", "$log.build.err", true)
+    val run = runner.step(["node", "${runner.root}/tools/fuzz-differential.mjs", output], [], [], "$log.stdout", "$log.stderr",
+        true)
+    FuzzJob([build, run], 0, 0, [])
+}
+
+/** The six modes of one cached phase; each result's `errors` holds its build's trace lines when `trace`. */
+fun fuzzCachedPhase(runner: FuzzRunner, directory: string, trace: bool): array<FuzzResult> {
+    val jobs: array<FuzzJob> = []
+    for (mode in FUZZ_MODES) {
+        val cache = "${runner.root}/$directory/cache-$mode"
+        if (mode == "wasm" || mode == "wasm-dev") {
+            jobs.append(fuzzCachedWasmJob(runner, directory, mode, cache, trace))
+        } else {
+            val source = "${runner.root}/$directory/" + (if (mode == "ct" || mode == "ct-jit") "program-ct.ab" else "program.ab")
+            val evaluation = if (mode == "ct") "interp" else if (mode == "ct-jit") "jit" else ""
+            jobs.append(fuzzCachedNativeJob(runner, source, "${runner.root}/$directory/cached-$mode", mode != "release",
+                evaluation, cache, trace))
+        }
+    }
+    runner.runJobs(jobs)
+    val results: array<FuzzResult> = []
+    for (index in 0 until FUZZ_MODES.size) {
+        val log = "${runner.root}/$directory/cached-${FUZZ_MODES[index]}"
+        val job = jobs[index]
+        val buildLog = fuzzReadText("$log.build.err")
+        if (job.statuses.size < 2 || job.statuses[0] != 0) {
+            results.append(FuzzResult(FUZZ_MODES[index], false, "", 0, fuzzFirstLines(buildLog, 6)))
+        } else {
+            results.append(FuzzResult(FUZZ_MODES[index], true, fuzzReadText("$log.stdout"), job.statuses[1],
+                if (trace) buildLog.split("\n") else []))
+        }
+    }
+    results
+}
+
+/** "" when every mode built, exited 0 and printed `expected`. */
+fun fuzzAllExpected(results: array<FuzzResult>, expected: string): string {
+    val bad = fuzzVerdict(results)
+    var mismatch = false
+    for (result in results) {
+        if (!result.built || result.status != 0 || result.output != expected) mismatch = true
+    }
+    if (bad == "" && !mismatch) return ""
+    val shown: array<string> = []
+    for (result in results) shown.append("${result.mode} ${result.describe()}")
+    (if (bad != "") bad else "oracle mismatch") + "; expected ${fuzzQuote(expected)}; results " + textJoin(shown, ", ")
+}
+
+/** Removes everything in a mode's cache but its discovery records, so the frontend runs again over them. */
+fun fuzzKeepDiscoveryOnly(cache: string): void {
+    if (Path(cache).exists()) {
+        for (entry in Path(cache).entries()) {
+            if (!entry.name().startsWith("discovery-v1-")) entry.removeTree()
+        }
+    }
+    return
+}
+
+/** Whether a mode's build trace reports a discovery-cache hit on `file` (by its absolute or root-relative path). */
+fun fuzzDiscoveryHit(result: FuzzResult, root: string, relative: string): bool {
+    for (line in result.errors) {
+        if (line.contains("discovery.hit:$relative") || line.contains("discovery.hit:$root/$relative")) return true
+    }
+    false
+}
+
+/** Runs the cached phases after the no-cache run: cold, warm, discovery, then each edit `edits` makes. */
+fun fuzzGraphPhase(runner: FuzzRunner, label: string, directory: string, phase: string, expected: string,
+    hitFile: string): string {
+    val discovery = phase == "discovery"
+    if (discovery) {
+        for (mode in FUZZ_MODES) fuzzKeepDiscoveryOnly("${runner.root}/$directory/cache-$mode")
+    }
+    val results = fuzzCachedPhase(runner, directory, discovery)
+    if (discovery) {
+        for (result in results) {
+            if (result.built && !fuzzDiscoveryHit(result, runner.root, "$directory/$hitFile")) {
+                return "$label, discovery: ${result.mode} did not report a $hitFile cache hit; retained $directory"
+            }
+        }
+    }
+    val bad = fuzzAllExpected(results, expected)
+    if (bad != "") "$label, $phase: $bad; retained $directory" else ""
+}
+
+// ---- module graphs
+
+fun fuzzGraphProvider(base: int, extra: int): string {
+    val signature = if (extra < 0) "n: int" else "n: int, extra: int = $extra"
+    val suffix = if (extra < 0) "" else " + extra"
+    "val base = $base\nclass MBox<T>(val value: T)\nfun <T> mbox(value: T): MBox<T> = MBox(value)\n" +
+        "interface Measure { fun measure(): int }\nclass Meter(val n: int) : Measure { fun measure(): int = this.n + base }\n" +
+        "compile fun stage($signature): int = n + base$suffix\n"
+}
+
+fun fuzzGraphExpected(a: int, b: int, base: int, extra: int): string = "c0=$a:$b:7:${2 + base}:${5 + base + extra}\n"
+
+/** A strict graph (direct, facade or diamond, with one visible name clash) in six modes, then cached phases with a
+ * provider constant edit and a provider signature edit (a defaulted parameter). "" when every phase agrees. */
+fun fuzzRunModuleGraph(runner: FuzzRunner, seed: int, keep: bool): string {
+    val directory = "build/fuzz-abla/graph$seed"
+    val absolute = "${runner.root}/$directory"
+    if (Path(absolute).exists()) Path(absolute).removeTree()
+    Path(absolute).createDirectories()
+    val r = prngSeeded(seed)
+    val a = r.range(1, 9)
+    val b = r.range(10, 19)
+    val base = r.range(20, 40)
+    val delta = r.range(1, 9)
+    val extra = r.range(1, 9)
+    val variant = seed % 3
+    Path("$absolute/abla.toml").writeText("name = \"fuzz-modules\"\nversion = \"0.1.0\"\nentry = \"program.ab\"\nvisibility = \"imports\"\n")
+    val clash = if (variant == 0) "\nfun clash(): int = 7\n" else ""
+    Path("$absolute/provider.ab").writeText(fuzzGraphProvider(base, -1) + clash)
+    var imports = "import \"./provider.ab\"\n"
+    var left = "mbox($a).value"
+    var right = "mbox($b).value"
+    if (variant != 0) {
+        Path("$absolute/left.ab").writeText("export import \"./provider.ab\"\nfun leftValue(): int = mbox($a).value\n" +
+            "fun clash(): int = 7\n")
+        imports = "import \"./left.ab\"\n"
+        left = "leftValue()"
+        if (variant == 2) {
+            Path("$absolute/right.ab").writeText("import \"./provider.ab\"\nfun rightValue(): int = mbox($b).value\n" +
+                "fun clash(): int = 100\n")
+            imports = imports + "import \"./right.ab\" as Right\n"
+            right = "Right.rightValue()"
+        }
+    }
+    val prelude = "import \"abla/io\"\n" + imports + "val staged = #stage(5)\n"
+    val lines = ["fun c0(): string {", "    val m: Measure = Meter(2)",
+        "    \"\${$left}:\${$right}:\${clash()}:\${m.measure()}:\$staged\"", "}"]
+    val label = "graph seed $seed"
+    val plain = runner.allModes(directory, prelude, [FuzzCheck(lines, "c0()", "str", 0)], true)
+    val first = fuzzAllExpected(plain, fuzzGraphExpected(a, b, base, 0))
+    if (first != "") return "$label, no-cache: $first; retained $directory"
+    for (phase in ["cold", "warm", "discovery", "constant", "signature"]) {
+        val edited = phase == "constant" || phase == "signature"
+        val currentBase = if (edited) base + delta else base
+        val currentExtra = if (phase == "signature") extra else -1
+        if (edited) Path("$absolute/provider.ab").writeText(fuzzGraphProvider(currentBase, currentExtra) + clash)
+        val found = fuzzGraphPhase(runner, label, directory, phase,
+            fuzzGraphExpected(a, b, currentBase, if (currentExtra < 0) 0 else currentExtra), "provider.ab")
+        if (found != "") return found
+        if (phase == "cold") {
+            // Every mode's cache must hold a discovery record with the provider's source in it.
+            val provider = Path("$absolute/provider.ab").readText()
+            for (mode in FUZZ_MODES) {
+                if (!fuzzHasDiscoveryRecord("$absolute/cache-$mode", provider)) {
+                    return "$label, cold: $mode has no provider discovery cache record; retained $directory"
+                }
+            }
+        }
+    }
+    if (!keep) Path(absolute).removeTree()
+    ""
+}
+
+fun fuzzHasDiscoveryRecord(cache: string, source: string): bool {
+    if (!Path(cache).exists()) return false
+    for (entry in Path(cache).entries()) {
+        if (entry.name().startsWith("discovery-v1-")) {
+            for (record in entry.entries()) {
+                if (record.name().endsWith(".discovery") && record.readText().contains(source)) return true
+            }
+        }
+    }
+    false
+}
+
+// ---- subparser graphs
+
+fun fuzzSubparserProvider(style: int, extra: int, offset: int): string {
+    val arguments = if (style == 0) "[syntaxNamedArgument(\"right\", b), syntaxNamedArgument(\"left\", a)]" else
+        if (style == 1) "[a, syntaxNamedArgument(\"right\", b), syntaxNamedArgument(\"extra\", syntaxInteger($extra))]" else
+        "[syntaxNamedArgument(\"extra\", syntaxInteger($extra)), syntaxNamedArgument(\"right\", b), syntaxNamedArgument(\"left\", a)]"
+    val pair = "    parserExpect(cursor, \"(\")\n    val a = parserParseAblaExpression(cursor)\n    parserExpect(cursor, \",\")\n" +
+        "    val b = parserParseAblaExpression(cursor)\n    parserExpect(cursor, \")\")\n"
+    val empty = "    parserExpect(cursor, \"(\")\n    parserExpect(cursor, \")\")\n"
+    "import \"abla/compiler\"\nimport \"abla/compiler/parser\"\n" +
+        "compile fun parsePair(cursor: ParserCursor): SyntaxExpression {\n$pair    syntaxCall(\"combine\", $arguments)\n}\n" +
+        "compile fun parseItems(cursor: ParserCursor): SyntaxExpression {\n$pair    syntaxArray([a, b])\n}\n" +
+        "compile fun parseEarly(cursor: ParserCursor): SyntaxExpression {\n$empty    val absent: int? = null\n" +
+        "    syntaxInteger(absent ?? return syntaxInteger($offset))\n}\n" +
+        "compile fun parseBonus(cursor: ParserCursor): SyntaxExpression {\n$empty    syntaxInteger($offset)\n}\n" +
+        "#compilerRegisterSubparser(\"pair\", parsePair)\n#compilerRegisterSubparser(\"items\", parseItems)\n" +
+        "#compilerRegisterSubparser(\"early\", parseEarly)\n#compilerRegisterSubparser(\"bonus\", parseBonus)\n"
+}
+
+fun fuzzSubparserExpected(a: int, b: int, extra: int, style: int, offset: int): string {
+    val value = (a + 1) * 100 + b * 10 + (if (style == 0) 3 else extra)
+    "c0=$value:$value:${a + 1 + b}:1:$offset:$offset:42\n"
+}
+
+/** Generated calls (named, defaulted, mixed), a loop source, a `when` subject and a `?? return` in a subparser, in six
+ * modes, then cached phases and a provider edit. Registration-bearing providers record no discovery entry, so the
+ * discovery phase looks for a hit on the plain helper module. "" when every phase agrees. */
+fun fuzzRunSubparserGraph(runner: FuzzRunner, seed: int, keep: bool): string {
+    val directory = "build/fuzz-abla/subparser$seed"
+    val absolute = "${runner.root}/$directory"
+    if (Path(absolute).exists()) Path(absolute).removeTree()
+    Path(absolute).createDirectories()
+    val r = prngSeeded(seed)
+    val a = r.range(1, 8)
+    val b = r.range(1, 9)
+    val extra = r.range(4, 9)
+    val offset = r.range(10, 20)
+    val delta = r.range(1, 5)
+    val style = seed % 3
+    Path("$absolute/abla.toml").writeText("name = \"fuzz-subparser\"\nversion = \"0.1.0\"\nentry = \"program.ab\"\nvisibility = \"imports\"\n")
+    Path("$absolute/provider.ab").writeText(fuzzSubparserProvider(style, extra, offset))
+    Path("$absolute/helper.ab").writeText("fun marker(): int = 42\n")
+    val value = (a + 1) * 100 + b * 10 + (if (style == 0) 3 else extra)
+    val directExtra = if (style == 0) "" else ", extra = $extra"
+    val prelude = "import \"abla/io\"\nimport \"./provider.ab\"\nimport \"./helper.ab\"\n" +
+        "fun combine(left: int, right: int, extra: int = 3): int = left * 100 + right * 10 + extra\n"
+    val lines = ["fun c0(): string {", "    val got = \$pair($a + 1, $b)",
+        "    val direct = combine(left = $a + 1, right = $b$directExtra)", "    var sum = 0",
+        "    for (v in \$items($a + 1, $b)) sum += v", "    val choice = when (\$pair($a + 1, $b)) { $value -> 1; else -> 0 }",
+        "    \"\$got:\$direct:\$sum:\$choice:\${\$early()}:\${\$bonus()}:\${marker()}\"", "}"]
+    val label = "subparser seed $seed"
+    val plain = runner.allModes(directory, prelude, [FuzzCheck(lines, "c0()", "str", 0)], true)
+    val first = fuzzAllExpected(plain, fuzzSubparserExpected(a, b, extra, style, offset))
+    if (first != "") return "$label, no-cache: $first; retained $directory"
+    for (phase in ["cold", "warm", "discovery", "provider-edit"]) {
+        val currentOffset = if (phase == "provider-edit") offset + delta else offset
+        if (phase == "provider-edit") Path("$absolute/provider.ab").writeText(fuzzSubparserProvider(style, extra, currentOffset))
+        val found = fuzzGraphPhase(runner, label, directory, phase, fuzzSubparserExpected(a, b, extra, style, currentOffset),
+            "helper.ab")
+        if (found != "") return found
+    }
+    if (!keep) Path(absolute).removeTree()
+    ""
+}
+
+// ---- subparser refusals
+
+val FUZZ_REFUSAL_PROVIDER = "import \"abla/compiler\"\nimport \"abla/compiler/parser\"\n" +
+    "compile fun noArgs(cursor: ParserCursor): void { parserExpect(cursor, \"(\"); parserExpect(cursor, \")\"); return }\n" +
+    "compile fun named(name: string, value: int): SyntaxExpression = syntaxNamedArgument(name, syntaxInteger(value))\n" +
+    "compile fun parseUnknown(cursor: ParserCursor): SyntaxExpression {\n    noArgs(cursor)\n" +
+    "    syntaxCall(\"combine\", [named(\"left\", 2), named(\"right\", 3), named(\"unknown\", 1)])\n}\n" +
+    "compile fun parseDuplicate(cursor: ParserCursor): SyntaxExpression {\n    noArgs(cursor)\n" +
+    "    syntaxCall(\"combine\", [named(\"left\", 2), named(\"right\", 3), named(\"left\", 1)])\n}\n" +
+    "compile fun parseOrder(cursor: ParserCursor): SyntaxExpression {\n    noArgs(cursor)\n" +
+    "    syntaxCall(\"combine\", [named(\"left\", 2), syntaxInteger(3)])\n}\n" +
+    "compile fun parseEarlyBad(cursor: ParserCursor): SyntaxExpression {\n    noArgs(cursor)\n    val absent: int? = null\n" +
+    "    syntaxInteger(absent ?? return syntaxCall(\"combine\", [named(\"left\", 2), named(\"right\", 3), named(\"unknown\", 1)]))\n}\n" +
+    "compile fun parseStop(cursor: ParserCursor): SyntaxExpression {\n    noArgs(cursor)\n    var n = 0\n" +
+    "    while (n < 1000000) n += 1\n    syntaxInteger(n)\n}\n" +
+    "#compilerRegisterSubparser(\"unknown\", parseUnknown)\n#compilerRegisterSubparser(\"duplicate\", parseDuplicate)\n" +
+    "#compilerRegisterSubparser(\"order\", parseOrder)\n#compilerRegisterSubparser(\"earlybad\", parseEarlyBad)\n" +
+    "#compilerRegisterSubparser(\"stop\", parseStop)\n"
+
+/** The source span named by the first `source[<label>]:...:<begin>:<end>` line, or [-1, -1]. */
+fun fuzzSourceSpan(errors: string, label: string): array<int> {
+    for (line in errors.split("\n")) {
+        val at = line.indexOf("source[$label]:")
+        if (at >= 0) {
+            val parts = line.split(":")
+            if (parts.size >= 2) {
+                val begin = parts[parts.size - 2].trim().parseInt() ?? -1
+                val end = parts[parts.size - 1].trim().parseInt() ?? -1
+                return [begin, end]
+            }
+        }
+    }
+    [-1, -1]
+}
+
+/** Each refused generated call fails with its diagnostic at the `$name()` site, in interp and in JIT; the step limit
+ * and the early-returned bad call give exactly one error. 0 when all ten builds do. */
+fun fuzzCheckSubparserRefusals(runner: FuzzRunner): int {
+    val directory = "${runner.root}/build/fuzz-abla/subparser-refusals"
+    if (Path(directory).exists()) Path(directory).removeTree()
+    Path(directory).createDirectories()
+    Path("$directory/provider.ab").writeText(FUZZ_REFUSAL_PROVIDER)
+    val names = ["unknown", "duplicate", "order", "earlybad", "stop"]
+    val codes = ["E_NAMED_ARGUMENT_UNKNOWN", "E_NAMED_ARGUMENT_DUPLICATE", "E_NAMED_ARGUMENT_ORDER",
+        "E_NAMED_ARGUMENT_UNKNOWN", "E_EVAL_STEP_LIMIT"]
+    val labels = ["named-argument", "named-argument", "named-argument", "named-argument", "extension-expression"]
+    val jobs: array<FuzzJob> = []
+    val texts: array<string> = []
+    val logs: array<string> = []
+    for (index in 0 until names.size) {
+        val name = names[index]
+        val text = "import \"./provider.ab\"\nfun combine(left: int, right: int): int = left + right\nfun main(): int = \$$name()\n"
+        Path("$directory/$name.ab").writeText(text)
+        for (tier in ["interp", "jit"]) {
+            val envNames: array<string> = ["ABLA_COMPILE_EVAL"]
+            val envValues: array<string> = [tier]
+            if (name == "stop") {
+                envNames.append("ABLA_EVAL_STEP_LIMIT")
+                envValues.append("10000")
+            }
+            val log = "$directory/$name-$tier"
+            jobs.append(FuzzJob([runner.step([runner.compiler, "build", "$directory/$name.ab", "--fast", "--no-cache", "-o", log],
+                envNames, envValues, "$log.out", "$log.err", true)], 0, 0, []))
+            texts.append(text)
+            logs.append(log)
+        }
+    }
+    runner.runJobs(jobs)
+    for (index in 0 until jobs.size) {
+        val name = names[index / 2]
+        val tier = if (index % 2 == 0) "interp" else "jit"
+        val errors = fuzzReadText("${logs[index]}.err")
+        var count = 0
+        var hasCode = false
+        for (line in errors.split("\n")) {
+            if (line.startsWith("error[")) {
+                count = count + 1
+                if (line.startsWith("error[${codes[index / 2]}]")) hasCode = true
+            }
+        }
+        val span = fuzzSourceSpan(errors, labels[index / 2])
+        val text = texts[index]
+        val site = span[0] >= 0 && span[1] <= text.size && span[0] <= span[1] &&
+            text.slice(span[0], span[1]).contains("\$$name()")
+        val status = jobs[index].statuses[0]
+        if (status == 0 || !hasCode || !site || ((name == "stop" || name == "earlybad") && count != 1)) {
+            println("$name $tier: unexpected diagnostic/status $status; errors=$count; site=$site\n$errors")
+            return 1
+        }
+        println("$name $tier: expected ${codes[index / 2]} at call site ($count error(s))")
+    }
+    0
+}
+
+// ---- cross-target tiers
+
+val FUZZ_TIER_NATIVE: array<string> = ["WRAP", "SHIFT", "TEXT", "ARRAY", "CLASS", "BYTES", "HASH", "FILE"]
+val FUZZ_TIER_INTERPRETED: array<string> = ["FLOAT", "POINTER", "TARGET"]
+val FUZZ_TIER_REASONS: array<string> = ["expression float", "pointerIsNull", "ablaU128NarrowTarget"]
+
+/** The Wasm child: compile-time values of each portable kind, and three that must fall back to the interpreter. Its
+ * run() returns 0 when every value is the one computed here. The SHA-256 expectation comes from abla/crypto (checked
+ * against Node's by tools/test-sha2-differential.sh), the rest from plain arithmetic. */
+fun fuzzCrossTargetProgram(seed: int, dataPath: string, data: string): string {
+    val r = prngSeeded(seed)
+    val n = r.range(1, 1000)
+    val shift = r.range(64, 80)
+    val values = [r.range(1, 50), r.range(1, 50), r.range(1, 50)]
+    val text = "tier${seed}x$n"
+    val digest = hexEncode(sha256(data))
+    val wrapped = 9223372036854775807 + n
+    "import \"abla/wasm/build\"\nimport \"abla/compiler\"\nimport \"abla/bytes\"\nimport \"abla/crypto\"\nimport \"abla/fs\"\n" +
+        "import \"abla/uint128\"\nimport \"abla/unsafe/memory/raw\"\n#compilerGrant(\"filesystem.read\")\n" +
+        "#compilerGrant(\"trusted.native\")\nclass TierBox(var value: int)\n" +
+        "compile fun wrapping(): int { var x = 9223372036854775807; x += $n; x }\n" +
+        "compile fun sequence(): int { val xs: array<int> = [${values[0]}, ${values[1]}]; xs.append(${values[2]}); " +
+        "xs[0] + xs[1] + xs[2] }\n" +
+        "compile fun boxed(): int { val box = TierBox(${values[0]}); box.value += ${values[1]}; box.value }\n" +
+        "compile fun byteSum(): int { val b = byteBuffer(); b.appendByteValue(${values[0]}); " +
+        "b.appendByteValue(${values[1]}); val t = b.toText(); t[0] + t[1] }\n" +
+        "trusted fun pointerCheck(): int = if (pointerIsNull(nativeNullPointer())) 42 else 1\n" +
+        "val WRAP = #wrapping()\nval SHIFT = #(1 << $shift)\nval TEXT = #\"$text\".slice(1, ${text.size - 1})\n" +
+        "val ARRAY = #sequence()\nval CLASS = #boxed()\nval BYTES = #byteSum()\nval HASH = #hexEncode(sha256(\"$data\"))\n" +
+        "val FILE = #path(\"$dataPath\").readText()\nval FLOAT = #(1.5 + 0.5)\nval POINTER = #pointerCheck()\n" +
+        "val TARGET = #ablaU128NarrowTarget()\n@export(\"run\")\nfun run(): int {\n" +
+        "    if (WRAP != $wrapped || SHIFT != 0 || TEXT != \"${text.slice(1, text.size - 1)}\") return 1\n" +
+        "    if (ARRAY != ${values[0] + values[1] + values[2]} || CLASS != ${values[0] + values[1]} || " +
+        "BYTES != ${values[0] + values[1]}) return 2\n" +
+        "    if (HASH != \"$digest\" || FILE != \"$data\") return 3\n" +
+        "    if (FLOAT != 2.0 || POINTER != 42 || TARGET) return 4\n    0\n}\n"
+}
+
+/** Whether the trace reports `val NAME = #`'s site running natively (`note[ct-jit]: native at ...child.ab:<offset of
+ * the #>`). */
+fun fuzzTierNative(trace: string, text: string, name: string): bool {
+    val marker = text.indexOf("val $name = #") + "val $name = #".size - 1
+    for (line in trace.split("\n")) {
+        if (line.startsWith("note[ct-jit]: native at ") && line.endsWith("child.ab:$marker")) return true
+    }
+    false
+}
+
+/** Whether the trace reports `val NAME = #`'s expression interpreted for `reason`. */
+fun fuzzTierInterpreted(trace: string, text: string, name: string, reason: string): bool {
+    var expression = text.indexOf("val $name = #") + "val $name = #".size
+    while (expression < text.size && (text[expression] == 32 || text[expression] == 40)) expression = expression + 1
+    for (line in trace.split("\n")) {
+        if (line.startsWith("note[ct-jit]: interpreted at $expression: cross-target site reaches ") &&
+            line.contains(reason)) return true
+    }
+    false
+}
+
+/** One Wasm child built at compile time under interp, jit and auto: identical bytes, its checks pass under node, and
+ * under jit and auto the trace shows native child sites (never none) and the three fallbacks interpreted. */
+fun fuzzRunCrossTargetTiers(runner: FuzzRunner, seed: int, keep: bool): string {
+    val directory = "build/fuzz-abla/cross-target-tiers-$seed"
+    val absolute = "${runner.root}/$directory"
+    Path(absolute).createDirectories()
+    val source = "$directory/child.ab"
+    val dataPath = "$directory/input.txt"
+    val data = "tier fixture $seed"
+    val text = fuzzCrossTargetProgram(seed, dataPath, data)
+    Path("$absolute/child.ab").writeText(text)
+    Path("$absolute/input.txt").writeText(data)
+    Path("$absolute/abla.toml").writeText("compileCapabilities = [\"filesystem.read\", \"trusted.native\"]\n")
+    val wasm = "$directory/child.wasm"
+    val driver = "$directory/build.ab"
+    Path("${runner.root}/$driver").writeText("import \"abla/wasm/build\"\nval built = #wasmBuildModule(\"tier\", \"$source\", " +
+        "\"$wasm\", true, false)\nfun main: int = if (built) 0 else 1\n")
+    val artifacts: array<string> = []
+    val sites: array<string> = []
+    for (tier in ["interp", "jit", "auto"]) {
+        if (Path("${runner.root}/$wasm").exists()) Path("${runner.root}/$wasm").remove()
+        val log = "$absolute/$tier"
+        val build = runner.step([runner.compiler, "build", driver, "--fast", "--no-cache", "-o", "$absolute/builder"],
+            ["ABLA_COMPILE_EVAL", "ABLA_COMPILE_EVAL_TRACE"], [tier, "1"], "$log.out", "$log.trace", true)
+        val builder = runner.step(["$absolute/builder"], [], [], "$log.builder.out", "$log.builder.err", true)
+        val node = runner.step(["node", "${runner.root}/tools/fuzz-differential.mjs", wasm], [], [], "$log.node.out",
+            "$log.node.err", true)
+        val jobs = [FuzzJob([build], 0, 0, [])]
+        runner.runJobs(jobs)
+        val trace = fuzzReadText("$log.trace")
+        if (jobs[0].statuses[0] != 0 || !Path("${runner.root}/$wasm").exists()) {
+            val tail = if (trace.size > 2000) trace.slice(trace.size - 2000, trace.size) else trace
+            return "cross-target seed $seed $tier: build failed (${jobs[0].statuses[0]}): $tail; retained $directory"
+        }
+        artifacts.append(Path("${runner.root}/$wasm").readText())
+        Path("$absolute/$tier.wasm").writeText(artifacts[artifacts.size - 1])
+        val after = [FuzzJob([builder], 0, 0, []), FuzzJob([node], 0, 0, [])]
+        runner.runJobs(after)
+        if (after[0].statuses[0] != 0) {
+            return "cross-target seed $seed $tier: builder exited ${after[0].statuses[0]}: " +
+                "${fuzzReadText("$log.builder.err")}; retained $directory"
+        }
+        val out = fuzzReadText("$log.node.out")
+        if (after[1].statuses[0] != 0 || out != "") {
+            return "cross-target seed $seed $tier: oracle failed status=${after[1].statuses[0]} stdout=${fuzzQuote(out)} " +
+                "stderr=${fuzzQuote(fuzzReadText("$log.node.err"))}; retained $directory"
+        }
+        if (tier != "interp") {
+            val native: array<string> = []
+            for (name in FUZZ_TIER_NATIVE) {
+                if (fuzzTierNative(trace, text, name)) native.append(name)
+            }
+            if (native.size == 0) return "cross-target seed $seed $tier: vacuous (no native child sites); retained $directory"
+            for (k in 0 until FUZZ_TIER_INTERPRETED.size) {
+                if (!fuzzTierInterpreted(trace, text, FUZZ_TIER_INTERPRETED[k], FUZZ_TIER_REASONS[k])) {
+                    return "cross-target seed $seed $tier: ${FUZZ_TIER_INTERPRETED[k]} not observed interpreted; retained $directory"
+                }
+            }
+            sites.append("$tier: [${textJoin(native, ", ")}]")
+        }
+    }
+    if (artifacts[0] != artifacts[1] || artifacts[0] != artifacts[2]) {
+        return "cross-target seed $seed: Wasm bytes differ between tiers; retained $directory"
+    }
+    println("cross-target seed $seed: byte-identical Wasm and expected values; native child sites {${textJoin(sites, "; ")}}")
+    if (!keep) Path(absolute).removeTree()
+    ""
+}

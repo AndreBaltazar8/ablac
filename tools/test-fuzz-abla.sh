@@ -3,7 +3,8 @@
 # the comparison self-test, a planted disagreement that the minimiser must find and reduce, a check's own oracle
 # failure and a shared non-zero exit through the real six-way runner, two fixed seeds, the recorded cases, and a
 # wrong expectation that each oracle (drop logs, gzip, JSON, YAML) must report in every mode, and one seed of each
-# campaign (hosted tasks, panics, hostless capabilities, shared globals). Long
+# campaign (hosted tasks, panics, hostless capabilities, shared globals, module and subparser graphs with their cache
+# phases, cross-target tiers, subparser refusals). Long
 # campaigns run outside the suite (tools/fuzz/run --seeds ...).
 set -euo pipefail
 
@@ -41,3 +42,7 @@ fuzz --hosted-tasks --seeds 100000 --checks 8
 fuzz --panics --seeds 100008 --checks 2
 fuzz --check-hostless-capabilities
 fuzz --shared-globals --seeds 100000
+fuzz --module-graphs --seeds 100002
+fuzz --subparser-graphs --seeds 100001
+fuzz --cross-target-tiers --seeds 100001
+fuzz --check-subparser-refusals
