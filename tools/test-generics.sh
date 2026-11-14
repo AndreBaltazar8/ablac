@@ -58,6 +58,19 @@ output=$(run "$output_directory/strict")
 [[ $output == $'<3> <s> 2\nstatus 42' ]] ||
     { echo "generics, strict imports: $output" >&2; exit 1; }
 
+# A copied generic call's mark (byte 0x1e on the call's text) is dropped from
+# calls alone: a string literal holding that byte keeps it and what follows,
+# in a program with a copied call and in one without.
+expected='3 5 3 3 3 1 3 4 13 32 | 30 98 30 100 30 49 30 30 30 119 30 30 116 30 | true'
+for program in with-copy without-copy; do
+    for flags in "" --fast; do
+        "$compiler" build "$cases/copy-mark/$program.ab" -o "$output_directory/copy-mark-$program" --no-cache $flags
+        output=$(run "$output_directory/copy-mark-$program")
+        [[ $output == "$expected | x"*$'\nstatus 42' ]] ||
+            { echo "generics, copy mark in literals ($program $flags): $output" >&2; exit 1; }
+    done
+done
+
 # The compiler API: instances listed, type arguments read, and an instance
 # made because a transform asked for it (under each evaluator).
 for mode in interp jit; do
