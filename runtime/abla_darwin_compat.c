@@ -663,6 +663,7 @@ static long darwin_sigprocmask(int64_t how, const void *linux_set,
   return 0;
 }
 
+#if !ABLA_DARWIN_SYSCALLS
 // A signalfd is a kqueue watching its signals with EVFILT_SIGNAL, which sees a
 // signal sent to the process even while it is blocked; poll and the epoll
 // adapter see the kqueue readable once one arrives. A read takes them as
@@ -791,6 +792,7 @@ static long darwin_signalfd_read(int slot, int descriptor,
   return (long)measured * record;
 }
 
+#endif
 // Darwin has no procfs. The one path the toolchain reads, `/proc/self/exe`
 // (its own image, for the build cache identity and to re-run itself), names
 // the running executable. Linux resolves that link to the image the process
@@ -846,6 +848,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
                                   int64_t argument5) {
   long result = -1;
   switch (number) {
+#if !ABLA_DARWIN_SYSCALLS
   case 0: {
     const int slot = darwin_signal_slot((int)argument0);
     result = slot >= 0 ? darwin_signalfd_read(
@@ -856,15 +859,18 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
                               (size_t)argument2);
     break;
   }
+#endif
 #if !ABLA_DARWIN_SYSCALLS
   case 1:
     result = write((int)argument0, (const void *)(uintptr_t)argument1,
                    (size_t)argument2);
     break;
 #endif
+#if !ABLA_DARWIN_SYSCALLS
   case 3:
     result = darwin_close((int)argument0);
     break;
+#endif
 #if !ABLA_DARWIN_SYSCALLS
   case 5: {
     struct stat information;
@@ -897,10 +903,12 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
                                 (void *)(uintptr_t)argument2, argument3);
     break;
 #endif
+#if !ABLA_DARWIN_SYSCALLS
   case 289:
     result = darwin_signalfd(argument0, (const void *)(uintptr_t)argument1,
                              argument2, argument3);
     break;
+#endif
 #if !ABLA_DARWIN_SYSCALLS
   case 16:
     result =

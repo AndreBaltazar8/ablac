@@ -3824,6 +3824,155 @@ trusted fun __ablaRuntimeDarwinEpollWait(queue: int, output: int, maximum: int, 
     written
 }
 
+// ---- macOS signalfd, read and close (#811) ----
+// A signalfd is a kqueue watching its signals with EVFILT_SIGNAL (-6), which sees a signal sent to the process
+// even while it is blocked; poll and the epoll shim see the kqueue readable once one arrives. A read takes the
+// signals as Linux's 128-byte signalfd_siginfo records and, as reading a signalfd does, accepts the pending signal
+// (sigpending 52, __sigwait 330: UNVERIFIED, from memory of xnu's syscalls.master). The descriptors (with whether
+// they are nonblocking, which a read must honour itself) are the ones read and close look for: a table of 16 slots,
+// each a descriptor + 1 (0 free) and a nonblocking flag, and the number in use at +256 (what the adapter's static
+// tables were). BSD numbers: read 3, close 6, kqueue 362, kevent 363.
+trusted fun __ablaRuntimeDarwinSignalState(): int = nativeStaticAllocate(264)
+
+trusted fun __ablaRuntimeDarwinSignalSlot(descriptor: int): int {
+    if (descriptor < 0) return -1
+    val state = __ablaRuntimeDarwinSignalState()
+    if (ablaRuntimeAtomicLoadI64(state + 256) == 0) return -1
+    var slot = 0
+    while (slot < 16) {
+        if (ablaRuntimeAtomicLoadI64(state + slot * 16) == descriptor + 1) return slot
+        slot = slot + 1
+    }
+    -1
+}
+
+// close 3: a signalfd leaves the table first.
+trusted fun __ablaRuntimeDarwinClose(descriptor: int): int {
+    val slot = __ablaRuntimeDarwinSignalSlot(descriptor)
+    if (slot >= 0) {
+        val state = __ablaRuntimeDarwinSignalState()
+        ablaRuntimeAtomicStoreI64(state + slot * 16, 0)
+        ablaRuntimeAtomicFetchAddI64(state + 256, -1)
+    }
+    __ablaRuntimeDarwinResult(ablaDarwinSyscall(6, descriptor, 0, 0, 0, 0, 0))
+}
+
+// The Linux number of a Darwin signal (the inverse of __ablaRuntimeDarwinSignal's table).
+trusted fun __ablaRuntimeLinuxSignalOf(darwin: int): int {
+    var number = 1
+    while (number < 32) {
+        if (__ablaRuntimeDarwinSignal(number) == darwin) return number
+        number = number + 1
+    }
+    darwin
+}
+
+// signalfd4 289 (descriptor or -1, mask, size 8, flags SFD_NONBLOCK 2048 | SFD_CLOEXEC 524288): a new kqueue, or
+// the one of `descriptor`, watching exactly the mask's signals.
+trusted fun __ablaRuntimeDarwinSignalfd(descriptor: int, mask: int, size: int, flags: int): int {
+    if (mask == 0 || size != 8 || (flags & 526336) != flags) return -22
+    val state = __ablaRuntimeDarwinSignalState()
+    var slot = -1
+    var watcher = descriptor
+    if (descriptor != -1) {
+        slot = __ablaRuntimeDarwinSignalSlot(descriptor)
+        if (slot < 0) return -22
+    }
+    val bits = ablaRuntimeLoadI64(mask)
+    if (slot < 0) {
+        val queue = ablaDarwinSyscall(362, 0, 0, 0, 0, 0, 0)
+        if (queue < 0 && queue > -4096) return __ablaRuntimeDarwinResult(queue)
+        __ablaRuntimeDarwinConfigureDescriptor(queue, flags)
+        var free = 0
+        while (free < 16 && slot < 0) {
+            if (ablaRuntimeAtomicCompareExchangeI64(state + free * 16, 0,
+                queue + 1) == 0) slot = free
+            free = free + 1
+        }
+        if (slot < 0) {
+            ablaDarwinSyscall(6, queue, 0, 0, 0, 0, 0)
+            return -24
+        }
+        ablaRuntimeAtomicStoreI64(state + slot * 16 + 8, if ((flags & 2048) != 0) 1 else 0)
+        ablaRuntimeAtomicFetchAddI64(state + 256, 1)
+        watcher = queue
+    }
+    val change = __ablaRuntimeDarwinScratch(32)
+    if (__ablaRuntimeDarwinScratchFailed(change)) {
+        if (descriptor == -1) __ablaRuntimeDarwinClose(watcher)
+        return -12
+    }
+    var number = 1
+    while (number < 32) {
+        val darwin = __ablaRuntimeDarwinSignal(number)
+        if (darwin != 0) {
+            val watched = ((bits >> (number - 1)) & 1) != 0
+            __ablaRuntimeDarwinKevent(change, darwin, -6, if (watched) 5 else 2, 0)
+            val raw = ablaDarwinSyscall(363, watcher, change, 1, 0, 0, 0)
+            if (raw < 0 && raw > -4096 && watched) {
+                __ablaRuntimeDarwinScratchFree(change, 32)
+                if (descriptor == -1) __ablaRuntimeDarwinClose(watcher)
+                return __ablaRuntimeDarwinResult(raw)
+            }
+        }
+        number = number + 1
+    }
+    __ablaRuntimeDarwinScratchFree(change, 32)
+    watcher
+}
+
+// read 0 of a signalfd: up to 16 records of 128 bytes (ssi_signo at 0, the rest zero); EAGAIN 11 when a
+// nonblocking one has none. A mapping holds the kevents (512 bytes), a zero timespec (16) and the pending set and
+// the signal sigwait takes (8 each).
+trusted fun __ablaRuntimeDarwinSignalfdRead(slot: int, descriptor: int, output: int,
+    length: int): int {
+    var wanted = length / 128
+    if (output == 0 || wanted == 0) return -22
+    if (wanted > 16) wanted = 16
+    val memory = __ablaRuntimeDarwinScratch(544)
+    if (__ablaRuntimeDarwinScratchFailed(memory)) return -12
+    val events = memory
+    val zero = memory + 512
+    val pending = memory + 528
+    val nonblocking = ablaRuntimeAtomicLoadI64(__ablaRuntimeDarwinSignalState() + slot * 16 + 8) !=
+        0
+    var measured = ablaDarwinSyscall(363, descriptor, 0, 0, events, wanted,
+        if (nonblocking) zero else 0)
+    while (measured == -4) {
+        measured = ablaDarwinSyscall(363, descriptor, 0, 0, events, wanted,
+            if (nonblocking) zero else 0)
+    }
+    if (measured == 0) {
+        __ablaRuntimeDarwinScratchFree(memory, 544)
+        return -11
+    }
+    if (measured < 0) {
+        __ablaRuntimeDarwinScratchFree(memory, 544)
+        return __ablaRuntimeDarwinResult(measured)
+    }
+    var index = 0
+    while (index < measured) {
+        val signal = ablaRuntimeLoadI64(events + index * 32) & 4294967295
+        val record = output + index * 128
+        var word = 0
+        while (word < 16) {
+            ablaRuntimeStoreI64(record + word * 8, 0)
+            word = word + 1
+        }
+        ablaRuntimeStoreI32(record, __ablaRuntimeLinuxSignalOf(signal))
+        // Accept the pending signal, as reading a signalfd does.
+        ablaRuntimeStoreI64(pending, 0)
+        if (signal > 0 && signal < 32 && ablaDarwinSyscall(52, pending, 0, 0, 0, 0, 0) >= 0 &&
+            ((ablaRuntimeLoadI32(pending) >> (signal - 1)) & 1) != 0) {
+            ablaRuntimeStoreI64(pending, 1 << (signal - 1))
+            ablaDarwinSyscall(330, pending, pending + 8, 0, 0, 0, 0)
+        }
+        index = index + 1
+    }
+    __ablaRuntimeDarwinScratchFree(memory, 544)
+    measured * 128
+}
+
 // ---- macOS processes (#811 group 5) ----
 // BSD numbers: execve 59, wait4 7, kill 37 (pid, signal, posix = 1), setpgid 82. UNVERIFIED:
 // every number in this section (from memory of xnu's syscalls.master).
@@ -4236,6 +4385,16 @@ trusted fun __ablaRuntimeDarwinSyscall(
     if (!ablaHostIsMacOS()) return -38
     // write 1 -> 4, lseek 8 -> 199, dup2 33 -> 90, getpid 39 -> 20,
     // exit 60 and exit_group 231 -> 1, fsync 74 -> 95, chdir 80 -> 12, umask 95 -> 60.
+    // read 0 (a signalfd's records, else BSD read 3), close 3 (BSD close 6) and signalfd4 289: the table above.
+    if (number == 0) {
+        val slot = __ablaRuntimeDarwinSignalSlot(argument0)
+        if (slot >= 0) return __ablaRuntimeDarwinSignalfdRead(slot, argument0, argument1, argument2)
+        return __ablaRuntimeDarwinResult(ablaDarwinSyscall(3, argument0, argument1, argument2, 0, 0,
+            0))
+    }
+    if (number == 3) return __ablaRuntimeDarwinClose(argument0)
+    if (number == 289) return __ablaRuntimeDarwinSignalfd(argument0, argument1, argument2,
+        argument3)
     if (number == 1) return __ablaRuntimeDarwinResult(
         ablaDarwinSyscall(4, argument0, argument1, argument2, 0, 0, 0))
     if (number == 8) return __ablaRuntimeDarwinResult(
