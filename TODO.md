@@ -324,8 +324,8 @@ mmap form) apply there.
 
 - [ ] **Differential fuzzer: shared compile-time globals (#796).** `--shared-globals` compares
   Python-computed expectations in interp, jit and auto for array, map, object field, aliased array,
-  called-function mutation and read-only controls; it stays outside the default mix until #796 lands.
-  Seed 5901 exposes all five mutable cases in jit and auto while interp and the read-only control agree.
+  called-function mutation and read-only controls; it joins the default mix now that #796 is fixed.
+  Seed 5901 exposed all five mutable cases in jit and auto before the fix; interp and the read-only control agreed.
   The default mix also exercises #790 temporary owners in positional/named/constructor defaults and
   nested `if`/`when` arms, with Python-checked drop logs. On c1a93ef7, focused seeds 6002–6021
   (240 checks) and default seeds 6022–6041 (480 checks) agreed across all six modes; the tool suite passed.
@@ -559,14 +559,10 @@ mmap form) apply there.
   unrecognised modules/annotations and modules with implicit extension-field roots keep the evaluator.
   Prove those roots and their eager initializers before widening the rule; never emit the target platform runtime as host code.
 
-- Cross-target JIT materialised global data (#797 part 2, deferred to #796):
-  `compile fun assetHost(): string = compilerEnvironment("ASSET_HOST")`;
-  `val ASSET_HOST: string = #assetHost()`;
-  `val ASSET_TABLE = #assetTable(ASSET_HOST)` currently pulls the host global's
-  initializer query into the hashing site's reach. A kept string/int/bool value
-  can replace that reach only after #796 proves no possible writer; preserve
-  the initializer's own eligibility and environment-input journal/cache checks.
-  Add this exact global-argument shape to #796's parity and mutation controls.
+- Cross-target JIT materialised global data (#797 part 2, landed in 1ec3d69b after #796): an immutable scalar global that no
+  compile-time code writes is replayed in a cross-target slice although its initializer reads the environment
+  (`val ASSET_HOST: string = #assetHost()`; `val ASSET_TABLE = #assetTable(ASSET_HOST)`); fixtures in
+  tests/cases/compile-eval-environment.
 
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
