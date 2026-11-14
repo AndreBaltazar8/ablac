@@ -106,6 +106,43 @@ trusted fun arrive(): void {
     while (ablaRuntimeAtomicLoadI64(sharedCell() + 16) < total) {}
 }
 
+// Collections while threads read their thread-locals: each thread checks all its variables over and over, allocating and
+// dropping managed garbage and forcing collections of its own, as the main thread does too. A table or a variable the collector
+// could free or move would be found damaged (a variable is filled with its tag; a freed block is reused by the garbage).
+trusted fun churnAndCheck(base: int, count: int, tag: int, rounds: int): int {
+    var round = 0
+    while (round < rounds) {
+        val garbage: array<string> = []
+        var made = 0
+        while (made < 200) {
+            garbage.append("garbage ${made} ${round} ${tag}")
+            made = made + 1
+        }
+        if (round % 8 == 0) memoryCollect()
+        var index = 0
+        while (index < count) {
+            val address = emutlsGetAddress(controlAt(base, index))
+            var byte = 0
+            while (byte < sizeOf(index)) {
+                if (ablaRuntimeLoadU8(address + byte) != tag) return round * 1000 + index + 100000
+                byte = byte + 1
+            }
+            index = index + 1
+        }
+        if (garbage.size != 200) return 999999
+        round = round + 1
+    }
+    0
+}
+
+trusted fun churner(tag: int): int {
+    val base = ablaRuntimeLoadI64(sharedCell())
+    val count = ablaRuntimeLoadI64(sharedCell() + 8)
+    val first = visit(base, count, tag)
+    if (first != 0) return first
+    churnAndCheck(base, count, tag, 150)
+}
+
 trusted fun worker(tag: int): int {
     arrive()
     visit(ablaRuntimeLoadI64(sharedCell()), ablaRuntimeLoadI64(sharedCell() + 8), tag)
@@ -213,6 +250,27 @@ trusted fun main: int {
     while (round < 40) {
         failures = failures + race()
         round = round + 1
+    }
+    // Collections of the managed heap while four threads and this one read their thread-locals.
+    val churnBase = makeControls(CONTROLS)
+    ablaRuntimeStoreI64(sharedCell(), churnBase)
+    ablaRuntimeStoreI64(sharedCell() + 8, CONTROLS)
+    ablaRuntimeStoreI64(sharedCell() + 24, 0)
+    val churn1 = thread { churner(11) }
+    val churn2 = thread { churner(12) }
+    val churn3 = thread { churner(13) }
+    val churn4 = thread { churner(14) }
+    val churnOwn = visit(churnBase, CONTROLS, 15)
+    var churnStatus = churnOwn
+    if (churnStatus == 0) churnStatus = churnAndCheck(churnBase, CONTROLS, 15, 150)
+    val churnResults = [churnStatus, await churn1, await churn2, await churn3, await churn4]
+    var churnIndex = 0
+    while (churnIndex < 5) {
+        if (churnResults[churnIndex] != 0) {
+            println("collections with thread-locals, thread ${churnIndex}: step ${churnResults[churnIndex]}")
+            failures = failures + 1
+        }
+        churnIndex = churnIndex + 1
     }
     if (failures == 0) 42 else 1
 }
