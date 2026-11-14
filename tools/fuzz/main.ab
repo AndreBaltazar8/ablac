@@ -4,17 +4,20 @@
 // one check with the fewest statements that still disagrees. tools/fuzz/run builds this and runs it with
 // ABLA_FUZZ_ROOT set to the repository.
 //
-//   tools/fuzz/run --seeds 100000-100039 [--checks 24] [--compiler build/ablac] [--focus plain_check] [--keep]
-//   tools/fuzz/run --program x.ab [--show]   one existing program (with @export("run")), four ways
-//   tools/fuzz/run --replay                   every tests/cases/fuzz-differential/*.ab, and no MISMATCH line
-//   tools/fuzz/run --selftest                 the PRNG's reference vectors and the comparison
+//   tools/fuzz/run --seeds 100000-100039 [--checks 24] [--compiler build/ablac] [--focus json_check] [--keep]
+//   tools/fuzz/run --seeds ... --panics             also one panicking program per seed (native and Wasm)
+//   tools/fuzz/run --seeds ... --hosted-tasks       task_check only, the four hosted modes (Wasm has no tasks)
+//   tools/fuzz/run --seeds ... --shared-globals     compile-time code sharing ordinary globals, interp/jit/auto
+//   tools/fuzz/run --check-hostless-capabilities    both hostless Wasm builders refuse a task and a thread
+//   tools/fuzz/run --program x.ab [--show]          one existing program (with @export("run")), four ways
+//   tools/fuzz/run --replay                         every tests/cases/fuzz-differential/*.ab, and no MISMATCH line
+//   tools/fuzz/run --selftest                       the PRNG's reference vectors, the comparison, the JSON oracle
+//   tools/fuzz/run --control-minimise | --control-oracle f1,f2   the suite's controls (tools/test-fuzz-abla.sh)
 //
-// Ported so far: the generator core, the plain random check, and every check family: types, collections and text,
-// ownership, JSON, YAML and gzip
-// (FUZZ_FAMILIES in families.ab);
-// tools/fuzz-differential (Python) keeps the other families and campaigns until they are ported.
-// Seeds are not shared with it: this PRNG is xoshiro256**, so seed N here is not the Python's seed N. Use seeds
-// from 100000 up for this fuzzer.
+// Ported: every check family of tools/fuzz-differential (FUZZ_FAMILIES in families.ab; task_check through
+// --hosted-tasks) and its panic, hosted-task, hostless-capability and shared-global campaigns. Still only in the
+// Python: module graphs, subparser graphs and refusals, cross-target tiers. Seeds are not shared with it: this PRNG
+// is xoshiro256**, so seed N here is not the Python's seed N. Use seeds from 100000 up for this fuzzer.
 import "abla/io"
 import "abla/text"
 import "abla/integer"
@@ -40,7 +43,11 @@ class FuzzOptions(
     var selftest: bool,
     var noAny: bool,
     var controlMinimise: bool,
-    var controlOracle: string
+    var controlOracle: string,
+    var hostedTasks: bool,
+    var panics: bool,
+    var checkHostless: bool,
+    var sharedGlobals: bool
 )
 
 val FUZZ_WORK = "build/fuzz-abla"
@@ -73,7 +80,7 @@ fun fuzzSeedRange(text: string, var into: array<int>): void {
 }
 
 fun fuzzOptions(root: string): FuzzOptions {
-    val options = FuzzOptions([], 24, "$root/build/ablac", 120, "", false, "", false, false, false, false, false, "")
+    val options = FuzzOptions([], 24, "$root/build/ablac", 120, "", false, "", false, false, false, false, false, "", false, false, false, false)
     var seedText = "1"
     var index = 0
     val count = processArgumentCount()
@@ -107,6 +114,14 @@ fun fuzzOptions(root: string): FuzzOptions {
                 options.selftest = true
             } else if (argument == "--no-any") {
                 options.noAny = true
+            } else if (argument == "--hosted-tasks") {
+                options.hostedTasks = true
+            } else if (argument == "--panics") {
+                options.panics = true
+            } else if (argument == "--check-hostless-capabilities") {
+                options.checkHostless = true
+            } else if (argument == "--shared-globals") {
+                options.sharedGlobals = true
             } else if (argument == "--control-minimise") {
                 options.controlMinimise = true
             } else if (fuzzUsageError == "") {
@@ -117,7 +132,17 @@ fun fuzzOptions(root: string): FuzzOptions {
         index = index + (if (takes) 2 else 1)
     }
     fuzzSeedRange(seedText, options.seeds)
-    if (options.focus != "" && !fuzzHasFamily(options.focus)) {
+    if (options.hostedTasks) {
+        if (options.focus != "" && options.focus != "task_check") fuzzUsageError = "--hosted-tasks draws task_check only"
+        if (options.panics || options.program != "") fuzzUsageError = "--hosted-tasks cannot be combined with --panics or --program"
+        options.focus = "task_check"
+    } else if (options.focus == "task_check") {
+        fuzzUsageError = "task_check requires --hosted-tasks; it is not a hostless Wasm check"
+    }
+    if (options.sharedGlobals && (options.hostedTasks || options.focus != "" || options.panics || options.program != "")) {
+        fuzzUsageError = "--shared-globals cannot be combined with other campaigns"
+    }
+    if (options.focus != "" && options.focus != "task_check" && !fuzzHasFamily(options.focus)) {
         fuzzUsageError = "--focus ${options.focus}: no such generator (have: ${textJoin(FUZZ_FAMILIES, ", ")})"
     }
     options
@@ -196,7 +221,7 @@ fun fuzzMinimise(runner: FuzzRunner, options: FuzzOptions, prelude: string, seed
 fun fuzzStill(runner: FuzzRunner, options: FuzzOptions, prelude: string, seed: int, key: string, check: FuzzCheck,
     lines: array<string>, tag: string): string {
     val directory = "$FUZZ_WORK/min$seed-$key-$tag"
-    val got = runner.allModes(directory, prelude, [FuzzCheck(lines, check.call, check.ty, check.index)], true)
+    val got = runner.allModes(directory, prelude, [FuzzCheck(lines, check.call, check.ty, check.index)], !options.hostedTasks)
     var ok = fuzzVerdict(got) != ""
     for (result in got) {
         if (!result.built) ok = false
@@ -223,11 +248,11 @@ fun fuzzRunSeed(runner: FuzzRunner, options: FuzzOptions, prelude: string, seed:
     val checks: array<FuzzCheck> = []
     for (index in 0 until options.checks) checks.append(gen.check(index))
     val directory = "$FUZZ_WORK/seed$seed"
-    val results = runner.allModes(directory, prelude, checks, true)
+    val results = runner.allModes(directory, prelude, checks, !options.hostedTasks)
     val bad = fuzzVerdict(results)
     if (bad == "") {
         if (!options.keep) fuzzRemove("${runner.root}/$directory")
-        return ""
+        return if (options.panics) fuzzRunPanic(runner, seed, options.keep) else ""
     }
     fuzzMinimise(runner, options, prelude, seed, checks, results, bad)
 }
@@ -394,7 +419,21 @@ fun main: int {
         println(if (bad == "") "all modes agree" else bad)
         return if (bad == "") 0 else 1
     }
-    val prelude = fuzzPrelude(root)
+    if (options.checkHostless) return fuzzCheckHostlessCapabilities(runner)
+    if (options.sharedGlobals) {
+        var failed = 0
+        for (seed in options.seeds) {
+            val found = fuzzRunSharedGlobals(runner, seed, options.keep)
+            if (found != "") {
+                failed = failed + 1
+                println(found)
+            } else {
+                println("shared globals seed $seed: 6 shapes agree with their expected lines in interp/jit/auto")
+            }
+        }
+        return if (failed == 0) 0 else 1
+    }
+    val prelude = if (options.hostedTasks) FUZZ_PRELUDE_TASK else fuzzPrelude(root)
     if (options.controlMinimise) return fuzzControlMinimise(runner, options, prelude)
     if (options.controlOracle != "") {
         for (family in options.controlOracle.split(",")) {
@@ -412,7 +451,8 @@ fun main: int {
             failures = failures + 1
             println(found)
         } else {
-            println("seed $seed: ${options.checks} checks agree in all six modes")
+            val modes = if (options.hostedTasks) "four hosted modes (Wasm unsupported)" else "all six modes"
+            println("seed $seed: ${options.checks} checks agree in $modes")
         }
     }
     if (failures == 0) 0 else 1

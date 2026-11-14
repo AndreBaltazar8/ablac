@@ -1,0 +1,221 @@
+// Batch E1 of the port: the separate campaigns of tools/fuzz-differential that are not a draw of the mix. Hosted
+// tasks and threads (four hosted modes: hostless Wasm has no tasks), panics (native and Wasm must print `before`,
+// exit 101 and report the panic), the hostless builders' refusal of tasks and threads, and compile-time code
+// sharing ordinary globals across the evaluator's tiers (interp, jit, auto) — the last a positive campaign since #796.
+import "abla/io"
+import "abla/text"
+import "abla/fs"
+import "./prng.ab"
+import "./gen.ab"
+import "./modes.ab"
+import "./verdict.ab"
+
+val FUZZ_PRELUDE_TASK = "import \"abla/io\"\nval taskProbeLog: array<int> = []\n" +
+    "resource class TaskProbeTicket(val id: int) {\n    fun drop(): void { taskProbeLog.append(this.id); return }\n}\n" +
+    "class TaskProbeBox(val job: Task<int>)\nfun taskProbeConsume(own job: Task<int>): int = await job\n"
+
+/** Hosted-only deterministic tasks and independent threads, with an oracle. */
+fun FuzzGen.taskCheck(index: int): FuzzCheck {
+    val a = this.r.range(1, 90)
+    val b = this.r.range(101, 190)
+    val kind = this.r.pick(["unstarted", "early", "field", "thread"])
+    val lines: array<string> = ["fun c$index(): string {"]
+    var expected = ""
+    if (kind == "unstarted") {
+        for (line in ["    taskProbeLog.clear()", "    if (true) {", "        val owned = TaskProbeTicket($a)",
+            "        val pending = task { owned.id }", "    }",
+            "    val actual = \"\${taskProbeLog.size}:\${if (taskProbeLog.size > 0) taskProbeLog[0] else -1}\""]) {
+            lines.append(line)
+        }
+        expected = "1:$a"
+    } else if (kind == "early") {
+        for (line in ["    taskProbeLog.clear()", "    val outer = task {", "        val inner = task {",
+            "            val owned = TaskProbeTicket($a)", "            defer { taskProbeLog.append($b) }",
+            "            if (true) return owned.id", "            999", "        }", "        await inner", "    }",
+            "    val result = await outer",
+            "    val actual = \"\$result:\${taskProbeLog.size}:\${if (taskProbeLog.size > 0) taskProbeLog[0] else -1}:" +
+            "\${if (taskProbeLog.size > 1) taskProbeLog[1] else -1}\""]) lines.append(line)
+        expected = "$a:2:$b:$a"
+    } else if (kind == "field") {
+        for (line in ["    val box = TaskProbeBox(task { $a })", "    val first = await move(box.job)",
+            "    val local = task { $b }", "    val second = taskProbeConsume(move(local))",
+            "    val actual = \"\$first:\$second\""]) lines.append(line)
+        expected = "$a:$b"
+    } else {
+        for (line in ["    val first = thread { val value = $a; value * value + 1 }",
+            "    val second = thread { val value = $b; value * 2 + 3 }", "    val two = await second",
+            "    val one = await first", "    val actual = \"\$one:\$two\""]) lines.append(line)
+        expected = "${a * a + 1}:${b * 2 + 3}"
+    }
+    lines.append("    if (actual != \"$expected\") return \"FUZZ_ORACLE_FAILURE\"")
+    lines.append("    actual")
+    lines.append("}")
+    FuzzCheck(lines, "c$index()", "str", index)
+}
+
+val FUZZ_PANIC_NAMES: array<string> = ["array index", "string index", "string slice", "division", "remainder",
+    "i8 division", "filledArray", "truncate", "panic"]
+val FUZZ_PANIC_BODIES: array<string> = [
+    "val xs = [1, 2, 3]\n    val i = 3 + zero\n    println(\"before\")\n    println(\"\${xs[i]}\")",
+    "val s = \"héllo\"\n    println(\"before\")\n    println(\"\${s[10 + zero]}\")",
+    "val s = \"héllo\"\n    println(\"before\")\n    println(s.slice(2, 99 + zero))",
+    "println(\"before\")\n    println(\"\${7 / zero}\")",
+    "println(\"before\")\n    println(\"\${7 % zero}\")",
+    "println(\"before\")\n    println(\"\${i8(7) / i8(zero)}\")",
+    "println(\"before\")\n    val xs = filledArray(zero - 2, 0)\n    println(\"\${xs.size}\")",
+    "val xs = [1, 2]\n    println(\"before\")\n    xs.truncate(zero - 1)",
+    "println(\"before\")\n    panic(\"boom \${zero}\")"]
+
+/** A program that prints `before` and then panics one way (the evaluator reports a compile error for the same code,
+ * so the compile-time modes are not compared). */
+fun fuzzPanicProgram(kind: int): string =
+    "import \"abla/io\"\nimport \"abla/process/exit\"\n\nfun makeZero(): int {\n    var z = 0\n" +
+    "    for (i in 0 until 3) z = z * 0\n    z\n}\n\n@export(\"run\")\nfun run(): int {\n    val zero = makeZero()\n" +
+    "    ${FUZZ_PANIC_BODIES[kind]}\n    println(\"after\")\n    0\n}\n\nfun main: int = run()\n"
+
+/** One panic program, native and Wasm: they agree, and each prints `before` and not `after`, ends with status 101 (the
+ * language's panic status) and reports the panic on standard error. "" when it holds. */
+fun fuzzRunPanic(runner: FuzzRunner, seed: int, keep: bool): string {
+    val kind = seed % FUZZ_PANIC_NAMES.size
+    val directory = "build/fuzz-abla/panic$seed"
+    Path("${runner.root}/$directory").createDirectories()
+    Path("${runner.root}/$directory/program.ab").writeText(fuzzPanicProgram(kind))
+    val results = runner.modesOf(directory, "$directory/program.ab", "", true)
+    val absolute: array<string> = []
+    for (result in results) {
+        if (result.built) {
+            val reported = result.errors.size > 0 && result.errors[0].startsWith("panic")
+            if (result.output != "before\n" || result.status != 101 || !reported) {
+                absolute.append("${result.mode}: stdout ${fuzzQuote(result.output)}, status ${result.status}, " +
+                    "stderr ${textJoin(result.errors, " | ")}")
+            }
+        }
+    }
+    var bad = fuzzVerdict(results, true)
+    if (bad == "" && absolute.size > 0) bad = "all modes agree but do not panic as specified: " + textJoin(absolute, "; ")
+    if (bad == "" && !keep) Path("${runner.root}/$directory").removeTree()
+    if (bad == "") "" else "panic (${FUZZ_PANIC_NAMES[kind]}), seed $seed: $bad"
+}
+
+/** Each hostless Wasm builder refuses a task and a thread with E_BUILD_TARGET_CAPABILITY. 0 when all four do. */
+fun fuzzCheckHostlessCapabilities(runner: FuzzRunner): int {
+    val directory = "build/fuzz-abla/hostless-capabilities"
+    Path("${runner.root}/$directory").createDirectories()
+    val jobs: array<FuzzJob> = []
+    val names: array<string> = []
+    for (kind in ["task", "thread"]) {
+        val source = "$directory/$kind.ab"
+        Path("${runner.root}/$source").writeText("import \"abla/io\"\n@export(\"run\")\nfun run(): int { val t = $kind { 7 }; " +
+            "await t }\nfun main(): int = run()\n")
+        for (mode in ["wasm", "wasm-dev"]) {
+            val out = "$directory/$kind-$mode.wasm"
+            val call = if (mode == "wasm") "wasmBuildModule(\"probe\", \"$source\", \"$out\", false, false)" else
+                "buildProgram(\"probe\", \"$source\", \"$out\", \"wasm32-module\", \"module\", true, false)"
+            val registration = if (mode == "wasm-dev") "val target = #wasm32Target()\n" else ""
+            val driver = "${runner.root}/$directory/$kind-$mode-build.ab"
+            Path(driver).writeText("import \"abla/wasm/build\"\n${registration}val built = #$call\n" +
+                "fun main: int = if (built) 0 else 1\n")
+            val log = "${runner.root}/$directory/$kind-$mode"
+            jobs.append(FuzzJob([runner.step([runner.compiler, "build", driver, "-o", "$log-driver", "--fast", "--no-cache"],
+                [], [], "$log.out", "$log.err", true)], 0, 0, []))
+            names.append("$kind $mode")
+        }
+    }
+    runner.runJobs(jobs)
+    var failures = 0
+    for (index in 0 until jobs.size) {
+        val errors = fuzzReadText("${runner.root}/$directory/${names[index].replace(" ", "-")}.err")
+        if (jobs[index].statuses[0] == 0 || !errors.contains("E_BUILD_TARGET_CAPABILITY")) {
+            println("${names[index]}: expected E_BUILD_TARGET_CAPABILITY, got status ${jobs[index].statuses[0]}: " +
+                textJoin(fuzzFirstLines(errors, 6), " | "))
+            failures = failures + 1
+        } else {
+            println("${names[index]}: unsupported (E_BUILD_TARGET_CAPABILITY)")
+        }
+    }
+    if (failures == 0) 0 else 1
+}
+
+val FUZZ_SHARED_KINDS: array<string> = ["array", "map", "object", "alias", "function", "readonly"]
+
+/** A program whose compile-time functions write and read one ordinary global under `#`, and the line it must print in
+ * every evaluator tier: A (written then read), B and D (read in later evaluations), C (read before a second write). */
+fun fuzzSharedGlobalProgram(seed: int, kind: int): array<string> {
+    val r = prngSeeded(seed * 8 + kind)
+    val a = r.range(2, 99)
+    var b = r.range(2, 98)
+    if (b >= a) b = b + 1
+    val name = FUZZ_SHARED_KINDS[kind]
+    var declaration = "val shared: array<int> = []"
+    var write1 = "shared.append($a)"
+    var read = "shared.size"
+    var write2 = "shared.append($b)"
+    var expected = "1,1,1,2"
+    if (name == "alias") {
+        declaration = "val shared: array<int> = []\nval alias = shared"
+        read = "alias.size"
+        write2 = "alias.append($b)"
+    } else if (name == "function") {
+        declaration = "val shared: array<int> = []\ncompile fun helper(value: int): void { shared.append(value); return }"
+        write1 = "helper($a)"
+        write2 = "helper($b)"
+    } else if (name == "map") {
+        declaration = "val shared: Map<string, int> = Map()"
+        write1 = "shared.set(\"x\", $a)"
+        read = "(shared.get(\"x\") ?? 0)"
+        write2 = "shared.set(\"x\", $b)"
+        expected = "$a,$a,$a,$b"
+    } else if (name == "object") {
+        declaration = "class Box(var value: int)\nval shared = Box(0)"
+        write1 = "shared.value = $a"
+        read = "shared.value"
+        write2 = "shared.value = $b"
+        expected = "$a,$a,$a,$b"
+    } else if (name == "readonly") {
+        declaration = "val shared: array<int> = [$a, $b]"
+        write1 = "val unused = 0"
+        read = "shared[0] + shared[1]"
+        write2 = "val unused = 0"
+        expected = "${a + b},${a + b},${a + b},${a + b}"
+    }
+    val text = "import \"abla/compiler\"\nimport \"abla/io\"\n$declaration\n" +
+        "compile fun mutate(): int { $write1; $read }\ncompile fun observe(): int = $read\n" +
+        "compile fun interpreted(): int {\n    val ignored = compilerFindFunction(\"observe\")\n" +
+        "    if (ignored < 0) compilerApplyTransform({ })\n    val before = $read\n    $write2\n    before\n}\n" +
+        "val A = #mutate()\nval B = #observe()\nval C = #interpreted()\nval D = #observe()\n" +
+        "fun main: int { println(\"\$A,\$B,\$C,\$D\"); 0 }\n"
+    [text, "$expected\n"]
+}
+
+/** Every kind under interp, jit and auto must print its expected line. "" when they do. */
+fun fuzzRunSharedGlobals(runner: FuzzRunner, seed: int, keep: bool): string {
+    val directory = "build/fuzz-abla/shared-globals-$seed"
+    Path("${runner.root}/$directory").createDirectories()
+    val jobs: array<FuzzJob> = []
+    val outs: array<string> = []
+    val labels: array<string> = []
+    val expectations: array<string> = []
+    for (kind in 0 until FUZZ_SHARED_KINDS.size) {
+        val program = fuzzSharedGlobalProgram(seed, kind)
+        val source = "${runner.root}/$directory/${FUZZ_SHARED_KINDS[kind]}.ab"
+        Path(source).writeText(program[0])
+        for (tier in ["interp", "jit", "auto"]) {
+            val out = "${runner.root}/$directory/${FUZZ_SHARED_KINDS[kind]}-$tier"
+            jobs.append(fuzzNativeJob(runner, source, out, true, tier))
+            outs.append(out)
+            labels.append("${FUZZ_SHARED_KINDS[kind]}/$tier")
+            expectations.append(program[1])
+        }
+    }
+    runner.runJobs(jobs)
+    val failures: array<string> = []
+    for (index in 0 until jobs.size) {
+        val result = fuzzNativeResult(labels[index], jobs[index], outs[index])
+        if (!result.built || result.status != 0 || result.output != expectations[index]) {
+            failures.append("${labels[index]}: expected ${fuzzQuote(expectations[index])}, got ${result.describe()}")
+        }
+    }
+    if (failures.size > 0) return "shared globals seed $seed (sources in $directory): " + textJoin(failures, "; ")
+    if (!keep) Path("${runner.root}/$directory").removeTree()
+    ""
+}
