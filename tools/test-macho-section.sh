@@ -17,7 +17,7 @@ if [[ $(uname -s) == Darwin ]]; then
         [[ $mode == fast ]] && flags+=(--fast)
         "$compiler" build "$source" -o "$out/$mode" "${flags[@]}"
         [[ $("$out/$mode") == 'macho section: ok' ]] || { echo "macho section ($mode): wrong output" >&2; exit 1; }
-        if ! nm -m "$out/$mode" | grep -q '__abla_ct_alloca'; then
+        if ! nm -m "$out/$mode" | grep '__abla_ct_alloca' > /dev/null; then
             echo "macho section ($mode): the allocation entry is not in its own section" >&2
             exit 1
         fi
@@ -33,13 +33,13 @@ for target in arm64-macos x86_64-macos; do
     llc -O0 -filetype=obj "$out/$target.ll" -o "$out/$target.o" 2> "$out/$target.err" || {
         echo "macho section ($target): llc refused the module" >&2; head -n 5 "$out/$target.err" >&2; exit 1
     }
-    llvm-objdump -h "$out/$target.o" | grep -q '__abla_ct_alloca' || {
+    llvm-objdump -h "$out/$target.o" | grep '__abla_ct_alloca' > /dev/null || {
         echo "macho section ($target): no section __abla_ct_alloca in the object" >&2; exit 1
     }
     # The hidden memory routines' labels are assembler-private ("L"), not symbols a linker may dead-strip as atoms.
-    if llvm-nm "$out/$target.o" | grep -q ' [tT] \.Labla_'; then
+    if llvm-nm "$out/$target.o" | grep ' [tT] \.Labla_' > /dev/null; then
         echo "macho section ($target): a routine label is a symbol (.Labla_...)" >&2; exit 1
     fi
-    llvm-nm "$out/$target.o" | grep -q ' _memcpy$' || { echo "macho section ($target): no _memcpy of its own" >&2; exit 1; }
+    llvm-nm "$out/$target.o" | grep ' _memcpy$' > /dev/null || { echo "macho section ($target): no _memcpy of its own" >&2; exit 1; }
 done
 echo 'macho section: both Mac targets assemble, the allocation entry in __TEXT,__abla_ct_alloca'
