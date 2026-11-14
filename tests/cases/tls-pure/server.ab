@@ -453,6 +453,159 @@ fun main: int {
         pump(c, s)
         if (!s.failed()) fail("a server went on with a failing random source")
     }
+    // ---- the review against known bug classes (CVE classes of OpenSSL, BoringSSL, rustls, GnuTLS) ----
+    if (true) {
+        val plainConfig = TlsServerConfig(ed, [TLS_SUITE_AES_128_GCM_SHA256], [TLS_GROUP_X25519], [], random, false, false, acceptAny)
+        val config12 = TlsServerConfig(ed, [], [TLS_GROUP_X25519], [], random, false, false, acceptAny,
+            [TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256])
+        val ccs = tlsPlaintextRecord(TLS_CHANGE_CIPHER_SPEC, 771, tlsU8(1))
+        // CCS injection (CVE-2014-0224): a ChangeCipherSpec before the key exchange is done is a fatal error, on the server
+        // (right after the ClientHello), on the client (between ServerHello and Certificate) and after the handshake.
+        var ccsServer = tlsServerNew(config12)
+        var ccsClient = clientFor(edStore, "localhost")
+        ccsServer.feed(ccsClient.takeOutput())
+        ccsServer.takeOutput()
+        ccsServer.feed(ccs)
+        if (!ccsServer.failed()) fail("CCS injection: a TLS 1.2 server took a ChangeCipherSpec before the key exchange")
+        var ccsServer2 = tlsServerNew(config12)
+        var ccsClient2 = clientFor(edStore, "localhost")
+        ccsServer2.feed(ccsClient2.takeOutput())
+        val flight = splitRecords(ccsServer2.takeOutput())
+        val firstRecord = flight[0].slice(5, flight[0].size)
+        ccsClient2.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, firstRecord.slice(0, 4 + bytesToLength(firstRecord))))
+        if (ccsClient2.failed()) fail("CCS injection: the ServerHello was refused: ${ccsClient2.error}")
+        ccsClient2.feed(ccs)
+        if (!ccsClient2.failed()) fail("CCS injection: a TLS 1.2 client took a ChangeCipherSpec before the Certificate")
+        var done12 = tlsServerNew(config12)
+        var doneClient = clientFor(edStore, "localhost")
+        pump(doneClient, done12)
+        if (!doneClient.connected() || !done12.connected()) fail("TLS 1.2 pair: [${doneClient.error}] [${done12.error}]")
+        // Renegotiation: a HelloRequest to a client and a ClientHello to a server after the handshake are fatal (TLS 1.2),
+        // and so is any handshake message that is not a KeyUpdate or a ticket after a TLS 1.3 handshake.
+        val helloRequest = tls12Protect(done12.v12Write, TLS_HANDSHAKE, tlsHandshakeMessage(0, ""))
+        doneClient.feed(helloRequest.bytes)
+        if (!doneClient.failed()) fail("renegotiation: a TLS 1.2 client took a HelloRequest")
+        var done12b = tlsServerNew(config12)
+        var doneClientB = clientFor(edStore, "localhost")
+        pump(doneClientB, done12b)
+        val again = tls12Protect(doneClientB.v12Write, TLS_HANDSHAKE, doneClientB.firstHello)
+        done12b.feed(again.bytes)
+        if (!done12b.failed()) fail("renegotiation: a TLS 1.2 server took a second ClientHello")
+        var s13 = tlsServerNew(plainConfig)
+        var c13 = clientFor(edStore, "localhost")
+        pump(c13, s13)
+        c13.feed(tlsProtectRecord(s13.write, TLS_HANDSHAKE, tlsHandshakeMessage(0, "")).bytes)
+        if (!c13.failed()) fail("renegotiation: a TLS 1.3 client took a HelloRequest")
+        // SKIP-TLS / FREAK: the server's flight cannot skip a message: a Finished in place of EncryptedExtensions, and one in
+        // place of the Certificate, both end the handshake (TLS 1.3 and 1.2).
+        for (skip in [0, 1]) {
+            var skipServer = tlsServerNew(plainConfig)
+            var skipClient = clientFor(edStore, "localhost")
+            skipServer.feed(skipClient.takeOutput())
+            val skipFlight = splitRecords(skipServer.takeOutput())
+            skipClient.feed(skipFlight[0])
+            var handshakeKeys = tlsRecordProtection(skipClient.aead, skipClient.read.key, skipClient.read.iv)
+            if (skip == 1) {
+                skipClient.feed(tlsProtectRecord(handshakeKeys, TLS_HANDSHAKE,
+                    tlsHandshakeMessage(TLS_ENCRYPTED_EXTENSIONS, tlsU16(0))).bytes)
+            }
+            if (skipClient.failed()) fail("SKIP: the flight was refused early: ${skipClient.error}")
+            skipClient.feed(tlsProtectRecord(handshakeKeys, TLS_HANDSHAKE, tlsHandshakeMessage(TLS_FINISHED, random(32))).bytes)
+            if (!skipClient.failed() || !skipClient.error.contains("expected")) {
+                fail("SKIP (after $skip messages): a Finished that skips a message: [${skipClient.error}]")
+            }
+        }
+        var skip12Server = tlsServerNew(config12)
+        var skip12Client = clientFor(edStore, "localhost")
+        skip12Server.feed(skip12Client.takeOutput())
+        val skip12Flight = splitRecords(skip12Server.takeOutput())
+        skip12Client.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, skip12Flight[0].slice(5, 5 + 4 + bytesToLength(skip12Flight[0].slice(5, skip12Flight[0].size)))))
+        skip12Client.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, tlsHandshakeMessage(TLS_FINISHED, random(12))))
+        if (!skip12Client.failed() || !skip12Client.error.contains("expected")) fail("SKIP: a TLS 1.2 Finished in place of the Certificate: [${skip12Client.error}]")
+        // Triple handshake: a TLS 1.2 ServerHello without the extended master secret is refused by the client too.
+        var emsClient = clientFor(edStore, "localhost")
+        emsClient.takeOutput()
+        emsClient.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, tlsHandshakeMessage(TLS_SERVER_HELLO, tlsU16(771) + random(32) +
+            tlsVec8("") + tlsU16(TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256) + tlsU8(0) +
+            tlsVec16(tlsExtension(TLS_EXT_RENEGOTIATION_INFO, tlsU8(0))))))
+        if (!emsClient.failed() || !emsClient.error.contains("extended master secret")) fail("a client took a TLS 1.2 ServerHello without the extended master secret: [${emsClient.error}]")
+        // No CBC, no RSA key exchange, no 3DES/RC4: the ClientHello offers TLS 1.3's suites and ECDHE with an AEAD, and
+        // nothing else; a server given only those refuses the connection.
+        val offeredBytes = tlsReader(clientFor(edStore, "localhost").takeOutput().slice(5, 100))
+        offeredBytes.u8()
+        offeredBytes.u24()
+        offeredBytes.u16()
+        offeredBytes.bytes(32)
+        offeredBytes.vec8()
+        val offeredSuites = offeredBytes.vec16()
+        val allowedSuites = [4865, 4866, 4867, 49195, 49199, 49196, 49200, 52393, 52392]
+        var at = 0
+        while (at + 1 < offeredSuites.size) {
+            val code = offeredSuites[at] * 256 + offeredSuites[at + 1]
+            var allowed = false
+            for (candidate in allowedSuites) {
+                if (candidate == code) allowed = true
+            }
+            if (!allowed) fail("the ClientHello offers the cipher suite $code")
+            at = at + 2
+        }
+        val kexPair = tlsGenerateKeyPair(TLS_GROUP_X25519, random)
+        val kexShares: array<TlsKeyShare> = []
+        if (kexPair != null) kexShares.append(TlsKeyShare(kexPair.group, kexPair.publicKey))
+        val legacy = tlsBuildClientHello(random(32), "", [], "localhost", [TLS_GROUP_X25519], kexShares, [TLS_SIG_ED25519], [], "",
+            [156, 47, 10, 5])
+        var legacyServer = tlsServerNew(plainConfig)
+        legacyServer.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 769, legacy))
+        if (!legacyServer.failed()) fail("a server took a ClientHello that offers RSA key exchange, CBC and RC4 only")
+        // Heartbleed-style length trust: a length that runs past the data is an error, never a read past the end.
+        val helloHead = tlsU16(771) + random(32) + tlsVec8("") + tlsVec16(tlsU16(TLS_SUITE_AES_128_GCM_SHA256)) + tlsVec8(tlsU8(0))
+        for (lying in [tlsU16(500) + "short", tlsU16(8) + tlsU16(TLS_EXT_SERVER_NAME) + tlsU16(200) + "ab",
+                       tlsU16(9) + tlsU16(TLS_EXT_SERVER_NAME) + tlsU16(5) + tlsU16(200) + "a"]) {
+            var lyingServer = tlsServerNew(plainConfig)
+            lyingServer.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, tlsHandshakeMessage(TLS_CLIENT_HELLO, helloHead + lying)))
+            if (!lyingServer.failed()) fail("a ClientHello whose lengths run past its data was accepted")
+        }
+        var lyingClient = clientFor(edStore, "localhost")
+        lyingClient.takeOutput()
+        lyingClient.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, tlsHandshakeMessage(TLS_SERVER_HELLO, tlsU16(771) + random(32) +
+            tlsVec8("") + tlsU16(TLS_SUITE_AES_128_GCM_SHA256) + tlsU8(0) + tlsU16(300) + "no")))
+        if (!lyingClient.failed()) fail("a ServerHello whose extension length runs past its data was accepted")
+        // The zero-length record DoS and the KeyUpdate flood: 33 empty records or 33 KeyUpdates in a row end the connection.
+        var emptyServer = tlsServerNew(plainConfig)
+        var emptyClient = clientFor(edStore, "localhost")
+        pump(emptyClient, emptyServer)
+        var emptied = 0
+        while (emptied < 40 && !emptyServer.failed()) {
+            emptyServer.feed(tlsProtectRecord(emptyClient.write, TLS_APPLICATION_DATA, "").bytes)
+            emptied = emptied + 1
+        }
+        if (!emptyServer.failed() || emptied > TLS_MAX_EMPTY_RUN + 1 || !emptyServer.error.contains("empty")) fail("empty records: $emptied of them: [${emptyServer.error}]")
+        var floodServer = tlsServerNew(plainConfig)
+        var floodClient = clientFor(edStore, "localhost")
+        pump(floodClient, floodServer)
+        var flooded = 0
+        while (flooded < 40 && !floodServer.failed()) {
+            floodServer.feed(tlsProtectRecord(floodClient.write, TLS_HANDSHAKE, tlsHandshakeMessage(TLS_KEY_UPDATE, tlsU8(0))).bytes)
+            floodClient.clientApplicationSecret = tlsNextTrafficSecret(floodClient.hash, floodClient.clientApplicationSecret)
+            floodClient.write = tlsRecordProtection(floodClient.aead,
+                tlsTrafficKey(floodClient.hash, floodClient.clientApplicationSecret, floodClient.keyLength),
+                tlsTrafficIv(floodClient.hash, floodClient.clientApplicationSecret))
+            flooded = flooded + 1
+        }
+        if (!floodServer.failed() || flooded > TLS_MAX_EMPTY_RUN + 1 || !floodServer.error.contains("KeyUpdates")) fail("KeyUpdate flood: $flooded of them: [${floodServer.error}]")
+        // A TLS 1.2 sequence number past 2^62 seals and opens nothing either.
+        var spent = tls12Protection(tls12Suite(TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256) ?? return 1, random(16), random(4))
+        spent.sequence = 4611686018427387904
+        if (tls12Protect(spent, TLS_APPLICATION_DATA, "x").ok) fail("a TLS 1.2 record was sealed with an exhausted sequence number")
+        if (tls12Open(spent, tlsPlaintextRecord(TLS_APPLICATION_DATA, 771, random(40))).ok) fail("a TLS 1.2 record was opened with an exhausted sequence number")
+        // TLS_FALLBACK_SCSV from the client: a client that retries after a failure signals it, and says nothing otherwise.
+        val fallbackConfig = TlsClientConfig("localhost", [TLS_SUITE_AES_128_GCM_SHA256], [TLS_SIG_ED25519], [],
+            tlsX509Verifier(edStore, now), random, tlsPatchClientHello, [TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256], true)
+        val withScsv = tlsClientNew(fallbackConfig).takeOutput()
+        val withoutScsv = clientFor(edStore, "localhost").takeOutput()
+        if (!withScsv.contains(tlsU16(22016)) ) fail("a fallback client did not send TLS_FALLBACK_SCSV")
+        if (withoutScsv.contains(tlsU16(22016))) fail("a client that is not retrying sent TLS_FALLBACK_SCSV")
+    }
     if (failures > 0) return 1
     println("tls-pure server ok")
     0
@@ -460,3 +613,18 @@ fun main: int {
 
 fun tlsNextTrafficSecretFor(server: TlsServer): string =
     tlsNextTrafficSecret(server.hash, server.serverApplicationSecret)
+
+/** The records in a run of bytes (each with its header). */
+fun splitRecords(bytes: string): array<string> {
+    val records: array<string> = []
+    var at = 0
+    while (at + 5 <= bytes.size) {
+        val length = bytes[at + 3] * 256 + bytes[at + 4]
+        records.append(bytes.slice(at, at + 5 + length))
+        at = at + 5 + length
+    }
+    records
+}
+
+/** The body length of the handshake message at the start of `bytes` (its three-byte length field). */
+fun bytesToLength(bytes: string): int = bytes[1] * 65536 + bytes[2] * 256 + bytes[3]
