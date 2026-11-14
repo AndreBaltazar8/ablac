@@ -17,8 +17,8 @@ for tier in interp jit; do
     ABLA_COMPILE_EVAL=$tier "$compiler" build tests/cases/compiler-capture-process/main.ab \
         -o "$out/main-$tier" --fast --no-cache > "$out/$tier.log" 2>&1
     status=0
-    "$out/main-$tier" || status=$?
-    [[ $status == 42 ]] || { echo "capture checks failed: $status ($tier)" >&2; exit 1; }
+    "$out/main-$tier" > "$out/main-$tier.out" 2>&1 || status=$?
+    [[ $status == 42 ]] || { echo "capture checks failed: $status ($tier): $(cat "$out/main-$tier.out")" >&2; exit 1; }
     # Orphaned grandchildren may briefly remain zombies until init reaps them;
     # require they are no longer executing, on both Linux and Darwin.
     for pidfile in "$out/timeout-child.pid" "$out/overflow-child.pid"; do
