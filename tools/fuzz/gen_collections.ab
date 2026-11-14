@@ -1,0 +1,424 @@
+// Batch B of the port: the collection and text families of tools/fuzz-differential (strings and string equality,
+// arrays and their removal operations, optional elements, maps and map stress, ranges, abla/text, abla/regex and its
+// groups, and a jump in a built-in's argument). Same shapes and names as the Python's.
+import "abla/text"
+import "./prng.ab"
+import "./gen.ab"
+import "./gen_types.ab"
+
+/** A pattern or text as the body of a generated string literal: backslashes doubled, a newline as `\n`. */
+fun fuzzEscape(text: string): string = text.replace("\\", "\\\\").replace("\n", "\\n")
+
+/** A jump in a built-in argument must skip the call and the statements after it. */
+fun FuzzGen.elvisMemberCheck(index: int): FuzzCheck {
+    val stop = this.r.range(0, 3)
+    val lines: array<string> = ["compile fun elvisCompiler$index(): int {",
+        "    val value: int? = ${this.r.pick(["null", "-1"])}",
+        "    compilerIsPrivate(value ?? return 41)", "    42", "}",
+        "val elvisCompiled$index = #elvisCompiler$index()",
+        "fun c$index(): string {", "    val xs = [1, 2, 3, 4]", "    var out = \"\""]
+    for (n in 0 until 3) {
+        val op = this.r.pick(["truncate", "sliceBegin", "sliceEnd"])
+        val jump = this.r.pick(["continue", "break", "return \"returned\""])
+        lines.append("    for (i$n in 0 until 4) {")
+        lines.append("        val p$n: int? = if (i$n == $stop) null else i$n")
+        if (op == "truncate") {
+            lines.append("        xs.truncate(p$n ?? $jump)")
+        } else if (op == "sliceBegin") {
+            lines.append("        out = out + \"abcd\".slice(p$n ?? $jump, 4)")
+        } else {
+            lines.append("        out = out + \"abcd\".slice(0, p$n ?? $jump)")
+        }
+        lines.append("        out = out + \":\"")
+        lines.append("    }")
+    }
+    lines.append("    \"" + fuzzSplice("xs.size") + ":\$out:" + fuzzSplice("elvisCompiled$index") + "\"")
+    lines.append("}")
+    FuzzCheck(lines, "c$index()", "str", index)
+}
+
+fun FuzzGen.stringCheck(index: int): FuzzCheck {
+    val env = fuzzEnv()
+    val lines = fuzzOpen(index)
+    val count = this.r.range(3, 7)
+    for (i in 0 until count) {
+        val sv = "s${lines.size}"
+        lines.append("    val $sv = ${this.strExpr(2, env)}")
+        val kind = this.r.pick(["size", "slice", "byte", "cmp", "iter", "cat"])
+        if (kind == "size") {
+            lines.append("    out = out + \"" + fuzzSplice("$sv.size") + ",\"")
+        } else if (kind == "slice") {
+            lines.append("    out = out + safeSlice($sv, ${this.intExpr("int", 1, env)}, ${this.intExpr("int", 1, env)}) + \",\"")
+        } else if (kind == "byte") {
+            lines.append("    out = out + (if ($sv.size > 0) \"" +
+                fuzzSplice("$sv[((${this.intExpr("int", 1, env)}) & 2147483647) % $sv.size]") + "\" else \"e\") + \",\"")
+        } else if (kind == "cmp") {
+            val op = this.r.pick(FUZZ_COMPARE)
+            lines.append("    out = out + \"" + fuzzSplice("$sv $op ${this.strExpr(1, env)}") + ",\"")
+        } else if (kind == "iter") {
+            lines.append("    var sum$sv = 0")
+            lines.append("    for (b in $sv) sum$sv = sum$sv * 31 + b")
+            lines.append("    out = out + \"" + fuzzSplice("sum$sv") + ",\"")
+        } else {
+            lines.append("    out = out + $sv + ${this.strExpr(1, env)} + \",\"")
+        }
+    }
+    fuzzStringCheck(lines, index)
+}
+
+/** Arrays: append, truncate, indexing, nesting, iteration, filledArray. */
+fun FuzzGen.arrayCheck(index: int): FuzzCheck {
+    val env = fuzzEnv()
+    val lines: array<string> = ["fun c$index(): string {", "    val xs: array<int> = []", "    var out = \"\""]
+    val count = this.r.range(3, 8)
+    for (i in 0 until count) {
+        val kind = this.r.pick(["append", "append", "set", "trunc", "sum", "nest", "fill", "strs"])
+        if (kind == "append") {
+            lines.append("    xs.append(${this.intExpr("int", 2, env)})")
+        } else if (kind == "set") {
+            lines.append("    if (xs.size > 0) xs[((${this.intExpr("int", 1, env)}) & 1023) % xs.size] = ${this.intExpr("int", 1, env)}")
+        } else if (kind == "trunc") {
+            lines.append("    xs.truncate(((${this.intExpr("int", 1, env)}) & 7))")
+        } else if (kind == "sum") {
+            val v = "t${lines.size}"
+            lines.append("    var $v = 0")
+            lines.append("    for (x in xs) $v = $v * 31 + x")
+            lines.append("    out = out + \"" + fuzzSplice("xs.size") + ":" + fuzzSplice(v) + ";\"")
+        } else if (kind == "nest") {
+            val v = "g${lines.size}"
+            val n = this.r.range(1, 4)
+            lines.append("    val $v: array<array<int>> = []")
+            lines.append("    for (i in 0 until $n) { val row = filledArray(i + 1, i); row[i] = row[i] + ${this.intLit("int")}; $v.append(row) }")
+            lines.append("    var w$v = 0")
+            lines.append("    for (row in $v) for (e in row) w$v = w$v * 7 + e")
+            lines.append("    out = out + \"" + fuzzSplice("$v.size") + "/" + fuzzSplice("$v[${n - 1}].size") + "/" + fuzzSplice("w$v") + ";\"")
+        } else if (kind == "fill") {
+            val n = this.r.range(0, 5)
+            val v = "f${lines.size}"
+            lines.append("    val $v = filledArray($n, ${this.intLit("int")})")
+            lines.append("    out = out + \"" + fuzzSplice("$v.size") + fuzzSplice("if ($v.size > 0) $v[$v.size - 1] else 0") + ";\"")
+        } else {
+            val v = "w${lines.size}"
+            lines.append("    val $v = [${this.strExpr(1, env)}, ${this.strExpr(1, env)}]")
+            lines.append("    $v.append(${this.strExpr(1, env)})")
+            lines.append("    out = out + $v[0] + \"|\" + $v[$v.size - 1] + \"" + fuzzSplice("$v.size") + ";\"")
+        }
+    }
+    fuzzStringCheck(lines, index)
+}
+
+/** Maps with string and int keys: set, get, has, remove, insertion order. */
+fun FuzzGen.mapCheck(index: int): FuzzCheck {
+    val env = fuzzEnv()
+    val keyType = this.r.pick(["string", "int"])
+    val lines: array<string> = ["fun c$index(): string {", "    val m: Map<$keyType, int> = Map()", "    var out = \"\""]
+    val count = this.r.range(4, 9)
+    for (i in 0 until count) {
+        val kind = this.r.pick(["set", "set", "get", "has", "remove", "keys", "values", "clear"])
+        if (kind == "set") {
+            lines.append("    m.set(${this.mapKey(keyType)}, ${this.intExpr("int", 1, env)})")
+        } else if (kind == "get") {
+            lines.append("    out = out + \"" + fuzzSplice("m.get(${this.mapKey(keyType)}) ?? -1") + ",\"")
+        } else if (kind == "has") {
+            lines.append("    out = out + \"" + fuzzSplice("m.has(${this.mapKey(keyType)})") + ",\"")
+        } else if (kind == "remove") {
+            lines.append("    out = out + \"" + fuzzSplice("m.remove(${this.mapKey(keyType)})") + fuzzSplice("m.size") + ",\"")
+        } else if (kind == "keys") {
+            lines.append("    for (k in m.keys()) out = out + \"\${k}/\"")
+            lines.append("    out = out + \";\"")
+        } else if (kind == "values") {
+            lines.append("    for (v in m.values()) out = out + \"\${v}/\"")
+            lines.append("    out = out + \";\"")
+        } else if (this.r.chance(0.3)) {
+            lines.append("    m.clear()")
+        }
+    }
+    lines.append("    out = out + \"\${m.size}\"")
+    fuzzStringCheck(lines, index)
+}
+
+fun FuzzGen.mapKey(keyType: string): string =
+    if (keyType == "string") "\"" + this.r.pick(["a", "b", "c", "é", "", "😀", "ab"]) + "\"" else "${this.r.range(-3, 5)}"
+
+/** for loops over ranges: empty, reversed and wide bounds, with sums that expose off-by-ones. */
+fun FuzzGen.rangeCheck(index: int): FuzzCheck {
+    val lines = fuzzOpen(index)
+    val count = this.r.range(2, 5)
+    for (k in 0 until count) {
+        val low = this.r.pickInt([-3, -1, 0, 1, 2, 5])
+        val high = this.r.pickInt([-2, 0, 1, 3, 4, 8])
+        val op = this.r.pick(["until", ".."])
+        lines.append("    var s$k = 0")
+        lines.append("    var n$k = 0")
+        lines.append("    for (i in $low $op $high) { s$k = s$k * 3 + i; n$k += 1 }")
+        lines.append("    out = out + \"" + fuzzSplice("s$k") + "/" + fuzzSplice("n$k") + ";\"")
+    }
+    fuzzStringCheck(lines, index)
+}
+
+// Patterns and texts as their characters (fuzzEscape writes them into the generated literal).
+val FUZZ_REGEX_PATTERNS: array<string> = ["a+b", "(a|ab)(c|bcd)", "\\d+", "[a-c]*", "(\\w+)@(\\w+)", "^a.*b\$",
+    "x?y{2,3}", "(a*)+b", "[^ ]+", "\\bab", "é+", "(?:ab)+", "a{2}", ".", "a|b|"]
+val FUZZ_REGEX_TEXTS: array<string> = ["", "ab", "aab abab", "abcd", "12 a1 345", "me@host x@y", "xyyy xy yy", "aaab",
+    "éé é", "a\nb"]
+// Replacement templates as written into the generated literal.
+val FUZZ_REGEX_REPLACEMENTS: array<string> = ["<\$0>", "[\$1]", "\$\$", "-", ""]
+
+/** abla/regex at run time and under `#`: whole-text matches, finds, findAll spans, replace. */
+fun FuzzGen.regexCheck(index: int): FuzzCheck {
+    val lines = fuzzOpen(index)
+    val count = this.r.range(1, 3)
+    for (k in 0 until count) {
+        val pattern = fuzzEscape(this.r.pick(FUZZ_REGEX_PATTERNS))
+        val text = fuzzEscape(this.r.pick(FUZZ_REGEX_TEXTS))
+        val replacement = this.r.pick(FUZZ_REGEX_REPLACEMENTS)
+        lines.append("    val c$k = regexCompile(\"$pattern\")")
+        lines.append("    if (c$k.succeeded) {")
+        lines.append("        val re$k = c$k.regex")
+        lines.append("        out = out + \"" + fuzzSplice("re$k.matches(\"$text\")") + "\"")
+        lines.append("        val m$k = re$k.find(\"$text\")")
+        lines.append("        if (m$k != null) out = out + \"@" + fuzzSplice("m$k.start()") + "-" + fuzzSplice("m$k.end()") + "\"")
+        lines.append("        for (f in re$k.findAll(\"$text\")) out = out + \"[\${f.start()},\${f.end()}]\"")
+        lines.append("        out = out + re$k.replace(\"$text\", \"$replacement\")")
+        lines.append("    } else {")
+        lines.append("        out = out + c$k.error.message")
+        lines.append("    }")
+        lines.append("    out = out + \";\"")
+    }
+    fuzzStringCheck(lines, index)
+}
+
+// As written into the generated literal: the last one is the escapes \t and \n.
+val FUZZ_TEXT_POOL: array<string> = ["", "a", "abc", "  pad  ", "a,b,,c", "héllo", "日本語", "x😀y", "ABC def", "aaa",
+    "\\t\\n z "]
+val FUZZ_TEXT_PIECES: array<string> = ["", "a", "b,", ",", "é", "aa", "日", " "]
+
+/** abla/text methods at run time and under `#`: search, split, trim, replace, case, pad, code points. */
+fun FuzzGen.textCheck(index: int): FuzzCheck {
+    val lines = fuzzOpen(index)
+    val count = this.r.range(3, 7)
+    for (k in 0 until count) {
+        val t = "\"" + this.r.pick(FUZZ_TEXT_POOL) + "\""
+        val piece = "\"" + this.r.pick(FUZZ_TEXT_PIECES) + "\""
+        val kind = this.r.pick(["search", "split", "trim", "replace", "case", "pad", "points", "repeat"])
+        if (kind == "search") {
+            lines.append("    out = out + \"" + fuzzSplice("$t.startsWith($piece)") + fuzzSplice("$t.endsWith($piece)") +
+                fuzzSplice("$t.contains($piece)") + fuzzSplice("$t.indexOf($piece)") +
+                fuzzSplice("$t.indexOf($piece, ${this.r.range(0, 3)})") + fuzzSplice("$t.lastIndexOf($piece)") + ",\"")
+        } else if (kind == "split") {
+            val separator = "\"" + this.r.pick([",", "a", "é", " ", "aa"]) + "\""
+            lines.append("    for (part in $t.split($separator)) out = out + \"<\" + part + \">\"")
+            lines.append("    out = out + \",\"")
+        } else if (kind == "trim") {
+            lines.append("    out = out + \"[\" + $t.trim() + \"|\" + $t.trimStart() + \"|\" + $t.trimEnd() + \"],\"")
+        } else if (kind == "replace") {
+            lines.append("    out = out + $t.replace(\"${this.r.pick(["a", "aa", ",", "é"])}\", $piece) + \",\"")
+        } else if (kind == "case") {
+            lines.append("    out = out + $t.uppercase() + $t.lowercase() + \",\"")
+        } else if (kind == "pad") {
+            val start = this.r.range(0, 8)
+            val fill = if (this.r.chance(0.5)) piece else "\"*\""
+            lines.append("    out = out + $t.padStart($start, $fill) + \"|\" + $t.padEnd(${this.r.range(0, 8)}) + \",\"")
+        } else if (kind == "points") {
+            lines.append("    val n$k = $t.codePointCount()")
+            lines.append("    out = out + \"" + fuzzSplice("n$k") + fuzzSplice("$t.isValidUtf8()") + "\"")
+            lines.append("    if (n$k > 0) out = out + \"" + fuzzSplice("$t.codePointAt(0)") + "/" +
+                fuzzSplice("$t.codePointSlice(0, n$k / 2)") + "\"")
+            lines.append("    out = out + \",\"")
+        } else {
+            lines.append("    out = out + $t.repeat(${this.r.range(0, 3)}) + \",\"")
+        }
+    }
+    fuzzStringCheck(lines, index)
+}
+
+/** removeAt / removeLast / clear on int and string arrays, and arrays built from `split`. */
+fun FuzzGen.arrayOpsCheck(index: int): FuzzCheck {
+    val env = fuzzEnv()
+    val lines: array<string> = ["fun c$index(): string {", "    val xs: array<int> = []", "    val ws: array<string> = []",
+        "    var out = \"\""]
+    val count = this.r.range(4, 9)
+    for (i in 0 until count) {
+        val kind = this.r.pick(["push", "push", "pushw", "removeAt", "removeLast", "removeAtw", "clear", "split", "dump"])
+        if (kind == "push") {
+            lines.append("    xs.append(${this.intExpr("int", 1, env)})")
+        } else if (kind == "pushw") {
+            lines.append("    ws.append(${this.strExpr(1, env)})")
+        } else if (kind == "removeAt") {
+            lines.append("    if (xs.size > 0) out = out + \"" +
+                fuzzSplice("xs.removeAt(((${this.intExpr("int", 1, env)}) & 1023) % xs.size)") + ",\"")
+        } else if (kind == "removeLast") {
+            lines.append("    if (xs.size > 0) out = out + \"\${xs.removeLast()},\"")
+        } else if (kind == "removeAtw") {
+            lines.append("    if (ws.size > 0) out = out + ws.removeAt(((${this.intExpr("int", 1, env)}) & 1023) % ws.size) + \",\"")
+        } else if (kind == "clear") {
+            lines.append("    ${this.r.pick(["xs", "ws"])}.clear()")
+        } else if (kind == "split") {
+            val text = this.r.pick(FUZZ_TEXT_POOL).replace("\\", "\\\\")
+            lines.append("    for (part in \"$text\".split(\"${this.r.pick([",", "a", " "])}\")) ws.append(part)")
+        } else {
+            lines.append("    for (x in xs) out = out + \"\${x}.\"")
+            lines.append("    for (w in ws) out = out + \"<\" + w + \">\"")
+            lines.append("    out = out + \"\${xs.size}/\${ws.size};\"")
+        }
+    }
+    lines.append("    out = out + \"\${xs.size}/\${ws.size}\"")
+    fuzzStringCheck(lines, index)
+}
+
+/** Optional values inside collections: array<int?>, array<string?>, Map<string, int?>, `??` and `!= null`. */
+fun FuzzGen.optionalElementsCheck(index: int): FuzzCheck {
+    val env = fuzzEnv()
+    val lines: array<string> = ["fun c$index(): string {", "    val xs: array<int?> = []", "    val ws: array<string?> = []",
+        "    val m: Map<string, int?> = Map()", "    var out = \"\""]
+    val count = this.r.range(4, 9)
+    for (i in 0 until count) {
+        val kind = this.r.pick(["pushx", "pushx", "pushw", "setm", "readx", "readw", "readm", "count"])
+        if (kind == "pushx") {
+            lines.append("    xs.append(${this.r.pick(["null", this.intExpr("int", 1, env)])})")
+        } else if (kind == "pushw") {
+            lines.append("    ws.append(${this.r.pick(["null", this.strExpr(1, env)])})")
+        } else if (kind == "setm") {
+            val key = this.optionalKey()
+            lines.append("    m.set($key, ${this.r.pick(["null", this.intExpr("int", 1, env)])})")
+        } else if (kind == "readx") {
+            val at = this.intExpr("int", 1, env)
+            lines.append("    if (xs.size > 0) out = out + \"" +
+                fuzzSplice("xs[(($at) & 1023) % xs.size] ?? ${this.intLit("int")}") + ",\"")
+        } else if (kind == "readw") {
+            lines.append("    if (ws.size > 0) out = out + (ws[((${this.intExpr("int", 1, env)}) & 1023) % ws.size] ?? \"n\") + \",\"")
+        } else if (kind == "readm") {
+            val k = this.optionalKey()
+            lines.append("    out = out + \"" + fuzzSplice("m.has($k)") + fuzzSplice("m.get($k) ?? -9") + ",\"")
+        } else {
+            val v = "present${lines.size}"
+            lines.append("    var $v = 0")
+            lines.append("    for (x in xs) if (x != null) $v += 1")
+            lines.append("    for (w in ws) if (w != null) $v += 10")
+            lines.append("    out = out + \"" + fuzzSplice(v) + "/\${xs.size}/\${ws.size};\"")
+        }
+    }
+    fuzzStringCheck(lines, index)
+}
+
+fun FuzzGen.optionalKey(): string = "\"" + this.r.pick(["a", "b", "é", ""]) + "\""
+
+val FUZZ_REGEX_GROUP_PATTERNS: array<string> = ["(a)|(b)", "(a)?b", "(a+)(b+)?", "((a)|(b))+", "(\\w+)@(\\w+)",
+    "(x)?(y)?(z)?", "(a|ab)(c|bcd)(d*)", "(é)(.)?"]
+val FUZZ_REGEX_GROUP_TEXTS: array<string> = ["b", "ab", "aabb", "a", "me@host", "xz", "abcd", "ébé", "zzz", ""]
+// As written into the generated literal: `\${1}` is the escape that reaches the library as `${1}`.
+val FUZZ_REGEX_GROUP_TEMPLATES: array<string> = ["\$1", "\\\${1}x", "\$2\$1", "\$9", "[\$0]", "\\\${2}", "\$\$1"]
+
+/** Capture groups: which took part, their spans and text, and replacement templates that name them. */
+fun FuzzGen.regexGroupsCheck(index: int): FuzzCheck {
+    val lines = fuzzOpen(index)
+    val count = this.r.range(1, 3)
+    for (k in 0 until count) {
+        val pattern = fuzzEscape(this.r.pick(FUZZ_REGEX_GROUP_PATTERNS))
+        val text = this.r.pick(FUZZ_REGEX_GROUP_TEXTS)
+        val template = this.r.pick(FUZZ_REGEX_GROUP_TEMPLATES)
+        lines.append("    val c$k = regexCompile(\"$pattern\")")
+        lines.append("    if (c$k.succeeded) {")
+        lines.append("        val re$k = c$k.regex")
+        lines.append("        out = out + \"" + fuzzSplice("re$k.groupCount") + ":\"")
+        lines.append("        for (f in re$k.findAll(\"$text\")) {")
+        lines.append("            for (g in 0..f.groupCount()) {")
+        lines.append("                val gt = f.group(g) ?? \"-\"")
+        lines.append("                out = out + \"\${f.hasGroup(g)}/\${f.groupStart(g)}/\${f.groupEnd(g)}/\" + gt + \" \"")
+        lines.append("            }")
+        lines.append("            out = out + \"|\"")
+        lines.append("        }")
+        lines.append("        val w$k = re$k.matchFull(\"$text\")")
+        lines.append("        out = out + (if (w$k == null) \"nofull\" else \"full" + fuzzSplice("w$k.groupCount()") + "\")")
+        lines.append("        out = out + re$k.replace(\"$text\", \"$template\")")
+        lines.append("    } else {")
+        lines.append("        out = out + c$k.error.message")
+        lines.append("    }")
+        lines.append("    out = out + \";\"")
+    }
+    fuzzStringCheck(lines, index)
+}
+
+// Key expressions of the loop counter `i`, and the same with `j` (the Python's re.sub(r"\bi\b", "j", form)).
+val FUZZ_MAP_KEY_FORMS: array<string> = ["\"pre\${i % 11}-common-suffix\"",
+    "\"aaaabbbbccccdddd\".slice(i % 5, i % 5 + 4 + i % 7)", "\"ab\" + \"\${i % 13}\" + \"cd\" + \"\${i % 3}\"",
+    "\"0123456789abcdef0123\".slice(0, 18) + \"\${i % 17}\" + \"tail\"", "\"k\${i}\"",
+    "(\"x\".repeat(i % 9)) + \"|\" + (\"y\".repeat(i % 4))"]
+val FUZZ_MAP_KEY_FORMS_J: array<string> = ["\"pre\${j % 11}-common-suffix\"",
+    "\"aaaabbbbccccdddd\".slice(j % 5, j % 5 + 4 + j % 7)", "\"ab\" + \"\${j % 13}\" + \"cd\" + \"\${j % 3}\"",
+    "\"0123456789abcdef0123\".slice(0, 18) + \"\${j % 17}\" + \"tail\"", "\"k\${j}\"",
+    "(\"x\".repeat(j % 9)) + \"|\" + (\"y\".repeat(j % 4))"]
+
+/** Many inserts and removes (growth, rehash, tombstones) over keys that share prefixes and suffixes and are built as
+ * slices and concatenations; insertion order and sizes must agree. */
+fun FuzzGen.mapStressCheck(index: int): FuzzCheck {
+    val which = this.r.below(FUZZ_MAP_KEY_FORMS.size)
+    val form = FUZZ_MAP_KEY_FORMS[which]
+    val n = this.r.pickInt([20, 40, 90, 200, 400])
+    val every = this.r.pickInt([2, 3, 5, 7])
+    val clearAt = this.r.pickInt([-1, -1, n / 2])
+    val lines: array<string> = ["fun c$index(): string {", "    val m: Map<string, int> = Map()", "    var out = \"\""]
+    lines.append("    for (i in 0 until $n) {")
+    lines.append("        m.set($form, i * 3 + ${this.r.range(0, 9)})")
+    lines.append("        if (i % $every == 0) {")
+    lines.append("            val j = (i * 7) % (i + 1)")
+    lines.append("            m.remove(${FUZZ_MAP_KEY_FORMS_J[which]})")
+    lines.append("        }")
+    if (clearAt >= 0) lines.append("        if (i == $clearAt) m.clear()")
+    lines.append("    }")
+    lines.append("    var h = 0")
+    lines.append("    var count = 0")
+    lines.append("    for (k in m.keys()) { for (b in k) h = h * 31 + b; count += 1 }")
+    lines.append("    var total = 0")
+    lines.append("    for (v in m.values()) total = total * 7 + v")
+    lines.append("    out = out + \"\${m.size}/\${count}/\${h}/\${total};\"")
+    lines.append("    for (i in 0 until $n) if (i % ${this.r.pickInt([13, 29, 41])} == 0) {")
+    lines.append("        out = out + \"" + fuzzSplice("m.has($form)") + fuzzSplice("m.get($form) ?? -1") + ",\"")
+    lines.append("    }")
+    fuzzStringCheck(lines, index)
+}
+
+val FUZZ_EQ_LENGTHS: array<int> = [0, 1, 2, 3, 4, 7, 8, 9, 15, 16, 17, 23, 24, 31, 32, 33, 47, 48, 63, 64, 65]
+
+fun fuzzSortedInts(values: array<int>): array<int> {
+    val sorted: array<int> = []
+    for (value in values) {
+        var at = sorted.size
+        sorted.append(value)
+        while (at > 0 && sorted[at - 1] > value) {
+            sorted[at] = sorted[at - 1]
+            at = at - 1
+        }
+        sorted[at] = value
+    }
+    sorted
+}
+
+/** Equality and ordering at every length and alignment: equal strings (as slices of a larger string at offsets 0..7,
+ * and as concatenations), and strings differing in one byte at the start, the middle and the end. */
+fun FuzzGen.stringEqCheck(index: int): FuzzCheck {
+    val chosen: array<int> = []
+    for (at in this.r.permutation(FUZZ_EQ_LENGTHS.size, this.r.range(5, 9))) chosen.append(FUZZ_EQ_LENGTHS[at])
+    val lengths: array<string> = []
+    for (value in fuzzSortedInts(chosen)) lengths.append("$value")
+    val glyph = this.r.pick(["abcdefgh", "xxxxxxxx", "0123456789", "éa", "ab😀"])
+    val lines = fuzzOpen(index)
+    lines.append("    val source = \"$glyph\".repeat(70)")
+    lines.append("    for (len in [${textJoin(lengths, ", ")}]) {")
+    lines.append("        val base = source.slice(0, len)")
+    lines.append("        for (off in 0 until 8) {")
+    lines.append("            val big = \"........\".slice(0, off) + base + \"!!!!!!!!\"")
+    lines.append("            val view = big.slice(off, off + len)")
+    lines.append("            out = out + (if (view == base) \"1\" else \"0\") + (if (view != base) \"1\" else \"0\")")
+    lines.append("            if (len > 0) {")
+    lines.append("                for (at in [0, len / 2, len - 1]) {")
+    lines.append("                    val changed = base.slice(0, at) + \"#\" + base.slice(at + 1, len)")
+    lines.append("                    out = out + (if (view == changed) \"1\" else \"0\") + (if (changed < view) \"<\" else \">\")")
+    lines.append("                }")
+    lines.append("            }")
+    lines.append("            out = out + (if (view == base + \"\") \"e\" else \"n\") + (if (view == base + \"z\") \"1\" else \"0\")")
+    lines.append("        }")
+    lines.append("        out = out + \"|\"")
+    lines.append("    }")
+    fuzzStringCheck(lines, index)
+}
