@@ -5,8 +5,8 @@
 # not hold. The list is the union of CI's Apple Silicon and Intel runners (tools/macos-libsystem-
 # inventory.sh) and may only shrink: remove a line when its import goes away. A
 # line is "<subject> <symbol>"; a needed library is "needed:<install name>". An
-# import that only the other architecture has is fine: stale lines are reported,
-# never failed. Darwin only; Linux has tools/test-libc-imports.sh.
+# import that only the other architecture has is fine on Apple Silicon: stale lines are reported
+# there and fail on Intel, which imports every line. Darwin only; Linux has tools/test-libc-imports.sh.
 # Usage: tools/test-libsystem-imports.sh [compiler]
 set -euo pipefail
 export LC_ALL=C
@@ -34,6 +34,9 @@ mkdir -p build
 out=build/libsystem-imports
 tools/macos-libsystem-inventory.sh "$compiler" "$out" > "$out.log" 2>&1 || { tail -n 30 "$out.log" >&2; exit 1; }
 actual=$out/actual.txt
+# Homebrew lives under /opt/homebrew on Apple Silicon and /usr/local on Intel: one name for both.
+sed -E 's#needed:/(opt/homebrew|usr/local)/opt/#needed:<brew>/#' "$actual" | sort -u > "$out/actual-normalised.txt"
+actual=$out/actual-normalised.txt
 if grep -q BUILD-FAILED "$actual"; then
     echo "libsystem imports: a program did not build:" >&2
     grep BUILD-FAILED "$actual" >&2
@@ -47,7 +50,10 @@ if [[ -n $new ]]; then
 fi
 stale=$(comm -23 "$allow" "$actual")
 if [[ -n $stale ]]; then
-    echo 'libsystem imports: no longer imported here, remove from tools/libsystem-imports-allowlist.txt (unless only the other architecture has it):'
-    echo "$stale"
+    echo 'libsystem imports: no longer imported here, remove from tools/libsystem-imports-allowlist.txt:' >&2
+    echo "$stale" >&2
+    # Intel is strict: every line of the list is imported there (Intel CI run 43611303835).
+    # Apple Silicon only reports.
+    if [[ $(uname -m) == x86_64 ]]; then exit 1; fi
 fi
 echo "libsystem imports: $(wc -l < "$actual" | tr -d ' ') imports, all within the allowed list"
