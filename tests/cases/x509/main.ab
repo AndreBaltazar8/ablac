@@ -8,6 +8,8 @@ import "abla/fs"
 import "abla/integer"
 import "abla/io"
 import "abla/process/arguments"
+import "abla/tls/pure/handshake"
+import "abla/tls/pure/verify"
 
 var failures = 0
 
@@ -112,6 +114,12 @@ fun hosts(): void {
 /** Parses every truncation of a certificate and every version of it with one byte changed. */
 fun damage(directory: string): void {
     val good = x509ParsePem(path(directory + "/leaf-ec.pem").readText()).certificates[0].der
+    // A certificate that still parses after a change is verified against the real intermediate and root: every byte of the
+    // signed part is signed, and the signature and its algorithm are checked, so none may verify.
+    val realRoots = readCertificates(directory, "root-ec.pem")
+    val realInter = readCertificates(directory, "inter-ec.pem")
+    check(x509Verify([good, realInter[0].der], X509TrustStore(realRoots), X509Options("example.com", 1893456000)).ok, "the undamaged certificate verifies")
+    var survivors = 0
     check(x509ParseDer(good).ok, "the certificate parses")
     var parsed = 0
     for (size in 0 until good.size) {
@@ -126,12 +134,80 @@ fun damage(directory: string): void {
             val result = x509ParseDer(damaged)
             parsed = parsed + 1
             if (result.ok) {
-                // A change in a value, not in the structure, still parses (a serial, a key byte). Verification must still answer.
-                x509Verify([damaged], X509TrustStore([]), X509Options("example.com", 1893456000))
+                // A change in a value, not in the structure, still parses (a serial, a key byte): it must not verify.
+                survivors = survivors + 1
+                if (x509Verify([damaged, realInter[0].der], X509TrustStore(realRoots), X509Options("example.com", 1893456000)).ok) {
+                    fail("a certificate with byte $at changed by $change verified")
+                }
             }
         }
     }
-    println("x509: $parsed damaged certificates answered")
+    check(survivors > 0, "no damaged certificate survived parsing: the verification of survivors was not exercised")
+    println("x509: $parsed damaged certificates answered, $survivors of them parsed and none verified")
+    return
+}
+
+/** Lengths and tags a strict DER reader refuses, a name with a NUL, the limits of the path builder, the key usage of a
+ *  handshake signature. */
+fun attacks(directory: string): void {
+    val cert = readCertificates(directory, "leaf-ec.pem")[0]
+    val good = cert.der
+    check(int(good[0]) == 48 && int(good[1]) == 130, "the outer header is 30 82 hh ll")
+    val body = good.slice(4, good.size)
+    val length = good.slice(2, 4)
+    val variants: array<string> = [
+        "\x30\x80" + body + "\x00\x00",
+        "\x30\x83\x00" + length + body,
+        "\x30\x81" + "\x05" + body,
+        "\x30\x85\x01\x00\x00\x00\x00" + body,
+        "\x30\x84\xff\xff\xff\xff" + body,
+        "\x30\x82\xff\xff" + body,
+        "\x30\x82\x00\x10" + body,
+        "\x1f\x82" + length + body,
+        "\x31\x82" + length + body]
+    var index = 0
+    for (variant in variants) {
+        if (x509ParseDer(variant).ok) fail("a DER certificate with a bad outer header parsed (variant $index)")
+        index = index + 1
+    }
+    check(x509ParseDer("\x30\x82" + length + body).ok, "the control (a rebuilt header) parses")
+    check(!derItem("\x30\x81\x05hello", 0, 8).ok, "a long-form length below 128")
+    check(derItem("\x30\x05hello", 0, 7).ok, "a short-form length")
+    check(!derItem("\x30\x80hello\x00\x00", 0, 9).ok, "an indefinite length")
+    check(!derItem("\x30\x82\x00\x80" + "x".repeat(128), 0, 132).ok, "a length with a leading zero byte")
+    check(!derItem("\x1f\x05hello", 0, 7).ok, "a multi-byte tag")
+    // A NUL (or any control character) in a dNSName is refused when the certificate is read, and no host with a NUL matches.
+    val at = pemFind(good, "www.example.com", 0)
+    check(at >= 0, "the SAN www.example.com is in the certificate")
+    check(x509ParseDer(good.slice(0, at + 3) + "x" + good.slice(at + 4, good.size)).ok, "the control (a changed letter in a SAN) parses")
+    check(!x509ParseDer(good.slice(0, at + 3) + "\x00" + good.slice(at + 4, good.size)).ok, "a dNSName with a NUL byte")
+    check(!x509ParseDer(good.slice(0, at + 3) + "\x01" + good.slice(at + 4, good.size)).ok, "a dNSName with a control character")
+    check(x509MatchesHost(cert, "example.com"), "the host matches")
+    check(!x509MatchesHost(cert, "example.com\x00.evil.com"), "a host with a NUL matched")
+    check(!x509MatchesHost(cert, "example.com\x00"), "a host with a trailing NUL matched")
+    check(x509MatchesHost(cert, "example.com."), "one trailing dot is the same name")
+    check(!x509MatchesHost(cert, "example.com.."), "two trailing dots are not")
+    check(x509MatchesHost(cert, "a.wild.example.com."), "a wildcard match with a trailing dot")
+    check(!x509MatchesHost(cert, "a.b.wild.example.com"), "a wildcard is one label")
+    // The path builder gives up after 64 signature checks: a chain with a few decoys that name the issuer but have another key
+    // verifies, one whose real intermediate comes after 70 of them does not (and answers).
+    val roots = readCertificates(directory, "root-ec.pem")
+    val inter = readCertificates(directory, "inter-ec.pem")[0]
+    val decoys = readCertificates(directory, "decoys.pem")
+    check(decoys.size == 70, "decoys.pem holds ${decoys.size} certificates")
+    for (count in [0, 10, 70]) {
+        val chain: array<string> = [good]
+        for (n in 0 until count) chain.append(decoys[n].der)
+        chain.append(inter.der)
+        val result = x509Verify(chain, X509TrustStore(roots), X509Options("example.com", 1893456000))
+        if (count < 40 && !result.ok) fail("$count decoys: ${result.error}")
+        if (count == 70 && result.ok) fail("70 decoys: the path builder went past its limit")
+    }
+    // The key usage of a handshake signature: a certificate that does not allow digitalSignature signs none.
+    val noSignature = readCertificates(directory, "leaf-key-usage.pem")[0]
+    val verdict = tlsCheckSignature(noSignature, TLS_SIG_ECDSA_SECP256R1_SHA256, "content", "signature")
+    check(!verdict.accepted() && verdict.text.contains("key usage"), "a certificate without digitalSignature signed a handshake: [${verdict.text}]")
+    println("x509: DER lengths, names, decoys, key usage")
     return
 }
 
@@ -171,6 +247,7 @@ fun main: int {
     hosts()
     chains(directory)
     damage(directory)
+    attacks(directory)
     if (failures != 0) {
         println("x509: $failures failure(s)")
         return 1
