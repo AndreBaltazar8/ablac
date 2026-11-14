@@ -1,9 +1,9 @@
 // TlsSession (abla/tls/pure): a client over a non-blocking socket the program polls itself.
-// Usage: session <mode: none|chain|host> <host> <port> <ca file> <family: 4|6> <action: get|flood|silent> [server pid for flood]
+// Usage: session <mode: none|chain|host> <host> <port> <ca file> <family: 4|6> <action: get|flood|silent> [server pid for flood and silent]
 //   get:    handshake, send a request, read the response to the end, print "result ok <bytes> <wantRead> <wantWrite>".
 //   flood:  handshake, write 16 MB the server does not read: it must see want-write, then a failure; prints
 //           "result flood wantWrite=<n> written=<bytes>".
-//   silent: handshake only (the server never answers): prints how many want-read the poll loop saw.
+//   silent: handshake only, with the server stopped while the ClientHello goes out: the first step must be want-read; prints how many want-read the poll loop saw.
 // A handshake that fails prints "result failed <detail>". The poll loop is the caller's: the session never blocks.
 import "abla/io"
 import "abla/process/arguments"
@@ -24,7 +24,7 @@ fun main: int {
     val ca = processArgument(3)
     val family = processArgument(4)
     val action = processArgument(5)
-    val stopPid = if (action == "flood") decimal(processArgument(6)) else 0
+    val stopPid = if (action == "flood" || action == "silent") decimal(processArgument(6)) else 0
     val mode = if (modeName == "none") TLS_VERIFY_NONE else if (modeName == "chain") TLS_VERIFY_CHAIN else TLS_VERIFY_HOST
     var tcp = if (family == "4") tcpConnectIpv4("127.0.0.1", port, 5000) else tcpConnectIpv6(ipv6Loopback(port), 5000)
     if (tcp.descriptor < 0) {
@@ -36,7 +36,17 @@ fun main: int {
     val session = tlsSessionClient(descriptor, host, mode, ca)
     var wantRead = 0
     var wantWrite = 0
+    // silent: the server is stopped (SIGSTOP) while the ClientHello goes out, so nothing can answer yet: the first handshake()
+    // must say want-read, whatever the machine's load; then the server continues and the handshake finishes.
+    if (action == "silent") linuxSyscall2(62, stopPid, 19)
     var status = session.handshake()
+    if (action == "silent") {
+        linuxSyscall2(62, stopPid, 18)
+        if (status != 2) {
+            println("result failed the first handshake step said $status, not want-read")
+            return 1
+        }
+    }
     var rounds = 0
     while ((status == 2 || status == 3) && rounds < 5000) {
         if (status == 2) wantRead = wantRead + 1 else wantWrite = wantWrite + 1

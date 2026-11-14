@@ -83,9 +83,9 @@ expect_failed "host IPv4 address without an IP entry" "$(run host 127.0.0.1 "$ou
 expect_ok "chain IPv4 address without an IP entry" "$(run chain 127.0.0.1 "$out/dnsonly.pem" 4 get)"
 stop_server
 checks=$((checks + 3))
-# want-read: the handshake needs the server's answer, so the poll loop sees at least one.
+# want-read: the server is stopped while the ClientHello goes out, so the first handshake step cannot have an answer.
 start_server good -tls1_3 -www
-result=$(run host localhost "$out/good.pem" 6 silent)
+result=$(run host localhost "$out/good.pem" 6 silent "$server_pid")
 [[ $result == 'result handshake wantRead='* && ${result#*wantRead=} -ge 1 ]] || { echo "tls-session (want-read): [$result]" >&2; exit 1; }
 # want-write: a server that stopped reading fills the socket buffers.
 result=$(run host localhost "$out/good.pem" 6 flood "$server_pid")
