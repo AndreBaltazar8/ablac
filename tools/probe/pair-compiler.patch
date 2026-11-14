@@ -1,0 +1,103 @@
+diff --git a/src/backend/llvm/analysis.ab b/src/backend/llvm/analysis.ab
+index 5aab81ad..6b2bb828 100644
+--- a/src/backend/llvm/analysis.ab
++++ b/src/backend/llvm/analysis.ab
+@@ -1947,6 +1947,7 @@ fun bootstrapLlvmNativeIntrinsic(name: string): bool =
+     name == "ablaLinuxEnvironmentPointer" ||
+     name == "ablaLinuxSyscall" ||
+     name == "ablaDarwinSyscall" ||
++    name == "ablaDarwinSyscallPair" ||
+     name == "ablaRuntimeWasmHeapBase" ||
+     name == "ablaRuntimeWasmMemorySize" ||
+     name == "ablaRuntimeWasmMemoryGrow"
+diff --git a/src/backend/llvm/core.ab b/src/backend/llvm/core.ab
+index ca9987b7..a3c44e2f 100644
+--- a/src/backend/llvm/core.ab
++++ b/src/backend/llvm/core.ab
+@@ -1114,7 +1114,7 @@ fun bootstrapLlvmDarwinSyscallTarget(backend: BootstrapLlvmBackend): bool =
+      bootstrapTextContains(backend.targetTriple, "x86_64"))
+ 
+ // `values` are the BSD system call number and its six arguments, all i64.
+-fun bootstrapLlvmInlineDarwinSyscall(
++fun bootstrapLlvmInlineDarwinSyscallPair(
+     backend: BootstrapLlvmBackend,
+     values: array<i64*>,
+     name: string
+@@ -1141,9 +1141,19 @@ fun bootstrapLlvmInlineDarwinSyscall(
+         LLVMGetInlineAsm(type, assembly, assembly.size, constraints, constraints.size, 1, 0, 0, 0),
+         arguments, name
+     )
+-    LLVMBuildExtractValue(backend.builder, pairValue, i32(0), "$name.result")
++    pairValue
+ }
+ 
++// The first result of the call (the form `ablaDarwinSyscall` takes).
++fun bootstrapLlvmInlineDarwinSyscall(
++    backend: BootstrapLlvmBackend,
++    values: array<i64*>,
++    name: string
++): i64* = LLVMBuildExtractValue(
++    backend.builder, bootstrapLlvmInlineDarwinSyscallPair(backend, values, name), i32(0),
++    "$name.result"
++)
++
+ // AArch64 Linux has no libc to call and its own system call numbers: a call by its
+ // x86-64 number goes to the module's abla_x64_syscall routine (aarch64.ab).
+ fun bootstrapLlvmAarch64SyscallCall(
+diff --git a/src/backend/llvm/functions.ab b/src/backend/llvm/functions.ab
+index 9a5c2f9f..4cffa2a5 100644
+--- a/src/backend/llvm/functions.ab
++++ b/src/backend/llvm/functions.ab
+@@ -2819,6 +2819,7 @@ fun bootstrapLlvmCoreIntrinsic(name: string): bool =
+     name == "ablaLinuxEnvironmentPointer" ||
+     name == "ablaLinuxSyscall" ||
+     name == "ablaDarwinSyscall" ||
++    name == "ablaDarwinSyscallPair" ||
+     name == "ablaRuntimeWasmHeapBase" ||
+     name == "ablaRuntimeWasmMemorySize" ||
+     name == "ablaRuntimeWasmMemoryGrow"
+@@ -7160,6 +7161,44 @@ fun bootstrapLlvmEmitCoreIntrinsic(
+             )
+         }
+     }
++    // ablaDarwinSyscallPair(number, a0..a4, second): as ablaDarwinSyscall with five arguments; the second result
++    // register (x1 / rdx: fork's child flag, pipe's second descriptor) is stored at the address `second`.
++    if (name == "ablaDarwinSyscallPair") {
++        if (instruction.operands.size != 7) supported = false
++        if (instruction.operands.size == 7) {
++            val arguments: array<i64*> = []
++            var operand = 0
++            while (operand < 6) {
++                arguments.append(bootstrapLlvmCoreIntrinsicInteger(
++                    backend, storage, instruction.operands[operand]
++                ))
++                operand = operand + 1
++            }
++            arguments.append(LLVMConstInt(backend.i64Type, 0, 0))
++            val second = bootstrapLlvmCoreIntrinsicInteger(
++                backend, storage, instruction.operands[6]
++            )
++            if (bootstrapLlvmDarwinSyscallTarget(backend)) {
++                val pairValue = bootstrapLlvmInlineDarwinSyscallPair(
++                    backend, arguments, "darwin.syscall.pair"
++                )
++                LLVMBuildStore(
++                    backend.builder,
++                    LLVMBuildExtractValue(backend.builder, pairValue, i32(1),
++                        "darwin.syscall.second"),
++                    LLVMBuildIntToPtr(backend.builder, second, backend.pointerType,
++                        "darwin.syscall.second.address")
++                )
++                bootstrapLlvmSetNativeValue(
++                    backend, storage, instruction.result,
++                    LLVMBuildExtractValue(backend.builder, pairValue, i32(0),
++                        "darwin.syscall.pair.result")
++                )
++            } else bootstrapLlvmSetNativeValue(
++                backend, storage, instruction.result, LLVMConstInt(backend.i64Type, -38, 1)
++            )
++        }
++    }
+     if (name == "ablaLinuxEnvironmentPointer") {
+         if (instruction.operands.size != 0) supported = false
+         if (instruction.operands.size == 0) {

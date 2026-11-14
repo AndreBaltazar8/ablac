@@ -1,0 +1,61 @@
+name: Probe macOS stage 1
+
+# A hang in the pinned bootstrap's native arm64 build of the current sources (runs 43588375980, 43594346734) is
+# bisected by variant: the intrinsic's declaration in host.ab alone, its lowering in the compiler alone, and neither.
+# Each leg builds stage 1 under a watchdog that samples the stuck processes. Dispatch only; nothing else runs.
+on:
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds the stage 1 build may run before it is sampled and stopped
+        required: false
+        default: '420'
+
+jobs:
+  probe:
+    name: stage 1 (${{ matrix.variant }})
+    runs-on: macos-15
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [none, declaration, compiler]
+    env:
+      JOBS: '2'
+      ABLA_NATIVE_JOBS: '2'
+      ABLA_CODEGEN_JOBS: '2'
+      ABLA_RELEASE_SELFHOST_BUILD_SECONDS: '1200'
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install the bottled native toolchain
+        run: |
+          brew update
+          brew install --force-bottle llvm@23 lld@23 openssl@3 binaryen
+          {
+            echo "$(brew --prefix llvm@23)/bin"
+            echo "$(brew --prefix lld@23)/bin"
+            echo "$(brew --prefix openssl@3)/bin"
+          } >> "$GITHUB_PATH"
+      - name: Fetch the checksum-pinned bootstrap
+        run: tools/bootstrap-compiler.sh build/ci/bootstrap-ablac
+      - name: Apply the variant
+        run: |
+          case '${{ matrix.variant }}' in
+            declaration) git apply tools/probe/pair-declaration.patch ;;
+            compiler) git apply tools/probe/pair-compiler.patch ;;
+          esac
+          git diff --stat
+      - name: Build stage 1 under the watchdog
+        run: tools/probe/stage1-watchdog.sh '${{ inputs.seconds }}' build/ci/bootstrap-ablac build/ci/ablac-stage1
+      - name: Keep the samples
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: probe-stage1-${{ matrix.variant }}
+          path: build/probe/
+          retention-days: 3
+          if-no-files-found: ignore
