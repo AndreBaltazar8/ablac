@@ -6,9 +6,6 @@
 
 import "abla/bytes"
 import "abla/ct"
-import "abla/unsafe/memory"
-import "abla/unsafe/memory/raw"
-import "abla/unsafe/mmio"
 
 // Phase-safe entry point: staged execution provides the same byte semantics,
 // while native and Wasm targets bind this symbol to the contiguous Abla
@@ -145,71 +142,66 @@ private fun cryptoSha2Long(value: string, initial: array<int>, digestBytes: int)
         state.append(initial[index])
         index = index + 1
     }
-    // The evaluator takes only the first branch, and counts only its effects.
-    if (ablaAtCompileTime()) {
-        val constants = cryptoSha512Constants()
-        var offset = 0
-        while (offset < input.size) {
-            val words: array<int> = []
-            index = 0
-            while (index < 16) {
-                val at = offset + index * 8
-                words.append(
-                    (cryptoReadU32Big(input, at) << 32) | cryptoReadU32Big(input, at + 4)
-                )
-                index = index + 1
-            }
-            while (index < 80) {
-                val previous15 = words[index - 15]
-                val previous2 = words[index - 2]
-                val small0 = cryptoRotateRight64(previous15, 1) ^
-                    cryptoRotateRight64(previous15, 8) ^ (previous15 >>> 7)
-                val small1 = cryptoRotateRight64(previous2, 19) ^
-                    cryptoRotateRight64(previous2, 61) ^ (previous2 >>> 6)
-                words.append(words[index - 16] + small0 + words[index - 7] + small1)
-                index = index + 1
-            }
-
-            var a = state[0]
-            var b = state[1]
-            var c = state[2]
-            var d = state[3]
-            var e = state[4]
-            var f = state[5]
-            var g = state[6]
-            var h = state[7]
-            index = 0
-            while (index < 80) {
-                val big1 = cryptoRotateRight64(e, 14) ^
-                    cryptoRotateRight64(e, 18) ^ cryptoRotateRight64(e, 41)
-                val choose = (e & f) ^ (~e & g)
-                val temporary1 = h + big1 + choose + constants[index] + words[index]
-                val big0 = cryptoRotateRight64(a, 28) ^
-                    cryptoRotateRight64(a, 34) ^ cryptoRotateRight64(a, 39)
-                val majority = (a & b) ^ (a & c) ^ (b & c)
-                val temporary2 = big0 + majority
-                h = g
-                g = f
-                f = e
-                e = d + temporary1
-                d = c
-                c = b
-                b = a
-                a = temporary1 + temporary2
-                index = index + 1
-            }
-            state[0] = state[0] + a
-            state[1] = state[1] + b
-            state[2] = state[2] + c
-            state[3] = state[3] + d
-            state[4] = state[4] + e
-            state[5] = state[5] + f
-            state[6] = state[6] + g
-            state[7] = state[7] + h
-            offset = offset + 128
+    val constants = cryptoSha512Constants()
+    var offset = 0
+    while (offset < input.size) {
+        val words: array<int> = []
+        index = 0
+        while (index < 16) {
+            val at = offset + index * 8
+            words.append(
+                (cryptoReadU32Big(input, at) << 32) | cryptoReadU32Big(input, at + 4)
+            )
+            index = index + 1
         }
-    } else {
-        cryptoSha512Run(state, cryptoByteString(input))
+        while (index < 80) {
+            val previous15 = words[index - 15]
+            val previous2 = words[index - 2]
+            val small0 = cryptoRotateRight64(previous15, 1) ^
+                cryptoRotateRight64(previous15, 8) ^ (previous15 >>> 7)
+            val small1 = cryptoRotateRight64(previous2, 19) ^
+                cryptoRotateRight64(previous2, 61) ^ (previous2 >>> 6)
+            words.append(words[index - 16] + small0 + words[index - 7] + small1)
+            index = index + 1
+        }
+
+        var a = state[0]
+        var b = state[1]
+        var c = state[2]
+        var d = state[3]
+        var e = state[4]
+        var f = state[5]
+        var g = state[6]
+        var h = state[7]
+        index = 0
+        while (index < 80) {
+            val big1 = cryptoRotateRight64(e, 14) ^
+                cryptoRotateRight64(e, 18) ^ cryptoRotateRight64(e, 41)
+            val choose = (e & f) ^ (~e & g)
+            val temporary1 = h + big1 + choose + constants[index] + words[index]
+            val big0 = cryptoRotateRight64(a, 28) ^
+                cryptoRotateRight64(a, 34) ^ cryptoRotateRight64(a, 39)
+            val majority = (a & b) ^ (a & c) ^ (b & c)
+            val temporary2 = big0 + majority
+            h = g
+            g = f
+            f = e
+            e = d + temporary1
+            d = c
+            c = b
+            b = a
+            a = temporary1 + temporary2
+            index = index + 1
+        }
+        state[0] = state[0] + a
+        state[1] = state[1] + b
+        state[2] = state[2] + c
+        state[3] = state[3] + d
+        state[4] = state[4] + e
+        state[5] = state[5] + f
+        state[6] = state[6] + g
+        state[7] = state[7] + h
+        offset = offset + 128
     }
     val output: array<int> = []
     index = 0
@@ -346,176 +338,6 @@ fun sha256Stream(): Sha256Stream {
     )
 }
 
-// BEGIN SHA2 SECRET CORES
-// SHA-256 and SHA-512 compression over native memory, every word a secret: in HMAC and HKDF (the TLS key schedule) the
-// state and the schedule are made from a key. Additions, rotations and logic only, no branch, index or division from
-// them; tools/test-ct.sh reads these functions on every target. A state is eight words, native order (SHA-512's as
-// low then high halves); the input is whole blocks, big-endian, as the standard reads them.
-private @inline trusted fun sha2Load(address: int): secretU32 =
-    secretU32(u32(ablaUnsafeLoadU32(nativePointerFromAddress(address))))
-private @inline trusted fun sha2Store(address: int, value: secretU32): void =
-    ablaUnsafeStoreU32(nativePointerFromAddress(address), int(value.declassify()))
-private @inline trusted fun sha2Big(address: int): secretU32 {
-    val x = sha2Load(address)
-    ((x & secretU32(u32(255))) << 24) | ((x & secretU32(u32(65280))) << 8) | ((x >> 8) &
-        secretU32(u32(65280))) |
-        (x >> 24)
-}
-private @inline trusted fun sha2Load64(address: int): secretU64 =
-    sha2Load(address).widen() | (sha2Load(address + 4).widen() << 32)
-private @inline trusted fun sha2Store64(address: int, value: secretU64): void {
-    sha2Store(address, value.low())
-    sha2Store(address + 4, value.high())
-}
-private @inline trusted fun sha2Big64(address: int): secretU64 = (sha2Big(address).widen() << 32) |
-    sha2Big(address + 4).widen()
-private @inline trusted fun sha256Constants(): int =
-    nativeStaticBytes("\x98\x2f\x8a\x42\x91\x44\x37\x71\xcf\xfb\xc0\xb5\xa5\xdb\xb5\xe9\x5b\xc2\x56\x39\xf1\x11\xf1\x59\xa4\x82\x3f\x92\xd5\x5e\x1c\xab\x98\xaa\x07\xd8\x01\x5b\x83\x12\xbe\x85\x31\x24\xc3\x7d\x0c\x55\x74\x5d\xbe\x72\xfe\xb1\xde\x80\xa7\x06\xdc\x9b\x74\xf1\x9b\xc1\xc1\x69\x9b\xe4\x86\x47\xbe\xef\xc6\x9d\xc1\x0f\xcc\xa1\x0c\x24\x6f\x2c\xe9\x2d\xaa\x84\x74\x4a\xdc\xa9\xb0\x5c\xda\x88\xf9\x76\x52\x51\x3e\x98\x6d\xc6\x31\xa8\xc8\x27\x03\xb0\xc7\x7f\x59\xbf\xf3\x0b\xe0\xc6\x47\x91\xa7\xd5\x51\x63\xca\x06\x67\x29\x29\x14\x85\x0a\xb7\x27\x38\x21\x1b\x2e\xfc\x6d\x2c\x4d\x13\x0d\x38\x53\x54\x73\x0a\x65\xbb\x0a\x6a\x76\x2e\xc9\xc2\x81\x85\x2c\x72\x92\xa1\xe8\xbf\xa2\x4b\x66\x1a\xa8\x70\x8b\x4b\xc2\xa3\x51\x6c\xc7\x19\xe8\x92\xd1\x24\x06\x99\xd6\x85\x35\x0e\xf4\x70\xa0\x6a\x10\x16\xc1\xa4\x19\x08\x6c\x37\x1e\x4c\x77\x48\x27\xb5\xbc\xb0\x34\xb3\x0c\x1c\x39\x4a\xaa\xd8\x4e\x4f\xca\x9c\x5b\xf3\x6f\x2e\x68\xee\x82\x8f\x74\x6f\x63\xa5\x78\x14\x78\xc8\x84\x08\x02\xc7\x8c\xfa\xff\xbe\x90\xeb\x6c\x50\xa4\xf7\xa3\xf9\xbe\xf2\x78\x71\xc6")
-private @inline trusted fun sha512Constants(): int =
-    nativeStaticBytes("\x22\xae\x28\xd7\x98\x2f\x8a\x42\xcd\x65\xef\x23\x91\x44\x37\x71\x2f\x3b\x4d\xec\xcf\xfb\xc0\xb5\xbc\xdb\x89\x81\xa5\xdb\xb5\xe9\x38\xb5\x48\xf3\x5b\xc2\x56\x39\x19\xd0\x05\xb6\xf1\x11\xf1\x59\x9b\x4f\x19\xaf\xa4\x82\x3f\x92\x18\x81\x6d\xda\xd5\x5e\x1c\xab\x42\x02\x03\xa3\x98\xaa\x07\xd8\xbe\x6f\x70\x45\x01\x5b\x83\x12\x8c\xb2\xe4\x4e\xbe\x85\x31\x24\xe2\xb4\xff\xd5\xc3\x7d\x0c\x55\x6f\x89\x7b\xf2\x74\x5d\xbe\x72\xb1\x96\x16\x3b\xfe\xb1\xde\x80\x35\x12\xc7\x25\xa7\x06\xdc\x9b\x94\x26\x69\xcf\x74\xf1\x9b\xc1\xd2\x4a\xf1\x9e\xc1\x69\x9b\xe4\xe3\x25\x4f\x38\x86\x47\xbe\xef\xb5\xd5\x8c\x8b\xc6\x9d\xc1\x0f\x65\x9c\xac\x77\xcc\xa1\x0c\x24\x75\x02\x2b\x59\x6f\x2c\xe9\x2d\x83\xe4\xa6\x6e\xaa\x84\x74\x4a\xd4\xfb\x41\xbd\xdc\xa9\xb0\x5c\xb5\x53\x11\x83\xda\x88\xf9\x76\xab\xdf\x66\xee\x52\x51\x3e\x98\x10\x32\xb4\x2d\x6d\xc6\x31\xa8\x3f\x21\xfb\x98\xc8\x27\x03\xb0\xe4\x0e\xef\xbe\xc7\x7f\x59\xbf\xc2\x8f\xa8\x3d\xf3\x0b\xe0\xc6\x25\xa7\x0a\x93\x47\x91\xa7\xd5\x6f\x82\x03\xe0\x51\x63\xca\x06\x70\x6e\x0e\x0a\x67\x29\x29\x14\xfc\x2f\xd2\x46\x85\x0a\xb7\x27\x26\xc9\x26\x5c\x38\x21\x1b\x2e\xed\x2a\xc4\x5a\xfc\x6d\x2c\x4d\xdf\xb3\x95\x9d\x13\x0d\x38\x53\xde\x63\xaf\x8b\x54\x73\x0a\x65\xa8\xb2\x77\x3c\xbb\x0a\x6a\x76\xe6\xae\xed\x47\x2e\xc9\xc2\x81\x3b\x35\x82\x14\x85\x2c\x72\x92\x64\x03\xf1\x4c\xa1\xe8\xbf\xa2\x01\x30\x42\xbc\x4b\x66\x1a\xa8\x91\x97\xf8\xd0\x70\x8b\x4b\xc2\x30\xbe\x54\x06\xa3\x51\x6c\xc7\x18\x52\xef\xd6\x19\xe8\x92\xd1\x10\xa9\x65\x55\x24\x06\x99\xd6\x2a\x20\x71\x57\x85\x35\x0e\xf4\xb8\xd1\xbb\x32\x70\xa0\x6a\x10\xc8\xd0\xd2\xb8\x16\xc1\xa4\x19\x53\xab\x41\x51\x08\x6c\x37\x1e\x99\xeb\x8e\xdf\x4c\x77\x48\x27\xa8\x48\x9b\xe1\xb5\xbc\xb0\x34\x63\x5a\xc9\xc5\xb3\x0c\x1c\x39\xcb\x8a\x41\xe3\x4a\xaa\xd8\x4e\x73\xe3\x63\x77\x4f\xca\x9c\x5b\xa3\xb8\xb2\xd6\xf3\x6f\x2e\x68\xfc\xb2\xef\x5d\xee\x82\x8f\x74\x60\x2f\x17\x43\x6f\x63\xa5\x78\x72\xab\xf0\xa1\x14\x78\xc8\x84\xec\x39\x64\x1a\x08\x02\xc7\x8c\x28\x1e\x63\x23\xfa\xff\xbe\x90\xe9\xbd\x82\xde\xeb\x6c\x50\xa4\x15\x79\xc6\xb2\xf7\xa3\xf9\xbe\x2b\x53\x72\xe3\xf2\x78\x71\xc6\x9c\x61\x26\xea\xce\x3e\x27\xca\x07\xc2\xc0\x21\xc7\xb8\x86\xd1\x1e\xeb\xe0\xcd\xd6\x7d\xda\xea\x78\xd1\x6e\xee\x7f\x4f\x7d\xf5\xba\x6f\x17\x72\xaa\x67\xf0\x06\xa6\x98\xc8\xa2\xc5\x7d\x63\x0a\xae\x0d\xf9\xbe\x04\x98\x3f\x11\x1b\x47\x1c\x13\x35\x0b\x71\x1b\x84\x7d\x04\x23\xf5\x77\xdb\x28\x93\x24\xc7\x40\x7b\xab\xca\x32\xbc\xbe\xc9\x15\x0a\xbe\x9e\x3c\x4c\x0d\x10\x9c\xc4\x67\x1d\x43\xb6\x42\x3e\xcb\xbe\xd4\xc5\x4c\x2a\x7e\x65\xfc\x9c\x29\x7f\x59\xec\xfa\xd6\x3a\xab\x6f\xcb\x5f\x17\x58\x47\x4a\x8c\x19\x44\x6c")
-
-/** SHA-256 over `blocks` 64-byte blocks at `input`: the state (8 words at `state`) is updated; `words` is 256 bytes of
- *  scratch for the schedule. */
-private @inline trusted fun sha256CoreBlocks(state: int, input: int, blocks: int,
-    words: int): void {
-    val constants = sha256Constants()
-    for (block in 0 until blocks) {
-        val at = input + block * 64
-        for (i in 0 until 16) sha2Store(words + i * 4, sha2Big(at + i * 4))
-        for (i in 16 until 64) {
-            val v15 = sha2Load(words + (i - 15) * 4)
-            val v2 = sha2Load(words + (i - 2) * 4)
-            val s0 = v15.rotr(7) ^ v15.rotr(18) ^ (v15 >> 3)
-            val s1 = v2.rotr(17) ^ v2.rotr(19) ^ (v2 >> 10)
-            sha2Store(words + i * 4,
-                sha2Load(words + (i - 16) * 4) + s0 + sha2Load(words + (i - 7) * 4) + s1)
-        }
-        var a = sha2Load(state)
-        var b = sha2Load(state + 4)
-        var c = sha2Load(state + 8)
-        var d = sha2Load(state + 12)
-        var e = sha2Load(state + 16)
-        var f = sha2Load(state + 20)
-        var g = sha2Load(state + 24)
-        var h = sha2Load(state + 28)
-        for (i in 0 until 64) {
-            val t1 = h + (e.rotr(6) ^ e.rotr(11) ^ e.rotr(25)) + ((e & f) ^ (~e & g)) +
-                sha2Load(constants + i * 4) +
-                sha2Load(words + i * 4)
-            val t2 = (a.rotr(2) ^ a.rotr(13) ^ a.rotr(22)) + ((a & b) ^ (a & c) ^ (b & c))
-            h = g
-            g = f
-            f = e
-            e = d + t1
-            d = c
-            c = b
-            b = a
-            a = t1 + t2
-        }
-        sha2Store(state, sha2Load(state) + a)
-        sha2Store(state + 4, sha2Load(state + 4) + b)
-        sha2Store(state + 8, sha2Load(state + 8) + c)
-        sha2Store(state + 12, sha2Load(state + 12) + d)
-        sha2Store(state + 16, sha2Load(state + 16) + e)
-        sha2Store(state + 20, sha2Load(state + 20) + f)
-        sha2Store(state + 24, sha2Load(state + 24) + g)
-        sha2Store(state + 28, sha2Load(state + 28) + h)
-    }
-}
-
-/** SHA-512 (and SHA-384) over `blocks` 128-byte blocks at `input`; `words` is 640 bytes of scratch. */
-private @inline trusted fun sha512CoreBlocks(state: int, input: int, blocks: int,
-    words: int): void {
-    val constants = sha512Constants()
-    for (block in 0 until blocks) {
-        val at = input + block * 128
-        for (i in 0 until 16) sha2Store64(words + i * 8, sha2Big64(at + i * 8))
-        for (i in 16 until 80) {
-            val v15 = sha2Load64(words + (i - 15) * 8)
-            val v2 = sha2Load64(words + (i - 2) * 8)
-            val s0 = v15.rotr(1) ^ v15.rotr(8) ^ (v15 >> 7)
-            val s1 = v2.rotr(19) ^ v2.rotr(61) ^ (v2 >> 6)
-            sha2Store64(words + i * 8,
-                sha2Load64(words + (i - 16) * 8) + s0 + sha2Load64(words + (i - 7) * 8) + s1)
-        }
-        var a = sha2Load64(state)
-        var b = sha2Load64(state + 8)
-        var c = sha2Load64(state + 16)
-        var d = sha2Load64(state + 24)
-        var e = sha2Load64(state + 32)
-        var f = sha2Load64(state + 40)
-        var g = sha2Load64(state + 48)
-        var h = sha2Load64(state + 56)
-        for (i in 0 until 80) {
-            val t1 = h + (e.rotr(14) ^ e.rotr(18) ^ e.rotr(41)) + ((e & f) ^ (~e & g)) +
-                sha2Load64(constants + i * 8) +
-                sha2Load64(words + i * 8)
-            val t2 = (a.rotr(28) ^ a.rotr(34) ^ a.rotr(39)) + ((a & b) ^ (a & c) ^ (b & c))
-            h = g
-            g = f
-            f = e
-            e = d + t1
-            d = c
-            c = b
-            b = a
-            a = t1 + t2
-        }
-        sha2Store64(state, sha2Load64(state) + a)
-        sha2Store64(state + 8, sha2Load64(state + 8) + b)
-        sha2Store64(state + 16, sha2Load64(state + 16) + c)
-        sha2Store64(state + 24, sha2Load64(state + 24) + d)
-        sha2Store64(state + 32, sha2Load64(state + 32) + e)
-        sha2Store64(state + 40, sha2Load64(state + 40) + f)
-        sha2Store64(state + 48, sha2Load64(state + 48) + g)
-        sha2Store64(state + 56, sha2Load64(state + 56) + h)
-    }
-}
-// END SHA2 SECRET CORES
-
-// The cores' scratch is wiped before it is freed (it held a key's state and schedule).
-private trusted fun cryptoWipe(address: int, size: int): void {
-    for (i in 0 until size) ablaUnsafeVolatileStoreU8(address + i, 0)
-    return
-}
-
-/** SHA-256 over `blocks` whole blocks of `input` from `offset`, on the stream's state: the secret core above at run time,
- *  the portable block function at compile time (where the constant-time types do not run). */
-private fun Sha256Stream.runBlocks(input: string, offset: int, blocks: int): void {
-    if (blocks <= 0) return
-    // The evaluator takes only this branch, and counts only its effects.
-    if (ablaAtCompileTime()) {
-        for (block in 0 until blocks) cryptoSha256Block(this.state, this.constants, this.schedule,
-            input, offset + block * 64)
-    } else {
-        cryptoSha256Run(this.state, input, offset, blocks)
-    }
-    return
-}
-
-private trusted fun cryptoSha256Run(var state: array<int>, input: string, offset: int,
-    blocks: int): void {
-    val memory = ablaUnsafeAllocate(288)
-    val base = ablaUnsafePointerAddress(memory)
-    for (k in 0 until 8) sha2Store(base + k * 4, secretU32(u32(state[k])))
-    sha256CoreBlocks(base, ablaUnsafeStringAddress(input) + offset, blocks, base + 32)
-    for (k in 0 until 8) state[k] = int(sha2Load(base + k * 4).declassify())
-    cryptoWipe(base, 288)
-    ablaUnsafeFree(memory)
-    return
-}
-
-/** SHA-512's core over the padded message `text` (whole 128-byte blocks), on `state`. */
-private trusted fun cryptoSha512Run(var state: array<int>, text: string): void {
-    val memory = ablaUnsafeAllocate(704)
-    val base = ablaUnsafePointerAddress(memory)
-    for (k in 0 until 8) sha2Store64(base + k * 8, secretU64(u64(state[k])))
-    sha512CoreBlocks(base, ablaUnsafeStringAddress(text), text.size / 128, base + 64)
-    for (k in 0 until 8) state[k] = int(sha2Load64(base + k * 8).declassify())
-    cryptoWipe(base, 704)
-    ablaUnsafeFree(memory)
-    return
-}
-
 // Rotates written out, and no call in the loops: built --fast nothing inlines, and this is most of the time spent.
 private fun cryptoSha256Block(
     var state: array<int>,
@@ -587,13 +409,14 @@ fun Sha256Stream.update(value: string): void {
         this.pending = "${this.pending}${value.slice(0, taken)}"
         offset = taken
         if (this.pending.size == 64) {
-            this.runBlocks(this.pending, 0, 1)
+            cryptoSha256Block(this.state, this.constants, this.schedule, this.pending, 0)
             this.pending = ""
         }
     }
-    val whole = (value.size - offset) / 64
-    this.runBlocks(value, offset, whole)
-    offset = offset + whole * 64
+    while (value.size - offset >= 64) {
+        cryptoSha256Block(this.state, this.constants, this.schedule, value, offset)
+        offset = offset + 64
+    }
     if (offset < value.size) this.pending = "${this.pending}${value.slice(offset, value.size)}"
     return
 }
@@ -607,7 +430,11 @@ fun Sha256Stream.finish(): string {
     cryptoAppendU32Big(tail, bitLength >>> 32)
     cryptoAppendU32Big(tail, bitLength & 4294967295)
     val text = cryptoByteString(tail)
-    this.runBlocks(text, 0, text.size / 64)
+    var offset = 0
+    while (offset < text.size) {
+        cryptoSha256Block(this.state, this.constants, this.schedule, text, offset)
+        offset = offset + 64
+    }
     val output: array<int> = []
     for (word in this.state) cryptoAppendU32Big(output, word)
     cryptoByteString(output)
