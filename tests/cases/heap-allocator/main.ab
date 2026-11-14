@@ -280,6 +280,44 @@ trusted fun coalescing(): int {
     0
 }
 
+// Runs of small blocks, every other run freed, then trimmed: the merged free blocks are past 128 KiB (the bin of
+// large free blocks), whose interior pages go back. Those must be whole pages of the host (16 KiB on Apple Silicon,
+// where madvise rounds a range outward), never a free block's header, links or footer, nor the bytes of the live
+// runs next to it (the v0.2.59 arm64 macOS compiler hangs: a corrupted bin list).
+trusted fun neighbours(): int {
+    if (!__ablaRuntimeHostHeapNative()) return 0
+    val live: array<int> = []
+    val tags: array<int> = []
+    val gone: array<int> = []
+    for (group in 0 until 48) {
+        for (item in 0 until 70) {
+            val tag = group * 100 + item
+            val address = allocate(3990 + (group % 5) * 24)
+            if (address == 0) return fail("allocate is null")
+            fill(address, 3990, tag)
+            if (group % 2 == 0) gone.append(address) else {
+                live.append(address)
+                tags.append(tag)
+            }
+        }
+    }
+    for (address in gone) release(address)
+    var round = 0
+    while (round < 3) {
+        trim()
+        val bad = consistent("after the neighbours' trim")
+        if (bad != 0) return bad
+        for (index in 0 until live.size) {
+            if (wrong(live[index], 3990, tags[index]) >= 0) {
+                return fail("a live block beside a trimmed free block was overwritten")
+            }
+        }
+        round = round + 1
+    }
+    for (address in live) release(address)
+    0
+}
+
 // Random allocation, growth and freeing of a few thousand blocks of every size, the heap's tags checked
 // and every live block's bytes compared at each trim.
 trusted fun scramble(seed: int): int {
@@ -405,6 +443,7 @@ fun main: int {
     failures = failures + resizing()
     failures = failures + giveBack()
     failures = failures + coalescing()
+    failures = failures + neighbours()
     failures = failures + scramble(1)
     failures = failures + scramble(2)
     val a = thread { churn(1) }

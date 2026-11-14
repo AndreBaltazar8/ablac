@@ -614,6 +614,18 @@ trusted fun __ablaRuntimeHostHeapMerge(block: int): void {
     return
 }
 
+// Gives back the whole pages inside [from, to): rounded inward to the host's page, which is 16 KiB on Apple
+// Silicon. Darwin's madvise rounds the start down and the end up to its page, so a range only 4 KiB aligned
+// would also discard the live data around it (the free block's own header and links, the block before it):
+// the intermittent heap corruption behind the arm64 macOS compiler hangs of v0.2.59.
+trusted fun __ablaRuntimeHostHeapDiscard(from: int, to: int): void {
+    val page = if (ablaHostIsMacOS()) 16384 else 4096
+    val low = (from + page - 1) & -page
+    val high = to & -page
+    if (high > low) ablaLinuxSyscall(28, low, high - low, 4, 0, 0, 0)
+    return
+}
+
 // The large free blocks (bin 120) give their pages back, keeping each one's header, links and footer, all but
 // the first ones (the newest, the likeliest to be wanted next) that make up what the bins are meant to keep.
 @noinline
@@ -624,9 +636,7 @@ trusted fun __ablaRuntimeHostHeapGiveBack(): void {
     while (block != 0) {
         val end = block + (ablaRuntimeLoadI64(block - 8) & __ablaRuntimeHostHeapSizeMask)
         kept = kept + (end - block)
-        val low = (block + 32 + 4095) & -4096
-        val high = (end - 16) & -4096
-        if (kept > keep && high > low) ablaLinuxSyscall(28, low, high - low, 4, 0, 0, 0)
+        if (kept > keep) __ablaRuntimeHostHeapDiscard(block + 32, end - 16)
         block = ablaRuntimeLoadI64(block)
     }
     return
@@ -859,9 +869,7 @@ trusted fun __ablaRuntimeHostHeapTrim(): void {
         var free = ablaRuntimeLoadI64(__ablaRuntimeHostHeapState() + 960 + bin * 8)
         while (free != 0) {
             val end = free + (ablaRuntimeLoadI64(free - 8) & __ablaRuntimeHostHeapSizeMask)
-            val low = (free + 32 + 4095) & -4096
-            val high = (end - 16) & -4096
-            if (high > low) ablaLinuxSyscall(28, low, high - low, 4, 0, 0, 0)
+            __ablaRuntimeHostHeapDiscard(free + 32, end - 16)
             free = ablaRuntimeLoadI64(free)
         }
         bin = bin + 1
