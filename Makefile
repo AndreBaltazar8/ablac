@@ -192,6 +192,7 @@ test-serial: ablac
 	tools/test-shadowed-branch-types.sh $(COMPILER)
 	tools/test-run-built.sh $(COMPILER)
 	tools/test-jit-host-selection.sh $(COMPILER)
+	tools/test-ct-jit-extension-operators.sh $(COMPILER)
 	tools/test-jit-object-cache.sh $(COMPILER)
 	tools/test-jit-http.sh $(COMPILER)
 	tools/test-string-helpers.sh $(COMPILER)

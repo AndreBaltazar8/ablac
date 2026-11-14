@@ -205,20 +205,24 @@ class BootstrapCtState(
         visible
     }
 
-    // The one item a member call resolves to by the checker's facts (a class receiver, a
-    // non-generic target present among `known`), else -1: every candidate stays.
+    // The one item a member call resolves to by the checker's facts, else -1: every candidate
+    // stays. The target must be present among `known` and not generic, and either an extension
+    // function, which is bound statically whatever its receiver (`secretU64.minus`, #828), or a
+    // method of a class receiver with a single implementation.
     fun exactTarget(expression: BootstrapExpression, known: array<int>): int {
         val fact = this.methodTargets.find(this.itemSource[this.current], expression)
         if (fact < 0) return -1
         val selected = this.methodTargets.targets[fact]
         if (selected.target < 0 || selected.identity == "") return -1
-        if (!(this.concrete.get(selected.receiver) ?? false)) return -1
+        val concrete = this.concrete.get(selected.receiver) ?? false
         for (item in known) {
             if (item == selected.target) {
                 val declaration = this.itemDeclaration[item]
                 if (declaration < 0) return -1
                 val owner = this.declarations[declaration]
                 val method = this.itemMethod[item]
+                val extension = method < 0 && owner.extensionOwner != ""
+                if (!concrete && !extension) return -1
                 val target = if (method < 0) owner else owner.methods[method]
                 val identity = if (method < 0) bootstrapResolvedDeclarationIdentity(owner)
                     else bootstrapResolvedDeclarationIdentity(target, owner.sourceIdentity)
@@ -309,11 +313,24 @@ class BootstrapCtState(
         if (index < target.parameters.size) target.parameters[index] else ""
     }
 
+    // A parameter of a scalar or string type takes no origins: such a value is no part of
+    // any global's heap, whatever it was computed from (`bnLoad(address: int)` reached with
+    // an offset derived from a global does not make its raw load write that global, #828).
+    fun parameterIsValue(item: int, index: int): bool {
+        val declaration = this.itemDeclaration[item]
+        if (declaration < 0) return false
+        val owner = this.declarations[declaration]
+        val method = this.itemMethod[item]
+        val target = if (method < 0) owner else owner.methods[method]
+        index < target.parameterTypes.size &&
+            bootstrapCtStateImmutableType(bootstrapNormalizeType(target.parameterTypes[index]))
+    }
+
     fun bindArguments(item: int, taints: array<array<int>>, from: int): void {
         var index = 0
         while (from + index < taints.size) {
             val name = this.parameterName(item, index)
-            if (name != "") {
+            if (name != "" && !this.parameterIsValue(item, index)) {
                 val key = "$item:$name"
                 val existing = this.variables.get(key) ?? []
                 if (bootstrapCtStateMerge(existing, taints[from + index])) this.changed = true

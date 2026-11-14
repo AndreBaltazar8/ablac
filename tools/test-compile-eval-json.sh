@@ -17,8 +17,8 @@ table=(
     "dom|-|2|0|"
     "errors|-|2|0|"
     "document|-|1|0|"
-    "limits-global|-|0|1|ordinary mutable global"
-    "stringify|-|0|1|ordinary mutable global"
+    "limits-global|-|1|0|"
+    "stringify|-|1|0|"
     "float|-|0|1|expression float"
     "mutate-empty|-|0|3|ordinary mutable global"
 )

@@ -898,17 +898,16 @@ compile pass to replace its outer pass's JIT state.
 JSON in a cross-target site (#795): `jsonParse`, `jsonDocument` and their readers
 (`Json`, `JsonNode`, `JsonCursor`), `JsonLimits` and the error results run natively when every
 declaration they reach passes the same checks as any other code. These keep a site in
-the evaluator, and the trace names them. First, floats: `asF64`, `readNumber`, `f64ParseRange`
+the evaluator, and the trace names them. Floats: `asF64`, `readNumber`, `f64ParseRange`
 and the encoder's `number` are refused, because a finite set of passing tests does not prove that
 the host and the evaluator agree on every NaN payload, signed zero, subnormal, rounding mode,
 conversion and fused operation; a proof would need a specified operation set, not samples.
-Second, raw memory: `jsonStringify` and the other encoders write through trusted pointers. Third,
-the shared empty arrays and number every parsed scalar points at (`jsonNoKeys`, `jsonNoValues`,
+And the shared empty arrays and number every parsed scalar points at (`jsonNoKeys`, `jsonNoValues`,
 `jsonNoNumber`, and the two limits records) are ordinary globals: any compile-time code that can
 write one (`jsonNull().keys.append(x)`, or a raw store) sends every site that reaches it to the
-evaluator, as for any ordinary global. A `JsonLimits` that a site reads from a global (`jsonDefaultLimits()` passed explicitly,
-or a user's `val`) is such a case too: the analysis cannot place the raw-memory writers of the library apart from it, so the
-site is interpreted; a `JsonLimits(...)` built in the site, or the default argument, stays native. The scanning intrinsics (`ablaJsonWhitespaceEnd`,
+evaluator, as for any ordinary global. The encoders' raw-pointer writes (`jsonStringify`) go to buffers of their own, and a
+`JsonLimits` read from a global (`jsonDefaultLimits()` passed explicitly, or a user's `val`) reaches them only through scalar
+fields; since #828 neither keeps a site in the evaluator. The scanning intrinsics (`ablaJsonWhitespaceEnd`,
 `ablaJsonFindPlainStringEnd`, `ablaJsonMatchCompactObjectField`, `ablaJsonCompactArrayNext`,
 `ablaJsonAvailableIntegerEnd`, `ablaJsonIntegerValueAt`, `ablaJsonStringIsPlain`,
 `ablaTextIsValidUtf8`, `ablaTextReadU32LittleEndian`, `ablaTextFindByte`, `ablaTextAsciiEqualInsensitive`,
@@ -916,11 +915,15 @@ site is interpreted; a `JsonLimits(...)` built in the site, or the default argum
 code answer alike for every argument (`tests/cases/compile-eval-json/intrinsics.ab`). `$json` and
 `$jsons` stay in the evaluator: they use the parser API.
 
-For a statically resolved method on a concrete receiver, the cross-target proof
-uses the type checker's selected method. An unrelated type's method with the
+For a statically resolved method on a concrete receiver, or any extension function
+(an operator such as abla/ct's `secretU64.minus` included), the slice's reach and
+the ordinary-global write analysis use the type checker's selected declaration,
+in host and cross-target builds alike (#828). An unrelated type's method with the
 same name does not become a dependency of that call. Unknown, ambiguous,
 generic or interface dispatch keeps the conservative candidate set; retained
 class bodies and eager global initializers still need their existing checks.
+The write analysis gives a parameter of a scalar or string type no origins: such
+a value is no part of any global's heap, whatever it was computed from.
 
 - A runtime panic in native compile-time code is the evaluator's error for the
   same failure, with the same text (`E_EVAL_OUT_OF_BOUNDS`,

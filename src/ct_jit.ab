@@ -148,8 +148,11 @@ fun bootstrapCtAnalyze(
             sources.append(site.sourceIdentity)
         }
     }
+    // The checker's resolved method and operator targets are kept for every target: the
+    // cross-target reach narrows by them, and so does the ordinary-global write analysis
+    // (ct_state.ab), which a host build runs too (#828).
     val analyzed = bootstrapAnalyzeRequestedSourceSpans(
-        parsed, begins, ends, kinds, sources, !bootstrapCtTripleIsHost(targetTriple)
+        parsed, begins, ends, kinds, sources, true
     )
     for (site in bootstrapCtSites) {
         if (!site.action) {
@@ -443,15 +446,17 @@ class BootstrapCtReach(
         if (fact < 0) return -1
         val selected = this.methodTargets.targets[fact]
         if (selected.target < 0 || selected.identity == "") return -1
-        // Class receivers have a single static implementation. Interface,
-        // generic, unknown and dynamic receivers keep every possible candidate.
+        // Class receivers have a single static implementation, and an extension function is
+        // bound statically whatever its receiver (#828). Interface, generic, unknown and
+        // dynamic receivers of a method keep every possible candidate.
         val concrete = this.concreteReceivers.find(selected.receiver, -1) >= 0
-        if (!concrete) return -1
         var candidate = this.table.find(node.text, -1)
         while (candidate >= 0) {
             if (this.itemHandles[candidate] == selected.target &&
                 this.itemIdentities[candidate] == selected.identity) {
                 val owner = this.declarations[this.itemDeclarations[candidate]]
+                val extension = this.itemMethods[candidate] < 0 && owner.extensionOwner != ""
+                if (!concrete && !extension) return -1
                 val declaration = if (this.itemMethods[candidate] < 0) owner
                     else owner.methods[this.itemMethods[candidate]]
                 if (declaration.typeParameters.size > 0) return -1
@@ -1210,6 +1215,14 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string,
     for (declaration in parsed.declarations) {
         if (bootstrapCtRuntimeDeclaration(declaration)) {
             reach.keepFrom(declaration.expression, declaration.sourceIdentity)
+            // An extension field is kept in every slice, so its owner type is too: without it the
+            // slice is refused (field.extension-owner), as jwt's was by CryptoPassword's fields (#828).
+            if (bootstrapIsExtensionFieldKind(declaration.kind) && declaration.extensionOwner != "") {
+                val owner = bootstrapNormalizeType(declaration.extensionOwner)
+                val angle = owner.indexOf("<")
+                reach.keepFrom(BootstrapExpression("type", if (angle > 0) owner.slice(0, angle) else owner, 0, 0, []),
+                    declaration.sourceIdentity)
+            }
             for (method in declaration.methods) reach.keepFrom(method.expression,
                 if (method.sourceIdentity !=
                     "") method.sourceIdentity else declaration.sourceIdentity)

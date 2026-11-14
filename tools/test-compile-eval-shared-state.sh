@@ -67,17 +67,17 @@ NODE
                 elif [[ $name == member-* || $name == interface-* || $name == operator-builtin || $name == operator-scalar || $name == operator-generic || $name == operator-compound || $name == operator-unary || $name == operator-string ]]; then
                     # X (a call of B.touch; the sum of two ints) and Y (a call of A.touch or of Box.plus: a write
                     # of `shared`).
-                    # A Wasm slice carries the checker's resolved targets, so X reaches B.touch
+                    # Every slice carries the checker's resolved targets (host ones too since #828), so X reaches B.touch
                     # alone and stays native (a generic body is one copy per instantiation, go<B> and go<A>, each with its
-                    # own fact; the slice carries the classes' interface, #813); a host slice keeps every `touch`, and
-                    # operator-generic's copies are not narrowed on a built-in fact. Y always runs in the interpreter.
+                    # own fact; the slice carries the classes' interface, #813); operator-generic's copies are not
+                    # narrowed on a built-in fact. Y always runs in the interpreter.
                     posX=$(( $(offset 'val X = #') + 8 ))
                     posY=$(( $(offset 'val Y = #') + 8 ))
                     grep -Fq "note[ct-jit]: interpreted at $((posY+1)):" "$log" ||
                         { echo "$name $target $tier: Y was not interpreted" >&2; exit 1; }
                     grep -F "note[ct-jit]: interpreted at $((posY+1)):" "$log" | grep 'ordinary mutable global shared may be written at ' >/dev/null ||
                         { echo "$name $target $tier: Y was not interpreted for the write" >&2; exit 1; }
-                    if [[ $name != operator-generic && $target == wasm ]]; then
+                    if [[ $name != operator-generic ]]; then
                         grep '^note\[ct-jit\]: native at ' "$log" | grep -F "$name.ab:$posX" >/dev/null ||
                             { echo "$name $target $tier: X was not native" >&2; exit 1; }
                     else
