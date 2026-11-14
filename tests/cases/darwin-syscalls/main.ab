@@ -275,6 +275,49 @@ fun main: int {
         mismatch) && good
     val unmapped = linuxSyscall2(11, region, 16384)
     good = report("munmap", unmapped == 0, unmapped) && good
+    // read, close and signalfd4 (the slot table): a signalfd of SIGUSR1 (Linux 10), nonblocking; a blocked signal
+    // arrives as one 128-byte record; a plain pipe is read and closed on the same calls.
+    val signalMask = nativeByteBuffer(8)
+    signalMask.storeI64(0, 512)
+    val blocked = linuxSyscall4(14, 0, nativePointerAddress(signalMask.address), 0, 8)
+    good = report("sigprocmask block SIGUSR1", blocked == 0, blocked) && good
+    val signalDescriptor = linuxSyscall4(289, -1, nativePointerAddress(signalMask.address), 8,
+        526336)
+    good = report("signalfd4 creates", signalDescriptor >= 3, signalDescriptor) && good
+    val records = nativeByteBuffer(256)
+    val none = linuxSyscall3(0, signalDescriptor, nativePointerAddress(records.address), 128)
+    good = report("signalfd read with none pending", none == -11, none) && good
+    val sent = linuxSyscall2(62, pid, 10)
+    good = report("kill SIGUSR1 to self", sent == 0, sent) && good
+    val taken = linuxSyscall3(0, signalDescriptor, nativePointerAddress(records.address), 256)
+    good = report("signalfd read one record", taken == 128, taken) && good
+    val signalNumber = firstWordAt(nativePointerAddress(records.address)) & 4294967295
+    good = report("signalfd record's signal", signalNumber == 10, signalNumber) && good
+    val drained = linuxSyscall3(0, signalDescriptor, nativePointerAddress(records.address), 128)
+    good = report("signalfd read once taken", drained == -11, drained) && good
+    val shortRead = linuxSyscall3(0, signalDescriptor, nativePointerAddress(records.address), 64)
+    good = report("signalfd read of a short buffer", shortRead == -22, shortRead) && good
+    signalMask.storeI64(0, 0)
+    val retargeted = linuxSyscall4(289, signalDescriptor, nativePointerAddress(signalMask.address),
+        8, 0)
+    good = report("signalfd4 changes the mask", retargeted == signalDescriptor, retargeted) && good
+    val closedSignal = linuxSyscall1(3, signalDescriptor)
+    good = report("close a signalfd", closedSignal == 0, closedSignal) && good
+    val afterClose = linuxSyscall3(0, signalDescriptor, nativePointerAddress(records.address), 128)
+    good = report("read after close", afterClose == -9, afterClose) && good
+    val ends = nativeByteBuffer(16)
+    val piped = linuxSyscall2(293, nativePointerAddress(ends.address), 524288)
+    good = report("pipe2", piped == 0, piped) && good
+    val readEnd = firstWordAt(nativePointerAddress(ends.address)) & 4294967295
+    val writeEnd = (firstWordAt(nativePointerAddress(ends.address)) >> 32) & 4294967295
+    val pipeWrite = linuxSyscall3(1, writeEnd, nativePointerAddress(records.address), 3)
+    val pipeRead = linuxSyscall3(0, readEnd, nativePointerAddress(records.address), 16)
+    good = report("pipe write and read", pipeWrite == 3 && pipeRead == 3, pipeRead) && good
+    linuxSyscall1(3, writeEnd)
+    val pipeEnd = linuxSyscall3(0, readEnd, nativePointerAddress(records.address), 16)
+    good = report("pipe read at end of file", pipeEnd == 0, pipeEnd) && good
+    val pipeClosed = linuxSyscall1(3, readEnd)
+    good = report("close a pipe end", pipeClosed == 0, pipeClosed) && good
     println(if (good) "darwin-syscalls: all ok" else "darwin-syscalls: FAILED")
     // exit_group with a status the harness checks
     linuxSyscall1(231, if (good) 7 else 9)
