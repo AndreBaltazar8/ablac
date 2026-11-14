@@ -7,6 +7,7 @@ import "abla/net"
 import "abla/process"
 import "abla/process/time"
 import "abla/sys/linux"
+import "abla/text"
 import "abla/tls/pure"
 import "abla/websocket/tls"
 
@@ -61,6 +62,27 @@ fun checks(certificate: string, key: string, tlsPort: int, silentPort: int): int
     defaulted.write("GET /late HTTP/1.1\r\n\r\n")
     if (defaulted.read(64) != "late") return failed("default limit", "no reply")
     defaulted.close()
+
+    // A write that fails part way (here: the peer stalls and never reads, so 32 MB cannot go out within the limit)
+    // leaves part of a record on the wire: the connection is broken, and reads and writes after it say so.
+    val stuck = tlsConnectWithCa("localhost", certificate, tlsPort, 3000, 400)
+    if (stuck.handle == -1) return failed("broken write", "connect: ${tlsLastError()}")
+    stuck.write("GET /stall HTTP/1.1\r\n\r\n")
+    var megabyte = "0123456789abcdef"
+    for (i in 0 until 16) megabyte = megabyte + megabyte
+    var body = megabyte
+    for (i in 0 until 5) body = body + body
+    started = monotonicMilliseconds()
+    if (stuck.write(body) != -1) return failed("broken write", "32 MB went to a peer that does not read")
+    if (tlsLastError() != "TLS read or write timed out") return failed("broken write", "the write failed with [${tlsLastError()}]")
+    if (within("broken write", started, 350, 120000) != 0) return 1
+    if (stuck.write("more") != -1 || tlsLastError() != "TLS read or write timed out" || !stuck.detail().contains("broken")) {
+        return failed("after a failed write", "a write went on: [${tlsLastError()}] [${stuck.detail()}]")
+    }
+    if (stuck.read(10) != "" || tlsLastError() != "TLS read or write timed out" || !stuck.detail().contains("broken")) {
+        return failed("after a failed write", "a read went on: [${tlsLastError()}] [${stuck.detail()}]")
+    }
+    stuck.close()
 
     // A stop and continue during the read isn't its timeout (EINTR), and the limit
     // stays what it was: it isn't a new one from there.

@@ -80,6 +80,17 @@ for kind in ed25519 p256 p384 rsa; do
     echo "$kind: ok"
 done
 echo "$runs handshakes (4 certificate types x 3 suites x 2 groups, the P-256 ones through a HelloRetryRequest)"
+# A TlsConnection that is dropped (never close()d) tells the peer: s_server -msg logs the close_notify it received.
+"$compiler" build tests/cases/tls-pure/dropnotify.ab -o "$out/dropnotify" --no-cache
+start_server ed25519 -www -msg
+result=$("$root/tools/run-limited.sh" "$out/dropnotify" "$port" "$out/ed25519.pem") || {
+    echo "tls-pure dropnotify: $result" >&2; head -5 "$out/server.log" >&2; exit 1; }
+[[ $result == 'tls-pure dropnotify ok' ]] || { echo "tls-pure dropnotify: $result" >&2; exit 1; }
+for _ in $(seq 50); do grep -q '<<< TLS 1.3, Alert \[length 0002\], warning close_notify' "$out/server.log" && break; sleep 0.1; done
+grep -q '<<< TLS 1.3, Alert \[length 0002\], warning close_notify' "$out/server.log" ||
+    { echo "tls-pure dropnotify: the server never saw a close_notify from the dropped connection" >&2; tail -8 "$out/server.log" >&2; exit 1; }
+stop_server
+echo "drop: the dropped connection sent close_notify"
 # TLS 1.2 (the modern subset): the pure client against `openssl s_server -tls1_2`: RSA, P-256 and Ed25519 certificates x their six
 # ECDHE suites x X25519 and P-256, and RSA with PKCS#1 v1.5 signatures only; a TLS 1.2 server without the extended
 # master secret is refused.
