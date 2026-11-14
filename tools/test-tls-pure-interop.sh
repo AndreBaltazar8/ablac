@@ -226,15 +226,16 @@ trap 'stop_serve; [[ -z $server_pid ]] || kill "$server_pid" 2> /dev/null || tru
 start_serve() {   # the serve.ab arguments; sets serve_port
     "$out/serve" "$@" > "$out/serve.log" 2>&1 &
     serve_pid=$!
-    # Up to 60 s: on a machine under load (parallel suites) a process that starts in 12 ms can wait seconds for a CPU;
-    # one that died stops the wait at once.
-    for _ in $(seq 600); do
+    # Up to 120 s by the clock (not by counting iterations: under load each iteration takes more than its sleep); one
+    # that died stops the wait at once. A failure says what the process was doing.
+    local until=$(( SECONDS + 120 ))
+    while (( SECONDS < until )); do
         grep -q '^listening ' "$out/serve.log" 2> /dev/null && break
         kill -0 "$serve_pid" 2> /dev/null || { echo "tls-pure serve: did not start: $(head -3 "$out/serve.log")" >&2; exit 1; }
         sleep 0.1
     done
     serve_port=$(sed -n 's/^listening //p' "$out/serve.log" | head -1)
-    [[ -n $serve_port ]] || { echo "tls-pure serve: no port after 60 s (process $(kill -0 "$serve_pid" 2> /dev/null && echo alive || echo gone), load $(cut -d" " -f1-3 /proc/loadavg)): $(head -3 "$out/serve.log")" >&2; exit 1; }
+    [[ -n $serve_port ]] || { echo "tls-pure serve: no port after 120 s (process $(kill -0 "$serve_pid" 2> /dev/null && echo alive || echo gone), state $(sed -n 's/^State:\s*//p' "/proc/$serve_pid/status" 2> /dev/null | head -1), wchan $(cat "/proc/$serve_pid/wchan" 2> /dev/null), load $(cut -d" " -f1-3 /proc/loadavg)): $(head -3 "$out/serve.log")" >&2; exit 1; }
 }
 s_client() {   # the s_client options after the address; prints what the server sent
     printf 'GET /pure HTTP/1.0\r\n\r\n' | timeout 15 openssl s_client -connect "[::1]:$serve_port" ${s_tls:--tls1_3} -servername localhost -quiet "$@" 2> "$out/s_client.err" || true
