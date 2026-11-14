@@ -178,6 +178,7 @@ private fun TlsServer.fail(description: int, message: string): void {
     this.queueAlert(description)
     this.state = TLS_SERVER_FAILED
     this.error = message
+    this.wipeSecrets()
     return
 }
 
@@ -197,7 +198,37 @@ private fun TlsServer.queueRecord(type: int, content: string): void {
     return
 }
 
+// ---- clearing the secrets (keysched's tlsWipe): each when nothing reads it again, and all of them when the connection
+// fails or closes ----
+private fun TlsServer.wipeSecrets(): void {
+    tlsWipe(this.handshakeSecret)
+    tlsWipe(this.clientHandshakeSecret)
+    tlsWipe(this.serverHandshakeSecret)
+    tlsWipe(this.clientApplicationSecret)
+    tlsWipe(this.serverApplicationSecret)
+    tlsWipe(this.read.key)
+    tlsWipe(this.read.iv)
+    tlsWipe(this.write.key)
+    tlsWipe(this.write.iv)
+    tlsWipe(this.v12Pair.privateKey)
+    tlsWipe(this.master)
+    // The TLS 1.2 protections hold the key block's parts (v12Keys).
+    tlsWipe(this.v12Keys.clientKey)
+    tlsWipe(this.v12Keys.serverKey)
+    tlsWipe(this.v12Keys.clientIv)
+    tlsWipe(this.v12Keys.serverIv)
+    return
+}
+
 private fun TlsServer.setKeys(secret: string, forWrite: bool): void {
+    // The protection this replaces is done with.
+    if (forWrite) {
+        tlsWipe(this.write.key)
+        tlsWipe(this.write.iv)
+    } else {
+        tlsWipe(this.read.key)
+        tlsWipe(this.read.iv)
+    }
     val protection = tlsRecordProtection(this.aead, tlsTrafficKey(this.hash, secret, this.keyLength),
         tlsTrafficIv(this.hash, secret))
     if (forWrite) {
@@ -379,6 +410,10 @@ private fun TlsServer.handleClientHello(message: string, body: string): void {
     this.serverHandshakeSecret = secrets.serverTraffic
     this.setKeys(secrets.serverTraffic, true)
     this.setKeys(secrets.clientTraffic, false)
+    // The key exchange is done with: the private key, the shared secret and the early secret.
+    tlsWipe(pair.privateKey)
+    tlsWipe(shared.bytes)
+    tlsWipe(early)
     this.sendFlight(scheme)
     return
 }
@@ -419,6 +454,12 @@ private fun TlsServer.sendFlight(scheme: int): void {
     val application = tlsDeriveApplicationSecrets(this.hash, this.handshakeSecret, this.transcript.hash(this.hash))
     this.clientApplicationSecret = application.clientTraffic
     this.serverApplicationSecret = application.serverTraffic
+    // The server's Finished is made and the application secrets too: the handshake secret, the server's handshake
+    // traffic secret and the master and exporter secrets (no resumption, no exporter here) are done with.
+    tlsWipe(this.serverHandshakeSecret)
+    tlsWipe(this.handshakeSecret)
+    tlsWipe(application.masterSecret)
+    tlsWipe(application.exporter)
     this.setKeys(application.serverTraffic, true)
     this.state = if (this.config.requestClientCertificate) TLS_SERVER_WAIT_CERTIFICATE else TLS_SERVER_WAIT_FINISHED
     return
@@ -491,6 +532,7 @@ private fun TlsServer.handleClientFinished(message: string, body: string): void 
     }
     this.transcript.add(message)
     this.setKeys(this.clientApplicationSecret, false)
+    tlsWipe(this.clientHandshakeSecret)
     this.state = TLS_SERVER_CONNECTED
     return
 }
@@ -505,7 +547,9 @@ private fun TlsServer.handleKeyUpdate(body: string): void {
         this.fail(TLS_ALERT_UNEXPECTED_MESSAGE, "tls: too many KeyUpdates in a row")
         return
     }
-    this.clientApplicationSecret = tlsNextTrafficSecret(this.hash, this.clientApplicationSecret)
+    val previousRead = this.clientApplicationSecret
+    this.clientApplicationSecret = tlsNextTrafficSecret(this.hash, previousRead)
+    tlsWipe(previousRead)
     this.setKeys(this.clientApplicationSecret, false)
     // One answer for a batch of requests: it goes out before the next application data (section 4.6.3).
     if (body[0] == 1) this.keyUpdateOwed = true
@@ -525,7 +569,9 @@ private fun TlsServer.answerKeyUpdate(): void {
     if (!this.keyUpdateOwed || this.state != TLS_SERVER_CONNECTED) return
     this.keyUpdateOwed = false
     this.queueRecord(TLS_HANDSHAKE, tlsHandshakeMessage(TLS_KEY_UPDATE, tlsU8(0)))
-    this.serverApplicationSecret = tlsNextTrafficSecret(this.hash, this.serverApplicationSecret)
+    val previousWrite = this.serverApplicationSecret
+    this.serverApplicationSecret = tlsNextTrafficSecret(this.hash, previousWrite)
+    tlsWipe(previousWrite)
     this.setKeys(this.serverApplicationSecret, true)
     return
 }
@@ -592,6 +638,7 @@ private fun TlsServer.handleAlert(content: string): void {
         if (!this.sentClose) this.queueAlert(TLS_ALERT_CLOSE_NOTIFY)
         this.sentClose = true
         this.state = TLS_SERVER_CLOSED
+        this.wipeSecrets()
         return
     }
     if (level == 1) {
@@ -726,6 +773,7 @@ fun TlsServer.close(): void {
         this.queueAlert(TLS_ALERT_CLOSE_NOTIFY)
         this.sentClose = true
         this.state = TLS_SERVER_CLOSED
+        this.wipeSecrets()
     }
     return
 }
@@ -904,6 +952,9 @@ private fun TlsServer.handleClientKeyExchange12(message: string, body: string): 
     // The extended master secret: the session hash is through the ClientKeyExchange.
     this.master = tls12MasterSecret(suite.hash, shared.bytes, this.transcript.hash(suite.hash))
     this.v12Keys = tls12DeriveKeys(suite, this.master, this.serverRandom, this.clientRandom)
+    // The ephemeral key and the premaster secret are done with once the master secret is made.
+    tlsWipe(this.v12Pair.privateKey)
+    tlsWipe(shared.bytes)
     // With a client certificate, its CertificateVerify comes next; without, the ChangeCipherSpec.
     this.state = if (this.clientChain.size > 0) TLS_SERVER12_WAIT_CERTIFICATE_VERIFY else TLS_SERVER12_WAIT_CHANGE_CIPHER_SPEC
     return
@@ -954,6 +1005,8 @@ private fun TlsServer.handleClientFinished12(message: string, body: string): voi
     this.writeEncrypted = true
     this.queueRecord12(TLS_HANDSHAKE, tlsHandshakeMessage(TLS_FINISHED,
         tls12FinishedData(this.hash, this.master, "server finished", this.transcript.hash(this.hash))))
+    // The last use of the master secret.
+    tlsWipe(this.master)
     this.state = TLS_SERVER_CONNECTED
     return
 }

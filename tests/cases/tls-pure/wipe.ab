@@ -1,0 +1,262 @@
+// abla/tls/pure clears its secrets once nothing reads them again (#823), checked where that can be seen: the test keeps a
+// reference to each secret string (the machines' fields are public) and looks at its bytes after the step that is its
+// last use. A cleared secret is all zeros; one still in use is not. Over a sans-IO client and server in one process:
+// TLS 1.3 (the key pairs, the shared secret's results: handshake, handshake traffic and master secrets, the handshake
+// record keys), a HelloRetryRequest (the first key share), KeyUpdate both ways (the old traffic secrets and keys),
+// close_notify and a failure (everything), TLS 1.2 (the ephemeral key, the master secret, the key block at the end); key
+// pairs given to tlsClientStartWith stay as the caller made them; an identity's key bytes (PEM for each key kind, and
+// PKCS#12) are cleared by wipe(), after which it signs nothing; a listener clears its identity when it closes.
+// Usage: wipe <directory> with <kind>.pem / <kind>.key / <kind>.p12 (password "secret") for ed25519, p256 and rsa, as
+// tools/test-tls-pure-interop.sh makes them. Prints "tls-pure wipe ok".
+import "abla/io"
+import "abla/crypto"
+import "abla/crypto/x509"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/tls/pure"
+import "abla/tls/pure/client"
+import "abla/tls/pure/handshake"
+import "abla/tls/pure/identity"
+import "abla/tls/pure/record"
+import "abla/tls/pure/server"
+import "abla/tls/pure/tls12"
+import "abla/tls/pure/verify"
+
+var failures = 0
+var seed = 7
+
+fun fail(what: string): void {
+    failures = failures + 1
+    if (failures < 40) println("FAIL $what")
+    return
+}
+
+fun random(count: int): string {
+    val bytes: array<int> = []
+    for (i in 0 until count) {
+        seed = (seed * 1103515245 + 12345) & 2147483647
+        bytes.append((seed >> 8) & 255)
+    }
+    cryptoByteString(bytes)
+}
+
+fun read(path: string): string = linuxReadFile(path, 1048576)
+fun now(): int = linuxRealtimeNanoseconds() / 1000000000
+
+fun cleared(secret: string): bool {
+    if (secret.size == 0) return false
+    for (byte in secret) if (byte != 0) return false
+    true
+}
+
+fun live(secret: string): bool = secret.size > 0 && !cleared(secret)
+
+fun expectCleared(what: string, secret: string): void {
+    if (!cleared(secret)) fail("$what: not cleared (${secret.size} bytes)")
+    return
+}
+
+fun expectLive(what: string, secret: string): void {
+    if (!live(secret)) fail("$what: cleared while still in use")
+    return
+}
+
+fun acceptAny(chain: array<string>, scheme: int, content: string, signature: string): TlsVerdict = tlsAccepted()
+
+fun pump(var client: TlsClient, var server: TlsServer): void {
+    var rounds = 0
+    while (rounds < 50) {
+        val toServer = client.takeOutput()
+        if (toServer.size > 0) server.feed(toServer)
+        val toClient = server.takeOutput()
+        if (toClient.size > 0) client.feed(toClient)
+        if (toServer.size == 0 && toClient.size == 0) return
+        rounds = rounds + 1
+    }
+    return
+}
+
+fun exchange(var client: TlsClient, var server: TlsServer, what: string): void {
+    client.send("ping")
+    pump(client, server)
+    if (server.takeApplicationData() != "ping") fail("$what: client to server")
+    server.send("pong")
+    pump(client, server)
+    if (client.takeApplicationData() != "pong") fail("$what: server to client")
+    return
+}
+
+fun main: int {
+    val directory = processArgument(0)
+    val ed = tlsIdentityFromPem(read("$directory/ed25519.pem"), read("$directory/ed25519.key"))
+    val store = x509TrustStoreFromPem(read("$directory/ed25519.pem"))
+    if (!ed.ok()) {
+        println("FAIL identity: ${ed.error}")
+        return 1
+    }
+    val clientConfig = tlsClientConfig("localhost", tlsX509Verifier(store, now), random)
+    val serverConfig = TlsServerConfig(ed, [TLS_SUITE_AES_128_GCM_SHA256], [TLS_GROUP_X25519], [], random, false, false,
+        acceptAny)
+
+    // ---- TLS 1.3, step by step ----
+    var client = tlsClientNew(clientConfig)
+    var server = tlsServerNew(serverConfig)
+    val clientPrivate = client.keyPairs[0].privateKey
+    expectLive("1.3 client key share before the ServerHello", clientPrivate)
+    server.feed(client.takeOutput())
+    // The server made its flight and its application secrets; it still reads the client's Finished under the client's
+    // handshake keys.
+    expectCleared("1.3 server handshake secret", server.handshakeSecret)
+    expectCleared("1.3 server's own handshake traffic secret", server.serverHandshakeSecret)
+    val serverClientHandshake = server.clientHandshakeSecret
+    val serverHandshakeReadKey = server.read.key
+    expectLive("1.3 server's client handshake traffic secret before the client's Finished", serverClientHandshake)
+    expectLive("1.3 server handshake read key before the client's Finished", serverHandshakeReadKey)
+    client.feed(server.takeOutput())
+    if (!client.connected()) fail("1.3: the client did not connect: ${client.error}")
+    expectCleared("1.3 client key share", clientPrivate)
+    expectCleared("1.3 client handshake secret", client.handshakeSecret)
+    expectCleared("1.3 client handshake traffic secret", client.clientHandshakeSecret)
+    expectCleared("1.3 client's server handshake traffic secret", client.serverHandshakeSecret)
+    expectCleared("1.3 client master secret", client.masterSecret)
+    expectLive("1.3 client application secret", client.clientApplicationSecret)
+    expectLive("1.3 client write key", client.write.key)
+    server.feed(client.takeOutput())
+    if (!server.connected()) fail("1.3: the server did not connect: ${server.error}")
+    expectCleared("1.3 server's client handshake traffic secret", serverClientHandshake)
+    expectCleared("1.3 server handshake read key", serverHandshakeReadKey)
+    expectLive("1.3 server application secret", server.serverApplicationSecret)
+    exchange(client, server, "1.3")
+
+    // ---- KeyUpdate: the server asks (by hand, as tests/cases/tls-pure/server.ab does), the client answers ----
+    val clientOldRead = client.serverApplicationSecret
+    val clientOldReadKey = client.read.key
+    val clientOldWrite = client.clientApplicationSecret
+    val clientOldWriteKey = client.write.key
+    val serverOldRead = server.clientApplicationSecret
+    val update = tlsProtectRecord(server.write, TLS_HANDSHAKE, tlsHandshakeMessage(TLS_KEY_UPDATE, tlsU8(1)))
+    server.serverApplicationSecret = tlsNextTrafficSecret(server.hash, server.serverApplicationSecret)
+    server.write = tlsRecordProtection(server.aead, tlsTrafficKey(server.hash, server.serverApplicationSecret,
+        server.keyLength), tlsTrafficIv(server.hash, server.serverApplicationSecret))
+    client.feed(update.bytes)
+    expectCleared("KeyUpdate: the client's old read secret", clientOldRead)
+    expectCleared("KeyUpdate: the client's old read key", clientOldReadKey)
+    expectLive("KeyUpdate: the client's write secret before it answers", clientOldWrite)
+    exchange(client, server, "after KeyUpdate")
+    expectCleared("KeyUpdate: the client's old write secret", clientOldWrite)
+    expectCleared("KeyUpdate: the client's old write key", clientOldWriteKey)
+    expectCleared("KeyUpdate: the server's old read secret", serverOldRead)
+
+    // ---- close_notify: everything, on both sides ----
+    val clientWrite = client.clientApplicationSecret
+    val clientRead = client.serverApplicationSecret
+    val clientWriteKey = client.write.key
+    val clientReadIv = client.read.iv
+    val serverWrite = server.serverApplicationSecret
+    val serverReadKey = server.read.key
+    client.close()
+    expectCleared("close: client write secret", clientWrite)
+    expectCleared("close: client read secret", clientRead)
+    expectCleared("close: client write key", clientWriteKey)
+    expectCleared("close: client read iv", clientReadIv)
+    server.feed(client.takeOutput())
+    if (!server.closed()) fail("close: the server did not see close_notify")
+    expectCleared("close_notify: server write secret", serverWrite)
+    expectCleared("close_notify: server read key", serverReadKey)
+
+    // ---- a failure: everything ----
+    var failing = tlsClientNew(clientConfig)
+    var failingServer = tlsServerNew(serverConfig)
+    pump(failing, failingServer)
+    val failingWrite = failing.clientApplicationSecret
+    val failingKey = failing.read.key
+    expectLive("failure: secret before", failingWrite)
+    failing.feed(tlsPlaintextRecord(23, 771, "not a record under the keys"))
+    if (!failing.failed()) fail("failure: the client took a damaged record")
+    expectCleared("failure: client write secret", failingWrite)
+    expectCleared("failure: client read key", failingKey)
+
+    // ---- HelloRetryRequest: the first share goes when the second replaces it ----
+    var retrying = tlsClientNew(clientConfig)
+    val firstShare = retrying.keyPairs[0].privateKey
+    var p256Only = tlsServerNew(TlsServerConfig(ed, [TLS_SUITE_AES_128_GCM_SHA256], [TLS_GROUP_SECP256R1], [], random,
+        false, false, acceptAny))
+    p256Only.feed(retrying.takeOutput())
+    retrying.feed(p256Only.takeOutput())
+    expectCleared("HelloRetryRequest: the first key share", firstShare)
+    val secondShare = retrying.keyPairs[0].privateKey
+    expectLive("HelloRetryRequest: the second key share before the ServerHello", secondShare)
+    pump(retrying, p256Only)
+    if (!retrying.connected()) fail("HelloRetryRequest: no connection: ${retrying.error}")
+    expectCleared("HelloRetryRequest: the second key share", secondShare)
+
+    // ---- key pairs given to tlsClientStartWith stay the caller's ----
+    val pair = tlsGenerateKeyPair(TLS_GROUP_X25519, random)
+    if (pair != null) {
+        val helloRandom = random(32)
+        val sessionId = random(32)
+        val hello = tlsBuildClientHello(helloRandom, sessionId, clientConfig.suites, "localhost", [TLS_GROUP_X25519],
+            [TlsKeyShare(pair.group, pair.publicKey)], clientConfig.signatureAlgorithms, [], "", clientConfig.suites12)
+        var given = tlsClientStartWith(clientConfig, hello, helloRandom, sessionId, [pair], 769)
+        var givenServer = tlsServerNew(serverConfig)
+        pump(given, givenServer)
+        if (!given.connected()) fail("tlsClientStartWith: no connection: ${given.error}")
+        expectLive("tlsClientStartWith: the caller's private key", pair.privateKey)
+    } else fail("tlsGenerateKeyPair")
+
+    // ---- TLS 1.2: the ephemeral key and the master secret after the handshake, the key block at the end ----
+    var client12 = tlsClientNew(clientConfig)
+    var server12 = tlsServerNew(TlsServerConfig(ed, [], [TLS_GROUP_X25519], [], random, false, false, acceptAny,
+        [TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256]))
+    pump(client12, server12)
+    if (!client12.connected() || !server12.connected()) fail("1.2: no connection: [${client12.error}] [${server12.error}]")
+    expectCleared("1.2 client master secret", client12.masterSecret)
+    expectCleared("1.2 server master secret", server12.master)
+    expectCleared("1.2 server ephemeral key", server12.v12Pair.privateKey)
+    val keyBlockPart = client12.v12Keys.clientKey
+    val serverKeyBlockPart = server12.v12Keys.serverIv
+    expectLive("1.2 client key", keyBlockPart)
+    exchange(client12, server12, "1.2")
+    client12.close()
+    server12.feed(client12.takeOutput())
+    expectCleared("1.2 close: client key", keyBlockPart)
+    expectCleared("1.2 close_notify: server iv", serverKeyBlockPart)
+
+    // ---- identities: wipe() clears the key bytes, and a cleared identity signs nothing ----
+    for (kind in ["ed25519", "p256", "rsa"]) {
+        val scheme = if (kind == "ed25519") TLS_SIG_ED25519 else if (kind == "p256") TLS_SIG_ECDSA_SECP256R1_SHA256
+            else TLS_SIG_RSA_PSS_RSAE_SHA256
+        val fromPem = tlsIdentityFromPem(read("$directory/$kind.pem"), read("$directory/$kind.key"))
+        val fromPkcs12 = tlsIdentityFromPkcs12(read("$directory/$kind.p12"), "secret")
+        for (identity in [fromPem, fromPkcs12]) {
+            if (!identity.ok() || identity.secrets.size == 0) {
+                fail("$kind identity: ${identity.error} (${identity.secrets.size} secrets)")
+                continue
+            }
+            for (secret in identity.secrets) expectLive("$kind identity key before wipe", secret)
+            if (identity.sign(scheme, "content").size == 0) fail("$kind identity: no signature before wipe")
+            identity.wipe()
+            for (secret in identity.secrets) expectCleared("$kind identity key after wipe", secret)
+            if (identity.sign(scheme, "content").size != 0) fail("$kind identity: a signature after wipe")
+        }
+    }
+
+    // ---- a listener clears the identity it loaded when it closes ----
+    var listener = tlsListen("$directory/p256.pem", "$directory/p256.key", "127.0.0.1", 0)
+    if (listener.handle == -1) fail("listener: ${tlsLastError()}")
+    else {
+        // (A list of its own: the strings are the identity's, which is what is looked at.)
+        val listenerSecrets: array<string> = []
+        for (secret in listener.config.identity.secrets) listenerSecrets.append(secret)
+        if (listenerSecrets.size == 0) fail("listener: its identity has no secrets")
+        for (secret in listenerSecrets) expectLive("listener key while open", secret)
+        listener.close()
+        for (secret in listenerSecrets) expectCleared("listener key after close", secret)
+    }
+
+    if (failures == 0) {
+        println("tls-pure wipe ok")
+        return 0
+    }
+    1
+}

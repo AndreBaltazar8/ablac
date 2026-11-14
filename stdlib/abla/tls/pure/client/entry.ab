@@ -68,12 +68,21 @@ class TlsClientConfig(
 /** An ephemeral key pair offered in the key_share extension. */
 class TlsKeyPair(val group: int, val publicKey: string, val privateKey: string)
 
-/** A client certificate for mutual TLS: the chain (DER, end entity first), the signature schemes its key can
- *  make, and the signing function (scheme and the content to sign give the signature, "" on failure). */
+/** A certificate and its key, a client's for mutual TLS or a server's: the chain (DER, end entity first), the signature
+ *  schemes its key can make, and the signing function (scheme and the content to sign give the signature, "" on
+ *  failure). `secrets` are the key bytes the signing function holds, which `wipe` clears (the loaders,
+ *  tlsIdentityFromPem and tlsIdentityFromPkcs12, fill them in). */
 class TlsIdentity(val chain: array<string>, val schemes: array<int>, val sign: (int, string) -> string,
-    val error: string = "") {
+    val error: string = "", val secrets: array<string> = []) {
     /** True for an identity with a certificate and a key that signs. */
     fun ok(): bool = this.error == "" && this.chain.size > 0
+}
+
+/** Clears the key bytes the identity holds: it signs nothing after this. For when it is done with (a connection's
+ *  identity after its handshake, a listener's when it closes). */
+fun TlsIdentity.wipe(): void {
+    for (secret in this.secrets) tlsWipe(secret)
+    return
 }
 
 class TlsClient(
@@ -144,7 +153,9 @@ fun tlsAeadFor(suite: int): int =
 
 fun tlsSuiteHash(suite: int): int = if (suite == TLS_SUITE_AES_256_GCM_SHA384) HKDF_SHA384 else HKDF_SHA256
 
-/** A key pair for `group` from 32 bytes of randomness: X25519 only for now; `ok` false for others. */
+/** A key pair for `group` (X25519 or P-256) from 32 bytes of `random`: null for another group. The private key is the
+ *  random source's bytes themselves, which the machine that uses the pair clears when it is done (tlsWipe): `random`
+ *  returns fresh bytes, as tlsPureRandom does. */
 fun tlsGenerateKeyPair(group: int, random: (int) -> string): TlsKeyPair? {
     if (group == TLS_GROUP_X25519) {
         val privateKey = random(32)
@@ -159,6 +170,7 @@ fun tlsGenerateKeyPair(group: int, random: (int) -> string): TlsKeyPair? {
             val privateKey = random(32)
             val publicKey = p256PublicKey(privateKey)
             if (publicKey.ok) return TlsKeyPair(group, publicKey.bytes, privateKey)
+            tlsWipe(privateKey)
             attempt = attempt + 1
         }
     }
@@ -185,8 +197,17 @@ fun tlsClientConfig(host: string, verifier: (array<string>, string, int, string,
 
 /** Starts a client from a ClientHello message that is already built (its 4-byte header included), with
  *  the random, session id and key pairs it was built from. The RFC 8448 traces use this; `tlsClientNew`
- *  builds its own. The ClientHello is queued as the first record. */
+ *  builds its own. The ClientHello is queued as the first record. The client keeps copies of the private keys, which it
+ *  clears when it is done with them; `keyPairs` stay as they are. */
 fun tlsClientStartWith(config: TlsClientConfig, clientHello: string, helloRandom: string, sessionId: string,
+    keyPairs: array<TlsKeyPair>, recordVersion: int): TlsClient {
+    val owned: array<TlsKeyPair> = []
+    for (pair in keyPairs) owned.append(TlsKeyPair(pair.group, pair.publicKey, tlsOwnedCopy(pair.privateKey)))
+    tlsClientStart(config, clientHello, helloRandom, sessionId, owned, recordVersion)
+}
+
+// The client, with key pairs that are its own to clear.
+private fun tlsClientStart(config: TlsClientConfig, clientHello: string, helloRandom: string, sessionId: string,
     keyPairs: array<TlsKeyPair>, recordVersion: int): TlsClient {
     val client = TlsClient(config, TLS_CLIENT_WAIT_SERVER_HELLO, "", "", TlsHandshakeBuffer([], 0), "", "", tlsTranscript(),
         HKDF_SHA256, 0, 16, TLS_AEAD_AES_128_GCM, helloRandom, sessionId, clientHello, keyPairs, false, 0,
@@ -228,7 +249,7 @@ fun tlsClientNew(config: TlsClientConfig): TlsClient {
     }
     val hello = tlsBuildClientHello(helloRandom, sessionId, config.suites, config.host,
         [TLS_GROUP_X25519, TLS_GROUP_SECP256R1], shares, config.signatureAlgorithms, config.alpn, "", config.suites12)
-    tlsClientStartWith(config, hello, helloRandom, sessionId, pairs, 769)
+    tlsClientStart(config, hello, helloRandom, sessionId, pairs, 769)
 }
 
 fun TlsClient.failed(): bool = this.state == TLS_CLIENT_FAILED
@@ -285,6 +306,7 @@ private fun TlsClient.fail(description: int, message: string): void {
     this.queueAlert(description)
     this.state = TLS_CLIENT_FAILED
     this.error = message
+    this.wipeSecrets()
     return
 }
 
@@ -304,7 +326,42 @@ private fun TlsClient.queueRecord(type: int, content: string): void {
     return
 }
 
+// ---- clearing the secrets (keysched's tlsWipe): each when nothing reads it again, and all of them when the connection
+// fails or closes ----
+private fun TlsClient.wipeKeyPairs(): void {
+    for (pair in this.keyPairs) tlsWipe(pair.privateKey)
+    return
+}
+
+private fun TlsClient.wipeSecrets(): void {
+    this.wipeKeyPairs()
+    tlsWipe(this.handshakeSecret)
+    tlsWipe(this.clientHandshakeSecret)
+    tlsWipe(this.serverHandshakeSecret)
+    tlsWipe(this.clientApplicationSecret)
+    tlsWipe(this.serverApplicationSecret)
+    tlsWipe(this.masterSecret)
+    tlsWipe(this.read.key)
+    tlsWipe(this.read.iv)
+    tlsWipe(this.write.key)
+    tlsWipe(this.write.iv)
+    // The TLS 1.2 protections hold the key block's parts (v12Keys).
+    tlsWipe(this.v12Keys.clientKey)
+    tlsWipe(this.v12Keys.serverKey)
+    tlsWipe(this.v12Keys.clientIv)
+    tlsWipe(this.v12Keys.serverIv)
+    return
+}
+
 private fun TlsClient.setKeys(secret: string, forWrite: bool): void {
+    // The protection this replaces is done with.
+    if (forWrite) {
+        tlsWipe(this.write.key)
+        tlsWipe(this.write.iv)
+    } else {
+        tlsWipe(this.read.key)
+        tlsWipe(this.read.iv)
+    }
     val protection = tlsRecordProtection(this.aead, tlsTrafficKey(this.hash, secret, this.keyLength),
         tlsTrafficIv(this.hash, secret))
     if (forWrite) {
@@ -343,6 +400,8 @@ private fun TlsClient.handleServerHello(message: string, body: string): void {
         if (this.config.suites.size > 0 && (sentinel == "DOWNGRD" + tlsU8(1) || sentinel == "DOWNGRD" + tlsU8(0))) {
             this.fail(TLS_ALERT_ILLEGAL_PARAMETER, "tls: downgrade detected")
         } else if (this.config.suites12.size > 0 && hello.selectedVersion == 0 && !this.retried) {
+            // TLS 1.3's key shares go unused.
+            this.wipeKeyPairs()
             this.startV12(message, body)
         } else {
             this.fail(TLS_ALERT_PROTOCOL_VERSION, "tls: the server does not speak TLS 1.3")
@@ -402,6 +461,10 @@ private fun TlsClient.handleServerHello(message: string, body: string): void {
     // compatibility ChangeCipherSpec (appendix D.4) goes out before the first of those records.
     this.sendCompatibilityChangeCipherSpec()
     this.setKeys(secrets.clientTraffic, true)
+    // The key exchange is done with: the private keys, the shared secret and the early secret.
+    this.wipeKeyPairs()
+    tlsWipe(shared.bytes)
+    tlsWipe(early)
     this.state = TLS_CLIENT_WAIT_ENCRYPTED_EXTENSIONS
     return
 }
@@ -437,6 +500,8 @@ private fun TlsClient.handleRetryRequest(message: string, hello: TlsServerHello)
     val firstHash = tlsHashOf(this.hash, this.firstHello)
     this.transcript.messages = tlsHandshakeMessage(TLS_MESSAGE_HASH, firstHash)
     this.transcript.add(message)
+    // A new share replaces the ones sent first, whose private keys are done with.
+    if (!cookieOnly) this.wipeKeyPairs()
     this.keyPairs = [pair]
     this.sendCompatibilityChangeCipherSpec()
     val second = this.config.secondHello(this.firstHello, TlsKeyShare(pair.group, pair.publicKey), hello.cookie)
@@ -601,6 +666,12 @@ private fun TlsClient.handleFinished(message: string, body: string): void {
     this.masterSecret = application.masterSecret
     this.clientApplicationSecret = application.clientTraffic
     this.serverApplicationSecret = application.serverTraffic
+    // The server's Finished is checked and the application secrets are made: the handshake secret, the server's
+    // handshake traffic secret and the master and exporter secrets (no resumption, no exporter here) are done with.
+    tlsWipe(this.serverHandshakeSecret)
+    tlsWipe(this.handshakeSecret)
+    tlsWipe(application.masterSecret)
+    tlsWipe(application.exporter)
     // The client's second flight: ChangeCipherSpec (compatibility mode), then its Finished under the
     // client handshake keys, then everything after is application traffic.
     this.sendCompatibilityChangeCipherSpec()
@@ -616,6 +687,7 @@ private fun TlsClient.handleFinished(message: string, body: string): void {
     this.transcript.add(finished)
     this.setKeys(application.clientTraffic, true)
     this.setKeys(application.serverTraffic, false)
+    tlsWipe(this.clientHandshakeSecret)
     this.state = TLS_CLIENT_CONNECTED
     return
 }
@@ -630,7 +702,9 @@ private fun TlsClient.handleKeyUpdate(body: string): void {
         this.fail(TLS_ALERT_UNEXPECTED_MESSAGE, "tls: too many KeyUpdates in a row")
         return
     }
-    this.serverApplicationSecret = tlsNextTrafficSecret(this.hash, this.serverApplicationSecret)
+    val previousRead = this.serverApplicationSecret
+    this.serverApplicationSecret = tlsNextTrafficSecret(this.hash, previousRead)
+    tlsWipe(previousRead)
     this.setKeys(this.serverApplicationSecret, false)
     // One answer for a batch of requests: it goes out before the next application data (section 4.6.3).
     if (body[0] == 1) this.keyUpdateOwed = true
@@ -650,7 +724,9 @@ private fun TlsClient.answerKeyUpdate(): void {
     if (!this.keyUpdateOwed || this.state != TLS_CLIENT_CONNECTED) return
     this.keyUpdateOwed = false
     this.queueRecord(TLS_HANDSHAKE, tlsHandshakeMessage(TLS_KEY_UPDATE, tlsU8(0)))
-    this.clientApplicationSecret = tlsNextTrafficSecret(this.hash, this.clientApplicationSecret)
+    val previousWrite = this.clientApplicationSecret
+    this.clientApplicationSecret = tlsNextTrafficSecret(this.hash, previousWrite)
+    tlsWipe(previousWrite)
     this.setKeys(this.clientApplicationSecret, true)
     return
 }
@@ -728,6 +804,7 @@ private fun TlsClient.handleAlert(content: string): void {
         if (!this.sentClose) this.queueAlert(TLS_ALERT_CLOSE_NOTIFY)
         this.sentClose = true
         this.state = TLS_CLIENT_CLOSED
+        this.wipeSecrets()
         return
     }
     if (level == 1) {
@@ -861,6 +938,7 @@ fun TlsClient.close(): void {
         this.queueAlert(TLS_ALERT_CLOSE_NOTIFY)
         this.sentClose = true
         this.state = TLS_CLIENT_CLOSED
+        this.wipeSecrets()
     }
     return
 }
@@ -1044,6 +1122,9 @@ private fun TlsClient.handleHelloDone12(message: string, body: string): void {
     // The extended master secret: the session hash is through the ClientKeyExchange.
     val master = tls12MasterSecret(suite.hash, shared.bytes, this.transcript.hash(suite.hash))
     this.masterSecret = master
+    // The ephemeral key and the premaster secret are done with once the master secret is made.
+    tlsWipe(pair.privateKey)
+    tlsWipe(shared.bytes)
     if (scheme != 0 && identity != null) {
         val signature = identity.sign(scheme, this.transcript.messages)
         if (signature.size == 0) {
@@ -1074,6 +1155,8 @@ private fun TlsClient.handleFinished12(message: string, body: string): void {
         return
     }
     val expected = tls12FinishedData(this.hash, this.masterSecret, "server finished", this.transcript.hash(this.hash))
+    // The last use of the master secret (the client's Finished is sent).
+    tlsWipe(this.masterSecret)
     if (!constantTimeEquals(expected, body)) {
         this.fail(TLS_ALERT_DECRYPT_ERROR, "tls: the server's Finished does not verify")
         return

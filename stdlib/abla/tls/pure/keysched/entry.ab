@@ -6,12 +6,40 @@
 //   master secret     = HKDF-Extract(Derive-Secret(handshake, "derived", ""), hash-length zeros)
 //
 // `hash` is HKDF_SHA256 or HKDF_SHA384 (abla/crypto/hkdf). Transcript hashes are the caller's
-// (tlsTranscriptHash). Secrets are strings here, as everywhere in abla/crypto's HMAC layer: they are
-// not scrubbed on drop (a later step of the plan moves them into wiped buffers).
+// (tlsTranscriptHash). Secrets are strings here, as everywhere in abla/crypto's HMAC layer. The state machines clear
+// the ones they made with tlsWipe once nothing reads them again; what HMAC and HKDF make inside a call (the padded keys,
+// the intermediate blocks) is not cleared.
 
 import "abla/crypto"
 import "abla/crypto/hkdf"
 import "abla/crypto/result"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+import "abla/unsafe/mmio"
+
+// ---- clearing secrets ----
+// A string shares its bytes with its slices, and two names can hold one string, so only a secret the TLS code made
+// itself is cleared, and only once nothing reads it again: an HKDF or PRF output, an ECDH result, a key pair it generated
+// or copied (tlsOwnedCopy), the keys of a record protection it replaced. A string it was given is not its to clear (a
+// literal may even be read-only memory).
+
+/** Overwrites `secret`'s bytes with zeros (volatile stores, which the optimizer keeps). */
+trusted fun tlsWipe(secret: string): void {
+    if (secret.size == 0) return
+    val address = ablaUnsafeStringAddress(secret)
+    for (i in 0 until secret.size) ablaUnsafeVolatileStoreU8(address + i, 0)
+    return
+}
+
+/** A copy of `value` in a buffer of its own, which tlsWipe may clear without touching `value`. */
+trusted fun tlsOwnedCopy(value: string): string {
+    if (value.size == 0) return ""
+    val buffer = nativeByteBuffer(value.size + 1)
+    val from = ablaUnsafeStringAddress(value)
+    for (i in 0 until value.size) ablaUnsafeStoreU8(buffer.pointerAt(i), ablaUnsafeLoadU8(nativePointerFromAddress(from + i)))
+    ablaUnsafeStoreU8(buffer.pointerAt(value.size), 0)
+    buffer.adoptString(value.size)
+}
 
 /** The hash's output length in bytes (32 for SHA-256, 48 for SHA-384). */
 fun tlsHashLength(hash: int): int = if (hash == HKDF_SHA384) 48 else 32
@@ -37,12 +65,20 @@ fun tlsEarlySecret(hash: int, psk: string): string =
     hkdfExtract(hash, tlsZeros(hash), if (psk.size == 0) tlsZeros(hash) else psk)
 
 /** The handshake secret from the early secret and the (EC)DHE shared secret. */
-fun tlsHandshakeSecret(hash: int, earlySecret: string, sharedSecret: string): string =
-    hkdfExtract(hash, tlsDeriveSecret(hash, earlySecret, "derived", tlsHashOf(hash, "")), sharedSecret)
+fun tlsHandshakeSecret(hash: int, earlySecret: string, sharedSecret: string): string {
+    val salt = tlsDeriveSecret(hash, earlySecret, "derived", tlsHashOf(hash, ""))
+    val secret = hkdfExtract(hash, salt, sharedSecret)
+    tlsWipe(salt)
+    secret
+}
 
 /** The master secret from the handshake secret. */
-fun tlsMasterSecret(hash: int, handshakeSecret: string): string =
-    hkdfExtract(hash, tlsDeriveSecret(hash, handshakeSecret, "derived", tlsHashOf(hash, "")), tlsZeros(hash))
+fun tlsMasterSecret(hash: int, handshakeSecret: string): string {
+    val salt = tlsDeriveSecret(hash, handshakeSecret, "derived", tlsHashOf(hash, ""))
+    val secret = hkdfExtract(hash, salt, tlsZeros(hash))
+    tlsWipe(salt)
+    secret
+}
 
 /** The traffic key of a traffic secret, `length` bytes (16 for AES-128-GCM, 32 for AES-256-GCM and
  *  ChaCha20-Poly1305). */
@@ -64,7 +100,9 @@ fun tlsFinishedKey(hash: int, baseKey: string): string =
 /** verify_data = HMAC(finished_key, Transcript-Hash(messages up to the Finished)). */
 fun tlsFinishedVerifyData(hash: int, baseKey: string, transcriptHash: string): string {
     val key = tlsFinishedKey(hash, baseKey)
-    if (hash == HKDF_SHA384) hmacSha384(key, transcriptHash) else hmacSha256(key, transcriptHash)
+    val verifyData = if (hash == HKDF_SHA384) hmacSha384(key, transcriptHash) else hmacSha256(key, transcriptHash)
+    tlsWipe(key)
+    verifyData
 }
 
 /** Everything derived from the handshake secret once the ServerHello is hashed: the two handshake

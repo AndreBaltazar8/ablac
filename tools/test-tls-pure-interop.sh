@@ -203,6 +203,13 @@ echo "$result"
 result=$("$root/tools/run-limited.sh" "$out/server" "$out") || { echo "tls-pure server (in process): $result" >&2; exit 1; }
 [[ $result == 'tls-pure server ok' ]] || { echo "tls-pure server (in process): $result" >&2; exit 1; }
 echo "$result"
+# Secrets cleared once nothing reads them (tests/cases/tls-pure/wipe.ab): key shares, handshake and master secrets, old
+# traffic secrets and keys after KeyUpdate, everything at close and failure, TLS 1.2's ephemeral key and master secret,
+# identities' keys (PEM and PKCS#12) on wipe(), a listener's on close.
+"$compiler" build tests/cases/tls-pure/wipe.ab -o "$out/wipe" --no-cache
+result=$("$root/tools/run-limited.sh" "$out/wipe" "$out") || { echo "tls-pure wipe: $result" >&2; exit 1; }
+[[ $result == 'tls-pure wipe ok' ]] || { echo "tls-pure wipe: $result" >&2; exit 1; }
+echo "$result"
 # abla/tls/pure as the SERVER: tests/cases/tls-pure/serve.ab (listening on ::1 on a free port) against openssl s_client
 # (every key kind x cipher suite x group, so the P-256 ones through a HelloRetryRequest), against the pure client,
 # with ALPN, and requiring a client certificate.

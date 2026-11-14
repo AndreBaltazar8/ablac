@@ -71,6 +71,24 @@ must alias one of them. (A type that the stdlib hands out, such as `TlsWebSocket
 - If `NIX_SSL_CERT_FILE`, `SSL_CERT_FILE` or `SSL_CERT_DIR` is set, it is the whole trust: a missing file or one with no
   certificate gives a store in which nothing verifies, not the system bundle.
 
+## Secrets in memory
+
+The client and server clear each secret they made once nothing reads it again (overwritten with zeros, by volatile
+stores): their key shares once the shared secret is made (and the first share when a HelloRetryRequest replaces it), the
+shared secret and the early, handshake and master secrets once the handshake keys and the application secrets are made,
+the handshake traffic secrets and keys after the Finished messages, an old traffic secret and its keys at each KeyUpdate,
+and everything left when the connection closes or fails. In TLS 1.2: the ephemeral key and the premaster secret once
+the master secret is made, the master secret after the Finished messages, the key block at the end. An identity holds
+its key bytes in `secrets`; `TlsIdentity.wipe()` clears them, after which it signs nothing: `tlsServerUpgrade` does it
+for the identity it loaded once the handshake is over, and a listener for its own when it closes or is dropped. An
+identity the program made and passed in is the program's to wipe. Key pairs given to `tlsClientStartWith` are copied, and
+the copies cleared.
+
+What this does not reach: copies that HMAC and HKDF make inside a call (the padded key, intermediate blocks), what the
+AEADs and signers already wipe themselves aside, a string the program passed in, and copies an earlier collection or a
+large string's rope left behind. (A string shares its bytes with its slices, so only strings the TLS code made itself are
+cleared, and only once their last reader is done.) `tests/cases/tls-pure/wipe.ab` checks each of these points.
+
 ## Layers
 
 `abla/tls/pure/keysched`, `record`, `handshake`, `tls12`, `client` and `server` are sans-IO: bytes in with `feed`,
