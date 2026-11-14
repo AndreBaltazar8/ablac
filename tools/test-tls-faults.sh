@@ -17,11 +17,15 @@ cd "$project_root"
 # reads NIX_SSL_CERT_FILE before it, and a Nix install sets that to the system
 # bundle (CI does), so it would not see the certificate.
 unset NIX_SSL_CERT_FILE
-cp tests/vectors/crypto/test-keys/tls-server.pem "$output_directory/key.pem"
+# (These programs are built in release mode, not --fast: their stages time the exchange against budgets of 300 ms and
+# up, and the pure TLS handshake of an unoptimised build costs hundreds of milliseconds on a slow or loaded machine
+# (the Linux CI runner, one busy CPU here), which is not what they measure. An Ed25519 key keeps the server's
+# signature cheap too.)
+openssl genpkey -algorithm ED25519 -out "$output_directory/key.pem" || exit 2
 openssl req -x509 -new -key "$output_directory/key.pem" -days 2 -subj /CN=localhost \
     -addext subjectAltName=DNS:localhost,IP:127.0.0.1 \
     -out "$output_directory/certificate.pem" 2>/dev/null || exit 2
-"$compiler" build tests/cases/tls-faults/faults.ab -o "$output_directory/faults" --fast || exit 2
+"$compiler" build tests/cases/tls-faults/faults.ab -o "$output_directory/faults" || exit 2
 
 # The time limits here (`timeout`, the bounds in the programs) are hang guards, far above what the stages take: the
 # stages' own timeouts (a second or less) are what they test, and a loaded machine must not turn into a failure.
@@ -84,8 +88,8 @@ if [[ -n ${TLS_FAULTS_FAULTS_ONLY:-} ]]; then
     exit "$status"
 fi
 
-"$compiler" build tests/cases/tls-faults/timeouts.ab -o "$output_directory/timeouts" --fast || exit 2
-"$compiler" build tests/cases/tls-faults/deadlines.ab -o "$output_directory/deadlines" --fast || exit 2
+"$compiler" build tests/cases/tls-faults/timeouts.ab -o "$output_directory/timeouts" || exit 2
+"$compiler" build tests/cases/tls-faults/deadlines.ab -o "$output_directory/deadlines" || exit 2
 timeout 600 "$output_directory/timeouts" "$output_directory/certificate.pem" "$output_directory/key.pem" \
     > "$output_directory/timeouts.log" 2>&1 &
 timeouts=$!

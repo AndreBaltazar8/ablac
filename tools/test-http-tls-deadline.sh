@@ -28,7 +28,9 @@ run_client() {
     sed -e "s|CERTFILE|$out/cert.pem|g" -e "s|KEYFILE|$out/key.pem|g" \
         -e "s|P12FILE|$out/identity.p12|g" -e "s/39093/$port/g" \
         "$root/tests/cases/http-tls-deadline/main.ab" > "$out/main.ab"
-    "$compiler" build "$out/main.ab" -o "$out/main" --fast --no-cache
+    # (Release mode: the control below needs a client that fails far inside 100 ms, which a handshake attempt of an
+    # unoptimised build does not on a slow machine.)
+    "$compiler" build "$out/main.ab" -o "$out/main" --no-cache
     status=0
     "$out/main" || status=$?
     kill "$peer_pid" 2>/dev/null || true

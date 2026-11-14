@@ -61,20 +61,18 @@ fun clientFor(store: X509TrustStore, host: string): TlsClient {
 
 fun trusting(path: string): X509TrustStore = x509TrustStoreFromPem(read(path))
 
-fun acceptAny(chain: array<string>, scheme: int, content: string, signature: string): string = ""
+fun acceptAny(chain: array<string>, scheme: int, content: string, signature: string): TlsVerdict = tlsAccepted()
 
-fun trustClient(store: X509TrustStore): (array<string>, int, string, string) -> string =
+fun trustClient(store: X509TrustStore): (array<string>, int, string, string) -> TlsVerdict =
     { chain: array<string>, scheme: int, content: string, signature: string ->
-        val verification = x509Verify(chain, store, X509Options("", now(), 8, 1))
-        if (!verification.ok) "client certificate: ${verification.error}"
-        else tlsVerifySignature(verification.path[0], scheme, content, signature)
+        tlsVerifyClientCertificate(chain, scheme, content, signature, store, now())
     }
 
 fun main: int {
     val directory = processArgument(0)
     // Every key kind x every suite x X25519 / HelloRetryRequest.
     for (kind in ["ed25519", "p256", "rsa"]) {
-        val identity = tlsClientIdentityFromPem(read("$directory/$kind.pem"), read("$directory/$kind.key"))
+        val identity = tlsIdentityFromPem(read("$directory/$kind.pem"), read("$directory/$kind.key"))
         if (!identity.ok()) {
             fail("$kind identity: ${identity.error}")
             continue
@@ -112,13 +110,13 @@ fun main: int {
         }
     }
 
-    val ed = tlsClientIdentityFromPem(read("$directory/ed25519.pem"), read("$directory/ed25519.key"))
+    val ed = tlsIdentityFromPem(read("$directory/ed25519.pem"), read("$directory/ed25519.key"))
     val edStore = trusting("$directory/ed25519.pem")
     // TLS 1.2 (the modern subset), every key kind x every suite whose key type matches x both ways of being 1.2:
     // a default client against a TLS 1.2-only server, and a TLS 1.2-only client against a default server (which says
     // so in its random: the downgrade sentinel).
     for (kind in ["ed25519", "p256", "rsa"]) {
-        val identity12 = tlsClientIdentityFromPem(read("$directory/$kind.pem"), read("$directory/$kind.key"))
+        val identity12 = tlsIdentityFromPem(read("$directory/$kind.pem"), read("$directory/$kind.key"))
         val store12 = trusting("$directory/$kind.pem")
         val rsaKey = kind == "rsa"
         for (code in [TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256, TLS12_ECDHE_ECDSA_AES_256_GCM_SHA384, TLS12_ECDHE_ECDSA_CHACHA20_POLY1305_SHA256,
@@ -173,6 +171,19 @@ fun main: int {
     dgNewClient.takeOutput()
     dgNewClient.feed(dgFlight)
     if (!dgNewClient.failed() || !dgNewClient.error.contains("downgrade")) fail("a downgrade was not detected: [${dgNewClient.error}]")
+    // A ClientHello that declares more than 2^17 bytes is refused at its header; twenty thousand one-byte records of
+    // handshake data (no quadratic copying) end in the refusal of the whole message too.
+    var bigServer = tlsServerNew(TlsServerConfig(ed, [TLS_SUITE_AES_128_GCM_SHA256], [TLS_GROUP_X25519], [], random, false, false, acceptAny))
+    bigServer.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, cryptoByteString([TLS_CLIENT_HELLO, 16, 0, 0])))
+    if (!bigServer.failed()) fail("an oversized ClientHello header was accepted")
+    var dripServer = tlsServerNew(TlsServerConfig(ed, [TLS_SUITE_AES_128_GCM_SHA256], [TLS_GROUP_X25519], [], random, false, false, acceptAny))
+    dripServer.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, cryptoByteString([TLS_CLIENT_HELLO, 0, 78, 32])))
+    var dripped = 0
+    while (dripped < 20000 && !dripServer.failed()) {
+        dripServer.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, cryptoByteString([0])))
+        dripped = dripped + 1
+    }
+    if (!dripServer.failed() || dripped != 20000) fail("a ClientHello of 20 000 zero bytes in one-byte records: failed ${dripServer.failed()} after $dripped")
     // A TLS 1.2 client hello without the extended master secret is refused by the server.
     val noEms = tlsHandshakeMessage(TLS_CLIENT_HELLO, tlsU16(771) + random(32) + tlsVec8("") +
         tlsVec16(tlsU16(TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256) + tlsU16(255)) + tlsVec8(tlsU8(0)) +
@@ -183,7 +194,7 @@ fun main: int {
     if (!emsServer.failed() || !emsServer.error.contains("extended master secret")) fail("a client without the extended master secret was accepted: [${emsServer.error}]")
     // TLS 1.2 with client certificates, RSA and P-256 client keys.
     for (clientKind in ["p256", "rsa"]) {
-        val clientIdentity12 = tlsClientIdentityFromPem(read("$directory/client-$clientKind.pem"), read("$directory/client-$clientKind.key"))
+        val clientIdentity12 = tlsIdentityFromPem(read("$directory/client-$clientKind.pem"), read("$directory/client-$clientKind.key"))
         val clientStore12 = trusting("$directory/client-$clientKind.pem")
         val serverConfig12 = TlsServerConfig(ed, [], [TLS_GROUP_X25519], [], random, true, true, trustClient(clientStore12),
             [TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256])
@@ -219,7 +230,7 @@ fun main: int {
     if (!noAlpnServer.failed() || !noAlpnClient.failed()) fail("no ALPN in common did not fail")
 
     // Client certificates.
-    val clientIdentity = tlsClientIdentityFromPem(read("$directory/client-p256.pem"), read("$directory/client-p256.key"))
+    val clientIdentity = tlsIdentityFromPem(read("$directory/client-p256.pem"), read("$directory/client-p256.key"))
     val clientStore = trusting("$directory/client-p256.pem")
     val baseConfig = TlsServerConfig(ed, [TLS_SUITE_AES_128_GCM_SHA256], [TLS_GROUP_X25519], [], random, true, true,
         trustClient(clientStore))

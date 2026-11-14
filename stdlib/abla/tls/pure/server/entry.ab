@@ -36,14 +36,14 @@ val TLS_ALERT_CERTIFICATE_REQUIRED = 116
  *  that sends none) with `clientVerifier(chain, scheme, signed content, signature)` returning "" for a client it
  *  trusts, else the reason. */
 class TlsServerConfig(
-    val identity: TlsClientIdentity,
+    val identity: TlsIdentity,
     val suites: array<int>,
     val groups: array<int>,
     val alpn: array<string>,
     val random: (int) -> string,
     val requestClientCertificate: bool,
     val requireClientCertificate: bool,
-    val clientVerifier: (array<string>, int, string, string) -> string,
+    val clientVerifier: (array<string>, int, string, string) -> TlsVerdict,
     /** The TLS 1.2 suites (the modern subset) the server accepts, in its order: [] makes a TLS 1.3-only server. The
      *  suites whose key type does not match the identity are skipped. */
     val suites12: array<int> = [TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256, TLS12_ECDHE_RSA_AES_128_GCM_SHA256,
@@ -56,7 +56,7 @@ class TlsServer(
     var state: int,
     var error: string,
     var inbox: string,
-    var handshakeBuffer: string,
+    var handshakeBuffer: TlsHandshakeBuffer,
     var outbox: string,
     var applicationData: string,
     val transcript: TlsTranscript,
@@ -100,7 +100,7 @@ private fun tlsServerEmptyProtection(): TlsRecordProtection = tlsRecordProtectio
 
 /** A TLS 1.3 server connection waiting for its ClientHello. */
 fun tlsServerNew(config: TlsServerConfig): TlsServer =
-    TlsServer(config, TLS_SERVER_WAIT_CLIENT_HELLO, "", "", "", "", "", tlsTranscript(), HKDF_SHA256, 0, 16,
+    TlsServer(config, TLS_SERVER_WAIT_CLIENT_HELLO, "", "", TlsHandshakeBuffer([], 0), "", "", tlsTranscript(), HKDF_SHA256, 0, 16,
         TLS_AEAD_AES_128_GCM, "", "", false, 0, 0, false, false, tlsServerEmptyProtection(),
         tlsServerEmptyProtection(), "", "", "", "", "", [], "", "", false, false, false, false, false, 0,
         tls12Protection(tls12Placeholder(), "", ""), tls12Protection(tls12Placeholder(), "", ""), Tls12Keys("", "", "", ""),
@@ -108,21 +108,21 @@ fun tlsServerNew(config: TlsServerConfig): TlsServer =
 
 /** The usual configuration: the given identity, AES-GCM and ChaCha20 suites, X25519 then P-256, no ALPN, no client
  *  certificate. */
-fun tlsServerConfig(identity: TlsClientIdentity, random: (int) -> string): TlsServerConfig =
+fun tlsServerConfig(identity: TlsIdentity, random: (int) -> string): TlsServerConfig =
     TlsServerConfig(identity, [TLS_SUITE_AES_128_GCM_SHA256, TLS_SUITE_AES_256_GCM_SHA384,
         TLS_SUITE_CHACHA20_POLY1305_SHA256], [TLS_GROUP_X25519, TLS_GROUP_SECP256R1], [], random, false, false,
         tlsServerRefuseClients)
 
 /** As tlsServerConfig, and asks the client for a certificate that `verifier` (chain, signature scheme, signed content,
  *  signature: "" to accept, else the reason) accepts; `required` refuses a client that sends none. */
-fun tlsServerConfigWithClientCertificates(identity: TlsClientIdentity, random: (int) -> string, required: bool,
-    verifier: (array<string>, int, string, string) -> string): TlsServerConfig =
+fun tlsServerConfigWithClientCertificates(identity: TlsIdentity, random: (int) -> string, required: bool,
+    verifier: (array<string>, int, string, string) -> TlsVerdict): TlsServerConfig =
     TlsServerConfig(identity, [TLS_SUITE_AES_128_GCM_SHA256, TLS_SUITE_AES_256_GCM_SHA384,
         TLS_SUITE_CHACHA20_POLY1305_SHA256], [TLS_GROUP_X25519, TLS_GROUP_SECP256R1], [], random, true, required, verifier)
 
 /** The client verifier of a server that asks for no certificate: it trusts none. */
-fun tlsServerRefuseClients(chain: array<string>, scheme: int, content: string, signature: string): string =
-    "client certificates are not accepted"
+fun tlsServerRefuseClients(chain: array<string>, scheme: int, content: string, signature: string): TlsVerdict =
+    tlsRefused(TLS_VERDICT_BAD_CERTIFICATE, "client certificates are not accepted")
 
 fun TlsServer.failed(): bool = this.state == TLS_SERVER_FAILED
 fun TlsServer.connected(): bool = this.state == TLS_SERVER_CONNECTED
@@ -412,8 +412,8 @@ private fun TlsServer.handleClientCertificateVerify(message: string, body: strin
     }
     val content = tlsCertificateVerifyContent(false, this.transcript.hash(this.hash))
     val verdict = this.config.clientVerifier(this.clientChain, parsed.scheme, content, parsed.signature)
-    if (verdict.size > 0) {
-        this.fail(TLS_ALERT_BAD_CERTIFICATE, verdict)
+    if (!verdict.accepted()) {
+        this.fail(verdict.alert, verdict.text)
         return
     }
     this.clientAuthenticated = true
@@ -432,7 +432,7 @@ private fun TlsServer.handleClientFinished(message: string, body: string): void 
         this.fail(TLS_ALERT_DECRYPT_ERROR, "tls: the client's Finished does not verify")
         return
     }
-    if (this.handshakeBuffer.size != 0) {
+    if (!this.handshakeBuffer.empty()) {
         this.fail(TLS_ALERT_UNEXPECTED_MESSAGE, "tls: data after the client's Finished in its record")
         return
     }
@@ -479,13 +479,17 @@ private fun TlsServer.handleMessage(type: int, message: string, body: string): v
 
 private fun TlsServer.processHandshake(): void {
     while (this.state != TLS_SERVER_FAILED && this.state != TLS_SERVER_CLOSED) {
-        val header = tlsParseMessageHeader(this.handshakeBuffer, 0)
+        val header = this.handshakeBuffer.header()
+        // The cap is checked at the header, before the body is buffered (a peer not yet authenticated).
+        if (header.bodyLength > tlsMessageLimit(header.type)) {
+            this.fail(TLS_ALERT_ILLEGAL_PARAMETER, "tls: a handshake message longer than allowed")
+            return
+        }
         if (!header.complete) return
-        val message = this.handshakeBuffer.slice(0, header.total)
-        this.handshakeBuffer = this.handshakeBuffer.slice(header.total, this.handshakeBuffer.size)
+        val message = this.handshakeBuffer.take(header.total)
         this.handleMessage(header.type, message, message.slice(4, message.size))
         // A ClientHello must be alone in its record before the keys change.
-        if (this.handshakeBuffer.size > 0 && (this.state == TLS_SERVER_WAIT_SECOND_HELLO ||
+        if (!this.handshakeBuffer.empty() && (this.state == TLS_SERVER_WAIT_SECOND_HELLO ||
             this.state == TLS_SERVER_WAIT_CERTIFICATE || this.state == TLS_SERVER_WAIT_FINISHED) && !this.readEncrypted) {
             this.fail(TLS_ALERT_UNEXPECTED_MESSAGE, "tls: handshake data after the ClientHello in its record")
             return
@@ -551,7 +555,7 @@ private fun TlsServer.handleRecord(record: string, header: TlsRecordHeader): voi
             this.fail(TLS_ALERT_UNEXPECTED_MESSAGE, "tls: an empty handshake record")
             return
         }
-        this.handshakeBuffer = this.handshakeBuffer + content
+        this.handshakeBuffer.add(content)
         this.processHandshake()
     } else if (type == TLS_ALERT) {
         this.handleAlert(content)
@@ -619,7 +623,7 @@ val TLS_SERVER12_WAIT_CERTIFICATE_VERIFY = 22
 val TLS_SERVER12_WAIT_CHANGE_CIPHER_SPEC = 23
 val TLS_SERVER12_WAIT_FINISHED = 24
 
-private fun tlsServerKeyIsRsa(identity: TlsClientIdentity): bool {
+private fun tlsServerKeyIsRsa(identity: TlsIdentity): bool {
     for (scheme in identity.schemes) {
         if (scheme == TLS_SIG_RSA_PSS_RSAE_SHA256 || scheme == TLS_SIG_RSA_PKCS1_SHA256) return true
     }
@@ -782,8 +786,8 @@ private fun TlsServer.handleClientCertificateVerify12(message: string, body: str
     // The signature covers every handshake message before this one.
     val verdict = this.config.clientVerifier(this.clientChain, parsed.scheme + TLS_SIGNATURE_TLS12, this.transcript.messages,
         parsed.signature)
-    if (verdict.size > 0) {
-        this.fail(TLS_ALERT_BAD_CERTIFICATE, verdict)
+    if (!verdict.accepted()) {
+        this.fail(verdict.alert, verdict.text)
         return
     }
     this.clientAuthenticated = true
@@ -802,7 +806,7 @@ private fun TlsServer.handleClientFinished12(message: string, body: string): voi
         this.fail(TLS_ALERT_DECRYPT_ERROR, "tls: the client's Finished does not verify")
         return
     }
-    if (this.handshakeBuffer.size != 0) {
+    if (!this.handshakeBuffer.empty()) {
         this.fail(TLS_ALERT_UNEXPECTED_MESSAGE, "tls: data after the client's Finished in its record")
         return
     }
@@ -839,10 +843,14 @@ private fun TlsServer.handleMessage12(type: int, message: string, body: string):
 
 private fun TlsServer.processHandshake12(): void {
     while (this.state != TLS_SERVER_FAILED && this.state != TLS_SERVER_CLOSED) {
-        val header = tlsParseMessageHeader(this.handshakeBuffer, 0)
+        val header = this.handshakeBuffer.header()
+        // The cap is checked at the header, before the body is buffered (a peer not yet authenticated).
+        if (header.bodyLength > tlsMessageLimit(header.type)) {
+            this.fail(TLS_ALERT_ILLEGAL_PARAMETER, "tls: a handshake message longer than allowed")
+            return
+        }
         if (!header.complete) return
-        val message = this.handshakeBuffer.slice(0, header.total)
-        this.handshakeBuffer = this.handshakeBuffer.slice(header.total, this.handshakeBuffer.size)
+        val message = this.handshakeBuffer.take(header.total)
         this.handleMessage12(header.type, message, message.slice(4, message.size))
     }
     return
@@ -851,7 +859,7 @@ private fun TlsServer.processHandshake12(): void {
 private fun TlsServer.handleRecord12(record: string, header: TlsRecordHeader): void {
     if (header.type == TLS_CHANGE_CIPHER_SPEC) {
         if (this.state != TLS_SERVER12_WAIT_CHANGE_CIPHER_SPEC || record.size != 6 || record[5] != 1 ||
-            this.handshakeBuffer.size != 0) {
+            !this.handshakeBuffer.empty()) {
             this.fail(TLS_ALERT_UNEXPECTED_MESSAGE, "tls: an unexpected ChangeCipherSpec")
             return
         }
@@ -884,7 +892,7 @@ private fun TlsServer.handleRecord12(record: string, header: TlsRecordHeader): v
             this.fail(TLS_ALERT_UNEXPECTED_MESSAGE, "tls: an empty handshake record")
             return
         }
-        this.handshakeBuffer = this.handshakeBuffer + content
+        this.handshakeBuffer.add(content)
         this.processHandshake12()
     } else if (type == TLS_ALERT) {
         this.handleAlert(content)

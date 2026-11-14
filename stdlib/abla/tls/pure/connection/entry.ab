@@ -7,6 +7,7 @@ import "abla/dns"
 import "abla/random"
 import "abla/sys/linux/net"
 import "abla/sys/linux/process"
+import "abla/tls/pure/handshake"
 import "abla/tls/pure/client"
 import "abla/tls/pure/server"
 
@@ -16,7 +17,7 @@ fun tlsPureRandom(count: int): string {
     if (result.succeeded) result.bytes else ""
 }
 
-private fun tlsPureNoVerify(chain: array<string>, host: string, scheme: int, content: string, signature: string): string = ""
+private fun tlsPureNoVerify(chain: array<string>, host: string, scheme: int, content: string, signature: string): TlsVerdict = tlsAccepted()
 private fun tlsPureNoSignature(scheme: int, content: string): string = ""
 
 /** The state machine nobody uses in a connection of the other kind: cheap, no key generation. */
@@ -24,7 +25,7 @@ private fun tlsPurePlaceholderClient(): TlsClient =
     tlsClientStartWith(tlsClientConfig("", tlsPureNoVerify, tlsPureRandom), "", "", "", [], 769)
 
 private fun tlsPurePlaceholderServer(): TlsServer =
-    tlsServerNew(tlsServerConfig(TlsClientIdentity([], [], tlsPureNoSignature), tlsPureRandom))
+    tlsServerNew(tlsServerConfig(TlsIdentity([], [], tlsPureNoSignature), tlsPureRandom))
 
 /** A connection: a socket and the state machine that speaks TLS on it, a client's or a server's (the other is an
  *  unused placeholder; `isServer` says which). `stage` is why it is unusable, as the hosted API numbers them: 0 none,
@@ -122,7 +123,8 @@ private fun tlsPureTake(var tcp: TcpConnection): TcpConnection {
     owned
 }
 
-/** Runs the handshake until the machine is connected or failed. `timeoutMilliseconds` bounds each wait, `deadline`
+/** Runs the handshake until the machine is connected or failed (a timeout during it is a handshake failure, as in the hosted
+ *  module: stage 9 or 12, with the text of the timeout in `lastError`). `timeoutMilliseconds` bounds each wait, `deadline`
  *  (an absolute monotonic millisecond time, 0 for none) the whole of it; the failure stage is `failStage` for a
  *  handshake error (9 for a client, 12 for a server). */
 private fun TlsPureConnection.handshake(timeoutMilliseconds: int, deadline: int, failStage: int): void {
@@ -131,7 +133,7 @@ private fun TlsPureConnection.handshake(timeoutMilliseconds: int, deadline: int,
         val wait = tlsPureDeadlineWait(deadline, timeoutMilliseconds)
         if (wait <= 0) {
             this.lastError = "TLS read or write timed out"
-            this.stage = 13
+            this.stage = failStage
             running = false
         } else {
             this.tcp.setTimeouts(wait, wait)
@@ -144,7 +146,7 @@ private fun TlsPureConnection.handshake(timeoutMilliseconds: int, deadline: int,
                 this.lastError = if (timedOut) "TLS read or write timed out"
                     else if (received.reachedEof()) "TLS failed at handshake: the connection closed"
                     else "TLS failed at handshake"
-                this.stage = if (timedOut) 13 else failStage
+                this.stage = failStage
                 running = false
             }
         }
@@ -161,7 +163,7 @@ private fun TlsPureConnection.handshake(timeoutMilliseconds: int, deadline: int,
  *  `ok()`: on failure `lastError` and `stage` say why. */
 fun tlsPureUpgrade(var tcp: TcpConnection, config: TlsClientConfig, timeoutMilliseconds: int = 5000,
     readWriteTimeoutMilliseconds: int = 30000, deadline: int = 0,
-    identity: TlsClientIdentity? = null): TlsPureConnection {
+    identity: TlsIdentity? = null): TlsPureConnection {
     val owned = tlsPureTake(tcp)
     var connection = TlsPureConnection(move(owned), tlsClientNew(config), tlsPurePlaceholderServer(),
         false, "", 0)
@@ -171,10 +173,17 @@ fun tlsPureUpgrade(var tcp: TcpConnection, config: TlsClientConfig, timeoutMilli
         return connection
     }
     if (identity != null) connection.client.useIdentity(identity)
-    connection.tcp.setTimeouts(timeoutMilliseconds, timeoutMilliseconds)
+    // A socket that already has limits keeps them, through the handshake and after (as abla/tls/hosted does).
+    // (The handshake sets each wait's limit itself, so the socket's own are read first and put back after it.)
+    val ownLimits = linuxSocketHasTimeouts(connection.tcp.descriptor)
+    val ownRead = linuxSocketTimeoutMilliseconds(connection.tcp.descriptor, 20)
+    val ownWrite = linuxSocketTimeoutMilliseconds(connection.tcp.descriptor, 21)
+    if (!ownLimits) connection.tcp.setTimeouts(timeoutMilliseconds, timeoutMilliseconds)
     connection.handshake(timeoutMilliseconds, deadline, 9)
     if (!connection.connected()) {
         connection.tcp.close()
+    } else if (ownLimits) {
+        connection.tcp.setTimeouts(ownRead, ownWrite)
     } else {
         connection.tcp.setTimeouts(readWriteTimeoutMilliseconds, readWriteTimeoutMilliseconds)
     }
@@ -184,7 +193,7 @@ fun tlsPureUpgrade(var tcp: TcpConnection, config: TlsClientConfig, timeoutMilli
 /** Connects (a host name, an IPv4 or IPv6 address; "localhost" goes to ::1) and runs the handshake. */
 fun tlsPureConnect(config: TlsClientConfig, port: int = 443, timeoutMilliseconds: int = 5000,
     readWriteTimeoutMilliseconds: int = 30000, deadline: int = 0,
-    identity: TlsClientIdentity? = null): TlsPureConnection {
+    identity: TlsIdentity? = null): TlsPureConnection {
     val connectTimeout = tlsPureDeadlineWait(deadline,
         if (timeoutMilliseconds > 10000) 10000 else timeoutMilliseconds)
     var tcp = if (connectTimeout <= 0) TcpConnection(-1)

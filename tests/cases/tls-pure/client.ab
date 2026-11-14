@@ -25,7 +25,7 @@ var verifierHost = ""
 var verifierScheme = 0
 var verifierContent = ""
 var verifierSignature = ""
-var verifierAnswer = ""
+var verifierAnswer = tlsAccepted()
 
 fun fail(what: string): void {
     failures = failures + 1
@@ -53,7 +53,7 @@ fun vector(heading: string, name: string, occurrence: int = 1): string {
 
 fun raw(heading: string, name: string, occurrence: int = 1): string = hexDecode(vector(heading, name, occurrence))
 
-fun verifier(chain: array<string>, host: string, scheme: int, content: string, signature: string): string {
+fun verifier(chain: array<string>, host: string, scheme: int, content: string, signature: string): TlsVerdict {
     verifierCalls = verifierCalls + 1
     verifierChain = chain
     verifierHost = host
@@ -163,13 +163,13 @@ fun main: int {
     client.feed(serverHello())
     if (!client.failed()) fail("two ServerHellos were accepted")
 
-    verifierAnswer = "tls: untrusted certificate"
+    verifierAnswer = tlsRefused(TLS_VERDICT_UNKNOWN_CA, "tls: untrusted certificate")
     client = newClient()
     client.takeOutput()
     client.feed(serverHello())
     client.feed(serverFlight())
     if (!client.failed() || client.error != "tls: untrusted certificate") fail("a rejecting verifier: ${client.error}")
-    verifierAnswer = ""
+    verifierAnswer = tlsAccepted()
 
     // A ServerHello for TLS 1.2 (no supported_versions) is refused.
     client = newClient()
@@ -184,6 +184,25 @@ fun main: int {
     client.takeOutput()
     client.feed(tlsPlaintextRecord(TLS_ALERT, 771, tlsU8(2) + tlsU8(40)))
     if (!client.failed() || client.error != "tls: the server sent alert 40") fail("a fatal alert: ${client.error}")
+
+    // A handshake message that declares more body than its type may have is refused at once, before the body arrives:
+    // a ServerHello of 200 000 bytes, a Certificate of 70 000, a Finished of 20 000; also with the header split over
+    // records of one byte; one declared at the limit is merely waited for.
+    for (declared in [cryptoByteString([TLS_SERVER_HELLO, 3, 13, 64]), cryptoByteString([TLS_CERTIFICATE, 1, 17, 112]),
+        cryptoByteString([TLS_FINISHED, 0, 78, 32])]) {
+        client = newClient()
+        client.takeOutput()
+        client.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, declared))
+        if (!client.failed()) fail("an oversized handshake message header was accepted (type ${declared[0]})")
+        client = newClient()
+        client.takeOutput()
+        for (i in 0 until 4) client.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, declared.slice(i, i + 1)))
+        if (!client.failed()) fail("an oversized header in one-byte records was accepted (type ${declared[0]})")
+    }
+    client = newClient()
+    client.takeOutput()
+    client.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, cryptoByteString([TLS_SERVER_HELLO, 2, 0, 0])))
+    if (client.failed()) fail("a ServerHello declared at its limit was refused")
 
     // Compatibility mode (section 7): a 32-byte session id; the server's ChangeCipherSpec after its
     // ServerHello is ignored, and the client sends its own before its Finished.

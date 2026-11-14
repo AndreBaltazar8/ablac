@@ -30,99 +30,135 @@ private val TLS_CURVE_P384 = "x\x06\x05\x2b\x81\x04\x00\x22"
 
 /** TLS 1.2's ECDSA (RFC 5246 section 7.4.1.4.1): the scheme names only the hash, the curve is the key's own (P-256 or P-384).
  *  A TLS 1.3 scheme fixes the curve too, and is checked below. */
-private fun tlsVerifyEcdsa12(leaf: X509Certificate, scheme: int, content: string, signature: string): string {
-    if (leaf.keyOid != TLS_OID_EC_PUBLIC_KEY) return "the certificate's key is not an EC key"
+private fun tlsVerifyEcdsa12(leaf: X509Certificate, scheme: int, content: string, signature: string): TlsVerdict {
+    if (leaf.keyOid != TLS_OID_EC_PUBLIC_KEY) {
+        return tlsRefused(TLS_VERDICT_UNSUPPORTED_CERTIFICATE, "the certificate's key is not an EC key")
+    }
     val digest = if (scheme == TLS_SIG_ECDSA_SECP256R1_SHA256) sha256(content) else sha384(content)
     if (leaf.keyParameters == TLS_CURVE_P256) {
         val raw = p256SignatureFromDer(signature)
-        return if (raw != "" && p256EcdsaVerifyDigestRaw(leaf.keyBits, digest, raw)) "" else "the signature is not valid"
+        return if (raw != "" && p256EcdsaVerifyDigestRaw(leaf.keyBits, digest, raw)) tlsAccepted()
+            else tlsRefused(TLS_VERDICT_BAD_CERTIFICATE, "the signature is not valid")
     }
     if (leaf.keyParameters == TLS_CURVE_P384) {
         val raw = p384SignatureFromDer(signature)
-        return if (raw != "" && p384EcdsaVerifyDigestRaw(leaf.keyBits, digest, raw)) "" else "the signature is not valid"
+        return if (raw != "" && p384EcdsaVerifyDigestRaw(leaf.keyBits, digest, raw)) tlsAccepted()
+            else tlsRefused(TLS_VERDICT_BAD_CERTIFICATE, "the signature is not valid")
     }
-    "the certificate's curve is not supported"
+    tlsRefused(TLS_VERDICT_UNSUPPORTED_CERTIFICATE, "the certificate's curve is not supported")
 }
 
 /** Checks `signature` over `content` with the end-entity certificate's key for a TLS signature scheme. A scheme carrying
  *  TLS_SIGNATURE_TLS12 (what the TLS 1.2 call sites pass) is checked by TLS 1.2's rules; any other is checked by TLS 1.3's, the
  *  strict ones, so a caller that says nothing gets those. */
-fun tlsVerifySignature(leaf: X509Certificate, scheme: int, content: string, signature: string): string {
+fun tlsCheckSignature(leaf: X509Certificate, scheme: int, content: string, signature: string): TlsVerdict {
     val tls12 = tlsSignatureIsTls12(scheme)
     val named = tlsSignatureScheme(scheme)
     if (tls12 && (named == TLS_SIG_ECDSA_SECP256R1_SHA256 || named == TLS_SIG_ECDSA_SECP384R1_SHA384)) {
         return tlsVerifyEcdsa12(leaf, named, content, signature)
     }
-    return tlsVerifySignatureNamed(leaf, named, content, signature)
+    return tlsCheckSignatureNamed(leaf, named, content, signature)
 }
 
-private fun tlsVerifySignatureNamed(leaf: X509Certificate, scheme: int, content: string, signature: string): string {
+private fun tlsCheckSignatureNamed(leaf: X509Certificate, scheme: int, content: string, signature: string): TlsVerdict {
     if (scheme == TLS_SIG_ECDSA_SECP256R1_SHA256) {
         if (leaf.keyOid != TLS_OID_EC_PUBLIC_KEY || leaf.keyParameters != TLS_CURVE_P256) {
-            return "the certificate's key is not a P-256 key"
+            return tlsRefused(TLS_VERDICT_UNSUPPORTED_CERTIFICATE, "the certificate's key is not a P-256 key")
         }
-        return if (p256EcdsaVerify(leaf.keyBits, content, signature)) "" else "the CertificateVerify signature is not valid"
+        return if (p256EcdsaVerify(leaf.keyBits, content, signature)) tlsAccepted() else tlsRefused(TLS_VERDICT_BAD_CERTIFICATE, "the CertificateVerify signature is not valid")
     }
     if (scheme == TLS_SIG_ECDSA_SECP384R1_SHA384) {
         if (leaf.keyOid != TLS_OID_EC_PUBLIC_KEY || leaf.keyParameters != TLS_CURVE_P384) {
-            return "the certificate's key is not a P-384 key"
+            return tlsRefused(TLS_VERDICT_UNSUPPORTED_CERTIFICATE, "the certificate's key is not a P-384 key")
         }
-        return if (p384EcdsaVerify(leaf.keyBits, content, signature)) "" else "the CertificateVerify signature is not valid"
+        return if (p384EcdsaVerify(leaf.keyBits, content, signature)) tlsAccepted() else tlsRefused(TLS_VERDICT_BAD_CERTIFICATE, "the CertificateVerify signature is not valid")
     }
     if (scheme == TLS_SIG_RSA_PSS_RSAE_SHA256 || scheme == TLS_SIG_RSA_PSS_RSAE_SHA384 ||
         scheme == TLS_SIG_RSA_PSS_RSAE_SHA512) {
-        if (leaf.keyOid != TLS_OID_RSA_ENCRYPTION) return "the certificate's key is not an RSA key"
+        if (leaf.keyOid != TLS_OID_RSA_ENCRYPTION) return tlsRefused(TLS_VERDICT_UNSUPPORTED_CERTIFICATE, "the certificate's key is not an RSA key")
         val key = rsaPublicKeyFromDer(leaf.spki)
-        if (!key.ok()) return "the certificate's RSA key is unreadable"
+        if (!key.ok()) return tlsRefused(TLS_VERDICT_UNSUPPORTED_CERTIFICATE, "the certificate's RSA key is unreadable")
         val bits = if (scheme == TLS_SIG_RSA_PSS_RSAE_SHA256) 256 else if (scheme == TLS_SIG_RSA_PSS_RSAE_SHA384) 384 else 512
         // The salt is as long as the hash (RFC 8446 section 4.2.3), rsaPssVerify's default.
-        return if (rsaPssVerify(key, bits, content, signature)) "" else "the CertificateVerify signature is not valid"
+        return if (rsaPssVerify(key, bits, content, signature)) tlsAccepted() else tlsRefused(TLS_VERDICT_BAD_CERTIFICATE, "the CertificateVerify signature is not valid")
     }
     // RSA PKCS#1 v1.5 (TLS 1.2 only: a TLS 1.3 client does not accept these schemes in a CertificateVerify).
     if (scheme == TLS_SIG_RSA_PKCS1_SHA256 || scheme == TLS_SIG_RSA_PKCS1_SHA384 || scheme == TLS_SIG_RSA_PKCS1_SHA512) {
-        if (leaf.keyOid != TLS_OID_RSA_ENCRYPTION) return "the certificate's key is not an RSA key"
+        if (leaf.keyOid != TLS_OID_RSA_ENCRYPTION) return tlsRefused(TLS_VERDICT_UNSUPPORTED_CERTIFICATE, "the certificate's key is not an RSA key")
         val key = rsaPublicKeyFromDer(leaf.spki)
-        if (!key.ok()) return "the certificate's RSA key is unreadable"
+        if (!key.ok()) return tlsRefused(TLS_VERDICT_UNSUPPORTED_CERTIFICATE, "the certificate's RSA key is unreadable")
         val info = if (scheme == TLS_SIG_RSA_PKCS1_SHA256) TLS_DIGEST_INFO_SHA256
             else if (scheme == TLS_SIG_RSA_PKCS1_SHA384) TLS_DIGEST_INFO_SHA384 else TLS_DIGEST_INFO_SHA512
         val digest = if (scheme == TLS_SIG_RSA_PKCS1_SHA256) sha256(content)
             else if (scheme == TLS_SIG_RSA_PKCS1_SHA384) sha384(content) else sha512(content)
-        return if (rsaVerifyWith(key, info, digest, signature)) "" else "the signature is not valid"
+        return if (rsaVerifyWith(key, info, digest, signature)) tlsAccepted() else tlsRefused(TLS_VERDICT_BAD_CERTIFICATE, "the signature is not valid")
     }
     if (scheme == TLS_SIG_ED25519) {
-        if (leaf.keyOid != TLS_OID_ED25519) return "the certificate's key is not an Ed25519 key"
-        return if (ed25519Verify(leaf.keyBits, content, signature)) "" else "the CertificateVerify signature is not valid"
+        if (leaf.keyOid != TLS_OID_ED25519) return tlsRefused(TLS_VERDICT_UNSUPPORTED_CERTIFICATE, "the certificate's key is not an Ed25519 key")
+        return if (ed25519Verify(leaf.keyBits, content, signature)) tlsAccepted() else tlsRefused(TLS_VERDICT_BAD_CERTIFICATE, "the CertificateVerify signature is not valid")
     }
-    "unsupported signature scheme $scheme"
+    tlsRefused(TLS_VERDICT_UNSUPPORTED_CERTIFICATE, "unsupported signature scheme $scheme")
 }
 
-/** The whole check: the chain against `store` for `host` at `now` (seconds since 1970), then the signature. */
+/** As tlsCheckSignature, the reason only: "" when the signature is valid. */
+fun tlsVerifySignature(leaf: X509Certificate, scheme: int, content: string, signature: string): string =
+    tlsCheckSignature(leaf, scheme, content, signature).text
+
+/** The alert RFC 8446 section 4.4.2.4 and 6.2 give a certificate chain that x509 refused for `kind`. OpenSSL 3 sends
+ *  bad_certificate for the rest (a wrong host name, a missing subjectAltName, a bad path). */
+fun tlsChainVerdictAlert(kind: int): int {
+    if (kind == X509_FAILURE_UNKNOWN_AUTHORITY) return TLS_VERDICT_UNKNOWN_CA
+    if (kind == X509_FAILURE_EXPIRED) return TLS_VERDICT_CERTIFICATE_EXPIRED
+    TLS_VERDICT_BAD_CERTIFICATE
+}
+
+/** The whole check: the chain against `store` for `host` at `now` (seconds since 1970), then the signature. The
+ *  verdict carries the alert to send (unknown_ca for a chain with no trusted anchor, certificate_expired for an
+ *  expired or not yet valid one, unsupported_certificate for a key or signature algorithm it cannot use, else
+ *  bad_certificate). */
 fun tlsVerifyServerCertificate(chain: array<string>, host: string, scheme: int, content: string,
-    signature: string, store: X509TrustStore, now: int): string {
+    signature: string, store: X509TrustStore, now: int, allowAnyHost: bool = false): TlsVerdict {
+    // An empty host name would turn the name check off (abla/crypto/x509 reads "" as "no name to check"): refused
+    // unless the caller says it wants a certificate for any name.
+    if (host == "" && !allowAnyHost) {
+        return tlsRefused(TLS_VERDICT_BAD_CERTIFICATE, "certificate: no host name to verify the certificate for")
+    }
     val verification = x509Verify(chain, store, X509Options(host, now))
-    if (!verification.ok) return "certificate: ${verification.error}"
-    if (verification.path.size == 0) return "certificate: no path"
-    tlsVerifySignature(verification.path[0], scheme, content, signature)
+    if (!verification.ok) {
+        return tlsRefused(tlsChainVerdictAlert(verification.kind), "certificate: ${verification.error}")
+    }
+    if (verification.path.size == 0) return tlsRefused(TLS_VERDICT_BAD_CERTIFICATE, "certificate: no path")
+    tlsCheckSignature(verification.path[0], scheme, content, signature)
+}
+
+/** The verification of a client's certificate chain for a server (extended key usage clientAuth), as
+ *  tlsVerifyServerCertificate: the same verdicts. */
+fun tlsVerifyClientCertificate(chain: array<string>, scheme: int, content: string, signature: string,
+    store: X509TrustStore, now: int): TlsVerdict {
+    val verification = x509Verify(chain, store, X509Options("", now, 8, 1))
+    if (!verification.ok) {
+        return tlsRefused(tlsChainVerdictAlert(verification.kind), "certificate: ${verification.error}")
+    }
+    if (verification.path.size == 0) return tlsRefused(TLS_VERDICT_BAD_CERTIFICATE, "certificate: no path")
+    tlsCheckSignature(verification.path[0], scheme, content, signature)
 }
 
 /** A verifier for TlsClientConfig that trusts `store`, with the time from `now` (called once per handshake). */
-fun tlsX509Verifier(store: X509TrustStore, now: () -> int): (array<string>, string, int, string, string) -> string =
+fun tlsX509Verifier(store: X509TrustStore, now: () -> int): (array<string>, string, int, string, string) -> TlsVerdict =
     { chain: array<string>, host: string, scheme: int, content: string, signature: string ->
         tlsVerifyServerCertificate(chain, host, scheme, content, signature, store, now())
     }
 
-/** The check of a client's certificate: the chain against `store` for client authentication (no host name) at `now`, then
- *  the signature of its CertificateVerify under the end-entity key. "" when it is good, else the reason. */
-fun tlsVerifyClientCertificate(chain: array<string>, scheme: int, content: string, signature: string, store: X509TrustStore,
-    now: int): string {
-    val verification = x509Verify(chain, store, X509Options("", now, 8, 1))
-    if (!verification.ok) return "client certificate: ${verification.error}"
-    if (verification.path.size == 0) return "client certificate: no path"
-    tlsVerifySignature(verification.path[0], scheme, content, signature)
-}
-
 /** A client verifier for TlsServerConfig that trusts `store`, with the time from `now` (called once per handshake). */
-fun tlsX509ClientVerifier(store: X509TrustStore, now: () -> int): (array<string>, int, string, string) -> string =
+fun tlsX509ClientVerifier(store: X509TrustStore, now: () -> int): (array<string>, int, string, string) -> TlsVerdict =
     { chain: array<string>, scheme: int, content: string, signature: string ->
         tlsVerifyClientCertificate(chain, scheme, content, signature, store, now())
+    }
+
+/** As tlsX509Verifier, with the trust store fetched when the server's certificate arrives (not when the connection
+ *  starts): a handshake that never gets that far, a peer that closes or stalls, does not pay for parsing the system's
+ *  certificate bundle. */
+fun tlsX509VerifierLazy(store: () -> X509TrustStore, now: () -> int): (array<string>, string, int, string, string) -> TlsVerdict =
+    { chain: array<string>, host: string, scheme: int, content: string, signature: string ->
+        tlsVerifyServerCertificate(chain, host, scheme, content, signature, store(), now())
     }
