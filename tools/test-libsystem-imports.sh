@@ -19,10 +19,14 @@ cd "$root"
 compiler=${1:-build/ablac}
 allow=tools/libsystem-imports-allowlist.txt
 [[ -f $allow ]] || { echo "libsystem imports: missing $allow" >&2; exit 1; }
-if ! sort -cu "$allow"; then
+if ! grep -v "^#" "$allow" | sort -cu; then
     echo "libsystem imports: $allow must be sorted and unique" >&2
     exit 1
 fi
+# Comment lines ("#") are documentation; the rest is compared.
+mkdir -p build
+grep -v "^#" "$allow" > build/libsystem-imports-allow.txt
+allow=build/libsystem-imports-allow.txt
 # The list was taken with ABLA_DEBUG=0, as the suite runs.
 export ABLA_DEBUG=0
 unset ABLA_TEST_FAST_BUILDS
