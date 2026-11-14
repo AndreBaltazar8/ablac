@@ -18,7 +18,7 @@ while pgrep -f "$pattern" > /dev/null && (( ${#pending[@]} > 0 )); do
         mark=${pending[0]}
         pending=("${pending[@]:1}")
         echo "SAMPLER: the build is still running after $SECONDS s (sample point $mark s)"
-        ps -axo pid,ppid,etime,%cpu,command | grep -E 'ablac|clang|llc|lld|/ld ' | grep -v grep || true
+        ps -axo pid,ppid,stat,etime,%cpu,command | grep -E 'ablac|clang|llc|lld|/ld |defunct| Z' | grep -v grep || true
         for pid in $(pgrep -f 'ablac|clang'); do
             [[ $pid == $$ ]] && continue
             sample "$pid" 5 -file "build/probe/sample-$mark-$pid.txt" > /dev/null 2>&1 || continue
