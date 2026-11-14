@@ -150,6 +150,9 @@ make_identity() { # name, signing CA
 } > "$out/tls-keys.log" 2>&1 || { fail "generating TLS keys"; sed 's/^/     /' "$out/tls-keys.log"; }
 
 start_server() { # extra s_server arguments
+    # Empty the log before the child starts: until it gets to run, the log holds the previous server's ACCEPT line and the loop below
+    # would take its (closed) port.
+    : > "$out/s_server.log"
     openssl s_server -accept 0 -cert "$tls/server.pem" -key "$tls/server.key" -CAfile "$tls/ca.pem" \
         -Verify 1 -verify_return_error -www "$@" > "$out/s_server.log" 2>&1 < /dev/null &
     server_pid=$!

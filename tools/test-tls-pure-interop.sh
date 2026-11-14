@@ -219,6 +219,10 @@ stop_serve() {
 }
 trap 'stop_serve; [[ -z $server_pid ]] || kill "$server_pid" 2> /dev/null || true' EXIT
 start_serve() {   # the serve.ab arguments; sets serve_port
+    # Empty the log HERE, before the child starts: a log that only the child's own redirection truncates still holds the previous
+    # server's "listening" line until that process gets to run, and on a loaded machine the grep below can run first, see it,
+    # and have the sed that reads the port find the log empty by then (the failure said "no port after 120 s" after 35 ms).
+    : > "$out/serve.log"
     "$out/serve" "$@" > "$out/serve.log" 2>&1 &
     serve_pid=$!
     # Up to 120 s by the clock (not by counting iterations: under load each iteration takes more than its sleep); one
