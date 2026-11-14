@@ -317,10 +317,8 @@ kept the event loop about 8% busy.
 #### TLS (`wss://` and `https://`)
 
 `abla/websocket/server/tls` serves the same server over TLS. It is a second
-import, beside `abla/websocket/server`, on purpose: the build links OpenSSL
-(`-lssl -lcrypto`) into a program exactly when its imports declare the OpenSSL
-functions, so keeping them out of `abla/websocket/server` means a plain server
-never depends on OpenSSL or loads it at startup. Load one certificate chain and its private key (for example an ACME client's
+import, beside `abla/websocket/server`, so that a plain server carries none of the TLS code. The TLS is
+`abla/tls/pure`'s (a `TlsServerSession` per connection): no OpenSSL, no libc. Load one certificate chain and its private key (for example an ACME client's
 `fullchain.pem` and `privkey.pem`) with `webSocketServerTls`, or from PEM text
 with `webSocketServerTlsPem`, and pass the result as
 `WebSocketServerOptions(tls = ...)`. Everything above works unchanged:
@@ -363,14 +361,8 @@ Connections negotiate TLS 1.2 or later with one certificate (no SNI). A
 configuration that failed to load has a non-empty `error`, and a server given
 it closes its listener (`localPort()` is -1) rather than serve plaintext.
 
-OpenSSL writes with `write(2)`, which raises `SIGPIPE` when the peer has reset
-the socket. A TLS server holds `SIGPIPE` around each OpenSSL call and releases
-it after, leaving the thread's mask as it was, so such a write fails with
-`EPIPE` and only that connection closes, whichever thread drives the server.
-On macOS, sockets carry `SO_NOSIGPIPE` already. A program that
-builds with `--emit object` and links the object itself must put
-`-lssl -lcrypto` on its link line for this module, as for any TLS module
-below; `ablac build` adds them on its own.
+The TLS session sends with `MSG_NOSIGNAL`, so a write to a peer that has reset the socket
+fails with `EPIPE` and only that connection closes, whichever thread drives the server.
 
 ### Nonblocking HTTP client
 
@@ -404,7 +396,7 @@ val replies = http.takeCompletions()
 `abla/jwt` verifies compact JWS tokens signed with RS256 or ES256 against a
 JSON Web Key Set. Keys are imported once from their JWK parameters; encoding,
 key selection by `kid`, and `exp`/`nbf`/`iss`/`aud`/`sub` checks are Abla, and
-only the signature primitive uses OpenSSL libcrypto. `abla/jwt/remote` fetches
+the signatures are `abla/crypto`'s RSA and P-256 (no OpenSSL, no libc). `abla/jwt/remote` fetches
 a JWKS over HTTPS, caches it for a day, and refetches at most once per
 cooldown when a token names an unknown key:
 
@@ -541,8 +533,7 @@ Client connections of both modules enable peer verification, system trust, SNI, 
 CA-file connector and certificate/private-key listener support local and private PKI deployments. `abla/http/tls` and
 `abla/websocket/tls` provide the HTTPS and WSS client transports, over `abla/tls/pure`.
 
-`abla/tls/hosted` dynamically loads OpenSSL 1.1 or 3 only when imported (the server modules that still use it, such
-as `abla/websocket/server/tls`, and a program that imports it directly). `ablac build` links OpenSSL for a program
+`abla/tls/hosted` dynamically loads OpenSSL 1.1 or 3 only when imported (a program that imports it directly, or the hosted platform modules). `ablac build` links OpenSSL for a program
 that imports it on its own; a program built with `--emit object` and linked by hand (for example with `gcc` for
 x86_64-linux) needs `-lssl -lcrypto` on the link line. Hosted secure random is supplied by `abla/random/hosted` on
 Linux and macOS.

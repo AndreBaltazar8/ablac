@@ -1,32 +1,29 @@
 // TLS for `abla/websocket/server`. Loads one certificate chain and private key
-// into an OpenSSL server context and hands the server the nonblocking OpenSSL
-// calls it drives from `step`:
+// into an abla/tls/pure server configuration and hands the server the
+// nonblocking TLS calls it drives from `step`:
 //
 //     val tls = webSocketServerTls("fullchain.pem", "privkey.pem")
 //     if (tls.error != "") println(tls.error)
 //     val server = webSocketServer(ipv4Any(443), WebSocketServerOptions(tls = tls))
 //
-// Only programs that import this module link OpenSSL. Connections negotiate
-// TLS 1.2 or later; a peer that closes TCP without close_notify reads as a
-// close. Create the configuration once: its context lives as long as the
-// program, and each server holds a reference of its own.
+// No OpenSSL and no libc: each connection is a TlsServerSession over the accepted
+// socket. Connections negotiate TLS 1.2 or later; a peer that closes TCP without
+// close_notify reads as a close. Create the configuration once: it lives as
+// long as the program, and each server holds a reference of its own.
 
 import "abla/websocket/server"
-import "abla/sys/linux/net"
-import "../../../tls/hosted/openssl.ab"
-import "../../../http/async/openssl-nonblocking.ab"
-import "../../../jwt/libcrypto.ab"
-import "abla/unsafe/memory"
-import "abla/unsafe/memory/raw"
+import "abla/tls/pure"
+import "abla/tls/pure/server"
+import "abla/sys/linux"
 
-trusted noescape extern:"c" fun SSL_has_pending(session: i64*): i32
-trusted noescape extern:"c" fun SSL_CTX_up_ref(context: i64*): i32
-trusted noescape extern:"c" fun SSL_CTX_set_options(
-    context: i64*, options: int
-): int
-trusted noescape extern:"c" fun PEM_read_bio_X509_AUX(
-    bio: i64*, existing: i64*, callback: i64*, data: i64*
-): i64*
+// The configurations, by the id the WebSocketServerTls carries as its `context`, with their reference counts; and the
+// sessions, by the descriptor they run over plus one (0 is "no session"). One event loop drives them.
+class WebSocketServerTlsEntry(val id: int, val config: TlsServerConfig, var references: int)
+
+val webSocketServerTlsConfigs: array<WebSocketServerTlsEntry> = []
+val webSocketServerTlsSessions: array<TlsServerSession> = []
+val webSocketServerTlsHandles: array<int> = []
+var webSocketServerTlsNextId = 1
 
 // Reads a certificate chain (leaf first) and its private key from PEM files,
 // such as an ACME client's fullchain.pem and privkey.pem.
@@ -34,8 +31,8 @@ fun webSocketServerTls(
     certificatePath: string,
     privateKeyPath: string,
     handshakeTimeoutMilliseconds: int = 5000
-): WebSocketServerTls = webSocketServerTlsConfigured(
-    certificatePath, privateKeyPath, false, handshakeTimeoutMilliseconds
+): WebSocketServerTls = webSocketServerTlsPem(
+    webSocketServerTlsFile(certificatePath), webSocketServerTlsFile(privateKeyPath), handshakeTimeoutMilliseconds
 )
 
 // Same, from PEM text already in memory.
@@ -43,21 +40,20 @@ fun webSocketServerTlsPem(
     certificatePem: string,
     privateKeyPem: string,
     handshakeTimeoutMilliseconds: int = 5000
-): WebSocketServerTls = webSocketServerTlsConfigured(
-    certificatePem, privateKeyPem, true, handshakeTimeoutMilliseconds
-)
-
-class WebSocketServerTlsLoad(var context: int, var error: string)
-
-trusted fun webSocketServerTlsConfigured(
-    certificate: string,
-    privateKey: string,
-    pem: bool,
-    handshakeTimeoutMilliseconds: int
 ): WebSocketServerTls {
-    val load = webSocketServerTlsLoad(certificate, privateKey, pem)
+    val config = tlsServerConfigFromPem(certificatePem, privateKeyPem)
+    var error = ""
+    var context = 0
+    if (config == null) {
+        error = if (tlsServerPemError(certificatePem, privateKeyPem) == "certificate") "TLS certificate failed to load"
+            else "TLS private key failed to load"
+    } else {
+        context = webSocketServerTlsNextId
+        webSocketServerTlsNextId = webSocketServerTlsNextId + 1
+        webSocketServerTlsConfigs.append(WebSocketServerTlsEntry(context, config, 1))
+    }
     WebSocketServerTls(
-        load.context, load.error, handshakeTimeoutMilliseconds,
+        context, error, handshakeTimeoutMilliseconds,
         webSocketServerTlsStart, webSocketServerTlsHandshake,
         webSocketServerTlsRead, webSocketServerTlsWrite,
         webSocketServerTlsPending, webSocketServerTlsFree,
@@ -65,194 +61,108 @@ trusted fun webSocketServerTlsConfigured(
     )
 }
 
-trusted fun webSocketServerTlsLoad(
-    certificate: string,
-    privateKey: string,
-    pem: bool
-): WebSocketServerTlsLoad {
-    var error = ""
-    var context = nativeNullPointer()
-    if (OpenSSL_version_num() <= 0) error = "TLS is unavailable"
-    if (error == "") {
-        ERR_clear_error()
-        context = SSL_CTX_new(TLS_server_method())
-        if (pointerIsNull(context)) error = "TLS context creation failed"
+private fun webSocketServerTlsFile(path: string): string = linuxReadFile(path, 1048576)
+
+private fun webSocketServerTlsConfigIndex(context: int): int {
+    var at = 0
+    while (at < webSocketServerTlsConfigs.size) {
+        if (webSocketServerTlsConfigs[at].id == context) return at
+        at = at + 1
     }
-    if (error == "") {
-        // SSL_CTX_set_min_proto_version(TLS1_2_VERSION)
-        SSL_CTX_ctrl(context, 123, 771, nativeNullPointer())
-        // SSL_OP_IGNORE_UNEXPECTED_EOF: a peer that drops TCP without
-        // close_notify reads as a close rather than a protocol error.
-        SSL_CTX_set_options(context, 128)
-        val loaded = if (pem) webSocketServerTlsUsePemCertificate(
-            context, certificate
-        ) else SSL_CTX_use_certificate_chain_file(context, certificate) == 1
-        if (!loaded) error = "TLS certificate failed to load"
-    }
-    if (error == "") {
-        val loaded = if (pem) webSocketServerTlsUsePemKey(context, privateKey)
-            else SSL_CTX_use_PrivateKey_file(context, privateKey, 1) == 1
-        if (!loaded) error = "TLS private key failed to load"
-    }
-    if (error == "" && SSL_CTX_check_private_key(context) != 1) {
-        error = "TLS private key does not match the certificate"
-    }
-    if (error != "" && !pointerIsNull(context)) {
-        SSL_CTX_free(context)
-        context = nativeNullPointer()
-    }
-    ERR_clear_error()
-    WebSocketServerTlsLoad(
-        if (pointerIsNull(context)) 0 else nativePointerAddress(context), error
-    )
+    -1
 }
 
-// The leaf certificate, then any intermediates in order.
-trusted fun webSocketServerTlsUsePemCertificate(
-    context: i64*,
-    text: string
-): bool {
-    val bio = BIO_new_mem_buf(
-        nativePointerFromAddress(nativeStringAddress(text)), text.size
-    )
-    if (pointerIsNull(bio)) return false
-    val leaf = PEM_read_bio_X509_AUX(
-        bio, nativeNullPointer(), nativeNullPointer(), nativeNullPointer()
-    )
-    var loaded = !pointerIsNull(leaf) && SSL_CTX_use_certificate(context, leaf) == 1
-    if (!pointerIsNull(leaf)) X509_free(leaf)
-    var reading = loaded
-    while (reading) {
-        val intermediate = PEM_read_bio_X509(
-            bio, nativeNullPointer(), nativeNullPointer(), nativeNullPointer()
-        )
-        if (pointerIsNull(intermediate)) reading = false
-        // SSL_CTX_add0_chain_cert takes ownership on success.
-        else if (SSL_CTX_ctrl(context, 89, 0, intermediate) != 1) {
-            X509_free(intermediate)
-            loaded = false
-            reading = false
-        }
+private fun webSocketServerTlsIndex(session: int): int {
+    var at = 0
+    while (at < webSocketServerTlsHandles.size) {
+        if (webSocketServerTlsHandles[at] == session) return at
+        at = at + 1
     }
-    BIO_free(bio)
-    loaded
+    -1
 }
 
-trusted fun webSocketServerTlsUsePemKey(context: i64*, text: string): bool {
-    val bio = BIO_new_mem_buf(
-        nativePointerFromAddress(nativeStringAddress(text)), text.size
-    )
-    if (pointerIsNull(bio)) return false
-    // With no callback, OpenSSL takes the last argument as the passphrase itself.
-    // Null would ask on the terminal: an encrypted key fails on the empty one.
-    val key = PEM_read_bio_PrivateKey(
-        bio, nativeNullPointer(), nativeNullPointer(),
-        nativePointerFromAddress(nativeCStringAddress(""))
-    )
-    val loaded = !pointerIsNull(key) && SSL_CTX_use_PrivateKey(context, key) == 1
-    if (!pointerIsNull(key)) EVP_PKEY_free(key)
-    BIO_free(bio)
-    loaded
-}
-
-fun webSocketServerTlsStatus(code: int, failure: int): int = when (code) {
+// 1 progress or done, 2 wants the socket readable, 3 writable: the TLS_IO statuses as the server's wait values.
+fun webSocketServerTlsStatus(status: int, failure: int): int = when (status) {
     2 -> webSocketServerTlsWantsRead
     3 -> webSocketServerTlsWantsWrite
     else -> failure
 }
 
-trusted fun webSocketServerTlsStart(context: int, descriptor: int): int {
-    ERR_clear_error()
-    val session = SSL_new(nativePointerFromAddress(context))
-    if (pointerIsNull(session)) return 0
-    if (SSL_set_fd(session, descriptor) != 1) {
-        SSL_free(session)
-        return 0
-    }
-    // SSL_CTRL_MODE: SSL_MODE_ENABLE_PARTIAL_WRITE |
-    // SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER | SSL_MODE_RELEASE_BUFFERS (idle
-    // connections hold no record buffers).
-    SSL_ctrl(session, 33, 19, "")
-    nativePointerAddress(session)
+fun webSocketServerTlsStart(context: int, descriptor: int): int {
+    val at = webSocketServerTlsConfigIndex(context)
+    if (at < 0 || descriptor < 0) return 0
+    val session = tlsServerSession(webSocketServerTlsConfigs[at].config, descriptor, true)
+    if (!session.ok()) return 0
+    val handle = descriptor + 1
+    webSocketServerTlsHandles.append(handle)
+    webSocketServerTlsSessions.append(session)
+    handle
 }
 
-trusted fun webSocketServerTlsHandshake(session: int): int {
-    ERR_clear_error()
-    val pointer = nativePointerFromAddress(session)
-    val held = linuxBrokenPipeHold()
-    val result: int = SSL_accept(pointer)
-    linuxBrokenPipeRelease(held)
-    if (result == 1) 1 else {
-        val code: int = SSL_get_error(pointer, i32(result))
-        webSocketServerTlsStatus(code, -5)
-    }
+fun webSocketServerTlsHandshake(session: int): int {
+    val at = webSocketServerTlsIndex(session)
+    if (at < 0) return -5
+    val status = webSocketServerTlsSessions[at].handshake()
+    if (status == 1) 1 else webSocketServerTlsStatus(status, -5)
 }
 
-trusted fun webSocketServerTlsRead(
-    session: int,
-    var result: WebSocketServerRead
-): void {
-    ERR_clear_error()
-    val stack = nativeStackAllocate(16384)
-    val pointer = nativePointerFromAddress(session)
-    val held = linuxBrokenPipeHold()
-    val measured: int = SSL_read(pointer, nativePointerFromAddress(stack), 16384)
-    linuxBrokenPipeRelease(held)
-    if (measured > 0) {
-        val target = nativeByteBuffer(measured + 1)
-        ablaUnsafeCopyMemory(nativePointerAddress(target.address), stack, measured)
-        result.text = target.adoptString(measured)
-        result.status = measured
+fun webSocketServerTlsRead(session: int, var result: WebSocketServerRead): void {
+    result.text = ""
+    val at = webSocketServerTlsIndex(session)
+    if (at < 0) {
+        result.status = -5
+        return
+    }
+    val read = webSocketServerTlsSessions[at].readReady(16384)
+    if (read.status == 1 && read.bytes.size > 0) {
+        result.text = read.bytes
+        result.status = read.bytes.size
     } else {
-        result.text = ""
-        val code: int = SSL_get_error(pointer, i32(measured))
-        // SSL_ERROR_ZERO_RETURN: the peer closed.
-        result.status = if (code == 6) 0 else webSocketServerTlsStatus(code, -5)
+        // 0 is the peer closing (cleanly, or by ending the TCP stream).
+        result.status = if (read.status == 0) 0 else webSocketServerTlsStatus(read.status, -5)
     }
     return
 }
 
-// Writes at most one record. A retry after a pending write passes the same
-// bytes at the same offset, at least as long, as OpenSSL requires.
-trusted fun webSocketServerTlsWrite(
-    session: int,
-    contents: string,
-    offset: int
-): int {
-    ERR_clear_error()
-    val pointer = nativePointerFromAddress(session)
-    var length = contents.size - offset
-    if (length > 16384) length = 16384
-    val held = linuxBrokenPipeHold()
-    val written: int = SSL_write(
-        pointer, contents.slice(offset, offset + length), length
-    )
-    linuxBrokenPipeRelease(held)
-    if (written > 0) written else {
-        val code: int = SSL_get_error(pointer, i32(written))
-        webSocketServerTlsStatus(code, -32)
-    }
+// Writes at most one record. A retry after a pending write passes the same bytes at the same offset.
+fun webSocketServerTlsWrite(session: int, contents: string, offset: int): int {
+    val at = webSocketServerTlsIndex(session)
+    if (at < 0) return -32
+    val sent = webSocketServerTlsSessions[at].writeReady(contents, offset)
+    if (sent.status == 1 && sent.written > 0) sent.written
+    else webSocketServerTlsStatus(sent.status, -32)
 }
 
-trusted fun webSocketServerTlsPending(session: int): bool =
-    SSL_has_pending(nativePointerFromAddress(session)) == 1
+fun webSocketServerTlsPending(session: int): bool {
+    val at = webSocketServerTlsIndex(session)
+    at >= 0 && webSocketServerTlsSessions[at].hasPending()
+}
 
-trusted fun webSocketServerTlsFree(session: int, notify: bool): void {
-    val pointer = nativePointerFromAddress(session)
-    if (notify) {
-        val held = linuxBrokenPipeHold()
-        SSL_shutdown(pointer)
-        linuxBrokenPipeRelease(held)
-    }
-    SSL_free(pointer)
-    ERR_clear_error()
+// With `notify` close_notify is offered once; the server closes the socket itself.
+fun webSocketServerTlsFree(session: int, notify: bool): void {
+    val at = webSocketServerTlsIndex(session)
+    if (at < 0) return
+    webSocketServerTlsHandles.takeAt(at)
+    var ended = webSocketServerTlsSessions.takeAt(at)
+    if (notify) ended.close() else ended.discard()
     return
 }
 
-trusted fun webSocketServerTlsRetain(context: int): bool =
-    SSL_CTX_up_ref(nativePointerFromAddress(context)) == 1
+fun webSocketServerTlsRetain(context: int): bool {
+    val at = webSocketServerTlsConfigIndex(context)
+    if (at < 0) return false
+    webSocketServerTlsConfigs[at].references = webSocketServerTlsConfigs[at].references + 1
+    true
+}
 
-trusted fun webSocketServerTlsRelease(context: int): void {
-    SSL_CTX_free(nativePointerFromAddress(context))
+// The last reference clears the private key.
+fun webSocketServerTlsRelease(context: int): void {
+    val at = webSocketServerTlsConfigIndex(context)
+    if (at < 0) return
+    webSocketServerTlsConfigs[at].references = webSocketServerTlsConfigs[at].references - 1
+    if (webSocketServerTlsConfigs[at].references <= 0) {
+        val entry = webSocketServerTlsConfigs.takeAt(at)
+        tlsServerConfigWipe(entry.config)
+    }
     return
 }

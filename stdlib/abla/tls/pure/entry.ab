@@ -745,3 +745,188 @@ fun TlsSession.close(): void {
     this.finished = true
     return
 }
+
+// ---- the server side of a session: a TLS server over a socket the caller accepted and polls ----
+// As TlsSession, for an event loop that accepts the sockets itself (abla/websocket/server/tls): the sans-IO server machine
+// over a descriptor made non-blocking by the caller, which stays the caller's. `handshake`, `readReady` and `writeReady`
+// return the TLS_IO statuses and never block.
+
+/** The identity of a PEM chain (leaf first) and a PEM private key (an encrypted PKCS#8 key opens with `passphrase`; ""
+ *  fails it, nothing is asked on a terminal) as a server configuration, or null (`tlsServerPemError` says which part). */
+fun tlsServerConfigFromPem(certificatePem: string, privateKeyPem: string, passphrase: string = ""): TlsServerConfig? {
+    val identity = tlsIdentityFromPem(certificatePem, privateKeyPem, passphrase)
+    if (!identity.ok()) return null
+    tlsServerConfig(identity, tlsPureRandom)
+}
+
+/** What is wrong with a certificate and key that `tlsServerConfigFromPem` refused: "certificate", "key" or "". */
+fun tlsServerPemError(certificatePem: string, privateKeyPem: string, passphrase: string = ""): string {
+    if (x509ParsePem(certificatePem).certificates.size == 0) return "certificate"
+    if (tlsIdentityFromPem(certificatePem, privateKeyPem, passphrase).ok()) "" else "key"
+}
+
+/** Clears a configuration's private key once no session or listener uses it any more. */
+fun tlsServerConfigWipe(config: TlsServerConfig): void {
+    config.identity.wipe()
+    return
+}
+
+class TlsServerSession(var server: TlsServer, var descriptor: int, var pending: string, var inflight: int, var received: string,
+    var failure: string, var finished: bool, var allowTruncation: bool)
+
+/** Starts a TLS server on `descriptor` (accepted and non-blocking): `handshake` reads the ClientHello. With
+ *  `allowTruncation` a peer that ends the TCP stream without close_notify reads as a clean end (status 0) instead of a failure. */
+fun tlsServerSession(config: TlsServerConfig, descriptor: int, allowTruncation: bool = false): TlsServerSession {
+    val session = TlsServerSession(tlsServerNew(config), descriptor, "", 0, "", "", false, allowTruncation)
+    if (descriptor < 0) {
+        session.failure = "TLS failed at configuration"
+        session.finished = true
+    }
+    session
+}
+
+fun TlsServerSession.ok(): bool = !this.finished && this.failure == ""
+
+fun TlsServerSession.descriptor(): int = this.descriptor
+
+/** The reason of the last failure ("" if none). */
+fun TlsServerSession.detail(): string = this.failure
+
+/** Whether decrypted application data is waiting: a read now returns it though the socket has nothing to read. */
+fun TlsServerSession.hasPending(): bool = this.received.size > 0
+
+private fun TlsServerSession.fail(reason: string): void {
+    if (this.failure == "") this.failure = reason
+    this.finished = true
+    return
+}
+
+private fun TlsServerSession.flush(): int {
+    this.pending = this.pending + this.server.takeOutput()
+    while (this.pending.size > 0) {
+        val sent = pureTlsSessionSend(this.descriptor, this.pending)
+        if (sent > 0) {
+            this.pending = this.pending.slice(sent, this.pending.size)
+        } else if (sent == -11) {
+            return 3
+        } else {
+            this.fail("TLS write failed")
+            return -1
+        }
+    }
+    1
+}
+
+private fun TlsServerSession.pull(): int {
+    val read = pureTlsSessionRecv(this.descriptor, 16384)
+    if (read.bytes.size > 0) {
+        this.server.feed(read.bytes)
+        return 1
+    }
+    if (read.code == -11) return 2
+    if (read.code == 1) return 0
+    this.fail("TLS read failed")
+    -1
+}
+
+/** Drives the handshake as far as the socket allows: 1 done, 2 wants the socket readable, 3 writable, -1 failed. */
+fun TlsServerSession.handshake(): int {
+    if (this.finished) return -1
+    var status = 0
+    while (status == 0) {
+        val sent = this.flush()
+        if (sent < 0) return -1
+        if (this.server.failed()) {
+            this.fail(this.server.error)
+            return -1
+        }
+        if (this.server.connected()) return if (sent == 3) 3 else 1
+        if (sent == 3) {
+            status = 3
+        } else {
+            val pulled = this.pull()
+            if (pulled == 2) status = 2
+            else if (pulled == 0) {
+                this.fail("TLS failed at handshake: the connection closed")
+                return -1
+            } else if (pulled < 0) return -1
+        }
+    }
+    status
+}
+
+/** As TlsSession.readReady. */
+fun TlsServerSession.readReady(maximum: int): TlsIo {
+    if (maximum <= 0 || this.finished) return TlsIo("", 0, -1)
+    while (true) {
+        if (this.received.size == 0) this.received = this.server.takeApplicationData()
+        if (this.received.size > 0) {
+            val count = if (this.received.size > maximum) maximum else this.received.size
+            val chunk = this.received.slice(0, count)
+            this.received = this.received.slice(count, this.received.size)
+            return TlsIo(chunk, 0, 1)
+        }
+        if (this.server.failed()) {
+            this.flush()
+            this.fail(this.server.error)
+            return TlsIo("", 0, -1)
+        }
+        if (this.server.closed()) {
+            this.flush()
+            return TlsIo("", 0, 0)
+        }
+        if (this.flush() < 0) return TlsIo("", 0, -1)
+        val pulled = this.pull()
+        if (pulled == 2) return TlsIo("", 0, 2)
+        if (pulled == 0) {
+            if (this.allowTruncation) return TlsIo("", 0, 0)
+            this.fail("TLS read failed: the connection closed without close_notify")
+            return TlsIo("", 0, -1)
+        }
+        if (pulled < 0) return TlsIo("", 0, -1)
+    }
+    TlsIo("", 0, -1)
+}
+
+/** As TlsSession.writeReady: at most 16 KiB of `bytes` from `offset` per call, a partial send kept for the next call. */
+fun TlsServerSession.writeReady(bytes: string, offset: int): TlsIo {
+    if (this.finished || offset < 0) return TlsIo("", 0, -1)
+    if (offset >= bytes.size && this.inflight == 0) return TlsIo("", 0, 1)
+    if (this.inflight == 0) {
+        val remaining = bytes.size - offset
+        val count = if (remaining > 16384) 16384 else remaining
+        if (!this.server.send(bytes.slice(offset, offset + count))) {
+            this.fail(if (this.server.error == "") "TLS write failed: the session is not open" else this.server.error)
+            return TlsIo("", 0, -1)
+        }
+        this.inflight = count
+    }
+    val sent = this.flush()
+    if (sent < 0) return TlsIo("", 0, -1)
+    if (sent == 3) return TlsIo("", 0, 3)
+    val count = this.inflight
+    this.inflight = 0
+    TlsIo("", count, 1)
+}
+
+/** Best effort and never blocking: close_notify is offered once and the connection is shut down in both directions. The
+ *  descriptor is not closed. */
+fun TlsServerSession.close(): void {
+    if (this.descriptor >= 0 && !this.finished) {
+        this.server.close()
+        this.flush()
+        linuxSyscall3(48, this.descriptor, 2, 0)
+    }
+    this.finished = true
+    return
+}
+
+/** Drops the session without a word to the peer: the keys are wiped, nothing is sent, the socket is left as it is. */
+fun TlsServerSession.discard(): void {
+    this.server.close()
+    this.server.takeOutput()
+    this.pending = ""
+    this.received = ""
+    this.finished = true
+    return
+}

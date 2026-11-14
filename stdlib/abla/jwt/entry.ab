@@ -2,8 +2,8 @@
 //
 // Supports RS256 (RSASSA-PKCS1-v1_5 with SHA-256) and ES256 (ECDSA P-256
 // with SHA-256). Keys are imported once from their JWK parameters (n/e or
-// crv/x/y) into OpenSSL public keys; parsing, key encoding, and claim checks
-// are Abla, and only the signature primitive is delegated to libcrypto.
+// crv/x/y) into public keys; parsing and claim checks
+// are Abla, and the signature primitives are abla/crypto's (no OpenSSL, no libc).
 //
 //     val keys = jwtKeySet(jwksJson)            // e.g. fetched by abla/jwt/remote
 //     val result = keys.verify(token, JwtOptions(issuer = "Example"))
@@ -14,13 +14,14 @@
 // tolerance, `iss`/`aud` must match when configured, and the token's `alg`
 // must match the selected key (the "none" algorithm is never accepted).
 
-import "libcrypto.ab"
 import "abla/crypto"
+import "abla/crypto/p256"
+import "abla/crypto/rsa"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
 import "abla/json"
 import "abla/net"
 import "abla/bytes"
-import "abla/unsafe/memory"
-import "abla/unsafe/memory/raw"
 import "abla/sys/linux"
 import "abla/text"
 
@@ -28,22 +29,14 @@ class JwtKey(
     val kid: string,
     val kty: string,
     val alg: string,
-    val handle: int
+    val usable: bool,
+    val modulus: string,
+    val exponent: string,
+    val point: string
 )
 
-// Owns the imported OpenSSL keys; they are freed when the set is dropped.
-resource class JwtKeySet(val keys: array<JwtKey>, val error: string) {
-    trusted fun drop(): void {
-        var index = 0
-        while (index < this.keys.size) {
-            if (this.keys[index].handle != 0) {
-                EVP_PKEY_free(nativePointerFromAddress(this.keys[index].handle))
-            }
-            index = index + 1
-        }
-        return
-    }
-}
+// The public keys of a JWKS document.
+class JwtKeySet(val keys: array<JwtKey>, val error: string)
 
 class JwtOptions(
     val issuer: string = "",
@@ -130,110 +123,16 @@ fun jwtBase64UrlEncode(bytes: string): string {
     output.toText()
 }
 
-private fun jwtDerLength(length: int): string {
-    val output = byteBuffer()
-    if (length < 128) output.appendByteValue(length)
-    else if (length < 256) {
-        output.appendByteValue(129)
-        output.appendByteValue(length)
-    } else {
-        output.appendByteValue(130)
-        output.appendByteValue((length >>> 8) & 255)
-        output.appendByteValue(length & 255)
-    }
-    output.toText()
-}
-
-private fun jwtDer(tag: int, contents: string): string =
-    "${byteEncode(tag)}${jwtDerLength(contents.size)}$contents"
-
-// Unsigned big-endian magnitude as a DER INTEGER.
-private fun jwtDerUnsignedInteger(magnitude: string): string {
-    var begin = 0
-    while (begin + 1 < magnitude.size && magnitude[begin] == 0) begin = begin + 1
-    var digits = magnitude.slice(begin, magnitude.size)
-    if (digits.size == 0) digits = byteEncode(0)
-    if (digits[0] >= 128) digits = "${byteEncode(0)}$digits"
-    jwtDer(2, digits)
-}
-
-// SubjectPublicKeyInfo for an RSA public key (rsaEncryption, NULL params).
-private fun jwtRsaSubjectPublicKeyInfo(modulus: string, exponent: string): string {
-    val algorithm = jwtDer(
-        48, "${jwtDer(6, "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01")}\x05\x00"
-    )
-    val key = jwtDer(
-        48,
-        "${jwtDerUnsignedInteger(modulus)}${jwtDerUnsignedInteger(exponent)}"
-    )
-    jwtDer(48, "$algorithm${jwtDer(3, "${byteEncode(0)}$key")}")
-}
-
-// SubjectPublicKeyInfo for an uncompressed P-256 point.
-private fun jwtEcSubjectPublicKeyInfo(x: string, y: string): string {
-    val algorithm = jwtDer(
-        48,
-        "${jwtDer(6, "\x2a\x86\x48\xce\x3d\x02\x01")}${jwtDer(6, "\x2a\x86\x48\xce\x3d\x03\x01\x07")}"
-    )
-    jwtDer(48, "$algorithm${jwtDer(3, "${byteEncode(0)}${byteEncode(4)}$x$y")}")
-}
-
-// JOSE ECDSA signatures are r || s; OpenSSL expects a DER Ecdsa-Sig-Value.
-private fun jwtEcdsaSignatureDer(raw: string): string {
-    val half = raw.size / 2
-    jwtDer(
-        48,
-        "${jwtDerUnsignedInteger(raw.slice(0, half))}${jwtDerUnsignedInteger(raw.slice(half, raw.size))}"
-    )
-}
-
-// ---------------------------------------------------------------------------
-// OpenSSL boundary
-
-trusted fun jwtImportPublicKey(der: string): int {
-    val cursor = nativeByteBuffer(8)
-    cursor.storeI64(0, nativeStringAddress(der))
-    val key = d2i_PUBKEY(nativeNullPointer(), cursor.address, der.size)
-    cursor.close()
-    if (pointerIsNull(key)) {
-        ERR_clear_error()
-        0
-    } else nativePointerAddress(key)
-}
-
-trusted fun jwtVerifySha256Signature(
-    handle: int,
-    message: string,
-    signature: string
-): bool {
-    if (handle == 0 || signature.size == 0) return false
-    val context = EVP_MD_CTX_new()
-    if (pointerIsNull(context)) return false
-    var verified = EVP_DigestVerifyInit(
-        context, nativeNullPointer(), EVP_sha256(), nativeNullPointer(),
-        nativePointerFromAddress(handle)
-    ) == i32(1)
-    if (verified) {
-        verified = EVP_DigestVerify(
-            context,
-            nativePointerFromAddress(nativeStringAddress(signature)),
-            signature.size,
-            nativePointerFromAddress(nativeStringAddress(message)),
-            message.size
-        ) == i32(1)
-    }
-    EVP_MD_CTX_free(context)
-    ERR_clear_error()
-    verified
-}
-
 // ---------------------------------------------------------------------------
 // Keys
 
 private fun jwtImportJwk(jwk: Json): JwtKey {
     val kty = jwk.getString("kty")
     var alg = jwk.getString("alg")
-    var handle = 0
+    var usable = false
+    var rsaModulus = ""
+    var rsaExponent = ""
+    var point = ""
     val use = jwk.getString("use")
     if (use == "" || use == "sig") {
         if (kty == "RSA" && (alg == "" || alg == "RS256")) {
@@ -241,9 +140,9 @@ private fun jwtImportJwk(jwk: Json): JwtKey {
             val exponent = jwtBase64UrlDecode(jwk.getString("e"))
             if (modulus.valid && exponent.valid && modulus.bytes.size >= 256 &&
                 exponent.bytes.size > 0) {
-                handle = jwtImportPublicKey(
-                    jwtRsaSubjectPublicKeyInfo(modulus.bytes, exponent.bytes)
-                )
+                rsaModulus = modulus.bytes
+                rsaExponent = exponent.bytes
+                usable = rsaPublicFromNumbers(rsaModulus, rsaExponent, "unreadable").ok()
             }
             if (alg == "") alg = "RS256"
         } else if (kty == "EC" && jwk.getString("crv") == "P-256" &&
@@ -251,14 +150,13 @@ private fun jwtImportJwk(jwk: Json): JwtKey {
             val x = jwtBase64UrlDecode(jwk.getString("x"))
             val y = jwtBase64UrlDecode(jwk.getString("y"))
             if (x.valid && y.valid && x.bytes.size == 32 && y.bytes.size == 32) {
-                handle = jwtImportPublicKey(
-                    jwtEcSubjectPublicKeyInfo(x.bytes, y.bytes)
-                )
+                point = "\x04${x.bytes}${y.bytes}"
+                usable = p256IsValidPublicKey(point)
             }
             if (alg == "") alg = "ES256"
         }
     }
-    JwtKey(jwk.getString("kid"), kty, alg, handle)
+    JwtKey(jwk.getString("kid"), kty, alg, usable, rsaModulus, rsaExponent, point)
 }
 
 // Parses a JWKS document. Keys with unsupported types or algorithms are
@@ -275,7 +173,7 @@ fun jwtKeySet(jwks: string): JwtKeySet {
         var index = 0
         while (index < entries.size()) {
             val key = jwtImportJwk(entries.at(index))
-            if (key.handle != 0) keys.append(key)
+            if (key.usable) keys.append(key)
             index = index + 1
         }
         if (keys.size == 0) error = "JWKS contains no usable keys"
@@ -383,16 +281,18 @@ fun JwtKeySet.verify(
         return jwtFailure("multiple matching keys", header, claims)
     }
     if (selected < 0) return jwtFailure("no matching key", header, claims)
-    var signatureBytes = signature.bytes
+    val message = token.slice(0, secondDot)
+    val key = this.keys[selected]
+    var verified = false
     if (alg == "ES256") {
-        if (signatureBytes.size != 64) {
+        if (signature.bytes.size != 64) {
             return jwtFailure("invalid signature", header, claims)
         }
-        signatureBytes = jwtEcdsaSignatureDer(signatureBytes)
+        verified = p256EcdsaVerifyRaw(key.point, message, signature.bytes)
+    } else if (signature.bytes.size > 0) {
+        verified = rsaPublicFromNumbers(key.modulus, key.exponent, "unreadable").verifyPkcs1Sha256(message, signature.bytes)
     }
-    if (!jwtVerifySha256Signature(
-        this.keys[selected].handle, token.slice(0, secondDot), signatureBytes
-    )) return jwtFailure("signature verification failed", header, claims)
+    if (!verified) return jwtFailure("signature verification failed", header, claims)
 
     val now = if (options.nowSeconds >= 0) options.nowSeconds else jwtNowSeconds()
     val tolerance = options.clockToleranceSeconds

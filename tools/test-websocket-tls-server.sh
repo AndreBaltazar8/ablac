@@ -5,7 +5,7 @@
 # times in partial writes, a PEM-text configuration (an encrypted key refused
 # without asking for its passphrase on the terminal), a client that never
 # handshakes (dropped at the handshake timeout while the others are served)
-# and a plaintext request at the TLS port. A plain server must not link OpenSSL.
+# and a plaintext request at the TLS port. No server links OpenSSL (libc-imports/websocket-server-tls.ab is checked static).
 set -euo pipefail
 compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
