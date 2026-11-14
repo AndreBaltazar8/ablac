@@ -360,6 +360,7 @@ test-serial: ablac
 	tools/test-aarch64-linux.sh $(COMPILER)
 	tools/test-memmove.sh $(COMPILER)
 	tools/test-fork-heap.sh $(COMPILER)
+	tools/test-emutls.sh $(COMPILER)
 	@if test "$$(uname -s)" = Darwin; then tools/test-macos-host.sh $(COMPILER); else echo "macOS host: skipped on $$(uname -s)"; fi
 	tools/test-portable-io.sh $(COMPILER)
 	tools/test-stable-native-symbols.sh $(COMPILER)

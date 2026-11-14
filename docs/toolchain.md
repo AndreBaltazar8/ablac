@@ -116,6 +116,19 @@ What stays in libSystem, and why:
 - the compiler itself: libLLVM, OpenSSL, `dlopen`/`dlsym` for compile-time native calls, and its
   threads.
 
+`ablac run` on macOS JIT-compiles the program with LLVM's emulated TLS (LLJIT has no MachOPlatform), so a thread-local of
+the program is a call of `___emutls_get_address`. The compiler defines that function itself (`abla/runtime/emutls`, exported
+from `src/emutls_export.ab`), on the Abla heap and atomics: compiler-rt's imports libSystem's `malloc`, `free`, `realloc`,
+pthread mutexes and keys, so the compiler imports none of them (#826). A control block gets its index from one process-wide
+counter by a compare-and-swap, and each thread has one table of its variables' addresses, grown by copying. What it does not
+do is free a thread's table and variables when the thread ends: that needs an exit hook (compiler-rt uses a pthread key's destructor), and a program built without the compiler has none to call. A thread that touches variables leaves
+8 * (1 + capacity) bytes (the capacity is the largest index it used, at least 8; indexes are process-wide and never reused)
+plus each variable's size and its alignment padding. Measured by `tests/cases/emutls` (500 threads one after another, ten
+variables, indexes 1 to 10): 654 bytes per thread; eighty variables: 7,796 bytes per thread. A JIT-compiled program that
+starts and joins a million threads touching ten variables would leave about 650 MB behind. The heap lock is made live before
+`ablac run` calls the program's `main` (`runtimeMemoryEnableSharing`), because a thread the runtime did not start allocates
+from the compiler's heap.
+
 The BSD system call numbers and structure layouts in the dispatcher are not checked on Linux: the macOS CI
 job runs `tools/test-darwin-syscalls.sh` (one line per call, the same program that runs on Linux with Linux's own
 numbers) before building stage 2, and that run is what judges each one.

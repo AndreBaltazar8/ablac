@@ -1,0 +1,87 @@
+// Emulated thread-local storage over the Abla runtime, with no libc and no pthread key (#826).
+//
+// LLVM lowers a thread-local of JIT-compiled code to a call of `__emutls_get_address(&control)` where the target has no
+// native TLS for the JIT (ORC without a MachOPlatform on macOS: `ablac run`). compiler-rt's version of that function
+// brings in libSystem's malloc, free, realloc, pthread mutexes and pthread keys; this one needs only the Abla heap and
+// atomics, and the compiler's own native thread-local (a Mach-O TLV, whose bootstrap the compiler already imports).
+//
+// The control block is the ABI's, four words:  +0 size, +8 alignment, +16 index (0 until the first use), +24 the initial
+// value (null: zeroes). A control gets its index (1, 2, ...) from one process-wide counter by a compare-and-swap, so
+// concurrent first uses agree on it. Each thread has one table: a word with its capacity, then one word per index with
+// the address of that thread's copy of the variable (0 before its first use). A table grows by being copied into a larger
+// one that only its own thread sees; a variable's storage is allocated from the Abla heap on first use and aligned as the
+// control asks.
+//
+// What it does not do: free anything when a thread ends. compiler-rt does that from a pthread key's destructor, and
+// there is no exit hook here that a program built without the compiler could call. A thread that touches V variables
+// leaves its table (8 * (1 + capacity) bytes, the capacity being the largest index it used, at least 8) and V copies
+// (size + alignment each) behind (docs/toolchain.md has the measured numbers).
+import "abla/runtime/scalar"
+import "abla/runtime/self"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+private trusted fun emutlsCounterAddress(): int = nativeStaticAllocate(8)
+
+// Internal thread-local bytes, like the runtime's own per-thread cells: an exported thread-local would keep ELF's `__tls_get_addr`
+// in the compiler's imports, where an internal one is relaxed to a direct access.
+private trusted fun emutlsTableCellAddress(): int = nativeThreadLocalBytes("\x00\x00\x00\x00\x00\x00\x00\x00")
+
+private trusted fun emutlsAllocate(size: int): int {
+    val address = ablaRuntimePointerAddress(ablaUnsafeAllocate(size))
+    if (address == 0) ablaRuntimeTrap()
+    address
+}
+
+// A zeroed table of `capacity` slots, with `old` (its capacity `oldCapacity`) copied in.
+private trusted fun emutlsGrow(old: int, oldCapacity: int, needed: int): int {
+    var capacity = if (oldCapacity < 8) 8 else oldCapacity * 2
+    if (capacity < needed) capacity = needed
+    val table = emutlsAllocate(8 * (1 + capacity))
+    ablaUnsafeSetMemory(nativePointerFromAddress(table), 0, 8 * (1 + capacity))
+    if (old != 0) ablaUnsafeCopyMemory(table + 8, old + 8, 8 * oldCapacity)
+    ablaRuntimeStoreI64(table, capacity)
+    if (old != 0) ablaUnsafeFree(nativePointerFromAddress(old))
+    table
+}
+
+private trusted fun emutlsMakeCopy(control: int): int {
+    val size = ablaRuntimeLoadI64(control)
+    var alignment = ablaRuntimeLoadI64(control + 8)
+    // The ABI's alignment is a power of two; anything else (or nothing) gets a word's.
+    if (alignment < 8 || (alignment & (alignment - 1)) != 0) alignment = 8
+    val length = if (size < 1) 1 else size
+    val base = emutlsAllocate(length + alignment)
+    val address = (base + alignment - 1) & (0 - alignment)
+    val initial = ablaRuntimeLoadI64(control + 24)
+    if (initial != 0 && size > 0) ablaUnsafeCopyMemory(address, initial, size)
+    else ablaUnsafeSetMemory(nativePointerFromAddress(address), 0, length)
+    address
+}
+
+// The address of the calling thread's copy of the variable `control` describes.
+trusted fun emutlsGetAddress(control: int): int {
+    var index = ablaRuntimeAtomicLoadI64(control + 16)
+    if (index == 0) {
+        val assigned = ablaRuntimeAtomicFetchAddI64(emutlsCounterAddress(), 1) + 1
+        val seen = ablaRuntimeAtomicCompareExchangeI64(control + 16, 0, assigned)
+        index = if (seen == 0) assigned else seen
+    }
+    val cell = emutlsTableCellAddress()
+    var table = ablaRuntimeLoadI64(cell)
+    val capacity = if (table == 0) 0 else ablaRuntimeLoadI64(table)
+    if (index > capacity) {
+        table = emutlsGrow(table, capacity, index)
+        ablaRuntimeStoreI64(cell, table)
+    }
+    val slot = table + 8 * index
+    var address = ablaRuntimeLoadI64(slot)
+    if (address == 0) {
+        address = emutlsMakeCopy(control)
+        ablaRuntimeStoreI64(slot, address)
+    }
+    address
+}
+
+// How many indexes have been handed out, process-wide (the counter itself).
+trusted fun emutlsIndexCount(): int = ablaRuntimeAtomicLoadI64(emutlsCounterAddress())

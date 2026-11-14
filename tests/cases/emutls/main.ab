@@ -1,0 +1,218 @@
+// abla/runtime/emutls (#826): the emulated thread-local storage that replaces compiler-rt's on macOS, driven through its
+// own interface with the control blocks LLVM would make. Alignment, the initial value (a template or zeroes), one
+// copy per thread, an address that stays put, racing first uses of one control from eight threads, and the memory a
+// thread leaves behind when it ends (printed, and bounded).
+import "abla/io"
+import "abla/memory"
+import "abla/runtime/emutls"
+import "abla/runtime/scalar"
+import "abla/runtime/self"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+val CONTROLS = 80
+
+trusted fun controlAt(base: int, index: int): int = base + 32 * index
+
+trusted fun templateAt(base: int, count: int, index: int): int = base + 32 * count + 256 * index
+
+trusted fun sizeOf(index: int): int = if (index % 9 == 0) 0 else (index * 7) % 130 + 1
+
+trusted fun alignOf(index: int): int {
+    val choices = [1, 8, 16, 32, 64]
+    choices[index % 5]
+}
+
+trusted fun hasTemplate(index: int): bool = index % 2 == 0
+
+// The control blocks of `count` variables and their templates, in one allocation (never freed: the test is short).
+trusted fun makeControls(count: int): int {
+    val total = 32 * count + 256 * count
+    val base = ablaRuntimePointerAddress(ablaUnsafeAllocate(total))
+    ablaUnsafeSetMemory(nativePointerFromAddress(base), 0, total)
+    var index = 0
+    while (index < count) {
+        val control = controlAt(base, index)
+        ablaRuntimeStoreI64(control, sizeOf(index))
+        ablaRuntimeStoreI64(control + 8, alignOf(index))
+        if (hasTemplate(index)) {
+            ablaRuntimeStoreI64(control + 24, templateAt(base, count, index))
+            var byte = 0
+            while (byte < 256) {
+                ablaRuntimeStoreU8(templateAt(base, count, index) + byte, (index + byte) & 255)
+                byte = byte + 1
+            }
+        }
+        index = index + 1
+    }
+    base
+}
+
+// Visits every variable twice as this thread: the first visit must find the initial value, the thread then fills the
+// variable with `tag`, and the second visit must find the same address with the fill intact. Returns 0, or the
+// failing step (index * 10 + code).
+trusted fun visit(base: int, count: int, tag: int): int {
+    val addresses: array<int> = []
+    var index = 0
+    while (index < count) {
+        val control = controlAt(base, index)
+        val size = sizeOf(index)
+        val address = emutlsGetAddress(control)
+        var alignment = alignOf(index)
+        if (alignment < 8) alignment = 8
+        if (address == 0 || address % alignment != 0) return index * 10 + 1
+        var byte = 0
+        while (byte < size) {
+            val expected = if (hasTemplate(index)) (index + byte) & 255 else 0
+            if (ablaRuntimeLoadU8(address + byte) != expected) return index * 10 + 2
+            ablaRuntimeStoreU8(address + byte, tag)
+            byte = byte + 1
+        }
+        addresses.append(address)
+        index = index + 1
+    }
+    index = 0
+    while (index < count) {
+        val address = emutlsGetAddress(controlAt(base, index))
+        if (address != addresses[index]) return index * 10 + 3
+        var byte = 0
+        while (byte < sizeOf(index)) {
+            if (ablaRuntimeLoadU8(address + byte) != tag) return index * 10 + 4
+            byte = byte + 1
+        }
+        // No two variables of a thread overlap.
+        var other = 0
+        while (other < index) {
+            val low = if (addresses[other] < address) addresses[other] else address
+            val lowSize = if (addresses[other] < address) sizeOf(other) else sizeOf(index)
+            val high = if (addresses[other] < address) address else addresses[other]
+            if (low + lowSize > high) return index * 10 + 5
+            other = other + 1
+        }
+        index = index + 1
+    }
+    0
+}
+
+// The threads read their controls from here: a thread closure captures no raw integers.
+trusted fun sharedCell(): int = nativeStaticAllocate(32)
+
+// Waits until `total` threads (the word at +24, 0 for none) have arrived (the counter at +16), so the first uses of the
+// racing phase start together.
+trusted fun arrive(): void {
+    val total = ablaRuntimeLoadI64(sharedCell() + 24)
+    if (total == 0) return
+    ablaRuntimeAtomicFetchAddI64(sharedCell() + 16, 1)
+    while (ablaRuntimeAtomicLoadI64(sharedCell() + 16) < total) {}
+}
+
+trusted fun worker(tag: int): int {
+    arrive()
+    visit(ablaRuntimeLoadI64(sharedCell()), ablaRuntimeLoadI64(sharedCell() + 8), tag)
+}
+
+trusted fun spawnAndMeasure(base: int, count: int, threads: int): int {
+    ablaRuntimeStoreI64(sharedCell(), base)
+    ablaRuntimeStoreI64(sharedCell() + 8, count)
+    memoryCollect()
+    val before = memoryLiveBytes()
+    var started = 0
+    while (started < threads) {
+        val handle = thread { worker(7) }
+        val status = await handle
+        if (status != 0) return 0 - status
+        started = started + 1
+    }
+    memoryCollect()
+    (memoryLiveBytes() - before) / threads
+}
+
+// One round of racing first uses: eight threads and this one start together on controls nobody has used. Returns the
+// number of failures.
+trusted fun race(): int {
+    val base = makeControls(CONTROLS)
+    ablaRuntimeStoreI64(sharedCell() + 16, 0)
+    ablaRuntimeStoreI64(sharedCell(), base)
+    ablaRuntimeStoreI64(sharedCell() + 8, CONTROLS)
+    ablaRuntimeStoreI64(sharedCell() + 24, 9)
+    val first = thread { worker(1) }
+    val second = thread { worker(2) }
+    val third = thread { worker(3) }
+    val fourth = thread { worker(4) }
+    val fifth = thread { worker(5) }
+    val sixth = thread { worker(6) }
+    val seventh = thread { worker(7) }
+    val eighth = thread { worker(8) }
+    var failures = 0
+    ablaRuntimeAtomicFetchAddI64(sharedCell() + 16, 1)
+    while (ablaRuntimeAtomicLoadI64(sharedCell() + 16) < 9) {}
+    val own = visit(base, CONTROLS, 99)
+    if (own != 0) {
+        println("main thread: step $own")
+        failures = failures + 1
+    }
+    ablaRuntimeStoreI64(sharedCell() + 24, 0)
+    val results = [await first, await second, await third, await fourth, await fifth, await sixth, await seventh, await eighth]
+    var number = 0
+    while (number < 8) {
+        if (results[number] != 0) {
+            println("thread ${number + 1}: step ${results[number]}")
+            failures = failures + 1
+        }
+        number = number + 1
+    }
+    // Every control got one index, and no two the same.
+    var index = 0
+    while (index < CONTROLS) {
+        val assigned = ablaRuntimeLoadI64(controlAt(base, index) + 16)
+        var other = 0
+        while (other < index) {
+            if (ablaRuntimeLoadI64(controlAt(base, other) + 16) == assigned) {
+                println("controls $other and $index share the index $assigned")
+                failures = failures + 1
+            }
+            other = other + 1
+        }
+        if (assigned < 1 || assigned > emutlsIndexCount()) {
+            println("control $index: index $assigned of ${emutlsIndexCount()}")
+            failures = failures + 1
+        }
+        index = index + 1
+    }
+    // The main thread's copy kept its own fill while the others wrote theirs.
+    index = 0
+    while (index < CONTROLS) {
+        val address = emutlsGetAddress(controlAt(base, index))
+        var byte = 0
+        while (byte < sizeOf(index)) {
+            if (ablaRuntimeLoadU8(address + byte) != 99) {
+                println("control $index: the main thread's copy was overwritten")
+                failures = failures + 1
+                byte = 1000
+            }
+            byte = byte + 1
+        }
+        index = index + 1
+    }
+    failures
+}
+
+trusted fun main: int {
+    var failures = 0
+    // What a thread leaves behind (no exit hook frees it): one thread after another, on fresh controls.
+    val small = makeControls(10)
+    val leakSmall = spawnAndMeasure(small, 10, 500)
+    val large = makeControls(CONTROLS)
+    val leakLarge = spawnAndMeasure(large, CONTROLS, 500)
+    println("emutls leak per thread: $leakSmall bytes for 10 variables, $leakLarge bytes for $CONTROLS")
+    if (leakSmall <= 0 || leakLarge <= leakSmall || leakLarge > 40000) {
+        println("the leak per thread is out of bounds")
+        failures = failures + 1
+    }
+    var round = 0
+    while (round < 40) {
+        failures = failures + race()
+        round = round + 1
+    }
+    if (failures == 0) 42 else 1
+}
