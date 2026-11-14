@@ -25,8 +25,9 @@ remove an entry when the last use in that file is gone. First port, in order:
 `test-text-blocks.sh`, `test-running-image-identity.sh`, then
 `test-formatter.py` (149 lines; preserve its golden, byte-level, mode,
 parser-field and negative controls). Then port HTTP and event fixtures in
-ascending size; use Abla for socket protocol peers. The differential fuzzer
-and constant-time checker remain until their later ports.
+ascending size; use Abla for socket protocol peers. The differential fuzzer is
+ported (tools/fuzz, #648) and its Python version removed; the constant-time checker
+remains until its later port.
 
 Left on the allow-list on purpose: `tests/cases/device-serial/session.py` (and
 `tools/test-device-serial.sh` with it) is a pty/termios oracle, independent of the
@@ -49,7 +50,6 @@ paths have the prefix `tools/test-` and suffix `.sh`.
 
 | Suite script | Blocks | Lines |
 |---|---:|---:|
-| `fuzz-differential` | 1 | 82 |
 | `http-close-delimited` | 1 | 65 |
 | `http-interim` | 1 | 63 |
 | `xtensa-companion-offline` | 8 | 63 |
