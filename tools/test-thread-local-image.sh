@@ -26,7 +26,7 @@ for program in "tests/cases/thread-local-image/main.ab" "tests/cases/modules/thr
         "$compiler" build "$project_root/$program" -o "$output_directory/$name-$mode" --no-cache "${flags[@]}" \
             > "$output_directory/$name-$mode.log" 2>&1 ||
             { echo "thread-local image: $program ($mode) did not build" >&2; cat "$output_directory/$name-$mode.log" >&2; exit 1; }
-        if readelf -lW "$output_directory/$name-$mode" | grep -q INTERP; then
+        if readelf -lW "$output_directory/$name-$mode" | grep INTERP > /dev/null; then
             echo "thread-local image: $program ($mode) linked libc; the libc-free start is what this tests" >&2; exit 1
         fi
         status=0
