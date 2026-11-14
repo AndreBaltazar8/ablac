@@ -36,10 +36,13 @@ start_server() {
     shift
     local attempt
     for attempt in 1 2 3 4 5 6 7 8; do
-        port=$(( 20000 + RANDOM % 20000 ))
+        # The kernel picks the port (0) and s_server reports it on its ACCEPT line: no random number in the ephemeral range
+        # (32768 and up) that a parallel suite's outgoing connection may hold, and nobody else can be on it. It binds [::1], the
+        # address every client of this script connects to (the name "localhost" is ::1 here), so no family is left to chance.
         # (A test hook: TLS_PURE_FIRST_PORT forces the first attempt of each start onto a port, to exercise the retry.)
-        [[ $attempt -eq 1 && -n ${TLS_PURE_FIRST_PORT:-} ]] && port=$TLS_PURE_FIRST_PORT
-        (cd "${server_directory:-.}" && exec openssl s_server -accept "$port" -cert "$root/$out/$kind.pem" -key "$root/$out/$kind.key" ${tls_flag:--tls1_3} "$@") > "$out/server.log" 2>&1 &
+        local bind="[::1]:0"
+        [[ $attempt -eq 1 && -n ${TLS_PURE_FIRST_PORT:-} ]] && bind="[::1]:$TLS_PURE_FIRST_PORT"
+        (cd "${server_directory:-.}" && exec openssl s_server -accept "$bind" -cert "$root/$out/$kind.pem" -key "$root/$out/$kind.key" ${tls_flag:--tls1_3} "$@") > "$out/server.log" 2>&1 &
         server_pid=$!
         local started=0
         for _ in $(seq 300); do
@@ -47,14 +50,23 @@ start_server() {
             kill -0 "$server_pid" 2> /dev/null || break
             sleep 0.1
         done
-        [[ $started -eq 1 ]] && return 0
+        if [[ $started -eq 1 ]]; then
+            port=$(sed -n 's/^ACCEPT .*:\([0-9][0-9]*\)$/\1/p' "$out/server.log" | head -1)
+            [[ -n $port ]] && return 0
+        fi
         kill "$server_pid" 2> /dev/null || true
         wait "$server_pid" 2> /dev/null || true
         server_pid=
         grep -q 'Address already in use' "$out/server.log" || break
     done
-    echo "tls-pure interop: s_server did not start on port $port after $attempt attempt(s): $(head -3 "$out/server.log")" >&2
+    echo "tls-pure interop: s_server did not start (bind $bind) after $attempt attempt(s): $(head -3 "$out/server.log")" >&2
     exit 1
+}
+show_port() {   # what the kernel knows about $port, for a failure that says tcp_connect while s_server logged ACCEPT
+    command -v ss > /dev/null || return 0
+    echo "tls-pure interop: sockets on port $port (ss -tanp), s_server pid ${server_pid:-none}:" >&2
+    ss -tanp "( sport = :$port or dport = :$port )" 2>&1 | head -12 >&2
+    echo "s_server log: $(head -3 "$out/server.log" 2> /dev/null)" >&2
 }
 stop_server() {
     kill "$server_pid" 2> /dev/null || true
@@ -67,8 +79,8 @@ for kind in ed25519 p256 p384 rsa; do
         for group in X25519 P-256; do
             start_server "$kind" -www -ciphersuites "${suite%:*}" -groups "$group"
             result=$("$root/tools/run-limited.sh" "$out/interop" "$port" "$out/$kind.pem" "${suite#*:}" "$out/$([[ $kind == p256 ]] && echo rsa || echo p256).pem") || {
-                echo "tls-pure interop ($kind ${suite%:*} $group): $result" >&2; head -5 "$out/server.log" >&2; exit 1; }
-            [[ $result == 'tls-pure interop ok'* ]] || { echo "tls-pure interop ($kind ${suite%:*} $group): $result" >&2; exit 1; }
+                echo "tls-pure interop ($kind ${suite%:*} $group): $result" >&2; head -5 "$out/server.log" >&2; show_port; exit 1; }
+            [[ $result == 'tls-pure interop ok'* ]] || { echo "tls-pure interop ($kind ${suite%:*} $group): $result" >&2; show_port; exit 1; }
             # The alert each refusal sent (RFC 8446 section 6.2): wrong host name, expired and untrusted certificates.
             # s_server logs a connection's alert when it gets to it, after the client program has exited (the expired case
             # is the client's last connection): wait for each line, up to 20 s, rather than look once.
@@ -110,16 +122,16 @@ for kind in rsa p256 ed25519; do
         for group in X25519 P-256; do
             tls_flag=-tls1_2 start_server "$kind" -www -cipher "${suite%:*}" -groups "$group"
             result=$("$root/tools/run-limited.sh" "$out/interop" "$port" "$out/$kind.pem" "${suite#*:}" "$out/$([[ $kind == p256 ]] && echo rsa || echo p256).pem") || {
-                echo "tls-pure TLS 1.2 ($kind ${suite%:*} $group): $result" >&2; head -5 "$out/server.log" >&2; exit 1; }
-            [[ $result == 'tls-pure interop ok'* ]] || { echo "tls-pure TLS 1.2 ($kind ${suite%:*} $group): $result" >&2; exit 1; }
+                echo "tls-pure TLS 1.2 ($kind ${suite%:*} $group): $result" >&2; head -5 "$out/server.log" >&2; show_port; exit 1; }
+            [[ $result == 'tls-pure interop ok'* ]] || { echo "tls-pure TLS 1.2 ($kind ${suite%:*} $group): $result" >&2; show_port; exit 1; }
             stop_server
             runs12=$((runs12 + 1))
         done
     done
 done
 tls_flag=-tls1_2 start_server rsa -www -cipher ECDHE-RSA-AES128-GCM-SHA256 -groups X25519
-result=$("$root/tools/run-limited.sh" "$out/interop" "$port" "$out/rsa.pem" 49199 "$out/p256.pem" pkcs1) || { echo "tls-pure TLS 1.2 (RSA PKCS#1): $result" >&2; head -5 "$out/server.log" >&2; exit 1; }
-[[ $result == 'tls-pure interop ok'* ]] || { echo "tls-pure TLS 1.2 (RSA PKCS#1): $result" >&2; exit 1; }
+result=$("$root/tools/run-limited.sh" "$out/interop" "$port" "$out/rsa.pem" 49199 "$out/p256.pem" pkcs1) || { echo "tls-pure TLS 1.2 (RSA PKCS#1): $result" >&2; head -5 "$out/server.log" >&2; show_port; exit 1; }
+[[ $result == 'tls-pure interop ok'* ]] || { echo "tls-pure TLS 1.2 (RSA PKCS#1): $result" >&2; show_port; exit 1; }
 stop_server
 runs12=$((runs12 + 1))
 echo "TLS 1.2: $runs12 handshakes (3 certificate types x 3 suites x 2 groups, and RSA with PKCS#1 v1.5)"

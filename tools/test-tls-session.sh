@@ -26,8 +26,8 @@ start_server() {   # certificate name, then s_server options; sets port
     local name=$1 attempt
     shift
     for attempt in 1 2 3 4 5 6 7 8; do
-        port=$(( 20000 + RANDOM % 20000 ))
-        openssl s_server -accept "$port" -cert "$out/$name.pem" -key "$out/$name.key" "$@" > "$out/server.log" 2>&1 &
+        # The kernel picks the port (0, dual-stack: the IPv4 and IPv6 checks both connect to it) and s_server reports it.
+        openssl s_server -accept 0 -cert "$out/$name.pem" -key "$out/$name.key" "$@" > "$out/server.log" 2>&1 &
         server_pid=$!
         local started=0
         for _ in $(seq 300); do
@@ -35,7 +35,10 @@ start_server() {   # certificate name, then s_server options; sets port
             kill -0 "$server_pid" 2> /dev/null || break
             sleep 0.1
         done
-        [[ $started -eq 1 ]] && return 0
+        if [[ $started -eq 1 ]]; then
+            port=$(sed -n 's/^ACCEPT .*:\([0-9][0-9]*\)$/\1/p' "$out/server.log" | head -1)
+            [[ -n $port ]] && return 0
+        fi
         kill "$server_pid" 2> /dev/null || true
         wait "$server_pid" 2> /dev/null || true
         server_pid=
