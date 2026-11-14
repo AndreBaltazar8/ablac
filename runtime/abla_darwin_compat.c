@@ -1343,6 +1343,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     break;
   }
 #endif
+#if !ABLA_DARWIN_SYSCALLS
   case 293: {
     int *descriptors = (int *)(uintptr_t)argument0;
     result = pipe(descriptors);
@@ -1352,6 +1353,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     }
     break;
   }
+#endif
 #if !ABLA_DARWIN_SYSCALLS
   case 278:
   case 318:
