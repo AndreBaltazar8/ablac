@@ -1,0 +1,135 @@
+// Signatures that must be refused: the edge cases of a verifier that are not in the vector files' ordinary cases.
+// ECDSA P-256 with r or s of 0, n, n + 1 or above (and a non-minimal or negative DER integer), Ed25519 with S + L (the same
+// signature, malleated) and a trailing byte, RSA PKCS#1 v1.5 with the paddings a lax parser accepts (Bleichenbacher's e = 3
+// forgery needs a verifier that does not rebuild the whole block: ours does): fewer than eight 0xff bytes, no 0x00 after
+// them, a digest followed by garbage, a DigestInfo without its NULL parameters. Argument 0 is the directory of
+// tests/vectors/crypto/test-keys. Prints "crypto-pure signatures ok".
+import "abla/crypto"
+import "abla/crypto/ed25519"
+import "abla/crypto/p256"
+import "abla/crypto/rsa"
+import "abla/fs"
+import "abla/io"
+import "abla/process/arguments"
+
+var failures = 0
+
+fun fail(what: string): void {
+    failures = failures + 1
+    println("FAIL $what")
+    return
+}
+
+fun expect(ok: bool, what: string): void {
+    if (!ok) fail(what)
+    return
+}
+
+val P256_N = "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"
+
+/** The big-endian number `value` (32 bytes) plus `add` (a small number), as 32 bytes. */
+fun plusSmall(value: string, add: int): string {
+    val bytes: array<int> = []
+    for (i in 0 until value.size) bytes.append(int(value[i]))
+    var carry = add
+    var at = bytes.size - 1
+    while (at >= 0 && carry > 0) {
+        val sum = bytes[at] + carry
+        bytes[at] = sum & 255
+        carry = sum >> 8
+        at = at - 1
+    }
+    cryptoByteString(bytes)
+}
+
+fun ecdsa(): void {
+    val key = "\x7f\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f"
+    val publicKey = p256PublicKey(key).bytes
+    val message = "the message"
+    val signed = p256EcdsaSignRaw(key, message)
+    expect(signed.ok && signed.bytes.size == 64, "signing")
+    expect(p256EcdsaVerifyRaw(publicKey, message, signed.bytes), "a good signature verifies")
+    val r = signed.bytes.slice(0, 32)
+    val s = signed.bytes.slice(32, 64)
+    val n = hexDecode(P256_N)
+    val zero = "\x00".repeat(32)
+    for (bad in [zero + s, r + zero, n + s, r + n, plusSmall(n, 1) + s, r + plusSmall(n, 1), "\xff".repeat(32) + s,
+                 r + "\xff".repeat(32), zero + zero, r, r + s + "\x00"]) {
+        expect(!p256EcdsaVerifyRaw(publicKey, message, bad), "a malformed ECDSA signature verified: ${hexEncode(bad).slice(0, 16)}...")
+    }
+    // The same through DER: r = 0 and s = n as DER integers, and a non-minimal integer (a leading zero before a byte below 0x80).
+    val der = p256SignatureToDer(signed.bytes)
+    expect(p256SignatureFromDer(der) == signed.bytes, "DER round trip")
+    expect(p256SignatureFromDer("\x30\x06\x02\x01\x00\x02\x01\x01") == "" || !p256EcdsaVerifyRaw(publicKey, message,
+        p256SignatureFromDer("\x30\x06\x02\x01\x00\x02\x01\x01")), "DER r = 0")
+    expect(p256SignatureFromDer("\x30\x07\x02\x02\x00\x01\x02\x01\x01") == "", "a non-minimal DER integer")
+    expect(p256SignatureFromDer("\x30\x06\x02\x01\xff\x02\x01\x01") == "", "a negative DER integer")
+    return
+}
+
+fun ed25519(): void {
+    val seed = "\x7f\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f"
+    val publicKey = ed25519PublicKey(seed).bytes
+    val message = "the message"
+    val signed = ed25519Sign(seed, message)
+    expect(signed.ok && signed.bytes.size == 64, "ed25519 signing")
+    expect(ed25519Verify(publicKey, message, signed.bytes), "a good Ed25519 signature verifies")
+    // S + L is the same point equation (L is the group order): the malleated signature must be refused (RFC 8032 section 5.1.7).
+    // L = 2^252 + 27742317777372353535851937790883648493, little-endian.
+    val order = hexDecode("edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010")
+    val s = signed.bytes.slice(32, 64)
+    val sum: array<int> = []
+    var carry = 0
+    for (i in 0 until 32) {
+        val total = int(s[i]) + int(order[i]) + carry
+        sum.append(total & 255)
+        carry = total >> 8
+    }
+    expect(carry == 0, "S + L fits 256 bits")
+    val malleated = signed.bytes.slice(0, 32) + cryptoByteString(sum)
+    expect(!ed25519Verify(publicKey, message, malleated), "Ed25519 accepted S + L")
+    expect(!ed25519Verify(publicKey, message, signed.bytes + "\x00"), "Ed25519 accepted a trailing byte")
+    expect(!ed25519Verify(publicKey, message, signed.bytes.slice(0, 63)), "Ed25519 accepted a short signature")
+    return
+}
+
+fun rsa(directory: string): void {
+    val key = rsaPrivateKeyFromPem(Path(directory + "/tls-server.pem").readText())
+    expect(key.ok(), "the 2048-bit test key: ${key.error}")
+    if (!key.ok()) return
+    val publicKey = rsaPublicFromNumbers(key.modulus, key.publicExponent, "unreadable")
+    val message = "the message"
+    val digest = sha256(message)
+    val digestInfo = "\x30\x31\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x01\x05\x00\x04\x20"
+    val size = key.modulus.size
+    val good = key.signPkcs1Sha256(message)
+    expect(good.ok && publicKey.verifyPkcs1Sha256(message, good.bytes), "a good PKCS#1 signature verifies")
+    // Each block below is a valid-looking encoding that a lax verifier takes; the private key signs it as it is.
+    val blocks: array<string> = [
+        "\x00\x01" + "\xff".repeat(7) + "\x00" + digestInfo + digest + "\x00".repeat(size - 2 - 7 - 1 - digestInfo.size - digest.size),
+        "\x00\x01" + "\xff".repeat(size - 3 - digestInfo.size - digest.size) + "\x01" + digestInfo + digest,
+        "\x00\x01" + "\xff".repeat(size - 3 - digestInfo.size - digest.size - 8) + "\x00" + digestInfo + digest + "garbage!",
+        "\x00\x01" + "\xff".repeat(size - 3 - 17 - digest.size) + "\x00" + "\x30\x2f\x30\x0b\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x01\x04\x20".slice(0, 17) + digest,
+        "\x00\x02" + "\xff".repeat(size - 3 - digestInfo.size - digest.size) + "\x00" + digestInfo + digest,
+        "\x01\x01" + "\xff".repeat(size - 3 - digestInfo.size - digest.size) + "\x00" + digestInfo + digest]
+    var index = 0
+    for (block in blocks) {
+        if (block.size != size) {
+            fail("test block $index has ${block.size} bytes, not $size")
+        } else {
+            val forged = rsaPrivateOperation(key, block)
+            expect(forged.ok && !publicKey.verifyPkcs1Sha256(message, forged.bytes), "a malformed padding block $index verified")
+        }
+        index = index + 1
+    }
+    return
+}
+
+fun main: int {
+    ecdsa()
+    ed25519()
+    rsa(processArgument(0))
+    if (failures > 0) return 1
+    println("crypto-pure signatures ok")
+    0
+}
