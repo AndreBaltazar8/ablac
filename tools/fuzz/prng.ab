@@ -1,0 +1,114 @@
+// The fuzzer's random stream: xoshiro256** (Blackman and Vigna), its state seeded through SplitMix64 from one
+// integer, the reference way. Every operation is 64-bit wrapping arithmetic on `int` with `>>>` as the logical shift.
+// The stream is our own: an Abla seed does not reproduce a Python fuzz-differential seed (Python's Mersenne
+// Twister), so a finding is reproduced by its Abla seed or by the program the run kept.
+import "abla/float"
+
+// The state is an array so a borrowed generator (a field of a borrowed FuzzGen) can advance it.
+class Prng(val s: array<int>)
+
+class SplitMix(val state: array<int>)
+
+fun SplitMix.next(): int {
+    this.state[0] = this.state[0] + -7046029254386353131 // 0x9E3779B97F4A7C15
+    var z = this.state[0]
+    z = (z ^ (z >>> 30)) * -4658895280553007687 // 0xBF58476D1CE4E5B9
+    z = (z ^ (z >>> 27)) * -7723592293110705685 // 0x94D049BB133111EB
+    z ^ (z >>> 31)
+}
+
+fun prngRotateLeft(value: int, count: int): int = (value << count) | (value >>> (64 - count))
+
+fun prngSeeded(seed: int): Prng {
+    val mix = SplitMix([seed])
+    Prng([mix.next(), mix.next(), mix.next(), mix.next()])
+}
+
+/** The next 64 random bits. */
+fun Prng.next(): int {
+    val result = prngRotateLeft(this.s[1] * 5, 7) * 9
+    val t = this.s[1] << 17
+    this.s[2] = this.s[2] ^ this.s[0]
+    this.s[3] = this.s[3] ^ this.s[1]
+    this.s[1] = this.s[1] ^ this.s[2]
+    this.s[0] = this.s[0] ^ this.s[3]
+    this.s[2] = this.s[2] ^ t
+    this.s[3] = prngRotateLeft(this.s[3], 45)
+    result
+}
+
+/** Uniform in 0 until n (n > 0), without modulo bias: 62-bit draws past the last whole multiple of n are redrawn. */
+fun Prng.below(n: int): int {
+    if (n <= 1) return 0
+    val span = 4611686018427387904 // 2^62
+    val limit = span - span % n
+    var draw = this.next() >>> 2
+    while (draw >= limit) draw = this.next() >>> 2
+    draw % n
+}
+
+/** Uniform in low..high, both included. */
+fun Prng.range(low: int, high: int): int = low + this.below(high - low + 1)
+
+/** Uniform in [0, 1): the top 53 bits. */
+fun Prng.unit(): f64 = f64FromInt(this.next() >>> 11) / 9007199254740992.0
+
+fun Prng.chance(probability: f64): bool = this.unit() < probability
+
+/** The top `count` bits (1..63) as a non-negative integer. */
+fun Prng.bits(count: int): int = this.next() >>> (64 - count)
+
+fun Prng.pick(values: array<string>): string = values[this.below(values.size)]
+
+fun Prng.pickInt(values: array<int>): int = values[this.below(values.size)]
+
+/** `count` distinct values of low..high in increasing order (Python's sorted(r.sample(range(low, high + 1), count))). */
+fun Prng.sample(low: int, high: int, count: int): array<int> {
+    val pool: array<int> = []
+    var value = low
+    while (value <= high) {
+        pool.append(value)
+        value = value + 1
+    }
+    // A partial Fisher-Yates shuffle, then the chosen prefix in order.
+    var index = 0
+    while (index < count) {
+        val other = index + this.below(pool.size - index)
+        val kept = pool[index]
+        pool[index] = pool[other]
+        pool[other] = kept
+        index = index + 1
+    }
+    val chosen: array<int> = []
+    for (candidate in low until high + 1) {
+        var taken = false
+        var at = 0
+        while (at < count) {
+            if (pool[at] == candidate) taken = true
+            at = at + 1
+        }
+        if (taken) chosen.append(candidate)
+    }
+    chosen
+}
+
+/** The reference vectors: SplitMix64 from 0 and xoshiro256** from the state 1, 2, 3, 4. "" when they match. */
+fun prngSelftest(): string {
+    val mix = SplitMix([0])
+    val mixed = [mix.next(), mix.next(), mix.next()]
+    if (mixed[0] != -2152535657050944081 || mixed[1] != 7960286522194355700 || mixed[2] != 487617019471545679) {
+        return "SplitMix64 from 0 gave ${mixed[0]} ${mixed[1]} ${mixed[2]}"
+    }
+    val stream = Prng([1, 2, 3, 4])
+    val expected = [11520, 0, 1509978240, 1215971899390074240, 1216172134540287360]
+    for (want in expected) {
+        val got = stream.next()
+        if (got != want) return "xoshiro256** from 1, 2, 3, 4 gave $got, expected $want"
+    }
+    val bounded = prngSeeded(7)
+    for (n in 1 until 201) {
+        val value = bounded.below(n)
+        if (value < 0 || value >= n) return "below($n) gave $value"
+    }
+    ""
+}

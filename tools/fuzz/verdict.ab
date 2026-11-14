@@ -1,0 +1,146 @@
+// Comparing the modes' results, as tools/fuzz-differential's verdict and differing_lines do.
+import "abla/text"
+import "./modes.ab"
+
+/** A check's own oracle failed: FUZZ_ORACLE_FAILURE, alone or followed by `:` and what it saw. */
+fun fuzzOracleFailed(text: string): bool = text == "FUZZ_ORACLE_FAILURE" || text.startsWith("FUZZ_ORACLE_FAILURE:")
+
+/** The text after a line's first `=` ("" when it has none). */
+fun fuzzLineValue(line: string): string {
+    val at = line.indexOf("=")
+    if (at < 0) "" else line.slice(at + 1, line.size)
+}
+
+fun fuzzLineKey(line: string): string {
+    val at = line.indexOf("=")
+    if (at < 0) line else line.slice(0, at)
+}
+
+/** "" when every mode agrees, else a short description. */
+fun fuzzVerdict(results: array<FuzzResult>, allowNonzero: bool = false): string {
+    for (result in results) {
+        if (result.built && result.status != 0 && !allowNonzero) {
+            return "${result.mode}: exited with status ${result.status}"
+        }
+        if (result.built) {
+            for (line in result.output.split("\n")) {
+                if (fuzzOracleFailed(fuzzLineValue(line))) return "${result.mode}: result oracle failed"
+            }
+        }
+    }
+    val keys: array<string> = []
+    val groups: array<string> = []
+    val shown: array<string> = []
+    for (result in results) {
+        val key = result.key()
+        var found = -1
+        var index = 0
+        while (index < keys.size) {
+            if (keys[index] == key) found = index
+            index = index + 1
+        }
+        if (found < 0) {
+            keys.append(key)
+            groups.append(result.mode)
+            shown.append(result.describe())
+        } else {
+            groups[found] = groups[found] + "+" + result.mode
+        }
+    }
+    if (keys.size == 1) {
+        val first = results[0]
+        if (!first.built) {
+            val errors: array<string> = []
+            for (line in first.errors) {
+                if (errors.size < 3) errors.append(line)
+            }
+            return "all modes failed to build: " + textJoin(errors, " | ")
+        }
+        return ""
+    }
+    val parts: array<string> = []
+    var index = 0
+    while (index < keys.size) {
+        parts.append("${groups[index]} -> ${shown[index]}")
+        index = index + 1
+    }
+    textJoin(parts, "; ")
+}
+
+/** The check ids whose printed line differs between modes, or whose oracle failed, sorted. */
+fun fuzzDifferingLines(results: array<FuzzResult>): array<string> {
+    // For each check id, the distinct texts the modes printed for it.
+    val ids: array<string> = []
+    val texts: array<string> = [] // id index -> "\x00"-joined distinct texts
+    val counts: array<int> = []
+    val failed: array<bool> = []
+    for (result in results) {
+        if (result.built) {
+            for (line in result.output.split("\n")) {
+                if (line != "") {
+                    val key = fuzzLineKey(line)
+                    val value = fuzzLineValue(line)
+                    var found = -1
+                    var index = 0
+                    while (index < ids.size) {
+                        if (ids[index] == key) found = index
+                        index = index + 1
+                    }
+                    if (found < 0) {
+                        ids.append(key)
+                        texts.append("\x00$value\x00")
+                        counts.append(1)
+                        failed.append(fuzzOracleFailed(value))
+                    } else if (!texts[found].contains("\x00$value\x00")) {
+                        texts[found] = texts[found] + "$value\x00"
+                        counts[found] = counts[found] + 1
+                        if (fuzzOracleFailed(value)) failed[found] = true
+                    }
+                }
+            }
+        }
+    }
+    val differing: array<string> = []
+    var index = 0
+    while (index < ids.size) {
+        if (counts[index] > 1 || failed[index]) differing.append(ids[index])
+        index = index + 1
+    }
+    sortedStrings(differing)
+}
+
+fun fuzzSet(output: string, status: int): array<FuzzResult> {
+    val results: array<FuzzResult> = []
+    for (mode in ["fast", "release", "ct", "wasm"]) results.append(FuzzResult(mode, true, output, status, []))
+    results
+}
+
+fun fuzzSelftestFail(what: string): string = "fuzz: comparison self-test failed: $what"
+
+/** The comparison itself, ported from the Python's selftest: agreeing results pass, any difference is reported. */
+fun fuzzVerdictSelftest(): string {
+    val same = fuzzSet("c0=1\nc1=2\n", 0)
+    if (fuzzVerdict(same) != "") return fuzzSelftestFail("agreement reported")
+    val crashed = fuzzSet("", 101)
+    if (fuzzVerdict(crashed) == "" || fuzzVerdict(crashed, true) != "") return fuzzSelftestFail("shared crash")
+    val oracle = fuzzSet("c0=FUZZ_ORACLE_FAILURE\n", 0)
+    val oracleLines = fuzzDifferingLines(oracle)
+    if (fuzzVerdict(oracle) == "" || oracleLines.size != 1 || oracleLines[0] != "c0") return fuzzSelftestFail("oracle")
+    val seen = fuzzSet("c0=FUZZ_ORACLE_FAILURE:12,900,\n", 0)
+    val seenLines = fuzzDifferingLines(seen)
+    if (fuzzVerdict(seen) == "" || seenLines.size != 1 || seenLines[0] != "c0") return fuzzSelftestFail("oracle detail")
+    val other = fuzzSet("c0=1\nc1=2\n", 0)
+    other[2] = FuzzResult("ct", true, "c0=1\nc1=3\n", 0, [])
+    val otherLines = fuzzDifferingLines(other)
+    if (fuzzVerdict(other) == "" || otherLines.size != 1 || otherLines[0] != "c1") return fuzzSelftestFail("one line")
+    val status = fuzzSet("c0=1\nc1=2\n", 0)
+    status[3] = FuzzResult("wasm", true, "c0=1\nc1=2\n", 101, [])
+    if (fuzzVerdict(status) == "" || fuzzDifferingLines(status).size != 0) return fuzzSelftestFail("status")
+    val broken = fuzzSet("c0=1\nc1=2\n", 0)
+    broken[1] = FuzzResult("release", false, "", 0, ["error"])
+    if (fuzzVerdict(broken) == "") return fuzzSelftestFail("one build failed")
+    val none: array<FuzzResult> = []
+    for (mode in ["fast", "release", "ct", "wasm"]) none.append(FuzzResult(mode, false, "", 0, ["error"]))
+    if (!fuzzVerdict(none).startsWith("all modes failed")) return fuzzSelftestFail("all builds failed")
+    ""
+}

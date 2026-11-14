@@ -1,0 +1,417 @@
+// The generator core: literals, typed expressions, statements and the plain random check, ported from
+// tools/fuzz-differential's Gen. Each check is a function `c<index>()` and a call; the program prints every call's
+// result as `c<index>=<value>`. Expression types are the Python's names: the integer types, "f64", "f32", "bool" and
+// "str" (written `string` in Abla source).
+import "abla/text"
+import "./prng.ab"
+
+val FUZZ_INTS: array<string> = ["i8", "i16", "i32", "int", "u8", "u16", "u32", "u64"]
+val FUZZ_EDGES: array<int> = [0, 1, 2, 3, 7, 8, 15, 16, 31, 32, 63, 64, 100, 127, 128, 255, 256, 32767, 32768, 65535,
+    65536, 2147483647, 2147483648, 4294967295, 4294967296, 9223372036854775807]
+val FUZZ_FLOAT_EDGES: array<string> = ["0.0", "1.0", "0.5", "2.5", "-1.5", "3.0e10", "1.0e-5", "123456.789",
+    "1.0e300", "4.9e-324", "0.1", "-0.0"]
+val FUZZ_F32_LITERALS: array<string> = ["0.0", "1.0", "0.5", "2.5", "(-1.5)", "3.0e10", "1.0e-5", "123456.789", "0.1",
+    "(-0.0)"]
+// Written as the bytes they are: "a" plus U+0301 is a combining sequence.
+val FUZZ_STRINGS: array<string> = ["", "a", "ab", "hello", "x y", "0123456789", "é", "line", "日本語",
+    "héllo, 日本 😀", "😀😀", "á"]
+val FUZZ_COMPARE: array<string> = ["<", "<=", ">", ">=", "==", "!="]
+
+fun fuzzIsInt(ty: string): bool {
+    for (name in FUZZ_INTS) {
+        if (name == ty) return true
+    }
+    false
+}
+
+fun fuzzIsSigned(ty: string): bool = ty == "i8" || ty == "i16" || ty == "i32" || ty == "int"
+
+fun fuzzTypeName(ty: string): string = if (ty == "str") "string" else ty
+
+/** The variables in scope: parallel names and types. */
+class FuzzEnv(val names: array<string>, val types: array<string>)
+
+fun fuzzEnv(): FuzzEnv = FuzzEnv([], [])
+
+fun FuzzEnv.add(name: string, ty: string): void {
+    this.names.append(name)
+    this.types.append(ty)
+    return
+}
+
+fun FuzzEnv.copy(): FuzzEnv {
+    val names: array<string> = []
+    val types: array<string> = []
+    for (name in this.names) names.append(name)
+    for (ty in this.types) types.append(ty)
+    FuzzEnv(names, types)
+}
+
+/** One check: the function's lines, its call and the type of its result. */
+class FuzzCheck(val lines: array<string>, val call: string, val ty: string, val index: int)
+
+class FuzzGen(val r: Prng, val withAny: bool, val focus: string, val depthLimit: int)
+
+fun fuzzGen(seed: int, withAny: bool, focus: string): FuzzGen = FuzzGen(prngSeeded(seed), withAny, focus, 4)
+
+// ---- literals
+
+fun fuzzIntConst(value: int, ty: string): string {
+    val text = if (value == -9223372036854775807 - 1) "(-9223372036854775807 - 1)" else
+        if (value < 0) "($value)" else "$value"
+    if (ty == "int") text else "$ty($text)"
+}
+
+fun FuzzGen.intLit(ty: string): string {
+    val pick = this.r.unit()
+    var value = 0
+    if (pick < 0.5) {
+        value = this.r.pickInt(FUZZ_EDGES)
+    } else if (pick < 0.8) {
+        value = this.r.range(0, 300)
+    } else {
+        value = this.r.bits(this.r.pickInt([8, 16, 32, 63]))
+    }
+    if (this.r.chance(0.35)) value = 0 - value
+    fuzzIntConst(value, ty)
+}
+
+fun FuzzGen.floatLit(): string {
+    val value = this.r.pick(FUZZ_FLOAT_EDGES)
+    if (value.startsWith("-")) "($value)" else value
+}
+
+fun FuzzGen.stringLit(): string = "\"" + this.r.pick(FUZZ_STRINGS) + "\""
+
+fun FuzzGen.varOf(ty: string, env: FuzzEnv): string {
+    val names: array<string> = []
+    var index = 0
+    while (index < env.names.size) {
+        if (env.types[index] == ty) names.append(env.names[index])
+        index = index + 1
+    }
+    if (names.size == 0) "" else this.r.pick(names)
+}
+
+// ---- expressions
+
+fun FuzzGen.expr(ty: string, depth: int, env: FuzzEnv): string {
+    if (fuzzIsInt(ty)) return this.intExpr(ty, depth, env)
+    if (ty == "f64") return this.f64Expr(depth, env)
+    if (ty == "f32") return this.f32Expr(depth, env)
+    if (ty == "bool") return this.boolExpr(depth, env)
+    this.strExpr(depth, env)
+}
+
+fun FuzzGen.intExpr(ty: string, depth: int, env: FuzzEnv): string {
+    if (depth <= 0) {
+        val name = this.varOf(ty, env)
+        return if (name != "" && this.r.chance(0.6)) name else this.intLit(ty)
+    }
+    val c = this.r.unit()
+    val d = depth - 1
+    if (c < 0.30) {
+        val op = this.r.pick(["+", "-", "*", "&", "|", "^"])
+        return "(${this.intExpr(ty, d, env)} $op ${this.intExpr(ty, d, env)})"
+    }
+    if (c < 0.40) {
+        val op = this.r.pick(["/", "%"])
+        val divisor = this.intExpr(ty, d, env)
+        val one = fuzzIntConst(1, ty)
+        return "(${this.intExpr(ty, d, env)} $op ($divisor | $one))"
+    }
+    if (c < 0.50) {
+        val op = this.r.pick(["<<", ">>", ">>>"])
+        val count = this.intExpr(this.r.pick(FUZZ_INTS), d, env)
+        return "(${this.intExpr(ty, d, env)} $op $count)"
+    }
+    if (c < 0.56) {
+        if (this.r.chance(0.5) || !fuzzIsSigned(ty)) return "(~${this.intExpr(ty, d, env)})"
+        return "(-${this.intExpr(ty, d, env)})"
+    }
+    if (c < 0.68) {
+        val source = this.r.pick(FUZZ_INTS)
+        return "$ty(${this.intExpr(source, d, env)})"
+    }
+    if (c < 0.74) {
+        return "(if (${this.boolExpr(d, env)}) ${this.intExpr(ty, d, env)} else ${this.intExpr(ty, d, env)})"
+    }
+    if (c < 0.78) {
+        val selector = this.intExpr("int", d, env)
+        val arms: array<string> = []
+        for (key in this.r.sample(-3, 5, 3)) arms.append("$key -> ${this.intExpr(ty, d, env)}")
+        return "(when ($selector) { ${textJoin(arms, "; ")}; else -> ${this.intExpr(ty, d, env)} })"
+    }
+    if (c < 0.82) return "$ty(f64ToInt(${this.f64Expr(d, env)}))"
+    if (c < 0.85) return "$ty(${this.strExpr(d, env)}.size)"
+    if (c < 0.88) return "$ty(f32ToI32(${this.f32Expr(d, env)}))"
+    val name = this.varOf(ty, env)
+    if (name != "") name else this.intLit(ty)
+}
+
+fun FuzzGen.f64Expr(depth: int, env: FuzzEnv): string {
+    if (depth <= 0) {
+        val name = this.varOf("f64", env)
+        return if (name != "" && this.r.chance(0.6)) name else this.floatLit()
+    }
+    val c = this.r.unit()
+    val d = depth - 1
+    if (c < 0.45) {
+        val op = this.r.pick(["+", "-", "*", "/"])
+        return "(${this.f64Expr(d, env)} $op ${this.f64Expr(d, env)})"
+    }
+    if (c < 0.55) return "(-${this.f64Expr(d, env)})"
+    if (c < 0.70) return "f64FromInt(${this.intExpr("int", d, env)})"
+    if (c < 0.78) return "f32ToF64(${this.f32Expr(d, env)})"
+    if (c < 0.86) {
+        return "(if (${this.boolExpr(d, env)}) ${this.f64Expr(d, env)} else ${this.f64Expr(d, env)})"
+    }
+    val name = this.varOf("f64", env)
+    if (name != "") name else this.floatLit()
+}
+
+fun FuzzGen.f32Expr(depth: int, env: FuzzEnv): string {
+    if (depth <= 0) {
+        val name = this.varOf("f32", env)
+        return if (name != "" && this.r.chance(0.6)) name else "f64ToF32(${this.floatLit()})"
+    }
+    val c = this.r.unit()
+    val d = depth - 1
+    // f32 of a float literal (a conversion the evaluator once rejected) and the division edges: x / 0, 0 / 0 (NaN)
+    // and infinities.
+    if (c < 0.08) return "f32(${this.r.pick(FUZZ_F32_LITERALS)})"
+    if (c < 0.14) return "(${this.r.pick(["f32(0.0)", "f32(1.0)", "f32(-1.5)", "f32(3.4e38)"])} / f32(0.0))"
+    if (c < 0.5) {
+        val op = this.r.pick(["+", "-", "*", "/"])
+        return "(${this.f32Expr(d, env)} $op ${this.f32Expr(d, env)})"
+    }
+    if (c < 0.7) return "f64ToF32(${this.f64Expr(d, env)})"
+    if (c < 0.85) return "f32FromInt(${this.intExpr("int", d, env)})"
+    val name = this.varOf("f32", env)
+    if (name != "") name else "f64ToF32(${this.floatLit()})"
+}
+
+fun FuzzGen.boolExpr(depth: int, env: FuzzEnv): string {
+    if (depth <= 0) {
+        val name = this.varOf("bool", env)
+        return if (name != "" && this.r.chance(0.5)) name else this.r.pick(["true", "false"])
+    }
+    val c = this.r.unit()
+    val d = depth - 1
+    if (c < 0.35) {
+        val ty = this.r.pick(FUZZ_INTS)
+        val op = this.r.pick(FUZZ_COMPARE)
+        return "(${this.intExpr(ty, d, env)} $op ${this.intExpr(ty, d, env)})"
+    }
+    if (c < 0.45) {
+        val op = this.r.pick(FUZZ_COMPARE)
+        return "(${this.f64Expr(d, env)} $op ${this.f64Expr(d, env)})"
+    }
+    if (c < 0.50) {
+        val op = this.r.pick(FUZZ_COMPARE)
+        return "(${this.f32Expr(d, env)} $op ${this.f32Expr(d, env)})"
+    }
+    if (c < 0.60) {
+        val op = this.r.pick(["&&", "||"])
+        return "(${this.boolExpr(d, env)} $op ${this.boolExpr(d, env)})"
+    }
+    if (c < 0.65) return "(!${this.boolExpr(d, env)})"
+    if (c < 0.75) {
+        val op = this.r.pick(["==", "!=", "<", ">="])
+        return "(${this.strExpr(d, env)} $op ${this.strExpr(d, env)})"
+    }
+    if (c < 0.90 && this.withAny) return "anyEq(${this.anyArg(d, env)}, ${this.anyArg(d, env)})"
+    val name = this.varOf("bool", env)
+    if (name != "") name else this.r.pick(["true", "false"])
+}
+
+/** A value to box; NaNs stay in (equality through `any` is typed `==` for floats of one kind, and a float never
+ * equals an integer). */
+fun FuzzGen.anyArg(depth: int, env: FuzzEnv): string =
+    this.expr(this.r.pick(["int", "u8", "i32", "u32", "f64", "f32", "bool", "str", "int"]), depth, env)
+
+fun FuzzGen.strExpr(depth: int, env: FuzzEnv): string {
+    if (depth <= 0) {
+        val name = this.varOf("str", env)
+        return if (name != "" && this.r.chance(0.6)) name else this.stringLit()
+    }
+    val c = this.r.unit()
+    val d = depth - 1
+    if (c < 0.30) return "(${this.strExpr(d, env)} + ${this.strExpr(d, env)})"
+    if (c < 0.55) {
+        val ty = this.r.pick(["int", "u8", "i32", "u32", "u64", "i16", "bool"])
+        return "\"<\${${this.expr(ty, d, env)}}>\""
+    }
+    if (c < 0.65) return "fmtF(${this.f64Expr(d, env)})"
+    if (c < 0.75) {
+        val text = this.strExpr(d, env)
+        return "safeSlice($text, ${this.intExpr("int", d, env)}, ${this.intExpr("int", d, env)})"
+    }
+    if (c < 0.85) {
+        return "(if (${this.boolExpr(d, env)}) ${this.strExpr(d, env)} else ${this.strExpr(d, env)})"
+    }
+    val name = this.varOf("str", env)
+    if (name != "") name else this.stringLit()
+}
+
+fun fuzzMax(a: int, b: int): int = if (a > b) a else b
+
+// ---- statements: each a self-contained line or a short block that extends `env`
+
+fun FuzzGen.statements(var env: FuzzEnv, depth: int, count: int, indent: string = "    "): array<string> {
+    val out: array<string> = []
+    var step = 0
+    while (step < count) {
+        step = step + 1
+        val k = this.r.unit()
+        val n = "v${env.names.size}"
+        if (k < 0.30) {
+            val ty = this.r.pick(["i8", "i16", "i32", "int", "u8", "u16", "u32", "u64", "f64", "f32", "bool", "str"])
+            out.append("${indent}val $n: ${fuzzTypeName(ty)} = ${this.expr(ty, depth, env)}")
+            env.add(n, ty)
+        } else if (k < 0.40) {
+            val ty = this.r.pick(FUZZ_INTS)
+            out.append("${indent}var $n: $ty = ${this.expr(ty, depth, env)}")
+            val it = "i${env.names.size}"
+            val inner = env.copy()
+            inner.add(it, "int")
+            inner.add(n, ty)
+            val loop = this.r.pick(["for", "while"])
+            val op = this.r.pick(["+", "-", "*", "^", "|", "&"])
+            val body = this.intExpr(ty, fuzzMax(depth - 1, 1), inner)
+            val bound = this.r.range(1, 6)
+            if (loop == "for") {
+                out.append("${indent}for ($it in 0 until $bound) {")
+                out.append("$indent    $n = $n $op $body")
+            } else {
+                out.append("${indent}var $it = 0")
+                out.append("${indent}while ($it < $bound) {")
+                out.append("$indent    $n = $n $op $body")
+                out.append("$indent    $it += 1")
+            }
+            out.append("$indent}")
+            env.add(n, ty)
+        } else if (k < 0.50) {
+            val a = "xs${env.names.size}"
+            val size = this.r.range(1, 5)
+            val elements: array<string> = []
+            for (i in 0 until size) elements.append(this.intExpr("int", fuzzMax(depth - 1, 0), env))
+            out.append("${indent}val $a = [${textJoin(elements, ", ")}]")
+            if (this.r.chance(0.5)) out.append("$indent$a.append(${this.intExpr("int", fuzzMax(depth - 1, 0), env)})")
+            val index = this.intExpr("int", fuzzMax(depth - 1, 0), env)
+            out.append("${indent}val $n: int = $a[(($index) & 2147483647) % $a.size] + $a.size")
+            env.add(n, "int")
+        } else if (k < 0.60) {
+            val m = "m${env.names.size}"
+            out.append("${indent}val $m: Map<int, int> = Map()")
+            val sets = this.r.range(1, 4)
+            for (i in 0 until sets) {
+                val key = this.intExpr("int", 1, env)
+                out.append("$indent$m.set($key & 7, ${this.intExpr("int", fuzzMax(depth - 1, 0), env)})")
+            }
+            val probe = this.intExpr("int", 1, env)
+            out.append("${indent}val $n: int = (if ($m.has($probe & 7)) 1 else 0) + $m.size")
+            env.add(n, "int")
+        } else if (k < 0.70) {
+            val acc = "acc${env.names.size}"
+            out.append("${indent}val $acc = Acc(${this.intExpr("int", 1, env)}, ${this.intExpr("int", 1, env)})")
+            out.append("$indent$acc.add(${this.intExpr("int", fuzzMax(depth - 1, 0), env)})")
+            out.append("${indent}val $n: int = $acc.add(${this.intExpr("int", fuzzMax(depth - 1, 0), env)}) + $acc.total")
+            env.add(n, "int")
+        } else if (k < 0.80) {
+            val captured = this.intExpr("int", 1, env)
+            val g = "g${env.names.size}"
+            out.append("${indent}val $g = { x: int -> (x ${this.r.pick(["+", "^", "*"])} $captured) }")
+            out.append("${indent}val $n: int = $g(${this.intExpr("int", 1, env)}) + applyTwice($g, ${this.intExpr("int", 1, env)})")
+            env.add(n, "int")
+        } else if (k < 0.90) {
+            val condition = this.boolExpr(fuzzMax(depth - 1, 1), env)
+            val ty = this.r.pick(FUZZ_INTS)
+            out.append("${indent}var $n: $ty = ${this.expr(ty, 1, env)}")
+            out.append("${indent}if ($condition) {")
+            out.append("$indent    $n = ${this.expr(ty, fuzzMax(depth - 1, 1), env)}")
+            out.append("$indent} else {")
+            out.append("$indent    $n = ${this.expr(ty, fuzzMax(depth - 1, 1), env)}")
+            out.append("$indent}")
+            env.add(n, ty)
+        } else if (this.withAny) {
+            out.append("${indent}val $n: any = ${this.anyArg(depth, env)}")
+            out.append("${indent}val ${n}b: bool = anyEq($n, ${this.anyArg(depth, env)})")
+            env.add("${n}b", "bool")
+        }
+    }
+    out
+}
+
+fun FuzzGen.arg(ty: string): string {
+    if (fuzzIsInt(ty)) return this.intLit(ty)
+    if (ty == "f64") return this.floatLit()
+    if (ty == "bool") return this.r.pick(["true", "false"])
+    this.stringLit()
+}
+
+/** The plain random check: a function of 0-3 typed parameters, some statements and a result expression. */
+fun FuzzGen.plainCheck(index: int): FuzzCheck {
+    val count = this.r.range(0, 3)
+    val env = fuzzEnv()
+    val names: array<string> = []
+    val types: array<string> = []
+    for (p in 0 until count) {
+        val ty = this.r.pick(["i8", "i16", "i32", "int", "u8", "u16", "u32", "u64", "f64", "bool", "str"])
+        names.append("p$p")
+        types.append(ty)
+        env.add("p$p", ty)
+    }
+    val result = this.r.pick(["i8", "i16", "i32", "int", "u8", "u16", "u32", "u64", "f64", "f32", "bool", "str"])
+    val parameters: array<string> = []
+    for (p in 0 until count) parameters.append("${names[p]}: ${fuzzTypeName(types[p])}")
+    val lines: array<string> = ["fun c$index(${textJoin(parameters, ", ")}): ${fuzzTypeName(result)} {"]
+    for (line in this.statements(env, this.depthLimit - 1, this.r.range(1, 5))) lines.append(line)
+    lines.append("    ${this.expr(result, this.depthLimit, env)}")
+    lines.append("}")
+    val arguments: array<string> = []
+    for (ty in types) arguments.append(this.arg(ty))
+    FuzzCheck(lines, "c$index(${textJoin(arguments, ", ")})", result, index)
+}
+
+/** The check generators this stage has: their names for --focus. */
+val FUZZ_FAMILIES: array<string> = ["plain_check"]
+
+fun fuzzHasFamily(name: string): bool {
+    for (family in FUZZ_FAMILIES) {
+        if (family == name) return true
+    }
+    false
+}
+
+/** One check: the focused family's, else a draw from the mix (stage 1: the plain random check only). */
+fun FuzzGen.check(index: int): FuzzCheck = this.plainCheck(index)
+
+// ---- the program
+
+fun fuzzRenderResult(call: string, ty: string): string {
+    if (ty == "f64") return "fmtF($call)"
+    if (ty == "f32") return "fmtF(f32ToF64($call))"
+    call
+}
+
+/** Source text for the checks; with `ct` every result is computed by the compile-time evaluator (`#`). */
+fun fuzzAssemble(prelude: string, checks: array<FuzzCheck>, ct: bool): string {
+    val out: array<string> = [prelude]
+    for (check in checks) {
+        for (line in check.lines) out.append(line)
+        out.append("")
+    }
+    out.append("@export(\"run\")")
+    out.append("fun run(): int {")
+    for (check in checks) {
+        val shown = fuzzRenderResult(check.call, check.ty)
+        val value = if (ct) "#($shown)" else shown
+        out.append("    println(\"c${check.index}=\${$value}\")")
+    }
+    out.append("    0")
+    out.append("}")
+    out.append("")
+    out.append("fun main: int = run()")
+    textJoin(out, "\n") + "\n"
+}

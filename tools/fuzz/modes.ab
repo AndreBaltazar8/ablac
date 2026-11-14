@@ -1,0 +1,214 @@
+// Running one program six ways, as tools/fuzz-differential's Runner does: native `--fast` and release builds, the
+// compile-time evaluator on every check (ABLA_COMPILE_EVAL=interp, and =jit for native compile-time code), and
+// hostless WebAssembly, a release module and a development module that node runs through
+// tools/fuzz-differential.mjs. The six jobs run at once as child processes; each child runs under coreutils
+// `timeout`, so a hang ends with status 124. A mode's result is its standard output (bytes, unchanged: a byte slice
+// may cut a UTF-8 sequence) and exit status, or the first lines of its build errors.
+import "abla/text"
+import "abla/fs"
+import "abla/process/time"
+import "abla/sys/linux/process"
+import "./gen.ab"
+
+class FuzzResult(val mode: string, val built: bool, val output: string, val status: int, val errors: array<string>)
+
+/** How a mode's result compares: equal keys agree. */
+fun FuzzResult.key(): string =
+    if (this.built) "status ${this.status}\n${this.output}" else "build-failed\n${textJoin(this.errors, "\n")}"
+
+fun FuzzResult.describe(): string {
+    val text = if (this.built) "(${fuzzQuote(this.output)}, ${this.status})" else
+        "('build-failed', [${textJoin(this.errors, " | ")}])"
+    if (text.size > 200) text.slice(0, 200) else text
+}
+
+fun fuzzQuote(text: string): string = "'" + text.replace("\\", "\\\\").replace("\n", "\\n").replace("'", "\\'") + "'"
+
+/** One child process of a job: argument vector, extra environment, files for its streams. */
+class FuzzStep(
+    val arguments: array<string>,
+    val environmentNames: array<string>,
+    val environmentValues: array<string>,
+    val output: string,
+    val errors: string,
+    val required: bool
+)
+
+/** A mode's steps, run one after another; a failed required step skips the rest. */
+class FuzzJob(val steps: array<FuzzStep>, var at: int, var process: int, val statuses: array<int>)
+
+// `plant`: the minimiser control (main.ab's --control-minimise) reads the Wasm release module's line `c0=planted` as
+// `c0=planted-wasm`, a disagreement that every mode can build and the compile-time evaluator can compute.
+class FuzzRunner(val root: string, val compiler: string, val timeout: int, val plant: bool)
+
+fun FuzzRunner.step(arguments: array<string>, names: array<string>, values: array<string>, output: string,
+    errors: string, required: bool): FuzzStep {
+    val wrapped: array<string> = ["timeout", "-k", "5", "${this.timeout}"]
+    for (argument in arguments) wrapped.append(argument)
+    FuzzStep(wrapped, names, values, output, errors, required)
+}
+
+fun FuzzRunner.startStep(step: FuzzStep): int {
+    val command = linuxCommand(step.arguments[0])
+    var index = 1
+    while (index < step.arguments.size) {
+        command.argument(step.arguments[index])
+        index = index + 1
+    }
+    command.removeEnvironment("ABLA_COMPILE_EVAL")
+    index = 0
+    while (index < step.environmentNames.size) {
+        command.environment(step.environmentNames[index], step.environmentValues[index])
+        index = index + 1
+    }
+    command.directory(this.root)
+    command.output(step.output)
+    command.errors(step.errors)
+    command.start().process
+}
+
+/** Runs the jobs at once; each job's statuses, one per step it ran. */
+fun FuzzRunner.runJobs(var jobs: array<FuzzJob>): void {
+    var running = 0
+    for (j in 0 until jobs.size) {
+        if (jobs[j].steps.size > 0) {
+            jobs[j].process = this.startStep(jobs[j].steps[0])
+            running = running + 1
+        }
+    }
+    while (running > 0) {
+        var progressed = false
+        for (j in 0 until jobs.size) {
+            if (jobs[j].process > 0) {
+                val observed = linuxWaitProcess(jobs[j].process, true)
+                if (observed.output != "pending") {
+                    progressed = true
+                    jobs[j].statuses.append(observed.status)
+                    val step = jobs[j].steps[jobs[j].at]
+                    jobs[j].at = jobs[j].at + 1
+                    jobs[j].process = 0
+                    if ((observed.status == 0 || !step.required) && jobs[j].at < jobs[j].steps.size) {
+                        jobs[j].process = this.startStep(jobs[j].steps[jobs[j].at])
+                    } else {
+                        running = running - 1
+                    }
+                }
+            }
+        }
+        if (!progressed) sleep(20)
+    }
+    return
+}
+
+fun fuzzReadText(file: string): string = if (Path(file).exists()) Path(file).readText() else ""
+
+fun fuzzFirstLines(text: string, count: int): array<string> {
+    val lines: array<string> = []
+    for (line in text.trim().split("\n")) {
+        if (lines.size < count) lines.append(line)
+    }
+    lines
+}
+
+fun fuzzNativeJob(runner: FuzzRunner, source: string, out: string, fast: bool, evaluation: string): FuzzJob {
+    val arguments: array<string> = [runner.compiler, "build", source, "-o", out, "--no-cache"]
+    if (fast) arguments.append("--fast")
+    val names: array<string> = []
+    val values: array<string> = []
+    if (evaluation != "") {
+        names.append("ABLA_COMPILE_EVAL")
+        values.append(evaluation)
+    }
+    val build = runner.step(arguments, names, values, "$out.build.out", "$out.build.err", true)
+    val run = runner.step([out], [], [], "$out.stdout", "$out.stderr", true)
+    FuzzJob([build, run], 0, 0, [])
+}
+
+fun fuzzNativeResult(mode: string, job: FuzzJob, out: string): FuzzResult {
+    if (job.statuses.size == 0 || job.statuses[0] != 0) {
+        return FuzzResult(mode, false, "", 0, fuzzFirstLines(fuzzReadText("$out.build.err"), 6))
+    }
+    FuzzResult(mode, true, fuzzReadText("$out.stdout"), job.statuses[1], [])
+}
+
+fun fuzzRelative(runner: FuzzRunner, path: string): string =
+    if (path.startsWith("${runner.root}/")) path.slice(runner.root.size + 1, path.size) else path
+
+/** Builds both Wasm modules at compile time from a driver program, then node runs each. */
+fun fuzzWasmJob(runner: FuzzRunner, source: string, directory: string): FuzzJob {
+    // The build requests take paths relative to the root (a request with absolute paths failed with E_BUILD_PROGRAM_REQUEST), as the Python's do.
+    val relativeSource = fuzzRelative(runner, source)
+    val relativeStem = fuzzRelative(runner, "$directory/w")
+    val stem = "$directory/w"
+    val driver = "$directory/build-wasm.ab"
+    Path(driver).writeText(
+        "import \"abla/wasm/build\"\nimport \"abla/build\"\n\n" +
+        "val release = #wasmBuildModule(\"w\", \"$relativeSource\", \"$relativeStem.wasm\", false, false)\n" +
+        "val development = #buildProgram(\"w-dev\", \"$relativeSource\", \"$relativeStem-dev.wasm\", \"wasm32-module\", \"module\", " +
+        "true, false)\n\nfun main: int = if (release && development) 0 else 1\n")
+    val build = runner.step([runner.compiler, "build", driver, "-o", "$directory/wasm-driver", "--fast", "--no-cache"],
+        [], [], "$stem.build.out", "$stem.build.err", true)
+    val harness = "${runner.root}/tools/fuzz-differential.mjs"
+    val release = runner.step(["node", harness, "$stem.wasm"], [], [], "$stem.stdout", "$stem.stderr", false)
+    val development = runner.step(["node", harness, "$stem-dev.wasm"], [], [], "$stem-dev.stdout", "$stem-dev.stderr",
+        false)
+    FuzzJob([build, release, development], 0, 0, [])
+}
+
+fun fuzzWasmResults(runner: FuzzRunner, job: FuzzJob, directory: string, var results: array<FuzzResult>): void {
+    val stem = "$directory/w"
+    val built = job.statuses.size > 0 && job.statuses[0] == 0
+    val errors = fuzzFirstLines(fuzzReadText("$stem.build.err"), 6)
+    val names = ["wasm", "wasm-dev"]
+    val files = ["$stem.wasm", "$stem-dev.wasm"]
+    val outputs = ["$stem.stdout", "$stem-dev.stdout"]
+    for (index in 0 until 2) {
+        if (!built || !Path(files[index]).exists() || job.statuses.size < index + 2) {
+            results.append(FuzzResult(names[index], false, "", 0, errors))
+        } else {
+            var output = fuzzReadText(outputs[index])
+            if (runner.plant && index == 0) output = output.replace("c0=planted\n", "c0=planted-wasm\n")
+            results.append(FuzzResult(names[index], true, output, job.statuses[index + 1], []))
+        }
+    }
+    return
+}
+
+/** Writes program.ab and program-ct.ab under `directory` (relative to the root) and runs every mode. */
+fun FuzzRunner.allModes(directory: string, prelude: string, checks: array<FuzzCheck>, includeWasm: bool): array<FuzzResult> {
+    Path("${this.root}/$directory").createDirectories()
+    val plain = "$directory/program.ab"
+    val ct = "$directory/program-ct.ab"
+    Path("${this.root}/$plain").writeText(fuzzAssemble(prelude, checks, false))
+    Path("${this.root}/$ct").writeText(fuzzAssemble(prelude, checks, true))
+    this.modesOf(directory, plain, ct, includeWasm)
+}
+
+/** Every mode of an existing program; `ct` is "" when there is no compile-time variant (it runs four ways). */
+fun FuzzRunner.modesOf(relative: string, plainRelative: string, ctRelative: string, includeWasm: bool): array<FuzzResult> {
+    val directory = "${this.root}/$relative"
+    val plain = if (plainRelative.startsWith("/")) plainRelative else "${this.root}/$plainRelative"
+    val ct = if (ctRelative == "" || ctRelative.startsWith("/")) ctRelative else "${this.root}/$ctRelative"
+    val jobs: array<FuzzJob> = [
+        fuzzNativeJob(this, plain, "$directory/fast", true, ""),
+        fuzzNativeJob(this, plain, "$directory/release", false, "")
+    ]
+    if (ct != "") {
+        jobs.append(fuzzNativeJob(this, ct, "$directory/ct", true, "interp"))
+        jobs.append(fuzzNativeJob(this, ct, "$directory/ctjit", true, "jit"))
+    }
+    if (includeWasm) jobs.append(fuzzWasmJob(this, plain, directory))
+    this.runJobs(jobs)
+    val results: array<FuzzResult> = [
+        fuzzNativeResult("fast", jobs[0], "$directory/fast"),
+        fuzzNativeResult("release", jobs[1], "$directory/release")
+    ]
+    var next = 2
+    if (ct != "") {
+        results.append(fuzzNativeResult("ct", jobs[2], "$directory/ct"))
+        results.append(fuzzNativeResult("ct-jit", jobs[3], "$directory/ctjit"))
+        next = 4
+    }
+    if (includeWasm) fuzzWasmResults(this, jobs[next], directory, results)
+    results
+}

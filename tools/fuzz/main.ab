@@ -1,0 +1,334 @@
+// The differential fuzzer in Abla (#648, decision #60): random well-typed Abla programs, each a list of independent
+// checks, run six ways (native --fast, native release, the compile-time evaluator as interpreter and as native code,
+// hostless Wasm release and development modules); output and exit status must agree. A disagreement is minimised to
+// one check with the fewest statements that still disagrees. tools/fuzz/run builds this and runs it with
+// ABLA_FUZZ_ROOT set to the repository.
+//
+//   tools/fuzz/run --seeds 100000-100039 [--checks 24] [--compiler build/ablac] [--focus plain_check] [--keep]
+//   tools/fuzz/run --program x.ab [--show]   one existing program (with @export("run")), four ways
+//   tools/fuzz/run --replay                   every tests/cases/fuzz-differential/*.ab, and no MISMATCH line
+//   tools/fuzz/run --selftest                 the PRNG's reference vectors and the comparison
+//
+// This is stage 1 of the port: the generator core and the plain random check. tools/fuzz-differential (Python)
+// keeps the other check families until they are ported. Seeds are not shared with it: this PRNG is xoshiro256**,
+// so seed N here is not the Python's seed N. Use seeds from 100000 up for this fuzzer.
+import "abla/io"
+import "abla/text"
+import "abla/integer"
+import "abla/fs"
+import "abla/process/arguments"
+import "abla/process/environment"
+import "./gen.ab"
+import "./modes.ab"
+import "./verdict.ab"
+
+class FuzzOptions(
+    var seeds: array<int>,
+    var checks: int,
+    var compiler: string,
+    var timeout: int,
+    var focus: string,
+    var keep: bool,
+    var program: string,
+    var show: bool,
+    var replay: bool,
+    var selftest: bool,
+    var noAny: bool,
+    var controlMinimise: bool
+)
+
+val FUZZ_WORK = "build/fuzz-abla"
+
+var fuzzUsageError = ""
+
+fun fuzzParseInt(text: string): int {
+    val parsed = text.trim().parseInt() ?? -1
+    if (parsed < 0 && fuzzUsageError == "") fuzzUsageError = "not a number: $text"
+    parsed
+}
+
+/** A seed or a range such as 5-9, or a comma-separated list of those. */
+fun fuzzSeedRange(text: string, var into: array<int>): void {
+    for (part in text.split(",")) {
+        val dash = part.indexOf("-")
+        if (dash > 0) {
+            val low = fuzzParseInt(part.slice(0, dash))
+            val high = fuzzParseInt(part.slice(dash + 1, part.size))
+            var seed = low
+            while (seed <= high) {
+                into.append(seed)
+                seed = seed + 1
+            }
+        } else {
+            into.append(fuzzParseInt(part))
+        }
+    }
+    return
+}
+
+fun fuzzOptions(root: string): FuzzOptions {
+    val options = FuzzOptions([], 24, "$root/build/ablac", 120, "", false, "", false, false, false, false, false)
+    var seedText = "1"
+    var index = 0
+    val count = processArgumentCount()
+    while (index < count) {
+        val argument = processArgument(index)
+        val value = if (index + 1 < count) processArgument(index + 1) else ""
+        var takes = true
+        if (argument == "--seeds" || argument == "--seed") {
+            seedText = value
+        } else if (argument == "--checks") {
+            options.checks = fuzzParseInt(value)
+        } else if (argument == "--compiler") {
+            options.compiler = value
+        } else if (argument == "--timeout") {
+            options.timeout = fuzzParseInt(value)
+        } else if (argument == "--focus") {
+            options.focus = value
+        } else if (argument == "--program") {
+            options.program = value
+        } else {
+            takes = false
+            if (argument == "--keep") {
+                options.keep = true
+            } else if (argument == "--show") {
+                options.show = true
+            } else if (argument == "--replay") {
+                options.replay = true
+            } else if (argument == "--selftest") {
+                options.selftest = true
+            } else if (argument == "--no-any") {
+                options.noAny = true
+            } else if (argument == "--control-minimise") {
+                options.controlMinimise = true
+            } else if (fuzzUsageError == "") {
+                fuzzUsageError = "unknown argument: $argument"
+            }
+        }
+        if (takes && index + 1 >= count && fuzzUsageError == "") fuzzUsageError = "$argument needs a value"
+        index = index + (if (takes) 2 else 1)
+    }
+    fuzzSeedRange(seedText, options.seeds)
+    if (options.focus != "" && !fuzzHasFamily(options.focus)) {
+        fuzzUsageError = "--focus ${options.focus}: no such generator (have: ${textJoin(FUZZ_FAMILIES, ", ")})"
+    }
+    options
+}
+
+fun fuzzRemove(path: string): void {
+    if (Path(path).exists()) Path(path).removeTree()
+    return
+}
+
+fun fuzzPrelude(root: string): string = Path("$root/tools/fuzz/prelude.txt").readText()
+
+/** Reduces a disagreement to one check, then to fewer statements: the report's lines. */
+fun fuzzMinimise(runner: FuzzRunner, options: FuzzOptions, prelude: string, seed: int, checks: array<FuzzCheck>,
+    results: array<FuzzResult>, first: string): string {
+    val report: array<string> = ["seed $seed: $first"]
+    val ids = fuzzDifferingLines(results)
+    if (ids.size == 0) {
+        report.append("  no single check line differs (build or exit status differs); kept whole")
+        return textJoin(report, "\n")
+    }
+    var taken = 0
+    for (key in ids) {
+        if (taken < 3) {
+            taken = taken + 1
+            var check = checks[0]
+            for (candidate in checks) {
+                if ("c${candidate.index}" == key) check = candidate
+            }
+            var lines = fuzzCopyLines(check.lines)
+            var tag = 0
+            var got = fuzzStill(runner, options, prelude, seed, key, check, lines, "base")
+            if (got == "") {
+                report.append("  $key: disagreement does not reproduce alone")
+            } else {
+                // Drop body lines one at a time while the same check still disagrees; repeat the pass until none can go (a
+                // line that a later one reads can go once that later one has; the Python made one pass).
+                var shrinking = true
+                while (shrinking) {
+                    shrinking = false
+                    var at = 1
+                    while (at < lines.size - 2) {
+                        val candidate: array<string> = []
+                        var line = 0
+                        while (line < lines.size) {
+                            if (line != at) candidate.append(lines[line])
+                            line = line + 1
+                        }
+                        tag = tag + 1
+                        val trial = fuzzStill(runner, options, prelude, seed, key, check, candidate, "$tag")
+                        if (trial != "") {
+                            lines = candidate
+                            got = trial
+                            shrinking = true
+                        } else {
+                            at = at + 1
+                        }
+                    }
+                }
+                report.append("  $key minimised to ${lines.size} lines:")
+                for (line in lines) report.append("    $line")
+                report.append("  call: ${check.call}")
+                report.append("  outputs: $got")
+                val kept = "$FUZZ_WORK/min$seed-$key"
+                Path("${runner.root}/$kept").createDirectories()
+                Path("${runner.root}/$kept/program.ab")
+                    .writeText(fuzzAssemble(prelude, [FuzzCheck(lines, check.call, check.ty, check.index)], false))
+                report.append("  kept: $kept/program.ab")
+            }
+        }
+    }
+    textJoin(report, "\n")
+}
+
+/** The verdict when the one check with these lines still makes `key` differ and every mode built; else "". */
+fun fuzzStill(runner: FuzzRunner, options: FuzzOptions, prelude: string, seed: int, key: string, check: FuzzCheck,
+    lines: array<string>, tag: string): string {
+    val directory = "$FUZZ_WORK/min$seed-$key-$tag"
+    val got = runner.allModes(directory, prelude, [FuzzCheck(lines, check.call, check.ty, check.index)], true)
+    var ok = fuzzVerdict(got) != ""
+    for (result in got) {
+        if (!result.built) ok = false
+    }
+    if (ok) {
+        ok = false
+        for (id in fuzzDifferingLines(got)) {
+            if (id == key) ok = true
+        }
+    }
+    if (!options.keep) fuzzRemove("${runner.root}/$directory")
+    if (ok) fuzzVerdict(got) else ""
+}
+
+/** A fresh copy, so the minimiser can replace it. */
+fun fuzzCopyLines(lines: array<string>): array<string> {
+    val copy: array<string> = []
+    for (line in lines) copy.append(line)
+    copy
+}
+
+fun fuzzRunSeed(runner: FuzzRunner, options: FuzzOptions, prelude: string, seed: int): string {
+    val gen = fuzzGen(seed, !options.noAny, options.focus)
+    val checks: array<FuzzCheck> = []
+    for (index in 0 until options.checks) checks.append(gen.check(index))
+    val directory = "$FUZZ_WORK/seed$seed"
+    val results = runner.allModes(directory, prelude, checks, true)
+    val bad = fuzzVerdict(results)
+    if (bad == "") {
+        if (!options.keep) fuzzRemove("${runner.root}/$directory")
+        return ""
+    }
+    fuzzMinimise(runner, options, prelude, seed, checks, results, bad)
+}
+
+/** One existing program, four ways (no compile-time variant): "" when they agree. */
+fun fuzzRunProgram(runner: FuzzRunner, source: string, name: string): array<FuzzResult> {
+    val directory = "$FUZZ_WORK/$name"
+    Path("${runner.root}/$directory").createDirectories()
+    Path("${runner.root}/$directory/program.ab").writeText(Path(source).readText())
+    runner.modesOf(directory, "$directory/program.ab", "", true)
+}
+
+fun fuzzShown(result: FuzzResult): string =
+    if (result.built) result.output else textJoin(result.errors, "\n") + "\n"
+
+fun fuzzReplay(runner: FuzzRunner): int {
+    val cases: array<string> = []
+    for (entry in Path("${runner.root}/tests/cases/fuzz-differential").entries()) {
+        if (entry.text.endsWith(".ab")) cases.append(entry.text)
+    }
+    var failures = 0
+    for (source in sortedStrings(cases)) {
+        val results = fuzzRunProgram(runner, source, "replay")
+        val bad = fuzzVerdict(results)
+        if (bad != "") {
+            println("$source: $bad")
+            failures = failures + 1
+        } else if (results[0].output.contains("MISMATCH")) {
+            println("$source: compile time disagrees with run time")
+            failures = failures + 1
+        } else {
+            println("$source: all modes agree")
+        }
+    }
+    if (failures == 0) println("fuzz: ${cases.size} recorded cases agree in every mode")
+    if (failures == 0) 0 else 1
+}
+
+/** The minimiser on a planted disagreement (FuzzRunner.plant: the Wasm release module's `c0=planted` reads differently).
+ * Three padding lines go; the check keeps its header, the line that makes the value, its result and its brace. */
+fun fuzzControlMinimise(runner: FuzzRunner, options: FuzzOptions, prelude: string): int {
+    val lines = ["fun c0(): string {", "    val pad0 = 1 + 2", "    val pad1 = \"x\" + \"\$pad0\"", "    val pad2 = pad0 * 3",
+        "    val seen = \"plant\" + \"ed\"", "    \"\${seen}\"", "}"]
+    val checks = [FuzzCheck(lines, "c0()", "str", 0)]
+        val results = runner.allModes("$FUZZ_WORK/control-minimise", prelude, checks, true)
+    val bad = fuzzVerdict(results)
+    val report = if (bad == "") "" else fuzzMinimise(runner, options, prelude, 0, checks, results, bad)
+    if (!report.contains("c0 minimised to 4 lines:") || !report.contains("    val seen = \"plant\" + \"ed\"")) {
+        eprintln("fuzz: minimiser control failed:\n$report")
+        return 1
+    }
+    println("fuzz: a planted Wasm difference is found and minimised to its 4 essential lines")
+    0
+}
+
+fun fuzzAbsolute(path: string): string {
+    if (path.startsWith("/")) return path
+    val here = processEnvironment("PWD") ?? ""
+    if (here == "") path else "$here/$path"
+}
+
+fun main: int {
+    val root = processEnvironment("ABLA_FUZZ_ROOT") ?? ""
+    if (root == "") {
+        eprintln("fuzz: run through tools/fuzz/run (ABLA_FUZZ_ROOT is not set)")
+        return 2
+    }
+    val options = fuzzOptions(root)
+    if (fuzzUsageError != "") {
+        eprintln("fuzz: $fuzzUsageError")
+        return 2
+    }
+    if (options.selftest) {
+        val prng = prngSelftest()
+        if (prng != "") {
+            eprintln("fuzz: PRNG self-test failed: $prng")
+            return 1
+        }
+        val comparison = fuzzVerdictSelftest()
+        if (comparison != "") {
+            eprintln(comparison)
+            return 1
+        }
+        println("fuzz: PRNG reference vectors and comparison self-test passed")
+        return 0
+    }
+    val runner = FuzzRunner(root, fuzzAbsolute(options.compiler), options.timeout, options.controlMinimise)
+    if (options.replay) return fuzzReplay(runner)
+    if (options.program != "") {
+        val results = fuzzRunProgram(runner, fuzzAbsolute(options.program), "program")
+        if (options.show) {
+            print(fuzzShown(results[0]))
+            return 0
+        }
+        val bad = fuzzVerdict(results)
+        println(if (bad == "") "all modes agree" else bad)
+        return if (bad == "") 0 else 1
+    }
+    val prelude = fuzzPrelude(root)
+    if (options.controlMinimise) return fuzzControlMinimise(runner, options, prelude)
+    var failures = 0
+    for (seed in options.seeds) {
+        val found = fuzzRunSeed(runner, options, prelude, seed)
+        if (found != "") {
+            failures = failures + 1
+            println(found)
+        } else {
+            println("seed $seed: ${options.checks} checks agree in all six modes")
+        }
+    }
+    if (failures == 0) 0 else 1
+}

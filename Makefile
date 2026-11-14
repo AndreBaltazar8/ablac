@@ -447,6 +447,7 @@ test-serial: ablac
 	tools/test-gc-background-free.sh $(COMPILER)
 	tools/test-json-differential.sh $(COMPILER)
 	tools/test-fuzz-differential.sh $(COMPILER)
+	tools/test-fuzz-abla.sh $(COMPILER)
 	tools/test-subparser-site-key.sh $(COMPILER)
 	tools/test-subparser-named-arguments.sh $(COMPILER)
 	tools/test-stable-names.sh $(COMPILER)
