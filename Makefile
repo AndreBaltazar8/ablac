@@ -98,6 +98,7 @@ test-serial: ablac
 	tools/test-macho-section.sh $(COMPILER)
 	tools/test-heap-stress.sh $(COMPILER)
 	tools/test-futex-locks.sh $(COMPILER)
+	tools/test-thread-local-image.sh $(COMPILER)
 	tools/test-libc-jump-routines.sh $(COMPILER)
 	tools/test-version.sh $(COMPILER)
 	tools/test-coverage.sh $(COMPILER)
