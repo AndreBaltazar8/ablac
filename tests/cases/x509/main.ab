@@ -202,6 +202,35 @@ fun attacks(directory: string): void {
         val result = x509Verify(chain, X509TrustStore(roots), X509Options("example.com", 1893456000))
         if (count < 40 && !result.ok) fail("$count decoys: ${result.error}")
         if (count == 70 && result.ok) fail("70 decoys: the path builder went past its limit")
+        if (count == 70 && !result.error.contains("too many candidate issuers")) fail("70 decoys: the error does not name the limit: [${result.error}]")
+    }
+    // A key rollover (certificates with one subject, each signed by the key of the one before) does not lengthen a path, but a path
+    // holds at most three self-issued certificates: three are accepted, four are not.
+    val rollRoots = X509TrustStore(readCertificates(directory, "roll-root.pem"))
+    val rollThree: array<string> = [readCertificates(directory, "roll-leaf.pem")[0].der]
+    for (name in ["roll-4", "roll-3", "roll-2", "roll-1"]) rollThree.append(readCertificates(directory, name + ".pem")[0].der)
+    val threeVerdict = x509Verify(rollThree, rollRoots, X509Options("example.com", 1893456000))
+    check(threeVerdict.ok, "a rollover chain with three self-issued certificates: ${threeVerdict.error}")
+    val rollFour: array<string> = [readCertificates(directory, "roll-leaf5.pem")[0].der]
+    for (name in ["roll-5", "roll-4", "roll-3", "roll-2", "roll-1"]) rollFour.append(readCertificates(directory, name + ".pem")[0].der)
+    val fourVerdict = x509Verify(rollFour, rollRoots, X509Options("example.com", 1893456000))
+    check(!fourVerdict.ok && fourVerdict.error.contains("too many self-issued"), "four self-issued certificates in a path: [${fourVerdict.error}]")
+    // The subject's emailAddress is an rfc822Name for name constraints: a CA that permits only example.com's e-mail does not
+    // sign a certificate whose subject has another.
+    val mailVerdict = x509Verify([readCertificates(directory, "mail-leaf.pem")[0].der, readCertificates(directory, "mail-inter.pem")[0].der],
+        X509TrustStore(readCertificates(directory, "mail-root.pem")), X509Options("example.com", 1893456000))
+    check(!mailVerdict.ok && mailVerdict.error.contains("name constraints"), "a subject emailAddress outside the e-mail constraints: [${mailVerdict.error}]")
+    // A serial number in a longer form than DER allows (0x00 before a byte below 0x80, 0xff before one of 0x80 or more) does not parse; one that needs its zero does.
+    val serialAt = pemFind(good, "\x02\x01\x67", 8)
+    check(serialAt > 8 && serialAt < 20, "the serial number 0x67 is near the start")
+    val outerLength = int(good[2]) * 256 + int(good[3])
+    val innerLength = int(good[6]) * 256 + int(good[7])
+    for (variant in ["\x02\x02\x00\x67", "\x02\x02\xff\x80", "\x02\x02\x01\x67"]) {
+        val wider = good.slice(0, 2) + byteEncode((outerLength + 1) >> 8) + byteEncode((outerLength + 1) & 255) + good.slice(4, 6) +
+            byteEncode((innerLength + 1) >> 8) + byteEncode((innerLength + 1) & 255) + good.slice(8, serialAt) + variant +
+            good.slice(serialAt + 3, good.size)
+        val minimal = variant == "\x02\x02\x01\x67"
+        if (minimal != x509ParseDer(wider).ok) fail("a serial number written ${hexEncode(variant)}: parses ${x509ParseDer(wider).ok}, should ${minimal}")
     }
     // The key usage of a handshake signature: a certificate that does not allow digitalSignature signs none.
     val noSignature = readCertificates(directory, "leaf-key-usage.pem")[0]

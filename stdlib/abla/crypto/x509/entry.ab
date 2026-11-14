@@ -402,6 +402,10 @@ fun x509ParseDer(der: string): X509Certificate {
     if (!serialItem.ok || serialItem.tag != DER_INTEGER || serialItem.end == serialItem.start ||
         serialItem.end - serialItem.start > 21) return x509Failed("bad serial number")
     val serial = der.slice(serialItem.start, serialItem.end)
+    // DER: the shortest form (no 0x00 before a byte below 0x80, no 0xff before one of 0x80 or more).
+    if (serial.size > 1 && ((int(serial[0]) == 0 && int(serial[1]) < 128) || (int(serial[0]) == 255 && int(serial[1]) >= 128))) {
+        return x509Failed("bad serial number")
+    }
     val innerAlgorithm = derItem(der, serialItem.end, tbsItem.end)
     if (!innerAlgorithm.ok || innerAlgorithm.tag != DER_SEQUENCE) return x509Failed("bad signature algorithm")
     if (der.slice(innerAlgorithm.start - x509HeaderSize(innerAlgorithm), innerAlgorithm.end) !=
@@ -915,6 +919,10 @@ private fun x509NameConstraintError(ca: X509Certificate, cert: X509Certificate):
     val names: array<X509GeneralName> = []
     for (n in cert.altNames) names.append(n)
     if (cert.subject.rdns.size > 0) names.append(X509GeneralName(4, cert.subject.canonical, cert.subject))
+    // RFC 5280 4.2.1.10: an emailAddress in the subject is an rfc822Name for the constraints, as one in the alternative names is.
+    for (rdn in cert.subject.rdns) for (attribute in rdn) {
+        if (attribute.oid == "1.2.840.113549.1.9.1") names.append(X509GeneralName(1, attribute.value, x509EmptyName()))
+    }
     for (name in names) {
         var anyPermitted = false
         var matched = false
@@ -998,6 +1006,8 @@ val X509_FAILURE_EXPIRED = 2
 val X509_FAILURE_MALFORMED = 3
 
 private val X509_MAXIMUM_SIGNATURE_CHECKS = 64
+/** The self-issued certificates a path may hold between its leaf and its anchor (key rollovers). */
+private val X509_MAXIMUM_SELF_ISSUED = 3
 
 private fun x509HasPurpose(cert: X509Certificate, purpose: string): bool {
     if (!cert.hasExtendedKeyUsage) return true
@@ -1072,6 +1082,14 @@ fun x509ValidatePath(path: array<X509Certificate>, options: X509Options): string
 
 private class X509Search(var checks: int, var error: string, var kind: int)
 
+/** The search stopped at its limit of signature checks: that is the reason the chain is refused, whatever the candidates before
+ *  it said. */
+private fun x509Capped(var search: X509Search): void {
+    search.error = "too many candidate issuers: the path search stopped after $X509_MAXIMUM_SIGNATURE_CHECKS signature checks"
+    search.kind = X509_FAILURE_OTHER
+    return
+}
+
 private fun x509Note(var search: X509Search, error: string, kind: int = 0): void {
     if (search.error == "") {
         search.error = error
@@ -1115,16 +1133,28 @@ private fun x509Extend(
             x509Note(search, problem, x509PathFailureKind(path, options.now))
         }
     }
-    // Self-issued certificates in the middle of a path (a key rollover) do not lengthen it (RFC 5280, 6.1.3).
+    // Self-issued certificates in the middle of a path (a key rollover) do not lengthen it (RFC 5280, 6.1.3), but they are not free
+    // either: a path holds at most X509_MAXIMUM_SELF_ISSUED of them, so a pool of same-name certificates cannot make the search
+    // build a path as long as its signature checks allow.
     var length = 1
-    for (j in 1 until path.size) if (!path[j].selfIssued()) length = length + 1
+    var selfIssued = 0
+    for (j in 1 until path.size) {
+        if (path[j].selfIssued()) selfIssued = selfIssued + 1 else length = length + 1
+    }
     if (length >= options.maximumDepth) {
         x509Note(search, "the certificate chain is too long")
         return null
     }
+    if (selfIssued > X509_MAXIMUM_SELF_ISSUED) {
+        x509Note(search, "the certificate chain has too many self-issued certificates")
+        return null
+    }
     for (anchor in store.certificates) {
         if (anchor.subject.canonical != current.issuer.canonical || !x509KeyIdsAgree(current, anchor)) continue
-        if (search.checks >= X509_MAXIMUM_SIGNATURE_CHECKS) return null
+        if (search.checks >= X509_MAXIMUM_SIGNATURE_CHECKS) {
+            x509Capped(search)
+            return null
+        }
         search.checks = search.checks + 1
         val bad = x509CheckSignature(current, anchor)
         if (bad != "") {
@@ -1141,7 +1171,10 @@ private fun x509Extend(
     for (candidate in pool) {
         if (candidate.subject.canonical != current.issuer.canonical || !x509KeyIdsAgree(current, candidate)) continue
         if (x509InPath(path, candidate)) continue
-        if (search.checks >= X509_MAXIMUM_SIGNATURE_CHECKS) return null
+        if (search.checks >= X509_MAXIMUM_SIGNATURE_CHECKS) {
+            x509Capped(search)
+            return null
+        }
         search.checks = search.checks + 1
         val bad = x509CheckSignature(current, candidate)
         if (bad != "") {
