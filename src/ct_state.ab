@@ -128,7 +128,15 @@ class BootstrapCtState(
     // The type checker's resolved targets of member calls on a class receiver, and the
     // receiver types with a single static implementation (as ct_jit.ab's reach uses them).
     val methodTargets: BootstrapResolvedMethodTargets,
-    val concrete: Map<string, bool>
+    val concrete: Map<string, bool>,
+    // Field names every declaration of which (a class's constructor field, an extension field) has a scalar or
+    // string type, and `size` when no class declares a field of that name (#829): such a field's value is no part
+    // of any global's heap, so storing into it or reading it carries no origins.
+    val scalarFields: Map<string, bool>,
+    // Locals ("item:name") the checker typed as a scalar or a string (#829): what is assigned to them carries no origins.
+    val scalarLocals: Map<string, bool>,
+    // Field names every declaration of which has type array<T> with T a scalar or a string (#829).
+    val scalarArrayFields: Map<string, bool>
 ) {
     fun variable(name: string): array<int> =
         bootstrapCtStateCopy(this.variables.get("${this.current}:$name") ?? [])
@@ -162,6 +170,7 @@ class BootstrapCtState(
     fun field(name: string): array<int> = bootstrapCtStateCopy(this.fields.get(name) ?? [])
 
     fun storeField(name: string, taint: array<int>): void {
+        if (this.scalarFields.get(name) ?? false) return
         val existing = this.fields.get(name) ?? []
         if (bootstrapCtStateMerge(existing, taint)) this.changed = true
         this.fields.set(name, existing)
@@ -360,6 +369,7 @@ class BootstrapCtState(
         if (kind == "assign") {
             val value = this.evaluate(children[0])
             if (this.bound(expression.text)) {
+                val scalarLocal = this.scalarLocals.get("${this.current}:${expression.text}") ?? false
                 // A local bound by a delegate assigns through its setValue.
                 if ((this.delegatedLocals.get("${this.current}:${expression.text}") ?? false) ==
                     true) {
@@ -367,7 +377,7 @@ class BootstrapCtState(
                     this.write(place, expression)
                     this.implicitCall("setValue", [place, value])
                 }
-                this.bind(expression.text, value)
+                if (!scalarLocal) this.bind(expression.text, value)
             } else {
                 for (item in this.candidates(expression.text)) {
                     if (item < this.declarations.size &&
@@ -388,6 +398,7 @@ class BootstrapCtState(
         }
         if (kind == "member" && children.size > 0) {
             val result = this.evaluate(children[0])
+            if (this.scalarFields.get(expression.text) ?? false) return []
             bootstrapCtStateMerge(result, this.field(expression.text))
             return result
         }
@@ -399,6 +410,11 @@ class BootstrapCtState(
             return []
         }
         if (kind == "index" && children.size > 1) {
+            if (this.scalarElements(children[0])) {
+                this.evaluate(children[0])
+                this.evaluate(children[1])
+                return []
+            }
             val result = this.evaluate(children[0])
             this.evaluate(children[1])
             bootstrapCtStateMerge(result, this.elements)
@@ -426,7 +442,10 @@ class BootstrapCtState(
         if (kind == "local.val" || kind == "local.var") {
             val value = if (children.size > 0) this.evaluate(children[0]) else []
             this.scope.append(expression.text)
-            this.bind(expression.text, value)
+            // A local the checker typed as a scalar or a string takes no origins, now or when assigned (#829).
+            val scalar = this.localHasNoDrop(expression)
+            if (scalar) this.scalarLocals.set("${this.current}:${expression.text}", true)
+            this.bind(expression.text, if (scalar) [] else value)
             if (children.size > 0 && children[0].kind == "delegate.initializer") {
                 this.delegatedLocals.set("${this.current}:${expression.text}", true)
                 // Reading it calls getValue; it is dropped with its scope.
@@ -443,7 +462,7 @@ class BootstrapCtState(
             this.scope.append(name)
             val element = bootstrapCtStateCopy(source)
             bootstrapCtStateMerge(element, this.elements)
-            this.bind(name, element)
+            this.bind(name, if (this.scalarElements(children[0])) [] else element)
             this.evaluate(children[1])
             this.scope.truncate(mark)
             return []
@@ -461,6 +480,12 @@ class BootstrapCtState(
             for (child in children) this.evaluate(child)
             return []
         }
+        // A comparison, a boolean operator or a type test gives a bool: no part of any global's heap (#829).
+        if (kind == "==" || kind == "!=" || kind == "<" || kind == "<=" || kind == ">" || kind == ">=" ||
+            kind == "&&" || kind == "||" || kind == "unary!" || kind == "is") {
+            for (child in children) this.evaluate(child)
+            return []
+        }
         // Operator functions, and delegate reads and writes, are calls the source does not write.
         val operator = bootstrapOperatorFunctionName(kind)
         if (operator != "") {
@@ -469,8 +494,10 @@ class BootstrapCtState(
             val result = this.union(operands)
             val known = this.methodCandidates(operator)
             val fact = this.operatorFact(expression, known)
+            // The built-in operator of scalar or string operands (-2) gives a scalar or a fresh string (#829).
+            if (fact == -2) return []
             if (fact >= 0) bootstrapCtStateMerge(result, this.implicitCallOn([fact], operands))
-            else if (fact != -2) bootstrapCtStateMerge(result, this.implicitCallOn(known, operands))
+            else bootstrapCtStateMerge(result, this.implicitCallOn(known, operands))
             return result
         }
         if (kind == "delegate.assign" && children.size > 1) {
@@ -503,6 +530,40 @@ class BootstrapCtState(
         bootstrapCtStateMerge(this.itemGlobals[this.current], [declaration])
         this.reach(declaration)
         return
+    }
+
+    // Whether `expression` is an array whose declared element type is a scalar or a string: a global, a parameter or a
+    // field declared `array<T>` (#829). An element read from it, or a `for` over it, gives no origins.
+    fun scalarElements(expression: BootstrapExpression): bool {
+        if (expression.kind == "identifier") {
+            if (this.bound(expression.text)) {
+                val declaration = this.itemDeclaration[this.current]
+                if (declaration < 0) return false
+                val owner = this.declarations[declaration]
+                val method = this.itemMethod[this.current]
+                val target = if (method < 0) owner else owner.methods[method]
+                var index = 0
+                while (index < target.parameters.size) {
+                    if (target.parameters[index] == expression.text) {
+                        return index < target.parameterTypes.size &&
+                            bootstrapCtStateScalarArrayType(target.parameterTypes[index])
+                    }
+                    index = index + 1
+                }
+                return false
+            }
+            var found = false
+            var all = true
+            for (item in this.candidates(expression.text)) {
+                if (item < this.declarations.size && this.isValue(this.declarations[item].kind)) {
+                    found = true
+                    if (!bootstrapCtStateScalarArrayType(this.declarations[item].resultType)) all = false
+                }
+            }
+            return found && all
+        }
+        if (expression.kind == "member") return this.scalarArrayFields.get(expression.text) ?? false
+        false
     }
 
     fun evaluateIdentifier(expression: BootstrapExpression): array<int> {
@@ -709,7 +770,9 @@ class BootstrapCtState(
             for (item in externs) {
                 if (!bootstrapCtStateImmutableType(bootstrapNormalizeType(this.declarations[item].resultType))) scalarResult = false
             }
-            if (!scalarResult) bootstrapCtStateMerge(result, arguments)
+            // An extern's result can be part of an argument it could write through, never of a scalar or string one (#829).
+            if (!scalarResult) bootstrapCtStateMerge(result,
+                if (foreign) this.union(this.writableArguments(taints, externs)) else arguments)
         }
         result
     }
@@ -853,7 +916,8 @@ fun bootstrapCtStateAnalyze(
         declarations, library, itemDeclaration, itemMethod, byName, itemSource,
         itemLibrary, reachedItems, itemGlobals, itemCallees, globalTaint, Map(), returns,
         Map(), [], writers, ordinary, component, true, false, 0, [], [], Map(),
-        methodTargets, concrete
+        methodTargets, concrete, bootstrapCtStateScalarFields(declarations), Map(),
+        bootstrapCtStateScalarFields(declarations, true)
     )
     var passes = 0
     while (state.changed && passes < 64) {
@@ -961,4 +1025,40 @@ fun bootstrapCtStateMayHoldClosure(
         index = index + 1
     }
     false
+}
+
+// See BootstrapCtState.scalarFields.
+// With `arrays`, the field names every declaration of which is array<T> of a scalar or string T instead.
+fun bootstrapCtStateScalarFields(declarations: array<BootstrapDeclaration>, arrays: bool = false): Map<string, bool> {
+    val scalar: Map<string, bool> = Map()
+    for (declaration in declarations) {
+        if (bootstrapIsExtensionFieldKind(declaration.kind)) {
+            val value = if (arrays) bootstrapCtStateScalarArrayType(declaration.resultType)
+                else bootstrapCtStateImmutableType(bootstrapNormalizeType(declaration.resultType))
+            scalar.set(declaration.name, (scalar.get(declaration.name) ?? true) && value)
+        } else {
+            // A class's parameters all count (a non-field one only narrows the set); of another declaration, its
+            // `val`/`var` ones (bootstrapRegionHeapFields reads them the same way). A function has no fields.
+            var field = 0
+            while (field < declaration.parameters.size) {
+                val kind = if (field < declaration.parameterKinds.size) declaration.parameterKinds[field] else ""
+                if (declaration.kind == "class" || kind == "val" || kind == "var") {
+                    val name = declaration.parameters[field]
+                    val type = if (field < declaration.parameterTypes.size)
+                        bootstrapNormalizeType(declaration.parameterTypes[field]) else ""
+                    scalar.set(name, (scalar.get(name) ?? true) &&
+                        (if (arrays) bootstrapCtStateScalarArrayType(type) else bootstrapCtStateImmutableType(type)))
+                }
+                field = field + 1
+            }
+        }
+    }
+    if (!arrays && !scalar.has("size")) scalar.set("size", true)
+    scalar
+}
+
+// array<T> with T a scalar or a string (normalized, `array:T`).
+fun bootstrapCtStateScalarArrayType(type: string): bool {
+    val normal = bootstrapNormalizeType(type)
+    normal.startsWith("array:") && bootstrapCtStateImmutableType(normal.slice(6, normal.size))
 }
