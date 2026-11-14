@@ -114,7 +114,11 @@ class Plan(
     var applied: bool,
     var note: string,
     var stalling: bool,
-    var recordType: int
+    var recordType: int,
+    // Set by a mutation whose effect depends on the record: either outcome is right (`either`), or a change that is
+    // harmless for most values is harmful for this one (`harmful`).
+    var either: bool = false,
+    var harmful: bool = false
 )
 
 /** A plaintext handshake record: one the mutations that keep the handshake valid may change (before either side
@@ -342,6 +346,8 @@ fun intercept(data: string, fromClient: bool, var wire: Wire, var plan: Plan): a
                 if (!encrypted && record.type != 23) {
                     val version = [768, 769, 770, 771, 772, 0, 65535][below(7)]
                     plan.note = "version $version"
+                    // A record version that is not 3.x ends the connection (a peer that speaks no TLS).
+                    if ((version >> 8) != 3) plan.harmful = true
                     out = Record(record.type, version, record.body).bytes()
                 } else plan.note = "not applicable"
             } else if (mutation == "flip") {
@@ -376,6 +382,9 @@ fun intercept(data: string, fromClient: bool, var wire: Wire, var plan: Plan): a
                 out = out + out
             } else if (mutation == "swap") {
                 if (index + 1 < records.size) {
+                    // TLS 1.3 drops its compatibility CCS wherever it comes before the Finished, a CCS before the
+                    // ServerHello included.
+                    if (wire.tls13 && records[index + 1].type == 20) plan.either = true
                     out = records[index + 1].raw() + out
                     index = index + 1
                     wire.events = wire.events + 1
@@ -384,6 +393,8 @@ fun intercept(data: string, fromClient: bool, var wire: Wire, var plan: Plan): a
                 val level = [1, 2, 0, 3][below(4)]
                 val description = [0, 10, 20, 40, 42, 47, 50, 70, 80, 90, 100, 109, 110, 112, 116, 255][below(16)]
                 plan.note = "alert $level/$description"
+                // A warning may be ignored (TLS 1.2, user_canceled, or before the version is known): either outcome.
+                if (level == 1) plan.either = true
                 out = Record(21, 771, byteString(level) + byteString(description)).bytes() + out
             } else if (mutation == "message") {
                 if (plaintextHandshake(record, encrypted)) {
@@ -499,11 +510,13 @@ fun main: int {
                 findings = findings + 1
                 println("FINDING (an unmutated handshake failed) $what: client '${outcome.clientError}' server '${outcome.serverError}'")
             }
+        } else if (plan.either) {
+            if (verbose) println("note: either outcome is right: $what")
         } else if (!plan.tls12 && plan.recordType == 20 && (plan.mutation == "drop" || plan.mutation == "duplicate" ||
             plan.mutation == "swap" || plan.mutation == "chunk" || plan.mutation == "version")) {
             // TLS 1.3's compatibility CCS: RFC 8446 section 5 says to drop it wherever it comes before the peer's Finished.
             if (verbose && !both) println("note: a CCS change refused: $what")
-        } else if (harmless(plan.mutation)) {
+        } else if (harmless(plan.mutation) && !plan.harmful) {
             if (!both) {
                 findings = findings + 1
                 println("FINDING (a harmless change refused) $what: client '${outcome.clientError}' server '${outcome.serverError}'")
