@@ -69,7 +69,9 @@ before measurement. Each observation has separate storage.
 | `bn-divsteps`, `bn-gcd`, `bn-inverse` | Private secret cores, eight-limb fixed odd p and zero vs random value |
 | `gcm-tag` | `aesGcmDecrypt` of a 64-byte TLS record (5-byte header as associated data, fixed key and nonce) whose tag is wrong in its last byte (zero class) or in nearly every byte (random class): both refused; the time must not say how much of the tag matched |
 | `gcm-key` | `aesGcmDecrypt` of a fixed record under a zero vs random key: refused under both, after the key expansion, GHASH and the tag |
+| `gcm-tag-software`, `gcm-key-software` | `gcm-tag` and `gcm-key` with `aesSetHardware(false)`: the bitsliced AES and the software GHASH that a CPU without AES-NI or CLMUL runs |
 | `chacha-tag` | `chaCha20Poly1305Open`, as `gcm-tag` |
+| `hmac-sha384`, `hkdf-expand-sha384` | `hmacSha384` over a 64-byte message and `hkdfExpand` (HKDF-SHA384) of a TLS 1.3 key label, under a zero vs random 48-byte secret (TLS_AES_256_GCM_SHA384) |
 | `hkdf-expand` | `hkdfExpand` (HMAC-SHA256) of a TLS 1.3 key label from a zero vs random 32-byte PRK |
 | `x25519` | `x25519` of a zero vs random scalar (clamped by the function) with a fixed peer share |
 | `p256-ecdh` | `p256Ecdh` of a scalar whose top byte is 0x7f in both classes, with a fixed peer point |

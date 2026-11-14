@@ -29,9 +29,8 @@ the compact [JSON summary](results.json) also records strongest-crop counts.
 | bn-gcd | 20000 / 20000 | 0.125 | 1.501 | No leak detected at 40,000 samples |
 | bn-inverse | 19990 / 20010 | 2.026 | 2.026 | No leak detected at 40,000 samples |
 
-P-256 and X25519: **explicitly unavailable**, with no implementation in the
-current `abla/crypto`. The eight-limb inverse test uses a fixed odd modulus;
-even-modulus and other-width distributions remain outside this timing campaign.
+The eight-limb inverse test uses a fixed odd modulus; even-modulus and other-width distributions remain outside this
+timing campaign. (X25519, P-256 and Ed25519, added with the TLS stack, are in the "TLS paths" section below.)
 
 The uncropped control exceeds 10 as well as the cropped test. No crypto candidate
 crossed 10, so no real candidate required a confirmation run. The confirmation
@@ -92,3 +91,18 @@ zero vs random key (fixed message) and with a fixed key over a zero vs random me
 | p256-sign-nonce | 0.338 | 1.528 | No leak detected at 40,000 samples |
 | ed25519-sign | 0.033 | 1.709 | No leak detected at 40,000 samples |
 | ed25519-sign-nonce | 0.53 | 1.817 | No leak detected at 40,000 samples |
+
+## Software GHASH and SHA-384 (2026-11-14)
+
+The same machine (i9-13900K, load average about 15 from other jobs), taskset CPU 10, confirmation CPU 14, master cae5a190's
+compiler with branch tls-hardening-2's stdlib. The same method: 40,000 measurement observations per row, all valid. The
+`*-software` rows call `aesSetHardware(false)` first: the bitsliced AES and the software GHASH, which the other rows
+(on a CPU with AES-NI and CLMUL) do not reach. The SHA-384 rows are TLS_AES_256_GCM_SHA384's HMAC and HKDF-Expand.
+
+| Primitive | Raw abs(t) | Max abs(t) | Observation |
+| --- | ---: | ---: | --- |
+| Control: early exit | 73.357 | 1704.071 | Leak detected (required control) |
+| gcm-tag-software | 1.218 | 2.032 | No leak detected at 40,000 samples |
+| gcm-key-software | 1.008 | 1.2 | No leak detected at 40,000 samples |
+| hmac-sha384 | 2.529 | 2.799 | No leak detected at 40,000 samples |
+| hkdf-expand-sha384 | 0.671 | 1.595 | No leak detected at 40,000 samples |
