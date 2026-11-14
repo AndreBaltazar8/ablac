@@ -72,6 +72,16 @@ must alias one of them. (A type that the stdlib hands out, such as `TlsWebSocket
   certificate, an empty directory, or the variable set to nothing (`SSL_CERT_FILE=`, as OpenSSL reads it) gives a store in
   which nothing verifies, not the system bundle (`tools/test-tls-trust-env.sh`).
 
+## One certificate for several protocols (ALPACA)
+
+A certificate that is valid for a host name is valid for every service on that name. A client that is tricked into a
+connection to the wrong one (a browser sent to an FTP or SMTP port) can have the TLS handshake succeed and its requests
+read as the other protocol (the ALPACA attacks). `abla/tls/pure` does not select a certificate by server name, and a
+server whose `alpn` is `[]` accepts any client. A server that shares one certificate (or a wildcard) across protocols
+must set `alpn` to the protocols it speaks: then a client that offers protocols and none of them match is refused with
+`no_application_protocol`, (a client that offers no ALPN at all is still accepted:
+require ALPN in the application if that matters). A client that sends ALPN refuses a server's answer that it did not offer.
+
 ## Secrets in memory
 
 The client and server clear each secret they made once nothing reads it again (overwritten with zeros, by volatile
