@@ -18,7 +18,7 @@ for mode in fast release; do
     flags=()
     [[ $mode == fast ]] && flags+=(--fast)
     "$compiler" build tests/cases/crypto-legacy/main.ab -o "$out/main.$mode" --no-cache ${flags[@]+"${flags[@]}"}
-    "$out/main.$mode" | grep -qx 'crypto-legacy: ok' || { echo "crypto-legacy ($mode) failed" >&2; exit 1; }
+    "$out/main.$mode" | grep -x 'crypto-legacy: ok' > /dev/null || { echo "crypto-legacy ($mode) failed" >&2; exit 1; }
 done
 if [[ -n ${AT_TEST_PFX:-} ]]; then
     "$compiler" build tests/cases/crypto-legacy/at-identity.ab -o "$out/at-identity" --no-cache
