@@ -1,0 +1,489 @@
+// Batch A of the port: the type-system check families of tools/fuzz-differential (conversions, generics,
+// interfaces, nullable chains, sealed `when`, `when` forms, closures, generic lambdas, type parameters named like
+// classes, `any`). Each returns one FuzzCheck whose function returns a string; the prelude (prelude.txt) has the
+// classes and helpers they call. Names inside a check follow the Python's (its line count or `<index>x<n>`), so a
+// generated program reads the same as the Python's.
+import "abla/text"
+import "./prng.ab"
+import "./gen.ab"
+
+/** The source text `${e}`, for a template inside generated code. */
+fun fuzzSplice(e: string): string = "\${" + e + "}"
+
+/** `"${e}"`: a generated string literal showing one value. */
+fun fuzzShowText(e: string): string = "\"" + fuzzSplice(e) + "\""
+
+/** How a value of `ty` is shown: floats through fmtF, the rest through a template. */
+fun fuzzShowAs(ty: string, e: string): string = if (ty == "f64") "fmtF($e)" else fuzzShowText(e)
+
+fun fuzzStringCheck(var lines: array<string>, index: int): FuzzCheck {
+    lines.append("    out")
+    lines.append("}")
+    FuzzCheck(lines, "c$index()", "str", index)
+}
+
+fun fuzzOpen(index: int): array<string> = ["fun c$index(): string {", "    var out = \"\""]
+
+/** Conversions between integer widths, and between integers and floats. */
+fun FuzzGen.convCheck(index: int): FuzzCheck {
+    val lines = fuzzOpen(index)
+    val count = this.r.range(8, 16)
+    for (i in 0 until count) {
+        val source = this.r.pick(FUZZ_INTS)
+        val target = this.r.pick(FUZZ_INTS)
+        val value = this.intLit(source)
+        lines.append("    out = out + \"" + fuzzSplice("$target($value)") + " \"")
+    }
+    val floats = this.r.range(1, 4)
+    for (i in 0 until floats) {
+        val f = this.r.pick(["f64ToInt", "f32ToI32", "f32ToU32"])
+        if (f == "f64ToInt") {
+            lines.append("    out = out + \"" + fuzzSplice("$f(${this.floatLit()} * ${this.floatLit()})") + " \"")
+        } else {
+            lines.append("    out = out + \"" + fuzzSplice("$f(f64ToF32(${this.floatLit()} * ${this.floatLit()}))") + " \"")
+        }
+    }
+    fuzzStringCheck(lines, index)
+}
+
+fun FuzzGen.genericCheck(index: int): FuzzCheck {
+    val env = fuzzEnv()
+    val lines = fuzzOpen(index)
+    val count = this.r.range(2, 5)
+    for (i in 0 until count) {
+        val ty = this.r.pick(["int", "f64", "str", "u8", "i32"])
+        val a = this.expr(ty, 2, env)
+        val b = this.expr(ty, 2, env)
+        val kind = this.r.pick(["pick", "box", "first", "swap", "map"])
+        if (kind == "pick") {
+            lines.append("    " + fuzzGenericWrap(ty, "pick($a, $b, ${this.boolExpr(1, env)})"))
+        } else if (kind == "box") {
+            val name = "bx$index${lines.size}"
+            lines.append("    val $name = Box($a)")
+            lines.append("    " + fuzzGenericWrap(ty, "$name.put($b)"))
+        } else if (kind == "first") {
+            lines.append("    " + fuzzGenericWrap(ty, "firstOf([$a, $b])"))
+        } else if (kind == "swap") {
+            lines.append("    " + fuzzGenericWrap(ty, "swapped(Pair($a, $b)).first"))
+        } else {
+            val k = this.intLit("int")
+            val name = "mp${lines.size}"
+            lines.append("    val $name = mapAll([${this.intLit("int")}, ${this.intLit("int")}]) { n -> \"" +
+                fuzzSplice("n * $k") + "\" }")
+            lines.append("    out = out + $name[0] + $name[1] + \";\"")
+        }
+    }
+    fuzzStringCheck(lines, index)
+}
+
+fun fuzzGenericWrap(ty: string, e: string): string =
+    if (ty == "f64") "out = out + fmtF($e) + \";\"" else "out = out + \"" + fuzzSplice(e) + ";\""
+
+fun FuzzGen.ifaceCheck(index: int): FuzzCheck {
+    val env = fuzzEnv()
+    val lines: array<string> = ["fun c$index(): string {"]
+    val parts: array<string> = []
+    val count = this.r.range(2, 5)
+    for (i in 0 until count) {
+        val k = this.r.pick(["Square", "Rect", "Circle"])
+        if (k == "Rect") {
+            parts.append("Rect(${this.intExpr("int", 2, env)}, ${this.intExpr("int", 2, env)})")
+        } else {
+            parts.append("$k(${this.intExpr("int", 2, env)})")
+        }
+    }
+    lines.append("    val shapes: array<Shape> = [${textJoin(parts, ", ")}]")
+    lines.append("    var total = 0")
+    lines.append("    var names = \"\"")
+    lines.append("    var squares = 0")
+    lines.append("    for (s in shapes) {")
+    lines.append("        total += s.area()")
+    lines.append("        names = names + s.name() + \",\"")
+    lines.append("        squares += when (s) { is Square -> 1; else -> 0 }")
+    lines.append("    }")
+    lines.append("    \"\$total \$names \$squares\"")
+    lines.append("}")
+    FuzzCheck(lines, "c$index()", "str", index)
+}
+
+fun FuzzGen.nullableNode(depth: int, env: FuzzEnv): string {
+    if (depth == 0 || this.r.chance(0.25)) return "null"
+    val label = if (this.r.chance(0.4)) "null" else this.stringLit()
+    "Node(${this.intExpr("int", 1, env)}, ${this.nullableNode(depth - 1, env)}, $label)"
+}
+
+/** `n` followed by one to three `?.next` steps, each present three times in four. */
+fun FuzzGen.nextPath(root: string): string {
+    var path = root
+    val steps = this.r.range(1, 3)
+    for (i in 0 until steps) {
+        if (this.r.below(4) < 3) path = path + "?.next"
+    }
+    path
+}
+
+fun FuzzGen.nullableCheck(index: int): FuzzCheck {
+    val env = fuzzEnv()
+    val lines: array<string> = ["fun c$index(): string {", "    val n: Node? = ${this.nullableNode(4, env)}",
+        "    var out = \"\""]
+    val count = this.r.range(3, 6)
+    for (i in 0 until count) {
+        val chain = this.nextPath("n")
+        val tail = this.r.pick(["?.value ?? " + this.intLit("int"), "?.label?.size ?? " + this.intLit("int"),
+            "?.label ?? \"d\"", "?.value ?? -1"])
+        val kind = this.r.pick(["chain", "depth", "when", "opt"])
+        if (kind == "chain") {
+            lines.append("    out = out + \"" + fuzzSplice("$chain$tail") + ";\"")
+        } else if (kind == "depth") {
+            lines.append("    out = out + \"" + fuzzSplice("depth($chain)") + ";\"")
+        } else if (kind == "when") {
+            lines.append("    out = out + when ($chain?.label) { null -> \"none;\"; else -> \"some" +
+                fuzzSplice("$chain?.label?.size ?? 0") + ";\" }")
+        } else {
+            val x = "x${lines.size}"
+            lines.append("    val $x: int? = ${this.r.pick(["null", this.intExpr("int", 2, env)])}")
+            lines.append("    out = out + \"" + fuzzSplice("$x ?? ${this.intLit("int")}") + fuzzSplice("$x == null") +
+                fuzzSplice("if ($x != null) $x + 1 else 0") + ";\"")
+        }
+    }
+    fuzzStringCheck(lines, index)
+}
+
+/** Lambdas: captured variables, lambdas calling captured lambdas, composition, function values in arrays. */
+fun FuzzGen.closureCheck(index: int): FuzzCheck {
+    val env = fuzzEnv()
+    val lines: array<string> = ["fun c$index(): string {", "    var out = \"\"", "    var calls = ${this.intLit("int")}"]
+    lines.append("    val bump = { calls += 1 }")
+    lines.append("    val f = { x: int -> x + ${this.intLit("int")} }")
+    lines.append("    val g = { x: int -> x * ${this.intLit("int")} - calls }")
+    val count = this.r.range(3, 7)
+    for (i in 0 until count) {
+        val kind = this.r.pick(["bump", "call", "compose", "chain", "array", "apply", "hold"])
+        val a = this.intExpr("int", 1, env)
+        if (kind == "bump") {
+            lines.append("    bump()")
+            lines.append("    out = out + \"" + fuzzSplice("calls") + ";\"")
+        } else if (kind == "call") {
+            lines.append("    out = out + \"" + fuzzSplice("f($a)") + "," + fuzzSplice("g($a)") + ";\"")
+        } else if (kind == "compose") {
+            val name = "h${lines.size}"
+            lines.append("    val $name = compose(f, g)")
+            lines.append("    out = out + \"" + fuzzSplice("$name($a)") + ";\"")
+        } else if (kind == "chain") {
+            val name = "c${lines.size}"
+            lines.append("    val $name = { x: int -> g(f(x)) + calls }")
+            lines.append("    out = out + \"" + fuzzSplice("$name($a)") + ";\"")
+        } else if (kind == "array") {
+            val v = "fs${lines.size}"
+            lines.append("    val $v: array<(int) -> int> = [f, g, { n: int -> n - calls }]")
+            lines.append("    var acc$v = $a")
+            lines.append("    for (fn in $v) acc$v = fn(acc$v)")
+            lines.append("    out = out + \"" + fuzzSplice("acc$v") + ";\"")
+        } else if (kind == "apply") {
+            lines.append("    out = out + \"" + fuzzSplice("applyTwice(f, $a)") + "," +
+                fuzzSplice("applyTwice({ n: int -> n + calls }, $a)") + ";\"")
+        } else {
+            val v = "k${lines.size}"
+            lines.append("    var $v = 0")
+            lines.append("    val inc$v = { $v += ${this.r.range(1, 5)} }")
+            lines.append("    inc$v()")
+            lines.append("    inc$v()")
+            lines.append("    out = out + \"" + fuzzSplice(v) + ";\"")
+        }
+    }
+    fuzzStringCheck(lines, index)
+}
+
+fun FuzzGen.sealedTree(depth: int, env: FuzzEnv): string {
+    if (depth == 0 || this.r.chance(0.2)) return "Num(${this.intExpr("int", 1, env)})"
+    val kind = this.r.pick(["Add", "Mul", "Neg", "Pick"])
+    if (kind == "Neg") return "Neg(${this.sealedTree(depth - 1, env)})"
+    if (kind == "Pick") {
+        return "Pick(${this.sealedTree(depth - 1, env)}, ${this.sealedTree(depth - 1, env)}, " +
+            "${this.sealedTree(depth - 1, env)})"
+    }
+    "$kind(${this.sealedTree(depth - 1, env)}, ${this.sealedTree(depth - 1, env)})"
+}
+
+/** A sealed interface evaluated by an exhaustive `when` with `is` arms. */
+fun FuzzGen.sealedCheck(index: int): FuzzCheck {
+    val env = fuzzEnv()
+    val lines = fuzzOpen(index)
+    val count = this.r.range(1, 3)
+    for (k in 0 until count) {
+        lines.append("    val e$k: Expr = ${this.sealedTree(this.r.range(1, 4), env)}")
+        lines.append("    out = out + render(e$k) + \"=\" + \"" + fuzzSplice("evaluate(e$k)") + ";\"")
+    }
+    fuzzStringCheck(lines, index)
+}
+
+/** `when` on ints, strings and bools: multi-value arms, first match wins, subject evaluated once. */
+fun FuzzGen.whenFormsCheck(index: int): FuzzCheck {
+    val env = fuzzEnv()
+    val lines = fuzzOpen(index)
+    val count = this.r.range(2, 5)
+    for (k in 0 until count) {
+        val kind = this.r.pick(["int", "string", "bool", "once", "nested"])
+        if (kind == "int") {
+            val values: array<int> = []
+            for (offset in this.r.permutation(9, this.r.range(3, 6))) values.append(offset - 3)
+            val arms: array<string> = []
+            for (a in 0 until values.size / 2) arms.append("${values[2 * a]}, ${values[2 * a + 1]} -> \"g$a\"")
+            if (values.size % 2 == 1) arms.append("${values[values.size - 1]} -> \"s\"")
+            lines.append("    val s$k = when ((${this.intExpr("int", 1, env)}) % ${this.r.range(3, 9)}) {")
+            for (arm in arms) lines.append("        $arm")
+            lines.append("        else -> \"e\"")
+            lines.append("    }")
+            lines.append("    out = out + s$k + \",\"")
+        } else if (kind == "string") {
+            val pool = ["a", "b", "é", "", "ab", "日"]
+            val words: array<string> = []
+            for (at in this.r.permutation(pool.size, 4)) words.append(pool[at])
+            lines.append("    val s$k = when (${this.strExpr(1, env)}) {")
+            lines.append("        \"${words[0]}\", \"${words[1]}\" -> \"x\"")
+            lines.append("        \"${words[2]}\" -> \"y\"")
+            lines.append("        else -> \"z\"")
+            lines.append("    }")
+            lines.append("    out = out + s$k + \",\"")
+        } else if (kind == "bool") {
+            lines.append("    val s$k = when ((${this.intExpr("int", 1, env)}) > (${this.intExpr("int", 1, env)})) {")
+            lines.append("        true -> \"t\"")
+            lines.append("        false -> \"f\"")
+            lines.append("    }")
+            lines.append("    out = out + s$k + \",\"")
+        } else if (kind == "once") {
+            val a = "acc$k"
+            lines.append("    val $a = Acc(${this.intExpr("int", 1, env)}, 1)")
+            lines.append("    val s$k = when ($a.add(2) % 3) {")
+            lines.append("        0 -> \"zero\"")
+            lines.append("        1 -> \"one\"")
+            lines.append("        else -> \"other\"")
+            lines.append("    }")
+            lines.append("    out = out + s$k + \"" + fuzzSplice("$a.total") + ",\"")
+        } else {
+            lines.append("    val n$k = (${this.intExpr("int", 1, env)}) % 4")
+            lines.append("    val s$k = when (n$k) {")
+            lines.append("        0 -> when (n$k + 1) { 1 -> \"a\"; else -> \"b\" }")
+            lines.append("        1, 2 -> if (n$k == 1) \"c\" else \"d\"")
+            lines.append("        else -> \"e\"")
+            lines.append("    }")
+            lines.append("    out = out + s$k + \",\"")
+        }
+    }
+    fuzzStringCheck(lines, index)
+}
+
+val FUZZ_ANY_POOL: array<string> = ["0", "1", "(-1)", "u8(1)", "u8(255)", "i8(-1)", "u64(-1)", "i32(1)", "true", "false",
+    "0.0", "(-0.0)", "1.0", "f64FromBits(9221120237041090560)", "f64FromBits(9221120237041090561)", "f64FromInt(1)",
+    "f64ToF32(1.0)", "f64ToF32(0.0)", "4607182418800017408", "4611686018427387904", "9218868437227405312",
+    "\"a\"", "(\"\" + \"a\")", "\"ab\"", "(\"a\" + \"b\")", "\"\"", "[1]", "[1]", "o", "o", "Acc(1, 1)",
+    "f64FromBits(1)", "f64FromBits(4607182418800017408)", "97", "u8(97)", "f64ToF32(-1.5)", "3217031168",
+    "(-1077936128)", "i32(-1077936128)"]
+
+/** Pairs of values whose bits or contents collide, compared through `any`. */
+fun FuzzGen.anyPoolCheck(index: int): FuzzCheck {
+    val lines: array<string> = ["fun c$index(): string {", "    val o = Acc(3, 4)", "    var out = \"\""]
+    val count = this.r.range(6, 12)
+    for (i in 0 until count) {
+        val a = this.r.pick(FUZZ_ANY_POOL)
+        var b = this.r.pick(FUZZ_ANY_POOL)
+        if (this.r.chance(0.3)) b = a
+        lines.append("    out = out + (if (anyEq($a, $b)) \"1\" else \"0\")")
+    }
+    fuzzStringCheck(lines, index)
+}
+
+/** Nested generic classes, generic functions over interface values, closures through them. */
+fun FuzzGen.deepGenericCheck(index: int): FuzzCheck {
+    val env = fuzzEnv()
+    val lines = fuzzOpen(index)
+    val count = this.r.range(2, 5)
+    for (n in 0 until count) {
+        val ty = this.r.pick(["int", "f64", "str", "u8", "i32"])
+        val a = this.expr(ty, 2, env)
+        val b = this.expr(ty, 2, env)
+        val tn = fuzzTypeName(ty)
+        val kind = this.r.pick(["nested", "heldOr", "heldNull", "via", "zip", "twice", "boxbox"])
+        val tag = "${index}x$n"
+        if (kind == "nested") {
+            lines.append("    val nb$tag = nested($a)")
+            lines.append("    out = out + ${fuzzShowAs(ty, "nb$tag.get().first")} + " +
+                "${fuzzShowAs(ty, "nb$tag.get().second[1]")} + \";\"")
+        } else if (kind == "heldOr") {
+            lines.append("    out = out + ${fuzzShowAs(ty, "heldOr(Cell($a), $b)")} + \";\"")
+        } else if (kind == "heldNull") {
+            lines.append("    val hn$tag: Holder<$tn>? = ${this.r.pick(["null", "Cell($a)"])}")
+            lines.append("    out = out + ${fuzzShowAs(ty, "heldOr(hn$tag, $b)")} + \";\"")
+        } else if (kind == "via") {
+            lines.append("    out = out + viaHolder(Twice($a), { xs -> \"" + fuzzSplice("xs.size") + fuzzSplice("xs[1]") +
+                "\" }) + \";\"")
+        } else if (kind == "zip") {
+            lines.append("    val zp$tag = zipPair(Cell($a), Cell(${this.r.pick(["true", "false"])}))")
+            lines.append("    out = out + ${fuzzShowAs(ty, "zp$tag.first")} + \"" + fuzzSplice("zp$tag.second") + ";\"")
+        } else if (kind == "twice") {
+            lines.append("    out = out + ${fuzzShowAs(ty, "Twice($a).held()[0]")} + \"" +
+                fuzzSplice("Twice($b).held().size") + ";\"")
+        } else {
+            lines.append("    val bb$tag = Box(Box($a))")
+            lines.append("    out = out + ${fuzzShowAs(ty, "bb$tag.get().get()")} + " +
+                "${fuzzShowAs(ty, "Box(Box($b)).get().get()")} + \";\"")
+        }
+    }
+    fuzzStringCheck(lines, index)
+}
+
+/** Interface dispatch through generic holders and arrays of holders. */
+fun FuzzGen.deepIfaceCheck(index: int): FuzzCheck {
+    val env = fuzzEnv()
+    val items: array<string> = []
+    val count = this.r.range(2, 4)
+    for (i in 0 until count) items.append("Cell(${this.intExpr("int", 2, env)})")
+    val lines: array<string> = ["fun c$index(): string {", "    val hs: array<Holder<int>> = [${textJoin(items, ", ")}]",
+        "    var total = 0", "    var out = \"\"", "    for (h in hs) total += h.held()",
+        "    val boxed = Box<Holder<int>>(hs[${this.r.range(0, items.size - 1)}])",
+        "    out = out + \"" + fuzzSplice("total") + " " + fuzzSplice("boxed.get().held()") + "\""]
+    val more = this.r.range(1, 3)
+    for (i in 0 until more) {
+        val k = this.r.pick(["via", "pick", "swap"])
+        val x = this.intExpr("int", 2, env)
+        val y = this.intExpr("int", 2, env)
+        if (k == "via") {
+            lines.append("    out = out + \" " + fuzzSplice("viaHolder(Cell($x), { v -> v * ${this.intLit("int")} })") + "\"")
+        } else if (k == "pick") {
+            lines.append("    out = out + \" " +
+                fuzzSplice("pick<Holder<int>>(Cell($x), Cell($y), ${this.boolExpr(1, env)}).held()") + "\"")
+        } else {
+            lines.append("    out = out + \" " + fuzzSplice("swapped(Pair(Cell($x), Cell($y))).first.held()") + "\"")
+        }
+    }
+    fuzzStringCheck(lines, index)
+}
+
+fun FuzzGen.deepChain(depth: int, env: FuzzEnv): string {
+    if (depth == 0 || this.r.chance(0.25)) return "null"
+    val cell = if (this.r.chance(0.35)) "null" else "Cell(${this.intExpr("int", 1, env)})"
+    val tag = if (this.r.chance(0.4)) "null" else this.stringLit()
+    "Chain(${this.deepChain(depth - 1, env)}, $cell, $tag)"
+}
+
+/** `?.` and `??` chains across nullable class fields, nullable generic instances, when on nullables. */
+fun FuzzGen.deepNullableCheck(index: int): FuzzCheck {
+    val env = fuzzEnv()
+    val lines: array<string> = ["fun c$index(): string {", "    val c: Chain? = ${this.deepChain(4, env)}",
+        "    var out = \"\""]
+    val count = this.r.range(3, 6)
+    for (k in 0 until count) {
+        val path = this.nextPath("c")
+        val kind = this.r.pick(["cell", "tag", "size", "when", "cellnull", "guard", "elvis"])
+        if (kind == "cell") {
+            lines.append("    out = out + \"" + fuzzSplice("$path?.cell?.inner ?? ${this.intLit("int")}") + ";\"")
+        } else if (kind == "tag") {
+            lines.append("    out = out + \"" + fuzzSplice("$path?.tag ?? \"d\"") + ";\"")
+        } else if (kind == "size") {
+            lines.append("    out = out + \"" + fuzzSplice("$path?.tag?.size ?? -1") + ";\"")
+        } else if (kind == "when") {
+            lines.append("    out = out + when ($path?.cell) { null -> \"none;\"; else -> \"cell" +
+                fuzzSplice("$path?.cell?.inner ?? 0") + ";\" }")
+        } else if (kind == "cellnull") {
+            lines.append("    out = out + \"" + fuzzSplice("$path?.cell == null") + fuzzSplice("$path?.tag != null") + ";\"")
+        } else if (kind == "guard") {
+            val x = "g$k"
+            lines.append("    val $x: Cell<int>? = $path?.cell")
+            lines.append("    out = out + (if ($x != null) \"" + fuzzSplice("$x.held() + 1") + ";\" else \"no;\")")
+        } else {
+            lines.append("    out = out + \"" + fuzzSplice("heldOr($path?.cell, ${this.intLit("int")})") + ";\"")
+        }
+    }
+    fuzzStringCheck(lines, index)
+}
+
+val FUZZ_ANY_VALUES: array<string> = ["0", "1", "(-1)", "\"0\"", "\"a\"", "true", "false", "1.5", "0.0", "(-0.0)",
+    "f64ToF32(1.5)", "f64ToF32(0.0)", "u8(0)", "u8(1)", "i32(1)", "[1]"]
+val FUZZ_ANY_FLOATS: array<string> = ["0.0", "1.0", "1.5", "(-0.0)", "f64ToF32(1.5)", "f64ToF32(0.0)", "f64ToF32(1.0)"]
+
+/** An `any` holding one value compared with float literals and values: `==`, `!=`, `when`. */
+fun FuzzGen.anyCheck(index: int): FuzzCheck {
+    val lines = fuzzOpen(index)
+    val count = this.r.range(3, 6)
+    for (k in 0 until count) {
+        val held = this.r.pick(FUZZ_ANY_VALUES)
+        val other = this.r.pick(FUZZ_ANY_FLOATS)
+        lines.append("    val a$k: any = $held")
+        val kind = this.r.pick(["eq", "ne", "rev", "when", "both"])
+        if (kind == "eq") {
+            lines.append("    out = out + (if (a$k == $other) \"1\" else \"0\")")
+        } else if (kind == "ne") {
+            lines.append("    out = out + (if (a$k != $other) \"1\" else \"0\")")
+        } else if (kind == "rev") {
+            lines.append("    out = out + (if ($other == a$k) \"1\" else \"0\")")
+        } else if (kind == "when") {
+            lines.append("    out = out + when (a$k) { $other -> \"w\"; else -> \"n\" }")
+        } else {
+            lines.append("    val v$k: any = $other")
+            lines.append("    out = out + (if (a$k == v$k) \"1\" else \"0\")")
+        }
+    }
+    fuzzStringCheck(lines, index)
+}
+
+/** Type parameters named like classes (T, U, K): the parameter in scope wins, the class still builds. */
+fun FuzzGen.clashCheck(index: int): FuzzCheck {
+    val env = fuzzEnv()
+    val lines = fuzzOpen(index)
+    val count = this.r.range(2, 5)
+    for (n in 0 until count) {
+        val kind = this.r.pick(["slot", "mapped", "same", "swap", "klass", "prelude"])
+        val a = this.intExpr("int", 1, env)
+        val b = this.intExpr("int", 1, env)
+        val tag = "${index}x$n"
+        if (kind == "slot") {
+            lines.append("    out = out + \"" + fuzzSplice("Slot($a).item") + ",\"")
+        } else if (kind == "mapped") {
+            lines.append("    val sm$tag = Slot(T($a)).mapTo { x -> U(x.n + ($b)) }")
+            lines.append("    out = out + \"" + fuzzSplice("sm$tag.item.n") + ",\"")
+        } else if (kind == "same") {
+            lines.append("    out = out + \"" + fuzzSplice("same(K($a)).item.n") + fuzzSplice("same(\"s\").item") + ",\"")
+        } else if (kind == "swap") {
+            lines.append("    val sw$tag = crossed(T($a), U($b))")
+            lines.append("    out = out + \"" + fuzzSplice("sw$tag.first.n") + "/" + fuzzSplice("sw$tag.second.n") + ",\"")
+        } else if (kind == "klass") {
+            lines.append("    out = out + \"" + fuzzSplice("T($a).n + U($b).n + K(1).n") + ",\"")
+        } else {
+            lines.append("    out = out + \"" + fuzzSplice("Box(T($a)).value.n") + fuzzSplice("heldOr(Cell(K($b)), K(0)).n") +
+                ",\"")
+        }
+    }
+    fuzzStringCheck(lines, index)
+}
+
+/** Generic functions and extensions that take lambdas: the type arguments come from the lambda's result, the lambda
+ * captures a local, and results go through Box<T>.mapBox chains. */
+fun FuzzGen.genericLambdaCheck(index: int): FuzzCheck {
+    val env = fuzzEnv()
+    val lines = fuzzOpen(index)
+    val count = this.r.range(2, 5)
+    for (n in 0 until count) {
+        val ty = this.r.pick(["int", "f64", "str"])
+        val a = this.expr(ty, 2, env)
+        val b = this.expr(ty, 2, env)
+        val tag = "${index}x$n"
+        val step = if (ty == "int") "v * 3 + 1" else if (ty == "f64") "v + 1.5" else "v + \"!\""
+        val text = if (ty == "f64") "fmtF(v)" else fuzzShowText("v")
+        val kind = this.r.pick(["twice", "apply", "map", "chain", "capture", "toBox"])
+        if (kind == "twice") {
+            lines.append("    out = out + ${fuzzShowAs(ty, "twiceOf($a, { v -> $step })")} + \";\"")
+        } else if (kind == "apply") {
+            lines.append("    out = out + applyTo($a, { v -> $text }) + \";\"")
+        } else if (kind == "map") {
+            lines.append("    out = out + ${fuzzShowAs(ty, "Box($a).mapBox { v -> $step }.value")} + \";\"")
+        } else if (kind == "chain") {
+            lines.append("    out = out + ${fuzzShowAs(ty, "Box($a).mapBox { v -> $step }.mapBox { v -> $step }.value")} + \";\"")
+        } else if (kind == "capture") {
+            lines.append("    val k$tag = $b")
+            lines.append("    out = out + ${fuzzShowAs(ty, "twiceOf($a, { v -> v + k$tag })")} + \";\"")
+        } else {
+            lines.append("    out = out + Box($a).mapBox { v -> $text }.value + \";\"")
+        }
+    }
+    fuzzStringCheck(lines, index)
+}
