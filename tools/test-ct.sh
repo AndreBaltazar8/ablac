@@ -205,18 +205,19 @@ worker_read() { # object, architecture (default x86_64), how many of the reads m
 p256_read() { # object, architecture (default x86_64)
     local object=$1 arch=${2:-x86_64}
     local specs=(ct_p256_add:@0,@1,@2,@3 ct_p256_subtract:@0,@1,@2,@3 ct_p256_in_range:@0,@1 ct_p256_point_add:@0,@1,@2,@3,@4
-        ct_p256_point_double:@0,@1,@2,@3 ct_p256_scalar_multiply:@0,@1,@2,@3,@4)
+        ct_p256_point_double:@0,@1,@2,@3 ct_p256_scalar_multiply:@0,@1,@2,@3,@4
+        ct_p256_multiply_plain:@0,@1,@2,@3,@4 ct_bn_exp_secret:@0,@1,@2,@3,@5)
     $check --follow-calls "$arch" "$object" "${specs[@]}" > "$out/$arch-p256.log" 2>&1 || {
         cat "$out/$arch-p256.log" >&2; echo "ct: a secret reached a branch or an address in the P-256 cores on $arch" >&2; exit 1
     }
     local spec
-    for spec in ct_p256_leak_window:@0,@1,@2 ct_p256_leak_branch:@0,@1,@2,@3,@4; do
+    for spec in ct_p256_leak_window:@0,@1,@2 ct_p256_leak_branch:@0,@1,@2,@3,@4 ct_bn_exp_leak_branch:@0,@1,@2,@3; do
         if $check --follow-calls "$arch" "$object" "$spec" > "$out/$arch-p256-leak.log" 2>&1; then
             echo "ct: the checker missed $spec on $arch" >&2; exit 1
         fi
         grep -q '^LEAK' "$out/$arch-p256-leak.log" || { cat "$out/$arch-p256-leak.log" >&2; exit 1; }
     done
-    echo "ok   $arch P-256 cores: ${#specs[@]} read with their calls followed, 2 leaks caught"
+    echo "ok   $arch P-256 cores, the ECDSA scalar work and the secret exponentiation: ${#specs[@]} read with their calls followed, 3 leaks caught"
 }
 
 # X25519: the ladder, the inverse, the pack and the whole scalar multiplication call the field routines, which stay

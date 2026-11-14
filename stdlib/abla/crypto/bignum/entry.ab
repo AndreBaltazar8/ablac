@@ -196,41 +196,61 @@ trusted fun bnDecode(modulus: BnModulus, out: int, a: int): void {
 
 private val BN_WINDOW_ENTRIES = 16
 
+/** The multiplication of the exponentiations below on a modulus block at `memory` (a BnModulus's memory, `words` limbs):
+ *  Montgomery's, with the block's modulus, inverse word and scratch. */
+@inline trusted fun bnMultiplyAt(memory: int, words: int, out: int, a: int, b: int): void =
+    bnMontgomeryMultiply(out, a, b, memory, memory + words * 4, words, memory + words * 12 + 4)
+
 /** `out` = `base` ^ `exponent` mod the modulus, `base` below it in plain form, `exponent` of `bits` bits in
  *  limbs. Every window squares four times and multiplies once by an entry read from all sixteen, whatever
  *  the exponent's bits are. */
 @noinline trusted fun bnExpSecret(modulus: BnModulus, out: int, base: int, exponent: int,
     bits: int): void {
     val words = modulus.words
-    val table = bnAllocate(BN_WINDOW_ENTRIES * words)
-    val entry = bnAllocate(words)
-    bnCopy(table, modulus.one(), words)
-    bnEncode(modulus, table + words * 4, base)
+    val work = bnAllocate((BN_WINDOW_ENTRIES + 1) * words)
+    bnExpSecretBody(modulus.memory, words, out, base, exponent, bits, work)
+    bnRelease(work, (BN_WINDOW_ENTRIES + 1) * words)
+}
+
+/** What bnExpSecret does, on a modulus block at `memory` and the work area it is given: `work` (17 * words limbs: the table of 16
+ *  powers, then one entry). tools/test-ct.sh reads this whole. */
+@inline trusted fun bnExpSecretBody(memory: int, words: int, out: int, base: int, exponent: int, bits: int,
+    work: int): void {
+    val table = work
+    val entry = work + BN_WINDOW_ENTRIES * words * 4
+    val one = memory + words * 8 + 4
+    bnCopy(table, one, words)
+    // Into Montgomery form: a multiplication by 2^2k mod the modulus.
+    bnMultiplyAt(memory, words, table + words * 4, base, memory + words * 4 + 4)
     for (i in 2 until BN_WINDOW_ENTRIES) {
-        bnMultiply(modulus, table + i * words * 4, table + (i - 1) * words * 4, table + words * 4)
+        bnMultiplyAt(memory, words, table + i * words * 4, table + (i - 1) * words * 4, table + words * 4)
     }
     val windows = (bits + 3) / 4
-    bnCopy(out, modulus.one(), words)
+    bnCopy(out, one, words)
     var window = windows - 1
     while (window >= 0) {
-        for (i in 0 until 4) bnMultiply(modulus, out, out, out)
+        for (i in 0 until 4) bnMultiplyAt(memory, words, out, out, out)
         val position = window * 4
         val limb = position / 32
         val offset = position % 32
         var digit = bnLoad(exponent + limb * 4) >> offset
         if (offset > 28 && (limb + 1) * 32 < bits) digit = digit | (bnLoad(exponent + (limb + 1) *
             4) << (32 - offset))
-        bnLookup(entry, table, BN_WINDOW_ENTRIES, words, digit & secretU32(u32(15)))
-        bnMultiply(modulus, out, out, entry)
+        bnLookupBody(entry, table, BN_WINDOW_ENTRIES, words, digit & secretU32(u32(15)))
+        bnMultiplyAt(memory, words, out, out, entry)
         window = window - 1
     }
-    bnDecode(modulus, out, out)
-    bnRelease(table, BN_WINDOW_ENTRIES * words)
-    bnRelease(entry, words)
+    // Out of Montgomery form: a multiplication by one.
+    bnClear(entry, words)
+    ablaUnsafeStoreU32(bnPointer(entry), 1)
+    bnMultiplyAt(memory, words, out, out, entry)
+    return
 }
 
 /** `out` = `base` ^ `exponent` mod the modulus, with a **public** big-endian exponent. `base` stays secret:
- *  this branches only on the exponent's bits. */
+ *  this branches only on the exponent's bits. (Not read by tools/test-ct.sh: the checker cannot tell a load of the
+ *  exponent's bytes from a load of secret memory; its multiplications are the Montgomery multiplication it does read,
+ *  and the condition is the exponent's, which is public.) */
 @noinline trusted fun bnExpPublic(modulus: BnModulus, out: int, base: int, exponent: string): void {
     val words = modulus.words
     val encoded = bnAllocate(words)
