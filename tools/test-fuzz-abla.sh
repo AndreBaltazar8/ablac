@@ -37,7 +37,7 @@ echo "fuzz: an oracle failure and a non-zero exit are reported through every mod
 
 fuzz --seeds 100000-100001 --checks 12
 fuzz --replay
-fuzz --control-oracle default_owner_check,ownership_lifetime_check,fresh_select_check,json_check,yaml_check,gzip_check
+fuzz --control-oracle default_owner_check,ownership_lifetime_check,fresh_select_check,json_check,yaml_check,gzip_check,region_member_check
 fuzz --hosted-tasks --seeds 100000 --checks 8
 fuzz --panics --seeds 100008 --checks 2
 fuzz --check-hostless-capabilities
