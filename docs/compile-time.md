@@ -873,7 +873,7 @@ replaced by the compiler-owned hosted platform inside the slice, while user
 modules remain those parsed for the target. Only encoded values cross back
 to the target program. A separate conservative reachability check permits scalar
 integer computations, strings, arrays and plain classes, with audited `abla/bytes`,
-`abla/crypto`, `abla/text` and filesystem declarations, plus known capability
+`abla/crypto`, `abla/text`, `abla/json` and filesystem declarations, plus known capability
 providers through their existing evaluator bridges. A direct `compilerEnvironment(name)`
 read is also bridged: it requires the source grant and manifest authorization for
 `environment`, and the named value is journaled and revalidated on cache reuse.
@@ -891,6 +891,27 @@ sites interpreted until those roots have a portability proof. Such sites keep th
 unexecuted native staging paths do not make their portable SHA operations target
 dependent. This does not change the default tier or permit a genuinely reentrant
 compile pass to replace its outer pass's JIT state.
+
+JSON in a cross-target site (#795): `jsonParse`, `jsonDocument` and their readers
+(`Json`, `JsonNode`, `JsonCursor`), `JsonLimits` and the error results run natively when every
+declaration they reach passes the same checks as any other code. These keep a site in
+the evaluator, and the trace names them. First, floats: `asF64`, `readNumber`, `f64ParseRange`
+and the encoder's `number` are refused, because a finite set of passing tests does not prove that
+the host and the evaluator agree on every NaN payload, signed zero, subnormal, rounding mode,
+conversion and fused operation; a proof would need a specified operation set, not samples.
+Second, raw memory: `jsonStringify` and the other encoders write through trusted pointers. Third,
+the shared empty arrays and number every parsed scalar points at (`jsonNoKeys`, `jsonNoValues`,
+`jsonNoNumber`, and the two limits records) are ordinary globals: any compile-time code that can
+write one (`jsonNull().keys.append(x)`, or a raw store) sends every site that reaches it to the
+evaluator, as for any ordinary global. A `JsonLimits` that a site reads from a global (`jsonDefaultLimits()` passed explicitly,
+or a user's `val`) is such a case too: the analysis cannot place the raw-memory writers of the library apart from it, so the
+site is interpreted; a `JsonLimits(...)` built in the site, or the default argument, stays native. The scanning intrinsics (`ablaJsonWhitespaceEnd`,
+`ablaJsonFindPlainStringEnd`, `ablaJsonMatchCompactObjectField`, `ablaJsonCompactArrayNext`,
+`ablaJsonAvailableIntegerEnd`, `ablaJsonIntegerValueAt`, `ablaJsonStringIsPlain`,
+`ablaTextIsValidUtf8`, `ablaTextReadU32LittleEndian`, `ablaTextFindByte`, `ablaTextAsciiEqualInsensitive`,
+`ablaUtf8EncodeScalar`) cross because the evaluator and the native
+code answer alike for every argument (`tests/cases/compile-eval-json/intrinsics.ab`). `$json` and
+`$jsons` stay in the evaluator: they use the parser API.
 
 For a statically resolved method on a concrete receiver, the cross-target proof
 uses the type checker's selected method. An unrelated type's method with the

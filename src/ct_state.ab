@@ -59,14 +59,17 @@ fun bootstrapCtStateCopy(values: array<int>): array<int> {
     result
 }
 
+// Whether a declared type is a scalar or a string.
+fun bootstrapCtStateImmutableType(type: string): bool =
+    type == "int" || type == "bool" || type == "string" || type == "char" ||
+    type == "f32" || type == "f64" || type == "i8" || type == "u8" || type == "i16" ||
+    type == "u16" || type == "i32" || type == "u32" || type == "i64" || type == "u64"
+
 // Whether a global of this type (or, when it is inferred, with this initializer) holds a
 // scalar or string: a value that cannot be aliased or written in place.
 fun bootstrapCtStateImmutable(type: string, initializer: BootstrapExpression): bool {
     val kind = initializer.kind
-    if (type == "int" || type == "bool" || type == "string" || type == "char" ||
-        type == "f32" || type == "f64" || type == "i8" || type == "u8" || type == "i16" ||
-        type == "u16" || type == "i32" || type == "u32" || type == "i64" || type ==
-        "u64") return true
+    if (bootstrapCtStateImmutableType(type)) return true
     (type == "" || type == "inferred") &&
         (kind == "integer" || kind == "string" || kind == "float" || kind == "float32" ||
          kind == "char" || kind == "true" || kind == "false" || kind == "string.template")
@@ -521,6 +524,23 @@ class BootstrapCtState(
         result
     }
 
+    // The origins of the arguments an extern call can write through: those whose parameter, in some declaration
+    // of that name, is not a scalar or a string.
+    fun writableArguments(taints: array<array<int>>, externs: array<int>): array<array<int>> {
+        val writable: array<array<int>> = []
+        var index = 0
+        while (index < taints.size) {
+            var scalar = true
+            for (item in externs) {
+                val types = this.declarations[item].parameterTypes
+                if (index >= types.size || !bootstrapCtStateImmutableType(bootstrapNormalizeType(types[index]))) scalar = false
+            }
+            if (!scalar) writable.append(taints[index])
+            index = index + 1
+        }
+        writable
+    }
+
     fun evaluateArguments(expression: BootstrapExpression, from: int): array<array<int>> {
         val taints: array<array<int>> = []
         var index = from
@@ -625,12 +645,14 @@ class BootstrapCtState(
         val callables: array<int> = []
         var constructor = -1
         var foreign = false
+        val externs: array<int> = []
         for (item in this.candidates(name)) {
             if (item < this.declarations.size) {
                 val declaration = this.declarations[item]
                 if (declaration.kind == "class") constructor = item
                 else if (declaration.kind == "extern") {
                     foreign = true
+                    externs.append(item)
                     if (bootstrapCtStateEditsDeclarations(declaration.name)) this.editing = true
                 }
                 else if ((declaration.kind == "fun" || declaration.kind == "compile.fun") &&
@@ -662,8 +684,15 @@ class BootstrapCtState(
         if (foreign || (constructor < 0 && callables.size == 0)) {
             // A foreign or built-in function: it may write what it is given, and
             // its result may be part of it.
-            if (foreign) this.write(arguments, expression)
-            bootstrapCtStateMerge(result, arguments)
+            // An argument of a scalar or string type is a value the callee cannot write through, whatever it was
+            // read from (a string field of a global does not make the global written).
+            if (foreign) this.write(this.union(this.writableArguments(taints, externs)), expression)
+            // An extern that returns a scalar or a string returns no part of what it was given.
+            var scalarResult = foreign
+            for (item in externs) {
+                if (!bootstrapCtStateImmutableType(bootstrapNormalizeType(this.declarations[item].resultType))) scalarResult = false
+            }
+            if (!scalarResult) bootstrapCtStateMerge(result, arguments)
         }
         result
     }

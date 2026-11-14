@@ -1,0 +1,96 @@
+// The JSON and text scanning intrinsics must answer alike in the evaluator, in compile-time native code (host
+// layout, also in a Wasm child's slice) and at run time, for every argument, hostile ones included: the same digest
+// is computed under `#` and at run time and the two must agree. (A cross-target slice runs the host's intrinsics.)
+import "abla/bytes"
+import "abla/io"
+import "abla/json"
+import "abla/text"
+
+fun bytes(values: array<int>): string {
+    var out = ""
+    for (value in values) out = out + byteEncode(value)
+    out
+}
+
+fun corpus(): array<string> = [
+    "", " ", "\t\n\r x", "123", "-123", "0", "-0", "01", "-01", "1.5", "1e5", "1E5", "-", "+1",
+    "12a",
+    "9223372036854775807", "9223372036854775808", "-9223372036854775808", "-9223372036854775809",
+    "99999999999999999999", "1000000000000000000", "[1,2]", "[]", "[ ]", "[1, 2]", ",1", "],",
+    "[,]",
+    "\"abc\"", "\"a\\nb\"", "\"a\tb\"", "\"\"", "{\"a\":1,\"bc\":2}", "{\"a\" :1}", "{\"a\":",
+    "\"a\":", ",\"a\":",
+    ",\"abc\":", "ab", "abcd", "abcde", "\"é\"", "\"€\"", "\"😀\"",
+    bytes([34, 65, 34]), bytes([34, 195, 34]), bytes([34, 195, 169, 34]), bytes([34, 192, 175, 34]),
+    bytes([34, 193, 191, 34]), bytes([34, 224, 128, 128, 34]), bytes([34, 224, 160, 128, 34]),
+    bytes([34, 237, 160, 128, 34]), bytes([34, 237, 159, 191, 34]), bytes([34, 240, 128, 128, 128,
+        34]),
+    bytes([34, 240, 144, 128, 128, 34]), bytes([34, 244, 143, 191, 191, 34]), bytes([34, 244, 144,
+        128, 128, 34]),
+    bytes([34, 245, 128, 128, 128, 34]), bytes([34, 255, 34]), bytes([34, 128, 34]), bytes([34, 239,
+        191, 190, 34]),
+    bytes([34, 226, 130]), bytes([34, 31, 34]), bytes([34, 127, 34]), bytes([0]), bytes([255, 255,
+        255, 255]),
+    bytes([1, 2, 3, 4, 5]), bytes([128, 129, 130, 131]), bytes([240, 159, 152])
+]
+
+fun offsets(size: int): array<int> {
+    val values: array<int> = [-9223372036854775807 - 1, -4294967296, -2, -1, 9223372036854775807,
+        9223372036854775806,
+        9223372036854775805, 9223372036854775804, 4294967296, 4294967295]
+    var index = 0
+    while (index <= size + 2) {
+        values.append(index)
+        index += 1
+    }
+    values
+}
+
+fun digest(): string {
+    var out = ""
+    for (scalar in [-1, 0, 1, 127, 128, 2047, 2048, 55295, 55296, 57343, 57344, 65535, 65536,
+        1114111, 1114112, 4294967296, 9223372036854775807]) {
+        out = out + "${utf8Encode(scalar).size}" + utf8Encode(scalar)
+    }
+    val names = ["", "a", "bc", "abc", "é", "ab\"", "1"]
+    for (text in corpus()) {
+        out = out + "${text.size}:${text.isValidUtf8()}${ablaJsonStringIsPlain(text)}"
+        for (other in ["", "ABCD", "abcd", "abc", "\u00c9",
+            "Ab\u00e9"]) out = out + "${textAsciiEqualInsensitive(text, other)}"
+        for (begin in offsets(text.size)) {
+            out = out +
+                "|${begin}:${textReadU32LittleEndian(text, begin)},${ablaJsonWhitespaceEnd(text, begin)}," +
+                "${ablaJsonAvailableIntegerEnd(text, begin)},${ablaJsonCompactArrayNext(text, begin, true)}," +
+                "${ablaJsonCompactArrayNext(text, begin, false)}"
+            for (name in names) {
+                out = out + ",${ablaJsonMatchCompactObjectField(text, begin, name, true)}" +
+                    "${ablaJsonMatchCompactObjectField(text, begin, name, false)}"
+            }
+            for (end in offsets(text.size)) {
+                out = out + ";${ablaJsonFindPlainStringEnd(text, begin, end)}" +
+                    ":${textFindByte(text, 34, begin, end)}${textFindByte(text, 300, begin, end)}"
+                // Only the argument a caller has checked: ablaJsonIntegerValueAt is read on a scanned integer.
+                if (begin >= 0 && end > begin && end <= text.size && end - begin < 40) {
+                    out = out + "/${ablaJsonIntegerValueAt(text, begin, end)}"
+                }
+            }
+        }
+    }
+    out
+}
+
+val COMPILE_TIME = #digest()
+val SIZE = COMPILE_TIME.size
+
+fun main: int {
+    val runtime = digest()
+    if (runtime != COMPILE_TIME) {
+        var index = 0
+        while (index < runtime.size && index < COMPILE_TIME.size && runtime[index] ==
+            COMPILE_TIME[index]) index += 1
+        println("json intrinsics differ at $index of ${runtime.size}/${COMPILE_TIME.size}: ${runtime.slice(index, index + 80)} / ${COMPILE_TIME.slice(index, index + 80)}")
+        return 1
+    }
+    println("json intrinsics ok $SIZE")
+    0
+}
