@@ -155,9 +155,17 @@ jobs:
 
   macos:
     if: ${{ !inputs.xtensa_compiler_memory_probe && !inputs.xtensa_companion_routing_probe && !inputs.xtensa_companion_embedded_probe && !inputs.xtensa_companion_install_probe && !inputs.macos_published_rebuild && !inputs.macos_runtime_bench && !inputs.android_pointer_tags_control }}
-    name: macOS host and compiler fixed point
-    # One standard arm64 runner; Intel remains part of the release matrix.
-    runs-on: macos-15
+    name: ${{ matrix.name }}
+    # Both macOS architectures run on push: Apple Silicon the whole job, Intel the compiler stages and the host tests
+    # (the Darwin code paths differ by architecture: BSD system call asm, Mach-O routines). The self-rebuild, the iOS
+    # Simulator stay Apple Silicon only, and the import guard is informative on Intel (its list is the union of both).
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {runner: macos-15, name: macOS host and compiler fixed point, full: true}
+          - {runner: macos-15-intel, name: macOS host and compiler fixed point (Intel), full: false}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 35
     env:
       JOBS: '2'
@@ -171,6 +179,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install the bottled native toolchain
+        if: ${{ matrix.full }}
         run: |
           brew update
           # Fail rather than compile LLVM from source if a bottle is missing.
@@ -180,6 +189,9 @@ jobs:
             echo "$(brew --prefix lld@23)/bin"
             echo "$(brew --prefix openssl@3)/bin"
           } >> "$GITHUB_PATH"
+      - name: Install the pinned native toolchain (Homebrew builds no Intel bottles)
+        if: ${{ !matrix.full }}
+        run: tools/install-macos-intel-toolchain.sh
       - name: Fetch the checksum-pinned bootstrap
         run: tools/bootstrap-compiler.sh build/ci/bootstrap-ablac
       - name: Build stage 1 from current sources
@@ -215,6 +227,7 @@ jobs:
           tools/test-macos-host.sh build/ci/ablac-stage2 \
             2>&1 | tee build/ci-logs/macos-host.log
       - name: Check the libSystem import guard
+        continue-on-error: ${{ !matrix.full }}
         run: |
           tools/test-libsystem-imports.sh build/ci/ablac-stage2 \
             2>&1 | tee build/ci-logs/macos-libsystem-imports.log
@@ -226,10 +239,12 @@ jobs:
           tools/macos-import-origin.sh "$binary" _malloc _free _realloc _pthread_mutex_lock _pthread_mutex_unlock \
             2>&1 | tee build/ci-logs/macos-import-origin.log
       - name: Link iOS slices and exercise an exported C call on Simulator
+        if: ${{ matrix.full }}
         run: |
           tools/test-ios-simulator.sh build/ci/ablac-stage2 \
             2>&1 | tee build/ci-logs/ios-simulator.log
       - name: Check the compiler fixed point and native child
+        if: ${{ matrix.full }}
         run: |
           # Builds stage 3, compares both generations' IR, checks the Darwin
           # adapter/object and executes a child built by the rebuilt compiler.
@@ -239,7 +254,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: macos-ci-logs
+          name: macos-ci-logs-${{ matrix.full && 'arm64' || 'x86_64' }}
           path: build/ci-logs/
           retention-days: 3
           if-no-files-found: ignore
