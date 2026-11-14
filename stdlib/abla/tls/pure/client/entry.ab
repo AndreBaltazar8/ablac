@@ -44,6 +44,7 @@ val TLS_ALERT_PROTOCOL_VERSION = 70
 val TLS_ALERT_INTERNAL_ERROR = 80
 val TLS_ALERT_MISSING_EXTENSION = 109
 val TLS_ALERT_UNSUPPORTED_EXTENSION = 110
+val TLS_ALERT_INAPPROPRIATE_FALLBACK = 86
 
 /** The certificate check: the chain (DER, end entity first), the host name, the signature scheme of
  *  the CertificateVerify, the content that was signed and the signature. Returns "" when the chain is
@@ -197,11 +198,27 @@ fun tlsClientStartWith(config: TlsClientConfig, clientHello: string, helloRandom
     client
 }
 
+private fun tlsClientFailedAtStart(config: TlsClientConfig, message: string): TlsClient {
+    val client = tlsClientStartWith(config, "", "", "", [], 769)
+    client.outbox = ""
+    client.state = TLS_CLIENT_FAILED
+    client.error = message
+    client
+}
+
 /** Starts a client: builds a ClientHello with a fresh random, a 32-byte compatibility session id and an
  *  X25519 key share from the configuration's random source. */
 fun tlsClientNew(config: TlsClientConfig): TlsClient {
+    // A name or a protocol list that cannot be encoded, and a random source that gave less than asked, are errors the
+    // caller sees, not a ClientHello that is wrong.
+    if ((tlsIsDnsName(config.host) && config.host != "" && !tlsServerNameValid(config.host)) || !tlsAlpnNamesValid(config.alpn)) {
+        return tlsClientFailedAtStart(config, "tls: an invalid server name or ALPN protocol")
+    }
     val helloRandom = config.random(32)
     val sessionId = config.random(32)
+    if (helloRandom.size != 32 || sessionId.size != 32) {
+        return tlsClientFailedAtStart(config, "tls: the random source failed")
+    }
     val pair = tlsGenerateKeyPair(TLS_GROUP_X25519, config.random)
     val pairs: array<TlsKeyPair> = []
     val shares: array<TlsKeyShare> = []
@@ -272,12 +289,18 @@ private fun TlsClient.fail(description: int, message: string): void {
 }
 
 private fun TlsClient.queueRecord(type: int, content: string): void {
-    val sealed = tlsProtectRecord(this.write, type, content)
-    if (!sealed.ok) {
-        this.fail(TLS_ALERT_INTERNAL_ERROR, sealed.error)
-        return
+    // Over 2^14 bytes the content is split over several records (a client certificate chain, say).
+    var offset = 0
+    while (offset < content.size || offset == 0) {
+        val end = if (content.size - offset > TLS_MAX_PLAINTEXT) offset + TLS_MAX_PLAINTEXT else content.size
+        val sealed = tlsProtectRecord(this.write, type, content.slice(offset, end))
+        if (!sealed.ok) {
+            this.fail(TLS_ALERT_INTERNAL_ERROR, sealed.error)
+            return
+        }
+        this.outbox = this.outbox + sealed.bytes
+        offset = end
     }
-    this.outbox = this.outbox + sealed.bytes
     return
 }
 
@@ -614,6 +637,15 @@ private fun TlsClient.handleKeyUpdate(body: string): void {
     return
 }
 
+/** Updates the sending key when it has protected as many records as its cipher allows (RFC 8446 section 5.5). */
+private fun TlsClient.rekeyIfDue(): void {
+    if (this.write.sequence < tlsRecordLimit(this.write.aead)) return
+    this.queueRecord(TLS_HANDSHAKE, tlsHandshakeMessage(TLS_KEY_UPDATE, tlsU8(0)))
+    this.clientApplicationSecret = tlsNextTrafficSecret(this.hash, this.clientApplicationSecret)
+    this.setKeys(this.clientApplicationSecret, true)
+    return
+}
+
 private fun TlsClient.answerKeyUpdate(): void {
     if (!this.keyUpdateOwed || this.state != TLS_CLIENT_CONNECTED) return
     this.keyUpdateOwed = false
@@ -686,6 +718,12 @@ private fun TlsClient.handleAlert(content: string): void {
         return
     }
     if (content[1] == TLS_ALERT_CLOSE_NOTIFY) {
+        if (this.state != TLS_CLIENT_CONNECTED) {
+            // A close_notify before the handshake is done ends it: there is no connection to close cleanly.
+            this.state = TLS_CLIENT_FAILED
+            this.error = "tls: the peer closed the connection during the handshake"
+            return
+        }
         this.peerClosed = true
         if (!this.sentClose) this.queueAlert(TLS_ALERT_CLOSE_NOTIFY)
         this.sentClose = true
@@ -721,8 +759,7 @@ private fun TlsClient.handleRecord(record: string, header: TlsRecordHeader): voi
             this.fail(TLS_ALERT_UNEXPECTED_MESSAGE, "tls: too many empty records")
             return
         }
-        if (this.state == TLS_CLIENT_CONNECTED || record.size != 6 || record[5] != 1 ||
-            (this.state == TLS_CLIENT_WAIT_SERVER_HELLO && !this.retried)) {
+        if (this.state == TLS_CLIENT_CONNECTED || record.size != 6 || record[5] != 1) {
             this.fail(TLS_ALERT_UNEXPECTED_MESSAGE, "tls: an unexpected ChangeCipherSpec")
         }
         return
@@ -811,6 +848,7 @@ fun TlsClient.send(data: string): bool {
     var offset = 0
     while (offset < data.size && this.state == TLS_CLIENT_CONNECTED) {
         val end = if (data.size - offset > TLS_MAX_PLAINTEXT) offset + TLS_MAX_PLAINTEXT else data.size
+        this.rekeyIfDue()
         this.queueRecord(TLS_APPLICATION_DATA, data.slice(offset, end))
         offset = end
     }
@@ -898,12 +936,18 @@ private fun TlsClient.startV12(message: string, body: string): void {
 }
 
 private fun TlsClient.queueRecord12(type: int, content: string): void {
-    val sealed = tls12Protect(this.v12Write, type, content)
-    if (!sealed.ok) {
-        this.fail(TLS_ALERT_INTERNAL_ERROR, sealed.error)
-        return
+    // Over 2^14 bytes the content is split over several records (a client certificate chain, say).
+    var offset = 0
+    while (offset < content.size || offset == 0) {
+        val end = if (content.size - offset > TLS_MAX_PLAINTEXT) offset + TLS_MAX_PLAINTEXT else content.size
+        val sealed = tls12Protect(this.v12Write, type, content.slice(offset, end))
+        if (!sealed.ok) {
+            this.fail(TLS_ALERT_INTERNAL_ERROR, sealed.error)
+            return
+        }
+        this.outbox = this.outbox + sealed.bytes
+        offset = end
     }
-    this.outbox = this.outbox + sealed.bytes
     return
 }
 

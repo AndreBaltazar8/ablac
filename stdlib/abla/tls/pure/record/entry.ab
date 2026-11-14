@@ -24,6 +24,13 @@ val TLS_AEAD_CHACHA20_POLY1305 = 3
  *  (ciphertext with its tag) may be (section 5.2). */
 val TLS_MAX_PLAINTEXT = 16384
 val TLS_MAX_EMPTY_RUN = 32
+
+// RFC 8446 section 5.5: a key protects a limited number of records. AES-GCM: 2^24 (the analysis allows 2^24.5), after
+// which the sender updates its key; ChaCha20-Poly1305 has no limit that matters, 2^34 is far inside it. A sequence number
+// never wraps: past 2^62 records nothing more is sealed or opened.
+val TLS_MAX_SEQUENCE = 4611686018427387904
+
+fun tlsRecordLimit(aead: int): int = if (aead == TLS_AEAD_CHACHA20_POLY1305) 17179869184 else 16777216
 val TLS_MAX_CIPHERTEXT = 16640
 
 /** One direction's protection: the traffic key, the IV (12 bytes) and the next record's sequence number. */
@@ -66,8 +73,18 @@ private fun tlsHeaderBytes(type: int, version: int, length: int): string =
 
 /** A plaintext record (used before the handshake keys exist): a header with the legacy version
  *  (0x0301 on a first ClientHello for compatibility, else 0x0303), then the content as is. */
-fun tlsPlaintextRecord(type: int, version: int, content: string): string =
-    tlsHeaderBytes(type, version, content.size) + content
+fun tlsPlaintextRecord(type: int, version: int, content: string): string {
+    if (content.size <= TLS_MAX_PLAINTEXT) return tlsHeaderBytes(type, version, content.size) + content
+    // A message longer than a record (a certificate chain, say) is split over several (RFC 8446 section 5.1).
+    var records = ""
+    var offset = 0
+    while (offset < content.size) {
+        val end = if (content.size - offset > TLS_MAX_PLAINTEXT) offset + TLS_MAX_PLAINTEXT else content.size
+        records = records + tlsHeaderBytes(type, version, end - offset) + content.slice(offset, end)
+        offset = end
+    }
+    records
+}
 
 /** Reads the 5-byte header at `offset` of `data`. `ok` is false when fewer than five bytes remain. */
 fun tlsParseRecordHeader(data: string, offset: int): TlsRecordHeader {
@@ -91,6 +108,7 @@ fun tlsProtectRecord(var protection: TlsRecordProtection, contentType: int, cont
     if (padding < 0 || content.size + 1 + padding > TLS_MAX_PLAINTEXT + 1) {
         return cryptoFailed("tls: record padding out of range")
     }
+    if (protection.sequence >= TLS_MAX_SEQUENCE) return cryptoFailed("tls: the record sequence number is exhausted")
     val zeros: array<int> = []
     while (zeros.size < padding) zeros.append(0)
     val inner = content + cryptoByteString([contentType]) + cryptoByteString(zeros)
@@ -115,6 +133,7 @@ fun tlsOpenRecord(var protection: TlsRecordProtection, record: string): TlsOpene
     if (header.length > TLS_MAX_CIPHERTEXT) return tlsOpenFailed("tls: record overflow")
     if (header.length != record.size - 5) return tlsOpenFailed("tls: the record length does not match")
     if (header.length < 17) return tlsOpenFailed("tls: a protected record shorter than its tag and type")
+    if (protection.sequence >= TLS_MAX_SEQUENCE) return tlsOpenFailed("tls: the record sequence number is exhausted")
     val opened = tlsOpen(protection.aead, protection.key, tlsRecordNonce(protection.iv, protection.sequence),
         record.slice(5, record.size), record.slice(0, 5))
     if (!opened.ok) return tlsOpenFailed("tls: bad record MAC")

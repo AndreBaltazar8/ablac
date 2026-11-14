@@ -37,6 +37,7 @@ fun random(count: int): string {
     cryptoByteString(bytes)
 }
 
+fun failingRandom(count: int): string = ""
 fun read(path: string): string = linuxReadFile(path, 1048576)
 fun now(): int = linuxRealtimeNanoseconds() / 1000000000
 
@@ -322,6 +323,107 @@ fun main: int {
         if (fuzzServer.connected() && !fuzzServer.failed() && !fuzzClient.connected()) fail("a damaged hello connected only the server")
     }
 
+
+    // ---- #823: the remainder of the review ----
+    // TlsServer.suite is the TLS 1.2 suite after a TLS 1.2 handshake too (checked above for every suite; once here).
+    {
+        var s12 = tlsServerNew(TlsServerConfig(ed, [], [TLS_GROUP_X25519], [], random, false, false, acceptAny,
+            [TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256]))
+        var c12 = clientFor(edStore, "localhost")
+        pump(c12, s12)
+        if (!s12.connected() || s12.suite != TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256) fail("TlsServer.suite after TLS 1.2: ${s12.suite}")
+    }
+    // A close_notify before the handshake is done ends it at once, for a client and for a server.
+    {
+        var c = clientFor(edStore, "localhost")
+        c.takeOutput()
+        c.feed(tlsPlaintextRecord(TLS_ALERT, 771, cryptoByteString([1, 0])))
+        if (!c.failed()) fail("a client went on after a close_notify in the handshake")
+        var s = tlsServerNew(baseConfig)
+        var c2 = clientFor(edStore, "localhost")
+        s.feed(c2.takeOutput())
+        s.feed(tlsPlaintextRecord(TLS_ALERT, 771, cryptoByteString([1, 0])))
+        if (!s.failed()) fail("a server went on after a close_notify in the handshake")
+    }
+    // A client certificate flight over 2^14 bytes is split over records: 64 copies of the certificate, TLS 1.3 and 1.2.
+    {
+        val chain: array<string> = []
+        for (i in 0 until 64) chain.append(ed.chain[0])
+        val long = TlsIdentity(chain, ed.schemes, ed.sign)
+        for (version12 in [false, true]) {
+            val serverConfig = TlsServerConfig(ed, if (version12) [] else [TLS_SUITE_AES_128_GCM_SHA256], [TLS_GROUP_X25519], [], random,
+                true, true, acceptAny, [TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256])
+            var s = tlsServerNew(serverConfig)
+            var c = clientFor(edStore, "localhost")
+            c.useIdentity(long)
+            pump(c, s)
+            if (!c.connected() || !s.connected() || !s.clientAuthenticated) {
+                fail("a long client certificate (TLS 1.2 $version12): client [${c.error}] server [${s.error}]")
+            }
+        }
+    }
+    // The sending key is replaced after 2^24 records (AES-GCM, RFC 8446 section 5.5): the data goes on, under a new key.
+    {
+        var s = tlsServerNew(baseConfig)
+        var c = clientFor(edStore, "localhost")
+        pump(c, s)
+        c.write.sequence = 16777215
+        c.send("a")
+        c.send("b")
+        pump(c, s)
+        if (s.failed() || c.failed() || s.takeApplicationData() != "ab") fail("data across the automatic KeyUpdate: [${s.error}] [${c.error}]")
+        if (c.write.sequence > 4) fail("the client did not update its key: sequence ${c.write.sequence}")
+        // And a sequence number past 2^62 seals nothing.
+        var exhausted = tlsRecordProtection(TLS_AEAD_AES_128_GCM, random(16), random(12))
+        exhausted.sequence = TLS_MAX_SEQUENCE
+        if (tlsProtectRecord(exhausted, TLS_APPLICATION_DATA, "x").ok) fail("a record was sealed with an exhausted sequence number")
+    }
+    // TLS_FALLBACK_SCSV with a version below the server's best is inappropriate_fallback.
+    {
+        val groups = [TLS_GROUP_X25519]
+        val pair = tlsGenerateKeyPair(TLS_GROUP_X25519, random)
+        val shares: array<TlsKeyShare> = []
+        if (pair != null) shares.append(TlsKeyShare(pair.group, pair.publicKey))
+        val hello = tlsBuildClientHello(random(32), random(32), [], "localhost", groups, shares, [TLS_SIG_ED25519], [], "",
+            [TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256, 22016])
+        var s = tlsServerNew(baseConfig)
+        s.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 769, hello))
+        if (!s.failed()) fail("a TLS 1.2 ClientHello with the fallback SCSV was served by a TLS 1.3 server")
+        // Without the SCSV the same hello is served (TLS 1.2).
+        val plain = tlsBuildClientHello(random(32), random(32), [], "localhost", groups, shares, [TLS_SIG_ED25519], [], "",
+            [TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256])
+        var s2 = tlsServerNew(baseConfig)
+        s2.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 769, plain))
+        if (s2.failed() && s2.error.contains("fallback")) fail("a TLS 1.2 ClientHello without the SCSV was refused as a fallback")
+    }
+    // Names: a server name with a NUL byte or a '/' (and a protocol list with an empty name) cannot be offered; a server
+    // refuses a ClientHello that carries one.
+    {
+        for (bad in ["a/b", "a b", "a,b"]) {
+            var c = clientFor(edStore, bad)
+            if (!c.failed()) fail("a client was started with the host name [$bad]")
+        }
+        val alpnConfig2 = TlsClientConfig("localhost", [TLS_SUITE_AES_128_GCM_SHA256], [TLS_SIG_ED25519], [""], tlsX509Verifier(edStore, now),
+            random, tlsPatchClientHello)
+        if (!tlsClientNew(alpnConfig2).failed()) fail("a client was started with an empty ALPN protocol name")
+        val pair = tlsGenerateKeyPair(TLS_GROUP_X25519, random)
+        val shares: array<TlsKeyShare> = []
+        if (pair != null) shares.append(TlsKeyShare(pair.group, pair.publicKey))
+        val nul = tlsBuildClientHello(random(32), random(32), [TLS_SUITE_AES_128_GCM_SHA256], "bad\x00name", [TLS_GROUP_X25519], shares,
+            [TLS_SIG_ED25519], [], "")
+        var s = tlsServerNew(baseConfig)
+        s.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 769, nul))
+        if (!s.failed()) fail("a server accepted a server name with a NUL byte")
+    }
+    // A random source that fails is an error, not a hello with short randoms.
+    {
+        val broken = tlsClientNew(tlsClientConfig("localhost", tlsX509Verifier(edStore, now), failingRandom))
+        if (!broken.failed() || !broken.error.contains("random")) fail("a client started with a failing random source: [${broken.error}]")
+        var s = tlsServerNew(TlsServerConfig(ed, [TLS_SUITE_AES_128_GCM_SHA256], [TLS_GROUP_X25519], [], failingRandom, false, false, acceptAny))
+        var c = clientFor(edStore, "localhost")
+        pump(c, s)
+        if (!s.failed()) fail("a server went on with a failing random source")
+    }
     if (failures > 0) return 1
     println("tls-pure server ok")
     0

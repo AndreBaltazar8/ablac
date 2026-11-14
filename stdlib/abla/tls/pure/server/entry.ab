@@ -237,6 +237,12 @@ private fun TlsServer.handleClientHello(message: string, body: string): void {
         this.fail(TLS_ALERT_DECODE_ERROR, hello.error)
         return
     }
+    // RFC 7507: a client that signals a fallback (TLS_FALLBACK_SCSV, 0x5600) with a version below the server's best was
+    // pushed down by an attacker; TLS 1.3 is the server's best when it has suites for it.
+    if (tlsServerListHas(hello.suites, 22016) && this.config.suites.size > 0 && !tlsServerListHas(hello.versions, 772)) {
+        this.fail(TLS_ALERT_INAPPROPRIATE_FALLBACK, "tls: the client's fallback to a lower version")
+        return
+    }
     if (!tlsServerListHas(hello.versions, 772) || this.config.suites.size == 0) {
         // No TLS 1.3 (the client does not offer it, or this server is TLS 1.2 only): a TLS 1.2 client (supported_versions absent or listing 3.3, legacy_version 3.3 or more).
         if (this.config.suites12.size > 0 && this.state == TLS_SERVER_WAIT_CLIENT_HELLO && hello.legacyVersion >= 771 &&
@@ -356,7 +362,12 @@ private fun TlsServer.handleClientHello(message: string, body: string): void {
     this.negotiatedAlpn = alpn
     this.transcript.add(message)
     // ServerHello (plaintext), then the key schedule and the encrypted flight.
-    val serverHello = tlsBuildServerHello(this.config.random(32), hello.sessionId, suite,
+    val serverRandom13 = this.config.random(32)
+    if (serverRandom13.size != 32) {
+        this.fail(TLS_ALERT_INTERNAL_ERROR, "tls: the random source failed")
+        return
+    }
+    val serverHello = tlsBuildServerHello(serverRandom13, hello.sessionId, suite,
         TlsKeyShare(pair.group, pair.publicKey))
     this.transcript.add(serverHello)
     this.outbox = this.outbox + tlsPlaintextRecord(TLS_HANDSHAKE, 771, serverHello)
@@ -372,12 +383,20 @@ private fun TlsServer.handleClientHello(message: string, body: string): void {
     return
 }
 
+/** The signature schemes the server lists in its CertificateRequest (TLS 1.3: no PKCS#1 v1.5, section 4.2.3). */
+private fun tlsServerRequestSchemes13(): array<int> =
+    [TLS_SIG_ECDSA_SECP256R1_SHA256, TLS_SIG_RSA_PSS_RSAE_SHA256, TLS_SIG_RSA_PSS_RSAE_SHA384, TLS_SIG_RSA_PSS_RSAE_SHA512,
+        TLS_SIG_ED25519, TLS_SIG_ECDSA_SECP384R1_SHA384]
+
+private fun tlsServerRequestSchemes12(): array<int> =
+    [TLS_SIG_ECDSA_SECP256R1_SHA256, TLS_SIG_RSA_PSS_RSAE_SHA256, TLS_SIG_RSA_PSS_RSAE_SHA384, TLS_SIG_RSA_PSS_RSAE_SHA512,
+        TLS_SIG_ED25519, TLS_SIG_RSA_PKCS1_SHA256]
+
 private fun TlsServer.sendFlight(scheme: int): void {
     var flight = tlsBuildEncryptedExtensions(this.negotiatedAlpn)
     this.transcript.add(flight)
     if (this.config.requestClientCertificate) {
-        val request = tlsBuildCertificateRequest("", [TLS_SIG_ECDSA_SECP256R1_SHA256, TLS_SIG_RSA_PSS_RSAE_SHA256,
-            TLS_SIG_RSA_PSS_RSAE_SHA384, TLS_SIG_RSA_PSS_RSAE_SHA512, TLS_SIG_ED25519, TLS_SIG_ECDSA_SECP384R1_SHA384])
+        val request = tlsBuildCertificateRequest("", tlsServerRequestSchemes13())
         this.transcript.add(request)
         flight = flight + request
     }
@@ -439,6 +458,11 @@ private fun TlsServer.handleClientCertificateVerify(message: string, body: strin
         this.fail(TLS_ALERT_DECODE_ERROR, "tls: malformed CertificateVerify")
         return
     }
+    // The scheme must be one the CertificateRequest listed, and never PKCS#1 v1.5 in TLS 1.3 (RFC 8446 section 4.4.3).
+    if (!tlsServerListHas(tlsServerRequestSchemes13(), parsed.scheme)) {
+        this.fail(TLS_ALERT_ILLEGAL_PARAMETER, "tls: the client signed with a scheme that was not requested")
+        return
+    }
     val content = tlsCertificateVerifyContent(false, this.transcript.hash(this.hash))
     val verdict = this.config.clientVerifier(this.clientChain, parsed.scheme, content, parsed.signature)
     if (!verdict.accepted()) {
@@ -485,6 +509,15 @@ private fun TlsServer.handleKeyUpdate(body: string): void {
     this.setKeys(this.clientApplicationSecret, false)
     // One answer for a batch of requests: it goes out before the next application data (section 4.6.3).
     if (body[0] == 1) this.keyUpdateOwed = true
+    return
+}
+
+/** Updates the sending key when it has protected as many records as its cipher allows (RFC 8446 section 5.5). */
+private fun TlsServer.rekeyIfDue(): void {
+    if (this.write.sequence < tlsRecordLimit(this.write.aead)) return
+    this.queueRecord(TLS_HANDSHAKE, tlsHandshakeMessage(TLS_KEY_UPDATE, tlsU8(0)))
+    this.serverApplicationSecret = tlsNextTrafficSecret(this.hash, this.serverApplicationSecret)
+    this.setKeys(this.serverApplicationSecret, true)
     return
 }
 
@@ -549,6 +582,12 @@ private fun TlsServer.handleAlert(content: string): void {
         return
     }
     if (content[1] == TLS_ALERT_CLOSE_NOTIFY) {
+        if (this.state != TLS_SERVER_CONNECTED) {
+            // A close_notify before the handshake is done ends it: there is no connection to close cleanly.
+            this.state = TLS_SERVER_FAILED
+            this.error = "tls: the peer closed the connection during the handshake"
+            return
+        }
         this.peerClosed = true
         if (!this.sentClose) this.queueAlert(TLS_ALERT_CLOSE_NOTIFY)
         this.sentClose = true
@@ -674,6 +713,7 @@ fun TlsServer.send(data: string): bool {
     var offset = 0
     while (offset < data.size && this.state == TLS_SERVER_CONNECTED) {
         val end = if (data.size - offset > TLS_MAX_PLAINTEXT) offset + TLS_MAX_PLAINTEXT else data.size
+        this.rekeyIfDue()
         this.queueRecord(TLS_APPLICATION_DATA, data.slice(offset, end))
         offset = end
     }
@@ -765,6 +805,7 @@ private fun TlsServer.startV12(message: string, hello: TlsClientHello): void {
     }
     this.v12 = true
     this.v12Suite = chosen.code
+    this.suite = chosen.code
     this.hash = chosen.hash
     this.v12Pair = pair
     this.clientRandom = hello.random
@@ -772,6 +813,10 @@ private fun TlsServer.startV12(message: string, hello: TlsClientHello): void {
     this.serverName = hello.serverName
     this.negotiatedAlpn = alpn
     this.serverRandom = this.config.random(32)
+    if (this.serverRandom.size != 32) {
+        this.fail(TLS_ALERT_INTERNAL_ERROR, "tls: the random source failed")
+        return
+    }
     // A TLS 1.3-capable server that negotiates TLS 1.2 says so in its random (RFC 8446 section 4.1.3).
     if (this.config.suites.size > 0) this.serverRandom = this.serverRandom.slice(0, 24) + "DOWNGRD" + tlsU8(1)
     this.transcript.add(message)
@@ -795,8 +840,7 @@ private fun TlsServer.startV12(message: string, hello: TlsClientHello): void {
     this.transcript.add(keyExchange)
     var flight = serverHello + certificate + keyExchange
     if (this.config.requestClientCertificate) {
-        val request = tls12BuildCertificateRequest([TLS_SIG_ECDSA_SECP256R1_SHA256, TLS_SIG_RSA_PSS_RSAE_SHA256,
-            TLS_SIG_RSA_PSS_RSAE_SHA384, TLS_SIG_RSA_PSS_RSAE_SHA512, TLS_SIG_ED25519, TLS_SIG_RSA_PKCS1_SHA256])
+        val request = tls12BuildCertificateRequest(tlsServerRequestSchemes12())
         this.transcript.add(request)
         flight = flight + request
     }
@@ -809,12 +853,18 @@ private fun TlsServer.startV12(message: string, hello: TlsClientHello): void {
 }
 
 private fun TlsServer.queueRecord12(type: int, content: string): void {
-    val sealed = tls12Protect(this.v12Write, type, content)
-    if (!sealed.ok) {
-        this.fail(TLS_ALERT_INTERNAL_ERROR, sealed.error)
-        return
+    // Over 2^14 bytes the content is split over several records (a client certificate chain, say).
+    var offset = 0
+    while (offset < content.size || offset == 0) {
+        val end = if (content.size - offset > TLS_MAX_PLAINTEXT) offset + TLS_MAX_PLAINTEXT else content.size
+        val sealed = tls12Protect(this.v12Write, type, content.slice(offset, end))
+        if (!sealed.ok) {
+            this.fail(TLS_ALERT_INTERNAL_ERROR, sealed.error)
+            return
+        }
+        this.outbox = this.outbox + sealed.bytes
+        offset = end
     }
-    this.outbox = this.outbox + sealed.bytes
     return
 }
 
@@ -863,6 +913,10 @@ private fun TlsServer.handleClientCertificateVerify12(message: string, body: str
     val parsed = tlsParseCertificateVerify(body)
     if (!parsed.ok) {
         this.fail(TLS_ALERT_DECODE_ERROR, "tls: malformed CertificateVerify")
+        return
+    }
+    if (!tlsServerListHas(tlsServerRequestSchemes12(), parsed.scheme)) {
+        this.fail(TLS_ALERT_ILLEGAL_PARAMETER, "tls: the client signed with a scheme that was not requested")
         return
     }
     // The signature covers every handshake message before this one.

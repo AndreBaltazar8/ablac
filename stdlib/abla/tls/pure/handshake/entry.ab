@@ -5,6 +5,7 @@
 
 import "abla/crypto"
 import "abla/text"
+import "abla/process/exit"
 
 // ---- handshake message types and code points ----
 val TLS_CLIENT_HELLO = 1
@@ -58,8 +59,37 @@ fun tlsU32(value: int): string =
     cryptoByteString([(value >> 24) & 255, (value >> 16) & 255, (value >> 8) & 255, value & 255])
 
 /** `data` with a one-, two- or three-byte length in front. */
-fun tlsVec8(data: string): string = tlsU8(data.size) + data
-fun tlsVec16(data: string): string = tlsU16(data.size) + data
+/** A vector with a one- or two-byte length prefix. A longer one would write a wrong length: that is a bug of the caller
+ *  (a name or a list that was not validated), and the encoder stops the program rather than put it on the wire. */
+fun tlsVec8(data: string): string {
+    if (data.size > 255) panic("tlsVec8: ${data.size} bytes do not fit")
+    return tlsU8(data.size) + data
+}
+
+fun tlsVec16(data: string): string {
+    if (data.size > 65535) panic("tlsVec16: ${data.size} bytes do not fit")
+    return tlsU16(data.size) + data
+}
+
+/** A server name (RFC 6066 section 3): 1 to 255 bytes of letters, digits, '.', '-' and '_'. Anything else (a NUL byte, '/',
+ *  spaces, a list of names) is not a host name. */
+fun tlsServerNameValid(name: string): bool {
+    if (name.size == 0 || name.size > 255) return false
+    for (c in name) {
+        if (!((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 46 || c == 45 || c == 95)) return false
+    }
+    true
+}
+
+/** ALPN protocol names (RFC 7301): each 1 to 255 bytes, the list at most 65535 bytes in all. */
+fun tlsAlpnNamesValid(names: array<string>): bool {
+    var total = 0
+    for (name in names) {
+        if (name.size == 0 || name.size > 255) return false
+        total = total + 1 + name.size
+    }
+    total <= 65535
+}
 fun tlsVec24(data: string): string = tlsU24(data.size) + data
 
 /** A handshake message: type, three-byte length, body. */
@@ -564,7 +594,10 @@ fun tlsParseClientHello(body: string): TlsClientHello {
             while (list.remaining() > 2 && list.ok) {
                 val type = list.u8()
                 val name = list.vec16()
-                if (type == 0 && serverName == "") serverName = name
+                if (type == 0) {
+                    if (serverName != "" || !tlsServerNameValid(name)) return tlsBadClientHello("tls: an invalid or repeated server name")
+                    serverName = name
+                }
             }
             if (!data.finished() || !list.finished()) return tlsBadClientHello("tls: malformed server_name")
         } else if (extension.type == 11) {

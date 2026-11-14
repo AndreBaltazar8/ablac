@@ -32,10 +32,12 @@ private fun tlsPurePlaceholderServer(): TlsServer =
  *  1 configuration, 2 tcp_connect, 8 socket_attach, 9 handshake, 10 certificate_verification, 12 server handshake,
  *  13 timed out. */
 resource class TlsPureConnection(var tcp: TcpConnection, var client: TlsClient, var server: TlsServer,
-    var isServer: bool, var lastError: string, var stage: int) {
+    var isServer: bool, var lastError: string, var stage: int, var broken: bool = false) {
     fun drop(): void {
         if (this.tcp.descriptor >= 0) {
+            // close_notify goes out best effort (a broken connection has nothing sane to send).
             this.closeMachine()
+            if (!this.broken) this.flush()
             this.tcp.close()
         }
         return
@@ -102,6 +104,8 @@ private fun TlsPureConnection.flush(): bool {
     if (data.size == 0) return true
     val result = this.tcp.writeResult(data)
     if (!result.succeeded()) {
+        // Part of a record may be on the wire: nothing more can be written to this stream (a timeout is final).
+        this.broken = true
         val timedOut = result.timedOut() || result.errorCode == 11
         this.lastError = if (timedOut) "TLS read or write timed out" else "TLS write failed"
         this.stage = if (timedOut) 13 else 9
@@ -236,6 +240,16 @@ fun TlsPureConnection.ok(): bool = this.tcp.descriptor >= 0 && this.connected()
 fun TlsPureConnection.read(maximum: int = 65536): string {
     this.lastError = ""
     this.stage = 0
+    if (maximum <= 0) {
+        this.lastError = "TLS read of no bytes"
+        this.stage = 9
+        return ""
+    }
+    if (this.broken) {
+        this.lastError = "TLS connection broken by an earlier write failure"
+        this.stage = 9
+        return ""
+    }
     while (true) {
         val buffered = this.pending()
         if (buffered.size > 0) {
@@ -273,6 +287,11 @@ fun TlsPureConnection.read(maximum: int = 65536): string {
 
 /** Sends all of `contents`; the bytes taken, or -1 on failure. */
 fun TlsPureConnection.write(contents: string): int {
+    if (this.broken) {
+        this.lastError = "TLS connection broken by an earlier write failure"
+        this.stage = 9
+        return -1
+    }
     if (!this.sendData(contents)) return -1
     if (!this.flush()) return -1
     contents.size
