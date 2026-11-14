@@ -1,0 +1,65 @@
+import "abla/io"
+import "abla/text"
+
+// Threads hammering the heap with the compiler's allocation pattern (many small strings and arrays, maps that grow,
+// objects linked into lists, some large buffers), at once: the heap's one lock is taken and released millions of times
+// from every thread, so a lost wakeup (a thread asleep on a lock nobody will release) shows up as a hang, which
+// tools/test-heap-stress.sh's watchdog turns into stacks. Each thread checks what it built, so a corrupted heap shows
+// as a wrong sum.
+
+class Cell(val value: int, val label: string)
+
+fun work(seed: int, rounds: int): int {
+    var state = seed * 2654435761 + 12345
+    var checksum = 0
+    for (round in 0 until rounds) {
+        val names: array<string> = []
+        val table: Map<string, int> = Map()
+        val cells: array<Cell> = []
+        var expected = 0
+        for (index in 0 until 600) {
+            state = (state * 6364136223846793005 + 1442695040888963407) & 0x7fffffffffffffff
+            val size = (state >> 16) % 40
+            val name = "key-$seed-$round-$index-" + "x".repeat(size)
+            names.append(name)
+            table.set(name, index)
+            cells.append(Cell(index, name))
+            expected = expected + index
+        }
+        var seen = 0
+        for (position in 0 until names.size) {
+            if (table.get(names[position]) == position) seen = seen + position
+        }
+        if (seen != expected) return -1
+        var walked = 0
+        for (cell in cells) walked = walked + cell.value + cell.label.size - cell.label.size
+        if (walked != expected) return -2
+        // A few large buffers, freed when the round ends.
+        val big: array<int> = []
+        val count = 2000 + (state >> 8) % 60000
+        for (item in 0 until count) big.append(item)
+        var total = 0
+        for (item in big) total = total + item
+        if (total != count * (count - 1) / 2) return -3
+        checksum = checksum + walked
+    }
+    checksum
+}
+
+fun main: int {
+    val a = thread { work(1, 60) }
+    val b = thread { work(2, 60) }
+    val c = thread { work(3, 60) }
+    val d = thread { work(4, 60) }
+    val e = thread { work(5, 60) }
+    val f = thread { work(6, 60) }
+    val g = thread { work(7, 60) }
+    val mine = work(8, 60)
+    val sums = [await a, await b, await c, await d, await e, await f, await g, mine]
+    var failed = 0
+    for (sum in sums) {
+        if (sum < 0) failed = failed + 1
+    }
+    println(if (failed == 0) "heap stress ok" else "heap stress FAILED ${failed} threads")
+    failed
+}
