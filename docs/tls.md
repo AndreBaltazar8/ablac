@@ -109,16 +109,29 @@ list of what fails today and why).
 driver that has done its own plaintext exchange on the socket first, such as PostgreSQL's SSLRequest). Nothing in it
 blocks or sets a timeout; it tells you what it needs from the socket:
 
-```abla
+```abla build
+import "abla/sys/linux/net"
 import "abla/tls/pure"
 
-val session = tlsSessionClient(descriptor, "db.example.com", TLS_VERIFY_HOST, "")   // descriptor: connected, non-blocking
-var status = session.handshake()
-while (status == TLS_IO_WANT_READ || status == TLS_IO_WANT_WRITE) {
-    poll(descriptor, status == TLS_IO_WANT_READ, status == TLS_IO_WANT_WRITE)        // your event loop
-    status = session.handshake()
+// `descriptor`: a connected, non-blocking TCP socket (here the caller made it; a driver would hand over the one it used
+// for its own plaintext exchange). The poll is your event loop's.
+fun handshakeOn(descriptor: int): bool {
+    val session = tlsSessionClient(descriptor, "db.example.com", TLS_VERIFY_HOST, "")
+    var status = session.handshake()
+    while (status == TLS_IO_WANT_READ || status == TLS_IO_WANT_WRITE) {
+        linuxPollSocket(descriptor, status == TLS_IO_WANT_READ, status == TLS_IO_WANT_WRITE, 5000)
+        status = session.handshake()
+    }
+    // status 1: connected; -1: failed, session.detail() says why.
+    status == 1
 }
-// status 1: connected; -1: failed, session.detail() says why.
+
+fun main: int {
+    val socket = tcpConnectIpv6(ipv6Loopback(5432), 1000)
+    if (socket.descriptor < 0) return 1
+    socket.setNonblocking(true)
+    if (handshakeOn(socket.descriptor)) 0 else 1
+}
 ```
 
 - `handshake()` returns 1 (done), 2 (wait for the socket to be readable), 3 (writable) or -1.
