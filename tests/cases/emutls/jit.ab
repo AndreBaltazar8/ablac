@@ -1,0 +1,54 @@
+// Run with `ablac run`: the program is JIT-compiled and its own runtime keeps each thread's transaction descriptor and
+// root-frame head in thread-locals, which the JIT lowers to ___emutls_get_address (the compiler's abla/runtime/emutls). Five
+// threads run transactions, allocate managed garbage and force collections of this program's heap, as the roots of
+// every thread are walked: the total at the end, and every thread's own checks, must be exact (#826).
+import "abla/io"
+import "abla/memory"
+
+var counter: int by TVar(0)
+
+fun worker(tag: int, rounds: int): int {
+    var round = 0
+    var sum = 0
+    while (round < rounds) {
+        val garbage: array<string> = []
+        var made = 0
+        while (made < 100) {
+            garbage.append("garbage $made $round $tag")
+            made = made + 1
+        }
+        atomic { counter += 1 }
+        if (round % 8 == 0) memoryCollect()
+        // The garbage and the transaction's value survive the collection.
+        if (garbage.size != 100 || garbage[99] != "garbage 99 $round $tag") return 1000 + round
+        sum = sum + garbage[50].size
+        round = round + 1
+    }
+    if (sum <= 0) return 2
+    0
+}
+
+fun main: int {
+    val first = thread { worker(1, 300) }
+    val second = thread { worker(2, 300) }
+    val third = thread { worker(3, 300) }
+    val fourth = thread { worker(4, 300) }
+    val own = worker(5, 300)
+    val results = [own, await first, await second, await third, await fourth]
+    var failures = 0
+    var index = 0
+    while (index < 5) {
+        if (results[index] != 0) {
+            println("thread $index: ${results[index]}")
+            failures = failures + 1
+        }
+        index = index + 1
+    }
+    val total = atomic { counter }
+    if (total != 1500) {
+        println("the counter is $total, not 1500")
+        failures = failures + 1
+    }
+    if (failures == 0) println("jit emutls ok")
+    failures
+}

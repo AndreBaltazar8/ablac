@@ -24,6 +24,10 @@ for mode in release fast; do
     [[ $result == *"emutls leak per thread: "* ]] || { echo "emutls ($mode): no leak line: $result" >&2; exit 1; }
     printf '%s\n' "$result" | grep 'emutls leak'
 done
+# A JIT-compiled program (`ablac run`): its runtime's own thread-locals (transaction descriptor, root-frame head) go through the
+# compiler's ___emutls_get_address while five threads run transactions and force collections of the program's heap.
+result=$("$compiler" run tests/cases/emutls/jit.ab 2>&1) || { echo "emutls (run): $result" >&2; exit 1; }
+[[ $result == *"jit emutls ok"* ]] || { echo "emutls (run): $result" >&2; exit 1; }
 tools_dir=${ABLA_LLVM_TOOLS:-}
 if [[ -z $tools_dir ]] || [[ ! -x $tools_dir/llc || ! -x $tools_dir/llvm-nm ]]; then
     tools_dir=$(dirname "$(command -v llc 2>/dev/null || true)")
