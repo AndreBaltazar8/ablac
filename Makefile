@@ -222,6 +222,7 @@ test-serial: ablac
 	tools/test-scoped-region.sh $(COMPILER)
 	tools/test-memory-promote.sh $(COMPILER)
 	tools/test-region-extension-names.sh $(COMPILER)
+	tools/test-region-member-names.sh $(COMPILER)
 	tools/test-null-default-leave.sh $(COMPILER)
 	tools/test-exhaustive-when.sh $(COMPILER)
 	tools/test-loop-control.sh $(COMPILER)

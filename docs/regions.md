@@ -71,6 +71,12 @@ fun main {
 // error: region.call-retention:rememberFile
 ```
 
+A method call is held to the method it calls: when the receiver's type is a
+class (or has an extension of that name), only that class's method counts, so
+`counter.dispatch(x)` stays callable in a region even if an unrelated
+`Keeper.dispatch` stores its argument. A call on an interface value may reach
+any implementation, so it is refused when any method of that name may retain.
+
 The rest of this page gives the complete rules.
 
 ## Why a checked form

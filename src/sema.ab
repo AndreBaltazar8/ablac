@@ -2313,7 +2313,9 @@ fun bootstrapCopyRegionCallSummary(
         bootstrapStringSetCopy(source.unsafeMembers),
         bootstrapStringSetCopy(source.retainingReceivers),
         bootstrapStringSetCopy(source.retainingParameters),
-        bootstrapStringSetCopy(source.heapFields)
+        bootstrapStringSetCopy(source.heapFields),
+        bootstrapStringSetCopy(source.declaredMembers),
+        source.fieldTypes
     )
 }
 
@@ -5823,7 +5825,13 @@ fun bootstrapCallersOf(
 // `unsafe` holds unsafeNames, `unsafeMembers` every part of one after a dot
 // (a member call `x.name` is unsafe when some unsafe `….name` is), and
 // `heapFields` the `owner\nfield` pairs whose field holds heap memory
-// (bootstrapRegionHeapFields).
+// (bootstrapRegionHeapFields). `declaredMembers` holds `Class.method` for every
+// method a class declares and `Owner.name` for every extension function, and
+// `fieldTypes` maps `Class.field` to a constructor field's declared type:
+// with them a member call whose receiver is statically a class is decided by
+// the declaration it resolves to (#827). Classes are final, so a class-typed
+// receiver reaches its own method or none; any other receiver (an interface,
+// an unknown type) falls back to the name, as any `….name` might answer it.
 class BootstrapRegionCallSummary(
     val unsafeNames: array<string>,
     val retainingReceiverNames: array<string>,
@@ -5832,7 +5840,9 @@ class BootstrapRegionCallSummary(
     val unsafeMembers: BootstrapStringSet,
     val retainingReceivers: BootstrapStringSet,
     val retainingParameters: BootstrapStringSet,
-    val heapFields: BootstrapStringSet
+    val heapFields: BootstrapStringSet,
+    val declaredMembers: BootstrapStringSet,
+    val fieldTypes: Map<string, string>
 )
 
 // A top-level body's name in the summary: an extension function's is
@@ -5864,11 +5874,6 @@ fun bootstrapRegionCallIsUnsafe(
     summary: BootstrapRegionCallSummary,
     name: string
 ): bool = summary.unsafe.contains(name)
-
-fun bootstrapRegionMemberCallIsUnsafe(
-    summary: BootstrapRegionCallSummary,
-    name: string
-): bool = summary.unsafeMembers.contains(name)
 
 fun bootstrapRegionReceiverCallIsRetaining(
     summary: BootstrapRegionCallSummary,
@@ -5968,6 +5973,76 @@ fun bootstrapRegionHeapFields(
         pair = pair + 1
     }
     result
+}
+
+// `Class.method` for every method a class declares, and `Owner.name` for every
+// extension function (bootstrapRegionBodyName): the members a call on a
+// receiver of that static type resolves to (#827).
+fun bootstrapRegionDeclaredMembers(
+    declarations: array<BootstrapDeclaration>
+): BootstrapStringSet {
+    val members = bootstrapStringSet()
+    for (declaration in declarations) {
+        if (declaration.extensionOwner != "") {
+            members.add(bootstrapRegionBodyName(declaration))
+        }
+        if (declaration.kind == "class") {
+            for (method in declaration.methods) members.add("${declaration.name}.${method.name}")
+        }
+    }
+    members
+}
+
+// `Class.field` to the declared type of a class's constructor field.
+fun bootstrapRegionFieldTypes(
+    declarations: array<BootstrapDeclaration>
+): Map<string, string> {
+    val types: Map<string, string> = Map()
+    for (declaration in declarations) {
+        if (declaration.kind == "class") {
+            var field = 0
+            while (field < declaration.parameters.size && field < declaration.parameterTypes.size) {
+                types.set("${declaration.name}.${declaration.parameters[field]}",
+                    bootstrapNormalizeType(declaration.parameterTypes[field]))
+                field = field + 1
+            }
+        }
+    }
+    types
+}
+
+// Whether a member call `receiver.name` may retain region memory. When the
+// receiver's static type declares `name` (a class's own method, or an
+// extension on that type), only that declaration counts; otherwise any unsafe
+// `….name` does, as an interface or unknown receiver might reach it.
+fun bootstrapRegionResolvedMemberIsUnsafe(
+    summary: BootstrapRegionCallSummary,
+    receiverType: string,
+    name: string
+): bool {
+    var owner = receiverType
+    if (owner.endsWith("?")) owner = owner.slice(0, owner.size - 1)
+    val key = "$owner.$name"
+    if (owner != "" && summary.declaredMembers.contains(key)) return summary.unsafe.contains(key)
+    summary.unsafeMembers.contains(name)
+}
+
+// The static type of a member call's receiver while the summary is built,
+// where nothing is inferred yet: `this` is the enclosing class (or extension
+// owner) and `this.field` that class's declared field type; anything else is
+// unknown ("").
+fun bootstrapRegionSummaryReceiverType(
+    receiver: BootstrapExpression,
+    owner: string,
+    summary: BootstrapRegionCallSummary
+): string {
+    if (owner == "") return ""
+    if (receiver.kind == "identifier" && receiver.text == "this") return owner
+    if (receiver.kind == "member" && receiver.children.size == 1 &&
+        receiver.children[0].kind == "identifier" && receiver.children[0].text == "this") {
+        return summary.fieldTypes.get("$owner.${receiver.text}") ?? ""
+    }
+    ""
 }
 
 fun bootstrapRegionFieldIsHeap(
@@ -6206,9 +6281,15 @@ fun bootstrapRegionExpressionRetainsReceiver(
     retaining
 }
 
+fun bootstrapRegionExtensionOwner(declaration: BootstrapDeclaration): string =
+    if (declaration.extensionOwner == "") "" else bootstrapNormalizeType(declaration.extensionOwner)
+
+// `owner`: the class (or extension owner) whose body this is, for `this` and
+// `this.field` receivers; "" elsewhere.
 fun bootstrapRegionExpressionCallsUnsafe(
     expression: BootstrapExpression,
-    summary: BootstrapRegionCallSummary
+    summary: BootstrapRegionCallSummary,
+    owner: string = ""
 ): bool {
     var unsafe = false
     if (expression.kind == "call" && expression.text != "move" &&
@@ -6223,8 +6304,11 @@ fun bootstrapRegionExpressionCallsUnsafe(
         expression.text != "downgrade" &&
         expression.text != "upgrade" &&
         expression.text != "isAlive") {
-        unsafe = bootstrapRegionMemberCallIsUnsafe(
+        val receiverType = if (expression.children.size > 0)
+            bootstrapRegionSummaryReceiverType(expression.children[0], owner, summary) else ""
+        unsafe = bootstrapRegionResolvedMemberIsUnsafe(
             summary,
+            receiverType,
             expression.text
         )
     }
@@ -6232,7 +6316,8 @@ fun bootstrapRegionExpressionCallsUnsafe(
     while (!unsafe && child < expression.children.size) {
         unsafe = bootstrapRegionExpressionCallsUnsafe(
             expression.children[child],
-            summary
+            summary,
+            owner
         )
         child = child + 1
     }
@@ -6465,7 +6550,9 @@ fun bootstrapBuildRegionCallSummary(
     val summary = BootstrapRegionCallSummary(
         [], [], [], bootstrapStringSet(), bootstrapStringSet(),
         bootstrapStringSet(), bootstrapStringSet(),
-        bootstrapRegionHeapFields(declarations)
+        bootstrapRegionHeapFields(declarations),
+        bootstrapRegionDeclaredMembers(declarations),
+        bootstrapRegionFieldTypes(declarations)
     )
     var declarationIndex = 0
     while (declarationIndex < declarations.size) {
@@ -6567,7 +6654,8 @@ fun bootstrapBuildRegionCallSummary(
                     !bootstrapRegionCallIsUnsafe(summary, bodyName) &&
                     bootstrapRegionExpressionCallsUnsafe(
                         declaration.expression,
-                        summary
+                        summary,
+                        bootstrapRegionExtensionOwner(declaration)
                     )) {
                     bootstrapRegionAddUnsafe(summary, bodyName)
                     changed = true
@@ -6597,7 +6685,8 @@ fun bootstrapBuildRegionCallSummary(
                 if (!bootstrapRegionCallIsUnsafe(summary, name) &&
                     (bootstrapRegionExpressionCallsUnsafe(
                         method.expression,
-                        summary
+                        summary,
+                        declaration.name
                     ) || (moduleRecheck.contains(name) &&
                         bootstrapRegionExpressionStoresModuleValue(
                             method.expression,
@@ -14824,9 +14913,12 @@ fun bootstrapInferMemberCall(
 ): string {
     var result = initial
     var resolvedTarget = -1
+    // Decided by the declaration the receiver's static type resolves to, when
+    // it names one (#827); by the method's name otherwise.
     if (analyzer.regionDepth > 0 &&
-        bootstrapRegionMemberCallIsUnsafe(
+        bootstrapRegionResolvedMemberIsUnsafe(
             analyzer.regionCalls,
+            bootstrapNormalizeType(bootstrapBorrowElementType(receiver)),
             expression.text
         )) {
         analyzer.fail("region.call-retention:${expression.text}")
