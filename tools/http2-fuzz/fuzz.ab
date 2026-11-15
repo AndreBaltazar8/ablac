@@ -16,7 +16,9 @@ import "abla/crypto"
 import "abla/integer"
 import "abla/process/arguments"
 import "abla/http/h2/hpack"
+import "abla/http"
 import "abla/http/h2"
+import "abla/http/h2/server"
 
 var choiceState = 1
 
@@ -264,6 +266,69 @@ fun clientRun(seed: int): void {
     }
     return
 }
+
+// ---- H2Server ----
+/** A plausible client conversation: preface, SETTINGS, requests (with bodies, trailers), resets, window updates, pings, priorities. */
+fun clientScript(): string {
+    var encoder = hpackEncoderNew(4096)
+    var out = H2_PREFACE + fuzzFrame(4, 0, 0, if (below(2) == 0) "" else cryptoByteString([0, 4, 0, 0, below(256), below(256)]))
+    var next = 1
+    val pieces = 2 + below(14)
+    for (i in 0 until pieces) {
+        val kind = below(8)
+        if (kind <= 2) {
+            val fields: array<HpackField> = [HpackField(":method", if (below(3) == 0) "POST" else "GET", false), HpackField(":scheme", "https", false), HpackField(":path", "/" + randomText(10, false), false), HpackField(":authority", "x.test", false), HpackField("x-a", randomText(30, false), false)]
+            out = out + fuzzFrame(1, 4 | below(2), next, encoder.encode(fields))
+            if (below(2) == 0) out = out + fuzzFrame(0, below(2), next, randomText(500, true))
+            next = next + 2
+        } else if (kind == 3) {
+            out = out + fuzzFrame(3, 0, 1 + 2 * below(next), fuzzBe32(below(14)))
+        } else if (kind == 4) {
+            out = out + fuzzFrame(8, 0, if (below(2) == 0) 0 else 1 + 2 * below(next), fuzzBe32(1 + below(100000)))
+        } else if (kind == 5) {
+            out = out + fuzzFrame(6, below(2), 0, "12345678")
+        } else if (kind == 6) {
+            out = out + fuzzFrame(1, 5, 1 + 2 * below(next), encoder.encode([HpackField("x-trailer", "1", false)]))
+        } else {
+            out = out + fuzzFrame(2, 0, 1 + 2 * below(next), "12345")
+        }
+    }
+    out
+}
+
+fun serverRun(seed: int): void {
+    var server = h2ServerNew(4, 100000)
+    server.takeOutput()
+    var answered: array<int> = []
+    val mode = below(3)
+    var input = if (mode == 0) H2_PREFACE + randomFrames() else clientScript()
+    if (mode == 2) input = mutate(input)
+    var at = 0
+    var now = 0
+    while (at < input.size) {
+        val take = 1 + below(if (below(2) == 0) 40 else 3000)
+        val end = if (at + take > input.size) input.size else at + take
+        server.feed(input.slice(at, end), now)
+        at = end
+        now = now + below(300)
+        server.tick(now)
+        for (r in server.takeRequests()) {
+            for (id in answered) {
+                if (id == r.stream) finding(seed, "stream ${r.stream} delivered twice")
+            }
+            answered.append(r.stream)
+            if (below(4) != 0) server.respond(r.stream, 200 + below(5), [HttpHeader("X-B", randomText(20, false))], randomText(70000, false))
+        }
+        if (below(12) == 0) server.shutdown()
+        if (server.takeOutput().size > 4000000) finding(seed, "output past what the input explains")
+        if (server.openStreams() > 4) finding(seed, "more streams than the limit: ${server.openStreams()}")
+    }
+    if (server.isClosed()) {
+        server.feed(clientScript(), now)
+        if (server.takeOutput().size > 0) finding(seed, "output after the connection closed")
+    }
+    return
+}
 fun main: int {
     val firstArg = processArgument(0).parseInt()
     val countArg = processArgument(1).parseInt()
@@ -278,6 +343,7 @@ fun main: int {
         mutated(seed)
         randomBlock(seed)
         clientRun(seed)
+        serverRun(seed)
     }
     if (failures == 0) println("http2-fuzz ok: seeds $first..${first + count - 1}")
     failures
