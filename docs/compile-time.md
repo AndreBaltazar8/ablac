@@ -680,6 +680,12 @@ the compiler's watchdog stops it. Await the thread before anything waits on
 it, or run such code in the [native tier](#native-evaluation), where threads
 run alongside the code that started them, as at run time.
 
+In the native tier, a site that stops (a panic, `exit`, the time limit, a bad
+memory access) while a thread it started is still running ends the build
+there with `E_CT_STOPPED`, naming the stop: that thread can't be stopped, and
+the compiler can't go on beside it. Await every thread before code that can
+stop; a site that has awaited its threads reports its panic as usual.
+
 ## Declaration blocks
 
 In compile-time code, braces whose first member is a declaration (`fun`,

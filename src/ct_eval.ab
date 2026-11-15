@@ -267,7 +267,7 @@ trusted fun bootstrapCtTryEvaluate(
     bootstrapCtCurrentLive = true
     // Compiler API calls the entry makes (bridge shims) run on this evaluator.
     val bridge = ctBridgeEnter(evaluator, site.expression.begin, site.expression.end)
-    val called = bootstrapCtCall(site.entry)
+    val called = bootstrapCtCall(site.entry, bootstrapCtSiteLabel(site))
     evaluator = ctBridgeFrames[ctBridgeTopIndex()].evaluator
     ctBridgeLeave(bridge)
     bootstrapCtCurrent = enclosing
@@ -514,7 +514,10 @@ fun bootstrapCtEvaluate(
 // Calls `entry` of the live generation under its guard, the time limit and the stack
 // fault handler. A stop spends the generation: frames the jump back skipped never
 // popped their collector roots, so nothing more may run on it.
-trusted fun bootstrapCtCall(entry: int): BootstrapCtCallResult {
+trusted fun bootstrapCtCall(entry: int, label: string = ""): BootstrapCtCallResult {
+    // The process's threads before the call (Linux; -1 elsewhere), to tell whether a stop leaves any the
+    // call started still running.
+    val threadsBefore = bootstrapCtThreadCount()
     // The guard writes how the call stopped here (0: it returned).
     val stopped = nativeI64Cell(0)
     val limit = bootstrapCtTimeLimitSeconds()
@@ -530,8 +533,59 @@ trusted fun bootstrapCtCall(entry: int): BootstrapCtCallResult {
     val closed = stopped.close()
     if (how != 0) {
         bootstrapCtGenerationSpent = "an earlier compile-time evaluation of this pass stopped"
+        if (threadsBefore > 0) bootstrapCtStopBesideThreads(threadsBefore, how, label)
     }
     BootstrapCtCallResult(if (how != 0) 0 else value, how)
+}
+
+// The number of threads the process has (the Threads: line of /proc/self/status), or -1 where there is none to read.
+trusted fun bootstrapCtThreadCount(): int {
+    if (ablaHostIsMacOS()) return -1
+    val status = linuxOpen("/proc/self/status", 524288)
+    if (status.descriptor < 0) return -1
+    val text = status.read(8192)
+    status.close()
+    val key = "\nThreads:"
+    var at = 0
+    while (at + key.size <= text.size && text.slice(at, at + key.size) != key) at = at + 1
+    if (at + key.size > text.size) return -1
+    var index = at + key.size
+    while (index < text.size && (text[index] == 9 || text[index] == 32)) index = index + 1
+    var count = 0
+    var digits = 0
+    while (index < text.size && text[index] >= 48 && text[index] <= 57) {
+        count = count * 10 + text[index] - 48
+        index = index + 1
+        digits = digits + 1
+    }
+    if (digits == 0) -1 else count
+}
+
+// A native call stopped (a panic, an abort, the time limit, a bad access) while threads it started may still
+// run its code: the jump back left them running beside the compiler, which then crashed at random (#831: its
+// collector roots and heap, used from both sides). Give a thread that is just ending a moment; if any is still
+// there, the build ends here with the stop's reason, before the compiler goes on.
+trusted fun bootstrapCtStopBesideThreads(threadsBefore: int, how: int, label: string): void {
+    var waited = 0
+    var running = bootstrapCtThreadCount() - threadsBefore
+    while (running > 0 && waited < 500) {
+        linuxSleep(10)
+        waited = waited + 10
+        running = bootstrapCtThreadCount() - threadsBefore
+    }
+    if (running <= 0) return
+    val reason = if (how == 5 && bootstrapCtPanicMessage() != "") "panicked: ${bootstrapCtPanicMessage()}"
+        else if (how == 3) "ran past the time limit"
+        else if (how == 4) "made a bad memory access"
+        else "stopped: a runtime check failed or the code aborted"
+    val site = if (label == "") "" else " at $label"
+    linuxWriteStandardError(
+        "error[E_CT_STOPPED]: compile-time evaluation$site $reason, while $running thread(s) it started still " +
+        "run; the compiler can't go on beside them, so the build stops here (await every thread before code " +
+        "that can stop, or evaluate the site with ABLA_COMPILE_EVAL=interp)\n"
+    )
+    linuxSyscall1(231, 1)
+    return
 }
 
 // --- the time limit -------------------------------------------------------------
