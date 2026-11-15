@@ -83,7 +83,8 @@ must set `alpn` to the protocols it speaks: then a client that offers protocols 
 `no_application_protocol`, (a client that offers no ALPN at all is still accepted:
 require ALPN in the application if that matters). A client that sends ALPN refuses a server's answer that it did not offer.
 A session client offers protocols with `tlsSessionClient(descriptor, host, mode, caPath, sessions, alpn)` (for example `["h2", "http/1.1"]`; `abla/http/async` does this for
-`HttpAsyncOptions.http2`) and reads the server's choice with `TlsSession.alpn()` once the handshake is done ("" if none).
+`HttpAsyncOptions.http2`) and reads the server's choice with `TlsSession.alpn()` once the handshake is done ("" if none). A server offers its list with `tlsServerConfigWithAlpn(config, alpn)` and
+reads the client's pick with `TlsServerSession.alpn()` (`abla/http/event/tls` serves `h2` and `http/1.1` this way).
 
 ## Key exchange groups and the hybrid X25519MLKEM768
 

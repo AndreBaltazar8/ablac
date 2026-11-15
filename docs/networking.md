@@ -420,6 +420,35 @@ What changes with HTTP/2:
   it completes with an error that names the code. `tools/test-http2.sh` runs the tests and the interop (nghttpd, `h2load`, `openssl s_server`); `tools/test-http2-fuzz.sh` fuzzes the HPACK
   decoder and the `H2Client` from a seed.
 
+### HTTPS and HTTP/2 server
+
+`abla/http/event/tls` is the HTTPS counterpart of `HttpEventServer` (the plain HTTP/1.1 event server, which has no TLS): the same handler or router
+(`(HttpRequest) -> HttpResponse`), limits and responses, over TLS from `abla/tls/pure` (no OpenSSL), with HTTP/2 chosen by ALPN.
+
+```abla fragment
+val tls = httpsEventServerTls("fullchain.pem", "privkey.pem")   // TlsServerConfig? offering h2 and http/1.1; null if the certificate or key failed to load
+val server = httpsEventServer(router, ipv4Any(443), tls)
+while (true) server.step(1000)                                // or server.run(): graceful shutdown on SIGTERM
+```
+
+Each connection handshakes without blocking (`handshakeTimeoutMilliseconds`, 5 s); then ALPN `h2` makes it an HTTP/2 connection and anything else HTTP/1.1.
+Without a TLS configuration the server speaks plain TCP: HTTP/1.1, and h2c with prior knowledge for a connection that begins with the HTTP/2 preface (there is no
+`Upgrade: h2c`). `HttpsEventServerOptions(http2 = false)` serves HTTP/1.1 only; `http1 = false` makes the port HTTP/2-only.
+
+The handler runs once per request, and over HTTP/2 once per stream when the request is whole (END_STREAM), on the event loop's thread: nothing in the router API changes.
+Requests and responses are fully buffered (`maximumBodyBytes`; a larger request body is answered 413 and the upload stopped). A response is sent as HEADERS and DATA under
+the client's flow-control windows and a 256 KiB output queue; `connection`, `keep-alive`, `transfer-encoding`, `upgrade` and `host` response headers are dropped, names are
+lower-cased, `content-length` is added, and a response with status 101 becomes a 500 (no WebSocket upgrade over HTTP/2, no push, no streaming bodies, no trailers).
+`abla/http/h2/server` is the sans-IO `H2Server` underneath (`feed`, `takeRequests`, `respond`, `takeOutput`, `shutdown`), for an event loop of your own.
+
+Limits a client cannot talk the server out of (each ends the connection with GOAWAY and the RFC 9113 error code, or resets the stream, and each has a test that fails with
+the check removed): **Rapid Reset** (CVE-2023-44487): more than 200 RST_STREAM frames in a second end the connection with `ENHANCE_YOUR_CALM`, and a request reaches the handler only
+when whole, so a stream reset earlier costs a header decode and nothing else; **CONTINUATION flood**: a header block is limited to 32 CONTINUATION frames and 128 KiB before it is
+decoded, and decoded to 64 KiB, 256 fields and 16 KiB per field (an HPACK bomb is cut by the same limits); more than 100 concurrent streams are refused (`REFUSED_STREAM`);
+1000 frames in a row that carry nothing, 10,000 control frames per second and more than 100 acknowledgements owed (PING, SETTINGS) end the connection; a frame over 16 KiB, a
+window overrun, an unacknowledged SETTINGS for 10 s, and every violation RFC 9113 names a connection error for do too. Conformance: h2spec 2.6.0 passes in strict mode (147 tests, over TLS and over
+h2c); `tools/test-http2-server.sh` also runs our `H2Client`, curl, nghttp, h2load and live attacks against the server, and `tools/test-http2-fuzz.sh` fuzzes `H2Server`.
+
 ### JSON Web Tokens
 
 `abla/jwt` verifies compact JWS tokens signed with RS256 or ES256 against a
@@ -713,7 +742,7 @@ silently acquires hosted dependencies; cross-platform programs select
 `abla/net/hosted`. The bounded DNS client currently implements UDP A/AAAA with
 compression pointers, but not DNSSEC, TCP fallback, IDNA, or a shared cache.
 TLS is hosted and OpenSSL-backed rather than part of the raw syscall target.
-HTTP/2 is an opt-in client feature of `abla/http/async` (above), with no server side; HTTP/3/QUIC, proxy negotiation, and automatic reconnection remain
+HTTP/2 is an opt-in client feature of `abla/http/async` and a server feature of `abla/http/event/tls` (both above); HTTP/3/QUIC, proxy negotiation, and automatic reconnection remain
 separate protocols rather than implicit behavior in the HTTP/1.1 APIs.
 
 ## Tests and benchmark
