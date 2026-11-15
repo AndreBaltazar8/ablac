@@ -747,7 +747,10 @@ mmap form) apply there.
   x86-64 assembly, so an AArch64 `--coverage-functions` build failed to assemble: `popq %rbx: invalid operand`). AArch64
   installs its handlers with SA_RESTART alone (no restorer of its own: SA_RESTORER with a null one would return to 0).
   `tools/test-coverage.sh` runs the fixture under qemu-aarch64 (--fast and release; SIGTERM in --fast, whose wait loop a
-  release build removes).
+  release build removes). **macOS executables** (2026-11-15, ablac-9e): the same dump by the BSD system calls (getpid 20,
+  open 5 with Darwin's O_WRONLY|O_CREAT|O_TRUNC, write, close, rename 128, kill 37, select 93 for the pause, sigaction 46
+  through the program's own trampoline), so the flag adds no libSystem import; `tools/test-coverage-macos.sh` runs it in
+  test-macos-host on both Macs (Mac evidence comes from master's CI). macOS dylibs stay refused (#833).
 - [x] **abla-pdf signs through the released `abla/crypto/rsa`** (since its 1a2c416, as abla-saft does). Its
   64c36d1 checks signatures against OpenSSL and against the old signer, byte for byte, on ablac 0.2.45.
 - [x] **Encrypted RSA key import:** pure PBES2/PBKDF2 SHA256/SHA1 + AES128/256-CBC PKCS#8 and MAC-verified DER PKCS#12 key bags, with owned passwords and bounded work. Legacy PBES1/RC2/DES and broader PFX formats remain unsupported; see [the scope and limits](docs/stdlib/encrypted-keys.md).

@@ -133,8 +133,23 @@ if "$compiler" build "$fixture" -o "$out/refused" --fast --coverage-functions --
     echo "coverage: wasm accepted the flag"; exit 1
 fi
 grep -q 'E_COVERAGE_TARGET' "$out/refused.log" || { cat "$out/refused.log"; echo "coverage: the refusal has no code"; exit 1; }
-if "$compiler" build "$fixture" -o "$out/refused-mac" --fast --coverage-functions --target x86_64-macos > "$out/refused-mac.log" 2>&1; then
-    echo "coverage: macOS accepted the flag"; exit 1
+# A macOS executable dumps by the BSD system calls (it runs in tools/test-coverage-macos.sh on a Mac). Built here for both
+# Macs: the flag is accepted, and the program's object (written before the link, which needs ABLA_MACOS_SDK away from
+# macOS) calls none of the libSystem functions the dump used to (getenv, strstr, snprintf, open, signal, raise, usleep).
+for mac in x86_64-macos arm64-macos; do
+    "$compiler" build "$fixture" -o "$out/mac-$mac" --fast --no-cache --coverage-functions --target "$mac" \
+        > "$out/mac-$mac.log" 2>&1 || true
+    ! grep -q E_COVERAGE_TARGET "$out/mac-$mac.log" || { cat "$out/mac-$mac.log"; echo "coverage: $mac refused the flag"; exit 1; }
+    [ -s "$out/mac-$mac.o" ] || { cat "$out/mac-$mac.log"; echo "coverage: no $mac object"; exit 1; }
+    # llvm-nm: GNU nm cannot read Mach-O (and a failed read must fail here, not pass as "no imports").
+    undefined=$(llvm-nm -u "$out/mac-$mac.o") || { echo "coverage: llvm-nm could not read the $mac object"; exit 1; }
+    imports=$(grep -E "^ *(U )?_(getenv|strstr|snprintf|getpid|open|close|write|rename|signal|raise|usleep)\$" <<< "$undefined" || true)
+    [ -z "$imports" ] || { echo "coverage: the $mac dump calls libSystem:"; echo "$imports"; exit 1; }
+done
+# A macOS dylib is still refused (#833: it links the C adapter).
+if "$compiler" build tests/cases/coverage-lib/lib.ab --emit shared-library -o "$out/refused-mac.dylib" --fast --coverage-functions \
+    --target arm64-macos > "$out/refused-mac.log" 2>&1; then
+    echo "coverage: a macOS dylib accepted the flag"; exit 1
 fi
 grep -q E_COVERAGE_TARGET "$out/refused-mac.log" || { cat "$out/refused-mac.log"; exit 1; }
-echo "coverage: files listed at exit, exit(), panic and SIGTERM; nothing for SIGKILL, an unset variable or an unflagged build; wasm refused"
+echo "coverage: files listed at exit, exit(), panic and SIGTERM (x86-64 and AArch64 Linux); nothing for SIGKILL, an unset variable or an unflagged build; macOS objects by system calls; wasm and macOS dylibs refused"

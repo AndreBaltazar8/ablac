@@ -70,6 +70,8 @@ expect_status_42 "$output_directory/rsa-default-random"
     --fast -o "$output_directory/uuid"
 expect_status_42 "$output_directory/uuid"
 
+# --coverage-functions by the BSD system calls (before the TLS steps, so its evidence survives their failures).
+"$project_root/tools/test-coverage-macos.sh" "$compiler"
 "$project_root/tools/test-device-serial.sh" "$compiler"
 "$project_root/tools/test-path-file-mode.sh" "$compiler"
 "$project_root/tools/test-proc-self-exe.sh" "$compiler"

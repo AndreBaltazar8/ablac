@@ -1,6 +1,6 @@
 // Function coverage (`--coverage-functions`): which source files a program ran.
 //
-// A flagged hosted Linux executable gets one byte per source file that has an instrumented
+// A flagged Linux executable, library or object, or macOS executable, gets one byte per source file that has an instrumented
 // function. Every such function stores 1 into its file's byte as its first act (a relaxed atomic
 // store: a plain `mov`, idempotent, safe from any thread; it is made before optimization, so an
 // inlined body keeps it). At exit the program writes the files whose byte is set, one path per
@@ -13,12 +13,14 @@
 
 import "../../ir.ab"
 import "../../source_rewrite.ab"
+import "../../sema.ab"
 import "core.ab"
 import "analysis.ab"
 import "bindings.ab"
 import "debug.ab"
 import "abla/unsafe/memory/raw"
 import "abla/sys/linux/fs"
+import "abla/process/exit"
 
 var bootstrapLlvmCoverage: bool = false
 // The flag as the command line gave it, before the target decides whether it applies.
@@ -202,9 +204,49 @@ fun bootstrapLlvmCoverageCall(
 // coverage runtime needs none: the path comes from the environment vector
 // main received, the files and signals are system calls (AArch64 through the
 // module's translator from the x86-64 numbers), and two internal helpers do
-// the string work getenv, strstr and snprintf did.
+// the string work getenv, strstr and snprintf did. A macOS executable (#811) does
+// the same with the BSD system calls, so it imports nothing more from libSystem.
 fun bootstrapLlvmCoverageKernel(backend: BootstrapLlvmBackend): bool =
-    bootstrapLlvmStackGuardKernel(backend) && backend.executableTls
+    (bootstrapLlvmStackGuardKernel(backend) && backend.executableTls) || bootstrapLlvmCoverageDarwin(backend)
+
+fun bootstrapLlvmCoverageDarwin(backend: BootstrapLlvmBackend): bool =
+    bootstrapLlvmDarwinSyscallTarget(backend)
+
+// A system call by its x86-64 Linux number: on macOS the BSD one (getpid 20, write 4, open 5, close 6,
+// rename 128, kill 37; a result below zero is -errno, as on Linux). nanosleep (35) has no BSD call:
+// bootstrapLlvmCoverageSleep.
+fun bootstrapLlvmCoverageSyscall(
+    backend: BootstrapLlvmBackend,
+    number: int,
+    arguments: array<i64*>
+): i64* {
+    if (!bootstrapLlvmCoverageDarwin(backend)) return bootstrapLlvmLinuxX64Syscall(backend, number, arguments)
+    val darwin = if (number == 39) 20 else if (number == 1) 4 else if (number == 2) 5 else if (number == 3) 6
+        else if (number == 82) 128 else if (number == 62) 37 else -1
+    if (darwin < 0) panic("coverage: no BSD system call for Linux number $number")
+    bootstrapLlvmDarwinSyscallBy(backend, darwin, arguments)
+}
+
+// O_WRONLY | O_CREAT | O_TRUNC: 0x241 on Linux, 0x601 on macOS.
+fun bootstrapLlvmCoverageOpenFlags(backend: BootstrapLlvmBackend): i64* =
+    LLVMConstInt(backend.i64Type, if (bootstrapLlvmCoverageDarwin(backend)) 1537 else 577, 0)
+
+// A millisecond's pause: nanosleep on Linux; on macOS select (93) with no descriptors and a timeval of 1000 us.
+fun bootstrapLlvmCoverageSleep(backend: BootstrapLlvmBackend): void {
+    val b = backend.builder
+    val i64 = backend.i64Type
+    val pause = LLVMBuildAlloca(b, LLVMArrayType2(i64, 2), "cov.pause")
+    LLVMBuildStore(b, LLVMConstInt(i64, 0, 0), bootstrapLlvmByteAt(backend, pause, 16, 0))
+    if (bootstrapLlvmCoverageDarwin(backend)) {
+        LLVMBuildStore(b, LLVMConstInt(i64, 1000, 0), bootstrapLlvmByteAt(backend, pause, 16, 8))
+        val zero = LLVMConstInt(i64, 0, 0)
+        bootstrapLlvmDarwinSyscallBy(backend, 93, [zero, zero, zero, zero, pause])
+        return
+    }
+    LLVMBuildStore(b, LLVMConstInt(i64, 1000000, 0), bootstrapLlvmByteAt(backend, pause, 16, 8))
+    bootstrapLlvmLinuxX64Syscall(backend, 35, [pause, LLVMConstInt(i64, 0, 0)])
+    return
+}
 
 // The two helpers, in IR so that every target the dump runs on by system calls shares them (they were x86-64
 // assembly, which an AArch64 build could not assemble). Loop variables live in allocas; "no-builtins" keeps LLVM
@@ -502,9 +544,15 @@ fun bootstrapLlvmCoverageEmitDump(backend: BootstrapLlvmBackend): void {
     if (kernel) {
         bootstrapLlvmCoverageEmitGetenv(backend)
         bootstrapLlvmCoverageEmitCompose(backend)
-        // The handlers return through the kernel's restorer on x86-64 (debug.ab); AArch64 has none of its own.
-        bootstrapLlvmSigreturnRestorer(backend)
-        bootstrapLlvmEmitSigreturnRestorer(backend)
+        if (bootstrapLlvmCoverageDarwin(backend)) {
+            // The handlers are entered and left through the program's own trampoline (debug.ab, #811).
+            bootstrapLlvmDarwinSigtramp(backend)
+            bootstrapLlvmEmitDarwinSigtramp(backend)
+        } else {
+            // The handlers return through the kernel's restorer on x86-64 (debug.ab); AArch64 has none of its own.
+            bootstrapLlvmSigreturnRestorer(backend)
+            bootstrapLlvmEmitSigreturnRestorer(backend)
+        }
     }
     LLVMPositionBuilderAtEnd(b, entry)
     val previous = LLVMBuildAtomicRMW(b, 0, done, LLVMConstInt(i32, 1, 0), 2, 0)
@@ -525,7 +573,7 @@ fun bootstrapLlvmCoverageEmitDump(backend: BootstrapLlvmBackend): void {
     if (kernel) {
         val composed = bootstrapLlvmCoverageCall(backend, "abla_coverage_compose", i64,
             [ptr, i64, ptr, i64, i64], false, [buffer, LLVMConstInt(i64, 4096, 0), out,
-                bootstrapLlvmLinuxX64Syscall(backend, 39, []), LLVMConstInt(i64, 0, 0)])
+                bootstrapLlvmCoverageSyscall(backend, 39, []), LLVMConstInt(i64, 0, 0)])
         LLVMBuildCondBr(b, LLVMBuildICmp(b, llvmIntSignedGreaterOrEqual(), composed,
             LLVMConstInt(i64, 4096, 0), "cov.long"), leave, open)
         LLVMPositionBuilderAtEnd(b, plain)
@@ -602,11 +650,7 @@ fun bootstrapLlvmCoverageEmitDump(backend: BootstrapLlvmBackend): void {
     LLVMBuildCondBr(b, stop, loserExit, sleepBlock)
     LLVMPositionBuilderAtEnd(b, sleepBlock)
     if (kernel) {
-        // nanosleep for a millisecond: { 0 s, 1000000 ns }.
-        val pause = LLVMBuildAlloca(b, LLVMArrayType2(i64, 2), "cov.pause")
-        LLVMBuildStore(b, LLVMConstInt(i64, 0, 0), bootstrapLlvmByteAt(backend, pause, 16, 0))
-        LLVMBuildStore(b, LLVMConstInt(i64, 1000000, 0), bootstrapLlvmByteAt(backend, pause, 16, 8))
-        bootstrapLlvmLinuxX64Syscall(backend, 35, [pause, LLVMConstInt(i64, 0, 0)])
+        bootstrapLlvmCoverageSleep(backend)
     } else {
         bootstrapLlvmCoverageCall(backend, "usleep", i32, [i32], false, [LLVMConstInt(i32, 1000,
             0)])
@@ -626,10 +670,10 @@ fun bootstrapLlvmCoverageEmitDump(backend: BootstrapLlvmBackend): void {
     val descriptor = if (kernel) {
         bootstrapLlvmCoverageCall(backend, "abla_coverage_compose", i64, [ptr, i64, ptr, i64, i64],
             false, [temporary, LLVMConstInt(i64, 4112, 0), target,
-                bootstrapLlvmLinuxX64Syscall(backend, 39, []), LLVMConstInt(i64, 1, 0)])
+                bootstrapLlvmCoverageSyscall(backend, 39, []), LLVMConstInt(i64, 1, 0)])
         // open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644): a descriptor or -errno.
-        LLVMBuildTrunc(b, bootstrapLlvmLinuxX64Syscall(backend, 2, [temporary,
-            LLVMConstInt(i64, 577, 0), LLVMConstInt(i64, 420, 0)]), i32, "cov.descriptor")
+        LLVMBuildTrunc(b, bootstrapLlvmCoverageSyscall(backend, 2, [temporary,
+            bootstrapLlvmCoverageOpenFlags(backend), LLVMConstInt(i64, 420, 0)]), i32, "cov.descriptor")
     } else {
         val tmpFormat = LLVMBuildGlobalStringPtr(b, "%s.tmp.%d", "cov.tmp.format")
         bootstrapLlvmCoverageCall(backend, "snprintf", i32, [ptr, i64, ptr], true, [
@@ -659,7 +703,7 @@ fun bootstrapLlvmCoverageEmitDump(backend: BootstrapLlvmBackend): void {
             LLVMBuildSExt(b, descriptor, i64, "cov.fd"), LLVMBuildGlobalStringPtr(b, line,
                 "cov.path.text"), LLVMConstInt(i64, line.size, 0)
         ]
-        if (kernel) bootstrapLlvmLinuxX64Syscall(backend, 1, lineArguments)
+        if (kernel) bootstrapLlvmCoverageSyscall(backend, 1, lineArguments)
         else bootstrapLlvmCoverageCall(backend, "write", i64, [i64, ptr, i64], false,
             lineArguments)
         LLVMBuildBr(b, nextBlock)
@@ -667,8 +711,8 @@ fun bootstrapLlvmCoverageEmitDump(backend: BootstrapLlvmBackend): void {
         slot = slot + 1
     }
     if (kernel) {
-        bootstrapLlvmLinuxX64Syscall(backend, 3, [LLVMBuildSExt(b, descriptor, i64, "cov.fd")])
-        bootstrapLlvmLinuxX64Syscall(backend, 82, [temporary, target])
+        bootstrapLlvmCoverageSyscall(backend, 3, [LLVMBuildSExt(b, descriptor, i64, "cov.fd")])
+        bootstrapLlvmCoverageSyscall(backend, 82, [temporary, target])
     } else {
         bootstrapLlvmCoverageCall(backend, "close", i32, [i32], false, [descriptor])
         bootstrapLlvmCoverageCall(backend, "rename", i32, [ptr, ptr], false, [temporary, target])
@@ -685,13 +729,18 @@ fun bootstrapLlvmCoverageEmitDump(backend: BootstrapLlvmBackend): void {
     LLVMBuildStore(b, LLVMConstInt(i32, 1, 0), inSignal)
     LLVMBuildCall2(b, dumpType, dump, nativeNullPointer(), i32(0), "")
     val number = LLVMBuildSExt(b, LLVMGetParam(handler, i32(0)), i64, "cov.signal")
-    if (kernel) {
+    if (bootstrapLlvmCoverageDarwin(backend)) {
+        // SIG_DFL by sigaction (46), then kill(getpid(), signal): delivered once the trampoline's sigreturn
+        // unblocks it.
+        bootstrapLlvmDarwinSigDefault(backend, number)
+        bootstrapLlvmCoverageSyscall(backend, 62, [bootstrapLlvmCoverageSyscall(backend, 39, []), number])
+    } else if (kernel) {
         // SIG_DFL by rt_sigaction with an all-zero action, then kill(getpid(), signal).
         val defaultType = LLVMArrayType2(backend.i8Type, 32)
         val action = LLVMBuildAlloca(b, defaultType, "cov.default")
         LLVMBuildStore(b, LLVMConstNull(defaultType), action)
         bootstrapLlvmStackGuardKernelSigaction(backend, number, action)
-        bootstrapLlvmLinuxX64Syscall(backend, 62, [bootstrapLlvmLinuxX64Syscall(backend, 39, []),
+        bootstrapLlvmCoverageSyscall(backend, 62, [bootstrapLlvmCoverageSyscall(backend, 39, []),
             number])
     } else {
         bootstrapLlvmCoverageCall(backend, "signal", ptr, [i64, ptr], false, [number,
@@ -706,6 +755,13 @@ fun bootstrapLlvmCoverageEmitDump(backend: BootstrapLlvmBackend): void {
 fun bootstrapLlvmCoverageInstallSignals(backend: BootstrapLlvmBackend): void {
     if (!bootstrapLlvmCoverage) return
     val handler = LLVMGetNamedFunction(backend.module, "abla_coverage_signal")
+    if (bootstrapLlvmCoverageDarwin(backend)) {
+        // sigaction (46) with SA_RESTART (2), through the program's trampoline.
+        for (signal in [15, 2, 1]) {
+            bootstrapLlvmDarwinSigaction(backend, LLVMConstInt(backend.i64Type, signal, 0), handler, 2)
+        }
+        return
+    }
     if (bootstrapLlvmCoverageKernel(backend)) {
         // signal()'s meaning by rt_sigaction: SA_RESTORER | SA_RESTART with the module's restorer on x86-64.
         // AArch64 has no restorer of its own (a null one with SA_RESTORER would return the handler to address
@@ -765,3 +821,10 @@ fun bootstrapLlvmCoverageRegisterLibrary(backend: BootstrapLlvmBackend): void {
     used.drop()
     return
 }
+
+/** Where `--coverage-functions` applies: a Linux executable, shared library or object, and a macOS executable (its
+ *  dump by the BSD system calls; a macOS dylib still links the C adapter, #833). */
+fun bootstrapLlvmCoverageTarget(llvmTriple: string, objectFormat: string, libcFree: bool, artifact: string): bool =
+    ((artifact == "executable" || artifact == "shared-library" || artifact == "object") &&
+        bootstrapTextContains(llvmTriple, "linux") && objectFormat != "wasm" && !libcFree) ||
+    (artifact == "executable" && bootstrapLlvmTargetIsMacOS(llvmTriple))
