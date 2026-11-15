@@ -45,6 +45,34 @@ for source in $programs $checks; do
         cmp -s "$out/$name-$mode.native.out" "$out/$name-$mode.out" || fail "$name $mode: output differs from the native build"
     done
 done
+# Static and libc-free, built only (no run): the other libc-imports programs that have an AArch64 build (tls-http needs
+# OpenSSL, which has none) in both modes, and one program for each stdlib area a libc-free build can still reach libc
+# from (sockets, processes, signals, stm, tls/pure, http/async, websocket), --fast. A regression there would otherwise
+# show only on a machine that runs AArch64.
+static_both='tests/cases/libc-imports/http-async-tls.ab tests/cases/libc-imports/jwt-verify.ab
+tests/cases/libc-imports/tls-pure-https.ab tests/cases/libc-imports/tls-pure-thread.ab
+tests/cases/libc-imports/websocket-server-tls.ab'
+static_fast='tests/cases/modules/hosted-network.ab tests/cases/modules/udp-ephemeral.ab tests/cases/modules/linux-process.ab
+tests/cases/modules/process-capture.ab tests/cases/modules/signal-watch.ab tests/cases/stm/bank.ab
+tests/cases/tls-pure/client.ab tests/cases/modules/http-async.ab tests/cases/modules/websocket-event.ab
+tests/cases/modules/websocket-server.ab'
+static_check() { # SOURCE MODE: builds for AArch64 and requires no library, loader or undefined symbol
+    local source=$1 mode=$2 name flags=''
+    name=static-$(basename "$source" .ab)-$mode
+    [[ $mode == release ]] || flags=--fast
+    # shellcheck disable=SC2086
+    "$compiler" build "$source" --target aarch64-linux -o "$out/$name" --no-cache $flags \
+        > "$out/$name.log" 2>&1 || { cat "$out/$name.log" >&2; fail "$source ($mode) did not build"; }
+    if readelf -d "$out/$name" 2> /dev/null | grep NEEDED >/dev/null || readelf -l "$out/$name" | grep INTERP >/dev/null ||
+        [[ -n $(nm -D --undefined-only "$out/$name" 2> /dev/null) ]]; then
+        fail "$source ($mode) links libc or leaves a symbol undefined"
+    fi
+}
+for source in $static_both; do
+    static_check "$source" release
+    static_check "$source" fast
+done
+for source in $static_fast; do static_check "$source" fast; done
 if [[ $have_qemu -eq 1 ]]; then
     # A bad access in a --fast build: the fault report, then the default action (SIGSEGV).
     # The debug runtime needs debug information, which the suite turns off (ABLA_DEBUG=0).
