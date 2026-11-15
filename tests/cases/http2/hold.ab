@@ -1,0 +1,54 @@
+// Holds C h2c connections to a server for `seconds`, each with S streams opened and never finished (a POST HEADERS with no DATA and no END_STREAM), to measure the server's memory
+// per idle connection and per open stream (tools/measure-http2-memory.sh samples the server's RSS meanwhile). Usage: hold <port> <connections> <streams per connection> <seconds>.
+// Prints "held <connections> connections with <streams> streams each; <refused> refused" after the hold. A connection the server closes is counted as "dropped".
+import "abla/io"
+import "abla/crypto"
+import "abla/http/h2"
+import "abla/http/h2/hpack"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/sys/linux/net"
+import "abla/integer"
+
+fun frame(kind: int, flags: int, stream: int, payload: string): string {
+    val n = payload.size
+    cryptoByteString([(n >> 16) & 255, (n >> 8) & 255, n & 255, kind, flags, (stream >> 24) & 127, (stream >> 16) & 255, (stream >> 8) & 255, stream & 255]) + payload
+}
+
+fun main: int {
+    val port = processArgument(0).parseInt()
+    val connections = processArgument(1).parseInt()
+    val streams = processArgument(2).parseInt()
+    val seconds = processArgument(3).parseInt()
+    if (port == null || connections == null || streams == null || seconds == null) return 2
+    var encoder = hpackEncoderNew(0)
+    val block = encoder.encode([HpackField(":method", "POST", false), HpackField(":scheme", "http", false), HpackField(":path", "/echo", false), HpackField(":authority", "localhost", false)])
+    var script = H2_PREFACE + frame(4, 0, 0, "")
+    for (k in 0 until streams) script = script + frame(1, 4, 1 + 2 * k, block)
+    val held: array<TcpConnection> = []
+    for (c in 0 until connections) {
+        var conn = tcpConnect(ipv4Loopback(port))
+        if (conn.descriptor >= 0) {
+            conn.write(script)
+            held.append(conn)
+        }
+    }
+    println("opened ${held.size} connections")
+    var dropped = 0
+    var refused = 0
+    val end = linuxMonotonicMilliseconds() + seconds * 1000
+    while (linuxMonotonicMilliseconds() < end) {
+        // Read what the server sends so its output never backs up; count resets.
+        for (i in 0 until held.size) {
+            if (held[i].descriptor < 0) continue
+            val got = held[i].readWithTimeoutResult(65536, 1)
+            if (got.reachedEof() || got.failed()) {
+                held[i].close()
+                dropped = dropped + 1
+            }
+        }
+        linuxSleepMillisecondsChecked(200)
+    }
+    println("held ${held.size} connections with $streams streams each; $dropped dropped")
+    0
+}
