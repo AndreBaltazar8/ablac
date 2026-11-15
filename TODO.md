@@ -1255,6 +1255,41 @@ mmap form) apply there.
   that fills the used-assignment, delegated-name, effect-local and callers tables together; (3) `bootstrapEmitLlvmProgramPrepared`
   and the LLVM module build (19.5% of a small build, a third of it inside libLLVM: `LLVMVerifyModule`, `setValueName`).
   A change here must give byte-identical IR on the compiler's own source and a few suite cases.
+  *The release preparation pipeline* (`BOOTSTRAP_COMPILER_RELEASE_PASSES`, the serial `opt` that is 26 s of the 47 s
+  self-build; tried and declined 2026-11-15, nothing landed). Method: a variant of the constant, built as X1 (the
+  current compiler builds the tree) and X2 (X1 builds it again, so X2 is "built with the variant"); the benefit is X2's
+  own `--emit-llvm src/orc_main.ab` and the frontend of `tests/cases/modules/http-event.ab` (`perf stat -e
+  instructions:u`, `cpu_core` line, 5 runs, spread <= 0.3%); the cost is `opt`'s instructions over the pre-opt module
+  (deterministic; its wall and user times move with load by 20-50% and gave wrong answers). Baseline: 73.79 G, http-event
+  4.510 G, opt 177.8 G. Per pass of the baseline (`opt -time-passes`, 23.7 s of passes + 3.3 s of analyses): SROA 3.7 s,
+  Inliner 2.9, InstCombine 2.5, AlwaysInliner 2.0, BitcodeWriter 1.8, EarlyCSE 1.8, IPSCCP 1.6, SimplifyCFG 1.2,
+  GlobalOpt 1.1; MemorySSA 1.0 (31% of the analyses).
+
+  | Variant | opt work | compiler | http-event |
+  |---|---:|---:|---:|
+  | early-cse<memssa> -> early-cse<> | -2.2% | +0.15% | +0.24% |
+  | the loop-mssa group (licm, rotate, unswitch) dropped | -8.8% | +0.52% | +0.69% |
+  | the cgscc InstCombine dropped | -4.4% | +0.41% | -0.10% |
+  | memcpyopt dropped | -2.5% | +0.38% | -0.04% |
+  | the last simplifycfg dropped | -0.5% | +0.62% | 0.00% |
+  | devirt<4> -> devirt<1> | +0.1% | -0.03% | 0.00% |
+  | the early scalar block (simplifycfg, sroa, early-cse) dropped | -3.1% | +0.80% | |
+  | openmp-opt, ipsccp, called-value-propagation dropped | -2.7% | +0.68% | |
+  | always-inline dropped | not counted (user time +1.3 s) | +0.46% | |
+  | the mem2reg/instcombine/simplifycfg block dropped | not counted (user time -0.4 s) | -0.05% | |
+  | `-inline-threshold=100` | not counted | +0.23% | |
+  | early-cse<> + loop group + cgscc InstCombine ("t2") | -17.0% | +0.75% | +0.99% |
+  | the early block + ipsccp group + devirt<1> | -5.1% | +1.60% | +1.96% |
+  | that + early-cse<> | -7.3% | +1.18% | +1.76% |
+  | t2 + memcpyopt dropped | -19.6% | +1.07% | +0.98% |
+
+  The chosen stack ("t2", branch `release-passes-cheaper` `b8dea026`, kept unmerged) made a self-build 47.2/50.1 s ->
+  44.1/41.9 s (about -5 s), with stage 2 == stage 3 (`41e88e2a8a8a522a`), `tools/test-reproducible-elsewhere.sh --self`
+  byte-identical and 16/16 of the self-hosted, compiler-memory, compiler-bitcode, analysis, codegen, fuzz and
+  conformance tests. Declined: every user's compile would pay the +0.75-1% forever and only the compiler's own
+  self-builds get the 5 s. Reopen only with a cut that costs the built compiler under ~0.2%: the table says the cheap
+  ones are early-cse<memssa> -> <> (+0.15% for -2.2%) and nothing else; the rest of the serial `opt` is SROA, the
+  inliner, InstCombine and always-inline, which cost quality to touch.
 - **Peak RSS swings with where a collection falls in the program's phases, not with the trigger (#677,
   recorded as a no-go for a trigger or marking fix).** (2026-11-09, master `0eaf983e`, branch
   `gc-schedule`.) `tests/benchmarks/json-megabyte.ab` at 170000, same binary and input: 912 MB in
