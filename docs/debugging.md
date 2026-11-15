@@ -141,9 +141,23 @@ close to the cause.
 ABLA_GC_STRESS=1 build/app
 ```
 
+The collector also **poisons what it frees**: both sweeps fill each freed block
+with `0xDB` bytes (`0xDBDBDBDBDBDBDBDB` as an `int`) before the block goes back to
+the heap. Without the variable a freed block keeps its old bytes until it is
+reused, so a use after free often still "works": a string reads right, a native
+C string still holds its path. Under stress it reads garbage at once. An `int`
+or an address that comes out as `-2604246222170760229`, a string of `\xDB`
+bytes, or a pointer to such a block means the value was freed while something
+still held it: look for an address kept as an integer past a safe point
+(`nativeCStringAddress` copies are collected allocations too, so a native table
+must live in a native buffer, not in such copies), or a value that no root
+holds. Run a program once plain and once under stress and compare; the suite
+does this in `tools/test-gc-stress-io.sh`, where each program must exit 42 both
+ways.
+
 Expect the program to run much slower (each collection walks the whole heap),
 so use small inputs. The variable changes nothing else: results and output
-are the same as without it. A program in manual collection mode
+are the same as without it, unless the program uses freed memory. A program in manual collection mode
 (`memorySetManualCollection()`) has no safe points, so it is unaffected.
 WebAssembly modules don't read it. Without the variable it costs nothing:
 the safe point's check is the same compare either way.

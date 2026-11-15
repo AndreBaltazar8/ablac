@@ -1,6 +1,21 @@
-# `ablac run` as a live JIT: redefining functions while the program runs (design, not built)
+# `ablac run` as a live JIT: redefining functions while the program runs
 
-Status: design for review (ablac-e8, 2026-11-15). No code yet.
+Status: stages 0 to 2c are built and on master (opt-in, `ablac run --live`); stage 3 and the rest of the
+design are not. The text below the status table is the original design; where it differs from the table,
+the table is what exists. For using it, see "Live run" in [the toolchain interface](../toolchain.md).
+
+| Stage | What | State |
+|---|---|---|
+| 0 | Audit of the interprocedural facts a compiled function depends on (section at the end) | done (698cfd8d) |
+| 1 | The program's own functions called through one table of code pointers (`abla_live_table`) | built (6e8300fc), `--live` only |
+| 2a | `liveReload()`: recompile, keep the functions whose IR hash changed, publish a new table | built (6f6d36f0) |
+| 2b | A reload is refused when unchanged code would compile differently, or a signature or class layout changed | built (f9f311f4): `E_LIVE_SIGNATURE`, `E_LIVE_LAYOUT`, `E_LIVE_CALLER`, `E_LIVE_GLOBAL` |
+| 2c | Only data and the table's functions are shared between generations; a live run is object-cached with the compiler's record beside the object (`<object>.live`) | built (f89ff893) |
+| 3 | Lambdas: a changed or added lambda is refused today (`E_LIVE_LAMBDA`) | not built |
+| - | `liveDefine(path)`, `--watch`, `E_LIVE_REMOVED`, `E_LIVE_SUMMARY` | not built; what a removed function does has not been defined |
+| - | Platforms | tested on x86-64 Linux only |
+
+Decision taken for question 1 below: live mode is **opt-in** (`--live`); without it nothing changes and no table is built.
 
 ## What exists today
 

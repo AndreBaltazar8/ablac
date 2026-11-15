@@ -396,6 +396,51 @@ evaluation, `run`, tests, the REPL, and macro/subparser handlers share the same
 instructions, values, limits, native registry, and diagnostics. The JIT is a
 different execution backend for that IR and must pass interpreter/JIT parity.
 
+### Live run: `ablac run --live`
+
+`ablac run --live` (with the default `--o1` or with `--fast`) runs the program so that its functions can be
+redefined while it runs. It is off unless you give the flag; `--built` and `--release` ignore it without a
+warning, and `ablac build` and `ablac test` never build this way.
+
+The functions of the program's own source files (not the standard library, the runtime or module
+initialisers) are called through one table of code pointers: direct calls, function values, closures, thread
+and generator entries and recursion all reach the newest body. The price is two dependent loads per call and
+no inlining of those functions. A live run has its own object-cache key.
+
+The program asks for a reload with `abla/live`, after its source files were edited on disk
+(`tests/cases/live-jit/reload.ab` edits its own copy and reloads):
+
+```abla fragment
+import "abla/io"
+import "abla/live"
+
+if (liveAvailable()) {
+    val result = liveReload()
+    println(result.message)
+}
+```
+
+`liveReload()` compiles the program's sources again as the next generation and keeps only the functions whose
+code changed. It returns a `LiveResult` whose `status` is `applied()` (0), `refused()` (1), `failed()` (2) or
+`unavailable()` (3: not under `--live`). Calls made after it returns take the new bodies; a thread that is
+inside an old body finishes it on the old code; old code is never freed, so each applied reload costs memory;
+the calling thread blocks while the compiler works. A refused reload changes nothing and the old code keeps
+running; the message names the reason:
+
+| Code | Reason |
+|---|---|
+| `E_LIVE_LAMBDA` | a lambda changed or was added |
+| `E_LIVE_GLOBAL` | a variable the running program does not have |
+| `E_LIVE_SIGNATURE` | a changed parameter list or result |
+| `E_LIVE_LAYOUT` | a class's name, fields or size changed |
+| `E_LIVE_CALLER` | an unchanged function would compile differently (for example through an escape fact); the message names it and the edited callees |
+| `E_LIVE_BUSY` | another reload is running |
+
+A program that no longer compiles is `failed` with `E_LIVE_COMPILE` (the diagnostics go to stderr), and new code
+that cannot be loaded is `E_LIVE_LINK`. `ABLA_LIVE_TRACE` (any value) prints how many functions go through the
+table; `ABLA_LIVE_DUMP=<dir>` writes each compiled body per generation as `<generation>-<name>.ll`.
+Only x86-64 Linux has been tested. What is built and what is not: [the design](design/live-jit.md).
+
 ## Compiler diagnostics
 
 Every failed compilation renders at least one primary `error[E_*]` diagnostic
