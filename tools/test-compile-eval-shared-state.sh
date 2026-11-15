@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 compiler=${1:-build/ablac}
+# host, wasm, or both (the default): the suite runs the two as separate entries, which run at once.
+targets=${2:-host wasm}
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
-out=build/compile-eval-shared-state
+out=build/compile-eval-shared-state/${targets// /-}
 cases=tests/cases/compile-eval-shared-state
 mkdir -p "$out"
 for source in "$cases"/*.ab; do
@@ -30,8 +32,10 @@ import "abla/wasm/build"
 val built = #wasmBuildModule("shared-state", "$source", "$out/result.wasm", true, false)
 fun main: int = if (built) 0 else 1
 EOF
-    for target in host wasm; do
-        for tier in interp jit auto; do
+    for target in $targets; do
+        # interp and jit: `auto` is `jit` until the tier policy lands (bootstrapCtMode, ct_eval.ab: every caller asks
+        # only whether the mode is "interp"), so a third pass built the same thing again.
+        for tier in interp jit; do
             input=$source
             [[ $target != wasm ]] || input="$out/build.ab"
             ABLA_COMPILE_EVAL=$tier ABLA_COMPILE_EVAL_TRACE=1 "$compiler" build "$input" \
@@ -107,8 +111,7 @@ NODE
         done
         if [[ $target == wasm ]]; then
             cmp "$out/$name-interp.wasm" "$out/$name-jit.wasm"
-            cmp "$out/$name-interp.wasm" "$out/$name-auto.wasm"
         fi
     done
 done
-echo 'compile-time shared state: host/Wasm three-tier and order parity; mutable components fall back, read-only tables stay native'
+echo "compile-time shared state ($targets): interp/jit and order parity; mutable components fall back, read-only tables stay native"
