@@ -76,6 +76,11 @@ prepare-test-driver:
 test: ablac
 	tools/run-tests.sh $(COMPILER)
 
+# The quick lane: the guards, the short commands and the touched areas' tests (tools/test-quick.txt), about two
+# minutes after a change. Not a gate: `make test` is.
+test-quick: ablac
+	tools/test-quick.sh $(COMPILER)
+
 # Every script's builds for release: what a release must pass.
 test-full: ablac
 	RUN_TESTS_FULL=1 tools/run-tests.sh $(COMPILER)
