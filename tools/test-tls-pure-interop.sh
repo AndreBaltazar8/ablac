@@ -26,7 +26,18 @@ for kind in ed25519 p256 p384 rsa; do
     openssl req -x509 -new -key "$out/$kind.key" -out "$out/$kind.pem" -subj /CN=localhost \
         -addext 'subjectAltName=DNS:localhost' -days 2 2> /dev/null
 done
-"$compiler" build tests/cases/tls-pure/interop.ab -o "$out/interop" --no-cache
+# The programs, built up front, four at once: they read nothing at compile time, and built one before each use they
+# were most of this test's wall time (11 release builds of about 10 s, 2026-11-15).
+programs=(interop dropnotify api identity mtls tls12prf server wipe serve unix bulk)
+pids=()
+for program in "${programs[@]}"; do
+    while (( $(jobs -rp | wc -l) >= 4 )); do sleep 0.2; done
+    "$compiler" build "tests/cases/tls-pure/$program.ab" -o "$out/$program" --no-cache > "$out/$program.build.log" 2>&1 &
+    pids+=("$!")
+done
+for index in "${!programs[@]}"; do
+    wait "${pids[$index]}" || { cat "$out/${programs[$index]}.build.log" >&2; echo "tls-pure interop: ${programs[$index]} did not build" >&2; exit 1; }
+done
 server_pid=
 trap '[[ -z $server_pid ]] || kill "$server_pid" 2> /dev/null || true' EXIT
 # Starts s_server for the key kind with the given options on a free port (in $port), in $server_directory
@@ -83,7 +94,6 @@ for kind in ed25519 p256 p384 rsa; do
 done
 echo "$runs handshakes (4 certificate types x 3 suites x 2 groups, and Ed25519 x 3 suites x P-384 and X25519MLKEM768; P-256 and P-384 go through a HelloRetryRequest)"
 # A TlsConnection that is dropped (never close()d) tells the peer: s_server -msg logs the close_notify it received.
-"$compiler" build tests/cases/tls-pure/dropnotify.ab -o "$out/dropnotify" --no-cache
 start_server ed25519 -www -msg
 result=$("$root/tools/run-limited.sh" "$out/dropnotify" "$port" "$out/ed25519.pem") || {
     echo "tls-pure dropnotify: $result" >&2; head -5 "$out/server.log" >&2; exit 1; }
@@ -125,7 +135,6 @@ stop_server
 runs12=$((runs12 + 1))
 echo "TLS 1.2: $runs12 handshakes (4 certificate types x 3 suites x 2 groups, P-384 ECDHE for Ed25519 and P-384 certificates, and RSA with PKCS#1 v1.5)"
 # The hosted-API-compatible surface (abla/tls/pure: tlsConnectWithCa, TlsConnection, tlsLastError ...).
-"$compiler" build tests/cases/tls-pure/api.ab -o "$out/api" --no-cache
 start_server ed25519 -www -groups X25519
 result=$("$root/tools/run-limited.sh" "$out/api" "$port" "$out/ed25519.pem" "$out/rsa.pem") || { echo "tls-pure api: $result" >&2; head -5 "$out/server.log" >&2; exit 1; }
 [[ $result == 'tls-pure api ok' ]] || { echo "tls-pure api: $result" >&2; exit 1; }
@@ -146,11 +155,9 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$o
 openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$out/chain-leaf.key" -out "$out/chain-leaf.csr" -subj /CN=chain-leaf 2> /dev/null
 openssl x509 -req -in "$out/chain-leaf.csr" -CA "$out/chain-ca.pem" -CAkey "$out/chain-ca.key" -CAcreateserial -out "$out/chain-leaf.pem" -days 2 2> /dev/null
 openssl pkcs12 -export -inkey "$out/chain-leaf.key" -in "$out/chain-leaf.pem" -certfile "$out/chain-ca.pem" -out "$out/chain.p12" -passout pass:secret 2> /dev/null
-"$compiler" build tests/cases/tls-pure/identity.ab -o "$out/identity" --no-cache
 result=$("$root/tools/run-limited.sh" "$out/identity" "$out") || { echo "tls-pure identity: $result" >&2; exit 1; }
 [[ $result == 'tls-pure identity ok' ]] || { echo "tls-pure identity: $result" >&2; exit 1; }
 echo "$result"
-"$compiler" build tests/cases/tls-pure/mtls.ab -o "$out/mtls" --no-cache
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$out/client-rsa.key" 2> /dev/null
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$out/client-p256.key" 2> /dev/null
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-384 -out "$out/client-p384.key" 2> /dev/null
@@ -190,7 +197,6 @@ stop_server
 echo 'TLS 1.2: a server without the extended master secret is refused'
 # TLS 1.2 building blocks: the PRF against `openssl kdf TLS1-PRF` (random secrets and seeds, SHA-256 and SHA-384, the
 # labels TLS 1.2 uses), the key block, the AEAD record layer for three suites, the message codecs.
-"$compiler" build tests/cases/tls-pure/tls12prf.ab -o "$out/tls12prf" --no-cache
 hex() { od -An -vtx1 | tr -d ' \n'; }
 prf_args=()
 for spec in "SHA256 48 master secret" "SHA256 12 client finished" "SHA384 104 key expansion" "SHA384 12 server finished" "SHA256 104 key expansion" "SHA384 48 extended master secret"; do
@@ -206,21 +212,18 @@ result=$("$root/tools/run-limited.sh" "$out/tls12prf" "${prf_args[@]}") || { ech
 echo "$result"
 # The sans-IO server against the sans-IO client in one process (tests/cases/tls-pure/server.ab): every key kind x suite x
 # group (HelloRetryRequest), 70 KB each way, ALPN, client certificates, KeyUpdate, refusals, damaged input.
-"$compiler" build tests/cases/tls-pure/server.ab -o "$out/server" --no-cache
 result=$("$root/tools/run-limited.sh" "$out/server" "$out") || { echo "tls-pure server (in process): $result" >&2; exit 1; }
 [[ $result == 'tls-pure server ok' ]] || { echo "tls-pure server (in process): $result" >&2; exit 1; }
 echo "$result"
 # Secrets cleared once nothing reads them (tests/cases/tls-pure/wipe.ab): key shares, handshake and master secrets, old
 # traffic secrets and keys after KeyUpdate, everything at close and failure, TLS 1.2's ephemeral key and master secret,
 # identities' keys (PEM and PKCS#12) on wipe(), a listener's on close.
-"$compiler" build tests/cases/tls-pure/wipe.ab -o "$out/wipe" --no-cache
 result=$("$root/tools/run-limited.sh" "$out/wipe" "$out") || { echo "tls-pure wipe: $result" >&2; exit 1; }
 [[ $result == 'tls-pure wipe ok' ]] || { echo "tls-pure wipe: $result" >&2; exit 1; }
 echo "$result"
 # abla/tls/pure as the SERVER: tests/cases/tls-pure/serve.ab (listening on ::1 on a free port) against openssl s_client
 # (every key kind x cipher suite x group, so the P-256 ones through a HelloRetryRequest), against the pure client,
 # with ALPN, and requiring a client certificate.
-"$compiler" build tests/cases/tls-pure/serve.ab -o "$out/serve" --no-cache
 serve_pid=
 stop_serve() {
     [[ -z $serve_pid ]] || { kill "$serve_pid" 2> /dev/null || true; wait "$serve_pid" 2> /dev/null || true; }
@@ -340,7 +343,6 @@ stop_serve
 echo "pure server: ALPN (server order, none in common refused) and a required client certificate (accepted, absent and untrusted refused)"
 # Unix stream sockets: the pure client over `openssl s_server -unix`, and the pure server over a Unix listener against
 # `openssl s_client -unix`.
-"$compiler" build tests/cases/tls-pure/unix.ab -o "$out/unix" --no-cache
 socket="$out/tls.sock"
 rm -f "$socket"
 openssl s_server -unix "$socket" -unlink -cert "$out/ed25519.pem" -key "$out/ed25519.key" -tls1_3 -www > "$out/unix-server.log" 2>&1 &
@@ -360,7 +362,6 @@ serve_pid=
 rm -f "$socket"
 echo 'tls-pure unix: the client over s_server -unix and the server for s_client -unix'
 # A bulk transfer: a 6 MB file, many records; size and SHA-256 must match (Ed25519, checked in the program).
-"$compiler" build tests/cases/tls-pure/bulk.ab -o "$out/bulk" --no-cache
 mkdir -p "$out/www"
 head -c 6291456 /dev/urandom > "$out/www/big.bin"
 expected=$(sha256sum "$out/www/big.bin" | cut -d' ' -f1)
