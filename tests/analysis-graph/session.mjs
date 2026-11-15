@@ -5,7 +5,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 // Absolute, not resolved: build/ablac is a symlink to a launcher that finds its payload
 // beside the name it was run as.
@@ -16,10 +16,11 @@ const uri = (file) => pathToFileURL(file).href;
 const bytes = (text) => Buffer.byteLength(text);
 
 class Session {
-    constructor(project, { graph = true } = {}) {
+    constructor(project, { graph = true, mode = 'graph-v1' } = {}) {
         this.id = 0;
         this.project = project;
         this.graph = graph;
+        this.mode = mode;
     }
     async start() {
         const stderr = fs.openSync(path.join(this.project, 'service.stderr'), 'w');
@@ -28,10 +29,11 @@ class Session {
         this.exit = new Promise((resolve) => this.process.on('close', resolve));
         this.lines = readline.createInterface({ input: this.process.stdout })[Symbol.asyncIterator]();
         const params = { workspaceRoots: [this.project], clientName: 'graph-fixture', clientVersion: '1' };
-        if (this.graph) params.analysisMode = 'graph-v1';
+        if (this.graph) params.analysisMode = this.mode;
         const init = (await this.rpc('initialize', params)).result;
         assert.equal(init.protocolVersion, 1);
         assert.equal(init.capabilities.includes('module-graph-analysis-v1'), this.graph);
+        assert.equal(init.capabilities.includes('stable-declaration-ids-v1'), this.graph && this.mode === 'graph-v2');
         return this;
     }
     async rpc(method, params) {
@@ -47,6 +49,7 @@ class Session {
     async analyze() {
         const result = (await this.rpc('analyze', {})).result;
         assert.equal(typeof result.revision, 'string');
+        if (this.graph) assert.equal(result.analysisMode, this.mode);
         for (const document of result.documents) {
             for (const key of ['uri', 'version', 'text', 'symbols', 'occurrences', 'diagnostics']) assert.ok(key in document, key);
             for (const symbol of document.symbols) {
@@ -368,18 +371,18 @@ async function namedCalls() {
 // A long-lived service keeps work between analyses; its answer must still be the answer of a service that has never seen the
 // project before, whatever the edits that came in between. Each step is compared byte for byte (the revision, a counter of
 // the session's own, aside) with a fresh service given the same open documents.
-async function editSequence() {
+async function editSequence(mode = 'graph-v1') {
     const files = {
         'main.ab': 'import "util.ab"\nimport "model.ab"\nfun main: int {\n    val m = Model(1)\n    scale(m.value) + extra()\n}\n',
         'util.ab': 'import "model.ab"\nfun scale(value: int): int = value * 2\nfun extra(): int = helper(3)\nprivate fun helper(n: int): int = n + 1\n',
         'model.ab': 'class Model(val value: int) {\n    fun twice(): int = value * 2\n}\n',
     };
-    const p = fixture('edit-sequence', files);
+    const p = fixture(`edit-sequence-${mode}`, files);
     const at = (file) => path.join(p, file);
     const open = new Map();
     const comparable = (snapshot) => JSON.stringify({ ...snapshot, revision: 0 });
     const cold = async () => {
-        const fresh = await start(p);
+        const fresh = await start(p, { mode });
         for (const [file, { version, text }] of open) {
             assert.ok(!('error' in await fresh.rpc('document/open', { uri: uri(at(file)), version, text })));
         }
@@ -387,7 +390,7 @@ async function editSequence() {
         await fresh.close();
         return comparable(answer);
     };
-    const s = await start(p);
+    const s = await start(p, { mode });
     let version = 0;
     const edit = async (file, text) => {
         version += 1;
@@ -435,7 +438,97 @@ async function editSequence() {
     await s.close();
 }
 
-const tests = { edit_sequence: editSequence, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
+// graph-v2 names a declaration by its module, its container and its name (and a function by its parameter types), not by its offset: an
+// edit that moves other declarations leaves their ids alone, and every id a document's occurrences name is one of a symbol's.
+async function stableIds() {
+    const model = [
+        'class Model(val value: int, val label: string) {',
+        '    fun twice(): int = value * 2',
+        '    fun twice(factor: int): int = value * factor',
+        '}',
+        '',
+    ].join('\n');
+    const util = [
+        'import "model.ab"',
+        'fun scale(value: int): int {',
+        '    val doubled = value * 2',
+        '    val doubled2 = doubled + 1',
+        '    return doubled2',
+        '}',
+        'fun scale(value: string): string = value',
+        'fun total(items: array<int>): int {',
+        '    var sum = 0',
+        '    for (item in items) sum = sum + item',
+        '    val add = { a: int -> a + sum }',
+        '    return add(1)',
+        '}',
+        'fun twice(m: Model): int = m.twice() + m.twice(2)',
+        '',
+    ].join('\n');
+    const main = 'import "util.ab"\nimport "model.ab"\nfun main: int {\n    val m = Model(1, "x")\n    scale(m.value) + total([1, 2]) + twice(m)\n}\n';
+    const p = fixture('stable-ids', { 'main.ab': main, 'util.ab': util, 'model.ab': model });
+    const ids = (snapshot, file) => doc(snapshot, path.join(p, file)).symbols.map((x) => x.id);
+    const s = await start(p, { mode: 'graph-v2' });
+    const a = await s.analyze();
+    noErrors(a);
+    // Every symbol id is unique across the graph, every id an occurrence names is a symbol's, and none carries an offset.
+    const all = new Set();
+    for (const d of a.documents) for (const symbol of d.symbols) {
+        assert.ok(!all.has(symbol.id), `duplicate id ${symbol.id}`);
+        all.add(symbol.id);
+        assert.ok(symbol.id.startsWith('abla:'), symbol.id);
+        assert.ok(!/:\d+:/.test(symbol.id), `an offset in ${symbol.id}`);
+    }
+    for (const d of a.documents) for (const symbol of d.symbols) if ('containerId' in symbol) assert.ok(all.has(symbol.containerId), `unknown container of ${symbol.id}`);
+    let named = 0;
+    for (const d of a.documents) for (const o of d.occurrences) if (o.declarationId) {
+        named += 1;
+        assert.ok(all.has(o.declarationId), `${o.name} names ${o.declarationId}, which no symbol has`);
+    }
+    assert.ok(named > 20, 'few occurrences name a declaration');
+    const modelPath = path.join(p, 'model.ab');
+    const utilIds = ids(a, 'util.ab');
+    const twice = ids(a, 'model.ab').filter((id) => /\.twice\([^)]*\)$/.test(id));
+    assert.equal(twice.length, 2, 'the two overloads of twice have two ids');
+    assert.notEqual(twice[0], twice[1]);
+    assert.ok(utilIds.filter((id) => /#scale\([^)]*\)$/.test(id)).length === 2, 'the overloads of scale differ');
+    // Locals, a loop variable and a lambda parameter are named by their declaration and their name.
+    for (const part of ['/param:value', '/local:doubled', '/local:doubled2', '/for:item', '/local:sum', '/lambda:a']) {
+        assert.ok(utilIds.some((id) => id.includes(part)), `no symbol with ${part}: ${utilIds.join(' ')}`);
+    }
+    // A name used from another file resolves to the declaration's id, and the queries answer with it.
+    const mainDoc = doc(a, path.join(p, 'main.ab'));
+    const scale = mainDoc.occurrences.find((o) => o.name === 'scale');
+    assert.ok(scale.declarationId.includes('util.ab#scale('), scale.declarationId);
+    const query = (method, offset) => s.rpc(method, { uri: uri(path.join(p, 'main.ab')), offset, revision: a.revision });
+    assert.equal((await query('query/definition', scale.range.start)).result.value.id, scale.declarationId);
+    assert.equal((await query('query/hover', scale.range.start)).result.value.symbol.id, scale.declarationId);
+    const refs = (await query('query/references', scale.range.start)).result.value;
+    assert.ok(refs.some((r) => r.uri === uri(path.join(p, 'main.ab'))));
+    // Edits that move offsets keep every id: a comment on top of each file, an added declaration before the others, a longer body.
+    const before = new Map(a.documents.map((d) => [d.uri, d.symbols.map((x) => x.id)]));
+    const open = async (file, text, version) => assert.ok(!('error' in await s.rpc('document/open', { uri: uri(path.join(p, file)), version, text })));
+    await open('util.ab', '// a comment before every offset\n' + util.replace('    val doubled = value * 2\n', '    val unused = 1\n    val doubled = value * 2\n'), 1);
+    await open('model.ab', 'fun added(): int = 1\n' + model, 1);
+    const b = await s.analyze();
+    noErrors(b);
+    for (const [uriText, was] of before) {
+        const now = doc(b, fileURLToPath(uriText)).symbols.map((x) => x.id);
+        for (const id of was) assert.ok(now.includes(id), `${id} is not an id after the edit`);
+    }
+    assert.ok(ids(b, 'util.ab').some((id) => id.includes('/local:unused')));
+    // The occurrences in main.ab are those of before (nothing in it changed), so its whole export is.
+    assert.equal(JSON.stringify(doc(b, path.join(p, 'main.ab')).occurrences.map((o) => o.declarationId)),
+        JSON.stringify(mainDoc.occurrences.map((o) => o.declarationId)), 'main.ab names other ids after an edit that moved offsets elsewhere');
+    // A graph-v1 service still names declarations by offset.
+    const legacy = await start(p);
+    const v1 = await legacy.analyze();
+    assert.ok(ids(v1, 'util.ab').every((id) => /:\d+:/.test(id)), 'graph-v1 ids are offset-based');
+    await legacy.close();
+    await s.close();
+}
+
+const tests = { edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
 const filter = process.env.ANALYSIS_TEST_FILTER ? process.env.ANALYSIS_TEST_FILTER.split(',') : null;
 for (const [name, test] of Object.entries(tests)) {
     if (filter && !filter.includes(name)) continue;

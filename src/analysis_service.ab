@@ -7,6 +7,7 @@ import "frontend.ab"
 
 import "module.ab"
 import "abla/json"
+import "abla/text"
 import "abla/sys/linux/fs"
 import "abla/sys/linux/io"
 import "parser.ab"
@@ -40,6 +41,8 @@ class BootstrapAnalysisService(
     var initialized: bool,
     var running: bool,
     var graphMode: bool = false,
+    // graph-v2: the symbols' ids are stable (module, container path, name, overload signature) instead of offset-based.
+    var graphStableIds: bool = false,
     val graphEntries: array<string> = [],
     val graphInputPaths: array<string> = [],
     val graphInputValues: array<string> = [],
@@ -573,6 +576,104 @@ fun bootstrapAnalysisSymbolsJson(
             method = method + 1
         }
         declaration = declaration + 1
+    }
+    jsonArray(values)
+}
+
+/** The part of a declaration's stable id that tells overloads apart: its parameter types as written, for a function. */
+fun bootstrapAnalysisStableSignature(declaration: BootstrapDeclaration): string {
+    if (bootstrapAnalysisSymbolKind(declaration.kind) != "function") return ""
+    "(${declaration.parameterTypes.join(",")})"
+}
+
+/** The declaration's own name as its stable id writes it: an extension is named by its owner. */
+fun bootstrapAnalysisStableName(declaration: BootstrapDeclaration): string =
+    if (declaration.extensionOwner != "" && !declaration.name.startsWith("${declaration.extensionOwner}."))
+        "${declaration.extensionOwner}.${declaration.name}" else declaration.name
+
+/** Where a symbol's stable id is kept while it is made: the ids taken so far (a second symbol with the same id gets `~2`, a
+ *  third `~3`, ...), and the stable id of each symbol by the offset-based id the compiler's identities are translated to. */
+class BootstrapAnalysisStableIds(
+    val stable: Map<string, string> = Map(),
+    val taken: Map<string, int> = Map()
+)
+
+fun bootstrapAnalysisStableOf(ids: BootstrapAnalysisStableIds, internal: string): string {
+    val known = ids.stable.get(internal)
+    if (known != null) known else ""
+}
+
+fun bootstrapAnalysisStableTake(var ids: BootstrapAnalysisStableIds, internal: string, base: string): string {
+    val count = ids.taken.get(base)
+    val stable = if (count == null) base else "$base~${count + 1}"
+    ids.taken.set(base, if (count == null) 1 else count + 1)
+    ids.stable.set(internal, stable)
+    stable
+}
+
+/** Stable ids for the symbols of one module (the exported list `symbols`, whose ids are offset-based): a declaration is its
+ *  module, its name and, for a function, its parameter types; a method is its class's id, its name and its parameter types; a
+ *  parameter, a field, a local, a loop variable and a lambda parameter are their declaration's id and their name. An edit
+ *  that moves the offsets, or adds or removes other declarations, does not change an id; only a change to the declaration's
+ *  own name or parameter types does (and, for a local, the ordinal among those of the same name in its declaration). Keyed
+ *  by the offset-based id. */
+fun bootstrapAnalysisStableIdsOf(
+    path: string,
+    parsed: BootstrapParseResult,
+    symbols: Json,
+    enabled: bool
+): Map<string, string> {
+    val ids = BootstrapAnalysisStableIds()
+    if (!enabled) return ids.stable
+    val signatures: Map<string, string> = Map()
+    for (declaration in parsed.declarations) {
+        signatures.set(bootstrapAnalysisDeclarationId(declaration),
+            "${bootstrapAnalysisStableName(declaration)}${bootstrapAnalysisStableSignature(declaration)}")
+        for (method in declaration.methods) {
+            signatures.set(bootstrapAnalysisDeclarationId(method),
+                "${method.name}${bootstrapAnalysisStableSignature(method)}")
+        }
+    }
+    for (symbol in symbols.values) {
+        val internal = symbol.getString("id")
+        val container = symbol.getString("containerId")
+        val signature = signatures.get(internal)
+        if (signature != null) {
+            val owner = bootstrapAnalysisStableOf(ids, container)
+            bootstrapAnalysisStableTake(ids, internal,
+                if (owner != "") "${owner}.${signature}" else "abla:${path}#${signature}")
+        } else {
+            val owner = bootstrapAnalysisStableOf(ids, container)
+            val kind = symbol.getString("kind")
+            val detail = symbol.getString("detail")
+            val role = if (kind == "property") "field"
+                else if (kind == "parameter" && detail == "lambda.parameter") "lambda"
+                else if (kind == "parameter") "param"
+                else if (detail == "for") "for"
+                else "local"
+            val prefix = if (owner != "") owner else "abla:${path}#"
+            bootstrapAnalysisStableTake(ids, internal, "${prefix}/${role}:${symbol.getString("name")}")
+        }
+    }
+    ids.stable
+}
+
+/** `symbols` with each id (and container id) replaced by its stable id. */
+fun bootstrapAnalysisStableSymbols(symbols: Json, stable: Map<string, string>): Json {
+    val values: array<Json> = []
+    for (symbol in symbols.values) {
+        val keys: array<string> = []
+        val newValues: array<Json> = []
+        for (index in 0 until symbol.keys.size) {
+            val key = symbol.keys[index]
+            val value = symbol.values[index]
+            keys.append(key)
+            if (key == "id" || key == "containerId") {
+                val known = stable.get(value.asString())
+                newValues.append(if (known != null) jsonString(known) else value)
+            } else newValues.append(value)
+        }
+        values.append(jsonObject(keys, newValues))
     }
     jsonArray(values)
 }
@@ -1278,6 +1379,7 @@ fun BootstrapAnalysisService.validateEdit(params: Json): Json {
     var reason = if (valid) "" else "analysis revision is stale"
     val candidate = BootstrapAnalysisService([], [], this.revision, true, true)
     candidate.graphMode = this.graphMode
+    candidate.graphStableIds = this.graphStableIds
     for (entry in this.graphEntries) candidate.graphEntries.append(entry)
     var root = 0
     while (root < this.roots.size) {
@@ -1458,7 +1560,9 @@ fun BootstrapAnalysisService.initialize(params: Json): Json {
             index = index + 1
         }
     }
-    this.graphMode = params.getString("analysisMode") == "graph-v1"
+    this.graphMode = params.getString("analysisMode") == "graph-v1" ||
+        params.getString("analysisMode") == "graph-v2"
+    this.graphStableIds = params.getString("analysisMode") == "graph-v2"
     val entries = params.get("entryPoints")
     var entryIndex = 0
     while (entries.isArray() && entryIndex < entries.size()) {
@@ -1471,6 +1575,7 @@ fun BootstrapAnalysisService.initialize(params: Json): Json {
         jsonString("semantic-name-references")]
     if (this.graphMode) {
         capabilities.append(jsonString("module-graph-analysis-v1"))
+        if (this.graphStableIds) capabilities.append(jsonString("stable-declaration-ids-v1"))
         capabilities.append(jsonString("no-eval-ct"))
         capabilities.append(jsonString("pre-ct-types"))
         capabilities.append(jsonString("analysis-queries-v1"))
@@ -1500,9 +1605,9 @@ fun BootstrapAnalysisService.handle(request: Json): string {
         )
     } else if (method == "initialize") {
         val mode = params.getString("analysisMode")
-        if (mode != "" && mode != "graph-v1") response = bootstrapAnalysisError(id,
+        if (mode != "" && mode != "graph-v1" && mode != "graph-v2") response = bootstrapAnalysisError(id,
             "unsupported_analysis_mode", "unsupported analysisMode")
-        else if (this.initialized && (this.graphMode || mode == "graph-v1")) response =
+        else if (this.initialized && (this.graphMode || mode == "graph-v1" || mode == "graph-v2")) response =
             bootstrapAnalysisError(id, "already_initialized",
                 "initialize may only run once in graph mode")
         else response = bootstrapAnalysisResponse(id, this.initialize(params))

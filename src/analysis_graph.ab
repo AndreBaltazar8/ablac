@@ -27,15 +27,28 @@ class BootstrapAnalysisGraphParsed(
     val full: bool,
     val parsed: BootstrapParseResult,
     val symbols: Json,
-    val rewrite: BootstrapSourceRewrite
+    val rewrite: BootstrapSourceRewrite,
+    // For a service with stable ids (graph-v2): each symbol's stable id by its offset-based one, and the exported symbols with them
+    // (`symbols` itself is what the compiler's identities are translated to, and keeps its offset-based ids). Empty and `symbols`
+    // for graph-v1.
+    val stable: Map<string, string>,
+    val exported: Json
 )
 
 class BootstrapAnalysisGraphDocument(
     val document: BootstrapAnalysisDocument,
     val parsed: BootstrapParseResult,
     val symbols: Json,
-    val rewrite: BootstrapSourceRewrite
+    val rewrite: BootstrapSourceRewrite,
+    val stable: Map<string, string>,
+    val exported: Json
 )
+
+/** The id the answer names a symbol of `document` by, given its offset-based one. */
+fun bootstrapAnalysisGraphStable(document: BootstrapAnalysisGraphDocument, id: string): string {
+    val known = document.stable.get(id)
+    if (known != null) known else id
+}
 
 fun bootstrapAnalysisGraphUriValid(uri: string): bool {
     if (uri.size < 8 || uri.slice(0, 8) != "file:///") return false
@@ -100,9 +113,9 @@ fun BootstrapAnalysisService.graphEntry(): string {
     opened
 }
 
-fun bootstrapAnalysisGraphIncomplete(revision: int, message: string): Json =
+fun bootstrapAnalysisGraphIncomplete(revision: int, message: string, mode: string): Json =
     jsonObject(["revision", "documents", "analysisMode", "complete", "issues"],
-        [jsonString("$revision"), jsonArray([]), jsonString("graph-v1"), jsonBoolean(false),
+        [jsonString("$revision"), jsonArray([]), jsonString(mode), jsonBoolean(false),
             jsonArray([jsonObject(["code", "message"],
                 [jsonString("E_ANALYSIS_SCOPE"), jsonString(message)])])])
 
@@ -194,7 +207,8 @@ fun bootstrapAnalysisGraphDeclarationAliases(
     if (matchedId != null && matchedId == "") return
     val matched = if (matchedId != null) matchedId else ""
     if (matched != "") {
-        aliases.set(bootstrapAnalysisDeclarationId(declaration), matched)
+        aliases.set(bootstrapAnalysisDeclarationId(declaration),
+            bootstrapAnalysisGraphStable(document, matched))
         bootstrapAnalysisGraphScopeAliases(document, matched, declaration.sourceIdentity, aliases,
             lookup)
     }
@@ -223,9 +237,11 @@ fun bootstrapAnalysisGraphScopeAliases(
                 end = end + 1
             }
             val rewritten = document.rewrite.rewritten(begin)
-            aliases.set("abla:$source:$rewritten${id.slice(end, id.size)}", id)
+            aliases.set("abla:$source:$rewritten${id.slice(end, id.size)}",
+                bootstrapAnalysisGraphStable(document, id))
             if (symbol.getString("kind") == "property") {
-                aliases.set("abla:$source:$rewritten:field:${symbol.getString("name")}", id)
+                aliases.set("abla:$source:$rewritten:field:${symbol.getString("name")}",
+                    bootstrapAnalysisGraphStable(document, id))
             }
         }
     }
@@ -243,7 +259,8 @@ fun bootstrapAnalysisGraphLocalAliases(
     while (index < document.symbols.size()) {
         val symbol = document.symbols.at(index)
         val id = symbol.getString("id")
-        aliases.set(id, id)
+        val stableId = bootstrapAnalysisGraphStable(document, id)
+        aliases.set(id, stableId)
         if (id.size > prefix.size && id.slice(0, prefix.size) == prefix) {
             var end = prefix.size
             var begin = 0
@@ -253,10 +270,10 @@ fun bootstrapAnalysisGraphLocalAliases(
             }
             val rewritten = document.rewrite.rewritten(begin)
             val suffix = id.slice(end, id.size)
-            aliases.set("$prefix$rewritten$suffix", id)
-            aliases.set("abla:${document.document.path}#contract:$rewritten$suffix", id)
+            aliases.set("$prefix$rewritten$suffix", stableId)
+            aliases.set("abla:${document.document.path}#contract:$rewritten$suffix", stableId)
             if (symbol.getString("kind") == "property") {
-                aliases.set("$prefix$rewritten:field:${symbol.getString("name")}", id)
+                aliases.set("$prefix$rewritten:field:${symbol.getString("name")}", stableId)
                 aliases
                     .set("abla:${document.document.path}#contract:$rewritten:field:${symbol.getString("name")}",
                         id)
@@ -397,7 +414,7 @@ fun bootstrapAnalysisGraphReuse(cached: BootstrapAnalysisGraphParsed): Bootstrap
 }
 
 fun bootstrapAnalysisGraphParse(source: string, uri: string, full: bool,
-    path: string): BootstrapAnalysisGraphParsed {
+    path: string, stableIds: bool): BootstrapAnalysisGraphParsed {
     val raw = bootstrapParseWithIdentity(source, path)
     val visible: array<BootstrapDeclaration> = []
     for (declaration in raw.declarations) {
@@ -406,14 +423,19 @@ fun bootstrapAnalysisGraphParse(source: string, uri: string, full: bool,
     val surface = BootstrapParseResult(visible, raw.actions, raw.errors, raw.extensionErrors,
         raw.compileInputPaths, raw.compileInputContents, raw.diagnostics)
     val contract = if (full) surface else bootstrapProjectContract(surface, path)
-    BootstrapAnalysisGraphParsed(source, uri, full, contract,
-        bootstrapAnalysisSymbolsJson(source, uri, contract), bootstrapSourceRewriteOf(path))
+    val symbols = bootstrapAnalysisSymbolsJson(source, uri, contract)
+    val stable = bootstrapAnalysisStableIdsOf(path, contract, symbols, stableIds)
+    BootstrapAnalysisGraphParsed(source, uri, full, contract, symbols, bootstrapSourceRewriteOf(path),
+        stable, if (stableIds) bootstrapAnalysisStableSymbols(symbols, stable) else symbols)
 }
+
+fun BootstrapAnalysisService.graphModeName(): string = if (this.graphStableIds) "graph-v2" else "graph-v1"
 
 fun BootstrapAnalysisService.graphSnapshot(): Json {
     val entry = this.graphEntry()
     if (entry == "") return bootstrapAnalysisGraphIncomplete(this.revision,
-        "select one project entry with entryPoints or analyze roots; no project entry was found")
+        "select one project entry with entryPoints or analyze roots; no project entry was found",
+        this.graphModeName())
     if (bootstrapAnalysisGraphActiveEntry != entry) {
         bootstrapAnalysisGraphActiveEntry = entry
         bootstrapAnalysisGraphModules = bootstrapModuleState()
@@ -426,7 +448,7 @@ fun BootstrapAnalysisService.graphSnapshot(): Json {
     }
     if (!bootstrapAnalysisGraphModules
         .sourceExists(entry)) return bootstrapAnalysisGraphIncomplete(this.revision,
-            "project entry does not exist and has no open overlay")
+            "project entry does not exist and has no open overlay", this.graphModeName())
     bootstrapSourceRewrites = []
     val project = bootstrapFrontendLoadHostProject(entry, bootstrapAnalysisGraphModules)
     this.graphObserveInputs(project, entry)
@@ -458,12 +480,12 @@ fun BootstrapAnalysisService.graphSnapshot(): Json {
             // The parser's only effect outside its result is recording the module's source rewrites: the cached ones are put back.
             val entryParsed = if (cached != null && cached.source == source && cached.uri == uri &&
                 cached.full == full) bootstrapAnalysisGraphReuse(cached)
-                else bootstrapAnalysisGraphParse(source, uri, full, module.path)
+                else bootstrapAnalysisGraphParse(source, uri, full, module.path, this.graphStableIds)
             this.graphParsed.set(module.path, entryParsed)
             val parsed = entryParsed.parsed
             documents.append(BootstrapAnalysisGraphDocument(
                 BootstrapAnalysisDocument(uri, module.path, version, source, true), parsed,
-                entryParsed.symbols, entryParsed.rewrite))
+                entryParsed.symbols, entryParsed.rewrite, entryParsed.stable, entryParsed.exported))
             for (declaration in parsed
                 .declarations) bootstrapAnalysisGraphDeclarationCallNames(declaration, names)
             for (action in parsed.actions) bootstrapAnalysisGraphCallNames(action, module.path,
@@ -504,7 +526,7 @@ fun BootstrapAnalysisService.graphSnapshot(): Json {
             values.append(jsonObject(["uri", "version", "text", "symbols", "occurrences",
                 "diagnostics"],
                 [jsonString(document.document.uri), jsonInteger(document.document.version),
-                    jsonString(document.document.text), document.symbols,
+                    jsonString(document.document.text), document.exported,
                     jsonRawUnchecked(bootstrapAnalysisOccurrenceSetText(document.document.text, set)),
                     bootstrapAnalysisGraphDiagnostics(document, project, semanticDiagnostics)]))
         }
@@ -513,7 +535,7 @@ fun BootstrapAnalysisService.graphSnapshot(): Json {
             values.append(jsonObject(["uri", "version", "text", "symbols", "occurrences",
                 "diagnostics"],
                 [jsonString(document.document.uri), jsonInteger(document.document.version),
-                    jsonString(document.document.text), document.symbols, jsonArray([]),
+                    jsonString(document.document.text), document.exported, jsonArray([]),
                     bootstrapAnalysisGraphDiagnostics(document, project, "")]))
         }
     }
@@ -528,7 +550,7 @@ fun BootstrapAnalysisService.graphSnapshot(): Json {
     }
     val result = jsonObject(["revision", "documents", "analysisMode", "complete", "pending",
         "entry"],
-        [jsonString("${this.revision}"), jsonArray(values), jsonString("graph-v1"),
+        [jsonString("${this.revision}"), jsonArray(values), jsonString(this.graphModeName()),
             jsonBoolean(analyzed != null && pending.size == 0), jsonArray(pending),
             jsonString(entry)])
     this.graphQueryIndex = bootstrapAnalysisGraphQueryIndex(result, this.revision, sets)
