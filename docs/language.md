@@ -2845,6 +2845,7 @@ declaration may carry several, each at most once.
 | `@naked` | trusted function | emits the body as raw assembly without a prologue ([llvm-backend.md](llvm-backend.md)) |
 | `@section("name")` | function | places it in a linker section ([llvm-backend.md](llvm-backend.md)) |
 | `@wasmImport("module")` | `extern:"c"` declaration | imports it from that Wasm module; `["module", "field"]` also renames it ([toolchain.md](toolchain.md)) |
+| `@hostImport` | `extern:"c"` declaration | the application that loads the shared library defines it: a macOS dylib leaves it undefined (an ELF library leaves any undefined symbol to the loader), and any other symbol the library does not find fails its link |
 
 Other annotation names are kept as metadata for compile-time code to read
 (`compiler.annotation`, `functionsAnnotated`; see
