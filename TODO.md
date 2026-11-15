@@ -31,7 +31,7 @@ check runs without it:
   `tests/cases/regex/corpus.tsv.gz` (6000 pattern and text pairs). The oracle stays Python's `re`, the
   semantics abla's regex is checked against. Random patterns are tried again by `tools/fuzz/run --regex`
   against an oracle written in Abla with another algorithm (`tools/fuzz/regex_oracle.ab`, see
-  docs/stdlib/regex.md); it covers the whole-match span and whole-text match, not groups or replace.
+  docs/stdlib/regex.md); it also answers groups (Python's last-round rule), `findAll` and `replace`.
 - The constant-time checker, the HTTP and event fixtures and the other suite scripts are ported (Abla
   or shell); the device-serial pty/termios oracle is `tests/cases/device-serial/driver.ab`.
 

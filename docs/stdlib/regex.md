@@ -121,12 +121,17 @@ compiled program run by a Pike VM it asks, for each syntax-tree node and start
 position, which end positions the node can reach in priority order (a greedy repeat
 lists its longer runs first, a lazy one stops first, an alternation lists its first
 branch first), and takes the first end for the smallest start with any. It has its
-own parser for the same syntax and imports nothing from `abla/regex`. Patterns are
+own parser for the same syntax and imports nothing from `abla/regex`. Each path
+also carries the groups that completed on it, a later one overriding an earlier
+(a group keeps its value from the last round of a loop, as in Python), and the
+search for all matches follows Python 3.7's empty-match rule. Patterns are
 generated as trees and written as text, so the engine's parser is exercised too;
-for each pair the whole-text answer, the leftmost-first span from the start and the
-span from a later start must agree. A disagreement is shrunk (tree and text) and
-printed with a `corpus:` line; `tools/regex-corpus-add.sh` adds such lines
-to `corpus.tsv.gz`. The oracle is checked against the recorded Python results
-(`tools/fuzz/run --regex-corpus`), and a planted fault in it must be found
-(`--control-regex`). It answers spans of the whole match, not groups, `findAll` or
-`replace`, and it has no loops over nullable bodies.
+for each pair the four answers of the corpus (find with its groups, `findAll`, the
+whole-text match with its groups, `replace` with `[$0]`) and the find from a later
+start must agree. A disagreement is shrunk (tree and text) and printed with a
+`corpus:` line; `tools/regex-corpus-add.sh` adds such lines to `corpus.tsv.gz`.
+The oracle is checked against the recorded Python results
+(`tools/fuzz/run --regex-corpus`: every one it can read, groups, `findAll` and
+`replace` included), and a planted fault in it must be found (`--control-regex`).
+It has no loops over nullable bodies, where Python's group rule differs from
+this engine's (above).

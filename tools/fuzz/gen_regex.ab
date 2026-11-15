@@ -1,8 +1,8 @@
 // The regex campaign: random patterns and texts, abla/regex against the independent oracle of regex_oracle.ab, in
 // this process (no generated program, no six modes). Patterns are built as trees from the old Python fuzzer's atoms
 // and written as text, so the pattern parser of abla/regex is under test too; the texts draw from an alphabet with
-// multi-byte characters and newlines. For each pair the whole-text answer, the leftmost-first span from the start of
-// the text and the span from a later start must agree. A disagreement is shrunk (tree and text) and printed with the
+// multi-byte characters and newlines. For each pair find with its groups, findAll, the whole-text match with its
+// groups and replace (the four answers of the recorded corpus) and the find from a later start must agree. A disagreement is shrunk (tree and text) and printed with the
 // line that records it in tests/cases/regex/corpus.tsv.gz.
 import "abla/io"
 import "abla/regex"
@@ -116,28 +116,88 @@ fun RxGen.text(): array<int> {
     out
 }
 
-/** "" when abla/regex and the oracle agree on this pattern and text; else what differs. `bug` plants a fault in the
- * oracle (the suite's control). */
+fun rxHexBytes(text: string): string {
+    val digits = "0123456789abcdef"
+    var out = ""
+    for (b in text) out = out + digits.slice(b / 16, b / 16 + 1) + digits.slice(b % 16, b % 16 + 1)
+    out
+}
+
+fun rxJoinInts(values: array<int>): string {
+    var out = ""
+    for (k in 0 until values.size) out = out + (if (k > 0) " " else "") + "${values[k]}"
+    out
+}
+
+/** The match as the answer lines name it: "-" for none, else start, end and each group's start and end. */
+fun rxCapsText(caps: array<int>): string = if (caps.size == 0) "-" else rxJoinInts(caps)
+
+fun rxAblaCaps(m: RegexMatch?): string {
+    if (m == null) return "-"
+    val caps: array<int> = []
+    for (g in 0..m.groupCount()) {
+        caps.append(m.groupStart(g))
+        caps.append(m.groupEnd(g))
+    }
+    rxJoinInts(caps)
+}
+
+/** The four answer lines of tests/cases/regex/corpus.tsv.gz, as the oracle computes them: find, findAll's spans, the
+ * whole-text match with its groups, and replace with "[$0]" in hex. */
+fun rxOracleLines(root: RxNode, text: array<int>, bug: int): array<string> {
+    val q = rxMatcher(root, text)
+    q.m.bug = bug
+    val subject = rxToText(text)
+    val lines = ["F " + rxCapsText(rxFind(q, 0))]
+    var all = "A "
+    var replaced = ""
+    var at = 0
+    var first = true
+    for (caps in rxFindAll(q)) {
+        all = all + (if (first) "" else " ") + "${caps[0]}-${caps[1]}"
+        first = false
+        replaced = replaced + subject.slice(at, caps[0]) + "[" + subject.slice(caps[0], caps[1]) + "]"
+        at = caps[1]
+    }
+    lines.append(all)
+    lines.append("M " + rxCapsText(rxWhole(q)))
+    lines.append("R " + rxHexBytes(replaced + subject.slice(at, subject.size)))
+    lines
+}
+
+fun rxAblaLines(re: Regex, subject: string): array<string> {
+    val lines = ["F " + rxAblaCaps(re.find(subject))]
+    var all = "A "
+    var first = true
+    for (x in re.findAll(subject)) {
+        all = all + (if (first) "" else " ") + "${x.start()}-${x.end()}"
+        first = false
+    }
+    lines.append(all)
+    lines.append("M " + rxAblaCaps(re.matchFull(subject)))
+    lines.append("R " + rxHexBytes(re.replace(subject, "[$0]")))
+    lines
+}
+
+/** "" when abla/regex and the oracle agree on this pattern and text (the four answer lines, and find from the
+ * code point `later`); else what differs. `bug` plants a fault in the oracle (the suite's control). */
 fun rxDisagreement(root: RxNode, text: array<int>, later: int, bug: int): string {
     val pattern = rxRender(root)
     val compiled = regexCompile(pattern)
     if (!compiled.succeeded) return "abla refuses the pattern: ${compiled.error.message} at ${compiled.error.offset}"
     val re = compiled.regex
-    val matcher = rxMatcher(root, text)
-    matcher.m.bug = bug
     val subject = rxToText(text)
-    val whole = re.matches(subject)
-    val wholeWant = rxMatchesWhole(matcher)
-    if (whole != wholeWant) return "matches(): abla $whole, oracle $wholeWant"
-    var start = 0
-    for (round in 0 until 2) {
-        val from = if (round == 0) 0 else later
-        if (round == 1 && later <= 0) break
-        val want = rxFind(matcher, from)
-        val m = re.find(subject, matcher.m.offsets[from])
-        val got = if (m == null) "-" else "${m.start()}-${m.end()}"
-        val wanted = if (want.size == 0) "-" else "${want[0]}-${want[1]}"
-        if (got != wanted) return "find from code point $from: abla $got, oracle $wanted"
+    val q = rxMatcher(root, text)
+    q.m.bug = bug
+    val want = rxOracleLines(root, text, bug)
+    val have = rxAblaLines(re, subject)
+    for (k in 0 until 4) {
+        if (want[k] != have[k]) return "${have[k]} from abla, ${want[k]} from the oracle"
+    }
+    if (later > 0) {
+        val oracle = rxCapsText(rxFind(q, later))
+        val abla = rxAblaCaps(re.find(subject, q.m.offsets[later]))
+        if (oracle != abla) return "find from code point $later: abla $abla, oracle $oracle"
     }
     ""
 }
@@ -258,14 +318,9 @@ fun rxHexList(cps: array<int>): string {
     out
 }
 
-/** The corpus line that records the oracle's answers for this pair (kind `span`, read by tests/cases/regex/corpus.ab). */
-fun rxCorpusLine(root: RxNode, text: array<int>): string {
-    val matcher = rxMatcher(root, text)
-    val want = rxFind(matcher, 0)
-    val found = if (want.size == 0) "F -" else "F ${want[0]} ${want[1]}"
-    rxHexList(rxCodePoints(rxRender(root))) + "\t" + rxHexList(text) + "\tspan\t" + found + "\tM " +
-        (if (rxMatchesWhole(matcher)) "1" else "0")
-}
+/** The corpus line that records the oracle's answers for this pair (kind `match`, as Python's were). */
+fun rxCorpusLine(root: RxNode, text: array<int>): string =
+    rxHexList(rxCodePoints(rxRender(root))) + "\t" + rxHexList(text) + "\tmatch\t" + textJoin(rxOracleLines(root, text, 0), "\t")
 
 class RxReport(val failures: int, val text: string)
 
@@ -333,7 +388,8 @@ fun rxHexDecode(field: string): array<int> {
     out
 }
 
-/** Every `match` line of the corpus the oracle can read is answered by the oracle as Python recorded: 0 when so. */
+/** Every `match` line of the corpus the oracle can read is answered by the oracle as Python recorded it: find with
+ * its groups, findAll, the whole-text match with its groups and replace. 0 when so. */
 fun rxCorpusCheck(corpus: string): int {
     var checked = 0
     var unread = 0
@@ -347,18 +403,15 @@ fun rxCorpusCheck(corpus: string): int {
             unread = unread + 1
             continue
         }
-        val tree = root
         val text = rxHexDecode(fields[1])
-        val matcher = rxMatcher(tree, text)
-        val want = rxFind(matcher, 0)
-        val wanted = fields[3].split(" ")
-        val ok = if (want.size == 0) wanted[1] == "-" else wanted.size >= 3 && wanted[1] == "${want[0]}" && wanted[2] == "${want[1]}"
-        val whole = rxMatchesWhole(matcher)
-        val recordedWhole = fields[5] != "M -"
+        val want = rxOracleLines(root, text, 0)
         checked = checked + 1
-        if (!ok || whole != recordedWhole) {
-            bad = bad + 1
-            if (bad <= 5) println("oracle disagrees with the recorded result: ${fields[0]} on ${fields[1]}: ${fields[3]} ${fields[5]}")
+        for (k in 0 until 4) {
+            if (want[k] != fields[3 + k]) {
+                bad = bad + 1
+                if (bad <= 5) println("oracle disagrees with the recorded result: ${fields[0]} on ${fields[1]}: ${fields[3 + k]}, oracle ${want[k]}")
+                break
+            }
         }
     }
     println("regex oracle: ${checked} recorded results answered, ${unread} patterns outside its subset, ${bad} disagreements")

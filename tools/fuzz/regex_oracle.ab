@@ -5,7 +5,9 @@
 // end of its first, in order; an alternation lists its first branch's ends before its second's; a greedy repeat lists
 // the longer runs before stopping, a lazy one stops first. The leftmost-first match is then the first end for the
 // smallest start that has one. There is no VM, no thread list and no backtracking: every (node, position) answer is
-// a list of at most text-size ends, and the unbounded repeat's answers are memoised. Nothing here imports abla/regex.
+// a list of at most text-size paths, and the unbounded repeat's answers are memoised. A path is an end plus the
+// groups that completed on the way (the last round of a loop wins, as in Python), and the search for all matches
+// follows Python 3.7's rule for an empty match. Nothing here imports abla/regex.
 //
 // The subset is what the generator draws (and the old Python fuzzer drew): literals, escapes, classes, the shorthands,
 // `.`, `^ $ \b \B`, groups, alternation and every repeat form. A repeat over a body that can match the empty string
@@ -33,13 +35,19 @@ fun rxGroup(kid: RxNode, capturing: bool): RxNode = RxNode(0, 8, 0, 0, 0, [], [k
 fun rxRepeat(kid: RxNode, least: int, most: int, lazy: bool): RxNode =
     RxNode(0, 7, least, most, if (lazy) 1 else 0, [], [kid], "", false)
 
-/** A copy of the tree with its nodes numbered in order (next[0] is the next number). */
+/** A copy of the tree with its nodes numbered in order (next[0] is the next node number, next[1] the groups so far:
+ * a capturing group's `a` is its number, in the order of the opening parentheses). */
 fun rxNumbered(node: RxNode, var next: array<int>): RxNode {
     val id = next[0]
     next[0] = id + 1
+    var a = node.a
+    if (node.kind == 8 && node.capturing) {
+        next[1] = next[1] + 1
+        a = next[1]
+    }
     val kids: array<RxNode> = []
     for (kid in node.kids) kids.append(rxNumbered(kid, next))
-    RxNode(id, node.kind, node.a, node.b, node.c, node.set, kids, node.src, node.capturing)
+    RxNode(id, node.kind, a, node.b, node.c, node.set, kids, node.src, node.capturing)
 }
 
 fun rxNullable(node: RxNode): bool {
@@ -74,14 +82,16 @@ fun rxIsWord(c: int): bool = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c 
 
 fun rxWidth(cp: int): int = if (cp < 128) 1 else if (cp < 2048) 2 else if (cp < 65536) 3 else 4
 
-/** One match question: a tree, a text of code points, the memo of the unbounded repeats. */
+/** One match question: a text of code points and the memo of the unbounded repeats. A path is [end, then triples
+ * group, start, end for each group that completed on the way, in the order they completed]; later triples override
+ * earlier ones (a group keeps its value from the last round of a loop, as in Python). */
 class RxMatcher(val text: array<int>, val offsets: array<int>, val width: int, val done: array<bool>,
-    val memo: array<array<int>>, var bug: int)
+    val memo: array<array<array<int>>>, var bug: int)
 
-class RxQuery(val root: RxNode, var m: RxMatcher)
+class RxQuery(val root: RxNode, var m: RxMatcher, val groups: int)
 
 fun rxMatcher(tree: RxNode, text: array<int>): RxQuery {
-    val counter = [0]
+    val counter = [0, 0]
     val root = rxNumbered(tree, counter)
     val count = counter[0]
     val offsets: array<int> = []
@@ -92,12 +102,12 @@ fun rxMatcher(tree: RxNode, text: array<int>): RxQuery {
     }
     offsets.append(at)
     val done: array<bool> = []
-    val memo: array<array<int>> = []
+    val memo: array<array<array<int>>> = []
     for (i in 0 until count * (text.size + 1)) {
         done.append(false)
         memo.append([])
     }
-    RxQuery(root, RxMatcher(text, offsets, text.size + 1, done, memo, 0))
+    RxQuery(root, RxMatcher(text, offsets, text.size + 1, done, memo, 0), counter[1])
 }
 
 fun rxCopy(values: array<int>): array<int> {
@@ -106,15 +116,30 @@ fun rxCopy(values: array<int>): array<int> {
     out
 }
 
+fun rxCopyPaths(paths: array<array<int>>): array<array<int>> {
+    val out: array<array<int>> = []
+    for (path in paths) out.append(rxCopy(path))
+    out
+}
+
 fun rxClone(node: RxNode): RxNode =
     RxNode(0, node.kind, node.a, node.b, node.c, node.set, node.kids, node.src, node.capturing)
 
-fun rxAdd(var into: array<int>, end: int): void {
+/** Adds a path unless one with the same end is there already (the earlier one has the higher priority). */
+fun rxAdd(var into: array<array<int>>, path: array<int>): void {
     for (have in into) {
-        if (have == end) return
+        if (have[0] == path[0]) return
     }
-    into.append(end)
+    into.append(path)
     return
+}
+
+/** `first` then `second`: second's end, first's triples, second's triples. */
+fun rxJoin(first: array<int>, second: array<int>): array<int> {
+    val out: array<int> = [second[0]]
+    for (k in 1 until first.size) out.append(first[k])
+    for (k in 1 until second.size) out.append(second[k])
+    out
 }
 
 fun rxClassHas(node: RxNode, c: int): bool {
@@ -136,98 +161,150 @@ fun rxAssertHolds(m: RxMatcher, which: int, i: int): bool {
     if (which == 2) before != after else before == after
 }
 
-/** The ends of `node` started at code point `i`, in priority order, each once. `least` and `most` are the repeat
- * counts still to make. */
-fun rxRepeatEnds(var m: RxMatcher, node: RxNode, least: int, most: int, i: int): array<int> {
+/** The paths of a repeat of `node`'s body started at code point `i`, `least` and `most` rounds still to make. */
+fun rxRepeatEnds(var m: RxMatcher, node: RxNode, least: int, most: int, i: int): array<array<int>> {
     val body = node.kids[0]
     val lazy = node.c == 1 && m.bug != 1
-    val ends: array<int> = []
+    val ends: array<array<int>> = []
     if (least > 0) {
-        for (e in rxEnds(m, body, i)) {
-            for (x in rxRepeatEnds(m, node, least - 1, if (most < 0) -1 else most - 1, e)) rxAdd(ends, x)
+        for (p in rxEnds(m, body, i)) {
+            for (q in rxRepeatEnds(m, node, least - 1, if (most < 0) -1 else most - 1, p[0])) rxAdd(ends, rxJoin(p, q))
         }
         return ends
     }
     if (most == 0) {
-        ends.append(i)
+        ends.append([i])
         return ends
     }
     val unbounded = most < 0
     val slot = node.id * m.width + i
-    if (unbounded && m.done[slot]) return rxCopy(m.memo[slot])
-    val more: array<int> = []
-    for (e in rxEnds(m, body, i)) {
+    if (unbounded && m.done[slot]) return rxCopyPaths(m.memo[slot])
+    val more: array<array<int>> = []
+    for (p in rxEnds(m, body, i)) {
         // An empty round adds nothing the position itself does not already give.
-        if (!unbounded || e > i) {
-            for (x in rxRepeatEnds(m, node, 0, if (unbounded) -1 else most - 1, e)) rxAdd(more, x)
+        if (!unbounded || p[0] > i) {
+            for (q in rxRepeatEnds(m, node, 0, if (unbounded) -1 else most - 1, p[0])) rxAdd(more, rxJoin(p, q))
         }
     }
     if (lazy) {
-        rxAdd(ends, i)
+        rxAdd(ends, [i])
         for (x in more) rxAdd(ends, x)
     } else {
         for (x in more) rxAdd(ends, x)
-        rxAdd(ends, i)
+        rxAdd(ends, [i])
     }
     if (unbounded) {
         m.done[slot] = true
-        m.memo[slot] = rxCopy(ends)
+        m.memo[slot] = rxCopyPaths(ends)
     }
     ends
 }
 
-fun rxEnds(var m: RxMatcher, node: RxNode, i: int): array<int> {
+/** The paths of `node` started at code point `i`, in priority order, one per end. */
+fun rxEnds(var m: RxMatcher, node: RxNode, i: int): array<array<int>> {
     val n = m.text.size
-    val ends: array<int> = []
+    val ends: array<array<int>> = []
     if (node.kind == 0) {
-        ends.append(i)
+        ends.append([i])
     } else if (node.kind == 1) {
-        if (i < n && m.text[i] == node.a) ends.append(i + 1)
+        if (i < n && m.text[i] == node.a) ends.append([i + 1])
     } else if (node.kind == 2) {
-        if (i < n && m.text[i] != 10) ends.append(i + 1)
+        if (i < n && m.text[i] != 10) ends.append([i + 1])
     } else if (node.kind == 3) {
-        if (i < n && rxClassHas(node, m.text[i])) ends.append(i + 1)
+        if (i < n && rxClassHas(node, m.text[i])) ends.append([i + 1])
     } else if (node.kind == 5) {
-        var now: array<int> = [i]
+        var now: array<array<int>> = [[i]]
         for (kid in node.kids) {
-            val next: array<int> = []
-            for (e in now) {
-                for (x in rxEnds(m, kid, e)) rxAdd(next, x)
+            val next: array<array<int>> = []
+            for (p in now) {
+                for (q in rxEnds(m, kid, p[0])) rxAdd(next, rxJoin(p, q))
             }
             now = next
         }
-        return rxCopy(now)
+        return rxCopyPaths(now)
     } else if (node.kind == 6) {
         for (kid in node.kids) {
-            for (x in rxEnds(m, kid, i)) rxAdd(ends, x)
+            for (q in rxEnds(m, kid, i)) rxAdd(ends, q)
         }
     } else if (node.kind == 7) {
         return rxRepeatEnds(m, node, node.a, node.b, i)
     } else if (node.kind == 8) {
-        return rxEnds(m, node.kids[0], i)
+        for (q in rxEnds(m, node.kids[0], i)) {
+            val path = rxCopy(q)
+            if (node.capturing) {
+                path.append(node.a)
+                path.append(i)
+                path.append(q[0])
+            }
+            rxAdd(ends, path)
+        }
     } else if (node.kind == 9) {
-        if (rxAssertHolds(m, node.a, i)) ends.append(i)
+        if (rxAssertHolds(m, node.a, i)) ends.append([i])
     }
     ends
 }
 
-/** The leftmost-first match starting at a code point index at or after `from`: [start, end] in bytes, or []. */
-fun rxFind(var q: RxQuery, from: int): array<int> {
+/** [start, end, group 1 start, group 1 end, ...] in bytes, -1 for a group that took no part. */
+fun rxCaps(q: RxQuery, start: int, path: array<int>): array<int> {
+    val caps: array<int> = []
+    for (k in 0 until 2 * (q.groups + 1)) caps.append(-1)
+    caps[0] = q.m.offsets[start]
+    caps[1] = q.m.offsets[path[0]]
+    var k = 1
+    while (k + 2 < path.size) {
+        caps[2 * path[k]] = q.m.offsets[path[k + 1]]
+        caps[2 * path[k] + 1] = q.m.offsets[path[k + 2]]
+        k = k + 3
+    }
+    caps
+}
+
+/** The leftmost-first match starting at a code point at or after `from`; with `notEmptyAt` a match that is empty
+ * at that position does not count (Python's rule after an empty match). [] when there is none. */
+fun rxFindFrom(var q: RxQuery, from: int, notEmptyAt: int): array<int> {
     var s = from
     while (s <= q.m.text.size) {
-        val ends = rxEnds(q.m, q.root, s)
-        if (ends.size > 0) return [q.m.offsets[s], q.m.offsets[ends[0]]]
+        for (path in rxEnds(q.m, q.root, s)) {
+            if (!(s == notEmptyAt && path[0] == s)) return rxCaps(q, s, path)
+        }
         s = s + 1
     }
     []
 }
 
-/** Whether the whole text is a match. */
-fun rxMatchesWhole(var q: RxQuery): bool {
-    for (e in rxEnds(q.m, q.root, 0)) {
-        if (e == q.m.text.size) return true
+fun rxFind(var q: RxQuery, from: int): array<int> = rxFindFrom(q, from, -1)
+
+/** The match of the whole text with its groups, or []. */
+fun rxWhole(var q: RxQuery): array<int> {
+    for (path in rxEnds(q.m, q.root, 0)) {
+        if (path[0] == q.m.text.size) return rxCaps(q, 0, path)
     }
-    false
+    []
+}
+
+fun rxMatchesWhole(var q: RxQuery): bool = rxWhole(q).size > 0
+
+fun rxCodePointAt(q: RxQuery, offset: int): int {
+    for (k in 0 until q.m.offsets.size) {
+        if (q.m.offsets[k] == offset) return k
+    }
+    -1
+}
+
+/** Every match, left to right: after one the search resumes at its end, and a match that is empty may not sit where
+ * the previous empty match did (Python 3.7). */
+fun rxFindAll(var q: RxQuery): array<array<int>> {
+    val all: array<array<int>> = []
+    var pos = 0
+    var advance = -1
+    while (pos <= q.m.text.size) {
+        val caps = rxFindFrom(q, pos, advance)
+        if (caps.size == 0) break
+        all.append(caps)
+        pos = rxCodePointAt(q, caps[1])
+        advance = if (caps[0] == caps[1]) pos else -1
+    }
+    all
 }
 
 // ---- A parser for the same subset, so the oracle can read patterns written by others (the recorded corpus).
