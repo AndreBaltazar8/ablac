@@ -6,7 +6,8 @@
 # must print the same lines and exit 42 with and without --live, release (--o1) and --fast. The
 # live runs must report that functions went through the table (ABLA_LIVE_TRACE), and a plain run
 # must not. The object cache is off, so each run compiles.
-# Then tests/cases/live-jit/reload.ab redefines its own functions while it runs (abla/live).
+# Then tests/cases/live-jit/reload.ab redefines its own functions while it runs (abla/live), also when
+# the live run starts from the object cache, and tests/cases/live-jit/refuse.ab checks the refusals.
 # Usage: tools/test-live-jit.sh [compiler]
 set -euo pipefail
 compiler=${1:-build/ablac}
@@ -66,6 +67,25 @@ for profile in o1 fast; do
         exit 1
     fi
 done
+# A live run from the object cache (stage 2c): the first run compiles and keeps the object with the
+# compiler's record (<object>.live); the second, on a fresh copy, must start from the cache and still reload.
+for round in compile cached; do
+    cp tests/cases/live-jit/reload.ab "$reload"
+    status=0
+    ABLA_JIT_CACHE=1 ABLA_JIT_CACHE_TRACE=1 ABLA_CACHE_DIR=$PWD/$out/cache timeout 300 "$compiler" run --live "$reload" -- "$reload" \
+        > "$out/reload-$round.out" 2> "$out/reload-$round.err" || status=$?
+    if [[ $status -ne 42 ]] || grep -q ': FAIL' "$out/reload-$round.out"; then
+        printf 'live jit (reload, %s): exit status %s (42 expected)\n' "$round" "$status" >&2
+        cat "$out/reload-$round.out" >&2
+        head -n 30 "$out/reload-$round.err" >&2
+        exit 1
+    fi
+done
+if ! grep -q '^\[jit-cache\] hit ' "$out/reload-cached.err"; then
+    echo "live jit (reload, cached): the second live run did not start from the object cache" >&2
+    cat "$out/reload-cached.err" >&2
+    exit 1
+fi
 # The refusals (stage 2b): tests/cases/live-jit/refuse.ab, see its header.
 refuse=$PWD/$out/reload/refuse.ab
 cp tests/cases/live-jit/refuse.ab "$refuse"
