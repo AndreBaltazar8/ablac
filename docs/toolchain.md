@@ -135,10 +135,11 @@ What a macOS program imports (`tools/libsystem-imports-allowlist.txt`, release a
 | one that starts no thread (hello, files, strings, float `%`, tasks, pure-Abla TLS) | `libSystem.B.dylib`, `__tlv_bootstrap`, `_fork` (a `--fast` task program on Apple Silicon also `_pthread_join`) |
 | one that starts threads (`thread { }`) | those, `_pthread_create`, `_pthread_join` |
 | one with a TLS connection through OpenSSL (`abla/tls/hosted`) | those, `libssl` and `libcrypto` and `_OpenSSL_version_num` (its lines marked " ?" were not yet checked on a Mac) |
+| a dylib (`--emit shared-library`, `tests/cases/libsystem-dylibs`) | `libSystem.B.dylib`, `__tlv_bootstrap`, and `_pthread_create`, `_pthread_join` when it starts threads (#833; not yet checked on a Mac) |
 
 The memory and jump routines, float remainder, system calls, signals and their trampoline, clocks, random
-numbers, the running image's path and the stack guard are the program's own; the image uses chained fixups
-(no `dyld_stub_binder`).
+numbers, the running image's path and the stack guard are the program's own (a dylib's too); the image uses
+chained fixups (no `dyld_stub_binder`), and an `@hostImport` symbol of a dylib is a flat-namespace bind.
 
 `ablac run` on macOS JIT-compiles the program with LLVM's emulated TLS (LLJIT has no MachOPlatform), so a thread-local of
 the program is a call of `___emutls_get_address`. The compiler defines that function itself (`abla/runtime/emutls`, exported
