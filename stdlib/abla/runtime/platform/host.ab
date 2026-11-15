@@ -1026,38 +1026,49 @@ trusted fun __ablaRuntimeHostSignalStackCall(installed: int, previous: int): boo
     ablaLinuxSyscall(number, installed, previous, 0, 0, 0, 0) == 0
 }
 
+// The signal stack is a mapping of its own (mmap and munmap by system call, as the heap maps its large blocks), and the
+// stack_t each call passes lives in its first bytes: the kernel copies a stack_t when sigaltstack is called, so it may
+// sit in the stack it describes. Enter and Leave take nothing from the heap, so they read none of the thread's
+// thread-locals (the heap's, the emulated ones): where they run relative to the thread-end hook doesn't matter.
+val __ablaRuntimeHostSignalStackBytes = 65536
+
 trusted fun __ablaRuntimePlatformThreadSignalStackEnter(): int {
     val arch = ablaSimdTargetArch()
     if (arch != 1 && arch != 2) return 0
     val flagsAt = if (ablaHostIsMacOS()) 16 else 8
     val sizeAt = if (ablaHostIsMacOS()) 8 else 16
     val disabled = if (ablaHostIsMacOS()) 4 else 2
-    val state = __ablaRuntimePlatformRawAllocate(32)
-    var stack = 0
-    if (__ablaRuntimeHostSignalStackCall(0, state) &&
-        (ablaRuntimeLoadI64(state + flagsAt) & 4294967295 & disabled) != 0) {
-        val size = 65536
-        val memory = __ablaRuntimePlatformRawAllocate(size)
-        ablaRuntimeStoreI64(state, memory)
-        ablaRuntimeStoreI64(state + 8, 0)
-        ablaRuntimeStoreI64(state + 16, 0)
-        ablaRuntimeStoreI64(state + sizeAt, size)
-        if (__ablaRuntimeHostSignalStackCall(state, 0)) stack = memory
-        else __ablaRuntimePlatformRawFree(memory)
+    val size = __ablaRuntimeHostSignalStackBytes
+    val memory = __ablaRuntimeHostHeapMap(size)
+    if (memory == 0) return 0
+    // The thread's current one, read into the start of the new mapping: kept if there is one (abla_clone_create's).
+    if (!__ablaRuntimeHostSignalStackCall(0, memory) ||
+        (ablaRuntimeLoadI64(memory + flagsAt) & 4294967295 & disabled) == 0) {
+        __ablaRuntimeHostHeapUnmap(memory, size)
+        return 0
     }
-    __ablaRuntimePlatformRawFree(state)
-    stack
+    ablaRuntimeStoreI64(memory, memory)
+    ablaRuntimeStoreI64(memory + 8, 0)
+    ablaRuntimeStoreI64(memory + 16, 0)
+    ablaRuntimeStoreI64(memory + sizeAt, size)
+    if (!__ablaRuntimeHostSignalStackCall(memory, 0)) {
+        __ablaRuntimeHostHeapUnmap(memory, size)
+        return 0
+    }
+    memory
 }
 
 trusted fun __ablaRuntimePlatformThreadSignalStackLeave(stack: int): void {
     if (stack == 0) return
     val flagsAt = if (ablaHostIsMacOS()) 16 else 8
     val disabled = if (ablaHostIsMacOS()) 4 else 2
-    val state = __ablaRuntimePlatformRawAllocate(32)
-    ablaRuntimeStoreI64(state + flagsAt, disabled)
-    __ablaRuntimeHostSignalStackCall(state, 0)
-    __ablaRuntimePlatformRawFree(state)
-    __ablaRuntimePlatformRawFree(stack)
+    // SS_DISABLE, in a stack_t at the start of the stack it takes down (no handler runs on it now).
+    ablaRuntimeStoreI64(stack, 0)
+    ablaRuntimeStoreI64(stack + 8, 0)
+    ablaRuntimeStoreI64(stack + 16, 0)
+    ablaRuntimeStoreI64(stack + flagsAt, disabled)
+    __ablaRuntimeHostSignalStackCall(stack, 0)
+    __ablaRuntimeHostHeapUnmap(stack, __ablaRuntimeHostSignalStackBytes)
     return
 }
 
