@@ -164,7 +164,10 @@ test-serial: ablac
 	tools/test-xtensa-assembly.sh $(COMPILER)
 	tools/test-xtensa-catalog.sh $(COMPILER)
 	tools/test-simd.sh $(COMPILER)
-	tools/test-ct.sh $(COMPILER)
+	tools/test-ct.sh $(COMPILER) x86
+	tools/test-ct.sh $(COMPILER) aarch64
+	tools/test-ct.sh $(COMPILER) wasm
+	tools/test-ct.sh $(COMPILER) xtensa
 	tools/test-ct-timing-stats.sh $(COMPILER)
 	tools/test-bignum-secret.sh $(COMPILER)
 	tools/test-wide-integers.sh $(COMPILER)

@@ -10,9 +10,14 @@ set -euo pipefail
 
 compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
+# Which targets' reads run (x86, aarch64, wasm, xtensa; all by default): the suite runs one entry per target, at once,
+# each with the shared fixtures and self-tests below and its own output directory. The refusals run with x86.
+parts=${2:-all}
+part() { [[ $parts == all || " $parts " == *" $1 "* ]]; }
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-cases=build/ct/cases
 out=build/ct
+[[ $parts == all ]] || out=build/ct-${parts// /-}
+cases=$out/cases
 cd "$project_root"
 rm -rf "$out"
 mkdir -p "$out"
@@ -55,7 +60,7 @@ sed -i 's|^import "abla/ct"$|import "abla/ct"\nimport "abla/ct/scrub"|' "$out/re
 "$tools_out/residue-entries" "$out/residue-cases/fixture.ab" ctScrubStack1024 "$out/residue-cases/fixture.ab" \
     "$cases/crypto-generated.follow" > "$out/residue-entries.txt"
 # Staged build drivers need the scratch fixture paths as well.
-sed -i 's@tests/cases/ct/@build/ct/cases/@g' "$cases/build.ab" "$cases/build-fast.ab" "$cases/aarch64-build.ab"
+sed -i "s@build/ct/@$out/@g; s@tests/cases/ct/@$cases/@g" "$cases/build.ab" "$cases/build-fast.ab" "$cases/aarch64-build.ab"
 "$tools_out/selftest"
 "$tools_out/test-source-fixtures" "$tools_out/source-fixtures" "$project_root" "$PWD/$out/source-test"
 
@@ -931,6 +936,7 @@ xtensa_follow_read() {
     echo "ok   xtensa call following: five clean calls read, seven leaks and refusals found, the calls refused without following"
 }
 
+if part x86; then
 # --- x86-64 ---------------------------------------------------------------------------
 for mode in "" --fast; do
     "$compiler" build "$cases/native.ab" -o "$out/native" --no-cache $mode
@@ -986,7 +992,9 @@ header_allocator x86_64 header-x86
 header_allocator aarch64 header-a64
 header_allocator wasm header-wasm.wasm 0
 header_allocator xtensa header-xtensa.o 4
+fi
 
+if part aarch64; then
 # --- AArch64 --------------------------------------------------------------------------
 "$compiler" build "$cases/aarch64-build.ab" -o "$out/aarch64-driver" --no-cache
 llvm-mc -triple aarch64-linux-gnu -filetype=obj tests/cases/simd/aarch64-start.s -o "$out/aarch64-start.o"
@@ -1016,7 +1024,9 @@ kem_read "$out/aarch64.o" aarch64
 p384_read "$out/aarch64.o" aarch64
 # A --fast build keeps every call: the checker follows each into its callee, defined in the same object.
 fast_read aarch64 "$out/aarch64-fast.o" "" "" "$cases/fast-known-aarch64.txt"
+fi
 
+if part wasm; then
 # --- Wasm: the final module ----------------------------------------------------------
 "$compiler" build "$cases/build.ab" -o "$out/wasm-driver" --no-cache 2> "$out/wasm.log" || { cat "$out/wasm.log" >&2; exit 1; }
 "$out/wasm-driver"
@@ -1039,7 +1049,9 @@ env -u ABLA_KEEP_LLVM_TEXT "$compiler" build "$cases/build-fast.ab" -o "$out/was
     cat "$out/wasm-fast.log" >&2; exit 1
 }
 fast_read wasm "$out/ct-fast.wasm" "" "" "$cases/fast-known-wasm.txt"
+fi
 
+if part xtensa; then
 # --- Xtensa: read, not run ------------------------------------------------------------
 tools_directory="$out/xtensa-tools"
 . "$project_root/tools/xtensa-test-tools.sh"
@@ -1077,7 +1089,9 @@ xtensa_place_read
 xtensa_residue_read
 scrub_available_read
 write_only_read
+fi
 
+if part x86; then
 # --- What the compiler refuses ----------------------------------------------------------
 for invalid in "$cases"/invalid-*.ab; do
     expected=$(sed -n '1s|^// *||p' "$invalid")
@@ -1092,4 +1106,5 @@ for invalid in "$cases"/invalid-*.ab; do
     fi
 done
 echo "ok   refusals: $(ls "$cases"/invalid-*.ab | wc -l)"
-echo "ct: ok"
+fi
+echo "ct: ok ($parts)"
