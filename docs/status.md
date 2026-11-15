@@ -82,9 +82,10 @@ follow-on performance and API work, not blockers for the foundation milestone.
 
 1. Reduce cold semantic-analysis and lowering cost without weakening fixed-point
    or conformance gates; preserve the warm cache path.
-2. Close remaining ownership and inference edge cases, and decide which
-   reserved generic forms to implement: `where` clauses, `const` type
-   parameters and associated types. Preserve the shipped interface and
+2. Close remaining ownership and inference edge cases. The reserved generic
+   forms are decided (#63): `where` clauses and `const` type parameters stay
+   reserved and deferred; associated types are not planned (bound-instance
+   inference covers their use). Preserve the shipped interface and
    generic conformance gates; open work is tracked in [TODO.md](../TODO.md).
 3. Grow host-neutral standard libraries and extension-owned Android/WASM
    packages on top of the generic compiler contracts.

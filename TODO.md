@@ -1040,8 +1040,16 @@ mmap form) apply there.
   like a clock change), or take the region from the first logged commit that writes it rather than the first
   access. The 16-clock limit (thread number & 15) is the same as before.
 
-- [ ] **The rest of the reserved generic syntax.** `where` clauses, `const` type parameters and
-  an interface's `type Item` still give `E_PARSE_NOT_YET_SUPPORTED`. Decide which to build.
+- [ ] **Deferred: `where` clauses and `const` type parameters (André's decision #63).** Both stay reserved
+  (`E_PARSE_NOT_YET_SUPPORTED`); no code asks for either. `where` would be sugar over the existing bounds
+  (about 110 lines: parser, formatter, tests, docs) and must never make a class's methods conditional. `const`
+  parameters (600 to 1,200 lines, medium risk) give nothing the language can use without a fixed-size array or
+  vector type: revisit them together with one (the `abla/simd` blocks, crypto limb counts). Decided at the same
+  time: the inference rule for bound instances (12ea2618) stays, and an interface's `type Item` is not reserved
+  any more (a plain `E_PARSE_CLASS_MEMBER`); real associated types are not planned. The design report is
+  `~/agents-memory/abla/ablac-reserved-generic-syntax-design.md`. Not covered by any of the three and seen in
+  real code: static members on type parameters (a bound that gives `T.fromJson(...)`), which abla-one works
+  around with function parameters.
 - [ ] **Module-scoped globals (André's decision #64).** Strict imports (`visibility = "imports"`) exist, opt-in;
   what the decision covers is making them the default and retiring flat packages. The compiler and the standard library are
   strict (the 2026-10-19 count of 102 in the compiler is 0). Strict mode's gaps are closed: extension functions and

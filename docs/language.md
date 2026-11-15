@@ -1864,7 +1864,8 @@ fun main {
   `deep`) is `generic.instantiation-depth:<f>`. A generic function may not
   share its name with another function (`generic.overload:<f>`), and a
   generic function is called, not passed as a value
-  (`generic.reference:<f>`). `where` clauses are reserved syntax.
+  (`generic.reference:<f>`). `where` clauses and `const` type parameters are
+  reserved syntax ([Bounds](#bounds) says what was decided).
 - **At compile time** generics behave as at run time: `#first([1, 2])`
   evaluates the instance the call names. `#` code in a generic's body runs
   per instance ([below](#compile-time-code-per-instance)).
@@ -2075,6 +2076,17 @@ naming a parameter another bound bound (`<A, S : Source<A>, K : Sink<A>>`). A
 type that conforms to two instances of the interface (`class Both : Marker<int>,
 Marker<string>`) or to none leaves `T` open, so `generic.cannot-infer` stands
 and the type arguments are written out (`idOf<int, Both>(…)`).
+
+**Not in the language (decision #63).** Three generic forms were reserved; this is what was decided for each.
+
+- **Associated types (`type Item` in an interface):** not planned. The failure they were reserved for, a bound
+  that names its element type (`fun <T, C : Source<T>> firstOf(c: C): T?`), is the inference rule above. The
+  reservation is dropped: `type Item` in an interface is an ordinary parse error
+  (`E_PARSE_CLASS_MEMBER`), like any other member that is not a method.
+- **`where` clauses:** deferred, still reserved (`E_PARSE_NOT_YET_SUPPORTED`). They would only restate what bounds say; if
+  they come, they are sugar over `<T : Bound>` and never change what a class's methods are.
+- **`const` type parameters (`class Matrix<const N: int>`):** deferred, still reserved (`E_PARSE_NOT_YET_SUPPORTED`).
+  They are worth building together with a fixed-size array or vector type, not alone.
 
 ### Compile-time code per instance
 

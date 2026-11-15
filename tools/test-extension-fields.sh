@@ -69,6 +69,11 @@ rejected invalid field.extension-default:Point.missing field.extension-owner:int
     { echo "extension fields: a duplicate reported more than once"; exit 1; }
 rejected invalid-resource field.extension-resource:Plain.t
 rejected reserved E_PARSE_NOT_YET_SUPPORTED
-[[ $(grep -c 'E_PARSE_NOT_YET_SUPPORTED' "$output_directory/reserved.err") == 4 ]] ||
+[[ $(grep -c 'E_PARSE_NOT_YET_SUPPORTED' "$output_directory/reserved.err") == 3 ]] ||
     { echo "extension fields: reserved syntax:"; cat "$output_directory/reserved.err"; exit 1; }
+# `type Item` in an interface is no longer reserved (decision #63): a plain parse error.
+rejected type-item E_PARSE_CLASS_MEMBER
+if grep -qF 'NOT_YET_SUPPORTED' "$output_directory/type-item.err"; then
+    echo "extension fields: type Item is still reserved syntax"; cat "$output_directory/type-item.err"; exit 1
+fi
 echo "extension fields: reads, writes, defaults, mutations, val, modules, drops, # (both tiers), compiler API, diagnostics, reserved syntax"
