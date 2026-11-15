@@ -1,0 +1,179 @@
+// Fuzzing of abla/http/h2 (the sans-IO HTTP/2 pieces; H2Client joins when it exists), deterministic from a seed, no sockets.
+// HPACK, per run:
+//   roundtrip  random header lists (credentials, long and short values, repeated names, binary bytes) through an encoder and
+//              a decoder whose table sizes change between blocks (setPeerTableSize): every list must come back equal, both
+//              tables must agree in size, credential names must come back marked sensitive and must never be in the table
+//   mutate     a valid block with one change (a byte flipped, inserted, removed, truncated, a run repeated): the decoder may
+//              accept or refuse, but must not panic, never exceed its limits (fields, list bytes, table bytes) and, once it
+//              refused, must refuse every later block
+//   random     a block of random bytes, and one made of random HPACK instruction prefixes: same rules
+// A finding is a violated rule, a run that takes too long (quadratic cost), or a crash (a panic ends the program: the seed is
+// printed before each run with --verbose). Usage: fuzz <first seed> <count> [--verbose]
+import "abla/io"
+import "abla/crypto"
+import "abla/integer"
+import "abla/process/arguments"
+import "abla/http/h2/hpack"
+
+var choiceState = 1
+
+fun nextChoice(): int {
+    choiceState = (choiceState * 6364136223846793005 + 1442695040888963407)
+    (choiceState >> 33) & 2147483647
+}
+
+fun below(limit: int): int = if (limit <= 0) 0 else nextChoice() % limit
+
+var failures = 0
+
+fun finding(seed: int, what: string): void {
+    failures = failures + 1
+    if (failures < 20) println("FINDING seed $seed: $what")
+    return
+}
+
+fun randomText(maximum: int, binary: bool): string {
+    val count = below(maximum + 1)
+    val bytes: array<int> = []
+    for (i in 0 until count) bytes.append(if (binary) below(256) else 97 + below(26))
+    cryptoByteString(bytes)
+}
+
+val NAMES: array<string> = [":method", ":path", ":authority", "cookie", "authorization", "user-agent", "accept", "x-a", "x-b", "x-c", "content-type", "set-cookie", "x-token"]
+
+fun randomFields(): array<HpackField> {
+    val fields: array<HpackField> = []
+    val count = 1 + below(12)
+    for (i in 0 until count) {
+        var name = NAMES[below(NAMES.size)]
+        if (below(5) == 0) name = "x-" + randomText(12, false)
+        val value = if (below(4) == 0) randomText(300, true) else randomText(20, false)
+        fields.append(HpackField(name, value, below(8) == 0))
+    }
+    fields
+}
+
+fun isSecret(name: string): bool = name == "cookie" || name == "authorization" || name == "set-cookie" || name == "x-token"
+
+fun roundtrip(seed: int): void {
+    var encoder = hpackEncoderNew(4096, ["x-token"])
+    var decoder = hpackDecoderNew(4096, 65536, 16384, 256)
+    var blocks = 1 + below(6)
+    for (b in 0 until blocks) {
+        if (below(3) == 0) {
+            val size = below(5000)
+            encoder.setPeerTableSize(size)
+            // The decoder's advertised size is 4096: a peer size above it is capped by the encoder (cap 4096).
+        }
+        val fields = randomFields()
+        val block = encoder.encode(fields)
+        val got = decoder.decode(block)
+        if (!got.ok) {
+            finding(seed, "a block the encoder made was refused: ${got.error}")
+            return
+        }
+        if (got.fields.size != fields.size) {
+            finding(seed, "roundtrip count")
+            return
+        }
+        for (i in 0 until fields.size) {
+            if (got.fields[i].name != fields[i].name || got.fields[i].value != fields[i].value) {
+                finding(seed, "roundtrip field $i")
+                return
+            }
+            if ((isSecret(fields[i].name) || fields[i].sensitive) && !got.fields[i].sensitive) finding(seed, "a secret came back unmarked: ${fields[i].name}")
+        }
+        if (encoder.tableBytes() != decoder.tableBytes()) {
+            finding(seed, "tables differ: ${encoder.tableBytes()} vs ${decoder.tableBytes()}")
+            return
+        }
+    }
+    return
+}
+
+fun mutate(block: string): string {
+    if (block.size == 0) return block
+    val at = below(block.size)
+    val kind = below(6)
+    if (kind == 0) return block.slice(0, at) + cryptoByteString([below(256)]) + block.slice(at + 1, block.size)
+    if (kind == 1) return block.slice(0, at) + cryptoByteString([below(256)]) + block.slice(at, block.size)
+    if (kind == 2) return block.slice(0, at) + block.slice(at + 1, block.size)
+    if (kind == 3) return block.slice(0, at)
+    if (kind == 4) {
+        val end = at + below(block.size - at) + 1
+        return block.slice(0, end) + block.slice(at, end) + block.slice(end, block.size)
+    }
+    block.slice(0, at) + cryptoByteString([255, 255, 255, 255, 127]) + block.slice(at, block.size)
+}
+
+fun check(seed: int, decoder: HpackDecoder, got: HpackBlock, tableLimit: int, what: string): void {
+    if (decoder.tableBytes() > tableLimit) finding(seed, "$what: the table grew past its limit: ${decoder.tableBytes()}")
+    if (got.ok) {
+        if (got.fields.size > 256) finding(seed, "$what: more fields than the limit")
+        var total = 0
+        for (f in got.fields) total = total + f.name.size + f.value.size + 32
+        if (total > 65536) finding(seed, "$what: a list past its limit: $total")
+    }
+    return
+}
+
+fun mutated(seed: int): void {
+    var encoder = hpackEncoderNew(4096)
+    var decoder = hpackDecoderNew(4096, 65536, 16384, 256)
+    // Warm the tables with a valid block or two, then feed a mutated one.
+    val warm = decoder.decode(encoder.encode(randomFields()))
+    if (!warm.ok) {
+        finding(seed, "warm block refused")
+        return
+    }
+    val block = mutate(encoder.encode(randomFields()))
+    val got = decoder.decode(block)
+    check(seed, decoder, got, 4096, "mutated")
+    if (!got.ok) {
+        // Once refused, refused for good.
+        val again = decoder.decode(encoder.encode(randomFields()))
+        if (again.ok) finding(seed, "a decoder that failed accepted a later block")
+    }
+    return
+}
+
+fun randomBlock(seed: int): void {
+    var decoder = hpackDecoderNew(4096, 65536, 16384, 256)
+    // Pure random bytes.
+    val noise = randomText(600, true)
+    val got = decoder.decode(noise)
+    check(seed, decoder, got, 4096, "random")
+    // Random instruction prefixes with plausible lengths: more of the block is parsed before it fails.
+    var decoder2 = hpackDecoderNew(4096, 65536, 16384, 256)
+    val pieces: array<int> = []
+    val count = 1 + below(40)
+    for (i in 0 until count) {
+        val kind = below(5)
+        if (kind == 0) pieces.append(128 + below(128))
+        else if (kind == 1) pieces.append(64 + below(64))
+        else if (kind == 2) pieces.append(below(32))
+        else if (kind == 3) pieces.append(32 + below(32))
+        else pieces.append(below(256))
+    }
+    val got2 = decoder2.decode(cryptoByteString(pieces))
+    check(seed, decoder2, got2, 4096, "prefixes")
+    return
+}
+
+fun main: int {
+    val firstArg = processArgument(0).parseInt()
+    val countArg = processArgument(1).parseInt()
+    if (firstArg == null || countArg == null) return 2
+    val first: int = firstArg
+    val count: int = countArg
+    val verbose = processArgumentCount() > 2 && processArgument(2) == "--verbose"
+    for (seed in first until first + count) {
+        choiceState = seed * 2654435761 + 12345
+        if (verbose) println("seed $seed")
+        roundtrip(seed)
+        mutated(seed)
+        randomBlock(seed)
+    }
+    if (failures == 0) println("http2-fuzz ok: seeds $first..${first + count - 1}")
+    failures
+}
