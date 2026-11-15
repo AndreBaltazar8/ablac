@@ -9,10 +9,10 @@ root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
 list=tools/test-quick.txt
 output=${RUN_TESTS_OUTPUT:-build/test-results/quick}
-mkdir -p "$output"
+mkdir -p "$(dirname "$output")"
 
 # The suite's commands, as tools/run-tests.sh takes them, keyed with COMPILER for the compiler.
-suite=$output/suite-commands.txt
+suite=$output.suite-commands.txt
 MAKEFLAGS= MFLAGS= make -s -n -o ablac -o "$compiler" test-serial COMPILER="$compiler" >"$suite"
 key() { local command=$1; printf '%s\n' "${command//$compiler/COMPILER}"; }
 
@@ -33,7 +33,8 @@ while IFS= read -r line; do
     fi
 done <"$list"
 
-selected=$output/commands.txt
+# Beside the output, which tools/run-tests.sh empties before it starts.
+selected=$output.commands.txt
 : >"$selected"
 while IFS= read -r command; do
     [[ -z $command ]] && continue

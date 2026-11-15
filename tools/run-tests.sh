@@ -275,7 +275,9 @@ echo "running ${#parallel[@]} commands, $jobs at a time, and ${#serial[@]} once 
 run_all "$jobs" ${parallel[@]+"${parallel[@]}"}
 
 sort -n -o "$output/results.tsv" "$output/results.tsv" 2>/dev/null
-if [[ -z $filter && -s $output/results.tsv ]]; then
+# A whole run only: a filtered run or a command file of its own (make test-quick) would leave the next run its order
+# for the few commands it ran.
+if [[ -z $filter && -z ${RUN_TESTS_COMMANDS:-} && -s $output/results.tsv ]]; then
     mkdir -p "$(dirname "$history_file")" && cp "$output/results.tsv" "$history_file"
 fi
 elapsed=$(awk -v b="$started_at" -v e="$(seconds_now)" 'BEGIN { printf "%d", e - b }')
