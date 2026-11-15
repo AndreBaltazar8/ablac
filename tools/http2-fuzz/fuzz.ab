@@ -8,12 +8,15 @@
 //              refused, must refuse every later block
 //   random     a block of random bytes, and one made of random HPACK instruction prefixes: same rules
 // A finding is a violated rule, a run that takes too long (quadratic cost), or a crash (a panic ends the program: the seed is
+// H2Client, per run: a valid server script (SETTINGS, responses, data, trailers, resets, window updates, pings, GOAWAY), a mutated one or random frames, delivered in
+// random pieces with time moving: no panic, each stream ends once, at most one CLOSED, no more streams than the limit, nothing queued after the end.
 // printed before each run with --verbose). Usage: fuzz <first seed> <count> [--verbose]
 import "abla/io"
 import "abla/crypto"
 import "abla/integer"
 import "abla/process/arguments"
 import "abla/http/h2/hpack"
+import "abla/http/h2"
 
 var choiceState = 1
 
@@ -160,6 +163,107 @@ fun randomBlock(seed: int): void {
     return
 }
 
+
+// ---- H2Client ----
+fun fuzzFrame(kind: int, flags: int, stream: int, payload: string): string {
+    val n = payload.size
+    cryptoByteString([(n >> 16) & 255, (n >> 8) & 255, n & 255, kind, flags, (stream >> 24) & 127, (stream >> 16) & 255, (stream >> 8) & 255, stream & 255]) + payload
+}
+
+fun fuzzBe32(value: int): string = cryptoByteString([(value >> 24) & 255, (value >> 16) & 255, (value >> 8) & 255, value & 255])
+
+/** A plausible server conversation for requests on streams 1, 3, 5: SETTINGS, responses, data, trailers, resets, window updates, pings, a goaway. */
+fun serverScript(): string {
+    var encoder = hpackEncoderNew(4096)
+    var out = fuzzFrame(4, 0, 0, if (below(2) == 0) "" else cryptoByteString([0, 3, 0, 0, 0, 1 + below(5), 0, 4, 0, 0, below(256), below(256)]))
+    val pieces = 2 + below(12)
+    for (i in 0 until pieces) {
+        val stream = 1 + 2 * below(3)
+        val kind = below(9)
+        if (kind == 0) {
+            out = out + fuzzFrame(1, 4 | below(2), stream, encoder.encode([HpackField(":status", if (below(5) == 0) "103" else "200", false), HpackField("x-a", randomText(30, false), false)]))
+        } else if (kind == 1) {
+            out = out + fuzzFrame(0, below(2) | 0, stream, randomText(2000, true))
+        } else if (kind == 2) {
+            out = out + fuzzFrame(3, 0, stream, fuzzBe32(below(14)))
+        } else if (kind == 3) {
+            out = out + fuzzFrame(8, 0, if (below(2) == 0) 0 else stream, fuzzBe32(1 + below(100000)))
+        } else if (kind == 4) {
+            out = out + fuzzFrame(6, below(2), 0, "12345678")
+        } else if (kind == 5) {
+            out = out + fuzzFrame(4, below(2), 0, if (below(2) == 0) "" else cryptoByteString([0, 4, 0, 0, below(2), below(256)]))
+        } else if (kind == 6) {
+            out = out + fuzzFrame(1, below(2), stream, encoder.encode([HpackField("x-trailer", "1", false)]))
+        } else if (kind == 7) {
+            out = out + fuzzFrame(2, 0, stream, "12345")
+        } else {
+            out = out + fuzzFrame(7, 0, 0, fuzzBe32(below(8)) + fuzzBe32(below(3)))
+        }
+    }
+    out
+}
+
+fun randomFrames(): string {
+    var out = fuzzFrame(4, 0, 0, "")
+    val count = 1 + below(20)
+    for (i in 0 until count) {
+        val length = if (below(4) == 0) below(40) else below(10)
+        out = out + fuzzFrame(below(12), below(256), if (below(3) == 0) 0 else below(8), randomText(length, true))
+    }
+    out
+}
+
+fun checkClient(seed: int, var client: H2Client, var ended: array<int>, what: string): void {
+    var closed = 0
+    for (e in client.takeEvents()) {
+        if (e.kind == H2_EVENT_END || e.kind == H2_EVENT_RESET) {
+            for (id in ended) {
+                if (id == e.stream) finding(seed, "$what: stream ${e.stream} ended twice")
+            }
+            ended.append(e.stream)
+        }
+        if (e.kind == H2_EVENT_CLOSED) closed = closed + 1
+        if (e.kind == H2_EVENT_DATA && e.data.size > 16384) finding(seed, "$what: a data event over the frame size")
+    }
+    if (closed > 1) finding(seed, "$what: closed more than once")
+    if (client.openStreams() > 100) finding(seed, "$what: more streams than the limit")
+    return
+}
+
+fun clientRun(seed: int): void {
+    var client = h2ClientNew(100, 100000)
+    client.takeOutput()
+    var ended: array<int> = []
+    val mode = below(3)
+    for (r in 0 until 3) client.request("GET", "https", "example.com", "/", [], if (r == 2) randomText(70000, true) else "")
+    var input = if (mode == 0) randomFrames() else serverScript()
+    if (mode == 2) input = mutate(input)
+    // Delivered in random pieces, with time moving and the output taken between.
+    var at = 0
+    var now = 0
+    while (at < input.size) {
+        val take = 1 + below(if (below(2) == 0) 40 else 3000)
+        val end = if (at + take > input.size) input.size else at + take
+        client.feed(input.slice(at, end), now)
+        at = end
+        now = now + below(300)
+        client.tick(now)
+        val act = below(24)
+        if (act == 0) client.cancel(1 + 2 * below(4))
+        if (act == 1) client.ping(now)
+        if (act == 2) client.request("POST", "https", "example.com", "/x", [], randomText(500, true))
+        if (act == 3) client.shutdown()
+        if (act == 4) client.broken("fuzz")
+        if (client.takeOutput().size > 2000000) finding(seed, "output past what two megabytes of work explain")
+        checkClient(seed, client, ended, "run")
+    }
+    if (client.isClosed()) {
+        // Nothing more is accepted and nothing is queued after the end.
+        client.feed(serverScript(), now)
+        if (client.takeOutput().size > 0) finding(seed, "output after the connection closed")
+    }
+    return
+}
 fun main: int {
     val firstArg = processArgument(0).parseInt()
     val countArg = processArgument(1).parseInt()
@@ -173,6 +277,7 @@ fun main: int {
         roundtrip(seed)
         mutated(seed)
         randomBlock(seed)
+        clientRun(seed)
     }
     if (failures == 0) println("http2-fuzz ok: seeds $first..${first + count - 1}")
     failures
