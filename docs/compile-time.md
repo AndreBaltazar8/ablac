@@ -661,9 +661,12 @@ there is no step limit, only a [time limit](#native-evaluation).
 
 The runtime memory API (`memoryLiveBytes`, `memoryCollect`, `memoryReset`,
 ...) needs a heap of the program's own. The evaluator has none, so there each
-function used is one `E_EVAL_MEMORY_UNAVAILABLE` error. The exception is
-`memorySetBackgroundFree`, which only changes when freed memory goes back to
-the system and so does nothing in the evaluator. Native compile-time code has
+function used is one `E_EVAL_MEMORY_UNAVAILABLE` error. The exceptions do
+nothing the program could count: `memoryCollect()` is a safe point the program
+asks for, and the evaluator's values are the compiler's, so it returns 0 bytes
+reclaimed; `memorySetBackgroundFree` only changes when freed memory goes back to
+the system. A program that only collects evaluates; one that measures
+(`memoryLiveBytes`, a checkpoint and reset) is refused. Native compile-time code has
 a runtime of its own, and the API measures and manages that heap.
 
 ### Threads at compile time
@@ -749,7 +752,7 @@ reason:
 | `abla/ct`'s secret integers (`secretU8` to `secretU64`) and their operators | works, no grant: a secret integer is its integer, typed, and nothing is secret or timed under `#`. The stack wipes (`ctScrubStack...`) are not evaluated: they need `trusted.native` and do nothing |
 | `abla/simd/target`: `simdTargetArch()`, `targetHas`, `cpuHas` | works, no grant: the architecture is the build's target, not the compiler's host; `cpuHas` answers false for every feature, so compile-time code takes the portable software path (a hardware path must give the same answers) |
 | Volatile loads and stores (`abla/unsafe/mmio`) | work as ordinary ones, with the grant raw memory has |
-| The runtime memory API (`memoryLiveBytes`, `memoryCollect`, ...) | evaluator: `E_EVAL_MEMORY_UNAVAILABLE`; native tier: its own runtime's heap ([limits](#limits)) |
+| The runtime memory API (`memoryLiveBytes`, `memoryReset`, ...) | evaluator: `E_EVAL_MEMORY_UNAVAILABLE` (`memoryCollect()` returns 0); native tier: its own runtime's heap ([limits](#limits)) |
 | Run-time globals | see [above](#ordinary-globals-at-compile-time) |
 | Process arguments (`processArgumentCount()`) | works: compile-time code sees none, so the count is 0; no capability needed |
 

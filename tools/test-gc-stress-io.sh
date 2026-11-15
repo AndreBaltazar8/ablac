@@ -5,7 +5,7 @@
 # copy in a table, a field or a local) then points at poison, not at the bytes a freed block keeps until it is
 # reused, so the program fails at once instead of under rare pressure. Each must exit 42 both ways. The list is
 # fixed so the step stays short. tests/cases/gc-stress-io/ct-process.ab is the compiler's own process capture,
-# which every `#` site with process.io runs.
+# which every `#` site with process.io runs; native-argv.ab is the argv it hands LLVM's in-process option parser.
 set -euo pipefail
 
 compiler=${1:-build/ablac}
@@ -23,6 +23,7 @@ esac
 cases=(
     tests/cases/process-exec-strings/main.ab
     tests/cases/gc-stress-io/ct-process.ab
+    tests/cases/gc-stress-io/native-argv.ab
     tests/cases/modules/process-capture.ab
     tests/cases/modules/linux-process.ab
     tests/cases/modules/host-process-configured.ab

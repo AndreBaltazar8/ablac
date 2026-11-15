@@ -58,8 +58,10 @@ grep -q "^  --> unicode-column.ab:$line:$column\$" "$log" ||
 
 log=$output/memory.log
 build_fails compile-time-memory.ab "$log"
-grep -q '^error\[E_EVAL_MEMORY_UNAVAILABLE\]: `runtimeMemoryCollect` has no program heap' "$log" ||
+grep -q '^error\[E_EVAL_MEMORY_UNAVAILABLE\]: `runtimeMemoryLiveBytes` has no program heap' "$log" ||
     fail "memory: not denied" "$log"
+! grep -q '`runtimeMemoryCollect` has no program heap' "$log" ||
+    fail "memory: a collection alone is a no-op, not an error" "$log"
 
 log=$output/compile-fun.log
 build_fails compile-fun-at-run-time.ab "$log"

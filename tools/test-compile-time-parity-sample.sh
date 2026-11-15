@@ -19,10 +19,11 @@ size=${PARITY_SAMPLE_SIZE:-12}
 # Always run: rows that guard fixes. In jit: #828 jwt and lambda-inferred-result, #829 http-event and a stale-row status;
 # in interp and jit: #829 thread-local-bytes, process-capture and linux-process (the children's exec strings), and the
 # cases whose own checks were wrong (generator-nested-*, the compilation's one value of a global; compile-time-f32-parity,
-# a NaN's unspecified bits).
+# a NaN's unspecified bits); thread-heap-mutex (the runtime's atomics) and runtime-memory-global-container (a collection
+# is a no-op) in the interpreter.
 fixed=(http-event jwt lambda-inferred-result scoped-region)
 fixedBoth=(thread-local-bytes generator-nested-borrowed generator-nested-index compile-time-f32-parity process-capture
-    linux-process)
+    linux-process thread-heap-mutex runtime-memory-global-container)
 # Never sampled: rows whose expected status never finishes (they take their known timeout, as tls and websocket-live
 # do), and rows that depend on the machine's loopback networking and signals.
 skip=" http-server signal-watch network-advanced "
