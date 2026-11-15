@@ -9,7 +9,7 @@ Status: proposal, 2026-11-15, before code. RFC 9113 (HTTP/2) and RFC 7541 (HPACK
   `HttpAsyncOptions` fields.
 - Many requests to one origin share one connection (multiplexed streams); `maximumConnectionsPerHost` is then a cap on extra connections opened when a connection's
   stream limit is reached, not the way concurrency is reached.
-- Responses stay fully buffered (`maximumResponseBytes`, as now); no streaming API, no trailers in the completion, no push (`SETTINGS_ENABLE_PUSH = 0`), no priorities.
+- Responses stay fully buffered (`maximumResponseBytes`, as now); no streaming API, trailers are dropped but visible: `HttpAsyncCompletion.trailers()` returns them (empty for now; a caller who asks can see that none are kept), no push (`SETTINGS_ENABLE_PUSH = 0`), no priorities.
 - `http://` stays HTTP/1.1. h2c with prior knowledge exists but is off: `HttpAsyncOptions.http2PriorKnowledge = false`; when true every `http://` origin of that
   client is spoken to as h2c. There is no `Upgrade: h2c` (deprecated by RFC 9113).
 
@@ -101,7 +101,7 @@ negotiated: the body is sent at once.
 
 ## Options added (all defaulted; callers change nothing)
 
-`http2: bool = true` (offer `h2`), `http2PriorKnowledge: bool = false`, `maximumStreamsPerConnection: int = 100`, `http2NeverIndex: array<string> = []`, `http2PingAfterIdleMilliseconds: int = 30000`,
+`http2: bool = false` (offer `h2`; off for one release so that callers opt in, then the default is revisited; the release notes say so), `http2PriorKnowledge: bool = false`, `maximumStreamsPerConnection: int = 100`, `http2NeverIndex: array<string> = []`, `http2PingAfterIdleMilliseconds: int = 30000`,
 `maximumHeaderListBytes: int = 65536`. The hard limits above that are not options (header block 128 KiB, CONTINUATION 32, fields 256, windows, flood budgets) are constants in `abla/http/h2` so that a caller cannot weaken them by accident.
 
 ## Tests
@@ -116,8 +116,9 @@ negotiated: the body is sent at once.
 
 1. `abla/http/h2/hpack` with its tests. 2. Frame codec and `H2Client` with the scripted-peer tests. 3. Integration in `abla/http/async` with ALPN in `tlsSessionClient`, then the pool changes. 4. Fuzz and the interop scripts (`tools/test-http2.sh`). 5. Docs (`docs/stdlib` http section) and the options table.
 
-## Questions for the lead
+## Decisions (lead, approved)
 
-- Is "one connection first while the origin's protocol is unknown" acceptable (an HTTP/1.1-only origin pays one handshake of serialization once per DNS-cache lifetime)?
-- Response header names arrive lowercase over h2 (HTTP/1.1 keeps the server's case); `HttpAsyncCompletion.header()` already compares case-insensitively. Trailers are dropped. OK?
-- Default `http2 = true` changes what an existing `https://` caller negotiates (and the server sees `h2` in ALPN): acceptable, or default off for one release?
+- One connection first while an origin's protocol is unknown: accepted.
+- Response header names arrive lowercase over h2 (HTTP/1.1 keeps the server's case) and trailers are dropped: accepted, both documented in the stdlib docs; `HttpAsyncCompletion.trailers()` exists (empty for now) so a caller can see that trailers are not kept.
+- `http2` defaults to false for one release (callers opt in); noted in the release notes when it lands.
+- The sans-IO `H2Client` has a fuzz target (`tools/http2-fuzz`) from the start, not at the end.
