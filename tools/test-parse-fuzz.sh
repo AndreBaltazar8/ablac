@@ -48,8 +48,9 @@ build() {   # build MODE: the fuzzer in the mode, into $out/fuzz-MODE
 run() {   # run MODE TARGET COUNT [ENV...]
     local mode=$1 target=$2 count=$3
     shift 3
+    local began=$SECONDS
     if env "$@" "$root/tools/run-limited.sh" "$out/fuzz-$mode" "$target" "$first" "$count" $seed_files > "$out/$target-$mode.log" 2>&1; then
-        echo "parse-fuzz $target ($mode${1:+, $1}): $(tail -1 "$out/$target-$mode.log")"
+        echo "parse-fuzz $target ($mode${1:+, $1}): $(tail -1 "$out/$target-$mode.log") [$((SECONDS - began)) s]"
     else
         grep -E 'FINDING|panic' "$out/$target-$mode.log" | head -8 >&2
         echo "parse-fuzz $target ($mode${1:+, $1}): FAILED (log: $out/$target-$mode.log)" >&2
