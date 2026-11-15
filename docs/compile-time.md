@@ -462,6 +462,8 @@ which is what the program sees after the same operations at run time:
 Another process (one started under `process.io`) sees only the disk, so a
 file the build has staged isn't there for it yet. `removeTree()` asks what a
 path is without following links, which is native code (`trusted.native`).
+So are `linkTo`, `linkTarget` and `linkInfo`: system calls, which see only
+the disk, so a link made in a directory the build has staged fails.
 
 `print`, `println`, `eprint` and `eprintln` need no capability: under `#` they
 write to the compiler's own standard output and error. What a compilation
@@ -718,7 +720,8 @@ reason:
   meet, finishes in the native tier;
 - a program that reads its own executable, or calls its own exported
   functions, finds the compiler under `#`;
-- another process can't see a file the build has staged
+- another process, or a system call such as `linkTo`'s, can't see a file
+  the build has staged
   ([capabilities](#capabilities-files-environment-processes-network));
 - a program that panics at run time stops the build with the same panic
   under `#`, because a compile-time panic is a compile error.

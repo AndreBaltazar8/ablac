@@ -388,9 +388,11 @@ private fun linuxExecUnblockSignals(): void {
     return
 }
 
-// C-string addresses of what a child needs. nativeCStringAddress may copy a string that has no
-// NUL after it, which allocates: so they are all made before the fork, and a child only uses
-// these numbers (0 = none).
+// C-string addresses of what a child needs (0 = none), into native memory that execStrings
+// copied them to before the fork, so a child only uses these numbers and allocates nothing.
+// Not nativeCStringAddress: its copy is on the collected heap, held by nothing but the number,
+// so a collection in any allocation before the exec (the argument and environment vectors)
+// could take it, and the child exec'd freed bytes (#829).
 class LinuxExecAddresses(
     val executable: int,
     val directory: int,
@@ -399,12 +401,19 @@ class LinuxExecAddresses(
     val error: int
 )
 
-private fun LinuxCommand.execAddresses(executable: string): LinuxExecAddresses = LinuxExecAddresses(
-    nativeCStringAddress(executable),
-    if (this.workingDirectory != "") nativeCStringAddress(this.workingDirectory) else 0,
-    if (this.inputPath != "") nativeCStringAddress(this.inputPath) else 0,
-    if (this.outputPath != "") nativeCStringAddress(this.outputPath) else 0,
-    if (this.errorPath != "") nativeCStringAddress(this.errorPath) else 0
+// The executable, working directory and redirect paths, NUL-terminated in one native buffer
+// (laid out as an argument vector); the caller closes it once the child is forked.
+private fun LinuxCommand.execStrings(executable: string): NativeByteBuffer =
+    linuxArgumentVector([
+        executable, this.workingDirectory, this.inputPath, this.outputPath, this.errorPath
+    ])
+
+private fun LinuxCommand.execAddresses(strings: NativeByteBuffer): LinuxExecAddresses = LinuxExecAddresses(
+    strings.loadI64(0),
+    if (this.workingDirectory != "") strings.loadI64(8) else 0,
+    if (this.inputPath != "") strings.loadI64(16) else 0,
+    if (this.outputPath != "") strings.loadI64(24) else 0,
+    if (this.errorPath != "") strings.loadI64(32) else 0
 )
 
 private fun linuxRedirect(path: int, flags: int, target: int): bool {
@@ -452,8 +461,8 @@ private fun LinuxCommand.execPrepared(
 fun LinuxCommand.run(): int {
     var result = 127
     if (this.arguments.size > 0) {
-        val executable = linuxExecutablePath(this.arguments[0])
-        val addresses = this.execAddresses(executable)
+        val strings = this.execStrings(linuxExecutablePath(this.arguments[0]))
+        val addresses = this.execAddresses(strings)
         val vector = linuxArgumentVector(this.arguments)
         val environment = this.environmentVector()
         val process = linuxFork()
@@ -464,6 +473,7 @@ fun LinuxCommand.run(): int {
         if (process > 0) result = linuxWaitProcess(process).status
         environment.close()
         vector.close()
+        strings.close()
     }
     result
 }
@@ -473,13 +483,14 @@ fun LinuxCommand.run(): int {
 fun LinuxCommand.execute(): int {
     var result = 127
     if (this.arguments.size > 0) {
-        val executable = linuxExecutablePath(this.arguments[0])
-        val addresses = this.execAddresses(executable)
+        val strings = this.execStrings(linuxExecutablePath(this.arguments[0]))
+        val addresses = this.execAddresses(strings)
         val vector = linuxArgumentVector(this.arguments)
         val environment = this.environmentVector()
         result = this.execPrepared(addresses, vector, environment)
         environment.close()
         vector.close()
+        strings.close()
     }
     result
 }
@@ -487,8 +498,8 @@ fun LinuxCommand.execute(): int {
 fun LinuxCommand.capture(): LinuxProcessResult {
     var result = LinuxProcessResult(127, "")
     if (this.arguments.size > 0) {
-        val executable = linuxExecutablePath(this.arguments[0])
-        val addresses = this.execAddresses(executable)
+        val strings = this.execStrings(linuxExecutablePath(this.arguments[0]))
+        val addresses = this.execAddresses(strings)
         val vector = linuxArgumentVector(this.arguments)
         val environment = this.environmentVector()
         val descriptors = nativeByteBuffer(8)
@@ -534,6 +545,7 @@ fun LinuxCommand.capture(): LinuxProcessResult {
         descriptors.close()
         environment.close()
         vector.close()
+        strings.close()
     }
     result
 }
@@ -543,8 +555,8 @@ fun LinuxCommand.captureText(): string = this.capture().output
 fun LinuxCommand.start(): LinuxChildProcess {
     var process = -1
     if (this.arguments.size > 0) {
-        val executable = linuxExecutablePath(this.arguments[0])
-        val addresses = this.execAddresses(executable)
+        val strings = this.execStrings(linuxExecutablePath(this.arguments[0]))
+        val addresses = this.execAddresses(strings)
         val vector = linuxArgumentVector(this.arguments)
         val environment = this.environmentVector()
         process = linuxFork()
@@ -554,6 +566,7 @@ fun LinuxCommand.start(): LinuxChildProcess {
         }
         environment.close()
         vector.close()
+        strings.close()
     }
     LinuxChildProcess(process)
 }
@@ -594,9 +607,11 @@ fun linuxStartConfiguredProcess(
             executable = linuxExecutablePath(arguments[0])
         }
         val vector = linuxArgumentVector(launched)
-        val executableAddress = nativeCStringAddress(executable)
-        val directoryAddress = if (directory != "") nativeCStringAddress(directory) else 0
-        val outputAddress = if (outputPath != "") nativeCStringAddress(outputPath) else 0
+        // In native memory, as LinuxExecAddresses says why.
+        val strings = linuxArgumentVector([executable, directory, outputPath])
+        val executableAddress = strings.loadI64(0)
+        val directoryAddress = if (directory != "") strings.loadI64(8) else 0
+        val outputAddress = if (outputPath != "") strings.loadI64(16) else 0
         process = linuxFork()
         if (process == 0) {
             // setpgid(0, 0): the whole test process tree can be terminated on
@@ -621,6 +636,7 @@ fun linuxStartConfiguredProcess(
         }
         if (process > 0) linuxSyscall2(109, process, process)
         vector.close()
+        strings.close()
     }
     LinuxChildProcess(process)
 }
@@ -1030,8 +1046,9 @@ fun linuxPipelineStart(commands: array<LinuxCommand>, grouped: bool, capture: bo
             0) linuxExecutablePath(command.arguments[0]) else ""
         val vector = linuxArgumentVector(command.arguments)
         val environment = command.environmentVector()
+        val strings = command.execStrings(executable)
         val addresses = if (executable !=
-            "") command.execAddresses(executable) else LinuxExecAddresses(0, 0, 0, 0, 0)
+            "") command.execAddresses(strings) else LinuxExecAddresses(0, 0, 0, 0, 0)
         val process = linuxFork()
         if (process == 0) {
             var ready = true
@@ -1074,6 +1091,7 @@ fun linuxPipelineStart(commands: array<LinuxCommand>, grouped: bool, capture: bo
         }
         environment.close()
         vector.close()
+        strings.close()
         if (process < 0) problem = "fork failed"
         else {
             processes.append(process)

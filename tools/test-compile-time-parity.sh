@@ -172,6 +172,9 @@ by_design='module/proc-self-exe	*	host-dependent	reads its own executable (/proc
 module/unsafe-boundary	*	host-dependent	calls its own @export functions through dlsym: they exist only in the running program, not in the compiler
 module/http-advanced	*	staged-writes	a child process (gzip) reads a file the case wrote: under `#` writes stay staged until the build succeeds
 module/network-advanced	jit	staged-writes	its http-advanced part: a child process (gzip) reads a file the case wrote, which stays staged under `#` (interp: interp-threads)
+module/filesystem	*	staged-writes	linkTo is a system call (trusted.native), which sees only the disk: the directory the case made is still staged under `#`, so check 12 (the link) fails
+module/websocket-live	jit	interp-threads	its handler writes the ordinary global webSocketServerValid, so the site falls back to the interpreter, which runs the client thread only at await: the server waits for it for ever
+module/tls	jit	interp-threads	the pure TLS assigns its trust-store cache, the ordinary global pureTlsSystemCache, so the site falls back to the interpreter, which runs the client thread only at await
 module/websocket-server-protocol	interp	interp-timing	forks clients with 100 ms ping / 3 s idle deadlines the interpreter cannot meet (passes under jit)
 module/http-async	interp	interp-timing	the interpreted child builds the 200 KB /big body byte by byte and misses the client timeout (passes under jit)'
 
@@ -342,6 +345,11 @@ run_mode() { # kind name source mode
                 if [[ $mode == interp ]] && starts_thread "$source"; then
                     status=interp-threads
                     detail="waits on a thread the interpreter runs only at await"
+                fi
+                # A jit site that falls back to the interpreter (by_design names why) waits the same way.
+                if [[ $(by_design_status "$name" "$mode") == interp-threads ]]; then
+                    status=interp-threads
+                    detail=$(by_design_reason "$name" "$mode")
                 fi
                 ;;
             build*)
