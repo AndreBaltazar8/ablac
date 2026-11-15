@@ -22,6 +22,10 @@ for name in hpack client mock; do
     echo "http2 $name ok"
 done
 
+"$compiler" build tests/cases/http2/hpack-corpus.ab -o "$out/hpack-corpus" --no-cache > "$out/hpack-corpus.build.log" 2>&1 || { cat "$out/hpack-corpus.build.log" >&2; exit 1; }
+result=$("$root/tools/run-limited.sh" "$out/hpack-corpus" "$root/tests/vectors/hpack/stories.txt") || { echo "http2 hpack-corpus: $result" >&2; exit 1; }
+echo "$result"
+
 command -v openssl > /dev/null || { echo "http2: openssl is needed for the network tests" >&2; exit 1; }
 command -v nghttpd > /dev/null || { echo "http2: nghttpd (nghttp2) is needed for the network tests; the scripted tests above passed" >&2; exit 1; }
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$out/p256.key" 2> /dev/null
