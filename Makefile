@@ -284,6 +284,7 @@ test-serial: ablac
 	tools/test-ir-finalization.sh $(COMPILER)
 	tools/test-determinism.sh $(COMPILER)
 	tools/test-compile-effects.sh $(COMPILER)
+	tools/test-ct-interp-intrinsics.sh $(COMPILER)
 	tools/test-compiler-capture-process.sh $(COMPILER)
 	tools/test-subparser-generated-adapter.sh $(COMPILER)
 	tools/test-ct-bridge.sh $(COMPILER)
