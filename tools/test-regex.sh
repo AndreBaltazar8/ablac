@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # abla/regex: unit and pathological-pattern cases in fast and release builds,
-# the release build again under GC stress, and a short differential run
-# against Python's re (tools/fuzz-regex).
+# the release build again under GC stress, and 6000 pattern and text pairs
+# checked against recorded results of Python's re (tests/cases/regex/corpus.tsv.gz).
 set -euo pipefail
 compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
@@ -17,5 +17,7 @@ for mode in --fast release; do
     timeout 60 "$out/main-$mode" | grep -x ok >/dev/null
 done
 ABLA_GC_STRESS=1 timeout 300 "$out/main-release" | grep -x ok >/dev/null
-python3 tools/fuzz-regex --compiler "$compiler" --seeds 1 --cases 120
+"$compiler" build "$root/tests/cases/regex/corpus.ab" -o "$out/corpus" --no-cache --fast
+zcat "$root/tests/cases/regex/corpus.tsv.gz" >"$out/corpus.tsv"
+timeout 300 "$out/corpus" "$out/corpus.tsv"
 echo "regex: ok"
