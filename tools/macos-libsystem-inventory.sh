@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Lists the dynamic imports of the small hosted programs in tests/cases/libc-imports
-# (built release and --fast) and of the compiler itself on macOS, the start of a
-# Darwin guard list like tools/libc-imports-allowlist.txt (#811). Each line is
+# (built release and --fast), of the dylibs of tests/cases/libsystem-dylibs (#833) and of the
+# compiler itself on macOS, the start of a Darwin guard list like tools/libc-imports-allowlist.txt (#811). Each line is
 # "<subject> <symbol>"; a needed library is "needed:<install name>". The compiler's
 # libLLVM C API calls are left out, as on Linux. Usage:
 #   tools/macos-libsystem-inventory.sh <compiler> [output-directory]
@@ -28,6 +28,21 @@ for program in tests/cases/libc-imports/*.ab; do
         [[ $mode == fast ]] && flags+=(--fast)
         if "$compiler" build "$program" -o "$out/$name.$mode" "${flags[@]}" > "$out/$name.$mode.log" 2>&1; then
             imports "$name.$mode" "$out/$name.$mode" >> "$actual"
+        else
+            echo "$name.$mode BUILD-FAILED" >> "$actual"
+            tail -n 8 "$out/$name.$mode.log" >&2
+        fi
+    done
+done
+# The dylibs of tests/cases/libsystem-dylibs (#833), as subjects "dylib-<name>.<mode>". A dylib's otool -L names
+# the dylib itself (its install name) first: that line is not an import.
+for library in tests/cases/libsystem-dylibs/*.ab; do
+    name=dylib-$(basename "$library" .ab)
+    for mode in release fast; do
+        flags=(--no-cache --emit shared-library)
+        [[ $mode == fast ]] && flags+=(--fast)
+        if "$compiler" build "$library" -o "$out/$name.$mode.dylib" "${flags[@]}" > "$out/$name.$mode.log" 2>&1; then
+            imports "$name.$mode" "$out/$name.$mode.dylib" | grep -v "needed:@rpath/$name.$mode.dylib\$" >> "$actual" || true
         else
             echo "$name.$mode BUILD-FAILED" >> "$actual"
             tail -n 8 "$out/$name.$mode.log" >&2

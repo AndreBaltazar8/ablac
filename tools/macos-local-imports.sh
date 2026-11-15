@@ -24,11 +24,18 @@ grep -v '^#' "$root/tools/libsystem-imports-allowlist.txt" |
     grep -v -e '^compiler ' -e '^tls-http\.' -e ' needed:<brew>/' | sed 's/ ?$//' | sort -u > "$out/allow.txt"
 subjects=$(awk '{split($1, part, "."); print part[1]}' "$out/allow.txt" | sort -u)
 for name in $subjects; do
-    program=$root/tests/cases/libc-imports/$name.ab
+    # A "dylib-<name>" subject is tests/cases/libsystem-dylibs/<name>.ab, built as a dylib (#833).
+    emit=()
+    if [[ $name == dylib-* ]]; then
+        program=$root/tests/cases/libsystem-dylibs/${name#dylib-}.ab
+        emit=(--emit shared-library)
+    else
+        program=$root/tests/cases/libc-imports/$name.ab
+    fi
     [[ -f $program ]] || { echo "macos local imports: no $program for the list's $name lines" >&2; exit 1; }
     for arch in arm64 x86_64; do
         for mode in release fast; do
-            flags=(--no-cache)
+            flags=(--no-cache ${emit[@]+"${emit[@]}"})
             [[ $mode == fast ]] && flags+=(--fast)
             binary=$out/$name.$arch.$mode
             if ! "$compiler" build "$program" --target "$arch-macos" -o "$binary" "${flags[@]}" \
