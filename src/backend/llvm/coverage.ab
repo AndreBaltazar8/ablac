@@ -198,182 +198,273 @@ fun bootstrapLlvmCoverageCall(
     call
 }
 
-// On an x86-64 Linux executable (#806) the coverage runtime needs no libc: the
-// path comes from the environment vector main received, the files and signals
-// are system calls, and two hidden routines do the string work.
-// abla_coverage_getenv(envp, name) is the value of `name=` in envp, or null;
-// abla_coverage_compose(buffer, capacity, text, pid, mode) writes `text` with
-// its first `%p` replaced by the decimal pid (mode 0) or `text` + ".tmp." +
-// pid (mode 1), always terminated, and returns the full length, as snprintf
-// does (a length >= capacity means it did not fit).
+// On a Linux executable that runs without libc (#806: x86-64, AArch64) the
+// coverage runtime needs none: the path comes from the environment vector
+// main received, the files and signals are system calls (AArch64 through the
+// module's translator from the x86-64 numbers), and two internal helpers do
+// the string work getenv, strstr and snprintf did.
 fun bootstrapLlvmCoverageKernel(backend: BootstrapLlvmBackend): bool =
     bootstrapLlvmStackGuardKernel(backend) && backend.executableTls
 
-fun bootstrapLlvmCoverageAssembly(): string =
-    ".section .text.abla_coverage_getenv,\"ax\",@progbits\n" +
-    ".p2align 4\n" +
-    ".globl abla_coverage_getenv\n" +
-    ".hidden abla_coverage_getenv\n" +
-    ".type abla_coverage_getenv,@function\n" +
-    "abla_coverage_getenv:\n" +
-    "    testq %rdi, %rdi\n" +
-    "    jz .Labla_cov_none\n" +
-    ".Labla_cov_next:\n" +
-    "    movq (%rdi), %rdx\n" +
-    "    testq %rdx, %rdx\n" +
-    "    jz .Labla_cov_none\n" +
-    "    movq %rsi, %rcx\n" +
-    ".Labla_cov_cmp:\n" +
-    "    movzbl (%rcx), %eax\n" +
-    "    testb %al, %al\n" +
-    "    jz .Labla_cov_end\n" +
-    "    cmpb %al, (%rdx)\n" +
-    "    jne .Labla_cov_skip\n" +
-    "    incq %rcx\n" +
-    "    incq %rdx\n" +
-    "    jmp .Labla_cov_cmp\n" +
-    ".Labla_cov_end:\n" +
-    "    cmpb \$61, (%rdx)\n" +
-    "    jne .Labla_cov_skip\n" +
-    "    leaq 1(%rdx), %rax\n" +
-    "    ret\n" +
-    ".Labla_cov_skip:\n" +
-    "    addq \$8, %rdi\n" +
-    "    jmp .Labla_cov_next\n" +
-    ".Labla_cov_none:\n" +
-    "    xorl %eax, %eax\n" +
-    "    ret\n" +
-    ".size abla_coverage_getenv, .-abla_coverage_getenv\n" +
-    ".section .text.abla_coverage_compose,\"ax\",@progbits\n" +
-    ".p2align 4\n" +
-    ".globl abla_coverage_compose\n" +
-    ".hidden abla_coverage_compose\n" +
-    ".type abla_coverage_compose,@function\n" +
-    "abla_coverage_compose:\n" +
-    "    pushq %rbx\n" +
-    "    pushq %r12\n" +
-    "    subq \$40, %rsp\n" +
-    "    movq %rdx, %rbx\n" +
-    "    movq %r8, %r12\n" +
-    "    movl %ecx, %eax\n" +
-    "    leaq 32(%rsp), %r10\n" +
-    "    movq %r10, %r11\n" +
-    "    movl \$10, %r8d\n" +
-    ".Labla_cov_digit:\n" +
-    "    xorl %edx, %edx\n" +
-    "    divl %r8d\n" +
-    "    addb \$48, %dl\n" +
-    "    decq %r11\n" +
-    "    movb %dl, (%r11)\n" +
-    "    testl %eax, %eax\n" +
-    "    jnz .Labla_cov_digit\n" +
-    "    leaq -1(%rsi), %r8\n" +
-    "    xorl %r9d, %r9d\n" +
-    "    xorl %ecx, %ecx\n" +
-    "    testq %r12, %r12\n" +
-    "    jnz .Labla_cov_copy\n" +
-    ".Labla_cov_char:\n" +
-    "    movzbl (%rbx), %eax\n" +
-    "    testb %al, %al\n" +
-    "    jz .Labla_cov_finish\n" +
-    "    testl %ecx, %ecx\n" +
-    "    jnz .Labla_cov_plain\n" +
-    "    cmpb \$37, %al\n" +
-    "    jne .Labla_cov_plain\n" +
-    "    cmpb \$112, 1(%rbx)\n" +
-    "    jne .Labla_cov_plain\n" +
-    "    movl \$1, %ecx\n" +
-    "    movq %r11, %rdx\n" +
-    ".Labla_cov_pid:\n" +
-    "    cmpq %r10, %rdx\n" +
-    "    jae .Labla_cov_pid_done\n" +
-    "    movzbl (%rdx), %eax\n" +
-    "    cmpq %r8, %r9\n" +
-    "    jae .Labla_cov_e1\n" +
-    "    movb %al, (%rdi,%r9)\n" +
-    ".Labla_cov_e1:\n" +
-    "    incq %r9\n" +
-    "    incq %rdx\n" +
-    "    jmp .Labla_cov_pid\n" +
-    ".Labla_cov_pid_done:\n" +
-    "    addq \$2, %rbx\n" +
-    "    jmp .Labla_cov_char\n" +
-    ".Labla_cov_plain:\n" +
-    "    cmpq %r8, %r9\n" +
-    "    jae .Labla_cov_e2\n" +
-    "    movb %al, (%rdi,%r9)\n" +
-    ".Labla_cov_e2:\n" +
-    "    incq %r9\n" +
-    "    incq %rbx\n" +
-    "    jmp .Labla_cov_char\n" +
-    ".Labla_cov_copy:\n" +
-    "    movzbl (%rbx), %eax\n" +
-    "    testb %al, %al\n" +
-    "    jz .Labla_cov_suffix\n" +
-    "    cmpq %r8, %r9\n" +
-    "    jae .Labla_cov_e3\n" +
-    "    movb %al, (%rdi,%r9)\n" +
-    ".Labla_cov_e3:\n" +
-    "    incq %r9\n" +
-    "    incq %rbx\n" +
-    "    jmp .Labla_cov_copy\n" +
-    ".Labla_cov_suffix:\n" +
-    "    movl \$46, %eax\n" +
-    "    cmpq %r8, %r9\n" +
-    "    jae .Labla_cov_e4\n" +
-    "    movb %al, (%rdi,%r9)\n" +
-    ".Labla_cov_e4:\n" +
-    "    incq %r9\n" +
-    "    movl \$116, %eax\n" +
-    "    cmpq %r8, %r9\n" +
-    "    jae .Labla_cov_e5\n" +
-    "    movb %al, (%rdi,%r9)\n" +
-    ".Labla_cov_e5:\n" +
-    "    incq %r9\n" +
-    "    movl \$109, %eax\n" +
-    "    cmpq %r8, %r9\n" +
-    "    jae .Labla_cov_e6\n" +
-    "    movb %al, (%rdi,%r9)\n" +
-    ".Labla_cov_e6:\n" +
-    "    incq %r9\n" +
-    "    movl \$112, %eax\n" +
-    "    cmpq %r8, %r9\n" +
-    "    jae .Labla_cov_e7\n" +
-    "    movb %al, (%rdi,%r9)\n" +
-    ".Labla_cov_e7:\n" +
-    "    incq %r9\n" +
-    "    movl \$46, %eax\n" +
-    "    cmpq %r8, %r9\n" +
-    "    jae .Labla_cov_e8\n" +
-    "    movb %al, (%rdi,%r9)\n" +
-    ".Labla_cov_e8:\n" +
-    "    incq %r9\n" +
-    "    movq %r11, %rdx\n" +
-    ".Labla_cov_tmp_pid:\n" +
-    "    cmpq %r10, %rdx\n" +
-    "    jae .Labla_cov_finish\n" +
-    "    movzbl (%rdx), %eax\n" +
-    "    cmpq %r8, %r9\n" +
-    "    jae .Labla_cov_e9\n" +
-    "    movb %al, (%rdi,%r9)\n" +
-    ".Labla_cov_e9:\n" +
-    "    incq %r9\n" +
-    "    incq %rdx\n" +
-    "    jmp .Labla_cov_tmp_pid\n" +
-    ".Labla_cov_finish:\n" +
-    "    movq %r9, %rax\n" +
-    "    cmpq %r8, %rax\n" +
-    "    jbe .Labla_cov_nul\n" +
-    "    movq %r8, %rax\n" +
-    ".Labla_cov_nul:\n" +
-    "    movb \$0, (%rdi,%rax)\n" +
-    "    movq %r9, %rax\n" +
-    "    addq \$40, %rsp\n" +
-    "    popq %r12\n" +
-    "    popq %rbx\n" +
-    "    ret\n" +
-    ".size abla_coverage_compose, .-abla_coverage_compose\n" +
-    ".text\n"
+// The two helpers, in IR so that every target the dump runs on by system calls shares them (they were x86-64
+// assembly, which an AArch64 build could not assemble). Loop variables live in allocas; "no-builtins" keeps LLVM
+// from turning a byte loop into a call of memcpy or strlen, which a program without libc does not have.
+fun bootstrapLlvmCoverageHelper(
+    backend: BootstrapLlvmBackend,
+    name: string,
+    result: i64*,
+    parameters: array<i64*>
+): i64* {
+    val function = bootstrapLlvmDeclare(backend, name, result, parameters, false, [])
+    LLVMSetLinkage(function, llvmInternalLinkage())
+    bootstrapLlvmAddStringFunctionAttribute(backend, function, "no-builtins", "")
+    bootstrapLlvmAddFunctionAttribute(backend, function, "nounwind")
+    function
+}
+
+/** The address of byte `index` (an i64 value) of `base`. */
+fun bootstrapLlvmCoverageByte(backend: BootstrapLlvmBackend, base: i64*, index: i64*): i64* {
+    val indices = llvmPointerVector(1)
+    indices.set(0, index)
+    val address = LLVMBuildGEP2(backend.builder, backend.i8Type, base, indices.pointer(), 1, "cov.byte")
+    indices.drop()
+    address
+}
+
+fun bootstrapLlvmCoverageLoadI64(backend: BootstrapLlvmBackend, cell: i64*): i64* =
+    LLVMBuildLoad2(backend.builder, backend.i64Type, cell, "cov.value")
+
+fun bootstrapLlvmCoverageLoadByte(backend: BootstrapLlvmBackend, base: i64*, index: i64*): i64* =
+    LLVMBuildLoad2(backend.builder, backend.i8Type, bootstrapLlvmCoverageByte(backend, base, index),
+        "cov.char")
+
+fun bootstrapLlvmCoverageAddTo(backend: BootstrapLlvmBackend, cell: i64*, amount: i64*): void {
+    LLVMBuildStore(backend.builder, LLVMBuildAdd(backend.builder,
+        bootstrapLlvmCoverageLoadI64(backend, cell), amount, "cov.sum"), cell)
+    return
+}
+
+// abla_coverage_getenv(envp, name): the value of `name=` in the null-terminated vector envp, or null.
+fun bootstrapLlvmCoverageEmitGetenv(backend: BootstrapLlvmBackend): void {
+    val b = backend.builder
+    val ptr = backend.pointerType
+    val i8 = backend.i8Type
+    val i64 = backend.i64Type
+    val function = bootstrapLlvmCoverageHelper(backend, "abla_coverage_getenv", ptr, [ptr, ptr])
+    val ctx = backend.context
+    val entry = LLVMAppendBasicBlockInContext(ctx, function, "entry")
+    val next = LLVMAppendBasicBlockInContext(ctx, function, "next")
+    val compare = LLVMAppendBasicBlockInContext(ctx, function, "compare")
+    val step = LLVMAppendBasicBlockInContext(ctx, function, "step")
+    val ended = LLVMAppendBasicBlockInContext(ctx, function, "ended")
+    val found = LLVMAppendBasicBlockInContext(ctx, function, "found")
+    val skip = LLVMAppendBasicBlockInContext(ctx, function, "skip")
+    val none = LLVMAppendBasicBlockInContext(ctx, function, "none")
+    val zero = LLVMConstInt(i64, 0, 0)
+    val one = LLVMConstInt(i64, 1, 0)
+    val vector = LLVMGetParam(function, i32(0))
+    val name = LLVMGetParam(function, i32(1))
+    LLVMPositionBuilderAtEnd(b, entry)
+    val slot = LLVMBuildAlloca(b, i64, "cov.slot")
+    val at = LLVMBuildAlloca(b, i64, "cov.at")
+    LLVMBuildStore(b, zero, slot)
+    LLVMBuildCondBr(b, LLVMBuildICmp(b, llvmIntEqual(), vector, LLVMConstNull(ptr), "cov.novector"),
+        none, next)
+    LLVMPositionBuilderAtEnd(b, next)
+    val entries = llvmPointerVector(1)
+    entries.set(0, bootstrapLlvmCoverageLoadI64(backend, slot))
+    val cellAddress = LLVMBuildGEP2(b, ptr, vector, entries.pointer(), 1, "cov.cell")
+    entries.drop()
+    val text = LLVMBuildLoad2(b, ptr, cellAddress, "cov.entry")
+    LLVMBuildStore(b, zero, at)
+    LLVMBuildCondBr(b, LLVMBuildICmp(b, llvmIntEqual(), text, LLVMConstNull(ptr), "cov.end"), none,
+        compare)
+    LLVMPositionBuilderAtEnd(b, compare)
+    // `text` is a value of block `next`, which dominates every block below.
+    val index = bootstrapLlvmCoverageLoadI64(backend, at)
+    val wanted = bootstrapLlvmCoverageLoadByte(backend, name, index)
+    LLVMBuildCondBr(b, LLVMBuildICmp(b, llvmIntEqual(), wanted, LLVMConstInt(i8, 0, 0), "cov.nameend"),
+        ended, step)
+    LLVMPositionBuilderAtEnd(b, step)
+    val have = bootstrapLlvmCoverageLoadByte(backend, text, index)
+    LLVMBuildStore(b, LLVMBuildAdd(b, index, one, "cov.next"), at)
+    LLVMBuildCondBr(b, LLVMBuildICmp(b, llvmIntEqual(), have, wanted, "cov.same"), compare, skip)
+    LLVMPositionBuilderAtEnd(b, ended)
+    val equals = bootstrapLlvmCoverageLoadByte(backend, text, index)
+    LLVMBuildCondBr(b, LLVMBuildICmp(b, llvmIntEqual(), equals, LLVMConstInt(i8, 61, 0), "cov.equals"),
+        found, skip)
+    LLVMPositionBuilderAtEnd(b, found)
+    LLVMBuildRet(b, bootstrapLlvmCoverageByte(backend, text, LLVMBuildAdd(b, index, one, "cov.value.at")))
+    LLVMPositionBuilderAtEnd(b, skip)
+    bootstrapLlvmCoverageAddTo(backend, slot, one)
+    LLVMBuildBr(b, next)
+    LLVMPositionBuilderAtEnd(b, none)
+    LLVMBuildRet(b, LLVMConstNull(ptr))
+    return
+}
+
+// abla_coverage_put(buffer, limit, length cell, byte): the byte at buffer[length] while length < limit; the
+// length grows either way, so the caller sees the full length as snprintf gives it.
+fun bootstrapLlvmCoverageEmitPut(backend: BootstrapLlvmBackend): void {
+    val b = backend.builder
+    val ptr = backend.pointerType
+    val i64 = backend.i64Type
+    val function = bootstrapLlvmCoverageHelper(backend, "abla_coverage_put", backend.voidType,
+        [ptr, i64, ptr, backend.i8Type])
+    val ctx = backend.context
+    val entry = LLVMAppendBasicBlockInContext(ctx, function, "entry")
+    val store = LLVMAppendBasicBlockInContext(ctx, function, "store")
+    val count = LLVMAppendBasicBlockInContext(ctx, function, "count")
+    LLVMPositionBuilderAtEnd(b, entry)
+    val length = LLVMGetParam(function, i32(2))
+    val at = bootstrapLlvmCoverageLoadI64(backend, length)
+    LLVMBuildCondBr(b, LLVMBuildICmp(b, llvmIntUnsignedLessThan(), at, LLVMGetParam(function, i32(1)),
+        "cov.fits"), store, count)
+    LLVMPositionBuilderAtEnd(b, store)
+    LLVMBuildStore(b, LLVMGetParam(function, i32(3)),
+        bootstrapLlvmCoverageByte(backend, LLVMGetParam(function, i32(0)), at))
+    LLVMBuildBr(b, count)
+    LLVMPositionBuilderAtEnd(b, count)
+    LLVMBuildStore(b, LLVMBuildAdd(b, at, LLVMConstInt(i64, 1, 0), "cov.grown"), length)
+    LLVMBuildRetVoid(b)
+    return
+}
+
+fun bootstrapLlvmCoverageEmitByte(
+    backend: BootstrapLlvmBackend,
+    put: i64*,
+    buffer: i64*,
+    limit: i64*,
+    length: i64*,
+    byte: i64*
+): void {
+    val arguments = llvmPointerVector(4)
+    arguments.set(0, buffer)
+    arguments.set(1, limit)
+    arguments.set(2, length)
+    arguments.set(3, byte)
+    LLVMBuildCall2(backend.builder, LLVMGlobalGetValueType(put), put, arguments.pointer(), i32(4), "")
+    arguments.drop()
+    return
+}
+
+// abla_coverage_compose(buffer, capacity, text, pid, mode) writes `text` with its first `%p` replaced by the
+// decimal pid (mode 0), or `text` + ".tmp." + pid (mode 1), always terminated, and returns the full length, as
+// snprintf does (a length >= capacity means it did not fit).
+fun bootstrapLlvmCoverageEmitCompose(backend: BootstrapLlvmBackend): void {
+    bootstrapLlvmCoverageEmitPut(backend)
+    val put = LLVMGetNamedFunction(backend.module, "abla_coverage_put")
+    val b = backend.builder
+    val ptr = backend.pointerType
+    val i8 = backend.i8Type
+    val i64 = backend.i64Type
+    val function = bootstrapLlvmCoverageHelper(backend, "abla_coverage_compose", i64,
+        [ptr, i64, ptr, i64, i64])
+    val ctx = backend.context
+    val buffer = LLVMGetParam(function, i32(0))
+    val text = LLVMGetParam(function, i32(2))
+    val zero = LLVMConstInt(i64, 0, 0)
+    val one = LLVMConstInt(i64, 1, 0)
+    val ten = LLVMConstInt(i64, 10, 0)
+    val entry = LLVMAppendBasicBlockInContext(ctx, function, "entry")
+    val digit = LLVMAppendBasicBlockInContext(ctx, function, "digit")
+    val scan = LLVMAppendBasicBlockInContext(ctx, function, "scan")
+    val character = LLVMAppendBasicBlockInContext(ctx, function, "character")
+    val percent = LLVMAppendBasicBlockInContext(ctx, function, "percent")
+    val marker = LLVMAppendBasicBlockInContext(ctx, function, "marker")
+    val plain = LLVMAppendBasicBlockInContext(ctx, function, "plain")
+    val suffix = LLVMAppendBasicBlockInContext(ctx, function, "suffix")
+    val pid = LLVMAppendBasicBlockInContext(ctx, function, "pid")
+    val pidByte = LLVMAppendBasicBlockInContext(ctx, function, "pid.byte")
+    val pidDone = LLVMAppendBasicBlockInContext(ctx, function, "pid.done")
+    val finish = LLVMAppendBasicBlockInContext(ctx, function, "finish")
+    LLVMPositionBuilderAtEnd(b, entry)
+    val digits = LLVMBuildAlloca(b, LLVMArrayType2(i8, 24), "cov.digits")
+    val first = LLVMBuildAlloca(b, i64, "cov.first")
+    val value = LLVMBuildAlloca(b, i64, "cov.pidvalue")
+    val length = LLVMBuildAlloca(b, i64, "cov.length")
+    val at = LLVMBuildAlloca(b, i64, "cov.at")
+    val replaced = LLVMBuildAlloca(b, i64, "cov.replaced")
+    val digitAt = LLVMBuildAlloca(b, i64, "cov.digit.at")
+    // From pid's block: where to go once the digits are out (scan in mode 0, finish in mode 1).
+    val after = LLVMBuildAlloca(b, i64, "cov.after")
+    val limit = LLVMBuildSub(b, LLVMGetParam(function, i32(1)), one, "cov.limit")
+    LLVMBuildStore(b, LLVMConstInt(i64, 24, 0), first)
+    LLVMBuildStore(b, LLVMGetParam(function, i32(3)), value)
+    LLVMBuildStore(b, zero, length)
+    LLVMBuildStore(b, zero, at)
+    LLVMBuildStore(b, zero, replaced)
+    LLVMBuildBr(b, digit)
+    // The pid's decimal digits, last first, at the end of `digits`.
+    LLVMPositionBuilderAtEnd(b, digit)
+    val current = bootstrapLlvmCoverageLoadI64(backend, value)
+    val place = LLVMBuildSub(b, bootstrapLlvmCoverageLoadI64(backend, first), one, "cov.place")
+    LLVMBuildStore(b, place, first)
+    LLVMBuildStore(b, LLVMBuildTrunc(b, LLVMBuildAdd(b, LLVMBuildURem(b, current, ten, "cov.rem"),
+        LLVMConstInt(i64, 48, 0), "cov.ascii"), i8, "cov.digit"), bootstrapLlvmCoverageByte(backend,
+        digits, place))
+    val rest = LLVMBuildUDiv(b, current, ten, "cov.rest")
+    LLVMBuildStore(b, rest, value)
+    val mode = LLVMGetParam(function, i32(4))
+    LLVMBuildCondBr(b, LLVMBuildICmp(b, llvmIntNotEqual(), rest, zero, "cov.more"), digit, scan)
+    // The text, byte by byte.
+    LLVMPositionBuilderAtEnd(b, scan)
+    val index = bootstrapLlvmCoverageLoadI64(backend, at)
+    val byte = bootstrapLlvmCoverageLoadByte(backend, text, index)
+    LLVMBuildCondBr(b, LLVMBuildICmp(b, llvmIntEqual(), byte, LLVMConstInt(i8, 0, 0), "cov.textend"),
+        suffix, character)
+    LLVMPositionBuilderAtEnd(b, character)
+    val templated = LLVMBuildAnd(b, LLVMBuildICmp(b, llvmIntEqual(), mode, zero, "cov.mode0"),
+        LLVMBuildICmp(b, llvmIntEqual(), bootstrapLlvmCoverageLoadI64(backend, replaced), zero,
+            "cov.unreplaced"), "cov.template")
+    LLVMBuildCondBr(b, LLVMBuildAnd(b, templated, LLVMBuildICmp(b, llvmIntEqual(), byte,
+        LLVMConstInt(i8, 37, 0), "cov.percent"), "cov.maybe"), percent, plain)
+    LLVMPositionBuilderAtEnd(b, percent)
+    val following = bootstrapLlvmCoverageLoadByte(backend, text, LLVMBuildAdd(b, index, one, "cov.peek"))
+    LLVMBuildCondBr(b, LLVMBuildICmp(b, llvmIntEqual(), following, LLVMConstInt(i8, 112, 0), "cov.p"),
+        marker, plain)
+    LLVMPositionBuilderAtEnd(b, marker)
+    LLVMBuildStore(b, one, replaced)
+    LLVMBuildStore(b, LLVMBuildAdd(b, index, LLVMConstInt(i64, 2, 0), "cov.skip"), at)
+    LLVMBuildStore(b, zero, after)
+    LLVMBuildBr(b, pid)
+    LLVMPositionBuilderAtEnd(b, plain)
+    bootstrapLlvmCoverageEmitByte(backend, put, buffer, limit, length, byte)
+    LLVMBuildStore(b, LLVMBuildAdd(b, index, one, "cov.advance"), at)
+    LLVMBuildBr(b, scan)
+    // The end of the text: in mode 1, ".tmp." and the pid.
+    LLVMPositionBuilderAtEnd(b, suffix)
+    val tmpBlock = LLVMAppendBasicBlockInContext(ctx, function, "tmp")
+    LLVMBuildCondBr(b, LLVMBuildICmp(b, llvmIntEqual(), mode, zero, "cov.nosuffix"), finish, tmpBlock)
+    LLVMPositionBuilderAtEnd(b, tmpBlock)
+    for (letter in [46, 116, 109, 112, 46]) bootstrapLlvmCoverageEmitByte(backend, put, buffer, limit, length, LLVMConstInt(i8, letter, 0))
+    LLVMBuildStore(b, one, after)
+    LLVMBuildBr(b, pid)
+    LLVMPositionBuilderAtEnd(b, pid)
+    LLVMBuildStore(b, bootstrapLlvmCoverageLoadI64(backend, first), digitAt)
+    LLVMBuildBr(b, pidByte)
+    LLVMPositionBuilderAtEnd(b, pidByte)
+    val digitIndex = bootstrapLlvmCoverageLoadI64(backend, digitAt)
+    val pidWrite = LLVMAppendBasicBlockInContext(ctx, function, "pid.write")
+    LLVMBuildCondBr(b, LLVMBuildICmp(b, llvmIntUnsignedLessThan(), digitIndex, LLVMConstInt(i64, 24, 0),
+        "cov.digitsleft"), pidWrite, pidDone)
+    LLVMPositionBuilderAtEnd(b, pidWrite)
+    bootstrapLlvmCoverageEmitByte(backend, put, buffer, limit, length, bootstrapLlvmCoverageLoadByte(backend, digits, digitIndex))
+    LLVMBuildStore(b, LLVMBuildAdd(b, digitIndex, one, "cov.digit.next"), digitAt)
+    LLVMBuildBr(b, pidByte)
+    LLVMPositionBuilderAtEnd(b, pidDone)
+    LLVMBuildCondBr(b, LLVMBuildICmp(b, llvmIntEqual(), bootstrapLlvmCoverageLoadI64(backend, after), zero,
+        "cov.back"), scan, finish)
+    // Terminated at min(length, limit); the full length is the result.
+    LLVMPositionBuilderAtEnd(b, finish)
+    val total = bootstrapLlvmCoverageLoadI64(backend, length)
+    val end = LLVMBuildSelect(b, LLVMBuildICmp(b, llvmIntUnsignedLessOrEqual(), total, limit, "cov.within"),
+        total, limit, "cov.end")
+    LLVMBuildStore(b, LLVMConstInt(i8, 0, 0), bootstrapLlvmCoverageByte(backend, buffer, end))
+    LLVMBuildRet(b, total)
+    return
+}
+
 
 fun bootstrapLlvmCoverageEmitDump(backend: BootstrapLlvmBackend): void {
     val dumpType = bootstrapLlvmFunctionType(backend, backend.voidType, [])
@@ -409,9 +500,9 @@ fun bootstrapLlvmCoverageEmitDump(backend: BootstrapLlvmBackend): void {
     val i64 = backend.i64Type
     val kernel = bootstrapLlvmCoverageKernel(backend)
     if (kernel) {
-        val assembly = bootstrapLlvmCoverageAssembly()
-        LLVMAppendModuleInlineAsm(backend.module, assembly, assembly.size)
-        // The handlers return through the kernel's restorer (debug.ab).
+        bootstrapLlvmCoverageEmitGetenv(backend)
+        bootstrapLlvmCoverageEmitCompose(backend)
+        // The handlers return through the kernel's restorer on x86-64 (debug.ab); AArch64 has none of its own.
         bootstrapLlvmSigreturnRestorer(backend)
         bootstrapLlvmEmitSigreturnRestorer(backend)
     }
@@ -616,9 +707,12 @@ fun bootstrapLlvmCoverageInstallSignals(backend: BootstrapLlvmBackend): void {
     if (!bootstrapLlvmCoverage) return
     val handler = LLVMGetNamedFunction(backend.module, "abla_coverage_signal")
     if (bootstrapLlvmCoverageKernel(backend)) {
-        // signal()'s meaning by rt_sigaction: SA_RESTORER | SA_RESTART, the kernel's restorer.
-        val action = bootstrapLlvmStackGuardKernelAction(backend, handler, 335544320,
-            bootstrapLlvmSigreturnRestorer(backend), "cov.action")
+        // signal()'s meaning by rt_sigaction: SA_RESTORER | SA_RESTART with the module's restorer on x86-64.
+        // AArch64 has no restorer of its own (a null one with SA_RESTORER would return the handler to address
+        // 0), so it asks for SA_RESTART alone and the kernel returns through the vDSO's trampoline.
+        val aarch64 = bootstrapLlvmAarch64LinuxExecutable(backend)
+        val action = bootstrapLlvmStackGuardKernelAction(backend, handler,
+            if (aarch64) 268435456 else 335544320, bootstrapLlvmSigreturnRestorer(backend), "cov.action")
         for (signal in [15, 2, 1]) {
             bootstrapLlvmStackGuardKernelSigaction(backend, LLVMConstInt(backend.i64Type, signal,
                 0), action)

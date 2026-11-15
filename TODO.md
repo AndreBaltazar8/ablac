@@ -650,7 +650,7 @@ mmap form) apply there.
 
 ## Compiler and stdlib
 
-- [ ] **Function coverage: which source files a program ran (design only, 2026-11-10; asked for by NovaKind, todo 740,
+- [ ] **Function coverage: which source files a program ran (built and on master; designed 2026-11-10; asked for by NovaKind, todo 740,
   backed by their lead; with André as a decision because it is a new public flag).** NovaKind wants, per test suite,
   the list of `one/*.ab` files its live app executed, so that a change to one screen file selects only the suites
   that ran it. File level is enough; no lines. Nothing like it exists (`docs/coverage.md` is documentation coverage; no
@@ -740,7 +740,14 @@ mmap form) apply there.
   (+9.9%, a call-bound worst case: one store per user call), trees 8,923 M to 9,125 M (+2.3%); the binary grows 2.4 KB (fib)
   and 2.7 KB (trees). Review fixes (ablac-e6): the temporary is `<path>.tmp.<pid>`; a path of 4096 bytes or more is refused;
   compile-time slices are never instrumented; a thread that finds the dump under way waits (up to about 5 s) for the
-  winner to finish. Signal handlers still call `snprintf`/`getenv`, which are not async-signal-safe.
+  winner to finish. Signal handlers still call `snprintf`/`getenv` where the dump goes through libc (shared libraries and
+  objects), which are not async-signal-safe. **By system calls** (#806, 2026-11-12 on x86-64; 2026-11-15, ablac-9e, on
+  AArch64): an executable that runs without libc reads the path from main's environment vector and writes with system
+  calls; the string helpers (getenv, the `%p` and `.tmp.<pid>` composition) are IR now, shared by every such target (they were
+  x86-64 assembly, so an AArch64 `--coverage-functions` build failed to assemble: `popq %rbx: invalid operand`). AArch64
+  installs its handlers with SA_RESTART alone (no restorer of its own: SA_RESTORER with a null one would return to 0).
+  `tools/test-coverage.sh` runs the fixture under qemu-aarch64 (--fast and release; SIGTERM in --fast, whose wait loop a
+  release build removes).
 - [x] **abla-pdf signs through the released `abla/crypto/rsa`** (since its 1a2c416, as abla-saft does). Its
   64c36d1 checks signatures against OpenSSL and against the old signer, byte for byte, on ablac 0.2.45.
 - [x] **Encrypted RSA key import:** pure PBES2/PBKDF2 SHA256/SHA1 + AES128/256-CBC PKCS#8 and MAC-verified DER PKCS#12 key bags, with owned passwords and bounded work. Legacy PBES1/RC2/DES and broader PFX formats remain unsupported; see [the scope and limits](docs/stdlib/encrypted-keys.md).
