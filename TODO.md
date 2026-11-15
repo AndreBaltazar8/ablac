@@ -1039,10 +1039,13 @@ mmap form) apply there.
 
 - [ ] **The rest of the reserved generic syntax.** `where` clauses, `const` type parameters and
   an interface's `type Item` still give `E_PARSE_NOT_YET_SUPPORTED`. Decide which to build.
-- [ ] **Module-scoped globals.** A module seeing only its own and its imports' globals would
-  need a language-wide migration: measured on 2026-10-19, 102 errors in the compiler's own
-  sources and 2061 in a game client written against today's flat namespace. Today the standard
-  library never reads a program's globals (`library.program-global`).
+- [ ] **Module-scoped globals (André's decision #64).** Strict imports (`visibility = "imports"`) exist, opt-in;
+  what the decision covers is making them the default and retiring flat packages. The compiler and the standard library are
+  strict (the 2026-10-19 count of 102 in the compiler is 0). Strict mode's gaps are closed: extension functions and
+  operators, and overloads, of modules a module doesn't import; ambiguity through `export import`
+  (tools/test-strict-members.sh). `--visibility-report` lists those uses too (`member`, `overload`). Counts, the
+  migration path and what breaks: ~/agents-memory/abla/ablac-module-scoped-globals-design.md. No default is changed
+  until André decides.
 
 ## Toolchain and project
 

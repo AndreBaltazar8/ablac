@@ -2773,16 +2773,33 @@ fun main: int = nextId()
   (such as its native bindings) aren't API: a flat program reaches their
   names through the module that imports them, and a strict one doesn't, which
   E_NAME_NOT_IMPORTED says.
-- Member names (after `.`, or a class's own members in its body), named
-  arguments and a declaration's own parameters and locals aren't looked up
-  this way. Aliases, `private` and `E_IMPORT_UNQUALIFIED_AMBIGUOUS` work as
-  in any module.
+- A class's own members, named arguments and a declaration's own parameters
+  and locals aren't looked up this way. Aliases, `private` and
+  `E_IMPORT_UNQUALIFIED_AMBIGUOUS` work as in any module.
+- An extension function or extension operator is seen only where its module
+  is: a call `p.doubled()` or `p + q` that resolves to one of a module this
+  one doesn't import (an import under an alias counts: a member call has no
+  qualifier) is `E_NAME_NOT_IMPORTED`, with the import to add. An extension
+  declared in its receiver type's own module (`fun Point.tripled()` beside
+  `class Point`) is one of the type's methods and is seen wherever the type
+  is; one of a built-in type (`string.startsWith` of `abla/text`) is not.
+- Only the overloads a module sees are candidates. When only an overload of
+  a module it doesn't see fits, the call is `E_NAME_NOT_IMPORTED` naming that
+  module. When a seen one fits, it is chosen even if an unseen one would fit
+  better.
+- A name that two imports pass on from different modules (an imported
+  module's own, or one an `export import` passes on) is
+  `E_IMPORT_UNQUALIFIED_AMBIGUOUS`, as for two direct imports, unless the
+  module declares the name itself. An imported module's own declaration of a
+  name hides what it passes on under that name.
 - `visibility = "program"` keeps a package flat. A program without a
   manifest, or whose manifest doesn't say, is strict when built with
   `--strict-imports`.
 - To migrate, `ablac build app.ab -o app --visibility-report report.tsv`
   builds as usual and writes every name each module would lose, with the
-  import to add; `ablac run tools/fix-imports.ab -- report.tsv` adds those
+  import to add, and each extension, operator and overload call that relies
+  on a module it doesn't import (a seventh column says `member` or
+  `overload`); `ablac run tools/fix-imports.ab -- report.tsv` adds those
   imports. A new import that makes a name ambiguous needs an alias, which the
   next build reports.
 

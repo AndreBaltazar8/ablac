@@ -350,7 +350,9 @@ pure self-rebuild gate; options after the source are order-independent.
 identity). `build --visibility-report <file>` builds as usual, without the
 cache, and writes to `<file>` one tab-separated line per name a module would
 lose under strict imports: module, line, column, name, declaring module and
-the import to add. `ablac run tools/fix-imports.ab -- <file>` adds those
+the import to add, and a line with a seventh column, `member` or `overload`,
+for each extension function or operator call and each overload choice that
+relies on a module the caller doesn't import (found once the call is typed). `ablac run tools/fix-imports.ab -- <file>` adds those
 imports.
 
 Compile-time build definitions may register additional program nodes through

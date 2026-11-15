@@ -8212,6 +8212,11 @@ class BootstrapAnalyzer(
             code.slice(0, 27) == "delegate.initializer-scope:") {
             this.diagnostics =
                 "${this.diagnostics}error[E_DELEGATE_INITIALIZER_SCOPE]: ${code.slice(27, code.size)}\n"
+        } else if (code.startsWith("name.not-imported:")) {
+            // `name.not-imported:<what>|<declaring module>|<import line>@<offset>` (sema's strict checks).
+            val parts = code.slice(18, code.size).split("|")
+            this.diagnostics =
+                "${this.diagnostics}error[E_NAME_NOT_IMPORTED]: `${parts[0]}` is declared in ${if (parts.size > 1) parts[1] else "?"}, which this module doesn't import\n"
         } else if (code == "delegate.move-projection") {
             this.diagnostics =
                 "${this.diagnostics}error[E_DELEGATE_MOVE_PROJECTION]: a delegate projection cannot be consumed with `move`\n"
@@ -8247,6 +8252,15 @@ class BootstrapAnalyzer(
         }
         val help = bootstrapSemanticHelp(code)
         if (help != "") this.diagnostics = "${this.diagnostics}help: $help\n"
+        if (code.startsWith("name.not-imported:")) {
+            val parts = code.slice(18, code.size).split("|")
+            if (parts.size > 2) {
+                var line = parts[2]
+                val marker = line.indexOf("@")
+                if (marker >= 0) line = line.slice(0, marker)
+                this.diagnostics = "${this.diagnostics}help: add: $line\n"
+            }
+        }
         // The hidden local of `??` or `?.` (parser.ab, nullGuard).
         if (bootstrapTextContains(code, "__abla_null_default_")) this.diagnostics =
             "${this.diagnostics}help: `a ?? b` takes `a` to hand it on: a resource there must be given away, as `move(a) ?? b`\n"
@@ -9255,6 +9269,47 @@ class BootstrapAnalyzer(
         ""
     }
 
+    /** Strict imports for a member call `owner.name(...)` that resolved to an extension function (an operator's
+     *  too, once overload.ab made it one): a strict module sees only the extensions of the modules it sees, so one
+     *  of another module is E_NAME_NOT_IMPORTED with the import to add; a module `--visibility-report` covers lists
+     *  it as a `member` line. A class's own method, and an interface's default body, belong to the type. */
+    fun checkStrictMember(owner: string, name: string, at: int): void {
+        if (bootstrapStrictVisibilityTable.modes.size == 0) return
+        val entry = this.methodDeclarations.find(owner, name)
+        if (entry < 0) return
+        val declaration = this.methodDeclarations.declarations[entry]
+        if (declaration.extensionOwner == "") return
+        val hidden = bootstrapStrictHidden(this.currentSourceIdentity, declaration.sourceIdentity, true)
+        if (hidden == 0 || this.extensionBelongsToType(declaration)) return
+        val shown = "${bootstrapSourceVisibleType(owner)}.${bootstrapStrictShownName(name)}"
+        val declaring = bootstrapGenericSourceFile(declaration.sourceIdentity)
+        if (hidden == 1) {
+            this.fail(
+                "name.not-imported:$shown|$declaring|${bootstrapStrictImportLine(this.currentSourceIdentity, declaring)}@$at"
+            )
+        } else bootstrapVisibilityReportUse(this.currentSourceIdentity, at, shown, declaring, "member")
+        return
+    }
+
+    /** Whether extension `declaration` is declared in the module that declares its receiver type (`fun
+     *  TlsClient.connected()` beside `class TlsClient`): it is one of the type's methods, seen wherever the type is,
+     *  as a method in the class body is. An extension of a built-in type, or of another module's type, is not. */
+    fun extensionBelongsToType(declaration: BootstrapDeclaration): bool {
+        var owner = bootstrapNormalizeType(declaration.extensionOwner)
+        val generic = owner.indexOf("<")
+        if (generic > 0) owner = owner.slice(0, generic)
+        val module = bootstrapGenericSourceFile(declaration.sourceIdentity)
+        var node = this.declarationNames.first(owner)
+        while (node >= 0) {
+            val candidate = this.declarations[this.declarationNames.nodeDeclarations[node]]
+            if (candidate.name == owner && candidate.extensionOwner == "" &&
+                (candidate.kind == "class" || candidate.kind == "interface" || candidate.kind == "type") &&
+                bootstrapGenericSourceFile(candidate.sourceIdentity) == module) return true
+            node = this.declarationNames.nodeNexts[node]
+        }
+        false
+    }
+
     /** The symbol of the extension field `owner.field` (`var Owner.field: T`),
      *  -1 when there is none. A declared field of the class comes first. */
     fun extensionFieldSymbol(owner: string, field: string): int {
@@ -9483,6 +9538,12 @@ class BootstrapAnalyzer(
         var best = ""
         var bestExact = -1
         var ambiguous = false
+        // Under strict imports a module chooses among the overloads it sees: the best of those (`visibleBest`), and
+        // whether any it doesn't see was a candidate.
+        var visibleBest = ""
+        var visibleExact = -1
+        var visibleAmbiguous = false
+        var anyHidden = false
         var candidate = 0
         while (candidate < this.overloads.keys.size) {
             val name = this.overloads.names[candidate]
@@ -9522,8 +9583,46 @@ class BootstrapAnalyzer(
                     bestExact = exact
                     ambiguous = false
                 } else if (fits && exact == bestExact) ambiguous = true
+                // (A class's own method belongs to its type, as does an extension in the type's module: always
+                // seen.)
+                var hidden = if (owner != "" && declaration.extensionOwner == "") 0
+                    else bootstrapStrictHidden(this.currentSourceIdentity, declaration.sourceIdentity, owner != "")
+                if (hidden != 0 && owner != "" && this.extensionBelongsToType(declaration)) hidden = 0
+                if (hidden == 1) anyHidden = true
+                if (fits && hidden != 1 && exact > visibleExact) {
+                    visibleBest = name
+                    visibleExact = exact
+                    visibleAmbiguous = false
+                } else if (fits && hidden != 1 && exact == visibleExact) visibleAmbiguous = true
             }
             candidate = candidate + 1
+        }
+        if (anyHidden) {
+            if (visibleBest != "" || visibleAmbiguous) {
+                best = visibleBest
+                ambiguous = visibleAmbiguous
+            } else if (best != "" && !ambiguous) {
+                // Only an overload of a module it doesn't see fits: E_NAME_NOT_IMPORTED naming that module (a member
+                // call's extension is reported where the call is checked, checkStrictMember).
+                if (owner == "") {
+                    val declaring = bootstrapGenericSourceFile(
+                        this.overloadDeclaration(owner, this.overloadDeclarationIndex(owner, best)).sourceIdentity
+                    )
+                    this.overloadFailures =
+                        "${this.overloadFailures}error[E_NAME_NOT_IMPORTED]: `${bootstrapStrictShownName(best)}` is declared in $declaring, which this module doesn't import\nsource[semantic]:${this.currentSourceIdentity}:${at.begin}:${if (at.end > at.begin) at.end else at.begin + 1}\nhelp: add: ${bootstrapStrictImportLine(this.currentSourceIdentity, declaring)}\n"
+                }
+                return best
+            }
+        }
+        // A module the report covers keeps the overload it chooses today; the report says which import keeps it.
+        if (owner == "" && best != "" && !ambiguous) {
+            val chosen = this.overloadDeclaration(owner, this.overloadDeclarationIndex(owner, best))
+            if (bootstrapStrictHidden(this.currentSourceIdentity, chosen.sourceIdentity) == 2) {
+                bootstrapVisibilityReportUse(
+                    this.currentSourceIdentity, at.begin, bootstrapStrictShownName(best),
+                    bootstrapGenericSourceFile(chosen.sourceIdentity), "overload"
+                )
+            }
         }
         if (ambiguous || (best == "" && !operatorOnly)) {
             var types = ""
@@ -15257,6 +15356,8 @@ fun bootstrapInferMemberCall(
                 "name.private:${receiver}.${expression.text}:$privateExtension@${expression.begin}"
             )
         }
+        // An extension function or operator of a module this one doesn't see (strict imports).
+        if (parameterCount >= 0) analyzer.checkStrictMember(receiver, expression.text, expression.begin)
         if (parameterCount < 0) {
             analyzer.fail(
                 "method.unknown:${receiver}.${expression.text}@${expression.begin}"
@@ -17323,4 +17424,11 @@ fun bootstrapStmStreamFunction(declaration: BootstrapDeclaration): bool {
         bootstrapCompileProviderModule(declaration) == "io") return true
     name.startsWith("linuxPrintStandard") || name.startsWith("linuxWriteStandard") ||
         name.startsWith("linuxReadStandard")
+}
+
+/** A function's name as written, for a diagnostic: without the parameter types overload.ab gives each member of an
+ *  overload set (`describe__string` is `describe`). */
+fun bootstrapStrictShownName(name: string): string {
+    val mark = name.indexOf("__", 1)
+    if (mark > 0) name.slice(0, mark) else name
 }

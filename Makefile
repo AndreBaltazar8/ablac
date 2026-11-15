@@ -449,6 +449,7 @@ test-serial: ablac
 	tools/test-transactions.sh $(COMPILER)
 	tools/test-private.sh $(COMPILER)
 	tools/test-strict-imports.sh $(COMPILER)
+	tools/test-strict-members.sh $(COMPILER)
 	tools/test-generics.sh $(COMPILER)
 	tools/test-generic-ownership-origin.sh $(COMPILER)
 	tools/test-octal-literals.sh $(COMPILER)

@@ -4,6 +4,8 @@
 // the module graph (sema.ab is compiled alone by some tools and tests).
 import "abla/sys/linux/fs"
 import "abla/sys/linux/process"
+import "generic_types.ab"
+import "abla/text"
 
 // Compiler-owned sources must not depend on the directory from which ablac was
 // invoked. The public launcher supplies ABLA_SYSROOT automatically; the
@@ -280,4 +282,109 @@ fun bootstrapUnquotedImportDiagnostic(expression: string): string {
     }
     if (hasSeparator) "error[E_IMPORT_PATH_UNQUOTED]: an import path needs quotes: import \"$expression\"\n"
     else ""
+}
+
+/** What strict imports let each module see, for the checks sema makes once a call's target is known (an extension
+ *  function or operator, an overload): set by bootstrapValidateStrictImports for every build. `modes[m]` is 0 for a
+ *  module not checked, 1 for a strict one (a hidden target is an error), 2 for a flat one whose uses
+ *  `--visibility-report` lists; `visible[m]` holds, for a checked module, which modules it sees. `importFor(m, d)` is
+ *  the import line module `m` adds to see module `d`. */
+// `--visibility-report <path>` (module.ab writes the names, sema the members and overloads).
+var bootstrapVisibilityReportPath: string = ""
+var bootstrapVisibilityReportStarted: bool = false
+
+class BootstrapStrictVisibility(
+    val modules: Map<string, int>,
+    val modes: array<int>,
+    // Bitsets (bootstrapStrictBits): one bit a module.
+    val visible: array<array<int>>,
+    // As `visible`, with the modules imported under an alias too (for extension functions and operators).
+    val memberVisible: array<array<int>>,
+    val sources: array<string>,
+    val importFor: (int, int) -> string
+)
+
+// Each source identity a lookup met (a generic instance's too) to its module in the table (-1: none),
+// emptied with each new table: a lookup is per call and per overload candidate, and a generic instance's
+// module is a slice of its identity, which would be a new path-long string each time.
+var bootstrapStrictIdentityModules: Map<string, int> = Map()
+
+fun bootstrapStrictVisibilityEmpty(): BootstrapStrictVisibility =
+    BootstrapStrictVisibility(Map(), [], [], [], [], { caller: int, declaring: int -> "" })
+
+var bootstrapStrictVisibilityTable: BootstrapStrictVisibility = bootstrapStrictVisibilityEmpty()
+
+// The member and overload lines sema added to the report in this process, each once.
+val bootstrapVisibilityReportMemberLines: Map<string, int> = Map()
+
+/** How module `caller` sees a declaration of module `declaring` (both source identities, a generic instance's
+ *  included): 0 visible or not checked, 1 hidden from a strict module, 2 hidden from a module the report covers. */
+fun bootstrapStrictHidden(caller: string, declaring: string, member: bool = false): int {
+    val table = bootstrapStrictVisibilityTable
+    if (table.modes.size == 0) return 0
+    val from = bootstrapStrictModuleOf(table, caller)
+    if (from < 0 || table.modes[from] == 0) return 0
+    val to = bootstrapStrictModuleOf(table, declaring)
+    if (to < 0) return 0
+    val mode = table.modes[from]
+    val seen = if (member) table.memberVisible[from] else table.visible[from]
+    if (mode == 0 || seen.size == 0 || bootstrapStrictBit(seen, to)) 0 else mode
+}
+
+/** `flags` as a bitset, 64 to a word: the table keeps one for each checked module's view of every module. */
+fun bootstrapStrictBits(flags: array<bool>): array<int> {
+    val words = filledArray((flags.size + 63) / 64, 0)
+    var index = 0
+    while (index < flags.size) {
+        if (flags[index]) words[index / 64] = words[index / 64] | (1 << (index % 64))
+        index = index + 1
+    }
+    words
+}
+
+fun bootstrapStrictBit(bits: array<int>, index: int): bool =
+    index / 64 < bits.size && ((bits[index / 64] >> (index % 64)) & 1) != 0
+
+/** The module (its index in the table) of a source identity, -1 for one no checked build module has. */
+fun bootstrapStrictModuleOf(table: BootstrapStrictVisibility, identity: string): int {
+    val known = bootstrapStrictIdentityModules.get(identity)
+    if (known != null) return known
+    val found = table.modules.get(bootstrapGenericSourceFile(identity)) ?? -1
+    bootstrapStrictIdentityModules.set(identity, found)
+    found
+}
+
+/** The import `caller` adds to see `declaring`'s declarations (`import "…"`), "" when unknown. */
+fun bootstrapStrictImportLine(caller: string, declaring: string): string {
+    val table = bootstrapStrictVisibilityTable
+    val from = table.modules.get(bootstrapGenericSourceFile(caller))
+    val to = table.modules.get(bootstrapGenericSourceFile(declaring))
+    if (from == null || to == null) return ""
+    val importFor = table.importFor
+    importFor(from, to)
+}
+
+/** Adds a report line for a use sema found (`kind` is `member` or `overload`): the module, the line and column of
+ *  `offset` in it, what is used, the declaring module, the import to add and the kind. */
+fun bootstrapVisibilityReportUse(caller: string, offset: int, name: string, declaring: string, kind: string): void {
+    val path = bootstrapVisibilityReportPath
+    val table = bootstrapStrictVisibilityTable
+    val from = table.modules.get(bootstrapGenericSourceFile(caller))
+    if (path == "" || from == null) return
+    val source = table.sources[from]
+    var line = 1
+    var column = 1
+    var cursor = 0
+    while (cursor < offset && cursor < source.size) {
+        if (source[cursor] == 10) {
+            line = line + 1
+            column = 1
+        } else column = column + 1
+        cursor = cursor + 1
+    }
+    val text = "${bootstrapGenericSourceFile(caller)}\t$line\t$column\t$name\t${bootstrapGenericSourceFile(declaring)}\t${bootstrapStrictImportLine(caller, declaring)}\t$kind\n"
+    if (bootstrapVisibilityReportMemberLines.has(text)) return
+    bootstrapVisibilityReportMemberLines.set(text, 1)
+    Path(path).appendText(text)
+    return
 }
