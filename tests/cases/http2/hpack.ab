@@ -1,0 +1,219 @@
+// HPACK (abla/http/h2/hpack): the vectors of RFC 7541 appendix C (C.2 single fields, C.3/C.4 three requests without and with Huffman, C.5/C.6 three
+// responses with a 256-byte table and evictions), the Huffman code round trip over every byte, integer edges, the decoder's limits (each must fail with
+// its check removed), the table-size rules, never-indexed handling in the encoder, and encoder -> decoder round trips.
+// Prints "http2 hpack ok".
+import "abla/io"
+import "abla/crypto"
+import "abla/http/h2/hpack"
+
+var failures = 0
+
+fun fail(what: string): void {
+    failures = failures + 1
+    if (failures < 40) println("FAIL $what")
+    return
+}
+
+fun expect(cond: bool, what: string): void {
+    if (!cond) fail(what)
+    return
+}
+
+fun field(name: string, value: string): HpackField = HpackField(name, value, false)
+
+fun same(got: HpackBlock, names: array<string>, values: array<string>, what: string): void {
+    if (!got.ok) {
+        fail("$what: ${got.error}")
+        return
+    }
+    if (got.fields.size != names.size) {
+        fail("$what: ${got.fields.size} fields, wanted ${names.size}")
+        return
+    }
+    for (i in 0 until names.size) {
+        if (got.fields[i].name != names[i] || got.fields[i].value != values[i]) fail("$what: field $i is ${got.fields[i].name}: ${got.fields[i].value}")
+    }
+    return
+}
+
+fun decodeHex(var decoder: HpackDecoder, hex: string): HpackBlock = decoder.decode(hexDecode(hex))
+
+fun fresh(): HpackDecoder = hpackDecoderNew(4096, 65536, 16384, 256)
+
+fun main: int {
+    // C.2.1 literal with indexing, new name.
+    val c21 = decodeHex(fresh(), "400a637573746f6d2d6b65790d637573746f6d2d686561646572")
+    same(c21, ["custom-key"], ["custom-header"], "C.2.1")
+    // C.2.2 literal without indexing, indexed name; C.2.3 never indexed; C.2.4 indexed.
+    same(decodeHex(fresh(), "040c2f73616d706c652f70617468"), [":path"], ["/sample/path"], "C.2.2")
+    val c23 = decodeHex(fresh(), "100870617373776f726406736563726574")
+    same(c23, ["password"], ["secret"], "C.2.3")
+    if (c23.ok) expect(c23.fields[0].sensitive, "C.2.3 never indexed is marked")
+    same(decodeHex(fresh(), "82"), [":method"], ["GET"], "C.2.4")
+
+    // C.3 requests without Huffman, one decoder across the three.
+    var d3 = fresh()
+    same(decodeHex(d3, "828684410f7777772e6578616d706c652e636f6d"), [":method", ":scheme", ":path", ":authority"], ["GET", "http", "/", "www.example.com"], "C.3.1")
+    expect(d3.tableBytes() == 57, "C.3.1 table 57")
+    same(decodeHex(d3, "828684be58086e6f2d6361636865"), [":method", ":scheme", ":path", ":authority", "cache-control"], ["GET", "http", "/", "www.example.com", "no-cache"], "C.3.2")
+    expect(d3.tableBytes() == 110, "C.3.2 table 110")
+    same(decodeHex(d3, "828785bf400a637573746f6d2d6b65790c637573746f6d2d76616c7565"), [":method", ":scheme", ":path", ":authority", "custom-key"], ["GET", "https", "/index.html", "www.example.com", "custom-value"], "C.3.3")
+    expect(d3.tableBytes() == 164, "C.3.3 table 164")
+
+    // C.4 the same with Huffman.
+    var d4 = fresh()
+    same(decodeHex(d4, "828684418cf1e3c2e5f23a6ba0ab90f4ff"), [":method", ":scheme", ":path", ":authority"], ["GET", "http", "/", "www.example.com"], "C.4.1")
+    same(decodeHex(d4, "828684be5886a8eb10649cbf"), [":method", ":scheme", ":path", ":authority", "cache-control"], ["GET", "http", "/", "www.example.com", "no-cache"], "C.4.2")
+    same(decodeHex(d4, "828785bf408825a849e95ba97d7f8925a849e95bb8e8b4bf"), [":method", ":scheme", ":path", ":authority", "custom-key"], ["GET", "https", "/index.html", "www.example.com", "custom-value"], "C.4.3")
+    expect(d4.tableBytes() == 164, "C.4.3 table 164")
+
+    // C.5 responses without Huffman, a 256-byte table.
+    var d5 = hpackDecoderNew(256, 65536, 16384, 256)
+    same(decodeHex(d5, "4803333032580770726976617465611d4d6f6e2c203231204f637420323031332032303a31333a323120474d546e1768747470733a2f2f7777772e6578616d706c652e636f6d"),
+        [":status", "cache-control", "date", "location"], ["302", "private", "Mon, 21 Oct 2013 20:13:21 GMT", "https://www.example.com"], "C.5.1")
+    expect(d5.tableBytes() == 222, "C.5.1 table 222")
+    same(decodeHex(d5, "4803333037c1c0bf"), [":status", "cache-control", "date", "location"], ["307", "private", "Mon, 21 Oct 2013 20:13:21 GMT", "https://www.example.com"], "C.5.2")
+    expect(d5.tableBytes() == 222, "C.5.2 table 222")
+    same(decodeHex(d5, "88c1611d4d6f6e2c203231204f637420323031332032303a31333a323220474d54c05a04677a69707738666f6f3d4153444a4b48514b425a584f5157454f50495541585157454f49553b206d61782d6167653d333630303b2076657273696f6e3d31"),
+        [":status", "cache-control", "date", "location", "content-encoding", "set-cookie"], ["200", "private", "Mon, 21 Oct 2013 20:13:22 GMT", "https://www.example.com", "gzip", "foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1"], "C.5.3")
+    expect(d5.tableBytes() == 215, "C.5.3 table 215")
+
+    // C.6 the same with Huffman.
+    var d6 = hpackDecoderNew(256, 65536, 16384, 256)
+    same(decodeHex(d6, "488264025885aec3771a4b6196d07abe941054d444a8200595040b8166e082a62d1bff6e919d29ad171863c78f0b97c8e9ae82ae43d3"),
+        [":status", "cache-control", "date", "location"], ["302", "private", "Mon, 21 Oct 2013 20:13:21 GMT", "https://www.example.com"], "C.6.1")
+    same(decodeHex(d6, "4883640effc1c0bf"), [":status", "cache-control", "date", "location"], ["307", "private", "Mon, 21 Oct 2013 20:13:21 GMT", "https://www.example.com"], "C.6.2")
+    same(decodeHex(d6, "88c16196d07abe941054d444a8200595040b8166e084a62d1bffc05a839bd9ab77ad94e7821dd7f2e6c7b335dfdfcd5b3960d5af27087f3672c1ab270fb5291f9587316065c003ed4ee5b1063d5007"),
+        [":status", "cache-control", "date", "location", "content-encoding", "set-cookie"], ["200", "private", "Mon, 21 Oct 2013 20:13:22 GMT", "https://www.example.com", "gzip", "foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1"], "C.6.3")
+
+    huffman()
+    integers()
+    limits()
+    tableRules()
+    encoder()
+    if (failures == 0) println("http2 hpack ok")
+    failures
+}
+
+fun huffman(): void {
+    // Every byte value round trips, alone and in one long string; a string of all 256 values too.
+    val all: array<int> = []
+    for (i in 0 until 256) all.append(i)
+    val everything = cryptoByteString(all)
+    var e = hpackEncoderNew(4096)
+    var d = fresh()
+    val sent = e.encode([field("x-all", everything)])
+    same(d.decode(sent), ["x-all"], [everything], "all 256 bytes")
+    for (b in 0 until 256) {
+        val one = cryptoByteString([b])
+        var e1 = hpackEncoderNew(0)
+        var d1 = hpackDecoderNew(0, 65536, 16384, 256)
+        same(d1.decode(e1.encode([field("k", one + one + "a")])), ["k"], [one + one + "a"], "byte $b")
+    }
+    // Padding rules: "a" is 00011 + 3 padding bits of ones (0x1f: 00011111). Padding of zeros, or a whole byte of padding, or EOS inside, are errors.
+    var p = fresh()
+    same(p.decode(hexDecode("00" + "811f" + "00")), ["a"], [""], "valid padding")
+    expect(!fresh().decode(hexDecode("00" + "8118" + "00")).ok, "zero padding refused")
+    expect(!fresh().decode(hexDecode("00" + "821fff" + "00")).ok, "a whole byte of padding refused")
+    expect(!fresh().decode(hexDecode("00" + "84ffffffff" + "00")).ok, "EOS inside a string refused")
+    return
+}
+
+fun integers(): void {
+    // 5.1 examples: 10 in a 5-bit prefix = 0x0a; 1337 in a 5-bit prefix = 1f 9a 0a; 42 in an 8 bit prefix. Through the encoder: index of a long literal name length.
+    var e = hpackEncoderNew(0)
+    val long = "v".repeat(1337)
+    var d = hpackDecoderNew(0, 65536, 16384, 256)
+    same(d.decode(e.encode([field("n", long)])), ["n"], [long], "a 1337 byte value")
+    // An integer that never ends, or overflows 2^31, is refused.
+    expect(!fresh().decode(hexDecode("ffffffffffffff")).ok, "a runaway integer is refused")
+    expect(!fresh().decode(hexDecode("ffffffffff0f")).ok, "an integer over 2^31 is refused")
+    expect(!fresh().decode(hexDecode("ff")).ok, "a cut-off integer is refused")
+    return
+}
+
+fun limits(): void {
+    // A string longer than the field limit is refused before it is read, as a limit (not as malformed).
+    var small = hpackDecoderNew(4096, 65536, 10, 256)
+    val tooLong = small.decode(hexDecode("400161" + "0b" + "61616161616161616161" + "61"))
+    expect(!tooLong.ok && tooLong.limit, "a value over the field limit is a limit")
+    // A string whose length claims more than the block holds is malformed, not a limit.
+    val cut = fresh().decode(hexDecode("40016105" + "6161"))
+    expect(!cut.ok && !cut.limit, "a cut-off string is malformed")
+    // Too many fields.
+    var few = hpackDecoderNew(4096, 65536, 16384, 3)
+    expect(!few.decode(hexDecode("82828282")).ok, "four fields over a limit of three")
+    expect(!few.decode(hexDecode("82")).ok, "a decoder that failed stays failed")
+    // Header list size: each :method GET field counts 7 + 3 + 32 = 42.
+    var list = hpackDecoderNew(4096, 100, 16384, 256)
+    val over = list.decode(hexDecode("828282"))
+    expect(!over.ok && over.limit, "a header list over its limit is a limit")
+    // The decompression bomb: one dynamic entry of ~4000 bytes referenced thousands of times is cut by the list limit, not expanded.
+    var d = hpackDecoderNew(4096, 65536, 16384, 256)
+    val big = "z".repeat(3000)
+    // Literal with indexing, new name "x-bomb", a 3000 byte value (length 3000 = 7f b9 16 in a 7-bit prefix): one 3038 byte table entry.
+    val loaded = d.decode(hexDecode("4006") + "x-bomb" + hexDecode("7fb916") + big)
+    expect(loaded.ok && d.tableEntries() == 1, "the bomb entry is loaded")
+    val bomb = d.decode(hexDecode("be".repeat(200)))
+    expect(!bomb.ok && bomb.limit, "an indexed bomb is cut by the list limit")
+    // An index that is not there.
+    expect(!fresh().decode(hexDecode("c0")).ok, "an index above the table is refused")
+    expect(!fresh().decode(hexDecode("80")).ok, "index 0 is refused")
+    return
+}
+
+fun tableRules(): void {
+    // A size update above what we advertised is refused; one at the start is fine; one after a field is refused.
+    expect(!hpackDecoderNew(100, 65536, 16384, 256).decode(hexDecode("3fe201")).ok, "an update above the advertised size")
+    expect(hpackDecoderNew(4096, 65536, 16384, 256).decode(hexDecode("2082")).ok, "an update at the start")
+    expect(!hpackDecoderNew(4096, 65536, 16384, 256).decode(hexDecode("8220")).ok, "an update after a field")
+    // An entry larger than the table empties it and is not kept.
+    var d = hpackDecoderNew(64, 65536, 16384, 256)
+    val r = d.decode(hexDecode("400161" + "30" + "61".repeat(48)))
+    expect(r.ok && d.tableEntries() == 0 && d.tableBytes() == 0, "an entry larger than the table is not added")
+    // Eviction from the old end.
+    var e = hpackDecoderNew(100, 65536, 16384, 256)
+    e.decode(hexDecode("4001610162"))
+    e.decode(hexDecode("4001630164"))
+    expect(e.tableEntries() == 2, "two entries of 34")
+    e.decode(hexDecode("4001650166"))
+    expect(e.tableEntries() == 2 && e.tableBytes() == 68, "the oldest is evicted")
+    return
+}
+
+fun encoder(): void {
+    var e = hpackEncoderNew(4096, ["X-Token"])
+    var d = fresh()
+    val fields = [field(":method", "GET"), field(":path", "/a"), field("authorization", "Bearer abc"), field("cookie", "a=b"), field("x-token", "t"),
+        field("user-agent", "abla"), field("x-plain", "v")]
+    val block = e.encode(fields)
+    val got = d.decode(block)
+    expect(got.ok && got.fields.size == 7, "encoder -> decoder")
+    if (got.ok) {
+        expect(got.fields[2].sensitive && got.fields[3].sensitive && got.fields[4].sensitive, "credentials go out never indexed")
+        expect(!got.fields[0].sensitive && !got.fields[6].sensitive, "others are not marked")
+    }
+    // The secrets are in neither table: a sensitive value never enters the dynamic table.
+    expect(d.tableEntries() == 3, "only :path, user-agent and x-plain entered the decoder's table: ${d.tableEntries()}")
+    expect(e.tableBytes() == d.tableBytes(), "both tables agree")
+    // Sending the same fields again uses indexed forms for the indexable ones: the second block is shorter.
+    val second = e.encode(fields)
+    expect(second.size < block.size, "a repeated block is smaller")
+    same(d.decode(second), [":method", ":path", "authorization", "cookie", "x-token", "user-agent", "x-plain"], ["GET", "/a", "Bearer abc", "a=b", "t", "abla", "v"], "second block")
+    // A peer table size: the next block starts with the update, and the tables stay in step.
+    e.setPeerTableSize(0)
+    val after = e.encode([field("x-plain", "v")])
+    expect(after.size > 0 && (after[0] & 224) == 32, "a size update leads the block")
+    var d2 = hpackDecoderNew(0, 65536, 16384, 256)
+    // Both sides emptied: the fresh decoder at size 0 reads it.
+    same(d2.decode(after), ["x-plain"], ["v"], "block after size 0")
+    // Shrink then grow between blocks: two updates, smallest first.
+    var e2 = hpackEncoderNew(4096)
+    e2.setPeerTableSize(0)
+    e2.setPeerTableSize(2000)
+    val two = e2.encode([field("a", "b")])
+    var d3 = fresh()
+    same(d3.decode(two), ["a"], ["b"], "shrink then grow")
+    expect((two[0] & 224) == 32, "starts with an update")
+    return
+}

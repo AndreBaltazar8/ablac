@@ -1,0 +1,1042 @@
+// HPACK (RFC 7541): header compression for HTTP/2, in Abla, sans-IO. The decoder is the dangerous side (a peer controls what it is fed): every size it
+// can grow to is bounded by a limit it is made with (the dynamic table by the size we advertised, a header list by its byte cap and field count,
+// a string by the field cap, an integer by 2^31), it works on a whole header block at once (the caller bounds the block), and any error leaves it
+// unusable (the table would no longer match the peer's): a connection error in HTTP/2 (RFC 9113 section 4.3). The encoder never puts a secret
+// into the dynamic table (CRIME/BREACH): names in its never-index list, and the credential names built in, go out as literals marked never
+// indexed (section 6.2.3); other values enter the table only when short or of a stable name. Constant time is not needed here (headers are
+// not secrets from the one who reads this process's memory, and nothing branches on a key).
+
+import "abla/bytes"
+import "abla/text"
+import "abla/array"
+
+// ---- the tables (generated from RFC 7541 appendices A and B by tools/gen-hpack-tables.sh; do not edit) ----
+val HPACK_STATIC_NAMES: array<string> = [
+    ":authority",
+    ":method",
+    ":method",
+    ":path",
+    ":path",
+    ":scheme",
+    ":scheme",
+    ":status",
+    ":status",
+    ":status",
+    ":status",
+    ":status",
+    ":status",
+    ":status",
+    "accept-charset",
+    "accept-encoding",
+    "accept-language",
+    "accept-ranges",
+    "accept",
+    "access-control-allow-origin",
+    "age",
+    "allow",
+    "authorization",
+    "cache-control",
+    "content-disposition",
+    "content-encoding",
+    "content-language",
+    "content-length",
+    "content-location",
+    "content-range",
+    "content-type",
+    "cookie",
+    "date",
+    "etag",
+    "expect",
+    "expires",
+    "from",
+    "host",
+    "if-match",
+    "if-modified-since",
+    "if-none-match",
+    "if-range",
+    "if-unmodified-since",
+    "last-modified",
+    "link",
+    "location",
+    "max-forwards",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "range",
+    "referer",
+    "refresh",
+    "retry-after",
+    "server",
+    "set-cookie",
+    "strict-transport-security",
+    "transfer-encoding",
+    "user-agent",
+    "vary",
+    "via",
+    "www-authenticate"
+]
+val HPACK_STATIC_VALUES: array<string> = [
+    "",
+    "GET",
+    "POST",
+    "/",
+    "/index.html",
+    "http",
+    "https",
+    "200",
+    "204",
+    "206",
+    "304",
+    "400",
+    "404",
+    "500",
+    "",
+    "gzip, deflate",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    ""
+]
+// The code of each symbol 0..255 and EOS (256), and its length in bits (RFC 7541 appendix B).
+val HPACK_HUFFMAN_CODES: array<int> = [
+    8184,
+    8388568,
+    268435426,
+    268435427,
+    268435428,
+    268435429,
+    268435430,
+    268435431,
+    268435432,
+    16777194,
+    1073741820,
+    268435433,
+    268435434,
+    1073741821,
+    268435435,
+    268435436,
+    268435437,
+    268435438,
+    268435439,
+    268435440,
+    268435441,
+    268435442,
+    1073741822,
+    268435443,
+    268435444,
+    268435445,
+    268435446,
+    268435447,
+    268435448,
+    268435449,
+    268435450,
+    268435451,
+    20,
+    1016,
+    1017,
+    4090,
+    8185,
+    21,
+    248,
+    2042,
+    1018,
+    1019,
+    249,
+    2043,
+    250,
+    22,
+    23,
+    24,
+    0,
+    1,
+    2,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    92,
+    251,
+    32764,
+    32,
+    4091,
+    1020,
+    8186,
+    33,
+    93,
+    94,
+    95,
+    96,
+    97,
+    98,
+    99,
+    100,
+    101,
+    102,
+    103,
+    104,
+    105,
+    106,
+    107,
+    108,
+    109,
+    110,
+    111,
+    112,
+    113,
+    114,
+    252,
+    115,
+    253,
+    8187,
+    524272,
+    8188,
+    16380,
+    34,
+    32765,
+    3,
+    35,
+    4,
+    36,
+    5,
+    37,
+    38,
+    39,
+    6,
+    116,
+    117,
+    40,
+    41,
+    42,
+    7,
+    43,
+    118,
+    44,
+    8,
+    9,
+    45,
+    119,
+    120,
+    121,
+    122,
+    123,
+    32766,
+    2044,
+    16381,
+    8189,
+    268435452,
+    1048550,
+    4194258,
+    1048551,
+    1048552,
+    4194259,
+    4194260,
+    4194261,
+    8388569,
+    4194262,
+    8388570,
+    8388571,
+    8388572,
+    8388573,
+    8388574,
+    16777195,
+    8388575,
+    16777196,
+    16777197,
+    4194263,
+    8388576,
+    16777198,
+    8388577,
+    8388578,
+    8388579,
+    8388580,
+    2097116,
+    4194264,
+    8388581,
+    4194265,
+    8388582,
+    8388583,
+    16777199,
+    4194266,
+    2097117,
+    1048553,
+    4194267,
+    4194268,
+    8388584,
+    8388585,
+    2097118,
+    8388586,
+    4194269,
+    4194270,
+    16777200,
+    2097119,
+    4194271,
+    8388587,
+    8388588,
+    2097120,
+    2097121,
+    4194272,
+    2097122,
+    8388589,
+    4194273,
+    8388590,
+    8388591,
+    1048554,
+    4194274,
+    4194275,
+    4194276,
+    8388592,
+    4194277,
+    4194278,
+    8388593,
+    67108832,
+    67108833,
+    1048555,
+    524273,
+    4194279,
+    8388594,
+    4194280,
+    33554412,
+    67108834,
+    67108835,
+    67108836,
+    134217694,
+    134217695,
+    67108837,
+    16777201,
+    33554413,
+    524274,
+    2097123,
+    67108838,
+    134217696,
+    134217697,
+    67108839,
+    134217698,
+    16777202,
+    2097124,
+    2097125,
+    67108840,
+    67108841,
+    268435453,
+    134217699,
+    134217700,
+    134217701,
+    1048556,
+    16777203,
+    1048557,
+    2097126,
+    4194281,
+    2097127,
+    2097128,
+    8388595,
+    4194282,
+    4194283,
+    33554414,
+    33554415,
+    16777204,
+    16777205,
+    67108842,
+    8388596,
+    67108843,
+    134217702,
+    67108844,
+    67108845,
+    134217703,
+    134217704,
+    134217705,
+    134217706,
+    134217707,
+    268435454,
+    134217708,
+    134217709,
+    134217710,
+    134217711,
+    134217712,
+    67108846,
+    1073741823
+]
+val HPACK_HUFFMAN_LENGTHS: array<int> = [
+    13,
+    23,
+    28,
+    28,
+    28,
+    28,
+    28,
+    28,
+    28,
+    24,
+    30,
+    28,
+    28,
+    30,
+    28,
+    28,
+    28,
+    28,
+    28,
+    28,
+    28,
+    28,
+    30,
+    28,
+    28,
+    28,
+    28,
+    28,
+    28,
+    28,
+    28,
+    28,
+    6,
+    10,
+    10,
+    12,
+    13,
+    6,
+    8,
+    11,
+    10,
+    10,
+    8,
+    11,
+    8,
+    6,
+    6,
+    6,
+    5,
+    5,
+    5,
+    6,
+    6,
+    6,
+    6,
+    6,
+    6,
+    6,
+    7,
+    8,
+    15,
+    6,
+    12,
+    10,
+    13,
+    6,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    7,
+    8,
+    7,
+    8,
+    13,
+    19,
+    13,
+    14,
+    6,
+    15,
+    5,
+    6,
+    5,
+    6,
+    5,
+    6,
+    6,
+    6,
+    5,
+    7,
+    7,
+    6,
+    6,
+    6,
+    5,
+    6,
+    7,
+    6,
+    5,
+    5,
+    6,
+    7,
+    7,
+    7,
+    7,
+    7,
+    15,
+    11,
+    14,
+    13,
+    28,
+    20,
+    22,
+    20,
+    20,
+    22,
+    22,
+    22,
+    23,
+    22,
+    23,
+    23,
+    23,
+    23,
+    23,
+    24,
+    23,
+    24,
+    24,
+    22,
+    23,
+    24,
+    23,
+    23,
+    23,
+    23,
+    21,
+    22,
+    23,
+    22,
+    23,
+    23,
+    24,
+    22,
+    21,
+    20,
+    22,
+    22,
+    23,
+    23,
+    21,
+    23,
+    22,
+    22,
+    24,
+    21,
+    22,
+    23,
+    23,
+    21,
+    21,
+    22,
+    21,
+    23,
+    22,
+    23,
+    23,
+    20,
+    22,
+    22,
+    22,
+    23,
+    22,
+    22,
+    23,
+    26,
+    26,
+    20,
+    19,
+    22,
+    23,
+    22,
+    25,
+    26,
+    26,
+    26,
+    27,
+    27,
+    26,
+    24,
+    25,
+    19,
+    21,
+    26,
+    27,
+    27,
+    26,
+    27,
+    24,
+    21,
+    21,
+    26,
+    26,
+    28,
+    27,
+    27,
+    27,
+    20,
+    24,
+    20,
+    21,
+    22,
+    21,
+    21,
+    23,
+    22,
+    22,
+    25,
+    25,
+    24,
+    24,
+    26,
+    23,
+    26,
+    27,
+    26,
+    26,
+    27,
+    27,
+    27,
+    27,
+    27,
+    28,
+    27,
+    27,
+    27,
+    27,
+    27,
+    26,
+    30
+]
+
+/** One header field of a decoded block; `sensitive` is set for a field the sender marked never indexed. */
+class HpackField(val name: string, val value: string, val sensitive: bool = false)
+
+/** A decoded block: the fields in order, or why it failed. `limit` is true when the failure is one of OUR limits (header list, field, field count, table
+ *  size) rather than a malformed block: HTTP/2 answers a limit with ENHANCE_YOUR_CALM and a malformed block with COMPRESSION_ERROR. */
+class HpackBlock(val ok: bool, val fields: array<HpackField>, val error: string, val limit: bool)
+
+private fun hpackFailed(error: string): HpackBlock = HpackBlock(false, [], error, false)
+private fun hpackOverLimit(error: string): HpackBlock = HpackBlock(false, [], error, true)
+
+// ---- the Huffman code ----
+// A tree built once from the code table: node n has children left[n] (bit 0) and right[n] (bit 1); a leaf stores symbol + 1 in `leaf`.
+private class HpackTree(val left: array<int>, val right: array<int>, val leaf: array<int>)
+
+private var hpackTreeCache: HpackTree? = null
+
+private fun hpackTree(): HpackTree {
+    val cached = hpackTreeCache
+    if (cached != null) return cached
+    val left: array<int> = [0]
+    val right: array<int> = [0]
+    val leaf: array<int> = [0]
+    for (symbol in 0 until 257) {
+        val code = HPACK_HUFFMAN_CODES[symbol]
+        val length = HPACK_HUFFMAN_LENGTHS[symbol]
+        var node = 0
+        for (bit in 0 until length) {
+            val one = (code >> (length - 1 - bit)) & 1
+            var next = if (one == 1) right[node] else left[node]
+            if (next == 0) {
+                next = left.size
+                left.append(0)
+                right.append(0)
+                leaf.append(0)
+                if (one == 1) right[node] = next else left[node] = next
+            }
+            node = next
+        }
+        leaf[node] = symbol + 1
+    }
+    val built = HpackTree(left, right, leaf)
+    hpackTreeCache = built
+    built
+}
+
+/** The Huffman coding of `text`: the bytes, the last byte padded with the high bits of EOS (all ones). */
+fun hpackHuffmanEncode(text: string): string {
+    var buffer = byteBuffer()
+    var accumulator = 0
+    var bits = 0
+    for (i in 0 until text.size) {
+        val symbol = text[i]
+        accumulator = (accumulator << HPACK_HUFFMAN_LENGTHS[symbol]) | HPACK_HUFFMAN_CODES[symbol]
+        bits = bits + HPACK_HUFFMAN_LENGTHS[symbol]
+        while (bits >= 8) {
+            buffer.appendByteValue((accumulator >> (bits - 8)) & 255)
+            bits = bits - 8
+            accumulator = accumulator & ((1 << bits) - 1)
+        }
+    }
+    if (bits > 0) buffer.appendByteValue(((accumulator << (8 - bits)) | ((1 << (8 - bits)) - 1)) & 255)
+    buffer.toText()
+}
+
+private fun hpackHuffmanLength(text: string): int {
+    var bits = 0
+    for (i in 0 until text.size) bits = bits + HPACK_HUFFMAN_LENGTHS[text[i]]
+    (bits + 7) / 8
+}
+
+/** The text a Huffman-coded string stands for, at most `limit` bytes of it; "" and an error text in `error` for a malformed string (EOS inside it, padding
+ *  longer than 7 bits or not all ones, a code that leads nowhere) or one that would decode to more than `limit`. */
+private class HpackText(val ok: bool, val text: string, val limit: bool)
+
+private fun hpackHuffmanDecode(data: string, limit: int): HpackText {
+    val tree = hpackTree()
+    var buffer = byteBuffer()
+    var node = 0
+    var pending = 0
+    var allOnes = true
+    var count = 0
+    for (i in 0 until data.size) {
+        for (shift in 0 until 8) {
+            val one = (data[i] >> (7 - shift)) & 1
+            node = if (one == 1) tree.right[node] else tree.left[node]
+            pending = pending + 1
+            if (one == 0) allOnes = false
+            if (node == 0) return HpackText(false, "", false)
+            val leaf = tree.leaf[node]
+            if (leaf != 0) {
+                if (leaf == 257) return HpackText(false, "", false)
+                count = count + 1
+                if (count > limit) return HpackText(false, "", true)
+                buffer.appendByteValue(leaf - 1)
+                node = 0
+                pending = 0
+                allOnes = true
+            }
+        }
+    }
+    // What is left is padding: at most 7 bits, all ones (a prefix of EOS).
+    if (pending > 7 || !allOnes) return HpackText(false, "", false)
+    HpackText(true, buffer.toText(), false)
+}
+
+// ---- integers (section 5.1) ----
+private class HpackInteger(val ok: bool, val value: int, val next: int)
+
+private fun hpackInteger(data: string, at: int, prefix: int): HpackInteger {
+    if (at >= data.size) return HpackInteger(false, 0, at)
+    val mask = (1 << prefix) - 1
+    var value = data[at] & mask
+    var position = at + 1
+    if (value < mask) return HpackInteger(true, value, position)
+    var shift = 0
+    var steps = 0
+    while (true) {
+        if (position >= data.size || steps >= 5) return HpackInteger(false, 0, position)
+        val octet = data[position]
+        position = position + 1
+        steps = steps + 1
+        value = value + ((octet & 127) << shift)
+        // Nothing legitimate needs more than 2^31: a block that says otherwise is refused here, before it can size anything.
+        if (value > 2147483647) return HpackInteger(false, 0, position)
+        if ((octet & 128) == 0) return HpackInteger(true, value, position)
+        shift = shift + 7
+    }
+    HpackInteger(false, 0, position)
+}
+
+private fun hpackWriteInteger(var buffer: ByteBuffer, first: int, prefix: int, value: int): void {
+    val mask = (1 << prefix) - 1
+    if (value < mask) {
+        buffer.appendByteValue(first | value)
+        return
+    }
+    buffer.appendByteValue(first | mask)
+    var rest = value - mask
+    while (rest >= 128) {
+        buffer.appendByteValue((rest & 127) | 128)
+        rest = rest >> 7
+    }
+    buffer.appendByteValue(rest)
+    return
+}
+
+// ---- the dynamic table (section 2.3.2), shared by the decoder and the encoder ----
+// Entries are kept oldest first; the dynamic index of the newest is 62, so entry i of `names` has the HPACK index 62 + (size - 1 - i).
+class HpackTable(var names: array<string>, var values: array<string>, var size: int, var maximum: int)
+
+private fun hpackEntrySize(name: string, value: string): int = name.size + value.size + 32
+
+private fun HpackTable.evict(room: int): void {
+    while (this.names.size > 0 && this.size + room > this.maximum) {
+        this.size = this.size - hpackEntrySize(this.names[0], this.values[0])
+        this.names.removeAt(0)
+        this.values.removeAt(0)
+    }
+    return
+}
+
+private fun HpackTable.add(name: string, value: string): void {
+    val entry = hpackEntrySize(name, value)
+    // An entry larger than the table empties it and is not added (section 4.4).
+    this.evict(entry)
+    if (entry <= this.maximum) {
+        this.names.append(name)
+        this.values.append(value)
+        this.size = this.size + entry
+    }
+    return
+}
+
+private fun HpackTable.resize(maximum: int): void {
+    this.maximum = maximum
+    this.evict(0)
+    return
+}
+
+// ---- the decoder ----
+/** A decoder with the limits it enforces. `tableSize` is the SETTINGS_HEADER_TABLE_SIZE we advertised (the peer may not exceed it); `listBytes` caps a header
+ *  list (name + value + 32 per field, RFC 9113 section 6.5.2), `fieldBytes` one name or value, `fieldCount` the fields of a block. */
+class HpackDecoder(val table: HpackTable, val advertised: int, val listBytes: int, val fieldBytes: int, val fieldCount: int, var broken: bool)
+
+fun hpackDecoderNew(tableSize: int, listBytes: int, fieldBytes: int, fieldCount: int): HpackDecoder =
+    HpackDecoder(HpackTable([], [], 0, tableSize), tableSize, listBytes, fieldBytes, fieldCount, false)
+
+/** The bytes of the dynamic table (tests and limits). */
+fun HpackDecoder.tableBytes(): int = this.table.size
+fun HpackDecoder.tableEntries(): int = this.table.names.size
+
+private class HpackString(val ok: bool, val text: string, val next: int, val limit: bool)
+
+private fun HpackDecoder.string(data: string, at: int): HpackString {
+    if (at >= data.size) return HpackString(false, "", at, false)
+    val huffman = (data[at] & 128) != 0
+    val length = hpackInteger(data, at, 7)
+    if (!length.ok) return HpackString(false, "", at, false)
+    // The length is checked before a byte is read or a buffer made: a peer claiming a huge string gets nothing.
+    if (length.value > this.fieldBytes && !huffman) return HpackString(false, "", at, true)
+    if (length.value > this.fieldBytes * 2 && huffman) return HpackString(false, "", at, true)
+    if (length.next + length.value > data.size) return HpackString(false, "", at, false)
+    val raw = data.slice(length.next, length.next + length.value)
+    if (!huffman) return HpackString(true, raw, length.next + length.value, false)
+    val decoded = hpackHuffmanDecode(raw, this.fieldBytes)
+    if (!decoded.ok) return HpackString(false, "", at, decoded.limit)
+    HpackString(true, decoded.text, length.next + length.value, false)
+}
+
+private fun HpackDecoder.lookup(index: int): HpackField? {
+    if (index <= 0) return null
+    if (index <= 61) return HpackField(HPACK_STATIC_NAMES[index - 1], HPACK_STATIC_VALUES[index - 1])
+    val dynamic = index - 62
+    if (dynamic >= this.table.names.size) return null
+    val at = this.table.names.size - 1 - dynamic
+    HpackField(this.table.names[at], this.table.values[at])
+}
+
+/** Decodes one whole header block. A table size update must come first (section 4.2), at most the advertised size. */
+fun HpackDecoder.decode(block: string): HpackBlock {
+    if (this.broken) return hpackFailed("hpack: the decoder failed before")
+    val fields: array<HpackField> = []
+    var at = 0
+    var total = 0
+    var seenField = false
+    while (at < block.size) {
+        val first = block[at]
+        if ((first & 128) != 0) {
+            // Indexed header field.
+            val index = hpackInteger(block, at, 7)
+            if (!index.ok) return this.fail("hpack: a bad indexed field")
+            val field = this.lookup(index.value)
+            if (field == null) return this.fail("hpack: an index that is not in the table")
+            at = index.next
+            seenField = true
+            total = total + hpackEntrySize(field.name, field.value)
+            fields.append(field)
+        } else if ((first & 224) == 32) {
+            // Dynamic table size update: only before the first field of the block, and within what we advertised.
+            val update = hpackInteger(block, at, 5)
+            if (!update.ok || seenField) return this.fail("hpack: a bad table size update")
+            if (update.value > this.advertised) return this.fail("hpack: a table size above the advertised one")
+            this.table.resize(update.value)
+            at = update.next
+        } else {
+            val indexed = (first & 192) == 64
+            val prefix = if (indexed) 6 else 4
+            val sensitive = (first & 240) == 16
+            val index = hpackInteger(block, at, prefix)
+            if (!index.ok) return this.fail("hpack: a bad literal")
+            at = index.next
+            var name = ""
+            if (index.value == 0) {
+                val parsed = this.string(block, at)
+                if (!parsed.ok) return if (parsed.limit) this.overLimit("hpack: a name over the field limit") else this.fail("hpack: a bad name")
+                name = parsed.text
+                at = parsed.next
+            } else {
+                val named = this.lookup(index.value)
+                if (named == null) return this.fail("hpack: a name index that is not in the table")
+                name = named.name
+            }
+            val parsedValue = this.string(block, at)
+            if (!parsedValue.ok) return if (parsedValue.limit) this.overLimit("hpack: a value over the field limit") else this.fail("hpack: a bad value")
+            at = parsedValue.next
+            seenField = true
+            total = total + hpackEntrySize(name, parsedValue.text)
+            fields.append(HpackField(name, parsedValue.text, sensitive))
+            if (indexed) this.table.add(name, parsedValue.text)
+        }
+        if (fields.size > this.fieldCount) return this.overLimit("hpack: too many fields in a block")
+        if (total > this.listBytes) return this.overLimit("hpack: the header list is too large")
+    }
+    HpackBlock(true, fields, "", false)
+}
+
+private fun HpackDecoder.fail(error: string): HpackBlock {
+    this.broken = true
+    hpackFailed(error)
+}
+
+private fun HpackDecoder.overLimit(error: string): HpackBlock {
+    this.broken = true
+    hpackOverLimit(error)
+}
+
+// ---- the encoder ----
+/** The names that are never put in the dynamic table, besides the credentials built in. */
+private val HPACK_SECRET_NAMES: array<string> = ["authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key", "x-auth-token"]
+/** Stable names whose long values may still be indexed. */
+private val HPACK_STABLE_NAMES: array<string> = [":authority", ":scheme", ":method", "user-agent", "accept", "accept-encoding", "accept-language", "content-type"]
+
+class HpackEncoder(val table: HpackTable, val cap: int, val neverIndex: array<string>, var pendingSmallest: int, var pendingFinal: int)
+
+/** An encoder whose table is at most `tableSize` bytes (the smaller of that and what the peer allows, set with `setPeerTableSize`). `neverIndex` names
+ *  are sent never indexed, in addition to the built-in credential names. */
+fun hpackEncoderNew(tableSize: int, neverIndex: array<string> = []): HpackEncoder {
+    val lowered: array<string> = []
+    for (name in neverIndex) lowered.append(name.lowercase())
+    HpackEncoder(HpackTable([], [], 0, tableSize), tableSize, lowered, -1, -1)
+}
+
+/** The peer's SETTINGS_HEADER_TABLE_SIZE: the table shrinks or grows to the smaller of it and the cap, and the next block starts with the size update(s) section 4.2 asks for. */
+fun HpackEncoder.setPeerTableSize(size: int): void {
+    val target = if (size < this.cap) size else this.cap
+    if (this.pendingSmallest < 0 || target < this.pendingSmallest) this.pendingSmallest = target
+    this.pendingFinal = target
+    this.table.resize(target)
+    return
+}
+
+fun HpackEncoder.tableBytes(): int = this.table.size
+
+private fun hpackListHas(list: array<string>, name: string): bool {
+    for (item in list) {
+        if (item == name) return true
+    }
+    false
+}
+
+private fun hpackWriteString(var buffer: ByteBuffer, text: string): void {
+    val huffman = hpackHuffmanLength(text)
+    if (huffman < text.size) {
+        hpackWriteInteger(buffer, 128, 7, huffman)
+        buffer.appendText(hpackHuffmanEncode(text))
+    } else {
+        hpackWriteInteger(buffer, 0, 7, text.size)
+        buffer.appendText(text)
+    }
+    return
+}
+
+/** One block for `fields` (names lower case: HTTP/2 requires it). */
+fun HpackEncoder.encode(fields: array<HpackField>): string {
+    var buffer = byteBuffer()
+    // Size updates owed to the peer: the smallest size since the last block, then the final one if different (section 4.2).
+    if (this.pendingSmallest >= 0) {
+        hpackWriteInteger(buffer, 32, 5, this.pendingSmallest)
+        if (this.pendingFinal != this.pendingSmallest) hpackWriteInteger(buffer, 32, 5, this.pendingFinal)
+        this.pendingSmallest = -1
+        this.pendingFinal = -1
+    }
+    for (field in fields) {
+        val name = field.name
+        val value = field.value
+        // The best match: a whole field, else a name, in the static table first, then the dynamic one.
+        var whole = 0
+        var named = 0
+        for (i in 0 until 61) {
+            if (HPACK_STATIC_NAMES[i] == name) {
+                if (named == 0) named = i + 1
+                if (HPACK_STATIC_VALUES[i] == value && whole == 0) whole = i + 1
+            }
+        }
+        for (i in 0 until this.table.names.size) {
+            val index = 62 + (this.table.names.size - 1 - i)
+            if (this.table.names[i] == name) {
+                if (named == 0) named = index
+                if (this.table.values[i] == value && whole == 0) whole = index
+            }
+        }
+        val secret = field.sensitive || hpackListHas(HPACK_SECRET_NAMES, name) || hpackListHas(this.neverIndex, name)
+        if (whole != 0 && !secret) {
+            hpackWriteInteger(buffer, 128, 7, whole)
+        } else if (secret) {
+            // Literal, never indexed (0001): an intermediary must keep it that way.
+            hpackWriteInteger(buffer, 16, 4, named)
+            if (named == 0) hpackWriteString(buffer, name)
+            hpackWriteString(buffer, value)
+        } else if (value.size < 16 || hpackListHas(HPACK_STABLE_NAMES, name)) {
+            hpackWriteInteger(buffer, 64, 6, named)
+            if (named == 0) hpackWriteString(buffer, name)
+            hpackWriteString(buffer, value)
+            this.table.add(name, value)
+        } else {
+            // Literal without indexing (0000).
+            hpackWriteInteger(buffer, 0, 4, named)
+            if (named == 0) hpackWriteString(buffer, name)
+            hpackWriteString(buffer, value)
+        }
+    }
+    buffer.toText()
+}
