@@ -20,12 +20,12 @@ esac
 
 fail() { echo "gc threads: $*" >&2; exit 1; }
 
-for name in churn hold; do
+for name in churn hold stale-claim manual; do
     "$compiler" build "tests/cases/gc-threads/$name.ab" -o "$output_directory/$name" --fast --no-cache \
         || fail "$name did not build"
 done
 
-for name in churn hold; do
+for name in churn hold stale-claim manual; do
     for mode in "ABLA_GC_GROWTH=1048576" "ABLA_GC_STRESS=1"; do
         status=0
         env "$mode" ABLA_GC_TRACE=1 timeout 120 "$output_directory/$name" \

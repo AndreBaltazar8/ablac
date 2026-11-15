@@ -1283,12 +1283,16 @@ trusted fun __ablaRuntimePlatformNativeEnter(): void {
 trusted fun __ablaRuntimePlatformNativeLeave(): void {
     val record = __ablaRuntimeHostStwRecord()
     if (record == 0) return
-    val seen = ablaRuntimeAtomicCompareExchangeI64(record + 24, -1, 0)
-    if (seen == -1) return
-    // A collection claimed the thread while it was away: wait for it to end.
     val stw = __ablaRuntimeHostStwAddress()
-    while (ablaRuntimeAtomicLoadI64(stw) == seen) __ablaRuntimeFutexWait(stw, seen)
-    ablaRuntimeAtomicStoreI64(record + 24, 0)
+    while (true) {
+        val seen = ablaRuntimeAtomicCompareExchangeI64(record + 24, -1, 0)
+        if (seen == -1 || seen >= 0) return
+        // A collection claimed the thread while it was away (its claim is -2 - the stop's token): wait for the
+        // stop to end, then try again: the stop put the thread back to -1, and the next stop may have claimed it
+        // already (a plain store of 0 here would let that stop collect while this thread runs).
+        val token = -2 - seen
+        while (ablaRuntimeAtomicLoadI64(stw) == token) __ablaRuntimeFutexWait(stw, token)
+    }
     return
 }
 
@@ -1332,6 +1336,16 @@ private trusted fun __ablaRuntimeHostStwTrace(message: string, length: int, numb
     return
 }
 
+// The stop `token` ends: threads it claimed in native code are in native code again (the registry's lock is held).
+private trusted fun __ablaRuntimeHostStwUnclaim(token: int): void {
+    var other = ablaRuntimeLoadI64(__ablaRuntimeHostStwAddress() + 16)
+    while (other != 0) {
+        ablaRuntimeAtomicCompareExchangeI64(other + 24, -2 - token, -1)
+        other = ablaRuntimeLoadI64(other)
+    }
+    return
+}
+
 // 0: the thread was parked for another's collection, or the stop was abandoned, or it may not collect: it does not
 // collect. 1: every other thread is parked, the registry stays locked until __ablaRuntimeHostStwRelease. 2: no
 // other thread can exist (the runtime never shared), no stop is needed.
@@ -1371,9 +1385,9 @@ trusted fun __ablaRuntimeHostStwStop(): int {
             if (other != me) {
                 others = others + 1
                 val state = ablaRuntimeAtomicLoadI64(other + 24)
-                var isParked = state == token
+                var isParked = state == token || state == -2 - token
                 if (!isParked && state == -1) {
-                    isParked = ablaRuntimeAtomicCompareExchangeI64(other + 24, -1, token) == -1
+                    isParked = ablaRuntimeAtomicCompareExchangeI64(other + 24, -1, -2 - token) == -1
                 }
                 if (ablaRuntimeLoadI64(ablaRuntimeLoadI64(other + 8) + 8) != 0) {
                     // A thread in a region never parks.
@@ -1394,6 +1408,9 @@ trusted fun __ablaRuntimeHostStwStop(): int {
             val number = ablaRuntimeLoadI64(blocker + 16)
             __ablaRuntimeFutexUnlock(stw + 8)
             if (reason == 2 || __ablaRuntimeHostStwMilliseconds() >= deadline) {
+                __ablaRuntimeFutexLock(stw + 8)
+                __ablaRuntimeHostStwUnclaim(token)
+                __ablaRuntimeFutexUnlock(stw + 8)
                 ablaRuntimeStoreI64(stw + 40, ablaRuntimeLoadI64(stw + 40) + 1)
                 if (__ablaRuntimeHostGcTrace) {
                     if (reason == 2) {
@@ -1425,6 +1442,7 @@ trusted fun __ablaRuntimeHostStwRelease(restore: bool): void {
     if (me == 0 || ablaRuntimeLoadI64(stw + 48) != me) return
     ablaRuntimeStoreI64(stw + 48, 0)
     if (restore) __ablaRuntimeHostCollectionThreshold = ablaRuntimeLoadI64(stw + 56)
+    __ablaRuntimeHostStwUnclaim(ablaRuntimeAtomicLoadI64(stw))
     __ablaRuntimeFutexUnlock(stw + 8)
     ablaRuntimeAtomicStoreI64(stw, ablaRuntimeAtomicLoadI64(stw) + 1)
     __ablaRuntimeFutexWake(stw, 2147483647)
@@ -3454,9 +3472,11 @@ trusted fun __ablaRuntimeHostGcStressConfigured(): bool {
 // byte threshold before resolving the thread-local region: the usual safe point
 // is below it, and needs neither that TLS lookup nor collection.
 trusted fun __ablaRuntimeMemoryPressure(): int {
-    if (!__ablaRuntimeHostCollectionEnabled ||
+    // With pressure collection off (manual collection) only a stop under way gets past here: it set the threshold to 0.
+    if ((!__ablaRuntimeHostCollectionEnabled && __ablaRuntimeHostCollectionThreshold != 0) ||
         __ablaRuntimeHostLiveBytes < __ablaRuntimeHostCollectionThreshold ||
         __ablaRuntimeHostRegionLoad() != 0) return 0
+    if (!__ablaRuntimeHostCollectionEnabled && (ablaRuntimeAtomicLoadI64(__ablaRuntimeHostStwAddress()) & 1) == 0) return 0
     __ablaRuntimeHostPressureCollect()
 }
 
