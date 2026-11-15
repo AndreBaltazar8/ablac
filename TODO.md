@@ -1121,7 +1121,7 @@ mmap form) apply there.
   native-build-roots **2**, operation-log-unit **31**, total **108**. The runner's
   raw result fields 53/24/3/31 include the first three PASS-summary lines;
   those are not extra assertions.
-- [ ] **Compiler GC trigger sensitivity at normalize → semantic.** A +0.84 MB parse
+- [x] **Compiler GC trigger sensitivity at normalize → semantic.** A +0.84 MB parse
   increase in the Xtensa routing source moves normalization across a collection:
   `parse.normalize.end` is about 339 MB before, 168 MB after. High runs already
   retain another 50–60 MB before annotations (253–257 MB versus 196–200 MB),
@@ -1158,6 +1158,14 @@ mmap form) apply there.
   1,562,972 to 1,573,004; change 1,462,208, 1,463,188 and 1,465,028 (3 runs) and seven from 1,557,584 to 1,571,036.
   So the ~55 MB the high mode keeps is not the probe's dead state: it is live at the crossing, inside the stage's
   own analysis, which a narrower scope cannot release.
+  Re-measured 2026-11-15 (master `6409ecd4` + #814's names-off/editor commits; `--emit-llvm` of this tree's
+  `src/orc_main.ab`, absolute path, `taskset -c 0-7`, machine load 5-25): the bimodality is not
+  there any more. The compiler of master before those commits, 10 runs: 1,721,716-1,742,524 KiB (a 1.2% spread,
+  one mode). With them, 24 runs: 1,559,232-1,600,560 KiB (2.6%, continuous, no gap near the ~55 MB the high mode
+  used to add: 23 of the 24 within 1,559,000-1,590,000). Not isolated, but the likely reason: the semantic identities (a string with the source path
+  per name occurrence and per local) were a large part of what the stage holds, and with them gone the
+  stage no longer moves the peak between two levels. No collection placement change tried or kept
+  (nothing to fix; `gc-pre-overloads` stays unused). Closed; reopen if a run spread over 5% shows again.
 - **Peak RSS swings with where a collection falls in the program's phases, not with the trigger (#677,
   recorded as a no-go for a trigger or marking fix).** (2026-11-09, master `0eaf983e`, branch
   `gc-schedule`.) `tests/benchmarks/json-megabyte.ab` at 170000, same binary and input: 912 MB in
