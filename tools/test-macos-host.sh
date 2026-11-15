@@ -58,6 +58,11 @@ cmp "$output_directory/portable-io.expected" \
     --fast -o "$output_directory/unix-stream"
 expect_status_42 "$output_directory/unix-stream"
 
+# RSA keys load and sign with the target's own random source (a guard on x86-64 alone failed every private operation here).
+"$compiler" build "$project_root/tests/cases/rsa-default-random/main.ab" \
+    --fast -o "$output_directory/rsa-default-random"
+expect_status_42 "$output_directory/rsa-default-random"
+
 # Includes IPv4/IPv6, Unix, event and TLS request peer metadata.
 "$project_root/tools/test-http-peer.sh" "$compiler"
 

@@ -20,7 +20,7 @@ tests/cases/libc-imports/tasks.ab tests/cases/libc-imports/threads.ab'
 checks='tests/cases/linux-syscall/main.ab tests/cases/linux-syscall/legacy.ab tests/cases/linux-syscall/epoll.ab
 tests/cases/modules/http-client.ab
 tests/cases/linux-syscall/random.ab tests/cases/linux-syscall/wide.ab tests/cases/linux-syscall/int128.ab tests/cases/linux-syscall/memory.ab
-tests/cases/libc-memory-routines/main.ab'
+tests/cases/libc-memory-routines/main.ab tests/cases/rsa-default-random/main.ab'
 for source in $programs $checks; do
     name=$(basename "$source" .ab)-$(basename "$(dirname "$source")")
     for mode in release fast; do
