@@ -178,7 +178,7 @@ mmap form) apply there.
 
 ## Shared-library exports (#811)
 
-- [ ] **Stop-the-world collection, steps (ii) to (iv) (#811).** Step (i) is in: threads register a record, a
+- [ ] **Stop-the-world collection, steps (ii) to (iv) (#811; owner ablac-4e, on step (ii)).** Step (i) is in: threads register a record, a
   collection parks the others at their next safe point (byte threshold 0) and marks every chain, on Linux for
   a program's threads and a library's callers; `tools/test-gc-threads.sh`. Still open: (ii) a thread blocked
   in I/O, a lock or a sleep never parks, so the collection is abandoned after 20 ms (classify those calls as native
