@@ -894,7 +894,7 @@ mmap form) apply there.
   read is two loads, and the compiler adds a null test and tag checks around them that move with its inlining. (3) A
   field is public by the language's design, but nothing in the object file says which loads are fields, so a "public
   length" would be typed by hand and checked against nothing. What stays instead: the type system keeps secrets out of
-  these functions (no branch, index or division from a secret, `declassify` the only way out), `crypto-source-fixtures.py`
+  these functions (no branch, index or division from a secret, `declassify` the only way out), `tools/ct/fixtures/source.ab`
   hashes their text so a change there is a reviewed one and asserts there is no `declassify` in it, and the entry
   above takes the allocation out of the part that is read. Revisit only if the constructor's pressure and layout checks move into the shared object-block function and that function gets a
   stable mark for another reason.
