@@ -1,0 +1,139 @@
+// ML-KEM-768 (abla/crypto/mlkem) against the NIST ACVP known answers in tests/vectors/crypto/mlkem768/vectors.txt (key generation
+// from the seeds, encapsulation with the message, decapsulation including the ciphertexts that were altered, the two key
+// checks of FIPS 203 7.2 and 7.3), then what the vectors do not say: the reciprocal that Compress multiplies by is exact for every
+// input, a flipped bit anywhere gives the implicit-rejection secret (a different, repeatable one), the keys round trip with
+// random messages, a key with a coefficient of q or above is refused, wrong sizes are refused. Argument 0 is the vectors' directory.
+// Prints "crypto-pure mlkem ok" and the counts.
+import "abla/crypto"
+import "abla/crypto/mlkem"
+import "abla/crypto/rsa"
+import "abla/fs"
+import "abla/io"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/sys/linux/random"
+import "abla/text"
+
+var failures = 0
+
+fun expect(ok: bool, what: string): void {
+    if (!ok) {
+        failures = failures + 1
+        if (failures < 400) println("FAIL $what")
+    }
+    return
+}
+
+fun flip(value: string, at: int, mask: int): string {
+    val bytes: array<int> = []
+    for (i in 0 until value.size) bytes.append(int(value[i]))
+    bytes[at] = bytes[at] ^ mask
+    cryptoByteString(bytes)
+}
+
+/** `ek` with its first 12-bit coefficient set to `value`. */
+fun withFirstCoefficient(ek: string, value: int): string =
+    cryptoByteString([value & 255, (int(ek[1]) & 240) | (value >> 8)]) + ek.slice(2, ek.size)
+
+/** `ek` with its second 12-bit coefficient set to `value`. */
+fun withSecondCoefficient(ek: string, value: int): string =
+    ek.slice(0, 1) + cryptoByteString([(int(ek[1]) & 15) | ((value & 15) << 4), value >> 4]) + ek.slice(3, ek.size)
+
+fun reciprocal(): void {
+    for (d in [1, 4, 10, 11]) {
+        for (x in 0 until 3329) {
+            val t = (x << d) + 1664
+            expect(((t * MLKEM_COMPRESS_RECIPROCAL) >> 40) == t / 3329, "the reciprocal of q is not exact at x = $x, d = $d")
+        }
+    }
+    return
+}
+
+fun vectors(directory: string): void {
+    var keygens = 0
+    var encaps = 0
+    var decaps = 0
+    var checks = 0
+    var rejected = 0
+    for (line in Path(directory + "/mlkem768/vectors.txt").readText().split("\n")) {
+        val f = line.split(" ")
+        if (f.size < 4) continue
+        val kind = f[0]
+        val id = f[1]
+        if (kind == "keygen") {
+            val made = mlkem768KeyGenFromSeeds(hexDecode(f[2]), hexDecode(f[3]))
+            expect(made.ok && hexEncode(made.bytes) == f[5], "keygen $id: the decapsulation key")
+            expect(hexEncode(mlkem768EncapsulationKey(made.bytes)) == f[4], "keygen $id: the encapsulation key")
+            keygens = keygens + 1
+        } else if (kind == "encaps") {
+            val e = mlkem768EncapsulateWithMessage(hexDecode(f[2]), hexDecode(f[3]))
+            expect(e.ok && hexEncode(e.ciphertext) == f[4] && hexEncode(e.sharedSecret) == f[5], "encaps $id")
+            encaps = encaps + 1
+        } else if (kind == "decaps") {
+            val r = mlkem768Decapsulate(hexDecode(f[2]), hexDecode(f[3]))
+            expect(r.ok && hexEncode(r.bytes) == f[4], "decaps $id")
+            decaps = decaps + 1
+        } else if (kind == "ekcheck") {
+            expect(mlkem768CheckEncapsulationKey(hexDecode(f[2])) == (f[3] == "true"), "ekcheck $id")
+            checks = checks + 1
+        } else if (kind == "dkcheck") {
+            val key = hexDecode(f[2])
+            expect(mlkem768CheckDecapsulationKey(key) == (f[3] == "true"), "dkcheck $id")
+            if (f[3] != "true") {
+                expect(!mlkem768Decapsulate(key, "".padEnd(1088, "a")).ok, "decaps with a bad dk $id")
+                rejected = rejected + 1
+            }
+            checks = checks + 1
+        }
+    }
+    expect(keygens == 25 && encaps == 25 && decaps == 10 && checks == 20, "the vector counts: $keygens $encaps $decaps $checks")
+    println("vectors: $keygens keygen, $encaps encaps, $decaps decaps, $checks checks, $rejected bad dk refused")
+    return
+}
+
+fun roundTrips(): void {
+    cryptoSetRandom({ count: int -> secureRandomBytes(count).bytes })
+    for (round in 0 until 6) {
+        val key = mlkem768GenerateKey()
+        expect(key.ok && key.bytes.size == 2400 && mlkem768CheckDecapsulationKey(key.bytes), "generated key")
+        if (!key.ok) continue
+        val ek = mlkem768EncapsulationKey(key.bytes)
+        expect(mlkem768CheckEncapsulationKey(ek), "generated ek")
+        val e = mlkem768Encapsulate(ek)
+        expect(e.ok && e.ciphertext.size == 1088 && e.sharedSecret.size == 32, "encapsulation")
+        val d = mlkem768Decapsulate(key.bytes, e.ciphertext)
+        expect(d.ok && d.bytes == e.sharedSecret, "round trip $round")
+        // A ciphertext altered at the start, the middle and the end gives another secret, the same one each time.
+        for (at in [0, 319, 320, 960, 1000, 1087]) {
+            val bad = flip(e.ciphertext, at, 1 + (round % 7))
+            val once = mlkem768Decapsulate(key.bytes, bad)
+            val twice = mlkem768Decapsulate(key.bytes, bad)
+            expect(once.ok && once.bytes.size == 32 && once.bytes != e.sharedSecret, "implicit rejection at byte $at")
+            expect(once.bytes == twice.bytes, "implicit rejection is repeatable at byte $at")
+        }
+        // The key in the bytes of another decapsulation key's z: the secret of a good ciphertext does not change.
+        val other = mlkem768Decapsulate(flip(key.bytes, 2380, 255), e.ciphertext)
+        expect(other.ok && other.bytes == e.sharedSecret, "z is used only for rejection")
+        // A coefficient of q or above in ek is refused; so are wrong sizes.
+        val badEk = ek.slice(0, 1000) + "\xff\xff\xff" + ek.slice(1003, 1184)
+        expect(!mlkem768Encapsulate(badEk).ok, "an ek with a coefficient above q")
+        // The check is "below q": 3329 in the first coefficient is refused, 3328 is not.
+        expect(!mlkem768CheckEncapsulationKey(withFirstCoefficient(ek, 3329)), "an ek with the coefficient q")
+        expect(mlkem768CheckEncapsulationKey(withFirstCoefficient(ek, 3328)), "an ek with the coefficient q - 1")
+        expect(!mlkem768CheckEncapsulationKey(withSecondCoefficient(ek, 3329)), "an ek with its second coefficient q")
+        expect(mlkem768CheckEncapsulationKey(withSecondCoefficient(ek, 3328)), "an ek with its second coefficient q - 1")
+        expect(!mlkem768Encapsulate(ek.slice(0, 1183)).ok, "a short ek")
+        expect(!mlkem768Decapsulate(key.bytes, e.ciphertext.slice(0, 1087)).ok, "a short ciphertext")
+        expect(!mlkem768Decapsulate(key.bytes.slice(0, 2399), e.ciphertext).ok, "a short dk")
+    }
+    return
+}
+
+fun main: int {
+    reciprocal()
+    vectors(processArgument(0))
+    roundTrips()
+    if (failures > 0) return 1
+    println("crypto-pure mlkem ok")
+    0
+}

@@ -1,0 +1,537 @@
+// ML-KEM-768 (FIPS 203), the key-encapsulation mechanism of the hybrid TLS 1.3 key exchange X25519MLKEM768, in Abla, with no
+// OpenSSL, on every target. Parameters: k = 3, eta1 = eta2 = 2, du = 10, dv = 4; an encapsulation key is 1184 bytes, a
+// decapsulation key 2400 (dkPKE || ek || H(ek) || z), a ciphertext 1088, a shared secret 32.
+//
+// What is secret and how it is handled:
+//  - The private values are the seeds d and z, the secret vector s, the noise e, y, e1, e2, the message m, the shared secret
+//    and the decapsulation key. Every coefficient of them is a `secretU32` in memory (256 words a polynomial), and the
+//    arithmetic mod q = 3329 is Montgomery's with R = 2^16: multiplications, additions, shifts and masks, no division, no branch
+//    and no table indexed by a coefficient (the zeta tables are read at public positions). The reduction is a mask-select of q.
+//    Compress is a multiplication by the reciprocal of q at 2^-40 (exact for every input of the range: tests/cases/crypto-pure/mlkem.ab
+//    checks all 3329 values against the division), decompress a multiply and a shift. Packing walks every bit position.
+//  - Decapsulation re-encrypts the message it found and compares the whole ciphertext in constant time (OR of the differences),
+//    then picks the shared secret or the implicit-rejection secret J(z || c) by a mask, so a modified ciphertext is
+//    indistinguishable from a good one by time or by branch (FIPS 203 algorithm 18).
+//  - Public, and branched on: the matrix A (sampled from the public rho with rejection sampling: which bytes are kept is
+//    a property of rho, not of a secret), the lengths, the encapsulation key's contents when it is checked (FIPS 203 7.2).
+//  - Keccak (abla/crypto/sha3) is constant time by construction.
+// tools/test-ct.sh reads the functions between the BEGIN and END lines below as written. Strings (seeds, messages, shared
+// secrets) cannot be wiped, so what a string held stays in memory until it is collected, as with every key in abla/crypto; the
+// polynomials, the arena and the sponge states are wiped when the call ends.
+
+import "abla/crypto"
+import "abla/crypto/alloc"
+import "abla/crypto/rsa"
+import "abla/crypto/sha3"
+import "abla/ct"
+import "abla/ct/scrub"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+import "abla/unsafe/mmio"
+export import "abla/crypto/result"
+
+val MLKEM768_ENCAPSULATION_KEY_SIZE = 1184
+val MLKEM768_DECAPSULATION_KEY_SIZE = 2400
+val MLKEM768_CIPHERTEXT_SIZE = 1088
+val MLKEM_SHARED_SECRET_SIZE = 32
+/** ceil(2^40 / 3329): Compress multiplies by it and shifts right by 40; exact for every x 2^d + 1664 below 2^28 (the test checks the range used). */
+val MLKEM_COMPRESS_RECIPROCAL = 330282857
+
+// BEGIN MLKEM SECRET CORE
+// The zeta^BitRev7(i) (the NTT's) and zeta^(2 BitRev7(i) + 1) (the base case's) for i = 0..127, with zeta = 17, each times
+// R = 2^16 mod 3329, as 16-bit little endian.
+@inline trusted fun mlkemZetas(): int =
+    nativeStaticBytes("\xed\x08\x0b\x0a\x9a\x0b\x14\x07\xd5\x05\x8e\x05\x1f\x01\xca\x00\x56\x0c\x6e\x02\x29\x06\xb6\x00\xc2\x03\x4f\x08\x3f\x07\xbc\x05\x3d\x02\xd4\x07\x08\x01\x7f\x01\xc4\x09\xb2\x05\xbf\x06\x7f\x0c\x58\x0a\xf9\x03\xdc\x02\x60\x02\xfb\x06\x9b\x01\x34\x0c\xde\x06\xc7\x04\x8c\x02\xd9\x0a\xf7\x03\xf4\x07\xd3\x05\xe7\x0b\xf9\x06\x04\x02\xf9\x0c\xc1\x0b\x67\x0a\xaf\x06\x77\x08\x7e\x00\xbd\x05\xac\x09\xa7\x0c\xf2\x0b\x3e\x03\x6b\x00\x74\x07\x0a\x0c\x4a\x09\x73\x0b\xc1\x03\x1d\x07\x2c\x0a\xc0\x01\xd8\x08\xa5\x02\x06\x08\xb2\x08\xae\x01\x2b\x02\x4b\x03\x1e\x08\x67\x03\x0e\x06\x69\x00\xa6\x01\x4b\x02\xb1\x00\x16\x0c\xde\x0b\x35\x0b\x26\x06\x75\x06\x0b\x0c\x0a\x03\x87\x04\x6e\x0c\xf8\x09\xcb\x05\xa7\x0a\x5f\x04\xcb\x06\x84\x02\x99\x09\x5d\x01\xa2\x01\x49\x01\x65\x0c\xb6\x0c\x31\x03\x49\x04\x5b\x02\x62\x02\x2a\x05\xfc\x07\x48\x07\x80\x01\x42\x08\x79\x0c\xc2\x04\xca\x07\x97\x09\xdc\x00\x5e\x08\x86\x06\x60\x08\x07\x07\x03\x08\x1a\x03\x1b\x07\xab\x09\x9b\x09\xde\x01\x95\x0c\xcd\x0b\xe4\x03\xdf\x03\xbe\x03\x4d\x07\xf2\x05\x5c\x06")
+@inline trusted fun mlkemGammas(): int =
+    nativeStaticBytes("\xb2\x08\x4f\x04\xae\x01\x53\x0b\x2b\x02\xd6\x0a\x4b\x03\xb6\x09\x1e\x08\xe3\x04\x67\x03\x9a\x09\x0e\x06\xf3\x06\x69\x00\x98\x0c\xa6\x01\x5b\x0b\x4b\x02\xb6\x0a\xb1\x00\x50\x0c\x16\x0c\xeb\x00\xde\x0b\x23\x01\x35\x0b\xcc\x01\x26\x06\xdb\x06\x75\x06\x8c\x06\x0b\x0c\xf6\x00\x0a\x03\xf7\x09\x87\x04\x7a\x08\x6e\x0c\x93\x00\xf8\x09\x09\x03\xcb\x05\x36\x07\xa7\x0a\x5a\x02\x5f\x04\xa2\x08\xcb\x06\x36\x06\x84\x02\x7d\x0a\x99\x09\x68\x03\x5d\x01\xa4\x0b\xa2\x01\x5f\x0b\x49\x01\xb8\x0b\x65\x0c\x9c\x00\xb6\x0c\x4b\x00\x31\x03\xd0\x09\x49\x04\xb8\x08\x5b\x02\xa6\x0a\x62\x02\x9f\x0a\x2a\x05\xd7\x07\xfc\x07\x05\x05\x48\x07\xb9\x05\x80\x01\x81\x0b\x42\x08\xbf\x04\x79\x0c\x88\x00\xc2\x04\x3f\x08\xca\x07\x37\x05\x97\x09\x6a\x03\xdc\x00\x25\x0c\x5e\x08\xa3\x04\x86\x06\x7b\x06\x60\x08\xa1\x04\x07\x07\xfa\x05\x03\x08\xfe\x04\x1a\x03\xe7\x09\x1b\x07\xe6\x05\xab\x09\x56\x03\x9b\x09\x66\x03\xde\x01\x23\x0b\x95\x0c\x6c\x00\xcd\x0b\x34\x01\xe4\x03\x1d\x09\xdf\x03\x22\x09\xbe\x03\x43\x09\x4d\x07\xb4\x05\xf2\x05\x0f\x07\x5c\x06\xa5\x06")
+
+@inline trusted fun mlkemLoad(address: int): secretU32 =
+    secretU32(u32(ablaUnsafeLoadU32(nativePointerFromAddress(address))))
+@inline trusted fun mlkemStore(address: int, value: secretU32): void =
+    ablaUnsafeStoreU32(nativePointerFromAddress(address), int(value.declassify()))
+@inline trusted fun mlkemLoadByte(address: int): secretU32 =
+    secretU32(u32(ablaUnsafeLoadU8(nativePointerFromAddress(address))))
+@inline trusted fun mlkemStoreByte(address: int, value: secretU32): void =
+    ablaUnsafeStoreU8(nativePointerFromAddress(address), int(value.declassify()))
+@inline trusted fun mlkemTable(table: int, index: int): secretU32 =
+    secretU32(u32(ablaUnsafeLoadU16(nativePointerFromAddress(table + index * 2))))
+@inline fun mlkemConstant(value: int): secretU32 = secretU32(u32(value))
+
+/** `x` - q where that does not go below zero: for x below 2q, the value mod q. */
+@inline fun mlkemSubQ(x: secretU32): secretU32 {
+    val difference = x - mlkemConstant(3329)
+    difference + (mlkemConstant(3329) & (mlkemConstant(0) - (difference >> 31)))
+}
+@inline fun mlkemAdd(a: secretU32, b: secretU32): secretU32 = mlkemSubQ(a + b)
+@inline fun mlkemSub(a: secretU32, b: secretU32): secretU32 = mlkemSubQ(a + mlkemConstant(3329) - b)
+/** Montgomery's reduction of `x` (below q * 2^16): x / 2^16 mod q, canonical. */
+@inline fun mlkemReduce(x: secretU32): secretU32 {
+    val m = ((x & mlkemConstant(65535)) * mlkemConstant(3327)) & mlkemConstant(65535)
+    mlkemSubQ((x + m * mlkemConstant(3329)) >> 16)
+}
+/** a * b / 2^16 mod q, for a and b in 0..q-1. */
+@inline fun mlkemMultiply(a: secretU32, b: secretU32): secretU32 = mlkemReduce(a * b)
+
+/** The forward number-theoretic transform (algorithm 9) of the polynomial at `a`, in place. */
+@noinline trusted fun mlkemNtt(a: int): void {
+    val zetas = mlkemZetas()
+    var k = 1
+    var length = 128
+    while (length >= 2) {
+        var start = 0
+        while (start < 256) {
+            val zeta = mlkemTable(zetas, k)
+            k = k + 1
+            for (j in start until start + length) {
+                val t = mlkemMultiply(zeta, mlkemLoad(a + (j + length) * 4))
+                val x = mlkemLoad(a + j * 4)
+                mlkemStore(a + (j + length) * 4, mlkemSub(x, t))
+                mlkemStore(a + j * 4, mlkemAdd(x, t))
+            }
+            start = start + 2 * length
+        }
+        length = length >> 1
+    }
+}
+
+/** The inverse transform (algorithm 10), in place, of a polynomial that came out of `mlkemBasemulAdd` (every coefficient
+ *  is its value / 2^16): the last step multiplies by 2^16 / 128, which gives the true polynomial. */
+@noinline trusted fun mlkemInvNtt(a: int): void {
+    val zetas = mlkemZetas()
+    var k = 127
+    var length = 2
+    while (length <= 128) {
+        var start = 0
+        while (start < 256) {
+            val zeta = mlkemTable(zetas, k)
+            k = k - 1
+            for (j in start until start + length) {
+                val t = mlkemLoad(a + j * 4)
+                val y = mlkemLoad(a + (j + length) * 4)
+                mlkemStore(a + j * 4, mlkemAdd(t, y))
+                mlkemStore(a + (j + length) * 4, mlkemMultiply(zeta, mlkemSub(y, t)))
+            }
+            start = start + 2 * length
+        }
+        length = length << 1
+    }
+    for (j in 0 until 256) mlkemStore(a + j * 4, mlkemMultiply(mlkemLoad(a + j * 4), mlkemConstant(1441)))
+}
+
+/** r = r + a * b in the transform's domain (algorithm 11, with the sum of the matrix product's terms folded in). Every
+ *  product comes out divided by 2^16; `mlkemScale` or `mlkemInvNtt` takes that out. */
+@noinline trusted fun mlkemBasemulAdd(r: int, a: int, b: int): void {
+    val gammas = mlkemGammas()
+    for (i in 0 until 128) {
+        val a0 = mlkemLoad(a + i * 8)
+        val a1 = mlkemLoad(a + i * 8 + 4)
+        val b0 = mlkemLoad(b + i * 8)
+        val b1 = mlkemLoad(b + i * 8 + 4)
+        val c0 = mlkemMultiply(a0, b0) + mlkemMultiply(mlkemMultiply(a1, b1), mlkemTable(gammas, i))
+        val c1 = mlkemMultiply(a0, b1) + mlkemMultiply(a1, b0)
+        mlkemStore(r + i * 8, mlkemAdd(mlkemLoad(r + i * 8), mlkemSubQ(c0)))
+        mlkemStore(r + i * 8 + 4, mlkemAdd(mlkemLoad(r + i * 8 + 4), mlkemSubQ(c1)))
+    }
+}
+
+/** The polynomial at `a` times 2^16 (the Montgomery domain's factor out of a sum of `mlkemBasemulAdd`s). */
+@noinline trusted fun mlkemScale(a: int): void {
+    for (j in 0 until 256) mlkemStore(a + j * 4, mlkemMultiply(mlkemLoad(a + j * 4), mlkemConstant(1353)))
+}
+
+@noinline trusted fun mlkemZero(a: int): void {
+    for (j in 0 until 256) mlkemStore(a + j * 4, mlkemConstant(0))
+}
+
+/** r = a + b. `r` may be either. */
+@noinline trusted fun mlkemPolyAdd(r: int, a: int, b: int): void {
+    for (j in 0 until 256) mlkemStore(r + j * 4, mlkemAdd(mlkemLoad(a + j * 4), mlkemLoad(b + j * 4)))
+}
+
+/** r = a - b. `r` may be either. */
+@noinline trusted fun mlkemPolySub(r: int, a: int, b: int): void {
+    for (j in 0 until 256) mlkemStore(r + j * 4, mlkemSub(mlkemLoad(a + j * 4), mlkemLoad(b + j * 4)))
+}
+
+/** The centered binomial distribution, eta = 2 (algorithm 8), from the 128 bytes at `bytes` (a PRF's output). */
+@noinline trusted fun mlkemCbd2(poly: int, bytes: int): void {
+    for (i in 0 until 256) {
+        val nibble = (mlkemLoadByte(bytes + (i >> 1)) >> ((i & 1) * 4)) & mlkemConstant(15)
+        val a = (nibble & mlkemConstant(1)) + ((nibble >> 1) & mlkemConstant(1))
+        val b = ((nibble >> 2) & mlkemConstant(1)) + (nibble >> 3)
+        mlkemStore(poly + i * 4, mlkemSubQ(a + mlkemConstant(3329) - b))
+    }
+}
+
+/** Compress_d in place (4.7): round(2^d x / q) mod 2^d, as (x 2^d + 1664) / q by a multiplication by ceil(2^40 / q). */
+@noinline trusted fun mlkemCompress(poly: int, d: int): void {
+    val reciprocal = secretU64(u64(MLKEM_COMPRESS_RECIPROCAL))
+    val mask = mlkemConstant((1 << d) - 1)
+    for (j in 0 until 256) {
+        val t = ((mlkemLoad(poly + j * 4) << d) + mlkemConstant(1664)).widen()
+        mlkemStore(poly + j * 4, ((t * reciprocal) >> 40).low() & mask)
+    }
+}
+
+/** Decompress_d in place: round(q y / 2^d). */
+@noinline trusted fun mlkemDecompress(poly: int, d: int): void {
+    for (j in 0 until 256) {
+        mlkemStore(poly + j * 4, (mlkemLoad(poly + j * 4) * mlkemConstant(3329) + mlkemConstant(1 << (d - 1))) >> d)
+    }
+}
+
+/** ByteEncode_d: the polynomial's 256 coefficients of d bits (the low d bits of each word) into 32 d bytes. */
+@noinline trusted fun mlkemPack(out: int, poly: int, d: int): void {
+    for (i in 0 until 32 * d) mlkemStoreByte(out + i, mlkemConstant(0))
+    for (i in 0 until 256) {
+        val x = mlkemLoad(poly + i * 4)
+        for (b in 0 until d) {
+            val at = i * d + b
+            val bit = (x >> b) & mlkemConstant(1)
+            mlkemStoreByte(out + (at >> 3), mlkemLoadByte(out + (at >> 3)) | (bit << (at & 7)))
+        }
+    }
+}
+
+/** ByteDecode_d: 32 d bytes into 256 coefficients of d bits. */
+@noinline trusted fun mlkemUnpack(poly: int, bytes: int, d: int): void {
+    for (i in 0 until 256) {
+        var x = mlkemConstant(0)
+        for (b in 0 until d) {
+            val at = i * d + b
+            x = x | (((mlkemLoadByte(bytes + (at >> 3)) >> (at & 7)) & mlkemConstant(1)) << b)
+        }
+        mlkemStore(poly + i * 4, x)
+    }
+}
+
+/** Decompress_1 of the message's 256 bits: each is 0 or round(q / 2) = 1665. */
+@noinline trusted fun mlkemMessageToPoly(poly: int, message: int): void {
+    for (i in 0 until 256) {
+        val bit = (mlkemLoadByte(message + (i >> 3)) >> (i & 7)) & mlkemConstant(1)
+        mlkemStore(poly + i * 4, (mlkemConstant(0) - bit) & mlkemConstant(1665))
+    }
+}
+
+/** The decapsulation's end: `out` (32 bytes) is `good` where the ciphertext `c` and the re-encrypted one `c2` (`count`
+ *  bytes) agree on every byte, and `bad` where they differ in any. The comparison reads every byte and the choice is a mask. */
+@noinline trusted fun mlkemSelect(out: int, good: int, bad: int, c: int, c2: int, count: int): void {
+    var difference = mlkemConstant(0)
+    for (i in 0 until count) difference = difference | (mlkemLoadByte(c + i) ^ mlkemLoadByte(c2 + i))
+    val different = ctIsNonZero(difference)
+    for (i in 0 until 32) mlkemStoreByte(out + i, ctSelect(different, mlkemLoadByte(bad + i), mlkemLoadByte(good + i)))
+}
+// END MLKEM SECRET CORE
+
+// ---- The algorithms, on addresses ----
+// One arena for each operation: eight polynomials of 1024 bytes (0..8192), then byte buffers at the offsets below. Wiped and freed
+// at the end of the operation.
+private val MLKEM_POLY = 1024
+private val MLKEM_ARENA = 12288
+private val MLKEM_HASH = 8192       // 64 bytes: G's output (rho, sigma) or (K, r)
+private val MLKEM_PRF = 8256        // 128 bytes: a PRF output
+private val MLKEM_XOF = 8384        // 168 bytes: a block of SHAKE128 output
+private val MLKEM_TEXT = 8576       // 40 bytes: absorbed text with its indices
+private val MLKEM_MESSAGE = 8640    // 32 bytes: the message m
+private val MLKEM_KEY = 8672        // 32 bytes: K or K-bar
+private val MLKEM_RESULT = 8704     // 32 bytes: the decapsulation's result
+private val MLKEM_CIPHERTEXT = 8768 // 1088 bytes: the ciphertext c' of a re-encryption
+private val MLKEM_Q = 3329
+
+private trusted fun mlkemWipe(address: int, size: int): void {
+    for (i in 0 until size) ablaUnsafeVolatileStoreU8(address + i, 0)
+}
+
+private trusted fun mlkemFill(address: int, text: string): void {
+    ablaUnsafeCopyMemory(address, ablaUnsafeStringAddress(text), text.size)
+}
+
+private trusted fun mlkemBytes(address: int, count: int): string {
+    val bytes: array<int> = []
+    for (i in 0 until count) bytes.append(ablaUnsafeLoadU8(nativePointerFromAddress(address + i)))
+    cryptoByteString(bytes)
+}
+
+/** SHA3-512 (G) of the `count` bytes at `input` into `out` (64 bytes). */
+private trusted fun mlkemG(input: int, count: int, out: int): void {
+    var sponge = keccakSha3(72)
+    sponge.absorbAt(input, count)
+    sponge.squeezeTo(out, 64)
+    sponge.close()
+}
+
+/** SHA3-256 (H) of the `count` bytes at `input` into `out` (32 bytes). */
+private trusted fun mlkemH(input: int, count: int, out: int): void {
+    var sponge = keccakSha3(136)
+    sponge.absorbAt(input, count)
+    sponge.squeezeTo(out, 32)
+    sponge.close()
+}
+
+/** PRF_eta (eta = 2): SHAKE256 of the 32 bytes at `seed` and the byte `counter`, 128 bytes into `out`. */
+private trusted fun mlkemPrf(seed: int, counter: int, text: int, out: int): void {
+    ablaUnsafeStoreU8(nativePointerFromAddress(text), counter)
+    var sponge = keccakShake256()
+    sponge.absorbAt(seed, 32)
+    sponge.absorbAt(text, 1)
+    sponge.squeezeTo(out, 128)
+    sponge.close()
+}
+
+/** SampleNTT (algorithm 7) from XOF(rho, j, i): a polynomial of the transform's domain by rejection, which is public (rho is). */
+private trusted fun mlkemSampleNtt(rho: int, i: int, j: int, poly: int, text: int, block: int): void {
+    ablaUnsafeCopyMemory(text, rho, 32)
+    ablaUnsafeStoreU8(nativePointerFromAddress(text + 32), j)
+    ablaUnsafeStoreU8(nativePointerFromAddress(text + 33), i)
+    var sponge = keccakShake128()
+    sponge.absorbAt(text, 34)
+    var count = 0
+    while (count < 256) {
+        sponge.squeezeTo(block, 168)
+        var at = 0
+        while (at < 168 && count < 256) {
+            val b0 = ablaUnsafeLoadU8(nativePointerFromAddress(block + at))
+            val b1 = ablaUnsafeLoadU8(nativePointerFromAddress(block + at + 1))
+            val b2 = ablaUnsafeLoadU8(nativePointerFromAddress(block + at + 2))
+            val d1 = b0 + 256 * (b1 & 15)
+            val d2 = (b1 >> 4) + 16 * b2
+            if (d1 < MLKEM_Q) {
+                ablaUnsafeStoreU32(nativePointerFromAddress(poly + count * 4), d1)
+                count = count + 1
+            }
+            if (d2 < MLKEM_Q && count < 256) {
+                ablaUnsafeStoreU32(nativePointerFromAddress(poly + count * 4), d2)
+                count = count + 1
+            }
+            at = at + 3
+        }
+    }
+    sponge.close()
+}
+
+/** K-PKE.KeyGen (algorithm 13) from the 32-byte seed at `seed`: the encapsulation key (1184 bytes) to `ek` and dkPKE (1152) to `dk`. */
+private trusted fun mlkemKeyGenWork(w: int, seed: int, ek: int, dk: int): void {
+    ablaUnsafeCopyMemory(w + MLKEM_TEXT, seed, 32)
+    ablaUnsafeStoreU8(nativePointerFromAddress(w + MLKEM_TEXT + 32), 3)
+    mlkemG(w + MLKEM_TEXT, 33, w + MLKEM_HASH)
+    val rho = w + MLKEM_HASH
+    val sigma = w + MLKEM_HASH + 32
+    for (i in 0 until 3) {
+        mlkemPrf(sigma, i, w + MLKEM_TEXT, w + MLKEM_PRF)
+        mlkemCbd2(w + i * MLKEM_POLY, w + MLKEM_PRF)
+        mlkemNtt(w + i * MLKEM_POLY)
+        mlkemPack(dk + i * 384, w + i * MLKEM_POLY, 12)
+    }
+    for (i in 0 until 3) {
+        val acc = w + 3 * MLKEM_POLY
+        val tmp = w + 4 * MLKEM_POLY
+        mlkemZero(acc)
+        for (j in 0 until 3) {
+            mlkemSampleNtt(rho, i, j, tmp, w + MLKEM_TEXT, w + MLKEM_XOF)
+            mlkemBasemulAdd(acc, tmp, w + j * MLKEM_POLY)
+        }
+        mlkemScale(acc)
+        mlkemPrf(sigma, 3 + i, w + MLKEM_TEXT, w + MLKEM_PRF)
+        mlkemCbd2(tmp, w + MLKEM_PRF)
+        mlkemNtt(tmp)
+        mlkemPolyAdd(acc, acc, tmp)
+        mlkemPack(ek + i * 384, acc, 12)
+    }
+    ablaUnsafeCopyMemory(ek + 1152, rho, 32)
+}
+
+/** K-PKE.Encrypt (algorithm 14): the 1088-byte ciphertext to `out`, of the message at `message` under the key at `ek` with the randomness at `r`. */
+private trusted fun mlkemEncryptWork(w: int, ek: int, message: int, r: int, out: int): void {
+    val rho = ek + 1152
+    val acc = w + 3 * MLKEM_POLY
+    val tmp = w + 4 * MLKEM_POLY
+    val noise = w + 5 * MLKEM_POLY
+    val t = w + 6 * MLKEM_POLY
+    for (i in 0 until 3) {
+        mlkemPrf(r, i, w + MLKEM_TEXT, w + MLKEM_PRF)
+        mlkemCbd2(w + i * MLKEM_POLY, w + MLKEM_PRF)
+        mlkemNtt(w + i * MLKEM_POLY)
+    }
+    for (i in 0 until 3) {
+        mlkemZero(acc)
+        for (j in 0 until 3) {
+            mlkemSampleNtt(rho, j, i, tmp, w + MLKEM_TEXT, w + MLKEM_XOF)
+            mlkemBasemulAdd(acc, tmp, w + j * MLKEM_POLY)
+        }
+        mlkemInvNtt(acc)
+        mlkemPrf(r, 3 + i, w + MLKEM_TEXT, w + MLKEM_PRF)
+        mlkemCbd2(noise, w + MLKEM_PRF)
+        mlkemPolyAdd(acc, acc, noise)
+        mlkemCompress(acc, 10)
+        mlkemPack(out + i * 320, acc, 10)
+    }
+    mlkemZero(acc)
+    for (j in 0 until 3) {
+        mlkemUnpack(t, ek + j * 384, 12)
+        mlkemBasemulAdd(acc, t, w + j * MLKEM_POLY)
+    }
+    mlkemInvNtt(acc)
+    mlkemPrf(r, 6, w + MLKEM_TEXT, w + MLKEM_PRF)
+    mlkemCbd2(noise, w + MLKEM_PRF)
+    mlkemPolyAdd(acc, acc, noise)
+    mlkemMessageToPoly(tmp, message)
+    mlkemPolyAdd(acc, acc, tmp)
+    mlkemCompress(acc, 4)
+    mlkemPack(out + 960, acc, 4)
+}
+
+/** K-PKE.Decrypt (algorithm 15): the 32-byte message to `message`, of the ciphertext at `c` under dkPKE at `dk`. */
+private trusted fun mlkemDecryptWork(w: int, dk: int, c: int, message: int): void {
+    val acc = w + 3 * MLKEM_POLY
+    val tmp = w + 4 * MLKEM_POLY
+    val s = w + 5 * MLKEM_POLY
+    for (i in 0 until 3) {
+        mlkemUnpack(w + i * MLKEM_POLY, c + i * 320, 10)
+        mlkemDecompress(w + i * MLKEM_POLY, 10)
+        mlkemNtt(w + i * MLKEM_POLY)
+    }
+    mlkemZero(acc)
+    for (i in 0 until 3) {
+        mlkemUnpack(s, dk + i * 384, 12)
+        mlkemBasemulAdd(acc, s, w + i * MLKEM_POLY)
+    }
+    mlkemInvNtt(acc)
+    mlkemUnpack(tmp, c + 960, 4)
+    mlkemDecompress(tmp, 4)
+    mlkemPolySub(acc, tmp, acc)
+    mlkemCompress(acc, 1)
+    mlkemPack(message, acc, 1)
+}
+
+private trusted fun mlkemOpen(): int {
+    val w = cryptoAllocate(MLKEM_ARENA)
+    mlkemWipe(w, MLKEM_ARENA)
+    w
+}
+
+private trusted fun mlkemClose(w: int): void {
+    mlkemWipe(w, MLKEM_ARENA)
+    ablaUnsafeFree(nativePointerFromAddress(w))
+}
+
+/** The 2400-byte decapsulation key (ML-KEM.KeyGen_internal, algorithm 16) from the seeds `d` and `z`, 32 bytes each. */
+private @noinline trusted fun mlkemKeyGenBody(d: string, z: string): string {
+    val w = mlkemOpen()
+    val dk = cryptoAllocate(MLKEM768_DECAPSULATION_KEY_SIZE)
+    mlkemKeyGenWork(w, ablaUnsafeStringAddress(d), dk + 1152, dk)
+    mlkemH(dk + 1152, 1184, dk + 2336)
+    ablaUnsafeCopyMemory(dk + 2368, ablaUnsafeStringAddress(z), 32)
+    val result = mlkemBytes(dk, MLKEM768_DECAPSULATION_KEY_SIZE)
+    mlkemWipe(dk, MLKEM768_DECAPSULATION_KEY_SIZE)
+    ablaUnsafeFree(nativePointerFromAddress(dk))
+    mlkemClose(w)
+    result
+}
+
+/** ML-KEM-768.KeyGen_internal: the decapsulation key from the 32-byte seeds `d` and `z`. */
+fun mlkem768KeyGenFromSeeds(d: string, z: string): CryptoResult {
+    if (d.size != 32 || z.size != 32) return cryptoFailed("ml-kem: the seeds are 32 bytes each")
+    val result = CryptoResult(mlkemKeyGenBody(d, z), true, "")
+    ctScrubStack4096()
+    result
+}
+
+/** A new key pair: the decapsulation key (2400 bytes, whose bytes 1152 to 2336 are the encapsulation key). */
+fun mlkem768GenerateKey(): CryptoResult {
+    val seeds = cryptoRandomBytes(64)
+    if (seeds.size != 64) return cryptoFailed("ml-kem: no random source here: call cryptoSetRandom")
+    mlkem768KeyGenFromSeeds(seeds.slice(0, 32), seeds.slice(32, 64))
+}
+
+/** The encapsulation key inside a decapsulation key. */
+fun mlkem768EncapsulationKey(decapsulationKey: string): string =
+    if (decapsulationKey.size == MLKEM768_DECAPSULATION_KEY_SIZE) decapsulationKey.slice(1152, 2336) else ""
+
+/** FIPS 203 section 7.2, the check of an encapsulation key: 1184 bytes, and every 12-bit value of the vector below q (the
+ *  decoding and re-encoding of the vector gives the bytes back). */
+trusted fun mlkem768CheckEncapsulationKey(key: string): bool {
+    if (key.size != MLKEM768_ENCAPSULATION_KEY_SIZE) return false
+    val at = ablaUnsafeStringAddress(key)
+    var i = 0
+    while (i < 1152) {
+        val b0 = ablaUnsafeLoadU8(nativePointerFromAddress(at + i))
+        val b1 = ablaUnsafeLoadU8(nativePointerFromAddress(at + i + 1))
+        val b2 = ablaUnsafeLoadU8(nativePointerFromAddress(at + i + 2))
+        if (b0 + 256 * (b1 & 15) >= MLKEM_Q || (b1 >> 4) + 16 * b2 >= MLKEM_Q) return false
+        i = i + 3
+    }
+    true
+}
+
+/** FIPS 203 section 7.3, the check of a decapsulation key: 2400 bytes, and the hash in it is the hash of the encapsulation key in it. */
+fun mlkem768CheckDecapsulationKey(key: string): bool {
+    if (key.size != MLKEM768_DECAPSULATION_KEY_SIZE) return false
+    sha3256(key.slice(1152, 2336)) == key.slice(2336, 2368)
+}
+
+/** (ciphertext, shared secret) of an encapsulation: `ok` false for a key that fails the check or a wrong length. */
+class MlkemEncapsulation(val ok: bool, val ciphertext: string, val sharedSecret: string, val error: string)
+
+private @noinline trusted fun mlkemEncapsulateBody(ek: string, m: string): MlkemEncapsulation {
+    val w = mlkemOpen()
+    val key = ablaUnsafeStringAddress(ek)
+    ablaUnsafeCopyMemory(w + MLKEM_MESSAGE, ablaUnsafeStringAddress(m), 32)
+    mlkemH(key, 1184, w + MLKEM_TEXT + 32)        // m || H(ek)
+    ablaUnsafeCopyMemory(w + MLKEM_TEXT, w + MLKEM_MESSAGE, 32)
+    mlkemG(w + MLKEM_TEXT, 64, w + MLKEM_HASH)    // K || r
+    val out = w + MLKEM_CIPHERTEXT
+    mlkemEncryptWork(w, key, w + MLKEM_MESSAGE, w + MLKEM_HASH + 32, out)
+    val result = MlkemEncapsulation(true, mlkemBytes(out, MLKEM768_CIPHERTEXT_SIZE), mlkemBytes(w + MLKEM_HASH, 32), "")
+    mlkemClose(w)
+    result
+}
+
+/** ML-KEM-768.Encaps_internal (algorithm 17) with the message `m` (32 random bytes). */
+fun mlkem768EncapsulateWithMessage(encapsulationKey: string, m: string): MlkemEncapsulation {
+    if (m.size != 32) return MlkemEncapsulation(false, "", "", "ml-kem: the message is 32 bytes")
+    if (!mlkem768CheckEncapsulationKey(encapsulationKey)) {
+        return MlkemEncapsulation(false, "", "", "ml-kem: the encapsulation key is not a valid ML-KEM-768 key")
+    }
+    val result = mlkemEncapsulateBody(encapsulationKey, m)
+    ctScrubStack4096()
+    result
+}
+
+/** ML-KEM-768.Encaps: a fresh message from the random source (see cryptoSetRandom). */
+fun mlkem768Encapsulate(encapsulationKey: string): MlkemEncapsulation {
+    val m = cryptoRandomBytes(32)
+    if (m.size != 32) return MlkemEncapsulation(false, "", "", "ml-kem: no random source here: call cryptoSetRandom")
+    mlkem768EncapsulateWithMessage(encapsulationKey, m)
+}
+
+private @noinline trusted fun mlkemDecapsulateBody(dk: string, c: string): string {
+    val w = mlkemOpen()
+    val key = ablaUnsafeStringAddress(dk)
+    val ct = ablaUnsafeStringAddress(c)
+    mlkemDecryptWork(w, key, ct, w + MLKEM_MESSAGE)
+    ablaUnsafeCopyMemory(w + MLKEM_TEXT, w + MLKEM_MESSAGE, 32)           // m' || h
+    ablaUnsafeCopyMemory(w + MLKEM_TEXT + 32, key + 2336, 32)
+    mlkemG(w + MLKEM_TEXT, 64, w + MLKEM_HASH)                           // K' || r'
+    // K-bar = J(z || c), SHAKE256.
+    var sponge = keccakShake256()
+    sponge.absorbAt(key + 2368, 32)
+    sponge.absorbAt(ct, MLKEM768_CIPHERTEXT_SIZE)
+    sponge.squeezeTo(w + MLKEM_KEY, 32)
+    sponge.close()
+    mlkemEncryptWork(w, key + 1152, w + MLKEM_MESSAGE, w + MLKEM_HASH + 32, w + MLKEM_CIPHERTEXT)
+    mlkemSelect(w + MLKEM_RESULT, w + MLKEM_HASH, w + MLKEM_KEY, ct, w + MLKEM_CIPHERTEXT, MLKEM768_CIPHERTEXT_SIZE)
+    val result = mlkemBytes(w + MLKEM_RESULT, 32)
+    mlkemClose(w)
+    result
+}
+
+/** ML-KEM-768.Decaps (algorithm 18): the shared secret. A ciphertext that was not made for this key gives a pseudorandom secret (implicit
+ *  rejection), not an error; only a wrong length or a key whose hash does not match is refused. */
+fun mlkem768Decapsulate(decapsulationKey: string, ciphertext: string): CryptoResult {
+    if (decapsulationKey.size != MLKEM768_DECAPSULATION_KEY_SIZE) return cryptoFailed("ml-kem: the decapsulation key is 2400 bytes")
+    if (ciphertext.size != MLKEM768_CIPHERTEXT_SIZE) return cryptoFailed("ml-kem: the ciphertext is 1088 bytes")
+    if (!mlkem768CheckDecapsulationKey(decapsulationKey)) return cryptoFailed("ml-kem: the decapsulation key fails its hash check")
+    val result = CryptoResult(mlkemDecapsulateBody(decapsulationKey, ciphertext), true, "")
+    ctScrubStack4096()
+    result
+}

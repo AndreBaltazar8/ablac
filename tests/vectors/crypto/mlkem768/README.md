@@ -2,7 +2,7 @@
 
 Source: NIST ACVP-Server, https://github.com/usnistgov/ACVP-Server, commit 975de31eb83d87039ec88934fdc47d8c312b892d,
 gen-val/json-files/ML-KEM-keyGen-FIPS203/internalProjection.json and gen-val/json-files/ML-KEM-encapDecap-FIPS203/internalProjection.json,
-the ML-KEM-768 groups only. One test per line, fields in hex, produced with jq:
+the ML-KEM-768 groups only. One test per line, fields in lowercase hex, produced with jq (and `tr A-F a-f`):
 
     keygen TCID d z ek dk                  key generation from the seeds d and z (keyGen, AFT)
     encaps TCID ek m c k                   encapsulation with the message m (encapDecap encapsulation, AFT)

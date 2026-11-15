@@ -27,7 +27,7 @@ random_hex() { head -c "$1" /dev/urandom | od -An -vtx1 | tr -d ' \n'; }
 
 # (At once: each writes only its own files.)
 pids=()
-programs=(vectors edge tool against-hosted both kat-native wycheproof-tls signatures sha3)
+programs=(vectors edge tool against-hosted both kat-native wycheproof-tls signatures sha3 mlkem)
 for program in "${programs[@]}"; do
     "$compiler" build "$cases/$program.ab" -o "$out/$program" --no-cache \
         > "$out/$program.build.log" 2>&1 &
@@ -90,6 +90,15 @@ if "$out/sha3" "$out/sha3-random.hex" > "$out/sha3.log" 2>&1 && grep -q '^crypto
 else
     fail sha3; tail -20 "$out/sha3.log"
 fi
+
+# ML-KEM-768: the NIST ACVP vectors (key generation, encapsulation, decapsulation with altered ciphertexts, the key checks),
+# the exactness of Compress's reciprocal, implicit rejection, round trips, refusals.
+if "$out/mlkem" tests/vectors/crypto > "$out/mlkem.log" 2>&1; then
+    echo "ok   ml-kem-768: $(grep '^vectors' "$out/mlkem.log")"
+else
+    fail mlkem; tail -20 "$out/mlkem.log"
+fi
+
 # --- Keys, refusals ------------------------------------------------------------------------
 keys=$out/keys
 # This helper generates interop keys; the dedicated keygen test still covers --fast.
