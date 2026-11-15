@@ -145,6 +145,11 @@ for mac in x86_64-macos arm64-macos; do
     undefined=$(llvm-nm -u "$out/mac-$mac.o") || { echo "coverage: llvm-nm could not read the $mac object"; exit 1; }
     imports=$(grep -E "^ *(U )?_(getenv|strstr|snprintf|getpid|open|close|write|rename|signal|raise|usleep)\$" <<< "$undefined" || true)
     [ -z "$imports" ] || { echo "coverage: the $mac dump calls libSystem:"; echo "$imports"; exit 1; }
+    # And it is instrumented: no imports also holds for an object the flag left alone (master 4ac86702 built macOS
+    # programs without coverage: the build only enabled it for Linux triples, and the Mac CI found no file).
+    llvm-nm "$out/mac-$mac.o" | grep -E ' _?abla_coverage_dump$' >/dev/null &&
+        grep -a -F 'tests/cases/coverage/sub/used.ab' "$out/mac-$mac.o" >/dev/null ||
+        { echo "coverage: the $mac object has no coverage dump or file list"; exit 1; }
 done
 # A macOS dylib is still refused (#833: it links the C adapter).
 if "$compiler" build tests/cases/coverage-lib/lib.ab --emit shared-library -o "$out/refused-mac.dylib" --fast --coverage-functions \
