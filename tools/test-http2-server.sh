@@ -30,6 +30,9 @@ trap 'for p in "${pids[@]}"; do kill "$p" 2> /dev/null || true; done' EXIT
 start_server() {   # start_server NAME ARGS...: runs the server, sets $port from its "listening" line
     local name=$1
     shift
+    # The log exists before the server starts: the background child creates it only when it runs, and a read of a
+    # missing file ends this script (set -e, pipefail) before the wait below.
+    : > "$out/$name.log"
     "$out/server" 0 "$@" > "$out/$name.log" 2>&1 &
     pids+=("$!")
     for _ in $(seq 100); do
