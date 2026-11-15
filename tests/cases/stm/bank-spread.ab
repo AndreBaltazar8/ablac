@@ -3,9 +3,9 @@ import "./stm.ab"
 
 // Eight threads move money between 16 accounts at random while two audit the
 // total in read-only transactions: every audit and the end see the same total,
-// and some attempts conflicted on the way. The accounts are 1,200 bytes apart
-// (spare TVars between them), so each is in a clock of its own: every transfer
-// and every audit starts on one clock and moves to the partitioned protocol.
+// and some attempts conflicted on the way. Each account is in a clock of its own (a
+// thread of its own reads it first, spreadClocks): every transfer and every audit
+// starts on one clock and moves to the partitioned protocol.
 
 // The accounts' TVars, which every thread reaches.
 resource class Accounts(val cells: array<any>)
@@ -14,18 +14,32 @@ val bank: Shared<Accounts> = Shared(openAccounts())
 
 fun openAccounts(): Accounts {
     val opened: array<any> = []
-    val spares: array<any> = []
     var index = 0
     while (index < 16) {
         opened.append(tvar(100))
-        var spare = 0
-        while (spare < 25) {
-            spares.append(tvar(0))
-            spare = spare + 1
-        }
         index = index + 1
     }
+    // The next account spreadClocks gives a clock.
+    opened.append(tvar(0))
     Accounts(opened)
+}
+
+// A TVar's clock is that of the thread whose logged transaction reaches it first: one
+// short thread per account, each reading it first, gives each its own.
+fun claimNext(): int = atomically {
+    val next = readInt(bank.get().cells[16])
+    writeInt(bank.get().cells[16], next + 1)
+    readInt(bank.get().cells[next])
+}
+
+fun spreadClocks(): void {
+    alwaysLogged(true)
+    var index = 0
+    while (index < 16) {
+        await thread { claimNext() }
+        index = index + 1
+    }
+    alwaysLogged(false)
 }
 
 fun total(): int = atomically {
@@ -73,6 +87,7 @@ fun audits(count: int): int {
 
 fun main: int {
     if (total() != 1600) return 2
+    spreadClocks()
     val a = thread { transfers(1, 20000) }
     val b = thread { transfers(2, 20000) }
     val c = thread { transfers(3, 20000) }

@@ -2,7 +2,9 @@
 # The runtime's transactions (stdlib/abla/runtime/self/entry.ab, no language
 # surface yet): one thread running them directly and logged, with collections
 # inside them (natively, with ABLA_GC_STRESS=1, and in a WebAssembly module);
-# eight threads moving money among sixteen TVars while two audit the total; a
+# eight threads moving money among sixteen TVars while two audit the total (and
+# the same with each TVar in a clock of its own); TVars made together taking the
+# clock of the thread that first uses each; a
 # one-slot channel whose ends wake each other through retry; a retry no thread
 # could wake; and a panic contained by a checked export rolling a transaction
 # back. tests/cases/stm/bench.ab measures their cost (not run here).
@@ -52,6 +54,11 @@ build blind-spread.ab blind-spread
 output=$(run "$output_directory/blind-spread")
 [[ $output == *$'blind writes, wrong audits 0\nstatus 42' ]] ||
     { echo "stm, blind writes across clocks: $output" >&2; exit 1; }
+
+build region.ab region
+output=$(run "$output_directory/region")
+[[ $output == $'before: -2 -2 -2 -2 -2 -2 -2 -2\ntwo clocks: true, each group one: true, unchanged: true\nstatus 42' ]] ||
+    { echo "stm, a TVar's clock follows the thread that reaches it first: $output" >&2; exit 1; }
 
 build retry.ab retry
 output=$(run "$output_directory/retry")

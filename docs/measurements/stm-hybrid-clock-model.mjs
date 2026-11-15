@@ -7,11 +7,22 @@
 // state is the serial one.  Modes: hybrid (the protocol), resample (negative control: at
 // escalation the first clock is sampled again instead of keeping the fast snapshot, no
 // revalidation), nosample (no revalidation at a new clock's first read), broken (no
-// revalidation when a snapshot is extended), skipfresh (commit never validates).
+// revalidation when a snapshot is extended), skipfresh (commit never validates). lazy: no
+// TVar has a clock until a transaction first reaches it, and then takes that transaction's home
+// clock (the thread's), once (the runtime's compare-and-swap at its +8); overwrite (negative control
+// for lazy: every access stamps the TVar with its own home clock again).
 //
 //   node stm-hybrid-clock-model.mjs [MODE] [SCHEDULES_PER_SPEC]
 const MODE = process.argv[2] ?? 'hybrid';
 const PART = { x: 0, z: 0, y: 1 };
+const LAZY = MODE === 'lazy' || MODE === 'overwrite';
+
+// The clock of TVar v for a transaction whose home clock is `home`: fixed (PART), or under lazy the home
+// clock of the first transaction that reached it.
+function partOf(w, v, home) {
+    if (LAZY && (w.part[v] === undefined || MODE === 'overwrite')) w.part[v] = home;
+    return w.part[v];
+}
 
 class Abort extends Error {}
 
@@ -31,10 +42,11 @@ function generator(seed) {
 function newWorld() {
     const w = { clock: [0, 0], val: { x: 0, y: 0, z: 0 }, ver: { x: 0, y: 0, z: 0 }, lock: { x: null, y: null, z: null }, violations: [], commits: { local: 0, wide: 0 } };
     w.states = [{ ...w.val }];
+    w.part = LAZY ? {} : { ...PART };
     return w;
 }
 
-function* txn(w, name, kind, order) {
+function* txn(w, name, kind, order, home) {
     for (;;) {
         let prim = null;          // null: no access yet; 0/1: fast on that clock; 'wide': escalated
         const snap = new Map();   // clock -> snapshot (fast: one entry)
@@ -63,7 +75,8 @@ function* txn(w, name, kind, order) {
         };
         try {
             for (const v of order) {
-                const p = PART[v];
+                if (LAZY) yield;
+                const p = partOf(w, v, home);
                 yield* access(p);
                 if (prim === 'wide' && !snap.has(p)) {
                     yield;
@@ -102,7 +115,7 @@ function* txn(w, name, kind, order) {
             const targets = kind === 'local' ? 'xz' : 'xyz';
             for (const v of targets) {
                 if (!(v in seen)) {
-                    yield* access(PART[v]);
+                    yield* access(partOf(w, v, home));
                     yield;
                     // a blind read-modify-write is not modelled: writers read what they write
                 }
@@ -128,7 +141,7 @@ function* txn(w, name, kind, order) {
                 newver.set(prim, c + 1);
                 fresh = c === snap.get(prim);
             } else {
-                for (const q of [...new Set([...targets].map((v) => PART[v]))].sort((x, y) => x - y)) {
+                for (const q of [...new Set([...targets].map((v) => w.part[v]))].sort((x, y) => x - y)) {
                     yield;
                     const c = w.clock[q];
                     w.clock[q] = c + 1;
@@ -158,7 +171,7 @@ function* txn(w, name, kind, order) {
             }
             for (const v of targets) {
                 yield;
-                w.ver[v] = newver.get(PART[v]);
+                w.ver[v] = newver.get(w.part[v]);
                 w.lock[v] = null;
             }
             w.commits[kind] += 1;
@@ -172,7 +185,7 @@ function* txn(w, name, kind, order) {
 
 function run(rng, spec, steps = 600) {
     const w = newWorld();
-    const gens = spec.map(([n, k, o]) => txn(w, n, k, o));
+    const gens = spec.map(([n, k, o], i) => txn(w, n, k, o, i % 2));
     const done = gens.map(() => false);
     let n = 0;
     while (!done.every(Boolean) && n < steps) {

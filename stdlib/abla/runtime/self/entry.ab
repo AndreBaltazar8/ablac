@@ -922,7 +922,8 @@ trusted fun __ablaRuntimeAwait(operation: any): any {
 // A TVar is a 40-byte block the collector reads as layout 7 (its value at +16):
 //   +0  its word: the version of its value << 1, plus 1 while a committing
 //       transaction holds it
-//   +8  unused
+//   +8  its region, which picks its clock: -2 until a logged transaction
+//       first reaches it (__ablaRuntimeStmAccess)
 //   +16 the value
 // A value of tag 14 holds it.
 //
@@ -1000,7 +1001,7 @@ trusted fun __ablaRuntimeStmSharedCreate(): int {
         __ablaRuntimePlatformMutexInitialize(shared + 192)
         __ablaRuntimePlatformMutexInitialize(shared + 192 + mutexBytes)
         __ablaRuntimePlatformConditionInitialize(shared + 192 + 2 * mutexBytes)
-        // Sixteen clocks, each alone in a cache line (a TVar's clock is picked by its address).
+        // Sixteen clocks, each alone in a cache line (a TVar's is its region's).
         val clocksBlock = __ablaRuntimePlatformRawAllocate(1024 + 64)
         val clocks = (clocksBlock + 63) & -64
         var clock = 0
@@ -1083,14 +1084,17 @@ trusted fun __ablaRuntimeStmThreadExit(): void {
 trusted fun __ablaRuntimeTVarCreate(value: any): any {
     val tvar = __ablaRuntimeAllocateLayout(40, 7)
     ablaRuntimeStoreI64(tvar, 0)
-    ablaRuntimeStoreI64(tvar + 8, 0)
+    // Its region: none yet (-2, never a transaction's mode), until a logged transaction first reaches it
+    // (__ablaRuntimeStmAccess).
+    ablaRuntimeStoreI64(tvar + 8, -2)
     __ablaRuntimeCopyValue(value, tvar + 16)
     ablaRuntimeMakeValue(14, 0, tvar, 0)
 }
 
-// The clock a TVar's version comes from: one of sixteen, by its address.
+// The clock a TVar's version comes from: one of sixteen, its region's (set once it was reached in a logged
+// transaction, which every TVar a commit writes was).
 @inline
-trusted fun __ablaRuntimeStmPartition(tvar: int): int = (tvar >> 10) & 15
+trusted fun __ablaRuntimeStmPartition(tvar: int): int = ablaRuntimeLoadI64(tvar + 8) & 15
 
 // A TVar's bit in a descriptor's written filter.
 @inline
@@ -1206,15 +1210,28 @@ trusted fun __ablaRuntimeStmAbandon(descriptor: int, retrying: bool): never {
 trusted fun __ablaRuntimeStmClock(partition: int): int =
     ablaRuntimeLoadI64(__ablaRuntimeStmShared + 176) + partition * 64
 
-// A logged transaction's mode, at +728: 0 before its first access, the region (address >> 10)
-// of its first access while every access so far is in that region (one clock, partition
+// A TVar's region, at +8, is that of the thread whose logged transaction reached it first:
+// (number << 4) | (number & 15), the number its descriptor's (+24). So the TVars a thread's
+// transactions use share that thread's clock however and wherever they were made, and a
+// structure one thread works on never straddles two clocks. It is set once, from -2 by a
+// compare-and-swap here, before any commit gives the TVar a version, and never changes after.
+//
+// A logged transaction's mode, at +728: 0 before its first access, the region of its first
+// access while every access so far is in that region (one clock, partition
 // region & 15, whose value is the snapshot at +16: the protocol of a single global clock),
 // -1 once it has touched a second region (a snapshot for each clock, at +336, the mask of
 // those taken at +736, in the order taken at +592 with their count at +720). An access
-// outside the mode's region comes here, and returns the mode that applies after it. (A heap
-// TVar is above address 1,024, so a region is never 0.)
+// outside the mode's region, or to a TVar with none yet, comes here, and returns the mode
+// that applies after it. (A region is never 0 or -1, so it never equals those modes.)
 @noinline
-trusted fun __ablaRuntimeStmAccess(descriptor: int, region: int, mode: int): int {
+trusted fun __ablaRuntimeStmAccess(descriptor: int, tvar: int, mode: int): int {
+    var region = ablaRuntimeLoadI64(tvar + 8)
+    if (region == -2) {
+        val number = ablaRuntimeLoadI64(descriptor + 24)
+        ablaRuntimeAtomicCompareExchangeI64(tvar + 8, -2, (number << 4) | (number & 15))
+        region = ablaRuntimeAtomicLoadI64(tvar + 8)
+        if (region == mode) return mode
+    }
     if (mode == 0) {
         ablaRuntimeStoreI64(
             descriptor + 16, ablaRuntimeAtomicLoadI64(__ablaRuntimeStmClock(region & 15))
@@ -1240,9 +1257,12 @@ trusted fun __ablaRuntimeStmReadLogged(descriptor: int, tvarValue: any, tvar: in
     if (written >= 0) {
         return __ablaRuntimeValueAt(ablaRuntimeLoadI64(descriptor + 96) + written * 56 + 24)
     }
-    val region = tvar >> 10
+    var region = ablaRuntimeLoadI64(tvar + 8)
     var mode = ablaRuntimeLoadI64(descriptor + 728)
-    if (mode != region) mode = __ablaRuntimeStmAccess(descriptor, region, mode)
+    if (mode != region) {
+        mode = __ablaRuntimeStmAccess(descriptor, tvar, mode)
+        region = ablaRuntimeLoadI64(tvar + 8)
+    }
     if (mode > 0) {
         // One clock so far: this one's snapshot is at +16.
         var tries = 0
@@ -1357,9 +1377,9 @@ trusted fun __ablaRuntimeStmWriteLogged(descriptor: int, tvarValue: any, tvar: i
             )
         } else __ablaRuntimeCopyValue(value, tvar + 16)
     } else if (logged) {
-        val region = tvar >> 10
+        val region = ablaRuntimeLoadI64(tvar + 8)
         val mode = ablaRuntimeLoadI64(descriptor + 728)
-        if (mode != region) __ablaRuntimeStmAccess(descriptor, region, mode)
+        if (mode != region) __ablaRuntimeStmAccess(descriptor, tvar, mode)
         __ablaRuntimeStmLogWrite(descriptor, tvarValue, value)
     } else {
         __ablaRuntimeStmLogWrite(descriptor, tvarValue, __ablaRuntimeValueAt(tvar + 16))

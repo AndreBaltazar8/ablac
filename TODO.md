@@ -1017,20 +1017,16 @@ mmap form) apply there.
   indirection stubs (ORC lazy reexports or an indirect stubs manager) so a function can be
   redefined while the program runs.
 
-- [ ] **Transactional memory: clocks beyond the region.** A logged transaction now runs the
-  single-clock protocol on the clock of its first 1 KB region (sixteen clocks, region & 15) and keeps
-  a snapshot for each clock only once it touches a second region
-  (`docs/measurements/stm-hybrid-clocks-2026-11-08.md`). Four threads on disjoint TVars take 58% less
-  time per block (cycles −55%) when each thread's TVars were made apart from the others', and 12% less
-  (cycles −23%) when sixteen TVars were made one after the other, a thread's group of four straddling a
-  region boundary or sharing a region with its neighbour; shared TVars show no gain beyond noise. The costs: a forced-logged
-  one-thread block executes 7.9% more instructions (1,241 to 1,339; its cycles are the baseline's to
-  within noise) and a transaction that touches a second region pays the partitioned protocol's
-  per-clock sampling. Open: a block over TVars made together can still straddle two regions (it then
-  samples two clocks, and neighbours that share a region share its clock); a region size that follows
-  the allocator's size classes, or counting a TVar's region at creation, would keep a structure's
-  TVars on one clock. The partitioned-only prototype that cost a logged block 30% more is on
-  branch `stm-clocks`.
+- [x] **Transactional memory: clocks beyond the region.** A logged transaction runs the single-clock
+  protocol on its first region's clock and keeps a snapshot per clock only once it touches a second region
+  (`docs/measurements/stm-hybrid-clocks-2026-11-08.md`). A TVar's region is no longer its address >> 10: it is set
+  once, to that of the thread whose logged transaction first reaches it
+  (`docs/measurements/stm-region-at-first-use-2026-11-15.md`). Four threads on disjoint TVars made one after the
+  other now stay on one clock each: cycles −31% and time −20% a block (paired, under load), the same 1,330
+  instructions as the one-thread logged block, which did not grow (1,335 to 1,330). TVars made apart and shared
+  TVars show no change beyond noise. A region at the allocator's page, or counted at creation, kept the boundaries
+  (screened, not shipped). Open: a thread that first touches TVars others mostly use gives them its clock. The
+  partitioned-only prototype that cost a logged block 30% more is on branch `stm-clocks`.
 
 - [ ] **The rest of the reserved generic syntax.** `where` clauses, `const` type parameters and
   an interface's `type Item` still give `E_PARSE_NOT_YET_SUPPORTED`. Decide which to build.
