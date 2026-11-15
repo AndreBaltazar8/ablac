@@ -30,6 +30,11 @@ for mode in interp jit; do
     [[ $output == $'generics: 0 failed\nstatus 42' ]] ||
         { echo "generics ($mode): $output" >&2; exit 1; }
 done
+# The same cases as fast (development) code, which the loop above does not build.
+"$compiler" build "$cases/main.ab" -o "$output_directory/generics-fast" --no-cache --fast
+output=$(run "$output_directory/generics-fast")
+[[ $output == $'generics: 0 failed\nstatus 42' ]] ||
+    { echo "generics (--fast): $output" >&2; exit 1; }
 output=$(run "$compiler" run "$cases/main.ab")
 [[ $output == $'generics: 0 failed\nstatus 42' ]] ||
     { echo "generics (ablac run): $output" >&2; exit 1; }

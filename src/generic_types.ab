@@ -845,6 +845,95 @@ fun bootstrapGenericUnifyConforming(
     bootstrapGenericUnify(pattern, value, parameters, bindings)
 }
 
+/** Every instance of the generic interface `target` that `type` conforms to (directly or through others), in the
+ *  order they are found; `type` itself when it is one. */
+fun bootstrapGenericConformanceInstances(
+    declarations: array<BootstrapDeclaration>,
+    table: BootstrapGenericTable,
+    type: string,
+    target: string
+): array<string> {
+    val found: array<string> = []
+    if (bootstrapGenericInstanceGeneric(type) == target) {
+        found.append(type)
+        return found
+    }
+    val pending = [type]
+    var seen = bootstrapStringSet()
+    seen.add(type)
+    var next = 0
+    while (next < pending.size) {
+        val current = pending[next]
+        next = next + 1
+        for (conformance in bootstrapGenericDirectConformances(declarations, table, current)) {
+            if (bootstrapGenericInstanceGeneric(conformance) == target) {
+                var known = false
+                for (have in found) if (have == conformance) known = true
+                if (!known) found.append(conformance)
+            }
+            if (!seen.contains(conformance)) {
+                seen.add(conformance)
+                pending.append(conformance)
+            }
+        }
+    }
+    found
+}
+
+/** A bounded type parameter bound to a type binds what its bound's type arguments name from that type's conformance:
+ *  with `<T, C : Source<T>>` and `C` a `Numbers : Source<int>`, `T` is `int`. Only a type that conforms to exactly one
+ *  instance of the bound's interface binds (two instances leave `T` open, for the caller to write); a parameter
+ *  already bound keeps its binding (a mismatch is the bound check's `generic.bound`). Repeats so a bound that names a
+ *  parameter bound by another bound (`<A, B : Source<A>, C : Sink<B>>`) binds too. */
+fun bootstrapGenericBindFromBounds(
+    analyzer: BootstrapAnalyzer,
+    parameters: array<string>,
+    bounds: array<array<string>>,
+    var bindings: array<string>
+): void {
+    var round = 0
+    var changed = true
+    while (changed && round < parameters.size) {
+        changed = false
+        round = round + 1
+        var index = 0
+        while (index < parameters.size) {
+            if (bindings[index] != "") {
+                for (written in bounds[index]) {
+                    var angle = false
+                    for (byte in written) if (byte == 60) angle = true
+                    if (!angle) continue
+                    val pattern = bootstrapGenericPattern(written, analyzer.generics)
+                    if (!pattern.instance) continue
+                    val template = analyzer.generics.findId(pattern.head)
+                    if (template < 0 || analyzer.generics.declarations[template].kind != "interface") continue
+                    var open = false
+                    var slot = 0
+                    while (slot < parameters.size) {
+                        if (bindings[slot] == "" && bootstrapGenericTypeMentions(pattern, parameters[slot])) open = true
+                        slot = slot + 1
+                    }
+                    if (!open) continue
+                    val instances = bootstrapGenericConformanceInstances(analyzer.declarations, analyzer.generics,
+                        bindings[index], pattern.head)
+                    if (instances.size == 1) {
+                        val before: array<string> = []
+                        for (binding in bindings) before.append(binding)
+                        bootstrapGenericUnify(pattern, bootstrapGenericParse(instances[0]), parameters, bindings)
+                        var moved = 0
+                        while (moved < bindings.size) {
+                            if (before[moved] != bindings[moved]) changed = true
+                            moved = moved + 1
+                        }
+                    }
+                }
+            }
+            index = index + 1
+        }
+    }
+    return
+}
+
 /** The generics of a program, for the probe that types their uses
  *  (generics.ab). A generic is a function, an extension or a class; its id
  *  names its instances: the name, and for an extension the receiver too
@@ -1242,6 +1331,7 @@ fun bootstrapGenericBind(
         }
         child = child + 1
     }
+    bootstrapGenericBindFromBounds(analyzer, parameters, bounds, bindings)
     var lambda = 0
     while (lambda < lambdas.size) {
         val parameter = lambdaParameters[lambda]
@@ -1305,6 +1395,7 @@ fun bootstrapGenericBind(
         } else analyzer.infer(lambdas[lambda])
         lambda = lambda + 1
     }
+    bootstrapGenericBindFromBounds(analyzer, parameters, bounds, bindings)
     for (request in requests) analyzer.genericRequests.append(request)
     if (failed) return BootstrapGenericInstanceCall("", parameters, bindings)
     var index = 0

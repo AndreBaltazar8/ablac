@@ -2065,6 +2065,17 @@ fun main {
 A type argument outside a bound that is an instance reads as one in
 `generic.bound` (`generic.bound:largest:T:i64:Ordered<i64>`).
 
+A bound that is an instance also binds the type parameters it names, from the
+bounded type's conformance: in `fun <T, C : Source<T>> firstOf(c: C): T?`, a
+`Numbers` that conforms to `Source<int>` makes `T` `int`, a `Repeat<string>`
+makes it `string`, and an interface value `Source<int>` itself makes it `int`.
+This runs after the arguments have bound what they bind (an argument that binds
+`T` first wins, and a mismatch is `generic.bound`), and again for a bound
+naming a parameter another bound bound (`<A, S : Source<A>, K : Sink<A>>`). A
+type that conforms to two instances of the interface (`class Both : Marker<int>,
+Marker<string>`) or to none leaves `T` open, so `generic.cannot-infer` stands
+and the type arguments are written out (`idOf<int, Both>(…)`).
+
 ### Compile-time code per instance
 
 `#` code in a generic's body is evaluated for each instance, and in it a
