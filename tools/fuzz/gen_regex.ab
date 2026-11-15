@@ -1,0 +1,366 @@
+// The regex campaign: random patterns and texts, abla/regex against the independent oracle of regex_oracle.ab, in
+// this process (no generated program, no six modes). Patterns are built as trees from the old Python fuzzer's atoms
+// and written as text, so the pattern parser of abla/regex is under test too; the texts draw from an alphabet with
+// multi-byte characters and newlines. For each pair the whole-text answer, the leftmost-first span from the start of
+// the text and the span from a later start must agree. A disagreement is shrunk (tree and text) and printed with the
+// line that records it in tests/cases/regex/corpus.tsv.gz.
+import "abla/io"
+import "abla/regex"
+import "abla/text"
+import "./prng.ab"
+import "./regex_oracle.ab"
+
+val RX_ATOMS: array<string> = ["a", "b", "c", "1", "é", "😀", "\\.", "\\-", "\\n", "\\x41", "\\u00e9", "_", " ", "Z",
+    "\\x61", "\\u00e9"]
+val RX_CLASSES: array<string> = ["[ab]", "[^a]", "[a-c]", "[^b-c1]", "[\\d_]", "[\\w-]", "[é-ü]", "[^\\s]", "[]a]",
+    "[a\\-z]", "[\\D]", "[a-c\\d]", "[\\W]", "[^\\n]", "[0-9a-f]", "[é😀]", "[\\s\\d]"]
+val RX_SHORT: array<string> = ["\\d", "\\D", "\\w", "\\W", "\\s", "\\S", "."]
+val RX_ASSERTS: array<string> = ["^", "$", "\\b", "\\B"]
+val RX_TEXT: array<int> = [97, 98, 99, 97, 98, 49, 50, 95, 32, 10, 45, 233, 252, 128512, 90, 65, 46]
+
+fun rxCodePoints(text: string): array<int> {
+    val out: array<int> = []
+    for (k in 0 until text.codePointCount()) out.append(text.codePointAt(k))
+    out
+}
+
+fun rxToText(cps: array<int>): string {
+    var out = ""
+    for (cp in cps) out = out + utf8Encode(cp)
+    out
+}
+
+/** A leaf written as `src`, read by the oracle's own parser. */
+fun rxFromSource(src: string): RxNode {
+    val parsed = rxParse(rxCodePoints(src))
+    if (parsed == null) return rxEmpty()
+    val node = parsed
+    if (!(node.kind == 1 || node.kind == 2 || node.kind == 3 || node.kind == 9)) return rxEmpty()
+    RxNode(0, node.kind, node.a, node.b, node.c, node.set, node.kids, src, node.capturing)
+}
+
+fun rxIsLeaf(node: RxNode): bool = node.kind == 1 || node.kind == 2 || node.kind == 3
+
+fun rxCount(node: RxNode): string {
+    if (node.a == 0 && node.b < 0) return "*"
+    if (node.a == 1 && node.b < 0) return "+"
+    if (node.a == 0 && node.b == 1) return "?"
+    if (node.b == node.a) return "{${node.a}}"
+    if (node.b < 0) return "{${node.a},}"
+    if (node.a == 0) return "{,${node.b}}"
+    "{${node.a},${node.b}}"
+}
+
+fun rxRender(node: RxNode): string {
+    if (node.kind == 5) {
+        var out = ""
+        for (kid in node.kids) out = out + (if (kid.kind == 6) "(?:" + rxRender(kid) + ")" else rxRender(kid))
+        return out
+    }
+    if (node.kind == 6) {
+        var out = ""
+        var first = true
+        for (kid in node.kids) {
+            if (!first) out = out + "|"
+            first = false
+            out = out + rxRender(kid)
+        }
+        return out
+    }
+    if (node.kind == 8) return (if (node.capturing) "(" else "(?:") + rxRender(node.kids[0]) + ")"
+    if (node.kind == 7) {
+        val body = node.kids[0]
+        val written = if (rxIsLeaf(body) || body.kind == 8) rxRender(body) else "(?:" + rxRender(body) + ")"
+        return written + rxCount(node) + (if (node.c == 1) "?" else "")
+    }
+    node.src
+}
+
+class RxGen(val r: Prng)
+
+fun RxGen.atom(depth: int): RxNode {
+    val c = this.r.unit()
+    if (c < 0.35) return rxFromSource(this.r.pick(RX_ATOMS))
+    if (c < 0.5) return rxFromSource(this.r.pick(RX_CLASSES))
+    if (c < 0.65) return rxFromSource(this.r.pick(RX_SHORT))
+    if (c < 0.72) return rxFromSource(this.r.pick(RX_ASSERTS))
+    if (depth < 3) return rxGroup(this.alt(depth + 1), this.r.chance(0.7))
+    rxFromSource(this.r.pick(RX_ATOMS))
+}
+
+fun RxGen.quantified(atom: RxNode): RxNode {
+    if (atom.kind == 9 || this.r.chance(0.55)) return rxClone(atom)
+    val counts = [[0, -1], [1, -1], [0, 1], [2, 2], [1, 3], [2, -1], [0, 2]]
+    val q = counts[this.r.below(counts.size)]
+    if (rxNullable(atom) && !(q[0] == 0 && q[1] == 1)) return rxClone(atom)
+    rxRepeat(atom, q[0], q[1], this.r.chance(0.25))
+}
+
+fun RxGen.cat(depth: int): RxNode {
+    val parts: array<RxNode> = []
+    val count = this.r.pickInt([1, 2, 2, 3, 4])
+    for (k in 0 until count) parts.append(this.quantified(this.atom(depth)))
+    if (parts.size == 1) rxClone(parts[0]) else rxInner(5, parts)
+}
+
+fun RxGen.alt(depth: int): RxNode {
+    val branches: array<RxNode> = []
+    val count = this.r.pickInt([1, 1, 1, 2, 3])
+    for (k in 0 until count) branches.append(this.cat(depth))
+    if (branches.size == 1) rxClone(branches[0]) else rxInner(6, branches)
+}
+
+fun RxGen.text(): array<int> {
+    val out: array<int> = []
+    for (k in 0 until this.r.below(14)) out.append(this.r.pickInt(RX_TEXT))
+    out
+}
+
+/** "" when abla/regex and the oracle agree on this pattern and text; else what differs. `bug` plants a fault in the
+ * oracle (the suite's control). */
+fun rxDisagreement(root: RxNode, text: array<int>, later: int, bug: int): string {
+    val pattern = rxRender(root)
+    val compiled = regexCompile(pattern)
+    if (!compiled.succeeded) return "abla refuses the pattern: ${compiled.error.message} at ${compiled.error.offset}"
+    val re = compiled.regex
+    val matcher = rxMatcher(root, text)
+    matcher.m.bug = bug
+    val subject = rxToText(text)
+    val whole = re.matches(subject)
+    val wholeWant = rxMatchesWhole(matcher)
+    if (whole != wholeWant) return "matches(): abla $whole, oracle $wholeWant"
+    var start = 0
+    for (round in 0 until 2) {
+        val from = if (round == 0) 0 else later
+        if (round == 1 && later <= 0) break
+        val want = rxFind(matcher, from)
+        val m = re.find(subject, matcher.m.offsets[from])
+        val got = if (m == null) "-" else "${m.start()}-${m.end()}"
+        val wanted = if (want.size == 0) "-" else "${want[0]}-${want[1]}"
+        if (got != wanted) return "find from code point $from: abla $got, oracle $wanted"
+    }
+    ""
+}
+
+fun rxWithKid(node: RxNode, index: int, kid: RxNode): RxNode {
+    val kids: array<RxNode> = []
+    for (k in 0 until node.kids.size) kids.append(if (k == index) kid else node.kids[k])
+    RxNode(0, node.kind, node.a, node.b, node.c, node.set, kids, node.src, node.capturing)
+}
+
+fun rxWithoutKid(node: RxNode, index: int): RxNode {
+    val kids: array<RxNode> = []
+    for (k in 0 until node.kids.size) {
+        if (k != index) kids.append(node.kids[k])
+    }
+    RxNode(0, node.kind, node.a, node.b, node.c, node.set, kids, node.src, node.capturing)
+}
+
+fun rxBadShape(node: RxNode): bool {
+    if (node.kind == 7 && node.kids[0].kind == 9) return true
+    if ((node.kind == 5 || node.kind == 6) && node.kids.size == 0) return true
+    for (kid in node.kids) {
+        if (rxBadShape(kid)) return true
+    }
+    false
+}
+
+/** Smaller trees: the node replaced by a part of it, a kid dropped, a count lowered, a lazy repeat made greedy; and
+ * the same inside each kid. */
+fun rxVariants(node: RxNode): array<RxNode> {
+    val out: array<RxNode> = []
+    if (node.kind == 5 || node.kind == 6) {
+        for (kid in node.kids) out.append(kid)
+        if (node.kids.size > 2) {
+            for (k in 0 until node.kids.size) out.append(rxWithoutKid(node, k))
+        }
+    }
+    if (rxIsLeaf(node) && node.src != "a") out.append(rxFromSource("a"))
+    if (node.kind == 8) out.append(node.kids[0])
+    if (node.kind == 7) {
+        out.append(node.kids[0])
+        if (node.c == 1) out.append(RxNode(0, 7, node.a, node.b, 0, [], node.kids, "", false))
+        if (node.a > 0) out.append(RxNode(0, 7, node.a - 1, node.b, node.c, [], node.kids, "", false))
+        if (node.b > node.a) out.append(RxNode(0, 7, node.a, node.b - 1, node.c, [], node.kids, "", false))
+        if (node.b > 0 && node.a == node.b) out.append(RxNode(0, 7, node.a - 1, node.b - 1, node.c, [], node.kids, "", false))
+    }
+    for (k in 0 until node.kids.size) {
+        for (inner in rxVariants(node.kids[k])) out.append(rxWithKid(node, k, inner))
+    }
+    out
+}
+
+class RxCase(var root: RxNode, var text: array<int>, var later: int)
+
+/** The smallest tree and text found by taking any smaller variant that still disagrees, until none does. */
+fun rxShrink(var found: RxCase, bug: int): void {
+    var shrinking = true
+    while (shrinking) {
+        shrinking = false
+        for (candidate in rxVariants(found.root)) {
+            if (!rxBadShape(candidate) && rxLoopsOk(candidate) && rxDisagreement(candidate, found.text, found.later, bug) != "") {
+                found.root = candidate
+                shrinking = true
+                break
+            }
+        }
+        if (shrinking) continue
+        for (k in 0 until found.text.size) {
+            val shorter: array<int> = []
+            for (j in 0 until found.text.size) {
+                if (j != k) shorter.append(found.text[j])
+            }
+            val later = if (found.later > shorter.size) shorter.size else found.later
+            if (rxDisagreement(found.root, shorter, later, bug) != "") {
+                found.text = shorter
+                found.later = later
+                shrinking = true
+                break
+            }
+        }
+        if (shrinking) continue
+        for (k in 0 until found.text.size) {
+            if (found.text[k] != 97) {
+                val simpler: array<int> = []
+                for (j in 0 until found.text.size) simpler.append(if (j == k) 97 else found.text[j])
+                if (rxDisagreement(found.root, simpler, found.later, bug) != "") {
+                    found.text = simpler
+                    shrinking = true
+                    break
+                }
+            }
+        }
+        if (shrinking) continue
+        if (found.later > 0 && rxDisagreement(found.root, found.text, found.later - 1, bug) != "") {
+            found.later = found.later - 1
+            shrinking = true
+        }
+    }
+    return
+}
+
+fun rxHexList(cps: array<int>): string {
+    val digits = "0123456789abcdef"
+    var out = ""
+    var first = true
+    for (cp in cps) {
+        if (!first) out = out + ","
+        first = false
+        var piece = ""
+        var rest = cp
+        if (rest == 0) piece = "0"
+        while (rest > 0) {
+            piece = digits.slice(rest % 16, rest % 16 + 1) + piece
+            rest = rest / 16
+        }
+        out = out + piece
+    }
+    out
+}
+
+/** The corpus line that records the oracle's answers for this pair (kind `span`, read by tests/cases/regex/corpus.ab). */
+fun rxCorpusLine(root: RxNode, text: array<int>): string {
+    val matcher = rxMatcher(root, text)
+    val want = rxFind(matcher, 0)
+    val found = if (want.size == 0) "F -" else "F ${want[0]} ${want[1]}"
+    rxHexList(rxCodePoints(rxRender(root))) + "\t" + rxHexList(text) + "\tspan\t" + found + "\tM " +
+        (if (rxMatchesWhole(matcher)) "1" else "0")
+}
+
+class RxReport(val failures: int, val text: string)
+
+/** `cases` pairs from `seed`; the report of the first disagreement (shrunk) if any. */
+fun rxRun(seed: int, cases: int, bug: int): RxReport {
+    val gen = RxGen(prngSeeded(seed))
+    var accepted = 0
+    for (index in 0 until cases) {
+        val root = gen.alt(0)
+        if (!rxLoopsOk(root)) continue
+        val text = gen.text()
+        val later = if (text.size > 0) gen.r.below(text.size + 1) else 0
+        val why = rxDisagreement(root, text, later, bug)
+        accepted = accepted + 1
+        if (why != "") {
+            val found = RxCase(root, text, later)
+            rxShrink(found, bug)
+            val small = rxDisagreement(found.root, found.text, found.later, bug)
+            val lines = [
+                "regex seed $seed case $index: $why",
+                "  minimised: pattern ${rxRender(found.root)} on text ${rxToText(found.text)} (from code point ${found.later}): $small",
+                "  corpus: ${rxCorpusLine(found.root, found.text)}"
+            ]
+            return RxReport(1, textJoin(lines, "\n"))
+        }
+    }
+    RxReport(0, "regex seed $seed: $accepted random patterns and texts agree with the oracle")
+}
+
+/** The planted fault (lazy repeats read as greedy in the oracle) must be found and shrunk to a pattern of at most
+ * seven characters on at most two. Returns 0 when it is. */
+fun rxControl(): int {
+    var seed = 100000
+    while (seed < 100020) {
+        val report = rxRun(seed, 400, 1)
+        if (report.failures > 0) {
+            if (!report.text.contains("minimised: pattern ")) break
+            val at = report.text.indexOf("minimised: pattern ") + 19
+            val on = report.text.indexOf(" on text ", at)
+            val line = report.text.slice(on + 9, report.text.indexOf(" (from", on))
+            val pattern = report.text.slice(at, on)
+            if (pattern.codePointCount() <= 7 && line.codePointCount() <= 2 && pattern.contains("?")) {
+                println("fuzz: a planted regex oracle fault (lazy read as greedy) is found and shrunk to ${pattern} on ${line}")
+                return 0
+            }
+            eprintln("fuzz: regex control shrank to ${pattern} on ${line}")
+            return 1
+        }
+        seed = seed + 1
+    }
+    eprintln("fuzz: regex control: the planted fault was not found")
+    1
+}
+
+// ---- The recorded corpus read by the oracle: Python's answers (kind `match`) must be the oracle's too.
+
+fun rxHexDecode(field: string): array<int> {
+    val out: array<int> = []
+    if (field.size == 0) return out
+    for (part in field.split(",")) {
+        var value = 0
+        for (b in part) value = value * 16 + (if (b >= 97) b - 87 else b - 48)
+        out.append(value)
+    }
+    out
+}
+
+/** Every `match` line of the corpus the oracle can read is answered by the oracle as Python recorded: 0 when so. */
+fun rxCorpusCheck(corpus: string): int {
+    var checked = 0
+    var unread = 0
+    var bad = 0
+    for (line in corpus.split("\n")) {
+        if (line.size == 0) continue
+        val fields = line.split("\t")
+        if (fields[2] != "match") continue
+        val root = rxParse(rxHexDecode(fields[0]))
+        if (root == null) {
+            unread = unread + 1
+            continue
+        }
+        val tree = root
+        val text = rxHexDecode(fields[1])
+        val matcher = rxMatcher(tree, text)
+        val want = rxFind(matcher, 0)
+        val wanted = fields[3].split(" ")
+        val ok = if (want.size == 0) wanted[1] == "-" else wanted.size >= 3 && wanted[1] == "${want[0]}" && wanted[2] == "${want[1]}"
+        val whole = rxMatchesWhole(matcher)
+        val recordedWhole = fields[5] != "M -"
+        checked = checked + 1
+        if (!ok || whole != recordedWhole) {
+            bad = bad + 1
+            if (bad <= 5) println("oracle disagrees with the recorded result: ${fields[0]} on ${fields[1]}: ${fields[3]} ${fields[5]}")
+        }
+    }
+    println("regex oracle: ${checked} recorded results answered, ${unread} patterns outside its subset, ${bad} disagreements")
+    if (bad == 0 && checked > 4000) 0 else 1
+}

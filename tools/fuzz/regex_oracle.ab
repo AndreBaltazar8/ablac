@@ -1,0 +1,528 @@
+// An independent oracle for abla/regex: what a pattern matches, computed a way abla/regex does not. abla/regex
+// compiles a pattern to a program and runs a Pike VM (threads in lock step). This works on the syntax tree and
+// answers one question for a node and a position: the END positions where the node can finish, in priority order (the
+// order a backtracking engine would try them), each once. A concatenation takes the ends of its second part from each
+// end of its first, in order; an alternation lists its first branch's ends before its second's; a greedy repeat lists
+// the longer runs before stopping, a lazy one stops first. The leftmost-first match is then the first end for the
+// smallest start that has one. There is no VM, no thread list and no backtracking: every (node, position) answer is
+// a list of at most text-size ends, and the unbounded repeat's answers are memoised. Nothing here imports abla/regex.
+//
+// The subset is what the generator draws (and the old Python fuzzer drew): literals, escapes, classes, the shorthands,
+// `.`, `^ $ \b \B`, groups, alternation and every repeat form. A repeat over a body that can match the empty string
+// is only the `?` form (the empty-loop group rule differs from Python's and is not a span question).
+import "abla/text"
+
+// Node kinds: 0 empty, 1 character (a = code point), 2 any but \n, 3 class (a = 1 when negated, set = lo, hi pairs),
+// 5 concatenation, 6 alternation, 7 repeat (a = least, b = most or -1, c = 1 when lazy), 8 group, 9 assertion
+// (a: 0 ^, 1 $, 2 \b, 3 \B). `src` is the leaf's pattern text; renderers read it.
+class RxNode(var id: int, val kind: int, val a: int, val b: int, val c: int, val set: array<int>,
+    val kids: array<RxNode>, val src: string, val capturing: bool)
+
+fun rxLeaf(kind: int, a: int, set: array<int>, src: string): RxNode = RxNode(0, kind, a, 0, 0, set, [], src, false)
+
+fun rxEmpty(): RxNode = rxLeaf(0, 0, [], "")
+
+fun rxChar(cp: int, src: string): RxNode = rxLeaf(1, cp, [], src)
+
+fun rxAssert(which: int, src: string): RxNode = rxLeaf(9, which, [], src)
+
+fun rxInner(kind: int, kids: array<RxNode>): RxNode = RxNode(0, kind, 0, 0, 0, [], kids, "", false)
+
+fun rxGroup(kid: RxNode, capturing: bool): RxNode = RxNode(0, 8, 0, 0, 0, [], [kid], "", capturing)
+
+fun rxRepeat(kid: RxNode, least: int, most: int, lazy: bool): RxNode =
+    RxNode(0, 7, least, most, if (lazy) 1 else 0, [], [kid], "", false)
+
+/** A copy of the tree with its nodes numbered in order (next[0] is the next number). */
+fun rxNumbered(node: RxNode, var next: array<int>): RxNode {
+    val id = next[0]
+    next[0] = id + 1
+    val kids: array<RxNode> = []
+    for (kid in node.kids) kids.append(rxNumbered(kid, next))
+    RxNode(id, node.kind, node.a, node.b, node.c, node.set, kids, node.src, node.capturing)
+}
+
+fun rxNullable(node: RxNode): bool {
+    if (node.kind == 0 || node.kind == 9) return true
+    if (node.kind == 5) {
+        for (kid in node.kids) {
+            if (!rxNullable(kid)) return false
+        }
+        return true
+    }
+    if (node.kind == 6) {
+        for (kid in node.kids) {
+            if (rxNullable(kid)) return true
+        }
+        return false
+    }
+    if (node.kind == 7) return node.a == 0 || rxNullable(node.kids[0])
+    if (node.kind == 8) return rxNullable(node.kids[0])
+    false
+}
+
+/** Whether every repeat is one the oracle answers as the VM does: no repeat but `?` over a body that can be empty. */
+fun rxLoopsOk(node: RxNode): bool {
+    if (node.kind == 7 && rxNullable(node.kids[0]) && !(node.a == 0 && node.b == 1)) return false
+    for (kid in node.kids) {
+        if (!rxLoopsOk(kid)) return false
+    }
+    true
+}
+
+fun rxIsWord(c: int): bool = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+
+fun rxWidth(cp: int): int = if (cp < 128) 1 else if (cp < 2048) 2 else if (cp < 65536) 3 else 4
+
+/** One match question: a tree, a text of code points, the memo of the unbounded repeats. */
+class RxMatcher(val text: array<int>, val offsets: array<int>, val width: int, val done: array<bool>,
+    val memo: array<array<int>>, var bug: int)
+
+class RxQuery(val root: RxNode, var m: RxMatcher)
+
+fun rxMatcher(tree: RxNode, text: array<int>): RxQuery {
+    val counter = [0]
+    val root = rxNumbered(tree, counter)
+    val count = counter[0]
+    val offsets: array<int> = []
+    var at = 0
+    for (cp in text) {
+        offsets.append(at)
+        at = at + rxWidth(cp)
+    }
+    offsets.append(at)
+    val done: array<bool> = []
+    val memo: array<array<int>> = []
+    for (i in 0 until count * (text.size + 1)) {
+        done.append(false)
+        memo.append([])
+    }
+    RxQuery(root, RxMatcher(text, offsets, text.size + 1, done, memo, 0))
+}
+
+fun rxCopy(values: array<int>): array<int> {
+    val out: array<int> = []
+    for (v in values) out.append(v)
+    out
+}
+
+fun rxClone(node: RxNode): RxNode =
+    RxNode(0, node.kind, node.a, node.b, node.c, node.set, node.kids, node.src, node.capturing)
+
+fun rxAdd(var into: array<int>, end: int): void {
+    for (have in into) {
+        if (have == end) return
+    }
+    into.append(end)
+    return
+}
+
+fun rxClassHas(node: RxNode, c: int): bool {
+    var inside = false
+    var at = 0
+    while (at < node.set.size) {
+        if (c >= node.set[at] && c <= node.set[at + 1]) inside = true
+        at = at + 2
+    }
+    inside != (node.a == 1)
+}
+
+fun rxAssertHolds(m: RxMatcher, which: int, i: int): bool {
+    val n = m.text.size
+    if (which == 0) return i == 0
+    if (which == 1) return i == n
+    val before = i > 0 && rxIsWord(m.text[i - 1])
+    val after = i < n && rxIsWord(m.text[i])
+    if (which == 2) before != after else before == after
+}
+
+/** The ends of `node` started at code point `i`, in priority order, each once. `least` and `most` are the repeat
+ * counts still to make. */
+fun rxRepeatEnds(var m: RxMatcher, node: RxNode, least: int, most: int, i: int): array<int> {
+    val body = node.kids[0]
+    val lazy = node.c == 1 && m.bug != 1
+    val ends: array<int> = []
+    if (least > 0) {
+        for (e in rxEnds(m, body, i)) {
+            for (x in rxRepeatEnds(m, node, least - 1, if (most < 0) -1 else most - 1, e)) rxAdd(ends, x)
+        }
+        return ends
+    }
+    if (most == 0) {
+        ends.append(i)
+        return ends
+    }
+    val unbounded = most < 0
+    val slot = node.id * m.width + i
+    if (unbounded && m.done[slot]) return rxCopy(m.memo[slot])
+    val more: array<int> = []
+    for (e in rxEnds(m, body, i)) {
+        // An empty round adds nothing the position itself does not already give.
+        if (!unbounded || e > i) {
+            for (x in rxRepeatEnds(m, node, 0, if (unbounded) -1 else most - 1, e)) rxAdd(more, x)
+        }
+    }
+    if (lazy) {
+        rxAdd(ends, i)
+        for (x in more) rxAdd(ends, x)
+    } else {
+        for (x in more) rxAdd(ends, x)
+        rxAdd(ends, i)
+    }
+    if (unbounded) {
+        m.done[slot] = true
+        m.memo[slot] = rxCopy(ends)
+    }
+    ends
+}
+
+fun rxEnds(var m: RxMatcher, node: RxNode, i: int): array<int> {
+    val n = m.text.size
+    val ends: array<int> = []
+    if (node.kind == 0) {
+        ends.append(i)
+    } else if (node.kind == 1) {
+        if (i < n && m.text[i] == node.a) ends.append(i + 1)
+    } else if (node.kind == 2) {
+        if (i < n && m.text[i] != 10) ends.append(i + 1)
+    } else if (node.kind == 3) {
+        if (i < n && rxClassHas(node, m.text[i])) ends.append(i + 1)
+    } else if (node.kind == 5) {
+        var now: array<int> = [i]
+        for (kid in node.kids) {
+            val next: array<int> = []
+            for (e in now) {
+                for (x in rxEnds(m, kid, e)) rxAdd(next, x)
+            }
+            now = next
+        }
+        return rxCopy(now)
+    } else if (node.kind == 6) {
+        for (kid in node.kids) {
+            for (x in rxEnds(m, kid, i)) rxAdd(ends, x)
+        }
+    } else if (node.kind == 7) {
+        return rxRepeatEnds(m, node, node.a, node.b, i)
+    } else if (node.kind == 8) {
+        return rxEnds(m, node.kids[0], i)
+    } else if (node.kind == 9) {
+        if (rxAssertHolds(m, node.a, i)) ends.append(i)
+    }
+    ends
+}
+
+/** The leftmost-first match starting at a code point index at or after `from`: [start, end] in bytes, or []. */
+fun rxFind(var q: RxQuery, from: int): array<int> {
+    var s = from
+    while (s <= q.m.text.size) {
+        val ends = rxEnds(q.m, q.root, s)
+        if (ends.size > 0) return [q.m.offsets[s], q.m.offsets[ends[0]]]
+        s = s + 1
+    }
+    []
+}
+
+/** Whether the whole text is a match. */
+fun rxMatchesWhole(var q: RxQuery): bool {
+    for (e in rxEnds(q.m, q.root, 0)) {
+        if (e == q.m.text.size) return true
+    }
+    false
+}
+
+// ---- A parser for the same subset, so the oracle can read patterns written by others (the recorded corpus).
+
+class RxParser(val p: array<int>, var at: int, var ok: bool, var groups: int)
+
+fun RxParser.peek(): int = if (this.at < this.p.size) this.p[this.at] else -1
+
+fun rxComplement(set: array<int>): array<int> {
+    // The code points outside `set` (pairs, any order, overlaps allowed), as pairs.
+    val out: array<int> = []
+    var low = 0
+    val marks: array<int> = []
+    for (k in 0 until set.size / 2) {
+        // insertion by low end
+        var at = marks.size
+        marks.append(0)
+        marks.append(0)
+        while (at > 0 && marks[at - 2] > set[2 * k]) {
+            marks[at] = marks[at - 2]
+            marks[at + 1] = marks[at - 1]
+            at = at - 2
+        }
+        marks[at] = set[2 * k]
+        marks[at + 1] = set[2 * k + 1]
+    }
+    var k = 0
+    while (k < marks.size) {
+        if (marks[k] > low) {
+            out.append(low)
+            out.append(marks[k] - 1)
+        }
+        if (marks[k + 1] + 1 > low) low = marks[k + 1] + 1
+        k = k + 2
+    }
+    if (low <= 1114111) {
+        out.append(low)
+        out.append(1114111)
+    }
+    out
+}
+
+fun rxShorthand(letter: int): array<int> {
+    if (letter == 100) return [48, 57]
+    if (letter == 119) return [48, 57, 65, 90, 95, 95, 97, 122]
+    [9, 13, 32, 32]
+}
+
+fun rxHex(p: array<int>, at: int, count: int): int {
+    if (at + count > p.size) return -1
+    var value = 0
+    for (k in 0 until count) {
+        val c = p[at + k]
+        if (c >= 48 && c <= 57) value = value * 16 + c - 48
+        else if (c >= 97 && c <= 102) value = value * 16 + c - 87
+        else if (c >= 65 && c <= 70) value = value * 16 + c - 55
+        else return -1
+    }
+    value
+}
+
+fun rxAlnum(c: int): bool = rxIsWord(c) && c != 95
+
+/** After a backslash: a code point for a literal escape, or -2 for a shorthand (the letter is left at `at`),
+ * -1 for an escape outside the subset. */
+fun RxParser.escapeValue(): int {
+    val c = this.peek()
+    this.at = this.at + 1
+    if (c == 110) return 10
+    if (c == 114) return 13
+    if (c == 116) return 9
+    if (c == 102) return 12
+    if (c == 118) return 11
+    if (c == 120) {
+        val v = rxHex(this.p, this.at, 2)
+        this.at = this.at + 2
+        return v
+    }
+    if (c == 117) {
+        val v = rxHex(this.p, this.at, 4)
+        this.at = this.at + 4
+        return v
+    }
+    if (c == 100 || c == 68 || c == 119 || c == 87 || c == 115 || c == 83) return -2
+    if (c >= 0 && !rxAlnum(c)) return c
+    -1
+}
+
+fun RxParser.parseClass(): RxNode {
+    val set: array<int> = []
+    var negated = 0
+    if (this.peek() == 94) {
+        negated = 1
+        this.at = this.at + 1
+    }
+    var first = true
+    while (this.ok) {
+        val c = this.peek()
+        if (c < 0) {
+            this.ok = false
+            break
+        }
+        if (c == 93 && !first) {
+            this.at = this.at + 1
+            break
+        }
+        first = false
+        var low = c
+        this.at = this.at + 1
+        var shorthand = false
+        if (c == 92) {
+            val letter = this.peek()
+            val v = this.escapeValue()
+            if (v == -1) {
+                this.ok = false
+                break
+            }
+            if (v == -2) {
+                shorthand = true
+                val lower = if (letter >= 65 && letter <= 90) letter + 32 else letter
+                val s = rxShorthand(lower)
+                val use = if (letter < 97) rxComplement(s) else s
+                for (x in use) set.append(x)
+            } else {
+                low = v
+            }
+        }
+        if (shorthand) {
+            if (this.peek() == 45 && this.at + 1 < this.p.size && this.p[this.at + 1] != 93) this.ok = false
+            continue
+        }
+        var high = low
+        if (this.peek() == 45 && this.at + 1 < this.p.size && this.p[this.at + 1] != 93) {
+            this.at = this.at + 1
+            val hc = this.peek()
+            this.at = this.at + 1
+            high = hc
+            if (hc == 92) {
+                val v = this.escapeValue()
+                if (v < 0) {
+                    this.ok = false
+                    break
+                }
+                high = v
+            }
+            if (high < low) {
+                this.ok = false
+                break
+            }
+        }
+        set.append(low)
+        set.append(high)
+    }
+    rxLeaf(3, negated, set, "")
+}
+
+fun RxParser.repeatCounts(): array<int> {
+    // `{m}`, `{m,}`, `{m,n}`, `{,n}` at the `{`; [] when it is not a repeat (a literal brace); advances only on success.
+    var k = this.at + 1
+    var low = 0
+    var haveLow = false
+    while (k < this.p.size && this.p[k] >= 48 && this.p[k] <= 57) {
+        low = low * 10 + this.p[k] - 48
+        haveLow = true
+        k = k + 1
+    }
+    if (k >= this.p.size) return []
+    if (this.p[k] == 125) {
+        if (!haveLow) return []
+        this.at = k + 1
+        return [low, low]
+    }
+    if (this.p[k] != 44) return []
+    k = k + 1
+    var high = 0
+    var haveHigh = false
+    while (k < this.p.size && this.p[k] >= 48 && this.p[k] <= 57) {
+        high = high * 10 + this.p[k] - 48
+        haveHigh = true
+        k = k + 1
+    }
+    if (k >= this.p.size || this.p[k] != 125) return []
+    this.at = k + 1
+    // `{,}` is `*`, as in Python.
+    [low, if (haveHigh) high else -1]
+}
+
+fun RxParser.parseAtom(): RxNode {
+    val c = this.peek()
+    this.at = this.at + 1
+    if (c == 40) {
+        var capturing = true
+        if (this.peek() == 63) {
+            if (this.at + 1 < this.p.size && this.p[this.at + 1] == 58) {
+                capturing = false
+                this.at = this.at + 2
+            } else {
+                this.ok = false
+            }
+        }
+        val inner = this.parseAlt()
+        if (this.peek() != 41) this.ok = false
+        this.at = this.at + 1
+        return rxGroup(inner, capturing)
+    }
+    if (c == 91) return this.parseClass()
+    if (c == 46) return rxLeaf(2, 0, [], "")
+    if (c == 94) return rxAssert(0, "^")
+    if (c == 36) return rxAssert(1, "$")
+    if (c == 92) {
+        val letter = this.peek()
+        if (letter == 98) {
+            this.at = this.at + 1
+            return rxAssert(2, "\\b")
+        }
+        if (letter == 66) {
+            this.at = this.at + 1
+            return rxAssert(3, "\\B")
+        }
+        val v = this.escapeValue()
+        if (v == -2) {
+            val lower = if (letter >= 65 && letter <= 90) letter + 32 else letter
+            return rxLeaf(3, if (letter < 97) 1 else 0, rxShorthand(lower), "")
+        }
+        if (v < 0) {
+            this.ok = false
+            return rxEmpty()
+        }
+        return rxChar(v, "")
+    }
+    if (c == 42 || c == 43 || c == 63 || c == 41) {
+        this.ok = false
+        return rxEmpty()
+    }
+    rxChar(c, "")
+}
+
+fun RxParser.parseCat(): RxNode {
+    val parts: array<RxNode> = []
+    while (this.ok && this.at < this.p.size && this.peek() != 124 && this.peek() != 41) {
+        var atom = this.parseAtom()
+        if (!this.ok) break
+        val q = this.peek()
+        var least = -1
+        var most = -1
+        if (q == 42) {
+            least = 0
+            this.at = this.at + 1
+        } else if (q == 43) {
+            least = 1
+            this.at = this.at + 1
+        } else if (q == 63) {
+            least = 0
+            most = 1
+            this.at = this.at + 1
+        } else if (q == 123) {
+            val counts = this.repeatCounts()
+            if (counts.size == 2) {
+                least = counts[0]
+                most = counts[1]
+                if (most >= 0 && most < least) this.ok = false
+                if (least > 1000 || most > 1000) this.ok = false
+            }
+        }
+        if (least >= 0) {
+            if (atom.kind == 9) this.ok = false
+            var lazy = false
+            if (this.peek() == 63) {
+                lazy = true
+                this.at = this.at + 1
+            }
+            val after = this.peek()
+            if (after == 42 || after == 43 || after == 63) this.ok = false
+            atom = rxRepeat(atom, least, most, lazy)
+        }
+        parts.append(atom)
+    }
+    if (parts.size == 1) rxClone(parts[0]) else rxInner(5, parts)
+}
+
+fun RxParser.parseAlt(): RxNode {
+    val branches: array<RxNode> = [this.parseCat()]
+    while (this.ok && this.peek() == 124) {
+        this.at = this.at + 1
+        branches.append(this.parseCat())
+    }
+    if (branches.size == 1) rxClone(branches[0]) else rxInner(6, branches)
+}
+
+/** The tree of a pattern given as code points, or null when the subset does not cover it (the pattern is invalid
+ * or uses something else: lookaround, backreferences, a loop over a body that can be empty). */
+fun rxParse(pattern: array<int>): RxNode? {
+    val parser = RxParser(pattern, 0, true, 0)
+    val root = parser.parseAlt()
+    if (!parser.ok || parser.at != pattern.size) return null
+    if (!rxLoopsOk(root)) return null
+    root
+}

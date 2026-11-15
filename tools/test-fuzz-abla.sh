@@ -4,7 +4,8 @@
 # failure and a shared non-zero exit through the real six-way runner, two fixed seeds, the recorded cases, and a
 # wrong expectation that each oracle (drop logs, gzip, JSON, YAML) must report in every mode, and one seed of each
 # campaign (hosted tasks, panics, hostless capabilities, shared globals, module and subparser graphs with their cache
-# phases, cross-target tiers, subparser refusals). Long
+# phases, cross-target tiers, subparser refusals), and the regex campaign: abla/regex against the independent oracle on
+# two fixed seeds, the oracle against the recorded Python results, and a planted oracle fault. Long
 # campaigns run outside the suite (tools/fuzz/run --seeds ...).
 set -euo pipefail
 
@@ -46,3 +47,8 @@ fuzz --module-graphs --seeds 100002
 fuzz --subparser-graphs --seeds 100001
 fuzz --cross-target-tiers --seeds 100001
 fuzz --check-subparser-refusals
+fuzz --regex --seeds 100000-100001 --cases 1000
+fuzz --control-regex
+regex_corpus=build/fuzz-abla/regex-corpus.tsv
+zcat tests/cases/regex/corpus.tsv.gz >"$regex_corpus"
+fuzz --regex-corpus "$regex_corpus"
