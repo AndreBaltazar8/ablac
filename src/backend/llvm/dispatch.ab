@@ -228,8 +228,11 @@ fun bootstrapLlvmEmitClosureDispatchers(
         backend, "abla_function_capture_count", [closure],
         "capture.count", false, [true]
     )
+    // In a live run an id this module doesn't know may be a lambda a reload added (dispatched below).
+    val liveUnknown = if (bootstrapLlvmLiveRun)
+        LLVMAppendBasicBlockInContext(backend.context, drop, "live.unknown") else releaseBlock
     val switch = LLVMBuildSwitch(
-        backend.builder, functionId, releaseBlock, i32(program.functions.size)
+        backend.builder, functionId, liveUnknown, i32(program.functions.size)
     )
     var original = 0
     while (original < program.functions.size) {
@@ -263,6 +266,19 @@ fun bootstrapLlvmEmitClosureDispatchers(
             LLVMBuildBr(backend.builder, releaseBlock)
         }
         original = original + 1
+    }
+    if (bootstrapLlvmLiveRun) {
+        // The generation that has the lambda drops its captures and releases the closure.
+        LLVMPositionBuilderAtEnd(backend.builder, liveUnknown)
+        val target = bootstrapLlvmLiveLambdaLookup(backend, functionId, 2)
+        val forward = LLVMAppendBasicBlockInContext(backend.context, drop, "live.forward")
+        val missing = LLVMBuildICmp(backend.builder, llvmIntEqual(), target,
+            LLVMConstNull(backend.pointerType),
+            "live.missing")
+        LLVMBuildCondBr(backend.builder, missing, releaseBlock, forward)
+        LLVMPositionBuilderAtEnd(backend.builder, forward)
+        bootstrapLlvmCallTyped(backend, LLVMGlobalGetValueType(drop), target, [closure], "")
+        LLVMBuildRetVoid(backend.builder)
     }
     LLVMPositionBuilderAtEnd(backend.builder, releaseBlock)
     bootstrapLlvmCallNamed(
@@ -547,6 +563,21 @@ fun bootstrapLlvmEmitIndirectDispatcher(
     LLVMBuildUnreachable(backend.builder)
 
     LLVMPositionBuilderAtEnd(backend.builder, invalid)
+    if (bootstrapLlvmLiveRun) {
+        // A lambda a reload added: the generation that has it dispatches the same call.
+        val target = bootstrapLlvmLiveLambdaLookup(backend, functionId, 1)
+        val forward = LLVMAppendBasicBlockInContext(backend.context, function, "live.forward")
+        val unknown = LLVMAppendBasicBlockInContext(backend.context, function, "live.unknown")
+        val missing = LLVMBuildICmp(backend.builder, llvmIntEqual(), target,
+            LLVMConstNull(backend.pointerType),
+            "live.missing")
+        LLVMBuildCondBr(backend.builder, missing, unknown, forward)
+        LLVMPositionBuilderAtEnd(backend.builder, forward)
+        bootstrapLlvmCallTyped(backend, LLVMGlobalGetValueType(function), target,
+            [output, closure, arguments, count], "")
+        LLVMBuildRetVoid(backend.builder)
+        LLVMPositionBuilderAtEnd(backend.builder, unknown)
+    }
     val invalidMessage = LLVMBuildGlobalStringPtr(
         backend.builder, "invalid function reference", "function.error"
     )
@@ -903,4 +934,88 @@ fun bootstrapLlvmDefineWasmStmInvoke(
     )
     LLVMBuildUnreachable(backend.builder)
     return
+}
+
+// `ablac run --live` (docs/design/live-jit.md, stage 3): a closure a later generation made, of a lambda the
+// running module has never seen, reaches this module's dispatchers from code that was not redefined. The
+// registry `abla_live_lambdas` (null until a reload adds a lambda, then a pointer to an immutable array the
+// compiler publishes with one release store, as it does the table: the count, then for each id that
+// generation's call dispatcher and drop dispatcher) knows which generation's dispatcher has a case for it.
+// Every live module defines the global as null; a reload's module finds it defined and names the first's.
+trusted fun bootstrapLlvmLiveLambdaRegistry(backend: BootstrapLlvmBackend): i64* {
+    val found = LLVMGetNamedGlobal(backend.module, "abla_live_lambdas")
+    if (!pointerIsNull(found)) return found
+    val global = LLVMAddGlobal(backend.module, backend.pointerType, "abla_live_lambdas")
+    LLVMSetAlignment(global, i32(8))
+    LLVMSetInitializer(global, LLVMConstNull(backend.pointerType))
+    global
+}
+
+// The dispatcher the registry has for `functionId` (`which`: 1 the call dispatcher, 2 the drop dispatcher), as
+// a pointer, null when it has none; the builder is left in the block after the lookup.
+trusted fun bootstrapLlvmLiveLambdaLookup(backend: BootstrapLlvmBackend, functionId: i64*,
+    which: int): i64* {
+    val function = LLVMGetBasicBlockParent(LLVMGetInsertBlock(backend.builder))
+    val start = LLVMGetInsertBlock(backend.builder)
+    val head = LLVMAppendBasicBlockInContext(backend.context, function, "live.registry")
+    val loop = LLVMAppendBasicBlockInContext(backend.context, function, "live.registry.loop")
+    val body = LLVMAppendBasicBlockInContext(backend.context, function, "live.registry.entry")
+    val next = LLVMAppendBasicBlockInContext(backend.context, function, "live.registry.next")
+    val found = LLVMAppendBasicBlockInContext(backend.context, function, "live.registry.found")
+    val done = LLVMAppendBasicBlockInContext(backend.context, function, "live.registry.done")
+    val registry = LLVMBuildLoad2(
+        backend.builder, backend.pointerType, bootstrapLlvmLiveLambdaRegistry(backend),
+        "live.registry.array"
+    )
+    LLVMSetAlignment(registry, i32(8))
+    // Acquire: the entries are written before the array is published.
+    LLVMSetOrdering(registry, i32(4))
+    val absent = LLVMBuildICmp(backend.builder, llvmIntEqual(), registry,
+        LLVMConstNull(backend.pointerType),
+        "live.registry.absent")
+    LLVMBuildCondBr(backend.builder, absent, done, head)
+    LLVMPositionBuilderAtEnd(backend.builder, head)
+    val base = LLVMBuildPtrToInt(backend.builder, registry, backend.i64Type,
+        "live.registry.address")
+    val count = LLVMBuildLoad2(backend.builder, backend.i64Type, registry, "live.registry.count")
+    LLVMSetAlignment(count, i32(8))
+    val wanted = LLVMBuildSExt(backend.builder, functionId, backend.i64Type, "live.registry.wanted")
+    LLVMBuildBr(backend.builder, loop)
+    LLVMPositionBuilderAtEnd(backend.builder, loop)
+    val index = LLVMBuildPhi(backend.builder, backend.i64Type, "live.registry.index")
+    bootstrapLlvmAddPhiIncoming(index, LLVMConstInt(backend.i64Type, 0, 0), head)
+    val over = LLVMBuildICmp(backend.builder, llvmIntUnsignedGreaterOrEqual(), index, count,
+        "live.registry.over")
+    LLVMBuildCondBr(backend.builder, over, done, body)
+    LLVMPositionBuilderAtEnd(backend.builder, body)
+    val offset = LLVMBuildAdd(backend.builder,
+        LLVMBuildMul(backend.builder, index, LLVMConstInt(backend.i64Type, 24, 0),
+            "live.registry.scaled"),
+        LLVMConstInt(backend.i64Type, 8, 0), "live.registry.offset")
+    val entry = LLVMBuildAdd(backend.builder, base, offset, "live.registry.at")
+    val key = LLVMBuildLoad2(backend.builder, backend.i64Type,
+        LLVMBuildIntToPtr(backend.builder, entry, backend.pointerType, "live.registry.key.at"),
+        "live.registry.key")
+    LLVMSetAlignment(key, i32(8))
+    val same = LLVMBuildICmp(backend.builder, llvmIntEqual(), key, wanted, "live.registry.same")
+    LLVMBuildCondBr(backend.builder, same, found, next)
+    LLVMPositionBuilderAtEnd(backend.builder, next)
+    val following = LLVMBuildAdd(backend.builder, index, LLVMConstInt(backend.i64Type, 1, 0),
+        "live.registry.following")
+    bootstrapLlvmAddPhiIncoming(index, following, next)
+    LLVMBuildBr(backend.builder, loop)
+    LLVMPositionBuilderAtEnd(backend.builder, found)
+    val slot = LLVMBuildAdd(backend.builder, entry, LLVMConstInt(backend.i64Type, which * 8, 0),
+        "live.registry.slot")
+    val target = LLVMBuildLoad2(backend.builder, backend.pointerType,
+        LLVMBuildIntToPtr(backend.builder, slot, backend.pointerType, "live.registry.slot.at"),
+        "live.registry.target")
+    LLVMSetAlignment(target, i32(8))
+    LLVMBuildBr(backend.builder, done)
+    LLVMPositionBuilderAtEnd(backend.builder, done)
+    val result = LLVMBuildPhi(backend.builder, backend.pointerType, "live.registry.result")
+    bootstrapLlvmAddPhiIncoming(result, LLVMConstNull(backend.pointerType), start)
+    bootstrapLlvmAddPhiIncoming(result, LLVMConstNull(backend.pointerType), loop)
+    bootstrapLlvmAddPhiIncoming(result, target, found)
+    result
 }

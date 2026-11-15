@@ -5,9 +5,16 @@
 // - a thread inside slow()'s old body during the reload finishes it on the old code (10), and its
 //   next call takes the new body (20);
 // - a reload with no change applies nothing;
-// - a changed lambda is refused (E_LIVE_LAMBDA, naming it) and the old lambda keeps running.
-// Exits 42 when every check passed. Markers are kept the same length, so no other offset moves, and
-// are spelled in two pieces in main, so an edit changes only the marked line.
+// - a changed lambda is redefined (stage 3): a closure made before the reload runs the new body, also when
+//   the edit changes the lambda's length (which renames it: the reload matches it to the running one), and
+//   keeps the captures it was made with;
+// - a lambda whose captures change is refused (E_LIVE_LAMBDA, naming the change) and keeps running as it was;
+// - a lambda a reload adds, handed to code that was not redefined, runs through the running module's dispatcher
+//   (the registry of new lambdas), and one whose closure owns a Token is dropped through its drop dispatcher.
+// - a function a reload adds whose runtime id collides with the running program's livetrqwlyjuls: a function value
+//   of livetrqwlyjuls made before the reload still calls it, from new code too.
+// Exits 42 when every check passed. Markers are spelled in two pieces in main, so an edit changes only the
+// marked line.
 import "abla/io"
 import "abla/live"
 import "abla/text"
@@ -30,6 +37,50 @@ fun slow(): int {
 
 fun lambdaMaker(): () -> int = { 5 } // lambda-marker
 
+// A lambda with a capture: base + 1 becomes base + 100, which changes the lambda's length.
+fun adder(base: int): () -> int = { base + 1 } // adder-marker
+
+// A lambda that starts capturing a second value.
+fun shaped(first: int, second: int): () -> int = { first } // shaped-marker
+
+// Calls what it is given: its code is the running program's, so a lambda a reload adds reaches it through the
+// running module's dispatcher, which must find the new generation's.
+fun applyIt(f: () -> int): int = f()
+
+// Gains a lambda in a reload (an owner with none before), which it hands to applyIt. It allocates before the edit
+// too (a string), so main, which calls it, keeps the same roots across the call and is not redefined.
+fun fresh(): int = "${value()}".size - 1 // fresh-marker
+
+var dropped: int by TVar(0)
+
+resource class Token(val id: int) {
+    fun drop(): void {
+        atomic { dropped += 1 }
+        return
+    }
+}
+
+// Owns the closure it is given and drops it uncalled when it returns (a call would consume it, in the lambda's own
+// code): its code is the running program's, so a closure of a lambda a reload adds is dropped through the running
+// module's drop dispatcher, which must find the new one's.
+fun discardIt(own once: FnOnce() -> int): int = 0
+
+// Two names whose runtime ids collide (the hash of their name, parameters and result): the running program has
+// livetrqwlyjuls; a reload adds livekegiafmcsp, which would win the id (its symbol sorts first) and leave a
+// function value of livetrqwlyjuls made before the reload calling livekegiafmcsp. A reload keeps the running
+// program's ids and gives a function it adds another.
+fun livetrqwlyjuls(): int = 2
+
+// new-function-marker
+
+// Calls the function value it is given; a reload makes it hand the new function to applyIt too.
+fun viaNew(f: () -> int): int = f() // via-marker
+
+// Gains a lambda that captures a Token, handed to discardIt (an array: it allocates before the edit too).
+fun freshDrop(): int {
+    return [value()].size - 1 // drop-marker
+}
+
 var failures = 0
 
 fun check(name: string, ok: bool, detail: string): void {
@@ -50,7 +101,16 @@ fun main: int {
     val f: () -> int = value
     val closure: () -> int = { value() * 1 }
     val made = lambdaMaker()
+    val added = adder(5)
+    val kept = shaped(3, 4)
     check("before", value() == 1 && f() == 1 && closure() == 1, "${value()}")
+    // applyIt is the running program's (its own code calls what it is given) before any reload.
+    check("apply before", applyIt(f) == 1, "${applyIt(f)}")
+    val collided: () -> int = livetrqwlyjuls
+    check("via before", viaNew(collided) == 2, "")
+    val first = Token(1)
+    check("consume before",
+        discardIt(move { first.id }) == 0 && atomic { dropped } == 1 && freshDrop() == 0, "")
     val watcher = thread {
         var rounds = 0
         while (value() == 1 && rounds < 2000000000) rounds += 1
@@ -61,8 +121,9 @@ fun main: int {
         val second = slow()
         first * 100 + second
     }
-    while (atomic { entered } == 0) { }
-    check("edit value and slow", edit(path, "= 1 // value-" + "marker", "= 2 // value-" + "marker") &&
+    while (atomic { entered } == 0) {}
+    check("edit value and slow", edit(path, "= 1 // value-" + "marker",
+        "= 2 // value-" + "marker") &&
         edit(path, "10 // slow-" + "marker", "20 // slow-" + "marker"), path)
     val applied = liveReload()
     check("reload applied", applied.applied(), applied.message)
@@ -81,10 +142,52 @@ fun main: int {
     val unchanged = liveReload()
     check("nothing changed", unchanged.applied() && unchanged.message.contains("nothing changed"),
         unchanged.message)
-    check("edit lambda", edit(path, "{ 5 } // lambda-" + "marker", "{ 6 } // lambda-" + "marker"), path)
+    check("edit lambda", edit(path, "{ 5 } // lambda-" + "marker", "{ 6 } // lambda-" + "marker"),
+        path)
     val lambda = liveReload()
-    check("lambda refused", lambda.refused() && lambda.message.contains("E_LIVE_LAMBDA") &&
-        lambda.message.contains("lambda"), lambda.message)
-    check("old lambda kept", made() == 5 && lambdaMaker()() == 5, "${made()}")
+    check("lambda applied", lambda.applied(), lambda.message)
+    check("closure made before takes the new lambda", made() == 6 && lambdaMaker()() == 6,
+        "${made()}")
+    check("edit lambda length", edit(path, "{ base + 1 } // adder-" + "marker",
+        "{ base + 100 } // adder-" + "marker"), path)
+    val longer = liveReload()
+    check("renamed lambda applied", longer.applied(), longer.message)
+    check("closure made before, captures kept", added() == 105 && adder(7)() == 107, "${added()}")
+    check("edit captures", edit(path, "= { first } // shaped-" + "marker",
+        "= { first + second } // shaped-" + "marker"), path)
+    val shape = liveReload()
+    check("capture change refused", shape.refused() && shape.message.contains("E_LIVE_LAMBDA") &&
+        shape.message.contains("captures") && shape.message.contains("second"), shape.message)
+    check("lambda kept after the refusal", kept() == 3 && shaped(3, 4)() == 3, "${kept()}")
+    // Undo the refused edit, then add a lambda: the running code calls it through its own dispatcher.
+    check("undo captures", edit(path, "= { first + second } // shaped-" + "marker",
+        "= { first } // shaped-" + "marker"), path)
+    check("add a lambda", edit(path, ".size - 1 // fresh-" + "marker",
+        ".size * 0 + applyIt({ 21 }) * 2 // fresh-" + "marker"), path)
+    val adding = liveReload()
+    check("new lambda applied", adding.applied() && !adding.message.contains("applyIt"),
+        adding.message)
+    check("new lambda through the running dispatcher", fresh() == 42, "${fresh()}")
+    check("add a dropped lambda", edit(path, "return [value()].size - 1 // drop-" + "marker",
+        "val token = Token(7); return [value()].size * 0 + discardIt(move { token.id }) + 7 // drop-" +
+        "marker"), path)
+    val dropping = liveReload()
+    check("dropped lambda applied", dropping.applied() && !dropping.message.contains("discardIt"),
+        dropping.message)
+    val tokenId = freshDrop()
+    check("new lambda dropped through the running dispatcher",
+        tokenId == 7 && atomic { dropped } == 2,
+        "$tokenId, dropped ${atomic { dropped }}")
+    check("add a colliding function",
+        edit(path, "// new-function-" + "marker",
+            "fun livekegiafmcsp(): int = 1 // new-function-" + "marker") &&
+            edit(path, "= f() // via-" + "marker",
+                "= f() + applyIt(livekegiafmcsp) * 10 // via-" + "marker"),
+        path)
+    val colliding = liveReload()
+    check("colliding function applied", colliding.applied(), colliding.message)
+    val through = viaNew(collided)
+    check("a value made before keeps its body", through == 12 && collided() == 2,
+        "$through, ${collided()}")
     if (failures == 0) 42 else 1
 }

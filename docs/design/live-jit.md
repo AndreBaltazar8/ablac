@@ -186,3 +186,80 @@ be deterministic per function (it is: stage2 == stage3). A cheap pre-test in sta
 the same program twice in live mode and compare the hashes of every function.
 Escape stays exact in live mode: no conservative setting is needed, since a frame closure that a
 change would break shows up as a changed caller.
+
+## Stage 3: lambdas (2026-11-15, built)
+
+ir.ab names a lambda `<owner>_lambda_<begin>_<end>_<n>`: its span in its owner and its number among the
+functions lowered there. An edit inside a lambda, or before it in its owner, renames it, and a renamed lambda is
+a new function with a new runtime id, so a closure the running code made would keep the old body. Lambdas are in
+the live table like any function (stage 1), so what a reload needs is to recognise the lambda it replaces.
+
+**Matching** (src/backend/llvm/live_lambdas.ab). Before a reload's program reaches the backend, the reload's
+lambdas are matched, owner by owner, to the running program's:
+1. A lambda with the same source text and shape is the same lambda: it keeps its name, so its code must be the
+   same, and E_LIVE_CALLER applies to it as to an unchanged function.
+2. The lambdas left on each side, paired in order when there are as many on both sides, are the edited ones.
+3. Lambdas left over when the other side has none are new. When both sides have some left, in different
+   numbers, the reload is refused: `E_LIVE_LAMBDA: <owner>: its lambdas were edited and some added or removed`.
+
+A matched lambda takes the running program's name in the whole reload's program (its function and every
+instruction naming it), so its symbol, its table slot and its runtime id are the running code's. An edited body
+is then an ordinary redefinition. A closure made before the reload runs the new body with the captures it was made
+with, and the base module's dispatcher and wrapper reach it. A new lambda whose own name happens to be one the
+program has gets a name of its own (`_g<generation>`).
+
+**What is refused.** A paired lambda whose shape changed: its parameters, captures first, and their types, and
+its result. Example: `E_LIVE_LAMBDA: shaped.lambda #0: its captures, parameters or result changed ((first: unknown)
+-> unknown, now (first: unknown, second: unknown) -> unknown): closures the running code made hold the old
+captures`. The running code's closures hold the old capture array.
+
+**New lambdas from code that was not redefined.** A new lambda has an id no base dispatcher knows. Since stage 2c
+each generation has its own internal dispatchers, so new code calling it works. Code that was not redefined (a
+base function that calls what it is given, the collector dropping a closure) goes through the base module's
+dispatchers, whose closed switch ends in "invalid function reference" (call) or a plain release (drop).
+- In a live run, each dispatcher's default first looks the id up in `abla_live_lambdas` (dispatch.ab). Every live
+  module defines that global, null; a reload's module finds it defined and names the first's.
+- The registry is an immutable array: the count, then for each id that generation's call and drop dispatchers.
+- A reload that adds lambdas names its own dispatchers `abla_llvm_call_indirect_live<g>` and
+  `abla_llvm_drop_closure_live<g>`, hidden external. Once it is applied, the compiler publishes a new array, the
+  old entries plus the new ids (sign-extended, as the dispatchers compare them), with one release store. The
+  dispatchers load it with acquire.
+
+**Runtime ids.** A function value holds its function's runtime id: the hash of its name, parameters and result,
+with a collision moved to the next free id, the keeper chosen by symbol order. A reload compiles the whole program,
+so a function it adds whose id collides with a running one's, and whose symbol sorts first, would take that id. A
+value the running code made would then call the new function from new code, and the running code that makes
+such values would compile differently: E_LIVE_CALLER would refuse the reload. So a reload keeps every running
+function's id (by symbol, `bootstrapLlvmLiveRuntimeIds`, in the cached record as `rid` lines), and gives a function
+it adds one none of them has. Every function a reload adds, named or lambda, is in the registry, because a value of
+any of them can reach code that was not redefined.
+
+**State.** The running program's lambdas (name, owner, number, text hash, shape) are kept with the rest of the
+compiler's record. They are updated when a reload is applied, and written to the cached record (`abla-live 2`;
+a version 1 record is not loaded, so the run compiles).
+
+**Tests** (tests/cases/live-jit/reload.ab):
+- a same-length edit of a lambda without captures;
+- a length-changing edit of a lambda with a capture: a closure made before the reload runs the new body with
+  its captured 5 (105);
+- a capture added: refused, and the old lambda keeps running;
+- a lambda added in a function that had none, handed to a base function that calls it (`applyIt`, which `main`
+  uses before the reload, so the base program has it);
+- a function added whose id collides with a running one (two names found by a birthday search over the id hash):
+  a function value made before the reload still calls its own function, from new code too, and the new function
+  handed to a base function reaches it;
+- a new `move` lambda capturing a Token, handed to a base function that owns it and drops it uncalled
+  (`discardIt`): the base drop dispatcher finds the new generation's and the Token is dropped. A call would have
+  consumed it in the lambda's own code, never reaching the base dispatcher.
+
+The last two need their owners to allocate before the edit too. Otherwise their callers' code depends on them
+never collecting (they keep no GC roots across the call), and the unchanged-code rule refuses the reload, as it
+should.
+
+Mutation-checked, each turned off failing the test on its own check:
+- the matching (a closure made before keeps the old body: 6);
+- the shape refusal;
+- the call registry lookup (`invalid function reference`);
+- the drop registry lookup (the Token is not dropped).
+- the id pinning (before it, the collision reload is refused: E_LIVE_CALLER on main);
+- the registry's named functions (only lambdas registered: invalid function reference).

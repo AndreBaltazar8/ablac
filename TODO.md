@@ -1012,9 +1012,13 @@ mmap form) apply there.
   pipeline; built 15.45/6.39 s), a map builder 10.90 s (86.76 s; 10.58/9.52 s), a model
   generator 57.75 s (over 9 min; 62.4/62.0 s). Done since: an object cache (`jit_cache.ab`:
   the object LLJIT generated, captured through its object transform layer, reused while every
-  source file and compile-time input is unchanged), so a rerun skips compiling. Next:
-  indirection stubs (ORC lazy reexports or an indirect stubs manager) so a function can be
-  redefined while the program runs.
+  source file and compile-time input is unchanged), so a rerun skips compiling. Done since:
+  `run --live` (docs/design/live-jit.md): the program's functions through a table of code pointers,
+  `liveReload()` redefining the changed ones, refusals that name what changed (signature, layout,
+  unchanged code that would compile differently), object-cached live runs, and lambda edits
+  (stage 3: an edited lambda is matched to the running one, so closures made before take its new
+  body; new lambdas reach code that was not redefined through a registry). Open: live mode as
+  `run`'s default or opt-in (by its measured cost), freeing old generations, `--watch`.
 
 - [x] **Transactional memory: clocks beyond the region.** A logged transaction runs the single-clock
   protocol on its first region's clock and keeps a snapshot per clock only once it touches a second region

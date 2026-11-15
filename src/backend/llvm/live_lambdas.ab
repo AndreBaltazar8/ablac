@@ -1,0 +1,408 @@
+import "core.ab"
+import "live.ab"
+import "../../ir.ab"
+import "../../codegen_units.ab"
+import "abla/text"
+import "abla/sys/linux/fs"
+import "abla/integer"
+
+// Lambdas across generations of `ablac run --live` (docs/design/live-jit.md, stage 3). ir.ab names a lambda
+// `<owner>_lambda_<begin>_<end>_<n>`: offsets in its owner and its number among the functions lowered in the
+// owner. So an edit inside a lambda, or before it in its owner, renames it, and a renamed lambda would be a
+// new function with a new runtime id. Then a closure the running code made would keep the old body.
+//
+// So before a reload's program reaches the backend, each lambda is matched to the one it replaces, in the
+// same owner:
+// - first, a lambda whose source text is the same as one of the program's (in order);
+// - then the ones left, in order, when as many are left on each side: those are the edited ones.
+// A matched lambda takes the program's name again, so its symbol, its table slot and its runtime id are the
+// running code's. An edited body is then an ordinary redefinition, which closures made before the reload take,
+// with their captures as they are. A lambda whose captures, parameters or result changed would read the
+// running code's closures wrongly, so the reload is refused (E_LIVE_LAMBDA, naming the change), as it is
+// when an owner's lambdas were edited and also added or removed so that the pairs can't be told. A lambda
+// left over is new: a name of its own (one the program never had) and an id of its own.
+
+// The program's lambdas, as loaded and as each applied reload left them: name, owner (the name without its
+// offsets and number), number, source text hash and shape (parameters, captures first, and result).
+var bootstrapLlvmLiveLambdaNames: array<string> = []
+var bootstrapLlvmLiveLambdaOwners: array<string> = []
+var bootstrapLlvmLiveLambdaOrdinals: array<int> = []
+var bootstrapLlvmLiveLambdaTexts: array<int> = []
+var bootstrapLlvmLiveLambdaShapes: array<string> = []
+// What a reload's pass found: its refusals, the lambdas whose text is the program's (their code must be too,
+// bootstrapLlvmLiveIndirect checks), and the records to change or add once it is applied (-1: a new one).
+var bootstrapLlvmLiveLambdaRefusals: array<string> = []
+var bootstrapLlvmLiveLambdaUnchanged: Map<string, int> = Map()
+var bootstrapLlvmLiveLambdaPendingRecords: array<int> = []
+var bootstrapLlvmLiveLambdaPendingNames: array<string> = []
+var bootstrapLlvmLiveLambdaPendingOwners: array<string> = []
+var bootstrapLlvmLiveLambdaPendingOrdinals: array<int> = []
+var bootstrapLlvmLiveLambdaPendingTexts: array<int> = []
+var bootstrapLlvmLiveLambdaPendingShapes: array<string> = []
+
+// A lambda's name taken apart: its owner, its span's length in the owner's text and its number; null for any
+// other function.
+class BootstrapLlvmLiveLambdaName(val owner: string, val length: int, val ordinal: int)
+
+fun bootstrapLlvmLiveLambdaParse(name: string): BootstrapLlvmLiveLambdaName? {
+    var at = name.indexOf("lambda_")
+    while (at >= 0) {
+        val numbers: array<int> = []
+        var cursor = at + 7
+        var ok = true
+        while (ok && numbers.size < 3) {
+            val start = cursor
+            var value = 0
+            while (cursor < name.size && name[cursor] >= 48 && name[cursor] <= 57) {
+                value = value * 10 + name[cursor] - 48
+                cursor = cursor + 1
+            }
+            if (cursor == start) ok = false
+            else {
+                numbers.append(value)
+                if (numbers.size < 3) {
+                    if (cursor < name.size && name[cursor] == 95) cursor = cursor + 1 else ok =
+                        false
+                }
+            }
+        }
+        if (ok && numbers.size == 3) {
+            return BootstrapLlvmLiveLambdaName(
+                "${name.slice(0, at)}|${name.slice(cursor, name.size)}", numbers[1] - numbers[0],
+                numbers[2]
+            )
+        }
+        at = name.indexOf("lambda_", at + 1)
+    }
+    null
+}
+
+// The parameters (its captures come first), their types and the result, as the running code's closures
+// call it.
+fun bootstrapLlvmLiveLambdaShape(function: BootstrapIrFunction): string {
+    var text = "("
+    var index = 0
+    while (index < function.parameters.size) {
+        val type = if (index < function.parameterTypes.size) function.parameterTypes[index] else "?"
+        text = "$text${if (index > 0) ", " else ""}${function.parameters[index]}: $type"
+        index = index + 1
+    }
+    "$text) -> ${function.resultType}"
+}
+
+// The lambda's own source text as a number (from where it starts, as long as its span).
+fun bootstrapLlvmLiveLambdaText(
+    function: BootstrapIrFunction,
+    parsed: BootstrapLlvmLiveLambdaName,
+    var files: Map<int, string>
+): int {
+    val file = bootstrapIrSourcePositionFile(function.position)
+    val offset = bootstrapIrSourcePositionOffset(function.position)
+    var text = files.get(file)
+    if (text == null) {
+        val read = if (file >= 0 && file < bootstrapIrSourceFiles.size)
+            Path(bootstrapIrSourceFiles[file]).readText() else ""
+        files.set(file, read)
+        text = read
+    }
+    val source = text ?? ""
+    val begin = if (offset >= 0 && offset <= source.size) offset else source.size
+    val end = if (begin + parsed.length <= source.size) begin + parsed.length else source.size
+    bootstrapCodegenTextHash(source.slice(begin, end), 17)
+}
+
+fun bootstrapLlvmLiveLambdaReset(): void {
+    bootstrapLlvmLiveLambdaNames = []
+    bootstrapLlvmLiveLambdaOwners = []
+    bootstrapLlvmLiveLambdaOrdinals = []
+    bootstrapLlvmLiveLambdaTexts = []
+    bootstrapLlvmLiveLambdaShapes = []
+    return
+}
+
+// The program's lambdas, in order of their number, by owner: the record indices.
+fun bootstrapLlvmLiveLambdaByOwner(owner: string): array<int> {
+    val found: array<int> = []
+    var index = 0
+    while (index < bootstrapLlvmLiveLambdaOwners.size) {
+        if (bootstrapLlvmLiveLambdaOwners[index] == owner) {
+            found.append(index)
+            var at = found.size - 1
+            while (at > 0 && bootstrapLlvmLiveLambdaOrdinals[found[at - 1]] >
+                bootstrapLlvmLiveLambdaOrdinals[index]) {
+                found[at] = found[at - 1]
+                at = at - 1
+            }
+            found[at] = index
+        }
+        index = index + 1
+    }
+    found
+}
+
+fun bootstrapLlvmLiveLambdaShown(function: BootstrapIrFunction,
+    parsed: BootstrapLlvmLiveLambdaName): string =
+    "${if (function.label != "") function.label else "lambda"} #${parsed.ordinal}"
+
+// The pass: on the program as loaded it records its lambdas; on a reload it matches them and returns the
+// program with the matched ones renamed (the program as it was when nothing needs renaming).
+fun bootstrapLlvmLiveLambdaPass(program: BootstrapIrProgram,
+    stdlibRoot: string): BootstrapIrProgram {
+    bootstrapLlvmLiveLambdaRefusals = []
+    bootstrapLlvmLiveLambdaUnchanged = Map()
+    bootstrapLlvmLiveLambdaPendingRecords = []
+    bootstrapLlvmLiveLambdaPendingNames = []
+    bootstrapLlvmLiveLambdaPendingOwners = []
+    bootstrapLlvmLiveLambdaPendingOrdinals = []
+    bootstrapLlvmLiveLambdaPendingTexts = []
+    bootstrapLlvmLiveLambdaPendingShapes = []
+    val files: Map<int, string> = Map()
+    // The live lambdas of this compile: function index, parsed name, text, shape.
+    val indices: array<int> = []
+    val parsedNames: array<BootstrapLlvmLiveLambdaName> = []
+    val texts: array<int> = []
+    val shapes: array<string> = []
+    var index = 0
+    while (index < program.functions.size) {
+        val function = program.functions[index]
+        val parsed = if (bootstrapLlvmLiveFunction(function, stdlibRoot))
+            bootstrapLlvmLiveLambdaParse(function.name) else null
+        if (parsed != null) {
+            indices.append(index)
+            parsedNames.append(parsed)
+            texts.append(bootstrapLlvmLiveLambdaText(function, parsed, files))
+            shapes.append(bootstrapLlvmLiveLambdaShape(function))
+        }
+        index = index + 1
+    }
+    if (bootstrapLlvmLiveGeneration == 0) {
+        bootstrapLlvmLiveLambdaReset()
+        var lambda = 0
+        while (lambda < indices.size) {
+            bootstrapLlvmLiveLambdaNames.append(program.functions[indices[lambda]].name)
+            bootstrapLlvmLiveLambdaOwners.append(parsedNames[lambda].owner)
+            bootstrapLlvmLiveLambdaOrdinals.append(parsedNames[lambda].ordinal)
+            bootstrapLlvmLiveLambdaTexts.append(texts[lambda])
+            bootstrapLlvmLiveLambdaShapes.append(shapes[lambda])
+            lambda = lambda + 1
+        }
+        return program
+    }
+    // The owners, each once, in order.
+    val owners: array<string> = []
+    for (parsed in parsedNames) {
+        var listed = false
+        for (owner in owners) if (owner == parsed.owner) listed = true
+        if (!listed) owners.append(parsed.owner)
+    }
+    // A new lambda's name (by its function's) and the program's names any of them takes.
+    val renames: Map<string, string> = Map()
+    var renamed = 0
+    val taken: Map<string, int> = Map()
+    // Each new lambda's record: the program's it matched, or -1.
+    val matched = filledArray(indices.size, -1)
+    for (owner in owners) {
+        // This compile's lambdas of the owner, in order of their number.
+        val current: array<int> = []
+        var lambda = 0
+        while (lambda < indices.size) {
+            if (parsedNames[lambda].owner == owner) {
+                current.append(lambda)
+                var at = current.size - 1
+                while (at > 0 && parsedNames[current[at - 1]].ordinal >
+                    parsedNames[lambda].ordinal) {
+                    current[at] = current[at - 1]
+                    at = at - 1
+                }
+                current[at] = lambda
+            }
+            lambda = lambda + 1
+        }
+        val before = bootstrapLlvmLiveLambdaByOwner(owner)
+        val used = filledArray(before.size, false)
+        // The same text and shape: the same lambda, unchanged.
+        for (lambdaIndex in current) {
+            var candidate = 0
+            while (candidate < before.size && matched[lambdaIndex] < 0) {
+                val record = before[candidate]
+                if (!used[candidate] && bootstrapLlvmLiveLambdaTexts[record] ==
+                    texts[lambdaIndex] &&
+                    bootstrapLlvmLiveLambdaShapes[record] == shapes[lambdaIndex]) {
+                    used[candidate] = true
+                    matched[lambdaIndex] = record
+                    bootstrapLlvmLiveLambdaUnchanged.set(bootstrapLlvmLiveLambdaNames[record], 1)
+                }
+                candidate = candidate + 1
+            }
+        }
+        val leftBefore: array<int> = []
+        var candidate = 0
+        while (candidate < before.size) {
+            if (!used[candidate]) leftBefore.append(before[candidate])
+            candidate = candidate + 1
+        }
+        val leftNow: array<int> = []
+        for (lambdaIndex in current) if (matched[lambdaIndex] < 0) leftNow.append(lambdaIndex)
+        if (leftBefore.size == leftNow.size) {
+            // The edited ones, in order.
+            var pair = 0
+            while (pair < leftNow.size) {
+                val lambdaIndex = leftNow[pair]
+                val record = leftBefore[pair]
+                val function = program.functions[indices[lambdaIndex]]
+                if (bootstrapLlvmLiveLambdaShapes[record] != shapes[lambdaIndex]) {
+                    bootstrapLlvmLiveLambdaRefusals.append(
+                        "E_LIVE_LAMBDA: ${bootstrapLlvmLiveLambdaShown(function, parsedNames[lambdaIndex])}: its captures, parameters or result changed (${bootstrapLlvmLiveLambdaShapes[record]}, now ${shapes[lambdaIndex]}): closures the running code made hold the old captures"
+                    )
+                } else matched[lambdaIndex] = record
+                pair = pair + 1
+            }
+        } else if (leftBefore.size > 0 && leftNow.size > 0) {
+            val first = program.functions[indices[leftNow[0]]]
+            bootstrapLlvmLiveLambdaRefusals.append(
+                "E_LIVE_LAMBDA: ${if (first.label != "") first.label else "a function"}: its lambdas were edited and some added or removed (${leftBefore.size} changed or gone, ${leftNow.size} changed or new): the running code's closures can't be matched to the new lambdas"
+            )
+        }
+    }
+    // The renames, the records to change, and the new lambdas' own names.
+    var lambda = 0
+    while (lambda < indices.size) {
+        val name = program.functions[indices[lambda]].name
+        val record = matched[lambda]
+        if (record >= 0) {
+            val base = bootstrapLlvmLiveLambdaNames[record]
+            if (base != name) {
+                renames.set(name, base)
+                renamed = renamed + 1
+            }
+            taken.set(base, 1)
+        }
+        lambda = lambda + 1
+    }
+    lambda = 0
+    while (lambda < indices.size) {
+        val name = program.functions[indices[lambda]].name
+        var final = renames.get(name) ?? name
+        if (matched[lambda] < 0) {
+            // A new lambda whose name is one the program has (another lambda's, a span and number that
+            // happen to agree) would take that one's slot: it gets one of its own.
+            var known = taken.get(name) != null
+            for (old in bootstrapLlvmLiveLambdaNames) if (old == name) known = true
+            if (known) {
+                final = "${name}_g$bootstrapLlvmLiveGeneration"
+                renames.set(name, final)
+                renamed = renamed + 1
+            }
+        }
+        bootstrapLlvmLiveLambdaPendingRecords.append(matched[lambda])
+        bootstrapLlvmLiveLambdaPendingNames.append(final)
+        bootstrapLlvmLiveLambdaPendingOwners.append(parsedNames[lambda].owner)
+        bootstrapLlvmLiveLambdaPendingOrdinals.append(parsedNames[lambda].ordinal)
+        bootstrapLlvmLiveLambdaPendingTexts.append(texts[lambda])
+        bootstrapLlvmLiveLambdaPendingShapes.append(shapes[lambda])
+        lambda = lambda + 1
+    }
+    if (renamed == 0) return program
+    bootstrapLlvmLiveLambdaRenamed(program, renames)
+}
+
+// The program with functions named after `renames`, and every instruction that names one of them.
+fun bootstrapLlvmLiveLambdaRenamed(program: BootstrapIrProgram,
+    renames: Map<string, string>): BootstrapIrProgram {
+    val functions: array<BootstrapIrFunction> = []
+    for (function in program.functions) {
+        val name = renames.get(function.name) ?? function.name
+        val instructions = bootstrapLlvmLiveLambdaInstructions(function.instructions, renames)
+        functions.append(if (name == function.name && instructions.size == 0) function
+            else BootstrapIrFunction(
+                name, function.parameters,
+                if (instructions.size == 0) function.instructions else instructions,
+                function.result, function.blocks, function.locals, function.localTypes,
+                function.parameterTypes, function.resultType, function.inlineHint,
+                function.noinlineHint,
+                function.naked, function.section, function.targetFeatures,
+                function.verificationErrors,
+                function.label, function.position
+            ))
+    }
+    val top = bootstrapLlvmLiveLambdaInstructions(program.instructions, renames)
+    BootstrapIrProgram(
+        if (top.size == 0) program.instructions else top, functions, program.classes,
+        program.natives,
+        program.globalNames, program.globalTypes, program.globalKinds, program.compileInputPaths,
+        program.compileInputContents, program.errors, program.lookup, program.validationFailures,
+        program.extensionFields
+    )
+}
+
+// The instructions with each name in `renames` replaced, or none when nothing named one.
+fun bootstrapLlvmLiveLambdaInstructions(
+    instructions: array<BootstrapInstruction>,
+    renames: Map<string, string>
+): array<BootstrapInstruction> {
+    var any = false
+    for (instruction in instructions) {
+        if (renames.get(instruction.text) != null) any = true
+        for (text in instruction.texts) if (renames.get(text) != null) any = true
+    }
+    val result: array<BootstrapInstruction> = []
+    if (!any) return result
+    for (instruction in instructions) {
+        var changed = renames.get(instruction.text) != null
+        for (text in instruction.texts) if (renames.get(text) != null) changed = true
+        if (!changed) result.append(instruction)
+        else {
+            val texts: array<string> = []
+            for (text in instruction.texts) texts.append(renames.get(text) ?? text)
+            result.append(BootstrapInstruction(
+                instruction.opcode, instruction.result, instruction.left, instruction.right,
+                renames.get(instruction.text) ?? instruction.text, instruction.target,
+                instruction.alternate,
+                instruction.operands, texts, instruction.position
+            ))
+        }
+    }
+    result
+}
+
+// Once a reload is applied: its lambdas are the program's.
+fun bootstrapLlvmLiveLambdaApplied(): void {
+    var pending = 0
+    while (pending < bootstrapLlvmLiveLambdaPendingNames.size) {
+        val record = bootstrapLlvmLiveLambdaPendingRecords[pending]
+        if (record >= 0) {
+            bootstrapLlvmLiveLambdaTexts[record] = bootstrapLlvmLiveLambdaPendingTexts[pending]
+            bootstrapLlvmLiveLambdaShapes[record] = bootstrapLlvmLiveLambdaPendingShapes[pending]
+        } else {
+            bootstrapLlvmLiveLambdaNames.append(bootstrapLlvmLiveLambdaPendingNames[pending])
+            bootstrapLlvmLiveLambdaOwners.append(bootstrapLlvmLiveLambdaPendingOwners[pending])
+            bootstrapLlvmLiveLambdaOrdinals.append(bootstrapLlvmLiveLambdaPendingOrdinals[pending])
+            bootstrapLlvmLiveLambdaTexts.append(bootstrapLlvmLiveLambdaPendingTexts[pending])
+            bootstrapLlvmLiveLambdaShapes.append(bootstrapLlvmLiveLambdaPendingShapes[pending])
+        }
+        pending = pending + 1
+    }
+    return
+}
+
+// The records as lines of the live record (`lambda\t<name>\t<owner>\t<number>\t<text>\t<shape>`).
+fun bootstrapLlvmLiveLambdaRecordText(): string {
+    var text = ""
+    var index = 0
+    while (index < bootstrapLlvmLiveLambdaNames.size) {
+        text = text +
+            "lambda\t${bootstrapLlvmLiveLambdaNames[index]}\t${bootstrapLlvmLiveLambdaOwners[index]}\t${bootstrapLlvmLiveLambdaOrdinals[index]}\t${bootstrapLlvmLiveLambdaTexts[index]}\t${bootstrapLlvmLiveLambdaShapes[index]}\n"
+        index = index + 1
+    }
+    text
+}
+
+fun bootstrapLlvmLiveLambdaRecordLine(fields: array<string>): void {
+    if (fields.size != 6 || fields[0] != "lambda") return
+    bootstrapLlvmLiveLambdaNames.append(fields[1])
+    bootstrapLlvmLiveLambdaOwners.append(fields[2])
+    bootstrapLlvmLiveLambdaOrdinals.append(fields[3].parseInt() ?? 0)
+    bootstrapLlvmLiveLambdaTexts.append(fields[4].parseInt() ?? 0)
+    bootstrapLlvmLiveLambdaShapes.append(fields[5])
+    return
+}
