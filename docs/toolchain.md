@@ -347,7 +347,13 @@ pure self-rebuild gate; options after the source are order-independent.
 
 `build --strict-imports` makes every module whose package doesn't set
 `visibility` [strict](language.md#strict-imports) (it is part of the cache
-identity). `build --visibility-report <file>` builds as usual, without the
+identity). `build --strict-imports=warn` leaves those modules flat and prints,
+as a warning, each diagnostic `--strict-imports` would give them, with the
+same place and `help:` line: a name of a module they don't import, an
+extension function, operator or overload of one, a name two imports pass on
+through `export import`. Each is printed once, and the build doesn't use the
+cache (the warnings come from the front end). A package that sets
+`visibility` is not affected. `build --visibility-report <file>` builds as usual, without the
 cache, and writes to `<file>` one tab-separated line per name a module would
 lose under strict imports: module, line, column, name, declaring module and
 the import to add, and a line with a seventh column, `member` or `overload`,

@@ -2806,7 +2806,8 @@ fun main: int = nextId()
   name hides what it passes on under that name.
 - `visibility = "program"` keeps a package flat. A program without a
   manifest, or whose manifest doesn't say, is strict when built with
-  `--strict-imports`.
+  `--strict-imports`; with `--strict-imports=warn` it stays flat and each
+  diagnostic strict imports would give it is a warning, with its `help:`.
 - To migrate, `ablac build app.ab -o app --visibility-report report.tsv`
   builds as usual and writes every name each module would lose, with the
   import to add, and each extension, operator and overload call that relies

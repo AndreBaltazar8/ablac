@@ -2600,6 +2600,13 @@ fun bootstrapModuleStrict(modulePath: string): bool {
     else bootstrapStrictImportsRequested
 }
 
+/** Whether `--strict-imports=warn` covers `modulePath`: a program's module that `--strict-imports` would make strict
+ *  (its package doesn't set `visibility`). */
+fun bootstrapModuleStrictWarned(modulePath: string): bool =
+    bootstrapStrictImportsWarn && !modulePath.startsWith("<") &&
+        !bootstrapStandardLibraryModuleSource(modulePath) &&
+        bootstrapModuleManifestVisibility(modulePath) == ""
+
 /** `target` as an import from `importer`: a standard-library module by its
  *  name (`abla/io`), another file by its path relative to the importer's. */
 fun bootstrapImportSpelling(importer: string, target: string): string {
@@ -2659,14 +2666,18 @@ fun bootstrapValidateStrictImports(
     // What the report asks: every module of the program (not the standard
     // library's) as if it were strict.
     val asStrict: array<bool> = []
+    // The modules `--strict-imports=warn` covers: checked as strict, warned about, built flat.
+    val warned: array<bool> = []
     var anyStrict = false
     for (snapshot in snapshots) {
         val found = bootstrapModuleStrict(snapshot.path)
+        val warn = !found && bootstrapModuleStrictWarned(snapshot.path)
         strict.append(found)
-        asStrict.append(found || (report &&
+        warned.append(warn)
+        asStrict.append(found || warn || (report &&
             !bootstrapStandardLibraryModuleSource(snapshot.path) &&
             !snapshot.path.startsWith("<")))
-        if (found) anyStrict = true
+        if (found || warn) anyStrict = true
     }
     if (!anyStrict && !report) return BootstrapImportAliasValidation(0, "")
     val strictSummary = bootstrapAliasSummary(aliases, snapshots, Map())
@@ -2736,7 +2747,7 @@ fun bootstrapValidateStrictImports(
     module = 0
     while (module < snapshots.size) {
         tableModules.set(snapshots[module].path, module)
-        tableModes.append(if (strict[module]) 1 else if (asStrict[module]) 2 else 0)
+        tableModes.append(if (strict[module]) 1 else if (warned[module]) 3 else if (asStrict[module]) 2 else 0)
         tableVisible.append([])
         tableMemberVisible.append([])
         // (The sources only for the report's lines and columns: kept for the whole build otherwise.)
@@ -2788,22 +2799,27 @@ fun bootstrapValidateStrictImports(
                 val programSpelling = if (internal) bootstrapLibraryEntryReaching(
                     finding.declaring, aliases, snapshots
                 ) else spelling
-                if (strict[module]) {
-                    errors = errors + 1
-                    diagnostics = if (internal)
-                        "${diagnostics}error[E_NAME_NOT_IMPORTED]: `${finding.name}` is internal to the standard library (declared in ${snapshots[finding.declaring].path}); no import makes it visible\nhelp: a library module that offers it would be a change to the standard library to request\nsource[strict-import]:${snapshot.path}:${finding.begin}:${finding.end}\n"
+                if (strict[module] || warned[module]) {
+                    val diagnostic = if (internal)
+                        "error[E_NAME_NOT_IMPORTED]: `${finding.name}` is internal to the standard library (declared in ${snapshots[finding.declaring].path}); no import makes it visible\nhelp: a library module that offers it would be a change to the standard library to request\nsource[strict-import]:${snapshot.path}:${finding.begin}:${finding.end}\n"
                     else
-                        "${diagnostics}error[E_NAME_NOT_IMPORTED]: `${finding.name}` is declared in ${snapshots[finding.declaring].path}, which this module doesn't import\nhelp: add: import \"$spelling\"\nsource[strict-import]:${snapshot.path}:${finding.begin}:${finding.end}\n"
+                        "error[E_NAME_NOT_IMPORTED]: `${finding.name}` is declared in ${snapshots[finding.declaring].path}, which this module doesn't import\nhelp: add: import \"$spelling\"\nsource[strict-import]:${snapshot.path}:${finding.begin}:${finding.end}\n"
+                    if (strict[module]) {
+                        errors = errors + 1
+                        diagnostics = "$diagnostics$diagnostic"
+                    } else bootstrapStrictImportWarning(diagnostic)
                 }
                 lines =
                     "$lines${snapshot.path}\t${finding.line}\t${finding.column}\t${finding.name}\t${snapshots[finding.declaring].path}\timport \"$programSpelling\"\n"
             }
-            if (strict[module]) {
+            if (strict[module] || warned[module]) {
                 val ambiguity = bootstrapStrictPassedOnAmbiguity(
                     module, aliases, snapshots, names, declaring, sharedNames
                 )
-                errors = errors + ambiguity.errors
-                diagnostics = "$diagnostics${ambiguity.diagnostics}"
+                if (strict[module]) {
+                    errors = errors + ambiguity.errors
+                    diagnostics = "$diagnostics${ambiguity.diagnostics}"
+                } else bootstrapStrictImportWarning(ambiguity.diagnostics)
             }
         }
         module = module + 1
