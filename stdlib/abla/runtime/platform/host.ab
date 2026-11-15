@@ -479,6 +479,7 @@ trusted fun __ablaRuntimeHostForkRepair(): void {
     // other thread runs.
     if (mutexWord != 0) ablaRuntimeAtomicStoreI64(mutexWord, 0)
     if (!held) __ablaRuntimeHostActiveThreads = 0
+    __ablaRuntimeHostStwForkReset()
     return
 }
 
@@ -1079,6 +1080,12 @@ var __ablaRuntimeHostHeapMutex: int = 0
 var __ablaRuntimeHostActiveThreads: int = 0
 
 trusted fun __ablaRuntimePlatformThreadsEnable(): void {
+    __ablaRuntimeHostThreadsShare()
+    // The thread that starts sharing is a registered one for good (a program's main thread).
+    if (__ablaRuntimeHostStwRecord() == 0) __ablaRuntimePlatformThreadRegister()
+}
+
+trusted fun __ablaRuntimeHostThreadsShare(): void {
     if (__ablaRuntimeHostHeapNative()) __ablaRuntimeHostHeapShare()
     if (__ablaRuntimeHostHeapMutex == 0) {
         // Static storage, the platform's whole mutex (40 bytes on Linux, 64 on Darwin; a 40-byte block let
@@ -1115,18 +1122,20 @@ trusted fun __ablaRuntimeExportEnter(): int {
     val share = __ablaRuntimeHostExportShareAddress()
     if (ablaRuntimeAtomicLoadI64(share) != 2) {
         if (ablaRuntimeAtomicCompareExchangeI64(share, 0, 1) == 0) {
-            __ablaRuntimePlatformThreadsEnable()
+            __ablaRuntimeHostThreadsShare()
             ablaRuntimeAtomicStoreI64(share, 2)
         } else {
             while (ablaRuntimeAtomicLoadI64(share) != 2) {}
         }
     }
+    __ablaRuntimePlatformThreadRegister()
     ablaRuntimeAtomicFetchAddI64(__ablaRuntimeHostExportInsideAddress(), 1)
     0
 }
 
 trusted fun __ablaRuntimeExportLeave(): int {
     ablaRuntimeAtomicFetchAddI64(__ablaRuntimeHostExportInsideAddress(), -1)
+    __ablaRuntimePlatformThreadUnregister()
     0
 }
 
@@ -1149,6 +1158,351 @@ trusted fun __ablaRuntimeExportInitBegin(): int {
 trusted fun __ablaRuntimeExportInitEnd(): int {
     ablaRuntimeAtomicStoreI64(__ablaRuntimeHostExportInitAddress(), 2)
     0
+}
+
+
+// ---- Stop-the-world collection (#811) -------------------------------------------------------------------------
+// A collection needs every thread's roots, and no thread running while it marks and sweeps. Threads register a record
+// in a list; the thread that collects (it runs a safe point past the threshold) makes the others stop at their next
+// safe point by setting the byte threshold to 0, so each one's next safe point calls the collector, finds a collection
+// under way and parks there. Its roots are then stable on its own chain, which the collector walks with its own.
+//   A thread's record (raw memory, from its registration to its last leave; a word of thread-local storage holds its
+//   address): 0 next record  8 the thread's root cell (the block above: head, region)  16 the thread's number
+//   24 parked  32 registration depth  40 1 while the thread's own pressure collection holds the stop
+//   48 1 when it parked for another thread's collection.
+//   `parked` holds the stop's token while the thread waits at a safe point, -1 while it is in native code that blocks
+//   (a join), where the collector may claim it (its token) and the thread, coming back, waits for the stop to end.
+//   The stop's word: even when no collection is under way, odd (its token) from the moment a thread wins it.
+// A thread in a region, or one that never reaches a safe point (blocked in the system, a loop that does not allocate),
+// cannot park: the stop is abandoned after __ablaRuntimeHostStwWaitMilliseconds (counted, and ABLA_GC_TRACE=1 says
+// which thread) and the collection does not run; no stop starts for ten times that long afterwards.
+// The block (static storage): 0 the word  8 the registry's lock  16 its head  24 threads numbered  32 collections
+// that stopped threads  40 stops abandoned  48 the collector's record  56 the threshold before the stop  64 frames
+// of exited threads (the permanent global-roots frames)  72 clock scratch (16)  96 number scratch (32)
+// 128 no stop starts before this time (milliseconds), after one was abandoned  136 the debug hold  144 free records
+private trusted fun __ablaRuntimeHostStwAddress(): int = nativeStaticAllocate(160)
+
+// The calling thread's record (0 before its first registration).
+private trusted fun __ablaRuntimeHostStwRecordCell(): int =
+    nativeThreadLocalBytes("\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
+
+private trusted fun __ablaRuntimeHostStwRecord(): int =
+    ablaRuntimeLoadI64(__ablaRuntimeHostStwRecordCell())
+
+var __ablaRuntimeHostGcTrace: bool = __ablaRuntimeHostGcTraceConfigured()
+
+@noinline
+trusted fun __ablaRuntimeHostGcTraceConfigured(): bool {
+    val value = ablaRuntimePointerAddress(__ablaRuntimeHostGetenv(ablaRuntimePointerFromAddress(
+        __ablaRuntimeWord0("ABLA_GC_TRACE")
+    )))
+    value != 0 && ablaRuntimeLoadU8(value) == 49 && ablaRuntimeLoadU8(value + 1) == 0
+}
+
+// The thread joins the registry; nested registrations (an export called from an export) count.
+trusted fun __ablaRuntimePlatformThreadRegister(): void {
+    var record = __ablaRuntimeHostStwRecord()
+    if (record != 0) {
+        ablaRuntimeStoreI64(record + 32, ablaRuntimeLoadI64(record + 32) + 1)
+        return
+    }
+    val stw = __ablaRuntimeHostStwAddress()
+    // Records of exited threads are reused (+144 heads the list), so a program that starts many threads allocates
+    // no more than its most at once.
+    __ablaRuntimeFutexLock(stw + 8)
+    record = ablaRuntimeLoadI64(stw + 144)
+    if (record != 0) ablaRuntimeStoreI64(stw + 144, ablaRuntimeLoadI64(record))
+    __ablaRuntimeFutexUnlock(stw + 8)
+    if (record == 0) record = __ablaRuntimePlatformRawAllocate(64)
+    ablaRuntimeStoreI64(record + 8, __ablaRuntimeHostRootFrameAddress())
+    ablaRuntimeStoreI64(record + 24, 0)
+    ablaRuntimeStoreI64(record + 32, 1)
+    ablaRuntimeStoreI64(record + 40, 0)
+    ablaRuntimeStoreI64(record + 48, 0)
+    __ablaRuntimeFutexLock(stw + 8)
+    ablaRuntimeStoreI64(record, ablaRuntimeLoadI64(stw + 16))
+    ablaRuntimeStoreI64(stw + 16, record)
+    val number = ablaRuntimeLoadI64(stw + 24) + 1
+    ablaRuntimeStoreI64(stw + 24, number)
+    ablaRuntimeStoreI64(record + 16, number)
+    ablaRuntimeStoreI64(__ablaRuntimeHostStwRecordCell(), record)
+    __ablaRuntimeFutexUnlock(stw + 8)
+    return
+}
+
+// The outermost leave: the record leaves the registry. Frames still on the thread's chain are permanent (the static
+// frame of an export's globals, never popped): they move to the registry's own chain, which every collection marks.
+trusted fun __ablaRuntimePlatformThreadUnregister(): void {
+    val record = __ablaRuntimeHostStwRecord()
+    if (record == 0) return
+    val depth = ablaRuntimeLoadI64(record + 32) - 1
+    ablaRuntimeStoreI64(record + 32, depth)
+    if (depth != 0) return
+    val cell = __ablaRuntimeHostRootFrameAddress()
+    val stw = __ablaRuntimeHostStwAddress()
+    __ablaRuntimeFutexLock(stw + 8)
+    var at = stw + 16
+    var seen = ablaRuntimeLoadI64(at)
+    while (seen != 0 && seen != record) {
+        at = seen
+        seen = ablaRuntimeLoadI64(at)
+    }
+    if (seen == record) ablaRuntimeStoreI64(at, ablaRuntimeLoadI64(record))
+    val head = ablaRuntimeLoadI64(cell)
+    if (head != 0) {
+        var tail = head
+        while (ablaRuntimeLoadI64(tail) != 0) tail = ablaRuntimeLoadI64(tail)
+        ablaRuntimeStoreI64(tail, ablaRuntimeLoadI64(stw + 64))
+        ablaRuntimeStoreI64(stw + 64, head)
+        ablaRuntimeStoreI64(cell, 0)
+    }
+    ablaRuntimeStoreI64(__ablaRuntimeHostStwRecordCell(), 0)
+    ablaRuntimeStoreI64(record, ablaRuntimeLoadI64(stw + 144))
+    ablaRuntimeStoreI64(stw + 144, record)
+    __ablaRuntimeFutexUnlock(stw + 8)
+    return
+}
+
+// The calling thread waits for the stop `token` to end, parked.
+private trusted fun __ablaRuntimeHostStwPark(token: int, record: int): void {
+    val stw = __ablaRuntimeHostStwAddress()
+    ablaRuntimeAtomicStoreI64(record + 24, token)
+    while (ablaRuntimeAtomicLoadI64(stw) == token) __ablaRuntimeFutexWait(stw, token)
+    ablaRuntimeStoreI64(record + 48, 1)
+    return
+}
+
+// In native code that blocks (a join) the thread counts as parked: its chain is stable. Coming back it waits out
+// a stop that claimed it.
+trusted fun __ablaRuntimePlatformNativeEnter(): void {
+    val record = __ablaRuntimeHostStwRecord()
+    if (record != 0) ablaRuntimeAtomicStoreI64(record + 24, -1)
+    return
+}
+
+trusted fun __ablaRuntimePlatformNativeLeave(): void {
+    val record = __ablaRuntimeHostStwRecord()
+    if (record == 0) return
+    val seen = ablaRuntimeAtomicCompareExchangeI64(record + 24, -1, 0)
+    if (seen == -1) return
+    // A collection claimed the thread while it was away: wait for it to end.
+    val stw = __ablaRuntimeHostStwAddress()
+    while (ablaRuntimeAtomicLoadI64(stw) == seen) __ablaRuntimeFutexWait(stw, seen)
+    ablaRuntimeAtomicStoreI64(record + 24, 0)
+    return
+}
+
+private trusted fun __ablaRuntimeHostStwMilliseconds(): int {
+    val scratch = __ablaRuntimeHostStwAddress() + 72
+    ablaLinuxSyscall(228, 1, scratch, 0, 0, 0, 0)
+    ablaRuntimeLoadI64(scratch) * 1000 + ablaRuntimeLoadI64(scratch + 8) / 1000000
+}
+
+private trusted fun __ablaRuntimeHostStwSleep(): void {
+    val scratch = __ablaRuntimeHostStwAddress() + 72
+    ablaRuntimeStoreI64(scratch, 0)
+    ablaRuntimeStoreI64(scratch + 8, 20000)
+    ablaLinuxSyscall(35, scratch, 0, 0, 0, 0, 0)
+    return
+}
+
+private trusted fun __ablaRuntimeHostStwWriteNumber(value: int): void {
+    val scratch = __ablaRuntimeHostStwAddress() + 96
+    var digits = 0
+    var rest = value
+    if (rest < 0) rest = 0
+    while (true) {
+        ablaRuntimeStoreU8(scratch + 31 - digits, 48 + rest % 10)
+        digits = digits + 1
+        rest = rest / 10
+        if (rest == 0) break
+    }
+    __ablaRuntimeHostWrite(2, scratch + 32 - digits, digits)
+    return
+}
+
+// How long the collector waits for the others to park.
+private trusted fun __ablaRuntimeHostStwWaitMilliseconds(): int = 20
+
+private trusted fun __ablaRuntimeHostStwTrace(message: string, length: int, number: int, tail: string, tailLength: int): void {
+    if (!__ablaRuntimeHostGcTrace) return
+    __ablaRuntimeHostWrite(2, __ablaRuntimeWord0(message), length)
+    __ablaRuntimeHostStwWriteNumber(number)
+    __ablaRuntimeHostWrite(2, __ablaRuntimeWord0(tail), tailLength)
+    return
+}
+
+// 0: the thread was parked for another's collection, or the stop was abandoned, or it may not collect: it does not
+// collect. 1: every other thread is parked, the registry stays locked until __ablaRuntimeHostStwRelease. 2: no
+// other thread can exist (the runtime never shared), no stop is needed.
+@noinline
+trusted fun __ablaRuntimeHostStwStop(): int {
+    if (!__ablaRuntimePlatformThreadsEnabled()) return 2
+    val me = __ablaRuntimeHostStwRecord()
+    // A thread that never registered cannot be stopped nor walked: it does not collect.
+    if (me == 0) return 0
+    val stw = __ablaRuntimeHostStwAddress()
+    var token = ablaRuntimeAtomicLoadI64(stw)
+    while (true) {
+        if ((token & 1) == 1) {
+            __ablaRuntimeHostStwPark(token, me)
+            return 0
+        }
+        // After an abandoned stop the next attempt waits (a thread blocked in the system would stall each collection).
+        if (ablaRuntimeLoadI64(stw + 128) != 0 && __ablaRuntimeHostStwMilliseconds() < ablaRuntimeLoadI64(stw + 128)) return 0
+        val seen = ablaRuntimeAtomicCompareExchangeI64(stw, token, token + 1)
+        if (seen == token) break
+        token = seen
+    }
+    token = token + 1
+    ablaRuntimeStoreI64(stw + 48, me)
+    ablaRuntimeStoreI64(stw + 56, __ablaRuntimeHostCollectionThreshold)
+    // Every other thread's next safe point calls the collector.
+    __ablaRuntimeHostCollectionThreshold = 0
+    val deadline = __ablaRuntimeHostStwMilliseconds() + __ablaRuntimeHostStwWaitMilliseconds()
+    var stopped = 0
+    while (stopped == 0) {
+        __ablaRuntimeFutexLock(stw + 8)
+        var blocker = 0
+        var reason = 0
+        var other = ablaRuntimeLoadI64(stw + 16)
+        var others = 0
+        while (other != 0) {
+            if (other != me) {
+                others = others + 1
+                val state = ablaRuntimeAtomicLoadI64(other + 24)
+                var isParked = state == token
+                if (!isParked && state == -1) {
+                    isParked = ablaRuntimeAtomicCompareExchangeI64(other + 24, -1, token) == -1
+                }
+                if (ablaRuntimeLoadI64(ablaRuntimeLoadI64(other + 8) + 8) != 0) {
+                    // A thread in a region never parks.
+                    blocker = other
+                    reason = 2
+                } else if (!isParked && blocker == 0) {
+                    blocker = other
+                    reason = 1
+                }
+            }
+            other = ablaRuntimeLoadI64(other)
+        }
+        if (blocker == 0) {
+            if (__ablaRuntimeHostGcTrace) __ablaRuntimeHostStwTrace("gc: stopped ", 12, others, " thread(s)\n", 11)
+            ablaRuntimeStoreI64(stw + 32, ablaRuntimeLoadI64(stw + 32) + 1)
+            stopped = 1
+        } else {
+            val number = ablaRuntimeLoadI64(blocker + 16)
+            __ablaRuntimeFutexUnlock(stw + 8)
+            if (reason == 2 || __ablaRuntimeHostStwMilliseconds() >= deadline) {
+                ablaRuntimeStoreI64(stw + 40, ablaRuntimeLoadI64(stw + 40) + 1)
+                if (__ablaRuntimeHostGcTrace) {
+                    if (reason == 2) {
+                        __ablaRuntimeHostStwTrace("gc: stop abandoned (thread ", 27, number, " is in a region)\n", 17)
+                    } else {
+                        __ablaRuntimeHostStwTrace("gc: stop abandoned (thread ", 27, number, " not parked after ", 18)
+                        __ablaRuntimeHostStwWriteNumber(__ablaRuntimeHostStwWaitMilliseconds())
+                        __ablaRuntimeHostWrite(2, __ablaRuntimeWord0(" ms)\n"), 5)
+                    }
+                }
+                ablaRuntimeStoreI64(stw + 48, 0)
+                ablaRuntimeStoreI64(stw + 128, __ablaRuntimeHostStwMilliseconds() + 10 * __ablaRuntimeHostStwWaitMilliseconds())
+                __ablaRuntimeHostCollectionThreshold = ablaRuntimeLoadI64(stw + 56)
+                ablaRuntimeAtomicStoreI64(stw, token + 1)
+                __ablaRuntimeFutexWake(stw, 2147483647)
+                return 0
+            }
+            __ablaRuntimeHostStwSleep()
+        }
+    }
+    1
+}
+
+// The collecting thread lets the others go (its registry lock too). `restore`: the threshold the stop found goes
+// back (a collection that sets its own threshold afterwards passes false).
+trusted fun __ablaRuntimeHostStwRelease(restore: bool): void {
+    val stw = __ablaRuntimeHostStwAddress()
+    val me = __ablaRuntimeHostStwRecord()
+    if (me == 0 || ablaRuntimeLoadI64(stw + 48) != me) return
+    ablaRuntimeStoreI64(stw + 48, 0)
+    if (restore) __ablaRuntimeHostCollectionThreshold = ablaRuntimeLoadI64(stw + 56)
+    __ablaRuntimeFutexUnlock(stw + 8)
+    ablaRuntimeAtomicStoreI64(stw, ablaRuntimeAtomicLoadI64(stw) + 1)
+    __ablaRuntimeFutexWake(stw, 2147483647)
+    return
+}
+
+// The end of a collection that Stop let run: the pressure collection keeps the stop until it has set its threshold.
+@inline
+trusted fun __ablaRuntimeHostStwDone(stopped: int): void {
+    if (stopped == 1 && ablaRuntimeLoadI64(__ablaRuntimeHostStwRecord() + 40) == 0) {
+        __ablaRuntimeHostStwRelease(true)
+    }
+}
+
+// What a pressure collection tells the stop: it keeps the stop (1), and whether it parked for another's (read back).
+trusted fun __ablaRuntimeHostStwPressureBegin(): void {
+    val record = __ablaRuntimeHostStwRecord()
+    if (record != 0) {
+        ablaRuntimeStoreI64(record + 48, 0)
+        ablaRuntimeStoreI64(record + 40, 1)
+    }
+    return
+}
+
+// True when the thread parked for another's collection, which sets the threshold itself.
+trusted fun __ablaRuntimeHostStwPressureEnd(): bool {
+    val record = __ablaRuntimeHostStwRecord()
+    if (record == 0) return false
+    ablaRuntimeStoreI64(record + 40, 0)
+    ablaRuntimeLoadI64(record + 48) != 0
+}
+
+// The test hook (memoryDebugHold): the word at +136 of the stop's block is 0 (off), 1 (armed) or 2 (a thread holds).
+trusted fun __ablaRuntimePlatformMemoryDebugHold(mode: int): int {
+    val word = __ablaRuntimeHostStwAddress() + 136
+    if (mode == 1) {
+        ablaRuntimeAtomicStoreI64(word, 1)
+        return 0
+    }
+    if (mode == 0) {
+        ablaRuntimeAtomicStoreI64(word, 0)
+        __ablaRuntimeFutexWake(word, 2147483647)
+        return 0
+    }
+    if (ablaRuntimeAtomicLoadI64(word) == 2) 1 else 0
+}
+
+// A collection point: the thread that finds the hook armed holds here, in native state (stopped, its roots stable).
+private trusted fun __ablaRuntimeHostStwHoldPoint(): void {
+    val word = __ablaRuntimeHostStwAddress() + 136
+    if (ablaRuntimeAtomicLoadI64(word) != 1) return
+    if (__ablaRuntimeHostStwRecord() == 0) return
+    if (ablaRuntimeAtomicCompareExchangeI64(word, 1, 2) != 1) return
+    __ablaRuntimePlatformNativeEnter()
+    while (ablaRuntimeAtomicLoadI64(word) == 2) __ablaRuntimeFutexWait(word, 2)
+    __ablaRuntimePlatformNativeLeave()
+    return
+}
+
+// Stops abandoned and collections that stopped threads (memoryHeapStat 8 and 7).
+trusted fun __ablaRuntimeHostStwStat(which: int): int =
+    ablaRuntimeLoadI64(__ablaRuntimeHostStwAddress() + (if (which == 8) 40 else 32))
+
+// In a forked child only the forking thread exists: the registry is that thread's record alone, no stop under way.
+trusted fun __ablaRuntimeHostStwForkReset(): void {
+    val stw = __ablaRuntimeHostStwAddress()
+    val record = __ablaRuntimeHostStwRecord()
+    ablaRuntimeAtomicStoreI64(stw + 8, 0)
+    ablaRuntimeStoreI64(stw + 16, 0)
+    if (record != 0) {
+        ablaRuntimeStoreI64(record, 0)
+        ablaRuntimeStoreI64(stw + 16, record)
+        ablaRuntimeAtomicStoreI64(record + 24, 0)
+    }
+    ablaRuntimeStoreI64(stw + 48, 0)
+    val token = ablaRuntimeAtomicLoadI64(stw)
+    if ((token & 1) == 1) ablaRuntimeAtomicStoreI64(stw, token + 1)
+    return
 }
 
 // Whether a thread was ever started: shared runtime structures (a rope's flat
@@ -1201,10 +1555,12 @@ trusted fun __ablaRuntimePlatformThreadCreate(
 }
 
 trusted fun __ablaRuntimePlatformThreadJoin(handle: int): bool {
+    __ablaRuntimePlatformNativeEnter()
     val joined = pthread_join(
         ablaRuntimeLoadI64(handle),
         ablaRuntimePointerFromAddress(0)
     ) == 0
+    __ablaRuntimePlatformNativeLeave()
     if (joined) {
         val mutex = __ablaRuntimeHostHeapLock()
         if (__ablaRuntimeHostActiveThreads <= 0) ablaRuntimeTrap()
@@ -1929,6 +2285,7 @@ trusted fun __ablaRuntimePlatformMemoryHeapStat(which: int): int =
     if (which == 4) __ablaRuntimeHostLiveBytes
     else if (which == 5) __ablaRuntimeHostCollectionLazyCount
     else if (which == 6) __ablaRuntimeHostCollectionDirectoryCount
+    else if (which == 7 || which == 8) __ablaRuntimeHostStwStat(which)
     else 0
 
 // The heap census (abla/memory's memoryCensus): what the last
@@ -2570,8 +2927,8 @@ trusted fun __ablaRuntimeHostMarkValue(value: int): void {
     }
 }
 
-trusted fun __ablaRuntimeHostMarkRootValues(): void {
-    var frame: int = __ablaRuntimeHostRootFrameLoad()
+trusted fun __ablaRuntimeHostMarkRootChain(head: int): void {
+    var frame: int = head
     while (frame != 0) {
         val roots = ablaRuntimeLoadI64(frame + 8)
         val packed = ablaRuntimeLoadI64(frame + 16)
@@ -2595,6 +2952,22 @@ trusted fun __ablaRuntimeHostMarkRootValues(): void {
         }
         frame = ablaRuntimeLoadI64(frame)
     }
+}
+
+// Every thread's roots: the collecting thread's chain, the chains of the registered threads (all parked, or in a join,
+// while the registry is locked by the stop), and the permanent frames of threads that left the registry.
+trusted fun __ablaRuntimeHostMarkRootValues(): void {
+    val me = __ablaRuntimeHostRootFrameAddress()
+    __ablaRuntimeHostMarkRootChain(ablaRuntimeLoadI64(me))
+    if (!__ablaRuntimePlatformThreadsEnabled()) return
+    val stw = __ablaRuntimeHostStwAddress()
+    var other = ablaRuntimeLoadI64(stw + 16)
+    while (other != 0) {
+        val cell = ablaRuntimeLoadI64(other + 8)
+        if (cell != me) __ablaRuntimeHostMarkRootChain(ablaRuntimeLoadI64(cell))
+        other = ablaRuntimeLoadI64(other)
+    }
+    __ablaRuntimeHostMarkRootChain(ablaRuntimeLoadI64(stw + 64))
 }
 
 trusted fun __ablaRuntimeHostTraceMarkedAllocations(): void {
@@ -2834,18 +3207,17 @@ trusted fun __ablaRuntimePlatformMemoryCollect(): int {
     // Region pages are reclaimed as a unit and may contain references into
     // the persistent heap. Defer collection until the outermost region ends,
     // when compiler-published stack/global roots are sufficient.
+    __ablaRuntimeHostStwHoldPoint()
+    if (__ablaRuntimeHostRegionLoad() != 0 || __ablaRuntimeHostForkNoCollect) return 0
+    val stopped = __ablaRuntimeHostStwStop()
+    if (stopped == 0) return 0
     val mutex = __ablaRuntimeHostHeapLock()
-    if (__ablaRuntimeHostRegionLoad() != 0 ||
-        __ablaRuntimeHostActiveThreads != 0 || __ablaRuntimeHostExportInside() > 1 ||
-        __ablaRuntimeHostForkNoCollect) {
-        __ablaRuntimeHostHeapUnlock(mutex)
-        return 0
-    }
     val before = __ablaRuntimeHostLiveBytes
     // The registry's slots bound the allocations (freed ones leave holes).
     val allocationCount = __ablaRuntimeHostRegistrySlots
     if (allocationCount == 0) {
         __ablaRuntimeHostHeapUnlock(mutex)
+        __ablaRuntimeHostStwDone(stopped)
         return 0
     }
     __ablaRuntimeHostCollectionWorklist = ablaRuntimePointerAddress(
@@ -2905,6 +3277,7 @@ trusted fun __ablaRuntimePlatformMemoryCollect(): int {
     __ablaRuntimeHostCollectionRanges = 0
     val freed = before - __ablaRuntimeHostLiveBytes
     __ablaRuntimeHostHeapUnlock(mutex)
+    __ablaRuntimeHostStwDone(stopped)
     freed
 }
 
@@ -2916,18 +3289,17 @@ trusted fun __ablaRuntimeHostBackgroundMemoryCollect(): int {
     // Region pages are reclaimed as a unit and may contain references into
     // the persistent heap. Defer collection until the outermost region ends,
     // when compiler-published stack/global roots are sufficient.
+    __ablaRuntimeHostStwHoldPoint()
+    if (__ablaRuntimeHostRegionLoad() != 0 || __ablaRuntimeHostForkNoCollect) return 0
+    val stopped = __ablaRuntimeHostStwStop()
+    if (stopped == 0) return 0
     val mutex = __ablaRuntimeHostHeapLock()
-    if (__ablaRuntimeHostRegionLoad() != 0 ||
-        __ablaRuntimeHostActiveThreads != 0 || __ablaRuntimeHostExportInside() > 1 ||
-        __ablaRuntimeHostForkNoCollect) {
-        __ablaRuntimeHostHeapUnlock(mutex)
-        return 0
-    }
     val before = __ablaRuntimeHostLiveBytes
     // The registry's slots bound the allocations (freed ones leave holes).
     val allocationCount = __ablaRuntimeHostRegistrySlots
     if (allocationCount == 0) {
         __ablaRuntimeHostHeapUnlock(mutex)
+        __ablaRuntimeHostStwDone(stopped)
         return 0
     }
     __ablaRuntimeHostCollectionWorklist = ablaRuntimePointerAddress(
@@ -2967,6 +3339,7 @@ trusted fun __ablaRuntimeHostBackgroundMemoryCollect(): int {
     __ablaRuntimeHostCollectionRanges = 0
     val freed = before - __ablaRuntimeHostLiveBytes
     __ablaRuntimeHostHeapUnlock(mutex)
+    __ablaRuntimeHostStwDone(stopped)
     freed
 }
 
@@ -3102,7 +3475,10 @@ trusted fun __ablaRuntimeMemoryPressureLoop(): int {
 
 @noinline
 trusted fun __ablaRuntimeHostPressureCollect(): int {
+    __ablaRuntimeHostStwPressureBegin()
     __ablaRuntimePlatformMemoryCollect()
+    // Parked for another thread's collection: that one sets the threshold, and this thread's safe point goes on.
+    if (__ablaRuntimeHostStwPressureEnd()) return 0
     val reserve = 67108864
     val least = __ablaRuntimeHostCollectionGrowth
     val growth = if (__ablaRuntimeHostLiveBytes / 2 > least) {
@@ -3127,6 +3503,7 @@ trusted fun __ablaRuntimeHostPressureCollect(): int {
         } else latest
     }
     __ablaRuntimeHostCollectionThreshold = if (__ablaRuntimeHostGcStress) 0 else next
+    __ablaRuntimeHostStwRelease(false)
     0
 }
 

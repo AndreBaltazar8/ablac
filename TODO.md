@@ -178,15 +178,14 @@ mmap form) apply there.
 
 ## Shared-library exports (#811)
 
-- [ ] **Stop-the-world collection for overlapping callers.** A shared library's exports count the threads inside
-  (`__ablaRuntimeExportEnter`), and a collection runs only when its caller is alone, as it runs only without
-  Abla worker threads: under permanently overlapping callers (an app's UI thread and workers) or with a worker
-  thread running, a library never collects and its memory grows. A real collection would have to find every
-  thread's root chain (a registry of the thread-local heads, which exports register on entry) and park the other
-  threads at a safe point (a flag polled at function entry and loop back edges, or a signal on Linux and bionic
-  with the async-signal-safety work) before marking, for the library's callers and for Abla's own threads.
-  The same step lets `ActiveThreads != 0` stop meaning "never collect". See docs/programmable-builds.md,
-  "Calling exports from several threads".
+- [ ] **Stop-the-world collection, steps (ii) to (iv) (#811).** Step (i) is in: threads register a record, a
+  collection parks the others at their next safe point (byte threshold 0) and marks every chain, on Linux for
+  a program's threads and a library's callers; `tools/test-gc-threads.sh`. Still open: (ii) a thread blocked
+  in I/O, a lock or a sleep never parks, so the collection is abandoned after 20 ms (classify those calls as native
+  state, as `join` already is, and measure the rooting size and compile time on the compiler and NovaKind's
+  signer); (iii) foreign callers blocked in the host; (iv) macOS (the stop's clock and sleep go through the
+  Linux system call numbers the Darwin shim maps; nothing was run on a Mac). A loop that never allocates has no safe
+  point and holds up every collection while it runs.
 
 ## Bugs seen
 

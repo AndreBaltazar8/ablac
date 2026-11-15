@@ -207,10 +207,13 @@ function is a thunk that enters the runtime and leaves it after the body:
 
 - the first entry makes the heap lock live (the mode a program is in once it starts a thread); other callers wait
   for that, and every allocation takes the heap lock from then on;
-- the threads inside the library are counted, and a collection runs only when its caller is the only one inside.
-  A library under overlapping callers therefore does not collect while they overlap, like a program with threads
-  (memory grows until a moment when one caller is alone; there is no stop-the-world collection yet, see
-  TODO.md);
+- each thread inside registers with the collector, and a collection stops the others first (stop-the-world, #811):
+  the collecting thread sets the byte threshold to 0, so every other thread's next safe point calls the collector
+  and parks there; their root chains are then marked with the collector's own. A thread that cannot park (blocked
+  in the system, in a loop that never allocates, or in a region) makes the collector give up after 20 ms: that
+  collection does not run (`memoryHeapStat(8)` counts these, `ABLA_GC_TRACE=1` names the thread), and none is
+  tried for 200 ms. The same holds for the threads of a program: collection no longer waits for `thread` workers to
+  end. A thread in `join` counts as stopped. Other native waits (I/O, locks) do not yet: step (ii) of #811;
 - the module globals are initialized by one caller while the others wait; an export entered again on the
   initializing thread (the library called the host, which called an export) goes on, with the globals as far as
   they are initialized;
