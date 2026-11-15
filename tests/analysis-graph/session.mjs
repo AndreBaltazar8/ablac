@@ -319,7 +319,53 @@ async function projections() {
     await s.close();
 }
 
-const tests = { simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections };
+// A call with named, defaulted or mixed arguments is the call it names (#814): the compiler's own temporaries
+// (`__abla_named_<offset>_<n>`, ...) are not in the source and must not take its span. One of them once did when its
+// name was as long as the call's, so the callee lost its declaration (and go-to-definition and hover with it): the
+// callees here have every name length from 10 to 30, in named, defaulted and mixed calls and in a constructor's.
+async function namedCalls() {
+    const names = [];
+    for (let length = 10; length <= 30; length++) names.push('f' + 'x'.repeat(length - 1));
+    const dep = [
+        'fun box(width: int, height: int = 2, label: string = "x"): int = width * height',
+        'class Point(val x: int, val y: int = 0)',
+        ...names.map((name) => `fun ${name}(): int = 3`),
+        '',
+    ].join('\n');
+    const lines = ['import "dep.ab"', 'fun main: int {'];
+    names.forEach((name, index) => {
+        lines.push(`    val named${index} = box(height = 1, width = ${name}())`);
+        lines.push(`    val defaulted${index} = box(${name}())`);
+        lines.push(`    val mixed${index} = box(${name}(), label = "y")`);
+        lines.push(`    val point${index} = Point(y = ${name}(), x = 1)`);
+    });
+    lines.push('    0', '}', '');
+    const p = fixture('named-calls', { 'main.ab': lines.join('\n'), 'dep.ab': dep });
+    const s = await start(p);
+    const a = await s.analyze();
+    noErrors(a);
+    const document = doc(a, path.join(p, 'main.ab'));
+    const dependency = doc(a, path.join(p, 'dep.ab'));
+    assert.deepEqual(document.occurrences.filter((o) => o.name.startsWith('__abla_')), []);
+    const check = async (name, symbol, count) => {
+        const found = occurrence(document, name);
+        assert.equal(found.length, count, `${name}: occurrences`);
+        for (const call of found) {
+            assert.equal(call.declarationId, symbol.id, `${name} at ${call.range.start}: declarationId`);
+            assert.ok(call.type, `${name} at ${call.range.start}: type`);
+            const params = { uri: uri(path.join(p, 'main.ab')), offset: call.range.start, revision: a.revision };
+            const definition = (await s.rpc('query/definition', params)).result;
+            assert.equal(definition.value.uri, uri(path.join(p, 'dep.ab')), `${name} at ${call.range.start}: definition`);
+            const hover = (await s.rpc('query/hover', params)).result;
+            assert.ok(hover.value.type, `${name} at ${call.range.start}: hover`);
+        }
+    };
+    await check('box', dependency.symbols.find((x) => x.name === 'box'), names.length * 3);
+    for (const name of names) await check(name, dependency.symbols.find((x) => x.name === name), 4);
+    await s.close();
+}
+
+const tests = { simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
 const filter = process.env.ANALYSIS_TEST_FILTER ? process.env.ANALYSIS_TEST_FILTER.split(',') : null;
 for (const [name, test] of Object.entries(tests)) {
     if (filter && !filter.includes(name)) continue;
