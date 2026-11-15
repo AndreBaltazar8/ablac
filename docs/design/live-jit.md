@@ -138,3 +138,36 @@ Status: design for review (ablac-e8, 2026-11-15). No code yet.
 2. Is the v1 scope right? Bodies and new functions only; no layout, signature or global changes;
    old code never freed.
 3. Is the trigger right? A program-driven `abla/live` API first, `--watch` later.
+
+## Stage 0: audit of interprocedural facts (2026-11-15)
+
+Where compiling a function uses facts about the functions it calls:
+
+| Fact | Where | Used for | A changed callee would break |
+|---|---|---|---|
+| mutating receivers (`bootstrapBuildMutableReceiverSummary`, sema.ab:718) | ir.ab:7338, 7373, 7545, 9095, 9331, 10285; part of the IR hash (ir.ab:1142) | lowering: whether a call mutates its receiver (delegated `getValue`, copies) | an old caller's copy/store decisions |
+| managed alias tracking (`managedAliasBegins`, sema `bootstrapSummaryTypeNeedsManagedAliasTracking*`) | IR hash (ir.ab:1157), lowering | alias handling of managed references | an old caller's alias bookkeeping |
+| non-escaping parameters (escape.ab, `bootstrapLlvmParameterEscapes`) | backend: frame closures and cells | a closure or cell in the caller's frame | a dangling frame pointer |
+| region call retention (`BootstrapRegionCallSummary`, sema.ab:5841) | sema checking only | rejecting unsafe region use | nothing: a reload re-checks the whole program |
+| compile effects (`bootstrapBuildCompileEffectSummary`) | sema and eval: compile-time checks | compile-time authorization | nothing at run time |
+| module alias summary (module.ab:1493) | import resolution | names | nothing beyond a signature change |
+
+Conclusion: the facts that shape code are the first three. Making sema's facts conservative would make
+live mode reject programs that compile, not just compile them more slowly. So, instead of an
+open-ended list of conservative modes:
+
+**The general rule: a reload is accepted only if every function the change did not touch
+compiles to the same code.** The reload compiles the whole new program anyway. It then compares,
+for every unchanged function, a hash of its emitted LLVM function before optimization, with the
+table indices and the generation's symbol names normalized. If any of them differs, the change
+altered a fact that function's running code relies on, and the reload is refused:
+
+`E_LIVE_CALLER: render (unchanged) would compile differently: it calls drawTile, whose change it depends on`
+
+The changed callees named are the ones it calls directly that changed. This covers the three
+facts above, any added later, and signature or layout changes; the specific refusals
+(E_LIVE_SIGNATURE, E_LIVE_LAYOUT) are checked first, for clearer messages. It needs the emission to
+be deterministic per function (it is: stage2 == stage3). A cheap pre-test in stage 1: compile
+the same program twice in live mode and compare the hashes of every function.
+Escape stays exact in live mode: no conservative setting is needed, since a frame closure that a
+change would break shows up as a changed caller.
