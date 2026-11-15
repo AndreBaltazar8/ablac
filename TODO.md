@@ -2866,3 +2866,11 @@ tools/test-wipe-sources.sh, tests/cases/crypto-pure/wipe-views.ab). Decided not 
 TlsRecordProtection and Tls12Keys, 12 keysched return types and the 70 `tlsWipe` sites; no public crypto API change; mechanical but wide.
 It buys ownership, not erasure: every per-use copy is a string again. Erasure everywhere needs aes, chacha, hmac, hkdf, x25519 and p256
 to take owners or addresses (about 40 public functions). Revisit if a wipe bug appears that the lint does not catch.
+
+## TLS 1.2 session resumption (decided against for now, 2026-11-15)
+
+abla/tls/pure resumes TLS 1.3 sessions (PSK with tickets). TLS 1.2 has no resumption: every 1.2 connection is a full handshake. Cost if done: the RFC 5077
+ticket extension in both hellos, NewSessionTicket before ChangeCipherSpec, the abbreviated handshake (the server's Finished first), the extended master secret
+bound into the session (RFC 7627 section 5.3), a TLS 1.2 ticket format and its tests: about the size of the TLS 1.3 change again. Benefit: small. Our TLS 1.2 is a
+compatibility floor (ECDHE with AEAD and the extended master secret only), nearly every server that matters speaks 1.3, and a resumption would save one ECDHE and
+one signature (about 5 ms for P-256 on x86-64). Revisit only if a 1.2-only peer shows up where handshake time matters (an embedded target with a slow CPU).
