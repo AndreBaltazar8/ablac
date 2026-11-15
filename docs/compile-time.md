@@ -732,6 +732,13 @@ reason:
 - a program that panics at run time stops the build with the same panic
   under `#`, because a compile-time panic is a compile error.
 
+Every case has an expected status in each tier
+(`tests/cases/parity/expected-pass.txt`), and every standard-library module
+is reached by some case or listed with the reason it isn't
+(`tests/cases/parity/uncovered-modules.txt`, a list that only shrinks);
+`tools/test-compile-time-parity-guard.sh` checks both. Test programs whose
+build is meant to fail aren't cases (`tests/cases/parity/negative.txt`).
+
 | Area | Under `#` today |
 |---|---|
 | Functions, recursion, classes and methods, arrays, `Map`, strings, string templates | works |

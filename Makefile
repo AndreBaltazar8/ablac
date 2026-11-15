@@ -242,6 +242,7 @@ test-serial: ablac
 	tools/test-compile-time-diagnostics.sh $(COMPILER)
 	PARITY_SET=probes PARITY_OUTPUT=$(BUILD_DIR)/compile-time-parity-probes tools/test-compile-time-parity.sh $(COMPILER)
 	tools/test-compile-time-parity-sample.sh $(COMPILER)
+	tools/test-compile-time-parity-guard.sh
 	tools/test-scoped-region.sh $(COMPILER)
 	tools/test-memory-promote.sh $(COMPILER)
 	tools/test-region-extension-names.sh $(COMPILER)

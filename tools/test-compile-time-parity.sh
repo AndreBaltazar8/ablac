@@ -38,6 +38,11 @@
 #                   that status, `pass` when there is none (default
 #                   tests/cases/parity/expected-pass.txt); the script fails when
 #                   one of them doesn't, and lists cases that newly pass.
+#   PARITY_NEGATIVE a file of module cases not run, whose run-time build is
+#                   meant to fail (default tests/cases/parity/negative.txt)
+#   PARITY_LIST_ONLY
+#                   set: print the selected cases ("<kind> <name> <source>")
+#                   and stop (tools/test-compile-time-parity-guard.sh)
 #   PARITY_OUTPUT   the results directory (default build/compile-time-parity);
 #                   emptied first, so runs at the same time each need their own
 #   PARITY_ORDER    a file of case names started before the others, slowest
@@ -88,16 +93,18 @@ build_flags=${PARITY_BUILD_FLAGS:-}
 [[ $output == /* ]] || output=$PWD/$output
 export ABLA_SYSROOT=${ABLA_SYSROOT:-$project_root}
 
-rm -rf "$output"
-mkdir -p "$output/cases" "$output/work"
+negative=${PARITY_NEGATIVE:-$project_root/tests/cases/parity/negative.txt}
+negative_names=" $(awk '$1 != "" && $1 !~ /^#/ { print $1 }' "$negative" 2>/dev/null | tr '\n' ' ') "
 
-# The expectations, one "<mode> <case> <status>" line each.
+# The expectations, one "<mode> <case> <status>" line each (a `#` starts a comment, on a line or after its words).
 expected=""
 if [[ -f $expect ]]; then
-    expected=$(awk '$1 != "" && $1 !~ /^#/ { print $1, $2, ($3 == "" ? "pass" : $3) }' "$expect")
+    expected=$(sed 's/#.*//' "$expect" | awk '$1 != "" { print $1, $2, ($3 == "" ? "pass" : $3) }')
 fi
 
-# Lists "<kind> <name> <source>" for every selected case.
+# Lists "<kind> <name> <source>" for every selected case: not the negative ones
+# (PARITY_NEGATIVE, default tests/cases/parity/negative.txt), programs whose
+# run-time build is meant to fail.
 list_cases() {
     local source name
     if [[ $set_name == all || $set_name == probes ]]; then
@@ -115,10 +122,21 @@ list_cases() {
             name=$(basename "$source" .ab)
             [[ $name == invalid-* ]] && continue
             grep -qE '^fun main(\(\))?: int' "$source" || continue
+            [[ $negative_names == *" module/$name "* ]] && continue
             printf 'module module/%s %s\n' "$name" "$source"
         done
     fi
 }
+
+# PARITY_LIST_ONLY=1: print the cases ("<kind> <name> <source>") and stop
+# (tools/test-compile-time-parity-guard.sh reads them).
+if [[ -n ${PARITY_LIST_ONLY:-} ]]; then
+    list_cases
+    exit 0
+fi
+
+rm -rf "$output"
+mkdir -p "$output/cases" "$output/work"
 
 # The first diagnostic of a failed compile, without positions.
 first_error() {
@@ -214,14 +232,35 @@ has_compile_time_code() { # source
     sources_match '#[A-Za-z_({]|[$][a-z][A-Za-z0-9]* *[{]' "$1"
 }
 
+# The directory a case's two sides build in. A module case's copy of
+# tests/cases/modules sits at the same depth under its work directory as in the
+# repository, beside links to the repository's other top-level directories, so
+# a case that imports `../../../src/…` or `../../../examples/…` (the compiler's
+# own modules) finds them.
+case_dir() { # kind name
+    if [[ $1 == module ]]; then
+        printf '%s\n' "$output/work/$2/tests/cases/modules"
+    else
+        printf '%s\n' "$output/work/$2"
+    fi
+}
+
 # Runs one case: its run-time side (once, unless it has compile-time code),
 # then each mode's `#` side against it, all in one work directory (so every
 # side sees the same paths), whose files are then published to
 # <output>/cases/<mode>/<name>.
 run_case() { # kind name source
     local kind=$1 name=$2 source=$3
-    local dir=$output/work/$name mode want side_seconds=$seconds started
+    local dir mode want side_seconds=$seconds started
+    dir=$(case_dir "$kind" "$name")
     mkdir -p "$dir"
+    if [[ $kind == module ]]; then
+        local top
+        for top in "$project_root"/*; do
+            [[ -d $top && ${top##*/} != tests && ${top##*/} != build ]] || continue
+            ln -s "$top" "$output/work/$name/${top##*/}"
+        done
+    fi
     if [[ $kind == probe ]]; then
         if [[ $(basename "$source") == main.ab ]]; then
             cp -R "$(dirname "$source")/." "$dir/"
@@ -277,13 +316,14 @@ run_case() { # kind name source
         run_mode "$kind" "$name" "$source" "$mode"
         publish_mode "$kind" "$name" "$mode" $((SECONDS - started)) "$runtime_seconds"
     done
-    rm -rf "$dir"
+    rm -rf "${output:?}/work/$name"
 }
 
 # Compares one mode's `#` side with the run-time side; sets status and detail.
 run_mode() { # kind name source mode
     local kind=$1 name=$2 source=$3 mode=$4
-    local dir=$output/work/$name granted="" side_seconds=$seconds
+    local dir granted="" side_seconds=$seconds
+    dir=$(case_dir "$kind" "$name")
     # A `#` side expected never to finish only needs to show that it doesn't,
     # and one expected past the interpreter's step limit to pass a lower one
     # (ABLA_EVAL_STEP_LIMIT overrides it): either way the status is the same.
@@ -409,7 +449,8 @@ run_mode() { # kind name source mode
 # next mode: the `#` side's files go, its source comes back unedited.
 publish_mode() { # kind name mode seconds runtime-seconds
     local kind=$1 name=$2 mode=$3
-    local dir=$output/work/$name target=$output/cases/$3/$2 entry
+    local dir target=$output/cases/$3/$2 entry
+    dir=$(case_dir "$kind" "$name")
     mkdir -p "$target"
     # Keep only what a failure needs: of a module case, its two sides and its
     # grant, not the copy of the module tree beside them (hundreds of files,
@@ -431,7 +472,7 @@ publish_mode() { # kind name mode seconds runtime-seconds
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$mode" "$status" "$detail" "$4" "$5" >"$target/result.tsv"
     printf '%-14s %-8s %s %s\n' "$status" "$mode" "$name" "${detail:0:120}"
 }
-export -f run_case run_mode publish_mode build_and_run first_error limited \
+export -f run_case run_mode publish_mode build_and_run first_error limited case_dir \
     expected_status by_design_status by_design_reason sources_match starts_thread \
     has_compile_time_code
 export output compiler seconds known_timeout_seconds known_step_limit modes expected project_root \
@@ -471,8 +512,8 @@ done
 
 failed=0
 if [[ -f $expect ]]; then
-    while read -r mode name want; do
-        [[ -z $mode || $mode == \#* ]] && continue
+    while read -r mode name want _; do
+        [[ -z $mode ]] && continue
         want=${want:-pass}
         [[ " $modes " == *" $mode "* ]] || continue
         [[ -z $filter || $name =~ $filter ]] || continue
@@ -484,10 +525,10 @@ if [[ -f $expect ]]; then
             echo "REGRESSED: $mode $name (expected $want)"
             failed=1
         fi
-    done <"$expect"
+    done < <(sed 's/#.*//' "$expect")
     awk -F'\t' '$3 == "pass" { print $2 " " $1 }' "$output/results.tsv" |
         while read -r line; do
-            grep -qE "^$line( pass)?$" "$expect" || echo "newly passing: $line"
+            grep -qE "^$line( pass)? *(#.*)?$" "$expect" || echo "newly passing: $line"
         done
 fi
 echo "results: $output/results.tsv"

@@ -31,14 +31,23 @@ skip=" http-server signal-watch network-advanced "
 skip="$skip jwt jwt-remote http-async dns-async http-event "
 
 candidates=()
-while read -r mode name status; do
-    [[ -z $mode || $mode == \#* ]] && continue
+while read -r mode name status _; do
+    [[ -z $mode ]] && continue
     [[ $name == module/* ]] || continue
-    case ${status:-pass} in timeout|interp-threads|runtime-skipped) continue ;; esac
     row=${name#module/}
-    [[ $skip == *" $row "* ]] && continue
+    # A sampled row runs in both modes, so a slow status in either keeps it out (compile-failed: a `#` side that
+    # may run to the evaluator's own step limit, minutes).
+    case ${status:-pass} in timeout|interp-threads|runtime-skipped|compile-failed|mismatch)
+        skip="$skip $row "
+        continue ;;
+    esac
     [[ " ${candidates[*]} " == *" $row "* ]] || candidates+=("$row")
-done <"$expect"
+done < <(sed 's/#.*//' "$expect")
+kept=()
+for row in "${candidates[@]}"; do
+    [[ $skip == *" $row "* ]] || kept+=("$row")
+done
+candidates=("${kept[@]}")
 count=${#candidates[@]}
 (( count > 0 )) || { echo "parity sample: no module rows in $expect" >&2; exit 1; }
 if [[ -n ${PARITY_SAMPLE_OFFSET:-} ]]; then
