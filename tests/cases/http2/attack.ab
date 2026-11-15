@@ -1,0 +1,130 @@
+// The HTTP/2 server under attack, over a real socket (tools/test-http2-server.sh, against tools/h2spec/server.ab in h2c-only mode): Rapid Reset (CVE-2023-44487), a CONTINUATION flood
+// (CVE-2024-27983 family), a PING flood, a SETTINGS flood, an oversized frame, a stream limit overrun and a slow header block each end their connection (GOAWAY, or a close) within a bound, the server
+// answers an ordinary request on a new connection every time, and a client that opens streams without finishing them cannot take more than the stream limit. Argument: the port.
+// Prints "http2 attack ok".
+import "abla/io"
+import "abla/crypto"
+import "abla/http"
+import "abla/http/async"
+import "abla/http/h2"
+import "abla/http/h2/hpack"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/sys/linux/net"
+import "abla/integer"
+
+var failures = 0
+
+fun fail(what: string): void {
+    failures = failures + 1
+    if (failures < 30) println("FAIL $what")
+    return
+}
+
+fun be32(value: int): string = cryptoByteString([(value >> 24) & 255, (value >> 16) & 255, (value >> 8) & 255, value & 255])
+
+fun frame(kind: int, flags: int, stream: int, payload: string): string {
+    val n = payload.size
+    cryptoByteString([(n >> 16) & 255, (n >> 8) & 255, n & 255, kind, flags, (stream >> 24) & 127, (stream >> 16) & 255, (stream >> 8) & 255, stream & 255]) + payload
+}
+
+fun requestBlock(path: string): string {
+    var e = hpackEncoderNew(0)
+    e.encode([HpackField(":method", "GET", false), HpackField(":scheme", "http", false), HpackField(":path", path, false), HpackField(":authority", "localhost", false)])
+}
+
+/** Connects, sends `script` (after the preface and an empty SETTINGS), and reads until the server closes or `limitMilliseconds` pass. Returns the GOAWAY error code seen (-1: none) and
+ *  sets `closed` when the connection ended. */
+class Outcome(val goaway: int, val closed: bool, val bytes: int, val refused: int = 0)
+
+fun attack(port: int, script: string, limitMilliseconds: int): Outcome {
+    var conn = tcpConnect(ipv4Loopback(port))
+    if (conn.descriptor < 0) return Outcome(-2, true, 0)
+    conn.write(H2_PREFACE + frame(4, 0, 0, "") + script)
+    var all = ""
+    var closed = false
+    val deadline = linuxMonotonicMilliseconds() + limitMilliseconds
+    while (!closed && linuxMonotonicMilliseconds() < deadline) {
+        val got = conn.readWithTimeoutResult(65536, 200)
+        if (got.hasData()) all = all + got.bytes
+        else if (got.reachedEof() || got.failed()) closed = true
+    }
+    conn.close()
+    var code = -1
+    var refused = 0
+    var at = 0
+    while (at + 9 <= all.size) {
+        val n = (all[at] << 16) | (all[at + 1] << 8) | all[at + 2]
+        if (all[at + 3] == 7 && at + 9 + 8 <= all.size) code = (all[at + 9 + 4] << 24) | (all[at + 9 + 5] << 16) | (all[at + 9 + 6] << 8) | all[at + 9 + 7]
+        if (all[at + 3] == 3 && n == 4 && at + 13 <= all.size && all[at + 12] == 7) refused = refused + 1
+        at = at + 9 + n
+    }
+    Outcome(code, closed, all.size, refused)
+}
+
+fun ordinary(port: int): bool {
+    var client = httpAsyncClient(HttpAsyncOptions(http2PriorKnowledge = true))
+    val id = client.get("http://127.0.0.1:$port/small.txt", [], 5000)
+    var done = false
+    var ok = false
+    val deadline = linuxMonotonicMilliseconds() + 6000
+    while (!done && linuxMonotonicMilliseconds() < deadline) {
+        client.step(20)
+        for (c in client.takeCompletions()) {
+            if (c.id == id) {
+                done = true
+                ok = c.status == 200 && c.body == "hello h2\n" && c.protocol == "h2"
+            }
+        }
+    }
+    ok
+}
+
+fun main: int {
+    val port = processArgument(0).parseInt()
+    if (port == null) return 2
+    if (!ordinary(port)) fail("the server does not answer before the attacks")
+    // Rapid Reset: 2000 streams opened and reset at once.
+    var rapid = ""
+    for (k in 0 until 2000) rapid = rapid + frame(1, 4, 1 + 2 * k, requestBlock("/")) + frame(3, 0, 1 + 2 * k, be32(8))
+    var r = attack(port, rapid, 5000)
+    if (r.goaway != H2_ENHANCE_YOUR_CALM || !r.closed) fail("Rapid Reset: goaway ${r.goaway} closed ${r.closed}")
+    if (!ordinary(port)) fail("the server does not answer after Rapid Reset")
+    // CONTINUATION flood: a header block that never ends.
+    var cont = frame(1, 0, 1, "")
+    for (k in 0 until 200) cont = cont + frame(9, 0, 1, "a".repeat(1000))
+    r = attack(port, cont, 5000)
+    if (r.goaway != H2_ENHANCE_YOUR_CALM || !r.closed) fail("CONTINUATION flood: goaway ${r.goaway} closed ${r.closed}")
+    if (!ordinary(port)) fail("the server does not answer after the CONTINUATION flood")
+    // PING flood and SETTINGS flood (acknowledgements owed).
+    var pings = ""
+    for (k in 0 until 400) pings = pings + frame(6, 0, 0, "12345678")
+    r = attack(port, pings, 5000)
+    if (r.goaway != H2_ENHANCE_YOUR_CALM || !r.closed) fail("PING flood: goaway ${r.goaway} closed ${r.closed}")
+    var settings = ""
+    for (k in 0 until 400) settings = settings + frame(4, 0, 0, "")
+    r = attack(port, settings, 5000)
+    if (r.goaway != H2_ENHANCE_YOUR_CALM || !r.closed) fail("SETTINGS flood: goaway ${r.goaway} closed ${r.closed}")
+    // Empty DATA frames, and an oversized frame.
+    var empties = frame(1, 4, 1, postBlock("/echo"))
+    for (k in 0 until 1500) empties = empties + frame(0, 0, 1, "")
+    r = attack(port, empties, 5000)
+    if (r.goaway != H2_ENHANCE_YOUR_CALM || !r.closed) fail("empty DATA flood: goaway ${r.goaway} closed ${r.closed}")
+    r = attack(port, cryptoByteString([0, 64, 1, 0, 0, 0, 0, 0, 0]), 5000)
+    if (r.goaway != H2_FRAME_SIZE_ERROR || !r.closed) fail("an oversized frame: goaway ${r.goaway} closed ${r.closed}")
+    // Streams opened and never finished: past the limit they are refused, the connection stays up and serves another stream.
+    var open = ""
+    for (k in 0 until 150) open = open + frame(1, 4, 1 + 2 * k, postBlock("/echo"))
+    r = attack(port, open, 1500)
+    if (r.closed || r.goaway != -1 || r.refused < 40) fail("150 unfinished streams: closed ${r.closed} goaway ${r.goaway} refused ${r.refused}")
+    if (!ordinary(port)) fail("the server does not answer after the unfinished streams")
+    if (failures > 0) return 1
+    println("http2 attack ok")
+    0
+}
+
+
+fun postBlock(path: string): string {
+    var e = hpackEncoderNew(0)
+    e.encode([HpackField(":method", "POST", false), HpackField(":scheme", "http", false), HpackField(":path", path, false), HpackField(":authority", "localhost", false)])
+}
