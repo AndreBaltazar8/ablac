@@ -1,0 +1,263 @@
+// SHA-3 (FIPS 202): the Keccak-f[1600] permutation, SHA3-256, SHA3-512, SHAKE128 and SHAKE256, in Abla, on every target, for
+// ML-KEM (abla/crypto/mlkem), whose seeds and shared secret go through it. Keccak has no table lookup, no branch and no
+// division on a lane: only exclusive-or, and, not and rotation by constant amounts, so the permutation is constant time by
+// construction; tools/test-ct.sh reads it as written, every lane a secret. What is public is the length of what is absorbed
+// and squeezed.
+//
+// The state is 25 lanes of 64 bits in native memory (little endian on every target of Abla, so a byte i of the state is the byte
+// i of the memory and the sponge xors bytes in directly), 200 bytes, followed by 40 bytes of scratch for the permutation.
+// `Keccak` is one sponge: absorb, then squeeze as often as needed (SHAKE's output has no length fixed in advance, which
+// ML-KEM's sampling of a matrix needs). `close` wipes it.
+
+import "abla/crypto"
+import "abla/crypto/alloc"
+import "abla/ct"
+import "abla/ct/scrub"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+import "abla/unsafe/mmio"
+
+// BEGIN SHA3 SECRET CORE
+@inline trusted fun sha3Load(address: int): secretU64 =
+    secretU64(u64(ablaUnsafeLoadU32(nativePointerFromAddress(address)))) |
+    (secretU64(u64(ablaUnsafeLoadU32(nativePointerFromAddress(address + 4)))) << 32)
+@inline trusted fun sha3Store(address: int, value: secretU64): void {
+    ablaUnsafeStoreU32(nativePointerFromAddress(address), int(value.low().declassify()))
+    ablaUnsafeStoreU32(nativePointerFromAddress(address + 4), int(value.high().declassify()))
+}
+
+/** One round of Keccak-f[1600] on the 25 lanes at `s` (and 5 lanes of scratch at `s + 200`), with the round constant `rc`. */
+@inline trusted fun sha3Round(s: int, rc: secretU64): void {
+    val c = s + 200
+    for (i in 0 until 5) {
+        sha3Store(c + i * 8, sha3Load(s + i * 8) ^ sha3Load(s + (i + 5) * 8) ^ sha3Load(s + (i + 10) * 8) ^
+            sha3Load(s + (i + 15) * 8) ^ sha3Load(s + (i + 20) * 8))
+    }
+    for (i in 0 until 5) {
+        val d = sha3Load(c + ((i + 4) % 5) * 8) ^ sha3Load(c + ((i + 1) % 5) * 8).rotl(1)
+        for (j in 0 until 5) sha3Store(s + (j * 5 + i) * 8, sha3Load(s + (j * 5 + i) * 8) ^ d)
+    }
+    // rho and pi: the lanes move along one cycle of 24, by constant rotations.
+    var t = sha3Load(s + 8)
+    val b0 = sha3Load(s + 10 * 8)
+    sha3Store(s + 10 * 8, t.rotl(1))
+    t = b0
+    val b1 = sha3Load(s + 7 * 8)
+    sha3Store(s + 7 * 8, t.rotl(3))
+    t = b1
+    val b2 = sha3Load(s + 11 * 8)
+    sha3Store(s + 11 * 8, t.rotl(6))
+    t = b2
+    val b3 = sha3Load(s + 17 * 8)
+    sha3Store(s + 17 * 8, t.rotl(10))
+    t = b3
+    val b4 = sha3Load(s + 18 * 8)
+    sha3Store(s + 18 * 8, t.rotl(15))
+    t = b4
+    val b5 = sha3Load(s + 3 * 8)
+    sha3Store(s + 3 * 8, t.rotl(21))
+    t = b5
+    val b6 = sha3Load(s + 5 * 8)
+    sha3Store(s + 5 * 8, t.rotl(28))
+    t = b6
+    val b7 = sha3Load(s + 16 * 8)
+    sha3Store(s + 16 * 8, t.rotl(36))
+    t = b7
+    val b8 = sha3Load(s + 8 * 8)
+    sha3Store(s + 8 * 8, t.rotl(45))
+    t = b8
+    val b9 = sha3Load(s + 21 * 8)
+    sha3Store(s + 21 * 8, t.rotl(55))
+    t = b9
+    val b10 = sha3Load(s + 24 * 8)
+    sha3Store(s + 24 * 8, t.rotl(2))
+    t = b10
+    val b11 = sha3Load(s + 4 * 8)
+    sha3Store(s + 4 * 8, t.rotl(14))
+    t = b11
+    val b12 = sha3Load(s + 15 * 8)
+    sha3Store(s + 15 * 8, t.rotl(27))
+    t = b12
+    val b13 = sha3Load(s + 23 * 8)
+    sha3Store(s + 23 * 8, t.rotl(41))
+    t = b13
+    val b14 = sha3Load(s + 19 * 8)
+    sha3Store(s + 19 * 8, t.rotl(56))
+    t = b14
+    val b15 = sha3Load(s + 13 * 8)
+    sha3Store(s + 13 * 8, t.rotl(8))
+    t = b15
+    val b16 = sha3Load(s + 12 * 8)
+    sha3Store(s + 12 * 8, t.rotl(25))
+    t = b16
+    val b17 = sha3Load(s + 2 * 8)
+    sha3Store(s + 2 * 8, t.rotl(43))
+    t = b17
+    val b18 = sha3Load(s + 20 * 8)
+    sha3Store(s + 20 * 8, t.rotl(62))
+    t = b18
+    val b19 = sha3Load(s + 14 * 8)
+    sha3Store(s + 14 * 8, t.rotl(18))
+    t = b19
+    val b20 = sha3Load(s + 22 * 8)
+    sha3Store(s + 22 * 8, t.rotl(39))
+    t = b20
+    val b21 = sha3Load(s + 9 * 8)
+    sha3Store(s + 9 * 8, t.rotl(61))
+    t = b21
+    val b22 = sha3Load(s + 6 * 8)
+    sha3Store(s + 6 * 8, t.rotl(20))
+    t = b22
+    val b23 = sha3Load(s + 1 * 8)
+    sha3Store(s + 1 * 8, t.rotl(44))
+    t = b23
+    for (j in 0 until 5) {
+        for (i in 0 until 5) sha3Store(c + i * 8, sha3Load(s + (j * 5 + i) * 8))
+        for (i in 0 until 5) {
+            sha3Store(s + (j * 5 + i) * 8,
+                sha3Load(s + (j * 5 + i) * 8) ^ (~sha3Load(c + ((i + 1) % 5) * 8) & sha3Load(c + ((i + 2) % 5) * 8)))
+        }
+    }
+    sha3Store(s, sha3Load(s) ^ rc)
+}
+
+/** The permutation: 24 rounds. The round constants are literals, so nothing is looked up. */
+@noinline trusted fun sha3Permute(s: int): void {
+    sha3Round(s, secretU64(u64(1)) | (secretU64(u64(0)) << 32))
+    sha3Round(s, secretU64(u64(32898)) | (secretU64(u64(0)) << 32))
+    sha3Round(s, secretU64(u64(32906)) | (secretU64(u64(2147483648)) << 32))
+    sha3Round(s, secretU64(u64(2147516416)) | (secretU64(u64(2147483648)) << 32))
+    sha3Round(s, secretU64(u64(32907)) | (secretU64(u64(0)) << 32))
+    sha3Round(s, secretU64(u64(2147483649)) | (secretU64(u64(0)) << 32))
+    sha3Round(s, secretU64(u64(2147516545)) | (secretU64(u64(2147483648)) << 32))
+    sha3Round(s, secretU64(u64(32777)) | (secretU64(u64(2147483648)) << 32))
+    sha3Round(s, secretU64(u64(138)) | (secretU64(u64(0)) << 32))
+    sha3Round(s, secretU64(u64(136)) | (secretU64(u64(0)) << 32))
+    sha3Round(s, secretU64(u64(2147516425)) | (secretU64(u64(0)) << 32))
+    sha3Round(s, secretU64(u64(2147483658)) | (secretU64(u64(0)) << 32))
+    sha3Round(s, secretU64(u64(2147516555)) | (secretU64(u64(0)) << 32))
+    sha3Round(s, secretU64(u64(139)) | (secretU64(u64(2147483648)) << 32))
+    sha3Round(s, secretU64(u64(32905)) | (secretU64(u64(2147483648)) << 32))
+    sha3Round(s, secretU64(u64(32771)) | (secretU64(u64(2147483648)) << 32))
+    sha3Round(s, secretU64(u64(32770)) | (secretU64(u64(2147483648)) << 32))
+    sha3Round(s, secretU64(u64(128)) | (secretU64(u64(2147483648)) << 32))
+    sha3Round(s, secretU64(u64(32778)) | (secretU64(u64(0)) << 32))
+    sha3Round(s, secretU64(u64(2147483658)) | (secretU64(u64(2147483648)) << 32))
+    sha3Round(s, secretU64(u64(2147516545)) | (secretU64(u64(2147483648)) << 32))
+    sha3Round(s, secretU64(u64(32896)) | (secretU64(u64(2147483648)) << 32))
+    sha3Round(s, secretU64(u64(2147483649)) | (secretU64(u64(0)) << 32))
+    sha3Round(s, secretU64(u64(2147516424)) | (secretU64(u64(2147483648)) << 32))
+}
+// END SHA3 SECRET CORE
+
+private val SHA3_CONTEXT_SIZE = 240
+
+/** One sponge. `rate` is the bytes absorbed or squeezed per permutation (168 SHAKE128, 136 SHAKE256 and SHA3-256, 72
+ *  SHA3-512); `position` is where the next byte goes in the current block; `suffix` is the domain separation of the
+ *  padding (0x06 SHA-3, 0x1f SHAKE); `squeezing` is set once the padding is in. */
+class Keccak(val context: int, val rate: int, val suffix: int, var position: int, var squeezing: bool)
+
+private trusted fun sha3Wipe(address: int, size: int): void {
+    for (i in 0 until size) ablaUnsafeVolatileStoreU8(address + i, 0)
+}
+
+private trusted fun keccakNew(rate: int, suffix: int): Keccak {
+    val context = cryptoAllocate(SHA3_CONTEXT_SIZE)
+    sha3Wipe(context, SHA3_CONTEXT_SIZE)
+    Keccak(context, rate, suffix, 0, false)
+}
+
+fun keccakSha3(rate: int): Keccak = keccakNew(rate, 6)
+fun keccakShake128(): Keccak = keccakNew(168, 31)
+fun keccakShake256(): Keccak = keccakNew(136, 31)
+
+/** Wipes the state and frees it. The sponge can't be used afterwards. */
+trusted fun Keccak.close(): void {
+    sha3Wipe(this.context, SHA3_CONTEXT_SIZE)
+    ablaUnsafeFree(nativePointerFromAddress(this.context))
+}
+
+/** Absorbs `count` bytes at `address` (a string's, an array's: anything in memory). */
+trusted fun Keccak.absorbAt(address: int, count: int): void {
+    var done = 0
+    while (done < count) {
+        val chunk = if (count - done < this.rate - this.position) count - done else this.rate - this.position
+        for (i in 0 until chunk) {
+            val at = nativePointerFromAddress(this.context + this.position + i)
+            ablaUnsafeStoreU8(at, ablaUnsafeLoadU8(at) ^ ablaUnsafeLoadU8(nativePointerFromAddress(address + done + i)))
+        }
+        this.position = this.position + chunk
+        done = done + chunk
+        if (this.position == this.rate) {
+            sha3Permute(this.context)
+            this.position = 0
+        }
+    }
+}
+
+trusted fun Keccak.absorb(data: string): void = this.absorbAt(ablaUnsafeStringAddress(data), data.size)
+
+/** Ends the input: the suffix and the 10*1 padding, and the first permutation. */
+private trusted fun Keccak.finish(): void {
+    val first = nativePointerFromAddress(this.context + this.position)
+    ablaUnsafeStoreU8(first, ablaUnsafeLoadU8(first) ^ this.suffix)
+    val last = nativePointerFromAddress(this.context + this.rate - 1)
+    ablaUnsafeStoreU8(last, ablaUnsafeLoadU8(last) ^ 128)
+    sha3Permute(this.context)
+    this.position = 0
+    this.squeezing = true
+}
+
+/** Squeezes `count` bytes to `address`. The first call ends the input. */
+trusted fun Keccak.squeezeTo(address: int, count: int): void {
+    if (!this.squeezing) this.finish()
+    var done = 0
+    while (done < count) {
+        if (this.position == this.rate) {
+            sha3Permute(this.context)
+            this.position = 0
+        }
+        val chunk = if (count - done < this.rate - this.position) count - done else this.rate - this.position
+        for (i in 0 until chunk) {
+            ablaUnsafeStoreU8(nativePointerFromAddress(address + done + i),
+                ablaUnsafeLoadU8(nativePointerFromAddress(this.context + this.position + i)))
+        }
+        this.position = this.position + chunk
+        done = done + chunk
+    }
+}
+
+trusted fun Keccak.squeeze(count: int): string {
+    val bytes: array<int> = []
+    val buffer = cryptoAllocate(count + 1)
+    this.squeezeTo(buffer, count)
+    for (i in 0 until count) bytes.append(ablaUnsafeLoadU8(nativePointerFromAddress(buffer + i)))
+    ablaUnsafeFree(nativePointerFromAddress(buffer))
+    cryptoByteString(bytes)
+}
+
+private fun sha3Digest(rate: int, size: int, input: string): string {
+    var sponge = keccakSha3(rate)
+    sponge.absorb(input)
+    val digest = sponge.squeeze(size)
+    sponge.close()
+    ctScrubStack2048()
+    digest
+}
+
+private fun shakeDigest(var sponge: Keccak, input: string, size: int): string {
+    sponge.absorb(input)
+    val digest = sponge.squeeze(size)
+    sponge.close()
+    ctScrubStack2048()
+    digest
+}
+
+/** SHA3-256 of `input`, 32 bytes. */
+fun sha3256(input: string): string = sha3Digest(136, 32, input)
+/** SHA3-512 of `input`, 64 bytes. */
+fun sha3512(input: string): string = sha3Digest(72, 64, input)
+/** SHAKE128 of `input`, `size` bytes. */
+fun shake128(input: string, size: int): string = shakeDigest(keccakShake128(), input, size)
+/** SHAKE256 of `input`, `size` bytes. */
+fun shake256(input: string, size: int): string = shakeDigest(keccakShake256(), input, size)

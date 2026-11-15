@@ -27,7 +27,7 @@ random_hex() { head -c "$1" /dev/urandom | od -An -vtx1 | tr -d ' \n'; }
 
 # (At once: each writes only its own files.)
 pids=()
-programs=(vectors edge tool against-hosted both kat-native wycheproof-tls signatures)
+programs=(vectors edge tool against-hosted both kat-native wycheproof-tls signatures sha3)
 for program in "${programs[@]}"; do
     "$compiler" build "$cases/$program.ab" -o "$out/$program" --no-cache \
         > "$out/$program.build.log" 2>&1 &
@@ -65,6 +65,31 @@ else
     fail signatures; tail -20 "$out/signatures.log"
 fi
 
+
+# SHA-3 and SHAKE: the known answers inside, the digests of prefixes of random bytes against openssl dgst, one call against pieces.
+random_hex 1100 > "$out/sha3-random.hex"
+unhex "$out/sha3-random.hex" "$out/sha3-random.bin"
+if "$out/sha3" "$out/sha3-random.hex" > "$out/sha3.log" 2>&1 && grep -q '^crypto-pure sha3 ok$' "$out/sha3.log"; then
+    mismatches=0
+    checked=0
+    while read -r name length digest; do
+        [[ $name == crypto-pure ]] && continue
+        case $name in
+            sha3-256|sha3-512) expected=$(head -c "$length" "$out/sha3-random.bin" | openssl dgst "-$name" -binary | od -An -vtx1 | tr -d ' \n') ;;
+            shake128|shake256) expected=$(head -c "$length" "$out/sha3-random.bin" | openssl dgst "-$name" -xoflen 300 -binary | od -An -vtx1 | tr -d ' \n') ;;
+            *) fail "sha3: unknown line $name"; continue ;;
+        esac
+        checked=$((checked + 1))
+        [[ $digest == "$expected" ]] || { mismatches=$((mismatches + 1)); echo "sha3: $name over $length bytes differs from openssl"; }
+    done < "$out/sha3.log"
+    if [[ $mismatches -eq 0 && $checked -gt 100 ]]; then
+        echo "ok   sha3: $checked digests agree with openssl, pieces agree with one call"
+    else
+        fail "sha3: $mismatches of $checked digests differ from openssl"
+    fi
+else
+    fail sha3; tail -20 "$out/sha3.log"
+fi
 # --- Keys, refusals ------------------------------------------------------------------------
 keys=$out/keys
 # This helper generates interop keys; the dedicated keygen test still covers --fast.
