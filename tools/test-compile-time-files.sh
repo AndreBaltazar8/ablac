@@ -39,7 +39,7 @@ for mode in interp jit; do
     printf 'kept' > build/compile-time-files/failed/old.txt
     ABLA_COMPILE_EVAL_TRACE=1 "$compiler" build publish.ab -o publish --no-cache 2> publish.trace
     ./publish && status=0 || status=$?
-    [[ $status -eq 4 ]] || { echo "compile-time files ($mode): publish staged $status of 4"; exit 1; }
+    [[ $status -eq 4 ]] || { echo "compile-time files ($mode): publish did $status of 4"; exit 1; }
     [[ $(cat build/compile-time-files/publish/written.txt) == written ]]
     [[ -d build/compile-time-files/publish/made ]]
     [[ ! -e build/compile-time-files/publish/old.txt ]]
@@ -63,19 +63,26 @@ for mode in interp jit; do
         echo 'compile-time files: mode fixture did not run natively'; cat modes.trace; exit 1
     fi
 
-    # A build failing in analysis, and one failing after its staging ran.
+    # A build failing in analysis runs no site: the disk is as it was. One failing after a site ran keeps what the
+    # site did, as a program that fails after writing does (#72: compile-time writes are real writes).
     for failing in publish-failed late-fail; do
+        rm -f build/compile-time-files/failed/written.txt
         printf 'kept' > build/compile-time-files/failed/old.txt
         if ABLA_COMPILE_EVAL_TRACE=1 "$compiler" build $failing.ab -o failed --no-cache \
             > $failing.err 2>&1; then
-            echo "compile-time files ($mode): $failing built"; exit 1
+            echo "compile-time files ($mode): $failing build succeeded"; exit 1
         fi
-        [[ ! -e build/compile-time-files/failed/written.txt ]] || {
-            echo "compile-time files ($mode): the failed $failing build wrote to the disk"; exit 1
-        }
-        [[ $(cat build/compile-time-files/failed/old.txt) == kept ]] || {
-            echo "compile-time files ($mode): the failed $failing build removed a file"; exit 1
-        }
+        if [[ $failing == publish-failed ]]; then
+            [[ ! -e build/compile-time-files/failed/written.txt &&
+                $(cat build/compile-time-files/failed/old.txt) == kept ]] || {
+                echo "compile-time files ($mode): a build that failed in analysis ran its site"; exit 1
+            }
+        else
+            [[ $(cat build/compile-time-files/failed/written.txt) == written &&
+                ! -e build/compile-time-files/failed/old.txt ]] || {
+                echo "compile-time files ($mode): the site's writes didn't stay when the build failed later"; exit 1
+            }
+        fi
     done
     if [[ $mode == jit ]]; then
         # Every provider these cases reach crosses the bridge: each site is native.
@@ -100,4 +107,4 @@ for mode in interp jit; do
         echo "compile-time files ($mode): a cached build missed a changed input"; exit 1
     }
 done
-echo "compile-time files: staged writes, moves and removals agree with run time and publish on success, in both tiers"
+echo "compile-time files: writes, moves and removals agree with run time, in both tiers"

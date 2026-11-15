@@ -436,7 +436,7 @@ The check happens before evaluation starts, so a denied path never runs.
 | Capability | What it allows | Providers | Native object cache |
 |---|---|---|---|
 | `filesystem.read` | read files, list directories, file metadata | `abla/fs`: `p.readText()`, `p.readTextResult()`, `p.exists()`, `p.info()`, `p.revision()`, `p.isSymbolicLink()`, `p.entries()`, `currentDirectory()` (the internal `ablaHostReadFile`/`ablaHostListDirectory` too) | kept: each read is journaled and revalidated, a failed one too |
-| `filesystem.write` | stage output files, directories, moves and removals, published only if the build succeeds | `compilerWriteFile(path, contents)`; `abla/fs`: `p.writeText()`, `p.writeTextAtomic()`, `p.appendText()`, `p.createDirectories()`, `p.createParentDirectories()`, `p.moveTo(destination)`, `p.remove()` | disabled |
+| `filesystem.write` | write files, make directories, move and remove paths: real writes, as at run time | `compilerWriteFile(path, contents)`; `abla/fs`: `p.writeText()`, `p.writeTextAtomic()`, `p.appendText()`, `p.createDirectories()`, `p.createParentDirectories()`, `p.moveTo(destination)`, `p.remove()` | disabled |
 | `environment` | read named environment variables | `compilerEnvironment(name)` (`""` when unset) | kept: each value is journaled and revalidated |
 | `process.io` | run a child process | `compilerRunProcess(arguments)` | disabled |
 | `network` | one TCP request/response | `compilerTcpExchange(ipv4, port, request, maxBytes, timeoutMs)` | disabled |
@@ -448,30 +448,21 @@ The check happens before evaluation starts, so a denied path never runs.
 The `compiler*` providers come from `import "abla/compiler"`. File paths are
 relative to the directory the compiler runs in.
 
-Under `#`, the `abla/fs` writes, moves and removals are staged exactly like
-`compilerWriteFile`: nothing touches the disk until the build succeeds, then
-the staging is published in the order it happened (each file written with its
-directories made as needed, each directory made, each moved or removed path
-deleted); a failed build publishes nothing. The same bounds apply, and paths
-must be project-relative.
+Under `#`, the `abla/fs` writes, moves and removals, and `compilerWriteFile`,
+are real writes, as at run time: each one is on disk when the call returns, so
+what the site does next sees it. That holds for its reads, its own system calls
+(`linkTo`, `permissions`, raw `openat`) and the processes it starts
+(`compilerRunProcess`, `compilerCaptureProcess`), in both tiers. Paths may be
+anywhere the compiler may write, `/tmp` included, as at run time
+(`compilerWriteFile` keeps its own contract, below). `removeTree()` asks what
+a path is without following links, which is native code (`trusted.native`);
+so are `linkTo`, `linkTarget` and `linkInfo`.
 
-Until then, compile-time code sees the disk with the staging laid over it,
-which is what the program sees after the same operations at run time:
-
-- a staged file reads back with its staged contents (`readText`,
-  `readTextResult`, `exists`, `info`), and `appendText` appends to them;
-- each staged change is a new `revision()`, so `watchFile` sees a staged
-  rewrite;
-- a write makes its parent directories, as at run time, and `entries()` lists
-  what was staged in a directory along with what is on disk;
-- `remove()` and `moveTo()` act on staged and disk paths alike: a removed path
-  is gone, and a directory with something in it is not removed.
-
-Another process (one started under `process.io`) sees only the disk, so a
-file the build has staged isn't there for it yet. `removeTree()` asks what a
-path is without following links, which is native code (`trusted.native`).
-So are `linkTo`, `linkTarget` and `linkInfo`: system calls, which see only
-the disk, so a link made in a directory the build has staged fails.
+A build that fails after a site wrote keeps what the site wrote, as a program
+that fails after writing does: a failed build can leave partial output. A
+build that fails before any site runs (in parsing or analysis) writes nothing.
+A build that grants `filesystem.write` is never taken from the native object
+cache, so its sites run, and write, on every build.
 
 `print`, `println`, `eprint` and `eprintln` need no capability: under `#` they
 write to the compiler's own standard output and error. What a compilation
@@ -484,8 +475,9 @@ compile-time evaluation is a program the compiler runs with no arguments:
 Bounds:
 
 - `compilerWriteFile`: paths are project-relative, without `.` or `..`
-  components. At most 16 MiB per file, 4096 paths and 256 MiB per build.
-  Writing the same path again replaces its staged contents.
+  components. At most 16 MiB per file and 256 MiB per build. Each write goes
+  beside its target and is renamed over it, so a reader sees the old contents
+  or the new ones, whole.
 - `compilerRunProcess`: at most 128 arguments of 4096 bytes each. The same
   watchdog that bounds the compiler bounds the child.
 - `compilerTcpExchange`: numeric IPv4 addresses only, at most 1 MiB each
@@ -737,9 +729,6 @@ reason:
   meet, finishes in the native tier;
 - a program that reads its own executable, or calls its own exported
   functions, finds the compiler under `#`;
-- another process, or a system call such as `linkTo`'s, can't see a file
-  the build has staged
-  ([capabilities](#capabilities-files-environment-processes-network));
 - a program that panics at run time stops the build with the same panic
   under `#`, because a compile-time panic is a compile error.
 
@@ -757,7 +746,7 @@ reason:
 | `print`/`println` | works, no grant: to the compiler's standard output |
 | `panic(message)`, `exit(code)` (`abla/process`) | no grant: stop the evaluation with `E_CT_PANIC` (the message) or `E_CT_STOPPED`, never the compiler, on either tier and with `trusted.native` too |
 | `abla/fs` reads, `abla/process/time` | works with `filesystem.read` / `clock` |
-| `abla/fs` writes, moves and removals | works with `filesystem.write`, staged until the build succeeds |
+| `abla/fs` writes, moves and removals | works with `filesystem.write`: real writes, as at run time |
 | Standard-library code built on its own raw memory (byte buffers) | works, no grant |
 | Other system calls (processes, sockets) | works with `trusted.native` ([native code](#native-code-at-compile-time)) |
 | `extern:"c"` functions, trusted raw memory (static and thread-local storage included), `nativeFunctionAddress` callbacks | works with `trusted.native` |
@@ -798,7 +787,7 @@ fun main: int = count
    and its value is stored as a constant. A top-level `val` or `var` whose
    initializer contains a `#expression` is always lowered, whether or not
    anything reads it and whether or not the program has `main`, so its
-   compile-time effects (an export, an internal link name, a staged file,
+   compile-time effects (an export, an internal link name, a written file,
    output, an error) are the same in every build. Code that runs only for its
    effect still reads best as a [top-level action](#top-level-actions).
 5. Check the result and generate code.
@@ -875,7 +864,7 @@ site gives the same program constant on either tier.
 Native code calls the compiler API, parser externs and host providers
 (`extern:"compiler"`, `extern:"parser"`, `extern:"host"`) through the compiler
 bridge: each call runs the evaluator's implementation on the site's evaluation,
-so grants, the input journal, staged writes and diagnostics are the
+so grants, the input journal, writes and diagnostics are the
 evaluator's, and compiler-owned values (syntax, cursors, builders) cross as
 handles.
 

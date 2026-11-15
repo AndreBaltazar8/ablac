@@ -1453,64 +1453,18 @@ fun bootstrapPrepareCompileOutputRoot(): bool {
     root.createDirectories(0o700) && (root.permissions() & 0o077) == 0
 }
 
-/** Slot `slot` now stages `kind` with `contents`, one revision later. */
-fun bootstrapRestageCompileOutput(slot: int, kind: string, contents: string): bool {
-    val root = bootstrapCompileOutputRoot()
-    val dataFile = Path("$root/$slot.data")
-    val previous = dataFile.readText().size
-    val nextBytes = bootstrapCompileOutputBytes - previous + contents.size
-    if (nextBytes > BOOTSTRAP_COMPILE_OUTPUT_BYTES) return false
-    if (!dataFile.writeText(contents, 0o600)) return false
-    bootstrapCompileOutputBytes = nextBytes
-    val kindFile = Path("$root/$slot.kind")
-    val kept = kindFile.writeText(kind, 0o600)
-    kept && Path("$root/$slot.revision").writeText(
-        "${bootstrapCompileOutputRevision(slot) + 1}", 0o600
-    )
-}
-
-/** Stages a file, directory or removal in the private output journal. */
-fun bootstrapStageCompileEntry(path: string, kind: string, contents: string = ""): bool {
-    if (!bootstrapCompileOutputPathValid(path)) return false
-    val slot = bootstrapCompileOutputSlot(path)
-    if (slot >= 0) return bootstrapRestageCompileOutput(slot, kind, contents)
-    if (bootstrapCompileOutputCount >= BOOTSTRAP_COMPILE_OUTPUT_LIMIT) return false
-    if (bootstrapCompileOutputBytes + contents.size > BOOTSTRAP_COMPILE_OUTPUT_BYTES) return false
-    val root = bootstrapCompileOutputRoot()
-    val index = bootstrapCompileOutputCount
-    val valid = bootstrapPrepareCompileOutputRoot() &&
-        Path("$root/$index.path").createExclusive(path) &&
-        Path("$root/$index.data").createExclusive(contents) &&
-        Path("$root/$index.kind").createExclusive(kind)
-    if (!valid) {
-        Path("$root/$index.path").remove()
-        Path("$root/$index.data").remove()
-        Path("$root/$index.kind").remove()
-    } else {
-        bootstrapCompileOutputCount = index + 1
-        bootstrapCompileOutputBytes = bootstrapCompileOutputBytes + contents.size
-    }
-    valid
-}
-
-fun bootstrapStageCompileOutput(path: string, contents: string, mode: int = 0o666,
-    exactMode: bool = false, replaceMode: bool = false): bool {
-    if (mode < 0 || mode > 0o7777 || contents.size > 16777216) return false
-    val oldSlot = bootstrapCompileOutputSlot(path)
-    val oldKind = if (oldSlot >= 0) bootstrapCompileOutputKind(oldSlot) else ""
-    if (!bootstrapStageCompileEntry(path, "file", contents)) return false
-    val slot = bootstrapCompileOutputSlot(path)
-    // Rewriting a staged file preserves its creation mode, just like open.
-    if (oldKind == "file" && !replaceMode) {
-        return Path("${bootstrapCompileOutputRoot()}/$slot.mode").exists()
-    }
-    val existing = if (oldKind == "removed" || replaceMode) -1 else Path(path).permissions()
-    val keptMode = if (existing >= 0) existing else mode
-    val root = bootstrapCompileOutputRoot()
-    if (!Path("$root/$slot.mode").writeText("$keptMode", 0o600)) return false
-    val exact = Path("$root/$slot.exact")
-    if (existing >= 0 || exactMode) exact.writeText("1", 0o600)
-    else exact.remove() || !exact.exists()
+/**
+ * compilerWriteFile: a real write, as compile-time code's other writes are (#72), done at once, so what the site
+ * does next (a read, a system call, a process it starts) sees it. A build that fails later keeps it. The API's own
+ * contract stays: a project-relative path without `.` or `..` components, at most 16 MiB a file and 256 MiB a build.
+ * Written beside its target and renamed over it; an existing file keeps its mode.
+ */
+fun bootstrapCompileWriteFile(path: string, contents: string): bool {
+    if (!bootstrapCompileOutputPathValid(path) || contents.size > 16777216 ||
+        bootstrapCompileOutputBytes + contents.size > BOOTSTRAP_COMPILE_OUTPUT_BYTES) return false
+    if (!bootstrapWriteBuildFile(Path(path), contents)) return false
+    bootstrapCompileOutputBytes = bootstrapCompileOutputBytes + contents.size
+    true
 }
 
 // Toolchain-owned sidecars inherit the already validated/authorized artifact
@@ -12487,10 +12441,7 @@ fun bootstrapEvaluateCallHost(
                 evaluator.allowedCompileEffects,
                 8
             )) {
-            result = bootstrapEvalBoolean(bootstrapStageCompileOutput(
-                path.text,
-                contents.text
-            ))
+            result = bootstrapEvalBoolean(bootstrapCompileWriteFile(path.text, contents.text))
         } else {
             evaluator.errors = evaluator.errors + 1
             result = bootstrapEvalInvalid()

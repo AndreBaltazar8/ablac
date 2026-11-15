@@ -1633,24 +1633,25 @@ fun ctNativeHostCall(
         evaluator.recordCompileInput("abla-input:current-directory:", directory)
         result = bootstrapEvalString(directory)
     } else if (operation == "WriteFile" || operation == "WriteFileAtomic") {
-        // Staged like compilerWriteFile: published when the build succeeds.
+        // A real write, as at run time (#72).
         val path = ctNativeValueText(values, 0)
-        val staged = ctNativeViewWrite(evaluator, path, ctNativeValueText(values, 1))
-        if (operation == "WriteFileAtomic") result = bootstrapEvalBoolean(staged)
+        val written = path != "" && (if (operation == "WriteFileAtomic")
+            Path(path).writeTextAtomic(ctNativeValueText(values, 1))
+            else Path(path).writeText(ctNativeValueText(values, 1)))
+        if (operation == "WriteFileAtomic") result = bootstrapEvalBoolean(written)
     } else if (operation == "CreateParentDirectories" ||
                operation == "CreateDirectories") {
         val path = ctNativeValueText(values, 0)
         val directory = if (operation == "CreateDirectories") path else Path(path).parent().text
-        val made = directory == "" || directory == "." ||
-            ctNativeViewCreateDirectories(evaluator, directory)
+        val made = directory == "" || directory == "." || Path(directory).createDirectories()
         if (operation == "CreateDirectories") result = bootstrapEvalBoolean(made)
     } else if (operation == "MoveFile") {
-        // Moves and removals act on the compile-time file view too.
-        result = bootstrapEvalBoolean(ctNativeViewMove(
-            evaluator, ctNativeValueText(values, 0), ctNativeValueText(values, 1)
-        ))
+        val source = ctNativeValueText(values, 0)
+        val destination = ctNativeValueText(values, 1)
+        result = bootstrapEvalBoolean(source != "" && destination != "" && Path(source).moveTo(Path(destination)))
     } else if (operation == "RemoveFile") {
-        result = bootstrapEvalBoolean(ctNativeViewRemove(evaluator, ctNativeValueText(values, 0)))
+        val path = ctNativeValueText(values, 0)
+        result = bootstrapEvalBoolean(path != "" && Path(path).remove())
     } else if (operation == "ArgumentCount") {
         result = bootstrapEvalInteger(0)
     } else if (operation == "Argument") {
@@ -1923,12 +1924,11 @@ fun ctNativeStagedText(slot: int): string =
 
 // ---- the compile-time file view ----
 //
-// Under `#`, files are written to the compilation's staging area and
-// published only when the build succeeds (bootstrapStageCompileOutput). What
-// compile-time code sees is the disk with that staging laid over it: a staged
-// file or directory is there, a staged removal is gone, and a directory holds
-// what it holds on disk plus what was staged in it. Disk observations are
-// journaled as build inputs; the staging is the build's own output.
+// Compile-time code's writes are real writes (#72), so what it reads is the
+// disk. The only staged entries are the toolchain's own outputs
+// (bootstrapStageToolchainOutput: sidecars, independent entries), published
+// with the build: the view lays those over the disk. Disk observations are
+// journaled as build inputs.
 
 /** Whether a live staged path (a file or directory) lies under `path`. */
 fun ctNativeStagedUnder(path: string): bool {
@@ -2057,56 +2057,6 @@ fun ctNativeViewEntries(var evaluator: BootstrapEvaluator, path: string): array<
     names
 }
 
-/** Stages `contents` at `path` as a file write does at run time: making its
- *  parent directories first. */
-fun ctNativeViewWrite(var evaluator: BootstrapEvaluator, path: string, contents: string,
-    mode: int = 0o666, exactMode: bool = false, replaceMode: bool = false): bool {
-    if (mode < 0 || mode > (if (replaceMode) 0o7777 else 0o777)) return false
-    val parent = Path(path).parent().text
-    (parent == "" || parent == "." || ctNativeViewCreateDirectories(evaluator, parent)) &&
-        bootstrapStageCompileOutput(path, contents, mode, exactMode, replaceMode)
-}
-
-/** Makes directory `path` in the view: true when it is one now. */
-fun ctNativeViewCreateDirectories(var evaluator: BootstrapEvaluator, path: string,
-    mode: int = 0o777): bool {
-    if (!bootstrapCompileOutputPathValid(path)) return false
-    val kind = ctNativeViewKind(evaluator, path)
-    if (kind == 2) return true
-    if (kind != 0) return false
-    bootstrapStageCompileEntry(path, "directory", "${mode & 0o7777}")
-}
-
-/** Removes a file, or an empty directory, from the view. */
-fun ctNativeViewRemove(var evaluator: BootstrapEvaluator, path: string): bool {
-    if (!bootstrapCompileOutputPathValid(path)) return false
-    val kind = ctNativeViewKind(evaluator, path)
-    if (kind == 0) return false
-    if (kind == 2 && ctNativeViewEntries(evaluator, path).size > 0) return false
-    bootstrapStageCompileEntry(path, "removed")
-}
-
-/** Moves a file or a directory (and what it holds) in the view. */
-fun ctNativeViewMove(var evaluator: BootstrapEvaluator, source: string, destination: string): bool {
-    if (!bootstrapCompileOutputPathValid(source) ||
-        !bootstrapCompileOutputPathValid(destination)) return false
-    val kind = ctNativeViewKind(evaluator, source)
-    if (kind == 1) {
-        val read = ctNativeViewRead(evaluator, source, true)
-        val slot = bootstrapCompileOutputSlot(source)
-        val mode = if (slot >= 0) bootstrapCompileOutputMode(slot) else Path(source).permissions()
-        val exact = if (slot >= 0) bootstrapCompileOutputExactMode(slot) else true
-        return read.succeeded && ctNativeViewWrite(evaluator, destination, read.text, mode, exact,
-            true) &&
-            bootstrapStageCompileEntry(source, "removed")
-    }
-    if (kind != 2 || !ctNativeViewCreateDirectories(evaluator, destination)) return false
-    for (name in ctNativeViewEntries(evaluator, source)) {
-        if (!ctNativeViewMove(evaluator, "$source/$name", "$destination/$name")) return false
-    }
-    bootstrapStageCompileEntry(source, "removed")
-}
-
 // Performs `Path.<method>` on an evaluated receiver; `arguments` holds the
 // call's children and the method's arguments start at `first`. It answers
 // from the compile-time file view (above), journaling what it observes on
@@ -2131,31 +2081,27 @@ fun ctNativeEvaluatePathMethod(
     }
     val path = ctNativePathText(receiver)
     var result = bootstrapEvalInvalid()
+    // Writes are real writes, as at run time (#72): the compiler performs the run-time operation itself, so the
+    // site's own system calls and the processes it starts see them at once. A build that fails later keeps what
+    // its sites wrote.
     if (method == "writeText" || method == "writeTextAtomic" || method == "appendText") {
-        // Staged like compilerWriteFile: published when the build succeeds,
-        // discarded when it fails.
-        var contents = ctNativeValueText(values, 0)
-        if (method == "appendText") {
-            val read = ctNativeViewRead(evaluator, path)
-            contents = "${if (read.succeeded) read.text else ""}$contents"
-        }
+        val contents = ctNativeValueText(values, 0)
         val mode = if (method != "appendText" && values.size > 1) ctNativeWord(values[1]) else 0o666
-        result = bootstrapEvalBoolean(ctNativeViewWrite(evaluator, path, contents, mode))
+        val target = Path(path)
+        result = bootstrapEvalBoolean(path != "" &&
+            (if (method == "appendText") target.appendText(contents)
+             else if (method == "writeTextAtomic") target.writeTextAtomic(contents, mode)
+             else target.writeText(contents, mode)))
     } else if (method == "createDirectories") {
         val mode = if (values.size == 0) 0o777 else ctNativeWord(values[0])
-        result = bootstrapEvalBoolean(ctNativeViewCreateDirectories(evaluator, path, mode))
+        result = bootstrapEvalBoolean(path != "" && Path(path).createDirectories(mode))
     } else if (method == "createParentDirectories") {
-        val parent = Path(path).parent().text
-        result = bootstrapEvalBoolean(
-            parent == "" || parent == "." || ctNativeViewCreateDirectories(evaluator, parent)
-        )
+        result = bootstrapEvalBoolean(path != "" && Path(path).createParentDirectories())
     } else if (method == "remove") {
-        result = bootstrapEvalBoolean(ctNativeViewRemove(evaluator, path))
+        result = bootstrapEvalBoolean(path != "" && Path(path).remove())
     } else if (method == "moveTo") {
-        result = bootstrapEvalBoolean(
-            ctNativeViewMove(evaluator, path,
-                ctNativePathText(if (values.size > 0) values[0] else bootstrapEvalInvalid()))
-        )
+        val destination = ctNativePathText(if (values.size > 0) values[0] else bootstrapEvalInvalid())
+        result = bootstrapEvalBoolean(path != "" && destination != "" && Path(path).moveTo(Path(destination)))
     } else if (method == "readText") {
         val read = ctNativeViewRead(evaluator, path, true)
         result = bootstrapEvalString(if (read.succeeded) read.text else "")

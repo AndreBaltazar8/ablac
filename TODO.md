@@ -560,6 +560,15 @@ mmap form) apply there.
   on the e89d5e4e compiler and 89e4596d sysroot. The tool suite passed, including interpreter/JIT expected
   refusals; the step-limit and `?? return` error controls each produced one diagnostic at the call site.
 
+- [x] Compile-time writes are real writes (André, decision #72 A, 2026-11-15). Under `#`, `abla/fs` writes,
+  moves and removals, and `compilerWriteFile`, go straight to the disk, as at run time, in both tiers and on
+  every OS. The site's own system calls and the processes it starts see them, and paths outside the tree
+  (`/tmp`) work. A failed build can leave partial output: what its sites wrote before the failure stays.
+  `compilerWriteFile` keeps its project-relative paths and 16 MiB / 256 MiB bounds. The staging journal now
+  only holds the toolchain's own sidecars. The private overlay that would have kept writes transactional
+  (#68 B, branch ct-overlay at 31849f6b, local only) was declined. Parity: filesystem, http-advanced, tls,
+  tool-support and network-advanced (jit) pass.
+
 - [ ] Extend cross-target compile-time JIT portability only with evaluator parity (#789).
   The initial Wasm32-only allow-list covers integer/string/array/plain-class computations, SHA and known
   capability providers. Compiler/parser queries, indirect calls, resources, raw memory,

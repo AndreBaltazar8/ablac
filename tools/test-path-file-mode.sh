@@ -43,8 +43,8 @@ for mask in 000 022 077; do
     [[ $mask != 077 ]] || all=700
     [[ $(mode_of "$dir/all") == "$all" ]]
 done
-# The staged provider must retain mode through rewrites/moves, and preserve
-# existing modes even when publication runs with a more restrictive umask.
+# A compile-time write keeps modes through rewrites and moves as at run time, and preserves
+# existing modes under a more restrictive umask.
 dir="$out/staged"
 rm -rf "$dir"
 prepare "$dir"
@@ -97,7 +97,7 @@ prepare "$dir"
 ABLA_SYSROOT=. "$compiler" build "$out/staged.ab" -o "$out/staged-relative" --fast --no-cache
 "$out/staged-relative"
 [[ $(mode_of "$dir/secret") == 600 && $(cat "$dir/secret") == secret ]]
-# A later compile-time error must discard a staged secret.
+# A compile-time write is a real write (#72): a later compile-time error leaves it on disk, with the mode it asked for.
 cat > "$out/failed.ab" <<'ABLA'
 import "abla/fs"
 import "abla/compiler"
@@ -109,11 +109,11 @@ fun main: int = 0
 ABLA
 rm -f "$out/not-published"
 if "$compiler" build "$out/failed.ab" -o "$out/failed" --fast --no-cache > "$out/failed.log" 2>&1; then
-    echo 'failed staged write unexpectedly built' >&2; exit 1
+    echo 'the build with a failing compile-time site succeeded' >&2; exit 1
 fi
 grep -q 'E_EVAL_DIVISION_BY_ZERO' "$out/failed.log"
-[[ ! -e "$out/not-published" ]]
-# Host staging remains available while the Wasm runtime has no filesystem.
+[[ $(mode_of "$out/not-published") == 600 && $(cat "$out/not-published") == secret ]]
+# Compile-time writes work on the host while the Wasm runtime has no filesystem.
 "$compiler" build tests/cases/path-file-mode/wasm-build.ab -o "$out/wasm-build" --fast --no-cache
 "$out/wasm-build"
 [[ $(mode_of "$out/wasm-host") == 600 && $(cat "$out/wasm-host") == 'host secret' ]]

@@ -61,11 +61,9 @@
 # (the program measures or resets its heap, which the interpreter doesn't have) |
 # interp-steps (the interpreter ran past its step limit; the same `#` code
 # under ABLA_COMPILE_EVAL=jit finishes and matches) | host-dependent and
-# staged-writes and interp-timing (listed below with the reason, differing by
-# design: what the case reports is the process it runs in, which under `#` is
-# the compiler; another process reads a file the case wrote, which under `#`
-# stays staged until the build succeeds; or the case keeps real-time deadlines
-# the interpreter can't meet) | same-panic (the program panics at run time and
+# interp-timing (listed below with the reason, differing by design: what the
+# case reports is the process it runs in, which under `#` is the compiler; or
+# the case keeps real-time deadlines the interpreter can't meet) | same-panic (the program panics at run time and
 # its `#` evaluation stops with the same panic: E_CT_PANIC, or the evaluator's
 # own code for it, with the same message).
 set -uo pipefail
@@ -175,11 +173,6 @@ build_and_run() { # dir tag entry mode
 # builds ("<case>\t<modes>\t<status>\t<reason>"; docs/compile-time.md).
 by_design='module/proc-self-exe	*	host-dependent	reads its own executable (/proc/self/exe): under `#` that is the compiler
 module/unsafe-boundary	*	host-dependent	calls its own @export functions through dlsym: they exist only in the running program, not in the compiler
-module/http-advanced	*	staged-writes	a child process (gzip) reads a file the case wrote: under `#` writes stay staged until the build succeeds
-module/network-advanced	jit	staged-writes	its http-advanced part: a child process (gzip) reads a file the case wrote, which stays staged under `#` (interp: interp-threads)
-module/filesystem	*	staged-writes	linkTo is a system call (trusted.native), which sees only the disk: the directory the case made is still staged under `#`, so check 12 (the link) fails
-module/tool-support	*	staged-writes	its files are made under /tmp: under `#` a write outside the tree is staged, so the system calls that follow (permissions, links) see none of it and its checks fail in both tiers
-module/tls	jit	staged-writes	it removes its certificate files, then `openssl req` (a child) writes new ones: under `#` the removal is staged and hides the files the child wrote from the site, so the server never starts and the client thread waits (interp: interp-threads)
 module/websocket-server-protocol	interp	interp-timing	forks clients with 100 ms ping / 3 s idle deadlines the interpreter cannot meet (passes under jit)
 module/http-async	interp	interp-timing	the interpreted child builds the 200 KB /big body byte by byte and misses the client timeout (passes under jit)'
 
@@ -468,7 +461,7 @@ find "$output/cases" -name result.tsv -exec cat {} + | sort >"$output/results.ts
 echo
 for mode in $modes; do
     printf '%s:' "$mode"
-    for status in pass mismatch compile-failed timeout interp-threads interp-memory interp-steps interp-timing host-dependent staged-writes same-panic runtime-skipped; do
+    for status in pass mismatch compile-failed timeout interp-threads interp-memory interp-steps interp-timing host-dependent same-panic runtime-skipped; do
         printf ' %s %d' "$status" \
             "$(awk -F'\t' -v m="$mode" -v s="$status" '$2 == m && $3 == s' \
                 "$output/results.tsv" | wc -l | tr -d ' ')"

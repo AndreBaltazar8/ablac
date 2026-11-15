@@ -147,11 +147,11 @@ rm -rf "$cases/fs-cache/build" "$cases/fs-cache/late.txt"
     exit 1
 }
 
-# abla/fs writes are staged: published on success, discarded on failure.
+# abla/fs writes under `#` are real writes, as at run time (#72): on disk at once, and kept when the build fails later.
 rm -rf "$cases/fs-write/build-fs-write" "$cases/fs-write-failed/build-fs-write-failed"
 run_case "$cases/fs-write" "$output_directory/fs-write" build > /dev/null
 [[ $(cat "$cases/fs-write/build-fs-write/generated.txt") == $'first\nsecond' ]] || {
-    echo 'a staged compile-time write was not published' >&2
+    echo 'a compile-time write did not reach the disk' >&2
     exit 1
 }
 expect_42 "$cases/fs-write" "$output_directory/fs-write"
@@ -162,13 +162,14 @@ run_case "$cases/fs-write-failed" "$output_directory/fs-write-failed" build \
 write_failed=$?
 set -e
 [[ $write_failed -ne 0 ]] || exit 1
-[[ ! -e $cases/fs-write-failed/build-fs-write-failed/never.txt ]] || {
-    echo 'a failed compilation published its staged write' >&2
+[[ $(cat "$cases/fs-write-failed/build-fs-write-failed/written.txt" 2>/dev/null) == written ]] || {
+    echo 'a compile-time write was lost when the build failed later (writes are real writes)' >&2
     exit 1
 }
+rm -rf "$cases/fs-write-failed/build-fs-write-failed"
 
 # Without the filesystem.write capability the write is denied and nothing is
-# staged or published.
+# written.
 rm -rf "$cases/fs-write-denied/build-fs-write-denied"
 set +e
 run_case "$cases/fs-write-denied" "$output_directory/fs-write-denied" build \
@@ -216,4 +217,4 @@ fi
 grep -q 'E_EVAL_NATIVE_ADDRESS.*ablaUnsafeStoreI64. at address 0' "$output_directory/null-address.log"
 grep -q 'E_EVAL_NATIVE_ADDRESS.*ablaUnsafeCallVoid0. at address 0' "$output_directory/null-address.log"
 
-echo "compile-time native: C calls, callbacks, raw memory, static storage, system calls, a manifest library, the host API, abla/fs reads, staged writes, println and contained standard-library memory; denied calls not performed, null addresses are errors"
+echo "compile-time native: C calls, callbacks, raw memory, static storage, system calls, a manifest library, the host API, abla/fs reads and writes, println and contained standard-library memory; denied calls not performed, null addresses are errors"
