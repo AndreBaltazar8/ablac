@@ -7620,6 +7620,13 @@ class BootstrapAnalyzer(
     // rather than looking the name up again, where the local is gone and a
     // global of the same name (of any module) would answer.
     val shadowedIdentifiers: BootstrapStringSet = bootstrapStringSet(),
+    // The typed-expression requests by their begin offset (typedRequestIndex), built as far as the request arrays reach, and the
+    // recorded calls by theirs (typedCallRecorded): a request is looked up for every expression the analysis visits, and every call
+    // recorded is checked against the ones already recorded, which were linear scans of both lists.
+    var typedRequestByBegin: Map<int, array<int>> = Map(),
+    var typedRequestIndexed: int = 0,
+    var typedCallByBegin: Map<int, array<int>> = Map(),
+    var typedCallIndexed: int = 0,
     // Delegated class properties: each one's `Owner.field` and its delegated
     // type (bootstrapDelegatedType), "" while it is being worked out.
     val delegatedFieldKeys: array<string> = [],
@@ -10935,6 +10942,31 @@ class BootstrapAnalyzer(
     }
 
     fun typedRequestIndex(expression: BootstrapExpression): int {
+        if (expression.begin >= 0) {
+            // A request matches by its span, kind and source: only the ones that begin here can.
+            val total = if (this.typedRequestBegins.size < this.typedRequestEnds.size) this.typedRequestBegins.size else this.typedRequestEnds.size
+            val limit = if (total < this.typedRequestKinds.size) total else this.typedRequestKinds.size
+            if (this.typedRequestIndexed > limit) {
+                this.typedRequestByBegin = Map()
+                this.typedRequestIndexed = 0
+            }
+            while (this.typedRequestIndexed < limit) {
+                val at = this.typedRequestBegins[this.typedRequestIndexed]
+                val known = this.typedRequestByBegin.get(at)
+                if (known == null) this.typedRequestByBegin.set(at, [this.typedRequestIndexed]) else known.append(this.typedRequestIndexed)
+                this.typedRequestIndexed = this.typedRequestIndexed + 1
+            }
+            val here = this.typedRequestByBegin.get(expression.begin)
+            if (here != null) {
+                for (request in here) {
+                    if (this.typedRequestEnds[request] == expression.end &&
+                        this.typedRequestKinds[request] == expression.kind &&
+                        !(this.typedRequestSources.size > request && this.typedRequestSources[request] != "" &&
+                            this.typedRequestSources[request] != this.currentSourceIdentity)) return request
+                }
+            }
+            return -1
+        }
         var matched = -1
         var request = 0
         while (matched < 0 && request < this.typedRequestBegins.size &&
@@ -11048,6 +11080,29 @@ class BootstrapAnalyzer(
         result
     }
 
+    // Whether a call at [begin, end) of `kind` (and, with `named`, of `name`) is recorded for this source already. The list is
+    // truncated by ct_infer.ab: the index starts over when it is longer than the list.
+    fun typedCallRecorded(begin: int, end: int, kind: string, name: string, named: bool): bool {
+        if (this.typedCallIndexed > this.typedCalls.size) {
+            this.typedCallByBegin = Map()
+            this.typedCallIndexed = 0
+        }
+        while (this.typedCallIndexed < this.typedCalls.size) {
+            val at = this.typedCalls[this.typedCallIndexed].begin
+            val known = this.typedCallByBegin.get(at)
+            if (known == null) this.typedCallByBegin.set(at, [this.typedCallIndexed]) else known.append(this.typedCallIndexed)
+            this.typedCallIndexed = this.typedCallIndexed + 1
+        }
+        val here = this.typedCallByBegin.get(begin)
+        if (here == null) return false
+        for (existing in here) {
+            val candidate = this.typedCalls[existing]
+            if (candidate.sourceIdentity == this.currentSourceIdentity && candidate.end == end && candidate.kind == kind &&
+                (!named || candidate.name == name)) return true
+        }
+        false
+    }
+
     fun recordTypedCall(
         expression: BootstrapExpression,
         resultType: string,
@@ -11061,18 +11116,8 @@ class BootstrapAnalyzer(
         if (this.typedRequestBegins.size == 0) return
         val request = this.typedRequestIndex(expression)
         if (request < 0) return
-        var already = false
-        var existing = 0
-        while (!already && existing < this.typedCalls.size) {
-            val candidate = this.typedCalls[existing]
-            if (request >= 0 &&
-                candidate.sourceIdentity == this.currentSourceIdentity &&
-                candidate.begin == this.typedRequestBegins[request] &&
-                candidate.end == this.typedRequestEnds[request] &&
-                candidate.kind == expression.kind &&
-                candidate.name == expression.text) already = true
-            existing = existing + 1
-        }
+        val already = this.typedCallRecorded(this.typedRequestBegins[request], this.typedRequestEnds[request], expression.kind,
+            expression.text, true)
         if (!already && request >= 0 && target >= 0) {
             val bindings: array<int> = []
             val conversions: array<string> = []
@@ -11114,17 +11159,8 @@ class BootstrapAnalyzer(
         if (this.typedRequestBegins.size == 0) return
         val request = this.typedRequestIndex(expression)
         if (request < 0) return
-        var already = false
-        var existing = 0
-        while (!already && existing < this.typedCalls.size) {
-            val candidate = this.typedCalls[existing]
-            if (request >= 0 &&
-                candidate.sourceIdentity == this.currentSourceIdentity &&
-                candidate.begin == this.typedRequestBegins[request] &&
-                candidate.end == this.typedRequestEnds[request] &&
-                candidate.kind == expression.kind) already = true
-            existing = existing + 1
-        }
+        val already = this.typedCallRecorded(this.typedRequestBegins[request], this.typedRequestEnds[request], expression.kind,
+            "", false)
         if (request >= 0 && !already && type != "unknown") {
             this.typedCalls.append(BootstrapTypedCall(
                 this.currentSourceIdentity,
