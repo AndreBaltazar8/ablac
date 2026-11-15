@@ -12,8 +12,7 @@ if [[ $(uname -s) == Linux ]]; then
         exit 1
     fi
 fi
-python3 "$root/tests/cases/device-serial/session.py" "$out/main"
-# The same client, driven by an Abla program on raw system calls (own termios constants, own flag decoding), on Linux and
+# The client, driven by an Abla program on raw system calls (own termios constants, own flag decoding), on Linux and
 # on macOS (where the runtime translates the Linux-numbered calls to BSD ones).
 "$compiler" build "$root/tests/cases/device-serial/driver.ab" -o "$out/driver" --fast --no-cache
 rm -rf "$out/driver-scratch"

@@ -29,12 +29,7 @@ ascending size; use Abla for socket protocol peers. The differential fuzzer is
 ported (tools/fuzz, #648) and its Python version removed; the constant-time checker
 remains until its later port.
 
-Left on the allow-list on purpose: `tests/cases/device-serial/session.py` (and
-`tools/test-device-serial.sh` with it) is a pty/termios oracle, independent of the
-library's own flag and layout code, with an interactive stdin/stdout protocol to the client,
-concurrent pty drains, a signal stream and rlimit set-up; it needs a raw-syscall Abla driver
-(ptmx, TIOCGPTN, TCGETS, fork/exec with pipes, setsid, setrlimit, kill, threads), built
-after the rest of #807.
+The device-serial pty/termios oracle is ported (tests/cases/device-serial/driver.ab, raw system calls, Linux and macOS); its Python session is removed.
 
 Kept as documented exceptions (lead's decision under "no Python if possible", 2026-11-13; the allow-list is
 sorted lines with no comments, so the reasons live here):
