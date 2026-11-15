@@ -4219,6 +4219,103 @@ trusted fun __ablaRuntimeDarwinNanosleep(request: int): int {
     __ablaRuntimeDarwinResult(raw)
 }
 
+
+// fork 57 over BSD fork 2 (#811 G1): the kernel answers in both processes, the child pid (parent) or the
+// parent's (child) in the first result register and 1 in the child's second, 0 in the parent's
+// (ablaDarwinSyscallPair). libSystem's fork handlers do not run: a child that stays in Abla code issues its
+// system calls itself, as the stdlib's fork-then-execve does.
+trusted fun __ablaRuntimeDarwinFork(): int {
+    val second = __ablaRuntimeDarwinScratch(16)
+    if (__ablaRuntimeDarwinScratchFailed(second)) return -12
+    ablaRuntimeStoreI64(second, 0)
+    val raw = ablaDarwinSyscallPair(2, 0, 0, 0, 0, 0, second)
+    val child = ablaRuntimeLoadI64(second) & 4294967295
+    __ablaRuntimeDarwinScratchFree(second, 16)
+    if (raw < 0 && raw > -4096) return __ablaRuntimeDarwinResult(raw)
+    if (child != 0) 0 else raw
+}
+
+// Ticks of mach_absolute_time a second: on Apple Silicon hw.tbfrequency (24 MHz), read once by sysctlbyname
+// 274; 0 until then (a racing first read writes the same value). An x86-64 process's ticks are nanoseconds,
+// on Intel and under Rosetta alike, where hw.tbfrequency still says 24 MHz (the CI probe on 6409ecd4).
+var __ablaRuntimeDarwinTicksPerSecond: int = 0
+
+// The timebase, `scratch` (16 bytes) holding the sysctl's value and its length for the call.
+trusted fun __ablaRuntimeDarwinTimebase(scratch: int): int {
+    val known = __ablaRuntimeDarwinTicksPerSecond
+    if (known > 0) return known
+    if (ablaSimdTargetArch() == 1) {
+        __ablaRuntimeDarwinTicksPerSecond = 1000000000
+        return 1000000000
+    }
+    ablaRuntimeStoreI64(scratch, 0)
+    ablaRuntimeStoreI64(scratch + 8, 8)
+    val raw = ablaDarwinSyscall(274, __ablaRuntimeWord0("hw.tbfrequency"), 14, scratch, scratch + 8, 0, 0)
+    var frequency = if (raw == 0) ablaRuntimeLoadI64(scratch) else 0
+    // Every Apple Silicon Mac so far counts at 24 MHz.
+    if (frequency <= 0) frequency = 24000000
+    __ablaRuntimeDarwinTicksPerSecond = frequency
+    frequency
+}
+
+// clock_gettime 228 (#811 G1) by gettimeofday 116, no libSystem: CLOCK_MONOTONIC 1 is the mach_absolute_time
+// the call writes at its third argument (time since boot, not counting sleep, as Linux's CLOCK_MONOTONIC;
+// libSystem's counts sleep) in nanoseconds by the timebase; any other clock is the wall clock (CLOCK_REALTIME
+// 0), the timeval the call writes at its first, as the C adapter mapped them.
+trusted fun __ablaRuntimeDarwinClockGettime(clock: int, timespec: int): int {
+    if (timespec == 0) return -14
+    if (clock == 1) {
+        val frequency = __ablaRuntimeDarwinTimebase(timespec)
+        ablaRuntimeStoreI64(timespec, 0)
+        val raw = ablaDarwinSyscall(116, 0, 0, timespec, 0, 0, 0)
+        if (raw < 0 && raw > -4096) return __ablaRuntimeDarwinResult(raw)
+        val ticks = ablaRuntimeLoadI64(timespec)
+        // A kernel that writes the ticks only along with the timeval: both into a mapping.
+        if (ticks == 0) return __ablaRuntimeDarwinMonotonicMapped(timespec, frequency)
+        __ablaRuntimeDarwinStoreTicks(timespec, ticks, frequency)
+        return 0
+    }
+    val raw = ablaDarwinSyscall(116, timespec, 0, 0, 0, 0, 0)
+    if (raw < 0 && raw > -4096) return __ablaRuntimeDarwinResult(raw)
+    // An older kernel returns the seconds and microseconds in the result registers instead.
+    if (raw > 0) return __ablaRuntimeDarwinRealtimeInRegisters(timespec)
+    // The timeval's microseconds are 32 bits followed by padding.
+    ablaRuntimeStoreI64(timespec + 8, (ablaRuntimeLoadI64(timespec + 8) & 4294967295) * 1000)
+    0
+}
+
+// `ticks` of mach_absolute_time as a timespec at `timespec`: whole seconds, then the rest (below `frequency`,
+// so its product with 10^9 fits) in nanoseconds.
+trusted fun __ablaRuntimeDarwinStoreTicks(timespec: int, ticks: int, frequency: int): void {
+    ablaRuntimeStoreI64(timespec, ticks / frequency)
+    ablaRuntimeStoreI64(timespec + 8, (ticks % frequency) * 1000000000 / frequency)
+    return
+}
+
+trusted fun __ablaRuntimeDarwinMonotonicMapped(timespec: int, frequency: int): int {
+    val scratch = __ablaRuntimeDarwinScratch(32)
+    if (__ablaRuntimeDarwinScratchFailed(scratch)) return -12
+    val raw = ablaDarwinSyscall(116, scratch, 0, scratch + 16, 0, 0, 0)
+    val ticks = ablaRuntimeLoadI64(scratch + 16)
+    __ablaRuntimeDarwinScratchFree(scratch, 32)
+    if (raw < 0 && raw > -4096) return __ablaRuntimeDarwinResult(raw)
+    if (ticks <= 0) return -22
+    __ablaRuntimeDarwinStoreTicks(timespec, ticks, frequency)
+    0
+}
+
+trusted fun __ablaRuntimeDarwinRealtimeInRegisters(timespec: int): int {
+    val second = __ablaRuntimeDarwinScratch(16)
+    if (__ablaRuntimeDarwinScratchFailed(second)) return -12
+    ablaRuntimeStoreI64(second, 0)
+    val seconds = ablaDarwinSyscallPair(116, 0, 0, 0, 0, 0, second)
+    val microseconds = ablaRuntimeLoadI64(second) & 4294967295
+    __ablaRuntimeDarwinScratchFree(second, 16)
+    if (seconds < 0 && seconds > -4096) return __ablaRuntimeDarwinResult(seconds)
+    ablaRuntimeStoreI64(timespec, seconds)
+    ablaRuntimeStoreI64(timespec + 8, microseconds * 1000)
+    0
+}
 // getrandom (278, 318) over getentropy (500), which takes at most 256 bytes a call.
 trusted fun __ablaRuntimeDarwinGetrandom(buffer: int, length: int): int {
     if (length < 0) return -22
@@ -4647,8 +4744,8 @@ trusted fun __ablaRuntimeDarwinSyscall(
         }
         return -22
     }
-    // Time and random (#811 group 7): nanosleep, getrandom. clock_gettime stays with the adapter:
-    // CLOCK_MONOTONIC has no system call (libSystem reads the commpage).
+    // Time and random (#811 group 7, G1): nanosleep, getrandom, clock_gettime.
+    if (number == 228) return __ablaRuntimeDarwinClockGettime(argument0, argument1)
     if (number == 35) return __ablaRuntimeDarwinNanosleep(argument0)
     if (number == 278 || number == 318) return __ablaRuntimeDarwinGetrandom(argument0, argument1)
     // The stat family, readlink, openat, getdents and getcwd. The running image's path
@@ -4721,6 +4818,7 @@ trusted fun __ablaRuntimeDarwinSyscall(
         return __ablaRuntimeDarwinResult(ablaDarwinSyscall(59, program, argument1, argument2, 0, 0,
             0))
     }
+    if (number == 57) return __ablaRuntimeDarwinFork()
     if (number == 61) return __ablaRuntimeDarwinResult(
         ablaDarwinSyscall(7, argument0, argument1, argument2, 0, 0, 0))
     if (number == 62) return __ablaRuntimeDarwinKill(argument0, argument1)
@@ -4729,6 +4827,6 @@ trusted fun __ablaRuntimeDarwinSyscall(
     // Signals (#811 group 6): the section above the dispatcher.
     if (number == 14) return __ablaRuntimeDarwinSigprocmask(
         argument0, argument1, argument2, argument3)
-    abla_darwin_linux_syscall(
-        number, argument0, argument1, argument2, argument3, argument4, argument5)
+    // Every call the portable surface makes is above (#811 G1): no C adapter behind this.
+    -38
 }

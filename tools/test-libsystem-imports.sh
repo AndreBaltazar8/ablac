@@ -23,9 +23,12 @@ if ! grep -v "^#" "$allow" | sort -cu; then
     echo "libsystem imports: $allow must be sorted and unique" >&2
     exit 1
 fi
-# Comment lines ("#") are documentation; the rest is compared.
+# Comment lines ("#") are documentation; the rest is compared. A line ending in " ?" is one whose import a
+# change is expected to remove but that could not be checked before a Mac run (the compiler, OpenSSL programs):
+# allowed while it is imported, reported (not a failure) once it is not, so that its next change removes it.
 mkdir -p build
-grep -v "^#" "$allow" > build/libsystem-imports-allow.txt
+grep -v "^#" "$allow" | sed 's/ ?$//' | sort -u > build/libsystem-imports-allow.txt
+grep -v "^#" "$allow" | { grep ' ?$' || true; } | sed 's/ ?$//' | sort -u > build/libsystem-imports-unsure.txt
 allow=build/libsystem-imports-allow.txt
 # The list was taken with ABLA_DEBUG=0, as the suite runs.
 export ABLA_DEBUG=0
@@ -48,7 +51,12 @@ if [[ -n $new ]]; then
     echo "$new" >&2
     exit 1
 fi
-stale=$(comm -23 "$allow" "$actual")
+unsure_stale=$(comm -23 "$allow" "$actual" | comm -12 - build/libsystem-imports-unsure.txt)
+if [[ -n $unsure_stale ]]; then
+    echo 'libsystem imports: lines marked " ?" no longer imported here, remove them from the list:' >&2
+    echo "$unsure_stale" >&2
+fi
+stale=$(comm -23 "$allow" "$actual" | comm -23 - build/libsystem-imports-unsure.txt)
 if [[ -n $stale ]]; then
     echo 'libsystem imports: no longer imported here, remove from tools/libsystem-imports-allowlist.txt:' >&2
     echo "$stale" >&2

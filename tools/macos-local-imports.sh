@@ -21,7 +21,7 @@ trap 'rm -rf "$out"' EXIT
 export ABLA_DEBUG=0
 unset ABLA_TEST_FAST_BUILDS
 grep -v '^#' "$root/tools/libsystem-imports-allowlist.txt" |
-    grep -v -e '^compiler ' -e '^tls-http\.' -e ' needed:<brew>/' | sort -u > "$out/allow.txt"
+    grep -v -e '^compiler ' -e '^tls-http\.' -e ' needed:<brew>/' | sed 's/ ?$//' | sort -u > "$out/allow.txt"
 subjects=$(awk '{split($1, part, "."); print part[1]}' "$out/allow.txt" | sort -u)
 for name in $subjects; do
     program=$root/tests/cases/libc-imports/$name.ab

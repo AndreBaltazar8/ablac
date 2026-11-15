@@ -1057,6 +1057,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     break;
   }
 #endif
+#if !ABLA_DARWIN_SYSCALLS
   case 57:
 #if TARGET_OS_IOS
     errno = ENOTSUP;
@@ -1065,6 +1066,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     result = fork();
 #endif
     break;
+#endif
 #if !ABLA_DARWIN_SYSCALLS
   case 59: {
 #if TARGET_OS_IOS
@@ -1236,10 +1238,12 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     break;
   }
 #endif
+#if !ABLA_DARWIN_SYSCALLS
   case 228:
     result = clock_gettime(argument0 == 1 ? CLOCK_MONOTONIC : CLOCK_REALTIME,
                            (struct timespec *)(uintptr_t)argument1);
     break;
+#endif
 #if !ABLA_DARWIN_SYSCALLS
   case 232:
     result =

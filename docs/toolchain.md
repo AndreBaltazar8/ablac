@@ -103,6 +103,12 @@ and so are the runtime's panic output, exit and its fault handlers. `tools/libsy
 lists what a program, release and `--fast`, and the compiler still import; `tools/test-libsystem-imports.sh`
 runs in the macOS CI job, and the list may only shrink.
 
+The monotonic clock (`clock_gettime` of `CLOCK_MONOTONIC` through the portable surface) is the kernel's
+`mach_absolute_time` from `gettimeofday`, in nanoseconds (by `hw.tbfrequency` on Apple Silicon; an x86-64 process's ticks, Rosetta's too, are nanoseconds): time since boot without the time
+asleep, as Linux's `CLOCK_MONOTONIC` counts it (libSystem's `CLOCK_MONOTONIC` counts sleep too). The wall clock
+is `gettimeofday`'s, to the microsecond. A process is forked by the BSD `fork` call, without libSystem's
+fork handlers: a child runs only Abla code until it execs or exits.
+
 What stays in libSystem, and why:
 
 - `pthread_create`, `pthread_join` and what a pthread needs (`pthread_self`, `pthread_get_stackaddr_np`,
@@ -111,8 +117,6 @@ What stays in libSystem, and why:
   (`bsdthread_register`) is refused once libSystem has made it, which it has by the time `main` runs.
 - the thread-local bootstrap `__tlv_bootstrap`: Mach-O thread locals are descriptors that dyld's
   bootstrap resolves.
-- `clock_gettime` for `CLOCK_MONOTONIC` (and the wall clock where it shares the call): libSystem reads
-  the commpage; there is no system call.
 - the compiler itself: libLLVM, OpenSSL, `dlopen`/`dlsym` for compile-time native calls, and its
   threads.
 
