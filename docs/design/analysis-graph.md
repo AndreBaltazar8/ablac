@@ -18,7 +18,7 @@ The default schema-1 protocol is unchanged. A client opts in during initializati
 {"schema":1,"id":1,"method":"initialize","params":{"workspaceRoots":["/project"],"analysisMode":"graph-v1"}}
 ```
 
-The envelope and `protocolVersion` remain 1. Added capabilities are
+The envelope and `protocolVersion` remain 1 (`analysisMode: "graph-v2"` selects stable ids, see below). Added capabilities are
 `module-graph-analysis-v1`, `no-eval-ct`, `pre-ct-types` and
 `refactor-validation-complete-only`. Reinitialization in graph mode is rejected.
 The client must explicitly select this capability; the existing abla-lsp client
@@ -38,6 +38,32 @@ offsets in the returned original source, including UTF-8 comments and source
 rewrites. Symbol identities come from compiler declaration/scope identities,
 not cross-file spelling matches. Contract-only imports expose the projected
 public signatures, not implementation locals or private declarations.
+
+## Stable declaration ids (graph-v2)
+
+`analysisMode: "graph-v2"` is `graph-v1` with stable symbol ids (capability `stable-declaration-ids-v1`; snapshots say `"analysisMode":"graph-v2"`).
+A client that asks for `graph-v1` gets what it always got, ids that carry the declaration's byte offset
+(`abla:<path>:<offset>:<name>`), so no client has to change on a flag day; the envelope and `protocolVersion` stay 1.
+In graph-v1 an edit that moves offsets changes the id of every later declaration of the file, and so the `declarationId` of
+every reference to it in other files, however unrelated the edit.
+
+In graph-v2 an id is made of names, never offsets. Ids are opaque to clients (compare them, do not parse them), but this is how
+they are made:
+
+| symbol | id |
+|---|---|
+| top-level declaration | `abla:<module path>#<name>`, a function with its parameter types: `abla:/p/util.ab#scale(int)`; an extension is named by its owner (`Owner.name`) |
+| method | its class's id, `.`, the name and the parameter types: `abla:/p/model.ab#Model.twice(int)` |
+| parameter, field | the declaration's id and `/param:<name>` or `/field:<name>` |
+| local, loop variable, lambda parameter | the declaration's id and `/local:<name>`, `/for:<name>` or `/lambda:<name>` |
+
+A second symbol that would get the same id (duplicate declarations, a name declared twice in one function) is numbered:
+`...~2`, `...~3`, in source order. An id changes only with its declaration's own module, name or parameter types (a local's also
+with its ordinal among the same-named ones of its declaration), so the other documents of a graph keep their exports through an
+edit that only moves offsets or adds, removes or edits other declarations. `containerId` and every occurrence's `declarationId`
+use the same ids. On the compiler's own source (134 documents), adding a statement to a body changes the export of 5 documents in
+graph-v1 and 1 in graph-v2, a comment on top of a module 17 and 1, and a changed parameter type 8 and 13 (its callers now name the
+new signature: they have to change).
 
 ## Evaluation and package policy
 
