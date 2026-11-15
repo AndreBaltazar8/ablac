@@ -392,6 +392,11 @@ trusted fun ctNativeEvaluateIntrinsic(
     if (name.startsWith("ablaUnsafeVolatile")) {
         return ctNativeEvaluateIntrinsic(evaluator, expression, ctNativeNonVolatileName(name))
     }
+    // An evaluation that already failed performs no raw memory access, call or system call: the values it
+    // goes on with are not the program's (an invalid load is read as 0 by arithmetic), so the effect would
+    // land on a made-up address. (The runtime's panic path, interpreted after such an error, called the real
+    // _longjmp with 0x30 and crashed the compiler: narrow-array-getters, scalar-array-setters.)
+    if (evaluator.errors > 0) return bootstrapEvalInvalid()
     val effect = ctNativeIntrinsicEffect(name)
     val contained = ctNativeRawContext == 1 && ctNativeRawOperation(name)
     if (!contained && !ctNativeAllowed(evaluator, effect)) {
@@ -1162,6 +1167,19 @@ trusted fun ctNativeEvaluateExternCall(
     if (!bootstrapCompileEffectHas(evaluator.allowedCompileEffects, 512)) {
         return ctNativeDenied(evaluator, "call to extern:\"c\" `$name`", 512)
     }
+    // No C call once the evaluation has failed (its arguments are made-up values: see ctNativeEvaluateIntrinsic).
+    if (evaluator.errors > 0) return bootstrapEvalInvalid()
+    // A non-local jump can't cross the interpreter: its buffer would name a frame of the compiler's own
+    // stack, or none. (The runtime's panic recovery ends in _longjmp.)
+    if (name == "_longjmp" || name == "longjmp" || name == "siglongjmp" || name == "_setjmp" ||
+        name == "setjmp" || name == "sigsetjmp") {
+        evaluator.errors = evaluator.errors + 1
+        evaluator.recordEvaluatorDiagnostic(
+            "E_COMPILE_NATIVE_JUMP",
+            "compile-time call to extern:\"c\" `$name`: a non-local jump can't run in the compile-time interpreter (ABLA_COMPILE_EVAL=jit runs it natively)"
+        )
+        return bootstrapEvalInvalid()
+    }
     val parameterTypes: array<string> = []
     var supported = true
     var index = 0
@@ -1218,6 +1236,8 @@ trusted fun ctNativeEvaluateExternCall(
         index = index + 1
     }
     var result = bootstrapEvalInvalid()
+    // An argument that failed to evaluate leaves a made-up word: no call.
+    if (evaluator.errors > 0) valid = false
     if (valid) {
         val output = nativeI64Cell(0)
         ctNativeCallbackParents.append(
