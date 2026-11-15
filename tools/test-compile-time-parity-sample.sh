@@ -21,7 +21,7 @@ size=${PARITY_SAMPLE_SIZE:-12}
 # cases whose own checks were wrong (generator-nested-*, the compilation's one value of a global; compile-time-f32-parity,
 # a NaN's unspecified bits); thread-heap-mutex (the runtime's atomics) and runtime-memory-global-container (a collection
 # is a no-op) in the interpreter.
-fixed=(http-event jwt lambda-inferred-result scoped-region)
+fixed=(http-event jwt lambda-inferred-result scoped-region json-permissive)
 fixedBoth=(thread-local-bytes generator-nested-borrowed generator-nested-index compile-time-f32-parity process-capture
     linux-process thread-heap-mutex runtime-memory-global-container)
 # Never sampled: rows whose expected status never finishes (they take their known timeout, as tls and websocket-live

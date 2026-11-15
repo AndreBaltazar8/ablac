@@ -354,18 +354,26 @@ journal and names the global and unsupported value kind. This prevents another
 alias from seeing an older copy of the shared value.
 
 Under `jit` and `auto`, an ordinary global (a plain `val` or `var`, not a
-`compile val` or `compile var`) belongs to whichever tier runs the site: the
-native code has its own copy, made by the global's initializer, and nothing
-carries a change to one copy into the other. So a compile-time site that
-reaches an ordinary global that any compile-time code of the build can write
-runs in the interpreter, whatever the order or number of the sites (a site can
-run again through a compile function, a generic instantiation or a rebuilt
-module). Code can write a global when it assigns it, stores into its fields or
+`compile val` or `compile var`) that compile-time code can write has one owner
+for the pass. The native tier owns it when every site of the pass that reaches
+it can run natively. The global must also have a type the native tier can hand
+back (written out, a literal's, a class constructor's, or a TVar delegate) that
+holds no closure, and no earlier evaluation may have kept a value of it. Those
+sites then share the native copy, made by its initializer. After each native
+call its value goes into the interpreter's store, so a later pass, or an
+interpreted evaluation that reads it, sees the one value. If one of those sites
+can't run natively, every site that reaches the global runs in the interpreter,
+whatever the order or number of the sites (a site can run again through a
+compile function, a generic instantiation or a rebuilt module). If an
+interpreted evaluation changes a global the native tier owns, the generation
+stops and the rest of the pass is interpreted. A TVar-delegated global (such as
+the pure TLS trust-store cache) is never kept between evaluations, in either
+tier: the native one lives for the pass. Code can write a global when it assigns it, stores into its fields or
 elements, calls a built-in mutator (`append`, `set`, `remove`, ...) on it or on
 something that may alias it, or hands it to code the analysis cannot follow
 (an extern, a closure called as a value); code that only reads a table leaves
 it alone, and a site that reads only such a table stays native.
-`ABLA_COMPILE_EVAL_TRACE=1` names the global and the code that may write it.
+`ABLA_COMPILE_EVAL_TRACE=1` names the global and the code that may write it, and says which globals are native for the pass.
 A site that makes a closure, in a build where compile-time code changes declarations (`replaceFunctionBody`, `applyTransform`, added
 fields or conformances), runs in the interpreter too: a native closure is
 positional and would run the edited body. Use `compile var` for state that

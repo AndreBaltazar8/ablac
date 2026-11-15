@@ -1021,6 +1021,76 @@ fun bootstrapCtDelegateKind(declaration: BootstrapDeclaration): string =
     if (declaration.expression.kind == "delegate.initializer") declaration.expression.text
     else ""
 
+fun bootstrapCtStateHas(values: array<int>, wanted: int): bool {
+    for (value in values) {
+        if (value == wanted) return true
+    }
+    false
+}
+
+// An ordinary global's type: the declared one, or a literal initializer's (`var failures = 0`), or a non-generic
+// class constructor's (`val box = Box(1)`); "" when none says.
+fun bootstrapCtOrdinaryTypeIn(declarations: array<BootstrapDeclaration>, declaration: BootstrapDeclaration): string {
+    val simple = bootstrapCtOrdinaryType(declaration)
+    if (simple != "") return simple
+    val initializer = declaration.expression
+    if (initializer.kind != "call" || initializer.text == "") return ""
+    var classes = 0
+    var named = 0
+    for (other in declarations) {
+        if (other.name == initializer.text) {
+            named = named + 1
+            if (other.kind == "class" && other.typeParameters.size == 0) classes = classes + 1
+        }
+    }
+    if (classes == 1 && named == 1) initializer.text else ""
+}
+
+fun bootstrapCtOrdinaryType(declaration: BootstrapDeclaration): string {
+    val declared = bootstrapNormalizeType(declaration.resultType)
+    if (declared != "" && declared != "inferred") return declared
+    val initializer = declaration.expression
+    if (initializer.kind == "true" || initializer.kind == "false") return "bool"
+    if (initializer.kind == "string") return "string"
+    if (initializer.kind == "integer" && initializer.text.size > 0) {
+        for (byte in initializer.text) {
+            if (byte < 48 || byte > 57) return ""
+        }
+        return "int"
+    }
+    ""
+}
+
+// Why a written ordinary global can't be owned by the native tier for a pass, "" when it can. The generation's copy
+// starts from the initializer, so the interpreter's journal must hold no value of it yet (an earlier pass's would be
+// lost); its value goes back to the journal after every native call, so its type must be one the lift carries back,
+// and hold no closure (the interpreter keeps those afresh per evaluation, a native copy would keep one). Delegated
+// globals keep their delegate in the interpreter.
+fun bootstrapCtOwnableReason(
+    declarations: array<BootstrapDeclaration>,
+    index: int,
+    edits: bool
+): string {
+    val declaration = declarations[index]
+    if (declaration.kind != "val" && declaration.kind != "var") return "not a plain val or var"
+    if (bootstrapCtDelegateKind(declaration) != "") {
+        // A TVar-delegated global (`var cache: T by TVar(...)`): the interpreter keeps no TVar between evaluations
+        // (each starts it afresh), so its journal never holds one, and the generation's TVar is the one value for
+        // the pass. Nothing goes back to the journal (bootstrapCtTVarDelegate). Other delegates stay interpreted.
+        return if (bootstrapCtTVarDelegate(declaration)) "" else
+            "a delegated global (by ${bootstrapCtDelegateText(declaration)})"
+    }
+    val type = bootstrapCtOrdinaryTypeIn(declarations, declaration)
+    if (type == "") return "its type is not written out"
+    if (type == "void" || type == "null") return "of type $type"
+    val typeReason = bootstrapLiftTypeReasonIn(declarations, type)
+    if (typeReason != "") return "of type $type, which native code cannot hand back: $typeReason"
+    if (bootstrapCtStateMayHoldClosure(declarations, type)) return "of type $type, which may hold a closure"
+    val kept = bootstrapCompileGlobalLoad(bootstrapCompileGlobalKey(declaration), declarations, [])
+    if (kept.kind != "invalid") return "an earlier evaluation kept a value of it"
+    ""
+}
+
 // A `compile var` of a settable type whose name no other declaration has: a value
 // the evaluator gives it goes back into the generation's copy through its setter.
 // (Assigning a delegated one would call its setValue, not replace its delegate.)
@@ -1179,6 +1249,15 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string,
         methodTargets
     )
     bootstrapCtNote("ordinary-global write analysis ${linuxMonotonicMilliseconds() - stateStarted} ms")
+    // A written ordinary global the native tier can own (bootstrapCtOwnableReason): its sites stay native unless
+    // one of them can't (the fixed point after the sites are prepared, below).
+    val ownable: array<bool> = []
+    var ownableIndex = 0
+    while (ownableIndex < parsed.declarations.size) {
+        ownable.append(state.writers[ownableIndex] != "" &&
+            bootstrapCtOwnableReason(parsed.declarations, ownableIndex, state.edits) == "")
+        ownableIndex = ownableIndex + 1
+    }
     var stateSite = 0
     for (site in bootstrapCtSites) {
         // Native closures are positional: one made before an edit would run the edited body.
@@ -1189,9 +1268,9 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string,
         }
         if (site.reason == "") {
             for (global in state.reached[stateSite]) {
-                if (site.reason == "" && state.writers[global] != "") {
+                if (site.reason == "" && state.writers[global] != "" && !ownable[global]) {
                     site.reason =
-                        "ordinary mutable global ${parsed.declarations[global].name} may be written at ${state.writers[global]}"
+                        "ordinary mutable global ${parsed.declarations[global].name} may be written at ${state.writers[global]} (${bootstrapCtOwnableReason(parsed.declarations, global, state.edits)})"
                 }
             }
         }
@@ -1349,6 +1428,71 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string,
             bootstrapCtNextSite = bootstrapCtNextSite + 1
             ready = ready + 1
         }
+    }
+    // An ownable global is native for the pass only if every site that reaches it runs natively: one that runs in
+    // the interpreter would see the interpreter's copy while the others change the generation's. A site refused here
+    // refuses, in turn, the other globals it reaches, so this repeats until nothing changes. (A refused site's walk
+    // kept only code the slice supports, so what it kept stays.)
+    var settled = false
+    while (!settled) {
+        settled = true
+        var owned = 0
+        while (owned < parsed.declarations.size) {
+            if (ownable[owned]) {
+                var refusal = ""
+                var reaching = 0
+                while (refusal == "" && reaching < bootstrapCtSites.size) {
+                    if (bootstrapCtSites[reaching].reason != "" &&
+                        bootstrapCtStateHas(state.reached[reaching], owned)) {
+                        refusal = bootstrapCtSiteLabel(bootstrapCtSites[reaching])
+                    }
+                    reaching = reaching + 1
+                }
+                if (refusal != "") {
+                    ownable[owned] = false
+                    settled = false
+                    var other = 0
+                    while (other < bootstrapCtSites.size) {
+                        val site = bootstrapCtSites[other]
+                        if (site.reason == "" && bootstrapCtStateHas(state.reached[other], owned)) {
+                            site.reason =
+                                "ordinary mutable global ${parsed.declarations[owned].name} may be written at ${state.writers[owned]}, and the site at $refusal that reaches it runs in the interpreter"
+                            ready = ready - 1
+                        }
+                        other = other + 1
+                    }
+                }
+            }
+            owned = owned + 1
+        }
+    }
+    // The owned globals go back to the interpreter's journal after every native call, as compile globals do
+    // (bootstrapCtExchangeGlobals): a later pass, or an interpreted evaluation of this one, reads the one value.
+    var ownedIndex = 0
+    while (ownedIndex < parsed.declarations.size) {
+        var reachedByNative = false
+        var siteIndex = 0
+        while (siteIndex < bootstrapCtSites.size) {
+            if (bootstrapCtSites[siteIndex].reason == "" &&
+                bootstrapCtStateHas(state.reached[siteIndex], ownedIndex)) reachedByNative = true
+            siteIndex = siteIndex + 1
+        }
+        if (ownable[ownedIndex] && reachedByNative && bootstrapCtTVarDelegate(parsed.declarations[ownedIndex])) {
+            bootstrapCtNote("ordinary global ${parsed.declarations[ownedIndex].name} (a TVar) is native for this pass")
+        } else if (ownable[ownedIndex] && reachedByNative) {
+            var known = false
+            for (existing in bootstrapCtGlobals) {
+                if (existing.declaration == ownedIndex) known = true
+            }
+            if (!known) {
+                bootstrapCtGlobals.append(BootstrapCtGlobal(
+                    ownedIndex, bootstrapCompileGlobalKey(parsed.declarations[ownedIndex]),
+                    bootstrapCtOrdinaryTypeIn(parsed.declarations, parsed.declarations[ownedIndex]), "", 0, 0, ""
+                ))
+                bootstrapCtNote("ordinary global ${parsed.declarations[ownedIndex].name} is native for this pass")
+            }
+        }
+        ownedIndex = ownedIndex + 1
     }
     if (ready > 0 && !bootstrapCtSession()) {
         bootstrapCtFailReady("the ORC session could not be created")
@@ -1642,12 +1786,16 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string,
     if (bootstrapCtFreeAddress == 0 || bootstrapCtGuardAddress == 0) {
         bootstrapCtFailReady("the slice's support entries are missing")
     }
+    var missing = false
     for (site in bootstrapCtSites) {
         if (site.reason == "") {
             site.entry = bootstrapCtLookup("abla_ct_eval_${site.id}")
-            if (site.entry == 0) site.reason = "the site's entry is missing"
+            if (site.entry == 0) missing = true
         }
     }
+    // Every site or none: the sites share the globals the native tier owns for the pass (G1), so one site left to
+    // the interpreter would read the interpreter's copy while the others change the generation's.
+    if (missing) bootstrapCtFailReady("a site's entry is missing")
     var getter = 0
     while (getter < bootstrapCtGlobals.size) {
         bootstrapCtGlobals[getter].getter =
@@ -2037,3 +2185,25 @@ fun bootstrapCtFinishPass(): void {
 }
 
 private noescape extern:"intrinsic" fun ablaHostIsMacOS(): bool
+
+// A global delegated to a TVar: `by TVar(...)` or `by TVar<T>(...)`.
+fun bootstrapCtTVarDelegate(declaration: BootstrapDeclaration): bool {
+    val initializer = declaration.expression
+    if (initializer.kind != "delegate.initializer" || initializer.children.size == 0) return false
+    val delegate = initializer.children[0]
+    if (delegate.kind != "call") return false
+    // The callee, without type arguments or the module prefix a library's names carry (`__abla_module_<hex>__TVar`).
+    val angle = delegate.text.indexOf("<")
+    var callee = if (angle >= 0) delegate.text.slice(0, angle) else delegate.text
+    // (A generic instantiation's name carries its arguments: `TVar__abla_generic_nullable_cX509TrustStore`.)
+    val generic = callee.indexOf("__abla_generic")
+    if (generic > 0) callee = callee.slice(0, generic)
+    callee == "TVar" || callee.endsWith("__TVar")
+}
+
+// What a delegated global is delegated to, for the trace (`call TVar<int>`).
+fun bootstrapCtDelegateText(declaration: BootstrapDeclaration): string {
+    val initializer = declaration.expression
+    if (initializer.kind != "delegate.initializer" || initializer.children.size == 0) return initializer.kind
+    "${initializer.children[0].kind} ${initializer.children[0].text}"
+}

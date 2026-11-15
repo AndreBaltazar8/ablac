@@ -20,7 +20,7 @@ table=(
     "limits-global|-|1|0|"
     "stringify|-|1|0|"
     "float|-|0|1|expression float"
-    "mutate-empty|-|0|3|ordinary mutable global"
+    "mutate-empty|-|0|3|"
 )
 wasm_build() { # source output
     cat >"$out/build.ab" <<AB

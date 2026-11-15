@@ -148,10 +148,12 @@ build_and_run() { # dir tag entry mode
         # launcher's memory default. Only the executable runs, so a release
         # build skips its relocatable object sidecar (ABLA_NO_SIDECAR), a
         # second optimization and code generation of the whole program.
+        # No standard input: a child process compile-time code starts (`openssl req` in tls) inherits the
+        # compiler's, and the harness's may be a pipe that never ends.
         ABLA_NO_SIDECAR=1 \
         ABLA_COMPILE_EVAL=$mode ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-4096} \
             limited "$compiler" build "$entry" -o "$tag.program" --no-cache $build_flags \
-            >"$tag.compiler.out" 2>"$tag.err"
+            >"$tag.compiler.out" 2>"$tag.err" </dev/null
     )
     status=$?
     if [[ $status -ne 0 ]]; then
@@ -176,8 +178,8 @@ module/unsafe-boundary	*	host-dependent	calls its own @export functions through 
 module/http-advanced	*	staged-writes	a child process (gzip) reads a file the case wrote: under `#` writes stay staged until the build succeeds
 module/network-advanced	jit	staged-writes	its http-advanced part: a child process (gzip) reads a file the case wrote, which stays staged under `#` (interp: interp-threads)
 module/filesystem	*	staged-writes	linkTo is a system call (trusted.native), which sees only the disk: the directory the case made is still staged under `#`, so check 12 (the link) fails
-module/websocket-live	jit	interp-threads	its handler writes the ordinary global webSocketServerValid, so the site falls back to the interpreter, which runs the client thread only at await: the server waits for it for ever
-module/tls	jit	interp-threads	the pure TLS assigns its trust-store cache, the ordinary global pureTlsSystemCache, so the site falls back to the interpreter, which runs the client thread only at await
+module/tool-support	*	staged-writes	its files are made under /tmp: under `#` a write outside the tree is staged, so the system calls that follow (permissions, links) see none of it and its checks fail in both tiers
+module/tls	jit	staged-writes	it removes its certificate files, then `openssl req` (a child) writes new ones: under `#` the removal is staged and hides the files the child wrote from the site, so the server never starts and the client thread waits (interp: interp-threads)
 module/websocket-server-protocol	interp	interp-timing	forks clients with 100 ms ping / 3 s idle deadlines the interpreter cannot meet (passes under jit)
 module/http-async	interp	interp-timing	the interpreted child builds the 200 KB /big body byte by byte and misses the client timeout (passes under jit)'
 
@@ -311,13 +313,16 @@ run_mode() { # kind name source mode
         # capabilities asks for those, and again for any the grant uncovers.
         if [[ $kind == module ]]; then
             local capabilities="" round=0
+            # (A denial the static analysis missed comes from the evaluation: E_COMPILE_NATIVE_DENIED, "needs the
+            # `clock` compile capability".)
+            local denial='^error\[(E_SEMANTIC\]: compile.effect-denied:|E_COMPILE_NATIVE_DENIED\]: .* needs the `[a-z.]*` compile capability)'
             while [[ $(cat "$dir/staged.status") == build* && $round -lt 8 ]] &&
-                grep -q '^error\[E_SEMANTIC\]: compile.effect-denied:' "$dir/staged.err" &&
-                ! grep -vq '^error\[E_SEMANTIC\]: compile.effect-denied:' \
-                    <<<"$(grep '^error' "$dir/staged.err")"; do
+                grep -Eq "$denial" "$dir/staged.err" &&
+                ! grep -Evq "$denial" <<<"$(grep '^error' "$dir/staged.err")"; do
                 local denied
-                denied=$(sed -n 's/^error\[E_SEMANTIC\]: compile.effect-denied:\([a-z.]*\).*/\1/p' \
-                    "$dir/staged.err" | sort -u)
+                denied=$( { sed -n 's/^error\[E_SEMANTIC\]: compile.effect-denied:\([a-z.]*\).*/\1/p' "$dir/staged.err"
+                    sed -n 's/^error\[E_COMPILE_NATIVE_DENIED\]: .* needs the `\([a-z.]*\)` compile capability.*/\1/p' \
+                        "$dir/staged.err"; } | sort -u)
                 local added=false capability
                 for capability in $denied; do
                     [[ " $capabilities " == *" $capability "* ]] && continue

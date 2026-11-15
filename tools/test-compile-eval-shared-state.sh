@@ -77,35 +77,48 @@ NODE
                     # narrowed on a built-in fact. Y always runs in the interpreter.
                     posX=$(( $(offset 'val X = #') + 8 ))
                     posY=$(( $(offset 'val Y = #') + 8 ))
-                    grep -Fq "note[ct-jit]: interpreted at $((posY+1)):" "$log" ||
-                        { echo "$name $target $tier: Y was not interpreted" >&2; exit 1; }
-                    grep -F "note[ct-jit]: interpreted at $((posY+1)):" "$log" | grep 'ordinary mutable global shared may be written at ' >/dev/null ||
-                        { echo "$name $target $tier: Y was not interpreted for the write" >&2; exit 1; }
+                    # Y writes `shared`: native when every site reaching it is (the native tier owns it for the pass),
+                    # else interpreted; either way once.
+                    grep '^note\[ct-jit\]: native at ' "$log" | grep -F "$name.ab:$posY" >/dev/null ||
+                        grep -Fq "note[ct-jit]: interpreted at $((posY+1)):" "$log" ||
+                        { echo "$name $target $tier: Y was neither native nor interpreted" >&2; exit 1; }
                     if [[ $name != operator-generic ]]; then
                         grep '^note\[ct-jit\]: native at ' "$log" | grep -F "$name.ab:$posX" >/dev/null ||
                             { echo "$name $target $tier: X was not native" >&2; exit 1; }
                     else
-                        grep -Fq "note[ct-jit]: interpreted at $((posX+1)):" "$log" ||
-                            { echo "$name $target $tier: X was not interpreted" >&2; exit 1; }
+                        # operator-generic's copies reach `shared` too: X runs in Y's tier (both native when the
+                        # native tier owns `shared`).
+                        grep '^note\[ct-jit\]: native at ' "$log" | grep -F "$name.ab:$posX" >/dev/null ||
+                            grep -Fq "note[ct-jit]: interpreted at $((posX+1)):" "$log" ||
+                            { echo "$name $target $tier: X was neither native nor interpreted" >&2; exit 1; }
                     fi
                 elif [[ $name == delegate-* ]]; then
                     # A delegated binding is rewritten before analysis, which moves the sites: count them.
                     sites=4
                     [[ $name == delegate-forward ]] || sites=3
-                    [[ $(grep -c "^note\[ct-jit\]: interpreted at .*ordinary mutable global " "$log") -eq $sites ]] ||
+                    [[ $(grep -c "^note\[ct-jit\]: interpreted at " "$log") -eq $sites ]] ||
                         { echo "$name: expected $sites interpreted sites" >&2; exit 1; }
                     ! grep -q "^note\[ct-jit\]: native at .*$name.ab" "$log"
                 else
+                    # A, B and D share a written global. The native tier owns it for the pass when every site that
+                    # reaches it is native (ct_jit.ab, bootstrapCtOwnableReason); otherwise all of them run in the
+                    # interpreter. Never some of each: the two copies would diverge (the results above would differ).
+                    native=0
+                    interpreted=0
                     for binding in A B D; do
                         pos=$(offset "val $binding = #")
                         pos=$((pos + 8))
                         if grep '^note\[ct-jit\]: native at ' "$log" | grep -F "$name.ab:$pos" >/dev/null; then
-                            echo "mutable site unexpectedly native: $name:$pos" >&2; exit 1
+                            native=$((native + 1))
+                        else
+                            fallback=$(grep -F "note[ct-jit]: interpreted at $((pos+1)):" "$log")
+                            [[ $(printf '%s\n' "$fallback" | wc -l) -eq 1 ]] ||
+                                { echo "$name $target $tier: $binding neither native nor interpreted once" >&2; exit 1; }
+                            interpreted=$((interpreted + 1))
                         fi
-                        fallback=$(grep -F "note[ct-jit]: interpreted at $((pos+1)):" "$log")
-                        [[ $(printf '%s\n' "$fallback" | wc -l) -eq 1 ]]
-                        [[ $fallback == *'ordinary mutable global '* && $fallback == *'written at '* ]]
                     done
+                    [[ $native -eq 0 || $interpreted -eq 0 ]] ||
+                        { echo "$name $target $tier: sites sharing a global ran in both tiers ($native native)" >&2; exit 1; }
                 fi
             fi
         done
@@ -114,4 +127,4 @@ NODE
         fi
     done
 done
-echo "compile-time shared state ($targets): interp/jit and order parity; mutable components fall back, read-only tables stay native"
+echo "compile-time shared state ($targets): interp/jit and order parity; sites sharing a written global run in one tier, read-only tables stay native"
