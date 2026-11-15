@@ -49,7 +49,12 @@ tls=$(rss)
 open=$(( $(fds) ))
 wait "$load" || true
 echo "idle TLS: $tls KiB with ~$((open - 8)) descriptors open: $(( (tls - base) * 1024 / n )) bytes per connection (h2load -c $n)"
-echo "peak after the TLS run: $(hwm) KiB"
+echo "peak after the TLS run: $(hwm) KiB; after the connections closed: $(rss) KiB"
+h2load -D 6 -c "$n" -m 1 -t 2 --rps 1 "https://localhost:$port/x" > "$out/h2load2.log" 2>&1 &
+load=$!
+sleep 4
+echo "a second wave of $n connections (the first one closed): $(rss) KiB (growth over the first: $(( $(rss) - tls )) KiB)"
+wait "$load" || true
 
 start h2only
 base=$(rss)
