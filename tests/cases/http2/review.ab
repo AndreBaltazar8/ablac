@@ -1,0 +1,217 @@
+// Review of the HTTP/2 server (43874f76), regression cases (tools/test-http2-review.sh): each fails today; prints
+// "http2 review ok" when all pass. Helpers as in tests/cases/http2/server.ab.
+import "abla/io"
+import "abla/crypto"
+import "abla/array"
+import "abla/integer"
+import "abla/http"
+import "abla/http/h2"
+import "abla/http/h2/hpack"
+import "abla/http/h2/server"
+
+var failures = 0
+
+fun fail(what: string): void {
+    failures = failures + 1
+    if (failures < 40) println("FAIL $what")
+    return
+}
+
+fun expect(cond: bool, what: string): void {
+    if (!cond) fail(what)
+    return
+}
+
+fun be32(value: int): string = cryptoByteString([(value >> 24) & 255, (value >> 16) & 255, (value >> 8) & 255, value & 255])
+
+fun frame(kind: int, flags: int, stream: int, payload: string): string {
+    val n = payload.size
+    cryptoByteString([(n >> 16) & 255, (n >> 8) & 255, n & 255, kind, flags, (stream >> 24) & 127, (stream >> 16) & 255, (stream >> 8) & 255, stream & 255]) + payload
+}
+
+class Seen(val kind: int, val flags: int, val stream: int, val payload: string)
+
+fun frames(output: string): array<Seen> {
+    val list: array<Seen> = []
+    var at = 0
+    while (at + 9 <= output.size) {
+        val n = (output[at] << 16) | (output[at + 1] << 8) | output[at + 2]
+        list.append(Seen(output[at + 3], output[at + 4], ((output[at + 5] & 127) << 24) | (output[at + 6] << 16) | (output[at + 7] << 8) | output[at + 8], output.slice(at + 9, at + 9 + n)))
+        at = at + 9 + n
+    }
+    list
+}
+
+fun count(list: array<Seen>, kind: int): int {
+    var n = 0
+    for (s in list) {
+        if (s.kind == kind) n = n + 1
+    }
+    n
+}
+
+fun goawayCode(list: array<Seen>): int {
+    for (s in list) {
+        if (s.kind == 7) return (s.payload[4] << 24) | (s.payload[5] << 16) | (s.payload[6] << 8) | s.payload[7]
+    }
+    -1
+}
+
+fun resetCode(list: array<Seen>, stream: int): int {
+    for (s in list) {
+        if (s.kind == 3 && s.stream == stream) return (s.payload[0] << 24) | (s.payload[1] << 16) | (s.payload[2] << 8) | s.payload[3]
+    }
+    -1
+}
+
+fun hf(name: string, value: string): HpackField = HpackField(name, value, false)
+
+fun block(fields: array<HpackField>): string {
+    var e = hpackEncoderNew(0)
+    e.encode(fields)
+}
+
+fun getFields(path: string): array<HpackField> = [hf(":method", "GET"), hf(":scheme", "https"), hf(":path", path), hf(":authority", "example.com")]
+
+/** A server past the preface and SETTINGS, its first output taken. */
+fun ready(): H2Server {
+    var s = h2ServerNew()
+    s.feed(H2_PREFACE + frame(4, 0, 0, ""), 0)
+    s.takeOutput()
+    s
+}
+
+fun has(list: array<Seen>, kind: int): bool = count(list, kind) > 0
+
+
+// H1 (medium). Response HEADERS are queued whatever the output holds: a client that never reads makes a server answer
+// HEAD requests (each ends its stream at once, so no stream limit applies) into a queue without bound. Expected: the
+// server stops taking requests (or closes) once its output passes a few times H2_OUTPUT_CAP.
+fun unreadOutput(): void {
+    // A 1 KiB header per response (HPACK indexes it once, so: a 1 KiB value that changes per response).
+    val base = "p".repeat(1000)
+    var s = ready()
+    var id = 1
+    var now = 0
+    while (id < 40000 && !s.closed) {
+        s.feed(frame(1, 5, id, block([hf(":method", "HEAD"), hf(":scheme", "https"), hf(":path", "/"), hf(":authority", "x")])), now)
+        val pad = base + "$id"
+        for (request in s.takeRequests()) s.respond(request.stream, 200, [HttpHeader("x-pad", pad)], "")
+        id = id + 2
+        if (id % 2001 == 0) now = now + 1000
+    }
+    if (!s.closed && s.outputBytes > 4 * H2_OUTPUT_CAP) {
+        fail("H1: 20000 HEAD requests with 1 KiB responses never read: ${s.outputBytes} bytes of output queued, the connection open")
+    }
+    return
+}
+
+// H2 (medium, CVE-2025-8671 "MadeYouReset"). A stream the server resets itself (here: WINDOW_UPDATE with increment 0 on
+// an open stream) frees its slot but its request was already handed out: the reset budget counts client RST_STREAM only.
+// Expected: at most the stream limit of requests from such a burst, or ENHANCE_YOUR_CALM/GOAWAY.
+fun madeYouReset(): void {
+    var s = ready()
+    var burst = ""
+    var id = 1
+    while (id < 600) {
+        burst = burst + frame(1, 5, id, block(getFields("/"))) + frame(8, 0, id, be32(0))
+        id = id + 2
+    }
+    s.feed(burst, 0)
+    val handed = s.takeRequests().size
+    val out = frames(s.takeOutput())
+    if (handed > 100 && !has(out, 7) && !s.closed) fail("H2: 300 HEADERS + WINDOW_UPDATE(0) pairs: $handed requests handed out, no GOAWAY")
+    return
+}
+
+// H3 (medium). RFC 9113 8.2.1: a field value with NUL, CR or LF (or leading/trailing whitespace) makes the request
+// malformed (stream error PROTOCOL_ERROR). Today it reaches HttpRequest's headers (header injection when reflected or
+// forwarded over HTTP/1).
+fun crlfValue(): void {
+    var s = ready()
+    val fields = getFields("/")
+    fields.append(hf("x-a", "v\r\nInjected: 1"))
+    s.feed(frame(1, 5, 1, block(fields)), 0)
+    val handed = s.takeRequests().size
+    val out = frames(s.takeOutput())
+    if (handed != 0 || resetCode(out, 1) != 1) fail("H3: a field value with CRLF: $handed requests, reset code ${resetCode(out, 1)} (wanted PROTOCOL_ERROR)")
+    var t = ready()
+    val named = getFields("/")
+    named.append(hf("x a", "v"))
+    t.feed(frame(1, 5, 1, block(named)), 0)
+    if (t.takeRequests().size != 0) fail("H3: a field name with a space was accepted")
+    return
+}
+
+// H4 (medium). The receive window is given back as DATA arrives, not as the handler takes the body: 100 streams each
+// buffer up to maximumBodyBytes before END_STREAM. Expected (a proposal: some per-connection budget): the server does
+// not credit more than 16 MiB of request bodies no handler has taken.
+fun bufferedBodies(): void {
+    var s = h2ServerNew()
+    s.feed(H2_PREFACE + frame(4, 0, 0, ""), 0)
+    s.takeOutput()
+    val piece = "a".repeat(16384)
+    var credited = 0
+    var stream = 1
+    while (stream < 200) {
+        val post = [hf(":method", "POST"), hf(":scheme", "https"), hf(":path", "/"), hf(":authority", "x")]
+        s.feed(frame(1, 4, stream, block(post)), 0)
+        var sent = 0
+        while (sent + 16384 < 512 * 1024 && !s.closed) {
+            s.feed(frame(0, 0, stream, piece), 0)
+            sent = sent + 16384
+            for (f in frames(s.takeOutput())) {
+                if (f.kind == 8 && f.stream == 0) credited = credited + ((f.payload[0] & 127) << 24 | f.payload[1] << 16 | f.payload[2] << 8 | f.payload[3])
+            }
+        }
+        stream = stream + 2
+    }
+    if (!s.closed && credited > 16 * 1048576) fail("H4: 100 streams of unfinished bodies: $credited bytes credited on the connection, none taken")
+    return
+}
+
+// H6 (low). A body over the limit gets 413, but the stream stays while the response waits for window, and trailers then
+// end the request: the handler gets the truncated body as if complete.
+fun bodyAfter413(): void {
+    var s = h2ServerNew(100, 10)
+    s.feed(H2_PREFACE + frame(4, 0, 0, cryptoByteString([0, 4, 0, 0, 0, 0])), 0)
+    s.takeOutput()
+    s.feed(frame(1, 4, 1, block([hf(":method", "POST"), hf(":scheme", "https"), hf(":path", "/"), hf(":authority", "x")])), 0)
+    s.feed(frame(0, 0, 1, "0123456789"), 0)
+    s.feed(frame(0, 0, 1, "x"), 0)
+    s.feed(frame(1, 5, 1, block([hf("x-t", "1")])), 0)
+    val handed = s.takeRequests()
+    if (handed.size != 0) fail("H6: a body over the limit (413) reached the handler, truncated: ${handed.size} request(s)")
+    return
+}
+
+// H7 (low): rule deviations.
+fun deviations() {
+    // A lower stream id than one already opened was never opened by the client: PROTOCOL_ERROR (RFC 9113 5.1.1), not STREAM_CLOSED.
+    var s = ready()
+    s.feed(frame(1, 5, 5, block(getFields("/"))), 0)
+    s.takeRequests()
+    s.feed(frame(1, 5, 3, block(getFields("/"))), 0)
+    val code = goawayCode(frames(s.takeOutput()))
+    if (code != 1) fail("H7: HEADERS on a lower, never-opened stream id: GOAWAY code $code, wanted PROTOCOL_ERROR (1)")
+    // No RST_STREAM on an idle stream (RFC 9113 5.1): a PRIORITY that depends on itself, on idle stream 9.
+    var t = ready()
+    t.feed(frame(2, 0, 9, be32(9) + cryptoByteString([0])), 0)
+    if (resetCode(frames(t.takeOutput()), 9) >= 0) fail("H7: RST_STREAM sent on idle stream 9")
+    // :path must start with "/" (RFC 9113 8.3.1) for http(s) requests other than OPTIONS *.
+    var u = ready()
+    u.feed(frame(1, 5, 1, block([hf(":method", "GET"), hf(":scheme", "https"), hf(":path", "a"), hf(":authority", "x")])), 0)
+    if (u.takeRequests().size != 0) fail("H7: a :path of \"a\" was accepted")
+    return
+}
+
+fun main: int {
+    unreadOutput()
+    madeYouReset()
+    crlfValue()
+    bufferedBodies()
+    bodyAfter413()
+    deviations()
+    if (failures == 0) println("http2 review ok")
+    if (failures == 0) 0 else 1
+}
