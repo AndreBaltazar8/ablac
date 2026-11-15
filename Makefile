@@ -182,6 +182,7 @@ test-serial: ablac
 	tools/test-array-truncate.sh $(COMPILER)
 	tools/test-array-filled.sh $(COMPILER)
 	tools/test-load-alias.sh $(COMPILER)
+	tools/test-darwin-seed-import.sh
 	tools/test-borrow-chain-scaling.sh $(COMPILER)
 	tools/test-builder-chain.sh $(COMPILER)
 	tools/test-collection-modes.sh $(COMPILER)
