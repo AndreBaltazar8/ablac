@@ -1,7 +1,9 @@
 // Linear-time regular expressions (RE2 style): a pattern is parsed to a tree,
 // compiled to a small program, and run by a Pike VM that advances every
-// possible path in lock step. Matching costs O(text size * program size) with
-// no backtracking, so no pattern can take exponential time. Backreferences and
+// possible path in lock step. A search costs O(text size * program size) with
+// no backtracking, so no pattern can take exponential time. findAll and replace
+// search again from the end of each match, so they cost up to (matches + 1) times
+// that when a longer alternative keeps running after a shorter one has matched. Backreferences and
 // lookaround are rejected when the pattern is compiled.
 //
 // Text is UTF-8: `.`, classes and literals match whole code points, and every
@@ -36,6 +38,36 @@ class Regex(
         var vm = regexVm(this, text)
         val spans = regexRun(this, vm, start, false, false, false)
         if (spans.size == 0) null else RegexMatch(text, spans)
+    }
+    /**
+     * A diagnostic: the VM steps (instructions added to a thread list, threads advanced) that `find(text)` takes.
+     * Never more than 2 * (text.size + 1) * program size, whatever the pattern.
+     */
+    fun findWork(text: string): int {
+        var vm = regexVm(this, text)
+        regexRun(this, vm, 0, false, false, false)
+        vm.work
+    }
+    /**
+     * A diagnostic: the VM steps `findAll(text)` (and so `replace`) takes. Each match restarts the search where the
+     * previous one ended, so a pattern whose longer alternative keeps running after a shorter one has matched
+     * (`a+b|a` over `aaaa…`) takes up to (matches + 1) times the bound of `findWork`.
+     */
+    fun findAllWork(text: string): int {
+        var vm = regexVm(this, text)
+        var position = 0
+        var advance = false
+        var more = true
+        while (more && position <= text.size) {
+            val spans = regexRun(this, vm, position, false, false, advance)
+            if (spans.size == 0) {
+                more = false
+            } else {
+                advance = spans[1] == spans[0]
+                position = spans[1]
+            }
+        }
+        vm.work
     }
     /** Every non-overlapping match, left to right. */
     fun findAll(text: string): array<RegexMatch> {
@@ -552,7 +584,8 @@ class RegexVm(
     val counts: array<int>,
     val seen: array<int>,
     var generation: int,
-    val stackPcs: array<int>
+    val stackPcs: array<int>,
+    var work: int
 ) {
     fun assertionHolds(kind: int, position: int): bool {
         if (kind == 0) return position == 0
@@ -589,6 +622,7 @@ class RegexVm(
                 follow = false
                 if (this.seen[pc] != this.generation) {
                     this.seen[pc] = this.generation
+                    this.work += 1
                     val op = this.program[pc * 3]
                     if (op == 4) {
                         pc = this.program[pc * 3 + 1]
@@ -635,7 +669,7 @@ private fun regexVm(re: Regex, text: string): RegexVm {
     val n = re.program.size / 3
     val slots = (re.groupCount + 1) * 2
     RegexVm(re.program, re.classes, text, n, slots, filledArray(n * 2, 0),
-        filledArray((n * 4 + 5) * slots, -1), [0, 0], filledArray(n, 0), 0, filledArray(n + 2, 0))
+        filledArray((n * 4 + 5) * slots, -1), [0, 0], filledArray(n, 0), 0, filledArray(n + 2, 0), 0)
 }
 
 // The width of the code point at `i`; an invalid byte is U+FFFD, one wide.
@@ -685,6 +719,7 @@ private fun regexRun(re: Regex, var vm: RegexVm, from: int, anchored: bool, need
             var t = 0
             var cut = false
             while (!cut && t < vm.counts[current]) {
+                vm.work += 1
                 val entry = current * vm.n + t
                 val pc = vm.pcs[entry]
                 val op = vm.program[pc * 3]

@@ -42,6 +42,25 @@ fun main {
 
 `regexCompile` returns an error, never a panic, for any invalid pattern.
 
+## Cost
+
+There is no backtracking, so no pattern takes exponential time: `(a+)+$`, `(a|a)*b`,
+`(a|aa)*c`, `(a*)*b`, `(x+x+)+y` and `(a|b|ab)*c` over a hundred thousand `a`s and a
+non-matching end take 4 to 21 ms. A single search (`matches`, `matchFull`, `find`)
+takes at most 2 × (text size + 1) × (program size) VM steps whatever the pattern;
+`re.findWork(text)` counts them, and `tests/cases/regex/work.ab` checks the bound on
+those shapes by step count, not by time. The program size grows with counted repeats:
+`(a{1,30}){1,30}b` is 1,863 instructions and takes 3.1 s over 100,000 characters.
+
+`findAll` and `replace` (and a loop of `find(text, start)`) search again from the end
+of each match. When a longer alternative keeps running after a shorter one has matched
+(`a+b|a`, `(?:a+b)?a`, `a*b|a` over `aaaa…`), each search runs to the end of the text
+before it can give the short match, and the whole takes quadratic time: 5,000
+characters 0.5 s, 10,000 2.1 s, 20,000 10 s, 40,000 38 s. `re.findAllWork(text)` counts
+the steps. RE2 and Rust's `regex` have the same limit. For untrusted text, bound the
+text's size, or avoid patterns whose alternatives can be prefixes of one another's
+continuations.
+
 ## Syntax
 
 | Form | Meaning |

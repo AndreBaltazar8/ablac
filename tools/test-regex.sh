@@ -20,4 +20,7 @@ ABLA_GC_STRESS=1 timeout 300 "$out/main-release" | grep -x ok >/dev/null
 "$compiler" build "$root/tests/cases/regex/corpus.ab" -o "$out/corpus" --no-cache --fast
 zcat "$root/tests/cases/regex/corpus.tsv.gz" >"$out/corpus.tsv"
 timeout 300 "$out/corpus" "$out/corpus.tsv"
+# Step counts, not times: a search is within 2 * (text + 1) * program steps for the classic exponential shapes.
+"$compiler" build "$root/tests/cases/regex/work.ab" -o "$out/work" --no-cache --fast
+"$out/work" | grep -x ok >/dev/null
 echo "regex: ok"
