@@ -1775,11 +1775,17 @@ fun bootstrapAliasShadowedAt(
 // duplicates. A same-named function with other parameters is an overload, not
 // a shadow. A runtime platform module's own names (the C externs `malloc`,
 // `write`, `pthread_*`) are private the same way, so a program may declare
-// them. Two modules that both declare a name and neither imports the other
-// stay a duplicate.
+// them. Two imported modules that both declare a name and neither imports the
+// other (abla/tls/hosted's and abla/tls/pure's TlsConnection) each carry their
+// prefix the same way, and a module that reaches only one of them, or one
+// nearer than the others, through its plain imports means that one
+// (`boundNames`, declared in `boundModules`). The runtime's modules keep their
+// names: a program's same-named declaration stays a duplicate.
 class BootstrapModuleShadow(
     val module: string,
-    val names: array<string>
+    val names: array<string>,
+    val boundNames: array<string> = [],
+    val boundModules: array<string> = []
 )
 
 fun bootstrapModuleShadowIndex(
@@ -1965,15 +1971,23 @@ fun bootstrapModuleShadows(
         }
         entry = entry + 1
     }
+    // Names that two sibling modules (neither imports the other) declare:
+    // each such module's declaration carries its prefix, and every module
+    // that only reaches one of them through its imports means that one.
+    val siblingNames: array<string> = []
     if (shared.size > 0) {
         val edgeImporters: array<int> = []
         val edgeTargets: array<int> = []
+        // Whether a module is imported by another (the root and the modules
+        // the build brings in by itself are not), and the plain edges.
+        val imported = filledArray(snapshots.size, false)
         var edge = 0
         while (edge < aliases.size) {
             val importer = summary.snapshotIndex.get(aliases[edge].importer)
             val target = summary.snapshotIndex.get(aliases[edge].target)
             edgeImporters.append(if (importer != null) importer else -1)
             edgeTargets.append(if (target != null) target else -1)
+            if (target != null) imported[target] = true
             edge = edge + 1
         }
         var group = 0
@@ -1983,9 +1997,10 @@ fun bootstrapModuleShadows(
                 val firstDeclaration = snapshots[entryModules[first]]
                     .discovery.declarations[entryDeclarations[first]]
                 var shadows = false
+                var sibling = false
                 var shadowed = -1
                 var second = shared[group]
-                while (second >= 0 && !shadows) {
+                while (second >= 0 && !shadows && !sibling) {
                     if (entryModules[second] != entryModules[first] &&
                         !bootstrapDeclarationsOverload(
                             firstDeclaration,
@@ -1993,13 +2008,25 @@ fun bootstrapModuleShadows(
                                 .discovery.declarations[
                                     entryDeclarations[second]
                                 ]
-                        ) &&
-                        bootstrapModuleReaches(
+                        )) {
+                        if (bootstrapModuleReaches(
                             entryModules[first], entryModules[second],
                             edgeImporters, edgeTargets, snapshots.size
                         )) {
-                        shadows = true
-                        shadowed = second
+                            shadows = true
+                            shadowed = second
+                        } else if (bootstrapModuleSiblingShadowable(
+                                snapshots[entryModules[first]].path,
+                                imported[entryModules[first]]
+                            ) && bootstrapModuleSiblingShadowable(
+                                snapshots[entryModules[second]].path,
+                                imported[entryModules[second]]
+                            ) && !bootstrapModuleReaches(
+                                entryModules[second], entryModules[first],
+                                edgeImporters, edgeTargets, snapshots.size
+                            )) {
+                            sibling = true
+                        }
                     }
                     second = chains[second]
                 }
@@ -2008,9 +2035,12 @@ fun bootstrapModuleShadows(
                 if (shadows && entryNames[first] == "main") {
                     shadowModules.append(entryModules[shadowed])
                     shadowNames.append(entryNames[shadowed])
-                } else if (shadows) {
+                } else if (shadows || sibling) {
                     shadowModules.append(entryModules[first])
                     shadowNames.append(entryNames[first])
+                }
+                if (sibling && !bootstrapAffineNamesContain(siblingNames, entryNames[first])) {
+                    siblingNames.append(entryNames[first])
                 }
                 first = chains[first]
             }
@@ -2029,10 +2059,99 @@ fun bootstrapModuleShadows(
             }
             index = index + 1
         }
-        if (names.size > 0) {
-            result.append(BootstrapModuleShadow(snapshots[module].path, names))
+        val bound = bootstrapSiblingBindings(
+            module, siblingNames, aliases, snapshots, summary,
+            entryModules, entryNames, shadowModules, shadowNames
+        )
+        if (names.size > 0 || bound.size > 0) {
+            val boundTargets: array<string> = []
+            val boundNames: array<string> = []
+            index = 0
+            while (index + 1 < bound.size) {
+                boundNames.append(bound[index])
+                boundTargets.append(bound[index + 1])
+                index = index + 2
+            }
+            result.append(BootstrapModuleShadow(
+                snapshots[module].path, names, boundNames, boundTargets
+            ))
         }
         module = module + 1
+    }
+    result
+}
+
+/** Whether `path`'s declarations may give way to a sibling module's of their
+ *  name: an imported module outside the runtime, whose names the backend and
+ *  the runtime look up as they are. */
+fun bootstrapModuleSiblingShadowable(path: string, imported: bool): bool =
+    imported && !bootstrapRuntimeModuleSource(path)
+
+/** For each of `siblingNames` that `module` does not declare, the module its
+ *  bare name means there: the declaring module its plain imports reach first,
+ *  when that one alone is the nearest and carries its prefix. Name and
+ *  module path pairs, flattened. */
+fun bootstrapSiblingBindings(
+    module: int,
+    siblingNames: array<string>,
+    aliases: array<BootstrapModuleAlias>,
+    snapshots: array<BootstrapModuleSnapshot>,
+    summary: BootstrapAliasSummary,
+    entryModules: array<int>,
+    entryNames: array<string>,
+    shadowModules: array<int>,
+    shadowNames: array<string>
+): array<string> {
+    val result: array<string> = []
+    if (siblingNames.size == 0) return result
+    // Breadth-first over the module's plain imports: each module's distance.
+    val distance = filledArray(snapshots.size, -1)
+    distance[module] = 0
+    val pending: array<int> = [module]
+    var next = 0
+    while (next < pending.size) {
+        val from = pending[next]
+        var edgeIndex = summary.firstEdgeOf(snapshots[from].path)
+        while (edgeIndex >= 0) {
+            val edge = aliases[edgeIndex]
+            val target = summary.snapshotIndex.get(edge.target)
+            if (edge.alias == "" && target != null && distance[target] < 0) {
+                distance[target] = distance[from] + 1
+                pending.append(target)
+            }
+            edgeIndex = summary.nextEdge[edgeIndex]
+        }
+        next = next + 1
+    }
+    for (name in siblingNames) {
+        if (!bootstrapModuleDeclares(snapshots[module].discovery, name)) {
+            var nearest = -1
+            var tied = false
+            var entry = 0
+            while (entry < entryNames.size) {
+                val declaring = entryModules[entry]
+                if (entryNames[entry] == name && distance[declaring] > 0 &&
+                    declaring != nearest) {
+                    if (nearest < 0 || distance[declaring] < distance[nearest]) {
+                        nearest = declaring
+                        tied = false
+                    } else if (distance[declaring] == distance[nearest]) {
+                        tied = true
+                    }
+                }
+                entry = entry + 1
+            }
+            var prefixed = false
+            var index = 0
+            while (index < shadowModules.size) {
+                if (shadowModules[index] == nearest && shadowNames[index] == name) prefixed = true
+                index = index + 1
+            }
+            if (nearest >= 0 && !tied && prefixed) {
+                result.append(name)
+                result.append(snapshots[nearest].path)
+            }
+        }
     }
     result
 }
@@ -2121,6 +2240,18 @@ fun bootstrapRewriteModuleSource(
             )
         }
         edgeIndex = summary.nextEdge[edgeIndex]
+    }
+    // A sibling module's name this module reaches only through others.
+    if (ownShadows >= 0) {
+        val own = shadows[ownShadows]
+        var bound = 0
+        while (bound < own.boundNames.size) {
+            names.append(own.boundNames[bound])
+            replacements.append(
+                "${bootstrapModuleCanonicalPrefix(own.boundModules[bound])}${own.boundNames[bound]}"
+            )
+            bound = bound + 1
+        }
     }
     val declarationBounds = if (names.size > 0) {
         bootstrapDeclarationBoundNames(snapshot.source, snapshot.discovery)

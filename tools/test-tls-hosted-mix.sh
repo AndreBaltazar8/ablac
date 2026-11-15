@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# abla/tls/hosted and the modules built on abla/tls/pure in one program. A module that imports abla/tls/pure unqualified
-# brings a second TlsConnection, TlsListener and tlsServerUpgrade into the program, and the compiler matches
-# declarations by name: v0.2.60's first candidate failed NovaKind's signer with `constructor.arity:TlsConnection`.
-# The modules import abla/tls/pure under an alias (as abla/http/tls does); each program in tests/cases/tls-mix must build.
+# abla/tls/hosted and the modules built on abla/tls/pure in one program. Both declare TlsConnection, TlsListener and
+# tlsServerUpgrade, and neither imports the other: v0.2.60's first candidate failed NovaKind's signer with
+# `constructor.arity:TlsConnection` (then worked around by aliasing abla/tls/pure). Since #830 each module's names mean
+# the declarations its own imports reach, and the modules import abla/tls/pure plainly; each program in
+# tests/cases/tls-mix must build.
 set -euo pipefail
 compiler=${1:-build/ablac}
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Import remaps: the root abla.toml's `[imports]` maps abla/math to
 # abla/math/v8 for every module of the build, a linked library's (with its own
-# strict manifest) included, so the two don't clash; without the remap they
-# do, and the clash names the imports that brought each module in. A target
+# strict manifest) included, so the lib sees V8's pow too; without the remap each module
+# keeps the one it imports. A target
 # that doesn't declare what its source does publicly is
 # E_IMPORT_REMAP_MISMATCH, a remap in a dependency's manifest is
 # E_IMPORT_REMAP_NOT_ROOT, and a remap that no import reaches leaves the IR
@@ -52,14 +52,16 @@ set -e
 [[ $status == 42 && $output == "NaN NaN 2 NaN" ]] ||
     { echo "import-remap: run exited $status and printed:"; echo "$output"; exit 1; }
 
-# Without it, abla/math and abla/math/v8 clash.
+# Without it, each module keeps the abla/math it imports (#830): the lib's pow is abla/math's
+# (pow(1, NaN) is 1), the program's V8's.
 variant plain 'name = "import-remap-test"'
-rejected "$output_directory/plain/app/main.ab" "symbol.duplicate:sqrt@" \
-    '/abla/math/entry.ab` is imported by `' "plain/lib/lib.ab:2:1" \
-    '/abla/math/v8/entry.ab` is imported by `' "plain/app/main.ab:6:1" \
-    "help: both modules' names are program-wide"
-[[ $(grep -c "help: both modules' names" "$output_directory/rejected.err") == 1 ]] ||
-    { echo "import-remap: the clash is explained more than once"; cat "$output_directory/rejected.err"; exit 1; }
+"$compiler" build "$output_directory/plain/app/main.ab" -o "$output_directory/plain-built" --no-cache
+set +e
+output=$("$output_directory/plain-built")
+status=$?
+set -e
+[[ $status == 42 && $output == "number NaN 2 number" ]] ||
+    { echo "import-remap: the unremapped program exited $status and printed:"; echo "$output"; exit 1; }
 
 # A target that lacks a declaration, or declares it otherwise.
 variant mismatch '[imports]
