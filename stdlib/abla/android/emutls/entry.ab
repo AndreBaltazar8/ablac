@@ -1,0 +1,142 @@
+// Emulated thread-local storage for an arm64 Android library, on bionic's pthread keys and nothing else of libc (#811).
+//
+// An Android library built for API 24 cannot use ELF TLS (bionic loads none from a dlopen'd library before API 29), so LLVM
+// lowers each thread-local to `__emutls_get_address(&control)`. The NDK's compiler-rt version of it imports malloc, free,
+// realloc, abort, pthread_once, pthread_key_create, pthread_getspecific, pthread_setspecific and the mutex calls. This one
+// imports the three key calls only: the one thing a library cannot do without the system is know which thread it is on
+// when it is called from threads it did not start, and a thread's end only reaches it through a key's destructor.
+// Everything else is the system call routine the library already has (mmap, munmap): no allocation of the Abla heap, whose
+// own per-thread cells are emulated thread-locals that call this function.
+//
+// Import this module from the library (`import "abla/android/emutls"`): the directive below defines the local symbol
+// `__emutls_get_address` that LLVM's calls refer to, so the link no longer takes it from the NDK's builtins archive.
+//
+// The control block is the ABI's, four words: +0 size, +8 alignment, +16 index (0 until the first use), +24 the initial value
+// (null: zeroes). A control gets its index (1, 2, ...) from one process-wide counter by a compare-and-swap. A thread's table
+// is one mapping: +0 its capacity (slots), +8 the newest chunk, +16 the next free byte of that chunk, +24 the end of the chunk,
+// then one word per index (+32 + 8 * index) with the address of the thread's copy (0 before its first use). Copies come from
+// chunks of the thread's own (a chunk: +0 the previous chunk, +8 its size, data from +16). The key's destructor unmaps the
+// table and every chunk when the thread ends.
+import "abla/build"
+import "abla/runtime/scalar"
+import "abla/runtime/self"
+import "abla/sys/linux"
+import "abla/unsafe/memory"
+import "abla/unsafe/native/function-address"
+import "abla/unsafe/memory/raw"
+
+private noescape extern:"c" fun pthread_key_create(key: i64, destructor: i64): i32
+private noescape extern:"c" fun pthread_getspecific(key: i32): i64
+private noescape extern:"c" fun pthread_setspecific(key: i32, value: i64): i32
+
+private trusted fun androidEmutlsCounterAddress(): int = nativeStaticAllocate(8)
+
+// 0: no key yet; -1: being created; key + 1 once there.
+private trusted fun androidEmutlsKeyCell(): int = nativeStaticAllocate(8)
+
+private trusted fun androidEmutlsKeyScratch(): int = nativeStaticAllocate(8)
+
+private trusted fun androidEmutlsMap(length: int): int {
+    val address = linuxSyscall6(9, 0, length, 3, 34, -1, 0)
+    if (address < 0 && address > -4096) ablaRuntimeTrap()
+    address
+}
+
+private trusted fun androidEmutlsUnmap(address: int, length: int): void {
+    linuxSyscall2(11, address, length)
+    return
+}
+
+private trusted fun androidEmutlsPages(bytes: int): int = (bytes + 4095) & (0 - 4096)
+
+private trusted fun androidEmutlsTableBytes(capacity: int): int = androidEmutlsPages(32 + 8 * (capacity + 1))
+
+// Runs when a thread that used a thread-local ends: the table and the chunks go back to the system.
+private trusted fun androidEmutlsDestroy(table: int): void {
+    if (table == 0) return
+    var chunk = ablaRuntimeLoadI64(table + 8)
+    while (chunk != 0) {
+        val previous = ablaRuntimeLoadI64(chunk)
+        androidEmutlsUnmap(chunk, ablaRuntimeLoadI64(chunk + 8))
+        chunk = previous
+    }
+    androidEmutlsUnmap(table, androidEmutlsTableBytes(ablaRuntimeLoadI64(table)))
+    return
+}
+
+// The thread-specific key, created by the first caller; the others wait for it (a few instructions).
+private trusted fun androidEmutlsKey(): int {
+    val cell = androidEmutlsKeyCell()
+    var state = ablaRuntimeAtomicLoadI64(cell)
+    if (state == 0) {
+        if (ablaRuntimeAtomicCompareExchangeI64(cell, 0, -1) == 0) {
+            val scratch = androidEmutlsKeyScratch()
+            if (pthread_key_create(scratch, nativeFunctionAddress(androidEmutlsDestroy)) != 0) ablaRuntimeTrap()
+            ablaRuntimeAtomicStoreI64(cell, (ablaRuntimeLoadI64(scratch) & 4294967295) + 1)
+        }
+        state = ablaRuntimeAtomicLoadI64(cell)
+        while (state <= 0) state = ablaRuntimeAtomicLoadI64(cell)
+    }
+    state - 1
+}
+
+private trusted fun androidEmutlsGrow(old: int, needed: int): int {
+    val oldCapacity = if (old == 0) 0 else ablaRuntimeLoadI64(old)
+    var capacity = if (oldCapacity < 8) 8 else oldCapacity * 2
+    if (capacity < needed) capacity = needed
+    val table = androidEmutlsMap(androidEmutlsTableBytes(capacity))
+    ablaRuntimeStoreI64(table, capacity)
+    if (old != 0) {
+        ablaUnsafeCopyMemory(table + 8, old + 8, 32 + 8 * oldCapacity)
+        androidEmutlsUnmap(old, androidEmutlsTableBytes(oldCapacity))
+    }
+    table
+}
+
+private trusted fun androidEmutlsMakeCopy(table: int, control: int): int {
+    val size = ablaRuntimeLoadI64(control)
+    var alignment = ablaRuntimeLoadI64(control + 8)
+    // The ABI's alignment is a power of two; anything else (or nothing) gets a word's.
+    if (alignment < 8 || (alignment & (alignment - 1)) != 0) alignment = 8
+    val length = if (size < 1) 1 else size
+    var address = (ablaRuntimeLoadI64(table + 16) + alignment - 1) & (0 - alignment)
+    if (ablaRuntimeLoadI64(table + 16) == 0 || address + length > ablaRuntimeLoadI64(table + 24)) {
+        val bytes = androidEmutlsPages(16 + alignment + length + (if (length < 16384) 16384 else 0))
+        val chunk = androidEmutlsMap(bytes)
+        ablaRuntimeStoreI64(chunk, ablaRuntimeLoadI64(table + 8))
+        ablaRuntimeStoreI64(chunk + 8, bytes)
+        ablaRuntimeStoreI64(table + 8, chunk)
+        ablaRuntimeStoreI64(table + 24, chunk + bytes)
+        address = (chunk + 16 + alignment - 1) & (0 - alignment)
+    }
+    ablaRuntimeStoreI64(table + 16, address + length)
+    val initial = ablaRuntimeLoadI64(control + 24)
+    // The pages are zero already.
+    if (initial != 0 && size > 0) ablaUnsafeCopyMemory(address, initial, size)
+    address
+}
+
+trusted fun androidEmutlsGetAddress(control: int): int {
+    var index = ablaRuntimeAtomicLoadI64(control + 16)
+    if (index == 0) {
+        val assigned = ablaRuntimeAtomicFetchAddI64(androidEmutlsCounterAddress(), 1) + 1
+        val seen = ablaRuntimeAtomicCompareExchangeI64(control + 16, 0, assigned)
+        index = if (seen == 0) assigned else seen
+    }
+    val key = androidEmutlsKey()
+    var table = pthread_getspecific(i32(key))
+    val capacity = if (table == 0) 0 else ablaRuntimeLoadI64(table)
+    if (index > capacity) {
+        table = androidEmutlsGrow(table, index)
+        if (pthread_setspecific(i32(key), table) != 0) ablaRuntimeTrap()
+    }
+    val slot = table + 32 + 8 * index
+    var address = ablaRuntimeLoadI64(slot)
+    if (address == 0) {
+        address = androidEmutlsMakeCopy(table, control)
+        ablaRuntimeStoreI64(slot, address)
+    }
+    address
+}
+
+#requiredInternalFunction("androidEmutlsGetAddress", "__emutls_get_address")

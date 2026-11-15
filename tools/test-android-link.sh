@@ -35,12 +35,16 @@ done | sort -u > "$exports"
 allow=tools/android-imports-allowlist.txt
 actual=$out/actual.txt
 : > "$actual"
-for case in small rich; do
-    "$compiler" build "tests/cases/android-link/build-$case.ab" -o "$out/build-$case" --fast --no-cache
+# label:build program:output directory:ABLA_DEBUG. The debug runtime is part of the set: it must not import a symbol
+# newer than the API level (backtrace is API 33) or bionic's write, and a release build must not import more.
+for variant in small:small:small:0 threads:threads:threads:0 threads-debug:threads:threads:1 rich:rich:rich:0 rich-release:rich-release:rich-release:0 \
+    rich-debug:rich:rich:1 rich-release-debug:rich-release:rich-release:1; do
+    IFS=: read -r case program dir debug <<< "$variant"
+    ABLA_DEBUG=$debug "$compiler" build "tests/cases/android-link/build-$program.ab" -o "$out/build-$case" --fast --no-cache
     status=0
-    "$out/build-$case" || status=$?
+    ABLA_DEBUG=$debug "$out/build-$case" || status=$?
     [[ $status -eq 37 ]] || { echo "android link: building the $case library failed ($status)" >&2; exit 1; }
-    library=$out/$case/src/main/jniLibs/arm64-v8a/libabla_app.so
+    library=$out/$dir/src/main/jniLibs/arm64-v8a/libabla_app.so
     [[ -f $library ]] || { echo "android link: no $library" >&2; exit 1; }
     "$nm" -D --undefined-only "$library" | awk -v c="$case" '{ s = $NF; sub(/@.*/, "", s); if (s != "") print c " " s }' | sort -u >> "$actual"
 done

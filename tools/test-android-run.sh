@@ -44,11 +44,11 @@ library=$PWD/$out/lib/src/main/jniLibs/arm64-v8a/libabla_app.so
 status=0
 LD_LIBRARY_PATH="$bionic/system/lib64/bootstrap:$bionic/system/lib64" timeout 300 qemu-aarch64 \
     "$bionic/system/bin/bootstrap/linker64" "$PWD/$out/driver" "$library" \
-    abla_run_random nonzero abla_run_heap 465 > "$out/run.out" 2> "$out/run.err" < /dev/null || status=$?
+    abla_run_random nonzero abla_run_heap 465 abla_run_thread 142 abla_run_threads_heap 1860 > "$out/run.out" 2> "$out/run.err" < /dev/null || status=$?
 if [[ $status -ne 0 ]]; then
     cat "$out/run.out" >&2
     grep -v 'linkerconfig' "$out/run.err" >&2 || true
     fail "the driver failed ($status)"
 fi
-grep -q '^abla_run_random ' "$out/run.out" && grep -qx 'abla_run_heap 465' "$out/run.out" || { cat "$out/run.out" >&2; fail 'unexpected output'; }
+grep -q '^abla_run_random ' "$out/run.out" && grep -qx 'abla_run_heap 465' "$out/run.out" && grep -qx 'abla_run_thread 142' "$out/run.out" && grep -qx 'abla_run_threads_heap 1860' "$out/run.out" || { cat "$out/run.out" >&2; fail 'unexpected output'; }
 echo 'android run: the arm64 Android library loads in bionic'"'"'s linker and its exports run under qemu-aarch64'
