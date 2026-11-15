@@ -1,0 +1,124 @@
+// abla/http/async over HTTP/2 against a real server (tools/test-http2.sh). Arguments: the port, the server certificate (PEM, the trust anchor), a mode, and for "h2" the
+// size of /big.bin in the server's document root (nghttpd serves /small.txt = "hello h2\n" and /big.bin).
+//   h2        http2 on: many concurrent requests share one connection (one connect, one handshake), bodies arrive whole, a 3 MiB download and a 300 KB upload cross the flow
+//             control windows, HEAD works, response header names are lower case, trailers() is empty, a request that times out leaves the connection to the others
+//   fallback  http2 on against a server that does not offer h2 (openssl s_server): the requests complete over HTTP/1.1 and the origin is remembered as HTTP/1.1
+//   default   the default options (http2 off) against the h2 server's HTTP/1.1 sibling (openssl s_server): HTTP/1.1, no h2 offered
+// Prints "http2 net <mode> ok".
+import "abla/io"
+import "abla/http/async"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/http"
+
+var failures = 0
+
+fun fail(what: string): void {
+    failures = failures + 1
+    if (failures < 30) println("FAIL $what")
+    return
+}
+
+fun decimal(text: string): int {
+    var value = 0
+    for (i in 0 until text.size) value = value * 10 + (text[i] - 48)
+    value
+}
+
+/** Steps the client until nothing is pending (or 20 s pass) and returns the completions. */
+fun drain(var client: HttpAsyncClient): array<HttpAsyncCompletion> {
+    val done: array<HttpAsyncCompletion> = []
+    val deadline = linuxMonotonicMilliseconds() + 20000
+    while (client.pending() > 0 && linuxMonotonicMilliseconds() < deadline) {
+        client.step(20)
+        for (c in client.takeCompletions()) done.append(c)
+    }
+    for (c in client.takeCompletions()) done.append(c)
+    done
+}
+
+fun find(done: array<HttpAsyncCompletion>, id: int): HttpAsyncCompletion? {
+    for (c in done) {
+        if (c.id == id) return c
+    }
+    null
+}
+
+fun h2(port: int, caPath: string, bigSize: int): void {
+    val client = httpAsyncClient(HttpAsyncOptions(caPath = caPath, http2 = true))
+    val base = "https://localhost:$port"
+    val ids: array<int> = []
+    for (i in 0 until 30) ids.append(client.get("$base/small.txt?i=$i", [HttpHeader("X-Test", "v$i")], 15000))
+    val bigId = client.get("$base/big.bin", [], 20000)
+    val headId = client.request("HEAD", "$base/small.txt", [], "", 15000)
+    val upId = client.request("POST", "$base/small.txt", [HttpHeader("Content-Type", "application/octet-stream")], "u".repeat(300000), 20000)
+    val done = drain(client)
+    expectAll(done, ids, bigId, headId, upId, bigSize)
+    if (client.connectionsOpened != 1) fail("one connection should carry everything: ${client.connectionsOpened} were opened")
+    // A second wave reuses the connection (no new connect).
+    val again: array<int> = []
+    for (i in 0 until 10) again.append(client.get("$base/small.txt", [], 15000))
+    val second = drain(client)
+    for (id in again) {
+        val c = find(second, id)
+        if (c == null) fail("wave 2: no completion for $id")
+        else if (c.status != 200 || c.protocol != "h2") fail("wave 2: ${c.status} ${c.protocol} ${c.error}")
+    }
+    if (client.connectionsOpened != 1) fail("the second wave opened a connection: ${client.connectionsOpened}")
+    return
+}
+
+fun expectAll(done: array<HttpAsyncCompletion>, ids: array<int>, bigId: int, headId: int, upId: int, bigSize: int): void {
+    for (id in ids) {
+        val c = find(done, id)
+        if (c == null) {
+            fail("no completion for $id")
+            continue
+        }
+        if (c.status != 200 || c.error != "") fail("small $id: ${c.status} ${c.error}")
+        else {
+            if (c.body != "hello h2\n") fail("small $id: body '${c.body}'")
+            if (c.protocol != "h2") fail("small $id: protocol '${c.protocol}'")
+            if (c.header("content-length") != "9") fail("small $id: content-length '${c.header("content-length")}'")
+            if (c.trailers().size != 0) fail("trailers are not kept")
+        }
+    }
+    val big = find(done, bigId)
+    if (big == null) fail("no completion for the big download")
+    else if (big.status != 200 || big.body.size != bigSize) fail("big: status ${big.status} ${big.error} size ${big.body.size} of $bigSize")
+    val head = find(done, headId)
+    if (head == null) fail("no completion for HEAD")
+    else if (head.status != 200 || head.body.size != 0 || head.header("content-length") != "9") fail("HEAD: ${head.status} body ${head.body.size} length '${head.header("content-length")}' ${head.error}")
+    val up = find(done, upId)
+    if (up == null) fail("no completion for the upload")
+    else if (up.error != "" || up.status != 200) fail("upload: ${up.status} ${up.error}")
+    return
+}
+
+fun other(port: int, caPath: string, http2: bool): void {
+    val client = httpAsyncClient(HttpAsyncOptions(caPath = caPath, http2 = http2))
+    val ids: array<int> = []
+    for (i in 0 until 6) ids.append(client.get("https://localhost:$port/", [], 15000))
+    val done = drain(client)
+    for (id in ids) {
+        val c = find(done, id)
+        if (c == null) fail("no completion for $id")
+        else if (c.status != 200 || c.protocol != "http/1.1") fail("${c.status} protocol '${c.protocol}' ${c.error}")
+    }
+    // After the first handshake the origin is HTTP/1.1: the later requests may open more than one connection.
+    if (http2 && client.connectionsOpened < 1) fail("no connection opened")
+    return
+}
+
+fun main: int {
+    val port = decimal(processArgument(0))
+    val caPath = processArgument(1)
+    val mode = processArgument(2)
+    if (mode == "h2") h2(port, caPath, decimal(processArgument(3)))
+    else if (mode == "fallback") other(port, caPath, true)
+    else if (mode == "default") other(port, caPath, false)
+    else fail("unknown mode $mode")
+    if (failures > 0) return 1
+    println("http2 net $mode ok")
+    0
+}

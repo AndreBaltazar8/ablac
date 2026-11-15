@@ -363,6 +363,8 @@ test-serial: ablac
 	tools/test-tls-trust-env.sh $(COMPILER)
 	tools/test-tls-session.sh $(COMPILER)
 	tools/test-tls-fuzz.sh $(COMPILER)
+	tools/test-http2.sh $(COMPILER)
+	tools/test-http2-fuzz.sh $(COMPILER)
 	tools/test-crypto-pure.sh $(COMPILER)
 	tools/test-sha2-differential.sh $(COMPILER)
 	tools/test-crypto-chacha.sh $(COMPILER)

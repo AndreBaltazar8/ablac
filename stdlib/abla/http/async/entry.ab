@@ -19,7 +19,10 @@
 
 import "abla/dns"
 import "abla/dns/async"
+import "abla/bytes"
 import "abla/http"
+import "abla/http/h2"
+import "abla/http/h2/hpack"
 import "abla/net"
 import "abla/random"
 import "abla/text"
@@ -44,7 +47,18 @@ class HttpAsyncOptions(
     val nameserverPort: int = 53,
     // The resolver's search domains and ndots, and its hosts file.
     val dnsConfigurationPath: string = "/etc/resolv.conf",
-    val dnsHostsPath: string = "/etc/hosts"
+    val dnsHostsPath: string = "/etc/hosts",
+    // HTTP/2 (RFC 9113): off by default for one release; true offers h2 by ALPN on https connections and uses it when the server picks it (one connection is shared by
+    // many requests, header names of an h2 response are lower case, trailers are not kept). http2PriorKnowledge speaks h2c on every http:// origin of this client.
+    val http2: bool = false,
+    val http2PriorKnowledge: bool = false,
+    // Concurrent requests on one h2 connection (also bounded by the server's SETTINGS_MAX_CONCURRENT_STREAMS).
+    val maximumStreamsPerConnection: int = 100,
+    // Header names HPACK never indexes, besides authorization, proxy-authorization, cookie and set-cookie.
+    val http2NeverIndex: array<string> = [],
+    // An h2 connection idle this long is probed with a PING before a request uses it.
+    val http2PingAfterIdleMilliseconds: int = 30000,
+    val maximumHeaderListBytes: int = 65536
 )
 
 class HttpAsyncCompletion(
@@ -53,9 +67,14 @@ class HttpAsyncCompletion(
     val headers: array<HttpHeader>,
     val body: string,
     val error: string,
-    val elapsedMilliseconds: int
+    val elapsedMilliseconds: int,
+    // "h2" or "http/1.1" for a request that got a response, "" otherwise.
+    val protocol: string = ""
 ) {
     fun succeeded(): bool = this.error == ""
+
+    // Trailers a response carried. HTTP/2 trailers are decoded and dropped, so this is empty for now: a caller that asks can see that none are kept.
+    fun trailers(): array<HttpHeader> = []
 }
 
 fun HttpAsyncCompletion.header(name: string): string {
@@ -93,6 +112,13 @@ private val httpAsyncConnectionHandshaking = 3
 private val httpAsyncConnectionWriting = 4
 private val httpAsyncConnectionReading = 5
 private val httpAsyncConnectionIdle = 6
+// An HTTP/2 connection past its handshake: many requests, each a stream of the slot's H2Client.
+private val httpAsyncConnectionH2 = 7
+
+// What an origin (scheme, host, port) is known to speak, from the ALPN of its last handshake.
+private val httpAsyncOriginUnknown = 0
+private val httpAsyncOriginHttp1 = 1
+private val httpAsyncOriginH2 = 2
 
 resource class HttpAsyncClient(
     val poller: SocketPoller,
@@ -110,6 +136,17 @@ resource class HttpAsyncClient(
     val requestDeadlines: array<int>,
     val requestStarted: array<int>,
     val requestRetried: array<bool>,
+    // The parts of a request, kept for HTTP/2 (HTTP/1.1 uses the rendered payload), the connection slot and stream carrying it, and the response as it arrives.
+    val requestMethods: array<string>,
+    val requestTargets: array<string>,
+    val requestAuthorities: array<string>,
+    val requestHeaderLists: array<array<HttpHeader>>,
+    val requestBodies: array<string>,
+    val requestSlots: array<int>,
+    val requestStreams: array<int>,
+    val requestStatuses: array<int>,
+    val requestResponseHeaders: array<array<HttpHeader>>,
+    val requestChunks: array<array<string>>,
     val freeRequests: array<int>,
     var freeRequestCount: int,
     // connections
@@ -131,8 +168,16 @@ resource class HttpAsyncClient(
     // The resolver's query id while resolving, otherwise 0.
     val connectionDnsQueries: array<int>,
     val connectionWriteInterest: array<bool>,
+    // 1 HTTP/1.1, 2 HTTP/2 (then connectionH2 is the connection's H2Client; other slots hold an unused one); the last time bytes arrived.
+    val connectionProtocols: array<int>,
+    val connectionH2: array<H2Client>,
+    val connectionActivity: array<int>,
     val freeConnections: array<int>,
     var freeConnectionCount: int,
+    // What each origin key speaks (httpAsyncOrigin*), until when that is believed.
+    val originKeys: array<string>,
+    val originProtocols: array<int>,
+    val originExpires: array<int>,
     // descriptor -> connection slot * 2 + role (0 socket, 1 dns)
     val routes: array<int>,
     // DNS cache
@@ -171,8 +216,9 @@ fun httpAsyncClient(options: HttpAsyncOptions = HttpAsyncOptions()): HttpAsyncCl
             options.dnsHostsPath
         )),
         HttpAsyncRead("", 0),
-        [], [], [], [], [], [], [], [], [], [], [], 0,
-        [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], 0,
+        [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], 0,
+        [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], 0,
+        [], [], [],
         [], [], [], [], [], 1, 0, 0
     )
 
@@ -227,6 +273,12 @@ private fun httpAsyncRender(
     if (!hasLength && (body.size > 0 || method == "POST" || method == "PUT" ||
         method == "PATCH")) output = "${output}Content-Length: ${body.size}\r\n"
     "$output\r\n$body"
+}
+
+// The :authority of a request: the host, with the port when it is not the scheme's default.
+private fun httpAsyncAuthority(target: HttpAsyncTarget): string {
+    val defaultPort = if (target.secure) 443 else 80
+    if (target.port == defaultPort) target.host else "${target.host}:${target.port}"
 }
 
 fun httpAsyncNumericIpv4(host: string): string =
@@ -364,15 +416,23 @@ fun HttpAsyncClient.complete(
     status: int,
     headers: array<HttpHeader>,
     body: string,
-    error: string
+    error: string,
+    protocol: string = ""
 ): void {
     if (request >= 0 && this.requestStates[request] != 0) {
         this.completions.append(HttpAsyncCompletion(
             this.requestIds[request], status, headers, body, error,
-            linuxMonotonicMilliseconds() - this.requestStarted[request]
+            linuxMonotonicMilliseconds() - this.requestStarted[request], protocol
         ))
         this.requestStates[request] = httpAsyncRequestFree
         this.requestPayloads[request] = ""
+        this.requestBodies[request] = ""
+        this.requestHeaderLists[request] = []
+        this.requestResponseHeaders[request] = []
+        this.requestChunks[request] = []
+        this.requestSlots[request] = -1
+        this.requestStreams[request] = -1
+        this.requestStatuses[request] = -1
         if (this.freeRequestCount < this.freeRequests.size) {
             this.freeRequests[this.freeRequestCount] = request
         } else this.freeRequests.append(request)
@@ -402,6 +462,8 @@ fun HttpAsyncClient.closeConnection(slot: int): void {
         this.connectionRequests[slot] = -1
         this.connectionOutputs[slot] = ""
         this.connectionInputs[slot] = ""
+        if (this.connectionProtocols[slot] == 2) this.connectionH2[slot] = h2ClientNew()
+        this.connectionProtocols[slot] = 1
         if (this.freeConnectionCount < this.freeConnections.size) {
             this.freeConnections[this.freeConnectionCount] = slot
         } else this.freeConnections.append(slot)
@@ -414,6 +476,10 @@ fun HttpAsyncClient.closeConnection(slot: int): void {
 // request whose reused keep-alive connection died before any response byte
 // is requeued once instead.
 fun HttpAsyncClient.fail(slot: int, error: string): void {
+    if (this.connectionProtocols[slot] == 2 && this.connectionStates[slot] == httpAsyncConnectionH2) {
+        this.h2Fail(slot, error)
+        return
+    }
     val request = this.connectionRequests[slot]
     val retry = request >= 0 && this.connectionUsed[slot] > 1 &&
         this.connectionInputs[slot] == "" && !this.requestRetried[request] &&
@@ -458,7 +524,12 @@ fun HttpAsyncClient.allocateConnection(request: int): int {
         this.connectionIdleSince.append(0)
         this.connectionDnsQueries.append(0)
         this.connectionWriteInterest.append(false)
+        this.connectionProtocols.append(1)
+        this.connectionH2.append(h2ClientNew())
+        this.connectionActivity.append(0)
     }
+    this.connectionProtocols[slot] = 1
+    this.connectionActivity[slot] = linuxMonotonicMilliseconds()
     this.connectionDescriptors[slot] = -1
     this.connectionSessions[slot] = 0
     this.connectionKeys[slot] = this.requestKeys[request]
@@ -597,7 +668,9 @@ fun HttpAsyncClient.startConnect(slot: int, address: string): void {
 fun HttpAsyncClient.connected(slot: int): void {
     if (this.connectionSecure[slot]) {
         // An empty caPath is the system trust store. The name is checked (a DNS name or an IP address, by subjectAltName).
-        val session = tlsSessionClient(this.connectionDescriptors[slot], this.connectionHosts[slot], TLS_VERIFY_HOST, this.options.caPath, this.options.sessions)
+        var alpn: array<string> = []
+        if (this.options.http2) alpn = ["h2", "http/1.1"]
+        val session = tlsSessionClient(this.connectionDescriptors[slot], this.connectionHosts[slot], TLS_VERIFY_HOST, this.options.caPath, this.options.sessions, alpn)
         if (!session.ok()) {
             this.fail(slot, "tls setup failed")
             return
@@ -606,13 +679,14 @@ fun HttpAsyncClient.connected(slot: int): void {
         this.connectionSessions[slot] = 1
         this.connectionStates[slot] = httpAsyncConnectionHandshaking
         this.handshake(slot)
-    } else this.beginWrite(slot)
+    } else if (this.options.http2PriorKnowledge) this.startH2(slot)
+    else this.beginWrite(slot)
     return
 }
 
 fun HttpAsyncClient.handshake(slot: int): void {
     val result = this.tlsHandshake(slot)
-    if (result == 1) this.beginWrite(slot)
+    if (result == 1) this.handshakeDone(slot)
     else if (result == -2) this.interest(slot, false)
     else if (result == -3) this.interest(slot, true)
     else if (result == -100) this.fail(slot, "tls certificate verification failed")
@@ -753,7 +827,7 @@ fun HttpAsyncClient.parseResponse(slot: int, eof: bool): bool {
     val request = this.connectionRequests[slot]
     this.connectionRequests[slot] = -1
     this.connectionInputs[slot] = ""
-    this.complete(request, response.status, response.headers, body, "")
+    this.complete(request, response.status, response.headers, body, "", "http/1.1")
     if (keepAlive && !eof) {
         this.connectionStates[slot] = httpAsyncConnectionIdle
         this.connectionIdleSince[slot] = linuxMonotonicMilliseconds()
@@ -812,7 +886,11 @@ fun HttpAsyncClient.socketReady(slot: int, readable: bool, writable: bool, faile
             }
         }
     } else if (state == httpAsyncConnectionHandshaking) this.handshake(slot)
-    else if (state == httpAsyncConnectionWriting) {
+    else if (state == httpAsyncConnectionH2) {
+        // Any event: read what arrived (which also writes what that needs), and write what is waiting.
+        this.h2Read(slot)
+        if (this.connectionStates[slot] == httpAsyncConnectionH2 && (writable || this.connectionH2[slot].wantsWrite())) this.h2Write(slot)
+    } else if (state == httpAsyncConnectionWriting) {
         if (this.connectionSecure[slot] || writable) this.writeSlot(slot)
         else if (failed) this.fail(slot, "connection lost")
     } else if (state == httpAsyncConnectionReading ||
@@ -820,6 +898,268 @@ fun HttpAsyncClient.socketReady(slot: int, readable: bool, writable: bool, faile
         if (readable || failed) this.readSlot(slot)
         else if (writable && this.connectionSecure[slot]) this.readSlot(slot)
     }
+    return
+}
+
+// ---------------------------------------------------------------------------
+// HTTP/2 connections (abla/http/h2): one H2Client per connection slot, many requests per connection
+
+private fun httpAsyncJoin(chunks: array<string>): string {
+    var buffer = byteBuffer()
+    for (chunk in chunks) buffer.appendText(chunk)
+    buffer.toText()
+}
+
+// What the origin of `key` is believed to speak: HTTP/2 when a live connection of it does, else the memory of its last handshake (until it expires with the
+// DNS cache), else unknown. Without http2 every origin speaks HTTP/1.1; http2PriorKnowledge makes every plain origin HTTP/2.
+fun HttpAsyncClient.originProtocol(key: string, secure: bool): int {
+    if (!secure) return if (this.options.http2PriorKnowledge) httpAsyncOriginH2 else httpAsyncOriginHttp1
+    if (!this.options.http2) return httpAsyncOriginHttp1
+    for (slot in 0 until this.connectionStates.size) {
+        if (this.connectionStates[slot] == httpAsyncConnectionH2 && this.connectionKeys[slot] == key) return httpAsyncOriginH2
+    }
+    val now = linuxMonotonicMilliseconds()
+    for (i in 0 until this.originKeys.size) {
+        if (this.originKeys[i] == key && this.originExpires[i] > now) return this.originProtocols[i]
+    }
+    httpAsyncOriginUnknown
+}
+
+fun HttpAsyncClient.rememberOrigin(key: string, protocol: int): void {
+    val expires = linuxMonotonicMilliseconds() + this.options.dnsCacheSeconds * 1000
+    for (i in 0 until this.originKeys.size) {
+        if (this.originKeys[i] == key) {
+            this.originProtocols[i] = protocol
+            this.originExpires[i] = expires
+            return
+        }
+    }
+    this.originKeys.append(key)
+    this.originProtocols.append(protocol)
+    this.originExpires.append(expires)
+    return
+}
+
+// The TLS handshake is done: what the server chose (ALPN) decides the protocol of the connection and is remembered for the origin.
+fun HttpAsyncClient.handshakeDone(slot: int): void {
+    if (!this.options.http2) {
+        this.beginWrite(slot)
+        return
+    }
+    val h2 = this.connectionTls[slot].alpn() == "h2"
+    this.rememberOrigin(this.connectionKeys[slot], if (h2) httpAsyncOriginH2 else httpAsyncOriginHttp1)
+    if (h2) this.startH2(slot) else this.beginWrite(slot)
+    return
+}
+
+// The connection speaks HTTP/2 from here: its request (if any) becomes the first stream.
+fun HttpAsyncClient.startH2(slot: int): void {
+    this.connectionProtocols[slot] = 2
+    this.connectionH2[slot] = h2ClientNew(this.options.maximumStreamsPerConnection, this.options.maximumResponseBytes, this.options.maximumHeaderListBytes, this.options.http2NeverIndex)
+    this.connectionStates[slot] = httpAsyncConnectionH2
+    this.connectionOutputs[slot] = ""
+    this.connectionOutputOffsets[slot] = 0
+    this.connectionIdleSince[slot] = linuxMonotonicMilliseconds()
+    this.connectionActivity[slot] = linuxMonotonicMilliseconds()
+    val request = this.connectionRequests[slot]
+    this.connectionRequests[slot] = -1
+    if (request >= 0) {
+        if (!this.h2Attach(slot, request)) this.requestStates[request] = httpAsyncRequestQueued
+    }
+    this.h2Pump(slot)
+    return
+}
+
+// Starts `request` as a stream of the slot's connection; false when the connection has no room.
+fun HttpAsyncClient.h2Attach(slot: int, request: int): bool {
+    val fields: array<HpackField> = []
+    for (header in this.requestHeaderLists[request]) fields.append(HpackField(header.name, header.value, false))
+    val stream = this.connectionH2[slot].request(this.requestMethods[request], if (this.requestSecure[request]) "https" else "http",
+        this.requestAuthorities[request], this.requestTargets[request], fields, this.requestBodies[request])
+    if (stream < 0) return false
+    this.requestStates[request] = httpAsyncRequestActive
+    this.requestSlots[request] = slot
+    this.requestStreams[request] = stream
+    this.requestStatuses[request] = -1
+    this.requestResponseHeaders[request] = []
+    this.requestChunks[request] = []
+    true
+}
+
+fun HttpAsyncClient.requestOnStream(slot: int, stream: int): int {
+    for (request in 0 until this.requestStates.size) {
+        if (this.requestStates[request] != 0 && this.requestSlots[request] == slot && this.requestStreams[request] == stream) return request
+    }
+    -1
+}
+
+// Takes what the connection's H2Client reports (response headers, data, ends, resets) into the requests; closes the slot when the connection ended.
+// `retryUnanswered`: a stream that got no response bytes when the connection broke goes back to the queue once.
+fun HttpAsyncClient.h2Events(slot: int, retryUnanswered: bool): void {
+    val events = this.connectionH2[slot].takeEvents()
+    var closed = false
+    for (event in events) {
+        if (event.kind == H2_EVENT_CLOSED) {
+            closed = true
+            continue
+        }
+        if (event.kind == H2_EVENT_GOAWAY) continue
+        val request = this.requestOnStream(slot, event.stream)
+        if (request < 0) continue
+        if (event.kind == H2_EVENT_HEADERS) {
+            this.requestStatuses[request] = event.status
+            val headers: array<HttpHeader> = []
+            for (field in event.headers) headers.append(HttpHeader(field.name, field.value))
+            this.requestResponseHeaders[request] = headers
+        } else if (event.kind == H2_EVENT_DATA) {
+            this.requestChunks[request].append(event.data)
+        } else if (event.kind == H2_EVENT_END) {
+            val headers: array<HttpHeader> = []
+            for (header in this.requestResponseHeaders[request]) headers.append(header)
+            val body = httpAsyncJoin(this.requestChunks[request])
+            val status = this.requestStatuses[request]
+            this.complete(request, status, headers, body, "", "h2")
+        } else if (event.kind == H2_EVENT_RESET) {
+            if ((event.retry || (retryUnanswered && this.requestStatuses[request] < 0)) && !this.requestRetried[request]) {
+                this.requestRetried[request] = true
+                this.requestStates[request] = httpAsyncRequestQueued
+                this.requestSlots[request] = -1
+                this.requestStreams[request] = -1
+                this.requestResponseHeaders[request] = []
+                this.requestChunks[request] = []
+            } else this.complete(request, 0, [], "", event.error)
+        }
+    }
+    if (closed) this.closeConnection(slot)
+    else if (this.connectionH2[slot].openStreams() == 0) this.connectionIdleSince[slot] = linuxMonotonicMilliseconds()
+    return
+}
+
+// Writes what the connection's H2Client has to send (and what is left of the last write), until the socket would block.
+fun HttpAsyncClient.h2Write(slot: int): void {
+    var writing = true
+    while (writing && this.connectionStates[slot] == httpAsyncConnectionH2) {
+        val offset = this.connectionOutputOffsets[slot]
+        val output = this.connectionOutputs[slot]
+        if (offset >= output.size) {
+            val more = this.connectionH2[slot].takeOutput()
+            if (more.size == 0) {
+                this.interest(slot, false)
+                writing = false
+                if (this.connectionH2[slot].isClosed()) this.closeConnection(slot)
+            } else {
+                this.connectionOutputs[slot] = more
+                this.connectionOutputOffsets[slot] = 0
+            }
+        } else if (this.connectionSecure[slot]) {
+            val written = this.tlsWrite(slot, output, offset)
+            if (written > 0) this.connectionOutputOffsets[slot] = offset + written
+            else if (written == -3 || written == -2) {
+                this.interest(slot, written == -3)
+                writing = false
+            } else {
+                this.fail(slot, "tls write failed")
+                writing = false
+            }
+        } else {
+            var connection = TcpConnection(this.connectionDescriptors[slot])
+            val result = connection.writeCompact(output, offset)
+            connection.descriptor = -1
+            if (result.written > 0) this.connectionOutputOffsets[slot] = offset + result.written
+            if (result.status == "error") {
+                if (result.errorCode == 11) this.interest(slot, true)
+                else this.fail(slot, "write failed")
+                writing = false
+            }
+        }
+    }
+    return
+}
+
+fun HttpAsyncClient.h2Pump(slot: int): void {
+    this.h2Events(slot, false)
+    if (this.connectionStates[slot] == httpAsyncConnectionH2) this.h2Write(slot)
+    return
+}
+
+fun HttpAsyncClient.h2Read(slot: int): void {
+    var reading = true
+    while (reading && this.connectionStates[slot] == httpAsyncConnectionH2) {
+        if (this.connectionSecure[slot]) this.tlsRead(slot)
+        else httpAsyncPlainRead(this.connectionDescriptors[slot], this.reader)
+        val status = this.reader.status
+        val chunk = this.reader.text
+        this.reader.text = ""
+        if (status > 0) {
+            val now = linuxMonotonicMilliseconds()
+            this.connectionActivity[slot] = now
+            this.connectionH2[slot].feed(chunk, now)
+            this.h2Events(slot, false)
+        } else {
+            val wouldBlock = if (this.connectionSecure[slot]) status == -2 || status == -3 else status == -11
+            if (wouldBlock) {
+                if (this.connectionSecure[slot] && status == -3) this.interest(slot, true)
+            } else {
+                // The socket ended or failed: what has no response yet may go to another connection once.
+                this.connectionH2[slot].broken("connection closed")
+                this.h2Events(slot, true)
+            }
+            reading = false
+        }
+    }
+    if (this.connectionStates[slot] == httpAsyncConnectionH2) this.h2Write(slot)
+    return
+}
+
+// An error on the connection (not the protocol's own): every stream fails with it.
+fun HttpAsyncClient.h2Fail(slot: int, error: string): void {
+    this.connectionH2[slot].broken(error)
+    this.h2Events(slot, false)
+    this.closeConnection(slot)
+    return
+}
+
+// A connection of the origin that can take a request now, or -1. One idle for a while is probed with a PING first and used when it answers.
+fun HttpAsyncClient.h2Open(key: string, now: int): int {
+    for (slot in 0 until this.connectionStates.size) {
+        if (this.connectionStates[slot] == httpAsyncConnectionH2 && this.connectionKeys[slot] == key && this.connectionH2[slot].hasRoom()) {
+            if (this.connectionH2[slot].pingOutstanding()) continue
+            if (this.connectionH2[slot].openStreams() == 0 && now - this.connectionActivity[slot] >= this.options.http2PingAfterIdleMilliseconds) {
+                this.connectionH2[slot].ping(now)
+                this.h2Pump(slot)
+                continue
+            }
+            return slot
+        }
+    }
+    -1
+}
+
+// True when a live HTTP/2 connection of the origin has room for a stream (even if it is being probed with a PING first): no new connection is opened then.
+fun HttpAsyncClient.h2Roomy(key: string): bool {
+    for (slot in 0 until this.connectionStates.size) {
+        if (this.connectionStates[slot] == httpAsyncConnectionH2 && this.connectionKeys[slot] == key && this.connectionH2[slot].hasRoom()) return true
+    }
+    false
+}
+
+// Connections of the origin that are still on their way (resolving, connecting or handshaking).
+fun HttpAsyncClient.connectionsComing(key: string): int {
+    var count = 0
+    for (slot in 0 until this.connectionStates.size) {
+        val state = this.connectionStates[slot]
+        if (state != 0 && state < httpAsyncConnectionWriting && this.connectionKeys[slot] == key) count = count + 1
+    }
+    count
+}
+
+fun HttpAsyncClient.openConnectionFor(request: int): void {
+    this.requestStates[request] = httpAsyncRequestActive
+    val slot = this.allocateConnection(request)
+    this.connectionRequests[slot] = request
+    val address = this.cachedAddress(this.requestHosts[request])
+    if (address != "") this.startConnect(slot, address)
+    else this.startResolve(slot)
     return
 }
 
@@ -854,6 +1194,21 @@ fun HttpAsyncClient.pumpEvents(): void {
     while (request < this.requestStates.size) {
         if (this.requestStates[request] == httpAsyncRequestQueued) {
             val key = this.requestKeys[request]
+            val protocol = this.originProtocol(key, this.requestSecure[request])
+            if (protocol == httpAsyncOriginH2) {
+                // One connection carries many requests: a stream on a connection with room, else a new connection only when none is on its way.
+                val open = this.h2Open(key, linuxMonotonicMilliseconds())
+                if (open >= 0 && this.h2Attach(open, request)) this.h2Pump(open)
+                else if (open < 0 && !this.h2Roomy(key) && this.connectionsComing(key) == 0 && this.connectionsFor(key) < this.options.maximumConnectionsPerHost) this.openConnectionFor(request)
+                request = request + 1
+                continue
+            }
+            if (protocol == httpAsyncOriginUnknown) {
+                // The first connection finds out: nothing else is opened for the origin until its handshake is done.
+                if (this.connectionsFor(key) == 0) this.openConnectionFor(request)
+                request = request + 1
+                continue
+            }
             val idle = this.idleConnection(key)
             if (idle >= 0) {
                 this.requestStates[request] = httpAsyncRequestActive
@@ -876,7 +1231,14 @@ fun HttpAsyncClient.pumpEvents(): void {
 fun HttpAsyncClient.sweep(now: int): void {
     var request = 0
     while (request < this.requestStates.size) {
-        if (this.requestStates[request] != 0 && now >= this.requestDeadlines[request]) {
+        if (this.requestStates[request] != 0 && now >= this.requestDeadlines[request] && this.requestSlots[request] >= 0 &&
+            this.connectionStates[this.requestSlots[request]] == httpAsyncConnectionH2) {
+            // An HTTP/2 request times out alone: its stream is cancelled and the connection stays.
+            val carrier = this.requestSlots[request]
+            this.connectionH2[carrier].cancel(this.requestStreams[request])
+            this.complete(request, 0, [], "", "timeout")
+            this.h2Pump(carrier)
+        } else if (this.requestStates[request] != 0 && now >= this.requestDeadlines[request]) {
             var owner = -1
             var slot = 0
             while (owner < 0 && slot < this.connectionStates.size) {
@@ -904,6 +1266,16 @@ fun HttpAsyncClient.sweep(now: int): void {
         } else if (state == httpAsyncConnectionIdle &&
             now - this.connectionIdleSince[slot] >= this.options.idleTimeoutMilliseconds) {
             this.closeConnection(slot)
+        } else if (state == httpAsyncConnectionH2) {
+            // Timers of the HTTP/2 connection (our SETTINGS acknowledged, a PING answered), then idleness: GOAWAY(NO_ERROR) and close.
+            this.connectionH2[slot].tick(now)
+            this.h2Pump(slot)
+            if (this.connectionStates[slot] == httpAsyncConnectionH2 && this.connectionH2[slot].openStreams() == 0 &&
+                now - this.connectionIdleSince[slot] >= this.options.idleTimeoutMilliseconds) {
+                this.connectionH2[slot].shutdown()
+                this.h2Pump(slot)
+                if (this.connectionStates[slot] != 0) this.closeConnection(slot)
+            }
         }
         slot = slot + 1
     }
@@ -937,6 +1309,16 @@ fun HttpAsyncClient.request(
         this.requestDeadlines.append(0)
         this.requestStarted.append(0)
         this.requestRetried.append(false)
+        this.requestMethods.append("")
+        this.requestTargets.append("")
+        this.requestAuthorities.append("")
+        this.requestHeaderLists.append([])
+        this.requestBodies.append("")
+        this.requestSlots.append(-1)
+        this.requestStreams.append(-1)
+        this.requestStatuses.append(-1)
+        this.requestResponseHeaders.append([])
+        this.requestChunks.append([])
     }
     val now = linuxMonotonicMilliseconds()
     this.requestIds[slot] = id
@@ -950,6 +1332,16 @@ fun HttpAsyncClient.request(
     this.requestDeadlines[slot] = now + timeoutMilliseconds
     this.requestStarted[slot] = now
     this.requestRetried[slot] = false
+    this.requestMethods[slot] = method
+    this.requestTargets[slot] = target.path
+    this.requestAuthorities[slot] = httpAsyncAuthority(target)
+    this.requestHeaderLists[slot] = headers
+    this.requestBodies[slot] = body
+    this.requestSlots[slot] = -1
+    this.requestStreams[slot] = -1
+    this.requestStatuses[slot] = -1
+    this.requestResponseHeaders[slot] = []
+    this.requestChunks[slot] = []
     this.activeRequests = this.activeRequests + 1
     if (!target.valid) this.complete(slot, 0, [], "", "invalid URL")
     else this.pumpEvents()

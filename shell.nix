@@ -39,6 +39,8 @@ pkgs.mkShell {
     binaryen
     nodejs
     openssl
+    # tools/test-http2.sh: nghttpd and h2load, the HTTP/2 server and load generator.
+    nghttp2
     # tests/cases/rsa-keygen/check.sh: independent arithmetic on a generated key.
     bc
     # prlimit, for tools/run-limited.sh: an image may have none of its own.

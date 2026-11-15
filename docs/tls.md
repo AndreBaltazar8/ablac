@@ -82,6 +82,8 @@ server whose `alpn` is `[]` accepts any client. A server that shares one certifi
 must set `alpn` to the protocols it speaks: then a client that offers protocols and none of them match is refused with
 `no_application_protocol`, (a client that offers no ALPN at all is still accepted:
 require ALPN in the application if that matters). A client that sends ALPN refuses a server's answer that it did not offer.
+A session client offers protocols with `tlsSessionClient(descriptor, host, mode, caPath, sessions, alpn)` (for example `["h2", "http/1.1"]`; `abla/http/async` does this for
+`HttpAsyncOptions.http2`) and reads the server's choice with `TlsSession.alpn()` once the handshake is done ("" if none).
 
 ## Key exchange groups and the hybrid X25519MLKEM768
 

@@ -391,6 +391,35 @@ http.step(0)
 val replies = http.takeCompletions()
 ```
 
+#### HTTP/2
+
+`HttpAsyncOptions(http2 = true)` offers `h2` and `http/1.1` by ALPN on every `https://` connection; when the server picks `h2` the connection speaks HTTP/2
+(RFC 9113, HPACK RFC 7541, in `abla/http/h2`: the sans-IO `H2Client` and the HPACK codec), otherwise HTTP/1.1 exactly as before. Callers change nothing else:
+`request`, `get`, `postJson`, `step` and `takeCompletions` are the same, and `HttpAsyncCompletion.protocol` says which protocol answered (`"h2"` or `"http/1.1"`).
+`http2` is **off by default for one release** so that callers opt in; the default is revisited after that.
+
+What changes with HTTP/2:
+
+- Many requests to one origin share one connection (multiplexed streams): `maximumConnectionsPerHost` then only bounds the extra connections opened when a connection's
+  stream limit is reached (`maximumStreamsPerConnection`, 100, and the server's `SETTINGS_MAX_CONCURRENT_STREAMS`, whichever is smaller). While an origin's protocol is not
+  yet known (its first handshake is not done) only one connection is opened to it; the answer is remembered for `dnsCacheSeconds`.
+- A deadline is per request: on expiry the stream is cancelled (`RST_STREAM(CANCEL)`) and the request completes with `"timeout"`; the connection and the other requests are
+  untouched. A connection with no open streams for `idleTimeoutMilliseconds` is closed with `GOAWAY(NO_ERROR)`; one idle for `http2PingAfterIdleMilliseconds` is probed with a
+  PING before a request uses it (no answer in five seconds: the connection is dropped and the request goes to a new one). A request the server did not process (`REFUSED_STREAM`,
+  or beyond a `GOAWAY`'s last stream) is retried once on another connection.
+- **Response header names are lower case** (HTTP/2 requires it; HTTP/1.1 keeps the server's case): `HttpAsyncCompletion.header(name)` compares names case-insensitively
+  either way. **Trailers are dropped** (they are decoded to keep the HPACK table in step, and counted against the header limits): `HttpAsyncCompletion.trailers()` exists and is
+  empty, so a caller can see that none are kept. Responses are fully buffered (`maximumResponseBytes`), no push (`SETTINGS_ENABLE_PUSH = 0`), no priorities.
+- Requests go out with `:method`, `:scheme`, `:authority` (host, with the port when it is not the scheme's), `:path`, then the caller's headers lower-cased minus `host`, `connection`,
+  `keep-alive`, `proxy-connection`, `transfer-encoding` and `upgrade` (`te` only as `trailers`), and `content-length` for a body. `http2NeverIndex` names headers that HPACK never
+  puts in its dynamic table (always so for `authorization`, `proxy-authorization`, `cookie` and `set-cookie`), against CRIME/BREACH-style leaks.
+- `http2PriorKnowledge = true` speaks h2c (HTTP/2 over plain TCP, no upgrade) to every `http://` origin of the client; there is no `Upgrade: h2c`.
+- Limits a peer cannot talk us out of (`abla/http/h2`): a frame over 16384 bytes, a header block over 128 KiB or over 32 CONTINUATION frames, a decoded header list over
+  `maximumHeaderListBytes` (64 KiB), a field over 16 KiB or more than 256 fields, more than 100 acknowledgements owed, 1000 frames in a row that carry nothing, 10,000 control frames in a
+  second (Rapid Reset, PING/SETTINGS floods), and a window overrun end the connection with the error code of RFC 9113 (`ENHANCE_YOUR_CALM` for the floods and the size limits); every request on
+  it completes with an error that names the code. `tools/test-http2.sh` runs the tests and the interop (nghttpd, `h2load`, `openssl s_server`); `tools/test-http2-fuzz.sh` fuzzes the HPACK
+  decoder and the `H2Client` from a seed.
+
 ### JSON Web Tokens
 
 `abla/jwt` verifies compact JWS tokens signed with RS256 or ES256 against a
@@ -684,7 +713,7 @@ silently acquires hosted dependencies; cross-platform programs select
 `abla/net/hosted`. The bounded DNS client currently implements UDP A/AAAA with
 compression pointers, but not DNSSEC, TCP fallback, IDNA, or a shared cache.
 TLS is hosted and OpenSSL-backed rather than part of the raw syscall target.
-HTTP/2, HTTP/3/QUIC, proxy negotiation, and automatic reconnection remain
+HTTP/2 is an opt-in client feature of `abla/http/async` (above), with no server side; HTTP/3/QUIC, proxy negotiation, and automatic reconnection remain
 separate protocols rather than implicit behavior in the HTTP/1.1 APIs.
 
 ## Tests and benchmark
