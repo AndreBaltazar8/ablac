@@ -1443,6 +1443,65 @@ fun bootstrapLlvmEmitExportInitializer(
     if (false) LLVMDisposeMessage(nativeNullPointer())
 }
 
+// An arm64 Android library is entered from threads it did not start (JNI: any thread of the app, at any time), and its
+// runtime keeps one heap, one collector and the globals' lazy initialization without locks until it starts a thread of
+// its own (#811). Every exported function therefore runs under one recursive process-wide mutex (bionic's
+// pthread_mutex_lock on a static recursive mutex): the thunk takes the symbol, the original body is renamed. Calls
+// from one thread nest; a call that waits for another thread's call into the library from inside an export would
+// deadlock, as with any big lock. Threads the library starts run beside the holder, as they do beside a program's main.
+fun bootstrapLlvmLockAndroidExports(
+    backend: BootstrapLlvmBackend,
+    names: array<string>
+): void {
+    if (names.size == 0) return
+    val mutexType = LLVMArrayType2(backend.i32Type, 10)
+    val words = llvmPointerVector(10)
+    var word = 0
+    while (word < 10) {
+        words.set(word, LLVMConstInt(backend.i32Type, if (word == 0) 16384 else 0, 0))
+        word = word + 1
+    }
+    val mutex = LLVMAddGlobal(backend.module, mutexType, "abla.export.mutex")
+    LLVMSetInitializer(mutex, LLVMConstArray2(backend.i32Type, words.pointer(), 10))
+    LLVMSetLinkage(mutex, llvmInternalLinkage())
+    words.drop()
+    val lock = bootstrapLlvmDeclare(
+        backend, "pthread_mutex_lock", backend.i32Type, [backend.pointerType], false, [false]
+    )
+    val unlock = bootstrapLlvmDeclare(
+        backend, "pthread_mutex_unlock", backend.i32Type, [backend.pointerType], false, [false]
+    )
+    val lockType = LLVMGlobalGetValueType(lock)
+    val unlockType = LLVMGlobalGetValueType(unlock)
+    for (name in names) {
+        val inner = LLVMGetNamedFunction(backend.module, name)
+        if (pointerIsNull(inner)) continue
+        val type = LLVMGlobalGetValueType(inner)
+        val innerName = "$name.unlocked"
+        LLVMSetValueName2(inner, innerName, innerName.size)
+        LLVMSetLinkage(inner, llvmInternalLinkage())
+        val outer = LLVMAddFunction(backend.module, name, type)
+        LLVMPositionBuilderAtEnd(
+            backend.builder, LLVMAppendBasicBlockInContext(backend.context, outer, "entry")
+        )
+        bootstrapLlvmCallTyped(backend, lockType, lock, [mutex], "")
+        val arguments: array<i64*> = []
+        val count = LLVMCountParams(outer)
+        var parameter = 0
+        while (parameter < count) {
+            arguments.append(LLVMGetParam(outer, i32(parameter)))
+            parameter = parameter + 1
+        }
+        val returnsVoid = LLVMGetTypeKind(LLVMGetReturnType(type)) == 0
+        val result = bootstrapLlvmCallTyped(
+            backend, type, inner, arguments, if (returnsVoid) "" else "export.locked"
+        )
+        bootstrapLlvmCallTyped(backend, unlockType, unlock, [mutex], "")
+        if (returnsVoid) LLVMBuildRetVoid(backend.builder) else LLVMBuildRet(backend.builder, result)
+    }
+    return
+}
+
 fun bootstrapLlvmEmitExports(
     backend: BootstrapLlvmBackend,
     program: BootstrapIrProgram,
@@ -1455,6 +1514,8 @@ fun bootstrapLlvmEmitExports(
 ): int {
     var errors = 0
     val retained: array<i64*> = []
+    val lockedExports: array<string> = []
+    val lockExports = bootstrapLlvmAndroidArm64Library(backend)
     var retainedData = 0
     while (retainedData < retainedLinkedData.size) {
         if (!pointerIsNull(retainedLinkedData[retainedData])) {
@@ -1505,7 +1566,7 @@ fun bootstrapLlvmEmitExports(
                 }
                 previous = previous + 1
             }
-            val directAlias = bootstrapLlvmExportCanAliasDirect(
+            val directAlias = !lockExports && bootstrapLlvmExportCanAliasDirect(
                 request,
                 program.functions[source],
                 source < initializationRequired.size &&
@@ -1611,7 +1672,7 @@ fun bootstrapLlvmEmitExports(
                 if (request.internal) {
                     LLVMSetLinkage(function, llvmInternalLinkage())
                     retained.append(function)
-                }
+                } else if (lockExports && nakedAssembly < 0) lockedExports.append(request.name)
                 if (request.name == "xt_unhandled_interrupt" &&
                     bootstrapTextContains(backend.targetTriple, "xtensa")) {
                     LLVMSetSection(function, ".iram1.text")
@@ -1751,6 +1812,7 @@ fun bootstrapLlvmEmitExports(
         }
         index = index + 1
     }
+    if (lockExports) bootstrapLlvmLockAndroidExports(backend, lockedExports)
     if (retained.size > 0) {
         val values = llvmPointerVector(retained.size)
         var retainedIndex = 0

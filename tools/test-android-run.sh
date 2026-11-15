@@ -51,4 +51,35 @@ if [[ $status -ne 0 ]]; then
     fail "the driver failed ($status)"
 fi
 grep -q '^abla_run_random ' "$out/run.out" && grep -qx 'abla_run_heap 465' "$out/run.out" && grep -qx 'abla_run_thread 142' "$out/run.out" && grep -qx 'abla_run_threads_heap 1860' "$out/run.out" || { cat "$out/run.out" >&2; fail 'unexpected output'; }
-echo 'android run: the arm64 Android library loads in bionic'"'"'s linker and its exports run under qemu-aarch64'
+# Threads the library did not start (JNI-style) call one export at the same time, under the collector's stress mode
+# (a collection at every safe point) and without: the library's exports run under one lock, so the heap, the lazy
+# initialization of the globals and the collector never see two callers. Without the lock this crashes.
+for stress in 0 1; do
+    count=8
+    [[ $stress -eq 0 ]] || count=4
+    status=0
+    ABLA_GC_STRESS=$stress LD_LIBRARY_PATH="$bionic/system/lib64/bootstrap:$bionic/system/lib64" timeout 600 qemu-aarch64 \
+        "$bionic/system/bin/bootstrap/linker64" "$PWD/$out/driver" "$library" -t "$count" abla_run_churn 1 \
+        > "$out/threads-$stress.out" 2> "$out/threads-$stress.err" < /dev/null || status=$?
+    if [[ $status -ne 0 ]]; then
+        cat "$out/threads-$stress.out" >&2
+        grep -v 'linkerconfig' "$out/threads-$stress.err" >&2 || true
+        fail "calls from $count foreign threads (GC stress $stress) failed ($status)"
+    fi
+done
+# A panic in a debug build: the message, the stack header and the load address on standard error, then the process ends
+# with status 101 (qemu-user has no process_vm_readv, so the frames themselves show on hardware only).
+ABLA_DEBUG=1 "$compiler" build tests/cases/android-run/build-debug.ab -o "$out/build-debug" --fast --no-cache > "$out/build-debug.log" 2>&1 \
+    || { cat "$out/build-debug.log" >&2; fail 'the debug build program did not build'; }
+status=0
+ABLA_DEBUG=1 "$out/build-debug" > "$out/generate-debug.log" 2>&1 || status=$?
+[[ $status -eq 37 ]] || { cat "$out/generate-debug.log" >&2; fail "building the debug library failed ($status)"; }
+debug_library=$PWD/$out/lib-debug/src/main/jniLibs/arm64-v8a/libabla_app.so
+status=0
+LD_LIBRARY_PATH="$bionic/system/lib64/bootstrap:$bionic/system/lib64" timeout 300 qemu-aarch64 \
+    "$bionic/system/bin/bootstrap/linker64" "$PWD/$out/driver" "$debug_library" abla_run_panic 0 \
+    > "$out/panic.out" 2> "$out/panic.err" < /dev/null || status=$?
+[[ $status -eq 101 ]] && grep -qx 'panic: index 5 out of bounds for array of size 1' "$out/panic.err" &&
+    grep -q '^stack (return addresses' "$out/panic.err" && grep -q '^load address 0x' "$out/panic.err" ||
+    { grep -v 'linkerconfig' "$out/panic.err" >&2; fail "the panic report: status $status"; }
+echo 'android run: the arm64 Android library loads in bionic'"'"'s linker and its exports run under qemu-aarch64, also from concurrent foreign threads, and a debug panic reports'
