@@ -13,7 +13,7 @@ rm -f "$out/timeout-child.pid" "$out/overflow-child.pid" "$out/spawned"
     -o "$out/fd-host" --fast --no-cache > "$out/fd-host.log" 2>&1
 (exec 0<&- 1>&- 2>&-; "$out/fd-host")
 
-for tier in interp jit; do
+for tier in interp jit bridge; do
     ABLA_COMPILE_EVAL=$tier "$compiler" build tests/cases/compiler-capture-process/main.ab \
         -o "$out/main-$tier" --fast --no-cache > "$out/$tier.log" 2>&1
     status=0
