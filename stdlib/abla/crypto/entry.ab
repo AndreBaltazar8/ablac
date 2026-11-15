@@ -472,6 +472,68 @@ private @inline trusted fun sha512CoreBlocks(state: int, input: int, blocks: int
 }
 // END SHA2 SECRET CORES
 
+
+// ---- Secrets held in strings ----
+// A string is immutable memory shared freely: `slice` is a view of its parent (the same bytes, no copy), `+` of strings
+// beyond 64 bytes in all is a rope that reads its parts until it is first read flat, an interpolation, padStart, replace
+// and trim may be either, and a literal may be read-only. So wiping a string in place has two ways to go wrong. It zeroes
+// every view and unflattened rope made from it that is still in use (the hybrid TLS key share was made of a decapsulation key's slice and then
+// the key was wiped), and it leaves behind what it does not cover: the part of a larger buffer a slice did not take (the
+// unused bytes of an HKDF block), and the copies a concatenation made. The rule: only a string whose buffer the code made for the purpose
+// is wiped (cryptoOwnedCopy, an adoptString of its own buffer), exactly sized, and only once nothing reads it again; what
+// is made of a secret and outlives its wiping is copied first; and what a function returns of a secret is an exact owned copy, not a
+// slice. Strings the code was given are not its to wipe.
+
+/** A copy of `value` in a buffer of its own, exactly its size: cryptoWipeString may clear it without touching `value` or anything made from `value`. */
+trusted fun cryptoOwnedCopy(value: string): string {
+    if (value.size == 0) return ""
+    val buffer = nativeByteBuffer(value.size + 1)
+    val from = ablaUnsafeStringAddress(value)
+    for (i in 0 until value.size) ablaUnsafeStoreU8(buffer.pointerAt(i), ablaUnsafeLoadU8(nativePointerFromAddress(from + i)))
+    ablaUnsafeStoreU8(buffer.pointerAt(value.size), 0)
+    buffer.adoptString(value.size)
+}
+
+/** The first `length` bytes of the concatenation of `parts`, in a buffer of its own (exactly `length` bytes; no rope, no slice): what an
+ *  HKDF or PRF output is made into, so that the blocks it came from can be wiped and the output wiped on its own. */
+trusted fun cryptoOwnedJoin(parts: array<string>, length: int): string {
+    if (length <= 0) return ""
+    val buffer = nativeByteBuffer(length + 1)
+    var at = 0
+    for (part in parts) {
+        val from = ablaUnsafeStringAddress(part)
+        var i = 0
+        while (i < part.size && at < length) {
+            ablaUnsafeStoreU8(buffer.pointerAt(at), ablaUnsafeLoadU8(nativePointerFromAddress(from + i)))
+            at = at + 1
+            i = i + 1
+        }
+    }
+    while (at < length) {
+        ablaUnsafeStoreU8(buffer.pointerAt(at), 0)
+        at = at + 1
+    }
+    ablaUnsafeStoreU8(buffer.pointerAt(length), 0)
+    buffer.adoptString(length)
+}
+
+/** Overwrites the bytes of `secret` with zeros (volatile stores, which the optimizer keeps). See the rule above: `secret` must be
+ *  a string whose buffer this code made, and not read again. */
+trusted fun cryptoWipeString(secret: string): void {
+    if (secret.size == 0) return
+    val address = ablaUnsafeStringAddress(secret)
+    for (i in 0 until secret.size) ablaUnsafeVolatileStoreU8(address + i, 0)
+    return
+}
+
+/** Whether `value` ends where its buffer ends (the byte after it is the zero every string's buffer has there): false for a slice
+ *  of something longer, so a function that returns a secret can be tested to return an owned copy and not a view of a bigger
+ *  secret. A slice that ends at its parent's end is not told apart, and a slice followed by a zero byte is told apart one time in
+ *  256: a test runs it on many values. */
+trusted fun cryptoStringEndsItsBuffer(value: string): bool {
+    if (value.size == 0) return true
+    ablaUnsafeLoadU8(nativePointerFromAddress(ablaUnsafeStringAddress(value) + value.size)) == 0
+}
 // The cores' scratch is wiped before it is freed (it held a key's state and schedule).
 private trusted fun cryptoWipe(address: int, size: int): void {
     for (i in 0 until size) ablaUnsafeVolatileStoreU8(address + i, 0)

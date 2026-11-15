@@ -1,0 +1,131 @@
+// Wiping a string that shares its bytes (#wipe-aliasing): what a function returns of a secret must be a buffer of its own, exactly sized,
+// so that wiping it neither zeroes anything else that is in use nor leaves the rest of a bigger buffer behind.
+//  - The runtime facts the rule in abla/crypto (cryptoOwnedCopy) rests on: a slice is a view, a concatenation beyond 64 bytes is a rope
+//    that reads its parts, so wiping the parent zeroes both (if this stops being so, the rule's comment is to be revisited).
+//  - cryptoOwnedCopy, cryptoOwnedJoin and cryptoWipeString.
+//  - Each function that returns a secret of its own making: hkdfExpand and tls13ExpandLabel (the traffic keys and IVs, 12 or 16 bytes of a
+//    32-byte block), the TLS 1.2 PRF and the key block's four parts: the result ends its buffer (not a prefix slice of a block), a hundred
+//    different inputs; wiping one result does not change another; and the values are still the right ones (computed twice).
+// Prints "crypto-pure wipe-views ok".
+import "abla/crypto"
+import "abla/crypto/hkdf"
+import "abla/io"
+import "abla/text"
+import "abla/tls/pure/handshake"
+import "abla/tls/pure/keysched"
+import "abla/tls/pure/tls12"
+import "abla/unsafe/memory/raw"
+
+var failures = 0
+
+fun expect(ok: bool, what: string): void {
+    if (!ok) {
+        failures = failures + 1
+        println("FAIL $what")
+    }
+    return
+}
+
+fun filled(size: int, seed: int): string {
+    val bytes: array<int> = []
+    for (i in 0 until size) bytes.append(1 + (i * 7 + seed * 13) % 250)
+    cryptoByteString(bytes)
+}
+
+fun allZero(value: string): bool {
+    for (byte in value) {
+        if (byte != 0) return false
+    }
+    true
+}
+
+/** The fraction of 100 inputs for which `make` returns a string that ends its buffer: all of them for an owned copy, none for a prefix slice. */
+fun endsBuffer(make: (int) -> string): int {
+    var count = 0
+    for (seed in 0 until 100) {
+        if (cryptoStringEndsItsBuffer(make(seed))) count = count + 1
+    }
+    count
+}
+
+fun facts(): void {
+    val parent = cryptoOwnedCopy(filled(100, 1))
+    val view = parent.slice(10, 40)
+    val rope = parent + parent.slice(0, 30)
+    cryptoWipeString(parent)
+    expect(allZero(view), "a slice is a view: wiping its parent zeroes it")
+    expect(allZero(rope.slice(0, 20)), "a concatenation beyond 64 bytes reads its parts until it is flat")
+    val owned = filled(100, 2)
+    val copy = cryptoOwnedCopy(owned)
+    cryptoWipeString(copy)
+    expect(allZero(copy) && !allZero(owned) && owned == filled(100, 2), "wiping an owned copy leaves the original")
+    val parts = [filled(20, 3), filled(20, 4)]
+    val joined = cryptoOwnedJoin(parts, 30)
+    expect(joined == filled(20, 3) + filled(20, 4).slice(0, 10) && joined.size == 30, "cryptoOwnedJoin: the first 30 bytes of two parts")
+    cryptoWipeString(parts[0])
+    expect(joined == filled(20, 3) + filled(20, 4).slice(0, 10), "the join does not read its parts after it is made")
+    expect(endsBuffer({ seed: int -> cryptoOwnedCopy(filled(32, seed)) }) == 100, "an owned copy ends its buffer")
+    expect(endsBuffer({ seed: int -> cryptoOwnedJoin([filled(32, seed)], 16) }) == 100, "a join ends its buffer")
+    expect(endsBuffer({ seed: int -> filled(64, seed).slice(0, 16) }) < 5, "a prefix slice does not end its buffer (the test's own control)")
+    return
+}
+
+fun hkdfOutputs(): void {
+    // 12 and 16 bytes of a 32-byte block (the IV and the AES-128 key), 32 of 48 (SHA-384), and a long one.
+    expect(endsBuffer({ seed: int -> hkdfExpand(HKDF_SHA256, filled(32, seed), "info", 16).bytes }) == 100, "hkdfExpand (16 bytes) ends its buffer")
+    expect(endsBuffer({ seed: int -> hkdfExpand(HKDF_SHA256, filled(32, seed), "info", 12).bytes }) == 100, "hkdfExpand (12 bytes) ends its buffer")
+    expect(endsBuffer({ seed: int -> hkdfExpand(HKDF_SHA384, filled(48, seed), "info", 32).bytes }) == 100, "hkdfExpand (32 of 48 bytes) ends its buffer")
+    expect(endsBuffer({ seed: int -> hkdfExpand(HKDF_SHA256, filled(32, seed), "info", 70).bytes }) == 100, "hkdfExpand (70 bytes, three blocks) ends its buffer")
+    expect(endsBuffer({ seed: int -> tlsTrafficKey(HKDF_SHA256, filled(32, seed), 16) }) == 100, "tlsTrafficKey ends its buffer")
+    expect(endsBuffer({ seed: int -> tlsTrafficIv(HKDF_SHA256, filled(32, seed)) }) == 100, "tlsTrafficIv ends its buffer")
+    expect(endsBuffer({ seed: int -> tlsDeriveSecret(HKDF_SHA384, filled(48, seed), "c hs traffic", filled(48, 9)) }) == 100, "tlsDeriveSecret ends its buffer")
+    // Wiping a result touches nothing else: two keys of one secret, one wiped.
+    val secret = filled(32, 5)
+    val first = tlsTrafficKey(HKDF_SHA256, secret, 16)
+    val second = tlsTrafficKey(HKDF_SHA256, secret, 16)
+    val iv = tlsTrafficIv(HKDF_SHA256, secret)
+    val ivAgain = tlsTrafficIv(HKDF_SHA256, secret)
+    tlsWipe(first)
+    expect(allZero(first) && second == tlsTrafficKey(HKDF_SHA256, secret, 16) && iv == ivAgain && !allZero(iv), "wiping a traffic key leaves the others")
+    expect(hkdfExpand(HKDF_SHA256, secret, "x", 0).ok && hkdfExpand(HKDF_SHA256, secret, "x", 0).bytes == "", "zero bytes")
+    return
+}
+
+fun tls12Outputs(): void {
+    expect(endsBuffer({ seed: int -> tls12Prf(HKDF_SHA256, filled(32, seed), "key expansion", filled(64, 1), 40) }) == 100, "tls12Prf (40 bytes) ends its buffer")
+    expect(endsBuffer({ seed: int -> tls12MasterSecret(HKDF_SHA256, filled(32, seed), filled(32, 1)) }) == 100, "the master secret ends its buffer")
+    expect(endsBuffer({ seed: int -> tls12Prf(HKDF_SHA384, filled(48, seed), "key expansion", filled(64, 1), 72) }) == 100, "tls12Prf (SHA-384) ends its buffer")
+    val suite = tls12Suite(TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256)
+    if (suite == null) {
+        expect(false, "the TLS 1.2 suite")
+        return
+    }
+    for (part in 0 until 4) {
+        expect(endsBuffer({ seed: int ->
+            val keys = tls12DeriveKeys(suite, filled(48, seed), filled(32, 1), filled(32, 2))
+            if (part == 0) keys.clientKey else if (part == 1) keys.serverKey else if (part == 2) keys.clientIv else keys.serverIv
+        }) == 100, "key block part $part ends its buffer")
+    }
+    // Wiping the client's keys leaves the server's (the four are separate buffers).
+    val master = filled(48, 7)
+    val keys = tls12DeriveKeys(suite, master, filled(32, 1), filled(32, 2))
+    val again = tls12DeriveKeys(suite, master, filled(32, 1), filled(32, 2))
+    // The parts are the right bytes of the key block (computed apart), none of them zero (a view of a wiped block would be).
+    val block = tls12Prf(suite.hash, master, "key expansion", filled(32, 1) + filled(32, 2), 40)
+    expect(again.clientKey == block.slice(0, 16) && again.serverKey == block.slice(16, 32) && again.clientIv == block.slice(32, 36) && again.serverIv == block.slice(36, 40), "the key block parts are the PRF output")
+    expect(!allZero(again.clientIv) && !allZero(again.serverIv) && !allZero(again.clientKey), "no part is zero")
+    tlsWipe(keys.clientKey)
+    tlsWipe(keys.clientIv)
+    expect(allZero(keys.clientKey) && keys.serverKey == again.serverKey && keys.serverIv == again.serverIv && !allZero(keys.serverKey), "wiping the client's key block parts leaves the server's")
+    expect(again.clientKey.size == 16 && again.serverKey.size == 16 && again.clientIv.size == 4 && again.serverIv.size == 4, "the sizes of the parts")
+    return
+}
+
+fun main: int {
+    facts()
+    hkdfOutputs()
+    tls12Outputs()
+    if (failures > 0) return 1
+    println("crypto-pure wipe-views ok")
+    0
+}

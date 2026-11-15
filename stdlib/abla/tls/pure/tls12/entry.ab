@@ -56,13 +56,22 @@ private fun tls12Hmac(hash: int, key: string, message: string): string =
 /** PRF(secret, label, seed) = P_hash(secret, label + seed), `length` bytes. */
 fun tls12Prf(hash: int, secret: string, label: string, seed: string, length: int): string {
     val labeled = label + seed
-    var output = ""
+    val parts: array<string> = []
+    val chain: array<string> = []
+    var total = 0
     var a = labeled
-    while (output.size < length) {
+    while (total < length) {
         a = tls12Hmac(hash, secret, a)
-        output = output + tls12Hmac(hash, secret, a + labeled)
+        chain.append(a)
+        val part = tls12Hmac(hash, secret, a + labeled)
+        parts.append(part)
+        total = total + part.size
     }
-    output.slice(0, length)
+    // The output is a buffer of its own, exactly sized; the blocks and the A(i) values it came from are wiped.
+    val output = cryptoOwnedJoin(parts, length)
+    for (part in parts) cryptoWipeString(part)
+    for (value in chain) cryptoWipeString(value)
+    output
 }
 
 /** The extended master secret (RFC 7627): PRF(premaster, "extended master secret", session hash), 48 bytes, where the
@@ -76,14 +85,17 @@ class Tls12Keys(val clientKey: string, val serverKey: string, val clientIv: stri
 fun tls12DeriveKeys(suite: Tls12Suite, master: string, serverRandom: string, clientRandom: string): Tls12Keys {
     val size = 2 * suite.keyLength + 2 * suite.ivLength
     val block = tls12Prf(suite.hash, master, "key expansion", serverRandom + clientRandom, size)
+    // Four buffers of their own (not slices of the block: wiping one would zero or miss its neighbours), then the block is wiped.
     var at = 0
-    val clientKey = block.slice(at, at + suite.keyLength)
+    val clientKey = cryptoOwnedCopy(block.slice(at, at + suite.keyLength))
     at = at + suite.keyLength
-    val serverKey = block.slice(at, at + suite.keyLength)
+    val serverKey = cryptoOwnedCopy(block.slice(at, at + suite.keyLength))
     at = at + suite.keyLength
-    val clientIv = block.slice(at, at + suite.ivLength)
+    val clientIv = cryptoOwnedCopy(block.slice(at, at + suite.ivLength))
     at = at + suite.ivLength
-    Tls12Keys(clientKey, serverKey, clientIv, block.slice(at, at + suite.ivLength))
+    val serverIv = cryptoOwnedCopy(block.slice(at, at + suite.ivLength))
+    cryptoWipeString(block)
+    Tls12Keys(clientKey, serverKey, clientIv, serverIv)
 }
 
 /** verify_data of a Finished: the first 12 bytes of PRF(master, label, hash of the handshake messages), with the

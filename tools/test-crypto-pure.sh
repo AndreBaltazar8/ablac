@@ -27,7 +27,7 @@ random_hex() { head -c "$1" /dev/urandom | od -An -vtx1 | tr -d ' \n'; }
 
 # (At once: each writes only its own files.)
 pids=()
-programs=(vectors edge tool against-hosted both kat-native wycheproof-tls signatures sha3 mlkem p384)
+programs=(vectors edge tool against-hosted both kat-native wycheproof-tls signatures sha3 mlkem p384 wipe-views)
 for program in "${programs[@]}"; do
     "$compiler" build "$cases/$program.ab" -o "$out/$program" --no-cache \
         > "$out/$program.build.log" 2>&1 &
@@ -119,6 +119,14 @@ if "$out/p384" "${p384_args[@]}" > "$out/p384.log" 2>&1 && grep -q '^crypto-pure
     echo "ok   p-384: scalar 1 and 2, refusals, ${#p384_expected[@]} outputs agree with openssl"
 else
     fail p384; tail -20 "$out/p384.log"; printf '%s\n' "${p384_expected[@]}" | head -4
+fi
+
+# Wiping strings that share bytes: what hkdfExpand, the TLS 1.3 key derivations and the TLS 1.2 PRF and key block return is a buffer
+# of its own, exactly sized (not a slice of a block), so a wipe neither zeroes another value nor leaves a bigger buffer's rest behind.
+if "$out/wipe-views" > "$out/wipe-views.log" 2>&1 && grep -q '^crypto-pure wipe-views ok$' "$out/wipe-views.log"; then
+    echo "ok   wipe-views: secrets returned as buffers of their own"
+else
+    fail wipe-views; tail -20 "$out/wipe-views.log"
 fi
 
 # --- Keys, refusals ------------------------------------------------------------------------
