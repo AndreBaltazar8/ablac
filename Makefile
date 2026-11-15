@@ -361,6 +361,7 @@ test-serial: ablac
 	tools/test-crypto-hosted-keygen.sh $(COMPILER)
 	tools/test-crypto-encrypted-rsa.sh $(COMPILER)
 	tools/test-pbe-key-residue.sh $(COMPILER)
+	tools/test-pbe-native-residue.sh $(COMPILER)
 	tools/test-crypto-legacy.sh $(COMPILER)
 	tools/test-rsa-export.sh $(COMPILER)
 	tools/test-rsa-keygen.sh $(COMPILER)
