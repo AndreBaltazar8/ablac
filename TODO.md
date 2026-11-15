@@ -1166,6 +1166,50 @@ mmap form) apply there.
   per name occurrence and per local) were a large part of what the stage holds, and with them gone the
   stage no longer moves the peak between two levels. No collection placement change tried or kept
   (nothing to fix; `gc-pre-overloads` stays unused). Closed; reopen if a run spread over 5% shows again.
+- [ ] **Compiler speed: where a build's time goes (profiled 2026-11-15, master `6409ecd4` + #814's commits;
+  nothing landed from it).** Method: `perf record -F 997/4999` of a self-hosted release build
+  (`build src/orc_main.ab --no-cache`, stage 2) and of a small suite-like one (`tests/cases/modules/http-event.ab
+  --fast`, 0.65 s idle, user 0.75 s, sys 0.17 s, 81k minor faults, maxrss 280 MB), phase times from
+  `ABLA_COMPILER_MEMORY_TRACE=1` markers timestamped by the shell on the monotonic clock (`perf record -k monotonic`),
+  samples attributed to phases by time. Release builds have no frame pointers, so `perf` call graphs do not chain
+  Abla frames (no `-g` trees): attribute by time slice. Symbols are `abla_fn_<h>_<h>` hashes of the name and the
+  parameters (`bootstrapLlvmFunctionSymbol`): to read them, print `symbol name` for every lowered function in a
+  throwaway build (an `ABLA_SYMBOL_NAMES` stderr line in that function) and join.
+  *Self-build* (47 s wall under load 10-14): the compiler process is the first ~8.5 s, serial; LLVM in children is the
+  other ~39 s (codegen children 62% of all CPU samples, `opt` 29%, the compiler 8.6%, `ld.lld` ~0). The compiler's
+  13.2 CPU-s: graph load + parse 1.3, normalize + pre-semantic pipeline 1.5, sema 1.1, IR lowering 3.6, LLVM module
+  build 3.4 (27% in libLLVM), bitcode write + partition 1.5. The runtime heap and collector are 42% of it (5.6 s, 64% of
+  lowering): collect + mark + consolidate 2.6 s, allocate/free/bins 1.6 s, strings/arrays the rest.
+  *Small `--fast` build* (3 runs, 13,000 samples): the compiler process is 95% of CPU; LLVM 18%, heap + collector 25%
+  (consolidate 4.0, allocate 3.9, collect 3.2, free 2.1, mark 1.1, bins 1.2), the compiler's own Abla code 54% spread
+  over hundreds of functions, none above 1.6% self (`bootstrapEmitLlvmProgramPrepared`, the lexer 1.4,
+  `BootstrapFunctionDeclarationIndex_find` 1.2, `bootstrapHashNameBytes` 1.2, `__ablaRuntimeStringBytesEqual` 2.3). CPU by
+  phase: graph load 7%, parse 12%, pre-semantic 3%, sema 11%, lowering 25%, LLVM module build 19.5%, emit + link 22%.
+  Lowering's top entries are whole-program summary walks, each its own traversal of every declaration's expression tree:
+  `BootstrapCallers_collect`, `bootstrapCollectUsedAssignments`, `bootstrapRegionExpressionStoresModuleValue`,
+  `bootstrapCollectDelegatedNames`, `bootstrapCollectEffectLocals`, `bootstrapRegionExpressionRetainsParameters`,
+  `bootstrapExpressionUsesStm` (about 0.3-0.5% of the build's CPU each, ~3.5% together).
+  *The collector*: mark-sweep, non-moving, non-generational; each pressure collection marks all live data (~400 MB on
+  the self-build, threshold = kept + 256 MiB), so its cost is the mark of the live AST and IR, not the garbage. Levers
+  tried on the small build, same tree, 10-12 alternating runs each, all dropped (<2% or worse): `MAP_POPULATE` on the 1 MiB
+  heap chunks (sys 0.175 -> 0.156 s, wall unchanged); the merge trigger x4 (`__ablaRuntimeHostHeapMergeAt` 16 MiB / mapped >> 3:
+  0.648 vs 0.641 s, same maxrss); skipping the pre-LLVM `runtimeMemoryRelease` and `bootstrapCollectAndRelease` when the
+  heap is under 128 MiB (0.689 vs 0.666 s `--fast`, 2.275 vs 2.255 s release, +30-70 MB RSS: the work moves, it does not
+  go away). Only a structural change moves it (a generational collector, or region allocation of the parsed AST, which is
+  never garbage during a build); fewer collections cost memory, which the peak rule (`tools/test-compiler-memory-peak.sh`)
+  forbids.
+  *Analyzer summaries*: `bootstrapAnalyzer` builds the whole-program summaries (affine type names, mutable receivers,
+  region calls, compile effects, the declaration/type/method/name indexes, `bootstrapProgramUsesStm`) per instance. An
+  instrumented build counts the instances: `http-event --fast` 1 analyzer (1,328 declarations; prelude 37 ms of ~650,
+  uses-Stm 2 ms), `hello --fast` 1 (784, 8 ms), `tools/ct/check` 1 (27 ms), `http-async` 4 (19,916 declarations total,
+  129 ms), the compiler itself 5 (33,916, 421 ms of ~9 s). So caching across probe analyzers does not apply to the builds
+  the suite makes; the four summaries are separate fixed-point analyses (a body re-walked when a method it calls joins the
+  summary), not mechanically fusable; the realistic gain is ~3% of a small build for a refactor of passes spread over
+  sema, ir and generics. Not done.
+  What is left, in order of payoff: (1) the collector (above); (2) the lowering's per-pass tree walks, as one traversal
+  that fills the used-assignment, delegated-name, effect-local and callers tables together; (3) `bootstrapEmitLlvmProgramPrepared`
+  and the LLVM module build (19.5% of a small build, a third of it inside libLLVM: `LLVMVerifyModule`, `setValueName`).
+  A change here must give byte-identical IR on the compiler's own source and a few suite cases.
 - **Peak RSS swings with where a collection falls in the program's phases, not with the trigger (#677,
   recorded as a no-go for a trigger or marking fix).** (2026-11-09, master `0eaf983e`, branch
   `gc-schedule`.) `tests/benchmarks/json-megabyte.ab` at 170000, same binary and input: 912 MB in
