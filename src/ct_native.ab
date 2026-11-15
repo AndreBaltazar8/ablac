@@ -680,6 +680,8 @@ trusted fun ctNativeEvaluateIntrinsic(
             number, argument0, argument1, argument2,
             argument3, argument4, argument5
         ))
+        // A call the time limit's alarm interrupted (EINTR) or that just ran long ends the site here.
+        if (ctNativeDeadline != 0 && ctNativeDeadlinePassed(evaluator)) return bootstrapEvalInvalid()
     } else if (name == "ablaLinuxArgumentCount" || name == "ablaLinuxArgument") {
         // A compile-time evaluation is a program run with no arguments (not
         // the compiler's): no count, no program path.
@@ -1256,6 +1258,7 @@ trusted fun ctNativeEvaluateExternCall(
         evaluator.diagnostics = parent.diagnostics
         val word = output.load()
         output.close()
+        if (ctNativeDeadline != 0 && ctNativeDeadlinePassed(evaluator)) return bootstrapEvalInvalid()
         result = if (resultType == "void") bootstrapEvalVoid()
             else if (resultType == "bool") bootstrapEvalBoolean(word != 0)
             else if (resultType == "f64") BootstrapEvalValue("f64", word, false, "",
@@ -2196,3 +2199,30 @@ fun ctNativePathProvider(var evaluator: BootstrapEvaluator, receiver: BootstrapE
         bootstrapCompileProviderEffect("fs", "Path", method) >= 0)
         ctNativeProviderTarget(evaluator, "Path", method)
     else -1
+
+// --- the time limit of an interpreted `#` site ------------------------------------------
+// A native site stops at ABLA_COMPILE_EVAL_TIME_LIMIT through its alarm (ct_eval.ab). An interpreted one had only
+// the step limit, which a site blocked in a system call (an accept, a wait for a child, a read of a pipe) never
+// reaches: the build hung (the tls case, whose server waits for a client that can't connect). ct_eval.ab arms
+// ITIMER_REAL for the interpreted site with a handler that only returns, first at the limit and then every second,
+// so a blocked call returns EINTR from then on; the evaluator checks the clock every few thousand steps and after
+// each system call or C call, and stops with E_CT_TIME_LIMIT.
+// Monotonic milliseconds, 0: no interpreted site is timed.
+var ctNativeDeadline: int = 0
+var ctNativeDeadlineSeconds: int = 0
+var ctNativeTimedOut: bool = false
+
+// Whether the interpreted site ran past its time limit (recorded once, as an error of `evaluator`).
+@noinline
+fun ctNativeDeadlinePassed(var evaluator: BootstrapEvaluator): bool {
+    if (ctNativeDeadline == 0) return false
+    if (!ctNativeTimedOut && linuxMonotonicMilliseconds() >= ctNativeDeadline) {
+        ctNativeTimedOut = true
+        evaluator.errors = evaluator.errors + 1
+        evaluator.recordEvaluatorDiagnostic(
+            "E_CT_TIME_LIMIT",
+            "compile-time evaluation ran past the time limit (${ctNativeDeadlineSeconds} s; ABLA_COMPILE_EVAL_TIME_LIMIT)"
+        )
+    }
+    ctNativeTimedOut
+}

@@ -24,6 +24,7 @@ import "abla/sys/linux/io"
 import "abla/unsafe/memory/raw"
 import "abla/unsafe/native/function-address"
 import "ct_native_effects.ab"
+import "ct_native.ab"
 import "ct_bridge.ab"
 import "sema.ab"
 import "abla/text"
@@ -470,7 +471,10 @@ fun bootstrapCtEvaluateWithEffects(
         if (outcome.taken) return outcome.result
         bootstrapCtNote("interpreted at ${expression.begin}: ${outcome.reason}")
     }
-    bootstrapEvaluateWithEffects(expression, declarations, allowedCompileEffects)
+    val timed = bootstrapCtInterpretBegin()
+    val result = bootstrapEvaluateWithEffects(expression, declarations, allowedCompileEffects)
+    bootstrapCtInterpretEnd(timed)
+    result
 }
 
 // `source`: the file being lowered, which an interpreted evaluation's failures name.
@@ -490,13 +494,16 @@ fun bootstrapCtEvaluateGranted(
         if (outcome.taken) return outcome.result
         bootstrapCtNote("interpreted at ${expression.begin}: ${outcome.reason}")
     }
-    bootstrapEvaluateWithEffectsIn(
+    val timed = bootstrapCtInterpretBegin()
+    val result = bootstrapEvaluateWithEffectsIn(
         bootstrapEvalContext(declarations),
         expression,
         declarations,
         allowedCompileEffects,
         source
     )
+    bootstrapCtInterpretEnd(timed)
+    result
 }
 
 fun bootstrapCtEvaluate(
@@ -509,7 +516,57 @@ fun bootstrapCtEvaluate(
         if (outcome.taken) return outcome.result
         bootstrapCtNote("interpreted at ${expression.begin}: ${outcome.reason}")
     }
-    bootstrapEvaluate(expression, declarations, source)
+    val timed = bootstrapCtInterpretBegin()
+    val result = bootstrapEvaluate(expression, declarations, source)
+    bootstrapCtInterpretEnd(timed)
+    result
+}
+
+// An interpreted site runs under the same time limit as a native call (ct_native.ab, ctNativeDeadline); nested
+// sites share the outermost one's. Begin returns whether this site set it, for End.
+fun bootstrapCtInterpretBegin(): bool {
+    val limit = bootstrapCtTimeLimitSeconds()
+    if (limit <= 0 || ctNativeDeadline != 0) return false
+    ctNativeDeadline = linuxMonotonicMilliseconds() + limit * 1000
+    ctNativeDeadlineSeconds = limit
+    ctNativeTimedOut = false
+    bootstrapCtArmInterpreterAlarm(limit)
+    true
+}
+
+fun bootstrapCtInterpretEnd(timed: bool): void {
+    if (!timed) return
+    bootstrapCtDisarmAlarm()
+    ctNativeDeadline = 0
+    ctNativeTimedOut = false
+    return
+}
+
+// A handler that only returns, so that SIGALRM interrupts a blocked system call (EINTR) and nothing else. The
+// bytes are `ret` on x86-64 and `add x3, x6, #0; ret` on AArch64 (x3 is a scratch register): one body for every
+// compiler host, as bootstrapCtSigreturn is written in bytes.
+@naked
+trusted fun bootstrapCtAlarmReturn(): void =
+    bootstrapCtSigreturnAssembly(".byte 0xc3, 0x00, 0x00, 0x91, 0xc0, 0x03, 0x5f, 0xd6", "")
+
+// SIGALRM for an interpreted site: first after `seconds`, then every second (ITIMER_REAL's interval), without
+// SA_RESTART so a blocked call returns EINTR; the evaluator then sees the deadline passed.
+trusted fun bootstrapCtArmInterpreterAlarm(seconds: int): bool {
+    val handler = nativeFunctionAddress(bootstrapCtAlarmReturn)
+    // (ablaHostIsMacOS, not bootstrapCtHostIsDarwin: that is set only once a native session exists.)
+    val action = if (ablaHostIsMacOS()) bootstrapCtZeroed(160) else bootstrapCtKernelAction(handler, 0)
+    if (ablaHostIsMacOS()) ablaRuntimeStoreI64(action, handler)
+    val installed = bootstrapCtSigaction(14, action, 0)
+    __ablaRuntimeFree(action)
+    var armed = false
+    if (installed) {
+        val timer = bootstrapCtZeroed(32)
+        ablaRuntimeStoreI64(timer, 1)
+        ablaRuntimeStoreI64(timer + 16, seconds)
+        armed = bootstrapCtSetTimer(timer)
+        __ablaRuntimeFree(timer)
+    }
+    armed
 }
 
 // Calls `entry` of the live generation under its guard, the time limit and the stack
@@ -529,6 +586,11 @@ trusted fun bootstrapCtCall(entry: int, label: string = ""): BootstrapCtCallResu
         bootstrapCtGuardAddress, entry, nativePointerAddress(stopped.address)
     )
     if (timer) bootstrapCtDisarmAlarm()
+    // A native call inside an interpreted site: the site's own alarm again, for what is left of its time.
+    if (timer && ctNativeDeadline != 0) {
+        val left = (ctNativeDeadline - linuxMonotonicMilliseconds() + 999) / 1000
+        bootstrapCtArmInterpreterAlarm(if (left > 0) left else 1)
+    }
     if (faults) bootstrapCtDisarmFaults()
     val how = stopped.load()
     val closed = stopped.close()

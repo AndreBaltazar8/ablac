@@ -957,7 +957,10 @@ a value is no part of any global's heap, whatever it was computed from.
   `memorySetManualCollection()`.
 - Native code has no step limit. One evaluation may run for
   `ABLA_COMPILE_EVAL_TIME_LIMIT` seconds (default 600, `0` for no limit), then
-  stops with `E_CT_TIME_LIMIT`.
+  stops with `E_CT_TIME_LIMIT`. An interpreted site has the same limit besides
+  its step limit. A call blocked in the kernel (an accept, a wait for a child,
+  a read of a pipe) is interrupted when the limit passes, so a build never hangs
+  on compile-time code.
 - `compile val`/`compile var` hold one value for the compilation on both
   tiers: after each native call their values are kept as the evaluator keeps
   them. When an evaluated site changes a `compile var` the slice holds whose
