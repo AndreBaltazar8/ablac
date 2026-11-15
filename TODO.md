@@ -1390,6 +1390,19 @@ mmap form) apply there.
   keys, and with the `.ab` paths dropped 20 cross-script repeats), not CPU-weighted, but the shared ones are
   small cases: a measured no-go, nothing changed. The suite's CPU is in distinct builds (the
   frontend and LLVM per program), which is the compile-cost work above, not in repeats.
+  2026-11-15 (ablac-9e, the gate of merge29: 409 commands, 5,692 s of wall and 5,039 CPU-seconds summed, so about
+  711 s at JOBS=8 with perfect packing; run-tests already starts the longest first). The 20 longest, rerun with a
+  compiler wrapper that logged each build: 1,454 builds, 982 of their about 2,300 CPU-seconds (43%); a release build
+  1.2 CPU-seconds on average (421 of them), a `--fast` one 0.6 (795). Done on branch suite-speed: programs that are
+  not under test as `--fast` code built release (x509 165 to 6 s of running its programs; test-ct's tools 364 to
+  169 s), test-ct as four entries, compile-eval-shared-state without the `auto` tier (it is `jit`) and as two
+  entries, tls-pure-interop's eleven builds up front four at once, the nested runners at 2 workers, and
+  `make test-quick` (about two minutes: the guards, the commands under 5 s and the touched areas' tests).
+  Open: **a release object cache.** A release build is one whole-module object, outside the codegen-unit cache
+  (`--no-cache` or not): http-event built release took 2.2 s with and without the default cache, against 0.7 s for
+  `--fast`. Keyed by the compiler, such a cache misses on every build after a compiler change, the case this item
+  is about, and the repeats within one run are the 0.4% to 0.8% above, so it pays only for reruns with the same
+  compiler (a failure's rerun, `make test` twice); the lever after a compiler change stays per-build compile cost.
 - [ ] **Editor analysis integration.** Grow opt-in graph-aware analysis and indexed positional
   queries from the compiler's own parser/type APIs. Update abla-lsp separately after the compiler
   capabilities are validated; use the same parser-derived `ablac fmt` for formatting.
