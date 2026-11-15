@@ -114,5 +114,8 @@ expect_status_42 \
 
 "$project_root/tools/test-codegen-cache-race.sh" "$compiler"
 
+# Reporting only (never fails): linker, thread-register and kernel facts for #811(b); read the "probe:" lines of the log.
+"$project_root/tools/probe-macos-linker.sh" || true
+
 printf '%s\n' \
     'macOS host: Mach-O build, console, filesystem, process, and ORC paths passed'
