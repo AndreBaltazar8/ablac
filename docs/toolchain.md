@@ -24,7 +24,7 @@ ablac build app.ab -o build/app
 ablac build app.ab -o build/app --fast
 ablac build app.ab -o build/app --fast --no-cache
 ablac build app.ab -o build/app -g        # debug information in a release build
-ablac run app.ab -- arguments  # compiled in process (--o1 IR pipeline) and called there
+ablac run app.ab -- arguments  # compiled in process (--o1 IR pipeline) and called there, live on x86-64 Linux (--no-live)
 ablac run --built app.ab   # built (--o1, cached) and exec'd
 ablac test tests/*.ab      # build and run test programs (abla/test)
 ablac fmt --check src/     # check layout without writing (formatter.md)
@@ -398,11 +398,12 @@ evaluation, `run`, tests, the REPL, and macro/subparser handlers share the same
 instructions, values, limits, native registry, and diagnostics. The JIT is a
 different execution backend for that IR and must pass interpreter/JIT parity.
 
-### Live run: `ablac run --live`
+### Live run: `ablac run` (`--no-live` to opt out)
 
-`ablac run --live` (with the default `--o1` or with `--fast`) runs the program so that its functions can be
-redefined while it runs. It is off unless you give the flag; `--built` and `--release` ignore it without a
-warning, and `ablac build` and `ablac test` never build this way.
+`ablac run` (with the default `--o1` or with `--fast`) runs the program so that its functions can be redefined
+while it runs. It is the default where live mode is supported, an x86-64 Linux host (decision #65); `--no-live`
+runs it as before, and elsewhere (macOS, AArch64 Linux) `run` is not live unless `--live` asks. `--built` and
+`--release` ignore both without a warning, and `ablac build` and `ablac test` never build this way.
 
 The functions of the program's own source files (not the standard library, the runtime or module
 initialisers) are called through one table of code pointers: direct calls, function values, closures, thread
@@ -424,7 +425,7 @@ if (liveAvailable()) {
 
 `liveReload()` compiles the program's sources again as the next generation and keeps only the functions whose
 code changed. It returns a `LiveResult` whose `status` is `applied()` (0), `refused()` (1), `failed()` (2) or
-`unavailable()` (3: not under `--live`). Calls made after it returns take the new bodies; a thread that is
+`unavailable()` (3: not a live run). Calls made after it returns take the new bodies; a thread that is
 inside an old body finishes it on the old code; old code is never freed, so each applied reload costs memory;
 the calling thread blocks while the compiler works. A refused reload changes nothing and the old code keeps
 running; the message names the reason:
