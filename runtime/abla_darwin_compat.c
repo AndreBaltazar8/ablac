@@ -56,7 +56,8 @@ double roundeven(double value) {
   double lower = floor(value);
   double fraction = value - lower;
   double rounded = lower;
-  if (fraction > 0.5 || (fraction == 0.5 && fmod(lower, 2.0) != 0.0))
+  // lower is an integer below 2^52 in magnitude: its parity is its int64_t's (no fmod, #811).
+  if (fraction > 0.5 || (fraction == 0.5 && ((int64_t)lower & 1) != 0))
     rounded = lower + 1.0;
   return copysign(rounded == 0.0 ? 0.0 : fabs(rounded), value);
 }

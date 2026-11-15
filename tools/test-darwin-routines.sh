@@ -2,7 +2,7 @@
 # The memory and C-runtime routines a macOS executable defines itself (#811, hidden module
 # assembly: memcpy, memmove, memset, memcmp, bcmp, strlen, strcmp, memchr, bzero): the program of
 # tests/cases/libc-memory-routines checks them against a byte formula, and the executable must not
-# import any of them from libSystem. Darwin only (Linux has tools/test-libc-memory-routines.sh).
+# import any of them from libSystem; a float `%` must match libSystem's fmod (tests/cases/darwin-float-remainder). Darwin only (Linux has tools/test-libc-memory-routines.sh).
 # Usage: tools/test-darwin-routines.sh [compiler]
 set -euo pipefail
 if [[ $(uname -s) != Darwin ]]; then
@@ -35,4 +35,16 @@ for mode in release fast; do
         exit 1
     fi
 done
-echo "$actual (release and --fast), none imported"
+recovered=$actual
+# A float `%` is the runtime's remainder: the same bits as libSystem's fmod and fmodf, which the program calls
+# itself to compare (the libSystem imports guard checks that an ordinary program imports neither).
+for mode in release fast; do
+    flags=(--no-cache)
+    [[ $mode == fast ]] && flags+=(--fast)
+    "$compiler" build tests/cases/darwin-float-remainder/main.ab -o "$out/remainder-$mode" "${flags[@]}"
+    status=0
+    remainder=$("$out/remainder-$mode") || status=$?
+    [[ $status == 42 ]] || {
+        printf 'darwin routines (remainder, %s): exit status %s: %s\n' "$mode" "$status" "$remainder" >&2; exit 1; }
+done
+echo "$recovered; $(tail -n 1 <<< "$remainder") (release and --fast), none imported"
