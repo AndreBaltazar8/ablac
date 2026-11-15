@@ -516,7 +516,7 @@ fun bootstrapCtEvaluate(
 // fault handler. A stop spends the generation: frames the jump back skipped never
 // popped their collector roots, so nothing more may run on it.
 trusted fun bootstrapCtCall(entry: int, label: string = ""): BootstrapCtCallResult {
-    // The process's threads before the call (Linux; -1 elsewhere), to tell whether a stop leaves any the
+    // The process's threads before the call (Linux and macOS; -1 elsewhere), to tell whether a stop leaves any the
     // call started still running.
     val threadsBefore = bootstrapCtThreadCount()
     // The guard writes how the call stopped here (0: it returned).
@@ -539,9 +539,19 @@ trusted fun bootstrapCtCall(entry: int, label: string = ""): BootstrapCtCallResu
     BootstrapCtCallResult(if (how != 0) 0 else value, how)
 }
 
-// The number of threads the process has (the Threads: line of /proc/self/status), or -1 where there is none to read.
+// The number of threads the process has, or -1 where it cannot be read: the Threads: line of /proc/self/status on
+// Linux; on macOS proc_info (system call 336, PROC_INFO_CALL_PIDINFO 2, PROC_PIDTASKINFO 4), whose 96-byte struct
+// proc_taskinfo has pti_threadnum at 84, the high half of the little-endian word at 80. A raw system call keeps it
+// out of the compiler's libSystem imports. It returned -1 there before, so a stop beside a running thread let the
+// compiler go on beside it and crash (#831 on macOS: "Segmentation fault: 11").
 trusted fun bootstrapCtThreadCount(): int {
-    if (ablaHostIsMacOS()) return -1
+    if (ablaHostIsMacOS()) {
+        val info = nativeByteBuffer(96)
+        val size = ablaDarwinSyscall(336, 2, linuxProcessId(), 4, 0, nativePointerAddress(info.address), 96)
+        val count = if (size == 96) (info.loadI64(80) >> 32) & 4294967295 else -1
+        info.close()
+        return if (count > 0) count else -1
+    }
     val status = linuxOpen("/proc/self/status", 524288)
     if (status.descriptor < 0) return -1
     val text = status.read(8192)
@@ -594,6 +604,15 @@ trusted fun bootstrapCtStopBesideThreads(threadsBefore: int, how: int, label: st
 noescape extern:"c" fun sigaction(signal: i32, action: i64*, previous: i64*): i32
 noescape extern:"c" fun setitimer(which: i32, value: i64*, previous: i64*): i32
 private noescape extern:"intrinsic" fun ablaHostIsMacOS(): bool
+private noescape extern:"intrinsic" fun ablaDarwinSyscall(
+    number: int,
+    argument0: int,
+    argument1: int,
+    argument2: int,
+    argument3: int,
+    argument4: int,
+    argument5: int
+): int
 
 // The compiler hosts are x86-64 Linux and macOS. x86-64 Linux arms the timer with
 // the system call (38), so the compiler needs no libc setitimer there (#806); macOS keeps libSystem's.
