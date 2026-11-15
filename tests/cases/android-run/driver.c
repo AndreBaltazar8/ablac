@@ -2,6 +2,7 @@
 //   driver <library> <export> <expected>|nonzero ...        each export once, on the main thread
 //   driver <library> -t <threads> <export> <expected>       one export from <threads> pthreads the library did not
 //                                                           start (JNI-style), each passing its own number 1..N
+// The driver is linked with --export-dynamic: the library's undefined abla_test_host_hook is this file's.
 // Each call prints "<name> <result>"; the program exits 0 only when every result is the expected one.
 #include <dlfcn.h>
 #include <pthread.h>
@@ -11,6 +12,13 @@
 #include <string.h>
 
 typedef int64_t (*export_function)(int64_t);
+
+static export_function nested_function;
+
+// The library calls this while its globals initialize (tests/cases/foreign-threads/shared.ab); it calls an export again.
+__attribute__((visibility("default"))) int64_t abla_test_host_hook(void) {
+    return nested_function ? nested_function(0) + 1 : -1;
+}
 
 struct job {
     export_function function;
@@ -28,6 +36,7 @@ int main(int argc, char **argv) {
     if (argc < 3) return 2;
     void *library = dlopen(argv[1], RTLD_NOW);
     if (!library) { printf("dlopen: %s\n", dlerror()); return 3; }
+    nested_function = (export_function)dlsym(library, "abla_run_nested");
     int failed = 0;
     if (strcmp(argv[2], "-t") == 0) {
         if (argc != 6) return 2;

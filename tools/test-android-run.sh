@@ -40,20 +40,20 @@ status=0
 [[ $status -eq 37 ]] || { cat "$out/generate.log" >&2; fail "building the library failed ($status)"; }
 library=$PWD/$out/lib/src/main/jniLibs/arm64-v8a/libabla_app.so
 [[ -f $library ]] || fail "no $library"
-"$clang" tests/cases/android-run/driver.c -o "$out/driver" -ldl || fail 'the driver did not build'
+"$clang" tests/cases/android-run/driver.c -o "$out/driver" -ldl -Wl,--export-dynamic || fail 'the driver did not build'
 status=0
 LD_LIBRARY_PATH="$bionic/system/lib64/bootstrap:$bionic/system/lib64" timeout 300 qemu-aarch64 \
     "$bionic/system/bin/bootstrap/linker64" "$PWD/$out/driver" "$library" \
-    abla_run_random nonzero abla_run_heap 465 abla_run_thread 142 abla_run_threads_heap 1860 > "$out/run.out" 2> "$out/run.err" < /dev/null || status=$?
+    abla_run_random nonzero abla_run_heap 465 abla_run_thread 142 abla_run_threads_heap 1860 abla_run_seed 78 abla_run_nested 77 > "$out/run.out" 2> "$out/run.err" < /dev/null || status=$?
 if [[ $status -ne 0 ]]; then
     cat "$out/run.out" >&2
     grep -v 'linkerconfig' "$out/run.err" >&2 || true
     fail "the driver failed ($status)"
 fi
-grep -q '^abla_run_random ' "$out/run.out" && grep -qx 'abla_run_heap 465' "$out/run.out" && grep -qx 'abla_run_thread 142' "$out/run.out" && grep -qx 'abla_run_threads_heap 1860' "$out/run.out" || { cat "$out/run.out" >&2; fail 'unexpected output'; }
+grep -q '^abla_run_random ' "$out/run.out" && grep -qx 'abla_run_heap 465' "$out/run.out" && grep -qx 'abla_run_thread 142' "$out/run.out" && grep -qx 'abla_run_threads_heap 1860' "$out/run.out" && grep -qx 'abla_run_seed 78' "$out/run.out" || { cat "$out/run.out" >&2; fail 'unexpected output'; }
 # Threads the library did not start (JNI-style) call one export at the same time, under the collector's stress mode
-# (a collection at every safe point) and without: the library's exports run under one lock, so the heap, the lazy
-# initialization of the globals and the collector never see two callers. Without the lock this crashes.
+# (a collection at every safe point) and without: each export enters and leaves the runtime (heap lock live, a count of threads inside, the globals initialized once), and a
+# nested export runs while the globals initialize. Without that this crashes.
 for stress in 0 1; do
     count=8
     [[ $stress -eq 0 ]] || count=4

@@ -151,6 +151,18 @@ mmap form) apply there.
   to `aarch64-linux-` and `android` in `src/` (the target triple checks in `src/backend/llvm` for the arm64 Android
   library are the other half).
 
+## Shared-library exports (#811)
+
+- [ ] **Stop-the-world collection for overlapping callers.** A shared library's exports count the threads inside
+  (`__ablaRuntimeExportEnter`), and a collection runs only when its caller is alone, as it runs only without
+  Abla worker threads: under permanently overlapping callers (an app's UI thread and workers) or with a worker
+  thread running, a library never collects and its memory grows. A real collection would have to find every
+  thread's root chain (a registry of the thread-local heads, which exports register on entry) and park the other
+  threads at a safe point (a flag polled at function entry and loop back edges, or a signal on Linux and bionic
+  with the async-signal-safety work) before marking, for the library's callers and for Abla's own threads.
+  The same step lets `ActiveThreads != 0` stop meaning "never collect". See docs/programmable-builds.md,
+  "Calling exports from several threads".
+
 ## Bugs seen
 
 - [x] Linux toolchain packaging could write its archive and then fail in its

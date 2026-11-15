@@ -201,21 +201,26 @@ result representation, ownership/nullability, and failure containment status.
 
 ### Calling exports from several threads
 
-A library's exports share one heap, one collector and the lazy initialization of the module globals, none of which
-is synchronized until the library starts a thread of its own. Two threads that call exports at the same time
-(a host's UI thread and its workers, JNI callers) therefore corrupt the heap and crash, measured on both the
-default x86-64 Linux shared library (four callers, with and without `ABLA_GC_STRESS=1`) and the arm64 Android
-library (`tools/test-android-run.sh`).
+A shared library (the default x86-64 Linux target, arm64 Android, and any other hosted shared library) is entered
+from threads it did not start: a host's UI thread and workers, JNI callers, at the same time. Each exported
+function is a thunk that enters the runtime and leaves it after the body:
 
-- **arm64 Android libraries** run every exported function under one recursive process-wide lock (bionic's
-  `pthread_mutex_lock`), so concurrent callers are serialized and the crash is gone. The costs: a caller waits
-  while another export runs, so a long export (a network wait) blocks the app's other calls into the library;
-  and an export that waits for another thread's call into the same library deadlocks, as with any big lock (a
-  callback into the host that blocks on a thread which itself is about to call an export). Keep exports short,
-  never wait on a thread that needs the library from inside one, and call back into the host without blocking on
-  its other threads.
-- **Linux shared libraries** have no such lock yet: the caller must serialize its calls (one thread, or its own
-  mutex). Calls from different threads one after another are fine.
+- the first entry makes the heap lock live (the mode a program is in once it starts a thread); other callers wait
+  for that, and every allocation takes the heap lock from then on;
+- the threads inside the library are counted, and a collection runs only when its caller is the only one inside.
+  A library under overlapping callers therefore does not collect while they overlap, like a program with threads
+  (memory grows until a moment when one caller is alone; there is no stop-the-world collection yet, see
+  TODO.md);
+- the module globals are initialized by one caller while the others wait; an export entered again on the
+  initializing thread (the library called the host, which called an export) goes on, with the globals as far as
+  they are initialized;
+- nested calls from one thread are fine, and overlapping calls run in parallel: no call waits for another's end.
+
+Cost: two atomic updates per call, and, once sharing is on, the heap lock on every allocation (no lock-free
+small-block fast path), the cost of a threaded program. Measured by `tools/test-foreign-threads.sh` (x86-64
+Linux) and `tools/test-android-run.sh` (bionic's linker on qemu-aarch64): 1, 4 and 8 pthreads calling an
+allocating export, with and without `ABLA_GC_STRESS=1`, and a nested export during initialization.
+
 The sidecar is cached with the object and restored on a cache hit. The current
 direct-export manifest deliberately says `panic: not-contained`; consumers can
 reject that contract instead of assuming exceptions or traps are isolated.

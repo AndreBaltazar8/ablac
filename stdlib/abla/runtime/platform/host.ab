@@ -1089,6 +1089,68 @@ trusted fun __ablaRuntimePlatformThreadsEnable(): void {
     }
 }
 
+
+// A shared library's exports are entered from threads the library did not start (a host's UI thread and workers, JNI
+// callers), possibly at the same time (#811). Each export's thunk (src/backend/llvm/exports.ab) calls
+// __ablaRuntimeExportEnter first and __ablaRuntimeExportLeave last, and the one-time initialization of the module
+// globals goes through __ablaRuntimeExportInitBegin and __ablaRuntimeExportInitEnd:
+//  - the first entry makes the heap lock live (the mode a program that starts a thread is in), before any other caller
+//    gets in; the others wait for it;
+//  - the number of threads inside the library is counted, and a collection runs only when its caller is the only one
+//    inside (and no thread of the library's own runs): a thread's roots are on its own chain, and nothing walks the
+//    chain of a thread that is inside. A library under overlapping callers does not collect while they overlap, as a
+//    program with threads does not (a stop-the-world collection is a separate project);
+//  - the globals are initialized by one caller while the others wait; a nested export on the initializing thread goes on.
+// The words are static storage (an address that never moves).
+private trusted fun __ablaRuntimeHostExportInsideAddress(): int = nativeStaticAllocate(8)
+private trusted fun __ablaRuntimeHostExportShareAddress(): int = nativeStaticAllocate(8)
+private trusted fun __ablaRuntimeHostExportInitAddress(): int = nativeStaticAllocate(8)
+private trusted fun __ablaRuntimeHostExportInitThreadAddress(): int = nativeStaticAllocate(8)
+
+// How many threads are inside the library's exports now (0 in a program that has none).
+trusted fun __ablaRuntimeHostExportInside(): int =
+    ablaRuntimeAtomicLoadI64(__ablaRuntimeHostExportInsideAddress())
+
+trusted fun __ablaRuntimeExportEnter(): int {
+    val share = __ablaRuntimeHostExportShareAddress()
+    if (ablaRuntimeAtomicLoadI64(share) != 2) {
+        if (ablaRuntimeAtomicCompareExchangeI64(share, 0, 1) == 0) {
+            __ablaRuntimePlatformThreadsEnable()
+            ablaRuntimeAtomicStoreI64(share, 2)
+        } else {
+            while (ablaRuntimeAtomicLoadI64(share) != 2) {}
+        }
+    }
+    ablaRuntimeAtomicFetchAddI64(__ablaRuntimeHostExportInsideAddress(), 1)
+    0
+}
+
+trusted fun __ablaRuntimeExportLeave(): int {
+    ablaRuntimeAtomicFetchAddI64(__ablaRuntimeHostExportInsideAddress(), -1)
+    0
+}
+
+// 1 when the caller is to initialize the globals, 0 when they are initialized or the caller is the thread doing it.
+trusted fun __ablaRuntimeExportInitBegin(): int {
+    val state = __ablaRuntimeHostExportInitAddress()
+    val owner = __ablaRuntimeHostExportInitThreadAddress()
+    val me = __ablaRuntimeHostRootFrameAddress()
+    var result = -1
+    while (result < 0) {
+        val seen = ablaRuntimeAtomicCompareExchangeI64(state, 0, 1)
+        if (seen == 0) {
+            ablaRuntimeAtomicStoreI64(owner, me)
+            result = 1
+        } else if (seen == 2 || ablaRuntimeAtomicLoadI64(owner) == me) result = 0
+    }
+    result
+}
+
+trusted fun __ablaRuntimeExportInitEnd(): int {
+    ablaRuntimeAtomicStoreI64(__ablaRuntimeHostExportInitAddress(), 2)
+    0
+}
+
 // Whether a thread was ever started: shared runtime structures (a rope's flat
 // copy) publish with fences from then on. Set before the first worker runs.
 // Whether 4- and 8-byte loads at any address are fine: user-mode x86-64 and AArch64 (Linux, macOS, iOS,
@@ -2774,7 +2836,8 @@ trusted fun __ablaRuntimePlatformMemoryCollect(): int {
     // when compiler-published stack/global roots are sufficient.
     val mutex = __ablaRuntimeHostHeapLock()
     if (__ablaRuntimeHostRegionLoad() != 0 ||
-        __ablaRuntimeHostActiveThreads != 0 || __ablaRuntimeHostForkNoCollect) {
+        __ablaRuntimeHostActiveThreads != 0 || __ablaRuntimeHostExportInside() > 1 ||
+        __ablaRuntimeHostForkNoCollect) {
         __ablaRuntimeHostHeapUnlock(mutex)
         return 0
     }
@@ -2855,7 +2918,8 @@ trusted fun __ablaRuntimeHostBackgroundMemoryCollect(): int {
     // when compiler-published stack/global roots are sufficient.
     val mutex = __ablaRuntimeHostHeapLock()
     if (__ablaRuntimeHostRegionLoad() != 0 ||
-        __ablaRuntimeHostActiveThreads != 0 || __ablaRuntimeHostForkNoCollect) {
+        __ablaRuntimeHostActiveThreads != 0 || __ablaRuntimeHostExportInside() > 1 ||
+        __ablaRuntimeHostForkNoCollect) {
         __ablaRuntimeHostHeapUnlock(mutex)
         return 0
     }

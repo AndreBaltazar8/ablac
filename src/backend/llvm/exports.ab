@@ -1381,10 +1381,14 @@ fun bootstrapLlvmEmitExportInitializer(
 ): void {
     val globals = functionIndex.find("__bootstrap_globals")
     if (globals >= 0 && bootstrapLlvmHasRuntimeGlobals(backend, program)) {
+        // Under overlapping callers (a shared library) the flag is a word one caller sets, with release, after the others
+        // waited for the initialization (abla_runtime_export_init_begin/end); else a bit set before it runs.
+        val concurrent = bootstrapIrExportRuntime
+        val flagType = if (concurrent) backend.i32Type else backend.i1Type
         val initialized = LLVMAddGlobal(
-            backend.module, backend.i1Type, "abla.exports.initialized"
+            backend.module, flagType, "abla.exports.initialized"
         )
-        LLVMSetInitializer(initialized, LLVMConstInt(backend.i1Type, 0, 0))
+        LLVMSetInitializer(initialized, LLVMConstInt(flagType, 0, 0))
         LLVMSetLinkage(initialized, llvmInternalLinkage())
         val initialize = bootstrapLlvmDeclare(
             backend, "abla_export_ensure_initialized", backend.voidType,
@@ -1401,12 +1405,43 @@ fun bootstrapLlvmEmitExportInitializer(
             backend.context, initialize, "done"
         )
         LLVMPositionBuilderAtEnd(backend.builder, entry)
-        val state = LLVMBuildLoad2(
-            backend.builder, backend.i1Type, initialized, "initialized"
-        )
-        LLVMBuildCondBr(backend.builder, state, done, run)
+        if (concurrent) {
+            val begin = LLVMAppendBasicBlockInContext(
+                backend.context, initialize, "begin"
+            )
+            val flag = LLVMBuildLoad2(
+                backend.builder, flagType, initialized, "initialized"
+            )
+            LLVMSetOrdering(flag, 4)
+            LLVMSetAlignment(flag, 4)
+            LLVMBuildCondBr(
+                backend.builder,
+                LLVMBuildICmp(
+                    backend.builder, llvmIntNotEqual(), flag,
+                    LLVMConstInt(flagType, 0, 0), "initialized.set"
+                ),
+                done, begin
+            )
+            LLVMPositionBuilderAtEnd(backend.builder, begin)
+            val mine = bootstrapLlvmCallNamed(
+                backend, "abla_runtime_export_init_begin", [], "init.mine", false, []
+            )
+            LLVMBuildCondBr(
+                backend.builder,
+                LLVMBuildICmp(
+                    backend.builder, llvmIntNotEqual(), mine,
+                    LLVMConstInt(backend.i64Type, 0, 0), "init.run"
+                ),
+                run, done
+            )
+        } else {
+            val state = LLVMBuildLoad2(
+                backend.builder, backend.i1Type, initialized, "initialized"
+            )
+            LLVMBuildCondBr(backend.builder, state, done, run)
+        }
         LLVMPositionBuilderAtEnd(backend.builder, run)
-        LLVMBuildStore(
+        if (!concurrent) LLVMBuildStore(
             backend.builder, LLVMConstInt(backend.i1Type, 1, 0), initialized
         )
         val result = LLVMBuildAlloca(
@@ -1424,6 +1459,14 @@ fun bootstrapLlvmEmitExportInitializer(
              LLVMConstInt(backend.i64Type, 0, 0)],
             "", true, [false, false, false]
         )
+        if (concurrent) {
+            bootstrapLlvmCallNamed(backend, "abla_runtime_export_init_end", [], "", false, [])
+            val published = LLVMBuildStore(
+                backend.builder, LLVMConstInt(flagType, 1, 0), initialized
+            )
+            LLVMSetOrdering(published, 5)
+            LLVMSetAlignment(published, 4)
+        }
         LLVMBuildBr(backend.builder, done)
         LLVMPositionBuilderAtEnd(backend.builder, done)
         LLVMBuildRetVoid(backend.builder)
@@ -1443,36 +1486,16 @@ fun bootstrapLlvmEmitExportInitializer(
     if (false) LLVMDisposeMessage(nativeNullPointer())
 }
 
-// An arm64 Android library is entered from threads it did not start (JNI: any thread of the app, at any time), and its
-// runtime keeps one heap, one collector and the globals' lazy initialization without locks until it starts a thread of
-// its own (#811). Every exported function therefore runs under one recursive process-wide mutex (bionic's
-// pthread_mutex_lock on a static recursive mutex): the thunk takes the symbol, the original body is renamed. Calls
-// from one thread nest; a call that waits for another thread's call into the library from inside an export would
-// deadlock, as with any big lock. Threads the library starts run beside the holder, as they do beside a program's main.
-fun bootstrapLlvmLockAndroidExports(
+// A shared library is entered from threads it did not start (a host's UI thread and workers, JNI callers) and may be
+// entered by several at the same time (#811). Each exported function is a thunk around the original body, renamed:
+// it enters the runtime (the heap lock live from the first entry, the count of threads inside, which a collection
+// consults) and leaves it after the body, and the globals' one-time initialization is guarded the same way
+// (abla_export_ensure_initialized, below). Calls from one thread nest. A library under overlapping callers does not
+// collect while they overlap (stdlib/abla/runtime/platform/host.ab, __ablaRuntimeExportEnter).
+fun bootstrapLlvmEnterLibraryExports(
     backend: BootstrapLlvmBackend,
     names: array<string>
 ): void {
-    if (names.size == 0) return
-    val mutexType = LLVMArrayType2(backend.i32Type, 10)
-    val words = llvmPointerVector(10)
-    var word = 0
-    while (word < 10) {
-        words.set(word, LLVMConstInt(backend.i32Type, if (word == 0) 16384 else 0, 0))
-        word = word + 1
-    }
-    val mutex = LLVMAddGlobal(backend.module, mutexType, "abla.export.mutex")
-    LLVMSetInitializer(mutex, LLVMConstArray2(backend.i32Type, words.pointer(), 10))
-    LLVMSetLinkage(mutex, llvmInternalLinkage())
-    words.drop()
-    val lock = bootstrapLlvmDeclare(
-        backend, "pthread_mutex_lock", backend.i32Type, [backend.pointerType], false, [false]
-    )
-    val unlock = bootstrapLlvmDeclare(
-        backend, "pthread_mutex_unlock", backend.i32Type, [backend.pointerType], false, [false]
-    )
-    val lockType = LLVMGlobalGetValueType(lock)
-    val unlockType = LLVMGlobalGetValueType(unlock)
     for (name in names) {
         val inner = LLVMGetNamedFunction(backend.module, name)
         if (pointerIsNull(inner)) continue
@@ -1484,7 +1507,7 @@ fun bootstrapLlvmLockAndroidExports(
         LLVMPositionBuilderAtEnd(
             backend.builder, LLVMAppendBasicBlockInContext(backend.context, outer, "entry")
         )
-        bootstrapLlvmCallTyped(backend, lockType, lock, [mutex], "")
+        bootstrapLlvmCallNamed(backend, "abla_runtime_export_enter", [], "", false, [])
         val arguments: array<i64*> = []
         val count = LLVMCountParams(outer)
         var parameter = 0
@@ -1494,9 +1517,9 @@ fun bootstrapLlvmLockAndroidExports(
         }
         val returnsVoid = LLVMGetTypeKind(LLVMGetReturnType(type)) == 0
         val result = bootstrapLlvmCallTyped(
-            backend, type, inner, arguments, if (returnsVoid) "" else "export.locked"
+            backend, type, inner, arguments, if (returnsVoid) "" else "export.entered"
         )
-        bootstrapLlvmCallTyped(backend, unlockType, unlock, [mutex], "")
+        bootstrapLlvmCallNamed(backend, "abla_runtime_export_leave", [], "", false, [])
         if (returnsVoid) LLVMBuildRetVoid(backend.builder) else LLVMBuildRet(backend.builder, result)
     }
     return
@@ -1515,7 +1538,7 @@ fun bootstrapLlvmEmitExports(
     var errors = 0
     val retained: array<i64*> = []
     val lockedExports: array<string> = []
-    val lockExports = bootstrapLlvmAndroidArm64Library(backend)
+    val lockExports = bootstrapIrExportRuntime
     var retainedData = 0
     while (retainedData < retainedLinkedData.size) {
         if (!pointerIsNull(retainedLinkedData[retainedData])) {
@@ -1812,7 +1835,7 @@ fun bootstrapLlvmEmitExports(
         }
         index = index + 1
     }
-    if (lockExports) bootstrapLlvmLockAndroidExports(backend, lockedExports)
+    if (lockExports) bootstrapLlvmEnterLibraryExports(backend, lockedExports)
     if (retained.size > 0) {
         val values = llvmPointerVector(retained.size)
         var retainedIndex = 0
