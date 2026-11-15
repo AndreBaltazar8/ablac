@@ -166,6 +166,10 @@ mmap form) apply there.
 
 ## Android build extension (#811)
 
+- [x] **Android minimum API (decision #62, André).** Keep API 24 with the three pthread-key imports
+  (`pthread_key_create`, `pthread_getspecific`, `pthread_setspecific`) that `abla/android/emutls` leaves; do not move to
+  API 29 and its ELF TLS. No code change; recorded in docs/targets.md, Android row.
+
 - [ ] **Move both NDK searches behind the Android build extension.** The compiler's link step finds the NDK's
   compiler-rt builtins archive (`bootstrapAndroidBuiltins`) and the API 24 `libc.so` stub (`bootstrapAndroidLibc`) in
   `src/toolchain.ab`, by shell searches over `ABLA_ANDROID_NDK` and the other NDK variables. That is Android policy in
@@ -178,14 +182,17 @@ mmap form) apply there.
 
 ## Shared-library exports (#811)
 
-- [ ] **Stop-the-world collection, steps (ii) to (iv) (#811; owner ablac-4e, on step (ii)).** Step (i) is in: threads register a record, a
-  collection parks the others at their next safe point (byte threshold 0) and marks every chain, on Linux for
-  a program's threads and a library's callers; `tools/test-gc-threads.sh`. Still open: (ii) a thread blocked
-  in I/O, a lock or a sleep never parks, so the collection is abandoned after 20 ms (classify those calls as native
-  state, as `join` already is, and measure the rooting size and compile time on the compiler and NovaKind's
-  signer); (iii) foreign callers blocked in the host; (iv) macOS (the stop's clock and sleep go through the
-  Linux system call numbers the Darwin shim maps; nothing was run on a Mac). A loop that never allocates has no safe
-  point and holds up every collection while it runs.
+- [ ] **Stop-the-world collection, steps (iii) and (iv) (#811; owner ablac-4e).** Steps (i) and (ii) are in: threads register a record,
+  a collection parks the others at their next safe point (byte threshold 0) and marks every chain, on Linux for a
+  program's threads and a library's callers; a thread in `join`, a standard-library system call or a blocking C call
+  counts as stopped (`tools/test-gc-threads.sh`: churn, hold, stale-claim, manual, blocked, hammer, echo). Open:
+  (iii) foreign callers blocked in the host; (iv) macOS (the stop's clock and sleep go through the Linux system call
+  numbers the Darwin shim maps; nothing was run on a Mac). Limits: the runtime's own futex and mutex waits count as
+  running, so a stop waits 20 ms for such a thread and gives up (counted by `memoryHeapStat(8)`); a loop that never
+  allocates has no safe point and holds up every collection while it runs; a manual-collection program
+  (`memorySetManualCollection` without a limit or growth call) has no safe points, so an explicit collection with a
+  running worker is abandoned. Measured (ablac-74's request): the compiler's own build 52.2 s against 54.2 s, binary
+  +0.39%, object +0.52%; NovaKind's signer (`--fast`) about +1.5% build time, binary +0.15%, object +0.19%.
 
 ## Bugs seen
 

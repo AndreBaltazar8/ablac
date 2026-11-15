@@ -213,7 +213,11 @@ function is a thunk that enters the runtime and leaves it after the body:
   in the system, in a loop that never allocates, or in a region) makes the collector give up after 20 ms: that
   collection does not run (`memoryHeapStat(8)` counts these, `ABLA_GC_TRACE=1` names the thread), and none is
   tried for 200 ms. The same holds for the threads of a program: collection no longer waits for `thread` workers to
-  end. A thread in `join` counts as stopped. Other native waits (I/O, locks) do not yet: step (ii) of #811;
+  end. A thread in `join`, or in a system call of the standard library's wrappers or a blocking C call (SSL, read/write,
+  long LLVM calls), counts as stopped: the compiler treats those calls as collection points, with the function's live
+  values rooted across them, and brackets them with `abla_runtime_native_enter/leave`; an address taken of a string
+  (`nativeStringAddress` and the like) keeps the string rooted to the end of its function. The runtime's own futex and
+  mutex waits do not count: a stop waits 20 ms for them and gives up;
 - the module globals are initialized by one caller while the others wait; an export entered again on the
   initializing thread (the library called the host, which called an export) goes on, with the globals as far as
   they are initialized;

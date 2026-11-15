@@ -638,6 +638,17 @@ fun bootstrapLlvmEntersGeneratedCode(symbol: string): bool =
 fun bootstrapLlvmRuntimeImplementation(name: string): bool =
     name.size >= 13 && name.slice(0, 13) == "__ablaRuntime"
 
+
+// A native call that may block or run long (#811): the thread is stopped for a collection while it is in one, so
+// its live values are rooted across it (its function collects) and the call is bracketed by
+// abla_runtime_native_enter/leave. A system call of the standard library's wrappers (sys/linux), a blocking C entry
+// point and the long LLVM calls; the runtime's own system calls (futexes, mutexes) are not: they hold the runtime's
+// locks and abandon a stop instead.
+
+fun bootstrapLlvmBlockingNative(instruction: BootstrapInstruction): bool =
+    (instruction.opcode == "extern.c" && bootstrapIrBlockingNativeSymbol(instruction.text)) ||
+    (instruction.opcode == "extern.intrinsic" && instruction.text == "ablaLinuxSyscall")
+
 fun bootstrapLlvmCollectingFunctions(
     program: BootstrapIrProgram,
     functionIndex: BootstrapLlvmNameIndex,
@@ -670,6 +681,8 @@ fun bootstrapLlvmCollectingFunctions(
                 candidate.opcode == "await") direct = true
             if (automaticPressure && !runtimeImplementation &&
                 bootstrapLlvmInstructionMayAllocate(candidate)) direct = true
+            if (automaticPressure && !runtimeImplementation &&
+                bootstrapLlvmBlockingNative(candidate)) direct = true
             // The dispatchers enter generated code: the closure, generator step or drop
             // they run may reach any safe point, also from a runtime implementation.
             if (automaticPressure && candidate.opcode == "extern.c" &&
@@ -905,6 +918,25 @@ fun bootstrapLlvmValueIntervals(function: BootstrapIrFunction): BootstrapLlvmVal
             val used = candidate.operands[operand]
             if (used >= 0) lastUses[used] = instruction
             operand = operand + 1
+        }
+        instruction = instruction + 1
+    }
+
+    // The address of a heap value handed to native code (a string's bytes: ablaUnsafeStringAddress and the C-string
+    // forms) is only good while the value is alive, and a call that blocks (a system call: its thread is stopped for
+    // another thread's collection) lasts after the address's last textual use: the value stays rooted to the end of
+    // the function, as a reachability fence (#811).
+    instruction = 0
+    while (instruction < function.instructions.size) {
+        val candidate = function.instructions[instruction]
+        if ((candidate.opcode == "extern.intrinsic" || candidate.opcode == "call") &&
+            bootstrapLlvmAddressTakingIntrinsic(candidate.text)) {
+            var operand = 0
+            while (operand < candidate.operands.size) {
+                val used = candidate.operands[operand]
+                if (used >= 0 && lastUses[used] >= 0) lastUses[used] = function.instructions.size - 1
+                operand = operand + 1
+            }
         }
         instruction = instruction + 1
     }
@@ -3550,6 +3582,8 @@ fun bootstrapLlvmSelfHostedRuntimeSymbol(name: string): string {
         symbol = "abla_runtime_panic_contain"
     }
     if (name == "__ablaRuntimeExportEnter") symbol = "abla_runtime_export_enter"
+    if (name == "__ablaRuntimePlatformNativeEnter") symbol = "abla_runtime_native_enter"
+    if (name == "__ablaRuntimePlatformNativeLeave") symbol = "abla_runtime_native_leave"
     if (name == "__ablaRuntimeExportLeave") symbol = "abla_runtime_export_leave"
     if (name == "__ablaRuntimeExportInitBegin") symbol = "abla_runtime_export_init_begin"
     if (name == "__ablaRuntimeExportInitEnd") symbol = "abla_runtime_export_init_end"
@@ -4009,3 +4043,8 @@ fun bootstrapLlvmProgramMayRecoverPanic(
     }
     false
 }
+
+fun bootstrapLlvmAddressTakingIntrinsic(name: string): bool =
+    name == "ablaUnsafeStringAddress" || name == "ablaUnsafeCStringAddress" ||
+    name == "nativeStringAddress" || name == "nativeCStringAddress" || name == "aesStringAddress" ||
+    name == "nativeStringDataAddress"

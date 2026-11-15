@@ -1,0 +1,61 @@
+// Two threads on a loopback socket, each blocked in poll and read most of the time while the other allocates and
+// collects (ABLA_GC_STRESS=1): a thread coming back from a blocking call must not run while a stop that claimed it is
+// still collecting. The client's echo accumulates in a rope of strings adopted from read buffers; a thread that left
+// native code during a collection used to see a freed buffer reused by its next read (#811).
+import "abla/io"
+import "abla/net"
+import "abla/memory"
+import "abla/text"
+
+resource class Port(val value: int)
+
+fun client(port: Shared<Port>): int {
+    val connection = tcpConnect(ipv4Loopback(port.get().value), 5000)
+    if (connection.descriptor < 0) return 1
+    var index = 0
+    while (index < 40) {
+        val message = "M$index;"
+        if (connection.write(message) != message.size) return 2
+        index += 1
+    }
+    var expect = ""
+    index = 0
+    while (index < 40) {
+        expect = "$expect" + "M$index;"
+        index += 1
+    }
+    var echoed = ""
+    var spins = 0
+    while (echoed.size < expect.size && spins < 200) {
+        val incoming = connection.readWithTimeoutResult(4096, 5000)
+        if (incoming.hasData()) echoed = "$echoed${incoming.bytes}"
+        spins += 1
+    }
+    if (echoed == expect) 0 else 3
+}
+
+fun main: int {
+    val listener = tcpListenAddress(ipv4Loopback(0))
+    val port = Shared(Port(listener.localPort()))
+    val client = thread { client(port) }
+    val connection = listener.accept()
+    var buffered = ""
+    var total = 0
+    var spins = 0
+    while (total < 40 && spins < 400) {
+        val incoming = connection.readWithTimeoutResult(4096, 5000)
+        if (incoming.hasData()) buffered = "$buffered${incoming.bytes}"
+        spins += 1
+        var cut = buffered.indexOf(";")
+        while (cut >= 0) {
+            val piece = buffered.slice(0, cut + 1)
+            if (piece != "M$total;") return 7
+            connection.write(piece)
+            buffered = buffered.slice(cut + 1, buffered.size)
+            total += 1
+            cut = buffered.indexOf(";")
+        }
+    }
+    val status = await client
+    if (total == 40 && status == 0) 42 else 1
+}
