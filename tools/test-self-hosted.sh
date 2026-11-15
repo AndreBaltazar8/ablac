@@ -66,6 +66,8 @@ runner_arguments=(
     --set "memory=$ABLA_MAX_MEMORY_MB"
     --set "seconds=$ABLA_MAX_SECONDS"
 )
+# Under the suite (tools/run-tests.sh sets ABLA_SUITE_JOBS), 2 workers beside its other jobs; else one per CPU.
+[[ -n ${ABLA_TEST_JOBS:-} || -z ${ABLA_SUITE_JOBS:-} ]] || ABLA_TEST_JOBS=2
 if [[ -n ${ABLA_TEST_JOBS:-} ]]; then
     runner_arguments+=(--jobs "$ABLA_TEST_JOBS")
 fi

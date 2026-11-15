@@ -23,7 +23,7 @@
 #                   jit" runs both in one pass)
 #   PARITY_SET      probes | modules | all (default all)
 #   PARITY_FILTER   extended regex on case names (default: every case)
-#   PARITY_JOBS     cases built at once (default: the number of CPUs)
+#   PARITY_JOBS     cases built at once (default: the number of CPUs; 2 under tools/run-tests.sh)
 #   PARITY_SECONDS  wall limit per compile and per run (default 120)
 #   PARITY_KNOWN_TIMEOUT_SECONDS
 #                   the limit instead for a side expected (PARITY_EXPECT) never
@@ -76,7 +76,10 @@ compiler=${1:-$project_root/build/ablac}
 modes=${PARITY_MODES:-interp}
 set_name=${PARITY_SET:-all}
 filter=${PARITY_FILTER:-}
-jobs=${PARITY_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
+# Under the suite (tools/run-tests.sh sets ABLA_SUITE_JOBS), 2 at once beside its other jobs; else one per CPU.
+default_jobs=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
+[[ -z ${ABLA_SUITE_JOBS:-} ]] || default_jobs=2
+jobs=${PARITY_JOBS:-$default_jobs}
 seconds=${PARITY_SECONDS:-120}
 known_timeout_seconds=${PARITY_KNOWN_TIMEOUT_SECONDS:-20}
 known_step_limit=${PARITY_KNOWN_STEP_LIMIT:-5000000}
