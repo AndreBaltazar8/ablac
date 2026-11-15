@@ -86,6 +86,19 @@ sed -i -e 's|^import "./extras.ab"$|import "./extras.ab" as extras|' -e 's/\${de
 "$compiler" build "$output_directory/fixed/main.ab" -o "$output_directory/fixed-main" --no-cache --strict-imports
 runs "$output_directory/fixed-main" "6 4 string string"
 
+# A name that carries its module's prefix was resolved where it was written: a call through an alias to an
+# overloaded function (abla/math/v8's roundEven, which abla/math/fast declares too), and a parameter default
+# calling an overload of the callee's module, copied into a caller that doesn't import it.
+for program in module-siblings/aliased-intrinsic modules/overload-defaults; do
+    "$compiler" build "$project_root/tests/cases/$program.ab" -o "$output_directory/qualified" --no-cache \
+        --strict-imports > "$output_directory/qualified.err" 2>&1 ||
+        { echo "strict-members: $program doesn't build strict:"; cat "$output_directory/qualified.err"; exit 1; }
+    set +e
+    "$output_directory/qualified"; qualified=$?
+    set -e
+    [[ $qualified == 42 ]] || { echo "strict-members: $program exited $qualified"; exit 1; }
+done
+
 # An extension in its receiver type's own module belongs to the type.
 "$compiler" build "$cases/belongs.ab" -o "$output_directory/belongs" --no-cache --strict-imports
 set +e
