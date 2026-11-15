@@ -110,6 +110,31 @@ suite ran with a memcpy that trapped on overlap; only the test that overlaps on 
 trapped); a raw clone thread can't run C library code, so clone threads only in
 libc-free images. The compiler links libLLVM and OpenSSL until step C, which is André's.
 
+Inventory 2026-11-15 (master `ede03cd6`, stage 2 of it; `tools/test-libc-imports.sh` plus a scan of every
+`tests/cases/modules/*.ab` and every `abla/*/entry.ab` import, `--fast` and release, x86-64 Linux; the 12
+`tests/cases/libc-imports` programs also with `ABLA_DEBUG=1` and `--target aarch64-linux`):
+- Everything is libc-free by default now: getenv and getpid (step 3, `42c18ad4`), the allocator on mmap (5), the
+  stdlib's fork/signal/fcntl, `_setjmp`/`_longjmp`. 128 of the 133 stdlib modules, imported alone, give a static
+  executable; of the 519 module test programs 302 build static, 202 fail to build (the `invalid-*` negative cases and
+  helper files) and 15 link libc: 11 import the compiler's own modules (libLLVM and libssl via
+  `abla/platform/host/tls`), `tls` and `network-advanced` (`abla/tls/hosted`: OpenSSL), `import-alias-externs` (a user
+  `extern:"c"` call to `sin`) and `unsafe-boundary` (`dlsym`): the last two are the by-design case (a program that names
+  a C function links the C library).
+- Debug (`ABLA_DEBUG=1`) and AArch64 Linux builds of the same programs are static as well; only `tls-http` links
+  (OpenSSL), and has no AArch64 build (no libssl for that target).
+- What is left for a Linux program that does not name C: `abla/tls/hosted` and `abla/crypto/hosted` (libssl,
+  libcrypto), and no stdlib module outside them imports either (the importers are tests, `tests/cases/tls-mix` among
+  them, NovaKind's signer and the compiler's `abla/platform/host/tls`).
+- Shared libraries leave only the loader's `__tls_get_addr` undefined (emulated TLS, `test-libc-imports.sh`).
+Next, in order: (1) NovaKind's signer onto `abla/tls/pure` (branch `tls-pure-822`, parked by André), then delete
+`abla/tls/hosted`, `abla/crypto/hosted` and `abla/jwt/libcrypto`'s leftovers, keeping OpenSSL only as the test oracle
+(`tests/cases/crypto-pure/against-hosted.ab`, move it to the `openssl` command line); `tls-http` leaves
+`tools/libc-imports-static-pending.txt` with them; (2) the AArch64 static check of `tools/test-aarch64-linux.sh` over
+all 11 `libc-imports` programs (it runs 6) and a representative set of the module cases, so a regression in a stdlib
+area the 11 programs miss (sockets, processes, signals, stm) shows; (3) the compiler's own `abla/platform/host/tls`
+through `abla/tls/pure`, which takes libssl and libcrypto out of the compiler's 36 imports (step C, André's, listed
+for completeness).
+
 Step 5, the heap (ablac-87, branch heap-806-step5): the runtime heap's malloc, calloc, realloc and
 free are Abla code over mmap, munmap, mremap and madvise on x86-64 Linux (`__ablaRuntimeHostHeap*`
 in `host.ab`); macOS and AArch64 Linux keep libc's. Blocks have glibc's geometry (a 16-byte aligned
