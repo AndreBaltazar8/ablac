@@ -12,6 +12,7 @@ import "abla/llvm/orc"
 import "abla/sys/linux"
 import "abla/sys/linux/fs"
 import "abla/sys/linux/process"
+import "abla/text"
 
 // `ablac run --live` (docs/design/live-jit.md): every function of the program's own source files is
 // called through one table of code pointers, so that a later generation can redefine it while the
@@ -41,6 +42,11 @@ var bootstrapLlvmLiveIndices: Map<string, int> = Map()
 var bootstrapLlvmLiveHashes: array<int> = []
 var bootstrapLlvmLiveNames: array<string> = []
 var bootstrapLlvmLiveDefined: Map<string, int> = Map()
+// Each entry's source text hash (bootstrapLlvmLiveSourceHashes), each named function's symbol by its
+// readable name, and the classes' layouts (bootstrapLlvmLiveClassLayouts), as the program was loaded.
+var bootstrapLlvmLiveSources: array<int> = []
+var bootstrapLlvmLiveLabels: Map<string, string> = Map()
+var bootstrapLlvmLiveClasses = ""
 
 // The result of the last live pass: the number of functions through the table, and for a reload
 // the entries it redefines or adds (their index, body symbol and hash), and why it is refused.
@@ -54,6 +60,9 @@ var bootstrapLlvmLiveChangedSymbols: array<string> = []
 var bootstrapLlvmLiveRefusals: array<string> = []
 // The definitions a reload's module keeps (added to bootstrapLlvmLiveDefined once it is applied).
 var bootstrapLlvmLiveKept: array<string> = []
+// Every entry's slot and source hash in a reload, recorded as the program's once it is applied.
+var bootstrapLlvmLivePendingSlots: array<int> = []
+var bootstrapLlvmLivePendingSources: array<int> = []
 
 // A function of the program's own source files: not the standard library's, the runtime's or a
 // naked or sectioned one (those keep their exact code).
@@ -116,9 +125,86 @@ trusted fun bootstrapLlvmLiveBodyHash(body: i64*): int {
 fun bootstrapLlvmLiveReset(): void {
     bootstrapLlvmLiveIndices = Map()
     bootstrapLlvmLiveHashes = []
+    bootstrapLlvmLiveSources = []
     bootstrapLlvmLiveNames = []
+    bootstrapLlvmLiveLabels = Map()
+    bootstrapLlvmLiveClasses = ""
     bootstrapLlvmLiveDefined = Map()
     return
+}
+
+// Each entry's source text as a number: from its declaration to the next named function's in the same
+// file (or the file's end). Two compiles of a function whose text is the same agree, wherever it moved.
+fun bootstrapLlvmLiveSourceHashes(program: BootstrapIrProgram, functions: array<int>): array<int> {
+    val starts: array<int> = []
+    for (function in program.functions) {
+        if (function.position >= 0 && !bootstrapLlvmLiveLambda(function.name)) starts.append(function.position)
+    }
+    val texts: Map<int, string> = Map()
+    val hashes: array<int> = []
+    for (index in functions) {
+        val position = program.functions[index].position
+        val file = bootstrapIrSourcePositionFile(position)
+        val offset = bootstrapIrSourcePositionOffset(position)
+        var text = texts.get(file)
+        if (text == null) {
+            val read = if (file >= 0 && file < bootstrapIrSourceFiles.size)
+                Path(bootstrapIrSourceFiles[file]).readText() else ""
+            texts.set(file, read)
+            text = read
+        }
+        val source = text ?? ""
+        var end = source.size
+        for (start in starts) {
+            if (bootstrapIrSourcePositionFile(start) == file) {
+                val other = bootstrapIrSourcePositionOffset(start)
+                if (other > offset && other < end) end = other
+            }
+        }
+        val begin = if (offset >= 0 && offset <= source.size) offset else source.size
+        hashes.append(bootstrapCodegenTextHash(source.slice(begin, if (end < begin) begin else end), 13))
+    }
+    hashes
+}
+
+// The program's classes as one text: each one's name, id, fields, their places and its size, in order.
+fun bootstrapLlvmLiveClassLayouts(program: BootstrapIrProgram): string {
+    var text = ""
+    for (type in program.classes) {
+        text = text + "${type.name} ${type.id} ${type.fields.join(",")} ${bootstrapLlvmLiveJoinInts(type.fieldPlaces)} ${type.size}\n"
+    }
+    text
+}
+
+// The first class whose layout differs between two class texts, for the refusal.
+fun bootstrapLlvmLiveLayoutChange(before: string, after: string): string {
+    val earlier = before.split("\n")
+    val later = after.split("\n")
+    var line = 0
+    while (line < earlier.size || line < later.size) {
+        val was = if (line < earlier.size) earlier[line] else ""
+        val now = if (line < later.size) later[line] else ""
+        if (was != now) {
+            val name = (if (now != "") now else was).split(" ")[0]
+            return if (was == "") "class $name was added" else if (now == "") "class ${was.split(" ")[0]} was removed"
+                else "class $name changed"
+        }
+        line = line + 1
+    }
+    "the classes changed"
+}
+
+fun bootstrapLlvmLiveJoinInts(values: array<int>): string {
+    var text = ""
+    for (value in values) text = if (text == "") "$value" else "$text,$value"
+    text
+}
+
+fun bootstrapLlvmLiveLabelOf(program: BootstrapIrProgram, name: string): string {
+    for (function in program.functions) {
+        if (function.name == name) return if (function.label != "") function.label else name
+    }
+    name
 }
 
 trusted fun bootstrapLlvmLiveIndirect(
@@ -136,6 +222,8 @@ trusted fun bootstrapLlvmLiveIndirect(
     bootstrapLlvmLiveChangedSymbols = []
     bootstrapLlvmLiveRefusals = []
     bootstrapLlvmLiveKept = []
+    bootstrapLlvmLivePendingSlots = []
+    bootstrapLlvmLivePendingSources = []
     if (generation == 0) bootstrapLlvmLiveReset()
     val root = bootstrapNormalizeModulePath(bootstrapStandardLibraryRoot())
     val stdlibRoot = if (root.endsWith("/")) root else root + "/"
@@ -232,24 +320,56 @@ trusted fun bootstrapLlvmLiveIndirect(
     }
     // Every local symbol gets a hidden external name; constants are named after their contents.
     bootstrapCodegenUnitPromote(backend.module, true)
+    val sources = bootstrapLlvmLiveSourceHashes(program, functions)
+    val layouts = bootstrapLlvmLiveClassLayouts(program)
+    if (generation == 0) {
+        bootstrapLlvmLiveClasses = layouts
+    } else if (layouts != bootstrapLlvmLiveClasses) {
+        bootstrapLlvmLiveRefusals.append(
+            "E_LIVE_LAYOUT: ${bootstrapLlvmLiveLayoutChange(bootstrapLlvmLiveClasses, layouts)}: instances made by the running code keep the old layout"
+        )
+    }
+    // A reload's entries whose code changed though their source did not (E_LIVE_CALLER, below), and the
+    // functions whose source the edit changed.
+    val callers: array<int> = []
+    val edited: Map<string, int> = Map()
     entry = 0
     while (entry < count) {
         val body = bodies[entry]
         val hash = bootstrapLlvmLiveBodyHash(body)
-        val label = program.functions[functions[entry]].label
+        val function = program.functions[functions[entry]]
+        val label = function.label
+        val shown = if (label != "") label else function.name
+        val symbol = bootstrapLlvmDirectFunctionSymbol(identities.symbols[functions[entry]])
         val slot = slots[entry]
         if (generation == 0) {
-            bootstrapLlvmLiveIndices.set(
-                bootstrapLlvmDirectFunctionSymbol(identities.symbols[functions[entry]]), slot
-            )
+            bootstrapLlvmLiveIndices.set(symbol, slot)
             bootstrapLlvmLiveHashes.append(hash)
-            bootstrapLlvmLiveNames.append(if (label != "") label else program.functions[functions[entry]].name)
-        } else if (slot >= bootstrapLlvmLiveHashes.size || bootstrapLlvmLiveHashes[slot] != hash) {
-            val shown = if (label != "") label else program.functions[functions[entry]].name
-            if (bootstrapLlvmLiveLambda(program.functions[functions[entry]].name)) {
+            bootstrapLlvmLiveSources.append(sources[entry])
+            bootstrapLlvmLiveNames.append(shown)
+            bootstrapLlvmLiveLabels.set(shown, symbol)
+        } else {
+            bootstrapLlvmLivePendingSlots.append(slot)
+            bootstrapLlvmLivePendingSources.append(sources[entry])
+            val known = slot < bootstrapLlvmLiveSources.size
+            if (!known || bootstrapLlvmLiveSources[slot] != sources[entry]) edited.set(function.name, 1)
+            if (!known) {
+                // A function the program has under another symbol: its parameters or result changed.
+                val before = bootstrapLlvmLiveLabels.get(shown)
+                if (before != null && before != symbol && !bootstrapLlvmLiveLambda(function.name)) {
+                    bootstrapLlvmLiveRefusals.append(
+                        "E_LIVE_SIGNATURE: $shown: its parameters or result changed; function values, closures and threads made by the running code still call it the old way"
+                    )
+                }
+            }
+        }
+        if (generation != 0 && (slot >= bootstrapLlvmLiveHashes.size || bootstrapLlvmLiveHashes[slot] != hash)) {
+            if (bootstrapLlvmLiveLambda(function.name)) {
                 bootstrapLlvmLiveRefusals.append(
                     "E_LIVE_LAMBDA: a lambda changed or was added ($shown): a reload redefines named functions only"
                 )
+            } else if (slot < bootstrapLlvmLiveSources.size && bootstrapLlvmLiveSources[slot] == sources[entry]) {
+                callers.append(entry)
             }
             bootstrapLlvmLiveChangedIndices.append(slot)
             bootstrapLlvmLiveChangedBodies.append(bootstrapLlvmDebugValueName(body))
@@ -260,6 +380,25 @@ trusted fun bootstrapLlvmLiveIndirect(
             )
         }
         entry = entry + 1
+    }
+    // The rule (docs/design/live-jit.md, stage 0): a function the edit did not touch must compile to the
+    // same code, or the running code relies on a fact about a callee that changed.
+    for (caller in callers) {
+        val function = program.functions[functions[caller]]
+        val shown = if (function.label != "") function.label else function.name
+        val names: array<string> = []
+        for (instruction in function.instructions) {
+            if (instruction.opcode == "call" && edited.get(instruction.text) != null) {
+                val callee = bootstrapLlvmLiveLabelOf(program, instruction.text)
+                var listed = false
+                for (name in names) if (name == callee) listed = true
+                if (!listed) names.append(callee)
+            }
+        }
+        val because = if (names.size == 0) "after this edit"
+            else if (names.size == 1) "it calls ${names[0]}, whose change it depends on"
+            else "it calls ${names.join(", ")}, whose changes it depends on"
+        bootstrapLlvmLiveRefusals.append("E_LIVE_CALLER: $shown (unchanged) would compile differently: $because")
     }
     bootstrapLlvmLiveCount = count
     bootstrapLlvmLiveTableSize = size
@@ -361,6 +500,13 @@ trusted fun bootstrapLlvmLiveCut(module: i64*): void {
 // entries' hashes are its.
 fun bootstrapLlvmLiveApplied(): void {
     for (name in bootstrapLlvmLiveKept) bootstrapLlvmLiveDefined.set(name, 1)
+    var pending = 0
+    while (pending < bootstrapLlvmLivePendingSlots.size) {
+        val slot = bootstrapLlvmLivePendingSlots[pending]
+        while (bootstrapLlvmLiveSources.size <= slot) bootstrapLlvmLiveSources.append(0)
+        bootstrapLlvmLiveSources[slot] = bootstrapLlvmLivePendingSources[pending]
+        pending = pending + 1
+    }
     var change = 0
     while (change < bootstrapLlvmLiveChangedIndices.size) {
         val slot = bootstrapLlvmLiveChangedIndices[change]
@@ -371,6 +517,9 @@ fun bootstrapLlvmLiveApplied(): void {
         bootstrapLlvmLiveHashes[slot] = bootstrapLlvmLiveChangedHashes[change]
         bootstrapLlvmLiveNames[slot] = bootstrapLlvmLiveChangedLabels[change]
         bootstrapLlvmLiveIndices.set(bootstrapLlvmLiveChangedSymbols[change], slot)
+        if (bootstrapLlvmLiveLabels.get(bootstrapLlvmLiveChangedLabels[change]) == null) {
+            bootstrapLlvmLiveLabels.set(bootstrapLlvmLiveChangedLabels[change], bootstrapLlvmLiveChangedSymbols[change])
+        }
         change = change + 1
     }
     return

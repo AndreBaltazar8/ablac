@@ -1,0 +1,78 @@
+// `ablac run --live`: edits a reload must refuse (docs/design/live-jit.md), each naming what changed,
+// with the running code left as it was. The program edits its own copy (tools/test-live-jit.sh passes
+// its path), reloads, checks the refusal and puts the edit back before the next one:
+// - E_LIVE_CALLER: apply() starts keeping its argument, so user()'s closure, which stayed in user()'s
+//   frame because apply()'s parameter did not escape, must now be on the heap: user() did not change
+//   but would compile differently, and is named with apply();
+// - E_LIVE_SIGNATURE: scaled()'s parameter is renamed, which is another signature;
+// - E_LIVE_LAYOUT: class Box gains a field.
+// After them an ordinary edit still applies. Exits 42 when every "name: ok" line is ok. Every string
+// an edit looks for is spelled in pieces here, so an edit changes only the marked line.
+import "abla/io"
+import "abla/live"
+import "abla/text"
+import "abla/sys/linux/fs"
+import "abla/sys/linux/process"
+
+var keeper: array<() -> int> = []
+
+fun apply(f: () -> int): int = f() // apply-marker
+
+fun user(): int {
+    // A closure with a capture: one without is a constant, never in a frame.
+    val base = 7
+    val seven: () -> int = { base }
+    apply(seven)
+}
+
+fun scaled(x: int): int = x * 2 // scaled-marker
+
+fun useScaled(): int = scaled(3)
+
+class Box(val a: int) // box-marker
+
+fun boxed(): int = Box(4).a
+
+fun plain(): int = 1 // plain-marker
+
+var failures = 0
+
+fun check(name: string, ok: bool, detail: string): void {
+    println("$name: ${if (ok) "ok" else "FAIL"} ($detail)")
+    if (!ok) failures += 1
+    return
+}
+
+// Replaces `from` by `to` in the copy, reloads, puts the copy back and returns the reload's result.
+fun attempt(path: string, from: string, to: string): LiveResult {
+    val source = Path(path).readText()
+    if (!source.contains(from)) return LiveResult(9, "marker not found: $from")
+    Path(path).writeText(source.replace(from, to))
+    val result = liveReload()
+    Path(path).writeText(source)
+    result
+}
+
+fun main: int {
+    val path = linuxArgument(linuxArgumentCount() - 1)
+    check("before", user() == 7 && useScaled() == 6 && boxed() == 4 && plain() == 1, "")
+    val caller = attempt(path, "= f() // apply-" + "marker", "{ keeper.append(f); return f() } // apply-" + "marker")
+    check("caller refused", caller.refused() && caller.message.contains("E_LIVE_CALLER") &&
+        caller.message.contains("user") && caller.message.contains("apply"), caller.message)
+    check("caller kept", user() == 7 && keeper.size == 0, "${user()}")
+    val signature = attempt(path, "scaled(x: int): int = x * 2 // scaled-" + "marker",
+        "scaled(y: int): int = y * 2 // scaled-" + "marker")
+    check("signature refused", signature.refused() && signature.message.contains("E_LIVE_SIGNATURE") &&
+        signature.message.contains("scaled"), signature.message)
+    check("signature kept", useScaled() == 6, "${useScaled()}")
+    val layout = attempt(path, "class Box(val a: int) // box-" + "marker",
+        "class Box(val a: int, val b: int = 0) // box-" + "marker")
+    check("layout refused", layout.refused() && layout.message.contains("E_LIVE_LAYOUT") &&
+        layout.message.contains("Box"), layout.message)
+    check("layout kept", boxed() == 4, "${boxed()}")
+    val source = Path(path).readText()
+    Path(path).writeText(source.replace("= 1 // plain-" + "marker", "= 2 // plain-" + "marker"))
+    val applied = liveReload()
+    check("then an edit applies", applied.applied() && plain() == 2, applied.message)
+    if (failures == 0) 42 else 1
+}

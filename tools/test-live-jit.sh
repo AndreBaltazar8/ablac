@@ -66,6 +66,17 @@ for profile in o1 fast; do
         exit 1
     fi
 done
+# The refusals (stage 2b): tests/cases/live-jit/refuse.ab, see its header.
+refuse=$PWD/$out/reload/refuse.ab
+cp tests/cases/live-jit/refuse.ab "$refuse"
+status=0
+timeout 300 "$compiler" run --live "$refuse" -- "$refuse" > "$out/refuse.out" 2> "$out/refuse.err" || status=$?
+if [[ $status -ne 42 ]] || grep -q ": FAIL" "$out/refuse.out"; then
+    printf 'live jit (refusals): exit status %s (42 expected)\n' "$status" >&2
+    cat "$out/refuse.out" >&2
+    head -n 30 "$out/refuse.err" >&2
+    exit 1
+fi
 cp tests/cases/live-jit/reload.ab "$reload"
 status=0
 timeout 300 "$compiler" run "$reload" -- "$reload" > "$out/reload-plain.out" 2>&1 || status=$?
@@ -74,4 +85,4 @@ if [[ $status -eq 42 ]] || ! grep -q '^live available: FAIL' "$out/reload-plain.
     cat "$out/reload-plain.out" >&2
     exit 1
 fi
-echo "live jit: $calls; reload: $(grep -c ': ok' "$out/reload-o1.out") checks (--o1 and --fast), unavailable without --live"
+echo "live jit: $calls; reload: $(grep -c ': ok' "$out/reload-o1.out") checks (--o1 and --fast), $(grep -c ": ok" "$out/refuse.out") refusal checks, unavailable without --live"
