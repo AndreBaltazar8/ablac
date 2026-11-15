@@ -1,4 +1,4 @@
-// NIST P-384 (secp384r1) in Abla: ECDH, ECDSA verification and public key checks, for TLS and certificate chains: the same complete
+// NIST P-384 (secp384r1) in Abla: ECDH, ECDSA signing and verification, and public key checks, for TLS and certificate chains: the same complete
 // point formulas as abla/crypto/p256 (a = -3 here too) on the big-number arithmetic of abla/crypto/bignum, 12 limbs.
 //
 // What is secret and how it is handled (as in abla/crypto/p256):
@@ -10,8 +10,13 @@
 //    doubles four times and adds once per window, the added point read from a table of sixteen by looking at every entry (bnLookup).
 //  - The inversion that makes the result affine is Fermat's by a public exponent (bnExpPublic): its input is the z of the
 //    result, which is not secret once the shared x is revealed; tools/test-ct.sh does not read it.
+//  - ECDSA signing (p384EcdsaSign, RFC 6979 nonce from HMAC-SHA-384): k * G is the secret scalar multiplication above, r * d and (e + r d) * k^-1 are
+//    plain multiplications in the order's Montgomery field (p384MultiplyPlain, in the region), the inverse of k is Fermat's by a public exponent
+//    (bnExpPublic, not read: the checker cannot tell a load of the exponent from a load of secret memory), and the nonce is a string from
+//    hmacSha384 (abla/crypto), which has no table or branch on its data but is not among the functions tools/test-ct.sh reads. A candidate nonce
+//    outside 1..n-1 (probability about 2^-190) and r or s of zero are public outcomes.
 //  - Verification works on public values only (a public key, a message digest, a signature) and uses a plain binary scalar
-//    multiplication (p384ScalarMultiplyPublic): nothing is claimed to be constant time there. Signing is not here.
+//    multiplication (p384ScalarMultiplyPublic): nothing is claimed to be constant time there.
 //
 // tools/test-ct.sh reads the region between BEGIN P384 SECRET CORES and END P384 SECRET CORES.
 // A public key is 97 bytes, 0x04 || X || Y; compressed points are refused.
@@ -244,6 +249,19 @@ trusted fun p384ScalarMultiplySecret(f: int, work: int, out: int, point: int, sc
     }
     bnCopy(out, accumulator, 36)
 }
+
+/** `out` = `a` * `b` mod the modulus, all plain (the ECDSA signature: r * d, and s = (e + r d) * k^-1: `d` and `k^-1` are secret). */
+trusted fun p384MultiplyPlain(m: BnModulus, out: int, a: int, b: int): void {
+    val encoded = bnAllocate(P384_WORDS)
+    p384MultiplyPlainBody(m.memory, out, a, b, encoded)
+    bnRelease(encoded, P384_WORDS)
+}
+
+/** What p384MultiplyPlain does, on a modulus block at `memory` and a work area of twelve limbs. */
+@inline trusted fun p384MultiplyPlainBody(memory: int, out: int, a: int, b: int, encoded: int): void {
+    bnMultiplyAt(memory, P384_WORDS, encoded, a, memory + P384_WORDS * 4 + 4)
+    bnMultiplyAt(memory, P384_WORDS, out, encoded, b)
+}
 // END P384 SECRET CORES
 
 class P384Curve(val field: BnModulus, val order: BnModulus, val work: int)
@@ -273,12 +291,6 @@ private trusted fun p384IsZero(value: int): bool {
     true
 }
 
-private trusted fun p384MultiplyPlain(m: BnModulus, out: int, a: int, b: int): void {
-    val encoded = bnAllocate(P384_WORDS)
-    bnEncode(m, encoded, a)
-    bnMultiply(m, out, encoded, b)
-    bnRelease(encoded, P384_WORDS)
-}
 
 /** `out` = `scalar` * `point` for a public scalar (signature verification) of twelve plain limbs; `point` projective, Montgomery; `out` is neither. */
 private trusted fun p384ScalarMultiplyPublic(c: P384Curve, out: int, point: int, scalar: int): void {
@@ -464,6 +476,120 @@ private @noinline trusted fun p384EcdhWork(privateKey: string, peerPublicKey: st
     bnRelease(scalar, P384_WORDS)
     p384Close(c)
     result
+}
+
+// --- ECDSA signing ----------------------------------------------------------------------------------------------------
+
+/** `out` = the digest's leftmost 384 bits as a number, reduced mod n (it is below 2 n). */
+private trusted fun p384DigestScalar(c: P384Curve, digest: string, out: int): void {
+    val size = if (digest.size > 48) 48 else digest.size
+    bnFromBytes(out, P384_WORDS, ablaUnsafeStringAddress(digest), size)
+    bnConditionalSubtractBody(out, out, secretU32(u32(0)), c.order.value(), P384_WORDS, c.order.scratch())
+}
+
+/** RFC 6979's nonce for SHA-384 and the private key `key` (48 bytes) for the message hash `h1`, or "" if no candidate falls in 1..n-1
+ *  in 100 tries (it always does). `reduced` is h1 mod n as bytes. The qlen of P-384 is 384 bits, hlen of SHA-384 is 384: a candidate is one HMAC block. */
+private trusted fun p384Nonce(c: P384Curve, key: string, reduced: string): string {
+    var v = "\x01".repeat(48)
+    var k = "\x00".repeat(48)
+    k = hmacSha384(k, v + "\x00" + key + reduced)
+    v = hmacSha384(k, v)
+    k = hmacSha384(k, v + "\x01" + key + reduced)
+    v = hmacSha384(k, v)
+    val candidate = bnAllocate(P384_WORDS)
+    var found = ""
+    var tries = 0
+    while (tries < 100) {
+        v = hmacSha384(k, v)
+        bnFromBytes(candidate, P384_WORDS, ablaUnsafeStringAddress(v), 48)
+        if (p384InRange(c.order.value(), candidate) != u32(0)) {
+            found = v
+            break
+        }
+        k = hmacSha384(k, v + "\x00")
+        v = hmacSha384(k, v)
+        tries = tries + 1
+    }
+    bnRelease(candidate, P384_WORDS)
+    found
+}
+
+/** ECDSA over SHA-384 (RFC 6979 nonce, so a message always gets the same signature): the 96 bytes r || s. */
+trusted fun p384EcdsaSignRaw(privateKey: string, message: string): CryptoResult {
+    val result = p384EcdsaSignWork(privateKey, message)
+    ctScrubStack4096()
+    return result
+}
+
+private @noinline trusted fun p384EcdsaSignWork(privateKey: string, message: string): CryptoResult {
+    val c = p384Open()
+    val d = bnAllocate(P384_WORDS)
+    var result = p384Failed("the private key is not a number from 1 to n-1 in 48 bytes")
+    if (p384ParseScalar(c, privateKey, d)) {
+        val order = c.order
+        val digest = sha384(message)
+        val e = bnAllocate(P384_WORDS)
+        p384DigestScalar(c, digest, e)
+        val nonce = p384Nonce(c, privateKey, p384Bytes(e, 48))
+        result = p384Failed("no usable nonce")
+        if (nonce.size == 48) {
+            val k = bnAllocate(P384_WORDS)
+            val g = bnAllocate(36)
+            val point = bnAllocate(36)
+            val x = bnAllocate(P384_WORDS)
+            val y = bnAllocate(P384_WORDS)
+            val inverse = bnAllocate(P384_WORDS)
+            val product = bnAllocate(P384_WORDS)
+            bnFromBytes(k, P384_WORDS, ablaUnsafeStringAddress(nonce), 48)
+            p384Generator(c, g)
+            p384ScalarMultiplySecret(c.field.memory, c.work, point, g, k)
+            p384ToAffine(c, point, x, y)
+            // r = x mod n (x is below p, which is below 2 n); s = k^-1 (e + r d) mod n.
+            bnConditionalSubtractBody(x, x, secretU32(u32(0)), order.value(), P384_WORDS, order.scratch())
+            bnExpPublic(order, inverse, k, hexDecode(P384_ORDER_MINUS_TWO))
+            p384MultiplyPlain(order, product, x, d)
+            p384Add(order.memory, product, product, e)
+            p384MultiplyPlain(order, product, product, inverse)
+            // r or s of zero would call, in RFC 6979, for the next candidate nonce: about once in 2^384 signatures, reported as a failure.
+            if (!p384IsZero(x) && !p384IsZero(product)) {
+                result = CryptoResult(p384Bytes(x, 48) + p384Bytes(product, 48), true, "")
+            }
+            bnRelease(k, P384_WORDS)
+            bnRelease(g, 36)
+            bnRelease(point, 36)
+            bnRelease(x, P384_WORDS)
+            bnRelease(y, P384_WORDS)
+            bnRelease(inverse, P384_WORDS)
+            bnRelease(product, P384_WORDS)
+        }
+        bnRelease(e, P384_WORDS)
+    }
+    bnRelease(d, P384_WORDS)
+    p384Close(c)
+    result
+}
+
+// An INTEGER of a DER signature for a 48-byte value: minimal, positive.
+private fun p384DerInteger(value: string): string {
+    var start = 0
+    while (start < 47 && value[start] == 0) start = start + 1
+    val body = value.slice(start, 48)
+    val padded = if (body[0] >= 128) "\x00" + body else body
+    "\x02" + byteEncode(padded.size) + padded
+}
+
+/** The signature r || s (96 bytes) as DER, the form X.509 and TLS carry. */
+fun p384SignatureToDer(raw: string): string {
+    if (raw.size != 96) return ""
+    val body = p384DerInteger(raw.slice(0, 48)) + p384DerInteger(raw.slice(48, 96))
+    "\x30" + byteEncode(body.size) + body
+}
+
+/** ECDSA over SHA-384, the signature as DER. */
+trusted fun p384EcdsaSign(privateKey: string, message: string): CryptoResult {
+    val raw = p384EcdsaSignRaw(privateKey, message)
+    if (!raw.ok) return raw
+    CryptoResult(p384SignatureToDer(raw.bytes), true, "")
 }
 
 /** Verifies the signature `r || s` (96 bytes) of a message digest (the leftmost 384 bits of a longer one count) under the

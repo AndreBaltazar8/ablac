@@ -35,7 +35,7 @@ CBC suites, RSA key exchange, static or finite-field Diffie-Hellman, RC4, 3DES a
 1.0 and 1.1; renegotiation (a HelloRequest after the handshake ends the connection); compression; a TLS 1.2 peer that
 does not support the extended master secret (RFC 7627) or secure renegotiation info; 0-RTT early data; session
 resumption and tickets (the server sends none, the client ignores them); a certificate that matches the host only by
-its Common Name (a subjectAltName is required, RFC 6125); a server identity with a P-384 key (the client verifies P-384 certificates; there is no P-384 signing);
+its Common Name (a subjectAltName is required, RFC 6125);
 RSA keys under 2048 bits for PSS verification.
 
 ## Differences from the OpenSSL-backed module
@@ -99,10 +99,10 @@ check, RFC 8446 section 7.4.2) and sends `illegal_parameter` if either fails; th
 (`illegal_parameter`) and the X25519 part. A ciphertext that was not made for the client's key is not an error at that point
 (ML-KEM's implicit rejection): the keys differ and the handshake fails at the first protected record, so a bad ciphertext does not
 tell a server whether it decapsulated. The hybrid is a TLS 1.3 group only: a TLS 1.2 server never selects it, and a TLS 1.2
-client refuses a ServerKeyExchange for it. P-384 works as an ECDHE group in both versions (key agreement only: there is no P-384
-*signing*, so a server identity cannot be a P-384 key; a client verifies P-384 certificates). In TLS 1.2 the group list also names the curves of
+client refuses a ServerKeyExchange for it. P-384 works as an ECDHE group in both versions, and as a certificate key (ECDSA with SHA-384,
+RFC 6979 nonces: `p384EcdsaSign`; a server identity can be a P-384 key, in PKCS#8, SEC1 or PKCS#12). In TLS 1.2 the group list also names the curves of
 the certificates a client accepts (RFC 8422 section 5.1.1): a client refuses an EC certificate whose curve it did not list (`bad_certificate`), and a
-server with a P-256 key does not serve a TLS 1.2 client that lists no P-256 (`handshake_failure`); TLS 1.3 has no such rule.
+server with a P-256 or P-384 key does not serve a TLS 1.2 client that lists no such curve (`handshake_failure`); TLS 1.3 has no such rule.
 
 ## Secrets in memory
 

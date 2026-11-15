@@ -9,6 +9,7 @@ import "abla/crypto"
 import "abla/crypto/der"
 import "abla/crypto/ed25519"
 import "abla/crypto/p256"
+import "abla/crypto/p384"
 import "abla/crypto/pbe"
 import "abla/crypto/result"
 import "abla/crypto/rsa"
@@ -60,6 +61,14 @@ private fun tlsEcSigner(scalar: string): (int, string) -> string =
         }
     }
 
+private fun tlsEc384Signer(scalar: string): (int, string) -> string =
+    { scheme: int, content: string ->
+        if (scheme != TLS_SIG_ECDSA_SECP384R1_SHA384) "" else {
+            val signature = p384EcdsaSign(scalar, content)
+            if (signature.ok) signature.bytes else ""
+        }
+    }
+
 private fun tlsEdSigner(seed: string): (int, string) -> string =
     { scheme: int, content: string ->
         // A cleared seed (TlsIdentity.wipe) would still sign, under another key: it signs nothing.
@@ -79,13 +88,14 @@ private val TLS_DIGEST_INFO_SHA256 = "\x30\x31\x30\x0d\x06\x09\x60\x86\x48\x01\x
 private val TLS_DIGEST_INFO_SHA384 = "\x30\x41\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x02\x05\x00\x04\x30"
 private val TLS_DIGEST_INFO_SHA512 = "\x30\x51\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x03\x05\x00\x04\x40"
 
-/** The scalar of an ECPrivateKey (RFC 5915) at `item` of `der`: "" if it is not a P-256 key's. */
+/** The scalar of an ECPrivateKey (RFC 5915) at `item` of `der` (a view of it), or "". */
 private fun tlsEcScalar(der: string, item: DerItem): string {
     if (!item.ok || item.tag != 48) return ""
     val version = derItem(der, item.start, item.end)
     val octets = derItem(der, version.end, item.end)
     if (!version.ok || !octets.ok || octets.tag != 4) return ""
-    tlsPadLeft(der.slice(octets.start, octets.end), 32)
+    // The octets as they are (32 bytes for P-256, 48 for P-384, RFC 5915 section 3); tlsIdentityFromEc pads a short one to its curve.
+    der.slice(octets.start, octets.end)
 }
 
 /** Reads the key and returns the identity for `chain`; `error` is set when it cannot. */
@@ -134,13 +144,31 @@ private fun tlsIdentityFromKey(chain: array<string>, keyDer: string, label: stri
     tlsIdentityFailed("an unsupported private key type ($algorithmOid)")
 }
 
-// (`keyDer` is what `scalar` was read from: a padded scalar is a copy, so both are the identity's secrets.)
-private fun tlsIdentityFromEc(chain: array<string>, leaf: X509Certificate, scalar: string, keyDer: string): TlsIdentity {
-    if (scalar.size != 32) return tlsIdentityFailed("not a readable P-256 private key")
-    val pub = p256PublicKey(scalar)
-    if (!pub.ok) return tlsIdentityFailed("not a valid P-256 private key")
-    if (pub.bytes != leaf.keyBits) return tlsIdentityFailed("the private key is not the client certificate's")
+// (`keyDer` is what `octets` was read from; the scalar is a buffer of its own, padded to its curve's size, so both are the identity's secrets and
+// wiping either leaves the other as it was.) A key of 32 bytes or fewer is P-256, one of 33 to 48 is P-384.
+private fun tlsIdentityFromEc(chain: array<string>, leaf: X509Certificate, octets: string, keyDer: string): TlsIdentity {
+    if (octets.size == 0 || octets.size > 48) return tlsIdentityFailed("not a readable EC private key")
+    val wide = octets.size > 32
+    val size = if (wide) 48 else 32
+    val scalar = cryptoOwnedJoin([tlsZeroBytes(size - octets.size), octets], size)
+    val pub = if (wide) p384PublicKey(scalar) else p256PublicKey(scalar)
+    val curve = if (wide) "P-384" else "P-256"
+    if (!pub.ok) {
+        cryptoWipeString(scalar)
+        return tlsIdentityFailed("not a valid $curve private key")
+    }
+    if (pub.bytes != leaf.keyBits) {
+        cryptoWipeString(scalar)
+        return tlsIdentityFailed("the private key is not the client certificate's")
+    }
+    if (wide) return TlsIdentity(chain, [TLS_SIG_ECDSA_SECP384R1_SHA384], tlsEc384Signer(scalar), "", [keyDer, scalar])
     TlsIdentity(chain, [TLS_SIG_ECDSA_SECP256R1_SHA256], tlsEcSigner(scalar), "", [keyDer, scalar])
+}
+
+private fun tlsZeroBytes(count: int): string {
+    val bytes: array<int> = []
+    while (bytes.size < count) bytes.append(0)
+    cryptoByteString(bytes)
 }
 
 /** The identity of a certificate PEM (the leaf first, then intermediates) and a private key PEM; `passphrase`

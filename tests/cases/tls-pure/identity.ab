@@ -11,6 +11,7 @@ import "abla/sys/linux"
 import "abla/tls/pure/client"
 import "abla/tls/pure/handshake"
 import "abla/tls/pure/identity"
+import "abla/tls/pure/keysched"
 import "abla/tls/pure/verify"
 
 var failures = 0
@@ -50,15 +51,16 @@ fun exercise(name: string, identity: TlsIdentity): void {
 
 fun main: int {
     val directory = processArgument(0)
-    for (kind in ["rsa", "p256", "ed25519"]) {
+    for (kind in ["rsa", "p256", "p384", "ed25519"]) {
         val certificate = read("$directory/$kind.pem")
         exercise(kind, tlsIdentityFromPem(certificate, read("$directory/$kind.key")))
     }
     exercise("rsa pkcs1", tlsIdentityFromPem(read("$directory/rsa.pem"), read("$directory/rsa-alt.key")))
     exercise("p256 sec1", tlsIdentityFromPem(read("$directory/p256.pem"), read("$directory/p256-alt.key")))
+    exercise("p384 sec1", tlsIdentityFromPem(read("$directory/p384.pem"), read("$directory/p384-alt.key")))
     exercise("rsa encrypted", tlsIdentityFromPem(read("$directory/rsa.pem"), read("$directory/rsa-enc.key"), "secret"))
     // PKCS#12 (PBES2, SHA-256 MAC, as OpenSSL 3 writes): every key kind, a wrong password, a chain, garbage.
-    for (kind in ["rsa", "p256", "ed25519"]) {
+    for (kind in ["rsa", "p256", "p384", "ed25519"]) {
         val container = linuxReadFile("$directory/$kind.p12", 1048576)
         exercise("$kind pkcs12", tlsIdentityFromPkcs12(container, "secret"))
         if (tlsIdentityFromPkcs12(container, "wrong").ok()) fail("$kind pkcs12 opened with a wrong password")
@@ -80,6 +82,11 @@ fun main: int {
     if (wrongPassphrase.ok()) fail("an encrypted key opened with a wrong passphrase")
     val mismatch = tlsIdentityFromPem(read("$directory/rsa.pem"), read("$directory/p256.key"))
     if (mismatch.ok()) fail("a key of another certificate was accepted")
+    val mismatch384 = tlsIdentityFromPem(read("$directory/p384.pem"), read("$directory/p256.key"))
+    if (mismatch384.ok()) fail("a P-256 key for a P-384 certificate was accepted")
+    val mismatch256 = tlsIdentityFromPem(read("$directory/p256.pem"), read("$directory/p384.key"))
+    if (mismatch256.ok()) fail("a P-384 key for a P-256 certificate was accepted")
+    ownership(directory)
     val mismatchRsa = tlsIdentityFromPem(read("$directory/p256.pem"), read("$directory/rsa.key"))
     if (mismatchRsa.ok()) fail("an RSA key for an EC certificate was accepted")
     if (tlsIdentityFromPem("", read("$directory/rsa.key")).ok()) fail("no certificate was accepted")
@@ -88,4 +95,22 @@ fun main: int {
     if (failures > 0) return 1
     println("tls-pure identity ok")
     0
+}
+
+/** An EC identity's scalar is a buffer of its own: wiping the key's DER (the first of its secrets) does not change what it signs with, and
+ *  wiping the scalar (the second) makes it sign nothing. (The scalar used to be a slice of the DER, so wiping the DER zeroed it.) */
+fun ownership(directory: string): void {
+    for (kind in ["p256", "p384"]) {
+        val identity = tlsIdentityFromPem(read("$directory/$kind.pem"), read("$directory/$kind.key"))
+        if (!identity.ok() || identity.secrets.size != 2) {
+            fail("$kind: the identity has ${identity.secrets.size} secrets: ${identity.error}")
+            continue
+        }
+        val scheme = identity.schemes[0]
+        tlsWipe(identity.secrets[0])
+        if (identity.sign(scheme, "after the DER is wiped").size == 0) fail("$kind: wiping the key's DER changed what the identity signs with")
+        tlsWipe(identity.secrets[1])
+        if (identity.sign(scheme, "after the scalar is wiped").size != 0) fail("$kind: an identity with a wiped scalar still signed")
+    }
+    return
 }

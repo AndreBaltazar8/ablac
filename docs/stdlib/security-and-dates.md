@@ -5,7 +5,7 @@
 | `abla/crypto` | SHA-512, SHA-384, SHA-256, SHA-1, MD5, HMAC, PBKDF2, Base64, hexadecimal, constant-time comparison |
 | `abla/crypto/aes`, `abla/crypto/rsa`, `abla/crypto/pure` | AES (GCM, CBC, ECB), RSA signing, verifying and encryption, key parsing: in Abla, on every target |
 | `abla/crypto/p256` | NIST P-256: ECDH and ECDSA (SHA-256, RFC 6979 nonces), in Abla, on every target |
-| `abla/crypto/p384` | NIST P-384: ECDH and ECDSA verification, in Abla |
+| `abla/crypto/p384` | NIST P-384: ECDH, ECDSA signing (RFC 6979, SHA-384) and verification, in Abla |
 | `abla/crypto/sha3` | SHA3-256, SHA3-512, SHAKE128 and SHAKE256 (FIPS 202) with an incremental sponge, in Abla, on every target |
 | `abla/crypto/mlkem` | ML-KEM-768 (FIPS 203): key generation, encapsulation and decapsulation with implicit rejection, in Abla, on every target |
 | `abla/crypto/x509` | X.509 certificates: parsing, chain building and validation (RFC 5280), host names (RFC 6125), a trust store, in Abla |
@@ -514,7 +514,7 @@ is refused, and e-mail or URI names and other name forms under constraints are r
 ECDSA with SHA-256, -384 or -512 on RSA, P-256 and P-384 keys; RSASSA-PSS (SHA-2, MGF1 of the same hash, an explicit salt length; the issuer's key rsaEncryption) and Ed25519; SHA-1 and MD5 signatures are refused. RSA keys under 2048 bits and unusual EC curves in a leaf or an intermediate
 are refused. Not done: revocation, certificate policies, the common name, the public suffix list, id-RSASSA-PSS public keys.
 
-`abla/crypto/p384` has ECDH (`p384Ecdh`, `p384PublicKey`: 48-byte private keys, constant time, tools/test-ct.sh reads the cores; checked against Wycheproof's 790 ECDH vectors and openssl) and ECDSA verification (variable time, on public values), checked against Wycheproof's 504
+`abla/crypto/p384` has ECDH (`p384Ecdh`, `p384PublicKey`, `p384EcdsaSign` and `p384EcdsaSignRaw` over SHA-384 with the RFC 6979 nonce, checked against RFC 6979 A.2.6 and openssl: 48-byte private keys, constant time, tools/test-ct.sh reads the cores; checked against Wycheproof's 790 ECDH vectors and openssl) and ECDSA verification (variable time, on public values), checked against Wycheproof's 504
 secp384r1/SHA-384 vectors. Tests (`tools/test-x509.sh`): the chains committed in `tests/cases/x509/chains` (made with `openssl` by
 `tools/gen-x509-fixtures.sh`: good RSA, P-256 and P-384 chains, expired, not yet valid, wrong name, wildcard and IP names, wrong
 usage, missing intermediate, unknown root, self-signed, tampered signature, name constraints, path length, a CA that is not one,

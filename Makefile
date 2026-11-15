@@ -343,6 +343,7 @@ test-serial: ablac
 	tools/test-crypto.sh $(COMPILER)
 	tools/test-hkdf.sh $(COMPILER)
 	tools/test-x25519.sh $(COMPILER)
+	tools/test-wipe-sources.sh
 	tools/test-ed25519.sh $(COMPILER)
 	tools/test-tls-pure.sh $(COMPILER)
 	tools/test-tls-pure-interop.sh $(COMPILER)

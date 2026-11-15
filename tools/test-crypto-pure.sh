@@ -103,7 +103,9 @@ fi
 # a peer openssl made).
 p384_args=()
 p384_expected=()
+p384_i=0
 for _ in 1 2 3 4 5 6; do
+    p384_i=$((p384_i + 1))
     p384_priv=00$(random_hex 47)
     { printf '\x30\x3e\x02\x01\x01\x04\x30'; printf "$(echo "$p384_priv" | sed 's/\(..\)/\\x\1/g')"; printf '\xa0\x07\x06\x05\x2b\x81\x04\x00\x22'; } > "$out/p384-priv.der"
     openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-384 -outform DER -out "$out/p384-peer.der" 2> /dev/null
@@ -112,11 +114,22 @@ for _ in 1 2 3 4 5 6; do
     p384_pub=$(openssl pkey -inform DER -in "$out/p384-priv.der" -pubout -outform DER 2> /dev/null | tail -c 97 | od -An -vtx1 | tr -d ' \n')
     p384_shared=$(openssl pkeyutl -derive -keyform DER -inkey "$out/p384-priv.der" -peerform DER -peerkey "$out/p384-peer-pub.der" 2> /dev/null | od -An -vtx1 | tr -d ' \n')
     p384_args+=("$p384_priv" "$p384_peer")
+    cp "$out/p384-priv.der" "$out/p384-priv-$p384_i.der"
     p384_expected+=("public $p384_pub" "shared $p384_shared")
 done
 if "$out/p384" "${p384_args[@]}" > "$out/p384.log" 2>&1 && grep -q '^crypto-pure p384 ok$' "$out/p384.log" &&
     [[ $(grep -E '^(public|shared) ' "$out/p384.log") == $(printf '%s\n' "${p384_expected[@]}") ]]; then
-    echo "ok   p-384: scalar 1 and 2, refusals, ${#p384_expected[@]} outputs agree with openssl"
+    p384_verified=0
+    printf 'p384 sign test' > "$out/p384-message"
+    p384_i=0
+    while read -r _ p384_signature; do
+        p384_i=$((p384_i + 1))
+        printf "$(echo "$p384_signature" | sed 's/\(..\)/\\x\1/g')" > "$out/p384-signature"
+        openssl pkey -inform DER -in "$out/p384-priv-$p384_i.der" -pubout -out "$out/p384-pub.pem" 2> /dev/null
+        openssl dgst -sha384 -verify "$out/p384-pub.pem" -signature "$out/p384-signature" "$out/p384-message" > "$out/p384-verify.log" 2>&1 && p384_verified=$((p384_verified + 1))
+    done < <(grep '^signature ' "$out/p384.log")
+    [[ $p384_verified -eq 6 ]] || { fail "p384: openssl verified $p384_verified of 6 signatures"; cat "$out/p384-verify.log"; }
+    echo "ok   p-384: scalar 1 and 2, refusals, RFC 6979 signature, ${#p384_expected[@]} outputs and $p384_verified signatures agree with openssl"
 else
     fail p384; tail -20 "$out/p384.log"; printf '%s\n' "${p384_expected[@]}" | head -4
 fi

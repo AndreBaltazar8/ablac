@@ -135,10 +135,11 @@ stop_server
 # certificate; that client is accepted, one with no identity and one with another certificate are refused. (TLS 1.2 needs the client certificate's curve in the server's groups: hence X25519:P-256.)
 openssl rsa -in "$out/rsa.key" -traditional -out "$out/rsa-alt.key" 2> /dev/null
 openssl ec -in "$out/p256.key" -out "$out/p256-alt.key" 2> /dev/null
+openssl ec -in "$out/p384.key" -out "$out/p384-alt.key" 2> /dev/null
 openssl pkcs8 -topk8 -v2 aes-256-cbc -iter 2000 -in "$out/rsa.key" -passout pass:secret -out "$out/rsa-enc.key" 2> /dev/null
 # PKCS#12 containers (OpenSSL 3's defaults: PBES2 AES-256-CBC, SHA-256 MAC) for the identity test and one mutual-TLS run:
 # one per key kind (the server certificates), the client certificates, and a chain (a CA and a leaf it signed).
-for kind in rsa p256 ed25519; do
+for kind in rsa p256 p384 ed25519; do
     openssl pkcs12 -export -inkey "$out/$kind.key" -in "$out/$kind.pem" -out "$out/$kind.p12" -passout pass:secret 2> /dev/null
 done
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$out/chain-ca.key" -out "$out/chain-ca.pem" -subj /CN=chain-ca -days 2 2> /dev/null
@@ -152,15 +153,17 @@ echo "$result"
 "$compiler" build tests/cases/tls-pure/mtls.ab -o "$out/mtls" --no-cache
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$out/client-rsa.key" 2> /dev/null
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$out/client-p256.key" 2> /dev/null
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-384 -out "$out/client-p384.key" 2> /dev/null
 openssl genpkey -algorithm ED25519 -out "$out/client-ed25519.key" 2> /dev/null
-for kind in rsa p256 ed25519; do
+for kind in rsa p256 p384 ed25519; do
     openssl req -x509 -new -key "$out/client-$kind.key" -out "$out/client-$kind.pem" -subj /CN=client-$kind -days 2 2> /dev/null
     openssl pkcs12 -export -inkey "$out/client-$kind.key" -in "$out/client-$kind.pem" -out "$out/client-$kind.p12" -passout pass:secret 2> /dev/null
 done
 for version in tls1_3 tls1_2; do
-for kind in rsa p256 ed25519; do
+for kind in rsa p256 p384 ed25519; do
     other=$([[ $kind == rsa ]] && echo p256 || echo rsa)
-    tls_flag=-$version start_server ed25519 -www -groups X25519:P-256 -Verify 1 -CAfile "$out/client-$kind.pem" -verify_return_error
+    # (OpenSSL checks a TLS 1.2 client certificate's curve against its own groups: a P-384 certificate needs P-384 among them.)
+    tls_flag=-$version start_server ed25519 -www -groups X25519:P-256:secp384r1 -Verify 1 -CAfile "$out/client-$kind.pem" -verify_return_error
     for case in "accepted:client-$kind" "refused:none" "refused:client-$other"; do
         expect=${case%%:*}
         who=${case#*:}
@@ -250,7 +253,7 @@ negotiated() {   # the s_client options after the address; prints the key exchan
     sed -n 's/^Negotiated TLS1.3 group: //p; s/^Peer Temp Key: //p' "$out/s_client.err"
 }
 served=0
-for kind in ed25519 p256 rsa; do
+for kind in ed25519 p256 p384 rsa; do
     start_serve plain "$out/$kind.pem" "$out/$kind.key"
     for suite in TLS_AES_128_GCM_SHA256 TLS_AES_256_GCM_SHA384 TLS_CHACHA20_POLY1305_SHA256; do
         groups="X25519 P-256"
@@ -274,7 +277,7 @@ for kind in ed25519 p256 rsa; do
     [[ $result == 'tls-pure interop ok'* ]] || { echo "tls-pure client vs pure server ($kind): $result" >&2; exit 1; }
     stop_serve
 done
-echo "pure server: $served openssl s_client handshakes (3 key kinds x 3 suites x 2 groups, Ed25519 also P-384 and X25519MLKEM768, which of them was negotiated, and one-group servers that send a HelloRetryRequest) and the pure client, each key kind"
+echo "pure server: $served openssl s_client handshakes (4 key kinds x 3 suites x 2 groups, Ed25519 also P-384 and X25519MLKEM768, which of them was negotiated, and one-group servers that send a HelloRetryRequest) and the pure client, each key kind"
 # A server with one group: P-384, and the hybrid. s_client sends a share for the first of its groups (X25519) only, so the server must answer
 # with a HelloRetryRequest and s_client must retry with the group the server wants.
 start_serve p384 "$out/ed25519.pem" "$out/ed25519.key"
@@ -287,7 +290,7 @@ answer=$(s_client -groups X25519 -CAfile "$out/ed25519.pem" -verify_return_error
 stop_serve
 # The same server speaks TLS 1.2 to openssl s_client -tls1_2: every key kind x its suites x X25519 / P-256, then a client certificate.
 served12=0
-for kind in ed25519 p256 rsa; do
+for kind in ed25519 p256 p384 rsa; do
     start_serve plain "$out/$kind.pem" "$out/$kind.key"
     if [[ $kind == rsa ]]; then
         suites12="ECDHE-RSA-AES128-GCM-SHA256 ECDHE-RSA-AES256-GCM-SHA384 ECDHE-RSA-CHACHA20-POLY1305"
@@ -298,9 +301,10 @@ for kind in ed25519 p256 rsa; do
         groups12="X25519 P-256"
         [[ $kind == ed25519 ]] && groups12="$groups12 secp384r1"
         for group in $groups12; do
-            # (A TLS 1.2 client must offer the certificate's curve: P-256 for the P-256 key, so X25519 is offered beside it.)
+            # (A TLS 1.2 client must offer the certificate's curve: P-256 for the P-256 key, P-384 for the P-384 key, beside the group tried.)
             offered=$group
-            [[ $kind == p256 && $group == X25519 ]] && offered=X25519:P-256
+            [[ $kind == p256 && $group != P-256 ]] && offered=$group:P-256
+            [[ $kind == p384 && $group != secp384r1 ]] && offered=$group:secp384r1
             answer=$(s_tls=-tls1_2 s_client -cipher "$suite" -groups "$offered" -CAfile "$out/$kind.pem" -verify_return_error -verify_hostname localhost)
             [[ $answer == *'pure server: GET /pure'* ]] || { echo "tls-pure server TLS 1.2 ($kind $suite $group): [$answer] $(head -3 "$out/s_client.err") $(head -3 "$out/serve.log")" >&2; exit 1; }
             served12=$((served12 + 1))
@@ -318,7 +322,7 @@ answer=$(s_tls=-tls1_2 s_client -CAfile "$out/ed25519.pem" -cert "$out/client-p2
 answer=$(s_tls=-tls1_2 s_client -CAfile "$out/ed25519.pem")
 [[ $answer != *'pure server'* ]] || { echo "tls-pure server TLS 1.2: a client with no certificate was served: [$answer]" >&2; exit 1; }
 stop_serve
-echo "pure server: $served12 openssl s_client -tls1_2 handshakes (3 key kinds x 3 suites x 2 groups, Ed25519 also P-384 ECDHE) and a required client certificate"
+echo "pure server: $served12 openssl s_client -tls1_2 handshakes (4 key kinds x 3 suites x 2 groups, Ed25519 also P-384 ECDHE) and a required client certificate"
 start_serve alpn "$out/ed25519.pem" "$out/ed25519.key"
 answer=$(s_client -CAfile "$out/ed25519.pem" -alpn http/1.1,h2)
 [[ $answer == *'alpn=h2'* ]] || { echo "tls-pure server ALPN: [$answer] $(head -3 "$out/s_client.err")" >&2; exit 1; }

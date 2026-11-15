@@ -260,7 +260,7 @@ ed25519_read() { # object, architecture (default x86_64)
 p384_read() { # object, architecture (default x86_64)
     local object=$1 arch=${2:-x86_64}
     local specs=(ct_p384_add:@0,@1,@2,@3 ct_p384_subtract:@0,@1,@2,@3 ct_p384_in_range:@0,@1 ct_p384_point_add:@0,@1,@2,@3,@4
-        ct_p384_point_double:@0,@1,@2,@3 ct_p384_scalar_multiply:@0,@1,@2,@3,@4)
+        ct_p384_point_double:@0,@1,@2,@3 ct_p384_scalar_multiply:@0,@1,@2,@3,@4 ct_p384_multiply_plain:@0,@1,@2,@3,@4)
     $check --follow-calls "$arch" "$object" "${specs[@]}" > "$out/$arch-p384.log" 2>&1 || {
         cat "$out/$arch-p384.log" >&2; echo "ct: a secret reached a branch or an address in the P-384 cores on $arch" >&2; exit 1
     }
