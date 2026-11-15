@@ -98,7 +98,7 @@ Intel static image runs). What a program calls out of it shrinks with the work i
 library's system calls (files, directories, `stat`, `getdents`, descriptors, sockets, `poll` and `epoll` on
 kqueue, process creation and waiting, signal masks, time and random numbers, resource limits, terminals)
 are BSD system calls issued by the program itself (`__ablaRuntimeDarwinSyscall` in
-`abla/runtime/platform/host.ab`, the inline `svc #0x80` / `syscall` of the `ablaDarwinSyscall` intrinsic),
+`abla/runtime/platform/darwin`, a file only a Mach-O target loads, the inline `svc #0x80` / `syscall` of the `ablaDarwinSyscall` intrinsic),
 and so are the runtime's panic output, exit and its fault handlers. `tools/libsystem-imports-allowlist.txt`
 lists what a program, release and `--fast`, and the compiler still import; `tools/test-libsystem-imports.sh`
 runs in the macOS CI job, and the list may only shrink.

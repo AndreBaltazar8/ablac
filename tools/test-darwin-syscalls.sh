@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The calls a macOS program issues by BSD system call (#811, host.ab's
+# The calls a macOS program issues by BSD system call (#811, platform/darwin's
 # __ablaRuntimeDarwinSyscall), exercised one by one through the portable surface:
 # each program of tests/cases/darwin-syscalls prints "name: ok (value)" per call and exits 7
 # when all are right: main.ab (files and descriptors), sockets.ab (sockets), process.ab (fork, execve, wait4, kill, setpgid), kqueue.ab (epoll
