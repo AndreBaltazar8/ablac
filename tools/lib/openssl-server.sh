@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # Sourced by the TLS test scripts that need an `openssl s_server` as the peer (. "$(dirname "${BASH_SOURCE[0]}")/lib/openssl-server.sh").
 #
 #   openssl_server_start LOG BIND [s_server options...]

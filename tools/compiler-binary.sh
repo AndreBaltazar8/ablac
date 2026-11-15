@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # Sourced by tests. `abla_compiler_binary <compiler>` prints the compiler
 # binary itself, for a test that sets ABLA_SYSROOT (or copies the compiler):
 # a launcher, a frozen toolchain's or a released bin/ablac, exports its own
