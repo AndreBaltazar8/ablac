@@ -1289,6 +1289,26 @@ mmap form) apply there.
   self-builds get the 5 s. Reopen only with a cut that costs the built compiler under ~0.2%: the table says the cheap
   ones are early-cse<memssa> -> <> (+0.15% for -2.2%) and nothing else; the rest of the serial `opt` is SROA, the
   inliner, InstCombine and always-inline, which cost quality to touch.
+  *The allocator and the first collection* (2026-11-15; measured, declined, nothing landed). Instruction-level profile
+  of `__ablaRuntimeHostHeapAllocate` (`perf annotate`): in the compiler's own build 44% of its samples are two locked
+  instructions, `lock cmpxchg` 18.7% and `lock decq` 25.5%, the heap lock. The lock is on because the compiler enables
+  the background-free helper (`src/orc_main.ab`: `runtimeMemorySetBackgroundFree(true)`) and the first collection's
+  `__ablaRuntimeHostFreeStart` calls `__ablaRuntimeHostHeapShare()`: from then on every allocation and free takes the
+  futex mutex (~3% of the self-build's frontend CPU). In a small build it is 5% of HeapAllocate (most never collect
+  before the end). Not fixed: Drepper's mutex 2 needs the RMW at unlock to learn about waiters (no plain-store release),
+  and dropping the lock between helper runs would race the thread-end hook (`999bc080` frees thread-locals from the
+  heap). Elsewhere the allocate path has no hotspot (class index, free-list pop, parked accounting; the hot load is the
+  popped block's next pointer, a cache miss). User programs are single-threaded by default and lock-free already.
+  What does cost a mid-sized build is the first pressure collection: `memorySetCollectionGrowth(bytes)` puts it at
+  live + bytes/2 (the compiler's 256 MiB step: ~135 MB), so `http-event --fast --no-cache` (272 MB RSS) collects once
+  near the end for ~90 MB of RSS. `build --fast --no-cache` instructions (`cpu_core instructions:u`, 3 runs), master
+  `9adebfd1`: base 5.81-5.85 G, RSS 272 MB; first collection at live + 3/4 step 5.44 G (-6.9%), RSS 365 MB (+93 MB),
+  the compiler's own build peak 1,518,900-1,526,500 -> 1,521,000-1,546,300 kB (+0.5%), `files` (262 MB) and `http-async`
+  (620 MB) unchanged; at a full step 5.44 G too but the self-build peak 1.52 -> 1.67 GB (+9%); with
+  `ABLA_COMPILER_COLLECT_GROWTH_MB` 384/512 the self-build peak is 1.68/1.76 GB. Declined: it trades ~90 MB of peak for
+  ~7% on the builds whose heap tops out between ~135 and ~200 MB, and shifts every user program that sets a growth, the
+  memory-for-CPU trade the peak rule excludes (branch `gc-first-threshold` `490aece6`: one line in `host.ab`,
+  `bytes / 2` -> `bytes * 3 / 4`; gc, heap, memory, runtime, collect and stress tests 21/21, stage 2 == stage 3).
 - **Peak RSS swings with where a collection falls in the program's phases, not with the trigger (#677,
   recorded as a no-go for a trigger or marking fix).** (2026-11-09, master `0eaf983e`, branch
   `gc-schedule`.) `tests/benchmarks/json-megabyte.ab` at 170000, same binary and input: 912 MB in
