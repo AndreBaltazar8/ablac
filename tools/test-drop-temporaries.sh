@@ -16,6 +16,10 @@
 #   parameter (a `for` over it ends it: only class instances are held as temporaries);
 # - alias: a view of a temporary's field kept after its statement sees what the drop did (it is accepted);
 # - refused: a view of a temporary kept after its statement is still refused.
+# - extensions, interfaces, generics, call-forms: the receiver and arguments of an extension function or operator, of
+#   interface dispatch, default bodies and interface extensions, of generic instances, and of named, default,
+#   overloaded and indirect calls; each case also compares its order under `#` with the run's (it prints "# differs"
+#   otherwise).
 set -euo pipefail
 
 compiler=${1:-build/ablac.bin}
@@ -57,6 +61,10 @@ runs loops ' |bare body 0 1 2 |no pass |source item20 item21 20 |array |end'
 runs labeled ' |nested 0 100 1 10 110 11 111 12 20 120 |or break 200 201 |do continue 310 311 320 321 |generator argument 401 402 403 |end'
 runs alias '0'
 runs evaluator 'true'
+runs extensions " |receiver 1 |argument of another type's extension 2 |receiver and argument 4 3 |operator 6 5 |in an interpolation v=7 7 |string receiver 8 |condition 9 then |end"
+runs interfaces ' |dispatch receiver 1 |default body receiver 2 |default body through the class 3 |dispatch argument 5 4 |default body argument 7 6 |interface extension receiver 8 |plain interface argument 10 |plain default body argument 11 |plain interface extension argument 12 |interface parameter 13 |end'
+runs generics ' |generic function 1 |generic class method 2 |returns T 3 4 |T is the resource 5 6 |bounded 7 |generic extension 8 |end'
+runs call-forms " |named 1 |default 2 |overloads 3 4 |function value 5 |lambda 6 |when arm 7 |callee's lambda 9 |for over a method's array x10 x11 10 |array append of a field 11 |map key from a method 12 |end"
 runs nested-order $'B2HI2HI1|B4HI4HI3|B6HI6HI5|B8HI8HI7|B10HI10HI9Y1|F12HI12HI11|B14HI14HI13|B19HI19,B18HI18HI17,|\nB2HI2HI1|B4HI4HI3|B6HI6HI5|B8HI8HI7|B10HI10HI9Y1|F12HI12HI11|B14HI14HI13|B19HI19,B18HI18HI17,|'
 runs affine-projection $'BHI|BHI|BHI|BHI|B|BHI|BHI|HI\nBHI|BHI|BHI|BHI|B|BHI|BHI|HI'
 

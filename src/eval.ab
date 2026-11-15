@@ -5359,11 +5359,13 @@ class BootstrapEvaluator(
         receiver: BootstrapEvalValue,
         expression: BootstrapExpression,
         // An interface whose default body answers (`this` stays the instance).
-        defaultOwner: string = ""
+        defaultOwner: string = "",
+        // An interface of the receiver's class whose extension function answers.
+        interfaceExtension: string = ""
     ): BootstrapEvalValue {
         var result = bootstrapEvalInvalid()
         val lookupOwner = if (defaultOwner != "") defaultOwner else receiver.owner
-        var receiverType = receiver.owner
+        var receiverType = if (interfaceExtension != "") interfaceExtension else receiver.owner
         if (receiver.kind == "string") receiverType = "string"
         if (bootstrapIsWideIntType(receiver.kind)) receiverType = receiver.kind
         if (receiver.kind == "integer") {
@@ -5710,6 +5712,14 @@ class BootstrapEvaluator(
             )
             if (interfaceName != "") {
                 return this.evaluateMethod(receiver, expression, interfaceName)
+            }
+            // An extension function of one of its interfaces (`fun Held.describe()`), as sema finds it.
+            if (interfaceExtension == "") {
+                for (candidate in bootstrapClassInterfaces(this.declarations, receiver.owner)) {
+                    if (bootstrapEvalInterfaceHasExtension(this, candidate, expression.text)) {
+                        return this.evaluateMethod(receiver, expression, "", candidate)
+                    }
+                }
             }
         }
         if (result.kind == "invalid") this.errors = this.errors + 1
@@ -8745,8 +8755,12 @@ fun bootstrapEvaluateMemberCall(
                // An extension of `array<T>` or `Map<K, V>`.
                receiver.kind == "array" ||
                receiver.kind == "map") {
+        // (Also a receiver whose call an interface's default body or extension function answers:
+        // `make().describe()`, as lowering holds it.)
         if (rawReceiver.kind == "object" && bootstrapEvalMayBeTemporary(expression.children[0]) &&
-            bootstrapEvalClassHasMethodOrExtension(evaluator, receiver.owner, expression.text)) {
+            (bootstrapEvalClassHasMethodOrExtension(evaluator, receiver.owner, expression.text) ||
+             (receiver.kind == "object" &&
+              bootstrapEvalInterfaceAnswers(evaluator, receiver.owner, expression.text)))) {
             evaluator.holdTemporary(expression.children[0], rawReceiver)
         }
         result = evaluator.evaluateMethod(receiver, expression)
@@ -8754,7 +8768,28 @@ fun bootstrapEvaluateMemberCall(
     result
 }
 
-/** Whether a class method or extension borrows this receiver. Interface default bodies are handled separately. */
+/** Whether an extension function `name` of interface `interfaceName` is declared. */
+fun bootstrapEvalInterfaceHasExtension(evaluator: BootstrapEvaluator, interfaceName: string,
+    name: string): bool {
+    for (declaration in evaluator.declarations) {
+        if ((declaration.kind == "fun" || declaration.kind == "compile.fun") &&
+            declaration.name == name && declaration.extensionOwner != "" &&
+            bootstrapNormalizeType(declaration.extensionOwner) == interfaceName) return true
+    }
+    false
+}
+
+/** Whether a call `name` on an instance of class `owner` borrows it through an interface: an interface's default body
+ *  or an extension function of one of its interfaces answers it. */
+fun bootstrapEvalInterfaceAnswers(evaluator: BootstrapEvaluator, owner: string, name: string): bool {
+    if (evaluator.defaultMethodInterface(owner, name) != "") return true
+    for (candidate in bootstrapClassInterfaces(evaluator.declarations, owner)) {
+        if (bootstrapEvalInterfaceHasExtension(evaluator, candidate, name)) return true
+    }
+    false
+}
+
+/** Whether a class method or extension borrows this receiver (an interface's default body is checked by the caller). */
 fun bootstrapEvalClassHasMethodOrExtension(evaluator: BootstrapEvaluator, owner: string,
     name: string): bool {
     val indexed = evaluator.context.size == evaluator.declarations.size

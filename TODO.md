@@ -778,15 +778,15 @@ mmap form) apply there.
   - The release Xtensa reading is unchanged, byte for byte: identical logs from master's checker and this one on the
     release object (63 fixtures and the 16 leaks, with and without `--follow-calls`) and on its residue entries.
   - No real secret branch from unoptimised lowering showed on any target.
-- [ ] **Close the temporary-resource drop gaps (#736 follow-up).** A fresh resource that is only a temporary is dropped at the
-  end of its statement when it is the receiver of a class's own method or of a field read, or an argument to a plain
-  function or method (docs/ownership.md). Still leaking as before, so a secret in one (the password case:
-  `pbeOpenPkcs8(data, cryptoPassword(pw))` is covered; the same through an extension function is not) is not wiped: the
-  receiver and arguments of an extension function, of interface dispatch and default bodies, of generic instances' calls
-  that lower through other paths, and of the built-in container methods. Each needs the same `holdTemporary` at its call
-  site in `src/ir.ab` (and the evaluator's in `src/eval.ab`) and a case in tests/cases/drop-temporaries; the `own`/`var`
-  kinds and constructors stay out. Check first which of them a resource can reach (a resource cannot be an array
-  element's receiver, for example).
+- [x] **Close the temporary-resource drop gaps (#736 follow-up).** A fresh resource that is only a temporary is dropped at
+  the end of its statement (docs/ownership.md) on every path this item listed, checked one by one (2026-11-15): the
+  receiver and arguments of an extension function or operator, of interface dispatch, default bodies and interface
+  extensions, of generic functions, generic class methods, bounded generics and generic extensions, and of named,
+  default, overloaded and indirect calls. Compiled code (release, --fast, JIT) already did after the later #736
+  follow-ups; the evaluator kept a receiver that a resource interface's default body answered, and could not call an
+  extension function of an interface at all, both fixed. A built-in container method takes a resource only to own it
+  (`append`, a map's `set`), so a temporary reaches one only through a field or a method's result, which drops as any
+  receiver. Cases: tests/cases/drop-temporaries/{extensions,interfaces,generics,call-forms}.ab, each compared with `#`.
 - [ ] **Secret residue is checked for stack slots on x86-64 and AArch64 release and on Xtensa, not on Wasm.** `--residue` fails an entry that returns with a
   secret in a slot of its frame, or that gave a secret to a callee and didn't wipe the stack below it
   (`abla/ct/scrub`; the checker reads the callees' depth and the size of the wipe). Every fixture's residue entry

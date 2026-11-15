@@ -402,6 +402,16 @@ log = log + "V$y|"
 // PI3I2V5|
 ```
 
+The same holds for every other way a call can borrow a temporary: interface
+dispatch, an interface's default body or extension function, a generic
+function or a generic class's method (the resource may be `T` itself), and
+named, default-argument, overloaded and indirect calls (a function value or a
+lambda), at compile time too. A built-in container method takes a resource only
+to own it (`append`, a map's `set`)
+([tests](../tests/cases/drop-temporaries/interfaces.ab),
+[generics](../tests/cases/drop-temporaries/generics.ab),
+[call forms](../tests/cases/drop-temporaries/call-forms.ab)).
+
 **Conditions and subjects.** A temporary in an `if`, `while` or `do`-`while`
 condition drops after that evaluation and before its body or the next
 statement. A loop condition is evaluated and cleaned up on each pass. A
