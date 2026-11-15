@@ -26,6 +26,7 @@ import "staged_parser.ab"
 import "package.ab"
 import "formatter_cli.ab"
 import "emutls_export.ab"
+import "backend/llvm/live.ab"
 
 // The guarded compiler launcher already supplies its process memory budget.
 // Feed a conservative portion of the same budget to Abla's tracked allocator
@@ -112,9 +113,11 @@ fun bootstrapOrcEmit(sourcePath: string): int {
 fun bootstrapRunInProcess(
     sourcePath: string,
     arguments: array<string> = [],
-    passes: string = ""
+    passes: string = "",
+    live: bool = false
 ): int {
-    val key = jitRunKey(sourcePath, passes)
+    // A live build (`--live`, live.ab) is another object: its calls go through the table.
+    val key = jitRunKey(sourcePath, if (live) "$passes\nlive" else passes)
     val session = llvmOrcCreateSession()
     var status = session.status
     var generation = LlvmOrcGeneration(nativeNullPointer(), 128, true)
@@ -133,7 +136,13 @@ fun bootstrapRunInProcess(
         }
     }
     if (status == 0 && entry == 0) {
+        val enclosingLive = bootstrapLlvmLiveRun
+        bootstrapLlvmLiveRun = live
         val prepared = bootstrapPrepareRun(sourcePath, true)
+        bootstrapLlvmLiveRun = enclosingLive
+        if (live && linuxEnvironment("ABLA_LIVE_TRACE").found) {
+            linuxPrintStandardError("live: ${bootstrapLlvmLiveCount} functions through the table\n")
+        }
         status = prepared.status
         if (status == 0) {
             // The session owns the held module from here on.
@@ -1029,7 +1038,7 @@ fun bootstrapRepl(): int {
 
 fun bootstrapOrcUsage(): int {
     linuxPrintStandardError(
-        "usage: ablac build [<file.ab> | --project <dir>] [-o output] [--emit executable|object|static-library|shared-library] [--fast | --o1] [-g | --debug | --no-debug] [--no-cache] [--sidecar | --no-sidecar] [--offline] [--strict-imports] [--visibility-report <file>] [--target <name> | --target-triple <triple> --object-format <elf|macho|coff|wasm>]\n       targets: ${bootstrapSupportedTargets()}\n       ablac package update [--project <dir>]\n       ablac package vendor [--project <dir>] [--offline]\n       ablac test <file.ab>... [--fast] [--no-cache] # build (--o1) and run test programs (abla/test)\n       ablac run [--o1 | --fast] [--built | --release] [<file.ab> | --project <dir>] [--offline] [-- <program arguments>] # in-process LLVM ORC (--built: cached build, exec'd)\n       ablac repl                                # persistent definitions + expressions\n       ablac serve [<file.ab> | --project <dir>] # watched fast-build service\n       ablac fmt [--check] [--width 100] <file.ab|directory|->...\n       ablac analyze --stdio                     # persistent JSON-lines analysis service\n       ablac --emit-llvm <file.ab>\n"
+        "usage: ablac build [<file.ab> | --project <dir>] [-o output] [--emit executable|object|static-library|shared-library] [--fast | --o1] [-g | --debug | --no-debug] [--no-cache] [--sidecar | --no-sidecar] [--offline] [--strict-imports] [--visibility-report <file>] [--target <name> | --target-triple <triple> --object-format <elf|macho|coff|wasm>]\n       targets: ${bootstrapSupportedTargets()}\n       ablac package update [--project <dir>]\n       ablac package vendor [--project <dir>] [--offline]\n       ablac test <file.ab>... [--fast] [--no-cache] # build (--o1) and run test programs (abla/test)\n       ablac run [--o1 | --fast] [--built | --release | --live] [<file.ab> | --project <dir>] [--offline] [-- <program arguments>] # in-process LLVM ORC (--built: cached build, exec'd; --live: functions redefinable while it runs)\n       ablac repl                                # persistent definitions + expressions\n       ablac serve [<file.ab> | --project <dir>] # watched fast-build service\n       ablac fmt [--check] [--width 100] <file.ab|directory|->...\n       ablac analyze --stdio                     # persistent JSON-lines analysis service\n       ablac --emit-llvm <file.ab>\n"
     )
     2
 }
@@ -1397,6 +1406,7 @@ fun main: int {
         }
         var runProfile = "o1"
         var runBuilt = false
+        var runLive = false
         val runOptions: array<string> = []
         scan = 1
         while (scan < runCount) {
@@ -1407,6 +1417,7 @@ fun main: int {
                 runProfile = "release"
                 runBuilt = true
             } else if (option == "--built") runBuilt = true
+            else if (option == "--live") runLive = true
             else if (option == "--jit") runBuilt = false
             else if (option == "--cache-dir" && scan + 1 < runCount) {
                 scan = scan + 1
@@ -1462,7 +1473,8 @@ fun main: int {
         if (runValid && !runBuilt) {
             status = bootstrapRunInProcess(
                 runSource, runArguments,
-                if (runProfile == "fast") llvmPassesFast() else llvmPassesBalanced()
+                if (runProfile == "fast") llvmPassesFast() else llvmPassesBalanced(),
+                runLive
             )
         } else if (runValid) {
             status = bootstrapRunBuilt(runSource, runArguments, runProfile)
