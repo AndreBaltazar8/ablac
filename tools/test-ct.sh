@@ -16,12 +16,14 @@ out=build/ct
 cd "$project_root"
 rm -rf "$out"
 mkdir -p "$out"
-# The checker, its fixture generators and their self-tests are Abla programs (tools/ct/check, tools/ct/fixtures).
+# The checker, its fixture generators and their self-tests are Abla programs (tools/ct/check, tools/ct/fixtures). They
+# are built release: what is under test is the code they read (the fixtures, --fast ones included), not their own, and
+# reading it took this test 364 s with them built --fast against 169 s built release (2026-11-15).
 tools_out=$out/tools
 mkdir -p "$tools_out"
 for tool in check/main:check check/selftest:selftest fixtures/source:source-fixtures fixtures/residue:residue-entries \
     fixtures/test-source:test-source-fixtures; do
-    "$compiler" build "tools/ct/${tool%%:*}.ab" -o "$tools_out/${tool##*:}" --fast > "$tools_out/${tool##*:}.log" 2>&1 ||
+    "$compiler" build "tools/ct/${tool%%:*}.ab" -o "$tools_out/${tool##*:}" > "$tools_out/${tool##*:}.log" 2>&1 ||
         { cat "$tools_out/${tool##*:}.log" >&2; echo "ct: tools/ct/${tool%%:*}.ab did not build" >&2; exit 1; }
 done
 check="$tools_out/check"

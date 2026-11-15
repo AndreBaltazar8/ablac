@@ -12,11 +12,13 @@ rm -rf "$out"
 mkdir -p "$out"
 cd "$root"
 pids=()
+# Release builds: these programs verify thousands of signatures, which take 165 s built --fast and 6 s built release
+# (2026-11-15), and nothing here is about --fast code.
 for program in main limbo; do
-    "$compiler" build "tests/cases/x509/$program.ab" -o "$out/$program" --fast --no-cache > "$out/$program.build.log" 2>&1 &
+    "$compiler" build "tests/cases/x509/$program.ab" -o "$out/$program" --no-cache > "$out/$program.build.log" 2>&1 &
     pids+=("$!")
 done
-"$compiler" build tests/cases/p384/main.ab -o "$out/p384" --fast --no-cache > "$out/p384.build.log" 2>&1 &
+"$compiler" build tests/cases/p384/main.ab -o "$out/p384" --no-cache > "$out/p384.build.log" 2>&1 &
 pids+=("$!")
 names=(main limbo p384)
 for index in "${!names[@]}"; do
