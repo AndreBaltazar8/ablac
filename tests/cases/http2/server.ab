@@ -1,0 +1,457 @@
+// H2Server (abla/http/h2/server) against a scripted client in process: the preface and SETTINGS, requests (GET, HEAD, POST with a body in pieces, trailers), responses under flow
+// control, every limit (frame size, header block, CONTINUATION, control floods, pending acknowledgements, Rapid Reset, concurrent streams, request body size, windows, HPACK errors),
+// the request rules (pseudo-headers, names, connection-specific headers, content-length), closed and idle streams, graceful shutdown. Each limit test fails with its check removed.
+// Prints "http2 server ok".
+import "abla/io"
+import "abla/crypto"
+import "abla/array"
+import "abla/integer"
+import "abla/http"
+import "abla/http/h2"
+import "abla/http/h2/hpack"
+import "abla/http/h2/server"
+
+var failures = 0
+
+fun fail(what: string): void {
+    failures = failures + 1
+    if (failures < 40) println("FAIL $what")
+    return
+}
+
+fun expect(cond: bool, what: string): void {
+    if (!cond) fail(what)
+    return
+}
+
+fun be32(value: int): string = cryptoByteString([(value >> 24) & 255, (value >> 16) & 255, (value >> 8) & 255, value & 255])
+
+fun frame(kind: int, flags: int, stream: int, payload: string): string {
+    val n = payload.size
+    cryptoByteString([(n >> 16) & 255, (n >> 8) & 255, n & 255, kind, flags, (stream >> 24) & 127, (stream >> 16) & 255, (stream >> 8) & 255, stream & 255]) + payload
+}
+
+class Seen(val kind: int, val flags: int, val stream: int, val payload: string)
+
+fun frames(output: string): array<Seen> {
+    val list: array<Seen> = []
+    var at = 0
+    while (at + 9 <= output.size) {
+        val n = (output[at] << 16) | (output[at + 1] << 8) | output[at + 2]
+        list.append(Seen(output[at + 3], output[at + 4], ((output[at + 5] & 127) << 24) | (output[at + 6] << 16) | (output[at + 7] << 8) | output[at + 8], output.slice(at + 9, at + 9 + n)))
+        at = at + 9 + n
+    }
+    list
+}
+
+fun count(list: array<Seen>, kind: int): int {
+    var n = 0
+    for (s in list) {
+        if (s.kind == kind) n = n + 1
+    }
+    n
+}
+
+fun goawayCode(list: array<Seen>): int {
+    for (s in list) {
+        if (s.kind == 7) return (s.payload[4] << 24) | (s.payload[5] << 16) | (s.payload[6] << 8) | s.payload[7]
+    }
+    -1
+}
+
+fun resetCode(list: array<Seen>, stream: int): int {
+    for (s in list) {
+        if (s.kind == 3 && s.stream == stream) return (s.payload[0] << 24) | (s.payload[1] << 16) | (s.payload[2] << 8) | s.payload[3]
+    }
+    -1
+}
+
+fun hf(name: string, value: string): HpackField = HpackField(name, value, false)
+
+fun block(fields: array<HpackField>): string {
+    var e = hpackEncoderNew(0)
+    e.encode(fields)
+}
+
+fun getFields(path: string): array<HpackField> = [hf(":method", "GET"), hf(":scheme", "https"), hf(":path", path), hf(":authority", "example.com")]
+
+/** A server past the preface and SETTINGS, its first output taken. */
+fun ready(): H2Server {
+    var s = h2ServerNew()
+    s.feed(H2_PREFACE + frame(4, 0, 0, ""), 0)
+    s.takeOutput()
+    s
+}
+
+fun ok(var s: H2Server): void {
+    s.respond(1, 200, [], "ok")
+    return
+}
+
+fun main: int {
+    basics()
+    limits()
+    floods()
+    streams()
+    rules()
+    flow()
+    ending()
+    if (failures == 0) println("http2 server ok")
+    failures
+}
+
+fun basics(): void {
+    var s = h2ServerNew()
+    val first = frames(s.takeOutput())
+    expect(first.size == 2 && first[0].kind == 4 && first[1].kind == 8, "SETTINGS and a connection WINDOW_UPDATE are queued")
+    s.feed(H2_PREFACE.slice(0, 10), 0)
+    expect(!s.isClosed(), "a prefix of the preface waits")
+    s.feed(H2_PREFACE.slice(10, 24) + frame(4, 0, 0, ""), 0)
+    expect(count(frames(s.takeOutput()), 4) == 1, "the client's SETTINGS is acknowledged")
+    s.feed(frame(1, 5, 1, block([hf(":method", "GET"), hf(":scheme", "https"), hf(":path", "/a/b?x=1&y=2"), hf(":authority", "example.com"), hf("x-test", "v")])), 1)
+    val reqs = s.takeRequests()
+    expect(reqs.size == 1 && reqs[0].stream == 1, "one request")
+    if (reqs.size == 1) {
+        val r = reqs[0].request
+        expect(r.method == "GET" && r.path == "/a/b" && r.query == "x=1&y=2" && r.body == "", "request line: ${r.method} ${r.path} ${r.query}")
+        expect(r.header("x-test") == "v" && r.header("host") == "example.com", "request headers")
+    }
+    expect(s.respond(1, 200, [HttpHeader("Content-Type", "text/plain"), HttpHeader("Connection", "close"), HttpHeader("X-A", "b")], "hello"), "respond")
+    val out = frames(s.takeOutput())
+    expect(out.size == 2 && out[0].kind == 1 && (out[0].flags & 4) != 0 && (out[0].flags & 1) == 0 && out[1].kind == 0 && (out[1].flags & 1) != 0 && out[1].payload == "hello", "HEADERS then DATA with END_STREAM")
+    var dec = hpackDecoderNew(4096, 65536, 16384, 256)
+    val got = dec.decode(out[0].payload)
+    var names = ""
+    if (got.ok) {
+        for (f in got.fields) names = names + f.name + ","
+        expect(got.fields[0].name == ":status" && got.fields[0].value == "200", "status")
+    }
+    expect(names == ":status,content-type,x-a,content-length,", "response fields (connection dropped, content-length added): ${names}")
+    expect(s.openStreams() == 0, "the stream is done")
+    expect(!s.respond(1, 200, [], "again"), "a second response is refused")
+    // HEAD: the headers with the length of the body, no DATA.
+    s.feed(frame(1, 5, 3, block([hf(":method", "HEAD"), hf(":scheme", "https"), hf(":path", "/"), hf(":authority", "e")])), 2)
+    s.takeRequests()
+    s.respond(3, 200, [], "twelve bytes")
+    val head = frames(s.takeOutput())
+    expect(head.size == 1 && head[0].kind == 1 && (head[0].flags & 1) != 0, "HEAD gets headers only")
+    // POST with the body in three DATA frames, then trailers on another.
+    s.feed(frame(1, 4, 5, block([hf(":method", "POST"), hf(":scheme", "https"), hf(":path", "/p"), hf(":authority", "e"), hf("content-length", "9")])) + frame(0, 0, 5, "abc") + frame(0, 0, 5, "def") + frame(0, 1, 5, "ghi"), 3)
+    val post = s.takeRequests()
+    expect(post.size == 1 && post[0].request.body == "abcdefghi" && post[0].request.method == "POST", "a body in pieces")
+    s.respond(5, 201, [], "")
+    s.takeOutput()
+    s.feed(frame(1, 4, 7, block([hf(":method", "POST"), hf(":scheme", "https"), hf(":path", "/t"), hf(":authority", "e")])) + frame(0, 0, 7, "xy") + frame(1, 5, 7, block([hf("x-trailer", "1")])), 4)
+    val tr = s.takeRequests()
+    expect(tr.size == 1 && tr[0].request.body == "xy" && tr[0].request.header("x-trailer") == "", "trailers are accepted and dropped")
+    // Invalid responses.
+    expect(!s.respond(7, 100, [], ""), "a 1xx status is refused")
+    expect(!s.respond(99, 200, [], ""), "an unknown stream is refused")
+    // Padded DATA and HEADERS with priority.
+    var p = ready()
+    p.feed(frame(1, 4 | 8 | 32 | 1 - 1, 1, cryptoByteString([2]) + be32(0) + cryptoByteString([10]) + block([hf(":method", "POST"), hf(":scheme", "https"), hf(":path", "/"), hf(":authority", "e")]) + "\0\0") + frame(0, 9, 1, cryptoByteString([3]) + "abc" + "\0\0\0"), 0)
+    val pr = p.takeRequests()
+    expect(pr.size == 1 && pr[0].request.body == "abc", "padding and priority fields are stripped")
+    return
+}
+
+fun limits(): void {
+    var a = ready()
+    a.feed(cryptoByteString([0, 64, 1, 0, 0, 0, 0, 0, 0]), 0)
+    expect(a.isClosed() && goawayCode(frames(a.takeOutput())) == H2_FRAME_SIZE_ERROR, "a frame header over 16384 is refused before its payload")
+    var b = ready()
+    var flood = frame(1, 0, 1, "")
+    for (k in 0 until 33) flood = flood + frame(9, 0, 1, "a")
+    b.feed(flood, 0)
+    expect(b.isClosed() && goawayCode(frames(b.takeOutput())) == H2_ENHANCE_YOUR_CALM, "a CONTINUATION flood")
+    var c = ready()
+    var bulk = frame(1, 0, 1, "")
+    for (k in 0 until 9) bulk = bulk + frame(9, 0, 1, "a".repeat(16000))
+    c.feed(bulk, 0)
+    expect(c.isClosed() && goawayCode(frames(c.takeOutput())) == H2_ENHANCE_YOUR_CALM, "a header block over 128 KiB")
+    var d = ready()
+    d.feed(frame(1, 4, 1, cryptoByteString([255, 255, 255, 255, 255, 255, 255])), 0)
+    expect(d.isClosed() && goawayCode(frames(d.takeOutput())) == H2_COMPRESSION_ERROR, "an HPACK error is COMPRESSION_ERROR")
+    var e = ready()
+    val many: array<HpackField> = getFields("/")
+    for (q in 0 until 300) many.append(hf("x-${q}", "v".repeat(300)))
+    var big = block(many)
+    var out = frame(1, 0, 1, big.slice(0, 16000))
+    var at = 16000
+    while (at < big.size) {
+        val take = if (big.size - at < 16000) big.size - at else 16000
+        out = out + frame(9, if (at + take >= big.size) 4 else 0, 1, big.slice(at, at + take))
+        at = at + take
+    }
+    e.feed(out, 0)
+    expect(e.isClosed() && goawayCode(frames(e.takeOutput())) == H2_ENHANCE_YOUR_CALM, "a decoded header list over the limit")
+    var f = ready()
+    f.feed(frame(1, 0, 1, block(getFields("/"))) + frame(6, 0, 0, "12345678"), 0)
+    expect(f.isClosed() && goawayCode(frames(f.takeOutput())) == H2_PROTOCOL_ERROR, "a frame inside a header block")
+    var g = ready()
+    g.feed(frame(9, 4, 1, "x"), 0)
+    expect(g.isClosed(), "CONTINUATION with no block open")
+    var h = h2ServerNew()
+    h.feed("GET / HTTP/1.1\r\n\r\nGET / HTTP/1.1\r\n", 0)
+    expect(h.isClosed() && goawayCode(frames(h.takeOutput())) == H2_PROTOCOL_ERROR, "a wrong preface")
+    var i = h2ServerNew()
+    i.feed(H2_PREFACE + frame(6, 0, 0, "12345678"), 0)
+    expect(i.isClosed(), "the first frame must be SETTINGS")
+    var j = ready()
+    j.feed(frame(5, 4, 1, be32(2) + "x"), 0)
+    expect(j.isClosed(), "PUSH_PROMISE from a client")
+    // The wrong lengths.
+    var k = ready()
+    k.feed(frame(6, 0, 0, "1234567"), 0)
+    expect(k.isClosed() && goawayCode(frames(k.takeOutput())) == H2_FRAME_SIZE_ERROR, "PING of the wrong length")
+    var l = ready()
+    l.feed(frame(8, 0, 0, "123"), 0)
+    expect(l.isClosed(), "WINDOW_UPDATE of the wrong length")
+    var m = ready()
+    m.feed(frame(4, 0, 0, "12345"), 0)
+    expect(m.isClosed(), "SETTINGS of the wrong length")
+    // Request body size: answered with 413 and the upload stopped.
+    var n = h2ServerNew(100, 10)
+    n.feed(H2_PREFACE + frame(4, 0, 0, "") + frame(1, 4, 1, block([hf(":method", "POST"), hf(":scheme", "https"), hf(":path", "/"), hf(":authority", "e")])) + frame(0, 0, 1, "0123456789ab"), 0)
+    val no = frames(n.takeOutput())
+    expect(n.takeRequests().size == 0 && count(no, 1) == 1 && count(no, 3) == 1 && !n.isClosed(), "a body over the limit is answered 413 and the upload stopped")
+    return
+}
+
+fun floods(): void {
+    var c = ready()
+    var pings = ""
+    for (k in 0 until 101) pings = pings + frame(6, 0, 0, "12345678")
+    c.feed(pings, 0)
+    expect(c.isClosed() && goawayCode(frames(c.takeOutput())) == H2_ENHANCE_YOUR_CALM, "more than 100 acknowledgements owed")
+    var d = ready()
+    var run = ""
+    for (k in 0 until 1001) run = run + frame(2, 0, 1, "12345")
+    d.feed(run, 0)
+    expect(d.isClosed() && goawayCode(frames(d.takeOutput())) == H2_ENHANCE_YOUR_CALM, "1001 empty frames in a row")
+    var e = ready()
+    var part = ""
+    for (k in 0 until 900) part = part + frame(2, 0, 1, "12345")
+    var okRun = true
+    for (r in 0 until 4) {
+        e.feed(part + frame(1, 5, 1 + 2 * r, block(getFields("/"))), 0)
+        e.takeRequests()
+    }
+    expect(!e.isClosed(), "frames with payload reset the run")
+    // Rapid Reset: streams opened and reset at once, over and over.
+    var f = ready()
+    var rapid = ""
+    for (k in 0 until 150) rapid = rapid + frame(1, 4, 1 + 2 * k, block(getFields("/"))) + frame(3, 0, 1 + 2 * k, be32(8))
+    f.feed(rapid, 0)
+    expect(!f.isClosed(), "150 resets in a second are within the budget")
+    var g = ready()
+    var rapid2 = ""
+    for (k in 0 until 300) rapid2 = rapid2 + frame(1, 4, 1 + 2 * k, block(getFields("/"))) + frame(3, 0, 1 + 2 * k, be32(8))
+    g.feed(rapid2, 0)
+    expect(g.isClosed() && goawayCode(frames(g.takeOutput())) == H2_ENHANCE_YOUR_CALM, "Rapid Reset: 300 resets in a second end the connection")
+    // The budget is per second: the same count spread over three seconds is fine.
+    var h = ready()
+    for (s in 0 until 3) {
+        var part2 = ""
+        for (k in 0 until 100) part2 = part2 + frame(1, 4, 1 + 2 * (s * 100 + k), block(getFields("/"))) + frame(3, 0, 1 + 2 * (s * 100 + k), be32(8))
+        h.feed(part2, 2000 * s + 5000)
+    }
+    expect(!h.isClosed(), "resets spread over several seconds")
+    return
+}
+
+fun streams(): void {
+    // Concurrent streams: past the limit the stream is refused (the connection goes on).
+    var s = h2ServerNew(2)
+    s.feed(H2_PREFACE + frame(4, 0, 0, ""), 0)
+    s.takeOutput()
+    s.feed(frame(1, 5, 1, block(getFields("/"))) + frame(1, 5, 3, block(getFields("/"))) + frame(1, 5, 5, block(getFields("/"))), 0)
+    val out = frames(s.takeOutput())
+    expect(!s.isClosed() && resetCode(out, 5) == H2_REFUSED_STREAM && s.takeRequests().size == 2, "a third stream over a limit of two is refused")
+    // Closed streams: DATA gets RST_STREAM(STREAM_CLOSED); a HEADERS with a lower id is a connection error.
+    var c = ready()
+    c.feed(frame(1, 5, 1, block(getFields("/"))), 0)
+    c.takeRequests()
+    c.respond(1, 200, [], "x")
+    c.takeOutput()
+    c.feed(frame(0, 0, 1, "late"), 0)
+    expect(resetCode(frames(c.takeOutput()), 1) == H2_STREAM_CLOSED && !c.isClosed(), "DATA on a closed stream")
+    c.feed(frame(1, 5, 3, block(getFields("/"))), 0)
+    c.takeRequests()
+    c.feed(frame(1, 5, 1, block(getFields("/"))), 0)
+    expect(c.isClosed() && goawayCode(frames(c.takeOutput())) == H2_STREAM_CLOSED, "HEADERS with a lower id")
+    var d = ready()
+    d.feed(frame(1, 5, 2, block(getFields("/"))), 0)
+    expect(d.isClosed(), "an even stream id")
+    var e = ready()
+    e.feed(frame(0, 0, 9, "x"), 0)
+    expect(e.isClosed(), "DATA on an idle stream")
+    var f = ready()
+    f.feed(frame(3, 0, 9, be32(8)), 0)
+    expect(f.isClosed(), "RST_STREAM on an idle stream")
+    var g = ready()
+    g.feed(frame(1, 4, 1, block([hf(":method", "POST"), hf(":scheme", "https"), hf(":path", "/"), hf(":authority", "e")])), 0)
+    g.feed(frame(1, 4, 1, block([hf("x", "y")])), 0)
+    expect(count(frames(g.takeOutput()), 3) == 1 && !g.isClosed(), "trailers without END_STREAM are a stream error")
+    return
+}
+
+fun rules(): void {
+    val bad: array<array<HpackField>> = [
+        [hf(":method", "GET"), hf(":scheme", "https"), hf(":path", "/"), hf("X-Upper", "1")],
+        [hf(":method", "GET"), hf(":scheme", "https")],
+        [hf(":method", "GET"), hf(":method", "GET"), hf(":scheme", "https"), hf(":path", "/")],
+        [hf(":method", "GET"), hf(":scheme", "https"), hf(":path", "/"), hf("connection", "close")],
+        [hf(":method", "GET"), hf(":scheme", "https"), hf(":path", "/"), hf("te", "gzip")],
+        [hf(":method", "GET"), hf(":scheme", "https"), hf(":path", "/"), hf(":status", "200")],
+        [hf(":method", "GET"), hf("x", "y"), hf(":scheme", "https"), hf(":path", "/")],
+        [hf(":method", "GET"), hf(":scheme", "https"), hf(":path", "/"), hf("content-length", "1"), hf("content-length", "2")],
+        [hf(":method", "CONNECT"), hf(":scheme", "https"), hf(":path", "/")],
+        [hf(":method", "GET"), hf(":scheme", "https"), hf(":path", "")]]
+    for (i in 0 until bad.size) {
+        var s = ready()
+        s.feed(frame(1, 5, 1, block(bad[i])), 0)
+        val out = frames(s.takeOutput())
+        expect(!s.isClosed() && s.takeRequests().size == 0 && resetCode(out, 1) == H2_PROTOCOL_ERROR, "bad request $i is a stream error")
+    }
+    var t = ready()
+    t.feed(frame(1, 5, 1, block([hf(":method", "GET"), hf(":scheme", "https"), hf(":path", "/"), hf("te", "trailers")])), 0)
+    expect(t.takeRequests().size == 1, "te: trailers is allowed")
+    var u = ready()
+    u.feed(frame(1, 4, 1, block([hf(":method", "POST"), hf(":scheme", "https"), hf(":path", "/"), hf("content-length", "5")])) + frame(0, 1, 1, "abc"), 0)
+    expect(count(frames(u.takeOutput()), 3) == 1 && u.takeRequests().size == 0, "content-length must match the body")
+    var v = ready()
+    v.feed(frame(1, 4, 1, block([hf(":method", "GET"), hf(":scheme", "https"), hf(":path", "/")])) + frame(0, 0, 1, "x"), 0)
+    expect(!v.isClosed(), "DATA after headers without END_STREAM is fine")
+    return
+}
+
+fun flow(): void {
+    // A response bigger than the window waits for WINDOW_UPDATE.
+    var s = ready()
+    s.feed(frame(1, 5, 1, block(getFields("/"))), 0)
+    s.takeRequests()
+    s.respond(1, 200, [], "b".repeat(100000))
+    var sent = 0
+    for (x in frames(s.takeOutput())) {
+        if (x.kind == 0) sent = sent + x.payload.size
+    }
+    expect(sent == 65535, "only the window is sent: $sent")
+    s.feed(frame(8, 0, 0, be32(100000)) + frame(8, 0, 1, be32(100000)), 0)
+    var more = 0
+    var ended = false
+    for (x in frames(s.takeOutput())) {
+        if (x.kind == 0) {
+            more = more + x.payload.size
+            if ((x.flags & 1) != 0) ended = true
+        }
+    }
+    expect(more == 100000 - 65535 && ended, "the rest follows the WINDOW_UPDATE: $more")
+    // A small stream window from SETTINGS binds before the connection window, and growing it releases the rest.
+    var sw = ready()
+    sw.feed(frame(4, 0, 0, cryptoByteString([0, 4, 0, 0, 0, 10])), 0)
+    sw.feed(frame(1, 5, 1, block(getFields("/"))), 0)
+    sw.takeRequests()
+    sw.takeOutput()
+    sw.respond(1, 200, [], "0123456789ABCDEF")
+    var n10 = 0
+    for (x in frames(sw.takeOutput())) {
+        if (x.kind == 0) n10 = n10 + x.payload.size
+    }
+    expect(n10 == 10, "the stream window follows SETTINGS: $n10")
+    sw.feed(frame(4, 0, 0, cryptoByteString([0, 4, 0, 0, 0, 20])), 0)
+    n10 = 0
+    for (x in frames(sw.takeOutput())) {
+        if (x.kind == 0) n10 = n10 + x.payload.size
+    }
+    expect(n10 == 6, "a larger initial window releases the rest: $n10")
+    // Two streams share the connection window.
+    var c = ready()
+    c.feed(frame(4, 0, 0, cryptoByteString([0, 4, 0, 1, 0, 0])), 0)
+    c.takeOutput()
+    c.feed(frame(1, 5, 1, block(getFields("/"))) + frame(1, 5, 3, block(getFields("/"))), 0)
+    c.takeRequests()
+    c.respond(1, 200, [], "a".repeat(50000))
+    c.respond(3, 200, [], "b".repeat(50000))
+    var total = 0
+    for (x in frames(c.takeOutput())) {
+        if (x.kind == 0) total = total + x.payload.size
+    }
+    expect(total == 65535, "the connection window caps all streams together: $total")
+    // The output queue is capped.
+    var d = ready()
+    d.feed(frame(8, 0, 0, be32(2000000000)) + frame(4, 0, 0, cryptoByteString([0, 4, 127, 0, 0, 0])), 0)
+    d.takeOutput()
+    d.feed(frame(1, 5, 1, block(getFields("/"))), 0)
+    d.takeRequests()
+    d.respond(1, 200, [], "c".repeat(2097152))
+    val first = d.takeOutput().size
+    expect(first < 300000, "the output queue is capped: $first")
+    expect(d.wantsWrite(), "the rest is queued once the output is taken")
+    // Zero and overflowing WINDOW_UPDATE; a bad INITIAL_WINDOW_SIZE.
+    var e = ready()
+    e.feed(frame(8, 0, 0, be32(0)), 0)
+    expect(e.isClosed() && goawayCode(frames(e.takeOutput())) == H2_PROTOCOL_ERROR, "a zero connection WINDOW_UPDATE")
+    var f = ready()
+    f.feed(frame(8, 0, 0, be32(2147483647)), 0)
+    expect(f.isClosed() && goawayCode(frames(f.takeOutput())) == H2_FLOW_CONTROL_ERROR, "the connection window passes 2^31-1")
+    var g = ready()
+    g.feed(frame(1, 4, 1, block([hf(":method", "POST"), hf(":scheme", "https"), hf(":path", "/"), hf(":authority", "e")])), 0)
+    g.feed(frame(8, 0, 1, be32(0)), 0)
+    expect(!g.isClosed() && count(frames(g.takeOutput()), 3) == 1, "a zero stream WINDOW_UPDATE is a stream error")
+    var h = ready()
+    h.feed(frame(4, 0, 0, cryptoByteString([0, 4, 128, 0, 0, 0])), 0)
+    expect(h.isClosed(), "INITIAL_WINDOW_SIZE above 2^31-1")
+    // Receive: more than the stream window in one read is a stream error; the connection window a connection error.
+    var r = ready()
+    r.feed(frame(1, 4, 1, block([hf(":method", "POST"), hf(":scheme", "https"), hf(":path", "/"), hf(":authority", "e")])), 0)
+    var burst = ""
+    for (k in 0 until 17) burst = burst + frame(0, 0, 1, "e".repeat(16384))
+    r.feed(burst, 0)
+    expect(!r.isClosed() && resetCode(frames(r.takeOutput()), 1) == H2_FLOW_CONTROL_ERROR, "the stream window is enforced")
+    var w = h2ServerNew(100, 100000000)
+    w.feed(H2_PREFACE + frame(4, 0, 0, ""), 0)
+    var heads = ""
+    for (k in 0 until 5) heads = heads + frame(1, 4, 1 + 2 * k, block([hf(":method", "POST"), hf(":scheme", "https"), hf(":path", "/"), hf(":authority", "e")]))
+    w.feed(heads, 0)
+    w.takeOutput()
+    var flood = ""
+    for (k in 0 until 5) {
+        for (q in 0 until 16) flood = flood + frame(0, 0, 1 + 2 * k, "f".repeat(16384))
+    }
+    w.feed(flood, 0)
+    expect(w.isClosed() && goawayCode(frames(w.takeOutput())) == H2_FLOW_CONTROL_ERROR, "the connection window is enforced")
+    return
+}
+
+fun ending(): void {
+    var s = ready()
+    s.feed(frame(1, 5, 1, block(getFields("/"))), 0)
+    s.takeRequests()
+    s.shutdown()
+    val out = frames(s.takeOutput())
+    expect(goawayCode(out) == 0 && !s.finished(), "shutdown sends GOAWAY(NO_ERROR) and waits for the open stream")
+    s.feed(frame(1, 5, 3, block(getFields("/"))), 0)
+    expect(resetCode(frames(s.takeOutput()), 3) == H2_REFUSED_STREAM, "a new stream after shutdown is refused")
+    s.respond(1, 200, [], "x")
+    expect(s.finished(), "finished once the last stream is answered")
+    var t = h2ServerNew()
+    t.takeOutput()
+    t.tick(0)
+    t.feed(H2_PREFACE + frame(4, 0, 0, ""), 1)
+    t.tick(9000)
+    expect(!t.isClosed(), "not yet")
+    t.tick(10001)
+    expect(t.isClosed() && goawayCode(frames(t.takeOutput())) == H2_SETTINGS_TIMEOUT, "SETTINGS_TIMEOUT")
+    var u = h2ServerNew()
+    u.takeOutput()
+    u.tick(0)
+    u.feed(H2_PREFACE + frame(4, 0, 0, "") + frame(4, 1, 0, ""), 1)
+    u.tick(20000)
+    expect(!u.isClosed(), "an acknowledged SETTINGS has no timeout")
+    var v = ready()
+    v.feed(frame(6, 0, 0, "abcdefgh"), 0)
+    val pf = frames(v.takeOutput())
+    expect(pf.size == 1 && pf[0].kind == 6 && (pf[0].flags & 1) == 1 && pf[0].payload == "abcdefgh", "PING is answered")
+    return
+}
