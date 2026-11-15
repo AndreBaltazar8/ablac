@@ -89,11 +89,13 @@ if awk '
     echo "pure export retained an unrelated lazy-global guard" >&2
     exit 1
 fi
+# A hosted library wraps an export that can reach the runtime in enter/leave
+# (#811), so its guard lives in the renamed inner definition.
 awk '
-    /^define .*@abla_guarded_value\(/ { inside = 1 }
+    /^define .*@abla_guarded_value(\.unlocked)?\(/ { inside = 1; seen = 1; found = 0 }
     inside && /@abla_export_ensure_initialized/ { found = 1 }
-    inside && /^}/ { exit found ? 0 : 1 }
-    END { if (!inside || !found) exit 1 }
+    inside && /^}/ { inside = 0; if (found) ok = 1 }
+    END { exit (seen && ok) ? 0 : 1 }
 ' "$output_directory/libabla_init_slice.so.ll"
 clang "$project_root/tests/cases/program-build/export-scalar-caller.c" \
     -L"$output_directory" -Wl,-rpath,"$output_directory" -labla_scalar \
