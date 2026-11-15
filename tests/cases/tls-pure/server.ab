@@ -80,7 +80,7 @@ fun main: int {
         }
         val store = trusting("$directory/$kind.pem")
         for (suite in [TLS_SUITE_AES_128_GCM_SHA256, TLS_SUITE_AES_256_GCM_SHA384, TLS_SUITE_CHACHA20_POLY1305_SHA256]) {
-            for (groups in [[TLS_GROUP_X25519], [TLS_GROUP_SECP256R1]]) {
+            for (groups in [[TLS_GROUP_X25519], [TLS_GROUP_SECP256R1], [TLS_GROUP_SECP384R1], [TLS_GROUP_X25519_MLKEM768]]) {
                 val name = "$kind suite $suite groups ${groups[0]}"
                 val config = TlsServerConfig(identity, [suite], groups, [], random, false, false, acceptAny)
                 var client = clientFor(store, "localhost")
@@ -95,8 +95,8 @@ fun main: int {
                     continue
                 }
                 if (client.suite != suite) fail("$name: suite ${client.suite}")
-                if (groups[0] == TLS_GROUP_SECP256R1 && !client.retried) fail("$name: no HelloRetryRequest")
-                if (groups[0] == TLS_GROUP_X25519 && client.retried) fail("$name: an unneeded HelloRetryRequest")
+                if ((groups[0] == TLS_GROUP_SECP256R1 || groups[0] == TLS_GROUP_SECP384R1) && !client.retried) fail("$name: no HelloRetryRequest")
+                if ((groups[0] == TLS_GROUP_X25519 || groups[0] == TLS_GROUP_X25519_MLKEM768) && client.retried) fail("$name: an unneeded HelloRetryRequest")
                 // Application data both ways, a lot of it (many records).
                 val big = random(70000)
                 if (!client.send(big) || !server.send("hello from the server")) fail("$name: send refused")
@@ -124,7 +124,7 @@ fun main: int {
             TLS12_ECDHE_RSA_AES_128_GCM_SHA256, TLS12_ECDHE_RSA_AES_256_GCM_SHA384, TLS12_ECDHE_RSA_CHACHA20_POLY1305_SHA256]) {
             val suite12 = tls12Suite(code) ?? return 1
             if (suite12.ecdsa == rsaKey) continue
-            for (groups in [[TLS_GROUP_X25519], [TLS_GROUP_SECP256R1]]) {
+            for (groups in [[TLS_GROUP_X25519], [TLS_GROUP_SECP256R1], [TLS_GROUP_SECP384R1]]) {
                 val name = "TLS 1.2 $kind suite $code groups ${groups[0]}"
                 // A default client, a TLS 1.2-only server.
                 var oldServerConfig = TlsServerConfig(identity12, [], groups, [], random, false, false, acceptAny, [code])
@@ -298,7 +298,8 @@ fun main: int {
         tlsX509Verifier(edStore, now), random, tlsPatchClientHello))
     pump(noSuiteClient, noSuite)
     if (!noSuite.failed() || !noSuiteClient.failed()) fail("no common cipher suite did not fail")
-    var noGroup = tlsServerNew(TlsServerConfig(ed, [TLS_SUITE_AES_128_GCM_SHA256], [TLS_GROUP_SECP384R1], [], random,
+    // Group 25 is secp521r1, which the client does not offer.
+    var noGroup = tlsServerNew(TlsServerConfig(ed, [TLS_SUITE_AES_128_GCM_SHA256], [25], [], random,
         false, false, acceptAny))
     var noGroupClient = clientFor(edStore, "localhost")
     pump(noGroupClient, noGroup)
@@ -606,6 +607,7 @@ fun main: int {
         if (!withScsv.contains(tlsU16(22016)) ) fail("a fallback client did not send TLS_FALLBACK_SCSV")
         if (withoutScsv.contains(tlsU16(22016))) fail("a client that is not retrying sent TLS_FALLBACK_SCSV")
     }
+    keyExchanges(directory)
     if (failures > 0) return 1
     println("tls-pure server ok")
     0
@@ -628,3 +630,263 @@ fun splitRecords(bytes: string): array<string> {
 
 /** The body length of the handshake message at the start of `bytes` (its three-byte length field). */
 fun bytesToLength(bytes: string): int = bytes[1] * 65536 + bytes[2] * 256 + bytes[3]
+
+// ---- Key exchange groups: the hybrid X25519MLKEM768, P-384, and what each side refuses ----
+
+/** The ServerHello (or HelloRetryRequest) in the first handshake record of what the server sent. */
+fun firstServerHello(output: string): TlsServerHello {
+    val records = splitRecords(output)
+    if (records.size == 0) return tlsParseServerHello("")
+    tlsParseServerHello(records[0].slice(9, records[0].size))
+}
+
+/** The alert description of the first record of `output`, which must be a plaintext alert, or -1. */
+fun alertOf(output: string): int =
+    if (output.size >= 7 && output[0] == 21) output[6] else -1
+
+fun hybridHello(share: string): string {
+    val shares = [TlsKeyShare(TLS_GROUP_X25519_MLKEM768, share)]
+    tlsBuildClientHello(random(32), random(32), [TLS_SUITE_AES_128_GCM_SHA256], "localhost",
+        [TLS_GROUP_X25519_MLKEM768], shares, [TLS_SIG_ED25519], [], "")
+}
+
+fun alertFor(share: string, edIdentity: TlsIdentity): int {
+    var server = tlsServerNew(TlsServerConfig(edIdentity, [TLS_SUITE_AES_128_GCM_SHA256], [TLS_GROUP_X25519_MLKEM768], [],
+        random, false, false, acceptAny))
+    server.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, hybridHello(share)))
+    if (!server.failed()) return -1
+    alertOf(server.takeOutput())
+}
+
+fun keyExchanges(directory: string): void {
+    val ed = tlsIdentityFromPem(read("$directory/ed25519.pem"), read("$directory/ed25519.key"))
+    val edStore = trusting("$directory/ed25519.pem")
+    if (!ed.ok()) {
+        fail("the identity: ${ed.error}")
+        return
+    }
+    // The default client offers the hybrid, X25519, P-256 and P-384, and sends shares for the hybrid and X25519, in that order.
+    var client = clientFor(edStore, "localhost")
+    val helloRecord = client.takeOutput()
+    val hello = tlsParseClientHello(helloRecord.slice(9, helloRecord.size))
+    if (!hello.ok || hello.groups.size != 4 || hello.groups[0] != TLS_GROUP_X25519_MLKEM768 || hello.groups[1] != TLS_GROUP_X25519 ||
+        hello.groups[2] != TLS_GROUP_SECP256R1 || hello.groups[3] != TLS_GROUP_SECP384R1) fail("the default groups: ${hello.groups.size} groups, first ${hello.groups[0]}")
+    if (hello.shares.size != 2 || hello.shares[0].group != TLS_GROUP_X25519_MLKEM768 || hello.shares[0].publicKey.size != 1216 ||
+        hello.shares[1].group != TLS_GROUP_X25519 || hello.shares[1].publicKey.size != 32) fail("the default key shares")
+    // A default server picks the hybrid: its ServerHello holds 1088 + 32 bytes, and the handshake completes with data both ways.
+    var server = tlsServerNew(tlsServerConfig(ed, random))
+    server.feed(helloRecord)
+    val answer = server.takeOutput()
+    val serverHello = firstServerHello(answer)
+    if (!serverHello.ok || serverHello.retryRequest || serverHello.shareGroup != TLS_GROUP_X25519_MLKEM768 || serverHello.shareKey.size != 1120) {
+        fail("the default server did not answer with the hybrid: group ${serverHello.shareGroup} share ${serverHello.shareKey.size}")
+    }
+    client.feed(answer)
+    pump(client, server)
+    if (!client.connected() || !server.connected()) fail("the hybrid handshake: [${client.error}] [${server.error}]")
+    client.send("hybrid ping")
+    pump(client, server)
+    if (server.takeApplicationData() != "hybrid ping") fail("hybrid: application data")
+    // A server with X25519 only: the share for it is in the hello, so no HelloRetryRequest.
+    var x25519Client = clientFor(edStore, "localhost")
+    var x25519Server = tlsServerNew(TlsServerConfig(ed, [TLS_SUITE_AES_128_GCM_SHA256], [TLS_GROUP_X25519], [], random, false, false, acceptAny))
+    pump(x25519Client, x25519Server)
+    if (!x25519Client.connected() || x25519Client.retried) fail("an X25519-only server: [${x25519Client.error}] retried ${x25519Client.retried}")
+    // A server that wants P-384 only: a HelloRetryRequest for group 24 (the handshake after it is in the loop above).
+    var retryClient = clientFor(edStore, "localhost")
+    var retryServer = tlsServerNew(TlsServerConfig(ed, [TLS_SUITE_AES_256_GCM_SHA384], [TLS_GROUP_SECP384R1], [], random, false, false, acceptAny))
+    retryServer.feed(retryClient.takeOutput())
+    val retry = firstServerHello(retryServer.takeOutput())
+    if (!retry.ok || !retry.retryRequest || retry.shareGroup != TLS_GROUP_SECP384R1) fail("the P-384 server's HelloRetryRequest: group ${retry.shareGroup}")
+    // The key shares follow BoringSSL's rule: one for the first classical group and one for the first hybrid, in the order of the list.
+    // A client whose list is P-256, then the hybrid: both shares, so a hybrid-only server needs no HelloRetryRequest; the P-256 share first.
+    var lateClient = tlsClientNew(TlsClientConfig("localhost", [TLS_SUITE_AES_128_GCM_SHA256], [TLS_SIG_ED25519], [],
+        tlsX509Verifier(edStore, now), random, tlsPatchClientHello, [], false, [TLS_GROUP_SECP256R1, TLS_GROUP_SECP384R1, TLS_GROUP_X25519_MLKEM768]))
+    val lateRecord = lateClient.takeOutput()
+    val lateHello = tlsParseClientHello(lateRecord.slice(9, lateRecord.size))
+    if (!lateHello.ok || lateHello.shares.size != 2 || lateHello.shares[0].group != TLS_GROUP_SECP256R1 ||
+        lateHello.shares[1].group != TLS_GROUP_X25519_MLKEM768) fail("the shares for [P-256, P-384, hybrid]: ${lateHello.shares.size}")
+    var hybridServer = tlsServerNew(TlsServerConfig(ed, [TLS_SUITE_AES_128_GCM_SHA256], [TLS_GROUP_X25519_MLKEM768], [], random, false, false, acceptAny))
+    hybridServer.feed(lateRecord)
+    pump(lateClient, hybridServer)
+    if (!lateClient.connected() || lateClient.retried || lateClient.negotiatedGroup != TLS_GROUP_X25519_MLKEM768) {
+        fail("the hybrid for a client listing it third: [${lateClient.error}] retried ${lateClient.retried} group ${lateClient.negotiatedGroup}")
+    }
+    // A client that lists P-384 only, against a server that wants P-256: a HelloRetryRequest for the group it did not send a share for.
+    var wrongClient = tlsClientNew(TlsClientConfig("localhost", [TLS_SUITE_AES_128_GCM_SHA256], [TLS_SIG_ED25519], [],
+        tlsX509Verifier(edStore, now), random, tlsPatchClientHello, [], false, [TLS_GROUP_SECP384R1, TLS_GROUP_SECP256R1]))
+    var p256Server = tlsServerNew(TlsServerConfig(ed, [TLS_SUITE_AES_128_GCM_SHA256], [TLS_GROUP_SECP256R1], [], random, false, false, acceptAny))
+    pump(wrongClient, p256Server)
+    if (!wrongClient.connected() || !wrongClient.retried || wrongClient.negotiatedGroup != TLS_GROUP_SECP256R1) {
+        fail("a retry from P-384 to P-256: [${wrongClient.error}] retried ${wrongClient.retried} group ${wrongClient.negotiatedGroup}")
+    }
+    // P-384 asked for first by the client: its share is sent, no retry.
+    var p384Client = tlsClientNew(TlsClientConfig("localhost", [TLS_SUITE_AES_256_GCM_SHA384], [TLS_SIG_ED25519], [],
+        tlsX509Verifier(edStore, now), random, tlsPatchClientHello, [], false, [TLS_GROUP_SECP384R1]))
+    var p384Server = tlsServerNew(TlsServerConfig(ed, [TLS_SUITE_AES_256_GCM_SHA384], [TLS_GROUP_SECP384R1], [], random, false, false, acceptAny))
+    pump(p384Client, p384Server)
+    if (!p384Client.connected() || p384Client.retried) fail("a P-384 client: [${p384Client.error}] retried ${p384Client.retried}")
+    // The hybrid and nothing else against a server without it: no common group.
+    var onlyHybrid = tlsClientNew(TlsClientConfig("localhost", [TLS_SUITE_AES_128_GCM_SHA256], [TLS_SIG_ED25519], [],
+        tlsX509Verifier(edStore, now), random, tlsPatchClientHello, [], false, [TLS_GROUP_X25519_MLKEM768]))
+    var noHybridServer = tlsServerNew(TlsServerConfig(ed, [TLS_SUITE_AES_128_GCM_SHA256], [TLS_GROUP_X25519], [], random, false, false, acceptAny))
+    pump(onlyHybrid, noHybridServer)
+    if (!noHybridServer.failed() || !onlyHybrid.failed()) fail("the hybrid against a server without it did not fail")
+    // The server refuses a client's hybrid share that is not valid (draft-ietf-tls-ecdhe-mlkem section 4.2): illegal_parameter (47).
+    val pair = tlsGenerateKeyPair(TLS_GROUP_X25519_MLKEM768, random) ?? return
+    val share = pair.publicKey
+    if (alertFor(share, ed) != -1) fail("a good hybrid share was refused")
+    // A coefficient of 3329 in the encapsulation key (FIPS 203 section 7.2).
+    val badKey = tlsU8(1) + tlsU8((share[1] & 240) | 13) + share.slice(2, share.size)
+    if (alertFor(badKey, ed) != 47) fail("an ML-KEM key with a coefficient of q: alert ${alertFor(badKey, ed)}")
+    if (alertFor(share.slice(0, 1215), ed) != 47) fail("a 1215-byte hybrid share: alert ${alertFor(share.slice(0, 1215), ed)}")
+    if (alertFor(share + "\x00", ed) != 47) fail("a 1217-byte hybrid share: alert ${alertFor(share + "\x00", ed)}")
+    // An X25519 part that is a point of small order (all zero): the secret is all zero, so illegal_parameter.
+    if (alertFor(share.slice(0, 1184) + "\x00".repeat(32), ed) != 47) fail("an all-zero X25519 part")
+    // A group's share of the wrong size for its group.
+    if (alertFor("\x01".repeat(65), ed) != 47) fail("a 65-byte share for the hybrid")
+    // The client's side (section 4.2 again): a server share of the wrong length, and an X25519 part of small order, are
+    // illegal_parameter; a ciphertext that is not one this client's key made is not an error here (implicit rejection) but the
+    // handshake fails at the first record the server's keys should have protected, with the keys, not the exchange, to blame.
+    var checkClient = clientFor(edStore, "localhost")
+    val outHello = checkClient.takeOutput()
+    val clientHello = tlsParseClientHello(outHello.slice(9, outHello.size))
+    val shortShare = tlsBuildServerHello(random(32), clientHello.sessionId, TLS_SUITE_AES_128_GCM_SHA256,
+        TlsKeyShare(TLS_GROUP_X25519_MLKEM768, random(1119)))
+    checkClient.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, shortShare))
+    if (!checkClient.failed() || alertOf(checkClient.takeOutput()) != 47) fail("a 1119-byte server share was not refused with illegal_parameter")
+    var zeroClient = clientFor(edStore, "localhost")
+    val zeroHello = zeroClient.takeOutput()
+    val zeroParsed = tlsParseClientHello(zeroHello.slice(9, zeroHello.size))
+    val zeroShare = tlsBuildServerHello(random(32), zeroParsed.sessionId, TLS_SUITE_AES_128_GCM_SHA256,
+        TlsKeyShare(TLS_GROUP_X25519_MLKEM768, random(1088) + "\x00".repeat(32)))
+    zeroClient.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, zeroShare))
+    if (!zeroClient.failed() || alertOf(zeroClient.takeOutput()) != 47) fail("a server X25519 part of small order was not refused")
+    var tamperClient = clientFor(edStore, "localhost")
+    var tamperServer = tlsServerNew(tlsServerConfig(ed, random))
+    tamperServer.feed(tamperClient.takeOutput())
+    val flight = tamperServer.takeOutput()
+    val records = splitRecords(flight)
+    val shareAt = records[0].indexOf(firstServerHello(flight).shareKey.slice(0, 16))
+    if (shareAt < 0) {
+        fail("the ciphertext is not in the ServerHello")
+    } else {
+        val bent = records[0].slice(0, shareAt + 100) + tlsU8(records[0][shareAt + 100] ^ 1) + records[0].slice(shareAt + 101, records[0].size)
+        var rest = bent
+        for (i in 1 until records.size) rest = rest + records[i]
+        tamperClient.feed(rest)
+        if (!tamperClient.failed()) fail("a bent ciphertext gave a working handshake")
+        if (tamperClient.error.contains("key exchange")) fail("a bent ciphertext was refused as a failed key exchange (an oracle): ${tamperClient.error}")
+    }
+    // TLS 1.2 has no hybrid: a TLS 1.2 client that lists it, against a server that lists it first, gets a classic curve (P-384 or
+    // X25519), and a server that has only the hybrid has no group for it.
+    for (group in [TLS_GROUP_X25519, TLS_GROUP_SECP384R1]) {
+        // (A client with TLS 1.3 suites too, so that its hello lists the hybrid: a TLS 1.2-only client does not list it.)
+        val config12 = TlsClientConfig("localhost", [TLS_SUITE_AES_128_GCM_SHA256], [TLS_SIG_ED25519, TLS_SIG_ECDSA_SECP384R1_SHA384, TLS_SIG_ECDSA_SECP256R1_SHA256], [],
+            tlsX509Verifier(edStore, now), random, tlsPatchClientHello, [TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256], false,
+            [TLS_GROUP_X25519_MLKEM768, TLS_GROUP_X25519, TLS_GROUP_SECP384R1])
+        var client12 = tlsClientNew(config12)
+        var server12 = tlsServerNew(TlsServerConfig(ed, [], [TLS_GROUP_X25519_MLKEM768, group], [], random, false, false, acceptAny,
+            [TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256]))
+        pump(client12, server12)
+        if (!client12.connected() || !server12.connected() || !client12.v12) fail("TLS 1.2 with the hybrid listed first and group $group: [${client12.error}] [${server12.error}]")
+        client12.send("twelve")
+        pump(client12, server12)
+        if (server12.takeApplicationData() != "twelve") fail("TLS 1.2 group $group: data")
+    }
+    // A TLS 1.2 ServerKeyExchange that names the hybrid (a TLS 1.3 group that the client offered, but not a curve ECDHE may use) is
+    // refused as a group that was not offered: illegal_parameter, before any signature is looked at.
+    var forgeClient = tlsClientNew(TlsClientConfig("localhost", [], [TLS_SIG_ED25519], [], tlsX509Verifier(edStore, now), random,
+        tlsPatchClientHello, [TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256], false, [TLS_GROUP_X25519_MLKEM768, TLS_GROUP_X25519]))
+    var forgeServer = tlsServerNew(TlsServerConfig(ed, [], [TLS_GROUP_X25519], [], random, false, false, acceptAny,
+        [TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256]))
+    forgeServer.feed(forgeClient.takeOutput())
+    // The server's flight is plaintext records that may hold several handshake messages: take the messages apart, swap the
+    // ServerKeyExchange (type 12), and send every message in a record of its own.
+    var payload = ""
+    for (record in splitRecords(forgeServer.takeOutput())) {
+        if (record[0] == 22) payload = payload + record.slice(5, record.size)
+    }
+    var forged = ""
+    var replaced = false
+    var at = 0
+    while (at + 4 <= payload.size) {
+        val length = bytesToLength(payload.slice(at, at + 4))
+        val message = payload.slice(at, at + 4 + length)
+        at = at + 4 + length
+        if (message[0] == 12) {
+            forged = forged + tlsPlaintextRecord(TLS_HANDSHAKE, 771, tls12BuildServerKeyExchange(TLS_GROUP_X25519_MLKEM768,
+                "\x01".repeat(32), TLS_SIG_ED25519, "\x00".repeat(64)))
+            replaced = true
+        } else {
+            forged = forged + tlsPlaintextRecord(TLS_HANDSHAKE, 771, message)
+        }
+    }
+    forgeClient.feed(forged)
+    val forgeAlert = alertOf(forgeClient.takeOutput())
+    if (!replaced || !forgeClient.failed() || forgeAlert != 47) fail("a TLS 1.2 ServerKeyExchange for the hybrid was not refused with illegal_parameter: replaced $replaced failed ${forgeClient.failed()} alert $forgeAlert [${forgeClient.error}]")
+    // RFC 8422 section 5.1.1: in TLS 1.2 an ECDSA certificate's curve must be among the client's groups. A server with a P-256 key refuses
+    // a TLS 1.2 client that lists P-384 only (and serves one that lists both); a TLS 1.2 client refuses a P-256 certificate when it listed
+    // P-384 only (the flight is another client's, which listed P-256: the check is in the Certificate, before any signature).
+    val p256 = tlsIdentityFromPem(read("$directory/p256.pem"), read("$directory/p256.key"))
+    val p256Store = trusting("$directory/p256.pem")
+    if (!p256.ok()) {
+        fail("the P-256 identity: ${p256.error}")
+    } else {
+        for (groups in [[TLS_GROUP_SECP384R1], [TLS_GROUP_SECP384R1, TLS_GROUP_SECP256R1]]) {
+            var curveClient = tlsClientNew(TlsClientConfig("localhost", [], [TLS_SIG_ECDSA_SECP256R1_SHA256], [], tlsX509Verifier(p256Store, now),
+                random, tlsPatchClientHello, [TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256], false, groups))
+            var curveServer = tlsServerNew(TlsServerConfig(p256, [], tlsDefaultGroups(), [], random, false, false, acceptAny,
+                [TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256]))
+            val listsP256 = groups.size == 2
+            // The server itself refuses (before the client could see a certificate): handshake_failure, 40.
+            curveServer.feed(curveClient.takeOutput())
+            if (listsP256 == curveServer.failed()) fail("a P-256 server and a TLS 1.2 client listing ${groups.size} groups: the server's verdict [${curveServer.error}]")
+            if (!listsP256 && alertOf(curveServer.takeOutput()) != 40) fail("a P-256 server refused a client without P-256 with another alert")
+            if (listsP256) {
+                pump(curveClient, curveServer)
+                if (!curveClient.connected() || !curveServer.connected()) fail("a TLS 1.2 client listing P-256 and P-384: [${curveClient.error}] [${curveServer.error}]")
+            }
+        }
+        var lister = tlsClientNew(TlsClientConfig("localhost", [], [TLS_SIG_ECDSA_SECP256R1_SHA256], [], tlsX509Verifier(p256Store, now),
+            random, tlsPatchClientHello, [TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256], false, [TLS_GROUP_SECP256R1]))
+        var flightServer = tlsServerNew(TlsServerConfig(p256, [], tlsDefaultGroups(), [], random, false, false, acceptAny,
+            [TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256]))
+        flightServer.feed(lister.takeOutput())
+        val flight = flightServer.takeOutput()
+        var narrow = tlsClientNew(TlsClientConfig("localhost", [], [TLS_SIG_ECDSA_SECP256R1_SHA256], [], tlsX509Verifier(p256Store, now),
+            random, tlsPatchClientHello, [TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256], false, [TLS_GROUP_SECP384R1]))
+        narrow.takeOutput()
+        narrow.feed(flight)
+        val narrowAlert = alertOf(narrow.takeOutput())
+        if (!narrow.failed() || narrowAlert != 42 || !narrow.error.contains("curve")) {
+            fail("a P-256 certificate for a client that listed P-384 only: failed ${narrow.failed()} alert $narrowAlert [${narrow.error}]")
+        }
+    }
+    // A HelloRetryRequest with a cookie alone (RFC 8446 section 4.1.2): the second ClientHello keeps the key_share extension as it was, both
+    // shares, and adds the cookie; every private key stays, so the server may still pick either share.
+    var cookieClient = clientFor(edStore, "localhost")
+    val firstRecord = cookieClient.takeOutput()
+    val firstParsed = tlsParseClientHello(firstRecord.slice(9, firstRecord.size))
+    val cookieRetry = tlsHandshakeMessage(TLS_SERVER_HELLO, tlsU16(771) + tlsHelloRetryRandom() + tlsVec8(firstParsed.sessionId) +
+        tlsU16(TLS_SUITE_AES_128_GCM_SHA256) + tlsU8(0) + tlsVec16(tlsExtension(TLS_EXT_SUPPORTED_VERSIONS, tlsU16(772)) +
+        tlsExtension(TLS_EXT_COOKIE, tlsVec16("cookie"))))
+    cookieClient.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, cookieRetry))
+    var secondRecords = splitRecords(cookieClient.takeOutput())
+    var secondRecord = ""
+    for (record in secondRecords) {
+        if (record[0] == 22) secondRecord = record
+    }
+    val secondParsed = tlsParseClientHello(if (secondRecord.size > 9) secondRecord.slice(9, secondRecord.size) else "")
+    if (cookieClient.failed() || !secondParsed.ok || secondParsed.cookie != "cookie" || secondParsed.shares.size != 2 ||
+        secondParsed.shares[0].publicKey != firstParsed.shares[0].publicKey || secondParsed.shares[1].publicKey != firstParsed.shares[1].publicKey) {
+        fail("a cookie-only HelloRetryRequest changed the key shares: failed ${cookieClient.failed()} [${cookieClient.error}] ${secondParsed.shares.size} shares")
+    }
+    var hybridOnly12 = tlsServerNew(TlsServerConfig(ed, [], [TLS_GROUP_X25519_MLKEM768], [], random, false, false, acceptAny,
+        [TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256]))
+    var client12 = tlsClientNew(TlsClientConfig("localhost", [], [TLS_SIG_ED25519], [], tlsX509Verifier(edStore, now), random,
+        tlsPatchClientHello, [TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256]))
+    pump(client12, hybridOnly12)
+    if (!hybridOnly12.failed()) fail("a TLS 1.2 server with only the hybrid accepted a TLS 1.2 client")
+    return
+}

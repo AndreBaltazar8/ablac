@@ -13,8 +13,11 @@
 // before the handshake ends. Not yet: resumption, 0-RTT.
 
 import "abla/crypto"
+import "abla/crypto/der"
 import "abla/crypto/hkdf"
+import "abla/crypto/mlkem"
 import "abla/crypto/p256"
+import "abla/crypto/p384"
 import "abla/crypto/x25519"
 import "abla/tls/pure/handshake"
 import "abla/tls/pure/keysched"
@@ -65,7 +68,10 @@ class TlsClientConfig(
         TLS12_ECDHE_ECDSA_CHACHA20_POLY1305_SHA256, TLS12_ECDHE_RSA_CHACHA20_POLY1305_SHA256],
     /** True for a client that retries after a failed handshake with a lower version than it supports: the ClientHello
      *  then carries TLS_FALLBACK_SCSV (RFC 7507), so a server that could have done better refuses it. */
-    val fallback: bool = false
+    val fallback: bool = false,
+    /** The groups offered, in the client's order ([] for tlsDefaultGroups: the hybrid, X25519, P-256, P-384). The first gets a key
+     *  share (with X25519's too when the first is the hybrid, as browsers do), the others are answered with a HelloRetryRequest. */
+    val groups: array<int> = []
 )
 
 /** An ephemeral key pair offered in the key_share extension. */
@@ -146,7 +152,10 @@ class TlsClient(
     var keyUpdateRun: int = 0,
     var keyUpdateOwed: bool = false,
     /** Warning alerts in a row (ignored up to four, as BoringSSL does). */
-    var warningRun: int = 0
+    var warningRun: int = 0,
+    /** The key exchange group that was negotiated (0 until the ServerHello is processed): the group of the key share, or of the
+     *  TLS 1.2 ServerKeyExchange. */
+    var negotiatedGroup: int = 0
 )
 
 fun tlsAeadFor(suite: int): int =
@@ -156,9 +165,32 @@ fun tlsAeadFor(suite: int): int =
 
 fun tlsSuiteHash(suite: int): int = if (suite == TLS_SUITE_AES_256_GCM_SHA384) HKDF_SHA384 else HKDF_SHA256
 
-/** A key pair for `group` (X25519 or P-256) from 32 bytes of `random`: null for another group. The private key is the
- *  random source's bytes themselves, which the machine that uses the pair clears when it is done (tlsWipe): `random`
- *  returns fresh bytes, as tlsPureRandom does. */
+// ---- Key exchange groups ----
+// (A slice, and a string built with `+`, may share their memory with the string they come from, so what is made of a secret and
+// outlives its wiping is copied into a buffer of its own, tlsOwnedCopy, first: the secret made of two parts, the public key sliced
+// out of a decapsulation key.)
+// X25519MLKEM768 (draft-ietf-tls-ecdhe-mlkem, section 4): the client's key_exchange value is the ML-KEM-768 encapsulation key (1184
+// bytes) followed by an X25519 public key (32): 1216 bytes (section 4.1, which notes the order is the reverse of the naming
+// convention of the hybrid design draft: "for historical reasons"); the server's is the ML-KEM ciphertext (1088) followed by its
+// X25519 public key (32): 1120 bytes (section 4.2); the shared secret is the ML-KEM secret followed by the X25519 one, 64 bytes
+// (section 4.3). The server checks the encapsulation key (FIPS 203 section 7.2) and aborts with illegal_parameter when it fails,
+// the client checks the ciphertext length (illegal_parameter), and the X25519 part has its all-zero check (section 4.3 and
+// RFC 8446 section 7.4.2). The private key of a hybrid pair is the 2400-byte decapsulation key followed by the 32-byte X25519 scalar.
+val TLS_MLKEM768_CLIENT_SHARE_SIZE = 1216
+val TLS_MLKEM768_SERVER_SHARE_SIZE = 1120
+
+/** The groups a ClientHello lists when the configuration names none: the hybrid first, then the classic curves. */
+fun tlsDefaultGroups(): array<int> = [TLS_GROUP_X25519_MLKEM768, TLS_GROUP_X25519, TLS_GROUP_SECP256R1, TLS_GROUP_SECP384R1]
+
+fun tlsGroupIsHybrid(group: int): bool = group == TLS_GROUP_X25519_MLKEM768
+
+/** The groups TLS 1.2's ECDHE can use (named curves): the hybrid is a TLS 1.3 group only. */
+fun tlsGroupIsClassic(group: int): bool =
+    group == TLS_GROUP_X25519 || group == TLS_GROUP_SECP256R1 || group == TLS_GROUP_SECP384R1
+
+/** A key pair for `group` from the bytes of `random` (32 for X25519 and P-256, 48 for P-384, 64 and 32 for the hybrid's seeds and
+ *  its X25519 key): null for another group. The private key is made of the random source's bytes, which the machine that uses
+ *  the pair clears when it is done (tlsWipe): `random` returns fresh bytes, as tlsPureRandom does. */
 fun tlsGenerateKeyPair(group: int, random: (int) -> string): TlsKeyPair? {
     if (group == TLS_GROUP_X25519) {
         val privateKey = random(32)
@@ -177,14 +209,139 @@ fun tlsGenerateKeyPair(group: int, random: (int) -> string): TlsKeyPair? {
             attempt = attempt + 1
         }
     }
+    if (group == TLS_GROUP_SECP384R1) {
+        // A random 48-byte string is a valid scalar but for one value in 2^190 or so (or a wrong length from a failing source).
+        var attempt = 0
+        while (attempt < 4) {
+            val privateKey = random(48)
+            val publicKey = p384PublicKey(privateKey)
+            if (publicKey.ok) return TlsKeyPair(group, publicKey.bytes, privateKey)
+            tlsWipe(privateKey)
+            attempt = attempt + 1
+        }
+    }
+    if (group == TLS_GROUP_X25519_MLKEM768) {
+        val seeds = random(64)
+        val scalar = random(32)
+        var pair: TlsKeyPair? = null
+        if (seeds.size == 64 && scalar.size == 32) {
+            val decapsulationKey = mlkem768KeyGenFromSeeds(seeds.slice(0, 32), seeds.slice(32, 64))
+            val x25519Key = x25519PublicKey(scalar)
+            if (decapsulationKey.ok && x25519Key.ok) {
+                pair = TlsKeyPair(group, tlsOwnedCopy(mlkem768EncapsulationKey(decapsulationKey.bytes) + x25519Key.bytes),
+                    tlsOwnedCopy(decapsulationKey.bytes + scalar))
+            }
+            tlsWipe(decapsulationKey.bytes)
+        }
+        tlsWipe(seeds)
+        tlsWipe(scalar)
+        return pair
+    }
     null
 }
 
-/** The shared secret of our key pair and the peer's share; `ok` false for an invalid share. */
-fun tlsAgree(pair: TlsKeyPair, peerShare: string): CryptoResult =
-    if (pair.group == TLS_GROUP_X25519) x25519(pair.privateKey, peerShare)
-    else if (pair.group == TLS_GROUP_SECP256R1) p256Ecdh(pair.privateKey, peerShare)
-    else cryptoFailed("tls: unsupported group")
+/** The shared secret of our key pair and the peer's share; `ok` false for an invalid share (for the hybrid: a share that is not
+ *  the 1120 bytes of a server's, or whose X25519 part gives an all-zero secret). */
+fun tlsAgree(pair: TlsKeyPair, peerShare: string): CryptoResult {
+    if (pair.group == TLS_GROUP_X25519) return x25519(pair.privateKey, peerShare)
+    if (pair.group == TLS_GROUP_SECP256R1) return p256Ecdh(pair.privateKey, peerShare)
+    if (pair.group == TLS_GROUP_SECP384R1) return p384Ecdh(pair.privateKey, peerShare)
+    if (pair.group == TLS_GROUP_X25519_MLKEM768) {
+        if (peerShare.size != TLS_MLKEM768_SERVER_SHARE_SIZE || pair.privateKey.size != 2432) {
+            return cryptoFailed("tls: the hybrid key share is not 1120 bytes")
+        }
+        val kem = mlkem768Decapsulate(pair.privateKey.slice(0, 2400), peerShare.slice(0, 1088))
+        val dh = x25519(pair.privateKey.slice(2400, 2432), peerShare.slice(1088, 1120))
+        var result = cryptoFailed("tls: the hybrid key exchange failed")
+        if (kem.ok && dh.ok) result = CryptoResult(tlsOwnedCopy(kem.bytes + dh.bytes), true, "")
+        tlsWipe(kem.bytes)
+        tlsWipe(dh.bytes)
+        return result
+    }
+    return cryptoFailed("tls: unsupported group")
+}
+
+/** What a server does with a client's key share: the share to send back and the shared secret, or the alert to send. */
+class TlsServerExchange(val ok: bool, val alert: int, val error: string, val publicKey: string, val secret: string)
+
+private fun tlsServerExchangeFailed(alert: int, error: string): TlsServerExchange = TlsServerExchange(false, alert, error, "", "")
+
+/** The server's half of the key exchange for `group` against the client's share. A DH group makes its ephemeral key and agrees;
+ *  the hybrid encapsulates to the client's ML-KEM key (which must pass FIPS 203 section 7.2) and makes an X25519 key. */
+fun tlsServerExchange(group: int, clientShare: string, random: (int) -> string): TlsServerExchange {
+    if (group != TLS_GROUP_X25519_MLKEM768) {
+        val pair = tlsGenerateKeyPair(group, random)
+        if (pair == null) return tlsServerExchangeFailed(TLS_ALERT_INTERNAL_ERROR, "tls: the server could not make a key share")
+        val shared = tlsAgree(pair, clientShare)
+        tlsWipe(pair.privateKey)
+        if (!shared.ok) return tlsServerExchangeFailed(TLS_ALERT_ILLEGAL_PARAMETER, "tls: the client's key share is not valid")
+        return TlsServerExchange(true, 0, "", pair.publicKey, shared.bytes)
+    }
+    if (clientShare.size != TLS_MLKEM768_CLIENT_SHARE_SIZE) {
+        return tlsServerExchangeFailed(TLS_ALERT_ILLEGAL_PARAMETER, "tls: the hybrid key share is not 1216 bytes")
+    }
+    val encapsulationKey = clientShare.slice(0, 1184)
+    if (!mlkem768CheckEncapsulationKey(encapsulationKey)) {
+        return tlsServerExchangeFailed(TLS_ALERT_ILLEGAL_PARAMETER, "tls: the ML-KEM encapsulation key is not valid")
+    }
+    val message = random(32)
+    val pair = tlsGenerateKeyPair(TLS_GROUP_X25519, random)
+    if (message.size != 32 || pair == null) {
+        tlsWipe(message)
+        return tlsServerExchangeFailed(TLS_ALERT_INTERNAL_ERROR, "tls: the server could not make a key share")
+    }
+    val encapsulation = mlkem768EncapsulateWithMessage(encapsulationKey, message)
+    val dh = x25519(pair.privateKey, clientShare.slice(1184, 1216))
+    tlsWipe(message)
+    tlsWipe(pair.privateKey)
+    if (!encapsulation.ok) {
+        return tlsServerExchangeFailed(TLS_ALERT_INTERNAL_ERROR, "tls: the ML-KEM encapsulation failed")
+    }
+    if (!dh.ok) {
+        tlsWipe(encapsulation.sharedSecret)
+        return tlsServerExchangeFailed(TLS_ALERT_ILLEGAL_PARAMETER, "tls: the client's X25519 share is not valid")
+    }
+    val secret = tlsOwnedCopy(encapsulation.sharedSecret + dh.bytes)
+    tlsWipe(encapsulation.sharedSecret)
+    tlsWipe(dh.bytes)
+    TlsServerExchange(true, 0, "", encapsulation.ciphertext + pair.publicKey, secret)
+}
+
+/** What a ClientHello offers for key exchange: the groups listed, the key shares sent and the key pairs behind them. */
+class TlsClientShares(val ok: bool, val groups: array<int>, val pairs: array<TlsKeyPair>, val shares: array<TlsKeyShare>)
+
+/** The groups and key shares of a ClientHello for the groups `requested` (in the client's order). With TLS 1.3 the shares are for the
+ *  first classical group (X25519, P-256 or P-384) and the first hybrid, as BoringSSL's and browsers' clients do, so a server that has
+ *  either answers with no extra round trip, and anything else costs a HelloRetryRequest; a group that cannot be offered here is
+ *  skipped for the shares. A client without TLS 1.3 (`tls13` false) lists the classical groups only (the hybrid is a TLS 1.3 group)
+ *  and has a share for the first of them. `ok` is false if a key pair cannot be made. */
+fun tlsClientShares(requested: array<int>, tls13: bool, random: (int) -> string): TlsClientShares {
+    val groups: array<int> = []
+    for (group in requested) {
+        if (tls13 || tlsGroupIsClassic(group)) groups.append(group)
+    }
+    val shareGroups: array<int> = []
+    var classic = false
+    var hybrid = false
+    for (group in groups) {
+        if (tlsGroupIsHybrid(group) && tls13 && !hybrid) {
+            shareGroups.append(group)
+            hybrid = true
+        } else if (tlsGroupIsClassic(group) && !classic) {
+            shareGroups.append(group)
+            classic = true
+        }
+    }
+    val pairs: array<TlsKeyPair> = []
+    val shares: array<TlsKeyShare> = []
+    for (group in shareGroups) {
+        val pair = tlsGenerateKeyPair(group, random)
+        if (pair == null) return TlsClientShares(false, groups, [], [])
+        pairs.append(pair)
+        shares.append(TlsKeyShare(pair.group, pair.publicKey))
+    }
+    TlsClientShares(true, groups, pairs, shares)
+}
 
 private fun tlsEmptyProtection(): TlsRecordProtection = tlsRecordProtection(TLS_AEAD_AES_128_GCM, "", "")
 
@@ -230,8 +387,8 @@ private fun tlsClientFailedAtStart(config: TlsClientConfig, message: string): Tl
     client
 }
 
-/** Starts a client: builds a ClientHello with a fresh random, a 32-byte compatibility session id and an
- *  X25519 key share from the configuration's random source. */
+/** Starts a client: builds a ClientHello with a fresh random, a 32-byte compatibility session id and the key shares for the
+ *  configuration's groups (the hybrid and X25519 by default) from its random source. */
 fun tlsClientNew(config: TlsClientConfig): TlsClient {
     // A name or a protocol list that cannot be encoded, and a random source that gave less than asked, are errors the
     // caller sees, not a ClientHello that is wrong.
@@ -243,15 +400,11 @@ fun tlsClientNew(config: TlsClientConfig): TlsClient {
     if (helloRandom.size != 32 || sessionId.size != 32) {
         return tlsClientFailedAtStart(config, "tls: the random source failed")
     }
-    val pair = tlsGenerateKeyPair(TLS_GROUP_X25519, config.random)
-    val pairs: array<TlsKeyPair> = []
-    val shares: array<TlsKeyShare> = []
-    if (pair != null) {
-        pairs.append(pair)
-        shares.append(TlsKeyShare(pair.group, pair.publicKey))
-    }
+    val offer = tlsClientShares(if (config.groups.size > 0) config.groups else tlsDefaultGroups(), config.suites.size > 0, config.random)
+    if (!offer.ok) return tlsClientFailedAtStart(config, "tls: the client could not make a key share")
     val hello = tlsBuildClientHello(helloRandom, sessionId, config.suites, config.host,
-        [TLS_GROUP_X25519, TLS_GROUP_SECP256R1], shares, config.signatureAlgorithms, config.alpn, "", config.suites12, config.fallback)
+        offer.groups, offer.shares, config.signatureAlgorithms, config.alpn, "", config.suites12, config.fallback)
+    val pairs = offer.pairs
     tlsClientStart(config, hello, helloRandom, sessionId, pairs, 769)
 }
 
@@ -449,6 +602,7 @@ private fun TlsClient.handleServerHello(message: string, body: string): void {
         return
     }
     val shared = tlsAgree(pair, hello.shareKey)
+    this.negotiatedGroup = pair.group
     if (!shared.ok) {
         this.fail(TLS_ALERT_ILLEGAL_PARAMETER, "tls: the key exchange failed")
         return
@@ -491,9 +645,9 @@ private fun TlsClient.handleRetryRequest(message: string, hello: TlsServerHello)
         this.fail(TLS_ALERT_ILLEGAL_PARAMETER, "tls: the HelloRetryRequest selects a group that was not offered")
         return
     }
-    // With a cookie alone the share already sent stands.
-    val pair = if (cookieOnly) this.keyPairs[0] else tlsGenerateKeyPair(hello.shareGroup, this.config.random)
-    if (pair == null) {
+    // With a cookie alone every share already sent stands, and the key_share extension stays as it was (RFC 8446 section 4.1.2).
+    val generated = if (cookieOnly) null else tlsGenerateKeyPair(hello.shareGroup, this.config.random)
+    if (!cookieOnly && generated == null) {
         this.fail(TLS_ALERT_HANDSHAKE_FAILURE, "tls: the server asks for a group this client does not support")
         return
     }
@@ -503,11 +657,16 @@ private fun TlsClient.handleRetryRequest(message: string, hello: TlsServerHello)
     val firstHash = tlsHashOf(this.hash, this.firstHello)
     this.transcript.messages = tlsHandshakeMessage(TLS_MESSAGE_HASH, firstHash)
     this.transcript.add(message)
-    // A new share replaces the ones sent first, whose private keys are done with.
-    if (!cookieOnly) this.wipeKeyPairs()
-    this.keyPairs = [pair]
+    // A new share replaces the ones sent first, whose private keys are done with; with a cookie alone the shares stay (group 0 says so).
+    var replacement = TlsKeyShare(0, "")
+    if (!cookieOnly) {
+        val fresh = generated ?? return
+        this.wipeKeyPairs()
+        this.keyPairs = [fresh]
+        replacement = TlsKeyShare(fresh.group, fresh.publicKey)
+    }
     this.sendCompatibilityChangeCipherSpec()
-    val second = this.config.secondHello(this.firstHello, TlsKeyShare(pair.group, pair.publicKey), hello.cookie)
+    val second = this.config.secondHello(this.firstHello, replacement, hello.cookie)
     if (second.size == 0) {
         this.fail(TLS_ALERT_INTERNAL_ERROR, "tls: the second ClientHello could not be built")
         return
@@ -1032,10 +1191,55 @@ private fun TlsClient.queueRecord12(type: int, content: string): void {
     return
 }
 
+private fun tlsGroupListed(list: array<int>, group: int): bool {
+    for (candidate in list) {
+        if (candidate == group) return true
+    }
+    false
+}
+
+/** The TLS group (secp256r1 23, secp384r1 24, secp521r1 25) of the EC key in the DER certificate `certificate`, or 0 for another or no
+ *  EC key (RFC 8422 section 5.1.1: in TLS 1.2 the client's list of groups also names the curves of the certificates it accepts). */
+fun tlsCertificateEcGroup(certificate: string): int {
+    val outer = derItem(certificate, 0, certificate.size)
+    if (!outer.ok || outer.tag != DER_SEQUENCE) return 0
+    val tbs = derItem(certificate, outer.start, outer.end)
+    if (!tbs.ok || tbs.tag != DER_SEQUENCE) return 0
+    var at = tbs.start
+    var item = derItem(certificate, at, tbs.end)
+    if (item.ok && item.tag == 160) at = item.end
+    // serial number, signature algorithm, issuer, validity, subject
+    for (i in 0 until 5) {
+        item = derItem(certificate, at, tbs.end)
+        if (!item.ok) return 0
+        at = item.end
+    }
+    val spki = derItem(certificate, at, tbs.end)
+    if (!spki.ok || spki.tag != DER_SEQUENCE) return 0
+    val algorithm = derItem(certificate, spki.start, spki.end)
+    if (!algorithm.ok || algorithm.tag != DER_SEQUENCE) return 0
+    val keyType = derItem(certificate, algorithm.start, algorithm.end)
+    if (!keyType.ok || keyType.tag != DER_OID || certificate.slice(keyType.start, keyType.end) != "\x2a\x86\x48\xce\x3d\x02\x01") return 0
+    val curve = derItem(certificate, keyType.end, algorithm.end)
+    if (!curve.ok || curve.tag != DER_OID) return 0
+    val name = certificate.slice(curve.start, curve.end)
+    if (name == "\x2a\x86\x48\xce\x3d\x03\x01\x07") return TLS_GROUP_SECP256R1
+    if (name == "\x2b\x81\x04\x00\x22") return TLS_GROUP_SECP384R1
+    if (name == "\x2b\x81\x04\x00\x23") return 25
+    0
+}
+
 private fun TlsClient.handleCertificate12(message: string, body: string): void {
     val parsed = tls12ParseCertificate(body)
     if (!parsed.ok || parsed.chain.size == 0) {
         this.fail(TLS_ALERT_DECODE_ERROR, "tls: a malformed or empty Certificate")
+        return
+    }
+    // RFC 8422 section 5.1.1: an EC key must be on a curve the ClientHello listed (TLS 1.2 has no signature_algorithms curve; TLS 1.3 does).
+    val leafGroup = tlsCertificateEcGroup(parsed.chain[0])
+    if (leafGroup != 0 && !tlsGroupListed(tlsClientHelloGroups(this.firstHello), leafGroup)) {
+        this.certificateRejected = true
+        this.fail(TLS_ALERT_BAD_CERTIFICATE, "tls: the certificate's curve was not offered in the ClientHello")
         return
     }
     this.chain = parsed.chain
@@ -1052,7 +1256,7 @@ private fun TlsClient.handleServerKeyExchange12(message: string, body: string): 
     }
     var offeredGroup = false
     for (group in tlsClientHelloGroups(this.firstHello)) {
-        if (group == parsed.group && (group == TLS_GROUP_X25519 || group == TLS_GROUP_SECP256R1)) offeredGroup = true
+        if (group == parsed.group && tlsGroupIsClassic(group)) offeredGroup = true
     }
     var offeredScheme = false
     for (scheme in this.config.signatureAlgorithms) {
@@ -1078,6 +1282,7 @@ private fun TlsClient.handleServerKeyExchange12(message: string, body: string): 
         return
     }
     this.v12Group = parsed.group
+    this.negotiatedGroup = parsed.group
     this.v12Point = parsed.point
     this.transcript.add(message)
     this.state = TLS_CLIENT12_WAIT_HELLO_DONE

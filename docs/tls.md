@@ -20,7 +20,7 @@ an empty read with an empty `tlsLastError`; a timed-out read can be repeated; a 
 | Versions | TLS 1.3 (RFC 8446) and TLS 1.2 (RFC 5246) in the subset below. One ClientHello offers both; a server answers with the best. |
 | TLS 1.3 suites | `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`, `TLS_CHACHA20_POLY1305_SHA256` |
 | TLS 1.2 suites | `TLS_ECDHE_{ECDSA,RSA}_WITH_AES_128_GCM_SHA256`, `..._AES_256_GCM_SHA384`, `..._CHACHA20_POLY1305_SHA256` |
-| Key exchange | X25519 and secp256r1 (P-256); a HelloRetryRequest when the server wants a group the client has no share for |
+| Key exchange | TLS 1.3: X25519MLKEM768 (the hybrid of X25519 and ML-KEM-768, draft-ietf-tls-ecdhe-mlkem; what browsers offer first), X25519, secp256r1 (P-256), secp384r1 (P-384); TLS 1.2: the three classic groups. A HelloRetryRequest when the server wants a group the client has no share for. A client sends shares for the first classical group and the first hybrid of its list (`TlsClientConfig.groups`; by default X25519 and the hybrid: BoringSSL's and the browsers' rule), a server prefers its own `groups` order (the default is the hybrid first) |
 | Signatures | ECDSA P-256 (SHA-256), ECDSA P-384 (SHA-384, TLS 1.3 only), RSA-PSS (rsae, SHA-256/384/512), Ed25519; RSA PKCS#1 v1.5 (SHA-256/384) in TLS 1.2 only |
 | Certificates | X.509 chains to the system trust store or a CA file, with name, validity, key-usage, basic-constraints, name-constraints and signature checks (`abla/crypto/x509`); client certificates (RSA, P-256, Ed25519) from PEM (PKCS#8, PKCS#1, SEC1, encrypted PKCS#8) or PKCS#12 (PBES2 with AES or 3DES, and the legacy RC2/3DES encodings, read only: see [PKCS#12 client certificates](pkcs12-client-certificates.md)) |
 | Other | ALPN, SNI, KeyUpdate, close_notify, middlebox-compatibility ChangeCipherSpec, the TLS 1.3 downgrade sentinel, deadlines |
@@ -35,9 +35,8 @@ CBC suites, RSA key exchange, static or finite-field Diffie-Hellman, RC4, 3DES a
 1.0 and 1.1; renegotiation (a HelloRequest after the handshake ends the connection); compression; a TLS 1.2 peer that
 does not support the extended master secret (RFC 7627) or secure renegotiation info; 0-RTT early data; session
 resumption and tickets (the server sends none, the client ignores them); a certificate that matches the host only by
-its Common Name (a subjectAltName is required, RFC 6125); TLS 1.2 with a P-384 *certificate* (a TLS 1.2 server needs
-the certificate's curve among the client's groups and there is no P-384 key exchange to offer; TLS 1.3 has no such rule
-and works); RSA keys under 2048 bits for PSS verification.
+its Common Name (a subjectAltName is required, RFC 6125); a server identity with a P-384 key (the client verifies P-384 certificates; there is no P-384 signing);
+RSA keys under 2048 bits for PSS verification.
 
 ## Differences from the OpenSSL-backed module
 
@@ -83,6 +82,27 @@ server whose `alpn` is `[]` accepts any client. A server that shares one certifi
 must set `alpn` to the protocols it speaks: then a client that offers protocols and none of them match is refused with
 `no_application_protocol`, (a client that offers no ALPN at all is still accepted:
 require ALPN in the application if that matters). A client that sends ALPN refuses a server's answer that it did not offer.
+
+## Key exchange groups and the hybrid X25519MLKEM768
+
+The default client offers `X25519MLKEM768`, `x25519`, `secp256r1`, `secp384r1` in that order and sends key shares for the first
+(1216 bytes: the ML-KEM-768 encapsulation key, then the X25519 key) and for X25519, as browsers do, so a server without the hybrid
+answers with no extra round trip; a server that wants P-256 or P-384 gets a HelloRetryRequest answered. `TlsClientConfig.groups`
+changes the list and the order (shares go to the first classical group and the first hybrid of the list; a TLS 1.2-only client lists no hybrid). The default server prefers the hybrid, then X25519, P-256 and P-384
+(`TlsServerConfig.groups` is its order); it answers a hybrid share with the ML-KEM ciphertext and its X25519 key (1120 bytes) and
+a client share it cannot use with a HelloRetryRequest.
+
+The hybrid follows draft-ietf-tls-ecdhe-mlkem section 4: the ML-KEM part comes first in the key shares and in the shared
+secret (4.1: the order is the reverse of the group name's, "for historical reasons"; 4.2; 4.3: the secret is the ML-KEM secret, then
+X25519's, 64 bytes). The server checks the client's encapsulation key (FIPS 203 section 7.2) and the X25519 part (the all-zero
+check, RFC 8446 section 7.4.2) and sends `illegal_parameter` if either fails; the client checks the share's length
+(`illegal_parameter`) and the X25519 part. A ciphertext that was not made for the client's key is not an error at that point
+(ML-KEM's implicit rejection): the keys differ and the handshake fails at the first protected record, so a bad ciphertext does not
+tell a server whether it decapsulated. The hybrid is a TLS 1.3 group only: a TLS 1.2 server never selects it, and a TLS 1.2
+client refuses a ServerKeyExchange for it. P-384 works as an ECDHE group in both versions (key agreement only: there is no P-384
+*signing*, so a server identity cannot be a P-384 key; a client verifies P-384 certificates). In TLS 1.2 the group list also names the curves of
+the certificates a client accepts (RFC 8422 section 5.1.1): a client refuses an EC certificate whose curve it did not list (`bad_certificate`), and a
+server with a P-256 key does not serve a TLS 1.2 client that lists no P-256 (`handshake_failure`); TLS 1.3 has no such rule.
 
 ## Secrets in memory
 

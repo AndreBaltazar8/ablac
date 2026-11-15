@@ -59,7 +59,11 @@ stop_server() {
 runs=0
 for kind in ed25519 p256 p384 rsa; do
     for suite in TLS_AES_128_GCM_SHA256:4865 TLS_AES_256_GCM_SHA384:4866 TLS_CHACHA20_POLY1305_SHA256:4867; do
-        for group in X25519 P-256; do
+        # The groups: X25519 (a share in the hello) and P-256 (a HelloRetryRequest); and, for one key kind, P-384 (HelloRetryRequest) and the
+        # hybrid X25519MLKEM768 (the first share), where s_server offers that group only, so the handshake proves it was the one used.
+        groups="X25519 P-256"
+        [[ $kind == ed25519 ]] && groups="$groups secp384r1 X25519MLKEM768"
+        for group in $groups; do
             start_server "$kind" -www -ciphersuites "${suite%:*}" -groups "$group"
             result=$("$root/tools/run-limited.sh" "$out/interop" "$port" "$out/$kind.pem" "${suite#*:}" "$out/$([[ $kind == p256 ]] && echo rsa || echo p256).pem") || {
                 echo "tls-pure interop ($kind ${suite%:*} $group): $result" >&2; head -5 "$out/server.log" >&2; show_port; exit 1; }
@@ -77,7 +81,7 @@ for kind in ed25519 p256 p384 rsa; do
     done
     echo "$kind: ok"
 done
-echo "$runs handshakes (4 certificate types x 3 suites x 2 groups, the P-256 ones through a HelloRetryRequest)"
+echo "$runs handshakes (4 certificate types x 3 suites x 2 groups, and Ed25519 x 3 suites x P-384 and X25519MLKEM768; P-256 and P-384 go through a HelloRetryRequest)"
 # A TlsConnection that is dropped (never close()d) tells the peer: s_server -msg logs the close_notify it received.
 "$compiler" build tests/cases/tls-pure/dropnotify.ab -o "$out/dropnotify" --no-cache
 start_server ed25519 -www -msg
@@ -93,16 +97,18 @@ echo "drop: the dropped connection sent close_notify"
 # ECDHE suites x X25519 and P-256, and RSA with PKCS#1 v1.5 signatures only; a TLS 1.2 server without the extended
 # master secret is refused.
 runs12=0
-# (No P-384 certificate: TLS 1.2 servers require the certificate's curve in the client's supported_groups, and the
-# client has no P-384 key exchange to offer it with; TLS 1.3 has no such rule.)
-for kind in rsa p256 ed25519; do
+# (A TLS 1.2 server requires the certificate's curve in the client's supported_groups: the P-384 certificate works because the client offers
+# P-384 for ECDHE too.)
+for kind in rsa p256 p384 ed25519; do
     if [[ $kind == rsa ]]; then
         suites12="ECDHE-RSA-AES128-GCM-SHA256:49199 ECDHE-RSA-AES256-GCM-SHA384:49200 ECDHE-RSA-CHACHA20-POLY1305:52392"
     else
         suites12="ECDHE-ECDSA-AES128-GCM-SHA256:49195 ECDHE-ECDSA-AES256-GCM-SHA384:49196 ECDHE-ECDSA-CHACHA20-POLY1305:52393"
     fi
     for suite in $suites12; do
-        for group in X25519 P-256; do
+        groups12="X25519 P-256"
+        [[ $kind == ed25519 || $kind == p384 ]] && groups12="$groups12 secp384r1"
+        for group in $groups12; do
             tls_flag=-tls1_2 start_server "$kind" -www -cipher "${suite%:*}" -groups "$group"
             result=$("$root/tools/run-limited.sh" "$out/interop" "$port" "$out/$kind.pem" "${suite#*:}" "$out/$([[ $kind == p256 ]] && echo rsa || echo p256).pem") || {
                 echo "tls-pure TLS 1.2 ($kind ${suite%:*} $group): $result" >&2; head -5 "$out/server.log" >&2; show_port; exit 1; }
@@ -117,7 +123,7 @@ result=$("$root/tools/run-limited.sh" "$out/interop" "$port" "$out/rsa.pem" 4919
 [[ $result == 'tls-pure interop ok'* ]] || { echo "tls-pure TLS 1.2 (RSA PKCS#1): $result" >&2; show_port; exit 1; }
 stop_server
 runs12=$((runs12 + 1))
-echo "TLS 1.2: $runs12 handshakes (3 certificate types x 3 suites x 2 groups, and RSA with PKCS#1 v1.5)"
+echo "TLS 1.2: $runs12 handshakes (4 certificate types x 3 suites x 2 groups, P-384 ECDHE for Ed25519 and P-384 certificates, and RSA with PKCS#1 v1.5)"
 # The hosted-API-compatible surface (abla/tls/pure: tlsConnectWithCa, TlsConnection, tlsLastError ...).
 "$compiler" build tests/cases/tls-pure/api.ab -o "$out/api" --no-cache
 start_server ed25519 -www -groups X25519
@@ -239,23 +245,46 @@ start_serve() {   # the serve.ab arguments; sets serve_port
 s_client() {   # the s_client options after the address; prints what the server sent
     printf 'GET /pure HTTP/1.0\r\n\r\n' | timeout 15 openssl s_client -connect "[::1]:$serve_port" ${s_tls:--tls1_3} -servername localhost -quiet "$@" 2> "$out/s_client.err" || true
 }
+negotiated() {   # the s_client options after the address; prints the key exchange s_client -brief reports: the TLS 1.3 group (X25519MLKEM768) or the temporary key ("ECDH, secp384r1, 384 bits")
+    printf 'GET /pure HTTP/1.0\r\n\r\n' | timeout 15 openssl s_client -connect "[::1]:$serve_port" ${s_tls:--tls1_3} -servername localhost -brief "$@" > "$out/s_client.out" 2> "$out/s_client.err" || true
+    sed -n 's/^Negotiated TLS1.3 group: //p; s/^Peer Temp Key: //p' "$out/s_client.err"
+}
 served=0
 for kind in ed25519 p256 rsa; do
     start_serve plain "$out/$kind.pem" "$out/$kind.key"
     for suite in TLS_AES_128_GCM_SHA256 TLS_AES_256_GCM_SHA384 TLS_CHACHA20_POLY1305_SHA256; do
-        for group in X25519 P-256; do
+        groups="X25519 P-256"
+        [[ $kind == ed25519 ]] && groups="$groups secp384r1 X25519MLKEM768"
+        for group in $groups; do
             answer=$(s_client -ciphersuites "$suite" -groups "$group" -CAfile "$out/$kind.pem" -verify_return_error -verify_hostname localhost)
             [[ $answer == *'pure server: GET /pure'* ]] || { echo "tls-pure server ($kind $suite $group): [$answer] $(head -3 "$out/s_client.err") $(head -3 "$out/serve.log")" >&2; exit 1; }
             served=$((served + 1))
         done
     done
+    # What the group of a handshake was (not only that it worked): the hybrid, and P-384 (with only X25519's share sent first: a
+    # HelloRetryRequest). The s_client default (no -groups) is not asked about: it depends on the OpenSSL version.
+    if [[ $kind == ed25519 ]]; then
+        [[ $(negotiated -groups X25519MLKEM768 -CAfile "$out/$kind.pem") == X25519MLKEM768 ]] || { echo "tls-pure server: the hybrid was not negotiated: $(cat "$out/s_client.err")" >&2; exit 1; }
+        [[ $(negotiated -groups secp384r1 -CAfile "$out/$kind.pem") == 'ECDH, secp384r1, 384 bits' ]] || { echo "tls-pure server: P-384 was not negotiated: $(cat "$out/s_client.err")" >&2; exit 1; }
+        [[ $(negotiated -groups X25519:X25519MLKEM768 -CAfile "$out/$kind.pem") == 'X25519, 253 bits' ]] || { echo "tls-pure server: X25519 was not chosen over a retry: $(cat "$out/s_client.err")" >&2; exit 1; }
+    fi
     # The pure client against it (one good connection, a wrong host name, an untrusted anchor).
     result=$("$root/tools/run-limited.sh" "$out/interop" "$serve_port" "$out/$kind.pem" 4865 "$out/$([[ $kind == p256 ]] && echo rsa || echo p256).pem") || {
         echo "tls-pure client vs pure server ($kind): $result" >&2; head -3 "$out/serve.log" >&2; exit 1; }
     [[ $result == 'tls-pure interop ok'* ]] || { echo "tls-pure client vs pure server ($kind): $result" >&2; exit 1; }
     stop_serve
 done
-echo "pure server: $served openssl s_client handshakes (3 key kinds x 3 suites x 2 groups) and the pure client, each key kind"
+echo "pure server: $served openssl s_client handshakes (3 key kinds x 3 suites x 2 groups, Ed25519 also P-384 and X25519MLKEM768, which of them was negotiated, and one-group servers that send a HelloRetryRequest) and the pure client, each key kind"
+# A server with one group: P-384, and the hybrid. s_client sends a share for the first of its groups (X25519) only, so the server must answer
+# with a HelloRetryRequest and s_client must retry with the group the server wants.
+start_serve p384 "$out/ed25519.pem" "$out/ed25519.key"
+[[ $(negotiated -groups X25519:secp384r1 -CAfile "$out/ed25519.pem") == 'ECDH, secp384r1, 384 bits' ]] || { echo "tls-pure server (P-384 only): no HelloRetryRequest to P-384: $(cat "$out/s_client.err")" >&2; exit 1; }
+stop_serve
+start_serve hybrid "$out/ed25519.pem" "$out/ed25519.key"
+[[ $(negotiated -groups X25519:X25519MLKEM768 -CAfile "$out/ed25519.pem") == X25519MLKEM768 ]] || { echo "tls-pure server (hybrid only): no HelloRetryRequest to the hybrid: $(cat "$out/s_client.err")" >&2; exit 1; }
+answer=$(s_client -groups X25519 -CAfile "$out/ed25519.pem" -verify_return_error)
+[[ $answer != *'pure server'* ]] || { echo "tls-pure server (hybrid only): a client without the hybrid was served: [$answer]" >&2; exit 1; }
+stop_serve
 # The same server speaks TLS 1.2 to openssl s_client -tls1_2: every key kind x its suites x X25519 / P-256, then a client certificate.
 served12=0
 for kind in ed25519 p256 rsa; do
@@ -266,7 +295,9 @@ for kind in ed25519 p256 rsa; do
         suites12="ECDHE-ECDSA-AES128-GCM-SHA256 ECDHE-ECDSA-AES256-GCM-SHA384 ECDHE-ECDSA-CHACHA20-POLY1305"
     fi
     for suite in $suites12; do
-        for group in X25519 P-256; do
+        groups12="X25519 P-256"
+        [[ $kind == ed25519 ]] && groups12="$groups12 secp384r1"
+        for group in $groups12; do
             # (A TLS 1.2 client must offer the certificate's curve: P-256 for the P-256 key, so X25519 is offered beside it.)
             offered=$group
             [[ $kind == p256 && $group == X25519 ]] && offered=X25519:P-256
@@ -275,6 +306,10 @@ for kind in ed25519 p256 rsa; do
             served12=$((served12 + 1))
         done
     done
+    if [[ $kind == ed25519 ]]; then
+        [[ $(s_tls=-tls1_2 negotiated -cipher ECDHE-ECDSA-AES128-GCM-SHA256 -groups secp384r1 -CAfile "$out/$kind.pem") == 'ECDH, secp384r1, 384 bits' ]] ||
+            { echo "tls-pure server TLS 1.2: P-384 was not negotiated: $(cat "$out/s_client.err")" >&2; exit 1; }
+    fi
     stop_serve
 done
 start_serve auth "$out/ed25519.pem" "$out/ed25519.key" "$out/client-p256.pem"
@@ -283,7 +318,7 @@ answer=$(s_tls=-tls1_2 s_client -CAfile "$out/ed25519.pem" -cert "$out/client-p2
 answer=$(s_tls=-tls1_2 s_client -CAfile "$out/ed25519.pem")
 [[ $answer != *'pure server'* ]] || { echo "tls-pure server TLS 1.2: a client with no certificate was served: [$answer]" >&2; exit 1; }
 stop_serve
-echo "pure server: $served12 openssl s_client -tls1_2 handshakes (3 key kinds x 3 suites x 2 groups) and a required client certificate"
+echo "pure server: $served12 openssl s_client -tls1_2 handshakes (3 key kinds x 3 suites x 2 groups, Ed25519 also P-384 ECDHE) and a required client certificate"
 start_serve alpn "$out/ed25519.pem" "$out/ed25519.key"
 answer=$(s_client -CAfile "$out/ed25519.pem" -alpn http/1.1,h2)
 [[ $answer == *'alpn=h2'* ]] || { echo "tls-pure server ALPN: [$answer] $(head -3 "$out/s_client.err")" >&2; exit 1; }

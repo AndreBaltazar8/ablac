@@ -3,7 +3,7 @@
 # pinned below and fetched into build/bogo/boringssl (not vendored), drives tools/tls-bogo/shim.ab as a client and as a
 # server through several thousand tests. tools/tls-bogo/config.json disables what abla/tls/pure refuses on purpose
 # (TLS 1.0/1.1, CBC and RSA key exchange, TLS 1.2 without the extended master secret, SHA-1, renegotiation, groups
-# besides X25519 and P-256, ECH, 0-RTT); the shim exits 89 (unimplemented) on a flag it has no answer for (DTLS, QUIC,
+# besides X25519, P-256, P-384 and X25519MLKEM768, ECH, 0-RTT); the shim exits 89 (unimplemented) on a flag it has no answer for (DTLS, QUIC,
 # resumption and the like), which the runner skips. tools/tls-bogo/expected-failures.txt lists the tests that fail
 # today, each with the reason: the regression record. The test fails when a test outside that list fails, and when a
 # test on it passes (take it off the list).

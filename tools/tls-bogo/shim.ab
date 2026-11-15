@@ -43,7 +43,8 @@ class ShimFlags(
     var curves: array<int>,
     var signingPrefs: array<int>,
     var verifyPrefs: array<int>,
-    var unimplemented: string
+    var unimplemented: string,
+    var expectCurveId: int = 0
 )
 
 fun shimDefaults(): ShimFlags =
@@ -114,6 +115,7 @@ fun parseFlags(): ShimFlags {
         else if (name == "-expect-version") flags.expectVersion = numberOf(value)
         else if (name == "-advertise-alpn") flags.advertiseAlpn = parseAlpnList(value)
         else if (name == "-expect-alpn") flags.expectAlpn = value
+        else if (name == "-expect-curve-id") flags.expectCurveId = numberOf(value)
         else if (name == "-select-alpn") flags.selectAlpn = value
         else if (name == "-host-name") flags.hostName = value
         else if (name == "-expect-server-name") flags.expectServerName = value
@@ -153,10 +155,12 @@ fun loadIdentity(flags: ShimFlags): TlsIdentity? {
     TlsIdentity(identity.chain, schemes, identity.sign, if (schemes.size == 0) "no usable signing preference" else "")
 }
 
-val SUPPORTED_GROUPS = [TLS_GROUP_X25519, TLS_GROUP_SECP256R1]
+// What the shim offers by default (the library's: the hybrid, X25519, P-256, P-384: BoGo expects the hybrid by default), and what -curves may ask for.
+val DEFAULT_GROUPS = tlsDefaultGroups()
+val SUPPORTED_GROUPS = [TLS_GROUP_X25519, TLS_GROUP_SECP256R1, TLS_GROUP_SECP384R1, TLS_GROUP_X25519_MLKEM768]
 
 fun shimGroups(flags: ShimFlags): array<int> {
-    if (flags.curves.size == 0) return SUPPORTED_GROUPS
+    if (flags.curves.size == 0) return DEFAULT_GROUPS
     val groups: array<int> = []
     for (group in flags.curves) if (has(SUPPORTED_GROUPS, group)) groups.append(group)
     groups
@@ -186,18 +190,12 @@ fun shimClient(flags: ShimFlags, groups: array<int>): TlsClient {
     // The 32-byte legacy session id is TLS 1.3's middlebox compatibility; a TLS 1.2-only client offers none (it does not
     // resume), as BoringSSL's does.
     val sessionId = if (flags.maxVersion >= 772) tlsPureRandom(32) else ""
-    val pairs: array<TlsKeyPair> = []
-    val shares: array<TlsKeyShare> = []
-    if (suites.size > 0) {
-        val pair = tlsGenerateKeyPair(groups[0], tlsPureRandom)
-        if (pair != null) {
-            pairs.append(pair)
-            shares.append(TlsKeyShare(pair.group, pair.publicKey))
-        }
-    }
-    val hello = tlsBuildClientHello(helloRandom, sessionId, suites, flags.hostName, groups, shares, signatures,
-        flags.advertiseAlpn, "", suites12)
-    tlsClientStartWith(config, hello, helloRandom, sessionId, pairs, 769)
+    // The library's choice of key shares (the first classical group and the first hybrid, in the order given), and its list: a client
+    // without TLS 1.3 lists no hybrid.
+    val offer = tlsClientShares(groups, suites.size > 0, tlsPureRandom)
+    val hello = tlsBuildClientHello(helloRandom, sessionId, suites, flags.hostName, offer.groups, if (suites.size > 0) offer.shares else [],
+        signatures, flags.advertiseAlpn, "", suites12)
+    tlsClientStartWith(config, hello, helloRandom, sessionId, if (suites.size > 0) offer.pairs else [], 769)
 }
 
 fun shimServer(flags: ShimFlags, identity: TlsIdentity, groups: array<int>): TlsServer {
@@ -233,6 +231,7 @@ fun Shim.received(): string = if (this.isServer) this.server.takeApplicationData
 fun Shim.send(data: string): bool = if (this.isServer) this.server.send(data) else this.client.send(data)
 fun Shim.version(): int = if (this.isServer) (if (this.server.v12) 771 else 772) else (if (this.client.v12) 771 else 772)
 fun Shim.alpn(): string = if (this.isServer) this.server.alpn() else this.client.alpn()
+fun Shim.negotiatedGroup(): int = if (this.isServer) this.server.negotiatedGroup else this.client.negotiatedGroup
 
 fun Shim.flush(): bool {
     val data = this.output()
@@ -329,6 +328,9 @@ fun main: int {
     // The checks the flags ask for.
     if (flags.expectVersion != 0 && shim.version() != flags.expectVersion) {
         return shim.failWith("version ${shim.version()}, expected ${flags.expectVersion}")
+    }
+    if (flags.expectCurveId != 0 && shim.negotiatedGroup() != flags.expectCurveId) {
+        return shim.failWith("group ${shim.negotiatedGroup()}, expected ${flags.expectCurveId}")
     }
     if (flags.expectAlpn != "" && shim.alpn() != flags.expectAlpn) {
         return shim.failWith("ALPN '${shim.alpn()}', expected '${flags.expectAlpn}'")

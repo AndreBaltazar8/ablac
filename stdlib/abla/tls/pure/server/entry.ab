@@ -100,7 +100,10 @@ class TlsServer(
     var keyUpdateRun: int = 0,
     var keyUpdateOwed: bool = false,
     /** Warning alerts in a row (ignored up to four, as BoringSSL does). */
-    var warningRun: int = 0
+    var warningRun: int = 0,
+    /** The key exchange group that was negotiated (0 until the ServerHello is processed): the group of the key share, or of the
+     *  TLS 1.2 ServerKeyExchange. */
+    var negotiatedGroup: int = 0
 )
 
 private fun tlsServerEmptyProtection(): TlsRecordProtection = tlsRecordProtection(TLS_AEAD_AES_128_GCM, "", "")
@@ -113,11 +116,11 @@ fun tlsServerNew(config: TlsServerConfig): TlsServer =
         tls12Protection(tls12Placeholder(), "", ""), tls12Protection(tls12Placeholder(), "", ""), Tls12Keys("", "", "", ""),
         TlsKeyPair(0, "", ""), "", "")
 
-/** The usual configuration: the given identity, AES-GCM and ChaCha20 suites, X25519 then P-256, no ALPN, no client
+/** The usual configuration: the given identity, AES-GCM and ChaCha20 suites, X25519MLKEM768, X25519, P-256 then P-384, no ALPN, no client
  *  certificate. */
 fun tlsServerConfig(identity: TlsIdentity, random: (int) -> string): TlsServerConfig =
     TlsServerConfig(identity, [TLS_SUITE_AES_128_GCM_SHA256, TLS_SUITE_AES_256_GCM_SHA384,
-        TLS_SUITE_CHACHA20_POLY1305_SHA256], [TLS_GROUP_X25519, TLS_GROUP_SECP256R1], [], random, false, false,
+        TLS_SUITE_CHACHA20_POLY1305_SHA256], tlsDefaultGroups(), [], random, false, false,
         tlsServerRefuseClients)
 
 /** As tlsServerConfig, and asks the client for a certificate that `verifier` (chain, signature scheme, signed content,
@@ -125,7 +128,7 @@ fun tlsServerConfig(identity: TlsIdentity, random: (int) -> string): TlsServerCo
 fun tlsServerConfigWithClientCertificates(identity: TlsIdentity, random: (int) -> string, required: bool,
     verifier: (array<string>, int, string, string) -> TlsVerdict): TlsServerConfig =
     TlsServerConfig(identity, [TLS_SUITE_AES_128_GCM_SHA256, TLS_SUITE_AES_256_GCM_SHA384,
-        TLS_SUITE_CHACHA20_POLY1305_SHA256], [TLS_GROUP_X25519, TLS_GROUP_SECP256R1], [], random, true, required, verifier)
+        TLS_SUITE_CHACHA20_POLY1305_SHA256], tlsDefaultGroups(), [], random, true, required, verifier)
 
 /** The client verifier of a server that asks for no certificate: it trusts none. */
 fun tlsServerRefuseClients(chain: array<string>, scheme: int, content: string, signature: string): TlsVerdict =
@@ -377,16 +380,13 @@ private fun TlsServer.handleClientHello(message: string, body: string): void {
         return
     }
     val selected = chosen ?? return
-    val pair = tlsGenerateKeyPair(selected.group, this.config.random)
-    if (pair == null) {
-        this.fail(TLS_ALERT_INTERNAL_ERROR, "tls: the server could not make a key share")
+    val exchange = tlsServerExchange(selected.group, selected.publicKey, this.config.random)
+    if (!exchange.ok) {
+        this.fail(exchange.alert, exchange.error)
         return
     }
-    val shared = tlsAgree(pair, selected.publicKey)
-    if (!shared.ok) {
-        this.fail(TLS_ALERT_ILLEGAL_PARAMETER, "tls: the client's key share is not valid")
-        return
-    }
+    val shared = exchange.secret
+    this.negotiatedGroup = selected.group
     this.clientRandom = hello.random
     this.sessionId = hello.sessionId
     this.serverName = hello.serverName
@@ -395,24 +395,24 @@ private fun TlsServer.handleClientHello(message: string, body: string): void {
     // ServerHello (plaintext), then the key schedule and the encrypted flight.
     val serverRandom13 = this.config.random(32)
     if (serverRandom13.size != 32) {
+        tlsWipe(shared)
         this.fail(TLS_ALERT_INTERNAL_ERROR, "tls: the random source failed")
         return
     }
     val serverHello = tlsBuildServerHello(serverRandom13, hello.sessionId, suite,
-        TlsKeyShare(pair.group, pair.publicKey))
+        TlsKeyShare(selected.group, exchange.publicKey))
     this.transcript.add(serverHello)
     this.outbox = this.outbox + tlsPlaintextRecord(TLS_HANDSHAKE, 771, serverHello)
     this.sendCompatibilityChangeCipherSpec()
     val early = tlsEarlySecret(this.hash, "")
-    val secrets = tlsDeriveHandshakeSecrets(this.hash, early, shared.bytes, this.transcript.hash(this.hash))
+    val secrets = tlsDeriveHandshakeSecrets(this.hash, early, shared, this.transcript.hash(this.hash))
     this.handshakeSecret = secrets.handshakeSecret
     this.clientHandshakeSecret = secrets.clientTraffic
     this.serverHandshakeSecret = secrets.serverTraffic
     this.setKeys(secrets.serverTraffic, true)
     this.setKeys(secrets.clientTraffic, false)
-    // The key exchange is done with: the private key, the shared secret and the early secret.
-    tlsWipe(pair.privateKey)
-    tlsWipe(shared.bytes)
+    // The key exchange is done with: the shared secret and the early secret (the private keys were wiped in tlsServerExchange).
+    tlsWipe(shared)
     tlsWipe(early)
     this.sendFlight(scheme)
     return
@@ -819,10 +819,15 @@ private fun TlsServer.startV12(message: string, hello: TlsClientHello): void {
         return
     }
     val chosen = suite ?? return
+    // RFC 8422 section 5.1.1: an ECDSA certificate needs its curve (an identity's EC key is P-256; Ed25519 has no curve to list) among the client's groups.
+    if (chosen.ecdsa && tlsServerListHas(this.config.identity.schemes, TLS_SIG_ECDSA_SECP256R1_SHA256) && !tlsServerListHas(hello.groups, TLS_GROUP_SECP256R1)) {
+        this.fail(TLS_ALERT_HANDSHAKE_FAILURE, "tls: the client does not list the curve of the certificate")
+        return
+    }
     // The group (the client's list, which TLS 1.2 requires for ECDHE) and the signature scheme.
     var group = 0
     for (candidate in this.config.groups) {
-        if (group == 0 && tlsServerListHas(hello.groups, candidate)) group = candidate
+        if (group == 0 && tlsGroupIsClassic(candidate) && tlsServerListHas(hello.groups, candidate)) group = candidate
     }
     var scheme = 0
     for (candidate in this.config.identity.schemes) {
@@ -856,6 +861,7 @@ private fun TlsServer.startV12(message: string, hello: TlsClientHello): void {
     this.suite = chosen.code
     this.hash = chosen.hash
     this.v12Pair = pair
+    this.negotiatedGroup = group
     this.clientRandom = hello.random
     this.sessionId = hello.sessionId
     this.serverName = hello.serverName

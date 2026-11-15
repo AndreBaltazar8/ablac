@@ -29,3 +29,7 @@ primitives abla/tls/pure uses that had no Wycheproof test (`ecdh_secp384r1_ecpoi
 `hkdf_sha384_test.json`, `hmac_sha256_test.json`, `hmac_sha384_test.json`, `rsa_signature_2048_sha384_test.json`,
 `rsa_signature_2048_sha512_test.json` and `rsa_pss_2048_sha384_mgf1_48_test.json` (read by
 `tests/cases/crypto-pure/wycheproof-tls.ab`, `tools/test-crypto-pure.sh`).
+
+## mlkem768/
+
+ML-KEM-768 known answers from the NIST ACVP server (commit and format in `mlkem768/README.md`), read by `tests/cases/crypto-pure/mlkem.ab` and, in part, embedded in `tests/cases/crypto-pure/kat.ab` (`tools/test-crypto-pure.sh`).

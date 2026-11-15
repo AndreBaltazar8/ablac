@@ -5,7 +5,9 @@
 | `abla/crypto` | SHA-512, SHA-384, SHA-256, SHA-1, MD5, HMAC, PBKDF2, Base64, hexadecimal, constant-time comparison |
 | `abla/crypto/aes`, `abla/crypto/rsa`, `abla/crypto/pure` | AES (GCM, CBC, ECB), RSA signing, verifying and encryption, key parsing: in Abla, on every target |
 | `abla/crypto/p256` | NIST P-256: ECDH and ECDSA (SHA-256, RFC 6979 nonces), in Abla, on every target |
-| `abla/crypto/p384` | NIST P-384 ECDSA verification (for certificates), in Abla |
+| `abla/crypto/p384` | NIST P-384: ECDH and ECDSA verification, in Abla |
+| `abla/crypto/sha3` | SHA3-256, SHA3-512, SHAKE128 and SHAKE256 (FIPS 202) with an incremental sponge, in Abla, on every target |
+| `abla/crypto/mlkem` | ML-KEM-768 (FIPS 203): key generation, encapsulation and decapsulation with implicit rejection, in Abla, on every target |
 | `abla/crypto/x509` | X.509 certificates: parsing, chain building and validation (RFC 5280), host names (RFC 6125), a trust store, in Abla |
 | `abla/crypto/chacha20poly1305` | ChaCha20, Poly1305 and the RFC 8439 AEAD: in Abla, on every target |
 | `abla/crypto/rsapss` | RSASSA-PSS (SHA-256, -384, -512; MGF1 over the same hash) on `abla/crypto/rsa` keys: in Abla, on every target |
@@ -100,6 +102,45 @@ memory and the stack below it (2,048 bytes) after each call, and nothing else (t
 there). Speed: about 1.4 ms per product on a current x86-64 core. Tested against RFC 7748 (section 5.2's two vectors, the
 iterated function after 1, 1,000 and, with `X25519_MILLION=1`, 1,000,000 rounds; section 6.1's Alice and Bob), the
 refusal of the small-order points, and random scalars and points against the `openssl` CLI (`tools/test-x25519.sh`).
+
+## `abla/crypto/sha3`
+
+SHA-3 and SHAKE ([FIPS 202](https://csrc.nist.gov/pubs/fips/202/final)): the Keccak-f[1600] permutation in Abla, on every target.
+
+| Function | Result |
+|---|---|
+| `sha3256(input)`, `sha3512(input)` | the 32- and 64-byte digests |
+| `shake128(input, size)`, `shake256(input, size)` | `size` bytes of output |
+| `keccakSha3(rate)`, `keccakShake128()`, `keccakShake256()` | a `Keccak` sponge: `absorb(text)` / `absorbAt(address, count)`, then `squeeze(count)` / `squeezeTo(address, count)` as often as needed, and `close()` (wipes the state) |
+
+The permutation is exclusive-or, and, not and rotation by constant amounts on 64-bit lanes: no table, branch or division on a lane,
+so it is constant time by construction; `tools/test-ct.sh` reads it (`BEGIN SHA3 SECRET CORE`), a leaky twin must be found.
+Tested against the FIPS 202 answers and `openssl dgst` for 31 message lengths around every rate boundary, one call against pieces
+(`tools/test-crypto-pure.sh`).
+
+## `abla/crypto/mlkem`
+
+ML-KEM-768 ([FIPS 203](https://csrc.nist.gov/pubs/fips/203/final)), the KEM of the TLS 1.3 hybrid X25519MLKEM768, in Abla, on every
+target. An encapsulation key is 1184 bytes, a decapsulation key 2400 (`dkPKE || ek || H(ek) || z`), a ciphertext 1088, a shared secret 32.
+
+| Function | Result |
+|---|---|
+| `mlkem768GenerateKey()` | a decapsulation key from the random source (`cryptoSetRandom`) |
+| `mlkem768KeyGenFromSeeds(d, z)` | the key from the 32-byte seeds (algorithm 16) |
+| `mlkem768EncapsulationKey(dk)` | the encapsulation key inside a decapsulation key |
+| `mlkem768Encapsulate(ek)`, `mlkem768EncapsulateWithMessage(ek, m)` | a `MlkemEncapsulation`: `ciphertext`, `sharedSecret`; `ok` is false for a key that fails the check of section 7.2 |
+| `mlkem768Decapsulate(dk, ciphertext)` | the shared secret. A ciphertext that was not made for the key gives a pseudorandom secret (implicit rejection), not an error; a wrong length or a key whose hash does not match is refused (section 7.3) |
+| `mlkem768CheckEncapsulationKey(ek)`, `mlkem768CheckDecapsulationKey(dk)` | the checks of sections 7.2 and 7.3 |
+
+Every coefficient of a secret is a `secretU32` in memory, the arithmetic mod 3329 is Montgomery's (multiplications, shifts, masks: no
+division, no branch or table lookup on a coefficient; the NTT's zeta tables are read at public positions), compression is a
+multiplication by a reciprocal checked for every input, and decapsulation compares the whole re-encrypted ciphertext in constant time
+and selects the secret or J(z || c) by a mask. The matrix is sampled from the public rho by rejection, which branches on public bytes.
+`tools/test-ct.sh` reads the kernels (`BEGIN MLKEM SECRET CORE`) on x86-64, AArch64, Wasm and Xtensa, with leaky twins. Strings
+(seeds, shared secrets) cannot be wiped; the polynomials, the working memory and the sponge are. Tested against the NIST ACVP vectors
+for ML-KEM-768 (25 key generations, 25 encapsulations, 10 decapsulations with altered ciphertexts, 20 key checks:
+`tests/vectors/crypto/mlkem768`), refusals, and round trips (`tools/test-crypto-pure.sh`), and by interoperating with `openssl s_server` and
+`s_client` in TLS (`tools/test-tls-pure-interop.sh`).
 
 ## `abla/crypto/ed25519`
 
@@ -473,7 +514,7 @@ is refused, and e-mail or URI names and other name forms under constraints are r
 ECDSA with SHA-256, -384 or -512 on RSA, P-256 and P-384 keys; RSASSA-PSS (SHA-2, MGF1 of the same hash, an explicit salt length; the issuer's key rsaEncryption) and Ed25519; SHA-1 and MD5 signatures are refused. RSA keys under 2048 bits and unusual EC curves in a leaf or an intermediate
 are refused. Not done: revocation, certificate policies, the common name, the public suffix list, id-RSASSA-PSS public keys.
 
-`abla/crypto/p384` has ECDSA verification on P-384 only (variable time, on public values), checked against Wycheproof's 504
+`abla/crypto/p384` has ECDH (`p384Ecdh`, `p384PublicKey`: 48-byte private keys, constant time, tools/test-ct.sh reads the cores; checked against Wycheproof's 790 ECDH vectors and openssl) and ECDSA verification (variable time, on public values), checked against Wycheproof's 504
 secp384r1/SHA-384 vectors. Tests (`tools/test-x509.sh`): the chains committed in `tests/cases/x509/chains` (made with `openssl` by
 `tools/gen-x509-fixtures.sh`: good RSA, P-256 and P-384 chains, expired, not yet valid, wrong name, wildcard and IP names, wrong
 usage, missing intermediate, unknown root, self-signed, tampered signature, name constraints, path length, a CA that is not one,
