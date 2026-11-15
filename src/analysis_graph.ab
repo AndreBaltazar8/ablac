@@ -106,7 +106,66 @@ fun bootstrapAnalysisGraphIncomplete(revision: int, message: string): Json =
             jsonArray([jsonObject(["code", "message"],
                 [jsonString("E_ANALYSIS_SCOPE"), jsonString(message)])])])
 
+/** What a snapshot looks up many times: the document of a source identity, and a document's symbols by start and kind. */
+class BootstrapAnalysisGraphLookup(
+    val slots: Map<string, int> = Map(),
+    val symbolStarts: Map<string, Map<string, string>> = Map(),
+    val containers: Map<string, Map<string, array<Json>>> = Map()
+)
+
+/** The document's symbols that a container owns, in the document's order. */
+fun bootstrapAnalysisGraphOwned(document: BootstrapAnalysisGraphDocument, owner: string,
+    var lookup: BootstrapAnalysisGraphLookup, var into: array<Json>): void {
+    val path = document.document.path
+    if (!lookup.containers.has(path)) {
+        val owned: Map<string, array<Json>> = Map()
+        for (symbol in document.symbols.values) {
+            val container = symbol.getString("containerId")
+            val previous = owned.get(container)
+            if (previous != null) previous.append(symbol) else owned.set(container, [symbol])
+        }
+        lookup.containers.set(path, owned)
+    }
+    val built = lookup.containers.get(path)
+    if (built != null) {
+        val found = built.get(owner)
+        if (found != null) for (symbol in found) into.append(symbol)
+    }
+    return
+}
+
 fun bootstrapAnalysisGraphDocumentIndex(
+    documents: array<BootstrapAnalysisGraphDocument>, source: string,
+    var lookup: BootstrapAnalysisGraphLookup
+): int {
+    val known = lookup.slots.get(source)
+    if (known != null) return known
+    val found = bootstrapAnalysisGraphDocumentSearch(documents, source)
+    lookup.slots.set(source, found)
+    found
+}
+
+/** The id of the symbol of `kind` starting at `begin` in the document, "" when two different symbols do, null when none. */
+fun bootstrapAnalysisGraphSymbolAt(document: BootstrapAnalysisGraphDocument, begin: int,
+    kind: string, var lookup: BootstrapAnalysisGraphLookup): string? {
+    val path = document.document.path
+    val built = lookup.symbolStarts.get(path)
+    if (built == null) {
+        val starts: Map<string, string> = Map()
+        for (found in document.symbols.values) {
+            val key = "${found.get("range").getInt("start")}:${found.getString("kind")}"
+            val id = found.getString("id")
+            val previous = starts.get(key)
+            if (previous == null) starts.set(key, id)
+            else if (previous != id) starts.set(key, "")
+        }
+        lookup.symbolStarts.set(path, starts)
+        return starts.get("$begin:$kind")
+    }
+    built.get("$begin:$kind")
+}
+
+fun bootstrapAnalysisGraphDocumentSearch(
     documents: array<BootstrapAnalysisGraphDocument>, source: string
 ): int {
     var candidate = bootstrapGenericSourceFile(source)
@@ -122,29 +181,25 @@ fun bootstrapAnalysisGraphDocumentIndex(
 fun bootstrapAnalysisGraphDeclarationAliases(
     declaration: BootstrapDeclaration,
     documents: array<BootstrapAnalysisGraphDocument>,
-    var aliases: Map<string, string>
+    var aliases: Map<string, string>,
+    var lookup: BootstrapAnalysisGraphLookup
 ): void {
-    val index = bootstrapAnalysisGraphDocumentIndex(documents, declaration.sourceIdentity)
+    val index = bootstrapAnalysisGraphDocumentIndex(documents, declaration.sourceIdentity, lookup)
     if (index < 0) return
     val document = documents[index]
     val begin = document.rewrite.original(declaration.begin)
     val kind = bootstrapAnalysisSymbolKind(declaration.kind)
-    var symbol = 0
-    var matched = ""
-    while (symbol < document.symbols.size()) {
-        val found = document.symbols.at(symbol)
-        if (found.get("range").getInt("start") == begin && found.getString("kind") == kind) {
-            if (matched != "" && matched != found.getString("id")) return
-            matched = found.getString("id")
-        }
-        symbol = symbol + 1
-    }
+    val matchedId = bootstrapAnalysisGraphSymbolAt(document, begin, kind, lookup)
+    // Two different symbols at one start and kind: the declaration is not aliased (nor are its methods).
+    if (matchedId != null && matchedId == "") return
+    val matched = if (matchedId != null) matchedId else ""
     if (matched != "") {
         aliases.set(bootstrapAnalysisDeclarationId(declaration), matched)
-        bootstrapAnalysisGraphScopeAliases(document, matched, declaration.sourceIdentity, aliases)
+        bootstrapAnalysisGraphScopeAliases(document, matched, declaration.sourceIdentity, aliases,
+            lookup)
     }
     for (method in declaration.methods) {
-        bootstrapAnalysisGraphDeclarationAliases(method, documents, aliases)
+        bootstrapAnalysisGraphDeclarationAliases(method, documents, aliases, lookup)
     }
     return
 }
@@ -153,13 +208,14 @@ fun bootstrapAnalysisGraphDeclarationAliases(
 // owned by the matched original declaration, using the compiler's byte mapping.
 fun bootstrapAnalysisGraphScopeAliases(
     document: BootstrapAnalysisGraphDocument, owner: string, source: string,
-    var aliases: Map<string, string>
+    var aliases: Map<string, string>, var lookup: BootstrapAnalysisGraphLookup
 ): void {
     val prefix = "abla:${document.document.path}:"
-    for (symbol in document.symbols.values) {
+    val owned: array<Json> = []
+    bootstrapAnalysisGraphOwned(document, owner, lookup, owned)
+    for (symbol in owned) {
         val id = symbol.getString("id")
-        if (symbol.getString("containerId") == owner && id.size > prefix.size &&
-            id.slice(0, prefix.size) == prefix) {
+        if (id.size > prefix.size && id.slice(0, prefix.size) == prefix) {
             var end = prefix.size
             var begin = 0
             while (end < id.size && id[end] >= 48 && id[end] <= 57) {
@@ -235,11 +291,12 @@ fun bootstrapAnalysisGraphDeclarationCallNames(
 fun bootstrapAnalysisGraphSemantic(
     semantic: BootstrapSemanticResult,
     documents: array<BootstrapAnalysisGraphDocument>,
-    names: Map<string, string>
+    names: Map<string, string>,
+    var lookup: BootstrapAnalysisGraphLookup
 ): BootstrapSemanticResult {
     val resolved: array<BootstrapResolvedName> = []
     for (name in semantic.resolvedNames) {
-        val index = bootstrapAnalysisGraphDocumentIndex(documents, name.sourceIdentity)
+        val index = bootstrapAnalysisGraphDocumentIndex(documents, name.sourceIdentity, lookup)
         if (index >= 0) {
             val document = documents[index]
             val begin = document.rewrite.original(name.begin)
@@ -257,7 +314,7 @@ fun bootstrapAnalysisGraphSemantic(
     }
     val calls: array<BootstrapTypedCall> = []
     for (call in semantic.typedCalls) {
-        val index = bootstrapAnalysisGraphDocumentIndex(documents, call.sourceIdentity)
+        val index = bootstrapAnalysisGraphDocumentIndex(documents, call.sourceIdentity, lookup)
         if (index >= 0) {
             val document = documents[index]
             val begin = document.rewrite.original(call.begin)
@@ -426,13 +483,14 @@ fun BootstrapAnalysisService.graphSnapshot(): Json {
     val analyzed = bootstrapFrontendTypeProject(project, begins, ends, kinds, sources)
     val aliases: Map<string, string> = Map()
     for (document in documents) bootstrapAnalysisGraphLocalAliases(document, aliases)
+    val lookup = BootstrapAnalysisGraphLookup()
     val values: array<Json> = []
     var semanticDiagnostics = ""
     if (analyzed != null) {
         for (declaration in analyzed.parsed.declarations) {
-            bootstrapAnalysisGraphDeclarationAliases(declaration, documents, aliases)
+            bootstrapAnalysisGraphDeclarationAliases(declaration, documents, aliases, lookup)
         }
-        val semantic = bootstrapAnalysisGraphSemantic(analyzed.semantic, documents, names)
+        val semantic = bootstrapAnalysisGraphSemantic(analyzed.semantic, documents, names, lookup)
         semanticDiagnostics = semantic.diagnostics
         val occurrenceIndex = bootstrapAnalysisOccurrenceIndex(analyzed.parsed.declarations,
             semantic)
