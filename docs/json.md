@@ -34,6 +34,7 @@ fun main {
 | `3` | Boolean |
 | `4` | array |
 | `5` | object |
+| `6` | raw: an already-encoded value (see *Raw nodes*); never produced by parsing |
 
 All JSON numbers use one `JsonNumber` representation. Its `text` field keeps
 the validated source lexeme, so fractions, exponents, and integers larger than
@@ -451,6 +452,44 @@ number text is emitted losslessly, and strings escape quotes, backslashes, and
 control bytes while retaining valid non-ASCII UTF-8. A manually forged invalid
 kind, number, string, or object shape produces the contained fallback `"null"`;
 invalid bytes are never emitted as JSON.
+
+### Raw nodes: a value that is already encoded
+
+A program that builds a large document once and sends it many times (a language
+service's per-file lists, say) can keep it as text instead of a tree of nodes, which
+costs a node for every number, string and member. A raw node (kind `6`) holds one
+already-encoded JSON value, and `jsonStringify` writes its text verbatim, at the root or
+as an array element or object member, copied once.
+
+```abla
+import "abla/io"
+import "abla/json"
+
+fun main {
+    val occurrences = jsonRaw("[{\"name\":\"x\",\"range\":{\"start\":0,\"end\":1}}]")
+    if (occurrences != null) {
+        println(jsonStringify(jsonObject(["uri", "occurrences"],
+            [jsonString("file:///a"), occurrences])))
+    }
+}
+// output:
+// {"uri":"file:///a","occurrences":[{"name":"x","range":{"start":0,"end":1}}]}
+```
+
+- `jsonRaw(text)` is the checked constructor: it returns `null` unless `text` is exactly one
+  well-formed JSON value (valid UTF-8, no trailing input, nesting as deep as `jsonParse`
+  allows, no size limit), at the cost of one validation pass. Whitespace inside the text is
+  kept as written.
+- `jsonRawUnchecked(text)` trusts its caller and does not look at `text`. If `text` is not
+  one well-formed JSON value, `jsonStringify`'s output is not JSON (and is not checked
+  again). Use it only for text the program encoded itself, with `jsonStringify` or
+  `jsonQuote`.
+- A raw node reads as none of the other kinds: `isRaw()` is true and `isNull()` ...
+  `isObject()` are false, `size()` is `0`, `get(key)` is JSON null and `asString()` is
+  `""`. `rawText()` returns its text (`""` for any other node); `jsonParse` that text to
+  read the value.
+- `jsonParse`, `jsonDocument` and `$json` never produce a raw node, so a tree read from
+  outside never contains one.
 
 `$json` constructs the same model directly. Its keys and values are Abla
 expressions:

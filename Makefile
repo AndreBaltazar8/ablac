@@ -405,6 +405,7 @@ test-serial: ablac
 	tools/test-json-ascii-spans.sh $(COMPILER)
 	tools/test-json-hex-quad.sh $(COMPILER)
 	tools/test-json-utf8.sh $(COMPILER)
+	tools/test-json-raw.sh $(COMPILER)
 	tools/test-transactional-native-output.sh $(COMPILER)
 	tools/test-typed-subparser-inspection.sh $(COMPILER)
 	tools/test-unsafe-boundary.sh $(COMPILER)
