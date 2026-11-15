@@ -139,6 +139,18 @@ against 1.32-1.45 GB (tests/cases/memory-peak records the new level).
 macOS keeps libSystem for system calls, malloc, threads and signals. Only steps 1 and 5 (in its
 mmap form) apply there.
 
+## Android build extension (#811)
+
+- [ ] **Move both NDK searches behind the Android build extension.** The compiler's link step finds the NDK's
+  compiler-rt builtins archive (`bootstrapAndroidBuiltins`) and the API 24 `libc.so` stub (`bootstrapAndroidLibc`) in
+  `src/toolchain.ab`, by shell searches over `ABLA_ANDROID_NDK` and the other NDK variables. That is Android policy in
+  the compiler. `tools/test-android-extension.sh` only forbids the literals `android-arm64` and `aarch64-linux-android`
+  in `src/`; the libc stub search was changed to a glob that avoids the second one, which keeps the guard quiet and
+  does not fix what it is for. Give `abla/android/build` the searches and hand the linker the extra inputs through an
+  extension-to-linker interface (extra link inputs of a target definition, found at build time), then widen the guard
+  to `aarch64-linux-` and `android` in `src/` (the target triple checks in `src/backend/llvm` for the arm64 Android
+  library are the other half).
+
 ## Bugs seen
 
 - [x] Linux toolchain packaging could write its archive and then fail in its
