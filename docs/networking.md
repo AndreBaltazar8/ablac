@@ -449,6 +449,12 @@ decoded, and decoded to 64 KiB, 256 fields and 16 KiB per field (an HPACK bomb i
 window overrun, an unacknowledged SETTINGS for 10 s, and every violation RFC 9113 names a connection error for do too. Resets the server itself sends (a stream error: a zero WINDOW_UPDATE, a refused stream) count in the same 200-per-second budget, which closes the MadeYouReset hole (CVE-2025-8671). Memory per connection is bounded: output the client has not read (new streams are refused with 512 KiB queued, the connection ends past 768 KiB; response bodies wait for window and a 256 KiB queue), request bodies no handler has taken (8 MiB per connection, past which receive windows are not replenished), the 128 KiB header block and the 64 KiB decoded list, and 100 streams; a stream answered before its request ended (a 413) drops the rest of the request. Header names must be tokens in lower case, values have no NUL, CR or LF and no outer whitespace (RFC 9113 section 8.2.1), and `:path` starts with `/`. Conformance: h2spec 2.6.0 passes in strict mode (147 tests, over TLS and over
 h2c); `tools/test-http2-server.sh` also runs our `H2Client`, curl, nghttp, h2load and live attacks against the server, and `tools/test-http2-fuzz.sh` fuzzes `H2Server`.
 
+Memory of the HTTP/2 server, measured with `tools/measure-http2-memory.sh` (x86-64, 500 connections held at once, the server's own VmRSS): about **21 KB per idle h2c connection**,
+about **3 KB per open stream** (a request whose HEADERS arrived and that is not finished), and about **280 KB of RSS per concurrent TLS connection** under h2load: most of that is the
+handshake's garbage in the collector's heap (a second wave of 500 connections after the first closed grew RSS by 3 MB, so nothing leaks, and the live part per connection is far smaller;
+size a TLS server by its peak concurrent handshakes, not by idle connections). The worst case one client can force, by the bounds above, is its own 100 streams, up to 8 MiB of request bodies,
+768 KiB of unread output and a 128 KiB header block in progress: under 10 MiB per connection, which `maximumConnections` (1023 by default) multiplies.
+
 ### JSON Web Tokens
 
 `abla/jwt` verifies compact JWS tokens signed with RS256 or ES256 against a
