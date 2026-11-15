@@ -116,6 +116,14 @@ for flags in "" "-g"; do
     [[ $overflow_status -eq 101 ]] || fail "stack overflow$flags exited $overflow_status"
     grep -qx 'panic: stack overflow' "$out/stack-overflow.err" ||
         fail "stack overflow$flags: $(head -3 "$out/stack-overflow.err")"
+    # On a thread the main thread started, the same panic (#831: the thread has a signal stack of its own).
+    set +e
+    "$out/stack" thread-overflow > /dev/null 2> "$out/stack-thread-overflow.err"
+    thread_status=$?
+    set -e
+    [[ $thread_status -eq 101 ]] || fail "a thread's stack overflow$flags exited $thread_status"
+    grep -qx 'panic: stack overflow' "$out/stack-thread-overflow.err" ||
+        fail "a thread's stack overflow$flags: $(head -3 "$out/stack-thread-overflow.err")"
     [[ $segv_status -eq 139 ]] || fail "SIGSEGV$flags exited $segv_status"
     ! grep -q 'stack overflow' "$out/stack-segv.err" ||
         fail "SIGSEGV$flags taken for a stack overflow"

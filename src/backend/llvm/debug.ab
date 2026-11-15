@@ -1169,7 +1169,7 @@ fun bootstrapLlvmEmitStackGuardHandler(backend: BootstrapLlvmBackend): void {
     }
     // low - window <= address < low + window (unsigned: address - (low -
     // window) < 2 * window).
-    val overflow = LLVMBuildICmp(
+    var overflow = LLVMBuildICmp(
         backend.builder, llvmIntUnsignedLessThan(),
         LLVMBuildSub(
             backend.builder, address,
@@ -1178,6 +1178,27 @@ fun bootstrapLlvmEmitStackGuardHandler(backend: BootstrapLlvmBackend): void {
         ),
         LLVMConstInt(i64, 2 * window, 0), "stack.overflow"
     )
+    if (!mac) {
+        // Another thread's stack (Linux; macOS asks the faulting thread's own bounds above): a fault within 64 KiB
+        // of the interrupted stack pointer, which an overflow's call or probe touches just below it (#831). The
+        // ucontext's saved stack pointer: gregs[REG_RSP] at 160 on x86-64, sigcontext.sp at 432 on AArch64.
+        val stackPointerAt = if (bootstrapTextContains(backend.targetTriple, "aarch64")) 432 else 160
+        val interrupted = LLVMBuildLoad2(
+            backend.builder, i64,
+            bootstrapLlvmByteAt(backend, LLVMGetParam(handler, 2), 512, stackPointerAt),
+            "interrupted.sp"
+        )
+        val nearStack = LLVMBuildICmp(
+            backend.builder, llvmIntUnsignedLessThan(),
+            LLVMBuildSub(
+                backend.builder, address,
+                LLVMBuildSub(backend.builder, interrupted, LLVMConstInt(i64, 65536, 0), ""),
+                ""
+            ),
+            LLVMConstInt(i64, 131072, 0), "thread.stack.overflow"
+        )
+        overflow = LLVMBuildOr(backend.builder, overflow, nearStack, "any.stack.overflow")
+    }
     val overflowed = LLVMAppendBasicBlockInContext(
         backend.context, handler, "overflow"
     )

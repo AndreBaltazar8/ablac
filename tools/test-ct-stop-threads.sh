@@ -4,7 +4,7 @@
 # collector roots and heap were used from both sides). The build must end with E_CT_STOPPED naming the stop, every
 # time and never by a signal. A thread that panics jumped back to the compiler's stack from its own thread; it now
 # parks and the site's thread stops, with the same E_CT_STOPPED. A site that awaited its thread still reports its
-# panic (E_CT_PANIC).
+# panic (E_CT_PANIC). A thread whose stack overflows (it has a signal stack of its own) stops the same way.
 set -euo pipefail
 
 compiler=${1:-build/ablac}
@@ -35,6 +35,16 @@ for run in $(seq 1 "$runs"); do
     [[ $status == 1 ]] || fail "thread-panic run $run: the compiler exited $status, not 1" "$log"
     grep -q '^error\[E_CT_STOPPED\]: compile-time evaluation at .* panicked: a thread gave up, while 1 thread(s) it started still run' "$log" ||
         fail "thread-panic run $run: no E_CT_STOPPED naming the thread's panic" "$log"
+done
+
+for run in $(seq 1 "$runs"); do
+    log=$output_directory/thread-overflow-$run.log
+    status=0
+    ABLA_COMPILE_EVAL=jit "$compiler" build "$cases/thread-overflow.ab" -o "$output_directory/thread-overflow" --no-cache \
+        > "$log" 2>&1 || status=$?
+    [[ $status == 1 ]] || fail "thread-overflow run $run: the compiler exited $status, not 1" "$log"
+    grep -q '^error\[E_CT_STOPPED\]: compile-time evaluation at .* made a bad memory access, while 1 thread(s) it started still run' "$log" ||
+        fail "thread-overflow run $run: no E_CT_STOPPED for the thread's stack overflow" "$log"
 done
 
 log=$output_directory/awaited.log

@@ -58,6 +58,11 @@ if [[ $have_qemu -eq 1 ]]; then
         status=0
         timeout 300 qemu-aarch64 "$out/overflow" < /dev/null > /dev/null 2> "$out/overflow.err" || status=$?
         [[ $status -eq 101 ]] && grep -qx "panic: stack overflow" "$out/overflow.err" || fail "stack overflow: status $status, $(cat "$out/overflow.err")"
+        # shellcheck disable=SC2086
+        "$compiler" build tests/cases/linux-syscall/thread-stack-overflow.ab --target aarch64-linux -o "$out/thread-overflow" --no-cache $mode > /dev/null 2>&1 || fail "the thread stack overflow program did not build"
+        status=0
+        timeout 300 qemu-aarch64 "$out/thread-overflow" < /dev/null > /dev/null 2> "$out/thread-overflow.err" || status=$?
+        [[ $status -eq 101 ]] && grep -qx "panic: stack overflow" "$out/thread-overflow.err" || fail "a thread's stack overflow: status $status, $(cat "$out/thread-overflow.err")"
     done
     echo 'aarch64 linux: static libc-free builds run under qemu-aarch64 like the x86-64 ones'
 else

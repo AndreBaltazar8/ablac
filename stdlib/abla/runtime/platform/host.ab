@@ -1011,6 +1011,56 @@ trusted fun __ablaRuntimeHostFree(pointer: i64*): void {
     return
 }
 
+// A thread's own alternate signal stack, for a thread that has none: a stack overflow's SIGSEGV has no room on
+// the overflowed stack, so without one the kernel ends the whole process before any handler runs. The main
+// thread's is the stack guard's (debug.ab), and an x86-64 Linux libc-free thread gets one from
+// abla_clone_create; a libpthread thread (a hosted program, or a `#` site's thread inside the compiler, #831) has
+// none. Enter installs 64 KiB and returns it (0 when the thread had one, or the host has no such call); Leave,
+// before the thread ends, takes it down and frees it. sigaltstack is 131 on x86-64 Linux (and in an AArch64
+// build whose system calls are translated), 132 on AArch64, 53 on Darwin, whose stack_t has its flags after the
+// size (and SS_DISABLE 4, not 2).
+trusted fun __ablaRuntimeHostSignalStackCall(installed: int, previous: int): bool {
+    if (ablaHostIsMacOS()) return ablaDarwinSyscall(53, installed, previous, 0, 0, 0, 0) == 0
+    val arch = ablaSimdTargetArch()
+    val number = if (arch == 1 || ablaHostOwnsRuntime()) 131 else 132
+    ablaLinuxSyscall(number, installed, previous, 0, 0, 0, 0) == 0
+}
+
+trusted fun __ablaRuntimePlatformThreadSignalStackEnter(): int {
+    val arch = ablaSimdTargetArch()
+    if (arch != 1 && arch != 2) return 0
+    val flagsAt = if (ablaHostIsMacOS()) 16 else 8
+    val sizeAt = if (ablaHostIsMacOS()) 8 else 16
+    val disabled = if (ablaHostIsMacOS()) 4 else 2
+    val state = __ablaRuntimePlatformRawAllocate(32)
+    var stack = 0
+    if (__ablaRuntimeHostSignalStackCall(0, state) &&
+        (ablaRuntimeLoadI64(state + flagsAt) & 4294967295 & disabled) != 0) {
+        val size = 65536
+        val memory = __ablaRuntimePlatformRawAllocate(size)
+        ablaRuntimeStoreI64(state, memory)
+        ablaRuntimeStoreI64(state + 8, 0)
+        ablaRuntimeStoreI64(state + 16, 0)
+        ablaRuntimeStoreI64(state + sizeAt, size)
+        if (__ablaRuntimeHostSignalStackCall(state, 0)) stack = memory
+        else __ablaRuntimePlatformRawFree(memory)
+    }
+    __ablaRuntimePlatformRawFree(state)
+    stack
+}
+
+trusted fun __ablaRuntimePlatformThreadSignalStackLeave(stack: int): void {
+    if (stack == 0) return
+    val flagsAt = if (ablaHostIsMacOS()) 16 else 8
+    val disabled = if (ablaHostIsMacOS()) 4 else 2
+    val state = __ablaRuntimePlatformRawAllocate(32)
+    ablaRuntimeStoreI64(state + flagsAt, disabled)
+    __ablaRuntimeHostSignalStackCall(state, 0)
+    __ablaRuntimePlatformRawFree(state)
+    __ablaRuntimePlatformRawFree(stack)
+    return
+}
+
 // The tracked heap stays lock-free until a program actually starts an Abla
 // thread. Thread creation happens before the worker can run, so this one-time
 // transition does not add a synchronization branch to initialization.
