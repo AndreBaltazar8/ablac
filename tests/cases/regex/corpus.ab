@@ -1,0 +1,106 @@
+import "abla/io"
+import "abla/regex"
+import "abla/sys/linux"
+import "abla/sys/linux/fs"
+import "abla/text"
+
+// abla/regex against recorded results of Python's re (ASCII mode, `$` as \Z) on 6000 random pattern and
+// text pairs (seeds 1-3 of the generator that tools/fuzz-regex used to be): find, findAll, full match and
+// replace must agree on byte spans, groups and output. Each line of the corpus is tab-separated: the
+// pattern and the text as comma-separated hex code points, then `reject` (Python refuses the pattern, so
+// Abla must too) or `match` and Python's four result lines. Abla may refuse, with one of the reasons in
+// docs/stdlib/regex.md, a pattern Python accepts.
+
+val knownRejections: array<string> = [
+    "lookaround is not supported", "unsupported group syntax",
+    "backreferences and octal escapes are not supported", "unsupported escape in a class",
+    "the pattern is too large", "repeat count is larger than 1000", "groups are nested too deeply",
+    "multiple repeat", "nothing to repeat", "unknown escape"
+]
+
+fun hexValue(text: string): int {
+    var value = 0
+    for (b in text) {
+        value = value * 16 + (if (b >= 97) b - 87 else b - 48)
+    }
+    value
+}
+
+fun decode(field: string): string {
+    var out = ""
+    if (field.size > 0) {
+        for (part in field.split(",")) out = out + utf8Encode(hexValue(part))
+    }
+    out
+}
+
+fun hex(s: string): string {
+    val digits = "0123456789abcdef"
+    var out = ""
+    for (b in s) out = out + digits.slice(b / 16, b / 16 + 1) + digits.slice(b % 16, b % 16 + 1)
+    out
+}
+
+fun spansText(m: RegexMatch): string {
+    var out = ""
+    for (g in 0..m.groupCount()) {
+        if (g > 0) out = out + " "
+        out = out + "${m.groupStart(g)} ${m.groupEnd(g)}"
+    }
+    out
+}
+
+fun known(message: string): bool {
+    for (reason in knownRejections) if (message.endsWith(reason)) return true
+    false
+}
+
+fun results(re: Regex, text: string): array<string> {
+    val m = re.find(text)
+    val lines: array<string> = [if (m == null) "F -" else "F " + spansText(m)]
+    var all = "A "
+    var first = true
+    for (x in re.findAll(text)) {
+        if (!first) all = all + " "
+        first = false
+        all = all + "${x.start()}-${x.end()}"
+    }
+    lines.append(all)
+    val f = re.matchFull(text)
+    lines.append(if (f == null) "M -" else "M " + spansText(f))
+    lines.append("R " + hex(re.replace(text, "[$0]")))
+    lines
+}
+
+fun main: int {
+    val corpus = Path(linuxArgument(0)).readText()
+    var cases = 0
+    var refused = 0
+    var bad = 0
+    for (line in corpus.split("\n")) {
+        if (line.size == 0) continue
+        val fields = line.split("\t")
+        val pattern = decode(fields[0])
+        val text = decode(fields[1])
+        cases = cases + 1
+        val compiled = regexCompile(pattern)
+        var problem = ""
+        if (fields[2] == "reject") {
+            if (compiled.succeeded) problem = "python rejects, abla accepts"
+        } else if (!compiled.succeeded) {
+            refused = refused + 1
+            if (!known(compiled.error.message)) problem = "abla rejects: ${compiled.error.message}"
+        } else {
+            val got = results(compiled.regex, text)
+            for (i in 0..3) {
+                if (got[i] != fields[3 + i]) problem = "wanted ${fields[3 + i]}, got ${got[i]}"
+            }
+        }
+        if (problem.size > 0) {
+            bad = bad + 1
+            if (bad <= 10) println("FAIL ${fields[0]} on ${fields[1]}: ${problem}")
+        }
+    }
+    println("regex corpus: ${cases} cases, ${refused} refused on purpose, ${bad} disagreements")
+    if (bad == 0 && cases > 5000) 0 else 1
+}
