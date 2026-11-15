@@ -18,64 +18,21 @@
 - Keep the measurements on performance items, and what was tried and dropped, so nobody
   repeats the work. Date them: they go stale.
 
-## Remove Python from the suite (#807)
+## Remove Python from the suite (#807): done
 
-The tracked-use guard records the present paths in `tools/legacy-py-allowlist.txt`;
-remove an entry when the last use in that file is gone. First port, in order:
-`test-text-blocks.sh`, `test-running-image-identity.sh`, then
-`test-formatter.py` (149 lines; preserve its golden, byte-level, mode,
-parser-field and negative controls). Then port HTTP and event fixtures in
-ascending size; use Abla for socket protocol peers. The differential fuzzer is
-ported (tools/fuzz, #648) and its Python version removed; the constant-time checker
-remains until its later port.
-
-The device-serial pty/termios oracle is ported (tests/cases/device-serial/driver.ab, raw system calls, Linux and macOS); its Python session is removed.
-
-Kept as documented exceptions (lead's decision under "no Python if possible", 2026-11-13; the allow-list is
-sorted lines with no comments, so the reasons live here):
-- `tools/fuzz-regex` and `tools/test-regex.sh`: the oracle is Python's `re`, the semantics abla's regex is checked
-  against; a JavaScript oracle would test something else. Revisit only if abla's regex gets semantics of its own
-  written down, or a second oracle independent of Abla.
-- `tools/test-xtensa-assembly.py`, `tools/test-xtensa-assembly.sh` and `tests/cases/xtensa-routing/sdk-narrow.py`: the
-  oracle is Espressif's own SDK script, pinned by sha256 (`assembly-provenance.json`); a port would not be that script.
-
-The following inventory is from the 1f1aea08 `test-serial` recipe. Counts are
-Python heredoc blocks and body lines, including blank and comment lines; all
-paths have the prefix `tools/test-` and suffix `.sh`.
-
-| Suite script | Blocks | Lines |
-|---|---:|---:|
-| `http-close-delimited` | 1 | 65 |
-| `http-interim` | 1 | 63 |
-| `xtensa-companion-offline` | 8 | 63 |
-| `compile-eval-directory` | 3 | 54 |
-| `tar-reader` | 1 | 39 |
-| `event-shutdown` | 1 | 36 |
-| `discovery-cache` | 4 | 33 |
-| `resource-scope-drops` | 3 | 32 |
-| `gzip-inflate` | 1 | 31 |
-| `gzip-parity` | 1 | 30 |
-| `compile-eval-environment` | 1 | 27 |
-| `gzip-stream` | 1 | 24 |
-| `http-tls-deadline` | 1 | 24 |
-| `xtensa-http-stream` | 1 | 24 |
-| `global-initializer-split` | 1 | 23 |
-| `tar-stream` | 1 | 22 |
-| `http-client` | 1 | 21 |
-| `compile-eval-cross-target` | 1 | 19 |
-| `for-constant-array` | 1 | 16 |
-| `compile-eval-method-targets` | 1 | 14 |
-| `wrapper-demand` | 1 | 14 |
-| `arrays-dense` | 1 | 12 |
-| `ablac-test-bundle` | 3 | 9 |
-| `secure-fs` | 1 | 8 |
-| `running-image-identity` | 1 | 3 |
-| `text-blocks` | 1 | 2 |
-
-Seven additional `-c` snippets occur in `android-rpc-example` (4 lines),
-`compile-effects` (11 lines), `crypto-pure` (two one-liners), `crypto`,
-`process-pipeline`, and `wide-integers` (one line each). External `.py`
-helpers are separate from these inline counts.
+No tracked file is a Python script or calls the interpreter, and `tools/test-repo-language-guard.sh`
+fails on any (there is no allow-list). Where Python was the oracle, its results are recorded and the
+check runs without it:
+- `tools/test-xtensa-assembly.sh` compares `assembly.ab` with what Espressif's SDK script (pinned by
+  sha256 in `tests/cases/xtensa-routing/assembly-provenance.json`) printed, kept in
+  `tests/cases/xtensa-routing/golden/`. To refresh them, run that script again on `firmware.s.gz` and
+  `golden/edges.input.s` in the four modes (the provenance note says how).
+- `tools/test-regex.sh` checks `tests/cases/regex/corpus.ab` against Python's `re` results in
+  `tests/cases/regex/corpus.tsv.gz` (6000 pattern and text pairs). The oracle stays Python's `re`, the
+  semantics abla's regex is checked against; the corpus is fixed, so new random patterns are no
+  longer tried: a new oracle independent of Abla would bring that back.
+- The constant-time checker, the HTTP and event fixtures and the other suite scripts are ported (Abla
+  or shell); the device-serial pty/termios oracle is `tests/cases/device-serial/driver.ab`.
 
 ## Abla without libc (#806)
 

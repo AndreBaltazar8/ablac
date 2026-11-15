@@ -106,9 +106,10 @@ with the number of instructions in the pattern, not with its nesting.
 `tools/test-regex.sh` (part of `make test`) runs unit cases, the
 pathological-pattern cases (100 000-character inputs against `(a*)*b`,
 `(a|aa)+$`, `(x+x+)+y`) in fast and release builds, the release build under GC
-stress, and a short differential run. `tools/fuzz-regex` generates random
-patterns from the supported subset and random texts (including multi-byte
-characters and newlines), runs Python's `re` in ASCII mode and the Abla engine on
-them, and compares `find` spans and groups, `findAll`, whole-text match and
-`replace`. Loops over nullable bodies are not generated (see the difference
-above).
+stress, and `tests/cases/regex/corpus.ab`: 6000 random pattern and text pairs
+(multi-byte characters and newlines included; a third of the patterns mutated)
+whose `find` spans and groups, `findAll`, whole-text match and `replace` results
+were recorded from Python's `re` in ASCII mode (`corpus.tsv.gz`). Abla must refuse
+every pattern Python refuses, and refuse one Python accepts only with a reason
+listed in this document. Loops over nullable bodies are not in the corpus (see
+the difference above).

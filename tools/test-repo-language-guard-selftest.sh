@@ -15,9 +15,7 @@ legacy="legacy.$suffix"
 added="new.$suffix"
 printf '#!/usr/bin/env %s\n' "$interpreter" >"$legacy"
 printf '#!/bin/sh\n%s -c pass\n' "$interpreter" >legacy.sh
-printf '%s\n' "$legacy" legacy.sh >tools/legacy-py-allowlist.txt
 git add tools "$legacy" legacy.sh
-bash tools/test-repo-language-guard.sh >/dev/null
 expect_blocked() {
     local name=$1 output
     if output=$(bash tools/test-repo-language-guard.sh 2>&1); then
@@ -25,6 +23,10 @@ expect_blocked() {
     fi
     [[ $output == *"$name"* ]] || { printf 'language guard self-test: missing path %s\n' "$name" >&2; exit 1; }
 }
+expect_blocked "$legacy"
+expect_blocked legacy.sh
+git rm --cached -q "$legacy" legacy.sh
+bash tools/test-repo-language-guard.sh >/dev/null
 printf 'pass\n' >"$added"
 git add "$added"
 expect_blocked "$added"
@@ -50,9 +52,4 @@ git rm --cached -q 'new executable'
 printf '#!/bin/sh\n# %s is mentioned here\necho ok\n' "$interpreter" >comment.sh
 git add comment.sh
 bash tools/test-repo-language-guard.sh >/dev/null
-# A removal is allowed before or after pruning its old baseline entry.
-git rm --cached -q "$legacy"
-bash tools/test-repo-language-guard.sh >/dev/null
-printf '%s\n' legacy.sh >tools/legacy-py-allowlist.txt
-bash tools/test-repo-language-guard.sh >/dev/null
-echo 'language guard: additions fail and removals are allowed'
+echo 'language guard: every addition fails and a tree without any passes'

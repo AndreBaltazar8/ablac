@@ -102,7 +102,7 @@ Test scripts marked † run in no suite: neither the Makefile `test` target nor
 | `abla/io`, `abla/fs`, `abla/process/*` | [stdlib/system.md](stdlib/system.md) | good | portable-buffered-io, filesystem, fs-tree, process-capture, process-environment, process-exit, process-metrics |
 | `abla/core`, `abla/math`, `abla/math/v8`, `abla/math/fast`, `abla/float`, `abla/bits`, `abla/integer`, `abla/random` | [stdlib/numbers.md](stdlib/numbers.md) | good | floating-math, stdlib, bits, math-v8, math-fast (`abla/integer`: none) |
 | `abla/uint256`, `abla/int256`, `abla/uint128`, `abla/int128` | [stdlib/uint256.md](stdlib/uint256.md), [int256](stdlib/int256.md), [uint128](stdlib/uint128.md), [int128](stdlib/int128.md) | good | test-wide-integers |
-| `abla/regex` | [stdlib/regex.md](stdlib/regex.md) | good | test-regex, `tools/fuzz-regex` (Python `re`) |
+| `abla/regex` | [stdlib/regex.md](stdlib/regex.md) | good | test-regex (a corpus of Python `re` results) |
 | `abla/crypto`, `abla/date` | [stdlib/security-and-dates.md](stdlib/security-and-dates.md) | good | crypto, date |
 | `abla/test`, `ablac test` | [stdlib/testing.md](stdlib/testing.md) | good | shell-ablac-test |
 | `abla/json`, `abla/http/json` | [json.md](json.md) | good | json-subparser, json-expressions, runtime-json, test-json-limits |
