@@ -32,7 +32,9 @@ class BootstrapAnalysisGraphParsed(
     // (`symbols` itself is what the compiler's identities are translated to, and keeps its offset-based ids). Empty and `symbols`
     // for graph-v1.
     val stable: Map<string, string>,
-    val exported: Json
+    val exported: Json,
+    // What a document's export depends on that a parse fixes (graph-v2's `since`): the hash of its text and exported symbols.
+    val key: string
 )
 
 class BootstrapAnalysisGraphDocument(
@@ -41,7 +43,20 @@ class BootstrapAnalysisGraphDocument(
     val symbols: Json,
     val rewrite: BootstrapSourceRewrite,
     val stable: Map<string, string>,
-    val exported: Json
+    val exported: Json,
+    val key: string
+)
+
+/** 128 bits of a text (two hashes of different seeds) and its length, as text: a document's export is taken to be the same as an
+ *  earlier one's when these are (a collision needs both 64-bit hashes to agree, by chance 2^-128 for texts that differ). */
+fun bootstrapAnalysisGraphHash(text: string): string =
+    "${bootstrapHashNameBytes(-3750763034362895579, text)}.${bootstrapHashNameBytes(7046029254386353131, text)}.${text.size}"
+
+/** What each document's export was at one revision (graph-v2's `since`): by uri, a fingerprint of everything the answer says of it. */
+class BootstrapAnalysisGraphGeneration(
+    val revision: string,
+    val fingerprints: Map<string, string>,
+    val uris: array<string>
 )
 
 /** The id the answer names a symbol of `document` by, given its offset-based one. */
@@ -425,8 +440,106 @@ fun bootstrapAnalysisGraphParse(source: string, uri: string, full: bool,
     val contract = if (full) surface else bootstrapProjectContract(surface, path)
     val symbols = bootstrapAnalysisSymbolsJson(source, uri, contract)
     val stable = bootstrapAnalysisStableIdsOf(path, contract, symbols, stableIds)
+    val exported = if (stableIds) bootstrapAnalysisStableSymbols(symbols, stable) else symbols
     BootstrapAnalysisGraphParsed(source, uri, full, contract, symbols, bootstrapSourceRewriteOf(path),
-        stable, if (stableIds) bootstrapAnalysisStableSymbols(symbols, stable) else symbols)
+        stable, exported, if (stableIds) bootstrapAnalysisGraphHash("${bootstrapAnalysisGraphHash(source)}${jsonStringify(exported)}") else "")
+}
+
+/** How many generations `since` can name (the one the client holds is the one it last analyzed: the last few cover queries and
+ *  analyses in between). */
+val BOOTSTRAP_ANALYSIS_GENERATIONS_KEPT = 8
+
+fun BootstrapAnalysisService.graphRememberGeneration(generation: BootstrapAnalysisGraphGeneration): void {
+    val kept: array<BootstrapAnalysisGraphGeneration> = []
+    val skip = this.graphGenerations.size + 1 - BOOTSTRAP_ANALYSIS_GENERATIONS_KEPT
+    for (index in 0 until this.graphGenerations.size) {
+        if (index >= skip && this.graphGenerations[index].revision != generation.revision) {
+            kept.append(this.graphGenerations[index])
+        }
+    }
+    kept.append(generation)
+    this.graphGenerations.truncate(0)
+    for (item in kept) this.graphGenerations.append(item)
+    return
+}
+
+fun BootstrapAnalysisService.graphHoldsGeneration(revision: string): bool {
+    var found = false
+    for (generation in this.graphGenerations) {
+        if (generation.revision == revision) found = true
+    }
+    found
+}
+
+/** What the answer said of `uri` at `revision`, as a fingerprint: "" when the revision is not held or had no such document. */
+fun BootstrapAnalysisService.graphFingerprint(revision: string, uri: string): string {
+    var found = ""
+    for (generation in this.graphGenerations) {
+        if (generation.revision == revision) {
+            val fingerprint = generation.fingerprints.get(uri)
+            if (fingerprint != null) found = fingerprint
+        }
+    }
+    found
+}
+
+/** `analyze` with `since` (graph-v2): the answer for `snapshot` says only what differs from what the client holds, the
+ *  revision `since`: `documents` are those whose export changed or that are new, `unchanged` and `removed` list the uris of
+ *  the others, and `full` is false. A revision the service no longer holds (or an incomplete analysis) gets the whole
+ *  snapshot, `full` true. */
+fun BootstrapAnalysisService.graphSince(snapshot: Json, since: string): Json {
+    val keys: array<string> = []
+    val values: array<Json> = []
+    val revision = snapshot.getString("revision")
+    if (!this.graphHoldsGeneration(since) || !this.graphHoldsGeneration(revision) ||
+        !snapshot.has("entry")) {
+        for (index in 0 until snapshot.keys.size) {
+            keys.append(snapshot.keys[index])
+            values.append(snapshot.values[index])
+        }
+        keys.append("since")
+        values.append(jsonString(since))
+        keys.append("full")
+        values.append(jsonBoolean(true))
+        return jsonObject(keys, values)
+    }
+    val changed: array<Json> = []
+    val unchanged: array<Json> = []
+    val present: Map<string, bool> = Map()
+    for (document in snapshot.get("documents").values) {
+        val uri = document.getString("uri")
+        present.set(uri, true)
+        val was = this.graphFingerprint(since, uri)
+        if (was != "" && was == this.graphFingerprint(revision, uri)) unchanged.append(jsonString(uri))
+        else changed.append(document)
+    }
+    val removed: array<Json> = []
+    for (uri in this.graphGenerationUris(since)) {
+        if (!present.has(uri)) removed.append(jsonString(uri))
+    }
+    for (index in 0 until snapshot.keys.size) {
+        keys.append(snapshot.keys[index])
+        values.append(if (snapshot.keys[index] == "documents") jsonArray(changed) else snapshot.values[index])
+    }
+    keys.append("unchanged")
+    values.append(jsonArray(unchanged))
+    keys.append("removed")
+    values.append(jsonArray(removed))
+    keys.append("since")
+    values.append(jsonString(since))
+    keys.append("full")
+    values.append(jsonBoolean(false))
+    jsonObject(keys, values)
+}
+
+fun BootstrapAnalysisService.graphGenerationUris(revision: string): array<string> {
+    val uris: array<string> = []
+    for (generation in this.graphGenerations) {
+        if (generation.revision == revision) {
+            for (uri in generation.uris) uris.append(uri)
+        }
+    }
+    uris
 }
 
 fun BootstrapAnalysisService.graphModeName(): string = if (this.graphStableIds) "graph-v2" else "graph-v1"
@@ -485,7 +598,7 @@ fun BootstrapAnalysisService.graphSnapshot(): Json {
             val parsed = entryParsed.parsed
             documents.append(BootstrapAnalysisGraphDocument(
                 BootstrapAnalysisDocument(uri, module.path, version, source, true), parsed,
-                entryParsed.symbols, entryParsed.rewrite, entryParsed.stable, entryParsed.exported))
+                entryParsed.symbols, entryParsed.rewrite, entryParsed.stable, entryParsed.exported, entryParsed.key))
             for (declaration in parsed
                 .declarations) bootstrapAnalysisGraphDeclarationCallNames(declaration, names)
             for (action in parsed.actions) bootstrapAnalysisGraphCallNames(action, module.path,
@@ -508,6 +621,8 @@ fun BootstrapAnalysisService.graphSnapshot(): Json {
     val lookup = BootstrapAnalysisGraphLookup()
     val values: array<Json> = []
     val sets: Map<string, BootstrapAnalysisOccurrenceSet> = Map()
+    val fingerprints: Map<string, string> = Map()
+    val fingerprintUris: array<string> = []
     var semanticDiagnostics = ""
     if (analyzed != null) {
         for (declaration in analyzed.parsed.declarations) {
@@ -523,20 +638,32 @@ fun BootstrapAnalysisService.graphSnapshot(): Json {
                 document.parsed, analyzed.parsed.declarations, semantic, aliases, true,
                 occurrenceIndex)
             sets.set(bootstrapAnalysisGraphPath(document.document.uri), set)
+            val occurrenceText = bootstrapAnalysisOccurrenceSetText(document.document.text, set)
+            val diagnostics = bootstrapAnalysisGraphDiagnostics(document, project, semanticDiagnostics)
+            if (this.graphStableIds) {
+                fingerprints.set(document.document.uri,
+                    "${document.document.version}|${document.key}|${bootstrapAnalysisGraphHash(occurrenceText)}|${bootstrapAnalysisGraphHash(jsonStringify(diagnostics))}")
+                fingerprintUris.append(document.document.uri)
+            }
             values.append(jsonObject(["uri", "version", "text", "symbols", "occurrences",
                 "diagnostics"],
                 [jsonString(document.document.uri), jsonInteger(document.document.version),
                     jsonString(document.document.text), document.exported,
-                    jsonRawUnchecked(bootstrapAnalysisOccurrenceSetText(document.document.text, set)),
-                    bootstrapAnalysisGraphDiagnostics(document, project, semanticDiagnostics)]))
+                    jsonRawUnchecked(occurrenceText), diagnostics]))
         }
     } else {
         for (document in documents) {
+            val diagnostics = bootstrapAnalysisGraphDiagnostics(document, project, "")
+            if (this.graphStableIds) {
+                fingerprints.set(document.document.uri,
+                    "${document.document.version}|${document.key}||${bootstrapAnalysisGraphHash(jsonStringify(diagnostics))}")
+                fingerprintUris.append(document.document.uri)
+            }
             values.append(jsonObject(["uri", "version", "text", "symbols", "occurrences",
                 "diagnostics"],
                 [jsonString(document.document.uri), jsonInteger(document.document.version),
                     jsonString(document.document.text), document.exported, jsonArray([]),
-                    bootstrapAnalysisGraphDiagnostics(document, project, "")]))
+                    diagnostics]))
         }
     }
     val pending: array<Json> = []
@@ -555,6 +682,8 @@ fun BootstrapAnalysisService.graphSnapshot(): Json {
             jsonString(entry)])
     this.graphQueryIndex = bootstrapAnalysisGraphQueryIndex(result, this.revision, sets)
     this.graphIndexRevision = this.revision
+    if (this.graphStableIds) this.graphRememberGeneration(BootstrapAnalysisGraphGeneration(
+        "${this.revision}", fingerprints, fingerprintUris))
     return result
 }
 

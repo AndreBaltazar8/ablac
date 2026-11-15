@@ -528,7 +528,98 @@ async function stableIds() {
     await s.close();
 }
 
-const tests = { edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
+// analyze with `since` (graph-v2) answers with what differs from the revision the client holds; applying it to the client's copy gives
+// the full answer, byte for byte, whatever the edits between (a fresh service's full answer is the reference).
+async function since() {
+    const files = {
+        'main.ab': 'import "util.ab"\nimport "model.ab"\nfun main: int {\n    val m = Model(1)\n    scale(m.value) + extra()\n}\n',
+        'util.ab': 'import "model.ab"\nfun scale(value: int): int = value * 2\nfun extra(): int = helper(3)\nprivate fun helper(n: int): int = n + 1\n',
+        'model.ab': 'class Model(val value: int) {\n    fun twice(): int = value * 2\n}\n',
+        'lone.ab': 'fun lonely(): int = 7\n',
+    };
+    const p = fixture('since', files);
+    const at = (file) => path.join(p, file);
+    const s = await start(p, { mode: 'graph-v2' });
+    const open = new Map();
+    let version = 0;
+    const edit = async (file, text) => {
+        version += 1;
+        const method = open.has(file) ? 'document/change' : 'document/open';
+        assert.ok(!('error' in await s.rpc(method, { uri: uri(at(file)), version, text })));
+        open.set(file, { version, text });
+    };
+    const full = async () => {
+        const fresh = await start(p, { mode: 'graph-v2' });
+        for (const [file, { version: v, text }] of open) await fresh.rpc('document/open', { uri: uri(at(file)), version: v, text });
+        const answer = await fresh.analyze();
+        await fresh.close();
+        return answer;
+    };
+    // The client's copy: documents by uri, brought up to date by each reply.
+    const held = new Map();
+    const apply = (reply) => {
+        if (reply.full) held.clear();
+        for (const uriText of reply.removed ?? []) held.delete(uriText);
+        for (const d of reply.documents) held.set(d.uri, d);
+        for (const uriText of reply.unchanged ?? []) assert.ok(held.has(uriText), `unchanged ${uriText} is not held`);
+    };
+    const check = async (label, expectChanged) => {
+        const reply = (await s.rpc('analyze', { since: revision })).result;
+        revision = reply.revision;
+        assert.equal(reply.since !== undefined, true);
+        const before = held.size;
+        apply(reply);
+        const reference = await full();
+        assert.equal(held.size, reference.documents.length, `${label}: documents held`);
+        for (const d of reference.documents) assert.equal(JSON.stringify(held.get(d.uri)), JSON.stringify(d), `${label}: ${d.uri}`);
+        if (expectChanged !== undefined) assert.deepEqual(reply.documents.map((d) => path.basename(fileURLToPath(d.uri))).sort(), expectChanged, `${label}: changed documents`);
+        return reply;
+    };
+    // The first analysis: no since, the full answer, and a since the service does not hold gets the full answer again.
+    const first = await s.analyze();
+    let revision = first.revision;
+    assert.equal(first.full, undefined);
+    for (const d of first.documents) held.set(d.uri, d);
+    const lost = (await s.rpc('analyze', { since: 'no-such-revision' })).result;
+    assert.equal(lost.full, true);
+    assert.equal(lost.documents.length, first.documents.length);
+    // Nothing changed: no documents.
+    const same = await check('nothing changed', []);
+    assert.equal(same.full, false);
+    assert.equal(same.unchanged.length, first.documents.length);
+    // A body edit that moves offsets in util.ab: only util.ab changes (ids are stable, so main.ab and model.ab keep their exports).
+    await edit('util.ab', files['util.ab'].replace('value * 2', 'value * 2 + 0'));
+    await check('a body edit', ['util.ab']);
+    // A comment on top of model.ab: only model.ab.
+    await edit('model.ab', '// on top\n' + files['model.ab']);
+    await check('a comment on top', ['model.ab']);
+    // A signature change: the file and its callers.
+    await edit('util.ab', files['util.ab'].replace('scale(value: int)', 'scale(value: int, extra: int)').replace('value * 2', 'value * extra'));
+    const signature = await check('a signature change');
+    assert.ok(signature.documents.some((d) => d.uri === uri(at('util.ab'))));
+    assert.ok(signature.documents.some((d) => d.uri === uri(at('main.ab'))), 'the caller changes with the signature');
+    // An unrelated file never changes.
+    assert.ok(!signature.documents.some((d) => d.uri === uri(at('lone.ab'))));
+    // An error and its fix, a change on disk, a file that leaves the graph.
+    await edit('main.ab', files['main.ab'].replace('scale(m.value)', 'scale(m.missing)'));
+    await check('an error');
+    await edit('main.ab', files['main.ab'].replace('import "model.ab"\n', ''));
+    await edit('main.ab', 'import "util.ab"\nfun main: int = extra()\n');
+    await edit('util.ab', 'fun extra(): int = 3\nprivate fun helper(n: int): int = n + 1\n');
+    const dropped = await check('model.ab leaves the graph');
+    assert.ok(dropped.removed.includes(uri(at('model.ab'))), 'the file that left the graph is listed in removed');
+    // since is for graph-v2 only, and a non-string is refused; fields projects the delta.
+    assert.equal(code(await s.rpc('analyze', { since: 5 })), 'invalid_params');
+    const projected = (await s.rpc('analyze', { since: revision, fields: ['diagnostics'] })).result;
+    assert.equal(projected.full, false);
+    assert.ok(projected.documents.every((d) => !('occurrences' in d)));
+    await s.close();
+    const legacy = await start(p);
+    assert.equal(code(await legacy.rpc('analyze', { since: '1' })), 'invalid_params');
+    await legacy.close();
+}
+
+const tests = { since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
 const filter = process.env.ANALYSIS_TEST_FILTER ? process.env.ANALYSIS_TEST_FILTER.split(',') : null;
 for (const [name, test] of Object.entries(tests)) {
     if (filter && !filter.includes(name)) continue;
