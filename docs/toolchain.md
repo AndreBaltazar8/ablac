@@ -120,12 +120,9 @@ What stays in libSystem, and why:
 the program is a call of `___emutls_get_address`. The compiler defines that function itself (`abla/runtime/emutls`, exported
 from `src/emutls_export.ab`), on the Abla heap and atomics: compiler-rt's imports libSystem's `malloc`, `free`, `realloc`,
 pthread mutexes and keys, so the compiler imports none of them (#826). A control block gets its index from one process-wide
-counter by a compare-and-swap, and each thread has one table of its variables' addresses, grown by copying. What it does not
-do is free a thread's table and variables when the thread ends: that needs an exit hook (compiler-rt uses a pthread key's destructor), and a program built without the compiler has none to call. A thread that touches variables leaves
+counter by a compare-and-swap, and each thread has one table of its variables' addresses, grown by copying. A thread's table and variables are freed when the thread ends: the runtime calls a thread-end hook last (`__ablaRuntimeThreadEndHook` in `abla/runtime/self`), which the first table a thread makes points at `emutlsThreadEnd`; a JIT-compiled program has a runtime of its own, whose hook the compiler sets before `main` runs (`llvmOrcInstallThreadEnd` in `abla/llvm/orc`). A thread the runtime did not start has no hook, and a thread that touches variables leaves
 8 * (1 + capacity) bytes (the capacity is the largest index it used, at least 8; indexes are process-wide and never reused)
-plus each variable's size and its alignment padding. Measured by `tests/cases/emutls` (500 threads one after another, ten
-variables, indexes 1 to 10): 654 bytes per thread; eighty variables: 7,796 bytes per thread. A JIT-compiled program that
-starts and joins a million threads touching ten variables would leave about 650 MB behind. The heap lock is made live before
+plus each variable's size and its alignment padding. `tests/cases/emutls` (500 threads one after another) now measures none; before the hook it measured 654 bytes per thread for ten variables (indexes 1 to 10) and 7,796 for eighty, so a JIT-compiled program that started and joined a million threads touching ten variables left about 650 MB behind. `tests/cases/emutls/jit-threads.ab` runs a hundred thousand JIT-compiled threads and checks the resident size (not verified on a Mac yet). The heap lock is made live before
 `ablac run` calls the program's `main` (`runtimeMemoryEnableSharing`), because a thread the runtime did not start allocates
 from the compiler's heap.
 

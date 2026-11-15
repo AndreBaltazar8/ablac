@@ -1,0 +1,48 @@
+// Run with `ablac run`: many short threads of a JIT-compiled program, each touching the runtime's thread-locals (its
+// transaction descriptor and root-frame head, which the JIT lowers to the compiler's ___emutls_get_address). Each thread's
+// table and variables are freed when it ends (the compiler stores its abla/runtime/emutls thread-end function in the
+// program's runtime hook before main runs, #826): the process's resident size must not grow with the thread count. Before
+// the hook a thread left a few hundred bytes behind, so this many would show as tens of megabytes. (On Linux this run grows by 61 KB
+// with or without the hook, measured, so it can only fail on a Mac: nothing here has been run there.)
+import "abla/io"
+import "abla/memory"
+import "abla/process/metrics"
+
+var counter: int by TVar(0)
+
+fun one(): int {
+    atomic { counter += 1 }
+    0
+}
+
+fun round(threads: int): int {
+    var started = 0
+    while (started < threads) {
+        val handle = thread { one() }
+        if (await handle != 0) return 1
+        started = started + 1
+    }
+    0
+}
+
+fun main: int {
+    // The first threads set up what is kept for good (the heap's chunks, the index counter, the descriptor's pages).
+    if (round(2000) != 0) return 1
+    memoryCollect()
+    val before = processResidentBytes()
+    if (round(100000) != 0) return 2
+    memoryCollect()
+    val grown = processResidentBytes() - before
+    println("jit threads: resident size grew by $grown bytes over 100000 threads")
+    val total = atomic { counter }
+    if (total != 102000) {
+        println("the counter is $total, not 102000")
+        return 3
+    }
+    if (before < 0 || grown > 4000000) {
+        println("a thread leaves its emulated thread-locals behind")
+        return 4
+    }
+    println("jit emutls threads ok")
+    0
+}

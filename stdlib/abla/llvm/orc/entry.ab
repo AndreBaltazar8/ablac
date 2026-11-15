@@ -1,6 +1,7 @@
 // Minimal LLVM 23 ORC C binding. All native references are opaque pointers;
 // ownership transfer follows LLVM's documented C API exactly.
 
+import "abla/runtime/emutls"
 import "abla/runtime/memory"
 import "abla/unsafe/memory"
 import "abla/unsafe/native"
@@ -566,6 +567,17 @@ fun LlvmOrcSession.lookup(name: string): LlvmOrcLookup {
     result
 }
 
+// A JIT-compiled program has its own runtime, with its own thread-end hook (abla/runtime/self): the compiler's
+// `emutlsThreadEnd` is stored there, so that the program's threads free their emulated thread-locals when they end
+// (abla/runtime/emutls). A program without threads has no hook to find: nothing happens.
+trusted fun LlvmOrcSession.installThreadEnd(): void {
+    val hook = this.lookup("__ablaRuntimeThreadEndHook")
+    if (hook.status == 0 && hook.address != 0) {
+        ablaUnsafeStoreI64(nativePointerFromAddress(hook.address), nativeFunctionAddress(emutlsThreadEnd))
+    }
+    return
+}
+
 fun LlvmOrcGeneration.remove(): int {
     var status = 0
     if (!this.closed) {
@@ -656,8 +668,11 @@ fun llvmOrcRunFile(
     if (result == 0) {
         val lookup = session.lookup("main")
         result = lookup.status
-        if (result == 0) result = llvmOrcCallMain(lookup.address,
-            if (program == "") path else program, arguments)
+        if (result == 0) {
+            session.installThreadEnd()
+            result = llvmOrcCallMain(lookup.address,
+                if (program == "") path else program, arguments)
+        }
     }
     val removeStatus = generation.remove()
     if (result == 0 && removeStatus != 0) result = removeStatus

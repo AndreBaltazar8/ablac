@@ -12,13 +12,16 @@
 // one that only its own thread sees; a variable's storage is allocated from the Abla heap on first use and aligned as the
 // control asks.
 //
-// What it does not do: free anything when a thread ends. compiler-rt does that from a pthread key's destructor, and
-// there is no exit hook here that a program built without the compiler could call. A thread that touches V variables
-// leaves its table (8 * (1 + capacity) bytes, the capacity being the largest index it used, at least 8) and V copies
-// (size + alignment each) behind (docs/toolchain.md has the measured numbers).
+// A thread's table and variables are freed when the thread ends: the first table a thread makes sets the runtime's
+// thread-end hook (abla/runtime/self: `__ablaRuntimeSetThreadEndHook`), which every Abla thread calls last, to
+// `emutlsThreadEnd`. A program's own runtime has its own hook: a JIT-compiled program (`ablac run`) is given the compiler's
+// `emutlsThreadEnd` by the compiler (abla/llvm/orc: llvmOrcInstallThreadEnd). A thread the runtime did not start (a
+// pthread of the compiler's) has no hook and leaves its table and V copies behind, 8 * (1 + capacity) bytes (the
+// capacity being the largest index it used, at least 8) and size + alignment + 8 each.
 import "abla/runtime/scalar"
 import "abla/runtime/self"
 import "abla/unsafe/memory"
+import "abla/unsafe/native"
 import "abla/unsafe/memory/raw"
 
 private trusted fun emutlsCounterAddress(): int = nativeStaticAllocate(8)
@@ -51,8 +54,10 @@ private trusted fun emutlsMakeCopy(control: int): int {
     // The ABI's alignment is a power of two; anything else (or nothing) gets a word's.
     if (alignment < 8 || (alignment & (alignment - 1)) != 0) alignment = 8
     val length = if (size < 1) 1 else size
-    val base = emutlsAllocate(length + alignment)
-    val address = (base + alignment - 1) & (0 - alignment)
+    // The block's base is kept in the word before the copy, to free it.
+    val base = emutlsAllocate(length + alignment + 8)
+    val address = (base + 8 + alignment - 1) & (0 - alignment)
+    ablaRuntimeStoreI64(address - 8, base)
     val initial = ablaRuntimeLoadI64(control + 24)
     if (initial != 0 && size > 0) ablaUnsafeCopyMemory(address, initial, size)
     else ablaUnsafeSetMemory(nativePointerFromAddress(address), 0, length)
@@ -69,6 +74,7 @@ trusted fun emutlsGetAddress(control: int): int {
     }
     val cell = emutlsTableCellAddress()
     var table = ablaRuntimeLoadI64(cell)
+    if (table == 0) __ablaRuntimeSetThreadEndHook(nativeFunctionAddress(emutlsThreadEnd))
     val capacity = if (table == 0) 0 else ablaRuntimeLoadI64(table)
     if (index > capacity) {
         table = emutlsGrow(table, capacity, index)
@@ -81,6 +87,23 @@ trusted fun emutlsGetAddress(control: int): int {
         ablaRuntimeStoreI64(slot, address)
     }
     address
+}
+
+// The thread is ending: its variables and its table are freed, and the cell is empty (a later use makes a new table).
+trusted fun emutlsThreadEnd(): void {
+    val cell = emutlsTableCellAddress()
+    val table = ablaRuntimeLoadI64(cell)
+    if (table == 0) return
+    ablaRuntimeStoreI64(cell, 0)
+    val capacity = ablaRuntimeLoadI64(table)
+    var index = 1
+    while (index <= capacity) {
+        val address = ablaRuntimeLoadI64(table + 8 * index)
+        if (address != 0) ablaUnsafeFree(nativePointerFromAddress(ablaRuntimeLoadI64(address - 8)))
+        index = index + 1
+    }
+    ablaUnsafeFree(nativePointerFromAddress(table))
+    return
 }
 
 // How many indexes have been handed out, process-wide (the counter itself).

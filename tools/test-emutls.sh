@@ -1,3 +1,7 @@
+# Many short threads of a JIT-compiled program: the compiler's thread-end function frees their thread-locals, the resident size stays put.
+result=$("$compiler" run tests/cases/emutls/jit-threads.ab 2>&1) || { echo "emutls (run, threads): $result" >&2; exit 1; }
+[[ $result == *"jit emutls threads ok"* ]] || { echo "emutls (run, threads): $result" >&2; exit 1; }
+printf '%s\n' "$result" | grep 'jit threads'
 #!/usr/bin/env bash
 # abla/runtime/emutls (#826): the emulated thread-local storage the macOS compiler exports for `ablac run`, instead of
 # compiler-rt's. tests/cases/emutls drives it through its interface with LLVM's control blocks (alignment, initial values,
@@ -28,6 +32,11 @@ done
 # compiler's ___emutls_get_address while five threads run transactions and force collections of the program's heap.
 result=$("$compiler" run tests/cases/emutls/jit.ab 2>&1) || { echo "emutls (run): $result" >&2; exit 1; }
 [[ $result == *"jit emutls ok"* ]] || { echo "emutls (run): $result" >&2; exit 1; }
+# Many short threads of a JIT-compiled program: the compiler's thread-end function (stored in the program's runtime hook
+# before main) frees their thread-locals, so the resident size stays put.
+result=$("$compiler" run tests/cases/emutls/jit-threads.ab 2>&1) || { echo "emutls (run, threads): $result" >&2; exit 1; }
+[[ $result == *"jit emutls threads ok"* ]] || { echo "emutls (run, threads): $result" >&2; exit 1; }
+printf '%s\n' "$result" | grep 'jit threads' || true
 tools_dir=${ABLA_LLVM_TOOLS:-}
 if [[ -z $tools_dir ]] || [[ ! -x $tools_dir/llc || ! -x $tools_dir/llvm-nm ]]; then
     tools_dir=$(dirname "$(command -v llc 2>/dev/null || true)")
