@@ -1,0 +1,106 @@
+// Session resumption against openssl (tools/test-tls-pure-interop.sh): the pure client with a ticket cache connects to `openssl s_server -www` three times
+// over; the first is a full handshake that leaves tickets, the next two resume (`resumed()` on our side, and s_server's status page says "Reused"). Then
+// the same through abla/http/async with `HttpAsyncOptions.sessions`: the cache is shared by the client's connections, and each new connection resumes.
+// Arguments: the port, the server's certificate (PEM, the trust anchor), and the mode: "blocking" or "async". Prints "tls-pure resume-net ok".
+import "abla/io"
+import "abla/crypto"
+import "abla/crypto/x509"
+import "abla/http/async"
+import "abla/process/arguments"
+import "abla/process/time"
+import "abla/sys/linux"
+import "abla/text"
+import "abla/tls/pure/client"
+import "abla/tls/pure/connection"
+import "abla/tls/pure/resume"
+import "abla/tls/pure/verify"
+
+var failures = 0
+
+fun fail(what: string): void {
+    failures = failures + 1
+    println("FAIL $what")
+    return
+}
+
+fun decimal(text: string): int {
+    var value = 0
+    for (i in 0 until text.size) value = value * 10 + (text[i] - 48)
+    value
+}
+
+fun now(): int = realtimeMilliseconds() / 1000
+
+fun blocking(port: int, caPath: string): void {
+    val store = x509TrustStoreFromPem(linuxReadFile(caPath, 1048576))
+    val cache = tlsSessionCacheNew(now)
+    for (round in 0 until 3) {
+        val config = tlsClientConfigWithSessions(tlsClientConfig("localhost", tlsX509Verifier(store, now), tlsPureRandom), cache, tlsX509Scope(store))
+        var connection = tlsPureConnect(config, port, 5000, 5000)
+        if (!connection.ok()) {
+            fail("round $round: connect: ${connection.lastError}")
+            return
+        }
+        if (connection.resumed() != (round > 0)) fail("round $round: resumed ${connection.resumed()}")
+        // A resumed connection reports the verification of the connection its ticket came from (R7 of the review).
+        if (!connection.peerVerified()) fail("round $round: peerVerified is false (resumed ${connection.resumed()})")
+        if (connection.write("GET / HTTP/1.0\r\n\r\n") < 0) fail("round $round: write: ${connection.lastError}")
+        var response = ""
+        var chunk = connection.read(4096)
+        while (chunk.size > 0) {
+            response = response + chunk
+            chunk = connection.read(4096)
+        }
+        if (response.size == 0) fail("round $round: no response")
+        if (round > 0 && !response.contains("Reused, TLSv1.3")) fail("round $round: s_server did not report a reused session")
+        if (round == 0 && response.contains("Reused, TLSv1.3")) fail("round 0 was reused")
+        connection.close()
+    }
+    if (cache.count("localhost") != 1 && cache.count("localhost") != 2) fail("the cache holds ${cache.count("localhost")} tickets")
+    cache.clear()
+    if (cache.count("localhost") != 0) fail("clear")
+    return
+}
+
+fun asyncWait(var client: HttpAsyncClient, id: int): HttpAsyncCompletion {
+    var result = HttpAsyncCompletion(id, -1, [], "", "no completion", 0)
+    var waiting = true
+    val limit = monotonicMilliseconds() + 60000
+    while (waiting && monotonicMilliseconds() < limit) {
+        client.step(50)
+        val done = client.takeCompletions()
+        for (completion in done) {
+            if (completion.id == id) {
+                result = completion
+                waiting = false
+            }
+        }
+    }
+    result
+}
+
+fun asynchronous(port: int, caPath: string): void {
+    val cache = tlsSessionCacheNew(now)
+    val client = httpAsyncClient(HttpAsyncOptions(8, 8388608, 30000, 3000, 60, caPath, cache))
+    for (round in 0 until 3) {
+        val completion = asyncWait(client, client.get("https://localhost:$port/", [], 30000))
+        if (completion.status != 200) {
+            fail("async round $round: status ${completion.status} ${completion.error}")
+            return
+        }
+        val reused = completion.body.contains("Reused, TLSv1.3")
+        if (reused != (round > 0)) fail("async round $round: reused $reused")
+        // (A request after a response closes its connection, so each round connects afresh.)
+        if (round == 0 && cache.count("localhost") < 1) fail("the first connection left no ticket in the cache")
+    }
+    cache.clear()
+    return
+}
+
+fun main: int {
+    val port = decimal(processArgument(0))
+    if (processArgument(2) == "async") asynchronous(port, processArgument(1)) else blocking(port, processArgument(1))
+    if (failures > 0) return 1
+    println("tls-pure resume-net ok")
+    0
+}

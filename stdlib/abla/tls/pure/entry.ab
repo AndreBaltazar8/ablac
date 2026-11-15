@@ -23,6 +23,7 @@ import "abla/sys/linux/process"
 import "abla/tls/pure/client"
 import "abla/tls/pure/connection"
 import "abla/tls/pure/handshake"
+export import "abla/tls/pure/resume"
 import "abla/tls/pure/server"
 import "abla/tls/pure/identity"
 import "abla/tls/pure/verify"
@@ -141,6 +142,9 @@ fun TlsConnection.peerCertificate(): string {
  *  against the trust store. A connection that failed, or whose client sent none, is false. */
 fun TlsConnection.peerCertificateVerified(): bool = this.handle != -1 && this.inner.peerVerified()
 
+/** Whether this connection resumed an earlier session (a ticket from the `sessions` cache was accepted: no certificate was sent). */
+fun TlsConnection.resumed(): bool = this.handle != -1 && this.inner.resumed()
+
 private fun TlsConnection.record(): void {
     pureTlsSetError(this.inner.stage)
     return
@@ -148,7 +152,12 @@ private fun TlsConnection.record(): void {
 
 // The client configuration for a CA file (read now: a missing file is a trust_store failure before any connection) or
 // the system store (read when the server's certificate arrives).
-private fun pureTlsConfigFor(host: string, caPath: string): TlsClientConfig? {
+private fun pureTlsConfigFor(host: string, caPath: string, sessions: TlsSessionCache? = null): TlsClientConfig? {
+    val config = pureTlsConfigForStore(host, caPath) ?? return null
+    if (sessions == null) config else tlsClientConfigWithSessions(config, sessions, "verify-host:" + (if (caPath == "") "system" else caPath))
+}
+
+private fun pureTlsConfigForStore(host: string, caPath: string): TlsClientConfig? {
     if (caPath == "") return pureTlsConfigSystem(host)
     val store = pureTlsStore(caPath) ?? return null
     pureTlsConfig(host, store)
@@ -175,11 +184,11 @@ private fun pureTlsFailed(host: string, stage: int): TlsConnection {
 }
 
 private fun pureTlsOpen(host: string, caPath: string, port: int, timeoutMilliseconds: int,
-    readWriteTimeoutMilliseconds: int, deadline: int, identity: TlsIdentity? = null): TlsConnection {
+    readWriteTimeoutMilliseconds: int, deadline: int, identity: TlsIdentity? = null, sessions: TlsSessionCache? = null): TlsConnection {
     if (host == "" || port <= 0 || port > 65535 || timeoutMilliseconds <= 0 || timeoutMilliseconds > 600000) {
         return pureTlsFailed(host, 1)
     }
-    val config = pureTlsConfigFor(host, caPath)
+    val config = pureTlsConfigFor(host, caPath, sessions)
     if (config == null) return pureTlsFailed(host, 4)
     val inner = tlsPureConnect(config, port, timeoutMilliseconds,
         readWriteTimeoutMilliseconds, deadline, identity)
@@ -193,7 +202,13 @@ private fun pureTlsOpen(host: string, caPath: string, port: int, timeoutMillisec
 fun tlsConnect(host: string, port: int = 443, timeoutMilliseconds: int = 5000,
     readWriteTimeoutMilliseconds: int = tlsDefaultReadWriteTimeoutMilliseconds,
     deadline: int = 0): TlsConnection =
-    pureTlsOpen(host, "", port, timeoutMilliseconds, readWriteTimeoutMilliseconds, deadline)
+    pureTlsOpen(host, "", port, timeoutMilliseconds, readWriteTimeoutMilliseconds, deadline, null)
+
+/** As tlsConnect with a ticket cache (abla/tls/pure/resume: tlsSessionCacheNew): a connection to a host that has a ticket in it resumes, and the tickets the server sends go in. A separate
+ *  function, not a parameter of tlsConnect: abla/tls/hosted declares tlsConnect too, and an overload that differs only by a defaulted parameter is ambiguous where both are visible. */
+fun tlsConnectWithSessions(host: string, sessions: TlsSessionCache, port: int = 443, timeoutMilliseconds: int = 5000,
+    readWriteTimeoutMilliseconds: int = tlsDefaultReadWriteTimeoutMilliseconds, deadline: int = 0, caPath: string = ""): TlsConnection =
+    pureTlsOpen(host, caPath, port, timeoutMilliseconds, readWriteTimeoutMilliseconds, deadline, null, sessions)
 
 /** Mutual TLS: as tlsConnect, presenting `identity` (tlsClientIdentityFromPem) when the server asks for a
  *  certificate, and trusting the CA file at `caPath` if it is not "". Under TLS 1.3 a server's refusal of the
@@ -208,16 +223,16 @@ fun tlsConnectWithIdentity(host: string, identity: TlsIdentity, caPath: string =
 /** As tlsConnect, trusting the CA file at `caPath` (PEM, one or more certificates) instead of the system store. */
 fun tlsConnectWithCa(host: string, caPath: string, port: int = 443, timeoutMilliseconds: int = 5000,
     readWriteTimeoutMilliseconds: int = tlsDefaultReadWriteTimeoutMilliseconds): TlsConnection =
-    pureTlsOpen(host, caPath, port, timeoutMilliseconds, readWriteTimeoutMilliseconds, 0)
+    pureTlsOpen(host, caPath, port, timeoutMilliseconds, readWriteTimeoutMilliseconds, 0, null)
 
 private fun pureTlsUpgrade(var connection: TcpConnection, host: string, caPath: string, timeoutMilliseconds: int,
-    readWriteTimeoutMilliseconds: int, deadline: int, identity: TlsIdentity?): TlsConnection {
+    readWriteTimeoutMilliseconds: int, deadline: int, identity: TlsIdentity?, sessions: TlsSessionCache? = null): TlsConnection {
     if (host == "") {
         pureTlsSetError(1)
         connection.close()
         return pureTlsFailed(host, 1)
     }
-    val config = pureTlsConfigFor(host, caPath)
+    val config = pureTlsConfigFor(host, caPath, sessions)
     if (config == null) {
         pureTlsSetError(4)
         connection.close()
@@ -234,6 +249,11 @@ private fun pureTlsUpgrade(var connection: TcpConnection, host: string, caPath: 
 fun tlsUpgrade(var connection: TcpConnection, host: string, caPath: string = "", timeoutMilliseconds: int = 5000,
     readWriteTimeoutMilliseconds: int = tlsDefaultReadWriteTimeoutMilliseconds): TlsConnection =
     pureTlsUpgrade(connection, host, caPath, timeoutMilliseconds, readWriteTimeoutMilliseconds, 0, null)
+
+/** As tlsUpgrade with a ticket cache (see tlsConnectWithSessions). */
+fun tlsUpgradeWithSessions(var connection: TcpConnection, host: string, sessions: TlsSessionCache, caPath: string = "", timeoutMilliseconds: int = 5000,
+    readWriteTimeoutMilliseconds: int = tlsDefaultReadWriteTimeoutMilliseconds): TlsConnection =
+    pureTlsUpgrade(connection, host, caPath, timeoutMilliseconds, readWriteTimeoutMilliseconds, 0, null, sessions)
 
 /** As tlsUpgrade over a Unix stream socket (the descriptor is what matters). `host` names the certificate and the
  *  server name, not the socket's path. */
@@ -549,6 +569,14 @@ private fun pureTlsSessionStore(caPath: string): X509TrustStore {
     if (store == null) X509TrustStore([]) else store
 }
 
+// What authenticates the server under `mode`, for the ticket cache (a ticket must not cross to a connection that verifies differently): nothing for TLS_VERIFY_NONE (no ticket is kept).
+private fun pureTlsSessionScope(mode: int, caPath: string): string {
+    val roots = if (caPath == "") "system" else caPath
+    if (mode == TLS_VERIFY_HOST) return "verify-host:" + roots
+    if (mode == TLS_VERIFY_CHAIN) return "verify-chain:" + roots
+    ""
+}
+
 private fun pureTlsSessionVerifier(mode: int, caPath: string): (array<string>, string, int, string, string) -> TlsVerdict {
     if (mode == TLS_VERIFY_HOST) return tlsX509VerifierLazy({ pureTlsSessionStore(caPath) }, pureTlsNow)
     if (mode == TLS_VERIFY_CHAIN) {
@@ -569,8 +597,8 @@ private fun pureTlsSessionVerifier(mode: int, caPath: string): (array<string>, s
  *  exchange): the ClientHello is queued, `handshake` sends it. `caPath` names a PEM file of roots ("" or "system": the
  *  system bundle, or what SSL_CERT_FILE and its friends name). A session that could not start is failed (`ok()` is false,
  *  `detail()` says why). */
-fun tlsSessionClient(descriptor: int, host: string, mode: int, caPath: string = ""): TlsSession {
-    val config = tlsClientConfig(host, pureTlsSessionVerifier(mode, caPath), tlsPureRandom)
+fun tlsSessionClient(descriptor: int, host: string, mode: int, caPath: string = "", sessions: TlsSessionCache? = null): TlsSession {
+    val config = tlsClientConfigWithSessions(tlsClientConfig(host, pureTlsSessionVerifier(mode, caPath), tlsPureRandom), sessions, pureTlsSessionScope(mode, caPath))
     val client = tlsClientNew(config)
     val session = TlsSession(client, descriptor, "", 0, "", "", false)
     if (descriptor < 0 || host == "" || mode < TLS_VERIFY_NONE || mode > TLS_VERIFY_HOST) {

@@ -1,0 +1,344 @@
+// TLS 1.3 session resumption (abla/tls/pure/resume): PSK with tickets, psk_dhe_ke, no 0-RTT, in one process with no sockets. A full handshake with a server that has
+// ticket keys leaves a ticket in the client's cache; the next connection resumes with it (no Certificate, `resumed()` on both sides, application data both ways,
+// a new ticket); a ticket is used once; tickets expire; a rotated key still opens what it sealed until they expire; a ticket of another server, another host
+// or another ALPN protocol, or one that was altered, gives a full handshake; a binder that does not verify is decrypt_error; a HelloRetryRequest keeps the PSK
+// (the binder is recomputed); a server that asks for client certificates sends none; tickets and PSKs are wiped (the wipe rule of abla/crypto). Argument 0 is
+// the directory of tools/test-tls-pure-interop.sh. Prints "tls-pure resume ok".
+import "abla/io"
+import "abla/crypto"
+import "abla/crypto/x509"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/text"
+import "abla/tls/pure/client"
+import "abla/tls/pure/handshake"
+import "abla/tls/pure/identity"
+import "abla/tls/pure/keysched"
+import "abla/tls/pure/resume"
+import "abla/tls/pure/server"
+import "abla/tls/pure/verify"
+
+var failures = 0
+var seed = 4242
+var clock = 1000
+
+fun fail(what: string): void {
+    failures = failures + 1
+    if (failures < 40) println("FAIL $what")
+    return
+}
+
+fun random(count: int): string {
+    val bytes: array<int> = []
+    for (i in 0 until count) {
+        seed = (seed * 1103515245 + 12345) & 2147483647
+        bytes.append((seed >> 8) & 255)
+    }
+    cryptoByteString(bytes)
+}
+
+fun now(): int = clock
+fun read(path: string): string = linuxReadFile(path, 1048576)
+fun acceptAny(chain: array<string>, scheme: int, content: string, signature: string): TlsVerdict = tlsAccepted()
+
+fun pump(var client: TlsClient, var server: TlsServer): void {
+    var rounds = 0
+    while (rounds < 50) {
+        val toServer = client.takeOutput()
+        if (toServer.size > 0) server.feed(toServer)
+        val toClient = server.takeOutput()
+        if (toClient.size > 0) client.feed(toClient)
+        if (toServer.size == 0 && toClient.size == 0) return
+        rounds = rounds + 1
+    }
+    return
+}
+
+fun allZero(value: string): bool {
+    for (byte in value) {
+        if (byte != 0) return false
+    }
+    true
+}
+
+fun clientWith(store: X509TrustStore, host: string, cache: TlsSessionCache, alpn: array<string> = [], groups: array<int> = []): TlsClient {
+    val base = tlsClientConfig(host, tlsX509Verifier(store, now), random)
+    tlsClientNew(TlsClientConfig(host, base.suites, base.signatureAlgorithms, alpn, base.verifier, random, tlsPatchClientHello, base.suites12, false, groups, cache, tlsX509Scope(store)))
+}
+
+fun serverWith(identity: TlsIdentity, keys: TlsTicketKeys?, groups: array<int> = [], alpn: array<string> = []): TlsServer {
+    val base = tlsServerConfig(identity, random)
+    tlsServerNew(TlsServerConfig(identity, base.suites, if (groups.size > 0) groups else base.groups, alpn, random, false, false, acceptAny,
+        base.suites12, keys))
+}
+
+/** A full handshake that leaves a ticket in `cache`, with `keys` on the server. */
+fun fullHandshake(identity: TlsIdentity, store: X509TrustStore, keys: TlsTicketKeys, cache: TlsSessionCache, what: string): bool {
+    var client = clientWith(store, "localhost", cache)
+    var server = serverWith(identity, keys)
+    pump(client, server)
+    if (!client.connected() || !server.connected() || client.resumed() || server.resumed()) {
+        fail("$what: the first handshake: [${client.error}] [${server.error}] resumed ${client.resumed()}")
+        return false
+    }
+    pump(client, server)
+    if (cache.count("localhost") != 1) {
+        fail("$what: the client holds ${cache.count("localhost")} tickets after a full handshake")
+        return false
+    }
+    true
+}
+
+fun main: int {
+    val directory = processArgument(0)
+    clock = linuxRealtimeNanoseconds() / 1000000000
+    val identity = tlsIdentityFromPem(read("$directory/ed25519.pem"), read("$directory/ed25519.key"))
+    val p256 = tlsIdentityFromPem(read("$directory/p256.pem"), read("$directory/p256.key"))
+    if (!identity.ok() || !p256.ok()) {
+        fail("the identities: ${identity.error} ${p256.error}")
+        return 1
+    }
+    val store = x509TrustStoreFromPem(read("$directory/ed25519.pem"))
+    val keys = tlsTicketKeysNew(random, now, 7200)
+    val cache = tlsSessionCacheNew(now)
+    if (!fullHandshake(identity, store, keys, cache, "basic")) return 1
+
+    // Resumption: the ticket is taken out of the cache, the server sends no certificate, both say so, data flows, and a new ticket arrives.
+    var client = clientWith(store, "localhost", cache)
+    if (cache.count("localhost") != 0) fail("a ticket is used once: the cache still holds ${cache.count("localhost")}")
+    var server = serverWith(identity, keys)
+    val hello = client.takeOutput()
+    server.feed(hello)
+    val answer = server.takeOutput()
+    val serverHello = tlsParseServerHello(answer.slice(9, 5 + answer[3] * 256 + answer[4]))
+    if (!serverHello.ok || serverHello.pskSelected != 0) fail("the ServerHello does not select the PSK: ${serverHello.pskSelected}")
+    client.feed(answer)
+    pump(client, server)
+    if (!client.connected() || !server.connected() || !client.resumed() || !server.resumed()) {
+        fail("the resumed handshake: [${client.error}] [${server.error}] ${client.resumed()} ${server.resumed()}")
+    }
+    if (client.chain.size != 0) fail("a resumed handshake carried a certificate chain")
+    client.send("resumed ping")
+    server.send("resumed pong")
+    pump(client, server)
+    if (server.takeApplicationData() != "resumed ping" || client.takeApplicationData() != "resumed pong") fail("resumed: application data")
+    if (cache.count("localhost") != 1) fail("a resumed connection left ${cache.count("localhost")} tickets")
+
+    // And again, from that ticket (a chain of resumptions).
+    var again = clientWith(store, "localhost", cache)
+    var againServer = serverWith(identity, keys)
+    pump(again, againServer)
+    pump(again, againServer)
+    if (!again.resumed() || !againServer.resumed() || !again.connected()) fail("the third connection did not resume")
+
+    // Tickets expire: after the lifetime the client's cache drops it and the handshake is full.
+    clock = clock + 7300
+    var late = clientWith(store, "localhost", cache)
+    var lateServer = serverWith(identity, keys)
+    pump(late, lateServer)
+    if (!late.connected() || late.resumed() || lateServer.resumed()) fail("an expired ticket resumed: [${late.error}] ${late.resumed()}")
+    if (cache.count("localhost") != 1) fail("expiry: ${cache.count("localhost")} tickets")
+    // A ticket the client still holds that the server finds expired (the server's clock is ahead): a full handshake, no error.
+    clock = clock + 100
+    val skewKeys = tlsTicketKeysNew(random, now, 50)
+    // A client whose clock stands still keeps offering a ticket the server finds expired: a full handshake, no error.
+    val frozen = clock
+    val skewCache = tlsSessionCacheNew({ frozen })
+    if (!fullHandshake(identity, store, skewKeys, skewCache, "expiry on the server")) return 1
+    clock = clock + 60
+    var wideClient = clientWith(store, "localhost", skewCache)
+    var wideServer = serverWith(identity, skewKeys)
+    pump(wideClient, wideServer)
+    if (!wideClient.connected() || wideClient.resumed() || wideServer.resumed()) fail("a ticket past the server's lifetime resumed")
+
+    // Key rotation: a ticket sealed under the old key opens until it expires; a ticket sealed after rotating uses the new one.
+    val rotating = tlsTicketKeysNew(random, now, 7200)
+    val rotatingCache = tlsSessionCacheNew(now)
+    if (!fullHandshake(identity, store, rotating, rotatingCache, "rotation")) return 1
+    if (!rotating.rotate()) fail("rotate failed")
+    var rotated = clientWith(store, "localhost", rotatingCache)
+    var rotatedServer = serverWith(identity, rotating)
+    pump(rotated, rotatedServer)
+    pump(rotated, rotatedServer)
+    if (!rotated.resumed() || !rotatedServer.resumed()) fail("a ticket of a rotated-out key did not resume")
+    clock = clock + 7300
+    rotating.rotate()
+    var expiredKey = clientWith(store, "localhost", rotatingCache)
+    var expiredKeyServer = serverWith(identity, rotating)
+    pump(expiredKey, expiredKeyServer)
+    if (!expiredKey.connected() || expiredKey.resumed()) fail("a ticket of a dropped key resumed")
+
+    // Other servers, hosts and ALPN protocols: a full handshake each.
+    val other = tlsTicketKeysNew(random, now, 7200)
+    val otherCache = tlsSessionCacheNew(now)
+    if (!fullHandshake(identity, store, keys, otherCache, "other")) return 1
+    var wrongKeys = clientWith(store, "localhost", otherCache)
+    var wrongKeysServer = serverWith(identity, other)
+    pump(wrongKeys, wrongKeysServer)
+    if (!wrongKeys.connected() || wrongKeys.resumed()) fail("a ticket of another server's keys resumed")
+    if (!fullHandshake(identity, store, keys, otherCache, "host")) return 1
+    var wrongHost = clientWith(store, "example.test", otherCache)
+    if (otherCache.count("localhost") != 1) fail("a ticket for another host was taken")
+    wrongHost.takeOutput()
+    // ALPN: the ticket remembers the protocol; a client that offers another one, or none, does not take it.
+    val alpnCache = tlsSessionCacheNew(now)
+    var alpnClient = clientWith(store, "localhost", alpnCache, ["h2", "http/1.1"])
+    var alpnServer = serverWith(identity, keys, [], ["h2"])
+    pump(alpnClient, alpnServer)
+    pump(alpnClient, alpnServer)
+    if (alpnClient.alpn() != "h2" || alpnCache.count("localhost") != 1) fail("the ALPN session: ${alpnClient.alpn()} ${alpnCache.count("localhost")}")
+    val offered = clientWith(store, "localhost", alpnCache, ["http/1.1"])
+    if (alpnCache.count("localhost") != 1) fail("a ticket for h2 was taken by a client offering http/1.1")
+    val none = clientWith(store, "localhost", alpnCache)
+    if (alpnCache.count("localhost") != 1) fail("a ticket for h2 was taken by a client offering no ALPN protocol")
+    var alpnAgain = clientWith(store, "localhost", alpnCache, ["http/1.1", "h2"])
+    var alpnAgainServer = serverWith(identity, keys, [], ["h2"])
+    pump(alpnAgain, alpnAgainServer)
+    if (!alpnAgain.resumed() || alpnAgain.alpn() != "h2") fail("the ALPN session did not resume: ${alpnAgain.alpn()} ${alpnAgain.error}")
+
+    // An altered ticket gives a full handshake (the server cannot open it); an altered binder is decrypt_error.
+    val tamperCache = tlsSessionCacheNew(now)
+    if (!fullHandshake(identity, store, keys, tamperCache, "tamper")) return 1
+    val tamperClient = clientWith(store, "localhost", tamperCache)
+    val tamperHello = tamperClient.takeOutput()
+    val parsed = tlsParseClientHello(tamperHello.slice(9, tamperHello.size))
+    if (!parsed.ok || parsed.pskIdentities.size != 1 || parsed.pskBinders.size != 1 || parsed.pskModes.size != 1 || parsed.pskModes[0] != 1) {
+        fail("the ClientHello's PSK offer")
+    } else {
+        val start = tlsBindersStart(tamperHello.slice(5, tamperHello.size))
+        val binder = parsed.pskBinders[0]
+        val bentBinder = tlsU8(binder[0] ^ 1) + binder.slice(1, binder.size)
+        val badBinder = tlsReplaceBinders(tamperHello.slice(5, tamperHello.size), [bentBinder])
+        var binderServer = serverWith(identity, keys)
+        binderServer.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, badBinder))
+        val binderOut = binderServer.takeOutput()
+        if (!binderServer.failed() || binderOut.size < 7 || binderOut[6] != 51) fail("a bad binder: failed ${binderServer.failed()} alert ${if (binderOut.size > 6) binderOut[6] else -1}")
+        // A ticket with a flipped byte: not an error, a full handshake.
+        val ticket = parsed.pskIdentities[0].identity
+        val bentTicket = ticket.slice(0, 40) + tlsU8(ticket[40] ^ 1) + ticket.slice(41, ticket.size)
+        val rebuilt = tlsBuildClientHello(parsed.random, parsed.sessionId, parsed.suites, "localhost", parsed.groups, parsed.shares, parsed.schemes, [], "",
+            [], false, [TlsPskIdentity(bentTicket, parsed.pskIdentities[0].obfuscatedAge)], binder.size)
+        var bentServer = serverWith(identity, keys)
+        bentServer.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, rebuilt))
+        val bentOut = bentServer.takeOutput()
+        if (bentServer.failed() && bentOut.size > 6 && bentOut[6] == 51) fail("an altered ticket was an error")
+    }
+
+
+    // The server binds a ticket to the server name and ALPN protocol of its session: a valid ticket with a valid binder, in a ClientHello for another name (or
+    // another protocol), is a full handshake, not a resumption and not an error (BoGo TLS13-Server-NoResumptionAcrossNames).
+    val acrossCache = tlsSessionCacheNew(now)
+    if (!fullHandshake(identity, store, keys, acrossCache, "across names")) return 1
+    val taken = acrossCache.take("localhost", [], tlsX509Scope(store))
+    if (taken == null) {
+        fail("no ticket for the names test")
+    } else {
+        for (variant in 0 until 2) {
+            val random32 = random(32)
+            val base = tlsClientConfig("localhost", tlsX509Verifier(store, now), random)
+            val offer = tlsClientShares(tlsDefaultGroups(), true, random)
+            val age = ((clock - taken.received) * 1000 + taken.ageAdd) & 4294967295
+            val host = if (variant == 0) "other.test" else "localhost"
+            val alpn = if (variant == 1) ["h2"] else []
+            var message = tlsBuildClientHello(random32, random(32), base.suites, host, offer.groups, offer.shares, base.signatureAlgorithms, alpn, "",
+                [], false, [TlsPskIdentity(taken.ticket, age)], tlsHashLength(tlsSuiteHash(taken.suite)))
+            val partial = message.slice(0, tlsBindersStart(message))
+            message = tlsReplaceBinders(message, [tlsBinderValue(tlsSuiteHash(taken.suite), taken.psk, partial)])
+            var acrossServer = serverWith(identity, keys, [], ["h2"])
+            acrossServer.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, message))
+            val acrossOut = acrossServer.takeOutput()
+            val acrossHello = tlsParseServerHello(acrossOut.slice(9, 5 + acrossOut[3] * 256 + acrossOut[4]))
+            if (acrossServer.failed() || !acrossHello.ok || acrossHello.pskSelected != -1) {
+                fail("a ticket for another ${if (variant == 0) "server name" else "ALPN protocol"} was accepted or refused: psk ${acrossHello.pskSelected} failed ${acrossServer.failed()}")
+            }
+        }
+        // (And the control: the same ticket, name and protocol as the session's, is selected.)
+        val message = tlsBuildClientHello(random(32), random(32), tlsClientConfig("localhost", tlsX509Verifier(store, now), random).suites, "localhost",
+            tlsDefaultGroups(), tlsClientShares(tlsDefaultGroups(), true, random).shares, tlsClientConfig("localhost", tlsX509Verifier(store, now), random).signatureAlgorithms, [], "",
+            [], false, [TlsPskIdentity(taken.ticket, ((clock - taken.received) * 1000 + taken.ageAdd) & 4294967295)], tlsHashLength(tlsSuiteHash(taken.suite)))
+        val partial = message.slice(0, tlsBindersStart(message))
+        var controlServer = serverWith(identity, keys)
+        controlServer.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, tlsReplaceBinders(message, [tlsBinderValue(tlsSuiteHash(taken.suite), taken.psk, partial)])))
+        val controlOut = controlServer.takeOutput()
+        val controlHello = tlsParseServerHello(controlOut.slice(9, 5 + controlOut[3] * 256 + controlOut[4]))
+        if (!controlHello.ok || controlHello.pskSelected != 0) fail("the control ticket was not selected: ${controlHello.pskSelected}")
+        tlsWipe(taken.ticket)
+        tlsWipe(taken.psk)
+    }
+    // HelloRetryRequest with a PSK: a server that wants P-384 only; the second ClientHello carries the PSK with a binder over the new transcript.
+    val retryCache = tlsSessionCacheNew(now)
+    if (!fullHandshake(identity, store, keys, retryCache, "retry")) return 1
+    var retryClient = clientWith(store, "localhost", retryCache)
+    var retryServer = serverWith(identity, keys, [TLS_GROUP_SECP384R1])
+    pump(retryClient, retryServer)
+    if (!retryClient.connected() || !retryClient.retried || !retryClient.resumed() || !retryServer.resumed()) {
+        fail("HelloRetryRequest and a PSK: [${retryClient.error}] [${retryServer.error}] retried ${retryClient.retried} resumed ${retryClient.resumed()}")
+    }
+
+    // A server that asks for client certificates sends no tickets.
+    val authCache = tlsSessionCacheNew(now)
+    var authClient = clientWith(store, "localhost", authCache)
+    val authBase = tlsServerConfig(identity, random)
+    var authServer = tlsServerNew(TlsServerConfig(identity, authBase.suites, authBase.groups, [], random, true, false, acceptAny, authBase.suites12, keys))
+    pump(authClient, authServer)
+    pump(authClient, authServer)
+    if (!authClient.connected() || authCache.count("localhost") != 0) fail("a server that requests client certificates sent a ticket")
+
+
+    // The cache itself: expiry, ALPN and the host, without a server.
+    val unit = tlsSessionCacheNew(now)
+    // The scope (R1 of the review): a ticket is kept and offered only under the scope it was obtained under; an empty scope keeps and offers none.
+    val scoped = tlsSessionCacheNew(now)
+    scoped.put("host", "", TLS_SUITE_AES_128_GCM_SHA256, "t", "p", 1, 100, "")
+    if (scoped.count("host") != 0) fail("a ticket without a scope was kept")
+    scoped.put("host", "", TLS_SUITE_AES_128_GCM_SHA256, "t", "p", 1, 100, "x509:aa")
+    if (scoped.take("host", [], "x509:bb") != null) fail("a ticket crossed to another scope")
+    if (scoped.take("host", [], "") != null) fail("a ticket was offered to an empty scope")
+    if (scoped.take("host", [], "x509:aa") == null) fail("a ticket was not offered to its own scope")
+    unit.put("host", "", TLS_SUITE_AES_128_GCM_SHA256, "ticket-one", "psk-one", 1, 10, "scope-a")
+    unit.put("host", "h2", TLS_SUITE_AES_128_GCM_SHA256, "ticket-two", "psk-two", 2, 100, "scope-a")
+    if (unit.count("host") != 2 || unit.count("other") != 0) fail("the cache counts")
+    if (unit.take("host", ["http/1.1"], "scope-a") != null) fail("a ticket for h2 or none was taken by a client offering http/1.1")
+    if (unit.take("host", ["h2"], "scope-a") == null) fail("the h2 ticket was not taken")
+    if (unit.take("host", ["h2"], "scope-a") != null) fail("the h2 ticket was taken twice")
+    if (unit.take("host", ["h2"], "scope-a") != null) fail("the ticket without ALPN was taken by a client offering h2")
+    val bare = unit.take("host", [], "scope-a")
+    if (bare == null || bare.ticket != "ticket-one") fail("the ticket without ALPN was not taken by a client offering none")
+    unit.put("host", "", TLS_SUITE_AES_128_GCM_SHA256, "ticket-three", "psk-three", 3, 10, "scope-a")
+    clock = clock + 11
+    if (unit.take("host", [], "scope-a") != null) fail("an expired ticket was taken")
+    if (unit.count("host") != 0) fail("an expired ticket stayed in the cache")
+    unit.put("host", "", TLS_SUITE_AES_128_GCM_SHA256, "ticket-four", "psk-four", 4, 0, "scope-a")
+    if (unit.count("host") != 0) fail("a ticket with no lifetime was kept")
+    val small = tlsSessionCacheNew(now, 2)
+    for (i in 0 until 4) small.put("host", "", TLS_SUITE_AES_128_GCM_SHA256, "ticket-$i", "psk-$i", i, 100, "scope-a")
+    if (small.count("host") != 2) fail("the capacity: ${small.count("host")} tickets")
+    val newest = small.take("host", [], "scope-a")
+    if (newest == null || newest.ticket != "ticket-3") fail("the newest ticket goes first")
+    // The wipe rule: a ticket taken from the cache and the PSK it gave are wiped with the connection; clearing the cache wipes what it holds.
+    val wipeCache = tlsSessionCacheNew(now)
+    if (!fullHandshake(identity, store, keys, wipeCache, "wipe")) return 1
+    val held = wipeCache.take("localhost", [], tlsX509Scope(store))
+    if (held == null) {
+        fail("no ticket to take")
+    } else {
+        val ticketCopy = held.ticket + ""
+        val ticketAddress = held.ticket
+        wipeCache.put("localhost", "", held.suite, held.ticket, held.psk, held.ageAdd, 100, tlsX509Scope(store))
+        wipeCache.clear()
+        if (wipeCache.count("localhost") != 0) fail("clear left tickets")
+        tlsWipe(held.ticket)
+        tlsWipe(held.psk)
+        if (!allZero(held.ticket) || !allZero(held.psk)) fail("a taken ticket was not wiped")
+    }
+    val wipeKeys = tlsTicketKeysNew(random, now, 7200)
+    val sealed = wipeKeys.seal(TLS_SUITE_AES_128_GCM_SHA256, 5, "p".repeat(32), "", "localhost")
+    val opened = wipeKeys.open(sealed)
+    if (!opened.ok || opened.psk != "p".repeat(32) || opened.serverName != "localhost" || opened.ageAdd != 5) fail("a ticket does not open to what was sealed")
+    wipeKeys.wipe()
+    if (wipeKeys.open(sealed).ok) fail("a ticket opened after its keys were wiped")
+
+    if (failures > 0) return 1
+    println("tls-pure resume ok")
+    0
+}

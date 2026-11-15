@@ -9,12 +9,14 @@ import "abla/crypto"
 import "abla/crypto/x509"
 import "abla/integer"
 import "abla/process/arguments"
+import "abla/process/time"
 import "abla/sys/linux"
 import "abla/sys/linux/net"
 import "abla/tls/pure/client"
 import "abla/tls/pure/connection"
 import "abla/tls/pure/handshake"
 import "abla/tls/pure/identity"
+import "abla/tls/pure/resume"
 import "abla/tls/pure/server"
 import "abla/tls/pure/tls12"
 import "abla/tls/pure/verify"
@@ -44,7 +46,10 @@ class ShimFlags(
     var signingPrefs: array<int>,
     var verifyPrefs: array<int>,
     var unimplemented: string,
-    var expectCurveId: int = 0
+    var expectCurveId: int = 0,
+    var resumeCount: int = 0,
+    var expectSessionMiss: bool = false,
+    var noTicket: bool = false
 )
 
 fun shimDefaults(): ShimFlags =
@@ -58,7 +63,7 @@ val UNSUPPORTED_BOOLEAN = ["-dtls", "-quic", "-enable-early-data", "-fuzzer-mode
     "-false-start", "-handshaker-resume", "-use-ticket-callback", "-renegotiate-freely", "-renegotiate-once",
     "-renegotiate-ignore", "-renegotiate-explicit", "-enable-ocsp-stapling", "-enable-signed-cert-timestamps",
     "-new-x509-credential", "-new-delegated-credential", "-new-psk-credential", "-new-spake2plusv1-credential",
-    "-new-rpk-credential", "-on-initial-new-x509-credential"]
+    "-new-rpk-credential"]
 
 /** The ALPN list in the shim's wire form: each name preceded by its one-byte length. */
 fun parseAlpnList(text: string): array<string> {
@@ -87,46 +92,71 @@ fun numberOf(text: string): int {
     val parsed = text.parseInt()
     if (parsed == null) -1 else parsed
 }
+/** One flag applied to `target`: 1 if it takes a value, 0 if not, -1 if the shim does not know it. */
+fun applyFlag(var target: ShimFlags, name: string, value: string): int {
+    var takesValue = true
+    if (name == "-server") { target.isServer = true; takesValue = false }
+    else if (name == "-ipv6") { target.ipv6 = true; takesValue = false }
+    else if (name == "-shim-writes-first") { target.shimWritesFirst = true; takesValue = false }
+    else if (name == "-require-any-client-certificate") { target.requireClientCertificate = true; takesValue = false }
+    else if (name == "-verify-peer") { target.verifyPeer = true; takesValue = false }
+    else if (name == "-decline-alpn") { target.declineAlpn = true; takesValue = false }
+    else if (name == "-no-tls13") { if (target.maxVersion > 771) target.maxVersion = 771; takesValue = false }
+    else if (name == "-no-tls12") { target.unimplemented = "-no-tls12 (needs TLS 1.1 or 1.3 alone)"; takesValue = false }
+    else if (name == "-no-tls11" || name == "-no-tls1" || name == "-no-ssl3") { takesValue = false }
+    else if (name == "-port") target.port = numberOf(value)
+    else if (name == "-shim-id") target.shimId = numberOf(value)
+    else if (name == "-key-file") target.keyFile = value
+    else if (name == "-cert-file") target.certFile = value
+    else if (name == "-trust-cert") takesValue = true
+    else if (name == "-min-version") target.minVersion = numberOf(value)
+    else if (name == "-max-version") target.maxVersion = numberOf(value)
+    else if (name == "-expect-version") target.expectVersion = numberOf(value)
+    else if (name == "-advertise-alpn") target.advertiseAlpn = parseAlpnList(value)
+    else if (name == "-expect-alpn") target.expectAlpn = value
+    else if (name == "-expect-curve-id") target.expectCurveId = numberOf(value)
+    else if (name == "-select-alpn") target.selectAlpn = value
+    else if (name == "-host-name") target.hostName = value
+    else if (name == "-expect-server-name") target.expectServerName = value
+    else if (name == "-curves") target.curves.append(numberOf(value))
+    else if (name == "-signing-prefs") target.signingPrefs.append(numberOf(value))
+    else if (name == "-verify-prefs") target.verifyPrefs.append(numberOf(value))
+    else if (name == "-resume-count") target.resumeCount = numberOf(value)
+    else if (name == "-expect-session-miss") { target.expectSessionMiss = true; takesValue = false }
+    else if (name == "-no-ticket") { target.noTicket = true; takesValue = false }
+    else if (hasText(UNSUPPORTED_BOOLEAN, name)) { target.unimplemented = name; takesValue = false }
+    else return -1
+    if (takesValue) 1 else 0
+}
 
-fun parseFlags(): ShimFlags {
-    val flags = shimDefaults()
+/** The flags for connection number `phase` (0 the first, 1 and later the resumptions): the runner sends `-on-initial-X` and `-on-resume-X` for what differs. */
+fun parseFlags(phase: int): ShimFlags {
+    var flags = shimDefaults()
+    var scratch = shimDefaults()
     val count = processArgumentCount()
     var index = 0
     while (index < count) {
-        val name = processArgument(index)
+        var name = processArgument(index)
+        var applies = true
+        if (name.startsWith("-on-initial-")) {
+            name = "-" + name.slice(12, name.size)
+            applies = phase == 0
+        } else if (name.startsWith("-on-resume-")) {
+            name = "-" + name.slice(11, name.size)
+            applies = phase != 0
+        }
         val value = if (index + 1 < count) processArgument(index + 1) else ""
-        var takesValue = true
-        if (name == "-server") { flags.isServer = true; takesValue = false }
-        else if (name == "-ipv6") { flags.ipv6 = true; takesValue = false }
-        else if (name == "-shim-writes-first") { flags.shimWritesFirst = true; takesValue = false }
-        else if (name == "-require-any-client-certificate") { flags.requireClientCertificate = true; takesValue = false }
-        else if (name == "-verify-peer") { flags.verifyPeer = true; takesValue = false }
-        else if (name == "-decline-alpn") { flags.declineAlpn = true; takesValue = false }
-        else if (name == "-no-tls13") { if (flags.maxVersion > 771) flags.maxVersion = 771; takesValue = false }
-        else if (name == "-no-tls12") { flags.unimplemented = "-no-tls12 (needs TLS 1.1 or 1.3 alone)"; takesValue = false }
-        else if (name == "-no-tls11" || name == "-no-tls1" || name == "-no-ssl3") { takesValue = false }
-        else if (name == "-port") flags.port = numberOf(value)
-        else if (name == "-shim-id") flags.shimId = numberOf(value)
-        else if (name == "-key-file") flags.keyFile = value
-        else if (name == "-cert-file") flags.certFile = value
-        else if (name == "-trust-cert") takesValue = true
-        else if (name == "-min-version") flags.minVersion = numberOf(value)
-        else if (name == "-max-version") flags.maxVersion = numberOf(value)
-        else if (name == "-expect-version") flags.expectVersion = numberOf(value)
-        else if (name == "-advertise-alpn") flags.advertiseAlpn = parseAlpnList(value)
-        else if (name == "-expect-alpn") flags.expectAlpn = value
-        else if (name == "-expect-curve-id") flags.expectCurveId = numberOf(value)
-        else if (name == "-select-alpn") flags.selectAlpn = value
-        else if (name == "-host-name") flags.hostName = value
-        else if (name == "-expect-server-name") flags.expectServerName = value
-        else if (name == "-curves") flags.curves.append(numberOf(value))
-        else if (name == "-signing-prefs") flags.signingPrefs.append(numberOf(value))
-        else if (name == "-verify-prefs") flags.verifyPrefs.append(numberOf(value))
-        else if (name == "-resume-count") { if (numberOf(value) != 0) flags.unimplemented = "resumption" }
-        else if (hasText(UNSUPPORTED_BOOLEAN, name)) { flags.unimplemented = name; takesValue = false }
-        else {
-            flags.unimplemented = name
-            return flags
+        val taken = if (applies) applyFlag(flags, name, value) else applyFlag(scratch, name, value)
+        var takesValue = taken == 1
+        if (taken < 0) {
+            // An unknown flag stops the parse (the test does not apply), unless it is for the other connection: then it is skipped with its value, if it has one.
+            if (applies) {
+                flags.unimplemented = name
+                index = count
+                takesValue = false
+            } else {
+                takesValue = index + 1 < count && !processArgument(index + 1).startsWith("-")
+            }
         }
         index = index + (if (takesValue) 2 else 1)
     }
@@ -174,7 +204,7 @@ val SIGNATURES = [TLS_SIG_ECDSA_SECP256R1_SHA256, TLS_SIG_RSA_PSS_RSAE_SHA256, T
     TLS_SIG_RSA_PSS_RSAE_SHA512, TLS_SIG_ED25519, TLS_SIG_ECDSA_SECP384R1_SHA384, TLS_SIG_RSA_PKCS1_SHA256,
     TLS_SIG_RSA_PKCS1_SHA384, TLS_SIG_RSA_PKCS1_SHA512]
 
-fun shimClient(flags: ShimFlags, groups: array<int>): TlsClient {
+fun shimClient(flags: ShimFlags, groups: array<int>, cache: TlsSessionCache?): TlsClient {
     val suites = if (flags.maxVersion >= 772) SUITES13 else []
     val suites12 = if (flags.minVersion <= 771) SUITES12 else []
     var signatures = SIGNATURES
@@ -183,8 +213,8 @@ fun shimClient(flags: ShimFlags, groups: array<int>): TlsClient {
         for (scheme in flags.verifyPrefs) if (has(SIGNATURES, scheme)) chosen.append(scheme)
         signatures = chosen
     }
-    val config = TlsClientConfig(flags.hostName, suites, signatures, flags.advertiseAlpn, signatureOnly, tlsPureRandom,
-        tlsPatchClientHello, suites12)
+    val config = tlsClientConfigWithSessions(TlsClientConfig(flags.hostName, suites, signatures, flags.advertiseAlpn, signatureOnly, tlsPureRandom,
+        tlsPatchClientHello, suites12), if (flags.noTicket) null else cache, "bogo-shim")
     // A key share for the first group the shim prefers (tlsClientNew's choice, X25519, when -curves allows it).
     val helloRandom = tlsPureRandom(32)
     // The 32-byte legacy session id is TLS 1.3's middlebox compatibility; a TLS 1.2-only client offers none (it does not
@@ -193,18 +223,19 @@ fun shimClient(flags: ShimFlags, groups: array<int>): TlsClient {
     // The library's choice of key shares (the first classical group and the first hybrid, in the order given), and its list: a client
     // without TLS 1.3 lists no hybrid.
     val offer = tlsClientShares(groups, suites.size > 0, tlsPureRandom)
-    val hello = tlsBuildClientHello(helloRandom, sessionId, suites, flags.hostName, offer.groups, if (suites.size > 0) offer.shares else [],
-        signatures, flags.advertiseAlpn, "", suites12)
-    tlsClientStartWith(config, hello, helloRandom, sessionId, if (suites.size > 0) offer.pairs else [], 769)
+    // (The library builds the hello, with a ticket from the cache as a PSK when it has one for this host and ALPN.)
+    val usable = TlsClientShares(offer.ok, offer.groups, if (suites.size > 0) offer.pairs else [], if (suites.size > 0) offer.shares else [])
+    val built = tlsClientBuildHello(config, helloRandom, sessionId, usable)
+    tlsClientStartWith(config, built.message, helloRandom, sessionId, usable.pairs, 769, built.ticket)
 }
 
-fun shimServer(flags: ShimFlags, identity: TlsIdentity, groups: array<int>): TlsServer {
+fun shimServer(flags: ShimFlags, identity: TlsIdentity, groups: array<int>, keys: TlsTicketKeys?): TlsServer {
     val suites = if (flags.maxVersion >= 772) SUITES13 else []
     val suites12 = if (flags.minVersion <= 771) SUITES12 else []
     val alpn: array<string> = if (flags.selectAlpn != "") [flags.selectAlpn] else if (flags.declineAlpn) [] else []
     val request = flags.requireClientCertificate || flags.verifyPeer
     tlsServerNew(TlsServerConfig(identity, suites, groups, alpn, tlsPureRandom, request, flags.requireClientCertificate,
-        clientSignatureOnly, suites12))
+        clientSignatureOnly, suites12, if (flags.noTicket) null else keys))
 }
 
 // ---- the connection: one machine, a client's or a server's (the other is an unused placeholder) ----
@@ -231,6 +262,7 @@ fun Shim.received(): string = if (this.isServer) this.server.takeApplicationData
 fun Shim.send(data: string): bool = if (this.isServer) this.server.send(data) else this.client.send(data)
 fun Shim.version(): int = if (this.isServer) (if (this.server.v12) 771 else 772) else (if (this.client.v12) 771 else 772)
 fun Shim.alpn(): string = if (this.isServer) this.server.alpn() else this.client.alpn()
+fun Shim.resumed(): bool = if (this.isServer) this.server.resumed() else this.client.resumed()
 fun Shim.negotiatedGroup(): int = if (this.isServer) this.server.negotiatedGroup else this.client.negotiatedGroup
 
 fun Shim.flush(): bool {
@@ -266,13 +298,10 @@ fun xorAll(data: string): string {
     cryptoByteString(bytes)
 }
 
-fun main: int {
-    // The runner asks once whether split handshakes are supported: they are not.
-    if (processArgumentCount() == 1 && processArgument(0) == "-is-handshaker-supported") {
-        println("No")
-        return 0
-    }
-    val flags = parseFlags()
+/** One connection of the shim's run: `phase` 0 is the first, 1 and later resume the session of the one before (`-resume-count`). The cache and the ticket keys outlive
+ *  the connections. */
+fun runConnection(phase: int, cache: TlsSessionCache, keys: TlsTicketKeys): int {
+    val flags = parseFlags(phase)
     if (flags.unimplemented != "") {
         eprintln("shim: unimplemented: ${flags.unimplemented}")
         return UNIMPLEMENTED
@@ -310,9 +339,9 @@ fun main: int {
     }
     tcp.writeResult(id)
 
-    var client = if (flags.isServer) placeholderClient() else shimClient(flags, groups)
+    var client = if (flags.isServer) placeholderClient() else shimClient(flags, groups, cache)
     if (!flags.isServer && identity != null) client.useIdentity(identity)
-    val server = if (flags.isServer && identity != null) shimServer(flags, identity, groups) else placeholderServer()
+    val server = if (flags.isServer && identity != null) shimServer(flags, identity, groups, keys) else placeholderServer()
     var shim = Shim(move(tcp), client, server, flags.isServer)
 
     // The handshake.
@@ -325,6 +354,14 @@ fun main: int {
     }
     if (shim.failed()) return shim.failWith(shim.error())
 
+    // Resumption (-resume-count): every connection after the first must resume the one before, unless the runner expects a miss; TLS 1.2 has no resumption here.
+    if (phase == 0 && flags.resumeCount > 0 && shim.version() < 772) {
+        eprintln("shim: unimplemented: TLS 1.2 resumption")
+        return UNIMPLEMENTED
+    }
+    if (phase > 0 && flags.expectSessionMiss == shim.resumed()) {
+        return shim.failWith(if (flags.expectSessionMiss) "the session was resumed, though a miss was expected" else "the session was not resumed")
+    }
     // The checks the flags ask for.
     if (flags.expectVersion != 0 && shim.version() != flags.expectVersion) {
         return shim.failWith("version ${shim.version()}, expected ${flags.expectVersion}")
@@ -369,6 +406,25 @@ fun main: int {
             shim.tcp.close()
             return 0
         }
+    }
+    0
+}
+
+fun shimNow(): int = realtimeMilliseconds() / 1000
+
+fun main: int {
+    // The runner asks once whether split handshakes are supported: they are not.
+    if (processArgumentCount() == 1 && processArgument(0) == "-is-handshaker-supported") {
+        println("No")
+        return 0
+    }
+    val first = parseFlags(0)
+    // One cache and one set of ticket keys for the whole run: the connections after the first resume.
+    val cache = tlsSessionCacheNew(shimNow)
+    val keys = tlsTicketKeysNew(tlsPureRandom, shimNow, 7200, 1)
+    for (phase in 0 until first.resumeCount + 1) {
+        val code = runConnection(phase, cache, keys)
+        if (code != 0) return code
     }
     0
 }

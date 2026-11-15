@@ -7,7 +7,8 @@
 // signature scheme (the identity's, among the client's) and the ALPN protocol, answers with ServerHello,
 // EncryptedExtensions, an optional CertificateRequest, Certificate, CertificateVerify and Finished, verifies the
 // client's Finished (and, when it asked, its Certificate and CertificateVerify through a configured verifier),
-// then carries application data. NewSessionTicket is not sent (no resumption). Refuses a client that does not
+// then carries application data. With ticket keys (TlsServerConfig.tickets) it sends NewSessionTicket and resumes tickets it sealed (a PSK with psk_dhe_ke: no Certificate
+// is sent; no 0-RTT). Refuses a client that does not
 // offer TLS 1.3, no common suite, group or signature scheme, a bad Finished, wrong message order, bad records.
 
 import "abla/crypto"
@@ -16,6 +17,7 @@ import "abla/tls/pure/client"
 import "abla/tls/pure/handshake"
 import "abla/tls/pure/keysched"
 import "abla/tls/pure/record"
+import "abla/tls/pure/resume"
 import "abla/tls/pure/tls12"
 
 val TLS_SERVER_WAIT_CLIENT_HELLO = 0
@@ -48,7 +50,10 @@ class TlsServerConfig(
      *  suites whose key type does not match the identity are skipped. */
     val suites12: array<int> = [TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256, TLS12_ECDHE_RSA_AES_128_GCM_SHA256,
         TLS12_ECDHE_ECDSA_AES_256_GCM_SHA384, TLS12_ECDHE_RSA_AES_256_GCM_SHA384,
-        TLS12_ECDHE_ECDSA_CHACHA20_POLY1305_SHA256, TLS12_ECDHE_RSA_CHACHA20_POLY1305_SHA256]
+        TLS12_ECDHE_ECDSA_CHACHA20_POLY1305_SHA256, TLS12_ECDHE_RSA_CHACHA20_POLY1305_SHA256],
+    /** Ticket keys: with them the server sends NewSessionTicket after a handshake and accepts tickets (TLS 1.3, psk_dhe_ke, no 0-RTT), keeping no state of its
+     *  own. null: no resumption. A server that asks for client certificates sends no tickets (a resumption would skip the client's authentication). */
+    val tickets: TlsTicketKeys? = null
 )
 
 class TlsServer(
@@ -103,7 +108,15 @@ class TlsServer(
     var warningRun: int = 0,
     /** The key exchange group that was negotiated (0 until the ServerHello is processed): the group of the key share, or of the
      *  TLS 1.2 ServerKeyExchange. */
-    var negotiatedGroup: int = 0
+    var negotiatedGroup: int = 0,
+    /** Whether this handshake resumed a session (a ticket was accepted: no certificate was sent), and the master secret kept until the client's Finished to make
+     *  the resumption master secret and the tickets (a buffer of its own; "" when no tickets are sent). */
+    var didResume: bool = false,
+    var ticketMaster: string = "",
+    /** The first ClientHello offered a PSK (after a HelloRetryRequest the second must too), and the client allowed tickets (psk_key_exchange_modes lists psk_dhe_ke). */
+    var firstOfferedPsk: bool = false,
+    var firstPskUsable: bool = false,
+    var wantTickets: bool = false
 )
 
 private fun tlsServerEmptyProtection(): TlsRecordProtection = tlsRecordProtection(TLS_AEAD_AES_128_GCM, "", "")
@@ -204,6 +217,7 @@ private fun TlsServer.queueRecord(type: int, content: string): void {
 // ---- clearing the secrets (keysched's tlsWipe): each when nothing reads it again, and all of them when the connection
 // fails or closes ----
 private fun TlsServer.wipeSecrets(): void {
+    tlsWipe(this.ticketMaster)
     tlsWipe(this.handshakeSecret)
     tlsWipe(this.clientHandshakeSecret)
     tlsWipe(this.serverHandshakeSecret)
@@ -346,6 +360,36 @@ private fun TlsServer.handleClientHello(message: string, body: string): void {
             }
         }
     }
+    // The pre_shared_key extension is checked for what it is before anything is answered, a HelloRetryRequest included (RFC 8446 section 4.2.11): the identities and binders agree in
+    // number, it is the last extension, and it comes with psk_key_exchange_modes.
+    if (hello.pskIdentities.size > 0) {
+        if (hello.pskMismatch) {
+            this.fail(TLS_ALERT_ILLEGAL_PARAMETER, "tls: the PSK identities and binders differ in number")
+            return
+        }
+        if (hello.pskNotLast) {
+            this.fail(TLS_ALERT_ILLEGAL_PARAMETER, "tls: pre_shared_key is not the last extension of the ClientHello")
+            return
+        }
+        if (hello.pskModes.size == 0) {
+            this.fail(TLS_ALERT_MISSING_EXTENSION, "tls: pre_shared_key without psk_key_exchange_modes")
+            return
+        }
+    }
+    // A second ClientHello (after a HelloRetryRequest) may drop the PSK of the first only when the suite the HelloRetryRequest chose made it unusable, and may not add one (RFC 8446
+    // section 4.1.2: the second keeps or removes what the first offered; only the binders are recomputed).
+    if (this.retried) {
+        if (hello.pskIdentities.size == 0 && this.firstPskUsable) {
+            this.fail(TLS_ALERT_MISSING_EXTENSION, "tls: the second ClientHello dropped a pre_shared_key the retry suite could still use")
+            return
+        }
+        if (hello.pskIdentities.size > 0 && !this.firstOfferedPsk) {
+            this.fail(TLS_ALERT_ILLEGAL_PARAMETER, "tls: the second ClientHello added a pre_shared_key")
+            return
+        }
+    }
+    this.wantTickets = tlsServerListHas(hello.pskModes, TLS_PSK_DHE_KE)
+    this.wantTickets = tlsServerListHas(hello.pskModes, TLS_PSK_DHE_KE)
     // The group: the server's first that the client has a share for, else retry on its first common group.
     var chosen: TlsKeyShare? = null
     var retryGroup = 0
@@ -365,7 +409,10 @@ private fun TlsServer.handleClientHello(message: string, body: string): void {
             this.fail(TLS_ALERT_HANDSHAKE_FAILURE, "tls: no key exchange group in common")
             return
         }
-        // HelloRetryRequest: the transcript restarts with a synthetic message_hash of this ClientHello.
+        // HelloRetryRequest: what the first ClientHello offered is remembered (the second may only drop a PSK this suite made unusable, not add one).
+        this.firstOfferedPsk = hello.pskIdentities.size > 0
+        this.firstPskUsable = this.anyUsablePsk(hello, suite, alpn)
+        // The transcript restarts with a synthetic message_hash of this ClientHello.
         this.clientRandom = hello.random
         this.sessionId = hello.sessionId
         this.retried = true
@@ -379,9 +426,42 @@ private fun TlsServer.handleClientHello(message: string, body: string): void {
         this.state = TLS_SERVER_WAIT_SECOND_HELLO
         return
     }
+    // A resumption (section 4.2.11): the client offered tickets (psk_dhe_ke) and one of them opens, is young enough, belongs to the same server name and
+    // ALPN protocol and the same hash, and its binder verifies over the transcript so far and the partial ClientHello (section 4.2.11.2). Anything less
+    // is a full handshake; a binder that does not verify is an error (decrypt_error).
+    var pskIndex = -1
+    var pskSecret = ""
+    if (hello.pskIdentities.size > 0) {
+        val tickets = this.config.tickets
+        if (tickets != null && !this.config.requestClientCertificate && tlsServerListHas(hello.pskModes, TLS_PSK_DHE_KE)) {
+            val partial = this.transcript.messages + message.slice(0, tlsBindersStart(message))
+            val at = tickets.now()
+            for (i in 0 until hello.pskIdentities.size) {
+                if (pskIndex < 0) {
+                    val state = tickets.open(hello.pskIdentities[i].identity)
+                    if (state.ok) {
+                        val age = at - state.issued
+                        val usable = age >= 0 && age < tickets.lifetime && state.suite == suite &&
+                            state.serverName == hello.serverName && state.alpn == alpn
+                        if (!usable) {
+                            tlsWipe(state.psk)
+                        } else if (!constantTimeEquals(tlsBinderValue(this.hash, state.psk, partial), hello.pskBinders[i])) {
+                            tlsWipe(state.psk)
+                            this.fail(TLS_ALERT_DECRYPT_ERROR, "tls: a PSK binder does not verify")
+                            return
+                        } else {
+                            pskIndex = i
+                            pskSecret = state.psk
+                        }
+                    }
+                }
+            }
+        }
+    }
     val selected = chosen ?? return
     val exchange = tlsServerExchange(selected.group, selected.publicKey, this.config.random)
     if (!exchange.ok) {
+        tlsWipe(pskSecret)
         this.fail(exchange.alert, exchange.error)
         return
     }
@@ -396,15 +476,16 @@ private fun TlsServer.handleClientHello(message: string, body: string): void {
     val serverRandom13 = this.config.random(32)
     if (serverRandom13.size != 32) {
         tlsWipe(shared)
+        tlsWipe(pskSecret)
         this.fail(TLS_ALERT_INTERNAL_ERROR, "tls: the random source failed")
         return
     }
     val serverHello = tlsBuildServerHello(serverRandom13, hello.sessionId, suite,
-        TlsKeyShare(selected.group, exchange.publicKey))
+        TlsKeyShare(selected.group, exchange.publicKey), pskIndex)
     this.transcript.add(serverHello)
     this.outbox = this.outbox + tlsPlaintextRecord(TLS_HANDSHAKE, 771, serverHello)
     this.sendCompatibilityChangeCipherSpec()
-    val early = tlsEarlySecret(this.hash, "")
+    val early = tlsEarlySecret(this.hash, pskSecret)
     val secrets = tlsDeriveHandshakeSecrets(this.hash, early, shared, this.transcript.hash(this.hash))
     this.handshakeSecret = secrets.handshakeSecret
     this.clientHandshakeSecret = secrets.clientTraffic
@@ -414,6 +495,8 @@ private fun TlsServer.handleClientHello(message: string, body: string): void {
     // The key exchange is done with: the shared secret and the early secret (the private keys were wiped in tlsServerExchange).
     tlsWipe(shared)
     tlsWipe(early)
+    tlsWipe(pskSecret)
+    this.didResume = pskIndex >= 0
     this.sendFlight(scheme)
     return
 }
@@ -430,21 +513,26 @@ private fun tlsServerRequestSchemes12(): array<int> =
 private fun TlsServer.sendFlight(scheme: int): void {
     var flight = tlsBuildEncryptedExtensions(this.negotiatedAlpn)
     this.transcript.add(flight)
-    if (this.config.requestClientCertificate) {
+    // A resumed handshake sends neither a CertificateRequest, a Certificate nor a CertificateVerify (section 2.2).
+    var certificate = ""
+    var verify = ""
+    if (this.config.requestClientCertificate && !this.didResume) {
         val request = tlsBuildCertificateRequest("", tlsServerRequestSchemes13())
         this.transcript.add(request)
         flight = flight + request
     }
-    val certificate = tlsBuildCertificate("", this.config.identity.chain)
-    this.transcript.add(certificate)
-    val content = tlsCertificateVerifyContent(true, this.transcript.hash(this.hash))
-    val signature = this.config.identity.sign(scheme, content)
-    if (signature.size == 0) {
-        this.fail(TLS_ALERT_INTERNAL_ERROR, "tls: the server certificate's key could not sign")
-        return
+    if (!this.didResume) {
+        certificate = tlsBuildCertificate("", this.config.identity.chain)
+        this.transcript.add(certificate)
+        val content = tlsCertificateVerifyContent(true, this.transcript.hash(this.hash))
+        val signature = this.config.identity.sign(scheme, content)
+        if (signature.size == 0) {
+            this.fail(TLS_ALERT_INTERNAL_ERROR, "tls: the server certificate's key could not sign")
+            return
+        }
+        verify = tlsBuildCertificateVerify(scheme, signature)
+        this.transcript.add(verify)
     }
-    val verify = tlsBuildCertificateVerify(scheme, signature)
-    this.transcript.add(verify)
     val finished = tlsHandshakeMessage(TLS_FINISHED,
         tlsFinishedVerifyData(this.hash, this.serverHandshakeSecret, this.transcript.hash(this.hash)))
     this.transcript.add(finished)
@@ -458,7 +546,8 @@ private fun TlsServer.sendFlight(scheme: int): void {
     // traffic secret and the master and exporter secrets (no resumption, no exporter here) are done with.
     tlsWipe(this.serverHandshakeSecret)
     tlsWipe(this.handshakeSecret)
-    tlsWipe(application.masterSecret)
+    // With ticket keys the master secret is kept until the client's Finished, for the resumption master secret and the tickets.
+    if (this.config.tickets != null && !this.config.requestClientCertificate && this.wantTickets) this.ticketMaster = application.masterSecret else tlsWipe(application.masterSecret)
     tlsWipe(application.exporter)
     this.setKeys(application.serverTraffic, true)
     this.state = if (this.config.requestClientCertificate) TLS_SERVER_WAIT_CERTIFICATE else TLS_SERVER_WAIT_FINISHED
@@ -534,6 +623,7 @@ private fun TlsServer.handleClientFinished(message: string, body: string): void 
     this.setKeys(this.clientApplicationSecret, false)
     tlsWipe(this.clientHandshakeSecret)
     this.state = TLS_SERVER_CONNECTED
+    this.sendTickets()
     return
 }
 
@@ -1119,4 +1209,51 @@ private fun TlsServer.send12(data: string): bool {
         offset = end
     }
     this.state == TLS_SERVER_CONNECTED
+}
+
+/** After the client's Finished (section 4.6.1): the resumption master secret, and `tickets.count` NewSessionTickets under the application keys, each with
+ *  its own nonce and the PSK it gives. Only a server with ticket keys, for a connection that sent no CertificateRequest. */
+private fun TlsServer.sendTickets(): void {
+    val tickets = this.config.tickets
+    if (tickets == null || this.ticketMaster.size == 0) return
+    val resumption = tlsResumptionMasterSecret(this.hash, this.ticketMaster, this.transcript.hash(this.hash))
+    tlsWipe(this.ticketMaster)
+    this.ticketMaster = ""
+    for (i in 0 until tickets.count) {
+        val nonce = tlsU8(i)
+        val psk = tlsResumptionPsk(this.hash, resumption, nonce)
+        val ageBytes = this.config.random(4)
+        if (psk.size > 0 && ageBytes.size == 4) {
+            val ageAdd = ageBytes[0] * 16777216 + ageBytes[1] * 65536 + ageBytes[2] * 256 + ageBytes[3]
+            val ticket = tickets.seal(this.suite, ageAdd, psk, this.negotiatedAlpn, this.serverName)
+            if (ticket.size > 0) {
+                this.queueRecord(TLS_HANDSHAKE, tlsHandshakeMessage(TLS_NEW_SESSION_TICKET,
+                    tlsU32(tickets.lifetime) + tlsU32(ageAdd) + tlsVec8(nonce) + tlsVec16(ticket) + tlsVec16("")))
+            }
+        }
+        tlsWipe(psk)
+    }
+    tlsWipe(resumption)
+    return
+}
+
+/** Whether this handshake resumed a session: the client's ticket was accepted (no certificate was sent). */
+fun TlsServer.resumed(): bool = this.didResume
+
+/** Whether any identity of `hello` opens to a ticket this connection could resume with under `suite` and `alpn`: the resumption's own checks (age, suite, server name, ALPN) without the binder.
+ *  Taken at a HelloRetryRequest, to tell a second ClientHello that drops a PSK the retry suite made unusable (allowed) from one that drops a usable PSK (RFC 8446 section 4.1.2). */
+private fun TlsServer.anyUsablePsk(hello: TlsClientHello, suite: int, alpn: string): bool {
+    val tickets = this.config.tickets ?? return false
+    if (this.config.requestClientCertificate || !tlsServerListHas(hello.pskModes, TLS_PSK_DHE_KE)) return false
+    val at = tickets.now()
+    for (i in 0 until hello.pskIdentities.size) {
+        val state = tickets.open(hello.pskIdentities[i].identity)
+        if (state.ok) {
+            val age = at - state.issued
+            val usable = age >= 0 && age < tickets.lifetime && state.suite == suite && state.serverName == hello.serverName && state.alpn == alpn
+            tlsWipe(state.psk)
+            if (usable) return true
+        }
+    }
+    false
 }

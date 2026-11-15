@@ -326,6 +326,39 @@ answer=$(s_tls=-tls1_2 s_client -CAfile "$out/ed25519.pem")
 [[ $answer != *'pure server'* ]] || { echo "tls-pure server TLS 1.2: a client with no certificate was served: [$answer]" >&2; exit 1; }
 stop_serve
 echo "pure server: $served12 openssl s_client -tls1_2 handshakes (4 key kinds x 3 suites x 2 groups, Ed25519 also P-384 ECDHE) and a required client certificate"
+# Session resumption, our server (ticket keys, two tickets per connection) with openssl s_client: -sess_out keeps the ticket of one connection,
+# -sess_in resumes it (s_client says "Reused", and the server's answer says resumed=true); a second resumption from the new ticket of the first.
+start_serve tickets "$out/ed25519.pem" "$out/ed25519.key"
+resume_client() {   # the s_client options: prints what the server answered; s_client's own report is in s_client.out
+    printf 'GET /pure HTTP/1.0\r\n\r\n' | timeout 15 openssl s_client -connect "[::1]:$serve_port" -tls1_3 -ign_eof -servername localhost -CAfile "$out/ed25519.pem" -verify_return_error "$@" > "$out/s_client.out" 2> "$out/s_client.err" || true
+    sed -n 's/^pure server: //p' "$out/s_client.out"
+}
+answer=$(resume_client -sess_out "$out/session.pem")
+[[ $answer == *'resumed=false'* ]] || { echo "tls-pure server resumption: the first connection: [$answer] $(head -3 "$out/s_client.err")" >&2; exit 1; }
+[[ -s $out/session.pem ]] || { echo "tls-pure server resumption: s_client kept no session (no ticket arrived)" >&2; exit 1; }
+for round in 1 2; do
+    answer=$(resume_client -sess_in "$out/session.pem" -sess_out "$out/session.pem")
+    [[ $answer == *'resumed=true'* && $(grep -c 'Reused, TLSv1.3' "$out/s_client.out") -ge 1 ]] ||
+        { echo "tls-pure server resumption: round $round did not resume: [$answer] $(head -3 "$out/s_client.err")" >&2; sed -n 1,20p "$out/s_client.out" >&2; exit 1; }
+done
+stop_serve
+echo "pure server: session resumption with openssl s_client -sess_out/-sess_in, twice"
+# And the pure client resuming from openssl s_server's tickets, blocking and through abla/http/async (tests/cases/tls-pure/resume-net.ab).
+"$compiler" build tests/cases/tls-pure/resume-net.ab -o "$out/resume-net" --no-cache
+for mode in blocking async; do
+    OPENSSL_SERVER_DIR="${server_directory:-.}" openssl_server_start "$out/server.log" "0" -cert "$root/$out/ed25519.pem" -key "$root/$out/ed25519.key" -tls1_3 -www -num_tickets 2 ||
+        { echo "tls-pure resumption: s_server did not start" >&2; exit 1; }
+    result=$("$root/tools/run-limited.sh" "$out/resume-net" "$openssl_server_port" "$out/ed25519.pem" "$mode") || { echo "tls-pure resume-net ($mode): $result" >&2; kill "$openssl_server_pid" 2> /dev/null; exit 1; }
+    [[ $result == 'tls-pure resume-net ok' ]] || { echo "tls-pure resume-net ($mode): $result" >&2; kill "$openssl_server_pid" 2> /dev/null; exit 1; }
+    kill "$openssl_server_pid" 2> /dev/null || true
+    wait "$openssl_server_pid" 2> /dev/null || true
+done
+echo "pure client: session resumption from s_server's tickets, blocking and through abla/http/async"
+# The in-process resumption tests (tests/cases/tls-pure/resume.ab): tickets, expiry, rotation, HelloRetryRequest with a PSK, binders, wipes.
+"$compiler" build tests/cases/tls-pure/resume.ab -o "$out/resume" --no-cache
+result=$("$root/tools/run-limited.sh" "$out/resume" "$out") || { echo "tls-pure resume (in process): $result" >&2; exit 1; }
+[[ $result == 'tls-pure resume ok' ]] || { echo "tls-pure resume (in process): $result" >&2; exit 1; }
+echo "$result"
 start_serve alpn "$out/ed25519.pem" "$out/ed25519.key"
 answer=$(s_client -CAfile "$out/ed25519.pem" -alpn http/1.1,h2)
 [[ $answer == *'alpn=h2'* ]] || { echo "tls-pure server ALPN: [$answer] $(head -3 "$out/s_client.err")" >&2; exit 1; }

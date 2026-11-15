@@ -34,7 +34,10 @@ val TLS_EXT_SERVER_NAME = 0
 val TLS_EXT_SUPPORTED_GROUPS = 10
 val TLS_EXT_SIGNATURE_ALGORITHMS = 13
 val TLS_EXT_ALPN = 16
+val TLS_EXT_PRE_SHARED_KEY = 41
 val TLS_EXT_PSK_KEY_EXCHANGE_MODES = 45
+/** psk_dhe_ke (RFC 8446 section 4.2.9): the only PSK key exchange mode this stack uses. */
+val TLS_PSK_DHE_KE = 1
 val TLS_EXT_SUPPORTED_VERSIONS = 43
 val TLS_EXT_COOKIE = 44
 val TLS_EXT_KEY_SHARE = 51
@@ -231,7 +234,8 @@ fun tlsIsDnsName(host: string): bool {
  *  compatibility mode (RFC 8446 appendix D.4) or empty; `cookie` repeats a HelloRetryRequest's cookie. */
 fun tlsBuildClientHello(random: string, sessionId: string, suites: array<int>, host: string,
     groups: array<int>, shares: array<TlsKeyShare>, signatureAlgorithms: array<int>,
-    alpn: array<string>, cookie: string, tls12Suites: array<int> = [], fallbackScsv: bool = false): string {
+    alpn: array<string>, cookie: string, tls12Suites: array<int> = [], fallbackScsv: bool = false,
+    pskOffers: array<TlsPskIdentity> = [], pskBinderLength: int = 0, ticketsWanted: bool = false): string {
     var suiteBytes = ""
     for (suite in suites) suiteBytes = suiteBytes + tlsU16(suite)
     // TLS 1.2 offers: its suites, the versions list, ec_point_formats, extended_master_secret, renegotiation_info.
@@ -263,6 +267,21 @@ fun tlsBuildClientHello(random: string, sessionId: string, suites: array<int>, h
         extensions = extensions + tlsExtension(TLS_EXT_ALPN, tlsVec16(names))
     }
     if (cookie.size > 0) extensions = extensions + tlsExtension(TLS_EXT_COOKIE, tlsVec16(cookie))
+    // A PSK offer (RFC 8446 section 4.2.11): the modes (psk_dhe_ke only) and, last of all the extensions, the identities with binders of zeros that the
+    // caller fills (tlsReplaceBinders) once the partial ClientHello is hashed.
+    // A client that wants tickets sends the modes even with no PSK to offer: a server sends NewSessionTicket only to a client that did (section 4.2.9).
+    if (pskOffers.size > 0 || ticketsWanted) {
+        extensions = extensions + tlsExtension(TLS_EXT_PSK_KEY_EXCHANGE_MODES, tlsVec8(tlsU8(TLS_PSK_DHE_KE)))
+    }
+    if (pskOffers.size > 0) {
+        var identityBytes = ""
+        var binderBytes = ""
+        for (offer in pskOffers) {
+            identityBytes = identityBytes + tlsVec16(offer.identity) + tlsU32(offer.obfuscatedAge)
+            binderBytes = binderBytes + tlsVec8("\x00".repeat(pskBinderLength))
+        }
+        extensions = extensions + tlsExtension(TLS_EXT_PRE_SHARED_KEY, tlsVec16(identityBytes) + tlsVec16(binderBytes))
+    }
     val body = tlsU16(771) + random + tlsVec8(sessionId) + tlsVec16(suiteBytes) + tlsVec8(tlsU8(0)) +
         tlsVec16(extensions)
     tlsHandshakeMessage(TLS_CLIENT_HELLO, body)
@@ -290,7 +309,9 @@ class TlsServerHello(val ok: bool, val error: string, val random: string, val se
     val shareKey: string, val cookie: string,
     /** The first extension that a ServerHello (supported_versions, key_share) or a HelloRetryRequest (and cookie) may
      *  not carry (RFC 8446 section 4.2), or -1. */
-    val unlisted: int = -1)
+    val unlisted: int = -1,
+    /** The pre_shared_key extension of a ServerHello: the index of the identity the server selected (RFC 8446 section 4.2.11), or -1. */
+    val pskSelected: int = -1)
 
 private fun tlsBadServerHello(error: string): TlsServerHello =
     TlsServerHello(false, error, "", "", 0, false, 0, 0, "", "")
@@ -335,8 +356,15 @@ fun tlsParseServerHello(body: string): TlsServerHello {
         if (!cookieReader.finished() || cookie.size == 0) return tlsBadServerHello("tls: malformed cookie")
     }
     val unlisted = tlsFirstUnlisted(extensions.list, if (retry) [TLS_EXT_SUPPORTED_VERSIONS, TLS_EXT_KEY_SHARE, TLS_EXT_COOKIE]
-        else [TLS_EXT_SUPPORTED_VERSIONS, TLS_EXT_KEY_SHARE])
-    TlsServerHello(true, "", random, sessionId, suite, retry, version, group, key, cookie, unlisted)
+        else [TLS_EXT_SUPPORTED_VERSIONS, TLS_EXT_KEY_SHARE, TLS_EXT_PRE_SHARED_KEY])
+    var pskSelected = -1
+    val pskExtension = tlsFindExtension(extensions.list, TLS_EXT_PRE_SHARED_KEY)
+    if (pskExtension != null) {
+        val pskReader = tlsReader(pskExtension.data)
+        pskSelected = pskReader.u16()
+        if (!pskReader.finished() || retry) return tlsBadServerHello("tls: malformed pre_shared_key")
+    }
+    TlsServerHello(true, "", random, sessionId, suite, retry, version, group, key, cookie, unlisted, pskSelected)
 }
 
 // ---- the encrypted flight ----
@@ -436,6 +464,7 @@ fun tlsPatchClientHello(first: string, share: TlsKeyShare, cookie: string): stri
     val extensions = tlsParseExtensions(reader)
     if (!reader.finished() || !extensions.ok) return ""
     var rebuilt = ""
+    var pskExtension = ""
     var replaced = false
     for (extension in extensions.list) {
         if (extension.type == TLS_EXT_KEY_SHARE) {
@@ -443,12 +472,16 @@ fun tlsPatchClientHello(first: string, share: TlsKeyShare, cookie: string): stri
             rebuilt = rebuilt + (if (share.group == 0) tlsExtension(extension.type, extension.data)
                 else tlsExtension(TLS_EXT_KEY_SHARE, tlsVec16(tlsU16(share.group) + tlsVec16(share.publicKey))))
             replaced = true
+        } else if (extension.type == TLS_EXT_PRE_SHARED_KEY) {
+            // The PSK extension stays last, after the cookie (RFC 8446 section 4.2.11); its binders are the caller's to recompute (tlsReplaceBinders).
+            pskExtension = tlsExtension(extension.type, extension.data)
         } else if (extension.type != TLS_EXT_COOKIE) {
             rebuilt = rebuilt + tlsExtension(extension.type, extension.data)
         }
     }
     if (!replaced) return ""
     if (cookie.size > 0) rebuilt = rebuilt + tlsExtension(TLS_EXT_COOKIE, tlsVec16(cookie))
+    rebuilt = rebuilt + pskExtension
     tlsHandshakeMessage(TLS_CLIENT_HELLO, tlsU16(version) + random + tlsVec8(sessionId) + tlsVec16(suites) +
         tlsVec8(compression) + tlsVec16(rebuilt))
 }
@@ -532,7 +565,16 @@ class TlsClientHello(val ok: bool, val error: string, val random: string, val se
      *  TLS_EMPTY_RENEGOTIATION_INFO_SCSV (0x00FF) was (RFC 5746). */
     val legacyVersion: int = 0, val extendedMasterSecret: bool = false, val secureRenegotiation: bool = false,
     /** Whether the key_share extension was present at all (an empty list is a request for a HelloRetryRequest). */
-    val hasKeyShare: bool = false, val compression: string = "\x00")
+    val hasKeyShare: bool = false, val compression: string = "\x00",
+    /** psk_key_exchange_modes, the pre_shared_key identities and binders (RFC 8446 section 4.2.11), where the binders list starts in the body (the
+     *  partial ClientHello of section 4.2.11.2 is the message without it), and whether the extension was not the last one (an error). */
+    val pskModes: array<int> = [], val pskIdentities: array<TlsPskIdentity> = [], val pskBinders: array<string> = [],
+    val pskBindersStart: int = -1, val pskNotLast: bool = false,
+    /** The identities and binders lists differ in length (RFC 8446 section 4.2.11: illegal_parameter). */
+    val pskMismatch: bool = false)
+
+/** One identity of a pre_shared_key offer: the ticket and the client's obfuscated ticket age. */
+class TlsPskIdentity(val identity: string, val obfuscatedAge: int)
 
 private fun tlsBadClientHello(error: string): TlsClientHello {
     val none: array<int> = []
@@ -565,6 +607,13 @@ fun tlsParseClientHello(body: string): TlsClientHello {
     var serverName = ""
     var cookie = ""
     var ems = false
+    val pskModes: array<int> = []
+    val pskIdentities: array<TlsPskIdentity> = []
+    val pskBinders: array<string> = []
+    var pskBindersStart = -1
+    var pskNotLast = false
+    var pskMismatch = false
+    var extensionIndex = 0
     var hasKeyShare = false
     var renegotiation = false
     for (suite in suites) {
@@ -572,6 +621,7 @@ fun tlsParseClientHello(body: string): TlsClientHello {
     }
     for (extension in extensions.list) {
         val data = tlsReader(extension.data)
+        extensionIndex = extensionIndex + 1
         if (extension.type == 23) ems = true
         if (extension.type == 65281) renegotiation = true
         if (extension.type == TLS_EXT_SUPPORTED_VERSIONS) {
@@ -620,20 +670,44 @@ fun tlsParseClientHello(body: string): TlsClientHello {
                 alpn.append(name)
             }
             if (!data.finished() || !list.finished()) return tlsBadClientHello("tls: malformed ALPN")
+        } else if (extension.type == TLS_EXT_PSK_KEY_EXCHANGE_MODES) {
+            val list = tlsReader(data.vec8())
+            while (list.remaining() > 0 && list.ok) pskModes.append(list.u8())
+            if (!data.finished() || !list.finished() || pskModes.size == 0) return tlsBadClientHello("tls: malformed psk_key_exchange_modes")
+        } else if (extension.type == TLS_EXT_PRE_SHARED_KEY) {
+            if (extensionIndex != extensions.list.size) pskNotLast = true
+            val identities = tlsReader(data.vec16())
+            while (identities.remaining() > 0 && identities.ok) {
+                val identity = identities.vec16()
+                // identity<1..2^16-1> (RFC 8446 section 4.2.11): an empty one is a decode error.
+                if (identity.size == 0) return tlsBadClientHello("tls: an empty PSK identity")
+                val age = identities.u32()
+                pskIdentities.append(TlsPskIdentity(identity, age))
+            }
+            // The binders list starts where its 2-byte length starts: at the end of the extension, which is the end of the body.
+            val bindersLength = data.remaining()
+            val bindersList = tlsReader(data.vec16())
+            while (bindersList.remaining() > 0 && bindersList.ok) pskBinders.append(bindersList.vec8())
+            // (PskBinderEntry is <32..255> in RFC 8446 section 4.2.11, but a shorter binder is refused by the binder check as decrypt_error, as BoringSSL's BoGo tests Resume-Server-BinderWrongLength expect: the connection ends either way.)
+            if (!data.finished() || !identities.finished() || !bindersList.finished() || pskIdentities.size == 0 ||
+                pskBinders.size == 0) return tlsBadClientHello("tls: malformed pre_shared_key")
+            if (pskIdentities.size != pskBinders.size) pskMismatch = true
+            pskBindersStart = body.size - bindersLength
         } else if (extension.type == TLS_EXT_COOKIE) {
             cookie = data.vec16()
             if (!data.finished()) return tlsBadClientHello("tls: malformed cookie")
         }
     }
     TlsClientHello(true, "", random, sessionId, suites, versions, groups, shares, schemes, alpn, serverName, cookie,
-        legacyVersion, ems, renegotiation, hasKeyShare, compression)
+        legacyVersion, ems, renegotiation, hasKeyShare, compression, pskModes, pskIdentities, pskBinders, pskBindersStart, pskNotLast, pskMismatch)
 }
 
 /** A ServerHello message: the echo of the session id, the suite, and the server's key share. */
-fun tlsBuildServerHello(random: string, sessionId: string, suite: int, share: TlsKeyShare): string =
+fun tlsBuildServerHello(random: string, sessionId: string, suite: int, share: TlsKeyShare, pskSelected: int = -1): string =
     tlsHandshakeMessage(TLS_SERVER_HELLO, tlsU16(771) + random + tlsVec8(sessionId) + tlsU16(suite) + tlsU8(0) +
         tlsVec16(tlsExtension(TLS_EXT_SUPPORTED_VERSIONS, tlsU16(772)) +
-        tlsExtension(TLS_EXT_KEY_SHARE, tlsU16(share.group) + tlsVec16(share.publicKey))))
+        tlsExtension(TLS_EXT_KEY_SHARE, tlsU16(share.group) + tlsVec16(share.publicKey)) +
+        (if (pskSelected >= 0) tlsExtension(TLS_EXT_PRE_SHARED_KEY, tlsU16(pskSelected)) else "")))
 
 /** A HelloRetryRequest: the special random, the suite, the group to retry with (and a cookie, if any). */
 fun tlsBuildHelloRetryRequest(sessionId: string, suite: int, group: int, cookie: string): string {
@@ -737,3 +811,42 @@ fun TlsVerdict.accepted(): bool = this.text.size == 0
 /** True for the signature schemes of an ECDSA or Ed25519 key (the ECDHE_ECDSA suites of TLS 1.2), false for RSA's. */
 fun tlsSchemeIsEcKey(scheme: int): bool = scheme == TLS_SIG_ECDSA_SECP256R1_SHA256 ||
     scheme == TLS_SIG_ECDSA_SECP384R1_SHA384 || scheme == 1539 || scheme == TLS_SIG_ED25519
+
+// ---- pre-shared key binders (RFC 8446 section 4.2.11.2) ----
+/** Where the binders list starts in the ClientHello `message` (header included): the partial ClientHello is `message` up to here. -1 if the
+ *  message offers no pre_shared_key or does not parse. */
+fun tlsBindersStart(message: string): int {
+    if (message.size < 4) return -1
+    val hello = tlsParseClientHello(message.slice(4, message.size))
+    if (!hello.ok || hello.pskBindersStart < 0) return -1
+    hello.pskBindersStart + 4
+}
+
+/** `message` with its binders replaced by `binders` (the same sizes: the message keeps its length). */
+fun tlsReplaceBinders(message: string, binders: array<string>): string {
+    val start = tlsBindersStart(message)
+    if (start < 0) return ""
+    var list = ""
+    for (binder in binders) list = list + tlsVec8(binder)
+    val replaced = message.slice(0, start) + tlsVec16(list)
+    if (replaced.size != message.size) return ""
+    replaced
+}
+
+/** `message` (a ClientHello) without its pre_shared_key extension (the psk_key_exchange_modes stay, so the server may still send tickets). */
+fun tlsDropPsk(message: string): string {
+    if (message.size < 4) return ""
+    val reader = tlsReader(message.slice(4, message.size))
+    val version = reader.u16()
+    val random = reader.bytes(32)
+    val sessionId = reader.vec8()
+    val suites = reader.vec16()
+    val compression = reader.vec8()
+    val extensions = tlsParseExtensions(reader)
+    if (!reader.finished() || !extensions.ok) return ""
+    var rebuilt = ""
+    for (extension in extensions.list) {
+        if (extension.type != TLS_EXT_PRE_SHARED_KEY) rebuilt = rebuilt + tlsExtension(extension.type, extension.data)
+    }
+    tlsHandshakeMessage(TLS_CLIENT_HELLO, tlsU16(version) + random + tlsVec8(sessionId) + tlsVec16(suites) + tlsVec8(compression) + tlsVec16(rebuilt))
+}

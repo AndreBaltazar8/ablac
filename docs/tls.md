@@ -33,8 +33,8 @@ connection starts.
 
 CBC suites, RSA key exchange, static or finite-field Diffie-Hellman, RC4, 3DES and every non-AEAD cipher; SSL 3.0, TLS
 1.0 and 1.1; renegotiation (a HelloRequest after the handshake ends the connection); compression; a TLS 1.2 peer that
-does not support the extended master secret (RFC 7627) or secure renegotiation info; 0-RTT early data; session
-resumption and tickets (the server sends none, the client ignores them); a certificate that matches the host only by
+does not support the extended master secret (RFC 7627) or secure renegotiation info;
+TLS 1.2 session resumption (ids or tickets); 0-RTT early data; a certificate that matches the host only by
 its Common Name (a subjectAltName is required, RFC 6125);
 RSA keys under 2048 bits for PSS verification.
 
@@ -103,6 +103,28 @@ client refuses a ServerKeyExchange for it. P-384 works as an ECDHE group in both
 RFC 6979 nonces: `p384EcdsaSign`; a server identity can be a P-384 key, in PKCS#8, SEC1 or PKCS#12). In TLS 1.2 the group list also names the curves of
 the certificates a client accepts (RFC 8422 section 5.1.1): a client refuses an EC certificate whose curve it did not list (`bad_certificate`), and a
 server with a P-256 or P-384 key does not serve a TLS 1.2 client that lists no such curve (`handshake_failure`); TLS 1.3 has no such rule.
+
+## Session resumption (TLS 1.3 tickets)
+
+PSK resumption with tickets, `psk_dhe_ke` only (a fresh key exchange every time, so a resumed session keeps forward secrecy), no 0-RTT early data
+(RFC 8446 sections 2.2, 4.2.11 and 4.6.1). A resumed handshake sends no Certificate: it saves the signature, the chain and its verification.
+
+- **Server:** give `TlsServerConfig.tickets` a `tlsTicketKeysNew(random, now, lifetime, count, rotateAfter)` (`abla/tls/pure/resume`). The server keeps no state:
+  a NewSessionTicket carries the session's PSK sealed under a ticket key (AES-256-GCM, the key's name as associated data), with the suite, the time it was
+  issued, the ticket_age_add, the ALPN protocol and the server name. A ticket resumes only for the same server name, ALPN protocol and cipher suite, and while it is
+  younger than `lifetime` (at most 7 days); a binder that does not verify is `decrypt_error`; a ticket that does not open or does not fit is a full handshake.
+  `keys.rotate()` makes a new current key (the old one keeps opening its tickets until they expire; `rotateAfter` does it by itself); `keys.wipe()` wipes them.
+  A server that asks for client certificates sends and accepts no tickets. Anti-replay is not needed without 0-RTT.
+- **Client:** keep a `tlsSessionCacheNew(now, capacity)` between connections and give it to the configuration with `tlsClientConfigWithSessions(config, cache, scope)`; `scope` names what authenticates the server (a resumption skips the Certificate, RFC 8446 section 4.6.1, so a ticket is kept and offered only under the scope it was obtained under: `tlsX509Scope(store)` for `tlsX509Verifier(store, now)`; abla/tls/pure derives it from the verify mode and trust file in its own functions; an empty scope keeps and offers none, so a connection that verified nothing leaves no ticket, and `peerVerified()` of a resumed connection is true) (`tlsConnectWithSessions(host, cache)`,
+  `tlsUpgradeWithSessions`, `tlsSessionClient`, and `HttpAsyncOptions.sessions` for `abla/http/async`, whose connections then share it). A new connection to
+  a host that has a ticket takes it out of the cache (a ticket is used once) and offers it with its binder, again after a HelloRetryRequest; the tickets a
+  server sends go in. A ticket is chosen by host and ALPN protocol; `connection.resumed()` says whether the server took it.
+- **Secrets:** tickets, PSKs and ticket keys are buffers of their own and follow the wipe rule of `abla/crypto` (below): wiped when used up, expired, replaced or
+  cleared (`cache.clear()`). Time comes from the `now` function you give, in seconds.
+- **TLS 1.2** has no resumption here (neither session ids nor RFC 5077 tickets): every TLS 1.2 connection is a full handshake.
+
+Tested against BoGo's resumption tests (about 45 of them run and pass), `openssl s_client -sess_out/-sess_in` against the pure server and the pure client
+against `openssl s_server` tickets, and `abla/http/async` reusing a session across connections (`tools/test-tls-pure-interop.sh`).
 
 ## Secrets in memory
 

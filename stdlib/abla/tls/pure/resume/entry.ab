@@ -1,0 +1,245 @@
+// TLS 1.3 session resumption (RFC 8446 sections 2.2, 4.2.11 and 4.6.1) for abla/tls/pure: PSK with tickets, psk_dhe_ke only, no 0-RTT.
+//
+// The server's side is stateless: a NewSessionTicket carries the session's PSK sealed under a ticket key (AES-256-GCM, the key's name as associated
+// data), so a server remembers nothing but its keys (`TlsTicketKeys`: the current key seals, the retired ones open until the last ticket they sealed has
+// expired; `rotate` makes a new current key, and `rotateAfter` does it by itself). A ticket holds the suite, when it was issued, the ticket_age_add, the PSK, the
+// ALPN protocol and the server name of the session: a resumption needs the same server name and the same hash, and its ticket must be younger than `lifetime`
+// (at most seven days, section 4.6.1). Anti-replay is not needed without 0-RTT.
+// The client's side is a `TlsSessionCache` the caller owns (and keeps between connections): a ticket goes in when a connection receives it, and comes out
+// when a new connection to the same host (and ALPN) takes it: a ticket is used once (appendix C.4). Ticket, PSK and ticket keys are secrets: each is a
+// buffer of its own (cryptoOwnedCopy), wiped when it is used up, expired or its owner cleared (the rule written above cryptoOwnedCopy).
+// Time comes from a `now` function in seconds, which the caller gives: nothing here reads a clock.
+
+import "abla/array"
+import "abla/crypto"
+import "abla/crypto/aes"
+import "abla/crypto/result"
+import "abla/tls/pure/handshake"
+import "abla/tls/pure/keysched"
+
+/** The longest a ticket may live (RFC 8446 section 4.6.1: seven days). */
+val TLS_TICKET_MAXIMUM_LIFETIME = 604800
+
+// ---- the server: ticket keys and tickets ----
+// (Both handles below are records of functions over state they keep: a server's configuration holds them read-only and many connections use them.)
+
+/** One ticket key: its name (16 random bytes, sent in the clear in every ticket it seals), the AES-256 key, when it was made and, once replaced, when. */
+class TlsTicketKey(val name: string, val key: string, val created: int, val retired: int)
+
+private class TlsTicketStore(var keys: array<TlsTicketKey>)
+
+/** What a ticket holds. */
+class TlsTicketState(val ok: bool, val suite: int, val issued: int, val ageAdd: int, val psk: string, val alpn: string, val serverName: string)
+
+/** A server's ticket keys. `seal` makes the ticket for a session (suite, ticket_age_add, PSK, ALPN protocol, server name); `open` gives back what a ticket holds
+ *  (a failed state for a ticket that is not ours, not authentic or malformed; the PSK of a good state is a buffer of its own for the caller to wipe);
+ *  `rotate` makes a new current key (the old one stays to open the tickets it sealed, until they expire); `wipe` wipes every key; `now` is the clock the keys
+ *  were made with. `lifetime` is the ticket_lifetime in seconds (at most 604800) and `count` the tickets sent per connection. */
+class TlsTicketKeys(val seal: (int, int, string, string, string) -> string, val open: (string) -> TlsTicketState, val rotate: () -> bool,
+    val wipe: () -> void, val now: () -> int, val lifetime: int, val count: int)
+
+private fun tlsNewTicketKey(random: (int) -> string, now: int): TlsTicketKey? {
+    val name = random(16)
+    val key = random(32)
+    if (name.size != 16 || key.size != 32) return null
+    TlsTicketKey(cryptoOwnedCopy(name), cryptoOwnedCopy(key), now, 0)
+}
+
+private fun tlsNoTicket(): TlsTicketState = TlsTicketState(false, 0, 0, 0, "", "", "")
+
+/** Drops (and wipes) the retired keys whose tickets have all expired. */
+private fun tlsExpireTicketKeys(var store: TlsTicketStore, now: () -> int, lifetime: int): void {
+    val at = now()
+    val kept: array<TlsTicketKey> = []
+    for (key in store.keys) {
+        if (key.retired != 0 && at > key.retired + lifetime) tlsWipe(key.key) else kept.append(key)
+    }
+    store.keys = kept
+    return
+}
+
+private fun tlsRotateTicketKeys(var store: TlsTicketStore, random: (int) -> string, now: () -> int, lifetime: int): bool {
+    val at = now()
+    val fresh = tlsNewTicketKey(random, at)
+    if (fresh == null) return false
+    val ordered: array<TlsTicketKey> = [fresh]
+    for (key in store.keys) ordered.append(if (key.retired == 0) TlsTicketKey(key.name, key.key, key.created, at) else key)
+    store.keys = ordered
+    tlsExpireTicketKeys(store, now, lifetime)
+    true
+}
+
+private fun tlsSealTicket(var store: TlsTicketStore, random: (int) -> string, now: () -> int, lifetime: int, rotateAfter: int,
+    suite: int, ageAdd: int, psk: string, alpn: string, serverName: string): string {
+    if (rotateAfter > 0 && store.keys.size > 0 && now() - store.keys[0].created >= rotateAfter) tlsRotateTicketKeys(store, random, now, lifetime)
+    tlsExpireTicketKeys(store, now, lifetime)
+    if (store.keys.size == 0 || store.keys[0].retired != 0) {
+        if (!tlsRotateTicketKeys(store, random, now, lifetime)) return ""
+    }
+    val keyBytes = store.keys[0].key
+    val keyName = store.keys[0].name
+    val nonce = random(12)
+    if (nonce.size != 12) return ""
+    val issued = now()
+    // The plaintext is one buffer of its own (not a rope over the PSK), wiped once it is sealed.
+    val pskPart = tlsVec8(psk)
+    val parts = [tlsU8(1), tlsU16(suite), tlsU32(issued >> 32), tlsU32(issued & 4294967295), tlsU32(ageAdd), pskPart, tlsVec8(alpn), tlsVec8(serverName)]
+    var total = 0
+    for (part in parts) total = total + part.size
+    val plain = cryptoOwnedJoin(parts, total)
+    val sealed = aesGcmEncrypt(keyBytes, nonce, plain, keyName)
+    cryptoWipeString(plain)
+    cryptoWipeString(pskPart)
+    if (!sealed.ok) return ""
+    keyName + nonce + sealed.bytes
+}
+
+private fun tlsOpenTicket(store: TlsTicketStore, ticket: string): TlsTicketState {
+    if (ticket.size < 16 + 12 + 16 + 16) return tlsNoTicket()
+    val name = ticket.slice(0, 16)
+    var index = -1
+    for (i in 0 until store.keys.size) {
+        if (index < 0 && constantTimeEquals(store.keys[i].name, name)) index = i
+    }
+    if (index < 0) return tlsNoTicket()
+    val keyBytes = store.keys[index].key
+    val opened = aesGcmDecrypt(keyBytes, ticket.slice(16, 28), ticket.slice(28, ticket.size), name)
+    if (!opened.ok) return tlsNoTicket()
+    val reader = tlsReader(opened.bytes)
+    val version = reader.u8()
+    val suite = reader.u16()
+    val high = reader.u32()
+    val low = reader.u32()
+    val ageAdd = reader.u32()
+    val psk = cryptoOwnedCopy(reader.vec8())
+    // (Slices of the plaintext die with its wipe: the strings that outlive it are copies.)
+    val alpn = cryptoOwnedCopy(reader.vec8())
+    val serverName = cryptoOwnedCopy(reader.vec8())
+    val good = version == 1 && reader.finished() && psk.size > 0
+    cryptoWipeString(opened.bytes)
+    if (!good) {
+        cryptoWipeString(psk)
+        return tlsNoTicket()
+    }
+    TlsTicketState(true, suite, high * 4294967296 + low, ageAdd, psk, alpn, serverName)
+}
+
+/** Ticket keys with one current key. `random` is the source (fresh bytes each call), `now` the clock in seconds, `lifetime` the ticket_lifetime
+ *  (capped at seven days), `count` the tickets sent per connection, `rotateAfter` the age in seconds after which the current key is replaced when a
+ *  ticket is next sealed (0: only `rotate` does it). */
+fun tlsTicketKeysNew(random: (int) -> string, now: () -> int, lifetime: int = 7200, count: int = 1, rotateAfter: int = 0): TlsTicketKeys {
+    val store = TlsTicketStore([])
+    val first = tlsNewTicketKey(random, now())
+    if (first != null) store.keys = [first]
+    val bounded = if (lifetime < 1) 1 else if (lifetime > TLS_TICKET_MAXIMUM_LIFETIME) TLS_TICKET_MAXIMUM_LIFETIME else lifetime
+    TlsTicketKeys(
+        { suite: int, ageAdd: int, psk: string, alpn: string, serverName: string ->
+            tlsSealTicket(store, random, now, bounded, rotateAfter, suite, ageAdd, psk, alpn, serverName)
+        },
+        { ticket: string -> tlsOpenTicket(store, ticket) },
+        { tlsRotateTicketKeys(store, random, now, bounded) },
+        { tlsWipeTicketKeys(store) },
+        now, bounded, if (count < 1) 1 else if (count > 8) 8 else count)
+}
+
+// ---- the client: a cache of tickets ----
+/** A ticket a client has received: the host and ALPN protocol of the connection, the suite, the ticket (the identity to offer), the PSK, the ticket_age_add,
+ *  the lifetime the server gave (capped at seven days) and when it arrived. */
+class TlsStoredTicket(val host: string, val alpn: string, val suite: int, val ticket: string, val psk: string, val ageAdd: int,
+    val lifetime: int, val received: int, val scope: string = "")
+
+private class TlsCacheStore(var entries: array<TlsStoredTicket>)
+
+/** The caller's cache of tickets, for any number of connections (give it to each `TlsClientConfig.sessions`). `put` keeps a ticket a connection to `host` (with ALPN protocol
+ *  `alpn`, "" for none) received: ticket and PSK are copied into buffers of their own, the arguments are not touched, a lifetime of zero keeps nothing, and the oldest ticket
+ *  goes when `capacity` is passed. `take(host, offered)` gives the newest unexpired ticket for `host` whose ALPN protocol the client still offers (`offered`: the protocols
+ *  of its configuration; a ticket without one needs a client that offers none) and removes it, a ticket being used once; the caller owns its strings and wipes
+ *  them. Expired tickets are wiped and dropped when met. `count(host)` is how many it holds, `clear` wipes and drops everything. */
+class TlsSessionCache(val put: (string, string, int, string, string, int, int, string) -> void, val take: (string, array<string>, string) -> TlsStoredTicket?,
+    val count: (string) -> int, val clear: () -> void, val now: () -> int)
+
+private fun tlsWipeTicket(entry: TlsStoredTicket): void {
+    tlsWipe(entry.ticket)
+    tlsWipe(entry.psk)
+}
+
+private fun tlsCachePut(var store: TlsCacheStore, now: () -> int, capacity: int, host: string, alpn: string, suite: int, ticket: string, psk: string,
+    ageAdd: int, lifetime: int, scope: string): void {
+    // A ticket resumes without a Certificate, so it is only worth what authenticated the server the first time: a connection whose verification has no name (scope "") keeps no ticket.
+    if (lifetime <= 0 || ticket.size == 0 || psk.size == 0 || scope == "") return
+    val bounded = if (lifetime > TLS_TICKET_MAXIMUM_LIFETIME) TLS_TICKET_MAXIMUM_LIFETIME else lifetime
+    val entry = TlsStoredTicket(host, alpn, suite, cryptoOwnedCopy(ticket), cryptoOwnedCopy(psk), ageAdd, bounded, now(), scope)
+    val kept: array<TlsStoredTicket> = []
+    for (old in store.entries) kept.append(old)
+    kept.append(entry)
+    while (kept.size > capacity) {
+        tlsWipeTicket(kept[0])
+        kept.removeAt(0)
+    }
+    store.entries = kept
+    return
+}
+
+private fun tlsCacheTake(var store: TlsCacheStore, now: () -> int, host: string, offered: array<string>, scope: string): TlsStoredTicket? {
+    if (scope == "") return null
+    val at = now()
+    val kept: array<TlsStoredTicket> = []
+    for (entry in store.entries) {
+        if (at - entry.received >= entry.lifetime || at < entry.received) tlsWipeTicket(entry) else kept.append(entry)
+    }
+    var chosenIndex = -1
+    var index = kept.size - 1
+    while (index >= 0 && chosenIndex < 0) {
+        var usable = kept[index].host == host && kept[index].scope == scope
+        if (usable) {
+            val alpn = kept[index].alpn
+            if (alpn == "") usable = offered.size == 0
+            else {
+                usable = false
+                for (name in offered) {
+                    if (name == alpn) usable = true
+                }
+            }
+        }
+        if (usable) chosenIndex = index
+        index = index - 1
+    }
+    var chosen: TlsStoredTicket? = null
+    if (chosenIndex >= 0) chosen = kept.removeAt(chosenIndex)
+    store.entries = kept
+    chosen
+}
+
+/** A cache of at most `capacity` tickets; `now` is the clock in seconds. */
+fun tlsSessionCacheNew(now: () -> int, capacity: int = 32): TlsSessionCache {
+    val store = TlsCacheStore([])
+    val bounded = if (capacity < 1) 1 else capacity
+    TlsSessionCache(
+        { host: string, alpn: string, suite: int, ticket: string, psk: string, ageAdd: int, lifetime: int, scope: string ->
+            tlsCachePut(store, now, bounded, host, alpn, suite, ticket, psk, ageAdd, lifetime, scope)
+        },
+        { host: string, offered: array<string>, scope: string -> tlsCacheTake(store, now, host, offered, scope) },
+        { host: string -> tlsCacheCount(store, host) },
+        { tlsClearCache(store) },
+        now)
+}
+
+private fun tlsWipeTicketKeys(var store: TlsTicketStore): void {
+    for (key in store.keys) tlsWipe(key.key)
+    store.keys = []
+    return
+}
+
+private fun tlsCacheCount(store: TlsCacheStore, host: string): int {
+    var count = 0
+    for (entry in store.entries) {
+        if (entry.host == host) count = count + 1
+    }
+    count
+}
+
+private fun tlsClearCache(var store: TlsCacheStore): void {
+    for (entry in store.entries) tlsWipeTicket(entry)
+    store.entries = []
+    return
+}
