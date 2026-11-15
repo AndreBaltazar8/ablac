@@ -898,6 +898,13 @@ mmap form) apply there.
   hashes their text so a change there is a reviewed one and asserts there is no `declassify` in it, and the entry
   above takes the allocation out of the part that is read. Revisit only if the constructor's pressure and layout checks move into the shared object-block function and that function gets a
   stable mark for another reason.
+  *Decision (lead, after ablac-60-2's reading): it stays out of `test-ct.sh`.* These functions are given no secret
+  value, only pointers to secret memory, so allocation sizes and the order of calls are public; the types keep a secret
+  out of a branch, an index and a division there, and `declassify` is the only way out, which
+  `tools/ct/fixtures/source.ab` hashes and asserts absent. Bringing it in needs a stable mark on the object-block
+  allocator (touching every program), the `%` tag with a layout generated from `runtime/`, and the box word, null and
+  tag-check loads. Residual risk, accepted: a branch the compiler itself adds in that text is not read, which matters
+  only if a secret value passes through it.
   **No real entry uses `%n` yet:** what exists is the mechanism and its hand-written controls, not coverage of `aesNewKey`,
   `rsaCrt` or any other function of the crypto plumbing; those stay unread until the application below is done.
   *Finding against the allocator step (2026-11-09, release x86-64, a key-shaped `resource class` and an
