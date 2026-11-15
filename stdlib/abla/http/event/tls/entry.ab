@@ -1,0 +1,584 @@
+// An epoll HTTPS server with HTTP/2: the HTTP/1.1 event server's API over TLS (abla/tls/pure, no OpenSSL), and HTTP/2 chosen by ALPN. Each connection starts a TLS
+// handshake (nonblocking, bounded by `handshakeTimeoutMilliseconds`); when it is done the ALPN result decides the protocol: "h2" runs the connection as an H2Server
+// (abla/http/h2/server: streams, flow control, the Rapid Reset, CONTINUATION and flood limits), anything else is HTTP/1.1 as in abla/http/event (the same framing, limits
+// and responses). Without TLS the server speaks plain TCP: HTTP/1.1, and h2c with prior knowledge for a connection that begins with the HTTP/2 preface (no Upgrade: h2c).
+//
+//     val tls = httpsEventServerTls("fullchain.pem", "privkey.pem")     // null if the certificate or key failed to load
+//     val server = httpsEventServer(router, ipv4Any(443), tls)
+//     while (true) server.step(1000)
+//
+// The handler (or router) is the one of HttpEventServer: `(HttpRequest) -> HttpResponse`, called once per request (once per stream over HTTP/2, when the request is whole),
+// on the event loop's thread. A handler that is slow stalls every connection, as there.
+
+import "abla/http"
+import "abla/http/stream"
+import "abla/http/event"
+import "abla/http/h2"
+import "abla/http/h2/server"
+import "abla/net"
+import "abla/sys/linux"
+import "abla/sys/linux/process"
+import "abla/text"
+import "abla/tls/pure"
+import "abla/tls/pure/server"
+
+class HttpsEventServerOptions(
+    val base: HttpEventServerOptions = httpEventServerOptions(),
+    // Serve HTTP/2 (ALPN h2, and h2c on plain connections).
+    val http2: bool = true,
+    // Serve HTTP/1.1. False makes the port HTTP/2 only: a TLS client that does not pick h2 is refused, a plain connection is taken as h2c whatever it sends first.
+    val http1: bool = true,
+    val maximumStreams: int = 100,
+    val maximumHeaderListBytes: int = 65536,
+    // A connection that has not finished its TLS handshake after this long is closed.
+    val handshakeTimeoutMilliseconds: int = 5000
+)
+
+// Connection states.
+private val httpsFree = 0
+private val httpsHandshaking = 1
+// Plain connection whose first bytes decide between HTTP/1.1 and h2c.
+private val httpsSniffing = 2
+private val httpsHttp1 = 3
+private val httpsHttp2 = 4
+
+resource class HttpsEventServer(
+    val handler: (HttpRequest) -> HttpResponse,
+    val listener: TcpListener,
+    val poller: SocketPoller,
+    val options: HttpsEventServerOptions,
+    val tls: TlsServerConfig?,
+    val descriptors: array<int>,
+    val descriptorSlots: array<int>,
+    val states: array<int>,
+    val sessions: array<TlsServerSession>,
+    val h2: array<H2Server>,
+    val inputs: array<string>,
+    val outputs: array<string>,
+    val outputOffsets: array<int>,
+    val writeWatching: array<bool>,
+    val requestCounts: array<int>,
+    val closing: array<bool>,
+    val lastActivity: array<int>,
+    val started: array<int>,
+    val peers: array<SocketPeerAddress?>,
+    var draining: bool,
+    var stopped: bool,
+    var drainDeadline: int,
+    var pass: int
+) {
+    fun drop(): void {
+        var index = 0
+        while (index < this.descriptors.size) {
+            if (this.descriptors[index] >= 0) {
+                linuxTcpCloseDescriptor(this.descriptors[index])
+                this.descriptors[index] = -1
+            }
+            index = index + 1
+        }
+        this.poller.close()
+        this.listener.close()
+        this.stopped = true
+        return
+    }
+}
+
+/** The certificate chain and private key (PEM files, such as an ACME client's fullchain.pem and privkey.pem) as a TLS configuration that offers h2 and http/1.1, or null
+ *  when either failed to load. Keep it for the life of the server. */
+fun httpsEventServerTls(certificatePath: string, privateKeyPath: string, http2: bool = true): TlsServerConfig? =
+    httpsEventServerTlsPem(linuxReadFile(certificatePath, 1048576), linuxReadFile(privateKeyPath, 1048576), http2)
+
+fun httpsEventServerTlsPem(certificatePem: string, privateKeyPem: string, http2: bool = true): TlsServerConfig? {
+    val config = tlsServerConfigFromPem(certificatePem, privateKeyPem)
+    if (config == null) return null
+    tlsServerConfigWithAlpn(config, if (http2) ["h2", "http/1.1"] else ["http/1.1"])
+}
+
+private fun httpsRouterHandler(router: HttpRouter): (HttpRequest) -> HttpResponse =
+    { request: HttpRequest -> router.dispatch(request) }
+
+fun httpsEventServer(
+    router: HttpRouter,
+    address: Ipv4SocketAddress,
+    tls: TlsServerConfig? = null,
+    options: HttpsEventServerOptions = HttpsEventServerOptions(),
+    reusePort: bool = false
+): HttpsEventServer = httpsEventServerHandler(httpsRouterHandler(router), address, tls, options, reusePort)
+
+fun httpsEventServerHandler(
+    handler: (HttpRequest) -> HttpResponse,
+    address: Ipv4SocketAddress,
+    tls: TlsServerConfig? = null,
+    options: HttpsEventServerOptions = HttpsEventServerOptions(),
+    reusePort: bool = false
+): HttpsEventServer {
+    val listener = tcpListenAddress(address, 1024, reusePort)
+    listener.setNonblocking()
+    val poller = socketPoller()
+    if (listener.descriptor >= 0 && poller.descriptor >= 0) poller.watchDescriptor(listener.descriptor)
+    HttpsEventServer(handler, move(listener), move(poller), options, tls, [], [], [], [], [], [], [], [], [], [], [], [], [], [], false, false, 0, linuxMonotonicMilliseconds())
+}
+
+fun HttpsEventServer.port(): int = this.listener.localPort()
+
+fun HttpsEventServer.activeConnections(): int {
+    var active = 0
+    for (index in 0 until this.descriptors.size) {
+        if (this.descriptors[index] >= 0) active = active + 1
+    }
+    active
+}
+
+private fun HttpsEventServer.slotOf(descriptor: int): int =
+    if (descriptor >= 0 && descriptor < this.descriptorSlots.size) this.descriptorSlots[descriptor] else -1
+
+private fun HttpsEventServer.allocate(descriptor: int): int {
+    val peer = socketPeerAddress(descriptor)
+    var slot = -1
+    var index = 0
+    while (slot < 0 && index < this.descriptors.size) {
+        if (this.descriptors[index] < 0) slot = index
+        index = index + 1
+    }
+    val now = linuxMonotonicMilliseconds()
+    val config = this.tls
+    if (slot < 0) {
+        slot = this.descriptors.size
+        this.descriptors.append(descriptor)
+        this.states.append(httpsFree)
+        if (config != null) this.sessions.append(tlsServerSession(config, -1))
+        this.h2.append(h2ServerNew())
+        this.inputs.append("")
+        this.outputs.append("")
+        this.outputOffsets.append(0)
+        this.writeWatching.append(false)
+        this.requestCounts.append(0)
+        this.closing.append(false)
+        this.lastActivity.append(now)
+        this.started.append(now)
+        this.peers.append(peer)
+    } else {
+        this.descriptors[slot] = descriptor
+        this.peers[slot] = peer
+        this.inputs[slot] = ""
+        this.outputs[slot] = ""
+        this.outputOffsets[slot] = 0
+        this.writeWatching[slot] = false
+        this.requestCounts[slot] = 0
+        this.closing[slot] = false
+        this.lastActivity[slot] = now
+        this.started[slot] = now
+    }
+    while (this.descriptorSlots.size <= descriptor) this.descriptorSlots.append(-1)
+    this.descriptorSlots[descriptor] = slot
+    slot
+}
+
+fun HttpsEventServer.closeSlot(slot: int): void {
+    if (slot >= 0 && slot < this.descriptors.size && this.descriptors[slot] >= 0) {
+        if (this.states[slot] != httpsFree && this.tls != null && this.states[slot] != httpsSniffing) {
+            // close_notify is offered once, best effort (the session ignores a placeholder).
+            this.sessions[slot].close()
+        }
+        if (this.tls == null) {
+            // Closing a socket with unread input resets the connection, which can destroy the answer (a GOAWAY) still in flight: what the peer already sent is read and dropped first.
+            val connection = TcpConnection(this.descriptors[slot])
+            var drained = 0
+            while (drained < 8) {
+                val rest = connection.readResult(65536)
+                drained = if (rest.hasData()) drained + 1 else 8
+            }
+            connection.descriptor = -1
+        }
+        this.poller.unwatchDescriptor(this.descriptors[slot])
+        if (this.descriptors[slot] < this.descriptorSlots.size) this.descriptorSlots[this.descriptors[slot]] = -1
+        linuxTcpCloseDescriptor(this.descriptors[slot])
+        this.descriptors[slot] = -1
+        this.states[slot] = httpsFree
+        this.peers[slot] = null
+        this.inputs[slot] = ""
+        this.outputs[slot] = ""
+        this.outputOffsets[slot] = 0
+        this.writeWatching[slot] = false
+        this.closing[slot] = false
+        this.lastActivity[slot] = 0
+        if (this.states[slot] == httpsHttp2) this.h2[slot] = h2ServerNew()
+    }
+    return
+}
+
+private fun HttpsEventServer.watchWrite(slot: int, want: bool): void {
+    if (this.writeWatching[slot] != want && this.descriptors[slot] >= 0) {
+        if (this.poller.modifyDescriptor(this.descriptors[slot], true, want)) this.writeWatching[slot] = want
+    }
+    return
+}
+
+// ---- bytes in and out of a slot, through TLS or plain ----
+// Returns the bytes read ("" with `status` 0 for would-block, 1 closed, -1 failed in `lastStatus`); for TLS: want-write is reported as would-block with the write interest set.
+class HttpsRead(var bytes: string, var status: int)
+
+private fun HttpsEventServer.receive(slot: int, var into: HttpsRead): void {
+    into.bytes = ""
+    into.status = 0
+    if (this.tls != null && this.states[slot] != httpsSniffing) {
+        val read = this.sessions[slot].readReady(16384)
+        if (read.status == 1 && read.bytes.size > 0) {
+            into.bytes = read.bytes
+        } else if (read.status == 3) {
+            this.watchWrite(slot, true)
+        } else if (read.status == 0) {
+            into.status = 1
+        } else if (read.status < 0) {
+            into.status = -1
+        }
+        return
+    }
+    val connection = TcpConnection(this.descriptors[slot])
+    val result = connection.readResult(65536)
+    connection.descriptor = -1
+    if (result.hasData()) into.bytes = result.bytes
+    else if (result.reachedEof()) into.status = 1
+    else if (result.errorCode != 11) into.status = -1
+    return
+}
+
+// Writes what is queued for the slot until the socket would block; closes the slot when a closing connection is done.
+private fun HttpsEventServer.flush(slot: int): void {
+    var writing = this.descriptors[slot] >= 0
+    while (writing) {
+        // The H2Server may have more to say (acknowledgements, held-back bodies).
+        if (this.outputOffsets[slot] >= this.outputs[slot].size) {
+            this.outputs[slot] = ""
+            this.outputOffsets[slot] = 0
+            if (this.states[slot] == httpsHttp2) {
+                val more = this.h2[slot].takeOutput()
+                if (more.size > 0) this.outputs[slot] = more
+            }
+            if (this.outputs[slot].size == 0) {
+                this.watchWrite(slot, false)
+                writing = false
+                if (this.states[slot] == httpsHttp2 && this.h2[slot].finished()) this.closeSlot(slot)
+                else if (this.closing[slot]) this.closeSlot(slot)
+                continue
+            }
+        }
+        val offset = this.outputOffsets[slot]
+        if (this.tls != null && this.states[slot] != httpsSniffing) {
+            val sent = this.sessions[slot].writeReady(this.outputs[slot], offset)
+            if (sent.status == 1 && sent.written > 0) {
+                this.outputOffsets[slot] = offset + sent.written
+                this.lastActivity[slot] = this.pass
+            } else if (sent.status == 2 || sent.status == 3) {
+                this.watchWrite(slot, true)
+                writing = false
+            } else {
+                this.closeSlot(slot)
+                writing = false
+            }
+        } else {
+            val connection = TcpConnection(this.descriptors[slot])
+            val remaining = if (offset == 0) this.outputs[slot] else this.outputs[slot].slice(offset, this.outputs[slot].size)
+            val written = connection.writeResult(remaining)
+            connection.descriptor = -1
+            if (written.written > 0) {
+                this.outputOffsets[slot] = offset + written.written
+                this.lastActivity[slot] = this.pass
+            }
+            if (written.failed() && written.errorCode != 11) {
+                this.closeSlot(slot)
+                writing = false
+            } else if (written.written == 0) {
+                this.watchWrite(slot, true)
+                writing = false
+            }
+        }
+    }
+    return
+}
+
+// ---- protocols ----
+private fun HttpsEventServer.startProtocol(slot: int, http2: bool): void {
+    if (http2 && this.options.http2) {
+        this.states[slot] = httpsHttp2
+        this.h2[slot] = h2ServerNew(this.options.maximumStreams, this.options.base.maximumBodyBytes, this.options.maximumHeaderListBytes, this.peers[slot])
+        if (this.draining) this.h2[slot].shutdown()
+    } else if (!this.options.http1) {
+        this.closeSlot(slot)
+    } else this.states[slot] = httpsHttp1
+    return
+}
+
+private fun HttpsEventServer.serveHttp1(slot: int): void {
+    var processing = this.states[slot] == httpsHttp1 && this.descriptors[slot] >= 0 && this.outputs[slot].size == 0
+    while (processing) {
+        val base = this.options.base
+        val frame = httpEventFrame(this.inputs[slot], base.maximumHeaderBytes, base.maximumBodyBytes, this.peers[slot])
+        val length = frame.length
+        if (length < 0) {
+            this.outputs[slot] = httpText("bad request", 400).render()
+            this.outputOffsets[slot] = 0
+            this.closing[slot] = true
+            processing = false
+            this.flush(slot)
+        } else if (length == 0) processing = false
+        else {
+            if (length < this.inputs[slot].size) this.inputs[slot] = this.inputs[slot].slice(length, this.inputs[slot].size)
+            else this.inputs[slot] = ""
+            val request = frame.request
+            if (request == null) {
+                this.closeSlot(slot)
+                return
+            }
+            val eventHandler = this.handler
+            val response = eventHandler(request)
+            this.requestCounts[slot] = this.requestCounts[slot] + 1
+            val keepAlive = (if (frame.http10) httpHeaderTokenContains(request.header("Connection"), "keep-alive") && httpRequestKeepAlive(request) else httpRequestKeepAlive(request)) &&
+                !this.draining && this.requestCounts[slot] < base.maximumRequestsPerConnection
+            this.outputs[slot] = httpEventResponse(request, response, keepAlive, base.gzipMinimumBytes)
+            this.outputOffsets[slot] = 0
+            this.closing[slot] = !keepAlive
+            if (this.outputs[slot].size > base.maximumPendingBytes) {
+                this.closeSlot(slot)
+                processing = false
+            } else {
+                this.flush(slot)
+                processing = this.descriptors[slot] >= 0 && this.outputs[slot].size == 0 && !this.closing[slot]
+            }
+        }
+    }
+    return
+}
+
+private fun HttpsEventServer.serveHttp2(slot: int, data: string): void {
+    this.h2[slot].feed(data, this.pass)
+    for (r in this.h2[slot].takeRequests()) {
+        val eventHandler = this.handler
+        val response = eventHandler(r.request)
+        // A response the HTTP/1.1 server would send as an upgrade cannot exist here.
+        if (response.status == 101 || response.status < 200 || response.status > 599) {
+            this.h2[slot].respond(r.stream, 500, [HttpHeader("content-type", "text/plain")], "internal server error")
+        } else if (r.request.method == "HEAD" || response.body.size < this.options.base.gzipMinimumBytes) {
+            this.h2[slot].respond(r.stream, response.status, response.headers, response.body)
+        } else {
+            val encoded = httpGzipResponse(r.request, response, this.options.base.gzipMinimumBytes)
+            this.h2[slot].respond(r.stream, encoded.status, encoded.headers, encoded.body)
+        }
+    }
+    this.flush(slot)
+    return
+}
+
+private fun HttpsEventServer.onBytes(slot: int, data: string): void {
+    var state = this.states[slot]
+    if (state == httpsSniffing) {
+        // Plain connection: the start of the HTTP/2 preface means h2c, anything else HTTP/1.1.
+        this.inputs[slot] = this.inputs[slot] + data
+        val seen = this.inputs[slot]
+        // "PRI * HTTP/2.0\r\n" (16 bytes) is not an HTTP/1.1 request line a server should take: from there the connection is HTTP/2 and a wrong rest of the preface ends it.
+        val preface = H2_PREFACE.slice(0, 16)
+        val compare = if (seen.size < preface.size) seen.size else preface.size
+        if (seen.slice(0, compare) == preface.slice(0, compare)) {
+            if (seen.size < preface.size) return
+            this.startProtocol(slot, true)
+        } else if (!this.options.http1 && this.options.http2) {
+            this.startProtocol(slot, true)
+        } else this.startProtocol(slot, false)
+        state = this.states[slot]
+        val held = this.inputs[slot]
+        this.inputs[slot] = ""
+        if (state == httpsHttp2) this.serveHttp2(slot, held)
+        else {
+            this.inputs[slot] = held
+            this.serveHttp1(slot)
+        }
+        return
+    }
+    if (state == httpsHttp2) {
+        this.serveHttp2(slot, data)
+    } else if (state == httpsHttp1) {
+        this.inputs[slot] = this.inputs[slot] + data
+        if (this.inputs[slot].size > this.options.base.maximumHeaderBytes + this.options.base.maximumBodyBytes &&
+            httpEventRequestLength(this.inputs[slot], this.options.base.maximumHeaderBytes, this.options.base.maximumBodyBytes) <= 0) this.closeSlot(slot)
+        else this.serveHttp1(slot)
+    }
+    return
+}
+
+private fun HttpsEventServer.handshake(slot: int): void {
+    val status = this.sessions[slot].handshake()
+    if (status == 1) {
+        this.watchWrite(slot, false)
+        this.startProtocol(slot, this.sessions[slot].alpn() == "h2")
+        this.lastActivity[slot] = this.pass
+        // A client that sent its request with its Finished may have data waiting inside the session already.
+        this.readSlot(slot)
+    } else if (status == 2) this.watchWrite(slot, false)
+    else if (status == 3) this.watchWrite(slot, true)
+    else this.closeSlot(slot)
+    return
+}
+
+fun HttpsEventServer.readSlot(slot: int): void {
+    var reading = slot >= 0 && this.descriptors[slot] >= 0
+    var result = HttpsRead("", 0)
+    var rounds = 0
+    while (reading && this.descriptors[slot] >= 0 && rounds < 64) {
+        rounds = rounds + 1
+        if (this.states[slot] == httpsHandshaking) {
+            this.handshake(slot)
+            return
+        }
+        this.receive(slot, result)
+        if (result.status != 0) {
+            this.closeSlot(slot)
+            reading = false
+        } else if (result.bytes.size > 0) {
+            this.lastActivity[slot] = this.pass
+            this.onBytes(slot, result.bytes)
+            // A connection with an unwritten answer reads no further until it is written (backpressure).
+            if (this.descriptors[slot] >= 0 && this.outputs[slot].size > 0) reading = false
+        } else reading = false
+    }
+    return
+}
+
+fun HttpsEventServer.writeSlot(slot: int): void {
+    if (slot >= 0 && this.descriptors[slot] >= 0) {
+        if (this.states[slot] == httpsHandshaking) {
+            this.handshake(slot)
+            return
+        }
+        this.flush(slot)
+        // An answer that was waiting for the socket lets the next request in the input run.
+        if (this.descriptors[slot] >= 0 && this.states[slot] == httpsHttp1 && this.outputs[slot].size == 0) this.serveHttp1(slot)
+    }
+    return
+}
+
+fun HttpsEventServer.acceptReady(): void {
+    var accepting = !this.draining && this.activeConnections() < this.options.base.maximumConnections
+    while (accepting) {
+        val connection = this.listener.accept()
+        if (connection.descriptor < 0) accepting = false
+        else {
+            connection.setNonblocking()
+            val descriptor = connection.descriptor
+            connection.descriptor = -1
+            val slot = this.allocate(descriptor)
+            val config = this.tls
+            if (config != null) {
+                this.sessions[slot] = tlsServerSession(config, descriptor, true)
+                this.states[slot] = if (this.sessions[slot].ok()) httpsHandshaking else httpsFree
+            } else this.states[slot] = httpsSniffing
+            this.poller.watchDescriptor(descriptor)
+            if (this.states[slot] == httpsFree) this.closeSlot(slot)
+            accepting = this.activeConnections() < this.options.base.maximumConnections
+        }
+    }
+    return
+}
+
+/** One pass of the loop: waits up to `timeoutMilliseconds` for socket events, serves them, then applies the timeouts. Returns the number of events handled. */
+fun HttpsEventServer.step(timeoutMilliseconds: int = 1000): int {
+    var handled = 0
+    var maximumEvents = this.options.base.maximumConnections + 1
+    if (maximumEvents > 1024) maximumEvents = 1024
+    val events = this.poller.waitCompact(maximumEvents, timeoutMilliseconds)
+    this.pass = linuxMonotonicMilliseconds()
+    var index = 0
+    while (index + 12 <= events.size) {
+        val flags = textReadU32LittleEndian(events, index)
+        val descriptor = textReadU32LittleEndian(events, index + 4)
+        val readable = (flags & 1) != 0
+        val writable = (flags & 4) != 0
+        val closed = (flags & 16) != 0 || (flags & 8192) != 0
+        val error = (flags & 8) != 0
+        if (!this.draining && descriptor == this.listener.descriptor && readable) {
+            this.acceptReady()
+            handled = handled + 1
+        } else {
+            val slot = this.slotOf(descriptor)
+            if (slot >= 0) {
+                if (error) this.closeSlot(slot)
+                else {
+                    // A half-closed peer may still have sent a request: read before giving up on it.
+                    if (readable || closed) this.readSlot(slot)
+                    if (writable && slot < this.descriptors.size && this.descriptors[slot] >= 0) this.writeSlot(slot)
+                    if (closed && slot < this.descriptors.size && this.descriptors[slot] >= 0 && !readable) this.closeSlot(slot)
+                }
+                handled = handled + 1
+            }
+        }
+        index = index + 12
+    }
+    this.timers()
+    handled
+}
+
+private fun HttpsEventServer.timers(): void {
+    val now = this.pass
+    for (slot in 0 until this.descriptors.size) {
+        if (this.descriptors[slot] < 0) continue
+        if (this.states[slot] == httpsHandshaking && now - this.started[slot] >= this.options.handshakeTimeoutMilliseconds) {
+            this.closeSlot(slot)
+        } else if (this.states[slot] == httpsHttp2) {
+            this.h2[slot].tick(now)
+            this.flush(slot)
+            if (this.descriptors[slot] >= 0 && this.options.base.idleTimeoutMilliseconds > 0 && now - this.lastActivity[slot] >= this.options.base.idleTimeoutMilliseconds) {
+                // Idle: GOAWAY(NO_ERROR), then close with whatever is queued written.
+                this.h2[slot].shutdown()
+                this.flush(slot)
+                if (this.descriptors[slot] >= 0) this.closeSlot(slot)
+            }
+        } else if (this.options.base.idleTimeoutMilliseconds > 0 && now - this.lastActivity[slot] >= this.options.base.idleTimeoutMilliseconds) {
+            this.closeSlot(slot)
+        }
+    }
+    return
+}
+
+/** Graceful stop: no new connections, HTTP/2 connections get GOAWAY and finish their streams, idle HTTP/1.1 connections close. */
+fun HttpsEventServer.beginDrain(): void {
+    if (!this.draining) {
+        this.draining = true
+        this.drainDeadline = linuxMonotonicMilliseconds() + this.options.base.drainTimeoutMilliseconds
+        if (this.listener.descriptor >= 0) {
+            this.poller.unwatchDescriptor(this.listener.descriptor)
+            this.listener.close()
+        }
+        for (slot in 0 until this.descriptors.size) {
+            if (this.descriptors[slot] < 0) continue
+            if (this.states[slot] == httpsHttp2) {
+                this.h2[slot].shutdown()
+                this.flush(slot)
+            } else if (this.outputs[slot].size > 0) this.closing[slot] = true
+            else this.closeSlot(slot)
+        }
+    }
+    return
+}
+
+fun HttpsEventServer.stop(): void {
+    this.beginDrain()
+    return
+}
+
+fun HttpsEventServer.forceStop(): void {
+    for (slot in 0 until this.descriptors.size) this.closeSlot(slot)
+    this.stopped = true
+    return
+}
+
+fun HttpsEventServer.drain(): int {
+    this.beginDrain()
+    while (this.activeConnections() > 0 && linuxMonotonicMilliseconds() < this.drainDeadline) this.step(50)
+    this.forceStop()
+    0
+}
+
+fun HttpsEventServer.run(): int {
+    this.poller.watchGracefulShutdown()
+    while (!this.stopped && !tcpShutdownRequested()) this.step(1000)
+    if (!this.stopped) this.drain() else 0
+}
