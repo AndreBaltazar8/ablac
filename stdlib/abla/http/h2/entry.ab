@@ -5,7 +5,7 @@
 // payload), the control frames it makes us answer (100 pending), the run of frames that carry nothing (1000) and the control frames per second
 // (10000), the output we queue (256 KiB before request bodies pause), and a response (`maximumResponseBytes`). Past a flood limit the connection ends
 // with GOAWAY(ENHANCE_YOUR_CALM); a violation of the protocol ends it with the RFC's error code and every stream on it fails with that code.
-// Response header names are lower case as HTTP/2 requires; trailers are decoded (the HPACK table must stay in step) and dropped.
+// Response header names are lower case as HTTP/2 requires; trailers are decoded and handed out in a TRAILERS event.
 
 import "abla/bytes"
 import "abla/crypto"
@@ -32,6 +32,7 @@ val H2_EVENT_END = 3
 val H2_EVENT_RESET = 4
 val H2_EVENT_GOAWAY = 5
 val H2_EVENT_CLOSED = 6
+val H2_EVENT_TRAILERS = 7
 
 // Limits that are not options: a caller cannot weaken them by accident.
 val H2_MAX_FRAME_PAYLOAD = 16384
@@ -53,6 +54,7 @@ val H2_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 /** Something that happened on the connection. `kind` is one of the H2_EVENT_ values:
  *  HEADERS: `status` and `headers` (final response headers, lower case, no pseudo-headers); DATA: `data`; END: the stream finished well;
  *  RESET: the stream failed (`code`, `error`; `retry` says the server did not process it: REFUSED_STREAM, or beyond a GOAWAY's last id);
+ *  TRAILERS: `headers` (the trailer fields, before END);
  *  GOAWAY: `code` and `stream` (the last stream the peer processed); CLOSED: the connection ended (`error`, `code`). */
 class H2Event(val kind: int, val stream: int, val status: int = 0, val headers: array<HpackField> = [], val data: string = "", val code: int = 0, val error: string = "", val retry: bool = false)
 
@@ -629,8 +631,9 @@ private fun H2Client.finishBlock(): void {
         headers.append(f)
     }
     if (this.streams[at].sawFinal) {
-        // Trailers: no pseudo-headers (checked above), must end the stream; decoded and dropped.
+        // Trailers: no pseudo-headers (checked above), must end the stream; handed out as a TRAILERS event before END.
         if (!endStream) { this.streamError(stream, H2_PROTOCOL_ERROR, "trailers without END_STREAM"); return }
+        if (headers.size > 0) this.emit(H2Event(H2_EVENT_TRAILERS, stream, headers = headers))
         this.finishStream(stream)
         return
     }

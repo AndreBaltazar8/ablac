@@ -408,8 +408,8 @@ What changes with HTTP/2:
   PING before a request uses it (no answer in five seconds: the connection is dropped and the request goes to a new one). A request the server did not process (`REFUSED_STREAM`,
   or beyond a `GOAWAY`'s last stream) is retried once on another connection.
 - **Response header names are lower case** (HTTP/2 requires it; HTTP/1.1 keeps the server's case): `HttpAsyncCompletion.header(name)` compares names case-insensitively
-  either way. **Trailers are dropped** (they are decoded to keep the HPACK table in step, and counted against the header limits): `HttpAsyncCompletion.trailers()` exists and is
-  empty, so a caller can see that none are kept. Responses are fully buffered (`maximumResponseBytes`), no push (`SETTINGS_ENABLE_PUSH = 0`), no priorities.
+  either way. **Trailers are kept** (decoded, counted against the header limits, lower-case names): `HttpAsyncCompletion.trailers()` returns them in order; it is
+  empty for HTTP/1.1 (chunked trailers are not kept there). Responses are fully buffered (`maximumResponseBytes`), no push (`SETTINGS_ENABLE_PUSH = 0`), no priorities.
 - Requests go out with `:method`, `:scheme`, `:authority` (host, with the port when it is not the scheme's), `:path`, then the caller's headers lower-cased minus `host`, `connection`,
   `keep-alive`, `proxy-connection`, `transfer-encoding` and `upgrade` (`te` only as `trailers`), and `content-length` for a body. `http2NeverIndex` names headers that HPACK never
   puts in its dynamic table (always so for `authorization`, `proxy-authorization`, `cookie` and `set-cookie`), against CRIME/BREACH-style leaks.
@@ -434,7 +434,7 @@ while (true) server.step(1000)                                // or server.run()
 Each connection handshakes without blocking (`handshakeTimeoutMilliseconds`, 5 s); then ALPN `h2` makes it an HTTP/2 connection and anything else HTTP/1.1.
 Without a TLS configuration the server speaks plain TCP: HTTP/1.1, and h2c with prior knowledge for a connection that begins with the HTTP/2 preface (there is no
 `Upgrade: h2c`). `HttpsEventServerOptions(http2 = false)` serves HTTP/1.1 only; `http1 = false` makes the port HTTP/2-only.
-
+ A request that carries both `:authority` and `host` gets `host` set to the `:authority` value (RFC 9113 8.3.1), so a handler sees one origin; a request with only `:authority` gets `host` from it.
 The handler runs once per request, and over HTTP/2 once per stream when the request is whole (END_STREAM), on the event loop's thread: nothing in the router API changes.
 Requests and responses are fully buffered (`maximumBodyBytes`; a larger request body is answered 413 and the upload stopped). A response is sent as HEADERS and DATA under
 the client's flow-control windows and a 256 KiB output queue; `connection`, `keep-alive`, `transfer-encoding`, `upgrade` and `host` response headers are dropped, names are

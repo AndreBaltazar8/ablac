@@ -9,7 +9,7 @@ Status: proposal, 2026-11-15, before code. RFC 9113 (HTTP/2) and RFC 7541 (HPACK
   `HttpAsyncOptions` fields.
 - Many requests to one origin share one connection (multiplexed streams); `maximumConnectionsPerHost` is then a cap on extra connections opened when a connection's
   stream limit is reached, not the way concurrency is reached.
-- Responses stay fully buffered (`maximumResponseBytes`, as now); no streaming API, trailers are dropped but visible: `HttpAsyncCompletion.trailers()` returns them (empty for now; a caller who asks can see that none are kept), no push (`SETTINGS_ENABLE_PUSH = 0`), no priorities.
+- Responses stay fully buffered (`maximumResponseBytes`, as now); no streaming API, trailers are kept: `HttpAsyncCompletion.trailers()` returns them (the client emits a TRAILERS event before END), no push (`SETTINGS_ENABLE_PUSH = 0`), no priorities.
 - `http://` stays HTTP/1.1. h2c with prior knowledge exists but is off: `HttpAsyncOptions.http2PriorKnowledge = false`; when true every `http://` origin of that
   client is spoken to as h2c. There is no `Upgrade: h2c` (deprecated by RFC 9113).
 
@@ -119,6 +119,6 @@ negotiated: the body is sent at once.
 ## Decisions (lead, approved)
 
 - One connection first while an origin's protocol is unknown: accepted.
-- Response header names arrive lowercase over h2 (HTTP/1.1 keeps the server's case) and trailers are dropped: accepted, both documented in the stdlib docs; `HttpAsyncCompletion.trailers()` exists (empty for now) so a caller can see that trailers are not kept.
+- Response header names arrive lowercase over h2 (HTTP/1.1 keeps the server's case) and trailers are returned by `HttpAsyncCompletion.trailers()` (first release: dropped, then kept).
 - `http2` defaults to false for one release (callers opt in); noted in the release notes when it lands.
 - The sans-IO `H2Client` has a fuzz target (`tools/http2-fuzz`) from the start, not at the end.

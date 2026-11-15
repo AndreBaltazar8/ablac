@@ -49,7 +49,7 @@ class HttpAsyncOptions(
     val dnsConfigurationPath: string = "/etc/resolv.conf",
     val dnsHostsPath: string = "/etc/hosts",
     // HTTP/2 (RFC 9113): off by default for one release; true offers h2 by ALPN on https connections and uses it when the server picks it (one connection is shared by
-    // many requests, header names of an h2 response are lower case, trailers are not kept). http2PriorKnowledge speaks h2c on every http:// origin of this client.
+    // many requests, header names of an h2 response are lower case, trailers are in `trailers()`). http2PriorKnowledge speaks h2c on every http:// origin of this client.
     val http2: bool = false,
     val http2PriorKnowledge: bool = false,
     // Concurrent requests on one h2 connection (also bounded by the server's SETTINGS_MAX_CONCURRENT_STREAMS).
@@ -69,12 +69,13 @@ class HttpAsyncCompletion(
     val error: string,
     val elapsedMilliseconds: int,
     // "h2" or "http/1.1" for a request that got a response, "" otherwise.
-    val protocol: string = ""
+    val protocol: string = "",
+    val trailerList: array<HttpHeader> = []
 ) {
     fun succeeded(): bool = this.error == ""
 
-    // Trailers a response carried. HTTP/2 trailers are decoded and dropped, so this is empty for now: a caller that asks can see that none are kept.
-    fun trailers(): array<HttpHeader> = []
+    // Trailer fields an HTTP/2 response carried (lower case names), in order; empty when there were none and for HTTP/1.1.
+    fun trailers(): array<HttpHeader> = this.trailerList
 }
 
 fun HttpAsyncCompletion.header(name: string): string {
@@ -147,6 +148,7 @@ resource class HttpAsyncClient(
     val requestStatuses: array<int>,
     val requestResponseHeaders: array<array<HttpHeader>>,
     val requestChunks: array<array<string>>,
+    val requestTrailers: array<array<HttpHeader>>,
     val freeRequests: array<int>,
     var freeRequestCount: int,
     // connections
@@ -216,7 +218,7 @@ fun httpAsyncClient(options: HttpAsyncOptions = HttpAsyncOptions()): HttpAsyncCl
             options.dnsHostsPath
         )),
         HttpAsyncRead("", 0),
-        [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], 0,
+        [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], 0,
         [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], 0,
         [], [], [],
         [], [], [], [], [], 1, 0, 0
@@ -422,7 +424,7 @@ fun HttpAsyncClient.complete(
     if (request >= 0 && this.requestStates[request] != 0) {
         this.completions.append(HttpAsyncCompletion(
             this.requestIds[request], status, headers, body, error,
-            linuxMonotonicMilliseconds() - this.requestStarted[request], protocol
+            linuxMonotonicMilliseconds() - this.requestStarted[request], protocol, this.requestTrailers[request]
         ))
         this.requestStates[request] = httpAsyncRequestFree
         this.requestPayloads[request] = ""
@@ -430,6 +432,7 @@ fun HttpAsyncClient.complete(
         this.requestHeaderLists[request] = []
         this.requestResponseHeaders[request] = []
         this.requestChunks[request] = []
+        this.requestTrailers[request] = []
         this.requestSlots[request] = -1
         this.requestStreams[request] = -1
         this.requestStatuses[request] = -1
@@ -983,6 +986,7 @@ fun HttpAsyncClient.h2Attach(slot: int, request: int): bool {
     this.requestStatuses[request] = -1
     this.requestResponseHeaders[request] = []
     this.requestChunks[request] = []
+    this.requestTrailers[request] = []
     true
 }
 
@@ -1012,6 +1016,10 @@ fun HttpAsyncClient.h2Events(slot: int, retryUnanswered: bool): void {
             val headers: array<HttpHeader> = []
             for (field in event.headers) headers.append(HttpHeader(field.name, field.value))
             this.requestResponseHeaders[request] = headers
+        } else if (event.kind == H2_EVENT_TRAILERS) {
+            val kept: array<HttpHeader> = []
+            for (field in event.headers) kept.append(HttpHeader(field.name, field.value))
+            this.requestTrailers[request] = kept
         } else if (event.kind == H2_EVENT_DATA) {
             this.requestChunks[request].append(event.data)
         } else if (event.kind == H2_EVENT_END) {
@@ -1030,10 +1038,12 @@ fun HttpAsyncClient.h2Events(slot: int, retryUnanswered: bool): void {
                 this.requestStreams[request] = -1
                 this.requestResponseHeaders[request] = []
                 this.requestChunks[request] = []
+                this.requestTrailers[request] = []
             } else this.complete(request, 0, [], "", event.error)
         }
     }
-    if (closed) this.closeConnection(slot)
+    // A connection the server announced it will close (GOAWAY) takes no new stream: once its last stream is done it goes, it does not idle.
+    if (closed || (this.connectionH2[slot].isDraining() && this.connectionH2[slot].openStreams() == 0)) this.closeConnection(slot)
     else if (finished && this.connectionH2[slot].openStreams() == 0) this.connectionIdleSince[slot] = linuxMonotonicMilliseconds()
     return
 }
@@ -1323,6 +1333,7 @@ fun HttpAsyncClient.request(
         this.requestStatuses.append(-1)
         this.requestResponseHeaders.append([])
         this.requestChunks.append([])
+        this.requestTrailers.append([])
     }
     val now = linuxMonotonicMilliseconds()
     this.requestIds[slot] = id
@@ -1346,6 +1357,7 @@ fun HttpAsyncClient.request(
     this.requestStatuses[slot] = -1
     this.requestResponseHeaders[slot] = []
     this.requestChunks[slot] = []
+    this.requestTrailers[slot] = []
     this.activeRequests = this.activeRequests + 1
     if (!target.valid) this.complete(slot, 0, [], "", "invalid URL")
     else this.pumpEvents()

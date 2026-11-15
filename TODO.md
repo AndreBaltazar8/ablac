@@ -3057,7 +3057,6 @@ one signature (about 5 ms for P-256 on x86-64). Revisit only if a 1.2-only peer 
 
 abla/http/async speaks HTTP/2 when `HttpAsyncOptions.http2` is true (abla/http/h2: HPACK, H2Client; docs/networking.md, docs/design/http2-client.md). Left open on purpose:
 - `http2` is off by default for one release; after it, decide the default (release notes say so). Flip it only with tools/test-http2.sh green on the release.
-- Trailers are decoded and dropped; `HttpAsyncCompletion.trailers()` is empty. Keeping them needs the H2Client to hand the decoded trailer list out (it has it in `finishBlock`).
 - Responses stay fully buffered (`maximumResponseBytes`); a streaming body API would need a change to HttpAsyncCompletion, not only to h2.
 - No server side, push, priorities (RFC 9218), `Upgrade: h2c`, or extended CONNECT (RFC 8441). HTTP/3 is a separate protocol.
 - The h2o interop of the design was not run (h2o is not in the pinned nix packages of the dev shell); nghttpd, `h2load` and `openssl s_server` are.

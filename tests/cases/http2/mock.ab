@@ -113,6 +113,10 @@ fun serveConnection(var conn: TcpConnection, number: int): int {
                     return 0
                 }
                 respond(conn, encoder, stream, "200", common, "new connection", true)
+            } else if (path == "/drain") {
+                // GOAWAY (no error) naming this stream as the last one, then its response, and the connection stays open.
+                conn.write(frame(7, 0, 0, be32(stream) + be32(0)))
+                respond(conn, encoder, stream, "200", common, "drained", true)
             } else if (path == "/trailers") {
                 respond(conn, encoder, stream, "200", common, "t", false)
                 conn.write(frame(1, 5, stream, encoder.encode([hf("x-trailer", "1")])))
@@ -211,7 +215,7 @@ fun basics(): void {
     // Headers: the caller's name in another case reaches the server lower-cased (x-echo), and lower case comes back.
     val first = find(done, ids[3])
     if (first != null) expect(first.header("X-Seen") == "e3", "the request header arrives: '${first.header("X-Seen")}'")
-    // 1xx skipped, trailers dropped, many headers.
+    // 1xx skipped, trailers kept, many headers.
     val interim = client.get("$base/interim", [], 5000)
     val trailers = client.get("$base/trailers", [], 5000)
     val many = client.get("$base/many", [], 5000)
@@ -219,7 +223,7 @@ fun basics(): void {
     val i1 = find(more, interim)
     if (i1 == null || i1.status != 200 || i1.body != "after interim" || i1.header("link") != "") fail("1xx is skipped")
     val t1 = find(more, trailers)
-    if (t1 == null || t1.body != "t" || t1.trailers().size != 0 || t1.header("x-trailer") != "") fail("trailers are dropped and trailers() is empty")
+    if (t1 == null || t1.body != "t" || t1.trailers().size != 1 || t1.trailers()[0].name != "x-trailer" || t1.trailers()[0].value != "1" || t1.header("x-trailer") != "") fail("trailers() returns the trailer, headers do not")
     val m1 = find(more, many)
     if (m1 == null || m1.headers.size != 50 || m1.header("x-n49") != "v49") fail("many headers")
     expect(client.connectionsOpened == 1, "still one connection: ${client.connectionsOpened}")
@@ -267,6 +271,18 @@ fun retries(): void {
     val gd = find(drain(client2, 5000), g)
     if (gd == null || gd.status != 200 || gd.body != "new connection" || gd.header("x-conn") != "2") fail("GOAWAY: the request is retried on a new connection: ${if (gd == null) "none" else gd.error + " conn " + gd.header("x-conn")}")
     expect(client2.connectionsOpened == 2, "two connections: ${client2.connectionsOpened}")
+    // GOAWAY that lets the stream finish: the connection is closed once it has, not left idle.
+    val mock2b = startMock()
+    linuxSleepMillisecondsChecked(100)
+    var client2b = httpAsyncClient(options(0))
+    val dr = client2b.get("http://127.0.0.1:${mock2b.port}/drain", [], 5000)
+    val drd = find(drain(client2b, 5000), dr)
+    if (drd == null || drd.status != 200 || drd.body != "drained") fail("GOAWAY(last = this stream): the response arrives: ${if (drd == null) "none" else drd.error}")
+    var open = 0
+    for (state in client2b.connectionStates) {
+        if (state != 0) open = open + 1
+    }
+    expect(open == 0, "a connection that got GOAWAY and has no stream left is closed: $open open")
     // A protocol error from the server fails the request and names the code.
     val mock3 = startMock()
     linuxSleepMillisecondsChecked(100)
@@ -280,6 +296,7 @@ fun retries(): void {
     if (pb == null || !pb.error.contains("PROTOCOL_ERROR")) fail("and fails every request on the connection: ${if (pb == null) "none" else pb.error}")
     stopMock(mock)
     stopMock(mock2)
+    stopMock(mock2b)
     stopMock(mock3)
     return
 }
