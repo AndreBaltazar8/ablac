@@ -205,7 +205,7 @@ else
     say "G6 build failed: $(tr '\n' ' ' < "$out/threads.log" | cut -c1-400)"
 fi
 # ---- G1, G2: the kernel probe, one section at a time -------------------------------------------------------------------
-for section in 1 2 3 4 5 6; do
+for section in 1 2 3 4 5 6 7; do
     if xcrun clang -mmacosx-version-min=11.0 -O0 -DSECTION=$section -o "$out/kernel-$section" "$root/tools/probe-macos-kernel.c" > "$out/kernel-$section.log" 2>&1; then
         status=0
         guarded 90 "$out/kernel-$section" || status=$?
@@ -214,4 +214,18 @@ for section in 1 2 3 4 5 6; do
         say "kernel section $section: build failed: $(tr '\n' ' ' < "$out/kernel-$section.log" | cut -c1-500)"
     fi
 done
+# ---- the x86-64 build under Rosetta, on an Apple Silicon runner (one time formula for translated processes) ----------------
+if [[ $machine == arm64 ]] && arch -x86_64 /usr/bin/true > /dev/null 2>&1; then
+    for section in 1 3 7; do
+        if xcrun clang -arch x86_64 -mmacosx-version-min=11.0 -O0 -DSECTION=$section -o "$out/kernel-x86-$section" "$root/tools/probe-macos-kernel.c" > "$out/kernel-x86-$section.log" 2>&1; then
+            status=0
+            guarded 90 arch -x86_64 "$out/kernel-x86-$section" || status=$?
+            say "kernel section $section (x86-64 under Rosetta): exit $status"
+        else
+            say "kernel section $section (x86-64 under Rosetta): build failed: $(tr '\n' ' ' < "$out/kernel-x86-$section.log" | cut -c1-500)"
+        fi
+    done
+else
+    say "no Rosetta here (or an Intel runner): no translated run"
+fi
 exit 0

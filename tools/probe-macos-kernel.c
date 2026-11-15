@@ -399,6 +399,43 @@ static void probe_overflow(void) {
 }
 
 #endif
+#if !defined(SECTION) || SECTION == 7
+// ---- 7. hw.tbfrequency by the raw sysctlbyname (BSD 274) ------------------------------------------------------------------------
+#include <sys/sysctl.h>
+static void probe_tbfrequency(void) {
+    const char *name = "hw.tbfrequency";
+    uint64_t value = 0xFEEDFACEFEEDFACEull;
+    uint64_t length = 8;
+    struct raw r = raw_call(274, (long)name, (long)strlen(name), (long)&value, (long)&length, 0, 0);
+    show("G1 sysctlbyname raw (\"hw.tbfrequency\", 14, &u64, &8, NULL, 0)", r);
+    printf("probe: G1 raw hw.tbfrequency = %llu, oldlen after = %llu\n", (unsigned long long)value,
+           (unsigned long long)length);
+    uint64_t libc_value = 0;
+    size_t libc_length = sizeof(libc_value);
+    int status = sysctlbyname(name, &libc_value, &libc_length, NULL, 0);
+    mach_timebase_info_data_t info = {0, 0};
+    mach_timebase_info(&info);
+    uint64_t before = mach_absolute_time();
+    uint64_t absolute = 0xFEEDFACEFEEDFACEull;
+    struct timeval tv;
+    struct raw g = raw_call(116, (long)&tv, 0, (long)&absolute, 0, 0, 0);
+    uint64_t after = mach_absolute_time();
+    printf("probe: G1 libSystem sysctlbyname = %d, hw.tbfrequency = %llu; mach_timebase_info = %u/%u; gettimeofday raw r0=%ld *abs=%llu (between %llu and %llu)\n",
+           status, (unsigned long long)libc_value, info.numer, info.denom, g.r0, (unsigned long long)absolute,
+           (unsigned long long)before, (unsigned long long)after);
+    if (value != 0 && value != 0xFEEDFACEFEEDFACEull) {
+        printf("probe: G1 ns = abs * 1e9 / tbfrequency: %llu (mach_absolute_time * numer / denom = %llu)\n",
+               (unsigned long long)((unsigned __int128)after * 1000000000u / value),
+               (unsigned long long)((unsigned __int128)after * info.numer / info.denom));
+    }
+#if defined(__x86_64__)
+    int translated = 0;
+    size_t translated_length = sizeof(translated);
+    int rosetta = sysctlbyname("sysctl.proc_translated", &translated, &translated_length, NULL, 0);
+    printf("probe: G1 sysctl.proc_translated = %d (call returned %d)\n", translated, rosetta);
+#endif
+}
+#endif
 int main(void) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     printf("probe: kernel probe on %s\n", arch_name());
@@ -419,6 +456,9 @@ int main(void) {
 #endif
 #if !defined(SECTION) || SECTION == 6
     probe_overflow();
+#endif
+#if !defined(SECTION) || SECTION == 7
+    probe_tbfrequency();
 #endif
     printf("probe: kernel probe done\n");
     return 0;
