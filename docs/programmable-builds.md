@@ -198,6 +198,24 @@ successful linking, with the build's staged outputs. Schema `abla.abi.v1`
 records the selected target,
 artifact container, foreign symbol, source declaration, parameter list, ABI
 result representation, ownership/nullability, and failure containment status.
+
+### Calling exports from several threads
+
+A library's exports share one heap, one collector and the lazy initialization of the module globals, none of which
+is synchronized until the library starts a thread of its own. Two threads that call exports at the same time
+(a host's UI thread and its workers, JNI callers) therefore corrupt the heap and crash, measured on both the
+default x86-64 Linux shared library (four callers, with and without `ABLA_GC_STRESS=1`) and the arm64 Android
+library (`tools/test-android-run.sh`).
+
+- **arm64 Android libraries** run every exported function under one recursive process-wide lock (bionic's
+  `pthread_mutex_lock`), so concurrent callers are serialized and the crash is gone. The costs: a caller waits
+  while another export runs, so a long export (a network wait) blocks the app's other calls into the library;
+  and an export that waits for another thread's call into the same library deadlocks, as with any big lock (a
+  callback into the host that blocks on a thread which itself is about to call an export). Keep exports short,
+  never wait on a thread that needs the library from inside one, and call back into the host without blocking on
+  its other threads.
+- **Linux shared libraries** have no such lock yet: the caller must serialize its calls (one thread, or its own
+  mutex). Calls from different threads one after another are fine.
 The sidecar is cached with the object and restored on a cache hit. The current
 direct-export manifest deliberately says `panic: not-contained`; consumers can
 reject that contract instead of assuming exceptions or traps are isolated.
