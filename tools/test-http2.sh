@@ -15,7 +15,7 @@ out=build/http2
 rm -rf "$out"
 mkdir -p "$out/docroot"
 
-for name in hpack client mock; do
+for name in hpack client server mock; do
     "$compiler" build "tests/cases/http2/$name.ab" -o "$out/$name" --no-cache > "$out/$name.build.log" 2>&1 || { cat "$out/$name.build.log" >&2; exit 1; }
     result=$("$root/tools/run-limited.sh" "$out/$name") || { echo "http2 $name: $result" >&2; exit 1; }
     [[ $result == "http2 $name ok" ]] || { echo "http2 $name: $result" >&2; exit 1; }
