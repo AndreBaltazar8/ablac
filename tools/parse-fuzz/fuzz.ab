@@ -1,0 +1,519 @@
+// Fuzzing of everything that parses untrusted bytes in abla/crypto and abla/tls/pure, deterministic from a seed (tools/test-parse-fuzz.sh drives it; the HPACK, H2Client and H2Server
+// targets are tools/http2-fuzz and the TLS state machines tools/tls-fuzz). Usage: fuzz <target> <first seed> <count> [seed file...] [--verbose]
+// Targets (each takes its seed files: valid inputs it mutates; a target that needs none says so):
+//   der        derItem walked recursively over mutated DER (seeds: .pem certificates and keys, .der, .p12)
+//   x509       x509ParseDer, x509ParsePem and x509Verify (against the unmutated chain as trust store and against a mutated one) on mutated certificates
+//   pem        pemBody, pemFind, pemLabel and pemBase64Decode on mutated PEM text
+//   identity   tlsIdentityFromPem on a mutated certificate chain and a mutated private key (PKCS#8, SEC1, RSA; seeds: .pem)
+//   pkcs       pbeOpenPkcs8 and pbeOpenPkcs12 on mutated encrypted keys and .p12 files with the test password (seeds: encrypted-rsa)
+//   mlkem      ML-KEM-768 encapsulation key and decapsulation key checks on mutated and random keys, encapsulation to random and mutated keys, decapsulation of mutated ciphertexts
+//              (implicit rejection: always a key, never the real one) and of wrong sizes; no seed files
+//   record     tlsOpenRecord on mutated, truncated and spliced protected records (every one must be refused: an authenticated record changes if a byte does) and on random bytes
+//   handshake  tlsParseClientHello, ServerHello, EncryptedExtensions, Certificate, CertificateVerify, NewSessionTicket, CertificateRequest, message headers and extensions on mutated
+//              built messages and random bytes
+//   ticket     the server's ticket opening on mutated and random tickets (never opens one that is not ours)
+// A finding is a violated rule, an input that takes over two seconds (quadratic cost), or a crash (a panic ends the program: the seed is printed before each run with --verbose).
+// Coverage: every distinct outcome (an accepted input kind, an error text) is counted and listed at the end.
+import "abla/io"
+import "abla/crypto"
+import "abla/crypto/der"
+import "abla/crypto/x509"
+import "abla/crypto/pbe"
+import "abla/crypto/mlkem"
+import "abla/crypto/result"
+import "abla/integer"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/tls/pure"
+import "abla/tls/pure/record"
+import "abla/tls/pure/handshake"
+import "abla/tls/pure/identity"
+import "abla/tls/pure/resume"
+import "abla/text"
+
+var choiceState = 1
+var failures = 0
+val coverageLabels: array<string> = []
+val coverageCounts: array<int> = []
+
+fun nextChoice(): int {
+    choiceState = (choiceState * 6364136223846793005 + 1442695040888963407)
+    (choiceState >> 33) & 2147483647
+}
+
+fun below(limit: int): int = if (limit <= 0) 0 else nextChoice() % limit
+
+fun finding(seed: int, what: string): void {
+    failures = failures + 1
+    if (failures < 25) println("FINDING seed $seed: $what")
+    return
+}
+
+fun cover(label: string): void {
+    for (i in 0 until coverageLabels.size) {
+        if (coverageLabels[i] == label) {
+            coverageCounts[i] = coverageCounts[i] + 1
+            return
+        }
+    }
+    coverageLabels.append(label)
+    coverageCounts.append(1)
+    return
+}
+
+fun randomBytes(maximum: int): string {
+    val count = below(maximum + 1)
+    val bytes: array<int> = []
+    for (i in 0 until count) bytes.append(below(256))
+    cryptoByteString(bytes)
+}
+
+/** One structural change: a byte flipped, set to an extreme, inserted, removed, a run repeated or cut, two places swapped, or a DER length made huge. */
+fun mutate(input: string): string {
+    if (input.size == 0) return randomBytes(8)
+    val at = below(input.size)
+    val kind = below(10)
+    if (kind == 0) return input.slice(0, at) + cryptoByteString([below(256)]) + input.slice(at + 1, input.size)
+    if (kind == 1) return input.slice(0, at) + cryptoByteString([input[at] ^ (1 << below(8))]) + input.slice(at + 1, input.size)
+    if (kind == 2) return input.slice(0, at) + cryptoByteString([below(256)]) + input.slice(at, input.size)
+    if (kind == 3) return input.slice(0, at) + input.slice(at + 1, input.size)
+    if (kind == 4) return input.slice(0, at)
+    if (kind == 5) {
+        val end = at + below(input.size - at) + 1
+        return input.slice(0, end) + input.slice(at, end) + input.slice(end, input.size)
+    }
+    if (kind == 6) {
+        val other = below(input.size)
+        return input.slice(0, at) + cryptoByteString([input[other]]) + input.slice(at + 1, input.size)
+    }
+    if (kind == 7) return input.slice(0, at) + cryptoByteString([255, 255, 255, 255, 127]) + input.slice(at, input.size)
+    if (kind == 8) return input.slice(0, at) + cryptoByteString([0x84, 255, 255, 255, 255]) + input.slice(at, input.size)
+    input.slice(0, at) + cryptoByteString([0x80]) + input.slice(at, input.size)
+}
+
+fun mutateMany(input: string): string {
+    var out = mutate(input)
+    var rounds = below(3)
+    while (rounds > 0) {
+        out = mutate(out)
+        rounds = rounds - 1
+    }
+    out
+}
+
+/** The input unchanged (a control: it must parse), one byte changed (often still well-formed), or several structural changes. */
+fun variant(input: string): string {
+    val kind = below(4)
+    if (kind == 0) return input
+    if (kind == 1 && input.size > 0) {
+        val at = below(input.size)
+        return input.slice(0, at) + cryptoByteString([below(256)]) + input.slice(at + 1, input.size)
+    }
+    mutateMany(input)
+}
+
+// ---- seeds: files; a PEM is kept as text and its decoded DER as another seed ----
+val textSeeds: array<string> = []
+val derSeeds: array<string> = []
+val p12Seeds: array<string> = []
+val p8Seeds: array<string> = []
+val certSeeds: array<string> = []
+val keySeeds: array<string> = []
+
+fun loadSeeds(paths: array<string>): void {
+    for (path in paths) {
+        val data = linuxReadFile(path, 4194304)
+        if (data.size == 0) continue
+        if (path.endsWith(".p12")) {
+            p12Seeds.append(data)
+            derSeeds.append(data)
+        } else if (data.contains("-----BEGIN")) {
+            textSeeds.append(data)
+            if (pemLabel(data) == "CERTIFICATE") certSeeds.append(data)
+            if (pemLabel(data).endsWith("PRIVATE KEY")) keySeeds.append(data)
+            val label = pemLabel(data)
+            val body = pemBody(data, label)
+            val decoded = pemBase64Decode(body)
+            if (decoded.size > 0) {
+                derSeeds.append(decoded)
+                if (label == "ENCRYPTED PRIVATE KEY") p8Seeds.append(decoded)
+            }
+        } else derSeeds.append(data)
+    }
+    return
+}
+
+fun pick(list: array<string>): string = list[below(list.size)]
+
+/** A PEM text for `der` under `label`. */
+fun rePem(label: string, der: string): string = "-----BEGIN $label-----\n" + base64Encode(der) + "\n-----END $label-----\n"
+
+/** A seed PEM with its DER body changed (so the text stays well-formed and the parser below it gets the mutation). */
+fun mutatePem(text: string): string {
+    val label = pemLabel(text)
+    if (label == "") return mutateMany(text)
+    val body = pemBase64Decode(pemBody(text, label))
+    if (body.size == 0) return mutateMany(text)
+    rePem(label, mutateMany(body))
+}
+
+fun timed(seed: int, what: string, started: int): void {
+    val spent = linuxMonotonicMilliseconds() - started
+    if (spent > 2000) finding(seed, "$what took $spent ms")
+    return
+}
+
+// ---- der ----
+fun walk(data: string, at: int, limit: int, depth: int): int {
+    var count = 0
+    var position = at
+    while (position < limit && count < 2000) {
+        val item = derItem(data, position, limit)
+        if (!item.ok) {
+            cover("der: item refused")
+            return count
+        }
+        cover("der: tag ${item.tag}")
+        if (item.end <= position || item.end > limit) return -1
+        if ((item.tag & 32) != 0 && depth < 12) {
+            val inner = walk(data, item.start, item.end, depth + 1)
+            if (inner < 0) return -1
+        }
+        position = item.end
+        count = count + 1
+    }
+    count
+}
+
+fun targetDer(seed: int): void {
+    val input = mutateMany(pick(derSeeds))
+    val started = linuxMonotonicMilliseconds()
+    if (walk(input, 0, input.size, 0) < 0) finding(seed, "derItem returned an item outside its limit")
+    timed(seed, "der", started)
+    return
+}
+
+// ---- x509 ----
+fun targetX509(seed: int): void {
+    val der = mutateMany(pick(derSeeds))
+    val started = linuxMonotonicMilliseconds()
+    val cert = x509ParseDer(der)
+    cover(if (cert.ok) "x509: a certificate parsed" else "x509: ${cert.error}")
+    val text = if (below(3) == 0) mutateMany(pick(textSeeds)) else mutatePem(pick(textSeeds))
+    val parsed = x509ParsePem(text)
+    cover("x509 pem: ${parsed.certificates.size} certificates, ${parsed.skipped} skipped")
+    if (parsed.certificates.size > 0) {
+        // Verify the mutated chain against the (unmutated) pem as the trust store and against itself.
+        val chain: array<string> = []
+        for (c in parsed.certificates) chain.append(c.der)
+        val store = x509TrustStoreFromPem(pick(textSeeds))
+        val verdict = x509Verify(chain, store, X509Options("localhost", 1893456000))
+        cover(if (verdict.ok) "x509: a chain verified" else "x509 verify: ${verdict.error}")
+        val self = x509Verify(chain, X509TrustStore(parsed.certificates), X509Options("", 1893456000))
+        cover(if (self.ok) "x509: a chain verified against itself" else "x509 verify (self): ${self.error}")
+    }
+    timed(seed, "x509", started)
+    return
+}
+
+// ---- pem ----
+fun targetPem(seed: int): void {
+    val text = if (below(3) == 0) mutateMany(pick(textSeeds)) else mutatePem(pick(textSeeds))
+    val started = linuxMonotonicMilliseconds()
+    val label = pemLabel(text)
+    cover(if (label == "") "pem: no label" else "pem: label $label")
+    val body = pemBody(text, if (label == "") "CERTIFICATE" else label)
+    val decoded = pemBase64Decode(body)
+    cover(if (decoded.size > 0) "pem: decoded" else "pem: not decoded")
+    val found = pemFind(text, "-----BEGIN", below(text.size + 1))
+    if (found < -1 || found > text.size) finding(seed, "pemFind returned $found for a text of ${text.size}")
+    timed(seed, "pem", started)
+    return
+}
+
+// ---- identity ----
+fun targetIdentity(seed: int): void {
+    if (certSeeds.size == 0 || keySeeds.size == 0) return
+    var certificate = pick(certSeeds)
+    var key = pick(keySeeds)
+    if (below(3) == 0) {
+        // One file holding both (a chain and its key): the success path, and the mutations of it.
+        val both = pick(textSeeds)
+        certificate = both
+        key = both
+    }
+    if (below(4) == 0) {
+        // unchanged: the success path
+    } else if (below(2) == 0) certificate = if (below(4) == 0) mutateMany(certificate) else mutatePem(certificate)
+    else key = if (below(4) == 0) mutateMany(key) else mutatePem(key)
+    val started = linuxMonotonicMilliseconds()
+    val identity = tlsIdentityFromPem(certificate, key, if (below(3) == 0) "test-only-password" else "")
+    cover(if (identity.ok()) "identity: loaded" else "identity: ${identity.error}")
+    timed(seed, "identity", started)
+    return
+}
+
+// ---- pkcs ----
+fun targetPkcs(seed: int): void {
+    val password = cryptoPassword("test-only-password")
+    val started = linuxMonotonicMilliseconds()
+    if (below(2) == 0 && p12Seeds.size > 0) {
+        val data = mutateMany(pick(p12Seeds))
+        val opened = pbeOpenPkcs12(data, password)
+        cover(if (opened.ok) "pkcs12: opened" else "pkcs12: ${opened.error}")
+    } else if (p8Seeds.size > 0) {
+        val data = mutateMany(pick(p8Seeds))
+        val opened = pbeOpenPkcs8(data, password)
+        cover(if (opened.ok) "pkcs8: opened" else "pkcs8: ${opened.error}")
+    }
+    timed(seed, "pkcs", started)
+    return
+}
+
+// ---- mlkem ----
+var mlkemEk = ""
+var mlkemDk = ""
+
+fun targetMlkem(seed: int): void {
+    if (mlkemEk.size == 0) {
+        val pair = mlkem768GenerateKey()
+        if (!pair.ok) {
+            finding(seed, "key generation failed")
+            return
+        }
+        mlkemDk = pair.bytes
+        mlkemEk = mlkem768EncapsulationKey(mlkemDk)
+    }
+    val started = linuxMonotonicMilliseconds()
+    val kind = below(6)
+    if (kind == 0) {
+        val ek = mutateMany(mlkemEk)
+        val ok = mlkem768CheckEncapsulationKey(ek)
+        cover(if (ok) "mlkem: a mutated ek accepted" else "mlkem: a mutated ek refused")
+        if (ok && ek.size != 1184) finding(seed, "an encapsulation key of ${ek.size} bytes was accepted")
+        if (ok) {
+            // An accepted key must encapsulate and its ciphertext decapsulate to the same secret only with the real key; here only that it does not crash.
+            val enc = mlkem768Encapsulate(ek)
+            cover(if (enc.ok) "mlkem: encapsulated to an accepted mutated ek" else "mlkem: encapsulation refused after the check")
+        }
+    } else if (kind == 1) {
+        val ok = mlkem768CheckEncapsulationKey(randomBytes(1300))
+        cover(if (ok) "mlkem: random ek accepted" else "mlkem: random ek refused")
+    } else if (kind == 2) {
+        val dk = mutateMany(mlkemDk)
+        val ok = mlkem768CheckDecapsulationKey(dk)
+        cover(if (ok) "mlkem: a mutated dk accepted" else "mlkem: a mutated dk refused")
+        if (ok && dk.size != 2400) finding(seed, "a decapsulation key of ${dk.size} bytes was accepted")
+    } else if (kind == 3) {
+        val good = mlkem768Encapsulate(mlkemEk)
+        if (!good.ok) {
+            finding(seed, "encapsulation to a good key failed")
+            return
+        }
+        val back = mlkem768Decapsulate(mlkemDk, good.ciphertext)
+        if (!back.ok || back.bytes != good.sharedSecret) finding(seed, "decapsulation did not recover the secret")
+        // A changed ciphertext: implicit rejection gives a secret that is not the real one, deterministically.
+        val bad = mutate(good.ciphertext)
+        val rejected = mlkem768Decapsulate(mlkemDk, bad)
+        if (bad.size == 1088) {
+            cover("mlkem: a mutated ciphertext decapsulated")
+            if (!rejected.ok) finding(seed, "decapsulation of a mutated ciphertext failed instead of rejecting implicitly: ${rejected.error}")
+            else if (bad != good.ciphertext && rejected.bytes == good.sharedSecret) finding(seed, "a mutated ciphertext gave the real secret")
+            else {
+                val again = mlkem768Decapsulate(mlkemDk, bad)
+                if (again.bytes != rejected.bytes) finding(seed, "implicit rejection is not deterministic")
+            }
+        } else {
+            cover("mlkem: a ciphertext of the wrong size")
+            if (rejected.ok) finding(seed, "a ciphertext of ${bad.size} bytes was decapsulated")
+        }
+    } else if (kind == 4) {
+        val r = mlkem768Decapsulate(mlkemDk, randomBytes(1200))
+        cover(if (r.ok) "mlkem: a random ciphertext decapsulated" else "mlkem: a random ciphertext refused")
+    } else {
+        val r = mlkem768Decapsulate(randomBytes(2500), randomBytes(1100))
+        cover(if (r.ok) "mlkem: a random dk decapsulated" else "mlkem: a random dk refused")
+    }
+    timed(seed, "mlkem", started)
+    return
+}
+
+// ---- record ----
+fun targetRecord(seed: int): void {
+    val aead = 1 + below(3)
+    val key = randomBytes(0)
+    val keyBytes: array<int> = []
+    for (i in 0 until tlsAeadKeyLength(aead)) keyBytes.append(below(256))
+    val ivBytes: array<int> = []
+    for (i in 0 until 12) ivBytes.append(below(256))
+    var sender = tlsRecordProtection(aead, cryptoByteString(keyBytes), cryptoByteString(ivBytes))
+    var receiver = tlsRecordProtection(aead, cryptoByteString(keyBytes), cryptoByteString(ivBytes))
+    val content = randomBytes(300)
+    val sealed = tlsProtectRecord(sender, 23, content, 0)
+    if (!sealed.ok) {
+        finding(seed, "sealing failed: ${sealed.error}")
+        return
+    }
+    val started = linuxMonotonicMilliseconds()
+    var tampered = sealed.bytes
+    val kind = below(4)
+    if (kind == 0) tampered = mutate(sealed.bytes)
+    else if (kind == 1) tampered = sealed.bytes.slice(0, below(sealed.bytes.size))
+    else if (kind == 2) tampered = sealed.bytes + randomBytes(8)
+    else tampered = randomBytes(80)
+    var probe = tlsRecordProtection(aead, cryptoByteString(keyBytes), cryptoByteString(ivBytes))
+    val opened = tlsOpenRecord(probe, tampered)
+    if (opened.ok && tampered != sealed.bytes) finding(seed, "a changed record (${kind}) was accepted")
+    cover(if (opened.ok) "record: opened" else "record: ${opened.error.slice(0, stripParen(opened.error))}")
+    // The unchanged record opens, and a replay under the next sequence number does not.
+    val good = tlsOpenRecord(receiver, sealed.bytes)
+    if (!good.ok || good.content != content || good.type != 23) finding(seed, "a good record did not open")
+    val replay = tlsOpenRecord(receiver, sealed.bytes)
+    if (replay.ok) finding(seed, "a replayed record opened")
+    timed(seed, "record", started)
+    return
+}
+
+// ---- handshake ----
+fun targetHandshake(seed: int): void {
+    val started = linuxMonotonicMilliseconds()
+    val random = randomBytes(0)
+    val shares: array<TlsKeyShare> = [TlsKeyShare(29, randomBytesFixed(32))]
+    var hello = tlsBuildClientHello(randomBytesFixed(32), randomBytesFixed(32), [4865, 4866, 4867], "example.com", [29, 23], shares, [1027, 2052, 1025], ["h2", "http/1.1"], "", [49199, 49200],
+        false, [TlsPskIdentity(randomBytesFixed(40), 12345)], 32, true)
+    // The message body (after the 4-byte header) is what the parser takes.
+    val body = if (hello.size > 4) hello.slice(4, hello.size) else hello
+    val kind = below(9)
+    if (kind == 0) {
+        val parsed = tlsParseClientHello(variant(body))
+        cover(if (parsed.ok) "handshake: client hello parsed" else "handshake client hello: ${parsed.error}")
+    } else if (kind == 1) {
+        val parsed = tlsParseClientHello(randomBytes(300))
+        cover(if (parsed.ok) "handshake: random client hello parsed" else "handshake client hello (random): ${parsed.error}")
+    } else if (kind == 2) {
+        val parsed = tlsParseServerHello(variant(serverHelloBody()))
+        cover(if (parsed.ok) "handshake: server hello parsed" else "handshake server hello: ${parsed.error}")
+    } else if (kind == 3) {
+        val parsed = tlsParseEncryptedExtensions(mutateMany("\x00\x0b\x00\x10\x00\x0e\x00\x0c\x02h2\x08http/1.1" + randomBytes(10)))
+        cover(if (parsed.ok) "handshake: encrypted extensions parsed" else "handshake encrypted extensions: ${parsed.error}")
+    } else if (kind == 4) {
+        val parsed = tlsParseCertificate(mutateMany("\x00\x00\x00\x0a\x00\x00\x03abc\x00\x00" + randomBytes(20)))
+        cover(if (parsed.ok) "handshake: certificate parsed" else "handshake certificate: ${parsed.error}")
+        val parsed2 = tlsParseCertificate(randomBytes(200))
+        cover(if (parsed2.ok) "handshake: random certificate parsed" else "handshake certificate (random): ${parsed2.error}")
+    } else if (kind == 5) {
+        val parsed = tlsParseCertificateVerify(mutateMany("\x04\x03\x00\x04abcd" + randomBytes(4)))
+        cover(if (parsed.ok) "handshake: certificate verify parsed" else "handshake certificate verify: refused")
+    } else if (kind == 6) {
+        val parsed = tlsParseNewSessionTicket(mutateMany("\x00\x00\x1c\x20\x01\x02\x03\x04\x02\x00\x01\x00\x08ABCDEFGH\x00\x00"))
+        cover(if (parsed.ok) "handshake: new session ticket parsed" else "handshake new session ticket: refused")
+        val parsed2 = tlsParseNewSessionTicket(randomBytes(120))
+        cover(if (parsed2.ok) "handshake: random new session ticket parsed" else "handshake new session ticket (random): refused")
+    } else if (kind == 7) {
+        val parsed = tlsParseCertificateRequest(mutateMany("\x00\x00\x08\x00\x0d\x00\x04\x00\x02\x04\x03") + randomBytes(0))
+        cover(if (parsed.ok) "handshake: certificate request parsed" else "handshake certificate request: refused")
+    } else {
+        val header = tlsParseMessageHeader(randomBytes(20), below(10))
+        cover(if (header.ok) "handshake: message header parsed" else "handshake: message header refused")
+        var reader = tlsReader(mutateMany(body))
+        val extensions = tlsParseExtensions(reader)
+        cover(if (extensions.ok) "handshake: extensions parsed" else "handshake extensions refused")
+    }
+    timed(seed, "handshake", started)
+    return
+}
+
+fun randomBytesFixed(count: int): string {
+    val bytes: array<int> = []
+    for (i in 0 until count) bytes.append(below(256))
+    cryptoByteString(bytes)
+}
+
+fun serverHelloBody(): string {
+    val random = randomBytesFixed(32)
+    "\x03\x03" + random + "\x20" + randomBytesFixed(32) + "\x13\x01\x00" + "\x00\x2e\x00\x2b\x00\x02\x03\x04\x00\x33\x00\x24\x00\x1d\x00\x20" + randomBytesFixed(32)
+}
+
+// ---- ticket ----
+var ticketKeys: TlsTicketKeys? = null
+var ticketClock = 1000
+
+fun fixedRandom(count: int): string = randomBytesFixed(count)
+
+fun targetTicket(seed: int): void {
+    if (ticketKeys == null) ticketKeys = tlsTicketKeysNew(fixedRandom, { -> ticketClock })
+    val keys = ticketKeys
+    if (keys == null) {
+        finding(seed, "no ticket keys")
+        return
+    }
+    val started = linuxMonotonicMilliseconds()
+    val seal = keys.seal
+    val open = keys.open
+    val good = seal(4865, 12345, randomBytesFixed(32), "h2", "example.com")
+    val state = open(good)
+    cover(if (state.ok) "ticket: a good ticket opened" else "ticket: a good ticket refused")
+    if (!state.ok) finding(seed, "a ticket the server sealed did not open")
+    val kind = below(3)
+    var ticket = good
+    if (kind == 0) ticket = mutateMany(good)
+    else if (kind == 1) ticket = randomBytes(200)
+    else ticket = good.slice(0, below(good.size))
+    val opened = open(ticket)
+    if (opened.ok && ticket != good) finding(seed, "a changed ticket opened (${kind})")
+    cover(if (opened.ok) "ticket: opened" else "ticket: refused")
+    // A ticket outlives its lifetime: refused (the server checks the clock in the state; the age is the caller's).
+    timed(seed, "ticket", started)
+    return
+}
+
+fun main: int {
+    if (processArgumentCount() < 3) {
+        println("usage: fuzz <target> <first seed> <count> [seed file...] [--verbose]")
+        return 2
+    }
+    val target = processArgument(0)
+    val firstArg = processArgument(1).parseInt()
+    val countArg = processArgument(2).parseInt()
+    if (firstArg == null || countArg == null) return 2
+    val first: int = firstArg
+    val count: int = countArg
+    val paths: array<string> = []
+    var verbose = false
+    for (i in 3 until processArgumentCount()) {
+        if (processArgument(i) == "--verbose") verbose = true
+        else paths.append(processArgument(i))
+    }
+    loadSeeds(paths)
+    val needsSeeds = target == "der" || target == "x509" || target == "pem" || target == "identity" || target == "pkcs"
+    if (needsSeeds && derSeeds.size == 0) {
+        println("target $target needs seed files")
+        return 2
+    }
+    for (seed in first until first + count) {
+        choiceState = seed * 2654435761 + 12345
+        if (verbose) println("seed $seed")
+        if (target == "der") targetDer(seed)
+        else if (target == "x509") targetX509(seed)
+        else if (target == "pem") targetPem(seed)
+        else if (target == "identity") targetIdentity(seed)
+        else if (target == "pkcs") targetPkcs(seed)
+        else if (target == "mlkem") targetMlkem(seed)
+        else if (target == "record") targetRecord(seed)
+        else if (target == "handshake") targetHandshake(seed)
+        else if (target == "ticket") targetTicket(seed)
+        else {
+            println("unknown target $target")
+            return 2
+        }
+    }
+    println("coverage: ${coverageLabels.size} outcomes")
+    for (i in 0 until coverageLabels.size) println("  ${coverageCounts[i]} ${coverageLabels[i]}")
+    if (failures == 0) println("parse-fuzz $target ok: seeds $first..${first + count - 1}")
+    failures
+}
+
+fun stripParen(text: string): int {
+    val at = text.indexOf("(")
+    if (at < 0) text.size else at
+}
