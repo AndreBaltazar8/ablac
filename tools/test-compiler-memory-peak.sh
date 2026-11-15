@@ -30,6 +30,27 @@ for run in 1 2; do
     measured=$(tail -n 1 "$output_directory/peak.$run")
     if [[ -z $peak || $measured -lt $peak ]]; then peak=$measured; fi
 done
+# The same compile given the path relative to the project root must peak the same: the semantic identities once carried the
+# source path of every name and local, and an absolute path peaked ~100 MB over a relative one (#814). Lower of two runs; the
+# absolute path may not peak more than 4% (about 60 MB) over the relative one.
+relative_peak=""
+for run in 1 2; do
+    (
+        cd "$project_root"
+        ABLA_MAX_MEMORY_MB=4096 ABLA_MAX_SECONDS=1800 ABLA_MAX_CPU_SECONDS=120 /usr/bin/env time -f '%M' -o "$output_directory/relative.$run" \
+            "$project_root/tools/run-limited.sh" "$compiler" --emit-llvm src/orc_main.ab >"$output_directory/self.ll" 2>"$output_directory/self.err"
+    ) || {
+        echo "compiler-memory-peak: --emit-llvm src/orc_main.ab (a relative path) failed" >&2
+        sed -n '1,20p' "$output_directory/self.err" >&2
+        exit 1
+    }
+    measured=$(tail -n 1 "$output_directory/relative.$run")
+    if [[ -z $relative_peak || $measured -lt $relative_peak ]]; then relative_peak=$measured; fi
+done
+if (( peak * 100 > relative_peak * 104 )); then
+    echo "compiler-memory-peak: $peak kB with the absolute path to src/orc_main.ab, $relative_peak kB with the relative one: a build's peak must not follow the length of the path (what keeps the path per name or local?)." >&2
+    exit 1
+fi
 recorded=$(grep -v '^#' "$record" | tail -n 1 | cut -d' ' -f1)
 if (( peak * 100 > recorded * 110 )); then
     echo "compiler-memory-peak: $peak kB, over the recorded $recorded kB by more than 10%. Find what grew (ABLA_COMPILER_MEMORY_TRACE=1 prints live bytes by phase), or add a line to $record saying why." >&2
@@ -39,4 +60,4 @@ if (( peak * 100 < recorded * 80 )); then
     echo "compiler-memory-peak: $peak kB, more than 20% under the recorded $recorded kB: add a line to $record." >&2
     exit 1
 fi
-echo "compiler-memory-peak: --emit-llvm of the compiler peaks at $peak kB (recorded $recorded kB)"
+echo "compiler-memory-peak: --emit-llvm of the compiler peaks at $peak kB (recorded $recorded kB; $relative_peak kB given a relative path)"
