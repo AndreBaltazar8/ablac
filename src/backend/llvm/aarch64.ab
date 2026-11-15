@@ -449,3 +449,35 @@ fun bootstrapLlvmEmitMachORoutines(backend: BootstrapLlvmBackend): void {
     LLVMAppendModuleInlineAsm(backend.module, assembly, assembly.size)
     return
 }
+
+fun bootstrapLlvmEmitMachOJumpRoutines(backend: BootstrapLlvmBackend): void {
+    val assembly = bootstrapLlvmMachOJumpAssembly(bootstrapLlvmMachOIsArm(backend.targetTriple))
+    LLVMAppendModuleInlineAsm(backend.module, assembly, assembly.size)
+    return
+}
+
+// _setjmp and _longjmp of a macOS executable (#811), hidden (`.private_extern`) like the memory
+// routines, so the program imports neither from libSystem. Their jmp_buf is their own: both
+// ends are in the program's module (the runtime's _longjmp, the backend's _setjmp call sites), so
+// no libSystem format is kept. arm64 is the AArch64 Linux layout (aarch64.ab) rewritten for Mach-O;
+// x86-64 is the Linux layout without glibc's pointer guard (macOS has no %fs:0x30): rbx, rbp, r12,
+// r13, r14, r15, rsp after the return, the return address, in words 0 to 7. Not for an image that
+// links LLVM (the compiler): code ORC runs in that process resolves libSystem's, and a buffer must
+// not be set by one and left by the other.
+fun bootstrapLlvmMachOJumpAssembly(arm: bool): string {
+    if (arm) return bootstrapLlvmMachOAssembly(bootstrapLlvmAarch64JumpAssembly())
+    ".text\n.p2align 4\n" +
+        ".globl __setjmp\n.private_extern __setjmp\n__setjmp:\n" +
+        "    movq %rbx, (%rdi)\n    movq %rbp, 8(%rdi)\n    movq %r12, 16(%rdi)\n" +
+        "    movq %r13, 24(%rdi)\n    movq %r14, 32(%rdi)\n    movq %r15, 40(%rdi)\n" +
+        "    leaq 8(%rsp), %rdx\n    movq %rdx, 48(%rdi)\n" +
+        "    movq (%rsp), %rax\n    movq %rax, 56(%rdi)\n" +
+        "    xorl %eax, %eax\n    ret\n" +
+        ".p2align 4\n" +
+        ".globl __longjmp\n.private_extern __longjmp\n__longjmp:\n" +
+        "    movq (%rdi), %rbx\n    movq 8(%rdi), %rbp\n    movq 16(%rdi), %r12\n" +
+        "    movq 24(%rdi), %r13\n    movq 32(%rdi), %r14\n    movq 40(%rdi), %r15\n" +
+        "    movq 48(%rdi), %rdx\n    movq 56(%rdi), %rcx\n" +
+        "    movl %esi, %eax\n    testl %eax, %eax\n    jne 1f\n    incl %eax\n" +
+        "1:  movq %rdx, %rsp\n    jmp *%rcx\n"
+}

@@ -8,7 +8,7 @@ compiler=${1:-build/ablac}
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
 if [[ $(uname -s) != Linux || $(uname -m) != x86_64 ]]; then
-    echo 'libc jump routines: x86-64 Linux only (macOS keeps libSystem)'
+    echo 'libc jump routines: x86-64 Linux only (macOS: tools/test-darwin-routines.sh)'
     exit 0
 fi
 out=build/libc-jump-routines
