@@ -5,6 +5,7 @@ import "backend/llvm/backend.ab"
 import "backend/llvm/coverage.ab"
 import "backend/llvm/analysis.ab"
 import "module.ab"
+import "ct_native.ab"
 import "lexer.ab"
 import "sourcemap.ab"
 import "abla/sys/linux/fs"
@@ -95,13 +96,23 @@ fun bootstrapRequireStandardLibrary(): void {
 }
 
 // The module graph of `sourcePath` with the host runtime, loaded (not yet parsed).
-fun bootstrapLoadHostModuleGraph(sourcePath: string): BootstrapModuleGraph {
+fun bootstrapLoadHostModuleGraph(sourcePath: string, honorManifest: bool = false): BootstrapModuleGraph {
     val state = bootstrapModuleState()
     val graph = BootstrapModuleGraph([], 0, state, [], [], "", [], bootstrapModuleGraphIndex())
     val standardLibrary = Path(bootstrapStandardLibraryRoot())
     bootstrapRequireStandardLibrary()
     // (The runtime loads first: its imports are remapped as the program's.)
-    graph.useRootManifest(bootstrapNormalizeModulePath(sourcePath))
+    val entryIdentity = bootstrapNormalizeModulePath(sourcePath)
+    graph.useRootManifest(entryIdentity)
+    // The first module a graph loads names the manifest whose compileCapabilities authorize its compile-time code (and the
+    // entry compile-time file access is relative to). Here that is the runtime, so without this a program's own
+    // compileCapabilities were never read: `ablac build` honoured them, `run` stopped with compile.capability-not-authorized.
+    // `run` asks for them; --emit-llvm, a view of the IR that must not run a program's processes or read its files, does not.
+    val capabilities: array<string> = if (honorManifest) bootstrapManifestCompileCapabilities(entryIdentity) else []
+    if (capabilities.size > 0) {
+        ctNativeSetEntry(entryIdentity)
+        for (capability in capabilities) graph.authorizedCompileCapabilities.append(capability)
+    }
     graph.load(standardLibrary.child("abla/runtime/self/entry.ab").text)
     graph.load(standardLibrary.child("abla/runtime/platform/host.ab").text)
     if (ablaHostIsMacOS()) graph.load(standardLibrary.child("abla/runtime/platform/darwin/entry.ab").text)
@@ -5129,7 +5140,7 @@ fun bootstrapPrepareRun(sourcePath: string, hold: bool = false): BootstrapRunIr 
     val enclosingFloatAvailable = bootstrapFloatBridgeAvailable
     bootstrapBeginCompileOutputs()
     val llvmPath = "build/.abla-run-${linuxProcessId()}.ll"
-    val graph = bootstrapLoadHostModuleGraph(sourcePath)
+    val graph = bootstrapLoadHostModuleGraph(sourcePath, true)
     var parsed = graph.parse()
     val baseSnapshots = graph.orderedSnapshots.size
     val enclosingHold = bootstrapLlvmHoldModule
