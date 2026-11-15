@@ -1,18 +1,31 @@
-// NIST P-384 (secp384r1) ECDSA verification and public key checks, in Abla, for certificate chains and TLS: the same complete
+// NIST P-384 (secp384r1) in Abla: ECDH, ECDSA verification and public key checks, for TLS and certificate chains: the same complete
 // point formulas as abla/crypto/p256 (a = -3 here too) on the big-number arithmetic of abla/crypto/bignum, 12 limbs.
-// Everything here works on public values (a public key, a message digest, a signature), so the scalar multiplication
-// is a plain binary one and nothing is claimed to be constant time. Signing and key agreement on P-384 are not here.
 //
+// What is secret and how it is handled (as in abla/crypto/p256):
+//  - A private key is 48 big-endian bytes, a string (as every key in abla/crypto: it cannot be wiped; the limbs made from it
+//    and the table of multiples are, when the call ends). It is refused when it is not in 1..n-1; that outcome is public.
+//  - Point addition and doubling are the complete formulas of Renes, Costello and Batina (ePrint 2015/1060, algorithms 4 and 6 for
+//    a = -3): the same instructions for every input, the point at infinity and equal points included.
+//  - A secret scalar multiplication (p384ScalarMultiplySecret, for ECDH and the public key) walks all 96 four-bit windows of the scalar,
+//    doubles four times and adds once per window, the added point read from a table of sixteen by looking at every entry (bnLookup).
+//  - The inversion that makes the result affine is Fermat's by a public exponent (bnExpPublic): its input is the z of the
+//    result, which is not secret once the shared x is revealed; tools/test-ct.sh does not read it.
+//  - Verification works on public values only (a public key, a message digest, a signature) and uses a plain binary scalar
+//    multiplication (p384ScalarMultiplyPublic): nothing is claimed to be constant time there. Signing is not here.
+//
+// tools/test-ct.sh reads the region between BEGIN P384 SECRET CORES and END P384 SECRET CORES.
 // A public key is 97 bytes, 0x04 || X || Y; compressed points are refused.
 
 import "abla/bytes"
 import "abla/ct"
 import "abla/crypto"
 import "abla/crypto/bignum"
+import "abla/ct/scrub"
+import "abla/text"
 import "abla/unsafe/memory"
 import "abla/unsafe/memory/raw"
+export import "abla/crypto/result"
 
-private val P384_WORDS = 12
 private val P384_PRIME = "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffff"
 private val P384_PRIME_MINUS_TWO = "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000fffffffd"
 private val P384_ORDER = "ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196accc52973"
@@ -21,10 +34,17 @@ private val P384_B = "b3312fa7e23ee7e4988e056be3f82d19181d9c6efe8141120314088f50
 private val P384_GX = "aa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a385502f25dbf55296c3a545e3872760ab7"
 private val P384_GY = "3617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c00a60b1ce1d7e819d7a431d7c90ea0e5f"
 
-// Work area, in bytes: five temporaries of 48 bytes, then b.
+// BEGIN P384 SECRET CORES
+private val P384_WORDS = 12
+// Work area, in bytes: five temporaries of 48 bytes, then b, then the accumulator, the sum and the entry read from the table (a
+// projective point is three field elements, 144 bytes), then the table of sixteen points.
 private val P384_TEMPS = 0
 private val P384_B_AT = 240
-private val P384_WORK_WORDS = 72
+private val P384_ACCUMULATOR = 288
+private val P384_SUM = 432
+private val P384_ENTRY = 576
+private val P384_TABLE = 720
+private val P384_WORK_WORDS = 756
 
 // Where a BnModulus keeps what the arithmetic reads, for twelve limbs.
 private @inline fun p384Inverse(m: int): int = m + 48
@@ -180,6 +200,52 @@ private trusted fun p384PointDouble(f: int, work: int, out: int, p: int): void {
 }
 
 
+/** Nonzero when the twelve limbs at `value` are a number from 1 to n-1, n at `order`: every limb is read, and only the verdict is
+ *  public (a key that is refused). A word, not a bool: a comparison here would be a branch on a target with no conditional set. */
+trusted fun p384InRange(order: int, value: int): u32 {
+    var borrow = secretU32(u32(0))
+    var any = secretU32(u32(0))
+    for (j in 0 until P384_WORDS) {
+        val x = bnLoad(value + j * 4)
+        val y = bnLoad(order + j * 4)
+        val difference = x - y - borrow
+        borrow = ((~x & y) | ((~x | y) & difference)) >> 31
+        any = any | x
+    }
+    // value - n borrows exactly when value < n.
+    (borrow & ctIsNonZero(any)).declassify()
+}
+
+/** `out` = `scalar` * `point`: `scalar` is twelve plain limbs (secret), `point` projective in Montgomery form, and `out` is neither.
+ *  Every window of four bits does the same four doublings, one addition and a read of the whole table of sixteen multiples. */
+trusted fun p384ScalarMultiplySecret(f: int, work: int, out: int, point: int, scalar: int): void {
+    val accumulator = work + P384_ACCUMULATOR
+    val sum = work + P384_SUM
+    val entry = work + P384_ENTRY
+    val table = work + P384_TABLE
+    // Entry 0 is the point at infinity, (0 : 1 : 0).
+    for (j in 0 until 36) ablaUnsafeStoreU32(bnPointer(table + j * 4), 0)
+    bnCopy(table + 48, p384One(f), P384_WORDS)
+    bnCopy(table + 144, point, 36)
+    for (i in 2 until 16) p384PointAdd(f, work, table + i * 144, table + (i - 1) * 144, point)
+    bnCopy(accumulator, table, 36)
+    var window = 95
+    while (window >= 0) {
+        for (i in 0 until 4) {
+            p384PointDouble(f, work, sum, accumulator)
+            bnCopy(accumulator, sum, 36)
+        }
+        val position = window * 4
+        val digit = (bnLoad(scalar + (position / 32) * 4) >> (position % 32)) & secretU32(u32(15))
+        bnLookup(entry, table, 16, 36, digit)
+        p384PointAdd(f, work, sum, accumulator, entry)
+        bnCopy(accumulator, sum, 36)
+        window = window - 1
+    }
+    bnCopy(out, accumulator, 36)
+}
+// END P384 SECRET CORES
+
 class P384Curve(val field: BnModulus, val order: BnModulus, val work: int)
 
 private trusted fun p384Open(): P384Curve {
@@ -214,8 +280,8 @@ private trusted fun p384MultiplyPlain(m: BnModulus, out: int, a: int, b: int): v
     bnRelease(encoded, P384_WORDS)
 }
 
-/** `out` = `scalar` * `point` (public scalar of twelve plain limbs; `point` projective, Montgomery), `out` is neither. */
-private trusted fun p384ScalarMultiply(c: P384Curve, out: int, point: int, scalar: int): void {
+/** `out` = `scalar` * `point` for a public scalar (signature verification) of twelve plain limbs; `point` projective, Montgomery; `out` is neither. */
+private trusted fun p384ScalarMultiplyPublic(c: P384Curve, out: int, point: int, scalar: int): void {
     val f = c.field.memory
     val work = c.work
     val accumulator = bnAllocate(36)
@@ -304,6 +370,102 @@ trusted fun p384IsValidPublicKey(encoded: string): bool {
     ok
 }
 
+private fun p384Failed(error: string): CryptoResult = cryptoFailed(error)
+
+/** The `count` bytes at `limbs` as a string, most significant first. */
+private trusted fun p384Bytes(limbs: int, count: int): string {
+    val out = nativeByteBuffer(count + 1)
+    bnToBytes(ablaUnsafePointerAddress(out.pointerAt(0)), count, limbs)
+    out.adoptString(count)
+}
+
+/** The point at `point` (projective, Montgomery) as plain affine x and y, or false for the point at infinity. */
+private trusted fun p384ToAffine(c: P384Curve, point: int, x: int, y: int): bool {
+    val f = c.field
+    val z = bnAllocate(P384_WORDS)
+    val inverse = bnAllocate(P384_WORDS)
+    bnDecode(f, z, point + 96)
+    val infinity = p384IsZero(z)
+    bnExpPublic(f, inverse, z, hexDecode(P384_PRIME_MINUS_TWO))
+    bnDecode(f, x, point)
+    bnDecode(f, y, point + 48)
+    p384MultiplyPlain(f, x, x, inverse)
+    p384MultiplyPlain(f, y, y, inverse)
+    bnRelease(z, P384_WORDS)
+    bnRelease(inverse, P384_WORDS)
+    !infinity
+}
+
+/** The 48 bytes at `key` as a private scalar in `out` (twelve limbs), if it is in 1..n-1. */
+private trusted fun p384ParseScalar(c: P384Curve, key: string, out: int): bool {
+    if (key.size != 48) return false
+    bnFromBytes(out, P384_WORDS, ablaUnsafeStringAddress(key), 48)
+    p384InRange(c.order.value(), out) != u32(0)
+}
+
+/** The public key, 97 bytes (0x04 || X || Y), of a private key of 48 bytes. */
+trusted fun p384PublicKey(privateKey: string): CryptoResult {
+    val result = p384PublicKeyWork(privateKey)
+    ctScrubStack4096()
+    return result
+}
+
+private @noinline trusted fun p384PublicKeyWork(privateKey: string): CryptoResult {
+    val c = p384Open()
+    val scalar = bnAllocate(P384_WORDS)
+    var result = p384Failed("the private key is not a number from 1 to n-1 in 48 bytes")
+    if (p384ParseScalar(c, privateKey, scalar)) {
+        val g = bnAllocate(36)
+        val point = bnAllocate(36)
+        val x = bnAllocate(P384_WORDS)
+        val y = bnAllocate(P384_WORDS)
+        p384Generator(c, g)
+        p384ScalarMultiplySecret(c.field.memory, c.work, point, g, scalar)
+        if (p384ToAffine(c, point, x, y)) {
+            result = CryptoResult("\x04" + p384Bytes(x, 48) + p384Bytes(y, 48), true, "")
+        }
+        bnRelease(g, 36)
+        bnRelease(point, 36)
+        bnRelease(x, P384_WORDS)
+        bnRelease(y, P384_WORDS)
+    }
+    bnRelease(scalar, P384_WORDS)
+    p384Close(c)
+    result
+}
+
+/** ECDH: the x coordinate, 48 bytes, of `privateKey` times the peer's public point. The peer's point is checked (a point of the
+ *  curve: the group has cofactor 1, so that is all there is to check); a private key out of range is refused. */
+trusted fun p384Ecdh(privateKey: string, peerPublicKey: string): CryptoResult {
+    val result = p384EcdhWork(privateKey, peerPublicKey)
+    ctScrubStack4096()
+    return result
+}
+
+private @noinline trusted fun p384EcdhWork(privateKey: string, peerPublicKey: string): CryptoResult {
+    val c = p384Open()
+    val scalar = bnAllocate(P384_WORDS)
+    var result = p384Failed("the private key is not a number from 1 to n-1 in 48 bytes")
+    if (p384ParseScalar(c, privateKey, scalar)) {
+        val peer = bnAllocate(36)
+        result = p384Failed("the public key is not a point of P-384")
+        if (p384ParsePoint(c, peerPublicKey, peer)) {
+            val point = bnAllocate(36)
+            val x = bnAllocate(P384_WORDS)
+            val y = bnAllocate(P384_WORDS)
+            p384ScalarMultiplySecret(c.field.memory, c.work, point, peer, scalar)
+            if (p384ToAffine(c, point, x, y)) result = CryptoResult(p384Bytes(x, 48), true, "")
+            bnRelease(point, 36)
+            bnRelease(x, P384_WORDS)
+            bnRelease(y, P384_WORDS)
+        }
+        bnRelease(peer, 36)
+    }
+    bnRelease(scalar, P384_WORDS)
+    p384Close(c)
+    result
+}
+
 /** Verifies the signature `r || s` (96 bytes) of a message digest (the leftmost 384 bits of a longer one count) under the
  *  public key (97 bytes). */
 trusted fun p384EcdsaVerifyDigestRaw(publicKey: string, digest: string, signature: string): bool {
@@ -335,8 +497,8 @@ trusted fun p384EcdsaVerifyDigestRaw(publicKey: string, digest: string, signatur
             p384MultiplyPlain(order, u1, e, w)
             p384MultiplyPlain(order, u2, r, w)
             p384Generator(c, g)
-            p384ScalarMultiply(c, first, g, u1)
-            p384ScalarMultiply(c, second, q, u2)
+            p384ScalarMultiplyPublic(c, first, g, u1)
+            p384ScalarMultiplyPublic(c, second, q, u2)
             p384PointAdd(c.field.memory, c.work, total, first, second)
             if (p384AffineX(c, total, x)) {
                 bnConditionalSubtractBody(x, x, secretU32(u32(0)), order.value(), P384_WORDS, order.scratch())

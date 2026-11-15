@@ -75,6 +75,8 @@ before measurement. Each observation has separate storage.
 | `hkdf-expand` | `hkdfExpand` (HMAC-SHA256) of a TLS 1.3 key label from a zero vs random 32-byte PRK |
 | `x25519` | `x25519` of a zero vs random scalar (clamped by the function) with a fixed peer share |
 | `p256-ecdh` | `p256Ecdh` of a scalar whose top byte is 0x7f in both classes, with a fixed peer point |
+| `p384-ecdh` | `p384Ecdh` of a 48-byte scalar whose top byte is 0x7f in both classes, with a fixed peer point |
+| `mlkem-decaps` | `mlkem768Decapsulate` with a fixed key: the ciphertext is the valid one in the zero class and the valid one altered throughout in the random class (implicit rejection), so the accepted and the rejected path must take the same time |
 | `p256-sign` | `p256EcdsaSign` (RFC 6979 nonce) of a fixed message with a key whose top byte is 0x7f in both classes, zero vs random below it |
 | `p256-sign-nonce` | `p256EcdsaSign` with a fixed key of a zero vs random 64-byte message: the message is public, the nonce it sets is not |
 | `ed25519-sign` | `ed25519Sign` of a fixed message with a zero vs random seed |

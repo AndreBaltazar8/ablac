@@ -1,0 +1,83 @@
+// P-384 key agreement (abla/crypto/p384): what Wycheproof's ECDH file (wycheproof-tls.ab) does not say, and the outputs that
+// tools/test-crypto-pure.sh compares with openssl. Private keys out of range (0, n, n + 1, all ones, a wrong length) are refused;
+// scalar 1 gives the generator and 2 its double; the peer points that must be refused (off the curve, the point at infinity, a
+// compressed form, a coordinate at or above p, a wrong length) are. Arguments: PRIVATE_HEX PEER_PUBLIC_HEX (pairs); for each pair
+// prints "public HEX" (the public key of PRIVATE) and "shared HEX" (the x coordinate of PRIVATE times PEER), for openssl to check.
+// Prints "crypto-pure p384 ok" last.
+import "abla/crypto"
+import "abla/crypto/p384"
+import "abla/io"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/text"
+
+var failures = 0
+
+fun expect(ok: bool, what: string): void {
+    if (!ok) {
+        failures = failures + 1
+        println("FAIL $what")
+    }
+    return
+}
+
+val ORDER = "ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196accc52973"
+val PRIME = "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffff"
+val GX = "aa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a385502f25dbf55296c3a545e3872760ab7"
+val GY = "3617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c00a60b1ce1d7e819d7a431d7c90ea0e5f"
+// 2G, from FIPS 186 / SEC 2 test data.
+val G2X = "08d999057ba3d2d969260045c55b97f089025959a6f434d651d207d19fb96e9e4fe0e86ebe0e64f85b96a9c75295df61"
+val G2Y = "8e80f1fa5b1b3cedb7bfe8dffd6dba74b275d875bc6cc43e904e505f256ab4255ffd43e94d39e22d61501e700a940e80"
+
+fun hex48(value: int): string = "00".repeat(47) + hexByte(value)
+fun hexByte(value: int): string = hexEncode(cryptoByteString([value]))
+
+fun refusals(): void {
+    val one = hexDecode(hex48(1))
+    val g = hexDecode("04" + GX + GY)
+    val made = p384PublicKey(one)
+    expect(made.ok && made.bytes == g, "the public key of 1 is the generator")
+    val two = p384PublicKey(hexDecode(hex48(2)))
+    expect(two.ok && two.bytes == hexDecode("04" + G2X + G2Y), "the public key of 2 is 2G")
+    expect(!p384PublicKey(hexDecode(hex48(0))).ok, "a zero private key")
+    expect(!p384PublicKey(hexDecode(ORDER)).ok, "the private key n")
+    val orderPlusOne = hexDecode(ORDER.slice(0, 94) + "74")
+    expect(!p384PublicKey(orderPlusOne).ok, "the private key n + 1")
+    expect(!p384PublicKey(hexDecode("ff".repeat(48))).ok, "an all-ones private key")
+    expect(p384PublicKey(hexDecode(ORDER.slice(0, 94) + "72")).ok, "the private key n - 1")
+    expect(!p384PublicKey(hexDecode("00".repeat(47))).ok, "a 47-byte private key")
+    expect(!p384PublicKey(hexDecode(hex48(1) + "00")).ok, "a 49-byte private key")
+    expect(!p384Ecdh(hexDecode(ORDER), g).ok, "ECDH with the private key n")
+    expect(p384Ecdh(one, g).ok && p384Ecdh(one, g).bytes == hexDecode(GX), "ECDH of 1 and G is Gx")
+    // Peer points that are refused.
+    val offCurve = hexDecode("04" + GX + GY.slice(0, 94) + "60")
+    expect(!p384Ecdh(one, offCurve).ok, "a point off the curve")
+    expect(!p384Ecdh(one, hexDecode("04" + "00".repeat(96))).ok, "the point (0, 0)")
+    expect(!p384Ecdh(one, hexDecode("02" + GX)).ok, "a compressed point")
+    expect(!p384Ecdh(one, hexDecode("03" + GX)).ok, "a compressed point, odd")
+    expect(!p384Ecdh(one, hexDecode("00")).ok, "the point at infinity, encoded as one byte")
+    expect(!p384Ecdh(one, hexDecode("04" + PRIME + GY)).ok, "x equal to p")
+    expect(!p384Ecdh(one, hexDecode("04" + GX + PRIME)).ok, "y equal to p")
+    expect(!p384Ecdh(one, hexDecode("04" + GX + GY + "00")).ok, "a 98-byte point")
+    expect(!p384Ecdh(one, hexDecode("04" + GX + GY.slice(0, 94))).ok, "a 96-byte point")
+    expect(!p384Ecdh(one, hexDecode("05" + GX + GY)).ok, "a wrong prefix")
+    return
+}
+
+fun main: int {
+    refusals()
+    var at = 0
+    while (at + 1 < processArgumentCount()) {
+        val priv = hexDecode(processArgument(at))
+        val peer = hexDecode(processArgument(at + 1))
+        val made = p384PublicKey(priv)
+        val shared = p384Ecdh(priv, peer)
+        expect(made.ok && shared.ok, "pair at argument $at")
+        println("public ${hexEncode(made.bytes)}")
+        println("shared ${hexEncode(shared.bytes)}")
+        at = at + 2
+    }
+    if (failures > 0) return 1
+    println("crypto-pure p384 ok")
+    0
+}

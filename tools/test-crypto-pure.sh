@@ -27,7 +27,7 @@ random_hex() { head -c "$1" /dev/urandom | od -An -vtx1 | tr -d ' \n'; }
 
 # (At once: each writes only its own files.)
 pids=()
-programs=(vectors edge tool against-hosted both kat-native wycheproof-tls signatures sha3 mlkem)
+programs=(vectors edge tool against-hosted both kat-native wycheproof-tls signatures sha3 mlkem p384)
 for program in "${programs[@]}"; do
     "$compiler" build "$cases/$program.ab" -o "$out/$program" --no-cache \
         > "$out/$program.build.log" 2>&1 &
@@ -97,6 +97,28 @@ if "$out/mlkem" tests/vectors/crypto > "$out/mlkem.log" 2>&1; then
     echo "ok   ml-kem-768: $(grep '^vectors' "$out/mlkem.log")"
 else
     fail mlkem; tail -20 "$out/mlkem.log"
+fi
+
+# P-384: scalar 1 and 2, the refusals, and random keys against openssl (the public key of a private key, and the ECDH secret with
+# a peer openssl made).
+p384_args=()
+p384_expected=()
+for _ in 1 2 3 4 5 6; do
+    p384_priv=00$(random_hex 47)
+    { printf '\x30\x3e\x02\x01\x01\x04\x30'; printf "$(echo "$p384_priv" | sed 's/\(..\)/\\x\1/g')"; printf '\xa0\x07\x06\x05\x2b\x81\x04\x00\x22'; } > "$out/p384-priv.der"
+    openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-384 -outform DER -out "$out/p384-peer.der" 2> /dev/null
+    openssl pkey -inform DER -in "$out/p384-peer.der" -pubout -outform DER -out "$out/p384-peer-pub.der" 2> /dev/null
+    p384_peer=$(tail -c 97 "$out/p384-peer-pub.der" | od -An -vtx1 | tr -d ' \n')
+    p384_pub=$(openssl pkey -inform DER -in "$out/p384-priv.der" -pubout -outform DER 2> /dev/null | tail -c 97 | od -An -vtx1 | tr -d ' \n')
+    p384_shared=$(openssl pkeyutl -derive -keyform DER -inkey "$out/p384-priv.der" -peerform DER -peerkey "$out/p384-peer-pub.der" 2> /dev/null | od -An -vtx1 | tr -d ' \n')
+    p384_args+=("$p384_priv" "$p384_peer")
+    p384_expected+=("public $p384_pub" "shared $p384_shared")
+done
+if "$out/p384" "${p384_args[@]}" > "$out/p384.log" 2>&1 && grep -q '^crypto-pure p384 ok$' "$out/p384.log" &&
+    [[ $(grep -E '^(public|shared) ' "$out/p384.log") == $(printf '%s\n' "${p384_expected[@]}") ]]; then
+    echo "ok   p-384: scalar 1 and 2, refusals, ${#p384_expected[@]} outputs agree with openssl"
+else
+    fail p384; tail -20 "$out/p384.log"; printf '%s\n' "${p384_expected[@]}" | head -4
 fi
 
 # --- Keys, refusals ------------------------------------------------------------------------

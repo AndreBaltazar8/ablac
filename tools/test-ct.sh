@@ -34,6 +34,9 @@ sed -n '/^\/\/ BEGIN P256 SECRET CORES$/,/^\/\/ END P256 SECRET CORES$/p' stdlib
 sed -n '/^\/\/ BEGIN PBE OWNER WIPE$/,/^\/\/ END PBE OWNER WIPE$/p' stdlib/abla/crypto/pbe/entry.ab >> "$cases/fixture.ab"
 sed -n '/^\/\/ BEGIN X25519 SECRET CORE$/,/^\/\/ END X25519 SECRET CORE$/p' stdlib/abla/crypto/x25519/entry.ab >> "$cases/fixture.ab"
 sed -n '/^\/\/ BEGIN ED25519 SECRET CORE$/,/^\/\/ END ED25519 SECRET CORE$/p' stdlib/abla/crypto/ed25519/entry.ab >> "$cases/fixture.ab"
+sed -n '/^\/\/ BEGIN SHA3 SECRET CORE$/,/^\/\/ END SHA3 SECRET CORE$/p' stdlib/abla/crypto/sha3/entry.ab >> "$cases/fixture.ab"
+sed -n '/^\/\/ BEGIN MLKEM SECRET CORE$/,/^\/\/ END MLKEM SECRET CORE$/p' stdlib/abla/crypto/mlkem/entry.ab >> "$cases/fixture.ab"
+sed -n '/^\/\/ BEGIN P384 SECRET CORES$/,/^\/\/ END P384 SECRET CORES$/p' stdlib/abla/crypto/p384/entry.ab >> "$cases/fixture.ab"
 # Source-generated coverage for loops around the previously checked primitives.
 # No production edits or call exemptions: see generator's scope guards.
 # The AES functions that touch a key, as written (their allocating wrappers stay outside, see the generator).
@@ -250,6 +253,54 @@ ed25519_read() { # object, architecture (default x86_64)
         echo "ct: the Ed25519 fixtures didn't need following their calls" >&2; exit 1
     fi
     echo "ok   $arch Ed25519: ${#specs[@]} entries read with their calls followed"
+}
+
+# P-384's secret cores (abla/crypto/p384), as P-256's above: read whole with their calls followed; the table read at a secret digit
+# and the branch on a scalar bit must be found.
+p384_read() { # object, architecture (default x86_64)
+    local object=$1 arch=${2:-x86_64}
+    local specs=(ct_p384_add:@0,@1,@2,@3 ct_p384_subtract:@0,@1,@2,@3 ct_p384_in_range:@0,@1 ct_p384_point_add:@0,@1,@2,@3,@4
+        ct_p384_point_double:@0,@1,@2,@3 ct_p384_scalar_multiply:@0,@1,@2,@3,@4)
+    $check --follow-calls "$arch" "$object" "${specs[@]}" > "$out/$arch-p384.log" 2>&1 || {
+        cat "$out/$arch-p384.log" >&2; echo "ct: a secret reached a branch or an address in the P-384 cores on $arch" >&2; exit 1
+    }
+    local spec
+    for spec in ct_p384_leak_window:@0,@1,@2 ct_p384_leak_branch:@0,@1,@2,@3,@4; do
+        if $check --follow-calls "$arch" "$object" "$spec" > "$out/$arch-p384-leak.log" 2>&1; then
+            echo "ct: the checker missed $spec on $arch" >&2; exit 1
+        fi
+        grep -q '^LEAK' "$out/$arch-p384-leak.log" || { cat "$out/$arch-p384-leak.log" >&2; exit 1; }
+    done
+    echo "ok   $arch P-384 cores: ${#specs[@]} read with their calls followed, 2 leaks caught"
+}
+
+# SHA-3's permutation and ML-KEM's arithmetic: every kernel on secret polynomials and bytes (a secret word in each lane, each coefficient),
+# read with the calls followed, and refused without following (the wrappers call the kernels).
+kem_read() { # object, architecture (default x86_64)
+    local object=$1 arch=${2:-x86_64}
+    local specs=(ct_sha3_permute:@0 ct_mlkem_ntt:@0 ct_mlkem_invntt:@0 ct_mlkem_basemul:@0,@1,@2 ct_mlkem_scale:@0 ct_mlkem_add:@0,@1,@2
+        ct_mlkem_sub:@0,@1,@2 ct_mlkem_cbd:@0,@1 ct_mlkem_compress:@0 ct_mlkem_decompress:@0 ct_mlkem_pack:@0,@1 ct_mlkem_unpack:@0,@1
+        ct_mlkem_message:@0,@1 ct_mlkem_select:@0,@1,@2,@3,@4)
+    $check --follow-calls "$arch" "$object" "${specs[@]}" > "$out/$arch-kem.log" 2>&1 || {
+        cat "$out/$arch-kem.log" >&2; echo "ct: a secret reached a branch or an address in SHA-3 or ML-KEM" >&2; exit 1
+    }
+    # Wasm inlines most of the kernels into their wrappers (only the permutation and the NTT stay calls there), the other targets keep every call.
+    local want=${#specs[@]}
+    [[ $arch == wasm ]] && want=2
+    [[ $(grep -c '^ok.*following [1-9]' "$out/$arch-kem.log") == "$want" ]] || {
+        cat "$out/$arch-kem.log" >&2; echo "ct: a SHA-3 or ML-KEM read followed no call" >&2; exit 1
+    }
+    if $check "$arch" "$object" "${specs[@]}" > "$out/$arch-kem-nofollow.log" 2>&1; then
+        echo "ct: the SHA-3 and ML-KEM fixtures didn't need following their calls" >&2; exit 1
+    fi
+    local leak
+    for leak in ct_mlkem_leak_branch:@0 ct_mlkem_leak_index:@0,@1 ct_sha3_leak_branch:@0; do
+        if $check --follow-calls "$arch" "$object" "$leak" > "$out/$arch-kem-leak.log" 2>&1; then
+            echo "ct: the checker missed $leak on $arch" >&2; exit 1
+        fi
+        grep -q '^LEAK' "$out/$arch-kem-leak.log" || { cat "$out/$arch-kem-leak.log" >&2; echo "ct: $leak was refused, not found" >&2; exit 1; }
+    done
+    echo "ok   $arch SHA-3 and ML-KEM: ${#specs[@]} entries read with their calls followed, 3 leaks caught"
 }
 
 # Two rules of the checker, with hand-written controls: cqto defines rdx from rax (a secret left in rdx is not a secret
@@ -909,6 +960,8 @@ clmul_read "$out/x86.o" x86_64
 p256_read "$out/x86.o"
 x25519_read "$out/x86.o"
 ed25519_read "$out/x86.o"
+kem_read "$out/x86.o"
+p384_read "$out/x86.o"
 division_read
 # The crypto allocation entry stays out of line in a release object: each export of the probe module, which reaches
 # the key and big-number allocations, calls the function in the section .text.abla_ct_allocate. (A function that
@@ -957,6 +1010,8 @@ clmul_read "$out/aarch64.o" aarch64
 p256_read "$out/aarch64.o" aarch64
 x25519_read "$out/aarch64.o" aarch64
 ed25519_read "$out/aarch64.o" aarch64
+kem_read "$out/aarch64.o" aarch64
+p384_read "$out/aarch64.o" aarch64
 # A --fast build keeps every call: the checker follows each into its callee, defined in the same object.
 fast_read aarch64 "$out/aarch64-fast.o" "" "" "$cases/fast-known-aarch64.txt"
 
@@ -973,6 +1028,8 @@ worker_read "$out/ct.wasm" wasm 5
 p256_read "$out/ct.wasm" wasm
 x25519_read "$out/ct.wasm" wasm
 ed25519_read "$out/ct.wasm" wasm
+kem_read "$out/ct.wasm" wasm
+p384_read "$out/ct.wasm" wasm
 # The --fast module keeps every call. Its inline assembly (the barrier of the constant-time primitives) builds on the
 # default in-process route since the WebAssembly asm parser is registered there (tools/test-wasm-ct-barrier.sh);
 # ABLA_KEEP_LLVM_TEXT is unset so that a developer shell with it set cannot hide a regression.
@@ -1006,6 +1063,8 @@ worker_read "$out/xtensa.o" xtensa
 p256_read "$out/xtensa.o" xtensa
 x25519_read "$out/xtensa.o" xtensa
 ed25519_read "$out/xtensa.o" xtensa
+kem_read "$out/xtensa.o" xtensa
+p384_read "$out/xtensa.o" xtensa
 # The --fast object keeps every call, which the checker follows: all 63 fixtures come out clean (fast-known-xtensa.txt
 # is empty; a fixture the checker can't place would be listed there, class unplaced, see fast_class), and the 16 leak
 # controls are still found in unoptimised code.

@@ -6,6 +6,8 @@ import "abla/crypto/ed25519"
 import "abla/crypto/hkdf"
 import "abla/crypto/p256"
 import "abla/crypto/x25519"
+import "abla/crypto/mlkem"
+import "abla/crypto/p384"
 import "abla/crypto/rsa"
 import "abla/crypto/bignum"
 import "abla/unsafe/memory/raw"
@@ -101,6 +103,12 @@ trusted fun main: int {
     if (aesGcmDecrypt(tlsKey, tlsNonce, gcmBody + gcmNear, tlsHeader).ok) return 11
     val peer = x25519PublicKey("\x09\x08\x07\x06\x05\x04\x03\x02\x01\x00\x09\x08\x07\x06\x05\x04\x03\x02\x01\x00\x09\x08\x07\x06\x05\x04\x03\x02\x01\x00\x01\x02").bytes
     val p256Peer = p256PublicKey("\x09\x08\x07\x06\x05\x04\x03\x02\x01\x00\x09\x08\x07\x06\x05\x04\x03\x02\x01\x00\x09\x08\x07\x06\x05\x04\x03\x02\x01\x00\x01\x02").bytes
+    val p384Peer = p384PublicKey("\x09\x08\x07\x06\x05\x04\x03\x02\x01\x00\x09\x08\x07\x06\x05\x04\x03\x02\x01\x00\x09\x08\x07\x06\x05\x04\x03\x02\x01\x00\x09\x08\x07\x06\x05\x04\x03\x02\x01\x00\x09\x08\x07\x06\x05\x04\x03\x02").bytes
+    // ML-KEM-768 with a fixed key (from fixed seeds) and a valid ciphertext of a fixed message, for the decapsulation target.
+    val kemKey = mlkem768KeyGenFromSeeds(signSeed(1), signSeed(2))
+    val kemEncapsulation = mlkem768EncapsulateWithMessage(mlkem768EncapsulationKey(kemKey.bytes), signSeed(3))
+    if (!kemKey.ok || !kemEncapsulation.ok || mlkem768Decapsulate(kemKey.bytes, kemEncapsulation.ciphertext).bytes != kemEncapsulation.sharedSecret) return 15
+    if (p384Peer.size != 97) return 16
     if (peer.size != 32 || p256Peer.size != 65) return 12
     // Signing as a TLS server or client does it (CertificateVerify): a fixed key that signs and verifies, checked before
     // timing.
@@ -183,6 +191,20 @@ trusted fun main: int {
             val scalar = bytesAt(data, 32)
             ctt_begin(state, data, output, work)
             val shared = p256Ecdh(scalar, p256Peer)
+            ctt_end(state, i, data, output, work, shared.bytes.size)
+        } else if (mode == "p384-ecdh") {
+            // As p256-ecdh: a secret scalar with its top byte forced to 0x7f in both classes (48 bytes), a fixed peer point.
+            ablaUnsafeStoreU8(bnPointer(data), 127)
+            val scalar = bytesAt(data, 48)
+            ctt_begin(state, data, output, work)
+            val shared = p384Ecdh(scalar, p384Peer)
+            ctt_end(state, i, data, output, work, shared.bytes.size)
+        } else if (mode == "mlkem-decaps") {
+            // A fixed decapsulation key. The ciphertext is the valid one where the 256 bytes of input are zero and altered by the input,
+            // repeated over its 1088 bytes, in the other class: the accepted and the implicitly rejected secret must take the same time.
+            val ciphertext = xorRepeated(kemEncapsulation.ciphertext, bytesAt(data, 256))
+            ctt_begin(state, data, output, work)
+            val shared = mlkem768Decapsulate(kemKey.bytes, ciphertext)
             ctt_end(state, i, data, output, work, shared.bytes.size)
         } else if (mode == "p256-sign") {
             // The secret is the key (top byte 0x7f in both classes, so it is in 1..n-1); the RFC 6979 nonce follows from it.
@@ -278,4 +300,18 @@ trusted fun main: int {
     bnRelease(divisor, 8)
     bnRelease(zero, 64)
     ctt_finish(state)
+}
+
+/** 32 fixed bytes that depend on `n`, for the seeds and the message of the ML-KEM target. */
+fun signSeed(n: int): string {
+    val bytes: array<int> = []
+    for (i in 0 until 32) bytes.append((i * 7 + n * 31) & 255)
+    cryptoByteString(bytes)
+}
+
+/** `base` with its bytes exclusive-or-ed with `noise` repeated: the base itself where `noise` is all zero. */
+fun xorRepeated(base: string, noise: string): string {
+    val bytes: array<int> = []
+    for (i in 0 until base.size) bytes.append(int(base[i]) ^ int(noise[i % noise.size]))
+    cryptoByteString(bytes)
 }
