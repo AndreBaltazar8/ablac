@@ -110,17 +110,35 @@ is `gettimeofday`'s, to the microsecond.
 
 What stays in libSystem, and why:
 
-- `pthread_create`, `pthread_join` and what a pthread needs (`pthread_self`, `pthread_get_stackaddr_np`,
-  `pthread_get_stacksize_np` for the stack bounds of a thread, the mutex and condition calls): a Mach thread
-  that libSystem does not know has none of its per-thread state, and the kernel's thread registration
-  (`bsdthread_register`) is refused once libSystem has made it, which it has by the time `main` runs.
-- the thread-local bootstrap `__tlv_bootstrap`: Mach-O thread locals are descriptors that dyld's
-  bootstrap resolves.
+- `pthread_create` and `pthread_join` (decision #57): a Mach thread that libSystem does not know has none of
+  its per-thread state, and the kernel's thread registration (`bsdthread_register`) is refused once libSystem
+  has made it, which it has by the time `main` runs. Nothing else of libpthread: locks wait on `__ulock_wait`
+  and `__ulock_wake`, and the stack guard needs no thread bounds (a fault near the interrupted stack pointer
+  is an overflow).
+- the thread-local bootstrap `__tlv_bootstrap`: Mach-O thread locals are descriptors that dyld's bootstrap
+  resolves, and it stays (#811, 2026-11-15). The ways around it were looked at and refused. `TPIDR_EL0` is
+  not preserved across context switches on Apple Silicon (the CI probe on 6409ecd4: 200000 of 200000 reads
+  differed). Reaching a pthread key's slot directly (`TPIDRRO_EL0` + key * 8 on arm64, `%gs` on x86-64) reads
+  libpthread's private data structure, which Apple changes without notice; and where a changed system call
+  fails loudly (an error, a crash), a moved slot would make a thread-local read another key's or another
+  thread's value with no error at all.
 - `fork`: libSystem's fork handlers bring its state over to the child (Mach ports, malloc, locks). The BSD
   `fork` call alone left a child that ran C code broken (an OpenSSL handshake in a forked child failed on both
   Macs, #811), and the runtime cannot tell a child that only execs from one that does not.
 - the compiler itself: libLLVM, OpenSSL, `dlopen`/`dlsym` for compile-time native calls, and its
   threads.
+
+What a macOS program imports (`tools/libsystem-imports-allowlist.txt`, release and `--fast`, both Macs):
+
+| Program | Imports |
+|---|---|
+| one that starts no thread (hello, files, strings, float `%`, tasks, pure-Abla TLS) | `libSystem.B.dylib`, `__tlv_bootstrap`, `_fork` (a `--fast` task program on Apple Silicon also `_pthread_join`) |
+| one that starts threads (`thread { }`) | those, `_pthread_create`, `_pthread_join` |
+| one with a TLS connection through OpenSSL (`abla/tls/hosted`) | those, `libssl` and `libcrypto` and `_OpenSSL_version_num` (its lines marked " ?" were not yet checked on a Mac) |
+
+The memory and jump routines, float remainder, system calls, signals and their trampoline, clocks, random
+numbers, the running image's path and the stack guard are the program's own; the image uses chained fixups
+(no `dyld_stub_binder`).
 
 `ablac run` on macOS JIT-compiles the program with LLVM's emulated TLS (LLJIT has no MachOPlatform), so a thread-local of
 the program is a call of `___emutls_get_address`. The compiler defines that function itself (`abla/runtime/emutls`, exported
