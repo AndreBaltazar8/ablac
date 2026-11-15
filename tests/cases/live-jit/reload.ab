@@ -1,0 +1,90 @@
+// `ablac run --live`: the program edits its own copy (tools/test-live-jit.sh passes the copy's path)
+// and redefines its functions while it runs (abla/live). The checks, each a "name: ok|FAIL" line:
+// - value() returns 1, then 2 after the reload: called directly, through a function value and a
+//   closure made before the reload, and from a thread that was already calling it in a loop;
+// - a thread inside slow()'s old body during the reload finishes it on the old code (10), and its
+//   next call takes the new body (20);
+// - a reload with no change applies nothing;
+// - a changed lambda is refused (E_LIVE_LAMBDA, naming it) and the old lambda keeps running.
+// Exits 42 when every check passed. Markers are kept the same length, so no other offset moves, and
+// are spelled in two pieces in main, so an edit changes only the marked line.
+import "abla/io"
+import "abla/live"
+import "abla/text"
+import "abla/sys/linux/fs"
+import "abla/sys/linux/process"
+
+var entered: int by TVar(0)
+var released: int by TVar(0)
+var spun: int by TVar(0)
+
+fun value(): int = 1 // value-marker
+
+fun slow(): int {
+    atomic { entered = 1 }
+    while (atomic { released } == 0) {
+        atomic { spun += 1 }
+    }
+    10 // slow-marker
+}
+
+fun lambdaMaker(): () -> int = { 5 } // lambda-marker
+
+var failures = 0
+
+fun check(name: string, ok: bool, detail: string): void {
+    println("$name: ${if (ok) "ok" else "FAIL"} ($detail)")
+    if (!ok) failures += 1
+    return
+}
+
+fun edit(path: string, from: string, to: string): bool {
+    val source = Path(path).readText()
+    if (!source.contains(from)) return false
+    Path(path).writeText(source.replace(from, to))
+}
+
+fun main: int {
+    val path = linuxArgument(linuxArgumentCount() - 1)
+    check("live available", liveAvailable(), path)
+    val f: () -> int = value
+    val closure: () -> int = { value() * 1 }
+    val made = lambdaMaker()
+    check("before", value() == 1 && f() == 1 && closure() == 1, "${value()}")
+    val watcher = thread {
+        var rounds = 0
+        while (value() == 1 && rounds < 2000000000) rounds += 1
+        value()
+    }
+    val inside = thread {
+        val first = slow()
+        val second = slow()
+        first * 100 + second
+    }
+    while (atomic { entered } == 0) { }
+    check("edit value and slow", edit(path, "= 1 // value-" + "marker", "= 2 // value-" + "marker") &&
+        edit(path, "10 // slow-" + "marker", "20 // slow-" + "marker"), path)
+    val applied = liveReload()
+    check("reload applied", applied.applied(), applied.message)
+    // Two compiles of an unchanged function give the same code: only the two edited ones are redefined.
+    val words = applied.message.split(" ")
+    var named = 0
+    for (word in words) if (word == "value" || word == "slow") named += 1
+    check("only the edited functions", words.size == 3 && named == 2, applied.message)
+    check("direct", value() == 2, "${value()}")
+    check("function value", f() == 2, "${f()}")
+    check("closure", closure() == 2, "${closure()}")
+    check("thread already calling", await watcher == 2, "")
+    atomic { released = 1 }
+    val pair = await inside
+    check("inside the old body, then the new", pair == 1020, "$pair")
+    val unchanged = liveReload()
+    check("nothing changed", unchanged.applied() && unchanged.message.contains("nothing changed"),
+        unchanged.message)
+    check("edit lambda", edit(path, "{ 5 } // lambda-" + "marker", "{ 6 } // lambda-" + "marker"), path)
+    val lambda = liveReload()
+    check("lambda refused", lambda.refused() && lambda.message.contains("E_LIVE_LAMBDA") &&
+        lambda.message.contains("lambda"), lambda.message)
+    check("old lambda kept", made() == 5 && lambdaMaker()() == 5, "${made()}")
+    if (failures == 0) 42 else 1
+}

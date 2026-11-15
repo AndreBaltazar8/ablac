@@ -7,6 +7,11 @@ import "../../codegen_units.ab"
 import "../../ir.ab"
 import "../../module_paths.ab"
 import "abla/unsafe/memory/raw"
+import "abla/unsafe/memory"
+import "abla/llvm/orc"
+import "abla/sys/linux"
+import "abla/sys/linux/fs"
+import "abla/sys/linux/process"
 
 // `ablac run --live` (docs/design/live-jit.md): every function of the program's own source files is
 // called through one table of code pointers, so that a later generation can redefine it while the
@@ -14,16 +19,41 @@ import "abla/unsafe/memory/raw"
 // (`abla_live_entries` for the first generation); a redefinition publishes a new array with one
 // release store. Each such function's `<symbol>_direct` becomes a trampoline: load the table
 // (acquire), load the entry, call it with the same arguments. Its body is renamed
-// `<symbol>_live0` and every use of the old function (direct calls, its wrapper, its own recursion)
-// is redirected to the trampoline, so nothing at a call site changes and function values, closures
-// and thread entries (which reach a body through its wrapper) all take the newest body. LLVM may
-// inline a trampoline into its callers (a caller then loads the table itself) but never a body: its
-// only reference is the table, which is not constant.
-
-// Set by `ablac run --live` around its program build; only a module with `main` takes it.
-var bootstrapLlvmLiveRun = false
+// `<symbol>_live<generation>` and every use of the old function (direct calls, its wrapper, its own
+// recursion) is redirected to the trampoline, so nothing at a call site changes and function values,
+// closures and thread entries (which reach a body through its wrapper) all take the newest body.
+// LLVM may inline a trampoline into its callers (a caller then loads the table itself) but never a
+// body: its only reference is the table, which is not constant.
+//
+// Then every local symbol is given a hidden external name (codegen_units.ab's promotion, which also
+// names each private constant after its contents), so a later generation, a module of its own in the
+// same JITDylib, can name what this one defines. A generation is the whole program compiled again;
+// the live pass then cuts it down (bootstrapLlvmLiveCut): what the first generation defines becomes a
+// declaration of it, a body whose code is unchanged goes, and what is left is the changed bodies, new
+// functions and the code only they need.
 
 noescape extern:"c" fun LLVMSetTailCall(call: i64*, isTailCall: i32): void
+
+// What the program as loaded defines, kept in the compiler between reloads (generation 0 sets it,
+// each applied reload extends it): the table index of each live function's direct symbol, each
+// entry's body hash, and the name of every definition in the JITDylib.
+var bootstrapLlvmLiveIndices: Map<string, int> = Map()
+var bootstrapLlvmLiveHashes: array<int> = []
+var bootstrapLlvmLiveNames: array<string> = []
+var bootstrapLlvmLiveDefined: Map<string, int> = Map()
+
+// The result of the last live pass: the number of functions through the table, and for a reload
+// the entries it redefines or adds (their index, body symbol and hash), and why it is refused.
+var bootstrapLlvmLiveCount = 0
+var bootstrapLlvmLiveTableSize = 0
+var bootstrapLlvmLiveChangedIndices: array<int> = []
+var bootstrapLlvmLiveChangedBodies: array<string> = []
+var bootstrapLlvmLiveChangedHashes: array<int> = []
+var bootstrapLlvmLiveChangedLabels: array<string> = []
+var bootstrapLlvmLiveChangedSymbols: array<string> = []
+var bootstrapLlvmLiveRefusals: array<string> = []
+// The definitions a reload's module keeps (added to bootstrapLlvmLiveDefined once it is applied).
+var bootstrapLlvmLiveKept: array<string> = []
 
 // A function of the program's own source files: not the standard library's, the runtime's or a
 // naked or sectioned one (those keep their exact code).
@@ -37,49 +67,116 @@ fun bootstrapLlvmLiveFunction(function: BootstrapIrFunction, stdlibRoot: string)
     !(stdlibRoot != "" && path.startsWith(stdlibRoot))
 }
 
-// The number of functions that went through the table (0: none, or not a live build).
-var bootstrapLlvmLiveCount = 0
+// A lambda's function (ir.ab names it `<owner>_lambda_<begin>_<end>_<n>`, offsets in its owner): an
+// edit before it in its owner renames it, so a reload does not redefine one (stage 3 gives a reload's
+// new lambdas ids of their own).
+fun bootstrapLlvmLiveLambda(name: string): bool = name.contains("lambda_")
 
-fun bootstrapLlvmLiveIndirect(
+// A body's code as a number: its printed IR with its own name (which has the generation in it) and
+// the metadata attachments (debug locations) left out. The constants it names are named after their
+// contents by then, and everything else it names by symbol, so two compiles of the same code agree.
+trusted fun bootstrapLlvmLiveBodyHash(body: i64*): int {
+    val name = bootstrapLlvmDebugValueName(body)
+    val printed = LLVMPrintValueToString(body)
+    val text = nativeCString(printed)
+    LLVMDisposeMessage(printed)
+    // ABLA_LIVE_DUMP=<directory>: each hashed body as printed, per generation, to compare two compiles.
+    val dump = linuxEnvironment("ABLA_LIVE_DUMP")
+    if (dump.found && dump.value != "") {
+        Path("${dump.value}/${bootstrapLlvmLiveGeneration}-$name.ll").writeText(text)
+    }
+    var hash = 1469598103
+    var index = 0
+    while (index < text.size) {
+        val character = text[index]
+        // `!dbg !12`, `!tbaa !3`: an attachment runs to the end of its token; so does an attribute group
+        // (`#12`), which the module numbers.
+        if (character == 35 && index + 1 < text.size && text[index + 1] >= 48 && text[index + 1] <= 57) {
+            index = index + 1
+            while (index < text.size && text[index] >= 48 && text[index] <= 57) index = index + 1
+            continue
+        }
+        if (character == 33) {
+            while (index < text.size && text[index] != 10 && text[index] != 44 &&
+                text[index] != 32) index = index + 1
+            continue
+        }
+        if (character == 64 && index + 1 + name.size <= text.size &&
+            text.slice(index + 1, index + 1 + name.size) == name) {
+            hash = bootstrapCodegenMix(hash, 7)
+            index = index + 1 + name.size
+            continue
+        }
+        hash = bootstrapCodegenMix(hash, character)
+        index = index + 1
+    }
+    hash
+}
+
+fun bootstrapLlvmLiveReset(): void {
+    bootstrapLlvmLiveIndices = Map()
+    bootstrapLlvmLiveHashes = []
+    bootstrapLlvmLiveNames = []
+    bootstrapLlvmLiveDefined = Map()
+    return
+}
+
+trusted fun bootstrapLlvmLiveIndirect(
     backend: BootstrapLlvmBackend,
     program: BootstrapIrProgram,
     identities: BootstrapLlvmFunctionIdentities,
     emitted: array<bool>
 ): void {
+    val generation = bootstrapLlvmLiveGeneration
     bootstrapLlvmLiveCount = 0
+    bootstrapLlvmLiveChangedIndices = []
+    bootstrapLlvmLiveChangedBodies = []
+    bootstrapLlvmLiveChangedHashes = []
+    bootstrapLlvmLiveChangedLabels = []
+    bootstrapLlvmLiveChangedSymbols = []
+    bootstrapLlvmLiveRefusals = []
+    bootstrapLlvmLiveKept = []
+    if (generation == 0) bootstrapLlvmLiveReset()
     val root = bootstrapNormalizeModulePath(bootstrapStandardLibraryRoot())
     val stdlibRoot = if (root.endsWith("/")) root else root + "/"
     val originals: array<i64*> = []
-    val indices: array<int> = []
+    val functions: array<int> = []
+    val slots: array<int> = []
+    var appended = bootstrapLlvmLiveNames.size
     var index = 0
     while (index < program.functions.size) {
         if (index < emitted.size && emitted[index] &&
             bootstrapLlvmLiveFunction(program.functions[index], stdlibRoot)) {
-            val original = LLVMGetNamedFunction(
-                backend.module, bootstrapLlvmDirectFunctionSymbol(identities.symbols[index])
-            )
+            val symbol = bootstrapLlvmDirectFunctionSymbol(identities.symbols[index])
+            val original = LLVMGetNamedFunction(backend.module, symbol)
             if (!pointerIsNull(original) && LLVMIsDeclaration(original) == 0) {
                 originals.append(original)
-                indices.append(index)
+                functions.append(index)
+                val known = bootstrapLlvmLiveIndices.get(symbol)
+                if (known != null) slots.append(known)
+                else {
+                    slots.append(if (generation == 0) slots.size else appended)
+                    if (generation != 0) appended = appended + 1
+                }
             }
         }
         index = index + 1
     }
     val count = originals.size
-    if (count == 0) return
+    var size = if (generation == 0) count else appended
+    if (count == 0 && generation == 0) return
     LLVMSetCurrentDebugLocation2(backend.builder, nativeNullPointer())
-    val tableType = LLVMArrayType2(backend.pointerType, count)
-    val entries = LLVMAddGlobal(backend.module, tableType, "abla_live_entries")
+    val tableType = LLVMArrayType2(backend.pointerType, if (size > 0) size else 1)
     val table = LLVMAddGlobal(backend.module, backend.pointerType, "abla_live_table")
-    LLVMSetInitializer(table, entries)
     LLVMSetAlignment(table, i32(8))
+    val bodies: array<i64*> = []
     var entry = 0
     while (entry < count) {
         val original = originals[entry]
-        val function = program.functions[indices[entry]]
-        val name = bootstrapLlvmDirectFunctionSymbol(identities.symbols[indices[entry]])
+        val function = program.functions[functions[entry]]
+        val name = bootstrapLlvmDirectFunctionSymbol(identities.symbols[functions[entry]])
         val type = LLVMGlobalGetValueType(original)
-        val renamed = "${name}_live0"
+        val renamed = "${name}_live$generation"
         LLVMSetValueName2(original, renamed, renamed.size)
         val trampoline = LLVMAddFunction(backend.module, name, type)
         LLVMSetLinkage(trampoline, llvmInternalLinkage())
@@ -93,7 +190,7 @@ fun bootstrapLlvmLiveIndirect(
         LLVMSetAlignment(current, i32(8))
         // Acquire: the entries of a newly published array are visible before its pointer.
         LLVMSetOrdering(current, i32(4))
-        val slot = bootstrapLlvmArrayElement(backend, tableType, current, entry, "live.slot")
+        val slot = bootstrapLlvmArrayElement(backend, tableType, current, slots[entry], "live.slot")
         val target = LLVMBuildLoad2(backend.builder, backend.pointerType, slot, "live.body")
         LLVMSetAlignment(target, i32(8))
         val arguments: array<i64*> = []
@@ -110,11 +207,171 @@ fun bootstrapLlvmLiveIndirect(
         // LLVMVoidTypeKind is 0.
         if (LLVMGetTypeKind(LLVMGetReturnType(type)) == 0) LLVMBuildRetVoid(backend.builder)
         else LLVMBuildRet(backend.builder, call)
+        bodies.append(original)
         entry = entry + 1
     }
-    val elements = bootstrapLlvmPointerArguments(backend, originals)
-    LLVMSetInitializer(entries, LLVMConstArray2(backend.pointerType, elements, count))
-    bootstrapLlvmDropPointerArguments(backend, elements)
+    // The first generation's entries; a reload's array is the compiler's (bootstrapLiveReload).
+    val entries = LLVMAddGlobal(backend.module, tableType, "abla_live_entries")
+    if (generation == 0) {
+        val elements = bootstrapLlvmPointerArguments(backend, bodies)
+        LLVMSetInitializer(entries, LLVMConstArray2(backend.pointerType, elements, count))
+        bootstrapLlvmDropPointerArguments(backend, elements)
+    } else {
+        LLVMSetInitializer(entries, LLVMConstNull(tableType))
+    }
+    LLVMSetInitializer(table, entries)
+    // The program reaches the compiler's reload through `abla_live_host` (ablaLiveHost()).
+    val host = LLVMGetNamedGlobal(backend.module, "abla_live_host")
+    if (!pointerIsNull(host)) {
+        val reloadType = bootstrapLlvmFunctionType(
+            backend, backend.i64Type, [backend.pointerType, backend.i64Type]
+        )
+        var reload = LLVMGetNamedFunction(backend.module, "ablac_live_reload")
+        if (pointerIsNull(reload)) reload = LLVMAddFunction(backend.module, "ablac_live_reload", reloadType)
+        LLVMSetInitializer(host, LLVMConstPtrToInt(reload, backend.i64Type))
+    }
+    // Every local symbol gets a hidden external name; constants are named after their contents.
+    bootstrapCodegenUnitPromote(backend.module, true)
+    entry = 0
+    while (entry < count) {
+        val body = bodies[entry]
+        val hash = bootstrapLlvmLiveBodyHash(body)
+        val label = program.functions[functions[entry]].label
+        val slot = slots[entry]
+        if (generation == 0) {
+            bootstrapLlvmLiveIndices.set(
+                bootstrapLlvmDirectFunctionSymbol(identities.symbols[functions[entry]]), slot
+            )
+            bootstrapLlvmLiveHashes.append(hash)
+            bootstrapLlvmLiveNames.append(if (label != "") label else program.functions[functions[entry]].name)
+        } else if (slot >= bootstrapLlvmLiveHashes.size || bootstrapLlvmLiveHashes[slot] != hash) {
+            val shown = if (label != "") label else program.functions[functions[entry]].name
+            if (bootstrapLlvmLiveLambda(program.functions[functions[entry]].name)) {
+                bootstrapLlvmLiveRefusals.append(
+                    "E_LIVE_LAMBDA: a lambda changed or was added ($shown): a reload redefines named functions only"
+                )
+            }
+            bootstrapLlvmLiveChangedIndices.append(slot)
+            bootstrapLlvmLiveChangedBodies.append(bootstrapLlvmDebugValueName(body))
+            bootstrapLlvmLiveChangedHashes.append(hash)
+            bootstrapLlvmLiveChangedLabels.append(shown)
+            bootstrapLlvmLiveChangedSymbols.append(
+                bootstrapLlvmDirectFunctionSymbol(identities.symbols[functions[entry]])
+            )
+        }
+        entry = entry + 1
+    }
     bootstrapLlvmLiveCount = count
+    bootstrapLlvmLiveTableSize = size
+    if (generation == 0) bootstrapLlvmLiveRecordDefinitions(backend.module)
+    else bootstrapLlvmLiveCut(backend.module)
+    return
+}
+
+trusted fun bootstrapLlvmLiveRecordDefinitions(module: i64*): void {
+    var function = LLVMGetFirstFunction(module)
+    while (!pointerIsNull(function)) {
+        if (LLVMIsDeclaration(function) == 0) bootstrapLlvmLiveDefined.set(bootstrapLlvmDebugValueName(function), 1)
+        function = LLVMGetNextFunction(function)
+    }
+    var global = LLVMGetFirstGlobal(module)
+    while (!pointerIsNull(global)) {
+        if (LLVMIsDeclaration(global) == 0) bootstrapLlvmLiveDefined.set(bootstrapLlvmDebugValueName(global), 1)
+        global = LLVMGetNextGlobal(global)
+    }
+    var alias = LLVMGetFirstGlobalAlias(module)
+    while (!pointerIsNull(alias)) {
+        bootstrapLlvmLiveDefined.set(bootstrapLlvmDebugValueName(alias), 1)
+        alias = LLVMGetNextGlobalAlias(alias)
+    }
+    return
+}
+
+fun bootstrapLlvmLiveIsDefined(name: string): bool = bootstrapLlvmLiveDefined.get(name) != null
+
+// Cuts a reload's module down: everything the JITDylib already defines becomes a declaration of it
+// (as codegen_units.ab's unit strip does for other units), a body whose code did not change goes, the
+// `llvm.*` arrays and module assembly go, and what is left must be code: a variable the program does
+// not have yet is refused (its initializer never ran: E_LIVE_GLOBAL).
+trusted fun bootstrapLlvmLiveCut(module: i64*): void {
+    val changed: Map<string, int> = Map()
+    for (body in bootstrapLlvmLiveChangedBodies) changed.set(body, 1)
+    val arrays: array<int> = []
+    var global = LLVMGetFirstGlobal(module)
+    while (!pointerIsNull(global)) {
+        val name = bootstrapLlvmDebugValueName(global)
+        if (bootstrapCodegenLlvmName(name)) {
+            arrays.append(nativePointerAddress(global))
+        } else if (LLVMIsDeclaration(global) == 0) {
+            if (bootstrapLlvmLiveIsDefined(name)) {
+                LLVMSetInitializer(global, nativeNullPointer())
+                LLVMSetLinkage(global, i32(0))
+                LLVMGlobalClearMetadata(global)
+            } else if (LLVMIsGlobalConstant(global) == 0) {
+                bootstrapLlvmLiveRefusals.append(
+                    "E_LIVE_GLOBAL: a variable the running program does not have ($name): its initializer would not run"
+                )
+            } else bootstrapLlvmLiveKept.append(name)
+        }
+        global = LLVMGetNextGlobal(global)
+    }
+    for (array in arrays) LLVMDeleteGlobal(nativePointerFromAddress(array))
+    LLVMSetModuleInlineAsm2(module, "", 0)
+    val declared: array<int> = []
+    val dropped: array<int> = []
+    var function = LLVMGetFirstFunction(module)
+    while (!pointerIsNull(function)) {
+        if (LLVMIsDeclaration(function) == 0) {
+            val name = bootstrapLlvmDebugValueName(function)
+            if (bootstrapLlvmLiveIsDefined(name)) declared.append(nativePointerAddress(function))
+            else if (name.contains("_direct_live") && changed.get(name) == null) {
+                dropped.append(nativePointerAddress(function))
+            } else bootstrapLlvmLiveKept.append(name)
+        }
+        function = LLVMGetNextFunction(function)
+    }
+    for (other in declared) bootstrapCodegenDeclareFunction(module, nativePointerFromAddress(other))
+    for (body in dropped) {
+        val value = nativePointerFromAddress(body)
+        if (pointerIsNull(LLVMGetFirstUse(value))) LLVMDeleteFunction(value)
+        else bootstrapCodegenDeclareFunction(module, value)
+    }
+    var stub = nativeNullPointer()
+    var alias = LLVMGetFirstGlobalAlias(module)
+    while (!pointerIsNull(alias)) {
+        val name = bootstrapLlvmDebugValueName(alias)
+        if (bootstrapLlvmLiveIsDefined(name)) {
+            val type = LLVMGlobalGetValueType(alias)
+            LLVMSetValueName2(alias, "", 0)
+            val declaration = if (LLVMGetTypeKind(type) == i32(9))
+                LLVMAddFunction(module, name, type)
+                else LLVMAddGlobal(module, type, name)
+            LLVMSetVisibility(declaration, LLVMGetVisibility(alias))
+            LLVMReplaceAllUsesWith(alias, declaration)
+            if (pointerIsNull(stub)) stub = bootstrapCodegenAliasStub(module)
+            LLVMAliasSetAliasee(alias, stub)
+            LLVMSetLinkage(alias, i32(9))
+        } else bootstrapLlvmLiveKept.append(name)
+        alias = LLVMGetNextGlobalAlias(alias)
+    }
+    return
+}
+
+// After a reload's module is in the JITDylib: what it defines is now the program's, and the changed
+// entries' hashes are its.
+fun bootstrapLlvmLiveApplied(): void {
+    for (name in bootstrapLlvmLiveKept) bootstrapLlvmLiveDefined.set(name, 1)
+    var change = 0
+    while (change < bootstrapLlvmLiveChangedIndices.size) {
+        val slot = bootstrapLlvmLiveChangedIndices[change]
+        while (bootstrapLlvmLiveHashes.size <= slot) {
+            bootstrapLlvmLiveHashes.append(0)
+            bootstrapLlvmLiveNames.append("")
+        }
+        bootstrapLlvmLiveHashes[slot] = bootstrapLlvmLiveChangedHashes[change]
+        bootstrapLlvmLiveNames[slot] = bootstrapLlvmLiveChangedLabels[change]
+        bootstrapLlvmLiveIndices.set(bootstrapLlvmLiveChangedSymbols[change], slot)
+        change = change + 1
+    }
     return
 }

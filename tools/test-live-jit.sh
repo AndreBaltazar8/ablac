@@ -6,6 +6,7 @@
 # must print the same lines and exit 42 with and without --live, release (--o1) and --fast. The
 # live runs must report that functions went through the table (ABLA_LIVE_TRACE), and a plain run
 # must not. The object cache is off, so each run compiles.
+# Then tests/cases/live-jit/reload.ab redefines its own functions while it runs (abla/live).
 # Usage: tools/test-live-jit.sh [compiler]
 set -euo pipefail
 compiler=${1:-build/ablac}
@@ -48,4 +49,29 @@ for profile in o1 fast; do
         exit 1
     fi
 done
-echo "live jit: $(wc -l < "$out/live-o1.out" | tr -d ' ') lines alike with and without --live (--o1 and --fast), $count functions through the table"
+calls="$(wc -l < "$out/live-o1.out" | tr -d ' ') lines alike with and without --live (--o1 and --fast), $count functions through the table"
+# Redefinition (stage 2): tests/cases/live-jit/reload.ab edits a copy of itself and calls liveReload();
+# see its header for the checks. Without --live the same program must find reloading unavailable.
+reload=$PWD/$out/reload/main.ab
+mkdir -p "$out/reload"
+for profile in o1 fast; do
+    cp tests/cases/live-jit/reload.ab "$reload"
+    status=0
+    timeout 300 "$compiler" run "--$profile" --live "$reload" -- "$reload" \
+        > "$out/reload-$profile.out" 2> "$out/reload-$profile.err" || status=$?
+    if [[ $status -ne 42 ]] || grep -q ': FAIL' "$out/reload-$profile.out"; then
+        printf 'live jit (reload, %s): exit status %s (42 expected)\n' "$profile" "$status" >&2
+        cat "$out/reload-$profile.out" >&2
+        head -n 30 "$out/reload-$profile.err" >&2
+        exit 1
+    fi
+done
+cp tests/cases/live-jit/reload.ab "$reload"
+status=0
+timeout 300 "$compiler" run "$reload" -- "$reload" > "$out/reload-plain.out" 2>&1 || status=$?
+if [[ $status -eq 42 ]] || ! grep -q '^live available: FAIL' "$out/reload-plain.out"; then
+    echo "live jit (reload without --live): reloading was not refused as unavailable (exit $status)" >&2
+    cat "$out/reload-plain.out" >&2
+    exit 1
+fi
+echo "live jit: $calls; reload: $(grep -c ': ok' "$out/reload-o1.out") checks (--o1 and --fast), unavailable without --live"

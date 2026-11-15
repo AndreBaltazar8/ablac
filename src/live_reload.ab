@@ -1,0 +1,155 @@
+// The compiler's side of `ablac run --live` (docs/design/live-jit.md): `ablac_live_reload`, which a
+// live program reaches through abla/live (`ablaLiveHost()` is its address, the base module's
+// `abla_live_host`). It compiles the program's sources again as the next generation, which the live
+// pass (src/backend/llvm/live.ab) cuts down to the bodies that changed; refused, nothing is added and
+// the program keeps running its code. Applied, the module goes into the program's session and one
+// release store publishes a new table array: the old entries with the changed ones replaced and new
+// functions appended. Old code is never removed (a thread may still be in it), and nor is an old
+// array (a thread may have loaded it).
+import "abla/llvm/orc"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+import "abla/unsafe/native"
+import "backend/llvm/core.ab"
+import "backend/llvm/debug.ab"
+import "backend/llvm/live.ab"
+import "toolchain.ab"
+
+// The running program's session and how it was built, set by bootstrapRunInProcess for a live run.
+var bootstrapLiveSession = LlvmOrcSession(nativeNullPointer(), nativeNullPointer(), 128, true)
+var bootstrapLiveSource = ""
+var bootstrapLivePasses = ""
+// Entries in the published array.
+var bootstrapLiveTableSize = 0
+// A word that is 1 while a reload runs (a second one at the same time is refused).
+var bootstrapLiveBusy = 0
+
+trusted fun bootstrapLiveBegin(session: LlvmOrcSession, source: string, passes: string): void {
+    bootstrapLiveSession = session
+    bootstrapLiveSource = source
+    bootstrapLivePasses = passes
+    bootstrapLiveTableSize = bootstrapLlvmLiveTableSize
+    bootstrapLlvmLiveGeneration = 0
+    if (bootstrapLiveBusy == 0) bootstrapLiveBusy = nativePointerAddress(ablaUnsafeAllocate(8))
+    ablaUnsafeStoreI64(nativePointerFromAddress(bootstrapLiveBusy), 0)
+    return
+}
+
+// The reply in the program's buffer: its length (8 bytes), then its bytes, as many as fit.
+trusted fun bootstrapLiveReply(buffer: int, capacity: int, message: string): void {
+    if (buffer == 0 || capacity < 8) return
+    val room = capacity - 8
+    val length = if (message.size < room) message.size else room
+    ablaUnsafeStoreI64(nativePointerFromAddress(buffer), length)
+    var index = 0
+    while (index < length) {
+        ablaUnsafeStoreU8(nativePointerFromAddress(buffer + 8 + index), message[index])
+        index = index + 1
+    }
+    return
+}
+
+// 0: applied (the reply names what changed); 1: refused (the reply says why); 2: the program did not
+// compile (its diagnostics are on standard error); 3: not available.
+@export("ablac_live_reload")
+trusted fun bootstrapLiveReloadEntry(buffer: int, capacity: int): int {
+    if (bootstrapLiveBusy == 0 || bootstrapLiveSession.status != 0) {
+        bootstrapLiveReply(buffer, capacity, "E_LIVE_UNAVAILABLE: no live session")
+        return 3
+    }
+    if (int(ablaUnsafeAtomicCompareExchangeU32(bootstrapLiveBusy, u32(0), u32(1))) != 0) {
+        bootstrapLiveReply(buffer, capacity, "E_LIVE_BUSY: another reload is running")
+        return 1
+    }
+    val status = bootstrapLiveReload(buffer, capacity)
+    ablaUnsafeAtomicFence()
+    ablaUnsafeStoreI64(nativePointerFromAddress(bootstrapLiveBusy), 0)
+    status
+}
+
+trusted fun bootstrapLiveDisposeHeld(): void {
+    if (!pointerIsNull(bootstrapLlvmHeldModule)) LLVMDisposeModule(bootstrapLlvmHeldModule)
+    if (!pointerIsNull(bootstrapLlvmHeldContext)) LLVMContextDispose(bootstrapLlvmHeldContext)
+    bootstrapLlvmHeldModule = nativeNullPointer()
+    bootstrapLlvmHeldContext = nativeNullPointer()
+    return
+}
+
+trusted fun bootstrapLiveReload(buffer: int, capacity: int): int {
+    val generation = bootstrapLlvmLiveGeneration + 1
+    val enclosingLive = bootstrapLlvmLiveRun
+    bootstrapLlvmLiveRun = true
+    bootstrapLlvmLiveGeneration = generation
+    val prepared = bootstrapPrepareRun(bootstrapLiveSource, true)
+    bootstrapLlvmLiveRun = enclosingLive
+    if (prepared.status != 0 || pointerIsNull(bootstrapLlvmHeldModule)) {
+        bootstrapLlvmLiveGeneration = generation - 1
+        bootstrapLiveDisposeHeld()
+        bootstrapLiveReply(buffer, capacity,
+            "E_LIVE_COMPILE: the program does not compile (its diagnostics are on standard error)")
+        return 2
+    }
+    if (bootstrapLlvmLiveRefusals.size > 0) {
+        bootstrapLlvmLiveGeneration = generation - 1
+        bootstrapLiveDisposeHeld()
+        var message = ""
+        for (refusal in bootstrapLlvmLiveRefusals) message = message + refusal + "\n"
+        bootstrapLiveReply(buffer, capacity, message)
+        return 1
+    }
+    if (bootstrapLlvmLiveChangedIndices.size == 0) {
+        bootstrapLlvmLiveGeneration = generation - 1
+        bootstrapLiveDisposeHeld()
+        bootstrapLiveReply(buffer, capacity, "applied: nothing changed")
+        return 0
+    }
+    val added = bootstrapLiveSession.addModule(bootstrapLlvmHeldContext, bootstrapLlvmHeldModule,
+        bootstrapLivePasses)
+    bootstrapLlvmHeldContext = nativeNullPointer()
+    bootstrapLlvmHeldModule = nativeNullPointer()
+    if (added.status != 0) {
+        bootstrapLlvmLiveGeneration = generation - 1
+        bootstrapLiveReply(buffer, capacity, "E_LIVE_LINK: the new code could not be added (status ${added.status})")
+        return 2
+    }
+    // The bodies first: looking one up links the module.
+    val addresses: array<int> = []
+    for (body in bootstrapLlvmLiveChangedBodies) {
+        val found = bootstrapLiveSession.lookup(body)
+        if (found.status != 0 || found.address == 0) {
+            bootstrapLiveReply(buffer, capacity, "E_LIVE_LINK: $body was not found (status ${found.status})")
+            return 2
+        }
+        addresses.append(found.address)
+    }
+    val table = bootstrapLiveSession.lookup("abla_live_table")
+    if (table.status != 0 || table.address == 0) {
+        bootstrapLiveReply(buffer, capacity, "E_LIVE_LINK: abla_live_table was not found")
+        return 2
+    }
+    val old = ablaUnsafeLoadI64(nativePointerFromAddress(table.address))
+    var size = bootstrapLiveTableSize
+    for (slot in bootstrapLlvmLiveChangedIndices) if (slot + 1 > size) size = slot + 1
+    val entries = nativePointerAddress(ablaUnsafeAllocate(size * 8))
+    var slot = 0
+    while (slot < size) {
+        ablaUnsafeStoreI64(nativePointerFromAddress(entries + slot * 8),
+            if (slot < bootstrapLiveTableSize) ablaUnsafeLoadI64(nativePointerFromAddress(old + slot * 8)) else 0)
+        slot = slot + 1
+    }
+    var change = 0
+    while (change < addresses.size) {
+        ablaUnsafeStoreI64(nativePointerFromAddress(entries + bootstrapLlvmLiveChangedIndices[change] * 8),
+            addresses[change])
+        change = change + 1
+    }
+    // Release: the entries are written before the array is published.
+    ablaUnsafeAtomicFence()
+    ablaUnsafeStoreI64(nativePointerFromAddress(table.address), entries)
+    bootstrapLiveTableSize = size
+    bootstrapLlvmLiveApplied()
+    var message = "applied:"
+    for (label in bootstrapLlvmLiveChangedLabels) message = message + " " + label
+    bootstrapLiveReply(buffer, capacity, message)
+    0
+}

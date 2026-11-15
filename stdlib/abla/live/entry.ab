@@ -1,0 +1,47 @@
+// Redefining a running program's functions (docs/design/live-jit.md). Under `ablac run --live`,
+// `liveReload()` compiles the program's source files again and redefines every function whose code
+// changed: each call made after it returns takes the new body; a thread already inside an old body
+// finishes it. A change it cannot apply safely is refused (the message names the function and the
+// reason) and the program keeps running its code. In any other build the result is `unavailable`.
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+private trusted noescape extern:"intrinsic" fun ablaLiveHost(): int
+private trusted noescape extern:"intrinsic" fun ablaUnsafeCallExact_I64_Pointer_I64(
+    address: int,
+    buffer: i64*,
+    capacity: int
+): int
+
+// 0 applied, 1 refused, 2 the program did not compile (its diagnostics are on standard error),
+// 3 unavailable (not `ablac run --live`).
+class LiveResult(val status: int, val message: string) {
+    fun applied(): bool = status == 0
+    fun refused(): bool = status == 1
+    fun failed(): bool = status == 2
+    fun unavailable(): bool = status == 3
+}
+
+// Whether the program runs under `ablac run --live`.
+trusted fun liveAvailable(): bool = ablaLiveHost() != 0
+
+trusted fun liveReload(): LiveResult {
+    val host = ablaLiveHost()
+    if (host == 0) return LiveResult(3, "not running under `ablac run --live`")
+    val capacity = 65536
+    val buffer = nativeByteBuffer(capacity)
+    buffer.storeI64(0, 0)
+    val status = ablaUnsafeCallExact_I64_Pointer_I64(host, buffer.pointerAt(0), capacity)
+    var length = buffer.loadI64(0)
+    if (length < 0) length = 0
+    if (length > capacity - 8) length = capacity - 8
+    var message = ""
+    if (length > 0) {
+        val address = ablaUnsafePointerAddress(ablaUnsafeAllocate(length + 1))
+        ablaUnsafeCopyMemory(address, ablaUnsafePointerAddress(buffer.pointerAt(8)), length)
+        ablaUnsafeStoreU8(nativePointerFromAddress(address + length), 0)
+        message = adoptNativeString(address, length)
+    }
+    buffer.close()
+    LiveResult(status, message)
+}
