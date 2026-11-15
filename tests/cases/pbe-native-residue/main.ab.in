@@ -1,0 +1,201 @@
+// A native program searches its own memory for the decrypted private key of abla/crypto/pbe after it is dropped
+// (tools/test-pbe-native-residue.sh). `main <mode>` opens the committed encrypted fixtures (the public test key,
+// password "test-only-password") through abla/crypto/rsa, drops what it opened, collects twice, and scans every
+// readable and writable private mapping of /proc/self/maps (the heap's chunks and free blocks, the stacks, the data)
+// for 16-byte windows of p, q, d, dp, dq and qinv in both byte orders and 8-byte windows of the password, counted
+// against the same scan before the call. The windows come in as hex (@NEEDLES@, from openssl, never from the key under
+// test) and are kept XOR-masked: their bytes appear nowhere in this process but in what is searched for. It prints one
+// "left <kind> <count>" line per kind found more often after; mode 9 is the control, an unwiped managed copy of the
+// key's unencrypted DER, which must be found.
+import "abla/io"
+import "abla/process"
+import "abla/memory"
+import "abla/crypto"
+import "abla/crypto/rsa"
+import "abla/bytes"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+import "abla/sys/linux"
+
+val pkcs8Hex = "@P8HEX@"
+val pkcs12Hex = "@P12HEX@"
+val pemHex = "@PEMHEX@"
+val plainPemHex = "@PLAINPEMHEX@"
+// "<kind> <hex window>," entries.
+val needleText = "@NEEDLES@"
+val kindNames = ["prime1 big-endian", "prime1 little-endian", "prime2 big-endian", "prime2 little-endian",
+    "privateExponent big-endian", "privateExponent little-endian", "exponent1 big-endian", "exponent1 little-endian",
+    "exponent2 big-endian", "exponent2 little-endian", "coefficient big-endian", "coefficient little-endian",
+    "password ASCII", "password UTF-16"]
+
+val MASK = 6510615555426900570
+val SLOTS = 32768
+// The table: SLOTS slots of four words: the masked first 8 bytes (0: empty), the masked last 8 (16-byte windows), the
+// kind, and whether the window has 16 bytes.
+val table = nativeByteBuffer(SLOTS * 32)
+
+trusted fun slotOf(key: int): int = ((key * 7046029254386353131) >> 45) & (SLOTS - 1)
+
+trusted fun hexValue(byte: int): int = if (byte >= 97) byte - 87 else if (byte >= 65) byte - 55 else byte - 48
+
+// The masked word of the 8 bytes at `at` of hex text `text` (16 hex digits), without the plain bytes ever stored.
+trusted fun maskedWord(text: string, at: int): int {
+    var word = 0
+    var i = 7
+    while (i >= 0) {
+        val value = hexValue(text[at + 2 * i]) * 16 + hexValue(text[at + 2 * i + 1])
+        word = (word << 8) | value
+        i = i - 1
+    }
+    word ^ MASK
+}
+
+trusted fun loadNeedles(): int {
+    var count = 0
+    var at = 0
+    while (at < needleText.size) {
+        var end = at
+        while (end < needleText.size && needleText[end] != 44) end = end + 1
+        var space = at
+        while (needleText[space] != 32) space = space + 1
+        var kind = 0
+        var i = at
+        while (i < space) { kind = kind * 10 + needleText[i] - 48; i = i + 1 }
+        val hexStart = space + 1
+        val long = end - hexStart == 32
+        val first = maskedWord(needleText, hexStart)
+        val last = if (long) maskedWord(needleText, hexStart + 16) else 0
+        var slot = slotOf(first)
+        while (table.loadI64(slot * 32) != 0) slot = (slot + 1) & (SLOTS - 1)
+        table.storeI64(slot * 32, first)
+        table.storeI64(slot * 32 + 8, last)
+        table.storeI64(slot * 32 + 16, kind)
+        table.storeI64(slot * 32 + 24, if (long) 1 else 0)
+        count = count + 1
+        at = end + 1
+    }
+    count
+}
+
+// What /proc/self/maps lists, read whole.
+trusted fun mapsText(): string {
+    val maps = linuxOpen("/proc/self/maps")
+    val text = byteBuffer()
+    var reading = true
+    while (reading) {
+        val chunk = maps.read(65536)
+        if (chunk.size == 0) reading = false else text.appendText(chunk)
+    }
+    maps.close()
+    text.toText()
+}
+
+trusted fun hexNumber(text: string, from: int, to: int): int {
+    var value = 0
+    var i = from
+    while (i < to) { value = (value << 4) | hexValue(text[i]); i = i + 1 }
+    value
+}
+
+// Each kind's count over the readable, writable private mappings, into `counts` (14 words).
+trusted fun scan(var counts: NativeByteBuffer): void {
+    var kind = 0
+    while (kind < 14) { counts.storeI64(kind * 8, 0); kind = kind + 1 }
+    val maps = mapsText()
+    // The ranges first (start, end), so that nothing the scan does changes what it walks.
+    val ranges = nativeByteBuffer(16 * 4096)
+    var regions = 0
+    var at = 0
+    while (at < maps.size && regions < 4096) {
+        var end = at
+        while (end < maps.size && maps[end] != 10) end = end + 1
+        var dash = at
+        while (maps[dash] != 45) dash = dash + 1
+        var space = dash
+        while (maps[space] != 32) space = space + 1
+        val readable = maps[space + 1] == 114 && maps[space + 2] == 119 && maps[space + 4] == 112
+        val line = maps.slice(at, end)
+        val special = line.contains("[vvar") || line.contains("[vsyscall]") || line.contains("[vdso]")
+        if (readable && !special) {
+            ranges.storeI64(regions * 16, hexNumber(maps, at, dash))
+            ranges.storeI64(regions * 16 + 8, hexNumber(maps, dash + 1, space))
+            regions = regions + 1
+        }
+        at = end + 1
+    }
+    var region = 0
+    while (region < regions) {
+        var address = ranges.loadI64(region * 16)
+        val end = ranges.loadI64(region * 16 + 8)
+        while (address + 16 <= end) {
+            val word = ablaUnsafeLoadI64(nativePointerFromAddress(address)) ^ MASK
+            if (word != 0) {
+                var slot = slotOf(word)
+                var key = table.loadI64(slot * 32)
+                while (key != 0) {
+                    if (key == word) {
+                        val long = table.loadI64(slot * 32 + 24) == 1
+                        if (!long || (ablaUnsafeLoadI64(nativePointerFromAddress(address + 8)) ^ MASK) ==
+                            table.loadI64(slot * 32 + 8)) {
+                            val found = table.loadI64(slot * 32 + 16)
+                            counts.storeI64(found * 8, counts.loadI64(found * 8) + 1)
+                        }
+                    }
+                    slot = (slot + 1) & (SLOTS - 1)
+                    key = table.loadI64(slot * 32)
+                }
+            }
+            address = address + 8
+        }
+        region = region + 1
+    }
+    ranges.close()
+    return
+}
+
+@noinline trusted fun openPkcs8(): bool {
+    val password = cryptoPassword("test-only-password")
+    val key = rsaPrivateKeyFromDer(hexDecode(pkcs8Hex), password)
+    key.ok() && key.bits == 2048
+}
+
+@noinline trusted fun openPkcs12(): bool {
+    val password = cryptoPassword("test-only-password")
+    val key = rsaPrivateKeyFromPkcs12(hexDecode(pkcs12Hex), password)
+    key.ok() && key.bits == 2048
+}
+
+// The password inline, a temporary owner.
+@noinline trusted fun openPem(): bool {
+    val key = rsaPrivateKeyFromPem(hexDecode(pemHex), cryptoPassword("test-only-password"))
+    key.ok() && key.bits == 2048 &&
+        hexEncode(sha256(key.modulus)) == "ebeba98ef666cf584dfebad1922952ce1107cccaf63e3d74f357fd195b88dc44"
+}
+
+// The control: the unencrypted key's DER, decoded into a managed string that nothing wipes.
+@noinline trusted fun leakPlain(): bool {
+    val pem = hexDecode(plainPemHex)
+    val key = rsaPrivateKeyFromPem(pem)
+    key.ok()
+}
+
+fun main: int {
+    val mode = if (processArgumentCount() > 0) processArgument(0) else "pkcs8"
+    if (loadNeedles() < 100) return 2
+    val before = nativeByteBuffer(14 * 8)
+    scan(before)
+    val ok = if (mode == "pkcs8") openPkcs8() else if (mode == "pkcs12") openPkcs12()
+        else if (mode == "pem") openPem() else leakPlain()
+    if (!ok) return 3
+    memoryCollect()
+    memoryCollect()
+    val after = nativeByteBuffer(14 * 8)
+    scan(after)
+    var kind = 0
+    while (kind < 14) {
+        val more = after.loadI64(kind * 8) - before.loadI64(kind * 8)
+        if (more > 0) println("left ${kindNames[kind]} $more")
+        kind = kind + 1
+    }
+    0
+}
