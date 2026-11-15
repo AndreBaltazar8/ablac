@@ -405,6 +405,18 @@ trusted fun __ablaRuntimeHostHeapZero(address: int, size: int): void {
     return
 }
 
+// Under ABLA_GC_STRESS=1 the sweep fills each block it frees with 0xDB bytes first, so a use after free reads
+// garbage at once, not the old bytes a block keeps until it is reused (a C string, a path: #829).
+trusted fun __ablaRuntimeHostHeapPoison(address: int, size: int): void {
+    val end = address + ((size + 7) & -8)
+    var at = address
+    while (at < end) {
+        ablaRuntimeStoreI64(at, -2604246222170760229)
+        at = at + 8
+    }
+    return
+}
+
 // A fork leaves only the forking thread in the child, so a lock another thread held stays held for ever (#812).
 // No fork hook is needed, and no system call on the allocation path: one page of its own holds a 1, and
 // MADV_WIPEONFORK (Linux 4.14) makes the kernel zero it in the child. The first lock the child takes looks at
@@ -2561,6 +2573,7 @@ trusted fun __ablaRuntimeHostCollectionSweep(): void {
     val lists = __ablaRuntimeHostSmallLists()
     val keptLimit = __ablaRuntimeHostSmallKept
     var smallBytes = __ablaRuntimeHostSmallBytes
+    val poison = __ablaRuntimeHostGcStress
     var pushed = 0
     var freedBytes = 0
     var kept = 0
@@ -2573,6 +2586,7 @@ trusted fun __ablaRuntimeHostCollectionSweep(): void {
             if (state >= 0 && state < 16 && state != 10 && state != 12) {
                 val size = ablaRuntimeLoadI64(header + 16)
                 freedBytes = freedBytes + size
+                if (poison) __ablaRuntimeHostHeapPoison(header + 32, size)
                 // __ablaRuntimeHostBlockFree, with its counters held here.
                 if (size <= 480 && smallBytes < keptLimit) {
                     val total = (size + 39) & -8
@@ -2843,6 +2857,9 @@ trusted fun __ablaRuntimeHostBackgroundSweep(): void {
             if (state >= 0 && state < 16 && state != 10 && state != 12) {
                 __ablaRuntimeHostLiveBytes =
                     __ablaRuntimeHostLiveBytes - ablaRuntimeLoadI64(header + 16)
+                if (__ablaRuntimeHostGcStress) {
+                    __ablaRuntimeHostHeapPoison(header + 32, ablaRuntimeLoadI64(header + 16))
+                }
                 __ablaRuntimeHostFreeLater(header)
             } else {
                 if (state >= 16) ablaRuntimeStoreI64(header + 24, state - 32)

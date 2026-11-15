@@ -100,6 +100,7 @@ test-serial: ablac
 	tools/test-futex-locks.sh $(COMPILER)
 	tools/test-thread-local-image.sh $(COMPILER)
 	tools/test-process-exec-strings.sh $(COMPILER)
+	tools/test-gc-stress-io.sh $(COMPILER)
 	tools/test-libc-jump-routines.sh $(COMPILER)
 	tools/test-version.sh $(COMPILER)
 	tools/test-coverage.sh $(COMPILER)
