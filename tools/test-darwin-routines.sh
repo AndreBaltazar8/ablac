@@ -37,7 +37,7 @@ for mode in release fast; do
         exit 1
     fi
     # Chained fixups (#811 G5): dyld binds the imports at load, no lazy stubs, no dyld_stub_binder.
-    if ! otool -l "$out/$mode" | grep -q LC_DYLD_CHAINED_FIXUPS; then
+    if ! otool -l "$out/$mode" | grep LC_DYLD_CHAINED_FIXUPS >/dev/null; then
         printf 'darwin routines (%s): no LC_DYLD_CHAINED_FIXUPS load command\n' "$mode" >&2
         exit 1
     fi
