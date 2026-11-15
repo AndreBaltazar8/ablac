@@ -468,14 +468,14 @@ class RegexParser(
     }
 }
 
-class RegexEmitter(val program: array<int>, var failed: bool, var groupSlots: int) {
+class RegexEmitter(val program: array<int>, var failed: bool, var groupSlots: int, val limit: int) {
     fun count(): int = this.program.size / 3
 
     fun add(op: int, x: int, y: int): int {
         this.program.append(op)
         this.program.append(x)
         this.program.append(y)
-        if (this.program.size / 3 > regexMaximumInstructions) this.failed = true
+        if (this.program.size / 3 > this.limit) this.failed = true
         this.program.size / 3 - 1
     }
 
@@ -547,21 +547,34 @@ class RegexEmitter(val program: array<int>, var failed: bool, var groupSlots: in
     }
 }
 
-/** Compile `pattern`. On failure `error` has the message and its byte offset. */
-fun regexCompile(pattern: string): RegexCompileResult {
+/**
+ * Compile `pattern`. On failure `error` has the message and its byte offset. A pattern whose program has more than
+ * 100,000 instructions is refused ("the pattern is too large"); counted repeats multiply when nested, so
+ * `(a{1,30}){1,30}` is 1,863 instructions and `((a{1000}){1000}){1000}` is far over. A search costs up to
+ * 2 * (text size + 1) * instructions steps, so for patterns from an untrusted source use `regexCompileWithin`.
+ */
+fun regexCompile(pattern: string): RegexCompileResult = regexCompileWithin(pattern, regexMaximumInstructions)
+
+/** As `regexCompile`, refusing a program of more than `maximumInstructions` instructions (at most 100,000). */
+fun regexCompileWithin(pattern: string, maximumInstructions: int): RegexCompileResult {
+    val limit = if (maximumInstructions > regexMaximumInstructions) regexMaximumInstructions else maximumInstructions
     val info = utf8Info(pattern)
     if (!info.valid) return regexFail(pattern, "the pattern is not valid UTF-8", info.errorOffset)
     val parser = RegexParser(pattern, 0, 0, 0, false, "", 0, [])
     val tree = parser.parseAlternation()
     if (!parser.failed && parser.pos < pattern.size) parser.fail("unmatched )", parser.pos)
     if (parser.failed) return regexFail(pattern, parser.message, parser.errorOffset)
-    val emitter = RegexEmitter([], false, 0)
+    val emitter = RegexEmitter([], false, 0, limit)
     emitter.add(5, 0, 0)
     emitter.emit(tree)
     emitter.add(5, 1, 0)
     emitter.add(7, 0, 0)
-    if (emitter.failed || emitter.count() * (parser.groups + 1) * 2 > regexMaximumWork) {
-        return regexFail(pattern, "the pattern is too large", 0)
+    if (emitter.failed) {
+        return regexFail(pattern, "the pattern is too large: its program has more than ${limit} instructions", 0)
+    }
+    if (emitter.count() * (parser.groups + 1) * 2 > regexMaximumWork) {
+        return regexFail(pattern, "the pattern is too large: ${emitter.count()} instructions times ${parser.groups + 1} " +
+            "capture groups is more than ${regexMaximumWork / 2}", 0)
     }
     RegexCompileResult(Regex(pattern, parser.groups, emitter.program, parser.classes), true,
         RegexError("", 0))

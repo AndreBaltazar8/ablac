@@ -61,6 +61,11 @@ the steps. RE2 and Rust's `regex` have the same limit. For untrusted text, bound
 text's size, or avoid patterns whose alternatives can be prefixes of one another's
 continuations.
 
+A search costs at most 2 × (text size + 1) × instructions steps (about 12 ns each), so at the limit of
+100,000 instructions a megabyte of text could take many minutes. Nested counted repeats multiply: `(a{1,30}){1,30}` is
+1,863 instructions. For patterns from an untrusted source use `regexCompileWithin(pattern, maximumInstructions)`, which
+refuses a larger program with the same error (it never allows more than 100,000).
+
 ## Syntax
 
 | Form | Meaning |
@@ -78,7 +83,7 @@ continuations.
 | `* + ? {m} {m,} {m,n} {,n}` | greedy repetition (`{,n}` is `{0,n}`, as in Python); add `?` (`*?`, `{2,5}?`) for lazy |
 
 Repeat counts go up to 1000; a pattern whose expansion exceeds 100 000
-instructions (`((a{1000}){1000}){1000}`) or whose instructions times capture slots exceed 2 000 000, or that has more
+instructions (`((a{1000}){1000}){1000}`; the error says "the pattern is too large: its program has more than 100000 instructions") or whose instructions times capture slots exceed 2 000 000, or that has more
 than 500 groups or nests groups deeper than 200 levels, is rejected ("too large",
 "too many groups"), which bounds the memory a search needs. A `{` that does not start a valid repeat is a literal.
 
