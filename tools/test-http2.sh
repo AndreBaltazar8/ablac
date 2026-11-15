@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # HTTP/2 for abla/http/async (abla/http/h2): the HPACK test (RFC 7541 appendix C, the Huffman code, the decoder's limits, the encoder's never-indexed rule), the H2Client
-# test against a scripted peer (flow control, floods, limits, response rules), then the real thing: HttpAsyncClient with http2 on against `nghttpd` (nghttp2, over TLS with ALPN: 30
+# test against a scripted peer (flow control, floods, limits, response rules), the async client against a scripted h2c server in a forked child (per-stream timeout, REFUSED_STREAM and GOAWAY retries, a protocol error, trailers, PING before reuse, idle close), then the real thing: HttpAsyncClient with http2 on against `nghttpd` (nghttp2, over TLS with ALPN: 30
 # concurrent requests on one connection, a 3 MiB download and a 300 KB upload across the flow-control windows, HEAD, a second wave on the same connection), the ALPN fallback to
 # HTTP/1.1 against `openssl s_server`, and the default options (http2 off). `h2load` then drives 20000 requests over 8 connections at nghttpd, 100 streams each, through the
 # same server for a load run of the server side only (it checks nghttpd, not us). Usage: tools/test-http2.sh [compiler]
@@ -15,7 +15,7 @@ out=build/http2
 rm -rf "$out"
 mkdir -p "$out/docroot"
 
-for name in hpack client; do
+for name in hpack client mock; do
     "$compiler" build "tests/cases/http2/$name.ab" -o "$out/$name" --no-cache > "$out/$name.build.log" 2>&1 || { cat "$out/$name.build.log" >&2; exit 1; }
     result=$("$root/tools/run-limited.sh" "$out/$name") || { echo "http2 $name: $result" >&2; exit 1; }
     [[ $result == "http2 $name ok" ]] || { echo "http2 $name: $result" >&2; exit 1; }

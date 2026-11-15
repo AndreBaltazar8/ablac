@@ -998,6 +998,7 @@ fun HttpAsyncClient.requestOnStream(slot: int, stream: int): int {
 fun HttpAsyncClient.h2Events(slot: int, retryUnanswered: bool): void {
     val events = this.connectionH2[slot].takeEvents()
     var closed = false
+    var finished = false
     for (event in events) {
         if (event.kind == H2_EVENT_CLOSED) {
             closed = true
@@ -1014,12 +1015,14 @@ fun HttpAsyncClient.h2Events(slot: int, retryUnanswered: bool): void {
         } else if (event.kind == H2_EVENT_DATA) {
             this.requestChunks[request].append(event.data)
         } else if (event.kind == H2_EVENT_END) {
+            finished = true
             val headers: array<HttpHeader> = []
             for (header in this.requestResponseHeaders[request]) headers.append(header)
             val body = httpAsyncJoin(this.requestChunks[request])
             val status = this.requestStatuses[request]
             this.complete(request, status, headers, body, "", "h2")
         } else if (event.kind == H2_EVENT_RESET) {
+            finished = true
             if ((event.retry || (retryUnanswered && this.requestStatuses[request] < 0)) && !this.requestRetried[request]) {
                 this.requestRetried[request] = true
                 this.requestStates[request] = httpAsyncRequestQueued
@@ -1031,7 +1034,7 @@ fun HttpAsyncClient.h2Events(slot: int, retryUnanswered: bool): void {
         }
     }
     if (closed) this.closeConnection(slot)
-    else if (this.connectionH2[slot].openStreams() == 0) this.connectionIdleSince[slot] = linuxMonotonicMilliseconds()
+    else if (finished && this.connectionH2[slot].openStreams() == 0) this.connectionIdleSince[slot] = linuxMonotonicMilliseconds()
     return
 }
 
@@ -1236,6 +1239,7 @@ fun HttpAsyncClient.sweep(now: int): void {
             // An HTTP/2 request times out alone: its stream is cancelled and the connection stays.
             val carrier = this.requestSlots[request]
             this.connectionH2[carrier].cancel(this.requestStreams[request])
+            if (this.connectionH2[carrier].openStreams() == 0) this.connectionIdleSince[carrier] = now
             this.complete(request, 0, [], "", "timeout")
             this.h2Pump(carrier)
         } else if (this.requestStates[request] != 0 && now >= this.requestDeadlines[request]) {
