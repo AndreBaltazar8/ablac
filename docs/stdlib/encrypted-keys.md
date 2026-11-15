@@ -42,9 +42,16 @@ Both `rsaPrivateKeyFromPem(pem, password, limits)` and
 `rsaPrivateKeyFromDer(der, password, limits)` return the usual affine
 `RsaPrivateKey`; inspect `ok()` and `error`. Derived keys, HMAC pads/digests and
 hash states stay in wiped native scratch rather than managed strings. AES key
-schedules are wiped too, using volatile stores. Decrypted DER still passes
-through the existing string-based RSA parser and cannot be wiped; neither can
-copies the caller made before importing a password.
+schedules are wiped too, using volatile stores. The decrypted DER is wiped as
+well: `abla/crypto/pbe`'s `pbeOpenPkcs8` and `pbeOpenPkcs12` return it in a
+`PbeKey`, a resource that overwrites it with zeros when dropped (`der()` lends
+it while the owner lives; a copy kept longer, with `cryptoOwnedCopy`, is the
+caller's to wipe with `cryptoWipeString`), and every buffer a container is
+decrypted into on the way is wiped before they return. `pbeOpenPkcs12Contents`
+returns the key as an exact copy of its own, the caller's to wipe.
+`tools/test-pbe-key-residue.sh` searches a Wasm module's memory after two
+collections for the key's numbers and the password. What cannot be wiped are
+copies the caller made: the PEM or DER text it read, and its password string.
 
 ## Bounds and compatibility
 

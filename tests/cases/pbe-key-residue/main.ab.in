@@ -1,0 +1,74 @@
+// The decrypted key of abla/crypto/pbe must not stay in freed memory (tools/test-pbe-key-residue.sh): each export opens
+// the committed encrypted fixtures of tests/vectors/crypto/encrypted-rsa (the public test key, password
+// "test-only-password") and drops what it opened; the driver collects twice and searches linear memory for the key's
+// p, q, d, dp, dq and qinv, and for the password. `control` keeps a plain managed copy of the decrypted DER, never wiped,
+// which the search must find: the proof that a freed, unwiped key would be seen.
+import "abla/crypto"
+import "abla/crypto/pbe"
+import "abla/crypto/rsa"
+import "abla/bytes"
+import "abla/memory"
+
+val pkcs8 = hexDecode("@P8HEX@")
+val pkcs12 = hexDecode("@P12HEX@")
+val pem = hexDecode("@PEMHEX@")
+
+// Named owners, dropped at the end of the function.
+@noinline trusted fun openPkcs8(): int {
+    val password = cryptoPassword("test-only-password")
+    val key = pbeOpenPkcs8(pkcs8, password)
+    if (key.ok() && key.der().size > 1000) 0 else 1
+}
+
+@noinline trusted fun openPkcs12(): int {
+    val password = cryptoPassword("test-only-password")
+    val key = pbeOpenPkcs12(pkcs12, password)
+    if (key.ok() && key.der().size > 1000) 0 else 2
+}
+
+// The password written inline, a temporary owner (#736): dropped, so wiped, after the statement.
+@noinline trusted fun openPkcs8Inline(): int =
+    if (pbeOpenPkcs8(pkcs8, cryptoPassword("test-only-password")).ok()) 0 else 3
+
+// A deterministic source for the key's blinding: Wasm has no random source of its own (test only).
+var residueState = 1
+fun residueRandom(count: int): string {
+    val out = byteBuffer()
+    for (i in 0 until count) {
+        residueState = (residueState * 1103515245 + 12345) & 2147483647
+        out.appendText(byteEncode((residueState >> 16) & 255))
+    }
+    out.toText()
+}
+
+// Through abla/crypto/rsa: parsed into the key's own allocation, which is wiped on its drop.
+@noinline trusted fun openPem(): int {
+    cryptoSetRandom({ count: int -> residueRandom(count) })
+    val key = rsaPrivateKeyFromPem(pem, cryptoPassword("test-only-password"))
+    // The key's modulus outlives the opened DER, which was wiped: it is a copy of its own.
+    if (key.ok() && key.bits == 2048 &&
+        hexEncode(sha256(key.modulus)) == "ebeba98ef666cf584dfebad1922952ce1107cccaf63e3d74f357fd195b88dc44") 0 else 4
+}
+
+// The control: a plain copy of the decrypted DER in a managed string, never wiped.
+@noinline trusted fun leakCopy(): int {
+    val password = cryptoPassword("test-only-password")
+    val key = pbeOpenPkcs8(pkcs8, password)
+    val copy = byteBuffer()
+    copy.appendText(key.der())
+    if (copy.toText().size > 1000) 0 else 9
+}
+
+@export("run")
+fun run(which: int): int =
+    if (which == 1) openPkcs8() else if (which == 2) openPkcs12() else if (which == 3) openPkcs8Inline()
+    else if (which == 4) openPem() else leakCopy()
+
+@export("collect")
+fun collect(): int {
+    memoryCollect()
+    memoryCollect()
+    0
+}
+
+fun main(): int = run(1)

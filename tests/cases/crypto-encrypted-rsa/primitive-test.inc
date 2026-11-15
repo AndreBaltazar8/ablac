@@ -1,5 +1,4 @@
 // Test-only public outputs: fixed, non-secret KAT inputs. Not an exported API.
-import "abla/crypto"
 import "abla/bytes"
 trusted fun pbeTestHash(message: string, sha1: bool): string {
     val hash = pbeHash(sha1)

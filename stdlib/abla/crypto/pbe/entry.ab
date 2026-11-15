@@ -1,6 +1,7 @@
 import "abla/ct"
 import "abla/ct/scrub"
 import "abla/text"
+import "abla/crypto"
 import "abla/crypto/aes"
 import "abla/crypto/der"
 import "abla/crypto/legacy"
@@ -504,22 +505,61 @@ private trusted fun pbeDecrypt(cipher: PbeCipher, password: CryptoPassword,
     pbeWipe(ablaUnsafePointerAddress(derived.address), derived.capacity)
     result
 }
-/** Checked PBES2 envelope. Plaintext is a managed DER string, as in the existing
- * RSA parser. This is not authenticated encryption or an entire-loader CT claim. */
+/** An opened private key: the decrypted PKCS#8 PrivateKeyInfo DER (the key's p, q, d and the rest) in a buffer of its own,
+ *  which `drop` overwrites with zeros, so no copy of it is left in freed memory. `der()` lends it: read it while the owner
+ *  lives; to keep it longer, copy it (cryptoOwnedCopy), and the copy is then yours to wipe (cryptoWipeString). Check
+ *  `ok()` and `error()`. */
+resource class PbeKey() {
+    trusted fun drop(): void {
+        if (this.keyOwned) {
+            cryptoWipeString(this.keyDer)
+            this.keyDer = ""
+            this.keyOwned = false
+            this.keyError = "key owner is closed"
+        }
+    }
+    fun ok(): bool = this.keyOwned
+    fun error(): string = this.keyError
+    fun der(): string = this.keyDer
+}
+private var PbeKey.keyDer: string = ""
+private var PbeKey.keyOwned: bool = false
+private var PbeKey.keyError: string = "invalid key owner"
+
+// An owner of a copy of `der`, or of `error`: the copy is exact, a buffer of its own (cryptoOwnedCopy), so its wipe
+// touches nothing else.
+private trusted fun pbeKeyOwning(der: string, error: string): PbeKey {
+    var key = PbeKey()
+    if (error == "") {
+        key.keyDer = cryptoOwnedCopy(der)
+        key.keyOwned = true
+        key.keyError = ""
+    } else key.keyError = error
+    key
+}
+
+/** Checked PBES2 envelope. The decrypted key comes back in an owner that wipes it when dropped (PbeKey), and the
+ * plaintext buffer it was decrypted into is wiped before this returns. This is not authenticated encryption or an
+ * entire-loader CT claim. */
 trusted fun pbeOpenPkcs8(data: string, password: CryptoPassword,
-    limits: RsaKeyReadLimits = rsaKeyReadLimits()): CryptoResult {
+    limits: RsaKeyReadLimits = rsaKeyReadLimits()): PbeKey {
     val result = pbeOpenPkcs8Work(data, password, limits)
     ctScrubStack4096()
     return result
 }
 private @noinline trusted fun pbeOpenPkcs8Work(data: string, password: CryptoPassword,
-    limits: RsaKeyReadLimits): CryptoResult {
-    if (!rsaKeyReadLimitsValid(limits)) return cryptoFailed("invalid RSA key read limits")
-    if (!password.ok()) return cryptoFailed(password.error())
+    limits: RsaKeyReadLimits): PbeKey {
+    if (!rsaKeyReadLimitsValid(limits)) return pbeKeyOwning("", "invalid RSA key read limits")
+    if (!password.ok()) return pbeKeyOwning("", password.error())
     val cipher = pbeEncryptedInfo(data, limits)
-    if (cipher.error != "") return cryptoFailed(cipher.error)
+    if (cipher.error != "") return pbeKeyOwning("", cipher.error)
     val budget = PbeBudget(limits)
-    pbeDecrypt(cipher, password, budget)
+    val opened = pbeDecrypt(cipher, password, budget)
+    if (!opened.ok) return pbeKeyOwning("", opened.error)
+    val key = pbeKeyOwning(opened.bytes, "")
+    // The plaintext buffer pbeDecrypt made (its padding, after the key, is not secret).
+    cryptoWipeString(opened.bytes)
+    key
 }
 
 // PKCS#12 Appendix B: the key (ID 1), IV (ID 2) and MAC key (ID 3) derivation of the container, with SHA-1 or SHA-256, for any
@@ -631,10 +671,22 @@ private trusted fun pbePkcs12CheckMac(data: string, safe: string, item: DerItem,
     result
 }
 
+// `made`: the plaintext buffers pbeDecrypt made on the way (a shrouded key, an EncryptedData's SafeContents, which holds
+// a key bag's key and the certificates too). `finish` takes what outlives them out of them first, then wipes them.
 private class PbeSafeWalk(val limits: RsaKeyReadLimits, var bags: int = 0,
-    var keys: int = 0, var key: string = "", var error: string = "", var certificates: array<string> = [])
+    var keys: int = 0, var key: string = "", var error: string = "", var certificates: array<string> = [],
+    var made: array<string> = [])
 private fun PbeSafeWalk.fail(error: string): void {
     if (this.error == "") this.error = error
+}
+// The key, as an exact copy of its own (or "" without exactly one), with every plaintext buffer of the walk wiped after:
+// on a failure too, since a decryption may have happened before it.
+private trusted fun PbeSafeWalk.finish(): string {
+    val key = if (this.error == "" && this.keys == 1) cryptoOwnedCopy(this.key) else ""
+    this.key = ""
+    for (plaintext in this.made) cryptoWipeString(plaintext)
+    this.made = []
+    key
 }
 // Attributes may be ignored semantically, but their DER structure stays bounded.
 private fun PbeSafeWalk.attribute(data: string, item: DerItem, depth: int): bool {
@@ -694,6 +746,7 @@ private trusted fun PbeSafeWalk.contents(data: string, password: CryptoPassword,
                 if (cipher.error != "") { this.fail(cipher.error); return }
                 val decrypted = pbeDecrypt(cipher, password, budget)
                 if (!decrypted.ok) { this.fail(decrypted.error); return }
+                this.made.append(decrypted.bytes)
                 this.key = decrypted.bytes
             }
         } else if (pbeOid(data, oid, "\x2a\x86\x48\x86\xf7\x0d\x01\x0c\x0a\x01\x03")) {
@@ -708,7 +761,8 @@ private trusted fun PbeSafeWalk.contents(data: string, password: CryptoPassword,
             if (!explicit.ok || explicit.tag != 160 || explicit.end != payload.end ||
                 !certificate.ok || certificate.tag != DER_OCTET_STRING || certificate.end !=
                 explicit.end) { this.fail("wrong password or corrupt key"); return }
-            this.certificates.append(data.slice(certificate.start, certificate.end))
+            // A copy: `data` may be a decrypted SafeContents, which finish wipes.
+            this.certificates.append(cryptoOwnedCopy(data.slice(certificate.start, certificate.end)))
         } else if (pbeOid(data, oid, "\x2a\x86\x48\x86\xf7\x0d\x01\x0c\x0a\x01\x06")) {
             this.contents(data.slice(value.start, value.end), password, budget, depth + 1)
         } else { this.fail("unsupported PKCS#12 bag type"); return }
@@ -752,16 +806,30 @@ private trusted fun PbeSafeWalk.contentInfo(data: string, info: DerItem, passwor
         if (cipher.error != "") { this.fail(cipher.error); return }
         val decrypted = pbeDecrypt(cipher, password, budget)
         if (!decrypted.ok) { this.fail(decrypted.error); return }
+        this.made.append(decrypted.bytes)
         this.contents(decrypted.bytes, password, budget, 1)
     } else this.fail("unsupported PKCS#12 content (data or PBES2 EncryptedData required)")
 }
 /** DER PFXv3 with a required SHA1/SHA256 MAC. Only authenticated content is
- * traversed or decrypted; returns exactly one PKCS#8 key, not a TLS identity. */
+ * traversed or decrypted; returns exactly one PKCS#8 key, in an owner that wipes it when dropped (PbeKey), not a TLS
+ * identity. Every buffer decrypted on the way is wiped before this returns. */
 trusted fun pbeOpenPkcs12(data: string, password: CryptoPassword,
-    limits: RsaKeyReadLimits = rsaKeyReadLimits()): CryptoResult {
-    val result = pbeOpenPkcs12Work(data, password, limits)
+    limits: RsaKeyReadLimits = rsaKeyReadLimits()): PbeKey {
+    val result = pbeOpenPkcs12Key(data, password, limits)
     ctScrubStack4096()
     return result
+}
+// The work's key is already an exact copy of its own (PbeSafeWalk.finish): the owner takes it as it is.
+private @noinline trusted fun pbeOpenPkcs12Key(data: string, password: CryptoPassword,
+    limits: RsaKeyReadLimits): PbeKey {
+    val opened = pbeOpenPkcs12Work(data, password, limits)
+    var key = PbeKey()
+    if (opened.ok) {
+        key.keyDer = opened.bytes
+        key.keyOwned = true
+        key.keyError = ""
+    } else key.keyError = opened.error
+    key
 }
 private @noinline trusted fun pbeOpenPkcs12Work(data: string, password: CryptoPassword,
     limits: RsaKeyReadLimits): CryptoResult {
@@ -803,18 +871,21 @@ private @noinline trusted fun pbeOpenPkcs12Work(data: string, password: CryptoPa
     var count = 0
     while (at < sequence.end && walk.error == "") {
         count += 1
-        if (count > limits.maximumBags) return cryptoFailed("PKCS#12 content count limit exceeded")
+        if (count > limits.maximumBags) { walk.fail("PKCS#12 content count limit exceeded"); break }
         val info = derItem(safe, at, sequence.end)
-        if (!info.ok) return cryptoFailed("wrong password or corrupt key")
+        if (!info.ok) { walk.fail("wrong password or corrupt key"); break }
         walk.contentInfo(safe, info, password, budget)
         at = info.end
     }
+    // An exact copy of the key, and every buffer the walk decrypted wiped: before any return.
+    val key = walk.finish()
     if (walk.error != "") return cryptoFailed(walk.error)
     if (walk.keys != 1) return cryptoFailed("PKCS#12 contains no private key")
-    CryptoResult(walk.key, true, "")
+    CryptoResult(key, true, "")
 }
 
-/** What a PKCS#12 holds: its one private key (PKCS#8 DER) and its certificates (DER) in bag order. */
+/** What a PKCS#12 holds: its one private key (PKCS#8 DER) and its certificates (DER) in bag order. `key` is an exact copy
+ *  of its own (every buffer decrypted on the way is wiped): it is the caller's, to wipe with cryptoWipeString when done. */
 class Pkcs12Contents(val ok: bool, val error: string, val key: string, val certificates: array<string>)
 
 private fun pkcs12Failed(error: string): Pkcs12Contents {
@@ -871,13 +942,15 @@ private @noinline trusted fun pbeOpenPkcs12ContentsWork(data: string, password: 
     var count = 0
     while (at < sequence.end && walk.error == "") {
         count += 1
-        if (count > limits.maximumBags) return pkcs12Failed("PKCS#12 content count limit exceeded")
+        if (count > limits.maximumBags) { walk.fail("PKCS#12 content count limit exceeded"); break }
         val info = derItem(safe, at, sequence.end)
-        if (!info.ok) return pkcs12Failed("wrong password or corrupt key")
+        if (!info.ok) { walk.fail("wrong password or corrupt key"); break }
         walk.contentInfo(safe, info, password, budget)
         at = info.end
     }
+    // An exact copy of the key, and every buffer the walk decrypted wiped: before any return.
+    val key = walk.finish()
     if (walk.error != "") return pkcs12Failed(walk.error)
     if (walk.keys != 1) return pkcs12Failed("PKCS#12 contains no private key")
-    Pkcs12Contents(true, "", walk.key, walk.certificates)
+    Pkcs12Contents(true, "", key, walk.certificates)
 }

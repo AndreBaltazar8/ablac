@@ -61,9 +61,9 @@ fun pbePrimitiveChecks(): int {
     if (hexEncode(pbeTestPkcs12Kdf("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13", 17, 1, true, 24)) != "7950d458e416d56f6016d8aff92d45af1108082833690a96") return 58
     if (hexEncode(pbeTestPkcs12Kdf("x", "\x73\x61\x6c\x74", 3, 1, false, 80)) != "0872fc060380f12a2a5e958cfc77c48d3a8e12f89dd5696cd5d575291e0f5a52da8285306e5607dfcc686eee18892b4e8be9a58f557c8fe4de7c12a1848dc9eedb990d4fd2a87189cce5477e83f985e4") return 59
     val nulPassword = cryptoPassword("a\x00b")
-    if (pbeOpenPkcs12("", nulPassword).error != "PKCS#12 password contains NUL") return 90
+    if (pbeOpenPkcs12("", nulPassword).error() != "PKCS#12 password contains NUL") return 90
     val astralPassword = cryptoPassword("\xf0\x9f\x98\x80")
-    if (pbeOpenPkcs12("", astralPassword).error != "unsupported PKCS#12 password encoding (UTF-8 BMP text required)") return 91
+    if (pbeOpenPkcs12("", astralPassword).error() != "unsupported PKCS#12 password encoding (UTF-8 BMP text required)") return 91
     0
 }
 fun main(): int = pbePrimitiveChecks()
