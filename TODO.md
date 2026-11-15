@@ -1027,6 +1027,15 @@ mmap form) apply there.
   TVars show no change beyond noise. A region at the allocator's page, or counted at creation, kept the boundaries
   (screened, not shipped). Open: a thread that first touches TVars others mostly use gives them its clock. The
   partitioned-only prototype that cost a logged block 30% more is on branch `stm-clocks`.
+- [ ] **Transactional memory: a TVar takes the clock of the thread that first uses it.** Since
+  `docs/measurements/stm-region-at-first-use-2026-11-15.md`, a TVar's region is set once, by the first logged
+  transaction that reaches it. A thread that touches TVars first which other threads then mostly use gives them
+  its clock: one worker initialising a shared structure in logged transactions while the others run puts all of
+  it on that worker's clock, and the others' transactions on it escalate to the partitioned protocol or share
+  the clock. Not measured yet. Options: let a TVar's region move while no transaction holds it (the protocol
+  needs a TVar's clock fixed from its first versioned commit, so a move must happen before one or be validated
+  like a clock change), or take the region from the first logged commit that writes it rather than the first
+  access. The 16-clock limit (thread number & 15) is the same as before.
 
 - [ ] **The rest of the reserved generic syntax.** `where` clauses, `const` type parameters and
   an interface's `type Item` still give `E_PARSE_NOT_YET_SUPPORTED`. Decide which to build.
