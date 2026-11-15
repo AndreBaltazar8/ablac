@@ -30,9 +30,12 @@ result=$("$compiler" run tests/cases/emutls/jit.ab 2>&1) || { echo "emutls (run)
 [[ $result == *"jit emutls ok"* ]] || { echo "emutls (run): $result" >&2; exit 1; }
 # Many short threads of a JIT-compiled program: the compiler's thread-end function (stored in the program's runtime hook
 # before main) frees their thread-locals, so the resident size stays put.
-result=$("$compiler" run tests/cases/emutls/jit-threads.ab 2>&1) || { echo "emutls (run, threads): $result" >&2; exit 1; }
-[[ $result == *"jit emutls threads ok"* ]] || { echo "emutls (run, threads): $result" >&2; exit 1; }
-printf '%s\n' "$result" | grep 'jit threads' || true
+# Twice: the second run takes the program's object from the JIT cache (jit_cache.ab), which must find the hook as well.
+for round in compiled cached; do
+    result=$("$compiler" run tests/cases/emutls/jit-threads.ab 2>&1) || { echo "emutls (run, threads, $round): $result" >&2; exit 1; }
+    [[ $result == *"jit emutls threads ok"* ]] || { echo "emutls (run, threads, $round): $result" >&2; exit 1; }
+    printf '%s\n' "$result" | grep 'jit threads' || true
+done
 tools_dir=${ABLA_LLVM_TOOLS:-}
 if [[ -z $tools_dir ]] || [[ ! -x $tools_dir/llc || ! -x $tools_dir/llvm-nm ]]; then
     tools_dir=$(dirname "$(command -v llc 2>/dev/null || true)")
