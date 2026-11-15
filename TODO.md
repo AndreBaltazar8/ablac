@@ -2855,3 +2855,14 @@ reached nodes, keeps stable IDs, and writes no files for unchanged keeps.
 These are local Linux measurements, not NovaKind timings. Single-root reads
 stay below twice the old best-case cost and constant in unrelated roots;
 whole-graph work grows linearly. There is no persistent bundle cache.
+
+## Secrets in strings: an owner type (SecretBytes)
+
+A string value has no owner information: a slice is a view and a concatenation beyond 64 bytes a rope, so a wipe can zero what was made
+from the string or leave the rest of a bigger buffer (the audit and fixes: `cryptoOwnedCopy`/`cryptoWipeString` in abla/crypto,
+tools/test-wipe-sources.sh, tests/cases/crypto-pure/wipe-views.ab). Decided not to do now: a `resource class SecretBytes` (like
+`CryptoPassword`: native buffer, copy in at the boundary, wipe and free on drop, `bytes()` lends a fresh copy) for long-lived secrets
+(traffic secrets, record keys, identity scalars, private keys). Estimated cost (2026-11-15): about 30 fields in TlsClient, TlsServer,
+TlsRecordProtection and Tls12Keys, 12 keysched return types and the 70 `tlsWipe` sites; no public crypto API change; mechanical but wide.
+It buys ownership, not erasure: every per-use copy is a string again. Erasure everywhere needs aes, chacha, hmac, hkdf, x25519 and p256
+to take owners or addresses (about 40 public functions). Revisit if a wipe bug appears that the lint does not catch.
