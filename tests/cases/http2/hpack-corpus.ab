@@ -1,0 +1,72 @@
+// HPACK against the http2jp/hpack-test-case stories (tests/vectors/hpack): the bytes of 14 independent encoders decode to exactly the header lists they were made from, one decoder
+// per story with the table carried from case to case. Then our encoder's output for every case's header list decodes back to it. Argument: stories.txt.
+// Prints "http2 hpack-corpus ok N cases".
+import "abla/io"
+import "abla/crypto"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/text"
+import "abla/integer"
+import "abla/http/h2/hpack"
+
+var failures = 0
+
+fun fail(what: string): void {
+    failures = failures + 1
+    if (failures < 30) println("FAIL $what")
+    return
+}
+
+fun main: int {
+    val text = linuxReadFile(processArgument(0), 4194304)
+    val separator = cryptoByteString([31])
+    val lines = text.split("\n")
+    var decoder = hpackDecoderNew(65536, 1048576, 65536, 4096)
+    var encoder = hpackEncoderNew(4096)
+    var round = hpackDecoderNew(4096, 1048576, 65536, 4096)
+    var story = ""
+    var cases = 0
+    for (line in lines) {
+        if (line.size == 0) continue
+        val parts = line.split(separator)
+        if (parts[0] != story) {
+            // A new story: fresh tables on both sides of every pair.
+            story = parts[0]
+            decoder = hpackDecoderNew(65536, 1048576, 65536, 4096)
+            encoder = hpackEncoderNew(4096)
+            round = hpackDecoderNew(4096, 1048576, 65536, 4096)
+        }
+        val expected: array<HpackField> = []
+        var i = 4
+        while (i + 1 < parts.size) {
+            expected.append(HpackField(parts[i], parts[i + 1], false))
+            i = i + 2
+        }
+        val got = decoder.decode(hexDecode(parts[3]))
+        cases = cases + 1
+        if (!got.ok) {
+            fail("${parts[0]} case ${parts[1]}: ${got.error}")
+            story = ""
+            continue
+        }
+        if (got.fields.size != expected.size) {
+            fail("${parts[0]} case ${parts[1]}: ${got.fields.size} fields, wanted ${expected.size}")
+            continue
+        }
+        for (k in 0 until expected.size) {
+            if (got.fields[k].name != expected[k].name || got.fields[k].value != expected[k].value) fail("${parts[0]} case ${parts[1]} field $k: ${got.fields[k].name}: ${got.fields[k].value}")
+        }
+        // Our encoder on the same list, through our decoder.
+        val back = round.decode(encoder.encode(expected))
+        if (!back.ok || back.fields.size != expected.size) fail("${parts[0]} case ${parts[1]}: our encoder's block: ${back.error}")
+        else {
+            for (k in 0 until expected.size) {
+                if (back.fields[k].name != expected[k].name || back.fields[k].value != expected[k].value) fail("${parts[0]} case ${parts[1]} field $k: round trip")
+            }
+        }
+    }
+    if (cases < 1000) fail("only $cases cases read")
+    if (failures > 0) return 1
+    println("http2 hpack-corpus ok $cases cases")
+    0
+}
