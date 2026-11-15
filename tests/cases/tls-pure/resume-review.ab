@@ -1,0 +1,178 @@
+// Review of TLS 1.3 resumption (bff819d1), regression cases (tools/test-tls-resume-review.sh). Each fails today; prints
+// "resume review ok" when all pass. Argument 0: a directory with ed25519.pem/.key (the trusted server) and p256.pem/.key
+// (a server the store does not trust).
+import "abla/io"
+import "abla/crypto"
+import "abla/crypto/x509"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/tls/pure/client"
+import "abla/tls/pure/handshake"
+import "abla/tls/pure/identity"
+import "abla/tls/pure/keysched"
+import "abla/tls/pure/resume"
+import "abla/tls/pure/server"
+import "abla/tls/pure/verify"
+
+var failures = 0
+var seed = 99
+var clock = 1000
+
+fun fail(what: string): void {
+    failures = failures + 1
+    println("FAIL $what")
+    return
+}
+fun random(count: int): string {
+    val bytes: array<int> = []
+    for (i in 0 until count) {
+        seed = (seed * 1103515245 + 12345) & 2147483647
+        bytes.append((seed >> 8) & 255)
+    }
+    cryptoByteString(bytes)
+}
+fun now(): int = clock
+fun read(path: string): string = linuxReadFile(path, 1048576)
+fun base0(): TlsClientConfig = tlsClientConfig("localhost", trustAnything, random)
+fun acceptAny(chain: array<string>, scheme: int, content: string, signature: string): TlsVerdict = tlsAccepted()
+fun trustAnything(chain: array<string>, host: string, scheme: int, content: string, signature: string): TlsVerdict = tlsAccepted()
+
+fun pump(var client: TlsClient, var server: TlsServer): void {
+    var rounds = 0
+    while (rounds < 50) {
+        val toServer = client.takeOutput()
+        if (toServer.size > 0) server.feed(toServer)
+        val toClient = server.takeOutput()
+        if (toClient.size > 0) client.feed(toClient)
+        if (toServer.size == 0 && toClient.size == 0) return
+        rounds = rounds + 1
+    }
+    return
+}
+
+fun client(host: string, verifier: (array<string>, string, int, string, string) -> TlsVerdict, cache: TlsSessionCache, scope: string,
+    suites: array<int> = []): TlsClient {
+    val base = tlsClientConfig(host, verifier, random)
+    tlsClientNew(TlsClientConfig(host, if (suites.size > 0) suites else base.suites, base.signatureAlgorithms, [], verifier, random,
+        tlsPatchClientHello, base.suites12, false, [], cache, scope))
+}
+
+fun server(identity: TlsIdentity, keys: TlsTicketKeys, suites: array<int> = [], groups: array<int> = []): TlsServer {
+    val base = tlsServerConfig(identity, random)
+    tlsServerNew(TlsServerConfig(identity, if (suites.size > 0) suites else base.suites, if (groups.size > 0) groups else base.groups, [], random,
+        false, false, acceptAny, base.suites12, keys))
+}
+
+fun u16At(text: string, at: int): int = text[at] * 256 + text[at + 1]
+fun withU16(text: string, at: int, value: int): string =
+    text.slice(0, at) + cryptoByteString([(value >> 8) & 255, value & 255]) + text.slice(at + 2, text.size)
+
+// A ClientHello handshake message whose last extension is pre_shared_key with 32-byte binders, less its last binder
+// entry (33 bytes): the binders list, the extension, the extensions and the message lengths shrink by 33.
+fun dropLastBinder(message: string): string {
+    var at = 4 + 2 + 32
+    at = at + 1 + message[at]
+    at = at + 2 + u16At(message, at)
+    at = at + 1 + message[at]
+    val extensions = at
+    // The last extension: walk them.
+    var cursor = extensions + 2
+    var last = cursor
+    while (cursor < message.size) {
+        last = cursor
+        cursor = cursor + 4 + u16At(message, cursor + 2)
+    }
+    val binders = tlsBindersStart(message)
+    var out = message.slice(0, message.size - 33)
+    out = withU16(out, binders, u16At(out, binders) - 33)
+    out = withU16(out, last + 2, u16At(out, last + 2) - 33)
+    out = withU16(out, extensions, u16At(out, extensions) - 33)
+    val length = (out[1] << 16 | out[2] << 8 | out[3]) - 33
+    out.slice(0, 1) + cryptoByteString([(length >> 16) & 255, (length >> 8) & 255, length & 255]) + out.slice(4, out.size)
+}
+
+fun main: int {
+    val directory = processArgument(0)
+    clock = linuxRealtimeNanoseconds() / 1000000000
+    val goodIdentity = tlsIdentityFromPem(read("$directory/ed25519.pem"), read("$directory/ed25519.key"))
+    val untrusted = tlsIdentityFromPem(read("$directory/p256.pem"), read("$directory/p256.key"))
+    if (!goodIdentity.ok() || !untrusted.ok()) { fail("identities"); return 1 }
+    val store = x509TrustStoreFromPem(read("$directory/ed25519.pem"))
+    val strict = tlsX509Verifier(store, now)
+
+    // R1 (high). A ticket from a connection that verified nothing (or by other rules) must not resume a connection that
+    // verifies: resumption skips Certificate and CertificateVerify (RFC 8446 4.6.1), so the cache must bind a ticket to
+    // how the server was authenticated. The attacker's server (a certificate the strict store does not trust) issues a
+    // ticket to a client that accepts anything; a strict client sharing the cache must not complete with it.
+    val shared = tlsSessionCacheNew(now)
+    val attackerKeys = tlsTicketKeysNew(random, now, 7200)
+    var weak = client("localhost", trustAnything, shared, "")
+    var attacker = server(untrusted, attackerKeys)
+    pump(weak, attacker)
+    pump(weak, attacker)
+    if (!weak.connected()) fail("R1 setup: the accept-anything client did not connect [${weak.error}]")
+    if (shared.count("localhost") != 0) fail("R1: a connection that verified nothing kept a ticket")
+    var victim = client("localhost", strict, shared, tlsX509Scope(store))
+    var attacker2 = server(untrusted, attackerKeys)
+    pump(victim, attacker2)
+    if (victim.connected()) {
+        fail("R1: a strict client resumed with a ticket from an unverified connection (resumed ${victim.resumed()}): the server was never verified")
+    }
+    // The control: the strict client alone, against the same server, refuses it.
+    var alone = client("localhost", strict, tlsSessionCacheNew(now), tlsX509Scope(store))
+    var attacker3 = server(untrusted, attackerKeys)
+    pump(alone, attacker3)
+    if (alone.connected()) fail("R1 control: the strict client accepted the untrusted certificate")
+
+    // R2 (medium). RFC 8446 4.1.2 lets the second ClientHello drop PSKs that do not fit the suite the HelloRetryRequest
+    // chose; this client does (tlsDropPsk). A ticket of a SHA-384 suite, then a server that prefers a SHA-256 suite and
+    // wants P-384 (a HelloRetryRequest): the connection must complete with a full handshake, not missing_extension.
+    val cache384 = tlsSessionCacheNew(now)
+    val keys = tlsTicketKeysNew(random, now, 7200)
+    var first = client("localhost", strict, cache384, tlsX509Scope(store), [TLS_SUITE_AES_256_GCM_SHA384])
+    var firstServer = server(goodIdentity, keys, [TLS_SUITE_AES_256_GCM_SHA384])
+    pump(first, firstServer)
+    pump(first, firstServer)
+    if (!first.connected() || cache384.count("localhost") != 1) fail("R2 setup: no SHA-384 ticket [${first.error}] [${firstServer.error}]")
+    var second = client("localhost", strict, cache384, tlsX509Scope(store), [TLS_SUITE_AES_128_GCM_SHA256, TLS_SUITE_AES_256_GCM_SHA384])
+    var secondServer = server(goodIdentity, keys, [TLS_SUITE_AES_128_GCM_SHA256], [TLS_GROUP_SECP384R1])
+    pump(second, secondServer)
+    if (!second.connected() || !second.retried || second.resumed()) {
+        fail("R2: a second ClientHello without the PSK the suite change made unusable: connected ${second.connected()} retried ${second.retried} [${second.error}] [${secondServer.error}]")
+    }
+
+    // R3 (low). RFC 8446 4.2.11: a pre_shared_key whose identities and binders differ in number (or that is not last) is
+    // illegal_parameter, whatever else the ClientHello asks. Today the checks run after the HelloRetryRequest branch, so a
+    // first ClientHello that needs a retry gets a HelloRetryRequest instead of the alert.
+    val mismatchShares = tlsClientShares(tlsDefaultGroups(), true, random)
+    val twoOffers = tlsBuildClientHello(random(32), random(32), base0().suites, "localhost", mismatchShares.groups, mismatchShares.shares,
+        base0().signatureAlgorithms, [], "", [], false, [TlsPskIdentity("one", 0), TlsPskIdentity("two", 0)], 32)
+    val oneBinder = dropLastBinder(tlsReplaceBinders(twoOffers, [random(32), random(32)]))
+    var retryingServer = server(goodIdentity, keys, [], [TLS_GROUP_SECP384R1])
+    retryingServer.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, oneBinder))
+    retryingServer.takeOutput()
+    if (!retryingServer.failed() || !retryingServer.error.contains("differ in number")) {
+        fail("R3: two PSK identities with one binder, in a ClientHello that needs a retry: not refused for the mismatch [${retryingServer.error}] failed ${retryingServer.failed()}")
+    }
+    // The control: the same ClientHello to a server that needs no retry is refused for the mismatch.
+    var plainServer = server(goodIdentity, keys)
+    plainServer.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, oneBinder))
+    plainServer.takeOutput()
+    if (!plainServer.failed() || !plainServer.error.contains("differ in number")) fail("R3 control: the mismatch is not refused [${plainServer.error}]")
+
+    // R5 (low). RFC 8446 4.2.11: PskIdentity identity<1..2^16-1>, PskBinderEntry<32..255>. An
+    // empty identity is a decode error (a binder of 31 bytes is refused by the binder check as decrypt_error, as BoGo expects: Resume-Server-BinderWrongLength).
+    val base = tlsClientConfig("localhost", strict, random)
+    val offer = tlsClientShares(tlsDefaultGroups(), true, random)
+    for (variant in 1 until 2) {
+        val identity = if (variant == 0) "ticket-bytes" else ""
+        val binderLength = if (variant == 0) 31 else 32
+        val message = tlsBuildClientHello(random(32), random(32), base.suites, "localhost", offer.groups, offer.shares, base.signatureAlgorithms, [], "",
+            [], false, [TlsPskIdentity(identity, 0)], binderLength)
+        val parsed = tlsParseClientHello(message.slice(4, message.size))
+        if (parsed.ok) fail("R5: a ClientHello with ${if (variant == 0) "a 31-byte binder" else "an empty PSK identity"} parsed")
+    }
+
+    if (failures == 0) println("resume review ok")
+    if (failures == 0) 0 else 1
+}
