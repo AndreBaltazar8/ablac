@@ -37,7 +37,11 @@ for name in $subjects; do
                 tail -n 5 "$out/build.log" >&2
                 continue
             fi
-            llvm-nm -u "$binary" | awk -v subject="$name.$mode" '{print subject, $NF}'
+            # lld (the linker here) leaves dyld_stub_binder undefined in the symbol table of an image with
+            # chained fixups, with nothing bound to it; Apple's ld, which the Mac links with, does not (#811 G5).
+            chained=$(llvm-objdump --macho --private-headers "$binary" | grep -c LC_DYLD_CHAINED_FIXUPS || true)
+            llvm-nm -u "$binary" | awk -v subject="$name.$mode" -v chained="$chained" \
+                '!(chained > 0 && $NF == "dyld_stub_binder") {print subject, $NF}'
             echo "$name.$mode needed:/usr/lib/libSystem.B.dylib"
         done
     done
