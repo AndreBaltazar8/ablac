@@ -1382,3 +1382,15 @@ int malloc_trim(size_t pad) {
   malloc_zone_pressure_relief(NULL, 0);
   return 1;
 }
+
+// libSystem's fork, for the Abla dispatcher's fork 57 on macOS (stdlib/abla/runtime/platform/host.ab): its fork
+// handlers must run, or a child that goes on to run C code is broken (#811). The dispatcher names this, not fork,
+// so an iOS build, which emits the runtime whole, names no process API; iOS refuses process creation here. Weak: the
+// compiler defines its own (src/darwin_fork_export.ab, for the code it JIT-compiles on every host), which wins there.
+__attribute__((weak)) int64_t abla_darwin_fork(void) {
+#if TARGET_OS_IOS
+  return -1;
+#else
+  return (int64_t)fork();
+#endif
+}

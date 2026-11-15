@@ -1,6 +1,11 @@
 import "abla/io"
 import "abla/sys/linux"
 import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+// libSystem's (macOS) or libc's (Linux) allocator, for the child that runs C code after a fork.
+extern:"c" fun malloc(size: int): i64*
+extern:"c" fun free(block: i64*): void
 
 // The process calls a macOS program issues by BSD system call (#811 group 5), through the portable
 // Linux-numbered surface (fork 57, execve 59, wait4 61, kill 62, setpgid 109); on Linux the same
@@ -56,6 +61,25 @@ trusted fun main: int {
     good = report("wait4 exit status",
         reaped == first && ((code >> 8) & 255) == 3 && (code & 127) == 0,
         code) && good
+    // A child that runs C code after the fork (#811): libSystem's malloc of 64 MiB (fresh virtual memory), written at
+    // both ends. The BSD fork call without libSystem's fork handlers left such a child broken on macOS (an OpenSSL
+    // handshake in one failed); fork 57 is libSystem's fork there.
+    val cChild = linuxSyscall0(57)
+    if (cChild == 0) {
+        val block = malloc(67108864)
+        var ok = !pointerIsNull(block)
+        if (ok) {
+            ablaRuntimeStoreU8(nativePointerAddress(block), 7)
+            ablaRuntimeStoreU8(nativePointerAddress(block) + 67108863, 9)
+            ok = ablaRuntimeLoadU8(nativePointerAddress(block)) + ablaRuntimeLoadU8(nativePointerAddress(block) + 67108863) == 16
+            free(block)
+        }
+        linuxSyscall1(231, if (ok) 0 else 1)
+    }
+    ablaRuntimeStoreI32(status, -1)
+    val cReaped = linuxSyscall4(61, cChild, status, 0, 0)
+    val cCode = ablaRuntimeLoadI32(status)
+    good = report("fork, then C code in the child", cChild > 0 && cReaped == cChild && cCode == 0, cCode) && good
     // A running child: probed, not yet waited for, then ended by a signal.
     val sleeper = spawn(SLEEP_SCRIPT)
     val probe = linuxSyscall2(62, sleeper, 0)

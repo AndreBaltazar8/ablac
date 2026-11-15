@@ -106,8 +106,7 @@ runs in the macOS CI job, and the list may only shrink.
 The monotonic clock (`clock_gettime` of `CLOCK_MONOTONIC` through the portable surface) is the kernel's
 `mach_absolute_time` from `gettimeofday`, in nanoseconds (by `hw.tbfrequency` on Apple Silicon; an x86-64 process's ticks, Rosetta's too, are nanoseconds): time since boot without the time
 asleep, as Linux's `CLOCK_MONOTONIC` counts it (libSystem's `CLOCK_MONOTONIC` counts sleep too). The wall clock
-is `gettimeofday`'s, to the microsecond. A process is forked by the BSD `fork` call, without libSystem's
-fork handlers: a child runs only Abla code until it execs or exits.
+is `gettimeofday`'s, to the microsecond.
 
 What stays in libSystem, and why:
 
@@ -117,6 +116,9 @@ What stays in libSystem, and why:
   (`bsdthread_register`) is refused once libSystem has made it, which it has by the time `main` runs.
 - the thread-local bootstrap `__tlv_bootstrap`: Mach-O thread locals are descriptors that dyld's
   bootstrap resolves.
+- `fork`: libSystem's fork handlers bring its state over to the child (Mach ports, malloc, locks). The BSD
+  `fork` call alone left a child that ran C code broken (an OpenSSL handshake in a forked child failed on both
+  Macs, #811), and the runtime cannot tell a child that only execs from one that does not.
 - the compiler itself: libLLVM, OpenSSL, `dlopen`/`dlsym` for compile-time native calls, and its
   threads.
 
