@@ -365,7 +365,77 @@ async function namedCalls() {
     await s.close();
 }
 
-const tests = { simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
+// A long-lived service keeps work between analyses; its answer must still be the answer of a service that has never seen the
+// project before, whatever the edits that came in between. Each step is compared byte for byte (the revision, a counter of
+// the session's own, aside) with a fresh service given the same open documents.
+async function editSequence() {
+    const files = {
+        'main.ab': 'import "util.ab"\nimport "model.ab"\nfun main: int {\n    val m = Model(1)\n    scale(m.value) + extra()\n}\n',
+        'util.ab': 'import "model.ab"\nfun scale(value: int): int = value * 2\nfun extra(): int = helper(3)\nprivate fun helper(n: int): int = n + 1\n',
+        'model.ab': 'class Model(val value: int) {\n    fun twice(): int = value * 2\n}\n',
+    };
+    const p = fixture('edit-sequence', files);
+    const at = (file) => path.join(p, file);
+    const open = new Map();
+    const comparable = (snapshot) => JSON.stringify({ ...snapshot, revision: 0 });
+    const cold = async () => {
+        const fresh = await start(p);
+        for (const [file, { version, text }] of open) {
+            assert.ok(!('error' in await fresh.rpc('document/open', { uri: uri(at(file)), version, text })));
+        }
+        const answer = await fresh.analyze();
+        await fresh.close();
+        return comparable(answer);
+    };
+    const s = await start(p);
+    let version = 0;
+    const edit = async (file, text) => {
+        version += 1;
+        const method = open.has(file) ? 'document/change' : 'document/open';
+        assert.ok(!('error' in await s.rpc(method, { uri: uri(at(file)), version, text })), `${method} ${file}`);
+        open.set(file, { version, text });
+    };
+    const close = async (file) => {
+        await s.rpc('document/close', { uri: uri(at(file)) });
+        open.delete(file);
+    };
+    const check = async (label) => {
+        const incremental = comparable(await s.analyze());
+        assert.equal(incremental, await cold(), `${label}: the edited service's answer differs from a fresh service's`);
+        const again = comparable(await s.analyze());
+        assert.equal(again, incremental, `${label}: a second analysis of the same state differs`);
+    };
+    await check('before any edit');
+    await edit('util.ab', files['util.ab'].replace('value * 2', 'value * 3'));
+    await check('a body edit');
+    await edit('util.ab', files['util.ab'].replace('value * 2', 'value * 3').replace('(): int = helper', '(): int =\n    helper'));
+    await check('a whitespace edit that moves ranges');
+    await edit('model.ab', files['model.ab'].replace('Model(val value: int)', 'Model(val value: string)'));
+    await check('a type change seen from two files');
+    await edit('model.ab', files['model.ab']);
+    await check('the type change reverted');
+    await edit('main.ab', files['main.ab'].replace('scale(m.value)', 'scale(m.missing)'));
+    await check('an error introduced');
+    await edit('main.ab', files['main.ab'].replace('scale(m.value)', 'scale(m.twice())'));
+    await check('the error fixed another way');
+    await edit('util.ab', '// an edit before every range\n' + files['util.ab']);
+    await check('a comment added at the top');
+    await edit('main.ab', files['main.ab'].replace('import "model.ab"\n', ''));
+    await check('an import removed');
+    await edit('main.ab', files['main.ab']);
+    await check('the import back');
+    await edit('model.ab', files['model.ab'] + 'fun more(): int = 1\n');
+    await check('a declaration added');
+    await close('util.ab');
+    await check('an overlay closed');
+    fs.writeFileSync(at('model.ab'), files['model.ab'].replace('value * 2', 'value * 5'));
+    await close('model.ab');
+    await check('a file changed on disk');
+    fs.writeFileSync(at('model.ab'), files['model.ab']);
+    await s.close();
+}
+
+const tests = { edit_sequence: editSequence, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
 const filter = process.env.ANALYSIS_TEST_FILTER ? process.env.ANALYSIS_TEST_FILTER.split(',') : null;
 for (const [name, test] of Object.entries(tests)) {
     if (filter && !filter.includes(name)) continue;

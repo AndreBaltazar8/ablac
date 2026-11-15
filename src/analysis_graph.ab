@@ -20,6 +20,16 @@ import "abla/bytes"
 var bootstrapAnalysisGraphActiveEntry = ""
 var bootstrapAnalysisGraphModules: BootstrapModuleState = bootstrapModuleState()
 
+/** A module's parse and symbols export, valid while its source, uri and visibility stay as they were. */
+class BootstrapAnalysisGraphParsed(
+    val source: string,
+    val uri: string,
+    val full: bool,
+    val parsed: BootstrapParseResult,
+    val symbols: Json,
+    val rewrite: BootstrapSourceRewrite
+)
+
 class BootstrapAnalysisGraphDocument(
     val document: BootstrapAnalysisDocument,
     val parsed: BootstrapParseResult,
@@ -324,6 +334,25 @@ fun BootstrapAnalysisService.graphObserveInputs(project: BootstrapFrontendProjec
     return
 }
 
+fun bootstrapAnalysisGraphReuse(cached: BootstrapAnalysisGraphParsed): BootstrapAnalysisGraphParsed {
+    bootstrapRecordSourceRewrite(cached.rewrite)
+    cached
+}
+
+fun bootstrapAnalysisGraphParse(source: string, uri: string, full: bool,
+    path: string): BootstrapAnalysisGraphParsed {
+    val raw = bootstrapParseWithIdentity(source, path)
+    val visible: array<BootstrapDeclaration> = []
+    for (declaration in raw.declarations) {
+        if (full || !declaration.isPrivate) visible.append(declaration)
+    }
+    val surface = BootstrapParseResult(visible, raw.actions, raw.errors, raw.extensionErrors,
+        raw.compileInputPaths, raw.compileInputContents, raw.diagnostics)
+    val contract = if (full) surface else bootstrapProjectContract(surface, path)
+    BootstrapAnalysisGraphParsed(source, uri, full, contract,
+        bootstrapAnalysisSymbolsJson(source, uri, contract), bootstrapSourceRewriteOf(path))
+}
+
 fun BootstrapAnalysisService.graphSnapshot(): Json {
     val entry = this.graphEntry()
     if (entry == "") return bootstrapAnalysisGraphIncomplete(this.revision,
@@ -331,6 +360,7 @@ fun BootstrapAnalysisService.graphSnapshot(): Json {
     if (bootstrapAnalysisGraphActiveEntry != entry) {
         bootstrapAnalysisGraphActiveEntry = entry
         bootstrapAnalysisGraphModules = bootstrapModuleState()
+        this.graphParsed = Map()
     }
     bootstrapAnalysisGraphModules.overlays = []
     for (document in this.overlays) {
@@ -343,8 +373,14 @@ fun BootstrapAnalysisService.graphSnapshot(): Json {
     bootstrapSourceRewrites = []
     val project = bootstrapFrontendLoadHostProject(entry, bootstrapAnalysisGraphModules)
     this.graphObserveInputs(project, entry)
-    val cached = this.graphQueryIndex
-    if (cached != null && cached.revision == this.revision) return cached.snapshot
+    // The slot of `cached` is only set when this returns: on the way to a new generation nothing here holds the old one.
+    if (this.graphIndexRevision == this.revision) {
+        val cached = this.graphQueryIndex
+        if (cached != null && cached.revision == this.revision) return cached.snapshot
+    }
+    // The previous generation (its answer tree and indexes, ~2 GB on the compiler's own source) is released before the new one
+    // is built, not when it is replaced: both were resident for the length of an analysis.
+    this.graphQueryIndex = null
     val documents: array<BootstrapAnalysisGraphDocument> = []
     val names: Map<string, string> = Map()
     for (module in project.modules) {
@@ -360,21 +396,17 @@ fun BootstrapAnalysisService.graphSnapshot(): Json {
             }
             val source = if (module.source !=
                 "") module.source else bootstrapAnalysisGraphModules.acquire(module.path).source
-            val raw = bootstrapParseWithIdentity(source, module.path)
-            val visible: array<BootstrapDeclaration> = []
-            for (declaration in raw.declarations) {
-                if (project.fullModules.has(module.path) ||
-                    !declaration.isPrivate) visible.append(declaration)
-            }
-            val surface = BootstrapParseResult(visible, raw.actions, raw.errors,
-                raw.extensionErrors,
-                raw.compileInputPaths, raw.compileInputContents, raw.diagnostics)
-            val parsed = if (project.fullModules.has(module.path)) surface
-                else bootstrapProjectContract(surface, module.path)
+            val full = project.fullModules.has(module.path)
+            val cached = this.graphParsed.get(module.path)
+            // The parser's only effect outside its result is recording the module's source rewrites: the cached ones are put back.
+            val entryParsed = if (cached != null && cached.source == source && cached.uri == uri &&
+                cached.full == full) bootstrapAnalysisGraphReuse(cached)
+                else bootstrapAnalysisGraphParse(source, uri, full, module.path)
+            this.graphParsed.set(module.path, entryParsed)
+            val parsed = entryParsed.parsed
             documents.append(BootstrapAnalysisGraphDocument(
                 BootstrapAnalysisDocument(uri, module.path, version, source, true), parsed,
-                bootstrapAnalysisSymbolsJson(source, uri, parsed),
-                bootstrapSourceRewriteOf(module.path)))
+                entryParsed.symbols, entryParsed.rewrite))
             for (declaration in parsed
                 .declarations) bootstrapAnalysisGraphDeclarationCallNames(declaration, names)
             for (action in parsed.actions) bootstrapAnalysisGraphCallNames(action, module.path,
@@ -438,6 +470,7 @@ fun BootstrapAnalysisService.graphSnapshot(): Json {
             jsonBoolean(analyzed != null && pending.size == 0), jsonArray(pending),
             jsonString(entry)])
     this.graphQueryIndex = bootstrapAnalysisGraphQueryIndex(result, this.revision)
+    this.graphIndexRevision = this.revision
     return result
 }
 
@@ -447,19 +480,26 @@ class BootstrapAnalysisGraphQueryIndex(
     val revision: int,
     val snapshot: Json,
     val documents: Map<string, Json>,
-    val symbols: Map<string, Json>,
-    val references: Map<string, array<Json>>
+    val symbols: Map<string, Json>
 )
 
 fun bootstrapAnalysisGraphQueryIndex(snapshot: Json,
     revision: int): BootstrapAnalysisGraphQueryIndex {
     val documents: Map<string, Json> = Map()
     val symbols: Map<string, Json> = Map()
-    val references: Map<string, array<Json>> = Map()
     for (document in snapshot.get("documents").values) {
         val uri = document.getString("uri")
         documents.set(bootstrapAnalysisGraphPath(uri), document)
         for (symbol in document.get("symbols").values) symbols.set(symbol.getString("id"), symbol)
+    }
+    BootstrapAnalysisGraphQueryIndex(revision, snapshot, documents, symbols)
+}
+
+/** The locations of every occurrence by the declaration it names (built once for a generation). */
+fun bootstrapAnalysisGraphBuildReferences(snapshot: Json): Map<string, array<Json>> {
+    val references: Map<string, array<Json>> = Map()
+    for (document in snapshot.get("documents").values) {
+        val uri = document.getString("uri")
         for (occurrence in document.get("occurrences").values) {
             val id = occurrence.getString("declarationId")
             if (id != "") {
@@ -471,7 +511,7 @@ fun bootstrapAnalysisGraphQueryIndex(snapshot: Json,
             }
         }
     }
-    BootstrapAnalysisGraphQueryIndex(revision, snapshot, documents, symbols, references)
+    references
 }
 
 fun BootstrapAnalysisService.graphQuery(id: int, method: string, params: Json): string {
@@ -519,7 +559,12 @@ fun BootstrapAnalysisService.graphQuery(id: int, method: string, params: Json): 
             [occurrence.get("range"), jsonString(occurrence.getString("type")),
                 if (symbol != null) symbol else jsonNull()])
     } else {
-        val references = index.references.get(identity)
+        // One location object per occurrence: only this query needs them, so they are made on its first use for a generation.
+        if (this.graphReferencesRevision != this.revision) {
+            this.graphReferences = bootstrapAnalysisGraphBuildReferences(index.snapshot)
+            this.graphReferencesRevision = this.revision
+        }
+        val references = this.graphReferences.get(identity)
         value = if (references != null) jsonArray(references) else jsonArray([])
     }
     bootstrapAnalysisResponse(id, jsonObject(["revision", "complete", "pending", "value"],
