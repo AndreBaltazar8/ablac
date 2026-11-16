@@ -6007,6 +6007,53 @@ fun bootstrapEvalGenericSpelling(evaluator: BootstrapEvaluator, text: string): s
     if (bootstrapIsGenericInstanceName(spelled)) spelled else text
 }
 
+// The name tests that gate bootstrapEvaluateIntrinsicCall's handlers, made once per name: an intrinsic call is
+// most of what compile-time code in a loop evaluates, and its name went through some twenty prefix tests and the
+// intrinsic name lists on every call. A bit says a handler may take the name; the handler still decides by the
+// arguments, in the same order as before.
+val BOOTSTRAP_EVAL_ROUTE_WIDE = 1
+val BOOTSTRAP_EVAL_ROUTE_IMPORTS = 2
+val BOOTSTRAP_EVAL_ROUTE_REFLECTION = 4
+val BOOTSTRAP_EVAL_ROUTE_TEXT = 8
+val BOOTSTRAP_EVAL_ROUTE_COMPILER = 16
+val BOOTSTRAP_EVAL_ROUTE_HOST = 32
+val BOOTSTRAP_EVAL_ROUTE_PARSER = 64
+val BOOTSTRAP_EVAL_ROUTE_SYNTAX = 128
+val BOOTSTRAP_EVAL_ROUTE_GENERATED = 256
+val BOOTSTRAP_EVAL_ROUTE_TYPED = 512
+val BOOTSTRAP_EVAL_ROUTE_PRIMITIVE = 1024
+val BOOTSTRAP_EVAL_ROUTE_CONVERSION = 2048
+val BOOTSTRAP_EVAL_ROUTE_INTRINSIC = 4096
+val BOOTSTRAP_EVAL_ROUTE_PROVIDER = 8192
+val BOOTSTRAP_EVAL_ROUTE_PATH = 16384
+val bootstrapEvalIntrinsicRoutes: Map<string, int> = Map()
+
+fun bootstrapEvalIntrinsicRoute(name: string): int {
+    val known = bootstrapEvalIntrinsicRoutes.get(name)
+    if (known != null) return known
+    var route = 0
+    if (bootstrapWideIntrinsicType(name) != "") route = route | BOOTSTRAP_EVAL_ROUTE_WIDE
+    if (name.startsWith("__abla") || name.startsWith("git") || name.startsWith("import") ||
+        name.startsWith("resolved")) route = route | BOOTSTRAP_EVAL_ROUTE_IMPORTS
+    if (name.startsWith("compiler") || name.startsWith("typed")) route = route | BOOTSTRAP_EVAL_ROUTE_REFLECTION
+    if (name.startsWith("abla") || name.startsWith("runtime")) route = route | BOOTSTRAP_EVAL_ROUTE_TEXT
+    if (name.startsWith("compiler")) route = route | BOOTSTRAP_EVAL_ROUTE_COMPILER
+    if (name.startsWith("abla") || name.startsWith("compiler")) route = route | BOOTSTRAP_EVAL_ROUTE_HOST
+    if (name.startsWith("parser")) route = route | BOOTSTRAP_EVAL_ROUTE_PARSER
+    if (name.startsWith("syntax")) route = route | BOOTSTRAP_EVAL_ROUTE_SYNTAX
+    if (name.startsWith("compilerGenerated")) route = route | BOOTSTRAP_EVAL_ROUTE_GENERATED
+    if (name.startsWith("typed")) route = route | BOOTSTRAP_EVAL_ROUTE_TYPED
+    if (ctNativePrimitive(name)) route = route | BOOTSTRAP_EVAL_ROUTE_PRIMITIVE
+    if (ctNativeScalarConversion(name)) route = route | BOOTSTRAP_EVAL_ROUTE_CONVERSION
+    if (ctNativeIntrinsicPrefix(name) && ctNativeIntrinsic(name)) route = route | BOOTSTRAP_EVAL_ROUTE_INTRINSIC
+    if (ctNativeProviderName(name)) route = route | BOOTSTRAP_EVAL_ROUTE_PROVIDER
+    if (name.startsWith("Path.")) route = route | BOOTSTRAP_EVAL_ROUTE_PATH
+    bootstrapEvalIntrinsicRoutes.set(name, route)
+    route
+}
+
+fun bootstrapEvalRoutes(route: int, bit: int): bool = (route & bit) != 0
+
 // The compiler's builtins, by family: each family's cases (and their locals)
 // live in a frame of their own, entered only for a name of that family.
 @noinline
@@ -6017,20 +6064,17 @@ fun bootstrapEvaluateIntrinsicCall(
     initial: BootstrapEvalValue
 ): BootstrapEvalValue {
     var result = initial
-    if (bootstrapWideIntrinsicType(targetName) != "") {
+    val route = bootstrapEvalIntrinsicRoute(targetName)
+    if (bootstrapEvalRoutes(route, BOOTSTRAP_EVAL_ROUTE_WIDE)) {
         return bootstrapEvaluateU256Intrinsic(evaluator, expression, targetName)
     }
-    if (targetName.startsWith("__abla") ||
-        targetName.startsWith("git") ||
-        targetName.startsWith("import") ||
-        targetName.startsWith("resolved")) {
+    if (bootstrapEvalRoutes(route, BOOTSTRAP_EVAL_ROUTE_IMPORTS)) {
         result = bootstrapEvaluateCallImports(
             evaluator, expression, targetName, result
         )
     }
     val journaled = bootstrapActionJournalBegin(targetName)
-    if (targetName.startsWith("compiler") ||
-        targetName.startsWith("typed")) {
+    if (bootstrapEvalRoutes(route, BOOTSTRAP_EVAL_ROUTE_REFLECTION)) {
         result = bootstrapEvaluateCallReflection(
             evaluator, expression, targetName, result
         )
@@ -6040,8 +6084,7 @@ fun bootstrapEvaluateIntrinsicCall(
             return result
         }
     }
-    if (targetName.startsWith("abla") ||
-        targetName.startsWith("runtime")) {
+    if (bootstrapEvalRoutes(route, BOOTSTRAP_EVAL_ROUTE_TEXT)) {
         result = bootstrapEvaluateCallText(
             evaluator, expression, targetName, result
         )
@@ -6051,7 +6094,7 @@ fun bootstrapEvaluateIntrinsicCall(
             return result
         }
     }
-    if (targetName.startsWith("compiler")) {
+    if (bootstrapEvalRoutes(route, BOOTSTRAP_EVAL_ROUTE_COMPILER)) {
         result = bootstrapEvaluateCallCompiler(
             evaluator, expression, targetName, result
         )
@@ -6061,8 +6104,7 @@ fun bootstrapEvaluateIntrinsicCall(
             return result
         }
     }
-    if (targetName.startsWith("abla") ||
-        targetName.startsWith("compiler")) {
+    if (bootstrapEvalRoutes(route, BOOTSTRAP_EVAL_ROUTE_HOST)) {
         result = bootstrapEvaluateCallHost(
             evaluator, expression, targetName, result
         )
@@ -6074,44 +6116,43 @@ fun bootstrapEvaluateIntrinsicCall(
     }
     if (journaled) bootstrapActionJournalEnd(evaluator, targetName, result,
         expression.children.size)
-    if (targetName.startsWith("parser")) {
+    if (bootstrapEvalRoutes(route, BOOTSTRAP_EVAL_ROUTE_PARSER)) {
         result = bootstrapEvaluateCallParser(
             evaluator, expression, targetName, result
         )
         if (bootstrapEvalLeaves(result)) return result
     }
-    if (targetName.startsWith("syntax")) {
+    if (bootstrapEvalRoutes(route, BOOTSTRAP_EVAL_ROUTE_SYNTAX)) {
         result = bootstrapEvaluateCallSyntax(
             evaluator, expression, targetName, result
         )
         if (bootstrapEvalLeaves(result)) return result
     }
-    if (targetName.startsWith("compilerGenerated")) {
+    if (bootstrapEvalRoutes(route, BOOTSTRAP_EVAL_ROUTE_GENERATED)) {
         result = bootstrapEvaluateCallGenerated(
             evaluator, expression, targetName, result
         )
         if (bootstrapEvalLeaves(result)) return result
     }
-    if (targetName.startsWith("typed")) {
+    if (bootstrapEvalRoutes(route, BOOTSTRAP_EVAL_ROUTE_TYPED)) {
         result = bootstrapEvaluateCallTyped(
             evaluator, expression, targetName, result
         )
         if (bootstrapEvalLeaves(result)) return result
     }
-    if (result.kind == "invalid" && ctNativePrimitive(targetName)) {
+    if (result.kind == "invalid" && bootstrapEvalRoutes(route, BOOTSTRAP_EVAL_ROUTE_PRIMITIVE)) {
         result = ctNativeEvaluatePrimitive(evaluator, expression, targetName)
         if (bootstrapEvalLeaves(result)) return result
     }
-    if (result.kind == "invalid" && ctNativeScalarConversion(targetName)) {
+    if (result.kind == "invalid" && bootstrapEvalRoutes(route, BOOTSTRAP_EVAL_ROUTE_CONVERSION)) {
         result = ctNativeEvaluateScalarConversion(evaluator, expression, targetName)
         if (bootstrapEvalLeaves(result)) return result
     }
-    if (result.kind == "invalid" && ctNativeIntrinsicPrefix(targetName) &&
-        ctNativeIntrinsic(targetName)) {
+    if (result.kind == "invalid" && bootstrapEvalRoutes(route, BOOTSTRAP_EVAL_ROUTE_INTRINSIC)) {
         result = ctNativeEvaluateIntrinsic(evaluator, expression, targetName)
         if (bootstrapEvalLeaves(result)) return result
     }
-    if (result.kind == "invalid" && ctNativeProviderName(targetName)) {
+    if (result.kind == "invalid" && bootstrapEvalRoutes(route, BOOTSTRAP_EVAL_ROUTE_PROVIDER)) {
         val effect = ctNativeProviderTarget(evaluator, "", targetName)
         if (effect >= 0) {
             result = ctNativeEvaluateProvider(evaluator, expression, targetName, effect)
@@ -6119,7 +6160,7 @@ fun bootstrapEvaluateIntrinsicCall(
     }
     // A provider method by its key (the JIT tier's bridge): the receiver is
     // the first child.
-    if (result.kind == "invalid" && targetName.startsWith("Path.") &&
+    if (result.kind == "invalid" && bootstrapEvalRoutes(route, BOOTSTRAP_EVAL_ROUTE_PATH) &&
         expression.children.size > 0) {
         val receiver = bootstrapEvalUnwrapBorrow(evaluator.evaluate(expression.children[0]))
         if (bootstrapEvalLeaves(receiver)) return receiver
