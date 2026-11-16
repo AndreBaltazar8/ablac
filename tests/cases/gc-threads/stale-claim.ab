@@ -6,15 +6,23 @@ import "abla/io"
 import "abla/memory"
 import "abla/process/time"
 
+var spinnerStarted: int by TVar(0)
+
 // No allocation, so no safe point: a thread that cannot park while it runs.
 fun busy(rounds: int): int {
     var sum = 0
     var index = 0
     while (index < rounds) {
-        sum = sum + (index ^ 3)
+        // A dependent multiply-add chain: the compiler cannot turn the loop into a vector sum, so it runs for seconds.
+        sum = sum * 6364136223846793005 + 1442695040888963407
         index += 1
     }
     sum
+}
+
+fun spin(rounds: int): int {
+    atomic { spinnerStarted = 1 }
+    busy(rounds)
 }
 
 fun holder(): int {
@@ -26,21 +34,30 @@ fun main: int {
     memoryDebugHold(1)
     val held = thread { holder() }
     while (memoryDebugHold(2) == 0) {}
-    val spinning = thread { busy(900000000) }
+    val spinning = thread { spin(3000000000) }
+    // On a busy machine the thread may not have started yet: the first stop has to find it running.
+    while (atomic { spinnerStarted } == 0) sleep(1)
     sleep(10)
     val abandonedBefore = memoryHeapStat(8)
-    // Claims the held thread, then gives up on the spinning one.
-    memoryCollect()
+    // Claims the held thread, then gives up on the spinning one. A stop abandoned earlier (the collector's own safe
+    // points collect under ABLA_GC_STRESS=1) puts off the next for 200 ms, so ask until one is abandoned.
+    var tries = 0
+    while (memoryHeapStat(8) == abandonedBefore && tries < 600) {
+        memoryCollect()
+        sleep(5)
+        tries += 1
+    }
     val first = memoryHeapStat(8) - abandonedBefore
     await spinning
     // Past the backoff after an abandoned stop.
     sleep(300)
+    val abandonedMid = memoryHeapStat(8)
     val stoppedBefore = memoryHeapStat(7)
     memoryCollect()
     val stopped = memoryHeapStat(7) - stoppedBefore
-    val later = memoryHeapStat(8) - abandonedBefore - first
+    val later = memoryHeapStat(8) - abandonedMid
     memoryDebugHold(0)
     await held
-    println("first stop abandoned: $first; then stopped: $stopped, abandoned: $later")
-    if (first == 1 && stopped == 1 && later == 0) 42 else 1
+    println("stops abandoned while the spinner ran: $first; then stopped: $stopped, abandoned: $later")
+    if (first >= 1 && stopped == 1 && later == 0) 42 else 1
 }
