@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # #812: a fork while another thread holds the runtime's heap lock must not leave the child's heap locked for ever.
-# A thread allocates and frees all the time while the process forks 300 times, and each child allocates and checks
+# A thread allocates and frees all the time while the process forks 300 times (100 for the system-call program, see its comment), and each child allocates and checks
 # what it built (a hang is the old failure: every child and the whole run are bounded by a time limit):
 #   - an Abla program on x86-64 with its own libc fork, release and --fast;
 #   - the same with the fork system call (what an AArch64 Linux program has), x86-64 and, under qemu-aarch64,
