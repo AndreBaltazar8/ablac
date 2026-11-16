@@ -55,8 +55,11 @@ for entry in zero:0:10 negative:-1:10 large:1048577:10 timeout-zero:1:0 timeout-
 done
 printf '%sval RESULT = #%s)\n%s\n' "$prefix" "$call" "$trailer" > "$out/denied/manifest.ab"
 printf 'import "abla/compiler"\nval RESULT = #%s)\n%s\n' "$call" "$trailer" > "$out/authorized/grant.ab"
-printf '%sval RESULT = #compilerCaptureProcess(["sh", "bad\\u0000argument"])\n%s\n' "$prefix" "$trailer" \
+# (A NUL byte is `\0`: `\u0000` before a hex digit is not one.) Both calls would spawn the child if they were not refused first.
+printf '%sval RESULT = #compilerCaptureProcess(["sh", "tests/cases/compiler-capture-process/child.sh", "mark", "build/compiler-capture-process/spawned", "bad\\0argument"])\n%s\n' "$prefix" "$trailer" \
     > "$out/authorized/nul.ab"
+printf '%sval RESULT = #compilerRunProcess(["sh", "tests/cases/compiler-capture-process/child.sh", "mark", "build/compiler-capture-process/spawned", "bad\\0argument"])\n%s\n' "$prefix" "$trailer" \
+    > "$out/authorized/run-nul.ab"
 printf '%sval RESULT = #compilerCaptureProcess([])\n%s\n' "$prefix" "$trailer" > "$out/authorized/empty.ab"
 printf '%sval RESULT = #compilerCaptureProcess(filledArray(129, "true"))\n%s\n' "$prefix" "$trailer" \
     > "$out/authorized/many.ab"
@@ -77,9 +80,7 @@ grep -q 'compile.capability-not-authorized:process.io' "$out/revoked-denied.log"
 [[ ! -e $out/spawned ]]
 printf 'compileCapabilities = ["process.io"]\n' > "$out/authorized/abla.toml"
 
-# (nul.ab, an argument with a NUL byte, is not here: it was never rejected, --emit-llvm denied it with the rest until it read the manifest.
-# TODO: reject it, see the todo list.)
-for source in "$out/denied/manifest.ab" "$out/authorized/"{grant,zero,negative,large,timeout-zero,timeout-large,empty,many,long}.ab; do
+for source in "$out/denied/manifest.ab" "$out/authorized/"{grant,zero,negative,large,timeout-zero,timeout-large,nul,run-nul,empty,many,long}.ab; do
     name=$(basename "$source" .ab)
     if "$compiler" --emit-llvm "$source" > "$out/$name.ll" 2> "$out/$name.err"; then
         echo "capture incorrectly accepted $name" >&2; exit 1
