@@ -534,7 +534,7 @@ release gate still verifies byte-identical IR from the rebuilt compiler.
 | `ABLA_KEEP_LLVM_TEXT`, `ABLA_LLVM_OUT_OF_PROCESS`, `ABLA_LLVM_VERIFY`, `ABLA_FAST_INLINE_THRESHOLD`, `ABLA_WASM_OPT_CORES`, `ABLA_SIDECAR`, `ABLA_NO_SIDECAR` | code-generation controls (above) |
 | `ABLA_MACOS_SDK`, `ABLA_MACOS_LLVM_LIB`, `ABLA_MACOS_OPENSSL_LIB`, `ABLA_MACOS_CLANG` | cross-linking for macOS: the SDK, target libraries, and the `clang` used to link (default `clang`) |
 | `ABLA_COMPILER_COLLECT_GROWTH_MB` | without a launcher memory budget, the compiler collects garbage each time its heap grows by this much (default 256; 0 never collects) |
-| `ABLA_COMPILER_MEMORY_TRACE`, `ABLA_COMPILER_REACHABILITY_TRACE` | when non-empty, print the compiler's live memory per phase, or its reachability decisions, to standard error |
+| `ABLA_COMPILER_MEMORY_TRACE`, `ABLA_COMPILER_REACHABILITY_TRACE` | when non-empty, print the compiler's live memory per phase, or its reachability decisions, to standard error; `ablac analyze --stdio` prints `abla-analysis-memory <phase> <live bytes>` at the phases of each analysis and `abla-analysis-peak-live <bytes>` at shutdown (tools/test-analysis-memory.sh bounds that peak) |
 | `ABLA_EVAL_INDEX_CHECK`, `ABLA_OVERLOAD_CHECK`, `ABLA_BORROW_INDEX_CHECK`, `ABLA_RECEIVER_INDEX_CHECK`, `ABLA_EXPECTED_INDEX_CHECK`, `ABLA_MODULE_INDEX_CHECK`, `ABLA_LIFT_CODEC_CHECK` | compiler self-checks for its own tests: `=1` cross-checks a fast path against the slow one and reports any disagreement |
 
 Source formatting, preservation checks and editor stdin usage are described in
