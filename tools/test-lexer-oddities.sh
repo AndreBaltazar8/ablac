@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Odd source text the lexer and parser used to take badly: a malformed string escape is reported over the whole escape (it
 # covered two bytes), a block comment that is never closed is E_PARSE_UNTERMINATED_COMMENT at its `/*`, a UTF-8 byte order
-# mark at the start of a file is skipped.
+# mark at the start of a file is skipped, invalid UTF-8 in a string literal is E_PARSE_INVALID_UTF8.
 set -euo pipefail
 compiler=${1:-build/ablac}
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -59,4 +59,28 @@ set -e
 fails $'\xef\xbb\xbffun main: int {\n    val s = "\\q"\n    0\n}\n'
 grep -Fq "case.ab:32:34" "$out/case.log" || { echo "lexer oddities: after a BOM the offsets are not bytes (32:34)" >&2; cat "$out/case.log" >&2; exit 1; }
 
-echo "lexer oddities: malformed escapes are reported over the whole escape, an unterminated comment at its start, a BOM is skipped"
+
+# Invalid UTF-8 in a string literal is E_PARSE_INVALID_UTF8 at the offending byte (it was accepted, stored as written).
+bad_utf8() { # $1 = string text (bytes), $2 = offset of the first bad byte in the file
+    fails $'fun main: int {\n    val s = "'"$1"$'"\n    0\n}\n'
+    grep -Fq 'error[E_PARSE_INVALID_UTF8]' "$out/case.log" || { echo "lexer oddities: invalid UTF-8 lacks E_PARSE_INVALID_UTF8" >&2; cat "$out/case.log" >&2; exit 1; }
+    grep -Fq "case.ab:$2:$(($2 + 1))" "$out/case.log" || { echo "lexer oddities: invalid UTF-8 span is not $2:$(($2 + 1))" >&2; cat "$out/case.log" >&2; exit 1; }
+}
+bad_utf8 $'\xff' 29
+bad_utf8 $'ab\xc3' 31
+bad_utf8 $'\x80' 29
+bad_utf8 $'\xc0\x80' 29
+bad_utf8 $'a\xed\xa0\x80' 30
+bad_utf8 $'\xf4\x90\x80\x80' 29
+bad_utf8 $'\xe2\x82' 29
+bad_utf8 $'\xc3(' 29
+# Well-formed text and the byte escapes are fine.
+printf 'fun main: int {\n    val s = "\xc3\xa9 \xe2\x82\xac \xf0\x9f\x98\x80 \\xff"\n    s.size\n}\n' > "$out/ok.ab"
+"$compiler" build "$out/ok.ab" -o "$out/ok" --fast --no-cache > "$out/ok.log" 2>&1 || { echo "lexer oddities: well-formed text was rejected" >&2; cat "$out/ok.log" >&2; exit 1; }
+set +e
+"$out/ok"
+status=$?
+set -e
+[[ $status -eq 13 ]] || { echo "lexer oddities: well-formed text has size $status, not 13" >&2; exit 1; }
+
+echo "lexer oddities: malformed escapes are reported over the whole escape, an unterminated comment at its start, a BOM is skipped, invalid UTF-8 refused"
