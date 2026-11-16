@@ -28,7 +28,7 @@ for kind in ed25519 p256 p384 rsa; do
 done
 # The programs, built up front, four at once: they read nothing at compile time, and built one before each use they
 # were most of this test's wall time (11 release builds of about 10 s, 2026-11-15).
-programs=(interop dropnotify api identity mtls tls12prf server wipe serve unix bulk)
+programs=(interop dropnotify binding-interop api identity mtls tls12prf server wipe serve unix bulk)
 pids=()
 for program in "${programs[@]}"; do
     while (( $(jobs -rp | wc -l) >= 4 )); do sleep 0.2; done
@@ -103,6 +103,22 @@ grep -q '<<< TLS 1.3, Alert \[length 0002\], warning close_notify' "$out/server.
     { echo "tls-pure dropnotify: the server never saw a close_notify from the dropped connection" >&2; tail -8 "$out/server.log" >&2; exit 1; }
 stop_server
 echo "drop: the dropped connection sent close_notify"
+# Channel bindings (abla/tls/pure/binding) against OpenSSL: tls-exporter equals what s_server -keymatexport prints for the same
+# connection (RFC 9266: label EXPORTER-Channel-Binding, empty context, 32 bytes), tls-server-end-point the SHA-256 of the
+# server's DER certificate (the P-256 certificate is signed with ecdsa-with-SHA256, RFC 5929).
+# (A plain s_server, not -www, prints the keying material; it exits when its stdin ends, so it reads one that stays open.)
+OPENSSL_SERVER_INHERIT_STDIN=1 start_server p256 -keymatexport EXPORTER-Channel-Binding -keymatexportlen 32 < <(sleep 60)
+result=$("$root/tools/run-limited.sh" "$out/binding-interop" "$port" "$out/p256.pem") || {
+    echo "tls-pure binding: $result" >&2; head -5 "$out/server.log" >&2; exit 1; }
+read -r _ got_exporter got_endpoint <<< "$result"
+for _ in $(seq 50); do grep -q 'Keying material: ' "$out/server.log" && break; sleep 0.1; done
+want_exporter=$(sed -n 's/.*Keying material: \([0-9A-Fa-f]*\).*/\1/p' "$out/server.log" | head -1 | tr 'A-F' 'a-f')
+want_endpoint=$(openssl x509 -in "$out/p256.pem" -outform DER | openssl dgst -sha256 -binary | od -An -v -tx1 | tr -d ' \n')
+[[ -n $want_exporter && $got_exporter == "$want_exporter" ]] ||
+    { echo "tls-pure binding: tls-exporter '$got_exporter', OpenSSL '$want_exporter'" >&2; cat "$out/server.log" >&2; exit 1; }
+[[ $got_endpoint == "$want_endpoint" ]] || { echo "tls-pure binding: tls-server-end-point '$got_endpoint', expected '$want_endpoint'" >&2; exit 1; }
+stop_server
+echo "binding: tls-exporter and tls-server-end-point agree with OpenSSL"
 # TLS 1.2 (the modern subset): the pure client against `openssl s_server -tls1_2`: RSA, P-256 and Ed25519 certificates x their six
 # ECDHE suites x X25519 and P-256, and RSA with PKCS#1 v1.5 signatures only; a TLS 1.2 server without the extended
 # master secret is refused.

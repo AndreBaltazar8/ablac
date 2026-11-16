@@ -367,6 +367,7 @@ test-serial: ablac
 	tools/test-ed25519.sh $(COMPILER)
 	tools/test-tls-pure.sh $(COMPILER)
 	tools/test-tls-pure-interop.sh $(COMPILER)
+	tools/test-tls-binding.sh $(COMPILER)
 	tools/test-tls-client-ca.sh $(COMPILER)
 	tools/test-tls-ecdsa-curve.sh $(COMPILER)
 	tools/test-tls-accept-deadline.sh $(COMPILER)

@@ -1,0 +1,113 @@
+// Channel bindings (abla/tls/pure/binding) of a TLS 1.3 connection, client and server in process (tools/test-tls-binding.sh):
+// tls-exporter is the same 32 bytes on both sides and differs per connection; tls-server-end-point is the hash of the
+// server's certificate by its signature hash (SHA-256 for an ECDSA P-256 certificate signed with SHA-256, SHA-384 for
+// SHA-384, none for Ed25519); nothing before the handshake is done; a resumed connection has an exporter but no end-point value.
+// Argument 0: a directory with ed25519, p256 and p384 (.pem/.key). Prints "tls binding ok".
+import "abla/io"
+import "abla/crypto"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/tls/pure/binding"
+import "abla/tls/pure/client"
+import "abla/tls/pure/identity"
+import "abla/tls/pure/resume"
+import "abla/tls/pure/server"
+import "abla/tls/pure/verify"
+
+var failures = 0
+var seed = 7
+var clock = 1000
+
+fun fail(what: string): void {
+    failures = failures + 1
+    println("FAIL $what")
+    return
+}
+fun random(count: int): string {
+    val bytes: array<int> = []
+    for (i in 0 until count) {
+        seed = (seed * 1103515245 + 12345) & 2147483647
+        bytes.append((seed >> 8) & 255)
+    }
+    cryptoByteString(bytes)
+}
+fun now(): int = clock
+fun read(path: string): string = linuxReadFile(path, 1048576)
+fun trustAnything(chain: array<string>, host: string, scheme: int, content: string, signature: string): TlsVerdict = tlsAccepted()
+fun acceptAny(chain: array<string>, scheme: int, content: string, signature: string): TlsVerdict = tlsAccepted()
+
+fun pump(var client: TlsClient, var server: TlsServer): void {
+    var rounds = 0
+    while (rounds < 50) {
+        val toServer = client.takeOutput()
+        if (toServer.size > 0) server.feed(toServer)
+        val toClient = server.takeOutput()
+        if (toClient.size > 0) client.feed(toClient)
+        if (toServer.size == 0 && toClient.size == 0) return
+        rounds = rounds + 1
+    }
+    return
+}
+
+fun client(cache: TlsSessionCache): TlsClient {
+    val base = tlsClientConfig("localhost", trustAnything, random)
+    tlsClientNew(TlsClientConfig("localhost", base.suites, base.signatureAlgorithms, [], trustAnything, random,
+        tlsPatchClientHello, base.suites12, false, [], cache, "binding-test"))
+}
+
+fun server(identity: TlsIdentity, keys: TlsTicketKeys): TlsServer {
+    val base = tlsServerConfig(identity, random)
+    tlsServerNew(TlsServerConfig(identity, base.suites, base.groups, [], random, false, false, acceptAny, base.suites12, keys))
+}
+
+fun main: int {
+    val directory = processArgument(0)
+    clock = linuxRealtimeNanoseconds() / 1000000000
+    val keys = tlsTicketKeysNew(random, now, 7200)
+
+    // Before the handshake is done there is nothing.
+    val early = client(tlsSessionCacheNew(now))
+    if (early.channelBinding(TLS_BINDING_EXPORTER) != "" || early.channelBinding(TLS_BINDING_END_POINT) != "") fail("a binding before the handshake")
+
+    for (kind in ["p256", "p384", "ed25519"]) {
+        val identity = tlsIdentityFromPem(read("$directory/$kind.pem"), read("$directory/$kind.key"))
+        if (!identity.ok()) { fail("identity $kind"); continue }
+        val cache = tlsSessionCacheNew(now)
+        var c1 = client(cache)
+        var s1 = server(identity, keys)
+        pump(c1, s1)
+        pump(c1, s1)
+        if (!c1.connected() || !s1.connected()) { fail("$kind: no connection [${c1.error}] [${s1.error}]"); continue }
+        val exporter = c1.channelBinding(TLS_BINDING_EXPORTER)
+        if (exporter.size != 32) fail("$kind: tls-exporter is ${exporter.size} bytes")
+        if (exporter != s1.channelBinding(TLS_BINDING_EXPORTER)) fail("$kind: client and server disagree on tls-exporter")
+        // A second connection: another value.
+        var c2 = client(tlsSessionCacheNew(now))
+        var s2 = server(identity, keys)
+        pump(c2, s2)
+        pump(c2, s2)
+        if (c2.channelBinding(TLS_BINDING_EXPORTER) == exporter) fail("$kind: two connections share a tls-exporter value")
+        // The end-point value: the hash of the leaf by its signature hash.
+        val leaf = identity.chain[0]
+        val endpoint = c1.channelBinding(TLS_BINDING_END_POINT)
+        val expected = if (kind == "p256") sha256(leaf) else if (kind == "p384") sha384(leaf) else ""
+        if (endpoint != expected) fail("$kind: tls-server-end-point ${endpoint.size} bytes, expected ${expected.size}")
+        if (s1.channelBinding(TLS_BINDING_END_POINT) != expected) fail("$kind: the server's tls-server-end-point differs")
+        if (c1.channelBinding("tls-unique") != "" || c1.channelBinding("nonsense") != "") fail("$kind: an unknown binding type has a value")
+        // Resumption: a new connection with the ticket has an exporter (equal on both sides) and no end-point value.
+        if (kind == "p256") {
+            var c3 = client(cache)
+            var s3 = server(identity, keys)
+            pump(c3, s3)
+            pump(c3, s3)
+            if (!c3.connected() || !c3.resumed()) fail("p256: the third connection did not resume [${c3.error}]")
+            else {
+                if (c3.channelBinding(TLS_BINDING_EXPORTER).size != 32 || c3.channelBinding(TLS_BINDING_EXPORTER) != s3.channelBinding(TLS_BINDING_EXPORTER)) fail("resumed: tls-exporter")
+                if (c3.channelBinding(TLS_BINDING_EXPORTER) == exporter) fail("resumed: same exporter as the first connection")
+                if (c3.channelBinding(TLS_BINDING_END_POINT) != "" || s3.channelBinding(TLS_BINDING_END_POINT) != "") fail("resumed: an end-point value without a certificate")
+            }
+        }
+    }
+    if (failures == 0) println("tls binding ok")
+    if (failures == 0) 0 else 1
+}
