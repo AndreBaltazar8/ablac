@@ -1636,7 +1636,7 @@ mmap form) apply there.
 
 ## Compile time and memory
 
-- [ ] **Cached small blocks cannot be reused for another size.** The native lists
+- [x] **Cached small blocks cannot be reused for another size (closed 2026-11-16, see the last paragraph).** The native lists
   (`__ablaRuntimeHostSmallLists`) use an adaptive 32 MiB floor and 128 MiB ceiling;
   the compiler explicitly caps them at 32 MiB. A smaller budget does not evict
   blocks already retained on the wrong size's list. Remeasured on `6c69d56c`
@@ -1689,6 +1689,10 @@ mmap form) apply there.
   (-14.9%, floor 8) for +5.2% instructions; trim changes nothing, freeing unhit lists changes json-readers by
   0 MiB and raises json-megabyte 218 to 298 MiB. No variant passes; not pursued. What would still be open is
   a signal that separates json-readers' use of its lists from trees' without a per-hit counter.
+  Compiler self-build bound (2026-11-16): the compiler caps the lists at 32 MiB, and a self-build's
+  cgroup peak (all its processes, systemd `Memory peak`) is 2.3 GiB, so recovering every cached byte
+  would save at most 1.4% of peak memory, under the 2% bar; the screened variants cost 1.7% to 3%
+  instructions on trees and strings. Closed, no change proposed.
   Prototypes, exact patches, scripts and raw data remain in
   `worktrees/ablac-small-remeasure/build/cache-lab/` (`report.md`, `summary.json`,
   `rss-runs.json`, `probe-{runs,rechecks}.json`, `screen-{runs,summary}.json`).
