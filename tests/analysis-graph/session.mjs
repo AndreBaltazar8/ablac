@@ -374,6 +374,65 @@ async function typeNames(mode) {
     await s.close();
 }
 
+// The uses of a `var` parameter (a mutable borrow, not a field), a call of a function-typed parameter, and a method called without a receiver inside
+// its class each name the declaration they mean: they once named none (the exporter called a function's `var` parameter a field, so sema's
+// identity for its uses matched nothing; the call of a local and a call on `this` were not recorded as uses).
+async function localNames(mode) {
+    const main = [
+        'class Box(var size: Int) {',
+        '    fun twice(n: Int): Int = n * 2',
+        '    fun use(n: Int): Int = twice(n) + size',
+        '}',
+        'fun fill(var out: array<Int>, var box: Box, n: Int, f: (Int) -> Int): Int {',
+        '    out.append(n)',
+        '    box.size = 3',
+        '    val g = f(n)',
+        '    return g + out.size + box.size + f(n)',
+        '}',
+        'fun other(var out: array<Int>): Int {',
+        '    out.append(1)',
+        '    return out.size',
+        '}',
+        'fun main: Int {',
+        '    val xs: array<Int> = []',
+        '    return fill(xs, Box(1), 2, { q -> q + 1 }) + Box(2).use(3) + Box(3).twice(4) + other(xs)',
+        '}',
+        '',
+    ].join('\n').replace(/Int/g, 'int');
+    const p = fixture(`local-names-${mode}`, { 'main.ab': main });
+    const s = await start(p, { mode });
+    const a = await s.analyze();
+    const d = doc(a, path.join(p, 'main.ab'));
+    const lineOf = (o) => d.text.slice(0, o.range.start).split('\n').length;
+    const inFunction = (name, first, last) => occurrence(d, name).filter((o) => lineOf(o) >= first && lineOf(o) <= last);
+    // `out` of fill (lines 5-9): the parameter and its two uses name one declaration; `other`'s `out` (lines 11-14) another
+    const fillOut = inFunction('out', 5, 9);
+    assert.equal(fillOut.length, 3);
+    assert.ok(fillOut.every((o) => o.declarationId), 'every use of a var parameter names it');
+    assert.equal(new Set(fillOut.map((o) => o.declarationId)).size, 1);
+    const otherOut = inFunction('out', 11, 14);
+    assert.equal(otherOut.length, 3);
+    assert.equal(new Set(otherOut.map((o) => o.declarationId)).size, 1);
+    assert.notEqual(otherOut[0].declarationId, fillOut[0].declarationId);
+    const fillBox = inFunction('box', 5, 9);
+    assert.ok(fillBox.length === 3 && fillBox.every((o) => o.declarationId) && new Set(fillBox.map((o) => o.declarationId)).size === 1);
+    // a class's own `var` constructor parameter stays its field: `box.size` names the field, as `size` in the method does
+    const fieldIds = new Set(occurrence(d, 'size').filter((o) => o.declarationId).map((o) => o.declarationId));
+    assert.ok([...fieldIds].some((id) => /field/.test(id)), 'the field of Box');
+    // the call of a function-typed parameter names the parameter
+    const f = inFunction('f', 5, 9);
+    assert.equal(f.length, 3);
+    assert.ok(f.every((o) => o.declarationId) && new Set(f.map((o) => o.declarationId)).size === 1, 'f(n) names the parameter f');
+    // a method called inside its class without a receiver, and with one, name the method
+    const twice = occurrence(d, 'twice');
+    assert.equal(twice.length, 3);
+    assert.ok(twice.every((o) => o.declarationId) && new Set(twice.map((o) => o.declarationId)).size === 1, 'twice(n) names the method twice');
+    // find-references on the method: its declaration, the call inside the class and the call with a receiver
+    const refs = (await s.rpc('query/references', { uri: d.uri, offset: twice[0].range.start })).result.value;
+    assert.equal(refs.length, 3);
+    await s.close();
+}
+
 async function projections() {
     let p = fixture('projections', { 'main.ab': '// café 😀\nimport "dep.ab"\nfun main: int = answer()\n', 'dep.ab': 'fun answer: int = 42\n' });
     let s = await start(p);
@@ -706,7 +765,7 @@ async function since() {
     await legacy.close();
 }
 
-const tests = { type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
+const tests = { local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
 const filter = process.env.ANALYSIS_TEST_FILTER ? process.env.ANALYSIS_TEST_FILTER.split(',') : null;
 for (const [name, test] of Object.entries(tests)) {
     if (filter && !filter.includes(name)) continue;
