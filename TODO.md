@@ -204,12 +204,9 @@ mmap form) apply there.
   reachable from an export). Wasm, freestanding and compile-time slices are unchanged. Cost, measured on the Android
   test library built as an x86-64 `.so`: 51,536 to 67,048 bytes (+30%; the collector's code and the safe points), build
   time 0.89 s to 1.07 s. It exposed a recursion on Android: the emulated thread-local routines (`abla/android/emutls`)
-  were rooted functions, so reading the root-frame head called them again; they (and anything named `emutls`) are now
-  runtime implementations, and their `mmap` goes through the system call intrinsic, not the bracketed wrapper.
-  `tests/cases/android-run` checks that its library, which asks for nothing, collects (`abla_run_collected`). Found
-  on the way: `ABLA_GC_STRESS` and `ABLA_GC_TRACE` are read from the process environment, which a library does not
-  have (no `_start`), so the `-t` "stress" runs of the library tests have never been stress runs; a library needs its
-  own way to ask for stress.
+  were rooted functions, so reading the root-frame head called them again; they are marked `@runtimeImplementation`
+  (runtime implementations), and their `mmap` goes through the system call intrinsic, not the bracketed wrapper.
+  `tests/cases/android-run` checks that its library, which asks for nothing, collects (`abla_run_collected`). A library has no process environment, so ABLA_GC_STRESS and ABLA_GC_TRACE never reached it and the `-t` stress runs of the library tests were not stress runs; `memorySetStress`/`memorySetTrace` are the calls for it, and the test driver passes the variables on.
 
 ## Bugs seen
 

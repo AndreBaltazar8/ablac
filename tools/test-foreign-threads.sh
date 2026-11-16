@@ -45,9 +45,12 @@ status=0
 for stress in 0 1; do
     for count in 1 4 8; do
         status=0
-        ABLA_GC_STRESS=$stress limited "$out/driver" "$PWD/$out/$library" -t "$count" abla_run_churn 1 \
+        ABLA_GC_STRESS=$stress ABLA_GC_TRACE=1 limited "$out/driver" "$PWD/$out/$library" -t "$count" abla_run_churn 1 \
             > "$out/threads-$stress-$count.out" 2>&1 < /dev/null || status=$?
         [[ $status -eq 0 ]] || { cat "$out/threads-$stress-$count.out" >&2; fail "$count threads, GC stress $stress: status $status"; }
+        # The stress run really stresses: the library has no environment, the driver passes the variable on as a call.
+        [[ $stress -eq 0 ]] || grep -q '^gc: stopped' "$out/threads-$stress-$count.out" \
+            || fail "$count threads under GC stress: the library never collected (memorySetStress did not reach it)"
     done
 done
 # A thread blocked in the host's code inside an export counts as stopped for the collections of another thread (#811).
