@@ -47,6 +47,9 @@
 #                   emptied first, so runs at the same time each need their own
 #   PARITY_ORDER    a file of case names started before the others, slowest
 #                   first (default tests/cases/parity/slow-first.txt)
+#   PARITY_LONG_BUILDS
+#                   a file of case names whose sides get three times PARITY_SECONDS
+#                   (default tests/cases/parity/long-builds.txt)
 #   PARITY_BUILD_FLAGS
 #                   more flags for every build of both sides (`--fast` builds
 #                   each program without the optimizer, in about half the
@@ -89,6 +92,7 @@ known_step_limit=${PARITY_KNOWN_STEP_LIMIT:-5000000}
 expect=${PARITY_EXPECT:-$project_root/tests/cases/parity/expected-pass.txt}
 output=${PARITY_OUTPUT:-$project_root/build/compile-time-parity}
 order=${PARITY_ORDER:-$project_root/tests/cases/parity/slow-first.txt}
+long_builds=${PARITY_LONG_BUILDS:-$project_root/tests/cases/parity/long-builds.txt}
 build_flags=${PARITY_BUILD_FLAGS:-}
 [[ $output == /* ]] || output=$PWD/$output
 export ABLA_SYSROOT=${ABLA_SYSROOT:-$project_root}
@@ -249,9 +253,16 @@ case_dir() { # kind name
 # then each mode's `#` side against it, all in one work directory (so every
 # side sees the same paths), whose files are then published to
 # <output>/cases/<mode>/<name>.
+# The wall limit of a side of case `name`: PARITY_SECONDS, three times that for a case in PARITY_LONG_BUILDS (a
+# file of case names, one a line; `#` starts a comment), whose builds are long by nature (a program that imports
+# the compiler's own sources builds in about a minute alone, and past the limit under a loaded suite).
+case_seconds() { # name
+    if [[ -f $long_builds ]] && grep -qxF "$1" "$long_builds"; then echo $((seconds * 3)); else echo "$seconds"; fi
+}
+
 run_case() { # kind name source
     local kind=$1 name=$2 source=$3
-    local dir mode want side_seconds=$seconds started
+    local dir mode want side_seconds=$(case_seconds "$name") started
     dir=$(case_dir "$kind" "$name")
     mkdir -p "$dir"
     if [[ $kind == module ]]; then
@@ -296,7 +307,7 @@ run_case() { # kind name source
     for mode in $modes; do
         want=$(expected_status "$mode" "$name")
         if [[ $want != runtime-skipped ]]; then
-            side_seconds=$seconds
+            side_seconds=$(case_seconds "$name")
             break
         fi
         side_seconds=$known_timeout_seconds
@@ -322,7 +333,7 @@ run_case() { # kind name source
 # Compares one mode's `#` side with the run-time side; sets status and detail.
 run_mode() { # kind name source mode
     local kind=$1 name=$2 source=$3 mode=$4
-    local dir granted="" side_seconds=$seconds
+    local dir granted="" side_seconds=$(case_seconds "$name")
     dir=$(case_dir "$kind" "$name")
     # A `#` side expected never to finish only needs to show that it doesn't,
     # and one expected past the interpreter's step limit to pass a lower one
@@ -474,8 +485,8 @@ publish_mode() { # kind name mode seconds runtime-seconds
 }
 export -f run_case run_mode publish_mode build_and_run first_error limited case_dir \
     expected_status by_design_status by_design_reason sources_match starts_thread \
-    has_compile_time_code
-export output compiler seconds known_timeout_seconds known_step_limit modes expected project_root \
+    has_compile_time_code case_seconds
+export output compiler seconds long_builds known_timeout_seconds known_step_limit modes expected project_root \
     by_design build_flags
 
 # The cases known to take longest start first (PARITY_ORDER, a file of case

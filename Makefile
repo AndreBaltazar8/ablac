@@ -108,6 +108,7 @@ test-serial: ablac
 	tools/test-thread-local-image.sh $(COMPILER)
 	tools/test-process-exec-strings.sh $(COMPILER)
 	tools/test-gc-stress-io.sh $(COMPILER)
+	tools/test-bootstrap-cases.sh $(COMPILER)
 	tools/test-ct-stop-threads.sh $(COMPILER)
 	tools/test-ct-threads-heap.sh $(COMPILER)
 	tools/test-ct-interp-runtime.sh $(COMPILER)
