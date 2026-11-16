@@ -8,6 +8,12 @@ import "abla/memory"
 // against a model over plain strings for all 64 combinations, on one thread
 // (direct, then logged, with a collection between kept writes and their undo)
 // and on four threads at once (logged, conflicting on a shared counter).
+//
+// The collection is bit 6 of `flags` (bits 0-5 are the retries). Each one stops
+// every thread, so the threads take it in one combination of 16 and the single
+// thread in all of them. With every combination collecting, a run was 10,700
+// stops, each waiting for four threads to reach a safe point: 1.7 s alone, and
+// past the test's 60 s limit on a loaded machine.
 
 trusted fun alwaysLogged(logged: bool): void = __ablaRuntimeStmSetAlwaysLogged(logged)
 
@@ -32,7 +38,7 @@ fun alternative(trail: Trail, level: int, flags: int, side: int): bool {
     if (level < 3) choice(trail, level + 1, flags)
     // The kept values (strings) must survive a collection before the undo,
     // and the blocks of any it freed are taken again at once.
-    if (level == 3) {
+    if (level == 3 && flagged(flags, 6)) {
         memoryCollect()
         val churn: array<string> = []
         for (index in 0 until 200) churn.append("${index % 10}x${trail.count}y${level}z")
@@ -85,9 +91,12 @@ fun combination(flags: int): int {
     if (text == expected && count == markers(expected) && chosen == (model != null)) 0 else 1
 }
 
-fun allCombinations(rounds: int): int {
+// `collectEvery`: the combinations that collect, one in that many (it moves on each round).
+fun allCombinations(rounds: int, collectEvery: int): int {
     var failed = 0
-    for (round in 0 until rounds) for (flags in 0 until 64) failed += combination(flags)
+    for (round in 0 until rounds) for (flags in 0 until 64) {
+        failed += combination(if ((flags + round) % collectEvery == 0) flags | 64 else flags)
+    }
     failed
 }
 
@@ -101,15 +110,15 @@ fun committed(rounds: int): int {
 }
 
 fun main: int {
-    var failed = allCombinations(1)
+    var failed = allCombinations(1, 1)
     alwaysLogged(true)
-    failed += allCombinations(1)
+    failed += allCombinations(1, 1)
     alwaysLogged(false)
     val before = atomic { noise }
-    val one = thread { allCombinations(5) }
-    val two = thread { allCombinations(5) }
-    val three = thread { allCombinations(5) }
-    val four = thread { allCombinations(5) }
+    val one = thread { allCombinations(5, 16) }
+    val two = thread { allCombinations(5, 16) }
+    val three = thread { allCombinations(5, 16) }
+    val four = thread { allCombinations(5, 16) }
     failed += await one + await two + await three + await four
     val bumps = atomic { noise } - before
     println("nested orElse: $failed failed, $bumps committed alternatives (expected ${committed(20)})")
