@@ -17,12 +17,15 @@
 # the answer's occurrences are kept as text, so the loop peaks near the first analysis's level. Its bound, 2,200,000 kB (1,930,000 measured), sits
 # between that and the old behaviour's; the final answer must carry the edited module at its last version.
 #
-# The loop's resident size is not a stable measure: the same compiler peaked at 2.03 GB alone and 2.29 GB in a loaded suite run (it is
-# about twice the live heap, 0.94 GB: the rest is what the heap holds between collections, and how much depends on when the kernel and
-# the collector's free helper get to run; one busy loop beside it, or eight, did not reproduce it). So the loop is bounded by what the
-# service itself reports with ABLA_COMPILER_MEMORY_TRACE: the most live heap bytes it saw at its phase boundaries
-# (abla-analysis-peak-live, bootstrapAnalysisSampleMemory), which the load does not change. The resident size keeps its bound too,
-# as the lowest of two runs when the first is over it.
+# The loop is bounded twice, because neither number alone follows the source as it grows. Its resident size, bound 2,200,000 kB (the lowest of
+# two runs when the first is over it), is what an editor's machine pays; but it is not a stable measure (the same compiler peaked at 2.03 GB alone
+# and 2.29 GB in a loaded suite run: it is about twice the reachable heap, the rest is what the heap holds between collections). What the
+# loop must not do is keep the previous answer: so a third run, with ABLA_COMPILER_MEMORY_TRACE set, has the service collect the heap and
+# print the bytes still reachable at the phase boundaries of each analysis (bootstrapAnalysisSampleMemory), and the loop's peak is bounded to
+# 1.35 times the first, cold analysis's in the same run. That is a ratio, so it follows the source as it grows (the cold analysis was 0.68 GB on the
+# compiler's own source and the loop's peak 0.74 to 0.81 GB, 1.08 to 1.19 times it; an absolute bound of 1,030,000,000 bytes on live bytes read between
+# collections, which hold the garbage made since the last one, tripped at 1,031,677,366 after 520 lines of source were added), and a loop that
+# keeps the previous answer (about twice the cold analysis) is far over it.
 set -euo pipefail
 
 compiler=${1:-build/ablac}
@@ -31,7 +34,7 @@ project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 output_directory="$project_root/build/analysis-memory"
 bound_kilobytes=2040000
 edit_bound_kilobytes=2200000
-edit_live_bound_bytes=1030000000
+edit_retention_percent=135
 mkdir -p "$output_directory"
 if ! /usr/bin/env time --version >/dev/null 2>&1; then
     echo "analysis-memory: needs GNU time (shell.nix has it)" >&2
@@ -95,9 +98,8 @@ if (named < 100000) throw new Error(`only ${named} occurrences name a declaratio
 ' "$output_directory/output.jsonl"
 
 edit_peak=""
-edit_live=""
 for run in 1 2; do
-    ABLA_SYSROOT="$root" ABLA_COMPILE_EVAL=jit ABLA_COMPILER_MEMORY_TRACE=1 ABLA_MAX_MEMORY_MB=6144 ABLA_MAX_SECONDS=1800 ABLA_MAX_CPU_SECONDS=900 \
+    ABLA_SYSROOT="$root" ABLA_COMPILE_EVAL=jit ABLA_MAX_MEMORY_MB=6144 ABLA_MAX_SECONDS=1800 ABLA_MAX_CPU_SECONDS=900 \
         /usr/bin/env time -f '%M' -o "$output_directory/edit-peak" \
         "$project_root/tools/run-limited.sh" "$compiler" analyze --stdio < "$output_directory/edit-input.jsonl" > "$output_directory/edit-output.jsonl" 2> "$output_directory/edit-error.txt" || {
         echo "analysis-memory: the edit loop over src/orc_main.ab failed" >&2
@@ -106,12 +108,21 @@ for run in 1 2; do
     }
     measured=$(tail -n 1 "$output_directory/edit-peak")
     if [[ -z $edit_peak || $measured -lt $edit_peak ]]; then edit_peak=$measured; fi
-    live=$(sed -n 's/^abla-analysis-peak-live //p' "$output_directory/edit-error.txt" | tail -n 1)
-    [[ -n $live ]] || { echo "analysis-memory: the service did not report its peak live heap (abla-analysis-peak-live)" >&2; exit 1; }
-    edit_live=$live
     # A second run only when the first is over the resident bound (load can raise it; the lowest counts).
     (( edit_peak <= edit_bound_kilobytes )) && break
 done
+# The traced run: what is reachable at the phase boundaries, the cold analysis's peak against the loop's.
+ABLA_SYSROOT="$root" ABLA_COMPILE_EVAL=jit ABLA_COMPILER_MEMORY_TRACE=1 ABLA_MAX_MEMORY_MB=6144 ABLA_MAX_SECONDS=1800 ABLA_MAX_CPU_SECONDS=900 \
+    "$project_root/tools/run-limited.sh" "$compiler" analyze --stdio < "$output_directory/edit-input.jsonl" > "$output_directory/traced-output.jsonl" 2> "$output_directory/traced-error.txt" || {
+    echo "analysis-memory: the traced edit loop over src/orc_main.ab failed" >&2
+    sed -n '1,20p' "$output_directory/traced-error.txt" >&2
+    exit 1
+}
+read -r first_live loop_live < <(awk '/^abla-analysis-memory / { live = $NF + 0; if (!cold_done && live > first) first = live; if (live > peak) peak = live; if ($2 == "answer" && $3 == "built") cold_done = 1 } END { print first + 0, peak + 0 }' "$output_directory/traced-error.txt")
+if (( first_live == 0 || loop_live == 0 )); then
+    echo "analysis-memory: the service did not report the live heap at its phases (abla-analysis-memory)" >&2
+    exit 1
+fi
 node -e '
 const lines = require("fs").readFileSync(process.argv[1], "utf8").trim().split("\n").map((line) => JSON.parse(line));
 const last = lines.find((line) => line.id === 7).result;
@@ -122,8 +133,8 @@ for (const document of last.documents) for (const occurrence of document.occurre
 if (named < 100000) throw new Error(`only ${named} occurrences name a declaration after the edits`);
 ' "$output_directory/edit-output.jsonl"
 
-if (( edit_live > edit_live_bound_bytes )); then
-    echo "analysis-memory: the edit loop's live heap peaked at $edit_live bytes, over $edit_live_bound_bytes: what keeps the previous answer alive while the next is built?" >&2
+if (( loop_live * 100 > first_live * edit_retention_percent )); then
+    echo "analysis-memory: the edit loop's reachable heap peaked at $loop_live bytes, over $edit_retention_percent% of the cold analysis's $first_live: what keeps the previous answer alive while the next is built?" >&2
     exit 1
 fi
 if (( edit_peak > edit_bound_kilobytes )); then
@@ -134,4 +145,4 @@ if (( peak > bound_kilobytes )); then
     echo "analysis-memory: analyze --stdio over src/orc_main.ab peaked at $peak kB, over $bound_kilobytes kB: what keeps the path or a string per occurrence (resolvedNames, the occurrence index)?" >&2
     exit 1
 fi
-echo "analysis memory: analyze --stdio over the compiler's own source peaks at $peak kB (bound $bound_kilobytes kB), and after edits at $edit_peak kB (bound $edit_bound_kilobytes kB), with a live heap of $edit_live bytes (bound $edit_live_bound_bytes)"
+echo "analysis memory: analyze --stdio over the compiler's own source peaks at $peak kB (bound $bound_kilobytes kB), and after edits at $edit_peak kB (bound $edit_bound_kilobytes kB), with a reachable heap of $loop_live bytes against the cold analysis's $first_live (bound $edit_retention_percent%)"
