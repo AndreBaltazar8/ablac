@@ -535,6 +535,7 @@ import "abla/io"
 import "abla/compiler"
 import "abla/unsafe/memory"
 import "abla/unsafe/native"
+import "abla/unsafe/memory/raw"
 
 #compilerGrant("trusted.native")
 

@@ -46,7 +46,8 @@ lowered cold || fail 'the cold build did not lower'
 [[ ! -e $(text) ]] || fail 'the cold build left LLVM text'
 run 42
 cp "$output" "$work/cold.bin"
-members=("$cache"/native-*-inprocess-o1-held-o1-single-v1-*.o)
+# (Under strict imports, the default, the profile reads inprocess-o1-strict.)
+members=("$cache"/native-*-inprocess-o1*-held-o1-single-v1-*.o)
 [[ ${#members[@]} -eq 1 && -e ${members[0]} ]] || fail "expected one held object, found ${#members[@]}"
 printf 'held-o1-cache-marker\n' > "$(text)"
 build warm

@@ -2733,9 +2733,10 @@ import github("AndreBaltazar8/abla-mvc") as mvc
 
 ### Strict imports
 
-A package whose `abla.toml` says `visibility = "imports"` is strict: each of
-its modules sees its own declarations and those of the modules it imports
-without an alias, and nothing else. `export import "path"` imports a module
+Imports are strict: each module sees its own declarations and those of the
+modules it imports without an alias, and nothing else. That is the default
+for a package that doesn't say, and what `visibility = "imports"` in its
+`abla.toml` says explicitly; a package can still opt out (below). `export import "path"` imports a module
 and passes its declarations on, as if declared here, to the modules that
 import this one:
 
@@ -2807,11 +2808,15 @@ fun main: int = nextId()
   `E_IMPORT_UNQUALIFIED_AMBIGUOUS`, as for two direct imports, unless the
   module declares the name itself. An imported module's own declaration of a
   name hides what it passes on under that name.
-- `visibility = "program"` keeps a package flat. A program without a
-  manifest, or whose manifest doesn't say, is strict when built with
-  `--strict-imports`; with `--strict-imports=warn` it stays flat and each
-  diagnostic strict imports would give it is a warning, with its `help:`.
-- To migrate, `ablac build app.ab -o app --visibility-report report.tsv`
+- Flat is the opt-out, for code that hasn't been migrated: `visibility = "flat"`
+  (or the older spelling `"program"`) keeps a package flat, where every module
+  sees every name the program declares, and `ablac build --flat-imports` builds
+  a program whose manifest doesn't say flat. With `--strict-imports=warn` it
+  also builds flat, and each diagnostic strict imports would give it is a
+  warning, with its `help:`. A module strict only by default says how to opt
+  out in a second `help:` line of its `E_NAME_NOT_IMPORTED`. Flat is going away
+  once downstream code has migrated (decision #66).
+- To migrate, `ablac build app.ab -o app --flat-imports --visibility-report report.tsv`
   builds as usual and writes every name each module would lose, with the
   import to add, and each extension, operator and overload call that relies
   on a module it doesn't import (a seventh column says `member` or
@@ -2965,6 +2970,8 @@ bridge and similar tools needed from a value's words, is
 isn't a function.
 
 ```abla error
+import "abla/runtime/scalar"
+
 trusted fun word(value: any): int = ablaRuntimeValueWord0(value)
 
 fun main: int = word(1)

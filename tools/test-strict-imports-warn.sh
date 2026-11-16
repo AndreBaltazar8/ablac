@@ -60,11 +60,11 @@ if "$compiler" build "$cases/strict-members/passed-on/unused.ab" -o "$output_dir
 grep -qF 'error[E_IMPORT_UNQUALIFIED_AMBIGUOUS]' "$output_directory/warn.err" ||
     fail "passed-on/unused.ab lacks its strict error"
 
-# A strict package's errors stay errors; a flat build without the option prints nothing.
+# A strict package's errors stay errors; a --flat-imports build without the option prints nothing.
 if "$compiler" build "$cases/strict-imports/pkg/bad.ab" -o "$output_directory/invalid" --strict-imports=warn \
     > "$output_directory/warn.err" 2>&1; then fail "pkg/bad.ab compiled"; fi
 grep -qF 'error[E_NAME_NOT_IMPORTED]' "$output_directory/warn.err" || fail "pkg/bad.ab lacks its error"
-"$compiler" build "$cases/strict-imports/flat/main.ab" -o "$output_directory/flat" --no-cache \
+"$compiler" build "$cases/strict-imports/flat/main.ab" -o "$output_directory/flat" --no-cache --flat-imports \
     > "$output_directory/warn.err" 2>&1 || fail "flat/main.ab did not build"
 grep -qF 'warning[' "$output_directory/warn.err" && fail "a flat build without the option warned"
 echo "strict-imports-warn: names, members, overloads and export-import ambiguity as warnings; strict packages and plain flat builds unchanged"

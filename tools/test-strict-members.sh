@@ -36,7 +36,7 @@ rejected() { # $1 = source, $2 = extra build flag or "", then the texts its diag
 }
 
 # Flat, as before.
-"$compiler" build "$cases/main.ab" -o "$output_directory/flat" --no-cache
+"$compiler" build "$cases/main.ab" -o "$output_directory/flat" --no-cache --flat-imports
 runs "$output_directory/flat" "6 4 string string"
 
 # Strict: the extension, the operator and the only fitting overload name extras.ab, and the help imports it.
@@ -63,7 +63,7 @@ runs "$output_directory/sees" "any"
 
 # The report lists each use with its kind, and fix-imports makes the program build strict with flat's output.
 cp -R "$cases" "$output_directory/fixed"
-"$compiler" build "$output_directory/fixed/main.ab" -o "$output_directory/reported" --no-cache \
+"$compiler" build "$output_directory/fixed/main.ab" -o "$output_directory/reported" --no-cache --flat-imports \
     --visibility-report "$output_directory/report.tsv"
 for row in $'\tPoint.doubled\t' $'\tPoint.plus\t' $'\tdescribe\t' $'\tlabel\t'; do
     grep -F -- "$row" "$output_directory/report.tsv" | grep -F 'import "./extras.ab"' >/dev/null ||

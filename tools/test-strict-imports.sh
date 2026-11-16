@@ -43,16 +43,25 @@ runs "$output_directory/pkg" "4 18 8 5"
 rejected "$cases/pkg/bad.ab" "" \
     'error[E_NAME_NOT_IMPORTED]: `utilHelp` is declared in' 'help: add: import "./util.ab"'
 
-# A flat program builds as before, and is rejected with --strict-imports; a
-# standard-library name is suggested by the import the program writes.
-"$compiler" build "$cases/flat/main.ab" -o "$output_directory/flat"
+# A program written flat builds with --flat-imports, and is rejected by default and with --strict-imports; a
+# standard-library name is suggested by the import the program writes. Strict only by default, its
+# E_NAME_NOT_IMPORTED names the opt-out in a second help line; asked for, it doesn't (decision #66, step 3).
+"$compiler" build "$cases/flat/main.ab" -o "$output_directory/flat" --flat-imports
 runs "$output_directory/flat" "81 x/y"
+rejected "$cases/flat/main.ab" "" \
+    '`bThing` is declared in' 'help: add: import "./b.ab"' 'help: add: import "abla/fs"' \
+    'help: imports are strict by default; to build this package flat while its imports are added: --flat-imports'
 rejected "$cases/flat/main.ab" --strict-imports \
     '`bThing` is declared in' 'help: add: import "./b.ab"' 'help: add: import "abla/fs"'
+"$compiler" build "$cases/flat/main.ab" -o "$output_directory/invalid" --strict-imports \
+    > "$output_directory/asked.out" 2>&1 || true
+if grep -qF 'imports are strict by default' "$output_directory/asked.out"; then
+    echo "strict-imports: --strict-imports, asked for, still names the opt-out"; exit 1
+fi
 
 # Report, apply, and build strict.
 cp -R "$cases/flat" "$output_directory/fixed"
-"$compiler" build "$output_directory/fixed/main.ab" -o "$output_directory/flat" \
+"$compiler" build "$output_directory/fixed/main.ab" -o "$output_directory/flat" --flat-imports \
     --visibility-report "$output_directory/report.tsv"
 grep -qF "	bThing	" "$output_directory/report.tsv" ||
     { echo "strict-imports: the report lacks bThing"; cat "$output_directory/report.tsv"; exit 1; }
@@ -91,7 +100,7 @@ source "$project_root/tools/compiler-binary.sh"
 ABLA_SYSROOT="$library_root" rejected "$cases/library-user.ab" "" \
     'error[E_NAME_NOT_IMPORTED]: `Path` is declared in' 'help: add: import "abla/sys/linux/fs"')
 # A program's value named like a type the library's annotations name.
-"$compiler" build "$cases/value-named-like-type.ab" -o "$output_directory/value-named"
+"$compiler" build "$cases/value-named-like-type.ab" -o "$output_directory/value-named" --flat-imports
 runs "$output_directory/value-named" "5"
 "$compiler" build "$cases/value-named-like-type.ab" -o "$output_directory/value-named-strict" \
     --strict-imports
@@ -113,14 +122,14 @@ runs "$output_directory/generic-types" "5 2 1 3"
 # A type parameter in scope wins over a flat program's class of the same name
 # (and over a standard-library type name); a class that is no type parameter
 # there still is E_NAME_NOT_IMPORTED.
-"$compiler" build "$cases/type-parameters/main.ab" -o "$output_directory/type-parameters"
+"$compiler" build "$cases/type-parameters/main.ab" -o "$output_directory/type-parameters" --flat-imports
 runs "$output_directory/type-parameters" "3 6 5 4 15 9
 15"
 rejected "$cases/type-parameters/bad-main.ab" "" \
     'error[E_NAME_NOT_IMPORTED]: `Other` is declared in'
 # A library module's other file isn't API: a flat program's report names the
 # entry module that reaches it, and a strict program is told it's internal.
-"$compiler" build "$cases/internal.ab" -o "$output_directory/internal" \
+"$compiler" build "$cases/internal.ab" -o "$output_directory/internal" --flat-imports \
     --visibility-report "$output_directory/internal.tsv" > "$output_directory/internal.out" 2>&1 || true
 grep -F "	OpenSSL_version_num	" "$output_directory/internal.tsv" | grep -F 'import "abla/tls/hosted"' >/dev/null ||
     { echo "strict-imports: the internal name's report line:"; cat "$output_directory/internal.tsv"; exit 1; }

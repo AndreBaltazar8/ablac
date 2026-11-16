@@ -15,7 +15,9 @@ rm -rf "$output_directory"
 mkdir -p "$output_directory"
 
 for mode in release fast; do
-    flags=(--no-cache)
+    # Flat: what this checks is how far a flat module's names reach (deep.ab sees pure.ab through user.ab alone);
+    # strict imports, the default, would reject that use as E_NAME_NOT_IMPORTED.
+    flags=(--no-cache --flat-imports)
     [[ $mode == fast ]] && flags+=(--fast)
     if ! "$compiler" build "$cases/main.ab" -o "$output_directory/$mode" "${flags[@]}" > "$output_directory/$mode.log" 2>&1; then
         cat "$output_directory/$mode.log" >&2

@@ -346,9 +346,11 @@ object semantics change without a corresponding source-graph change.
 `.ll`/object sidecars. It is the reproducibility and profiling mode used by the
 pure self-rebuild gate; options after the source are order-independent.
 
-`build --strict-imports` makes every module whose package doesn't set
-`visibility` [strict](language.md#strict-imports) (it is part of the cache
-identity). `build --strict-imports=warn` leaves those modules flat and prints,
+A module whose package doesn't set `visibility` is [strict](language.md#strict-imports)
+by default; `build --flat-imports` builds those modules flat instead, the opt-out for code
+not yet migrated, and `--strict-imports` says the default explicitly (the mode is part of
+the cache identity). An `E_NAME_NOT_IMPORTED` in a module strict only by default has a
+second `help:` line naming the opt-out. `build --strict-imports=warn` leaves those modules flat and prints,
 as a warning, each diagnostic `--strict-imports` would give them, with the
 same place and `help:` line: a name of a module they don't import, an
 extension function, operator or overload of one, a name two imports pass on
@@ -360,7 +362,9 @@ lose under strict imports: module, line, column, name, declaring module and
 the import to add, and a line with a seventh column, `member` or `overload`,
 for each extension function or operator call and each overload choice that
 relies on a module the caller doesn't import (found once the call is typed). `ablac run tools/fix-imports.ab -- <file>` adds those
-imports.
+imports (a module the file already imports, even under an alias, is left alone). To migrate a package that doesn't
+build strict yet: `ablac build app.ab -o app --flat-imports --visibility-report report.tsv`, then the fixer, then
+`ablac build app.ab -o app`; a new import that makes a name ambiguous needs an alias, which that build reports.
 
 Compile-time build definitions may register additional program nodes through
 the versioned compiler API. After the root succeeds, `build` drains the bounded

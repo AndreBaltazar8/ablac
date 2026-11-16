@@ -139,7 +139,7 @@ done
 # Flat programs keep their existing whole-program name resolution in either
 # order, including the implementation reference forbidden in strict mode.
 for flat in main contract-first ordinary-first; do
-    "$compiler" build "$visibility/$flat.ab" -o "$output/flat-$flat" --fast --no-cache
+    "$compiler" build "$visibility/$flat.ab" -o "$output/flat-$flat" --fast --no-cache --flat-imports
     set +e
     "$output/flat-$flat"
     status=$?
@@ -174,10 +174,11 @@ printf '%s\n' 'contract projection: strict surface, dependency types and root si
 
 # A contract carries a class its module reaches only through another module's
 # import: the declaring module is loaded for the contract, the module between is
-# not, and a module the program also imports in full stays whole in either order.
+# not, and a module the program also imports in full stays whole in either order (flat: the class is reached
+# through another module's import).
 transitive="$project_root/tests/cases/contract-transitive"
 for name in contract-only full-first contract-first api-full-elsewhere api-full-first json-full-elsewhere; do
-    "$compiler" build "$transitive/$name.ab" -o "$output/transitive-$name" --fast --no-cache
+    "$compiler" build "$transitive/$name.ab" -o "$output/transitive-$name" --fast --no-cache --flat-imports
     status=0
     "$output/transitive-$name" || status=$?
     [[ $status -eq 42 ]] || { echo "contract transitive $name: $status != 42"; exit 1; }

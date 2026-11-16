@@ -30,6 +30,7 @@ if llvm-nm "$out/staged-integer" | grep ' abla_erased_to_string$' >/dev/null; th
 fi
 cat > "$out/build-wasm.ab" <<WASM
 import "abla/wasm/build"
+import "abla/build"
 val a = #wasmBuildModule("erased-float", "tests/cases/erased-float-format/main.ab", "build/erased-float-format/release.wasm", false, false)
 val b = #buildProgram("erased-float-fast", "tests/cases/erased-float-format/main.ab", "build/erased-float-format/fast.wasm", "wasm32-module", "module", true, false)
 fun main: int = if (a && b) 0 else 1

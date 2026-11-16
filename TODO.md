@@ -1115,13 +1115,18 @@ mmap form) apply there.
   `~/agents-memory/abla/ablac-reserved-generic-syntax-design.md`. Not covered by any of the three and seen in
   real code: static members on type parameters (a bound that gives `T.fromJson(...)`), which abla-one works
   around with function parameters.
-- [ ] **Module-scoped globals (André's decision #64).** Strict imports (`visibility = "imports"`) exist, opt-in;
+- [ ] **Retire flat imports (decision #66, step 4).** Strict imports are the default (step 3); flat stays as the
+  opt-out (`--flat-imports`, `visibility = "flat"` or `"program"`, `--strict-imports=warn`). Remove it, with
+  those flags and keys, only once downstream has migrated: NovaKind (parked; its main isn't touched until André
+  resumes it) and game-pandatrails build strict on their default branches, and the abla-* siblings' strict-imports
+  branches (step 2) are on theirs. Then E_NAME_NOT_IMPORTED's opt-out help line goes too.
+- [ ] **Module-scoped globals (André's decision #64).** Strict imports (`visibility = "imports"`) are the default;
   what the decision covers is making them the default and retiring flat packages. The compiler and the standard library are
   strict (the 2026-10-19 count of 102 in the compiler is 0). Strict mode's gaps are closed: extension functions and
   operators, and overloads, of modules a module doesn't import; ambiguity through `export import`
   (tools/test-strict-members.sh). `--visibility-report` lists those uses too (`member`, `overload`). Counts, the
-  migration path and what breaks: ~/agents-memory/abla/ablac-module-scoped-globals-design.md. No default is changed
-  until André decides.
+  migration path and what breaks: ~/agents-memory/abla/ablac-module-scoped-globals-design.md. Decision #66 made
+  strict the default (step 3); retiring flat is the entry above.
 
 ## Toolchain and project
 

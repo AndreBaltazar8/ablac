@@ -203,6 +203,7 @@ affine TCP connection adapter. It implements:
 
 ```abla build
 import "abla/websocket"
+import "abla/http"
 
 fun echo(request: HttpRequest, var socket: WebSocketConnection): void {
     val message = socket.readMessage()
@@ -330,6 +331,8 @@ is still the peer's socket, so `linuxSocketAddress` reads its address.
 import "abla/io"
 import "abla/websocket/server"
 import "abla/websocket/server/tls"
+import "abla/net"
+import "abla/http"
 
 fun main: int {
     val tls = webSocketServerTls("fullchain.pem", "privkey.pem")

@@ -17,6 +17,7 @@ done
 ABLA_GC_STRESS=1 "$out/fast"
 cat > "$out/build-wasm.ab" <<WASM
 import "abla/wasm/build"
+import "abla/build"
 val a = #wasmBuildModule("float-extension", "build/erased-float-extension/main.ab", "build/erased-float-extension/release.wasm", false, false)
 val b = #buildProgram("float-extension-fast", "build/erased-float-extension/main.ab", "build/erased-float-extension/fast.wasm", "wasm32-module", "module", true, false)
 fun main: int = if (a && b) 0 else 1

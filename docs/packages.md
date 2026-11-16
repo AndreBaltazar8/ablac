@@ -126,10 +126,12 @@ The entry is a library module and does not need `main`. Relative imports stay
 inside the materialized package. Provider imports in dependency entries are
 discovered transitively; incompatible duplicate names and cycles are rejected.
 
-`visibility = "imports"` makes the package's modules
-[strict](language.md#strict-imports): each sees only its own declarations and
-what it imports. `visibility = "program"`, or no key, keeps every name visible
-program-wide (`--strict-imports` makes a package without the key strict). The
+A package's modules are [strict](language.md#strict-imports) unless it says
+otherwise: each sees only its own declarations and what it imports
+(`visibility = "imports"` says so explicitly). `visibility = "flat"` (or the
+older `"program"`) keeps every name visible program-wide, the opt-out for a
+package not yet migrated; `ablac build --flat-imports` does the same for a
+package without the key. The
 key belongs to the nearest manifest at or above a module, so a strict package
 can depend on a flat one and the other way round.
 

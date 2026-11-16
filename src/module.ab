@@ -2544,7 +2544,12 @@ class BootstrapImportAliasValidation(
 // module whether it is strict or not and in a strict library module, to
 // <path> (module, line, column, name, declaring module, import);
 // tools/fix-imports.ab applies it.
-var bootstrapStrictImportsRequested: bool = false
+// Strict is the default (decision #66, step 3): a module whose package doesn't set `visibility` is strict unless
+// the build says `--flat-imports` (or `--strict-imports=warn`, which builds it flat with warnings).
+var bootstrapStrictImportsRequested: bool = true
+// No `--strict-imports` or `--flat-imports` given: a module strict only by default gets the way to opt out in
+// E_NAME_NOT_IMPORTED's help (bootstrapStrictImportsOptOutHelp).
+var bootstrapStrictImportsByDefault: bool = true
 
 /** The `visibility` of the package `modulePath` belongs to: its nearest
  *  abla.toml's, or "" when that doesn't say (or there is none). */
@@ -2596,9 +2601,16 @@ fun bootstrapModuleStrict(modulePath: string): bool {
     }
     val visibility = bootstrapModuleManifestVisibility(modulePath)
     if (visibility == "imports") true
-    else if (visibility == "program") false
+    else if (visibility == "flat" || visibility == "program") false
     else bootstrapStrictImportsRequested
 }
+
+/** Whether `modulePath` is strict only because strict is the default: its package doesn't set `visibility`,
+ *  and the build named neither mode. Its E_NAME_NOT_IMPORTED then says how to opt out
+ *  (bootstrapStrictOptOutHelp). */
+fun bootstrapModuleStrictByDefault(modulePath: string): bool =
+    bootstrapStrictImportsByDefault && bootstrapStrictImportsRequested && !modulePath.startsWith("<") &&
+        !bootstrapStandardLibraryModuleSource(modulePath) && bootstrapModuleManifestVisibility(modulePath) == ""
 
 /** Whether `--strict-imports=warn` covers `modulePath`: a program's module that `--strict-imports` would make strict
  *  (its package doesn't set `visibility`). */
@@ -2661,6 +2673,7 @@ fun bootstrapValidateStrictImports(
     // (What sema checks once targets are known: none until this build's modules say.)
     bootstrapStrictVisibilityTable = bootstrapStrictVisibilityEmpty()
     bootstrapStrictIdentityModules = Map()
+    bootstrapStrictOptOutModules = Map()
     val report = bootstrapVisibilityReportPath != ""
     val strict: array<bool> = []
     // What the report asks: every module of the program (not the standard
@@ -2674,6 +2687,7 @@ fun bootstrapValidateStrictImports(
         val warn = !found && bootstrapModuleStrictWarned(snapshot.path)
         strict.append(found)
         warned.append(warn)
+        if (found && bootstrapModuleStrictByDefault(snapshot.path)) bootstrapStrictOptOutModules.set(snapshot.path, true)
         asStrict.append(found || warn || (report &&
             !bootstrapStandardLibraryModuleSource(snapshot.path) &&
             !snapshot.path.startsWith("<")))
@@ -2758,20 +2772,24 @@ fun bootstrapValidateStrictImports(
     // found ("": the module itself, by its path).
     val suggested = filledArray(snapshots.size, "")
     val suggestedKnown = filledArray(snapshots.size, false)
+    val edges = bootstrapStrictEdgesOf(aliases, snapshots)
+    val independent: array<bool> = []
+    for (each in snapshots) independent.append(bootstrapIndependentEntryIdentity(each.path))
     module = 0
     while (module < snapshots.size) {
         val snapshot = snapshots[module]
         if (asStrict[module]) {
             val visible = bootstrapStrictVisibleModules(
-                module, aliases, snapshots, asStrict
+                module, edges, snapshots, asStrict
             )
             tableVisible[module] = bootstrapStrictBits(visible)
             tableMemberVisible[module] = bootstrapStrictBits(
-                bootstrapStrictVisibleModules(module, aliases, snapshots, asStrict, true)
+                bootstrapStrictVisibleModules(module, edges, snapshots, asStrict, true)
             )
             val findings = bootstrapStrictImportFindings(
                 snapshot, names, declaring, functionsOnly, classes, classMembers, visible, typeNames,
-                !fullModules.has(snapshot.path), !contractRoots.has(snapshot.path)
+                !fullModules.has(snapshot.path), !contractRoots.has(snapshot.path),
+                independent
             )
             for (finding in findings) {
                 if (!suggestedKnown[finding.declaring]) {
@@ -2801,9 +2819,9 @@ fun bootstrapValidateStrictImports(
                 ) else spelling
                 if (strict[module] || warned[module]) {
                     val diagnostic = if (internal)
-                        "error[E_NAME_NOT_IMPORTED]: `${finding.name}` is internal to the standard library (declared in ${snapshots[finding.declaring].path}); no import makes it visible\nhelp: a library module that offers it would be a change to the standard library to request\nsource[strict-import]:${snapshot.path}:${finding.begin}:${finding.end}\n"
+                        "error[E_NAME_NOT_IMPORTED]: `${finding.name}` is internal to the standard library (declared in ${snapshots[finding.declaring].path}); no import makes it visible\nhelp: a library module that offers it would be a change to the standard library to request\n${bootstrapStrictOptOutHelp(snapshot.path)}source[strict-import]:${snapshot.path}:${finding.begin}:${finding.end}\n"
                     else
-                        "error[E_NAME_NOT_IMPORTED]: `${finding.name}` is declared in ${snapshots[finding.declaring].path}, which this module doesn't import\nhelp: add: import \"$spelling\"\nsource[strict-import]:${snapshot.path}:${finding.begin}:${finding.end}\n"
+                        "error[E_NAME_NOT_IMPORTED]: `${finding.name}` is declared in ${snapshots[finding.declaring].path}, which this module doesn't import\nhelp: add: import \"$spelling\"\n${bootstrapStrictOptOutHelp(snapshot.path)}source[strict-import]:${snapshot.path}:${finding.begin}:${finding.end}\n"
                     if (strict[module]) {
                         errors = errors + 1
                         diagnostics = "$diagnostics$diagnostic"
@@ -3056,18 +3074,48 @@ fun bootstrapLibraryEntryReaching(
     bootstrapImportSpelling("", snapshots[target].path)
 }
 
-/** The modules whose names `module` sees under strict imports, by index. */
-fun bootstrapStrictVisibleModules(
-    module: int,
+// The import edges of a build by importing module, with their targets as snapshot indexes, and the modules every
+// program sees without importing them: made once per build (bootstrapStrictEdgesOf), so each module's walk
+// (bootstrapStrictVisibleModules) follows only its own edges. Walking every edge of the program, with a linear
+// lookup of each target, for every module and every module it reaches made the strict check quadratic in the
+// modules (tools/test-frontend-scaling.sh: 600 modules 9.6 s of it, 300 modules 1.5 s).
+class BootstrapStrictEdges(
+    // By importer path: its edges' targets (-1: not a module of the build), whether each is unaliased, exported.
+    val byImporter: Map<string, int>,
+    val targets: array<array<int>>,
+    val unaliased: array<array<bool>>,
+    val exported: array<array<bool>>,
+    val implicit: array<int>
+)
+
+fun bootstrapStrictEdgesOf(
     aliases: array<BootstrapModuleAlias>,
-    snapshots: array<BootstrapModuleSnapshot>,
-    strict: array<bool>,
-    // Also the modules imported under an alias, and what they pass on: an extension function or operator of one
-    // is called as a member (`p.doubled()`), which no alias can qualify.
-    aliased: bool = false
-): array<bool> {
-    val visible = filledArray(snapshots.size, false)
-    visible[module] = true
+    snapshots: array<BootstrapModuleSnapshot>
+): BootstrapStrictEdges {
+    // A path's first snapshot, as bootstrapSnapshotIndex finds it.
+    val indexOf: Map<string, int> = Map()
+    var index = 0
+    while (index < snapshots.size) {
+        if (!indexOf.has(snapshots[index].path)) indexOf.set(snapshots[index].path, index)
+        index = index + 1
+    }
+    val byImporter: Map<string, int> = Map()
+    val targets: array<array<int>> = []
+    val unaliased: array<array<bool>> = []
+    val exported: array<array<bool>> = []
+    for (edge in aliases) {
+        var slot = byImporter.get(edge.importer) ?? -1
+        if (slot < 0) {
+            slot = targets.size
+            byImporter.set(edge.importer, slot)
+            targets.append([])
+            unaliased.append([])
+            exported.append([])
+        }
+        targets[slot].append(indexOf.get(edge.target) ?? -1)
+        unaliased[slot].append(edge.alias == "")
+        exported[slot].append(edge.exported)
+    }
     // abla/stm, and the runtime the compiler loads into every program for its
     // target (abla/runtime/self and abla/runtime/platform's host.ab or
     // wasm.ab), which a program has without importing them.
@@ -3079,35 +3127,58 @@ fun bootstrapStrictVisibleModules(
     val platform = standardLibrary.child("abla/runtime/platform")
     val hostPlatform = bootstrapNormalizeModulePath(platform.child("host.ab").text)
     val wasmPlatform = bootstrapNormalizeModulePath(platform.child("wasm.ab").text)
-    var index = 0
+    val implicit: array<int> = []
+    index = 0
     while (index < snapshots.size) {
         val path = snapshots[index].path
         if (path == transactions || path == runtime ||
-            path == hostPlatform || path == wasmPlatform) visible[index] = true
+            path == hostPlatform || path == wasmPlatform) implicit.append(index)
         index = index + 1
     }
+    BootstrapStrictEdges(byImporter, targets, unaliased, exported, implicit)
+}
+
+/** The modules whose names `module` sees under strict imports, by index. */
+fun bootstrapStrictVisibleModules(
+    module: int,
+    edges: BootstrapStrictEdges,
+    snapshots: array<BootstrapModuleSnapshot>,
+    strict: array<bool>,
+    // Also the modules imported under an alias, and what they pass on: an extension function or operator of one
+    // is called as a member (`p.doubled()`), which no alias can qualify.
+    aliased: bool = false
+): array<bool> {
+    val visible = filledArray(snapshots.size, false)
+    visible[module] = true
+    for (index in edges.implicit) visible[index] = true
     val pending: array<int> = []
     // Its own unaliased imports, then what they pass on.
-    for (edge in aliases) {
-        if ((edge.alias == "" || aliased) && edge.importer == snapshots[module].path) {
-            val target = bootstrapSnapshotIndex(snapshots, edge.target)
-            if (target >= 0 && !visible[target]) {
+    val own = edges.byImporter.get(snapshots[module].path) ?? -1
+    if (own >= 0) {
+        var edge = 0
+        while (edge < edges.targets[own].size) {
+            val target = edges.targets[own][edge]
+            if ((edges.unaliased[own][edge] || aliased) && target >= 0 && !visible[target]) {
                 visible[target] = true
                 pending.append(target)
             }
+            edge = edge + 1
         }
     }
     var next = 0
     while (next < pending.size) {
         val from = pending[next]
-        for (edge in aliases) {
-            if (edge.alias == "" && edge.importer == snapshots[from].path &&
-                (!strict[from] || edge.exported)) {
-                val target = bootstrapSnapshotIndex(snapshots, edge.target)
-                if (target >= 0 && !visible[target]) {
+        val slot = edges.byImporter.get(snapshots[from].path) ?? -1
+        if (slot >= 0) {
+            var edge = 0
+            while (edge < edges.targets[slot].size) {
+                val target = edges.targets[slot][edge]
+                if (edges.unaliased[slot][edge] && (!strict[from] || edges.exported[slot][edge]) &&
+                    target >= 0 && !visible[target]) {
                     visible[target] = true
                     pending.append(target)
                 }
+                edge = edge + 1
             }
         }
         next = next + 1
@@ -3233,7 +3304,9 @@ fun bootstrapStrictImportFindings(
     visible: array<bool>,
     typeNames: BootstrapStringSet,
     contractOnly: bool,
-    typesOnly: bool
+    typesOnly: bool,
+    // By module index: a generated independent entry (bootstrapIndependentEntryIdentity).
+    independent: array<bool> = []
 ): array<BootstrapStrictImportFinding> {
     val result: array<BootstrapStrictImportFinding> = []
     val source = snapshot.source
@@ -3298,6 +3371,16 @@ fun bootstrapStrictImportFindings(
                 var seen = false
                 for (candidate in declaring[known]) {
                     if (visible[candidate]) seen = true
+                }
+                // A built-in (Cell, Shared, Mutex, Map, filledArray, move) is seen everywhere: where no module this
+                // one sees declares the name, it is the built-in, as in a flat module that doesn't import the
+                // program's declaration of it (tests/cases/builtin-names).
+                if (!seen && bootstrapBuiltinCallableName(text)) seen = true
+                // A declaration of a generated independent entry (`program.declare { ... }`) is written in this
+                // module's own source, inside the block its compile-time code hands to the new program: no
+                // module imports that entry, and a use there is the generated program's (program-build).
+                for (candidate in declaring[known]) {
+                    if (candidate < independent.size && independent[candidate]) seen = true
                 }
                 // A call of a function that two modules overload: sema picks the overload the arguments fit and
                 // names its module (chooseOverload); the first declaring module may not be it.

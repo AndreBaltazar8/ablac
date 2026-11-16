@@ -16,6 +16,7 @@ for profile in fast release; do
 done
 cat > "$out/build-wasm.ab" <<WASM
 import "abla/wasm/build"
+import "abla/build"
 val a = #wasmBuildModule("float-boundaries", "build/erased-float-boundaries/representation.ab", "build/erased-float-boundaries/release.wasm", false, false)
 val b = #buildProgram("float-boundaries-fast", "build/erased-float-boundaries/representation.ab", "build/erased-float-boundaries/fast.wasm", "wasm32-module", "module", true, false)
 fun main: int = if (a && b) 0 else 1
