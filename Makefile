@@ -230,6 +230,7 @@ test-serial: ablac
 	tools/test-compile-time-depth.sh $(COMPILER)
 	tools/test-import-precedence-diagnostics.sh $(COMPILER)
 	tools/test-string-escapes.sh $(COMPILER)
+	tools/test-string-escape-bytes.sh $(COMPILER)
 	tools/test-text-blocks.sh $(COMPILER)
 	tools/test-parse-errors-stop.sh $(COMPILER)
 	tools/test-return-type-diagnostic.sh $(COMPILER)
