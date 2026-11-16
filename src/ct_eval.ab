@@ -16,6 +16,7 @@ import "ct_global_graph.ab"
 import "eval.ab"
 import "ct_lift.ab"
 import "abla/unsafe/memory"
+import "abla/runtime/memory"
 import "abla/bytes"
 import "parser.ab"
 import "abla/sys/linux"
@@ -95,9 +96,13 @@ var bootstrapCtFreeAddress: int = 0
 var bootstrapCtGuardAddress: int = 0
 var bootstrapCtAlarmAddress: int = 0
 var bootstrapCtFaultAddress: int = 0
+// Whether the live generation can start threads (ct_jit.ab): before a call into one, the compiler's heap is shared.
+var bootstrapCtGenerationThreads: bool = false
 // Where a caught runtime panic leaves its message (0: the slice has no panic catcher).
 var bootstrapCtPanicTextAddress: int = 0
 var bootstrapCtPanicSizeAddress: int = 0
+// Where the slice leaves the name of the function whose trap or abort stopped a call (ct_jit.ab, bootstrapCtMarkStopSites).
+var bootstrapCtStopSiteAddress: int = 0
 var bootstrapCtGenerationSpent: string = ""
 var bootstrapCtCurrentLive: bool = false
 var bootstrapCtCurrent: BootstrapEvaluator = BootstrapEvaluator(
@@ -165,6 +170,30 @@ trusted fun bootstrapCtPanicMessage(): string {
     bytes.toText()
 }
 
+// How a call stopped by a trap (2) or an abort (1) is told, with the function it was in when the slice recorded it:
+// " in churn". The slice's names are the backend's, with a module's prefix (__abla_module_<hex>__) left out.
+trusted fun bootstrapCtStopWhat(how: int): string {
+    val what = if (how == 2) "a runtime check failed" else "the code aborted"
+    if (bootstrapCtStopSiteAddress == 0) return what
+    val name = ablaUnsafeLoadI64(nativePointerFromAddress(bootstrapCtStopSiteAddress))
+    if (name == 0) return what
+    val bytes = byteBuffer()
+    var index = 0
+    while (index < 512) {
+        val byte = ablaUnsafeLoadU8(ablaUnsafePointerOffset(nativePointerFromAddress(name), index))
+        if (byte == 0) break
+        bytes.appendByteValue(byte)
+        index = index + 1
+    }
+    var text = bytes.toText()
+    if (text.startsWith("__abla_module_")) {
+        var at = 14
+        while (at + 1 < text.size && !(text[at] == 95 && text[at + 1] == 95)) at = at + 1
+        if (at + 2 < text.size) text = text.slice(at + 2, text.size)
+    }
+    "$what in `$text`"
+}
+
 // A native call that stopped, reported as the interpreter reports the same failure:
 // a panic with its code and text (bootstrapEvalRuntimePanic), placed at the site.
 fun bootstrapCtReportStop(var evaluator: BootstrapEvaluator, site: BootstrapCtSite,
@@ -200,7 +229,7 @@ fun bootstrapCtReportStop(var evaluator: BootstrapEvaluator, site: BootstrapCtSi
     } else {
         evaluator.recordEvaluatorDiagnostic(
             "E_CT_STOPPED",
-            "compile-time evaluation at $label stopped: a runtime check failed or the code aborted"
+            "compile-time evaluation at $label stopped: ${bootstrapCtStopWhat(how)}"
         )
         evaluator.errors = evaluator.errors + 1
     }
@@ -576,6 +605,14 @@ trusted fun bootstrapCtCall(entry: int, label: string = ""): BootstrapCtCallResu
     // The process's threads before the call (Linux and macOS; -1 elsewhere), to tell whether a stop leaves any the
     // call started still running.
     val threadsBefore = bootstrapCtThreadCount()
+    // A generation that can start threads: their thread-locals are emulated by the compiler's own
+    // `__emutls_get_address` (src/emutls_export.ab), which takes each thread's table and copies from the compiler's
+    // heap. That heap's lock must be live before the first of them exists, as `ablac run` makes it before a program's
+    // main (abla/llvm/orc, llvmOrcCallMain): without it two threads starting together allocated from the heap at once,
+    // and could be given overlapping blocks for their root-frame cells. The build then stopped at random under load
+    // ("a runtime check failed" in the root-frame unlink, or a bad access; thread-heap-mutex in the parity sample).
+    // Once on, the lock stays on (as a program's does after its first thread).
+    if (bootstrapCtGenerationThreads) runtimeMemoryEnableSharing()
     // The guard writes how the call stopped here (0: it returned).
     val stopped = nativeI64Cell(0)
     val limit = bootstrapCtTimeLimitSeconds()
@@ -650,7 +687,7 @@ trusted fun bootstrapCtStopBesideThreads(threadsBefore: int, how: int, label: st
     val reason = if (how == 5 && bootstrapCtPanicMessage() != "") "panicked: ${bootstrapCtPanicMessage()}"
         else if (how == 3) "ran past the time limit"
         else if (how == 4) "made a bad memory access"
-        else "stopped: a runtime check failed or the code aborted"
+        else "stopped: ${bootstrapCtStopWhat(how)}"
     val site = if (label == "") "" else " at $label"
     linuxWriteStandardError(
         "error[E_CT_STOPPED]: compile-time evaluation$site $reason, while $running thread(s) it started still " +

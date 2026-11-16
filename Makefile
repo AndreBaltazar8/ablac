@@ -109,6 +109,7 @@ test-serial: ablac
 	tools/test-process-exec-strings.sh $(COMPILER)
 	tools/test-gc-stress-io.sh $(COMPILER)
 	tools/test-ct-stop-threads.sh $(COMPILER)
+	tools/test-ct-threads-heap.sh $(COMPILER)
 	tools/test-ct-interp-runtime.sh $(COMPILER)
 	tools/test-ct-time-limit.sh $(COMPILER)
 	tools/test-libc-jump-routines.sh $(COMPILER)

@@ -1755,6 +1755,9 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string,
         val written = dumped.writeText("${dump.value}/generation-$generation.ll")
         dumped.closed = true
     }
+    // Whether the generation can start threads (its runtime creates them with pthread_create): ct_eval.ab enables the
+    // compiler heap's lock before calling into it.
+    bootstrapCtGenerationThreads = !pointerIsNull(LLVMGetNamedFunction(module, "pthread_create"))
     val added = bootstrapCtSessionState.addModule(context, module, llvmPassesFast())
     if (added.status != 0) {
         bootstrapCtFailReady("ORC rejected the slice (status ${added.status})")
@@ -1782,6 +1785,7 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string,
         bootstrapCtPanicTextAddress = bootstrapCtLookup("abla_ct_panic_text_$generation")
         bootstrapCtPanicSizeAddress = bootstrapCtLookup("abla_ct_panic_size_$generation")
     }
+    bootstrapCtStopSiteAddress = bootstrapCtLookup("abla_ct_stop_site_$generation")
     bootstrapCtGenerationSpent = ""
     if (bootstrapCtFreeAddress == 0 || bootstrapCtGuardAddress == 0) {
         bootstrapCtFailReady("the slice's support entries are missing")
@@ -1849,6 +1853,33 @@ fun bootstrapCtSetEnvironment(context: i64*, module: i64*, grants: int): void {
 // so the compiler reports the failure and goes on. The generation is spent
 // afterwards: frames the jump skipped never popped their collector roots, so no
 // later entry may run on it.
+private noescape extern:"c" fun LLVMGetInstructionParent(instruction: i64*): i64*
+
+// Before each call of `callee` (llvm.trap, abort) the name of the function it is in goes to `site`, so a stop names
+// where it happened: "a runtime check failed in churn" rather than only that something did. A call in a function of
+// the guard itself (the catchers) is left alone. Racing threads store names of their own: the stop names the last.
+fun bootstrapCtMarkStopSites(builder: i64*, callee: i64*, site: i64*): void {
+    val names: Map<string, i64*> = Map()
+    var use = LLVMGetFirstUse(callee)
+    while (!pointerIsNull(use)) {
+        val user = LLVMGetUser(use)
+        use = LLVMGetNextUse(use)
+        if (pointerIsNull(LLVMIsACallInst(user))) continue
+        val function = LLVMGetBasicBlockParent(LLVMGetInstructionParent(user))
+        val name = bootstrapLlvmDebugValueName(function)
+        if (name == "" || name.startsWith("abla.ct.")) continue
+        LLVMPositionBuilderBefore(builder, user)
+        val known = names.get(name)
+        val text = if (known != null) known else {
+            val made = LLVMBuildGlobalStringPtr(builder, name, "abla.ct.site.name")
+            names.set(name, made)
+            made
+        }
+        LLVMBuildStore(builder, text, site)
+    }
+    return
+}
+
 fun bootstrapCtInstallGuard(context: i64*, module: i64*, generation: int): bool {
     val builder = LLVMCreateBuilderInContext(context)
     val voidType = LLVMVoidTypeInContext(context)
@@ -1891,6 +1922,9 @@ fun bootstrapCtInstallGuard(context: i64*, module: i64*, generation: int): bool 
     val pending = LLVMAddGlobal(module, i32Type, "abla.ct.pending")
     LLVMSetInitializer(pending, LLVMConstInt(i32Type, 0, 0))
     LLVMSetLinkage(pending, llvmInternalLinkage())
+    // The function whose trap or abort stopped the call (bootstrapCtMarkStopSites), read by the report (ct_eval.ab).
+    val stopSite = LLVMAddGlobal(module, pointer, "abla_ct_stop_site_$generation")
+    LLVMSetInitializer(stopSite, LLVMConstNull(pointer))
     val selfType = LLVMFunctionType(i64Type, nativeNullPointer(), 0, 0)
     var pthreadSelf = LLVMGetNamedFunction(module, "pthread_self")
     if (pointerIsNull(pthreadSelf)) pthreadSelf = LLVMAddFunction(module, "pthread_self", selfType)
@@ -1950,6 +1984,7 @@ fun bootstrapCtInstallGuard(context: i64*, module: i64*, generation: int): bool 
         val trapType = LLVMGlobalGetValueType(trap)
         val catcher = LLVMAddFunction(module, "abla.ct.trap", trapType)
         LLVMSetLinkage(catcher, llvmInternalLinkage())
+        bootstrapCtMarkStopSites(builder, trap, stopSite)
         LLVMReplaceAllUsesWith(trap, catcher)
         val entry = LLVMAppendBasicBlockInContext(context, catcher, "entry")
         val back = LLVMAppendBasicBlockInContext(context, catcher, "back")
@@ -1973,6 +2008,7 @@ fun bootstrapCtInstallGuard(context: i64*, module: i64*, generation: int): bool 
         val abortType = LLVMGlobalGetValueType(abort)
         val catcher = LLVMAddFunction(module, "abla.ct.abort", abortType)
         LLVMSetLinkage(catcher, llvmInternalLinkage())
+        bootstrapCtMarkStopSites(builder, abort, stopSite)
         LLVMReplaceAllUsesWith(abort, catcher)
         val entry = LLVMAppendBasicBlockInContext(context, catcher, "entry")
         val back = LLVMAppendBasicBlockInContext(context, catcher, "back")
@@ -2064,6 +2100,7 @@ fun bootstrapCtInstallGuard(context: i64*, module: i64*, generation: int): bool 
     LLVMBuildStore(builder,
         LLVMBuildCall2(builder, selfType, pthreadSelf, nativeNullPointer(), 0, "guard.self"), guardThread)
     LLVMBuildStore(builder, LLVMConstInt(i32Type, 0, 0), pending)
+    LLVMBuildStore(builder, LLVMConstNull(pointer), stopSite)
     LLVMBuildStore(builder, LLVMConstInt(i1, 1, 0), armed)
     val entryType = LLVMFunctionType(i64Type, nativeNullPointer(), 0, 0)
     val reply = LLVMBuildCall2(
@@ -2177,6 +2214,7 @@ fun bootstrapCtFinishPass(): void {
     bootstrapCtFunctions = bootstrapCtNoFunctions()
     bootstrapCtPanicTextAddress = 0
     bootstrapCtPanicSizeAddress = 0
+    bootstrapCtStopSiteAddress = 0
     // (No fresh array where there is nothing to drop: inside a region it would not
     // outlive it.)
     if (bootstrapCtSites.size > 0) bootstrapCtSites = []
