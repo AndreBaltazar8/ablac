@@ -966,6 +966,11 @@ a value is no part of any global's heap, whatever it was computed from.
 - `ABLA_COMPILE_EVAL_TRACE=1` prints, per site, whether it ran natively or why
   it did not; `ABLA_COMPILE_EVAL_DUMP=<directory>` keeps each slice's LLVM
   module.
+- A slice of up to 700 functions (the usual one) is optimized with the `--o1`
+  pipeline, a larger one (a TLS stack) with the fast one: code that works hard
+  runs several times faster optimized and a small slice pays about 15% more
+  code generation for it, a large one twice that. `ABLA_COMPILE_EVAL_PASSES=fast|balanced`
+  chooses for every slice.
 
 ## Diagnostics
 

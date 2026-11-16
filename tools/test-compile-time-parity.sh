@@ -73,7 +73,8 @@
 # case reports is the process it runs in, which under `#` is the compiler; or
 # the case keeps real-time deadlines the interpreter can't meet) | same-panic (the program panics at run time and
 # its `#` evaluation stops with the same panic: E_CT_PANIC, or the evaluator's
-# own code for it, with the same message).
+# own code for it, with the same message; or the compiler itself dies of that panic
+# when the native slice runs out of memory: "panic: out of memory ...").
 set -uo pipefail
 
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -424,6 +425,9 @@ run_mode() { # kind name source mode
                     panic=$(sed -n 's/^panic: //p' "$dir/runtime.program.err" | head -1)
                     staged_panic=$(sed -E -n 's/^error\[(E_CT_PANIC|E_EVAL_OUT_OF_BOUNDS|E_EVAL_DIVISION_BY_ZERO)\]: //p' \
                         "$dir/staged.err" | head -1)
+                    # Native code that runs out of memory takes the compiler down with the program's own panic (the slice
+                    # is the program's code in the compiler's process): the compiler's last words are the panic.
+                    [[ -n $staged_panic ]] || staged_panic=$(sed -n 's/^panic: //p' "$dir/staged.err" | head -1)
                     if [[ -n $panic && $panic == "$staged_panic" ]]; then
                         status=same-panic
                         detail="panics at run time and under \`#\`: $panic"
