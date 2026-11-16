@@ -46,12 +46,13 @@ compare_case() {
     fi
 }
 
-# Every case using the compiler API, parser extensions or compile grants.
+# Every case using the compiler API, parser extensions or compile grants. (Not capabilities/ambient.ab: the compile-time clock and
+# random number it embeds differ from one evaluation to the next.)
 cases=()
 while IFS= read -r source; do
     cases+=("$source")
 done < <(grep -rlE 'import "abla/compiler|compilerGrant|compileCapabilities' \
-    tests/cases --include='*.ab' | sort)
+    tests/cases --include='*.ab' | grep -v '^tests/cases/capabilities/ambient\.ab$' | sort)
 (( ${#cases[@]} >= 40 ))
 # The cases are independent: CT_BRIDGE_JOBS of them at a time (default: the
 # number of CPUs); xargs exits nonzero when any of them mismatches.
