@@ -1098,12 +1098,62 @@ fun bootstrapCtOwnableReason(
     val type = bootstrapCtOrdinaryTypeIn(declarations, declaration)
     if (type == "") return "its type is not written out"
     if (type == "void" || type == "null") return "of type $type"
+    // A global whose value may hold resources (abla/tls/pure's `pureTlsHandleTable: array<TlsConnection>`) isn't
+    // handed back, and needn't be: the interpreter keeps no such value between evaluations (a resource is acquired
+    // and released by the code that runs). Like a TVar it is the generation's for the pass (bootstrapCtUnexchanged),
+    // so neither a value native code can't describe nor a closure in it stops it, unless this pass edits
+    // declarations: a native closure made before an edit would run the edited body.
+    val holdsResource = bootstrapCtMayHoldResource(declarations, type)
     val typeReason = bootstrapLiftTypeReasonIn(declarations, type)
-    if (typeReason != "") return "of type $type, which native code cannot hand back: $typeReason"
-    if (bootstrapCtStateMayHoldClosure(declarations, type)) return "of type $type, which may hold a closure"
+    if (typeReason != "" && !holdsResource) return "of type $type, which native code cannot hand back: $typeReason"
+    if ((!holdsResource || edits) && bootstrapCtStateMayHoldClosure(declarations, type))
+        return "of type $type, which may hold a closure"
     val kept = bootstrapCompileGlobalLoad(bootstrapCompileGlobalKey(declaration), declarations, [])
     if (kept.kind != "invalid") return "an earlier evaluation kept a value of it"
     ""
+}
+
+// Whether a value of `type` may hold an instance of a resource class (directly, in an array, map, nullable or shared
+// wrapper, or in a field of a class it holds), or of a resource interface.
+fun bootstrapCtMayHoldResource(declarations: array<BootstrapDeclaration>, type: string, depth: int = 0): bool {
+    if (depth > 6) return false
+    val normalized = bootstrapNormalizeType(type)
+    var begin = 0
+    var index = 0
+    while (index <= normalized.size) {
+        val byte = if (index < normalized.size) normalized[index] else 32
+        val word = (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) ||
+            byte == 95
+        if (!word) {
+            if (index > begin) {
+                val name = normalized.slice(begin, index)
+                for (declaration in declarations) {
+                    if (declaration.name == name && (declaration.kind == "class" || declaration.kind == "interface")) {
+                        if (declaration.isResource) return true
+                        if (declaration.kind == "class") {
+                            for (field in declaration.parameterTypes) {
+                                if (bootstrapCtMayHoldResource(declarations, field, depth + 1)) return true
+                            }
+                        }
+                    }
+                }
+            }
+            begin = index + 1
+        }
+        index = index + 1
+    }
+    false
+}
+
+// An owned global that stays the generation's alone for the pass: a TVar delegate, or a global whose value holds
+// resources. The interpreter keeps neither between evaluations, so nothing goes back to the journal after a native
+// call (the others do: bootstrapCtExchangeGlobals).
+fun bootstrapCtUnexchanged(declarations: array<BootstrapDeclaration>, index: int): bool {
+    val declaration = declarations[index]
+    if (bootstrapCtTVarDelegate(declaration)) return true
+    if (bootstrapCtDelegateKind(declaration) != "") return false
+    val type = bootstrapCtOrdinaryTypeIn(declarations, declaration)
+    type != "" && bootstrapCtMayHoldResource(declarations, type)
 }
 
 // A `compile var` of a settable type whose name no other declaration has: a value
@@ -1492,8 +1542,9 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string,
                 bootstrapCtStateHas(state.reached[siteIndex], ownedIndex)) reachedByNative = true
             siteIndex = siteIndex + 1
         }
-        if (ownable[ownedIndex] && reachedByNative && bootstrapCtTVarDelegate(parsed.declarations[ownedIndex])) {
-            bootstrapCtNote("ordinary global ${parsed.declarations[ownedIndex].name} (a TVar) is native for this pass")
+        if (ownable[ownedIndex] && reachedByNative && bootstrapCtUnexchanged(parsed.declarations, ownedIndex)) {
+            val what = if (bootstrapCtTVarDelegate(parsed.declarations[ownedIndex])) "a TVar" else "it holds resources"
+            bootstrapCtNote("ordinary global ${parsed.declarations[ownedIndex].name} ($what) is native for this pass")
         } else if (ownable[ownedIndex] && reachedByNative) {
             var known = false
             for (existing in bootstrapCtGlobals) {
