@@ -197,6 +197,18 @@ mmap form) apply there.
   running worker is abandoned. Measured (ablac-74's request): the compiler's own build 52.2 s against 54.2 s, binary
   +0.39%, object +0.52%; NovaKind's signer (`--fast`) about +1.5% build time, binary +0.15%, object +0.19%.
 
+- [ ] **A child's first collection after a raw fork waits 20 ms for its parent's threads, then is abandoned (#811;
+  2026-11-16, ablac-4e).** After the `fork` system call (an AArch64 Linux program's only fork) the child's registry
+  still lists the parent's other threads until the next heap call repairs it (`__ablaRuntimeHostForkRepair`, through the
+  wiped fork page), so a collection that is the child's first act (`tests/cases/fork-heap/syscall.ab`) starts a stop,
+  waits the full 20 ms for threads that are not there and is abandoned: 20 ms a fork, 300 abandoned stops in that
+  test, 5.5 s alone and 25 s on 2 CPUs beside two busy loops (`ABLA_GC_TRACE=1` shows them); the test now forks 100
+  times. Measured: a fork check at the start of `__ablaRuntimeHostStwStop` removes the wait, but then the child really
+  collects the whole inherited heap (about 300 ms each; the 300-fork run took 92 s of CPU and hit the CPU limit), where
+  the abandoned stop skipped it, so that is not the fix. Idea to try: repair the registry without collecting (a check
+  at the start of `__ablaRuntimePlatformMemoryCollect` that runs the repair and returns 0 once), so the child's next
+  stop is a real one only when allocation pressure asks for it.
+
 - [x] **A hosted shared library collects under allocation pressure by default (#811).** An export-only module used to be
   manual by default, so a long-lived `.so`, dylib or Android library never collected unless something called
   `memorySetCollectionGrowth`; `bootstrapLlvmNeedsCollector` now makes a hosted shared library (`bootstrapIrExportRuntime`)
