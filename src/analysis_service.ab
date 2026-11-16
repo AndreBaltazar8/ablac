@@ -758,7 +758,14 @@ class BootstrapAnalysisOccurrenceTarget(val identity: string, val type: string)
 class BootstrapAnalysisOccurrenceIndex(
     val resolved: Map<string, BootstrapAnalysisOccurrenceTarget>,
     val calls: Map<string, array<BootstrapTypedCall>>,
-    val handles: array<string>
+    val handles: array<string>,
+    // The type declarations (class, interface, enum, type) by the name written in the source, the id of the one declaration of that
+    // name in the program ("" when two declare it): sema records a name where it looks a value up, and a type is written as text, so
+    // a type's uses (`s: Square`, `Square(2)`, `: Shape`) are named from here.
+    val types: Map<string, string> = Map(),
+    // Each top-level declaration by its module and the name written in the source (`<module path>#<name>`), "" when two of a module
+    // declare it (overloads): what `geo.area` names when `geo` is an `import "…" as geo` of that module.
+    val members: Map<string, string> = Map()
 )
 
 /** The key of a name occurrence in the index: the source by a short id (not its path, which each of the index's million
@@ -790,7 +797,29 @@ fun bootstrapAnalysisOccurrenceIndex(
         if (previous != null) previous.append(call)
         else calls.set(call.sourceIdentity, [call])
     }
-    BootstrapAnalysisOccurrenceIndex(resolved, calls, handles)
+    val types: Map<string, string> = Map()
+    val members: Map<string, string> = Map()
+    for (index in 0 until declarations.size) {
+        val declaration = declarations[index]
+        // The name as written: a module imported under an alias has its names carry the module's prefix.
+        val written = bootstrapCanonicalDeclarationSourceName(declaration.name)
+        val memberKey = "${declaration.sourceIdentity}#$written"
+        val member = members.get(memberKey)
+        members.set(memberKey, if (member == null) handles[index] else "")
+        val kind = declaration.kind
+        if (kind == "class" || kind == "interface" || kind == "enum" || kind == "type") {
+            val known = types.get(written)
+            types.set(written, if (known == null) handles[index] else "")
+        }
+    }
+    BootstrapAnalysisOccurrenceIndex(resolved, calls, handles, types, members)
+}
+
+/** A type parameter's name: `T:Shape&Named` (a bound) is `T`. */
+fun bootstrapAnalysisTypeParameterName(text: string): string {
+    var end = 0
+    while (end < text.size && text[end] != 58) end = end + 1
+    text.slice(0, end)
 }
 
 // Index call candidates against token positions once, visiting only tokens in
@@ -896,6 +925,23 @@ fun bootstrapAnalysisOccurrenceSet(
     val semanticIndex = if (occurrenceIndex != null) occurrenceIndex
         else bootstrapAnalysisOccurrenceIndex(declarations, semantic)
     val callAt = bootstrapAnalysisCallTokens(source, sourceIdentity, tokens, semanticIndex)
+    // The modules this one imports under an alias, by alias: `geo.area` is the `area` of the module `geo` names.
+    val aliasTargets: Map<string, string> = Map()
+    val scan = bootstrapScanImports(source)
+    for (edge in scan.edges) {
+        if (!edge.provider && edge.alias != "") {
+            aliasTargets.set(edge.alias, bootstrapImportAliasExposedTarget(
+                bootstrapResolveImport(sourceIdentity, edge.source)))
+        }
+    }
+    // A type parameter (`T`) is not the type of that name, if the program has one.
+    val typeParameters: Map<string, bool> = Map()
+    for (found in parsed.declarations) {
+        for (parameter in found.typeParameters) typeParameters.set(bootstrapAnalysisTypeParameterName(parameter), true)
+        for (member in found.methods) {
+            for (parameter in member.typeParameters) typeParameters.set(bootstrapAnalysisTypeParameterName(parameter), true)
+        }
+    }
     var index = 0
     while (index < tokens.size) {
         val token = tokens[index]
@@ -917,6 +963,22 @@ fun bootstrapAnalysisOccurrenceSet(
                 if (call != null) {
                     declarationId = call.identity
                     resolvedType = call.type
+                }
+            }
+            if (declarationId == "") {
+                if (index > 0 && tokens[index - 1].kind == BOOTSTRAP_TOKEN_DOT) {
+                    // `geo.area`, `geo.Square`: a member of the module `geo` is an alias of.
+                    if (index > 1 && tokens[index - 2].kind == BOOTSTRAP_TOKEN_IDENTIFIER) {
+                        val target = aliasTargets.get(bootstrapTokenText(source, tokens[index - 2]))
+                        if (target != null) {
+                            val member = semanticIndex.members.get("$target#$name")
+                            if (member != null) declarationId = member
+                        }
+                    }
+                } else if (typeParameters.get(name) == null) {
+                    // A type written as text: `s: Square`, `Square(2)`, `: Shape`.
+                    val known = semanticIndex.types.get(name)
+                    if (known != null) declarationId = known
                 }
             }
             if (declarationId != "") {

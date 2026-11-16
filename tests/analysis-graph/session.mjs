@@ -287,6 +287,93 @@ async function queries() {
     await legacy.close();
 }
 
+// A type is written as text (`s: Square`, `Square(2)`, `: Shape`) and a module imported under an alias is written as a qualifier (`geo.area`):
+// both name the declaration they mean, so find-references on a class finds its uses and a rename of an aliased function is not missing its uses.
+async function typeNames(mode) {
+    const shapes = [
+        'class Square(val side: int) {',
+        '    fun grow(): Square = Square(side + 1)',
+        '}',
+        'interface Shape { fun sides(): int }',
+        'fun area(s: Square): int = s.side * s.side',
+        'val unit = 1',
+        'private class Twin(val v: int)',
+        'fun twinShapes(): int = Twin(1).v',
+        '',
+    ].join('\n');
+    const util = [
+        'class Plain(val n: int)',
+        'class Holder(val Plain: int)',
+        'class Item(val n: int)',
+        'fun makePlain(): Plain = Plain(1)',
+        'fun usePlain(p: Plain): int = p.n',
+        'fun <Item> pass(x: Item): Item = x',
+        'private class Twin(val v: int)',
+        'fun twinUtil(): int = Twin(2).v',
+        '',
+    ].join('\n');
+    const main = [
+        'import "shapes.ab" as geo',
+        'import "util.ab"',
+        'fun main: int {',
+        '    val s: geo.Square = geo.Square(2)',
+        '    val p: Plain = makePlain()',
+        '    return geo.area(s.grow()) + geo.unit + usePlain(p) + Plain(3).n + Holder(4).Plain + pass(5) + twinShapes() + twinUtil()',
+        '}',
+        '',
+    ].join('\n');
+    const p = fixture(`type-names-${mode}`, { 'main.ab': main, 'shapes.ab': shapes, 'util.ab': util });
+    const s = await start(p, { mode });
+    const a = await s.analyze();
+    const main_ = doc(a, path.join(p, 'main.ab'));
+    const shapes_ = doc(a, path.join(p, 'shapes.ab'));
+    const util_ = doc(a, path.join(p, 'util.ab'));
+    const symbol = (d, name, kind) => d.symbols.find((x) => x.name === name && (!kind || x.kind === kind));
+    const square = symbol(shapes_, 'Square', 'class');
+    const shape = symbol(shapes_, 'Shape', 'interface');
+    const area = symbol(shapes_, 'area');
+    const unit = symbol(shapes_, 'unit');
+    const plain = symbol(util_, 'Plain', 'class');
+    const item = symbol(util_, 'Item', 'class');
+    for (const x of [square, shape, area, unit, plain, item]) assert.ok(x, 'a declaration the fixture needs');
+    const before = (d, o) => d.text.slice(Math.max(0, o.range.start - 1), o.range.start);
+    const ids = (d, name) => occurrence(d, name).map((o) => [before(d, o), o.declarationId]);
+    // the class's uses in its own module: the return type, the constructor call, the parameter type of `area`
+    assert.deepEqual(ids(shapes_, 'Square').map(([, id]) => id), [square.id, square.id, square.id, square.id]);
+    // from another module, through the alias: the type annotation and the constructor call
+    assert.deepEqual(ids(main_, 'Square'), [['.', square.id], ['.', square.id]]);
+    // a function and a value through the alias
+    assert.deepEqual(ids(main_, 'area'), [['.', area.id]]);
+    assert.deepEqual(ids(main_, 'unit'), [['.', unit.id]]);
+    // a plain import: the annotation and the constructor call name the class; a field spelled like the class (`.Plain`) is the field's
+    const plainUses = occurrence(main_, 'Plain');
+    assert.equal(plainUses.length, 3);
+    assert.deepEqual(plainUses.filter((o) => before(main_, o) !== '.').map((o) => o.declarationId), [plain.id, plain.id]);
+    assert.notEqual(plainUses.find((o) => before(main_, o) === '.').declarationId, plain.id);
+    // a type parameter (`<Item>`, `x: Item`, `: Item`) is not the class of that name
+    const itemUses = occurrence(util_, 'Item');
+    assert.equal(itemUses.length, 4);
+    assert.equal(itemUses.filter((o) => o.declarationId === item.id).length, 1, 'only the class declaration names the class Item');
+    // two modules' private classes of one name are not told apart by name: unnamed, not guessed
+    for (const d of [shapes_, util_]) {
+        const twins = occurrence(d, 'Twin').filter((o) => !d.symbols.some((x) => x.name === 'Twin' && x.selectionRange.start === o.range.start));
+        assert.ok(twins.length > 0);
+        for (const o of twins) assert.equal(o.declarationId, undefined, 'an ambiguous name is left unnamed');
+    }
+    // find-references on the class: its declaration and every use, in both modules
+    const at = (d, o) => ({ uri: d.uri, offset: o.range.start });
+    const classReferences = (await s.rpc('query/references', { ...at(shapes_, occurrence(shapes_, 'Square')[0]) })).result.value;
+    const starts = (list) => list.map((r) => `${r.uri.split('/').pop()}:${r.range.start}`).sort();
+    assert.equal(classReferences.length, 6, `references of Square: ${starts(classReferences)}`);
+    // a rename of an aliased function is an edit of every reference of its declaration: the use through the alias is in it
+    const areaReferences = (await s.rpc('query/references', at(shapes_, occurrence(shapes_, 'area')[0]))).result.value;
+    assert.deepEqual(starts(areaReferences), [`main.ab:${occurrence(main_, 'area')[0].range.start}`, `shapes.ab:${occurrence(shapes_, 'area')[0].range.start}`].sort());
+    // and from the use, hover and definition find the declaration
+    const use = at(main_, occurrence(main_, 'area')[0]);
+    assert.equal((await s.rpc('query/definition', use)).result.value.uri, shapes_.uri);
+    await s.close();
+}
+
 async function projections() {
     let p = fixture('projections', { 'main.ab': '// café 😀\nimport "dep.ab"\nfun main: int = answer()\n', 'dep.ab': 'fun answer: int = 42\n' });
     let s = await start(p);
@@ -619,7 +706,7 @@ async function since() {
     await legacy.close();
 }
 
-const tests = { since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
+const tests = { type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
 const filter = process.env.ANALYSIS_TEST_FILTER ? process.env.ANALYSIS_TEST_FILTER.split(',') : null;
 for (const [name, test] of Object.entries(tests)) {
     if (filter && !filter.includes(name)) continue;

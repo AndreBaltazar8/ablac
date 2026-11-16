@@ -32,6 +32,14 @@ than merging unrelated programs into one namespace. This first profile is the
 native hosted runtime graph, not a cross-target project configuration service.
 
 Snapshots retain `revision`, `documents`, symbols, occurrences and diagnostics.
+
+An occurrence names the declaration it means (`declarationId`) in three ways: sema records the names it looks a value up by (functions, methods,
+fields, locals, variables); a type written as text (`s: Square`, `Square(2)`, `: Shape`, `Box<Item>`) names the one class, interface, enum or
+type of that name in the program (two declarations of one name, such as two modules' private classes, are told apart by neither, so both stay
+unnamed, and a type parameter of the same name is not the type); and a name qualified by the alias of an `import "…" as geo` (`geo.area`,
+`geo.Square`) names the declaration of that name in the module the alias imports (an overloaded name stays unnamed). A client that renames or
+finds references therefore sees every use of a class or of an aliased function; an occurrence that stays unnamed is one the service could not
+tell, and a client must not guess it.
 Additional fields are `analysisMode`, `entry`, `complete` and `pending`.
 A scope error uses `issues` and an empty document list. Ranges are UTF-8 byte
 offsets in the returned original source, including UTF-8 comments and source
