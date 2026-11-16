@@ -1,0 +1,215 @@
+// Waiting for files to change, with no libc: inotify on Linux (system calls 294 inotify_init1, 254 inotify_add_watch,
+// 7 poll), kqueue on macOS (BSD 362 kqueue, 363 kevent, 5 open with O_EVTONLY). `fileEvents(paths)` watches each file
+// and the directory holding it (an editor that saves through a temporary file and a rename replaces the file the
+// watch was on). `wait(milliseconds)` returns true once something that may have changed one of the files happened,
+// false when the time ran out. It may also return true for a write that left a file as it was, or (on macOS) for
+// another file of the same directory: a caller that needs to know compares the contents. Elsewhere `fileEvents` gives
+// a watch whose `active()` is false and whose `wait` only sleeps.
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+import "abla/sys/linux"
+import "abla/text"
+
+private noescape extern:"intrinsic" fun ablaHostIsMacOS(): bool
+private noescape extern:"intrinsic" fun ablaHostIsIOS(): bool
+private noescape extern:"intrinsic" fun ablaSimdTargetArch(): int
+private trusted noescape extern:"intrinsic" fun ablaDarwinSyscall(
+    number: int,
+    argument0: int,
+    argument1: int,
+    argument2: int,
+    argument3: int,
+    argument4: int,
+    argument5: int
+): int
+
+// The directory part of a path ("." for a bare name) and its last component.
+fun fileWatchDirectory(path: string): string {
+    val slash = path.lastIndexOf("/")
+    if (slash < 0) "." else if (slash == 0) "/" else path.slice(0, slash)
+}
+
+fun fileWatchName(path: string): string {
+    val slash = path.lastIndexOf("/")
+    if (slash < 0) path else path.slice(slash + 1, path.size)
+}
+
+// `descriptor` is the inotify or kqueue descriptor (-1: none). On Linux `watches` holds each directory's watch
+// number, `directories` its path; on macOS `handles` holds the open descriptors (the directories', then the files').
+class FileEvents(
+    var descriptor: int,
+    val paths: array<string>,
+    val directories: array<string>,
+    var watches: array<int>,
+    var handles: array<int>
+) {
+    fun active(): bool = descriptor >= 0
+
+    // Closes the descriptors (a watch is not closed by itself: close it when done with it).
+    fun close(): void {
+        fileWatchCloseHandles(this.handles)
+        if (this.descriptor >= 0) fileWatchClose(this.descriptor)
+        this.descriptor = -1
+        this.handles = []
+        return
+    }
+}
+
+private fun fileWatchSupported(): bool =
+    !ablaHostIsIOS() && (ablaHostIsMacOS() || ablaSimdTargetArch() == 1 || ablaSimdTargetArch() == 2)
+
+private trusted fun fileWatchClose(descriptor: int): void {
+    if (ablaHostIsMacOS()) ablaDarwinSyscall(6, descriptor, 0, 0, 0, 0, 0) else linuxSyscall1(3, descriptor)
+    return
+}
+
+private fun fileWatchCloseHandles(handles: array<int>): void {
+    for (handle in handles) if (handle >= 0) fileWatchClose(handle)
+    return
+}
+
+private fun fileWatchUnique(values: array<string>): array<string> {
+    val unique: array<string> = []
+    for (value in values) {
+        var seen = false
+        for (kept in unique) if (kept == value) seen = true
+        if (!seen) unique.append(value)
+    }
+    unique
+}
+
+trusted fun fileEvents(paths: array<string>): FileEvents {
+    val all: array<string> = []
+    for (path in paths) all.append(fileWatchDirectory(path))
+    val directories = fileWatchUnique(all)
+    if (!fileWatchSupported()) return FileEvents(-1, paths, directories, [], [])
+    if (ablaHostIsMacOS()) {
+        val queue = ablaDarwinSyscall(362, 0, 0, 0, 0, 0, 0)
+        if (queue < 0) return FileEvents(-1, paths, directories, [], [])
+        val watch = FileEvents(queue, paths, directories, [], [])
+        watch.darwinArm()
+        return watch
+    }
+    // IN_NONBLOCK | IN_CLOEXEC
+    val queue = linuxSyscall1(294, 2048 | 524288)
+    if (queue < 0) return FileEvents(-1, paths, directories, [], [])
+    val watches: array<int> = []
+    // IN_MODIFY 2, IN_CLOSE_WRITE 8, IN_MOVED_TO 128, IN_CREATE 256, IN_DELETE 512
+    for (directory in directories) {
+        watches.append(linuxSyscall3(254, queue, nativeCStringAddress(directory), 2 | 8 | 128 | 256 | 512))
+    }
+    FileEvents(queue, paths, directories, watches, [])
+}
+
+// macOS: a vnode filter (EVFILT_VNODE -4) on each directory and each file, opened for events only (O_EVTONLY
+// 0x8000), with EV_ADD | EV_CLEAR (1 | 0x20) and NOTE_DELETE 1 | NOTE_WRITE 2 | NOTE_EXTEND 4 | NOTE_RENAME 0x20.
+// Called again after an event: a file replaced by a rename is a new file to open.
+private trusted fun FileEvents.darwinArm(): void {
+    fileWatchCloseHandles(this.handles)
+    val targets: array<string> = []
+    for (directory in this.directories) targets.append(directory)
+    for (path in this.paths) targets.append(path)
+    val handles: array<int> = []
+    val change = nativeByteBuffer(32)
+    for (target in targets) {
+        val handle = ablaDarwinSyscall(5, nativeCStringAddress(target), 32768, 0, 0, 0, 0)
+        handles.append(handle)
+        if (handle >= 0) {
+            change.storeI64(0, handle)
+            // filter -4 as an int16 (0xfffc), flags 0x21 as a uint16, fflags 0x27 as a uint32: one 64-bit word
+            change.storeI64(8, 65532 | (33 << 16) | (39 << 32))
+            change.storeI64(16, 0)
+            change.storeI64(24, 0)
+            ablaDarwinSyscall(363, this.descriptor, nativePointerAddress(change.pointerAt(0)), 1, 0, 0, 0)
+        }
+    }
+    change.close()
+    this.handles = handles
+    return
+}
+
+// True once a change may have happened to one of the files, false when `milliseconds` passed without one.
+trusted fun FileEvents.wait(milliseconds: int): bool {
+    if (this.descriptor < 0) {
+        if (milliseconds > 0) {
+            val time = nativeByteBuffer(16)
+            time.storeI64(0, milliseconds / 1000)
+            time.storeI64(8, (milliseconds % 1000) * 1000000)
+            linuxSyscall2(35, nativePointerAddress(time.pointerAt(0)), 0)
+            time.close()
+        }
+        return false
+    }
+    if (ablaHostIsMacOS()) return this.darwinWait(milliseconds)
+    val poll = nativeByteBuffer(8)
+    // struct pollfd: fd (int32), events POLLIN 1 (int16), revents (int16)
+    poll.storeI64(0, this.descriptor + 4294967296)
+    val ready = linuxSyscall3(7, nativePointerAddress(poll.pointerAt(0)), 1, milliseconds)
+    poll.close()
+    if (ready <= 0) return false
+    fileWatchLinuxDrain(this)
+}
+
+// Reads every queued inotify event; true when one names a watched file (or a watch went away: its directory was
+// removed or moved, so the files may be anywhere).
+private trusted fun fileWatchLinuxDrain(watch: FileEvents): bool {
+    val capacity = 16384
+    val buffer = nativeByteBuffer(capacity)
+    var relevant = false
+    var reading = true
+    while (reading) {
+        val count = linuxSyscall3(0, watch.descriptor, nativePointerAddress(buffer.pointerAt(0)), capacity)
+        if (count <= 0) reading = false
+        else {
+            var offset = 0
+            while (offset + 16 <= count) {
+                val number = buffer.loadI64(offset) & 4294967295
+                val mask = (buffer.loadI64(offset) >> 32) & 4294967295
+                val length = (buffer.loadI64(offset + 8) >> 32) & 4294967295
+                // IN_IGNORED 0x8000, IN_Q_OVERFLOW 0x4000
+                if ((mask & (32768 | 16384)) != 0) relevant = true
+                var end = 0
+                while (end < length && buffer.load(offset + 16 + end) != 0) end += 1
+                var index = 0
+                while (index < watch.watches.size) {
+                    if (watch.watches[index] == number) {
+                        for (path in watch.paths) {
+                            if (fileWatchDirectory(path) == watch.directories[index] &&
+                                fileWatchNameIs(buffer, offset + 16, end, fileWatchName(path))) {
+                                relevant = true
+                            }
+                        }
+                    }
+                    index += 1
+                }
+                offset = offset + 16 + length
+            }
+        }
+    }
+    buffer.close()
+    relevant
+}
+
+// Whether the `length` bytes at `offset` are `name`.
+private trusted fun fileWatchNameIs(buffer: NativeByteBuffer, offset: int, length: int, name: string): bool {
+    if (length != name.size) return false
+    var index = 0
+    while (index < length) {
+        if (buffer.load(offset + index) != name[index]) return false
+        index += 1
+    }
+    true
+}
+
+private trusted fun FileEvents.darwinWait(milliseconds: int): bool {
+    val events = nativeByteBuffer(32 * 16 + 16)
+    val time = 32 * 16
+    events.storeI64(time, milliseconds / 1000)
+    events.storeI64(time + 8, (milliseconds % 1000) * 1000000)
+    val count = ablaDarwinSyscall(363, this.descriptor, 0, 0, nativePointerAddress(events.pointerAt(0)), 16,
+        nativePointerAddress(events.pointerAt(time)))
+    events.close()
+    if (count <= 0) return false
+    this.darwinArm()
+    true
+}

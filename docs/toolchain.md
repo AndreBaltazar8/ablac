@@ -24,7 +24,7 @@ ablac build app.ab -o build/app
 ablac build app.ab -o build/app --fast
 ablac build app.ab -o build/app --fast --no-cache
 ablac build app.ab -o build/app -g        # debug information in a release build
-ablac run app.ab -- arguments  # compiled in process (--o1 IR pipeline) and called there, live on x86-64 Linux (--no-live)
+ablac run app.ab -- arguments  # compiled in process (--o1 IR pipeline) and called there, live on x86-64 Linux (--no-live; --watch reloads on a save)
 ablac run --built app.ab   # built (--o1, cached) and exec'd
 ablac test tests/*.ab      # build and run test programs (abla/test)
 ablac fmt --check src/     # check layout without writing (formatter.md)
@@ -450,6 +450,17 @@ A program that no longer compiles is `failed` with `E_LIVE_COMPILE` (the diagnos
 that cannot be loaded is `E_LIVE_LINK`. `ABLA_LIVE_TRACE` (any value) prints how many functions go through the
 table; `ABLA_LIVE_DUMP=<dir>` writes each compiled body per generation as `<generation>-<name>.ll`.
 Only x86-64 Linux has been tested. What is built and what is not: [the design](design/live-jit.md).
+
+`ablac run --watch` is a live run that reloads by itself: when one of the program's own source files changes, the
+same reload runs and its outcome goes to stderr as one line, `ablac run --watch: applied: <functions>`, a refusal
+with its code, or `E_LIVE_COMPILE` after the diagnostics. A refused reload, or a save that does not compile, keeps
+the program running its code, and the next good save is applied. The program's `main` runs on a thread of its own,
+and the compiler's thread waits for the files to change (`abla/fs/watch`: inotify on Linux, kqueue on macOS,
+through system calls, no libc). It lets a burst of writes settle (an editor saves in several steps: a quiet 120 ms,
+at most about 3 s) and reloads only when a file's contents changed. Only the files the module graph read are
+watched, not the standard library, the cache or output directories, and the list follows each reload (an added
+import is watched from then on). `--watch` implies `--live`; it does not go with `--built`, `--release` or
+`--no-live`. `tools/test-live-watch.sh` edits a running program and saves a broken file.
 
 ## Compiler diagnostics
 

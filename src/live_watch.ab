@@ -1,0 +1,94 @@
+// `ablac run --watch` (docs/design/live-jit.md): a live run whose program is reloaded when one of its own source files
+// changes. The program's `main` runs on a thread of its own (llvmOrcCallMainWatched); this thread waits for file events
+// (abla/fs/watch: inotify on Linux, kqueue on macOS, no libc), lets a burst of writes settle (an editor saves in several
+// steps), checks that a file's contents changed, and calls the reload `liveReload()` calls (one at a time: a reload the
+// program asks for meanwhile is refused as busy). A refusal or a program that does not compile leaves the running code
+// as it was; the outcome is printed on standard error. Only the program's own files are watched (not the standard
+// library, the build cache or the output directories), as the module graph read them; the list follows each reload.
+import "abla/fs"
+import "abla/fs/watch"
+import "abla/io"
+import "abla/text"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+import "abla/sys/linux"
+import "abla/sys/linux/io"
+import "live_reload.ab"
+
+
+
+// Waiting this long for a first event, then until the files are quiet this long, at most `settleRounds` times.
+val bootstrapLiveWatchWaitMilliseconds = 250
+val bootstrapLiveWatchQuietMilliseconds = 120
+val bootstrapLiveWatchSettleRounds = 25
+
+fun bootstrapLiveSamePaths(first: array<string>, second: array<string>): bool {
+    if (first.size != second.size) return false
+    var index = 0
+    while (index < first.size) {
+        if (first[index] != second[index]) return false
+        index = index + 1
+    }
+    true
+}
+
+// The watch of a `--watch` run, on the thread that waits (the compiler's own): the files, their events and their
+// contents as last compiled.
+var bootstrapLiveWatchedPaths: array<string> = []
+var bootstrapLiveWatchEvents = FileEvents(-1, [], [], [], [])
+var bootstrapLiveWatchContents = watchFiles([])
+
+fun bootstrapLiveWatchOpen(): void {
+    bootstrapLiveWatchEvents.close()
+    val paths = bootstrapLiveWatchPaths
+    val files: array<Path> = []
+    for (item in paths) files.append(Path(item))
+    bootstrapLiveWatchedPaths = paths
+    bootstrapLiveWatchEvents = fileEvents(paths)
+    bootstrapLiveWatchContents = watchFiles(files)
+    return
+}
+
+fun bootstrapLiveWatchClose(): void {
+    bootstrapLiveWatchEvents.close()
+    return
+}
+
+// One round of the watch: waits for an event; once the files are quiet and one of them changed, reloads.
+trusted fun bootstrapLiveWatchStep(): void {
+    if (!bootstrapLiveWatchEvents.wait(bootstrapLiveWatchWaitMilliseconds)) {
+        // macOS gives no events for a file whose directory could not be opened, and a platform without a watch
+        // only sleeps: comparing the contents now and then still sees a save.
+        if (bootstrapLiveWatchEvents.active()) return
+    } else {
+        var rounds = 0
+        while (rounds < bootstrapLiveWatchSettleRounds &&
+            bootstrapLiveWatchEvents.wait(bootstrapLiveWatchQuietMilliseconds)) {
+            rounds = rounds + 1
+        }
+    }
+    if (!bootstrapLiveWatchContents.changed()) return
+    bootstrapLiveWatchContents.refresh()
+    val capacity = 65536
+    val buffer = nativeByteBuffer(capacity)
+    buffer.storeI64(0, 0)
+    val status = bootstrapLiveReloadEntry(nativePointerAddress(buffer.pointerAt(0)), capacity)
+    var length = buffer.loadI64(0)
+    if (length < 0) length = 0
+    if (length > capacity - 8) length = capacity - 8
+    var message = ""
+    if (length > 0) {
+        val address = ablaUnsafePointerAddress(ablaUnsafeAllocate(length + 1))
+        ablaUnsafeCopyMemory(address, ablaUnsafePointerAddress(buffer.pointerAt(8)), length)
+        ablaUnsafeStoreU8(nativePointerFromAddress(address + length), 0)
+        message = adoptNativeString(address, length)
+    }
+    buffer.close()
+    val outcome = if (status == 0) message
+        else if (status == 2) "$message; the program keeps running its code"
+        else "refused, the program keeps running its code: $message"
+    linuxPrintStandardError("ablac run --watch: ${outcome.trim()}\n")
+    // An import added or removed: watch the files the reload read.
+    if (!bootstrapLiveSamePaths(bootstrapLiveWatchedPaths, bootstrapLiveWatchPaths)) bootstrapLiveWatchOpen()
+    return
+}

@@ -611,6 +611,51 @@ trusted fun llvmOrcCallMain(address: int, program: string, arguments: array<stri
     // The program may run threads of its own, whose thread-locals (emulated on macOS: abla/runtime/emutls) allocate from
     // this process's heap: its lock must be live before the first of them exists.
     runtimeMemoryEnableSharing()
+    var block = llvmOrcMainBlock(program, arguments)
+    val status = ablaUnsafeCallExact_I32_I32_Pointer(address, arguments.size + 1, block.address)
+    block.close()
+    status
+}
+
+// `main`'s address, its argument count and the address of its argv block, for the thread that runs it.
+resource class LlvmOrcMainCall(val address: int, val count: int, val vector: int)
+
+// Whether `main` returned, set by the thread that ran it.
+resource class LlvmOrcMainDone(var done: bool)
+
+private fun llvmOrcMarkDone(var state: LlvmOrcMainDone): bool {
+    state.done = true
+    true
+}
+
+private fun llvmOrcIsDone(var state: LlvmOrcMainDone): bool = state.done
+
+private trusted fun llvmOrcRunMainCall(call: Shared<LlvmOrcMainCall>, done: Mutex<LlvmOrcMainDone>): int {
+    val target = call.get()
+    val status = ablaUnsafeCallExact_I32_I32_Pointer(target.address, target.count,
+        nativePointerFromAddress(target.vector))
+    done.with(llvmOrcMarkDone)
+    status
+}
+
+// As llvmOrcCallMain, with `main` on a thread of its own: this thread calls `step` again and again while `main`
+// runs (each call should block for a short while, as a wait for an event with a timeout does) and returns `main`'s
+// result once it returns. `ablac run --watch` waits for source changes in `step`.
+trusted fun llvmOrcCallMainWatched(address: int, program: string, arguments: array<string>, step: () -> void): int {
+    runtimeMemoryEnableSharing()
+    var block = llvmOrcMainBlock(program, arguments)
+    val call = Shared(LlvmOrcMainCall(address, arguments.size + 1, nativePointerAddress(block.address)))
+    val done = Mutex(LlvmOrcMainDone(false))
+    val running = done.clone()
+    val runner = thread { llvmOrcRunMainCall(call, running) }
+    while (!done.with(llvmOrcIsDone)) step()
+    val status = await runner
+    block.close()
+    status
+}
+
+// The argv block: [program, arguments…, NULL], then the host's envp and NULL, then the argument strings.
+private trusted fun llvmOrcMainBlock(program: string, arguments: array<string>): NativeByteBuffer {
     val argc = arguments.size + 1
     val environment = linuxEnvironmentPointer()
     var environmentCount = 0
@@ -646,9 +691,7 @@ trusted fun llvmOrcCallMain(address: int, program: string, arguments: array<stri
         entry = entry + 1
     }
     block.storePointer((argc + 1 + environmentCount) * 8, nativeNullPointer())
-    val status = ablaUnsafeCallExact_I32_I32_Pointer(address, argc, block.address)
-    block.close()
-    status
+    block
 }
 
 // Returns the JIT-compiled program's main result. Infrastructure failures use

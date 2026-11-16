@@ -78,6 +78,7 @@ expect_status_42 "$output_directory/uuid"
 # Exercise the Darwin openat/no-follow and descriptor-relative filesystem shims.
 "$project_root/tools/test-open-nofollow.sh" "$compiler"
 "$project_root/tools/test-secure-fs.sh" "$compiler"
+"$project_root/tools/test-fs-watch.sh" "$compiler"
 "$project_root/tools/test-xtensa-companion-offline.sh" "$compiler"
 "$project_root/tools/test-xtensa-catalog.sh" "$compiler"
 "$project_root/tools/test-compiler-capture-process.sh" "$compiler"

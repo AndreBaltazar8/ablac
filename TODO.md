@@ -1057,8 +1057,10 @@ mmap form) apply there.
   `liveReload()` redefining the changed ones, refusals that name what changed (signature, layout,
   unchanged code that would compile differently), object-cached live runs, and lambda edits
   (stage 3: an edited lambda is matched to the running one, so closures made before take its new
-  body; new lambdas reach code that was not redefined through a registry). Open: live mode as
-  `run`'s default or opt-in (by its measured cost), freeing old generations, `--watch`.
+  body; new lambdas reach code that was not redefined through a registry). Done since: live by default on an
+  x86-64 Linux host (decision #65, `--no-live` opts out), and `run --watch` (`src/live_watch.ab`: reloads when one
+  of the program's own source files changes, inotify or kqueue, the outcome on stderr; kqueue not yet run on a Mac).
+  Open: freeing old generations.
 
 - [x] **Transactional memory: clocks beyond the region.** A logged transaction runs the single-clock
   protocol on its first region's clock and keeps a snapshot per clock only once it touches a second region

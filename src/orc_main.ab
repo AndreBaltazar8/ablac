@@ -31,6 +31,7 @@ import "darwin_fork_export.ab"
 import "backend/llvm/live.ab"
 import "backend/llvm/core.ab"
 import "live_reload.ab"
+import "live_watch.ab"
 import "abla/text"
 
 // The guarded compiler launcher already supplies its process memory budget.
@@ -119,7 +120,8 @@ fun bootstrapRunInProcess(
     sourcePath: string,
     arguments: array<string> = [],
     passes: string = "",
-    live: bool = false
+    live: bool = false,
+    watch: bool = false
 ): int {
     // A live run (`--live`, live.ab) is another object (its calls go through the table), and a reload
     // needs the compiler's record of the program as built: a cached one keeps it beside the object.
@@ -137,6 +139,7 @@ fun bootstrapRunInProcess(
             if (lookup.status == 0) {
                 entry = lookup.address
                 if (live) bootstrapLiveBegin(session, sourcePath, passes)
+                if (watch) bootstrapLiveWatchPaths = bootstrapLiveOwnPaths(jitRunRecordedPaths(key))
             } else {
                 // An object the JIT cannot link is compiled afresh.
                 val removed = generation.remove()
@@ -149,6 +152,7 @@ fun bootstrapRunInProcess(
         bootstrapLlvmLiveRun = live
         val prepared = bootstrapPrepareRun(sourcePath, true)
         bootstrapLlvmLiveRun = enclosingLive
+        if (watch) bootstrapLiveWatchPaths = bootstrapLiveOwnPaths(prepared.sourcePaths)
         if (live && linuxEnvironment("ABLA_LIVE_TRACE").found) {
             linuxPrintStandardError("live: ${bootstrapLlvmLiveCount} functions through the table\n")
         }
@@ -190,7 +194,11 @@ fun bootstrapRunInProcess(
     if (status == 0) {
         val frame = ctBridgeRunFrameBegin(sourcePath)
         session.installThreadEnd()
-        status = llvmOrcCallMain(entry, sourcePath, arguments)
+        if (watch) {
+            bootstrapLiveWatchOpen()
+            status = llvmOrcCallMainWatched(entry, sourcePath, arguments, { bootstrapLiveWatchStep() })
+            bootstrapLiveWatchClose()
+        } else status = llvmOrcCallMain(entry, sourcePath, arguments)
         ctBridgeRunFrameEnd(frame)
     }
     val removeStatus = generation.remove()
@@ -1049,7 +1057,7 @@ fun bootstrapRepl(): int {
 
 fun bootstrapOrcUsage(): int {
     linuxPrintStandardError(
-        "usage: ablac build [<file.ab> | --project <dir>] [-o output] [--emit executable|object|static-library|shared-library] [--fast | --o1] [-g | --debug | --no-debug] [--no-cache] [--sidecar | --no-sidecar] [--offline] [--strict-imports | --strict-imports=warn] [--visibility-report <file>] [--target <name> | --target-triple <triple> --object-format <elf|macho|coff|wasm>]\n       targets: ${bootstrapSupportedTargets()}\n       ablac package update [--project <dir>]\n       ablac package vendor [--project <dir>] [--offline]\n       ablac test <file.ab>... [--fast] [--no-cache] # build (--o1) and run test programs (abla/test)\n       ablac run [--o1 | --fast] [--built | --release] [--live | --no-live] [<file.ab> | --project <dir>] [--offline] [-- <program arguments>] # in-process LLVM ORC (--built: cached build, exec'd; live, its functions redefinable while it runs, by default on x86-64 Linux: --no-live opts out, --live asks elsewhere)\n       ablac repl                                # persistent definitions + expressions\n       ablac serve [<file.ab> | --project <dir>] # watched fast-build service\n       ablac fmt [--check] [--width 100] <file.ab|directory|->...\n       ablac analyze --stdio                     # persistent JSON-lines analysis service\n       ablac --emit-llvm <file.ab>\n"
+        "usage: ablac build [<file.ab> | --project <dir>] [-o output] [--emit executable|object|static-library|shared-library] [--fast | --o1] [-g | --debug | --no-debug] [--no-cache] [--sidecar | --no-sidecar] [--offline] [--strict-imports | --strict-imports=warn] [--visibility-report <file>] [--target <name> | --target-triple <triple> --object-format <elf|macho|coff|wasm>]\n       targets: ${bootstrapSupportedTargets()}\n       ablac package update [--project <dir>]\n       ablac package vendor [--project <dir>] [--offline]\n       ablac test <file.ab>... [--fast] [--no-cache] # build (--o1) and run test programs (abla/test)\n       ablac run [--o1 | --fast] [--built | --release] [--live | --no-live | --watch] [<file.ab> | --project <dir>] [--offline] [-- <program arguments>] # in-process LLVM ORC (--built: cached build, exec'd; live, its functions redefinable while it runs, by default on x86-64 Linux: --no-live opts out, --live asks elsewhere; --watch: live, reloaded when a source file changes)\n       ablac repl                                # persistent definitions + expressions\n       ablac serve [<file.ab> | --project <dir>] # watched fast-build service\n       ablac fmt [--check] [--width 100] <file.ab|directory|->...\n       ablac analyze --stdio                     # persistent JSON-lines analysis service\n       ablac --emit-llvm <file.ab>\n"
     )
     2
 }
@@ -1424,6 +1432,8 @@ fun main: int {
         // Live (live.ab) by default where it is supported, an x86-64 Linux host (decision #65); --no-live opts out and
         // --live asks for it anywhere.
         var runLive = bootstrapLiveRunSupported()
+        // --watch: live, and reloaded when one of the program's own source files changes (live_watch.ab).
+        var runWatch = false
         val runOptions: array<string> = []
         scan = 1
         while (scan < runCount) {
@@ -1436,6 +1446,10 @@ fun main: int {
             } else if (option == "--built") runBuilt = true
             else if (option == "--live") runLive = true
             else if (option == "--no-live") runLive = false
+            else if (option == "--watch") {
+                runWatch = true
+                runLive = true
+            }
             else if (option == "--jit") runBuilt = false
             else if (option == "--cache-dir" && scan + 1 < runCount) {
                 scan = scan + 1
@@ -1488,11 +1502,17 @@ fun main: int {
                 }
             }
         }
+        if (runValid && runWatch && (runBuilt || !runLive)) {
+            linuxPrintStandardError("ablac run: --watch reloads a live in-process run; it does not go with --built, --release or --no-live\n")
+            runValid = false
+            status = 2
+        }
         if (runValid && !runBuilt) {
             status = bootstrapRunInProcess(
                 runSource, runArguments,
                 if (runProfile == "fast") llvmPassesFast() else llvmPassesBalanced(),
-                runLive
+                runLive,
+                runWatch
             )
         } else if (runValid) {
             status = bootstrapRunBuilt(runSource, runArguments, runProfile)

@@ -12,7 +12,8 @@ the table is what exists. For using it, see "Live run" in [the toolchain interfa
 | 2b | A reload is refused when unchanged code would compile differently, or a signature or class layout changed | built (f9f311f4): `E_LIVE_SIGNATURE`, `E_LIVE_LAYOUT`, `E_LIVE_CALLER`, `E_LIVE_GLOBAL` |
 | 2c | Only data and the table's functions are shared between generations; a live run is object-cached with the compiler's record beside the object (`<object>.live`) | built (f89ff893) |
 | 3 | Lambdas: a changed or added lambda is refused today (`E_LIVE_LAMBDA`) | not built |
-| - | `liveDefine(path)`, `--watch`, `E_LIVE_REMOVED`, `E_LIVE_SUMMARY` | not built; what a removed function does has not been defined |
+| - | `--watch`: a reload when one of the program's own source files changes (inotify, kqueue), printed on stderr | built (`src/live_watch.ab`, `tools/test-live-watch.sh`) |
+| - | `liveDefine(path)`, `E_LIVE_REMOVED`, `E_LIVE_SUMMARY` | not built; what a removed function does has not been defined |
 | - | Platforms | tested on x86-64 Linux only |
 
 Decision taken for question 1 below: live mode is **opt-in** (`--live`); without it nothing changes and no table is built.
@@ -66,7 +67,7 @@ Decision taken for question 1 below: live mode is **opt-in** (`--live`); without
   resolved by the process search generator that already serves `__emutls_get_address`.
   `liveReload` blocks the calling thread while it compiles; other threads keep running the old
   code.
-- `--watch` (reload when a file changes) can come later, on top of this.
+- `--watch` reloads when a file changes, on top of this: `main` on a thread of its own, the compiler's thread waiting for file events and calling the same reload (`src/live_watch.ab`).
 - The compiler keeps the program as it was loaded:
   - its frontend result;
   - the per-function fingerprints (the `fp1`/`fp2` hashes in the wrapper names);
