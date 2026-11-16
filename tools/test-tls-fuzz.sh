@@ -32,3 +32,16 @@ else
     echo "tls-fuzz: FAILED" >&2
     exit 1
 fi
+# The slow check itself (CPU time, not wall time): a run made slow by 3.5 s of burnt CPU is a finding, one made slow by waiting 3.5 s
+# (a loaded machine looks like that) is not.
+if "$root/tools/run-limited.sh" "$out/fuzz" "$out/certs" 1 1 --inject-cpu > "$out/inject-cpu.log" 2>&1 || ! grep -q 'FINDING (slow: ' "$out/inject-cpu.log"; then
+    cat "$out/inject-cpu.log" >&2
+    echo "tls-fuzz: a run that burnt 3.5 s of CPU was not reported as slow" >&2
+    exit 1
+fi
+if ! "$root/tools/run-limited.sh" "$out/fuzz" "$out/certs" 1 1 --inject-sleep > "$out/inject-sleep.log" 2>&1 || grep -q 'FINDING (slow: ' "$out/inject-sleep.log"; then
+    cat "$out/inject-sleep.log" >&2
+    echo "tls-fuzz: a run that only waited 3.5 s was reported as slow" >&2
+    exit 1
+fi
+echo "tls-fuzz: the slow check counts CPU time (3.5 s burnt: a finding; 3.5 s waited: none)"

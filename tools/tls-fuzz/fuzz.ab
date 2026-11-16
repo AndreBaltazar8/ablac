@@ -18,13 +18,16 @@
 //              consistent                                                         must not connect
 // A finding is: a harmful mutation after which both sides connect and exchange data, a harmless one after which they
 // do not, a run that takes too long (quadratic cost), or a crash (a panic ends the program: the seed is printed
-// before each run with --verbose). Usage: fuzz <certificate directory> <first seed> <count> [--verbose]
+// before each run with --verbose). "Too long" is CPU time (getrusage), not wall time: a loaded machine makes a run slow without it being so.
+// Usage: fuzz <certificate directory> <first seed> <count> [--verbose|--inject-cpu|--inject-sleep] (the last two make every run slow on
+// purpose, by burning 3.5 s of CPU or by sleeping 3.5 s, to test the check: the first must be a finding, the second must not).
 // The directory holds ed25519/p256/rsa .pem and .key (CN and SAN localhost).
 import "abla/io"
 import "abla/crypto"
 import "abla/crypto/x509"
 import "abla/integer"
 import "abla/process/arguments"
+import "abla/process/metrics"
 import "abla/sys/linux"
 import "abla/sys/linux/process"
 import "abla/tls/pure/client"
@@ -415,8 +418,26 @@ fun intercept(data: string, fromClient: bool, var wire: Wire, var plan: Plan): a
     pieces
 }
 
-class Outcome(val clientConnected: bool, val serverConnected: bool, val dataOk: bool, val milliseconds: int,
+// `milliseconds` is wall-clock time, `cpuMilliseconds` the CPU time this process spent (user + system; the fuzzer is one thread): only the
+// CPU time says a run was slow, wall time on a loaded machine says the machine was.
+class Outcome(val clientConnected: bool, val serverConnected: bool, val dataOk: bool, val milliseconds: int, val cpuMilliseconds: int,
     val clientError: string, val serverError: string)
+
+/** The CPU time of this process so far, in microseconds (user + system). */
+fun cpuMicroseconds(): int {
+    val usage = processCpuMicroseconds()
+    usage[0] + usage[1]
+}
+
+/** A test of the slow check (--inject-cpu, --inject-sleep): a run made slow on purpose, by burning CPU or by waiting. */
+var injectSlow = ""
+
+fun burn(milliseconds: int): void {
+    val deadline = cpuMicroseconds() + milliseconds * 1000
+    var spin = 0
+    while (cpuMicroseconds() < deadline) spin = spin + 1
+    return
+}
 
 fun runOne(seed: int, kinds: array<Kind>, var plan: Plan): Outcome {
     tlsState = seed * 7919 + 17
@@ -436,6 +457,9 @@ fun runOne(seed: int, kinds: array<Kind>, var plan: Plan): Outcome {
     if (plan.clientCertificate) client.useIdentity(kinds[0].identity)
     var wire = Wire(0, false, false, null, !plan.tls12)
     val started = linuxMonotonicMilliseconds()
+    val cpuStarted = cpuMicroseconds()
+    if (injectSlow == "cpu") burn(3500)
+    if (injectSlow == "sleep") linuxSleep(3500)
     var rounds = 0
     while (rounds < 60) {
         val toServer = client.takeOutput()
@@ -455,7 +479,7 @@ fun runOne(seed: int, kinds: array<Kind>, var plan: Plan): Outcome {
         client.feed(server.takeOutput())
         dataOk = got == message && client.takeApplicationData() == message + "!"
     }
-    Outcome(client.connected(), server.connected(), dataOk, linuxMonotonicMilliseconds() - started, client.error,
+    Outcome(client.connected(), server.connected(), dataOk, linuxMonotonicMilliseconds() - started, (cpuMicroseconds() - cpuStarted) / 1000, client.error,
         server.error)
 }
 
@@ -478,6 +502,8 @@ fun main: int {
     val count = processArgument(2).parseInt()
     if (first == null || count == null) return 2
     val verbose = processArgumentCount() > 3 && processArgument(3) == "--verbose"
+    if (processArgumentCount() > 3 && processArgument(3) == "--inject-cpu") injectSlow = "cpu"
+    if (processArgumentCount() > 3 && processArgument(3) == "--inject-sleep") injectSlow = "sleep"
     val kinds = [loadKind(directory, "ed25519"), loadKind(directory, "p256"), loadKind(directory, "rsa")]
     for (kind in kinds) {
         if (!kind.identity.ok()) {
@@ -495,8 +521,8 @@ fun main: int {
         var plan = planFor(seed, kinds.size)
         if (verbose) eprintln("seed $seed: ${plan.mutation} at ${plan.target} ${kinds[plan.kind].name} 1.2=${plan.tls12} hrr=${plan.retry}")
         val outcome = runOne(seed, kinds, plan)
-        if (outcome.milliseconds > slowest) {
-            slowest = outcome.milliseconds
+        if (outcome.cpuMilliseconds > slowest) {
+            slowest = outcome.cpuMilliseconds
             slowestSeed = seed
         }
         val both = outcome.clientConnected && outcome.serverConnected && outcome.dataOk
@@ -529,12 +555,12 @@ fun main: int {
             // it is done); noted for review in verbose mode.
             if (verbose) println("note: one side connected: $what")
         }
-        if (outcome.milliseconds > 3000) {
+        if (outcome.cpuMilliseconds > 3000) {
             findings = findings + 1
-            println("FINDING (slow: ${outcome.milliseconds} ms) $what")
+            println("FINDING (slow: ${outcome.cpuMilliseconds} ms of CPU, ${outcome.milliseconds} ms wall) $what")
         }
     }
     println("fuzz: seeds $first..${first + count - 1}: $accepted connected, $refused refused, $notApplicable unmutated, " +
-        "$findings findings, slowest $slowest ms (seed $slowestSeed)")
+        "$findings findings, slowest $slowest ms of CPU (seed $slowestSeed)")
     if (findings == 0) 0 else 1
 }
