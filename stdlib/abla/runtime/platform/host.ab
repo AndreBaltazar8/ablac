@@ -806,23 +806,19 @@ trusted fun __ablaRuntimeHostHeapAllocate(size: int, zero: bool): int {
     block
 }
 
-trusted fun __ablaRuntimeHostHeapFree(address: int): void {
+// Free with the heap's lock held by the caller (a batch of frees takes it once): the body of __ablaRuntimeHostHeapFree.
+trusted fun __ablaRuntimeHostHeapFreeLocked(address: int): void {
     if (address == 0) return
     val header = ablaRuntimeLoadI64(address - 8)
     if ((header & 2) != 0) {
         val length = header & -4096
-        val shared = __ablaRuntimeHostHeapShared
-        if (shared) __ablaRuntimeHostHeapAcquire()
         val kept = __ablaRuntimeHostHeapCachePut(address - 16, length)
-        if (shared) __ablaRuntimeHostHeapLetGo()
         if (!kept) __ablaRuntimeHostHeapUnmap(address - 16, length)
         return
     }
     val sizeClass = (header >> 40) & 255
     if (sizeClass >= __ablaRuntimeHostHeapClasses) ablaRuntimeTrap()
     val state = __ablaRuntimeHostHeapState()
-    val shared = __ablaRuntimeHostHeapShared
-    if (shared) __ablaRuntimeHostHeapAcquire()
     val head = state + sizeClass * 8
     ablaRuntimeStoreI64(address, ablaRuntimeLoadI64(head))
     ablaRuntimeStoreI64(head, address)
@@ -832,6 +828,24 @@ trusted fun __ablaRuntimeHostHeapFree(address: int): void {
     if (__ablaRuntimeHostHeapParked >= __ablaRuntimeHostHeapTrigger) {
         __ablaRuntimeHostHeapConsolidate()
     }
+    return
+}
+
+trusted fun __ablaRuntimeHostHeapFree(address: int): void {
+    if (address == 0) return
+    val shared = __ablaRuntimeHostHeapShared
+    val header = ablaRuntimeLoadI64(address - 8)
+    if ((header & 2) != 0) {
+        // A mapping of its own: kept in the cache under the lock, unmapped outside it.
+        val length = header & -4096
+        if (shared) __ablaRuntimeHostHeapAcquire()
+        val kept = __ablaRuntimeHostHeapCachePut(address - 16, length)
+        if (shared) __ablaRuntimeHostHeapLetGo()
+        if (!kept) __ablaRuntimeHostHeapUnmap(address - 16, length)
+        return
+    }
+    if (shared) __ablaRuntimeHostHeapAcquire()
+    __ablaRuntimeHostHeapFreeLocked(address)
     if (shared) __ablaRuntimeHostHeapLetGo()
     return
 }
@@ -3184,14 +3198,28 @@ trusted fun __ablaRuntimePlatformMemorySetBackgroundFree(enabled: bool): void {
 // Frees every block of a batch, then its chunks: the helper's entry (C ABI, through
 // nativeFunctionAddress), or the collection itself when no helper could start.
 trusted fun __ablaRuntimeHostFreeWorker(batch: int): int {
+    // The native heap's lock is taken once per run of frees, not once per block: a helper that took it for each of a
+    // collection's millions of blocks fought the program's own allocation for it,
+    // about 10% more CPU time and wall time in the compile-time interpreter. The program waits for at most one run.
+    val locked = __ablaRuntimeHostHeapNative() && __ablaRuntimeHostHeapShared
     var chunk = batch
     while (chunk != 0) {
         val count = ablaRuntimeLoadI64(chunk + 8)
         var index = 0
         while (index < count) {
-            __ablaRuntimeHostFree(ablaRuntimePointerFromAddress(ablaRuntimeLoadI64(chunk + 16 +
-                index * 8)))
-            index = index + 1
+            if (locked) {
+                val run = if (count - index > 256) index + 256 else count
+                __ablaRuntimeHostHeapAcquire()
+                while (index < run) {
+                    __ablaRuntimeHostHeapFreeLocked(ablaRuntimeLoadI64(chunk + 16 + index * 8))
+                    index = index + 1
+                }
+                __ablaRuntimeHostHeapLetGo()
+            } else {
+                __ablaRuntimeHostFree(ablaRuntimePointerFromAddress(ablaRuntimeLoadI64(chunk + 16 +
+                    index * 8)))
+                index = index + 1
+            }
         }
         val next = ablaRuntimeLoadI64(chunk)
         __ablaRuntimeHostFree(ablaRuntimePointerFromAddress(chunk))
