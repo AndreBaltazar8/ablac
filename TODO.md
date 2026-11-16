@@ -196,6 +196,15 @@ mmap form) apply there.
   (`memorySetManualCollection` without a limit or growth call) has no safe points, so an explicit collection with a
   running worker is abandoned. Measured (ablac-74's request): the compiler's own build 52.2 s against 54.2 s, binary
   +0.39%, object +0.52%; NovaKind's signer (`--fast`) about +1.5% build time, binary +0.15%, object +0.19%.
+  **Polling at every loop back edge: measured and dropped (2026-11-16).** A volatile load of a flag plus a branch to a
+  cold call at every back edge (the cheapest poll that LLVM cannot hoist; the real one reads the collection
+  threshold and the live bytes, so it costs at least this) against master `5dc81c4c`, `perf stat -e instructions:u`, one
+  P core, alternating builds, mean of 3 runs (the counts are deterministic to under 0.001%): fib +0.00%,
+  nbody -3.3%, matrix +20.2%, sieve +9.4%, trees +10.6%. The load blocks LICM, unrolling and vectorization of
+  the loop it sits in, so the cost is far over the 1% bar; nbody's drop is a different unrolling choice, not a gain.
+  A poll in a function without a frame would also need that function's live references rooted (a first try that
+  emitted the existing allocating-loop safe point in every loop made sieve and trees panic with "stack overflow").
+  A non-allocating loop therefore keeps holding up a stop until it ends.
 
 - [ ] **A child's first collection after a raw fork waits 20 ms for its parent's threads, then is abandoned (#811;
   2026-11-16, ablac-4e).** After the `fork` system call (an AArch64 Linux program's only fork) the child's registry
