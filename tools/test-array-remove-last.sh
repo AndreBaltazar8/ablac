@@ -10,7 +10,7 @@ for profile in fast o1 release; do
     flags=()
     if [[ $profile == fast ]]; then flags=(--fast); fi
     if [[ $profile == o1 ]]; then flags=(--o1); fi
-    for name in main take resource; do
+    for name in main take resource class; do
         "$compiler" build "tests/cases/array-remove-last/$name.ab" -o "$out/$name-$profile" ${flags[@]+"${flags[@]}"} --no-cache
         "$out/$name-$profile"
         ABLA_GC_STRESS=1 "$out/$name-$profile"
