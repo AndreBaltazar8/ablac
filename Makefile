@@ -238,6 +238,7 @@ test-serial: ablac
 	tools/test-string-escapes.sh $(COMPILER)
 	tools/test-string-escape-bytes.sh $(COMPILER)
 	tools/test-lexer-oddities.sh $(COMPILER)
+	tools/test-numeric-edges.sh $(COMPILER)
 	tools/test-text-blocks.sh $(COMPILER)
 	tools/test-parse-errors-stop.sh $(COMPILER)
 	tools/test-return-type-diagnostic.sh $(COMPILER)
