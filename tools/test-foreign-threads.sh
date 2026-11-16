@@ -50,4 +50,8 @@ for stress in 0 1; do
         [[ $status -eq 0 ]] || { cat "$out/threads-$stress-$count.out" >&2; fail "$count threads, GC stress $stress: status $status"; }
     done
 done
+# A thread blocked in the host's code inside an export counts as stopped for the collections of another thread (#811).
+status=0
+ABLA_GC_STRESS=1 limited "$out/driver" "$PWD/$out/$library" -b 1500 > "$out/blocked.out" 2>&1 < /dev/null || status=$?
+[[ $status -eq 0 ]] || { cat "$out/blocked.out" >&2; fail "a thread blocked in the host was not stopped for a collection ($status)"; }
 echo "foreign threads ($(uname -s)): concurrent callers of a shared library and a nested export during initialization"

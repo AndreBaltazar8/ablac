@@ -182,11 +182,13 @@ mmap form) apply there.
 
 ## Shared-library exports (#811)
 
-- [ ] **Stop-the-world collection, steps (iii) and (iv) (#811; owner ablac-4e).** Steps (i) and (ii) are in: threads register a record,
+- [ ] **Stop-the-world collection, step (iv) (#811; owner ablac-4e).** Steps (i) to (iii) are in: threads register a record,
   a collection parks the others at their next safe point (byte threshold 0) and marks every chain, on Linux for a
   program's threads and a library's callers; a thread in `join`, a standard-library system call or a blocking C call
-  counts as stopped (`tools/test-gc-threads.sh`: churn, hold, stale-claim, manual, blocked, hammer, echo). Open:
-  (iii) foreign callers blocked in the host; (iv) macOS (the stop's clock and sleep go through the Linux system call
+  counts as stopped (`tools/test-gc-threads.sh`: churn, hold, stale-claim, manual, blocked, hammer, echo), and so does a
+  thread inside a call into the host (an `@hostImport` symbol; an export it calls from there takes the thread out of the
+  stopped state until it returns: `tools/test-foreign-threads.sh`'s `-b` run).
+  Open: (iv) macOS (the stop's clock and sleep go through the Linux system call
   numbers the Darwin shim maps; nothing was run on a Mac). Limits: the runtime's own futex and mutex waits count as
   running, so a stop waits 20 ms for such a thread and gives up (counted by `memoryHeapStat(8)`); a loop that never
   allocates has no safe point and holds up every collection while it runs; a manual-collection program

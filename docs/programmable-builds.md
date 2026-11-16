@@ -217,7 +217,9 @@ function is a thunk that enters the runtime and leaves it after the body:
   long LLVM calls), counts as stopped: the compiler treats those calls as collection points, with the function's live
   values rooted across them, and brackets them with `abla_runtime_native_enter/leave`; an address taken of a string
   (`nativeStringAddress` and the like) keeps the string rooted to the end of its function. The runtime's own futex and
-  mutex waits do not count: a stop waits 20 ms for them and gives up;
+  mutex waits do not count: a stop waits 20 ms for them and gives up. A call into the host (an `@hostImport` symbol: a
+  JNI callback, a UI thread's message) counts as stopped the same way; an export the host calls from inside such a call
+  runs Abla code again, so the thread stops counting as stopped until that export returns;
 - the module globals are initialized by one caller while the others wait; an export entered again on the
   initializing thread (the library called the host, which called an export) goes on, with the globals as far as
   they are initialized;
