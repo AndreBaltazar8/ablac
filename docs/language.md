@@ -137,7 +137,7 @@ statement, so `if (found) return i` followed by `-1` on the next line returns
 
 **Integer literals** are decimal, hexadecimal (`0x2a`) or octal (`0o600`),
 with optional `_` separators (`1_000_000`, `0xFF_FF`, `0o7_55`). Octal digits
-are `0` through `7`; `8`, `9`, and an empty `0o` prefix are errors, and so is a literal larger than 18446744073709551615 (`E_PARSE_INTEGER_RANGE`; one above `9223372036854775807` is the `int` with those bits, which `u64(...)` reads as written). **Floating literals** need a fractional part or
+are `0` through `7`; `8`, `9`, and an empty `0o` or `0x` prefix are errors, and so is a literal larger than 18446744073709551615 (`E_PARSE_INTEGER_RANGE`; one above `9223372036854775807` is the `int` with those bits, which `u64(...)` reads as written). **Floating literals** need a fractional part or
 an exponent (`1.5`, `2e3`, `1.25e-2`) and have type `f64`. There are no
 character literals: `"abc"[1]` is the byte value `98`.
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Integer literals: the largest u64 and below keep their bits in every base, anything larger is E_PARSE_INTEGER_RANGE
-# (it used to wrap around silently).
+# (it used to wrap around silently), and `0x` with no digit is E_PARSE_INVALID_HEX (it used to be the integer 0).
 set -euo pipefail
 compiler=${1:-build/ablac}
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -27,4 +27,7 @@ for literal in 18446744073709551616 99999999999999999999 18_446_744_073_709_551_
     0x10000000000000000 0x1FFFFFFFFFFFFFFFF 0X1_0000_0000_0000_0000 0o2000000000000000000000 0o7777777777777777777777; do
     reject "$literal" E_PARSE_INTEGER_RANGE
 done
-echo "integer literal range: up to the largest u64 kept in every base, larger literals rejected"
+for literal in 0x 0X 0x_ 0x__; do
+    reject "$literal" E_PARSE_INVALID_HEX
+done
+echo "integer literal range: up to the largest u64 kept in every base, larger and empty hex literals rejected"
