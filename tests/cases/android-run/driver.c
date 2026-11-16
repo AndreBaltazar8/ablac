@@ -49,6 +49,12 @@ int main(int argc, char **argv) {
     void *library = dlopen(argv[1], RTLD_NOW);
     if (!library) { printf("dlopen: %s\n", dlerror()); return 3; }
     nested_function = (export_function)dlsym(library, "abla_run_nested");
+    // A library has no process environment to read ABLA_GC_STRESS and ABLA_GC_TRACE from: pass them on as calls.
+    const char *stress = getenv("ABLA_GC_STRESS"), *trace = getenv("ABLA_GC_TRACE");
+    export_function set_stress = (export_function)dlsym(library, "abla_run_stress");
+    export_function set_trace = (export_function)dlsym(library, "abla_run_trace");
+    if (trace && strcmp(trace, "1") == 0 && set_trace) set_trace(1);
+    if (stress && strcmp(stress, "1") == 0 && set_stress) set_stress(1);
     int failed = 0;
     if (strcmp(argv[2], "-b") == 0) {
         if (argc != 4) return 2;
