@@ -83,6 +83,18 @@ printf '%s\t4\t1\tmathAbs\tstdlib/abla/math/entry.ab\timport "abla/math"\n' "$ou
 grep -qF "fix-imports: 0 module(s) changed" "$output_directory/aliased.out" &&
     [[ $(grep -c '^import "abla/math"' "$output_directory/aliased/main.ab") -eq 1 ]] ||
     { echo "strict-imports: fix-imports imported an aliased module again:"; cat "$output_directory/aliased/main.ab"; exit 1; }
+# A module several programs share, whose name each program declares itself (a hook): the joined reports name a
+# different module for it in each, and importing them all would make it ambiguous; no import, and it is listed.
+mkdir -p "$output_directory/hook"
+printf 'fun shared(): int = hook()\n' > "$output_directory/hook/shared.ab"
+printf '%s\t1\t21\thook\ta.ab\timport "./a.ab"\n%s\t1\t21\thook\tb.ab\timport "./b.ab"\n' \
+    "$output_directory/hook/shared.ab" "$output_directory/hook/shared.ab" > "$output_directory/hook/report.tsv"
+"$compiler" run "$project_root/tools/fix-imports.ab" -- "$output_directory/hook/report.tsv" \
+    > "$output_directory/hook.out"
+grep -qF "fix-imports: 0 module(s) changed" "$output_directory/hook.out" &&
+    grep -qF '`hook` is declared differently by the programs that share this module' "$output_directory/hook.out" &&
+    ! grep -q '^import' "$output_directory/hook/shared.ab" ||
+    { echo "strict-imports: fix-imports imported a hook each program declares:"; cat "$output_directory/hook.out" "$output_directory/hook/shared.ab"; exit 1; }
 # The standard library is a strict package: its facades pass on what they
 # front, and a library module that uses a name it doesn't import is rejected,
 # with the library module to import (here in a copy of the sysroot).
