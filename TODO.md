@@ -472,6 +472,7 @@ mmap form) apply there.
   without freeing the caller's handle; fresh generators given to borrowing calls remain caller-owned. The drop check
   draws the Generator shapes by default again (ablac-f3-2 saw the same class as the `test-labeled-loops` segfault of
   #736's first gate).
+  Campaign of 2026-11-16 on `5dc81c4c`'s stage 1 (seeds 200000 and up, one slot hold each; no disagreement, crash or oracle failure): default 20 seeds x 24 checks in six modes; `--panics` 10 seeds; `--hosted-tasks` 10; `--shared-globals` 10; `--module-graphs` 8; `--subparser-graphs` 8; `--regex` 10 seeds x 2,000 patterns.
 
 - **Conditional method receivers (#800).** A fresh affine receiver selected by an `if`, `when`, or block is held
   until its statement ends, in native and compile-time execution. Previously it leaked on both tiers.
