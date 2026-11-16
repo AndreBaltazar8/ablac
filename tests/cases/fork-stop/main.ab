@@ -1,0 +1,61 @@
+// A fork by system call while another thread collects all the time (#811): the forking thread is in native state during
+// the call, so a collection can claim it and be in the middle of its stop at the instant of the fork. The child inherits
+// the stop and the claim, and must not wait for a collector that did not survive. Each child exits at once; the parent
+// gives each a time limit and kills one that hangs.
+import "abla/io"
+import "abla/memory"
+import "abla/process/time"
+import "abla/text"
+import "abla/runtime/self"
+import "abla/unsafe/memory/raw"
+import "abla/unsafe/native"
+import "abla/sys/linux"
+
+trusted fun stopWord(): int = nativeStaticAllocate(8)
+
+// Allocates and collects without pause: a stop every few microseconds.
+trusted fun collector(): int {
+    val stop = stopWord()
+    var rounds = 0
+    var total = 0
+    while (ablaRuntimeAtomicLoadI64(stop) == 0) {
+        val text = "round ${rounds} " + "z".repeat(rounds % 30)
+        total = total + text.size
+        memoryCollect()
+        rounds = rounds + 1
+    }
+    rounds
+}
+
+trusted fun main: int {
+    val stop = stopWord()
+    val status = nativeStaticAllocate(8)
+    val worker = thread { collector() }
+    var hung = 0
+    var forks = 0
+    while (forks < 200) {
+        val process = linuxSyscall0(57)
+        if (process == 0) linuxSyscall1(231, 0)
+        if (process < 0) return 4
+        var waited = 0
+        var waitedMilliseconds = 0
+        while (waited == 0 && waitedMilliseconds < 5000) {
+            ablaRuntimeStoreI64(status, 0)
+            waited = linuxSyscall4(61, process, status, 1, 0)
+            if (waited == 0) {
+                sleep(1)
+                waitedMilliseconds = waitedMilliseconds + 1
+            }
+        }
+        if (waited != process) {
+            hung = hung + 1
+            linuxSyscall2(62, process, 9)
+            linuxSyscall4(61, process, status, 0, 0)
+        }
+        forks = forks + 1
+    }
+    ablaRuntimeAtomicStoreI64(stop, 1)
+    val rounds = await worker
+    println("forks ${forks} hung ${hung} collections ${rounds} stops ${memoryHeapStat(7)} abandoned ${memoryHeapStat(8)}")
+    if (hung == 0) 42 else 1
+}
