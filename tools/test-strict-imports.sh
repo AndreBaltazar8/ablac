@@ -63,6 +63,17 @@ grep -qF "fix-imports: 1 module(s) changed" "$output_directory/fix.out" ||
 "$compiler" build "$output_directory/fixed/main.ab" -o "$output_directory/fixed-main" \
     --strict-imports
 runs "$output_directory/fixed-main" "81 x/y"
+# A module the file imports under an alias isn't imported again: a second, plain import of it is
+# E_IMPORT_ALIAS_TARGET_DUPLICATE.
+mkdir -p "$output_directory/aliased"
+printf 'import "abla/io"\nimport "abla/math" as m\n\nfun main: int = 42\n' > "$output_directory/aliased/main.ab"
+printf '%s\t4\t1\tmathAbs\tstdlib/abla/math/entry.ab\timport "abla/math"\n' "$output_directory/aliased/main.ab" \
+    > "$output_directory/aliased/report.tsv"
+"$compiler" run "$project_root/tools/fix-imports.ab" -- "$output_directory/aliased/report.tsv" \
+    > "$output_directory/aliased.out"
+grep -qF "fix-imports: 0 module(s) changed" "$output_directory/aliased.out" &&
+    [[ $(grep -c '^import "abla/math"' "$output_directory/aliased/main.ab") -eq 1 ]] ||
+    { echo "strict-imports: fix-imports imported an aliased module again:"; cat "$output_directory/aliased/main.ab"; exit 1; }
 # The standard library is a strict package: its facades pass on what they
 # front, and a library module that uses a name it doesn't import is rejected,
 # with the library module to import (here in a copy of the sysroot).
