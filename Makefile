@@ -475,6 +475,7 @@ test-serial: ablac
 	tools/test-generics.sh $(COMPILER)
 	tools/test-generic-ownership-origin.sh $(COMPILER)
 	tools/test-octal-literals.sh $(COMPILER)
+	tools/test-integer-literal-range.sh $(COMPILER)
 	tools/test-lazy-defaults.sh $(COMPILER)
 	tools/test-named-generic-guard.sh $(COMPILER)
 	tools/test-named-generic-default.sh $(COMPILER)

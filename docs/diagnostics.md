@@ -55,6 +55,8 @@ only its parse errors.
 | `E_PARSE_EXTENSION_RECEIVER` | an extension's receiver type isn't followed by `.name` (e.g. an unclosed `array<int`) |
 | `E_PARSE_ELVIS` | Kotlin's `?:`: Abla writes it `??` ([null-safe operators](language.md#null-safe-operators)) |
 | `E_PARSE_INVALID_ESCAPE` | an unknown backslash escape in a string, a `\x` without 2 hex digits, or a `\u` that isn't a Unicode code point ([language.md](language.md#lexical-structure)) |
+| `E_PARSE_INTEGER_RANGE` | an integer literal larger than 18446744073709551615, the largest `u64` (up to that it keeps its bits; above 9223372036854775807 it is the `int` with those bits, which `u64(...)` reads as written) ([language.md](language.md#lexical-structure)) |
+| `E_PARSE_INVALID_OCTAL` | an octal literal with an `8` or `9`, or with no digit (`0o`) |
 | `E_PARSE_ASSIGNMENT_TARGET` | the left side of `=` can't be assigned (a `?.` chain is not a place) |
 | `E_PARSE_COMPOUND_ASSIGNMENT_TARGET` | the left side of `+=` etc. contains a call ([language.md](language.md#expressions-and-operators)) |
 | `E_PARSE_TRAILING_LAMBDA_TARGET` | a trailing lambda after something that can't be called |
