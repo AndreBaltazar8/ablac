@@ -22,6 +22,25 @@ mkdir -p "$output_directory"
 cd "$project_root"
 export ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-2048}
 export ABLA_MAX_SECONDS=${ABLA_MAX_SECONDS:-120}
+# tools/test-compile-effects.sh rewrites tests/cases/capabilities/input.txt and its abla.toml while it runs, and the
+# suite runs it beside this test: one copy, taken once, is what every case's work directory sees as
+# tests/cases/capabilities, so both tiers of a case read the same files.
+capabilities_snapshot="$output_directory/capabilities"
+cp -R tests/cases/capabilities "$capabilities_snapshot"
+# Each tier's work directory: links to the project's top-level directories (tests/cases/capabilities to the snapshot),
+# made once and copied.
+work_template="$output_directory/work-template"
+mkdir -p "$work_template/tests/cases"
+for top in "$project_root"/*; do
+    [[ ${top##*/} == build || ${top##*/} == tests ]] || ln -s "$top" "$work_template/${top##*/}"
+done
+for top in "$project_root"/tests/*; do
+    [[ ${top##*/} == cases ]] || ln -s "$top" "$work_template/tests/${top##*/}"
+done
+for top in "$project_root"/tests/cases/*; do
+    if [[ ${top##*/} == capabilities ]]; then ln -s "$capabilities_snapshot" "$work_template/tests/cases/capabilities"
+    else ln -s "$top" "$work_template/tests/cases/${top##*/}"; fi
+done
 
 compare_case() {
     local source=$1
@@ -30,12 +49,30 @@ compare_case() {
     local base="$output_directory/loopback/$name"
     mkdir -p "$output_directory/loopback"
     local interp_status=0 bridge_status=0
-    ABLA_COMPILE_EVAL=interp "$project_root/tools/run-limited.sh" \
+    # Compile-time writes are real writes (#72) and --emit-llvm honours a case's compileCapabilities (#886), so a case
+    # writes its relative paths where it runs (build-fs-write/, build-host-compile/, ...), a failed one too. Each tier
+    # runs in the same fresh directory (an output naming the working directory compares equal) that links the
+    # project's top-level directories, so the tree is left as it was and one tier's files never meet the other's.
+    local work="$output_directory/work/$name"
+    fresh_work() {
+        rm -rf "$work"
+        mkdir -p "$(dirname "$work")"
+        cp -a "$work_template" "$work"
+    }
+    # A site blocked by design (tests/cases/ct-time-limit) stops at a short compile-time time limit in both tiers, with
+    # the same E_CT_TIME_LIMIT, well before the wall limit kills the compiler (whose report differs from run to run).
+    # Every other case keeps the default: a heavy one ran past a short limit in one tier only under a loaded suite.
+    local limit=${ABLA_COMPILE_EVAL_TIME_LIMIT:-}
+    [[ $source != tests/cases/ct-time-limit/* ]] || limit=10
+    fresh_work
+    (cd "$work" && env ${limit:+ABLA_COMPILE_EVAL_TIME_LIMIT=$limit} ABLA_COMPILE_EVAL=interp "$project_root/tools/run-limited.sh" \
         "$compiler" --emit-llvm "$source" \
-        > "$base.interp.ll" 2> "$base.interp.err" || interp_status=$?
-    ABLA_COMPILE_EVAL=bridge "$project_root/tools/run-limited.sh" \
+        > "$base.interp.ll" 2> "$base.interp.err") || interp_status=$?
+    fresh_work
+    (cd "$work" && env ${limit:+ABLA_COMPILE_EVAL_TIME_LIMIT=$limit} ABLA_COMPILE_EVAL=bridge "$project_root/tools/run-limited.sh" \
         "$compiler" --emit-llvm "$source" \
-        > "$base.bridge.ll" 2> "$base.bridge.err" || bridge_status=$?
+        > "$base.bridge.ll" 2> "$base.bridge.err") || bridge_status=$?
+    rm -rf "$work"
     if [[ $interp_status -ne $bridge_status ]] ||
         ! cmp -s "$base.interp.ll" "$base.bridge.ll" ||
         ! cmp -s "$base.interp.err" "$base.bridge.err"; then
@@ -56,7 +93,7 @@ done < <(grep -rlE 'import "abla/compiler|compilerGrant|compileCapabilities' \
 (( ${#cases[@]} >= 40 ))
 # The cases are independent: CT_BRIDGE_JOBS of them at a time (default: the
 # number of CPUs); xargs exits nonzero when any of them mismatches.
-export compiler project_root output_directory
+export compiler project_root output_directory work_template
 export -f compare_case
 printf '%s\0' "${cases[@]}" |
     xargs -0 -n1 -P "${CT_BRIDGE_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}" \
