@@ -310,6 +310,7 @@ test-serial: ablac
 	tools/test-extension-receivers.sh $(COMPILER)
 	tools/test-compile-time-scalars.sh $(COMPILER)
 	tools/test-integer-narrowing.sh $(COMPILER)
+	tools/test-integer-narrowing-stores.sh $(COMPILER)
 	tools/test-array-remove-last.sh $(COMPILER)
 	tools/test-path-home.sh $(COMPILER)
 	tools/test-path-directory-mode.sh $(COMPILER)

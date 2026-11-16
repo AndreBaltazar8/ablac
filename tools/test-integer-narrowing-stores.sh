@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# An int does not narrow implicitly where a narrower integer is stored, not only where it is passed (#953's neighbour):
+# a local, a `var` or field or element assignment, an array literal, a result. A literal that fits needs no
+# conversion; one that does not, or any int value, is integer.narrowing. They were accepted and kept out-of-range bits
+# (`val a: u8 = 256` printed 256, `val a: u8 = someInt` kept 300) or silently wrapped (a result, an array literal).
+set -euo pipefail
+compiler=${1:-build/ablac}
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$root"
+out=build/integer-narrowing-stores
+rm -rf "$out"
+mkdir -p "$out"
+"$compiler" build tests/cases/integer-narrowing-stores/valid.ab -o "$out/valid" --fast --no-cache
+got=$("$out/valid")
+[[ $got == "255 -128 0 44 32767 255 200 255 A 255 -128 44" ]] || { echo "integer narrowing stores: valid.ab printed '$got'" >&2; exit 1; }
+reject() { # $1 = name, $2 = declarations, $3 = statements of main
+    printf 'class Box(var value: u8)\n%s\nfun main: int {\n%s\n    0\n}\n' "$2" "$3" > "$out/$1.ab"
+    if "$compiler" build "$out/$1.ab" -o "$out/$1" --fast --no-cache > "$out/$1.log" 2>&1; then
+        echo "integer narrowing stores: $1 was accepted" >&2; exit 1
+    fi
+    grep -Fq 'error[E_SEMANTIC]: integer.narrowing:' "$out/$1.log" ||
+        { echo "integer narrowing stores: $1 lacks integer.narrowing:" >&2; cat "$out/$1.log" >&2; exit 1; }
+}
+reject local-u8 '' '    val a: u8 = 256'
+reject local-i8 '' '    val a: i8 = -129'
+reject local-negative '' '    val a: u8 = -1'
+reject local-u32 '' '    val a: u32 = 4294967296'
+reject local-u16 '' '    val a: u16 = 65536'
+reject local-i32 '' '    val a: i32 = 2147483648'
+reject local-char '' '    val a: char = 256'
+reject local-int-value '' $'    val i = 300\n    val a: u8 = i'
+reject local-if '' '    val a: u8 = if (true) 256 else 0'
+reject assign-literal '' $'    var a: u8 = 0\n    a = 256'
+reject assign-int-value '' $'    var a: u8 = 0\n    val i = 7\n    a = i'
+reject field-literal '' $'    val box = Box(0)\n    box.value = 256'
+reject element-literal '' $'    val items: array<u8> = [1]\n    items[0] = 256'
+reject array-literal '' '    val items: array<u8> = [1, 256]'
+reject result-statement 'fun f(): u8 {
+    return 256
+}' '    val a = f()'
+reject result-expression 'fun f(): u8 = 256' '    val a = f()'
+reject result-int-value 'fun f(i: int): u8 = i' '    val a = f(1)'
+echo "integer narrowing stores: fitting literals and conversions accepted in every store, 17 other forms rejected"

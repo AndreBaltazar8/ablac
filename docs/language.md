@@ -422,10 +422,13 @@ fun main {
   none is a `Map` key (`map.key-type`) or a `when` subject (`secret.when`), and an
   `@export` function can't use one in its signature (`simd.export`). See [numbers](stdlib/numbers.md).
 
-- An `int` argument for a parameter of a narrower type (`u8`, `i32`, ...) of
-  a function, method or constructor is `integer.narrowing`: write `u8(value)`
-  to keep the low bits. An integer literal that fits, or an `if` of such
-  literals, needs no conversion (`take(200)`).
+- An `int` where a narrower integer type (`u8`, `i32`, `char`, ...) is wanted is
+  `integer.narrowing`: an argument of a function, method or constructor, and
+  also an initializer of a declared local, an assignment to a `var`, a field or
+  an element, an element of an array literal, and a result (`return` or an
+  expression body). Write `u8(value)` to keep the low bits. An integer literal
+  that fits, or an `if` of such literals, needs no conversion (`take(200)`,
+  `val a: u8 = 255`); one that does not fit (`val a: u8 = 256`) is the error.
 
 ### Floating point
 

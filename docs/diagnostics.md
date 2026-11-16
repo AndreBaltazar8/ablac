@@ -85,6 +85,7 @@ only its parse errors.
 | `null-default.non-null:<T>` | `??` after a value that is never `null`, so the default is never used |
 | `null-default.type:<T>:<U>` | `a ?? b` where `b`'s type isn't `a`'s non-null type `T` (an integer literal is an `int`: write `i32(0)`) |
 | `local.initializer:<name>` | an initializer doesn't match the declared type |
+| `integer.narrowing:<where>@<offset>:<expected>:<actual>` | an `int` where a narrower integer is stored or passed (an argument, a declared local's initializer, an assignment, an array element or a result) that is not a literal that fits: convert it, e.g. `u8(value)` |
 | `assignment.type:<name>@<offset>` | an assigned value doesn't match the variable's type |
 | `assignment.immutable`, `global.immutable`, `field.immutable`, `member.immutable` | assigning a `val` |
 | `library.program-global:<name>@<offset>` | standard-library code names a program's global `val` or `var` ([modules](language.md#modules-and-imports)) |
