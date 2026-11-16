@@ -2506,14 +2506,48 @@ class BootstrapEvaluator(
     // The source of the code being evaluated, which an evaluation failure
     // names (bootstrapEvaluateFrom sets it for a declaration's body).
     var sourceIdentity: string = "",
-    val projectionOwnerLeaves: array<BootstrapExpression> = [],
-    val projectionOwnerSlots: array<int> = [],
+    // The projection owners, container sources and loop map views in force (each pushed and truncated back,
+    // innermost last; evaluate() matches the leaves by identity). An evaluator owns its own five arrays. A
+    // call's evaluator (bootstrapEvalInvocation) starts with the shared empty ones and `ownsScopes` false,
+    // and makes its own at its first push (ownScopes): most calls push none, and these were five of the
+    // allocations of every call. Every push goes through pushProjectionOwner, pushContainerSource or
+    // pushLoopMapView (tools/test-eval-scopes-guard.sh), so the shared arrays stay empty.
+    var projectionOwnerLeaves: array<BootstrapExpression> = [],
+    var projectionOwnerSlots: array<int> = [],
     var suppressProjectionOwner: int = 0,
-    val containerSourceLeaves: array<BootstrapExpression> = [],
-    val containerSourceFlags: array<int> = [],
-    val loopMapViews: array<BootstrapExpression> = [],
-    val globalGraph: BootstrapGlobalNodeMemo = BootstrapGlobalNodeMemo()
+    var containerSourceLeaves: array<BootstrapExpression> = [],
+    var containerSourceFlags: array<int> = [],
+    var loopMapViews: array<BootstrapExpression> = [],
+    val globalGraph: BootstrapGlobalNodeMemo = BootstrapGlobalNodeMemo(),
+    var ownsScopes: bool = true
 ) {
+    fun ownScopes(): void {
+        if (this.ownsScopes) return
+        this.projectionOwnerLeaves = []
+        this.projectionOwnerSlots = []
+        this.containerSourceLeaves = []
+        this.containerSourceFlags = []
+        this.loopMapViews = []
+        this.ownsScopes = true
+    }
+
+    fun pushProjectionOwner(leaf: BootstrapExpression, slot: int): void {
+        this.ownScopes()
+        this.projectionOwnerLeaves.append(leaf) // scopes-guard: the push
+        this.projectionOwnerSlots.append(slot) // scopes-guard: the push
+    }
+
+    fun pushContainerSource(leaf: BootstrapExpression, flag: int): void {
+        this.ownScopes()
+        this.containerSourceLeaves.append(leaf) // scopes-guard: the push
+        this.containerSourceFlags.append(flag) // scopes-guard: the push
+    }
+
+    fun pushLoopMapView(view: BootstrapExpression): void {
+        this.ownScopes()
+        this.loopMapViews.append(view) // scopes-guard: the push
+    }
+
     fun evaluateProjectionReceiver(expression: BootstrapExpression,
         holdMoved: bool = false): BootstrapEvalValue {
         val owners: array<int> = []
@@ -2533,8 +2567,7 @@ class BootstrapEvaluator(
         this.mutable.append(false)
         val mark = this.projectionOwnerLeaves.size
         for (leaf in fresh) {
-            this.projectionOwnerLeaves.append(leaf)
-            this.projectionOwnerSlots.append(slot)
+            this.pushProjectionOwner(leaf, slot)
         }
         val value = this.evaluate(expression)
         this.projectionOwnerLeaves.truncate(mark)
@@ -6404,8 +6437,18 @@ fun bootstrapEvalInvocation(
     evaluator.steps,
     evaluator.diagnostics,
     evaluator.sourceIdentity,
-        globalGraph = evaluator.globalGraph
+        projectionOwnerLeaves = BOOTSTRAP_EVAL_NO_SCOPE_LEAVES,
+        projectionOwnerSlots = BOOTSTRAP_EVAL_NO_SCOPE_SLOTS,
+        containerSourceLeaves = BOOTSTRAP_EVAL_NO_SCOPE_LEAVES,
+        containerSourceFlags = BOOTSTRAP_EVAL_NO_SCOPE_SLOTS,
+        loopMapViews = BOOTSTRAP_EVAL_NO_SCOPE_LEAVES,
+        globalGraph = evaluator.globalGraph,
+        ownsScopes = false
     )
+
+// The empty scopes a call's evaluator starts with (BootstrapEvaluator.ownScopes): shared, so never pushed to.
+val BOOTSTRAP_EVAL_NO_SCOPE_LEAVES: array<BootstrapExpression> = []
+val BOOTSTRAP_EVAL_NO_SCOPE_SLOTS: array<int> = []
 
 /** A default argument, evaluated with the parameters bound before it. */
 @noinline
@@ -9452,7 +9495,7 @@ fun bootstrapEvaluateFor(
     val mapMark = evaluator.loopMapViews.size
     val mapViews: array<BootstrapExpression> = []
     bootstrapCollectLoopMapViews(expression.children[0], mapViews)
-    for (view in mapViews) evaluator.loopMapViews.append(view)
+    for (view in mapViews) evaluator.pushLoopMapView(view)
     // The chosen fresh or moved arm transfers its elements to the loop; an
     // identifier, field, or borrowed result leaves them with its owner.
     val flag = evaluator.names.size
@@ -9464,8 +9507,7 @@ fun bootstrapEvaluateFor(
     bootstrapProjectionFreshLeaves(expression.children[0], leaves)
     bootstrapCollectMovedLoopLeaves(expression.children[0], leaves)
     for (leaf in leaves) {
-        evaluator.containerSourceLeaves.append(leaf)
-        evaluator.containerSourceFlags.append(flag)
+        evaluator.pushContainerSource(leaf, flag)
     }
     val rawSource = evaluator.evaluate(expression.children[0])
     evaluator.loopMapViews.truncate(mapMark)
