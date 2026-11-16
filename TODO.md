@@ -196,6 +196,19 @@ mmap form) apply there.
   running worker is abandoned. Measured (ablac-74's request): the compiler's own build 52.2 s against 54.2 s, binary
   +0.39%, object +0.52%; NovaKind's signer (`--fast`) about +1.5% build time, binary +0.15%, object +0.19%.
 
+- [ ] **An export-only library never collects by default (#811, found in step (iii)).** A program with `main` collects under
+  allocation pressure unless it opts out; a module entered through its exports (a shared library, a dylib) is manual
+  by default (`bootstrapLlvmNeedsCollector`): its allocating functions are not safe points, so nothing collects unless
+  some reachable code calls `memorySetCollectionGrowth` or `memorySetLimit`, or the host never calls anything that
+  collects. A long-lived `.so` or dylib therefore grows without bound, and the foreign-threads tests (which never asked)
+  never ran a collection until step (iii)'s `-b` run called `abla_run_enable`. Recommendation: make a hosted shared
+  library collect under pressure by default, as a program with `main` does: the exports are its entry points, the
+  caller cannot call `memoryCollect`, and the stop-the-world collector now stops its other callers. A library that
+  wants the old behaviour says so (`memorySetManualCollection`, which already opts a program out); the manual default
+  stays for wasm and freestanding targets. Cost to measure first: the safe points compiled into every allocating
+  function of a library (the +0.4% object size of step (ii) is the guide), and the first collections of every
+  library's tests then run under ABLA_GC_STRESS (foreign-threads `-t`, android-run), which may find missing roots.
+
 ## Bugs seen
 
 - [x] Linux toolchain packaging could write its archive and then fail in its
