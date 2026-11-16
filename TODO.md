@@ -197,18 +197,19 @@ mmap form) apply there.
   running worker is abandoned. Measured (ablac-74's request): the compiler's own build 52.2 s against 54.2 s, binary
   +0.39%, object +0.52%; NovaKind's signer (`--fast`) about +1.5% build time, binary +0.15%, object +0.19%.
 
-- [ ] **An export-only library never collects by default (#811, found in step (iii)).** A program with `main` collects under
-  allocation pressure unless it opts out; a module entered through its exports (a shared library, a dylib) is manual
-  by default (`bootstrapLlvmNeedsCollector`): its allocating functions are not safe points, so nothing collects unless
-  some reachable code calls `memorySetCollectionGrowth` or `memorySetLimit`, or the host never calls anything that
-  collects. A long-lived `.so` or dylib therefore grows without bound, and the foreign-threads tests (which never asked)
-  never ran a collection until step (iii)'s `-b` run called `abla_run_enable`. Recommendation: make a hosted shared
-  library collect under pressure by default, as a program with `main` does: the exports are its entry points, the
-  caller cannot call `memoryCollect`, and the stop-the-world collector now stops its other callers. A library that
-  wants the old behaviour says so (`memorySetManualCollection`, which already opts a program out); the manual default
-  stays for wasm and freestanding targets. Cost to measure first: the safe points compiled into every allocating
-  function of a library (the +0.4% object size of step (ii) is the guide), and the first collections of every
-  library's tests then run under ABLA_GC_STRESS (foreign-threads `-t`, android-run), which may find missing roots.
+- [x] **A hosted shared library collects under allocation pressure by default (#811).** An export-only module used to be
+  manual by default, so a long-lived `.so`, dylib or Android library never collected unless something called
+  `memorySetCollectionGrowth`; `bootstrapLlvmNeedsCollector` now makes a hosted shared library (`bootstrapIrExportRuntime`)
+  automatic, as a program with `main` is, and a library opts out the way a program does (`memorySetManualCollection`
+  reachable from an export). Wasm, freestanding and compile-time slices are unchanged. Cost, measured on the Android
+  test library built as an x86-64 `.so`: 51,536 to 67,048 bytes (+30%; the collector's code and the safe points), build
+  time 0.89 s to 1.07 s. It exposed a recursion on Android: the emulated thread-local routines (`abla/android/emutls`)
+  were rooted functions, so reading the root-frame head called them again; they (and anything named `emutls`) are now
+  runtime implementations, and their `mmap` goes through the system call intrinsic, not the bracketed wrapper.
+  `tests/cases/android-run` checks that its library, which asks for nothing, collects (`abla_run_collected`). Found
+  on the way: `ABLA_GC_STRESS` and `ABLA_GC_TRACE` are read from the process environment, which a library does not
+  have (no `_start`), so the `-t` "stress" runs of the library tests have never been stress runs; a library needs its
+  own way to ask for stress.
 
 ## Bugs seen
 

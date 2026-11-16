@@ -199,6 +199,15 @@ records the selected target,
 artifact container, foreign symbol, source declaration, parameter list, ABI
 result representation, ownership/nullability, and failure containment status.
 
+### Collection in a shared library
+
+A hosted shared library collects under allocation pressure by default, as a program with `main` does: its allocating
+functions are safe points, and a collection runs when the heap passes its threshold (32 MB to start, then half again
+past what it kept). It opts out the way a program does, by reaching `memorySetManualCollection()` from an export; the
+growth is set with `memorySetCollectionGrowth(bytes)`. A module for Wasm or a freestanding target is manual by default,
+and compile-time slices are as they were. The environment variables `ABLA_GC_STRESS` and `ABLA_GC_TRACE` are read from
+the process environment, which a library does not have, so they have no effect in one.
+
 ### Calling exports from several threads
 
 A shared library (the default x86-64 Linux target, arm64 Android, and any other hosted shared library) is entered

@@ -44,7 +44,7 @@ library=$PWD/$out/lib/src/main/jniLibs/arm64-v8a/libabla_app.so
 status=0
 LD_LIBRARY_PATH="$bionic/system/lib64/bootstrap:$bionic/system/lib64" timeout 300 qemu-aarch64 \
     "$bionic/system/bin/bootstrap/linker64" "$PWD/$out/driver" "$library" \
-    abla_run_random nonzero abla_run_heap 465 abla_run_thread 142 abla_run_threads_heap 1860 abla_run_seed 78 abla_run_nested 77 abla_run_collect_on 0 > "$out/run.out" 2> "$out/run.err" < /dev/null || status=$?
+    abla_run_random nonzero abla_run_heap 465 abla_run_thread 142 abla_run_threads_heap 1860 abla_run_seed 78 abla_run_nested 77 abla_run_collected 1 > "$out/run.out" 2> "$out/run.err" < /dev/null || status=$?
 if [[ $status -ne 0 ]]; then
     cat "$out/run.out" >&2
     grep -v 'linkerconfig' "$out/run.err" >&2 || true
