@@ -1664,15 +1664,20 @@ fun bootstrapEvalFirstEscape(values: array<BootstrapEvalValue>): int {
  *  `name` is no scalar type declaration. */
 fun bootstrapEvalScalarUnderlying(var evaluator: BootstrapEvaluator, name: string): string {
     if (!bootstrapCouldNameScalarType(name)) return ""
+    val known = evaluator.context.scalarUnderlying.get(name)
+    if (known != null) return known
+    var underlying = ""
     var node = evaluator.firstNamed(name)
     while (node >= 0) {
         val declaration = evaluator.declarations[evaluator.namedDeclaration(node)]
         if (declaration.kind == "type" && declaration.name == name) {
-            return bootstrapNormalizeType(declaration.resultType)
+            underlying = bootstrapNormalizeType(declaration.resultType)
+            break
         }
         node = evaluator.nextNamed(node)
     }
-    ""
+    if (bootstrapEvalMemoAllowed(evaluator.context)) evaluator.context.scalarUnderlying.set(name, underlying)
+    underlying
 }
 
 /** `value` as it reaches a place declared `type` (a parameter, a result, a
@@ -2410,8 +2415,19 @@ class BootstrapEvalContext(
     // Bounded scalar memo, owned by this evaluation context rather than by AST nodes.
     // The value's kind distinguishes f32/f64 literals with the same source spelling.
     val floatLiteralTexts: array<string> = [],
-    val floatLiteralValues: array<BootstrapEvalValue> = []
+    val floatLiteralValues: array<BootstrapEvalValue> = [],
+    // Name lookups that depend on the declarations alone, made once per name (a context is built per
+    // declaration list): the scalar a `type` name stands for (bootstrapEvalScalarUnderlying), and the names
+    // that no value declaration has (bootstrapEvalGlobalCallable; most calls are of functions, and each one
+    // walked every declaration of its name to find none). Kept only where bootstrapEvalMemoAllowed says.
+    val scalarUnderlying: Map<string, string> = Map(),
+    val valueless: Map<string, bool> = Map()
 )
+
+// A context's name memos are written only for a real declaration list (not bootstrapEvalNoContext, which is
+// shared) and outside a `region`, which would free the entries the context keeps.
+fun bootstrapEvalMemoAllowed(context: BootstrapEvalContext): bool =
+    context.size >= 0 && !runtimeMemoryRegionActive()
 
 // ABLA_EVAL_STEP_LIMIT overrides the default for tests or heavier computations.
 // At most 18 decimal digits keep parsing and the first over-limit step in range.
@@ -6216,6 +6232,8 @@ fun bootstrapEvalGlobalCallable(
     name: string
 ): BootstrapEvalValue {
     var callable = bootstrapEvalInvalid()
+    if (evaluator.context.valueless.has(name)) return callable
+    var valued = false
     var globalNode = evaluator.firstNamed(name)
     while (callable.kind == "invalid" &&
            globalNode >= 0) {
@@ -6223,6 +6241,7 @@ fun bootstrapEvalGlobalCallable(
         val declaration = evaluator.declarations[global]
         if (bootstrapDeclarationIsValue(declaration.kind) &&
             declaration.name == name) {
+            valued = true
             if (declaration.expression.kind == "delegate.initializer") {
                 callable = evaluator.delegatedSlot(name)
                 if (callable.kind == "delegate" && callable.elements.size == 1)
@@ -6235,6 +6254,7 @@ fun bootstrapEvalGlobalCallable(
         }
         globalNode = evaluator.nextNamed(globalNode)
     }
+    if (!valued && bootstrapEvalMemoAllowed(evaluator.context)) evaluator.context.valueless.set(name, true)
     callable
 }
 
