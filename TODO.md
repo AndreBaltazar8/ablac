@@ -188,8 +188,9 @@ mmap form) apply there.
   counts as stopped (`tools/test-gc-threads.sh`: churn, hold, stale-claim, manual, blocked, hammer, echo), and so does a
   thread inside a call into the host (an `@hostImport` symbol; an export it calls from there takes the thread out of the
   stopped state until it returns: `tools/test-foreign-threads.sh`'s `-b` run).
-  Open: (iv) macOS (the stop's clock and sleep go through the Linux system call
-  numbers the Darwin shim maps; nothing was run on a Mac). Limits: the runtime's own futex and mutex waits count as
+  Open: (iv) macOS: the code is shared (the stop's clock, sleep and futex go through the Linux system call numbers the
+  Darwin shim maps, in platform/darwin), `tools/test-gc-threads.sh` no longer skips on Darwin and has a step in the macOS CI job;
+  nothing was run on a Mac when this was written, so the first CI run is the answer. Limits: the runtime's own futex and mutex waits count as
   running, so a stop waits 20 ms for such a thread and gives up (counted by `memoryHeapStat(8)`); a loop that never
   allocates has no safe point and holds up every collection while it runs; a manual-collection program
   (`memorySetManualCollection` without a limit or growth call) has no safe points, so an explicit collection with a

@@ -14,10 +14,10 @@ output_directory=build/gc-threads
 rm -rf "$output_directory"
 mkdir -p "$output_directory"
 
-case $(uname -s) in
-    Linux) ;;
-    *) echo "gc threads: not Linux, skipped"; exit 0 ;;
-esac
+# A wall-clock limit: GNU timeout where there is one, the repository's limiter elsewhere (the Mac runners have no timeout).
+limited() {
+    if command -v timeout > /dev/null; then timeout 120 "$@"; else ABLA_MAX_SECONDS=120 tools/run-limited.sh "$@"; fi
+}
 
 fail() { echo "gc threads: $*" >&2; exit 1; }
 
@@ -32,7 +32,7 @@ for name in churn hold stale-claim manual blocked hammer echo; do
     for mode in "ABLA_GC_GROWTH=1048576" "ABLA_GC_STRESS=1"; do
       for ((round = 0; round < repeat; round++)); do
         status=0
-        env "$mode" ABLA_GC_TRACE=1 timeout 120 "$output_directory/$name" \
+        ( export "$mode" ABLA_GC_TRACE=1; limited "$output_directory/$name" ) \
             > "$output_directory/$name.out" 2> "$output_directory/$name.err" < /dev/null || status=$?
         [[ $status -eq 42 ]] || { cat "$output_directory/$name.out" "$output_directory/$name.err" >&2; fail "$name under $mode: status $status"; }
         if [[ $name == churn ]]; then
