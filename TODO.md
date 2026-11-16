@@ -73,9 +73,10 @@ trunc and round to libm without SSE4.1). Coverage builds add `strstr`, `snprintf
 `rename` (`src/backend/llvm/coverage.ab`). Not yet covered by the test: the native `-l` libraries a
 program names, and `abla/crypto/hosted` (libcrypto EVP through the manifest's nativeLibraries).
 
-The compiler links libssl and libcrypto only because the compile-time evaluator can open TLS
-connections (`src/ct_native.ab:28` imports `abla/platform/host/tls`, since c70e83c6). It links
-libLLVM for code generation and the ORC JIT; libLLVM in turn needs libstdc++, libz, libxml2, libffi.
+The compiler no longer links libssl or libcrypto: the compile-time evaluator's TLS (`src/ct_native.ab:28` imports
+`abla/platform/host/tls`) is over `abla/tls/pure`, and the build's OpenSSL marker is the declaration `extern:"c" fun
+OpenSSL_version_num(` (it was a text the compiler's own source held, which linked OpenSSL for every build of it).
+It links libLLVM for code generation and the ORC JIT; libLLVM in turn needs libstdc++, libz, libxml2, libffi.
 
 Status (compiler only): setitimer, link and utimes are system calls on x86-64 Linux (the compile-time
 process capture also forks by system call), and the compile-time symbol lookup asks LLVM instead of
@@ -131,7 +132,7 @@ Next, in order: (1) NovaKind's signer onto `abla/tls/pure` (branch `tls-pure-822
 (`tests/cases/crypto-pure/against-hosted.ab`, move it to the `openssl` command line); `tls-http` leaves
 `tools/libc-imports-static-pending.txt` with them; (2) the AArch64 static check of `tools/test-aarch64-linux.sh` over
 all 11 `libc-imports` programs (it runs 6) and a representative set of the module cases, so a regression in a stdlib
-area the 11 programs miss (sockets, processes, signals, stm) shows; (3) the compiler's own `abla/platform/host/tls`
+area the 11 programs miss (sockets, processes, signals, stm) shows; (3, done) the compiler's own `abla/platform/host/tls`
 through `abla/tls/pure`, which takes libssl and libcrypto out of the compiler's 36 imports (step C, André's, listed
 for completeness).
 

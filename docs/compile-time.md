@@ -589,9 +589,13 @@ it implies — `ablaHostFileKind`, `FileSize`, `FileRevision` and
 `CurrentDirectory` are `filesystem.read` (journaled like a read); writes, moves
 and removals `filesystem.write`; standard output and error none (and
 `Argument`/`ArgumentCount` none: there are no arguments under `#`); standard
-input and processes `process.io`; `Net*` (and the `Tls*` functions
-of `abla/platform/host/tls`) `network`; `Sleep` and `MonotonicMilliseconds`
-`clock`; `SecureRandom` `random`.
+input and processes `process.io`; `Net*` `network`; `Sleep` and `MonotonicMilliseconds`
+`clock`; `SecureRandom` `random`. The `Tls*` functions of `abla/platform/host/tls` are not providers: they are
+`abla/tls/pure` (TLS in Abla, no OpenSSL) compiled into the site like any stdlib code, so a site that uses them needs
+`ABLA_COMPILE_EVAL=jit` (interpreted, a handshake runs past the step limit) and the grants of the code it runs:
+`trusted.native` (the sockets), `filesystem.read` (the trust store), `environment` (`SSL_CERT_FILE`, `SSL_CERT_DIR`) and
+`clock` (certificate validity),
+and not `network`.
 
 Without the grant, a native call is rejected before it runs
 (`compile.effect-denied:trusted.native`, or `E_COMPILE_NATIVE_DENIED` from a

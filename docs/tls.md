@@ -4,7 +4,8 @@
 X.509 verification, over the sockets of `abla/sys/linux/net`. It needs no OpenSSL and no libc. `abla/http/tls`,
 `abla/websocket/tls` and the Xtensa installer's HTTPS stream use it, so a program that opens HTTPS connections links
 as a static, libc-free executable. `abla/tls/hosted` (OpenSSL) remains for the server modules that still import it
-(`abla/websocket/server/tls`) and for the flat host API (`abla/platform/host/tls`).
+(`abla/websocket/server/tls`). The flat host API (`abla/platform/host/tls`, which the compiler's compile-time evaluator
+uses) is over `abla/tls/pure` too: the compiler imports no libssl or libcrypto.
 
 The module has the calls of `abla/tls/hosted`: `tlsConnect`, `tlsConnectWithCa`, `tlsConnectWithIdentity`,
 `tlsUpgrade` and `tlsUpgradeWithIdentity` (TCP and Unix sockets), `tlsListen`, `TlsListener.accept`,

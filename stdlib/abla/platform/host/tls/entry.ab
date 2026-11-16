@@ -1,52 +1,59 @@
 // TLS for the flat host API (see abla/platform/host): connections and
-// listeners are integer handles of abla/tls/hosted. Importing this module
-// links the system TLS library.
+// listeners are integer handles (a connection's or a listener's socket
+// descriptor), over abla/tls/pure: TLS in Abla, no OpenSSL and no libc, with
+// the verification of every other pure client (the system trust store or the
+// CA file, the host name from the certificate's subject alternative names).
 
 import "abla/platform/host"
-import "abla/tls/hosted"
+import "abla/tls/pure"
 
 fun ablaHostTlsAvailable(): bool = tlsAvailable()
 
 // A connection handle (negative on failure; ablaHostTlsError() says why).
-fun ablaHostTlsOpen(host: string, port: int, timeoutMilliseconds: int): int =
-    tlsOpen(host, "", port, timeoutMilliseconds)
+fun ablaHostTlsOpen(host: string, port: int, timeoutMilliseconds: int): int {
+    val connection = tlsConnect(host, port, timeoutMilliseconds)
+    if (connection.handle == -1) return -1
+    tlsRelease(move(connection))
+}
 
 fun ablaHostTlsOpenWithCa(
     host: string,
     port: int,
     timeoutMilliseconds: int,
     caPath: string
-): int = tlsOpen(host, caPath, port, timeoutMilliseconds)
-
-fun ablaHostTlsRead(handle: int, maximum: int): string {
-    var connection = TlsConnection(handle)
-    val text = connection.read(maximum)
-    connection.handle = -1
-    text
+): int {
+    val connection = tlsConnectWithCa(host, caPath, port, timeoutMilliseconds)
+    if (connection.handle == -1) return -1
+    tlsRelease(move(connection))
 }
 
-fun ablaHostTlsWrite(handle: int, contents: string): int {
-    var connection = TlsConnection(handle)
-    val written = connection.write(contents)
-    connection.handle = -1
-    written
-}
+fun ablaHostTlsRead(handle: int, maximum: int): string = tlsReadHandle(handle, maximum)
+
+fun ablaHostTlsWrite(handle: int, contents: string): int = tlsWriteHandle(handle, contents)
 
 // Replaces the limits on one read and one write; 0 waits as long as it takes.
 fun ablaHostTlsSetTimeouts(
     handle: int,
     readMilliseconds: int,
     writeMilliseconds: int
-): bool {
-    var connection = TlsConnection(handle)
-    val set = connection.setTimeouts(readMilliseconds, writeMilliseconds)
-    connection.handle = -1
-    set
-}
+): bool = tlsSetTimeoutsHandle(handle, readMilliseconds, writeMilliseconds)
 
 fun ablaHostTlsClose(handle: int): bool = tlsCloseHandle(handle)
 
 fun ablaHostTlsError(): string = tlsLastError()
+
+// The listeners, by their socket's descriptor. One thread (the compile-time evaluator's), as the connection table of
+// abla/tls/pure.
+private var hostTlsListeners: array<TlsListener> = []
+
+private fun hostTlsListenerIndex(handle: int): int {
+    var at = 0
+    while (at < hostTlsListeners.size) {
+        if (hostTlsListeners[at].descriptor() == handle) return at
+        at = at + 1
+    }
+    -1
+}
 
 fun ablaHostTlsListen(
     host: string,
@@ -55,24 +62,31 @@ fun ablaHostTlsListen(
     dualStack: bool,
     certificatePath: string,
     privateKeyPath: string
-): int = tlsListenHandle(
-    certificatePath, privateKeyPath, host, port, backlog, dualStack
-)
+): int {
+    val listener = tlsListen(certificatePath, privateKeyPath, host, port, backlog, dualStack)
+    if (listener.handle == -1) return -1
+    val descriptor = listener.descriptor()
+    hostTlsListeners.append(move(listener))
+    descriptor
+}
 
 fun ablaHostTlsListenerPort(handle: int): int {
-    var listener = TlsListener(handle)
-    val port = listener.localPort()
-    listener.handle = -1
-    port
+    val at = hostTlsListenerIndex(handle)
+    if (at < 0) return -1
+    hostTlsListeners[at].localPort()
 }
 
 fun ablaHostTlsAccept(handle: int): int {
-    var listener = TlsListener(handle)
-    var connection = listener.accept()
-    listener.handle = -1
-    val accepted = connection.handle
-    connection.handle = -1
-    accepted
+    val at = hostTlsListenerIndex(handle)
+    if (at < 0) return -1
+    val connection = hostTlsListeners[at].accept()
+    if (connection.handle == -1) return -1
+    tlsRelease(move(connection))
 }
 
-fun ablaHostTlsListenerClose(handle: int): bool = tlsCloseListenerHandle(handle)
+fun ablaHostTlsListenerClose(handle: int): bool {
+    val at = hostTlsListenerIndex(handle)
+    if (at < 0) return false
+    var listener = hostTlsListeners.takeAt(at)
+    listener.close()
+}
