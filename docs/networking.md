@@ -459,6 +459,30 @@ handshake's garbage in the collector's heap (a second wave of 500 connections af
 size a TLS server by its peak concurrent handshakes, not by idle connections). The worst case one client can force, by the bounds above, is its own 100 streams, up to 8 MiB of request bodies,
 768 KiB of unread output and a 128 KiB header block in progress: under 10 MiB per connection, which `maximumConnections` (1023 by default) multiplies.
 
+### Streaming bodies (HTTP/1.1 and HTTP/2 client, HTTP/2 server)
+
+Bodies that do not fit in memory, or that must start before they end, are streamed; the buffered APIs above are unchanged. The rule everywhere is that **receive credit follows consumption**:
+an HTTP/2 stream window is credited as the caller takes the bytes (the connection window on arrival, so one stalled stream does not stall the others), and HTTP/1.1 stops reading the socket
+while 192 KiB wait. A caller that stops taking stops the peer after one stream window (256 KiB), so memory is bounded by the receiver's pace.
+
+**Client** (`abla/http/async`, HTTP/1.1 and HTTP/2): `getStream(url)` and `requestStream(method, url, headers, length)` (`length` -1: unknown, sent chunked or as END_STREAM) return an id;
+`takeStreamEvents()` gives `HEADERS`, `READABLE` (bytes waiting: read until `readStream(id, max)` returns ""), `WRITABLE` (`writeBody(id, chunk)` takes up to 256 KiB unsent and returns how many; it takes 0
+before the first WRITABLE), `END` (after the last response byte was read) and `ERROR`; `finishBody(id)`, `cancelStream(id)`, `streamPending(id)`. The timeout is an idle one (default 30 s). A streaming request
+is never retried and a streamed response is not bounded by `maximumResponseBytes`.
+
+**Server** (`abla/http/event/tls`, over HTTP/2; HTTP/1.1 requests to a streaming route are not streamed yet and reach the buffered handler): `server.streamRoute(method, path, handler, maximumStreamBodyBytes = 0)`
+serves an exact path with an `HttpStreamHandler` (`onRequest`, `onData`, `onEnd`, `onWritable`, `onAbort`, called on the event loop's thread, never blocking). Each callback returns an `HttpStreamStep` (respond,
+write, finish with trailers, pause or resume the request body, abort); `server.streamStep(id, step)` gives one from outside a callback (a producer). A route's body limit is `maximumStreamBodyBytes` (0: none; 413
+when nothing was sent yet); **a handler that accumulates the body or an unbounded response is its own memory bound**, the server holds at most a stream window of request body and 256 KiB of response per exchange.
+`exchange.room` is how many response bytes can be written now; what a handler writes past it is kept by the server and sent first. Use `HTTP_STREAM_PAUSE_FOR_ROOM` (pause the request only if the
+write did not fit, resume by itself once it is out) for echoes and proxies, `wantWritable` for producers. No gzip is applied to a streamed response. An idle exchange ends with the connection's idle timeout (`onAbort`).
+
+Measured (tools/test-http2-stream.sh, tools/test-http2-stream-server.sh; h2o, nghttpd, curl and our own client): 1 GiB downloads and uploads over h2c, 256 MiB echoed both ways at once, 64 MiB over TLS,
+a consumer that stops reading and a request body nobody takes (the stream stalls after one window and the idle timeout ends it): byte-exact, an unread stream held at most one window, the client's resident
+memory peaked at about 70 MB and the server's at about 100 MB in every run, from 16 MiB to 1 GiB (it does not grow with the transfer; the rest is the runtime's heap and its garbage). Two limits that
+ended large transfers were fixed on the way: WINDOW_UPDATE frames on a request or response being sent no longer count as frames that carry nothing (1000 in a row ended an upload at 16 MiB and a download at
+87 MB), and `HttpsEventServer` serves the decrypted bytes a TLS session still holds without waiting for the socket (a 1 MiB upload could stall).
+
 ### JSON Web Tokens
 
 `abla/jwt` verifies compact JWS tokens signed with RS256 or ES256 against a

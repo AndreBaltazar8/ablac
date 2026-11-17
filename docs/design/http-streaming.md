@@ -110,3 +110,12 @@ Each step lands with its own tests and does not change a buffered result.
 `tools/test-http2-stream.sh` (h2o and nghttpd, over h2c and TLS): a 1 GiB download and a 1 GiB upload over h2c, 64 MiB each over TLS and a consumer that stops reading for 1.5 s, all byte-exact; an unread stream held at most one stream window (262144 bytes) of the peer's data; `writeBody` took less than it was offered (backpressure) during the upload; the client process' resident memory peaked at **about 70 MB in every run**, from 64 MiB to 1 GiB, so it does not grow with the transfer (the Abla heap's garbage, collected). The test limit is 128 MiB.
 
 A bug found by that test and fixed with it: the client counted every WINDOW_UPDATE as a frame that carries nothing, and ended the connection (ENHANCE_YOUR_CALM) after 1000 in a row, which nghttpd's one-update-per-DATA-frame reached at 16 MiB of upload. A window update on a request that is still being sent no longer counts. This affected buffered uploads too (v0.2.61's `http2 = true` client and any upload over 16 MiB to such a server).
+
+## Server side, as built (HTTP/2)
+
+The three decisions were confirmed: interface callbacks, `maximumStreamBodyBytes` per route with 0 as the default (a handler that accumulates is its own memory bound; the server's own state per exchange is a
+window of request body and 256 KiB of response), no gzip on streamed responses. As built: `H2Server` has `streamRoute`, `takeEvents` (REQUEST, DATA, END, WRITABLE, RESET), `consumed` (the credit),
+`respondStream`, `writeResponse`, `endResponse`, `responseRoom` and `abortStream`; `HttpsEventServer.streamRoute` registers an `HttpStreamHandler` and returns `HttpStreamStep` values from the callbacks.
+Two changes from the sketch: a handler cannot hold the server (a resource), so the callbacks return plain-value steps and `server.streamStep(id, step)` serves a producer outside a callback; and pausing from
+`exchange.room` raced with the room that opens while a step is applied (an echo deadlocked about half the time at 8 MiB over TLS), hence `HTTP_STREAM_PAUSE_FOR_ROOM`, decided after the write was applied and
+lifted by the server itself. `HttpStreamStep.wantWritable` is how a producer hears of room. HTTP/1.1 on the server (incremental request framing, chunked responses) is the next step.
