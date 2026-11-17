@@ -3,6 +3,7 @@ set -euo pipefail
 compiler=${1:-build/ablac}
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$project_root"
+. tools/lib/ct-auto-trace.sh
 out="$project_root/build/compile-eval-cross-target"
 mkdir -p "$out"
 export ABLA_DEBUG=0
@@ -79,6 +80,13 @@ for mode in jit auto; do
     cmp "$out/implicit-interp.wasm" "$out/implicit-$mode.wasm"
     cmp "$out/collision-interp.wasm" "$out/collision-$mode.wasm"
     cmp "$out/floats-interp.wasm" "$out/floats-$mode.wasm"
+    if [[ $mode == auto ]]; then
+        for log in "" floats- collision- implicit-; do
+            ct_auto_follows_jit "$out/${log}auto.log" "$out/${log}jit.log" ||
+                { echo "cross-target: ${log}auto.log: not the jit choices" >&2; exit 1; }
+        done
+        continue
+    fi
     [[ $(grep -c 'interpreted at' "$out/floats-$mode.log") -eq 7 ]]
     ! grep -q 'native at .*[/]floats.ab:' "$out/floats-$mode.log"
     grep -q 'interpreted at .*cross-target host runtime declaration collision: write' "$out/collision-$mode.log"

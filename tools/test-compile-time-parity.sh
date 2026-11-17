@@ -20,7 +20,8 @@
 #
 # Environment:
 #   PARITY_MODES    ABLA_COMPILE_EVAL modes to run (default "interp"; "interp
-#                   jit" runs both in one pass)
+#                   auto" runs both in one pass; `auto` is the compiler's
+#                   default tier)
 #   PARITY_SET      probes | modules | all (default all)
 #   PARITY_FILTER   extended regex on case names (default: every case)
 #   PARITY_JOBS     cases built at once (default: the number of CPUs; 2 under tools/run-tests.sh)
@@ -415,7 +416,8 @@ run_mode() { # kind name source mode
                 fi
                 # The runtime memory API has no heap to measure in the
                 # interpreter (docs/compile-time.md).
-                if [[ $mode == interp ]] &&
+                # (auto, the default, interprets the sites the native tier refuses and passes it leaves alone.)
+                if [[ $mode != jit ]] &&
                     grep -q '^error\[E_EVAL_MEMORY_UNAVAILABLE\]' "$dir/staged.err"; then
                     status=interp-memory
                 fi
@@ -434,7 +436,8 @@ run_mode() { # kind name source mode
                     fi
                 fi
                 # Past the interpreter's step limit: the same code natively.
-                if [[ $mode == interp ]] &&
+                # (auto, the default, interprets the sites the native tier refuses and passes it leaves alone.)
+                if [[ $mode != jit ]] &&
                     grep -q '^error\[E_EVAL_STEP_LIMIT\]' "$dir/staged.err"; then
                     build_and_run "$dir" staged-jit staged.ab jit
                     if [[ $(cat "$dir/staged-jit.status") != build* ]] &&

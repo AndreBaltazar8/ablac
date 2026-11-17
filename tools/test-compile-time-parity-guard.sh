@@ -2,7 +2,8 @@
 # The compile-time parity set can't rot unseen (tools/test-compile-time-parity.sh; it builds nothing, so it runs in
 # seconds):
 #   - every case (probe or module program) has an expectation line in tests/cases/parity/expected-pass.txt for each
-#     mode, interp and jit, and every line names a case: a case without one could fail without anyone seeing it;
+#     mode, interp, jit and auto (the default tier), and every line names a case: a case without one could fail
+#     without anyone seeing it;
 #   - every line of tests/cases/parity/negative.txt (programs whose run-time build is meant to fail, not run) names a
 #     tests/cases/modules program that is still there;
 #   - every standard-library module (stdlib/abla/**/entry.ab) is reached by some case, through its imports, directly or
@@ -30,7 +31,7 @@ PARITY_LIST_ONLY=1 PARITY_NEGATIVE="$negative" tools/test-compile-time-parity.sh
 
 # 1. An expectation line per case and mode, and no line for anything else.
 sed 's/#.*//' "$expect" | awk '$1 != "" { print $1, $2 }' | sort >"$work/lines"
-for mode in interp jit; do awk -v m="$mode" '{ print m, $2 }' "$work/cases"; done | sort >"$work/wanted"
+for mode in interp jit auto; do awk -v m="$mode" '{ print m, $2 }' "$work/cases"; done | sort >"$work/wanted"
 while read -r line; do fail "no expectation line: $line (add \"$line [<status>]\" to $expect)"; done \
     < <(comm -23 "$work/wanted" "$work/lines")
 while read -r line; do fail "$expect has a line for no case: $line"; done \
@@ -101,4 +102,4 @@ if base=$(git merge-base HEAD origin/master 2>/dev/null) && git cat-file -e "$ba
 fi
 
 (( failed == 0 )) || exit 1
-echo "parity guard: $(wc -l <"$work/cases") cases with a line for interp and jit, $(grep -c . "$work/reached") of $(wc -l <"$work/modules") standard-library modules reached, $(grep -c . "$work/exempt" || true) uncovered with a reason"
+echo "parity guard: $(wc -l <"$work/cases") cases with a line for interp, jit and auto, $(grep -c . "$work/reached") of $(wc -l <"$work/modules") standard-library modules reached, $(grep -c . "$work/exempt" || true) uncovered with a reason"

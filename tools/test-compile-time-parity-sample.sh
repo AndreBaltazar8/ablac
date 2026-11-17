@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Compile-time parity of tests/cases/modules programs, sampled (#829): the full run (every module program, run time
 # against `#`, in interp and jit) takes about half an hour, so it ran outside the suite and expected-pass.txt rows rotted
-# unseen. This step runs, in both modes, a fixed set of rows that guard past fixes and a rotating sample of the listed
+# unseen. This step runs, in interp, jit and auto (the default tier), a fixed set of rows that guard past fixes and a
+# rotating sample of the listed
 # module rows: the sample starts at the number of commits times its size, so consecutive commits walk through every row.
 # Every selected row must keep its expected status (tools/test-compile-time-parity.sh fails otherwise).
 #
-#   PARITY_SAMPLE_SIZE    rotating rows per run (default 12)
+#   PARITY_SAMPLE_SIZE    rotating rows per run (default 8: each runs in three modes)
 #   PARITY_SAMPLE_OFFSET  where the rotation starts (default: commits * size); the step prints it, to rerun one sample
 set -euo pipefail
 
@@ -14,7 +15,7 @@ compiler=${1:-build/ablac}
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$project_root"
 expect=tests/cases/parity/expected-pass.txt
-size=${PARITY_SAMPLE_SIZE:-12}
+size=${PARITY_SAMPLE_SIZE:-8}
 
 # Always run: rows that guard fixes. In jit: #828 jwt and lambda-inferred-result, #829 http-event and a stale-row status;
 # in interp and jit: #829 thread-local-bytes, process-capture and linux-process (the children's exec strings), and the
@@ -71,5 +72,5 @@ run() { # modes output names...
 }
 echo "parity sample: fixed (jit): ${fixed[*]}"
 run jit build/compile-time-parity-sample-fixed "${fixed[@]}"
-echo "parity sample: offset $offset of $count rows (PARITY_SAMPLE_OFFSET=$offset reruns it), interp and jit: ${fixedBoth[*]} ${selected[*]}"
-run "interp jit" build/compile-time-parity-sample "${fixedBoth[@]}" "${selected[@]}"
+echo "parity sample: offset $offset of $count rows (PARITY_SAMPLE_OFFSET=$offset reruns it), interp, jit and auto: ${fixedBoth[*]} ${selected[*]}"
+run "interp jit auto" build/compile-time-parity-sample "${fixedBoth[@]}" "${selected[@]}"

@@ -166,7 +166,15 @@ fun bootstrapCtAnalyze(
             }
         }
     }
+    // An erased float in a string template is written by the erased-float formatter when the program
+    // demands it (backend.ab decides after this analysis, for the program's own lowering): the slice is
+    // lowered here, before that, so it is told now. Else `"${x}"` of an `any` holding 2.5 printed the
+    // float's bits natively, where the evaluator and the program print 2.5.
+    val outerFormatting = bootstrapFloatFormattingRequested
+    if (bootstrapFloatDemandActive && bootstrapFloatBridgeAvailable &&
+        bootstrapFloatDemandOrigin && bootstrapFloatDemandText) bootstrapFloatFormattingRequested = true
     if (analyzed.errors == 0) bootstrapCtPrepare(parsed, targetTriple, analyzed.methodTargets)
+    bootstrapFloatFormattingRequested = outerFormatting
     analyzed
 }
 
@@ -762,6 +770,111 @@ class BootstrapCtReach(
         }
         reason
     }
+}
+
+// --- the auto tier's cost rule -------------------------------------------------
+
+// A construct whose work the code's size doesn't bound: a loop, a lambda (a local function
+// can call itself through one), an atomic block (it retries), or a call through a value.
+fun bootstrapCtLongNode(node: BootstrapExpression): bool {
+    val kind = node.kind
+    kind == "while" || kind == "do.while" || kind == "for" || kind == "lambda" ||
+        kind == "lambda.move" || kind == "atomic" || kind == "stm.orElse" || kind == "call.value"
+}
+
+// Scans `expression`: true when it holds a long construct, else the names it mentions are
+// appended to `names`.
+fun bootstrapCtScanBody(expression: BootstrapExpression, var names: array<string>): bool {
+    val pending: array<BootstrapExpression> = [expression]
+    while (pending.size > 0) {
+        val node = pending[pending.size - 1]
+        pending.truncate(pending.size - 1)
+        if (bootstrapCtLongNode(node)) return true
+        val literal = node.kind == "string" || node.kind == "integer" ||
+            node.kind == "float" || node.kind == "float32" || node.kind == "char"
+        if (!literal && node.text != "") names.append(node.text)
+        for (child in node.children) pending.append(child)
+    }
+    false
+}
+
+// Whether a site can run long (the work under ABLA_COMPILE_EVAL=auto that pays for a native
+// generation): what its walk just visited (reach.visited, after reach.unsupported) or the site
+// itself holds a long construct (bootstrapCtLongNode), or the visited declarations call each
+// other in a cycle (recursion). Otherwise the interpreter's steps are bounded by the size of the
+// code the site reaches. A class's methods count for loops (an operator or an implicit call can
+// reach one no name names) but give no call edges: a method called by name is visited itself.
+fun bootstrapCtMayRunLong(reach: BootstrapCtReach, expression: BootstrapExpression): bool {
+    val unused: array<string> = []
+    if (bootstrapCtScanBody(expression, unused)) return true
+    // Each visited item's outgoing edges, as the visited items its body names.
+    val nodes: array<int> = []
+    val position: array<int> = []
+    var item = 0
+    while (item < reach.visited.size) {
+        position.append(-1)
+        if (reach.visited[item]) {
+            position[item] = nodes.size
+            nodes.append(item)
+        }
+        item = item + 1
+    }
+    // A node's edges are edgeTo[edgeStart[node] until edgeStart[node + 1]].
+    val edgeStart: array<int> = []
+    val edgeTo: array<int> = []
+    val indegree: array<int> = []
+    for (node in nodes) indegree.append(0)
+    var index = 0
+    while (index < nodes.size) {
+        edgeStart.append(edgeTo.size)
+        val visitedItem = nodes[index]
+        val owner = reach.declarations[reach.itemDeclarations[visitedItem]]
+        val method = reach.itemMethods[visitedItem]
+        val declaration = if (method < 0) owner else owner.methods[method]
+        val names: array<string> = []
+        if (bootstrapCtScanBody(declaration.expression, names)) return true
+        for (parameterDefault in declaration.parameterDefaults) {
+            if (bootstrapCtScanBody(parameterDefault, names)) return true
+        }
+        if (method < 0) {
+            for (member in declaration.methods) {
+                val ignored: array<string> = []
+                if (bootstrapCtScanBody(member.expression, ignored)) return true
+            }
+        }
+        for (name in names) {
+            var target = reach.table.find(name, -1)
+            while (target >= 0) {
+                if (reach.visited[target]) {
+                    edgeTo.append(position[target])
+                    indegree[position[target]] = indegree[position[target]] + 1
+                }
+                target = reach.itemNext[target]
+            }
+        }
+        index = index + 1
+    }
+    edgeStart.append(edgeTo.size)
+    // Kahn's order: a node left with an incoming edge lies on (or after) a cycle.
+    val ready: array<int> = []
+    index = 0
+    while (index < nodes.size) {
+        if (indegree[index] == 0) ready.append(index)
+        index = index + 1
+    }
+    var removed = 0
+    while (ready.size > 0) {
+        val node = ready[ready.size - 1]
+        ready.truncate(ready.size - 1)
+        removed = removed + 1
+        var edge = edgeStart[node]
+        while (edge < edgeStart[node + 1]) {
+            indegree[edgeTo[edge]] = indegree[edgeTo[edge]] - 1
+            if (indegree[edgeTo[edge]] == 0) ready.append(edgeTo[edge])
+            edge = edge + 1
+        }
+    }
+    removed < nodes.size
 }
 
 // `expression` with each `#e` as `e`: inside compile-time code, compile-time code
@@ -1410,6 +1523,8 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string,
         }
     }
     var ready = 0
+    val auto = bootstrapCtMode() == "auto"
+    var anyLong = false
     for (site in bootstrapCtSites) {
         if (site.reason == "" && implicitReason != "") site.reason = implicitReason
         site.encodes = !site.action && site.type != "void" && site.type != "null"
@@ -1434,6 +1549,12 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string,
             }
             if (site.reason == "") site.reason = reach.unsupported(site.expression, reached, false,
                 site.sourceIdentity)
+            // Under auto, whether the site can run long, while reach.visited is its walk (once one site
+            // can, the pass has a generation whatever the others are, so they are not asked).
+            if (site.reason == "" && auto && !anyLong) {
+                site.long = bootstrapCtMayRunLong(reach, site.expression)
+                anyLong = site.long
+            }
             if (crossTarget && site.reason == "") {
                 // Whole bodies are kept even where the phase proof skips an arm.
                 // A global reached only from that arm would nevertheless initialize
@@ -1529,6 +1650,25 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string,
                 }
             }
             owned = owned + 1
+        }
+    }
+    // Under auto, a pass none of whose native-ready sites can run long (bootstrapCtMayRunLong) is
+    // interpreted whole: the interpreter's steps for each are bounded by the size of its code, which costs
+    // less than the native generation (hundreds of milliseconds of code generation). Decided before any
+    // site runs, and the whole pass, so no global is shared between the tiers.
+    if (auto && ready > 0) {
+        var long = false
+        for (site in bootstrapCtSites) {
+            if (site.reason == "" && site.long) long = true
+        }
+        if (!long) {
+            for (site in bootstrapCtSites) {
+                if (site.reason == "") {
+                    site.reason =
+                        "auto: no site of this pass reaches a loop, a lambda or recursion, so the interpreter runs them without a native generation"
+                }
+            }
+            ready = 0
         }
     }
     // The owned globals go back to the interpreter's journal after every native call, as compile globals do
@@ -1824,6 +1964,11 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string,
     // Whether the generation can start threads (its runtime creates them with pthread_create): ct_eval.ab enables the
     // compiler heap's lock before calling into it.
     bootstrapCtGenerationThreads = !pointerIsNull(LLVMGetNamedFunction(module, "pthread_create"))
+    // The root manifest's nativeLibraries, loaded into the process's global scope (when the program holds
+    // the trusted.native grant), where the session's process generator resolves the slice's extern:"c"
+    // symbols as the interpreter's calls find them (ct_native.ab). Else a site calling one failed the
+    // generation: "Symbols not found".
+    val libraries = bootstrapCtNativeLibraries(parsed)
     val added = bootstrapCtSessionState.addModule(context, module, bootstrapCtSlicePasses(program.functions.size))
     if (added.status != 0) {
         bootstrapCtFailReady("ORC rejected the slice (status ${added.status})")

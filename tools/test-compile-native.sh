@@ -82,6 +82,15 @@ LIBRARY_PATH="$library_directory" run_case "$cases/library" \
     "$output_directory/library" build
 expect_42 "$cases/library" "$output_directory/library" \
     LD_LIBRARY_PATH="$library_directory" DYLD_LIBRARY_PATH="$library_directory"
+# The same sites natively (the default tier leaves these loop-free ones to the interpreter): the
+# generation resolves the library's symbols as the interpreter's calls do.
+(cd "$cases/library" && LIBRARY_PATH="$library_directory" ABLA_COMPILE_EVAL=jit ABLA_COMPILE_EVAL_TRACE=1 \
+    "$compiler" build main.ab -o "$output_directory/library-jit" --no-cache) \
+    2> "$output_directory/library-jit.trace"
+[[ $(grep -c '^note\[ct-jit\]: native at' "$output_directory/library-jit.trace") -eq 4 ]] ||
+    { cat "$output_directory/library-jit.trace" >&2; echo "library: not every site ran natively under jit" >&2; exit 1; }
+expect_42 "$cases/library" "$output_directory/library-jit" \
+    LD_LIBRARY_PATH="$library_directory" DYLD_LIBRARY_PATH="$library_directory"
 
 # A library that is not found: the missing symbol names it.
 set +e

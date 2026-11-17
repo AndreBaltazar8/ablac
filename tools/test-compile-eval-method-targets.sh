@@ -3,6 +3,7 @@ set -euo pipefail
 compiler=${1:-build/ablac}
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
+. tools/lib/ct-auto-trace.sh
 out=build/compile-eval-method-targets
 mkdir -p "$out"
 "$compiler" build tests/cases/compile-eval-method-targets/facts.ab --fast --no-cache \
@@ -21,7 +22,10 @@ for name in unrelated selected interface generic default-interface default-safe 
     cmp "$out/$name-interp.wasm" "$out/$name-jit.wasm"
     cmp "$out/$name-interp.wasm" "$out/$name-auto.wasm"
 done
-for tier in jit auto; do
+for name in unrelated selected interface generic default-interface default-safe field-unrelated field-called field-default field-delegate name-unrelated free-unrelated free-called library-unrelated; do
+    ct_auto_follows_jit "$out/$name-auto.log" "$out/$name-jit.log" || { echo "method targets: $name auto: not the jit choices" >&2; exit 1; }
+done
+for tier in jit; do
     for name in unrelated selected interface generic default-interface default-safe field-unrelated field-called field-default field-delegate name-unrelated free-unrelated free-called library-unrelated; do
         # Byte offset just past `val H = ` is where the compile-time call starts.
         marker=$(( $(grep -boa 'val H = #' "tests/cases/compile-eval-method-targets/$name.ab" | head -n 1 | cut -d: -f1) + 8 ))

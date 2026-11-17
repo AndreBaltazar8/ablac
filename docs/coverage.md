@@ -80,7 +80,7 @@ Test scripts marked † run in no suite: neither the Makefile `test` target nor
 | Capabilities, `abla.toml`, `compilerGrant` | `sema.ab`, `module.ab`, `eval.ab` | [compile-time.md#capabilities-files-environment-processes-network](compile-time.md#capabilities-files-environment-processes-network) | good | test-compile-effects, test-compile-effect-path |
 | Step limit, `ABLA_EVAL_STEP_LIMIT` | `eval.ab` | [compile-time.md#limits](compile-time.md#limits) | good | test-eval-steps |
 | Declaration blocks | `parser.ab`, `sema.ab`, `eval.ab` | [compile-time.md#declaration-blocks](compile-time.md#declaration-blocks) | reference | test-independent-modules |
-| `ABLA_COMPILE_EVAL` (interpreter / JIT) | in progress | — | missing | — |
+| `ABLA_COMPILE_EVAL` (`auto` default, `interp`, `jit`) | `ct_eval.ab`, `ct_jit.ab`, `ct_native.ab` | [compile-time.md#native-evaluation](compile-time.md#native-evaluation) | good | test-compile-eval-jit, test-compile-eval-tier, test-compile-time-parity |
 | Compiler reflection, transforms, generated modules, exports | `eval.ab`, `stdlib/abla/compiler` | [compiler-api.md](compiler-api.md) | good (reflection, transforms, types run; generated modules reference) | compiler tests (69 files) |
 | Subparsers `$name` | `subparser.ab`, `stdlib/abla/compiler/parser` | [subparsers.md](subparsers.md) | good (tutorial runs) | subparser tests (34 files) |
 | Programmable builds | `toolchain.ab`, `stdlib/abla/build` | [programmable-builds.md](programmable-builds.md) | reference | test-programmable-build, test-target-descriptors |
@@ -115,8 +115,6 @@ Test scripts marked † run in no suite: neither the Makefile `test` target nor
 
 ## Open documentation gaps
 
-- `ABLA_COMPILE_EVAL` and compile-time native calls: to be documented when
-  they land.
 - Networking: `abla/websocket/event`, `abla/websocket/tls` and
   `abla/http/async` have prose and fragments but no runnable example.
 - `abla/html`, `abla/compression/gzip`, `abla/llvm/*`.

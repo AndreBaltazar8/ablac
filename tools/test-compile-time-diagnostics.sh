@@ -57,7 +57,9 @@ grep -q "^  --> unicode-column.ab:$line:$column\$" "$log" ||
     fail "unicode: expected unicode-column.ab:$line:$column" "$log"
 
 log=$output/memory.log
-build_fails compile-time-memory.ab "$log"
+# The evaluator has no program heap (natively, by default, the site answers as the program does). A cache
+# of its own: the build cache is the same for every tier, and a default-tier build of the case succeeds.
+(export ABLA_COMPILE_EVAL=interp ABLA_CACHE_DIR="$output/memory-cache"; build_fails compile-time-memory.ab "$log")
 grep -q '^error\[E_EVAL_MEMORY_UNAVAILABLE\]: `runtimeMemoryLiveBytes` has no program heap' "$log" ||
     fail "memory: not denied" "$log"
 ! grep -q '`runtimeMemoryCollect` has no program heap' "$log" ||

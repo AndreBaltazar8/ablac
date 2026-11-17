@@ -255,7 +255,7 @@ test-serial: ablac
 	tools/test-formatter.sh $(COMPILER)
 	tools/test-generic-close.sh $(COMPILER)
 	tools/test-compile-time-diagnostics.sh $(COMPILER)
-	PARITY_SET=probes PARITY_OUTPUT=$(BUILD_DIR)/compile-time-parity-probes tools/test-compile-time-parity.sh $(COMPILER)
+	PARITY_SET=probes PARITY_MODES="interp auto" PARITY_OUTPUT=$(BUILD_DIR)/compile-time-parity-probes tools/test-compile-time-parity.sh $(COMPILER)
 	tools/test-compile-time-parity-sample.sh $(COMPILER)
 	tools/test-compile-time-parity-guard.sh
 	tools/test-eval-scopes-guard.sh
@@ -274,6 +274,7 @@ test-serial: ablac
 	tools/test-thread-globals.sh $(COMPILER)
 	tools/test-compile-global-graph.sh $(COMPILER)
 	tools/test-compile-eval-jit.sh $(COMPILER)
+	tools/test-compile-eval-tier.sh $(COMPILER)
 	tools/test-compile-eval-shared-state.sh $(COMPILER) host
 	tools/test-compile-eval-shared-state.sh $(COMPILER) wasm
 	tools/test-compile-eval-json.sh $(COMPILER)

@@ -353,7 +353,7 @@ already-kept shared graph unpersistable, compilation stops before changing the
 journal and names the global and unsupported value kind. This prevents another
 alias from seeing an older copy of the shared value.
 
-Under `jit` and `auto`, an ordinary global (a plain `val` or `var`, not a
+Under `auto` (the default) and `jit`, an ordinary global (a plain `val` or `var`, not a
 `compile val` or `compile var`) that compile-time code can write has one owner
 for the pass. The native tier owns it when every site of the pass that reaches
 it can run natively. The global must also have a type the native tier can hand
@@ -627,7 +627,7 @@ The limit bounds accidental endless loops as well as finite computations.
 An endless loop stops with:
 
 ```text
-error[E_EVAL_STEP_LIMIT]: compile-time evaluation ran past 50000000 steps (an endless loop?); adjust ABLA_EVAL_STEP_LIMIT or try ABLA_COMPILE_EVAL=jit for heavy compile-time work (unsupported sites still use the evaluator)
+error[E_EVAL_STEP_LIMIT]: compile-time evaluation ran past 50000000 steps (an endless loop?); adjust ABLA_EVAL_STEP_LIMIT; the native tier has no step limit, and ABLA_COMPILE_EVAL_TRACE=1 says why it did not take this site
 ```
 
 `ABLA_EVAL_STEP_LIMIT=<n>` overrides the limit for a build, either raising it
@@ -635,9 +635,11 @@ for heavier computations or lowering it in tests. It accepts a positive decimal
 integer of at most 18 digits; empty, zero, negative, malformed or longer values
 keep the default. For example, `ABLA_EVAL_STEP_LIMIT=200000000 ablac build app.ab`
 allows four times the default work per evaluation. Increasing the limit also lets
-an accidental endless loop run longer. `ABLA_COMPILE_EVAL=jit` can run eligible
-compile-time sites as native code; unsupported sites still use the evaluator and
-its step limit. The default evaluation tier is unchanged.
+an accidental endless loop run longer. The step limit is the evaluator's: by
+default a site the native tier can take runs as native code, which has none,
+unless no site of its pass reaches a loop or recursion
+([native evaluation](#native-evaluation)). `ABLA_COMPILE_EVAL_TRACE=1` says
+why a site ran in the evaluator.
 
 Recursion at compile time is bounded by the compiler's own stack. The
 evaluator measures how much of that stack nested evaluation has used and stops
@@ -857,9 +859,38 @@ fun main {
 
 ## Native evaluation
 
-`ABLA_COMPILE_EVAL=jit` runs compile-time code as machine code instead of in
-the evaluator; the default is still `interp` while the native tier is
-completed, and `auto` is the same as `jit` today. After type checking, each
+Compile-time code runs as machine code where it can, and in the evaluator
+where it can't. `ABLA_COMPILE_EVAL` chooses the tier:
+
+- `jit`: each site the native tier can take runs natively, and every other
+  site runs in the evaluator. The choice is made for each site before
+  anything runs, from what the slice below proves about the site (its reach,
+  the globals it can write and the type of its result), so no site runs twice
+  to choose, and a site with effects (a network call, a process, a file
+  write) performs them once.
+- `auto` (the default, also when the variable is unset or empty): as `jit`,
+  except for a compile pass none of whose sites can run long. Such a pass
+  runs in the evaluator, without a native generation, whose code generation
+  costs hundreds of milliseconds. A site *can run long* when the code it
+  reaches holds a loop (`while`, `do`/`while`, `for`), a lambda (a local
+  function can call itself through one), an `atomic` block or a call through
+  a function value, or when the functions it reaches call each other in a
+  cycle (recursion). Without any of these the evaluator's work for a site is
+  bounded by the size of its code. The rule is decided before any site runs
+  and covers the whole pass, so no global is shared between the tiers. A
+  table built in a loop, a hash, a parser or a TLS handshake runs natively;
+  `#square(6)` costs no code generation.
+- `interp`: every site runs in the evaluator.
+
+`ABLA_COMPILE_EVAL_TRACE=1` prints the tier each site ran on and, for a site
+left to the evaluator, the reason.
+- `bridge`: the evaluator, calling the compiler API through the native
+  bridge (a check of the bridge).
+
+The action journal (`ABLA_ACTION_JOURNAL`) records evaluated actions only:
+when it is on and `ABLA_COMPILE_EVAL` names no tier, the tier is `interp`.
+
+After type checking, each
 compile pass builds one *slice* of the program: the declarations its `#expression`s and actions reach, the
 runtime, and an exported entry per site, with compile declarations compiled
 as ordinary code. The slice goes through the same code generator as the
@@ -885,7 +916,7 @@ native code can't take in (an object, a map, a nested array, or any value of a
 site not proven portable, the REPL, and a compilation that compile-time code
 starts inside the active outer pass.
 
-With explicit `jit` or `auto`, a Wasm32 module (including a `wasmBuildModule`
+Under `auto` (the default) and `jit`, a Wasm32 module (including a `wasmBuildModule`
 child) can run portable compile-time sites natively. Other cross-target families
 keep their existing evaluator fallback. The slice
 always uses the host's code generator and layout; a Wasm platform runtime is
@@ -909,7 +940,7 @@ sites interpreted until those roots have a portability proof. Such sites keep th
 `ABLA_COMPILE_EVAL_TRACE=1` names the first dependency the proof refuses. The
 `ablaAtCompileTime()` branches used by byte buffers are true on both tiers, so
 unexecuted native staging paths do not make their portable SHA operations target
-dependent. This does not change the default tier or permit a genuinely reentrant
+dependent. This does not permit a genuinely reentrant
 compile pass to replace its outer pass's JIT state.
 
 JSON in a cross-target site (#795): `jsonParse`, `jsonDocument` and their readers

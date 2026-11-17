@@ -3,6 +3,7 @@ set -euo pipefail
 compiler=${1:-build/ablac}
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
+. tools/lib/ct-auto-trace.sh
 out=build/compile-eval-directory
 mkdir -p "$out/project" "$out/input"
 cp tests/cases/compile-eval-directory/lookup.ab "$out/project/lookup.ab"
@@ -84,8 +85,10 @@ for (let i = 0; i < bytes.length; ++i) bytes[i] = Number(e.tableByte(BigInt(i)))
 assert.deepEqual(bytes, fs.readFileSync(process.argv[3]));
 NODE
         check_journal "$state" "$mode"
-        if [[ $mode != interp ]]; then
+        if [[ $mode == jit ]]; then
             check_native_trace "$state" "$out/$state-$mode.log"
+        elif [[ $mode == auto ]]; then
+            ct_auto_follows_jit "$out/$state-auto.log" "$out/$state-jit.log" || fail "$state auto: not the jit choices"
         fi
     done
     cmp "$out/$state-interp.wasm" "$out/$state-jit.wasm"

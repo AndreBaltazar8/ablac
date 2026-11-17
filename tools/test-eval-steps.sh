@@ -6,6 +6,8 @@ project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 output_directory="$project_root/build/eval-steps"
 mkdir -p "$output_directory"
 program="$project_root/tests/cases/eval-steps/main.ab"
+# The evaluator's steps: by default a site the native tier takes runs natively, without a step limit.
+export ABLA_COMPILE_EVAL=interp
 
 # The compile-time evaluator counts steps exactly as before: the program takes
 # 358, so a limit of 357 stops it at its last step and 358 lets it finish. A
@@ -110,7 +112,7 @@ for expression in "${expressions[@]}"; do
         log="$output_directory/operand-$case_number-$limit.out"
         if [[ $status -ne 1 || $(grep -c '^error\[' "$log") -ne 1 ]] ||
             ! grep -Fq 'error[E_EVAL_STEP_LIMIT]' "$log" ||
-            ! grep -Fq 'ABLA_COMPILE_EVAL=jit' "$log"; then
+            ! grep -Fq 'ABLA_COMPILE_EVAL_TRACE=1' "$log"; then
             echo "eval-steps: $expression at $limit steps did not give exactly one step-limit error" >&2
             cat "$log" >&2
             exit 1

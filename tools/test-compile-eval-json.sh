@@ -8,11 +8,12 @@ set -euo pipefail
 compiler=${1:-build/ablac}
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
+. tools/lib/ct-auto-trace.sh
 out=build/compile-eval-json
 cases=tests/cases/compile-eval-json
 rm -rf "$out"
 mkdir -p "$out"
-# fixture|(unused)|native sites in a Wasm jit/auto build|interpreted sites|the reason every interpreted site names
+# fixture|(unused)|native sites in a Wasm jit build (auto makes jit's choices, or interprets a pass whole)|interpreted sites|the reason every interpreted site names
 table=(
     "dom|-|2|0|"
     "errors|-|2|0|"
@@ -59,7 +60,8 @@ for row in "${table[@]}"; do
                 actual=$(wasm_result "$out/result.wasm")
             fi
             [[ $actual == "$expected" ]] || fail "$name $target $tier: [$actual] != [$expected]"
-            if [[ $target == wasm && $tier != interp ]]; then
+            [[ $tier != auto ]] || ct_auto_follows_jit "$log" "$out/$name-$target-jit.log" || fail "$name $target auto: not the jit choices"
+            if [[ $target == wasm && $tier == jit ]]; then
                 nativeCount=$(grep -c '^note\[ct-jit\]: native at ' "$log" || true)
                 interpretedCount=$(grep -c '^note\[ct-jit\]: interpreted at ' "$log" || true)
                 # The build program's own site (wasmBuildModule) is native too: one more than the fixture's.

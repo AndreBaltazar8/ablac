@@ -3,6 +3,7 @@ set -euo pipefail
 compiler=${1:-build/ablac}
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
+. tools/lib/ct-auto-trace.sh
 out=build/compile-eval-environment
 mkdir -p "$out/project"
 fail() { echo "compile-eval-environment: $1" >&2; exit 1; }
@@ -23,6 +24,10 @@ check_environment_trace() {
             || fail "$tag: a changed value did not rewrite the same sidecar"
     fi
     [[ $tier != interp ]] || return 0
+    if [[ $tier == auto ]]; then
+        ct_auto_follows_jit "$tag.log" "$out/$shape-$state-jit.log" || fail "$tag: not the jit choices"
+        return 0
+    fi
     pos=$(( $(grep -boa 'val TABLE = #' "$out/project/table.ab" | head -n 1 | cut -d: -f1) + 12 ))
     expression_pos=$((pos + 1))
     [[ $(dd if="$out/project/table.ab" bs=1 skip=$((pos + 1)) count=1 2> /dev/null) != '(' ]] || expression_pos=$((pos + 2))
