@@ -2,7 +2,7 @@
 # The streaming API of abla/http/async (tests/cases/http2/streamnet.ab) against h2o and nghttpd, over h2c and over TLS: a download of STREAM_BYTES (default 1 GiB, a sparse file served
 # by h2o) read piece by piece, an upload of the same size written as writeBody takes it (nghttpd reads the body), and a consumer that stops reading. What it checks besides the bytes:
 # an unread stream holds at most one stream window (262144 bytes) of the peer's data, writeBody tells a fast sender to wait, and the client process' resident memory stays far below the
-# transfer (STREAM_RSS_LIMIT_KIB, default 65536). The TLS runs use STREAM_TLS_BYTES (default 64 MiB): the pure-Abla cipher is not the thing under test.
+# transfer (STREAM_RSS_LIMIT_KIB, default 131072: about twice what a transfer of any size peaked at, 70 MB at 256 MiB and beyond). The TLS runs use STREAM_TLS_BYTES (default 64 MiB): the pure-Abla cipher is not the thing under test.
 # Usage: tools/test-http2-stream.sh [compiler]. Needs openssl, h2o and nghttpd (nix-shell provides them).
 set -euo pipefail
 compiler=${1:-build/ablac}
@@ -14,7 +14,7 @@ for tool in openssl h2o nghttpd; do
 done
 bytes=${STREAM_BYTES:-1073741824}
 tls_bytes=${STREAM_TLS_BYTES:-67108864}
-limit=${STREAM_RSS_LIMIT_KIB:-65536}
+limit=${STREAM_RSS_LIMIT_KIB:-131072}
 out=build/http2-stream
 rm -rf "$out"
 mkdir -p "$out/docroot" "$out/sink"

@@ -2,7 +2,7 @@
 //   streamnet <port> <certificate.pem or "-" for h2c> <mode> <bytes> <path>
 //   down   GET /gig.bin (a file of <bytes> zero bytes served by h2o): read in pieces with readStream, every byte counted and zero; a first phase where nothing is read for 600 ms: what waits
 //          never exceeds one stream window (262144), the peer is stalled, not buffered; then the rest. The process' resident memory stays far below <bytes> (peak printed).
-//   up     POST <path> (an existing file of nghttpd, which reads the body and answers with the file) with <bytes> written in 64 KiB pieces as writeBody takes them (0 means wait for WRITABLE), then finishBody: the response is
+//   up     POST <path> (an existing file of nghttpd, which reads the body and answers with the file) with <bytes> written in 64 KiB pieces as writeBody takes them (0 means wait for WRITABLE), then finishBody; the answer is read (END waits for its last byte): the response is
 //          200, writeBody was told to wait at least once (the sender was faster than the peer's windows), memory stays flat.
 //   slow   a consumer that reads 100 bytes and then nothing for 1.5 s while the peer has a whole body for it: pending stays at most one window, and the stream is still alive after
 //          (idle timeout 30 s); then it reads everything.
@@ -14,6 +14,7 @@ import "abla/process/arguments"
 import "abla/process/metrics"
 import "abla/sys/linux"
 import "abla/sys/linux/process"
+import "abla/text"
 
 var failures = 0
 var peak = 0
@@ -113,6 +114,9 @@ fun up(var client: HttpAsyncClient, base: string, path: string, total: int): voi
                 return
             }
         }
+        // The response body has to be read too: END comes after its last byte was taken.
+        var reply = client.readStream(id, 65536)
+        while (reply.size > 0) reply = client.readStream(id, 65536)
         var more = writable && sent < total
         while (more) {
             val want = if (total - sent < piece.size) total - sent else piece.size
@@ -127,7 +131,10 @@ fun up(var client: HttpAsyncClient, base: string, path: string, total: int): voi
             } else {
                 sent = sent + taken
                 // A partial take leaves the rest of this piece: it is offered again whole next round (the bytes are all "u").
-                if (taken < want) more = false
+                if (taken < want) {
+                    waited = waited + 1
+                    more = false
+                }
                 if (sent >= total) {
                     client.finishBody(id)
                     more = false
@@ -141,7 +148,7 @@ fun up(var client: HttpAsyncClient, base: string, path: string, total: int): voi
     if (!ended) fail("the upload did not end: sent $sent of $total")
     if (status != 200) fail("upload status $status")
     if (sent != total) fail("sent $sent of $total")
-    if (waited == 0 && total > 4194304) fail("writeBody never told the sender to wait: no backpressure on $total bytes")
+    if (waited == 0 && total > 4194304) fail("writeBody never took less than it was offered: no backpressure on $total bytes")
     return
 }
 
