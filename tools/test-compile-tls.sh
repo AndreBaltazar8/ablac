@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The compiler's own TLS (abla/platform/host/tls, over abla/tls/pure: no OpenSSL) at compile time and in the program it
-# builds, against `openssl s_server`: a TLS 1.3 and a TLS 1.2 server answer; a host name the certificate does not name
+# builds with the network grant only (default tier), against `openssl s_server`: a TLS 1.3 and a TLS 1.2 server answer; a host name the certificate does not name
 # (the SAN is DNS:localhost; 127.0.0.1 is refused), an expired certificate and a closed port are refused with the stage in
 # the error, and nothing hangs. The compile-time and the run-time results are the same. Skipped without openssl.
 set -euo pipefail
@@ -45,8 +45,8 @@ kill "${pids[${#pids[@]}-1]}" 2> /dev/null || true
 wait "${pids[${#pids[@]}-1]}" 2> /dev/null || true
 sed -e "s#@PORT13@#$port13#g; s#@PORT12@#$port12#g; s#@PORTEXPIRED@#$port_expired#g; s#@PORTCLOSED@#$port_closed#g" \
     -e "s#@CA@#$out/good.pem#g; s#@EXPIREDCA@#$out/expired.pem#g" tests/cases/compile-tls/main.ab > "$out/main.ab"
-printf 'compileCapabilities = ["filesystem.read", "environment", "clock", "trusted.native"]\n' > "$out/abla.toml"
-ABLA_COMPILE_EVAL=jit "$compiler" build "$out/main.ab" -o "$out/main" --no-cache
+printf 'compileCapabilities = ["network"]\n' > "$out/abla.toml"
+"$compiler" build "$out/main.ab" -o "$out/main" --no-cache
 status=0
 timeout 120 "$out/main" > "$out/run.log" 2>&1 || status=$?
 cat "$out/run.log"
@@ -55,4 +55,52 @@ refused='refused: TLS failed at certificate_verification'
 expected="HTTP/1.0 200 ok | HTTP/1.0 200 ok | $refused | $refused | refused: TLS failed at tcp_connect"
 grep -Fxq "compiled: $expected" "$out/run.log" || { echo 'compile-tls: the compile-time results differ' >&2; exit 1; }
 grep -Fxq "running: $expected" "$out/run.log" || { echo 'compile-tls: the run-time results differ' >&2; exit 1; }
-echo 'compile-tls: TLS 1.3 and 1.2 at compile time and run time, a wrong host name and an expired certificate refused, a closed port reported'
+
+# The network grant covers the TLS code's own effects and nothing beside it (docs/compile-time.md, network scopes).
+# Without the grant the fetch is denied for network; with it, the program's own clock or environment read next to the
+# fetch is still denied for itself.
+negative() { # <name> <expected error> <program>
+    local name=$1 expected=$2
+    mkdir -p "$out/$name"
+    printf 'compileCapabilities = ["network"]\n' > "$out/$name/abla.toml"
+    cat > "$out/$name/main.ab"
+    if "$compiler" build "$out/$name/main.ab" -o "$out/$name/main" --no-cache > "$out/$name.log" 2>&1; then
+        echo "compile-tls: $name was built, expected $expected" >&2
+        exit 1
+    fi
+    grep -Fq "$expected" "$out/$name.log" || { echo "compile-tls: $name: expected $expected" >&2; cat "$out/$name.log" >&2; exit 1; }
+}
+negative nogrant 'compile.effect-denied:network' << EOF2
+import "abla/platform/host"
+import "abla/platform/host/tls"
+fun fetch(): string {
+    val handle = ablaHostTlsOpenWithCa("localhost", $port13, 5000, "$out/good.pem")
+    if (handle < 0) "refused" else "open"
+}
+fun main(): int = if (#fetch() == "open") 42 else 1
+EOF2
+negative ownclock 'compile.effect-denied:clock' << EOF2
+import "abla/compiler"
+import "abla/platform/host"
+import "abla/platform/host/tls"
+import "abla/process/time"
+#compilerGrant("network")
+fun fetch(): string {
+    val started = monotonicMilliseconds()
+    val handle = ablaHostTlsOpenWithCa("localhost", $port13, 5000, "$out/good.pem")
+    if (handle < 0 || started < 0) "refused" else "open"
+}
+fun main(): int = if (#fetch() == "open") 42 else 1
+EOF2
+negative ownenvironment 'compile.effect-denied:environment' << EOF2
+import "abla/compiler"
+import "abla/platform/host"
+import "abla/platform/host/tls"
+#compilerGrant("network")
+fun fetch(): string {
+    val handle = ablaHostTlsOpenWithCa("localhost", $port13, 5000, "$out/good.pem")
+    if (handle < 0 || compilerEnvironment("HOME") == "x") "refused" else "open"
+}
+fun main(): int = if (#fetch() == "open") 42 else 1
+EOF2
+echo 'compile-tls: TLS 1.3 and 1.2 at compile time and run time with the network grant only, a wrong host name and an expired certificate refused, a closed port reported; without the grant, or with its own clock or environment read beside it, the build is denied'
