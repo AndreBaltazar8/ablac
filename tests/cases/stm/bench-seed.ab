@@ -1,0 +1,125 @@
+import "abla/io"
+import "abla/process/time"
+import "abla/runtime/scalar"
+import "./stm.ab"
+
+// A TVar takes the clock of the thread whose logged transaction reaches it first. Sixteen TVars, four threads each using
+// four of them: "own", each thread reaches its own four first (four clocks); "seeded", one thread reaches all sixteen
+// first (one clock for everything, as when a worker initialises a structure the others then use). ns per block.
+
+resource class TVars(val cells: array<any>)
+
+val own: Shared<TVars> = Shared(makeTVars())
+val seeded: Shared<TVars> = Shared(makeTVars())
+
+fun makeTVars(): TVars {
+    val made: array<any> = []
+    var index = 0
+    while (index < 16) {
+        made.append(tvar(0))
+        index = index + 1
+    }
+    TVars(made)
+}
+
+trusted fun regionOf(cell: any): int = ablaRuntimeLoadI64(__ablaRuntimeSharedControl(cell, 14) + 8)
+
+val ROUNDS = 300000
+
+fun touchown(first: int, count: int): int = atomically {
+    var index = first
+    while (index < first + count) {
+        writeInt(own.get().cells[index], readInt(own.get().cells[index]))
+        index = index + 1
+    }
+    0
+}
+
+fun workerown(first: int): int {
+    val body = {
+        var sum = 0
+        var index = first
+        while (index < first + 4) {
+            val value = readInt(own.get().cells[index])
+            writeInt(own.get().cells[index], value + 1)
+            sum = sum + value
+            index = index + 1
+        }
+        sum
+    }
+    var round = 0
+    var sum = 0
+    while (round < ROUNDS) {
+        sum = sum + atomically(body)
+        round = round + 1
+    }
+    sum
+}
+
+fun runown(): int {
+    val started = monotonicNanoseconds()
+    val a = thread { workerown(0) }
+    val b = thread { workerown(4) }
+    val c = thread { workerown(8) }
+    val d = thread { workerown(12) }
+    await a + await b + await c + await d
+    (monotonicNanoseconds() - started) / (4 * ROUNDS)
+}
+fun touchseeded(first: int, count: int): int = atomically {
+    var index = first
+    while (index < first + count) {
+        writeInt(seeded.get().cells[index], readInt(seeded.get().cells[index]))
+        index = index + 1
+    }
+    0
+}
+
+fun workerseeded(first: int): int {
+    val body = {
+        var sum = 0
+        var index = first
+        while (index < first + 4) {
+            val value = readInt(seeded.get().cells[index])
+            writeInt(seeded.get().cells[index], value + 1)
+            sum = sum + value
+            index = index + 1
+        }
+        sum
+    }
+    var round = 0
+    var sum = 0
+    while (round < ROUNDS) {
+        sum = sum + atomically(body)
+        round = round + 1
+    }
+    sum
+}
+
+fun runseeded(): int {
+    val started = monotonicNanoseconds()
+    val a = thread { workerseeded(0) }
+    val b = thread { workerseeded(4) }
+    val c = thread { workerseeded(8) }
+    val d = thread { workerseeded(12) }
+    await a + await b + await c + await d
+    (monotonicNanoseconds() - started) / (4 * ROUNDS)
+}
+
+fun main: int {
+    alwaysLogged(true)
+    await thread { touchown(0, 4) }
+    await thread { touchown(4, 4) }
+    await thread { touchown(8, 4) }
+    await thread { touchown(12, 4) }
+    await thread { touchseeded(0, 16) }
+    alwaysLogged(false)
+    println("regions own ${regionOf(own.get().cells[0])} ${regionOf(own.get().cells[4])} ${regionOf(own.get().cells[8])} seeded ${regionOf(seeded.get().cells[0])} ${regionOf(seeded.get().cells[4])} ${regionOf(seeded.get().cells[8])}")
+    var line = ""
+    for (repeat in 0 until 12) {
+        val a = runown()
+        val b = runseeded()
+        line = line + " own $a seeded $b |"
+    }
+    println("ns per block:$line")
+    0
+}
