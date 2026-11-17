@@ -10,6 +10,8 @@
 #   sha256      every `.sha256` file matches its asset, and every asset has one
 #   version     the Linux binary's --version prints `ablac <tag without v>`
 #   stage2      the Linux binary is byte for byte the local stage 2 (cmp)
+#   convergence a green bootstrap-convergence run exists for the release's source commit (tools/release-convergence.sh);
+#               required: without --source-ref (or the tag) and a run, this check fails
 #
 # Options:
 #   --repo OWNER/REPO     (default AndreBaltazar8/ablac)
@@ -18,6 +20,12 @@
 #   --previous TAG        the release whose asset names to compare (default: the highest published
 #                         release below <tag>)
 #   --assets-from FILE    the expected asset names, one per line, instead of asking GitHub
+#   --source-ref SHA      the commit the release is made from, for the convergence check (default: the commit
+#                         <tag> already names)
+#   --convergence-run ID  the bootstrap-convergence workflow run to check (default: the newest green one that matches)
+#   --convergence-comparison FILE
+#                         a downloaded comparison.json to check instead (with --lineage, no gh is needed)
+#   --lineage TAG         the convergence lineage to expect (default: the highest published release below <tag>)
 set -uo pipefail
 
 usage() {
@@ -30,6 +38,10 @@ out=
 artifacts=
 previous=
 assets_from=
+source_ref=
+convergence_run=
+convergence_comparison=
+lineage=
 positional=()
 while (($#)); do
     case $1 in
@@ -38,6 +50,10 @@ while (($#)); do
         --artifacts) artifacts=${2:?}; shift 2 ;;
         --previous) previous=${2:?}; shift 2 ;;
         --assets-from) assets_from=${2:?}; shift 2 ;;
+        --source-ref) source_ref=${2:?}; shift 2 ;;
+        --convergence-run) convergence_run=${2:?}; shift 2 ;;
+        --convergence-comparison) convergence_comparison=${2:?}; shift 2 ;;
+        --lineage) lineage=${2:?}; shift 2 ;;
         -h | --help) usage ;;
         -*) echo "release-check: unknown option $1" >&2; usage ;;
         *) positional+=("$1"); shift ;;
@@ -210,6 +226,19 @@ elif cmp -s "$linux" "$stage2"; then
     report PASS stage2 "cmp equal to $stage2 ($(sha256 "$stage2" | cut -c1-12))"
 else
     report FAIL stage2 "differs from $stage2 ($(sha256 "$linux" | cut -c1-12) against $(sha256 "$stage2" | cut -c1-12))"
+fi
+
+# 5. convergence: the historical-seed bootstrap routes agree on this release's source (required).
+convergence_args=(verify "$tag" --repo "$repo")
+[[ -z $source_ref ]] || convergence_args+=(--source-ref "$source_ref")
+[[ -z $lineage ]] || convergence_args+=(--lineage "$lineage")
+[[ -z $convergence_run ]] || convergence_args+=(--run "$convergence_run")
+[[ -z $convergence_comparison ]] || convergence_args+=(--comparison "$convergence_comparison")
+convergence=$("$(dirname -- "${BASH_SOURCE[0]}")/release-convergence.sh" "${convergence_args[@]}" 2>&1 | tail -n 1)
+if [[ $convergence == PASS* ]]; then
+    report PASS convergence "${convergence#PASS  convergence }"
+else
+    report FAIL convergence "${convergence#FAIL  convergence }"
 fi
 
 printf 'release-check %s  run %s  %s\n' "$tag" "$run_id" "$out"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tools/release-check.sh and tools/release-pin.sh on a made-up release (no network, no gh):
+# tools/release-check.sh, tools/release-convergence.sh and tools/release-pin.sh on a made-up release (no network, no gh):
 # what they accept, and each way they must refuse.
 set -euo pipefail
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -8,6 +8,7 @@ if [[ $(uname -s)/$(uname -m) != Linux/x86_64 ]]; then
     exit 0
 fi
 check=$project_root/tools/release-check.sh
+convergence=$project_root/tools/release-convergence.sh
 pin=$project_root/tools/release-pin.sh
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
@@ -50,16 +51,29 @@ done
 stage2=$work/stage2
 cp "$release/ablac-x86_64-linux" "$stage2"
 
+# The comparison.json a green bootstrap-convergence run leaves: lineage v9.9.8 (route A its release, route B v9.9.7),
+# the candidate being the commit the release is made from.
+source_ref=0123456789abcdef0123456789abcdef01234567
+hex64() { printf '%064d' "$1" | tr 0 "$2"; }
+comparison=$work/comparison.json
+cat >"$comparison" <<JSON
+{"passed": true, "candidate": {"revision": "$source_ref", "tree": "t"}, "lineage": "v9.9.8",
+ "seeds": {"a": {"version": "v9.9.8", "sha256": "$(hex64 0 a)"}, "b": {"version": "v9.9.7", "sha256": "$(hex64 0 b)"}},
+ "historical_revision": "$(printf '%040d' 0 | tr 0 c)", "canonical_root": "/build/source", "entry": "src/orc_main.ab",
+ "canonical_ir_sha256": "$(hex64 0 1)", "stage2_binary_sha256": "$(hex64 0 2)", "stage2_object_sha256": "$(hex64 0 3)",
+ "toolchain": {"environment_sha256": "$(hex64 0 4)", "closure_sha256": "$(hex64 0 5)"}}
+JSON
+convergence_flags=(--lineage v9.9.8 --source-ref "$source_ref" --convergence-comparison "$comparison")
 run_check() { # artifacts-dir tag stage2 [extra...]
     local directory=$1 tag=$2 local_stage2=$3
     shift 3
     "$check" "$tag" 1 "$local_stage2" --artifacts "$directory" --assets-from "$work/names.txt" \
-        --out "$work/out-$RANDOM" "$@"
+        --out "$work/out-$RANDOM" "${convergence_flags[@]}" "$@"
 }
 
 # --- release-check: accepts the good release.
 output=$(run_check "$release" v9.9.9 "$stage2") || { echo "$output" >&2; fail "release-check refused a good release"; }
-for name in assets sha256 version stage2; do
+for name in assets sha256 version stage2 convergence; do
     grep -q "^PASS  $name" <<<"$output" || { echo "$output" >&2; fail "no PASS line for $name"; }
 done
 grep -q '^RESULT: PASS' <<<"$output" || fail "no RESULT: PASS"
@@ -123,10 +137,39 @@ grep -q '^FAIL  assets.*same file name' "$work/out.txt" || fail "a repeated file
 mkdir -p "$work/empty-artifacts"
 expect_fail "no artifacts" run_check "$work/empty-artifacts" v9.9.9 "$stage2"
 grep -q '^FAIL  assets.*no files' "$work/out.txt" || fail "an empty artifacts directory did not fail clearly"
+# The convergence check is required: no run, a run of another source or lineage, a failed or incomplete comparison.
+no_gh=$work/no-gh
+mkdir -p "$no_gh"
+printf '#!/bin/sh\nexit 1\n' >"$no_gh/gh"
+chmod +x "$no_gh/gh"
+convergence_only() { # extra release-check options: the convergence line, with gh unavailable
+    PATH=$no_gh:$PATH "$check" v9.9.9 1 "$stage2" --artifacts "$release" --assets-from "$work/names.txt" --out "$work/out-$RANDOM" "$@"
+}
+expect_fail "no convergence run" convergence_only --lineage v9.9.8 --source-ref "$source_ref"
+grep -q '^FAIL  convergence' "$work/out.txt" || fail "a release with no convergence run did not fail the convergence check"
+expect_fail "no source commit" convergence_only --lineage v9.9.8 --convergence-comparison "$comparison"
+grep -q '^FAIL  convergence' "$work/out.txt" || fail "no source commit did not fail the convergence check"
+expect_fail "another source commit" convergence_only --lineage v9.9.8 --source-ref ffffffffffffffffffffffffffffffffffffffff --convergence-comparison "$comparison"
+grep -q '^FAIL  convergence.*not the release' "$work/out.txt" || fail "another source did not fail the convergence check"
+expect_fail "another lineage" convergence_only --lineage v9.9.7 --source-ref "$source_ref" --convergence-comparison "$comparison"
+grep -q '^FAIL  convergence.*lineage' "$work/out.txt" || fail "another lineage did not fail the convergence check"
+sed 's/"passed": true/"passed": false, "error": "route a: broken bootstrap chain"/' "$comparison" >"$work/failed.json"
+expect_fail "a failed comparison" convergence_only --lineage v9.9.8 --source-ref "$source_ref" --convergence-comparison "$work/failed.json"
+grep -q '^FAIL  convergence.*did not pass' "$work/out.txt" || fail "a failed comparison did not fail the convergence check"
+sed 's/"stage2_binary_sha256": "[0-9a-f]*", //' "$comparison" >"$work/incomplete.json"
+expect_fail "a comparison with no stage 2 hash" convergence_only --lineage v9.9.8 --source-ref "$source_ref" --convergence-comparison "$work/incomplete.json"
+expect_fail "a short source commit" convergence_only --lineage v9.9.8 --source-ref 0123456 --convergence-comparison "$comparison"
+
+# --- release-convergence: the PASS line and the release-notes text.
+"$convergence" verify v9.9.9 --lineage v9.9.8 --source-ref "$source_ref" --comparison "$comparison" >"$work/out.txt" ||
+    fail "release-convergence refused a good comparison"
+grep -q '^PASS  convergence v9.9.8 seeds' "$work/out.txt" || fail "no PASS line from release-convergence"
+expect_fail "release-convergence run without a source commit" env PATH="$no_gh:$PATH" "$convergence" run v9.9.9 --lineage v9.9.8
+
 # A second run into the directory the script made is allowed.
 out2=$work/out-again
-"$check" v9.9.9 1 "$stage2" --artifacts "$release" --assets-from "$work/names.txt" --out "$out2" >/dev/null || fail "release-check refused a first run"
-"$check" v9.9.9 1 "$stage2" --artifacts "$release" --assets-from "$work/names.txt" --out "$out2" >/dev/null || fail "release-check refused its own directory"
+"$check" v9.9.9 1 "$stage2" --artifacts "$release" --assets-from "$work/names.txt" --out "$out2" "${convergence_flags[@]}" >/dev/null || fail "release-check refused a first run"
+"$check" v9.9.9 1 "$stage2" --artifacts "$release" --assets-from "$work/names.txt" --out "$out2" "${convergence_flags[@]}" >/dev/null || fail "release-check refused its own directory"
 
 # --- release-pin: a checkout pinned to v9.9.8 moves to v9.9.9.
 root=$work/root

@@ -1680,8 +1680,11 @@ mmap form) apply there.
   Bounded first gate: manual Linux `bootstrap-convergence.yml` compares the pinned
   v0.2.45 route with v0.2.44 through the v0.2.45 source tag, raw pre-prune IR at
   identical logical paths, fixed points, provenance and compiler objects/binaries.
-  This is historical-seed convergence within one lineage; an independent translator
-  and target-independent maintenance remain open, as do both roadmap tiers.
+  This is historical-seed convergence within one lineage. It now gates each release: `tools/release-convergence.sh`
+  dispatches it for the release's source commit, `tools/release-check.sh` requires a green run, and the seed manifest is
+  written to the release notes. An independent translator (a second implementation of a frozen bootstrap subset; a design
+  decision, since `docs/bootstrap.md` rejects a second compiler implementation) and target-independent maintenance remain open,
+  as do both roadmap tiers.
 - [ ] **Language editions and a deprecation policy,** and signed package identities above the
   immutable locks, when the ecosystem needs them (`docs/reliability-roadmap.md` section 8).
 

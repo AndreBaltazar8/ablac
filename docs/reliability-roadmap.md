@@ -453,7 +453,10 @@ It checks exact raw, non-debug `--emit-llvm src/orc_main.ab` output, before
 release pruning or optimization, at the same absolute source path, with the
 same target and pinned LLVM environment. It strips no provenance or IR.
 Linux compiler objects and executables must also match. Logs, raw IR, seed
-and source hashes, stage chains and toolchain provenance are retained.
+and source hashes, stage chains and toolchain provenance are retained. A release is
+not published until this gate is green on its source commit
+(`tools/release-convergence.sh`, required by `tools/release-check.sh`), and the seed
+manifest goes into the release notes.
 
 This tests convergence from two historical starting artifacts within the same
 compiler lineage. It does not supply an independently implemented translator,

@@ -18,6 +18,7 @@ const SEEDS_DEFAULT = {
     b: ['v0.2.44', '90a5614b3557221baf62a224160d4b42e884bcd18545af8475da22c096f03a98'],
 };
 export let SEEDS = { ...SEEDS_DEFAULT };
+export let LINEAGE = 'v0.2.45'; // the name configure() selected
 // The pairs of routes the gate knows. A lineage names the tag whose source route B rebuilds (the "bridge"), the route A
 // seed (that tag's own release) and the route B seed (the release before it). The default is the first pair the gate
 // was built for; --lineage picks a newer one. Seeds are checksum-pinned release assets.
@@ -55,6 +56,28 @@ export const LINEAGES = {
             b: ['v0.2.57', '8f7fad343a2171d694d6632c5268e7b3e2c8d5b4d916d2da1381cbf332fd1278'],
         },
     },
+    // Each later release adds its entry (docs/bootstrap.md, "Release step"); the historical revision is the tag's commit.
+    'v0.2.59': {
+        historical: 'c917ba5701d3deae68ac1284cc0476a6de5b0b5c',
+        seeds: {
+            a: ['v0.2.59', 'd3a3457ff6def72a85844ba9a6cc384a321582e7a3349a4f8447abe62768f700'],
+            b: ['v0.2.58', '3de95d4e46fc43010319cfe619104e683d304e0ffcfb4239b8618de891c4e09e'],
+        },
+    },
+    'v0.2.60': {
+        historical: '3c3d714b5163a05627ecccf2e95871f041392d05',
+        seeds: {
+            a: ['v0.2.60', '1d6b1d1985caeb0dfc45ba0c0d35de843168d5ea18781bf22814d436a21c60db'],
+            b: ['v0.2.59', 'd3a3457ff6def72a85844ba9a6cc384a321582e7a3349a4f8447abe62768f700'],
+        },
+    },
+    'v0.2.61': {
+        historical: '8bdb252198448058d33e2e337de6f039b068ddc1',
+        seeds: {
+            a: ['v0.2.61', '5c307e3d313d5367510ea84fabdc1eb49df5eb79d2e25dbd554c87ebd846409d'],
+            b: ['v0.2.60', '1d6b1d1985caeb0dfc45ba0c0d35de843168d5ea18781bf22814d436a21c60db'],
+        },
+    },
 };
 
 /** Select the pair of routes (the module-level HISTORICAL and SEEDS the rest of the gate reads), and where the candidate
@@ -62,6 +85,7 @@ export const LINEAGES = {
  *  /build/source; a local run without it names a directory it owns, such as <scratch>/build/source. */
 export function configure(lineage, root = null) {
     if (!(lineage in LINEAGES)) throw new Error(`unknown lineage ${lineage}; known: ${Object.keys(LINEAGES).sort().join(', ')}`);
+    LINEAGE = lineage;
     HISTORICAL = LINEAGES[lineage].historical;
     SEEDS = { a: [...LINEAGES[lineage].seeds.a], b: [...LINEAGES[lineage].seeds.b] };
     CANONICAL_ROOT = root ?? '/build/source';
@@ -306,6 +330,11 @@ export function compare(a, b, output, expectedRevision = null) {
         for (const name of ['environment.txt', 'closure.txt', 'stage2.ll', 'stage2.bin', 'stage2.o']) same(path.join(a, name), path.join(b, name));
         writeJson(path.join(output, 'comparison.json'), {
             passed: true, candidate: manifests[0].candidate, canonical_ir_sha256: manifests[0].files['stage2.ll'],
+            // The seed manifest: what both routes started from, for the release notes (tools/release-convergence.sh).
+            lineage: LINEAGE, seeds: { a: { version: SEEDS.a[0], sha256: SEEDS.a[1] }, b: { version: SEEDS.b[0], sha256: SEEDS.b[1] } },
+            historical_revision: HISTORICAL, canonical_root: CANONICAL_ROOT, entry: ENTRY, settings: manifests[0].settings,
+            toolchain: manifests[0].toolchain, stage2_binary_sha256: manifests[0].files['stage2.bin'],
+            stage2_object_sha256: manifests[0].files['stage2.o'],
             claim: 'historical-seed route convergence; not independent implementation',
         });
     } catch (error) {

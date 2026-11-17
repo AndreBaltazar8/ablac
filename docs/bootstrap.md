@@ -125,7 +125,17 @@ and route B from v0.2.50, rebuilding the v0.2.51 sources (`1758d94e64b0e7f31f221
 The same shape for `v0.2.52` and `v0.2.53` (the latter: A the v0.2.53 pin, B v0.2.52, sources `b9ed669ce148440cef09650dde9db4085358f0cd`). The
 default stays the v0.2.45 pair above. Adding a lineage is adding its two seed checksums and the bridge commit.
 
-**Release step.** At each release, add a `LINEAGES` entry for the new tag (route A: the new tag's pinned seed; route B: the previous release's seed; historical: the new tag's source commit) and dispatch the workflow with `lineage=<tag>`.
+**Release gate.** A release is not published until this gate is green on its source commit.
+`tools/release-convergence.sh run vX --source-ref <the commit vX is made from>` dispatches the workflow with
+`lineage=<the release before vX>` and `source_ref=<commit>`, waits, checks that the run's comparison names that lineage and
+that commit, prints `PASS` or `FAIL`, and writes the release-notes text (both seeds and their checksums, the bridge
+commit, the canonical IR, stage 2 and toolchain hashes, the run) to `build/release-vX.notes.md`, for
+`gh release create ... --notes-file`. Route A starts from the previous release's binary and route B from the one before it,
+so both seeds exist before vX does. `tools/release-check.sh` has a required `convergence` check that fails unless a green run
+for that source and lineage exists (`--convergence-run ID`, or the newest matching green run; `--source-ref` names the
+commit until the tag does). After vX is published, add its `LINEAGES` entry (route A: vX's pinned seed; route B: the previous
+release's seed; historical: vX's tag commit) and the workflow's `lineage` option: they gate the next release, and a unit test
+fails when the two lists differ.
 
 Each source tree uses its own runtime, standard library and Nix shell.
 Candidate sources occupy `/build/source` on both builders, with a declared

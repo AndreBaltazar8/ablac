@@ -162,3 +162,31 @@ describe('lineages: the pairs of routes the gate knows, selected by --lineage', 
         } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
     });
 });
+
+describe('the release gate (tools/release-convergence.sh)', () => {
+    test('the workflow offers exactly the lineages the gate knows, so a new entry cannot be left undispatchable', () => {
+        const workflow = fs.readFileSync(new URL('../.github/workflows/bootstrap-convergence.yml', import.meta.url), 'utf8');
+        const options = JSON.parse(/options: (\[.*\])/.exec(workflow)[1]);
+        assert.deepEqual([...options].sort(), Object.keys(gate.LINEAGES).sort());
+        assert.ok(options.includes(/default: "(v[\d.]+)"/.exec(workflow)[1]), 'the default lineage is one of the options');
+    });
+    test('each lineage pairs adjacent releases and names the bridge by a full commit', () => {
+        for (const [name, lineage] of Object.entries(gate.LINEAGES)) {
+            assert.equal(lineage.seeds.a[0], name);
+            assert.match(lineage.historical, /^[0-9a-f]{40}$/);
+            for (const [, checksum] of Object.values(lineage.seeds)) assert.match(checksum, /^[0-9a-f]{64}$/);
+        }
+    });
+    test('the comparison names the lineage and seeds a release note needs', () => {
+        const f = fixture();
+        try {
+            f.check();
+            const comparison = JSON.parse(fs.readFileSync(path.join(f.root, 'comparison/comparison.json'), 'utf8'));
+            assert.equal(comparison.lineage, gate.LINEAGE);
+            assert.deepEqual(comparison.seeds.a, { version: gate.SEEDS.a[0], sha256: gate.SEEDS.a[1] });
+            assert.deepEqual(comparison.seeds.b, { version: gate.SEEDS.b[0], sha256: gate.SEEDS.b[1] });
+            assert.equal(comparison.historical_revision, gate.HISTORICAL);
+            for (const key of ['canonical_ir_sha256', 'stage2_binary_sha256', 'stage2_object_sha256']) assert.match(comparison[key], /^[0-9a-f]{64}$/);
+        } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+    });
+});
