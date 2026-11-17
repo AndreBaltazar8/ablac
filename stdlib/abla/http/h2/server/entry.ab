@@ -28,10 +28,28 @@ val H2_MAX_OUTPUT_BYTES = 786432
 /** A request that is whole: the handler's `HttpRequest` and the stream to answer on. */
 class H2ServerRequest(val stream: int, val request: HttpRequest)
 
+// Streaming routes (`streamRoute`): a request of one is reported as events instead of waiting to be whole, and its response is written as it is made. REQUEST: the headers are in
+// (`request` has no body); DATA: a piece of the body (credit for it is given by `consumed`); END: the request ended (`trailers`); WRITABLE: `writeResponse` has room again; RESET: the
+// stream or the connection ended before the exchange did (`code`, `error`).
+val H2_SERVER_EVENT_REQUEST = 1
+val H2_SERVER_EVENT_DATA = 2
+val H2_SERVER_EVENT_END = 3
+val H2_SERVER_EVENT_WRITABLE = 4
+val H2_SERVER_EVENT_RESET = 5
+
+class H2ServerEvent(val kind: int, val stream: int, val request: HttpRequest? = null, val data: string = "", val trailers: array<HttpHeader> = [], val code: int = 0, val error: string = "")
+
+/** The response bytes a streamed response holds unsent: `writeResponse` takes in no more (one stream window). */
+val H2_SERVER_STREAM_BODY_CAP = 262144
+
 class H2ServerStream(val id: int, var recvWindow: int = 0, var sendWindow: int = 0, var owed: int = 0, var method: string = "", var path: string = "", var query: string = "",
     var authority: string = "", var scheme: string = "", var headers: array<HttpHeader> = [], var chunks: array<string> = [], var received: int = 0, var contentLength: int = -1,
     var requestDone: bool = false, var sawHeaders: bool = false, var responding: bool = false, var responseBody: string = "", var responsePosition: int = 0, var head: bool = false,
-    var buffered: int = 0, var abandoned: bool = false)
+    var buffered: int = 0, var abandoned: bool = false,
+    // A streaming route's exchange (streamRoute): `bodyLimit` bytes of request body (0: no limit), the response body written with writeResponse until endResponse (`bodyFinished`), `blocked` a writeResponse
+    // that took less than it was given, `endSent` the response's END_STREAM is out.
+    var streaming: bool = false, var bodyLimit: int = 0, var bodyFinished: bool = true, var blocked: bool = false, var endSent: bool = false,
+    var responseTrailers: array<HttpHeader> = [], var requestTrailers: array<HttpHeader> = [])
 
 class H2Server(
     var streams: array<H2ServerStream> = [],
@@ -73,7 +91,10 @@ class H2Server(
     var goawaySent: bool = false,
     var now: int = 0,
     var bufferedBytes: int = 0,
-    var overflow: bool = false)
+    var overflow: bool = false,
+    var events: array<H2ServerEvent> = [],
+    var streamRoutes: array<string> = [],
+    var streamLimits: array<int> = [])
 
 /** A connection with our SETTINGS queued; the peer's preface is expected first. `maximumBodyBytes` caps a request body, `maximumStreams` the concurrent streams. */
 fun h2ServerNew(maximumStreams: int = 100, maximumBodyBytes: int = 1048576, maximumHeaderListBytes: int = 65536, peer: SocketPeerAddress? = null): H2Server {
@@ -120,6 +141,137 @@ fun H2Server.takeRequests(): array<H2ServerRequest> {
     taken
 }
 
+// ---- streaming routes ----
+/** Makes `method` `path` (no query) a streaming route: its requests are reported as events (takeEvents) as they arrive and answered with respondStream, writeResponse and
+ *  endResponse. `maximumBodyBytes` bounds the request body (0: no limit; a bound the handler enforces itself, or memory it chooses to hold, is its own business). */
+fun H2Server.streamRoute(method: string, path: string, maximumBodyBytes: int): void {
+    this.streamRoutes.append("$method $path")
+    this.streamLimits.append(maximumBodyBytes)
+    return
+}
+
+private fun H2Server.streamRouteIndex(method: string, path: string): int {
+    if (this.streamRoutes.size == 0) return -1
+    val key = "$method $path"
+    for (i in 0 until this.streamRoutes.size) {
+        if (this.streamRoutes[i] == key) return i
+    }
+    -1
+}
+
+/** The streaming events since the last call (and the connection window's credit for what arrived). */
+fun H2Server.takeEvents(): array<H2ServerEvent> {
+    this.credit()
+    val taken: array<H2ServerEvent> = []
+    for (e in this.events) taken.append(e)
+    this.events = []
+    taken
+}
+
+/** The caller has dealt with `bytes` of the request body of a streaming `stream`: its window is credited for them (once half of it was). Not calling it is the pause: the client stalls
+ *  after one stream window. */
+fun H2Server.consumed(stream: int, bytes: int): void {
+    val at = this.indexOf(stream)
+    if (at < 0 || !this.streams[at].streaming || bytes <= 0) return
+    this.streams[at].owed = this.streams[at].owed + bytes
+    this.credit()
+    return
+}
+
+/** Starts the response of a streaming `stream`: HEADERS now (content-length when `length` >= 0 and the headers have none; 0 ends the response here, as does a HEAD request), then
+ *  writeResponse and endResponse. Returns false for a stream that is not a streaming one, was answered already, or a status outside 200..599. */
+fun H2Server.respondStream(stream: int, status: int, headers: array<HttpHeader>, length: int): bool {
+    if (this.closed) return false
+    val at = this.indexOf(stream)
+    if (at < 0 || !this.streams[at].streaming || this.streams[at].responding || status < 200 || status > 599 || this.overflow) return false
+    val fields: array<HpackField> = [HpackField(":status", "${status}", false)]
+    var hasLength = false
+    for (h in headers) {
+        val name = h.name.lowercase()
+        if (h2Forbidden(name) || name == "host" || name == "te") continue
+        if (name == "content-length") hasLength = true
+        fields.append(HpackField(name, h.value, false))
+    }
+    if (!hasLength && length >= 0) fields.append(HpackField("content-length", "$length", false))
+    val end = if (length == 0 || this.streams[at].head) 1 else 0
+    this.queueHeaderBlock(stream, this.encoder.encode(fields), end)
+    this.streams[at].responding = true
+    this.streams[at].bodyFinished = end == 1
+    if (end == 1) {
+        this.streams[at].endSent = true
+        this.finishResponse(stream)
+    }
+    true
+}
+
+/** HEADERS (and CONTINUATION frames) for a header block, ending the stream when `end` is 1. */
+private fun H2Server.queueHeaderBlock(stream: int, block: string, end: int): void {
+    if (block.size <= this.peerMaxFrame) {
+        this.queue(h2Frame(1, 4 | end, stream, block))
+    } else {
+        this.queue(h2Frame(1, end, stream, block.slice(0, this.peerMaxFrame)))
+        var from = this.peerMaxFrame
+        while (from < block.size) {
+            val take = if (block.size - from < this.peerMaxFrame) block.size - from else this.peerMaxFrame
+            this.queue(h2Frame(9, if (from + take >= block.size) 4 else 0, stream, block.slice(from, from + take)))
+            from = from + take
+        }
+    }
+    return
+}
+
+/** Writes response body bytes of a streaming `stream`: returns how many were taken (a prefix of `chunk`), 0 when it holds a window's worth of unsent bytes already (a WRITABLE event follows
+ *  when there is room), -1 when the stream is gone, not answered with respondStream, or ended. */
+fun H2Server.writeResponse(stream: int, chunk: string): int {
+    val at = this.indexOf(stream)
+    if (this.closed || at < 0 || !this.streams[at].streaming || !this.streams[at].responding || this.streams[at].bodyFinished) return -1
+    if (chunk.size == 0) return 0
+    val pending = this.streams[at].responseBody.size - this.streams[at].responsePosition
+    val room = H2_SERVER_STREAM_BODY_CAP - pending
+    if (room <= 0) {
+        this.streams[at].blocked = true
+        return 0
+    }
+    val taken = if (chunk.size < room) chunk.size else room
+    if (taken < chunk.size) this.streams[at].blocked = true
+    val kept = if (pending > 0) this.streams[at].responseBody.slice(this.streams[at].responsePosition, this.streams[at].responseBody.size) else ""
+    this.streams[at].responseBody = kept + (if (taken == chunk.size) chunk else chunk.slice(0, taken))
+    this.streams[at].responsePosition = 0
+    this.pump()
+    taken
+}
+
+/** The response of a streaming `stream` is complete: END_STREAM follows what is queued (on a HEADERS frame carrying `trailers` when there are any). */
+fun H2Server.endResponse(stream: int, trailers: array<HttpHeader> = []): void {
+    val at = this.indexOf(stream)
+    if (this.closed || at < 0 || !this.streams[at].streaming || !this.streams[at].responding || this.streams[at].bodyFinished) return
+    this.streams[at].bodyFinished = true
+    val kept: array<HttpHeader> = []
+    for (t in trailers) kept.append(t)
+    this.streams[at].responseTrailers = kept
+    this.pump()
+    return
+}
+
+/** An event for the owner of a streaming exchange: the stream ended before the exchange did. */
+private fun H2Server.resetEvent(at: int, code: int, reason: string): void {
+    if (this.streams[at].streaming) this.events.append(H2ServerEvent(H2_SERVER_EVENT_RESET, this.streams[at].id, code = code, error = reason))
+    return
+}
+
+
+/** A streaming route's request body passed the route's limit: answered 413 when nothing was sent yet, else the stream is reset; the rest of the body is dropped and the handler hears of the abort. */
+private fun H2Server.bodyOverLimit(at: int): void {
+    val id = this.streams[at].id
+    this.streams[at].abandoned = true
+    this.events.append(H2ServerEvent(H2_SERVER_EVENT_RESET, id, code = 0, error = "the request body passed the route's limit"))
+    if (!this.streams[at].responding) {
+        this.respondStream(id, 413, [HttpHeader("content-type", "text/plain")], 22)
+        this.writeResponse(id, "request body too large")
+        this.endResponse(id)
+    } else this.streamError(id, H2_CANCEL)
+    return
+}
 fun H2Server.isClosed(): bool = this.closed
 fun H2Server.openStreams(): int = this.streams.size
 /** Why the connection ended ("" while it is open). */
@@ -150,6 +302,7 @@ private fun H2Server.fail(code: int, reason: string): void {
     this.closed = true
     this.error = "${reason} (${h2CodeName(code)})"
     this.queue(h2Frame(7, 0, 0, h2Be32(this.highestStream) + h2Be32(code)))
+    for (i in 0 until this.streams.size) this.resetEvent(i, code, reason)
     this.streams = []
     this.bufferedBytes = 0
     return
@@ -157,6 +310,8 @@ private fun H2Server.fail(code: int, reason: string): void {
 
 private fun H2Server.streamError(id: int, code: int): void {
     this.queue(h2Frame(3, 0, id, h2Be32(code)))
+    val streamAt = this.indexOf(id)
+    if (streamAt >= 0 && !this.streams[streamAt].abandoned) this.resetEvent(streamAt, code, "a stream error (${h2CodeName(code)})")
     // The server's own resets count as much as the client's (MadeYouReset).
     this.countReset()
     this.rememberClosed(id)
@@ -253,8 +408,23 @@ private fun H2Server.pump(): void {
         while (i < this.streams.size) {
             if (this.outputBytes >= H2_OUTPUT_CAP) return
             val remaining = this.streams[i].responseBody.size - this.streams[i].responsePosition
-            if (!this.streams[i].responding || remaining <= 0) {
+            if (!this.streams[i].responding) {
                 i = i + 1
+                continue
+            }
+            if (remaining <= 0) {
+                // A streamed response that was ended after its last byte went out: an empty DATA frame (or a HEADERS frame with the trailers) ends the stream.
+                if (this.streams[i].bodyFinished && !this.streams[i].endSent) {
+                    val id = this.streams[i].id
+                    this.streams[i].endSent = true
+                    if (this.streams[i].responseTrailers.size > 0) {
+                        val fields: array<HpackField> = []
+                        for (t in this.streams[i].responseTrailers) fields.append(HpackField(t.name.lowercase(), t.value, false))
+                        this.queueHeaderBlock(id, this.encoder.encode(fields), 1)
+                    } else this.queue(h2Frame(0, 1, id, ""))
+                    progress = true
+                    this.finishResponse(id)
+                } else i = i + 1
                 continue
             }
             var take = remaining
@@ -268,14 +438,24 @@ private fun H2Server.pump(): void {
             }
             val id = this.streams[i].id
             val from = this.streams[i].responsePosition
-            val last = from + take >= this.streams[i].responseBody.size
+            // The last bytes of a body that is complete end the stream, unless trailers still have to follow them.
+            val last = this.streams[i].bodyFinished && from + take >= this.streams[i].responseBody.size && this.streams[i].responseTrailers.size == 0
             this.queue(h2Frame(0, if (last) 1 else 0, id, this.streams[i].responseBody.slice(from, from + take)))
             this.streams[i].responsePosition = from + take
             this.streams[i].sendWindow = this.streams[i].sendWindow - take
             this.connectionSend = this.connectionSend - take
             progress = true
-            if (last) this.finishResponse(id)
-            else i = i + 1
+            if (last) {
+                this.streams[i].endSent = true
+                this.finishResponse(id)
+            } else {
+                // A writeResponse that was refused hears of the room once half of the cap is free.
+                if (this.streams[i].blocked && this.streams[i].responseBody.size - this.streams[i].responsePosition <= H2_SERVER_STREAM_BODY_CAP / 2) {
+                    this.streams[i].blocked = false
+                    this.events.append(H2ServerEvent(H2_SERVER_EVENT_WRITABLE, id))
+                }
+                i = i + 1
+            }
         }
     }
     return
@@ -443,6 +623,7 @@ private fun H2Server.onReset(stream: int, payload: string, now: int): void {
         if (stream > this.highestStream || stream % 2 == 0) this.fail(H2_PROTOCOL_ERROR, "RST_STREAM on an idle stream")
         return
     }
+    if (!this.streams[at].abandoned) this.resetEvent(at, h2Read32(payload, 0), "reset by the client")
     this.rememberClosed(stream)
     this.dropAt(at)
     return
@@ -560,10 +741,15 @@ private fun H2Server.finishBlock(): void {
     val at = this.indexOf(stream)
     if (at < 0) return
     if (this.streams[at].sawHeaders) {
-        // Trailers: a header block after the request's own, which must end the stream, with no pseudo-headers; decoded and dropped.
+        // Trailers: a header block after the request's own, which must end the stream, with no pseudo-headers; decoded and dropped (a streaming route's handler gets them with END).
         if (!endStream) { this.streamError(stream, H2_PROTOCOL_ERROR); return }
         for (f in decoded.fields) {
             if (f.name.size > 0 && f.name[0] == 58) { this.streamError(stream, H2_PROTOCOL_ERROR); return }
+        }
+        if (this.streams[at].streaming) {
+            val kept: array<HttpHeader> = []
+            for (t in decoded.fields) kept.append(HttpHeader(t.name, t.value))
+            this.streams[at].requestTrailers = kept
         }
         this.requestEnded(stream)
         return
@@ -637,6 +823,13 @@ private fun H2Server.finishBlock(): void {
     this.streams[at].headers = headers
     this.streams[at].contentLength = contentLength
     this.streams[at].head = method == "HEAD"
+    // A streaming route: the handler hears of the request now, its body follows as events.
+    val route = this.streamRouteIndex(method, target)
+    if (route >= 0) {
+        this.streams[at].streaming = true
+        this.streams[at].bodyLimit = this.streamLimits[route]
+        this.events.append(H2ServerEvent(H2_SERVER_EVENT_REQUEST, stream, request = HttpRequest(method, target, query, headers, "", [], [], this.peer)))
+    }
     if (endStream) this.requestEnded(stream)
     return
 }
@@ -650,6 +843,10 @@ private fun H2Server.requestEnded(id: int): void {
         return
     }
     this.streams[at].requestDone = true
+    if (this.streams[at].streaming) {
+        this.events.append(H2ServerEvent(H2_SERVER_EVENT_END, id, trailers = this.streams[at].requestTrailers))
+        return
+    }
     var body = ""
     if (this.streams[at].chunks.size == 1) body = this.streams[at].chunks[0]
     else if (this.streams[at].chunks.size > 1) {
@@ -703,6 +900,17 @@ private fun H2Server.onData(flags: int, stream: int, payload: string, now: int):
     this.streams[at].recvWindow = this.streams[at].recvWindow - payload.size
     if (this.streams[at].recvWindow < 0) { this.streamError(stream, H2_FLOW_CONTROL_ERROR); return }
     this.streams[at].received = this.streams[at].received + (end - begin)
+    if (this.streams[at].streaming) {
+        // A streaming route: the body is passed on as it comes (its window is credited as the caller takes it: `consumed`); padding is credited at once.
+        if (this.streams[at].bodyLimit > 0 && this.streams[at].received > this.streams[at].bodyLimit) {
+            this.bodyOverLimit(at)
+            return
+        }
+        if (end > begin) this.events.append(H2ServerEvent(H2_SERVER_EVENT_DATA, stream, data = payload.slice(begin, end)))
+        this.streams[at].owed = this.streams[at].owed + (payload.size - (end - begin))
+        if ((flags & 1) != 0) this.requestEnded(stream)
+        return
+    }
     if (this.streams[at].received > this.maximumBodyBytes) {
         // Too large: answered, then the upload is stopped.
         this.streams[at].requestDone = false

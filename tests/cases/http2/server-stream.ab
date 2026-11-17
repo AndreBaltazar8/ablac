@@ -1,0 +1,248 @@
+// Streaming routes of H2Server (abla/http/h2/server: streamRoute, takeEvents, consumed, respondStream, writeResponse, endResponse) against a scripted client in process: a request is
+// reported by its headers and its body arrives as events whose receive window is credited as the caller takes them (`consumed`), never as they arrive; END carries the trailers; the
+// response is written as it is made, within one window of unsent bytes, with WRITABLE when there is room again; a duplex exchange (answered before the request ended); the route's body limit (413);
+// a reset by the client reaches the exchange. Each check fails with its feature removed (credit on arrival, no cap, no limit). Prints "http2 server stream ok". (tools/test-http2-server.sh runs the
+// whole thing over a socket: tools/test-http2-stream-server.sh.)
+import "abla/io"
+import "abla/crypto"
+import "abla/array"
+import "abla/integer"
+import "abla/http"
+import "abla/http/h2"
+import "abla/http/h2/hpack"
+import "abla/http/h2/server"
+import "abla/text"
+
+var failures = 0
+
+fun fail(what: string): void {
+    failures = failures + 1
+    if (failures < 40) println("FAIL $what")
+    return
+}
+
+fun expect(cond: bool, what: string): void {
+    if (!cond) fail(what)
+    return
+}
+
+fun be32(value: int): string = cryptoByteString([(value >> 24) & 255, (value >> 16) & 255, (value >> 8) & 255, value & 255])
+
+fun frame(kind: int, flags: int, stream: int, payload: string): string {
+    val n = payload.size
+    cryptoByteString([(n >> 16) & 255, (n >> 8) & 255, n & 255, kind, flags, (stream >> 24) & 127, (stream >> 16) & 255, (stream >> 8) & 255, stream & 255]) + payload
+}
+
+class Seen(val kind: int, val flags: int, val stream: int, val payload: string)
+
+fun frames(output: string): array<Seen> {
+    val list: array<Seen> = []
+    var at = 0
+    while (at + 9 <= output.size) {
+        val n = (output[at] << 16) | (output[at + 1] << 8) | output[at + 2]
+        list.append(Seen(output[at + 3], output[at + 4], ((output[at + 5] & 127) << 24) | (output[at + 6] << 16) | (output[at + 7] << 8) | output[at + 8], output.slice(at + 9, at + 9 + n)))
+        at = at + 9 + n
+    }
+    list
+}
+
+fun credit(list: array<Seen>, stream: int): int {
+    var sum = 0
+    for (s in list) {
+        if (s.kind == 8 && s.stream == stream) sum = sum + (((s.payload[0] & 127) << 24) | (s.payload[1] << 16) | (s.payload[2] << 8) | s.payload[3])
+    }
+    sum
+}
+
+fun dataBytes(list: array<Seen>, stream: int): int {
+    var sum = 0
+    for (s in list) {
+        if (s.kind == 0 && s.stream == stream) sum = sum + s.payload.size
+    }
+    sum
+}
+
+fun resetCode(list: array<Seen>, stream: int): int {
+    for (s in list) {
+        if (s.kind == 3 && s.stream == stream) return (s.payload[0] << 24) | (s.payload[1] << 16) | (s.payload[2] << 8) | s.payload[3]
+    }
+    -1
+}
+
+fun endsStream(list: array<Seen>, stream: int): bool {
+    for (s in list) {
+        if ((s.kind == 0 || s.kind == 1) && s.stream == stream && (s.flags & 1) != 0) return true
+    }
+    false
+}
+
+fun hf(name: string, value: string): HpackField = HpackField(name, value, false)
+
+fun block(fields: array<HpackField>): string {
+    var e = hpackEncoderNew(0)
+    e.encode(fields)
+}
+
+fun post(path: string): array<HpackField> = [hf(":method", "POST"), hf(":scheme", "https"), hf(":path", path), hf(":authority", "example.com")]
+
+fun kinds(events: array<H2ServerEvent>): string {
+    var out = ""
+    for (e in events) out = out + "${e.kind},"
+    out
+}
+
+fun chunk(size: int): string = "x".repeat(size)
+
+/** A server past the preface and SETTINGS with /up a streaming route (body limit `limit`). */
+fun ready(limit: int = 0): H2Server {
+    var s = h2ServerNew()
+    s.streamRoute("POST", "/up", limit)
+    s.streamRoute("GET", "/events", 0)
+    s.feed(H2_PREFACE + frame(4, 0, 0, ""), 0)
+    s.takeOutput()
+    s
+}
+
+fun requestAndBody(): void {
+    var s = ready()
+    s.feed(frame(1, 4, 1, block(post("/up?x=1"))), 0)
+    val events = s.takeEvents()
+    expect(kinds(events) == "1,", "a streaming request is reported by its headers: ${kinds(events)}")
+    val first = if (events.size == 1) events[0].request else null
+    expect(first != null && first.method == "POST" && first.path == "/up" && first.query == "x=1", "the request line")
+    expect(s.takeRequests().size == 0, "a streaming request is not a whole request")
+    // A whole window arrives; nothing is credited before the caller takes it.
+    for (i in 0 until 16) s.feed(frame(0, 0, 1, chunk(16384)), 0)
+    val data = s.takeEvents()
+    expect(kinds(data) == "2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,", "16 DATA events: ${kinds(data)}")
+    expect(credit(frames(s.takeOutput()), 1) == 0, "no stream credit while nothing was taken")
+    s.consumed(1, 262144)
+    expect(credit(frames(s.takeOutput()), 1) == 262144, "the stream is credited what was taken")
+    // The same window again, then one byte more: the client has to wait for credit.
+    var t = ready()
+    t.feed(frame(1, 4, 1, block(post("/up"))), 0)
+    for (i in 0 until 16) t.feed(frame(0, 0, 1, chunk(16384)), 0)
+    t.takeEvents()
+    t.takeOutput()
+    t.feed(frame(0, 0, 1, chunk(1)), 0)
+    expect(resetCode(frames(t.takeOutput()), 1) == 3, "data past the window: RST_STREAM(FLOW_CONTROL_ERROR)")
+    expect(kinds(t.takeEvents()) == "5,", "and the exchange hears of it")
+    // END with trailers.
+    var u = ready()
+    u.feed(frame(1, 4, 1, block(post("/up"))), 0)
+    u.feed(frame(0, 0, 1, "abc"), 0)
+    u.feed(frame(1, 5, 1, block([hf("x-sum", "1")])), 0)
+    val ended = u.takeEvents()
+    expect(kinds(ended) == "1,2,3,", "REQUEST, DATA, END: ${kinds(ended)}")
+    expect(ended.size == 3 && ended[2].trailers.size == 1 && ended[2].trailers[0].name == "x-sum", "END carries the trailers")
+    return
+}
+
+fun responseBody(): void {
+    var s = ready()
+    s.feed(frame(1, 5, 1, block([hf(":method", "GET"), hf(":scheme", "https"), hf(":path", "/events"), hf(":authority", "example.com")])), 0)
+    expect(kinds(s.takeEvents()) == "1,3,", "a GET with no body: REQUEST then END")
+    expect(s.respondStream(1, 200, [HttpHeader("content-type", "text/event-stream")], -1), "respondStream")
+    val head = frames(s.takeOutput())
+    expect(head.size == 1 && head[0].kind == 1 && (head[0].flags & 1) == 0 && (head[0].flags & 4) != 0, "HEADERS without END_STREAM")
+    expect(s.writeResponse(1, "data: one\n\n") == 11, "a small write is taken")
+    expect(dataBytes(frames(s.takeOutput()), 1) == 11, "and sent")
+    // 1 MiB: taken up to the cap (the client's window, 65535 less what went out, lets part go).
+    var accepted = 0
+    var more = s.writeResponse(1, chunk(1048576))
+    var rounds = 0
+    while (more > 0 && rounds < 50) {
+        accepted = accepted + more
+        rounds = rounds + 1
+        more = s.writeResponse(1, chunk(1048576))
+    }
+    expect(more == 0, "a writer is told to wait: $more")
+    expect(accepted > 0 && accepted <= 262144 + 65535, "no more than a window of unsent bytes plus the client's window: $accepted")
+    var sent = dataBytes(frames(s.takeOutput()), 1)
+    expect(sent > 0 && sent <= 65535, "the client's window limits what goes out: $sent")
+    // The client opens the windows: the rest goes and the writer hears.
+    s.feed(frame(8, 0, 0, be32(1048576)) + frame(8, 0, 1, be32(1048576)), 0)
+    var events = ""
+    for (i in 0 until 20) {
+        sent = sent + dataBytes(frames(s.takeOutput()), 1)
+        events = events + kinds(s.takeEvents())
+    }
+    expect(events.contains("4,"), "a WRITABLE event: '$events'")
+    expect(sent >= accepted, "everything taken was sent: $sent of $accepted")
+    // endResponse: the last DATA frame carries END_STREAM, or an empty one does.
+    s.endResponse(1)
+    var ended = false
+    for (i in 0 until 5) {
+        if (endsStream(frames(s.takeOutput()), 1)) ended = true
+    }
+    expect(ended, "endResponse ends the stream")
+    expect(s.writeResponse(1, "late") == -1, "no writes after the end")
+    // Trailers go on a HEADERS frame.
+    var t = ready()
+    t.feed(frame(1, 5, 1, block([hf(":method", "GET"), hf(":scheme", "https"), hf(":path", "/events"), hf(":authority", "example.com")])), 0)
+    t.takeEvents()
+    t.respondStream(1, 200, [], -1)
+    t.writeResponse(1, "body")
+    t.endResponse(1, [HttpHeader("x-done", "yes")])
+    val out = frames(t.takeOutput())
+    expect(out.size >= 3 && out[out.size - 1].kind == 1 && (out[out.size - 1].flags & 1) != 0, "trailers: the last frame is HEADERS with END_STREAM")
+    expect(out.size >= 3 && out[out.size - 2].kind == 0 && (out[out.size - 2].flags & 1) == 0, "and the body before it does not end the stream")
+    // A response of length 0 ends at once.
+    var u = ready()
+    u.feed(frame(1, 5, 1, block([hf(":method", "GET"), hf(":scheme", "https"), hf(":path", "/events"), hf(":authority", "example.com")])), 0)
+    u.takeEvents()
+    u.respondStream(1, 204, [], 0)
+    expect(endsStream(frames(u.takeOutput()), 1), "length 0: HEADERS ends the stream")
+    return
+}
+
+fun duplex(): void {
+    // Answered while the request is still coming (an echo): allowed; ending the response first resets the rest of the request with NO_ERROR.
+    var s = ready()
+    s.feed(frame(1, 4, 1, block(post("/up"))), 0)
+    s.takeEvents()
+    expect(s.respondStream(1, 200, [], -1), "an answer before the request ended")
+    s.feed(frame(0, 0, 1, "ping"), 0)
+    expect(kinds(s.takeEvents()) == "2,", "the request body still arrives")
+    s.writeResponse(1, "pong")
+    s.endResponse(1)
+    val out = frames(s.takeOutput())
+    expect(resetCode(out, 1) == 0, "the response ended first: RST_STREAM(NO_ERROR) for the rest of the request: ${resetCode(out, 1)}")
+    return
+}
+
+fun limits(): void {
+    var s = ready(1000)
+    s.feed(frame(1, 4, 1, block(post("/up"))), 0)
+    s.takeEvents()
+    s.feed(frame(0, 0, 1, chunk(600)), 0)
+    s.feed(frame(0, 0, 1, chunk(600)), 0)
+    val events = s.takeEvents()
+    expect(kinds(events) == "2,5,", "the first piece, then the limit: RESET: ${kinds(events)}")
+    val out = frames(s.takeOutput())
+    expect(out.size > 0 && out[0].kind == 1, "a response was sent: 413")
+    // A client reset reaches the exchange.
+    var t = ready()
+    t.feed(frame(1, 4, 1, block(post("/up"))), 0)
+    t.takeEvents()
+    t.feed(frame(3, 0, 1, be32(8)), 0)
+    val reset = t.takeEvents()
+    expect(kinds(reset) == "5,", "RST_STREAM from the client: ${kinds(reset)}")
+    expect(reset.size == 1 && reset[0].code == 8, "with its code")
+    // The connection failing resets every exchange.
+    var u = ready()
+    u.feed(frame(1, 4, 1, block(post("/up"))), 0)
+    u.takeEvents()
+    u.feed(frame(0, 0, 0, "x"), 0)
+    expect(u.isClosed() && kinds(u.takeEvents()) == "5,", "a connection error resets the exchanges")
+    return
+}
+
+fun main: int {
+    requestAndBody()
+    responseBody()
+    duplex()
+    limits()
+    if (failures == 0) println("http2 server stream ok")
+    if (failures == 0) 0 else 1
+}
