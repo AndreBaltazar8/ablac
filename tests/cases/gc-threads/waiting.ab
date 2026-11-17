@@ -1,0 +1,50 @@
+// A thread waiting on the runtime's own condition (a transaction's `retry`) counts as stopped: another thread's
+// collections run meanwhile with no stop abandoned (each used to wait 20 ms for it and give up), and the waiting
+// thread's live values survive them (#811).
+import "abla/io"
+import "abla/memory"
+import "abla/process/time"
+import "../stm/stm.ab"
+
+resource class Cell(val flag: any)
+
+val cell: Shared<Cell> = Shared(Cell(tvar(0)))
+
+fun waiter(): int {
+    val words: array<string> = []
+    var index = 0
+    while (index < 40) {
+        words.append("word-$index")
+        index += 1
+    }
+    // Waits on the condition here until main writes the flag.
+    atomically {
+        if (readInt(cell.get().flag) == 0) retry()
+        0
+    }
+    var total = 0
+    for (word in words) total += word.size
+    total
+}
+
+fun main: int {
+    val waiting = thread { waiter() }
+    sleep(300)
+    val abandonedBefore = memoryHeapStat(8)
+    val stoppedBefore = memoryHeapStat(7)
+    var round = 0
+    while (round < 20) {
+        val garbage = "garbage-$round-" + "x"
+        if (garbage.size > 0) memoryCollect()
+        round += 1
+    }
+    val abandoned = memoryHeapStat(8) - abandonedBefore
+    val stopped = memoryHeapStat(7) - stoppedBefore
+    atomically {
+        writeInt(cell.get().flag, 1)
+        0
+    }
+    val total = await waiting
+    println("stopped=$stopped abandoned=$abandoned total=$total")
+    if (total == 270 && abandoned == 0 && stopped >= 20) 42 else 1
+}

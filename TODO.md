@@ -190,8 +190,11 @@ mmap form) apply there.
   stopped state until it returns: `tools/test-foreign-threads.sh`'s `-b` run).
   Open: (iv) macOS: the code is shared (the stop's clock, sleep and futex go through the Linux system call numbers the
   Darwin shim maps, in platform/darwin), `tools/test-gc-threads.sh` no longer skips on Darwin and has a step in the macOS CI job;
-  nothing was run on a Mac when this was written, so the first CI run is the answer. Limits: the runtime's own futex and mutex waits count as
-  running, so a stop waits 20 ms for such a thread and gives up (counted by `memoryHeapStat(8)`); a loop that never
+  nothing was run on a Mac when this was written, so the first CI run is the answer. Limits: a wait for a `Mutex` another thread holds and a transaction's `retry` now
+  wait in native state, so a stop no longer waits 20 ms for them and gives up (`tests/cases/gc-threads/waiting.ab` and `lock-wait.ab`: one abandoned stop
+  each before, none after); the short locks the collector itself may take while it holds the stop (a Shared's count lock) stay plain, since waiting for one in native
+  state hung the churn test; the heap's and the stop's own futex locks still count as running (a stop waits 20 ms for
+  a thread there and gives up, counted by `memoryHeapStat(8)`); a loop that never
   allocates has no safe point and holds up every collection while it runs; a manual-collection program
   (`memorySetManualCollection` without a limit or growth call) has no safe points, so an explicit collection with a
   running worker is abandoned. Measured (ablac-74's request): the compiler's own build 52.2 s against 54.2 s, binary

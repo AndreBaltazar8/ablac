@@ -1,0 +1,57 @@
+// A thread waiting for a Mutex another thread holds counts as stopped: the holder's collections run meanwhile with no
+// stop abandoned, and the waiter's live values survive them (#811).
+import "abla/io"
+import "abla/memory"
+import "abla/process/time"
+
+resource class Counter(var value: int)
+
+fun addBatch(var counter: Counter): int {
+    counter.value += 10
+    counter.value
+}
+
+// Holds the lock while it collects twenty times.
+fun holdAndCollect(var counter: Counter): int {
+    sleep(300)
+    var round = 0
+    while (round < 20) {
+        val garbage = "garbage-$round-" + "x"
+        if (garbage.size > 0) memoryCollect()
+        round += 1
+    }
+    counter.value += 1
+    counter.value
+}
+
+fun holder(forHolder: Mutex<Counter>): int = forHolder.with(holdAndCollect)
+
+fun waiter(forWaiter: Mutex<Counter>): int {
+    val words: array<string> = []
+    var index = 0
+    while (index < 40) {
+        words.append("word-$index")
+        index += 1
+    }
+    // Blocked here on the lock while the holder collects.
+    val seen = forWaiter.with(addBatch)
+    var total = 0
+    for (word in words) total += word.size
+    total + seen
+}
+
+fun main: int {
+    val state = Mutex(Counter(0))
+    val forHolder = state.clone()
+    val forWaiter = state.clone()
+    val first = thread { holder(forHolder) }
+    sleep(100)
+    val abandonedBefore = memoryHeapStat(8)
+    val second = thread { waiter(forWaiter) }
+    val held = await first
+    val total = await second
+    val abandoned = memoryHeapStat(8) - abandonedBefore
+    println("held=$held total=$total abandoned=$abandoned")
+    // the holder leaves 1, the waiter adds 10 and sees 11; its words are 270 bytes.
+    if (held == 1 && total == 270 + 11 && abandoned == 0) 42 else 1
+}
