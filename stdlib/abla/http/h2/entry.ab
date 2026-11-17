@@ -33,6 +33,8 @@ val H2_EVENT_RESET = 4
 val H2_EVENT_GOAWAY = 5
 val H2_EVENT_CLOSED = 6
 val H2_EVENT_TRAILERS = 7
+val H2_EVENT_READABLE = 8
+val H2_EVENT_WRITABLE = 9
 
 // Limits that are not options: a caller cannot weaken them by accident.
 val H2_MAX_FRAME_PAYLOAD = 16384
@@ -45,6 +47,8 @@ val H2_MAX_CONTROL_PER_SECOND = 10000
 val H2_MAX_PENDING_ACKS = 100
 val H2_OUTPUT_CAP = 262144
 val H2_INITIAL_WINDOW = 262144
+// The request bytes a streaming request holds unsent (writeBody takes in no more): one stream window.
+val H2_STREAM_BODY_CAP = 262144
 val H2_CONNECTION_WINDOW = 1048576
 val H2_MAX_WINDOW = 2147483647
 val H2_MAX_RESET_REMEMBERED = 128
@@ -55,11 +59,15 @@ val H2_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
  *  HEADERS: `status` and `headers` (final response headers, lower case, no pseudo-headers); DATA: `data`; END: the stream finished well;
  *  RESET: the stream failed (`code`, `error`; `retry` says the server did not process it: REFUSED_STREAM, or beyond a GOAWAY's last id);
  *  TRAILERS: `headers` (the trailer fields, before END);
+ *  READABLE / WRITABLE (streaming requests only, `requestStream`): bytes wait in the stream's inbox for `takeData` (sent when the inbox was empty); `writeBody` has room again after it took in less than it was given;
  *  GOAWAY: `code` and `stream` (the last stream the peer processed); CLOSED: the connection ended (`error`, `code`). */
 class H2Event(val kind: int, val stream: int, val status: int = 0, val headers: array<HpackField> = [], val data: string = "", val code: int = 0, val error: string = "", val retry: bool = false)
 
 class H2Stream(val id: int, var state: int = 0, var sendWindow: int = 0, var recvWindow: int = 0, var owed: int = 0, var body: string = "", var bodyPosition: int = 0,
-    var localDone: bool = false, var status: int = -1, var contentLength: int = -1, var received: int = 0, var head: bool = false, var sawFinal: bool = false)
+    var localDone: bool = false, var status: int = -1, var contentLength: int = -1, var received: int = 0, var head: bool = false, var sawFinal: bool = false,
+    // A streaming request (requestStream): the response body waits in `inbox` for takeData (the window is credited as it is taken), the request body is written with
+    // writeBody until finishBody (`bodyFinished`); `ended` is the response's END_STREAM, its END event waits for the inbox to be empty; `blocked` is a writeBody that took less than it was given.
+    var streaming: bool = false, var inbox: string = "", var bodyFinished: bool = true, var ended: bool = false, var blocked: bool = false)
 
 class H2Client(
     var streams: array<H2Stream> = [],
@@ -269,7 +277,16 @@ fun h2Forbidden(name: string): bool =
 /** Starts a request: HEADERS (and DATA as the windows allow). Returns the stream id, -1 when the connection cannot take it (draining, closed, no room): the
  *  caller uses another connection. `headers` are the caller's (any case); host, connection, keep-alive, proxy-connection, transfer-encoding and upgrade are dropped
  *  (`te` only as `trailers`), and content-length is added for a body unless given. */
-fun H2Client.request(method: string, scheme: string, authority: string, path: string, headers: array<HpackField>, body: string): int {
+fun H2Client.request(method: string, scheme: string, authority: string, path: string, headers: array<HpackField>, body: string): int =
+    this.open(method, scheme, authority, path, headers, body, false, -1)
+
+/** A request whose body and response are streamed: the response body is read with `takeData` (events HEADERS, READABLE, TRAILERS, END, RESET), the request body written with
+ *  `writeBody` and ended with `finishBody`. `length` is the request body's size when known (it is sent as content-length; 0 ends the stream at once), -1 when not. Returns the stream id, -1
+ *  when the connection cannot take it. */
+fun H2Client.requestStream(method: string, scheme: string, authority: string, path: string, headers: array<HpackField>, length: int = -1): int =
+    this.open(method, scheme, authority, path, headers, "", true, length)
+
+private fun H2Client.open(method: string, scheme: string, authority: string, path: string, headers: array<HpackField>, body: string, streaming: bool, length: int): int {
     if (!this.hasRoom()) return -1
     val id = this.nextStreamId
     this.nextStreamId = this.nextStreamId + 2
@@ -283,8 +300,9 @@ fun H2Client.request(method: string, scheme: string, authority: string, path: st
         fields.append(HpackField(name, h.value, h.sensitive))
     }
     if (body.size > 0 && !hasLength) fields.append(HpackField("content-length", "${body.size}", false))
+    if (streaming && length >= 0 && !hasLength) fields.append(HpackField("content-length", "$length", false))
     val block = this.encoder.encode(fields)
-    val end = if (body.size == 0) 1 else 0
+    val end = if (body.size == 0 && (!streaming || length == 0)) 1 else 0
     // One HEADERS and as many CONTINUATIONs as the peer's frame size needs, queued together: nothing may come between them.
     if (block.size <= this.peerMaxFrame) {
         this.queue(h2Frame(1, 4 | end, id, block))
@@ -298,7 +316,7 @@ fun H2Client.request(method: string, scheme: string, authority: string, path: st
             at = at + take
         }
     }
-    this.streams.append(H2Stream(id, sendWindow = this.peerInitialWindow, recvWindow = H2_INITIAL_WINDOW, body = body, localDone = body.size == 0, head = method == "HEAD"))
+    this.streams.append(H2Stream(id, sendWindow = this.peerInitialWindow, recvWindow = H2_INITIAL_WINDOW, body = body, localDone = end == 1, head = method == "HEAD", streaming = streaming, bodyFinished = !streaming || length == 0))
     this.pump()
     id
 }
@@ -312,7 +330,16 @@ private fun H2Client.pump(): void {
             if (this.outputBytes >= H2_OUTPUT_CAP) return
             val i = (this.roundRobin + n) % this.streams.size
             val remaining = this.streams[i].body.size - this.streams[i].bodyPosition
-            if (this.streams[i].localDone || remaining <= 0) continue
+            if (this.streams[i].localDone) continue
+            if (remaining <= 0) {
+                // A streamed body that was finished after its last byte went out: an empty DATA frame ends the stream.
+                if (this.streams[i].bodyFinished) {
+                    this.queue(h2Frame(0, 1, this.streams[i].id, ""))
+                    this.streams[i].localDone = true
+                    progress = true
+                }
+                continue
+            }
             var take = remaining
             if (take > this.peerMaxFrame) take = this.peerMaxFrame
             // Whatever frame size the peer allows, one DATA frame is at most 64 KiB: the output cap is checked between frames.
@@ -321,17 +348,81 @@ private fun H2Client.pump(): void {
             if (take > this.connectionSend) take = this.connectionSend
             if (take <= 0) continue
             val from = this.streams[i].bodyPosition
-            val last = from + take >= this.streams[i].body.size
+            val last = this.streams[i].bodyFinished && from + take >= this.streams[i].body.size
             this.queue(h2Frame(0, if (last) 1 else 0, this.streams[i].id, this.streams[i].body.slice(from, from + take)))
             this.streams[i].bodyPosition = from + take
             this.streams[i].sendWindow = this.streams[i].sendWindow - take
             this.connectionSend = this.connectionSend - take
             if (last) this.streams[i].localDone = true
+            // A writeBody that was refused hears of the room once half of the cap is free.
+            if (this.streams[i].blocked && this.streams[i].body.size - this.streams[i].bodyPosition <= H2_STREAM_BODY_CAP / 2) {
+                this.streams[i].blocked = false
+                this.emit(H2Event(H2_EVENT_WRITABLE, this.streams[i].id))
+            }
             progress = true
         }
         if (this.streams.size > 0) this.roundRobin = (this.roundRobin + 1) % this.streams.size
     }
     return
+}
+
+// ---- streaming requests ----
+/** Writes request body bytes of a streaming request (`requestStream`): returns how many were taken (the first `taken` bytes of `chunk`), 0 when the stream already holds a window's worth
+ *  of unsent bytes (a WRITABLE event follows when there is room again), -1 when the stream is gone, finished or not a streaming one. The sent bytes go out as the peer's windows allow. */
+fun H2Client.writeBody(id: int, chunk: string): int {
+    val at = this.indexOf(id)
+    if (this.closed || at < 0 || !this.streams[at].streaming || this.streams[at].bodyFinished || this.streams[at].localDone) return -1
+    val pending = this.streams[at].body.size - this.streams[at].bodyPosition
+    val room = H2_STREAM_BODY_CAP - pending
+    if (chunk.size == 0) return 0
+    if (room <= 0) {
+        this.streams[at].blocked = true
+        return 0
+    }
+    val taken = if (chunk.size < room) chunk.size else room
+    if (taken < chunk.size) this.streams[at].blocked = true
+    val kept = if (pending > 0) this.streams[at].body.slice(this.streams[at].bodyPosition, this.streams[at].body.size) else ""
+    this.streams[at].body = kept + (if (taken == chunk.size) chunk else chunk.slice(0, taken))
+    this.streams[at].bodyPosition = 0
+    this.pump()
+    taken
+}
+
+/** The request body of a streaming request is complete: the last DATA frame carries END_STREAM (an empty one when everything was sent already). */
+fun H2Client.finishBody(id: int): void {
+    val at = this.indexOf(id)
+    if (this.closed || at < 0 || !this.streams[at].streaming || this.streams[at].bodyFinished) return
+    this.streams[at].bodyFinished = true
+    this.pump()
+    return
+}
+
+/** Takes up to `maximum` bytes of the response body of a streaming request. Taking is what gives the peer credit again (a WINDOW_UPDATE once half a window was taken): a caller that
+ *  does not take stalls the peer after one stream window. Call it until it returns "" after a READABLE event; the END event comes once the last byte was taken. */
+fun H2Client.takeData(id: int, maximum: int): string {
+    val at = this.indexOf(id)
+    if (at < 0 || !this.streams[at].streaming || maximum <= 0) return ""
+    val inbox = this.streams[at].inbox
+    if (inbox.size == 0) return ""
+    val count = if (inbox.size < maximum) inbox.size else maximum
+    val data = if (count == inbox.size) inbox else inbox.slice(0, count)
+    this.streams[at].inbox = if (count == inbox.size) "" else inbox.slice(count, inbox.size)
+    if (this.streams[at].ended) {
+        if (this.streams[at].inbox.size == 0) {
+            this.streams.takeAt(at)
+            this.emit(H2Event(H2_EVENT_END, id))
+        }
+    } else {
+        this.streams[at].owed = this.streams[at].owed + count
+        this.credit()
+    }
+    data
+}
+
+/** The bytes a streaming request's response holds that `takeData` has not taken. */
+fun H2Client.pendingData(id: int): int {
+    val at = this.indexOf(id)
+    if (at < 0) 0 else this.streams[at].inbox.size
 }
 
 // ---- liveness ----
@@ -608,6 +699,7 @@ private fun H2Client.finishBlock(): void {
     }
     val at = this.indexOf(stream)
     if (at < 0) return
+    if (this.streams[at].ended) { this.streamError(stream, H2_STREAM_CLOSED, "headers after the end of the stream"); return }
     var status = -1
     var seenRegular = false
     var contentLength = -1
@@ -665,6 +757,12 @@ private fun H2Client.finishStream(id: int): void {
         this.queue(h2Frame(3, 0, id, h2Be32(H2_NO_ERROR)))
         this.remember(id)
     }
+    if (this.streams[at].streaming && this.streams[at].inbox.size > 0) {
+        // The END event waits until takeData has taken the last byte; the stream holds its slot until then.
+        this.streams[at].ended = true
+        this.streams[at].localDone = true
+        return
+    }
     this.streams.takeAt(at)
     this.emit(H2Event(H2_EVENT_END, id))
     return
@@ -697,15 +795,27 @@ private fun H2Client.onData(flags: int, stream: int, payload: string, now: int):
         return
     }
     if (!this.streams[at].sawFinal) { this.streamError(stream, H2_PROTOCOL_ERROR, "DATA before the response headers"); return }
+    if (this.streams[at].ended) { this.streamError(stream, H2_STREAM_CLOSED, "DATA after the end of the stream"); return }
     this.streams[at].recvWindow = this.streams[at].recvWindow - payload.size
     if (this.streams[at].recvWindow < 0) { this.streamError(stream, H2_FLOW_CONTROL_ERROR, "the server sent more than the stream window"); return }
     val size = end - begin
     this.streams[at].received = this.streams[at].received + size
-    if (this.streams[at].received > this.maximumResponseBytes) {
+    if (!this.streams[at].streaming && this.streams[at].received > this.maximumResponseBytes) {
         this.queue(h2Frame(3, 0, stream, h2Be32(H2_CANCEL)))
         this.remember(stream)
         this.streams.takeAt(at)
         this.emit(H2Event(H2_EVENT_RESET, stream, code = H2_CANCEL, error = "response too large"))
+        return
+    }
+    if (this.streams[at].streaming) {
+        // Kept for takeData, which gives the credit for what it takes: the padding counts at once, the data when it is taken. The stream window bounds the inbox.
+        if (size > 0) {
+            val wasEmpty = this.streams[at].inbox.size == 0
+            this.streams[at].inbox = this.streams[at].inbox + payload.slice(begin, end)
+            if (wasEmpty) this.emit(H2Event(H2_EVENT_READABLE, stream))
+        }
+        this.streams[at].owed = this.streams[at].owed + (payload.size - size)
+        if ((flags & 1) != 0) this.finishStream(stream)
         return
     }
     if (size > 0) this.emit(H2Event(H2_EVENT_DATA, stream, data = payload.slice(begin, end)))

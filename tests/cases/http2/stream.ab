@@ -1,0 +1,260 @@
+// Streaming requests of H2Client (abla/http/h2: requestStream, writeBody, finishBody, takeData) against a scripted peer in process: the response body waits in the stream's inbox and
+// the stream window is credited as it is taken, never as it arrives (a peer that sends a whole window stalls until the caller takes); END comes after the last byte was taken; the request
+// body is written within one window's worth of unsent bytes, the rest is refused (0) and a WRITABLE event follows when there is room; finishBody ends the stream; a streaming response is
+// not bounded by maximumResponseBytes. Each check fails with its feature removed (credit on arrival, no cap, END before the take).
+// Prints "http2 stream ok". (tools/test-http2.sh)
+import "abla/io"
+import "abla/crypto"
+import "abla/array"
+import "abla/integer"
+import "abla/http/h2"
+import "abla/http/h2/hpack"
+import "abla/text"
+
+var failures = 0
+
+fun fail(what: string): void {
+    failures = failures + 1
+    if (failures < 40) println("FAIL $what")
+    return
+}
+
+fun expect(cond: bool, what: string): void {
+    if (!cond) fail(what)
+    return
+}
+
+fun be32(value: int): string = cryptoByteString([(value >> 24) & 255, (value >> 16) & 255, (value >> 8) & 255, value & 255])
+
+fun frame(kind: int, flags: int, stream: int, payload: string): string {
+    val n = payload.size
+    cryptoByteString([(n >> 16) & 255, (n >> 8) & 255, n & 255, kind, flags, (stream >> 24) & 127, (stream >> 16) & 255, (stream >> 8) & 255, stream & 255]) + payload
+}
+
+class Seen(val kind: int, val flags: int, val stream: int, val payload: string)
+
+fun frames(output: string): array<Seen> {
+    val list: array<Seen> = []
+    var at = 0
+    if (output.size >= 24 && output.slice(0, 4) == "PRI ") at = 24
+    while (at + 9 <= output.size) {
+        val n = (output[at] << 16) | (output[at + 1] << 8) | output[at + 2]
+        list.append(Seen(output[at + 3], output[at + 4], ((output[at + 5] & 127) << 24) | (output[at + 6] << 16) | (output[at + 7] << 8) | output[at + 8], output.slice(at + 9, at + 9 + n)))
+        at = at + 9 + n
+    }
+    list
+}
+
+/** The sum of the WINDOW_UPDATE increments for `stream` (0 is the connection). */
+fun credit(list: array<Seen>, stream: int): int {
+    var sum = 0
+    for (s in list) {
+        if (s.kind == 8 && s.stream == stream) sum = sum + (((s.payload[0] & 127) << 24) | (s.payload[1] << 16) | (s.payload[2] << 8) | s.payload[3])
+    }
+    sum
+}
+
+fun dataBytes(list: array<Seen>, stream: int): int {
+    var sum = 0
+    for (s in list) {
+        if (s.kind == 0 && s.stream == stream) sum = sum + s.payload.size
+    }
+    sum
+}
+
+fun resetCode(list: array<Seen>, stream: int): int {
+    for (s in list) {
+        if (s.kind == 3 && s.stream == stream) return (s.payload[0] << 24) | (s.payload[1] << 16) | (s.payload[2] << 8) | s.payload[3]
+    }
+    -1
+}
+
+fun settings(): string = frame(4, 0, 0, "")
+
+fun ready(maximumResponseBytes: int = 16777216): H2Client {
+    var c = h2ClientNew(100, maximumResponseBytes)
+    c.takeOutput()
+    c.feed(settings(), 0)
+    c.takeOutput()
+    c.takeEvents()
+    c
+}
+
+fun hf(name: string, value: string): HpackField = HpackField(name, value, false)
+
+fun headerBlock(fields: array<HpackField>): string {
+    var e = hpackEncoderNew(0)
+    e.encode(fields)
+}
+
+fun ok200(): string = headerBlock([hf(":status", "200")])
+
+fun kinds(events: array<H2Event>): string {
+    var out = ""
+    for (e in events) out = out + "${e.kind},"
+    out
+}
+
+fun chunk(size: int): string = "x".repeat(size)
+
+/** A streamed GET whose request is complete (length 0) with the response headers in. */
+fun opened(var c: H2Client): int {
+    val id = c.requestStream("GET", "https", "example.com", "/", [], 0)
+    c.takeOutput()
+    c.feed(frame(1, 4, id, ok200()), 0)
+    c.takeEvents()
+    id
+}
+
+fun responseCredit(): void {
+    var c = ready()
+    val id = c.requestStream("GET", "https", "example.com", "/", [], 0)
+    expect(id == 1, "the first stream is 1")
+    val head = frames(c.takeOutput())
+    expect(head.size > 0 && head[head.size - 1].kind == 1 && (head[head.size - 1].flags & 1) != 0, "length 0: HEADERS ends the stream")
+    c.feed(frame(1, 4, id, ok200()), 0)
+    for (i in 0 until 12) c.feed(frame(0, 0, id, chunk(16384)), 0)
+    expect(kinds(c.takeEvents()) == "1,8,", "HEADERS then one READABLE (not one event per frame, no DATA event)")
+    expect(c.pendingData(id) == 196608, "the inbox holds what arrived: ${c.pendingData(id)}")
+    val before = frames(c.takeOutput())
+    expect(credit(before, id) == 0, "a stream window is not credited before its bytes are taken: ${credit(before, id)}")
+    val first = c.takeData(id, 100)
+    expect(first.size == 100, "takeData(100) gives 100 bytes: ${first.size}")
+    expect(credit(frames(c.takeOutput()), id) == 0, "100 bytes taken: still no credit (less than half a window)")
+    val rest = c.takeData(id, 1000000)
+    expect(rest.size == 196508, "the rest: ${rest.size}")
+    val after = frames(c.takeOutput())
+    expect(credit(after, id) == 196608, "everything taken: the stream is credited what was taken: ${credit(after, id)}")
+    expect(c.takeData(id, 10) == "", "nothing left")
+    // After READABLE and a full take, the next arrival signals again.
+    c.feed(frame(0, 0, id, chunk(10)), 0)
+    expect(kinds(c.takeEvents()) == "8,", "READABLE again once the inbox was empty")
+    return
+}
+
+fun stalls(): void {
+    var c = ready()
+    val id = opened(c)
+    // A whole stream window (262144) is accepted ...
+    for (i in 0 until 16) c.feed(frame(0, 0, id, chunk(16384)), 0)
+    expect(c.pendingData(id) == 262144, "a full window waits in the inbox: ${c.pendingData(id)}")
+    expect(credit(frames(c.takeOutput()), id) == 0, "no credit while nothing was taken")
+    // ... and one more byte is a flow control error: the peer has to wait for credit that only a take gives.
+    c.feed(frame(0, 0, id, chunk(1)), 0)
+    expect(resetCode(frames(c.takeOutput()), id) == 3, "data past the window: RST_STREAM(FLOW_CONTROL_ERROR)")
+    return
+}
+
+fun endWaitsForTheTake(): void {
+    var c = ready()
+    val id = opened(c)
+    c.feed(frame(0, 1, id, "hello"), 0)
+    expect(kinds(c.takeEvents()) == "8,", "END_STREAM with data: READABLE, END waits: ${kinds(c.takeEvents())}")
+    expect(c.openStreams() == 1, "the stream holds its slot until the last byte is taken")
+    expect(c.takeData(id, 3) == "hel", "partial take")
+    expect(kinds(c.takeEvents()) == "", "no END while bytes are left")
+    expect(c.takeData(id, 10) == "lo", "the rest")
+    expect(kinds(c.takeEvents()) == "3,", "END after the last byte")
+    expect(c.openStreams() == 0, "the stream is gone")
+    // A response with no body ends at once.
+    var d = ready()
+    val e = d.requestStream("GET", "https", "example.com", "/", [], 0)
+    d.takeOutput()
+    d.feed(frame(1, 5, e, ok200()), 0)
+    expect(kinds(d.takeEvents()) == "1,3,", "no body: HEADERS and END")
+    // Data after the end (the peer broke the protocol while bytes waited) is a stream error.
+    var f = ready()
+    val g = opened(f)
+    f.feed(frame(0, 1, g, "abc"), 0)
+    f.takeEvents()
+    f.feed(frame(0, 0, g, "more"), 0)
+    expect(kinds(f.takeEvents()) == "4,", "DATA after END_STREAM: the stream is reset")
+    return
+}
+
+fun notBounded(): void {
+    // maximumResponseBytes bounds a buffered response; a streamed one is bounded by the window and the caller's pace.
+    var c = ready(1000)
+    val id = opened(c)
+    var total = 0
+    for (round in 0 until 20) {
+        c.feed(frame(0, 0, id, chunk(16384)), 0)
+        total = total + c.takeData(id, 100000).size
+        c.takeOutput()
+    }
+    expect(total == 20 * 16384, "a streamed response past maximumResponseBytes arrives whole: $total")
+    expect(c.openStreams() == 1, "and the stream is still open")
+    var d = ready(1000)
+    val e = d.request("GET", "https", "example.com", "/", [], "")
+    d.takeOutput()
+    d.feed(frame(1, 4, e, ok200()), 0)
+    d.takeEvents()
+    d.feed(frame(0, 0, e, chunk(2000)), 0)
+    expect(resetCode(frames(d.takeOutput()), e) == 8, "a buffered response over the limit is cancelled")
+    return
+}
+
+fun requestBody(): void {
+    var c = ready()
+    val id = c.requestStream("POST", "https", "example.com", "/up", [], -1)
+    val head = frames(c.takeOutput())
+    expect(head.size > 0 && head[head.size - 1].kind == 1 && (head[head.size - 1].flags & 1) == 0 && (head[head.size - 1].flags & 4) != 0, "unknown length: HEADERS without END_STREAM")
+    expect(c.writeBody(id, "a".repeat(100)) == 100, "a small write is taken")
+    val out = frames(c.takeOutput())
+    expect(dataBytes(out, id) == 100, "and sent: ${dataBytes(out, id)}")
+    // A write of 1 MiB is taken up to the cap; the peer's window (65535) lets part of it go.
+    var accepted = 0
+    var rounds = 0
+    var more = c.writeBody(id, chunk(1048576))
+    while (more > 0 && rounds < 50) {
+        accepted = accepted + more
+        rounds = rounds + 1
+        more = c.writeBody(id, chunk(1048576))
+    }
+    expect(more == 0, "a writer is told to wait once the cap is reached: $more")
+    expect(accepted > 0 && accepted <= 262144 + 65535, "no more than a window of unsent bytes plus the peer's window is taken: $accepted")
+    val sent = dataBytes(frames(c.takeOutput()), id)
+    expect(sent > 0 && sent <= 65535, "the peer's window limits what goes out: $sent")
+    // Window updates let the rest go and tell the writer.
+    var wrote = sent
+    c.feed(frame(8, 0, 0, be32(1048576)) + frame(8, 0, id, be32(1048576)), 0)
+    var events = ""
+    for (i in 0 until 20) {
+        val out2 = frames(c.takeOutput())
+        wrote = wrote + dataBytes(out2, id)
+        events = events + kinds(c.takeEvents())
+    }
+    expect(events.contains("9,"), "a WRITABLE event after the room opened: '$events'")
+    expect(wrote >= accepted, "everything taken was sent: $wrote of $accepted")
+    expect(c.writeBody(id, "tail") == 4, "writes are taken again")
+    // finishBody: the last bytes carry END_STREAM, or an empty DATA frame does.
+    c.finishBody(id)
+    var ended = false
+    for (i in 0 until 5) {
+        for (s in frames(c.takeOutput())) {
+            if (s.kind == 0 && s.stream == id && (s.flags & 1) != 0) ended = true
+        }
+    }
+    expect(ended, "finishBody ends the request stream")
+    expect(c.writeBody(id, "late") == -1, "no writes after finishBody")
+    // Finishing with nothing pending sends an empty DATA with END_STREAM.
+    var d = ready()
+    val e = d.requestStream("POST", "https", "example.com", "/up", [], -1)
+    d.takeOutput()
+    expect(d.writeBody(e, "xy") == 2, "two bytes")
+    d.takeOutput()
+    d.finishBody(e)
+    val last = frames(d.takeOutput())
+    expect(last.size == 1 && last[0].kind == 0 && (last[0].flags & 1) != 0 && last[0].payload.size == 0, "an empty DATA frame with END_STREAM")
+    return
+}
+
+fun main: int {
+    responseCredit()
+    stalls()
+    endWaitsForTheTake()
+    notBounded()
+    requestBody()
+    if (failures == 0) println("http2 stream ok")
+    if (failures == 0) 0 else 1
+}
