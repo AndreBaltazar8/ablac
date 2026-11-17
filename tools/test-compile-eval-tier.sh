@@ -92,6 +92,20 @@ build bounded-auto "$cases/bounded.ab" -u ABLA_COMPILE_EVAL ||
 [[ $(grep -c '^note\[ct-jit\]: interpreted at [0-9]*: auto: no site of this pass reaches a loop' \
     "$output/bounded-auto.trace") == 2 ]] ||
     { cat "$output/bounded-auto.trace" >&2; fail "bounded.ab under auto: the two sites don't give the reason"; }
+# Literal subparser registrations (abla/json's) never run, so they are no sites: a program with no other `#`
+# prepares no pass (no write analysis, no call targets kept), which held the compiler's self-build ~45 MB over
+# interp (tools/test-compiler-memory-peak.sh).
+for tier in unset jit; do
+    case $tier in
+        unset) settings=(-u ABLA_COMPILE_EVAL) ;;
+        *) settings=(ABLA_COMPILE_EVAL=$tier) ;;
+    esac
+    build "registers-$tier" "$cases/registers.ab" "${settings[@]}" ||
+        { cat "$output/registers-$tier.trace" >&2; fail "registers.ab under $tier did not build"; }
+    [[ $(runs "registers-$tier") == 42 ]] || fail "registers.ab under $tier gave the wrong value"
+    ! grep -q '^note\[ct-jit\]: ordinary-global write analysis' "$output/registers-$tier.trace" ||
+        { cat "$output/registers-$tier.trace" >&2; fail "registers.ab under $tier: a pass was prepared for abla/json's registrations"; }
+done
 build bounded-jit "$cases/bounded.ab" ABLA_COMPILE_EVAL=jit ||
     { cat "$output/bounded-jit.trace" >&2; fail "bounded.ab under jit did not build"; }
 [[ $(runs bounded-jit) == 42 ]] || fail "bounded.ab under jit gave the wrong values"
