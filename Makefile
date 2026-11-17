@@ -239,6 +239,7 @@ test-serial: ablac
 	tools/test-text-padding.sh $(COMPILER)
 	tools/test-string-escapes.sh $(COMPILER)
 	tools/test-string-escape-bytes.sh $(COMPILER)
+	tools/test-format-edges.sh $(COMPILER)
 	tools/test-lexer-oddities.sh $(COMPILER)
 	tools/test-numeric-edges.sh $(COMPILER)
 	tools/test-collection-edges.sh $(COMPILER)
