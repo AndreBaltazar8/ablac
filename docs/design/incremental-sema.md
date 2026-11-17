@@ -206,3 +206,42 @@ a program, only how the editor service reuses results, and the fallback is today
   at the top.
 - Held set: a counter of the bytes the collector marks, per collection: the service holds 541 MB between analyses (80 bytes per
   byte of source), two thirds of what an edit's collections mark.
+
+## Checklist: the per-analysis global tables, rebuilt or kept by slice 1
+
+Every `var` (and the `val` maps that are written to) at file scope of the files an analysis runs through, with what slice 1 does
+with it when it re-analyses one module against cached rows of the rest. "Reset" means the incremental run puts the table in its
+state at the start of a cold analysis before the module's run; "rebuild" means it is recomputed for the whole program from
+per-module rows (cheap, a pass over the rows, not over bodies); "keep" means it is process configuration or a dedupe table that
+must outlive the analysis. A table not listed here is not written by an analysis (checked by grepping `^var` and `^val .*Map` in
+sema.ab, generics.ab, overload.ab, receiver_names.ab, expected_types.ab, delegated_properties.ab, borrow_inference.ab,
+named_arguments.ab, module.ab, module_paths.ab, parser.ab, lexer.ab, staged_parser.ab, frontend.ab, source_rewrite.ab,
+generic_types.ab, call_targets.ab, named_overload.ab, analysis_service.ab, analysis_graph.ab).
+
+| Table | Where | What it is | Slice 1 |
+| --- | --- | --- | --- |
+| `bootstrapSemanticRecordNames` | sema.ab | on around an editor analysis | keep (set on for the module run, as `bootstrapFrontendTypeProject` does) |
+| `bootstrapIdentityInterned` | sema.ab | one string object per distinct identity of a resolved name; emptied by each analysis so that edits leave no old identities | reset per analysis; rows of cached modules keep their own string objects (more memory, no wrong answer) |
+| `bootstrapSourceKeys` | sema.ab | path to short key, used when names are not recorded | keep (the editor path records names and does not use it) |
+| `bootstrapPathIds` | sema.ab | path to `p<n>` in first-use order, for the occurrence index's keys | keep; the keys only tell sources apart within one analysis, so a gap in the numbering is harmless |
+| `bootstrapFloatDemandOrigin/Text/Active/Names/Source` | sema.ab | per-run flags and a count of floats that reach `any`, which decide lowering, not editor output | reset per module run, result ignored |
+| `bootstrapCompileEffectReading`, `...LastReader`, `...EdgeReaders`, `...EdgeReads` | sema.ab | scratch of the compile-effect summary builder, empty outside it | reset before each summary run |
+| `bootstrapSimdCurrentFeatures`, `bootstrapRuntimeModulePrefix`, `bootstrapStandardLibraryModulePrefix`, `bootstrapSemanticTargetsWasm`, `bootstrapSemanticWasmUnwinds` | sema.ab | target and library configuration | keep |
+| `bootstrapSourceRewrites` | source_rewrite.ab | the rewrite of each module's source (aliased names, private names), recorded by the graph's parse and replayed on a cache hit (`bootstrapAnalysisGraphReuse`); the editor maps ranges back through it | rebuild per analysis from the per-module cache entries: the edited module's new rewrite replaces its entry, the others are replayed |
+| `bootstrapGenericMethods` | generic_types.ab | "Class.method" of the generic methods of the program, for diagnostics | rebuild per analysis from the generic table |
+| `bootstrapModuleImportsCurrent` | module_paths.ab | the import table of the graph parsed last, the analyzer's default | rebuild per parse (cheap); an edit of an import line falls back to a full analysis anyway |
+| `bootstrapStrictVisibilityTable`, `bootstrapStrictIdentityModules` | module_paths.ab | the strict-import visibility table of a graph, and a memo from source identities to modules, emptied with each new table | reset per parse; unchanged import edges leave the table as is |
+| `bootstrapModuleIdentityRoot`, `...Stdlib`, `...Prefixes` | module_paths.ab | what turns a path into a module identity; set by each graph parse | keep while the entry is the same |
+| `bootstrapWorkingDirectory`, `bootstrapStrictImportsRequested`, `bootstrapStrictImportsWarn`, `bootstrapVisibilityReportPath`, `bootstrapVisibilityReportStarted` | module_paths.ab, module.ab | configuration of the process | keep |
+| `bootstrapStandardLibraryVisibilityRoot/Value` | module.ab | the standard library's `visibility`, read once per root | keep |
+| `bootstrapStrictImportWarningsShown`, `bootstrapVisibilityReportMemberLines` | module_paths.ab | once-per-process dedupe of warnings and report lines | keep: the incremental run must not print a warning again that a cold analysis printed once |
+| `bootstrapLexMemoActive/Memo/Bytes` | lexer.ab | token memo of a build, off in the editor | none (inactive) |
+| `bootstrapExpectedIndexCheckValue`, `bootstrapModuleIndexCheckValue` | expected_types.ab, module.ab | debug-check switches read once | keep |
+| `bootstrapAnalysisGraphActiveEntry`, `bootstrapAnalysisGraphModules` | analysis_graph.ab | the entry the service holds and its module state (snapshots by path, acquisition counters, overlays) | keep; the snapshot of the edited module is replaced, as today |
+| `bootstrapFrontendSiteCache` | frontend.ab | a module's compile-time sites by source (the editor-load-cache branch) | keep, entry replaced per edited module |
+| the service's `graphParsed`, `graphQueryIndex`, `graphGenerations`, `graphReferences` | analysis_service.ab | the per-module parse and symbols cache; the current answer's index; the last eight generations' fingerprints; the references memo (filled on the first query of a revision) | `graphParsed` keep (it is the model of what slice 1 adds for sema); the others are replaced per analysis as today, `graphReferences` refilled lazily |
+
+Not tables but the same kind of state, **inside** `BootstrapAnalyzer`, which slice 1 must build from per-module rows instead of
+from a walk over every declaration: the symbol table and its index (symbol numbering follows program order), the overload and
+generic probe tables, `inferredResults` (and its `settled` flag), the subparser registry, the compile-effect, mutable-receiver,
+affine and region summaries, `initEdges` (global initialization order), `clashesExplained`, the stack-depth-stopped sources.
