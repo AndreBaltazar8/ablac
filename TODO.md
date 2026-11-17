@@ -1661,6 +1661,17 @@ mmap form) apply there.
   `--fast`. Keyed by the compiler, such a cache misses on every build after a compiler change, the case this item
   is about, and the repeats within one run are the 0.4% to 0.8% above, so it pays only for reruns with the same
   compiler (a failure's rerun, `make test` twice); the lever after a compiler change stays per-build compile cost.
+  2026-11-17 (ablac-c2, a gate of a branch off master, 451 commands, 0 failures, 5,537 CPU-seconds of commands; a launcher
+  wrapper logged each of the 5,239 compiler calls with its CPU and owning script): the compiler is 3,854 CPU-seconds (70%):
+  1,808 release builds 1,586 s (0.88 each), 1,912 `--fast` builds 1,398 s (0.73), 1,062 `--emit-llvm` 415 s, `analyze` 167 s.
+  The same source and flags built by two different scripts: 59 builds, 42 CPU-seconds (0.8%; the environment was not logged,
+  so some differ in it): sharing builds is a no-go again, as on 2026-11-15. The release-heavy scripts are release on purpose
+  (the tls ones for #822, parity and reproducible-elsewhere for the release output, aarch64's release half for coverage).
+  No cut of 10% or more exists that keeps the tests' power. Two found and made: test-tls-faults polled `/proc` with a
+  `readlink` process per process (about 2.3 CPU-seconds a look with 1,300 processes): 49.9 s to 13.3 s wall, 42.5 to 1.5
+  CPU-seconds; and test-aarch64-linux, the longest single command (613 s of wall in that gate), builds its programs in
+  workers (2 under the suite): 210.9 s to 86.2 s wall, CPU unchanged. The ranking by CPU: ct-bridge 230 (557 `--emit-llvm`
+  calls), fuzz-abla 216, tls-pure-interop 207, self-hosted 187, aarch64 164, analysis-memory 109.
 - [ ] **Editor analysis integration.** Grow opt-in graph-aware analysis and indexed positional
   queries from the compiler's own parser/type APIs. Update abla-lsp separately after the compiler
   capabilities are validated; use the same parser-derived `ablac fmt` for formatting.
