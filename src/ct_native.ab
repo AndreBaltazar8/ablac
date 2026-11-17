@@ -92,6 +92,23 @@ fun bootstrapCtCacheTier(): string {
     if (configured.found) configured.value else ""
 }
 
+// Set while a site runs as a trial under ABLA_COMPILE_EVAL=auto (ct_jit.ab, bootstrapCtTrials): an attempt the
+// native tier repeats if it does not finish, so nothing in it may act outside the interpreter. A provider call
+// (files, output, the clock…), an extern:"c" call, a system call, an unsafe call or static storage stops it
+// before it happens (ctNativeTrialStop): the site then runs natively, once.
+var ctNativeTrial: bool = false
+
+fun ctNativeTrialStop(var evaluator: BootstrapEvaluator, what: string): bool {
+    if (!ctNativeTrial) return false
+    evaluator.errors = evaluator.errors + 1
+    evaluator.recordEvaluatorDiagnostic("E_CT_TRIAL", "a trial evaluation stops before $what")
+    true
+}
+
+fun ctNativeTrialIntrinsic(name: string): bool =
+    name == "ablaLinuxSyscall" || name.startsWith("ablaDarwin") || name.startsWith("ablaUnsafeCall") ||
+    name.startsWith("nativeStatic") || name == "nativeThreadLocalBytes"
+
 // The compile capabilities granted to the `#` expressions of the program being
 // lowered: its source requests intersected with the manifest's authorization,
 // and none once semantic analysis failed (a denied effect is one such
@@ -411,6 +428,7 @@ trusted fun ctNativeEvaluateIntrinsic(
     // land on a made-up address. (The runtime's panic path, interpreted after such an error, called the real
     // _longjmp with 0x30 and crashed the compiler: narrow-array-getters, scalar-array-setters.)
     if (evaluator.errors > 0) return bootstrapEvalInvalid()
+    if (ctNativeTrialIntrinsic(name) && ctNativeTrialStop(evaluator, "intrinsic `$name`")) return bootstrapEvalInvalid()
     val effect = ctNativeIntrinsicEffect(name)
     val contained = ctNativeRawContext == 1 && ctNativeRawOperation(name)
     if (!contained && !ctNativeAllowed(evaluator, effect)) {
@@ -1182,6 +1200,7 @@ trusted fun ctNativeEvaluateExternCall(
     declaration: BootstrapDeclaration
 ): BootstrapEvalValue {
     val name = bootstrapCanonicalDeclarationSourceName(declaration.name)
+    if (ctNativeTrialStop(evaluator, "extern:\"c\" `$name`")) return bootstrapEvalInvalid()
     if (!bootstrapCompileEffectHas(evaluator.allowedCompileEffects, 512)) {
         return ctNativeDenied(evaluator, "call to extern:\"c\" `$name`", 512)
     }
@@ -1884,6 +1903,7 @@ fun ctNativeEvaluateProvider(
     name: string,
     effect: int
 ): BootstrapEvalValue {
+    if (ctNativeTrialStop(evaluator, "`$name`")) return bootstrapEvalInvalid()
     if (!ctNativeAllowed(evaluator, effect)) {
         return ctNativeDenied(evaluator, "call to `$name`", effect)
     }

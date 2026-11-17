@@ -885,12 +885,28 @@ where it can't. `ABLA_COMPILE_EVAL` chooses the tier:
   and covers the whole pass, so no global is shared between the tiers. A
   table built in a loop, a hash, a parser or a TLS handshake runs natively;
   `#square(6)` costs no code generation.
-- `interp`: every site runs in the evaluator.
 
-`ABLA_COMPILE_EVAL_TRACE=1` prints the tier each site ran on and, for a site
-left to the evaluator, the reason.
+  In a pass that can run long, a site that can act on nothing outside the
+  evaluator first gets a *trial*: the evaluator runs it within what is left
+  of the pass's step budget (`ABLA_COMPILE_EVAL_TRIAL_STEPS`, default
+  1000000, about a tenth of a second; 0 turns trials off). Such a site is
+  not a top-level action, reaches no compile global and no ordinary global
+  compile-time code writes, and its code calls no `extern:"c"` function and
+  no compile-time provider (files, output, the environment, the clock,
+  random numbers). The pass must also change no declaration. Running such a
+  site twice is harmless, and the evaluator stops a trial before anything
+  that would not be (a provider or C call, a system call, static storage).
+  A site whose trial finishes keeps the evaluator's result. One whose trial
+  runs out of steps, is stopped, or fails runs natively, as under `jit`. If
+  every site of the pass finishes, the pass builds no native generation. A
+  site that acts outside the evaluator never gets a trial: it runs once, on
+  the tier chosen for it before the pass runs.
+- `interp`: every site runs in the evaluator.
 - `bridge`: the evaluator, calling the compiler API through the native
   bridge (a check of the bridge).
+
+`ABLA_COMPILE_EVAL_TRACE=1` prints the tier each site ran on and, for a site
+left to the evaluator, the reason; a trial that did not finish says why.
 
 The action journal (`ABLA_ACTION_JOURNAL`) records evaluated actions only:
 when it is on and `ABLA_COMPILE_EVAL` names no tier, the tier is `interp`.

@@ -9,7 +9,10 @@
 #     native generation (the interpreter runs them), one with recursion does; jit takes both;
 #   - effects/: a site the native tier takes and one it refuses each append one line to a file:
 #     each file holds its line once (no site runs twice to choose), the trace says which ran
-#     natively and why the other did not.
+#     natively and why the other did not;
+#   - trial.ab, printing.ab: under auto a site that can act on nothing outside the interpreter
+#     runs there first within a step budget (a trial), and needs no generation if it finishes;
+#     one that prints gets no trial.
 set -euo pipefail
 
 compiler=${1:-build/ablac.bin}
@@ -94,10 +97,37 @@ build bounded-jit "$cases/bounded.ab" ABLA_COMPILE_EVAL=jit ||
 [[ $(runs bounded-jit) == 42 ]] || fail "bounded.ab under jit gave the wrong values"
 [[ $(grep -c '^note\[ct-jit\]: native at' "$output/bounded-jit.trace") == 2 ]] ||
     { cat "$output/bounded-jit.trace" >&2; fail "bounded.ab under jit: not both sites native"; }
-build recursive-auto "$cases/recursive.ab" -u ABLA_COMPILE_EVAL ||
+# (Without trials: with them, this short recursion finishes in its trial, as in section 4.)
+build recursive-auto "$cases/recursive.ab" -u ABLA_COMPILE_EVAL ABLA_COMPILE_EVAL_TRIAL_STEPS=0 ||
     { cat "$output/recursive-auto.trace" >&2; fail "recursive.ab under auto did not build"; }
 [[ $(runs recursive-auto) == 42 ]] || fail "recursive.ab under auto gave the wrong value"
 grep -q '^note\[ct-jit\]: native at' "$output/recursive-auto.trace" ||
     { cat "$output/recursive-auto.trace" >&2; fail "recursive.ab's site was not native under auto"; }
+
+# 4. Trials (auto): a site that can act on nothing outside the interpreter runs there first, within the pass's
+# step budget. trial.ab's short loop finishes, so the pass has no generation; with no budget it is native.
+# heavy.ab's trial in section 1 runs out (its loop needs more than the default 1000000 steps) and the site runs
+# natively. printing.ab's loop prints, so it gets no trial, and each line is printed once.
+build trial-auto "$cases/trial.ab" -u ABLA_COMPILE_EVAL ||
+    { cat "$output/trial-auto.trace" >&2; fail "trial.ab under auto did not build"; }
+[[ $(runs trial-auto) == 42 ]] || fail "trial.ab under auto gave the wrong value"
+! grep -q '^note\[ct-jit\]: \(generation\|native at\)' "$output/trial-auto.trace" ||
+    { cat "$output/trial-auto.trace" >&2; fail "trial.ab under auto made a native generation"; }
+grep -q '^note\[ct-jit\]: interpreted at [0-9]*: auto: finished in the interpreter in [0-9]* steps' \
+    "$output/trial-auto.trace" || { cat "$output/trial-auto.trace" >&2; fail "trial.ab: no finished trial"; }
+build trial-none "$cases/trial.ab" -u ABLA_COMPILE_EVAL ABLA_COMPILE_EVAL_TRIAL_STEPS=0 ||
+    { cat "$output/trial-none.trace" >&2; fail "trial.ab without trials did not build"; }
+grep -q '^note\[ct-jit\]: native at' "$output/trial-none.trace" ||
+    { cat "$output/trial-none.trace" >&2; fail "trial.ab without trials was not native"; }
+grep -q '^note\[ct-jit\]: trial at .* did not finish after [0-9]* steps' "$output/heavy-unset.trace" ||
+    { cat "$output/heavy-unset.trace" >&2; fail "heavy.ab under auto: no trial that ran out"; }
+build printing-auto "$cases/printing.ab" -u ABLA_COMPILE_EVAL ||
+    { cat "$output/printing-auto.trace" >&2; fail "printing.ab under auto did not build"; }
+[[ $(runs printing-auto) == 42 ]] || fail "printing.ab under auto gave the wrong value"
+[[ $(grep -c '^compile-eval-tier line' "$output/printing-auto.out") == 3 ]] ||
+    { cat "$output/printing-auto.out" "$output/printing-auto.trace" >&2; fail "printing.ab: not three lines once each"; }
+! grep -q '^note\[ct-jit\]: trial at' "$output/printing-auto.trace" || fail "printing.ab's site got a trial"
+grep -q '^note\[ct-jit\]: native at' "$output/printing-auto.trace" ||
+    { cat "$output/printing-auto.trace" >&2; fail "printing.ab's site was not native under auto"; }
 
 echo "compile-eval-tier: ok"

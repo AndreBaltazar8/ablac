@@ -1366,6 +1366,105 @@ fun bootstrapCtTripleFamily(triple: string): string {
 fun bootstrapCtTripleIsHost(triple: string): bool =
     bootstrapCtTripleFamily(triple) == bootstrapCtTripleFamily(llvmDefaultTargetTriple())
 
+// What a site's walk (reach.visited, after reach.unsupported) reaches that acts outside the compiler, "" when
+// nothing: a program's extern:"c" declaration or a compile-time provider (files, output, the clock, the
+// environment, …). The standard library's own C declarations (its allocator's malloc, which nearly every walk
+// reaches) don't count: what a trial would call of them, ctNativeTrialStop stops before the call.
+fun bootstrapCtReachActs(reach: BootstrapCtReach): string {
+    var item = 0
+    while (item < reach.visited.size) {
+        if (reach.visited[item] && reach.itemMethods[item] < 0) {
+            val declaration = reach.declarations[reach.itemDeclarations[item]]
+            if (declaration.kind == "extern" && declaration.externalLibrary == "c" &&
+                !bootstrapCtLibraryDeclaration(declaration)) {
+                return "it reaches extern:\"c\" ${declaration.name}"
+            }
+            if (bootstrapCompileDeclarationProviderEffect(declaration) >= 0) {
+                return "it reaches the compile-time provider ${declaration.name}"
+            }
+        }
+        item = item + 1
+    }
+    ""
+}
+
+// ABLA_COMPILE_EVAL_TRIAL_STEPS: the interpreter steps a pass's trials may take together under auto (default
+// 1000000, about a tenth of a second; 0: no trials).
+var bootstrapCtTrialStepsValue: int = -1
+
+fun bootstrapCtTrialSteps(): int {
+    if (bootstrapCtTrialStepsValue < 0) {
+        val configured = linuxEnvironment("ABLA_COMPILE_EVAL_TRIAL_STEPS")
+        bootstrapCtTrialStepsValue = 1000000
+        if (configured.found && configured.value.size > 0 && configured.value.size <= 12) {
+            var parsed = 0
+            var valid = true
+            for (byte in configured.value) {
+                if (byte < 48 || byte > 57) valid = false
+                else parsed = parsed * 10 + byte - 48
+            }
+            if (valid) bootstrapCtTrialStepsValue = parsed
+        }
+    }
+    bootstrapCtTrialStepsValue
+}
+
+// Under auto, before the pass's native generation is built: each ready site that can act on nothing outside the
+// interpreter runs there first, within what is left of the pass's step budget (bootstrapCtTrialSteps). Such a
+// site is not a top-level action, reaches no compile global and no ordinary global compile-time code writes, and
+// its walk reaches no extern:"c" code and no provider (bootstrapCtReachActs); and the pass changes no declaration,
+// so where in it the site runs makes no difference. Running it twice is then harmless, and the interpreter
+// stops it before anything that would not be (ct_native.ab, ctNativeTrialStop). A site the trial finishes keeps
+// that result for lowering and needs no generation; one it doesn't (out of steps, stopped before an effect, an
+// error) runs natively, as it would have. Returns how many sites finished. A pass whose ready sites all finish
+// builds no generation: the cost auto saves on a program whose compile-time work is small.
+fun bootstrapCtTrials(parsed: BootstrapParseResult, state: BootstrapCtStateResult): int {
+    var left = bootstrapCtTrialSteps()
+    if (left <= 0 || state.edits) return 0
+    val shared = bootstrapEvalContext(parsed.declarations)
+    val grants = bootstrapBuildCompileEffectGrants(
+        bootstrapBuildCompileEffectRequests(parsed),
+        bootstrapBuildCompileEffectAuthorizations(parsed)
+    )
+    var finished = 0
+    var index = 0
+    while (index < bootstrapCtSites.size && left > 0) {
+        val site = bootstrapCtSites[index]
+        var noTrial = if (site.action) "a top-level action" else site.noTrial
+        if (site.reason == "" && noTrial == "") {
+            for (global in state.reached[index]) {
+                if (noTrial == "" && state.writers[global] != "") {
+                    noTrial = "it reaches ${parsed.declarations[global].name}, which compile-time code writes"
+                }
+            }
+        }
+        if (site.reason == "" && noTrial != "") {
+            bootstrapCtNote("no trial at ${bootstrapCtSiteLabel(site)}: $noTrial")
+        }
+        if (site.reason == "" && noTrial == "") {
+            val context = BootstrapEvalContext(
+                shared.size, shared.affineTypes, shared.index, shared.check, left
+            )
+            ctNativeTrial = true
+            val result = bootstrapEvaluateWithEffectsIn(
+                context, site.expression, parsed.declarations, grants, site.sourceIdentity
+            )
+            ctNativeTrial = false
+            val spent = bootstrapEvalLastSteps
+            left = left - spent
+            if (result.errors == 0) {
+                site.tried = result
+                site.reason = "auto: finished in the interpreter in $spent steps (a trial), so it needs no native generation"
+                finished = finished + 1
+            } else {
+                bootstrapCtNote("trial at ${bootstrapCtSiteLabel(site)} did not finish after $spent steps: ${bootstrapCtFirstLine(result.diagnostics)}; it runs natively")
+            }
+        }
+        index = index + 1
+    }
+    finished
+}
+
 fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string,
     methodTargets: BootstrapResolvedMethodTargets = bootstrapResolvedMethodTargets()): void {
     val started = linuxMonotonicMilliseconds()
@@ -1555,6 +1654,13 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string,
                 site.long = bootstrapCtMayRunLong(reach, site.expression)
                 anyLong = site.long
             }
+            // Under auto, what decides a trial (bootstrapCtTrials), while the walk is the site's.
+            if (site.reason == "" && auto) {
+                site.noTrial = bootstrapCtReachActs(reach)
+                if (site.noTrial == "" && reached.size > 0) {
+                    site.noTrial = "it reaches compile global ${parsed.declarations[reached[0]].name}"
+                }
+            }
             if (crossTarget && site.reason == "") {
                 // Whole bodies are kept even where the phase proof skips an arm.
                 // A global reached only from that arm would nevertheless initialize
@@ -1671,6 +1777,7 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string,
             ready = 0
         }
     }
+    if (auto && ready > 0) ready = ready - bootstrapCtTrials(parsed, state)
     // The owned globals go back to the interpreter's journal after every native call, as compile globals do
     // (bootstrapCtExchangeGlobals): a later pass, or an interpreted evaluation of this one, reads the one value.
     var ownedIndex = 0
