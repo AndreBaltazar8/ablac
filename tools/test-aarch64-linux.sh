@@ -12,6 +12,38 @@ out="$root/build/aarch64-linux"
 rm -rf "$out"
 mkdir -p "$out"
 fail() { echo "aarch64 linux: $1" >&2; exit 1; }
+# The builds are independent: they run in workers, 2 at once under the suite (tools/run-tests.sh sets ABLA_SUITE_JOBS; the
+# suite's other jobs are running too), else one per CPU this process may use (nproc follows taskset), at most 8.
+# ABLA_TEST_JOBS overrides. Every worker's output goes to its own file under $out; the first failure is reported.
+workers=${ABLA_TEST_JOBS:-}
+if [[ -z $workers ]]; then
+    if [[ -n ${ABLA_SUITE_JOBS:-} ]]; then workers=2; else workers=$(nproc 2> /dev/null || echo 2); ((workers <= 8)) || workers=8; fi
+fi
+[[ $workers =~ ^[1-9][0-9]*$ ]] || fail "ABLA_TEST_JOBS must be a positive integer, got $workers"
+failed_jobs=()
+parallel_each() { # FUNCTION ARGUMENT...: FUNCTION ARGUMENT for each argument, $workers at once; fails when any fails
+    local function_name=$1 argument pid
+    shift
+    local pids=() arguments=()
+    for argument in "$@"; do
+        while ((${#pids[@]} >= workers)); do
+            wait_one
+        done
+        "$function_name" "$argument" > "$out/job-${argument//\//_}-$function_name.log" 2>&1 &
+        pids+=($!)
+        arguments+=("$argument")
+    done
+    while ((${#pids[@]} > 0)); do wait_one; done
+    if ((${#failed_jobs[@]} > 0)); then
+        for argument in "${failed_jobs[@]}"; do cat "$out/job-${argument//\//_}-$function_name.log" >&2; done
+        exit 1
+    fi
+}
+wait_one() { # waits for the oldest worker; records the argument of one that failed
+    if ! wait "${pids[0]}"; then failed_jobs+=("${arguments[0]}"); fi
+    pids=("${pids[@]:1}")
+    arguments=("${arguments[@]:1}")
+}
 have_qemu=1
 command -v qemu-aarch64 > /dev/null || have_qemu=0
 programs='tests/cases/libc-imports/hello.ab tests/cases/libc-imports/float-remainder.ab
@@ -21,7 +53,8 @@ checks='tests/cases/linux-syscall/main.ab tests/cases/linux-syscall/legacy.ab te
 tests/cases/modules/http-client.ab
 tests/cases/linux-syscall/random.ab tests/cases/linux-syscall/wide.ab tests/cases/linux-syscall/int128.ab tests/cases/linux-syscall/memory.ab
 tests/cases/libc-memory-routines/main.ab tests/cases/rsa-default-random/main.ab'
-for source in $programs $checks; do
+program_check() { # SOURCE: both modes, built for AArch64, checked, and run under qemu against the native build
+    local source=$1 name mode flags file_kind native_status foreign_status
     name=$(basename "$source" .ab)-$(basename "$(dirname "$source")")
     for mode in release fast; do
         flags=''
@@ -35,7 +68,8 @@ for source in $programs $checks; do
             fail "$name $mode needs a shared library or a loader"
         fi
         [[ $have_qemu -eq 1 ]] || continue
-        native_status=0 foreign_status=0
+        native_status=0
+        foreign_status=0
         # shellcheck disable=SC2086
         "$compiler" build "$source" -o "$out/$name-native-$mode" --no-cache $flags > /dev/null 2>&1 \
             || fail "$name $mode native build failed"
@@ -44,7 +78,9 @@ for source in $programs $checks; do
         [[ $native_status -eq $foreign_status ]] || fail "$name $mode: status $foreign_status under qemu, $native_status natively"
         cmp -s "$out/$name-$mode.native.out" "$out/$name-$mode.out" || fail "$name $mode: output differs from the native build"
     done
-done
+}
+# shellcheck disable=SC2086
+parallel_each program_check $programs $checks
 # Static and libc-free, built only (no run): the other libc-imports programs that have an AArch64 build (tls-http needs
 # OpenSSL, which has none) in both modes, and one program for each stdlib area a libc-free build can still reach libc
 # from (sockets, processes, signals, stm, tls/pure, http/async, websocket), --fast. A regression there would otherwise
@@ -68,11 +104,12 @@ static_check() { # SOURCE MODE: builds for AArch64 and requires no library, load
         fail "$source ($mode) links libc or leaves a symbol undefined"
     fi
 }
-for source in $static_both; do
-    static_check "$source" release
-    static_check "$source" fast
-done
-for source in $static_fast; do static_check "$source" fast; done
+static_both_check() { static_check "$1" release; static_check "$1" fast; }
+static_fast_check() { static_check "$1" fast; }
+# shellcheck disable=SC2086
+parallel_each static_both_check $static_both
+# shellcheck disable=SC2086
+parallel_each static_fast_check $static_fast
 if [[ $have_qemu -eq 1 ]]; then
     # A bad access in a --fast build: the fault report, then the default action (SIGSEGV).
     # The debug runtime needs debug information, which the suite turns off (ABLA_DEBUG=0).
