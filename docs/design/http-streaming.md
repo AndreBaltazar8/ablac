@@ -34,13 +34,15 @@ New methods, same client, same `step`:
                                                             // length -1: unknown (chunked on HTTP/1.1, END_STREAM at finishBody on HTTP/2)
     client.writeBody(id, chunk): int                        // bytes accepted (<= chunk.size); 0: the send side is full, wait for a WRITABLE event
     client.finishBody(id): void
-    client.takeStreamEvents(): array<HttpAsyncStreamEvent>   // HEADERS(status, headers) | DATA(chunk) | WRITABLE | END(trailers) | ERROR(message)
-    client.cancel(id)                                       // RST_STREAM(CANCEL) on HTTP/2, closes the connection on HTTP/1.1
+    client.readStream(id, max): string                      // up to max bytes of the response body ("" when none waits); reading is what credits the peer
+    client.streamPending(id): int                           // the bytes that wait
+    client.takeStreamEvents(): array<HttpAsyncStreamEvent>   // HEADERS(status, headers) | READABLE | WRITABLE | END(trailers) | ERROR(message)
+    client.cancelStream(id)                                 // RST_STREAM(CANCEL) on HTTP/2, closes the connection on HTTP/1.1; its last event is ERROR "cancelled"
 
-- `takeStreamEvents` is the consumption point: the DATA it returns is credited. Not calling it is the pause. There is no separate `resume`.
+- `readStream` is the consumption point (a change from the first draft, which returned DATA in the events: a pull per stream lets one stream pause while the others go on). READABLE is sent when bytes arrive for a stream that had none waiting: read until `readStream` returns "". The stream window is credited as the bytes are read (a WINDOW_UPDATE once half a window was), the connection window on arrival, so one stalled stream cannot stall the others; not reading is the pause and there is no `resume`. **END comes after the last response byte was read**: a caller that ignores a response body never sees END.
 - `writeBody` is bounded: a stream's unsent request bytes never exceed one HTTP/2 stream window plus the output cap (`H2_OUTPUT_CAP`), or the socket buffer on HTTP/1.1. A caller that writes more than is accepted keeps the rest and writes it when WRITABLE comes. `H2Stream.body` becomes a chunk queue with a `finished` flag; the whole-string body of today is the case "one chunk, finished".
 - Timeouts: the per-request timeout of the buffered API stays a total. A stream has an idle timeout (no event or accepted byte for N ms) and an optional total deadline. The default idle timeout is 30 s.
-- HTTP/1.1: one stream per connection as now. The response is read as the socket delivers; reading stops (interest off) when the undelivered bytes pass 256 KiB and resumes when `takeStreamEvents` drains them. A request with unknown length is sent `Transfer-Encoding: chunked`.
+- HTTP/1.1: one stream per connection as now. The response is read as the socket delivers; reading stops (interest off) when the undelivered bytes pass 256 KiB and resumes when `readStream` drains them. A request with unknown length is sent `Transfer-Encoding: chunked`.
 - `http2PingAfterIdleMilliseconds`, GOAWAY handling and the one-retry rule apply as for buffered requests; a stream that already delivered bytes is never retried (an ERROR event says so).
 
 ## Server API (`abla/http/event/tls`, `abla/http/h2/server`)
@@ -100,3 +102,11 @@ Each step lands with its own tests and does not change a buffered result.
 1. Interface callbacks (`HttpStreamHandler`) rather than closures or a polling `takeEvents` on the server. A polling server API (`server.takeStreamEvents()`) would mirror the client and avoids resources in callbacks, but the handler would then need its own loop around the server; callbacks keep the existing "give the server a handler" shape.
 2. `maximumStreamBodyBytes` default 0 (no limit) on streaming routes, against a large default such as 1 GiB. Unlimited is what a file upload route wants, and the route is opt-in; the idle timeout bounds a stall, not a slow steady upload.
 3. No automatic gzip for streamed responses in the first release.
+
+## What exists (client side) and what was measured
+
+`H2Client` has `requestStream`, `writeBody`, `finishBody`, `takeData`, `pendingData` and the READABLE and WRITABLE events; `HttpAsyncClient` has the API above over HTTP/2 (HTTP/1.1 streaming and the server side are the later steps). `writeBody` returns 0 until the first WRITABLE event, which the client sends when the stream is attached to a connection. A streaming request is never retried and a streaming response is not bounded by `maximumResponseBytes` (the caller's pace and the window bound it).
+
+`tools/test-http2-stream.sh` (h2o and nghttpd, over h2c and TLS): a 1 GiB download and a 1 GiB upload over h2c, 64 MiB each over TLS and a consumer that stops reading for 1.5 s, all byte-exact; an unread stream held at most one stream window (262144 bytes) of the peer's data; `writeBody` took less than it was offered (backpressure) during the upload; the client process' resident memory peaked at **about 70 MB in every run**, from 64 MiB to 1 GiB, so it does not grow with the transfer (the Abla heap's garbage, collected). The test limit is 128 MiB.
+
+A bug found by that test and fixed with it: the client counted every WINDOW_UPDATE as a frame that carries nothing, and ended the connection (ENHANCE_YOUR_CALM) after 1000 in a row, which nghttpd's one-update-per-DATA-frame reached at 16 MiB of upload. A window update on a request that is still being sent no longer counts. This affected buffered uploads too (v0.2.61's `http2 = true` client and any upload over 16 MiB to such a server).
