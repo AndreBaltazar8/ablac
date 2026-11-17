@@ -820,14 +820,23 @@ private trusted fun httpParseRequestNative(input: string, peer: SocketPeerAddres
                     val next = ablaUnsafeLoadU8(nativePointerFromAddress(data + probe + 1))
                     if (next == 10) lineEnd = probe
                     else malformed = true
-                } else if (byte == 10) malformed = true
+                } else if (byte == 10 || (byte < 32 && byte != 9) || byte == 127) malformed = true
                 probe = probe + 1
             }
             end = if (lineEnd >= 0) lineEnd else httpLineEnd(input, probe)
-            // Past the window the bytes up to the line end are searched once, only by a long value.
+            // Past the window the bytes up to the line end are searched once, only by a long value: a bare LF or CR, or
+            // any other control byte but a tab (or DEL), is not a field value byte (RFC 9110 5.5).
             if (lineEnd < 0 && end > probe) {
                 if (textFindByte(input, 10, probe, end) >= 0) malformed = true
                 else if (textFindByte(input, 13, probe, end) >= 0) malformed = true
+                else {
+                    var at = probe
+                    while (!malformed && at < end) {
+                        val byte = ablaUnsafeLoadU8(nativePointerFromAddress(data + at))
+                        if ((byte < 32 && byte != 9) || byte == 127) malformed = true
+                        at = at + 1
+                    }
+                }
             }
         }
         if (end == cursor) {
@@ -873,7 +882,7 @@ fun httpTokenByte(byte: int): bool =
     byte == 46 || (byte >= 94 && byte <= 96) || byte == 124 || byte == 126
 
 /** What a request head line that no reader can take as a header leaves in `request.headers`: a line without a colon or
- *  with an empty name (a folded line is one), or one with a bare LF or CR in it or a byte in its name that is not a
+ *  with an empty name (a folded line is one), or one with a bare LF or CR in it, a control byte but a tab (or DEL) in its value, or a byte in its name that is not a
  *  token character (RFC 9112 2.2, 5.1, 5.2). The line is
  *  dropped from the parse as before, but this marker (a name that begins with a space, which `httpRequestFraming`
  *  refuses, and an empty value) says it was there, so a request with such a line is refused, not read two ways. */
@@ -885,6 +894,18 @@ fun httpHasControlByte(input: string, begin: int, end: int): bool {
     var found = false
     while (!found && at < end) {
         if (input[at] < 32) found = true
+        at = at + 1
+    }
+    found
+}
+
+/** Whether the header value in `input[begin, end)` has a control byte other than a tab, or DEL (RFC 9110 5.5). */
+fun httpValueHasControl(input: string, begin: int, end: int): bool {
+    var at = begin
+    var found = false
+    while (!found && at < end) {
+        val byte = input[at]
+        if ((byte < 32 && byte != 9) || byte == 127) found = true
         at = at + 1
     }
     found
@@ -945,7 +966,8 @@ private fun httpParseRequestChecked(input: string, peer: SocketPeerAddress?): Ht
             }
             if (colon <= cursor || textFindByte(input, 10, cursor, end) >= 0 ||
                 textFindByte(input, 13, cursor, end) >= 0 ||
-                httpNameHasNonToken(input, cursor, colon)) headers.append(httpMalformedLineHeader())
+                httpNameHasNonToken(input, cursor, colon) ||
+                httpValueHasControl(input, colon + 1, end)) headers.append(httpMalformedLineHeader())
             cursor = end + 2
             if (cursor >= input.size) more = false
             cursor = cursor
