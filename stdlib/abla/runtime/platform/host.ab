@@ -2340,6 +2340,12 @@ trusted fun __ablaRuntimePlatformMemoryHeapStat(which: int): int =
     else if (which == 5) __ablaRuntimeHostCollectionLazyCount
     else if (which == 6) __ablaRuntimeHostCollectionDirectoryCount
     else if (which == 7 || which == 8) __ablaRuntimeHostStwStat(which)
+    else if (which == 9) ablaRuntimeLoadI64(__ablaRuntimeHostCollectStats())
+    else if (which == 10) ablaRuntimeLoadI64(__ablaRuntimeHostCollectStats() + 8)
+    else if (which == 11) ablaRuntimeLoadI64(__ablaRuntimeHostFrozenState() + 16)
+    else if (which == 12) ablaRuntimeLoadI64(__ablaRuntimeHostFrozenState() + 32)
+    else if (which == 13) ablaRuntimeLoadI64(__ablaRuntimeHostFrozenState() + 40)
+    else if (which == 14) ablaRuntimeLoadI64(__ablaRuntimeHostFrozenState() + 56)
     else 0
 
 // The heap census (abla/memory's memoryCensus): what the last
@@ -2958,6 +2964,11 @@ trusted fun __ablaRuntimeHostMarkPointer(candidate: int): bool {
     if (candidate == 0 || __ablaRuntimeHostCollectionCount == 0) {
         return false
     }
+    // A frozen group is not traced: reaching it marks the group.
+    if (__ablaRuntimeHostFrozenBase != 0 && __ablaRuntimeHostFrozenIn(candidate)) {
+        __ablaRuntimeHostFrozenMark(candidate)
+        return false
+    }
     if (u64(candidate) < u64(__ablaRuntimeHostCollectionMinimum) ||
         u64(candidate) >= u64(__ablaRuntimeHostCollectionMaximum)) return false
     val header = if (__ablaRuntimeHostCollectionMode ==
@@ -3294,6 +3305,7 @@ trusted fun __ablaRuntimePlatformMemoryCollect(): int {
     val stopped = __ablaRuntimeHostStwStop()
     if (stopped == 0) return 0
     val mutex = __ablaRuntimeHostHeapLock()
+    val collectStarted = __ablaRuntimeHostClockNanoseconds()
     val before = __ablaRuntimeHostLiveBytes
     // The registry's slots bound the allocations (freed ones leave holes).
     val allocationCount = __ablaRuntimeHostRegistrySlots
@@ -3330,6 +3342,7 @@ trusted fun __ablaRuntimePlatformMemoryCollect(): int {
     if (__ablaRuntimeHostCollectionMode != 1) __ablaRuntimeHostCollectionPagesBuild()
     __ablaRuntimeHostMarkRootValues()
     __ablaRuntimeHostTraceMarkedAllocations()
+    __ablaRuntimeHostFrozenReclaim()
     if (__ablaRuntimeHostCollectionMode == 1) {
         __ablaRuntimeHostCollectionLazyCount = __ablaRuntimeHostCollectionLazyCount + 1
     } else __ablaRuntimeHostCollectionDirectoryCount = __ablaRuntimeHostCollectionDirectoryCount + 1
@@ -3360,6 +3373,9 @@ trusted fun __ablaRuntimePlatformMemoryCollect(): int {
     val freed = before - __ablaRuntimeHostLiveBytes
     __ablaRuntimeHostHeapUnlock(mutex)
     __ablaRuntimeHostStwDone(stopped)
+    val collectStats = __ablaRuntimeHostCollectStats()
+    ablaRuntimeStoreI64(collectStats, ablaRuntimeLoadI64(collectStats) + 1)
+    ablaRuntimeStoreI64(collectStats + 8, ablaRuntimeLoadI64(collectStats + 8) + __ablaRuntimeHostClockNanoseconds() - collectStarted)
     freed
 }
 
@@ -3398,6 +3414,7 @@ trusted fun __ablaRuntimeHostBackgroundMemoryCollect(): int {
     __ablaRuntimeHostCollectionPagesBuild()
     __ablaRuntimeHostMarkRootValues()
     __ablaRuntimeHostTraceMarkedAllocations()
+    __ablaRuntimeHostFrozenReclaim()
     __ablaRuntimeHostSmallListsSettle()
     if (background) {
         __ablaRuntimeHostBackgroundSweep()
@@ -3818,3 +3835,617 @@ trusted noescape extern:"c" fun abla_darwin_linux_syscall(
     argument5: int
 ): int
 
+
+// ---- Frozen groups (docs/design/frozen-heap.md): graphs copied into read-only memory that the collector does not trace
+// or sweep. A group is made by __ablaRuntimePlatformMemoryFreeze: the value's whole reachable graph is copied into pages of
+// a reserved window, then made read-only; the copy points only at frozen blocks or at memory outside the heap, so no
+// young block can be missed, and a store into it faults. Marking a pointer into the window marks the pointer's group; a
+// group holds the groups it points at (its edges); a group no collection reached is returned to the window whole.
+// Linux only: where the window cannot be reserved, a freeze returns its value unchanged.
+
+// The window: [base, end), 0 until the first freeze.
+var __ablaRuntimeHostFrozenBase: int = 0
+var __ablaRuntimeHostFrozenEnd: int = 0
+
+// +0 the next free address of the window, +8 groups made (the table below is indexed by it), +16 bytes accounted,
+// +24 freezes refused, +32 the last refusal's reason.
+private trusted fun __ablaRuntimeHostFrozenState(): int = nativeStaticAllocate(64)
+
+// 1024 group records of 48 bytes: +0 start, +8 mapped length (0: reclaimed), +16 reached by the mark (0/1), +24 the groups it
+// points at (a malloc'd array of indexes), +32 their count, +40 the live bytes it accounts for.
+private trusted fun __ablaRuntimeHostFrozenGroups(): int = nativeStaticAllocate(49152)
+
+// The freeze's working state (one freeze at a time, under the stop and the heap lock): +0 the blocks (old headers), +8 their
+// count, +16 their capacity, +24 the forwarding table (16-byte entries: old header, index + 1), +32 its capacity, +40 the bytes
+// of the group so far, +48 offsets of the blocks, +56 flags (1: data only), +64 the groups pointed at, +72 their count,
+// +80 failure reason (0 none), +88 the group's base address (0 while discovering).
+private trusted fun __ablaRuntimeHostFreezeContext(): int = nativeStaticAllocate(96)
+
+@inline
+trusted fun __ablaRuntimeHostFrozenIn(address: int): bool =
+    __ablaRuntimeHostFrozenBase != 0 &&
+    u64(address - __ablaRuntimeHostFrozenBase) < u64(__ablaRuntimeHostFrozenEnd - __ablaRuntimeHostFrozenBase)
+
+// The window is cut into 64 KiB chunks; a group owns a run of them. 16384 chunks (1 GiB) at most, each owner entry 4 bytes:
+// 0 free, else the group's record + 1.
+private trusted fun __ablaRuntimeHostFrozenOwners(): int = nativeStaticAllocate(65536)
+
+// The record of the group holding `address` (in the window), or 0.
+trusted fun __ablaRuntimeHostFrozenGroupOf(address: int): int {
+    val owner = ablaRuntimeLoadI32(__ablaRuntimeHostFrozenOwners() + ((address - __ablaRuntimeHostFrozenBase) >>> 16) * 4)
+    if (owner == 0) 0 else __ablaRuntimeHostFrozenGroups() + (owner - 1) * 48
+}
+
+// The mark reached `address`, in the window.
+@noinline
+trusted fun __ablaRuntimeHostFrozenMark(address: int): void {
+    val group = __ablaRuntimeHostFrozenGroupOf(address)
+    if (group != 0) ablaRuntimeStoreI64(group + 16, 1)
+    return
+}
+
+// After the mark: the groups the reached ones point at are reached too, and what none reached goes back to the window.
+trusted fun __ablaRuntimeHostFrozenReclaim(): void {
+    val count = ablaRuntimeLoadI64(__ablaRuntimeHostFrozenState() + 8)
+    if (count == 0) return
+    val groups = __ablaRuntimeHostFrozenGroups()
+    var changed = true
+    while (changed) {
+        changed = false
+        var index = 0
+        while (index < count) {
+            val group = groups + index * 48
+            if (ablaRuntimeLoadI64(group + 16) != 0 && ablaRuntimeLoadI64(group + 8) != 0) {
+                val edges = ablaRuntimeLoadI64(group + 24)
+                var edge = 0
+                while (edge < ablaRuntimeLoadI64(group + 32)) {
+                    val target = groups + ablaRuntimeLoadI64(edges + edge * 8) * 48
+                    if (ablaRuntimeLoadI64(target + 16) == 0) {
+                        ablaRuntimeStoreI64(target + 16, 1)
+                        changed = true
+                    }
+                    edge = edge + 1
+                }
+            }
+            index = index + 1
+        }
+    }
+    var index = 0
+    while (index < count) {
+        val group = groups + index * 48
+        val length = ablaRuntimeLoadI64(group + 8)
+        if (length != 0) {
+            if (ablaRuntimeLoadI64(group + 16) == 0) {
+                // Back to reserved, unbacked address space (a fixed anonymous no-access mapping over it).
+                ablaLinuxSyscall(9, ablaRuntimeLoadI64(group), length, 0, 16418 + 16, -1, 0)
+                var chunk = (ablaRuntimeLoadI64(group) - __ablaRuntimeHostFrozenBase) >>> 16
+                val chunkEnd = chunk + (length >>> 16)
+                while (chunk < chunkEnd) {
+                    ablaRuntimeStoreI32(__ablaRuntimeHostFrozenOwners() + chunk * 4, 0)
+                    chunk = chunk + 1
+                }
+                __ablaRuntimeHostLiveBytes = __ablaRuntimeHostLiveBytes - ablaRuntimeLoadI64(group + 40)
+                ablaRuntimeStoreI64(__ablaRuntimeHostFrozenState() + 16,
+                    ablaRuntimeLoadI64(__ablaRuntimeHostFrozenState() + 16) - ablaRuntimeLoadI64(group + 40))
+                __ablaRuntimeHostFree(ablaRuntimePointerFromAddress(ablaRuntimeLoadI64(group + 24)))
+                ablaRuntimeStoreI64(group + 24, 0)
+                ablaRuntimeStoreI64(group + 32, 0)
+                ablaRuntimeStoreI64(group + 8, 0)
+                ablaRuntimeStoreI64(group + 40, 0)
+            } else ablaRuntimeStoreI64(group + 16, 0)
+        }
+        index = index + 1
+    }
+    return
+}
+
+// The block index of old header `header` in the forwarding table, or -1.
+trusted fun __ablaRuntimeHostFreezeFind(header: int): int {
+    val context = __ablaRuntimeHostFreezeContext()
+    val table = ablaRuntimeLoadI64(context + 24)
+    val mask = ablaRuntimeLoadI64(context + 32) - 1
+    var slot = ((header >>> 4) * -7046029254386353131) & mask
+    var key = ablaRuntimeLoadI64(table + slot * 16)
+    while (key != 0) {
+        if (key == header) return ablaRuntimeLoadI64(table + slot * 16 + 8) - 1
+        slot = (slot + 1) & mask
+        key = ablaRuntimeLoadI64(table + slot * 16)
+    }
+    -1
+}
+
+trusted fun __ablaRuntimeHostFreezeTableInsert(table: int, mask: int, header: int, index: int): void {
+    var slot = ((header >>> 4) * -7046029254386353131) & mask
+    while (ablaRuntimeLoadI64(table + slot * 16) != 0) slot = (slot + 1) & mask
+    ablaRuntimeStoreI64(table + slot * 16, header)
+    ablaRuntimeStoreI64(table + slot * 16 + 8, index + 1)
+    return
+}
+
+// Adds the block at `header` to the group: its place, its flag.
+trusted fun __ablaRuntimeHostFreezeAdd(header: int, mode: int): void {
+    val context = __ablaRuntimeHostFreezeContext()
+    var count = ablaRuntimeLoadI64(context + 8)
+    var capacity = ablaRuntimeLoadI64(context + 16)
+    if (count == capacity) {
+        capacity = capacity * 2
+        ablaRuntimeStoreI64(context, ablaRuntimePointerAddress(__ablaRuntimeHostRealloc(
+            ablaRuntimePointerFromAddress(ablaRuntimeLoadI64(context)), capacity * 8)))
+        ablaRuntimeStoreI64(context + 48, ablaRuntimePointerAddress(__ablaRuntimeHostRealloc(
+            ablaRuntimePointerFromAddress(ablaRuntimeLoadI64(context + 48)), capacity * 8)))
+        ablaRuntimeStoreI64(context + 56, ablaRuntimePointerAddress(__ablaRuntimeHostRealloc(
+            ablaRuntimePointerFromAddress(ablaRuntimeLoadI64(context + 56)), capacity * 8)))
+        ablaRuntimeStoreI64(context + 16, capacity)
+        if (ablaRuntimeLoadI64(context) == 0 || ablaRuntimeLoadI64(context + 48) == 0 ||
+            ablaRuntimeLoadI64(context + 56) == 0) __ablaRuntimeHostOutOfMemory()
+    }
+    if ((count + 1) * 2 > ablaRuntimeLoadI64(context + 32)) {
+        val newCapacity = ablaRuntimeLoadI64(context + 32) * 2
+        val table = ablaRuntimePointerAddress(__ablaRuntimeHostCalloc(newCapacity * 2, 8))
+        if (table == 0) __ablaRuntimeHostOutOfMemory()
+        var index = 0
+        while (index < count) {
+            __ablaRuntimeHostFreezeTableInsert(table, newCapacity - 1,
+                ablaRuntimeLoadI64(ablaRuntimeLoadI64(context) + index * 8), index)
+            index = index + 1
+        }
+        __ablaRuntimeHostFree(ablaRuntimePointerFromAddress(ablaRuntimeLoadI64(context + 24)))
+        ablaRuntimeStoreI64(context + 24, table)
+        ablaRuntimeStoreI64(context + 32, newCapacity)
+    }
+    ablaRuntimeStoreI64(ablaRuntimeLoadI64(context) + count * 8, header)
+    ablaRuntimeStoreI64(ablaRuntimeLoadI64(context + 48) + count * 8, ablaRuntimeLoadI64(context + 40))
+    ablaRuntimeStoreI64(ablaRuntimeLoadI64(context + 56) + count * 8, mode)
+    __ablaRuntimeHostFreezeTableInsert(ablaRuntimeLoadI64(context + 24), ablaRuntimeLoadI64(context + 32) - 1,
+        header, count)
+    ablaRuntimeStoreI64(context + 40,
+        ablaRuntimeLoadI64(context + 40) + 32 + (((if ((mode & 15) == 2) ablaRuntimeLoadI64(header + 32) + 1 else ablaRuntimeLoadI64(header + 16)) + 15) & -16))
+    ablaRuntimeStoreI64(context + 8, count + 1)
+    return
+}
+
+// The heap block holding `candidate` (its header), or 0 when it names no block of the heap.
+trusted fun __ablaRuntimeHostFreezeLocate(candidate: int): int {
+    if (candidate == 0 || u64(candidate) < u64(__ablaRuntimeHostCollectionMinimum) ||
+        u64(candidate) >= u64(__ablaRuntimeHostCollectionMaximum)) return 0
+    val header = __ablaRuntimeHostCollectionLocate(candidate)
+    if (header == 0) return 0
+    val payload = header + 32
+    val size = ablaRuntimeLoadI64(header + 16)
+    val layout = ablaRuntimeLoadI64(header + 24)
+    if (u64(candidate) < u64(payload) || u64(candidate - payload) >= u64(size) ||
+        layout < 0 || layout >= 16) return 0
+    header
+}
+
+// Discovery: the pointer `candidate` found in a block being copied.
+trusted fun __ablaRuntimeHostFreezeNote(candidate: int, mode: int): void {
+    if (candidate == 0) return
+    val context = __ablaRuntimeHostFreezeContext()
+    if (__ablaRuntimeHostFrozenIn(candidate)) {
+        val group = __ablaRuntimeHostFrozenGroupOf(candidate)
+        if (group != 0) {
+            val index = (group - __ablaRuntimeHostFrozenGroups()) / 48
+            val edges = ablaRuntimeLoadI64(context + 64)
+            val count = ablaRuntimeLoadI64(context + 72)
+            var at = 0
+            while (at < count && ablaRuntimeLoadI64(edges + at * 8) != index) at = at + 1
+            if (at == count && count < 1024) {
+                ablaRuntimeStoreI64(edges + count * 8, index)
+                ablaRuntimeStoreI64(context + 72, count + 1)
+            }
+        }
+        return
+    }
+    val header = __ablaRuntimeHostFreezeLocate(candidate)
+    if (header == 0) return
+    val found = __ablaRuntimeHostFreezeFind(header)
+    if (found >= 0) {
+        val kept = ablaRuntimeLoadI64(ablaRuntimeLoadI64(context + 56) + found * 8)
+        if ((mode & 15) == 0 && (kept & 15) == 1) ablaRuntimeStoreI64(ablaRuntimeLoadI64(context + 56) + found * 8, kept & -16)
+        return
+    }
+    val layout = ablaRuntimeLoadI64(header + 24)
+    // Layouts 0 to 5 are copied; a raw block is checked when it is scanned.
+    if (layout > 5 && !((mode & 15) == 2 && layout == 6) || (mode & 15) == 2 && layout != 6) {
+        if (ablaRuntimeLoadI64(context + 80) == 0) ablaRuntimeStoreI64(context + 80, 100 + layout)
+        return
+    }
+    __ablaRuntimeHostFreezeAdd(header, mode)
+    return
+}
+
+// The copy's address for `candidate` (a pointer into a block of the group, or elsewhere: unchanged).
+trusted fun __ablaRuntimeHostFreezeRelocate(candidate: int): int {
+    if (candidate == 0 || __ablaRuntimeHostFrozenIn(candidate)) return candidate
+    val header = __ablaRuntimeHostFreezeLocate(candidate)
+    if (header == 0) return candidate
+    val context = __ablaRuntimeHostFreezeContext()
+    val index = __ablaRuntimeHostFreezeFind(header)
+    if (index < 0) return candidate
+    ablaRuntimeLoadI64(context + 88) + ablaRuntimeLoadI64(ablaRuntimeLoadI64(context + 48) + index * 8) + 32 +
+        (candidate - (header + 32))
+}
+
+// One pointer slot of a block: `offset` from its payload. Discovery notes the pointer; the copy pass (`copy` is the
+// copy's payload) rewrites the copy's word.
+@inline
+trusted fun __ablaRuntimeHostFreezeSlot(payload: int, copy: int, offset: int, mode: int): void {
+    if (copy == 0) {
+        __ablaRuntimeHostFreezeNote(ablaRuntimeLoadI64(payload + offset), mode)
+    }
+    else ablaRuntimeStoreI64(copy + offset, __ablaRuntimeHostFreezeRelocate(ablaRuntimeLoadI64(payload + offset)))
+    return
+}
+
+// A value at `offset` (24 bytes: tag, auxiliary, two words): the words that hold pointers, by the marker's rules.
+trusted fun __ablaRuntimeHostFreezeValueSlots(payload: int, copy: int, offset: int): void {
+    val tag = ablaRuntimeLoadI32(payload + offset)
+    if (copy == 0 && ablaRuntimeLoadI64(__ablaRuntimeHostFreezeContext() + 80) == 0) {
+        val h0 = __ablaRuntimeHostFreezeLocate(ablaRuntimeLoadI64(payload + offset + 8))
+        val h1 = __ablaRuntimeHostFreezeLocate(ablaRuntimeLoadI64(payload + offset + 16))
+        ablaRuntimeStoreI64(__ablaRuntimeHostFrozenState() + 56, tag * 1000000 + (if (h0 != 0 && ablaRuntimeLoadI64(h0 + 24) == 6) 1000 + (ablaRuntimeLoadI64(payload + offset + 8) - h0 - 32) else 0) + (if (h1 != 0 && ablaRuntimeLoadI64(h1 + 24) == 6) 100000 else 0))
+    }
+    if (tag == 4) {
+        if (ablaRuntimeLoadI64(payload + offset + 8) == 0 && __ablaRuntimeHostFreezeIsRope(ablaRuntimeLoadI64(payload + offset + 16))) {
+            // A rope (a concatenation tree): the group holds its flat bytes, a string of its own.
+            val rope = ablaRuntimeLoadI64(payload + offset + 16)
+            if (copy == 0) __ablaRuntimeHostFreezeNote(rope, 2)
+            else {
+                ablaRuntimeStoreI64(copy + offset + 8, __ablaRuntimeHostFreezeRelocate(rope))
+                ablaRuntimeStoreI64(copy + offset + 16, ablaRuntimeLoadI64(rope))
+            }
+        } else {
+            __ablaRuntimeHostFreezeSlot(payload, copy, offset + 8, 0)
+            __ablaRuntimeHostFreezeSlot(payload, copy, offset + 16, 0)
+        }
+    }
+    if (tag == 5) __ablaRuntimeHostFreezeSlot(payload, copy, offset + 16, 0)
+    if (tag >= 6 && tag <= 14) __ablaRuntimeHostFreezeSlot(payload, copy, offset + 8, 0)
+    return
+}
+
+// The pointer slots of the block at `header`, by its layout as the marker walks it. `copy`: 0 to discover, else the copy's payload.
+trusted fun __ablaRuntimeHostFreezeScan(header: int, copy: int, mode: int): void {
+    val payload = header + 32
+    val size = ablaRuntimeLoadI64(header + 16)
+    val layout = ablaRuntimeLoadI64(header + 24)
+    val context = __ablaRuntimeHostFreezeContext()
+    if (layout == 0 && (mode & 15) == 0 && copy == 0) {
+        // A raw block is conservative to the marker: one that holds a word naming a heap block cannot be copied.
+        var offset = 0
+        while (offset + 8 <= size) {
+            if (__ablaRuntimeHostFreezeLocate(ablaRuntimeLoadI64(payload + offset)) != 0) {
+                ablaRuntimeStoreI64(context + 80, 100)
+                return
+            }
+            offset = offset + 8
+        }
+    }
+    if (layout == 2) {
+        // A backing store the array header counts (its live prefix): the slack past it may hold stale values.
+        val limit = (mode >> 4) - 1
+        var bound = size
+        if (limit >= 0 && limit * 24 < size) bound = limit * 24
+        var offset = 0
+        while (offset + 24 <= bound) {
+            __ablaRuntimeHostFreezeValueSlots(payload, copy, offset)
+            offset = offset + 24
+        }
+        if (copy != 0) {
+            while (offset < size) {
+                ablaRuntimeStoreI64(copy + offset, 0)
+                offset = offset + 8
+            }
+        }
+    }
+    if (layout == 3) {
+        var offset = 0
+        while (offset + 32 <= size) {
+            __ablaRuntimeHostFreezeValueSlots(payload, copy, offset + 8)
+            offset = offset + 32
+        }
+    }
+    if (layout == 4 && size >= 24) {
+        val count = ablaRuntimeLoadI64(payload)
+        val values = ablaRuntimeLoadI64(payload + 16)
+        val dense = (ablaRuntimeLoadI64(payload + 8) >> 56) != 0
+        __ablaRuntimeHostFreezeSlot(payload, copy, 16,
+            if (values == payload + 24) 0 else if (dense) 1 else (count + 1) * 16)
+        if (values == payload + 24 && !dense) {
+            var index = 0
+            while (index < count) {
+                __ablaRuntimeHostFreezeValueSlots(payload, copy, 24 + index * 24)
+                index = index + 1
+            }
+        }
+    }
+    if (layout == 5 && size >= 16) {
+        val descriptor = ablaRuntimeLoadI64(payload) - 4611686018427387904
+        val traced = ablaRuntimeLoadI32(descriptor + 12)
+        val entries = descriptor + 16 + ablaRuntimeLoadI32(descriptor + 4) * 16
+        var index = 0
+        while (index < traced) {
+            val field = ablaRuntimeLoadI32(entries + index * 8)
+            val kind = ablaRuntimeLoadI32(entries + index * 8 + 4)
+            if (kind == 0) __ablaRuntimeHostFreezeValueSlots(payload, copy, field)
+            if (kind == 3 && ablaRuntimeLoadI64(payload + field) == 0 && __ablaRuntimeHostFreezeIsRope(ablaRuntimeLoadI64(payload + field + 8))) {
+                // A string field holding a rope: the group holds its flat bytes.
+                val rope = ablaRuntimeLoadI64(payload + field + 8)
+                if (copy == 0) __ablaRuntimeHostFreezeNote(rope, 2)
+                else {
+                    ablaRuntimeStoreI64(copy + field, __ablaRuntimeHostFreezeRelocate(rope))
+                    ablaRuntimeStoreI64(copy + field + 8, ablaRuntimeLoadI64(rope))
+                }
+            } else {
+                if (kind != 0) __ablaRuntimeHostFreezeSlot(payload, copy, field, 0)
+                if (kind == 3) __ablaRuntimeHostFreezeSlot(payload, copy, field + 8, 0)
+            }
+            index = index + 1
+        }
+        __ablaRuntimeHostFreezeSlot(payload, copy, 8, 0)
+    }
+    return
+}
+
+// Frees what a freeze built (its tables and the directory the collector's locator reads).
+trusted fun __ablaRuntimeHostFreezeCleanup(): void {
+    val context = __ablaRuntimeHostFreezeContext()
+    __ablaRuntimeHostFree(ablaRuntimePointerFromAddress(ablaRuntimeLoadI64(context)))
+    __ablaRuntimeHostFree(ablaRuntimePointerFromAddress(ablaRuntimeLoadI64(context + 24)))
+    __ablaRuntimeHostFree(ablaRuntimePointerFromAddress(ablaRuntimeLoadI64(context + 48)))
+    __ablaRuntimeHostFree(ablaRuntimePointerFromAddress(ablaRuntimeLoadI64(context + 56)))
+    __ablaRuntimeHostFree(ablaRuntimePointerFromAddress(ablaRuntimeLoadI64(context + 64)))
+    __ablaRuntimeHostFree(ablaRuntimePointerFromAddress(__ablaRuntimeHostCollectionRanges))
+    __ablaRuntimeHostFree(ablaRuntimePointerFromAddress(__ablaRuntimeHostCollectionPages))
+    __ablaRuntimeHostFree(ablaRuntimePointerFromAddress(__ablaRuntimeHostCollectionBitmaps))
+    __ablaRuntimeHostCollectionPages = 0
+    __ablaRuntimeHostCollectionPageMask = 0
+    __ablaRuntimeHostCollectionBitmaps = 0
+    __ablaRuntimeHostCollectionLargeCount = 0
+    __ablaRuntimeHostCollectionRanges = 0
+    __ablaRuntimeHostCollectionMinimum = 0
+    __ablaRuntimeHostCollectionMaximum = 0
+    return
+}
+
+// The value, frozen: a copy of everything it reaches in a read-only group, or the value itself when it cannot be (no window
+// on this system, a threads stop that did not happen, inside a region). A block the copy cannot take (a raw block holding a
+// heap pointer, a task, a thread, a weak reference, a cell) panics, naming its layout.
+trusted fun __ablaRuntimePlatformMemoryFreeze(value: any): any {
+    val address = ablaRuntimeValueAddress(value)
+    val tag = ablaRuntimeLoadI32(address)
+    if (tag < 4 || tag == 5 && ablaRuntimeLoadI64(address + 16) == 0) {
+        ablaRuntimeStoreI64(__ablaRuntimeHostFrozenState() + 32, 100 + tag)
+        return value
+    }
+    __ablaRuntimeHostStwHoldPoint()
+    if (__ablaRuntimeHostRegionLoad() != 0 || __ablaRuntimeHostForkNoCollect) {
+        ablaRuntimeStoreI64(__ablaRuntimeHostFrozenState() + 32, 2)
+        return value
+    }
+    val state = __ablaRuntimeHostFrozenState()
+    if (__ablaRuntimeHostFrozenBase == 0) {
+        // The largest window the address-space limit allows, 1 GiB down to 64 MiB (the launcher caps the compiler's).
+        var span = 1073741824
+        var window = -1
+        while (window < 0 && span >= 67108864) {
+            window = ablaLinuxSyscall(9, 0, span, 0, 16418, -1, 0)
+            if (window < 0) span = span >> 1
+        }
+        if (window < 0) {
+            ablaRuntimeStoreI64(state + 32, 3)
+            return value
+        }
+        __ablaRuntimeHostFrozenBase = window
+        __ablaRuntimeHostFrozenEnd = window + span
+        ablaRuntimeStoreI64(state, window)
+    }
+    val stopped = __ablaRuntimeHostStwStop()
+    if (stopped == 0) {
+        ablaRuntimeStoreI64(state + 32, 4)
+        return value
+    }
+    val mutex = __ablaRuntimeHostHeapLock()
+    val context = __ablaRuntimeHostFreezeContext()
+    var index = 0
+    while (index < 12) {
+        ablaRuntimeStoreI64(context + index * 8, 0)
+        index = index + 1
+    }
+    ablaRuntimeStoreI64(context, ablaRuntimePointerAddress(__ablaRuntimeHostMalloc(1024 * 8)))
+    ablaRuntimeStoreI64(context + 16, 1024)
+    ablaRuntimeStoreI64(context + 24, ablaRuntimePointerAddress(__ablaRuntimeHostCalloc(4096 * 2, 8)))
+    ablaRuntimeStoreI64(context + 32, 4096)
+    ablaRuntimeStoreI64(context + 48, ablaRuntimePointerAddress(__ablaRuntimeHostMalloc(1024 * 8)))
+    ablaRuntimeStoreI64(context + 56, ablaRuntimePointerAddress(__ablaRuntimeHostMalloc(1024 * 8)))
+    ablaRuntimeStoreI64(context + 64, ablaRuntimePointerAddress(__ablaRuntimeHostMalloc(1024 * 8)))
+    if (ablaRuntimeLoadI64(context) == 0 || ablaRuntimeLoadI64(context + 24) == 0 || ablaRuntimeLoadI64(context + 48) == 0 ||
+        ablaRuntimeLoadI64(context + 56) == 0 || ablaRuntimeLoadI64(context + 64) == 0) __ablaRuntimeHostOutOfMemory()
+    __ablaRuntimeHostCollectionMode = 0
+    __ablaRuntimeHostCollectionPagesBuild()
+    var result = value
+    // The value's own pointer words are the first roots.
+    val vtag = tag
+    if (vtag == 4) {
+        if (ablaRuntimeLoadI64(address + 8) == 0 && __ablaRuntimeHostFreezeIsRope(ablaRuntimeLoadI64(address + 16))) ablaRuntimeStoreI64(context + 80, 200)
+        __ablaRuntimeHostFreezeNote(ablaRuntimeLoadI64(address + 8), 0)
+        __ablaRuntimeHostFreezeNote(ablaRuntimeLoadI64(address + 16), 0)
+    }
+    if (vtag == 5) __ablaRuntimeHostFreezeNote(ablaRuntimeLoadI64(address + 16), 0)
+    if (vtag >= 6 && vtag <= 14) __ablaRuntimeHostFreezeNote(ablaRuntimeLoadI64(address + 8), 0)
+    var next = 0
+    while (next < ablaRuntimeLoadI64(context + 8) && ablaRuntimeLoadI64(context + 80) == 0) {
+        val header = ablaRuntimeLoadI64(ablaRuntimeLoadI64(context) + next * 8)
+        val flag = ablaRuntimeLoadI64(ablaRuntimeLoadI64(context + 56) + next * 8)
+        ablaRuntimeStoreI64(__ablaRuntimeHostFrozenState() + 40, ablaRuntimeLoadI64(header + 24) * 1000000 + ablaRuntimeLoadI64(header + 16))
+        if ((flag & 15) != 2) __ablaRuntimeHostFreezeScan(header, 0, flag)
+        next = next + 1
+    }
+    val total = ablaRuntimeLoadI64(context + 40)
+    val count = ablaRuntimeLoadI64(context + 8)
+    val reason = ablaRuntimeLoadI64(context + 80)
+    val groupCount = ablaRuntimeLoadI64(state + 8)
+    val chunks = (total + 65535) >>> 16
+    val pages = chunks << 16
+    var base = 0
+    var record = -1
+    var firstChunk = -1
+    if (reason == 0 && count > 0) {
+        // A run of free chunks, first fit; a record whose group was reclaimed, else a new one.
+        val capacity = (__ablaRuntimeHostFrozenEnd - __ablaRuntimeHostFrozenBase) >>> 16
+        val owners = __ablaRuntimeHostFrozenOwners()
+        var chunk = 0
+        var run = 0
+        while (chunk < capacity && run < chunks) {
+            if (ablaRuntimeLoadI32(owners + chunk * 4) == 0) {
+                if (run == 0) firstChunk = chunk
+                run = run + 1
+            } else run = 0
+            chunk = chunk + 1
+        }
+        if (run < chunks) firstChunk = -1
+        var candidate = 0
+        while (candidate < groupCount && ablaRuntimeLoadI64(__ablaRuntimeHostFrozenGroups() + candidate * 48 + 8) != 0) {
+            candidate = candidate + 1
+        }
+        if (candidate < 1024) record = candidate
+        if (firstChunk < 0 || record < 0) {
+            ablaRuntimeStoreI64(state + 24, ablaRuntimeLoadI64(state + 24) + 1)
+            ablaRuntimeStoreI64(context + 80, 1)
+        } else {
+            base = __ablaRuntimeHostFrozenBase + (firstChunk << 16)
+            chunk = firstChunk
+            while (chunk < firstChunk + chunks) {
+                ablaRuntimeStoreI32(owners + chunk * 4, record + 1)
+                chunk = chunk + 1
+            }
+        }
+    }
+    if (ablaRuntimeLoadI64(context + 80) == 0 && count > 0) {
+        ablaLinuxSyscall(10, base, pages, 3, 0, 0, 0)
+        ablaRuntimeStoreI64(context + 88, base)
+        var block = 0
+        while (block < count) {
+            val old = ablaRuntimeLoadI64(ablaRuntimeLoadI64(context) + block * 8)
+            val place = base + ablaRuntimeLoadI64(ablaRuntimeLoadI64(context + 48) + block * 8)
+            if ((ablaRuntimeLoadI64(ablaRuntimeLoadI64(context + 56) + block * 8) & 15) == 2) {
+                // A rope: its flat bytes (a string's, with the terminator the fresh page already has).
+                val length = ablaRuntimeLoadI64(old + 32)
+                __ablaRuntimeHostFreezeFlatten(old + 32, place + 32)
+                ablaRuntimeStoreI64(place + 16, length + 1)
+                ablaRuntimeStoreI64(place + 24, 1)
+            } else {
+                val size = ablaRuntimeLoadI64(old + 16)
+                ablaUnsafeCopyMemory(place, old, 32 + size)
+            }
+            ablaRuntimeStoreI64(place, -1)
+            ablaRuntimeStoreI64(place + 8, 0)
+            block = block + 1
+        }
+        block = 0
+        while (block < count) {
+            val old = ablaRuntimeLoadI64(ablaRuntimeLoadI64(context) + block * 8)
+            val place = base + ablaRuntimeLoadI64(ablaRuntimeLoadI64(context + 48) + block * 8)
+            val flag = ablaRuntimeLoadI64(ablaRuntimeLoadI64(context + 56) + block * 8)
+            if ((flag & 15) != 2) __ablaRuntimeHostFreezeScan(old, place + 32, flag)
+            block = block + 1
+        }
+        ablaLinuxSyscall(10, base, pages, 1, 0, 0, 0)
+        // The group's record.
+        val group = __ablaRuntimeHostFrozenGroups() + record * 48
+        val edgeCount = ablaRuntimeLoadI64(context + 72)
+        val edges = ablaRuntimePointerAddress(__ablaRuntimeHostMalloc(edgeCount * 8 + 8))
+        if (edges == 0) __ablaRuntimeHostOutOfMemory()
+        ablaUnsafeCopyMemory(edges, ablaRuntimeLoadI64(context + 64), edgeCount * 8)
+        ablaRuntimeStoreI64(group, base)
+        ablaRuntimeStoreI64(group + 8, pages)
+        ablaRuntimeStoreI64(group + 16, 0)
+        ablaRuntimeStoreI64(group + 24, edges)
+        ablaRuntimeStoreI64(group + 32, edgeCount)
+        ablaRuntimeStoreI64(group + 40, total)
+        if (record + 1 > groupCount) ablaRuntimeStoreI64(state + 8, record + 1)
+        ablaRuntimeStoreI64(state + 16, ablaRuntimeLoadI64(state + 16) + total)
+        __ablaRuntimeHostLiveBytes = __ablaRuntimeHostLiveBytes + total
+        // The value, with its pointer words moved.
+        val aux = ablaRuntimeLoadI32(address + 4)
+        var word0 = ablaRuntimeLoadI64(address + 8)
+        var word1 = ablaRuntimeLoadI64(address + 16)
+        if (vtag == 4) {
+            word0 = __ablaRuntimeHostFreezeRelocate(word0)
+            word1 = __ablaRuntimeHostFreezeRelocate(word1)
+        }
+        if (vtag == 5) word1 = __ablaRuntimeHostFreezeRelocate(word1)
+        if (vtag >= 6 && vtag <= 14) word0 = __ablaRuntimeHostFreezeRelocate(word0)
+        result = ablaRuntimeMakeValue(vtag, aux, word0, word1)
+    }
+    val failure = ablaRuntimeLoadI64(context + 80)
+    __ablaRuntimeHostFreezeCleanup()
+    __ablaRuntimeHostHeapUnlock(mutex)
+    __ablaRuntimeHostStwDone(stopped)
+    // Refused, not fatal: the value stays as it is, and the reason is kept (memoryHeapStat 12).
+    if (failure != 0) ablaRuntimeStoreI64(state + 32, failure)
+    result
+}
+
+// Collection statistics for diagnostics (memoryHeapStat 9 and 10): collections that ran and the nanoseconds they took
+// (clock_gettime by system call), and 11: the bytes frozen groups account for.
+private trusted fun __ablaRuntimeHostCollectStats(): int = nativeStaticAllocate(64)
+
+trusted fun __ablaRuntimeHostClockNanoseconds(): int {
+    val scratch = __ablaRuntimeHostCollectStats() + 16
+    ablaLinuxSyscall(228, 1, scratch, 0, 0, 0, 0)
+    ablaRuntimeLoadI64(scratch) * 1000000000 + ablaRuntimeLoadI64(scratch + 8)
+}
+
+// The flat bytes of the rope whose payload is at `rope`, written at `destination` (length + 1 bytes' room, the
+// terminator already zero): its leaves in order, from the flat copy of any node that has one. An explicit stack, from the
+// system allocator (not the tracked heap: a freeze runs under the heap lock), and no store into the rope.
+trusted fun __ablaRuntimeHostFreezeFlatten(rope: int, destination: int): void {
+    var capacity = 256
+    var stack = ablaRuntimePointerAddress(__ablaRuntimeHostMalloc(capacity * 16))
+    if (stack == 0) __ablaRuntimeHostOutOfMemory()
+    var depth = 0
+    var written = 0
+    ablaRuntimeStoreI64(stack, 0)
+    ablaRuntimeStoreI64(stack + 8, rope)
+    depth = 1
+    while (depth > 0) {
+        depth = depth - 1
+        val first = ablaRuntimeLoadI64(stack + depth * 16)
+        val second = ablaRuntimeLoadI64(stack + depth * 16 + 8)
+        if (first != 0) {
+            // A flat leaf: data pointer, length.
+            ablaUnsafeCopyMemory(destination + written, first, second)
+            written = written + second
+        } else if (second != 0) {
+            val flat = ablaRuntimeLoadI64(second + 40)
+            if (flat != 0) {
+                val length = ablaRuntimeLoadI64(second)
+                ablaUnsafeCopyMemory(destination + written, flat, length)
+                written = written + length
+            } else {
+                if (depth + 2 > capacity) {
+                    capacity = capacity * 2
+                    stack = ablaRuntimePointerAddress(__ablaRuntimeHostRealloc(ablaRuntimePointerFromAddress(stack), capacity * 16))
+                    if (stack == 0) __ablaRuntimeHostOutOfMemory()
+                }
+                // The right child first, so the left one is read first.
+                ablaRuntimeStoreI64(stack + depth * 16, ablaRuntimeLoadI64(second + 24))
+                ablaRuntimeStoreI64(stack + depth * 16 + 8, ablaRuntimeLoadI64(second + 32))
+                ablaRuntimeStoreI64(stack + depth * 16 + 16, ablaRuntimeLoadI64(second + 8))
+                ablaRuntimeStoreI64(stack + depth * 16 + 24, ablaRuntimeLoadI64(second + 16))
+                depth = depth + 2
+            }
+        }
+    }
+    __ablaRuntimeHostFree(ablaRuntimePointerFromAddress(stack))
+    return
+}
+
+// Whether `candidate` is a rope node (a layout 6 block's payload, the start of one).
+trusted fun __ablaRuntimeHostFreezeIsRope(candidate: int): bool {
+    if (candidate == 0 || __ablaRuntimeHostFrozenIn(candidate)) return false
+    val header = __ablaRuntimeHostFreezeLocate(candidate)
+    header != 0 && ablaRuntimeLoadI64(header + 24) == 6 && candidate == header + 32
+}

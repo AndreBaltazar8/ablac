@@ -13,6 +13,9 @@ import "staged_parser.ab"
 import "abla/json"
 import "abla/sys/linux/fs"
 import "abla/bytes"
+import "abla/runtime/memory"
+import "abla/sys/linux/process"
+import "abla/sys/linux"
 
 // Compiler frontend globals are serial already. One process-local graph state
 // avoids handing an immutable field view to the mutable module-state API.
@@ -428,6 +431,21 @@ fun bootstrapAnalysisGraphReuse(cached: BootstrapAnalysisGraphParsed): Bootstrap
     cached
 }
 
+/** A module's cache entry is built whole and only read afterwards (every field is a `val` and nothing appends to its arrays), so
+ *  it is copied into read-only memory the collector neither marks nor sweeps (docs/design/frozen-heap.md): an edit analysis
+ *  would otherwise re-mark the unchanged modules at each of its collections. ABLA_ANALYSIS_FREEZE=0 turns it off (to measure). */
+fun bootstrapAnalysisGraphFrozen(entry: BootstrapAnalysisGraphParsed): BootstrapAnalysisGraphParsed {
+    val configured = linuxEnvironment("ABLA_ANALYSIS_FREEZE")
+    if (configured.found && configured.value == "0") return entry
+    val before = runtimeMemoryHeapStat(11)
+    val frozen = Frozen(entry).get()
+    val traced = linuxEnvironment("ABLA_COMPILER_MEMORY_TRACE")
+    if (traced.found && traced.value != "") {
+        linuxWriteStandardError("abla-analysis-freeze ${before} -> ${runtimeMemoryHeapStat(11)} reason ${runtimeMemoryHeapStat(12)} parent ${runtimeMemoryHeapStat(13)} slot ${runtimeMemoryHeapStat(14)}\n")
+    }
+    frozen
+}
+
 fun bootstrapAnalysisGraphParse(source: string, uri: string, full: bool,
     path: string, stableIds: bool): BootstrapAnalysisGraphParsed {
     val raw = bootstrapParseWithIdentity(source, path)
@@ -595,7 +613,8 @@ fun BootstrapAnalysisService.graphSnapshot(): Json {
             // The parser's only effect outside its result is recording the module's source rewrites: the cached ones are put back.
             val entryParsed = if (cached != null && cached.source == source && cached.uri == uri &&
                 cached.full == full) bootstrapAnalysisGraphReuse(cached)
-                else bootstrapAnalysisGraphParse(source, uri, full, module.path, this.graphStableIds)
+                else bootstrapAnalysisGraphFrozen(
+                    bootstrapAnalysisGraphParse(source, uri, full, module.path, this.graphStableIds))
             this.graphParsed.set(module.path, entryParsed)
             val parsed = entryParsed.parsed
             documents.append(BootstrapAnalysisGraphDocument(
