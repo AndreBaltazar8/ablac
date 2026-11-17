@@ -352,7 +352,7 @@ object semantics change without a corresponding source-graph change.
 pure self-rebuild gate; options after the source are order-independent.
 
 A module whose package doesn't set `visibility` is [strict](language.md#strict-imports)
-by default; `build --flat-imports` builds those modules flat instead, the opt-out for code
+by default; `build --flat-imports` builds those modules flat instead (not a package that says `visibility = "imports"`), the opt-out for code
 not yet migrated, and `--strict-imports` says the default explicitly (the mode is part of
 the cache identity, a build's and `ablac run`'s). `ablac test` and `ablac run` take the same
 three modes. A repository whose scripts call the compiler many times sets `visibility = "flat"`

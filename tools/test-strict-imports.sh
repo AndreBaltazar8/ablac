@@ -204,6 +204,13 @@ runs "$output_directory/type-parameters" "3 6 5 4 15 9
 15"
 rejected "$cases/type-parameters/bad-main.ab" "" \
     'error[E_NAME_NOT_IMPORTED]: `Other` is declared in'
+# --flat-imports reaches a dependency that doesn't say `visibility` (here under a strict app), and stops at a
+# package that says `visibility = "imports"`: declaring itself strict, it stays strict.
+"$compiler" build "$cases/flat-dep/main.ab" -o "$output_directory/flat-dep" --flat-imports
+runs "$output_directory/flat-dep" "41"
+rejected "$cases/flat-dep/main.ab" "" 'error[E_NAME_NOT_IMPORTED]: `otherValue` is declared in'
+rejected "$cases/type-parameters/bad-main.ab" --flat-imports \
+    'error[E_NAME_NOT_IMPORTED]: `Other` is declared in'
 # A library module's other file isn't API: a flat program's report names the
 # entry module that reaches it, and a strict program is told it's internal.
 "$compiler" build "$cases/internal.ab" -o "$output_directory/internal" --flat-imports \

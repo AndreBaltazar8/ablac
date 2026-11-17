@@ -131,7 +131,7 @@ otherwise: each sees only its own declarations and what it imports
 (`visibility = "imports"` says so explicitly). `visibility = "flat"` (or the
 older `"program"`) keeps every name visible program-wide, the opt-out for a
 package not yet migrated; `--flat-imports` (on `ablac build`, `test` or `run`)
-does the same for a package without the key. A repository whose scripts call
+does the same for a package without the key (a package that says `visibility = "imports"` stays strict under the flag). A repository whose scripts call
 the compiler many times sets `visibility = "flat"` in its abla.toml until its
 imports are added: the manifest reaches every one of those calls. The
 key belongs to the nearest manifest at or above a module, so a strict package

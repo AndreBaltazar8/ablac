@@ -2818,7 +2818,7 @@ fun main: int = nextId()
 - Flat is the opt-out, for code that hasn't been migrated: `visibility = "flat"`
   (or the older spelling `"program"`) keeps a package flat, where every module
   sees every name the program declares, and `--flat-imports` (on `ablac build`,
-  `test` or `run`) builds a program whose manifest doesn't say flat; a
+  `test` or `run`) builds a program whose manifest doesn't say flat (a package that says `visibility = "imports"` stays strict); a
   repository whose scripts call the compiler many times sets the manifest key
   instead. With `--strict-imports=warn` it
   also builds flat, and each diagnostic strict imports would give it is a
