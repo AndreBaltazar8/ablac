@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 typedef int64_t (*export_function)(int64_t);
 
@@ -58,12 +59,21 @@ int main(int argc, char **argv) {
     int waves = atoi(argv[2]), threads = atoi(argv[3]);
     setup(0);
     int failed = wave(touch, threads, 1);
+    // A joined thread can still answer tgkill for a moment (the kernel wakes the joiner before it is gone for good): a sweep
+    // leaves that one for the next, so the sweeps repeat, a few milliseconds apart, until the bytes live stop falling.
     reclaim(0); // the warm-up wave's ended threads: the baseline is what is live with none waiting
+    usleep(50000);
+    reclaim(0);
     int64_t before = live(0);
     for (int round = 0; round < waves; round++) failed |= wave(touch, threads, 1 + round);
     int64_t pending = live(0) - before;
     int64_t found = reclaim(0);
     int64_t left = live(0) - before;
+    for (int again = 0; again < 200 && left != 0; again++) {
+        usleep(5000);
+        found += reclaim(0);
+        left = live(0) - before;
+    }
     printf("emutls foreign threads: %d threads, %lld bytes waiting before a reclaim (%lld threads found), %lld bytes left after (%lld live before)%s\n",
            waves * threads, (long long)pending, (long long)found, (long long)left, (long long)before, failed ? ", a call failed" : "");
     return failed || left != 0 || pending > allowed;
