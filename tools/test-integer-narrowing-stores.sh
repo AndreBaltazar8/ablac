@@ -12,7 +12,7 @@ rm -rf "$out"
 mkdir -p "$out"
 "$compiler" build tests/cases/integer-narrowing-stores/valid.ab -o "$out/valid" --fast --no-cache
 got=$("$out/valid")
-[[ $got == "255 -128 0 44 32767 255 200 255 A 255 -128 44" ]] || { echo "integer narrowing stores: valid.ab printed '$got'" >&2; exit 1; }
+[[ $got == "255 -128 0 44 32767 255 200 255 A 255 -128 44 255 44 2 44" ]] || { echo "integer narrowing stores: valid.ab printed '$got'" >&2; exit 1; }
 reject() { # $1 = name, $2 = declarations, $3 = statements of main
     printf 'class Box(var value: u8)\n%s\nfun main: int {\n%s\n    0\n}\n' "$2" "$3" > "$out/$1.ab"
     if "$compiler" build "$out/$1.ab" -o "$out/$1" --fast --no-cache > "$out/$1.log" 2>&1; then
@@ -40,4 +40,11 @@ reject result-statement 'fun f(): u8 {
 }' '    val a = f()'
 reject result-expression 'fun f(): u8 = 256' '    val a = f()'
 reject result-int-value 'fun f(i: int): u8 = i' '    val a = f(1)'
-echo "integer narrowing stores: fitting literals and conversions accepted in every store, 17 other forms rejected"
+reject append-literal "" $'    val items: array<i8> = []\n    items.append(300)'
+reject append-int-value "" $'    val items: array<u8> = []\n    val i = 5\n    items.append(i)'
+reject append-u32 "" $'    val items: array<u32> = []\n    items.append(-1)'
+reject map-set-literal "" $'    val table: Map<string, u8> = Map()\n    table.set("k", 300)'
+reject map-set-int-value "" $'    val table: Map<string, i16> = Map()\n    val i = 1\n    table.set("k", i)'
+reject cell-set-literal "" $'    val cell = Cell(u8(1))\n    cell.set(256)'
+reject cell-set-int-value "" $'    val cell = Cell(u8(1))\n    val i = 1\n    cell.set(i)'
+echo "integer narrowing stores: fitting literals and conversions accepted in every store, 24 other forms rejected"
