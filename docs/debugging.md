@@ -173,7 +173,7 @@ skips all of it.
 
 ## Collector trace: `ABLA_GC_TRACE=1`
 
-`ABLA_GC_TRACE=1` writes one line to standard error for each collection, `gc: live <bytes> bytes before, <bytes> after, <n> ms`,
+`ABLA_GC_TRACE=1` writes one line to standard error for each collection, `gc: live <bytes> bytes before, <bytes> after, <n> ms, mapped <bytes> parked <bytes>` (live bytes by the heap's own count, the heap's chunks mapped and the freed bytes parked on its lists),
 and a line for each stop that parked threads (`gc: stopped <n> thread(s)`) or was abandoned and why. The live bytes after a
 collection are what the next one marks again, so for a long-running server they are its long-lived state: the framework's
 own event server (tests/cases/http-peer/server.ab shape, 300,000 requests) keeps 22 KB and collects in 2 ms, so only an

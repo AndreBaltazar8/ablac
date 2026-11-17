@@ -1099,6 +1099,26 @@ mmap form) apply there.
   TVars show no change beyond noise. A region at the allocator's page, or counted at creation, kept the boundaries
   (screened, not shipped). Open: a thread that first touches TVars others mostly use gives them its clock. The
   partitioned-only prototype that cost a logged block 30% more is on branch `stm-clocks`.
+- [x] **What the collector keeps, measured with `ABLA_GC_TRACE=1` (2026-11-17, ablac-4e).** Each collection prints
+  `gc: live <before> bytes before, <after> after, <ms> ms, mapped <bytes> parked <bytes>` (docs/debugging.md). Two
+  questions it answered:
+  - *Would a long-running server gain from the frozen heap (docs/design/frozen-heap.md)?* The framework's own event server
+    (`HttpEventServer`, a noescape handler, 300,000 requests) ends every collection with 21.8 KB live against about 67 MB
+    allocated between collections, and a collection takes 2 ms: nothing to freeze. An application's caches decide the rest.
+    NovaKind's server was not run (its stack belongs to running setups): run it with `ABLA_GC_TRACE=1` under its normal load, and
+    freeze a structure only when the live bytes after a collection are above roughly 100 MB and the collections take
+    100 ms or more; the pattern is `Frozen(value)` around something built whole and never mutated, with an environment
+    switch to turn it off (the editor's is `ABLA_ANALYSIS_FREEZE`).
+  - *What grew the compiler's self-build peak (`--emit-llvm src/orc_main.ab`, interpreter tier)?* Two compilers, each on its own
+    source, the 2026-11-15 record's tree (e9f585eb) and 10380d44, two interleaved runs each: 1,573,624 / 1,578,252 kB and
+    1,612,752 / 1,606,728 kB, +2.3%, while the source grew 6.2% (src 5.18 to 5.42 MB, stdlib 3.09 to 3.36 MB). The tracked live
+    bytes grow with it (+23 MB at the end of parse, +13 to 14 MB through emit, +21 MB at module drop): more live data in
+    proportion to the source, not fragmentation or the collection step. Where the 1.6 GB sits (the new compiler): seven
+    collections, the last with 611 MB live before and 476 MB after, 891 MB of heap chunks mapped and 77 MB parked; about
+    700 MB of the peak arrives after the last collection, in LLVM emission, which is not split further here. The record's
+    1,550,000 kB is 1.6% under what its own tree measures today. With the auto tier on, master 6040c155's stage 2 peaks at
+    1.695 to 1.701 GB and the AF tip caef75c1's at 1.751 to 1.754 GB (four runs each, interleaved, the test's method): +3.2%
+    for 0.6% more source, the tier's side (ablac-9e).
 - [ ] **Transactional memory: a TVar takes the clock of the thread that first uses it.** Since
   `docs/measurements/stm-region-at-first-use-2026-11-15.md`, a TVar's region is set once, by the first logged
   transaction that reaches it. A thread that touches TVars first which other threads then mostly use gives them
