@@ -66,7 +66,9 @@ class BootstrapTargetDescriptor(
     val linkerFlavor: string,
     val linkerEmulation: string,
     val valid: bool,
-    val sdk: string = ""
+    val sdk: string = "",
+    // Extra shared-library link inputs a build extension staged (absolute paths, one per line; BootstrapDefinedTarget).
+    val linkInputs: string = ""
 )
 
 // Direct host LLVM emission uses the same source runtime graph as a normal
@@ -189,39 +191,6 @@ fun bootstrapLinkCommand(linker: string): LinuxCommand {
     command.argument("ZERO_AR_DATE=1")
     command.argument(linker)
     command
-}
-
-// The NDK's compiler-rt builtins archive for aarch64 Android, or "": an Android library that has a thread-local
-// refers to __emutls_get_address (API 24 has no ELF TLS in a dlopen'd library), which bionic does not export and only
-// this archive defines. ABLA_ANDROID_BUILTINS names the archive itself; otherwise the NDK is looked for in
-// ABLA_ANDROID_NDK, ANDROID_NDK_ROOT, ANDROID_NDK_HOME and under ANDROID_HOME and ANDROID_SDK_ROOT (ndk/<version>,
-// ndk-bundle), the newest version winning.
-fun bootstrapAndroidBuiltins(): string {
-    val finder = linuxCommand("sh")
-    finder.argument("-c")
-    finder
-        .argument("if [ -n \"\$ABLA_ANDROID_BUILTINS\" ]; then [ -f \"\$ABLA_ANDROID_BUILTINS\" ] && echo \"\$ABLA_ANDROID_BUILTINS\"; exit 0; fi; for r in \"\$ABLA_ANDROID_NDK\" \"\$ANDROID_NDK_ROOT\" \"\$ANDROID_NDK_HOME\" \"\$ANDROID_HOME/ndk\" \"\$ANDROID_SDK_ROOT/ndk\" \"\$ANDROID_HOME/ndk-bundle\" \"\$ANDROID_SDK_ROOT/ndk-bundle\"; do [ -n \"\$r\" ] && [ -d \"\$r\" ] && find -L \"\$r\" -name libclang_rt.builtins-aarch64-android.a 2>/dev/null; done | sort -V | tail -n 1")
-    var text = finder.captureText()
-    var end = text.size
-    while (end > 0 && (text[end - 1] == 10 || text[end - 1] == 13)) end = end - 1
-    text.slice(0, end)
-}
-
-// The NDK sysroot's API 24 libc.so stub for aarch64 Android, or "": linking it makes the library name libc.so as
-// DT_NEEDED. bionic's linker resolves a dlopen'd library's imports (malloc, pthread_*, write) in the library's own needed
-// libraries and the global group (the executable and RTLD_GLOBAL libraries), not in the libraries the executable
-// needs: a library with no DT_NEEDED fails to load with `cannot locate symbol` (tools/test-android-run.sh).
-// Searched like the builtins archive (ABLA_ANDROID_NDK and the others; the newest version wins); the NDK sysroot has one
-// aarch64 triple directory with an API 24 subdirectory.
-fun bootstrapAndroidLibc(): string {
-    val finder = linuxCommand("sh")
-    finder.argument("-c")
-    finder
-        .argument("for r in \"\$ABLA_ANDROID_NDK\" \"\$ANDROID_NDK_ROOT\" \"\$ANDROID_NDK_HOME\" \"\$ANDROID_HOME/ndk\" \"\$ANDROID_SDK_ROOT/ndk\" \"\$ANDROID_HOME/ndk-bundle\" \"\$ANDROID_SDK_ROOT/ndk-bundle\"; do [ -n \"\$r\" ] && [ -d \"\$r\" ] && find -L \"\$r\" -path \"*/aarch64-linux-*/24/libc.so\" 2>/dev/null; done | sort -V | tail -n 1")
-    var text = finder.captureText()
-    var end = text.size
-    while (end > 0 && (text[end - 1] == 10 || text[end - 1] == 13)) end = end - 1
-    text.slice(0, end)
 }
 
 // Whether clang's library search finds `name` (a bare name comes back when it does not).
@@ -595,7 +564,8 @@ fun bootstrapDefinedTargetDescriptor(
       !target.libcFree && target.linkerFlavor == "apple-static" &&
       target.linkerEmulation == "" &&
       bootstrapAppleSdkMatchesTriple(target.sdk, target.llvmTriple))),
-    target.sdk
+    target.sdk,
+    target.linkInputs
 )
 
 fun bootstrapSupportedTargets(): string =
@@ -3631,8 +3601,10 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     val manifest = manifestPath.readText()
     val baseTargetIdentity =
         "${target.name}:${target.llvmTriple}:${target.objectFormat}:${target.hosted}:${target.libcFree}:${target.entrySymbol}:${target.linkerFlavor}:${target.linkerEmulation}"
-    val targetIdentity = if (target.sdk == "") baseTargetIdentity
+    val sdkIdentity = if (target.sdk == "") baseTargetIdentity
         else "$baseTargetIdentity:sdk=${target.sdk}"
+    val targetIdentity = if (target.linkInputs == "") sdkIdentity
+        else "$sdkIdentity:inputs=${target.linkInputs}"
     // Cache identity needs stable content identity, not a materialized copy of
     // every imported source. Module snapshots already carry two independent
     // content fingerprints plus size and canonical path.
@@ -4810,20 +4782,16 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         linkShared.argument("-m")
         linkShared.argument(target.linkerEmulation)
         linkShared.argument(objectPath)
-        // An aarch64 Android library takes __emutls_get_address from the NDK's builtins (see above); the archive
-        // follows the object so that only the members the object needs are pulled.
-        if (bootstrapTextContains(target.llvmTriple, "aarch64") &&
-            bootstrapTextContains(target.llvmTriple, "android")) {
-            val builtins = bootstrapAndroidBuiltins()
-            if (builtins != "") linkShared.argument(builtins)
-            else if (bootstrapBuildVerbose) {
-                linuxPrintStandardError(
-                    "note: no Android NDK found (set ABLA_ANDROID_NDK): the library's thread-locals need __emutls_get_address from its compiler-rt builtins\n"
-                )
+        // The inputs the target's build extension staged (defineTargetLinkInput), in order, after the object so that an
+        // archive contributes only the members the object needs.
+        var inputStart = 0
+        var inputEnd = 0
+        while (inputEnd < target.linkInputs.size) {
+            if (target.linkInputs[inputEnd] == 10) {
+                if (inputEnd > inputStart) linkShared.argument(target.linkInputs.slice(inputStart, inputEnd))
+                inputStart = inputEnd + 1
             }
-            // DT_NEEDED libc.so (see bootstrapAndroidLibc); the imports the library keeps are bionic's.
-            val libc = bootstrapAndroidLibc()
-            if (libc != "") linkShared.argument(libc)
+            inputEnd = inputEnd + 1
         }
         linkShared.argument("-o")
         linkShared.argument(publishPath)

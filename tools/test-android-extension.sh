@@ -66,6 +66,50 @@ set -e
 grep -q 'error\[E_BUILD_TARGET_DEFINITION\]' \
     "$output_directory/invalid-target.err"
 
+# The NDK lookup belongs to the extension: the compiler reads none of the NDK's variables and names none of its files.
+if rg -n 'ABLA_ANDROID|ANDROID_NDK|ANDROID_HOME|ANDROID_SDK_ROOT|libclang_rt' \
+    "$project_root/src" >/dev/null; then
+    echo "Android NDK lookup leaked into the compiler" >&2
+    exit 1
+fi
+
+# A synthetic NDK (an empty builtins archive and a libc.so stub in the NDK's layout): the extension finds it through
+# ABLA_ANDROID_NDK or under ANDROID_HOME/ndk/<version> and the link names libc.so as needed; with no NDK, it does not.
+fake="$output_directory/fake"
+rm -rf "$fake"
+ndk="$fake/sdk/ndk/27.0.0/toolchains/llvm/prebuilt/linux-x86_64"
+mkdir -p "$ndk/lib/clang/20/lib/linux" "$ndk/sysroot/usr/lib/aarch64-linux-android/24"
+: > "$fake/empty.s"
+llvm-mc -triple aarch64-linux-android -filetype=obj "$fake/empty.s" -o "$fake/empty.o"
+llvm-ar rcs "$ndk/lib/clang/20/lib/linux/libclang_rt.builtins-aarch64-android.a" "$fake/empty.o"
+ld.lld -shared -m aarch64linux -soname libc.so "$fake/empty.o" -o "$ndk/sysroot/usr/lib/aarch64-linux-android/24/libc.so"
+needed() { llvm-readelf -d "$library" | grep -c 'NEEDED.*\[libc.so\]' || true; }
+
+env -u ABLA_ANDROID_NDK -u ANDROID_NDK_ROOT -u ANDROID_NDK_HOME -u ANDROID_HOME -u ANDROID_SDK_ROOT -u ABLA_ANDROID_BUILTINS \
+    "$compiler" build "$project_root/tests/cases/android-extension/build.ab" \
+    -o "$output_directory/build-driver" --fast --no-cache
+[[ $(needed) -eq 0 ]] || { echo "a library built with no NDK needs libc.so" >&2; exit 1; }
+ABLA_ANDROID_NDK="$fake/sdk/ndk/27.0.0" \
+    "$compiler" build "$project_root/tests/cases/android-extension/build.ab" \
+    -o "$output_directory/build-driver" --fast --no-cache
+[[ $(needed) -eq 1 ]] || { echo "ABLA_ANDROID_NDK: the library does not need libc.so" >&2; exit 1; }
+env -u ABLA_ANDROID_NDK ANDROID_HOME="$fake/sdk" \
+    "$compiler" build "$project_root/tests/cases/android-extension/build.ab" \
+    -o "$output_directory/build-driver" --fast --no-cache
+[[ $(needed) -eq 1 ]] || { echo "ANDROID_HOME: the library does not need libc.so" >&2; exit 1; }
+
+# Without the two grants the build stops and says which one and where it came from.
+set +e
+"$compiler" build "$project_root/tests/cases/android-extension/missing-grant.ab" \
+    -o "$output_directory/missing-grant" --fast --no-cache \
+    >"$output_directory/missing-grant.out" 2>"$output_directory/missing-grant.err"
+missing_status=$?
+set -e
+[[ $missing_status -ne 0 ]] || { echo "a build script without the grants built" >&2; exit 1; }
+grep -q 'compile.effect-denied:filesystem.read:androidBuildArm64Library->androidNdkLookup' \
+    "$output_directory/missing-grant.err"
+grep -q '#compilerGrant' "$output_directory/missing-grant.err"
+
 if rg -n 'android-arm64|aarch64-linux-android' \
     "$project_root/src" >/dev/null; then
     echo "Android platform policy leaked into the compiler" >&2

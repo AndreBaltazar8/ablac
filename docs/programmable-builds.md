@@ -152,6 +152,19 @@ output. Cross-target fast builds still run bounded O1/global-DCE before LLVM
 target lowering so dead host-runtime details cannot invalidate another
 architecture.
 
+The extension also finds the Android NDK, which the compiler does not: a library with a thread-local needs the NDK's
+compiler-rt builtins archive (`__emutls_get_address`), and bionic's linker needs the library to name `libc.so` as needed,
+which the NDK sysroot's API 24 stub does. `androidNdkLookup` reads `ABLA_ANDROID_NDK`, `ANDROID_NDK_ROOT`,
+`ANDROID_NDK_HOME` and, under `ANDROID_HOME` and `ANDROID_SDK_ROOT`, `ndk/<version>` and `ndk-bundle` (`Path.entries()`;
+the newest version wins; `ABLA_ANDROID_BUILTINS` names the archive itself), and passes what it finds to the link with
+`defineTargetLinkInput(target, path)`: an absolute, one-line path (at most 16 per target) that joins the target's
+shared-library link after the object, in the order given, and is part of the target's cache identity. With no NDK the
+library links without them, as it always did. A build script that builds an Android library therefore grants the
+lookup its two effects: `#compilerGrant("environment")` and `#compilerGrant("filesystem.read")`, and lists them in
+`compileCapabilities` in its `abla.toml`. Without them the build stops with `compile.effect-denied:<capability>:` and the
+call path (`androidBuildArm64Library->androidNdkLookup->...`), and the diagnostic's help says to add the grant.
+`tools/test-android-extension.sh` finds a synthetic NDK both ways and fails if the compiler names any NDK variable.
+
 `abla/wasm/build` owns the format-level `wasm32-unknown-unknown` descriptor and
 requests a generic `module` artifact. `abla/mvc/wasm/build` composes it with an
 extension-generated JavaScript loader. Its proof module exports only the stable

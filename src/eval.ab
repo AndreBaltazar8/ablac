@@ -120,7 +120,10 @@ class BootstrapDefinedTarget(
     val linkerEmulation: string,
     val hosted: bool,
     val libcFree: bool,
-    val sdk: string = ""
+    val sdk: string = "",
+    // Extra inputs of the target's shared-library link (absolute paths, one per line), found by the target's build
+    // extension at build time (defineTargetLinkInput): an Android extension's NDK archives, for one.
+    val linkInputs: string = ""
 )
 
 var bootstrapCompileProgramRequestCount: int = 0
@@ -623,6 +626,7 @@ fun bootstrapStageDefinedTarget(target: BootstrapDefinedTarget): bool {
         if (target.libcFree) "1" else "0"
     )
     if (valid) valid = Path("$root/$targetIndex.sdk").writeText(target.sdk)
+    if (valid) valid = Path("$root/$targetIndex.inputs").writeText(target.linkInputs)
     if (valid) bootstrapDefinedTargetCount = targetIndex + 1
     if (!valid) {
         Path("$root/$targetIndex.name").remove()
@@ -633,8 +637,38 @@ fun bootstrapStageDefinedTarget(target: BootstrapDefinedTarget): bool {
         Path("$root/$targetIndex.hosted").remove()
         Path("$root/$targetIndex.libc-free").remove()
         Path("$root/$targetIndex.sdk").remove()
+        Path("$root/$targetIndex.inputs").remove()
     }
     valid
+}
+
+// An extra input of a registered ELF target's shared-library link: an absolute path, one line, at most 16 per target.
+// Staged with the descriptor so replayed build requests link the same files.
+fun bootstrapStageDefinedTargetLinkInput(name: string, input: string): bool {
+    if (input.size == 0 || input.size > 4096 || input[0] != 47) return false
+    var character = 0
+    while (character < input.size) {
+        if (input[character] == 10 || input[character] == 13 || input[character] == 0) return false
+        character = character + 1
+    }
+    val root = bootstrapDefinedTargetRoot()
+    var index = 0
+    while (index < bootstrapDefinedTargetCount) {
+        if (Path("$root/$index.name").readText() == name) {
+            if (Path("$root/$index.format").readText() != "elf") return false
+            val current = Path("$root/$index.inputs").readText()
+            var lines = 0
+            var cursor = 0
+            while (cursor < current.size) {
+                if (current[cursor] == 10) lines = lines + 1
+                cursor = cursor + 1
+            }
+            if (lines >= 16) return false
+            return Path("$root/$index.inputs").writeText("$current$input\n")
+        }
+        index = index + 1
+    }
+    false
 }
 
 // SDK selection is target metadata, staged with the descriptor so replayed
@@ -669,7 +703,8 @@ fun bootstrapTakeDefinedTargets(): array<BootstrapDefinedTarget> {
             Path("$root/$index.emulation").readText(),
             Path("$root/$index.hosted").readText() == "1",
             Path("$root/$index.libc-free").readText() == "1",
-            Path("$root/$index.sdk").readText()
+            Path("$root/$index.sdk").readText(),
+            Path("$root/$index.inputs").readText()
         ))
         Path("$root/$index.name").remove()
         Path("$root/$index.triple").remove()
@@ -679,6 +714,7 @@ fun bootstrapTakeDefinedTargets(): array<BootstrapDefinedTarget> {
         Path("$root/$index.hosted").remove()
         Path("$root/$index.libc-free").remove()
         Path("$root/$index.sdk").remove()
+        Path("$root/$index.inputs").remove()
         index = index + 1
     }
     bootstrapDefinedTargetCount = 0
@@ -5459,6 +5495,9 @@ class BootstrapEvaluator(
             }
             if (expression.text == "defineTargetSdk") {
                 target = "compilerDefineTargetSdk"
+            }
+            if (expression.text == "defineTargetLinkInput") {
+                target = "compilerDefineTargetLinkInput"
             }
             if (expression.text == "defineTarget") {
                 target = "compilerDefineTarget"
@@ -12294,6 +12333,23 @@ fun bootstrapEvaluateCallCompiler(
         if (!valid) {
             bootstrapStageDriverDiagnostic(
                 "error[E_BUILD_TARGET_SDK]: defineTargetSdk requires a registered target and macosx, iphoneos or iphonesimulator\n"
+            )
+            evaluator.errors = evaluator.errors + 1
+        }
+        result = bootstrapEvalBoolean(valid)
+    }
+    if (targetName == "compilerDefineTargetLinkInput") {
+        val name = bootstrapEvalJournalArg(evaluator, expression, 0)
+        if (bootstrapEvalLeaves(name)) return name
+        val input = bootstrapEvalJournalArg(evaluator, expression, 1)
+        if (bootstrapEvalLeaves(input)) return input
+        var valid = name.kind == "string" && input.kind == "string"
+        if (valid && !bootstrapArtifactSliceActive) {
+            valid = bootstrapStageDefinedTargetLinkInput(name.text, input.text)
+        }
+        if (!valid) {
+            bootstrapStageDriverDiagnostic(
+                "error[E_BUILD_TARGET_LINK_INPUT]: defineTargetLinkInput requires a registered ELF target and an absolute one-line path (at most 16 per target)\n"
             )
             evaluator.errors = evaluator.errors + 1
         }

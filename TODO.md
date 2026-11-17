@@ -170,15 +170,22 @@ mmap form) apply there.
   (`pthread_key_create`, `pthread_getspecific`, `pthread_setspecific`) that `abla/android/emutls` leaves; do not move to
   API 29 and its ELF TLS. No code change; recorded in docs/targets.md, Android row.
 
-- [ ] **Move both NDK searches behind the Android build extension.** The compiler's link step finds the NDK's
-  compiler-rt builtins archive (`bootstrapAndroidBuiltins`) and the API 24 `libc.so` stub (`bootstrapAndroidLibc`) in
-  `src/toolchain.ab`, by shell searches over `ABLA_ANDROID_NDK` and the other NDK variables. That is Android policy in
-  the compiler. `tools/test-android-extension.sh` only forbids the literals `android-arm64` and `aarch64-linux-android`
-  in `src/`; the libc stub search was changed to a glob that avoids the second one, which keeps the guard quiet and
-  does not fix what it is for. Give `abla/android/build` the searches and hand the linker the extra inputs through an
-  extension-to-linker interface (extra link inputs of a target definition, found at build time), then widen the guard
-  to `aarch64-linux-` and `android` in `src/` (the target triple checks in `src/backend/llvm` for the arm64 Android
-  library are the other half).
+- [x] **Both NDK searches moved behind the Android build extension (decision #73, A; 2026-11-17, ablac-4e).** The compiler no
+  longer looks for the NDK's compiler-rt builtins archive or the API 24 `libc.so` stub (`bootstrapAndroidBuiltins` and
+  `bootstrapAndroidLibc` are gone; it reads no NDK variable). `abla/android/build`'s `androidNdkLookup` reads
+  `ABLA_ANDROID_NDK`, `ANDROID_NDK_ROOT`, `ANDROID_NDK_HOME`, `ANDROID_HOME`, `ANDROID_SDK_ROOT` (and `ABLA_ANDROID_BUILTINS`),
+  lists the NDK's folders with `Path.entries()` (newest version wins) and hands the two files to the linker through a new
+  staged call, `defineTargetLinkInput(target, path)` (absolute one-line paths, at most 16 per target, after the object, in the
+  target's cache identity). Build scripts that build an Android library add `#compilerGrant("environment")` and
+  `#compilerGrant("filesystem.read")` (and the two to `compileCapabilities`); without them the build stops with
+  `compile.effect-denied:<capability>:androidBuildArm64Library->androidNdkLookup->...` and a help line saying to add the grant.
+  `tools/test-android-extension.sh` builds against a synthetic NDK (through `ABLA_ANDROID_NDK` and under `ANDROID_HOME/ndk`),
+  checks `libc.so` is needed with it and not without, checks the missing-grant error, and its guard now forbids the NDK
+  variables and `libclang_rt` in `src/`. The target-triple checks in `src/backend/llvm` (the arm64 Android library) are the
+  remaining Android knowledge in the compiler (#811 debt: those are code generation, not a path search).
+  **Release note:** "The Android NDK lookup moved from the compiler into `abla/android/build`. A build script that builds an Android
+  library with it must grant `#compilerGrant("environment")` and `#compilerGrant("filesystem.read")` (and list both in
+  `compileCapabilities` in abla.toml); the NDK is found as before (`ABLA_ANDROID_NDK`, `ANDROID_NDK_ROOT`, `ANDROID_HOME`...)."
 
 ## Shared-library exports (#811)
 

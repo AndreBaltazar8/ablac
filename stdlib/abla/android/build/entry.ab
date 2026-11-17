@@ -1,5 +1,6 @@
 import "abla/build"
 import "abla/compiler"
+import "abla/fs"
 
 compile fun androidReplaceAll(
     source: string,
@@ -17,6 +18,111 @@ compile fun androidReplaceAll(
         } else index = index + 1
     }
     "$output${source.slice(segment, source.size)}"
+}
+
+// ---- the Android NDK lookup -------------------------------------------------------------------------------------
+// An arm64 Android library that has a thread-local calls __emutls_get_address (API 24 has no ELF TLS in a dlopen'd
+// library), which bionic does not export and only the NDK's compiler-rt builtins archive defines; and bionic's linker
+// resolves a dlopen'd library's imports (malloc, pthread_*, write) in the library's own DT_NEEDED libraries, so the
+// library links the NDK sysroot's API 24 libc.so stub to name libc.so as needed. The compiler knows neither: this
+// lookup finds both files and hands them to the link (defineTargetLinkInput).
+//
+// The lookup reads the environment and lists directories, so a build script that builds an Android library grants
+// both: #compilerGrant("environment") and #compilerGrant("filesystem.read") (and lists them in compileCapabilities
+// in abla.toml). Without them the build stops with compile.effect-denied naming the grant and this lookup
+// (androidNdkLookup).
+
+// Version order of two paths ("sort -V"): runs of digits compare as numbers, the rest as text.
+compile fun androidVersionLess(left: string, right: string): bool {
+    var a = 0
+    var b = 0
+    while (a < left.size && b < right.size) {
+        val x = left[a]
+        val y = right[b]
+        val xDigit = x >= 48 && x <= 57
+        val yDigit = y >= 48 && y <= 57
+        if (xDigit && yDigit) {
+            var xEnd = a
+            while (xEnd < left.size && left[xEnd] >= 48 && left[xEnd] <= 57) xEnd += 1
+            var yEnd = b
+            while (yEnd < right.size && right[yEnd] >= 48 && right[yEnd] <= 57) yEnd += 1
+            var xStart = a
+            while (xStart < xEnd - 1 && left[xStart] == 48) xStart += 1
+            var yStart = b
+            while (yStart < yEnd - 1 && right[yStart] == 48) yStart += 1
+            val xLength = xEnd - xStart
+            val yLength = yEnd - yStart
+            if (xLength != yLength) return xLength < yLength
+            val xDigits = left.slice(xStart, xEnd)
+            val yDigits = right.slice(yStart, yEnd)
+            if (xDigits != yDigits) return xDigits < yDigits
+            a = xEnd
+            b = yEnd
+        } else {
+            if (x != y) return x < y
+            a += 1
+            b += 1
+        }
+    }
+    left.size - a < right.size - b
+}
+
+// The newest of `found` by version order, or "".
+compile fun androidNewest(found: array<string>): string {
+    var best = ""
+    for (candidate in found) {
+        if (best == "" || androidVersionLess(best, candidate)) best = candidate
+    }
+    best
+}
+
+// The NDK directories the environment names: ABLA_ANDROID_NDK, ANDROID_NDK_ROOT and ANDROID_NDK_HOME name one each;
+// ANDROID_HOME and ANDROID_SDK_ROOT hold them under ndk/<version> (and the older ndk-bundle).
+compile fun androidNdkRoots(): array<string> {
+    val roots: array<string> = []
+    for (name in ["ABLA_ANDROID_NDK", "ANDROID_NDK_ROOT", "ANDROID_NDK_HOME"]) {
+        val value = compilerEnvironment(name)
+        if (value != "") roots.append(value)
+    }
+    for (name in ["ANDROID_HOME", "ANDROID_SDK_ROOT"]) {
+        val sdk = compilerEnvironment(name)
+        if (sdk != "") {
+            for (version in Path("$sdk/ndk").entries()) roots.append(version.text)
+            roots.append("$sdk/ndk-bundle")
+        }
+    }
+    roots
+}
+
+// The compiler-rt builtins archive and the API 24 libc.so stub of one NDK directory (the layout of the NDK's
+// toolchains/llvm/prebuilt/<host>), appended to the two lists when they are there.
+compile fun androidNdkCollect(root: string, var builtins: array<string>, var libcs: array<string>): bool {
+    for (host in Path("$root/toolchains/llvm/prebuilt").entries()) {
+        for (version in Path("${host.text}/lib/clang").entries()) {
+            val archive = Path("${version.text}/lib/linux/libclang_rt.builtins-aarch64-android.a")
+            if (archive.info().isFile()) builtins.append(archive.text)
+        }
+        val libc = Path("${host.text}/sysroot/usr/lib/aarch64-linux-android/24/libc.so")
+        if (libc.info().isFile()) libcs.append(libc.text)
+    }
+    true
+}
+
+// Stages the NDK's builtins archive and libc.so stub as extra inputs of the target's link, when an NDK is found (the
+// newest version wins; ABLA_ANDROID_BUILTINS names the archive itself). A build with no NDK links without them, as
+// before: a library with no thread-local needs neither the archive; one without libc.so as needed does not load.
+compile fun androidNdkLookup(target: string): bool {
+    val builtins: array<string> = []
+    val libcs: array<string> = []
+    for (root in androidNdkRoots()) androidNdkCollect(root, builtins, libcs)
+    val explicit = compilerEnvironment("ABLA_ANDROID_BUILTINS")
+    var archive = androidNewest(builtins)
+    if (explicit != "") archive = if (Path(explicit).info().isFile()) explicit else ""
+    var staged = true
+    if (archive != "") staged = defineTargetLinkInput(target, archive)
+    val libc = androidNewest(libcs)
+    if (staged && libc != "") staged = defineTargetLinkInput(target, libc)
+    staged
 }
 
 compile fun androidArm64Target(): bool = defineTarget(
@@ -76,7 +182,8 @@ compile fun androidBuildArm64Library(
     fast: bool,
     cache: bool
 ): bool {
-    val target = androidArm64Target()
+    val defined = androidArm64Target()
+    val target = defined && androidNdkLookup("android-arm64")
     val integration = androidGenerateIntegration(
         packageName,
         generatedRoot
