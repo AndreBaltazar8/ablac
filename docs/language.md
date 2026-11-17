@@ -2823,6 +2823,10 @@ fun main: int = nextId()
   `overload`); `ablac run tools/fix-imports.ab -- report.tsv` adds those
   imports. A new import that makes a name ambiguous needs an alias, which the
   next build reports.
+- A name from a standard-library file that isn't a module's entry (`abla/tls/hosted/openssl.ab`, say) is internal: no import
+  makes it visible, and the error names the public module(s) that offer the surface. That list is data in the file's
+  header, a `// public: abla/tls/hosted, abla/tls/pure` comment (`none` when nothing public offers it); every such file
+  has one, and tools/test-strict-imports.sh checks that the modules it names exist.
 
 ### Contract imports
 

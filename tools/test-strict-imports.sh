@@ -135,5 +135,22 @@ grep -F "	OpenSSL_version_num	" "$output_directory/internal.tsv" | grep -F 'impo
     { echo "strict-imports: the internal name's report line:"; cat "$output_directory/internal.tsv"; exit 1; }
 rejected "$cases/internal.ab" --strict-imports \
     '`OpenSSL_version_num` is internal to the standard library' \
+    'help: the public module(s) for this: abla/tls/hosted, abla/tls/pure' \
     'help: a library module that offers it would be a change to the standard library to request'
+# The pointer is data in each internal file's header (`// public: <modules>`): every non-entry library file has it, and
+# every module it names is a library module (an entry.ab); `none` says nothing public offers the file.
+internal_count=0
+while IFS= read -r internal_file; do
+    internal_count=$((internal_count + 1))
+    line=$(grep -m1 '^// public:' "$internal_file" || true)
+    [[ -n $line ]] || { echo "strict-imports: $internal_file has no '// public:' header"; exit 1; }
+    modules=$(sed -e 's|^// public:||' -e 's|,| |g' <<<"$line")
+    [[ -n ${modules//[[:space:]]/} ]] || { echo "strict-imports: $internal_file: empty '// public:' header"; exit 1; }
+    for module in $modules; do
+        [[ $module == none ]] && continue
+        [[ -f "$project_root/stdlib/$module/entry.ab" ]] ||
+            { echo "strict-imports: $internal_file names $module, which is not a standard-library module"; exit 1; }
+    done
+done < <(find "$project_root/stdlib" -name '*.ab' ! -name entry.ab | sort)
+[[ $internal_count -gt 0 ]] || { echo "strict-imports: no internal library files found"; exit 1; }
 echo "strict-imports: strict package, export import, --strict-imports, report + fix-imports, strict standard library, internal library files"
