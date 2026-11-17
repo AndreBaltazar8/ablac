@@ -236,6 +236,7 @@ test-serial: ablac
 	tools/test-compile-time-depth.sh $(COMPILER)
 	tools/test-import-precedence-diagnostics.sh $(COMPILER)
 	tools/test-text-edges.sh $(COMPILER)
+	tools/test-text-padding.sh $(COMPILER)
 	tools/test-string-escapes.sh $(COMPILER)
 	tools/test-string-escape-bytes.sh $(COMPILER)
 	tools/test-lexer-oddities.sh $(COMPILER)

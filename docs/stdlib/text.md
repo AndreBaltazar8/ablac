@@ -52,7 +52,7 @@ fun main {
 | `s.replace(old, replacement)` | every occurrence replaced, left to right; an empty `old` replaces nothing |
 | `s.uppercase()`, `s.lowercase()` | ASCII letters mapped; other bytes unchanged |
 | `s.repeat(count)` | `count` copies |
-| `s.padStart(length, pad = " ")`, `s.padEnd(length, pad = " ")` | padded to `length` bytes; a longer string is unchanged |
+| `s.padStart(length, pad = " ")`, `s.padEnd(length, pad = " ")` | padded to `length` bytes with whole code points of `pad`, repeated; a code point that would not fit ends the padding (so the result can be up to 3 bytes short, never a half code point); a longer string is unchanged |
 | `textAsciiEqualInsensitive(a, b)` | ASCII case-insensitive equality |
 
 Positions and lengths are in bytes, matching `size` and `slice`. Case mapping
