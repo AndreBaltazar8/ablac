@@ -243,6 +243,7 @@ test-serial: ablac
 	tools/test-http-framing.sh $(COMPILER)
 	tools/test-percent-base64.sh $(COMPILER)
 	tools/test-yaml-edges.sh $(COMPILER)
+	tools/test-date-edges.sh $(COMPILER)
 	tools/test-lexer-oddities.sh $(COMPILER)
 	tools/test-numeric-edges.sh $(COMPILER)
 	tools/test-collection-edges.sh $(COMPILER)
