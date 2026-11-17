@@ -1171,13 +1171,19 @@ fun bootstrapCtOrdinaryTypeIn(declarations: array<BootstrapDeclaration>, declara
     if (initializer.kind != "call" || initializer.text == "") return ""
     var classes = 0
     var named = 0
+    var returned = ""
     for (other in declarations) {
         if (other.name == initializer.text) {
             named = named + 1
             if (other.kind == "class" && other.typeParameters.size == 0) classes = classes + 1
+            // A non-generic function's declared result (`var bootstrapGenericMethods = bootstrapStringSet()`).
+            if (other.kind == "fun" && other.extensionOwner == "" && other.typeParameters.size == 0) {
+                val result = bootstrapNormalizeType(other.resultType)
+                if (result != "inferred") returned = result
+            }
         }
     }
-    if (classes == 1 && named == 1) initializer.text else ""
+    if (named != 1) "" else if (classes == 1) initializer.text else returned
 }
 
 fun bootstrapCtOrdinaryType(declaration: BootstrapDeclaration): string {
@@ -1221,8 +1227,11 @@ fun bootstrapCtOwnableReason(
     // handed back, and needn't be: the interpreter keeps no such value between evaluations (a resource is acquired
     // and released by the code that runs). Like a TVar it is the generation's for the pass (bootstrapCtUnexchanged),
     // so neither a value native code can't describe nor a closure in it stops it, unless this pass edits
-    // declarations: a native closure made before an edit would run the edited body.
-    val holdsResource = bootstrapCtMayHoldResource(declarations, type)
+    // declarations: a native closure made before an edit would run the edited body. So is a raw pointer (the
+    // compiler's own `bootstrapLlvmHeldContext: i64*`: the interpreter has no raw memory, so it can neither make one
+    // nor do anything with one), and a value that always holds a closure, which the journal never keeps
+    // (bootstrapCtGenerationOnly).
+    val holdsResource = bootstrapCtGenerationOnly(declarations, type)
     val typeReason = bootstrapLiftTypeReasonIn(declarations, type)
     if (typeReason != "" && !holdsResource) return "of type $type, which native code cannot hand back: $typeReason"
     if ((!holdsResource || edits) && bootstrapCtStateMayHoldClosure(declarations, type))
@@ -1264,16 +1273,76 @@ fun bootstrapCtMayHoldResource(declarations: array<BootstrapDeclaration>, type: 
     false
 }
 
-// An owned global that stays the generation's alone for the pass: a TVar delegate, or a global whose value holds
-// resources. The interpreter keeps neither between evaluations, so nothing goes back to the journal after a native
+// An owned global that stays the generation's alone for the pass: a TVar delegate, a global whose value holds
+// resources, a raw pointer or a closure (bootstrapCtGenerationOnly). The interpreter keeps none of them between evaluations, so nothing goes back to the journal after a native
 // call (the others do: bootstrapCtExchangeGlobals).
 fun bootstrapCtUnexchanged(declarations: array<BootstrapDeclaration>, index: int): bool {
     val declaration = declarations[index]
     if (bootstrapCtTVarDelegate(declaration)) return true
     if (bootstrapCtDelegateKind(declaration) != "") return false
     val type = bootstrapCtOrdinaryTypeIn(declarations, declaration)
-    type != "" && bootstrapCtMayHoldResource(declarations, type)
+    type != "" && bootstrapCtGenerationOnly(declarations, type)
 }
+
+// Whether a global's type is a raw pointer (`i64*`, `u8*`): it addresses memory of the process that made it, so
+// it never goes back to the interpreter's journal, which can't hold one anyway (the interpreter has no raw memory).
+fun bootstrapCtRawPointer(type: string): bool {
+    val normalized = bootstrapNormalizeType(type)
+    normalized.size > 1 && normalized[normalized.size - 1] == 42
+}
+
+// Whether every value of `type` holds a closure: a function type, or a class with a field that always does (the
+// compiler's `bootstrapStrictVisibilityTable: BootstrapStrictVisibility`, whose importFor is a lambda). The
+// interpreter's journal keeps no such value (bootstrapCompileGlobalEncode: data only), so each evaluation makes it
+// afresh; nothing would go back to it after a native call either. (A nullable, generic or interface type, an
+// array or map, may hold none: bootstrapCtStateMayHoldClosure.)
+fun bootstrapCtAlwaysHoldsClosure(declarations: array<BootstrapDeclaration>, type: string): bool {
+    var seen: Map<string, bool> = Map()
+    bootstrapCtAlwaysHoldsClosureIn(declarations, type, seen)
+}
+
+fun bootstrapCtAlwaysHoldsClosureIn(
+    declarations: array<BootstrapDeclaration>,
+    type: string,
+    var seen: Map<string, bool>
+): bool {
+    val normalized = bootstrapNormalizeType(type)
+    if (normalized == "") return false
+    // bootstrapNormalizeType spells a function type `function:(…)->R`, with `once:`, `mut:` or `noescape:` before
+    // it for those families, and a nullable one `nullable:…`.
+    for (prefix in ["function:", "once:", "mut:", "noescape:"]) {
+        if (normalized.size > prefix.size && normalized.slice(0, prefix.size) == prefix) return true
+    }
+    for (byte in normalized) {
+        val word = (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) ||
+            byte == 95
+        if (!word) return false
+    }
+    if (seen.get(normalized) ?? false) return false
+    seen.set(normalized, true)
+    var found: BootstrapDeclaration? = null
+    var named = 0
+    for (declaration in declarations) {
+        if (declaration.name == normalized) {
+            named = named + 1
+            found = declaration
+        }
+    }
+    val declaration = found
+    if (named != 1 || declaration == null || declaration.kind != "class" ||
+        declaration.typeParameters.size != 0) return false
+    for (field in declaration.parameterTypes) {
+        if (bootstrapCtAlwaysHoldsClosureIn(declarations, field, seen)) return true
+    }
+    false
+}
+
+// A global the generation keeps alone for the pass, handing nothing back to the interpreter's journal, which keeps
+// no value of it between evaluations anyway: one that may hold resources, a raw pointer, or one that always holds a
+// closure (bootstrapCtOwnableReason, bootstrapCtUnexchanged).
+fun bootstrapCtGenerationOnly(declarations: array<BootstrapDeclaration>, type: string): bool =
+    bootstrapCtMayHoldResource(declarations, type) || bootstrapCtRawPointer(type) ||
+        bootstrapCtAlwaysHoldsClosure(declarations, type)
 
 // A `compile var` of a settable type whose name no other declaration has: a value
 // the evaluator gives it goes back into the generation's copy through its setter.
@@ -1795,8 +1864,15 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string,
                 bootstrapCtStateHas(state.reached[siteIndex], ownedIndex)) reachedByNative = true
             siteIndex = siteIndex + 1
         }
+        // (The write analysis's reach is wider than the slice's: a global no native call can touch, which the slice
+        // leaves out, stays the interpreter's. Exchanging it would name a declaration the slice hasn't.)
+        if (!reach.kept[ownedIndex]) reachedByNative = false
         if (ownable[ownedIndex] && reachedByNative && bootstrapCtUnexchanged(parsed.declarations, ownedIndex)) {
-            val what = if (bootstrapCtTVarDelegate(parsed.declarations[ownedIndex])) "a TVar" else "it holds resources"
+            val ownedType = bootstrapCtOrdinaryTypeIn(parsed.declarations, parsed.declarations[ownedIndex])
+            val what = if (bootstrapCtTVarDelegate(parsed.declarations[ownedIndex])) "a TVar"
+                else if (bootstrapCtMayHoldResource(parsed.declarations, ownedType)) "it holds resources"
+                else if (bootstrapCtRawPointer(ownedType)) "a raw pointer"
+                else "it holds a closure"
             bootstrapCtNote("ordinary global ${parsed.declarations[ownedIndex].name} ($what) is native for this pass")
         } else if (ownable[ownedIndex] && reachedByNative) {
             var known = false

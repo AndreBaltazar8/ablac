@@ -357,8 +357,9 @@ Under `auto` (the default) and `jit`, an ordinary global (a plain `val` or `var`
 `compile val` or `compile var`) that compile-time code can write has one owner
 for the pass. The native tier owns it when every site of the pass that reaches
 it can run natively. The global must also have a type the native tier can hand
-back (written out, a literal's, a class constructor's, or a TVar delegate) that
-holds no closure, and no earlier evaluation may have kept a value of it. Those
+back (written out, a literal's, a class constructor's, a plain function's declared
+result, or a TVar delegate) that holds no closure, and no earlier evaluation may
+have kept a value of it. Those
 sites then share the native copy, made by its initializer. After each native
 call its value goes into the interpreter's store, so a later pass, or an
 interpreted evaluation that reads it, sees the one value. If one of those sites
@@ -368,7 +369,11 @@ compile function, a generic instantiation or a rebuilt module). If an
 interpreted evaluation changes a global the native tier owns, the generation
 stops and the rest of the pass is interpreted. A TVar-delegated global (such as
 the pure TLS trust-store cache) is never kept between evaluations, in either
-tier: the native one lives for the pass. Code can write a global when it assigns it, stores into its fields or
+tier: the native one lives for the pass. So does a global whose value holds
+resources, a raw pointer (`i64*`: the interpreter has no raw memory), or a value
+that always holds a closure (a class with a function field): the interpreter
+makes those afresh at each evaluation, so nothing goes back to its store, and
+under declaration edits a closure-holding one still stays interpreted. Code can write a global when it assigns it, stores into its fields or
 elements, calls a built-in mutator (`append`, `set`, `remove`, ...) on it or on
 something that may alias it, or hands it to code the analysis cannot follow
 (an extern, a closure called as a value); code that only reads a table leaves

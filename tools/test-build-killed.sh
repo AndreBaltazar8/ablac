@@ -173,12 +173,18 @@ for owner in "$dead" "$dead-1" "$alive"; do
     printf 1 > "build/.abla-build-transaction-$owner/0.existed"
     printf 'old x' > "build/.abla-build-transaction-$owner/0.data"
 done
-mkdir -p "build/.abla-program-requests-$dead" "build/.abla-compile-outputs-$alive"
+# (`<pid>-ct`: a copy of the compiler that ran as compile-time code inside that process, eval.ab's
+# bootstrapProcessScratchTag.)
+mkdir -p "build/.abla-program-requests-$dead" "build/.abla-export-requests-$dead-ct" \
+    "build/.abla-compile-outputs-$alive" "build/.abla-compile-globals-$alive-ct"
 build other other
 [[ ! -e build/.abla-build-transaction-$dead && ! -e build/.abla-build-transaction-$dead-1 ]] ||
     fail "an old transaction of a process that has gone is left"
 [[ $(cat files/x) == "new x" ]] || fail "removing an old transaction changed its output"
 [[ ! -e build/.abla-program-requests-$dead ]] || fail "a scratch directory of a process that has gone is left"
+[[ ! -e build/.abla-export-requests-$dead-ct ]] ||
+    fail "a compile-time compiler's scratch directory of a process that has gone is left"
+[[ -d build/.abla-compile-globals-$alive-ct ]] || fail "a running process's compile-time scratch directory was removed"
 [[ -e build/.abla-build-transaction-$alive/0.data ]] || fail "a running process's transaction was removed"
 [[ -d build/.abla-compile-outputs-$alive ]] || fail "a running process's scratch directory was removed"
 kill "$alive"
@@ -186,6 +192,8 @@ kill "$alive"
 build other other
 [[ -z $(compgen -G "build/.abla-build-transaction-*") ]] || fail "an old transaction is left once its process has gone"
 [[ ! -e build/.abla-compile-outputs-$alive ]] || fail "a scratch directory is left once its process has gone"
+[[ ! -e build/.abla-compile-globals-$alive-ct ]] ||
+    fail "a compile-time scratch directory is left once its process has gone"
 
 build two app
 for output in "${outputs[@]}"; do
