@@ -162,7 +162,10 @@ expected_status() { # mode name
 # Builds and runs one program in its case directory; writes <tag>.out (stdout of
 # the compiler, then of the program, then the exit status) and <tag>.err.
 build_and_run() { # dir tag entry mode
-    local dir=$1 tag=$2 entry=$3 mode=$4 status
+    local dir=$1 tag=$2 entry=$3 mode=$4 status flags=$build_flags
+    # A case that tests flat name resolution says so in a line `// imports: flat` and builds flat, as every other
+    # harness that builds it does (tests/abla-tests.json passes --flat-imports).
+    if grep -qx '// imports: flat' "$dir/$entry"; then flags="$flags --flat-imports"; fi
     (
         cd "$dir" || exit 1
         # Through the runner, whatever $compiler is: a bare compiler binary
@@ -174,7 +177,7 @@ build_and_run() { # dir tag entry mode
         # compiler's, and the harness's may be a pipe that never ends.
         ABLA_NO_SIDECAR=1 \
         ABLA_COMPILE_EVAL=$mode ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-4096} \
-            limited "$compiler" build "$entry" -o "$tag.program" --no-cache $build_flags \
+            limited "$compiler" build "$entry" -o "$tag.program" --no-cache $flags \
             >"$tag.compiler.out" 2>"$tag.err" </dev/null
     )
     status=$?
