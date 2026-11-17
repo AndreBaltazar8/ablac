@@ -340,6 +340,7 @@ mmap form) apply there.
   compiler's raw IR, 2.19% of abla-one's, 0.19% of the frozen NovaKind tool) therefore stays the best estimate of what
   method-level demand would remove in real programs, below the 5% bar, and the item stays a no-go until a program is
   found whose dead methods carry a large dependency (the probe's shape).
+  Decided no-go again 2026-11-16 (lead): the numbers above are the measurement; nothing was re-measured or implemented.
 - [ ] Once during `make test` (2026-11-01), `tools/test-ct.sh` saw `python3: No such file or directory`
       and `suite-package-providers` failed to resolve a local git dependency, with neither recurring
       in the next runs. Suspected: the Nix profile changing mid-run. Not confirmed, but during a `home-manager switch`
@@ -1330,6 +1331,18 @@ mmap form) apply there.
   that fills the used-assignment, delegated-name, effect-local and callers tables together; (3) `bootstrapEmitLlvmProgramPrepared`
   and the LLVM module build (19.5% of a small build, a third of it inside libLLVM: `LLVMVerifyModule`, `setValueName`).
   A change here must give byte-identical IR on the compiler's own source and a few suite cases.
+  Re-profiled 2026-11-16 (master `5dc81c4c`, stage 2, `instructions:u`, one core): frontend (`--emit-llvm`) 3.73 G for
+  `http-event` (61% of its `--fast` build, 18% of release), 8.52 G for abla-one's `gallery/web` (76% / 22%), 76.6 G for the
+  self-build. So `--fast`, `run`, `serve` and the suite are frontend-bound; release builds are LLVM-bound. A `build --fast`
+  discards LLVM value names already (`src/backend/llvm/core.ab`), so name discarding gains nothing there.
+  *Permanent regions for the AST and IR: measured, not worth it.* The compiler's collections run through
+  `__ablaRuntimeHostBackgroundSweep` (`orc_main.ab` turns background freeing on; `HeapStat` 5/6 are not collection counters).
+  A scratch build stamped every object live at `parse.normalize.end` and counted the marked bytes of each later collection:
+  the self-build collects only 7 times in all (5 after the stamp); the stamped (parsed and normalized) objects are
+  ~95 MB of the 188-470 MB each collection marks (44%, 50%, 34%, 20%; 33% of the 1,440 MB marked in total). `http-event
+  --fast` collects once, marking 24 MB, 12.5 MB of it stamped. Mark and sweep are about 11% of the frontend, so skipping
+  the stamped third saves ~3-4% of the self-build frontend and ~2% of a small `--fast` build, for a collector change under
+  the memory-peak rule. Not done. Scratch build: counters in `BackgroundSweep` and `HeapStat` 22-24/29, not kept.
   *The release preparation pipeline* (`BOOTSTRAP_COMPILER_RELEASE_PASSES`, the serial `opt` that is 26 s of the 47 s
   self-build; tried and declined 2026-11-15, nothing landed). Method: a variant of the constant, built as X1 (the
   current compiler builds the tree) and X2 (X1 builds it again, so X2 is "built with the variant"); the benefit is X2's
