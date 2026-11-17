@@ -32,6 +32,12 @@ than merging unrelated programs into one namespace. This first profile is the
 native hosted runtime graph, not a cross-target project configuration service.
 
 Snapshots retain `revision`, `documents`, symbols, occurrences and diagnostics.
+Additional fields are `analysisMode`, `entry`, `complete` and `pending`.
+A scope error uses `issues` and an empty document list. Ranges are UTF-8 byte
+offsets in the returned original source, including UTF-8 comments and source
+rewrites. Symbol identities come from compiler declaration/scope identities,
+not cross-file spelling matches. Contract-only imports expose the projected
+public signatures, not implementation locals or private declarations.
 
 An occurrence names the declaration it means (`declarationId`) in three ways: sema records the names it looks a value up by (functions, methods,
 fields, locals, variables); a type written as text (`s: Square`, `Square(2)`, `: Shape`, `Box<Item>`) names the one class, interface, enum or
@@ -49,12 +55,11 @@ its `append` finds the calls), and a program that declares a type of the same na
 handles by itself (`bootstrapBuiltinMemberKey`) and the service translates them to the module's declarations, in graph-v1 and graph-v2 alike.
 `tools/test-builtin-docs.sh` keeps the module and the compiler in step: a member sema accepts on a built-in receiver and the module does not
 declare, a declaration the compiler rejects, and a type the table of types in docs/language.md lists and the module does not declare each fail it.
-Additional fields are `analysisMode`, `entry`, `complete` and `pending`.
-A scope error uses `issues` and an empty document list. Ranges are UTF-8 byte
-offsets in the returned original source, including UTF-8 comments and source
-rewrites. Symbol identities come from compiler declaration/scope identities,
-not cross-file spelling matches. Contract-only imports expose the projected
-public signatures, not implementation locals or private declarations.
+
+A symbol carries the comment above its declaration as `documentation` (a string, absent when there is none): the `/** ... */` block directly above it,
+or the run of `//` lines directly above it, as plain text (the comment markers and one blank after them left out; annotation lines between the comment and the
+declaration do not end it, a blank line does). A class's constructor fields, which are declared inside the parentheses, are documented the same way. A client
+shows it where it shows the declaration (abla-lsp's hover does), so the standard library's and the built-ins' comments reach the editor.
 
 ## Stable declaration ids (graph-v2)
 

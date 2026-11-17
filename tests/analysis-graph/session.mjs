@@ -539,6 +539,68 @@ async function fieldAssign(mode) {
     await s.close();
 }
 
+// A symbol carries the comment above its declaration as `documentation`: a `/** ... */` block, or a run of `//` lines with no blank line
+// between it and the declaration (annotation lines in between do not end it); constructor fields too.
+async function documentation(mode) {
+    const main = [
+        '/** Adds one.',
+        ' * More text.',
+        ' */',
+        'fun inc(n: int): int = n + 1',
+        '',
+        '// A line comment',
+        '// over two lines.',
+        'fun dec(n: int): int = n - 1',
+        '',
+        '// separated by a blank line',
+        '',
+        'fun plain(): int = 0',
+        '',
+        '/** A class. */',
+        'class Box(',
+        '    /** The held value. */',
+        '    val value: int,',
+        '    val bare: int',
+        ') {',
+        '    /** Doubles. */',
+        '    fun twice(): int = value * 2',
+        '    fun same(): int = value',
+        '}',
+        '',
+        '/** Annotated. */',
+        '@noinline',
+        'fun annotated(): int = 1',
+        '',
+        'fun main: int = inc(1) + dec(2) + plain() + annotated() + Box(1, 2).twice()',
+        '',
+    ].join('\n');
+    const p = fixture(`documentation-${mode}`, { 'main.ab': main });
+    const s = await start(p, { mode });
+    const a = await s.analyze();
+    noErrors(a);
+    const d = doc(a, path.join(p, 'main.ab'));
+    const docOf = (name) => d.symbols.find((x) => x.name === name)?.documentation;
+    assert.equal(docOf('inc'), 'Adds one.\nMore text.');
+    assert.equal(docOf('dec'), 'A line comment\nover two lines.');
+    assert.equal(docOf('plain'), undefined, 'a blank line ends the comment');
+    assert.equal(docOf('Box'), 'A class.');
+    assert.equal(docOf('value'), 'The held value.');
+    assert.equal(docOf('bare'), undefined);
+    assert.equal(docOf('twice'), 'Doubles.');
+    assert.equal(docOf('same'), undefined);
+    assert.equal(docOf('annotated'), 'Annotated.');
+    assert.equal(docOf('main'), undefined);
+    // the standard library's and the built-ins' comments come with their declarations
+    const stub = a.documents.find((x) => x.uri.endsWith('/stdlib/abla/builtins/declarations.ab'));
+    assert.equal(stub.symbols.find((x) => x.name === 'append').documentation, 'Adds `value` at the end.');
+    assert.equal(stub.symbols.find((x) => x.name === 'size' && x.kind === 'property').documentation.length > 0, true);
+    // hover returns the symbol, so it carries the documentation
+    const call = d.occurrences.find((o) => o.name === 'inc' && o.declarationId);
+    const hover = (await s.rpc('query/hover', { uri: d.uri, offset: call.range.start })).result.value;
+    assert.equal(hover.symbol.documentation, 'Adds one.\nMore text.');
+    await s.close();
+}
+
 async function projections() {
     let p = fixture('projections', { 'main.ab': '// café 😀\nimport "dep.ab"\nfun main: int = answer()\n', 'dep.ab': 'fun answer: int = 42\n' });
     let s = await start(p);
@@ -871,7 +933,7 @@ async function since() {
     await legacy.close();
 }
 
-const tests = { field_assign: () => fieldAssign('graph-v1'), field_assign_v2: () => fieldAssign('graph-v2'), builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
+const tests = { documentation: () => documentation('graph-v1'), documentation_v2: () => documentation('graph-v2'), field_assign: () => fieldAssign('graph-v1'), field_assign_v2: () => fieldAssign('graph-v2'), builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
 const filter = process.env.ANALYSIS_TEST_FILTER ? process.env.ANALYSIS_TEST_FILTER.split(',') : null;
 for (const [name, test] of Object.entries(tests)) {
     if (filter && !filter.includes(name)) continue;
