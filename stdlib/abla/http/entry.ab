@@ -529,6 +529,78 @@ fun httpCoreHeaderTokenContains(value: string, wanted: string): bool {
     matched
 }
 
+// Whether `input[begin, end)` is what may follow a chunk size on its line: nothing, or extensions `;name`, `;name=token`
+// and `;name="quoted string"` (RFC 9112 7.1.1, tabs and spaces allowed after a semicolon). A bare CR, any other control
+// byte, an empty name or a value that is neither a token nor a quoted string makes the chunked body malformed: a peer
+// that ends the line at a bare CR or LF reads the bytes after it as something else.
+fun httpChunkExtensionsValid(input: string, begin: int, end: int): bool {
+    var at = begin
+    var valid = true
+    while (valid && at < end) {
+        if (input[at] != 59) {
+            valid = false
+        } else {
+            at = at + 1
+            while (at < end && (input[at] == 32 || input[at] == 9)) at = at + 1
+            val nameBegin = at
+            while (at < end && httpTokenByte(input[at])) at = at + 1
+            if (at == nameBegin) valid = false
+            else if (at < end && input[at] == 61) {
+                at = at + 1
+                if (at < end && input[at] == 34) {
+                    at = at + 1
+                    var closed = false
+                    while (valid && !closed) {
+                        if (at >= end) {
+                            valid = false
+                        } else {
+                            val byte = input[at]
+                            if (byte == 34) {
+                                closed = true
+                                at = at + 1
+                            } else if (byte == 92) {
+                                at = at + 1
+                                if (at >= end || (input[at] < 32 && input[at] != 9) || input[at] == 127) valid = false
+                                else at = at + 1
+                            } else if ((byte < 32 && byte != 9) || byte == 127) {
+                                valid = false
+                            } else {
+                                at = at + 1
+                            }
+                        }
+                    }
+                } else {
+                    val valueBegin = at
+                    while (at < end && httpTokenByte(input[at])) at = at + 1
+                    if (at == valueBegin) valid = false
+                }
+            }
+        }
+    }
+    valid
+}
+
+// Whether `input[begin, end)` (one line of a chunked body's trailer section, without its CRLF) is a field line a recipient
+// may read: a token name, a colon and a value of visible characters, spaces, tabs and bytes over 127. A folded line (one
+// that starts with a space or tab), a line without a colon, a control byte, and the fields that frame a message
+// (Content-Length, Transfer-Encoding) are not (RFC 9110 6.5.1: they must not be sent in a trailer, and are never applied).
+fun httpTrailerLineValid(input: string, begin: int, end: int): bool {
+    var at = begin
+    while (at < end && httpTokenByte(input[at])) at = at + 1
+    var valid = at > begin && at < end && input[at] == 58
+    if (valid) {
+        val name = input.slice(begin, at)
+        if (httpAsciiEqualInsensitive(name, "Content-Length") || httpAsciiEqualInsensitive(name, "Transfer-Encoding")) valid = false
+        at = at + 1
+        while (valid && at < end) {
+            val byte = input[at]
+            if ((byte < 32 && byte != 9) || byte == 127) valid = false
+            at = at + 1
+        }
+    }
+    valid
+}
+
 fun httpCoreDecodeChunked(
     input: string,
     maximumBody: int = 1048576
@@ -548,17 +620,20 @@ fun httpCoreDecodeChunked(
             val length = httpCoreHexLength(
                 input.slice(offset, extension), maximumBody - output.size
             )
-            if (length < 0) valid = false
+            if (length < 0 || !httpChunkExtensionsValid(input, extension, lineEnd)) valid = false
             else if (length == 0) {
                 var trailerEnd = -1
                 var cursor = lineEnd + 2
-                while (trailerEnd < 0 && cursor + 1 < input.size) {
+                while (valid && trailerEnd < 0 && cursor + 1 < input.size) {
                     if (input[cursor] == 13 && input[cursor + 1] == 10) {
                         trailerEnd = cursor + 2
                     } else {
                         val next = httpLineEnd(input, cursor)
                         if (next >= input.size) cursor = input.size
-                        else cursor = next + 2
+                        else {
+                            if (!httpTrailerLineValid(input, cursor, next)) valid = false
+                            cursor = next + 2
+                        }
                     }
                 }
                 if (trailerEnd >= 0) {
