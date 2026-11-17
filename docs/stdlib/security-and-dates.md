@@ -439,9 +439,9 @@ fun main {
 | `utcMilliseconds(year, month, day, hour = 0, minute = 0, second = 0, millisecond = 0)` | the time of a civil date |
 | `utcDate(milliseconds)` | a `UtcDate(year, month, day, hour, minute, second, millisecond, weekday)`: month 1-12, day 1-31, weekday 0 (Sunday) to 6 |
 | `date.milliseconds()`, `date.dayOfYear()` | back to a time; the day number (1-366) |
-| `date.isoDate()`, `date.isoTime()`, `date.iso8601()`, `utcIso8601(ms)` | `2024-02-29`, `13:05:09.000`, `2024-02-29T13:05:09.000Z` |
+| `date.isoDate()`, `date.isoTime()`, `date.iso8601()`, `utcIso8601(ms)` | `2024-02-29`, `13:05:09.000`, `2024-02-29T13:05:09.000Z`; a year outside 0000 to 9999 is written as JavaScript does, with a sign and six digits (`-000001-12-31T23:59:59.999Z`, `+010000-01-01T00:00:00.000Z`) |
 | `date.httpDate()`, `httpDate(ms)` | `Thu, 29 Feb 2024 13:05:09 GMT` |
-| `utcIso8601Parse(text)`, `httpDateParse(text)` | `int?`: the time, or `null` for invalid text |
+| `utcIso8601Parse(text)`, `httpDateParse(text)` | `int?`: the time, or `null` for invalid text; `utcIso8601Parse` also reads the signed six-digit years `iso8601()` writes (`-000000` is not a year), `httpDateParse` only four-digit years |
 | `dateLeapYear(year)`, `dateDaysInMonth(year, month)`, `dateWeekdayName(weekday)`, `dateMonthName(month)` | calendar facts |
 
 The current time comes from `utcNow()` in `abla/process/time`

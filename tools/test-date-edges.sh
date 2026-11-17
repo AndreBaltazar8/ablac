@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # abla/date against Node's Date (tests/cases/date-edges): 728 instants (the epoch and its neighbours, day, leap-year and
 # century boundaries, years 0, 1, 9999, 10000 and the extremes of JS's range, and 500 pseudo-random ones) give the same
-# civil fields, weekday and day of the year as Date's getUTC* methods and, for years 0..9999, the text JS writes; a
+# civil fields, weekday and day of the year as Date's getUTC* methods and the text JS writes (a year outside 0..9999 as a sign and
+# six digits); a
 # time rebuilt from the fields, and the formatted text parsed back, give the time; 1309 ISO 8601 texts (valid
 # and invalid dates, 24:00, 60 minutes, short and long fractions, offsets, spaces, lower case, other digits) and 26 HTTP dates
 # parse to what an independent check in JS says or are refused. The results are recorded in cases.expected so that the test

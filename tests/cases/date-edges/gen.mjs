@@ -34,8 +34,9 @@ const fields = (t) => {
 for (const t of unique) {
     const f = fields(t);
     const inRange = f.y >= 0 && f.y <= 9999;
-    const iso = inRange ? `${pad(f.y, 4)}-${pad(f.mo, 2)}-${pad(f.d, 2)}T${pad(f.h, 2)}:${pad(f.mi, 2)}:${pad(f.s, 2)}.${pad(f.ms, 3)}Z` : "-";
-    const http = inRange ? `${names[f.wd]}, ${pad(f.d, 2)} ${months[f.mo - 1]} ${pad(f.y, 4)} ${pad(f.h, 2)}:${pad(f.mi, 2)}:${pad(f.s, 2)} GMT` : "-";
+    const year = inRange ? pad(f.y, 4) : (f.y < 0 ? "-" : "+") + pad(Math.abs(f.y), 6);
+    const iso = `${year}-${pad(f.mo, 2)}-${pad(f.d, 2)}T${pad(f.h, 2)}:${pad(f.mi, 2)}:${pad(f.s, 2)}.${pad(f.ms, 3)}Z`;
+    const http = `${names[f.wd]}, ${pad(f.d, 2)} ${months[f.mo - 1]} ${year} ${pad(f.h, 2)}:${pad(f.mi, 2)}:${pad(f.s, 2)} GMT`;
     lines.push(`t ${t} ${f.y} ${f.mo} ${f.d} ${f.h} ${f.mi} ${f.s} ${f.ms} ${f.wd} ${f.doy} ${iso} ${http.replace(/ /g, "_")}`);
 }
 // civil dates -> milliseconds, valid and invalid (invalid ones must be null from the parsers; utcMilliseconds is only for valid dates)
@@ -60,6 +61,18 @@ for (const [y, m, d] of dateTexts) {
     }
 }
 for (const bad of ["", "2024", "2024-1-1", "2024-01-1", "24-01-01", "2024/01/01", "2024-01-01T", "2024-01-01T00:00", "2024-01-01T00:00:00", "2024-01-01 00:00:00Z", "2024-01-01t00:00:00Z", "2024-01-01T00:00:00z", "2024-01-01T00:00:00+00:00", "2024-01-01T00:00:00.1Z", "2024-01-01T00:00:00.12Z", "2024-01-01T00:00:00.1234Z", "2024-01-01T00:00:00.Z", "2024-01-01T00:00:00,123Z", "2024-01-01T00:00:00Z ", " 2024-01-01", "2024-01-01\n", "2024-01-01T00:00:00ZZ", "+2024-01-01", "-0001-01-01", "2024-01-0a", "2024-0a-01", "２０２４-01-01", "2024-01-01T0a:00:00Z", "2024-01-01T00:00:00.00aZ", "20240101", "20240101T000000Z"]) parseCases.push([bad, "null"]);
+// ES2015's expanded-year form, checked strictly (V8's Date.parse falls back to lenient legacy parsing for other shapes).
+const strictExpanded = (text) => {
+    const m = /^([+-])(\d{6})-(\d\d)-(\d\d)(?:T(\d\d):(\d\d):(\d\d)(?:\.(\d{3}))?Z)?$/.exec(text);
+    if (!m) return "null";
+    const year = (m[1] === "-" ? -1 : 1) * Number(m[2]);
+    if (m[1] === "-" && Number(m[2]) === 0) return "null";
+    const [mo, d, h, mi, sec, ms] = [m[3], m[4], m[5] ?? "0", m[6] ?? "0", m[7] ?? "0", m[8] ?? "0"].map(Number);
+    if (mo < 1 || mo > 12 || h > 23 || mi > 59 || sec > 59) return "null";
+    const t = new Date(0); t.setUTCFullYear(year, mo - 1, d); t.setUTCHours(h, mi, sec, ms);
+    return t.getUTCDate() === d && t.getUTCMonth() === mo - 1 && t.getUTCFullYear() === year ? String(t.getTime()) : "null";
+};
+for (const text of ["+010000-01-01T00:00:00.000Z", "-000001-12-31T23:59:59.999Z", "+275760-09-13T00:00:00.000Z", "-271821-04-20T00:00:00.000Z", "+010000-01-01", "-000001-01-01", "+010000-01-01T00:00:00Z", "-000000-01-01T00:00:00.000Z", "-000000-01-01", "+002024-01-01T00:00:00.000Z", "+000000-01-01T00:00:00.000Z", "+10000-01-01T00:00:00.000Z", "+0100000-01-01T00:00:00.000Z", "+010000-1-01", "+010000-02-30", "-000004-02-29", "-000001-02-29", "+010000-01-01T24:00:00.000Z", "+01000a-01-01", "-0001-01-01", "+0001-01-01"]) parseCases.push([text, strictExpanded(text)]);
 const http = [];
 const httpGood = [0, 951782400000, 1709164800000, 1583020800000, 253402300799000, -2208988800000, 86399000, -1000, 1234567890000];
 for (const t of httpGood) { const f = fields(t); http.push([`${names[f.wd]}, ${pad(f.d, 2)} ${months[f.mo - 1]} ${pad(f.y, 4)} ${pad(f.h, 2)}:${pad(f.mi, 2)}:${pad(f.s, 2)} GMT`, String(t)]); }
@@ -76,11 +89,11 @@ fun cases(): array<string> {
     for (t in times()) {
         val d = utcDate(t)
         val inRange = d.year >= 0 && d.year <= 9999
-        val iso = if (inRange) d.iso8601() else "-"
-        val http = if (inRange) flat(d.httpDate()) else "-"
+        val iso = d.iso8601()
+        val http = flat(d.httpDate())
         // the fields rebuilt into a time, and the formatted text parsed back, must give the time
         var back = if (d.milliseconds() == t) "" else " MILLISECONDS-DIFFER"
-        if (inRange && utcIso8601Parse(iso) != t) back = back + " ISO-ROUNDTRIP-DIFFERS"
+        if (utcIso8601Parse(iso) != t) back = back + " ISO-ROUNDTRIP-DIFFERS"
         if (inRange && d.millisecond == 0 && httpDateParse(d.httpDate()) != t) back = back + " HTTP-ROUNDTRIP-DIFFERS"
         out.append("t \${t} \${d.year} \${d.month} \${d.day} \${d.hour} \${d.minute} \${d.second} \${d.millisecond} \${d.weekday} \${d.dayOfYear()} \${iso} \${http}\${back}")
     }
