@@ -166,4 +166,21 @@ for name in main message; do
     fi
 done
 
+# Steps that pass the limit by more than one before a check (a range's elements, 40 calls deep) still report the
+# step limit, once, wherever the limit falls: recorded only at limit + 1, the build said a bare E_EVAL_EXPRESSION.
+for limit in 2000 2001 2002 2003; do
+    log="$output_directory/past-limit-$limit.out"
+    set +e
+    ABLA_COMPILE_EVAL=interp ABLA_EVAL_STEP_LIMIT=$limit "$compiler" --emit-llvm \
+        "$project_root/tests/cases/eval-steps/past-limit.ab" > "$log" 2>&1
+    status=$?
+    set -e
+    if [[ $status -ne 1 || $(grep -c '^error\[' "$log") -ne 1 ]] ||
+        ! grep -Fq "error[E_EVAL_STEP_LIMIT]: compile-time evaluation ran past $limit steps" "$log"; then
+        echo "eval-steps: past-limit.ab at $limit steps did not report the step limit, once" >&2
+        cat "$log" >&2
+        exit 1
+    fi
+done
+
 echo "eval-steps: the program takes exactly $steps compile-time steps; the limit stops evaluation"
