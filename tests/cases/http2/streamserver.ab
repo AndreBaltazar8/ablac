@@ -1,0 +1,156 @@
+// A server with streaming routes (abla/http/event/tls: streamRoute, HttpStreamHandler) for tools/test-http2-stream-server.sh. One exchange at a time per route is assumed (the handlers keep their
+// state in fields).
+//   streamserver <port or 0> [certificate.pem private-key.pem] [idle <milliseconds>]
+//   POST /echo    answers 200 at once and writes every piece of the request body back as it arrives (pausing the request while the answer cannot take more), ends when the request does
+//   POST /sink    reads the request body without keeping it and answers "received <bytes>\n" when it ends
+//   GET  /big?n=N answers N bytes of a pattern (content-length N), writing as the client takes them
+//   GET  /events  five server-sent events, then ends
+//   POST /stall   pauses the request body at the first piece and never resumes: the client stalls after one window; the idle timeout ends the exchange
+//   POST /limited like /sink with a body limit of 100000 bytes
+// Anything else: "hello h2\n" (the buffered handler). Prints "listening <port>" and, for each aborted exchange, "abort <path> <reason>".
+import "abla/io"
+import "abla/http"
+import "abla/http/event"
+import "abla/http/event/tls"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/sys/linux/net"
+import "abla/tls/pure/server"
+import "abla/integer"
+import "abla/text"
+
+fun answer(request: HttpRequest): HttpResponse = HttpResponse(200, [HttpHeader("Content-Type", "text/plain")], "hello h2\n")
+
+fun textHeaders(): array<HttpHeader> = [HttpHeader("content-type", "application/octet-stream")]
+
+class EchoHandler : HttpStreamHandler {
+    fun onRequest(exchange: HttpStreamExchange): HttpStreamStep = HttpStreamStep(respond = true, status = 200, headers = textHeaders())
+    fun onData(exchange: HttpStreamExchange, chunk: string): HttpStreamStep =
+        // What does not fit in the response is kept by the server and the request waits until it is out.
+        HttpStreamStep(write = chunk, pause = HTTP_STREAM_PAUSE_FOR_ROOM)
+    fun onEnd(exchange: HttpStreamExchange, trailers: array<HttpHeader>): HttpStreamStep = HttpStreamStep(finish = true)
+    fun onWritable(exchange: HttpStreamExchange): HttpStreamStep = HttpStreamStep()
+    fun onAbort(exchange: HttpStreamExchange, reason: string): void {
+        println("abort ${exchange.path} $reason")
+        return
+    }
+}
+
+class SinkHandler(var received: int) : HttpStreamHandler {
+    fun onRequest(exchange: HttpStreamExchange): HttpStreamStep {
+        this.received = 0
+        HttpStreamStep()
+    }
+    fun onData(exchange: HttpStreamExchange, chunk: string): HttpStreamStep {
+        this.received = this.received + chunk.size
+        HttpStreamStep()
+    }
+    fun onEnd(exchange: HttpStreamExchange, trailers: array<HttpHeader>): HttpStreamStep {
+        val body = "received ${this.received}\n"
+        HttpStreamStep(respond = true, status = 200, headers = textHeaders(), length = body.size, write = body, finish = true)
+    }
+    fun onWritable(exchange: HttpStreamExchange): HttpStreamStep = HttpStreamStep()
+    fun onAbort(exchange: HttpStreamExchange, reason: string): void {
+        println("abort ${exchange.path} $reason")
+        return
+    }
+}
+
+class BigHandler(var left: int) : HttpStreamHandler {
+    fun piece(room: int): string {
+        var size = if (this.left < 65536) this.left else 65536
+        if (size > room) size = room
+        if (size <= 0) return ""
+        this.left = this.left - size
+        "0123456789abcdef".repeat(4096).slice(0, size)
+    }
+    fun onRequest(exchange: HttpStreamExchange): HttpStreamStep {
+        this.left = decimal(queryValue(exchange.query, "n"))
+        val first = this.piece(65536)
+        HttpStreamStep(respond = true, status = 200, headers = textHeaders(), length = first.size + this.left, write = first, finish = this.left == 0, wantWritable = this.left > 0)
+    }
+    fun onData(exchange: HttpStreamExchange, chunk: string): HttpStreamStep = HttpStreamStep()
+    fun onEnd(exchange: HttpStreamExchange, trailers: array<HttpHeader>): HttpStreamStep = HttpStreamStep()
+    fun onWritable(exchange: HttpStreamExchange): HttpStreamStep {
+        val next = this.piece(exchange.room)
+        HttpStreamStep(write = next, finish = this.left == 0, wantWritable = this.left > 0)
+    }
+    fun onAbort(exchange: HttpStreamExchange, reason: string): void {
+        println("abort ${exchange.path} $reason")
+        return
+    }
+}
+
+class EventsHandler : HttpStreamHandler {
+    fun onRequest(exchange: HttpStreamExchange): HttpStreamStep {
+        var events = ""
+        for (i in 0 until 5) events = events + "data: event $i\n\n"
+        HttpStreamStep(respond = true, status = 200, headers = [HttpHeader("content-type", "text/event-stream")], write = events, finish = true)
+    }
+    fun onData(exchange: HttpStreamExchange, chunk: string): HttpStreamStep = HttpStreamStep()
+    fun onEnd(exchange: HttpStreamExchange, trailers: array<HttpHeader>): HttpStreamStep = HttpStreamStep()
+    fun onWritable(exchange: HttpStreamExchange): HttpStreamStep = HttpStreamStep()
+    fun onAbort(exchange: HttpStreamExchange, reason: string): void {
+        println("abort ${exchange.path} $reason")
+        return
+    }
+}
+
+class StallHandler : HttpStreamHandler {
+    fun onRequest(exchange: HttpStreamExchange): HttpStreamStep = HttpStreamStep()
+    fun onData(exchange: HttpStreamExchange, chunk: string): HttpStreamStep = HttpStreamStep(pause = HTTP_STREAM_PAUSE)
+    fun onEnd(exchange: HttpStreamExchange, trailers: array<HttpHeader>): HttpStreamStep = HttpStreamStep()
+    fun onWritable(exchange: HttpStreamExchange): HttpStreamStep = HttpStreamStep()
+    fun onAbort(exchange: HttpStreamExchange, reason: string): void {
+        println("abort ${exchange.path} $reason")
+        return
+    }
+}
+
+fun decimal(text: string): int {
+    var value = 0
+    for (i in 0 until text.size) value = value * 10 + (text[i] - 48)
+    value
+}
+
+fun queryValue(query: string, name: string): string {
+    for (pair in query.split("&")) {
+        val at = pair.indexOf("=")
+        if (at > 0 && pair.slice(0, at) == name) return pair.slice(at + 1, pair.size)
+    }
+    ""
+}
+
+fun main: int {
+    val port = processArgument(0).parseInt()
+    if (port == null) return 2
+    var tls: TlsServerConfig? = null
+    var idle = 30000
+    var i = 1
+    while (i < processArgumentCount()) {
+        if (processArgument(i) == "idle") {
+            val value = processArgument(i + 1).parseInt()
+            if (value != null) idle = value
+            i = i + 2
+        } else i = i + 1
+    }
+    if (processArgumentCount() >= 3 && processArgument(1) != "idle") {
+        tls = httpsEventServerTls(processArgument(1), processArgument(2))
+        if (tls == null) {
+            println("certificate or key failed to load")
+            return 1
+        }
+    }
+    val limits = httpEventServerOptions()
+    val base = HttpEventServerOptions(limits.maximumConnections, limits.maximumHeaderBytes, limits.maximumBodyBytes, limits.maximumPendingBytes, limits.maximumRequestsPerConnection,
+        idle, limits.gzipMinimumBytes, limits.drainTimeoutMilliseconds)
+    var server = httpsEventServerHandler(answer, ipv4Loopback(port), tls, HttpsEventServerOptions(base = base))
+    server.streamRoute("POST", "/echo", EchoHandler())
+    server.streamRoute("POST", "/sink", SinkHandler(0))
+    server.streamRoute("GET", "/big", BigHandler(0))
+    server.streamRoute("GET", "/events", EventsHandler())
+    server.streamRoute("POST", "/stall", StallHandler())
+    server.streamRoute("POST", "/limited", SinkHandler(0), 100000)
+    println("listening ${server.port()}")
+    server.run()
+}

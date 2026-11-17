@@ -1,5 +1,5 @@
 // The streaming API of abla/http/async (getStream, requestStream, writeBody, finishBody, readStream, takeStreamEvents) over HTTP/2 against real servers (tools/test-http2-stream.sh):
-//   streamnet <port> <certificate.pem or "-" for h2c> <mode> <bytes> <path> [h1]   (h1: HTTP/1.1; modes down, up, upchunked (a request body of unknown length), slow)
+//   streamnet <port> <certificate.pem or "-" for h2c> <mode> <bytes> <path> [h1]   (h1: HTTP/1.1; modes down, up, upchunked (a request body of unknown length), slow, echo (write and read back at once), upstall (a body nobody takes: stalls, then the server ends it))
 //   down   GET /gig.bin (a file of <bytes> zero bytes served by h2o): read in pieces with readStream, every byte counted and zero; a first phase where nothing is read for 600 ms: what waits
 //          never exceeds one stream window (262144), the peer is stalled, not buffered; then the rest. The process' resident memory stays far below <bytes> (peak printed).
 //   up     POST <path> (an existing file of nghttpd, which reads the body and answers with the file) with <bytes> written in 64 KiB pieces as writeBody takes them (0 means wait for WRITABLE), then finishBody; the answer is read (END waits for its last byte): the response is
@@ -18,6 +18,7 @@ import "abla/text"
 
 var failures = 0
 var peak = 0
+var patternMode = -1
 
 fun fail(what: string): void {
     failures = failures + 1
@@ -43,9 +44,16 @@ fun round(var client: HttpAsyncClient, milliseconds: int): array<HttpAsyncStream
     client.takeStreamEvents()
 }
 
-fun zeros(text: string): bool {
+/** The bytes of a download are zeros (a sparse file) or the repeating pattern "0123456789abcdef" (tests/cases/http2/streamserver.ab): the first byte says which; `at` is the offset of text. */
+fun expected(text: string, at: int): bool {
+    if (patternMode < 0 && text.size > 0) patternMode = if (text[0] != 0) 1 else 0
+    val pattern = patternMode == 1
     for (i in 0 until text.size) {
-        if (text[i] != 0) return false
+        if (pattern) {
+            val want = (at + i) % 16
+            val code = if (want < 10) 48 + want else 87 + want
+            if (text[i] != code) return false
+        } else if (text[i] != 0) return false
     }
     true
 }
@@ -81,7 +89,7 @@ fun down(var client: HttpAsyncClient, base: string, path: string, total: int): v
         }
         var piece = client.readStream(id, 65536)
         while (piece.size > 0) {
-            if (!zeros(piece)) fail("a non-zero byte in the download at $received")
+            if (!expected(piece, received)) fail("an unexpected byte in the download at $received")
             received = received + piece.size
             piece = client.readStream(id, 65536)
         }
@@ -160,6 +168,88 @@ fun up(var client: HttpAsyncClient, base: string, path: string, total: int, chun
     return
 }
 
+// A duplex exchange: the pattern is written as the stream takes it while the answer (the same bytes, echoed) is read as it comes. Neither side is buffered whole.
+fun echo(var client: HttpAsyncClient, base: string, path: string, total: int): void {
+    val id = client.requestStream("POST", "$base$path", [HttpHeader("Content-Type", "application/octet-stream")], -1, 30000)
+    val pattern = "0123456789abcdef".repeat(4097)
+    var sent = 0
+    var received = 0
+    var writable = false
+    var ended = false
+    var rounds = 0
+    val deadline = linuxMonotonicMilliseconds() + 300000
+    while (!ended && linuxMonotonicMilliseconds() < deadline) {
+        for (event in round(client, 20)) {
+            if (event.kind == HTTP_STREAM_WRITABLE) writable = true
+            else if (event.kind == HTTP_STREAM_END) ended = true
+            else if (event.kind == HTTP_STREAM_ERROR) {
+                fail("the echo failed: ${event.error} after $sent sent, $received received of $total")
+                return
+            }
+        }
+        var piece = client.readStream(id, 65536)
+        while (piece.size > 0) {
+            if (!expected(piece, received)) fail("an unexpected byte in the echo at $received")
+            received = received + piece.size
+            piece = client.readStream(id, 65536)
+        }
+        var more = writable && sent < total
+        while (more) {
+            val want = if (total - sent < 65536) total - sent else 65536
+            val taken = client.writeBody(id, pattern.slice(sent % 16, sent % 16 + want))
+            if (taken < 0) {
+                fail("writeBody: the stream is gone at $sent")
+                return
+            }
+            sent = sent + taken
+            if (taken < want) more = false
+            if (taken > 0 && sent >= total) {
+                client.finishBody(id)
+                more = false
+            }
+            if (taken == 0) more = false
+        }
+        rounds = rounds + 1
+        if (rounds % 64 == 0) sample()
+    }
+    sample()
+    if (!ended) fail("the echo did not end: sent $sent, received $received of $total")
+    if (received != total) fail("received $received of $total bytes")
+    return
+}
+
+// A request body to a handler that never takes it (POST /stall pauses at the first piece): the stream stalls after one window, so what is accepted stays within the stream window plus the client's own
+// cap, and the exchange ends by the server's idle timeout (an ERROR event) instead of growing without bound. `total` is the most the sender would write.
+fun upstall(var client: HttpAsyncClient, base: string, path: string, total: int): void {
+    val id = client.requestStream("POST", "$base$path", [HttpHeader("Content-Type", "application/octet-stream")], -1, 60000)
+    val piece = "u".repeat(65536)
+    var sent = 0
+    var writable = false
+    var failedAt = -1
+    val deadline = linuxMonotonicMilliseconds() + 60000
+    var error = ""
+    while (error == "" && linuxMonotonicMilliseconds() < deadline) {
+        for (event in round(client, 20)) {
+            if (event.kind == HTTP_STREAM_WRITABLE) writable = true
+            else if (event.kind == HTTP_STREAM_ERROR) error = event.error
+        }
+        var more = writable && sent < total
+        while (more) {
+            val taken = client.writeBody(id, piece)
+            if (taken < 0) more = false
+            else {
+                sent = sent + taken
+                if (taken < piece.size) more = false
+            }
+        }
+    }
+    sample()
+    if (error == "") fail("the stalled upload was never ended by the server (sent $sent bytes)")
+    if (sent > 1048576) fail("a handler that takes nothing was sent $sent bytes: more than a stream window plus the client's cap")
+    if (sent < 65536) fail("only $sent bytes were sent before the stall: the first window should go")
+    return
+}
+
 fun slow(var client: HttpAsyncClient, base: string, path: string, total: int): void {
     val id = client.getStream("$base$path", [], 30000)
     var started = false
@@ -213,6 +303,8 @@ fun main: int {
     if (mode == "down") down(client, base, path, total)
     else if (mode == "up" || mode == "upchunked") up(client, base, path, total, mode == "upchunked", h1)
     else if (mode == "slow") slow(client, base, path, total)
+    else if (mode == "echo") echo(client, base, path, total)
+    else if (mode == "upstall") upstall(client, base, path, total)
     else fail("unknown mode $mode")
     if (failures > 0) return 1
     println("http2 streamnet $mode ok (peak resident ${peak / 1024} KiB)")
