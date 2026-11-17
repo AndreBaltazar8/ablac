@@ -130,8 +130,10 @@ A package's modules are [strict](language.md#strict-imports) unless it says
 otherwise: each sees only its own declarations and what it imports
 (`visibility = "imports"` says so explicitly). `visibility = "flat"` (or the
 older `"program"`) keeps every name visible program-wide, the opt-out for a
-package not yet migrated; `ablac build --flat-imports` does the same for a
-package without the key. The
+package not yet migrated; `--flat-imports` (on `ablac build`, `test` or `run`)
+does the same for a package without the key. A repository whose scripts call
+the compiler many times sets `visibility = "flat"` in its abla.toml until its
+imports are added: the manifest reaches every one of those calls. The
 key belongs to the nearest manifest at or above a module, so a strict package
 can depend on a flat one and the other way round.
 

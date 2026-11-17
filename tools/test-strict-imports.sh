@@ -8,6 +8,8 @@
 set -euo pipefail
 
 compiler=${1:-build/ablac.bin}
+# Absolute: the `test` checks run from the output directory.
+[[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cases="$project_root/tests/cases/strict-imports"
 output_directory="$project_root/build/strict-imports"
@@ -58,6 +60,27 @@ rejected "$cases/flat/main.ab" --strict-imports \
 if grep -qF 'imports are strict by default' "$output_directory/asked.out"; then
     echo "strict-imports: --strict-imports, asked for, still names the opt-out"; exit 1
 fi
+# `ablac test` and `ablac run` take the modes too. (The flat program exits 42: under `test` it builds and fails by
+# its exit, and strict it fails to build.) A strict run doesn't take the object a flat run of the program cached.
+(cd "$output_directory" &&
+    "$compiler" test --flat-imports "$cases/flat/main.ab" > test-flat.out 2>&1 || true
+    grep -qF '(exit 42)' test-flat.out ||
+        { echo "strict-imports: test --flat-imports:"; cat test-flat.out; exit 1; }
+    "$compiler" test "$cases/flat/main.ab" > test-strict.out 2>&1 || true
+    grep -qF '(build)' test-strict.out && grep -qF '`bThing` is declared in' test-strict.out ||
+        { echo "strict-imports: test, strict by default:"; cat test-strict.out; exit 1; })
+set +e
+run_output=$("$compiler" run --flat-imports --cache-dir "$output_directory/run-cache" "$cases/flat/main.ab")
+run_status=$?
+set -e
+[[ $run_status == 42 && $run_output == "81 x/y" ]] ||
+    { echo "strict-imports: run --flat-imports exited $run_status, printed: $run_output"; exit 1; }
+if "$compiler" run --cache-dir "$output_directory/run-cache" "$cases/flat/main.ab" \
+    > "$output_directory/run-strict.out" 2>&1; then
+    echo "strict-imports: a strict run took the flat run's object"; exit 1
+fi
+grep -qF '`bThing` is declared in' "$output_directory/run-strict.out" ||
+    { echo "strict-imports: run, strict by default:"; cat "$output_directory/run-strict.out"; exit 1; }
 
 # Report, apply, and build strict.
 cp -R "$cases/flat" "$output_directory/fixed"

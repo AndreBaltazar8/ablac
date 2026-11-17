@@ -354,7 +354,9 @@ pure self-rebuild gate; options after the source are order-independent.
 A module whose package doesn't set `visibility` is [strict](language.md#strict-imports)
 by default; `build --flat-imports` builds those modules flat instead, the opt-out for code
 not yet migrated, and `--strict-imports` says the default explicitly (the mode is part of
-the cache identity). An `E_NAME_NOT_IMPORTED` in a module strict only by default has a
+the cache identity, a build's and `ablac run`'s). `ablac test` and `ablac run` take the same
+three modes. A repository whose scripts call the compiler many times sets `visibility = "flat"`
+in its abla.toml instead, which every one of those calls reads. An `E_NAME_NOT_IMPORTED` in a module strict only by default has a
 second `help:` line naming the opt-out. `build --strict-imports=warn` leaves those modules flat and prints,
 as a warning, each diagnostic `--strict-imports` would give them, with the
 same place and `help:` line: a name of a module they don't import, an

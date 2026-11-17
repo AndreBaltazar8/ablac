@@ -242,8 +242,9 @@ fun bootstrapRunBuilt(
     val staged = "$output.${linuxProcessId()}"
     bootstrapOrcBalanced = profile == "o1"
     bootstrapNativeSidecarRequest = 0
+    // (Uncached for `--strict-imports=warn`: its warnings come from the front end.)
     var status = bootstrapOrcBuild(
-        sourcePath, staged, profile == "fast", true,
+        sourcePath, staged, profile == "fast", !bootstrapStrictImportsWarn,
         bootstrapTargetDescriptor(bootstrapHostTargetName()), "executable"
     )
     for (suffix in [".abi.json", ".ll", ".o", ".host.o", ".runtime.o",
@@ -279,7 +280,8 @@ fun bootstrapRunBuilt(
 // takes the middle profile, between --fast and the release default.
 var bootstrapOrcBalanced = false
 
-// `ablac test <file.ab|directory>... [--fast] [--no-cache] [--cache-dir <dir>] [--each] [-v]`:
+// `ablac test <file.ab|directory>... [--fast] [--no-cache] [--cache-dir <dir>] [--each] [-v]
+//  [--strict-imports | --flat-imports | --strict-imports=warn]`:
 // builds the test programs (--o1, as `ablac run`; or --fast) into build/abla-test and runs
 // each. A test suite's time is mostly its programs running: abla-qr's tests built --fast
 // took 8.5 G instructions to build and their slowest ran 2,975 G; --o1, 25.7 G and 276 G
@@ -289,6 +291,20 @@ var bootstrapOrcBalanced = false
 // bundles, each run once per test in a process of its own); --each, or a single file,
 // builds every file on its own. -v lists each bundle's files and what fell back. 0 when
 // every test passed.
+/** Whether `value` is an import mode, which `ablac build`, `test` and `run` all take (and then sets it):
+ *  - `--strict-imports`: modules whose package doesn't set `visibility` see only their imports, the default
+ *    (#66 step 3) said explicitly;
+ *  - `--flat-imports`: they see every name the program declares, as before strict imports were the default;
+ *  - `--strict-imports=warn`: they stay flat, and what strict imports would report is printed as warnings, by the
+ *    front end (so the caller builds uncached). */
+fun bootstrapStrictImportsOption(value: string): bool {
+    if (value != "--strict-imports" && value != "--flat-imports" && value != "--strict-imports=warn") return false
+    bootstrapStrictImportsRequested = value == "--strict-imports"
+    bootstrapStrictImportsByDefault = false
+    bootstrapStrictImportsWarn = value == "--strict-imports=warn"
+    true
+}
+
 fun bootstrapOrcTest(argumentCount: int): int {
     val arguments: array<string> = []
     var useCache = true
@@ -303,7 +319,9 @@ fun bootstrapOrcTest(argumentCount: int): int {
         else if (value == "--no-cache") useCache = false
         else if (value == "--each") each = true
         else if (value == "-v" || value == "--verbose") verbose = true
-        else if (value == "--cache-dir" && option + 1 < argumentCount) {
+        else if (bootstrapStrictImportsOption(value)) {
+            if (bootstrapStrictImportsWarn) useCache = false
+        } else if (value == "--cache-dir" && option + 1 < argumentCount) {
             option = option + 1
             bootstrapCacheDirectoryRequest = linuxArgument(option)
         } else arguments.append(value)
@@ -1057,7 +1075,7 @@ fun bootstrapRepl(): int {
 
 fun bootstrapOrcUsage(): int {
     linuxPrintStandardError(
-        "usage: ablac build [<file.ab> | --project <dir>] [-o output] [--emit executable|object|static-library|shared-library] [--fast | --o1] [-g | --debug | --no-debug] [--no-cache] [--sidecar | --no-sidecar] [--offline] [--strict-imports | --flat-imports | --strict-imports=warn] [--visibility-report <file>] [--target <name> | --target-triple <triple> --object-format <elf|macho|coff|wasm>]\n       targets: ${bootstrapSupportedTargets()}\n       ablac package update [--project <dir>]\n       ablac package vendor [--project <dir>] [--offline]\n       ablac test <file.ab>... [--fast] [--no-cache] # build (--o1) and run test programs (abla/test)\n       ablac run [--o1 | --fast] [--built | --release] [--live | --no-live | --watch] [<file.ab> | --project <dir>] [--offline] [-- <program arguments>] # in-process LLVM ORC (--built: cached build, exec'd; live, its functions redefinable while it runs, by default on x86-64 Linux: --no-live opts out, --live asks elsewhere; --watch: live, reloaded when a source file changes)\n       ablac repl                                # persistent definitions + expressions\n       ablac serve [<file.ab> | --project <dir>] # watched fast-build service\n       ablac fmt [--check] [--width 100] <file.ab|directory|->...\n       ablac analyze --stdio                     # persistent JSON-lines analysis service\n       ablac --emit-llvm <file.ab>\n"
+        "usage: ablac build [<file.ab> | --project <dir>] [-o output] [--emit executable|object|static-library|shared-library] [--fast | --o1] [-g | --debug | --no-debug] [--no-cache] [--sidecar | --no-sidecar] [--offline] [--strict-imports | --flat-imports | --strict-imports=warn] [--visibility-report <file>] [--target <name> | --target-triple <triple> --object-format <elf|macho|coff|wasm>]\n       targets: ${bootstrapSupportedTargets()}\n       ablac package update [--project <dir>]\n       ablac package vendor [--project <dir>] [--offline]\n       ablac test <file.ab>... [--fast] [--no-cache] [--strict-imports | --flat-imports | --strict-imports=warn] # build (--o1) and run test programs (abla/test)\n       ablac run [--o1 | --fast] [--built | --release] [--live | --no-live | --watch] [--strict-imports | --flat-imports | --strict-imports=warn] [<file.ab> | --project <dir>] [--offline] [-- <program arguments>] # in-process LLVM ORC (--built: cached build, exec'd; live, its functions redefinable while it runs, by default on x86-64 Linux: --no-live opts out, --live asks elsewhere; --watch: live, reloaded when a source file changes)\n       ablac repl                                # persistent definitions + expressions\n       ablac serve [<file.ab> | --project <dir>] # watched fast-build service\n       ablac fmt [--check] [--width 100] <file.ab|directory|->...\n       ablac analyze --stdio                     # persistent JSON-lines analysis service\n       ablac --emit-llvm <file.ab>\n"
     )
     2
 }
@@ -1264,25 +1282,9 @@ fun main: int {
             } else if (value == "--no-sidecar") {
                 bootstrapNativeSidecarRequest = 0
                 0
-            } else if (value == "--strict-imports") {
-                // Modules whose package doesn't set `visibility` see only their imports: the default (#66 step 3),
-                // said explicitly.
-                bootstrapStrictImportsRequested = true
-                bootstrapStrictImportsByDefault = false
-                0
-            } else if (value == "--flat-imports") {
-                // Modules whose package doesn't set `visibility` see every name the program declares, as before
-                // strict imports were the default.
-                bootstrapStrictImportsRequested = false
-                bootstrapStrictImportsByDefault = false
-                0
-            } else if (value == "--strict-imports=warn") {
-                // The same modules stay flat, and what strict imports would report is printed as warnings: by the
-                // front end, which a cached build skips.
-                bootstrapStrictImportsRequested = false
-                bootstrapStrictImportsByDefault = false
-                bootstrapStrictImportsWarn = true
-                useCache = false
+            } else if (bootstrapStrictImportsOption(value)) {
+                // (The warnings come from the front end, which a cached build skips.)
+                if (bootstrapStrictImportsWarn) useCache = false
                 0
             } else if (value == "--visibility-report" && option + 1 < argumentCount) {
                 // Written by the front end, which a cached build skips.
@@ -1461,6 +1463,7 @@ fun main: int {
                 runLive = true
             }
             else if (option == "--jit") runBuilt = false
+            else if (bootstrapStrictImportsOption(option)) 0
             else if (option == "--cache-dir" && scan + 1 < runCount) {
                 scan = scan + 1
                 bootstrapCacheDirectoryRequest = linuxArgument(scan)
