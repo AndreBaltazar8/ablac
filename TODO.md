@@ -307,12 +307,14 @@ mmap form) apply there.
 - [ ] **Xtensa `llc` aborts on frames of 128 to 255 bytes that take a stack address.** `LLVM ERROR: Error
   while trying to spill A6 from class AR: Cannot scavenge register without an emergency spill slot!`, seen
   2026-11-01 on `esp32RecoveredZN3nvs7Storage9writeItem...` from abla-embedded's `tools/build-example
-  imu-offsets` and `wifi-connect`. `llvm-xtensa-scavenging-slot.patch` reserves the slot past 255 bytes, but
-  `LEA_ADD`'s `ADDI` reaches only 127 (`isValidAddrOffsetForOpcode`). `!isInt<8>(MaxSPOffset)` fixes it:
-  checked with an Xtensa-only `llc` from the fork plus that one line, and both examples then compile. Branch
-  `llvm-xtensa-lea-scavenging` has it, pinned to the published `llvm-23.1.3-xtensa-2` (2026-11-01): both examples build with it
-  and its `llc` output matches the patches' source build. It's held back from master with `mcu-gc-inline`, until the PaperMono
-  hardware test; merging it is what closes this.
+  imu-offsets` (still, 2026-11-17, with abla-embedded 5cda415 and ablac v0.2.61). It's the fork's backend, not our IR:
+  `LEA_ADD`'s `ADDI` reaches only 127, the scratch register for a farther frame address needs the scavenger's slot, and
+  `llvm-xtensa-scavenging-slot.patch` reserved it only past 255 bytes. The patch now says `!isInt<8>(MaxSPOffset)`;
+  `tests/cases/xtensa-llc/scavenging-slot.ll` (47 lines, reduced from that function with llvm-reduce) aborts the pinned
+  companion's `llc` and compiles with the patched one (an Xtensa-only build of the fork plus the patch), and the whole
+  imu-offsets module compiles with it. A changed patch means a new companion revision (docs/llvm-xtensa.md, "Adding a
+  patch"), and it's held for the PaperMono hardware test with `mcu-gc-inline`: until the release is published,
+  `tools/test-llvm-xtensa.sh` fails on the pinned `llc`.
 - [ ] **A class's methods are all compiled, used or not** (abla-one, 0.2.29), so what only one method reaches stays in every program
   with the class: `val table = build()` read only by an uncalled method still runs at startup and links `build` (why abla-one's
   `Style.wrap` is an extension). The uncalled method is dropped by LLVM, its global's initializer isn't. Looked at 2026-11-02, not changed:

@@ -60,6 +60,15 @@ for instruction in 'call8[[:space:]]+target' 'extui' 'bbsi' 'beqz\.n'; do
     }
 done
 
+# A frame of 128 to 255 bytes that takes a stack address needs the scavenger's emergency slot (LEA_ADD's ADDI reaches 127):
+# without it llc aborts ("Cannot scavenge register without an emergency spill slot!").
+llc -mcpu=esp32 -relocation-model=static -O2 -xtensa-direct-calls -xtensa-narrow-branches \
+    "$project_root/tests/cases/xtensa-llc/scavenging-slot.ll" -o "$out/scavenging-slot.s" 2> "$out/scavenging-slot.log" || {
+    cat "$out/scavenging-slot.log" >&2
+    printf 'llc aborts on a 128 to 255 byte frame that takes a stack address: nix/llvm-xtensa-scavenging-slot.patch is missing or too narrow\n' >&2
+    exit 1
+}
+
 mkdir -p "$out/tools"
 real_llc=$(command -v llc)
 cat > "$out/tools/llc" <<SH
