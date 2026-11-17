@@ -1,0 +1,203 @@
+// The streaming API of abla/http/async (getStream, requestStream, writeBody, finishBody, readStream, takeStreamEvents) over HTTP/2 against real servers (tools/test-http2-stream.sh):
+//   streamnet <port> <certificate.pem or "-" for h2c> <mode> <bytes> <path>
+//   down   GET /gig.bin (a file of <bytes> zero bytes served by h2o): read in pieces with readStream, every byte counted and zero; a first phase where nothing is read for 600 ms: what waits
+//          never exceeds one stream window (262144), the peer is stalled, not buffered; then the rest. The process' resident memory stays far below <bytes> (peak printed).
+//   up     POST <path> (an existing file of nghttpd, which reads the body and answers with the file) with <bytes> written in 64 KiB pieces as writeBody takes them (0 means wait for WRITABLE), then finishBody: the response is
+//          200, writeBody was told to wait at least once (the sender was faster than the peer's windows), memory stays flat.
+//   slow   a consumer that reads 100 bytes and then nothing for 1.5 s while the peer has a whole body for it: pending stays at most one window, and the stream is still alive after
+//          (idle timeout 30 s); then it reads everything.
+// Prints "http2 streamnet <mode> ok (peak resident N KiB)".
+import "abla/io"
+import "abla/http"
+import "abla/http/async"
+import "abla/process/arguments"
+import "abla/process/metrics"
+import "abla/sys/linux"
+import "abla/sys/linux/process"
+
+var failures = 0
+var peak = 0
+
+fun fail(what: string): void {
+    failures = failures + 1
+    if (failures < 20) println("FAIL $what")
+    return
+}
+
+fun decimal(text: string): int {
+    var value = 0
+    for (i in 0 until text.size) value = value * 10 + (text[i] - 48)
+    value
+}
+
+fun sample(): void {
+    val resident = processResidentBytes()
+    if (resident > peak) peak = resident
+    return
+}
+
+/** Steps the client and returns this round's stream events. */
+fun round(var client: HttpAsyncClient, milliseconds: int): array<HttpAsyncStreamEvent> {
+    client.step(milliseconds)
+    client.takeStreamEvents()
+}
+
+fun zeros(text: string): bool {
+    for (i in 0 until text.size) {
+        if (text[i] != 0) return false
+    }
+    true
+}
+
+fun down(var client: HttpAsyncClient, base: string, path: string, total: int): void {
+    val id = client.getStream("$base$path", [], 30000)
+    var received = 0
+    var started = false
+    var ended = false
+    var stalledPending = -1
+    var rounds = 0
+    var deadline = linuxMonotonicMilliseconds() + 300000
+    while (!ended && linuxMonotonicMilliseconds() < deadline) {
+        val events = round(client, 20)
+        for (event in events) {
+            if (event.kind == HTTP_STREAM_HEADERS) {
+                started = true
+                if (event.status != 200) fail("status ${event.status}")
+            } else if (event.kind == HTTP_STREAM_END) ended = true
+            else if (event.kind == HTTP_STREAM_ERROR) {
+                fail("the download failed: ${event.error} after $received of $total bytes")
+                return
+            }
+        }
+        if (started && stalledPending < 0 && client.streamPending(id) > 0) {
+            // Nothing is read for a while: the peer fills the window and stops.
+            val resumeAt = linuxMonotonicMilliseconds() + 600
+            while (linuxMonotonicMilliseconds() < resumeAt) client.step(20)
+            stalledPending = client.streamPending(id)
+            client.takeStreamEvents()
+            if (stalledPending > 262144) fail("an unread stream holds $stalledPending bytes, more than a window (262144)")
+            if (stalledPending == 0) fail("nothing waited after 600 ms of not reading")
+        }
+        var piece = client.readStream(id, 65536)
+        while (piece.size > 0) {
+            if (!zeros(piece)) fail("a non-zero byte in the download at $received")
+            received = received + piece.size
+            piece = client.readStream(id, 65536)
+        }
+        rounds = rounds + 1
+        if (rounds % 64 == 0) sample()
+    }
+    sample()
+    if (!ended) fail("the download did not end: $received of $total")
+    if (received != total) fail("received $received of $total bytes")
+    return
+}
+
+fun up(var client: HttpAsyncClient, base: string, path: string, total: int): void {
+    val id = client.requestStream("POST", "$base$path", [HttpHeader("Content-Type", "application/octet-stream")], total, 30000)
+    val piece = "u".repeat(65536)
+    var sent = 0
+    var waited = 0
+    var writable = false
+    var ended = false
+    var status = 0
+    var rounds = 0
+    val deadline = linuxMonotonicMilliseconds() + 300000
+    while (!ended && linuxMonotonicMilliseconds() < deadline) {
+        for (event in round(client, 20)) {
+            if (event.kind == HTTP_STREAM_WRITABLE) writable = true
+            else if (event.kind == HTTP_STREAM_HEADERS) status = event.status
+            else if (event.kind == HTTP_STREAM_END) ended = true
+            else if (event.kind == HTTP_STREAM_ERROR) {
+                fail("the upload failed: ${event.error} after $sent of $total bytes")
+                return
+            }
+        }
+        var more = writable && sent < total
+        while (more) {
+            val want = if (total - sent < piece.size) total - sent else piece.size
+            val taken = client.writeBody(id, if (want == piece.size) piece else piece.slice(0, want))
+            if (taken < 0) {
+                fail("writeBody: the stream is gone at $sent")
+                return
+            }
+            if (taken == 0) {
+                waited = waited + 1
+                more = false
+            } else {
+                sent = sent + taken
+                // A partial take leaves the rest of this piece: it is offered again whole next round (the bytes are all "u").
+                if (taken < want) more = false
+                if (sent >= total) {
+                    client.finishBody(id)
+                    more = false
+                }
+            }
+        }
+        rounds = rounds + 1
+        if (rounds % 64 == 0) sample()
+    }
+    sample()
+    if (!ended) fail("the upload did not end: sent $sent of $total")
+    if (status != 200) fail("upload status $status")
+    if (sent != total) fail("sent $sent of $total")
+    if (waited == 0 && total > 4194304) fail("writeBody never told the sender to wait: no backpressure on $total bytes")
+    return
+}
+
+fun slow(var client: HttpAsyncClient, base: string, path: string, total: int): void {
+    val id = client.getStream("$base$path", [], 30000)
+    var started = false
+    for (i in 0 until 500) {
+        for (event in round(client, 20)) {
+            if (event.kind == HTTP_STREAM_HEADERS) started = true
+        }
+        if (started && client.streamPending(id) > 0) break
+    }
+    if (!started) { fail("no response"); return }
+    val first = client.readStream(id, 100)
+    if (first.size != 100) fail("first read ${first.size}")
+    val resumeAt = linuxMonotonicMilliseconds() + 1500
+    while (linuxMonotonicMilliseconds() < resumeAt) client.step(20)
+    val waiting = client.streamPending(id)
+    if (waiting > 262144) fail("a consumer that does not read: $waiting bytes wait, more than a window")
+    var received = 100
+    var ended = false
+    val deadline = linuxMonotonicMilliseconds() + 300000
+    while (!ended && linuxMonotonicMilliseconds() < deadline) {
+        for (event in round(client, 20)) {
+            if (event.kind == HTTP_STREAM_END) ended = true
+            else if (event.kind == HTTP_STREAM_ERROR) {
+                fail("the slow stream failed: ${event.error}")
+                return
+            }
+        }
+        var piece = client.readStream(id, 65536)
+        while (piece.size > 0) {
+            received = received + piece.size
+            piece = client.readStream(id, 65536)
+        }
+    }
+    sample()
+    if (!ended || received != total) fail("the slow consumer got $received of $total (ended $ended)")
+    return
+}
+
+fun main: int {
+    val port = decimal(processArgument(0))
+    val ca = processArgument(1)
+    val mode = processArgument(2)
+    val total = decimal(processArgument(3))
+    val path = processArgument(4)
+    val tls = ca != "-"
+    var client = httpAsyncClient(HttpAsyncOptions(caPath = if (tls) ca else "", http2 = true, http2PriorKnowledge = !tls))
+    val base = "${if (tls) "https" else "http"}://localhost:$port"
+    sample()
+    if (mode == "down") down(client, base, path, total)
+    else if (mode == "up") up(client, base, path, total)
+    else if (mode == "slow") slow(client, base, path, total)
+    else fail("unknown mode $mode")
+    if (failures > 0) return 1
+    println("http2 streamnet $mode ok (peak resident ${peak / 1024} KiB)")
+    0
+}

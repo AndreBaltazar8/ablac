@@ -90,6 +90,16 @@ fun HttpAsyncCompletion.header(name: string): string {
     result
 }
 
+// Streaming requests (requestStream, getStream): what happened to one, in order. HEADERS: `status` and `headers`; READABLE: bytes wait for readStream (sent when there were none
+// waiting; read until it returns ""); WRITABLE: writeBody has room again; END: the response ended well (`trailers`); ERROR: the request failed (`error`; the id is done).
+val HTTP_STREAM_HEADERS = 1
+val HTTP_STREAM_READABLE = 2
+val HTTP_STREAM_WRITABLE = 3
+val HTTP_STREAM_END = 4
+val HTTP_STREAM_ERROR = 5
+
+class HttpAsyncStreamEvent(val kind: int, val id: int, val status: int = 0, val headers: array<HttpHeader> = [], val trailers: array<HttpHeader> = [], val error: string = "")
+
 class HttpAsyncTarget(
     val secure: bool,
     val host: string,
@@ -189,7 +199,12 @@ resource class HttpAsyncClient(
     var completions: array<HttpAsyncCompletion>,
     var nextId: int,
     var activeRequests: int,
-    var connectionsOpened: int
+    var connectionsOpened: int,
+    // Streaming requests, by request slot: whether it is one, its request body length (-1 unknown) and idle timeout; the events not taken yet.
+    val requestStreaming: array<bool> = [],
+    val requestLengths: array<int> = [],
+    val requestIdle: array<int> = [],
+    var streamEvents: array<HttpAsyncStreamEvent> = []
 ) {
     trusted fun drop(): void {
         var slot = 0
@@ -422,10 +437,15 @@ fun HttpAsyncClient.complete(
     protocol: string = ""
 ): void {
     if (request >= 0 && this.requestStates[request] != 0) {
-        this.completions.append(HttpAsyncCompletion(
+        if (this.requestStreaming[request]) {
+            // A streaming request ends in a stream event, not a completion.
+            if (error == "") this.streamEvents.append(HttpAsyncStreamEvent(HTTP_STREAM_END, this.requestIds[request], status = status, trailers = this.requestTrailers[request]))
+            else this.streamEvents.append(HttpAsyncStreamEvent(HTTP_STREAM_ERROR, this.requestIds[request], error = error))
+        } else this.completions.append(HttpAsyncCompletion(
             this.requestIds[request], status, headers, body, error,
             linuxMonotonicMilliseconds() - this.requestStarted[request], protocol, this.requestTrailers[request]
         ))
+        this.requestStreaming[request] = false
         this.requestStates[request] = httpAsyncRequestFree
         this.requestPayloads[request] = ""
         this.requestBodies[request] = ""
@@ -708,6 +728,15 @@ fun HttpAsyncClient.beginWrite(slot: int): void {
         this.interest(slot, false)
         return
     }
+    if (this.requestStreaming[request]) {
+        // HTTP/1.1 streaming is not here yet (docs/design/http-streaming.md): the origin turned out not to speak HTTP/2.
+        this.connectionRequests[slot] = -1
+        this.complete(request, 0, [], "", "a streaming request needs HTTP/2, and this server speaks HTTP/1.1")
+        this.connectionStates[slot] = httpAsyncConnectionIdle
+        this.connectionIdleSince[slot] = linuxMonotonicMilliseconds()
+        this.interest(slot, false)
+        return
+    }
     this.connectionStates[slot] = httpAsyncConnectionWriting
     this.connectionOutputs[slot] = this.requestPayloads[request]
     this.connectionOutputOffsets[slot] = 0
@@ -977,8 +1006,10 @@ fun HttpAsyncClient.startH2(slot: int): void {
 fun HttpAsyncClient.h2Attach(slot: int, request: int): bool {
     val fields: array<HpackField> = []
     for (header in this.requestHeaderLists[request]) fields.append(HpackField(header.name, header.value, false))
-    val stream = this.connectionH2[slot].request(this.requestMethods[request], if (this.requestSecure[request]) "https" else "http",
-        this.requestAuthorities[request], this.requestTargets[request], fields, this.requestBodies[request])
+    val scheme = if (this.requestSecure[request]) "https" else "http"
+    val stream = if (this.requestStreaming[request])
+        this.connectionH2[slot].requestStream(this.requestMethods[request], scheme, this.requestAuthorities[request], this.requestTargets[request], fields, this.requestLengths[request])
+        else this.connectionH2[slot].request(this.requestMethods[request], scheme, this.requestAuthorities[request], this.requestTargets[request], fields, this.requestBodies[request])
     if (stream < 0) return false
     this.requestStates[request] = httpAsyncRequestActive
     this.requestSlots[request] = slot
@@ -987,6 +1018,11 @@ fun HttpAsyncClient.h2Attach(slot: int, request: int): bool {
     this.requestResponseHeaders[request] = []
     this.requestChunks[request] = []
     this.requestTrailers[request] = []
+    if (this.requestStreaming[request]) {
+        // The request body can start: the first WRITABLE (a request with no body has none).
+        this.streamTouch(request)
+        if (this.requestLengths[request] != 0) this.streamEvents.append(HttpAsyncStreamEvent(HTTP_STREAM_WRITABLE, this.requestIds[request]))
+    }
     true
 }
 
@@ -1011,11 +1047,18 @@ fun HttpAsyncClient.h2Events(slot: int, retryUnanswered: bool): void {
         if (event.kind == H2_EVENT_GOAWAY) continue
         val request = this.requestOnStream(slot, event.stream)
         if (request < 0) continue
-        if (event.kind == H2_EVENT_HEADERS) {
+        // A streaming request's deadline is an idle one: anything that happens to it moves it.
+        if (this.requestStreaming[request] && this.requestIdle[request] > 0) this.requestDeadlines[request] = linuxMonotonicMilliseconds() + this.requestIdle[request]
+        if (event.kind == H2_EVENT_READABLE) {
+            this.streamEvents.append(HttpAsyncStreamEvent(HTTP_STREAM_READABLE, this.requestIds[request]))
+        } else if (event.kind == H2_EVENT_WRITABLE) {
+            this.streamEvents.append(HttpAsyncStreamEvent(HTTP_STREAM_WRITABLE, this.requestIds[request]))
+        } else if (event.kind == H2_EVENT_HEADERS) {
             this.requestStatuses[request] = event.status
             val headers: array<HttpHeader> = []
             for (field in event.headers) headers.append(HttpHeader(field.name, field.value))
             this.requestResponseHeaders[request] = headers
+            if (this.requestStreaming[request]) this.streamEvents.append(HttpAsyncStreamEvent(HTTP_STREAM_HEADERS, this.requestIds[request], status = event.status, headers = headers))
         } else if (event.kind == H2_EVENT_TRAILERS) {
             val kept: array<HttpHeader> = []
             for (field in event.headers) kept.append(HttpHeader(field.name, field.value))
@@ -1031,7 +1074,8 @@ fun HttpAsyncClient.h2Events(slot: int, retryUnanswered: bool): void {
             this.complete(request, status, headers, body, "", "h2")
         } else if (event.kind == H2_EVENT_RESET) {
             finished = true
-            if ((event.retry || (retryUnanswered && this.requestStatuses[request] < 0)) && !this.requestRetried[request]) {
+            // A streaming request is never retried: its body was written by the caller as it went.
+            if ((event.retry || (retryUnanswered && this.requestStatuses[request] < 0)) && !this.requestRetried[request] && !this.requestStreaming[request]) {
                 this.requestRetried[request] = true
                 this.requestStates[request] = httpAsyncRequestQueued
                 this.requestSlots[request] = -1
@@ -1303,6 +1347,16 @@ fun HttpAsyncClient.request(
     headers: array<HttpHeader> = [],
     body: string = "",
     timeoutMilliseconds: int = 10000
+): int = this.openRequest(method, url, headers, body, timeoutMilliseconds, false, -1)
+
+private fun HttpAsyncClient.openRequest(
+    method: string,
+    url: string,
+    headers: array<HttpHeader>,
+    body: string,
+    timeoutMilliseconds: int,
+    streaming: bool,
+    length: int
 ): int {
     val id = this.nextId
     this.nextId = this.nextId + 1
@@ -1334,6 +1388,9 @@ fun HttpAsyncClient.request(
         this.requestResponseHeaders.append([])
         this.requestChunks.append([])
         this.requestTrailers.append([])
+        this.requestStreaming.append(false)
+        this.requestLengths.append(-1)
+        this.requestIdle.append(0)
     }
     val now = linuxMonotonicMilliseconds()
     this.requestIds[slot] = id
@@ -1358,8 +1415,12 @@ fun HttpAsyncClient.request(
     this.requestResponseHeaders[slot] = []
     this.requestChunks[slot] = []
     this.requestTrailers[slot] = []
+    this.requestStreaming[slot] = streaming
+    this.requestLengths[slot] = length
+    this.requestIdle[slot] = if (streaming) timeoutMilliseconds else 0
     this.activeRequests = this.activeRequests + 1
     if (!target.valid) this.complete(slot, 0, [], "", "invalid URL")
+    else if (streaming && !this.options.http2 && !(this.options.http2PriorKnowledge && !target.secure)) this.complete(slot, 0, [], "", "a streaming request needs HTTP/2: set HttpAsyncOptions.http2")
     else this.pumpEvents()
     id
 }
@@ -1377,6 +1438,120 @@ fun HttpAsyncClient.postJson(url: string, json: string, headers: array<HttpHeade
         index = index + 1
     }
     this.request("POST", url, all, json, timeoutMilliseconds)
+}
+
+// ---------------------------------------------------------------------------
+// Streaming requests (docs/design/http-streaming.md). Over HTTP/2 for now: the response body waits in the stream (it is read with readStream, and the peer is credited as it is
+// read), the request body is written with writeBody. The events (takeStreamEvents) say when: HEADERS, READABLE, WRITABLE, END, ERROR; an id ends with exactly one END or ERROR.
+// `idleTimeoutMilliseconds` is not a total: it counts from the last event, read or accepted write. Start writing a body after the first WRITABLE (before it writeBody takes 0).
+
+fun HttpAsyncClient.requestStream(
+    method: string,
+    url: string,
+    headers: array<HttpHeader> = [],
+    length: int = -1,
+    idleTimeoutMilliseconds: int = 30000
+): int = this.openRequest(method, url, headers, "", idleTimeoutMilliseconds, true, length)
+
+fun HttpAsyncClient.getStream(url: string, headers: array<HttpHeader> = [], idleTimeoutMilliseconds: int = 30000): int =
+    this.openRequest("GET", url, headers, "", idleTimeoutMilliseconds, true, 0)
+
+// The request slot of a live streaming request, or -1.
+private fun HttpAsyncClient.streamRequest(id: int): int {
+    for (request in 0 until this.requestStates.size) {
+        if (this.requestStates[request] != 0 && this.requestStreaming[request] && this.requestIds[request] == id) return request
+    }
+    -1
+}
+
+// The connection slot whose HTTP/2 connection carries the request's stream, or -1 (not attached yet).
+private fun HttpAsyncClient.streamCarrier(request: int): int {
+    val slot = this.requestSlots[request]
+    if (slot >= 0 && this.requestStreams[request] >= 0 && this.connectionStates[slot] == httpAsyncConnectionH2) slot else -1
+}
+
+private fun HttpAsyncClient.streamTouch(request: int): void {
+    if (this.requestIdle[request] > 0) this.requestDeadlines[request] = linuxMonotonicMilliseconds() + this.requestIdle[request]
+    return
+}
+
+/** Writes request body bytes: returns how many were taken (a prefix of `chunk`), 0 when the stream cannot take more now (wait for WRITABLE), -1 when the id is not a live streaming request. */
+fun HttpAsyncClient.writeBody(id: int, chunk: string): int {
+    val request = this.streamRequest(id)
+    if (request < 0) return -1
+    val carrier = this.streamCarrier(request)
+    if (carrier < 0) return 0
+    val taken = this.connectionH2[carrier].writeBody(this.requestStreams[request], chunk)
+    if (taken > 0) this.streamTouch(request)
+    this.h2Pump(carrier)
+    taken
+}
+
+/** The request body is complete (the stream's END_STREAM follows what is still queued). */
+fun HttpAsyncClient.finishBody(id: int): void {
+    val request = this.streamRequest(id)
+    if (request < 0) return
+    val carrier = this.streamCarrier(request)
+    if (carrier < 0) return
+    this.connectionH2[carrier].finishBody(this.requestStreams[request])
+    this.streamTouch(request)
+    this.h2Pump(carrier)
+    return
+}
+
+/** Up to `maximum` bytes of the response body. Reading is what credits the peer: not reading stalls it after one stream window. "" when nothing waits. */
+fun HttpAsyncClient.readStream(id: int, maximum: int = 65536): string {
+    val request = this.streamRequest(id)
+    if (request < 0) return ""
+    val carrier = this.streamCarrier(request)
+    if (carrier < 0) return ""
+    val data = this.connectionH2[carrier].takeData(this.requestStreams[request], maximum)
+    if (data.size > 0) this.streamTouch(request)
+    this.h2Pump(carrier)
+    data
+}
+
+/** The response bytes that wait to be read. */
+fun HttpAsyncClient.streamPending(id: int): int {
+    val request = this.streamRequest(id)
+    if (request < 0) return 0
+    val carrier = this.streamCarrier(request)
+    if (carrier < 0) return 0
+    this.connectionH2[carrier].pendingData(this.requestStreams[request])
+}
+
+/** The stream events since the last call. */
+fun HttpAsyncClient.takeStreamEvents(): array<HttpAsyncStreamEvent> {
+    val taken: array<HttpAsyncStreamEvent> = []
+    for (event in this.streamEvents) taken.append(event)
+    this.streamEvents = []
+    taken
+}
+
+/** Gives up on a streaming request: RST_STREAM(CANCEL); its last event is an ERROR "cancelled". */
+fun HttpAsyncClient.cancelStream(id: int): void {
+    val request = this.streamRequest(id)
+    if (request < 0) return
+    val carrier = this.streamCarrier(request)
+    if (carrier >= 0) {
+        this.connectionH2[carrier].cancel(this.requestStreams[request])
+        if (this.connectionH2[carrier].openStreams() == 0) this.connectionIdleSince[carrier] = linuxMonotonicMilliseconds()
+        this.complete(request, 0, [], "", "cancelled")
+        this.h2Pump(carrier)
+    } else {
+        var owner = -1
+        var slot = 0
+        while (owner < 0 && slot < this.connectionStates.size) {
+            if (this.connectionStates[slot] != 0 && this.connectionRequests[slot] == request) owner = slot
+            slot = slot + 1
+        }
+        if (owner >= 0) {
+            this.connectionRequests[owner] = -1
+            this.closeConnection(owner)
+        }
+        this.complete(request, 0, [], "", "cancelled")
+    }
+    return
 }
 
 // Progresses every request for up to `timeoutMilliseconds` (0 never blocks).
