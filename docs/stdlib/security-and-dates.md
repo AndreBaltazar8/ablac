@@ -48,7 +48,8 @@ fun main {
 | `sha512(data)`, `sha384(data)`, `sha256(data)`, `sha1(data)`, `md5(data)` | raw digest bytes (64, 48, 32, 20 and 16 bytes) |
 | `hmacSha512(key, message)`, `hmacSha384`, `hmacSha256`, `hmacSha1` | raw MAC of the hash's size |
 | `pbkdf2Sha256(password, salt, iterations)` | a raw 32-byte derived key |
-| `base64Encode(data)`, `base64Decode(text)` | standard Base64 with padding |
+| `base64Encode(data)`, `base64Decode(text)` | standard Base64 with padding; `base64Decode` gives `""` for invalid input, which is also what valid empty input gives |
+| `base64DecodeOrNull(text)`, `hexDecodeOrNull(text)` | the decoded bytes, or `null` for invalid input (valid empty input gives `""`): prefer these unless the input is known to be valid |
 | `hexEncode(data)`, `hexDecode(text)` | lowercase hexadecimal; decoding takes either case, and gives `""` for anything invalid |
 | `constantTimeEquals(a, b)` | equality that takes the same time wherever the inputs differ; use it to compare secrets |
 | `binaryXor(a, b)` | bytewise XOR of two equal-length strings |

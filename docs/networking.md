@@ -147,7 +147,8 @@ fun main {
 | `httpRouter(versionHeader = "Abla-Version")` | a router; `get`, `post`, `put`, `patch`, `delete`, `head`, `options`, `route(method, pattern, handler)` add routes; `:name` segments are parameters |
 | `router.version("2025-01-01").get(...)` | a versioned route, chosen by the version header ([standard-library.md](standard-library.md#http-versioning)) |
 | `router.dispatch(request)` | the response for one request (404 when no route matches) |
-| `request.header(name)`, `routeParameter(name)`, `queryParameter(name)`, `parameter(name)` | request accessors (`""` when absent; header names are case-insensitive) |
+| `request.header(name)`, `routeParameter(name)`, `queryParameter(name)`, `parameter(name)` | request accessors (`""` when absent; header names are case-insensitive; `queryParameter` returns the raw, still percent-encoded text) |
+| `request.queryParameterDecoded(name)` | the query value with `%XX` and `+` undone (`percentDecode` in query mode), or `null` when absent, empty or malformed |
 | `httpText(body, status = 200)`, `httpJson(body, status = 200)` | responses with a content type |
 | `httpGet(path)`, `httpPost(path, body)`, `httpRequest(method, path, body, headers)` | build a request |
 | `httpParseRequest(text)`, `httpParseResponse(text)`, `response.render()` | parse and render the wire format |

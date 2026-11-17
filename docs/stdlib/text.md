@@ -54,6 +54,8 @@ fun main {
 | `s.repeat(count)` | `count` copies |
 | `s.padStart(length, pad = " ")`, `s.padEnd(length, pad = " ")` | padded to `length` bytes with whole code points of `pad`, repeated; a code point that would not fit ends the padding (so the result can be up to 3 bytes short, never a half code point); a longer string is unchanged |
 | `textAsciiEqualInsensitive(a, b)` | ASCII case-insensitive equality |
+| `percentEncode(s, query = false)` | RFC 3986 percent encoding of the UTF-8 bytes: letters, digits and `- . _ ~` stay, every other byte is `%XX` (uppercase); with `query`, a space is `+` (a literal `+` is `%2B`) |
+| `percentDecode(s, query = false)` | the text `s` stands for, or `null` for a `%` not followed by two hex digits (either case) or a result that is not valid UTF-8 (`%C0%80`, `%ED%A0%80`, a stray `%80`); bytes that are not `%` pass as they are; with `query`, `+` is a space |
 
 Positions and lengths are in bytes, matching `size` and `slice`. Case mapping
 and trimming are ASCII-only, so UTF-8 text passes through unchanged.
