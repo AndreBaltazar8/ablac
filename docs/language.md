@@ -2808,6 +2808,11 @@ fun main: int = nextId()
   `E_IMPORT_UNQUALIFIED_AMBIGUOUS`, as for two direct imports, unless the
   module declares the name itself. An imported module's own declaration of a
   name hides what it passes on under that name.
+- A subparser's text (`$mvcview <main class="shell">…`) is the subparser's to
+  read: a word there that names a declaration elsewhere is no use of it. The
+  expressions the subparser parses from the source as Abla
+  (`parserParseAblaExpression`) are code, and their names are checked as any
+  other.
 - Flat is the opt-out, for code that hasn't been migrated: `visibility = "flat"`
   (or the older spelling `"program"`) keeps a package flat, where every module
   sees every name the program declares, and `--flat-imports` (on `ablac build`,

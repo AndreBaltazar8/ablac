@@ -2681,6 +2681,7 @@ fun bootstrapValidateStrictImports(
     bootstrapStrictVisibilityTable = bootstrapStrictVisibilityEmpty()
     bootstrapStrictIdentityModules = Map()
     bootstrapStrictOptOutModules = Map()
+    bootstrapStrictDeferredFindings = []
     val report = bootstrapVisibilityReportPath != ""
     val strict: array<bool> = []
     // What the report asks: every module of the program (not the standard
@@ -2824,18 +2825,26 @@ fun bootstrapValidateStrictImports(
                 val programSpelling = if (internal) bootstrapLibraryEntryReaching(
                     finding.declaring, aliases, snapshots
                 ) else spelling
-                if (strict[module] || warned[module]) {
-                    val diagnostic = if (internal)
-                        "error[E_NAME_NOT_IMPORTED]: `${finding.name}` is internal to the standard library (declared in ${snapshots[finding.declaring].path}); no import makes it visible\n${bootstrapInternalPublicHint(snapshots[finding.declaring].source)}help: a library module that offers it would be a change to the standard library to request\n${bootstrapStrictOptOutHelp(snapshot.path)}source[strict-import]:${snapshot.path}:${finding.begin}:${finding.end}\n"
-                    else
-                        "error[E_NAME_NOT_IMPORTED]: `${finding.name}` is declared in ${snapshots[finding.declaring].path}, which this module doesn't import\nhelp: add: import \"$spelling\"\n${bootstrapStrictOptOutHelp(snapshot.path)}source[strict-import]:${snapshot.path}:${finding.begin}:${finding.end}\n"
+                // (A report-only module has no diagnostic: the report line is all it gives.)
+                val diagnostic = if (!strict[module] && !warned[module]) "" else if (internal)
+                    "error[E_NAME_NOT_IMPORTED]: `${finding.name}` is internal to the standard library (declared in ${snapshots[finding.declaring].path}); no import makes it visible\n${bootstrapInternalPublicHint(snapshots[finding.declaring].source)}help: a library module that offers it would be a change to the standard library to request\n${bootstrapStrictOptOutHelp(snapshot.path)}source[strict-import]:${snapshot.path}:${finding.begin}:${finding.end}\n"
+                else
+                    "error[E_NAME_NOT_IMPORTED]: `${finding.name}` is declared in ${snapshots[finding.declaring].path}, which this module doesn't import\nhelp: add: import \"$spelling\"\n${bootstrapStrictOptOutHelp(snapshot.path)}source[strict-import]:${snapshot.path}:${finding.begin}:${finding.end}\n"
+                val reportLine =
+                    "${snapshot.path}\t${finding.line}\t${finding.column}\t${finding.name}\t${snapshots[finding.declaring].path}\timport \"$programSpelling\"\n"
+                if (finding.deferred) {
+                    bootstrapStrictDeferredFindings.append(BootstrapStrictDeferredFinding(
+                        snapshot.path, finding.name, finding.begin,
+                        if (strict[module]) 1 else if (warned[module]) 3 else 0,
+                        diagnostic, reportLine
+                    ))
+                } else {
                     if (strict[module]) {
                         errors = errors + 1
                         diagnostics = "$diagnostics$diagnostic"
-                    } else bootstrapStrictImportWarning(diagnostic)
+                    } else if (warned[module]) bootstrapStrictImportWarning(diagnostic)
+                    lines = "$lines$reportLine"
                 }
-                lines =
-                    "$lines${snapshot.path}\t${finding.line}\t${finding.column}\t${finding.name}\t${snapshots[finding.declaring].path}\timport \"$programSpelling\"\n"
             }
             if (strict[module] || warned[module]) {
                 val ambiguity = bootstrapStrictPassedOnAmbiguity(
@@ -2864,17 +2873,74 @@ fun bootstrapValidateStrictImports(
             bootstrapStrictImportSpellingFor(caller, declaring, aliases, standIns, strict)
         }
     )
-    // A build may check its module graph more than once: the first check
-    // starts the report, later ones add the lines it doesn't have yet.
-    if (report) {
-        val reportPath = Path(bootstrapVisibilityReportPath)
-        var written = if (bootstrapVisibilityReportStarted) reportPath.readText() else ""
-        for (line in lines.split("\n")) {
-            if (line != "" && !written.contains("$line\n")) written = "$written$line\n"
-        }
-        reportPath.writeTextAtomic(written)
-        bootstrapVisibilityReportStarted = true
+    if (report) bootstrapVisibilityReportAdd(lines)
+    BootstrapImportAliasValidation(errors, diagnostics)
+}
+
+/** Adds `lines` to the `--visibility-report`. A build may check its module graph more than once: the first check
+ *  starts the report, later ones (and the uses a module's parse settles) add the lines it doesn't have yet. */
+fun bootstrapVisibilityReportAdd(lines: string): void {
+    val reportPath = Path(bootstrapVisibilityReportPath)
+    var written = if (bootstrapVisibilityReportStarted) reportPath.readText() else ""
+    for (line in lines.split("\n")) {
+        if (line != "" && !written.contains("$line\n")) written = "$written$line\n"
     }
+    reportPath.writeTextAtomic(written)
+    bootstrapVisibilityReportStarted = true
+    return
+}
+
+/** A use bootstrapValidateStrictImports found after a `$name` in module `path`: `mode` 1 an error, 3 a warning
+ *  (`--strict-imports=warn`), 0 a report line only. */
+class BootstrapStrictDeferredFinding(
+    val path: string,
+    val name: string,
+    val begin: int,
+    val mode: int,
+    val diagnostic: string,
+    val reportLine: string
+)
+
+// The uses found after a `$name` in this check's modules, settled by each module's parse.
+var bootstrapStrictDeferredFindings: array<BootstrapStrictDeferredFinding> = []
+
+/** The deferred uses of module `path`, now that its parse says what each `$name` expanded (`parsed`): one inside an
+ *  expansion's text is a use only where the expansion has an expression the subparser took from the source (a name
+ *  in `$mvcview <main>` is markup); the others are uses. Each name's first is reported, as a module's other uses
+ *  are. The errors and their diagnostics, for the parse's. */
+fun bootstrapStrictSettleDeferred(path: string, parsed: BootstrapParseResult): BootstrapImportAliasValidation {
+    var errors = 0
+    var diagnostics = ""
+    var lines = ""
+    val reported = bootstrapStringSet()
+    for (finding in bootstrapStrictDeferredFindings) {
+        if (finding.path == path && !reported.contains(finding.name)) {
+            var text = false
+            var span = 0
+            while (!text && span + 1 < parsed.subparserSpans.size) {
+                if (finding.begin >= parsed.subparserSpans[span] && finding.begin < parsed.subparserSpans[span + 1]) {
+                    text = true
+                }
+                span = span + 2
+            }
+            if (text) {
+                for (use in parsed.subparserUses) if (use == finding.begin) text = false
+            }
+            if (!text) {
+                reported.add(finding.name)
+                if (finding.mode == 1) {
+                    errors = errors + 1
+                    diagnostics = "$diagnostics${finding.diagnostic}"
+                } else if (finding.mode == 3) bootstrapStrictImportWarning(finding.diagnostic)
+                lines = "$lines${finding.reportLine}"
+            }
+        }
+    }
+    if (lines != "" && bootstrapVisibilityReportPath != "") bootstrapVisibilityReportAdd(lines)
+    // (Settled once: a module parsed again, its contract twin, finds none left.)
+    val left: array<BootstrapStrictDeferredFinding> = []
+    for (finding in bootstrapStrictDeferredFindings) if (finding.path != path) left.append(finding)
+    bootstrapStrictDeferredFindings = left
     BootstrapImportAliasValidation(errors, diagnostics)
 }
 
@@ -3258,7 +3324,9 @@ class BootstrapStrictImportFinding(
     val begin: int,
     val end: int,
     val line: int,
-    val column: int
+    val column: int,
+    // After a `$name`: kept until the parse says whether a subparser's text holds it.
+    val deferred: bool = false
 )
 
 fun bootstrapStrictContractTokens(
@@ -3357,6 +3425,15 @@ fun bootstrapStrictImportFindings(
         orderCheck = orderCheck + 1
     }
     val reported = bootstrapStringSet()
+    // Where the first `$name` (a subparser's invocation) is, -1 for none.
+    var subparserFrom = -1
+    var scan = 0
+    while (subparserFrom < 0 && scan + 1 < tokens.size) {
+        if (tokens[scan].kind == BOOTSTRAP_TOKEN_DOLLAR && tokens[scan + 1].kind == BOOTSTRAP_TOKEN_IDENTIFIER) {
+            subparserFrom = tokens[scan].begin
+        }
+        scan = scan + 1
+    }
     var inImport = false
     var depth = 0
     var line = 1
@@ -3454,7 +3531,10 @@ fun bootstrapStrictImportFindings(
                         bootstrapAffineNamesContain(classMembers[ownerIndex], text)) seen = true
                 }
                 if (!seen) {
-                    reported.add(text)
+                    // After a `$name`, a subparser's text may be what the token is: the use is deferred until the
+                    // parse knows (bootstrapStrictSettleDeferred), and each one is kept, in case the first isn't one.
+                    val deferred = subparserFrom >= 0 && token.begin > subparserFrom
+                    if (!deferred) reported.add(text)
                     while (lineCursor < token.begin) {
                         if (source[lineCursor] == 10) {
                             line = line + 1
@@ -3464,7 +3544,7 @@ fun bootstrapStrictImportFindings(
                     }
                     result.append(BootstrapStrictImportFinding(
                         text, declaring[known][0], token.begin, token.end,
-                        line, token.begin - lineStart + 1
+                        line, token.begin - lineStart + 1, deferred
                     ))
                 }
             }
@@ -4442,6 +4522,11 @@ class BootstrapModuleGraph(
             dependencyFingerprint = dependencyFingerprint -
                 (dependencyFingerprint / 1000000009) * 1000000009
             parseErrors = parseErrors + parsed.errors
+            if (bootstrapStrictDeferredFindings.size > 0) {
+                val settled = bootstrapStrictSettleDeferred(snapshot.path, parsed)
+                parseErrors = parseErrors + settled.errors
+                parseDiagnostics = "$parseDiagnostics${settled.diagnostics}"
+            }
             extensionErrors = extensionErrors + parsed.extensionErrors
             for (source in parsed.stackDepthStoppedSources) stackDepthStoppedSources.append(source)
             parseDiagnostics = "$parseDiagnostics${parsed.diagnostics}"

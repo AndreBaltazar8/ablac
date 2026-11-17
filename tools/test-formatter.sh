@@ -160,7 +160,7 @@ check_fields() {
     done <<'LIST'
 BootstrapExpression|bootstrapFormatExpressionEqual|begin end
 BootstrapDeclaration|bootstrapFormatDeclarationEqual|begin end generatedOriginBegin generatedOriginEnd annotationBegins annotationEnds
-BootstrapParseResult|bootstrapFormatAstEqual|stackDepthStoppedSources
+BootstrapParseResult|bootstrapFormatAstEqual|stackDepthStoppedSources subparserSpans subparserUses
 LIST
 }
 unguarded=$(check_fields "$root/src/parser.ab" "$root/src/formatter.ab")
