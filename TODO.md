@@ -620,12 +620,16 @@ mmap form) apply there.
 
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
-- [ ] **Published Linux compiler portability.** The standalone x86-64 compiler assets in v0.2.54,
-  v0.2.55 and v0.2.56 require GLIBC_2.38 and request a specific `/nix/store/.../ld-linux-x86-64.so.2`
-  interpreter; the compiler in the v0.2.56 toolchain archive also requires GLIBC_2.38 but uses
-  `/lib64/ld-linux-x86-64.so.2`. README documents glibc 2.38 for the toolchain archive; it does not
-  explicitly state the standalone binary's Nix-store interpreter requirement. Investigate and document
-  standalone use and older Linux compatibility separately from the installer probe.
+- [x] **Published Linux compiler portability.** Checked on the real v0.2.61 assets (2026-11-17). The toolchain
+  archive's compiler asks for `/lib64/ld-linux-x86-64.so.2`, `$ORIGIN/../lib` and no glibc above 2.34, but its bundled
+  libgcc_s (from Ubuntu 22.04) needs `_dl_find_object@GLIBC_2.35`: the compiler runs on AlmaLinux 9 (RHEL's glibc 2.34
+  carries that interface) and fails on Fedora 35 (upstream 2.34, "version GLIBC_2.35 not found"), so the floor the docs
+  gave, 2.34, was one too low; they now say 2.35 and name the RHEL case. The standalone `ablac-x86_64-linux` asset names
+  a Nix-store loader (glibc 2.44) and finds libLLVM, libssl and libcrypto only through Nix-store RUNPATH entries: it is the
+  reproducible bootstrap compiler, and the docs now say that. The release job runs
+  `tools/test-linux-toolchain-portability.sh` on the archive: every 64-bit ELF file's loader, RUNPATH, glibc version
+  needs and bundled libraries, then the compiler building a program in Ubuntu 22.04 and AlmaLinux 9. Nothing was
+  changed in what is published; a portable standalone binary stays unneeded while the archive exists.
 
 - [ ] **Abla-native Xtensa companion installer.** The explicit optional installer used only the Python
   standard library until `abla/compression` could inflate gzip and read tar with bounded, safe extraction. It is Abla now

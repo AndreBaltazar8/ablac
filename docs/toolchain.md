@@ -11,13 +11,18 @@ directory. Installed or custom layouts may override that root with
 override. Project inputs, outputs, and caches continue to use project or
 invocation-relative paths.
 
-The Linux x86-64 toolchain archive requires glibc 2.34 or later. Ubuntu 22.04,
-Debian 12, RHEL 9 and later meet that requirement. The archive uses the
-system dynamic loader and bundles LLVM and its other non-glibc dependencies.
-The standalone `ablac-x86_64-linux` release asset is intended for bootstrapping:
-it requires glibc 2.34 and a specific Nix-store dynamic loader, so it is not
-intended for direct use on other systems. Use the toolchain archive for an
-installed toolchain.
+The Linux x86-64 toolchain archive requires glibc 2.35 or later. Ubuntu 22.04,
+Debian 12 and later meet that requirement; so do RHEL 9 and its rebuilds, whose
+glibc 2.34 carries the one 2.35 interface (`_dl_find_object`) that the bundled
+libgcc_s asks for. An upstream 2.34 without that interface, as in Fedora 35, cannot
+load it. The archive uses the system dynamic loader and bundles LLVM and its other
+non-glibc dependencies. The release job checks every ELF file of the archive
+(`tools/test-linux-toolchain-portability.sh`) and runs the compiler in Ubuntu 22.04
+and AlmaLinux 9.
+The standalone `ablac-x86_64-linux` release asset is the byte-reproducible bootstrap
+compiler (docs/bootstrap.md), built in the Nix shell: it names a Nix-store dynamic loader
+and finds libLLVM, libssl and libcrypto through Nix-store RUNPATH entries, so it runs only
+where those store paths exist. Use the toolchain archive for an installed toolchain.
 
 ```sh
 ablac build app.ab -o build/app
