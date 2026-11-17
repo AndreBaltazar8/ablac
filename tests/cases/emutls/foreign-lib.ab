@@ -1,0 +1,56 @@
+// A shared library whose exports use abla/runtime/emutls from threads the library did not start (#826): the host's
+// pthreads call abla_emutls_touch, and abla_emutls_live says how many bytes of the library's heap are live. Driven by
+// tests/cases/emutls/foreign-driver.c from tools/test-emutls.sh (x86-64 Linux and macOS).
+import "abla/build"
+import "abla/memory"
+import "abla/runtime/emutls"
+import "abla/runtime/memory"
+import "abla/runtime/scalar"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+val exportedSetup = #exportFunction("setup", "abla_emutls_setup")
+val exportedTouch = #exportFunction("touch", "abla_emutls_touch")
+val exportedLive = #exportFunction("live", "abla_emutls_live")
+
+val CONTROLS = 12
+
+trusted fun cell(): int = nativeStaticAllocate(8)
+
+// Twelve LLVM-style control blocks (size, alignment, index, template), made once and never freed. The heap lock is made live
+// here, while the host has one thread: the threads that call touch allocate from the heap through emutls outside the
+// collector's guards (the compiler does the same before its JIT-compiled program runs, abla/llvm/orc).
+trusted fun setup(zero: int): int {
+    runtimeMemoryEnableSharing()
+    val total = 32 * CONTROLS
+    val base = ablaRuntimePointerAddress(ablaUnsafeAllocate(total))
+    ablaUnsafeSetMemory(nativePointerFromAddress(base), 0, total)
+    var index = 0
+    while (index < CONTROLS) {
+        ablaRuntimeStoreI64(base + 32 * index, 16 + 24 * index)
+        ablaRuntimeStoreI64(base + 32 * index + 8, if (index % 2 == 0) 8 else 32)
+        index = index + 1
+    }
+    ablaRuntimeStoreI64(cell(), base)
+    zero
+}
+
+// One thread's visit of every variable: its own copy, filled with the thread's number and read back. 1 when all held.
+trusted fun touch(number: int): int {
+    val base = ablaRuntimeLoadI64(cell())
+    var index = 0
+    var ok = 1
+    while (index < CONTROLS) {
+        val address = emutlsGetAddress(base + 32 * index)
+        ablaRuntimeStoreU8(address, number & 255)
+        if (ablaRuntimeLoadU8(address) != (number & 255)) ok = 0
+        index = index + 1
+    }
+    ok
+}
+
+// The library's live heap bytes after a collection.
+fun live(zero: int): int {
+    memoryCollect()
+    memoryLiveBytes() + zero
+}

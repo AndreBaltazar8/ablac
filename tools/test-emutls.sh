@@ -2,7 +2,9 @@
 # abla/runtime/emutls (#826): the emulated thread-local storage the macOS compiler exports for `ablac run`, instead of
 # compiler-rt's. tests/cases/emutls drives it through its interface with LLVM's control blocks (alignment, initial values,
 # one copy per thread, forty rounds of nine threads racing on first use, the memory a thread leaves behind), release and
-# --fast. Then, on any host: the object of a Mach-O (arm64-macos) program that exports it is made from the LLVM IR the
+# --fast. Then a shared library that uses it from pthreads it did not start (x86-64 Linux and macOS: tests/cases/emutls/
+# foreign-lib.ab and foreign-driver.c): hundreds of short-lived threads call one export, and no byte of the library's heap may
+# stay behind (the pthread key's destructor frees what the runtime's thread-end hook cannot reach). Then, on any host: the object of a Mach-O (arm64-macos) program that exports it is made from the LLVM IR the
 # compiler writes before it needs a macOS SDK, and `llvm-nm` must show ___emutls_get_address defined and no
 # libSystem allocation or pthread-key symbol that the module adds (the compiler's own link on a Mac is judged by
 # tools/test-libsystem-imports.sh in the macOS CI job).
@@ -36,6 +38,42 @@ for round in compiled cached; do
     [[ $result == *"jit emutls threads ok"* ]] || { echo "emutls (run, threads, $round): $result" >&2; exit 1; }
     printf '%s\n' "$result" | grep 'jit threads' || true
 done
+# Threads the runtime did not start: waves of 8 short-lived pthreads of a C driver call an export that uses the emulated
+# thread-locals. On macOS the library's live heap bytes after the waves must be those before them (0 left): a pthread
+# key's destructor frees what the runtime's thread-end hook cannot reach. Without it each thread leaves its table and copies
+# behind (2,248 bytes of this library's, 1,600 threads: 3.6 MB). On Linux the key is not there (it would be a new libc
+# import of the compiler, #806): the leak is printed, and the library must import no pthread key function.
+case "$(uname -s) $(uname -m)" in
+    "Linux x86_64") foreign_flags=(-ldl -lpthread); foreign_check=report ;;
+    Darwin*) foreign_flags=(); foreign_check= ;;
+    *) foreign_flags=skip ;;
+esac
+if [[ ${foreign_flags[0]:-} == skip ]]; then
+    echo "emutls: foreign threads: x86-64 Linux and macOS only"
+else
+    for mode in release fast; do
+        flags=(--no-cache)
+        [[ $mode == fast ]] && flags+=(--fast)
+        library=foreign-$mode.so
+        [[ $(uname -s) != Darwin ]] || library=foreign-$mode.dylib
+        "$compiler" build tests/cases/emutls/foreign-lib.ab --emit shared-library -o "$out/$library" "${flags[@]}" \
+            > "$out/foreign-$mode.build.log" 2>&1 || { cat "$out/foreign-$mode.build.log" >&2; echo "emutls: the foreign-thread library ($mode) did not build" >&2; exit 1; }
+        clang tests/cases/emutls/foreign-driver.c -o "$out/foreign-driver" ${foreign_flags[@]+"${foreign_flags[@]}"} ||
+            { echo "emutls: the foreign-thread driver did not build" >&2; exit 1; }
+        status=0
+        result=$("$root/tools/run-limited.sh" "$out/foreign-driver" "$PWD/$out/$library" 200 8 ${foreign_check:+$foreign_check} 2>&1) || status=$?
+        [[ $status -eq 0 ]] || { echo "emutls (foreign threads, $mode): exit $status: $result" >&2; exit 1; }
+        [[ -n $foreign_check || $result == *" 0 bytes left "* ]] || { echo "emutls (foreign threads, $mode): $result" >&2; exit 1; }
+        printf '%s\n' "$result"
+        if [[ $(uname -s) == Linux && $mode == release ]]; then
+            imports=$(nm -D --undefined-only "$out/$library")
+            if [[ $imports == *pthread_key_create* || $imports == *pthread_setspecific* ]]; then
+                echo "emutls: the Linux library imports a pthread key function (#806)" >&2
+                exit 1
+            fi
+        fi
+    done
+fi
 tools_dir=${ABLA_LLVM_TOOLS:-}
 if [[ -z $tools_dir ]] || [[ ! -x $tools_dir/llc || ! -x $tools_dir/llvm-nm ]]; then
     tools_dir=$(dirname "$(command -v llc 2>/dev/null || true)")
@@ -68,10 +106,11 @@ done
 grep -q ' T ___emutls_get_address$' "$out/mach/with.defined" ||
     { echo "emutls: ___emutls_get_address is not defined by the Mach-O object" >&2; exit 1; }
 added=$(comm -13 "$out/mach/without.undefined" "$out/mach/with.undefined" | grep -v '^$' || true)
-# The export adapter brings __longjmp (the compiler already imports it); nothing else may be new.
-bad=$(printf '%s\n' "$added" | grep -v '^__longjmp$' | grep -v '^$' || true)
+# The export adapter brings __longjmp (the compiler already imports it); the key that frees the table of a thread the
+# runtime did not start brings _pthread_key_create and _pthread_setspecific (nothing else of libSystem's); nothing else may be new.
+bad=$(printf '%s\n' "$added" | grep -v -x -e '__longjmp' -e '_pthread_key_create' -e '_pthread_setspecific' | grep -v '^$' || true)
 [[ -z $bad ]] || { echo "emutls: the module adds imports: $bad" >&2; exit 1; }
-for symbol in _malloc _free _realloc _pthread_key_create _pthread_getspecific _pthread_setspecific; do
+for symbol in _malloc _free _realloc _pthread_getspecific; do
     ! grep -qx "$symbol" "$out/mach/with.undefined" || { echo "emutls: the Mach-O object imports $symbol" >&2; exit 1; }
 done
 echo "emutls ok"
