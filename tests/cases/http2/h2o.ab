@@ -1,0 +1,128 @@
+// abla/http/async over HTTP/2 against h2o (tools/test-http2-h2o.sh), over TLS (ALPN h2) and over h2c with prior knowledge.
+//   h2o <port> <certificate.pem or "-" for h2c> <mode> <docroot>
+//   full    30 concurrent requests share one connection, /big.bin (3 MiB of random bytes, compared with the file in the docroot) crosses the receive window, HEAD, an upload of
+//           300 KB and one of 3 MiB through /echo come back byte for byte (the send window opens and closes under h2o's window updates), a second wave reuses the connection,
+//           response header names are lower case, protocol "h2"
+//   goaway  the script (tools/test-http2-h2o.sh) sends h2o SIGTERM while /slow is in flight: h2o answers GOAWAY and the response still arrives; a request after it fails (the
+//           listener is gone) and does not hang. Prints "sent" once the request is out, for the script to start the shutdown.
+// Prints "http2 h2o <mode> ok".
+import "abla/io"
+import "abla/http/async"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/http"
+import "abla/sys/linux/process"
+import "abla/text"
+
+var failures = 0
+
+fun fail(what: string): void {
+    failures = failures + 1
+    if (failures < 30) println("FAIL $what")
+    return
+}
+
+fun decimal(text: string): int {
+    var value = 0
+    for (i in 0 until text.size) value = value * 10 + (text[i] - 48)
+    value
+}
+
+/** Steps the client until nothing is pending (or `limit` ms pass) and returns the completions. */
+fun drain(var client: HttpAsyncClient, limit: int = 30000): array<HttpAsyncCompletion> {
+    val done: array<HttpAsyncCompletion> = []
+    val deadline = linuxMonotonicMilliseconds() + limit
+    while (client.pending() > 0 && linuxMonotonicMilliseconds() < deadline) {
+        client.step(20)
+        for (c in client.takeCompletions()) done.append(c)
+    }
+    for (c in client.takeCompletions()) done.append(c)
+    done
+}
+
+fun find(done: array<HttpAsyncCompletion>, id: int): HttpAsyncCompletion? {
+    for (c in done) {
+        if (c.id == id) return c
+    }
+    null
+}
+
+fun payload(size: int): string {
+    val unit = "the quick brown fox 0123456789 jumps over the lazy dog\n"
+    var out = unit.repeat(size / unit.size)
+    out + unit.slice(0, size - out.size)
+}
+
+fun full(var client: HttpAsyncClient, base: string, docroot: string): void {
+    val big = linuxReadFile("$docroot/big.bin", 8388608)
+    val ids: array<int> = []
+    for (i in 0 until 30) ids.append(client.get("$base/small.txt?i=$i", [HttpHeader("X-Test", "v$i")], 20000))
+    val bigId = client.get("$base/big.bin", [], 30000)
+    val headId = client.request("HEAD", "$base/small.txt", [], "", 20000)
+    val small = payload(300000)
+    val large = payload(3145728)
+    val upSmall = client.request("POST", "$base/echo", [HttpHeader("Content-Type", "application/octet-stream")], small, 30000)
+    val upLarge = client.request("POST", "$base/echo", [HttpHeader("Content-Type", "application/octet-stream")], large, 30000)
+    val done = drain(client)
+    for (id in ids) {
+        val c = find(done, id)
+        if (c == null) fail("no completion for $id")
+        else if (c.status != 200 || c.body != "hello h2\n" || c.protocol != "h2" || c.header("content-length") != "9") fail("small $id: ${c.status} '${c.body}' ${c.protocol} ${c.error}")
+    }
+    val b = find(done, bigId)
+    if (b == null || b.error != "" || b.status != 200 || b.body != big) fail("big: ${if (b == null) "none" else "${b.status} ${b.error} ${b.body.size} of ${big.size}"}")
+    val h = find(done, headId)
+    if (h == null || h.status != 200 || h.body.size != 0 || h.header("content-length") != "9") fail("HEAD: ${if (h == null) "none" else "${h.status} ${h.body.size} '${h.header("content-length")}' ${h.error}"}")
+    val s = find(done, upSmall)
+    if (s == null || s.error != "" || s.status != 200 || s.body != small) fail("echo of 300 KB: ${if (s == null) "none" else "${s.status} ${s.error} ${s.body.size}"}")
+    val l = find(done, upLarge)
+    if (l == null || l.error != "" || l.status != 200 || l.body != large) fail("echo of 3 MiB: ${if (l == null) "none" else "${l.status} ${l.error} ${l.body.size}"}")
+    if (client.connectionsOpened != 1) fail("one connection should carry everything: ${client.connectionsOpened}")
+    val again: array<int> = []
+    for (i in 0 until 10) again.append(client.get("$base/small.txt", [], 20000))
+    val second = drain(client)
+    for (id in again) {
+        val c = find(second, id)
+        if (c == null || c.status != 200 || c.protocol != "h2") fail("wave 2: ${if (c == null) "none" else "${c.status} ${c.protocol} ${c.error}"}")
+    }
+    if (client.connectionsOpened != 1) fail("the second wave opened a connection: ${client.connectionsOpened}")
+    return
+}
+
+fun goaway(var client: HttpAsyncClient, base: string): void {
+    // The connection first, with a quick request, so that h2o has an HTTP/2 connection to send the GOAWAY on.
+    val first = client.get("$base/small.txt", [], 20000)
+    val warm = drain(client)
+    val w = find(warm, first)
+    if (w == null || w.status != 200 || w.protocol != "h2") { fail("the first request: ${if (w == null) "none" else "${w.status} ${w.protocol} ${w.error}"}"); return }
+    val slow = client.get("$base/slow", [], 20000)
+    // Step once so the request is on the wire, then tell the script.
+    client.step(50)
+    println("sent")
+    val done = drain(client, 25000)
+    val c = find(done, slow)
+    if (c == null || c.error != "" || c.status != 200 || c.body != "slow\n") fail("the request in flight at GOAWAY: ${if (c == null) "none" else "${c.status} '${c.body}' ${c.error}"}")
+    // h2o is going away: a new request must fail, not hang.
+    val after = client.get("$base/small.txt", [], 8000)
+    val late = drain(client, 15000)
+    val a = find(late, after)
+    if (a == null) fail("the request after GOAWAY neither completed nor failed")
+    else if (a.error == "" && a.status == 200) fail("the request after GOAWAY was answered 200: a server that said goodbye took it")
+    return
+}
+
+fun main: int {
+    val port = decimal(processArgument(0))
+    val ca = processArgument(1)
+    val mode = processArgument(2)
+    val docroot = processArgument(3)
+    val tls = ca != "-"
+    var client = httpAsyncClient(HttpAsyncOptions(caPath = if (tls) ca else "", http2 = true, http2PriorKnowledge = !tls))
+    val base = "${if (tls) "https" else "http"}://localhost:$port"
+    if (mode == "full") full(client, base, docroot)
+    else if (mode == "goaway") goaway(client, base)
+    else fail("unknown mode $mode")
+    if (failures > 0) return 1
+    println("http2 h2o $mode ok")
+    0
+}

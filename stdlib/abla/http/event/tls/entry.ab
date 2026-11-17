@@ -482,11 +482,25 @@ fun HttpsEventServer.acceptReady(): void {
 }
 
 /** One pass of the loop: waits up to `timeoutMilliseconds` for socket events, serves them, then applies the timeouts. Returns the number of events handled. */
+/** Whether the slot's TLS session holds decrypted bytes nobody has taken and the slot can take them (nothing of its own waits to be written). The socket has nothing to
+ *  say about them: readSlot reads at most 64 times per event, and what the session had already read from the socket stays in it. */
+private fun HttpsEventServer.buffered(slot: int): bool =
+    this.tls != null && this.descriptors[slot] >= 0 && this.outputs[slot].size == 0 &&
+    (this.states[slot] == httpsHttp1 || this.states[slot] == httpsHttp2) && this.sessions[slot].hasPending()
+
 fun HttpsEventServer.step(timeoutMilliseconds: int = 1000): int {
     var handled = 0
     var maximumEvents = this.options.base.maximumConnections + 1
     if (maximumEvents > 1024) maximumEvents = 1024
-    val events = this.poller.waitCompact(maximumEvents, timeoutMilliseconds)
+    // Bytes a session still holds are served without waiting for the socket: a request body of 1 MiB or more (64 reads of 16 KiB) whose last bytes arrived with the
+    // 64th read would otherwise wait for an event that never comes.
+    var waiting = timeoutMilliseconds
+    if (this.tls != null) {
+        for (slot in 0 until this.descriptors.size) {
+            if (this.buffered(slot)) waiting = 0
+        }
+    }
+    val events = this.poller.waitCompact(maximumEvents, waiting)
     this.pass = linuxMonotonicMilliseconds()
     var index = 0
     while (index + 12 <= events.size) {
@@ -513,6 +527,14 @@ fun HttpsEventServer.step(timeoutMilliseconds: int = 1000): int {
             }
         }
         index = index + 12
+    }
+    if (this.tls != null) {
+        for (slot in 0 until this.descriptors.size) {
+            if (this.buffered(slot)) {
+                this.readSlot(slot)
+                handled = handled + 1
+            }
+        }
     }
     this.timers()
     handled

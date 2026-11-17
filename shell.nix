@@ -41,6 +41,8 @@ pkgs.mkShell {
     openssl
     # tools/test-http2.sh, tools/test-http2-server.sh: nghttpd, nghttp and h2load (HTTP/2 server, client and load generator).
     nghttp2
+    # tools/test-http2-h2o.sh: h2o (server) and h2o-httpclient, a second HTTP/2 implementation next to nghttp2.
+    h2o
     # tools/test-http2-server.sh: the HTTP/2 conformance suite.
     h2spec
     # tests/cases/rsa-keygen/check.sh: independent arithmetic on a generated key.
