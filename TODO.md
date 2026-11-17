@@ -195,9 +195,10 @@ mmap form) apply there.
   each before, none after); the short locks the collector itself may take while it holds the stop (a Shared's count lock) stay plain, since waiting for one in native
   state hung the churn test; the heap's and the stop's own futex locks still count as running (a stop waits 20 ms for
   a thread there and gives up, counted by `memoryHeapStat(8)`); a loop that never
-  allocates has no safe point and holds up every collection while it runs; a manual-collection program
-  (`memorySetManualCollection` without a limit or growth call) has no safe points, so an explicit collection with a
-  running worker is abandoned. Measured (ablac-74's request): the compiler's own build 52.2 s against 54.2 s, binary
+  allocates has no safe point and holds up every collection while it runs; a hosted manual-collection program
+  (`memorySetManualCollection` without a limit or growth call) that starts threads and can reach `memoryCollect` now keeps
+  its safe points (`tests/cases/gc-threads/manual-bare.ab`: one abandoned stop before, none after), at the cost of rooting
+  in such programs only; one without threads, or without an explicit collection, has none and is unchanged. Measured (ablac-74's request): the compiler's own build 52.2 s against 54.2 s, binary
   +0.39%, object +0.52%; NovaKind's signer (`--fast`) about +1.5% build time, binary +0.15%, object +0.19%.
   **Polling at every loop back edge: measured and dropped (2026-11-16).** A volatile load of a flag plus a branch to a
   cold call at every back edge (the cheapest poll that LLVM cannot hoist; the real one reads the collection

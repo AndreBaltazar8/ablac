@@ -141,7 +141,9 @@ fun bootstrapLlvmNeedsSharedRuntime(program: BootstrapIrProgram): bool {
 // Wasm and freestanding programs, and modules entered through their exports,
 // are manual by default (a compile-time slice's exports count as its mains).
 // In every mode, a reachable `memorySetLimit` or
-// `memorySetCollectionGrowth` asks for pressure collection.
+// `memorySetCollectionGrowth` asks for pressure collection. A hosted manual
+// program that can start a thread and call `memoryCollect` keeps the safe points too,
+// so its explicit collection can park a running worker.
 fun bootstrapLlvmNeedsCollector(
     program: BootstrapIrProgram,
     exports: array<BootstrapExportRequest>,
@@ -185,6 +187,13 @@ fun bootstrapLlvmNeedsCollector(
         !bootstrapLlvmReachesCall(program, functionIndex, addressTaken, fromMain, [
             "runtimeMemorySetManualCollection"
         ])) return true
+    // A hosted manual program that starts threads and can call memoryCollect keeps its safe points (#811): without
+    // them a worker never parks, and every explicit collection is abandoned while one runs. Allocation pressure still
+    // does not collect (the runtime stays manual); only the safe points and their roots are paid for, by programs
+    // that start threads and collect by hand.
+    if (automaticByDefault &&
+        bootstrapLlvmReachesCall(program, functionIndex, addressTaken, fromMain, ["thread.create"]) &&
+        bootstrapLlvmReachesCall(program, functionIndex, addressTaken, fromMain, ["runtimeMemoryCollect"])) return true
     // A module's exports are entry points too (a wasm host calls them, not main),
     // but there only an explicit opt-in turns on collection under pressure: an
     // export that just collects (between frames, say) keeps its callees unrooted.
@@ -241,6 +250,12 @@ fun bootstrapLlvmReachesCall(
                program.functions[function].instructions.size) {
             val candidate =
                 program.functions[function].instructions[instruction]
+            // A target can also name an instruction ("thread.create"), not only a runtime function.
+            var named = 0
+            while (named < targets.size) {
+                if (candidate.opcode == targets[named]) return true
+                named = named + 1
+            }
             if (candidate.opcode == "call") {
                 var target = 0
                 while (target < targets.size) {
