@@ -47,15 +47,12 @@ report() { # name rc
 }
 # Every peer ends with its client (peer.ab): none may outlive the run.
 check_peers() {
-    local left=() attempt process
+    local left=() attempt
     for attempt in $(seq 1 1200); do
-        left=()
-        for process in /proc/[0-9]*; do
-            case $(readlink "$process/exe" 2>/dev/null) in
-                "$output_directory"/faults | "$output_directory"/timeouts | "$output_directory"/deadlines)
-                    left+=("${process#/proc/}") ;;
-            esac
-        done
+        # One `ls -l` of every process's exe link per look (a readlink per process was a fork each, hundreds of them on a
+        # busy suite machine, ten times a second).
+        mapfile -t left < <(ls -l /proc/[0-9]*/exe 2>/dev/null | awk -v dir="$output_directory" \
+            '$(NF - 1) == "->" && ($NF == dir "/faults" || $NF == dir "/timeouts" || $NF == dir "/deadlines") { split($(NF - 2), part, "/"); print part[3] }')
         [[ ${#left[@]} -eq 0 ]] && break
         sleep 0.1
     done
