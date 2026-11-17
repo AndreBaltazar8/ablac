@@ -40,6 +40,15 @@ unnamed, and a type parameter of the same name is not the type); and a name qual
 `geo.Square`) names the declaration of that name in the module the alias imports (an overloaded name stays unnamed). A client that renames or
 finds references therefore sees every use of a class or of an aliased function; an occurrence that stays unnamed is one the service could not
 tell, and a client must not guess it.
+
+The language's built-in types and members (`bool`, `int`, `string`, `array`, `Map`, `void`; `size`, `append`, `get`, `slice`, ...) have no
+declaration in any program: sema knows them itself. The answer therefore carries one more document, `stdlib/abla/builtins/declarations.ab`, which
+declares each of them (classes and methods without bodies, each with a doc comment) and is parsed for its symbols and never typed. The built-in
+types and members are named from it like any other declaration (go-to-definition opens it, hover shows the declaration, find-references on
+its `append` finds the calls), and a program that declares a type of the same name owns that name in its own code. sema marks the members it
+handles by itself (`bootstrapBuiltinMemberKey`) and the service translates them to the module's declarations, in graph-v1 and graph-v2 alike.
+`tools/test-builtin-docs.sh` keeps the module and the compiler in step: a member sema accepts on a built-in receiver and the module does not
+declare, a declaration the compiler rejects, and a type the table of types in docs/language.md lists and the module does not declare each fail it.
 Additional fields are `analysisMode`, `entry`, `complete` and `pending`.
 A scope error uses `issues` and an empty document list. Ranges are UTF-8 byte
 offsets in the returned original source, including UTF-8 comments and source

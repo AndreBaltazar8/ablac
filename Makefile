@@ -120,6 +120,7 @@ test-serial: ablac
 	tools/test-analysis-service.sh $(COMPILER)
 	tools/test-frontend-analysis.sh $(COMPILER)
 	tools/test-analysis-graph.sh $(COMPILER)
+	tools/test-builtin-docs.sh $(COMPILER)
 	tools/test-analysis-memory.sh $(COMPILER)
 	tools/test-deep-logical.sh $(COMPILER)
 	tools/test-compile-effect-path.sh $(COMPILER)

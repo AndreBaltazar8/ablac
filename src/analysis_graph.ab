@@ -41,6 +41,29 @@ fun bootstrapAnalysisCollectionGrowth(sourceBytes: int): int {
     else held
 }
 
+/** The module that declares the language's built-in types and members for the editor (stdlib/abla/builtins/declarations.ab). It is parsed for its
+ *  symbols and never typed: the compiler knows the built-ins itself (sema.ab), and a program that imported this file would clash with them. */
+fun bootstrapAnalysisGraphBuiltinsPath(): string =
+    bootstrapNormalizeModulePath(Path(bootstrapStandardLibraryRoot()).child("abla/builtins/declarations.ab").text)
+
+/** The ids, in the file's own coordinates, of the built-in declarations by what sema calls them: `array.append`, `Map.get`, `string.size`
+ *  for the members, `array`, `Map`, `string` for the types. */
+fun bootstrapAnalysisGraphBuiltinIds(declarations: array<BootstrapDeclaration>): Map<string, string> {
+    val ids: Map<string, string> = Map()
+    for (declaration in declarations) {
+        if (declaration.kind != "class") continue
+        ids.set(declaration.name, bootstrapAnalysisDeclarationId(declaration))
+        for (index in 0 until declaration.parameters.size) {
+            ids.set("${declaration.name}.${declaration.parameters[index]}",
+                "abla:${declaration.sourceIdentity}:${declaration.begin}:field:$index:${declaration.parameters[index]}")
+        }
+        for (method in declaration.methods) {
+            ids.set("${declaration.name}.${method.name}", bootstrapAnalysisDeclarationId(method))
+        }
+    }
+    ids
+}
+
 /** A module's parse and symbols export, valid while its source, uri and visibility stay as they were. */
 class BootstrapAnalysisGraphParsed(
     val source: string,
@@ -347,12 +370,21 @@ fun bootstrapAnalysisGraphCanonical(aliases: Map<string, string>, id: string): s
     if (canonical != null) canonical else ""
 }
 
+/** The id a sema row names its declaration by: a built-in's `builtin:array.append` is the built-in module's declaration. */
+fun bootstrapAnalysisGraphRowId(id: string, builtins: Map<string, string>): string {
+    if (id.size > 8 && id.slice(0, 8) == "builtin:") {
+        val known = builtins.get(id.slice(8, id.size))
+        if (known != null) known else ""
+    } else id
+}
+
 fun bootstrapAnalysisGraphSemantic(
     semantic: BootstrapSemanticResult,
     documents: array<BootstrapAnalysisGraphDocument>,
     names: Map<string, string>,
     var lookup: BootstrapAnalysisGraphLookup,
-    aliases: Map<string, string>
+    aliases: Map<string, string>,
+    builtins: Map<string, string>
 ): BootstrapSemanticResult {
     val resolved: array<BootstrapResolvedName> = []
     for (name in semantic.resolvedNames) {
@@ -365,10 +397,11 @@ fun bootstrapAnalysisGraphSemantic(
                 // The span's text, as the editor sees it; the name's own string when it is the same text, so the
                 // occurrences do not each keep a copy (a synthetic name, such as a named argument's temporary, is not).
                 val text = document.document.text.slice(begin, end)
+                val identity = bootstrapAnalysisGraphRowId(name.declarationIdentity, builtins)
                 resolved.append(BootstrapResolvedName(document.document.path, begin, end,
                     (if (text == name.name) name.name else text),
-                    name.declarationIdentity, name.type,
-                    name.kind, bootstrapAnalysisGraphCanonical(aliases, name.declarationIdentity)))
+                    identity, name.type,
+                    name.kind, bootstrapAnalysisGraphCanonical(aliases, identity)))
             }
         }
     }
@@ -384,8 +417,9 @@ fun bootstrapAnalysisGraphSemantic(
                 document.document.path, begin, end, call.kind, name, call.type,
                 call.receiverType, call.target, call.argumentTypes, call.parameterTypes,
                 call.parameterKinds, call.argumentParameters, call.argumentConversions,
-                call.insertedDefaults, call.isCompileOnly, call.isTrusted, call.isContract, call.targetId,
-                bootstrapAnalysisGraphCanonical(aliases, call.targetId)))
+                call.insertedDefaults, call.isCompileOnly, call.isTrusted, call.isContract,
+                bootstrapAnalysisGraphRowId(call.targetId, builtins),
+                bootstrapAnalysisGraphCanonical(aliases, bootstrapAnalysisGraphRowId(call.targetId, builtins))))
         }
     }
     BootstrapSemanticResult(semantic.symbols, semantic.errors, semantic.extensionErrors,
@@ -660,6 +694,28 @@ fun BootstrapAnalysisService.graphSnapshot(): Json {
     if (holdsProject && (!configuredGrowth.found || configuredGrowth.value == "")) {
         runtimeMemorySetCollectionGrowth(bootstrapAnalysisCollectionGrowth(sourceBytes))
     }
+    // The built-in types and members, as a document that is never typed.
+    var builtinIds: Map<string, string> = Map()
+    val builtinDeclarations: array<BootstrapDeclaration> = []
+    val builtinPath = bootstrapAnalysisGraphBuiltinsPath()
+    var builtinPresent = false
+    for (document in documents) {
+        if (document.document.path == builtinPath) builtinPresent = true
+    }
+    if (!builtinPresent && Path(builtinPath).info().exists()) {
+        val builtinUri = bootstrapAnalysisGraphUri(builtinPath)
+        val builtinSource = Path(builtinPath).readText()
+        val cachedBuiltins = this.graphParsed.get(builtinPath)
+        val builtinParsed = if (cachedBuiltins != null && cachedBuiltins.source == builtinSource && cachedBuiltins.uri == builtinUri)
+            bootstrapAnalysisGraphReuse(cachedBuiltins)
+            else bootstrapAnalysisGraphParse(builtinSource, builtinUri, true, builtinPath, this.graphStableIds)
+        this.graphParsed.set(builtinPath, builtinParsed)
+        documents.append(BootstrapAnalysisGraphDocument(
+            BootstrapAnalysisDocument(builtinUri, builtinPath, 0, builtinSource, true), builtinParsed.parsed,
+            builtinParsed.symbols, builtinParsed.rewrite, builtinParsed.stable, builtinParsed.exported, builtinParsed.key))
+        builtinIds = bootstrapAnalysisGraphBuiltinIds(builtinParsed.parsed.declarations)
+        for (declaration in builtinParsed.parsed.declarations) builtinDeclarations.append(declaration)
+    }
     val begins: array<int> = []
     val ends: array<int> = []
     val kinds: array<string> = []
@@ -685,11 +741,14 @@ fun BootstrapAnalysisService.graphSnapshot(): Json {
         for (declaration in analyzed.parsed.declarations) {
             bootstrapAnalysisGraphDeclarationAliases(declaration, documents, aliases, lookup)
         }
-        val semantic = bootstrapAnalysisGraphSemantic(analyzed.semantic, documents, names, lookup, aliases)
+        for (declaration in builtinDeclarations) {
+            bootstrapAnalysisGraphDeclarationAliases(declaration, documents, aliases, lookup)
+        }
+        val semantic = bootstrapAnalysisGraphSemantic(analyzed.semantic, documents, names, lookup, aliases, builtinIds)
         semanticDiagnostics = semantic.diagnostics
         bootstrapAnalysisSampleMemory("semantic converted")
         val occurrenceIndex = bootstrapAnalysisOccurrenceIndex(analyzed.parsed.declarations,
-            semantic)
+            semantic, builtinIds)
         bootstrapAnalysisSampleMemory("occurrence index")
         for (document in documents) {
             // Kept compact for the queries, and in the answer as the text it encodes to: not a node per occurrence.

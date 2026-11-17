@@ -433,6 +433,75 @@ async function localNames(mode) {
     await s.close();
 }
 
+// The language's built-in types and members have no declaration in any program: the editor names them from the documentation module
+// stdlib/abla/builtins/declarations.ab, which the service adds to the answer as a document that is never typed. Go-to-definition opens it, hover shows
+// the declaration, and a program's own declaration of the same name wins.
+async function builtins(mode) {
+    const main = [
+        'class Cell(val v: int)',
+        'fun main: int {',
+        '    val xs: array<int> = []',
+        '    xs.append(1)',
+        '    val m: Map<string, int> = Map()',
+        '    m.set("a", 1)',
+        '    val c = Cell(2)',
+        '    val s = "abc"',
+        '    val t = s.slice(0, 1)',
+        '    val n = xs.size + m.size + s.size + c.v',
+        '    if (m.has("a")) return n',
+        '    return 0',
+        '}',
+        '',
+    ].join('\n');
+    const p = fixture(`builtins-${mode}`, { 'main.ab': main });
+    const s = await start(p, { mode });
+    const a = await s.analyze();
+    noErrors(a);
+    const d = doc(a, path.join(p, 'main.ab'));
+    const stubUri = a.documents.map((x) => x.uri).find((u) => u.endsWith('/stdlib/abla/builtins/declarations.ab'));
+    assert.ok(stubUri, 'the built-in documentation module is a document of the answer');
+    const stub = a.documents.find((x) => x.uri === stubUri);
+    const stubSymbol = (name, container) => stub.symbols.find((x) => x.name === name && (container === undefined || x.containerId?.endsWith(container) || x.id.includes(container)));
+    const at = (name, nth = 0) => occurrence(d, name)[nth];
+    const named = (o, expectName) => {
+        assert.ok(o, `an occurrence of ${expectName}`);
+        assert.ok(o.declarationId, `${expectName} names a declaration`);
+        const symbol = stub.symbols.find((x) => x.id === o.declarationId);
+        assert.ok(symbol, `${expectName} names a declaration of the documentation module (${o.declarationId})`);
+        assert.equal(symbol.name, expectName);
+        return symbol;
+    };
+    // members: the method call, the property and the call through a nullable result
+    named(at('append'), 'append');
+    named(at('set'), 'set');
+    named(at('has'), 'has');
+    named(at('slice'), 'slice');
+    const sizes = occurrence(d, 'size');
+    assert.equal(sizes.length, 3);
+    for (const o of sizes) named(o, 'size');
+    // types: written as types, as constructors and as the receiver's declared types
+    for (const name of ['array', 'Map', 'string', 'int']) {
+        const uses = occurrence(d, name).filter((o) => d.text[o.range.start - 1] !== '.');
+        assert.ok(uses.length > 0, `a use of ${name}`);
+        for (const o of uses) named(o, name);
+    }
+    // the program's own class named like a built-in is its own (Cell has no built-in declaration here: the program's wins)
+    const own = d.symbols.find((x) => x.name === 'Cell');
+    assert.ok(own);
+    for (const o of occurrence(d, 'Cell').filter((x) => d.text[x.range.start - 1] !== '.')) assert.equal(o.declarationId, own.id, 'the program declares Cell');
+    // go-to-definition and hover on a built-in go to the documentation module
+    const params = (o) => ({ uri: d.uri, offset: o.range.start });
+    const definition = (await s.rpc('query/definition', params(at('append')))).result.value;
+    assert.equal(definition.uri, stubUri);
+    const hover = (await s.rpc('query/hover', params(at('append')))).result.value;
+    assert.equal(hover.symbol.name, 'append');
+    assert.equal(hover.symbol.uri, stubUri);
+    // find-references on the declaration in the documentation module finds the use in the program
+    const references = (await s.rpc('query/references', { uri: stubUri, offset: stubSymbol('append').selectionRange.start })).result.value;
+    assert.ok(references.some((r) => r.uri === d.uri), 'the call of append is a reference of the built-in append');
+    await s.close();
+}
+
 async function projections() {
     let p = fixture('projections', { 'main.ab': '// café 😀\nimport "dep.ab"\nfun main: int = answer()\n', 'dep.ab': 'fun answer: int = 42\n' });
     let s = await start(p);
@@ -765,7 +834,7 @@ async function since() {
     await legacy.close();
 }
 
-const tests = { local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
+const tests = { builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
 const filter = process.env.ANALYSIS_TEST_FILTER ? process.env.ANALYSIS_TEST_FILTER.split(',') : null;
 for (const [name, test] of Object.entries(tests)) {
     if (filter && !filter.includes(name)) continue;
