@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # A defer captures its enclosing binding before control flow can enter a loop
 # or skip the first defer. Captures survive every exit and are read in LIFO order.
+# A defer assigns the enclosing locals themselves (not copies), at run time and under `#`.
 set -euo pipefail
 compiler=${1:-build/ablac.bin}
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
