@@ -1165,11 +1165,17 @@ mmap form) apply there.
   Checked 2026-11-08: NovaKind's `gateway/toolchain/ablac-version` is still 0.2.32, so it stays until
   that moves (NovaKind's call). The abla-cli, abla-mjml, abla-qr and abla-saft CI pins moved to 0.2.50
   the same day (their CI steps pass with it); abla-s3's is 0.2.45, NovaKind's main pin 0.2.48.
-- [ ] **Released toolchains can't target Xtensa.** CI's Nix shell has the patched LLVM
-  ([llvm-xtensa.md](docs/llvm-xtensa.md)), but `abla-toolchain-x86_64-linux` bundles
-  stock LLVM and the macOS jobs use Homebrew's, without the private Xtensa patches. The old Nix-built one needs Nix's glibc 2.44; a separate glibc 2.35 companion
-  and native companions for both Macs are now published. Target-specific source routing is
-  validated; release packaging with that compiler is still pending.
+- [x] **Released toolchains target Xtensa through the optional companion (v0.2.49 and later).** The toolchain archives
+  bundle stock LLVM and no Xtensa patches ([llvm-xtensa.md](docs/llvm-xtensa.md)); the old Nix-built LLVM needs Nix's
+  glibc 2.44. A separate glibc 2.35 companion and native companions for both Macs are published, the packaged
+  `bin/abla-install-xtensa` installs them, and source routing is merged (`4b944cfc`). The release job now installs
+  the published companion into the packaged toolchain and builds Xtensa objects with it, byte-identical to the Nix
+  cohort's (`tools/test-release-xtensa.sh`; proved locally on 2026-11-17 against the real v0.2.61 Linux archive and the
+  published 23.1.3-1 companion in the release job's Ubuntu 22.04 image). A release gives relocatable objects only:
+  linking, boot/vector assembly and the ESP-IDF libraries stay the SDK's (see the user docs).
+  `tests/cases/xtensa-routing/nix-objects.json`'s object hashes are out of date for the current compiler (the first
+  object builds to `88e2365f…`, not `6a8e779e…`, with the Nix cohort and with the installed one alike), so the manual
+  routing probe `tools/test-xtensa-routing-installed.mjs` fails its first assertion until they are regenerated.
   #787: macOS refused publication of a 0555 staged directory with EACCES.
   Keep the root 0700 through rename and finalize it by handle afterward; an
   interrupted publish requires an operator to remove the incomplete version

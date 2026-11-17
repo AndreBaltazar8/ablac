@@ -136,6 +136,14 @@ process.exit(result.status === null ? 128 : result.status);
     }
     build('badcpu', [], { ABLA_ESP_CPU: 'esp32c3' }, 'E_XTENSA_CPU');
     build('missing', [], { ABLA_XTENSA_LLVM_ROOT: path.join(root, 'missing') }, 'E_XTENSA_LLVM_MISSING');
+    // The hint names an installer only where this compiler's toolchain has one (a packaged toolchain); a source build
+    // says to install a released toolchain, not a path that does not exist.
+    {
+        const hint = build('missing-hint', [], { ABLA_XTENSA_LLVM_ROOT: path.join(root, 'missing') }, 'E_XTENSA_LLVM_MISSING').stderr;
+        const named = /run '([^']*abla-install-xtensa) --version 23\.1\.3-1'/.exec(hint);
+        if (named) assert.ok(fs.existsSync(named[1]), `the hint names an installer that does not exist: ${named[1]}`);
+        else assert.ok(hint.includes('install a released toolchain and run its bin/abla-install-xtensa --version 23.1.3-1'), hint);
+    }
     const savedManifest = read(path.join(first, 'manifest.json'));
     fs.writeFileSync(path.join(first, 'manifest.json'), '{ broken json');
     build('bad-json', [], {}, 'E_XTENSA_LLVM_MANIFEST');

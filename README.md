@@ -90,7 +90,9 @@ on other systems. Use the toolchain archive instead.
 The optional Xtensa companion is installed explicitly with the packaged native
 `bin/abla-install-xtensa --version 23.1.3-1`. It does not support HTTP proxies;
 use `--archive PATH` with an archive downloaded by other means when needed.
-See [Xtensa installation](docs/llvm-xtensa.md#explicit-installation).
+See [Xtensa installation](docs/llvm-xtensa.md#explicit-installation). With the companion a release builds Xtensa
+objects (`--target-triple xtensa-esp-unknown-elf --emit object`); linking them, boot/vector assembly and flashing still
+need the ESP SDK ([what a release gives you](docs/llvm-xtensa.md#what-a-release-gives-you-and-what-it-does-not)).
 
 A macOS archive runs with
 Homebrew's, which must be the LLVM its compiler links, since the compiler reads

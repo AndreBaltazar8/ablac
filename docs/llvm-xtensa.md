@@ -1,5 +1,31 @@
 # The Xtensa LLVM
 
+## What a release gives you, and what it does not
+
+A released toolchain (v0.2.49 or later) builds Xtensa code once its optional companion is installed. Nothing else from
+the Nix shell is needed:
+
+```sh
+<toolchain>/bin/abla-install-xtensa --version 23.1.3-1     # a verified download, once per toolchain
+ABLA_ESP_CPU=esp32s3 <toolchain>/bin/ablac build main.ab -o main.o \
+    --target-triple xtensa-esp-unknown-elf --object-format elf --emit object
+```
+
+Without the companion that build stops with `E_XTENSA_LLVM_MISSING`, which names the installer. **The result is a
+relocatable ELF object (and its `.ll`, `.abi.json` and `.xtensa-tools.json`), not a firmware image.** What still comes
+from outside Abla, and from the ESP SDK, even with a release and the companion:
+
+- **Linking.** The companion has no Xtensa LLD, and `ablac` does not run a linker for Xtensa. The object is linked by the
+  SDK's GNU linker with its linker scripts, startup files and libraries.
+- **Boot and vector assembly.** A program that carries the SDK's boot/vector layout markers (`WindowVectors`,
+  `ABLA_XTENSA_*`) needs the SDK's GNU assembler; the build refuses it with `E_XTENSA_EXTERNAL_ASSEMBLER`.
+- **Flashing, partitions, the ESP-IDF components** (Wi-Fi, FreeRTOS, drivers) and a C compiler for any C glue.
+
+So a release alone is enough to compile Abla modules for ESP32 to objects, and to check that they build. Producing a
+board image still needs ESP-IDF, as in abla-embedded. Each release's job installs the published companion into the
+packaged toolchain and builds Xtensa objects with it (`tools/test-release-xtensa.sh`), so this path is tested for the
+archive that ships.
+
 Abla's ESP32 work needs LLVM's experimental Xtensa backend and the patches in
 `nix/llvm-xtensa-*.patch`. A full LLVM build can take over an hour, so x86_64 Linux
 uses a build made once by hand and published as a GitHub release of the fork
@@ -34,10 +60,9 @@ André chose a separately versioned, optional download. It does not go into ever
 Abla release or replace the parent LLVM or Clang. Revision
 [23.1.3-1](https://github.com/AndreBaltazar8/llvm-project/releases/tag/abla-xtensa-llvm-23.1.3-1)
 is published for all three hosts, and explicit verified installation is implemented.
-The source compiler routes Xtensa through that installed cohort; releases up to
+The compiler routes Xtensa through that installed cohort from v0.2.49 on; releases up to
 v0.2.48 still require the older Nix setup. The routing change's validation is
-tracked in the [design and evidence](design/xtensa-companion.md). The
-[design and gate list](design/xtensa-companion.md) records that status.
+tracked in the [design and evidence](design/xtensa-companion.md).
 
 The private cohort is `opt`, `llc` and `libLLVM`, with the Xtensa backend, for
 x86_64 Linux and native arm64/Intel macOS. Linux builds against glibc 2.35 and
@@ -76,11 +101,9 @@ HTTP proxies are not supported. If `HTTPS_PROXY`, `https_proxy` or `ALL_PROXY`
 is set, download the host archive by other means and add
 `--archive /path/to/the-host-archive.tar.gz`. The
 archive still has to match the checked-in catalog. Installation never changes
-Clang, the parent LLVM, or the compiler binary. The source compiler now routes
-Xtensa through the selected companion. Releases
-through v0.2.48 predate that routing change: installing it alone does not add
-Xtensa support to those older compiler binaries. The v0.2.49 migration draft is
-in TODO.md.
+Clang, the parent LLVM, or the compiler binary. The compiler routes Xtensa through the selected companion from
+v0.2.49 on. Releases through v0.2.48 predate that routing: installing it alone does not add
+Xtensa support to those older compiler binaries. The v0.2.49 migration wording is in TODO.md.
 
 The catalog is `tools/xtensa-companions.json`, also shipped under
 `share/abla/xtensa-companions.json`. It pins the archive URL and SHA-256 and the
@@ -239,6 +262,5 @@ Unsupported integrated-assembler CFI remains an explicit build failure.
 Live SDK boot/vector layout markers produce `E_XTENSA_EXTERNAL_ASSEMBLER`;
 those paths still need the SDK's GNU-as orchestration. Ordinary code generation
 and the real package-import memory gate are tested separately from that SDK
-boundary. Source routing and downstream gates have passed; the next release will carry
-the routing change. This section does not claim it is in an already published
-Abla release.
+boundary. Source routing and downstream gates passed, and the routing is in v0.2.49 and later. The installed-toolchain
+build is checked by each release's job (`tools/test-release-xtensa.sh`) and by the manual stock-parent probes in CI.
