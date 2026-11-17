@@ -1,0 +1,101 @@
+// Frozen groups (docs/design/frozen-heap.md): a graph with sharing, a cycle, ropes (long concatenations), nested arrays and
+// maps, copied into a read-only group, survives many collections intact (the collector neither marks nor sweeps it), and the
+// copy equals the original. Run under ABLA_GC_STRESS=1 too (tools/test-frozen.sh).
+import "abla/io"
+import "abla/memory"
+import "abla/runtime/memory"
+import "abla/text"
+
+
+class Leaf(val name: string, val values: array<int>)
+class Node(val label: string, val leaf: Leaf, val tags: Map<string, int>, val kids: array<Node>, var next: Node?)
+
+fun longText(n: int): string {
+    var text = ""
+    var index = 0
+    while (index < n) {
+        text = text + "part" + "${index}" + ";"
+        index = index + 1
+    }
+    text
+}
+
+fun build(depth: int, shared: Leaf): Node {
+    val tags: Map<string, int> = Map()
+    tags.set("depth", depth)
+    tags.set("twice${depth}", depth * 2)
+    val kids: array<Node> = []
+    if (depth > 0) {
+        kids.append(build(depth - 1, shared))
+        kids.append(build(depth - 1, shared))
+    }
+    // An array grown by appends has room past its count: the slack must not matter.
+    Node(longText(30 + depth) + "/${depth}", shared, tags, kids, null)
+}
+
+fun checksum(node: Node): int {
+    var total = node.label.size + node.leaf.values.size + (node.tags.get("depth") ?? -1)
+    for (value in node.leaf.values) total = total + value
+    for (kid in node.kids) total = total + checksum(kid)
+    total
+}
+
+fun same(left: Node, right: Node): bool {
+    if (left.label != right.label || left.leaf.name != right.leaf.name) return false
+    if (left.leaf.values.size != right.leaf.values.size || left.kids.size != right.kids.size) return false
+    if ((left.tags.get("depth") ?? -1) != (right.tags.get("depth") ?? -1)) return false
+    var index = 0
+    while (index < left.kids.size) {
+        if (!same(left.kids[index], right.kids[index])) return false
+        index = index + 1
+    }
+    true
+}
+
+fun main: int {
+    val shared = Leaf(longText(20), [1, 2, 3, 4, 5, 6, 7, 8])
+    val plain = build(6, shared)
+    // A cycle through a var field set before the freeze.
+    plain.next = plain
+    val expected = checksum(plain)
+    val before = runtimeMemoryHeapStat(11)
+    val frozen = Frozen(plain).get()
+    val after = runtimeMemoryHeapStat(11)
+    if (after <= before) {
+        println("FAIL: nothing was frozen ($before -> $after, reason ${runtimeMemoryHeapStat(12)})")
+        return 1
+    }
+    var round = 0
+    while (round < 12) {
+        val garbage: array<string> = []
+        var index = 0
+        while (index < 3000) {
+            garbage.append("garbage${index}")
+            index = index + 1
+        }
+        memoryCollect()
+        round = round + 1
+    }
+    val cycle = frozen.next
+    if (cycle == null || cycle.label != frozen.label) {
+        println("FAIL: the cycle is gone")
+        return 1
+    }
+    if (checksum(frozen) != expected || !same(frozen, plain)) {
+        println("FAIL: the frozen graph differs: ${checksum(frozen)} against $expected")
+        return 1
+    }
+    // Sharing: both children of the root reach one Leaf object in the original; the copy keeps that (one block).
+    if (frozen.kids[0].leaf.name != shared.name) {
+        println("FAIL: the shared leaf differs")
+        return 1
+    }
+    // A scalar is returned as it is.
+    val number = Frozen(41).get()
+    if (number + 1 != 42) {
+        println("FAIL: a scalar changed")
+        return 1
+    }
+    println("frozen graph ok: ${expected}")
+    0
+}
