@@ -5,8 +5,9 @@
 # explicit overrides.
 #   - heavy.ab: work past a lowered step limit is native by default and gives the run-time
 #     answer; under `interp` the same site stops with E_EVAL_STEP_LIMIT;
-#   - bounded.ab, recursive.ab: under auto a pass whose sites reach no loop, lambda or recursion gets no
-#     native generation (the interpreter runs them), one with recursion does; jit takes both;
+#   - bounded.ab, recursive.ab, native-call/: under auto a pass whose sites reach no loop, lambda, recursion or C
+#     function-pointer call gets no native generation (the interpreter runs them), one with recursion or such a
+#     call does; jit takes both;
 #   - effects/: a site the native tier takes and one it refuses each append one line to a file:
 #     each file holds its line once (no site runs twice to choose), the trace says which ran
 #     natively and why the other did not;
@@ -106,6 +107,13 @@ for tier in unset jit; do
     ! grep -q '^note\[ct-jit\]: ordinary-global write analysis' "$output/registers-$tier.trace" ||
         { cat "$output/registers-$tier.trace" >&2; fail "registers.ab under $tier: a pass was prepared for abla/json's registrations"; }
 done
+# A call through a C function pointer (dlsym, then `ablaUnsafeCallExact_*`) is one the interpreter can't make: under
+# auto such a site runs natively, though it holds no loop, lambda or recursion (native-call/, #1022).
+build native-call-auto "$cases/native-call/main.ab" -u ABLA_COMPILE_EVAL ||
+    { cat "$output/native-call-auto.trace" >&2; fail "native-call under auto did not build"; }
+[[ $(runs native-call-auto) == 42 ]] || fail "native-call under auto gave the wrong value"
+grep -q '^note\[ct-jit\]: native at' "$output/native-call-auto.trace" ||
+    { cat "$output/native-call-auto.trace" >&2; fail "native-call's site was not native under auto"; }
 build bounded-jit "$cases/bounded.ab" ABLA_COMPILE_EVAL=jit ||
     { cat "$output/bounded-jit.trace" >&2; fail "bounded.ab under jit did not build"; }
 [[ $(runs bounded-jit) == 42 ]] || fail "bounded.ab under jit gave the wrong values"

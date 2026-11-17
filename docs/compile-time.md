@@ -605,8 +605,10 @@ nothing. A load, store or call through such a null address (or any address in
 the null page) fails the evaluation with `E_EVAL_NATIVE_ADDRESS`; the compiler
 doesn't crash. Call C functions through `extern:"c"` declarations: the
 evaluator calls a function pointer itself only through `ablaUnsafeCallVoid0`,
-`ablaUnsafeCallI32` and `ablaUnsafeCallVoidPointer3`, and the other typed
-`ablaUnsafeCall*` functions of `abla/unsafe/native` work only at run time.
+`ablaUnsafeCallI32` and `ablaUnsafeCallVoidPointer3`. The other typed
+`ablaUnsafeCall*` calls (`ablaUnsafeCallExact_*` among them, which code that
+finds C functions with `dlsym` calls them through) work in the native tier,
+so under `auto` a site that reaches one runs natively.
 `nativeStaticAllocate` storage is zeroed and lasts for the compilation.
 
 ### Capabilities and the build cache
