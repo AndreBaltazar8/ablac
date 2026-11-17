@@ -95,6 +95,18 @@ grep -qF "fix-imports: 0 module(s) changed" "$output_directory/hook.out" &&
     grep -qF '`hook` is declared differently by the programs that share this module' "$output_directory/hook.out" &&
     ! grep -q '^import' "$output_directory/hook/shared.ab" ||
     { echo "strict-imports: fix-imports imported a hook each program declares:"; cat "$output_directory/hook.out" "$output_directory/hook/shared.ab"; exit 1; }
+# A name in a file of another (vendored) package that its entry doesn't pass on: no import into .abla/, which would
+# bypass the package import; it is listed, naming the package whose entry should `export import` the file.
+mkdir -p "$output_directory/vendored/src"
+printf 'fun lib(): int = parseIt()\n' > "$output_directory/vendored/src/lib.ab"
+printf '%s\t1\t18\tparseIt\t.abla/packages/abla-xml/source/src/parse.ab\timport "../.abla/packages/abla-xml/source/src/parse.ab"\n' \
+    "$output_directory/vendored/src/lib.ab" > "$output_directory/vendored/report.tsv"
+"$compiler" run "$project_root/tools/fix-imports.ab" -- "$output_directory/vendored/report.tsv" \
+    > "$output_directory/vendored.out"
+grep -qF "fix-imports: 0 module(s) changed" "$output_directory/vendored.out" &&
+    grep -qF "which package abla-xml's entry doesn't pass on: not imported" "$output_directory/vendored.out" &&
+    ! grep -q '^import' "$output_directory/vendored/src/lib.ab" ||
+    { echo "strict-imports: fix-imports imported a vendored package's file:"; cat "$output_directory/vendored.out" "$output_directory/vendored/src/lib.ab"; exit 1; }
 # The standard library is a strict package: its facades pass on what they
 # front, and a library module that uses a name it doesn't import is rejected,
 # with the library module to import (here in a copy of the sysroot).
