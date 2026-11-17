@@ -752,6 +752,25 @@ is reached by some case or listed with the reason it isn't
 `tools/test-compile-time-parity-guard.sh` checks both. Test programs whose
 build is meant to fail aren't cases (`tests/cases/parity/negative.txt`).
 
+Status, over the 371 cases:
+
+- `auto` (the default) and `jit`: 362 pass. The other 9 differ by design:
+  - 6 panic the same way on both sides;
+  - 2 report the process they run in (its executable, its addresses), which under `#` is the compiler;
+  - 1 is a server that never exits, so it has no result to compare.
+- `interp` (the evaluator, chosen explicitly): 311 pass. The other 60:
+  - the evaluator's limits, by design: 19 measure or reset the program heap the evaluator doesn't have, 15 run
+    past its step limit, 8 start threads whose bodies run only when awaited, 1 keeps real-time deadlines;
+  - 6 of the native tiers' kind (3 same panics, the process twice, the server), and one program whose own `#`
+    recursion is deeper than the evaluator's stack;
+  - 9 the evaluator can't build, each with its reason in `expected-pass.txt`:
+    - the compiler run under `#` passing its 4096 MB memory limit (2);
+    - the step limit inside a longer build (3);
+    - word-level runtime values (2), SIMD vectors (1), and one whose diagnostic is lost;
+  - 1 that differs: a forked child, a copy of the compiler running the evaluator, runs out of memory.
+
+  All of these but the 6 of the native tiers' kind pass under `auto` and `jit`, which run that code natively.
+
 | Area | Under `#` today |
 |---|---|
 | Functions, recursion, classes and methods, arrays, `Map`, strings, string templates | works |
