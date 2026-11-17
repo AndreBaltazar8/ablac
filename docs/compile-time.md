@@ -615,6 +615,11 @@ Environment values themselves are not stored in the cache sidecar. The
 manifest is part of the cache identity too. Every other capability makes a
 build that uses it uncacheable.
 
+The compile-time tier (`ABLA_COMPILE_EVAL`) is part of the cache identity of
+a build and of an `ablac run` record. The tiers can disagree: a site the
+evaluator stops on can finish natively. So a build cached under one tier is
+never reused under another.
+
 Parser handlers and extension finalizers get the same granted capabilities
 as the rest of their module, and their journals join the same cache record.
 Because they run before semantic analysis has finished, their grants are

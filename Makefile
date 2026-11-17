@@ -275,6 +275,7 @@ test-serial: ablac
 	tools/test-compile-global-graph.sh $(COMPILER)
 	tools/test-compile-eval-jit.sh $(COMPILER)
 	tools/test-compile-eval-tier.sh $(COMPILER)
+	tools/test-compile-eval-cache-tier.sh $(COMPILER)
 	tools/test-compile-eval-shared-state.sh $(COMPILER) host
 	tools/test-compile-eval-shared-state.sh $(COMPILER) wasm
 	tools/test-compile-eval-json.sh $(COMPILER)
