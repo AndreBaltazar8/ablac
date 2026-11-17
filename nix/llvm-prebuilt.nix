@@ -8,10 +8,10 @@
 { pkgs }:
 
 let
-  tag = "llvm-23.1.3-xtensa-1";
+  tag = "llvm-23.1.3-xtensa-2";
   archive = "${tag}-x86_64-linux";
   # Hash of these patches, in nix/llvm.nix's order, joined.
-  patchesSha256 = "2666bbe521afe4605a3fc9a7610985e44281ec3a17c35dff78b5745a2ebc81f3";
+  patchesSha256 = "4f544721c71fb8acfeff47d66f541dbcdeefeff82cc59e503986306c7adb6ea2";
   patchNames = [
     "direct-calls"
     "extui"
@@ -31,7 +31,7 @@ in
     outputs = [ "out" "lib" "dev" ];
     src = pkgs.fetchurl {
       url = "https://github.com/AndreBaltazar8/llvm-project/releases/download/${tag}/${archive}.tar.xz";
-      sha256 = "f71d997c7e7420736302dd53a2bf4071b99969b134f0415df7366ebf3ee7757a";
+      sha256 = "ac452ac71975498fcc54e928e8376f18f72fe871979e5220173d71c8dc9a9ca3";
     };
     nativeBuildInputs = [ pkgs.autoPatchelfHook ];
     buildInputs = with pkgs; [ stdenv.cc.cc.lib libffi libxml2 zlib ];

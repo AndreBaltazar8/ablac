@@ -231,8 +231,7 @@ from compilation.
    checksums in Abla's catalog and run its live metadata check.
 
 The portable companion has its own revision and release workflow; updating the
-Nix pin does not publish a companion or silently select a held patch. The
-128–255-byte scavenging-slot fix remains under its separate hardware gate.
+Nix pin does not publish a companion: a patch reaches the portable companion only through a new companion revision.
 
 ### Source compiler routing and firmware density
 

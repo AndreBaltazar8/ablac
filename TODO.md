@@ -304,17 +304,7 @@ mmap form) apply there.
   billion), and NovaKind's tool 2,674,576 to 2,824,680 (31.794 to 32.779
   billion). Revisit only with LLVM-correct relocation and section rules.
 
-- [ ] **Xtensa `llc` aborts on frames of 128 to 255 bytes that take a stack address.** `LLVM ERROR: Error
-  while trying to spill A6 from class AR: Cannot scavenge register without an emergency spill slot!`, seen
-  2026-11-01 on `esp32RecoveredZN3nvs7Storage9writeItem...` from abla-embedded's `tools/build-example
-  imu-offsets` (still, 2026-11-17, with abla-embedded 5cda415 and ablac v0.2.61). It's the fork's backend, not our IR:
-  `LEA_ADD`'s `ADDI` reaches only 127, the scratch register for a farther frame address needs the scavenger's slot, and
-  `llvm-xtensa-scavenging-slot.patch` reserved it only past 255 bytes. The patch now says `!isInt<8>(MaxSPOffset)`;
-  `tests/cases/xtensa-llc/scavenging-slot.ll` (47 lines, reduced from that function with llvm-reduce) aborts the pinned
-  companion's `llc` and compiles with the patched one (an Xtensa-only build of the fork plus the patch), and the whole
-  imu-offsets module compiles with it. A changed patch means a new companion revision (docs/llvm-xtensa.md, "Adding a
-  patch"), and it's held for the PaperMono hardware test with `mcu-gc-inline`: until the release is published,
-  `tools/test-llvm-xtensa.sh` fails on the pinned `llc`.
+- [ ] **The portable Xtensa companion (23.1.3-1) still aborts `llc` on frames of 128 to 255 bytes that take a stack address.** `LLVM ERROR: ... Cannot scavenge register without an emergency spill slot!` (abla-embedded `imu-offsets`). Fixed in the fork (e4da75d4, `nix/llvm-xtensa-scavenging-slot.patch`) and shipped to the Nix shell as `llvm-23.1.3-xtensa-2`; the portable companion needs a new revision (docs/llvm-xtensa.md, "Building a companion") for `tools/xtensa-companions.json`. `tests/cases/xtensa-llc/scavenging-slot.ll` is the reduced input, run by `tools/test-llvm-xtensa.sh`.
 - [ ] **A class's methods are all compiled, used or not** (abla-one, 0.2.29), so what only one method reaches stays in every program
   with the class: `val table = build()` read only by an uncalled method still runs at startup and links `build` (why abla-one's
   `Style.wrap` is an extension). The uncalled method is dropped by LLVM, its global's initializer isn't. Looked at 2026-11-02, not changed:
