@@ -591,11 +591,31 @@ and removals `filesystem.write`; standard output and error none (and
 `Argument`/`ArgumentCount` none: there are no arguments under `#`); standard
 input and processes `process.io`; `Net*` `network`; `Sleep` and `MonotonicMilliseconds`
 `clock`; `SecureRandom` `random`. The `Tls*` functions of `abla/platform/host/tls` are not providers: they are
-`abla/tls/pure` (TLS in Abla, no OpenSSL) compiled into the site like any stdlib code, so a site that uses them needs
-`ABLA_COMPILE_EVAL=jit` (interpreted, a handshake runs past the step limit) and the grants of the code it runs:
-`trusted.native` (the sockets), `filesystem.read` (the trust store), `environment` (`SSL_CERT_FILE`, `SSL_CERT_DIR`) and
-`clock` (certificate validity),
-and not `network`.
+`abla/tls/pure` (TLS in Abla, no OpenSSL) compiled into the site like any stdlib code. What they ask for is `network` and
+nothing else, by the rule below. Under `ABLA_COMPILE_EVAL=auto` such a site runs natively by itself (a handshake is far
+more than the interpreter's trial steps, and the trial stops before the first system call).
+
+### A standard-library module that carries its own effects under `network`
+
+A few trusted standard-library modules are *network scopes*: `abla/tls/pure` and `abla/platform/host/tls`. What the code
+of such a module does by itself (sockets and the other system calls, raw memory, the trust store and
+`SSL_CERT_FILE`/`SSL_CERT_DIR`, the clock for certificate validity, random numbers for the handshake) is the module's
+own business: the capability analysis turns the effects `trusted.native`, `filesystem.read`, `environment`, `clock` and
+`random` that reach a scope's declaration into `network`, at that declaration, and a caller is asked for `network` only.
+It is the containment the standard library already has for raw memory, one level up.
+
+The rule is narrow:
+
+- Only the effects of the scope's declarations and of what they call are turned into `network`. A program's own system
+  call, file read, environment read or clock read beside the TLS call still needs its own grant.
+- `filesystem.write` and `process.io` are never turned into `network`: a scope that reached them would be denied for them.
+- A function the program passes in (a callback, a closure) keeps its own effects, which are the program's.
+- A declaration that makes none of those effects (a parser, a key schedule) asks for nothing.
+- Nothing else is a scope: `abla/sys/linux/net` and the rest of the standard library need their grants when `#` code
+  calls them, as before.
+
+The scope changes what is asked, not what runs: the code runs in the site's native slice, and the native object cache is
+off for it like for every `network` site.
 
 Without the grant, a native call is rejected before it runs
 (`compile.effect-denied:trusted.native`, or `E_COMPILE_NATIVE_DENIED` from a
