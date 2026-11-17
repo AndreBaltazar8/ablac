@@ -609,6 +609,11 @@ The rule is narrow:
 - Only the effects of the scope's declarations and of what they call are turned into `network`. A program's own system
   call, file read, environment read or clock read beside the TLS call still needs its own grant.
 - `filesystem.write` and `process.io` are never turned into `network`: a scope that reached them would be denied for them.
+- No public declaration of a scope hands back the contents of a file or the value of an environment variable: the
+  files it reads (the trust store, a CA file, a certificate and key the caller names) are parsed as certificates and
+  keys and never returned as bytes, and the environment is read for `SSL_CERT_FILE`/`SSL_CERT_DIR` only. So `network`
+  does not become a general file or environment reader. A declaration added to a scope that returned raw file or
+  environment contents would have to stay out of it.
 - A function the program passes in (a callback, a closure) keeps its own effects, which are the program's.
 - A declaration that makes none of those effects (a parser, a key schedule) asks for nothing.
 - Nothing else is a scope: `abla/sys/linux/net` and the rest of the standard library need their grants when `#` code
