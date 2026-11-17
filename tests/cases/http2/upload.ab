@@ -1,0 +1,92 @@
+// A large upload to an HttpsEventServer over TLS (HTTP/1.1, our own TLS client writing the whole request at once), against the server of tools/h2spec/server.ab (/echo returns the
+// body): tools/test-http2-server.sh. The server reads at most 64 times of 16 KiB per socket event, and decrypted bytes its TLS session had already pulled from the socket stayed
+// behind with no event to announce them: a request of about 1 MiB or more, sent in one burst, then never completed and was never answered. Each size is tried several times (the
+// stall needs the last records to arrive together), each try on a connection of its own.
+//   upload <port> <certificate.pem> <largest size> [tries]
+// Prints "http2 upload ok".
+import "abla/io"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/tls/pure"
+
+var failures = 0
+
+fun fail(what: string): void {
+    failures = failures + 1
+    if (failures < 20) println("FAIL $what")
+    return
+}
+
+fun decimal(text: string): int {
+    var value = 0
+    for (i in 0 until text.size) value = value * 10 + (text[i] - 48)
+    value
+}
+
+fun payload(size: int): string {
+    val unit = "0123456789abcdef".repeat(64)
+    val out = unit.repeat(size / unit.size)
+    out + unit.slice(0, size - out.size)
+}
+
+/** One request on a connection of its own: the answer's body, or "" with `why` set. */
+fun post(port: int, ca: string, body: string): string {
+    val connection = tlsConnectWithCa("127.0.0.1", ca, port, 5000, 8000)
+    if (connection.handle == -1) {
+        fail("connect: ${tlsLastError()}")
+        return ""
+    }
+    val request = "POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/octet-stream\r\nContent-Length: ${body.size}\r\nConnection: close\r\n\r\n" + body
+    var sent = 0
+    while (sent < request.size) {
+        val n = connection.write(request.slice(sent, request.size))
+        if (n <= 0) {
+            fail("write of ${body.size} bytes: ${tlsLastError()}")
+            connection.close()
+            return ""
+        }
+        sent = sent + n
+    }
+    var response = ""
+    var end = -1
+    var wanted = -1
+    while (wanted < 0 || response.size < end + wanted) {
+        val piece = connection.read(65536)
+        if (piece.size == 0) break
+        response = response + piece
+        if (end < 0) {
+            val gap = response.indexOf("\r\n\r\n")
+            if (gap >= 0) {
+                end = gap + 4
+                val at = response.indexOf("Content-Length: ")
+                wanted = if (at >= 0) decimal(response.slice(at + 16, at + 16 + 12).split("\r\n")[0]) else 0
+            }
+        }
+    }
+    connection.close()
+    if (end < 0 || wanted < 0 || response.size < end + wanted) {
+        fail("the answer to ${body.size} bytes did not arrive: ${response.size} bytes of it, ${tlsLastError()}")
+        return ""
+    }
+    response.slice(end, end + wanted)
+}
+
+fun main: int {
+    val port = decimal(processArgument(0))
+    val ca = processArgument(1)
+    val largest = decimal(processArgument(2))
+    val tries = if (processArgumentCount() > 3) decimal(processArgument(3)) else 6
+    // Sizes around the 64 reads of 16 KiB (1 MiB with the headers), then the largest the server takes.
+    val sizes = [1000000, 1040000, 1048000, 1048576, largest]
+    for (size in sizes) {
+        if (size > largest) continue
+        val body = payload(size)
+        for (attempt in 0 until tries) {
+            val answer = post(port, ca, body)
+            if (answer.size > 0 && answer != body) fail("an upload of $size bytes came back different (${answer.size} bytes)")
+        }
+    }
+    if (failures > 0) return 1
+    println("http2 upload ok")
+    0
+}

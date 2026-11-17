@@ -20,7 +20,7 @@ done
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$out/p256.key" 2> /dev/null
 openssl req -x509 -new -key "$out/p256.key" -out "$out/p256.pem" -subj /CN=localhost -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1' -days 2 2> /dev/null
 
-for program in server:tools/h2spec/server.ab attack:tests/cases/http2/attack.ab net:tests/cases/http2/net.ab; do
+for program in server:tools/h2spec/server.ab attack:tests/cases/http2/attack.ab net:tests/cases/http2/net.ab upload:tests/cases/http2/upload.ab; do
     name=${program%%:*}
     "$compiler" build "${program#*:}" -o "$out/$name" --no-cache > "$out/$name.build.log" 2>&1 || { cat "$out/$name.build.log" >&2; exit 1; }
 done
@@ -81,6 +81,12 @@ post=$(curl -sS --cacert "$out/p256.pem" --http2 --data-binary 'posted body' "ht
 [[ $(curl -sS --http1.1 -o /dev/null -w '%{http_version}' "http://127.0.0.1:$plain_port/x") == 1.1 ]] || { echo "http2 server: plain HTTP/1.1 failed" >&2; exit 1; }
 [[ $(curl -sS --http2-prior-knowledge -o /dev/null -w '%{http_version}' "http://127.0.0.1:$plain_port/x") == 2 ]] || { echo "http2 server: h2c prior knowledge failed" >&2; exit 1; }
 echo "curl: h2 and http/1.1 over TLS, POST, and a plain port with HTTP/1.1 and h2c ok"
+
+# An HTTP/1.1 upload of 1 MiB over TLS from our own client, written in one burst: an event server that left decrypted bytes in its TLS session (it read 64 times per event and then waited for
+# the socket) never answered it. Fails without the fix of HttpsEventServer.step, in every try.
+result=$("$root/tools/run-limited.sh" "$out/upload" "$tls_port" "$out/p256.pem" 1048576) || { echo "http2 server: large HTTP/1.1 upload over TLS: $result" >&2; exit 1; }
+[[ $result == 'http2 upload ok' ]] || { echo "http2 server: large HTTP/1.1 upload over TLS: $result" >&2; exit 1; }
+echo "a 1 MiB HTTP/1.1 upload over TLS ok"
 
 # nghttp: a 3 MiB response and a POST.
 nghttp -n "https://localhost:$tls_port/big.bin" > "$out/nghttp.log" 2>&1 || { tail -5 "$out/nghttp.log" >&2; echo "http2 server: nghttp failed" >&2; exit 1; }
