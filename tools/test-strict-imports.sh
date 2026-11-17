@@ -45,6 +45,22 @@ runs "$output_directory/pkg" "4 18 8 5"
 rejected "$cases/pkg/bad.ab" "" \
     'error[E_NAME_NOT_IMPORTED]: `utilHelp` is declared in' 'help: add: import "./util.ab"'
 
+# In a strict package, an extension call of a module it doesn't import is an error and a report line too, so the
+# fixer adds the import (abla-soap's string.trim needed abla/text, and the report didn't say).
+cp -R "$cases/member-report" "$output_directory/member-report"
+if "$compiler" build "$output_directory/member-report/main.ab" -o "$output_directory/invalid" \
+    --visibility-report "$output_directory/member-report.tsv" > "$output_directory/member-report.err" 2>&1; then
+    echo "strict-imports: a strict package's unimported extension call compiled"; exit 1
+fi
+grep -qF '`string.shout` is declared in' "$output_directory/member-report.err" &&
+    grep -F '	string.shout	' "$output_directory/member-report.tsv" | grep -F 'member' >/dev/null ||
+    { echo "strict-imports: the strict package's member report:"; cat "$output_directory/member-report.err" \
+        "$output_directory/member-report.tsv"; exit 1; }
+"$compiler" run "$project_root/tools/fix-imports.ab" -- "$output_directory/member-report.tsv" \
+    > "$output_directory/member-report.fix"
+"$compiler" build "$output_directory/member-report/main.ab" -o "$output_directory/member-report-main"
+runs "$output_directory/member-report-main" "a!"
+
 # A subparser's text is the subparser's: a word there that names a declaration elsewhere (abla-mvc's
 # `$mvcview <main>`, `main` the program's) is no use of it, strict or in the report; an expression the subparser
 # parses from the source is code, checked as any other.
