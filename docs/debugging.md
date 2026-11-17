@@ -170,3 +170,11 @@ served module (the name section), a source map of a few MB and a debug module
 of a few tens of MB that only developer tools load, and some seconds of
 build time (code generation with line tables, and the map). `--no-debug`
 skips all of it.
+
+## Collector trace: `ABLA_GC_TRACE=1`
+
+`ABLA_GC_TRACE=1` writes one line to standard error for each collection, `gc: live <bytes> bytes before, <bytes> after, <n> ms`,
+and a line for each stop that parked threads (`gc: stopped <n> thread(s)`) or was abandoned and why. The live bytes after a
+collection are what the next one marks again, so for a long-running server they are its long-lived state: the framework's
+own event server (tests/cases/http-peer/server.ab shape, 300,000 requests) keeps 22 KB and collects in 2 ms, so only an
+application's caches could make a copy into read-only memory (`docs/design/frozen-heap.md`) worth having.
