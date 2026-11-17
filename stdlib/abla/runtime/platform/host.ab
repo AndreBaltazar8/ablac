@@ -4196,10 +4196,23 @@ trusted fun __ablaRuntimeHostFreezeCleanup(): void {
     return
 }
 
+// The value stays rooted while the freeze waits for a stop (it may park behind another thread's collection, which would
+// otherwise free what the caller's temporary holds).
+trusted fun __ablaRuntimePlatformMemoryFreeze(value: any): any {
+    val frame = ablaRuntimePointerAddress(__ablaRuntimeHostMalloc(32))
+    if (frame == 0) return __ablaRuntimeHostFreezeBody(value)
+    ablaRuntimeStoreI64(frame + 24, ablaRuntimeValueAddress(value))
+    __ablaRuntimeRootsPush(frame, frame + 24, 1)
+    val result = __ablaRuntimeHostFreezeBody(value)
+    __ablaRuntimeRootsPop(frame)
+    __ablaRuntimeHostFree(ablaRuntimePointerFromAddress(frame))
+    result
+}
+
 // The value, frozen: a copy of everything it reaches in a read-only group, or the value itself when it cannot be (no window
 // on this system, a threads stop that did not happen, inside a region). A block the copy cannot take (a raw block holding a
 // heap pointer, a task, a thread, a weak reference, a cell) panics, naming its layout.
-trusted fun __ablaRuntimePlatformMemoryFreeze(value: any): any {
+trusted fun __ablaRuntimeHostFreezeBody(value: any): any {
     val address = ablaRuntimeValueAddress(value)
     val tag = ablaRuntimeLoadI32(address)
     if (tag < 4 || tag == 5 && ablaRuntimeLoadI64(address + 16) == 0) {
@@ -4228,7 +4241,13 @@ trusted fun __ablaRuntimePlatformMemoryFreeze(value: any): any {
         __ablaRuntimeHostFrozenEnd = window + span
         ablaRuntimeStoreI64(state, window)
     }
-    val stopped = __ablaRuntimeHostStwStop()
+    // A stop that parked behind another thread's collection did not happen: ask again (a few times; an abandoned stop waits).
+    var stopped = __ablaRuntimeHostStwStop()
+    var attempts = 0
+    while (stopped == 0 && attempts < 64) {
+        stopped = __ablaRuntimeHostStwStop()
+        attempts = attempts + 1
+    }
     if (stopped == 0) {
         ablaRuntimeStoreI64(state + 32, 4)
         return value
