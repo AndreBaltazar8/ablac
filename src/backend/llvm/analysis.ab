@@ -704,6 +704,9 @@ fun bootstrapLlvmCollectingFunctions(
                 bootstrapLlvmEntersGeneratedCode(candidate.text)) direct = true
             instruction = instruction + 1
         }
+        // A spin wait has a safe point on its back edge (bootstrapLlvmLoopSafePoints), so its function collects.
+        if (automaticPressure && !runtimeImplementation && !direct &&
+            bootstrapLlvmHasSpinLoop(program.functions[function])) direct = true
         result.append(direct)
         function = function + 1
     }
@@ -867,11 +870,17 @@ fun bootstrapLlvmLoops(function: BootstrapIrFunction): BootstrapLlvmLoops {
 fun bootstrapLlvmLoopSafePoints(function: BootstrapIrFunction, pressure: bool): array<bool> {
     val points: array<bool> = []
     val allocations: array<int> = []
+    // Instructions that read memory other threads write (an atomic or volatile access), counted the same way.
+    val pollable = !function.name.contains("ablaRuntime") && !bootstrapLlvmRuntimeFunction(function)
+    val waits: array<int> = []
     allocations.append(0)
+    waits.append(0)
     for (instruction in function.instructions) {
         points.append(false)
         allocations.append(allocations[allocations.size - 1] +
             if (pressure && bootstrapLlvmInstructionMayAllocate(instruction)) 1 else 0)
+        waits.append(waits[waits.size - 1] +
+            if (pressure && pollable && bootstrapLlvmSharedMemoryAccess(instruction)) 1 else 0)
     }
     if (!pressure) return points
     val loops = bootstrapLlvmLoops(function)
@@ -879,9 +888,45 @@ fun bootstrapLlvmLoopSafePoints(function: BootstrapIrFunction, pressure: bool): 
     while (loop < loops.starts.size) {
         val end = loops.ends[loop]
         if (allocations[end + 1] > allocations[loops.starts[loop]]) points[end] = true
+        // A spin wait: no allocation, so no safe point, yet it waits for another thread, which may be the one collecting
+        // (it stops every thread first). Only a loop that reads shared memory with an atomic or volatile access pays the poll.
+        else if (waits[end + 1] > waits[loops.starts[loop]]) points[end] = true
         loop = loop + 1
     }
     points
+}
+
+// An atomic or volatile access of memory another thread may write: what a loop waiting for another thread reads.
+fun bootstrapLlvmSharedMemoryAccess(instruction: BootstrapInstruction): bool =
+    instruction.opcode == "extern.intrinsic" && (
+        instruction.text == "ablaRuntimeAtomicLoadI64" || instruction.text == "ablaRuntimeAtomicCompareExchangeI64" ||
+        instruction.text == "ablaRuntimeAtomicFetchAddI64" || instruction.text == "ablaUnsafeAtomicFetchAddI64" ||
+        instruction.text == "ablaUnsafeAtomicCompareExchangeU32" ||
+        instruction.text == "ablaUnsafeAtomicCompareExchangeRelaxedU32" ||
+        instruction.text == "ablaUnsafeVolatileLoadU8" || instruction.text == "ablaUnsafeVolatileLoadU16" ||
+        instruction.text == "ablaUnsafeVolatileLoadU32" || instruction.text == "ablaUnsafeVolatileLoadU64")
+
+/** Whether a loop of the function reads shared memory atomically: a spin wait, which gets a safe point on its back edge. */
+fun bootstrapLlvmHasSpinLoop(function: BootstrapIrFunction): bool {
+    // The runtime's own waits (the collector's stop, the futex locks) never poll: they run inside a collection. A private runtime
+    // function's name carries its module (`host.__ablaRuntime...`), which the runtime-implementation test does not see.
+    if (function.name.contains("ablaRuntime") || bootstrapLlvmRuntimeFunction(function)) return false
+    var shared = false
+    for (instruction in function.instructions) {
+        if (bootstrapLlvmSharedMemoryAccess(instruction)) shared = true
+    }
+    if (!shared) return false
+    val loops = bootstrapLlvmLoops(function)
+    var loop = 0
+    while (loop < loops.starts.size) {
+        var index = loops.starts[loop]
+        while (index <= loops.ends[loop]) {
+            if (bootstrapLlvmSharedMemoryAccess(function.instructions[index])) return true
+            index = index + 1
+        }
+        loop = loop + 1
+    }
+    false
 }
 
 fun bootstrapLlvmLoopSafePoint(loopSafePoints: array<bool>, index: int): bool =

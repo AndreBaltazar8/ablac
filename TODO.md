@@ -204,7 +204,7 @@ mmap form) apply there.
   the loop it sits in, so the cost is far over the 1% bar; nbody's drop is a different unrolling choice, not a gain.
   A poll in a function without a frame would also need that function's live references rooted (a first try that
   emitted the existing allocating-loop safe point in every loop made sieve and trees panic with "stack overflow").
-  A non-allocating loop therefore keeps holding up a stop until it ends.
+  A non-allocating loop therefore keeps holding up a stop until it ends, unless it is a spin wait (an atomic or volatile load in the loop), which is polled: a worker spinning while main made 3 GB of garbage peaked at 5.8 GB and never collected; with the poll 75 MB and 88 collections.
 
 - [ ] **A child's first collection after a raw fork waits 20 ms for its parent's threads, then is abandoned (#811;
   2026-11-16, ablac-4e).** After the `fork` system call (an AArch64 Linux program's only fork) the child's registry

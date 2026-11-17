@@ -208,6 +208,20 @@ growth is set with `memorySetCollectionGrowth(bytes)`. A module for Wasm or a fr
 and compile-time slices are as they were. The environment variables `ABLA_GC_STRESS` and `ABLA_GC_TRACE` are read from
 the process environment, which a library does not have, so they have no effect in one.
 
+### Which loops are collection points
+
+A function that allocates has a safe point at its entry, and a loop that
+allocates (an instruction in it may allocate) has one on its back edge. A loop that allocates nothing has none, except a
+spin wait: a loop of a user function that reads memory with an atomic or volatile access (`ablaRuntimeAtomic*`,
+`ablaUnsafeAtomic*`, `ablaUnsafeVolatileLoad*`) gets the back-edge safe point too, because it waits for another thread, which
+may be the one that is collecting. Any other loop that allocates nothing is not a collection point: a counted compute loop
+holds up a collection until it ends (the stop waits 20 ms and gives up, as for a blocked thread), which delays the
+collection and nothing else. A loop that reads shared data without an atomic access is a data race and is not made a
+collection point. The runtime's own waits (the futex locks, the stop itself) never poll: they run inside the
+collector. Polling every back edge was measured and dropped (+9 to +20% on sieve, trees and matrix), so the rule is by
+shape; `tests/cases/gc-spin` is the test (a worker spinning on an atomic while another thread makes 1.5 GB of garbage:
+no abandoned stop, a bounded heap).
+
 ### Calling exports from several threads
 
 A shared library (the default x86-64 Linux target, arm64 Android, and any other hosted shared library) is entered
