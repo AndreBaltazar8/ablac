@@ -23,6 +23,24 @@ import "abla/sys/linux"
 var bootstrapAnalysisGraphActiveEntry = ""
 var bootstrapAnalysisGraphModules: BootstrapModuleState = bootstrapModuleState()
 
+/** What the service keeps between analyses, per byte of the project's source (the module parses, symbols and snapshots: 541 MB for the
+ *  compiler's own 6.8 MB, measured as the bytes a collection marks at the start of an edit). A collection marks all of it, so the
+ *  fixed 256 MB step of the compiler's heap (collect when the heap has grown by that much) re-marked it four times in an edit,
+ *  two thirds of the marking and a third of the CPU of the analysis; the service collects after as much growth as it holds,
+ *  between the 256 MB of a small project and 512 MB (measured on the compiler's source, an edit's CPU at steps of 256, 512 and
+ *  768 MB: 13.0, 10.4 and 9.0 s for a peak of 2.0, 2.3 and 2.9 GB: past 512 MB each resident MB buys a third of the CPU). */
+val BOOTSTRAP_ANALYSIS_HELD_PER_SOURCE_BYTE = 80
+val BOOTSTRAP_ANALYSIS_GROWTH_FLOOR = 268435456
+val BOOTSTRAP_ANALYSIS_GROWTH_CEILING = 536870912
+
+/** The collection step for a project of `sourceBytes` of source. */
+fun bootstrapAnalysisCollectionGrowth(sourceBytes: int): int {
+    val held = sourceBytes * BOOTSTRAP_ANALYSIS_HELD_PER_SOURCE_BYTE
+    if (held < BOOTSTRAP_ANALYSIS_GROWTH_FLOOR) BOOTSTRAP_ANALYSIS_GROWTH_FLOOR
+    else if (held > BOOTSTRAP_ANALYSIS_GROWTH_CEILING) BOOTSTRAP_ANALYSIS_GROWTH_CEILING
+    else held
+}
+
 /** A module's parse and symbols export, valid while its source, uri and visibility stay as they were. */
 class BootstrapAnalysisGraphParsed(
     val source: string,
@@ -593,6 +611,9 @@ fun BootstrapAnalysisService.graphSnapshot(): Json {
     this.graphQueryIndex = null
     val documents: array<BootstrapAnalysisGraphDocument> = []
     val names: Map<string, string> = Map()
+    var sourceBytes = 0
+    // Only an analysis that follows another holds anything yet: the first has nothing to re-mark, and keeps the compiler's step.
+    val holdsProject = this.graphParsed.size > 0
     for (module in project.modules) {
         if (module.source != "" || bootstrapAnalysisGraphModules.sourceExists(module.path)) {
             var uri = bootstrapAnalysisGraphUri(module.path)
@@ -615,6 +636,7 @@ fun BootstrapAnalysisService.graphSnapshot(): Json {
                     bootstrapAnalysisGraphParse(source, uri, full, module.path, this.graphStableIds))
             this.graphParsed.set(module.path, entryParsed)
             val parsed = entryParsed.parsed
+            sourceBytes = sourceBytes + source.size
             documents.append(BootstrapAnalysisGraphDocument(
                 BootstrapAnalysisDocument(uri, module.path, version, source, true), parsed,
                 entryParsed.symbols, entryParsed.rewrite, entryParsed.stable, entryParsed.exported, entryParsed.key))
@@ -623,6 +645,12 @@ fun BootstrapAnalysisService.graphSnapshot(): Json {
             for (action in parsed.actions) bootstrapAnalysisGraphCallNames(action, module.path,
                 names)
         }
+    }
+    // The compiler's heap steps by a fixed 256 MB (orc_main.ab); a service that holds a big project steps by what it holds (unless
+    // ABLA_COMPILER_COLLECT_GROWTH_MB says what the step is), from its second analysis on.
+    val configuredGrowth = linuxEnvironment("ABLA_COMPILER_COLLECT_GROWTH_MB")
+    if (holdsProject && (!configuredGrowth.found || configuredGrowth.value == "")) {
+        runtimeMemorySetCollectionGrowth(bootstrapAnalysisCollectionGrowth(sourceBytes))
     }
     val begins: array<int> = []
     val ends: array<int> = []

@@ -17,7 +17,12 @@
 # the answer's occurrences are kept as text, so the loop peaks near the first analysis's level. Its bound, 2,200,000 kB (1,930,000 measured), sits
 # between that and the old behaviour's; the final answer must carry the edited module at its last version.
 #
-# The loop is bounded twice, because neither number alone follows the source as it grows. Its resident size, bound 2,200,000 kB (the lowest of
+# The service collects after as much growth as it holds, once it holds a project (analysis_graph.ab, bootstrapAnalysisCollectionGrowth: 512 MB
+# for the compiler's own source, 256 before): an edit's CPU fell by a fifth to a third, and the loop's resident peak rose from 2.03-2.04 GB
+# to 2.23-2.38 GB (three runs), so its bound moved from 2,200,000 to 2,650,000 kB. The first analysis, which holds nothing, keeps the
+# compiler's step and its bound.
+#
+# The loop is bounded twice, because neither number alone follows the source as it grows. Its resident size, bound 2,650,000 kB (the lowest of
 # two runs when the first is over it), is what an editor's machine pays; but it is not a stable measure (the same compiler peaked at 2.03 GB alone
 # and 2.29 GB in a loaded suite run: it is about twice the reachable heap, the rest is what the heap holds between collections). What the
 # loop must not do is keep the previous answer: so a third run, with ABLA_COMPILER_MEMORY_TRACE set, has the service collect the heap and
@@ -33,7 +38,7 @@ project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 [[ $compiler == /* ]] || compiler="$PWD/$compiler"
 output_directory="$project_root/build/analysis-memory"
 bound_kilobytes=2040000
-edit_bound_kilobytes=2200000
+edit_bound_kilobytes=2650000
 edit_retention_percent=135
 mkdir -p "$output_directory"
 if ! /usr/bin/env time --version >/dev/null 2>&1; then
