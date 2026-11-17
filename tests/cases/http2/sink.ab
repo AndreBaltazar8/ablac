@@ -1,0 +1,121 @@
+// An HTTP/1.1 server that reads request bodies and throws them away (tools/test-http2-stream.sh): one connection at a time, each request answered "received <bytes>\n" once its body
+// (Content-Length or chunked) has been read, keep-alive. A test peer, not a server: no limits, no timeouts.
+//   sink <port>           prints "listening <port>" (port 0 picks one)
+import "abla/io"
+import "abla/process/arguments"
+import "abla/sys/linux/net"
+import "abla/text"
+
+fun decimal(text: string): int {
+    var value = 0
+    for (i in 0 until text.size) value = value * 10 + (text[i] - 48)
+    value
+}
+
+fun lower(text: string): string = text.lowercase()
+
+/** Serves the requests of one connection until it closes. */
+fun serve(var connection: TcpConnection): void {
+    var buffer = ""
+    var open = true
+    while (open) {
+        // The head.
+        var headEnd = buffer.indexOf("\r\n\r\n")
+        while (headEnd < 0 && open) {
+            val piece = connection.read(65536)
+            if (piece.size == 0) open = false
+            else {
+                buffer = buffer + piece
+                headEnd = buffer.indexOf("\r\n\r\n")
+            }
+        }
+        if (!open) return
+        val head = lower(buffer.slice(0, headEnd))
+        buffer = buffer.slice(headEnd + 4, buffer.size)
+        val chunked = head.contains("transfer-encoding: chunked")
+        var length = 0
+        val at = head.indexOf("content-length: ")
+        if (at >= 0) {
+            val rest = head.slice(at + 16, head.size)
+            val lineEnd = rest.indexOf("\r\n")
+            length = decimal(if (lineEnd >= 0) rest.slice(0, lineEnd) else rest)
+        }
+        var received = 0
+        if (!chunked) {
+            var left = length
+            if (buffer.size > 0) {
+                val take = if (buffer.size < left) buffer.size else left
+                received = received + take
+                left = left - take
+                buffer = buffer.slice(take, buffer.size)
+            }
+            while (left > 0 && open) {
+                val piece = connection.read(65536)
+                if (piece.size == 0) open = false
+                else {
+                    val take = if (piece.size < left) piece.size else left
+                    received = received + take
+                    left = left - take
+                    if (take < piece.size) buffer = piece.slice(take, piece.size)
+                }
+            }
+        } else {
+            var done = false
+            while (!done && open) {
+                // A chunk: its size line, its data, the CRLF after it; size 0 ends (no trailers expected).
+                var lineEnd = buffer.indexOf("\r\n")
+                while (lineEnd < 0 && open) {
+                    val piece = connection.read(65536)
+                    if (piece.size == 0) open = false
+                    else {
+                        buffer = buffer + piece
+                        lineEnd = buffer.indexOf("\r\n")
+                    }
+                }
+                if (!open) break
+                var size = 0
+                for (i in 0 until lineEnd) {
+                    val c = buffer[i]
+                    size = size * 16 + (if (c >= 48 && c <= 57) c - 48 else if (c >= 97 && c <= 102) c - 87 else c - 55)
+                }
+                buffer = buffer.slice(lineEnd + 2, buffer.size)
+                var left = size + 2
+                if (size == 0) left = 2
+                while (left > 0 && open) {
+                    if (buffer.size == 0) {
+                        val piece = connection.read(65536)
+                        if (piece.size == 0) open = false
+                        else buffer = piece
+                    }
+                    if (buffer.size > 0) {
+                        val take = if (buffer.size < left) buffer.size else left
+                        // The data bytes, not the CRLF after them.
+                        val dataLeft = left - 2
+                        if (dataLeft > 0) received = received + (if (take < dataLeft) take else dataLeft)
+                        left = left - take
+                        buffer = buffer.slice(take, buffer.size)
+                    }
+                }
+                if (size == 0) done = true
+            }
+        }
+        if (!open) return
+        val body = "received $received\n"
+        connection.write("HTTP/1.1 200 OK\r\nContent-Length: ${body.size}\r\nContent-Type: text/plain\r\n\r\n$body")
+    }
+    return
+}
+
+fun main: int {
+    val port = decimal(processArgument(0))
+    val listener = tcpListenAddress(ipv4Loopback(port), 16)
+    println("listening ${listener.localPort()}")
+    while (true) {
+        var connection = listener.accept()
+        if (connection.descriptor >= 0) {
+            serve(connection)
+            connection.close()
+        }
+    }
+    0
+}

@@ -1,5 +1,5 @@
 // The streaming API of abla/http/async (getStream, requestStream, writeBody, finishBody, readStream, takeStreamEvents) over HTTP/2 against real servers (tools/test-http2-stream.sh):
-//   streamnet <port> <certificate.pem or "-" for h2c> <mode> <bytes> <path>
+//   streamnet <port> <certificate.pem or "-" for h2c> <mode> <bytes> <path> [h1]   (h1: HTTP/1.1; modes down, up, upchunked (a request body of unknown length), slow)
 //   down   GET /gig.bin (a file of <bytes> zero bytes served by h2o): read in pieces with readStream, every byte counted and zero; a first phase where nothing is read for 600 ms: what waits
 //          never exceeds one stream window (262144), the peer is stalled, not buffered; then the rest. The process' resident memory stays far below <bytes> (peak printed).
 //   up     POST <path> (an existing file of nghttpd, which reads the body and answers with the file) with <bytes> written in 64 KiB pieces as writeBody takes them (0 means wait for WRITABLE), then finishBody; the answer is read (END waits for its last byte): the response is
@@ -94,8 +94,9 @@ fun down(var client: HttpAsyncClient, base: string, path: string, total: int): v
     return
 }
 
-fun up(var client: HttpAsyncClient, base: string, path: string, total: int): void {
-    val id = client.requestStream("POST", "$base$path", [HttpHeader("Content-Type", "application/octet-stream")], total, 30000)
+fun up(var client: HttpAsyncClient, base: string, path: string, total: int, chunked: bool, h1: bool): void {
+    val id = client.requestStream("POST", "$base$path", [HttpHeader("Content-Type", "application/octet-stream")], if (chunked) -1 else total, 30000)
+    var answer = ""
     val piece = "u".repeat(65536)
     var sent = 0
     var waited = 0
@@ -116,7 +117,11 @@ fun up(var client: HttpAsyncClient, base: string, path: string, total: int): voi
         }
         // The response body has to be read too: END comes after its last byte was taken.
         var reply = client.readStream(id, 65536)
-        while (reply.size > 0) reply = client.readStream(id, 65536)
+        answer = answer + reply
+        while (reply.size > 0) {
+            reply = client.readStream(id, 65536)
+            answer = answer + reply
+        }
         var more = writable && sent < total
         while (more) {
             val want = if (total - sent < piece.size) total - sent else piece.size
@@ -147,8 +152,11 @@ fun up(var client: HttpAsyncClient, base: string, path: string, total: int): voi
     sample()
     if (!ended) fail("the upload did not end: sent $sent of $total")
     if (status != 200) fail("upload status $status")
+    // A server that counts what it was sent (tests/cases/http2/sink.ab) says how much arrived.
+    if (answer.size > 9 && answer.slice(0, 9) == "received " && answer != "received $total\n") fail("the server received: ${answer}, not $total bytes")
     if (sent != total) fail("sent $sent of $total")
-    if (waited == 0 && total > 4194304) fail("writeBody never took less than it was offered: no backpressure on $total bytes")
+    // (Over HTTP/1.1 the socket buffer is the only bound and a fast local peer may never fill it; over HTTP/2 the peer's windows are.)
+    if (!h1 && waited == 0 && total > 4194304) fail("writeBody never took less than it was offered: no backpressure on $total bytes")
     return
 }
 
@@ -197,11 +205,13 @@ fun main: int {
     val total = decimal(processArgument(3))
     val path = processArgument(4)
     val tls = ca != "-"
-    var client = httpAsyncClient(HttpAsyncOptions(caPath = if (tls) ca else "", http2 = true, http2PriorKnowledge = !tls))
+    // A sixth argument "h1": HTTP/1.1 (no ALPN offer, no prior knowledge).
+    val h1 = processArgumentCount() > 5 && processArgument(5) == "h1"
+    var client = httpAsyncClient(HttpAsyncOptions(caPath = if (tls) ca else "", http2 = !h1, http2PriorKnowledge = !tls && !h1))
     val base = "${if (tls) "https" else "http"}://localhost:$port"
     sample()
     if (mode == "down") down(client, base, path, total)
-    else if (mode == "up") up(client, base, path, total)
+    else if (mode == "up" || mode == "upchunked") up(client, base, path, total, mode == "upchunked", h1)
     else if (mode == "slow") slow(client, base, path, total)
     else fail("unknown mode $mode")
     if (failures > 0) return 1

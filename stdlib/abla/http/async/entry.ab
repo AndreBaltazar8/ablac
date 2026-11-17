@@ -100,6 +100,24 @@ val HTTP_STREAM_ERROR = 5
 
 class HttpAsyncStreamEvent(val kind: int, val id: int, val status: int = 0, val headers: array<HttpHeader> = [], val trailers: array<HttpHeader> = [], val error: string = "")
 
+// The HTTP/1.1 half of a streaming request (per request slot): the response body framing and what waits for readStream, and the request body's framing.
+// framing: 0 response headers not read yet, 1 Content-Length (`left` bytes to come), 2 chunked (phase: 0 size line, 1 data, 2 CRLF after data, 3 after the last chunk), 3 until the close, 4 no body.
+class HttpAsyncStreamState(
+    var inbox: string = "",
+    var framing: int = 0,
+    var left: int = 0,
+    var phase: int = 0,
+    var ended: bool = false,
+    var paused: bool = false,
+    var blocked: bool = false,
+    var bodyDone: bool = false,
+    var chunkedRequest: bool = false,
+    var keepAlive: bool = true,
+    var status: int = 0,
+    var headers: array<HttpHeader> = [],
+    var trailers: array<HttpHeader> = []
+)
+
 class HttpAsyncTarget(
     val secure: bool,
     val host: string,
@@ -125,6 +143,8 @@ private val httpAsyncConnectionReading = 5
 private val httpAsyncConnectionIdle = 6
 // An HTTP/2 connection past its handshake: many requests, each a stream of the slot's H2Client.
 private val httpAsyncConnectionH2 = 7
+// An HTTP/1.1 streaming request: the request body is written and the response body read at the same time.
+private val httpAsyncConnectionStreaming = 8
 
 // What an origin (scheme, host, port) is known to speak, from the ALPN of its last handshake.
 private val httpAsyncOriginUnknown = 0
@@ -204,7 +224,8 @@ resource class HttpAsyncClient(
     val requestStreaming: array<bool> = [],
     val requestLengths: array<int> = [],
     val requestIdle: array<int> = [],
-    var streamEvents: array<HttpAsyncStreamEvent> = []
+    var streamEvents: array<HttpAsyncStreamEvent> = [],
+    val streamStates: array<HttpAsyncStreamState> = []
 ) {
     trusted fun drop(): void {
         var slot = 0
@@ -265,6 +286,19 @@ private fun httpAsyncParseUrl(url: string): HttpAsyncTarget {
     HttpAsyncTarget(secure, host, port, path, host != "" && port > 0)
 }
 
+// The headers of a streamed HTTP/1.1 request: the caller's, then Content-Length when the body's size is known, else Transfer-Encoding: chunked (a streaming request with
+// length 0 sends Content-Length: 0 for methods that carry a body, as a buffered one does).
+private fun httpAsyncStreamHeaders(headers: array<HttpHeader>, length: int): array<HttpHeader> {
+    val all: array<HttpHeader> = []
+    for (header in headers) {
+        if (httpAsciiEqualInsensitive(header.name, "Content-Length") || httpAsciiEqualInsensitive(header.name, "Transfer-Encoding")) continue
+        all.append(header)
+    }
+    if (length > 0) all.append(HttpHeader("Content-Length", "$length"))
+    else if (length < 0) all.append(HttpHeader("Transfer-Encoding", "chunked"))
+    all
+}
+
 private fun httpAsyncRender(
     method: string,
     target: HttpAsyncTarget,
@@ -278,7 +312,7 @@ private fun httpAsyncRender(
     while (index < headers.size) {
         val header = headers[index]
         if (httpAsciiEqualInsensitive(header.name, "Host")) hasHost = true
-        if (httpAsciiEqualInsensitive(header.name, "Content-Length")) hasLength = true
+        if (httpAsciiEqualInsensitive(header.name, "Content-Length") || httpAsciiEqualInsensitive(header.name, "Transfer-Encoding")) hasLength = true
         output = "$output${header.name}: ${header.value}\r\n"
         index = index + 1
     }
@@ -729,12 +763,8 @@ fun HttpAsyncClient.beginWrite(slot: int): void {
         return
     }
     if (this.requestStreaming[request]) {
-        // HTTP/1.1 streaming is not here yet (docs/design/http-streaming.md): the origin turned out not to speak HTTP/2.
-        this.connectionRequests[slot] = -1
-        this.complete(request, 0, [], "", "a streaming request needs HTTP/2, and this server speaks HTTP/1.1")
-        this.connectionStates[slot] = httpAsyncConnectionIdle
-        this.connectionIdleSince[slot] = linuxMonotonicMilliseconds()
-        this.interest(slot, false)
+        // HTTP/1.1 streaming: the request body goes out as the caller writes it, the response comes in as the server sends it.
+        this.startStream(slot, request)
         return
     }
     this.connectionStates[slot] = httpAsyncConnectionWriting
@@ -922,6 +952,12 @@ fun HttpAsyncClient.socketReady(slot: int, readable: bool, writable: bool, faile
         // Any event: read what arrived (which also writes what that needs), and write what is waiting.
         this.h2Read(slot)
         if (this.connectionStates[slot] == httpAsyncConnectionH2 && (writable || this.connectionH2[slot].wantsWrite())) this.h2Write(slot)
+    } else if (state == httpAsyncConnectionStreaming) {
+        // A failed socket still has its bytes to read: they are taken past the high-water mark (the kernel holds them anyway), or the event would repeat.
+        val streaming = this.connectionRequests[slot]
+        if (failed && streaming >= 0) this.streamStates[streaming].paused = false
+        if (readable || failed || this.connectionSecure[slot]) this.streamRead(slot)
+        if (this.connectionStates[slot] == httpAsyncConnectionStreaming && (writable || (this.connectionSecure[slot] && this.connectionWriteInterest[slot]))) this.streamWrite(slot)
     } else if (state == httpAsyncConnectionWriting) {
         if (this.connectionSecure[slot] || writable) this.writeSlot(slot)
         else if (failed) this.fail(slot, "connection lost")
@@ -1391,6 +1427,7 @@ private fun HttpAsyncClient.openRequest(
         this.requestStreaming.append(false)
         this.requestLengths.append(-1)
         this.requestIdle.append(0)
+        this.streamStates.append(HttpAsyncStreamState())
     }
     val now = linuxMonotonicMilliseconds()
     this.requestIds[slot] = id
@@ -1400,10 +1437,10 @@ private fun HttpAsyncClient.openRequest(
     this.requestHosts[slot] = target.host
     this.requestPorts[slot] = target.port
     this.requestSecure[slot] = target.secure
-    this.requestPayloads[slot] = httpAsyncRender(method, target, headers, body)
+    this.requestPayloads[slot] = httpAsyncRender(method, target, if (streaming) httpAsyncStreamHeaders(headers, length) else headers, body)
     this.requestDeadlines[slot] = now + timeoutMilliseconds
     this.requestStarted[slot] = now
-    this.requestRetried[slot] = false
+    this.requestRetried[slot] = streaming
     this.requestMethods[slot] = method
     this.requestTargets[slot] = target.path
     this.requestAuthorities[slot] = httpAsyncAuthority(target)
@@ -1418,9 +1455,9 @@ private fun HttpAsyncClient.openRequest(
     this.requestStreaming[slot] = streaming
     this.requestLengths[slot] = length
     this.requestIdle[slot] = if (streaming) timeoutMilliseconds else 0
+    this.streamStates[slot] = HttpAsyncStreamState(chunkedRequest = streaming && length < 0)
     this.activeRequests = this.activeRequests + 1
     if (!target.valid) this.complete(slot, 0, [], "", "invalid URL")
-    else if (streaming && !this.options.http2 && !(this.options.http2PriorKnowledge && !target.secure)) this.complete(slot, 0, [], "", "a streaming request needs HTTP/2: set HttpAsyncOptions.http2")
     else this.pumpEvents()
     id
 }
@@ -1438,6 +1475,295 @@ fun HttpAsyncClient.postJson(url: string, json: string, headers: array<HttpHeade
         index = index + 1
     }
     this.request("POST", url, all, json, timeoutMilliseconds)
+}
+
+// ---------------------------------------------------------------------------
+// HTTP/1.1 streaming requests (docs/design/http-streaming.md): the connection writes the request body and reads the response body at the same time. The response body waits in
+// the request's inbox; reading stops while 192 KiB wait (the socket then fills and the peer stops) and goes on as readStream takes them; END comes after the last byte was read.
+
+private val httpAsyncStreamHigh = 196608
+private val httpAsyncStreamCap = 262144
+
+private fun httpAsyncHex(value: int): string {
+    if (value == 0) return "0"
+    var out = ""
+    var rest = value
+    while (rest > 0) {
+        val digit = rest % 16
+        out = (if (digit < 10) "${digit}" else if (digit == 10) "a" else if (digit == 11) "b" else if (digit == 12) "c" else if (digit == 13) "d" else if (digit == 14) "e" else "f") + out
+        rest = rest / 16
+    }
+    out
+}
+
+// The connection's read interest follows the request: off while its inbox is full.
+fun HttpAsyncClient.streamInterest(slot: int, write: bool): void {
+    val request = this.connectionRequests[slot]
+    val read = !(request >= 0 && this.streamStates[request].paused)
+    this.poller.modifyDescriptor(this.connectionDescriptors[slot], read, write)
+    this.connectionWriteInterest[slot] = write
+    return
+}
+
+fun HttpAsyncClient.startStream(slot: int, request: int): void {
+    this.connectionStates[slot] = httpAsyncConnectionStreaming
+    this.connectionOutputs[slot] = this.requestPayloads[request]
+    this.connectionOutputOffsets[slot] = 0
+    this.connectionInputs[slot] = ""
+    this.connectionHeaderEnds[slot] = -1
+    this.connectionUsed[slot] = this.connectionUsed[slot] + 1
+    this.requestSlots[request] = slot
+    this.streamTouch(request)
+    // The request body can start now (a request with length 0 has none).
+    if (this.requestLengths[request] != 0) this.streamEvents.append(HttpAsyncStreamEvent(HTTP_STREAM_WRITABLE, this.requestIds[request]))
+    this.streamWrite(slot)
+    return
+}
+
+// Writes what is queued until the socket would block; tells a blocked writeBody when half of the cap is free again.
+fun HttpAsyncClient.streamWrite(slot: int): void {
+    var writing = this.connectionStates[slot] == httpAsyncConnectionStreaming
+    while (writing) {
+        val offset = this.connectionOutputOffsets[slot]
+        val output = this.connectionOutputs[slot]
+        if (offset >= output.size) {
+            this.connectionOutputs[slot] = ""
+            this.connectionOutputOffsets[slot] = 0
+            this.streamInterest(slot, false)
+            writing = false
+        } else if (this.connectionSecure[slot]) {
+            val written = this.tlsWrite(slot, output, offset)
+            if (written > 0) this.connectionOutputOffsets[slot] = offset + written
+            else if (written == -3 || written == -2) {
+                this.streamInterest(slot, written == -3)
+                writing = false
+            } else {
+                this.fail(slot, "tls write failed")
+                return
+            }
+        } else {
+            var connection = TcpConnection(this.connectionDescriptors[slot])
+            val result = connection.writeCompact(output, offset)
+            connection.descriptor = -1
+            if (result.written > 0) this.connectionOutputOffsets[slot] = offset + result.written
+            if (result.status == "error") {
+                if (result.errorCode == 11) this.streamInterest(slot, true)
+                else {
+                    this.fail(slot, "write failed")
+                    return
+                }
+                writing = false
+            }
+        }
+    }
+    val request = this.connectionRequests[slot]
+    if (request >= 0 && this.streamStates[request].blocked && this.connectionOutputs[slot].size - this.connectionOutputOffsets[slot] <= httpAsyncStreamCap / 2) {
+        this.streamStates[request].blocked = false
+        this.streamEvents.append(HttpAsyncStreamEvent(HTTP_STREAM_WRITABLE, this.requestIds[request]))
+    }
+    return
+}
+
+// Reads what the socket has (until it would block or the inbox is full) and parses it.
+fun HttpAsyncClient.streamRead(slot: int): void {
+    var reading = true
+    while (reading && this.connectionStates[slot] == httpAsyncConnectionStreaming) {
+        val request = this.connectionRequests[slot]
+        if (request < 0 || this.streamStates[request].paused) return
+        if (this.connectionSecure[slot]) this.tlsRead(slot)
+        else httpAsyncPlainRead(this.connectionDescriptors[slot], this.reader)
+        val status = this.reader.status
+        val chunk = this.reader.text
+        this.reader.text = ""
+        if (status > 0) {
+            this.connectionInputs[slot] = if (this.connectionInputs[slot] == "") chunk else "${this.connectionInputs[slot]}$chunk"
+            this.streamParse(slot, false)
+            this.streamTouch(request)
+        } else {
+            val secure = this.connectionSecure[slot]
+            val wouldBlock = if (secure) status == -2 || status == -3 else status == -11
+            if (wouldBlock) {
+                if (secure && status == -3) this.streamInterest(slot, true)
+            } else this.streamParse(slot, true)
+            reading = false
+        }
+    }
+    return
+}
+
+// Takes the headers (once) and then the body bytes out of the connection's input into the request's inbox, by the response's framing.
+fun HttpAsyncClient.streamParse(slot: int, eof: bool): void {
+    val request = this.connectionRequests[slot]
+    if (request < 0) return
+    var input = this.connectionInputs[slot]
+    if (this.streamStates[request].framing == 0) {
+        val finalOffset = httpFinalResponseOffset(input)
+        if (finalOffset > 0) input = input.slice(finalOffset, input.size)
+        val headerEnd = httpHeaderEnd(input)
+        if (headerEnd < 0) {
+            this.connectionInputs[slot] = input
+            if (eof) this.fail(slot, "connection closed before response")
+            else if (input.size > 65536) this.fail(slot, "response header too large")
+            return
+        }
+        val response = httpParseResponseBounded(input.slice(0, headerEnd), 0).response
+        if (httpResponseLengthsDiffer(response.headers)) {
+            this.fail(slot, "conflicting Content-Length headers")
+            return
+        }
+        val transferEncoding = response.header("Transfer-Encoding")
+        val lengthHeader = response.header("Content-Length")
+        var keepAlive = !httpCoreHeaderTokenContains(response.header("Connection"), "close") && textFindSequence(input, "HTTP/1.1", 0, 8) == 0
+        var framing = 3
+        var left = 0
+        val isHead = httpRequestIsHead(this.requestPayloads[request])
+        if (isHead || (response.status >= 100 && response.status < 200) || response.status == 204 || response.status == 304) framing = 4
+        else if (httpCoreHeaderTokenContains(transferEncoding, "chunked")) framing = 2
+        else if (transferEncoding == "" && lengthHeader != "") {
+            left = httpDecimalLength(lengthHeader, 9223372036854775807)
+            if (left < 0) {
+                this.fail(slot, "invalid Content-Length")
+                return
+            }
+            framing = 1
+        }
+        if (response.status == 101 || framing == 3) keepAlive = false
+        this.streamStates[request].framing = framing
+        this.streamStates[request].left = left
+        this.streamStates[request].keepAlive = keepAlive
+        this.streamStates[request].status = response.status
+        this.streamStates[request].headers = response.headers
+        this.requestStatuses[request] = response.status
+        this.streamEvents.append(HttpAsyncStreamEvent(HTTP_STREAM_HEADERS, this.requestIds[request], status = response.status, headers = response.headers))
+        input = input.slice(headerEnd, input.size)
+    }
+    val wasEmpty = this.streamStates[request].inbox.size == 0
+    var complete = false
+    var broken = false
+    var more = true
+    while (more && !complete && !broken) {
+        val framing = this.streamStates[request].framing
+        if (framing == 4) complete = true
+        else if (framing == 1) {
+            val take = if (input.size < this.streamStates[request].left) input.size else this.streamStates[request].left
+            if (take > 0) {
+                this.streamStates[request].inbox = this.streamStates[request].inbox + (if (take == input.size) input else input.slice(0, take))
+                input = input.slice(take, input.size)
+                this.streamStates[request].left = this.streamStates[request].left - take
+            }
+            if (this.streamStates[request].left == 0) complete = true
+            else more = false
+        } else if (framing == 3) {
+            if (input.size > 0) {
+                this.streamStates[request].inbox = this.streamStates[request].inbox + input
+                input = ""
+            }
+            if (eof) complete = true
+            more = false
+        } else {
+            // chunked
+            val phase = this.streamStates[request].phase
+            if (phase == 0) {
+                val lineEnd = textFindSequence(input, "\r\n", 0, input.size)
+                if (lineEnd < 0) {
+                    if (input.size > 4096) broken = true
+                    more = false
+                } else {
+                    var digits = input.slice(0, lineEnd)
+                    val semicolon = digits.indexOf(";")
+                    if (semicolon >= 0) digits = digits.slice(0, semicolon)
+                    var size = 0
+                    var valid = digits.size > 0
+                    for (i in 0 until digits.size) {
+                        val c = digits[i]
+                        val digit = if (c >= 48 && c <= 57) c - 48 else if (c >= 97 && c <= 102) c - 87 else if (c >= 65 && c <= 70) c - 55 else -1
+                        if (digit < 0 || size > 1152921504606846975) valid = false
+                        else size = size * 16 + digit
+                    }
+                    if (!valid) broken = true
+                    else {
+                        input = input.slice(lineEnd + 2, input.size)
+                        this.streamStates[request].left = size
+                        this.streamStates[request].phase = if (size == 0) 3 else 1
+                    }
+                }
+            } else if (phase == 1) {
+                val take = if (input.size < this.streamStates[request].left) input.size else this.streamStates[request].left
+                if (take > 0) {
+                    this.streamStates[request].inbox = this.streamStates[request].inbox + (if (take == input.size) input else input.slice(0, take))
+                    input = input.slice(take, input.size)
+                    this.streamStates[request].left = this.streamStates[request].left - take
+                }
+                if (this.streamStates[request].left == 0) this.streamStates[request].phase = 2
+                else more = false
+            } else if (phase == 2) {
+                if (input.size < 2) more = false
+                else if (input[0] != 13 || input[1] != 10) broken = true
+                else {
+                    input = input.slice(2, input.size)
+                    this.streamStates[request].phase = 0
+                }
+            } else {
+                // After the last chunk: trailer fields, then an empty line.
+                if (input.size >= 2 && input[0] == 13 && input[1] == 10) {
+                    input = input.slice(2, input.size)
+                    complete = true
+                } else {
+                    val end = textFindSequence(input, "\r\n\r\n", 0, input.size)
+                    if (end < 0) {
+                        if (input.size > 65536) broken = true
+                        more = false
+                    } else {
+                        this.streamStates[request].trailers = httpParseResponseBounded("HTTP/1.1 200 OK\r\n" + input.slice(0, end + 4), 0).response.headers
+                        input = input.slice(end + 4, input.size)
+                        complete = true
+                    }
+                }
+            }
+        }
+    }
+    this.connectionInputs[slot] = input
+    if (broken) {
+        this.fail(slot, "invalid chunked response")
+        return
+    }
+    if (!complete && eof) {
+        this.fail(slot, "connection closed mid-response")
+        return
+    }
+    if (complete) this.streamStates[request].ended = true
+    if (wasEmpty && this.streamStates[request].inbox.size > 0) this.streamEvents.append(HttpAsyncStreamEvent(HTTP_STREAM_READABLE, this.requestIds[request]))
+    if (this.streamStates[request].inbox.size >= httpAsyncStreamHigh && !this.streamStates[request].ended) {
+        // Enough waits: the socket is not read until readStream takes some.
+        this.streamStates[request].paused = true
+        this.streamInterest(slot, this.connectionWriteInterest[slot])
+    }
+    if (this.streamStates[request].ended && this.streamStates[request].inbox.size == 0) this.streamFinish(slot)
+    return
+}
+
+// The response is whole and was read: END, and the connection is kept for another request when both bodies are done and the server allows it.
+fun HttpAsyncClient.streamFinish(slot: int): void {
+    val request = this.connectionRequests[slot]
+    if (request < 0) return
+    val keepAlive = this.streamStates[request].keepAlive
+    val bodyDone = this.streamStates[request].bodyDone
+    val status = this.streamStates[request].status
+    val headers: array<HttpHeader> = []
+    for (header in this.streamStates[request].headers) headers.append(header)
+    val trailers: array<HttpHeader> = []
+    for (header in this.streamStates[request].trailers) trailers.append(header)
+    val reusable = keepAlive && (bodyDone || this.requestLengths[request] == 0) && this.connectionOutputs[slot].size == 0 && this.connectionInputs[slot] == ""
+    this.connectionRequests[slot] = -1
+    this.requestTrailers[request] = trailers
+    this.complete(request, status, headers, "", "", "http/1.1")
+    if (reusable) {
+        this.connectionStates[slot] = httpAsyncConnectionIdle
+        this.connectionIdleSince[slot] = linuxMonotonicMilliseconds()
+        this.poller.modifyDescriptor(this.connectionDescriptors[slot], true, false)
+        this.connectionWriteInterest[slot] = false
+    } else this.closeConnection(slot)
+    return
 }
 
 // ---------------------------------------------------------------------------
@@ -1475,10 +1801,70 @@ private fun HttpAsyncClient.streamTouch(request: int): void {
     return
 }
 
+// The connection slot of a live HTTP/1.1 streaming request, or -1.
+private fun HttpAsyncClient.streamHttp1(request: int): int {
+    val slot = this.requestSlots[request]
+    if (slot >= 0 && this.connectionStates[slot] == httpAsyncConnectionStreaming && this.connectionRequests[slot] == request) slot else -1
+}
+
+private fun HttpAsyncClient.writeBodyHttp1(slot: int, request: int, chunk: string): int {
+    if (this.streamStates[request].bodyDone) return -1
+    if (chunk.size == 0) return 0
+    val unsent = this.connectionOutputs[slot].size - this.connectionOutputOffsets[slot]
+    val room = httpAsyncStreamCap - unsent
+    if (room <= 0) {
+        this.streamStates[request].blocked = true
+        return 0
+    }
+    val taken = if (chunk.size < room) chunk.size else room
+    if (taken < chunk.size) this.streamStates[request].blocked = true
+    val piece = if (taken == chunk.size) chunk else chunk.slice(0, taken)
+    val framed = if (this.streamStates[request].chunkedRequest) "${httpAsyncHex(taken)}\r\n$piece\r\n" else piece
+    val kept = if (unsent > 0) this.connectionOutputs[slot].slice(this.connectionOutputOffsets[slot], this.connectionOutputs[slot].size) else ""
+    this.connectionOutputs[slot] = kept + framed
+    this.connectionOutputOffsets[slot] = 0
+    this.streamTouch(request)
+    this.streamWrite(slot)
+    taken
+}
+
+private fun HttpAsyncClient.finishBodyHttp1(slot: int, request: int): void {
+    if (this.streamStates[request].bodyDone) return
+    this.streamStates[request].bodyDone = true
+    if (this.streamStates[request].chunkedRequest) {
+        val unsent = this.connectionOutputs[slot].size - this.connectionOutputOffsets[slot]
+        val kept = if (unsent > 0) this.connectionOutputs[slot].slice(this.connectionOutputOffsets[slot], this.connectionOutputs[slot].size) else ""
+        this.connectionOutputs[slot] = kept + "0\r\n\r\n"
+        this.connectionOutputOffsets[slot] = 0
+    }
+    this.streamTouch(request)
+    this.streamWrite(slot)
+    return
+}
+
+private fun HttpAsyncClient.readStreamHttp1(slot: int, request: int, maximum: int): string {
+    val inbox = this.streamStates[request].inbox
+    if (inbox.size == 0 || maximum <= 0) return ""
+    val count = if (inbox.size < maximum) inbox.size else maximum
+    val data = if (count == inbox.size) inbox else inbox.slice(0, count)
+    this.streamStates[request].inbox = if (count == inbox.size) "" else inbox.slice(count, inbox.size)
+    this.streamTouch(request)
+    if (this.streamStates[request].paused && this.streamStates[request].inbox.size < httpAsyncStreamHigh / 2) {
+        // Room again: read on (what the TLS session still holds does not announce itself).
+        this.streamStates[request].paused = false
+        this.streamInterest(slot, this.connectionWriteInterest[slot])
+        this.streamRead(slot)
+    }
+    if (this.connectionRequests[slot] == request && this.streamStates[request].ended && this.streamStates[request].inbox.size == 0) this.streamFinish(slot)
+    data
+}
+
 /** Writes request body bytes: returns how many were taken (a prefix of `chunk`), 0 when the stream cannot take more now (wait for WRITABLE), -1 when the id is not a live streaming request. */
 fun HttpAsyncClient.writeBody(id: int, chunk: string): int {
     val request = this.streamRequest(id)
     if (request < 0) return -1
+    val one = this.streamHttp1(request)
+    if (one >= 0) return this.writeBodyHttp1(one, request, chunk)
     val carrier = this.streamCarrier(request)
     if (carrier < 0) return 0
     val taken = this.connectionH2[carrier].writeBody(this.requestStreams[request], chunk)
@@ -1491,6 +1877,11 @@ fun HttpAsyncClient.writeBody(id: int, chunk: string): int {
 fun HttpAsyncClient.finishBody(id: int): void {
     val request = this.streamRequest(id)
     if (request < 0) return
+    val one = this.streamHttp1(request)
+    if (one >= 0) {
+        this.finishBodyHttp1(one, request)
+        return
+    }
     val carrier = this.streamCarrier(request)
     if (carrier < 0) return
     this.connectionH2[carrier].finishBody(this.requestStreams[request])
@@ -1503,6 +1894,8 @@ fun HttpAsyncClient.finishBody(id: int): void {
 fun HttpAsyncClient.readStream(id: int, maximum: int = 65536): string {
     val request = this.streamRequest(id)
     if (request < 0) return ""
+    val one = this.streamHttp1(request)
+    if (one >= 0) return this.readStreamHttp1(one, request, maximum)
     val carrier = this.streamCarrier(request)
     if (carrier < 0) return ""
     val data = this.connectionH2[carrier].takeData(this.requestStreams[request], maximum)
@@ -1515,6 +1908,7 @@ fun HttpAsyncClient.readStream(id: int, maximum: int = 65536): string {
 fun HttpAsyncClient.streamPending(id: int): int {
     val request = this.streamRequest(id)
     if (request < 0) return 0
+    if (this.streamHttp1(request) >= 0) return this.streamStates[request].inbox.size
     val carrier = this.streamCarrier(request)
     if (carrier < 0) return 0
     this.connectionH2[carrier].pendingData(this.requestStreams[request])
