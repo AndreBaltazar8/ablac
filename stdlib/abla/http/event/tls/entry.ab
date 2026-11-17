@@ -107,6 +107,20 @@ class HttpsExchange(
     var finishing: bool = false,
     var wantWritable: bool = false,
     var resumeOnDrain: bool = false,
+    var blockedWrite: bool = false,
+    // HTTP/1.1 (stream 0): the request body's framing (0 none, 1 Content-Length with `reqLeft` to come, 2 chunked with `reqPhase`), the response's (chunked when its length is unknown), and whether the
+    // connection stays for another request. `discarding`: the response ended before the request did, the rest of the request is thrown away.
+    var h1: bool = false,
+    var reqFraming: int = 0,
+    var reqLeft: int = 0,
+    var reqPhase: int = 0,
+    var reqEnded: bool = false,
+    var chunkedResponse: bool = false,
+    var headResponse: bool = false,
+    var responseDone: bool = false,
+    var keepAlive: bool = true,
+    var discarding: bool = false,
+    var requestTrailers: array<HttpHeader> = [],
     var trailers: array<HttpHeader> = []
 )
 
@@ -245,14 +259,118 @@ private fun HttpsEventServer.removeExchange(id: int): void {
     return
 }
 
+// ---- the transport of an exchange: HTTP/2 stream or HTTP/1.1 connection ----
+private fun HttpsEventServer.xRoom(index: int): int {
+    val slot = this.exchanges[index].slot
+    if (!this.exchanges[index].h1) return this.h2[slot].responseRoom(this.exchanges[index].stream)
+    if (!this.exchanges[index].exchange.responded || this.exchanges[index].responseDone) return 0
+    val room = httpsStreamCap - (this.outputs[slot].size - this.outputOffsets[slot])
+    if (room < 0) 0 else room
+}
+
+// Answers the exchange; false when it cannot be.
+private fun HttpsEventServer.xRespond(index: int, status: int, headers: array<HttpHeader>, length: int): bool {
+    val slot = this.exchanges[index].slot
+    if (!this.exchanges[index].h1) return this.h2[slot].respondStream(this.exchanges[index].stream, status, headers, length)
+    if (status < 200 || status > 599 || this.exchanges[index].exchange.responded) return false
+    var head = "HTTP/1.1 $status ${httpStatusReason(status)}\r\n"
+    for (h in headers) {
+        val name = h.name.lowercase()
+        if (name == "content-length" || name == "transfer-encoding" || name == "connection") continue
+        head = head + "${h.name}: ${h.value}\r\n"
+    }
+    val noBody = this.exchanges[index].headResponse || status == 204 || status == 304
+    if (noBody) { /* no body framing */ }
+    else if (length >= 0) head = head + "Content-Length: $length\r\n"
+    else {
+        head = head + "Transfer-Encoding: chunked\r\n"
+        this.exchanges[index].chunkedResponse = true
+    }
+    head = head + (if (this.exchanges[index].keepAlive) "Connection: keep-alive\r\n\r\n" else "Connection: close\r\n\r\n")
+    this.xAppend(slot, head)
+    // The response of a HEAD, of length 0 or without a body is complete with its head.
+    if (noBody || length == 0) this.exchanges[index].responseDone = true
+    true
+}
+
+// Appends bytes to the connection's output (the unsent part stays; the sent part goes).
+private fun HttpsEventServer.xAppend(slot: int, bytes: string): void {
+    val offset = this.outputOffsets[slot]
+    val kept = if (offset > 0 && offset < this.outputs[slot].size) this.outputs[slot].slice(offset, this.outputs[slot].size) else if (offset == 0) this.outputs[slot] else ""
+    this.outputs[slot] = kept + bytes
+    this.outputOffsets[slot] = 0
+    return
+}
+
+// Writes response bytes; returns how many were taken, 0 when the response is full, -1 when the exchange is not writable.
+private fun HttpsEventServer.xWrite(index: int, chunk: string): int {
+    val slot = this.exchanges[index].slot
+    if (!this.exchanges[index].h1) return this.h2[slot].writeResponse(this.exchanges[index].stream, chunk)
+    if (!this.exchanges[index].exchange.responded || (this.exchanges[index].responseDone && !this.exchanges[index].headResponse)) return -1
+    // A HEAD response has no body: what is written is dropped.
+    if (this.exchanges[index].headResponse) return chunk.size
+    val room = this.xRoom(index)
+    if (room <= 0) return 0
+    val taken = if (chunk.size < room) chunk.size else room
+    val piece = if (taken == chunk.size) chunk else chunk.slice(0, taken)
+    this.xAppend(slot, if (this.exchanges[index].chunkedResponse) "${httpsHex(taken)}\r\n$piece\r\n" else piece)
+    taken
+}
+
+private fun HttpsEventServer.xEnd(index: int, trailers: array<HttpHeader>): void {
+    val slot = this.exchanges[index].slot
+    if (!this.exchanges[index].h1) {
+        this.h2[slot].endResponse(this.exchanges[index].stream, trailers)
+        return
+    }
+    if (this.exchanges[index].chunkedResponse && !this.exchanges[index].responseDone) {
+        var end = "0\r\n"
+        for (t in trailers) end = end + "${t.name}: ${t.value}\r\n"
+        this.xAppend(slot, end + "\r\n")
+    }
+    this.exchanges[index].responseDone = true
+    return
+}
+
+private fun HttpsEventServer.xAbort(index: int, code: int): void {
+    val slot = this.exchanges[index].slot
+    if (!this.exchanges[index].h1) this.h2[slot].abortStream(this.exchanges[index].stream, code)
+    else this.closeSlot(slot)
+    return
+}
+
+// The request body credit held back is given: HTTP/2 window credit, HTTP/1.1 reading again.
+private fun HttpsEventServer.xRelease(index: int): void {
+    val slot = this.exchanges[index].slot
+    if (!this.exchanges[index].h1) {
+        if (this.exchanges[index].held > 0) {
+            this.h2[slot].consumed(this.exchanges[index].stream, this.exchanges[index].held)
+            this.exchanges[index].held = 0
+        }
+    } else this.h1Resume(slot)
+    return
+}
+
+private val httpsStreamCap = 262144
+
+private fun httpsHex(value: int): string {
+    if (value == 0) return "0"
+    var out = ""
+    var rest = value
+    while (rest > 0) {
+        val digit = rest % 16
+        out = (if (digit < 10) "${digit}" else if (digit == 10) "a" else if (digit == 11) "b" else if (digit == 12) "c" else if (digit == 13) "d" else if (digit == 14) "e" else "f") + out
+        rest = rest / 16
+    }
+    out
+}
+
 // Sends what a handler wrote past the room, then the end of the response when it was asked for; updates the room the handler sees.
 private fun HttpsEventServer.flushExchange(id: int): void {
     val index = this.exchangeById(id)
     if (index < 0) return
-    val slot = this.exchanges[index].slot
-    val stream = this.exchanges[index].stream
     if (this.exchanges[index].pending.size > 0) {
-        val taken = this.h2[slot].writeResponse(stream, this.exchanges[index].pending)
+        val taken = this.xWrite(index, this.exchanges[index].pending)
         if (taken < 0) this.exchanges[index].pending = ""
         else if (taken > 0) this.exchanges[index].pending = this.exchanges[index].pending.slice(taken, this.exchanges[index].pending.size)
     }
@@ -260,17 +378,30 @@ private fun HttpsEventServer.flushExchange(id: int): void {
     if (this.exchanges[index].pending.size == 0 && this.exchanges[index].resumeOnDrain && this.exchanges[index].paused) {
         this.exchanges[index].paused = false
         this.exchanges[index].resumeOnDrain = false
-        if (this.exchanges[index].held > 0) {
-            this.h2[slot].consumed(stream, this.exchanges[index].held)
-            this.exchanges[index].held = 0
-        }
+        this.xRelease(index)
     }
     if (this.exchanges[index].pending.size == 0 && this.exchanges[index].finishing) {
-        this.h2[slot].endResponse(stream, this.exchanges[index].trailers)
+        val ending: array<HttpHeader> = []
+        for (t in this.exchanges[index].trailers) ending.append(t)
+        this.xEnd(index, ending)
+        this.responseFinished(id)
+        return
+    }
+    if (this.exchanges[index].pending.size > 0) this.exchanges[index].blockedWrite = true
+    this.exchanges[index].exchange.room = if (this.exchanges[index].pending.size > 0) 0 else this.xRoom(index)
+    return
+}
+
+// The response of an exchange is complete. HTTP/2: the exchange is over. HTTP/1.1: it is over once the request is too (what is left of the request is thrown away) and the output is out.
+private fun HttpsEventServer.responseFinished(id: int): void {
+    val index = this.exchangeById(id)
+    if (index < 0) return
+    if (!this.exchanges[index].h1) {
         this.removeExchange(id)
         return
     }
-    this.exchanges[index].exchange.room = if (this.exchanges[index].pending.size > 0) 0 else this.h2[slot].responseRoom(stream)
+    this.exchanges[index].responseDone = true
+    if (!this.exchanges[index].reqEnded) this.exchanges[index].discarding = true
     return
 }
 
@@ -278,25 +409,23 @@ private fun HttpsEventServer.flushExchange(id: int): void {
 private fun HttpsEventServer.applyStep(id: int, step: HttpStreamStep): void {
     var index = this.exchangeById(id)
     if (index < 0) return
-    val slot = this.exchanges[index].slot
-    val stream = this.exchanges[index].stream
     if (step.abort) {
-        this.h2[slot].abortStream(stream, H2_CANCEL)
+        this.xAbort(index, H2_CANCEL)
         this.removeExchange(id)
         return
     }
     if ((step.respond || step.write.size > 0 || step.finish) && !this.exchanges[index].exchange.responded) {
         // A write or a finish before an answer is an answer: 200.
-        val ok = if (step.respond) this.h2[slot].respondStream(stream, step.status, step.headers, step.length) else this.h2[slot].respondStream(stream, 200, [], -1)
+        val ok = if (step.respond) this.xRespond(index, step.status, step.headers, step.length) else this.xRespond(index, 200, [], -1)
         if (!ok) {
-            this.h2[slot].abortStream(stream, H2_INTERNAL_ERROR)
+            this.xAbort(index, H2_INTERNAL_ERROR)
             this.removeExchange(id)
             return
         }
         this.exchanges[index].exchange.responded = true
         // A response of length 0 (or to a HEAD) is complete: no more writes.
-        if (step.respond && step.length == 0) {
-            this.removeExchange(id)
+        if (step.respond && (step.length == 0 || this.exchanges[index].responseDone)) {
+            this.responseFinished(id)
             return
         }
     }
@@ -312,14 +441,14 @@ private fun HttpsEventServer.applyStep(id: int, step: HttpStreamStep): void {
     if (step.pause == HTTP_STREAM_PAUSE_FOR_ROOM && this.exchanges[index].pending.size > 0) {
         this.exchanges[index].paused = true
         this.exchanges[index].resumeOnDrain = true
+        if (this.exchanges[index].h1) this.h1Pause(this.exchanges[index].slot)
     }
-    if (step.pause == HTTP_STREAM_PAUSE) this.exchanges[index].paused = true
-    else if (step.pause == HTTP_STREAM_RESUME && this.exchanges[index].paused) {
+    if (step.pause == HTTP_STREAM_PAUSE) {
+        this.exchanges[index].paused = true
+        if (this.exchanges[index].h1) this.h1Pause(this.exchanges[index].slot)
+    } else if (step.pause == HTTP_STREAM_RESUME && this.exchanges[index].paused) {
         this.exchanges[index].paused = false
-        if (this.exchanges[index].held > 0) {
-            this.h2[slot].consumed(stream, this.exchanges[index].held)
-            this.exchanges[index].held = 0
-        }
+        this.xRelease(index)
     }
     return
 }
@@ -402,6 +531,266 @@ private fun HttpsEventServer.streamEvent(slot: int, event: H2ServerEvent): void 
     } else if (event.kind == H2_SERVER_EVENT_RESET) {
         handler.onAbort(this.exchanges[index].exchange, event.error)
         this.removeExchange(id)
+    }
+    return
+}
+
+// ---- streaming routes over HTTP/1.1 ----
+// The request head is read as it arrives and the route's handler hears of it; the body is passed on as it is framed (Content-Length, or chunked) and reading stops while the handler is paused; the response
+// goes out as the handler writes it (Content-Length when it says how long, else chunked). The next request of the connection waits until both bodies are done. `Expect: 100-continue` is answered at once.
+
+private fun HttpsEventServer.h1Paused(slot: int): bool {
+    val index = this.exchangeAt(slot, 0)
+    index >= 0 && this.exchanges[index].h1 && this.exchanges[index].paused
+}
+
+private fun HttpsEventServer.setRead(slot: int, read: bool): void {
+    if (this.descriptors[slot] >= 0) this.poller.modifyDescriptor(this.descriptors[slot], read, this.writeWatching[slot])
+    return
+}
+
+private fun HttpsEventServer.h1Pause(slot: int): void {
+    this.setRead(slot, false)
+    return
+}
+
+private fun HttpsEventServer.h1Resume(slot: int): void {
+    this.setRead(slot, true)
+    return
+}
+
+// An HTTP/1.1 exchange of the slot that has something to do without a socket event: input it holds (or its TLS session does) and is not paused, or a producer with room.
+private fun HttpsEventServer.h1Ready(slot: int): bool {
+    val index = this.exchangeAt(slot, 0)
+    if (index < 0 || !this.exchanges[index].h1 || this.states[slot] != httpsHttp1) return false
+    if (this.exchanges[index].paused) return false
+    if (!this.exchanges[index].reqEnded && this.exchanges[index].exchange.responded && this.exchanges[index].resumeOnDrain && this.exchanges[index].pending.size == 0) return true
+    if (!this.exchanges[index].reqEnded && (this.inputs[slot].size > 0 || (this.tls != null && this.sessions[slot].hasPending()))) return this.outputs[slot].size == 0 || this.exchanges[index].exchange.responded
+    if (this.exchanges[index].blockedWrite || this.exchanges[index].wantWritable) return this.xRoom(index) >= httpsStreamCap / 2
+    this.exchanges[index].reqEnded && this.exchanges[index].responseDone && this.outputs[slot].size == 0
+}
+
+private fun HttpsEventServer.startH1Exchange(slot: int, request: HttpRequest, headerEnd: int, http10: bool, route: int): bool {
+    val limit = this.streamRoutes[route].maximumBodyBytes
+    val framing = httpRequestFraming(request, http10, if (limit > 0) limit else 4611686018427387903)
+    if (framing == -1) {
+        // Over the route's limit (a valid Content-Length past it) is 413, anything else is not a request.
+        val tooLarge = limit > 0 && httpDecimalLength(request.header("Content-Length"), 4611686018427387903) > limit
+        this.outputs[slot] = httpText(if (tooLarge) "request body too large" else "bad request", if (tooLarge) 413 else 400).render()
+        this.outputOffsets[slot] = 0
+        this.closing[slot] = true
+        this.flush(slot)
+        return true
+    }
+    this.requestCounts[slot] = this.requestCounts[slot] + 1
+    val keepAlive = (if (http10) httpHeaderTokenContains(request.header("Connection"), "keep-alive") && httpRequestKeepAlive(request) else httpRequestKeepAlive(request)) &&
+        !this.draining && this.requestCounts[slot] < this.options.base.maximumRequestsPerConnection
+    val id = this.nextExchange
+    this.nextExchange = this.nextExchange + 1
+    val exchange = HttpStreamExchange(id, request.method, request.path, request.query, request.headers, request.peerAddress)
+    val state = HttpsExchange(exchange, slot, 0, route, h1 = true, reqFraming = if (framing == -2) 2 else if (framing > 0) 1 else 0, reqLeft = if (framing > 0) framing else 0,
+        keepAlive = keepAlive, headResponse = request.method == "HEAD")
+    this.exchanges.append(state)
+    this.inputs[slot] = if (headerEnd < this.inputs[slot].size) this.inputs[slot].slice(headerEnd, this.inputs[slot].size) else ""
+    if (httpHeaderTokenContains(request.header("Expect"), "100-continue") && framing != 0) this.xAppend(slot, "HTTP/1.1 100 Continue\r\n\r\n")
+    if (framing == 0) {
+        // No body: the request is whole.
+        val index = this.exchangeById(id)
+        this.exchanges[index].reqEnded = true
+    }
+    val handler = this.streamRoutes[route].handler
+    this.applyStep(id, handler.onRequest(exchange))
+    val index = this.exchangeById(id)
+    if (index >= 0 && this.exchanges[index].reqEnded) {
+        exchange.requestEnded = true
+        this.applyStep(id, handler.onEnd(exchange, []))
+    }
+    true
+}
+
+// A piece of the request body for the handler (or the bin when the response is over).
+private fun HttpsEventServer.h1Deliver(id: int, chunk: string): void {
+    var index = this.exchangeById(id)
+    if (index < 0 || chunk.size == 0) return
+    if (this.exchanges[index].discarding) return
+    this.exchanges[index].exchange.requestBytes = this.exchanges[index].exchange.requestBytes + chunk.size
+    val limit = this.streamRoutes[this.exchanges[index].route].maximumBodyBytes
+    if (limit > 0 && this.exchanges[index].exchange.requestBytes > limit) {
+        // Past the route's limit: 413 when nothing was answered, the rest of the request is thrown away and the connection closes after.
+        this.h1OverLimit(id)
+        return
+    }
+    val handler = this.streamRoutes[this.exchanges[index].route].handler
+    this.applyStep(id, handler.onData(this.exchanges[index].exchange, chunk))
+    return
+}
+
+// Takes the request body out of the slot's input by the exchange's framing, a piece at a time, until the input is used up, the exchange is paused or the request is whole.
+private fun HttpsEventServer.h1Feed(slot: int): void {
+    var index = this.exchangeAt(slot, 0)
+    if (index < 0 || !this.exchanges[index].h1) return
+    val id = this.exchanges[index].exchange.id
+    var input = this.inputs[slot]
+    var more = true
+    while (more) {
+        index = this.exchangeById(id)
+        if (index < 0) {
+            this.inputs[slot] = input
+            return
+        }
+        if (this.exchanges[index].reqEnded || (this.exchanges[index].paused && !this.exchanges[index].discarding) || this.exchanges[index].reqFraming == 0) {
+            more = false
+        } else if (this.exchanges[index].reqFraming == 1) {
+            if (input.size == 0) more = false
+            else {
+                val take = if (input.size < this.exchanges[index].reqLeft) input.size else this.exchanges[index].reqLeft
+                val piece = if (take == input.size) input else input.slice(0, take)
+                input = if (take == input.size) "" else input.slice(take, input.size)
+                this.exchanges[index].reqLeft = this.exchanges[index].reqLeft - take
+                if (this.exchanges[index].reqLeft == 0) this.exchanges[index].reqEnded = true
+                this.inputs[slot] = input
+                this.h1Deliver(id, piece)
+                this.h1RequestEnded(id)
+            }
+        } else {
+            // chunked
+            val phase = this.exchanges[index].reqPhase
+            if (phase == 0) {
+                val lineEnd = textFindSequence(input, "\r\n", 0, input.size)
+                if (lineEnd < 0) {
+                    if (input.size > 4096) {
+                        this.closeSlot(slot)
+                        return
+                    }
+                    more = false
+                } else {
+                    var digits = input.slice(0, lineEnd)
+                    val semicolon = digits.indexOf(";")
+                    if (semicolon >= 0) digits = digits.slice(0, semicolon)
+                    var size = 0
+                    var valid = digits.size > 0
+                    for (i in 0 until digits.size) {
+                        val c = digits[i]
+                        val digit = if (c >= 48 && c <= 57) c - 48 else if (c >= 97 && c <= 102) c - 87 else if (c >= 65 && c <= 70) c - 55 else -1
+                        if (digit < 0 || size > 1152921504606846975) valid = false
+                        else size = size * 16 + digit
+                    }
+                    if (!valid) {
+                        this.closeSlot(slot)
+                        return
+                    }
+                    input = input.slice(lineEnd + 2, input.size)
+                    this.exchanges[index].reqLeft = size
+                    this.exchanges[index].reqPhase = if (size == 0) 3 else 1
+                }
+            } else if (phase == 1) {
+                if (input.size == 0) more = false
+                else {
+                    val take = if (input.size < this.exchanges[index].reqLeft) input.size else this.exchanges[index].reqLeft
+                    val piece = if (take == input.size) input else input.slice(0, take)
+                    input = if (take == input.size) "" else input.slice(take, input.size)
+                    this.exchanges[index].reqLeft = this.exchanges[index].reqLeft - take
+                    if (this.exchanges[index].reqLeft == 0) this.exchanges[index].reqPhase = 2
+                    this.inputs[slot] = input
+                    this.h1Deliver(id, piece)
+                }
+            } else if (phase == 2) {
+                if (input.size < 2) more = false
+                else if (input[0] != 13 || input[1] != 10) {
+                    this.closeSlot(slot)
+                    return
+                } else {
+                    input = input.slice(2, input.size)
+                    this.exchanges[index].reqPhase = 0
+                }
+            } else {
+                // After the last chunk: trailer fields, then an empty line.
+                if (input.size >= 2 && input[0] == 13 && input[1] == 10) {
+                    input = input.slice(2, input.size)
+                    this.exchanges[index].reqEnded = true
+                    this.inputs[slot] = input
+                    this.h1RequestEnded(id)
+                } else {
+                    val end = textFindSequence(input, "\r\n\r\n", 0, input.size)
+                    if (end < 0) {
+                        if (input.size > 65536) {
+                            this.closeSlot(slot)
+                            return
+                        }
+                        more = false
+                    } else {
+                        this.exchanges[index].requestTrailers = httpParseResponseBounded("HTTP/1.1 200 OK\r\n" + input.slice(0, end + 4), 0).response.headers
+                        input = input.slice(end + 4, input.size)
+                        this.exchanges[index].reqEnded = true
+                        this.inputs[slot] = input
+                        this.h1RequestEnded(id)
+                    }
+                }
+            }
+        }
+    }
+    this.inputs[slot] = input
+    return
+}
+
+// The request is whole: the handler hears of it (unless the response is over already).
+private fun HttpsEventServer.h1RequestEnded(id: int): void {
+    val index = this.exchangeById(id)
+    if (index < 0 || !this.exchanges[index].reqEnded || this.exchanges[index].exchange.requestEnded) return
+    this.exchanges[index].exchange.requestEnded = true
+    if (this.exchanges[index].discarding) return
+    val handler = this.streamRoutes[this.exchanges[index].route].handler
+    val trailers: array<HttpHeader> = []
+    for (t in this.exchanges[index].requestTrailers) trailers.append(t)
+    this.applyStep(id, handler.onEnd(this.exchanges[index].exchange, trailers))
+    return
+}
+
+// Producers and writers waiting for room hear of it (HTTP/1.1: the output drained).
+private fun HttpsEventServer.h1Round(slot: int): void {
+    var rounds = 0
+    while (rounds < 16) {
+        val index = this.exchangeAt(slot, 0)
+        if (index < 0 || !this.exchanges[index].h1) return
+        val id = this.exchanges[index].exchange.id
+        this.flushExchange(id)
+        val after = this.exchangeById(id)
+        if (after < 0) return
+        if (this.exchanges[after].discarding) return
+        if (this.exchanges[after].pending.size > 0 || this.exchanges[after].responseDone) return
+        val asking = this.exchanges[after].wantWritable || this.exchanges[after].blockedWrite
+        if (!asking || this.xRoom(after) < httpsStreamCap / 2) return
+        this.exchanges[after].wantWritable = false
+        this.exchanges[after].blockedWrite = false
+        this.exchanges[after].exchange.room = this.xRoom(after)
+        val handler = this.streamRoutes[this.exchanges[after].route].handler
+        this.applyStep(id, handler.onWritable(this.exchanges[after].exchange))
+        this.flush(slot)
+        rounds = rounds + 1
+    }
+    return
+}
+
+// A request body past the route's limit: 413 when nothing was answered yet (the connection closes after), else the connection is dropped; the handler hears of the abort either way.
+private fun HttpsEventServer.h1OverLimit(id: int): void {
+    val index = this.exchangeById(id)
+    if (index < 0) return
+    val slot = this.exchanges[index].slot
+    val handler = this.streamRoutes[this.exchanges[index].route].handler
+    if (!this.exchanges[index].exchange.responded) {
+        this.exchanges[index].keepAlive = false
+        this.exchanges[index].discarding = true
+        if (this.xRespond(index, 413, [HttpHeader("content-type", "text/plain")], 22)) {
+            this.exchanges[index].exchange.responded = true
+            this.xWrite(index, "request body too large")
+            this.xEnd(index, [])
+        }
+        handler.onAbort(this.exchanges[index].exchange, "the request body passed the route's limit")
+        this.flush(slot)
+    } else {
+        handler.onAbort(this.exchanges[index].exchange, "the request body passed the route's limit")
+        this.removeExchange(id)
+        this.closeSlot(slot)
     }
     return
 }
@@ -504,8 +893,8 @@ fun HttpsEventServer.closeSlot(slot: int): void {
         this.writeWatching[slot] = false
         this.closing[slot] = false
         this.lastActivity[slot] = 0
+        this.abortExchanges(slot, "the connection closed")
         if (wasHttp2) {
-            this.abortExchanges(slot, "the connection closed")
             this.h2[slot] = h2ServerNew()
         }
     }
@@ -514,7 +903,7 @@ fun HttpsEventServer.closeSlot(slot: int): void {
 
 private fun HttpsEventServer.watchWrite(slot: int, want: bool): void {
     if (this.writeWatching[slot] != want && this.descriptors[slot] >= 0) {
-        if (this.poller.modifyDescriptor(this.descriptors[slot], true, want)) this.writeWatching[slot] = want
+        if (this.poller.modifyDescriptor(this.descriptors[slot], !this.h1Paused(slot), want)) this.writeWatching[slot] = want
     }
     return
 }
@@ -616,9 +1005,49 @@ private fun HttpsEventServer.startProtocol(slot: int, http2: bool): void {
 }
 
 private fun HttpsEventServer.serveHttp1(slot: int): void {
-    var processing = this.states[slot] == httpsHttp1 && this.descriptors[slot] >= 0 && this.outputs[slot].size == 0
+    var processing = this.states[slot] == httpsHttp1 && this.descriptors[slot] >= 0
     while (processing) {
         val base = this.options.base
+        // A streaming exchange of this connection: its request body is fed to its handler, its writers hear of room; the next request waits until both bodies are done.
+        if (this.exchangeAt(slot, 0) >= 0) {
+            this.h1Feed(slot)
+            this.h1Round(slot)
+            this.flush(slot)
+            if (this.descriptors[slot] < 0) return
+            val live = this.exchangeAt(slot, 0)
+            if (live >= 0 && this.exchanges[live].reqEnded && this.exchanges[live].responseDone && this.outputs[slot].size == 0) {
+                val keep = this.exchanges[live].keepAlive
+                this.removeExchange(this.exchanges[live].exchange.id)
+                if (!keep) {
+                    this.closing[slot] = true
+                    this.flush(slot)
+                    processing = false
+                }
+            } else processing = false
+            continue
+        }
+        if (this.outputs[slot].size > 0) {
+            processing = false
+            continue
+        }
+        // A request for a streaming route is started from its head, whatever of its body has arrived.
+        if (this.streamRoutes.size > 0) {
+            val seen = this.inputs[slot]
+            val headEnd = httpHeaderEnd(seen)
+            if (headEnd > 0 && headEnd <= base.maximumHeaderBytes) {
+                val lineEnd = seen.indexOf("\r\n")
+                val line = if (lineEnd > 0) seen.slice(0, lineEnd) else ""
+                val http11 = line.endsWith(" HTTP/1.1")
+                if (http11 || line.endsWith(" HTTP/1.0")) {
+                    val head = httpParseRequestFrom(seen, this.peers[slot])
+                    val route = this.routeFor(head.method, head.path)
+                    if (route >= 0) {
+                        this.startH1Exchange(slot, head, headEnd, !http11, route)
+                        continue
+                    }
+                }
+            }
+        }
         val frame = httpEventFrame(this.inputs[slot], base.maximumHeaderBytes, base.maximumBodyBytes, this.peers[slot])
         val length = frame.length
         if (length < 0) {
@@ -730,7 +1159,7 @@ fun HttpsEventServer.readSlot(slot: int): void {
     var reading = slot >= 0 && this.descriptors[slot] >= 0
     var result = HttpsRead("", 0)
     var rounds = 0
-    while (reading && this.descriptors[slot] >= 0 && rounds < 64) {
+    while (reading && this.descriptors[slot] >= 0 && rounds < 64 && !this.h1Paused(slot)) {
         rounds = rounds + 1
         if (this.states[slot] == httpsHandshaking) {
             this.handshake(slot)
@@ -795,7 +1224,7 @@ fun HttpsEventServer.acceptReady(): void {
 /** Whether the slot's TLS session holds decrypted bytes nobody has taken and the slot can take them (nothing of its own waits to be written). The socket has nothing to
  *  say about them: readSlot reads at most 64 times per event, and what the session had already read from the socket stays in it. */
 private fun HttpsEventServer.buffered(slot: int): bool =
-    this.tls != null && this.descriptors[slot] >= 0 && this.outputs[slot].size == 0 &&
+    this.tls != null && this.descriptors[slot] >= 0 && this.outputs[slot].size == 0 && !this.h1Paused(slot) &&
     (this.states[slot] == httpsHttp1 || this.states[slot] == httpsHttp2) && this.sessions[slot].hasPending()
 
 fun HttpsEventServer.step(timeoutMilliseconds: int = 1000): int {
@@ -813,6 +1242,7 @@ fun HttpsEventServer.step(timeoutMilliseconds: int = 1000): int {
     if (this.exchanges.size > 0) {
         for (slot in 0 until this.descriptors.size) {
             if (this.descriptors[slot] >= 0 && this.states[slot] == httpsHttp2 && this.producerReady(slot)) waiting = 0
+            else if (this.descriptors[slot] >= 0 && this.states[slot] == httpsHttp1 && this.h1Ready(slot)) waiting = 0
         }
     }
     val events = this.poller.waitCompact(maximumEvents, waiting)
@@ -856,6 +1286,9 @@ fun HttpsEventServer.step(timeoutMilliseconds: int = 1000): int {
             if (this.descriptors[slot] >= 0 && this.states[slot] == httpsHttp2 && this.producerReady(slot)) {
                 this.streamRound(slot)
                 this.flush(slot)
+                handled = handled + 1
+            } else if (this.descriptors[slot] >= 0 && this.states[slot] == httpsHttp1 && this.h1Ready(slot)) {
+                this.serveHttp1(slot)
                 handled = handled + 1
             }
         }

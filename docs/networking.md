@@ -470,12 +470,12 @@ while 192 KiB wait. A caller that stops taking stops the peer after one stream w
 before the first WRITABLE), `END` (after the last response byte was read) and `ERROR`; `finishBody(id)`, `cancelStream(id)`, `streamPending(id)`. The timeout is an idle one (default 30 s). A streaming request
 is never retried and a streamed response is not bounded by `maximumResponseBytes`.
 
-**Server** (`abla/http/event/tls`, over HTTP/2; HTTP/1.1 requests to a streaming route are not streamed yet and reach the buffered handler): `server.streamRoute(method, path, handler, maximumStreamBodyBytes = 0)`
+**Server** (`abla/http/event/tls`, over HTTP/2 and HTTP/1.1): `server.streamRoute(method, path, handler, maximumStreamBodyBytes = 0)`
 serves an exact path with an `HttpStreamHandler` (`onRequest`, `onData`, `onEnd`, `onWritable`, `onAbort`, called on the event loop's thread, never blocking). Each callback returns an `HttpStreamStep` (respond,
 write, finish with trailers, pause or resume the request body, abort); `server.streamStep(id, step)` gives one from outside a callback (a producer). A route's body limit is `maximumStreamBodyBytes` (0: none; 413
 when nothing was sent yet); **a handler that accumulates the body or an unbounded response is its own memory bound**, the server holds at most a stream window of request body and 256 KiB of response per exchange.
 `exchange.room` is how many response bytes can be written now; what a handler writes past it is kept by the server and sent first. Use `HTTP_STREAM_PAUSE_FOR_ROOM` (pause the request only if the
-write did not fit, resume by itself once it is out) for echoes and proxies, `wantWritable` for producers. No gzip is applied to a streamed response. An idle exchange ends with the connection's idle timeout (`onAbort`).
+write did not fit, resume by itself once it is out) for echoes and proxies, `wantWritable` for producers. Over HTTP/1.1 the request head is read as it arrives, the body is framed incrementally (Content-Length or chunked; `Expect: 100-continue` is answered at once), reading stops while the handler is paused, the response is Content-Length or chunked, and the next request of the connection waits until both bodies are done; the bound over HTTP/1.1 is the socket (the kernel's buffers, not the server's memory). No gzip is applied to a streamed response. An idle exchange ends with the connection's idle timeout (`onAbort`).
 
 Measured (tools/test-http2-stream.sh, tools/test-http2-stream-server.sh; h2o, nghttpd, curl and our own client): 1 GiB downloads and uploads over h2c, 256 MiB echoed both ways at once, 64 MiB over TLS,
 a consumer that stops reading and a request body nobody takes (the stream stalls after one window and the idle timeout ends it): byte-exact, an unread stream held at most one window, the client's resident

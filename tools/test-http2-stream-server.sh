@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Streaming routes of the HTTPS event server (tests/cases/http2/streamserver.ab: HttpsEventServer.streamRoute with HttpStreamHandler) against curl and our own streaming client
+# Streaming routes of the HTTPS event server, over HTTP/2 and HTTP/1.1 (tests/cases/http2/streamserver.ab: HttpsEventServer.streamRoute with HttpStreamHandler) against curl and our own streaming client
 # (tests/cases/http2/streamnet.ab), over h2c and TLS (HTTP/2): small exchanges (server-sent events, an echo of 1.5 MB, a sink that counts, a download of a few MB, the body limit of a route:
 # 413), then STREAM_BYTES (default 1 GiB) down, up and echoed at once, a consumer that stops reading, and a request body nobody takes (the stream stalls after one window and the server's idle timeout
 # ends it). What it checks besides the bytes: the server's resident memory (its VmHWM, STREAM_SERVER_RSS_LIMIT_KIB, default 131072) stays flat through all of it, and so does the client's.
@@ -59,7 +59,7 @@ tls_port=$port
 tls_pid=$server_pid
 
 # curl, h2c and TLS: server-sent events, the buffered handler beside the streaming ones, an echo of 1.5 MB, a sink, a download, a route's body limit.
-for target in "h2c --http2-prior-knowledge http://127.0.0.1:$plain_port" "TLS --http2 --cacert $out/p256.pem https://localhost:$tls_port"; do
+for target in "h2c --http2-prior-knowledge http://127.0.0.1:$plain_port" "TLS --http2 --cacert $out/p256.pem https://localhost:$tls_port" "HTTP/1.1 --http1.1 http://127.0.0.1:$plain_port" "HTTP/1.1-over-TLS --http1.1 --cacert $out/p256.pem https://localhost:$tls_port"; do
     label=${target%% *}
     rest=${target#* }
     flags=${rest% *}
@@ -73,12 +73,16 @@ for target in "h2c --http2-prior-knowledge http://127.0.0.1:$plain_port" "TLS --
     [[ $(curl -sS $flags -o /dev/null -w '%{http_code}' --data-binary "@$out/body.bin" "$base/limited") == 413 ]] || { echo "http2 stream server ($label): a body over the route's limit was not refused with 413" >&2; exit 1; }
     head -c 50000 "$out/body.bin" > "$out/small.bin"
     [[ $(curl -sS $flags --data-binary "@$out/small.bin" "$base/limited") == 'received 50000' ]] || { echo "http2 stream server ($label): a body within the limit was refused" >&2; exit 1; }
+    # (HTTP/1.1: a chunked request body too)
+    if [[ $flags == *--http1.1* ]]; then
+        [[ $(curl -sS $flags -H 'Transfer-Encoding: chunked' --data-binary "@$out/body.bin" "$base/sink") == 'received 1500000' ]] || { echo "http2 stream server ($label): the sink miscounted a chunked request" >&2; exit 1; }
+    fi
     echo "http2 stream server ($label): curl ok (events, echo, sink, download, body limit)"
 done
 
-run() {   # run LABEL PORT CA MODE BYTES PATH
+run() {   # run LABEL PORT CA MODE BYTES PATH [h1]
     local label=$1 result peak
-    result=$("$root/tools/run-limited.sh" "$out/streamnet" "$2" "$3" "$4" "$5" "$6") || { echo "http2 stream server ($label): $result" >&2; tail -5 "$out"/*.log >&2; exit 1; }
+    result=$("$root/tools/run-limited.sh" "$out/streamnet" "$2" "$3" "$4" "$5" "$6" ${7:-}) || { echo "http2 stream server ($label): $result" >&2; tail -5 "$out"/*.log >&2; exit 1; }
     [[ $result == "http2 streamnet $4 ok"* ]] || { echo "http2 stream server ($label): $result" >&2; exit 1; }
     peak=${result##*peak resident }
     peak=${peak%% KiB*}
@@ -93,6 +97,15 @@ run "upload over TLS" "$tls_port" "$out/p256.pem" up "$tls_bytes" /sink
 run "echo over TLS" "$tls_port" "$out/p256.pem" echo "$tls_bytes" /echo
 run "a consumer that stops reading" "$plain_port" - slow 33554432 /big?n=33554432
 run "a request body nobody takes" "$plain_port" - upstall 33554432 /stall
+# The same over HTTP/1.1: reading stops while the handler is paused (nobody reads the socket), Content-Length and chunked request bodies, chunked responses.
+run "download over HTTP/1.1" "$plain_port" - down "$bytes" "/big?n=$bytes" h1
+run "upload over HTTP/1.1, known length" "$plain_port" - up "$bytes" /sink h1
+run "upload over HTTP/1.1, chunked" "$plain_port" - upchunked "$bytes" /sink h1
+run "echo over HTTP/1.1" "$plain_port" - echo $((bytes / 4)) /echo h1
+run "download over TLS, HTTP/1.1" "$tls_port" "$out/p256.pem" down "$tls_bytes" "/big?n=$tls_bytes" h1
+run "echo over TLS, HTTP/1.1" "$tls_port" "$out/p256.pem" echo "$tls_bytes" /echo h1
+run "a consumer that stops reading, HTTP/1.1" "$plain_port" - slow 33554432 /big?n=33554432 h1
+run "a request body nobody takes, HTTP/1.1" "$plain_port" - upstall 33554432 /stall h1
 grep -q '^abort /stall' "$out/plain.log" || { echo "http2 stream server: the server never heard of the stalled exchange ending" >&2; cat "$out/plain.log" >&2; exit 1; }
 
 # The servers' own memory: what they peaked at over everything above.
