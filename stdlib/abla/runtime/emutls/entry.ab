@@ -12,17 +12,24 @@
 // one that only its own thread sees; a variable's storage is allocated from the Abla heap on first use and aligned as the
 // control asks.
 //
-// A thread's table and variables are freed when the thread ends, by one of two ends. The first table a thread makes sets
+// A thread's table and variables are freed when the thread ends, by one of three ends. The first table a thread makes sets
 // the runtime's thread-end hook (abla/runtime/self: `__ablaRuntimeSetThreadEndHook`), which every Abla thread calls last,
 // to `emutlsThreadEnd`. A program's own runtime has its own hook: a JIT-compiled program (`ablac run`) is given the
 // compiler's `emutlsThreadEnd` by the compiler (abla/llvm/orc: llvmOrcInstallThreadEnd). A thread the runtime did not
 // start (a pthread of a host that calls an exported function, a thread of LLVM's or of the compiler's own) never reaches
-// that hook, so the first table it makes also stores a value under a pthread key whose destructor is `emutlsThreadEnd`
-// (#826): the system runs it as the thread ends. Both ends find the cell empty once either has run, and a table made
-// after the hook (a thread's last frees may use a thread-local) is registered again by its first use and freed by the
-// key. This is for macOS only, where libSystem is always there: the two pthread calls are its only imports from this
-// module, and tools/libc-imports-allowlist.txt (#806, Abla without libc) allows the Linux compiler no new libc import, so
-// on Linux a thread the runtime did not start still leaves its table behind (there is no thread-end notice without libc).
+// that hook (#826):
+//  - On macOS the first table such a thread makes also stores a value under one pthread key whose destructor is
+//    `emutlsThreadEnd`, and the system runs it as the thread ends. Either end finds the cell empty once the other has run;
+//    a table made after the hook (a thread's last frees may use a thread-local) is registered again by its first use.
+//    The two pthread calls are libSystem's, always there on macOS, and the only imports this module has;
+//    tools/libc-imports-allowlist.txt (#806, Abla without libc) allows the Linux compiler no new libc import.
+//  - Elsewhere (Linux, with system calls only) each thread's first table is entered in a registry with the thread's id,
+//    and a later registration looks for the threads that have gone: tgkill(pid, id, 0) answers ESRCH for a thread that
+//    has ended, and its table and variables are freed by the thread that found it. That is lazy: the registry is swept when
+//    the number of entries reaches twice what the last sweep left (at least 8), so at most that many ended threads' tables
+//    wait; `emutlsReclaim` sweeps at once (a library may call it, from an export, when it is idle). An id that a new
+//    thread was given again is no hiding place: a record whose id is the registering thread's own belongs to a thread
+//    that has ended, since a live thread has an id of its own. The thread-end hook takes its own entry out.
 import "abla/runtime/scalar"
 import "abla/runtime/self"
 import "abla/unsafe/memory"
@@ -30,6 +37,15 @@ import "abla/unsafe/native"
 import "abla/unsafe/memory/raw"
 
 private noescape extern:"intrinsic" fun ablaHostIsMacOS(): bool
+private trusted noescape extern:"intrinsic" fun ablaLinuxSyscall(
+    number: int,
+    argument0: int,
+    argument1: int,
+    argument2: int,
+    argument3: int,
+    argument4: int,
+    argument5: int
+): int
 private noescape extern:"c" fun pthread_key_create(key: i64, destructor: i64): i32
 private noescape extern:"c" fun pthread_setspecific(key: i32, value: i64): i32
 
@@ -39,6 +55,15 @@ private @runtimeImplementation trusted fun emutlsCounterAddress(): int = nativeS
 private @runtimeImplementation trusted fun emutlsKeyCell(): int = nativeStaticAllocate(8)
 
 private @runtimeImplementation trusted fun emutlsKeyScratch(): int = nativeStaticAllocate(8)
+
+// The registry of the threads that have a table (everywhere but macOS): +0 its lock, +8 the newest record, +16 how many
+// records, +24 the count at which the next registration sweeps. A record: +0 the next, +8 the previous, +16 the thread's
+// id, +24 its table (kept current when the table grows).
+private @runtimeImplementation trusted fun emutlsRegistry(): int = nativeStaticAllocate(32)
+
+// This thread's record (24 bytes of its own, not to be shared with another cell of the same text).
+private @runtimeImplementation trusted fun emutlsRecordCell(): int =
+    nativeThreadLocalBytes("\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
 
 // Internal thread-local bytes, like the runtime's own per-thread cells: an exported thread-local would keep ELF's `__tls_get_addr`
 // in the compiler's imports, where an internal one is relaxed to a direct access.
@@ -102,6 +127,127 @@ private @runtimeImplementation trusted fun emutlsMakeCopy(control: int): int {
     address
 }
 
+private @runtimeImplementation trusted fun emutlsLock(): void {
+    val lock = emutlsRegistry()
+    while (ablaRuntimeAtomicCompareExchangeI64(lock, 0, 1) != 0) {}
+    return
+}
+
+private @runtimeImplementation trusted fun emutlsUnlock(): void {
+    ablaRuntimeAtomicStoreI64(emutlsRegistry(), 0)
+    return
+}
+
+// A table's variables and the table.
+private @runtimeImplementation trusted fun emutlsFreeTable(table: int): void {
+    val capacity = ablaRuntimeLoadI64(table)
+    var index = 1
+    while (index <= capacity) {
+        val address = ablaRuntimeLoadI64(table + 8 * index)
+        if (address != 0) ablaUnsafeFree(nativePointerFromAddress(ablaRuntimeLoadI64(address - 8)))
+        index = index + 1
+    }
+    ablaUnsafeFree(nativePointerFromAddress(table))
+    return
+}
+
+// Takes `record` out of the registry (the lock held).
+private @runtimeImplementation trusted fun emutlsUnlink(record: int): void {
+    val registry = emutlsRegistry()
+    val next = ablaRuntimeLoadI64(record)
+    val previous = ablaRuntimeLoadI64(record + 8)
+    if (previous == 0) ablaRuntimeStoreI64(registry + 8, next) else ablaRuntimeStoreI64(previous, next)
+    if (next != 0) ablaRuntimeStoreI64(next + 8, previous)
+    ablaRuntimeStoreI64(registry + 16, ablaRuntimeLoadI64(registry + 16) - 1)
+    return
+}
+
+// Moves the records of threads that have ended off the registry onto a chain (the lock held): those of the thread id
+// `id` when it is not 0 (a live thread has an id of its own), and, when `full`, those whose thread tgkill says is gone
+// (ESRCH, -3). `keep` stays. Returns the chain's head (linked by +0).
+private @runtimeImplementation trusted fun emutlsCollectEnded(keep: int, id: int, full: bool): int {
+    val registry = emutlsRegistry()
+    val process = if (full) ablaLinuxSyscall(39, 0, 0, 0, 0, 0, 0) else 0
+    var chain = 0
+    var record = ablaRuntimeLoadI64(registry + 8)
+    while (record != 0) {
+        val next = ablaRuntimeLoadI64(record)
+        if (record != keep) {
+            val owner = ablaRuntimeLoadI64(record + 16)
+            if ((id != 0 && owner == id) || (full && ablaLinuxSyscall(234, process, owner, 0, 0, 0, 0) == -3)) {
+                emutlsUnlink(record)
+                ablaRuntimeStoreI64(record, chain)
+                chain = record
+            }
+        }
+        record = next
+    }
+    chain
+}
+
+// Frees what the chain of ended threads' records holds, and the records (the lock not held).
+private @runtimeImplementation trusted fun emutlsFreeEnded(chain: int): int {
+    var freed = 0
+    var record = chain
+    while (record != 0) {
+        val next = ablaRuntimeLoadI64(record)
+        val table = ablaRuntimeLoadI64(record + 24)
+        if (table != 0) emutlsFreeTable(table)
+        ablaUnsafeFree(nativePointerFromAddress(record))
+        freed = freed + 1
+        record = next
+    }
+    freed
+}
+
+// The calling thread's first table: it is entered in the registry, and the registry is swept when it has grown enough.
+private @runtimeImplementation trusted fun emutlsRegister(table: int): void {
+    val record = emutlsAllocate(32)
+    val id = ablaLinuxSyscall(186, 0, 0, 0, 0, 0, 0)
+    ablaRuntimeStoreI64(record + 16, id)
+    ablaRuntimeStoreI64(record + 24, table)
+    ablaRuntimeStoreI64(emutlsRecordCell(), record)
+    val registry = emutlsRegistry()
+    emutlsLock()
+    // A record with this thread's id is from a thread that has ended: it is known without asking the system.
+    var chain = emutlsCollectEnded(0, id, false)
+    val head = ablaRuntimeLoadI64(registry + 8)
+    ablaRuntimeStoreI64(record, head)
+    ablaRuntimeStoreI64(record + 8, 0)
+    if (head != 0) ablaRuntimeStoreI64(head + 8, record)
+    ablaRuntimeStoreI64(registry + 8, record)
+    val count = ablaRuntimeLoadI64(registry + 16) + 1
+    ablaRuntimeStoreI64(registry + 16, count)
+    if (count >= ablaRuntimeLoadI64(registry + 24)) {
+        val swept = emutlsCollectEnded(record, 0, true)
+        var last = swept
+        while (last != 0 && ablaRuntimeLoadI64(last) != 0) last = ablaRuntimeLoadI64(last)
+        if (last != 0) {
+            ablaRuntimeStoreI64(last, chain)
+            chain = swept
+        }
+        val left = ablaRuntimeLoadI64(registry + 16)
+        ablaRuntimeStoreI64(registry + 24, if (left * 2 < 8) 8 else left * 2)
+    }
+    emutlsUnlock()
+    emutlsFreeEnded(chain)
+    return
+}
+
+// Sweeps the registry now: the tables and variables of the threads that have ended and left them behind are freed. Returns
+// how many threads' were. (On macOS the pthread key frees them as the threads end: nothing is ever found.)
+@runtimeImplementation
+trusted fun emutlsReclaim(): int {
+    if (ablaHostIsMacOS()) return 0
+    val registry = emutlsRegistry()
+    emutlsLock()
+    val chain = emutlsCollectEnded(0, 0, true)
+    val left = ablaRuntimeLoadI64(registry + 16)
+    ablaRuntimeStoreI64(registry + 24, if (left * 2 < 8) 8 else left * 2)
+    emutlsUnlock()
+    emutlsFreeEnded(chain)
+}
+
 // The address of the calling thread's copy of the variable `control` describes.
 @runtimeImplementation
 trusted fun emutlsGetAddress(control: int): int {
@@ -113,15 +259,22 @@ trusted fun emutlsGetAddress(control: int): int {
     }
     val cell = emutlsTableCellAddress()
     var table = ablaRuntimeLoadI64(cell)
-    if (table == 0) {
+    val first = table == 0
+    if (first) {
         __ablaRuntimeSetThreadEndHook(nativeFunctionAddress(emutlsThreadEnd))
         // Any non-null value makes the system call the destructor as the thread ends.
         if (ablaHostIsMacOS() && pthread_setspecific(i32(emutlsKey()), 1) != 0) ablaRuntimeTrap()
     }
-    val capacity = if (table == 0) 0 else ablaRuntimeLoadI64(table)
+    val capacity = if (first) 0 else ablaRuntimeLoadI64(table)
     if (index > capacity) {
         table = emutlsGrow(table, capacity, index)
         ablaRuntimeStoreI64(cell, table)
+        if (first) {
+            if (!ablaHostIsMacOS()) emutlsRegister(table)
+        } else if (!ablaHostIsMacOS()) {
+            val record = ablaRuntimeLoadI64(emutlsRecordCell())
+            if (record != 0) ablaRuntimeStoreI64(record + 24, table)
+        }
     }
     val slot = table + 8 * index
     var address = ablaRuntimeLoadI64(slot)
@@ -139,14 +292,18 @@ trusted fun emutlsThreadEnd(): void {
     val table = ablaRuntimeLoadI64(cell)
     if (table == 0) return
     ablaRuntimeStoreI64(cell, 0)
-    val capacity = ablaRuntimeLoadI64(table)
-    var index = 1
-    while (index <= capacity) {
-        val address = ablaRuntimeLoadI64(table + 8 * index)
-        if (address != 0) ablaUnsafeFree(nativePointerFromAddress(ablaRuntimeLoadI64(address - 8)))
-        index = index + 1
+    // Out of the registry first: a sweep must not find this thread's table freed twice.
+    if (!ablaHostIsMacOS()) {
+        val record = ablaRuntimeLoadI64(emutlsRecordCell())
+        if (record != 0) {
+            ablaRuntimeStoreI64(emutlsRecordCell(), 0)
+            emutlsLock()
+            emutlsUnlink(record)
+            emutlsUnlock()
+            ablaUnsafeFree(nativePointerFromAddress(record))
+        }
     }
-    ablaUnsafeFree(nativePointerFromAddress(table))
+    emutlsFreeTable(table)
     return
 }
 

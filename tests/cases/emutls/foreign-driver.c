@@ -1,10 +1,12 @@
 // Waves of short-lived pthreads call one export of a library that uses abla/runtime/emutls (foreign-lib.ab), and the
 // library's live heap bytes are read before and after (tools/test-emutls.sh, #826):
-//   foreign-driver <library> <waves> <threads per wave> [report]
-// Every thread ends before the next wave starts and the main thread joins it, so the system has run each thread's key
-// destructor by then. The first wave warms the library up (the key, the counters); the bytes live after the others must be
-// the bytes live before them. Exits 0 only when every call answered 1 and no byte was left; with "report" the bytes left are
-// printed and do not decide (Linux: the runtime has no thread-end notice for a thread it did not start without libc, #806).
+//   foreign-driver <library> <waves> <threads per wave> <bytes allowed before a reclaim>
+// Every thread ends before the next wave starts and the main thread joins it. The first wave warms the library up (the
+// key, the counters); the bytes live after the others must be the bytes live before them, once abla_emutls_reclaim has
+// swept: on macOS a pthread key's destructor has freed each thread's table as the thread ended (allowed 0 before the sweep);
+// on Linux a later thread's registration finds the ended threads by tgkill and frees them, lazily, so a bounded few
+// are still there before the sweep. Exits 0 only when every call answered 1, no byte is left after the sweep and no
+// more than the allowed bytes before it.
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -44,22 +46,25 @@ static int wave(export_function touch, int threads, int64_t first) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 4 && argc != 5) return 2;
-    int report = argc == 5;
+    if (argc != 5) return 2;
+    long long allowed = atoll(argv[4]);
     void *library = dlopen(argv[1], RTLD_NOW);
     if (!library) { printf("dlopen: %s\n", dlerror()); return 3; }
     export_function setup = (export_function)dlsym(library, "abla_emutls_setup");
     export_function touch = (export_function)dlsym(library, "abla_emutls_touch");
     export_function live = (export_function)dlsym(library, "abla_emutls_live");
-    if (!setup || !touch || !live) { printf("dlsym: %s\n", dlerror()); return 3; }
+    export_function reclaim = (export_function)dlsym(library, "abla_emutls_reclaim");
+    if (!setup || !touch || !live || !reclaim) { printf("dlsym: %s\n", dlerror()); return 3; }
     int waves = atoi(argv[2]), threads = atoi(argv[3]);
     setup(0);
     int failed = wave(touch, threads, 1);
+    reclaim(0); // the warm-up wave's ended threads: the baseline is what is live with none waiting
     int64_t before = live(0);
     for (int round = 0; round < waves; round++) failed |= wave(touch, threads, 1 + round);
-    int64_t after = live(0);
-    int64_t left = after - before;
-    printf("emutls foreign threads: %d threads, %lld bytes left (%lld before, %lld after)%s\n", waves * threads, (long long)left,
-           (long long)before, (long long)after, failed ? ", a call failed" : "");
-    return failed || (!report && left != 0);
+    int64_t pending = live(0) - before;
+    int64_t found = reclaim(0);
+    int64_t left = live(0) - before;
+    printf("emutls foreign threads: %d threads, %lld bytes waiting before a reclaim (%lld threads found), %lld bytes left after (%lld live before)%s\n",
+           waves * threads, (long long)pending, (long long)found, (long long)left, (long long)before, failed ? ", a call failed" : "");
+    return failed || left != 0 || pending > allowed;
 }

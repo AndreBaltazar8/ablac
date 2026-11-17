@@ -39,13 +39,13 @@ for round in compiled cached; do
     printf '%s\n' "$result" | grep 'jit threads' || true
 done
 # Threads the runtime did not start: waves of 8 short-lived pthreads of a C driver call an export that uses the emulated
-# thread-locals. On macOS the library's live heap bytes after the waves must be those before them (0 left): a pthread
-# key's destructor frees what the runtime's thread-end hook cannot reach. Without it each thread leaves its table and copies
-# behind (2,248 bytes of this library's, 1,600 threads: 3.6 MB). On Linux the key is not there (it would be a new libc
-# import of the compiler, #806): the leak is printed, and the library must import no pthread key function.
+# thread-locals; the library's live heap bytes after the waves and a sweep (abla_emutls_reclaim) must be those before them
+# (0 left). On macOS a pthread key's destructor frees each thread's table as the thread ends (0 waiting before the sweep too);
+# on Linux (system calls only, #806) a registry finds the threads that have gone with tgkill and frees their tables lazily:
+# at most 64 KiB wait before the sweep (without it each thread leaves 2,248 bytes of this library's: 1,600 threads, 3.6 MB).
 case "$(uname -s) $(uname -m)" in
-    "Linux x86_64") foreign_flags=(-ldl -lpthread); foreign_check=report ;;
-    Darwin*) foreign_flags=(); foreign_check= ;;
+    "Linux x86_64") foreign_flags=(-ldl -lpthread); foreign_allowed=65536 ;;
+    Darwin*) foreign_flags=(); foreign_allowed=0 ;;
     *) foreign_flags=skip ;;
 esac
 if [[ ${foreign_flags[0]:-} == skip ]]; then
@@ -61,9 +61,8 @@ else
         clang tests/cases/emutls/foreign-driver.c -o "$out/foreign-driver" ${foreign_flags[@]+"${foreign_flags[@]}"} ||
             { echo "emutls: the foreign-thread driver did not build" >&2; exit 1; }
         status=0
-        result=$("$root/tools/run-limited.sh" "$out/foreign-driver" "$PWD/$out/$library" 200 8 ${foreign_check:+$foreign_check} 2>&1) || status=$?
+        result=$("$root/tools/run-limited.sh" "$out/foreign-driver" "$PWD/$out/$library" 200 8 "$foreign_allowed" 2>&1) || status=$?
         [[ $status -eq 0 ]] || { echo "emutls (foreign threads, $mode): exit $status: $result" >&2; exit 1; }
-        [[ -n $foreign_check || $result == *" 0 bytes left "* ]] || { echo "emutls (foreign threads, $mode): $result" >&2; exit 1; }
         printf '%s\n' "$result"
         if [[ $(uname -s) == Linux && $mode == release ]]; then
             imports=$(nm -D --undefined-only "$out/$library")
