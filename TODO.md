@@ -1173,9 +1173,10 @@ mmap form) apply there.
   cohort's (`tools/test-release-xtensa.sh`; proved locally on 2026-11-17 against the real v0.2.61 Linux archive and the
   published 23.1.3-1 companion in the release job's Ubuntu 22.04 image). A release gives relocatable objects only:
   linking, boot/vector assembly and the ESP-IDF libraries stay the SDK's (see the user docs).
-  `tests/cases/xtensa-routing/nix-objects.json`'s object hashes are out of date for the current compiler (the first
-  object builds to `88e2365f…`, not `6a8e779e…`, with the Nix cohort and with the installed one alike), so the manual
-  routing probe `tools/test-xtensa-routing-installed.mjs` fails its first assertion until they are regenerated.
+  `tests/cases/xtensa-routing/nix-objects.json` was regenerated on 2026-11-17: the 12 `tests/cases/f32/xtensa.ab` objects had
+  grown (esp32 release 20316 to 21068 bytes) by two ordinary changes: `6a2f9a9d` (integer text below 100 reads a digit
+  table; +728 bytes, in v0.2.55) and `ae0537de` (`ablaUnsafeCopyMemory` is `llvm.memmove`; +24 bytes, in v0.2.59). The 12
+  `intrinsics.ab` objects did not move.
   #787: macOS refused publication of a 0555 staged directory with EACCES.
   Keep the root 0700 through rename and finalize it by handle afterward; an
   interrupted publish requires an operator to remove the incomplete version
