@@ -502,6 +502,43 @@ async function builtins(mode) {
     await s.close();
 }
 
+// A field assigned inside its class (`count = count + 1`, `this.total = 2`) and through another object (`other.count = 3`) names the field, as a read of it does.
+async function fieldAssign(mode) {
+    const main = [
+        'class Counter(var count: int, var total: int) {',
+        '    fun bump(var other: Counter): int {',
+        '        count = count + 1',
+        '        this.total = 2',
+        '        other.count = 3',
+        '        return count + total',
+        '    }',
+        '}',
+        'fun main: int {',
+        '    val c = Counter(0, 0)',
+        '    c.count = 5',
+        '    val d = Counter(1, 1)',
+        '    return c.bump(d)',
+        '}',
+        '',
+    ].join('\n');
+    const p = fixture(`field-assign-${mode}`, { 'main.ab': main });
+    const s = await start(p, { mode });
+    const a = await s.analyze();
+    noErrors(a);
+    const d = doc(a, path.join(p, 'main.ab'));
+    const field = (name) => d.symbols.find((x) => x.name === name && /field/.test(x.id));
+    for (const name of ['count', 'total']) {
+        const id = field(name).id;
+        const uses = occurrence(d, name);
+        assert.ok(uses.length >= 3, `uses of ${name}`);
+        for (const o of uses) assert.equal(o.declarationId, id, `every use of the field ${name} names it (${d.text.slice(0, o.range.start).split('\n').length}: ${o.declarationId})`);
+    }
+    // find-references on the field: its parameter, the assignments and the reads
+    const refs = (await s.rpc('query/references', { uri: d.uri, offset: occurrence(d, 'count')[0].range.start })).result.value;
+    assert.equal(refs.length, occurrence(d, 'count').length);
+    await s.close();
+}
+
 async function projections() {
     let p = fixture('projections', { 'main.ab': '// café 😀\nimport "dep.ab"\nfun main: int = answer()\n', 'dep.ab': 'fun answer: int = 42\n' });
     let s = await start(p);
@@ -834,7 +871,7 @@ async function since() {
     await legacy.close();
 }
 
-const tests = { builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
+const tests = { field_assign: () => fieldAssign('graph-v1'), field_assign_v2: () => fieldAssign('graph-v2'), builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
 const filter = process.env.ANALYSIS_TEST_FILTER ? process.env.ANALYSIS_TEST_FILTER.split(',') : null;
 for (const [name, test] of Object.entries(tests)) {
     if (filter && !filter.includes(name)) continue;
