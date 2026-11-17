@@ -1,0 +1,149 @@
+// The strict-versus-flat campaign: a generated multi-module program whose modules reach each other's names through
+// imports they do not write themselves (a flat build lets a module see everything its imports pass on). After
+// `--visibility-report` and tools/fix-imports.ab it must build with --strict-imports and run exactly as the flat build did.
+// The graph mixes what strict imports treat differently: a function, a constant, a class and its method, and an extension
+// of a built-in type (seen only where its module is). Cross-module overloads are left out: two modules that expose one
+// name to a third are E_IMPORT_UNQUALIFIED_AMBIGUOUS in a flat build too.
+import "abla/io"
+import "abla/text"
+import "abla/fs"
+import "./prng.ab"
+import "./modes.ab"
+import "./verdict.ab"
+
+/** A module's number keeps every generated name unique. Its body reaches names of modules it need not import directly. */
+fun fuzzStrictModule(index: int, imports: array<int>, reach: array<int>, var r: Prng): string {
+    val lines: array<string> = []
+    for (target in imports) lines.append("import \"./m$target.ab\"")
+    lines.append("class C$index(val n: int)")
+    lines.append("fun C$index.twice(): int = this.n * 2")
+    lines.append("fun int.add$index(k: int): int = this + k * ${index + 2}")
+    lines.append("val k$index = ${r.range(2, 9)}")
+    var body = "x * ${index + 2}"
+    for (step in 0 until 2) {
+        if (reach.size > 0) {
+            val j = reach[r.below(reach.size)]
+            val form = r.below(4)
+            if (form == 0) body = "$body + f$j(x)"
+            else if (form == 1) body = "$body + k$j"
+            else if (form == 2) body = "$body + C$j(x).twice()"
+            else body = "$body + x.add$j(1)"
+        }
+    }
+    lines.append("fun f$index(x: int): int = $body")
+    textJoin(lines, "\n") + "\n"
+}
+
+/** Builds the graph under `absolute`; the program's expected output is whatever its flat build prints. */
+fun fuzzWriteStrictGraph(absolute: string, seed: int): void {
+    val r = prngSeeded(seed)
+    val count = r.range(3, 5)
+    val importsOf: array<array<int>> = []
+    val reachOf: array<array<int>> = []
+    for (index in 0 until count) {
+        val imports: array<int> = []
+        for (j in 0 until index) {
+            if (r.chance(0.4)) imports.append(j)
+        }
+        if (index > 0 && imports.size == 0) imports.append(index - 1)
+        // flat reach: the direct imports and, transitively, theirs
+        val reach: array<int> = []
+        for (j in imports) {
+            var present = false
+            for (seen in reach) {
+                if (seen == j) present = true
+            }
+            if (!present) reach.append(j)
+            for (deeper in reachOf[j]) {
+                var known = false
+                for (seen in reach) {
+                    if (seen == deeper) known = true
+                }
+                if (!known) reach.append(deeper)
+            }
+        }
+        importsOf.append(imports)
+        reachOf.append(reach)
+    }
+    for (index in 0 until count) {
+        Path("$absolute/m$index.ab").writeText(fuzzStrictModule(index, importsOf[index], reachOf[index], r))
+    }
+    // the program reaches the top of the graph through its own imports, and everything below through them
+    val mainImports: array<int> = [count - 1]
+    val mainReach: array<int> = [count - 1]
+    for (deeper in reachOf[count - 1]) mainReach.append(deeper)
+    for (j in 0 until count - 1) {
+        if (r.chance(0.3)) {
+            mainImports.append(j)
+            var known = false
+            for (seen in mainReach) {
+                if (seen == j) known = true
+            }
+            if (!known) mainReach.append(j)
+        }
+    }
+    val lines: array<string> = ["import \"abla/io\""]
+    for (target in mainImports) lines.append("import \"./m$target.ab\"")
+    lines.append("")
+    lines.append("fun main: int {")
+    for (j in mainReach) {
+        lines.append("    println(\"m$j \${f$j(${r.range(1, 20)})} \${k$j} \${C$j(${r.range(1, 20)}).twice()} \${(${r.range(1, 20)}).add$j(2)}\")")
+    }
+    lines.append("    0")
+    lines.append("}")
+    Path("$absolute/main.ab").writeText(textJoin(lines, "\n") + "\n")
+    return
+}
+
+/** One seed. "" when flat and strict agree after the fix, and strict refused the graph before it exactly when the report
+ * listed something to add. */
+fun fuzzRunStrictFlat(runner: FuzzRunner, seed: int, keep: bool): string {
+    val directory = "build/fuzz-abla/strict-flat-$seed"
+    val absolute = "${runner.root}/$directory"
+    if (Path(absolute).exists()) Path(absolute).removeTree()
+    Path(absolute).createDirectories()
+    fuzzWriteStrictGraph(absolute, seed)
+    val compiler = runner.compiler
+    val steps: array<string> = [
+        "'$compiler' build main.ab -o flat --no-cache --fast --visibility-report report.tsv",
+        "./flat",
+        "'$compiler' build main.ab -o before --no-cache --fast --strict-imports",
+        "'$compiler' run '${runner.root}/tools/fix-imports.ab' -- report.tsv",
+        "'$compiler' build main.ab -o strict --no-cache --fast --strict-imports",
+        "./strict"
+    ]
+    val names = ["flat build", "flat run", "strict build before the fix", "fix-imports", "strict build", "strict run"]
+    var beforeFixStatus = 0
+    for (index in 0 until steps.size) {
+        val job = FuzzJob([runner.step(["bash", "-c", "cd '$absolute' && ${steps[index]}"], [], [], "$absolute/step$index.out",
+            "$absolute/step$index.err", true)], 0, 0, [])
+        runner.runJobs([job])
+        if (index == 2) {
+            beforeFixStatus = job.statuses[0]
+        } else if (job.statuses[0] != 0) {
+            val errors = textJoin(fuzzFirstLines(fuzzReadText("$absolute/step$index.err"), 6), " | ")
+            return "strict-flat seed $seed: ${names[index]} failed (status ${job.statuses[0]}): $errors; retained $directory"
+        }
+        // the report is read before the fix changes the graph
+        if (index == 0) {
+            val report = fuzzReadText("$absolute/report.tsv").trim()
+            Path("$absolute/rows").writeText(if (report == "") "0" else "1")
+        }
+    }
+    val rows = fuzzReadText("$absolute/rows") == "1"
+    if (rows && beforeFixStatus == 0) {
+        return "strict-flat seed $seed: the report lists names to import, yet --strict-imports built the graph before the fix; " +
+            "retained $directory"
+    }
+    if (!rows && beforeFixStatus != 0) {
+        return "strict-flat seed $seed: the report is empty, yet --strict-imports refused the graph: " +
+            "${textJoin(fuzzFirstLines(fuzzReadText("$absolute/step2.err"), 4), " | ")}; retained $directory"
+    }
+    val flat = fuzzReadText("$absolute/step1.out")
+    val strict = fuzzReadText("$absolute/step5.out")
+    if (flat != strict) {
+        return "strict-flat seed $seed: flat printed ${fuzzQuote(flat)} but strict printed ${fuzzQuote(strict)}; retained $directory"
+    }
+    if (!keep) Path(absolute).removeTree()
+    ""
+}

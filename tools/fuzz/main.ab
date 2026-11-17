@@ -11,6 +11,9 @@
 //   tools/fuzz/run --seeds ... --module-graphs      provider graphs: no cache, then cached phases and provider edits
 //   tools/fuzz/run --seeds ... --subparser-graphs   subparser-built calls: no cache, cached phases, a provider edit
 //   tools/fuzz/run --seeds ... --cross-target-tiers one Wasm child built at compile time under interp, jit and auto
+//   tools/fuzz/run --seeds ... --integer-stores     an int stored into a narrower integer: refused or exact, in every site
+//   tools/fuzz/run --seeds ... --compile-time-tiers the same checks behind `#` in interp, jit and the default tier
+//   tools/fuzz/run --seeds ... --strict-flat        a module graph after fix-imports: flat and --strict-imports agree
 //   tools/fuzz/run --regex --seeds ... [--cases 2000]  abla/regex against the independent oracle (regex_oracle.ab)
 //   tools/fuzz/run --regex-corpus FILE | --control-regex   the oracle on the recorded Python results; its planted fault
 //   tools/fuzz/run --check-subparser-refusals       generated-call diagnostics at their sites, in interp and JIT
@@ -36,6 +39,8 @@ import "./verdict.ab"
 import "./oracle.ab"
 import "./graphs.ab"
 import "./gen_regex.ab"
+import "./stores.ab"
+import "./strictflat.ab"
 
 class FuzzOptions(
     var seeds: array<int>,
@@ -62,7 +67,10 @@ class FuzzOptions(
     var regex: bool,
     var controlRegex: bool,
     var regexCases: int,
-    var regexCorpus: string
+    var regexCorpus: string,
+    var integerStores: bool,
+    var compileTimeTiers: bool,
+    var strictFlat: bool
 )
 
 val FUZZ_WORK = "build/fuzz-abla"
@@ -95,7 +103,7 @@ fun fuzzSeedRange(text: string, var into: array<int>): void {
 }
 
 fun fuzzOptions(root: string): FuzzOptions {
-    val options = FuzzOptions([], 24, "$root/build/ablac", 120, "", false, "", false, false, false, false, false, "", false, false, false, false, false, false, false, false, false, false, 2000, "")
+    val options = FuzzOptions([], 24, "$root/build/ablac", 120, "", false, "", false, false, false, false, false, "", false, false, false, false, false, false, false, false, false, false, 2000, "", false, false, false)
     var seedText = "1"
     var index = 0
     val count = processArgumentCount()
@@ -149,6 +157,12 @@ fun fuzzOptions(root: string): FuzzOptions {
                 options.checkRefusals = true
             } else if (argument == "--cross-target-tiers") {
                 options.crossTargetTiers = true
+            } else if (argument == "--integer-stores") {
+                options.integerStores = true
+            } else if (argument == "--compile-time-tiers") {
+                options.compileTimeTiers = true
+            } else if (argument == "--strict-flat") {
+                options.strictFlat = true
             } else if (argument == "--regex") {
                 options.regex = true
             } else if (argument == "--control-regex") {
@@ -172,7 +186,8 @@ fun fuzzOptions(root: string): FuzzOptions {
     }
     var campaigns = 0
     for (on in [options.sharedGlobals, options.moduleGraphs, options.subparserGraphs, options.crossTargetTiers,
-        options.hostedTasks, options.checkRefusals, options.checkHostless]) {
+        options.hostedTasks, options.checkRefusals, options.checkHostless, options.integerStores, options.compileTimeTiers,
+        options.strictFlat]) {
         if (on) campaigns = campaigns + 1
     }
     if (campaigns > 1) fuzzUsageError = "choose one campaign at a time"
@@ -296,6 +311,38 @@ fun fuzzRunSeed(runner: FuzzRunner, options: FuzzOptions, prelude: string, seed:
         return if (options.panics) fuzzRunPanic(runner, seed, options.keep) else ""
     }
     fuzzMinimise(runner, options, prelude, seed, checks, results, bad)
+}
+
+/** The same checks, every one behind `#`, computed by the evaluator's interpreter, by its native code and by the default
+ * tier (ABLA_COMPILE_EVAL unset), beside a native build as the reference: "" when all four print the same lines. */
+fun fuzzRunTiers(runner: FuzzRunner, options: FuzzOptions, prelude: string, seed: int): string {
+    val gen = fuzzGen(seed, !options.noAny, options.focus)
+    val checks: array<FuzzCheck> = []
+    for (index in 0 until options.checks) checks.append(gen.check(index))
+    val directory = "$FUZZ_WORK/tiers$seed"
+    val absolute = "${runner.root}/$directory"
+    Path(absolute).createDirectories()
+    Path("$absolute/program.ab").writeText(fuzzAssemble(prelude, checks, false))
+    Path("$absolute/program-ct.ab").writeText(fuzzAssemble(prelude, checks, true))
+    val jobs: array<FuzzJob> = [
+        fuzzNativeJob(runner, "$absolute/program.ab", "$absolute/native", true, ""),
+        fuzzNativeJob(runner, "$absolute/program-ct.ab", "$absolute/interp", true, "interp"),
+        fuzzNativeJob(runner, "$absolute/program-ct.ab", "$absolute/jit", true, "jit"),
+        fuzzNativeJob(runner, "$absolute/program-ct.ab", "$absolute/default", true, "")
+    ]
+    runner.runJobs(jobs)
+    val results: array<FuzzResult> = [
+        fuzzNativeResult("native", jobs[0], "$absolute/native"),
+        fuzzNativeResult("interp", jobs[1], "$absolute/interp"),
+        fuzzNativeResult("jit", jobs[2], "$absolute/jit"),
+        fuzzNativeResult("default", jobs[3], "$absolute/default")
+    ]
+    val bad = fuzzVerdict(results)
+    if (bad == "") {
+        if (!options.keep) fuzzRemove(absolute)
+        return ""
+    }
+    "tiers seed $seed (sources in $directory): $bad; checks ${textJoin(fuzzDifferingLines(results), ",")}"
 }
 
 /** One existing program, four ways (no compile-time variant): "" when they agree. */
@@ -489,6 +536,26 @@ fun main: int {
             if (found != "") {
                 failed = failed + 1
                 println(found)
+            }
+        }
+        return if (failed == 0) 0 else 1
+    }
+    if (options.integerStores || options.compileTimeTiers || options.strictFlat) {
+        var failed = 0
+        for (seed in options.seeds) {
+            var found = ""
+            if (options.integerStores) found = fuzzRunStores(runner, seed, options.keep)
+            else if (options.compileTimeTiers) found = fuzzRunTiers(runner, options, fuzzPrelude(root), seed)
+            else found = fuzzRunStrictFlat(runner, seed, options.keep)
+            if (found != "") {
+                failed = failed + 1
+                println(found)
+            } else if (options.integerStores) {
+                println("integer stores seed $seed: every site of every class is refused or keeps the exact value, in all four modes")
+            } else if (options.compileTimeTiers) {
+                println("tiers seed $seed: ${options.checks} compile-time checks agree in interp, jit and the default tier")
+            } else {
+                println("strict-flat seed $seed: the graph builds and runs the same flat and with --strict-imports after fix-imports")
             }
         }
         return if (failed == 0) 0 else 1

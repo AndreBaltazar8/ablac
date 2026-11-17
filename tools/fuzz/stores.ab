@@ -1,0 +1,139 @@
+// The integer-store campaign: an `int` stored where a narrower integer is wanted (a local's initialiser or assignment, a
+// field, an array element, an `append`, an array literal, a function's result) must be refused at compile time unless it
+// is a literal that fits, and a store that is accepted must keep the exact value (docs/language.md, Integers). Never a value
+// that differs silently: 300 printed from an `i8`, or 44. One program per type, site and value class, each built native
+// `--fast`, native release and for hostless Wasm; every mode must agree, and each must either refuse the program or print
+// the stored value unchanged.
+import "abla/io"
+import "abla/text"
+import "abla/fs"
+import "./prng.ab"
+import "./modes.ab"
+import "./verdict.ab"
+
+val FUZZ_STORE_TYPES: array<string> = ["i8", "u8", "i16", "u16", "i32", "u32"]
+val FUZZ_STORE_SITES: array<string> = ["local-init", "local-assign", "field-assign", "element-assign", "element-append",
+    "array-literal", "result"]
+// literal that fits (must build and print exactly), an `int` variable that fits (refused or exact), a value out of
+// range as a literal and as an `int` variable (refused: nothing accepted can keep the value)
+val FUZZ_STORE_CLASSES: array<string> = ["literal-fits", "int-fits", "literal-over", "int-over"]
+
+fun fuzzStoreLow(type: string): int =
+    if (type == "i8") -128 else if (type == "i16") -32768 else if (type == "i32") -2147483648 else 0
+
+fun fuzzStoreHigh(type: string): int =
+    if (type == "i8") 127 else if (type == "u8") 255 else if (type == "i16") 32767 else if (type == "u16") 65535
+    else if (type == "i32") 2147483647 else 4294967295
+
+/** A value of `type` for the class: edges of the range and random points, or just past an edge, or far past it. */
+fun fuzzStoreValue(var r: Prng, type: string, over: bool): int {
+    val low = fuzzStoreLow(type)
+    val high = fuzzStoreHigh(type)
+    if (!over) {
+        val edge = r.below(4)
+        if (edge == 0) return low
+        if (edge == 1) return high
+        return r.range(low, high)
+    }
+    val kind = r.below(4)
+    if (kind == 0) return high + 1
+    if (kind == 1) return low - 1
+    if (kind == 2) return high + r.range(2, 70000)
+    low - r.range(2, 70000)
+}
+
+/** The program for one site: stores `expression` into `type` and prints `s=<stored value>`. */
+fun fuzzStoreProgram(type: string, site: string, expression: string): string {
+    var body = ""
+    if (site == "local-init") body = "    val x: $type = $expression\n    println(\"s=\${x}\")\n"
+    else if (site == "local-assign") body = "    var x: $type = 0\n    x = $expression\n    println(\"s=\${x}\")\n"
+    else if (site == "field-assign") body = "    val b = StoreBox(0)\n    b.f = $expression\n    println(\"s=\${b.f}\")\n"
+    else if (site == "element-assign") body = "    val a: array<$type> = [0, 0]\n    a[1] = $expression\n    println(\"s=\${a[1]}\")\n"
+    else if (site == "element-append") body = "    val a: array<$type> = []\n    a.append($expression)\n    println(\"s=\${a[0]}\")\n"
+    else if (site == "array-literal") body = "    val a: array<$type> = [$expression, 0]\n    println(\"s=\${a[0]}\")\n"
+    else body = "    println(\"s=\${stored()}\")\n"
+    "import \"abla/io\"\n\nclass StoreBox(var f: $type)\n\nfun id(value: int): int = value\n\n" +
+        "fun stored(): $type = ${if (site == "result") expression else "0"}\n\n" +
+        "@export(\"run\")\nfun run(): int {\n$body    0\n}\n\nfun main: int = run()\n"
+}
+
+/** What a mode's result means for the class: "" when it is allowed (refused, or the exact value), else the fault. */
+fun fuzzStoreFault(result: FuzzResult, value: int, mustBuild: bool, mayKeep: bool): string {
+    if (!result.built) {
+        if (mustBuild) return "${result.mode}: refused a store that fits: ${textJoin(result.errors, " | ")}"
+        return ""
+    }
+    val expected = "s=$value\n"
+    if (result.status != 0) return "${result.mode}: exit status ${result.status}"
+    if (result.output == expected) {
+        if (mayKeep) return ""
+        return "${result.mode}: accepted a value its type cannot hold and printed it (${fuzzQuote(result.output)})"
+    }
+    "${result.mode}: accepted the store and printed ${fuzzQuote(result.output)}, not ${fuzzQuote(expected)}"
+}
+
+/** One seed: one type, every site and class. "" when no mode accepts a different value and the modes agree. */
+fun fuzzRunStores(runner: FuzzRunner, seed: int, keep: bool): string {
+    val r = prngSeeded(seed)
+    val type = FUZZ_STORE_TYPES[seed % FUZZ_STORE_TYPES.size]
+    val directory = "build/fuzz-abla/stores-$seed"
+    Path("${runner.root}/$directory").createDirectories()
+    val faults: array<string> = []
+    for (cls in FUZZ_STORE_CLASSES) {
+        val over = cls.endsWith("over")
+        val viaInt = cls.startsWith("int")
+        val names: array<string> = []
+        val values: array<int> = []
+        for (site in FUZZ_STORE_SITES) {
+            val value = fuzzStoreValue(r, type, over)
+            val literal = "$value"
+            val expression = if (viaInt) "id($value)" else literal
+            val name = "$cls-$site"
+            val relative = "$directory/$name"
+            Path("${runner.root}/$relative").createDirectories()
+            Path("${runner.root}/$relative/program.ab").writeText(fuzzStoreProgram(type, site, expression))
+            names.append(name)
+            values.append(value)
+        }
+        val perSite: array<array<FuzzResult>> = []
+        for (index in 0 until names.size) {
+            val relative = "$directory/${names[index]}"
+            perSite.append(runner.modesOf(relative, "$relative/program.ab", "", true))
+        }
+        for (index in 0 until names.size) {
+            val results = perSite[index]
+            val mustBuild = cls == "literal-fits"
+            val mayKeep = !over
+            // one verdict per mode: refused, or built and printed; modes must agree on which, and on the output
+            var refused = 0
+            var built = 0
+            for (result in results) {
+                if (result.built) built = built + 1 else refused = refused + 1
+            }
+            if (refused > 0 && built > 0) {
+                faults.append("$type ${names[index]} (value ${values[index]}): ${refused} modes refuse the store, ${built} build it: " +
+                    textJoin(fuzzDifferingModes(results), ", "))
+            }
+            for (result in results) {
+                val fault = fuzzStoreFault(result, values[index], mustBuild, mayKeep)
+                if (fault != "") faults.append("$type ${names[index]} (value ${values[index]}): $fault")
+            }
+        }
+    }
+    if (faults.size > 0) {
+        val shown: array<string> = []
+        for (fault in faults) {
+            if (shown.size < 12) shown.append(fault)
+        }
+        return "integer stores seed $seed (${faults.size} faults, sources in $directory): " + textJoin(shown, "; ")
+    }
+    if (!keep) Path("${runner.root}/$directory").removeTree()
+    ""
+}
+
+/** Each mode's name with what it did, for a report. */
+fun fuzzDifferingModes(results: array<FuzzResult>): array<string> {
+    val parts: array<string> = []
+    for (result in results) parts.append("${result.mode}: ${if (result.built) "built" else "refused"}")
+    parts
+}
