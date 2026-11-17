@@ -12,7 +12,8 @@ rm -rf "$out"
 mkdir -p "$out"
 "$compiler" build tests/cases/integer-narrowing-stores/valid.ab -o "$out/valid" --fast --no-cache
 got=$("$out/valid")
-[[ $got == "255 -128 0 44 32767 255 200 255 A 255 -128 44 255 44 2 44" ]] || { echo "integer narrowing stores: valid.ab printed '$got'" >&2; exit 1; }
+[[ $got == "255 -128 0 44 32767 255 200 255 A 255 -128 44 255 44 2 44
+0 7 8 9 11 12 13" ]] ||{ echo "integer narrowing stores: valid.ab printed '$got'" >&2; exit 1; }
 reject() { # $1 = name, $2 = declarations, $3 = statements of main
     printf 'class Box(var value: u8)\n%s\nfun main: int {\n%s\n    0\n}\n' "$2" "$3" > "$out/$1.ab"
     if "$compiler" build "$out/$1.ab" -o "$out/$1" --fast --no-cache > "$out/$1.log" 2>&1; then
@@ -47,4 +48,11 @@ reject map-set-literal "" $'    val table: Map<string, u8> = Map()\n    table.se
 reject map-set-int-value "" $'    val table: Map<string, i16> = Map()\n    val i = 1\n    table.set("k", i)'
 reject cell-set-literal "" $'    val cell = Cell(u8(1))\n    cell.set(256)'
 reject cell-set-int-value "" $'    val cell = Cell(u8(1))\n    val i = 1\n    cell.set(i)'
-echo "integer narrowing stores: fitting literals and conversions accepted in every store, 24 other forms rejected"
+# A block's last expression is its result: an int value there, or a literal that doesn't fit, still narrows.
+reject block-tail-int-value $'fun f(x: int): u32 {\n    val n: int = x\n    n\n}' '    val a = f(1)'
+reject block-tail-literal $'fun f(x: int): u32 {\n    val n = x\n    4294967296\n}' '    val a = f(1)'
+reject if-block-int-value $'fun f(x: int): u8 {\n    val n = x\n    if (n > 0) {\n        val m = n\n        m\n    } else 1\n}' '    val a = f(1)'
+reject when-int-value $'fun f(x: int): u8 = when (x) {\n    1 -> 3\n    else -> x\n}' '    val a = f(1)'
+reject when-literal $'fun f(x: int): u8 = when (x) {\n    1 -> 256\n    else -> 0\n}' '    val a = f(1)'
+reject local-if-block $'fun f(x: int): int {\n    val a: u8 = if (x > 0) {\n        val y = x\n        y\n    } else 2\n    0\n}' '    val a = f(1)'
+echo "integer narrowing stores: fitting literals and conversions accepted in every store, 30 other forms rejected"

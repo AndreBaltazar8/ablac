@@ -427,8 +427,10 @@ fun main {
   also an initializer of a declared local, an assignment to a `var`, a field or
   an element, an element of an array literal, and a result (`return` or an
   expression body). Write `u8(value)` to keep the low bits. An integer literal
-  that fits, or an `if` of such literals, needs no conversion (`take(200)`,
-  `val a: u8 = 255`); one that does not fit (`val a: u8 = 256`) is the error.
+  that fits needs no conversion (`take(200)`, `val a: u8 = 255`), nor does an
+  `if` or `when` whose results all are such literals, or a block that ends in
+  one (a function body `{ log(x); 0 }` returning `u32`); one that does not fit
+  (`val a: u8 = 256`) is the error.
 
 ### Floating point
 
