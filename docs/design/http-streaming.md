@@ -119,3 +119,23 @@ window of request body and 256 KiB of response), no gzip on streamed responses. 
 Two changes from the sketch: a handler cannot hold the server (a resource), so the callbacks return plain-value steps and `server.streamStep(id, step)` serves a producer outside a callback; and pausing from
 `exchange.room` raced with the room that opens while a step is applied (an echo deadlocked about half the time at 8 MiB over TLS), hence `HTTP_STREAM_PAUSE_FOR_ROOM`, decided after the write was applied and
 lifted by the server itself. `HttpStreamStep.wantWritable` is how a producer hears of room. HTTP/1.1 on the server is the same API over the connection: the head is read as it arrives, the body is framed incrementally, and reading stops while the handler is paused (the bound there is the kernel's socket buffers).
+
+## Measured on the whole stack (tools/test-http2-stream-server.sh at its default sizes, 1 GiB)
+
+Peak resident memory (VmHWM), the client being our streaming client in its own process, the server one `HttpsEventServer` per transport that served every run below (HTTP/2 and HTTP/1.1, so its peak covers all of them):
+
+| run | client peak |
+|---|---|
+| 1 GiB download, h2c | 75.5 MB |
+| 1 GiB upload, h2c | 70.8 MB |
+| 256 MiB echoed both ways at once, h2c | 72.2 MB |
+| 64 MiB download / upload / echo, TLS (HTTP/2) | 77.3 / 69.7 / 75.9 MB |
+| a consumer that stops reading, HTTP/2 | 66.0 MB |
+| 1 GiB download, HTTP/1.1 | 38.7 MB |
+| 1 GiB upload, HTTP/1.1, Content-Length / chunked | 11.1 / 34.2 MB |
+| 256 MiB echoed both ways at once, HTTP/1.1 | 39.7 MB |
+| 64 MiB download / echo, TLS (HTTP/1.1) | 67.6 / 79.9 MB |
+| a consumer that stops reading, HTTP/1.1 | 49.2 MB |
+| a request body nobody takes (the stream stalls, then the idle timeout ends it), HTTP/2 / HTTP/1.1 | 2.3 / 1.5 MB |
+
+Server peaks over all of the above: **105.2 MB** (plain), **98.7 MB** (TLS); the test's limit is 128 MiB. None of them grows with the size of the transfer (the same programs at 16 MiB peak at the same level): what is held is a window of request body and 256 KiB of response per exchange (HTTP/2) or the socket buffers (HTTP/1.1), the rest is the runtime's heap and its garbage.
