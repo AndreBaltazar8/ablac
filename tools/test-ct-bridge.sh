@@ -64,15 +64,29 @@ compare_case() {
     # Every other case keeps the default: a heavy one ran past a short limit in one tier only under a loaded suite.
     local limit=${ABLA_COMPILE_EVAL_TIME_LIMIT:-}
     [[ $source != tests/cases/ct-time-limit/* ]] || limit=10
+    # A case long by nature (tests/cases/ct-bridge/long-loopback.txt) gets three times the wall limit in each tier.
+    local seconds=$ABLA_MAX_SECONDS
+    [[ $long_cases != *" $source "* ]] || seconds=$((ABLA_MAX_SECONDS * 3))
     fresh_work
-    (cd "$work" && env ${limit:+ABLA_COMPILE_EVAL_TIME_LIMIT=$limit} ABLA_COMPILE_EVAL=interp "$project_root/tools/run-limited.sh" \
-        "$compiler" --emit-llvm "$source" \
+    (cd "$work" && env ${limit:+ABLA_COMPILE_EVAL_TIME_LIMIT=$limit} ABLA_MAX_SECONDS=$seconds ABLA_MAX_CPU_SECONDS=$seconds \
+        ABLA_COMPILE_EVAL=interp "$project_root/tools/run-limited.sh" "$compiler" --emit-llvm "$source" \
         > "$base.interp.ll" 2> "$base.interp.err") || interp_status=$?
     fresh_work
-    (cd "$work" && env ${limit:+ABLA_COMPILE_EVAL_TIME_LIMIT=$limit} ABLA_COMPILE_EVAL=bridge "$project_root/tools/run-limited.sh" \
-        "$compiler" --emit-llvm "$source" \
+    (cd "$work" && env ${limit:+ABLA_COMPILE_EVAL_TIME_LIMIT=$limit} ABLA_MAX_SECONDS=$seconds ABLA_MAX_CPU_SECONDS=$seconds \
+        ABLA_COMPILE_EVAL=bridge "$project_root/tools/run-limited.sh" "$compiler" --emit-llvm "$source" \
         > "$base.bridge.ll" 2> "$base.bridge.err") || bridge_status=$?
     rm -rf "$work"
+    # run-limited's wall (124) or CPU (152) limit stopped a tier: that is no result to compare, whichever tier finished.
+    local tier stopped=""
+    for tier in interp bridge; do
+        local status_of=${tier}_status
+        if [[ ${!status_of} -eq 124 || ${!status_of} -eq 152 ]]; then stopped="$stopped $tier (status ${!status_of})"; fi
+    done
+    if [[ -n $stopped ]]; then
+        printf 'loopback timeout: %s: stopped by the %s s limit:%s; not compared (a case long by nature belongs in tests/cases/ct-bridge/long-loopback.txt)\n' \
+            "$source" "$seconds" "$stopped" >&2
+        return 1
+    fi
     if [[ $interp_status -ne $bridge_status ]] ||
         ! cmp -s "$base.interp.ll" "$base.bridge.ll" ||
         ! cmp -s "$base.interp.err" "$base.bridge.err"; then
@@ -93,7 +107,11 @@ done < <(grep -rlE 'import "abla/compiler|compilerGrant|compileCapabilities' \
 (( ${#cases[@]} >= 40 ))
 # The cases are independent: CT_BRIDGE_JOBS of them at a time (default: the
 # number of CPUs); xargs exits nonzero when any of them mismatches.
-export compiler project_root output_directory work_template
+long_cases=" $(sed 's/#.*//' tests/cases/ct-bridge/long-loopback.txt | awk 'NF { print $1 }' | tr '\n' ' ') "
+for long_case in $long_cases; do
+    [[ -f $long_case ]] || { echo "tests/cases/ct-bridge/long-loopback.txt names $long_case, which is gone" >&2; exit 1; }
+done
+export compiler project_root output_directory work_template long_cases
 export -f compare_case
 printf '%s\0' "${cases[@]}" |
     xargs -0 -n1 -P "${CT_BRIDGE_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}" \
