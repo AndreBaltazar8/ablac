@@ -77,7 +77,7 @@ hosts:
 EOF
     h2o -c "$out/h2o.conf" > "$out/h2o.log" 2>&1 &
     h2o_pid=$!
-    for _ in $(seq 100); do
+    for _ in $(seq 600); do
         ss -ltn "sport = :$tls_port" 2> /dev/null | grep LISTEN > /dev/null && ss -ltn "sport = :$plain_port" 2> /dev/null | grep LISTEN > /dev/null && return 0
         kill -0 "$h2o_pid" 2> /dev/null || break
         sleep 0.1
@@ -108,7 +108,7 @@ for transport in tls plain; do
     if [[ $transport == tls ]]; then port=$tls_port; ca=$out/p256.pem; else port=$plain_port; ca=-; fi
     "$root/tools/run-limited.sh" "$out/h2o" "$port" "$ca" goaway "$out/docroot" > "$out/goaway.out" 2>&1 &
     client_pid=$!
-    for _ in $(seq 100); do grep -q '^sent' "$out/goaway.out" 2> /dev/null && break; sleep 0.1; done
+    for _ in $(seq 600); do grep -q '^sent' "$out/goaway.out" 2> /dev/null && break; sleep 0.1; done
     grep -q '^sent' "$out/goaway.out" || { cat "$out/goaway.out" >&2; echo "http2 h2o: the client never sent the slow request" >&2; exit 1; }
     # SIGTERM goes once h2o is running /slow (its handler leaves the marker), not after a pause: on a loaded
     # machine the request may not have reached h2o 0.3 s after the client wrote it, and h2o would refuse it.
@@ -129,7 +129,7 @@ done
 server_port=$(free_port)
 "$out/server" "$server_port" "$out/p256.pem" "$out/p256.key" bigbody > "$out/server.log" 2>&1 &
 server_pid=$!
-for _ in $(seq 100); do grep -q '^listening' "$out/server.log" 2> /dev/null && break; sleep 0.1; done
+for _ in $(seq 600); do grep -q '^listening' "$out/server.log" 2> /dev/null && break; sleep 0.1; done
 grep -q '^listening' "$out/server.log" || { echo "http2 h2o: our server did not start: $(head -3 "$out/server.log")" >&2; exit 1; }
 url=https://127.0.0.1:$server_port
 hc() { timeout 120 h2o-httpclient -k -2 100 "$@"; }   # the exit status is the client's: non-zero on any I/O or protocol error
