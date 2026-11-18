@@ -28,6 +28,16 @@ for name in dns-async http-async; do
         { echo "dns async: $name exited with $status"; echo "$output"; exit 1; }
 done
 
+# The programs' servers are forked children that bind after the fork; a machine busy enough makes one late, and a
+# client that waits a fixed time gets "connect failed (errno 111)". Make it late on purpose: both must wait for it.
+for name in dns-async http-async; do
+    status=0
+    output=$(ABLA_TEST_SERVER_LATE=1 ABLA_TEST_DIRECTORY="$output_directory" \
+        ABLA_MAX_MEMORY_MB=256 ABLA_MAX_SECONDS=900 ABLA_MAX_CPU_SECONDS=30 \
+        "$project_root/tools/run-limited.sh" "$output_directory/$name") || status=$?
+    [[ $status -eq 42 ]] || { echo "dns async: $name with a late server exited with $status"; echo "$output"; exit 1; }
+done
+
 # Keep many port-zero sockets open together and check SO_REUSEADDR directly.
 "$compiler" build "$project_root/tests/cases/modules/udp-ephemeral.ab" \
     -o "$output_directory/udp-ephemeral"
