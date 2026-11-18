@@ -49,7 +49,11 @@ class BootstrapLiftState(
     val layouts: array<BootstrapLiftLambdaLayout>,
     var problems: int,
     // Types the captures of closures that came from native code.
-    val retyper: BootstrapLiftRetyper
+    val retyper: BootstrapLiftRetyper,
+    // The objects an object table built (bootstrapLiftEmitObjectTable): remembered with result -2 - entry, they
+    // are read back as element `tableIndexes[entry]` of the array `tableArrays[entry]` (bootstrapLiftFound).
+    val tableArrays: array<int> = [],
+    val tableIndexes: array<int> = []
 )
 
 fun bootstrapLiftState(
@@ -177,6 +181,19 @@ fun bootstrapLiftRemember(
     state.results.append(result)
 }
 
+/** What bootstrapLiftSeen finds, as a value here: an object an object table built is its array's element. */
+fun bootstrapLiftFound(
+    var lowerer: BootstrapLowerer,
+    state: BootstrapLiftState,
+    value: BootstrapEvalValue
+): int {
+    val seen = bootstrapLiftSeen(state, value)
+    if (seen > -2) return seen
+    val entry = -2 - seen
+    val index = lowerer.emit("const.i64", -1, -1, "${state.tableIndexes[entry]}")
+    lowerer.emit("array.get", state.tableArrays[entry], index, "")
+}
+
 /** The type a value of static `type` is built as: borrows read through,
  *  nominal scalars erased, a non-null value of a nullable type as its
  *  element type. */
@@ -216,7 +233,7 @@ fun bootstrapLiftEmit(
     val type = bootstrapLiftValueType(lowerer, value, staticType)
     val kind = value.kind
     val seen = if (bootstrapLiftIsScalar(kind)) -1
-        else bootstrapLiftSeen(state, value)
+        else bootstrapLiftFound(lowerer, state, value)
     if (seen >= 0) return seen
     if (kind == "integer") return bootstrapLiftEmitInteger(lowerer, value, type)
     if (kind == "boolean") {
@@ -327,6 +344,9 @@ fun bootstrapLiftEmitArray(
         scalars = bootstrapLiftIsScalar(value.elements[scalar].kind)
         scalar = scalar + 1
     }
+    if (!scalars && bootstrapLiftObjectTableFits(lowerer, state, value)) {
+        return bootstrapLiftEmitObjectTable(lowerer, state, value)
+    }
     var result = -1
     if (scalars) {
         val constants: array<int> = []
@@ -351,6 +371,129 @@ fun bootstrapLiftEmitArray(
             lowerer.emitMany("array.append", [result, stored], "")
             element = element + 1
         }
+    }
+    result
+}
+
+// From this many elements an array of objects is an object table (#1029): built one element at a time, 60,000
+// objects were one initializer with an 8.6 MB frame (a stack overflow when it ran) and minutes of register allocation.
+val BOOTSTRAP_LIFT_OBJECT_TABLE = 16
+
+/** The type an object table's column of field `name` of `owner` is, or "" when the field can't be one: an integer,
+ *  boolean, f64 or string field. */
+fun bootstrapLiftColumnType(var lowerer: BootstrapLowerer, owner: string, name: string): string {
+    val type = lowerer.lowerRuntimeType(
+        bootstrapBorrowElementType(bootstrapNormalizeType(lowerer.lowerFieldType(owner, name)))
+    )
+    if (bootstrapIsIntegerScalarType(type) || type == "bool" || type == "f64" || type == "string") type else ""
+}
+
+/** Whether `value`, an array, is built as an object table: at least BOOTSTRAP_LIFT_OBJECT_TABLE objects of one
+ *  class, with the same fields, each field a column (bootstrapLiftColumnType) holding scalars of one kind, and no
+ *  object seen before or twice (each is built once, and anything else that holds one reads it from the array). */
+fun bootstrapLiftObjectTableFits(
+    var lowerer: BootstrapLowerer,
+    state: BootstrapLiftState,
+    value: BootstrapEvalValue
+): bool {
+    val count = value.elements.size
+    if (count < BOOTSTRAP_LIFT_OBJECT_TABLE) return false
+    val first = value.elements[0]
+    if (first.kind != "object" || first.fieldNames.size == 0 ||
+        first.fieldNames.size != first.elements.size) return false
+    var field = 0
+    while (field < first.fieldNames.size) {
+        if (bootstrapLiftColumnType(lowerer, first.owner, first.fieldNames[field]) == "" ||
+            !bootstrapLiftIsScalar(first.elements[field].kind)) return false
+        field = field + 1
+    }
+    val distinct = BootstrapIdentityMap()
+    var element = 0
+    while (element < count) {
+        val object = value.elements[element]
+        if (object.kind != "object" || object.owner != first.owner ||
+            object.elements.size != first.elements.size || object.fieldNames.size != first.fieldNames.size) {
+            return false
+        }
+        if (distinct.get(object) != null || bootstrapLiftSeen(state, object) != -1) return false
+        distinct.set(object, element)
+        field = 0
+        while (field < first.fieldNames.size) {
+            if (object.fieldNames[field] != first.fieldNames[field] ||
+                object.elements[field].kind != first.elements[field].kind) return false
+            field = field + 1
+        }
+        element = element + 1
+    }
+    true
+}
+
+/** An array of objects bootstrapLiftObjectTableFits takes, built from a table: each field's values as one array
+ *  of constants (a static table, as an array of scalars is), then a loop that allocates each object and sets its
+ *  fields from them. The initializer's frame and size stay the same however many objects there are. */
+fun bootstrapLiftEmitObjectTable(
+    var lowerer: BootstrapLowerer,
+    var state: BootstrapLiftState,
+    value: BootstrapEvalValue
+): int {
+    val first = value.elements[0]
+    val owner = first.owner
+    val empty: array<int> = []
+    val result = lowerer.emitMany("array.create", empty, "")
+    bootstrapLiftRemember(state, value, result)
+    val columns: array<int> = []
+    val readers: array<string> = []
+    // A narrower integer's column holds i64s (only plain constants make a static table), cast as each is read.
+    val casts: array<string> = []
+    var field = 0
+    while (field < first.fieldNames.size) {
+        val type = bootstrapLiftColumnType(lowerer, owner, first.fieldNames[field])
+        val narrow = bootstrapIsIntegerScalarType(type) && type != "i64"
+        val constants: array<int> = []
+        for (object in value.elements) {
+            constants.append(
+                if (narrow) lowerer.emit("const.i64", -1, -1, "${object.elements[field].integer}")
+                else bootstrapLiftEmit(lowerer, state, object.elements[field], type)
+            )
+        }
+        columns.append(lowerer.emitMany("array.create", constants, ""))
+        readers.append(lowerer.lowerIndexGetOpcode(if (narrow) "array:i64" else "array:$type"))
+        casts.append(if (narrow) type else "")
+        field = field + 1
+    }
+    val counter = "lift_table_${lowerer.nextLabel}"
+    lowerer.emitControl("local.zero.i64", -1, -1, -1, counter)
+    val conditionLabel = lowerer.allocateLabel()
+    val bodyLabel = lowerer.allocateLabel()
+    val doneLabel = lowerer.allocateLabel()
+    lowerer.emitControl("jump", -1, conditionLabel, -1, "")
+    lowerer.emitControl("label", -1, conditionLabel, -1, "")
+    val current = lowerer.emit("local.load", -1, -1, counter)
+    val count = lowerer.emit("const.i64", -1, -1, "${value.elements.size}")
+    val more = lowerer.emit("<", current, count, "")
+    lowerer.emitControl("branch", more, bodyLabel, doneLabel, "")
+    lowerer.emitControl("label", -1, bodyLabel, -1, "")
+    val object = lowerer.emit("object.allocate", -1, -1, owner)
+    field = 0
+    while (field < first.fieldNames.size) {
+        val read = lowerer.emit(readers[field], columns[field], current, "")
+        val stored = if (casts[field] == "") read else lowerer.emit("scalar.cast", read, -1, casts[field])
+        lowerer.emitMany("field.set", [object, stored], first.fieldNames[field])
+        field = field + 1
+    }
+    lowerer.emitMany("array.append", [result, object], "")
+    val one = lowerer.emit("const.i64", -1, -1, "1")
+    val next = lowerer.emit("+", current, one, "")
+    lowerer.emitControl("local.set", next, -1, -1, counter)
+    lowerer.emitControl("jump", -1, conditionLabel, -1, "")
+    lowerer.emitControl("label", -1, doneLabel, -1, "")
+    // Each object, if anything else holds it, is read back from the array (bootstrapLiftFound).
+    var element = 0
+    while (element < value.elements.size) {
+        bootstrapLiftRemember(state, value.elements[element], -2 - state.tableArrays.size)
+        state.tableArrays.append(result)
+        state.tableIndexes.append(element)
+        element = element + 1
     }
     result
 }
@@ -430,7 +573,7 @@ fun bootstrapLiftEmitShared(
 ): int {
     // Handles to one Shared hold one control block: it is built once.
     val control = value.elements[0]
-    val known = bootstrapLiftSeen(state, control)
+    val known = bootstrapLiftFound(lowerer, state, control)
     if (known >= 0) return known
     val elementType = if (bootstrapIsSharedType(type))
         bootstrapSharedElementType(type)
@@ -735,7 +878,7 @@ fun bootstrapLiftEmitClosure(
         capture = capture + 1
     }
     // A cycle through a captured cell may have built this closure already.
-    val built = bootstrapLiftSeen(state, value)
+    val built = bootstrapLiftFound(lowerer, state, value)
     if (built >= 0) return built
     val result = bootstrapLowerLambdaFunction(
         lowerer, lambda, bootstrapLiftSymbolPrefix(), layout.parameters,
