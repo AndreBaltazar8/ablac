@@ -46,7 +46,10 @@ if [[ -r /proc/self/maps ]]; then
     "$compiler" build "$project_root/tests/cases/gc-lookup/mappings.ab" -o "$out/mappings" --fast --no-cache
     # Mappings: a few (lazy), about 2,200 (the listing outgrows 128 KiB, so its buffer is a mapping of its own;
     # still lazy), about 4,000 (over 256 KiB: the directory). The program's own answer is the same each way.
-    base=$("$out/mappings" 0 | head -1)
+    # (Captured whole and cut in the shell: `| head -1` closes the pipe early, and the program then dies of
+    # SIGPIPE, which pipefail turns into exit 141 whenever it is slow to write its second line.)
+    base=$("$out/mappings" 0)
+    base=${base%%$'\n'*}
     for pages in 64 4400; do
         answer=$("$out/mappings" "$pages")
         [[ $answer == "$base"$'\n'"lazy true directory false" ]] || fail "$pages pages: '$answer'"
