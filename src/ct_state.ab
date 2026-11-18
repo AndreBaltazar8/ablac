@@ -80,30 +80,89 @@ fun bootstrapCtStateMerge(var target: array<int>, source: array<int>): bool {
         }
     }
     if (!grows) return false
-    val merged: array<int> = []
+    // In place, from the back: count what the source adds, grow the target by that much, then fill it from its end
+    // (no second array built and copied back: #1022, most of the write analysis's time was its merges).
+    var added = 0
     var left = 0
     var right = 0
-    while (left < target.size || right < source.size) {
-        if (right >= source.size || (left < target.size && target[left] < source[right])) {
-            merged.append(target[left])
-            left = left + 1
-        } else if (left >= target.size || source[right] < target[left]) {
-            merged.append(source[right])
-            right = right + 1
-        } else {
-            merged.append(target[left])
-            left = left + 1
-            right = right + 1
-        }
+    while (right < source.size) {
+        while (left < target.size && target[left] < source[right]) left = left + 1
+        if (left >= target.size || target[left] != source[right]) added = added + 1
+        right = right + 1
     }
-    target.truncate(0)
-    for (value in merged) target.append(value)
+    var old = target.size - 1
+    var grow = 0
+    while (grow < added) {
+        target.append(0)
+        grow = grow + 1
+    }
+    var write = target.size - 1
+    right = source.size - 1
+    while (right >= 0) {
+        if (old >= 0 && target[old] > source[right]) {
+            target[write] = target[old]
+            old = old - 1
+        } else {
+            if (old >= 0 && target[old] == source[right]) old = old - 1
+            target[write] = source[right]
+            right = right - 1
+        }
+        write = write - 1
+    }
     true
 }
 
+/** Adds `value` to the sorted set `target` (bootstrapCtStateMerge of one value, without making an array of it). */
+fun bootstrapCtStateInsert(var target: array<int>, value: int): bool {
+    var low = 0
+    var high = target.size
+    while (low < high) {
+        val middle = (low + high) / 2
+        if (target[middle] < value) low = middle + 1 else high = middle
+    }
+    if (low < target.size && target[low] == value) return false
+    target.append(value)
+    var shift = target.size - 1
+    while (shift > low) {
+        target[shift] = target[shift - 1]
+        shift = shift - 1
+    }
+    target[low] = value
+    true
+}
+
+/** The union of two sorted sets, as a new one (neither is changed). */
+fun bootstrapCtStateUnion(first: array<int>, second: array<int>): array<int> {
+    // Made at its largest size and cut down: no growth while it is filled.
+    val result = filledArray(first.size + second.size, 0)
+    var size = 0
+    var left = 0
+    var right = 0
+    while (left < first.size || right < second.size) {
+        if (right >= second.size || (left < first.size && first[left] < second[right])) {
+            result[size] = first[left]
+            left = left + 1
+        } else if (left >= first.size || second[right] < first[left]) {
+            result[size] = second[right]
+            right = right + 1
+        } else {
+            result[size] = first[left]
+            left = left + 1
+            right = right + 1
+        }
+        size = size + 1
+    }
+    result.truncate(size)
+    result
+}
+
 fun bootstrapCtStateCopy(values: array<int>): array<int> {
-    val result: array<int> = []
-    for (value in values) result.append(value)
+    val result = filledArray(values.size, 0)
+    var index = 0
+    while (index < values.size) {
+        result[index] = values[index]
+        index = index + 1
+    }
     result
 }
 
@@ -253,16 +312,16 @@ class BootstrapCtState(
             this.changed = true
             this.dirty[item] = true
         }
-        bootstrapCtStateMerge(this.itemCallees[this.current], [item])
+        bootstrapCtStateInsert(this.itemCallees[this.current], item)
         // The caller reads the callee's returns.
-        bootstrapCtStateMerge(this.callers[item], [this.current])
+        bootstrapCtStateInsert(this.callers[item], this.current)
         return
     }
 
     // The current item reads the field `name`.
     fun noteFieldRead(name: string): void {
         val readers = this.fieldReaders.get(name) ?? []
-        bootstrapCtStateMerge(readers, [this.current])
+        bootstrapCtStateInsert(readers, this.current)
         this.fieldReaders.set(name, readers)
         return
     }
@@ -280,7 +339,7 @@ class BootstrapCtState(
 
     // The current item reads the elements.
     fun noteElementsRead(): void {
-        bootstrapCtStateMerge(this.elementReaders, [this.current])
+        bootstrapCtStateInsert(this.elementReaders, this.current)
         return
     }
 
@@ -568,9 +627,8 @@ class BootstrapCtState(
             val mark = this.scope.size
             val name = bootstrapForName(expression)
             this.scope.append(name)
-            val element = bootstrapCtStateCopy(source)
             this.noteElementsRead()
-            bootstrapCtStateMerge(element, this.elements)
+            val element = bootstrapCtStateUnion(source, this.elements)
             this.bind(name, if (this.scalarElements(children[0])) [] else element)
             this.evaluate(children[1])
             this.scope.truncate(mark)
@@ -637,9 +695,9 @@ class BootstrapCtState(
     }
 
     fun noteGlobal(declaration: int): void {
-        bootstrapCtStateMerge(this.itemGlobals[this.current], [declaration])
+        bootstrapCtStateInsert(this.itemGlobals[this.current], declaration)
         // The current item reads the declaration's taint.
-        bootstrapCtStateMerge(this.globalReaders[declaration], [this.current])
+        bootstrapCtStateInsert(this.globalReaders[declaration], this.current)
         this.reach(declaration)
         return
     }
@@ -694,7 +752,7 @@ class BootstrapCtState(
                 val declaration = this.declarations[item]
                 if (this.isValue(declaration.kind)) {
                     this.noteGlobal(item)
-                    if (this.component[item]) bootstrapCtStateMerge(result, [item])
+                    if (this.component[item]) bootstrapCtStateInsert(result, item)
                     bootstrapCtStateMerge(result, this.globalTaint[item])
                     if (declaration.expression.kind == "delegate.initializer") {
                         // Reading a delegated global calls its getValue.
@@ -796,19 +854,23 @@ class BootstrapCtState(
         var known = this.methodCandidates(name)
         val exact = this.exactTarget(expression, known)
         if (exact >= 0) known = [exact]
-        val spread = bootstrapCtStateCopy(receiver)
+        // The receiver and the elements, built once (#1022: copying the receiver, merging the elements into the copy and
+        // copying that again for the result was most of the write analysis). It is the result: the arguments are
+        // evaluated (a lambda argument's parameters merged from it) before anything is added to it.
         this.noteElementsRead()
-        bootstrapCtStateMerge(spread, this.elements)
+        val result = bootstrapCtStateUnion(receiver, this.elements)
         val mutator = bootstrapCtStateMutator(name)
         val taints = if (known.size == 0 || mutator)
-            this.evaluateArgumentsWith(expression, 1, spread)
+            this.evaluateArgumentsWith(expression, 1, result)
             else this.evaluateArguments(expression, 1)
-        val result = bootstrapCtStateCopy(spread)
-        if (mutator) {
-            this.write(receiver, expression)
-            this.storeElement(this.union(taints))
+        if (known.size == 0 || mutator) {
+            val arguments = this.union(taints)
+            if (mutator) {
+                this.write(receiver, expression)
+                this.storeElement(arguments)
+            }
+            bootstrapCtStateMerge(result, arguments)
         }
-        if (known.size == 0 || mutator) bootstrapCtStateMerge(result, this.union(taints))
         for (item in known) {
             this.reach(item)
             this.mergeVariable(item, "$item:this", receiver)
@@ -1092,7 +1154,7 @@ fun bootstrapCtStateAnalyze(
             val item = pending[pending.size - 1]
             pending.truncate(pending.size - 1)
             for (global in state.itemGlobals[item]) {
-                if (state.ordinary[global]) bootstrapCtStateMerge(globals, [global])
+                if (state.ordinary[global]) bootstrapCtStateInsert(globals, global)
             }
             for (callee in state.itemCallees[item]) {
                 if (!seen[callee]) {
