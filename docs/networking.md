@@ -668,6 +668,11 @@ and the drain time at SIGTERM. Handlers still run on the one loop thread, so
 a handler that blocks holds every connection, as it does in the blocking
 server.
 
+A server that could not bind (the port is taken, the address is invalid, no permission) is still returned, with a
+listener that has no descriptor: `server.listenError()` is 0 while it listens and otherwise the errno (98 for an address
+already in use), and `run()` returns 1 at once instead of waiting on nothing. The same holds for `httpsEventServer` and
+`webSocketEventServer`. Check it before serving when the port is not the kernel's choice (port 0).
+
 The event server frames requests strictly, because a proxy in front may frame
 them differently. HTTP/1.1 connections persist unless the request says
 `Connection: close`; HTTP/1.0 connections close unless it says
