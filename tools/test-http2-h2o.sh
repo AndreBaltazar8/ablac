@@ -70,6 +70,7 @@ hosts:
       /slow:
         mruby.handler: |
           Proc.new do |env|
+            File.open("$root/$out/slow-started", "w") { |marker| marker.write("started") }
             sleep 2
             [200, {"content-type" => "text/plain"}, ["slow\n"]]
           end
@@ -109,7 +110,11 @@ for transport in tls plain; do
     client_pid=$!
     for _ in $(seq 100); do grep -q '^sent' "$out/goaway.out" 2> /dev/null && break; sleep 0.1; done
     grep -q '^sent' "$out/goaway.out" || { cat "$out/goaway.out" >&2; echo "http2 h2o: the client never sent the slow request" >&2; exit 1; }
-    sleep 0.3
+    # SIGTERM goes once h2o is running /slow (its handler leaves the marker), not after a pause: on a loaded
+    # machine the request may not have reached h2o 0.3 s after the client wrote it, and h2o would refuse it.
+    for _ in $(seq 600); do [[ -e $out/slow-started ]] && break; sleep 0.1; done
+    [[ -e $out/slow-started ]] || { cat "$out/goaway.out" >&2; echo "http2 h2o: h2o never began the slow request" >&2; exit 1; }
+    rm -f "$out/slow-started"
     kill -TERM "$h2o_pid"
     wait "$client_pid" || { cat "$out/goaway.out" >&2; echo "http2 h2o (GOAWAY, $transport): the client failed" >&2; exit 1; }
     grep -q '^http2 h2o goaway ok' "$out/goaway.out" || { cat "$out/goaway.out" >&2; echo "http2 h2o (GOAWAY, $transport)" >&2; exit 1; }
