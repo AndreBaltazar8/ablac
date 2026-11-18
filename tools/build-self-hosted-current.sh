@@ -25,7 +25,8 @@ if [[ -n ${ABLA_LINUX_OPENSSL_LIB:-} ]] && ! "$compiler" --version >/dev/null 2>
     located_compiler=$(mktemp "$project_root/build/.bootstrap-located.XXXXXX")
     trap 'rm -f -- "$located_compiler"' EXIT
     cp -f "$compiler" "$located_compiler"
-    patchelf --add-rpath "$ABLA_LINUX_OPENSSL_LIB" "$located_compiler"
+    # (And this shell's libLLVM, after the one it was built with: a pin of another LLVM build moves that path.)
+    patchelf --add-rpath "$ABLA_LINUX_OPENSSL_LIB${ABLA_LINUX_LLVM_LIB:+:$ABLA_LINUX_LLVM_LIB}" "$located_compiler"
     chmod +x "$located_compiler"
     compiler=$located_compiler
 fi

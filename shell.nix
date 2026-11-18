@@ -69,6 +69,10 @@ pkgs.mkShell {
     ''}
     export ABLA_MACOS_CLANG="${llvm.clang-unwrapped}/bin/clang"
     export ABLA_LINUX_OPENSSL_LIB="${pkgs.openssl.out}/lib"
+    # The libLLVM of the LLVM above. A released compiler is linked to the one its own build had, a store path
+    # that this shell may not hold (a new pinned LLVM is another path): the bootstrap's located copy
+    # gets this one too (tools/build-self-hosted-current.sh).
+    export ABLA_LINUX_LLVM_LIB="${pkgs.lib.getLib llvmTools}/lib"
     # What links here finds this OpenSSL when it runs. LD_LIBRARY_PATH would do it
     # too, but it also reaches the host's own tools, whose glibc is another.
     export NIX_LDFLAGS="-rpath ${pkgs.openssl.out}/lib ''${NIX_LDFLAGS:-}"
