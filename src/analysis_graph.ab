@@ -632,6 +632,66 @@ fun bootstrapAnalysisCheckEnabled(): bool {
 }
 
 /** Each document's text digest and what the answer says besides the documents, by uri (and "" for the rest). */
+/** What a document's occurrences are, as a fingerprint (two 64-bit hashes of the spans, ids and types the set holds, with their number):
+ *  the answer's own text of them is not made for a document no answer carries. */
+fun bootstrapAnalysisGraphSetHash(set: BootstrapAnalysisOccurrenceSet): string {
+    var first = -3750763034362895579 ^ set.begins.size
+    var second = 7046029254386353131 ^ set.begins.size
+    for (item in 0 until set.begins.size) {
+        first = (first ^ set.begins[item]) * 1099511628211
+        first = (first ^ set.ends[item]) * 1099511628211
+        second = (second ^ set.ends[item]) * 1099511628211
+        second = (second ^ set.begins[item]) * 1099511628211
+        val id = set.ids[item]
+        if (id != "") {
+            first = (first ^ bootstrapHashNameBytes(7046029254386353131, id)) * 1099511628211
+            second = (second ^ bootstrapHashNameBytes(-3750763034362895579, id)) * 1099511628211
+        }
+        val type = set.types[item]
+        if (type != "") {
+            first = (first ^ bootstrapHashNameBytes(-3750763034362895579, type)) * 1099511628211
+            second = (second ^ bootstrapHashNameBytes(7046029254386353131, type)) * 1099511628211
+        }
+    }
+    "${first}.${second}.${set.begins.size}"
+}
+
+/** `answer` (a snapshot, or a `since` cut of one) with the occurrences of each document it carries made: the snapshot the service holds has
+ *  them null (see graphSnapshotRun), and an answer says them as the text they encode to. */
+fun BootstrapAnalysisService.graphMaterialize(answer: Json): Json {
+    if (!answer.has("documents")) return answer
+    val carried = answer.get("documents")
+    if (!carried.isArray()) return answer
+    val index = this.graphQueryIndex
+    val documents: array<Json> = []
+    var any = false
+    for (document in carried.values) {
+        if (document.get("occurrences").isNull() && index != null) {
+            val set = index.occurrences.get(bootstrapAnalysisGraphPath(document.getString("uri")))
+            if (set != null) {
+                val values: array<Json> = []
+                for (position in 0 until document.keys.size) {
+                    values.append(if (document.keys[position] == "occurrences")
+                        jsonRawUnchecked(bootstrapAnalysisOccurrenceSetText(document.getString("text"), set))
+                        else document.values[position])
+                }
+                documents.append(jsonObject(document.keys, values))
+                any = true
+                continue
+            }
+        }
+        documents.append(document)
+    }
+    if (!any) return answer
+    val keys: array<string> = []
+    val values: array<Json> = []
+    for (position in 0 until answer.keys.size) {
+        keys.append(answer.keys[position])
+        values.append(if (answer.keys[position] == "documents") jsonArray(documents) else answer.values[position])
+    }
+    jsonObject(keys, values)
+}
+
 fun bootstrapAnalysisCheckDigests(snapshot: Json): Map<string, string> {
     val digests: Map<string, string> = Map()
     val rest: array<string> = []
@@ -653,7 +713,7 @@ fun BootstrapAnalysisService.graphSnapshot(): Json {
     val fresh = this.graphIndexRevision != this.revision
     val result = this.graphSnapshotRun()
     if (!fresh || this.graphQueryIndex == null) return result
-    val incremental = bootstrapAnalysisCheckDigests(result)
+    val incremental = bootstrapAnalysisCheckDigests(this.graphMaterialize(result))
     // ABLA_ANALYSIS_CHECK=2 (the check's own test): the incremental answer's first document is taken to differ, and the run must say so.
     val selfTest = linuxEnvironment("ABLA_ANALYSIS_CHECK")
     if (selfTest.value == "2" && result.get("documents").values.size > 0) {
@@ -673,7 +733,7 @@ fun BootstrapAnalysisService.graphSnapshot(): Json {
     this.graphQueryIndex = null
     this.graphIndexRevision = -1
     val cold = this.graphSnapshotRun()
-    val reference = bootstrapAnalysisCheckDigests(cold)
+    val reference = bootstrapAnalysisCheckDigests(this.graphMaterialize(cold))
     this.graphParsed = keptParsed
     bootstrapAnalysisGraphModules = keptModules
     bootstrapAnalysisGraphActiveEntry = keptEntry
@@ -841,18 +901,19 @@ fun BootstrapAnalysisService.graphSnapshotRun(): Json {
                 document.parsed, analyzed.parsed.declarations, semantic, aliases, true,
                 occurrenceIndex)
             sets.set(bootstrapAnalysisGraphPath(document.document.uri), set)
-            val occurrenceText = bootstrapAnalysisOccurrenceSetText(document.document.text, set)
             val diagnostics = bootstrapAnalysisGraphDiagnostics(document, project, semanticDiagnostics)
             if (this.graphStableIds) {
                 fingerprints.set(document.document.uri,
-                    "${document.document.version}|${document.key}|${bootstrapAnalysisGraphHash(occurrenceText)}|${bootstrapAnalysisGraphHash(jsonStringify(diagnostics))}")
+                    "${document.document.version}|${document.key}|${bootstrapAnalysisGraphSetHash(set)}|${bootstrapAnalysisGraphHash(jsonStringify(diagnostics))}")
                 fingerprintUris.append(document.document.uri)
             }
+            // The occurrences are left out (null) here: the text of a document's set is made when an answer carries the document
+            // (graphMaterialize), not for the documents a `since` answer leaves out.
             values.append(jsonObject(["uri", "version", "text", "symbols", "occurrences",
                 "diagnostics"],
                 [jsonString(document.document.uri), jsonInteger(document.document.version),
                     jsonString(document.document.text), document.exported,
-                    jsonRawUnchecked(occurrenceText), diagnostics]))
+                    jsonNull(), diagnostics]))
         }
     } else {
         for (document in documents) {
