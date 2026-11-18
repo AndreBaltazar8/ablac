@@ -5396,6 +5396,32 @@ class BootstrapIrLocalNames(
 
 // Names whose bindings can affect a type query. Over-collecting names in
 // nested scopes is safe; omitting a local callable's name would not be.
+// From this many bytes of source a block's type selection is kept (BootstrapLowerer.blockTypeSelectionEntry).
+val BOOTSTRAP_IR_KEPT_BLOCK_SELECTION = 1024
+
+/** Which statements of `block` (a block of two or more) its tail's type depends on: from the last statement back, a
+ *  local the tail reads, or one a selected local's initializer reads. The block's type query binds those alone
+ *  (BootstrapLowerer.blockTypeSelectionEntry keeps it for a large block: walking the tail on every query was quadratic in how
+ *  deeply blocks nest, 84% of a build of 400 nested `if` blocks, #1022). */
+fun bootstrapBlockTypeSelection(block: BootstrapExpression): array<bool> {
+    val tail = block.children[block.children.size - 1]
+    val needed = bootstrapStringSet()
+    bootstrapTypeQueryReads(tail, needed)
+    val selected: array<bool> = []
+    for (statement in block.children) selected.append(false)
+    var pending = block.children.size - 1
+    while (pending > 0) {
+        pending = pending - 1
+        val statement = block.children[pending]
+        if (bootstrapStatementDeclaresLocal(statement) && statement.children.size > 1 &&
+            needed.contains(statement.text)) {
+            selected[pending] = true
+            bootstrapTypeQueryReads(statement.children[0], needed)
+        }
+    }
+    selected
+}
+
 fun bootstrapTypeQueryReads(expression: BootstrapExpression, var names: BootstrapStringSet): void {
     if (expression.kind == "identifier" || expression.kind == "call") names.add(expression.text)
     for (child in expression.children) bootstrapTypeQueryReads(child, names)
@@ -5498,8 +5524,31 @@ class BootstrapLowerer(
     val loopOwnerTemporaryStorages: array<string> = [],
     val containerIteratorStorages: array<string> = [],
     val containerIteratorFlags: array<string> = [],
-    val loopMapViews: array<BootstrapExpression> = []
+    val loopMapViews: array<BootstrapExpression> = [],
+    // Which statements of a block its type depends on (bootstrapBlockTypeSelection), per block, found by the block's
+    // span and then its identity: a function of the block's syntax alone, so made once however often (and in however
+    // many scopes) the block's type is asked for.
+    val blockSelectionSlots: Map<int, array<int>> = Map(),
+    val blockSelectionBlocks: array<BootstrapExpression> = [],
+    val blockSelections: array<array<bool>> = []
 ) {
+    /** The entry of `blockSelections` that holds which statements of `block` its tail's type depends on (the locals
+     *  the tail reads, and those their initializers read, transitively: bootstrapBlockTypeSelection), made once per
+     *  block. */
+    fun blockTypeSelectionEntry(block: BootstrapExpression): int {
+        val slot = block.begin * 31 + block.end
+        for (candidate in this.blockSelectionSlots.get(slot) ?? []) {
+            if (this.blockSelectionBlocks[candidate] == block) return candidate
+        }
+        val entry = this.blockSelectionBlocks.size
+        this.blockSelectionBlocks.append(block)
+        this.blockSelections.append(bootstrapBlockTypeSelection(block))
+        val entries = this.blockSelectionSlots.get(slot) ?? []
+        entries.append(entry)
+        this.blockSelectionSlots.set(slot, entries)
+        entry
+    }
+
     /** The newest visible local named `name` (with a type, when `typed`), or -1. */
     /** Every visible local named `name`, first declared first. */
     fun visibleLocalsNamed(name: string): array<int> {
@@ -6935,24 +6984,15 @@ class BootstrapLowerer(
             val previousStorage = this.localStorage.size
             val previousScopes = this.localScopes.size
             val previousBorrowSources = this.localBorrowSources.size
-            val needed = bootstrapStringSet()
-            bootstrapTypeQueryReads(tail, needed)
-            val selected: array<bool> = []
-            for (statement in expression.children) selected.append(false)
-            var pending = expression.children.size - 1
-            while (pending > 0) {
-                pending = pending - 1
-                val statement = expression.children[pending]
-                if (bootstrapStatementDeclaresLocal(statement) && statement.children.size > 1 &&
-                    needed.contains(statement.text)) {
-                    selected[pending] = true
-                    bootstrapTypeQueryReads(statement.children[0], needed)
-                }
-            }
+            // A large block's selection is kept (its tail is long to walk, and a block nested in it is asked for
+            // again from each enclosing one); a small one's is made again, which costs less than keeping it.
+            val entry = if (expression.end - expression.begin >= BOOTSTRAP_IR_KEPT_BLOCK_SELECTION)
+                this.blockTypeSelectionEntry(expression) else -1
+            val direct = if (entry < 0) bootstrapBlockTypeSelection(expression) else []
             var statementIndex = 0
             while (statementIndex + 1 < expression.children.size) {
                 val statement = expression.children[statementIndex]
-                if (selected[statementIndex]) {
+                if (if (entry >= 0) this.blockSelections[entry][statementIndex] else direct[statementIndex]) {
                     val initializer = statement.children[0]
                     val delegated = initializer.kind == "delegate.initializer" &&
                         initializer.children.size > 1
