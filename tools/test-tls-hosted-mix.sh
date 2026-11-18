@@ -18,4 +18,4 @@ for program in "$project_root"/tests/cases/tls-mix/*.ab; do
         exit 1
     fi
 done
-echo "tls hosted mix: abla/tls/hosted builds with abla/http/async, abla/websocket/server/tls, abla/http/tls and abla/websocket/tls"
+echo "tls hosted mix: abla/tls/hosted builds with abla/http/async, abla/websocket/server/tls, abla/http/tls, abla/websocket/tls and abla/xtensa/companion/httpstream"
