@@ -1217,7 +1217,8 @@ trusted fun __ablaRuntimeExportInitEnd(): int {
 //   The stop's word: even when no collection is under way, odd (its token) from the moment a thread wins it.
 // A thread in a region, or one that never reaches a safe point (blocked in the system, a loop that does not allocate),
 // cannot park: the stop is abandoned after __ablaRuntimeHostStwWaitMilliseconds (counted, and ABLA_GC_TRACE=1 says
-// which thread) and the collection does not run; no stop starts for ten times that long afterwards.
+// which thread) and the collection does not run; no stop starts for ten times that long afterwards. (A poll that found this
+// thread off the CPU for 2 ms or more moves the deadline by that time, up to ten times the wait.)
 // The block (static storage): 0 the word  8 the registry's lock  16 its head  24 threads numbered  32 collections
 // that stopped threads  40 stops abandoned  48 the collector's record  56 the threshold before the stop  64 frames
 // of exited threads (the permanent global-roots frames)  72 clock scratch (16)  96 number scratch (32)
@@ -1424,7 +1425,13 @@ trusted fun __ablaRuntimeHostStwStop(): int {
     ablaRuntimeStoreI64(stw + 56, __ablaRuntimeHostCollectionThreshold)
     // Every other thread's next safe point calls the collector.
     __ablaRuntimeHostCollectionThreshold = 0
-    val deadline = __ablaRuntimeHostStwMilliseconds() + __ablaRuntimeHostStwWaitMilliseconds()
+    // The wait is the collector's own wall time, so on a loaded machine a thread that is not scheduled looks like one that
+    // never parks. Each time this thread itself was off the CPU between two polls (a 20 us sleep that took 2 ms or more) the
+    // deadline moves by that time, since the thread that has to park was probably off it too; the total is capped at ten
+    // times the wait. A thread that never parks is still abandoned (a little later on a loaded machine).
+    val started = __ablaRuntimeHostStwMilliseconds()
+    var deadline = started + __ablaRuntimeHostStwWaitMilliseconds()
+    var lastPoll = started
     var stopped = 0
     while (stopped == 0) {
         __ablaRuntimeFutexLock(stw + 8)
@@ -1458,7 +1465,14 @@ trusted fun __ablaRuntimeHostStwStop(): int {
         } else {
             val number = ablaRuntimeLoadI64(blocker + 16)
             __ablaRuntimeFutexUnlock(stw + 8)
-            if (reason == 2 || __ablaRuntimeHostStwMilliseconds() >= deadline) {
+            val now = __ablaRuntimeHostStwMilliseconds()
+            if (now - lastPoll >= 2) {
+                deadline = deadline + now - lastPoll
+                val limit = started + 10 * __ablaRuntimeHostStwWaitMilliseconds()
+                if (deadline > limit) deadline = limit
+            }
+            lastPoll = now
+            if (reason == 2 || now >= deadline) {
                 __ablaRuntimeFutexLock(stw + 8)
                 __ablaRuntimeHostStwUnclaim(token)
                 __ablaRuntimeFutexUnlock(stw + 8)

@@ -228,7 +228,7 @@ allocates (an instruction in it may allocate) has one on its back edge. A loop t
 spin wait: a loop of a user function that reads memory with an atomic or volatile access (`ablaRuntimeAtomic*`,
 `ablaUnsafeAtomic*`, `ablaUnsafeVolatileLoad*`) gets the back-edge safe point too, because it waits for another thread, which
 may be the one that is collecting. Any other loop that allocates nothing is not a collection point: a counted compute loop
-holds up a collection until it ends (the stop waits 20 ms and gives up, as for a blocked thread), which delays the
+holds up a collection until it ends (the stop waits 20 ms, more on a loaded machine, and gives up, as for a blocked thread), which delays the
 collection and nothing else. A loop that reads shared data without an atomic access is a data race and is not made a
 collection point. The runtime's own waits (the futex locks, the stop itself) never poll: they run inside the
 collector. Polling every back edge was measured and dropped (+9 to +20% on sieve, trees and matrix), so the rule is by
@@ -246,7 +246,7 @@ function is a thunk that enters the runtime and leaves it after the body:
 - each thread inside registers with the collector, and a collection stops the others first (stop-the-world, #811):
   the collecting thread sets the byte threshold to 0, so every other thread's next safe point calls the collector
   and parks there; their root chains are then marked with the collector's own. A thread that cannot park (blocked
-  in the system, in a loop that never allocates, or in a region) makes the collector give up after 20 ms: that
+  in the system, in a loop that never allocates, or in a region) makes the collector give up after 20 ms (longer while the collecting thread itself is kept off the CPU by a loaded machine, up to 200 ms): that
   collection does not run (`memoryHeapStat(8)` counts these, `ABLA_GC_TRACE=1` names the thread), and none is
   tried for 200 ms. The same holds for the threads of a program: collection no longer waits for `thread` workers to
   end. A thread in `join`, or in a system call of the standard library's wrappers or a blocking C call (SSL, read/write,
