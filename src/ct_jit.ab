@@ -1172,7 +1172,13 @@ fun bootstrapCtStateHas(values: array<int>, wanted: int): bool {
 fun bootstrapCtOrdinaryTypeIn(declarations: array<BootstrapDeclaration>, declaration: BootstrapDeclaration): string {
     val simple = bootstrapCtOrdinaryType(declaration)
     if (simple != "") return simple
-    val initializer = declaration.expression
+    var initializer = declaration.expression
+    // A call that leaves defaults out is a block by now: a local for each default, then the call
+    // (named_arguments.ab). abla-forge's `val nativeWindow = NativeWindow(...)` (two defaulted
+    // fields) wasn't typed, so a site that wrote it ran in the interpreter (#1022).
+    if (initializer.kind == "block" && initializer.children.size > 0) {
+        initializer = initializer.children[initializer.children.size - 1]
+    }
     if (initializer.kind != "call" || initializer.text == "") return ""
     var classes = 0
     var named = 0
@@ -1194,14 +1200,48 @@ fun bootstrapCtOrdinaryTypeIn(declarations: array<BootstrapDeclaration>, declara
 fun bootstrapCtOrdinaryType(declaration: BootstrapDeclaration): string {
     val declared = bootstrapNormalizeType(declaration.resultType)
     if (declared != "" && declared != "inferred") return declared
-    val initializer = declaration.expression
-    if (initializer.kind == "true" || initializer.kind == "false") return "bool"
-    if (initializer.kind == "string") return "string"
-    if (initializer.kind == "integer" && initializer.text.size > 0) {
-        for (byte in initializer.text) {
+    bootstrapCtLiteralType(declaration.expression)
+}
+
+// The type of a literal initializer: a bool, a string or template, a number (bootstrapCtLiteralNumberType), or an
+// array literal whose elements all have one such type (abla-forge's `val __LENGTH_EXTRA = [0, 0, 1, ...]`) or that
+// names its element type; "" otherwise (an empty `[]` names none).
+fun bootstrapCtLiteralType(expression: BootstrapExpression): string {
+    val kind = expression.kind
+    if (kind == "true" || kind == "false") return "bool"
+    if (kind == "string" || kind == "string.template") return "string"
+    if (kind == "array") {
+        if (expression.text != "") return bootstrapNormalizeType(expression.text)
+        if (expression.children.size == 0) return ""
+        val element = bootstrapCtLiteralType(expression.children[0])
+        if (element == "") return ""
+        for (child in expression.children) {
+            if (bootstrapCtLiteralType(child) != element) return ""
+        }
+        return bootstrapNormalizeType("array<$element>")
+    }
+    bootstrapCtLiteralNumberType(expression)
+}
+
+// "int" or "f64" for a decimal integer or float literal, or arithmetic over literals of one kind (abla-forge's
+// `var vkxTimerPeriod = 0.0`, `-2.0`, `0 - 1`); "" otherwise. A float literal with no declared type is an f64
+// (f32_literal.ab).
+fun bootstrapCtLiteralNumberType(expression: BootstrapExpression): string {
+    val kind = expression.kind
+    if (kind == "float") return "f64"
+    if (kind == "integer") {
+        if (expression.text.size == 0) return ""
+        for (byte in expression.text) {
             if (byte < 48 || byte > 57) return ""
         }
         return "int"
+    }
+    if ((kind == "unary-" || kind == "unary+") && expression.children.size == 1) {
+        return bootstrapCtLiteralNumberType(expression.children[0])
+    }
+    if ((kind == "+" || kind == "-" || kind == "*" || kind == "/" || kind == "%") && expression.children.size == 2) {
+        val left = bootstrapCtLiteralNumberType(expression.children[0])
+        return if (left != "" && left == bootstrapCtLiteralNumberType(expression.children[1])) left else ""
     }
     ""
 }

@@ -111,6 +111,7 @@ test-serial: ablac
 	tools/test-bootstrap-cases.sh $(COMPILER)
 	tools/test-ct-stop-threads.sh $(COMPILER)
 	tools/test-ct-resource-globals.sh $(COMPILER)
+	tools/test-ct-default-globals.sh $(COMPILER)
 	tools/test-ct-threads-heap.sh $(COMPILER)
 	tools/test-ct-interp-runtime.sh $(COMPILER)
 	tools/test-ct-time-limit.sh $(COMPILER)
