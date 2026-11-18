@@ -619,7 +619,89 @@ fun BootstrapAnalysisService.graphGenerationUris(revision: string): array<string
 
 fun BootstrapAnalysisService.graphModeName(): string = if (this.graphStableIds) "graph-v2" else "graph-v1"
 
+/** ABLA_ANALYSIS_CHECK=1 (a test mode: the check holds a second analysis, so the peak is about twice an analysis's): every analysis that
+ *  is not the cached one of its revision is run again with nothing kept (no cached parse, no cached compile-time sites, no module
+ *  state), and the two answers are compared document by document. A difference is reported on standard error and the answer
+ *  becomes an incomplete one that says so. The kept state stays the incremental run's, so the next edit is incremental too. */
+fun bootstrapAnalysisCheckEnabled(): bool {
+    val configured = linuxEnvironment("ABLA_ANALYSIS_CHECK")
+    configured.found && (configured.value == "1" || configured.value == "2")
+}
+
+/** Each document's text digest and what the answer says besides the documents, by uri (and "" for the rest). */
+fun bootstrapAnalysisCheckDigests(snapshot: Json): Map<string, string> {
+    val digests: Map<string, string> = Map()
+    val rest: array<string> = []
+    for (index in 0 until snapshot.keys.size) {
+        if (snapshot.keys[index] == "documents") continue
+        rest.append("${snapshot.keys[index]}=${jsonStringify(snapshot.values[index])}")
+    }
+    var restText = ""
+    for (line in rest) restText = "$restText$line\n"
+    digests.set("", bootstrapAnalysisGraphHash(restText))
+    for (document in snapshot.get("documents").values) {
+        digests.set(document.getString("uri"), bootstrapAnalysisGraphHash(jsonStringify(document)))
+    }
+    digests
+}
+
 fun BootstrapAnalysisService.graphSnapshot(): Json {
+    if (!bootstrapAnalysisCheckEnabled()) return this.graphSnapshotRun()
+    val fresh = this.graphIndexRevision != this.revision
+    val result = this.graphSnapshotRun()
+    if (!fresh || this.graphQueryIndex == null) return result
+    val incremental = bootstrapAnalysisCheckDigests(result)
+    // ABLA_ANALYSIS_CHECK=2 (the check's own test): the incremental answer's first document is taken to differ, and the run must say so.
+    val selfTest = linuxEnvironment("ABLA_ANALYSIS_CHECK")
+    if (selfTest.value == "2" && result.get("documents").values.size > 0) {
+        incremental.set(result.get("documents").values[0].getString("uri"), "self-test")
+    }
+    val keptParsed = this.graphParsed
+    val keptModules = bootstrapAnalysisGraphModules
+    val keptEntry = bootstrapAnalysisGraphActiveEntry
+    val keptSites = bootstrapFrontendSiteCache
+    val keptIndex = this.graphQueryIndex
+    val keptIndexRevision = this.graphIndexRevision
+    val keptGenerations: array<BootstrapAnalysisGraphGeneration> = []
+    for (generation in this.graphGenerations) keptGenerations.append(generation)
+    // Nothing of the incremental run is reached from the cold one.
+    bootstrapAnalysisGraphActiveEntry = ""
+    bootstrapFrontendSiteCache = Map()
+    this.graphQueryIndex = null
+    this.graphIndexRevision = -1
+    val cold = this.graphSnapshotRun()
+    val reference = bootstrapAnalysisCheckDigests(cold)
+    this.graphParsed = keptParsed
+    bootstrapAnalysisGraphModules = keptModules
+    bootstrapAnalysisGraphActiveEntry = keptEntry
+    bootstrapFrontendSiteCache = keptSites
+    this.graphQueryIndex = keptIndex
+    this.graphIndexRevision = keptIndexRevision
+    this.graphGenerations.truncate(0)
+    for (generation in keptGenerations) this.graphGenerations.append(generation)
+    val differing: array<string> = []
+    for (key in reference.keys()) {
+        val was = incremental.get(key)
+        if (was == null || was != reference.get(key)) differing.append(if (key == "") "(answer outside the documents)" else key)
+    }
+    for (key in incremental.keys()) {
+        if (!reference.has(key)) differing.append("$key (only in the incremental answer)")
+    }
+    if (differing.size == 0) {
+        linuxWriteStandardError("abla-analysis-check ok revision ${this.revision} documents ${reference.size - 1}\n")
+        return result
+    }
+    var shown = 0
+    for (name in differing) {
+        if (shown < 20) linuxWriteStandardError("abla-analysis-check DIFFERENT revision ${this.revision}: $name\n")
+        shown = shown + 1
+    }
+    linuxWriteStandardError("abla-analysis-check FAILED revision ${this.revision}: ${differing.size} differences\n")
+    return bootstrapAnalysisGraphIncomplete(this.revision,
+        "ABLA_ANALYSIS_CHECK: the incremental analysis differs from a cold one in ${differing.size} documents", this.graphModeName())
+}
+
+fun BootstrapAnalysisService.graphSnapshotRun(): Json {
     val entry = this.graphEntry()
     if (entry == "") return bootstrapAnalysisGraphIncomplete(this.revision,
         "select one project entry with entryPoints or analyze roots; no project entry was found",

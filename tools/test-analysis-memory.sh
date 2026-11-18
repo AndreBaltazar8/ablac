@@ -7,9 +7,19 @@
 # run analysed something).
 #
 # The editor keeps the source path in its identities (they are what the client sees), so the peak follows the length of the
-# checkout's path: the source is analysed from a copy at a path of fixed length, and the lowest of two runs counts (the
-# runs differ by a few MB; a checkout path 25 characters longer is ~80 MB). The bound, 2,040,000, sits between the fixed compiler's level
-# and the old one's.
+# checkout's path: the source is analysed from a copy at a path of fixed length, and the lowest of up to three runs counts (the
+# runs differ by a few MB; a checkout path 25 characters longer is ~80 MB). The bound, 2,150,000, sits between the fixed compiler's level
+# and the old one's (record line: 2,030,000 kB of the commit that named built-ins, locals, types and field assignments and exported documentation; see below).
+#
+# The record line moved from 1,940,000 to 2,030,000 kB (bound 2,040,000 to 2,150,000) with the editor stack that names built-ins, locals, type
+# names and assigned fields and exports documentation (d8347f69 against 1bd36ddd, the same source analysed by a stage-1 build of each, three
+# runs alternately: 1,937,432 / 1,901,980 / 1,937,476 kB before, 2,045,552 / 2,028,672 / 2,033,344 after). Named occurrences of the compiler's
+# own source went from 265,798 to 305,054 of 323,000 (+15%) and the answer's occurrence text from 47.8 to 51.9 MB; the heap reachable at the
+# end of the analysis (ABLA_COMPILER_MEMORY_TRACE) rose 17-32 MB (808.6, 816.1 MB before; 826.0, 848.8 MB after) and what the service keeps after
+# it, 440-443 against 448 MB. The peak moved by more than that because a collection that falls a little later in the analysis catches the
+# answer being built with more garbage in the heap: a run of the same commit moves by up to 36 MB. The bound keeps the margin above the record
+# that it had (about 6%) and stays 5% below the retention it guards against (2,270,000 kB, an identity string per occurrence): the retained
+# answer is also bounded by reachable bytes, below.
 #
 # The editor then edits: the same service analyses after an edit to a module many modules depend on, after the same text again,
 # and after a second edit (the loop of a client at a keystroke). Each analysis once kept the previous answer (a tree of ~2 GB)
@@ -37,7 +47,7 @@ compiler=${1:-build/ablac}
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 [[ $compiler == /* ]] || compiler="$PWD/$compiler"
 output_directory="$project_root/build/analysis-memory"
-bound_kilobytes=2040000
+bound_kilobytes=2150000
 edit_bound_kilobytes=2650000
 edit_retention_percent=135
 mkdir -p "$output_directory"
@@ -83,7 +93,7 @@ fs.writeFileSync(process.argv[2], lines.map((line) => JSON.stringify(line)).join
 ' "$root" "$output_directory/edit-input.jsonl"
 
 peak=""
-for run in 1 2; do
+for run in 1 2 3; do
     ABLA_SYSROOT="$root" ABLA_COMPILE_EVAL=jit ABLA_MAX_MEMORY_MB=4096 ABLA_MAX_SECONDS=1800 ABLA_MAX_CPU_SECONDS=600 \
         /usr/bin/env time -f '%M' -o "$output_directory/peak.$run" \
         "$project_root/tools/run-limited.sh" "$compiler" analyze --stdio < "$output_directory/input.jsonl" > "$output_directory/output.jsonl" 2> "$output_directory/error.txt" || {
@@ -93,6 +103,8 @@ for run in 1 2; do
     }
     measured=$(tail -n 1 "$output_directory/peak.$run")
     if [[ -z $peak || $measured -lt $peak ]]; then peak=$measured; fi
+    # A further run only when the lowest so far is over the bound (load can raise a run; the lowest counts).
+    (( peak <= bound_kilobytes )) && break
 done
 node -e '
 const lines = require("fs").readFileSync(process.argv[1], "utf8").trim().split("\n");
@@ -103,7 +115,7 @@ if (named < 100000) throw new Error(`only ${named} occurrences name a declaratio
 ' "$output_directory/output.jsonl"
 
 edit_peak=""
-for run in 1 2; do
+for run in 1 2 3; do
     ABLA_SYSROOT="$root" ABLA_COMPILE_EVAL=jit ABLA_MAX_MEMORY_MB=6144 ABLA_MAX_SECONDS=1800 ABLA_MAX_CPU_SECONDS=900 \
         /usr/bin/env time -f '%M' -o "$output_directory/edit-peak" \
         "$project_root/tools/run-limited.sh" "$compiler" analyze --stdio < "$output_directory/edit-input.jsonl" > "$output_directory/edit-output.jsonl" 2> "$output_directory/edit-error.txt" || {
