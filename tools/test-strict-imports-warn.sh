@@ -66,5 +66,7 @@ if "$compiler" build "$cases/strict-imports/pkg/bad.ab" -o "$output_directory/in
 grep -qF 'error[E_NAME_NOT_IMPORTED]' "$output_directory/warn.err" || fail "pkg/bad.ab lacks its error"
 "$compiler" build "$cases/strict-imports/flat/main.ab" -o "$output_directory/flat" --no-cache --flat-imports \
     > "$output_directory/warn.err" 2>&1 || fail "flat/main.ab did not build"
-grep -qF 'warning[' "$output_directory/warn.err" && fail "a flat build without the option warned"
+# (Its one warning is that flat is deprecated: tools/test-flat-imports-deprecated.sh.)
+grep -F 'warning[' "$output_directory/warn.err" | grep -vF 'warning[W_FLAT_IMPORTS_DEPRECATED]' >/dev/null &&
+    fail "a flat build without the option warned"
 echo "strict-imports-warn: names, members, overloads and export-import ambiguity as warnings; strict packages and plain flat builds unchanged"

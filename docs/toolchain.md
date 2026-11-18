@@ -356,7 +356,9 @@ by default; `build --flat-imports` builds those modules flat instead (not a pack
 not yet migrated, and `--strict-imports` says the default explicitly (the mode is part of
 the cache identity, a build's and `ablac run`'s). `ablac test` and `ablac run` take the same
 three modes. A repository whose scripts call the compiler many times sets `visibility = "flat"`
-in its abla.toml instead, which every one of those calls reads. An `E_NAME_NOT_IMPORTED` in a module strict only by default has a
+in its abla.toml instead, which every one of those calls reads. Both are deprecated: each prints one
+`warning[W_FLAT_IMPORTS_DEPRECATED]` per build (the flag's even from the cache), naming the flag or the
+manifest, and `ABLA_ALLOW_FLAT_IMPORTS=1` silences it ([packages](packages.md)). An `E_NAME_NOT_IMPORTED` in a module strict only by default has a
 second `help:` line naming the opt-out. `build --strict-imports=warn` leaves those modules flat and prints,
 as a warning, each diagnostic `--strict-imports` would give them, with the
 same place and `help:` line: a name of a module they don't import, an

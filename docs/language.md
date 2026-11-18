@@ -2826,8 +2826,10 @@ fun main: int = nextId()
   instead. With `--strict-imports=warn` it
   also builds flat, and each diagnostic strict imports would give it is a
   warning, with its `help:`. A module strict only by default says how to opt
-  out in a second `help:` line of its `E_NAME_NOT_IMPORTED`. Flat is going away
-  once downstream code has migrated (decision #66).
+  out in a second `help:` line of its `E_NAME_NOT_IMPORTED`. Flat is deprecated
+  and goes away once downstream code has migrated (decision #66): the flag or a
+  flat manifest prints one `warning[W_FLAT_IMPORTS_DEPRECATED]` per build and
+  place, which `ABLA_ALLOW_FLAT_IMPORTS=1` silences ([packages](packages.md)).
 - To migrate, `ablac build app.ab -o app --flat-imports --visibility-report report.tsv`
   builds as usual and writes every name each module would lose, with the
   import to add, and each extension, operator and overload call that relies

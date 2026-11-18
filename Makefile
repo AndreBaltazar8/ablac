@@ -498,6 +498,7 @@ test-serial: ablac
 	tools/test-strict-imports.sh $(COMPILER)
 	tools/test-strict-members.sh $(COMPILER)
 	tools/test-strict-imports-warn.sh $(COMPILER)
+	tools/test-flat-imports-deprecated.sh $(COMPILER)
 	tools/test-generics.sh $(COMPILER)
 	tools/test-generic-ownership-origin.sh $(COMPILER)
 	tools/test-octal-literals.sh $(COMPILER)

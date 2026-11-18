@@ -137,6 +137,22 @@ imports are added: the manifest reaches every one of those calls. The
 key belongs to the nearest manifest at or above a module, so a strict package
 can depend on a flat one and the other way round.
 
+Flat is deprecated and will be removed (decision #66). A build given
+`--flat-imports`, or with a module flat because its manifest says
+`visibility = "flat"` or `"program"`, prints one warning on standard error for
+each place flat came from (the flag, or that abla.toml's path), however many
+modules it covers:
+
+```text
+warning[W_FLAT_IMPORTS_DEPRECATED]: flat imports (visibility = "flat" in /src/app/abla.toml) are deprecated and will be removed
+help: add the imports with tools/fix-imports.ab, then drop the flat setting (docs/packages.md); ABLA_ALLOW_FLAT_IMPORTS=1 silences this
+```
+
+The build is otherwise unchanged. To migrate, build with
+`--visibility-report report.tsv`, run `ablac run tools/fix-imports.ab -- report.tsv`,
+and remove the key or the flag (see [strict imports](language.md#strict-imports)).
+CI that knowingly builds flat until then sets `ABLA_ALLOW_FLAT_IMPORTS=1`.
+
 ## Subpaths
 
 `github("owner/repository/path")` is the package `owner/repository`, at the module

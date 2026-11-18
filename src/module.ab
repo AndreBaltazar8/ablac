@@ -2567,20 +2567,56 @@ fun bootstrapAbsoluteModulePath(path: string): string =
     else bootstrapNormalizeModulePath("${currentDirectory().text}/$path")
 
 fun bootstrapModuleManifestVisibility(modulePath: string): string {
+    val manifest = bootstrapModuleManifestPath(modulePath)
+    if (manifest == "") "" else bootstrapTomlStringField(manifest, "visibility")
+}
+
+/** The nearest abla.toml at or above `modulePath`'s directory, or "" when there is none. */
+fun bootstrapModuleManifestPath(modulePath: string): string {
     // (From the root: a relative path's parents end at the working directory.)
     var directory = Path(bootstrapAbsoluteModulePath(modulePath)).parent()
     var depth = 0
     while (depth < 128) {
         val candidate = directory.child("abla.toml")
-        if (candidate.exists()) {
-            return bootstrapTomlStringField(candidate.text, "visibility")
-        }
+        if (candidate.exists()) return candidate.text
         val parent = directory.parent()
         if (parent.text == directory.text) return ""
         directory = parent
         depth = depth + 1
     }
     ""
+}
+
+// Flat imports are deprecated (decision #66, step 4: strict by default, flat deprecated, then removed). A build
+// given `--flat-imports` (orc_main's bootstrapStrictImportsOption), or with a module flat because its manifest says
+// `visibility = "flat"` (or `"program"`), gets one W_FLAT_IMPORTS_DEPRECATED warning per place flat came from, on
+// standard error: nothing else changes. ABLA_ALLOW_FLAT_IMPORTS=1 silences it, for CI that knowingly builds flat until
+// its migration. (`--strict-imports=warn`, the migration aid, builds flat without it.)
+val bootstrapFlatImportsWarned: Map<string, int> = Map()
+
+fun bootstrapFlatImportsDeprecationWarning(source: string): void {
+    if (bootstrapFlatImportsWarned.has(source)) return
+    bootstrapFlatImportsWarned.set(source, 1)
+    val allowed = linuxEnvironment("ABLA_ALLOW_FLAT_IMPORTS")
+    if (allowed.found && allowed.value != "" && allowed.value != "0") return
+    linuxWriteStandardError(
+        "warning[W_FLAT_IMPORTS_DEPRECATED]: flat imports ($source) are deprecated and will be removed\n" +
+            "help: add the imports with tools/fix-imports.ab, then drop the flat setting (docs/packages.md); " +
+            "ABLA_ALLOW_FLAT_IMPORTS=1 silences this\n"
+    )
+    return
+}
+
+/** Warns, once per manifest and build, when `modulePath` (a module bootstrapModuleStrict found flat) is flat because
+ *  its manifest says so. */
+fun bootstrapWarnDeprecatedFlat(modulePath: string): void {
+    if (modulePath.startsWith("<") || bootstrapStandardLibraryModuleSource(modulePath)) return
+    val manifest = bootstrapModuleManifestPath(modulePath)
+    if (manifest == "") return
+    val visibility = bootstrapTomlStringField(manifest, "visibility")
+    if (visibility == "flat" || visibility == "program") {
+        bootstrapFlatImportsDeprecationWarning("visibility = \"$visibility\" in $manifest")
+    }
 }
 
 // The standard library's `visibility`, from its own abla.toml (read once per
@@ -2693,6 +2729,7 @@ fun bootstrapValidateStrictImports(
     for (snapshot in snapshots) {
         val found = bootstrapModuleStrict(snapshot.path)
         val warn = !found && bootstrapModuleStrictWarned(snapshot.path)
+        if (!found && !warn) bootstrapWarnDeprecatedFlat(snapshot.path)
         strict.append(found)
         warned.append(warn)
         if (found && bootstrapModuleStrictByDefault(snapshot.path)) bootstrapStrictOptOutModules.set(snapshot.path, true)
