@@ -33,8 +33,9 @@ for mode in release fast; do
     echo "gc spin ($mode): $result, peak ${peak} kB"
 done
 # The same program on one CPU shared with fourteen busy loops: the worker is often off the CPU when a stop needs it, so a
-# stop that gave up after a fixed 20 ms abandoned it (every run did: 14 to 23 of about 40 stops). The stop's deadline moves by the time the
-# collector itself was off the CPU, so none is abandoned; a worker that can never park is still given up on
+# stop that gave up after a fixed 20 ms abandoned it (every run did: 14 to 23 of about 40 stops). A stop that reaches its deadline reads
+# the worker's state: runnable with no processor time since the last look means it has not been scheduled, so the wait goes on (up to a
+# second) and at most one stop is abandoned; a worker that can never park is still given up on
 # (tests/cases/gc-threads, blocked and stale-claim).
 if command -v taskset > /dev/null; then
     cpu=$(taskset -pc $$ | sed 's/.*: *//; s/[-,].*//')
@@ -49,5 +50,5 @@ if command -v taskset > /dev/null; then
         result=$(taskset -c "$cpu" "$out/spin-release" 2>&1) || status=$?
         [[ $status -eq 0 && $result == "gc spin ok:"* ]] || { echo "gc spin (one busy CPU, run $run): status $status: $result" >&2; exit 1; }
     done
-    echo "gc spin (one busy CPU): 3 runs, no stop abandoned"
+    echo "gc spin (one busy CPU): 3 runs, at most one stop abandoned"
 fi

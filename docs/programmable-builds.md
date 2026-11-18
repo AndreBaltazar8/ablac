@@ -246,7 +246,7 @@ function is a thunk that enters the runtime and leaves it after the body:
 - each thread inside registers with the collector, and a collection stops the others first (stop-the-world, #811):
   the collecting thread sets the byte threshold to 0, so every other thread's next safe point calls the collector
   and parks there; their root chains are then marked with the collector's own. A thread that cannot park (blocked
-  in the system, in a loop that never allocates, or in a region) makes the collector give up after 20 ms (longer while the collecting thread itself is kept off the CPU by a loaded machine, up to 200 ms): that
+  in the system, in a loop that never allocates, or in a region) makes the collector give up after 20 ms (longer on a loaded machine: while the collecting thread itself is kept off the CPU, up to 200 ms, and while the thread the stop waits for is runnable but has not run, which Linux says in /proc/self/task/<id>/stat, up to a second): that
   collection does not run (`memoryHeapStat(8)` counts these, `ABLA_GC_TRACE=1` names the thread), and none is
   tried for 200 ms. The same holds for the threads of a program: collection no longer waits for `thread` workers to
   end. A thread in `join`, or in a system call of the standard library's wrappers or a blocking C call (SSL, read/write,

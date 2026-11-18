@@ -1211,19 +1211,21 @@ trusted fun __ablaRuntimeExportInitEnd(): int {
 //   A thread's record (raw memory, from its registration to its last leave; a word of thread-local storage holds its
 //   address): 0 next record  8 the thread's root cell (the block above: head, region)  16 the thread's number
 //   24 parked  32 registration depth  40 1 while the thread's own pressure collection holds the stop
-//   48 1 when it parked for another thread's collection.
+//   48 1 when it parked for another thread's collection  56 the export levels  64 its kernel thread id (0 off Linux).
 //   `parked` holds the stop's token while the thread waits at a safe point, -1 while it is in native code that blocks
 //   (a join), where the collector may claim it (its token) and the thread, coming back, waits for the stop to end.
 //   The stop's word: even when no collection is under way, odd (its token) from the moment a thread wins it.
 // A thread in a region, or one that never reaches a safe point (blocked in the system, a loop that does not allocate),
 // cannot park: the stop is abandoned after __ablaRuntimeHostStwWaitMilliseconds (counted, and ABLA_GC_TRACE=1 says
 // which thread) and the collection does not run; no stop starts for ten times that long afterwards. (A poll that found this
-// thread off the CPU for 2 ms or more moves the deadline by that time, up to ten times the wait.)
+// thread off the CPU for 2 ms or more moves the deadline by that time, up to ten times the wait. At the deadline a thread the system
+// reports as R with almost no processor time since the last look has not been scheduled: the wait goes on, up to a second.)
 // The block (static storage): 0 the word  8 the registry's lock  16 its head  24 threads numbered  32 collections
 // that stopped threads  40 stops abandoned  48 the collector's record  56 the threshold before the stop  64 frames
 // of exited threads (the permanent global-roots frames)  72 clock scratch (16)  96 number scratch (32)
 // 128 no stop starts before this time (milliseconds), after one was abandoned  136 the debug hold  144 free records
-private trusted fun __ablaRuntimeHostStwAddress(): int = nativeStaticAllocate(160)
+// 160 the path of a thread's stat file (48)  208 what was read from it (256)
+private trusted fun __ablaRuntimeHostStwAddress(): int = nativeStaticAllocate(480)
 
 // The calling thread's record (0 before its first registration).
 private trusted fun __ablaRuntimeHostStwRecordCell(): int =
@@ -1256,7 +1258,8 @@ trusted fun __ablaRuntimePlatformThreadRegister(): void {
     record = ablaRuntimeLoadI64(stw + 144)
     if (record != 0) ablaRuntimeStoreI64(stw + 144, ablaRuntimeLoadI64(record))
     __ablaRuntimeFutexUnlock(stw + 8)
-    if (record == 0) record = __ablaRuntimePlatformRawAllocate(64)
+    if (record == 0) record = __ablaRuntimePlatformRawAllocate(72)
+    ablaRuntimeStoreI64(record + 64, __ablaRuntimeHostStwThreadId())
     ablaRuntimeStoreI64(record + 8, __ablaRuntimeHostRootFrameAddress())
     ablaRuntimeStoreI64(record + 24, 0)
     ablaRuntimeStoreI64(record + 32, 1)
@@ -1362,6 +1365,78 @@ private trusted fun __ablaRuntimeHostStwSleep(): void {
     return
 }
 
+// The calling thread's kernel id (x86-64 and AArch64 Linux); 0 elsewhere, where a thread's state cannot be read.
+private trusted fun __ablaRuntimeHostStwThreadId(): int {
+    if (ablaHostIsMacOS()) return 0
+    val arch = ablaSimdTargetArch()
+    if (arch != 1 && arch != 2) return 0
+    val id = ablaLinuxSyscall(if (arch == 1 || ablaHostOwnsRuntime()) 186 else 178, 0, 0, 0, 0, 0, 0)
+    if (id < 0) 0 else id
+}
+
+private trusted fun __ablaRuntimeHostStwAppend(at: int, text: int): int {
+    var length = 0
+    while (ablaRuntimeLoadU8(text + length) != 0) {
+        ablaRuntimeStoreU8(at + length, ablaRuntimeLoadU8(text + length))
+        length = length + 1
+    }
+    at + length
+}
+
+// What /proc/self/task/<id>/stat says of a thread: its processor time (user and system, clock ticks) doubled, plus 1 when its
+// state (field 3) is R, runnable or running; -1 when it cannot be read (no /proc, a thread that ended, another system).
+private trusted fun __ablaRuntimeHostStwProbe(id: int): int {
+    if (id <= 0) return -1
+    val arch = ablaSimdTargetArch()
+    if (arch != 1 && arch != 2) return -1
+    val x86Numbers = arch == 1 || ablaHostOwnsRuntime()
+    val stw = __ablaRuntimeHostStwAddress()
+    val path = stw + 160
+    var at = __ablaRuntimeHostStwAppend(path, __ablaRuntimeWord0("/proc/self/task/"))
+    var scale = 1
+    while (id / scale >= 10) scale = scale * 10
+    while (scale > 0) {
+        ablaRuntimeStoreU8(at, 48 + id / scale % 10)
+        at = at + 1
+        scale = scale / 10
+    }
+    at = __ablaRuntimeHostStwAppend(at, __ablaRuntimeWord0("/stat"))
+    ablaRuntimeStoreU8(at, 0)
+    val descriptor = ablaLinuxSyscall(if (x86Numbers) 257 else 56, -100, path, 0, 0, 0, 0)
+    if (descriptor < 0) return -1
+    val buffer = stw + 208
+    val got = ablaLinuxSyscall(if (x86Numbers) 0 else 63, descriptor, buffer, 255, 0, 0, 0)
+    ablaLinuxSyscall(if (x86Numbers) 3 else 57, descriptor, 0, 0, 0, 0, 0)
+    if (got <= 0) return -1
+    // "id (name) S ppid ...": the name may hold a parenthesis, so the fields start after the last one.
+    var position = got - 1
+    while (position >= 0 && ablaRuntimeLoadU8(buffer + position) != 41) position = position - 1
+    if (position < 0 || position + 3 >= got) return -1
+    val runnable = if (ablaRuntimeLoadU8(buffer + position + 2) == 82) 1 else 0
+    position = position + 3
+    // ppid, pgrp, session, tty, tpgid, flags, minflt, cminflt, majflt, cmajflt lie between the state and utime.
+    var skipped = 0
+    while (skipped < 10 && position < got) {
+        position = position + 1
+        while (position < got && ablaRuntimeLoadU8(buffer + position) != 32) position = position + 1
+        skipped = skipped + 1
+    }
+    if (skipped < 10) return -1
+    var ticks = 0
+    var part = 0
+    while (part < 2) {
+        position = position + 1
+        var value = 0
+        while (position < got && ablaRuntimeLoadU8(buffer + position) >= 48 && ablaRuntimeLoadU8(buffer + position) <= 57) {
+            value = value * 10 + ablaRuntimeLoadU8(buffer + position) - 48
+            position = position + 1
+        }
+        ticks = ticks + value
+        part = part + 1
+    }
+    ticks * 2 + runnable
+}
+
 private trusted fun __ablaRuntimeHostStwWriteNumber(value: int): void {
     val scratch = __ablaRuntimeHostStwAddress() + 96
     var digits = 0
@@ -1379,6 +1454,9 @@ private trusted fun __ablaRuntimeHostStwWriteNumber(value: int): void {
 
 // How long the collector waits for the others to park.
 private trusted fun __ablaRuntimeHostStwWaitMilliseconds(): int = 20
+
+// The longest a stop goes on waiting for a thread the system says is runnable but that has not run.
+private trusted fun __ablaRuntimeHostStwRunnableMilliseconds(): int = 1000
 
 private trusted fun __ablaRuntimeHostStwTrace(message: string, length: int, number: int, tail: string, tailLength: int): void {
     if (!__ablaRuntimeHostGcTrace) return
@@ -1432,6 +1510,8 @@ trusted fun __ablaRuntimeHostStwStop(): int {
     val started = __ablaRuntimeHostStwMilliseconds()
     var deadline = started + __ablaRuntimeHostStwWaitMilliseconds()
     var lastPoll = started
+    var probedNumber = 0
+    var probedTicks = 0
     var stopped = 0
     while (stopped == 0) {
         __ablaRuntimeFutexLock(stw + 8)
@@ -1464,6 +1544,7 @@ trusted fun __ablaRuntimeHostStwStop(): int {
             stopped = 1
         } else {
             val number = ablaRuntimeLoadI64(blocker + 16)
+            val threadId = ablaRuntimeLoadI64(blocker + 64)
             __ablaRuntimeFutexUnlock(stw + 8)
             val now = __ablaRuntimeHostStwMilliseconds()
             if (now - lastPoll >= 2) {
@@ -1472,7 +1553,29 @@ trusted fun __ablaRuntimeHostStwStop(): int {
                 if (deadline > limit) deadline = limit
             }
             lastPoll = now
-            if (reason == 2 || now >= deadline) {
+            var giveUp = reason == 2
+            if (!giveUp && now >= deadline) {
+                giveUp = true
+                // Only here, once the wait is over, is the thread's state read (a thread that just has not been scheduled yet is
+                // R, a thread blocked in the system is S or D). One that is R and has used less than two clock ticks of processor
+                // time since the last look has not run for the whole wait: it cannot have passed a safe point, so the wait goes
+                // on, up to a second in all. One that ran and still did not park (a loop without a safe point) is given up on.
+                if (now < started + __ablaRuntimeHostStwRunnableMilliseconds()) {
+                    val probe = __ablaRuntimeHostStwProbe(threadId)
+                    if (probe >= 0 && (probe & 1) == 1) {
+                        if (probedNumber != number) {
+                            probedNumber = number
+                            probedTicks = probe >>> 1
+                            deadline = now + __ablaRuntimeHostStwWaitMilliseconds()
+                            giveUp = false
+                        } else if ((probe >>> 1) - probedTicks < 2) {
+                            deadline = now + __ablaRuntimeHostStwWaitMilliseconds()
+                            giveUp = false
+                        }
+                    }
+                }
+            }
+            if (giveUp) {
                 __ablaRuntimeFutexLock(stw + 8)
                 __ablaRuntimeHostStwUnclaim(token)
                 __ablaRuntimeFutexUnlock(stw + 8)
@@ -1482,7 +1585,7 @@ trusted fun __ablaRuntimeHostStwStop(): int {
                         __ablaRuntimeHostStwTrace("gc: stop abandoned (thread ", 27, number, " is in a region)\n", 17)
                     } else {
                         __ablaRuntimeHostStwTrace("gc: stop abandoned (thread ", 27, number, " not parked after ", 18)
-                        __ablaRuntimeHostStwWriteNumber(__ablaRuntimeHostStwWaitMilliseconds())
+                        __ablaRuntimeHostStwWriteNumber(now - started)
                         __ablaRuntimeHostWrite(2, __ablaRuntimeWord0(" ms)\n"), 5)
                     }
                 }
