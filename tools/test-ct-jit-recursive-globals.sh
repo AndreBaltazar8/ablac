@@ -2,7 +2,9 @@
 # A class that refers to itself holds no closure unless one of its fields does (#972): the jit tier's ordinary-global
 # analysis used to cut the search at depth 6 and decline the site of any global of a recursive class ("which may hold a
 # closure"). tests/cases/ct-jit-recursive-globals/plain.ab runs natively and agrees in interp, jit and the run-time
-# build; closure.ab (a recursive class with a function field) is still declined for that reason and still agrees.
+# build; closure.ab (a recursive class with a function field, its global reached by two sites) is still declined for
+# that reason and still agrees. single.ab: a global whose class may hold closures, reached by one site alone, is
+# native for the pass and agrees (#1022).
 set -euo pipefail
 
 compiler=${1:-build/ablac}
@@ -24,7 +26,8 @@ run() { # $1 = case, $2 = mode, $3 = expected output
 
 for mode in jit interp; do
     run plain "$mode" "12 0"
-    run closure "$mode" "4 0"
+    run closure "$mode" "4 5 0"
+    run single "$mode" "42 0 false"
 done
 if grep -q 'may hold a closure' "$output_directory/plain-jit.trace"; then
     echo "ct-jit recursive globals: the jit tier still declines the plain recursive class:" >&2
@@ -33,6 +36,9 @@ if grep -q 'may hold a closure' "$output_directory/plain-jit.trace"; then
 fi
 grep -q '^note\[ct-jit\]: native at ' "$output_directory/plain-jit.trace" ||
     { echo "ct-jit recursive globals: the plain recursive class's site did not run natively" >&2; exit 1; }
-grep -q 'may hold a closure' "$output_directory/closure-jit.trace" ||
-    { echo "ct-jit recursive globals: a class with a function field no longer holds a closure" >&2; cat "$output_directory/closure-jit.trace" >&2; exit 1; }
-echo "ct-jit recursive globals: a recursive class of plain fields runs natively; one with a function field is still declined"
+grep -q 'may hold a closure, and 2 sites reach it' "$output_directory/closure-jit.trace" ||
+    { echo "ct-jit recursive globals: a class with a function field reached by two sites is no longer declined" >&2; cat "$output_directory/closure-jit.trace" >&2; exit 1; }
+grep -q '^note\[ct-jit\]: native at ' "$output_directory/single-jit.trace" &&
+    grep -q '^note\[ct-jit\]: ordinary global app is native for this pass' "$output_directory/single-jit.trace" ||
+    { echo "ct-jit recursive globals: a closure-holding global one site reaches did not run natively" >&2; cat "$output_directory/single-jit.trace" >&2; exit 1; }
+echo "ct-jit recursive globals: a recursive class of plain fields runs natively; one with a function field is declined when two sites reach it, native when one does"

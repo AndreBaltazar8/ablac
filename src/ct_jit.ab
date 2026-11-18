@@ -1209,12 +1209,13 @@ fun bootstrapCtOrdinaryType(declaration: BootstrapDeclaration): string {
 // Why a written ordinary global can't be owned by the native tier for a pass, "" when it can. The generation's copy
 // starts from the initializer, so the interpreter's journal must hold no value of it yet (an earlier pass's would be
 // lost); its value goes back to the journal after every native call, so its type must be one the lift carries back,
-// and hold no closure (the interpreter keeps those afresh per evaluation, a native copy would keep one). Delegated
-// globals keep their delegate in the interpreter.
+// and hold no closure (the journal keeps none: bootstrapCompileGlobalEncode) unless one of the pass's `sites` alone
+// reaches it. Delegated globals keep their delegate in the interpreter.
 fun bootstrapCtOwnableReason(
     declarations: array<BootstrapDeclaration>,
     index: int,
-    edits: bool
+    edits: bool,
+    sites: int
 ): string {
     val declaration = declarations[index]
     if (declaration.kind != "val" && declaration.kind != "var") return "not a plain val or var"
@@ -1239,8 +1240,14 @@ fun bootstrapCtOwnableReason(
     val holdsResource = bootstrapCtGenerationOnly(declarations, type)
     val typeReason = bootstrapLiftTypeReasonIn(declarations, type)
     if (typeReason != "" && !holdsResource) return "of type $type, which native code cannot hand back: $typeReason"
-    if ((!holdsResource || edits) && bootstrapCtStateMayHoldClosure(declarations, type))
-        return "of type $type, which may hold a closure"
+    // A value one site alone reaches (abla-forge's `engineApp: App`, whose schedules hold the systems) may hold
+    // closures: the site's one evaluation starts from the initializer in either tier, no other site of the pass reads
+    // what it leaves, and what goes back to the journal after it is kept only if it holds no closure, as the
+    // interpreter's own value would be (#1022). With two sites the second would read the first's closures from the
+    // generation's copy; that stays declined.
+    if ((!holdsResource || edits) && (edits || sites > 1) && bootstrapCtStateMayHoldClosure(declarations, type))
+        return if (edits) "of type $type, which may hold a closure" else
+            "of type $type, which may hold a closure, and $sites sites reach it"
     val kept = bootstrapCompileGlobalLoad(bootstrapCompileGlobalKey(declaration), declarations, [])
     if (kept.kind != "invalid") return "an earlier evaluation kept a value of it"
     ""
@@ -1608,11 +1615,17 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string,
     bootstrapCtNote("ordinary-global write analysis ${linuxMonotonicMilliseconds() - stateStarted} ms")
     // A written ordinary global the native tier can own (bootstrapCtOwnableReason): its sites stay native unless
     // one of them can't (the fixed point after the sites are prepared, below).
+    // (How many of the pass's sites reach each global: a closure in one that a single site reaches can be owned.)
+    val reaching: array<int> = []
+    for (declaration in parsed.declarations) reaching.append(0)
+    for (reachedBySite in state.reached) {
+        for (global in reachedBySite) reaching[global] = reaching[global] + 1
+    }
     val ownable: array<bool> = []
     var ownableIndex = 0
     while (ownableIndex < parsed.declarations.size) {
         ownable.append(state.writers[ownableIndex] != "" &&
-            bootstrapCtOwnableReason(parsed.declarations, ownableIndex, state.edits) == "")
+            bootstrapCtOwnableReason(parsed.declarations, ownableIndex, state.edits, reaching[ownableIndex]) == "")
         ownableIndex = ownableIndex + 1
     }
     var stateSite = 0
@@ -1627,7 +1640,7 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string,
             for (global in state.reached[stateSite]) {
                 if (site.reason == "" && state.writers[global] != "" && !ownable[global]) {
                     site.reason =
-                        "ordinary mutable global ${parsed.declarations[global].name} may be written at ${state.writers[global]} (${bootstrapCtOwnableReason(parsed.declarations, global, state.edits)})"
+                        "ordinary mutable global ${parsed.declarations[global].name} may be written at ${state.writers[global]} (${bootstrapCtOwnableReason(parsed.declarations, global, state.edits, reaching[global])})"
                 }
             }
         }

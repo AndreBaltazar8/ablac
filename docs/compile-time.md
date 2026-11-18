@@ -358,7 +358,8 @@ Under `auto` (the default) and `jit`, an ordinary global (a plain `val` or `var`
 for the pass. The native tier owns it when every site of the pass that reaches
 it can run natively. The global must also have a type the native tier can hand
 back (written out, a literal's, a class constructor's, a plain function's declared
-result, or a TVar delegate) that holds no closure, and no earlier evaluation may
+result, or a TVar delegate) that holds no closure (unless one site of the pass alone
+reaches it, as abla-forge's `engineApp`, whose schedules hold closures), and no earlier evaluation may
 have kept a value of it. Those
 sites then share the native copy, made by its initializer. After each native
 call its value goes into the interpreter's store, so a later pass, or an
