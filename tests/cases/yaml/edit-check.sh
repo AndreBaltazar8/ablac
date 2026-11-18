@@ -7,10 +7,12 @@
 # source back unchanged (cmp).
 # Usage: edit-check.sh EDIT-PROBE OUTPUT-DIRECTORY
 set -euo pipefail
-# A hung probe must not stall the suite: run each under `timeout 5` where it
-# exists (Linux). macOS has no timeout and runs the probes unguarded.
+# A hung probe must not stall the suite: run each under `timeout 60` where it
+# exists (Linux). macOS has no timeout and runs the probes unguarded. A probe takes a few milliseconds and
+# is one thread with no waits: the limit is for a hang, and long enough that a host stalled by load is not
+# taken for one (5 s was hit twice in full-suite gates, never in 27,000 runs on busy CPUs).
 guard=()
-if command -v timeout >/dev/null 2>&1; then guard=(timeout 5); fi
+if command -v timeout >/dev/null 2>&1; then guard=(timeout 60); fi
 probe=$1
 output=$2
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
