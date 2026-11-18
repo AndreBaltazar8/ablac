@@ -16,7 +16,9 @@ cd "$root"
 for tool in openssl h2o h2o-httpclient; do
     command -v "$tool" > /dev/null || { echo "http2 h2o: $tool is needed (nix-shell provides it)" >&2; exit 1; }
 done
-out=build/http2-h2o
+# A directory of its own for each run (and its processes' ports are chosen free), so copies run side by side; a
+# failed run keeps its directory for the logs, a successful one removes it.
+out=build/http2-h2o-$$
 rm -rf "$out"
 mkdir -p "$out/docroot"
 for program in h2o:tests/cases/http2/h2o.ab server:tools/h2spec/server.ab; do
@@ -149,4 +151,6 @@ hc -m POST -b 4000 -c 1 -o "$out/tiny.out" "$url/echo" > "$out/hc-tiny.log" 2>&1
 hc -m POST -b 1048576 -c 4096 -t 20 -C 10 -o /dev/null "$url/echo" > "$out/hc-par.log" 2>&1 || { tail -5 "$out/hc-par.log" >&2; echo "http2 h2o (h2o-httpclient, 20 uploads of 1 MiB, 10 at once): failed" >&2; exit 1; }
 kill -0 "$server_pid" 2> /dev/null || { echo "http2 h2o: our server died during the h2o-httpclient runs" >&2; tail -5 "$out/server.log" >&2; exit 1; }
 echo "http2 h2o (h2o-httpclient against our server) ok"
+cleanup
+rm -rf "$out"
 echo "http2 h2o ok"

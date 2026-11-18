@@ -60,6 +60,9 @@ filter=${RUN_TESTS_FILTER:-}
 exclude=${RUN_TESTS_EXCLUDE:-}
 history_file=$project_root/build/test-results/suite-history.tsv
 history=${RUN_TESTS_HISTORY:-$history_file}
+# A tree that has not run the suite yet has no history: tools/test-times.tsv (a results.tsv of a whole run, refreshed
+# now and then) orders the longest commands first there too.
+[[ -s $history ]] || history=$project_root/tools/test-times.tsv
 [[ $jobs =~ ^[1-9][0-9]*$ ]] || { echo "JOBS must be a positive integer, got $jobs" >&2; exit 2; }
 [[ $output == /* ]] || output=$PWD/$output
 
@@ -146,7 +149,10 @@ order() {
                     if (field[3] ~ /^[0-9.]+$/) known[key(field[4])] = field[3]
                 }
             }
-            { k = key($2); print (k in known ? known[k] : -1) "\t" $1 }' |
+            # test-self-hosted.sh goes first of all: the commands in serial_reason wait for it, so a late start
+            # of it leaves them (and the run) waiting at the end.
+            { k = key($2); rank = (k in known ? known[k] : -1); if ($2 ~ /tools\/test-self-hosted\.sh/) rank = 1000000
+              print rank "\t" $1 }' |
         sort -t "$(printf '\t')" -k1,1nr -k2,2n | cut -f2
 }
 
@@ -256,7 +262,8 @@ run_all() { # limit n...
     while ((${#pending[@]} > 0 || ${#running_ns[@]} > 0 || ${#serial[@]} > 0)); do
         reap
         if ((${#serial[@]} > 0)) && ! self_hosted_active; then
-            pending+=("${serial[@]}")
+            # They are short (a minute together) and have waited: ahead of what is left, not behind it.
+            pending=("${serial[@]}" ${pending[@]+"${pending[@]}"})
             serial=()
         fi
         while ((${#pending[@]} > 0 && ${#running_ns[@]} < limit)); do
