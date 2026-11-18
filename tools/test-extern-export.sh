@@ -40,4 +40,12 @@ runs extern-only 5
 rejected bad-parameter 'extern.export-mismatch:mockDelay@' ':parameter1:i32:i64:' "$cases/bad-parameter.ab"
 rejected bad-count 'extern.export-mismatch:mockDelay@' ':parameters:2:1:' "$cases/bad-count.ab"
 rejected bad-result 'extern.export-mismatch:mockDelay@' ':result:i32:i64:' "$cases/bad-result.ab"
+# The program's own calls of its exported symbol are direct calls to the function, not calls of the exported alias (so they
+# are inlined, and the argument ABI optimized, like any internal call); the C symbol itself is still exported.
+"$compiler" --emit-llvm "$cases/match.ab" > "$output_directory/match.ll" 2> "$output_directory/match.ll.err" ||
+    { echo "extern-export: match.ab did not emit LLVM"; cat "$output_directory/match.ll.err"; exit 1; }
+grep -qE "^@mockDelay = alias" "$output_directory/match.ll" || { echo "extern-export: the exported symbol mockDelay is gone"; exit 1; }
+if grep -qF "@mockDelay(" "$output_directory/match.ll"; then
+    echo "extern-export: a call still goes through the exported alias @mockDelay"; exit 1
+fi
 echo "extern export: ok"

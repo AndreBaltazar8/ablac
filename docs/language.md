@@ -3022,6 +3022,9 @@ declaration and the definition must have the same signature, the same parameter 
 places; a C prototype isn't checked against its definition, so a mismatch would otherwise link and misbehave. A
 declaration with no export in the program, and an export nobody declares, are as before. The standard library's own
 declarations, methods and `@exportChecked` functions (whose ABI isn't the declared one) aren't compared.
+The program's own calls of such a symbol are direct calls to the exported function (not through the exported
+symbol), so they are inlined like any internal call; on a microcontroller target the usual "an exported function is
+not inlined" rule leaves them out.
 
 ## Native declarations
 
