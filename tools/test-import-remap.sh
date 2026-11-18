@@ -95,7 +95,7 @@ cmp "$output_directory/plain.ll" "$output_directory/empty.ll" ||
 # against the target's types (a class and an alias) are the program's, wherever the program is started
 # from (a path relative to the working directory names the modules relative too), strict or flat.
 extension_cases="$project_root/tests/cases/import-remap-extension"
-compiler_path=$(realpath "$compiler")
+compiler_path=$(cd -- "$(dirname -- "$compiler")" && pwd)/$(basename -- "$compiler")  # (not realpath: build/ablac is a launcher that finds its payload by its own name)
 remapped_extension() { # $1 = label, $2 = directory of the case, $3 = how the program is named
     local label=$1 directory=$2 entry=$3
     (cd "$directory/app" && "$compiler_path" build "$entry" -o "$output_directory/ext-$label" --no-cache) \
