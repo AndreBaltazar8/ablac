@@ -16,10 +16,39 @@ out="$root/build/fork-heap"
 rm -rf "$out"
 mkdir -p "$out"
 fail() { echo "fork heap: $1" >&2; exit 1; }
+# A run that reaches the 120 s limit has hung somewhere (it takes about half a second, and 380 runs on a machine
+# loaded with 40 busy loops never came near): at 100 s a watchdog writes what every process of the run, and every
+# thread of each, is doing (state and kernel wait channel), so the failure says whether the parent, a child or
+# one of the churning threads is stuck and on what, instead of only that the limit passed.
+hang_report() { # file, run-limited's pid
+    sleep 100 &
+    local nap=$!
+    trap 'kill "$nap" 2> /dev/null; exit 0' TERM
+    wait "$nap"
+    {
+        echo "state of the run at 100 s (pid state wchan comm):"
+        local pid task
+        for pid in "$2" $(pgrep -P "$2" 2> /dev/null) $(pgrep -f "$out" 2> /dev/null); do
+            [[ -d /proc/$pid ]] || continue
+            for task in /proc/$pid/task/*; do
+                echo "  ${task#/proc/} $(awk '/^State:/ {print $2}' "$task/status" 2> /dev/null) $(cat "$task/wchan" 2> /dev/null) $(cat "$task/comm" 2> /dev/null)"
+            done
+        done
+    } > "$1" 2>&1
+}
 run() { # label, then the command
-    local label=$1 result
+    local label=$1 result report="$out/hang-report.txt" runner watchdog status=0
     shift
-    result=$(ABLA_MAX_SECONDS=120 "$root/tools/run-limited.sh" "$@" 2>&1) || fail "$label: $result"
+    : > "$report"
+    ABLA_MAX_SECONDS=120 "$root/tools/run-limited.sh" "$@" > "$out/run.out" 2>&1 &
+    runner=$!
+    hang_report "$report" "$runner" &
+    watchdog=$!
+    wait "$runner" || status=$?
+    kill "$watchdog" 2> /dev/null || true
+    wait "$watchdog" 2> /dev/null || true
+    result=$(cat "$out/run.out")
+    [[ $status -eq 0 ]] || fail "$label: $result$([[ -s $report ]] && printf '\n%s' "$(cat "$report")")"
     [[ $result == *"failures 0"* || $result == *'fork heap library ok'* ]] || fail "$label said: $result"
 }
 x86=0
