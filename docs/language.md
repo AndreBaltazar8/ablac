@@ -430,7 +430,10 @@ fun main {
   that fits needs no conversion (`take(200)`, `val a: u8 = 255`), nor does an
   `if` or `when` whose results all are such literals, or a block that ends in
   one (a function body `{ log(x); 0 }` returning `u32`); one that does not fit
-  (`val a: u8 = 256`) is the error.
+  (`val a: u8 = 256`) is the error. A lambda's body is such a place when the
+  expected function type names the result: `take({ x -> 0 })` against
+  `(int) -> u32` is a `(int) -> u32`; a body that is an int value
+  (`{ x -> x }`) is still a function of another type, refused.
 
 ### Floating point
 

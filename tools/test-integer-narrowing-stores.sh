@@ -14,12 +14,15 @@ mkdir -p "$out"
 got=$("$out/valid")
 [[ $got == "255 -128 0 44 32767 255 200 255 A 255 -128 44 255 44 2 44
 0 7 8 9 11 12 13" ]] ||{ echo "integer narrowing stores: valid.ab printed '$got'" >&2; exit 1; }
+"$compiler" build tests/cases/integer-narrowing-stores/lambda.ab -o "$out/lambda" --fast --no-cache
+got=$("$out/lambda")
+[[ $got == "0 7 -3 9 5 200 1" ]] || { echo "integer narrowing stores: lambda.ab printed '$got'" >&2; exit 1; }
 reject() { # $1 = name, $2 = declarations, $3 = statements of main
     printf 'class Box(var value: u8)\n%s\nfun main: int {\n%s\n    0\n}\n' "$2" "$3" > "$out/$1.ab"
     if "$compiler" build "$out/$1.ab" -o "$out/$1" --fast --no-cache > "$out/$1.log" 2>&1; then
         echo "integer narrowing stores: $1 was accepted" >&2; exit 1
     fi
-    grep -Fq 'error[E_SEMANTIC]: integer.narrowing:' "$out/$1.log" ||
+    grep -Eq "error\[E_SEMANTIC\]: ${4:-integer\.narrowing}:" "$out/$1.log" ||
         { echo "integer narrowing stores: $1 lacks integer.narrowing:" >&2; cat "$out/$1.log" >&2; exit 1; }
 }
 reject local-u8 '' '    val a: u8 = 256'
@@ -55,4 +58,10 @@ reject if-block-int-value $'fun f(x: int): u8 {\n    val n = x\n    if (n > 0) {
 reject when-int-value $'fun f(x: int): u8 = when (x) {\n    1 -> 3\n    else -> x\n}' '    val a = f(1)'
 reject when-literal $'fun f(x: int): u8 = when (x) {\n    1 -> 256\n    else -> 0\n}' '    val a = f(1)'
 reject local-if-block $'fun f(x: int): int {\n    val a: u8 = if (x > 0) {\n        val y = x\n        y\n    } else 2\n    0\n}' '    val a = f(1)'
-echo "integer narrowing stores: fitting literals and conversions accepted in every store, 30 other forms rejected"
+# A lambda's result takes the expected function type only for a literal that fits.
+reject lambda-int-value $'fun take(f: (int) -> u32): u32 = f(1)' '    take({ x -> x })' 'function\.(argument|result)|local\.initializer'
+reject lambda-block-int-value $'fun take(f: (int) -> u8): u8 = f(1)' $'    take({ x ->\n        val y = x + 1\n        y\n    })' 'function\.(argument|result)|local\.initializer'
+reject lambda-literal-range $'fun take(f: (int) -> u8): u8 = f(1)' '    take({ x -> 256 })' 'function\.(argument|result)|local\.initializer'
+reject lambda-if-int-value $'fun make(): (int) -> u8 = { x -> if (x > 0) 5 else x }' '    make()' 'function\.(argument|result)|local\.initializer'
+reject lambda-declared-int-value '' '    val f: (int) -> u16 = { x -> x }' 'function\.(argument|result)|local\.initializer'
+echo "integer narrowing stores: fitting literals and conversions accepted in every store (lambda results too), 35 other forms rejected"
