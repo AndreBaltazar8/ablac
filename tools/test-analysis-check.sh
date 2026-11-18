@@ -16,16 +16,21 @@ if (( full )); then edits=${ANALYSIS_CHECK_EDITS:-6}; else edits=${ANALYSIS_CHEC
 root=$(mktemp -d /tmp/analysis-check.XXXXXX)
 trap 'rm -rf "$root"' EXIT
 cp -R "$project_root/src" "$project_root/stdlib" "$project_root/runtime" "$root/"
-# The check reports a difference when there is one (no edits: one analysis).
+# The check reports a difference when there is one: on a two-file program (an analysis of src/ costs seconds, and says no more).
+tiny=$(mktemp -d /tmp/analysis-check-tiny.XXXXXX)
+trap 'rm -rf "$root" "$tiny"' EXIT
+printf 'import "dep.ab"\nfun main(): int = answer()\n' > "$tiny/main.ab"
+printf 'fun answer(): int = 42\n' > "$tiny/dep.ab"
+printf 'name = "tiny"\nentry = "main.ab"\n' > "$tiny/abla.toml"
 ANALYSIS_CHECK_SELFTEST=1 ABLA_SYSROOT="$root" ABLA_COMPILE_EVAL=jit ABLA_MAX_MEMORY_MB=12288 ABLA_MAX_SECONDS=3000 ABLA_MAX_CPU_SECONDS=2400 \
-    node "$project_root/tests/analysis-check/run.mjs" "$project_root/tools/run-limited.sh" "$compiler" "$root" src/orc_main.ab "$seed" 0
+    node "$project_root/tests/analysis-check/run.mjs" "$project_root/tools/run-limited.sh" "$compiler" "$tiny" main.ab "$seed" 0
 ABLA_SYSROOT="$root" ABLA_COMPILE_EVAL=jit ABLA_MAX_MEMORY_MB=12288 ABLA_MAX_SECONDS=3000 ABLA_MAX_CPU_SECONDS=2400 \
     node "$project_root/tests/analysis-check/run.mjs" "$project_root/tools/run-limited.sh" "$compiler" "$root" src/orc_main.ab "$seed" "$edits"
 # abla-one, where it sits beside this checkout (or ABLA_ONE_DIR): a program of another shape (packages, a UI, a different import graph).
 one=${ABLA_ONE_DIR:-$project_root/../abla-one}
 if (( full )) && [[ -f $one/abla.toml ]]; then
     ONE_ROOT=$(mktemp -d /tmp/analysis-check-one.XXXXXX)
-    trap 'rm -rf "$root" "$ONE_ROOT"' EXIT
+    trap 'rm -rf "$root" "$tiny" "$ONE_ROOT"' EXIT
     (cd "$one" && tar --exclude=./build --exclude=./.git -cf - .) | tar -xf - -C "$ONE_ROOT"
     ABLA_SYSROOT="$root" ABLA_COMPILE_EVAL=jit ABLA_MAX_MEMORY_MB=12288 ABLA_MAX_SECONDS=3000 ABLA_MAX_CPU_SECONDS=2400 \
         node "$project_root/tests/analysis-check/run.mjs" "$project_root/tools/run-limited.sh" "$compiler" "$ONE_ROOT" src/one.ab "$seed" "$edits"
