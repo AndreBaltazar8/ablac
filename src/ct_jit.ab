@@ -1506,6 +1506,70 @@ fun bootstrapCtFailReady(reason: string): void {
     }
 }
 
+// After a site's walk: the program's own definition (under @export) of each extern:"c" function the walk kept is
+// walked too, as the site's code, until no kept extern is left without its definition; their names go in
+// `selfDefined`, which the slice exports. Why the site can't run natively, or "".
+fun bootstrapCtKeepSelfDefined(
+    declarations: array<BootstrapDeclaration>,
+    var reach: BootstrapCtReach,
+    var reached: array<int>,
+    var selfDefined: Map<string, bool>
+): string {
+    var added = true
+    while (added) {
+        added = false
+        val keptExterns: Map<string, bool> = Map()
+        var externIndex = 0
+        while (externIndex < declarations.size) {
+            if (reach.kept[externIndex] && declarations[externIndex].kind == "extern") {
+                keptExterns.set(declarations[externIndex].name, true)
+            }
+            externIndex = externIndex + 1
+        }
+        // (Whether a definition is kept, not whether an earlier site named it: a refused site's walk is undone.)
+        var exporter = 0
+        while (exporter < declarations.size) {
+            val declaration = declarations[exporter]
+            if (declaration.kind == "fun" && !reach.kept[exporter]) {
+                for (name in bootstrapCtExportNames(declaration)) {
+                    if ((keptExterns.get(name) ?? false) && !reach.kept[exporter]) {
+                        selfDefined.set(name, true)
+                        added = true
+                        val reason = reach.unsupported(BootstrapExpression(
+                            "call", declaration.name, declaration.begin, declaration.end, []
+                        ), reached, false, declaration.sourceIdentity)
+                        if (reason != "") return reason
+                        // (The walk kept it; set here too, so the loop ends whatever the call resolved to.)
+                        reach.kept[exporter] = true
+                    }
+                }
+            }
+            exporter = exporter + 1
+        }
+    }
+    ""
+}
+
+// The names a function's @export or @exportChecked gives it (`@export("a")`, `@export(["a", "b"])`).
+fun bootstrapCtExportNames(declaration: BootstrapDeclaration): array<string> {
+    val names: array<string> = []
+    var annotation = 0
+    while (annotation < declaration.annotations.size && annotation < declaration.annotationArguments.size) {
+        val kind = declaration.annotations[annotation]
+        if (kind == "export" || kind == "exportChecked") {
+            val argument = declaration.annotationArguments[annotation]
+            if (argument.kind == "string") names.append(argument.text)
+            if (argument.kind == "array") {
+                for (child in argument.children) {
+                    if (child.kind == "string") names.append(child.text)
+                }
+            }
+        }
+        annotation = annotation + 1
+    }
+    names
+}
+
 fun bootstrapCtFirstLine(text: string): string {
     var end = 0
     while (end < text.size && text[end] != 10) end = end + 1
@@ -1780,6 +1844,11 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string,
             reach.keepFrom(BootstrapExpression("call", declaration.name, 0, 0, []))
         }
     }
+    // An extern:"c" function the program defines itself, under @export (abla-forge's `host_option`, `gfx_submit`
+    // and the rest, which native/linux/host.ab exports): the linker resolves one to the other, so the slice keeps
+    // the exporting function and exports it under that name too (below), or the generation's link fails on the
+    // missing symbols (#1022). Each site's walk follows them (bootstrapCtKeepSelfDefined), as the site's own code.
+    val selfDefined: Map<string, bool> = Map()
     // The slice's analysis sees the program's top-level grants (they decide what its
     // compile code may do): the declaration they call is part of it.
     for (action in parsed.actions) {
@@ -1832,6 +1901,7 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string,
             }
             if (site.reason == "") site.reason = reach.unsupported(site.expression, reached, false,
                 site.sourceIdentity)
+            if (site.reason == "") site.reason = bootstrapCtKeepSelfDefined(parsed.declarations, reach, reached, selfDefined)
             // Under auto, whether the site can run long, while reach.visited is its walk (once one site
             // can, the pass has a generation whatever the others are, so they are not asked).
             if (site.reason == "" && auto && !anyLong) {
@@ -2192,6 +2262,24 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string,
     val outerExports = bootstrapTakeExportRequests()
     val outerDiagnostics = bootstrapTakeDriverDiagnostics()
     for (request in exports) bootstrapStageExportRequest(request)
+    // The program's own definitions of the externs it calls (selfDefined, above), exported under those names.
+    // (One generation is live at a time: bootstrapCtFinishPass removes the last before the next is made.)
+    for (declaration in sliceDeclarations) {
+        if (declaration.kind == "fun") {
+            for (name in bootstrapCtExportNames(declaration)) {
+                if (selfDefined.get(name) ?? false) {
+                    val parameterTypes: array<string> = []
+                    for (type in declaration.parameterTypes) {
+                        parameterTypes.append(bootstrapExportRuntimeType(sliceDeclarations, type))
+                    }
+                    val staged = bootstrapStageExportRequest(BootstrapExportRequest(
+                        declaration.name, name, bootstrapExportRuntimeType(sliceDeclarations, declaration.resultType),
+                        declaration.parameters, parameterTypes, false, false, false
+                    ))
+                }
+            }
+        }
+    }
     bootstrapCtLoweringSlice = true
     val program = bootstrapLowerParsedCached(
         lowered, analyzed, bootstrapIrTransientState(), true
