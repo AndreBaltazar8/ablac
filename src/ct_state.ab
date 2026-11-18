@@ -38,19 +38,67 @@ class BootstrapCtStateResult(
     val snapshot: array<bool>
 )
 
+// Adds the values of `source` to `target`; true when `target` grew. Both are kept in ascending order (every set here
+// starts empty and grows through this function), so a small source is bisected into a large target and inserted in
+// place, and a source of comparable size is merged by one linear scan; the sets reach thousands of origins (#1022).
 fun bootstrapCtStateMerge(var target: array<int>, source: array<int>): bool {
-    var changed = false
-    for (value in source) {
-        var present = false
-        for (existing in target) {
-            if (existing == value) present = true
+    if (source.size == 0) return false
+    if (target.size == 0) {
+        for (value in source) target.append(value)
+        return true
+    }
+    if (source.size * 16 <= target.size) {
+        var changed = false
+        for (value in source) {
+            var low = 0
+            var high = target.size
+            while (low < high) {
+                val middle = (low + high) / 2
+                if (target[middle] < value) low = middle + 1 else high = middle
+            }
+            if (low >= target.size || target[low] != value) {
+                target.append(value)
+                var shift = target.size - 1
+                while (shift > low) {
+                    target[shift] = target[shift - 1]
+                    shift = shift - 1
+                }
+                target[low] = value
+                changed = true
+            }
         }
-        if (!present) {
-            target.append(value)
-            changed = true
+        return changed
+    }
+    // Is every value of the source already there?
+    var grows = false
+    var at = 0
+    for (value in source) {
+        while (at < target.size && target[at] < value) at = at + 1
+        if (at >= target.size || target[at] != value) {
+            grows = true
+            break
         }
     }
-    changed
+    if (!grows) return false
+    val merged: array<int> = []
+    var left = 0
+    var right = 0
+    while (left < target.size || right < source.size) {
+        if (right >= source.size || (left < target.size && target[left] < source[right])) {
+            merged.append(target[left])
+            left = left + 1
+        } else if (left >= target.size || source[right] < target[left]) {
+            merged.append(source[right])
+            right = right + 1
+        } else {
+            merged.append(target[left])
+            left = left + 1
+            right = right + 1
+        }
+    }
+    target.truncate(0)
+    for (value in merged) target.append(value)
+    true
 }
 
 fun bootstrapCtStateCopy(values: array<int>): array<int> {
@@ -136,16 +184,57 @@ class BootstrapCtState(
     // Locals ("item:name") the checker typed as a scalar or a string (#829): what is assigned to them carries no origins.
     val scalarLocals: Map<string, bool>,
     // Field names every declaration of which has type array<T> with T a scalar or a string (#829).
-    val scalarArrayFields: Map<string, bool>
+    val scalarArrayFields: Map<string, bool>,
+    // What each item must be walked again for (#1022): an item is walked when something it reads changed. Per item: whether
+    // it is waiting for a walk; per declaration the items that read its taint; per item the items that call it (read its
+    // returns); the items that read each field name, and the elements.
+    val dirty: array<bool>,
+    val globalReaders: array<array<int>>,
+    val callers: array<array<int>>,
+    val fieldReaders: Map<string, array<int>>,
+    val elementReaders: array<int>
 ) {
     fun variable(name: string): array<int> =
         bootstrapCtStateCopy(this.variables.get("${this.current}:$name") ?? [])
 
-    fun bind(name: string, taint: array<int>): void {
-        val key = "${this.current}:$name"
+    fun markDirty(item: int): void {
+        this.dirty[item] = true
+        return
+    }
+
+    fun markReaders(items: array<int>): void {
+        for (reader in items) this.dirty[reader] = true
+        return
+    }
+
+    fun markGlobalReaders(declaration: int): void {
+        for (reader in this.globalReaders[declaration]) this.dirty[reader] = true
+        return
+    }
+
+    fun markCallers(item: int): void {
+        for (caller in this.callers[item]) this.dirty[caller] = true
+        return
+    }
+
+    fun markElementReaders(): void {
+        for (reader in this.elementReaders) this.dirty[reader] = true
+        return
+    }
+
+    // A change to what `item` knows about its parameters (or `this`, or a local): it is walked again.
+    fun mergeVariable(item: int, key: string, taint: array<int>): void {
         val existing = this.variables.get(key) ?? []
-        if (bootstrapCtStateMerge(existing, taint)) this.changed = true
+        if (bootstrapCtStateMerge(existing, taint)) {
+            this.changed = true
+            this.dirty[item] = true
+        }
         this.variables.set(key, existing)
+        return
+    }
+
+    fun bind(name: string, taint: array<int>): void {
+        this.mergeVariable(this.current, "${this.current}:$name", taint)
         return
     }
 
@@ -162,23 +251,44 @@ class BootstrapCtState(
         if (!this.reachedItems[item]) {
             this.reachedItems[item] = true
             this.changed = true
+            this.dirty[item] = true
         }
         bootstrapCtStateMerge(this.itemCallees[this.current], [item])
+        // The caller reads the callee's returns.
+        bootstrapCtStateMerge(this.callers[item], [this.current])
         return
     }
 
-    fun field(name: string): array<int> = bootstrapCtStateCopy(this.fields.get(name) ?? [])
+    // The current item reads the field `name`.
+    fun noteFieldRead(name: string): void {
+        val readers = this.fieldReaders.get(name) ?? []
+        bootstrapCtStateMerge(readers, [this.current])
+        this.fieldReaders.set(name, readers)
+        return
+    }
 
     fun storeField(name: string, taint: array<int>): void {
         if (this.scalarFields.get(name) ?? false) return
         val existing = this.fields.get(name) ?? []
-        if (bootstrapCtStateMerge(existing, taint)) this.changed = true
+        if (bootstrapCtStateMerge(existing, taint)) {
+            this.changed = true
+            this.markReaders(this.fieldReaders.get(name) ?? [])
+        }
         this.fields.set(name, existing)
         return
     }
 
+    // The current item reads the elements.
+    fun noteElementsRead(): void {
+        bootstrapCtStateMerge(this.elementReaders, [this.current])
+        return
+    }
+
     fun storeElement(taint: array<int>): void {
-        if (bootstrapCtStateMerge(this.elements, taint)) this.changed = true
+        if (bootstrapCtStateMerge(this.elements, taint)) {
+            this.changed = true
+            this.markElementReaders()
+        }
         return
     }
 
@@ -302,10 +412,7 @@ class BootstrapCtState(
         for (item in items) {
             this.reach(item)
             if (taints.size > 0) {
-                val self = "$item:this"
-                val existing = this.variables.get(self) ?? []
-                if (bootstrapCtStateMerge(existing, taints[0])) this.changed = true
-                this.variables.set(self, existing)
+                this.mergeVariable(item, "$item:this", taints[0])
             }
             this.bindArguments(item, taints, 1)
             bootstrapCtStateMerge(result, this.returns[item])
@@ -340,10 +447,7 @@ class BootstrapCtState(
         while (from + index < taints.size) {
             val name = this.parameterName(item, index)
             if (name != "" && !this.parameterIsValue(item, index)) {
-                val key = "$item:$name"
-                val existing = this.variables.get(key) ?? []
-                if (bootstrapCtStateMerge(existing, taints[from + index])) this.changed = true
-                this.variables.set(key, existing)
+                this.mergeVariable(item, "$item:$name", taints[from + index])
             }
             index = index + 1
         }
@@ -389,8 +493,10 @@ class BootstrapCtState(
                             this.implicitCall("setValue",
                                 [bootstrapCtStateCopy(this.globalTaint[item]), value])
                         }
-                        if (bootstrapCtStateMerge(this.globalTaint[item],
-                            value)) this.changed = true
+                        if (bootstrapCtStateMerge(this.globalTaint[item], value)) {
+                            this.changed = true
+                            this.markGlobalReaders(item)
+                        }
                     }
                 }
             }
@@ -399,7 +505,8 @@ class BootstrapCtState(
         if (kind == "member" && children.size > 0) {
             val result = this.evaluate(children[0])
             if (this.scalarFields.get(expression.text) ?? false) return []
-            bootstrapCtStateMerge(result, this.field(expression.text))
+            this.noteFieldRead(expression.text)
+            bootstrapCtStateMerge(result, this.fields.get(expression.text) ?? [])
             return result
         }
         if (kind == "member.assign" && children.size > 1) {
@@ -417,6 +524,7 @@ class BootstrapCtState(
             }
             val result = this.evaluate(children[0])
             this.evaluate(children[1])
+            this.noteElementsRead()
             bootstrapCtStateMerge(result, this.elements)
             return result
         }
@@ -461,6 +569,7 @@ class BootstrapCtState(
             val name = bootstrapForName(expression)
             this.scope.append(name)
             val element = bootstrapCtStateCopy(source)
+            this.noteElementsRead()
             bootstrapCtStateMerge(element, this.elements)
             this.bind(name, if (this.scalarElements(children[0])) [] else element)
             this.evaluate(children[1])
@@ -473,6 +582,7 @@ class BootstrapCtState(
                 bootstrapCtStateMerge(this.lambdaValues[this.lambdaValues.size - 1], value)
             } else if (bootstrapCtStateMerge(this.returns[this.current], value)) {
                 this.changed = true
+                this.markCallers(this.current)
             }
             return []
         }
@@ -528,6 +638,8 @@ class BootstrapCtState(
 
     fun noteGlobal(declaration: int): void {
         bootstrapCtStateMerge(this.itemGlobals[this.current], [declaration])
+        // The current item reads the declaration's taint.
+        bootstrapCtStateMerge(this.globalReaders[declaration], [this.current])
         this.reach(declaration)
         return
     }
@@ -685,6 +797,7 @@ class BootstrapCtState(
         val exact = this.exactTarget(expression, known)
         if (exact >= 0) known = [exact]
         val spread = bootstrapCtStateCopy(receiver)
+        this.noteElementsRead()
         bootstrapCtStateMerge(spread, this.elements)
         val mutator = bootstrapCtStateMutator(name)
         val taints = if (known.size == 0 || mutator)
@@ -698,10 +811,7 @@ class BootstrapCtState(
         if (known.size == 0 || mutator) bootstrapCtStateMerge(result, this.union(taints))
         for (item in known) {
             this.reach(item)
-            val self = "$item:this"
-            val existing = this.variables.get(self) ?? []
-            if (bootstrapCtStateMerge(existing, receiver)) this.changed = true
-            this.variables.set(self, existing)
+            this.mergeVariable(item, "$item:this", receiver)
             this.bindArguments(item, taints, 0)
             bootstrapCtStateMerge(result, this.returns[item])
         }
@@ -713,7 +823,7 @@ class BootstrapCtState(
         val children = expression.children
         if (this.bound(name)) {
             // A closure held in a local, called by value.
-            val callee = bootstrapCtStateCopy(this.variable(name))
+            val callee = this.variable(name)
             val taints = this.evaluateArguments(expression, 0)
             val arguments = this.union(taints)
             this.write(arguments, expression)
@@ -801,9 +911,13 @@ class BootstrapCtState(
         }
         val value = this.evaluate(body)
         if (item < this.declarations.size && this.isValue(this.declarations[item].kind)) {
-            if (bootstrapCtStateMerge(this.globalTaint[item], value)) this.changed = true
+            if (bootstrapCtStateMerge(this.globalTaint[item], value)) {
+                this.changed = true
+                this.markGlobalReaders(item)
+            }
         } else if (bootstrapCtStateMerge(this.returns[item], value)) {
             this.changed = true
+            this.markCallers(item)
         }
         return
     }
@@ -912,25 +1026,47 @@ fun bootstrapCtStateAnalyze(
             concrete.set(declaration.name, true)
         }
     }
+    // Which items wait for a walk: the sites, until their first one; then whatever something they read changed.
+    val dirty: array<bool> = []
+    val globalReaders: array<array<int>> = []
+    val callers: array<array<int>> = []
+    index = 0
+    while (index < count) {
+        dirty.append(reachedItems[index])
+        globalReaders.append([])
+        callers.append([])
+        index = index + 1
+    }
     val state = BootstrapCtState(
         declarations, library, itemDeclaration, itemMethod, byName, itemSource,
         itemLibrary, reachedItems, itemGlobals, itemCallees, globalTaint, Map(), returns,
         Map(), [], writers, ordinary, component, true, false, 0, [], [], Map(),
         methodTargets, concrete, bootstrapCtStateScalarFields(declarations), Map(),
-        bootstrapCtStateScalarFields(declarations, true)
+        bootstrapCtStateScalarFields(declarations, true), dirty, globalReaders, callers, Map(), []
     )
+    // A pass walks the items that wait for a walk (what an item reads is recorded as it is walked, and a change to it
+    // marks the item): the walks that would find nothing new are not made (#1022).
     var passes = 0
-    while (state.changed && passes < 64) {
-        state.changed = false
+    var pending = true
+    while (pending && passes < 64) {
         var item = 0
         while (item < count) {
-            if (state.reachedItems[item]) state.walk(item, itemBody[item])
+            if (state.reachedItems[item] && state.dirty[item]) {
+                state.dirty[item] = false
+                state.walk(item, itemBody[item])
+            }
             item = item + 1
         }
         passes = passes + 1
+        pending = false
+        item = 0
+        while (item < count) {
+            if (state.reachedItems[item] && state.dirty[item]) pending = true
+            item = item + 1
+        }
     }
     // Not converged: no write is ruled out.
-    if (state.changed) {
+    if (pending) {
         var unconverged = 0
         while (unconverged < declarations.size) {
             if (ordinary[unconverged] && writers[unconverged] == "") {
