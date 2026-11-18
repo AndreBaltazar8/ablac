@@ -37,6 +37,8 @@ rejected() { # $1 = case, then the texts its diagnostics must contain
 runs match 42
 grep -qx '10 12 1' "$output_directory/match.out" || { echo "extern-export: match printed:"; cat "$output_directory/match.out"; exit 1; }
 runs extern-only 5
+runs bool 7
+grep -qx "true false true" "$output_directory/bool.out" || { echo "extern-export: bool printed:"; cat "$output_directory/bool.out"; exit 1; }
 rejected bad-parameter 'extern.export-mismatch:mockDelay@' ':parameter1:i32:i64:' "$cases/bad-parameter.ab"
 rejected bad-count 'extern.export-mismatch:mockDelay@' ':parameters:2:1:' "$cases/bad-count.ab"
 rejected bad-result 'extern.export-mismatch:mockDelay@' ':result:i32:i64:' "$cases/bad-result.ab"
