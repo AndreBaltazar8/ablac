@@ -8192,6 +8192,81 @@ class BootstrapAnalyzer(
         return
     }
 
+    /** A program's `extern:"c"` declaration and its `@export` of the same symbol are one function to the linker,
+     *  so their signatures must be the same: the parameter count, each parameter's type and the result. (A C
+     *  prototype isn't checked against a definition, so a mismatch would otherwise link and misbehave.) The standard
+     *  library's own C declarations, a checked export (its ABI isn't the declared one), a method-style extern and an
+     *  extern with no export in the program are left alone. */
+    fun checkExternExports(parsed: BootstrapParseResult): void {
+        var externs = 0
+        for (declaration in parsed.declarations) {
+            if (declaration.kind == "extern" && declaration.externalLibrary == "c" && declaration.extensionOwner == "" &&
+                !bootstrapStandardLibraryModuleSource(bootstrapGenericSourceFile(declaration.sourceIdentity))) {
+                externs = externs + 1
+            }
+        }
+        if (externs == 0) return
+        val exported: Map<string, int> = Map()
+        var index = 0
+        while (index < parsed.declarations.size) {
+            val declaration = parsed.declarations[index]
+            if (declaration.kind == "fun" && declaration.extensionOwner == "") {
+                var annotation = 0
+                while (annotation < declaration.annotations.size && annotation < declaration.annotationArguments.size) {
+                    if (declaration.annotations[annotation] == "export") {
+                        val argument = declaration.annotationArguments[annotation]
+                        if (argument.kind == "string" && exported.get(argument.text) == null) {
+                            exported.set(argument.text, index)
+                        }
+                        if (argument.kind == "array") {
+                            for (child in argument.children) {
+                                if (child.kind == "string" && exported.get(child.text) == null) {
+                                    exported.set(child.text, index)
+                                }
+                            }
+                        }
+                    }
+                    annotation = annotation + 1
+                }
+            }
+            index = index + 1
+        }
+        for (declaration in parsed.declarations) {
+            if (declaration.kind != "extern" || declaration.externalLibrary != "c" || declaration.extensionOwner != "" ||
+                bootstrapStandardLibraryModuleSource(bootstrapGenericSourceFile(declaration.sourceIdentity))) continue
+            val symbol = bootstrapCanonicalDeclarationSourceName(declaration.name)
+            val found = exported.get(symbol)
+            if (found == null) continue
+            val definition = parsed.declarations[found]
+            var difference = ""
+            if (declaration.parameterTypes.size != definition.parameterTypes.size) {
+                difference = "parameters:${declaration.parameterTypes.size}:${definition.parameterTypes.size}"
+            } else {
+                var parameter = 0
+                while (parameter < declaration.parameterTypes.size && difference == "") {
+                    val declared = this.scalarValueType(declaration.parameterTypes[parameter])
+                    val defined = this.scalarValueType(definition.parameterTypes[parameter])
+                    if (declared != defined) {
+                        difference = "parameter${parameter + 1}:$declared:$defined"
+                    }
+                    parameter = parameter + 1
+                }
+            }
+            if (difference == "") {
+                val declared = this.scalarValueType(declaration.resultType)
+                val defined = this.scalarValueType(definition.resultType)
+                if (declared != defined) difference = "result:$declared:$defined"
+            }
+            if (difference != "") {
+                this.currentSourceIdentity = declaration.sourceIdentity
+                this.failAtOffset(
+                    "extern.export-mismatch:$symbol@${declaration.begin}:$difference:${declaration.sourceIdentity}:${definition.sourceIdentity}@${definition.begin}",
+                    declaration.begin
+                )
+            }
+        }
+    }
+
     fun scalarTypeUnderlying(name: string): string {
         var result = ""
         val declaration = this.typeDeclarations.find(name)
@@ -13124,6 +13199,7 @@ class BootstrapAnalyzer(
             }
             index = index + 1
         }
+        this.checkExternExports(parsed)
         index = 0
         while (index < parsed.declarations.size) {
             val declaration = parsed.declarations[index]

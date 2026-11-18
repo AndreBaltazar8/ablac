@@ -3015,6 +3015,14 @@ fun main: int = labs(-5)
 // exit: 5
 ```
 
+A program may define a symbol it also declares: an `@export("name")` function and an `extern:"c"` declaration of
+`name` are one function to the linker (a host test does this to stand in for a platform's native layer). The
+declaration and the definition must have the same signature, the same parameter count, parameter types and result
+(a nominal scalar is its underlying type), or the build fails with `extern.export-mismatch`, which names both
+places; a C prototype isn't checked against its definition, so a mismatch would otherwise link and misbehave. A
+declaration with no export in the program, and an export nobody declares, are as before. The standard library's own
+declarations, methods and `@exportChecked` functions (whose ABI isn't the declared one) aren't compared.
+
 ## Native declarations
 
 Prototype-compatible `extern:"c"` declarations are supported by the C ABI

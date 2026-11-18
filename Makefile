@@ -538,6 +538,7 @@ test-serial: ablac
 	tools/test-lambda-ordinal.sh $(COMPILER)
 	tools/test-lazy-root-frames.sh $(COMPILER)
 	tools/test-import-remap.sh $(COMPILER)
+	tools/test-extern-export.sh $(COMPILER)
 	tools/test-ownership-precision.sh $(COMPILER)
 	tools/test-when-subject-owner.sh $(COMPILER)
 	tools/test-elvis-container-loop.sh $(COMPILER)

@@ -118,6 +118,7 @@ only its parse errors.
 | `field.extension-reassigned:<T>.<f>` | a second assignment of an extension `val` (at run time; `E_EVAL_EXTENSION_REASSIGNED` under `#`) |
 | `name.private:<name>:<module>`, `E_NAME_PRIVATE` | another module's `private` declaration used here (through an alias: `E_NAME_PRIVATE`) ([modules](language.md#modules-and-imports)) |
 | `private.export:<f>` | `@export` on a `private` function |
+| `extern.export-mismatch:<symbol>@<offset>:<what>:<extern file>:<export file>@<offset>` | an `extern:"c"` declaration and an `@export` of the same symbol in one program with different signatures; `<what>` is `parameters:<declared>:<defined>`, `parameter<n>:<declared>:<defined>` or `result:<declared>:<defined>` ([language.md](language.md#trusted-native-implementations)) |
 | `interface.missing-member:<I>.<m>:<C>` | a class conforms to an interface, and no method, extension function or default body of the interface answers its member `m` ([interfaces](language.md#interfaces)) |
 | `interface.member-signature:<I>.<m>:<C>:<type>` | the class's method (or extension function) `m` takes other parameter types or modes, or returns another type, than the interface member's `<type>` |
 | `interface.member-untyped:<I>.<m>` | an interface member without a body and without a result type |
