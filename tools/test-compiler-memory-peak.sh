@@ -22,10 +22,13 @@ fi
 #
 # The compile is measured with the absolute path to src/orc_main.ab (the record's method) and with the path relative to the
 # project root: the semantic identities once carried the source path of every name and local, and an absolute path peaked
-# ~100 MB (6-7%) over a relative one (#814). The two are measured alternately, three rounds, so load that comes and goes
+# ~100 MB (6-7%) over a relative one (#814). The two are measured alternately, five rounds, so load that comes and goes
 # is on both; each takes the lowest of its runs. The absolute path may not peak more than 5% over the relative one: the
-# old compiler's gap is 6-7%, the fixed one's is -2%..+2%, and the lowest of three interleaved runs moves by about 1%
+# old compiler's gap is 6-7%, the fixed one's is -2%..+2%, and the lowest of five interleaved runs moves by about 1%
 # under suite load (the first version, the lower of two runs measured one kind after the other, saw +4.9% at load).
+# A source with the same text measured 1,689,700-1,730,964 kB on one machine across five runs of a commit (a 1.5-2% spread), and
+# 1,640,000-1,657,000 on another: the limits are 10% over and 20% under the last record line, so the lowest of five rounds (not three)
+# keeps a commit that did not move the peak from failing by luck of the load or of the checkout (see the record).
 measure() { # KIND ROUND: the peak resident kB of one compile, in the file named by the arguments
     local kind=$1 round=$2 input directory=$project_root
     input="$project_root/src/orc_main.ab"
@@ -43,7 +46,7 @@ measure() { # KIND ROUND: the peak resident kB of one compile, in the file named
 }
 peak=""
 relative_peak=""
-for round in 1 2 3; do
+for round in 1 2 3 4 5; do
     if (( round % 2 == 1 )); then first=absolute second=relative; else first=relative second=absolute; fi
     for kind in $first $second; do
         measured=$(measure "$kind" "$round")
