@@ -206,6 +206,10 @@ can't edit the library's imports. Rules:
 - Only the root manifest remaps. An `[imports]` table in any other manifest
   the build reaches is `E_IMPORT_REMAP_NOT_ROOT`: a library can't change what
   the program that links it imports.
+- A module that imports the replaced module gets the target, and what it declares against it (a function or
+  extension on the target's types) is the program's, however the program is named on the command line
+  (`ablac build main.ab` from its directory, or an absolute path) and whether the module's package is strict or not.
+  A shared module can therefore declare `fun Device.readWord()` against a stub that each program remaps to its backend.
 - The manifest is part of the build cache's identity, so changing a remap
   rebuilds. A remap that no import reaches changes nothing in the output.
 

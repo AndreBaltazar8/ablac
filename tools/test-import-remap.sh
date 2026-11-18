@@ -91,4 +91,32 @@ cmp "$output_directory/plain.ll" "$output_directory/remapped.ll" ||
 cmp "$output_directory/plain.ll" "$output_directory/empty.ll" ||
     { echo "import-remap: an empty [imports] changed the IR"; exit 1; }
 
+# A module that imports the remapped module sees the target: the extensions and functions it declares
+# against the target's types (a class and an alias) are the program's, wherever the program is started
+# from (a path relative to the working directory names the modules relative too), strict or flat.
+extension_cases="$project_root/tests/cases/import-remap-extension"
+compiler_path=$(realpath "$compiler")
+remapped_extension() { # $1 = label, $2 = directory of the case, $3 = how the program is named
+    local label=$1 directory=$2 entry=$3
+    (cd "$directory/app" && "$compiler_path" build "$entry" -o "$output_directory/ext-$label" --no-cache) \
+        > "$output_directory/ext-$label.err" 2>&1 ||
+        { echo "import-remap: the extension case ($label) didn't build"; cat "$output_directory/ext-$label.err"; exit 1; }
+    set +e
+    output=$("$output_directory/ext-$label")
+    status=$?
+    set -e
+    [[ $status == 42 && $output == "82 12 84" ]] ||
+        { echo "import-remap: the extension case ($label) exited $status and printed:"; echo "$output"; exit 1; }
+}
+cp -R "$extension_cases" "$output_directory/ext-strict"
+cp -R "$extension_cases" "$output_directory/ext-flat"
+rm "$output_directory/ext-flat/shared/abla.toml"
+remapped_extension strict-relative "$output_directory/ext-strict" main.ab
+remapped_extension strict-absolute "$output_directory/ext-strict" "$output_directory/ext-strict/app/main.ab"
+remapped_extension flat-relative "$output_directory/ext-flat" main.ab
+(cd "$output_directory/ext-strict" && "$compiler_path" build app/main.ab -o "$output_directory/ext-above" --no-cache) \
+    > "$output_directory/ext-above.err" 2>&1 ||
+    { echo "import-remap: the extension case didn't build from its parent directory"; cat "$output_directory/ext-above.err"; exit 1; }
+[[ $("$output_directory/ext-above") == "82 12 84" ]] || { echo "import-remap: the case built from its parent printed otherwise"; exit 1; }
+
 echo "import remap: ok"
