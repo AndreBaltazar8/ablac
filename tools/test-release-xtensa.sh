@@ -36,7 +36,7 @@ grep -q 'E_XTENSA_LLVM_MISSING' "$out/before.log" || fail "no E_XTENSA_LLVM_MISS
 grep -q "$prefix/bin/abla-install-xtensa" "$out/before.log" ||
     fail "the error does not name this toolchain's installer, $prefix/bin/abla-install-xtensa" "$out/before.log"
 
-"$prefix/bin/abla-install-xtensa" --version 23.1.3-1 > "$out/install.log" 2>&1 || fail "the install failed" "$out/install.log"
+"$prefix/bin/abla-install-xtensa" --version 23.1.3-2 > "$out/install.log" 2>&1 || fail "the install failed" "$out/install.log"
 "$prefix/bin/abla-install-xtensa" --verify >> "$out/install.log" 2>&1 || fail "the verify failed" "$out/install.log"
 
 # One object per (source, CPU, mode); the last two are the narrowing off and the optimized build.

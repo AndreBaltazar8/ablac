@@ -6,7 +6,7 @@ A released toolchain (v0.2.49 or later) builds Xtensa code once its optional com
 the Nix shell is needed:
 
 ```sh
-<toolchain>/bin/abla-install-xtensa --version 23.1.3-1     # a verified download, once per toolchain
+<toolchain>/bin/abla-install-xtensa --version 23.1.3-2     # a verified download, once per toolchain
 ABLA_ESP_CPU=esp32s3 <toolchain>/bin/ablac build main.ab -o main.o \
     --target-triple xtensa-esp-unknown-elf --object-format elf --emit object
 ```
@@ -57,9 +57,12 @@ enough to use it on Ubuntu 22.04. See the measured
 ## Optional portable companion
 
 André chose a separately versioned, optional download. It does not go into every
-Abla release or replace the parent LLVM or Clang. Revision
+Abla release or replace the parent LLVM or Clang. Revisions
 [23.1.3-1](https://github.com/AndreBaltazar8/llvm-project/releases/tag/abla-xtensa-llvm-23.1.3-1)
-is published for all three hosts, and explicit verified installation is implemented.
+and [23.1.3-2](https://github.com/AndreBaltazar8/llvm-project/releases/tag/abla-xtensa-llvm-23.1.3-2)
+are published for all three hosts, and explicit verified installation is implemented.
+23.1.3-2 is the default: it adds the scavenger's emergency slot for frames from 128 bytes (23.1.3-1's `llc` aborted on
+some functions); the catalog keeps -1 so existing installs still verify.
 The compiler routes Xtensa through that installed cohort from v0.2.49 on; releases up to
 v0.2.48 still require the older Nix setup. The routing change's validation is
 tracked in the [design and evidence](design/xtensa-companion.md).
@@ -93,7 +96,7 @@ From a packaged toolchain use its absolute path, without adding the companion's
 `bin` directory to `PATH`:
 
 ```sh
-/path/to/abla-toolchain/bin/abla-install-xtensa --version 23.1.3-1
+/path/to/abla-toolchain/bin/abla-install-xtensa --version 23.1.3-2
 /path/to/abla-toolchain/bin/abla-install-xtensa --verify
 ```
 
@@ -116,7 +119,7 @@ hosts and compares their output with the frozen Nix reference.
 The installer hashes the entire archive before extracting it, rejects links and
 special files, limits compressed and unpacked sizes, and checks the exact file
 set and every file's SHA-256 before running a helper. It installs a read-only
-revision under `lib/abla/xtensa-llvm/23.1.3-1` and atomically selects it with the
+revision under `lib/abla/xtensa-llvm/23.1.3-2` and atomically selects it with the
 relative `current` symlink. Old revisions remain intact. A failed install keeps
 the old selection; reinstalling the same revision fully verifies it first.
 

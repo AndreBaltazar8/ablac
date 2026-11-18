@@ -90,7 +90,7 @@ installable one: it names a Nix-store dynamic loader and finds libLLVM, libssl a
 through Nix-store RUNPATH entries, so it runs only where those store paths exist. Use the
 toolchain archive instead.
 The optional Xtensa companion is installed explicitly with the packaged native
-`bin/abla-install-xtensa --version 23.1.3-1`. It does not support HTTP proxies;
+`bin/abla-install-xtensa --version 23.1.3-2`. It does not support HTTP proxies;
 use `--archive PATH` with an archive downloaded by other means when needed.
 See [Xtensa installation](docs/llvm-xtensa.md#explicit-installation). With the companion a release builds Xtensa
 objects (`--target-triple xtensa-esp-unknown-elf --emit object`); linking them, boot/vector assembly and flashing still
