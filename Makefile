@@ -116,6 +116,7 @@ test-serial: ablac
 	tools/test-ct-wide-compare.sh $(COMPILER)
 	tools/test-ct-lift-objects.sh $(COMPILER)
 	tools/test-ct-self-exports.sh $(COMPILER)
+	tools/test-ct-lift-large.sh $(COMPILER)
 	tools/test-ct-threads-heap.sh $(COMPILER)
 	tools/test-ct-interp-runtime.sh $(COMPILER)
 	tools/test-ct-time-limit.sh $(COMPILER)

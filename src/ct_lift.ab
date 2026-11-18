@@ -53,7 +53,9 @@ class BootstrapLiftState(
     // The objects an object table built (bootstrapLiftEmitObjectTable): remembered with result -2 - entry, they
     // are read back as element `tableIndexes[entry]` of the array `tableArrays[entry]` (bootstrapLiftFound).
     val tableArrays: array<int> = [],
-    val tableIndexes: array<int> = []
+    val tableIndexes: array<int> = [],
+    // `values`' entries by identity (the first of a value is the one it is found by).
+    val index: BootstrapIdentityMap = BootstrapIdentityMap()
 )
 
 fun bootstrapLiftState(
@@ -163,13 +165,8 @@ fun bootstrapLiftEmitResult(
 }
 
 fun bootstrapLiftSeen(state: BootstrapLiftState, value: BootstrapEvalValue): int {
-    var found = -1
-    var index = 0
-    while (found < 0 && index < state.values.size) {
-        if (state.values[index] == value) found = state.results[index]
-        index = index + 1
-    }
-    found
+    val entry = state.index.get(value) ?? -1
+    if (entry >= 0) state.results[entry] else -1
 }
 
 fun bootstrapLiftRemember(
@@ -177,6 +174,7 @@ fun bootstrapLiftRemember(
     value: BootstrapEvalValue,
     result: int
 ): void {
+    if (state.index.get(value) == null) state.index.set(value, state.values.size)
     state.values.append(value)
     state.results.append(result)
 }
@@ -2013,13 +2011,22 @@ class BootstrapLiftRetyper(
     val declarations: array<BootstrapDeclaration>,
     val syntax: array<BootstrapExpression>,
     val memo: BootstrapLiftMemo,
-    var problem: string
+    var problem: string,
+    // Looked up once per retyper, not per value: a value of a large program has
+    // a scan of every declaration per element otherwise (#1022, minutes for a game).
+    val types: Map<string, string> = Map(),
+    val classes: Map<string, int> = Map(),
+    val classIds: Map<string, int> = Map(),
+    // Scans of the program's declarations made while typing (ABLA_COMPILE_EVAL_TRACE reports them).
+    var searches: int = 0
 )
 
-/** The raw aggregates typed so far and what each became. */
+/** The raw aggregates typed so far and what each became (`index` finds a raw
+ *  aggregate's entry by identity). */
 class BootstrapLiftMemo(
     val raw: array<BootstrapEvalValue>,
-    val typed: array<BootstrapEvalValue>
+    val typed: array<BootstrapEvalValue>,
+    val index: BootstrapIdentityMap = BootstrapIdentityMap()
 )
 
 fun bootstrapLiftRetyper(
@@ -2028,20 +2035,16 @@ fun bootstrapLiftRetyper(
 ): BootstrapLiftRetyper =
     BootstrapLiftRetyper(declarations, syntax, BootstrapLiftMemo([], []), "")
 
-fun bootstrapLiftRetypeKnown(retyper: BootstrapLiftRetyper, raw: BootstrapEvalValue): int {
-    var index = 0
-    while (index < retyper.memo.raw.size) {
-        if (retyper.memo.raw[index] == raw) return index
-        index = index + 1
-    }
-    -1
-}
+fun bootstrapLiftRetypeKnown(retyper: BootstrapLiftRetyper, raw: BootstrapEvalValue): int =
+    retyper.memo.index.get(raw) ?? -1
 
 fun bootstrapLiftRetypeRemember(
     var retyper: BootstrapLiftRetyper,
     raw: BootstrapEvalValue,
     typed: BootstrapEvalValue
 ): BootstrapEvalValue {
+    // The first entry of a raw aggregate is the one it is known by.
+    if (retyper.memo.index.get(raw) == null) retyper.memo.index.set(raw, retyper.memo.raw.size)
     retyper.memo.raw.append(raw)
     retyper.memo.typed.append(typed)
     typed
@@ -2064,16 +2067,49 @@ fun bootstrapLiftCanonicalInteger(word: int, type: string): int {
     word
 }
 
-fun bootstrapLiftRetypeType(declarations: array<BootstrapDeclaration>, type: string): string {
+fun bootstrapLiftRetypeType(var retyper: BootstrapLiftRetyper, type: string): string {
+    val cached = retyper.types.get(type)
+    if (cached != null) return cached
     var result = bootstrapBorrowElementType(bootstrapNormalizeType(type))
     var depth = 0
     while (depth < 16) {
-        val index = bootstrapLiftClassIndex(declarations, result)
-        if (index < 0 || declarations[index].kind != "type") return result
-        result = bootstrapNormalizeType(declarations[index].resultType)
+        val index = bootstrapLiftRetyperClassIndex(retyper, result)
+        if (index < 0 || retyper.declarations[index].kind != "type") break
+        result = bootstrapNormalizeType(retyper.declarations[index].resultType)
         depth = depth + 1
     }
+    retyper.types.set(type, result)
     result
+}
+
+/** bootstrapLiftClassIndex, once per name for a retyper. */
+fun bootstrapLiftRetyperClassIndex(var retyper: BootstrapLiftRetyper, type: string): int {
+    val cached = retyper.classes.get(type)
+    if (cached != null) return cached
+    retyper.searches += 1
+    val index = bootstrapLiftClassIndex(retyper.declarations, type)
+    retyper.classes.set(type, index)
+    index
+}
+
+/** The class whose stable id is `id` (as a native object carries it), or -1;
+ *  the first of an id wins. The table is built on first use. */
+fun bootstrapLiftRetyperClassOfId(var retyper: BootstrapLiftRetyper, id: string): int {
+    if (retyper.classIds.size == 0) {
+        retyper.searches += 1
+        var candidate = 0
+        while (candidate < retyper.declarations.size) {
+            val declaration = retyper.declarations[candidate]
+            if (declaration.kind == "class" && declaration.extensionOwner == "") {
+                val key = "${bootstrapLiftStableNameId(declaration.name)}"
+                if (retyper.classIds.get(key) == null) retyper.classIds.set(key, candidate)
+            }
+            candidate = candidate + 1
+        }
+        // Built: a program without classes still marks the table as built.
+        retyper.classIds.set("", -1)
+    }
+    retyper.classIds.get(id) ?? -1
 }
 
 /** `raw` (from native code or still untyped) as a value of static `type`. */
@@ -2082,7 +2118,7 @@ fun bootstrapLiftRetype(
     raw: BootstrapEvalValue,
     staticType: string
 ): BootstrapEvalValue {
-    val type = bootstrapLiftRetypeType(retyper.declarations, staticType)
+    val type = bootstrapLiftRetypeType(retyper, staticType)
     val kind = raw.kind
     if (kind.size < 4 || kind.slice(0, 4) != "raw.") {
         // Already typed (null, booleans, strings, void, invalid).
@@ -2183,18 +2219,9 @@ fun bootstrapLiftRetypeObject(
     type: string
 ): BootstrapEvalValue {
     // The class: the static one, else the one whose stable id the object carries.
-    var index = bootstrapLiftClassIndex(retyper.declarations, type)
+    var index = bootstrapLiftRetyperClassIndex(retyper, type)
     if (index < 0 || retyper.declarations[index].kind != "class") {
-        index = -1
-        var candidate = 0
-        while (index < 0 && candidate < retyper.declarations.size) {
-            val declaration = retyper.declarations[candidate]
-            if (declaration.kind == "class" && declaration.extensionOwner == "" &&
-                "${bootstrapLiftStableNameId(declaration.name)}" == raw.text) {
-                index = candidate
-            }
-            candidate = candidate + 1
-        }
+        index = if (raw.text == "") -1 else bootstrapLiftRetyperClassOfId(retyper, raw.text)
     }
     if (index < 0) {
         return bootstrapLiftRetypeFail(retyper,
@@ -2340,7 +2367,9 @@ class BootstrapCtDecoded(
     val ok: bool,
     val diagnostic: string,
     // Pass as BootstrapEvalResult.liftMemo (with `syntax` as its syntax).
-    val memo: BootstrapLiftMemo
+    val memo: BootstrapLiftMemo,
+    // The declaration searches typing it took (ABLA_COMPILE_EVAL_TRACE).
+    val searches: int = 0
 )
 
 /** A native result's reply bytes as the value the lift builds, read with the
@@ -2372,5 +2401,5 @@ fun bootstrapCtLiftDecode(
             retyper.memo
         )
     }
-    BootstrapCtDecoded(value, syntax, true, "", retyper.memo)
+    BootstrapCtDecoded(value, syntax, true, "", retyper.memo, retyper.searches)
 }
