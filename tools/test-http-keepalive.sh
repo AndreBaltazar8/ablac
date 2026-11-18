@@ -12,7 +12,9 @@ mkdir -p "$out"
 cd "$root"
 pid=""
 trap '[[ -z $pid ]] || kill -9 "$pid" 2>/dev/null || true' EXIT
-port=$((30000 + $$ % 20000))
+# Below the kernel's ephemeral range (32768 and up, ip_local_port_range): outgoing connections of the machine's other tests
+# take their source ports from there, and a port one of them holds (or holds in TIME_WAIT) cannot be bound.
+port=$((20000 + $$ % 10000))
 expected=$(printf 'GET /one keepalive-test text/x-test\n200 connects=1\nGET /two keepalive-test text/x-test\n200 connects=0\nGET /three keepalive-test text/x-test\n200 connects=0\n')
 for build in --fast ""; do
     # shellcheck disable=SC2086
