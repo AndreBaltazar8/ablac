@@ -18,9 +18,11 @@
 // compiler's `emutlsThreadEnd` by the compiler (abla/llvm/orc: llvmOrcInstallThreadEnd). A thread the runtime did not
 // start (a pthread of a host that calls an exported function, a thread of LLVM's or of the compiler's own) never reaches
 // that hook (#826):
-//  - On macOS the first table such a thread makes also stores a value under one pthread key whose destructor is
-//    `emutlsThreadEnd`, and the system runs it as the thread ends. Either end finds the cell empty once the other has run;
-//    a table made after the hook (a thread's last frees may use a thread-local) is registered again by its first use.
+//  - On macOS each table such a thread makes is also stored as the value under one pthread key whose destructor frees its
+//    argument (`emutlsKeyDestroy`), and the system runs it as the thread ends. The hook clears the value when it frees the
+//    table first, so either end frees a table once; a table made after the hook (a thread's last frees may use a
+//    thread-local) is stored again by its first use. The table comes from the value: the thread's own cell is a thread-local
+//    that the system may have ended before the destructor runs.
 //    The two pthread calls are libSystem's, always there on macOS, and the only imports this module has;
 //    tools/libc-imports-allowlist.txt (#806, Abla without libc) allows the Linux compiler no new libc import.
 //  - Elsewhere (Linux, with system calls only) each thread's first table is entered in a registry with the thread's id,
@@ -47,7 +49,7 @@ private trusted noescape extern:"intrinsic" fun ablaLinuxSyscall(
     argument5: int
 ): int
 private noescape extern:"c" fun pthread_key_create(key: i64, destructor: i64): i32
-private noescape extern:"c" fun pthread_setspecific(key: i32, value: i64): i32
+private noescape extern:"c" fun pthread_setspecific(key: i64, value: i64): i32
 
 private @runtimeImplementation trusted fun emutlsCounterAddress(): int = nativeStaticAllocate(8)
 
@@ -78,7 +80,7 @@ private @runtimeImplementation trusted fun emutlsKey(): int {
         if (ablaRuntimeAtomicCompareExchangeI64(cell, 0, -1) == 0) {
             val scratch = emutlsKeyScratch()
             if (pthread_key_create(scratch, nativeFunctionAddress(emutlsKeyDestroy)) != 0) ablaRuntimeTrap()
-            ablaRuntimeAtomicStoreI64(cell, (ablaRuntimeLoadI64(scratch) & 4294967295) + 1)
+            ablaRuntimeAtomicStoreI64(cell, ablaRuntimeLoadI64(scratch) + 1)
         }
         state = ablaRuntimeAtomicLoadI64(cell)
         while (state <= 0) state = ablaRuntimeAtomicLoadI64(cell)
@@ -86,10 +88,15 @@ private @runtimeImplementation trusted fun emutlsKey(): int {
     state - 1
 }
 
-// Runs as a thread that used a thread-local ends (the system clears the key's value first, so a thread that has run it
-// has nothing registered): the same as the runtime's thread-end hook, which it follows or replaces.
+// Runs as a thread that used a thread-local ends, with the key's value: the thread's table (the system clears the value
+// first, so it runs once per table; the runtime's thread-end hook clears it too, when it frees the table first). The table
+// comes from the value and not from the thread's own cell: that cell is a Mach-O thread-local, and the system may have ended
+// those already by the time a key's destructor runs. The cell is emptied as well, so a later use in this thread (another
+// destructor's) makes a new table instead of using this one.
 private @runtimeImplementation trusted fun emutlsKeyDestroy(value: int): void {
-    emutlsThreadEnd()
+    if (value == 0) return
+    ablaRuntimeStoreI64(emutlsTableCellAddress(), 0)
+    emutlsFreeTable(value)
     return
 }
 
@@ -262,13 +269,14 @@ trusted fun emutlsGetAddress(control: int): int {
     val first = table == 0
     if (first) {
         __ablaRuntimeSetThreadEndHook(nativeFunctionAddress(emutlsThreadEnd))
-        // Any non-null value makes the system call the destructor as the thread ends.
-        if (ablaHostIsMacOS() && pthread_setspecific(i32(emutlsKey()), 1) != 0) ablaRuntimeTrap()
     }
     val capacity = if (first) 0 else ablaRuntimeLoadI64(table)
     if (index > capacity) {
         table = emutlsGrow(table, capacity, index)
         ablaRuntimeStoreI64(cell, table)
+        // The table is the key's value, so the destructor that runs as the thread ends frees this one (a grown table replaces
+        // the old value).
+        if (ablaHostIsMacOS() && pthread_setspecific(emutlsKey(), table) != 0) ablaRuntimeTrap()
         if (first) {
             if (!ablaHostIsMacOS()) emutlsRegister(table)
         } else if (!ablaHostIsMacOS()) {
@@ -292,6 +300,8 @@ trusted fun emutlsThreadEnd(): void {
     val table = ablaRuntimeLoadI64(cell)
     if (table == 0) return
     ablaRuntimeStoreI64(cell, 0)
+    // The key's destructor must not free the table a second time.
+    if (ablaHostIsMacOS()) pthread_setspecific(emutlsKey(), 0)
     // Out of the registry first: a sweep must not find this thread's table freed twice.
     if (!ablaHostIsMacOS()) {
         val record = ablaRuntimeLoadI64(emutlsRecordCell())
