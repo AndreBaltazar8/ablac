@@ -58,6 +58,12 @@ compare_case() {
         rm -rf "$work"
         mkdir -p "$(dirname "$work")"
         cp -a "$work_template" "$work"
+        # A case that names a relative build/ directory of its own gets it here, in the tier's own tree: without it
+        # tests/cases/compiler-capture-process/main.ab fails its pid-file check in both tiers (the child cannot write
+        # build/compiler-capture-process/*.pid) and the tiers agree on the failure, which a directory appearing in one
+        # tier only turns into a mismatch. tools/test-compiler-capture-process.sh keeps the project's own build/ for
+        # its runs; nothing here touches it.
+        mkdir -p "$work/build/compiler-capture-process"
     }
     # A site blocked by design (tests/cases/ct-time-limit) stops at a short compile-time time limit in both tiers, with
     # the same E_CT_TIME_LIMIT, well before the wall limit kills the compiler (whose report differs from run to run).
@@ -116,6 +122,14 @@ export -f compare_case
 printf '%s\0' "${cases[@]}" |
     xargs -0 -n1 -P "${CT_BRIDGE_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}" \
         bash -c 'compare_case "$1"' compare_case
+# The capture case must pass in both tiers, not merely agree: a failed check's text ("check 11: failure=...") is in the output.
+for tier in interp bridge; do
+    if grep -q 'check [0-9]*: failure=' "$output_directory/loopback/compiler-capture-process_main.ab.$tier.ll"; then
+        grep -o 'check [0-9]*: failure=[^"]*' "$output_directory/loopback/compiler-capture-process_main.ab.$tier.ll" >&2
+        echo "ct-bridge: tests/cases/compiler-capture-process/main.ab failed one of its checks under $tier" >&2
+        exit 1
+    fi
+done
 
 # Native: shims for the whole compiler API, then a program calling them.
 ABLA_CT_BRIDGE_SHIMS_OUT="$output_directory/shims.ab" \
