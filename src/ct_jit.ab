@@ -1416,7 +1416,7 @@ fun bootstrapCtMayHoldResourceIn(
 
 // An owned global that stays the generation's alone for the pass: a TVar delegate, a global whose value holds
 // resources, a raw pointer or a closure (bootstrapCtGenerationOnly). The interpreter keeps none of them between evaluations, so nothing goes back to the journal after a native
-// call (the others do: bootstrapCtExchangeGlobals).
+// call (the others do: bootstrapCtFetchPending).
 fun bootstrapCtUnexchanged(declarations: array<BootstrapDeclaration>, index: int): bool {
     val declaration = declarations[index]
     if (bootstrapCtTVarDelegate(declaration)) return true
@@ -2086,8 +2086,8 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
         }
     }
     if (auto && ready > 0) ready = ready - bootstrapCtTrials(parsed, state)
-    // The owned globals go back to the interpreter's journal after every native call, as compile globals do
-    // (bootstrapCtExchangeGlobals): a later pass, or an interpreted evaluation of this one, reads the one value.
+    // The owned globals go back to the interpreter's journal when it next needs them after a native call, as compile
+    // globals do (bootstrapCtFetchPending): a later pass, or an interpreted evaluation of this one, reads the one value.
     var ownedIndex = 0
     while (ownedIndex < parsed.declarations.size) {
         var reachedByNative = false
@@ -2850,13 +2850,17 @@ var bootstrapCtPanicCaught: bool = false
 fun bootstrapCtIsI64(type: i64*): bool =
     LLVMGetTypeKind(type) == 8 && LLVMGetIntTypeWidth(type) == 64
 
-// A compile pass is over: its generation's code and memory go.
-fun bootstrapCtFinishPass(): void {
+// A compile pass is over: its generation's code and memory go. `another`: a round or pass of the same compilation
+// follows, so what the generation left pending goes to the journal first; at the compilation's end it is left
+// unread (bootstrapCtRetirePending).
+fun bootstrapCtFinishPass(another: bool = true): void {
     if (bootstrapCtNestedPasses > 0) {
         bootstrapCtNestedPasses = bootstrapCtNestedPasses - 1
         return
     }
     bootstrapCtPassActive = false
+    val fetched = bootstrapCtRetirePending(another)
+    if (fetched != "") bootstrapStageDriverDiagnostic("error[E_CT_JIT_RESULT]: $fetched\n")
     if (bootstrapCtGenerationLive) {
         val removed = bootstrapCtGenerationState.remove()
         bootstrapCtGenerationLive = false

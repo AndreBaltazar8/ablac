@@ -310,8 +310,9 @@ trusted fun bootstrapCtTryEvaluate(
     // that changed one since leaves this generation's copy stale.
     // A changed int or bool `compile var` goes back in through its setter; any other
     // change leaves the generation stale.
+    // (Globals still pending were neither read nor written since: either would have fetched them first.)
     for (global in bootstrapCtGlobals) {
-        if (global.getter != 0) {
+        if (!bootstrapCtPendingLive() && global.getter != 0) {
             val kept = bootstrapCompileGlobalLoad(global.key, declarations, [])
             if (bootstrapCompileGlobalEncode(kept) != global.exchanged &&
                 !bootstrapCtPushGlobal(global, kept)) {
@@ -362,8 +363,9 @@ trusted fun bootstrapCtTryEvaluate(
             }
         }
     }
-    if (called.how == 0) bootstrapCtExchangeGlobals(evaluator, site)
+    // (Kept first: the journal write would fetch what the call just left pending.)
     bootstrapKeepEvaluatorGlobals(evaluator)
+    if (called.how == 0) bootstrapCtLeavePending(declarations, site)
     BootstrapCtOutcome(true, "", BootstrapEvalResult(
         value,
         evaluator.errors,
@@ -376,42 +378,120 @@ trusted fun bootstrapCtTryEvaluate(
     ))
 }
 
-// After a call: the generation's compile globals as they now are, kept like the
-// interpreter keeps the globals an evaluation used.
-trusted fun bootstrapCtExchangeGlobals(var evaluator: BootstrapEvaluator,
-    site: BootstrapCtSite): void {
+// The generation's compile globals as a native call left them, which the interpreter's journal hasn't fetched yet
+// (bootstrapCtFetchPending): the site they were left after, and the declarations to type them back with ("": none
+// pending). The journal is only read at compile time (a run-time program starts from its globals' initializers), so
+// what no later evaluation reads is never encoded: the game client's offscreen run at compile time left the engine's
+// loaded models in `models`, gigabytes the build read back after its last site and never used (#1022).
+var bootstrapCtPendingSite: string = ""
+var bootstrapCtPendingDeclarations: array<BootstrapDeclaration> = []
+// Their keys: the journal fetches them when it reads or writes one.
+var bootstrapCtPendingKeys: array<string> = []
+// Why the pending globals can no longer be fetched ("" while they can): a later call of the generation stopped, or
+// the compilation ended (its generation went); a later read of one is then an error, not a stale value.
+var bootstrapCtPendingLost: string = ""
+// The `exchanged` text of a global whose pending value was dropped (a journal reset or rollback): no encoding is
+// this, so the next native site finds the journal's value changed and pushes it in, or leaves the generation.
+val BOOTSTRAP_CT_DROPPED = "!dropped"
+
+// After a call that returned: its compile globals are left pending, fetched when the journal is next read or written.
+fun bootstrapCtLeavePending(declarations: array<BootstrapDeclaration>, site: BootstrapCtSite): void {
+    val keys: array<string> = []
+    for (global in bootstrapCtGlobals) {
+        // (A global no entry of the generation reaches has no getter.)
+        if (global.getter != 0) keys.append(global.key)
+    }
+    if (keys.size == 0) return
+    bootstrapCtPendingSite = bootstrapCtSiteLabel(site)
+    bootstrapCtPendingDeclarations = declarations
+    bootstrapCtPendingKeys = keys
+    bootstrapCtPendingLost = ""
+    return
+}
+
+// Whether globals are pending that the journal can still fetch (the site-start check skips them).
+fun bootstrapCtPendingLive(): bool = bootstrapCtPendingSite != "" && bootstrapCtPendingLost == ""
+
+// The pending globals are forgotten without fetching them: the journal they would go to was reset or rolled back.
+fun bootstrapCtDropPending(): void {
+    if (bootstrapCtPendingSite == "") return
+    bootstrapCtPendingSite = ""
+    bootstrapCtPendingDeclarations = []
+    bootstrapCtPendingKeys = []
+    bootstrapCtPendingLost = ""
+    for (global in bootstrapCtGlobals) {
+        if (global.getter != 0) global.exchanged = BOOTSTRAP_CT_DROPPED
+    }
+    return
+}
+
+// bootstrapCtFetchPending when the journal reads or writes one of `keys` that is pending: other keys' values are the
+// interpreter's own, which no native value can share. (The build's other evaluations, constant initializers among
+// them, read and keep globals of their own.)
+trusted fun bootstrapCtFetchPendingFor(keys: array<string>): string {
+    if (bootstrapCtPendingSite == "") return ""
+    for (pending in bootstrapCtPendingKeys) {
+        for (key in keys) {
+            if (key == pending) return bootstrapCtFetchPending("the journal's use of $key")
+        }
+    }
+    ""
+}
+
+// A compilation or one of its rounds is over and its generation goes (ct_jit.ab, bootstrapCtFinishPass). `another`:
+// a round or pass of the same compilation follows, which reads the journal, so what is pending is fetched now; else
+// it is lost (a later read of it is an error). "" or the problem.
+trusted fun bootstrapCtRetirePending(another: bool): string {
+    if (!bootstrapCtPendingLive()) return ""
+    if (another) return bootstrapCtFetchPending("the next pass")
+    bootstrapCtPendingLost = "the compilation that left them ended first"
+    ""
+}
+
+// The pending globals go to the journal, all in one keep as after each call before, so values they share stay
+// shared: read through their getters and typed back. "" or the problem (the journal is then not written).
+trusted fun bootstrapCtFetchPending(cause: string): string {
+    if (bootstrapCtPendingSite == "") return ""
+    val site = bootstrapCtPendingSite
+    val declarations = bootstrapCtPendingDeclarations
+    bootstrapCtPendingSite = ""
+    bootstrapCtPendingDeclarations = []
+    bootstrapCtPendingKeys = []
+    if (bootstrapCtGuardAddress == 0 && bootstrapCtPendingLost == "")
+        bootstrapCtPendingLost = "the generation was retired first"
+    if (bootstrapCtPendingLost != "") {
+        bootstrapCtGenerationSpent = "compile globals could not be read back"
+        return "compile globals could not be read back after $site: $bootstrapCtPendingLost"
+    }
+    val keys: array<string> = []
+    val values: array<BootstrapEvalValue> = []
     var index = 0
     while (index < bootstrapCtGlobals.size) {
         val global = bootstrapCtGlobals[index]
-        // (A global no entry of the generation reaches has no getter.)
         val called = if (global.getter == 0) BootstrapCtCallResult(-1, 0)
             else bootstrapCtCall(global.getter)
         val reply = called.value
         if (called.how != 0 || reply == 0) {
             bootstrapCtGenerationSpent = "compile global ${global.key} could not be read back"
-            evaluator.recordEvaluatorDiagnostic(
-                "E_CT_JIT_RESULT",
-                "compile global ${global.key} could not be read back after ${bootstrapCtSiteLabel(site)}: " +
-                    bootstrapCtReadBackWhy(called.how)
-            )
-            evaluator.errors = evaluator.errors + 1
+            return "compile global ${global.key} could not be read back after $site: ${bootstrapCtReadBackWhy(called.how)}"
         } else if (reply > 0) {
             val text = bootstrapCtReadReply(reply)
             ablaUnsafeCallExact_I64_I64(bootstrapCtFreeAddress, reply)
-            val decoded = bootstrapCtLiftDecode(
-                text, global.type, evaluator.declarations, bootstrapCtFunctions
-            )
+            val decoded = bootstrapCtLiftDecode(text, global.type, declarations, bootstrapCtFunctions)
             if (decoded.ok) {
                 val kept = if (global.delegate == "") decoded.value
                     else bootstrapEvalDelegate(decoded.value, global.delegate == "var")
-                evaluator.globalKeys.append(global.key)
-                evaluator.globalValues.append(kept)
+                keys.append(global.key)
+                values.append(kept)
                 global.exchanged = bootstrapCompileGlobalEncode(kept)
             }
         }
         index = index + 1
     }
-    return
+    bootstrapCtNote("read back ${keys.size} compile globals left after $site, for $cause")
+    if (!bootstrapCompileGlobalsKeep(keys, values, [], declarations))
+        return "compile globals left after $site could not be kept"
+    ""
 }
 
 // Why a global's getter gave no value: how its call stopped (bootstrapCtCall's codes, told as a site's stop is), or
@@ -676,6 +756,9 @@ trusted fun bootstrapCtCall(entry: int, label: string = ""): BootstrapCtCallResu
     val how = stopped.load()
     val closed = stopped.close()
     if (how != 0) {
+        // (Its globals left pending by an earlier call can't be read from a spent generation. The stop is an error
+        // of its own, so the build fails whether or not a later evaluation would have read them.)
+        if (bootstrapCtPendingLive()) bootstrapCtPendingLost = "a later call of the generation stopped"
         bootstrapCtGenerationSpent = "an earlier compile-time evaluation of this pass stopped"
         if (threadsBefore > 0) bootstrapCtStopBesideThreads(threadsBefore, how, label)
     }
