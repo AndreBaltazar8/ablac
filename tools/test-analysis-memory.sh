@@ -32,7 +32,14 @@
 # to 2.23-2.38 GB (three runs), so its bound moved from 2,200,000 to 2,650,000 kB. The first analysis, which holds nothing, keeps the
 # compiler's step and its bound.
 #
-# The loop is bounded twice, because neither number alone follows the source as it grows. Its resident size, bound 2,650,000 kB (the lowest of
+# The step moved from 512 to 768 MB (1.5 times what the service holds, 120 bytes per byte of source, ceiling 768 MB: analysis_graph.ab). An edit
+# on the compiler's own source (a hub module's body, a session of three analyses less one over four alternating rounds): 6.8 s of CPU at 512
+# MB (2.25-2.31 GB peak), 5.2 s at 768 MB (2.45-2.65 GB), 5.5 s at 1,024 MB (3.02-3.04 GB), 5.8 s at 2,048 MB (4.5 GB), 3.3 s with no collection
+# (10 GB). The loop's bound moves from 2,650,000 to 3,300,000 kB. Record line: this test's loop of four analyses peaked at 2,908,308-2,980,868 kB
+# in four runs alone and 2,866,120 in a gate (2,230,000-2,380,000 at 512 MB), the session of three analyses above 2,450,000-2,650,000; the
+# bound is 10% over the highest. The cold analysis, which holds nothing, keeps the compiler's step and its bound.
+#
+# The loop is bounded twice, because neither number alone follows the source as it grows. Its resident size, bound 3,300,000 kB (the lowest of
 # two runs when the first is over it), is what an editor's machine pays; but it is not a stable measure (the same compiler peaked at 2.03 GB alone
 # and 2.29 GB in a loaded suite run: it is about twice the reachable heap, the rest is what the heap holds between collections). What the
 # loop must not do is keep the previous answer: so a third run, with ABLA_COMPILER_MEMORY_TRACE set, has the service collect the heap and
@@ -48,7 +55,7 @@ project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 [[ $compiler == /* ]] || compiler="$PWD/$compiler"
 output_directory="$project_root/build/analysis-memory"
 bound_kilobytes=2150000
-edit_bound_kilobytes=2650000
+edit_bound_kilobytes=3300000
 edit_retention_percent=135
 mkdir -p "$output_directory"
 if ! /usr/bin/env time --version >/dev/null 2>&1; then
