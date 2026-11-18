@@ -245,3 +245,31 @@ Not tables but the same kind of state, **inside** `BootstrapAnalyzer`, which sli
 from a walk over every declaration: the symbol table and its index (symbol numbering follows program order), the overload and
 generic probe tables, `inferredResults` (and its `settled` flag), the subparser registry, the compile-effect, mutable-receiver,
 affine and region summaries, `initEdges` (global initialization order), `clashesExplained`, the stack-depth-stopped sources.
+
+## Results (2026-11-18): the first slice, measured
+
+Everything below is on the compiler's own source (137 modules), a hub module's body edited, graph-v2 service, an edit's CPU taken as
+(a session of three analyses less a session of one) / 2, user+sys, three or four alternating rounds. The 10.5 s of the estimate above is
+gone: the service's collection step and the frozen heap landed first, and an edit costs about 6.7 s of CPU today.
+
+- **Where an edit goes** (a symbolized perf profile of an edit, 2,400 samples): the allocator and the collector are 46% (the free-list work
+  of `HeapAllocate`, `HeapConsolidate`, `HeapFromBins` and `HeapMerge` is 27%, sweep and marking 14%); nothing else is above 2%
+  (`bootstrapExpressionUsesStm` 1.9, `GenericRewriteExpression` 1.8, lexing 1.5, `GenericMayResolve` 1.5, ...). The profile is flat: no
+  stage is worth a rewrite by itself, and the 3.3 s the table above estimated for slice 1 assumed every stage per module.
+- **Typing the bodies** is about 1.3 s of an edit (`fun-bodies` 1.2 s, `method-bodies` 0.13 s of the final analysis, 0.3 s more in the probe
+  analyses). A switch that skipped the bodies of every module but the edited one took an edit from 6.8 to 4.3 s, but it also left the answer
+  without the rows of those bodies, so it overstated what replaying them saves.
+- **The effect log is sound.** After a body edit in a hub module, what each of the 36,788 bodies of the other modules appended to 15 of the
+  analyzer's accumulators (typed calls, resolved names, diagnostics, init edges, ...) was identical, in the same order. A demand inference
+  rolls everything back except the result type it sets (`ct_infer.ab`), so the bodies do not contaminate each other.
+- **A replay was built and checked** (src/body_replay.ab on the branch incremental-sema-1, wip commits): each body's effect recorded with a
+  hash of its prepared tree, put back when the hash and a fingerprint of everything outside the bodies (signatures, symbol types, summaries)
+  are unchanged, ids of moved declarations rewritten, a changed inferred result type falling back to the full analysis. ABLA_ANALYSIS_CHECK
+  agreed with a cold analysis on a hub edit (5,989 and 6,005 of 6,019 bodies put back). Held as ordinary objects the rows cost +460 MB of
+  peak and all the saving (the collector marks them at every collection); frozen per module (the frozen heap) an edit costs 6.15 s against
+  6.70 s (-8%), the cold analysis 1.6 s more (the copy), the peak 50-100 MB more. Not worth its risk: the branch is a reference.
+- **What did pay**: the collection step at 1.5 times what the service holds, up to 768 MB (editor-growth-768): an edit 6.8 -> 5.2 s (-24%),
+  peak 2.25 -> 2.45-2.65 GB (2.87-2.98 GB in the memory test's loop of four); and the allocator's merge-and-split churn (~20% of an edit,
+  and of builds) is the next item, in the runtime.
+- **The oracle** (ABLA_ANALYSIS_CHECK, tools/test-analysis-check.sh) landed with the first slice and stays: any later incremental work
+  (per-module pipeline stages, summaries) has a differential check ready.
