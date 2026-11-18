@@ -3682,7 +3682,12 @@ fun bootstrapBuildExtensionFieldDrops(
 fun bootstrapBuildDropFunction(
     type: string,
     declarations: array<BootstrapDeclaration>,
-    affineTypes: array<string>
+    affineTypes: array<string>,
+    // The lowered functions: the reachability walk keeps a class's `drop`
+    // only when the class is constructed, and a class that is only named as
+    // a field or element type (an empty array of it) has none to call; also
+    // what tells a class never constructed from a constructed one.
+    lowered: array<BootstrapIrFunction>
 ): BootstrapIrFunction {
     val instructions: array<BootstrapInstruction> = []
     val builder = BootstrapDropBuilder(instructions, 0, 0)
@@ -3817,7 +3822,26 @@ fun bootstrapBuildDropFunction(
             if (declaration.isResource) {
                 var method = 0
                 while (method < declaration.methods.size) {
+                    // The call is left out only for a class the program never constructs: no value of
+                    // it exists, so the drop cannot run. Any other missing `drop` stays a call without
+                    // a target, which the backend refuses (a skipped drop would leak or never close).
+                    var skip = false
                     if (declaration.methods[method].name == "drop") {
+                        var present = false
+                        var constructed = false
+                        for (candidate in lowered) {
+                            if (candidate.name == "${declaration.name}_drop") present = true
+                            if (!present && !constructed) {
+                                for (found in candidate.instructions) {
+                                    if ((found.opcode == "object.create" ||
+                                         found.opcode == "object.allocate") &&
+                                        found.text == declaration.name) constructed = true
+                                }
+                            }
+                        }
+                        skip = !present && !constructed
+                    }
+                    if (declaration.methods[method].name == "drop" && !skip) {
                         builder.emitMany(
                             "call",
                             [value],
@@ -3945,7 +3969,8 @@ fun bootstrapAppendDropFunctions(
         val drop = bootstrapBuildDropFunction(
             types[typeIndex],
             declarations,
-            affineTypes
+            affineTypes,
+            functions
         )
         errors = errors + drop.verificationErrors
         functions.append(drop)
