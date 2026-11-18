@@ -621,6 +621,9 @@ The rule is narrow:
 
 The scope changes what is asked, not what runs: the code runs in the site's native slice, and the native object cache is
 off for it like for every `network` site.
+The check is the static one: the capability analysis denies the program's own file, environment or clock use before the site runs, in every
+tier. The interpreter also keeps the scope while it runs a scope's code, and the native tier's compiler bridge lets provider calls through
+under `network`, because compiled code does not say which declaration called. `tools/test-compile-tls.sh` holds the denials in each tier.
 
 Without the grant, a native call is rejected before it runs
 (`compile.effect-denied:trusted.native`, or `E_COMPILE_NATIVE_DENIED` from a
