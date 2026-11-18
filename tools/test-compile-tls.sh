@@ -64,11 +64,13 @@ negative() { # <name> <expected error> <program>
     mkdir -p "$out/$name"
     printf 'compileCapabilities = ["network"]\n' > "$out/$name/abla.toml"
     cat > "$out/$name/main.ab"
-    if "$compiler" build "$out/$name/main.ab" -o "$out/$name/main" --no-cache > "$out/$name.log" 2>&1; then
-        echo "compile-tls: $name was built, expected $expected" >&2
+    for tier in interp jit auto; do
+    if ABLA_COMPILE_EVAL=$tier "$compiler" build "$out/$name/main.ab" -o "$out/$name/main" --no-cache > "$out/$name.$tier.log" 2>&1; then
+        echo "compile-tls: $name was built in tier $tier, expected $expected" >&2
         exit 1
     fi
-    grep -Fq "$expected" "$out/$name.log" || { echo "compile-tls: $name: expected $expected" >&2; cat "$out/$name.log" >&2; exit 1; }
+    grep -Fq "$expected" "$out/$name.$tier.log" || { echo "compile-tls: $name ($tier): expected $expected" >&2; cat "$out/$name.$tier.log" >&2; exit 1; }
+    done
 }
 negative nogrant 'compile.effect-denied:network' << EOF2
 import "abla/platform/host"
@@ -103,4 +105,16 @@ fun fetch(): string {
 }
 fun main(): int = if (#fetch() == "open") 42 else 1
 EOF2
-echo 'compile-tls: TLS 1.3 and 1.2 at compile time and run time with the network grant only, a wrong host name and an expired certificate refused, a closed port reported; without the grant, or with its own clock or environment read beside it, the build is denied'
+negative ownfile 'compile.effect-denied:filesystem.read' << EOF2
+import "abla/compiler"
+import "abla/fs"
+import "abla/platform/host"
+import "abla/platform/host/tls"
+#compilerGrant("network")
+fun fetch(): string {
+    val handle = ablaHostTlsOpenWithCa("localhost", $port13, 5000, "$out/good.pem")
+    if (handle < 0 || path("$out/good.pem").exists()) "refused" else "open"
+}
+fun main(): int = if (#fetch() == "open") 42 else 1
+EOF2
+echo 'compile-tls: TLS 1.3 and 1.2 at compile time and run time with the network grant only, a wrong host name and an expired certificate refused, a closed port reported; without the grant, or with its own file, clock or environment read beside it (in each tier), the build is denied'
