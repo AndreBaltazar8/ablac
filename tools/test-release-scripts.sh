@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tools/release-check.sh, release-convergence.sh, release-notes.sh, release-pin.sh and gate-release.sh (--dry-run) on a made-up release (no network, no gh):
+# tools/release-check.sh, release-convergence.sh, release-notes.sh, release-pin.sh and gate.sh and gate-release.sh (--dry-run) on a made-up release (no network, no gh):
 # what they accept, and each way they must refuse.
 set -euo pipefail
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -246,20 +246,57 @@ expect_fail "convergence notes of another tag" "$notes" v9.9.8 "$draft" --conver
 expect_fail "a draft that is not a notes draft" "$notes" v9.9.9 "$convergence_notes" --convergence "$convergence_notes" --out "$work/p5.md"
 expect_fail "a bad tag" "$notes" 9.9.9 "$draft" --convergence "$convergence_notes"
 
-# --- gate-release --dry-run: the slot's cores and jobs, the pinned seed, the full suite and the reproducibility check.
-gate=$project_root/tools/gate-release.sh
-"$gate" "$project_root" 3 --dry-run >"$work/gate.txt" 2>&1 || { cat "$work/gate.txt" >&2; fail "gate-release --dry-run failed"; }
-grep -q 'tools/bootstrap-compiler.sh build/gate/seed.bin' "$work/gate.txt" || fail "the gate does not take its seed from the pin"
-grep -q 'taskset -c 16-23 tools/build-self-hosted-release.sh build/gate/stage2 build/gate/stage3' "$work/gate.txt" || fail "slot 3 does not pin stage 3 to 16-23"
-grep -q 'RUN_TESTS_FULL=1 JOBS=8 taskset -c 16-23 tools/run-tests.sh' "$work/gate.txt" || fail "the suite is not the full one on slot 3's cores"
-grep -q 'test-reproducible-elsewhere.sh --self build/ablac.bin' "$work/gate.txt" || fail "the reproducibility check is missing"
-grep -q 'make self-rebuild' "$work/gate.txt" || fail "make self-rebuild is missing"
-grep -q '8-11' "$work/gate.txt" && fail "slot 3's gate touches slot 2's cores"
-gate_out=$("$gate" "$project_root" 2 --dry-run 2>&1); grep -q 'RUN_TESTS_FULL=1 JOBS=6 taskset -c 8-11,14-15 ' <<<"$gate_out" || fail "slot 2 is not 6 jobs on 8-11,14-15"
-gate_out=$(GATE_CPUS=0-1 GATE_JOBS=2 "$gate" "$project_root" 1 --dry-run 2>&1); grep -q 'RUN_TESTS_FULL=1 JOBS=2 taskset -c 0-1 ' <<<"$gate_out" || fail "GATE_CPUS and GATE_JOBS are not honoured"
+# --- gate.sh and gate-release.sh --dry-run, on two made-up trees: one with tools/bootstrap-stages.sh, one without.
+gate=$project_root/tools/gate.sh
+release_gate=$project_root/tools/gate-release.sh
+old_tree=$work/tree-old
+new_tree=$work/tree-new
+mkdir -p "$old_tree/tools" "$new_tree/tools"
+for tree in "$old_tree" "$new_tree"; do
+    printf '#!/bin/sh\nexit 0\n' >"$tree/tools/bootstrap-compiler.sh"
+    chmod +x "$tree/tools/bootstrap-compiler.sh"
+done
+printf '#!/bin/sh\nexit 0\n' >"$new_tree/tools/bootstrap-stages.sh"
+chmod +x "$new_tree/tools/bootstrap-stages.sh"
+# The regular gate, a tree without bootstrap-stages.sh: the pinned seed, three builds and a cmp, the suite (not the full one), no reproducibility check.
+out=$("$gate" "$old_tree" 3 --dry-run 2>&1) || { echo "$out" >&2; fail "gate --dry-run failed"; }
+grep -q 'tools/bootstrap-compiler.sh build/gate/seed.bin' <<<"$out" || fail "the gate does not take its seed from the pin"
+grep -q 'taskset -c 16-23 tools/build-self-hosted-release.sh build/gate/seed.bin build/gate/stage1' <<<"$out" || fail "stage 1 does not start from the seed on slot 3's cores"
+grep -q 'taskset -c 16-23 tools/build-self-hosted-release.sh build/gate/stage2 build/gate/stage3' <<<"$out" || fail "slot 3 does not pin stage 3 to 16-23"
+grep -q "cmp build/gate/stage2 build/gate/stage3 && echo 'stage2 == stage3'" <<<"$out" || fail "no cmp of stage 2 and 3 without bootstrap-stages.sh"
+grep -q 'bootstrap-stages' <<<"$out" && fail "a tree without bootstrap-stages.sh was given it"
+grep -q ' JOBS=8 taskset -c 16-23 tools/run-tests.sh' <<<"$out" || fail "the suite is not on slot 3's cores"
+grep -q 'RUN_TESTS_FULL' <<<"$out" && fail "the regular gate runs the full suite"
+grep -q 'reproducible-elsewhere' <<<"$out" && fail "the regular gate checks reproducibility"
+grep -q 'make self-rebuild' <<<"$out" || fail "make self-rebuild is missing"
+grep -q '8-11' <<<"$out" && fail "slot 3's gate touches slot 2's cores"
+# A tree with bootstrap-stages.sh: the quick stage 3, no separate stage builds.
+out=$("$gate" "$new_tree" 4 --dry-run 2>&1) || fail "gate --dry-run failed on a tree with bootstrap-stages.sh"
+grep -q 'taskset -c 24-31 tools/bootstrap-stages.sh build/gate/seed.bin build/gate$' <<<"$out" || { echo "$out" >&2; fail "the quick stages are not used (or --full is given) by the regular gate"; }
+grep -q 'build-self-hosted-release.sh' <<<"$out" && fail "a tree with bootstrap-stages.sh also builds the stages one by one"
+grep -q ' JOBS=8 taskset -c 24-31 tools/run-tests.sh' <<<"$out" || fail "slot 4 is not 8 jobs on 24-31"
+out5=$("$gate" "$new_tree" 5 --dry-run 2>&1)
+grep -q ' JOBS=8 taskset -c 20-27 tools/run-tests.sh' <<<"$out5" || fail "slot 5 is not 8 jobs on 20-27"
+# The release gate: --full stages, the full suite, reproducibility; gate-release.sh is gate.sh --release.
+out=$("$release_gate" "$new_tree" 1 --dry-run 2>&1) || fail "gate-release --dry-run failed"
+grep -q 'tools/bootstrap-stages.sh build/gate/seed.bin build/gate --full' <<<"$out" || fail "the release gate does not build stage 3 whole"
+grep -q 'RUN_TESTS_FULL=1 JOBS=8 taskset -c 0-7 tools/run-tests.sh' <<<"$out" || fail "the release gate's suite is not the full one"
+grep -q 'test-reproducible-elsewhere.sh --self build/ablac.bin' <<<"$out" || fail "the reproducibility check is missing"
+[[ $("$release_gate" "$old_tree" 2 --dry-run 2>&1) == "$("$gate" "$old_tree" 2 --release --dry-run 2>&1)" ]] || fail "gate-release.sh is not gate.sh --release"
+# The slot table.
+out=$("$gate" "$old_tree" 2 --dry-run 2>&1)
+grep -q ' JOBS=6 taskset -c 8-11,14-15 ' <<<"$out" || fail "slot 2 is not 6 jobs on 8-11,14-15"
+out=$(GATE_CPUS=0-1 GATE_JOBS=2 "$gate" "$old_tree" 1 --dry-run 2>&1)
+grep -q ' JOBS=2 taskset -c 0-1 ' <<<"$out" || fail "GATE_CPUS and GATE_JOBS are not honoured"
+for expected in '1: 0-7' '2: 8-11,14-15' '3: 16-23' '4: 24-31' 'efficiency cores' 'performance cores'; do
+    grep -q -- "$expected" "$gate" || fail "the slot table in gate.sh lost '$expected'"
+done
+# Nothing is written by a dry run, and the refusals.
+[[ ! -e $old_tree/build ]] || fail "a dry run wrote into the tree"
 expect_fail "a gate on a directory that is not a worktree" "$gate" "$work" 2 --dry-run
-expect_fail "a non-numeric slot" "$gate" "$project_root" two --dry-run
+expect_fail "a non-numeric slot" "$gate" "$old_tree" two --dry-run
 expect_fail "no arguments" "$gate"
+expect_fail "three positional arguments" "$gate" "$old_tree" 2 3 --dry-run
 
 # --- release-pin: a checkout pinned to v9.9.8 moves to v9.9.9.
 root=$work/root

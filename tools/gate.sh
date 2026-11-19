@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# The gate for one worktree: stage 1 from the bootstrap compiler the tree pins (tools/bootstrap-compiler.sh: the pinned release,
+# checksum-verified, kept as build/gate/seed.bin), stage 2 == stage 3 (tools/bootstrap-stages.sh when the tree has it: stage 3 is only
+# the compiler run, compared by bitcode; else three builds and a cmp), `make self-rebuild`, then the suite. Two chunks (the stage
+# builds and the self-rebuild; the suite) each queue for the shared full-test slot and then the build slot (fair-flock), so no
+# slot is held for more than one chunk. The progress is in <worktree>/build/gate/gate.log: the line `stage2 == stage3`, the
+# suite's `N passed, M failed in Xs`, and last `exit=<status>`. Run it through systemd-run (never nohup: it ignores SIGHUP and
+# breaks the signal-watch test).
+#
+#   tools/gate.sh <worktree> [slot] [--release] [--dry-run]
+#
+# The slot (default 2) picks the cores and jobs (all gates used to share cores 0-7):
+#   1: 0-7 (8 jobs)   2: 8-11,14-15 (6 jobs; cpus 12 and 13 are offline)   3: 16-23   4: 24-31   5: 20-27 (overlaps 3 and 4)
+# Core types (ablac-4e's measurements): cpus 0-15 are the performance cores (12 and 13 offline), cpus 16-31 the efficiency cores.
+# Slots 1 and 2 are P-cores; slots 3, 4 and 5 are E-cores, about 1.5x slower per test (37 s against 25 s for the same job), so a
+# timing-sensitive test sees slower cores there.
+# GATE_CPUS and GATE_JOBS override them; FAIR_FLOCK names the fair-flock script (default: novakind/tools/fair-flock beside the
+# projects directory).
+#
+# --release is the release gate (a release's Prepare commit): stage 3 is built whole and compared as an executable too, the suite
+# is the full one (RUN_TESTS_FULL=1), and the reproducible-elsewhere check runs on the finished compiler (tools/gate-release.sh
+# calls it so). --dry-run prints what each chunk would run, writes nothing and runs nothing.
+set -u
+dry=0
+release=0
+args=()
+for argument in "$@"; do
+    case $argument in
+        --dry-run) dry=1 ;;
+        --release) release=1 ;;
+        -h | --help) sed -n '2,/^set -u/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+        *) args+=("$argument") ;;
+    esac
+done
+((${#args[@]} >= 1 && ${#args[@]} <= 2)) || { echo "usage: tools/gate.sh <worktree> [slot] [--release] [--dry-run]" >&2; exit 2; }
+tree=${args[0]}
+n=${args[1]:-2}
+[[ -d $tree && -x $tree/tools/bootstrap-compiler.sh ]] || { echo "gate: $tree is not an ablac worktree" >&2; exit 2; }
+[[ $n =~ ^[0-9]+$ ]] || { echo "gate: the slot must be a number, got $n" >&2; exit 2; }
+tree=$(cd "$tree" && pwd)
+case $n in
+    1) cpus=0-7 jobs=8 ;;
+    2) cpus=8-11,14-15 jobs=6 ;;
+    3) cpus=16-23 jobs=8 ;;
+    4) cpus=24-31 jobs=8 ;;
+    5) cpus=20-27 jobs=8 ;;
+    *) cpus=0-7 jobs=8 ;;
+esac
+cpus=${GATE_CPUS:-$cpus}
+jobs=${GATE_JOBS:-$jobs}
+common=$(git -C "$tree" rev-parse --path-format=absolute --git-common-dir 2> /dev/null || echo "$tree/.git")   # <projects>/ablac/.git
+slot=${FAIR_FLOCK:-$(dirname -- "$(dirname -- "$common")")/novakind/tools/fair-flock}
+[[ -x $slot || $dry == 1 ]] || { echo "gate: no fair-flock at $slot (set FAIR_FLOCK)" >&2; exit 2; }
+log=$tree/build/gate/gate.log
+if ((dry)); then
+    log=/dev/null
+else
+    mkdir -p "$tree/build/gate"
+    [[ -e $tree/build/ablac ]] || ln -s ../tools/run-limited-compiler.sh "$tree/build/ablac"
+    echo "queued $(date -u +%FT%TZ) slot $n cpus $cpus jobs $jobs" > "$log"
+    # The seed: what the tree pins, checksum-verified; a seed left by an older pin is replaced.
+    seed=$tree/build/gate/seed.bin
+    if ! "$tree/tools/bootstrap-compiler.sh" "$seed" >> "$log" 2>&1; then
+        rm -f -- "$seed"
+        "$tree/tools/bootstrap-compiler.sh" "$seed" >> "$log" 2>&1 || { echo "gate: no bootstrap compiler (see $log)" >&2; echo "exit=1" >> "$log"; exit 1; }
+    fi
+fi
+
+# One chunk inside both slots, in the worktree's shell.
+step() { # name commands
+    if ((dry)); then
+        printf '== %s (slot %s, cpus %s, jobs %s, fair-flock %s)\n%s\n' "$1" "$n" "$cpus" "$jobs" "$slot" "$2"
+        return 0
+    fi
+    "$slot" --close /tmp/novakind-full-test.slot$n \
+        "$slot" --close /tmp/novakind-build.slot$n \
+        nix-shell "$tree/shell.nix" --run "
+        set -e
+        echo \"granted \$(date -u +%FT%TZ): $1\"
+        cd $tree
+        ulimit -Ss 8192
+        TIMEFORMAT='%R s'
+        $2
+        echo \"released \$(date -u +%FT%TZ): $1\"
+      " >> "$log" 2>&1
+}
+
+build() { echo "time taskset -c $cpus tools/build-self-hosted-release.sh $1 $2 src/orc_main.ab"; }
+
+seed_step='tools/bootstrap-compiler.sh build/gate/seed.bin'   # (a no-op when the seed there is the pinned one)
+if [[ -x $tree/tools/bootstrap-stages.sh ]]; then
+    stages="time taskset -c $cpus tools/bootstrap-stages.sh build/gate/seed.bin build/gate$( ((release)) && echo ' --full')"
+else
+    stages="$(build build/gate/seed.bin build/gate/stage1)
+        $(build build/gate/stage1 build/gate/stage2)
+        $(build build/gate/stage2 build/gate/stage3)
+        cmp build/gate/stage2 build/gate/stage3 && echo 'stage2 == stage3'"
+fi
+if ((release)); then
+    suite_env='RUN_TESTS_FULL=1 '
+else
+    suite_env=
+fi
+
+step builds "$seed_step
+        $stages
+        cp build/gate/stage2 build/ablac.bin
+        make self-rebuild" &&
+    step suite "rm -f build/test-logs/*.log 2>/dev/null || true; ${suite_env}JOBS=$jobs taskset -c $cpus tools/run-tests.sh" &&
+    if ((release)); then
+        step repro "time taskset -c $cpus tools/test-reproducible-elsewhere.sh --self build/ablac.bin
+        sha256sum build/gate/stage2
+        build/gate/stage2 --version"
+    fi
+rc=$?
+((dry)) || echo "exit=$rc" >> "$log"
+exit $rc
