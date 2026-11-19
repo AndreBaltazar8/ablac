@@ -1,0 +1,193 @@
+// The big-number code of abla/crypto/bignum (fused 32-bit Montgomery multiplication, 64-bit limbs where the target multiplies 64 x 64 -> 128 and the limb
+// count is even, a residue square and a window lookup on them) against the code it replaced (old-bignum.ab, unchanged): on random and extreme odd moduli
+// of every size from 1 to 70 limbs and the RSA sizes above, bit for bit the same
+//   - the prepared modulus block (modulus, inverse word, 2^2k mod it, 2^k mod it),
+//   - the Montgomery multiplication (operands below the modulus, zero, one, modulus - 1, all ones below it),
+//   - bnMultiply, bnEncode and bnDecode (which pick the 64-bit limbs from 16 limbs up),
+//   - the window lookup, and
+//   - the secret-exponent exponentiation (random exponents, zero, one, the largest, a single high bit) and the public-exponent one.
+// Prints "rsa-fast reference ok".
+import "abla/io"
+import "abla/crypto/bignum"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+import "abla/ct"
+import "./old-bignum.ab" as old
+
+var failures = 0
+var seed = 20261119
+
+fun fail(what: string): void {
+    failures = failures + 1
+    if (failures < 30) println("FAIL $what")
+    return
+}
+
+fun next(): int {
+    seed = (seed * 1103515245 + 12345) & 2147483647
+    (seed >> 16) & 255
+}
+
+fun random32(): int = next() | (next() << 8) | (next() << 16) | (next() << 24)
+
+trusted fun put(address: int, index: int, value: int): void = ablaUnsafeStoreU32(bnPointer(address + index * 4), value)
+trusted fun get(address: int, index: int): int = ablaUnsafeLoadU32(bnPointer(address + index * 4)) & 4294967295
+
+trusted fun same(a: int, b: int, words: int): bool {
+    for (i in 0 until words) if (get(a, i) != get(b, i)) return false
+    true
+}
+
+/** A random odd modulus of `words` limbs: kind 0 random with the top limb set, 1 with a small top limb, 2 all ones but a few low bits (carries everywhere),
+ *  3 a power of two minus a small number, 4 random limbs with a zero limb in the middle. */
+trusted fun modulusLimbs(into: int, words: int, kind: int): void {
+    for (i in 0 until words) put(into, i, random32())
+    if (kind == 0) put(into, words - 1, get(into, words - 1) | 2147483648)
+    if (kind == 1) put(into, words - 1, 1 + (next() & 7))
+    if (kind == 2) {
+        for (i in 0 until words) put(into, i, 4294967295)
+        put(into, 0, 4294967295 - 2 * (next() & 63))
+    }
+    if (kind == 3) {
+        for (i in 0 until words) put(into, i, 4294967295)
+        put(into, 0, 4294967295 - 2 * (next() & 1023))
+        put(into, words - 1, 2147483648 | (next() << 8) | 255)
+    }
+    if (kind == 4 && words > 2) {
+        put(into, words - 1, get(into, words - 1) | 2147483648)
+        put(into, words / 2, 0)
+    }
+    put(into, 0, get(into, 0) | 1)
+    // Never zero or one.
+    if (words == 1 && get(into, 0) < 3) put(into, 0, 3)
+}
+
+/** `out` below the modulus: random, or one of the edge values. */
+trusted fun operand(out: int, modulus: int, words: int, kind: int): void {
+    for (i in 0 until words) put(out, i, random32())
+    if (kind == 1) for (i in 0 until words) put(out, i, 0)
+    if (kind == 2) {
+        for (i in 0 until words) put(out, i, 0)
+        put(out, 0, 1)
+    }
+    if (kind == 3) {
+        // modulus - 1 (the modulus is odd: clear its low bit).
+        for (i in 0 until words) put(out, i, get(modulus, i))
+        put(out, 0, get(modulus, 0) - 1)
+    }
+    if (kind == 4) {
+        // modulus - 2 * (small): a value just below.
+        for (i in 0 until words) put(out, i, get(modulus, i))
+        put(out, 0, get(modulus, 0) - 1 - 2 * (next() & 15))
+    }
+    // Random: reduce by clearing top bits until below the modulus (compare from the top).
+    if (kind == 0 || kind == 5) {
+        var tries = 0
+        while (tries < 200 && !bnLessPublic(out, modulus, words)) {
+            put(out, words - 1, get(out, words - 1) >> 1)
+            tries = tries + 1
+        }
+        if (!bnLessPublic(out, modulus, words)) for (i in 0 until words) put(out, i, 0)
+    }
+}
+
+trusted fun blocks(words: int, kind: int): void {
+    val source = bnAllocate(words)
+    modulusLimbs(source, words, kind)
+    val bytes = bnAllocate(words)
+    bnToBytes(bytes, words * 4, source)
+    val fast = bnModulusFrom(bytes, words * 4, words)
+    val slow = old.bnModulusFrom(bytes, words * 4, words)
+    val label = "w=$words kind=$kind"
+    if (!same(fast.value(), slow.value(), words)) fail("$label modulus")
+    if (get(fast.inverse(), 0) != get(slow.inverse(), 0)) fail("$label inverse word")
+    if (!same(fast.square(), slow.square(), words)) fail("$label residue square")
+    if (!same(fast.one(), slow.one(), words)) fail("$label one")
+
+    val a = bnAllocate(words)
+    val b = bnAllocate(words)
+    val x = bnAllocate(words)
+    val y = bnAllocate(words)
+    val rounds = if (words > 40) 6 else 24
+    for (round in 0 until rounds) {
+        operand(a, fast.value(), words, if (round < 6) round else 0)
+        operand(b, fast.value(), words, if (round < 6) (round * 5 + 1) % 6 else 0)
+        // The raw multiplication and bnMultiply, bnEncode, bnDecode.
+        old.bnMultiply(slow, x, a, b)
+        bnMultiply(fast, y, a, b)
+        if (!same(x, y, words)) fail("$label bnMultiply round $round")
+        old.bnEncode(slow, x, a)
+        bnEncode(fast, y, a)
+        if (!same(x, y, words)) fail("$label bnEncode round $round")
+        old.bnDecode(slow, x, a)
+        bnDecode(fast, y, a)
+        if (!same(x, y, words)) fail("$label bnDecode round $round")
+        // In place (out is an operand).
+        bnCopy(x, a, words)
+        bnCopy(y, a, words)
+        old.bnMultiply(slow, x, x, b)
+        bnMultiply(fast, y, y, b)
+        if (!same(x, y, words)) fail("$label in place round $round")
+    }
+
+    // The window lookup: every index, 16 entries.
+    val table = bnAllocate(16 * words)
+    for (i in 0 until 16 * words) put(table, i, random32())
+    for (index in 0 until 16) {
+        old.bnLookup(x, table, 16, words, secretU32(u32(index)))
+        if (words % 2 == 0) bnLookup64(y, table, 16, words, secretU32(u32(index)))
+        else bnLookup(y, table, 16, words, secretU32(u32(index)))
+        if (!same(x, y, words)) fail("$label lookup $index")
+    }
+
+    // The exponentiations.
+    val exponent = bnAllocate(words)
+    val expRounds = if (words > 40) 2 else if (words > 20) 3 else 5
+    for (round in 0 until expRounds) {
+        operand(a, fast.value(), words, if (round == 1) 3 else if (round == 2) 2 else 0)
+        for (i in 0 until words) put(exponent, i, random32())
+        if (round == 1) for (i in 0 until words) put(exponent, i, if (i == words - 1) 2147483648 else 0)
+        if (round == 2) for (i in 0 until words) put(exponent, i, if (i == 0) 1 else 0)
+        if (round == 3) for (i in 0 until words) put(exponent, i, 4294967295)
+        if (round == 4) for (i in 0 until words) put(exponent, i, 0)
+        old.bnExpSecret(slow, x, a, exponent, words * 32)
+        bnExpSecret(fast, y, a, exponent, words * 32)
+        if (!same(x, y, words)) fail("$label bnExpSecret round $round")
+        // A bit count that is not a limb multiple.
+        if (words > 1) {
+            old.bnExpSecret(slow, x, a, exponent, words * 32 - 7)
+            bnExpSecret(fast, y, a, exponent, words * 32 - 7)
+            if (!same(x, y, words)) fail("$label bnExpSecret (bits - 7) round $round")
+        }
+    }
+    val publicExponent = "\x01\x00\x01"
+    operand(a, fast.value(), words, 0)
+    old.bnExpPublic(slow, x, a, publicExponent)
+    bnExpPublic(fast, y, a, publicExponent)
+    if (!same(x, y, words)) fail("$label bnExpPublic")
+
+    bnRelease(source, words)
+    bnRelease(bytes, words)
+    bnRelease(a, words)
+    bnRelease(b, words)
+    bnRelease(x, words)
+    bnRelease(y, words)
+    bnRelease(table, 16 * words)
+    bnRelease(exponent, words)
+    bnModulusRelease(fast)
+    old.bnModulusRelease(slow)
+}
+
+trusted fun main: int {
+    val sizes = [1, 2, 3, 4, 5, 7, 8, 9, 12, 15, 16, 17, 18, 24, 25, 31, 32, 33, 34, 48, 49, 64, 65, 70, 96]
+    for (words in sizes) {
+        for (kind in 0 until 5) {
+            // The larger sizes only a few kinds: the doubling that prepares a modulus is the cost.
+            if (words > 40 && kind > 2) continue
+            blocks(words, kind)
+        }
+    }
+    if (failures > 0) return 1
+    println("rsa-fast reference ok")
+    0
+}

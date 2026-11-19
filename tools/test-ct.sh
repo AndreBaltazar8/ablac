@@ -95,7 +95,7 @@ done
 while IFS= read -r spec; do fixtures+=("$spec"); done < "$cases/crypto-generated.good"
 # Xtensa passes later pointer parameters on the stack; its checker cannot yet
 # taint those parameters, so this separate-pointer shape is read on these ABIs.
-host_fixtures=(ct_fix_wide_separate:@0,@1,@2,@3,@5)
+host_fixtures=(ct_fix_wide_separate:@0,@1,@2,@3,@5 ct_fix_montgomery64:@0,@1,@2,@3 ct_fix_lookup64:0,@1,@2 ct_fix_residue64:@0,@1,@3)
 leaks=(ct_leak_branch:0 ct_leak_callee:0 ct_leak_callee_store:0 ct_leak_index:0 ct_leak_trap:0 ct_leak_compare:@0,@1 ct_leak_divide:0,1 ct_pbe_leak:@0 ct_x25519_leak_branch:0,@1,@2 ct_x25519_leak_index:@0,@1 ct_ed25519_leak_branch:0,@1,@2 ct_ed25519_leak_index:@0,@1 ct_leak_chacha_index:@0,@1 ct_leak_poly_branch:@0,@1 ct_leak_sha256:@0,@1,@2 ct_leak_sha512:@0,@1,@2)
 while IFS= read -r spec; do leaks+=("$spec"); done < "$cases/crypto-generated.leaks"
 
@@ -217,7 +217,7 @@ p256_read() { # object, architecture (default x86_64)
     local object=$1 arch=${2:-x86_64}
     local specs=(ct_p256_add:@0,@1,@2,@3 ct_p256_subtract:@0,@1,@2,@3 ct_p256_in_range:@0,@1 ct_p256_point_add:@0,@1,@2,@3,@4
         ct_p256_point_double:@0,@1,@2,@3 ct_p256_scalar_multiply:@0,@1,@2,@3,@4
-        ct_p256_multiply_plain:@0,@1,@2,@3,@4 ct_bn_exp_secret:@0,@1,@2,@3,@5
+        ct_p256_multiply_plain:@0,@1,@2,@3,@4 ct_bn_exp_secret:@0,@1,@2,@3,@5 ct_bn_exp_secret_odd:@0,@1,@2,@3,@5
         ct_p256_fadd:@0,@1,@2 ct_p256_fsub:@0,@1,@2 ct_p256_fmul:@0,@1,@2,@3 ct_p256_fixed_base:@0,@1,@2,@3,@4)
     $check --follow-calls "$arch" "$object" "${specs[@]}" > "$out/$arch-p256.log" 2>&1 || {
         cat "$out/$arch-p256.log" >&2; echo "ct: a secret reached a branch or an address in the P-256 cores on $arch" >&2; exit 1
