@@ -1451,7 +1451,8 @@ trusted fun bootstrapEmitCodegenUnit(
         if (exceptions) bootstrapSetLlvmWasmExceptions(true)
     } else if (status == 0 && llvmInitializeNativeTarget() != 0) status = 166
     var module = nullPointer
-    if (status == 0 && !bootstrapCodegenUnitStrip(lazy.load(), plan, index)) {
+    // (A compile-time generation's thread-locals are its in-session unit's: bootstrapCtAddGeneration.)
+    if (status == 0 && !bootstrapCodegenUnitStrip(lazy.load(), plan, index, if (kind == "native-jit") 1 else 0)) {
         LLVMDisposeModule(lazy.load())
         status = 2
     }
@@ -1468,8 +1469,15 @@ trusted fun bootstrapEmitCodegenUnit(
     }
     var machine = nullPointer
     var layout = nullPointer
+    // `native-jit`: a unit of a compile-time generation (ct_jit.ab), loaded into this host's ORC session, generated
+    // as LLJIT generates the whole module: for this CPU and its features, at the default level (the generation runs
+    // the program's compile-time code, often for a long time), position-independent (JIT memory is not in the low
+    // 2 GB that static code's 32-bit addresses reach). No unit holds a thread-local: JITLink takes no TLS relocation,
+    // and LLJIT emulates them, which no target machine made through the C API can.
+    val jit = kind == "native-jit"
     if (status == 0) {
         machine = if (wasm) LLVMCreateTargetMachine(target.load(), triple, "", "", 0, 1, 0)
+            else if (jit) LLVMCreateTargetMachine(target.load(), triple, llvmHostCpuName(), llvmHostCpuFeatures(), 2, 2, 0)
             else LLVMCreateTargetMachine(target.load(), triple, "generic", "", 0, 2, 0)
         if (pointerIsNull(machine)) status = 166
         else if (!wasm) LLVMSetTargetMachineGlobalISel(machine, 0)
@@ -1488,7 +1496,10 @@ trusted fun bootstrapEmitCodegenUnit(
         else {
             val start = LLVMGetBufferStart(bitcode)
             val size = LLVMGetBufferSize(bitcode)
-            val identity = "$kind $llvmTriple $salt"
+            // (A `native-jit` unit's machine is this host's: its CPU and features join the key, so a unit is never
+            // reused for another machine, nor across ordinary and compile-time builds, whose kinds differ.)
+            val identity = if (jit) "$kind $llvmTriple $salt ${llvmHostCpuName()} ${llvmHostCpuFeatures()}"
+                else "$kind $llvmTriple $salt"
             val first = bootstrapCodegenBytesHash(start, size, bootstrapCodegenTextHash(identity,
                 3))
             val second = bootstrapCodegenBytesHash(start, size, bootstrapCodegenTextHash(identity,

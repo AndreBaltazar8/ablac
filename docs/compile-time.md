@@ -1083,6 +1083,18 @@ a value is no part of any global's heap, whatever it was computed from.
   runs several times faster optimized and a small slice pays about 15% more
   code generation for it, a large one twice that. `ABLA_COMPILE_EVAL_PASSES=fast|balanced`
   chooses for every slice.
+- A generation of 60,000 IR instructions or more is cut into code generation
+  units after its passes, as an ordinary build is
+  ([toolchain.md](toolchain.md)): child compilers generate them at once, at the
+  same level, and the session loads their objects. A unit's object goes to the
+  code generation cache under a key that names this host's processor and the
+  JIT's machine, so it is never shared with an ordinary build. Functions that
+  use a thread-local stay in a small module that the session generates itself.
+  Splitting took a 72,000-instruction generation from 1.9 s to 0.6 s and the
+  5,326 functions of #1022 from 9.3 s to 3.3 s (1.4 s from the cache); below
+  50,000 the passes dominate and it neither gains nor costs. `ABLA_COMPILE_EVAL_UNITS=0`
+  keeps every generation one module; `ABLA_CODEGEN_UNITS_MINIMUM` changes the
+  threshold.
 
 ## Diagnostics
 

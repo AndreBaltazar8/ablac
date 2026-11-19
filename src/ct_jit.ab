@@ -35,6 +35,11 @@ import "backend/llvm/debug.ab"
 import "backend/llvm/bindings.ab"
 import "backend/llvm/analysis.ab"
 import "abla/text"
+import "abla/sys/linux"
+import "codegen_units.ab"
+import "toolchain.ab"
+import "jit_cache.ab"
+import "ct_tier.ab"
 
 // One ORC session for the process; one generation per compile pass that has sites.
 var bootstrapCtSessionLive: bool = false
@@ -2412,7 +2417,7 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
     // symbols as the interpreter's calls find them (ct_native.ab). Else a site calling one failed the
     // generation: "Symbols not found".
     val libraries = bootstrapCtNativeLibraries(parsed)
-    val added = bootstrapCtSessionState.addModule(context, module, bootstrapCtSlicePasses(program.functions.size))
+    val added = bootstrapCtAddGeneration(context, module, bootstrapCtSlicePasses(program.functions.size), generation)
     if (added.status != 0) {
         bootstrapCtFailReady("ORC rejected the slice (status ${added.status})")
         return
@@ -2478,6 +2483,86 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
     // What the slice cost, by phase (LLJIT compiles the module at its first lookup,
     // so "code" is machine code generation and linking).
     bootstrapCtNote("generation $generation: ${sliceDeclarations.size} declarations, ${program.functions.size} functions; preparation ${prepared - started} ms (with the write analysis), analysis ${analysisDone - prepared} ms, lowering ${loweringDone - analysisDone} ms, emission ${emissionDone - loweringDone} ms, code ${linuxMonotonicMilliseconds() - emissionDone} ms")
+}
+
+// A large generation is generated as code generation units (codegen_units.ab), by child compilers at once, and its
+// objects are loaded into the session; a small one is added as one module, which LLJIT generates on this thread.
+// LLJIT generated the client of #1022 (5,326 functions) in 9.5 s on one thread; split into 8 units at the same level,
+// in about 2 s. The cut is made after the slice's passes, as an ordinary build's is after its optimization, and a
+// unit's object goes to the code generation cache under a key of its module and of this host's machine (`native-jit`:
+// never an ordinary build's). ABLA_COMPILE_EVAL_UNITS=0 keeps every generation one module.
+//
+// Below BOOTSTRAP_CT_UNITS_MINIMUM instructions a generation is one module. Measured with chains of N functions
+// (code phase, cache off, one module against units): 24k-47k instructions (N 25-200, balanced passes) cost the same
+// either way, since the passes dominate; 72k went from 1.9 s to 0.6 s, 124k from 3.3 s to 0.7 s, 227k from 6.9 s to
+// 1.4 s. An ordinary build's minimum (150k) would leave the middle on one thread.
+val BOOTSTRAP_CT_UNITS_MINIMUM = 60000
+
+fun bootstrapCtAddGeneration(context: i64*, module: i64*, passes: string, generation: int): LlvmOrcGeneration {
+    val configured = linuxEnvironment("ABLA_COMPILE_EVAL_UNITS")
+    val wanted = !(configured.found && configured.value == "0")
+    val size = if (wanted) bootstrapCodegenModuleSize(module) else 0
+    val minimum = bootstrapCodegenEnvironmentCount("ABLA_CODEGEN_UNITS_MINIMUM", BOOTSTRAP_CT_UNITS_MINIMUM)
+    if (!wanted || bootstrapCodegenUnitCount() < 2 || size < minimum ||
+        !bootstrapCodegenThreadLocalUsers(module).supported) {
+        return bootstrapCtSessionState.addModule(context, module, passes)
+    }
+    val started = linuxMonotonicMilliseconds()
+    val nullPointer = nativeNullPointer()
+    var status = 0
+    if (passes != "") {
+        val options = LLVMCreatePassBuilderOptions()
+        status = llvmConsumeError(LLVMRunPasses(module, passes, nullPointer, options), 129)
+        LLVMDisposePassBuilderOptions(options)
+    }
+    val directory = "${bootstrapCacheDirectory()}/ct-units/${linuxProcessId()}-$generation"
+    Path(directory).removeTree()
+    if (status == 0 && !Path(directory).createDirectories()) status = 145
+    val objectPath = "$directory/generation"
+    // (The functions that use a thread-local go to one more unit, which this process cuts and the session generates:
+    // JITLink takes no TLS relocation, and LLJIT emulates thread-locals.)
+    val unitCounts = if (status == 0) bootstrapWriteCodegenUnits(module, objectPath, true) else []
+    if (status == 0 && unitCounts.size == 0) status = 145
+    LLVMDisposeModule(module)
+    LLVMContextDispose(context)
+    val counts: array<int> = []
+    var index = 0
+    while (index + 1 < unitCounts.size) {
+        counts.append(unitCounts[index])
+        index = index + 1
+    }
+    var session = BootstrapCodegenSessionUnit(0, nullPointer, nullPointer)
+    if (status == 0 && unitCounts[unitCounts.size - 1] > 0) {
+        session = bootstrapCodegenSessionUnit(objectPath, counts.size)
+        status = session.status
+    }
+    val written = linuxMonotonicMilliseconds()
+    val salt = "ct-${ctContentKey(jitCacheCompilerIdentity())}"
+    val places = BootstrapCodegenUnitPlaces(bootstrapCodegenCacheDirectory(bootstrapCacheDirectory()), salt)
+    var parts: array<string> = []
+    var entries: array<string> = []
+    if (status == 0) {
+        val generated = bootstrapGenerateCodegenUnits(
+            "native-jit", llvmDefaultTargetTriple(), objectPath, places, counts
+        )
+        status = generated.status
+        parts = generated.parts
+        entries = generated.entries
+    }
+    val unitsDone = linuxMonotonicMilliseconds()
+    val added = if (status == 0) bootstrapCtSessionState.addObjectFilesWith(parts, session.context, session.module)
+        else {
+            if (!pointerIsNull(session.module)) {
+                LLVMDisposeModule(session.module)
+                LLVMContextDispose(session.context)
+            }
+            LlvmOrcGeneration(nullPointer, status, true)
+        }
+    Path(directory).removeTree()
+    if (added.status == 0 && entries.size > 0) bootstrapCodegenSweepCache(places.cache, entries)
+    val inSession = if (unitCounts.size > 0) unitCounts[unitCounts.size - 1] else 0
+    bootstrapCtNote("generation $generation ($size instructions) in ${parts.size} units and $inSession functions in the session: passes and writing ${written - started} ms, units ${unitsDone - written} ms, loading ${linuxMonotonicMilliseconds() - unitsDone} ms${if (added.status != 0) " (failed: status ${added.status})" else ""}")
+    added
 }
 
 fun bootstrapCtLookup(symbol: string): int {

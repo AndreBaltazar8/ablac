@@ -486,6 +486,58 @@ fun LlvmOrcSession.addObjectBuffer(buffer: i64*): LlvmOrcGeneration {
     LlvmOrcGeneration(tracker, status, status != 0)
 }
 
+// Adds the object files at `paths` as one generation (one resource tracker, so
+// `remove` takes them all): the parts of a module generated elsewhere, which
+// link to each other. Status 120 when one cannot be read; on any failure none
+// stays added.
+fun LlvmOrcSession.addObjectFiles(paths: array<string>): LlvmOrcGeneration =
+    this.addObjectFilesWith(paths, nativeNullPointer(), nativeNullPointer())
+
+// addObjectFiles, with the IR `module` (of `context`, both consumed; none when
+// null) in the same generation: the part of a module generated elsewhere that
+// LLJIT generates itself (code with thread-locals, which it emulates).
+fun LlvmOrcSession.addObjectFilesWith(paths: array<string>, context: i64*, module: i64*): LlvmOrcGeneration {
+    val nullPointer = nativeNullPointer()
+    var status = if (this.closed || this.status != 0) 128 else 0
+    var tracker = nullPointer
+    if (status == 0) {
+        tracker = LLVMOrcJITDylibCreateResourceTracker(this.dylib)
+        if (pointerIsNull(tracker)) status = 124
+    }
+    if (!pointerIsNull(module)) {
+        if (status == 0) {
+            val threadContext = LLVMOrcCreateNewThreadSafeContextFromLLVMContext(context)
+            val threadModule = LLVMOrcCreateNewThreadSafeModule(module, threadContext)
+            // (Consumes the thread-safe module even on failure.)
+            status = llvmConsumeError(LLVMOrcLLJITAddLLVMIRModuleWithRT(this.jit, tracker, threadModule), 124)
+            LLVMOrcDisposeThreadSafeContext(threadContext)
+        } else {
+            LLVMDisposeModule(module)
+            LLVMContextDispose(context)
+        }
+    }
+    for (path in paths) {
+        if (status == 0) {
+            val buffer = nativePointerCell(nullPointer)
+            val message = nativePointerCell(nullPointer)
+            if (LLVMCreateMemoryBufferWithContentsOfFile(path, buffer.address, message.address) != 0) status = 120
+            if (!pointerIsNull(message.load())) LLVMDisposeMessage(message.load())
+            // (Consumes the buffer even on failure.)
+            if (status == 0) status = llvmConsumeError(
+                LLVMOrcLLJITAddObjectFileWithRT(this.jit, tracker, buffer.load()), 124
+            )
+            buffer.close()
+            message.close()
+        }
+    }
+    if (status != 0 && !pointerIsNull(tracker)) {
+        llvmConsumeError(LLVMOrcResourceTrackerRemove(tracker), 127)
+        LLVMOrcReleaseResourceTracker(tracker)
+        tracker = nullPointer
+    }
+    LlvmOrcGeneration(tracker, status, status != 0)
+}
+
 // Adds the object file at `path` (one `lookupCapturing` wrote, say) without
 // compiling anything: status 120 when it cannot be read.
 fun LlvmOrcSession.addObjectFile(path: string): LlvmOrcGeneration {

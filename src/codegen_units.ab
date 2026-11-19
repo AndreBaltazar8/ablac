@@ -415,8 +415,11 @@ trusted fun bootstrapCodegenAliasStub(module: i64*): i64* {
  *  every global variable is declared, the `llvm.*` arrays and the inline
  *  assembly go, and an alias of something this unit doesn't define is
  *  dropped (its uses name the alias's symbol, which its own unit defines).
+ *  `threadLocals` says where the thread-local globals are defined: 0, in unit 0 with the other data; 1, in no unit
+ *  (an object unit of a compile-time generation: unit 0 declares them); 2, in this unit (the generation's
+ *  in-session unit, which declares every other global).
  *  False when the plan doesn't fit the module. */
-trusted fun bootstrapCodegenUnitStrip(module: i64*, plan: array<int>, index: int): bool {
+trusted fun bootstrapCodegenUnitStrip(module: i64*, plan: array<int>, index: int, threadLocals: int = 0): bool {
     // (Addresses: a function's handle stays valid until it is replaced.)
     val others: array<int> = []
     var defined = 0
@@ -431,13 +434,25 @@ trusted fun bootstrapCodegenUnitStrip(module: i64*, plan: array<int>, index: int
     }
     if (defined != plan.size) return false
     for (other in others) bootstrapCodegenDeclareFunction(module, nativePointerFromAddress(other))
+    if (index == 0 && threadLocals == 1) {
+        var global = LLVMGetFirstGlobal(module)
+        while (!pointerIsNull(global)) {
+            if (LLVMIsThreadLocal(global) != i32(0) && LLVMIsDeclaration(global) == i32(0)) {
+                LLVMSetInitializer(global, nativeNullPointer())
+                LLVMSetLinkage(global, i32(0))
+                LLVMGlobalClearMetadata(global)
+            }
+            global = LLVMGetNextGlobal(global)
+        }
+    }
     if (index != 0) {
         val arrays: array<int> = []
         var global = LLVMGetFirstGlobal(module)
         while (!pointerIsNull(global)) {
             if (bootstrapCodegenLlvmName(bootstrapLlvmDebugValueName(global))) {
                 arrays.append(nativePointerAddress(global))
-            } else if (LLVMIsDeclaration(global) == i32(0)) {
+            } else if (LLVMIsDeclaration(global) == i32(0) &&
+                !(threadLocals == 2 && LLVMIsThreadLocal(global) != i32(0))) {
                 LLVMSetInitializer(global, nativeNullPointer())
                 LLVMSetLinkage(global, i32(0))
                 LLVMGlobalClearMetadata(global)
@@ -638,18 +653,119 @@ fun bootstrapCodegenSweepCache(cache: string, used: array<string>): void {
  *  has (the data's counts as one), or [] when they can't be written. The
  *  caller then disposes the module, so the children's copies don't add to it,
  *  and calls bootstrapRunCodegenUnits. */
-fun bootstrapWriteCodegenUnits(module: i64*, objectPath: string): array<int> {
+private noescape extern:"c" fun LLVMIsThreadLocal(global: i64*): i32
+private noescape extern:"c" fun LLVMIsAInstruction(value: i64*): i64*
+private noescape extern:"c" fun LLVMGetInstructionParent(instruction: i64*): i64*
+
+/** The functions of `module` that use one of its thread-local globals (directly or through a constant expression),
+ *  by address; `supported` is false when another global's initializer uses one. A compile-time generation's units
+ *  can't hold these (JITLink takes no TLS relocation, and LLJIT's own code emulates thread-locals), so they stay in
+ *  the generation's in-session module (bootstrapWriteCodegenUnits with `sessionThreadLocals`). */
+class BootstrapCodegenThreadLocalUsers(val supported: bool, val functions: Map<int, bool>)
+
+trusted fun bootstrapCodegenThreadLocalUsers(module: i64*): BootstrapCodegenThreadLocalUsers {
+    val functions: Map<int, bool> = Map()
+    var supported = true
+    var global = LLVMGetFirstGlobal(module)
+    while (!pointerIsNull(global)) {
+        if (LLVMIsThreadLocal(global) != i32(0) && !bootstrapCodegenCollectFunctionUsers(global, functions, 0)) {
+            supported = false
+        }
+        global = LLVMGetNextGlobal(global)
+    }
+    BootstrapCodegenThreadLocalUsers(supported, functions)
+}
+
+/** Adds the functions whose instructions use `value` (through constant expressions) to `functions`: false when a
+ *  global value's initializer uses it, or the constants nest too deep. */
+trusted fun bootstrapCodegenCollectFunctionUsers(value: i64*, var functions: Map<int, bool>, depth: int): bool {
+    if (depth > 16) return false
+    var use = LLVMGetFirstUse(value)
+    while (!pointerIsNull(use)) {
+        val user = LLVMGetUser(use)
+        if (!pointerIsNull(LLVMIsAInstruction(user))) {
+            functions.set(nativePointerAddress(LLVMGetBasicBlockParent(LLVMGetInstructionParent(user))), true)
+        } else if (!pointerIsNull(LLVMIsAGlobalValue(user)) ||
+            !bootstrapCodegenCollectFunctionUsers(user, functions, depth + 1)) return false
+        use = LLVMGetNextUse(use)
+    }
+    true
+}
+
+/** Writes the module and its plan for the unit children: the counts of functions per unit (unit 0 also counting the
+ *  data). With `sessionThreadLocals` (a compile-time generation, whose thread-local users bootstrapCodegenThreadLocalUsers
+ *  found supported), the functions that use a thread-local global go to one more unit, past the last
+ *  (bootstrapCodegenUnitCount() + 1), which no child generates: the caller cuts it out with bootstrapCodegenUnitStrip
+ *  (threadLocals 2) and adds it as IR; its count is the last of the counts. */
+fun bootstrapWriteCodegenUnits(module: i64*, objectPath: string, sessionThreadLocals: bool = false): array<int> {
     bootstrapCodegenUnitPromote(module)
     val units = bootstrapCodegenUnitCount()
     val counts: array<int> = [1]
     while (counts.size <= units) counts.append(0)
+    if (sessionThreadLocals) counts.append(0)
+    val assigned = bootstrapCodegenUnitPlan(module, units)
+    if (sessionThreadLocals) {
+        val users = bootstrapCodegenThreadLocalUsers(module).functions
+        var defined = 0
+        var function = LLVMGetFirstFunction(module)
+        while (!pointerIsNull(function)) {
+            if (LLVMIsDeclaration(function) == i32(0)) {
+                if (users.has(nativePointerAddress(function))) assigned[defined] = units + 1
+                defined = defined + 1
+            }
+            function = LLVMGetNextFunction(function)
+        }
+    }
     var plan = ""
-    for (unit in bootstrapCodegenUnitPlan(module, units)) {
+    for (unit in assigned) {
         plan = "$plan$unit\n"
         counts[unit] = counts[unit] + 1
     }
     if (LLVMWriteBitcodeToFile(module, "$objectPath.units.bc") == i32(0) &&
         Path("$objectPath.units.plan").writeText(plan)) counts else []
+}
+
+/** A unit cut out in this process (bootstrapCodegenSessionUnit): its module and context (null when status isn't 0). */
+class BootstrapCodegenSessionUnit(val status: int, val context: i64*, val module: i64*)
+
+/** Unit `index` of what bootstrapWriteCodegenUnits wrote for `objectPath` (with `sessionThreadLocals`), cut as a
+ *  child cuts its own (bootstrapEmitCodegenUnit), with the thread-locals defined (bootstrapCodegenUnitStrip, 2): the
+ *  in-session unit of a compile-time generation, in a context of its own. */
+trusted fun bootstrapCodegenSessionUnit(objectPath: string, index: int): BootstrapCodegenSessionUnit {
+    val nullPointer = nativeNullPointer()
+    val buffer = nativePointerCell(nullPointer)
+    val message = nativePointerCell(nullPointer)
+    val lazy = nativePointerCell(nullPointer)
+    val context = LLVMContextCreate()
+    LLVMContextSetDiscardValueNames(context, 1)
+    val plan = bootstrapReadCodegenUnitPlan("$objectPath.units.plan")
+    var status = 0
+    if (LLVMCreateMemoryBufferWithContentsOfFile("$objectPath.units.bc", buffer.address, message.address) != 0) {
+        status = 145
+    }
+    if (status == 0 && LLVMGetBitcodeModuleInContext2(context, buffer.load(), lazy.address) != 0) {
+        LLVMDisposeMemoryBuffer(buffer.load())
+        status = 145
+    }
+    var module = nullPointer
+    if (status == 0 && !bootstrapCodegenUnitStrip(lazy.load(), plan, index, 2)) {
+        LLVMDisposeModule(lazy.load())
+        status = 2
+    }
+    if (status == 0) {
+        module = LLVMModuleCreateWithNameInContext("session", context)
+        if (LLVMLinkModules2(module, lazy.load()) != 0) status = 145
+    }
+    if (!pointerIsNull(message.load())) LLVMDisposeMessage(message.load())
+    buffer.close()
+    message.close()
+    lazy.close()
+    if (status != 0) {
+        if (!pointerIsNull(module)) LLVMDisposeModule(module)
+        LLVMContextDispose(context)
+        return BootstrapCodegenSessionUnit(status, nullPointer, nullPointer)
+    }
+    BootstrapCodegenSessionUnit(0, context, module)
 }
 
 /** The plan bootstrapWriteCodegenUnits wrote to `path`, or [] when it can't
@@ -756,6 +872,27 @@ fun bootstrapRunCodegenUnits(
     places: BootstrapCodegenUnitPlaces,
     counts: array<int>
 ): int {
+    val generated = bootstrapGenerateCodegenUnits(kind, triple, objectPath, places, counts)
+    var status = generated.status
+    if (status == 0) status = bootstrapCodegenCombineUnits(kind, generated.parts, objectPath)
+    Path("$objectPath.units").removeTree()
+    if (status == 0 && generated.entries.size > 0) bootstrapCodegenSweepCache(places.cache, generated.entries)
+    status
+}
+
+/** What bootstrapGenerateCodegenUnits made: its status, each unit's object (`parts`, in `<objectPath>.units`, which
+ *  the caller removes) and the cache entries they used. */
+class BootstrapCodegenUnitParts(val status: int, val parts: array<string>, val entries: array<string>)
+
+/** The children of bootstrapRunCodegenUnits, without combining their objects: a compile-time generation
+ *  (ct_jit.ab) loads each into its session. */
+fun bootstrapGenerateCodegenUnits(
+    kind: string,
+    triple: string,
+    objectPath: string,
+    places: BootstrapCodegenUnitPlaces,
+    counts: array<int>
+): BootstrapCodegenUnitParts {
     val units = counts.size - 1
     val bitcodePath = "$objectPath.units.bc"
     val planPath = "$objectPath.units.plan"
@@ -812,8 +949,5 @@ fun bootstrapRunCodegenUnits(
         if (cached && generated !=
             "") linuxPrintStandardError("codegen units generated:$generated\n")
     }
-    if (status == 0) status = bootstrapCodegenCombineUnits(kind, parts, objectPath)
-    Path(directory).removeTree()
-    if (status == 0 && cached) bootstrapCodegenSweepCache(places.cache, entries)
-    status
+    BootstrapCodegenUnitParts(status, parts, if (cached) entries else [])
 }
