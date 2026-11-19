@@ -271,8 +271,12 @@ fun main {
 - Top-level `val`/`var` are initialized before `main` runs, in dependency
   order: a global whose initializer reads another global, directly or
   through the functions and methods it calls, in this module or another, is
-  initialized after it. Among globals ready at the same time the earliest
-  declared goes first, so independent globals keep declaration order. A
+  initialized after it. Otherwise globals keep declaration order: each one
+  is initialized in its turn, right after the globals it needs that aren't
+  initialized yet (earliest declared first). A global whose initializer
+  calls into the standard library still goes before the globals declared
+  after it, so `val seen = items.size` declared after `val filled = fill()`
+  sees what `fill()` appended. A
   cycle (`val a = b + 1` with `val b = a + 1`, also through functions or
   across modules) is a compile error, `global.initialization-cycle:a->b->a`,
   at run time and under `#` alike, so no initializer can see a global that

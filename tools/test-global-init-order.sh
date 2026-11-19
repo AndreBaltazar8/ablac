@@ -33,4 +33,12 @@ for template in floats call; do
         expect_42 "template $template under # ($mode)" "$output_root/staged-$template-$mode"
     done
 done
-echo "global init order: initializers see the values they read, also through the text writers templates call"
+# Independent globals keep declaration order when an initializer calls into the standard library (#1033).
+"$compiler" build stdlib-call.ab -o "$output_root/stdlib-call" --no-cache
+expect_42 "a standard-library call at run time" "$output_root/stdlib-call"
+for mode in interp jit; do
+    ABLA_COMPILE_EVAL=$mode "$compiler" build stdlib-call-sites.ab -o "$output_root/stdlib-call-sites-$mode" --no-cache
+    expect_42 "a standard-library call under # ($mode)" "$output_root/stdlib-call-sites-$mode"
+done
+echo "global init order: initializers see the values they read, also through the text writers templates call;" \
+    "independent globals keep declaration order"

@@ -1,7 +1,8 @@
 // Global initialization order: top-level values initialize in dependency
 // order. A value whose initializer reads another value, directly or through
 // the functions and methods it calls (in any module), initializes after it;
-// among values ready at the same time the earliest declared goes first. A
+// otherwise values keep declaration order, each right after the values it
+// needs that aren't initialized yet (earliest declared first). A
 // cycle is `global.initialization-cycle:a->b->a`, so no initializer (at run
 // time or under `#`) can read a value that isn't initialized yet.
 //
@@ -354,80 +355,48 @@ fun bootstrapInitialization(analyzer: BootstrapAnalyzer): BootstrapInitializatio
     if (cyclePaths.size > 0) {
         return BootstrapInitialization(order, cyclePaths, cycleSources, cycleBegins)
     }
-    // Kahn's order, the earliest declared ready value first.
-    val waiting: array<int> = []
-    val dependents: array<int> = []
-    val dependentStarts: array<int> = []
-    index = 0
-    while (index <= declarations.size) {
-        dependentStarts.append(0)
-        if (index < declarations.size) waiting.append(0)
-        index = index + 1
-    }
+    // Declaration order, each value just after the values it needs (#1033): a depth-first walk over the values in
+    // declaration order that places a value's dependencies, earliest declared first, before the value. Kahn's order
+    // (the earliest declared *ready* value first) let a value wait behind later ones whenever it needed a value
+    // declared late, as the standard library's are: `val filled = fill()` with a memorySetTrace call in fill() went
+    // after a later `val seen = items.size`, which then read the array before fill() wrote it. (No cycle is left
+    // here, so the walk ends.)
+    val placed: array<bool> = []
     index = 0
     while (index < declarations.size) {
-        var dependency = dependencyStarts[index]
-        while (dependency < dependencyStarts[index + 1]) {
-            val needed = dependencies[dependency]
-            waiting[index] = waiting[index] + 1
-            dependentStarts[needed + 1] = dependentStarts[needed + 1] + 1
-            dependency = dependency + 1
-        }
+        placed.append(false)
         index = index + 1
     }
+    // The walk's stack of values whose dependencies are being placed.
+    val walkValues: array<int> = []
     index = 0
     while (index < declarations.size) {
-        dependentStarts[index + 1] = dependentStarts[index + 1] + dependentStarts[index]
-        index = index + 1
-    }
-    val dependentFill: array<int> = []
-    index = 0
-    while (index < declarations.size) {
-        dependentFill.append(dependentStarts[index])
-        index = index + 1
-    }
-    while (dependents.size < dependentStarts[declarations.size]) dependents.append(0)
-    index = 0
-    while (index < declarations.size) {
-        var dependency = dependencyStarts[index]
-        while (dependency < dependencyStarts[index + 1]) {
-            val needed = dependencies[dependency]
-            dependents[dependentFill[needed]] = index
-            dependentFill[needed] = dependentFill[needed] + 1
-            dependency = dependency + 1
-        }
-        index = index + 1
-    }
-    // `ready` is kept sorted, so its front is the earliest declared.
-    val ready: array<int> = []
-    index = 0
-    while (index < declarations.size) {
-        if (isValue[index] && waiting[index] == 0) ready.append(index)
-        index = index + 1
-    }
-    var front = 0
-    while (front < ready.size) {
-        val value = ready[front]
-        front = front + 1
-        if (declarations[value].kind == "val" || declarations[value].kind == "var") {
-            order.append(value)
-        }
-        var dependent = dependentStarts[value]
-        while (dependent < dependentStarts[value + 1]) {
-            val waiter = dependents[dependent]
-            waiting[waiter] = waiting[waiter] - 1
-            if (waiting[waiter] == 0) {
-                // Insert in order among the values not taken yet.
-                ready.append(waiter)
-                var slot = ready.size - 1
-                while (slot > front && ready[slot - 1] > waiter) {
-                    ready[slot] = ready[slot - 1]
-                    slot = slot - 1
+        if (isValue[index] && !placed[index]) {
+            placed[index] = true
+            walkValues.append(index)
+            while (walkValues.size > 0) {
+                val top = walkValues.size - 1
+                val value = walkValues[top]
+                // Its next dependency not placed yet, in declaration order (the lists are in walk order).
+                var pick = -1
+                var at = dependencyStarts[value]
+                while (at < dependencyStarts[value + 1]) {
+                    val needed = dependencies[at]
+                    if (needed != value && !placed[needed] && (pick < 0 || needed < pick)) pick = needed
+                    at = at + 1
                 }
-                ready[slot] = waiter
+                if (pick >= 0) {
+                    placed[pick] = true
+                    walkValues.append(pick)
+                } else {
+                    walkValues.truncate(top)
+                    if (declarations[value].kind == "val" || declarations[value].kind == "var") {
+                        order.append(value)
+                    }
+                }
             }
-            dependent = dependent + 1
         }
+        index = index + 1
     }
     BootstrapInitialization(
         order, cyclePaths, cycleSources, cycleBegins, dependencyStarts, dependencies
