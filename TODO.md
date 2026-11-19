@@ -2695,6 +2695,15 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   new constant-time fixtures on four targets): estimated 1.6x on X25519 and Ed25519, about 20% of a TLS 1.3 server handshake. Not worth a rewritten constant-time
   core now; revisit if handshakes per second on small machines becomes the limit. The benchmark is `tests/cases/tls-pure/handshake-bench.ab`.
 
+- **Hardware SHA-256 (x86 SHA-NI, ARMv8 SHA2) behind a runtime CPU check (2026-11-19): sized, not built.** It is compiler work like the CLMUL path: the intrinsic names in
+  `src/simd_types.ab` and their type rules in `src/sema.ab`, the LLVM lowering in `src/backend/llvm/simd.ab` (`llvm.x86.sha256rnds2`, `sha256msg1`, `sha256msg2`;
+  `llvm.aarch64.crypto.sha256h`, `sha256h2`, `sha256su0`, `sha256su1`), a `@target` feature "sha" (`+sha,+sse4.1,+ssse3` / `+sha2`), the runtime check in
+  `abla/simd/target` (cpuid leaf 7 bit 29; AArch64 hwcap), a compile-time-interpreter fallback for each intrinsic (the tiers must agree), the block function in the
+  stdlib for both ISAs (about 60 and 40 lines), `tools/ct/check` decoding and tainting the new instructions or refusing them, and tests of both paths (every known answer
+  and a differential, the software path forced). `src/` changes mean two-stage validation. About 700-900 lines in all. Gain: SHA-256 compression is about 10% of a TLS 1.3
+  server handshake before the wrapper fix (`fa1accaf`) and less after it, so 6-8% per handshake, and 5-10x on bulk SHA-256 (PBKDF2, content hashing). Decided not worth
+  it for handshakes alone (ablac-74, 2026-11-19); worth reopening if bulk SHA-256 hashing becomes a cost somewhere.
+
 - **#762 serving compile-time action results from a record: correct, but 8-9% where 15% was the bar**
   (2026-11-11, branches `action-record` / `action-serve` local, rebased copy `action-serve-m` at `f52deee5` on master `b404276a`; the
   journal itself, step (a), is on master). Design: (a) an ordered journal of every compiler-API call an evaluation
