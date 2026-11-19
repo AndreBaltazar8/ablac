@@ -1716,6 +1716,19 @@ mmap form) apply there.
 
 ## Compile time and memory
 
+- [ ] **Deferred: a compile-time generation reused across edits (#1022; decided 2026-11-19 with the lead).** The idea: key a
+  generation by its slice (the declarations and support it lowers, the standard-library sources among them, the compile
+  globals it reads, the compiler binary's identity and the host machine), and on a hit load its objects and skip the write
+  analysis, analysis, lowering and emission. Not built, because it would rarely hit where it pays: the game client's slice
+  is the whole game (`nativeRun` reaches 5,327 functions, 8,423 declarations), so almost any edit of the client is inside it
+  and must miss, while an unchanged build is the build cache's already. The programs whose `#` sites reach little would hit,
+  and their generations cost 0.3 to 2.5 s, mostly passes. Keys by whole file are simple but miss on an edit to an unreached
+  function of a reached file; keys by declaration would hit there and need the slice's text per declaration. Revisit when a
+  program has a large slice that stays stable while the code around it changes (a compile-time asset baker, say). Safeguards
+  agreed if it is built: capability sites that already disable the object cache (filesystem.read, environment, network) also
+  disable it, a trace line says hit or miss and why, `ABLA_COMPILE_EVAL_CACHE=0` turns it off, and a negative test edits a
+  standard-library function the slice uses and expects a miss.
+
 - [x] **Cached small blocks cannot be reused for another size (closed 2026-11-16, see the last paragraph).** The native lists
   (`__ablaRuntimeHostSmallLists`) use an adaptive 32 MiB floor and 128 MiB ceiling;
   the compiler explicitly caps them at 32 MiB. A smaller budget does not evict
