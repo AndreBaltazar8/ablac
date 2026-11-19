@@ -135,7 +135,7 @@ check_run() { # run id [notes file]: the PASS or FAIL line for one run
 
 if [[ $mode == verify ]]; then
     if [[ -n $comparison ]]; then
-        result=$(verify_file "$comparison")
+        result=$(verify_file "$comparison" "$notes")   # (writes the release-notes text when --notes is given)
         printf '%s\n' "$result"
         [[ $result == PASS* ]]
         exit $?

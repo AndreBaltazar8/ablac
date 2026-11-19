@@ -21,7 +21,7 @@
 #                         release below <tag>)
 #   --assets-from FILE    the expected asset names, one per line, instead of asking GitHub
 #   --source-ref SHA      the commit the release is made from, for the convergence check (default: the commit
-#                         <tag> already names)
+#                         <tag> already names; while the tag does not exist yet, the head sha of the run <run-id>)
 #   --convergence-run ID  the bootstrap-convergence workflow run to check (default: the newest green one that matches)
 #   --convergence-comparison FILE
 #                         a downloaded comparison.json to check instead (with --lineage, no gh is needed)
@@ -229,6 +229,17 @@ else
 fi
 
 # 5. convergence: the historical-seed bootstrap routes agree on this release's source (required).
+# The source commit: --source-ref, else the commit the tag names (release-convergence.sh reads it), else, while the tag
+# does not exist yet, the commit the publish-off run built (its head sha; the run is dispatched on the ref the Prepare
+# commit is on), else release-convergence.sh fails with a message that names --source-ref.
+source_note=
+if [[ -z $source_ref ]] && ! gh api "repos/$repo/commits/$tag" --jq .sha >/dev/null 2>&1; then
+    run_sha=$(gh run view "$run_id" -R "$repo" --json headSha --jq .headSha 2>/dev/null || true)
+    if [[ $run_sha =~ ^[0-9a-f]{40}$ ]]; then
+        source_ref=$run_sha
+        source_note=" [source $run_sha: run $run_id's head, $tag does not exist yet]"
+    fi
+fi
 convergence_args=(verify "$tag" --repo "$repo")
 [[ -z $source_ref ]] || convergence_args+=(--source-ref "$source_ref")
 [[ -z $lineage ]] || convergence_args+=(--lineage "$lineage")
@@ -236,9 +247,9 @@ convergence_args=(verify "$tag" --repo "$repo")
 [[ -z $convergence_comparison ]] || convergence_args+=(--comparison "$convergence_comparison")
 convergence=$("$(dirname -- "${BASH_SOURCE[0]}")/release-convergence.sh" "${convergence_args[@]}" 2>&1 | tail -n 1)
 if [[ $convergence == PASS* ]]; then
-    report PASS convergence "${convergence#PASS  convergence }"
+    report PASS convergence "${convergence#PASS  convergence }$source_note"
 else
-    report FAIL convergence "${convergence#FAIL  convergence }"
+    report FAIL convergence "${convergence#FAIL  convergence }$source_note"
 fi
 
 printf 'release-check %s  run %s  %s\n' "$tag" "$run_id" "$out"

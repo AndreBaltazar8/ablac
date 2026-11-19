@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tools/release-check.sh, tools/release-convergence.sh and tools/release-pin.sh on a made-up release (no network, no gh):
+# tools/release-check.sh, release-convergence.sh, release-notes.sh, release-pin.sh and gate-release.sh (--dry-run) on a made-up release (no network, no gh):
 # what they accept, and each way they must refuse.
 set -euo pipefail
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -170,6 +170,96 @@ expect_fail "release-convergence run without a source commit" env PATH="$no_gh:$
 out2=$work/out-again
 "$check" v9.9.9 1 "$stage2" --artifacts "$release" --assets-from "$work/names.txt" --out "$out2" "${convergence_flags[@]}" >/dev/null || fail "release-check refused a first run"
 "$check" v9.9.9 1 "$stage2" --artifacts "$release" --assets-from "$work/names.txt" --out "$out2" "${convergence_flags[@]}" >/dev/null || fail "release-check refused its own directory"
+
+# --- release-check, a tag that does not exist yet: the source commit is the head sha of the publish-off run.
+fake_gh=$work/fake-gh
+mkdir -p "$fake_gh"
+cat >"$fake_gh/gh" <<'SH'
+#!/bin/sh
+# api repos/.../commits/<tag>: the tag does not exist (exit 1); run view: FAKE_RUN_SHA.
+case $1 in
+    api) exit 1 ;;
+    run) [ -n "${FAKE_RUN_SHA:-}" ] && echo "$FAKE_RUN_SHA" ; exit 0 ;;
+esac
+exit 1
+SH
+chmod +x "$fake_gh/gh"
+no_source() { # extra release-check options: no --source-ref, the fake gh in front
+    PATH=$fake_gh:$PATH "$check" v9.9.9 1 "$stage2" --artifacts "$release" --assets-from "$work/names.txt" --out "$work/out-$RANDOM" \
+        --lineage v9.9.8 --convergence-comparison "$comparison" "$@"
+}
+FAKE_RUN_SHA=$source_ref no_source >"$work/out.txt" 2>&1 || { cat "$work/out.txt" >&2; fail "release-check did not use the run's head sha for a tag that does not exist"; }
+grep -q "^PASS  convergence.*source $source_ref: run 1's head" "$work/out.txt" || fail "the run's head sha was not reported as the source"
+FAKE_RUN_SHA=ffffffffffffffffffffffffffffffffffffffff expect_fail "a run built another commit than the comparison's" no_source
+grep -q '^FAIL  convergence.*not the release' "$work/out.txt" || fail "another run head did not fail the convergence check"
+FAKE_RUN_SHA= expect_fail "no head sha from the run" no_source
+grep -q '^FAIL  convergence.*--source-ref' "$work/out.txt" || fail "no head sha did not name --source-ref"
+FAKE_RUN_SHA=notasha expect_fail "a malformed head sha" no_source
+grep -q '^FAIL  convergence.*--source-ref' "$work/out.txt" || fail "a malformed head sha did not name --source-ref"
+# --source-ref still wins over the run.
+FAKE_RUN_SHA=ffffffffffffffffffffffffffffffffffffffff no_source --source-ref "$source_ref" >/dev/null 2>&1 || fail "--source-ref did not win over the run's head sha"
+
+# --- release-notes: the draft without its header, Housekeeping and At release time, plus the convergence notes.
+notes=$project_root/tools/release-notes.sh
+draft=$work/draft.md
+cat >"$draft" <<'MD'
+DRAFT for v9.9.9, complete. Nothing is [pending] any more.
+
+## Behaviour changes and migration (read first)
+
+- a change
+
+## Fixes
+
+- a fix
+
+## Housekeeping (not for the notes)
+- tests only: abc
+
+## Highlights
+
+- a highlight
+
+## At release time (do not forget)
+- push the tag
+MD
+convergence_notes=$work/convergence-notes.md
+"$convergence" verify v9.9.9 --lineage v9.9.8 --source-ref "$source_ref" --comparison "$comparison" --notes "$convergence_notes" >/dev/null || fail "no convergence notes were written"
+"$notes" v9.9.9 "$draft" --convergence "$convergence_notes" --out "$work/publish.md" >/dev/null || fail "release-notes refused a good draft"
+grep -q '^## Behaviour changes' "$work/publish.md" && grep -q '^## Fixes' "$work/publish.md" && grep -q '^## Highlights' "$work/publish.md" || fail "a section is missing from the publish notes"
+grep -q 'DRAFT for' "$work/publish.md" && fail "the header line is in the publish notes"
+grep -q 'Housekeeping\|tests only: abc' "$work/publish.md" && fail "Housekeeping is in the publish notes"
+grep -q 'At release time\|push the tag' "$work/publish.md" && fail "At release time is in the publish notes"
+grep -q -- '- a highlight' "$work/publish.md" || fail "the section after Housekeeping was dropped"
+[[ $(head -n 1 "$work/publish.md") == '## Behaviour changes and migration (read first)' ]] || fail "the publish notes do not start at the first section"
+[[ $(grep -c '^### Bootstrap convergence' "$work/publish.md") -eq 1 ]] || fail "the convergence notes are not in the publish notes once"
+grep -q "^- route A: v9.9.8" "$work/publish.md" || fail "the convergence notes' route A line is missing"
+tail -n 1 "$work/publish.md" | grep -q 'seed compromise' || fail "the publish notes do not end with the convergence notes"
+# Refusals.
+sed 's/^- a fix$/- a fix [pending]/' "$draft" >"$work/pending.md"
+expect_fail "a draft with a [pending] line" "$notes" v9.9.9 "$work/pending.md" --convergence "$convergence_notes" --out "$work/p1.md"
+[[ ! -e $work/p1.md ]] || fail "release-notes wrote notes for a draft with [pending]"
+sed '1d' "$draft" >"$work/headerless.md"
+expect_fail "a draft without its header line" "$notes" v9.9.9 "$work/headerless.md" --convergence "$convergence_notes" --out "$work/p2.md"
+expect_fail "no convergence notes" "$notes" v9.9.9 "$draft" --convergence "$work/missing.md" --out "$work/p3.md"
+expect_fail "convergence notes of another tag" "$notes" v9.9.8 "$draft" --convergence "$convergence_notes" --out "$work/p4.md"
+expect_fail "a draft that is not a notes draft" "$notes" v9.9.9 "$convergence_notes" --convergence "$convergence_notes" --out "$work/p5.md"
+expect_fail "a bad tag" "$notes" 9.9.9 "$draft" --convergence "$convergence_notes"
+
+# --- gate-release --dry-run: the slot's cores and jobs, the pinned seed, the full suite and the reproducibility check.
+gate=$project_root/tools/gate-release.sh
+"$gate" "$project_root" 3 --dry-run >"$work/gate.txt" 2>&1 || { cat "$work/gate.txt" >&2; fail "gate-release --dry-run failed"; }
+grep -q 'tools/bootstrap-compiler.sh build/gate/seed.bin' "$work/gate.txt" || fail "the gate does not take its seed from the pin"
+grep -q 'taskset -c 16-23 tools/build-self-hosted-release.sh build/gate/stage2 build/gate/stage3' "$work/gate.txt" || fail "slot 3 does not pin stage 3 to 16-23"
+grep -q 'RUN_TESTS_FULL=1 JOBS=8 taskset -c 16-23 tools/run-tests.sh' "$work/gate.txt" || fail "the suite is not the full one on slot 3's cores"
+grep -q 'test-reproducible-elsewhere.sh --self build/ablac.bin' "$work/gate.txt" || fail "the reproducibility check is missing"
+grep -q 'make self-rebuild' "$work/gate.txt" || fail "make self-rebuild is missing"
+grep -q '8-11' "$work/gate.txt" && fail "slot 3's gate touches slot 2's cores"
+"$gate" "$project_root" 2 --dry-run 2>&1 | grep -q 'RUN_TESTS_FULL=1 JOBS=6 taskset -c 8-11,14-15 ' || fail "slot 2 is not 6 jobs on 8-11,14-15"
+GATE_CPUS=0-1 GATE_JOBS=2 "$gate" "$project_root" 1 --dry-run 2>&1 | grep -q 'RUN_TESTS_FULL=1 JOBS=2 taskset -c 0-1 ' || fail "GATE_CPUS and GATE_JOBS are not honoured"
+expect_fail "a gate on a directory that is not a worktree" "$gate" "$work" 2 --dry-run
+expect_fail "a non-numeric slot" "$gate" "$project_root" two --dry-run
+expect_fail "no arguments" "$gate"
 
 # --- release-pin: a checkout pinned to v9.9.8 moves to v9.9.9.
 root=$work/root
