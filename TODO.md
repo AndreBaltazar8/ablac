@@ -2178,7 +2178,14 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   6,800-7,500 CPU-seconds over about 490 commands, nearly all of it compiler calls, and after the per-test cuts
   (be0edb51, 2fbb1219, 3580e3ea, 710dbf4d: about 415 CPU-s) what is left is spread thin over many small builds
   (test-self-hosted: 450 builds of 0.2 to 2.5 s at --fast; the compile-eval shared-state test: 80 of about 1 s), each
-  analysing the same standard library again. In the profile
+  analysing the same standard library again. A build server is not the way (measured 2026-11-19): 20 module programs
+  of the suite built `--fast --no-cache` in one process that kept one `BootstrapModuleState` between them (a hidden
+  `--build-many-fast`, scratch only) took 107.0 and 107.1 G instructions against 107.3 and 103.4 G as 20 processes
+  (+0.3% and -3.5%), the 18 binaries identical: what the shared parse saves, the longer-lived heap's collections take
+  back. Today's fixed cost: an empty `main` is 1.65 G instructions to `--emit-llvm` (2.27 G built `--fast`), of which
+  the runtime's allocator and collector 25.6%, loading, lexing and parsing 22%, analysis and the rewrite passes about
+  18%, lowering 9.5%, the backend and libLLVM about 13%, the dynamic loader 4.9%; the allocator is ablac-4e's item.
+  In the profile
   above the compiler's own code is 58 to 59% of a `--fast` build and the standard library's modules are
   most of what a small program imports, so lexing, parsing, analyzing and lowering them again each
   build is the largest block left. My estimate, not a measurement: if a build could load their analyzed
