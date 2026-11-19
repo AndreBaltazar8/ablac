@@ -455,6 +455,7 @@ The check happens before evaluation starts, so a denied path never runs.
 | `clock` | read the clocks, sleep | `compilerClockMilliseconds()`; `abla/process/time`'s `sleep`, `monotonicMilliseconds()`, `realtimeMilliseconds()` and their nanosecond forms | disabled |
 | `random` | random integers | `compilerRandomInteger(maxExclusive)` | disabled |
 | `trusted.native` | run trusted and `extern` code (raw memory, C functions, system calls) | see [below](#what-works-at-compile-time-today) | disabled |
+| `time.unlimited` | the module's `#` sites run without `ABLA_COMPILE_EVAL_TIME_LIMIT` (a game played under `#`, a long generation); only the module that requests it, every other module keeps the limit | no provider: the request itself | kept: it changes no result |
 | `transform.library` | a transform changes a standard-library function's body or removes a standard-library extension field (annotations need no grant; a program's own modules never do) | `compilerReplaceFunctionBody`, `compilerRemoveExtensionField` on a standard-library target (see [compiler-api.md](compiler-api.md)) | kept: the edits are part of each module's fingerprint |
 
 `trusted.native` is all or nothing: it lets compile-time code load and call
@@ -664,8 +665,36 @@ possible because their inputs are journaled. Each read records the
 provider's identity, the size and a two-hash fingerprint of what was read.
 A later build revalidates every journaled input before it reuses the cache.
 Environment values themselves are not stored in the cache sidecar. The
-manifest is part of the cache identity too. Every other capability makes a
-build that uses it uncacheable.
+manifest is part of the cache identity too. `time.unlimited` changes no
+result, so it keeps the cache too. Every other capability makes a build that
+uses it uncacheable.
+
+### Non-reproducible sites
+
+A `#` site whose code can reach `trusted.native`, `clock`, `random`,
+`network`, `process.io` or `filesystem.write` may give a different value, or
+leave a different file behind, on the next build. The compiler refuses none
+of them, and reports each one after a successful build:
+
+```text
+note: non-reproducible: clock.ab:7 `#(compilerClockMilliseconds() > 0)` reached clock
+```
+
+The capabilities named are the granted ones among those the site's code can
+reach, as the capability check works them out (a `#` inside another is part of
+that one). More than eight sites are one line with their number. The list is
+also in the output's ABI manifest, `<output>.abi.json`, for a release or a
+check to read:
+
+```json
+"nonReproducible":[
+    {"site":"clock.ab:7","expression":"#(compilerClockMilliseconds() > 0)","capabilities":["clock"]}
+  ]
+```
+
+A build with a pure site has no notes and no `nonReproducible` key. A build
+with such a site is never a cache hit (each of those capabilities makes it
+uncacheable), so every build of it prints the same notes.
 
 The compile-time tier (`ABLA_COMPILE_EVAL`) is part of the cache identity of
 a build and of an `ablac run` record. The tiers can disagree: a site the
@@ -1080,7 +1109,12 @@ a value is no part of any global's heap, whatever it was computed from.
   stops with `E_CT_TIME_LIMIT`. An interpreted site has the same limit besides
   its step limit. A call blocked in the kernel (an accept, a wait for a child,
   a read of a pipe) is interrupted when the limit passes, so a build never hangs
-  on compile-time code.
+  on compile-time code. The sites of a module that requests `time.unlimited`
+  (and whose manifest authorizes it) have no time limit; every other module's
+  keep it. One native call is shared: the first call of a native generation
+  initializes the globals the generation keeps, so a site in one of their
+  initializers runs in that call, whichever site's call it is. When one of
+  those is an unlimited module's site, that first call has no limit.
 - `compile val`/`compile var` hold one value for the compilation on both
   tiers: after each native call their values are kept as the evaluator keeps
   them. When an evaluated site changes a `compile var` the slice holds whose

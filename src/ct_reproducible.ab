@@ -1,0 +1,153 @@
+// Non-reproducible `#` sites (decision #82 B): a site whose code can reach a capability whose result may differ from
+// one build to the next (trusted.native, clock, random, network, process.io, filesystem.write) is reported, and
+// nothing is refused. The analysis records each such site once (sema.ab, bootstrapInferCompile: the granted
+// capabilities among those its code can reach); the build prints one note per site, or one line for many, and writes
+// the list to the output's ABI manifest (`<output>.abi.json`, "nonReproducible") where a release or a check reads it.
+// A build with such a site is never a cache hit (each of these grants makes it uncacheable, toolchain.ab), so a
+// second build reports the same sites.
+import "diagnostic_positions.ab"
+
+var bootstrapNonReproducibleKeys: array<string> = []
+var bootstrapNonReproducibleSources: array<string> = []
+var bootstrapNonReproducibleBegins: array<int> = []
+var bootstrapNonReproducibleEnds: array<int> = []
+var bootstrapNonReproducibleMasks: array<int> = []
+
+// The capabilities, in the order a note names them.
+val BOOTSTRAP_NONREPRODUCIBLE_EFFECTS: array<int> = [512, 128, 256, 64, 32, 8]
+val BOOTSTRAP_NONREPRODUCIBLE_NAMES: array<string> =
+    ["trusted.native", "clock", "random", "network", "process.io", "filesystem.write"]
+// More sites than this are one summary line.
+val BOOTSTRAP_NONREPRODUCIBLE_NOTES = 8
+
+fun bootstrapNonReproducibleHas(mask: int, effect: int): bool = mask / effect - (mask / effect / 2) * 2 == 1
+
+// Records the site at `begin`..`end` of `source` if `effects` (what its code can reach) has a granted one of them.
+fun bootstrapRecordNonReproducibleSite(source: string, begin: int, end: int, effects: int, grants: int): void {
+    var mask = 0
+    for (effect in BOOTSTRAP_NONREPRODUCIBLE_EFFECTS) {
+        if (bootstrapNonReproducibleHas(effects, effect) && bootstrapNonReproducibleHas(grants, effect))
+            mask = mask + effect
+    }
+    if (mask == 0) return
+    val key = "$source:$begin:$end"
+    for (known in bootstrapNonReproducibleKeys) if (known == key) return
+    bootstrapNonReproducibleKeys.append(key)
+    bootstrapNonReproducibleSources.append(source)
+    bootstrapNonReproducibleBegins.append(begin)
+    bootstrapNonReproducibleEnds.append(end)
+    bootstrapNonReproducibleMasks.append(mask)
+    return
+}
+
+fun bootstrapNonReproducibleNamesOf(mask: int, separator: string): string {
+    var names = ""
+    var index = 0
+    while (index < BOOTSTRAP_NONREPRODUCIBLE_EFFECTS.size) {
+        if (bootstrapNonReproducibleHas(mask, BOOTSTRAP_NONREPRODUCIBLE_EFFECTS[index])) {
+            names = if (names == "") BOOTSTRAP_NONREPRODUCIBLE_NAMES[index]
+                else "$names$separator${BOOTSTRAP_NONREPRODUCIBLE_NAMES[index]}"
+        }
+        index = index + 1
+    }
+    names
+}
+
+// The site's text on one line: runs of white space are one space, and a long one is cut. A parenthesized site's
+// span (`#(a > 0)`) ends at its inner expression's end, so the closing parentheses after it are added back.
+fun bootstrapNonReproducibleText(contents: string, begin: int, siteEnd: int): string {
+    if (begin < 0 || siteEnd > contents.size || begin >= siteEnd) return ""
+    var open = 0
+    var scan = begin
+    while (scan < siteEnd) {
+        if (contents[scan] == 40) open = open + 1
+        else if (contents[scan] == 41) open = open - 1
+        scan = scan + 1
+    }
+    var end = siteEnd
+    var after = siteEnd
+    while (open > 0 && after < contents.size) {
+        val byte = contents[after]
+        after = after + 1
+        if (byte == 41) {
+            open = open - 1
+            end = after
+        } else if (byte != 32 && byte != 9 && byte != 10 && byte != 13) open = 0
+    }
+    var text = ""
+    var space = false
+    var index = begin
+    while (index < end) {
+        val byte = contents[index]
+        if (byte == 32 || byte == 9 || byte == 10 || byte == 13) space = true
+        else {
+            if (space && text.size > 0) text = "$text "
+            space = false
+            text = "$text${contents.slice(index, index + 1)}"
+        }
+        index = index + 1
+    }
+    if (text.size > 60) text = "${text.slice(0, 57)}..."
+    text
+}
+
+fun bootstrapNonReproducibleJsonText(text: string): string {
+    var escaped = ""
+    var index = 0
+    while (index < text.size) {
+        val byte = text[index]
+        if (byte == 34) escaped = "$escaped\\\""
+        else if (byte == 92) escaped = "$escaped\\\\"
+        else escaped = "$escaped${text.slice(index, index + 1)}"
+        index = index + 1
+    }
+    escaped
+}
+
+class BootstrapNonReproducibleReport(
+    // What the build prints ("" when there are none).
+    val notes: string,
+    // The manifest's "nonReproducible" array ("" when there are none).
+    val json: string
+)
+
+// `manifest`: where the list is written, which the summary line names.
+fun bootstrapNonReproducibleReport(manifest: string): BootstrapNonReproducibleReport {
+    val count = bootstrapNonReproducibleKeys.size
+    if (count == 0) return BootstrapNonReproducibleReport("", "")
+    var sources = BootstrapDiagnosticSources([], [], [])
+    var notes = ""
+    var json = "["
+    var every = 0
+    var site = 0
+    while (site < count) {
+        val path = bootstrapNonReproducibleSources[site]
+        val begin = bootstrapNonReproducibleBegins[site]
+        val mask = bootstrapNonReproducibleMasks[site]
+        val file = bootstrapDiagnosticSource(sources, path)
+        val contents = sources.contents[file]
+        var place = "$path:$begin"
+        if (sources.readable[file] && begin <= contents.size) {
+            var line = 1
+            var index = 0
+            while (index < begin) {
+                if (contents[index] == 10) line = line + 1
+                index = index + 1
+            }
+            place = "$path:$line"
+        }
+        val text = bootstrapNonReproducibleText(contents, begin, bootstrapNonReproducibleEnds[site])
+        val names = bootstrapNonReproducibleNamesOf(mask, ", ")
+        notes = "${notes}note: non-reproducible: $place `$text` reached $names\n"
+        json = "$json${if (site > 0) "," else ""}\n    {\"site\":\"${bootstrapNonReproducibleJsonText(place)}\",\"expression\":\"${bootstrapNonReproducibleJsonText(text)}\",\"capabilities\":[\"${bootstrapNonReproducibleNamesOf(mask, "\",\"")}\"]}"
+        for (effect in BOOTSTRAP_NONREPRODUCIBLE_EFFECTS) {
+            if (bootstrapNonReproducibleHas(mask, effect) && !bootstrapNonReproducibleHas(every, effect))
+                every = every + effect
+        }
+        site = site + 1
+    }
+    if (count > BOOTSTRAP_NONREPRODUCIBLE_NOTES) {
+        notes = "note: non-reproducible: $count `#` sites reached ${bootstrapNonReproducibleNamesOf(every, ", ")} (listed in $manifest, \"nonReproducible\")\n"
+    }
+    BootstrapNonReproducibleReport(notes, "$json\n  ]")
+}

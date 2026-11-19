@@ -125,6 +125,8 @@ test-serial: ablac
 	tools/test-ct-threads-heap.sh $(COMPILER)
 	tools/test-ct-interp-runtime.sh $(COMPILER)
 	tools/test-ct-time-limit.sh $(COMPILER)
+	tools/test-ct-time-unlimited.sh $(COMPILER)
+	tools/test-ct-nonreproducible.sh $(COMPILER)
 	tools/test-libc-jump-routines.sh $(COMPILER)
 	tools/test-version.sh $(COMPILER)
 	tools/test-coverage.sh $(COMPILER)
