@@ -40,6 +40,7 @@ import "codegen_units.ab"
 import "toolchain.ab"
 import "jit_cache.ab"
 import "ct_tier.ab"
+import "abla/runtime/memory"
 
 // One ORC session for the process; one generation per compile pass that has sites.
 var bootstrapCtSessionLive: bool = false
@@ -1828,8 +1829,34 @@ fun bootstrapCtTrials(parsed: BootstrapParseResult, state: BootstrapCtStateResul
 fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string,
     methodTargets: BootstrapResolvedMethodTargets = bootstrapResolvedMethodTargets()): void {
     bootstrapCtTypeIndexBegin(parsed.declarations)
+    bootstrapCtRaiseCollectionGrowth()
     bootstrapCtPrepareWith(parsed, targetTriple, methodTargets)
+    bootstrapCtRestoreCollectionGrowth()
     bootstrapCtTypeIndexEnd()
+    return
+}
+
+// The compiler's collection step (orc_main.ab sets it with the runtime's; 0 when it collects only on request, as in the
+// editor). While a generation is prepared, analyzed and lowered, the step is what the last collection kept, if more:
+// the outer program's analysis stays live through all of it, and each collection marks and sweeps it again. The client
+// of #1022 (about 350 MB kept) collected 12 times in those phases with the 256 MB step, 4.4 to 5.1 s of the 8.6 to
+// 9.9 s they took. (What the heap holds now would count the garbage since that collection: up to a step more.)
+var bootstrapCtCollectionGrowth: int = 0
+var bootstrapCtCollectionGrowthRaised = false
+
+fun bootstrapCtRaiseCollectionGrowth(): void {
+    if (bootstrapCtCollectionGrowth <= 0 || bootstrapCtCollectionGrowthRaised) return
+    val live = runtimeMemoryHeapStat(13)
+    if (live <= bootstrapCtCollectionGrowth) return
+    runtimeMemorySetCollectionGrowth(live)
+    bootstrapCtCollectionGrowthRaised = true
+    return
+}
+
+fun bootstrapCtRestoreCollectionGrowth(): void {
+    if (!bootstrapCtCollectionGrowthRaised) return
+    bootstrapCtCollectionGrowthRaised = false
+    runtimeMemorySetCollectionGrowth(bootstrapCtCollectionGrowth)
     return
 }
 
@@ -2459,6 +2486,7 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
         lowered, analyzed, bootstrapIrTransientState(), true
     )
     bootstrapCtLoweringSlice = false
+    bootstrapCtRestoreCollectionGrowth()
     val loweringDone = linuxMonotonicMilliseconds()
     var context = nativeNullPointer()
     var module = nativeNullPointer()

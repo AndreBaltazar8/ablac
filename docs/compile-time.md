@@ -1101,6 +1101,12 @@ a value is no part of any global's heap, whatever it was computed from.
   50,000 the passes dominate and it neither gains nor costs. `ABLA_COMPILE_EVAL_UNITS=0`
   keeps every generation one module; `ABLA_CODEGEN_UNITS_MINIMUM` changes the
   threshold.
+- While a generation is prepared, analyzed and lowered, the compiler collects
+  when its heap has grown by what the last collection kept, if that is more
+  than its usual step (256 MB, `ABLA_COMPILER_COLLECT_GROWTH_MB`): the
+  program's own analysis stays live meanwhile and every collection walks it
+  again. A small slice changes nothing; the client of #1022 (about 350 MB kept)
+  spends 0.9 s less in those phases, at the same peak.
 
 ## Diagnostics
 
