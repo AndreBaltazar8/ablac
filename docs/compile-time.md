@@ -1192,7 +1192,10 @@ a value is no part of any global's heap, whatever it was computed from.
   stops with `E_CT_TIME_LIMIT`. An interpreted site has the same limit besides
   its step limit. A call blocked in the kernel (an accept, a wait for a child,
   a read of a pipe) is interrupted when the limit passes, so a build never hangs
-  on compile-time code. The sites of a module that requests `time.unlimited`
+  on compile-time code. A provider call (the clock, `sleep`, a file read, the
+  compiler API) runs in the compiler: a native site stops when that call
+  returns, never in the middle of it, and a compile-time `sleep` wakes at the
+  limit instead of sleeping on. The sites of a module that requests `time.unlimited`
   (and whose manifest authorizes it) have no time limit; every other module's
   keep it. One native call is shared: the first call of a native generation
   initializes the globals the generation keeps, so a site in one of their

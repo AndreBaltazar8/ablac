@@ -1888,9 +1888,13 @@ fun ctNativeEvaluateProvider(
         val directory = currentDirectory().text
         evaluator.recordCompileInput("abla-input:current-directory:", directory)
         result = ctNativePathValue(directory)
-    } else if (name == "sleep") sleep(ctNativeValueWord(values, 0))
-    else if (name == "sleepNanoseconds") {
-        result = bootstrapEvalBoolean(sleepNanoseconds(ctNativeValueWord(values, 0)))
+    } else if (name == "sleep") {
+        ctNativeSleepUntilDeadline(ctNativeValueWord(values, 0) * 1000000)
+        if (ctNativeDeadline != 0 && ctNativeDeadlinePassed(evaluator)) result = bootstrapEvalInvalid()
+    } else if (name == "sleepNanoseconds") {
+        val nanoseconds = ctNativeValueWord(values, 0)
+        result = bootstrapEvalBoolean(nanoseconds >= 0 && ctNativeSleepUntilDeadline(nanoseconds))
+        if (ctNativeDeadline != 0 && ctNativeDeadlinePassed(evaluator)) result = bootstrapEvalInvalid()
     } else if (name == "monotonicNanoseconds") result = bootstrapEvalInteger(monotonicNanoseconds())
     else if (name == "monotonicMilliseconds") result = bootstrapEvalInteger(monotonicMilliseconds())
     else if (name == "realtimeNanoseconds") result = bootstrapEvalInteger(realtimeNanoseconds())
@@ -2160,6 +2164,45 @@ fun ctNativePathProvider(var evaluator: BootstrapEvaluator, receiver: BootstrapE
 var ctNativeDeadline: int = 0
 var ctNativeDeadlineSeconds: int = 0
 var ctNativeTimedOut: bool = false
+// The native call's deadline in monotonic milliseconds (ct_eval.ab, bootstrapCtCall), 0: none. Its alarm can't stop
+// the call while the compiler's code runs (a bridge call, ct_jit.ab), so a compile-time sleep wakes up by then.
+var ctNativeCallDeadline: int = 0
+
+// The live generation's mark of a stop the time limit deferred while the compiler's code ran (3; 0: none), a word of
+// the slice (ct_jit.ab, bootstrapCtWrapBridgeEntries; #1036); 0 without a generation.
+var ctNativeStopDeferredAddress: int = 0
+
+// Whether the native call's time limit has passed while the compiler's code ran (its stop waits for the return).
+trusted fun ctNativeStopDeferred(): bool = ctNativeStopDeferredAddress != 0 &&
+    ablaUnsafeLoadI64(nativePointerFromAddress(ctNativeStopDeferredAddress)) != 0
+
+// A compile-time `sleep`: `nanoseconds`, or less when the site's time limit comes first (#1036, #1037). Its signal
+// only interrupts the sleep, which the standard library resumes, so the limit would wait for the whole sleep. An
+// interpreted site's sleep ends at its deadline (the evaluator stops after it). A native site's ends once its alarm
+// has deferred the stop, which the bridge then takes; past the deadline it sleeps in short steps until then, as
+// the deadline here is read in milliseconds and the alarm may come a little later.
+fun ctNativeSleepUntilDeadline(nanoseconds: int): bool {
+    if (nanoseconds <= 0) return true
+    if (ctNativeDeadline == 0 && ctNativeCallDeadline == 0) return sleepNanoseconds(nanoseconds)
+    val end = monotonicNanoseconds() + nanoseconds
+    var slept = true
+    var now = monotonicNanoseconds()
+    while (slept && now < end) {
+        if (ctNativeDeadline != 0 && now >= ctNativeDeadline * 1000000) return true
+        if (ctNativeStopDeferred()) return true
+        var wake = end
+        if (ctNativeDeadline != 0 && ctNativeDeadline * 1000000 < wake) wake = ctNativeDeadline * 1000000
+        if (ctNativeCallDeadline != 0) {
+            val callDeadline = ctNativeCallDeadline * 1000000
+            if (now >= callDeadline) {
+                if (now + 5000000 < wake) wake = now + 5000000
+            } else if (callDeadline < wake) wake = callDeadline
+        }
+        slept = sleepNanoseconds(wake - now)
+        now = monotonicNanoseconds()
+    }
+    slept
+}
 
 // Whether the interpreted site ran past its time limit (recorded once, as an error of `evaluator`).
 @noinline

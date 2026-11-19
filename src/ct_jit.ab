@@ -2586,6 +2586,7 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
         bootstrapCtPanicSizeAddress = bootstrapCtLookup("abla_ct_panic_size_$generation")
     }
     bootstrapCtStopSiteAddress = bootstrapCtLookup("abla_ct_stop_site_$generation")
+    ctNativeStopDeferredAddress = bootstrapCtLookup("abla_ct_deferred_$generation")
     bootstrapCtGenerationSpent = ""
     // The generation's first call initializes the globals it keeps, so a `#` site those initializers hold runs there,
     // whichever site's call comes first: a site of a module that requests `time.unlimited` (decision #81 C) lifts
@@ -2919,6 +2920,20 @@ fun bootstrapCtInstallGuard(context: i64*, module: i64*, generation: int): bool 
     bootstrapCtPanicCaught =
         bootstrapCtCatchPanic(context, module, builder, generation, jump, armed, longjmpType,
             longjmp)
+    // The compiler's own code must never be jumped over: a provider the site calls (the clock, a file read, the
+    // compiler API) runs in the compiler through an abla_ct_bridge_* entry, whose frames are on the compiler's
+    // collector root chain. The time limit's jump from inside one left them linked there, and the compiler's next
+    // pop walked into the dead stack (#1036). So each bridge entry is called through a wrapper that counts the
+    // calls in progress; the alarm, meeting one, only marks the stop, and the wrapper takes the jump once the
+    // compiler's code has returned. The compiler finds the mark by its name (ct_native.ab,
+    // ctNativeStopDeferredAddress): a compile-time sleep reads it and wakes up for it. (A name, not the address of
+    // a compiler word in the code: that would differ from one build to the next and miss the code generation cache.)
+    val inCompiler = LLVMAddGlobal(module, i64Type, "abla.ct.in.compiler")
+    LLVMSetInitializer(inCompiler, LLVMConstInt(i64Type, 0, 0))
+    LLVMSetLinkage(inCompiler, llvmInternalLinkage())
+    val deferred = LLVMAddGlobal(module, i64Type, "abla_ct_deferred_$generation")
+    LLVMSetInitializer(deferred, LLVMConstInt(i64Type, 0, 0))
+    bootstrapCtWrapBridgeEntries(context, module, builder, jump, armed, inCompiler, deferred, longjmpType, longjmp)
     // void abla_ct_alarm_<g>(i32 signal), the time limit, and void
     // abla_ct_fault_<g>(i32 signal), a bad access (a stack run past its end, on the
     // alternate signal stack): while a call runs each jumps back; otherwise the
@@ -2939,7 +2954,20 @@ fun bootstrapCtInstallGuard(context: i64*, module: i64*, generation: int): bool 
         val handlerIdle = LLVMAppendBasicBlockInContext(context, function, "idle")
         LLVMPositionBuilderAtEnd(builder, handlerEntry)
         val handlerArmed = LLVMBuildLoad2(builder, i1, armed, "armed")
-        LLVMBuildCondBr(builder, handlerArmed, handlerBack, handlerIdle)
+        if (fault) LLVMBuildCondBr(builder, handlerArmed, handlerBack, handlerIdle)
+        else {
+            // In the compiler's code (a bridge call): the stop waits for its return.
+            val handlerCheck = LLVMAppendBasicBlockInContext(context, function, "check")
+            val handlerDefer = LLVMAppendBasicBlockInContext(context, function, "defer")
+            LLVMBuildCondBr(builder, handlerArmed, handlerCheck, handlerIdle)
+            LLVMPositionBuilderAtEnd(builder, handlerCheck)
+            val calls = LLVMBuildLoad2(builder, i64Type, inCompiler, "calls")
+            val busy = LLVMBuildICmp(builder, llvmIntNotEqual(), calls, LLVMConstInt(i64Type, 0, 0), "busy")
+            LLVMBuildCondBr(builder, busy, handlerDefer, handlerBack)
+            LLVMPositionBuilderAtEnd(builder, handlerDefer)
+            LLVMBuildStore(builder, LLVMConstInt(i64Type, 3, 0), deferred)
+            LLVMBuildRetVoid(builder)
+        }
         LLVMPositionBuilderAtEnd(builder, handlerBack)
         val handlerJump = llvmPointerVector(2)
         handlerJump.set(0, jump)
@@ -2990,6 +3018,8 @@ fun bootstrapCtInstallGuard(context: i64*, module: i64*, generation: int): bool 
         LLVMBuildCall2(builder, selfType, pthreadSelf, nativeNullPointer(), 0, "guard.self"), guardThread)
     LLVMBuildStore(builder, LLVMConstInt(i32Type, 0, 0), pending)
     LLVMBuildStore(builder, LLVMConstNull(pointer), stopSite)
+    LLVMBuildStore(builder, LLVMConstInt(i64Type, 0, 0), inCompiler)
+    LLVMBuildStore(builder, LLVMConstInt(i64Type, 0, 0), deferred)
     LLVMBuildStore(builder, LLVMConstInt(i1, 1, 0), armed)
     val entryType = LLVMFunctionType(i64Type, nativeNullPointer(), 0, 0)
     val reply = LLVMBuildCall2(
@@ -3005,6 +3035,83 @@ fun bootstrapCtInstallGuard(context: i64*, module: i64*, generation: int): bool 
     twoParameters.drop()
     LLVMDisposeBuilder(builder)
     true
+}
+
+// Puts a wrapper in the place of each abla_ct_bridge_* entry the slice calls (see the guard's builder): it counts the
+// call in abla.ct.in.compiler, and after the outermost one returns takes the jump a stop deferred meanwhile.
+trusted fun bootstrapCtWrapBridgeEntries(
+    context: i64*,
+    module: i64*,
+    builder: i64*,
+    jump: i64*,
+    armed: i64*,
+    inCompiler: i64*,
+    deferred: i64*,
+    longjmpType: i64*,
+    longjmp: i64*
+): void {
+    val i1 = LLVMInt1TypeInContext(context)
+    val i32Type = LLVMInt32TypeInContext(context)
+    val i64Type = LLVMInt64TypeInContext(context)
+    // (Collected first: the wrappers are functions of the module too.)
+    val names: array<string> = []
+    var function = LLVMGetFirstFunction(module)
+    while (!pointerIsNull(function)) {
+        if (LLVMIsDeclaration(function) != i32(0)) {
+            val name = bootstrapLlvmDebugValueName(function)
+            if (name.startsWith("abla_ct_bridge_")) {
+                names.append(name)
+            }
+        }
+        function = LLVMGetNextFunction(function)
+    }
+    var index = 0
+    while (index < names.size) {
+        val entry = LLVMGetNamedFunction(module, names[index])
+        val type = LLVMGlobalGetValueType(entry)
+        val wrapper = LLVMAddFunction(module, "abla.ct.wrap.${names[index]}", type)
+        LLVMSetLinkage(wrapper, llvmInternalLinkage())
+        LLVMReplaceAllUsesWith(entry, wrapper)
+        val body = LLVMAppendBasicBlockInContext(context, wrapper, "entry")
+        val stop = LLVMAppendBasicBlockInContext(context, wrapper, "stop")
+        val done = LLVMAppendBasicBlockInContext(context, wrapper, "done")
+        LLVMPositionBuilderAtEnd(builder, body)
+        val before = LLVMBuildLoad2(builder, i64Type, inCompiler, "calls")
+        LLVMBuildStore(builder, LLVMBuildAdd(builder, before, LLVMConstInt(i64Type, 1, 0), "entered"), inCompiler)
+        val count = int(LLVMCountParams(entry))
+        val arguments = llvmPointerVector(if (count > 0) count else 1)
+        var parameter = 0
+        while (parameter < count) {
+            arguments.set(parameter, LLVMGetParam(wrapper, i32(parameter)))
+            parameter = parameter + 1
+        }
+        val returnsVoid = LLVMGetTypeKind(LLVMGetReturnType(type)) == i32(0)
+        val result = LLVMBuildCall2(builder, type, entry, arguments.pointer(), i32(count),
+            if (returnsVoid) "" else "result")
+        arguments.drop()
+        val after = LLVMBuildLoad2(builder, i64Type, inCompiler, "calls.after")
+        val left = LLVMBuildSub(builder, after, LLVMConstInt(i64Type, 1, 0), "left")
+        LLVMBuildStore(builder, left, inCompiler)
+        val outermost = LLVMBuildICmp(builder, llvmIntEqual(), left, LLVMConstInt(i64Type, 0, 0), "outermost")
+        val mark = LLVMBuildLoad2(builder, i64Type, deferred, "deferred")
+        val marked = LLVMBuildICmp(builder, llvmIntNotEqual(), mark, LLVMConstInt(i64Type, 0, 0), "marked")
+        val how = LLVMBuildTrunc(builder, mark, i32Type, "how")
+        val stillArmed = LLVMBuildLoad2(builder, i1, armed, "armed")
+        val take = LLVMBuildAnd(builder, LLVMBuildAnd(builder, outermost, marked, "outermost.marked"), stillArmed,
+            "take")
+        LLVMBuildCondBr(builder, take, stop, done)
+        LLVMPositionBuilderAtEnd(builder, stop)
+        val jumpArguments = llvmPointerVector(2)
+        jumpArguments.set(0, jump)
+        jumpArguments.set(1, how)
+        LLVMBuildCall2(builder, longjmpType, longjmp, jumpArguments.pointer(), 2, "")
+        jumpArguments.drop()
+        LLVMBuildUnreachable(builder)
+        LLVMPositionBuilderAtEnd(builder, done)
+        if (returnsVoid) LLVMBuildRetVoid(builder) else LLVMBuildRet(builder, result)
+        index = index + 1
+    }
+    return
 }
 
 // A runtime panic (an index out of bounds, a division by zero, ...) prints
@@ -3108,6 +3215,7 @@ fun bootstrapCtFinishPass(another: bool = true): void {
     bootstrapCtPanicTextAddress = 0
     bootstrapCtPanicSizeAddress = 0
     bootstrapCtStopSiteAddress = 0
+    ctNativeStopDeferredAddress = 0
     // (No fresh array where there is nothing to drop: inside a region it would not
     // outlive it.)
     if (bootstrapCtSites.size > 0) bootstrapCtSites = []

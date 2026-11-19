@@ -2,8 +2,7 @@
 # `time.unlimited` (decision #81 C, tests/cases/ct-time-unlimited): a module that requests it, with the manifest's
 # authorization, runs its `#` sites without ABLA_COMPILE_EVAL_TIME_LIMIT; every other module's sites keep the limit,
 # and a request the manifest doesn't authorize is refused like any capability's. A 1 s limit and sites that keep busy
-# for 2.5 s, reading the clock. The unlimited site runs in both tiers; the stopped ones in the interpreter, since a
-# native site stopped inside a clock call takes the compiler down (#1036).
+# for 2.5 s, reading the clock, in both tiers.
 set -euo pipefail
 compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
@@ -18,11 +17,11 @@ build() { # mode name file
         --fast --no-cache > "$out/$2-$1.log" 2>&1 || status=$?
     echo "$status"
 }
-for name in slow granting; do
-    status=$(build interp $name $name.ab)
-    [[ $status == 1 ]] || fail "$out/$name-interp.log" "$name.ab: the compiler exited $status, not 1"
-    grep -q '^error\[E_CT_TIME_LIMIT\]' "$out/$name-interp.log" || fail "$out/$name-interp.log" "$name.ab: no E_CT_TIME_LIMIT"
-done
+for mode in interp jit; do for name in slow granting; do
+    status=$(build $mode $name $name.ab)
+    [[ $status == 1 ]] || fail "$out/$name-$mode.log" "$mode: $name.ab: the compiler exited $status, not 1"
+    grep -q '^error\[E_CT_TIME_LIMIT\]' "$out/$name-$mode.log" || fail "$out/$name-$mode.log" "$mode: $name.ab: no E_CT_TIME_LIMIT"
+done; done
 echo "ok   the limit stops slow.ab, and the imported module of granting.ab, which requests time.unlimited itself"
 for mode in interp jit; do
     status=$(build $mode unlimited unlimited.ab)
