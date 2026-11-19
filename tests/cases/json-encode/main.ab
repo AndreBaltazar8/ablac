@@ -1,0 +1,114 @@
+// jsonStringify (abla/json) against an independent escaper written here (RFC 8259: quote, backslash, \b \f \n \r \t, other controls as \u00xx, everything else verbatim, what the writer has always
+// produced: the same stdlib checked it at the commit before its plainness test went eight bytes at a time): strings of every length from 0 to 70 with a quote, a backslash, a control character,
+// DEL, a two-, three- and four-byte UTF-8 sequence or an invalid byte at every position (so at every place in an eight-byte word), random strings from such pieces (one the value
+// constructor refuses as invalid UTF-8 is null), as a value, an array element, an object key and value. Prints "json-encode ok".
+import "abla/io"
+import "abla/bytes"
+import "abla/json"
+import "abla/text"
+
+var failures = 0
+var seed = 515
+
+fun next(): int {
+    seed = (seed * 1103515245 + 12345) & 2147483647
+    (seed >> 16) & 255
+}
+
+fun fail(what: string): void {
+    failures = failures + 1
+    if (failures < 30) println("FAIL $what")
+    return
+}
+
+fun bytesOf(values: array<int>): string {
+    val buffer = byteBuffer()
+    for (value in values) buffer.appendByteValue(value)
+    buffer.toText()
+}
+
+fun hexOf(text: string): string {
+    var out = ""
+    for (i in 0 until text.size) out = out + "${text[i]} "
+    out
+}
+
+/** The JSON text of a string: the escaper above. */
+fun escaped(text: string): string {
+    val out = byteBuffer()
+    out.appendByteValue(34)
+    val hex = "0123456789abcdef"
+    for (i in 0 until text.size) {
+        val byte = text[i]
+        if (byte == 34) out.appendText("\\\"")
+        else if (byte == 92) out.appendText("\\\\")
+        else if (byte == 8) out.appendText("\\b")
+        else if (byte == 12) out.appendText("\\f")
+        else if (byte == 10) out.appendText("\\n")
+        else if (byte == 13) out.appendText("\\r")
+        else if (byte == 9) out.appendText("\\t")
+        else if (byte < 32) {
+            out.appendText("\\u00")
+            out.appendByteValue(hex[byte >> 4])
+            out.appendByteValue(hex[byte & 15])
+        } else out.appendByteValue(byte)
+    }
+    out.appendByteValue(34)
+    out.toText()
+}
+
+/** `text` through jsonStringify as a value, an array element, a key and a value, against the escaper (null for what is not valid UTF-8). */
+fun same(what: string, text: string): void {
+    val valid = text.isValidUtf8()
+    val expected = if (valid) escaped(text) else "null"
+    val fresh = jsonStringify(jsonString(text))
+    if (fresh != expected) fail("$what: '${hexOf(text)}' -> ${hexOf(fresh)} wanted ${hexOf(expected)}")
+    val inArray = jsonStringify(jsonArray([jsonString(text), jsonString("x")]))
+    if (inArray != "[" + expected + ",\"x\"]") fail("$what in an array")
+    if (valid) {
+        val inObject = jsonStringify(jsonObject([text, "k"], [jsonString(text), jsonInteger(1)]))
+        if (inObject != "{" + expected + ":" + expected + ",\"k\":1}") fail("$what as a key and a value")
+    }
+    return
+}
+
+fun main: int {
+    val specials: array<array<int>> = [
+        [34], [92], [0], [8], [9], [10], [12], [13], [31], [127], [128], [191], [192], [194, 128], [195, 169], [224, 160, 128], [226, 130, 172], [240, 159, 152, 128],
+        [255], [237, 160, 128], [244, 144, 128, 128], [194], [226, 130], [240, 159, 152], [47], [32], [126]
+    ]
+    for (length in 0 until 70) {
+        for (special in specials) {
+            for (position in [0, 1, 3, 7, 8, 9, 15, 16, 23, 31, 33, 40]) {
+                if (position + special.size > length) continue
+                val values: array<int> = []
+                for (i in 0 until length) values.append(97 + (i * 7 + position) % 26)
+                for (i in 0 until special.size) values[position + i] = special[i]
+                same("length $length position $position special ${special[0]}", bytesOf(values))
+            }
+        }
+        // Plain text and text made only of a special.
+        val plain: array<int> = []
+        for (i in 0 until length) plain.append(65 + i % 50)
+        same("plain $length", bytesOf(plain))
+        val bars: array<int> = []
+        for (i in 0 until length) bars.append(if (i % 3 == 0) 34 else 92)
+        same("quotes $length", bytesOf(bars))
+    }
+    for (round in 0 until 6000) {
+        val values: array<int> = []
+        val pieces = next() % 9
+        for (p in 0 until pieces) {
+            val kind = next() % 8
+            if (kind < 4) for (i in 0 until next() % 20) values.append(32 + next() % 95)
+            else if (kind == 4) values.append(next())
+            else if (kind == 5) { values.append(195); values.append(128 + next() % 64) }
+            else if (kind == 6) { values.append(226); values.append(130); values.append(128 + next() % 64) }
+            else values.append(next() % 40)
+        }
+        same("random $round", bytesOf(values))
+    }
+    if (failures > 0) return 1
+    println("json-encode ok")
+    0
+}

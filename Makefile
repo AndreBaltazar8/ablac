@@ -444,6 +444,7 @@ test-serial: ablac
 	tools/test-rsa-unbalanced.sh $(COMPILER)
 	tools/test-rsa-fast.sh $(COMPILER)
 	tools/test-p384.sh $(COMPILER)
+	tools/test-json-encode.sh $(COMPILER)
 	tools/test-sha3-fast.sh $(COMPILER)
 	tools/test-chacha-simd.sh $(COMPILER)
 	tools/test-aes-gcm-keyed.sh $(COMPILER)
