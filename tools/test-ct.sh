@@ -85,7 +85,7 @@ fixtures=(
     ct_fix_x25519_add:@0,@1,@2 ct_fix_x25519_sub:@0,@1,@2 ct_fix_x25519_mul:@0,@1,@2,@3
     ct_fix_x25519_mul_constant:@0,@1 ct_fix_x25519_swap:0,@1,@2
     ct_fix_x25519f_add:@0,@1,@2 ct_fix_x25519f_sub:@0,@1,@2 ct_fix_x25519f_swap:0,@1,@2
-    ct_fix_ed25519_select:0,@1,@2 ct_fix_ed25519_scadd:@0,@1,@2,@3
+    ct_fix_ed25519_store_le:@0,@1
     ct_fix_sha256:@0,@1,@2 ct_fix_sha512:@0,@1,@2
 )
 for width in 1 3 128; do
@@ -251,7 +251,7 @@ x25519_read() { # object, architecture (default x86_64)
 # Ed25519: the point additions and doublings, the scalar multiplication and the arithmetic modulo L call the field routines
 # and each other: read with those calls followed, and refused without following.
 ed25519_read() { # object, architecture (default x86_64)
-    local object=$1 arch=${2:-x86_64} specs=(ct_ed25519_add:@0,@1,@2,@3 ct_ed25519_double:@0,@1,@2 ct_ed25519_multiply:@0 ct_ed25519_reduce:@0,@1,@2 ct_ed25519_muladd:@0,@1,@2,@3,@4)
+    local object=$1 arch=${2:-x86_64} specs=(ct_ed25519_add:@0,@1,@2,@3 ct_ed25519_double:@0,@1,@2 ct_ed25519_fixed_base:@0,@1 ct_ed25519_multiply:@0,@1 ct_ed25519_encode:@0,@1,@2 ct_ed25519_reduce:@0,@1,@2,@3 ct_ed25519_muladd:@0,@1,@2,@3,@4,@5 ct_ed25519_scadd:@0,@1,@2,@3 ct_ed25519_load_le:@0,@1)
     $check --follow-calls "$arch" "$object" "${specs[@]}" > "$out/$arch-ed25519.log" 2>&1 || {
         cat "$out/$arch-ed25519.log" >&2; echo "ct: a secret reached a branch or an address in Ed25519" >&2; exit 1
     }

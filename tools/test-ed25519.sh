@@ -21,6 +21,12 @@ for mode in release fast; do
     result=$("$root/tools/run-limited.sh" "$out/main.$mode" tests/vectors/crypto) || { echo "ed25519 ($mode): $result" >&2; exit 1; }
     [[ $result == 'ed25519 ok (210 Wycheproof cases)' ]] || { echo "ed25519 ($mode): $result" >&2; exit 1; }
 done
+# The ten-limb field, the comb, the interleaved verification and the Montgomery arithmetic modulo L against the code they replaced (tests/cases/ed25519/old-ed25519.ab):
+# keys and signatures (the same bytes) and verification both ways over random and edge inputs, the small-order and non-canonical encodings, S at and above L. Release only:
+# the old code is slow, and --fast makes it slower still.
+"$compiler" build tests/cases/ed25519/reference.ab -o "$out/reference" --no-cache
+result=$(ABLA_MAX_SECONDS=1200 "$root/tools/run-limited.sh" "$out/reference") || { echo "ed25519 reference: $result" >&2; exit 1; }
+[[ $result == 'ed25519 reference ok' ]] || { echo "ed25519 reference: $result" >&2; exit 1; }
 "$compiler" build tests/cases/ed25519/tool.ab -o "$out/tool" --no-cache
 tool=$out/tool
 if command -v openssl > /dev/null && openssl genpkey -algorithm ED25519 -out "$out/probe.pem" 2> /dev/null; then
