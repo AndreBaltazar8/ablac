@@ -5,6 +5,8 @@
 # - cached: the same run again starts from the object cache and is reloaded on a save too.
 # - broken: a save that does not compile keeps the program running its code (stderr says so), a file of the same
 #   directory that is not the program's (an output) reloads nothing, and the next good save is applied (exit 42).
+# - restart: a save the running code cannot take (tests/cases/live-watch/restart.ab: a result type changes) restarts
+#   the run; the restarted run does not restart again for the same refusal, and the next good save is applied.
 # x86-64 Linux, where live mode is tested. Usage: tools/test-live-watch.sh [compiler]
 set -euo pipefail
 compiler=${1:-build/ablac}
@@ -22,10 +24,10 @@ export ABLA_CACHE_DIR=$out/cache
 pid=
 trap '[[ -n $pid ]] && kill "$pid" 2> /dev/null || true' EXIT
 
-start() {   # start NAME: runs a fresh copy under --watch and waits until main started
+start() {   # start NAME [FILE]: runs a fresh copy of FILE (program.ab) under --watch and waits until main started
     local name=$1
     mkdir -p "$out/$name"
-    cp "$root/tests/cases/live-watch/program.ab" "$out/$name/program.ab"
+    cp "$root/tests/cases/live-watch/${2:-program.ab}" "$out/$name/program.ab"
     "$compiler" run --watch "$out/$name/program.ab" -- "$out/$name/started" \
         > "$out/$name/stdout" 2> "$out/$name/stderr" &
     pid=$!
@@ -100,4 +102,35 @@ sed -i 's|= ) // value-marker|= 2 // value-marker|' "$out/broken/program.ab"
 finish broken
 grep -q '^ablac run --watch: applied: value' "$out/broken/stderr" ||
     { echo 'live watch (broken): the good save was not applied' >&2; cat "$out/broken/stderr" >&2; exit 1; }
-echo "live watch: a save is applied while the program runs; a broken one keeps it running"
+
+# restart: a save the running code cannot take (value()'s result type changes, E_LIVE_SIGNATURE) restarts the run, the
+# same process with the same arguments, on the saved source (one line on stderr says why). The restarted run's first
+# reload, refused for the same reason (the type changed back), does not restart again: it says so and keeps running
+# its code, and a later save it can take is applied (exit 42).
+start restart restart.ab
+first=$pid
+rm -f "$out/restart/started"
+sed -i 's|^fun value(): int = 1 // value-marker|fun value(): i32 = 3 // value-marker|' "$out/restart/program.ab"
+for _ in $(seq 600); do
+    [[ $(cat "$out/restart/started" 2> /dev/null) == 'started 3' ]] && break
+    kill -0 "$pid" 2> /dev/null || break
+    sleep 0.1
+done
+[[ $(cat "$out/restart/started" 2> /dev/null) == 'started 3' ]] ||
+    { echo 'live watch (restart): the program did not start again on the saved source' >&2; cat "$out/restart/stderr" >&2; exit 1; }
+[[ $(grep -c '^ablac run --watch: restarting the program: E_LIVE_SIGNATURE: value' "$out/restart/stderr") -eq 1 ]] ||
+    { echo 'live watch (restart): no one line naming the refused function' >&2; cat "$out/restart/stderr" >&2; exit 1; }
+[[ $pid == "$first" ]] && kill -0 "$pid" 2> /dev/null ||
+    { echo 'live watch (restart): the run did not stay the same process' >&2; exit 1; }
+rm -f "$out/restart/started"
+sed -i 's|^fun value(): i32 = 3 // value-marker|fun value(): int = 1 // value-marker|' "$out/restart/program.ab"
+wait_lines restart 2
+grep -q '^ablac run --watch: refused again after a restart, not restarting; the program keeps running its code: E_LIVE_SIGNATURE: value' "$out/restart/stderr" ||
+    { echo 'live watch (restart): the same refusal after a restart restarted again' >&2; cat "$out/restart/stderr" >&2; exit 1; }
+sleep 1
+[[ ! -e $out/restart/started ]] || { echo 'live watch (restart): the program started a third time' >&2; exit 1; }
+sed -i 's|^fun value(): int = 1 // value-marker|fun value(): i32 = 2 // value-marker|' "$out/restart/program.ab"
+finish restart
+grep -q '^ablac run --watch: applied: value' "$out/restart/stderr" ||
+    { echo 'live watch (restart): the save after the refusal was not applied' >&2; cat "$out/restart/stderr" >&2; exit 1; }
+echo "live watch: a save is applied while the program runs; a broken one keeps it running; a refused one restarts it, once for the same reason"

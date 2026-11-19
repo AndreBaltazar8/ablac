@@ -1089,7 +1089,7 @@ mmap form) apply there.
   (stage 3: an edited lambda is matched to the running one, so closures made before take its new
   body; new lambdas reach code that was not redefined through a registry). Done since: live by default on an
   x86-64 Linux host (decision #65, `--no-live` opts out), and `run --watch` (`src/live_watch.ab`: reloads when one
-  of the program's own source files changes, inotify or kqueue, the outcome on stderr; kqueue confirmed on both Macs in CI run 43974380493).
+  of the program's own source files changes, inotify or kqueue, the outcome on stderr; kqueue confirmed on both Macs in CI run 43974380493; a save the running code cannot take restarts the run).
   Freeing old generations: measured (4 to 76 kB of code a reload), not worth building yet; a run notes once past
   256 MB (docs/design/live-jit.md).
 

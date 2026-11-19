@@ -473,15 +473,21 @@ table; `ABLA_LIVE_DUMP=<dir>` writes each compiled body per generation as `<gene
 Only x86-64 Linux has been tested. What is built and what is not: [the design](design/live-jit.md).
 
 `ablac run --watch` is a live run that reloads by itself: when one of the program's own source files changes, the
-same reload runs and its outcome goes to stderr as one line, `ablac run --watch: applied: <functions>`, a refusal
-with its code, or `E_LIVE_COMPILE` after the diagnostics. A refused reload, or a save that does not compile, keeps
-the program running its code, and the next good save is applied. The program's `main` runs on a thread of its own,
-and the compiler's thread waits for the files to change (`abla/fs/watch`: inotify on Linux, kqueue on macOS,
+same reload runs and its outcome goes to stderr as one line, `ablac run --watch: applied: <functions>`, or
+`E_LIVE_COMPILE` after the diagnostics. A save that does not compile keeps the program running its code, and the
+next good save is applied. A save the running code cannot take (a refusal: a changed signature or layout, a new
+global; or new code that does not link) restarts the run: one line, `ablac run --watch: restarting the program:
+<code>: <function>: <why>`, then ablac replaces itself (the same process) with a fresh run of the same arguments
+and environment, so the program starts again on the saved sources and its state is lost (its descriptors close: the
+standard library opens them close-on-exec). The restarted run takes its reason out of the environment before the
+program sees it (`ABLAC_WATCH_RESTARTED`); if its first reload is refused for that same reason, it says so and keeps
+running its code rather than restarting again. A reload the program asked for itself (`liveReload`) never restarts.
+The program's `main` runs on a thread of its own, and the compiler's thread waits for the files to change (`abla/fs/watch`: inotify on Linux, kqueue on macOS,
 through system calls, no libc). It lets a burst of writes settle (an editor saves in several steps: a quiet 120 ms,
 at most about 3 s) and reloads only when a file's contents changed. Only the files the module graph read are
 watched, not the standard library, the cache or output directories, and the list follows each reload (an added
 import is watched from then on). `--watch` implies `--live`; it does not go with `--built`, `--release` or
-`--no-live`. `tools/test-live-watch.sh` edits a running program and saves a broken file.
+`--no-live`. `tools/test-live-watch.sh` edits a running program, saves a broken file and changes a result type.
 
 ## Compiler diagnostics
 

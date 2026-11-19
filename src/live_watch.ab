@@ -13,6 +13,7 @@ import "abla/unsafe/memory"
 import "abla/unsafe/memory/raw"
 import "abla/sys/linux"
 import "abla/sys/linux/io"
+import "abla/sys/linux/process"
 import "live_reload.ab"
 
 
@@ -84,11 +85,84 @@ trusted fun bootstrapLiveWatchStep(): void {
         message = adoptNativeString(address, length)
     }
     buffer.close()
-    val outcome = if (status == 0) message
-        else if (status == 2) "$message; the program keeps running its code"
-        else "refused, the program keeps running its code: $message"
-    linuxPrintStandardError("ablac run --watch: ${outcome.trim()}\n")
+    bootstrapLiveWatchReloads = bootstrapLiveWatchReloads + 1
+    // Refused (not busy: the program's own reload was running) or not linked: a restart applies the save.
+    if ((status == 1 && !message.startsWith("E_LIVE_BUSY")) || (status == 2 && message.startsWith("E_LIVE_LINK"))) {
+        bootstrapLiveRestart(bootstrapLiveOneLine(message))
+    } else {
+        val outcome = if (status == 0) message
+            else if (status == 2) "$message; the program keeps running its code"
+            else "refused, the program keeps running its code: $message"
+        linuxPrintStandardError("ablac run --watch: ${outcome.trim()}\n")
+    }
     // An import added or removed: watch the files the reload read.
     if (!bootstrapLiveSamePaths(bootstrapLiveWatchedPaths, bootstrapLiveWatchPaths)) bootstrapLiveWatchOpen()
+    return
+}
+
+// The watch of a run that starts: a restarted run first takes its reason out of the environment.
+fun bootstrapLiveWatchStart(): void {
+    bootstrapLiveRestartReason = bootstrapLiveTakeRestartReason()
+    bootstrapLiveWatchReloads = 0
+    bootstrapLiveWatchOpen()
+    return
+}
+
+// A reload the watch cannot apply (refused: a signature, a layout, a new global; or code that did not link) restarts
+// the run: ablac replaces itself with a fresh run of the same arguments and environment (linuxReexecute: the running
+// image, the same argv and envp), so the program starts again on the saved sources. Its state is lost and its
+// descriptors close (the standard library opens them close-on-exec). The new run learns why through
+// ABLAC_WATCH_RESTARTED, which it takes out of its environment before the program sees it: if its first reload is
+// refused for that same reason, it says so and keeps running its code rather than restarting again.
+val bootstrapLiveRestartVariable = "ABLAC_WATCH_RESTARTED"
+var bootstrapLiveRestartReason = ""
+var bootstrapLiveWatchReloads = 0
+
+// Takes ABLAC_WATCH_RESTARTED out of this process's environment (the entries after it move down one), returning its
+// value, or "" without one.
+trusted fun bootstrapLiveTakeRestartReason(): string {
+    val environment = nativePointerAddress(linuxEnvironmentPointer())
+    if (environment == 0) return ""
+    val prefix = "$bootstrapLiveRestartVariable="
+    var reason = ""
+    var found = false
+    var slot = 0
+    var current = ablaUnsafeLoadI64(nativePointerFromAddress(environment))
+    while (current != 0) {
+        val entry = borrowNativeCString(nativePointerFromAddress(current))
+        if (!found && entry.startsWith(prefix)) {
+            reason = entry.slice(prefix.size, entry.size)
+            found = true
+        }
+        if (found) ablaUnsafeStoreI64(nativePointerFromAddress(environment + slot * 8),
+            ablaUnsafeLoadI64(nativePointerFromAddress(environment + (slot + 1) * 8)))
+        slot = slot + 1
+        current = ablaUnsafeLoadI64(nativePointerFromAddress(environment + slot * 8))
+    }
+    reason
+}
+
+// The reasons of a refusal on one line.
+fun bootstrapLiveOneLine(message: string): string {
+    var line = ""
+    for (part in message.trim().split("\n")) {
+        val piece = part.trim()
+        if (piece != "") line = if (line == "") piece else "$line; $piece"
+    }
+    line
+}
+
+trusted fun bootstrapLiveRestart(reason: string): void {
+    if (bootstrapLiveWatchReloads == 1 && reason == bootstrapLiveRestartReason) {
+        linuxPrintStandardError("ablac run --watch: refused again after a restart, not restarting; the program keeps running its code: $reason\n")
+        return
+    }
+    linuxPrintStandardError("ablac run --watch: restarting the program: $reason\n")
+    bootstrapLiveWatchEvents.close()
+    val environment = linuxEnvironmentEntries()
+    environment.append("$bootstrapLiveRestartVariable=$reason")
+    linuxReexecuteWithEnvironment(environment)
+    linuxPrintStandardError("ablac run --watch: could not restart; the program keeps running its code\n")
+    bootstrapLiveWatchOpen()
     return
 }
