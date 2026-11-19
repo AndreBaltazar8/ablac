@@ -1150,8 +1150,9 @@ mmap form) apply there.
   cores (16 to 31 of its hybrid CPU), not the parallel mark: pinned to cores 16-23 the serial run takes 37.3 s (user 34.6 s) and 2 threads 35.6 s,
   pinned to cores 0-7 24.9 s and 22.3 s (`taskset`, ABLA_GC_TRACE pauses 6.0 s and 5.1 s against 4.6 s and 2.9 s). Timing runs on this machine
   must be pinned to one kind of core. (The gate's slot 3 is cores 16-23.)
-  *The HTTP event servers do not turn on background freeing* (`memorySetBackgroundFree`), so ABLA_GC_WORKERS does nothing for them today (the parallel mark is part of
-  that collection); whether they should is a later question (its cost: a helper thread and a wait for it at the next collection).
+  *The HTTP event servers now turn on background freeing and four collection threads* (httpEventServerCollector, called by the three
+  `httpEventServer*` constructors; ABLA_GC_WORKERS overrides). A static (libc-free) program starts the helper and the workers with its own
+  `abla_clone_create`, so no new libc import. Burst server (8 parallel /big, 5 rounds, 3 runs, cores 0-7): pause 2.0-2.2 s -> 1.0-1.1 s, burst 5.4-5.8 s -> 3.6 s, CPU the same, idle RSS 206 -> 188-199 MB. The batch compiler stays serial: a one-stage build's wall time is the same with 4 workers (4 cores 86.0-94.5 s -> 84.8-85.4 s, 16 cores 45.4-48.5 s -> 46.3-49.1 s) and its CPU 2% higher.
 - [ ] **Deferred: `where` clauses and `const` type parameters (André's decision #63).** Both stay reserved
   (`E_PARSE_NOT_YET_SUPPORTED`); no code asks for either. `where` would be sugar over the existing bounds
   (about 110 lines: parser, formatter, tests, docs) and must never make a class's methods conditional. `const`

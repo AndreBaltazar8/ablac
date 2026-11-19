@@ -67,6 +67,16 @@ for mode in release fast; do
         result=$(ABLA_GC_WORKERS=$workers ABLA_GC_STRESS=1 "$root/tools/run-limited.sh" "$out/sweep.$mode" 400 2>&1 | tr -d "\\0") || status=$?
         [[ $status -eq 0 && $result == "gc parallel sweep ok:"* ]] || fail "sweep, $workers threads under stress ($mode) failed ($status): ${result: -300}"
     done
+    # An event HTTP server's program gets background freeing and four threads by default (tests/cases/gc-parallel/event.ab only
+    # makes a server and collects): the trace names the parallel sweep and mark; ABLA_GC_WORKERS=0 turns both off with the same result.
+    "$compiler" build tests/cases/gc-parallel/event.ab -o "$out/event.$mode" "${flags[@]}" > "$out/event.$mode.build" 2>&1 \
+        || { cat "$out/event.$mode.build" >&2; fail "event server program ($mode) did not build"; }
+    status=0
+    result=$(ABLA_GC_TRACE=1 "$root/tools/run-limited.sh" "$out/event.$mode" 2>&1 | tr -d "\\0") || status=$?
+    [[ $status -eq 0 && $result == *"event gc ok:"* ]] || fail "event server ($mode) failed ($status): ${result: -300}"
+    [[ $result == *"gc: parallel sweep, slots"* && $result == *"gc: parallel mark"* ]] || fail "event server ($mode): the default is not four collection threads"
+    plain=$(ABLA_GC_WORKERS=0 ABLA_GC_TRACE=1 "$root/tools/run-limited.sh" "$out/event.$mode" 2>&1 | tr -d "\\0") || fail "event server, workers 0 ($mode) failed"
+    [[ $plain == *"event gc ok:"* && $plain != *"gc: parallel"* ]] || fail "event server ($mode): ABLA_GC_WORKERS=0 did not turn the threads off"
     echo "gc parallel ($mode): 2, 4 and 8 threads equal the serial mark and sweep; stress and the frozen graph pass"
 done
 # One CPU shared with busy loops: the threads run beside the loops and must finish in about the serial time.
