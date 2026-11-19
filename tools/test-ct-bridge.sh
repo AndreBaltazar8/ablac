@@ -73,14 +73,25 @@ compare_case() {
     # A case long by nature (tests/cases/ct-bridge/long-loopback.txt) gets three times the wall limit in each tier.
     local seconds=$ABLA_MAX_SECONDS
     [[ $long_cases != *" $source "* ]] || seconds=$((ABLA_MAX_SECONDS * 3))
+    # The bridge tier first: it writes $base.mark at its first routed call (ABLA_COMPILE_EVAL_BRIDGE_MARK). A run that
+    # writes none made no such call, and away from them it is the interpreter's own run, so there is nothing to compare
+    # (about half of the cases; RUN_TESTS_FULL=1 or CT_BRIDGE_ALL=1 compares them too).
+    rm -f "$base.mark"
     fresh_work
-    (cd "$work" && env ${limit:+ABLA_COMPILE_EVAL_TIME_LIMIT=$limit} ABLA_MAX_SECONDS=$seconds ABLA_MAX_CPU_SECONDS=$seconds \
+    # (Neither tier journals actions: ABLA_ACTION_JOURNAL is the interpreter's alone, which would make them differ.)
+    (cd "$work" && env -u ABLA_ACTION_JOURNAL ${limit:+ABLA_COMPILE_EVAL_TIME_LIMIT=$limit} ABLA_MAX_SECONDS=$seconds ABLA_MAX_CPU_SECONDS=$seconds \
+        ABLA_COMPILE_EVAL=bridge ABLA_COMPILE_EVAL_BRIDGE_MARK="$base.mark" \
+        "$project_root/tools/run-limited.sh" "$compiler" --emit-llvm "$source" \
+        > "$base.bridge.ll" 2> "$base.bridge.err") || bridge_status=$?
+    if [[ ! -f $base.mark && -z ${CT_BRIDGE_ALL:-${RUN_TESTS_FULL:-}} && $bridge_status -ne 124 && $bridge_status -ne 152 ]]; then
+        rm -rf "$work"
+        echo "$source" >> "$output_directory/loopback/unrouted.txt"
+        return 0
+    fi
+    fresh_work
+    (cd "$work" && env -u ABLA_ACTION_JOURNAL ${limit:+ABLA_COMPILE_EVAL_TIME_LIMIT=$limit} ABLA_MAX_SECONDS=$seconds ABLA_MAX_CPU_SECONDS=$seconds \
         ABLA_COMPILE_EVAL=interp "$project_root/tools/run-limited.sh" "$compiler" --emit-llvm "$source" \
         > "$base.interp.ll" 2> "$base.interp.err") || interp_status=$?
-    fresh_work
-    (cd "$work" && env ${limit:+ABLA_COMPILE_EVAL_TIME_LIMIT=$limit} ABLA_MAX_SECONDS=$seconds ABLA_MAX_CPU_SECONDS=$seconds \
-        ABLA_COMPILE_EVAL=bridge "$project_root/tools/run-limited.sh" "$compiler" --emit-llvm "$source" \
-        > "$base.bridge.ll" 2> "$base.bridge.err") || bridge_status=$?
     rm -rf "$work"
     # run-limited's wall (124) or CPU (152) limit stopped a tier: that is no result to compare, whichever tier finished.
     local tier stopped=""
@@ -119,17 +130,28 @@ for long_case in $long_cases; do
 done
 export compiler project_root output_directory work_template long_cases
 export -f compare_case
+mkdir -p "$output_directory/loopback"
+rm -f "$output_directory/loopback/unrouted.txt"
 printf '%s\0' "${cases[@]}" |
     xargs -0 -n1 -P "${CT_BRIDGE_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}" \
         bash -c 'compare_case "$1"' compare_case
 # The capture case must pass in both tiers, not merely agree: a failed check's text ("check 11: failure=...") is in the output.
+# (A case that makes no routed call has only the bridge tier's output, which is the interpreter's run.)
 for tier in interp bridge; do
+    [[ -f $output_directory/loopback/compiler-capture-process_main.ab.$tier.ll ]] || continue
     if grep -q 'check [0-9]*: failure=' "$output_directory/loopback/compiler-capture-process_main.ab.$tier.ll"; then
         grep -o 'check [0-9]*: failure=[^"]*' "$output_directory/loopback/compiler-capture-process_main.ab.$tier.ll" >&2
         echo "ct-bridge: tests/cases/compiler-capture-process/main.ab failed one of its checks under $tier" >&2
         exit 1
     fi
 done
+unrouted=$(cat "$output_directory/loopback/unrouted.txt" 2>/dev/null | wc -l)
+compared=$(( ${#cases[@]} - unrouted ))
+# The routed cases are the ones the loopback is for: a mark that is never written would leave none compared.
+if (( compared < 100 )); then
+    echo "ct-bridge: only $compared of ${#cases[@]} cases crossed the bridge (100 expected at least; 166 did on 2026-11-19): is ABLA_COMPILE_EVAL_BRIDGE_MARK written?" >&2
+    exit 1
+fi
 
 # Native: shims for the whole compiler API, then a program calling them.
 ABLA_CT_BRIDGE_SHIMS_OUT="$output_directory/shims.ab" \
@@ -302,4 +324,5 @@ if grep -q '^cache-hit$' "$output_directory/subparser-cache.ll"; then
 fi
 [[ $(run_status "$output_directory/subparser-cache") -eq 42 ]]
 
-printf 'ct-bridge: %s loopback cases, native shims ok\n' "${#cases[@]}"
+printf 'ct-bridge: %s loopback cases (%s cross the bridge and match the interpreter; %s make no routed call), native shims ok\n' \
+    "${#cases[@]}" "$compared" "$unrouted"
