@@ -2170,7 +2170,12 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   of the item above, and the medians are 1,420,024 and 1,417,600 (-0.2%): no sign that the change raises the peak.
   The change's gate (stage 2 == stage 3, `make self-rebuild`, suite 312/312) ran before its rebase onto the pin;
   batch 2's combined gate on master (stage 2 == stage 3, self-rebuild, 317/317) covers the merged tip.
-- [ ] **Reuse the frontend's work on the standard library between builds** (parked 2026-11-08). In the profile
+- [ ] **Reuse the frontend's work on the standard library between builds** (parked 2026-11-08; next in line after
+  per-call boxing, lead 2026-11-19). It is the suite's structural lever: on 2026-11-19 the gate's suite was about
+  6,800-7,500 CPU-seconds over about 490 commands, nearly all of it compiler calls, and after the per-test cuts
+  (be0edb51, 2fbb1219, 3580e3ea, 710dbf4d: about 415 CPU-s) what is left is spread thin over many small builds
+  (test-self-hosted: 450 builds of 0.2 to 2.5 s at --fast; the compile-eval shared-state test: 80 of about 1 s), each
+  analysing the same standard library again. In the profile
   above the compiler's own code is 58 to 59% of a `--fast` build and the standard library's modules are
   most of what a small program imports, so lexing, parsing, analyzing and lowering them again each
   build is the largest block left. My estimate, not a measurement: if a build could load their analyzed
