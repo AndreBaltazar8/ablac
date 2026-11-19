@@ -29,7 +29,7 @@ ablac build app.ab -o build/app
 ablac build app.ab -o build/app --fast
 ablac build app.ab -o build/app --fast --no-cache
 ablac build app.ab -o build/app -g        # debug information in a release build
-ablac run app.ab -- arguments  # compiled in process (--o1 IR pipeline) and called there, live on x86-64 Linux (--no-live; --watch reloads on a save)
+ablac run app.ab -- arguments  # compiled in process (--o1 IR pipeline) and called there, live on x86-64 Linux and macOS (--no-live; --watch reloads on a save)
 ablac run --built app.ab   # built (--o1, cached) and exec'd
 ablac test tests/*.ab      # build and run test programs (abla/test)
 ablac fmt --check src/     # check layout without writing (formatter.md)
@@ -429,8 +429,8 @@ different execution backend for that IR and must pass interpreter/JIT parity.
 ### Live run: `ablac run` (`--no-live` to opt out)
 
 `ablac run` (with the default `--o1` or with `--fast`) runs the program so that its functions can be redefined
-while it runs. It is the default where live mode is supported, an x86-64 Linux host (decision #65); `--no-live`
-runs it as before, and elsewhere (macOS, AArch64 Linux) `run` is not live unless `--live` asks. `--built` and
+while it runs. It is the default where live mode is supported, x86-64 Linux and macOS (decision #65); `--no-live`
+runs it as before, and elsewhere `run` is not live unless `--live` asks (no ablac is built for AArch64 Linux). `--built` and
 `--release` ignore both without a warning, and `ablac build` and `ablac test` never build this way.
 
 The functions of the program's own source files (not the standard library, the runtime or module
@@ -470,7 +470,7 @@ running; the message names the reason:
 A program that no longer compiles is `failed` with `E_LIVE_COMPILE` (the diagnostics go to stderr), and new code
 that cannot be loaded is `E_LIVE_LINK`. `ABLA_LIVE_TRACE` (any value) prints how many functions go through the
 table; `ABLA_LIVE_DUMP=<dir>` writes each compiled body per generation as `<generation>-<name>.ll`.
-Only x86-64 Linux has been tested. What is built and what is not: [the design](design/live-jit.md).
+Tested on x86-64 Linux and on both Macs (arm64 and Intel, in CI). What is built and what is not: [the design](design/live-jit.md).
 
 `ablac run --watch` is a live run that reloads by itself: when one of the program's own source files changes, the
 same reload runs and its outcome goes to stderr as one line, `ablac run --watch: applied: <functions>`, or

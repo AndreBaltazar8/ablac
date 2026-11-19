@@ -4,7 +4,7 @@
 # it. tests/cases/live-jit/calls.ab reaches functions every way a call can (direct, recursive, by
 # value, by closure, from a thread, a generator, a method; struct, string and scalar results) and
 # must print the same lines and exit 42 live and with --no-live, release (--o1) and --fast. The
-# live runs (the default on x86-64 Linux) must report that functions went through the table (ABLA_LIVE_TRACE),
+# live runs (the default on x86-64 Linux and macOS) must report that functions went through the table (ABLA_LIVE_TRACE),
 # and a --no-live run must not. The object cache is off, so each run compiles.
 # Then tests/cases/live-jit/reload.ab redefines its own functions while it runs (abla/live), also when
 # the live run starts from the object cache, and tests/cases/live-jit/refuse.ab checks the refusals.
@@ -85,10 +85,10 @@ run() {
         exit 1
     fi
 }
-# `ablac run` is live by default on an x86-64 Linux host (decision #65): there the live run gives no flag, and
+# `ablac run` is live by default on x86-64 Linux and macOS (decision #65): there the live run gives no flag, and
 # elsewhere it asks with --live; --no-live runs it as before.
 live_flags=()
-[[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || live_flags=(--live)
+[[ $(uname -s) == Darwin || $(uname -m) == x86_64 ]] || live_flags=(--live)
 for profile in o1 fast; do
     run "plain-$profile" "--$profile" --no-live
     run "live-$profile" "--$profile" ${live_flags[@]+"${live_flags[@]}"}

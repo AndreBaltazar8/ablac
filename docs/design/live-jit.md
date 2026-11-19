@@ -14,7 +14,7 @@ the table is what exists. For using it, see "Live run" in [the toolchain interfa
 | 3 | Lambdas: a changed or added lambda is refused today (`E_LIVE_LAMBDA`) | not built |
 | - | `--watch`: a reload when one of the program's own source files changes (inotify, kqueue), printed on stderr; a save the running code cannot take restarts the run | built (`src/live_watch.ab`, `tools/test-live-watch.sh`) |
 | - | `liveDefine(path)`, `E_LIVE_REMOVED`, `E_LIVE_SUMMARY` | not built; what a removed function does has not been defined |
-| - | Platforms | tested on x86-64 Linux only |
+| - | Platforms | live by default and tested on x86-64 Linux and macOS (arm64, Intel); no ablac is built for AArch64 Linux |
 
 Decision taken for question 1 below: live mode is **opt-in** (`--live`); without it nothing changes and no table is built.
 
@@ -328,7 +328,7 @@ stopped thread, or in any live heap object that holds an address inside G's memo
 - A generation that added a lambda is kept: a closure carries the lambda's id, not an address. Freeing those
   needs the registry to know which ids are still held (a scan for closure objects by id).
 - The base module is never freed (it has the runtime, the globals and the class descriptors).
-- Only x86-64 Linux, where live mode is tested; macOS keeps every generation until the probe is repeated there.
+- Measured on x86-64 Linux; macOS (live by default there too) has not been measured.
 
 ### Questions for the lead / André
 
