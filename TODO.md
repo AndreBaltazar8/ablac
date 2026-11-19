@@ -1122,6 +1122,18 @@ mmap form) apply there.
     1,550,000 kB is 1.6% under what its own tree measures today. With the auto tier on, master 6040c155's stage 2 peaks at
     1.695 to 1.701 GB and the AF tip caef75c1's at 1.751 to 1.754 GB (four runs each, interleaved, the test's method): +3.2%
     for 0.6% more source, the tier's side (ablac-9e).
+- [ ] **A collection's mark and sweep are proportional to the whole heap, not to what changed (2026-11-19, ablac-4e).** The editor
+  service's edit loop (`tools/test-analysis-memory.sh`'s three analyses and an edit on the compiler's own source, `ABLA_GC_TRACE=1`)
+  runs 16 stop-the-world collections that take 3.9 s of its roughly 22 s, and a pause grows with the live heap: 35 ms at 134 MB
+  live, 117 ms at 407 MB, 276 ms at 895 MB, 483 ms at 1.24 GB and 587 ms at 1.43 GB, about 0.4 ms per MB live. A perf profile of that
+  loop (cpu-clock, `-g` build for names) puts the marker's `CollectionLocate` (via `MarkPointer`, from `TraceMarkedAllocations`) at 7.5%
+  of CPU and `BackgroundSweep`, a pass over every registry slot, at 6.1%; the allocator's merging on the background free thread (`HeapConsolidate`, `HeapMerge`,
+  `HeapFreeLocked`) is another 14%. The frozen graph is already neither marked nor swept; everything else is, every time. Making a
+  collection cost what changed means a generational or sticky-mark scheme (an old generation marked once and revisited only through a
+  remembered set or card marks), which needs a way to see stores into old objects (a write barrier). Not started: the measured case for it is above.
+  The editor's freezes are a smaller slice of the same loop: 278 of them, 1.9 s (`gc: freeze <n> ms` in the trace), each building the page directory over
+  the whole registry. A freeze that found blocks from the registry alone, as a collection does, was tried and gained nothing: every freeze met an interior
+  pointer (a slice of the source text) within its first blocks and built the directory anyway. A directory kept between freezes is the open way.
 - [ ] **Deferred: `where` clauses and `const` type parameters (André's decision #63).** Both stay reserved
   (`E_PARSE_NOT_YET_SUPPORTED`); no code asks for either. `where` would be sugar over the existing bounds
   (about 110 lines: parser, formatter, tests, docs) and must never make a class's methods conditional. `const`
