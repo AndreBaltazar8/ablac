@@ -213,7 +213,7 @@ private fun deflateFixedLengths(): array<int> {
 
 /** One block of the tokens `tokens`, covering the `covered` input bytes that start at `start`, `last` or not: whichever of a stored, a fixed-code and a dynamic-code block
  *  is the smallest. `lengthCode` maps a length to its code. */
-private trusted fun deflateWriteBlock(var writer: DeflateBitWriter, input: string, start: int, covered: int, tokens: array<int>, last: bool,
+private trusted fun deflateWriteBlock(var writer: DeflateBitWriter, input: string, start: int, covered: int, tokenBase: int, tokenCount: int, tokens: array<int>, last: bool,
     lengthCode: array<int>): void {
     // The frequencies, and the extra bits the tokens carry whatever the codes are.
     val litFreq: array<int> = []
@@ -221,7 +221,8 @@ private trusted fun deflateWriteBlock(var writer: DeflateBitWriter, input: strin
     val distFreq: array<int> = []
     for (i in 0 until 30) distFreq.append(0)
     var extraBits = 0
-    for (token in tokens) {
+    for (index in 0 until tokenCount) {
+        val token = if (tokenBase != 0) ablaUnsafeLoadU32(nativePointerFromAddress(tokenBase + index * 4)) else tokens[index]
         if (token < 256) litFreq[token] = litFreq[token] + 1
         else {
             val length = ((token >> 15) & 255) + 3
@@ -371,7 +372,8 @@ private trusted fun deflateWriteBlock(var writer: DeflateBitWriter, input: strin
         litCodes = deflateCodes(litLengths, 286)
         distCodes = deflateCodes(distLengths, 30)
     }
-    for (token in tokens) {
+    for (index in 0 until tokenCount) {
+        val token = if (tokenBase != 0) ablaUnsafeLoadU32(nativePointerFromAddress(tokenBase + index * 4)) else tokens[index]
         if (token < 256) writer.append(litCodes[token], litCodeLengths[token])
         else {
             val length = ((token >> 15) & 255) + 3
@@ -387,6 +389,14 @@ private trusted fun deflateWriteBlock(var writer: DeflateBitWriter, input: strin
     }
     writer.append(litCodes[256], litCodeLengths[256])
     return
+}
+
+/** The token buffer doubled (the tokens are not flushed while a match is pending, which on data without matches is for ever). */
+private trusted fun deflateGrowTokens(base: int, count: int): int {
+    val grown = ablaUnsafePointerAddress(ablaUnsafeAllocate(count * 2 * 4))
+    ablaUnsafeCopyMemory(grown, base, count * 4)
+    ablaUnsafeFree(nativePointerFromAddress(base))
+    grown
 }
 
 private fun deflateHash(a: int, b: int, c: int, mask: int): int = (((a << 10) ^ (b << 5) ^ c) * 2654435761 >>> 8) & mask
@@ -406,15 +416,28 @@ private trusted fun deflateCompress(input: string, searchLimit: int): string {
     var hashBits = 8
     while (hashBits < 15 && (1 << hashBits) < size) hashBits = hashBits + 1
     val mask = (1 << hashBits) - 1
+    val native = !ablaAtCompileTime()
     val head: array<int> = []
-    for (i in 0 until (1 << hashBits)) head.append(-1)
     val prev: array<int> = []
-    for (i in 0 until size) prev.append(-1)
+    val headSize = 1 << hashBits
+    var table = 0
+    if (native) {
+        table = ablaUnsafePointerAddress(ablaUnsafeAllocate((headSize + size) * 4))
+        for (i in 0 until headSize + size) ablaUnsafeStoreU32(nativePointerFromAddress(table + i * 4), 0)
+    } else {
+        for (i in 0 until headSize) head.append(-1)
+        for (i in 0 until size) prev.append(-1)
+    }
+    val prevAt = table + headSize * 4
     val data = if (ablaAtCompileTime()) 0 else ablaUnsafeStringAddress(input)
     var chainLimit = searchLimit
     if (chainLimit > 4096) chainLimit = 4096
     if (chainLimit < 1) chainLimit = 1
+    // At run time the tokens, the hash heads and the chains live in native memory (positions plus one, 0 for none); the compile-time evaluator keeps arrays.
     var tokens: array<int> = []
+    var tokenCount = 0
+    var tokenBase = if (native) ablaUnsafePointerAddress(ablaUnsafeAllocate(16400 * 4)) else 0
+    var tokenCapacity = 16400
     var blockStart = 0
     var position = 0
     var previousLength = 2
@@ -429,9 +452,9 @@ private trusted fun deflateCompress(input: string, searchLimit: int): string {
             val b = if (ablaAtCompileTime()) input[position + 1] else ablaUnsafeLoadU8(nativePointerFromAddress(data + position + 1))
             val c = if (ablaAtCompileTime()) input[position + 2] else ablaUnsafeLoadU8(nativePointerFromAddress(data + position + 2))
             val h = deflateHash(a, b, c, mask)
-            candidate = head[h]
-            prev[position] = candidate
-            head[h] = position
+            candidate = if (native) ablaUnsafeLoadU32(nativePointerFromAddress(table + h * 4)) - 1 else head[h]
+            if (native) ablaUnsafeStoreU32(nativePointerFromAddress(prevAt + position * 4), candidate + 1) else prev[position] = candidate
+            if (native) ablaUnsafeStoreU32(nativePointerFromAddress(table + h * 4), position + 1) else head[h] = position
             inserted = position
         }
         var length = 2
@@ -458,14 +481,20 @@ private trusted fun deflateCompress(input: string, searchLimit: int): string {
                     distance = position - candidate
                     if (matched >= 128) steps = chain
                 }
-                candidate = prev[candidate]
+                candidate = if (native) ablaUnsafeLoadU32(nativePointerFromAddress(prevAt + candidate * 4)) - 1 else prev[candidate]
             }
             // A match of three bytes far away costs more than the three literals.
             if (length == 3 && distance > 4096) length = 2
         }
         if (previousLength >= 3 && length <= previousLength) {
             // The previous position's match stands: it covers bytes from position - 1.
-            tokens.append(deflateMatchToken(previousLength, previousDistance))
+            val matchToken = deflateMatchToken(previousLength, previousDistance)
+            if (native && tokenCount >= tokenCapacity) {
+                tokenBase = deflateGrowTokens(tokenBase, tokenCount)
+                tokenCapacity = tokenCapacity * 2
+            }
+            if (native) ablaUnsafeStoreU32(nativePointerFromAddress(tokenBase + tokenCount * 4), matchToken) else tokens.append(matchToken)
+            tokenCount = tokenCount + 1
             var next = position + 1
             val stop = position - 1 + previousLength
             while (next < stop) {
@@ -474,8 +503,8 @@ private trusted fun deflateCompress(input: string, searchLimit: int): string {
                     val b = if (ablaAtCompileTime()) input[next + 1] else ablaUnsafeLoadU8(nativePointerFromAddress(data + next + 1))
                     val c = if (ablaAtCompileTime()) input[next + 2] else ablaUnsafeLoadU8(nativePointerFromAddress(data + next + 2))
                     val h = deflateHash(a, b, c, mask)
-                    prev[next] = head[h]
-                    head[h] = next
+                    if (native) ablaUnsafeStoreU32(nativePointerFromAddress(prevAt + next * 4), ablaUnsafeLoadU32(nativePointerFromAddress(table + h * 4))) else prev[next] = head[h]
+                    if (native) ablaUnsafeStoreU32(nativePointerFromAddress(table + h * 4), next + 1) else head[h] = next
                     inserted = next
                 }
                 next = next + 1
@@ -484,7 +513,13 @@ private trusted fun deflateCompress(input: string, searchLimit: int): string {
             matchAvailable = false
             previousLength = 2
         } else if (matchAvailable) {
-            tokens.append(input[position - 1])
+            val literal = input[position - 1]
+            if (native && tokenCount >= tokenCapacity) {
+                tokenBase = deflateGrowTokens(tokenBase, tokenCount)
+                tokenCapacity = tokenCapacity * 2
+            }
+            if (native) ablaUnsafeStoreU32(nativePointerFromAddress(tokenBase + tokenCount * 4), literal) else tokens.append(literal)
+            tokenCount = tokenCount + 1
             position = position + 1
             previousLength = length
             previousDistance = distance
@@ -494,14 +529,27 @@ private trusted fun deflateCompress(input: string, searchLimit: int): string {
             previousLength = length
             previousDistance = distance
         }
-        if (tokens.size >= 16383 && !matchAvailable) {
-            deflateWriteBlock(writer, input, blockStart, position - blockStart, tokens, false, lengthCode)
+        if (tokenCount >= 16383 && !matchAvailable) {
+            deflateWriteBlock(writer, input, blockStart, position - blockStart, tokenBase, tokenCount, tokens, false, lengthCode)
             blockStart = position
             tokens = []
+            tokenCount = 0
         }
     }
-    if (matchAvailable) tokens.append(input[size - 1])
-    deflateWriteBlock(writer, input, blockStart, size - blockStart, tokens, true, lengthCode)
+    if (matchAvailable) {
+        val last = input[size - 1]
+        if (native && tokenCount >= tokenCapacity) {
+            tokenBase = deflateGrowTokens(tokenBase, tokenCount)
+            tokenCapacity = tokenCapacity * 2
+        }
+        if (native) ablaUnsafeStoreU32(nativePointerFromAddress(tokenBase + tokenCount * 4), last) else tokens.append(last)
+        tokenCount = tokenCount + 1
+    }
+    deflateWriteBlock(writer, input, blockStart, size - blockStart, tokenBase, tokenCount, tokens, true, lengthCode)
+    if (native) {
+        ablaUnsafeFree(nativePointerFromAddress(tokenBase))
+        ablaUnsafeFree(nativePointerFromAddress(table))
+    }
     writer.finish()
 }
 
