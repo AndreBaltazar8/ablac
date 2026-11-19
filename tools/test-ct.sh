@@ -173,6 +173,13 @@ clmul_read() { # object, architecture
     grep -q '^ok.*following [1-9]' "$out/$arch-clmul.log" || {
         cat "$out/$arch-clmul.log" >&2; echo "ct: the CLMUL GHASH read followed no call" >&2; exit 1
     }
+    # The four-block GHASH and the eight-block CTR keystream of the hardware path, also with their calls followed.
+    $check --follow-calls "$arch" "$object" ct_fix_ghash_four:@0,@1,@2,@3 ct_fix_ctr_hardware:@0,@1,@3 > "$out/$arch-aes-bulk.log" 2>&1 || {
+        cat "$out/$arch-aes-bulk.log" >&2; echo "ct: a secret reached a branch or an address in the hardware GHASH-by-four or CTR" >&2; exit 1
+    }
+    grep -q '^ok.*following [1-9]' "$out/$arch-aes-bulk.log" || {
+        cat "$out/$arch-aes-bulk.log" >&2; echo "ct: the hardware bulk read followed no call" >&2; exit 1
+    }
     if $check --follow-calls "$arch" "$object" ct_leak_ghash_clmul:@0,@1 > "$out/$arch-clmul-leak.log" 2>&1; then
         echo "ct: the checker missed the CLMUL GHASH leak" >&2; exit 1
     fi

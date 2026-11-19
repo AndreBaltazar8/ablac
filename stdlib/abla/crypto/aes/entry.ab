@@ -794,8 +794,53 @@ private trusted fun aesCbcDecryptExpanded(key: AesKey, iv: string,
     ghashReverse(result.asU8x16()).storeAddress(y)
 }
 
+/** `y` = (y ^ first) * h^4 ^ second * h^3 ^ third * h^2 ^ fourth * h, the four blocks of 16 bytes at `input` taken at once: the carry-less products are added before the one
+ *  reduction (`powers` holds h^2, h^3 and h^4, 48 bytes). The same result as four ghashHardwareMultiply calls. */
+@target("clmul")
+@noinline trusted fun ghashHardwareFour(y: int, h: int, powers: int, input: int): void {
+    val a1 = ghashReverse(u8x16LoadAddress(y) ^ u8x16LoadAddress(input)).asU64x2()
+    val a2 = ghashReverse(u8x16LoadAddress(input + 16)).asU64x2()
+    val a3 = ghashReverse(u8x16LoadAddress(input + 32)).asU64x2()
+    val a4 = ghashReverse(u8x16LoadAddress(input + 48)).asU64x2()
+    val b1 = ghashReverse(u8x16LoadAddress(powers + 32)).asU64x2()
+    val b2 = ghashReverse(u8x16LoadAddress(powers + 16)).asU64x2()
+    val b3 = ghashReverse(u8x16LoadAddress(powers)).asU64x2()
+    val b4 = ghashReverse(u8x16LoadAddress(h)).asU64x2()
+    val low = clmul(a1, b1, 0) ^ clmul(a2, b2, 0) ^ clmul(a3, b3, 0) ^ clmul(a4, b4, 0)
+    val middle = clmul(a1, b1, 16) ^ clmul(a1, b1, 1) ^ clmul(a2, b2, 16) ^ clmul(a2, b2, 1) ^
+        clmul(a3, b3, 16) ^ clmul(a3, b3, 1) ^ clmul(a4, b4, 16) ^ clmul(a4, b4, 1)
+    val high = clmul(a1, b1, 17) ^ clmul(a2, b2, 17) ^ clmul(a3, b3, 17) ^ clmul(a4, b4, 17)
+    val t3 = (low ^ ghashBytesLeft8(middle)).asU32x4()
+    val t6 = (high ^ ghashBytesRight8(middle)).asU32x4()
+    val carry3 = t3 >> 31
+    val carry6 = t6 >> 31
+    val shifted3 = (t3 << 1) | ghashWordsLeft1(carry3)
+    val shifted6 = (t6 << 1) | ghashWordsLeft1(carry6) | ghashWordsRight3(carry3)
+    val first = (shifted3 << 31) ^ (shifted3 << 30) ^ (shifted3 << 25)
+    val reduced = shifted3 ^ ghashWordsLeft3(first)
+    val second = (reduced >> 1) ^ (reduced >> 2) ^ (reduced >> 7) ^ ghashWordsRight1(first)
+    val result = shifted6 ^ reduced ^ second
+    ghashReverse(result.asU8x16()).storeAddress(y)
+}
+
 trusted fun ghashUpdate(y: int, h: int, input: int, size: int, hardware: bool): void {
     var at = 0
+    if (hardware && size >= 64) {
+        // Four blocks per reduction: h^2, h^3 and h^4 first (wiped after: they are the key's).
+        val powers = ablaUnsafePointerAddress(ablaUnsafeAllocate(48))
+        ablaUnsafeCopyMemory(powers, h, 16)
+        ghashHardwareMultiply(powers, h)
+        ablaUnsafeCopyMemory(powers + 16, powers, 16)
+        ghashHardwareMultiply(powers + 16, h)
+        ablaUnsafeCopyMemory(powers + 32, powers + 16, 16)
+        ghashHardwareMultiply(powers + 32, h)
+        while (size - at >= 64) {
+            ghashHardwareFour(y, h, powers, input + at)
+            at = at + 64
+        }
+        aesWipe(powers, 48)
+        ablaUnsafeFree(aesPointer(powers))
+    }
     while (at < size) {
         val take = if (size - at < 16) size - at else 16
         for (i in 0 until take) {
@@ -809,9 +854,80 @@ trusted fun ghashUpdate(y: int, h: int, input: int, size: int, hardware: bool): 
     }
 }
 
+/** The counter bits of a block, big-endian, as the word a little-endian lane holds. */
+@inline fun aesSwapWord(value: int): u32 {
+    val word = value & 4294967295
+    u32(((word & 255) << 24) | (((word >> 8) & 255) << 16) | (((word >> 16) & 255) << 8) | (word >> 24))
+}
+
+/** The CTR keystream of AES on hardware, XORed into `input` for `size` bytes at `output`: eight blocks at a time so that the AESENC latency is hidden, then single blocks, then
+ *  the tail. `counter` is the 16-byte counter block (12 bytes of nonce, a big-endian count): the first block uses count + 1, as aesGcmCrypt always did, and the count is
+ *  left at the last block used; `scratch` is 16 bytes for the tail. */
+@target("aes")
+@noinline trusted fun aesCtrHardware(schedule: int, rounds: int, counter: int, scratch: int, input: int, output: int, size: int): void {
+    val prefix = u32x4LoadAddress(counter)
+    var count = int(aesLoadBig(counter + 12).declassify())
+    val first = u8x16LoadAddress(schedule)
+    val last = u8x16LoadAddress(schedule + rounds * 16)
+    var at = 0
+    while (size - at >= 128) {
+        var s0 = prefix.with(3, aesSwapWord(count + 1)).asU8x16() ^ first
+        var s1 = prefix.with(3, aesSwapWord(count + 2)).asU8x16() ^ first
+        var s2 = prefix.with(3, aesSwapWord(count + 3)).asU8x16() ^ first
+        var s3 = prefix.with(3, aesSwapWord(count + 4)).asU8x16() ^ first
+        var s4 = prefix.with(3, aesSwapWord(count + 5)).asU8x16() ^ first
+        var s5 = prefix.with(3, aesSwapWord(count + 6)).asU8x16() ^ first
+        var s6 = prefix.with(3, aesSwapWord(count + 7)).asU8x16() ^ first
+        var s7 = prefix.with(3, aesSwapWord(count + 8)).asU8x16() ^ first
+        for (round in 1 until rounds) {
+            val key = u8x16LoadAddress(schedule + round * 16)
+            s0 = aesEncRound(s0, key)
+            s1 = aesEncRound(s1, key)
+            s2 = aesEncRound(s2, key)
+            s3 = aesEncRound(s3, key)
+            s4 = aesEncRound(s4, key)
+            s5 = aesEncRound(s5, key)
+            s6 = aesEncRound(s6, key)
+            s7 = aesEncRound(s7, key)
+        }
+        (aesEncLastRound(s0, last) ^ u8x16LoadAddress(input + at)).storeAddress(output + at)
+        (aesEncLastRound(s1, last) ^ u8x16LoadAddress(input + at + 16)).storeAddress(output + at + 16)
+        (aesEncLastRound(s2, last) ^ u8x16LoadAddress(input + at + 32)).storeAddress(output + at + 32)
+        (aesEncLastRound(s3, last) ^ u8x16LoadAddress(input + at + 48)).storeAddress(output + at + 48)
+        (aesEncLastRound(s4, last) ^ u8x16LoadAddress(input + at + 64)).storeAddress(output + at + 64)
+        (aesEncLastRound(s5, last) ^ u8x16LoadAddress(input + at + 80)).storeAddress(output + at + 80)
+        (aesEncLastRound(s6, last) ^ u8x16LoadAddress(input + at + 96)).storeAddress(output + at + 96)
+        (aesEncLastRound(s7, last) ^ u8x16LoadAddress(input + at + 112)).storeAddress(output + at + 112)
+        count = count + 8
+        at = at + 128
+    }
+    while (at < size) {
+        count = count + 1
+        var state = prefix.with(3, aesSwapWord(count)).asU8x16() ^ first
+        for (round in 1 until rounds) state = aesEncRound(state, u8x16LoadAddress(schedule + round * 16))
+        val block = aesEncLastRound(state, last)
+        if (size - at >= 16) {
+            (block ^ u8x16LoadAddress(input + at)).storeAddress(output + at)
+            at = at + 16
+        } else {
+            block.storeAddress(scratch)
+            for (i in 0 until size - at) {
+                ablaUnsafeStoreU8(aesPointer(output + at + i), ablaUnsafeLoadU8(aesPointer(input + at + i)) ^ ablaUnsafeLoadU8(aesPointer(scratch + i)))
+            }
+            aesWipe(scratch, 16)
+            at = size
+        }
+    }
+    aesStoreBig(counter + 12, secretU32(u32(count & 4294967295)))
+}
+
 // The counter's blocks are encrypted in batches, in place, then XORed in.
 trusted fun aesGcmCrypt(key: AesKey, counter: int, input: int, output: int, size: int): void {
     val batch = counter + 16
+    if (key.hardware) {
+        aesCtrHardware(key.schedule(), key.rounds, counter, batch, input, output, size)
+        return
+    }
     var at = 0
     while (at < size) {
         // The last 4 bytes of the counter block count big-endian.
@@ -986,21 +1102,8 @@ private trusted fun aesGcmStartHw(schedule: int, rounds: int, nonce: string, ass
     state
 }
 
-private trusted fun aesGcmCryptHw(schedule: int, rounds: int, counter: int, input: int, output: int, size: int): void {
-    val batch = counter + 16
-    var at = 0
-    while (at < size) {
-        val count = int(aesLoadBig(counter + 12).declassify()) + 1
-        aesStoreBig(counter + 12, secretU32(u32(count)))
-        ablaUnsafeCopyMemory(batch, counter, 16)
-        aesHardwareEncryptAt(schedule, rounds, batch, batch, 1)
-        val take = if (size - at < 16) size - at else 16
-        for (i in 0 until take) {
-            ablaUnsafeStoreU8(aesPointer(output + at + i), ablaUnsafeLoadU8(aesPointer(input + at + i)) ^ ablaUnsafeLoadU8(aesPointer(batch + i)))
-        }
-        at = at + take
-    }
-}
+private trusted fun aesGcmCryptHw(schedule: int, rounds: int, counter: int, input: int, output: int, size: int): void =
+    aesCtrHardware(schedule, rounds, counter, counter + 16, input, output, size)
 
 /** aesGcmEncrypt with the expanded key at `memory` (aesGcmKeyNew of a key of `keySize` bytes). */
 trusted fun aesGcmSealWithKey(memory: int, keySize: int, nonce: string, plaintext: string, associatedData: string = ""): CryptoResult {
