@@ -47,7 +47,12 @@ fuzz --shared-globals --seeds 100000
 fuzz --module-graphs --seeds 100002
 fuzz --compile-time-tiers --seeds 100000 --checks 8
 fuzz --strict-flat --seeds 100000-100001
-fuzz --integer-stores --seeds 100000-100005
+# A seed is one type (seed % 6: i8, u8, i16, u16, i32, u32), each in every site and value class, built three ways: all
+# six were 131 of this test's 286 CPU-seconds. The suite takes i8 (100002) and u32 (100001), the narrowest signed and
+# the widest unsigned; RUN_TESTS_FULL=1 (or FUZZ_STORES_FULL=1) takes all six.
+if [[ -n ${FUZZ_STORES_FULL:-${RUN_TESTS_FULL:-}} ]]; then fuzz --integer-stores --seeds 100000-100005
+else fuzz --integer-stores --seeds 100001-100002
+fi
 fuzz --subparser-graphs --seeds 100001
 fuzz --cross-target-tiers --seeds 100001
 fuzz --check-subparser-refusals
