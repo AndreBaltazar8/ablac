@@ -13,7 +13,7 @@ cd "$project_root/tests/cases/ct-time-unlimited"
 fail() { tail -5 "$1" >&2; echo "ct time unlimited: $2" >&2; exit 1; }
 build() { # mode name file
     local status=0
-    ABLA_COMPILE_EVAL=$1 ABLA_COMPILE_EVAL_TIME_LIMIT=1 timeout 120 "$compiler" build "$3" -o "$out/$2-$1" \
+    ABLA_COMPILE_EVAL=$1 ABLA_COMPILE_EVAL_TIME_LIMIT=1 ABLA_COMPILE_EVAL_TRACE=1 timeout 120 "$compiler" build "$3" -o "$out/$2-$1" \
         --fast --no-cache > "$out/$2-$1.log" 2>&1 || status=$?
     echo "$status"
 }
@@ -37,6 +37,10 @@ status=$(build jit shared shared/played.ab)
 [[ $status == 0 ]] || fail "$out/shared-jit.log" "shared: played.ab: the compiler exited $status"
 run=0; "$out/shared-jit" || run=$?
 [[ $run == 42 ]] || { echo "ct time unlimited: shared: played.ab's program exited $run, not 42" >&2; exit 1; }
+# Natively: the pass has its generation (the pause is the slice's own code, which needs no grant), and quick.ab's site
+# runs there. In the evaluator a pass would pass this case without any pause.
+grep -q '^note\[ct-jit\]: native at .*quick.ab:' "$out/shared-jit.log" && ! grep -q 'interpreted at' "$out/shared-jit.log" ||
+    fail "$out/shared-jit.log" "shared: played.ab's pass didn't run natively"
 status=$(build jit shared-slow shared/played-slow-first.ab)
 [[ $status == 1 ]] || fail "$out/shared-slow-jit.log" "shared: played-slow-first.ab: the compiler exited $status, not 1"
 grep -q '^error\[E_CT_TIME_LIMIT\]' "$out/shared-slow-jit.log" ||
