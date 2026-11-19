@@ -1,0 +1,112 @@
+// Latency and throughput of abla/http/async against one HTTPS server, over HTTP/1.1 or HTTP/2 (tools/bench-http2-client.sh): `parallel` requests kept
+// in flight until `total` have completed, each timed from the moment it is issued to its completion. Prints one line:
+//   <h2|h1> parallel=<n> total=<t> time_ms=<ms> rps=<r> p50_us=<a> p90_us=<b> p99_us=<c> max_us=<d> errors=<e> protocol=<what the server picked>
+// Arguments: url parallel total http2(0|1) caPath cold|warm [maximumConnectionsPerHost]
+// warm: one wave of `parallel` requests first, so the connections exist (the measured run reuses them); cold: the client is fresh, handshakes included.
+import "abla/io"
+import "abla/http/async"
+import "abla/process/arguments"
+import "abla/process/time"
+import "abla/text"
+
+fun parseNumber(text: string): int {
+    var value = 0
+    for (index in 0 until text.size) value = value * 10 + (text[index] - 48)
+    value
+}
+
+// The latencies, sorted in place by heapsort.
+class Latencies(var values: array<int>) {
+    fun sift(start: int, end: int): void {
+        var root = start
+        while (root * 2 + 1 < end) {
+            var child = root * 2 + 1
+            if (child + 1 < end && this.values[child] < this.values[child + 1]) child = child + 1
+            if (this.values[root] >= this.values[child]) return
+            val swap = this.values[root]
+            this.values[root] = this.values[child]
+            this.values[child] = swap
+            root = child
+        }
+        return
+    }
+
+    fun sort(): void {
+        var start = this.values.size / 2 - 1
+        while (start >= 0) {
+            this.sift(start, this.values.size)
+            start = start - 1
+        }
+        var end = this.values.size - 1
+        while (end > 0) {
+            val swap = this.values[0]
+            this.values[0] = this.values[end]
+            this.values[end] = swap
+            this.sift(0, end)
+            end = end - 1
+        }
+        return
+    }
+}
+
+// Runs `total` requests with `parallel` in flight; the latencies (microseconds), the errors and the protocol are in the answer.
+class Run(val latencies: array<int>, val errors: int, val protocol: string, val nanoseconds: int)
+
+fun run(var client: HttpAsyncClient, url: string, parallel: int, total: int): Run {
+    val started: array<int> = []
+    val firstId = client.get(url)
+    started.append(monotonicNanoseconds())
+    var issued = 1
+    var completed = 0
+    var errors = 0
+    var protocol = ""
+    val latencies: array<int> = []
+    val begin = started[0]
+    var inflight = 1
+    var deadline = monotonicMilliseconds() + 120000
+    while (completed < total && monotonicMilliseconds() < deadline) {
+        while (inflight < parallel && issued < total) {
+            client.get(url)
+            started.append(monotonicNanoseconds())
+            issued = issued + 1
+            inflight = inflight + 1
+        }
+        client.step(2)
+        val now = monotonicNanoseconds()
+        for (completion in client.takeCompletions()) {
+            val index = completion.id - firstId
+            if (index >= 0 && index < started.size) latencies.append((now - started[index]) / 1000)
+            if (!completion.succeeded()) errors = errors + 1
+            else if (protocol == "") protocol = completion.protocol
+            completed = completed + 1
+            inflight = inflight - 1
+        }
+    }
+    Run(latencies, errors + (total - completed), protocol, monotonicNanoseconds() - begin)
+}
+
+fun main: int {
+    val url = processArgument(0)
+    val parallel = parseNumber(processArgument(1))
+    val total = parseNumber(processArgument(2))
+    val http2 = processArgument(3) == "1"
+    val caPath = processArgument(4)
+    val warm = processArgument(5) == "warm"
+    val connections = if (processArgumentCount() > 6) parseNumber(processArgument(6)) else 8
+    val client = httpAsyncClient(HttpAsyncOptions(maximumConnectionsPerHost = connections, caPath = caPath, http2 = http2))
+    if (warm) run(client, url, parallel, parallel)
+    val result = run(client, url, parallel, total)
+    val sortable = Latencies([])
+    for (latency in result.latencies) sortable.values.append(latency)
+    sortable.sort()
+    val values = sortable.values
+    val count = values.size
+    val p50 = if (count > 0) values[count / 2] else 0
+    val p90 = if (count > 0) values[count * 9 / 10] else 0
+    val p99 = if (count > 0) values[count * 99 / 100] else 0
+    val maximum = if (count > 0) values[count - 1] else 0
+    val milliseconds = result.nanoseconds / 1000000
+    val rps = if (milliseconds > 0) total * 1000 / milliseconds else 0
+    println("${if (http2) "h2" else "h1"} parallel=$parallel total=$total time_ms=$milliseconds rps=$rps p50_us=$p50 p90_us=$p90 p99_us=$p99 max_us=$maximum errors=${result.errors} protocol=${result.protocol}")
+    if (result.errors > 0) 1 else 0
+}
