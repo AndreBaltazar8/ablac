@@ -5410,6 +5410,74 @@ fun bootstrapCompileEffectPathSearch(
     path
 }
 
+// The compile capabilities a `#compilerGrant` and `compileCapabilities` name (bootstrapCompileEffectFromName).
+val BOOTSTRAP_COMPILE_CAPABILITY_NAMES: array<string> = ["filesystem.read", "filesystem.write", "environment", "process.io",
+    "network", "clock", "random", "trusted.native", "transform.library"]
+
+/** The abla.toml that governs `module` (its directory's, else the nearest above it), or "" when there is none. */
+fun bootstrapCompileManifestFor(module: string): string {
+    var directory = Path(module).parent()
+    var depth = 0
+    while (depth < 128) {
+        val candidate = directory.child("abla.toml")
+        if (candidate.exists()) return candidate.text
+        val parent = directory.parent()
+        if (parent.text == directory.text) return ""
+        directory = parent
+        depth = depth + 1
+    }
+    ""
+}
+
+/** The `compileCapabilities` of the manifest at `path`, in their order: the quoted names of its array. */
+fun bootstrapCompileManifestCapabilities(path: string): array<string> {
+    val names: array<string> = []
+    if (path == "") return names
+    val source = Path(path).readText()
+    val at = source.indexOf("compileCapabilities")
+    if (at < 0) return names
+    val open = source.slice(at, source.size).indexOf("[")
+    if (open < 0) return names
+    val rest = source.slice(at + open + 1, source.size)
+    val close = rest.indexOf("]")
+    if (close < 0) return names
+    for (part in rest.slice(0, close).split(",")) {
+        val trimmed = part.trim()
+        if (trimmed.size >= 2 && trimmed.startsWith("\"") && trimmed.endsWith("\"")) {
+            names.append(trimmed.slice(1, trimmed.size - 1))
+        }
+    }
+    names
+}
+
+/** The help for a `#` expression whose code needs `capabilities` (comma-separated) that `module` hasn't granted, by
+ *  `path` (`home->processEnvironment->linuxEnvironment->…`, already trimmed for showing): the grant line to add to the
+ *  module, and the manifest line with every capability it then lists. */
+fun bootstrapCompileGrantHelp(capabilities: string, module: string, path: string): string {
+    val wanted = capabilities.split(",")
+    var grants = ""
+    for (name in wanted) grants = grants + (if (grants == "") "" else " ") + "`#compilerGrant(\"$name\")`"
+    val manifest = bootstrapCompileManifestFor(module)
+    val listed = bootstrapCompileManifestCapabilities(manifest)
+    val merged: array<string> = []
+    for (name in listed) merged.append(name)
+    var missing = false
+    for (name in wanted) {
+        var known = false
+        for (have in listed) if (have == name) known = true
+        if (!known) {
+            merged.append(name)
+            missing = true
+        }
+    }
+    var array = ""
+    for (name in merged) array = array + (if (array == "") "" else ", ") + "\"$name\""
+    val manifestLine = if (!missing) ""
+        else if (manifest == "") "; and authorize it in an abla.toml beside the entry: `compileCapabilities = [$array]`"
+        else "; and authorize it in $manifest: `compileCapabilities = [$array]`"
+    "the `#` expression reaches $path, which needs `${wanted[0]}`${if (wanted.size > 1) " (and more)" else ""}: add $grants to ${bootstrapGenericSourceFile(module)}$manifestLine"
+}
+
 fun bootstrapCompileEffectFromName(name: string): int {
     var effect = 0
     if (name == "filesystem.read") effect = 4
@@ -8876,6 +8944,48 @@ class BootstrapAnalyzer(
     }
 
     fun hasVisibleLocal(name: string): bool = this.visibleLocalIndex(name) >= 0
+
+    /** The standard-library module (`abla/process/environment`) that declares the function or method `name` names
+     *  (`processEnvironment`, `Path.readText`), or "" when the program does or nothing does. */
+    fun standardModuleDeclaring(name: string): string {
+        val dot = name.indexOf(".")
+        val owner = if (dot > 0) name.slice(0, dot) else ""
+        val member = if (dot > 0) name.slice(dot + 1, name.size) else name
+        for (declaration in this.declarations) {
+            var source = ""
+            if (owner == "" && declaration.name == member && declaration.extensionOwner == "") source = declaration.sourceIdentity
+            else if (owner != "" && declaration.name == member &&
+                bootstrapNormalizeType(declaration.extensionOwner) == owner) source = declaration.sourceIdentity
+            else if (owner != "" && declaration.name == owner && declaration.kind == "class") {
+                for (method in declaration.methods) if (method.name == member) source = declaration.sourceIdentity
+            }
+            if (source == "") continue
+            val file = bootstrapGenericSourceFile(source)
+            val marker = file.indexOf("/stdlib/abla/")
+            if (marker < 0) return ""
+            val module = file.slice(marker + 8, file.size)
+            return if (module.endsWith("/entry.ab")) module.slice(0, module.size - 9) else module
+        }
+        ""
+    }
+
+    /** A compile-effect path (`home->processEnvironment->linuxEnvironment->…`) as shown to the user: up to the first
+     *  function of the standard library, the rest named by its module. */
+    fun compileEffectPathShown(path: string): string {
+        val steps = path.split("->")
+        var shown = ""
+        var index = 0
+        while (index < steps.size) {
+            shown = shown + (if (shown == "") "" else " → ") + "`${steps[index]}`"
+            val module = this.standardModuleDeclaring(steps[index])
+            if (module != "") {
+                if (index + 1 < steps.size) shown = "$shown (inside $module)"
+                return shown
+            }
+            index = index + 1
+        }
+        shown
+    }
 
     /** Whether code being analyzed could name `declaration`: not private to another file, not hidden by strict
      *  imports, not a generated name. Only such a name is suggested (`did you mean`). */
@@ -13181,6 +13291,12 @@ class BootstrapAnalyzer(
                     val name = request.children[0].text
                     val effect = bootstrapCompileEffectFromName(name)
                     if (effect == 0) {
+                        // A misspelled capability: the one close known name, else the list.
+                        val near = bootstrapSuggestName(name, BOOTSTRAP_COMPILE_CAPABILITY_NAMES)
+                        var known = ""
+                        for (capability in BOOTSTRAP_COMPILE_CAPABILITY_NAMES) known = known + (if (known == "") "" else ", ") + "`$capability`"
+                        bootstrapPendingTypedHelp = if (near != "") "`$name` isn't a compile capability; did you mean `$near`?"
+                            else "`$name` isn't a compile capability; they are $known"
                         this.fail("compile.capability-unknown:$name")
                     } else if (!bootstrapCompileEffectHas(
                         this.compileEffectAuthorizations,
@@ -14274,6 +14390,10 @@ fun bootstrapInferCompile(
                 summary,
                 bootstrapFirstCompileEffect(madeDenied),
                 0
+            )
+            // The help names the capability, the grant line and the manifest line, and the path up to the library.
+            bootstrapPendingTypedHelp = bootstrapCompileGrantHelp(
+                bootstrapCompileEffectName(madeDenied), analyzer.currentSourceIdentity, analyzer.compileEffectPathShown(path)
             )
             analyzer.fail("compile.effect-denied:${bootstrapCompileEffectName(madeDenied)}:$path")
         }
