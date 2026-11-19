@@ -136,12 +136,19 @@ for run in 1 2 3; do
     (( edit_peak <= edit_bound_kilobytes )) && break
 done
 # The traced run: what is reachable at the phase boundaries, the cold analysis's peak against the loop's.
-ABLA_SYSROOT="$root" ABLA_COMPILE_EVAL=jit ABLA_COMPILER_MEMORY_TRACE=1 ABLA_MAX_MEMORY_MB=6144 ABLA_MAX_SECONDS=1800 ABLA_MAX_CPU_SECONDS=900 \
+ABLA_GC_TRACE=1 ABLA_SYSROOT="$root" ABLA_COMPILE_EVAL=jit ABLA_COMPILER_MEMORY_TRACE=1 ABLA_MAX_MEMORY_MB=6144 ABLA_MAX_SECONDS=1800 ABLA_MAX_CPU_SECONDS=900 \
     "$project_root/tools/run-limited.sh" "$compiler" analyze --stdio < "$output_directory/edit-input.jsonl" > "$output_directory/traced-output.jsonl" 2> "$output_directory/traced-error.txt" || {
     echo "analysis-memory: the traced edit loop over src/orc_main.ab failed" >&2
     sed -n '1,20p' "$output_directory/traced-error.txt" >&2
     exit 1
 }
+# The service collects on four threads unless ABLA_GC_WORKERS says otherwise (runtimeMemorySetGcWorkers in bootstrapAnalysisService:
+# the editor's pause 6.2 s -> 3.1 s over the loop): the collections' trace names the parallel sweep, and the mark's threads.
+parallel_sweeps=$(tr -d '\0' < "$output_directory/traced-error.txt" | grep -ac 'gc: parallel sweep, slots' || true)
+if (( parallel_sweeps == 0 )); then
+    echo "analysis-memory: the service's collections did not run the parallel sweep (the editor's default of four GC threads)" >&2
+    exit 1
+fi
 read -r first_live loop_live < <(awk '/^abla-analysis-memory / { live = $NF + 0; if (!cold_done && live > first) first = live; if (live > peak) peak = live; if ($2 == "answer" && $3 == "built") cold_done = 1 } END { print first + 0, peak + 0 }' "$output_directory/traced-error.txt")
 if (( first_live == 0 || loop_live == 0 )); then
     echo "analysis-memory: the service did not report the live heap at its phases (abla-analysis-memory)" >&2
