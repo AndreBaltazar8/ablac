@@ -28,7 +28,7 @@ for kind in ed25519 p256 p384 rsa; do
 done
 # The programs, built up front, four at once: they read nothing at compile time, and built one before each use they
 # were most of this test's wall time (11 release builds of about 10 s, 2026-11-15).
-programs=(interop dropnotify binding-interop api identity mtls tls12prf server wipe serve unix bulk)
+programs=(interop dropnotify binding-interop api identity mtls tls12prf server sni wipe serve unix bulk)
 pids=()
 for program in "${programs[@]}"; do
     while (( $(jobs -rp | wc -l) >= 4 )); do sleep 0.2; done
@@ -231,6 +231,9 @@ echo "$result"
 result=$("$root/tools/run-limited.sh" "$out/server" "$out") || { echo "tls-pure server (in process): $result" >&2; exit 1; }
 [[ $result == 'tls-pure server ok' ]] || { echo "tls-pure server (in process): $result" >&2; exit 1; }
 echo "$result"
+result=$("$root/tools/run-limited.sh" "$out/sni" "$out") || { echo "tls-pure sni (in process): $result" >&2; exit 1; }
+[[ $result == 'tls-pure sni ok' ]] || { echo "tls-pure sni (in process): $result" >&2; exit 1; }
+echo "$result"
 # Secrets cleared once nothing reads them (tests/cases/tls-pure/wipe.ab): key shares, handshake and master secrets, old
 # traffic secrets and keys after KeyUpdate, everything at close and failure, TLS 1.2's ephemeral key and master secret,
 # identities' keys (PEM and PKCS#12) on wipe(), a listener's on close.
@@ -390,6 +393,32 @@ answer=$(s_client -CAfile "$out/ed25519.pem" -cert "$out/client-rsa.pem" -key "$
 [[ $answer != *'pure server'* ]] || { echo "tls-pure server: an untrusted client certificate was served: [$answer]" >&2; exit 1; }
 stop_serve
 echo "pure server: ALPN (server order, none in common refused) and a required client certificate (accepted, absent and untrusted refused)"
+# Certificate selection by server name and signature algorithms (tests/cases/tls-pure/sni.ab does the same in memory): the leaf s_client gets
+# is compared with the certificate files, for TLS 1.3 and TLS 1.2.
+leaf() {   # s_client options: the first certificate the server sent, PEM
+    printf '' | timeout 15 openssl s_client -connect "[::1]:$serve_port" -showcerts "$@" 2> "$out/s_client.err" | awk '/BEGIN CERTIFICATE/ {on=1} on {print} /END CERTIFICATE/ {exit}' || true
+}
+expect_leaf() {   # NAME KIND s_client options
+    local name=$1 kind=$2; shift 2
+    local got; got=$(leaf "$@")
+    [[ $got == "$(cat "$out/$kind.pem")" ]] || { echo "tls-pure server SNI ($name): wanted the $kind certificate, got: ${got%%$'\n'*} $(head -3 "$out/s_client.err")" >&2; exit 1; }
+}
+start_serve sni "$out/p256.pem" "$out/p256.key" "$out/rsa.pem" "$out/rsa.key" "$out/ed25519.pem" "$out/ed25519.key"
+for tls in -tls1_3 -tls1_2; do
+    expect_leaf "pair.test $tls" p256 $tls -servername pair.test
+    expect_leaf "PAIR.TEST $tls" p256 $tls -servername PAIR.TEST
+    expect_leaf "pair.test RSA only $tls" rsa $tls -servername pair.test -sigalgs RSA-PSS+SHA256
+    expect_leaf "other.test $tls" p256 $tls -servername other.test
+    expect_leaf "no name $tls" p256 $tls -noservername
+    expect_leaf "other.test RSA only $tls" rsa $tls -servername other.test -sigalgs RSA-PSS+SHA256
+done
+expect_leaf "a.wild.test" ed25519 -tls1_3 -servername a.wild.test
+expect_leaf "a.b.wild.test" p256 -tls1_3 -servername a.b.wild.test
+# A server name served by an Ed25519 certificate to a client that cannot take one is refused, as a single certificate would.
+got=$(leaf -tls1_3 -servername a.wild.test -sigalgs RSA-PSS+SHA256)
+[[ -z $got ]] || { echo "tls-pure server SNI: a client that takes no Ed25519 was served: $got" >&2; exit 1; }
+stop_serve
+echo "pure server: SNI (name, wildcard, case, signature algorithms, TLS 1.3 and 1.2) against openssl s_client"
 # Unix stream sockets: the pure client over `openssl s_server -unix`, and the pure server over a Unix listener against
 # `openssl s_client -unix`.
 socket="$out/tls.sock"

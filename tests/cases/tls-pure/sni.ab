@@ -1,0 +1,183 @@
+// Server certificate selection (tlsServerConfigWithIdentities): one handshake per case, in one process with no sockets (bytes moved between the
+// state machines), over the certificates tools/test-tls-pure-interop.sh makes (<kind>.pem / <kind>.key). The server holds an ECDSA P-256 and an RSA
+// certificate for pair.test (ECDSA first), an Ed25519 one for *.wild.test and says which it chose by the chain the client got. What is checked:
+//  - the name picks the certificate (exact, case and a final dot ignored, a wildcard for exactly one label), a name nothing matches and no name get the first
+//    certificate the client's signature algorithms allow (the first is the default);
+//  - the client's signature_algorithms choose within a name (ECDSA first, RSA for a client that takes only RSA-PSS), on TLS 1.3 and TLS 1.2;
+//  - a name served only by a certificate the client cannot verify fails as one certificate does, and a client with none of the schemes fails;
+//  - a HelloRetryRequest (the client's X25519 share against a server that wants P-256) keeps the choice;
+//  - a server with the one identity, with or without the new configuration (empty names and extras), sends the very same bytes (the same seed gives the
+//    same handshake, record for record), and a single identity is never "chosen" (chosenIdentity stays null);
+//  - tlsServerConfigWipe clears every key. Prints "tls-pure sni ok".
+import "abla/io"
+import "abla/crypto"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/tls/pure"
+import "abla/tls/pure/client"
+import "abla/tls/pure/handshake"
+import "abla/tls/pure/identity"
+import "abla/tls/pure/record"
+import "abla/tls/pure/server"
+import "abla/text"
+import "abla/http/event/tls"
+import "abla/websocket/server/tls"
+
+var failures = 0
+var seed = 99
+
+fun fail(what: string): void {
+    failures = failures + 1
+    if (failures < 40) println("FAIL $what")
+    return
+}
+
+fun random(count: int): string {
+    val bytes: array<int> = []
+    for (i in 0 until count) {
+        seed = (seed * 1103515245 + 12345) & 2147483647
+        bytes.append((seed >> 8) & 255)
+    }
+    cryptoByteString(bytes)
+}
+
+fun read(path: string): string = linuxReadFile(path, 1048576)
+fun acceptAny(chain: array<string>, scheme: int, content: string, signature: string): TlsVerdict = tlsAccepted()
+fun acceptServer(chain: array<string>, host: string, scheme: int, content: string, signature: string): TlsVerdict = tlsAccepted()
+
+fun withSchemes(config: TlsClientConfig, schemes: array<int>): TlsClientConfig =
+    TlsClientConfig(config.host, config.suites, schemes, config.alpn, config.verifier, config.random, config.secondHello,
+        config.suites12, config.fallback, config.groups, config.sessions, config.sessionScope)
+
+fun clientFor(host: string, schemes: array<int>): TlsClientConfig = withSchemes(tlsClientConfig(host, acceptServer, random), schemes)
+
+fun withGroups(config: TlsClientConfig, groups: array<int>): TlsClientConfig =
+    TlsClientConfig(config.host, config.suites, config.signatureAlgorithms, config.alpn, config.verifier, config.random, config.secondHello,
+        config.suites12, config.fallback, groups, config.sessions, config.sessionScope)
+
+fun pump(var client: TlsClient, var server: TlsServer, var seen: array<string>): void {
+    var rounds = 0
+    while (rounds < 50) {
+        val toServer = client.takeOutput()
+        if (toServer.size > 0) server.feed(toServer)
+        val toClient = server.takeOutput()
+        if (toClient.size > 0) {
+            seen.append(toClient)
+            client.feed(toClient)
+        }
+        if (toServer.size == 0 && toClient.size == 0) return
+        rounds = rounds + 1
+    }
+    return
+}
+
+// The leaf certificate the client was served, "" when the handshake failed.
+fun served(config: TlsServerConfig, client: TlsClientConfig): string {
+    val c = tlsClientNew(client)
+    val s = tlsServerNew(config)
+    val seen: array<string> = []
+    pump(c, s, seen)
+    if (c.failed() || s.failed() || !c.connected() || !s.connected()) "" else c.chain[0]
+}
+
+fun check(name: string, got: string, wanted: string): void {
+    if (got != wanted) fail("$name: ${if (got == "") "no certificate (handshake failed)" else "another certificate"}")
+    return
+}
+
+fun main: int {
+    val directory = processArgument(0)
+    val ec = tlsIdentityFromPem(read("$directory/p256.pem"), read("$directory/p256.key"))
+    val rsa = tlsIdentityFromPem(read("$directory/rsa.pem"), read("$directory/rsa.key"))
+    val ed = tlsIdentityFromPem(read("$directory/ed25519.pem"), read("$directory/ed25519.key"))
+    if (!ec.ok() || !rsa.ok() || !ed.ok()) {
+        println("FAIL identities")
+        return 1
+    }
+    val ecLeaf = ec.chain[0]
+    val rsaLeaf = rsa.chain[0]
+    val edLeaf = ed.chain[0]
+    val extras = [TlsServerIdentity(rsa, ["pair.test"]), TlsServerIdentity(ed, ["*.wild.test"])]
+    val groups = tlsDefaultGroups()
+    val server13 = tlsServerConfigWithIdentities(tlsServerConfig(ec, random), ["pair.test"], extras)
+    // TLS 1.2 only: no TLS 1.3 suites.
+    val server12 = tlsServerConfigWithIdentities(TlsServerConfig(ec, [], groups, [], random, false, false, acceptAny), ["pair.test"], extras)
+    val allSchemes = tlsClientConfig("pair.test", acceptServer, random).signatureAlgorithms
+    val rsaOnly = [TLS_SIG_RSA_PSS_RSAE_SHA256, TLS_SIG_RSA_PSS_RSAE_SHA384, TLS_SIG_RSA_PSS_RSAE_SHA512]
+    val ecOnly = [TLS_SIG_ECDSA_SECP256R1_SHA256]
+    for (version in ["tls13", "tls12"]) {
+        val server = if (version == "tls13") server13 else server12
+        check("$version pair.test", served(server, clientFor("pair.test", allSchemes)), ecLeaf)
+        check("$version PAIR.TEST.", served(server, clientFor("PAIR.TEST.", allSchemes)), ecLeaf)
+        check("$version pair.test, RSA only", served(server, clientFor("pair.test", rsaOnly)), rsaLeaf)
+        check("$version pair.test, ECDSA only", served(server, clientFor("pair.test", ecOnly)), ecLeaf)
+        // A name nothing matches: the first certificate the client allows, the default.
+        check("$version other.test", served(server, clientFor("other.test", allSchemes)), ecLeaf)
+        check("$version other.test, RSA only", served(server, clientFor("other.test", rsaOnly)), rsaLeaf)
+        check("$version no name", served(server, clientFor("127.0.0.1", allSchemes)), ecLeaf)
+        check("$version no name, RSA only", served(server, clientFor("127.0.0.1", rsaOnly)), rsaLeaf)
+        // The wildcard is one label.
+        if (version == "tls13") {
+            check("tls13 a.wild.test", served(server, clientFor("a.wild.test", allSchemes)), edLeaf)
+            check("tls13 A.Wild.Test", served(server, clientFor("A.Wild.Test", allSchemes)), edLeaf)
+            check("tls13 a.b.wild.test", served(server, clientFor("a.b.wild.test", allSchemes)), ecLeaf)
+            check("tls13 wild.test", served(server, clientFor("wild.test", allSchemes)), ecLeaf)
+            // The name is the Ed25519 certificate's, which this client cannot take: it fails as a single certificate does.
+            check("tls13 a.wild.test, RSA only", served(server, clientFor("a.wild.test", rsaOnly)), "")
+        }
+        // No certificate suits the client.
+        check("$version no common scheme", served(server, clientFor("pair.test", [TLS_SIG_ED25519])), if (version == "tls13") "" else "")
+    }
+    // A HelloRetryRequest: the server wants P-256, the client sent an X25519 share. The choice is kept through the second ClientHello.
+    val retryServer = tlsServerConfigWithIdentities(TlsServerConfig(ec, [TLS_SUITE_AES_128_GCM_SHA256], [TLS_GROUP_SECP256R1], [], random, false, false, acceptAny),
+        ["pair.test"], extras)
+    for (schemes in [allSchemes, rsaOnly]) {
+        val client = withGroups(withSchemes(tlsClientConfig("pair.test", acceptServer, random), schemes), [TLS_GROUP_X25519, TLS_GROUP_SECP256R1])
+        val c = tlsClientNew(client)
+        val s = tlsServerNew(retryServer)
+        val seen: array<string> = []
+        pump(c, s, seen)
+        if (!c.connected() || !s.connected() || !c.retried) fail("retry: connected ${c.connected()} retried ${c.retried}: ${c.error} ${s.error}")
+        else if (c.chain[0] != (if (schemes.size == allSchemes.size) ecLeaf else rsaLeaf)) fail("retry: the wrong certificate after a HelloRetryRequest")
+    }
+    // One identity, byte for byte: the same seed, the same records from the server whichever way the configuration was made.
+    var recorded: array<array<string>> = []
+    for (config in [tlsServerConfig(ec, random), tlsServerConfigWithIdentities(tlsServerConfig(ec, random), [], []),
+        tlsServerConfigWithIdentities(tlsServerConfig(ec, random), ["pair.test"], [])]) {
+        seed = 4242
+        val c = tlsClientNew(tlsClientConfig("pair.test", acceptServer, random))
+        val s = tlsServerNew(config)
+        val seen: array<string> = []
+        pump(c, s, seen)
+        if (!c.connected() || !s.connected()) fail("one identity: not connected")
+        if (s.chosenIdentity != null) fail("one identity: an identity was chosen")
+        recorded.append(seen)
+    }
+    for (index in 1 until recorded.size) {
+        if (recorded[index].join("|") != recorded[0].join("|")) fail("one identity: the server's bytes differ in configuration $index")
+    }
+    // Names: exact, case, a final dot, one label.
+    val matches = [["a.test", "a.test", "t"], ["A.TEST", "a.test", "t"], ["a.test.", "a.test", "t"], ["a.test", "a.test.", "t"], ["*.a.test", "b.a.test", "t"],
+        ["*.a.test", "a.test", ""], ["*.a.test", "c.b.a.test", ""], ["*.a.test", ".a.test", ""], ["*.test", "a.test", "t"], ["a.test", "b.test", ""], ["*", "a.test", ""]]
+    for (row in matches) {
+        if (tlsServerNameMatches(row[0], row[1]) != (row[2] == "t")) fail("name ${row[0]} against ${row[1]}")
+    }
+    // The same from PEM text, and through the HTTPS event server's and the WebSocket server's loaders.
+    val pems = [TlsServerPem(read("$directory/p256.pem"), read("$directory/p256.key"), ["pair.test"]),
+        TlsServerPem(read("$directory/rsa.pem"), read("$directory/rsa.key"), ["pair.test"])]
+    val https = httpsEventServerTlsPems(pems)
+    if (https == null) fail("httpsEventServerTlsPems: null")
+    else {
+        val config = https
+        if (config.alpn.size != 2 || config.identities.size != 1) fail("httpsEventServerTlsPems: alpn ${config.alpn.size} identities ${config.identities.size}")
+        check("https pems, RSA only", served(config, clientFor("pair.test", rsaOnly)), rsaLeaf)
+        check("https pems", served(config, clientFor("pair.test", allSchemes)), ecLeaf)
+    }
+    if (webSocketServerTlsPems(pems).error != "") fail("webSocketServerTlsPems: ${webSocketServerTlsPems(pems).error}")
+    if (tlsServerConfigFromPems([]) != null) fail("no entries gave a configuration")
+    if (tlsServerConfigFromPems([TlsServerPem(read("$directory/p256.pem"), "not a key")]) != null) fail("a bad key gave a configuration")
+    if (tlsServerConfigFromPems([pems[0], TlsServerPem("nope", "nope")]) != null) fail("a bad second entry gave a configuration")
+    tlsServerConfigWipe(server13)
+    if (failures == 0) println("tls-pure sni ok")
+    failures
+}

@@ -12,6 +12,7 @@
 // offer TLS 1.3, no common suite, group or signature scheme, a bad Finished, wrong message order, bad records.
 
 import "abla/crypto"
+import "abla/text"
 import "abla/crypto/hkdf"
 import "abla/tls/pure/client"
 import "abla/tls/pure/binding"
@@ -54,8 +55,17 @@ class TlsServerConfig(
         TLS12_ECDHE_ECDSA_CHACHA20_POLY1305_SHA256, TLS12_ECDHE_RSA_CHACHA20_POLY1305_SHA256],
     /** Ticket keys: with them the server sends NewSessionTicket after a handshake and accepts tickets (TLS 1.3, psk_dhe_ke, no 0-RTT), keeping no state of its
      *  own. null: no resumption. A server that asks for client certificates sends no tickets (a resumption would skip the client's authentication). */
-    val tickets: TlsTicketKeys? = null
+    val tickets: TlsTicketKeys? = null,
+    /** The names `identity` is for (`TlsServerIdentity.names`); [] is any name. */
+    val identityNames: array<string> = [],
+    /** More certificates, each for names of its own: with any, the server picks one per ClientHello by the client's server_name (SNI) and
+     *  signature_algorithms (see `tlsServerConfigWithIdentities`). [] is a server with the one `identity`, exactly as before. */
+    val identities: array<TlsServerIdentity> = []
 )
+
+/** One of a server's certificates: the identity (chain and signer) and the names it serves, each an exact host name or a wildcard `*.example.com` (one label, as
+ *  RFC 6125 reads it); [] serves any name. */
+class TlsServerIdentity(val identity: TlsIdentity, val names: array<string>)
 
 class TlsServer(
     val config: TlsServerConfig,
@@ -119,7 +129,9 @@ class TlsServer(
     var firstPskUsable: bool = false,
     var wantTickets: bool = false,
     /** The tls-exporter channel binding (RFC 9266), made when the TLS 1.3 handshake completes; "" before, and on TLS 1.2. */
-    var channelExporter: string = ""
+    var channelExporter: string = "",
+    /** The identity picked for this connection from `config.identities` by its ClientHello (null: `config.identity`). */
+    var chosenIdentity: TlsIdentity? = null
 )
 
 private fun tlsServerEmptyProtection(): TlsRecordProtection = tlsRecordProtection(TLS_AEAD_AES_128_GCM, "", "")
@@ -136,7 +148,93 @@ fun tlsServerNew(config: TlsServerConfig): TlsServer =
  *  with no_application_protocol, one that offers none is still accepted (see docs/tls.md). The chosen one is `TlsServer.alpn()`. */
 fun tlsServerConfigWithAlpn(config: TlsServerConfig, alpn: array<string>): TlsServerConfig =
     TlsServerConfig(config.identity, config.suites, config.groups, alpn, config.random, config.requestClientCertificate, config.requireClientCertificate,
-        config.clientVerifier, config.suites12, config.tickets)
+        config.clientVerifier, config.suites12, config.tickets, config.identityNames, config.identities)
+
+/** `config` with more certificates (`identities`, each for its names) next to its own `identity` (for the names in `identityNames`, which tlsServerConfig leaves
+ *  empty: any). One ClientHello gets one certificate: among the ones whose names match the client's server_name (exact, case-insensitive, or a wildcard
+ *  `*.example.com` for exactly one label), the first (this configuration's own, then `identities` in order) that can sign with a scheme the client accepts. Put the
+ *  ECDSA certificate of a name before its RSA one to prefer it for the clients that take both. A name nothing matches, or no server_name, gets the first certificate
+ *  that the client's signature algorithms allow, in the same order (so the first is the default); and when no certificate suits the client, the handshake fails as
+ *  a single certificate's does (handshake_failure). No certificate is chosen differently for a resumed session: a ticket is bound to its server name. */
+fun tlsServerConfigWithIdentities(config: TlsServerConfig, identityNames: array<string>, identities: array<TlsServerIdentity>): TlsServerConfig =
+    TlsServerConfig(config.identity, config.suites, config.groups, config.alpn, config.random, config.requestClientCertificate, config.requireClientCertificate,
+        config.clientVerifier, config.suites12, config.tickets, identityNames, identities)
+
+private fun tlsServerLowerName(name: string): string {
+    val end = if (name.size > 0 && name[name.size - 1] == 46) name.size - 1 else name.size
+    name.slice(0, end).lowercase()
+}
+
+/** Whether `pattern` (a name, or `*.example.com`) serves `name`: names compare without case or a final dot; a wildcard stands for exactly one label. */
+fun tlsServerNameMatches(pattern: string, name: string): bool {
+    val wanted = tlsServerLowerName(name)
+    val have = tlsServerLowerName(pattern)
+    if (have == wanted) return true
+    if (have.size > 2 && have[0] == 42 && have[1] == 46) {
+        val suffix = have.slice(1, have.size)
+        if (wanted.size > suffix.size && wanted.slice(wanted.size - suffix.size, wanted.size) == suffix) {
+            val label = wanted.slice(0, wanted.size - suffix.size)
+            return label.size > 0 && label.indexOf(".") < 0
+        }
+    }
+    false
+}
+
+private fun tlsServerIdentityMatches(names: array<string>, name: string): bool {
+    for (pattern in names) {
+        if (tlsServerNameMatches(pattern, name)) return true
+    }
+    false
+}
+
+// Whether the identity can sign for this ClientHello as the handshake would need: a scheme of its own among the client's (TLS 1.3 takes no PKCS#1 one), and on
+// TLS 1.2 also a suite of its key type and, for an ECDSA key, its curve among the client's groups.
+private fun TlsServer.identityUsable(identity: TlsIdentity, hello: TlsClientHello, tls13: bool): bool {
+    if (identity.chain.size == 0) return false
+    var scheme = false
+    for (candidate in identity.schemes) {
+        if (tlsServerListHas(hello.schemes, candidate) && (!tls13 || !tlsSchemeIsPkcs1(candidate))) scheme = true
+    }
+    if (!scheme || tls13) return scheme
+    val rsa = tlsServerKeyIsRsa(identity)
+    var suite = false
+    for (code in this.config.suites12) {
+        val candidate = tls12Suite(code)
+        if (candidate != null && candidate.ecdsa != rsa && tlsServerListHas(hello.suites, code)) suite = true
+    }
+    val keyGroup = if (tlsServerListHas(identity.schemes, TLS_SIG_ECDSA_SECP256R1_SHA256)) TLS_GROUP_SECP256R1
+        else if (tlsServerListHas(identity.schemes, TLS_SIG_ECDSA_SECP384R1_SHA384)) TLS_GROUP_SECP384R1 else 0
+    suite && (rsa || keyGroup == 0 || tlsServerListHas(hello.groups, keyGroup))
+}
+
+// Picks the certificate of this connection from the configuration's (see tlsServerConfigWithIdentities). Nothing changes for a configuration with the one identity.
+private fun TlsServer.chooseIdentity(hello: TlsClientHello, tls13: bool): void {
+    if (this.config.identities.size == 0) return
+    val all: array<TlsServerIdentity> = [TlsServerIdentity(this.config.identity, this.config.identityNames)]
+    for (extra in this.config.identities) all.append(extra)
+    var picked: TlsIdentity? = null
+    if (hello.serverName != "") {
+        var firstMatch: TlsIdentity? = null
+        for (entry in all) {
+            if (tlsServerIdentityMatches(entry.names, hello.serverName)) {
+                if (firstMatch == null) firstMatch = entry.identity
+                if (picked == null && this.identityUsable(entry.identity, hello, tls13)) picked = entry.identity
+            }
+        }
+        // The name is served, but not to this client's signature algorithms: the certificate for it, so the handshake fails as it would with the one.
+        if (picked == null) picked = firstMatch
+    }
+    if (picked == null) {
+        for (entry in all) {
+            if (picked == null && this.identityUsable(entry.identity, hello, tls13)) picked = entry.identity
+        }
+    }
+    this.chosenIdentity = picked
+    return
+}
+
+/** The certificate this connection presents (the one `chooseIdentity` picked when the ClientHello came; the configuration's own before). */
+fun TlsServer.identity(): TlsIdentity = this.chosenIdentity ?? this.config.identity
 
 /** The usual configuration: the given identity, AES-GCM and ChaCha20 suites, X25519MLKEM768, X25519, P-256 then P-384, no ALPN, no client
  *  certificate. */
@@ -327,12 +425,13 @@ private fun TlsServer.handleClientHello(message: string, body: string): void {
         this.fail(TLS_ALERT_ILLEGAL_PARAMETER, "tls: the cipher suite changed after HelloRetryRequest")
         return
     }
+    this.chooseIdentity(hello, true)
     // The signature scheme: the identity's first that the client accepts.
     var scheme = 0
-    for (candidate in this.config.identity.schemes) {
+    for (candidate in this.identity().schemes) {
         if (scheme == 0 && tlsServerListHas(hello.schemes, candidate) && !tlsSchemeIsPkcs1(candidate)) scheme = candidate
     }
-    if (scheme == 0 || this.config.identity.chain.size == 0) {
+    if (scheme == 0 || this.identity().chain.size == 0) {
         this.fail(TLS_ALERT_HANDSHAKE_FAILURE, "tls: no signature scheme in common")
         return
     }
@@ -531,10 +630,10 @@ private fun TlsServer.sendFlight(scheme: int): void {
         flight = flight + request
     }
     if (!this.didResume) {
-        certificate = tlsBuildCertificate("", this.config.identity.chain)
+        certificate = tlsBuildCertificate("", this.identity().chain)
         this.transcript.add(certificate)
         val content = tlsCertificateVerifyContent(true, this.transcript.hash(this.hash))
-        val signature = this.config.identity.sign(scheme, content)
+        val signature = this.identity().sign(scheme, content)
         if (signature.size == 0) {
             this.fail(TLS_ALERT_INTERNAL_ERROR, "tls: the server certificate's key could not sign")
             return
@@ -905,8 +1004,9 @@ private fun TlsServer.startV12(message: string, hello: TlsClientHello): void {
         this.fail(TLS_ALERT_HANDSHAKE_FAILURE, "tls: the client does not support the extended master secret")
         return
     }
+    this.chooseIdentity(hello, false)
     // The suite: the server's first that the client offers and whose key type matches the identity.
-    val rsa = tlsServerKeyIsRsa(this.config.identity)
+    val rsa = tlsServerKeyIsRsa(this.identity())
     var suite: Tls12Suite? = null
     for (code in this.config.suites12) {
         val candidate = tls12Suite(code)
@@ -920,8 +1020,8 @@ private fun TlsServer.startV12(message: string, hello: TlsClientHello): void {
     }
     val chosen = suite ?? return
     // RFC 8422 section 5.1.1: an ECDSA certificate needs its curve (P-256 or P-384, by the identity's scheme; Ed25519 has no curve to list) among the client's groups.
-    val keyGroup = if (tlsServerListHas(this.config.identity.schemes, TLS_SIG_ECDSA_SECP256R1_SHA256)) TLS_GROUP_SECP256R1
-        else if (tlsServerListHas(this.config.identity.schemes, TLS_SIG_ECDSA_SECP384R1_SHA384)) TLS_GROUP_SECP384R1 else 0
+    val keyGroup = if (tlsServerListHas(this.identity().schemes, TLS_SIG_ECDSA_SECP256R1_SHA256)) TLS_GROUP_SECP256R1
+        else if (tlsServerListHas(this.identity().schemes, TLS_SIG_ECDSA_SECP384R1_SHA384)) TLS_GROUP_SECP384R1 else 0
     if (chosen.ecdsa && keyGroup != 0 && !tlsServerListHas(hello.groups, keyGroup)) {
         this.fail(TLS_ALERT_HANDSHAKE_FAILURE, "tls: the client does not list the curve of the certificate")
         return
@@ -932,10 +1032,10 @@ private fun TlsServer.startV12(message: string, hello: TlsClientHello): void {
         if (group == 0 && tlsGroupIsClassic(candidate) && tlsServerListHas(hello.groups, candidate)) group = candidate
     }
     var scheme = 0
-    for (candidate in this.config.identity.schemes) {
+    for (candidate in this.identity().schemes) {
         if (scheme == 0 && tlsServerListHas(hello.schemes, candidate)) scheme = candidate
     }
-    if (group == 0 || scheme == 0 || this.config.identity.chain.size == 0) {
+    if (group == 0 || scheme == 0 || this.identity().chain.size == 0) {
         this.fail(TLS_ALERT_HANDSHAKE_FAILURE, "tls: no key exchange group or signature scheme in common")
         return
     }
@@ -984,10 +1084,10 @@ private fun TlsServer.startV12(message: string, hello: TlsClientHello): void {
             tlsExtension(TLS_EXT_EXTENDED_MASTER_SECRET, "") + tlsExtension(TLS_EXT_ALPN, tlsVec16(tlsVec8(alpn)))))
     }
     this.transcript.add(serverHello)
-    val certificate = tls12BuildCertificate(this.config.identity.chain)
+    val certificate = tls12BuildCertificate(this.identity().chain)
     this.transcript.add(certificate)
     val params = tls12EcdheParams(pair.group, pair.publicKey)
-    val signature = this.config.identity.sign(scheme, tls12SignedParams(hello.random, this.serverRandom, params))
+    val signature = this.identity().sign(scheme, tls12SignedParams(hello.random, this.serverRandom, params))
     if (signature.size == 0) {
         this.fail(TLS_ALERT_INTERNAL_ERROR, "tls: the server certificate's key could not sign")
         return
@@ -1254,7 +1354,7 @@ fun TlsServer.resumed(): bool = this.didResume
 fun TlsServer.channelBinding(kind: string): string =
     if (!this.connected()) ""
     else if (kind == TLS_BINDING_EXPORTER) this.channelExporter
-    else if (kind == TLS_BINDING_END_POINT && !this.didResume && this.config.identity.chain.size > 0) tlsEndPointBinding(this.config.identity.chain[0])
+    else if (kind == TLS_BINDING_END_POINT && !this.didResume && this.identity().chain.size > 0) tlsEndPointBinding(this.identity().chain[0])
     else ""
 
 /** Whether any identity of `hello` opens to a ticket this connection could resume with under `suite` and `alpn`: the resumption's own checks (age, suite, server name, ALPN) without the binder.

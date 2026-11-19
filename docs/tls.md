@@ -50,7 +50,7 @@ RSA keys under 2048 bits for PSS verification.
 - Speed: an RSA-2048 signature (a server with an RSA certificate, or a client certificate) takes about 8 ms in a release
   build and about 300 ms in a `--fast` build; ECDSA and Ed25519 are far cheaper. Parsing a system bundle of 145
   certificates takes about 6 ms in a release build and 90 ms in a `--fast` build.
-- Server side: one certificate, no SNI selection.
+- Server side: one certificate by default; several are chosen by server name and signature algorithms (below).
 
 ## Together with `abla/tls/hosted`
 
@@ -74,11 +74,27 @@ must alias one of them. (A type that the stdlib hands out, such as `TlsWebSocket
   certificate, an empty directory, or the variable set to nothing (`SSL_CERT_FILE=`, as OpenSSL reads it) gives a store in
   which nothing verifies, not the system bundle (`tools/test-tls-trust-env.sh`).
 
+## Several certificates: SNI and signature algorithms
+
+A server has one certificate unless it is given more: `tlsServerConfigFromPems([TlsServerPem(certificatePem, privateKeyPem, names), ...])`
+(or `tlsServerConfigWithIdentities(config, identityNames, identities)` over identities already loaded) makes a configuration that picks a
+certificate for each ClientHello, from the server name (SNI, RFC 6066) the client sent and the signature algorithms it accepts. `names` are exact host
+names (compared without case or a final dot) or `*.example.com` (exactly one label: `a.example.com`, not `example.com` or `a.b.example.com`); `[]` is any
+name. The rule, in order: among the certificates whose names match the client's name, the first (the first entry, then the others in the given order) that
+can sign with a scheme the client lists (on TLS 1.2 also with a cipher suite of its key type and, for ECDSA, a curve the client lists); else, when the name
+matches a certificate the client cannot use, that certificate (the handshake then fails with `handshake_failure`, as with one certificate); else, for a name
+nothing matches or a client without a name, the first certificate the client can use. The first entry is therefore the default. To serve one name with an
+ECDSA and an RSA certificate, give both the name and put the ECDSA one first: a client that takes ECDSA gets it, a client that lists only RSA schemes gets RSA.
+A server never refuses a name it does not know (no `unrecognized_name` alert): it answers with the default certificate, whose name the client then
+checks. A resumed session sends no certificate; its ticket is bound to the server name. With the one `identity` (no list) nothing is chosen and the server's
+bytes are as they were before this existed (`tests/cases/tls-pure/sni.ab` compares them).
+`httpsEventServerTlsPems` and `webSocketServerTlsPems` take the same list for `HttpsEventServer`, `H2Server` and `WebSocketServer`.
+
 ## One certificate for several protocols (ALPACA)
 
 A certificate that is valid for a host name is valid for every service on that name. A client that is tricked into a
 connection to the wrong one (a browser sent to an FTP or SMTP port) can have the TLS handshake succeed and its requests
-read as the other protocol (the ALPACA attacks). `abla/tls/pure` does not select a certificate by server name, and a
+read as the other protocol (the ALPACA attacks). `abla/tls/pure` serves the one certificate unless given several (above), and a
 server whose `alpn` is `[]` accepts any client. A server that shares one certificate (or a wildcard) across protocols
 must set `alpn` to the protocols it speaks: then a client that offers protocols and none of them match is refused with
 `no_application_protocol`, (a client that offers no ALPN at all is still accepted:

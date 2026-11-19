@@ -357,7 +357,7 @@ resource class TlsListener(var handle: int, var listener: TcpListener, var confi
     fun drop(): void {
         this.handle = -1
         // The identity was loaded for this listener: its key is cleared with it.
-        this.config.identity.wipe()
+        tlsServerConfigWipe(this.config)
         return
     }
 }
@@ -430,7 +430,7 @@ fun TlsListener.accept(handshakeTimeoutMilliseconds: int = 5000,
 fun TlsListener.close(): bool {
     if (this.handle == -1) return true
     this.handle = -1
-    this.config.identity.wipe()
+    tlsServerConfigWipe(this.config)
     this.listener.close()
 }
 
@@ -447,7 +447,7 @@ fun tlsServerUpgrade(var connection: TcpConnection, certificatePath: string, pri
     }
     val inner = tlsPureServerUpgrade(connection, config, handshakeTimeoutMilliseconds, readWriteTimeoutMilliseconds, deadline)
     // The identity was loaded for this one handshake, which is over: its key is cleared.
-    config.identity.wipe()
+    tlsServerConfigWipe(config)
     pureTlsSetError(if (inner.ok()) 0 else if (inner.stage == 13) 13 else 12)
     val handle = if (inner.ok()) inner.tcp.descriptor else -1
     TlsConnection(handle, move(inner))
@@ -797,6 +797,30 @@ fun tlsServerConfigFromPem(certificatePem: string, privateKeyPem: string, passph
     tlsServerConfig(identity, tlsPureRandom)
 }
 
+/** One certificate of a server that has several (`tlsServerConfigFromPems`): a chain and a key (PEM, the key encrypted with `passphrase` if it has one) and the
+ *  names it is for, each an exact host name or `*.example.com`; [] is any name. */
+class TlsServerPem(val certificatePem: string, val privateKeyPem: string, val names: array<string> = [], val passphrase: string = "")
+
+/** A TLS server configuration with several certificates, chosen per connection by the client's server name (SNI) and the signature algorithms it accepts
+ *  (`tlsServerConfigWithIdentities`: the first entry is the default, and a name's ECDSA entry goes before its RSA one). null when `entries` is empty or any
+ *  certificate or key fails to load. With one entry it is exactly `tlsServerConfigFromPem`'s. */
+fun tlsServerConfigFromPems(entries: array<TlsServerPem>): TlsServerConfig? {
+    if (entries.size == 0) return null
+    val first = tlsIdentityFromPem(entries[0].certificatePem, entries[0].privateKeyPem, entries[0].passphrase)
+    if (!first.ok()) return null
+    val more: array<TlsServerIdentity> = []
+    for (index in 1 until entries.size) {
+        val identity = tlsIdentityFromPem(entries[index].certificatePem, entries[index].privateKeyPem, entries[index].passphrase)
+        if (!identity.ok()) {
+            first.wipe()
+            for (loaded in more) loaded.identity.wipe()
+            return null
+        }
+        more.append(TlsServerIdentity(identity, entries[index].names))
+    }
+    tlsServerConfigWithIdentities(tlsServerConfig(first, tlsPureRandom), entries[0].names, more)
+}
+
 /** What is wrong with a certificate and key that `tlsServerConfigFromPem` refused: "certificate", "key" or "". */
 fun tlsServerPemError(certificatePem: string, privateKeyPem: string, passphrase: string = ""): string {
     if (x509ParsePem(certificatePem).certificates.size == 0) return "certificate"
@@ -806,6 +830,7 @@ fun tlsServerPemError(certificatePem: string, privateKeyPem: string, passphrase:
 /** Clears a configuration's private key once no session or listener uses it any more. */
 fun tlsServerConfigWipe(config: TlsServerConfig): void {
     config.identity.wipe()
+    for (extra in config.identities) extra.identity.wipe()
     return
 }
 

@@ -361,7 +361,7 @@ closed when `handshakeTimeoutMilliseconds` (the third argument, 5000 by
 default) runs out, counted from the accept. A failed or timed-out handshake
 closes only that socket; no event is surfaced for it (the connection never
 reached the application), and `server.stats.tlsHandshakeFailures` counts it.
-Connections negotiate TLS 1.2 or later with one certificate (no SNI). A
+Connections negotiate TLS 1.2 or later with one certificate, or several chosen by SNI (`webSocketServerTlsPems`, docs/tls.md). A
 configuration that failed to load has a non-empty `error`, and a server given
 it closes its listener (`localPort()` is -1) rather than serve plaintext.
 
