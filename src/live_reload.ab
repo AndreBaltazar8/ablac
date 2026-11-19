@@ -16,6 +16,9 @@ import "backend/llvm/live.ab"
 import "toolchain.ab"
 import "module_paths.ab"
 import "abla/text"
+import "abla/sys/linux/process"
+import "abla/sys/linux/io"
+import "sema.ab"
 
 // The running program's session and how it was built, set by bootstrapRunInProcess for a live run.
 var bootstrapLiveSession = LlvmOrcSession(nativeNullPointer(), nativeNullPointer(), 128, true)
@@ -42,9 +45,34 @@ trusted fun bootstrapLiveBegin(session: LlvmOrcSession, source: string, passes: 
     bootstrapLiveSource = source
     bootstrapLivePasses = passes
     bootstrapLiveTableSize = bootstrapLlvmLiveTableSize
+    bootstrapLiveCodeBytes = 0
+    bootstrapLiveNoted = false
     bootstrapLlvmLiveGeneration = 0
     if (bootstrapLiveBusy == 0) bootstrapLiveBusy = nativePointerAddress(ablaUnsafeAllocate(8))
     ablaUnsafeStoreI64(nativePointerFromAddress(bootstrapLiveBusy), 0)
+    return
+}
+
+// Old generations are never freed (docs/design/live-jit.md, "Freeing old generations": measured, not worth it yet):
+// the session counts the objects its reloads added, and once they pass a limit (256 MB; ABLA_LIVE_NOTE_BYTES sets
+// another, for the test) says so on standard error, once a session.
+var bootstrapLiveCodeBytes = 0
+var bootstrapLiveNoted = false
+
+fun bootstrapLiveNoteLimit(): int {
+    val configured = linuxEnvironment("ABLA_LIVE_NOTE_BYTES")
+    if (configured.found) {
+        val bytes = bootstrapDecimalIndex(configured.value)
+        if (bytes >= 0) return bytes
+    }
+    268435456
+}
+
+fun bootstrapLiveNoteGrowth(): void {
+    if (bootstrapLiveNoted || bootstrapLiveCodeBytes < bootstrapLiveNoteLimit()) return
+    bootstrapLiveNoted = true
+    val size = if (bootstrapLiveCodeBytes >= 1048576) "${bootstrapLiveCodeBytes / 1048576} MB" else "${bootstrapLiveCodeBytes / 1024} kB"
+    linuxPrintStandardError("ablac run: the reloads of this live run have added $size of code, which is never freed; restart the run to give it back\n")
     return
 }
 
@@ -130,14 +158,16 @@ trusted fun bootstrapLiveReload(buffer: int, capacity: int): int {
     // The bodies first: looking one up links the module.
     val addresses: array<int> = []
     for (body in bootstrapLlvmLiveChangedBodies) {
-        val found = bootstrapLiveSession.lookup(body)
+        val found = bootstrapLiveSession.lookupMeasuring(body)
         if (found.status != 0 || found.address == 0) {
             bootstrapLiveReply(buffer, capacity,
                 "E_LIVE_LINK: $body was not found (status ${found.status})")
             return 2
         }
+        bootstrapLiveCodeBytes = bootstrapLiveCodeBytes + found.bytes
         addresses.append(found.address)
     }
+    bootstrapLiveNoteGrowth()
     val table = bootstrapLiveSession.lookup("abla_live_table")
     if (table.status != 0 || table.address == 0) {
         bootstrapLiveReply(buffer, capacity, "E_LIVE_LINK: abla_live_table was not found")

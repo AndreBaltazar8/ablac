@@ -62,12 +62,24 @@ mkdir -p "$out/reload"
 for profile in o1 fast; do
     cp tests/cases/live-jit/reload.ab "$reload"
     status=0
-    timeout 300 "$compiler" run "--$profile" --live "$reload" -- "$reload" \
+    # The note on the code reloads leave (never freed): --fast with a limit of one byte must print it once for
+    # its several applied reloads, --o1 under the default (256 MB) never.
+    limit=268435456
+    [[ $profile == fast ]] && limit=1
+    ABLA_LIVE_NOTE_BYTES=$limit timeout 300 "$compiler" run "--$profile" --live "$reload" -- "$reload" \
         > "$out/reload-$profile.out" 2> "$out/reload-$profile.err" || status=$?
     if [[ $status -ne 42 ]] || grep -q ': FAIL' "$out/reload-$profile.out"; then
         printf 'live jit (reload, %s): exit status %s (42 expected)\n' "$profile" "$status" >&2
         cat "$out/reload-$profile.out" >&2
         head -n 30 "$out/reload-$profile.err" >&2
+        exit 1
+    fi
+    notes=$(grep -c "^ablac run: the reloads of this live run have added " "$out/reload-$profile.err" || true)
+    expected=0
+    [[ $profile == fast ]] && expected=1
+    if [[ $notes -ne $expected ]]; then
+        printf "live jit (reload, %s): %s notes on the code reloads leave, %s expected\n" "$profile" "$notes" "$expected" >&2
+        cat "$out/reload-$profile.err" >&2
         exit 1
     fi
 done

@@ -264,3 +264,80 @@ Mutation-checked, each turned off failing the test on its own check:
 - the drop registry lookup (the Token is not dropped).
 - the id pinning (before it, the collision reload is refused: E_LIVE_CALLER on main);
 - the registry's named functions (only lambdas registered: invalid function reference).
+
+## Freeing old generations (design, 2026-11-16; measured, not built, not worth it yet)
+
+**Measured (2026-11-19), and the decision.** A program that edits one of its functions and reloads 100 times
+(`ablac run --live`, JITLink, x86-64 Linux; the JIT's code as the anonymous executable mappings of
+`/proc/self/maps`): an arithmetic edit left 4 kB of code a reload (one page: 96 kB to 496 kB over 100), an edit to a
+function that parses and formats JSON (its generation copies the json functions it calls) 76 kB a reload (96 kB to
+7.7 MB). Data sections were not counted and are of the same order at most. A day of about 500 reloads leaves 2 to
+40 MB, against a process the compiler keeps at 350 to 640 MB resident. So nothing below is built. Instead a live
+run counts the objects its reloads add (`lookupMeasuring`, the bytes of each compiled object) and, past 256 MB,
+prints once on stderr that the code is never freed and a restart gives it back (`ABLA_LIVE_NOTE_BYTES` sets the
+limit; tools/test-live-jit.sh checks the note appears once at one byte and never at the default). The probe below
+also ran the JIT tests on RuntimeDyld (live, watch, emutls with native ELF TLS, repl, compile-time JIT, object
+cache): all 15 passed, so piece A is open if the numbers change.
+
+Today every applied reload adds a generation (an LLVM module with its own ORC resource tracker) that is never
+removed, so a long `ablac run --watch` session grows by the code and constants of each reload. Removing a
+generation's tracker frees its code and data at once, so a generation can go only when nothing can reach either.
+
+### What can point into a generation G
+
+1. **The table.** An entry whose newest body is in G. Once every body G brought has been replaced, no entry
+   points at G. The reload knows which entries each generation set (`bootstrapLlvmLiveChangedIndices`); keeping
+   the generation of each entry beside its hash in the live record is a small addition.
+2. **Threads.** A thread executing in G, or a frame with a return address into G (a thread that entered an old
+   body finishes it on the old code, and its callers' frames return there).
+3. **Code pointers held as values.** G compiles its own copies of the functions it calls that are not the
+   program's (since stage 2c: the standard library's and the runtime's, internal to G), so a function value
+   made in G's code of such a function (`println` passed as a value), or a thread or generator G's code
+   started on one of them, points into G. A lambda G added is reached through the lambda registry, whose entry
+   points at G's dispatcher; a closure holding that lambda's id is invisible to an address scan.
+4. **Data.** Constants G defines: a string literal or constant array that is new in G (an unchanged one is the
+   base's, shared by name). A string value made from such a literal points into G's read-only data for as long
+   as the value lives. G defines no variables (`E_LIVE_GLOBAL` refuses new ones) and no class descriptors.
+
+So the condition is: no table entry in G, no lambda added by G, and no word on any stack, in any register of a
+stopped thread, or in any live heap object that holds an address inside G's memory.
+
+### The pieces
+
+- **A. G's memory ranges.** LLJIT's default linking layer (JITLink) does not tell the C API where it put an
+  object's sections. The C API can instead build LLJIT on RuntimeDyld with an MCJIT-like memory manager whose
+  callbacks allocate every code and data section (`LLVMOrcCreateRTDyldObjectLinkingLayerWithMCJITMemoryManagerLikeCallbacks`,
+  through `LLVMOrcLLJITBuilderSetObjectLinkingLayerCreator`): the compiler would then record each generation's
+  ranges as they are allocated. Risk: the program's thread-locals are native ELF TLS on Linux, and RuntimeDyld's
+  ELF TLS support is narrower than JITLink's; the object cache's capture runs through the object transform
+  layer, which is above the linking layer and should not change. A probe settles it: the live, run and
+  compile-time JIT tests with the RuntimeDyld layer. Without the ranges nothing below is sound (looking up G's
+  symbols gives starts, not sizes, and misses its anonymous constants).
+- **B. Proof that nothing points in.** At a stop-the-world collection (steps i–iv: every thread parked at a safe
+  point or counted as stopped, its registers saved), scan conservatively every thread's stack from its saved
+  stack pointer to its base, the saved registers, and the words of every live heap object, for an address in a
+  candidate generation's ranges. A word that happens to look like one keeps G alive: that is only memory not yet
+  freed, never a fault. The scan runs only while a candidate exists (a generation whose table entries are all
+  replaced and which added no lambda), at most once per collection, and one pass checks all candidates.
+- **C. Removal.** With the world still stopped, remove G's tracker (`LLVMOrcResourceTrackerRemove`): ORC frees
+  its code and data. Its table entries are already elsewhere, so no call goes there again.
+
+### Limits of a first version
+
+- A generation that added a lambda is kept: a closure carries the lambda's id, not an address. Freeing those
+  needs the registry to know which ids are still held (a scan for closure objects by id).
+- The base module is never freed (it has the runtime, the globals and the class descriptors).
+- Only x86-64 Linux, where live mode is tested; macOS keeps every generation until the probe is repeated there.
+
+### Questions for the lead / André
+
+1. Switch `ablac run` (live or not) to the RuntimeDyld layer if the probe passes, or only live runs? One layer
+   for both keeps one tested path; the plain run gains nothing from it.
+2. Is a conservative scan acceptable? It can keep a dead generation (a false positive), never free a live one.
+3. Is a first version that keeps lambda-adding generations worth landing? An edit to a lambda's body replaces
+   it in place (stage 3), so only reloads that add lambdas keep their generation.
+
+### Order
+
+Probe A first: if RuntimeDyld cannot run the live, run and compile-time JIT tests, the ranges need another
+source (a C++ shim is not an option: the compiler only uses LLVM's C API), and B and C wait.

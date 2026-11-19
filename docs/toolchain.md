@@ -454,7 +454,7 @@ if (liveAvailable()) {
 `liveReload()` compiles the program's sources again as the next generation and keeps only the functions whose
 code changed. It returns a `LiveResult` whose `status` is `applied()` (0), `refused()` (1), `failed()` (2) or
 `unavailable()` (3: not a live run). Calls made after it returns take the new bodies; a thread that is
-inside an old body finishes it on the old code; old code is never freed, so each applied reload costs memory;
+inside an old body finishes it on the old code; old code is never freed, so each applied reload costs memory (measured: 4 to 76 kB of code a reload; past 256 MB in a run, stderr says once that a restart gives it back);
 the calling thread blocks while the compiler works. A refused reload changes nothing and the old code keeps
 running; the message names the reason:
 
