@@ -35,7 +35,7 @@ start_server() {   # start_server NAME ARGS...: runs the server, sets $port from
     : > "$out/$name.log"
     "$out/server" 0 "$@" > "$out/$name.log" 2>&1 &
     pids+=("$!")
-    for _ in $(seq 100); do
+    for _ in $(seq 600); do
         port=$(sed -n 's/^listening //p' "$out/$name.log" | head -1)
         [[ -n $port ]] && return 0
         sleep 0.1

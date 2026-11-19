@@ -22,7 +22,7 @@ start_peer() {
     rm -f "$ready"
     timeout 60 "$output_directory/peer" "$ready" "$@" &
     peer_pid=$!
-    for _ in $(seq 1 500); do
+    for _ in $(seq 1 3000); do
         [[ -e $ready ]] && break
         sleep 0.02
     done

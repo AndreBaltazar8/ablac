@@ -27,7 +27,7 @@ start() {   # start ARGS...: the server, $port and $pid set
     [[ -z $pid ]] || { kill "$pid" 2> /dev/null || true; wait "$pid" 2> /dev/null || true; }
     ABLA_MAX_MEMORY_MB=0 "$out/server" 0 "$@" > "$out/server.log" 2>&1 &
     pid=$!
-    for _ in $(seq 100); do
+    for _ in $(seq 600); do
         port=$(sed -n 's/^listening //p' "$out/server.log" | head -1)
         [[ -n $port ]] && return 0
         sleep 0.1

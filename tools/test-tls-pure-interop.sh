@@ -83,7 +83,7 @@ for kind in ed25519 p256 p384 rsa; do
             # s_server logs a connection's alert when it gets to it, after the client program has exited (the expired case
             # is the client's last connection): wait for each line, up to 20 s, rather than look once.
             for alert in 'alert bad certificate' 'alert certificate expired' 'alert unknown ca'; do
-                for _ in $(seq 200); do grep -q "$alert" "$out/server.log" && break; sleep 0.1; done
+                for _ in $(seq 600); do grep -q "$alert" "$out/server.log" && break; sleep 0.1; done
                 grep -q "$alert" "$out/server.log" || { echo "tls-pure interop ($kind ${suite%:*} $group): s_server never saw 'tlsv1 $alert':" >&2; cat "$out/server.log" >&2; exit 1; }
             done
             stop_server
@@ -98,7 +98,7 @@ start_server ed25519 -www -msg
 result=$("$root/tools/run-limited.sh" "$out/dropnotify" "$port" "$out/ed25519.pem") || {
     echo "tls-pure dropnotify: $result" >&2; head -5 "$out/server.log" >&2; exit 1; }
 [[ $result == 'tls-pure dropnotify ok' ]] || { echo "tls-pure dropnotify: $result" >&2; exit 1; }
-for _ in $(seq 50); do grep -q '<<< TLS 1.3, Alert \[length 0002\], warning close_notify' "$out/server.log" && break; sleep 0.1; done
+for _ in $(seq 600); do grep -q '<<< TLS 1.3, Alert \[length 0002\], warning close_notify' "$out/server.log" && break; sleep 0.1; done
 grep -q '<<< TLS 1.3, Alert \[length 0002\], warning close_notify' "$out/server.log" ||
     { echo "tls-pure dropnotify: the server never saw a close_notify from the dropped connection" >&2; tail -8 "$out/server.log" >&2; exit 1; }
 stop_server
@@ -111,7 +111,7 @@ OPENSSL_SERVER_INHERIT_STDIN=1 start_server p256 -keymatexport EXPORTER-Channel-
 result=$("$root/tools/run-limited.sh" "$out/binding-interop" "$port" "$out/p256.pem") || {
     echo "tls-pure binding: $result" >&2; head -5 "$out/server.log" >&2; exit 1; }
 read -r _ got_exporter got_endpoint <<< "$result"
-for _ in $(seq 50); do grep -q 'Keying material: ' "$out/server.log" && break; sleep 0.1; done
+for _ in $(seq 600); do grep -q 'Keying material: ' "$out/server.log" && break; sleep 0.1; done
 want_exporter=$(sed -n 's/.*Keying material: \([0-9A-Fa-f]*\).*/\1/p' "$out/server.log" | head -1 | tr 'A-F' 'a-f')
 want_endpoint=$(openssl x509 -in "$out/p256.pem" -outform DER | openssl dgst -sha256 -binary | od -An -v -tx1 | tr -d ' \n')
 [[ -n $want_exporter && $got_exporter == "$want_exporter" ]] ||

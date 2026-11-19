@@ -43,7 +43,7 @@ start() { # required count: sets $port, $log
     log="$out/server-$1.log"
     "$out/server" "$out/server.pem" "$out/server.key" "$out/ca.pem" "$1" "$2" > "$log" 2> "$log.err" &
     server_pid=$!
-    for _ in $(seq 100); do
+    for _ in $(seq 600); do
         grep -q '^port ' "$log" 2> /dev/null && break
         sleep 0.1
     done

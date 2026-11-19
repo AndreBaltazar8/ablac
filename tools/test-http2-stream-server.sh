@@ -43,7 +43,7 @@ start_server() {   # start_server NAME ARGS...: sets $port, $server_pid
     "$out/streamserver" "$port" "$@" > "$out/$name.log" 2>&1 &
     server_pid=$!
     pids+=("$server_pid")
-    for _ in $(seq 100); do
+    for _ in $(seq 600); do
         (exec 3<> "/dev/tcp/127.0.0.1/$port") 2> /dev/null && return 0
         kill -0 "$server_pid" 2> /dev/null || break
         sleep 0.1

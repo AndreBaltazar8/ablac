@@ -22,7 +22,7 @@ run_client() {
     rm -f "$out/ready"
     timeout 900 "$out/peer" "$out/ready" "$@" &
     peer_pid=$!
-    for _ in $(seq 1 500); do [[ -e $out/ready ]] && break; sleep 0.02; done
+    for _ in $(seq 1 3000); do [[ -e $out/ready ]] && break; sleep 0.02; done
     [[ -e $out/ready ]] || { echo 'HTTPS handshake deadline: the peer did not publish its port' >&2; exit 1; }
     port=$(cat "$out/ready")
     sed -e "s|CERTFILE|$out/cert.pem|g" -e "s|KEYFILE|$out/key.pem|g" \

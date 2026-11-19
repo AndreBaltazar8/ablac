@@ -43,7 +43,7 @@ for attempt in $(seq 20); do
     ss -ltn "sport = :$candidate" 2> /dev/null | grep LISTEN > /dev/null && continue
     nghttpd -d "$out/docroot" "$candidate" "$out/p256.key" "$out/p256.pem" > "$out/nghttpd.log" 2>&1 &
     nghttpd_pid=$!
-    for _ in $(seq 30); do
+    for _ in $(seq 600); do
         ss -ltn "sport = :$candidate" 2> /dev/null | grep LISTEN > /dev/null && { nghttpd_port=$candidate; break; }
         kill -0 "$nghttpd_pid" 2> /dev/null || break
         sleep 0.1

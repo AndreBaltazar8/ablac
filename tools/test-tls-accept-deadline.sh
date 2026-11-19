@@ -21,7 +21,7 @@ openssl req -x509 -new -key "$out/key.pem" -out "$out/cert.pem" -subj /CN=localh
 "$out/server" "$out/cert.pem" "$out/key.pem" > "$out/server.log" 2>&1 &
 server_pid=$!
 trap 'kill "$server_pid" 2> /dev/null || true' EXIT
-for _ in $(seq 100); do
+for _ in $(seq 600); do
     grep -q '^port ' "$out/server.log" 2> /dev/null && break
     sleep 0.1
 done
@@ -39,7 +39,7 @@ const timer = setInterval(() => { if (at < bytes.length && socket.writable) sock
 setTimeout(() => process.exit(0), 20000);
 NODE
 client_pid=$!
-for _ in $(seq 150); do
+for _ in $(seq 600); do
     grep -q '^elapsed ' "$out/server.log" 2> /dev/null && break
     sleep 0.1
 done

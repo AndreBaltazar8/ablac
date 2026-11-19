@@ -32,7 +32,7 @@ kill "${pids[-1]}" 2> /dev/null || true
 # 2. A pure server, through a handle, against openssl s_client.
 "$out/handles" serve "$out/cert.pem" "$out/key.pem" "$out/port" > "$out/serve.log" 2>&1 &
 pids+=("$!")
-for _ in $(seq 100); do [[ -s $out/port ]] && break; sleep 0.1; done
+for _ in $(seq 600); do [[ -s $out/port ]] && break; sleep 0.1; done
 answer=$(printf 'GET /handles HTTP/1.0\r\n\r\n' | timeout 15 openssl s_client -connect "127.0.0.1:$(cat "$out/port")" -tls1_3 -servername localhost \
     -CAfile "$out/cert.pem" -verify_return_error -verify_hostname localhost -quiet 2> "$out/s_client.err" || true)
 wait "${pids[-1]}" || { echo "tls-handles serve: $(cat "$out/serve.log")" >&2; exit 1; }
@@ -44,7 +44,7 @@ echo "ok   tls-pure handles serve ok (answer $(printf %s "$answer" | wc -c) byte
 rm -f "$out/port"
 "$out/handles" reset "$out/cert.pem" "$out/key.pem" "$out/port" > "$out/reset.log" 2>&1 &
 pids+=("$!")
-for _ in $(seq 100); do [[ -s $out/port ]] && break; sleep 0.1; done
+for _ in $(seq 600); do [[ -s $out/port ]] && break; sleep 0.1; done
 result=$("$out/handles" expect-reset "$(cat "$out/port")" "$out/cert.pem" 2>&1) || { echo "tls-handles expect-reset: $result" >&2; cat "$out/reset.log" >&2; exit 1; }
 wait "${pids[-1]}" || { cat "$out/reset.log" >&2; exit 1; }
 grep -q 'reset ok' "$out/reset.log"

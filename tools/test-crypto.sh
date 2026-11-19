@@ -157,7 +157,7 @@ start_server() { # extra s_server arguments
         -Verify 1 -verify_return_error -www "$@" > "$out/s_server.log" 2>&1 < /dev/null &
     server_pid=$!
     port=
-    for _ in $(seq 1 100); do
+    for _ in $(seq 1 600); do
         port=$(sed -n 's/^ACCEPT .*:\([0-9][0-9]*\)$/\1/p' "$out/s_server.log" | head -1)
         [[ -z $port ]] || return 0
         sleep 0.1

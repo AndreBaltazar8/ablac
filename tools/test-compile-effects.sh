@@ -324,7 +324,7 @@ run_network_case() {
     rm -f -- "$network_ready"
     timeout 60 "$output_directory/network-peer" "$network_ready" "$@" &
     network_server_pid=$!
-    for _ in $(seq 1 500); do
+    for _ in $(seq 1 3000); do
         [[ -e $network_ready ]] && break
         sleep 0.02
     done

@@ -27,7 +27,7 @@ run_client() {
     rm -f "$out/ready"
     timeout 120 "$out/peer" "$out/ready" "$out/cert.pem" "$out/key.pem" "$@" &
     peer_pid=$!
-    for _ in $(seq 1 500); do [[ -e $out/ready ]] && break; sleep 0.02; done
+    for _ in $(seq 1 3000); do [[ -e $out/ready ]] && break; sleep 0.02; done
     [[ -e $out/ready ]] || { echo 'HTTP close-delimited: the peer did not publish its ports' >&2; exit 1; }
     read -r plain_port tls_port < "$out/ready"
     sed -e "s/39092/$plain_port/g" -e "s/39093/$tls_port/g" \

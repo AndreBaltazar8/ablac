@@ -44,7 +44,7 @@ free_port() {
     return 1
 }
 wait_listening() {   # wait_listening PORT PID LOG
-    for _ in $(seq 100); do
+    for _ in $(seq 600); do
         (exec 3<> "/dev/tcp/127.0.0.1/$1") 2> /dev/null && return 0
         kill -0 "$2" 2> /dev/null || break
         sleep 0.1

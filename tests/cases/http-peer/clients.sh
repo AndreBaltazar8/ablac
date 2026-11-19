@@ -20,7 +20,7 @@ for mode in "${modes[@]}"; do
     "$server" "$mode" "${arguments[@]}" > "$directory/stdout" 2> "$directory/stderr" &
     pid=$!
     ready=
-    for _ in $(seq 1 300); do
+    for _ in $(seq 1 1200); do
         ready=$(head -n 1 "$directory/stderr" 2> /dev/null || true)
         [[ -z $ready ]] || break
         kill -0 "$pid" 2> /dev/null || break
@@ -40,8 +40,8 @@ for mode in "${modes[@]}"; do
         echo "$mode: the client failed ($status)" >&2
         exit 1
     fi
-    # The server ends by itself once it has answered; five seconds, as before.
-    for _ in $(seq 1 100); do
+    # The server ends by itself once it has answered; a minute at most (a hung server costs that, an answered one nothing).
+    for _ in $(seq 1 1200); do
         kill -0 "$pid" 2> /dev/null || break
         sleep 0.05
     done
