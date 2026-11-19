@@ -93,6 +93,8 @@ private fun cryptoSha256Constants(): array<int> = [
     2428436474, 2756734187, 3204031479, 3329325298
 ]
 
+private val CRYPTO_ZERO_BYTES = "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+
 fun sha256(value: string): string {
     val stream = sha256Stream()
     stream.update(value)
@@ -337,12 +339,17 @@ class Sha256Stream(
 )
 
 fun sha256Stream(): Sha256Stream {
+    // The constants and the schedule are the compile-time evaluator's (runBlocks): a program that runs has a memory-based round and no use for them.
     val schedule: array<int> = []
-    while (schedule.size < 64) schedule.append(0)
+    var constants: array<int> = []
+    if (ablaAtCompileTime()) {
+        while (schedule.size < 64) schedule.append(0)
+        constants = cryptoSha256Constants()
+    }
     Sha256Stream(
         [1779033703, 3144134277, 1013904242, 2773480762,
          1359893119, 2600822924, 528734635, 1541459225],
-        cryptoSha256Constants(), schedule, "", 0
+        constants, schedule, "", 0
     )
 }
 
@@ -662,13 +669,12 @@ fun Sha256Stream.update(value: string): void {
 
 fun Sha256Stream.finish(): string {
     val bitLength = this.total * 8
-    val tail: array<int> = []
-    for (byte in this.pending) tail.append(int(byte))
-    tail.append(128)
-    while (tail.size % 64 != 56) tail.append(0)
-    cryptoAppendU32Big(tail, bitLength >>> 32)
-    cryptoAppendU32Big(tail, bitLength & 4294967295)
-    val text = cryptoByteString(tail)
+    // The last one or two blocks: what is pending, the 1 bit, zeros up to 56 mod 64, the length.
+    val zeros = if (this.pending.size <= 55) 55 - this.pending.size else 119 - this.pending.size
+    val length: array<int> = []
+    cryptoAppendU32Big(length, bitLength >>> 32)
+    cryptoAppendU32Big(length, bitLength & 4294967295)
+    val text = "${this.pending}\x80${CRYPTO_ZERO_BYTES.slice(0, zeros)}${cryptoByteString(length)}"
     this.runBlocks(text, 0, text.size / 64)
     val output: array<int> = []
     for (word in this.state) cryptoAppendU32Big(output, word)
@@ -678,18 +684,23 @@ fun Sha256Stream.finish(): string {
 fun hmacSha256(key: string, message: string): string {
     var normalized = key
     if (normalized.size > 64) normalized = sha256(normalized)
-    val inner: array<int> = []
-    val outer: array<int> = []
+    val inner = byteBuffer()
+    val outer = byteBuffer()
     var index = 0
     while (index < 64) {
         val byte = if (index < normalized.size) normalized[index] else 0
-        inner.append(byte ^ 54)
-        outer.append(byte ^ 92)
+        inner.appendByteValue(byte ^ 54)
+        outer.appendByteValue(byte ^ 92)
         index = index + 1
     }
-    cryptoAppendText(inner, message)
-    cryptoAppendText(outer, sha256(cryptoByteString(inner)))
-    sha256(cryptoByteString(outer))
+    // Through streams: a pad block, then the message (or the inner digest) with its padding: two compressions each.
+    val first = sha256Stream()
+    first.update(inner.toText())
+    first.update(message)
+    val second = sha256Stream()
+    second.update(outer.toText())
+    second.update(first.finish())
+    second.finish()
 }
 
 private fun cryptoHmacPad(key: string, blockBytes: int, mask: int): string {
