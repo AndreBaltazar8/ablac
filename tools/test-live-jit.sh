@@ -48,6 +48,29 @@ died() {   # died NAME STATUS OUTPUT
     sed -n '/"triggered" : true/,/"triggered"/p' "$report" | head -n 200 >&2 || true
     grep -A 40 '"threadState"' "$report" | grep -E '"(pc|lr|far|esr)"' -A 1 >&2 || true
 }
+# under_lldb PROFILE: on macOS, the reload again under lldb (at most three times, until it stops other than by
+# exiting 42): the trace naming where the code is (ABLA_LIVE_TRACE), then at the stop the backtrace, the
+# registers and the code around the pc and the return address.
+under_lldb() {
+    [[ $(uname -s) == Darwin ]] && command -v lldb > /dev/null || return 0
+    local binary=$compiler attempt
+    [[ -f $compiler.bin ]] && binary=$compiler.bin
+    for attempt in 1 2 3; do
+        cp tests/cases/live-jit/reload.ab "$reload"
+        limited lldb --batch -o run \
+            -k 'thread backtrace' -k 'register read' \
+            -k 'disassemble --start-address $pc-256 --count 96' \
+            -k 'disassemble --start-address $lr-128 --count 48' -k kill \
+            -- "$binary" run "--$1" --live "$reload" -- "$reload" > "$out/lldb.out" 2>&1 || true
+        if grep -q 'stop reason' "$out/lldb.out" && ! grep -q 'exited with status = 42' "$out/lldb.out"; then
+            echo "live jit (reload, $1, under lldb, attempt $attempt):" >&2
+            grep -v ': ok (' "$out/lldb.out" | tail -n 600 >&2
+            return 0
+        fi
+    done
+    echo "live jit (reload, $1, under lldb): it did not stop in three attempts" >&2
+    tail -n 20 "$out/lldb.out" >&2
+}
 touch "$started"
 program=tests/cases/live-jit/calls.ab
 run() {
@@ -103,8 +126,10 @@ for profile in o1 fast; do
     if [[ $status -ne 42 ]] || grep -q ': FAIL' "$out/reload-$profile.out"; then
         printf 'live jit (reload, %s): exit status %s (42 expected)\n' "$profile" "$status" >&2
         cat "$out/reload-$profile.out" >&2
-        head -n 30 "$out/reload-$profile.err" >&2
+        grep '^live: ' "$out/reload-$profile.err" >&2 || true
+        grep -v '^live: ' "$out/reload-$profile.err" | head -n 30 >&2 || true
         died "reload, $profile" "$status" "$out/reload-$profile.out"
+        ((status > 128 && status < 160)) && under_lldb "$profile"
         exit 1
     fi
     notes=$(grep -c "^ablac run: the reloads of this live run have added " "$out/reload-$profile.err" || true)
@@ -138,22 +163,7 @@ if ((repeat > 0)); then
         cp "$out/repeat.err" "$out/repeat-$round.err"
     done
     echo "live jit: the reload again $repeat times, $failed failed"
-    if ((failed > 0)) && [[ $(uname -s) == Darwin ]] && command -v lldb > /dev/null; then
-        binary=$compiler
-        [[ -f $compiler.bin ]] && binary=$compiler.bin
-        for round in $(seq "$repeat"); do
-            cp tests/cases/live-jit/reload.ab "$reload"
-            limited lldb --batch -o run \
-                -k 'thread backtrace' -k 'register read' -k 'disassemble --pc --count 40' \
-                -k 'disassemble --start-address $pc-160 --count 48' -k 'image lookup --address $pc' -k kill \
-                -- "$binary" run --o1 --live "$reload" -- "$reload" > "$out/lldb.out" 2>&1 || true
-            if grep -q 'stop reason' "$out/lldb.out" && ! grep -q 'exited with status = 42' "$out/lldb.out"; then
-                echo "live jit (repeat under lldb, round $round):" >&2
-                grep -v ': ok (' "$out/lldb.out" | tail -n 400 >&2
-                break
-            fi
-        done
-    fi
+    ((failed > 0)) && under_lldb o1
     ((failed == 0)) || exit 1
 fi
 # A live run from the object cache (stage 2c): the first run compiles and keeps the object with the
