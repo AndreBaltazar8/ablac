@@ -178,14 +178,16 @@ for mode in jit interp; do
         "$output_directory/stop-native/main-$mode.trace"
 done
 
-# An endless native evaluation stops at the time limit.
+# An endless native evaluation stops at the time limit, placed at its site (native code has no line table).
 stop_case endless jit ABLA_COMPILE_EVAL_TIME_LIMIT=1
-grep -q 'error\[E_CT_TIME_LIMIT\]: compile-time evaluation at .*endless.ab:[0-9]* ran past the time limit (1 s' \
+grep -q '^error\[E_CT_TIME_LIMIT\]: compile-time evaluation ran past the time limit (1 s' \
+    "$output_directory/endless-jit.trace"
+grep -q "^  --> .*endless.ab:[0-9]*:[0-9]* (its \`#\` site: the native tier's code has no line table)" \
     "$output_directory/endless-jit.trace"
 
-# Recursion past the end of the stack in native code is a diagnostic too.
+# Recursion past the end of the stack in native code is the evaluator's stack error.
 stop_case deep jit
-grep -q 'error\[E_CT_STOPPED\]: compile-time evaluation at .*deep.ab:[0-9]* stopped: a bad memory access' \
+grep -q "^error\[E_EVAL_STACK_DEPTH\]: compile-time evaluation used up the compiler's stack" \
     "$output_directory/deep-jit.trace"
 
 # Two compilations in one process: a program whose compile-time code builds another.

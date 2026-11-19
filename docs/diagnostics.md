@@ -27,7 +27,8 @@ help: ...
 - `help:` lines, when present, suggest a fix.
 - `context[...]` lines add the module or declaration involved.
 - The last line counts the errors per phase:
-  `LLVM compilation failed: 0 parser, 0 extension, 1 semantic, 0 IR, 1 total error(s)`.
+  `LLVM compilation failed: 0 parser, 0 extension, 1 semantic, 0 IR, 1 total error(s)`; when every error is a
+  failing `#` site's, `compile-time evaluation failed: 1 error(s)` ([compile-time.md](compile-time.md#diagnostics)).
 
 Types are written in their canonical spelling: `int` is `i64`, a nullable
 type is `nullable:T`, a function type is `function:(i64)->i64`, and a

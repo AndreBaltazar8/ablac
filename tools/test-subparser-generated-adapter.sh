@@ -18,7 +18,13 @@ ln -sf "$(command -v opt)" "$missing_toolchain_path/opt"
 assert_compiler_diagnostic_accounting() {
     local diagnostic_file=$1
     local summary parser extension semantic ir total primary
-    summary=$(grep 'compilation failed:' "$diagnostic_file" | tail -n 1)
+    summary=$(grep -E '(compilation|compile-time evaluation) failed:' "$diagnostic_file" | tail -n 1)
+    # Every error a compile-time evaluation's: the line says so with the total only.
+    if [[ $summary =~ ^compile-time\ evaluation\ failed:\ ([0-9]+)\ error ]]; then
+        [[ $(grep -c '^error\[' "$diagnostic_file") -eq ${BASH_REMATCH[1]} ]] || exit 1
+        ! grep -q 'error\[E_NATIVE_TOOLCHAIN\]' "$diagnostic_file"
+        return
+    fi
     read -r parser extension semantic ir total < <(
         sed -E \
             's/.*: ([0-9]+) parser, ([0-9]+) extension, ([0-9]+) semantic, ([0-9]+) IR, ([0-9]+) total.*/\1 \2 \3 \4 \5/' \
@@ -149,7 +155,7 @@ set +e
 invalid_status=$?
 set -e
 [[ $invalid_status -ne 0 ]] || exit 1
-grep -q 'LLVM compilation failed:' "$output_directory/invalid-builder.err"
+grep -Eq '(LLVM compilation|compile-time evaluation) failed:' "$output_directory/invalid-builder.err"
 
 set +e
 "$compiler" --emit-llvm \
@@ -159,7 +165,7 @@ set +e
 invalid_export_status=$?
 set -e
 [[ $invalid_export_status -ne 0 ]] || exit 1
-grep -q 'LLVM compilation failed:' "$output_directory/invalid-export.err"
+grep -Eq '(LLVM compilation|compile-time evaluation) failed:' "$output_directory/invalid-export.err"
 
 set +e
 "$compiler" --emit-llvm \

@@ -737,7 +737,7 @@ or 5,000 nested calls of a small function. A plain 8 MB stack allows about
 compiler:
 
 ```text
-error[E_EVAL_STACK_DEPTH]: compile-time evaluation nested 16408 levels deep and used up the compiler's stack (unbounded recursion, or recursion deeper than the compiler's stack allows)
+error[E_EVAL_STACK_DEPTH]: compile-time evaluation used up the compiler's stack (unbounded recursion, or recursion deeper than the compiler's stack allows)
 ```
 
 `ABLA_EVAL_DEPTH_LIMIT=<n>` lowers the limit (it never raises it), and
@@ -745,7 +745,7 @@ error[E_EVAL_STACK_DEPTH]: compile-time evaluation nested 16408 levels deep and 
 evaluator's. In the [native tier](#native-evaluation) compile-time code runs
 as machine code on the compiler's stack, with frames like a program's, so it
 recurses about as deep as at run time (100,000 levels of a small function
-fit); running past the end of the stack stops it with `E_CT_STOPPED`, and
+fit); running past the end of the stack stops it with the same `E_EVAL_STACK_DEPTH`, and
 there is no step limit, only a [time limit](#native-evaluation).
 
 The runtime memory API (`memoryLiveBytes`, `memoryCollect`, `memoryReset`,
@@ -1237,6 +1237,27 @@ a value is no part of any global's heap, whatever it was computed from.
 
 ## Diagnostics
 
+A `#` site that fails is reported the same way in both tiers: the error's code and text, where it failed, the site
+it came from, and a last line that says compile-time evaluation failed:
+
+```text
+error[E_EVAL_OUT_OF_BOUNDS]: index 7 out of bounds for array of size 3
+source[eval]:bounds.ab:131:140
+  --> bounds.ab:2:45
+source[site]:bounds.ab:221:229
+  = note: in `#table()` at bounds.ab:9:13
+compile-time evaluation failed: 1 error(s)
+```
+
+The place line (`-->`) is the one part that differs. The evaluator knows the expression it was evaluating. Native code
+has no line table, so its place is the site, and the line says so:
+
+```text
+  --> bounds.ab:9:13 (its `#` site: the native tier's code has no line table)
+```
+
+The `source[...]` lines are the same places for tools, in byte offsets.
+
 | Code | Meaning |
 |---|---|
 | `E_EVAL_EXPRESSION` | compile-time evaluation failed; the message names the expression kind and its byte range |
@@ -1245,8 +1266,8 @@ a value is no part of any global's heap, whatever it was computed from.
 | `E_EVAL_MEMORY_UNAVAILABLE` | the runtime memory API called in the evaluator, which has no program heap |
 | `E_EVAL_DIVISION_BY_ZERO` | an integer division or remainder by zero, which panics at run time |
 | `E_EVAL_OUT_OF_BOUNDS` | an index or slice outside a string or an array, or a negative `truncate` or `filledArray` count; the message is the run-time panic's |
-| `E_CT_STOPPED` | compile-time code called `exit`, or native compile-time code aborted, failed a check or ran past the end of the stack ([native evaluation](#native-evaluation)) |
-| `E_CT_TIME_LIMIT` | a native evaluation ran past `ABLA_COMPILE_EVAL_TIME_LIMIT` |
+| `E_CT_STOPPED` | compile-time code called `exit`, or native compile-time code aborted, failed a check or made a bad memory access ([native evaluation](#native-evaluation)) |
+| `E_CT_TIME_LIMIT` | an evaluation ran past `ABLA_COMPILE_EVAL_TIME_LIMIT` |
 | `E_CT_PANIC` | compile-time code called `panic`, or native compile-time code panicked with a reason the evaluator has no code of its own for |
 | `compile.effect-denied:<capability>:<call path>` | the code needs a capability that this module didn't grant |
 | `compile.capability-not-authorized:<capability>` | the module grants a capability that `abla.toml` doesn't authorize |

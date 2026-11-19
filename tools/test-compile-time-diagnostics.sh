@@ -41,7 +41,8 @@ grep -qx 'error\[E_EVAL_OUT_OF_BOUNDS\]: index 7 out of bounds for array of size
 grep -q '^source\[eval\]:compile-time-index.ab:48:61$' "$log" || fail "index: no record" "$log"
 grep -q '^  --> compile-time-index.ab:1:49$' "$log" || fail "index: no line:column" "$log"
 ! grep -qE 'E_IR_|E_LLVM_' "$log" || fail "index: code-generation noise" "$log"
-grep -q '1 semantic, 0 IR, 1 total' "$log" || fail "index: summary" "$log"
+grep -qx 'compile-time evaluation failed: 1 error(s)' "$log" || fail "index: summary" "$log"
+grep -q '^  = note: in `#compute()` at compile-time-index.ab:7:9$' "$log" || fail "index: no note naming the site" "$log"
 
 log=$output/unicode.log
 build_fails unicode-column.ab "$log"

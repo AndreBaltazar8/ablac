@@ -1,4 +1,5 @@
 import "ct_global_graph.ab"
+import "diagnostic_positions.ab"
 // Compile-time evaluation as native code: the calls (ABLA_COMPILE_EVAL=jit|auto).
 //
 // ct_jit.ab prepares, per compile pass, one generation of native code with an entry
@@ -222,46 +223,67 @@ trusted fun bootstrapCtStopWhat(how: int): string {
     "$what in `$text`"
 }
 
-// A native call that stopped, reported as the interpreter reports the same failure:
-// a panic with its code and text (bootstrapEvalRuntimePanic), placed at the site.
+// A native call that stopped, reported as the interpreter reports the same failure: the same code and text (a panic's,
+// the time limit's, the stack's). Only the place differs: the interpreter knows the expression it was evaluating, and
+// native code, which has no line table, is placed at its `#` site, which the place says (source[eval-site],
+// diagnostic_positions.ab). The site itself is named after it in both tiers (ir.ab, bootstrapLowerCompile).
 fun bootstrapCtReportStop(var evaluator: BootstrapEvaluator, site: BootstrapCtSite,
     how: int): void {
-    val label = bootstrapCtSiteLabel(site)
+    var code = "E_CT_STOPPED"
+    var text = ""
     if (how == 5 && bootstrapCtPanicMessage() != "") {
-        var text = bootstrapCtPanicMessage()
-        var code = bootstrapCompilePanicCode(text)
+        text = bootstrapCtPanicMessage()
+        code = bootstrapCompilePanicCode(text)
         // `exit(code)`, which the slice turns into a panic with the marked
         // message (ct_bridge.ab, ctBridgeExitSource).
         if (text.startsWith(BOOTSTRAP_COMPILE_EXIT_MARK)) {
             code = "E_CT_STOPPED"
             text = text.slice(BOOTSTRAP_COMPILE_EXIT_MARK.size, text.size)
         }
-        evaluator.errors = evaluator.errors + 1
-        evaluator.recordEvaluatorDiagnostic(code, text)
-        if (site.sourceIdentity != "") {
-            evaluator.diagnostics =
-                "${evaluator.diagnostics}source[eval]:${site.sourceIdentity}:${site.node.begin}:${site.node.end}\n"
-        }
     } else if (how == 3) {
-        evaluator.recordEvaluatorDiagnostic(
-            "E_CT_TIME_LIMIT",
-            "compile-time evaluation at $label ran past the time limit (${bootstrapCtTimeLimitSeconds()} s; ABLA_COMPILE_EVAL_TIME_LIMIT)"
-        )
-        evaluator.errors = evaluator.errors + 1
+        code = "E_CT_TIME_LIMIT"
+        text = bootstrapCtTimeLimitMessage(bootstrapCtTimeLimitSeconds())
+    } else if (how == 4 && bootstrapCtStopOverflowed) {
+        code = "E_EVAL_STACK_DEPTH"
+        text = BOOTSTRAP_EVAL_STACK_DEPTH_MESSAGE
     } else if (how == 4) {
-        evaluator.recordEvaluatorDiagnostic(
-            "E_CT_STOPPED",
-            "compile-time evaluation at $label stopped: a bad memory access (recursion deeper than the compiler's stack?)"
-        )
-        evaluator.errors = evaluator.errors + 1
+        text = "compile-time code made a bad memory access"
     } else {
-        evaluator.recordEvaluatorDiagnostic(
-            "E_CT_STOPPED",
-            "compile-time evaluation at $label stopped: ${bootstrapCtStopWhat(how)}"
-        )
-        evaluator.errors = evaluator.errors + 1
+        text = "compile-time code stopped: ${bootstrapCtStopWhat(how)}"
+    }
+    evaluator.errors = evaluator.errors + 1
+    evaluator.recordEvaluatorDiagnostic(code, text)
+    if (site.sourceIdentity != "") {
+        evaluator.diagnostics =
+            "${evaluator.diagnostics}source[eval-site]:${site.sourceIdentity}:${site.node.begin}:${site.node.end}\n"
     }
     return
+}
+
+// The live generation's word that its fault handler writes the faulting address to (ct_jit.ab), 0 without one.
+var bootstrapCtFaultAddressCell: int = 0
+// Whether the last native call that faulted ran past the end of the compiler's stack (bootstrapCtCall).
+var bootstrapCtStopOverflowed: bool = false
+
+// Whether the call's fault was just below the stack it started on (`mark`, an address in the caller's frame): within
+// the stack's limit and the guard gap under it. Native code runs on the compiler's stack, below that frame.
+trusted fun bootstrapCtFaultBelowStack(mark: int): bool {
+    if (bootstrapCtFaultAddressCell == 0) return false
+    val address = ablaUnsafeLoadI64(nativePointerFromAddress(bootstrapCtFaultAddressCell))
+    if (address <= 0 || address >= mark) return false
+    var stackBytes = 8 * 1024 * 1024
+    val limits = linuxStackLimits()
+    if (limits.size == 2) stackBytes = if (limits[0] < 0) 512 * 1024 * 1024 else limits[0]
+    mark - address <= stackBytes + 4 * 1024 * 1024
+}
+
+// `site`'s place for a message that has no record line: file:line:col (or the offset when the file can't be read).
+fun bootstrapCtSitePlace(site: BootstrapCtSite): string {
+    if (site.sourceIdentity == "") return "<root>:${site.node.begin}"
+    var sources = BootstrapDiagnosticSources([], [], [])
+    val file = bootstrapDiagnosticSource(sources, site.sourceIdentity)
+    if (!sources.readable[file] || site.node.begin > sources.contents[file].size) return bootstrapCtSiteLabel(site)
+    bootstrapDiagnosticLineColumn(site.sourceIdentity, sources.contents[file], site.node.begin)
 }
 
 trusted fun bootstrapCtReadReply(address: int): string {
@@ -334,7 +356,7 @@ trusted fun bootstrapCtTryEvaluate(
     bootstrapCtCurrentLive = true
     // Compiler API calls the entry makes (bridge shims) run on this evaluator.
     val bridge = ctBridgeEnter(evaluator, site.expression.begin, site.expression.end)
-    val called = bootstrapCtCall(site.entry, bootstrapCtSiteLabel(site))
+    val called = bootstrapCtCall(site.entry, bootstrapCtSitePlace(site))
     evaluator = ctBridgeFrames[ctBridgeTopIndex()].evaluator
     ctBridgeLeave(bridge)
     bootstrapCtCurrent = enclosing
@@ -754,6 +776,8 @@ trusted fun bootstrapCtCall(entry: int, label: string = ""): BootstrapCtCallResu
         val callDeadline = linuxMonotonicMilliseconds() + limit * 1000
         if (outerCallDeadline == 0 || callDeadline < outerCallDeadline) ctNativeCallDeadline = callDeadline
     }
+    // Where the compiler's stack is at the call: a fault just below it is recursion past its end.
+    val stackMark = bootstrapEvalStackMark()
     val faults = bootstrapCtFaultAddress != 0 && bootstrapCtArmFaults(bootstrapCtFaultAddress)
     val value = ablaUnsafeCallExact_I64_I64_I64(
         bootstrapCtGuardAddress, entry, nativePointerAddress(stopped.address)
@@ -767,6 +791,7 @@ trusted fun bootstrapCtCall(entry: int, label: string = ""): BootstrapCtCallResu
     }
     if (faults) bootstrapCtDisarmFaults()
     val how = stopped.load()
+    bootstrapCtStopOverflowed = how == 4 && bootstrapCtFaultBelowStack(stackMark)
     val closed = stopped.close()
     if (how != 0) {
         // (Its globals left pending by an earlier call can't be read from a spent generation. The stop is an error
@@ -1039,8 +1064,8 @@ trusted fun bootstrapCtArmFaults(handler: int): bool {
     if (darwin) {
         action = bootstrapCtZeroed(160)
         ablaRuntimeStoreI64(action, handler)
-        ablaRuntimeStoreI64(action + 8, 17 * 4294967296)
-    } else action = bootstrapCtKernelAction(handler, 1073741824 + 134217728)
+        ablaRuntimeStoreI64(action + 8, (17 + 64) * 4294967296)
+    } else action = bootstrapCtKernelAction(handler, 1073741824 + 134217728 + 4)
     val segv = bootstrapCtSigaction(11, action, bootstrapCtSavedSegv)
     val bus = bootstrapCtSigaction(bootstrapCtBusSignal(), action, bootstrapCtSavedBus)
     __ablaRuntimeFree(action)

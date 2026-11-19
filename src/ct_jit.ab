@@ -2606,6 +2606,7 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
     }
     bootstrapCtStopSiteAddress = bootstrapCtLookup("abla_ct_stop_site_$generation")
     ctNativeStopDeferredAddress = bootstrapCtLookup("abla_ct_deferred_$generation")
+    bootstrapCtFaultAddressCell = bootstrapCtLookup("abla_ct_fault_address_$generation")
     bootstrapCtGenerationSpent = ""
     if (bootstrapCtFreeAddress == 0 || bootstrapCtGuardAddress == 0) {
         bootstrapCtFailReady("the slice's support entries are missing")
@@ -2952,20 +2953,39 @@ fun bootstrapCtInstallGuard(context: i64*, module: i64*, generation: int): bool 
     signalParameter.set(0, i32Type)
     val handlerType = LLVMFunctionType(voidType, signalParameter.pointer(), 1, 0)
     signalParameter.drop()
+    // The fault handler is installed with SA_SIGINFO (ct_eval.ab, bootstrapCtArmFaults): it keeps the faulting
+    // address (siginfo's si_addr) in abla_ct_fault_address_<g>, so the report can tell recursion past the end of the
+    // stack from any other bad access.
+    val faultParameters = llvmPointerVector(3)
+    faultParameters.set(0, i32Type)
+    faultParameters.set(1, pointer)
+    faultParameters.set(2, pointer)
+    val faultType = LLVMFunctionType(voidType, faultParameters.pointer(), 3, 0)
+    faultParameters.drop()
+    val faultAddress = LLVMAddGlobal(module, i64Type, "abla_ct_fault_address_$generation")
+    LLVMSetInitializer(faultAddress, LLVMConstInt(i64Type, 0, 0))
     var handler = 0
     while (handler < 2) {
         val fault = handler == 1
         val function = LLVMAddFunction(
             module, if (fault) "abla_ct_fault_$generation" else "abla_ct_alarm_$generation",
-            handlerType
+            if (fault) faultType else handlerType
         )
         val handlerEntry = LLVMAppendBasicBlockInContext(context, function, "entry")
         val handlerBack = LLVMAppendBasicBlockInContext(context, function, "back")
         val handlerIdle = LLVMAppendBasicBlockInContext(context, function, "idle")
         LLVMPositionBuilderAtEnd(builder, handlerEntry)
         val handlerArmed = LLVMBuildLoad2(builder, i1, armed, "armed")
-        if (fault) LLVMBuildCondBr(builder, handlerArmed, handlerBack, handlerIdle)
-        else {
+        if (fault) {
+            // si_addr: after three ints and padding on Linux (16), after six ints on Darwin (24).
+            val offset = llvmPointerVector(1)
+            offset.set(0, LLVMConstInt(i64Type, if (ablaHostIsMacOS()) 24 else 16, 0))
+            val field = LLVMBuildGEP2(builder, LLVMInt8TypeInContext(context), LLVMGetParam(function, i32(1)),
+                offset.pointer(), i32(1), "si.addr")
+            offset.drop()
+            LLVMBuildStore(builder, LLVMBuildLoad2(builder, i64Type, field, "fault.address"), faultAddress)
+            LLVMBuildCondBr(builder, handlerArmed, handlerBack, handlerIdle)
+        } else {
             // In the compiler's code (a bridge call): the stop waits for its return.
             val handlerCheck = LLVMAppendBasicBlockInContext(context, function, "check")
             val handlerDefer = LLVMAppendBasicBlockInContext(context, function, "defer")
@@ -3226,6 +3246,7 @@ fun bootstrapCtFinishPass(another: bool = true): void {
     bootstrapCtPanicSizeAddress = 0
     bootstrapCtStopSiteAddress = 0
     ctNativeStopDeferredAddress = 0
+    bootstrapCtFaultAddressCell = 0
     // (No fresh array where there is nothing to drop: inside a region it would not
     // outlive it.)
     if (bootstrapCtSites.size > 0) bootstrapCtSites = []

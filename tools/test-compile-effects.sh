@@ -119,7 +119,7 @@ ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-1024} ABLA_MAX_SECONDS=30 \
 subparser_denied_status=$?
 set -e
 [[ $subparser_denied_status -ne 0 ]] || exit 1
-grep -q 'LLVM compilation failed:' \
+grep -Eq '(LLVM compilation|compile-time evaluation) failed:' \
     "$output_directory/subparser-denied.err"
 
 # The cache-hit checks build with --fast: an LTO build copies its cached .ll back
