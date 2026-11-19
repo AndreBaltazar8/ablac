@@ -8429,7 +8429,8 @@ class BootstrapAnalyzer(
             this.diagnostics =
                 "${this.diagnostics}source[semantic]:${this.currentSourceIdentity}:$begin:${begin + 1}\n"
         }
-        val help = bootstrapSemanticHelp(code)
+        val everyday = bootstrapEverydayHelp(code)
+        val help = if (everyday != "") everyday else bootstrapSemanticHelp(code)
         if (help != "") this.diagnostics = "${this.diagnostics}help: $help\n"
         if (code.startsWith("name.not-imported:")) {
             val parts = code.slice(18, code.size).split("|")
@@ -8873,6 +8874,54 @@ class BootstrapAnalyzer(
     }
 
     fun hasVisibleLocal(name: string): bool = this.visibleLocalIndex(name) >= 0
+
+    /** Whether code being analyzed could name `declaration`: not private to another file, not hidden by strict
+     *  imports, not a generated name. Only such a name is suggested (`did you mean`). */
+    fun declarationReachable(declaration: BootstrapDeclaration): bool {
+        if (declaration.name.contains("__") || declaration.name == "") return false
+        if (declaration.isPrivate && bootstrapGenericSourceFile(declaration.sourceIdentity) !=
+            bootstrapGenericSourceFile(this.currentSourceIdentity)) return false
+        bootstrapStrictHidden(this.currentSourceIdentity, declaration.sourceIdentity, declaration.extensionOwner != "") == 0
+    }
+
+    /** The one name close to `name` that code here can reach, or "": for a call (`calls`: top-level functions and
+     *  classes), else for a value (visible locals and parameters, then top-level values and functions). */
+    fun suggestVisibleName(name: string, calls: bool): string {
+        val candidates: array<string> = []
+        if (!calls) {
+            for (local in this.locals) {
+                if (this.scopeIsVisible(local.scope) && !local.name.contains("__")) candidates.append(local.name)
+            }
+        }
+        for (declaration in this.declarations) {
+            if (declaration.extensionOwner != "") continue
+            val kind = declaration.kind
+            val wanted = if (calls) kind == "fun" || kind == "class" || kind == "compile.fun" || kind == "extern"
+                else kind == "val" || kind == "var" || kind == "fun" || kind == "compile.val" || kind == "compile.var"
+            if (wanted && this.declarationReachable(declaration)) candidates.append(declaration.name)
+        }
+        bootstrapSuggestName(name, candidates)
+    }
+
+    /** The one member of `owner` close to `name` that code here can reach, or "": its methods, extension functions
+     *  this module sees, and (`fields`) its fields and constructor properties. */
+    fun suggestMember(owner: string, name: string, fields: bool): string {
+        val candidates: array<string> = []
+        val found = this.typeDeclarations.find(owner)
+        if (found >= 0 && found < this.declarations.size) {
+            val type = this.declarations[found]
+            for (method in type.methods) {
+                val field = method.kind == "val" || method.kind == "var"
+                if ((fields || !field) && !method.name.contains("__")) candidates.append(method.name)
+            }
+            if (fields) for (parameter in type.parameters) candidates.append(parameter)
+        }
+        for (declaration in this.declarations) {
+            if (declaration.extensionOwner != "" && bootstrapNormalizeType(declaration.extensionOwner) == owner &&
+                this.declarationReachable(declaration)) candidates.append(declaration.name)
+        }
+        bootstrapSuggestName(name, candidates)
+    }
 
     fun visibleLocalKind(name: string): string {
         val index = this.visibleLocalIndex(name)
@@ -14373,6 +14422,16 @@ fun bootstrapInferIdentifier(
                 "name.private:${expression.text}:$privateModule@${expression.begin}"
             else "identifier:${expression.text}@${expression.begin}"
         )
+        if (privateModule == "") {
+            val help = bootstrapStandardImportHelp(expression.text)
+            if (help != "") analyzer.diagnostics = "${analyzer.diagnostics}$help"
+            else {
+                // A misspelled local, parameter or value this module can name (`widht` for `width`).
+                val near = analyzer.suggestVisibleName(expression.text, false)
+                if (near != "") analyzer.diagnostics =
+                    "${analyzer.diagnostics}help: nothing named `${expression.text}` is visible here; did you mean `$near`?\n"
+            }
+        }
     }
     // A runtime-internal function taken as a value is called later, anywhere.
     if (bootstrapRuntimeInternalFunction(expression.text) &&
@@ -14903,6 +14962,12 @@ fun bootstrapInferCall(
         if (privateModule == "") {
             val help = bootstrapStandardImportHelp(expression.text)
             if (help != "") analyzer.diagnostics = "${analyzer.diagnostics}$help"
+            else {
+                // A misspelling of a function or class this module can call (`aera` for `area`).
+                val near = analyzer.suggestVisibleName(expression.text, true)
+                if (near != "") analyzer.diagnostics =
+                    "${analyzer.diagnostics}help: no function or class named `${expression.text}` is visible here; did you mean `$near`?\n"
+            }
         }
     }
     var argument = 0
@@ -15232,6 +15297,10 @@ fun bootstrapInferMember(
         result = analyzer.fieldType(receiver, expression.text)
         if (result == "unknown") {
             analyzer.fail("member:${receiver}.${expression.text}")
+            // A misspelled field or property (`p.lenght` for `length`).
+            val near = analyzer.suggestMember(receiver, expression.text, true)
+            if (near != "") analyzer.diagnostics =
+                "${analyzer.diagnostics}help: `${bootstrapShownType(receiver)}` has no field `${expression.text}`; did you mean `$near`?\n"
         }
         // (A property without a getter, reported with it, stays a field read.)
         if (analyzer.delegatedField(receiver, expression.text) != "" && result != "unknown") {
@@ -15666,6 +15735,11 @@ fun bootstrapInferMemberCall(
             if (module != "") {
                 analyzer.diagnostics =
                     "${analyzer.diagnostics}help: `${expression.text}` is declared in $module; add `import \"$module\"`\n"
+            } else {
+                // A misspelled method (`p.lenght()` for `length`).
+                val near = analyzer.suggestMember(receiver, expression.text, false)
+                if (near != "") analyzer.diagnostics =
+                    "${analyzer.diagnostics}help: `${bootstrapShownType(receiver)}` has no method `${expression.text}`; did you mean `$near`?\n"
             }
         } else if (suppliedCount > parameterCount ||
                    suppliedCount < requiredCount) {
@@ -16218,6 +16292,105 @@ fun bootstrapStandardIndexBefore(a: string, b: string): bool {
         index = index + 1
     }
     a.size < b.size
+}
+
+/** The edit distance between `a` and `b` (insertions, deletions, substitutions, a swap of two neighbours), or
+ *  `limit + 1` once it is over `limit`. */
+fun bootstrapEditDistance(a: string, b: string, limit: int): int {
+    val difference = if (a.size > b.size) a.size - b.size else b.size - a.size
+    if (difference > limit) return limit + 1
+    var previous2: array<int> = []
+    var previous: array<int> = []
+    for (j in 0 .. b.size) previous.append(j)
+    var i = 1
+    while (i <= a.size) {
+        val current: array<int> = [i]
+        var best = i
+        var j = 1
+        while (j <= b.size) {
+            val cost = if (a[i - 1] == b[j - 1]) 0 else 1
+            var value = previous[j - 1] + cost
+            if (previous[j] + 1 < value) value = previous[j] + 1
+            if (current[j - 1] + 1 < value) value = current[j - 1] + 1
+            if (i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] && previous2[j - 2] + 1 < value) {
+                value = previous2[j - 2] + 1
+            }
+            current.append(value)
+            if (value < best) best = value
+            j = j + 1
+        }
+        if (best > limit) return limit + 1
+        previous2 = previous
+        previous = current
+        i = i + 1
+    }
+    if (previous[b.size] > limit) limit + 1 else previous[b.size]
+}
+
+/** The one candidate close to `name`, or "": within 1 edit of a name of up to 4 characters, else 2, and no other
+ *  candidate as close (a tie suggests nothing). A did-you-mean that guesses wrong is worse than none. */
+fun bootstrapSuggestName(name: string, candidates: array<string>): string {
+    val limit = if (name.size <= 4) 1 else 2
+    var best = ""
+    var bestDistance = limit + 1
+    var tied = false
+    for (candidate in candidates) {
+        if (candidate == name || candidate == best) continue
+        val distance = bootstrapEditDistance(name, candidate, limit)
+        if (distance < bestDistance) {
+            best = candidate
+            bestDistance = distance
+            tied = false
+        } else if (distance == bestDistance && distance <= limit) tied = true
+    }
+    if (bestDistance <= limit && !tied) best else ""
+}
+
+/** A type as the program writes it: `int` for i64, without module prefixes. */
+fun bootstrapShownType(type: string): string {
+    val shown = bootstrapSourceVisibleType(type)
+    if (shown == "i64") "int" else if (shown == "i64?") "int?" else shown
+}
+
+/** How to turn a value of type `actual` into the `expected` one, for the common pairs, or "". */
+fun bootstrapConversionHint(expected: string, actual: string): string {
+    val wanted = bootstrapShownType(expected)
+    val given = bootstrapShownType(actual)
+    if (wanted == "int" && given == "string") return "; to read a number from text: `value.parseInt()` (abla/integer), `null` when the text isn't one"
+    if (wanted == "string" && (given == "int" || given == "f64" || given == "bool")) return "; to make text of it: `\"\$value\"`"
+    if (wanted == "f64" && given == "int") return "; `f64FromInt(value)` (abla/float)"
+    if (wanted == "int" && given == "f64") return "; `f64ToInt(value)` (abla/float) drops the fraction"
+    ""
+}
+
+/** The help line of an everyday type error, from its code alone, or "": a mismatched argument, result, assignment or
+ *  initializer, a call with the wrong number of arguments, an array literal of mixed elements. */
+fun bootstrapEverydayHelp(code: string): string {
+    if (code.startsWith("function.argument:")) {
+        // function.argument:<function>@<offset>:<parameter type>:<argument type>
+        val rest = code.slice(18, code.size)
+        val at = rest.indexOf("@")
+        if (at < 0) return ""
+        val parts = rest.slice(at + 1, rest.size).split(":")
+        if (parts.size < 3) return ""
+        return "`${rest.slice(0, at)}` takes `${bootstrapShownType(parts[1])}` there, and this argument is `${bootstrapShownType(parts[2])}`${bootstrapConversionHint(parts[1], parts[2])}"
+    }
+    if (code.startsWith("function.result:")) {
+        // function.result:<function>:<declared result>:<value type>
+        val parts = code.slice(16, code.size).split(":")
+        if (parts.size < 3) return ""
+        return "`${parts[0]}` is declared to return `${bootstrapShownType(parts[1])}`, and this value is `${bootstrapShownType(parts[2])}`${bootstrapConversionHint(parts[1], parts[2])}"
+    }
+    if (code.startsWith("function.arity:")) return "the call gives `${code.slice(15, code.size)}` another number of arguments than it declares (a parameter with a default may be left out)"
+    if (code.startsWith("constructor.argument:")) return "an argument of `${code.slice(21, code.size)}(...)` has a type its constructor parameter doesn't take"
+    if (code.startsWith("assignment.type:")) {
+        val rest = code.slice(16, code.size)
+        val at = rest.indexOf("@")
+        return "the value's type isn't the declared type of `${if (at >= 0) rest.slice(0, at) else rest}`"
+    }
+    if (code.startsWith("local.initializer:")) return "the initializer's type isn't the declared type of `${code.slice(18, code.size)}`"
+    if (code == "array.element-type") return "an array literal's elements all have the array's element type, and one of these doesn't"
+    ""
 }
 
 /** The help line for a call of `name` that nothing visible declares: where the standard library declares it, or "". */
