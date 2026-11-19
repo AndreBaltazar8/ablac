@@ -55,6 +55,8 @@ fun bootstrapCollectAndRelease(): void {
 // `ablac build --verbose`: notes on how the build linked (#806: why an x86-64
 // Linux executable linked libc).
 var bootstrapBuildVerbose: bool = false
+// `--wasm-imports`: list the imports of a linked WebAssembly module (bootstrapWasmImportsCheck).
+var bootstrapWasmImportsReport: bool = false
 
 class BootstrapTargetDescriptor(
     val name: string,
@@ -1315,6 +1317,81 @@ fun bootstrapWasmImportsHostWrite(path: string): bool {
         if (reader.at <= data.size) reader.at = end
     }
     found
+}
+
+// Every import of the linked WebAssembly module at `path` as `module.name`, in
+// import order (a module that is not WebAssembly or is truncated gives what was read).
+fun bootstrapWasmImportList(path: string): array<string> {
+    val imports: array<string> = []
+    val reader = BootstrapWasmReader(Path(path).readText(), 8)
+    val data = reader.data
+    if (data.size < 8 || data[0] != 0 || data[1] != 97 || data[2] != 115 || data[3] != 109) return imports
+    var done = false
+    while (!done && !reader.ended()) {
+        val id = reader.byte()
+        val size = reader.unsigned()
+        val end = reader.at + size
+        if (id == 2) {
+            var count = reader.unsigned()
+            while (count > 0 && reader.at <= data.size) {
+                count = count - 1
+                val module = reader.name()
+                val field = reader.name()
+                val kind = reader.byte()
+                if (kind == 0) reader.unsigned()
+                else if (kind == 1) {
+                    reader.byte()
+                    reader.limits()
+                } else if (kind == 2) reader.limits()
+                else if (kind == 3) {
+                    reader.byte()
+                    reader.byte()
+                } else if (kind == 4) {
+                    reader.byte()
+                    reader.unsigned()
+                } else reader.fail()
+                if (reader.at <= data.size) imports.append("$module.$field")
+            }
+            done = true
+        }
+        if (reader.at <= data.size) reader.at = end
+    }
+    imports
+}
+
+// Whether an import `module.name` is covered by a `wasmHostImports` entry: the same text, or `module.*`.
+fun bootstrapWasmImportExpected(expected: array<string>, entry: string): bool {
+    var found = false
+    for (candidate in expected) {
+        if (candidate == entry) found = true
+        else if (candidate.size > 2 && candidate.endsWith(".*") &&
+                 entry.startsWith(candidate.slice(0, candidate.size - 1))) found = true
+    }
+    found
+}
+
+// `ablac build --wasm-imports` lists the linked module's imports; the entry's abla.toml `wasmHostImports` (module.name
+// strings, `module.*` for a whole module) names the ones the embedding host defines, and any other import is a warning:
+// an extern that no Abla code and no library defines links as an `env` import (wasm-ld --allow-undefined) and the module
+// then fails to instantiate in the host, so this is where it shows. The runtime's own `abla_host.*` imports are expected.
+fun bootstrapWasmImportsCheck(sourcePath: string, outputPath: string, publishPath: string): void {
+    val manifest = bootstrapRootManifestPath(sourcePath)
+    val expected = if (manifest.exists()) bootstrapPackageManifestStringArray(manifest.text, "wasmHostImports") else []
+    val declared = expected.size > 0
+    if (!bootstrapWasmImportsReport && !declared) return
+    val imports = bootstrapWasmImportList(publishPath)
+    if (bootstrapWasmImportsReport) {
+        linuxPrintStandardError("note: $outputPath imports ${imports.size} host functions:\n")
+        for (entry in imports) linuxPrintStandardError("note:   $entry\n")
+    }
+    if (declared) {
+        for (entry in imports) {
+            if (!entry.startsWith("abla_host.") && !bootstrapWasmImportExpected(expected, entry)) {
+                linuxPrintStandardError("warning: $outputPath imports $entry, which wasmHostImports in ${manifest.text} does not list" +
+                    " (an extern nothing defines links as an import of module env)\n")
+            }
+        }
+    }
 }
 
 fun bootstrapDisposeHeldModule(): void {
@@ -4853,6 +4930,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             }
         }
         Path(withoutPanicWrite).remove()
+        if (status == 0) bootstrapWasmImportsCheck(sourcePath, outputPath, publishPath)
         if (status == 0) {
             Path(ltoObjectPath).remove()
         }

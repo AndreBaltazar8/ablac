@@ -192,6 +192,14 @@ trusted noescape extern:"c" fun fd_write(fd: i32, iovs: i32, count: i32, written
 ```
 
 The embedding runtime must validate the imported symbol names and signatures
+
+An extern that nothing defines (a typo, a symbol the host was meant to supply)
+therefore links silently as an `env` import. `ablac build --wasm-imports` prints
+every import of the linked module as `note:` lines. A `wasmHostImports` list in
+the entry's `abla.toml` (`module.name` strings, or `module.*` for a whole module)
+names the imports the host defines, and every other import is a `warning:`; the
+runtime's own `abla_host.*` imports are always expected. Without the list and the
+flag a build prints nothing (tools/test-wasm-imports.sh).
 before instantiation. A Wasm build with debug information keeps the function
 names and publishes `<module>.map` and `<module>.debug.wasm` beside the module.
 

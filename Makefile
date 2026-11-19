@@ -161,6 +161,7 @@ test-serial: ablac
 	tools/test-ownership-shadows-and-globals.sh $(COMPILER)
 	tools/test-wasm-export-extern.sh $(COMPILER)
 	tools/test-wasm-import-module.sh $(COMPILER)
+	tools/test-wasm-imports.sh $(COMPILER)
 	tools/test-wasm-float-remainder.sh $(COMPILER)
 	tools/test-wasm-host.sh $(COMPILER)
 	tools/test-wasm-panic-message.sh $(COMPILER)
