@@ -29,6 +29,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 typedef int64_t (*export_function)(int64_t);
@@ -102,6 +103,56 @@ static int wave(export_function touch, int threads, int64_t first) {
     return failed;
 }
 
+// First use: a process that has just loaded the library, and threads that all make their first call at the same moment
+// (they wait on a flag, then touch): the pthread key of the macOS build is made by whichever thread gets there first while the
+// others have to wait for it (a thread that saw the key "being made" once used the key -2: pthread_setspecific EINVAL, master CI
+// on macOS Intel, intermittent). One fresh process per round, so the library's key does not exist yet.
+static volatile int go;
+
+static void *run_job_after_go(void *argument) {
+    while (!go) { }
+    return run_job(argument);
+}
+
+static int first_use_round(const char *path, int threads) {
+    void *library = dlopen(path, RTLD_NOW);
+    if (!library) return 3;
+    export_function setup = (export_function)dlsym(library, "abla_emutls_setup");
+    export_function touch = (export_function)dlsym(library, "abla_emutls_touch");
+    if (!setup || !touch) return 3;
+    setup(0);
+    struct job *jobs = calloc(threads, sizeof *jobs);
+    pthread_t *handles = calloc(threads, sizeof *handles);
+    for (int index = 0; index < threads; index++) {
+        jobs[index].function = touch;
+        jobs[index].number = 1 + index;
+        if (pthread_create(&handles[index], 0, run_job_after_go, &jobs[index]) != 0) return 4;
+    }
+    usleep(2000);
+    go = 1;
+    int failed = 0;
+    for (int index = 0; index < threads; index++) {
+        pthread_join(handles[index], 0);
+        if (jobs[index].result != 1) failed = 1;
+    }
+    return failed;
+}
+
+static int first_use_rounds(const char *path, int rounds, int threads) {
+    for (int round = 0; round < rounds; round++) {
+        pid_t child = fork();
+        if (child < 0) return 5;
+        if (child == 0) _exit(first_use_round(path, threads));
+        int status = 0;
+        waitpid(child, &status, 0);
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            printf("first use, round %d: child status %d\n", round, status);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 5) return 2;
     struct sigaction trap;
@@ -112,6 +163,7 @@ int main(int argc, char **argv) {
     sigaction(SIGSEGV, &trap, 0);
     sigaction(SIGBUS, &trap, 0);
     long long allowed = atoll(argv[4]);
+    if (first_use_rounds(argv[1], 40, 16) != 0) return 6;
     void *library = dlopen(argv[1], RTLD_NOW);
     if (!library) { printf("dlopen: %s\n", dlerror()); return 3; }
     export_function setup = (export_function)dlsym(library, "abla_emutls_setup");
