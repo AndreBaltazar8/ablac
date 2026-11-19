@@ -145,7 +145,8 @@ so both seeds exist before vX does. `tools/release-check.sh` has a required `con
 for that source and lineage exists (`--convergence-run ID`, or the newest matching green run; `--source-ref` names the
 commit until the tag does). After vX is published, add its `LINEAGES` entry (route A: vX's pinned seed; route B: the previous
 release's seed; historical: vX's tag commit) and the workflow's `lineage` option: they gate the next release, and a unit test
-fails when the two lists differ.
+fails when the two lists differ. `tools/release-after.sh vX` does this and the pin (`tools/release-pin.sh`) in one go, changing
+only those lines (`--commit` commits the steps separately, `--times FILE` also refreshes `tools/test-times.tsv`).
 
 Each source tree uses its own runtime, standard library and Nix shell.
 Candidate sources occupy `/build/source` on both builders, with a declared

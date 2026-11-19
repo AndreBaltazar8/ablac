@@ -168,6 +168,7 @@ test-serial: ablac
 	tools/test-wasm-host.sh $(COMPILER)
 	tools/test-wasm-panic-message.sh $(COMPILER)
 	tools/test-release-scripts.sh $(COMPILER)
+	tools/test-release-after.sh $(COMPILER)
 	tools/test-wasm-debug-reproducible.sh $(COMPILER)
 	tools/test-rewritten-module-diagnostics.sh $(COMPILER)
 	tools/test-build-removed-outputs.sh $(COMPILER)
