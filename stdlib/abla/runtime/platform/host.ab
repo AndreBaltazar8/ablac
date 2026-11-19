@@ -3311,7 +3311,7 @@ trusted fun __ablaRuntimeHostTraceMarkedAllocations(): void {
 // register runs it. The sweep stays as it is, on the collecting thread.
 // State, static: +0 the pool's lock, +8 its count, +16 threads busy, +24 its capacity (the registry's slots), +32 the
 // pool's array, +40 the threads asked for.
-private trusted fun __ablaRuntimeHostMarkShared(): int = nativeStaticAllocate(64)
+private trusted fun __ablaRuntimeHostMarkShared(): int = nativeStaticAllocate(72)
 
 // A thread's block: +0 its stack's address, +8 its count, +16 its page cache's address, +24 1 once its thread started,
 // +32 its thread handle, +40 objects it traced, +48 times it took from the pool, +56 times it gave to the pool, +64 idle sleeps,
@@ -3480,6 +3480,91 @@ private trusted fun __ablaRuntimeHostMarkValueParallel(context: int, value: int)
     return
 }
 
+// A large array's element scan is split: past this many elements the scan is cut into chunks of this many, which the threads
+// take from the shared range queue (state +48 the entries' address, +56 their count, +64 their capacity; three words each: the
+// first and the end of the chunk in the payload, and the layout, which gives the element size).
+val __ablaRuntimeHostMarkChunk: int = 4096
+
+private trusted fun __ablaRuntimeHostMarkStride(layout: int): int = if (layout == 0) 8 else if (layout == 2) 24 else 32
+
+// The elements of one chunk, [start, end), of a payload of `layout` 0 (words), 2 (24-byte values) or 3 (32-byte slots).
+private trusted fun __ablaRuntimeHostMarkScanRange(context: int, start: int, end: int, layout: int): void {
+    var at = start
+    if (layout == 0) {
+        while (at + 8 <= end) {
+            __ablaRuntimeHostMarkPointerParallel(context, ablaRuntimeLoadI64(at))
+            at = at + 8
+        }
+    }
+    if (layout == 2) {
+        while (at + 24 <= end) {
+            __ablaRuntimeHostMarkValueParallel(context, at)
+            at = at + 24
+        }
+    }
+    if (layout == 3) {
+        while (at + 32 <= end) {
+            __ablaRuntimeHostMarkValueParallel(context, at + 8)
+            at = at + 32
+        }
+    }
+    return
+}
+
+// The scan of a claimed object of layout 0, 2 or 3: small ones whole, a large one cut into chunks; the first chunk is
+// scanned here, the others go to the range queue (what does not fit there is scanned here too).
+private trusted fun __ablaRuntimeHostMarkScan(context: int, payload: int, size: int, layout: int): void {
+    val stride = __ablaRuntimeHostMarkStride(layout)
+    val elements = size / stride
+    val end = payload + elements * stride
+    if (elements < 2 * __ablaRuntimeHostMarkChunk) {
+        __ablaRuntimeHostMarkScanRange(context, payload, end, layout)
+        return
+    }
+    val shared = __ablaRuntimeHostMarkShared()
+    val step = __ablaRuntimeHostMarkChunk * stride
+    var next = payload + step
+    __ablaRuntimeHostMarkPoolLock(shared)
+    val queue = ablaRuntimeLoadI64(shared + 48)
+    var queued = ablaRuntimeLoadI64(shared + 56)
+    val capacity = ablaRuntimeLoadI64(shared + 64)
+    while (next < end && queued < capacity) {
+        val last = if (next + step > end) end else next + step
+        ablaRuntimeStoreI64(queue + queued * 24, next)
+        ablaRuntimeStoreI64(queue + queued * 24 + 8, last)
+        ablaRuntimeStoreI64(queue + queued * 24 + 16, layout)
+        queued = queued + 1
+        next = last
+    }
+    ablaRuntimeAtomicStoreI64(shared + 56, queued)
+    ablaRuntimeAtomicStoreI64(shared, 0)
+    __ablaRuntimeHostMarkScanRange(context, payload, payload + step, layout)
+    if (next < end) __ablaRuntimeHostMarkScanRange(context, next, end, layout)
+    return
+}
+
+// Scans one chunk from the range queue; false when it was empty.
+private trusted fun __ablaRuntimeHostMarkTakeRange(context: int): bool {
+    val shared = __ablaRuntimeHostMarkShared()
+    __ablaRuntimeHostMarkPoolLock(shared)
+    val queued = ablaRuntimeLoadI64(shared + 56)
+    var start = 0
+    var end = 0
+    var layout = 0
+    if (queued > 0) {
+        val entry = ablaRuntimeLoadI64(shared + 48) + (queued - 1) * 24
+        start = ablaRuntimeLoadI64(entry)
+        end = ablaRuntimeLoadI64(entry + 8)
+        layout = ablaRuntimeLoadI64(entry + 16)
+        ablaRuntimeAtomicStoreI64(shared + 56, queued - 1)
+    }
+    ablaRuntimeAtomicStoreI64(shared, 0)
+    if (queued == 0) return false
+    ablaRuntimeStoreI64(context + 80, ablaRuntimeLoadI64(context + 80) + 1)
+    __ablaRuntimeHostMarkScanRange(context, start, end, layout)
+    true
+}
+
 // One claimed object's fields (the body of __ablaRuntimeHostTraceMarkedAllocations for one header).
 private trusted fun __ablaRuntimeHostMarkTraceParallel(context: int, header: int): void {
     val state = ablaRuntimeLoadI64(header + 24)
@@ -3489,27 +3574,7 @@ private trusted fun __ablaRuntimeHostMarkTraceParallel(context: int, header: int
     ablaRuntimeStoreI64(header + 24, layout + 32)
     val size = ablaRuntimeLoadI64(header + 16)
     val payload = header + 32
-    if (layout == 0) {
-        var offset: int = 0
-        while (offset + 8 <= size) {
-            __ablaRuntimeHostMarkPointerParallel(context, ablaRuntimeLoadI64(payload + offset))
-            offset = offset + 8
-        }
-    }
-    if (layout == 2) {
-        var offset: int = 0
-        while (offset + 24 <= size) {
-            __ablaRuntimeHostMarkValueParallel(context, payload + offset)
-            offset = offset + 24
-        }
-    }
-    if (layout == 3) {
-        var offset: int = 0
-        while (offset + 32 <= size) {
-            __ablaRuntimeHostMarkValueParallel(context, payload + offset + 8)
-            offset = offset + 32
-        }
-    }
+    if (layout == 0 || layout == 2 || layout == 3) __ablaRuntimeHostMarkScan(context, payload, size, layout)
     if (layout == 4 && size >= 24) {
         val count = ablaRuntimeLoadI64(payload)
         val values = ablaRuntimeLoadI64(payload + 16)
@@ -3566,16 +3631,16 @@ trusted fun __ablaRuntimeHostMarkWorker(context: int): int {
             ablaRuntimeStoreI64(context + 40, ablaRuntimeLoadI64(context + 40) + 1)
             __ablaRuntimeHostMarkTraceParallel(context, ablaRuntimeLoadI64(ablaRuntimeLoadI64(context) + count * 8))
         }
-        if (!__ablaRuntimeHostMarkTake(context)) {
+        if (!__ablaRuntimeHostMarkTake(context) && !__ablaRuntimeHostMarkTakeRange(context)) {
             ablaRuntimeAtomicFetchAddI64(shared + 16, -1)
             var waiting = true
             while (waiting) {
                 // Busy first, then the pool: nothing is added to the pool once no thread is busy.
                 val busy = ablaRuntimeAtomicLoadI64(shared + 16)
                 ablaRuntimeStoreI64(context + 72, ablaRuntimeLoadI64(context + 72) + 1)
-                if (ablaRuntimeAtomicLoadI64(shared + 8) > 0) {
+                if (ablaRuntimeAtomicLoadI64(shared + 8) > 0 || ablaRuntimeAtomicLoadI64(shared + 56) > 0) {
                     ablaRuntimeAtomicFetchAddI64(shared + 16, 1)
-                    if (__ablaRuntimeHostMarkTake(context)) waiting = false
+                    if (__ablaRuntimeHostMarkTake(context) || __ablaRuntimeHostMarkTakeRange(context)) waiting = false
                     else ablaRuntimeAtomicFetchAddI64(shared + 16, -1)
                 } else if (busy == 0) {
                     waiting = false
@@ -3611,6 +3676,7 @@ trusted fun __ablaRuntimeHostTraceParallel(workers: int): void {
         ablaRuntimeStoreI64(context + 56, 0)
         ablaRuntimeStoreI64(context + 64, 0)
         ablaRuntimeStoreI64(context + 72, 0)
+        ablaRuntimeStoreI64(context + 80, 0)
         var cached = 0
         while (cached < 512) {
             ablaRuntimeStoreI64(context + __ablaRuntimeHostMarkHeader + __ablaRuntimeHostMarkStack * 8 + cached * 8, 0)
@@ -3624,6 +3690,13 @@ trusted fun __ablaRuntimeHostTraceParallel(workers: int): void {
     ablaRuntimeStoreI64(shared + 24, __ablaRuntimeHostCollectionCount)
     ablaRuntimeStoreI64(shared + 32, __ablaRuntimeHostCollectionWorklist)
     ablaRuntimeStoreI64(shared + 40, workers)
+    // The range queue: chunks of at most 4,096 elements of a payload, so the payload bytes bound the chunks; a queue that
+    // cannot be had (or fills) only means a large array is scanned whole by the thread that claimed it.
+    val rangeCapacity = __ablaRuntimeHostLiveBytes / 32768 * 2 + 64
+    val queue = ablaRuntimePointerAddress(__ablaRuntimeHostMalloc(rangeCapacity * 24))
+    ablaRuntimeStoreI64(shared + 48, queue)
+    ablaRuntimeStoreI64(shared + 56, 0)
+    ablaRuntimeStoreI64(shared + 64, if (queue == 0) 0 else rangeCapacity)
     __ablaRuntimeHostCollectionWorklistCount = 0
     index = 1
     while (index < workers) {
@@ -3653,12 +3726,13 @@ trusted fun __ablaRuntimeHostTraceParallel(workers: int): void {
     }
     if (__ablaRuntimeHostGcTrace) {
         var counter = 0
-        while (counter < 4) {
+        while (counter < 5) {
             if (counter == 0) __ablaRuntimeHostWrite(2, __ablaRuntimeWord0("gc: parallel mark, objects by thread:"), 37)
             if (counter == 1) __ablaRuntimeHostWrite(2, __ablaRuntimeWord0("gc: parallel mark, takes by thread:"), 35)
             if (counter == 2) __ablaRuntimeHostWrite(2, __ablaRuntimeWord0("gc: parallel mark, gives by thread:"), 35)
             if (counter == 3) __ablaRuntimeHostWrite(2, __ablaRuntimeWord0("gc: parallel mark, sleeps by thread:"), 36)
-            val offset = if (counter == 0) 40 else if (counter == 1) 48 else if (counter == 2) 56 else 64
+            if (counter == 4) __ablaRuntimeHostWrite(2, __ablaRuntimeWord0("gc: parallel mark, ranges by thread:"), 36)
+            val offset = if (counter == 0) 40 else if (counter == 1) 48 else if (counter == 2) 56 else if (counter == 3) 64 else 80
             index = 0
             while (index < workers) {
                 __ablaRuntimeHostStwTrace(" ", 1, ablaRuntimeLoadI64(contexts + index * block + offset), "", 0)
@@ -3668,6 +3742,7 @@ trusted fun __ablaRuntimeHostTraceParallel(workers: int): void {
             counter = counter + 1
         }
     }
+    if (queue != 0) __ablaRuntimeHostFree(ablaRuntimePointerFromAddress(queue))
     __ablaRuntimeHostFree(ablaRuntimePointerFromAddress(contexts))
     return
 }

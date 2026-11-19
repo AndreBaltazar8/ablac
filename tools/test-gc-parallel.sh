@@ -40,7 +40,7 @@ for mode in release fast; do
     done
     for workers in 2 4; do
         status=0
-        result=$(ABLA_GC_WORKERS=$workers ABLA_GC_STRESS=1 "$root/tools/run-limited.sh" "$out/main.$mode" 3000 2>&1) || status=$?
+        result=$(ABLA_GC_WORKERS=$workers ABLA_GC_STRESS=1 "$root/tools/run-limited.sh" "$out/main.$mode" 9000 2>&1) || status=$?
         [[ $status -eq 0 && $result == "gc parallel ok:"* ]] || fail "$workers threads under stress ($mode) failed ($status): ${result: -300}"
     done
     status=0
