@@ -64,7 +64,13 @@ Things to know about `#`:
   `(#fib(20)) + 1`, and `#config.items[0]` evaluates the whole chain. Use
   parentheses for anything larger: `#(a() + b())`.
 - **It runs once per build**, not once per execution. A `#` inside a function
-  body or a loop is still one constant.
+  body or a loop is still one constant, and so is a global it initializes:
+  compile-time code that reads the global, or calls the function, gets the
+  value the `#` already has. Its effects happen once, when the build first
+  needs its value: at the `#` itself, or when compile-time code that reads
+  it starts and the globals initialize, in dependency order as at run time
+  (a global initializes after the globals its initializer reads, through the
+  functions it calls).
 - **It sees declarations, not the surrounding function.** The expression is
   evaluated with the program's top-level declarations in scope. It cannot
   read the parameters or locals of the function it appears in, because

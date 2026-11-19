@@ -119,6 +119,7 @@ test-serial: ablac
 	tools/test-ct-lift-large.sh $(COMPILER)
 	tools/test-ct-drop-first.sh $(COMPILER)
 	tools/test-ct-lazy-readback.sh $(COMPILER)
+	tools/test-ct-site-once.sh $(COMPILER)
 	tools/test-ct-threads-heap.sh $(COMPILER)
 	tools/test-ct-interp-runtime.sh $(COMPILER)
 	tools/test-ct-time-limit.sh $(COMPILER)

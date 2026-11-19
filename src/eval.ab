@@ -34,6 +34,7 @@ import "subparser.ab"
 import "ct_infer.ab"
 import "staged_parser.ab"
 import "ct_process.ab"
+import "ct_eval.ab"
 
 // Parser handlers, finalizers, and ordinary staged expressions use separate
 // evaluator objects. Keep their transaction in a private per-process staging
@@ -6011,7 +6012,7 @@ class BootstrapEvaluator(
             8 -> bootstrapEvaluateIdentifier(this, expression)
             59 -> bootstrapEvaluateNamedBorrow(this, expression)
             15 -> this.evaluateCall(expression)
-            16 -> this.evaluate(expression.children[0])
+            16 -> bootstrapEvaluateCompileSite(this, expression)
             17 -> this.evaluate(expression.children[0])
             21 -> bootstrapEvaluateTemplate(this, expression)
             22 -> bootstrapEvaluateBlock(this, expression)
@@ -7133,6 +7134,90 @@ fun bootstrapEvaluateFrom(
 // assigned still starts where the program's does.
 fun bootstrapRuntimeGlobalKey(declaration: BootstrapDeclaration): string =
     "runtime:${bootstrapCompileGlobalKey(declaration)}"
+
+/** The journal key of a `#` site's one value for the build: its source identity and place. A generic's instances
+ *  have identities of their own, so a site in a generic's body has a value per instance (`typeName<T>()`). The
+ *  lowering's evaluation of the site and an evaluation that meets it in code (a global's initializer read at compile
+ *  time) share it, so the site runs once (docs/compile-time.md, "It runs once per build"). */
+fun bootstrapCompileSiteKey(sourceIdentity: string, site: BootstrapExpression): string =
+    "site:$sourceIdentity:${site.begin}:${site.end}"
+
+/** A site the lowering evaluated: its result, held here until an evaluation asks the journal for its key
+ *  (bootstrapCompileSiteToJournal). Most never are: the result becomes a program constant and nothing at compile time
+ *  reads it, so it isn't encoded (a large one would cost what reading every native global back did, #1022). */
+class BootstrapCompileSiteResult(
+    val result: BootstrapEvalResult,
+    val declarations: array<BootstrapDeclaration>
+)
+var bootstrapCompileSiteResults: Map<string, BootstrapCompileSiteResult> = Map()
+// The key of the `#` site the lowering is about to interpret ("" otherwise), and whether that evaluation kept the
+// site's value itself (bootstrapEvaluateWithEffectsIn).
+var bootstrapCompileSiteEvaluating: string = ""
+var bootstrapCompileSiteKept: bool = false
+
+fun bootstrapCompileSiteRemember(key: string, result: BootstrapEvalResult,
+    declarations: array<BootstrapDeclaration>): void {
+    if (result.errors > 0 || result.value.kind == "invalid" || bootstrapEvalLeaves(result.value)) return
+    // Inside a `region` nothing is held: the region frees the result, and the map, a global, must never point there
+    // (as bootstrapEvalIntrinsicRoutes).
+    if (runtimeMemoryRegionActive()) return
+    bootstrapCompileSiteResults.set(key, BootstrapCompileSiteResult(result, declarations))
+    return
+}
+
+/** The site's value for the lowering, if it has one: the lowering's own (a generic's instances, a function lowered
+ *  again), or the one an evaluation that met the site first kept. */
+fun bootstrapCompileSiteValue(key: string, declarations: array<BootstrapDeclaration>): BootstrapEvalResult? {
+    val held = bootstrapCompileSiteResults.get(key)
+    if (held != null) return held.result
+    val kept = bootstrapCompileGlobalLoad(key, declarations, [])
+    if (kept.kind == "invalid" || bootstrapEvalLeaves(kept)) return null
+    BootstrapEvalResult(kept, 0, "", [], [], [])
+}
+
+/** The journal is about to read or write `key`: a site result held for it goes in first. */
+fun bootstrapCompileSiteToJournal(key: string): void {
+    if (bootstrapCompileSiteResults.size == 0 || !key.startsWith("site:")) return
+    val held = bootstrapCompileSiteResults.get(key)
+    if (held == null) return
+    bootstrapCompileSiteResults.remove(key)
+    val kept = bootstrapCompileGlobalsKeep([key], [held.result.value], held.result.syntax, held.declarations)
+    return
+}
+
+/** A `#` site met while evaluating: the value it already has, else its expression's, kept as the site's value.
+ *  `val a = #bump()` read at compile time used to run bump again after the site had (#1022). */
+fun bootstrapEvaluateCompileSite(var evaluator: BootstrapEvaluator, site: BootstrapExpression): BootstrapEvalValue {
+    val key = bootstrapCompileSiteKey(evaluator.sourceIdentity, site)
+    val slot = bootstrapEvalGlobalSlot(evaluator, key)
+    if (slot >= 0) return evaluator.globalValues[slot]
+    val kept = bootstrapLoadEvaluatorGlobal(evaluator, key)
+    if (bootstrapEvalLeaves(kept)) return kept
+    if (kept.kind != "invalid") {
+        evaluator.globalKeys.append(key)
+        evaluator.globalValues.append(kept)
+        return kept
+    }
+    // A site the live native generation runs: its entry, so the slice (which may reach the same site through a global
+    // or a function it keeps, bootstrapCtOnceSource) and this evaluation share one run.
+    if (bootstrapCtMode() != "interp") {
+        val outcome = bootstrapCtTryEvaluate(site.children[0], evaluator.declarations, evaluator.allowedCompileEffects)
+        if (outcome.taken) {
+            evaluator.errors = evaluator.errors + outcome.result.errors
+            evaluator.diagnostics = "${evaluator.diagnostics}${outcome.result.diagnostics}"
+            if (outcome.result.errors > 0) return BOOTSTRAP_EVAL_STOPPED
+            evaluator.globalKeys.append(key)
+            evaluator.globalValues.append(outcome.result.value)
+            return outcome.result.value
+        }
+    }
+    val value = evaluator.evaluate(site.children[0])
+    if (!bootstrapEvalLeaves(value) && value.kind != "invalid") {
+        evaluator.globalKeys.append(key)
+        evaluator.globalValues.append(value)
+    }
+    value
+}
 
 fun bootstrapEvalIndexGlobals(var evaluator: BootstrapEvaluator): void {
     while (evaluator.globalGraph.indexedRoots < evaluator.globalKeys.size) {
@@ -14446,7 +14531,17 @@ fun bootstrapEvaluateWithEffectsIn(
         "",
         source
     )
+    // The lowering's `#` site this evaluates, if it is one (taken before anything nested can see it).
+    val siteKey = bootstrapCompileSiteEvaluating
+    bootstrapCompileSiteEvaluating = ""
     val result = evaluator.evaluate(expression)
+    // Its value is kept with the globals it read, in the one keep, so it stays one object with them (`val alias =
+    // #kept` grows with `kept`): bootstrapEvaluateCompileSite reads it from there.
+    if (siteKey != "" && evaluator.errors == 0 && result.kind != "invalid" && !bootstrapEvalLeaves(result)) {
+        evaluator.globalKeys.append(siteKey)
+        evaluator.globalValues.append(result)
+        bootstrapCompileSiteKept = true
+    }
     bootstrapKeepEvaluatorGlobals(evaluator)
     bootstrapEvalLastSteps = evaluator.steps
     BootstrapEvalResult(

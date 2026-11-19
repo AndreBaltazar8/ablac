@@ -1077,9 +1077,84 @@ fun bootstrapCtEntrySource(site: BootstrapCtSite, generation: int): string {
     val header = "@export(\"abla_ct_eval_$id\")\ncompile fun __abla_ct_eval_$id(): int"
     if (!site.encodes) {
         "$header {\n    __abla_ct_site_$id()\n    __abla_ct_reply_$generation(\"\")\n}\n"
+    } else if (site.once) {
+        "$header =\n    __abla_lift_reply_$generation(__abla_ct_once_get_$id())\n${bootstrapCtOnceSource(site)}"
     } else {
         "$header =\n    __abla_lift_reply_$generation(__abla_ct_site_$id())\n"
     }
+}
+
+// A site the slice keeps the `#` node of has one value for the build, as everywhere (docs/compile-time.md): the slice
+// lowers the node (a kept global's initializer, a function's body) as a call of this accessor, and the site's entry
+// calls it too, so the site's code runs once, whichever gets there first. `val shot = #ctShot()` ran the game client's
+// whole offscreen run when the slice initialized its globals and again at its site (#1022). The cell is an array so
+// any type, nullable ones too, has an empty state.
+fun bootstrapCtOnceSource(site: BootstrapCtSite): string {
+    val id = "${site.id}"
+    "val __abla_ct_once_$id: array<${site.type}> = []\n" +
+    "compile fun __abla_ct_once_get_$id(): ${site.type} {\n" +
+    "    if (__abla_ct_once_$id.size == 0) __abla_ct_once_$id.append(__abla_ct_site_$id())\n" +
+    "    __abla_ct_once_$id[0]\n" +
+    "}\n"
+}
+
+// Whether a site can be a once site: one that runs natively and gives a value. (Its own `encodes` is set while the
+// sites are prepared, so a later site's isn't yet: this asks its type.)
+fun bootstrapCtOnceCandidate(site: BootstrapCtSite): bool =
+    site.reason == "" && !site.action && site.type != "void" && site.type != "null" && site.type != "unknown"
+
+// Marks the sites whose `#` nodes `expression` (a kept declaration's, in `sourceIdentity`) holds (BootstrapCtSite.once).
+// (A `#` nested in another is part of that site: bootstrapCtCollectNodes.)
+fun bootstrapCtMarkOnce(expression: BootstrapExpression, sourceIdentity: string): void {
+    if (expression.kind == "compile") {
+        for (site in bootstrapCtSites) {
+            if (bootstrapCtOnceCandidate(site) && site.sourceIdentity == sourceIdentity &&
+                site.node.begin == expression.begin && site.node.end == expression.end) site.once = true
+        }
+        return
+    }
+    for (child in expression.children) bootstrapCtMarkOnce(child, sourceIdentity)
+    return
+}
+
+// `expression` with the code of each `#` node of a once site replaced by a call of its accessor (bootstrapCtOnceSource), at
+// template positions so its facts meet no source node's; the same node where there is none.
+fun bootstrapCtOnceRewrite(expression: BootstrapExpression, sourceIdentity: string): BootstrapExpression {
+    if (expression.kind == "compile") {
+        for (site in bootstrapCtSites) {
+            if (site.once && site.sourceIdentity == sourceIdentity &&
+                site.node.begin == expression.begin && site.node.end == expression.end) {
+                // (Still a `#` node: only compile-time code may call the accessor, a compile fun, and the slice
+                // lowers the node's code as it stands, bootstrapLowerCompile.)
+                return BootstrapExpression("compile", expression.text, expression.begin, expression.end, [
+                    BootstrapExpression("call", "__abla_ct_once_get_${site.id}",
+                        expression.begin + BOOTSTRAP_CT_TEMPLATE_OFFSET, expression.end + BOOTSTRAP_CT_TEMPLATE_OFFSET, [])
+                ])
+            }
+        }
+        return expression
+    }
+    if (!bootstrapCtHasCompileNode(expression)) return expression
+    val children: array<BootstrapExpression> = []
+    for (child in expression.children) children.append(bootstrapCtOnceRewrite(child, sourceIdentity))
+    BootstrapExpression(expression.kind, expression.text, expression.begin, expression.end, children)
+}
+
+// Whether `expression` holds a `#` node no site of the pass can run natively (no site for it, or one that runs in the
+// evaluator): the slice would lower that node as its code and run it again (bootstrapCtOnceSource covers the rest).
+fun bootstrapCtUnheldCompileNode(expression: BootstrapExpression, sourceIdentity: string): bool {
+    if (expression.kind == "compile") {
+        var held = false
+        for (site in bootstrapCtSites) {
+            if (bootstrapCtOnceCandidate(site) && site.sourceIdentity == sourceIdentity &&
+                site.node.begin == expression.begin && site.node.end == expression.end) held = true
+        }
+        return !held
+    }
+    for (child in expression.children) {
+        if (bootstrapCtUnheldCompileNode(child, sourceIdentity)) return true
+    }
+    false
 }
 
 // Template positions move far past any source offset (still below 2^32, which
@@ -1993,6 +2068,25 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
                     global = global + 1
                 }
             }
+            if (site.reason == "") {
+                // A `#` site has one value for the build (docs/compile-time.md), which the lowering and the evaluator
+                // share (eval.ab, bootstrapEvaluateCompileSite). The slice calls one accessor for a site it can run
+                // (bootstrapCtOnceSource); a `#` node in a kept global's initializer or function's body that no native
+                // site holds would be lowered as its code and run again, so a site that reaches one runs in the
+                // evaluator.
+                var global = 0
+                while (site.reason == "" && global < parsed.declarations.size) {
+                    val declaration = parsed.declarations[global]
+                    if (reach.kept[global] && !keptBefore[global] &&
+                        (declaration.kind == "val" || declaration.kind == "var" || declaration.kind == "fun") &&
+                        bootstrapCtUnheldCompileNode(declaration.expression, declaration.sourceIdentity)) {
+                        site.reason = if (declaration.kind == "fun")
+                            "reaches ${declaration.name}, whose body has a `#` site (its one value is the evaluator's)"
+                            else "reaches global ${declaration.name}, which a `#` site initializes (its one compile-time value is the evaluator's)"
+                    }
+                    global = global + 1
+                }
+            }
             if (site.reason != "") {
                 var restored = 0
                 while (restored < keptBefore.size) {
@@ -2162,6 +2256,17 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
         keptIndex = keptIndex + 1
     }
     var source = bootstrapCtSupportSource(generation, kept)
+    // The sites whose `#` nodes the slice keeps run through one accessor (bootstrapCtOnceSource).
+    for (site in bootstrapCtSites) site.once = false
+    var onceIndex = 0
+    while (onceIndex < parsed.declarations.size) {
+        val declaration = parsed.declarations[onceIndex]
+        if (reach.kept[onceIndex] &&
+            (declaration.kind == "val" || declaration.kind == "var" || declaration.kind == "fun")) {
+            bootstrapCtMarkOnce(declaration.expression, declaration.sourceIdentity)
+        }
+        onceIndex = onceIndex + 1
+    }
     for (site in bootstrapCtSites) {
         if (site.reason == "") source = "$source${bootstrapCtEntrySource(site, generation)}"
     }
@@ -2187,7 +2292,12 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
         if (reach.kept[declarationIndex] || bootstrapCtRuntimeDeclaration(declaration)) {
             val shims = if (bootstrapCtBridged(declaration))
                 bootstrapCtSliceShims(declaration) else []
-            sliceDeclarations.append(if (shims.size == 1) shims[0] else declaration)
+            // (A once site's `#` node calls its accessor: bootstrapCtOnceSource.)
+            val held = if (shims.size == 1 || !bootstrapCtHasCompileNode(declaration.expression)) declaration
+                else bootstrapCtDeclarationWith(declaration, declaration.kind,
+                    bootstrapCtOnceRewrite(declaration.expression, declaration.sourceIdentity), 0,
+                    declaration.sourceIdentity)
+            sliceDeclarations.append(if (shims.size == 1) shims[0] else held)
         }
         declarationIndex = declarationIndex + 1
     }
@@ -2204,7 +2314,9 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
         var sourceIdentity = ""
         var expression = bootstrapCtSplice(declaration.expression, "", declaration.expression)
         for (site in bootstrapCtSites) {
-            if (site.reason == "" && declaration.name == "__abla_ct_eval_${site.id}") {
+            if (site.reason == "" && (declaration.name == "__abla_ct_eval_${site.id}" ||
+                declaration.name == "__abla_ct_once_get_${site.id}" ||
+                declaration.name == "__abla_ct_once_${site.id}")) {
                 sourceIdentity = site.sourceIdentity
                 expression = bootstrapCtSplice(
                     declaration.expression, "__abla_ct_site_${site.id}", site.expression
