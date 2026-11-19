@@ -47,17 +47,46 @@ done
 expect everyday 'help: `Point` has no method `lenght`; did you mean `length`?'
 expect everyday 'help: `Point` has no field `lenght`; did you mean `length`?'
 expect everyday 'help: `area` takes `int` there, and this argument is `string`; to read a number from text: `value.parseInt()` (abla/integer), `null` when the text isn'"'"'t one'
-expect everyday 'help: the value'"'"'s type isn'"'"'t the declared type of `d`'
+expect everyday 'help: `d` is declared `int`, and the value is `string`; to read a number from text: `value.parseInt()` (abla/integer), `null` when the text isn'"'"'t one'
 expect everyday 'help: no function or class named `aera` is visible here; did you mean `area`?'
 expect everyday 'help: nothing named `widht` is visible here; did you mean `width`?'
 expect everyday 'help: the call gives `area` another number of arguments than it declares (a parameter with a default may be left out)'
 expect everyday 'help: an argument of `Point(...)` has a type its constructor parameter doesn'"'"'t take'
 expect everyday 'help: an array literal'"'"'s elements all have the array'"'"'s element type, and one of these doesn'"'"'t'
-expect everyday 'help: the initializer'"'"'s type isn'"'"'t the declared type of `n`'
+expect everyday 'help: `n` is declared `string`, and the initializer is `int`; to make text of it: `"$value"`'
 expect everyday 'help: `half` is declared to return `int`, and this value is `string`; to read a number from text: `value.parseInt()` (abla/integer), `null` when the text isn'"'"'t one'
 absent everyday 'named `completelyUnrelatedName`'
 
 build hidden
 expect hidden 'help: no function or class named `helperTwp` is visible here; did you mean `helperTwo`?'
 absent hidden 'did you mean `helperOne`'
-echo "semantic-help: 11 everyday errors have their help line; a far name and a name strict imports hide are not suggested"
+
+# Five uses of println without abla/io: five errors, and on the command line one help line; an assignment of a string
+# to an int names both types (from the nodes: its code names only the target).
+build repeated
+[[ $(grep -c '^error\[E_SEMANTIC\]: call.target:println$' "$output_directory/repeated.log") -eq 5 ]] ||
+    { echo "semantic-help: repeated: not five errors" >&2; cat "$output_directory/repeated.log" >&2; exit 1; }
+[[ $(grep -c '^help: `println` is declared in abla/io' "$output_directory/repeated.log") -eq 1 ]] ||
+    { echo "semantic-help: repeated: the command line repeats the help line" >&2; cat "$output_directory/repeated.log" >&2; exit 1; }
+expect repeated 'help: `count` is declared `int`, and the value is `string`; to read a number from text: `value.parseInt()` (abla/integer), `null` when the text isn'"'"'t one'
+# The editor's analysis keeps the help on each of the five (a `help` field per diagnostic).
+node -e '
+const lines = [
+  { schema: 1, id: 1, method: "initialize", params: { workspaceRoots: [process.argv[1]], clientName: "semantic-help", clientVersion: "1", analysisMode: "graph-v1" } },
+  { schema: 1, id: 2, method: "analyze", params: { roots: [process.argv[2]] } },
+  { schema: 1, id: 3, method: "shutdown", params: {} },
+];
+require("fs").writeFileSync(process.argv[3], lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+' "$project_root/tests/cases/semantic-help" "$project_root/tests/cases/semantic-help/repeated.ab" "$output_directory/analyze.jsonl"
+"$compiler" analyze --stdio < "$output_directory/analyze.jsonl" > "$output_directory/analyze.out" 2> "$output_directory/analyze.err"
+node -e '
+const lines = require("fs").readFileSync(process.argv[1], "utf8").trim().split("\n").map(JSON.parse);
+const all = [];
+for (const line of lines) for (const document of (line.result && line.result.documents) || []) all.push(...(document.diagnostics || []));
+const println = all.filter((d) => d.message === "error[E_SEMANTIC]: call.target:println");
+const helped = println.filter((d) => Array.isArray(d.help) && d.help.some((h) => h.startsWith("`println` is declared in abla/io")));
+const count = all.find((d) => d.message.startsWith("error[E_SEMANTIC]: assignment.type:count@"));
+if (println.length !== 5 || helped.length !== 5) { console.error(`analysis: ${println.length} println errors, ${helped.length} with the help`); process.exit(1); }
+if (!count || !(count.help || []).some((h) => h.startsWith("`count` is declared `int`, and the value is `string`"))) { console.error("analysis: the assignment has no typed help"); process.exit(1); }
+' "$output_directory/analyze.out" || { echo "semantic-help: the editor's analysis lost a help line" >&2; exit 1; }
+echo "semantic-help: 11 everyday errors have their help line; a far name and a name strict imports hide are not suggested; a repeated help line is printed once on the command line and kept on each error in the analysis"

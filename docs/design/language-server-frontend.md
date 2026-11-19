@@ -29,7 +29,11 @@ records the current service's measured behavior and phase breakdown.
   snapshot those mappings before processing another project revision.
 - `frontend_diagnostics.ab` exports typed code/message/source/begin/end records
   using exactly the legacy located-diagnostic interpretation. The JSON-lines
-  adapter retains its previous field ordering and contents. Producer-side related
+  adapter retains its previous field ordering and contents. A diagnostic with
+  `help:` lines after its location also has an optional `help` field, an array
+  of those lines without the prefix, on every occurrence (the command line
+  prints a help line it already printed once, the editor shows each error with
+  its own). Producer-side related
   locations and richer partial-analysis recovery are not claimed by this refactor.
 
 Ordinary compilation keeps its staged policy. Schema-1 `ablac analyze --stdio`
