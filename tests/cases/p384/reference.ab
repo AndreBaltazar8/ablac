@@ -1,0 +1,92 @@
+// The P-384 of abla/crypto/p384 (field multiplication, table read and inversion on 64-bit limbs where the target multiplies 64 x 64 -> 128) against the one it
+// replaced (old-p384.ab, on the old 32-bit big-number code): public keys, ECDH, RFC 6979 signatures (the same bytes) and verification both ways, over random
+// scalars, the edges of the range (0, 1, 2, n-2, n-1, n, 2^384-1), random and invalid points, and altered signatures and messages. Prints "p384 reference ok".
+import "abla/io"
+import "abla/crypto"
+import "abla/crypto/p384"
+import "abla/crypto/result"
+import "abla/text"
+import "./old-p384.ab" as old
+
+var failures = 0
+var seed = 384384
+
+fun fail(what: string): void {
+    failures = failures + 1
+    if (failures < 30) println("FAIL $what")
+    return
+}
+
+fun next(): int {
+    seed = (seed * 1103515245 + 12345) & 2147483647
+    (seed >> 16) & 255
+}
+
+fun random48(): string {
+    val bytes: array<int> = []
+    for (i in 0 until 48) bytes.append(next())
+    cryptoByteString(bytes)
+}
+
+fun same(what: string, a: CryptoResult, b: CryptoResult): void {
+    if (a.ok != b.ok || (a.ok && a.bytes != b.bytes)) fail("$what: new ${a.ok} '${a.error}' ${hexEncode(a.bytes)} / old ${b.ok} '${b.error}' ${hexEncode(b.bytes)}")
+    return
+}
+
+fun main: int {
+    val order = hexDecode("ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196accc52973")
+    val edges = [
+        hexDecode("00".repeat(48)),
+        hexDecode("00".repeat(47) + "01"),
+        hexDecode("00".repeat(47) + "02"),
+        order,
+        order.slice(0, 47) + "\x72",
+        order.slice(0, 47) + "\x70",
+        hexDecode("ff".repeat(48)),
+        hexDecode("80" + "00".repeat(47)),
+        hexDecode("00".repeat(23) + "01" + "00".repeat(24)),
+        hexDecode("00".repeat(16) + "ff".repeat(32))
+    ]
+    val scalars: array<string> = []
+    for (e in edges) scalars.append(e)
+    for (i in 0 until 60) scalars.append(random48())
+    val publics: array<string> = []
+    for (i in 0 until scalars.size) {
+        val fast = p384PublicKey(scalars[i])
+        same("public key $i", fast, old.p384PublicKey(scalars[i]))
+        if (fast.ok) publics.append(fast.bytes)
+    }
+    // ECDH against every few keys, and invalid peers.
+    for (i in 0 until scalars.size) {
+        val peer = publics[i % publics.size]
+        same("ECDH $i", p384Ecdh(scalars[i], peer), old.p384Ecdh(scalars[i], peer))
+    }
+    for (i in 0 until 20) {
+        var bad = publics[i % publics.size]
+        val at = 1 + next() % 96
+        bad = bad.slice(0, at) + cryptoByteString([next() ^ 1]) + bad.slice(at + 1, bad.size)
+        same("ECDH invalid peer $i", p384Ecdh(scalars[10 + i], bad), old.p384Ecdh(scalars[10 + i], bad))
+        if (p384IsValidPublicKey(bad) != old.p384IsValidPublicKey(bad)) fail("validity of an altered point $i")
+    }
+    // Signatures: identical bytes; each verifies under both; altered ones under neither.
+    for (i in 0 until scalars.size) {
+        val message = "p384 reference message $i " + hexEncode(random48())
+        val fast = p384EcdsaSignRaw(scalars[i], message)
+        same("signature $i", fast, old.p384EcdsaSignRaw(scalars[i], message))
+        if (!fast.ok) continue
+        val pub = p384PublicKey(scalars[i]).bytes
+        val der = p384EcdsaSign(scalars[i], message)
+        if (!p384EcdsaVerify(pub, message, der.bytes)) fail("new verify refused a new signature $i")
+        if (!old.p384EcdsaVerify(pub, message, der.bytes)) fail("old verify refused a new signature $i")
+        if (p384EcdsaVerify(pub, message + "x", der.bytes) || old.p384EcdsaVerify(pub, message + "x", der.bytes)) fail("a signature verified for another message $i")
+        val at = 8 + next() % (der.bytes.size - 8)
+        val bent = der.bytes.slice(0, at) + cryptoByteString([der.bytes[at] ^ (1 << (next() % 8))]) + der.bytes.slice(at + 1, der.bytes.size)
+        if (p384EcdsaVerify(pub, message, bent) != old.p384EcdsaVerify(pub, message, bent)) fail("an altered signature $i is judged differently")
+        // A different key's public point.
+        val other = publics[(i + 7) % publics.size]
+        if (p384EcdsaVerify(other, message, der.bytes) != old.p384EcdsaVerify(other, message, der.bytes)) fail("another key's verification $i")
+    }
+    if (failures > 0) return 1
+    println("p384 reference ok")
+    0
+}
