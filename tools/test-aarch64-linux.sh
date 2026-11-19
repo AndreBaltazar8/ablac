@@ -106,6 +106,14 @@ static_check() { # SOURCE MODE: builds for AArch64 and requires no library, load
 }
 static_both_check() { static_check "$1" release; static_check "$1" fast; }
 static_fast_check() { static_check "$1" fast; }
+# The release builds of these were 45 of this test's 120 CPU-seconds (about 9 each). The suite builds one of them for
+# release, http-async-tls (tls/pure, http/async and the event loop: the widest reach), and the rest at --fast;
+# RUN_TESTS_FULL=1 (or AARCH64_RELEASE_ALL=1) builds all of them both ways.
+if [[ -z ${AARCH64_RELEASE_ALL:-${RUN_TESTS_FULL:-}} ]]; then
+    static_both_release='tests/cases/libc-imports/http-async-tls.ab'
+    static_fast="$static_fast ${static_both//tests\/cases\/libc-imports\/http-async-tls.ab/}"
+    static_both=$static_both_release
+fi
 # shellcheck disable=SC2086
 parallel_each static_both_check $static_both
 # shellcheck disable=SC2086
