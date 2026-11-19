@@ -10,6 +10,16 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+// macOS's <ucontext.h> refuses to compile unless _XOPEN_SOURCE is defined ("The deprecated ucontext routines require
+// _XOPEN_SOURCE"); _DARWIN_C_SOURCE keeps dladdr and backtrace visible beside it.
+#if defined(__APPLE__)
+#ifndef _XOPEN_SOURCE
+#define _XOPEN_SOURCE 700
+#endif
+#ifndef _DARWIN_C_SOURCE
+#define _DARWIN_C_SOURCE
+#endif
+#endif
 #include <dlfcn.h>
 #include <execinfo.h>
 #include <signal.h>
