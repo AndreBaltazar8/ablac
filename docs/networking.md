@@ -427,7 +427,7 @@ What changes with HTTP/2:
 `tools/bench-http2-client.sh` measures the client (and the servers) over HTTP/1.1 and HTTP/2: latency percentiles and total time for N parallel requests, against h2o,
 `HttpsEventServer` and nghttpd. It found that the event servers did not set TCP_NODELAY on accepted sockets (an HTTP/2 response written as HEADERS and then DATA waited for the
 peer's delayed ACK: 40 ms outliers, half the throughput at 8 and 32 parallel requests); they set it now (`TcpConnection.setNoDelay`, `tools/test-http-nodelay.sh`).
-A server closes an HTTP/1.1 connection after `maximumRequestsPerConnection` requests (100 by default), and the next request then pays a TLS handshake (about 7 ms of CPU
+A server closes an HTTP/1.1 connection after `maximumRequestsPerConnection` requests (1000 by default; it was 100, which cost one handshake per 100 requests), and the next request then pays a TLS handshake (about 7 ms of CPU
 with the pure-Abla X25519 and ECDSA; the first request of a connection is the tail of such a benchmark).
 
 ### HTTPS and HTTP/2 server
