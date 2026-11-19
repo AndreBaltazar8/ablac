@@ -21,8 +21,8 @@ for size in $sizes; do head -c "$size" /dev/urandom > "$out/docroot/$size.bin"; 
 "$compiler" build tests/cases/http2/streamserver.ab -o "$out/streamserver" --no-cache
 pids=()
 trap 'for p in "${pids[@]}"; do kill "$p" 2> /dev/null || true; done' EXIT
-free_port() { while :; do c=$((20000 + RANDOM % 20000)); ss -ltn "sport = :$c" 2> /dev/null | grep -q LISTEN || { echo "$c"; return; }; done; }
-wait_port() { for _ in $(seq 100); do ss -ltn "sport = :$1" 2> /dev/null | grep -q LISTEN && return 0; sleep 0.1; done; echo "bench-http2: nothing listens on $1" >&2; exit 1; }
+free_port() { while :; do c=$((20000 + RANDOM % 20000)); ss -ltn "sport = :$c" 2> /dev/null | grep LISTEN > /dev/null || { echo "$c"; return; }; done; }
+wait_port() { for _ in $(seq 100); do ss -ltn "sport = :$1" 2> /dev/null | grep LISTEN > /dev/null && return 0; sleep 0.1; done; echo "bench-http2: nothing listens on $1" >&2; exit 1; }
 
 h2o_port=$(free_port)
 cat > "$out/h2o.conf" <<CONF
