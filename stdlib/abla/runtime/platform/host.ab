@@ -1964,6 +1964,24 @@ var __ablaRuntimeHostCollectionDirectoryCount: int = 0
 // were outside the mapped ranges (tagged pointers), 4 "openfail" and 5 "readfail" make the real system
 // call fail. 0 otherwise.
 var __ablaRuntimeHostCollectionForce: int = __ablaRuntimeHostCollectionForceConfigured()
+// ABLA_GC_WORKERS=n (2 to 8): the mark of a collection runs on n threads (the parallel mark, below); unset, 0 or 1 is the
+// serial mark.
+var __ablaRuntimeHostGcWorkers: int = __ablaRuntimeHostGcWorkersConfigured()
+
+@noinline
+trusted fun __ablaRuntimeHostGcWorkersConfigured(): int {
+    val value = ablaRuntimePointerAddress(__ablaRuntimeHostGetenv(ablaRuntimePointerFromAddress(
+        __ablaRuntimeWord0("ABLA_GC_WORKERS")
+    )))
+    if (value == 0) return 0
+    var count = 0
+    var at = value
+    while (ablaRuntimeLoadU8(at) >= 48 && ablaRuntimeLoadU8(at) <= 57 && count < 1000) {
+        count = count * 10 + ablaRuntimeLoadU8(at) - 48
+        at = at + 1
+    }
+    if (count < 2) 0 else if (count > 8) 8 else count
+}
 val __ablaRuntimeHostCollectionSmallBytes: int = 32768
 
 val __ablaRuntimeHostRegionCachedDescriptors: int = 64
@@ -3276,6 +3294,378 @@ trusted fun __ablaRuntimeHostTraceMarkedAllocations(): void {
     }
 }
 
+// ---- Parallel mark (ABLA_GC_WORKERS=n, off by default) ---------------------------------------------------------------
+// The mark of __ablaRuntimeHostTraceMarkedAllocations on n threads (the collecting thread and n - 1 started for the mark):
+// each claims an object by a compare-and-swap of its state word (layout -> layout + 16; the loser of a race leaves it),
+// keeps a stack of its own claimed headers (4,096 entries), and gives half of it to a shared pool (the collection's work
+// list, under a spin lock) when the stack fills or when another thread has run dry; a thread with nothing takes from the
+// pool, and the mark is over when no thread is busy and the pool is empty. The page directory answers every candidate
+// (the lazy registry lookup switches a global mode on its first interior pointer: no race-free form), through a page
+// cache of each thread's own. Nothing here allocates or touches thread-local storage: a thread the runtime did not
+// register runs it. The sweep stays as it is, on the collecting thread.
+// State, static: +0 the pool's lock, +8 its count, +16 threads busy, +24 its capacity (the registry's slots), +32 the
+// pool's array, +40 the threads asked for.
+private trusted fun __ablaRuntimeHostMarkShared(): int = nativeStaticAllocate(64)
+
+// A thread's block: +0 its stack's address, +8 its count, +16 its page cache's address, +24 1 once its thread started,
+// +32 its thread handle, +40 objects it traced, +48 times it took from the pool, +56 times it gave to the pool, +64 idle sleeps,
+// +72 idle looks at the pool (the counts are for ABLA_GC_TRACE=1); the stack and the cache follow.
+val __ablaRuntimeHostMarkStack: int = 4096
+val __ablaRuntimeHostMarkHeader: int = 128
+val __ablaRuntimeHostMarkBlock: int = 128 + 4096 * 8 + 4096
+
+private trusted fun __ablaRuntimeHostMarkPoolLock(shared: int): void {
+    while (ablaRuntimeAtomicCompareExchangeI64(shared, 0, 1) != 0) {
+        while (ablaRuntimeAtomicLoadI64(shared) != 0) {}
+    }
+    return
+}
+
+// The oldest `given` entries of the stack go to the pool.
+private trusted fun __ablaRuntimeHostMarkDonate(context: int, given: int): void {
+    val shared = __ablaRuntimeHostMarkShared()
+    val stack = ablaRuntimeLoadI64(context)
+    val count = ablaRuntimeLoadI64(context + 8)
+    __ablaRuntimeHostMarkPoolLock(shared)
+    val pool = ablaRuntimeLoadI64(shared + 32)
+    val pooled = ablaRuntimeLoadI64(shared + 8)
+    if (pooled + given > ablaRuntimeLoadI64(shared + 24)) ablaRuntimeTrap()
+    var index = 0
+    while (index < given) {
+        ablaRuntimeStoreI64(pool + (pooled + index) * 8, ablaRuntimeLoadI64(stack + index * 8))
+        index = index + 1
+    }
+    ablaRuntimeAtomicStoreI64(shared + 8, pooled + given)
+    ablaRuntimeAtomicStoreI64(shared, 0)
+    index = given
+    while (index < count) {
+        ablaRuntimeStoreI64(stack + (index - given) * 8, ablaRuntimeLoadI64(stack + index * 8))
+        index = index + 1
+    }
+    ablaRuntimeStoreI64(context + 8, count - given)
+    ablaRuntimeStoreI64(context + 56, ablaRuntimeLoadI64(context + 56) + 1)
+    return
+}
+
+// Up to 256 headers from the pool onto the (empty) stack; false when the pool was empty.
+private trusted fun __ablaRuntimeHostMarkTake(context: int): bool {
+    val shared = __ablaRuntimeHostMarkShared()
+    __ablaRuntimeHostMarkPoolLock(shared)
+    val pooled = ablaRuntimeLoadI64(shared + 8)
+    val taken = if (pooled > 256) 256 else pooled
+    if (taken > 0) {
+        val pool = ablaRuntimeLoadI64(shared + 32)
+        val stack = ablaRuntimeLoadI64(context)
+        var index = 0
+        while (index < taken) {
+            ablaRuntimeStoreI64(stack + index * 8, ablaRuntimeLoadI64(pool + (pooled - 1 - index) * 8))
+            index = index + 1
+        }
+        ablaRuntimeAtomicStoreI64(shared + 8, pooled - taken)
+        ablaRuntimeStoreI64(context + 8, taken)
+        ablaRuntimeStoreI64(context + 48, ablaRuntimeLoadI64(context + 48) + 1)
+    }
+    ablaRuntimeAtomicStoreI64(shared, 0)
+    taken > 0
+}
+
+// __ablaRuntimeHostCollectionBitmapOf with the thread's own page cache.
+@inline
+trusted fun __ablaRuntimeHostMarkBitmapOf(cache: int, page: int): int {
+    val cached = cache + (page & 255) * 16
+    if (ablaRuntimeLoadI64(cached) == page + 1) return ablaRuntimeLoadI64(cached + 8)
+    val table = __ablaRuntimeHostCollectionPages
+    val slot = __ablaRuntimeHostCollectionPageSlot(table, __ablaRuntimeHostCollectionPageMask, page)
+    val bitmap = if (ablaRuntimeLoadI64(table + slot * 16) == 0) 0 else ablaRuntimeLoadI64(table + slot * 16 + 8)
+    ablaRuntimeStoreI64(cached, page + 1)
+    ablaRuntimeStoreI64(cached + 8, bitmap)
+    bitmap
+}
+
+// __ablaRuntimeHostCollectionLocate with the thread's own page cache.
+private trusted fun __ablaRuntimeHostMarkLocate(cache: int, candidate: int): int {
+    val start = candidate - 32
+    if ((start & 15) == 0) {
+        val startBitmap = __ablaRuntimeHostMarkBitmapOf(cache, start >>> 16)
+        val startBit = (start & 65535) >> 4
+        if (startBitmap != 0 &&
+            ((ablaRuntimeLoadI64(startBitmap + (startBit >> 6) * 8) >>> (startBit & 63)) & 1) != 0 &&
+            ablaRuntimeLoadI64(start + 16) > 0) return start
+    }
+    val page = candidate >>> 16
+    var header = 0
+    val bitmap = __ablaRuntimeHostMarkBitmapOf(cache, page)
+    if (bitmap != 0) {
+        header = __ablaRuntimeHostCollectionNearest(bitmap, page, (candidate & 65535) >> 4)
+    }
+    if (header == 0) {
+        val previous = __ablaRuntimeHostMarkBitmapOf(cache, page - 1)
+        if (previous != 0) header = __ablaRuntimeHostCollectionNearest(previous, page - 1, 4095)
+    }
+    if (header != 0) {
+        val payload = header + 32
+        if (u64(candidate) >= u64(payload) && u64(candidate - payload) < u64(ablaRuntimeLoadI64(header + 16))) {
+            return header
+        }
+    }
+    val ranges = __ablaRuntimeHostCollectionRanges
+    var lower = 0
+    var upper = __ablaRuntimeHostCollectionLargeCount
+    while (lower < upper) {
+        val middle = lower + (upper - lower) / 2
+        if (u64(ablaRuntimeLoadI64(ranges + middle * 8) + 32) <= u64(candidate)) lower = middle + 1
+        else upper = middle
+    }
+    if (lower == 0) return 0
+    val large = ablaRuntimeLoadI64(ranges + (lower - 1) * 8)
+    val payload = large + 32
+    if (u64(candidate) >= u64(payload) && u64(candidate - payload) < u64(ablaRuntimeLoadI64(large + 16))) large else 0
+}
+
+// __ablaRuntimeHostMarkPointer for a thread of the parallel mark: the claim is a compare-and-swap.
+private trusted fun __ablaRuntimeHostMarkPointerParallel(context: int, candidate: int): void {
+    if (candidate == 0) return
+    if (__ablaRuntimeHostFrozenBase != 0 && __ablaRuntimeHostFrozenIn(candidate)) {
+        // The group's reached flag: every thread stores the same 1, atomically.
+        val group = __ablaRuntimeHostFrozenGroupOf(candidate)
+        if (group != 0) ablaRuntimeAtomicStoreI64(group + 16, 1)
+        return
+    }
+    if (u64(candidate) < u64(__ablaRuntimeHostCollectionMinimum) ||
+        u64(candidate) >= u64(__ablaRuntimeHostCollectionMaximum)) return
+    val header = __ablaRuntimeHostMarkLocate(ablaRuntimeLoadI64(context + 16), candidate)
+    if (header == 0) return
+    val payload = header + 32
+    val size = ablaRuntimeLoadI64(header + 16)
+    val layout = ablaRuntimeAtomicLoadI64(header + 24)
+    if (u64(candidate) < u64(payload) || u64(candidate - payload) >= u64(size) ||
+        layout < 0 || layout >= 16) return
+    if (ablaRuntimeAtomicCompareExchangeI64(header + 24, layout, layout + 16) != layout) return
+    var count = ablaRuntimeLoadI64(context + 8)
+    if (count == __ablaRuntimeHostMarkStack) {
+        __ablaRuntimeHostMarkDonate(context, __ablaRuntimeHostMarkStack / 2)
+        count = ablaRuntimeLoadI64(context + 8)
+    }
+    ablaRuntimeStoreI64(ablaRuntimeLoadI64(context) + count * 8, header)
+    count = count + 1
+    ablaRuntimeStoreI64(context + 8, count)
+    // Another thread has run dry: share early, not only when the stack is full.
+    if ((count & 63) == 0 && count >= 128) {
+        val shared = __ablaRuntimeHostMarkShared()
+        if (ablaRuntimeAtomicLoadI64(shared + 16) < ablaRuntimeLoadI64(shared + 40)) {
+            __ablaRuntimeHostMarkDonate(context, count / 2)
+        }
+    }
+    return
+}
+
+private trusted fun __ablaRuntimeHostMarkValueParallel(context: int, value: int): void {
+    val tag = ablaRuntimeLoadI32(value)
+    if (tag == 4) {
+        __ablaRuntimeHostMarkPointerParallel(context, ablaRuntimeLoadI64(value + 8))
+        __ablaRuntimeHostMarkPointerParallel(context, ablaRuntimeLoadI64(value + 16))
+    }
+    if (tag == 5) {
+        __ablaRuntimeHostMarkPointerParallel(context, ablaRuntimeLoadI64(value + 16))
+    }
+    if (tag >= 6 && tag <= 14) {
+        __ablaRuntimeHostMarkPointerParallel(context, ablaRuntimeLoadI64(value + 8))
+    }
+    return
+}
+
+// One claimed object's fields (the body of __ablaRuntimeHostTraceMarkedAllocations for one header).
+private trusted fun __ablaRuntimeHostMarkTraceParallel(context: int, header: int): void {
+    val state = ablaRuntimeLoadI64(header + 24)
+    // Only the thread that claimed it is here, once: any other state is a double claim.
+    if (state < 16 || state >= 32) ablaRuntimeTrap()
+    val layout = state - 16
+    ablaRuntimeStoreI64(header + 24, layout + 32)
+    val size = ablaRuntimeLoadI64(header + 16)
+    val payload = header + 32
+    if (layout == 0) {
+        var offset: int = 0
+        while (offset + 8 <= size) {
+            __ablaRuntimeHostMarkPointerParallel(context, ablaRuntimeLoadI64(payload + offset))
+            offset = offset + 8
+        }
+    }
+    if (layout == 2) {
+        var offset: int = 0
+        while (offset + 24 <= size) {
+            __ablaRuntimeHostMarkValueParallel(context, payload + offset)
+            offset = offset + 24
+        }
+    }
+    if (layout == 3) {
+        var offset: int = 0
+        while (offset + 32 <= size) {
+            __ablaRuntimeHostMarkValueParallel(context, payload + offset + 8)
+            offset = offset + 32
+        }
+    }
+    if (layout == 4 && size >= 24) {
+        val count = ablaRuntimeLoadI64(payload)
+        val values = ablaRuntimeLoadI64(payload + 16)
+        val dense = (ablaRuntimeLoadI64(payload + 8) >> 56) != 0
+        if (values == payload + 24) {
+            var index: int = 0
+            while (!dense && index < count) {
+                __ablaRuntimeHostMarkValueParallel(context, values + index * 24)
+                index = index + 1
+            }
+        } else __ablaRuntimeHostMarkPointerParallel(context, values)
+    }
+    if (layout == 5 && size >= 16) {
+        val descriptor = ablaRuntimeLoadI64(payload) - 4611686018427387904
+        val traced = ablaRuntimeLoadI32(descriptor + 12)
+        val entries = descriptor + 16 + ablaRuntimeLoadI32(descriptor + 4) * 16
+        var index: int = 0
+        while (index < traced) {
+            val field = payload + ablaRuntimeLoadI32(entries + index * 8)
+            val kind = ablaRuntimeLoadI32(entries + index * 8 + 4)
+            if (kind == 0) __ablaRuntimeHostMarkValueParallel(context, field)
+            if (kind != 0) __ablaRuntimeHostMarkPointerParallel(context, ablaRuntimeLoadI64(field))
+            if (kind == 3) __ablaRuntimeHostMarkPointerParallel(context, ablaRuntimeLoadI64(field + 8))
+            index = index + 1
+        }
+        __ablaRuntimeHostMarkPointerParallel(context, ablaRuntimeLoadI64(payload + 8))
+    }
+    if (layout == 6 && size >= 48) {
+        __ablaRuntimeHostMarkPointerParallel(context, ablaRuntimeLoadI64(payload + 8))
+        __ablaRuntimeHostMarkPointerParallel(context, ablaRuntimeLoadI64(payload + 16))
+        __ablaRuntimeHostMarkPointerParallel(context, ablaRuntimeLoadI64(payload + 24))
+        __ablaRuntimeHostMarkPointerParallel(context, ablaRuntimeLoadI64(payload + 32))
+        __ablaRuntimeHostMarkPointerParallel(context, ablaRuntimeLoadI64(payload + 40))
+    }
+    if (layout == 7 && size >= 24) {
+        __ablaRuntimeHostMarkValueParallel(context, payload + 16)
+    }
+    if (layout == 11 && size >= 48) {
+        __ablaRuntimeHostMarkValueParallel(context, payload)
+        __ablaRuntimeHostMarkValueParallel(context, payload + 24)
+    }
+    return
+}
+
+// A thread of the mark (the C entry of the ones started for it; the collecting thread calls it too): works until every
+// thread is out of work.
+trusted fun __ablaRuntimeHostMarkWorker(context: int): int {
+    val shared = __ablaRuntimeHostMarkShared()
+    var running = true
+    while (running) {
+        while (ablaRuntimeLoadI64(context + 8) > 0) {
+            val count = ablaRuntimeLoadI64(context + 8) - 1
+            ablaRuntimeStoreI64(context + 8, count)
+            ablaRuntimeStoreI64(context + 40, ablaRuntimeLoadI64(context + 40) + 1)
+            __ablaRuntimeHostMarkTraceParallel(context, ablaRuntimeLoadI64(ablaRuntimeLoadI64(context) + count * 8))
+        }
+        if (!__ablaRuntimeHostMarkTake(context)) {
+            ablaRuntimeAtomicFetchAddI64(shared + 16, -1)
+            var waiting = true
+            while (waiting) {
+                // Busy first, then the pool: nothing is added to the pool once no thread is busy.
+                val busy = ablaRuntimeAtomicLoadI64(shared + 16)
+                ablaRuntimeStoreI64(context + 72, ablaRuntimeLoadI64(context + 72) + 1)
+                if (ablaRuntimeAtomicLoadI64(shared + 8) > 0) {
+                    ablaRuntimeAtomicFetchAddI64(shared + 16, 1)
+                    if (__ablaRuntimeHostMarkTake(context)) waiting = false
+                    else ablaRuntimeAtomicFetchAddI64(shared + 16, -1)
+                } else if (busy == 0) {
+                    waiting = false
+                    running = false
+                } else {
+                    ablaRuntimeStoreI64(context + 64, ablaRuntimeLoadI64(context + 64) + 1)
+                    __ablaRuntimeHostStwSleep()
+                }
+            }
+        }
+    }
+    0
+}
+
+// The mark on `workers` threads, from the roots the collection has put on its work list.
+trusted fun __ablaRuntimeHostTraceParallel(workers: int): void {
+    val shared = __ablaRuntimeHostMarkShared()
+    val block = __ablaRuntimeHostMarkBlock
+    val contexts = ablaRuntimePointerAddress(__ablaRuntimeHostMalloc(workers * block))
+    if (contexts == 0) {
+        __ablaRuntimeHostTraceMarkedAllocations()
+        return
+    }
+    var index = 0
+    while (index < workers) {
+        val context = contexts + index * block
+        ablaRuntimeStoreI64(context, context + __ablaRuntimeHostMarkHeader)
+        ablaRuntimeStoreI64(context + 8, 0)
+        ablaRuntimeStoreI64(context + 16, context + __ablaRuntimeHostMarkHeader + __ablaRuntimeHostMarkStack * 8)
+        ablaRuntimeStoreI64(context + 24, 0)
+        ablaRuntimeStoreI64(context + 40, 0)
+        ablaRuntimeStoreI64(context + 48, 0)
+        ablaRuntimeStoreI64(context + 56, 0)
+        ablaRuntimeStoreI64(context + 64, 0)
+        ablaRuntimeStoreI64(context + 72, 0)
+        var cached = 0
+        while (cached < 512) {
+            ablaRuntimeStoreI64(context + __ablaRuntimeHostMarkHeader + __ablaRuntimeHostMarkStack * 8 + cached * 8, 0)
+            cached = cached + 1
+        }
+        index = index + 1
+    }
+    ablaRuntimeAtomicStoreI64(shared, 0)
+    ablaRuntimeAtomicStoreI64(shared + 8, __ablaRuntimeHostCollectionWorklistCount)
+    ablaRuntimeAtomicStoreI64(shared + 16, 1)
+    ablaRuntimeStoreI64(shared + 24, __ablaRuntimeHostCollectionCount)
+    ablaRuntimeStoreI64(shared + 32, __ablaRuntimeHostCollectionWorklist)
+    ablaRuntimeStoreI64(shared + 40, workers)
+    __ablaRuntimeHostCollectionWorklistCount = 0
+    index = 1
+    while (index < workers) {
+        val context = contexts + index * block
+        ablaRuntimeAtomicFetchAddI64(shared + 16, 1)
+        if (pthread_create(
+            ablaRuntimePointerFromAddress(context + 32),
+            ablaRuntimePointerFromAddress(0),
+            ablaRuntimePointerFromAddress(nativeFunctionAddress(__ablaRuntimeHostMarkWorker)),
+            ablaRuntimePointerFromAddress(context)
+        ) == 0) {
+            ablaRuntimeStoreI64(context + 24, 1)
+        } else {
+            ablaRuntimeAtomicFetchAddI64(shared + 16, -1)
+            ablaRuntimeAtomicFetchAddI64(shared + 40, -1)
+        }
+        index = index + 1
+    }
+    __ablaRuntimeHostMarkWorker(contexts)
+    index = 1
+    while (index < workers) {
+        val context = contexts + index * block
+        if (ablaRuntimeLoadI64(context + 24) != 0) {
+            pthread_join(ablaRuntimeLoadI64(context + 32), ablaRuntimePointerFromAddress(0))
+        }
+        index = index + 1
+    }
+    if (__ablaRuntimeHostGcTrace) {
+        var counter = 0
+        while (counter < 4) {
+            if (counter == 0) __ablaRuntimeHostWrite(2, __ablaRuntimeWord0("gc: parallel mark, objects by thread:"), 37)
+            if (counter == 1) __ablaRuntimeHostWrite(2, __ablaRuntimeWord0("gc: parallel mark, takes by thread:"), 35)
+            if (counter == 2) __ablaRuntimeHostWrite(2, __ablaRuntimeWord0("gc: parallel mark, gives by thread:"), 35)
+            if (counter == 3) __ablaRuntimeHostWrite(2, __ablaRuntimeWord0("gc: parallel mark, sleeps by thread:"), 36)
+            val offset = if (counter == 0) 40 else if (counter == 1) 48 else if (counter == 2) 56 else 64
+            index = 0
+            while (index < workers) {
+                __ablaRuntimeHostStwTrace(" ", 1, ablaRuntimeLoadI64(contexts + index * block + offset), "", 0)
+                index = index + 1
+            }
+            __ablaRuntimeHostWrite(2, __ablaRuntimeWord0("\n"), 1)
+            counter = counter + 1
+        }
+    }
+    __ablaRuntimeHostFree(ablaRuntimePointerFromAddress(contexts))
+    return
+}
+
 // Free what the marker did not reach; clear the marks of what it did. What is
 // kept moves down the registry in its order, closing the empty slots.
 trusted fun __ablaRuntimeHostCollectionSweep(): void {
@@ -3478,7 +3868,7 @@ trusted fun __ablaRuntimePlatformMemoryCollect(): int {
         }
     }
     if (__ablaRuntimeHostGcStress) __ablaRuntimeHostCollectionMode = 2
-    else if (__ablaRuntimeHostCollectionForce != 1 && !__ablaRuntimeHostCollectionNeedsDirectory &&
+    else if (__ablaRuntimeHostGcWorkers < 2 && __ablaRuntimeHostCollectionForce != 1 && !__ablaRuntimeHostCollectionNeedsDirectory &&
         __ablaRuntimeHostCollectionMappingsLoad() && __ablaRuntimeHostCollectionRegistryMapped()) {
         // Foreign threads that unmap, a file mapping read past its truncated end and MTE tag
         // mismatches are not covered (only anonymous ranges are listed).
@@ -3489,7 +3879,8 @@ trusted fun __ablaRuntimePlatformMemoryCollect(): int {
     }
     if (__ablaRuntimeHostCollectionMode != 1) __ablaRuntimeHostCollectionPagesBuild()
     __ablaRuntimeHostMarkRootValues()
-    __ablaRuntimeHostTraceMarkedAllocations()
+    if (__ablaRuntimeHostGcWorkers >= 2) __ablaRuntimeHostTraceParallel(__ablaRuntimeHostGcWorkers)
+    else __ablaRuntimeHostTraceMarkedAllocations()
     __ablaRuntimeHostFrozenReclaim()
     if (__ablaRuntimeHostCollectionMode == 1) {
         __ablaRuntimeHostCollectionLazyCount = __ablaRuntimeHostCollectionLazyCount + 1
@@ -3566,7 +3957,8 @@ trusted fun __ablaRuntimeHostBackgroundMemoryCollect(): int {
     val background = ablaRuntimeLoadI64(__ablaRuntimeHostFreeState()) != 0
     __ablaRuntimeHostCollectionPagesBuild()
     __ablaRuntimeHostMarkRootValues()
-    __ablaRuntimeHostTraceMarkedAllocations()
+    if (__ablaRuntimeHostGcWorkers >= 2) __ablaRuntimeHostTraceParallel(__ablaRuntimeHostGcWorkers)
+    else __ablaRuntimeHostTraceMarkedAllocations()
     __ablaRuntimeHostFrozenReclaim()
     __ablaRuntimeHostSmallListsSettle()
     if (background) {
