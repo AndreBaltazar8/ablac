@@ -1197,10 +1197,11 @@ a value is no part of any global's heap, whatever it was computed from.
   returns, never in the middle of it, and a compile-time `sleep` wakes at the
   limit instead of sleeping on. The sites of a module that requests `time.unlimited`
   (and whose manifest authorizes it) have no time limit; every other module's
-  keep it. One native call is shared: the first call of a native generation
-  initializes the globals the generation keeps, so a site in one of their
-  initializers runs in that call, whichever site's call it is. When one of
-  those is an unlimited module's site, that first call has no limit.
+  keep it. An unlimited module's site can run inside another site's native
+  call: the first call of a generation initializes the globals the
+  generation keeps, and a site in one of their initializers runs there. The
+  call's limit is paused while that site's code runs, and only then, so the
+  rest of the call keeps its limit.
 - `compile val`/`compile var` hold one value for the compilation on both
   tiers: after each native call their values are kept as the evaluator keeps
   them. When an evaluated site changes a `compile var` the slice holds whose

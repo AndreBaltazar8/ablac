@@ -30,6 +30,18 @@ for mode in interp jit; do
     [[ $run == 42 ]] || { echo "ct time unlimited: $mode: unlimited.ab's program exited $run, not 42" >&2; exit 1; }
     echo "ok   $mode: unlimited.ab's site runs past the limit"
 done
+# In one native call: shared/played.ab's slow site is kept by the slice, and quick.ab's call (the generation's
+# first) runs it while it initializes the globals the slice keeps. Only that site's code is unlimited: the call runs
+# past the limit for it, and a call whose own code is slow (slow-first.ab's) still stops.
+status=$(build jit shared shared/played.ab)
+[[ $status == 0 ]] || fail "$out/shared-jit.log" "shared: played.ab: the compiler exited $status"
+run=0; "$out/shared-jit" || run=$?
+[[ $run == 42 ]] || { echo "ct time unlimited: shared: played.ab's program exited $run, not 42" >&2; exit 1; }
+status=$(build jit shared-slow shared/played-slow-first.ab)
+[[ $status == 1 ]] || fail "$out/shared-slow-jit.log" "shared: played-slow-first.ab: the compiler exited $status, not 1"
+grep -q '^error\[E_CT_TIME_LIMIT\]' "$out/shared-slow-jit.log" ||
+    fail "$out/shared-slow-jit.log" "shared: played-slow-first.ab: no E_CT_TIME_LIMIT"
+echo "ok   jit: an unlimited site kept by the slice runs past the limit in another site's call, whose own code doesn't"
 status=$(build interp unauthorized unauthorized/main.ab)
 [[ $status == 1 ]] || fail "$out/unauthorized-interp.log" "unauthorized: the compiler exited $status, not 1"
 grep -q 'compile.capability-not-authorized:time.unlimited' "$out/unauthorized-interp.log" ||

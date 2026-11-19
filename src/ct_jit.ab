@@ -1093,12 +1093,28 @@ fun bootstrapCtEntrySource(site: BootstrapCtSite, generation: int): string {
 // any type, nullable ones too, has an empty state.
 fun bootstrapCtOnceSource(site: BootstrapCtSite): string {
     val id = "${site.id}"
+    // A site of a module that requests `time.unlimited` runs with the call's time limit paused (ct_eval.ab,
+    // bootstrapCtTimePause), whichever call reaches it.
+    val run = if (bootstrapCtSiteUnlimitedModule(site))
+        "{\n        val left = __abla_ct_time_pause()\n        __abla_ct_once_$id.append(__abla_ct_site_$id())\n" +
+        "        __abla_ct_time_resume(left)\n    }"
+    else "__abla_ct_once_$id.append(__abla_ct_site_$id())"
     "val __abla_ct_once_$id: array<${site.type}> = []\n" +
     "compile fun __abla_ct_once_get_$id(): ${site.type} {\n" +
-    "    if (__abla_ct_once_$id.size == 0) __abla_ct_once_$id.append(__abla_ct_site_$id())\n" +
+    "    if (__abla_ct_once_$id.size == 0) $run\n" +
     "    __abla_ct_once_$id[0]\n" +
     "}\n"
 }
+
+fun bootstrapCtSiteUnlimitedModule(site: BootstrapCtSite): bool =
+    bootstrapAffineNamesContain(bootstrapCompileUnlimitedModules, site.sourceIdentity)
+
+// The pause and resume a kept site of an unlimited module calls (bootstrapCtOnceSource), once per generation.
+val BOOTSTRAP_CT_TIME_PAUSE_SOURCE =
+    "trusted noescape extern:\"c\" fun abla_ct_bridge_time_pause(): int\n" +
+    "trusted noescape extern:\"c\" fun abla_ct_bridge_time_resume(left: int): int\n" +
+    "trusted fun __abla_ct_time_pause(): int = abla_ct_bridge_time_pause()\n" +
+    "trusted fun __abla_ct_time_resume(left: int): void {\n    abla_ct_bridge_time_resume(left)\n    return\n}\n"
 
 // Whether a site can be a once site: one that runs natively and gives a value. (Its own `encodes` is set while the
 // sites are prepared, so a later site's isn't yet: this asks its type.)
@@ -2295,9 +2311,12 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
         }
         onceIndex = onceIndex + 1
     }
+    var pauses = false
     for (site in bootstrapCtSites) {
         if (site.reason == "") source = "$source${bootstrapCtEntrySource(site, generation)}"
+        if (site.reason == "" && site.encodes && site.once && bootstrapCtSiteUnlimitedModule(site)) pauses = true
     }
+    if (pauses) source = "$source$BOOTSTRAP_CT_TIME_PAUSE_SOURCE"
     var globalIndex = 0
     while (globalIndex < bootstrapCtGlobals.size) {
         source =
@@ -2588,15 +2607,6 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
     bootstrapCtStopSiteAddress = bootstrapCtLookup("abla_ct_stop_site_$generation")
     ctNativeStopDeferredAddress = bootstrapCtLookup("abla_ct_deferred_$generation")
     bootstrapCtGenerationSpent = ""
-    // The generation's first call initializes the globals it keeps, so a `#` site those initializers hold runs there,
-    // whichever site's call comes first: a site of a module that requests `time.unlimited` (decision #81 C) lifts
-    // the limit of that call (ct_eval.ab, bootstrapCtCall).
-    bootstrapCtGenerationCalls = 0
-    bootstrapCtGenerationUnlimited = false
-    for (kept in bootstrapCtSites) {
-        if (kept.once && bootstrapAffineNamesContain(bootstrapCompileUnlimitedModules, kept.sourceIdentity))
-            bootstrapCtGenerationUnlimited = true
-    }
     if (bootstrapCtFreeAddress == 0 || bootstrapCtGuardAddress == 0) {
         bootstrapCtFailReady("the slice's support entries are missing")
     }

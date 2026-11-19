@@ -745,9 +745,7 @@ trusted fun bootstrapCtCall(entry: int, label: string = ""): BootstrapCtCallResu
     if (bootstrapCtGenerationThreads) runtimeMemoryEnableSharing()
     // The guard writes how the call stopped here (0: it returned).
     val stopped = nativeI64Cell(0)
-    val limit = if (bootstrapCtGenerationUnlimited && bootstrapCtGenerationCalls == 0) 0
-        else bootstrapCtTimeLimitSeconds()
-    bootstrapCtGenerationCalls = bootstrapCtGenerationCalls + 1
+    val limit = bootstrapCtTimeLimitSeconds()
     val timer = limit > 0 && bootstrapCtAlarmAddress != 0 &&
         bootstrapCtArmAlarm(bootstrapCtAlarmAddress, limit)
     // (Nested calls keep the outer deadline when it is sooner.)
@@ -909,10 +907,6 @@ var bootstrapCtHostIsDarwin: bool = false
 // While the lowering evaluates a site of a module that requests `time.unlimited` (ir.ab, bootstrapLowerCompile): no
 // limit, as with 0. A `#` met inside that evaluation runs under it too.
 var bootstrapCtSiteUnlimited: bool = false
-// The live generation's calls so far, and whether its first one, which initializes the globals it keeps, runs
-// without the limit: they hold a site of a module that requests `time.unlimited` (ct_jit.ab).
-var bootstrapCtGenerationCalls: int = 0
-var bootstrapCtGenerationUnlimited: bool = false
 
 fun bootstrapCtTimeLimitSeconds(): int {
     if (bootstrapCtSiteUnlimited) return 0
@@ -963,6 +957,41 @@ trusted fun bootstrapCtArmAlarm(handler: int, seconds: int): bool {
         __ablaRuntimeFree(timer)
     }
     armed
+}
+
+// ITIMER_REAL in `milliseconds` (0: stopped), the handler left as it is.
+trusted fun bootstrapCtSetTimerMilliseconds(milliseconds: int): bool {
+    val timer = bootstrapCtZeroed(32)
+    ablaRuntimeStoreI64(timer + 16, milliseconds / 1000)
+    ablaRuntimeStoreI64(timer + 24, (milliseconds - milliseconds / 1000 * 1000) * 1000)
+    val set = bootstrapCtSetTimer(timer)
+    __ablaRuntimeFree(timer)
+    set
+}
+
+// A site of a module that requests `time.unlimited` can run inside another site's native call: the slice keeps it
+// (bootstrapCtOnceSource), and whichever call needs its value first runs it, often the generation's first call while
+// it initializes the globals the slice keeps (the game client of #1022 did). Its accessor pauses the call's time
+// limit around the site's code, so only that code is unlimited (decision #81 C). Pause: stops the timer and returns
+// the milliseconds left (-1: the call has no limit). The call's alarm may come meanwhile: it marks the stop, which
+// the bridge takes when the pause returns (ct_jit.ab), so a call out of time never starts the site.
+@export("abla_ct_bridge_time_pause")
+fun bootstrapCtTimePause(): i64 {
+    if (ctNativeCallDeadline == 0) return -1
+    val left = ctNativeCallDeadline - linuxMonotonicMilliseconds()
+    val stopped = bootstrapCtSetTimerMilliseconds(0)
+    ctNativeCallDeadline = 0
+    if (left > 0) left else 0
+}
+
+// Resume: the call's limit again, for the `left` milliseconds the pause returned.
+@export("abla_ct_bridge_time_resume")
+fun bootstrapCtTimeResume(left: i64): i64 {
+    if (left < 0) return 0
+    val wait = if (left > 0) left else 1
+    ctNativeCallDeadline = linuxMonotonicMilliseconds() + wait
+    val armed = bootstrapCtSetTimerMilliseconds(wait)
+    0
 }
 
 trusted fun bootstrapCtDisarmAlarm(): void {
