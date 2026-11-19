@@ -15,6 +15,7 @@ import "abla/sys/linux/io"
 import "abla/sys/linux/process"
 import "abla/text"
 import "module_paths.ab"
+import "sourcemap.ab"
 
 val BOOTSTRAP_FIX_IMPORTS_ROUNDS = 4
 
@@ -137,16 +138,18 @@ fun bootstrapFixImportsCommand(arguments: array<string>): int {
     var source = ""
     var project = ""
     var dryRun = false
+    var prune = false
     var index = 0
     while (index < arguments.size) {
         val value = arguments[index]
         if (value == "--dry-run") dryRun = true
+        else if (value == "--prune") prune = true
         else if (value == "--project" && index + 1 < arguments.size) {
             project = arguments[index + 1]
             index = index + 1
         } else if (source == "" && !value.startsWith("-")) source = value
         else {
-            linuxPrintStandardError("usage: ablac fix-imports [file.ab | --project <dir>] [--dry-run]\n")
+            linuxPrintStandardError("usage: ablac fix-imports [file.ab | --project <dir>] [--prune] [--dry-run]\n")
             return 2
         }
         index = index + 1
@@ -156,6 +159,11 @@ fun bootstrapFixImportsCommand(arguments: array<string>): int {
     val temporary = linuxEnvironment("TMPDIR")
     val scratch = "${if (temporary.found && temporary.value != "") temporary.value else "/tmp"}/abla-fix-imports-${linuxProcessId()}"
     Path(scratch).createDirectories()
+    if (prune) {
+        val status = bootstrapFixImportsPruneCommand(source, project, root, scratch, dryRun)
+        Path(scratch).removeTree()
+        return status
+    }
     var added = 0
     val changed: Map<string, bool> = Map()
     var unresolved: array<string> = []
@@ -190,4 +198,192 @@ fun bootstrapFixImportsCommand(arguments: array<string>): int {
         "fix-imports: ${if (dryRun) "would add" else "added"} $added import(s) in ${changed.keys().size} file(s); ${unresolved.size} name(s) left unresolved\n"
     )
     if (unresolved.size > 0) 1 else 0
+}
+
+// `ablac fix-imports --prune`: removes the imports W_UNUSED_IMPORT names (module.ab's bootstrapUnusedImportWarnings),
+// within the project only. An import a package's entry neither uses nor passes on is listed, never removed (it may be
+// meant as `export import`), and a file with a `#compilerGrant` keeps its last import. After removing, it builds
+// again: a file whose build got worse (more errors naming it, or a build that passed and now fails) gets its imports
+// back, and that round repeats until nothing more is restored.
+
+class BootstrapFixImportsUnused(val file: string, val line: int, val text: string)
+
+class BootstrapFixImportsBuild(val status: int, val diagnostics: string)
+
+fun bootstrapFixImportsBuild(source: string, project: string, scratch: string, warn: bool): BootstrapFixImportsBuild {
+    val log = "$scratch/build.log"
+    val build = linuxCommand("/proc/self/exe").argument("build")
+    if (source != "") build.argument(source)
+    if (project != "") build.argument("--project").argument(project)
+    build.argument("-o").argument("$scratch/program").argument("--fast")
+    if (warn) build.argument("--warn-unused-imports")
+    build.output("/dev/null").errors(log)
+    val status = build.run()
+    BootstrapFixImportsBuild(status, Path(log).readText())
+}
+
+/** The prunable warnings of a build's diagnostics; the package-entry ones go to `listed`. */
+fun bootstrapFixImportsUnused(diagnostics: string, root: string, var listed: array<string>): array<BootstrapFixImportsUnused> {
+    val found: array<BootstrapFixImportsUnused> = []
+    val lines = diagnostics.split("\n")
+    var index = 0
+    while (index < lines.size) {
+        val line = lines[index]
+        index = index + 1
+        if (!line.startsWith("warning[W_UNUSED_IMPORT]: ")) continue
+        val open = line.indexOf("`")
+        if (open < 0) continue
+        val close = line.slice(open + 1, line.size).indexOf("`")
+        if (close < 0) continue
+        val text = line.slice(open + 1, open + 1 + close)
+        // The `-->` line after it gives the import's line.
+        var at = index
+        var file = ""
+        var number = 0
+        while (at < lines.size && at < index + 3 && file == "") {
+            val place = lines[at].trim()
+            if (place.startsWith("--> ")) {
+                val parts = place.slice(4, place.size).split(":")
+                if (parts.size >= 2) {
+                    file = parts[0]
+                    number = bootstrapSourceMapParseInt(parts[1], 0, parts[1].size)
+                }
+            }
+            at = at + 1
+        }
+        if (file == "" || number <= 0) continue
+        if (line.endsWith("(W_UNUSED_IMPORT entry)")) {
+            listed.append("$file: `$text` left: the package's entry neither uses nor passes it on (`export import` it, or remove it)")
+            continue
+        }
+        if (!bootstrapFixImportsAbsolute(file).startsWith("$root/")) continue
+        found.append(BootstrapFixImportsUnused(file, number, text))
+    }
+    found
+}
+
+/** How many error diagnostics name each file. */
+fun bootstrapFixImportsErrors(diagnostics: string): Map<string, int> {
+    val counts: Map<string, int> = Map()
+    var inError = false
+    for (line in diagnostics.split("\n")) {
+        if (line.startsWith("error")) inError = true
+        else if (line.startsWith("warning")) inError = false
+        val place = line.trim()
+        if (inError && place.startsWith("--> ")) {
+            val file = bootstrapFixImportsAbsolute(place.slice(4, place.size).split(":")[0])
+            counts.set(file, (counts.get(file) ?? 0) + 1)
+            inError = false
+        }
+    }
+    counts
+}
+
+fun bootstrapFixImportsErrorTotal(counts: Map<string, int>): int {
+    var total = 0
+    for (file in counts.keys()) total = total + (counts.get(file) ?? 0)
+    total
+}
+
+fun bootstrapFixImportsPruneCommand(source: string, project: string, root: string, scratch: string, dryRun: bool): int {
+    val baseline = bootstrapFixImportsBuild(source, project, scratch, true)
+    val before = bootstrapFixImportsErrors(baseline.diagnostics)
+    var listed: array<string> = []
+    val unused = bootstrapFixImportsUnused(baseline.diagnostics, root, listed)
+    // Per file: its original text, and the line numbers to remove.
+    val files: array<string> = []
+    val removals: array<array<int>> = []
+    for (entry in unused) {
+        var index = 0
+        while (index < files.size && files[index] != entry.file) index = index + 1
+        if (index == files.size) {
+            files.append(entry.file)
+            removals.append([])
+        }
+        removals[index].append(entry.line)
+    }
+    val originals: Map<string, string> = Map()
+    val pruned: Map<string, int> = Map()
+    var kept = 0
+    var file = 0
+    while (file < files.size) {
+        val path = Path(files[file])
+        val text = path.readText()
+        val lines = text.split("\n")
+        val drop: Map<int, bool> = Map()
+        for (number in removals[file]) {
+            if (number > lines.size) continue
+            val trimmed = lines[number - 1].trim()
+            if (!trimmed.startsWith("import ") || trimmed.contains(" as ")) continue
+            var wanted: string = ""
+            for (entry in unused) if (entry.file == files[file] && entry.line == number) wanted = entry.text
+            if (bootstrapFixImportSpec(trimmed) != bootstrapFixImportSpec(wanted)) continue
+            drop.set(number - 1, true)
+        }
+        var imports = 0
+        var lastDropped = -1
+        var index = 0
+        while (index < lines.size) {
+            val trimmed = lines[index].trim()
+            if (trimmed.startsWith("import ") || trimmed.startsWith("export import ")) imports = imports + 1
+            if (drop.has(index)) lastDropped = index
+            index = index + 1
+        }
+        // A file with a #compilerGrant keeps its last import: the grant names what the file's compile actions may do.
+        if (text.contains("#compilerGrant") && lastDropped >= 0 && drop.keys().size == imports) {
+            drop.remove(lastDropped)
+            kept = kept + 1
+            listed.append("${files[file]}:${lastDropped + 1}: `${lines[lastDropped].trim()}` kept: the last import of a file with a #compilerGrant")
+        }
+        if (drop.keys().size > 0) {
+            for (line in removals[file]) {
+                if (drop.has(line - 1))
+                    linuxPrintStandardOutput("${files[file]}:$line: ${if (dryRun) "would remove" else "removed"} ${lines[line - 1].trim()}\n")
+            }
+            pruned.set(files[file], drop.keys().size)
+            if (!dryRun) {
+                originals.set(files[file], text)
+                var output = ""
+                index = 0
+                while (index < lines.size) {
+                    if (!drop.has(index)) output = if (index + 1 < lines.size) "$output${lines[index]}\n" else "$output${lines[index]}"
+                    index = index + 1
+                }
+                path.writeTextAtomic(output)
+            }
+        }
+        file = file + 1
+    }
+    // Rebuild; give back the imports of any file whose build got worse.
+    var restored = 0
+    var round = 0
+    while (!dryRun && originals.keys().size > 0 && round < BOOTSTRAP_FIX_IMPORTS_ROUNDS) {
+        val after = bootstrapFixImportsBuild(source, project, scratch, false)
+        val counts = bootstrapFixImportsErrors(after.diagnostics)
+        val worse: array<string> = []
+        for (changed in originals.keys()) {
+            val absolute = bootstrapFixImportsAbsolute(changed)
+            if ((counts.get(absolute) ?? 0) > (before.get(absolute) ?? 0)) worse.append(changed)
+        }
+        // Worse, but no error names a pruned file: put them all back.
+        val failedNow = after.status != 0 && baseline.status == 0
+        val moreErrors = bootstrapFixImportsErrorTotal(counts) > bootstrapFixImportsErrorTotal(before)
+        if (worse.size == 0 && (failedNow || moreErrors)) for (changed in originals.keys()) worse.append(changed)
+        if (worse.size == 0) break
+        for (changed in worse) {
+            Path(changed).writeTextAtomic(originals.get(changed) ?? "")
+            linuxPrintStandardOutput("$changed: restored: its build got worse without the imports\n")
+            restored = restored + (pruned.get(changed) ?? 0)
+            pruned.remove(changed)
+            originals.remove(changed)
+        }
+        round = round + 1
+    }
+    var removed = 0
+    for (changed in pruned.keys()) removed = removed + (pruned.get(changed) ?? 0)
+    for (line in listed) linuxPrintStandardOutput("$line\n")
+    linuxPrintStandardOutput(
+        "fix-imports: ${if (dryRun) "would remove" else "removed"} $removed unused import(s) in ${pruned.keys().size} file(s); $restored restored, ${listed.size} left\n"
+    )
+    0
 }

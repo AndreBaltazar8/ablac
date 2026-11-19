@@ -2707,12 +2707,132 @@ fun bootstrapRelativeImportSpelling(importer: string, target: string): string {
     spelled
 }
 
+// W_UNUSED_IMPORT: the build's import edges and the modules whose uses were kept (bootstrapValidateStrictImports).
+var bootstrapUnusedImportEdges: array<BootstrapModuleAlias> = []
+val bootstrapUnusedImportChecked: Map<string, bool> = Map()
+
+/** Whether `importer`'s source invokes a subparser `target` registers (`#compilerRegisterSubparser("json", ...)` and
+ *  `$json`). */
+fun bootstrapUnusedImportSubparserUsed(importer: string, target: string): bool {
+    val registering = Path(target).readText()
+    val marker = "#compilerRegisterSubparser(\""
+    var at = registering.indexOf(marker)
+    if (at < 0) return false
+    val source = Path(importer).readText()
+    while (at >= 0) {
+        val rest = registering.slice(at + marker.size, registering.size)
+        val end = rest.indexOf("\"")
+        if (end > 0 && source.contains("\$" + rest.slice(0, end))) return true
+        val next = rest.indexOf(marker)
+        at = if (next < 0) -1 else at + marker.size + next
+    }
+    false
+}
+
+/** One `warning[W_UNUSED_IMPORT]` per import of a checked module through which it uses nothing: not the import's module
+ *  nor what that module passes on (`export import`, followed). Not for an import under an alias, an `export import`,
+ *  nor one of a module that registers a subparser (`$json` reaches it without a name). Uses are the strict scan's names
+ *  and sema's member and operator resolution, so a name a local shadows counts as a use: a missed warning, never a false
+ *  one from that. */
+fun bootstrapUnusedImportWarnings(): string {
+    var output = ""
+    val warned: Map<string, bool> = Map()
+    for (edge in bootstrapUnusedImportEdges) {
+        val importer = bootstrapGenericSourceFile(edge.importer)
+        if (!bootstrapUnusedImportChecked.has(importer) || edge.alias != "" || edge.exported || edge.contractOnly) continue
+        val key = "$importer\t${edge.target}"
+        if (warned.has(key)) continue
+        // The import's module and what it passes on.
+        val through: array<string> = [edge.target]
+        var scan = 0
+        while (scan < through.size) {
+            for (other in bootstrapUnusedImportEdges) {
+                if (other.exported && other.importer == through[scan]) {
+                    var known = false
+                    for (seen in through) if (seen == other.target) known = true
+                    if (!known) through.append(other.target)
+                }
+            }
+            scan = scan + 1
+        }
+        var used = false
+        for (module in through) {
+            if (bootstrapImportUses.has("$importer\t${bootstrapGenericSourceFile(module)}")) used = true
+        }
+        // A subparser the module registers and this one invokes (`$json { ... }`) uses it without a name.
+        if (!used) used = bootstrapUnusedImportSubparserUsed(edge.importer, edge.target)
+        // A module that matters by being loaded (an @export function, a top-level `#` action) is never unused.
+        if (used || bootstrapUnusedImportLoadMatters(edge.target)) continue
+        // Only the project's own modules: one reached by path from another project is that project's to warn about.
+        if (!bootstrapUnusedImportInProject(importer)) continue
+        warned.set(key, true)
+        val line = if (edge.written != "") "import \"${edge.written}\"" else bootstrapStrictImportLine(edge.importer, edge.target)
+        // A package's entry that imports a module it neither uses nor passes on: the package likely means to offer it.
+        val message = if (bootstrapUnusedImportIsPackageEntry(edge.importer))
+            "`$line` is neither used here nor passed on: `export import` it if the package means to offer it (W_UNUSED_IMPORT entry)"
+            else "nothing `$line` declares is used here"
+        output = "${output}warning[W_UNUSED_IMPORT]: $importer: $message\nsource[import]:$importer:${edge.begin}:${edge.end}\n"
+    }
+    output
+}
+
+// The entry the build started from (toolchain.ab), whose project bounds the modules warned about.
+var bootstrapUnusedImportEntry: string = ""
+
+fun bootstrapUnusedImportAbsolute(path: string): string =
+    bootstrapNormalizeModulePath(if (path.startsWith("/")) path else "${currentDirectory().text}/$path")
+
+/** The directory of the project the build is of, absolute: its abla.toml's directory, else the entry's. */
+fun bootstrapUnusedImportProjectRoot(): string {
+    if (bootstrapUnusedImportEntry == "") return ""
+    val manifest = bootstrapCompileManifestFor(bootstrapUnusedImportEntry)
+    bootstrapUnusedImportAbsolute(
+        if (manifest != "") Path(manifest).parent().text else Path(bootstrapUnusedImportEntry).parent().text
+    )
+}
+
+fun bootstrapUnusedImportInProject(module: string): bool {
+    val root = bootstrapUnusedImportProjectRoot()
+    root == "" || bootstrapUnusedImportAbsolute(module).startsWith("$root/")
+}
+
+/** Whether `module` does something by being loaded: an `@export` function or a top-level `#` compile action. */
+fun bootstrapUnusedImportLoadMatters(module: string): bool {
+    for (line in Path(module).readText().split("\n")) {
+        // A registered subparser matters only where `$name` is written (bootstrapUnusedImportSubparserUsed), and
+        // a grant is the declaring file's own permission.
+        if (line.startsWith("#compilerRegisterSubparser") || line.startsWith("#compilerGrant")) continue
+        if (line.startsWith("@export") || (line.size > 1 && line[0] == 35 && line[1] != 33)) return true
+    }
+    false
+}
+
+/** Whether `module` is its package's entry (the governing abla.toml's `entry`). */
+fun bootstrapUnusedImportIsPackageEntry(module: string): bool {
+    val manifest = bootstrapCompileManifestFor(module)
+    if (manifest == "") return false
+    var rest = ""
+    for (line in Path(manifest).readText().split("\n")) {
+        if (rest == "" && line.trim().startsWith("entry")) rest = line
+    }
+    if (rest == "") return false
+    val open = rest.indexOf("\"")
+    if (open < 0) return false
+    val close = rest.slice(open + 1, rest.size).indexOf("\"")
+    if (close < 0) return false
+    val entry = Path(manifest).parent().child(rest.slice(open + 1, open + 1 + close)).text
+    // A program's entry (it has `main`) is imported by nothing: its imports are its own.
+    bootstrapNormalizeModulePath(entry) == bootstrapNormalizeModulePath(module) &&
+        !Path(module).readText().contains("\nfun main")
+}
+
 fun bootstrapValidateStrictImports(
     aliases: array<BootstrapModuleAlias>,
     snapshots: array<BootstrapModuleSnapshot>,
     fullModules: Map<string, int>,
     contractRoots: Map<string, int>
 ): BootstrapImportAliasValidation {
+    if (bootstrapUnusedImportsWanted()) bootstrapUnusedImportEdges = aliases
     // (What sema checks once targets are known: none until this build's modules say.)
     bootstrapStrictVisibilityTable = bootstrapStrictVisibilityEmpty()
     bootstrapStrictIdentityModules = Map()
@@ -2831,11 +2951,25 @@ fun bootstrapValidateStrictImports(
             tableMemberVisible[module] = bootstrapStrictBits(
                 bootstrapStrictVisibleModules(module, edges, snapshots, asStrict, true)
             )
+            // W_UNUSED_IMPORT: what a module of the program (not the standard library's, not a package's vendored
+            // copy) uses, by declaring module.
+            val checkUses = bootstrapUnusedImportsWanted() &&
+                !snapshot.path.startsWith(bootstrapNormalizeModulePath(bootstrapStandardLibraryRoot())) &&
+                !snapshot.path.contains("/.abla/packages/")
+            val uses: array<bool> = if (checkUses) filledArray(snapshots.size, false) else []
             val findings = bootstrapStrictImportFindings(
                 snapshot, names, declaring, functionsOnly, classes, classMembers, visible, typeNames,
                 !fullModules.has(snapshot.path), !contractRoots.has(snapshot.path),
-                independent
+                independent, uses
             )
+            if (checkUses) {
+                bootstrapUnusedImportChecked.set(bootstrapGenericSourceFile(snapshot.path), true)
+                var used = 0
+                while (used < uses.size) {
+                    if (uses[used]) bootstrapImportUseRecord(snapshot.path, snapshots[used].path)
+                    used = used + 1
+                }
+            }
             for (finding in findings) {
                 if (!suggestedKnown[finding.declaring]) {
                     suggested[finding.declaring] = bootstrapStrictSuggestedImport(
@@ -3436,7 +3570,9 @@ fun bootstrapStrictImportFindings(
     contractOnly: bool,
     typesOnly: bool,
     // By module index: a generated independent entry (bootstrapIndependentEntryIdentity).
-    independent: array<bool> = []
+    independent: array<bool> = [],
+    // By module index, set for each visible module a name of this one resolves to (W_UNUSED_IMPORT); empty: not kept.
+    var uses: array<bool>
 ): array<BootstrapStrictImportFinding> {
     val result: array<BootstrapStrictImportFinding> = []
     val source = snapshot.source
@@ -3509,7 +3645,10 @@ fun bootstrapStrictImportFindings(
             if (known >= 0 && !own.contains(text) && !reported.contains(text)) {
                 var seen = false
                 for (candidate in declaring[known]) {
-                    if (visible[candidate]) seen = true
+                    if (visible[candidate]) {
+                        seen = true
+                        if (candidate < uses.size) uses[candidate] = true
+                    }
                 }
                 // A built-in (Cell, Shared, Mutex, Map, filledArray, move) is seen everywhere: where no module this
                 // one sees declares the name, it is the built-in, as in a flat module that doesn't import the
