@@ -300,6 +300,7 @@ test-serial: ablac
 	tools/test-compile-eval-jit.sh $(COMPILER)
 	tools/test-nested-block-types.sh $(COMPILER)
 	tools/test-compile-eval-units.sh $(COMPILER)
+	tools/test-import-hints.sh $(COMPILER)
 	tools/test-compile-eval-tier.sh $(COMPILER)
 	tools/test-compile-eval-cache-tier.sh $(COMPILER)
 	tools/test-compile-eval-shared-state.sh $(COMPILER) host

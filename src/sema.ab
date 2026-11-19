@@ -14899,6 +14899,11 @@ fun bootstrapInferCall(
                 "name.private:${expression.text}:$privateModule@${expression.begin}"
             else "call.target:${expression.text}"
         )
+        // A name the program does not see: where the standard library declares it (`println`, abla/io).
+        if (privateModule == "") {
+            val help = bootstrapStandardImportHelp(expression.text)
+            if (help != "") analyzer.diagnostics = "${analyzer.diagnostics}$help"
+        }
     }
     var argument = 0
     val resolvedArgumentTypes: array<string> = []
@@ -16084,6 +16089,151 @@ fun bootstrapInferAwait(
 
 // package.ab's bootstrapStandardLibraryRoot, without importing it: programs
 // that import sema alone (the compiler's own tests) don't have module.ab.
+// Which standard-library modules declare a top-level function or class (`println`, `Path`), or an extension method
+// (`string.repeat`): for the help line of a call that names something no imported module declares. Built on the first
+// such error and kept for the build, so a file with many of them reads the standard library once; a build without one
+// never reads it. The runtime's, the platforms' and the built-ins' modules are left out: a program does not import them.
+var bootstrapStandardIndexReady = false
+var bootstrapStandardIndex: Map<string, array<string>> = Map()
+
+fun bootstrapStandardIndexSkipped(module: string): bool =
+    module.startsWith("abla/runtime") || module.startsWith("abla/builtins") || module.contains("/platform") ||
+        module.startsWith("abla/compiler/bridge")
+
+fun bootstrapStandardIndexAdd(key: string, module: string): void {
+    val modules = bootstrapStandardIndex.get(key) ?? []
+    for (known in modules) if (known == module) return
+    modules.append(module)
+    bootstrapStandardIndex.set(key, modules)
+    return
+}
+
+// The declared name after `fun ` or `class ` at `at`: letters, digits, `_` and one `.` (an extension's receiver), after an
+// optional `<...>` of type parameters.
+fun bootstrapStandardIndexName(line: string, start: int): string {
+    var at = start
+    if (at < line.size && line[at] == 60) {
+        var depth = 0
+        while (at < line.size) {
+            if (line[at] == 60) depth = depth + 1
+            if (line[at] == 62) depth = depth - 1
+            at = at + 1
+            if (depth == 0) break
+        }
+        while (at < line.size && line[at] == 32) at = at + 1
+    }
+    val begin = at
+    while (at < line.size) {
+        val c = line[at]
+        if (!((c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95 || c == 46)) break
+        at = at + 1
+    }
+    line.slice(begin, at)
+}
+
+// Module -> the modules it re-exports (`export import "abla/sys/linux/fs"` in abla/fs): a name the re-exported module
+// declares is suggested through the module that re-exports it, which is the one programs import.
+var bootstrapStandardReexports: Map<string, array<string>> = Map()
+
+fun bootstrapStandardIndexModule(source: string, module: string): void {
+    for (line in source.split("\n")) {
+        if (line.startsWith("export import \"")) {
+            val target = line.slice(15, line.size)
+            val end = target.indexOf("\"")
+            if (end > 0) {
+                val targets = bootstrapStandardReexports.get(module) ?? []
+                targets.append(target.slice(0, end))
+                bootstrapStandardReexports.set(module, targets)
+            }
+            continue
+        }
+        var rest = line
+        for (modifier in ["trusted ", "inline ", "noinline ", "data ", "resource ", "value "]) {
+            if (rest.startsWith(modifier)) rest = rest.slice(modifier.size, rest.size)
+        }
+        val start = if (rest.startsWith("fun ")) 4 else if (rest.startsWith("class ")) 6 else -1
+        if (start < 0) continue
+        val name = bootstrapStandardIndexName(rest, start)
+        if (name == "" || name.startsWith("__") || name.startsWith(".") || name.endsWith(".")) continue
+        bootstrapStandardIndexAdd(name, module)
+    }
+    return
+}
+
+fun bootstrapStandardIndexWalk(directory: Path, module: string): void {
+    for (entry in directory.entries()) {
+        val name = entry.name()
+        if (entry.info().isDirectory()) {
+            bootstrapStandardIndexWalk(entry, if (module == "") name else "$module/$name")
+        } else if (name == "entry.ab" && module != "" && !bootstrapStandardIndexSkipped(module)) {
+            bootstrapStandardIndexModule(entry.readText(), module)
+        }
+    }
+    return
+}
+
+/** The standard-library modules that declare `name` (a function or class, or `receiver.method`), at most a few, in
+ *  path order; empty when none does. */
+fun bootstrapStandardDeclarationModules(name: string): array<string> {
+    if (!bootstrapStandardIndexReady) {
+        bootstrapStandardIndexReady = true
+        val root = Path(bootstrapHintStandardLibraryRoot())
+        if (root.child("abla").info().isDirectory()) bootstrapStandardIndexWalk(root.child("abla"), "abla")
+    }
+    // A module that another re-exports is suggested as the one that re-exports it (one level, the case in the
+    // standard library).
+    val declared = bootstrapStandardIndex.get(name) ?? []
+    val shown: array<string> = []
+    for (module in declared) {
+        var facade = ""
+        for (candidate in bootstrapStandardReexports.keys()) {
+            for (target in bootstrapStandardReexports.get(candidate) ?? []) {
+                if (target == module && facade == "") facade = candidate
+            }
+        }
+        val pick = if (facade != "") facade else module
+        var known = false
+        for (already in shown) if (already == pick) known = true
+        if (!known) shown.append(pick)
+    }
+    // In path order (bytewise), whatever order the directories were listed in.
+    val found: array<string> = []
+    for (module in shown) {
+        found.append(module)
+        var at = found.size - 1
+        while (at > 0 && bootstrapStandardIndexBefore(found[at], found[at - 1])) {
+            val swap = found[at - 1]
+            found[at - 1] = found[at]
+            found[at] = swap
+            at = at - 1
+        }
+    }
+    found
+}
+
+fun bootstrapStandardIndexBefore(a: string, b: string): bool {
+    var index = 0
+    while (index < a.size && index < b.size) {
+        if (a[index] != b[index]) return a[index] < b[index]
+        index = index + 1
+    }
+    a.size < b.size
+}
+
+/** The help line for a call of `name` that nothing visible declares: where the standard library declares it, or "". */
+fun bootstrapStandardImportHelp(name: string): string {
+    val modules = bootstrapStandardDeclarationModules(name)
+    if (modules.size == 0) return ""
+    if (modules.size == 1) return "help: `$name` is declared in ${modules[0]}; add `import \"${modules[0]}\"`\n"
+    var listed = ""
+    var index = 0
+    while (index < modules.size && index < 4) {
+        listed = listed + (if (index == 0) "" else ", ") + "`import \"${modules[index]}\"`"
+        index = index + 1
+    }
+    "help: `$name` is declared in ${modules.size} standard-library modules; add the one you mean: $listed\n"
+}
+
 fun bootstrapHintStandardLibraryRoot(): string {
     val stdlib = linuxEnvironment("ABLA_STDLIB")
     val sysroot = linuxEnvironment("ABLA_SYSROOT")
@@ -16123,6 +16273,11 @@ fun bootstrapStandardMethodModule(receiver: string, method: string): string {
             }
             index = index + 1
         }
+    }
+    // Any other receiver, or a method declared elsewhere: the standard library's index (the first module by path).
+    if (result == "") {
+        val modules = bootstrapStandardDeclarationModules("$surface.$method")
+        if (modules.size > 0) result = modules[0]
     }
     result
 }
