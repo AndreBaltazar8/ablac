@@ -30,7 +30,10 @@
 # Environment: DOC_EXAMPLES_FILTER (a substring of "doc:line" to run a subset,
 # which also skips the link check), DOC_EXAMPLES_LINKS_ONLY=1 (check links only),
 # DOC_EXAMPLES_KEEP=1 (keep the work directory), DOC_EXAMPLES_JOBS (examples
-# built at once, default the number of CPUs), ABLA_MAX_SECONDS (per program).
+# built at once, default the number of CPUs), ABLA_MAX_SECONDS (per program),
+# DOC_EXAMPLES_COMPILE_TIME=1 (only the examples with compile-time code: a `#`
+# site or a `compile` declaration; also skips the link check), DOC_EXAMPLES_WORK
+# (the work directory, default build/doc-examples-work).
 set -euo pipefail
 
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -45,7 +48,7 @@ if (($# == 0)); then
 fi
 
 # At the same path each run: a build's cache key names its source's.
-work=$project_root/build/doc-examples-work
+work=${DOC_EXAMPLES_WORK:-$project_root/build/doc-examples-work}
 rm -rf "$work"
 mkdir -p "$work"
 if [[ ${DOC_EXAMPLES_KEEP:-0} != 1 ]]; then
@@ -205,7 +208,7 @@ check_links() { # $1 = document, $2 = its name for messages
 
 for doc in "$@"; do
     name=${doc#"$project_root"/}
-    if [[ -z ${DOC_EXAMPLES_FILTER:-} ]]; then check_links "$doc" "$name"; fi
+    if [[ -z ${DOC_EXAMPLES_FILTER:-} && ${DOC_EXAMPLES_COMPILE_TIME:-0} != 1 ]]; then check_links "$doc" "$name"; fi
     [[ ${DOC_EXAMPLES_LINKS_ONLY:-0} == 1 ]] && continue
     doc_dir=$work/$(printf '%s' "$name" | tr '/.' '__')
     mkdir -p "$doc_dir/files" "$doc_dir/blocks"
@@ -234,6 +237,10 @@ for doc in "$@"; do
         fi
         [[ $language == abla ]] || continue
         if [[ -n ${DOC_EXAMPLES_FILTER:-} && $location != *"$DOC_EXAMPLES_FILTER"* ]]; then
+            continue
+        fi
+        if [[ ${DOC_EXAMPLES_COMPILE_TIME:-0} == 1 ]] &&
+            ! grep -qE '#[A-Za-z_(]|^[[:space:]]*compile (fun|val|var) ' "$doc_dir/blocks/$n"; then
             continue
         fi
         case ${mode:-run} in

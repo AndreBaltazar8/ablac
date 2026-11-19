@@ -836,13 +836,15 @@ Status, over the 371 cases:
   - 1 is a server that never exits, so it has no result to compare.
 - `interp` (the evaluator, chosen explicitly): 311 pass. The other 60:
   - the evaluator's limits, by design: 19 measure or reset the program heap the evaluator doesn't have, 16 run
-    past its step limit, 8 start threads whose bodies run only when awaited, 1 keeps real-time deadlines;
+    past its step limit, 8 start threads whose bodies run only when awaited, 1 keeps real-time deadlines, 2
+    read the compiled runtime's own boxed words (`__ablaRuntimeArrayGet`), which the evaluator's values don't
+    have, and 1 uses SIMD vectors (`abla/simd`, about 870 intrinsics over 20 lane types), which only native code
+    has;
   - 6 of the native tiers' kind (3 same panics, the process twice, the server), and one program whose own `#`
     recursion is deeper than the evaluator's stack;
-  - 8 the evaluator can't build, each with its reason in `expected-pass.txt`:
+  - 5 the evaluator can't build, each with its reason in `expected-pass.txt`:
     - the compiler run under `#` passing its 4096 MB memory limit (2);
     - the step limit inside a longer build (3);
-    - word-level runtime values (2) and SIMD vectors (1);
   - 1 that differs: a forked child, a copy of the compiler running the evaluator, runs out of memory.
 
   All of these but the 6 of the native tiers' kind pass under `auto` and `jit`, which run that code natively.
