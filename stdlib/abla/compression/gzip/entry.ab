@@ -8,29 +8,58 @@ import "abla/unsafe/memory/raw"
 class DeflateBitWriter(
     val output: ByteBuffer,
     var bits: int,
-    var count: int
+    var count: int,
+    var memory: int,
+    var length: int
 )
 
-private fun deflateBitWriter(): DeflateBitWriter =
-    DeflateBitWriter(byteBuffer(), 0, 0)
+// At run time the bytes go to native memory a 32-bit word at a time (capacity for the worst case, `capacity` bytes of input and a margin for the block headers, is reserved by the
+// caller); the compile-time evaluator keeps the byte buffer.
+private trusted fun deflateBitWriter(capacity: int): DeflateBitWriter {
+    val memory = if (ablaAtCompileTime()) 0 else ablaUnsafePointerAddress(ablaUnsafeAllocate(capacity + capacity / 512 + 512))
+    DeflateBitWriter(byteBuffer(), 0, 0, memory, 0)
+}
 
-/** Appends the low `count` bits of `value` (at most 32), least significant first, as DEFLATE packs them: whole bytes leave at once. */
-fun DeflateBitWriter.append(value: int, count: int): void {
+/** Appends the low `count` bits of `value` (at most 32), least significant first, as DEFLATE packs them. */
+private trusted fun DeflateBitWriter.append(value: int, count: int): void {
     this.bits = this.bits | ((value & ((1 << count) - 1)) << this.count)
     this.count = this.count + count
-    while (this.count >= 8) {
-        this.output.appendByteValue(this.bits & 255)
-        this.bits = this.bits >>> 8
-        this.count = this.count - 8
+    if (this.memory == 0) {
+        while (this.count >= 8) {
+            this.output.appendByteValue(this.bits & 255)
+            this.bits = this.bits >>> 8
+            this.count = this.count - 8
+        }
+    } else if (this.count >= 32) {
+        ablaUnsafeStoreU32(nativePointerFromAddress(this.memory + this.length), this.bits & 4294967295)
+        this.length = this.length + 4
+        this.bits = this.bits >>> 32
+        this.count = this.count - 32
     }
     return
 }
 
-fun DeflateBitWriter.finish(): string {
-    if (this.count > 0) this.output.appendByteValue(this.bits & 255)
-    this.bits = 0
-    this.count = 0
-    this.output.toText()
+/** The bits not yet a whole byte, padded to one (a stored block starts on a byte). */
+private fun DeflateBitWriter.alignBits(): int = this.count & 7
+
+private trusted fun DeflateBitWriter.finish(): string {
+    if (this.memory == 0) {
+        if (this.count > 0) this.output.appendByteValue(this.bits & 255)
+        this.bits = 0
+        this.count = 0
+        return this.output.toText()
+    }
+    while (this.count > 0) {
+        ablaUnsafeStoreU8(nativePointerFromAddress(this.memory + this.length), this.bits & 255)
+        this.length = this.length + 1
+        this.bits = this.bits >>> 8
+        this.count = if (this.count > 8) this.count - 8 else 0
+    }
+    val text = nativeByteBuffer(this.length + 1)
+    ablaUnsafeCopyMemory(ablaUnsafePointerAddress(text.pointerAt(0)), this.memory, this.length)
+    ablaUnsafeFree(nativePointerFromAddress(this.memory))
+    this.memory = 0
+    text.adoptString(this.length)
 }
 
 private fun deflateReverseBits(value: int, count: int): int {
@@ -102,8 +131,7 @@ private fun deflateMatchToken(length: int, distance: int): int = 8388608 | ((len
  *  classic tree (the symbols sorted by frequency, then the two lightest nodes joined again and again from the two queues of leaves and of joined nodes), and the
  *  frequencies halved (but kept above zero) until the tree fits the limit. */
 private fun deflateCodeLengths(freq: array<int>, count: int, limit: int): array<int> {
-    val lengths: array<int> = []
-    for (i in 0 until count) lengths.append(0)
+    val lengths = filledArray(count, 0)
     val symbols: array<int> = []
     for (i in 0 until count) if (freq[i] > 0) symbols.append(i)
     val used = symbols.size
@@ -112,8 +140,8 @@ private fun deflateCodeLengths(freq: array<int>, count: int, limit: int): array<
         lengths[symbols[0]] = 1
         return lengths
     }
-    val weights: array<int> = []
-    for (i in 0 until count) weights.append(freq[i])
+    val weights = filledArray(count, 0)
+    for (i in 0 until count) weights[i] = freq[i]
     var fits = false
     while (!fits) {
         // The used symbols in order of weight (insertion sort: few symbols, nearly sorted runs).
@@ -160,8 +188,7 @@ private fun deflateCodeLengths(freq: array<int>, count: int, limit: int): array<
             made = made + 1
         }
         // Depths from the root down: a node's parent has a larger index.
-        val depth: array<int> = []
-        for (i in 0 until weight.size) depth.append(0)
+        val depth = filledArray(weight.size, 0)
         var top = weight.size - 2
         while (top >= 0) {
             depth[top] = depth[parent[top]] + 1
@@ -181,24 +208,19 @@ private fun deflateCodeLengths(freq: array<int>, count: int, limit: int): array<
 
 /** The canonical codes of RFC 1951 section 3.2.2 for `lengths`, each already reversed for the LSB-first bit packing. */
 private fun deflateCodes(lengths: array<int>, count: int): array<int> {
-    val lengthCount: array<int> = []
-    for (i in 0 until 16) lengthCount.append(0)
+    val lengthCount = filledArray(16, 0)
     for (i in 0 until count) lengthCount[lengths[i]] = lengthCount[lengths[i]] + 1
     lengthCount[0] = 0
-    val next: array<int> = []
+    val next = filledArray(16, 0)
     var code = 0
-    for (bits in 0 until 16) {
-        if (bits == 0) next.append(0)
-        else {
-            code = (code + lengthCount[bits - 1]) << 1
-            next.append(code)
-        }
+    for (bits in 1 until 16) {
+        code = (code + lengthCount[bits - 1]) << 1
+        next[bits] = code
     }
-    val codes: array<int> = []
+    val codes = filledArray(count, 0)
     for (i in 0 until count) {
-        if (lengths[i] == 0) codes.append(0)
-        else {
-            codes.append(deflateReverseBits(next[lengths[i]], lengths[i]))
+        if (lengths[i] != 0) {
+            codes[i] = deflateReverseBits(next[lengths[i]], lengths[i])
             next[lengths[i]] = next[lengths[i]] + 1
         }
     }
@@ -206,8 +228,9 @@ private fun deflateCodes(lengths: array<int>, count: int): array<int> {
 }
 
 private fun deflateFixedLengths(): array<int> {
-    val lengths: array<int> = []
-    for (i in 0 until 288) lengths.append(if (i < 144) 8 else if (i < 256) 9 else if (i < 280) 7 else 8)
+    val lengths = filledArray(288, 8)
+    for (i in 144 until 256) lengths[i] = 9
+    for (i in 256 until 280) lengths[i] = 7
     lengths
 }
 
@@ -216,10 +239,8 @@ private fun deflateFixedLengths(): array<int> {
 private trusted fun deflateWriteBlock(var writer: DeflateBitWriter, input: string, start: int, covered: int, tokenBase: int, tokenCount: int, tokens: array<int>, last: bool,
     lengthCode: array<int>): void {
     // The frequencies, and the extra bits the tokens carry whatever the codes are.
-    val litFreq: array<int> = []
-    for (i in 0 until 286) litFreq.append(0)
-    val distFreq: array<int> = []
-    for (i in 0 until 30) distFreq.append(0)
+    val litFreq = filledArray(286, 0)
+    val distFreq = filledArray(30, 0)
     var extraBits = 0
     for (index in 0 until tokenCount) {
         val token = if (tokenBase != 0) ablaUnsafeLoadU32(nativePointerFromAddress(tokenBase + index * 4)) else tokens[index]
@@ -301,8 +322,7 @@ private trusted fun deflateWriteBlock(var writer: DeflateBitWriter, input: strin
         }
         at = at + run
     }
-    val clFreq: array<int> = []
-    for (i in 0 until 19) clFreq.append(0)
+    val clFreq = filledArray(19, 0)
     for (symbol in clSymbols) clFreq[symbol] = clFreq[symbol] + 1
     val clLengths = deflateCodeLengths(clFreq, 19, 7)
     var hclen = 19
@@ -328,7 +348,7 @@ private trusted fun deflateWriteBlock(var writer: DeflateBitWriter, input: strin
             blocks = blocks - 1
             writer.append(if (blocks == 0) lastBit else 0, 1)
             writer.append(0, 2)
-            if (writer.count > 0) writer.append(0, 8 - writer.count)
+            if (writer.alignBits() > 0) writer.append(0, 8 - writer.alignBits())
             writer.append(size, 16)
             writer.append(65535 - size, 16)
             for (i in 0 until size) writer.append(input[start + offset + i], 8)
@@ -337,18 +357,17 @@ private trusted fun deflateWriteBlock(var writer: DeflateBitWriter, input: strin
         }
         return
     }
-    val litCodeLengths: array<int> = []
+    val litCodeLengths = filledArray(288, 0)
     var litCodes: array<int> = []
     var distCodes: array<int> = []
-    val distCodeLengths: array<int> = []
+    val distCodeLengths = filledArray(30, 0)
     if (fixedBits <= dynamicBits) {
         writer.append(lastBit, 1)
         writer.append(1, 2)
-        for (i in 0 until 288) litCodeLengths.append(fixedLengths[i])
+        for (i in 0 until 288) litCodeLengths[i] = fixedLengths[i]
         litCodes = deflateCodes(fixedLengths, 288)
-        val fixedDistance: array<int> = []
-        for (i in 0 until 30) fixedDistance.append(5)
-        for (i in 0 until 30) distCodeLengths.append(5)
+        val fixedDistance = filledArray(30, 5)
+        for (i in 0 until 30) distCodeLengths[i] = 5
         distCodes = deflateCodes(fixedDistance, 30)
         // Under the fixed code the distance codes are 5 bits as given, not canonical codes of a code of 30: they are the code number itself, reversed.
         for (i in 0 until 30) distCodes[i] = deflateReverseBits(i, 5)
@@ -367,8 +386,8 @@ private trusted fun deflateWriteBlock(var writer: DeflateBitWriter, input: strin
             else if (symbol == 17) writer.append(clExtra[i], 3)
             else if (symbol == 18) writer.append(clExtra[i], 7)
         }
-        for (i in 0 until 286) litCodeLengths.append(litLengths[i])
-        for (i in 0 until 30) distCodeLengths.append(distLengths[i])
+        for (i in 0 until 286) litCodeLengths[i] = litLengths[i]
+        for (i in 0 until 30) distCodeLengths[i] = distLengths[i]
         litCodes = deflateCodes(litLengths, 286)
         distCodes = deflateCodes(distLengths, 30)
     }
@@ -405,7 +424,7 @@ private fun deflateHash(a: int, b: int, c: int, mask: int): int = (((a << 10) ^ 
  *  (lazy matching: zlib's level 6), and every block of up to 16383 tokens written as the smallest of a stored, a fixed-code and a dynamic-code block. The work is
  *  bounded: at most `searchLimit` (at most 4096) candidates of a chain are compared at each position, and a match of 128 bytes or more ends the search. */
 private trusted fun deflateCompress(input: string, searchLimit: int): string {
-    val writer = deflateBitWriter()
+    val writer = deflateBitWriter(input.size)
     val size = input.size
     val lengthCode: array<int> = []
     for (length in 0 until 259) {
@@ -473,6 +492,9 @@ private trusted fun deflateCompress(input: string, searchLimit: int): string {
                 if (ablaAtCompileTime()) {
                     while (matched < maximum && input[position + matched] == input[candidate + matched]) matched = matched + 1
                 } else {
+                    // Eight bytes at a time while they agree, then byte by byte for the rest (the same length either way).
+                    while (matched + 8 <= maximum && ablaUnsafeLoadI64(nativePointerFromAddress(data + position + matched)) ==
+                        ablaUnsafeLoadI64(nativePointerFromAddress(data + candidate + matched))) matched = matched + 8
                     while (matched < maximum && ablaUnsafeLoadU8(nativePointerFromAddress(data + position + matched)) ==
                         ablaUnsafeLoadU8(nativePointerFromAddress(data + candidate + matched))) matched = matched + 1
                 }
