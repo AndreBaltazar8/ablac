@@ -22,6 +22,33 @@ export ABLA_JIT_CACHE=0 ABLA_LIVE_TRACE=1
 limited() {
     if command -v timeout > /dev/null; then timeout 300 "$@"; else ABLA_MAX_SECONDS=300 tools/run-limited.sh "$@"; fi
 }
+# A run killed by a signal: the step it was in (the program prints each check as it passes, so it died in the one
+# after the last), and on macOS the crash report's exception and faulting thread (ReportCrash writes it a moment
+# later, into ~/Library/Logs/DiagnosticReports).
+started=$out/started
+died() {   # died NAME STATUS OUTPUT
+    local name=$1 status=$2 output=$3 last report
+    ((status > 128 && status < 160)) || return 0
+    last=$(grep ': ok' "$output" | tail -n 1 | sed 's/: ok.*//' || true)
+    printf 'live jit (%s): killed by signal %s in the step after the check "%s"\n' "$name" "$((status - 128))" \
+        "${last:-(none passed)}" >&2
+    [[ $(uname -s) == Darwin ]] || return 0
+    report=
+    for _ in $(seq 30); do
+        report=$(find "$HOME/Library/Logs/DiagnosticReports" -name "*.ips" -newer "$started" 2> /dev/null | xargs ls -t 2> /dev/null | head -n 1 || true)
+        [[ -n $report ]] && break
+        sleep 1
+    done
+    if [[ -z $report ]]; then
+        echo "live jit ($name): no crash report" >&2
+        return 0
+    fi
+    echo "live jit ($name): crash report $report" >&2
+    grep -A 8 '"exception"' "$report" >&2 || true
+    sed -n '/"triggered" : true/,/"triggered"/p' "$report" | head -n 200 >&2 || true
+    grep -A 40 '"threadState"' "$report" | grep -E '"(pc|lr|far|esr)"' -A 1 >&2 || true
+}
+touch "$started"
 program=tests/cases/live-jit/calls.ab
 run() {
     local name=$1
@@ -31,6 +58,7 @@ run() {
     if [[ $status -ne 42 ]]; then
         printf 'live jit (%s): exit status %s (42 expected)\n' "$name" "$status" >&2
         head -n 20 "$out/$name.out" "$out/$name.err" >&2
+        died "$name" "$status" "$out/$name.out"
         exit 1
     fi
 }
@@ -76,6 +104,7 @@ for profile in o1 fast; do
         printf 'live jit (reload, %s): exit status %s (42 expected)\n' "$profile" "$status" >&2
         cat "$out/reload-$profile.out" >&2
         head -n 30 "$out/reload-$profile.err" >&2
+        died "reload, $profile" "$status" "$out/reload-$profile.out"
         exit 1
     fi
     notes=$(grep -c "^ablac run: the reloads of this live run have added " "$out/reload-$profile.err" || true)
@@ -87,6 +116,46 @@ for profile in o1 fast; do
         exit 1
     fi
 done
+# ABLA_LIVE_JIT_REPEAT=n: the --o1 reload n times more, for a failure that comes now and then (a Mac run trapped
+# in the new lambda's call, run 44586994389); each failure says where, and on macOS a run under lldb follows it
+# (the backtrace, registers and code at the stop).
+repeat=${ABLA_LIVE_JIT_REPEAT:-0}
+[[ $repeat =~ ^[0-9]+$ ]] || { echo "live jit: ABLA_LIVE_JIT_REPEAT must be a count, got $repeat" >&2; exit 1; }
+if ((repeat > 0)); then
+    failed=0
+    for round in $(seq "$repeat"); do
+        cp tests/cases/live-jit/reload.ab "$reload"
+        touch "$started"
+        status=0
+        limited "$compiler" run --o1 --live "$reload" -- "$reload" \
+            > "$out/repeat.out" 2> "$out/repeat.err" || status=$?
+        [[ $status -eq 42 ]] && ! grep -q ': FAIL' "$out/repeat.out" && continue
+        failed=$((failed + 1))
+        printf 'live jit (repeat %s): exit status %s (42 expected)\n' "$round" "$status" >&2
+        grep -v ': ok' "$out/repeat.out" >&2 || true
+        died "repeat $round" "$status" "$out/repeat.out"
+        cp "$out/repeat.out" "$out/repeat-$round.out"
+        cp "$out/repeat.err" "$out/repeat-$round.err"
+    done
+    echo "live jit: the reload again $repeat times, $failed failed"
+    if ((failed > 0)) && [[ $(uname -s) == Darwin ]] && command -v lldb > /dev/null; then
+        binary=$compiler
+        [[ -f $compiler.bin ]] && binary=$compiler.bin
+        for round in $(seq "$repeat"); do
+            cp tests/cases/live-jit/reload.ab "$reload"
+            limited lldb --batch -o run \
+                -k 'thread backtrace' -k 'register read' -k 'disassemble --pc --count 40' \
+                -k 'disassemble --start-address $pc-160 --count 48' -k 'image lookup --address $pc' -k kill \
+                -- "$binary" run --o1 --live "$reload" -- "$reload" > "$out/lldb.out" 2>&1 || true
+            if grep -q 'stop reason' "$out/lldb.out" && ! grep -q 'exited with status = 42' "$out/lldb.out"; then
+                echo "live jit (repeat under lldb, round $round):" >&2
+                grep -v ': ok (' "$out/lldb.out" | tail -n 400 >&2
+                break
+            fi
+        done
+    fi
+    ((failed == 0)) || exit 1
+fi
 # A live run from the object cache (stage 2c): the first run compiles and keeps the object with the
 # compiler's record (<object>.live); the second, on a fresh copy, must start from the cache and still reload.
 for round in compile cached; do
@@ -98,6 +167,7 @@ for round in compile cached; do
         printf 'live jit (reload, %s): exit status %s (42 expected)\n' "$round" "$status" >&2
         cat "$out/reload-$round.out" >&2
         head -n 30 "$out/reload-$round.err" >&2
+        died "reload, $round" "$status" "$out/reload-$round.out"
         exit 1
     fi
 done
@@ -115,6 +185,7 @@ if [[ $status -ne 42 ]] || grep -q ": FAIL" "$out/refuse.out"; then
     printf 'live jit (refusals): exit status %s (42 expected)\n' "$status" >&2
     cat "$out/refuse.out" >&2
     head -n 30 "$out/refuse.err" >&2
+    died refusals "$status" "$out/refuse.out"
     exit 1
 fi
 cp tests/cases/live-jit/reload.ab "$reload"
