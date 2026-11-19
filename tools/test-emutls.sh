@@ -68,7 +68,21 @@ else
         [[ $(uname -s) != Darwin ]] || library=foreign-$mode.dylib
         status=0
         result=$("$root/tools/run-limited.sh" "$out/foreign-driver" "$PWD/$out/$library" 200 8 "$foreign_allowed" 2>&1) || status=$?
-        [[ $status -eq 0 ]] || { echo "emutls (foreign threads, $mode): exit $status: $result" >&2; exit 1; }
+        if [[ $status -ne 0 ]]; then
+            echo "emutls (foreign threads, $mode): exit $status: $result" >&2
+            # The driver's trap handler names the faulting address and the calls above it as offsets into their image: the
+            # offsets into the library become the symbol before them (the library's symbol table, nm -n).
+            while read -r offset; do
+                best=
+                while read -r address _ name; do
+                    [[ -n $name && $address =~ ^[0-9a-fA-F]+$ ]] || continue
+                    (( 16#$address <= offset )) || break
+                    best=$name
+                done < <(nm -n "$out/$library" 2> /dev/null)
+                echo "emutls: $library+$offset is in ${best:-?}" >&2
+            done < <(printf '%s\n' "$result" | sed -n "s/^emutls-trap: [a-z]* offset \(0x[0-9a-f]*\) in .*\/$library .*/\1/p")
+            exit 1
+        fi
         printf '%s\n' "$result"
         if [[ $(uname -s) == Linux && $mode == release ]]; then
             imports=$(nm -D --undefined-only "$out/$library")

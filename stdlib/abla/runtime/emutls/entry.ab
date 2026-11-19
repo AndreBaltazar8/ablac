@@ -39,6 +39,15 @@ import "abla/unsafe/native"
 import "abla/unsafe/memory/raw"
 
 private noescape extern:"intrinsic" fun ablaHostIsMacOS(): bool
+private trusted noescape extern:"intrinsic" fun ablaDarwinSyscall(
+    number: int,
+    argument0: int,
+    argument1: int,
+    argument2: int,
+    argument3: int,
+    argument4: int,
+    argument5: int
+): int
 private trusted noescape extern:"intrinsic" fun ablaLinuxSyscall(
     number: int,
     argument0: int,
@@ -71,6 +80,50 @@ private @runtimeImplementation trusted fun emutlsRecordCell(): int =
 // in the compiler's imports, where an internal one is relaxed to a direct access.
 private @runtimeImplementation trusted fun emutlsTableCellAddress(): int = nativeThreadLocalBytes("\x00\x00\x00\x00\x00\x00\x00\x00")
 
+// The three ways this module traps, each in a function of its own (never inlined) that says which one on standard error first
+// (the trap alone is a SIGILL and no word: macOS Intel CI, foreign-thread test, 2026-11-19). `code` is the failing call's result.
+private @runtimeImplementation trusted fun emutlsSay(message: int, length: int, code: int): void {
+    val digits = emutlsKeyScratch()
+    var remaining = if (code < 0) 0 - code else code
+    var count = 0
+    // The code's decimal digits, at most four, after the message (the scratch word holds them: this thread is going to trap).
+    ablaRuntimeStoreI64(digits, 0)
+    ablaRuntimeStoreU8(digits + 7, 10)
+    while (count < 4 && (remaining > 0 || count == 0)) {
+        ablaRuntimeStoreU8(digits + 3 - count, 48 + remaining % 10)
+        remaining = remaining / 10
+        count = count + 1
+    }
+    if (ablaHostIsMacOS()) {
+        ablaDarwinSyscall(4, 2, message, length, 0, 0, 0)
+        ablaDarwinSyscall(4, 2, digits + 4 - count, count, 0, 0, 0)
+        ablaDarwinSyscall(4, 2, digits + 7, 1, 0, 0, 0)
+    } else {
+        ablaLinuxSyscall(1, 2, message, length, 0, 0, 0)
+        ablaLinuxSyscall(1, 2, digits + 4 - count, count, 0, 0, 0)
+        ablaLinuxSyscall(1, 2, digits + 7, 1, 0, 0, 0)
+    }
+    return
+}
+
+private @noinline @runtimeImplementation trusted fun emutlsTrapKeyCreate(code: int): void {
+    emutlsSay(__ablaRuntimeWord0("emutls trap: pthread_key_create returned "), 41, code)
+    ablaRuntimeTrap()
+    return
+}
+
+private @noinline @runtimeImplementation trusted fun emutlsTrapAllocate(): void {
+    emutlsSay(__ablaRuntimeWord0("emutls trap: no memory for a table or a variable "), 49, 0)
+    ablaRuntimeTrap()
+    return
+}
+
+private @noinline @runtimeImplementation trusted fun emutlsTrapSetSpecific(code: int): void {
+    emutlsSay(__ablaRuntimeWord0("emutls trap: pthread_setspecific returned "), 42, code)
+    ablaRuntimeTrap()
+    return
+}
+
 // The thread-specific key whose destructor ends a thread's table, made by the first caller; the others wait for it (a few
 // instructions).
 private @runtimeImplementation trusted fun emutlsKey(): int {
@@ -79,7 +132,8 @@ private @runtimeImplementation trusted fun emutlsKey(): int {
     if (state == 0) {
         if (ablaRuntimeAtomicCompareExchangeI64(cell, 0, -1) == 0) {
             val scratch = emutlsKeyScratch()
-            if (pthread_key_create(scratch, nativeFunctionAddress(emutlsKeyDestroy)) != 0) ablaRuntimeTrap()
+            val created = pthread_key_create(scratch, nativeFunctionAddress(emutlsKeyDestroy))
+            if (created != 0) emutlsTrapKeyCreate(created)
             ablaRuntimeAtomicStoreI64(cell, ablaRuntimeLoadI64(scratch) + 1)
         }
         state = ablaRuntimeAtomicLoadI64(cell)
@@ -102,7 +156,7 @@ private @runtimeImplementation trusted fun emutlsKeyDestroy(value: int): void {
 
 private @runtimeImplementation trusted fun emutlsAllocate(size: int): int {
     val address = ablaRuntimePointerAddress(ablaUnsafeAllocate(size))
-    if (address == 0) ablaRuntimeTrap()
+    if (address == 0) emutlsTrapAllocate()
     address
 }
 
@@ -276,7 +330,10 @@ trusted fun emutlsGetAddress(control: int): int {
         ablaRuntimeStoreI64(cell, table)
         // The table is the key's value, so the destructor that runs as the thread ends frees this one (a grown table replaces
         // the old value).
-        if (ablaHostIsMacOS() && pthread_setspecific(emutlsKey(), table) != 0) ablaRuntimeTrap()
+        if (ablaHostIsMacOS()) {
+            val stored = pthread_setspecific(emutlsKey(), table)
+            if (stored != 0) emutlsTrapSetSpecific(stored)
+        }
         if (first) {
             if (!ablaHostIsMacOS()) emutlsRegister(table)
         } else if (!ablaHostIsMacOS()) {
