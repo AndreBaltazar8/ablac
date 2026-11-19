@@ -34,7 +34,9 @@ for mode in release fast; do
     done
     status=0
     result=$("$root/tools/run-limited.sh" "$out/fault.$mode" 2>&1) || status=$?
-    [[ $status -ne 0 && $result == *"before 1"* && $result != *"after"* ]] \
+    # The program's own lines, not the whole result: run-limited's crash line names the script's path, and a checkout whose
+    # path has the word "after" in it (a worktree called release-after) must not look like the program printed `after`.
+    [[ $status -ne 0 ]] && grep -qx 'before 1' <<<"$result" && ! grep -q '^after ' <<<"$result" \
         || fail "fault ($mode): a store into a frozen object did not fault (status $status): $result"
     echo "fault ($mode): the store faulted ($status)"
 done
