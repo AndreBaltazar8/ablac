@@ -320,22 +320,6 @@ Collection has two modes:
   over less garbage, so each pause is shorter. Run with `ABLA_GC_STRESS=1` to
   collect at every safe point instead
   ([debugging.md](debugging.md#collector-stress-abla_gc_stress1)).
-  `ABLA_GC_WORKERS=<n>` (2 to 8, read once at startup; unset, 0 or 1 is the serial collector, which is what a
-  program gets by default) runs the **mark** of each collection on n threads: the collecting thread and n - 1 it
-  starts for the mark and joins at its end. It parallelizes only the mark, and only across objects: each thread
-  claims an object by a compare-and-swap of its state word, keeps its own stack of claimed objects and trades work
-  with the others through a shared pool, so a graph of many objects divides well, while one very large array or
-  one long chain is still scanned by a single thread. The sweep (the pass that frees what the mark did not reach
-  and compacts the allocation registry) is still serial, and so is the root scan. The parallel mark needs the
-  page directory for every pointer, so it does not use the lazy registry lookup a serial collection tries first.
-  Measured on the editor's edit loop over the compiler's own source (16 collections, 3 to 6 runs each, a machine
-  under load): the collections' total pause 3.9 s serial, 3.1 s at 2 threads, 2.7 s at 4 and 2.5 s at 8
-  (the mark itself about 2.1 s, 0.9 s at 4 threads), the loop's wall time 22.9 s, 22.1, 21.4 and 21.0, its user
-  CPU +4% at 4 threads and +8% at 8; an HTTP event server whose live data is one 800,000-element array gained
-  nothing and spent 8 to 10% more CPU. It is off by default until the large-array split is done (TODO.md);
-  `ABLA_GC_TRACE=1` adds, to each parallel collection, lines with how
-  many objects each thread traced, how often it took from and gave to the shared pool and how often it slept
-  waiting for work.
 - **Manual collection** (the default for wasm and freestanding targets, and
   for modules entered through their exports). Only an explicit
   `memoryCollect()` frees cyclic garbage. The compiler roots only the

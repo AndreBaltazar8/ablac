@@ -1134,17 +1134,6 @@ mmap form) apply there.
   The editor's freezes are a smaller slice of the same loop: 278 of them, 1.9 s (`gc: freeze <n> ms` in the trace), each building the page directory over
   the whole registry. A freeze that found blocks from the registry alone, as a collection does, was tried and gained nothing: every freeze met an interior
   pointer (a slice of the source text) within its first blocks and built the directory anyway. A directory kept between freezes is the open way.
-- [ ] **The parallel mark (`ABLA_GC_WORKERS=n`) is off by default; a condition before it is on (2026-11-19, ablac-4e).** The mark of a
-  collection runs on n threads (2 to 8; docs/standard-library.md has the measurements: the editor's edit loop pause 3.9 s serial, 2.7 s at 4 threads,
-  2.5 s at 8; its wall time 22.9 s to 21.4 and 21.0; tools/test-gc-parallel.sh, with the claim and the frozen group's flag mutation-checked).
-  *Split a large array's scan across threads.* A collection whose live data is one huge array (an HTTP server holding an 800,000-element array: 54
-  collections, pause 1.52 s serial and 1.50 to 1.63 s at 2, 4 and 8 threads, CPU +8 to 10%) gains nothing, and a server must not be slower with
-  workers on: the scan of one array is one thread's work. Push index ranges of a large array, not the array, onto the work list. The sweep (the
-  in-place registry compaction) is not parallel either, and is now more than half of a pause. *Explained (not a condition any more):* the first matrix's
-  three runs at 2 threads that took 38 to 42 s wall (user CPU 37 to 40 s, against 20 s serial) were the process running on this machine's efficiency
-  cores (16 to 31 of its hybrid CPU), not the parallel mark: pinned to cores 16-23 the serial run takes 37.3 s (user 34.6 s) and 2 threads 35.6 s,
-  pinned to cores 0-7 24.9 s and 22.3 s (`taskset`, ABLA_GC_TRACE pauses 6.0 s and 5.1 s against 4.6 s and 2.9 s). Timing runs on this machine
-  must be pinned to one kind of core. (The gate's slot 3 is cores 16-23.)
 - [ ] **Deferred: `where` clauses and `const` type parameters (André's decision #63).** Both stay reserved
   (`E_PARSE_NOT_YET_SUPPORTED`); no code asks for either. `where` would be sugar over the existing bounds
   (about 110 lines: parser, formatter, tests, docs) and must never make a class's methods conditional. `const`
