@@ -952,3 +952,105 @@ private @noinline trusted fun aesGcmDecryptWork(key: string, nonce: string, ciph
     ablaUnsafeFree(aesPointer(counter))
     CryptoResult(buffer.adoptString(size), true, "")
 }
+
+// --- AES-GCM with a key kept by the caller: hardware only, as raw memory ----------------------------------------------
+// The expansion of the key (the bitsliced schedule: most of the cost of a short record) done once, for a caller that has many records under one key and owns its
+// lifetime (the TLS record layer, one key per direction): `aesGcmKeyNew` gives the memory (0 where there are no AES instructions), `aesGcmKeyFree` wipes and frees it. The
+// memory is not an AesKey: a resource inside a connection is a single owner the runtime drops with the connection, and dropping one from the code that owns the
+// connection's other secrets crashed under load.
+
+/** The expanded key of `key` (16, 24 or 32 bytes) for hardware AES-GCM as memory the caller frees with aesGcmKeyFree, or 0 when the CPU has no AES instructions or the key's size is wrong. */
+trusted fun aesGcmKeyNew(key: string): int {
+    if (!aesHardwareAvailable() || aesKeySizeError(key) != "") return 0
+    val memory = aesAllocateMemory(key.size)
+    aesExpandSchedule(memory, aesStringAddress(key), key.size, true)
+    memory
+}
+
+/** Wipes and frees what aesGcmKeyNew returned for a key of `keySize` bytes. */
+trusted fun aesGcmKeyFree(memory: int, keySize: int): void {
+    aesWipe(memory, aesKeyBytes(keySize))
+    ablaUnsafeFree(aesPointer(memory))
+}
+
+private trusted fun aesGcmStartHw(schedule: int, rounds: int, nonce: string, associatedData: string, hardware: bool): AesGcmState {
+    val memory = ablaUnsafePointerAddress(ablaUnsafeAllocate(96))
+    aesWipe(memory, 96)
+    val state = AesGcmState(memory)
+    aesHardwareEncryptAt(schedule, rounds, state.h(), state.h(), 1)
+    ablaUnsafeCopyMemory(state.counter(), ablaUnsafeStringAddress(nonce), 12)
+    aesStoreBig(state.counter() + 12, secretU32(u32(1)))
+    ablaUnsafeCopyMemory(state.tagMask(), state.counter(), 16)
+    aesHardwareEncryptAt(schedule, rounds, state.tagMask(), state.tagMask(), 1)
+    ghashUpdate(state.y(), state.h(), ablaUnsafeStringAddress(associatedData), associatedData.size, hardware)
+    state
+}
+
+private trusted fun aesGcmCryptHw(schedule: int, rounds: int, counter: int, input: int, output: int, size: int): void {
+    val batch = counter + 16
+    var at = 0
+    while (at < size) {
+        val count = int(aesLoadBig(counter + 12).declassify()) + 1
+        aesStoreBig(counter + 12, secretU32(u32(count)))
+        ablaUnsafeCopyMemory(batch, counter, 16)
+        aesHardwareEncryptAt(schedule, rounds, batch, batch, 1)
+        val take = if (size - at < 16) size - at else 16
+        for (i in 0 until take) {
+            ablaUnsafeStoreU8(aesPointer(output + at + i), ablaUnsafeLoadU8(aesPointer(input + at + i)) ^ ablaUnsafeLoadU8(aesPointer(batch + i)))
+        }
+        at = at + take
+    }
+}
+
+/** aesGcmEncrypt with the expanded key at `memory` (aesGcmKeyNew of a key of `keySize` bytes). */
+trusted fun aesGcmSealWithKey(memory: int, keySize: int, nonce: string, plaintext: string, associatedData: string = ""): CryptoResult {
+    val result = aesGcmSealHw(memory + AES_SCRATCH_BYTES, keySize / 4 + 6, nonce, plaintext, associatedData)
+    ctScrubStack2048()
+    return result
+}
+
+private @noinline trusted fun aesGcmSealHw(schedule: int, rounds: int, nonce: string, plaintext: string, associatedData: string): CryptoResult {
+    if (nonce.size != 12) return cryptoFailed("an AES-GCM nonce here has 12 bytes")
+    val hardware = aesGcmHardware()
+    val state = aesGcmStartHw(schedule, rounds, nonce, associatedData, hardware)
+    val buffer = nativeByteBuffer(plaintext.size + 17)
+    val address = ablaUnsafePointerAddress(buffer.pointerAt(0))
+    aesGcmCryptHw(schedule, rounds, state.counter(), ablaUnsafeStringAddress(plaintext), address, plaintext.size)
+    ghashUpdate(state.y(), state.h(), address, plaintext.size, hardware)
+    aesGcmTag(state, associatedData.size, plaintext.size, hardware, address + plaintext.size)
+    CryptoResult(buffer.adoptString(plaintext.size + 16), true, "")
+}
+
+/** aesGcmDecrypt with the expanded key at `memory` (aesGcmKeyNew of a key of `keySize` bytes). */
+trusted fun aesGcmOpenWithKey(memory: int, keySize: int, nonce: string, ciphertext: string, associatedData: string = ""): CryptoResult {
+    if (nonce.size != 12) return cryptoFailed("an AES-GCM nonce here has 12 bytes")
+    if (ciphertext.size < 16) return cryptoFailed("the ciphertext is shorter than its tag")
+    val result = aesGcmOpenHw(memory + AES_SCRATCH_BYTES, keySize / 4 + 6, nonce, ciphertext, associatedData)
+    ctScrubStack2048()
+    return result
+}
+
+private @noinline trusted fun aesGcmOpenHw(schedule: int, rounds: int, nonce: string, ciphertext: string, associatedData: string): CryptoResult {
+    val failure = "authentication failed: the data, key, nonce or associated data is wrong"
+    val hardware = aesGcmHardware()
+    val state = aesGcmStartHw(schedule, rounds, nonce, associatedData, hardware)
+    val size = ciphertext.size - 16
+    ghashUpdate(state.y(), state.h(), ablaUnsafeStringAddress(ciphertext), size, hardware)
+    val tag = nativeByteBuffer(17)
+    val tagAddress = ablaUnsafePointerAddress(tag.pointerAt(0))
+    val counter = ablaUnsafePointerAddress(ablaUnsafeAllocate(32))
+    ablaUnsafeCopyMemory(counter, state.counter(), 16)
+    aesGcmTag(state, associatedData.size, size, hardware, tagAddress)
+    val input = ablaUnsafeStringAddress(ciphertext)
+    val different = ctDifferenceAddress(tagAddress, input + size, 16).declassify()
+    tag.close()
+    if (different != u8(0)) {
+        ablaUnsafeFree(aesPointer(counter))
+        return cryptoFailed(failure)
+    }
+    val buffer = nativeByteBuffer(size + 1)
+    val address = ablaUnsafePointerAddress(buffer.pointerAt(0))
+    aesGcmCryptHw(schedule, rounds, counter, input, address, size)
+    ablaUnsafeFree(aesPointer(counter))
+    CryptoResult(buffer.adoptString(size), true, "")
+}

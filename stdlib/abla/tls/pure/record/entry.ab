@@ -34,18 +34,32 @@ fun tlsRecordLimit(aead: int): int = if (aead == TLS_AEAD_CHACHA20_POLY1305) 171
 val TLS_MAX_CIPHERTEXT = 16640
 
 /** One direction's protection: the traffic key, the IV (12 bytes) and the next record's sequence number. */
-class TlsRecordProtection(val aead: int, val key: string, val iv: string, var sequence: int)
+class TlsRecordProtection(val aead: int, val key: string, val iv: string, var sequence: int, var gcmKey: int = 0)
+
+/** Ends what a protection holds beyond its key and IV strings (which its owner wipes): the expanded AES key's memory, wiped and freed. */
+fun tlsRecordProtectionRelease(var protection: TlsRecordProtection): void {
+    if (protection.gcmKey != 0) aesGcmKeyFree(protection.gcmKey, protection.key.size)
+    protection.gcmKey = 0
+    return
+}
 
 fun tlsRecordProtection(aead: int, key: string, iv: string): TlsRecordProtection =
     TlsRecordProtection(aead, key, iv, 0)
 
-private fun tlsSeal(aead: int, key: string, nonce: string, plaintext: string, aad: string): CryptoResult =
-    if (aead == TLS_AEAD_CHACHA20_POLY1305) chaCha20Poly1305Seal(key, nonce, plaintext, aad)
-    else aesGcmEncrypt(key, nonce, plaintext, aad)
+// AES-GCM expands the traffic key once per protection, on its first record, where the CPU has AES instructions (aesGcmKeyNew: 0 elsewhere, and the key is expanded per record).
+private fun tlsSeal(var protection: TlsRecordProtection, nonce: string, plaintext: string, aad: string): CryptoResult {
+    if (protection.aead == TLS_AEAD_CHACHA20_POLY1305) return chaCha20Poly1305Seal(protection.key, nonce, plaintext, aad)
+    if (protection.gcmKey == 0) protection.gcmKey = aesGcmKeyNew(protection.key)
+    if (protection.gcmKey == 0) return aesGcmEncrypt(protection.key, nonce, plaintext, aad)
+    aesGcmSealWithKey(protection.gcmKey, protection.key.size, nonce, plaintext, aad)
+}
 
-private fun tlsOpen(aead: int, key: string, nonce: string, sealed: string, aad: string): CryptoResult =
-    if (aead == TLS_AEAD_CHACHA20_POLY1305) chaCha20Poly1305Open(key, nonce, sealed, aad)
-    else aesGcmDecrypt(key, nonce, sealed, aad)
+private fun tlsOpen(var protection: TlsRecordProtection, nonce: string, sealed: string, aad: string): CryptoResult {
+    if (protection.aead == TLS_AEAD_CHACHA20_POLY1305) return chaCha20Poly1305Open(protection.key, nonce, sealed, aad)
+    if (protection.gcmKey == 0) protection.gcmKey = aesGcmKeyNew(protection.key)
+    if (protection.gcmKey == 0) return aesGcmDecrypt(protection.key, nonce, sealed, aad)
+    aesGcmOpenWithKey(protection.gcmKey, protection.key.size, nonce, sealed, aad)
+}
 
 /** The key length of an AEAD, 0 for one this layer does not know. */
 fun tlsAeadKeyLength(aead: int): int =
@@ -113,7 +127,7 @@ fun tlsProtectRecord(var protection: TlsRecordProtection, contentType: int, cont
     while (zeros.size < padding) zeros.append(0)
     val inner = content + cryptoByteString([contentType]) + cryptoByteString(zeros)
     val header = tlsHeaderBytes(TLS_APPLICATION_DATA, 771, inner.size + 16)
-    val sealed = tlsSeal(protection.aead, protection.key, tlsRecordNonce(protection.iv, protection.sequence),
+    val sealed = tlsSeal(protection, tlsRecordNonce(protection.iv, protection.sequence),
         inner, header)
     if (!sealed.ok) return sealed
     protection.sequence = protection.sequence + 1
@@ -134,7 +148,7 @@ fun tlsOpenRecord(var protection: TlsRecordProtection, record: string): TlsOpene
     if (header.length != record.size - 5) return tlsOpenFailed("tls: the record length does not match")
     if (header.length < 17) return tlsOpenFailed("tls: a protected record shorter than its tag and type")
     if (protection.sequence >= TLS_MAX_SEQUENCE) return tlsOpenFailed("tls: the record sequence number is exhausted")
-    val opened = tlsOpen(protection.aead, protection.key, tlsRecordNonce(protection.iv, protection.sequence),
+    val opened = tlsOpen(protection, tlsRecordNonce(protection.iv, protection.sequence),
         record.slice(5, record.size), record.slice(0, 5))
     if (!opened.ok) return tlsOpenFailed("tls: bad record MAC")
     protection.sequence = protection.sequence + 1

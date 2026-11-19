@@ -1,0 +1,80 @@
+// AES-GCM with a key expanded once (aesGcmKeyNew, aesGcmSealWithKey, aesGcmOpenWithKey) against the call that expands it every time (aesGcmEncrypt, aesGcmDecrypt): the same bytes over random keys
+// (16, 24 and 32 bytes), lengths 0 to 300 and around the block and batch sizes, associated data of several lengths, one key used for many records; each opens the other's, and
+// an altered record, nonce, associated data or length is refused by both. Also the speed of a 32-byte record both ways. Prints "aes-gcm keyed ok".
+import "abla/io"
+import "abla/crypto"
+import "abla/crypto/aes"
+import "abla/crypto/result"
+import "abla/process/time"
+import "abla/text"
+
+var failures = 0
+var seed = 99
+
+fun fail(what: string): void {
+    failures = failures + 1
+    if (failures < 30) println("FAIL $what")
+    return
+}
+
+fun next(): int {
+    seed = (seed * 1103515245 + 12345) & 2147483647
+    (seed >> 16) & 255
+}
+
+fun random(count: int): string {
+    val bytes: array<int> = []
+    for (i in 0 until count) bytes.append(next())
+    cryptoByteString(bytes)
+}
+
+fun main: int {
+    val lengths = [0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 100, 127, 128, 129, 255, 256, 300, 1000, 4096, 16384]
+    for (keySize in [16, 24, 32]) {
+        val key = random(keySize)
+        val expanded = aesGcmKeyNew(key)
+        if (expanded == 0) continue
+        for (length in lengths) {
+            for (aadSize in [0, 5, 16, 33]) {
+                val nonce = random(12)
+                val plain = random(length)
+                val aad = random(aadSize)
+                val reference = aesGcmEncrypt(key, nonce, plain, aad)
+                val keyed = aesGcmSealWithKey(expanded, keySize, nonce, plain, aad)
+                if (!reference.ok || !keyed.ok || reference.bytes != keyed.bytes) {
+                    fail("seal key $keySize length $length aad $aadSize")
+                    continue
+                }
+                val opened = aesGcmOpenWithKey(expanded, keySize, nonce, reference.bytes, aad)
+                if (!opened.ok || opened.bytes != plain) fail("open key $keySize length $length aad $aadSize")
+                val other = aesGcmDecrypt(key, nonce, keyed.bytes, aad)
+                if (!other.ok || other.bytes != plain) fail("the plain open of a keyed seal: key $keySize length $length aad $aadSize")
+                // Refusals.
+                val at = next() % reference.bytes.size
+                val bent = reference.bytes.slice(0, at) + cryptoByteString([reference.bytes[at] ^ 1]) + reference.bytes.slice(at + 1, reference.bytes.size)
+                if (aesGcmOpenWithKey(expanded, keySize, nonce, bent, aad).ok || aesGcmDecrypt(key, nonce, bent, aad).ok) fail("an altered record was accepted: key $keySize length $length")
+                if (aesGcmOpenWithKey(expanded, keySize, random(12), reference.bytes, aad).ok) fail("another nonce was accepted")
+                if (aesGcmOpenWithKey(expanded, keySize, nonce, reference.bytes, aad + "x").ok) fail("other associated data was accepted")
+                if (reference.bytes.size > 16 && aesGcmOpenWithKey(expanded, keySize, nonce, reference.bytes.slice(0, reference.bytes.size - 1), aad).ok) fail("a short record was accepted")
+            }
+        }
+        if (aesGcmSealWithKey(expanded, keySize, "short", "x", "").ok) fail("a nonce of the wrong size was accepted")
+        if (aesGcmOpenWithKey(expanded, keySize, random(12), "tiny", "").ok) fail("a record shorter than its tag was accepted")
+        aesGcmKeyFree(expanded, keySize)
+    }
+    val key = random(16)
+    val expanded = aesGcmKeyNew(key)
+    val nonce = random(12)
+    val small = random(32)
+    var t = monotonicNanoseconds()
+    for (i in 0 until 2000) aesGcmEncrypt(key, nonce, small, "aad")
+    val plainNanos = (monotonicNanoseconds() - t) / 2000
+    t = monotonicNanoseconds()
+    for (i in 0 until 2000) aesGcmSealWithKey(expanded, 16, nonce, small, "aad")
+    val keyedNanos = (monotonicNanoseconds() - t) / 2000
+    aesGcmKeyFree(expanded, 16)
+    println("32-byte record: expanding each time $plainNanos ns, expanded once $keyedNanos ns")
+    if (failures > 0) return 1
+    println("aes-gcm keyed ok")
+    0
+}
