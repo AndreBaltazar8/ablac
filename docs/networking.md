@@ -406,7 +406,7 @@ What changes with HTTP/2:
 
 - Many requests to one origin share one connection (multiplexed streams): `maximumConnectionsPerHost` then only bounds the extra connections opened when a connection's
   stream limit is reached (`maximumStreamsPerConnection`, 100, and the server's `SETTINGS_MAX_CONCURRENT_STREAMS`, whichever is smaller). While an origin's protocol is not
-  yet known (its first handshake is not done) only one connection is opened to it; the answer is remembered for `dnsCacheSeconds`.
+  yet known (its first handshake is not done) only one connection is opened to it; the answer is remembered for `dnsCacheSeconds`, and later connections to an origin that answered HTTP/1.1 offer no ALPN (so its TLS session tickets, which carry none, resume).
 - A deadline is per request: on expiry the stream is cancelled (`RST_STREAM(CANCEL)`) and the request completes with `"timeout"`; the connection and the other requests are
   untouched. A connection with no open streams for `idleTimeoutMilliseconds` is closed with `GOAWAY(NO_ERROR)`; one idle for `http2PingAfterIdleMilliseconds` is probed with a
   PING before a request uses it (no answer in five seconds: the connection is dropped and the request goes to a new one). A request the server did not process (`REFUSED_STREAM`,
