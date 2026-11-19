@@ -2685,6 +2685,16 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
 
 ## Tried, not pursued
 
+- **X25519/Ed25519 field on five 51-bit limbs (2026-11-19): measured in the shape that was cheap to try, no gain; the full rewrite is deferred.** The
+  product alone on 51-bit limbs (25 `mulq` per multiplication, 15 per square, 128-bit sums, 2^255 = 19 on the wrapped ones) under the existing ten-limb storage
+  (pairs of limbs packed on the way in, split on the way out; `ablaU128NativeMul()` on x86-64 and AArch64), bit for bit equal to the old field on the
+  x25519 and ed25519 reference tests, gave X25519 121 us -> 128 us and an Ed25519 public key 145 us -> 150 us, handshakes unchanged. Why: the 32 x 32 -> 64
+  product is already about three instructions, the multiplication is only about 40% of the ladder (callgrind: products 12.4% of a handshake benchmark, the ladder
+  30%; the rest is the carries, add/sub, the swaps and the load/store of ten limbs), and the new product is about 320 instructions (26 `mulq`, spilling) against
+  about 400. A gain needs the whole field on five 64-bit limbs (add, sub, swap, carry and weak reduction on five words, the comb table and the constants converted,
+  new constant-time fixtures on four targets): estimated 1.6x on X25519 and Ed25519, about 20% of a TLS 1.3 server handshake. Not worth a rewritten constant-time
+  core now; revisit if handshakes per second on small machines becomes the limit. The benchmark is `tests/cases/tls-pure/handshake-bench.ab`.
+
 - **#762 serving compile-time action results from a record: correct, but 8-9% where 15% was the bar**
   (2026-11-11, branches `action-record` / `action-serve` local, rebased copy `action-serve-m` at `f52deee5` on master `b404276a`; the
   journal itself, step (a), is on master). Design: (a) an ordered journal of every compiler-API call an evaluation
