@@ -2,7 +2,7 @@
 # HTTP/2 for abla/http/async (abla/http/h2): the HPACK test (RFC 7541 appendix C, the Huffman code, the decoder's limits, the encoder's never-indexed rule), the H2Client
 # test against a scripted peer (flow control, floods, limits, response rules), the async client against a scripted h2c server in a forked child (per-stream timeout, REFUSED_STREAM and GOAWAY retries, a protocol error, trailers, PING before reuse, idle close), then the real thing: HttpAsyncClient with http2 on against `nghttpd` (nghttp2, over TLS with ALPN: 30
 # concurrent requests on one connection, a 3 MiB download and a 300 KB upload across the flow-control windows, HEAD, a second wave on the same connection), the ALPN fallback to
-# HTTP/1.1 against `openssl s_server`, and the default options (http2 off). `h2load` then drives 20000 requests over 8 connections at nghttpd, 100 streams each, through the
+# HTTP/1.1 against `openssl s_server`, and the default options (http2 on: h2 against nghttpd, HTTP/1.1 against s_server; http2 = false against h2o in test-http2-h2o.sh). `h2load` then drives 20000 requests over 8 connections at nghttpd, 100 streams each, through the
 # same server for a load run of the server side only (it checks nghttpd, not us). Usage: tools/test-http2.sh [compiler]
 # Needs openssl and nghttpd (nix-shell provides both); without nghttpd the scripted tests run and the network part says so and fails.
 set -euo pipefail
@@ -58,6 +58,12 @@ done
 result=$("$root/tools/run-limited.sh" "$out/net" "$nghttpd_port" "$out/p256.pem" h2 3145728) || { echo "http2 net h2: $result" >&2; tail -5 "$out/nghttpd.log" >&2; exit 1; }
 [[ $result == 'http2 net h2 ok' ]] || { echo "http2 net h2: $result" >&2; exit 1; }
 echo "http2 net h2 ok (nghttpd)"
+
+for mode in default-h2; do
+    result=$("$root/tools/run-limited.sh" "$out/net" "$nghttpd_port" "$out/p256.pem" "$mode") || { echo "http2 net $mode: $result" >&2; tail -5 "$out/nghttpd.log" >&2; exit 1; }
+    [[ $result == "http2 net $mode ok" ]] || { echo "http2 net $mode: $result" >&2; exit 1; }
+    echo "http2 net $mode ok (nghttpd)"
+done
 
 if command -v h2load > /dev/null; then
     h2load -n 20000 -c 8 -m 100 "https://localhost:$nghttpd_port/small.txt" > "$out/h2load.log" 2>&1 || { tail -5 "$out/h2load.log" >&2; echo "http2: h2load failed" >&2; exit 1; }

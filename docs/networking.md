@@ -397,10 +397,10 @@ val replies = http.takeCompletions()
 
 #### HTTP/2
 
-`HttpAsyncOptions(http2 = true)` offers `h2` and `http/1.1` by ALPN on every `https://` connection; when the server picks `h2` the connection speaks HTTP/2
+`HttpAsyncOptions` offers `h2` and `http/1.1` by ALPN on every `https://` connection (`http2` is **on by default**); when the server picks `h2` the connection speaks HTTP/2
 (RFC 9113, HPACK RFC 7541, in `abla/http/h2`: the sans-IO `H2Client` and the HPACK codec), otherwise HTTP/1.1 exactly as before. Callers change nothing else:
 `request`, `get`, `postJson`, `step` and `takeCompletions` are the same, and `HttpAsyncCompletion.protocol` says which protocol answered (`"h2"` or `"http/1.1"`).
-`http2` is **off by default for one release** so that callers opt in; the default is revisited after that.
+`http2 = false` keeps HTTP/1.1 on every connection, as before the default changed. Plain `http://` is unchanged (HTTP/1.1; h2c only with `http2PriorKnowledge = true`, off by default). Watch for three differences when upgrading: response header names are lower case, one connection serves many requests (`maximumConnectionsPerHost` does not bound them), and trailers are in `trailers()`.
 
 What changes with HTTP/2:
 
@@ -787,7 +787,7 @@ silently acquires hosted dependencies; cross-platform programs select
 `abla/net/hosted`. The bounded DNS client currently implements UDP A/AAAA with
 compression pointers, but not DNSSEC, TCP fallback, IDNA, or a shared cache.
 TLS is hosted and OpenSSL-backed rather than part of the raw syscall target.
-HTTP/2 is an opt-in client feature of `abla/http/async` and a server feature of `abla/http/event/tls` (both above); HTTP/3/QUIC, proxy negotiation, and automatic reconnection remain
+HTTP/2 is a default-on (https) client feature of `abla/http/async` and a server feature of `abla/http/event/tls` (both above); HTTP/3/QUIC, proxy negotiation, and automatic reconnection remain
 separate protocols rather than implicit behavior in the HTTP/1.1 APIs.
 
 ## Tests and benchmark

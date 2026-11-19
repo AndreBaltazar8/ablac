@@ -3,7 +3,8 @@
 //   h2        http2 on: many concurrent requests share one connection (one connect, one handshake), bodies arrive whole, a 3 MiB download and a 300 KB upload cross the flow
 //             control windows, HEAD works, response header names are lower case, trailers() is empty, a request that times out leaves the connection to the others
 //   fallback  http2 on against a server that does not offer h2 (openssl s_server): the requests complete over HTTP/1.1 and the origin is remembered as HTTP/1.1
-//   default   the default options (http2 off) against the h2 server's HTTP/1.1 sibling (openssl s_server): HTTP/1.1, no h2 offered
+//   default   the default options (http2 on for https) against an HTTP/1.1-only server (openssl s_server): the requests complete over HTTP/1.1
+//   default-h2  the default options against nghttpd: h2 is negotiated, one connection carries the six requests
 // Prints "http2 net <mode> ok".
 import "abla/io"
 import "abla/http/async"
@@ -97,18 +98,18 @@ fun expectAll(done: array<HttpAsyncCompletion>, ids: array<int>, bigId: int, hea
     return
 }
 
-fun other(port: int, caPath: string, http2: bool): void {
-    val client = httpAsyncClient(HttpAsyncOptions(caPath = caPath, http2 = http2))
+fun other(port: int, path: string, options: HttpAsyncOptions, expected: string): void {
+    val client = httpAsyncClient(options)
     val ids: array<int> = []
-    for (i in 0 until 6) ids.append(client.get("https://localhost:$port/", [], 15000))
+    for (i in 0 until 6) ids.append(client.get("https://localhost:$port$path", [], 15000))
     val done = drain(client)
     for (id in ids) {
         val c = find(done, id)
         if (c == null) fail("no completion for $id")
-        else if (c.status != 200 || c.protocol != "http/1.1") fail("${c.status} protocol '${c.protocol}' ${c.error}")
+        else if (c.status != 200 || c.protocol != expected) fail("${c.status} protocol '${c.protocol}' (wanted $expected) ${c.error}")
     }
-    // After the first handshake the origin is HTTP/1.1: the later requests may open more than one connection.
-    if (http2 && client.connectionsOpened < 1) fail("no connection opened")
+    if (expected == "h2" && client.connectionsOpened != 1) fail("h2 should share one connection: ${client.connectionsOpened} were opened")
+    if (client.connectionsOpened < 1) fail("no connection opened")
     return
 }
 
@@ -117,8 +118,9 @@ fun main: int {
     val caPath = processArgument(1)
     val mode = processArgument(2)
     if (mode == "h2") h2(port, caPath, decimal(processArgument(3)))
-    else if (mode == "fallback") other(port, caPath, true)
-    else if (mode == "default") other(port, caPath, false)
+    else if (mode == "fallback") other(port, "/", HttpAsyncOptions(caPath = caPath, http2 = true), "http/1.1")
+    else if (mode == "default") other(port, "/", HttpAsyncOptions(caPath = caPath), "http/1.1")
+    else if (mode == "default-h2") other(port, "/small.txt", HttpAsyncOptions(caPath = caPath), "h2")
     else fail("unknown mode $mode")
     if (failures > 0) return 1
     println("http2 net $mode ok")

@@ -104,6 +104,9 @@ run_client() {   # run_client LABEL ARGS...
 start_h2o
 run_client "client over TLS" "$tls_port" "$out/p256.pem" full "$out/docroot"
 run_client "client over h2c" "$plain_port" - full "$out/docroot"
+run_client "default options over TLS (h2)" "$tls_port" "$out/p256.pem" default "$out/docroot"
+run_client "default options over plain http (HTTP/1.1)" "$plain_port" - default "$out/docroot"
+run_client "http2 = false over TLS (HTTP/1.1)" "$tls_port" "$out/p256.pem" off "$out/docroot"
 stop_h2o
 for transport in tls plain; do
     start_h2o
