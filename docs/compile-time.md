@@ -873,6 +873,7 @@ Status, over the 371 cases:
 | The runtime memory API (`memoryLiveBytes`, `memoryReset`, ...) | evaluator: `E_EVAL_MEMORY_UNAVAILABLE` (`memoryCollect()` returns 0); native tier: its own runtime's heap ([limits](#limits)) |
 | Run-time globals | see [above](#ordinary-globals-at-compile-time) |
 | Process arguments (`processArgumentCount()`) | works: compile-time code sees none, so the count is 0; no capability needed |
+| An interactive program (a window, rendering, input, audio, sockets) | native tier: works with `trusted.native` and `time.unlimited` ([below](#interactive-programs-at-compile-time)) |
 
 Compile-time code prints with `println` like any program; its output is
 the compiler's.
@@ -890,6 +891,88 @@ val count = #rows()
 fun main: int = count
 // error: E_CT_PANIC
 // error: the table is empty
+```
+
+## Interactive programs at compile time
+
+A `#` site can run a whole interactive program. A game client built on a
+native engine (X11, Vulkan, ALSA, libcurl) runs inside `ablac build` with no
+special support. It opens a window, renders, takes keyboard input, plays audio
+and talks to its game server until the player closes the window. Then the
+site's value is compiled into the program:
+
+```abla fragment
+import "abla/compiler"
+#compilerGrant("trusted.native")
+#compilerGrant("environment")
+#compilerGrant("filesystem.read")
+#compilerGrant("filesystem.write")
+#compilerGrant("time.unlimited")
+import "./main.ab"
+import "./game.ab"
+
+trusted fun ctPlay(): string {
+    val status = nativeRun("Panda Trails", 1280, 720)
+    "status $status, yaw ${player.yaw}"
+}
+
+val played = #ctPlay()
+
+fun main: int {
+    println("played at compile time: $played")
+    0
+}
+```
+
+```toml
+compileCapabilities = ["filesystem.write", "filesystem.read", "environment", "trusted.native", "time.unlimited"]
+```
+
+What makes it work:
+
+- **Grants.** The engine opens its C libraries with `dlopen`, so
+  `trusted.native` is what reaches the window, the GPU, audio and sockets
+  (see [Capabilities](#capabilities-files-environment-processes-network):
+  `trusted.native` is all or nothing, and `network` is never asked). The
+  client also reads its assets (`filesystem.read`), its settings
+  (`environment`) and writes generated files (`filesystem.write`). The
+  libraries have to be findable as at run time: the play script below
+  sets the engine's library path before it builds.
+- **No time limit for that module.** A site that runs until a person closes a
+  window needs `time.unlimited`. The other modules' sites keep
+  `ABLA_COMPILE_EVAL_TIME_LIMIT`, so one that hangs by mistake still stops
+  the build.
+- **One run.** The site's code runs once per build, even when the slice
+  reaches it first through a global it initializes. Before #1022 the client
+  ran twice, once when the slice initialized its globals and once at its site.
+- **The native tier.** The client runs as native code, which the default `auto`
+  tier picks for it: the evaluator would be far too slow for a game loop.
+
+Its value isn't reproducible. What the site returns depends on the player's
+input, the wall clock (frame timing, the camera) and the server's state. Every
+build of it runs the game again, since `trusted.native` makes the build
+uncacheable, and the build says so
+([Non-reproducible sites](#non-reproducible-sites)):
+
+```text
+note: non-reproducible: ctplay.ab:21 `#ctPlay()` reached trusted.native, filesystem.write
+```
+
+Audio and the window leave nothing in the program; only the site's value
+(here the run's status and the panda's heading) is compiled in.
+
+The play script that builds it:
+
+```sh
+#!/usr/bin/env bash
+# Play the game inside `ablac build`: close the window to finish the build.
+set -euo pipefail
+. "$forge/scripts/native-env.sh"; native_env "$forge"   # the engine's library path, for dlopen
+export NATIVE_ASSETS=$game NATIVE_SERVER=ws://127.0.0.1:9/ws   # the game's own settings: assets, server
+cd "$game/src/client"
+out=$(mktemp -d)
+ablac build ctplay.ab -o "$out/ctplay" --fast --no-cache
+"$out/ctplay"    # played at compile time: status 0, yaw -1.70
 ```
 
 ## How a compilation runs
