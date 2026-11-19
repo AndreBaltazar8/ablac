@@ -235,7 +235,7 @@ p256_read() { # object, architecture (default x86_64)
 # X25519: the ladder, the inverse, the pack and the whole scalar multiplication call the field routines, which stay
 # calls; they are read with those calls followed, and refused without following (the calls are what is covered).
 x25519_read() { # object, architecture (default x86_64)
-    local object=$1 arch=${2:-x86_64} specs=(ct_x25519_ladder:@0 ct_x25519_compute:@0 ct_x25519_invert:@0,@1,@2,@3 ct_x25519_pack:@0,@1,@2,@3 ct_x25519_unpack:@0,@1 ct_fix_x25519f_mul:@0,@1,@2,@3 ct_fix_x25519f_mul_constant:@0,@1,@2)
+    local object=$1 arch=${2:-x86_64} specs=(ct_x25519_ladder:@0 ct_x25519_compute:@0 ct_x25519_invert:@0,@1,@2,@3 ct_x25519_pack:@0,@1,@2,@3 ct_x25519_unpack:@0,@1 ct_fix_x25519f_mul:@0,@1,@2,@3 ct_fix_x25519f_mul_constant:@0,@1,@2 ct_x25519_fsquare:@0,@1,@2)
     $check --follow-calls "$arch" "$object" "${specs[@]}" > "$out/$arch-x25519.log" 2>&1 || {
         cat "$out/$arch-x25519.log" >&2; echo "ct: a secret reached a branch or an address in X25519" >&2; exit 1
     }
