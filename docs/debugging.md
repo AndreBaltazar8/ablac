@@ -162,6 +162,24 @@ are the same as without it, unless the program uses freed memory. A program in m
 WebAssembly modules don't read it. Without the variable it costs nothing:
 the safe point's check is the same compare either way.
 
+### Poison only: `ABLA_GC_POISON=1`
+
+`ABLA_GC_POISON=1` poisons what each collection frees, as stress does, but
+collects no more often than usual. Use it when a program is too large to run
+under stress, and make collections more frequent some other way: a smaller
+growth (`ABLA_GC_GROWTH=<bytes>`, or `memorySetCollectionGrowth`). For the
+compiler itself, `ABLA_COMPILER_COLLECT_GROWTH_MB` sets its own step (default
+256 MB; 1 collects every megabyte). A block freed while something still held
+its address then reads as `0xDB` bytes at the next use, not as its old bytes.
+The program reads the variable once at startup, and stress already includes
+it. `tools/test-ct-readback-collect.sh` builds with both variables: a
+compile-time reply buffer kept only as an `int` was freed by a collection
+inside the code that filled it.
+
+```sh
+ABLA_GC_POISON=1 ABLA_GC_GROWTH=1048576 build/app
+```
+
 ## Cost
 
 Debug information leaves release builds untouched. In a development build of

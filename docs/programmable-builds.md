@@ -218,8 +218,8 @@ A hosted shared library collects under allocation pressure by default, as a prog
 functions are safe points, and a collection runs when the heap passes its threshold (32 MB to start, then half again
 past what it kept). It opts out the way a program does, by reaching `memorySetManualCollection()` from an export; the
 growth is set with `memorySetCollectionGrowth(bytes)`. A module for Wasm or a freestanding target is manual by default,
-and compile-time slices are as they were. The environment variables `ABLA_GC_STRESS` and `ABLA_GC_TRACE` are read from
-the process environment, which a library does not have, so they have no effect in one.
+and compile-time slices are as they were. The environment variables `ABLA_GC_STRESS`, `ABLA_GC_POISON` and
+`ABLA_GC_TRACE` are read from the process environment, which a library does not have, so they have no effect in one.
 
 ### Which loops are collection points
 
