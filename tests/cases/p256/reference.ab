@@ -1,0 +1,194 @@
+// The P-256 of abla/crypto/p256 (unrolled field, fixed-base comb, interleaved verification) against the one it replaced (old-p256.ab, unchanged): the field operations on
+// their own (the Montgomery multiplication, addition and subtraction, on random and extreme operands: bit for bit the same), then public keys, ECDH, RFC 6979
+// signatures (the same bytes) and verification both ways, over random inputs, the scalars at the comb's and the windows' edges, and invalid and edge points.
+// Prints "p256 reference ok".
+import "abla/io"
+import "abla/crypto"
+import "abla/crypto/bignum"
+import "abla/crypto/p256"
+import "abla/crypto/result"
+import "abla/text"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+import "./old-p256.ab" as old
+
+var failures = 0
+var seed = 424242
+
+fun fail(what: string): void {
+    failures = failures + 1
+    if (failures < 30) println("FAIL $what")
+    return
+}
+
+fun next(): int {
+    seed = (seed * 1103515245 + 12345) & 2147483647
+    (seed >> 8) & 255
+}
+
+fun random32(): string {
+    val bytes: array<int> = []
+    for (i in 0 until 32) bytes.append(next())
+    cryptoByteString(bytes)
+}
+
+// A random private key: 32 random bytes, which is below n except with probability 2^-32.
+fun privateKey(): string = random32()
+
+val PRIME = "ffffffff00000001000000000000000000000000ffffffffffffffffffffffff"
+val ORDER = "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"
+
+fun hex(text: string): string = hexDecode(text)
+
+trusted fun words(text: string, into: int): void = bnFromBytes(into, 8, ablaUnsafeStringAddress(text), 32)
+trusted fun same(a: int, b: int): bool {
+    var equal = true
+    for (i in 0 until 32) if (ablaUnsafeLoadU8(bnPointer(a + i)) != ablaUnsafeLoadU8(bnPointer(b + i))) equal = false
+    equal
+}
+
+// The field operations against the generic ones, on pairs of operands below p.
+trusted fun fieldOperations(): void {
+    val c = p256Open()
+    val a = bnAllocate(8)
+    val b = bnAllocate(8)
+    val fast = bnAllocate(8)
+    val slow = bnAllocate(8)
+    val t = bnAllocate(16)
+    val prime = hex(PRIME)
+    val edges = [
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000001",
+        "0000000000000000000000000000000000000000000000000000000000000002",
+        "ffffffff00000001000000000000000000000000fffffffffffffffffffffffe",
+        "ffffffff00000001000000000000000000000000fffffffffffffffffffffffd",
+        "00000000ffffffff00000000000000000000000000000000ffffffffffffffff",
+        "0000000100000000000000000000000000000000ffffffffffffffffffffffff",
+        "ffffffff000000010000000000000000000000000000000000000000ffffffff",
+        "7fffffff800000008000000000000000000000007fffffffffffffffffffffff",
+        "00000000ffffffff0000000000000000000000010000000000000000ffffffff",
+        "00000001000000000000000000000000ffffffff00000000ffffffffffffffff",
+        "ffffffff0000000100000000000000000000000100000001ffffffffffffffff"
+    ]
+    val pool: array<string> = []
+    for (e in edges) pool.append(hex(e))
+    for (i in 0 until 3000) {
+        var v = random32()
+        // Reduce below p: a random 32 bytes is below p unless its top 32 bits are all ones.
+        if (v[0] == 255 && v[1] == 255 && v[2] == 255 && v[3] == 255) v = "\x7f" + v.slice(1, 32)
+        pool.append(v)
+    }
+    for (i in 0 until pool.size) {
+        val x = pool[i]
+        val y = pool[(i * 7 + 3) % pool.size]
+        words(x, a)
+        words(y, b)
+        p256FMul(fast, a, b, t)
+        p256Multiply(c.field.memory, slow, a, b)
+        if (!same(fast, slow)) fail("p256FMul ${hexEncode(x)} * ${hexEncode(y)}")
+        // The forms Xtensa uses (loops) against the unrolled ones, product and reduction apart.
+        val t2 = bnAllocate(16)
+        p256FProductUnrolled(t, a, b)
+        p256FProductLoops(t2, a, b)
+        var productsEqual = true
+        for (k in 0 until 64) if (ablaUnsafeLoadU8(bnPointer(t + k)) != ablaUnsafeLoadU8(bnPointer(t2 + k))) productsEqual = false
+        if (!productsEqual) fail("the product by loops differs: ${hexEncode(x)} * ${hexEncode(y)}")
+        p256FReduceWide(fast, t)
+        p256FReduceLoops(slow, t2)
+        if (!same(fast, slow)) fail("the reduction by loops differs: ${hexEncode(x)} * ${hexEncode(y)}")
+        bnRelease(t2, 16)
+        p256FMul(a, a, b, t)
+        if (!same(a, slow)) fail("p256FMul with out = a: ${hexEncode(x)} * ${hexEncode(y)}")
+        words(x, a)
+        p256FAdd(fast, a, b)
+        p256Add(c.field.memory, slow, a, b)
+        if (!same(fast, slow)) fail("p256FAdd ${hexEncode(x)} + ${hexEncode(y)}")
+        p256FSub(fast, a, b)
+        p256Subtract(c.field.memory, slow, a, b)
+        if (!same(fast, slow)) fail("p256FSub ${hexEncode(x)} - ${hexEncode(y)}")
+        p256FAdd(a, a, b)
+        p256Add(c.field.memory, slow, fast, fast)
+    }
+    bnRelease(a, 8)
+    bnRelease(b, 8)
+    bnRelease(fast, 8)
+    bnRelease(slow, 8)
+    bnRelease(t, 16)
+    p256Close(c)
+    return
+}
+
+fun compare(name: string, got: CryptoResult, want: CryptoResult): void {
+    if (got.ok != want.ok || got.bytes != want.bytes) fail("$name: new ${got.ok} ${hexEncode(got.bytes)} old ${want.ok} ${hexEncode(want.bytes)}")
+    return
+}
+
+fun main: int {
+    fieldOperations()
+    // Scalars at the edges of the windows and of the comb's rows: one bit, a run of bits, a whole row, all ones, n - 1, n - 2, 1 and 2.
+    val scalars: array<string> = [
+        "0000000000000000000000000000000000000000000000000000000000000001",
+        "0000000000000000000000000000000000000000000000000000000000000002",
+        "000000000000000000000000000000000000000000000000000000000000000f",
+        "0000000000000000000000000000000000000000000000010000000000000000",
+        "0000000000000000000000000000000100000000000000000000000000000000",
+        "0000000000000001000000000000000000000000000000000000000000000000",
+        "8000000000000000000000000000000000000000000000000000000000000000",
+        "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "00000000000000000000000000000000000000000000000000000000ffffffff",
+        "000000000000000000000000000000000000000000000000ffffffffffffffff",
+        "0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff",
+        "ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000",
+        "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632550",
+        "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc63254f",
+        "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc63254e",
+        "5555555555555555555555555555555555555555555555555555555555555555",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "0000000000000000000000000000000000000000000000000000000100000000",
+        "0000000000000000000000000000000000000000000000000000000000000100"
+    ]
+    for (i in 0 until 400) scalars.append(hexEncode(privateKey()))
+    // Peers: the public keys of random scalars, the generator's small multiples, a point off the curve, the point at infinity's encoding, and bad encodings.
+    val peers: array<string> = []
+    for (s in scalars) {
+        val key = hex(s)
+        val pub = old.p256PublicKey(key)
+        val fast = p256PublicKey(key)
+        compare("public key of $s", fast, pub)
+        if (pub.ok && peers.size < 120) peers.append(pub.bytes)
+    }
+    val bad = "\x04" + hex("6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296") + hex("4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f4")
+    val infinity = "\x04" + "\x00".repeat(64)
+    val compressed = "\x02" + hex("6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296")
+    val prime = hex(PRIME)
+    val outOfRange = "\x04" + prime + hex("4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5")
+    for (p in [bad, infinity, compressed, outOfRange, "", "\x04"]) peers.append(p)
+    var checked = 0
+    for (i in 0 until 600) {
+        val key = hex(scalars[i % scalars.size])
+        val peer = peers[(i * 13 + i / 3) % peers.size]
+        compare("ECDH $i", p256Ecdh(key, peer), old.p256Ecdh(key, peer))
+        checked = checked + 1
+    }
+    // Signatures: the same bytes, and each verifies under the other.
+    for (i in 0 until 300) {
+        val key = hex(scalars[i % scalars.size])
+        val message = "message $i " + hexEncode(random32())
+        val fast = p256EcdsaSignRaw(key, message)
+        val slow = old.p256EcdsaSignRaw(key, message)
+        compare("sign $i", fast, slow)
+        if (fast.ok && slow.ok) {
+            val pub = old.p256PublicKey(key).bytes
+            if (!p256EcdsaVerifyRaw(pub, message, slow.bytes)) fail("new verify refused an old signature ($i)")
+            if (!old.p256EcdsaVerifyRaw(pub, message, fast.bytes)) fail("old verify refused a new signature ($i)")
+            // A damaged signature, a damaged message and another key are refused alike.
+            val flipped = slow.bytes.slice(0, 40) + (if (slow.bytes[40] == 0) "\x01" else "\x00") + slow.bytes.slice(41, 64)
+            if (p256EcdsaVerifyRaw(pub, message, flipped) != old.p256EcdsaVerifyRaw(pub, message, flipped)) fail("verify of a damaged signature differs ($i)")
+            if (p256EcdsaVerifyRaw(pub, message + "x", slow.bytes)) fail("new verify accepted a damaged message ($i)")
+            val other = old.p256PublicKey(random32()).bytes
+            if (p256EcdsaVerifyRaw(other, message, slow.bytes) != old.p256EcdsaVerifyRaw(other, message, slow.bytes)) fail("verify under another key differs ($i)")
+        }
+    }
+    if (failures == 0) println("p256 reference ok")
+    failures
+}

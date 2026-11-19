@@ -14,6 +14,16 @@ cd "$root"
 "$compiler" build tests/cases/p256/main.ab -o "$out/test" --fast --no-cache
 "$out/test" vectors tests/cases/p256/vectors
 echo "ok   P-256 known answers, Wycheproof ECDSA and ECDH, round trips"
+# The unrolled field, the fixed-base comb and the interleaved verification against the code they replaced (tests/cases/p256/old-p256.ab): the field operations
+# bit for bit, public keys, ECDH and RFC 6979 signatures over random and edge inputs, verification both ways; release and --fast.
+for mode in release fast; do
+    flags=(--no-cache)
+    [[ $mode == fast ]] && flags+=(--fast)
+    "$compiler" build tests/cases/p256/reference.ab -o "$out/reference.$mode" "${flags[@]}"
+    result=$(ABLA_MAX_SECONDS=1200 "$root/tools/run-limited.sh" "$out/reference.$mode") || { echo "p256 reference ($mode): $result" >&2; exit 1; }
+    [[ $result == 'p256 reference ok' ]] || { echo "p256 reference ($mode): $result" >&2; exit 1; }
+done
+echo "ok   P-256 against the previous implementation: field operations, keys, ECDH, signatures, verification"
 
 # --- openssl -----------------------------------------------------------------------------------------------------
 printf 'p256 interoperability message' > "$out/message"
