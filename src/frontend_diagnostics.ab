@@ -2,6 +2,20 @@
 // The compiler still produces textual diagnostics; this adapter preserves the
 // existing analysis-service interpretation while giving clients typed records.
 // Producer-side related locations/origins remain a separate diagnostic API gap.
+import "abla/json"
+import "abla/text"
+
+// One edit that fixes a diagnostic, as data: the client applies [begin, end) -> newText and needs no help text.
+// kind "replace" (a did-you-mean: the name's own range) or "import" (a missing import: an empty range where the
+// import line goes, after the file's last import).
+class BootstrapFrontendFix(
+    val title: string,
+    val kind: string,
+    val begin: int,
+    val end: int,
+    val newText: string
+)
+
 class BootstrapFrontendDiagnostic(
     val code: string,
     val message: string,
@@ -9,8 +23,116 @@ class BootstrapFrontendDiagnostic(
     val begin: int,
     val end: int,
     // The error's `help:` lines, without the prefix.
-    val help: array<string> = []
+    val help: array<string> = [],
+    // The edits that fix it (optional; a help line states them in words, these state them for a client).
+    val fixes: array<BootstrapFrontendFix> = []
 )
+
+/** Where a new import line goes: after the last top-level `import` line, else after the file's leading comment lines. */
+fun bootstrapFrontendImportInsertion(text: string): int {
+    var lineBegin = 0
+    var afterImports = -1
+    var afterComments = 0
+    var inHeader = true
+    while (lineBegin < text.size) {
+        var lineEnd = lineBegin
+        while (lineEnd < text.size && text[lineEnd] != 10) lineEnd = lineEnd + 1
+        val trimmed = text.slice(lineBegin, lineEnd).trim()
+        val next = if (lineEnd < text.size) lineEnd + 1 else lineEnd
+        if (trimmed.startsWith("import ") || trimmed.startsWith("export import ")) {
+            afterImports = next
+            inHeader = false
+        } else if (inHeader && (trimmed == "" || trimmed.startsWith("//"))) {
+            afterComments = next
+        } else {
+            inHeader = false
+        }
+        lineBegin = next
+    }
+    if (afterImports >= 0) afterImports else afterComments
+}
+
+fun bootstrapFrontendIdentifierByte(byte: int): bool =
+    (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || byte == 95 || (byte >= 97 && byte <= 122)
+
+/** Where `name` stands as a whole word from `from` to the end of that line, or -1: an error's location can be the start of
+ *  the expression (`p` of `p.lenght()`), the name the help line quotes is further on the same line. */
+fun bootstrapFrontendFindName(text: string, name: string, from: int): int {
+    var at = from
+    while (at + name.size <= text.size && text[at] != 10) {
+        if (text.slice(at, at + name.size) == name &&
+            (at == 0 || !bootstrapFrontendIdentifierByte(text[at - 1])) &&
+            (at + name.size == text.size || !bootstrapFrontendIdentifierByte(text[at + name.size]))) return at
+        at = at + 1
+    }
+    return -1
+}
+
+/** The fix one help line states: "did you mean `X`?" renames the diagnostic's name, "add `import \"M\"`" adds the import. */
+fun bootstrapFrontendHelpFix(line: string, begin: int, end: int, text: string): array<BootstrapFrontendFix> {
+    val fixes: array<BootstrapFrontendFix> = []
+    val near = "; did you mean `"
+    val at = line.indexOf(near)
+    if (at >= 0 && line.endsWith("`?")) {
+        val name = line.slice(at + near.size, line.size - 2)
+        // The misspelled name is the last one the line quotes before the suggestion.
+        val before = line.slice(0, at)
+        val closing = before.lastIndexOf("`")
+        val opening = if (closing > 0) before.slice(0, closing).lastIndexOf("`") else -1
+        if (name != "" && name.indexOf("`") < 0 && opening >= 0) {
+            val wrong = before.slice(opening + 1, closing)
+            val found = bootstrapFrontendFindName(text, wrong, begin)
+            if (found >= 0) {
+                fixes.append(BootstrapFrontendFix("Change to `$name`", "replace", found, found + wrong.size, name))
+            }
+        }
+        return fixes
+    }
+    val add = "; add `import \""
+    val importAt = line.indexOf(add)
+    if (importAt >= 0 && line.endsWith("\"`")) {
+        val module = line.slice(importAt + add.size, line.size - 2)
+        if (module != "" && module.indexOf("\"") < 0) {
+            val importLine = "import \"$module\""
+            var present = false
+            for (existing in text.split("\n")) {
+                if (existing.trim() == importLine) present = true
+            }
+            if (!present) {
+                val insertion = bootstrapFrontendImportInsertion(text)
+                // After a last line with no newline, the new line starts its own.
+                val prefix = if (insertion > 0 && text[insertion - 1] != 10) "\n" else ""
+                fixes.append(BootstrapFrontendFix("Add import \"$module\"", "import", insertion, insertion, "$prefix$importLine\n"))
+            }
+        }
+    }
+    fixes
+}
+
+/** The diagnostic as the editor service answers it: `help` and `fixes` only when it has some (both optional). */
+fun bootstrapFrontendDiagnosticJson(value: BootstrapFrontendDiagnostic): Json {
+    val range = jsonObject(["start", "end"], [jsonInteger(value.begin), jsonInteger(value.end)])
+    val names = ["code", "message", "range"]
+    val values = [jsonString(value.code), jsonString(value.message), range]
+    if (value.help.size > 0) {
+        val help: array<Json> = []
+        for (line in value.help) help.append(jsonString(line))
+        names.append("help")
+        values.append(jsonArray(help))
+    }
+    if (value.fixes.size > 0) {
+        val fixes: array<Json> = []
+        for (fix in value.fixes) {
+            fixes.append(jsonObject(["title", "kind", "edits"], [jsonString(fix.title), jsonString(fix.kind), jsonArray([jsonObject(
+                ["range", "newText"],
+                [jsonObject(["start", "end"], [jsonInteger(fix.begin), jsonInteger(fix.end)]), jsonString(fix.newText)]
+            )])]))
+        }
+        names.append("fixes")
+        values.append(jsonArray(fixes))
+    }
+    jsonObject(names, values)
+}
 
 fun bootstrapFrontendDiagnosticCode(diagnostics: string): string {
     var code = "E_ANALYSIS"
@@ -86,6 +208,7 @@ fun bootstrapFrontendAppendLocatedDiagnostics(
             // The help lines after an error's location are its own (every occurrence keeps them: the editor shows one
             // error at a time; the command line prints a repeated one once).
             values[helpTarget].help.append(line.slice(6, line.size))
+            for (fix in bootstrapFrontendHelpFix(line, values[helpTarget].begin, values[helpTarget].end, text)) values[helpTarget].fixes.append(fix)
         }
         lineBegin = lineEnd + 1
     }

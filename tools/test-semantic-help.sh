@@ -89,4 +89,64 @@ const count = all.find((d) => d.message.startsWith("error[E_SEMANTIC]: assignmen
 if (println.length !== 5 || helped.length !== 5) { console.error(`analysis: ${println.length} println errors, ${helped.length} with the help`); process.exit(1); }
 if (!count || !(count.help || []).some((h) => h.startsWith("`count` is declared `int`, and the value is `string`"))) { console.error("analysis: the assignment has no typed help"); process.exit(1); }
 ' "$output_directory/analyze.out" || { echo "semantic-help: the editor's analysis lost a help line" >&2; exit 1; }
-echo "semantic-help: 11 everyday errors have their help line; a far name and a name strict imports hide are not suggested; a repeated help line is printed once on the command line and kept on each error in the analysis"
+# The editor's analysis also gives each of those errors the edit that fixes it, as data (a "fixes" field next to "help"):
+# a did-you-mean renames the name in its own range, a missing import adds the import line after the last import (or the
+# header comments). Applied to the source, the edits give the corrected names and the one import line.
+node -e '
+const fs = require("fs");
+const [root, dir, out] = process.argv.slice(1);
+const files = ["everyday.ab", "repeated.ab"].map((f) => dir + "/" + f);
+const lines = [{ schema: 1, id: 1, method: "initialize", params: { workspaceRoots: [root], clientName: "semantic-help", clientVersion: "1", analysisMode: "graph-v1" } }];
+files.forEach((file, i) => lines.push({ schema: 1, id: 2 + i, method: "analyze", params: { roots: [file] } }));
+lines.push({ schema: 1, id: 9, method: "shutdown", params: {} });
+fs.writeFileSync(out, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+' "$project_root/tests/cases/semantic-help" "$project_root/tests/cases/semantic-help" "$output_directory/fixes.jsonl"
+"$compiler" analyze --stdio < "$output_directory/fixes.jsonl" > "$output_directory/fixes.out" 2> "$output_directory/fixes.err"
+node -e '
+const fs = require("fs");
+const dir = process.argv[2];
+const answers = fs.readFileSync(process.argv[1], "utf8").trim().split("\n").map(JSON.parse);
+const fail = (message) => { console.error("fixes: " + message); process.exit(1); };
+const documentOf = (id, file) => {
+  const answer = answers.find((a) => a.id === id);
+  const document = ((answer && answer.result && answer.result.documents) || []).find((d) => d.uri.endsWith("/" + file));
+  if (!document) fail("no document " + file);
+  return document;
+};
+const apply = (text, edits) => {
+  const bytes = Buffer.from(text);
+  let out = Buffer.alloc(0), at = 0;
+  for (const e of edits.slice().sort((a, b) => a.range.start - b.range.start)) {
+    out = Buffer.concat([out, bytes.subarray(at, e.range.start), Buffer.from(e.newText)]);
+    at = e.range.end;
+  }
+  return Buffer.concat([out, bytes.subarray(at)]).toString();
+};
+const everyday = documentOf(2, "everyday.ab");
+const source = fs.readFileSync(dir + "/everyday.ab", "utf8");
+const bytes = Buffer.from(source);
+const renames = [];
+for (const d of everyday.diagnostics) for (const fix of d.fixes || []) {
+  if (fix.kind !== "replace" || fix.edits.length !== 1) fail("a rename is not one replace edit: " + JSON.stringify(fix));
+  const e = fix.edits[0];
+  renames.push(bytes.subarray(e.range.start, e.range.end).toString() + ">" + e.newText + " " + fix.title);
+}
+const q = String.fromCharCode(96);
+for (const name of [["lenght", "length"], ["aera", "area"], ["widht", "width"]]) {
+  const want = name[0] + ">" + name[1] + " Change to " + q + name[1] + q;
+  if (!renames.includes(want)) fail("no fix \"" + want + "\" in " + JSON.stringify(renames));
+}
+if (everyday.diagnostics.some((d) => (d.fixes || []).length && !(d.help || []).length)) fail("a fix without help");
+if (everyday.diagnostics.some((d) => d.message.includes("completelyUnrelatedName") && d.fixes)) fail("a far name has a fix");
+const repeated = documentOf(3, "repeated.ab");
+const text = fs.readFileSync(dir + "/repeated.ab", "utf8");
+const imports = repeated.diagnostics.flatMap((d) => d.fixes || []).filter((f) => f.kind === "import");
+if (imports.length !== 5) fail(imports.length + " import fixes on the five println errors");
+for (const fix of imports) {
+  if (fix.title !== "Add import \"abla/io\"" || fix.edits.length !== 1) fail("import fix " + JSON.stringify(fix));
+  const fixed = apply(text, fix.edits);
+  const header = text.slice(0, text.indexOf("fun main"));
+  if (fixed !== header + "import \"abla/io\"\n" + text.slice(header.length)) fail("the import is not after the header comments:\n" + fixed);
+}
+' "$output_directory/fixes.out" "$project_root/tests/cases/semantic-help" || { echo "semantic-help: the editor's analysis lost a fix" >&2; exit 1; }
+echo "semantic-help: 11 everyday errors have their help line; a far name and a name strict imports hide are not suggested; a repeated help line is printed once on the command line and kept on each error in the analysis; a did-you-mean and a missing import also come as edits (fixes)"
