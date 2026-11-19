@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 # `ablac run --watch` (src/live_watch.ab): a copy of tests/cases/live-watch/program.ab runs, and this script edits it
-# the way an editor saves (a new file renamed over the old one, `sed -i`).
+# the way an editor saves (a new file renamed over the old one).
 # - edit: value() returns 2 after the save; the program sees it and exits 42; the reload's outcome is on stderr.
 # - cached: the same run again starts from the object cache and is reloaded on a save too.
 # - broken: a save that does not compile keeps the program running its code (stderr says so), a file of the same
 #   directory that is not the program's (an output) reloads nothing, and the next good save is applied (exit 42).
 # - restart: a save the running code cannot take (tests/cases/live-watch/restart.ab: a result type changes) restarts
 #   the run; the restarted run does not restart again for the same refusal, and the next good save is applied.
-# x86-64 Linux, where live mode is tested. Usage: tools/test-live-watch.sh [compiler]
+# x86-64 Linux and macOS (an ablac that runs on AArch64 Linux is not built). Usage: tools/test-live-watch.sh [compiler]
 set -euo pipefail
 compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-if [[ $(uname -s) != Linux || $(uname -m) != x86_64 ]]; then
-    echo "live watch: skipped ($(uname -s) $(uname -m): live mode is tested on x86-64 Linux)"
+if [[ $(uname -s) == Linux && $(uname -m) != x86_64 ]]; then
+    echo "live watch: skipped ($(uname -s) $(uname -m): no ablac is built for it)"
     exit 0
 fi
 out=$root/build/live-watch
@@ -53,6 +53,11 @@ finish() {   # finish NAME: waits for the program, which must exit 42
     fi
 }
 
+save() {   # save EXPRESSION FILE: FILE edited by the sed EXPRESSION, written next to it and renamed over it
+    sed "$1" "$2" > "$2.saving"
+    mv "$2.saving" "$2"
+}
+
 lines() {   # lines NAME: the reload outcomes so far
     grep -c '^ablac run --watch: ' "$out/$1/stderr" || true
 }
@@ -69,7 +74,7 @@ wait_lines() {   # wait_lines NAME COUNT: until COUNT outcomes were printed
 
 # edit
 start edit
-sed -i 's|= 1 // value-marker|= 2 // value-marker|' "$out/edit/program.ab"
+save 's|= 1 // value-marker|= 2 // value-marker|' "$out/edit/program.ab"
 finish edit
 grep -q '^ablac run --watch: applied: value' "$out/edit/stderr" ||
     { echo 'live watch (edit): no "applied: value" on stderr' >&2; cat "$out/edit/stderr" >&2; exit 1; }
@@ -83,14 +88,14 @@ start edit
 unset ABLA_JIT_CACHE_TRACE
 grep -q '^\[jit-cache\] hit ' "$out/edit/stderr" ||
     { echo 'live watch (cached): the second run did not start from the cache' >&2; cat "$out/edit/stderr" >&2; exit 1; }
-sed -i 's|= 1 // value-marker|= 2 // value-marker|' "$out/edit/program.ab"
+save 's|= 1 // value-marker|= 2 // value-marker|' "$out/edit/program.ab"
 finish edit
 grep -q '^ablac run --watch: applied: value' "$out/edit/stderr" ||
     { echo 'live watch (cached): the save was not applied' >&2; cat "$out/edit/stderr" >&2; exit 1; }
 
 # broken
 start broken
-sed -i 's|= 1 // value-marker|= ) // value-marker|' "$out/broken/program.ab"
+save 's|= 1 // value-marker|= ) // value-marker|' "$out/broken/program.ab"
 wait_lines broken 1
 grep -q 'the program keeps running its code' "$out/broken/stderr" ||
     { echo 'live watch (broken): the failed reload was not reported' >&2; cat "$out/broken/stderr" >&2; exit 1; }
@@ -98,7 +103,7 @@ kill -0 "$pid" 2> /dev/null || { echo 'live watch (broken): the program ended af
 echo output > "$out/broken/output.txt"
 sleep 1
 [[ $(lines broken) -eq 1 ]] || { echo 'live watch (broken): a file that is not the program reloaded it' >&2; cat "$out/broken/stderr" >&2; exit 1; }
-sed -i 's|= ) // value-marker|= 2 // value-marker|' "$out/broken/program.ab"
+save 's|= ) // value-marker|= 2 // value-marker|' "$out/broken/program.ab"
 finish broken
 grep -q '^ablac run --watch: applied: value' "$out/broken/stderr" ||
     { echo 'live watch (broken): the good save was not applied' >&2; cat "$out/broken/stderr" >&2; exit 1; }
@@ -110,7 +115,7 @@ grep -q '^ablac run --watch: applied: value' "$out/broken/stderr" ||
 start restart restart.ab
 first=$pid
 rm -f "$out/restart/started"
-sed -i 's|^fun value(): int = 1 // value-marker|fun value(): i32 = 3 // value-marker|' "$out/restart/program.ab"
+save 's|^fun value(): int = 1 // value-marker|fun value(): i32 = 3 // value-marker|' "$out/restart/program.ab"
 for _ in $(seq 600); do
     [[ $(cat "$out/restart/started" 2> /dev/null) == 'started 3' ]] && break
     kill -0 "$pid" 2> /dev/null || break
@@ -123,13 +128,13 @@ done
 [[ $pid == "$first" ]] && kill -0 "$pid" 2> /dev/null ||
     { echo 'live watch (restart): the run did not stay the same process' >&2; exit 1; }
 rm -f "$out/restart/started"
-sed -i 's|^fun value(): i32 = 3 // value-marker|fun value(): int = 1 // value-marker|' "$out/restart/program.ab"
+save 's|^fun value(): i32 = 3 // value-marker|fun value(): int = 1 // value-marker|' "$out/restart/program.ab"
 wait_lines restart 2
 grep -q '^ablac run --watch: refused again after a restart, not restarting; the program keeps running its code: E_LIVE_SIGNATURE: value' "$out/restart/stderr" ||
     { echo 'live watch (restart): the same refusal after a restart restarted again' >&2; cat "$out/restart/stderr" >&2; exit 1; }
 sleep 1
 [[ ! -e $out/restart/started ]] || { echo 'live watch (restart): the program started a third time' >&2; exit 1; }
-sed -i 's|^fun value(): int = 1 // value-marker|fun value(): i32 = 2 // value-marker|' "$out/restart/program.ab"
+save 's|^fun value(): int = 1 // value-marker|fun value(): i32 = 2 // value-marker|' "$out/restart/program.ab"
 finish restart
 grep -q '^ablac run --watch: applied: value' "$out/restart/stderr" ||
     { echo 'live watch (restart): the save after the refusal was not applied' >&2; cat "$out/restart/stderr" >&2; exit 1; }

@@ -1092,6 +1092,9 @@ mmap form) apply there.
   of the program's own source files changes, inotify or kqueue, the outcome on stderr; kqueue confirmed on both Macs in CI run 43974380493; a save the running code cannot take restarts the run).
   Freeing old generations: measured (4 to 76 kB of code a reload), not worth building yet; a run notes once past
   256 MB (docs/design/live-jit.md).
+  Live by default on macOS: both Macs run test-live-jit and test-live-watch in CI (informative steps); once both
+  pass, `bootstrapLiveRunSupported` takes macOS and the steps block. AArch64 Linux: live mode there needs an ablac
+  that runs there, an AArch64 Linux compiler release, which is not built (out of scope until one is).
 
 - [x] **Transactional memory: clocks beyond the region.** A logged transaction runs the single-clock
   protocol on its first region's clock and keeps a snapshot per clock only once it touches a second region

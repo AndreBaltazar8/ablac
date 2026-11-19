@@ -18,6 +18,10 @@ out=build/live-jit
 rm -rf "$out"
 mkdir -p "$out"
 export ABLA_JIT_CACHE=0 ABLA_LIVE_TRACE=1
+# A wall-clock limit: GNU timeout where there is one, the repository's limiter elsewhere (the Mac runners have no timeout).
+limited() {
+    if command -v timeout > /dev/null; then timeout 300 "$@"; else ABLA_MAX_SECONDS=300 tools/run-limited.sh "$@"; fi
+}
 program=tests/cases/live-jit/calls.ab
 run() {
     local name=$1
@@ -66,7 +70,7 @@ for profile in o1 fast; do
     # its several applied reloads, --o1 under the default (256 MB) never.
     limit=268435456
     [[ $profile == fast ]] && limit=1
-    ABLA_LIVE_NOTE_BYTES=$limit timeout 300 "$compiler" run "--$profile" --live "$reload" -- "$reload" \
+    ABLA_LIVE_NOTE_BYTES=$limit limited "$compiler" run "--$profile" --live "$reload" -- "$reload" \
         > "$out/reload-$profile.out" 2> "$out/reload-$profile.err" || status=$?
     if [[ $status -ne 42 ]] || grep -q ': FAIL' "$out/reload-$profile.out"; then
         printf 'live jit (reload, %s): exit status %s (42 expected)\n' "$profile" "$status" >&2
@@ -88,7 +92,7 @@ done
 for round in compile cached; do
     cp tests/cases/live-jit/reload.ab "$reload"
     status=0
-    ABLA_JIT_CACHE=1 ABLA_JIT_CACHE_TRACE=1 ABLA_CACHE_DIR=$PWD/$out/cache timeout 300 "$compiler" run --live "$reload" -- "$reload" \
+    ABLA_JIT_CACHE=1 ABLA_JIT_CACHE_TRACE=1 ABLA_CACHE_DIR=$PWD/$out/cache limited "$compiler" run --live "$reload" -- "$reload" \
         > "$out/reload-$round.out" 2> "$out/reload-$round.err" || status=$?
     if [[ $status -ne 42 ]] || grep -q ': FAIL' "$out/reload-$round.out"; then
         printf 'live jit (reload, %s): exit status %s (42 expected)\n' "$round" "$status" >&2
@@ -106,7 +110,7 @@ fi
 refuse=$PWD/$out/reload/refuse.ab
 cp tests/cases/live-jit/refuse.ab "$refuse"
 status=0
-timeout 300 "$compiler" run --live "$refuse" -- "$refuse" > "$out/refuse.out" 2> "$out/refuse.err" || status=$?
+limited "$compiler" run --live "$refuse" -- "$refuse" > "$out/refuse.out" 2> "$out/refuse.err" || status=$?
 if [[ $status -ne 42 ]] || grep -q ": FAIL" "$out/refuse.out"; then
     printf 'live jit (refusals): exit status %s (42 expected)\n' "$status" >&2
     cat "$out/refuse.out" >&2
@@ -115,7 +119,7 @@ if [[ $status -ne 42 ]] || grep -q ": FAIL" "$out/refuse.out"; then
 fi
 cp tests/cases/live-jit/reload.ab "$reload"
 status=0
-timeout 300 "$compiler" run --no-live "$reload" -- "$reload" > "$out/reload-plain.out" 2>&1 || status=$?
+limited "$compiler" run --no-live "$reload" -- "$reload" > "$out/reload-plain.out" 2>&1 || status=$?
 if [[ $status -eq 42 ]] || ! grep -q '^live available: FAIL' "$out/reload-plain.out"; then
     echo "live jit (reload with --no-live): reloading was not refused as unavailable (exit $status)" >&2
     cat "$out/reload-plain.out" >&2
