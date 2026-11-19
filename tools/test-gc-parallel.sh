@@ -6,6 +6,9 @@
 # safe point, on a small graph), the frozen graph test at 4 threads under stress, and on one CPU shared with busy loops (the
 # threads must not make a collection worse than serial there). ABLA_GC_TRACE=1 shows the work each thread did
 # ("gc: parallel mark, objects by thread: ..."): the run at 4 threads must show every thread working.
+# The sweep (tests/cases/gc-parallel/sweep.ab): see the block in the loop. Mutation checks of the sweep (by hand, 2026-11-19): a header index off by one,
+# a kept object's mark not cleared and a kept entry moved to the wrong slot each end under ABLA_GC_STRESS=1 (the registry check traps, or the
+# program sees damaged strings or crashes).
 # Mutation checks (by hand): the claim as a load, a delay and a store, not the compare-and-swap, traps ("Illegal instruction") on
 # the first collection; the group's flag set by a toggle, not a store of 1, ends in a segmentation fault (the group is freed).
 set -euo pipefail
@@ -46,7 +49,25 @@ for mode in release fast; do
     status=0
     result=$(ABLA_GC_WORKERS=4 ABLA_GC_STRESS=1 "$root/tools/run-limited.sh" "$out/graph.$mode" 2>&1) || status=$?
     [[ $status -eq 0 && $result == *"frozen graph ok"* ]] || fail "frozen graph, 4 threads under stress ($mode) failed ($status): ${result: -300}"
-    echo "gc parallel ($mode): 2, 4 and 8 threads equal the serial mark; stress and the frozen graph pass"
+    # The parallel sweep with uneven slices (tests/cases/gc-parallel/sweep.ab: garbage then live, live then garbage, alternating): the
+    # result of every worker count is the serial one, the trace shows the sweep ran in parallel, and under stress each parallel sweep
+    # checks that every kept header's index is its slot (a trap otherwise).
+    "$compiler" build tests/cases/gc-parallel/sweep.ab -o "$out/sweep.$mode" "${flags[@]}" > "$out/sweep.$mode.build" 2>&1 \
+        || { cat "$out/sweep.$mode.build" >&2; fail "sweep ($mode) did not build"; }
+    serial=$(ABLA_GC_WORKERS=0 "$root/tools/run-limited.sh" "$out/sweep.$mode" 2>&1) || fail "sweep serial ($mode) failed: $serial"
+    [[ $serial == "gc parallel sweep ok:"* ]] || fail "sweep serial ($mode): $serial"
+    for workers in 2 4 8; do
+        status=0
+        result=$(ABLA_GC_WORKERS=$workers ABLA_GC_TRACE=1 "$root/tools/run-limited.sh" "$out/sweep.$mode" 2>&1 | tr -d "\\0") || status=$?
+        [[ $status -eq 0 && $result == *"$serial"* ]] || fail "sweep, $workers threads ($mode) failed ($status): ${result: -300}"
+        [[ $result == *"gc: parallel sweep, slots"* ]] || fail "sweep, $workers threads ($mode): no parallel sweep ran"
+    done
+    for workers in 2 4; do
+        status=0
+        result=$(ABLA_GC_WORKERS=$workers ABLA_GC_STRESS=1 "$root/tools/run-limited.sh" "$out/sweep.$mode" 400 2>&1 | tr -d "\\0") || status=$?
+        [[ $status -eq 0 && $result == "gc parallel sweep ok:"* ]] || fail "sweep, $workers threads under stress ($mode) failed ($status): ${result: -300}"
+    done
+    echo "gc parallel ($mode): 2, 4 and 8 threads equal the serial mark and sweep; stress and the frozen graph pass"
 done
 # One CPU shared with busy loops: the threads run beside the loops and must finish in about the serial time.
 if command -v taskset > /dev/null; then

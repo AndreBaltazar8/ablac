@@ -3855,6 +3855,12 @@ trusted fun __ablaRuntimeHostFreeLater(header: int): void {
         __ablaRuntimeHostBlockFree(header, blockSize)
         return
     }
+    __ablaRuntimeHostFreeBatch(header)
+    return
+}
+
+// A block the sweep found unreachable and nothing keeps on the lists: appended to the batch for the helper.
+trusted fun __ablaRuntimeHostFreeBatch(header: int): void {
     val state = __ablaRuntimeHostFreeState()
     var chunk = ablaRuntimeLoadI64(state + 32)
     if (chunk == 0 || ablaRuntimeLoadI64(chunk + 8) == 65534) {
@@ -4043,7 +4049,8 @@ trusted fun __ablaRuntimeHostBackgroundMemoryCollect(): int {
     __ablaRuntimeHostFrozenReclaim()
     __ablaRuntimeHostSmallListsSettle()
     if (background) {
-        __ablaRuntimeHostBackgroundSweep()
+        if (__ablaRuntimeHostGcWorkers >= 2 && __ablaRuntimeHostRegistrySlots >= (if (__ablaRuntimeHostGcStress) 256 else 32768)) __ablaRuntimeHostSweepParallel(__ablaRuntimeHostGcWorkers)
+        else __ablaRuntimeHostBackgroundSweep()
         __ablaRuntimeHostFreeStart()
     } else __ablaRuntimeHostCollectionSweep()
     __ablaRuntimeHostFree(ablaRuntimePointerFromAddress(
@@ -4077,6 +4084,198 @@ trusted fun __ablaRuntimeHostBackgroundMemoryCollect(): int {
 }
 
 // __ablaRuntimeHostCollectionSweep, handing what it frees to the helper.
+// ---- Parallel sweep (ABLA_GC_WORKERS=n, with the parallel mark; the background-free collection only) ----------------------
+// __ablaRuntimeHostBackgroundSweep on n threads, in three passes that keep the registry's memory as it is (no second array):
+//  A (parallel, n slices of the registry): for each entry, the header's state tells garbage from kept. Garbage is poisoned (stress),
+//    its size counted, and either pushed on the worker's own small-block lists (what __ablaRuntimeHostBlockKept would keep; the
+//    lists are spliced into the global ones afterwards) and its slot zeroed, or tagged (the entry's bit 1) for the helper. Kept: the
+//    mark is cleared (state - 32), counted.
+//  B (serial, on the registry alone, no header is read): a forward walk appends the tagged entries to the helper's batch and moves
+//    the others down (destination <= source: in place), so the registry is dense again.
+//  C (parallel, n slices of the dense registry): each kept header's word 0 is its new index (a free clears registry[word 0]).
+// Nothing in a worker allocates, takes a lock or touches thread-local storage.
+// A worker's block: +0 the slice's first slot, +8 its end, +16 the garbage bytes it freed, +24 the small-block bytes it kept on
+// its lists, +32 their budget, +40 its pthread handle, +48 1 once its thread started; the lists' heads follow at +64 (offset
+// by block size, 65 words), then their tails at +64 + 520.
+val __ablaRuntimeHostSweepBlock: int = 64 + 520 + 520
+
+// Static: +0 the pass (1 or 2), +8 whether garbage is poisoned.
+private trusted fun __ablaRuntimeHostSweepShared(): int = nativeStaticAllocate(16)
+
+private trusted fun __ablaRuntimeHostSweepPassA(context: int): void {
+    val registry = __ablaRuntimeHostRegistry
+    val poison = ablaRuntimeLoadI64(__ablaRuntimeHostSweepShared() + 8) != 0
+    val budget = ablaRuntimeLoadI64(context + 32)
+    var slot = ablaRuntimeLoadI64(context)
+    val end = ablaRuntimeLoadI64(context + 8)
+    var freed = 0
+    var added = 0
+    while (slot < end) {
+        val entry = ablaRuntimeLoadI64(registry + slot * 8)
+        if (entry != 0) {
+            val header = entry & -16
+            val state = ablaRuntimeLoadI64(header + 24)
+            if (state >= 0 && state < 16 && state != 10 && state != 12) {
+                val size = ablaRuntimeLoadI64(header + 16)
+                freed = freed + size
+                if (poison) __ablaRuntimeHostHeapPoison(header + 32, size)
+                if (size <= 480 && added < budget) {
+                    val total = (size + 39) & -8
+                    val heads = context + 64
+                    ablaRuntimeStoreI64(header, ablaRuntimeLoadI64(heads + total))
+                    if (ablaRuntimeLoadI64(heads + total) == 0) ablaRuntimeStoreI64(heads + 520 + total, header)
+                    ablaRuntimeStoreI64(heads + total, header)
+                    added = added + total
+                    ablaRuntimeStoreI64(registry + slot * 8, 0)
+                } else ablaRuntimeStoreI64(registry + slot * 8, entry | 2)
+            } else if (state >= 16) ablaRuntimeStoreI64(header + 24, state - 32)
+        }
+        slot = slot + 1
+    }
+    ablaRuntimeStoreI64(context + 16, freed)
+    ablaRuntimeStoreI64(context + 24, added)
+    return
+}
+
+private trusted fun __ablaRuntimeHostSweepPassC(context: int): void {
+    val registry = __ablaRuntimeHostRegistry
+    var slot = ablaRuntimeLoadI64(context)
+    val end = ablaRuntimeLoadI64(context + 8)
+    while (slot < end) {
+        ablaRuntimeStoreI64(ablaRuntimeLoadI64(registry + slot * 8) & -16, slot)
+        slot = slot + 1
+    }
+    return
+}
+
+// The C entry of the threads started for a pass (the collecting thread calls it as well).
+trusted fun __ablaRuntimeHostSweepWorker(context: int): int {
+    if (ablaRuntimeLoadI64(__ablaRuntimeHostSweepShared()) == 1) __ablaRuntimeHostSweepPassA(context)
+    else __ablaRuntimeHostSweepPassC(context)
+    0
+}
+
+// Runs the pass on the blocks of `contexts` (`workers` of them, slices of [0, slots)).
+private trusted fun __ablaRuntimeHostSweepRun(pass: int, contexts: int, workers: int, slots: int): void {
+    ablaRuntimeStoreI64(__ablaRuntimeHostSweepShared(), pass)
+    val block = __ablaRuntimeHostSweepBlock
+    val step = (slots + workers - 1) / workers
+    var index = 0
+    while (index < workers) {
+        val context = contexts + index * block
+        val first = if (index * step > slots) slots else index * step
+        val last = if (first + step > slots) slots else first + step
+        ablaRuntimeStoreI64(context, first)
+        ablaRuntimeStoreI64(context + 8, last)
+        ablaRuntimeStoreI64(context + 48, 0)
+        index = index + 1
+    }
+    index = 1
+    while (index < workers) {
+        val context = contexts + index * block
+        if (pthread_create(
+            ablaRuntimePointerFromAddress(context + 40),
+            ablaRuntimePointerFromAddress(0),
+            ablaRuntimePointerFromAddress(nativeFunctionAddress(__ablaRuntimeHostSweepWorker)),
+            ablaRuntimePointerFromAddress(context)
+        ) == 0) ablaRuntimeStoreI64(context + 48, 1)
+        else __ablaRuntimeHostSweepWorker(context)
+        index = index + 1
+    }
+    __ablaRuntimeHostSweepWorker(contexts)
+    index = 1
+    while (index < workers) {
+        val context = contexts + index * block
+        if (ablaRuntimeLoadI64(context + 48) != 0) pthread_join(ablaRuntimeLoadI64(context + 40), ablaRuntimePointerFromAddress(0))
+        index = index + 1
+    }
+    return
+}
+
+// Whether the registry's entries are as a sweep leaves them: each header's word 0 is its entry's slot (stress runs check it after
+// every parallel sweep).
+trusted fun __ablaRuntimeHostRegistryCheck(): void {
+    var slot = 0
+    while (slot < __ablaRuntimeHostRegistrySlots) {
+        val entry = ablaRuntimeLoadI64(__ablaRuntimeHostRegistry + slot * 8)
+        if (entry == 0 || (entry & 2) != 0 || ablaRuntimeLoadI64(entry & -16) != slot) ablaRuntimeTrap()
+        slot = slot + 1
+    }
+    return
+}
+
+trusted fun __ablaRuntimeHostSweepParallel(workers: int): void {
+    val slots = __ablaRuntimeHostRegistrySlots
+    val block = __ablaRuntimeHostSweepBlock
+    val contexts = ablaRuntimePointerAddress(__ablaRuntimeHostMalloc(workers * block))
+    if (contexts == 0) {
+        __ablaRuntimeHostBackgroundSweep()
+        return
+    }
+    var index = 0
+    var word = 0
+    val remaining = if (__ablaRuntimeHostSmallKept > __ablaRuntimeHostSmallBytes) __ablaRuntimeHostSmallKept - __ablaRuntimeHostSmallBytes else 0
+    while (index < workers) {
+        val context = contexts + index * block
+        word = 0
+        while (word < block) {
+            ablaRuntimeStoreI64(context + word, 0)
+            word = word + 8
+        }
+        ablaRuntimeStoreI64(context + 32, remaining / workers)
+        index = index + 1
+    }
+    ablaRuntimeStoreI64(__ablaRuntimeHostSweepShared() + 8, if (__ablaRuntimeHostGcStress) 1 else 0)
+    __ablaRuntimeHostSweepRun(1, contexts, workers, slots)
+    // The workers' lists join the global ones.
+    val lists = __ablaRuntimeHostSmallLists()
+    var freed = 0
+    var added = 0
+    index = 0
+    while (index < workers) {
+        val context = contexts + index * block
+        freed = freed + ablaRuntimeLoadI64(context + 16)
+        added = added + ablaRuntimeLoadI64(context + 24)
+        var total = 0
+        while (total <= 512) {
+            val head = ablaRuntimeLoadI64(context + 64 + total)
+            if (head != 0) {
+                ablaRuntimeStoreI64(ablaRuntimeLoadI64(context + 64 + 520 + total), ablaRuntimeLoadI64(lists + total))
+                ablaRuntimeStoreI64(lists + total, head)
+            }
+            total = total + 8
+        }
+        index = index + 1
+    }
+    __ablaRuntimeHostLiveBytes = __ablaRuntimeHostLiveBytes - freed
+    __ablaRuntimeHostSmallBytes = __ablaRuntimeHostSmallBytes + added
+    __ablaRuntimeHostSmallPushed = __ablaRuntimeHostSmallPushed + added
+    // B: the tagged entries to the helper's batch, the others down.
+    val registry = __ablaRuntimeHostRegistry
+    var kept = 0
+    var slot = 0
+    while (slot < slots) {
+        val entry = ablaRuntimeLoadI64(registry + slot * 8)
+        if (entry != 0) {
+            if ((entry & 2) != 0) __ablaRuntimeHostFreeBatch(entry & -16)
+            else {
+                ablaRuntimeStoreI64(registry + kept * 8, entry)
+                kept = kept + 1
+            }
+        }
+        slot = slot + 1
+    }
+    __ablaRuntimeHostRegistrySlots = kept
+    if (kept > 0) __ablaRuntimeHostSweepRun(2, contexts, workers, kept)
+    __ablaRuntimeHostFree(ablaRuntimePointerFromAddress(contexts))
+    if (__ablaRuntimeHostGcStress) __ablaRuntimeHostRegistryCheck()
+    if (__ablaRuntimeHostGcTrace) {
+        __ablaRuntimeHostStwTrace("gc: parallel sweep, slots ", 26, slots, " kept ", 6)
+        __ablaRuntimeHostStwTrace("", 0, kept, "\n", 1)
+    }
+    return
+}
+
 trusted fun __ablaRuntimeHostBackgroundSweep(): void {
     var kept = 0
     var slot = 0
