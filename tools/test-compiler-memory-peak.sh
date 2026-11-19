@@ -46,6 +46,14 @@ measure() { # KIND ROUND: the peak resident kB of one compile, in the file named
 }
 peak=""
 relative_peak=""
+recorded=$(grep -v '^#' "$record" | tail -n 1 | cut -d' ' -f1)
+# Five rounds keep a commit that did not move the peak from failing by luck, which matters near a limit. Clear of every
+# limit by a margin after two rounds (the gap within 3%, the peak within 7% over and 17% under the record), the rest
+# would only lower the minima (2026-11-19: 100 of the suite's CPU-seconds for the ten runs): the suite stops there.
+# More rounds can only bring a peak down, so a peak over a limit still fails, after all five. RUN_TESTS_FULL=1 or
+# MEMORY_PEAK_ROUNDS=5 always runs five.
+all_rounds=${MEMORY_PEAK_ROUNDS:-${RUN_TESTS_FULL:+5}}
+rounds=0
 for round in 1 2 3 4 5; do
     if (( round % 2 == 1 )); then first=absolute second=relative; else first=relative second=absolute; fi
     for kind in $first $second; do
@@ -56,12 +64,16 @@ for round in 1 2 3 4 5; do
             if [[ -z $relative_peak || $measured -lt $relative_peak ]]; then relative_peak=$measured; fi
         fi
     done
+    rounds=$round
+    if [[ $all_rounds != 5 ]] && (( round >= 2 && peak * 100 <= relative_peak * 103 &&
+        peak * 100 <= recorded * 107 && peak * 100 >= recorded * 83 )); then
+        break
+    fi
 done
 if (( peak * 100 > relative_peak * 105 )); then
     echo "compiler-memory-peak: $peak kB with the absolute path to src/orc_main.ab, $relative_peak kB with the relative one: a build's peak must not follow the length of the path (what keeps the path per name or local?)." >&2
     exit 1
 fi
-recorded=$(grep -v '^#' "$record" | tail -n 1 | cut -d' ' -f1)
 if (( peak * 100 > recorded * 110 )); then
     echo "compiler-memory-peak: $peak kB, over the recorded $recorded kB by more than 10%. Find what grew (ABLA_COMPILER_MEMORY_TRACE=1 prints live bytes by phase), or add a line to $record saying why." >&2
     exit 1
@@ -70,4 +82,4 @@ if (( peak * 100 < recorded * 80 )); then
     echo "compiler-memory-peak: $peak kB, more than 20% under the recorded $recorded kB: add a line to $record." >&2
     exit 1
 fi
-echo "compiler-memory-peak: --emit-llvm of the compiler peaks at $peak kB (recorded $recorded kB; $relative_peak kB given a relative path)"
+echo "compiler-memory-peak: --emit-llvm of the compiler peaks at $peak kB (recorded $recorded kB; $relative_peak kB given a relative path; $rounds rounds)"
