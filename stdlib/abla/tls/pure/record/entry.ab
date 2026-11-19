@@ -34,32 +34,36 @@ fun tlsRecordLimit(aead: int): int = if (aead == TLS_AEAD_CHACHA20_POLY1305) 171
 val TLS_MAX_CIPHERTEXT = 16640
 
 /** One direction's protection: the traffic key, the IV (12 bytes) and the next record's sequence number. */
-class TlsRecordProtection(val aead: int, val key: string, val iv: string, var sequence: int, var gcmKey: int = 0)
+class TlsRecordProtection(val aead: int, val key: string, val iv: string, var sequence: int, var gcm: AesGcmKey? = null)
 
-/** Ends what a protection holds beyond its key and IV strings (which its owner wipes): the expanded AES key's memory, wiped and freed. */
+/** Ends what a protection holds beyond its key and IV strings (which its owner wipes): the expanded AES key (dropped: wiped and freed). */
 fun tlsRecordProtectionRelease(var protection: TlsRecordProtection): void {
-    if (protection.gcmKey != 0) aesGcmKeyFree(protection.gcmKey, protection.key.size)
-    protection.gcmKey = 0
+    protection.gcm = null
     return
 }
 
 fun tlsRecordProtection(aead: int, key: string, iv: string): TlsRecordProtection =
     TlsRecordProtection(aead, key, iv, 0)
 
-// AES-GCM expands the traffic key once per protection, on its first record, where the CPU has AES instructions (aesGcmKeyNew: 0 elsewhere, and the key is expanded per record).
+// AES-GCM expands the traffic key once per protection, on its first record, where the CPU has AES instructions (aesGcmKeyOwner: null elsewhere, and the key is expanded per record).
 private fun tlsSeal(var protection: TlsRecordProtection, nonce: string, plaintext: string, aad: string): CryptoResult {
     if (protection.aead == TLS_AEAD_CHACHA20_POLY1305) return chaCha20Poly1305Seal(protection.key, nonce, plaintext, aad)
-    if (protection.gcmKey == 0) protection.gcmKey = aesGcmKeyNew(protection.key)
-    if (protection.gcmKey == 0) return aesGcmEncrypt(protection.key, nonce, plaintext, aad)
-    aesGcmSealWithKey(protection.gcmKey, protection.key.size, nonce, plaintext, aad)
+    if (protection.gcm == null) protection.gcm = aesGcmKeyOwner(protection.key)
+    tlsGcmSeal(protection.gcm, protection.key, nonce, plaintext, aad)
 }
 
 private fun tlsOpen(var protection: TlsRecordProtection, nonce: string, sealed: string, aad: string): CryptoResult {
     if (protection.aead == TLS_AEAD_CHACHA20_POLY1305) return chaCha20Poly1305Open(protection.key, nonce, sealed, aad)
-    if (protection.gcmKey == 0) protection.gcmKey = aesGcmKeyNew(protection.key)
-    if (protection.gcmKey == 0) return aesGcmDecrypt(protection.key, nonce, sealed, aad)
-    aesGcmOpenWithKey(protection.gcmKey, protection.key.size, nonce, sealed, aad)
+    if (protection.gcm == null) protection.gcm = aesGcmKeyOwner(protection.key)
+    tlsGcmOpen(protection.gcm, protection.key, nonce, sealed, aad)
 }
+
+// The kept key is read through a parameter (a field's resource would be moved into the safe call's hidden local); without one, the key bytes are expanded for this record.
+private fun tlsGcmSeal(gcm: AesGcmKey?, key: string, nonce: string, plaintext: string, aad: string): CryptoResult =
+    gcm?.seal(nonce, plaintext, aad) ?? aesGcmEncrypt(key, nonce, plaintext, aad)
+
+private fun tlsGcmOpen(gcm: AesGcmKey?, key: string, nonce: string, sealed: string, aad: string): CryptoResult =
+    gcm?.open(nonce, sealed, aad) ?? aesGcmDecrypt(key, nonce, sealed, aad)
 
 /** The key length of an AEAD, 0 for one this layer does not know. */
 fun tlsAeadKeyLength(aead: int): int =
