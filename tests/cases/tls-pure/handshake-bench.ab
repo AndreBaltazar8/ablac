@@ -1,0 +1,148 @@
+// Handshakes per second of the pure TLS client and server (abla/tls/pure), measured in one process without sockets: the two sides are pumped against each other and the
+// time inside each side's calls (creation, feed, takeOutput) is added up separately, so a side's cost per handshake is what one core of a server (or client) pays,
+// without the other side's work or the kernel. The client accepts any certificate (the server's cost is the subject; the client's excludes chain verification).
+//   handshake-bench <directory with ed25519.pem/.key, p256.pem/.key, rsa.pem/.key> [rounds]
+// Prints one line per scenario: key, version, full or resumed, server and client microseconds per handshake and handshakes per second per side.
+import "abla/io"
+import "abla/crypto"
+import "abla/crypto/x509"
+import "abla/process/arguments"
+import "abla/process/time"
+import "abla/sys/linux"
+import "abla/text"
+import "abla/sys/linux/process"
+import "abla/tls/pure/connection"
+import "abla/tls/pure/client"
+import "abla/tls/pure/handshake"
+import "abla/tls/pure/identity"
+import "abla/tls/pure/resume"
+import "abla/tls/pure/server"
+import "abla/tls/pure/tls12"
+import "abla/tls/pure/verify"
+
+var clock = 0
+var serverNanos = 0
+var clientNanos = 0
+
+fun now(): int = clock
+fun read(path: string): string = linuxReadFile(path, 1048576)
+fun acceptAny(chain: array<string>, scheme: int, content: string, signature: string): TlsVerdict = tlsAccepted()
+fun acceptServer(chain: array<string>, hostName: string, scheme: int, content: string, signature: string): TlsVerdict = tlsAccepted()
+
+fun pump(var client: TlsClient, var server: TlsServer): void {
+    var rounds = 0
+    while (rounds < 50) {
+        var t = monotonicNanoseconds()
+        val toServer = client.takeOutput()
+        clientNanos = clientNanos + (monotonicNanoseconds() - t)
+        t = monotonicNanoseconds()
+        if (toServer.size > 0) server.feed(toServer)
+        val toClient = server.takeOutput()
+        serverNanos = serverNanos + (monotonicNanoseconds() - t)
+        t = monotonicNanoseconds()
+        if (toClient.size > 0) client.feed(toClient)
+        clientNanos = clientNanos + (monotonicNanoseconds() - t)
+        if (toServer.size == 0 && toClient.size == 0) return
+        rounds = rounds + 1
+    }
+    return
+}
+
+fun report(label: string, rounds: int): void {
+    val s = serverNanos / 1000 / rounds
+    val c = clientNanos / 1000 / rounds
+    println("$label: server ${s} us (${if (s > 0) 1000000 / s else 0}/s), client ${c} us (${if (c > 0) 1000000 / c else 0}/s)")
+    serverNanos = 0
+    clientNanos = 0
+    return
+}
+
+fun decimal(text: string): int {
+    var value = 0
+    for (i in 0 until text.size) value = value * 10 + (text[i] - 48)
+    value
+}
+
+fun main: int {
+    val directory = processArgument(0)
+    val rounds = if (processArgumentCount() > 1) decimal(processArgument(1)) else 200
+    // An optional third argument picks one scenario: KIND:13, KIND:12 or KIND:resume.
+    val only = if (processArgumentCount() > 2) processArgument(2) else ""
+    clock = linuxRealtimeNanoseconds() / 1000000000
+    for (kind in ["ed25519", "p256", "rsa"]) {
+        val identity = tlsIdentityFromPem(read("$directory/$kind.pem"), read("$directory/$kind.key"))
+        if (!identity.ok()) {
+            println("$kind: ${identity.error}")
+            return 1
+        }
+        val keys = tlsTicketKeysNew(tlsPureRandom, now)
+        val baseClient = tlsClientConfig("localhost", acceptServer, tlsPureRandom)
+        // TLS 1.3, full (no tickets on the server: nothing to resume).
+        if (only == "" || only == "$kind:13") {
+        for (round in 0 until rounds) {
+            var t = monotonicNanoseconds()
+            var client = tlsClientNew(baseClient)
+            clientNanos = clientNanos + (monotonicNanoseconds() - t)
+            t = monotonicNanoseconds()
+            var server = tlsServerNew(tlsServerConfig(identity, tlsPureRandom))
+            serverNanos = serverNanos + (monotonicNanoseconds() - t)
+            pump(client, server)
+            if (!client.connected() || !server.connected()) {
+                println("$kind 1.3: handshake failed [${client.error}] [${server.error}]")
+                return 1
+            }
+        }
+        report("$kind TLS 1.3 full", rounds)
+        }
+        // TLS 1.2 (a client that offers only 1.2 suites, a server that has them).
+        if (only == "" || only == "$kind:12") {
+        val code = if (kind == "rsa") TLS12_ECDHE_RSA_AES_128_GCM_SHA256 else TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256
+        val oldClientConfig = TlsClientConfig("localhost", [], baseClient.signatureAlgorithms, [], acceptServer, tlsPureRandom, tlsPatchClientHello, [code])
+        val base = tlsServerConfig(identity, tlsPureRandom)
+        for (round in 0 until rounds) {
+            var t = monotonicNanoseconds()
+            var client = tlsClientNew(oldClientConfig)
+            clientNanos = clientNanos + (monotonicNanoseconds() - t)
+            t = monotonicNanoseconds()
+            var server = tlsServerNew(TlsServerConfig(identity, base.suites, base.groups, [], tlsPureRandom, false, false, acceptAny, [code]))
+            serverNanos = serverNanos + (monotonicNanoseconds() - t)
+            pump(client, server)
+            if (!client.connected() || !server.connected() || !server.v12) {
+                println("$kind 1.2: handshake failed [${client.error}] [${server.error}]")
+                return 1
+            }
+        }
+        report("$kind TLS 1.2 full", rounds)
+        }
+        // TLS 1.3 resumed: tickets on the server, a session cache on the client; each connection leaves the next ticket.
+        if (only == "" || only == "$kind:resume") {
+        val cache = tlsSessionCacheNew(now)
+        val scope = tlsX509Scope(x509TrustStoreFromPem(read("$directory/$kind.pem")))
+        val sessionConfig = TlsClientConfig("localhost", baseClient.suites, baseClient.signatureAlgorithms, [], acceptServer, tlsPureRandom, tlsPatchClientHello,
+            baseClient.suites12, false, [], cache, scope)
+        val ticketing = tlsServerConfig(identity, tlsPureRandom)
+        var resumed = 0
+        for (round in 0 until rounds + 1) {
+            var t = monotonicNanoseconds()
+            var client = tlsClientNew(sessionConfig)
+            clientNanos = clientNanos + (monotonicNanoseconds() - t)
+            t = monotonicNanoseconds()
+            var server = tlsServerNew(TlsServerConfig(identity, ticketing.suites, ticketing.groups, [], tlsPureRandom, false, false, acceptAny, ticketing.suites12, keys))
+            serverNanos = serverNanos + (monotonicNanoseconds() - t)
+            pump(client, server)
+            pump(client, server)
+            if (round == 0) {
+                // The first connection is a full one: not counted.
+                serverNanos = 0
+                clientNanos = 0
+            } else if (client.resumed()) resumed = resumed + 1
+        }
+        if (resumed != rounds) {
+            println("$kind: only $resumed of $rounds resumed")
+            return 1
+        }
+        report("$kind TLS 1.3 resumed", rounds)
+        }
+    }
+    0
+}
