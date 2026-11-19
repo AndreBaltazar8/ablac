@@ -234,7 +234,7 @@ grep -q -- '- a highlight' "$work/publish.md" || fail "the section after Houseke
 [[ $(head -n 1 "$work/publish.md") == '## Behaviour changes and migration (read first)' ]] || fail "the publish notes do not start at the first section"
 [[ $(grep -c '^### Bootstrap convergence' "$work/publish.md") -eq 1 ]] || fail "the convergence notes are not in the publish notes once"
 grep -q "^- route A: v9.9.8" "$work/publish.md" || fail "the convergence notes' route A line is missing"
-tail -n 1 "$work/publish.md" | grep -q 'seed compromise' || fail "the publish notes do not end with the convergence notes"
+[[ $(tail -n 1 "$work/publish.md") == *'seed compromise'* ]] || fail "the publish notes do not end with the convergence notes"
 # Refusals.
 sed 's/^- a fix$/- a fix [pending]/' "$draft" >"$work/pending.md"
 expect_fail "a draft with a [pending] line" "$notes" v9.9.9 "$work/pending.md" --convergence "$convergence_notes" --out "$work/p1.md"
@@ -255,8 +255,8 @@ grep -q 'RUN_TESTS_FULL=1 JOBS=8 taskset -c 16-23 tools/run-tests.sh' "$work/gat
 grep -q 'test-reproducible-elsewhere.sh --self build/ablac.bin' "$work/gate.txt" || fail "the reproducibility check is missing"
 grep -q 'make self-rebuild' "$work/gate.txt" || fail "make self-rebuild is missing"
 grep -q '8-11' "$work/gate.txt" && fail "slot 3's gate touches slot 2's cores"
-"$gate" "$project_root" 2 --dry-run 2>&1 | grep -q 'RUN_TESTS_FULL=1 JOBS=6 taskset -c 8-11,14-15 ' || fail "slot 2 is not 6 jobs on 8-11,14-15"
-GATE_CPUS=0-1 GATE_JOBS=2 "$gate" "$project_root" 1 --dry-run 2>&1 | grep -q 'RUN_TESTS_FULL=1 JOBS=2 taskset -c 0-1 ' || fail "GATE_CPUS and GATE_JOBS are not honoured"
+gate_out=$("$gate" "$project_root" 2 --dry-run 2>&1); grep -q 'RUN_TESTS_FULL=1 JOBS=6 taskset -c 8-11,14-15 ' <<<"$gate_out" || fail "slot 2 is not 6 jobs on 8-11,14-15"
+gate_out=$(GATE_CPUS=0-1 GATE_JOBS=2 "$gate" "$project_root" 1 --dry-run 2>&1); grep -q 'RUN_TESTS_FULL=1 JOBS=2 taskset -c 0-1 ' <<<"$gate_out" || fail "GATE_CPUS and GATE_JOBS are not honoured"
 expect_fail "a gate on a directory that is not a worktree" "$gate" "$work" 2 --dry-run
 expect_fail "a non-numeric slot" "$gate" "$project_root" two --dry-run
 expect_fail "no arguments" "$gate"

@@ -41,7 +41,7 @@ out=${out:-build/release-$tag.publish.md}
 [[ -f $draft ]] || fail "no draft at $draft"
 [[ -f $convergence ]] || fail "no convergence notes at $convergence (tools/release-convergence.sh run $tag writes them)"
 
-head -n 1 "$draft" | grep -q '^DRAFT for ' || fail "the first line of $draft is not the 'DRAFT for ...' header"
+[[ $(sed -n 1p "$draft") == 'DRAFT for '* ]] || fail "the first line of $draft is not the 'DRAFT for ...' header"
 if tail -n +2 "$draft" | grep -n '\[pending\]' >&2; then   # (the header line may say "nothing is [pending]")
     fail "$draft still has [pending] lines (listed above)"
 fi
