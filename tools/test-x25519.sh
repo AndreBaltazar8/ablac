@@ -20,6 +20,10 @@ for mode in release fast; do
     [[ ${X25519_MILLION:-0} == 1 ]] && extra=(million)
     result=$(ABLA_MAX_SECONDS=3000 "$root/tools/run-limited.sh" "$out/main.$mode" "${extra[@]}") || { echo "x25519 ($mode): $result" >&2; exit 1; }
     [[ $result == 'x25519 ok' ]] || { echo "x25519 ($mode): $result" >&2; exit 1; }
+    # The ten-limb field against the thirty-two-limb ladder it replaced (20,000 random inputs and the edge points).
+    "$compiler" build tests/cases/x25519/reference.ab -o "$out/reference.$mode" "${flags[@]}"
+    result=$(ABLA_MAX_SECONDS=3000 "$root/tools/run-limited.sh" "$out/reference.$mode") || { echo "x25519 reference ($mode): $result" >&2; exit 1; }
+    [[ $result == 'x25519 reference ok' ]] || { echo "x25519 reference ($mode): $result" >&2; exit 1; }
 done
 "$compiler" build tests/cases/x25519/tool.ab -o "$out/tool" --no-cache
 if command -v openssl > /dev/null && openssl genpkey -algorithm X25519 -out "$out/probe.pem" 2> /dev/null; then
