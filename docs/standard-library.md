@@ -324,8 +324,8 @@ Collection has two modes:
   program gets by default) runs the **mark** of each collection on n threads: the collecting thread and n - 1 it
   starts for the mark and joins at its end. It parallelizes only the mark, and only across objects: each thread
   claims an object by a compare-and-swap of its state word, keeps its own stack of claimed objects and trades work
-  with the others through a shared pool, so a graph of many objects divides well, while one very large array or
-  one long chain is still scanned by a single thread. The sweep (the pass that frees what the mark did not reach
+  with the others through a shared pool, so a graph of many objects divides well, and a large array's elements are scanned in chunks of 4,096 by several threads (an array of fewer than 8,192 elements, or
+  one long chain of objects, is still scanned by one thread). The sweep (the pass that frees what the mark did not reach
   and compacts the allocation registry) is still serial, and so is the root scan. The parallel mark needs the
   page directory for every pointer, so it does not use the lazy registry lookup a serial collection tries first. It is part of the collector that frees in the background, so a program gets it only when it turns that on (`memorySetBackgroundFree(true)`; the compiler and the editor server do).
   Measured on the editor's edit loop over the compiler's own source (16 collections, 3 to 6 runs each, a machine

@@ -1137,10 +1137,11 @@ mmap form) apply there.
 - [ ] **The parallel mark (`ABLA_GC_WORKERS=n`) is off by default; a condition before it is on (2026-11-19, ablac-4e).** The mark of a
   collection runs on n threads (2 to 8; docs/standard-library.md has the measurements: the editor's edit loop pause 3.9 s serial, 2.7 s at 4 threads,
   2.5 s at 8; its wall time 22.9 s to 21.4 and 21.0; tools/test-gc-parallel.sh, with the claim and the frozen group's flag mutation-checked).
-  *Split a large array's scan across threads.* A collection whose live data is one huge array (an HTTP server holding an 800,000-element array: 54
-  collections, pause 1.52 s serial and 1.50 to 1.63 s at 2, 4 and 8 threads, CPU +8 to 10%) gains nothing, and a server must not be slower with
-  workers on: the scan of one array is one thread's work. Push index ranges of a large array, not the array, onto the work list. The sweep (the
-  in-place registry compaction) is not parallel either, and is now more than half of a pause. *Explained (not a condition any more):* the first matrix's
+  *The large-array split is done (2026-11-19):* a large array's element scan (8,192 elements and more) is cut into chunks of 4,096 that the threads take from a
+  range queue (trace line "ranges by thread"). The HTTP burst server (800,000-element array per request, 54 collections, background free on): pause total
+  1.60 to 1.68 s serial, 1.34 to 1.49 s at 2 threads, 1.35 to 1.47 s at 4, 1.29 to 1.42 s at 8; CPU +6 to 17%. The gain is about 15% because a collection's
+  pause there is mostly the sweep (serial), not the mark. *What stands between this and default-on:* the sweep (the in-place registry compaction and the frees,
+  more than half of a pause) and a measurement of the compiler's own runtime share (the collector is 9.6 G of 54 s of a self-build's instructions).
   three runs at 2 threads that took 38 to 42 s wall (user CPU 37 to 40 s, against 20 s serial) were the process running on this machine's efficiency
   cores (16 to 31 of its hybrid CPU), not the parallel mark: pinned to cores 16-23 the serial run takes 37.3 s (user 34.6 s) and 2 threads 35.6 s,
   pinned to cores 0-7 24.9 s and 22.3 s (`taskset`, ABLA_GC_TRACE pauses 6.0 s and 5.1 s against 4.6 s and 2.9 s). Timing runs on this machine
