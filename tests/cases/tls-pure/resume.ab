@@ -1,7 +1,7 @@
 // TLS 1.3 session resumption (abla/tls/pure/resume): PSK with tickets, psk_dhe_ke, no 0-RTT, in one process with no sockets. A full handshake with a server that has
 // ticket keys leaves a ticket in the client's cache; the next connection resumes with it (no Certificate, `resumed()` on both sides, application data both ways,
 // a new ticket); a ticket is used once; tickets expire; a rotated key still opens what it sealed until they expire; a ticket of another server, another host
-// or another ALPN protocol, or one that was altered, gives a full handshake; a binder that does not verify is decrypt_error; a HelloRetryRequest keeps the PSK
+// or one that was altered, gives a full handshake; a binder that does not verify is decrypt_error; a HelloRetryRequest keeps the PSK
 // (the binder is recomputed); a server that asks for client certificates sends none; tickets and PSKs are wiped (the wipe rule of abla/crypto). Argument 0 is
 // the directory of tools/test-tls-pure-interop.sh. Prints "tls-pure resume ok".
 import "abla/io"
@@ -89,6 +89,28 @@ fun fullHandshake(identity: TlsIdentity, store: X509TrustStore, keys: TlsTicketK
         return false
     }
     true
+}
+
+/** A first connection (the client offers `firstOffer`, the server speaks `firstServer`) leaves a ticket; a second (`secondOffer`, `secondServer`) must resume it and negotiate `expected` afresh:
+ *  ALPN is a property of the connection, not of the session (RFC 7301 section 3.1); only early data would need the same protocol (RFC 8446 section 4.2.10), which this client does not send. */
+fun alpnResumes(identity: TlsIdentity, store: X509TrustStore, keys: TlsTicketKeys, what: string, firstOffer: array<string>, firstServer: array<string>,
+    secondOffer: array<string>, secondServer: array<string>, expected: string): void {
+    val cache = tlsSessionCacheNew(now)
+    var first = clientWith(store, "localhost", cache, firstOffer)
+    var firstPeer = serverWith(identity, keys, [], firstServer)
+    pump(first, firstPeer)
+    pump(first, firstPeer)
+    if (!first.connected() || cache.count("localhost") != 1) {
+        fail("$what: the first connection: [${first.error}] tickets ${cache.count("localhost")}")
+        return
+    }
+    var second = clientWith(store, "localhost", cache, secondOffer)
+    if (cache.count("localhost") != 0) fail("$what: the client did not offer its ticket")
+    var secondPeer = serverWith(identity, keys, [], secondServer)
+    pump(second, secondPeer)
+    if (!second.connected() || !second.resumed() || !secondPeer.resumed()) fail("$what: not resumed: [${second.error}] [${secondPeer.error}]")
+    if (second.alpn() != expected) fail("$what: ALPN '${second.alpn()}' instead of '$expected'")
+    return
 }
 
 fun main: int {
@@ -182,21 +204,12 @@ fun main: int {
     var wrongHost = clientWith(store, "example.test", otherCache)
     if (otherCache.count("localhost") != 1) fail("a ticket for another host was taken")
     wrongHost.takeOutput()
-    // ALPN: the ticket remembers the protocol; a client that offers another one, or none, does not take it.
-    val alpnCache = tlsSessionCacheNew(now)
-    var alpnClient = clientWith(store, "localhost", alpnCache, ["h2", "http/1.1"])
-    var alpnServer = serverWith(identity, keys, [], ["h2"])
-    pump(alpnClient, alpnServer)
-    pump(alpnClient, alpnServer)
-    if (alpnClient.alpn() != "h2" || alpnCache.count("localhost") != 1) fail("the ALPN session: ${alpnClient.alpn()} ${alpnCache.count("localhost")}")
-    val offered = clientWith(store, "localhost", alpnCache, ["http/1.1"])
-    if (alpnCache.count("localhost") != 1) fail("a ticket for h2 was taken by a client offering http/1.1")
-    val none = clientWith(store, "localhost", alpnCache)
-    if (alpnCache.count("localhost") != 1) fail("a ticket for h2 was taken by a client offering no ALPN protocol")
-    var alpnAgain = clientWith(store, "localhost", alpnCache, ["http/1.1", "h2"])
-    var alpnAgainServer = serverWith(identity, keys, [], ["h2"])
-    pump(alpnAgain, alpnAgainServer)
-    if (!alpnAgain.resumed() || alpnAgain.alpn() != "h2") fail("the ALPN session did not resume: ${alpnAgain.alpn()} ${alpnAgain.error}")
+    // ALPN is chosen afresh on every connection: a ticket resumes whatever protocols the new hello offers.
+    alpnResumes(identity, store, keys, "h2 ticket, same offer", ["h2", "http/1.1"], ["h2"], ["http/1.1", "h2"], ["h2"], "h2")
+    alpnResumes(identity, store, keys, "h2 ticket, offer of http/1.1 only", ["h2", "http/1.1"], ["h2", "http/1.1"], ["http/1.1"], ["h2", "http/1.1"], "http/1.1")
+    alpnResumes(identity, store, keys, "h2 ticket, no ALPN offered", ["h2"], ["h2"], [], ["h2"], "")
+    alpnResumes(identity, store, keys, "ticket without ALPN, an offered list (HTTP/1.1-only server)", [], [], ["h2", "http/1.1"], [], "")
+    alpnResumes(identity, store, keys, "ticket without ALPN, the server now speaks h2", [], [], ["h2", "http/1.1"], ["h2"], "h2")
 
     // An altered ticket gives a full handshake (the server cannot open it); an altered binder is decrypt_error.
     val tamperCache = tlsSessionCacheNew(now)
@@ -227,15 +240,15 @@ fun main: int {
     }
 
 
-    // The server binds a ticket to the server name and ALPN protocol of its session: a valid ticket with a valid binder, in a ClientHello for another name (or
-    // another protocol), is a full handshake, not a resumption and not an error (BoGo TLS13-Server-NoResumptionAcrossNames).
+    // The server binds a ticket to the server name of its session (not its ALPN protocol, chosen afresh: alpnResumes): a valid ticket with a valid binder, in a ClientHello for another name (or
+    // the same name with another protocol resumes), is a full handshake, not a resumption and not an error (BoGo TLS13-Server-NoResumptionAcrossNames).
     val acrossCache = tlsSessionCacheNew(now)
     if (!fullHandshake(identity, store, keys, acrossCache, "across names")) return 1
     val taken = acrossCache.take("localhost", [], tlsX509Scope(store))
     if (taken == null) {
         fail("no ticket for the names test")
     } else {
-        for (variant in 0 until 2) {
+        for (variant in 0 until 1) {
             val random32 = random(32)
             val base = tlsClientConfig("localhost", tlsX509Verifier(store, now), random)
             val offer = tlsClientShares(tlsDefaultGroups(), true, random)
@@ -300,12 +313,12 @@ fun main: int {
     unit.put("host", "", TLS_SUITE_AES_128_GCM_SHA256, "ticket-one", "psk-one", 1, 10, "scope-a")
     unit.put("host", "h2", TLS_SUITE_AES_128_GCM_SHA256, "ticket-two", "psk-two", 2, 100, "scope-a")
     if (unit.count("host") != 2 || unit.count("other") != 0) fail("the cache counts")
-    if (unit.take("host", ["http/1.1"], "scope-a") != null) fail("a ticket for h2 or none was taken by a client offering http/1.1")
-    if (unit.take("host", ["h2"], "scope-a") == null) fail("the h2 ticket was not taken")
-    if (unit.take("host", ["h2"], "scope-a") != null) fail("the h2 ticket was taken twice")
-    if (unit.take("host", ["h2"], "scope-a") != null) fail("the ticket without ALPN was taken by a client offering h2")
-    val bare = unit.take("host", [], "scope-a")
-    if (bare == null || bare.ticket != "ticket-one") fail("the ticket without ALPN was not taken by a client offering none")
+    // The offered protocols do not select a ticket (ALPN belongs to the connection): the newest ticket of the host goes first, whatever the hello offers.
+    val newestTicket = unit.take("host", ["http/1.1"], "scope-a")
+    if (newestTicket == null || newestTicket.ticket != "ticket-two") fail("an offer of http/1.1 did not take the newest ticket")
+    val older = unit.take("host", [], "scope-a")
+    if (older == null || older.ticket != "ticket-one") fail("an offer of no protocol did not take the remaining ticket")
+    if (unit.take("host", ["h2"], "scope-a") != null) fail("a ticket was taken twice")
     unit.put("host", "", TLS_SUITE_AES_128_GCM_SHA256, "ticket-three", "psk-three", 3, 10, "scope-a")
     clock = clock + 11
     if (unit.take("host", [], "scope-a") != null) fail("an expired ticket was taken")
