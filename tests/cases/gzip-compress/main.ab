@@ -1,0 +1,91 @@
+// gzipCompress over a corpus: empty and tiny inputs, long runs, repetitions at the edges of the match window (distance 32767, 32768, 32769) and of the longest match
+// (258, 259), text and JSON from the given files, incompressible random data at the sizes where a stored block splits (65534 to 65537, 200000), data of many
+// distinct literals (a block of 16383 tokens and past it), and mixes. Each input is compressed, decompressed by our decoder and compared, and written as
+// <directory>/<name>.raw and <directory>/<name>.gz for tools/test-gzip-compress.sh to decode with gzip and Node's zlib. Arguments: the directory, then
+// files to include as they are. Prints "gzip-compress ok N cases" and, per case, "name raw gz ratio".
+import "abla/io"
+import "abla/fs"
+import "abla/bytes"
+import "abla/compression/gzip"
+import "abla/process/arguments"
+import "abla/text"
+
+var failures = 0
+var seed = 20261119
+var cases = 0
+
+fun next(): int {
+    seed = (seed * 1103515245 + 12345) & 2147483647
+    (seed >> 16) & 255
+}
+
+fun random(count: int): string {
+    val bytes = byteBuffer()
+    for (i in 0 until count) bytes.appendByteValue(next())
+    bytes.toText()
+}
+
+fun repeated(unit: string, count: int): string {
+    val bytes = byteBuffer()
+    for (i in 0 until count) bytes.appendText(unit)
+    bytes.toText()
+}
+
+fun run(directory: string, name: string, raw: string): void {
+    cases = cases + 1
+    val packed = gzipCompress(raw)
+    val back = gzipDecompress(packed, raw.size + 1024)
+    if (back.error != "" || back.data != raw) {
+        failures = failures + 1
+        println("FAIL $name: our decoder gave back ${back.data.size} bytes (error '${back.error}'), wanted ${raw.size}")
+    }
+    path("$directory/$name.raw").writeText(raw)
+    path("$directory/$name.gz").writeText(packed)
+    println("$name ${raw.size} ${packed.size}")
+    return
+}
+
+fun main: int {
+    val directory = processArgument(0)
+    run(directory, "empty", "")
+    run(directory, "one", "a")
+    run(directory, "two", "ab")
+    run(directory, "three", "abc")
+    run(directory, "five-a", "aaaaa")
+    run(directory, "overlap", repeated("abc", 100))
+    run(directory, "zeros-1m", "\x00".repeat(1048576))
+    run(directory, "ones-70000", "\xff".repeat(70000))
+    run(directory, "random-100", random(100))
+    run(directory, "random-100k", random(100000))
+    run(directory, "random-1m", random(1048576))
+    for (size in [65534, 65535, 65536, 65537, 131070, 200000]) run(directory, "random-$size", random(size))
+    // Distinct literals past a block: 16383 tokens and beyond.
+    for (size in [16382, 16383, 16384, 16385, 40000]) run(directory, "literals-$size", random(size))
+    // A pattern repeated at exactly the edges of the window and of the longest match.
+    for (gap in [32767, 32768, 32769, 1, 2, 3, 4, 5, 255, 256, 257, 258, 259, 260]) {
+        val unit = random(gap)
+        run(directory, "gap-$gap", unit + unit + unit.slice(0, gap / 2))
+    }
+    for (length in [257, 258, 259, 260, 515, 516, 517]) run(directory, "run-$length", "x".repeat(length) + "y" + "x".repeat(length))
+    // Mixes: random and zeros alternating, text with random bytes inside, a short alphabet.
+    val mixed = byteBuffer()
+    for (i in 0 until 40) {
+        mixed.appendText(random(700))
+        mixed.appendText("\x00".repeat(1500))
+        mixed.appendText("the quick brown fox jumps over the lazy dog ")
+    }
+    run(directory, "mixed", mixed.toText())
+    val small = byteBuffer()
+    for (i in 0 until 200000) small.appendByteValue(97 + (next() & 3))
+    run(directory, "alphabet-4", small.toText())
+    val skew = byteBuffer()
+    for (i in 0 until 200000) skew.appendByteValue(if (next() < 230) 97 else next())
+    run(directory, "skewed", skew.toText())
+    val files = processArgumentCount()
+    for (index in 1 until files) {
+        val file = processArgument(index)
+        run(directory, "file-$index", path(file).readText())
+    }
+    if (failures == 0) println("gzip-compress ok $cases cases")
+    failures
+}

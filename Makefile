@@ -214,6 +214,7 @@ test-serial: ablac
 	tools/test-workflow-syntax.sh $(COMPILER)
 	tools/test-gzip-inflate.sh $(COMPILER)
 	tools/test-gzip-stream.sh $(COMPILER)
+	tools/test-gzip-compress.sh $(COMPILER)
 	tools/test-gzip-parity.sh $(COMPILER)
 	tools/test-tar-reader.sh $(COMPILER)
 	tools/test-tar-stream.sh $(COMPILER)
