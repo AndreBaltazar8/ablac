@@ -327,7 +327,7 @@ Collection has two modes:
   with the others through a shared pool, so a graph of many objects divides well, while one very large array or
   one long chain is still scanned by a single thread. The sweep (the pass that frees what the mark did not reach
   and compacts the allocation registry) is still serial, and so is the root scan. The parallel mark needs the
-  page directory for every pointer, so it does not use the lazy registry lookup a serial collection tries first.
+  page directory for every pointer, so it does not use the lazy registry lookup a serial collection tries first. It is part of the collector that frees in the background, so a program gets it only when it turns that on (`memorySetBackgroundFree(true)`; the compiler and the editor server do).
   Measured on the editor's edit loop over the compiler's own source (16 collections, 3 to 6 runs each, a machine
   under load): the collections' total pause 3.9 s serial, 3.1 s at 2 threads, 2.7 s at 4 and 2.5 s at 8
   (the mark itself about 2.1 s, 0.9 s at 4 threads), the loop's wall time 22.9 s, 22.1, 21.4 and 21.0, its user
