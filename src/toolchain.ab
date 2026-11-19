@@ -32,6 +32,7 @@ import "backend/llvm/debug.ab"
 import "backend/llvm/bindings.ab"
 import "codegen_units.ab"
 import "wasm_panic.ab"
+import "abla/process/exit"
 import "sema.ab"
 import "abla/sys/linux"
 import "ir.ab"
@@ -2230,6 +2231,31 @@ trusted fun bootstrapHeldMarkStringReferences(
 val BOOTSTRAP_COMPILER_RELEASE_PASSES =
     "memprof-remove-attributes,annotation2metadata,forceattrs,inferattrs,coro-early,function<eager-inv>(ee-instrument<>,lower-expect,simplifycfg<bonus-inst-threshold=1;no-forward-switch-cond;no-switch-range-to-icmp;no-switch-to-arithmetic;no-switch-to-lookup;keep-loops;no-hoist-common-insts;no-hoist-loads-stores-with-cond-faulting;no-sink-common-insts;speculate-blocks;simplify-cond-branch;no-speculate-unpredictables>,sroa<modify-cfg>,early-cse<>),openmp-opt,ipsccp,called-value-propagation,globalopt,function<eager-inv>(mem2reg,instcombine<max-iterations=1;no-verify-fixpoint>,simplifycfg<bonus-inst-threshold=1;no-forward-switch-cond;switch-range-to-icmp;no-switch-to-arithmetic;no-switch-to-lookup;keep-loops;no-hoist-common-insts;no-hoist-loads-stores-with-cond-faulting;no-sink-common-insts;speculate-blocks;simplify-cond-branch;no-speculate-unpredictables>),always-inline,require<globals-aa>,function(invalidate<aa>),require<profile-summary>,cgscc(devirt<4>(inline,function-attrs<skip-non-recursive-function-attrs>,function<eager-inv;no-rerun>(sroa<modify-cfg>,early-cse<memssa>,simplifycfg<bonus-inst-threshold=1;no-forward-switch-cond;switch-range-to-icmp;no-switch-to-arithmetic;no-switch-to-lookup;keep-loops;no-hoist-common-insts;no-hoist-loads-stores-with-cond-faulting;no-sink-common-insts;speculate-blocks;simplify-cond-branch;no-speculate-unpredictables>,instcombine<max-iterations=1;no-verify-fixpoint>,libcalls-shrinkwrap,simplifycfg<bonus-inst-threshold=1;no-forward-switch-cond;switch-range-to-icmp;no-switch-to-arithmetic;no-switch-to-lookup;keep-loops;no-hoist-common-insts;no-hoist-loads-stores-with-cond-faulting;no-sink-common-insts;speculate-blocks;simplify-cond-branch;no-speculate-unpredictables>,loop-mssa(loop-instsimplify,loop-simplifycfg,licm<no-allowspeculation>,loop-rotate<header-duplication;no-prepare-for-lto;no-check-exit-count>,licm<allowspeculation>,simple-loop-unswitch<no-nontrivial;trivial>),simplifycfg<bonus-inst-threshold=1;no-forward-switch-cond;switch-range-to-icmp;no-switch-to-arithmetic;no-switch-to-lookup;keep-loops;no-hoist-common-insts;no-hoist-loads-stores-with-cond-faulting;no-sink-common-insts;speculate-blocks;simplify-cond-branch;no-speculate-unpredictables>,memcpyopt,coro-elide,simplifycfg<bonus-inst-threshold=1;no-forward-switch-cond;switch-range-to-icmp;no-switch-to-arithmetic;no-switch-to-lookup;keep-loops;no-hoist-common-insts;no-hoist-loads-stores-with-cond-faulting;no-sink-common-insts;speculate-blocks;simplify-cond-branch;no-speculate-unpredictables>),function-attrs,function(require<should-not-run-function-passes>),coro-split,coro-annotation-elide)),deadargelim,coro-cleanup,globalopt,globaldce,elim-avail-extern,rpo-function-attrs,recompute-globalsaa,alloc-token,globaldce,constmerge,cg-profile,rel-lookup-table-converter,lower-comment-string,function(annotation-remarks),globaldce"
 
+// The bootstrap check (the gate's stage2 == stage3): a release build of the compiler hands opt the bitcode of its module
+// (`<output>.o.preopt.bc`); ABLA_COMPILER_BITCODE=<path> keeps a copy of it there. With ABLA_COMPILER_BITCODE_ONLY=1
+// the build ends once the copy is written (status 0, no executable): stage 3 is then the compiler run that emits this
+// bitcode, compared byte for byte with what stage 2 was built from. Equal bitcode gives the same executable, opt and
+// code generation being deterministic (tools/test-reproducible-build.sh checks that on its own); opt and code
+// generation took 43 of a stage's 54 s. A program built some other way (not a large LLVM-linked release executable)
+// never writes this bitcode, so it keeps no copy and does not stop.
+fun bootstrapKeepCompilerBitcode(bitcodePath: string, outputPath: string): void {
+    val requested = linuxEnvironment("ABLA_COMPILER_BITCODE")
+    if (!requested.found || requested.value == "") return
+    val only = linuxEnvironment("ABLA_COMPILER_BITCODE_ONLY")
+    val stop = only.found && only.value == "1"
+    val status = bootstrapPublishCacheFile(bitcodePath, requested.value)
+    if (status != 0) {
+        linuxPrintStandardError(
+            "error[E_BUILD_IO]: could not keep the compiler's bitcode at ${requested.value} (status $status)\n"
+        )
+    }
+    if (!stop) return
+    Path(bitcodePath).remove()
+    bootstrapRemoveBuildTemporaries(outputPath)
+    if (status == 0) linuxPrintStandardError("note: the compiler's bitcode is at ${requested.value}; stopped there (ABLA_COMPILER_BITCODE_ONLY=1)\n")
+    exit(if (status == 0) 0 else 1)
+}
+
 fun bootstrapPrepareSplitLlvm(llvmPath: string, preparedPath: string): int {
     val prepare = linuxCommand(bootstrapHostLlvmTool("opt"))
     prepare.argument("-passes=$BOOTSTRAP_COMPILER_RELEASE_PASSES")
@@ -4098,7 +4124,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                         if (status != 0) {
                             status = 145
                             failureKind = "io"
-                        }
+                        } else bootstrapKeepCompilerBitcode(compilerBitcodePath, outputPath)
                     } else {
                         heldText = bootstrapRenderHeldModule()
                     }

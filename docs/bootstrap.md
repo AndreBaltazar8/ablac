@@ -30,6 +30,16 @@ it to rebuild the current sources. `make self-rebuild` builds another compiler,
 requires byte-identical LLVM IR from both compilers, audits the child for
 unresolved Abla runtime symbols, and uses it to build and run a native probe.
 
+`tools/bootstrap-stages.sh <bootstrap> <directory>` is the fixed-point check
+of a tree: it builds stage 1 with the given compiler and stage 2 with stage 1,
+keeping the bitcode stage 2 was built from (`ABLA_COMPILER_BITCODE=<path>`),
+then runs stage 2 only up to its own bitcode (`ABLA_COMPILER_BITCODE_ONLY=1`)
+and compares the two byte for byte. Equal bitcode gives the same executable,
+since `opt` and code generation are deterministic
+(`tools/test-reproducible-build.sh`), and skipping them saves about 48 s of a
+three-stage build. It prints `stage2 == stage3` only on a match. `--full`
+builds stage 3 whole and also compares the executables, for release gates.
+
 `tools/test-clean-bootstrap.sh` checks that path from a fresh clone: the
 pinned release builds a stage-1 compiler from the current sources, and the
 stage-1 builds and runs a program. It reports which errors stop it when the

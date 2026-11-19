@@ -33,4 +33,9 @@ ABLA_COMPILER_PAYLOAD=$compiler \
     ABLA_MAX_MEMORY_MB=$build_memory_mb ABLA_MAX_SECONDS=$build_seconds \
     "$project_root/tools/run-limited-compiler.sh" build "$entry" -o "$output" --no-cache
 
+# ABLA_COMPILER_BITCODE_ONLY=1 stops the build at the compiler's bitcode (tools/bootstrap-stages.sh): no executable.
+if [[ ${ABLA_COMPILER_BITCODE_ONLY:-} == 1 ]]; then
+    [[ -s ${ABLA_COMPILER_BITCODE:-} ]] || exit 1
+    exit 0
+fi
 [[ -x $output ]] || exit 1
