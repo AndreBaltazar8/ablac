@@ -51,6 +51,8 @@ esac
 if [[ ${foreign_flags[0]:-} == skip ]]; then
     echo "emutls: foreign threads: x86-64 Linux and macOS only"
 else
+    # Both libraries are built before either is run: a --fast library that does not link (a symbol a dylib lacks) must not wait
+    # behind a release run's result (master CI, 2026-11-18: the fast dylib failed to link after the release one had passed).
     for mode in release fast; do
         flags=(--no-cache)
         [[ $mode == fast ]] && flags+=(--fast)
@@ -58,8 +60,12 @@ else
         [[ $(uname -s) != Darwin ]] || library=foreign-$mode.dylib
         "$compiler" build tests/cases/emutls/foreign-lib.ab --emit shared-library -o "$out/$library" "${flags[@]}" \
             > "$out/foreign-$mode.build.log" 2>&1 || { cat "$out/foreign-$mode.build.log" >&2; echo "emutls: the foreign-thread library ($mode) did not build" >&2; exit 1; }
-        clang tests/cases/emutls/foreign-driver.c -o "$out/foreign-driver" ${foreign_flags[@]+"${foreign_flags[@]}"} ||
-            { echo "emutls: the foreign-thread driver did not build" >&2; exit 1; }
+    done
+    clang tests/cases/emutls/foreign-driver.c -o "$out/foreign-driver" ${foreign_flags[@]+"${foreign_flags[@]}"} ||
+        { echo "emutls: the foreign-thread driver did not build" >&2; exit 1; }
+    for mode in release fast; do
+        library=foreign-$mode.so
+        [[ $(uname -s) != Darwin ]] || library=foreign-$mode.dylib
         status=0
         result=$("$root/tools/run-limited.sh" "$out/foreign-driver" "$PWD/$out/$library" 200 8 "$foreign_allowed" 2>&1) || status=$?
         [[ $status -eq 0 ]] || { echo "emutls (foreign threads, $mode): exit $status: $result" >&2; exit 1; }
