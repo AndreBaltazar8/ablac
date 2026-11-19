@@ -443,6 +443,7 @@ test-serial: ablac
 	tools/test-rsa-fast.sh $(COMPILER)
 	tools/test-p384.sh $(COMPILER)
 	tools/test-sha3-fast.sh $(COMPILER)
+	tools/test-chacha-simd.sh $(COMPILER)
 	tools/test-p256.sh $(COMPILER)
 	tools/test-tls-handles.sh $(COMPILER)
 	tools/test-tls-chains.sh $(COMPILER)

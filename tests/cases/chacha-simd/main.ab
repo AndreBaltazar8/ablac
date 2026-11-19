@@ -1,0 +1,73 @@
+// ChaCha20 on four blocks at a time (abla/crypto/chacha20poly1305, x86-64 and AArch64: vectors) against the scalar block function: a whole message in one call against the same
+// message in pieces of 192 bytes (under the 256 where the vector path starts, so each piece runs the scalar blocks, with the counter advanced by hand), over random keys, nonces,
+// starting counters (including one that makes the 32-bit block counter wrap inside a message) and lengths from 0 to 70000 around every multiple of 64 and 256; the AEAD seals and
+// opens the same messages and refuses altered ones. Prints "chacha-simd ok".
+import "abla/io"
+import "abla/crypto"
+import "abla/crypto/chacha20poly1305"
+import "abla/crypto/result"
+import "abla/text"
+
+var failures = 0
+var seed = 7
+
+fun fail(what: string): void {
+    failures = failures + 1
+    if (failures < 30) println("FAIL $what")
+    return
+}
+
+fun next(): int {
+    seed = (seed * 1103515245 + 12345) & 2147483647
+    (seed >> 16) & 255
+}
+
+fun random(count: int): string {
+    val bytes: array<int> = []
+    for (i in 0 until count) bytes.append(next())
+    cryptoByteString(bytes)
+}
+
+fun main: int {
+    val lengths = [0, 1, 63, 64, 65, 191, 192, 193, 255, 256, 257, 319, 320, 511, 512, 513, 767, 1000, 1024, 1025, 4096, 16384, 16385, 70000]
+    for (length in lengths) {
+        for (round in 0 until 3) {
+            val key = random(32)
+            val nonce = random(12)
+            val counter = if (round == 0) 0 else if (round == 1) 1 else 4294967200
+            val data = random(length)
+            val whole = chaCha20Xor(key, counter, nonce, data)
+            if (!whole.ok) {
+                // A counter that wraps inside the message is refused; shorter ones are not.
+                if (counter + (length + 63) / 64 <= 4294967296) fail("xor length $length counter $counter refused: ${whole.error}")
+                continue
+            }
+            var pieces = ""
+            var at = 0
+            var block = 0
+            while (at < length) {
+                val take = if (length - at < 192) length - at else 192
+                val part = chaCha20Xor(key, counter + block, nonce, data.slice(at, at + take))
+                pieces = pieces + part.bytes
+                at = at + take
+                block = block + 3
+            }
+            if (pieces != whole.bytes) fail("xor length $length counter $counter: the vector path differs from the scalar blocks")
+        }
+        val key = random(32)
+        val nonce = random(12)
+        val aad = random(next() % 40)
+        val plain = random(length)
+        val sealed = chaCha20Poly1305Seal(key, nonce, plain, aad)
+        val reference = chaCha20Xor(key, 1, nonce, plain)
+        if (!sealed.ok || sealed.bytes.slice(0, length) != reference.bytes) fail("seal length $length: the ciphertext differs from the scalar blocks")
+        val opened = chaCha20Poly1305Open(key, nonce, sealed.bytes, aad)
+        if (!opened.ok || opened.bytes != plain) fail("open length $length")
+        val at = next() % sealed.bytes.size
+        val bent = sealed.bytes.slice(0, at) + cryptoByteString([sealed.bytes[at] ^ 1]) + sealed.bytes.slice(at + 1, sealed.bytes.size)
+        if (chaCha20Poly1305Open(key, nonce, bent, aad).ok) fail("an altered record was accepted: length $length")
+    }
+    if (failures > 0) return 1
+    println("chacha-simd ok")
+    0
+}
