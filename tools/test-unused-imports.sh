@@ -6,7 +6,8 @@
 # `export import` line instead, and a module that runs compile code keeps its imports. Another project's module, a
 # vendored package and a checkout linked in get none, nor does any module after a front end that stopped at an error.
 # `ablac fix-imports --prune` removes the warned imports, leaves the entry's, keeps the abla/compiler import a
-# #compilerGrant uses, refuses a build that fails before every use is known, and the pruned programs still build.
+# #compilerGrant uses, refuses a build that fails before every use is known, reaches the project's other directories
+# from a test file's root, and the pruned programs still build.
 set -euo pipefail
 
 compiler=${1:-build/ablac}
@@ -159,6 +160,19 @@ grep -qxF 'warning[W_UNUSED_IMPORT]: lib.ab: nothing `import "abla/json"` declar
     fail "the library prune refused" "$work/library-prune.log"
 ! grep -qxF 'import "abla/json"' "$work/library/lib.ab" || fail "the library prune left abla/json" "$work/library/lib.ab"
 grep -qxF 'import "abla/text"' "$work/library/lib.ab" || fail "the library prune removed abla/text" "$work/library/lib.ab"
+
+# A root in another directory of the project (tests/lib_test.ab, abla.toml one up): the build warns in src/lib.ab, and
+# the prune from that root removes it there; the project is the manifest's directory, not the root file's.
+(cd "$work/nested" && "$compiler" build tests/lib_test.ab -o program --fast) > "$work/nested.log" 2>&1 ||
+    fail "nested/tests/lib_test.ab doesn't build" "$work/nested.log"
+grep -qxF 'warning[W_UNUSED_IMPORT]: src/lib.ab: nothing `import "abla/json"` declares is used here' "$work/nested.log" ||
+    fail "no warning in nested/src/lib.ab" "$work/nested.log"
+(cd "$work/nested" && "$compiler" fix-imports tests/lib_test.ab --prune) > "$work/nested-prune.log" 2>&1 ||
+    fail "the nested prune failed" "$work/nested-prune.log"
+grep -qxF 'fix-imports: removed 1 unused import(s) in 1 file(s); 0 restored, 0 left' "$work/nested-prune.log" ||
+    fail "the nested prune didn't remove src/lib.ab's import" "$work/nested-prune.log"
+! grep -qxF 'import "abla/json"' "$work/nested/src/lib.ab" || fail "the nested prune left abla/json" "$work/nested/src/lib.ab"
+grep -qxF 'import "abla/text"' "$work/nested/src/lib.ab" || fail "the nested prune removed abla/text" "$work/nested/src/lib.ab"
 
 # Extensions nothing calls: their receivers and declared types are uses (sema never checks those bodies).
 (cd "$work/receiver" && "$compiler" build main.ab -o program --fast --warn-unused-imports) > "$work/receiver.log" 2>&1 ||
