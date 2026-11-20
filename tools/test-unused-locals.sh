@@ -21,6 +21,11 @@ warning[W_UNUSED_LOCAL]: main.ab: `dead` is never used
 warning[W_UNUSED_LOCAL]: main.ab: `stale` is never used
 TXT
 diff "$work/expected.txt" "$work/warnings.txt" > "$work/warn.diff" || fail "the warnings differ" "$work/warn.diff"
+# Their places are the file's own offsets (the named arguments above them are rewritten before sema numbers the text).
+for name in dead stale; do
+    place=$(grep -A1 "\`$name\` is never used" "$work/warn.log" | sed -n "s/^source\[local\]:main.ab:\([0-9]*\):.*/\1/p")
+    [[ $(tail -c +$((place + 1)) "$work/main.ab" | head -c 3) == va? ]] || fail "$name points at offset $place" "$work/main.ab"
+done
 (cd "$work" && "$compiler" build main.ab -o program --fast) > "$work/plain.log" 2>&1 || fail "plain build failed" "$work/plain.log"
 ! grep -q W_UNUSED_LOCAL "$work/plain.log" || fail "a warning without --warn-unused-locals" "$work/plain.log"
 
@@ -47,6 +52,7 @@ const names = [];
 for (const d of warned) {
   if (d.severity !== "warning" || JSON.stringify(d.tags) !== "[\"unnecessary\"]") fail("severity or tags: " + JSON.stringify(d));
   const name = bytes.subarray(d.range.start, d.range.end).toString();
+  if (name !== "dead" && name !== "stale") fail("the range holds " + JSON.stringify(name));
   const fix = (d.fixes || [])[0];
   if (!fix || fix.kind !== "replace" || fix.edits.length !== 1 || fix.edits[0].newText !== "_" + name ||
       fix.edits[0].range.start !== d.range.start || fix.edits[0].range.end !== d.range.end) fail("fix: " + JSON.stringify(d.fixes));
