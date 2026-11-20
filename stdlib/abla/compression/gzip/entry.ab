@@ -577,6 +577,22 @@ private trusted fun deflateCompress(input: string, searchLimit: int): string {
 
 private @threadShared val gzipCrcTable: array<int> = gzipMakeCrcTable()
 
+// Slicing-by-8: table k (entries 256 k to 256 k + 255) is the CRC of a byte followed by k zero bytes, so eight bytes are folded at once.
+private @threadShared val gzipCrcSlices: array<int> = gzipMakeCrcSlices()
+
+private fun gzipMakeCrcSlices(): array<int> {
+    val base = gzipMakeCrcTable()
+    val slices = filledArray(2048, 0)
+    for (i in 0 until 256) slices[i] = base[i]
+    for (k in 1 until 8) {
+        for (i in 0 until 256) {
+            val previous = slices[(k - 1) * 256 + i]
+            slices[k * 256 + i] = (previous >>> 8) ^ base[previous & 255]
+        }
+    }
+    slices
+}
+
 private fun gzipMakeCrcTable(): array<int> {
     val table: array<int> = []
     for (n in 0 until 256) {
@@ -1064,12 +1080,30 @@ private trusted fun GzipStream.emitMatch(var output: ByteBuffer, count: int): vo
     this.crc = crc
 }
 
+/** The CRC register `crc` (not inverted) after the `count` bytes at `address`: eight bytes per step with the slicing tables, then bytes. */
+private trusted fun gzipCrcBytes(crc: int, address: int, count: int): int {
+    val slices = gzipCrcSlices
+    var register = crc
+    var at = 0
+    while (at + 8 <= count) {
+        val low = (ablaUnsafeLoadU32(nativePointerFromAddress(address + at)) & 4294967295) ^ register
+        val high = ablaUnsafeLoadU32(nativePointerFromAddress(address + at + 4)) & 4294967295
+        register = slices[1792 + (low & 255)] ^ slices[1536 + ((low >>> 8) & 255)] ^ slices[1280 + ((low >>> 16) & 255)] ^ slices[1024 + (low >>> 24)] ^
+            slices[768 + (high & 255)] ^ slices[512 + ((high >>> 8) & 255)] ^ slices[256 + ((high >>> 16) & 255)] ^ slices[high >>> 24]
+        at = at + 8
+    }
+    while (at < count) {
+        register = (register >>> 8) ^ slices[(register ^ ablaUnsafeLoadU8(nativePointerFromAddress(address + at))) & 255]
+        at = at + 1
+    }
+    register
+}
+
 // The run-time fast path of the symbol loop: while the current input chunk holds enough bytes for a whole symbol with its extra bits (48 bits), the literal/length and the distance symbols
 // come from the 9-bit tables, literals and whole matches are written to the window and the output with the bit state in locals, and anything else (a longer code, the end of the block,
 // the chunk's end, a limit, a match that would pass `cap`, an invalid distance) is left unconsumed for the general path, which also reports every error. The bytes read ahead but not
 // needed are given back to the input so that a byte alignment (a stored block, the trailer) sees what the general path would.
 private trusted fun GzipStream.inflateFast(var output: ByteBuffer, cap: int): void {
-    val crcTable = gzipCrcTable
     val lengthExtras = deflateLengthExtras
     val lengthBases = deflateLengthBases
     val distanceExtras = deflateDistanceExtras
@@ -1111,7 +1145,6 @@ private trusted fun GzipStream.inflateFast(var output: ByteBuffer, cap: int): vo
             if (total >= maximum) break
             ablaUnsafeStoreU8(nativePointerFromAddress(history + (total & 32767)), symbol)
             ablaUnsafeStoreU8(nativePointerFromAddress(destination + written), symbol)
-            crc = (crc >>> 8) ^ crcTable[(crc ^ symbol) & 255]
             total = total + 1
             written = written + 1
             bits = bits >>> width
@@ -1133,11 +1166,23 @@ private trusted fun GzipStream.inflateFast(var output: ByteBuffer, cap: int): vo
             val distance = distanceBases[distanceSymbol] + (rest & ((1 << distanceExtra) - 1))
             if (distance > total || length > maximum - total) break
             var copied = 0
+            // Eight bytes at a time when the match does not overlap itself (distance 8 or more) and neither the source nor the destination word wraps the 32 KiB window.
+            if (distance >= 8) {
+                while (copied + 8 <= length) {
+                    val from = (total - distance) & 32767
+                    val to = total & 32767
+                    if (from > 32760 || to > 32760) break
+                    val word = ablaUnsafeLoadI64(nativePointerFromAddress(history + from))
+                    ablaUnsafeStoreI64(nativePointerFromAddress(history + to), word)
+                    ablaUnsafeStoreI64(nativePointerFromAddress(destination + written + copied), word)
+                    total = total + 8
+                    copied = copied + 8
+                }
+            }
             while (copied < length) {
                 val value = ablaUnsafeLoadU8(nativePointerFromAddress(history + ((total - distance) & 32767)))
                 ablaUnsafeStoreU8(nativePointerFromAddress(history + (total & 32767)), value)
                 ablaUnsafeStoreU8(nativePointerFromAddress(destination + written + copied), value)
-                crc = (crc >>> 8) ^ crcTable[(crc ^ value) & 255]
                 total = total + 1
                 copied = copied + 1
             }
@@ -1157,7 +1202,7 @@ private trusted fun GzipStream.inflateFast(var output: ByteBuffer, cap: int): vo
     this.reader.bits = bits
     this.reader.count = count
     this.total = total
-    this.crc = crc
+    this.crc = gzipCrcBytes(crc, destination, written)
     output.staged += written
     output.byteCount += written
 }
