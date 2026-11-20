@@ -35,9 +35,33 @@ definitions=$!
     printf ':quit\n'
 } | session generations 600 &
 generations=$!
+# A live session (src/live_repl.ab, where live mode runs): a variable keeps its value across lines, any value
+# prints, a line that panics leaves the session and its state as they were, and a redefinition the running code
+# cannot take is refused with the old one kept.
+live=0
+[[ $(uname -s) == Darwin || $(uname -m) == x86_64 ]] && live=1
+if ((live)); then
+    printf 'var total = 0\ntotal += 5\ntotal\n"ab" + "c"\n1.5 * 3.0\n:quit\n' | session state 300 &
+    state=$!
+    printf 'val xs = [1, 2]\nxs[5]\nxs.size\n:quit\n' | session panic 300 &
+    panicking=$!
+    printf 'fun f(): int = 1\nval g = f\nfun f(): string = "x"\nf()\n:quit\n' | session refused 300 &
+    refused=$!
+fi
 wait "$recovery"
 wait "$definitions"
 wait "$generations"
+if ((live)); then
+    wait "$state"
+    wait "$panicking"
+    wait "$refused"
+    [[ $(< "$base.state.out") == $'abla> defined\nabla> 5\nabla> 5\nabla> abc\nabla> 4.5\nabla> ' ]] ||
+        { echo 'repl (state): a variable did not keep its value, or a value did not print' >&2; cat "$base.state.out" "$base.state.err" >&2; exit 1; }
+    [[ $(< "$base.panic.out") == $'abla> defined\nabla> abla> 2\nabla> ' ]] && grep -q 'E_LIVE_PANIC' "$base.panic.err" ||
+        { echo 'repl (panic): a line that panics did not leave the session and its state as they were' >&2; cat "$base.panic.out" "$base.panic.err" >&2; exit 1; }
+    [[ $(< "$base.refused.out") == $'abla> defined\nabla> defined\nabla> abla> 1\nabla> ' ]] && grep -q 'E_LIVE_SIGNATURE' "$base.refused.err" ||
+        { echo 'repl (refused): a refused redefinition did not keep the old one' >&2; cat "$base.refused.out" "$base.refused.err" >&2; exit 1; }
+fi
 
 [[ $(< "$base.recovery.out") == $'abla> abla> 41\nabla> 42\nabla> ' ]] || exit 1
 grep -q 'identifier:missingName' "$base.recovery.err"
@@ -45,4 +69,4 @@ grep -q 'identifier:missingName' "$base.recovery.err"
 grep -q 'identifier:base' "$base.definitions.err"
 [[ $(grep -o '42' "$base.generations.out" | wc -l) -eq 32 ]] || exit 1
 
-printf '%s\n' 'persistent REPL: retained definitions + recovery + reclaimed JIT generations'
+printf '%s\n' 'persistent REPL: retained definitions + recovery + reclaimed JIT generations; live: state across lines, a contained panic, a refused redefinition'

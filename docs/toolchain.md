@@ -430,11 +430,15 @@ inside the final compiler process, avoiding object emission and native linking.
 A program that selects a host capability resolves its host functions from the
 compiler process; no adapter library is built for the JIT.
 The bootstrap compiler retains a separate runner until the C bootstrap path is
-retired. The current `repl` retains one LLJIT session, compiles integer
-expressions transactionally, unloads each generation through an ORC resource
-tracker, and closes a compiler-checked lexical `region`. Retaining declarations,
-module interfaces, semantic indexes, and compile-time values across inputs is
-the next incremental-compilation rung.
+retired. `ablac repl` is a live run (`src/live_repl.ab`, where live mode runs: x86-64 Linux and macOS): one
+program runs for the whole session and each line is a reload of it. A declaration (`fun`, `val`, `var`,
+`class`, `import`, ...) replaces the one of the same name or is added (`defined`); a variable keeps its value
+from line to line. Any other line is an expression whose value prints (an int, a string, a float; an array does
+not interpolate yet), or a statement (`total += 5`). A line that panics prints `E_LIVE_PANIC` and its message on
+stderr and leaves the session as it was; a change the running code cannot take is refused (`E_LIVE_SIGNATURE`,
+...) with the old definition kept; a line that does not compile prints its diagnostics. `:reset` starts a new
+program with nothing defined. Elsewhere `repl` compiles each line on its own in a child compiler, so only
+declarations persist.
 
 The interpreter is not a second language implementation. Compile-time `#`
 evaluation, `run`, tests, the REPL, and macro/subparser handlers share the same

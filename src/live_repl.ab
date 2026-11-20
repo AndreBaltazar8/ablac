@@ -1,0 +1,209 @@
+// `ablac repl` on a live run (docs/toolchain.md, "Run and REPL"): one program runs for the whole session, and each line
+// is a reload of it (live_reload.ab), so what a line defines stays: a variable keeps its value, a function can be
+// redefined. The program's main waits until a line asks it to end (`__replQuit`); this thread reads the lines
+// (bootstrapReplStep, the step llvmOrcCallMainWatched calls between waits, as --watch does).
+//
+// - A declaration (`fun`, `val`, `var`, `class`, `interface`, `resource class`, `import`) replaces the one of the same
+//   name, or is added, and the program is reloaded: "defined" when it applies; otherwise its diagnostics or the
+//   refusal go to standard error and the session is as it was.
+// - Any other line is an expression: a new variable whose initializer prints it (`__replPrint("${<line>}")`), run
+//   once when the reload applies (live_globals.ab), so a value of any type prints. A line that is no expression of a
+//   value (an assignment, a call that returns nothing) runs as the body of a function that variable calls. A panic
+//   in it is contained: the reload fails (E_LIVE_PANIC), its message goes to standard error and the session's state
+//   is as it was.
+// - `:reset` ends the program and starts a new one with nothing defined; `:quit` (or the end of the input) ends it.
+import "abla/fs"
+import "abla/io"
+import "abla/text"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+import "abla/sys/linux"
+import "abla/sys/linux/io"
+import "abla/sys/linux/process"
+import "abla/process/exit"
+import "live_reload.ab"
+
+class BootstrapReplDeclaration(val key: string, val line: string)
+
+// The session: its declarations in order, the source file the program is compiled from, the lines read, and how it
+// is ending (bootstrapReplQuit: :quit or the end of the input, not :reset).
+var bootstrapReplDeclarations: array<BootstrapReplDeclaration> = []
+var bootstrapReplSourcePath = ""
+var bootstrapReplLines = 0
+var bootstrapReplEnding = false
+var bootstrapReplQuit = false
+var bootstrapReplMessage = ""
+
+fun bootstrapReplDeclarationKind(line: string): string {
+    for (kind in ["resource class ", "interface ", "class ", "import ", "fun ", "val ", "var "]) {
+        if (line.startsWith(kind)) return kind
+    }
+    ""
+}
+
+fun bootstrapReplDeclaration(line: string): bool = bootstrapReplDeclarationKind(line) != ""
+
+// What a declaration replaces: its kind's family and its name (`fun add(...)` and `fun add(...)` are the same one).
+fun bootstrapReplKey(line: string): string {
+    val kind = bootstrapReplDeclarationKind(line)
+    if (kind == "import ") return line.trim()
+    val rest = line.slice(kind.size, line.size)
+    var end = 0
+    while (end < rest.size) {
+        val byte = rest[end]
+        // ( < : = { space
+        if (byte == 40 || byte == 60 || byte == 58 || byte == 61 || byte == 123 || byte == 32) break
+        end = end + 1
+    }
+    val family = if (kind == "val " || kind == "var ") "variable" else if (kind == "fun ") "function" else "type"
+    "$family ${rest.slice(0, end)}"
+}
+
+// The session's program: its imports, the REPL's helpers, the declarations, the current line, and main, which waits. The
+// frontend lowers only what is referenced: __replKeep names every variable of the session (and the current line's,
+// `currentVariable`), and main refers to it under a condition that never holds, so each stays a variable of the
+// program (its initializer then runs when it is new, live_globals.ab).
+fun bootstrapReplSource(declarations: array<BootstrapReplDeclaration>, current: string,
+    currentVariable: string = ""): string {
+    var text = "import \"abla/io\"\nimport \"abla/float/text\"\nimport \"abla/sys/linux/process\"\n\n"
+    for (declaration in declarations) {
+        if (declaration.line.startsWith("import ")) text = "$text${declaration.line}\n"
+    }
+    text = "${text}\nvar __replQuit = 0\n\nfun __replPrint(text: string): int {\n    println(text)\n    return 0\n}\n\n"
+    for (declaration in declarations) {
+        if (!declaration.line.startsWith("import ")) text = "$text${declaration.line}\n"
+    }
+    var keep = "@noinline\nfun __replKeep(): int {\n"
+    var kept = 0
+    for (declaration in declarations) {
+        if (declaration.key.startsWith("variable ")) {
+            keep = "${keep}    val __replKept$kept = ${declaration.key.slice(9, declaration.key.size)}\n"
+            kept = kept + 1
+        }
+    }
+    if (currentVariable != "") keep = "${keep}    val __replKept$kept = $currentVariable\n"
+    keep = "${keep}    return 0\n}\n"
+    "$text$current\n\n$keep\nfun main: int {\n    while (__replQuit == 0) {\n        if (__replQuit < 0) __replKeep()\n        linuxSleep(20)\n    }\n    0\n}\n"
+}
+
+// Writes the session's source with `current` and reloads the program: the reload's status (0 applied, 1 refused, 2
+// failed, 3 unavailable), its message in bootstrapReplMessage. `quiet` sends the compiler's diagnostics nowhere (a
+// first try whose failure is not the user's to read).
+trusted fun bootstrapReplReload(declarations: array<BootstrapReplDeclaration>, current: string, quiet: bool,
+    currentVariable: string = ""): int {
+    if (!Path(bootstrapReplSourcePath).writeTextAtomic(bootstrapReplSource(declarations, current, currentVariable))) {
+        bootstrapReplMessage = "the session's source could not be written ($bootstrapReplSourcePath)"
+        return 2
+    }
+    var saved = -1
+    val loud = linuxEnvironment("ABLA_REPL_LOUD").found
+    if (quiet && !loud) {
+        // F_DUPFD from 10: standard error kept aside while /dev/null takes its place.
+        saved = linuxSyscall3(72, 2, 0, 10)
+        val nothing = linuxOpen("/dev/null", 1).descriptor
+        if (saved >= 0 && nothing >= 0) {
+            linuxSyscall2(33, nothing, 2)
+        }
+        if (nothing >= 0) linuxSyscall1(3, nothing)
+    }
+    val capacity = 65536
+    val buffer = nativeByteBuffer(capacity)
+    buffer.storeI64(0, 0)
+    val status = bootstrapLiveReloadEntry(nativePointerAddress(buffer.pointerAt(0)), capacity)
+    if (saved >= 0) {
+        linuxSyscall2(33, saved, 2)
+        linuxSyscall1(3, saved)
+    }
+    var length = buffer.loadI64(0)
+    if (length < 0) length = 0
+    if (length > capacity - 8) length = capacity - 8
+    var message = ""
+    if (length > 0) {
+        val address = ablaUnsafePointerAddress(ablaUnsafeAllocate(length + 1))
+        ablaUnsafeCopyMemory(address, ablaUnsafePointerAddress(buffer.pointerAt(8)), length)
+        ablaUnsafeStoreU8(nativePointerFromAddress(address + length), 0)
+        message = adoptNativeString(address, length)
+    }
+    buffer.close()
+    bootstrapReplMessage = message.trim()
+    if (loud) linuxPrintStandardError("repl reload: status $status: $bootstrapReplMessage\n")
+    status
+}
+
+// A refusal or a panic (a program that does not compile has printed its diagnostics already).
+fun bootstrapReplReport(status: int): void {
+    if (status == 2 && bootstrapReplMessage.startsWith("E_LIVE_COMPILE")) return
+    if (status != 0) linuxPrintStandardError("$bootstrapReplMessage\n")
+    return
+}
+
+// Ends the program: a line that sets __replQuit, so main returns and llvmOrcCallMainWatched stops calling the step.
+fun bootstrapReplEnd(): void {
+    bootstrapReplEnding = true
+    bootstrapReplLines = bootstrapReplLines + 1
+    val line = bootstrapReplLines
+    val status = bootstrapReplReload(bootstrapReplDeclarations,
+        "fun __repl_run_$line(): int {\n    __replQuit = 1\n    return 0\n}\nval __repl_$line: int = __repl_run_$line()",
+        false, "__repl_$line")
+    if (status != 0) {
+        bootstrapReplReport(status)
+        linuxPrintStandardError("ablac repl: the program could not be ended\n")
+        exit(1)
+    }
+    return
+}
+
+var bootstrapReplInput = linuxStandardInput()
+
+fun bootstrapReplStep(): void {
+    if (bootstrapReplEnding) {
+        linuxSleep(5)
+        return
+    }
+    linuxPrintStandardOutput("abla> ")
+    val input = bootstrapReplInput.readLine()
+    if (!input.available || input.text == ":quit") {
+        bootstrapReplQuit = true
+        bootstrapReplEnd()
+        return
+    }
+    val line = input.text
+    if (line == ":reset") {
+        bootstrapReplQuit = false
+        bootstrapReplEnd()
+        linuxPrintStandardOutput("reset\n")
+        return
+    }
+    if (line.trim() == "") return
+    if (bootstrapReplDeclaration(line)) {
+        val key = bootstrapReplKey(line)
+        val declarations: array<BootstrapReplDeclaration> = []
+        var replaced = false
+        for (declaration in bootstrapReplDeclarations) {
+            if (declaration.key == key) {
+                declarations.append(BootstrapReplDeclaration(key, line))
+                replaced = true
+            } else declarations.append(BootstrapReplDeclaration(declaration.key, declaration.line))
+        }
+        if (!replaced) declarations.append(BootstrapReplDeclaration(key, line))
+        val status = bootstrapReplReload(declarations, "", false)
+        if (status == 0) {
+            bootstrapReplDeclarations = declarations
+            linuxPrintStandardOutput("defined\n")
+        } else bootstrapReplReport(status)
+        return
+    }
+    bootstrapReplLines = bootstrapReplLines + 1
+    val number = bootstrapReplLines
+    // An expression first, its failure unshown; then the line as a statement, whose diagnostics are the user's.
+    var status = bootstrapReplReload(bootstrapReplDeclarations,
+        "val __repl_$number: int = __replPrint(\"\${$line}\")", true, "__repl_$number")
+    if (status == 2 && bootstrapReplMessage.startsWith("E_LIVE_COMPILE")) {
+        status = bootstrapReplReload(bootstrapReplDeclarations,
+            "fun __repl_run_$number(): int {\n    $line\n    return 0\n}\nval __repl_$number: int = __repl_run_$number()",
+            false, "__repl_$number")
+    }
+    bootstrapReplReport(status)
+    return
+}
+

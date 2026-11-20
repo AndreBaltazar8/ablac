@@ -35,6 +35,7 @@ import "backend/llvm/core.ab"
 import "live_reload.ab"
 import "live_watch.ab"
 import "test_watch.ab"
+import "live_repl.ab"
 import "abla/text"
 
 // The guarded compiler launcher already supplies its process memory budget.
@@ -130,7 +131,8 @@ fun bootstrapRunInProcess(
     arguments: array<string> = [],
     passes: string = "",
     live: bool = false,
-    watch: bool = false
+    watch: bool = false,
+    repl: bool = false
 ): int {
     // A live run (`--live`, live.ab) is another object (its calls go through the table), and a reload
     // needs the compiler's record of the program as built: a cached one keeps it beside the object.
@@ -208,6 +210,9 @@ fun bootstrapRunInProcess(
             bootstrapLiveWatchStart()
             status = llvmOrcCallMainWatched(entry, sourcePath, arguments, { bootstrapLiveWatchStep() })
             bootstrapLiveWatchClose()
+        } else if (repl) {
+            // `ablac repl` (live_repl.ab): main waits; this thread reads and reloads the lines.
+            status = llvmOrcCallMainWatched(entry, sourcePath, arguments, { bootstrapReplStep() })
         } else status = llvmOrcCallMain(entry, sourcePath, arguments)
         ctBridgeRunFrameEnd(frame)
     }
@@ -1011,20 +1016,6 @@ fun bootstrapOrcBuildModuleState(
     status
 }
 
-fun bootstrapReplDeclaration(line: string): bool {
-    var declaration = line.size >= 4 && line.slice(0, 4) == "fun "
-    if (line.size >= 6 && line.slice(0, 6) == "class ") declaration = true
-    if (line.size >= 10 && line.slice(0, 10) == "interface ") {
-        declaration = true
-    }
-    if (line.size >= 15 && line.slice(0, 15) == "resource class ") {
-        declaration = true
-    }
-    if (line.size >= 4 && line.slice(0, 4) == "val ") declaration = true
-    if (line.size >= 4 && line.slice(0, 4) == "var ") declaration = true
-    declaration
-}
-
 // One REPL line compiled by a child compiler (`--emit-llvm`): its LLVM IR,
 // or a failed status once the child has printed the line's diagnostics. The
 // compiler keeps tables in module values from one compilation to the next, so
@@ -1037,12 +1028,36 @@ fun bootstrapReplCompile(sourcePath: string): LinuxProcessResult {
     child.capture()
 }
 
+// `ablac repl`: a live session (live_repl.ab) where live mode runs; elsewhere the REPL below.
+fun bootstrapRepl(): int = if (bootstrapLiveRunSupported()) bootstrapReplLive() else bootstrapReplChildren()
+
+// The live session: its program runs with bootstrapReplStep reading the lines, again after each :reset. 0, or the run's
+// status when it failed.
+fun bootstrapReplLive(): int {
+    bootstrapReplSourcePath = "build/.abla-repl-source.${linuxProcessId()}.ab"
+    Path("build").createDirectories()
+    var status = 0
+    var running = true
+    while (running) {
+        bootstrapReplDeclarations = []
+        bootstrapReplLines = 0
+        bootstrapReplEnding = false
+        bootstrapReplQuit = false
+        if (!Path(bootstrapReplSourcePath).writeTextAtomic(bootstrapReplSource([], ""))) return 141
+        status = bootstrapRunInProcess(bootstrapReplSourcePath, [], llvmPassesBalanced(), true, false, true)
+        if (bootstrapReplQuit || status != 0) running = false
+    }
+    Path(bootstrapReplSourcePath).remove()
+    status
+}
+
+// The REPL where there is no live mode, one line a run, so nothing persists but declarations:
 // Persistent language REPL. Definitions are retained as source and included
 // in later expression generations. Publication is transactional: a malformed
 // definition is diagnosed without changing the accepted declaration set.
 // Machine code remains a reclaimable ORC generation in one LLJIT session.
 // Each line compiles in a child compiler (bootstrapReplCompile).
-fun bootstrapRepl(): int {
+fun bootstrapReplChildren(): int {
     val session = llvmOrcCreateSession()
     val standardInput = linuxStandardInput()
     val sourcePath = "build/.abla-repl-source.${linuxProcessId()}.ab"
