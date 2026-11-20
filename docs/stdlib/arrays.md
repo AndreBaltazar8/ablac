@@ -28,3 +28,22 @@ val values = [10, 20, 30]
 val middle = values.takeAt(1) // 20; values now contains [10, 30]
 val last = values.removeLast() // 30; values now contains [10]
 ```
+
+## Sorting
+
+`import "abla/array"` also gives a stable merge sort, O(n log n), that returns a new array and leaves the receiver
+unchanged:
+
+| Function | Result |
+|---|---|
+| `values.sortedBy { a, b -> a.key < b.key }` | A copy ordered by `less`, a strict "comes before" test. Elements neither of which comes before the other keep their order. |
+| `ints.sorted()` | A copy of an `array<int>` in ascending order. |
+
+`import "abla/text"` gives `strings.sorted()` and `sortedStrings(strings)`: a copy of an `array<string>` in byte
+order. The elements are copied, so use these with copyable element types.
+
+```abla
+import "abla/array"
+val words = ["pear", "fig", "apple"]
+val byLength = words.sortedBy { a, b -> a.size < b.size } // ["fig", "pear", "apple"]
+```
