@@ -96,6 +96,16 @@ grep -qxF 'warning[W_UNUSED_IMPORT]: lib.ab: nothing `import "abla/json"` declar
     fail "the library prune refused" "$work/library-prune.log"
 ! grep -qxF 'import "abla/json"' "$work/library/lib.ab" || fail "the library prune left abla/json" "$work/library/lib.ab"
 grep -qxF 'import "abla/text"' "$work/library/lib.ab" || fail "the library prune removed abla/text" "$work/library/lib.ab"
+
+# Extensions nothing calls: their receivers and declared types are uses (sema never checks those bodies).
+(cd "$work/receiver" && "$compiler" build main.ab -o program --fast --warn-unused-imports) > "$work/receiver.log" 2>&1 ||
+    fail "receiver/main.ab didn't build" "$work/receiver.log"
+! grep -q W_UNUSED_IMPORT "$work/receiver.log" || fail "a warning for an import only an extension's declaration uses" "$work/receiver.log"
+(cd "$work/receiver" && "$compiler" fix-imports main.ab --prune) > "$work/receiver-prune.log" 2>&1 ||
+    fail "receiver prune failed" "$work/receiver-prune.log"
+for kept in ./shape.ab ./box.ab ./pair.ab ./point.ab; do
+    grep -qxF "import \"$kept\"" "$work/receiver/ext.ab" || fail "the prune removed $kept from ext.ab" "$work/receiver/ext.ab"
+done
 # The prune.
 (cd "$work" && "$compiler" fix-imports main.ab --prune) > "$work/prune.log" 2>&1 || fail "prune failed" "$work/prune.log"
 grep -qxF 'fix-imports: removed 2 unused import(s) in 1 file(s); 0 restored, 0 left' "$work/prune.log" ||
