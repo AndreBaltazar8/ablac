@@ -1074,7 +1074,8 @@ where it can't. `ABLA_COMPILE_EVAL` chooses the tier:
   In a pass that can run long, a site that can act on nothing outside the
   evaluator first gets a *trial*: the evaluator runs it within what is left
   of the pass's step budget (`ABLA_COMPILE_EVAL_TRIAL_STEPS`, default
-  1000000, about a tenth of a second; 0 turns trials off). Such a site is
+  1000000, about as long as building a native generation takes; 0 turns
+  trials off). Such a site is
   not a top-level action, reaches no compile global and no ordinary global
   compile-time code writes, and its code calls no `extern:"c"` function and
   no compile-time provider (files, output, the environment, the clock,
@@ -1091,7 +1092,14 @@ where it can't. `ABLA_COMPILE_EVAL` chooses the tier:
   bridge (a check of the bridge).
 
 `ABLA_COMPILE_EVAL_TRACE=1` prints the tier each site ran on and, for a site
-left to the evaluator, the reason; a trial that did not finish says why.
+left to the evaluator, the reason and the time it took there; a trial that did
+not finish says why. Under `auto` and `jit`, a site the evaluator ran for a
+second or more is noted without the trace too, because the evaluator is often
+10 to 100 times slower than native code:
+
+```text
+note: the `#` site at slow.ab:16:14 ran in the compile-time evaluator for 3.6 s, not as native code: reaches extern:"compiler" fun compilerApplyTransform, which takes a function (not passed through the compiler bridge yet) (ABLA_COMPILE_EVAL_TRACE=1 says why for every site)
+```
 
 The action journal (`ABLA_ACTION_JOURNAL`) records evaluated actions only:
 when it is on and `ABLA_COMPILE_EVAL` names no tier, the tier is `interp`.

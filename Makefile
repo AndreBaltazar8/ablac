@@ -127,6 +127,7 @@ test-serial: ablac
 	tools/test-ct-time-limit.sh $(COMPILER)
 	tools/test-ct-time-unlimited.sh $(COMPILER)
 	tools/test-ct-site-errors.sh $(COMPILER)
+	tools/test-ct-fallback.sh $(COMPILER)
 	tools/test-ct-nonreproducible.sh $(COMPILER)
 	tools/test-libc-jump-routines.sh $(COMPILER)
 	tools/test-version.sh $(COMPILER)
