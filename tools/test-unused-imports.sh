@@ -2,8 +2,9 @@
 # W_UNUSED_IMPORT (module.ab: bootstrapUnusedImportWarnings), on by default (off with --no-warn-unused-imports or
 # ABLA_WARN_UNUSED_IMPORTS=0, and a cache hit prints what its entry kept): an import nothing in the importing file uses
 # gets a warning, an import used only through an extension method, a re-exported class or a
-# `$json` subparser doesn't, nor one of a module with an @export function; a package's entry gets the
-# `export import` line instead, and a module that runs compile code keeps its imports. Another project's module, a
+# `$json` subparser (also through a module that passes the registering one on) or an interpolated float doesn't, nor
+# one of a module with an @export function; a package's entry gets the `export import` line instead, and a module that
+# runs compile code or defines syntax (a subparser) keeps its imports. Another project's module, a
 # vendored package and a checkout linked in get none, nor does any module after a front end that stopped at an error.
 # `ablac fix-imports --prune` removes the warned imports, leaves the entry's, keeps the abla/compiler import a
 # #compilerGrant uses, refuses a build that fails before every use is known, reaches the project's other directories
@@ -183,6 +184,25 @@ grep -qxF 'import "abla/text"' "$work/nested/src/lib.ab" || fail "the nested pru
 for kept in ./shape.ab ./box.ab ./pair.ab ./point.ab; do
     grep -qxF "import \"$kept\"" "$work/receiver/ext.ab" || fail "the prune removed $kept from ext.ab" "$work/receiver/ext.ab"
 done
+
+# A float interpolated ("$x" lowers to abla/float/text's f64Text) is a use of abla/float/text: no warning, and the
+# prune keeps it.
+(cd "$work/interpolated" && "$compiler" build main.ab -o program --fast) > "$work/interpolated.log" 2>&1 ||
+    fail "interpolated/main.ab doesn't build" "$work/interpolated.log"
+! grep -q 'W_UNUSED_IMPORT' "$work/interpolated.log" || fail "an interpolated float's import is called unused" "$work/interpolated.log"
+(cd "$work/interpolated" && "$compiler" fix-imports main.ab --prune) > "$work/interpolated-prune.log" 2>&1 ||
+    fail "the interpolated prune failed" "$work/interpolated-prune.log"
+grep -qxF 'fix-imports: removed 0 unused import(s) in 0 file(s); 0 restored, 0 left' "$work/interpolated-prune.log" ||
+    fail "the interpolated prune touched abla/float/text" "$work/interpolated-prune.log"
+
+# Syntax: dsl.ab registers `$seven()`, whose generated call needs ./helper.ab, so a module defining syntax keeps its
+# imports; view.ab writes `$seven()` through kit.ab (which passes dsl.ab on), a use of ./kit.ab; main.ab imports kit.ab
+# and never writes it: the one warning.
+(cd "$work/syntax" && "$compiler" build main.ab -o program --fast) > "$work/syntax.log" 2>&1 ||
+    fail "syntax/main.ab doesn't build" "$work/syntax.log"
+[[ $(grep -c 'W_UNUSED_IMPORT' "$work/syntax.log") == 1 ]] || fail "syntax: not exactly one warning" "$work/syntax.log"
+grep -qxF 'warning[W_UNUSED_IMPORT]: main.ab: nothing `import "./kit.ab"` declares is used here' "$work/syntax.log" ||
+    fail "syntax: main.ab's unused kit.ab isn't warned" "$work/syntax.log"
 
 # A module with a runtime hook (`fun __abla...`) matters by being loaded.
 (cd "$work/hook" && "$compiler" build main.ab -o program --fast --warn-unused-imports) > "$work/hook.log" 2>&1 ||
