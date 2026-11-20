@@ -316,6 +316,7 @@ test-serial: ablac
 	tools/test-fix-imports.sh $(COMPILER)
 	tools/test-ct-grant-help.sh $(COMPILER)
 	tools/test-unused-imports.sh $(COMPILER)
+	tools/test-unused-locals.sh $(COMPILER)
 	tools/test-compile-eval-tier.sh $(COMPILER)
 	tools/test-compile-eval-cache-tier.sh $(COMPILER)
 	tools/test-compile-eval-shared-state.sh $(COMPILER) host
