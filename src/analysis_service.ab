@@ -877,9 +877,13 @@ fun bootstrapAnalysisCollectDeclarationIdentities(
 
 // Build once per semantic group. Preserve the legacy first-success ordering:
 // declarations win, then resolved names, then the earliest successful call.
-class BootstrapAnalysisOccurrenceTarget(val identity: string, val type: string, val canonical: string = "")
+class BootstrapAnalysisOccurrenceTarget(val identity: string, val type: string, val canonical: string = "", val name: string = "")
 class BootstrapAnalysisOccurrenceIndex(
-    val resolved: Map<string, BootstrapAnalysisOccurrenceTarget>,
+    // The resolved names: by source, then by span (`bootstrapAnalysisSpanKey`), the index in `targets` of the first of the names at that
+    // span (`nexts` chains the others), each target with the name it is for. Indexes, not references: nothing here is borrowed.
+    val resolved: Map<string, Map<int, int>>,
+    val targets: array<BootstrapAnalysisOccurrenceTarget>,
+    val nexts: array<int>,
     val calls: Map<string, array<BootstrapTypedCall>>,
     // The type declarations (class, interface, enum, type) by the name written in the source, the id of the one declaration of that
     // name in the program ("" when two declare it): sema records a name where it looks a value up, and a type is written as text, so
@@ -890,24 +894,50 @@ class BootstrapAnalysisOccurrenceIndex(
     val members: Map<string, string> = Map()
 )
 
-/** The key of a name occurrence in the index: the source by a short id (not its path, which each of the index's million
- *  keys would hold), then its span and name. */
-fun bootstrapAnalysisOccurrenceKey(source: string, begin: int, end: int, name: string): string =
-    "${bootstrapPathId(source)}:$begin:$end:$name"
+/** The key of a span in the index: both ends in one integer (a key that builds no string: the index holds a million). */
+fun bootstrapAnalysisSpanKey(begin: int, end: int): int = begin * 4294967296 + end
+
+/** The resolved names of `source`: its map from span to target, made when it has none yet. */
+fun bootstrapAnalysisResolvedOf(var resolved: Map<string, Map<int, int>>,
+    source: string): Map<int, int> {
+    val known = resolved.get(source)
+    if (known != null) return known
+    val fresh: Map<int, int> = Map()
+    resolved.set(source, fresh)
+    fresh
+}
 
 fun bootstrapAnalysisOccurrenceIndex(
     declarations: array<BootstrapDeclaration>, semantic: BootstrapSemanticResult,
     builtins: Map<string, string> = Map()
 ): BootstrapAnalysisOccurrenceIndex {
-    val resolved: Map<string, BootstrapAnalysisOccurrenceTarget> = Map()
+    val resolved: Map<string, Map<int, int>> = Map()
+    val targets: array<BootstrapAnalysisOccurrenceTarget> = []
+    val nexts: array<int> = []
     val calls: Map<string, array<BootstrapTypedCall>> = Map()
     for (name in semantic.resolvedNames) {
-        val key = bootstrapAnalysisOccurrenceKey(name.sourceIdentity, name.begin, name.end,
-            name.name)
-        val previous = resolved.get(key)
-        if (previous == null || previous.identity == "") {
-            resolved.set(key, BootstrapAnalysisOccurrenceTarget(name.declarationIdentity,
-                name.type, name.canonicalId))
+        val spans = bootstrapAnalysisResolvedOf(resolved, name.sourceIdentity)
+        val key = bootstrapAnalysisSpanKey(name.begin, name.end)
+        // The first row for a name at a span stands, unless it named no declaration: a later row then replaces it.
+        val head = spans.get(key)
+        var at = if (head != null) head else -1
+        var present = false
+        while (at >= 0) {
+            if (targets[at].name == name.name) {
+                present = true
+                // The first row for a name at a span stands, unless it named no declaration: a later row then replaces it.
+                if (targets[at].identity == "") {
+                    targets[at] = BootstrapAnalysisOccurrenceTarget(name.declarationIdentity, name.type, name.canonicalId,
+                        name.name)
+                }
+                at = -1
+            } else at = nexts[at]
+        }
+        if (!present) {
+            targets.append(BootstrapAnalysisOccurrenceTarget(name.declarationIdentity, name.type, name.canonicalId,
+                name.name))
+            nexts.append(if (head != null) head else -1)
+            spans.set(key, targets.size - 1)
         }
     }
     for (call in semantic.typedCalls) {
@@ -939,7 +969,7 @@ fun bootstrapAnalysisOccurrenceIndex(
             if (id != null) types.set(name, id)
         }
     }
-    BootstrapAnalysisOccurrenceIndex(resolved, calls, types, members)
+    BootstrapAnalysisOccurrenceIndex(resolved, targets, nexts, calls, types, members)
 }
 
 /** A type parameter's name: `T:Shape&Named` (a bound) is `T`. */
@@ -1043,14 +1073,16 @@ fun bootstrapAnalysisOccurrenceSet(
         }
         declaration = declaration + 1
     }
-    val declarationAt: Map<string, string> = Map()
+    val declarationAt: Map<int, string> = Map()
     for (item in 0 until declarationIds.size) {
-        declarationAt.set("${declarationBegins[item]}:${declarationEnds[item]}",
+        declarationAt.set(bootstrapAnalysisSpanKey(declarationBegins[item], declarationEnds[item]),
             declarationIds[item])
     }
     val semanticIndex = if (occurrenceIndex != null) occurrenceIndex
         else bootstrapAnalysisOccurrenceIndex(declarations, semantic)
     val callAt = bootstrapAnalysisCallTokens(source, sourceIdentity, tokens, semanticIndex)
+    // This source's resolved names, by span: found once, not by a key built for each token.
+    val resolvedHere = semanticIndex.resolved.get(sourceIdentity)
     // The modules this one imports under an alias, by alias: `geo.area` is the `area` of the module `geo` names.
     val aliasTargets: Map<string, string> = Map()
     val scan = bootstrapScanImports(source)
@@ -1077,20 +1109,27 @@ fun bootstrapAnalysisOccurrenceSet(
         val token = tokens[index]
         if (token.kind == BOOTSTRAP_TOKEN_IDENTIFIER) {
             val name = bootstrapTokenText(source, token)
-            val declared = declarationAt.get("${token.begin}:${token.end}")
+            val spanKey = bootstrapAnalysisSpanKey(token.begin, token.end)
+            val declared = declarationAt.get(spanKey)
             var declarationId = if (declared != null) declared else ""
             var resolvedType = ""
             // What the service's conversion of the semantic result made of the id a sema row names (see BootstrapResolvedName.canonicalId).
             var translated = ""
             var fromRow = false
             if (declarationId == "") {
-                val resolved = semanticIndex.resolved.get(bootstrapAnalysisOccurrenceKey(
-                    sourceIdentity, token.begin, token.end, name))
-                if (resolved != null) {
-                    declarationId = resolved.identity
-                    resolvedType = resolved.type
-                    translated = resolved.canonical
-                    fromRow = resolved.identity != ""
+                if (resolvedHere != null) {
+                    val first = resolvedHere.get(spanKey)
+                    var at = if (first != null) first else -1
+                    while (at >= 0) {
+                        val target = semanticIndex.targets[at]
+                        if (target.name == name) {
+                            declarationId = target.identity
+                            resolvedType = target.type
+                            translated = target.canonical
+                            fromRow = target.identity != ""
+                            at = -1
+                        } else at = semanticIndex.nexts[at]
+                    }
                 }
             }
             if (declarationId == "") {
