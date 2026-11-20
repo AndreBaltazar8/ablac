@@ -483,7 +483,10 @@ running; the message names the reason:
 | `E_LIVE_BUSY` | another reload is running |
 
 A program that no longer compiles is `failed` with `E_LIVE_COMPILE` (the diagnostics go to stderr), and new code
-that cannot be loaded is `E_LIVE_LINK`. `ABLA_LIVE_TRACE` (any value) prints how many functions go through the
+that cannot be loaded is `E_LIVE_LINK`. A new variable whose initializer panics is `failed` with `E_LIVE_PANIC` and
+the panic's message: the reload's code goes and the program keeps running with its variables as they were (a live
+run keeps the runtime's panic recovery for it). `ABLA_LIVE_DUMP_MODULE=<prefix>` writes each reload module as
+`<prefix>-<generation>.ll`. `ABLA_LIVE_TRACE` (any value) prints how many functions go through the
 table; `ABLA_LIVE_DUMP=<dir>` writes each compiled body per generation as `<generation>-<name>.ll`.
 Tested on x86-64 Linux and on both Macs (arm64 and Intel, in CI). What is built and what is not: [the design](design/live-jit.md).
 
