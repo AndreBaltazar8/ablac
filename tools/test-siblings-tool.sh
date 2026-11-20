@@ -20,6 +20,7 @@ commit "$projects/sib-good"
 commit "$projects/sib-bad"
 cat > "$projects/cand/build/ablac" <<'EOF'
 #!/usr/bin/env bash
+[[ ${1:-} == --version ]] && { echo fake-candidate; exit 0; }
 for argument in "$@"; do
     if [[ $argument == *bad.ab ]]; then echo "error[E_FAKE]: the candidate refuses $argument" >&2; exit 1; fi
 done
@@ -27,7 +28,8 @@ exit 0
 EOF
 printf '#!/usr/bin/env bash\nexit 0\n' > "$work/baseline"
 chmod +x "$projects/cand/build/ablac" "$work/baseline"
-printf 'sib-good\ttrue\nsib-bad\tfalse\nsib-missing\t-\n' > "$work/list"
+# sib-good's test runs `ablac` from PATH, as a Makefile's `COMPILER ?= ablac` does: it must be the candidate.
+printf 'sib-good\tablac --version > v.txt && grep fake-candidate v.txt >/dev/null\nsib-bad\tfalse\nsib-missing\t-\n' > "$work/list"
 
 status=0
 "$project_root/tools/test-siblings.sh" "$projects/cand" --baseline "$work/baseline" --list "$work/list" \

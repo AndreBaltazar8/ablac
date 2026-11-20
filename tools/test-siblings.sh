@@ -106,7 +106,19 @@ for name in "${repos[@]}"; do
         mkdir -p "$(dirname "$layout/$name/$relative")"
         ln -s "$layout/${target#"$projects/"}" "$layout/$name/$relative"
     done < <(find "$projects/$name" -path "$projects/$name/.git" -prune -o -path "*/.claude" -prune -o -type l -print 2>/dev/null)
+    # Each committed lock's packages at their locked revisions (decision #85), before anything builds: `package
+    # vendor` never moves a lock, and every compiler has it (a baseline may predate builds installing them).
+    while IFS= read -r lock; do
+        (cd "$(dirname "$lock")" && ABLA_SYSROOT=$candidate "$candidate/build/ablac" package vendor --project .) \
+            >> "$out/vendor-$name.log" 2>&1 || echo "test-siblings: $name: package vendor failed in $(dirname "${lock#"$layout/"}") (vendor-$name.log)" >&2
+    done < <(find "$layout/$name" \( -name .abla -o -name vendor -o -name build -o -name .claude -o -name .git \) -prune -o -name abla.lock -print)
 done
+
+# A test command that runs `ablac` from PATH (a Makefile's `COMPILER ?= ablac`) gets the candidate, not whatever is
+# installed.
+mkdir -p "$out/bin"
+printf '#!/usr/bin/env bash\nexec %q "$@"\n' "$candidate/build/ablac" > "$out/bin/ablac"
+chmod +x "$out/bin/ablac"
 
 # Programs.
 programs_file=$out/programs.txt
@@ -148,7 +160,7 @@ if ((tests)); then
         [[ $command == - ]] && { echo "$name -" >> "$out/tests.txt"; continue; }
         log=$out/test-$name.log
         status=0
-        (cd "$layout/$name" && ABLA_DEBUG=0 timeout 2400 bash -c "$command") > "$log" 2>&1 || status=$?
+        (cd "$layout/$name" && PATH="$out/bin:$PATH" ABLA_DEBUG=0 timeout 2400 bash -c "$command") > "$log" 2>&1 || status=$?
         echo "$name $status" >> "$out/tests.txt"
     done
 fi
