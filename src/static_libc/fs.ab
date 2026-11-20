@@ -1,0 +1,233 @@
+// The files and system-call wrappers of the statically linked compiler's C library: one system call each (#806 step C). An `int` parameter of C is
+// masked to its 32 bits, a `mode_t` and the like too; pointers and sizes are whole words.
+import "abla/runtime/scalar"
+import "abla/sys/linux"
+import "./errno.ab"
+
+// A C int argument: the low 32 bits, sign-extended.
+fun libcInt(value: int): int {
+    val low = value & 4294967295
+    if (low >= 2147483648) low - 4294967296 else low
+}
+
+@export("open")
+trusted fun libcOpen(path: int, flags: int, mode: int): int = libcResult(linuxSyscall3(2, path, libcInt(flags), mode & 4294967295))
+
+@export("close")
+trusted fun libcClose(descriptor: int): int = libcResult(linuxSyscall1(3, libcInt(descriptor)))
+
+@export("read")
+trusted fun libcRead(descriptor: int, buffer: int, count: int): int = libcResult(linuxSyscall3(0, libcInt(descriptor), buffer, count))
+
+@export("write")
+trusted fun libcWrite(descriptor: int, buffer: int, count: int): int = libcResult(linuxSyscall3(1, libcInt(descriptor), buffer, count))
+
+@export("pread")
+trusted fun libcPread(descriptor: int, buffer: int, count: int, offset: int): int =
+    libcResult(linuxSyscall4(17, libcInt(descriptor), buffer, count, offset))
+
+@export("lseek")
+trusted fun libcLseek(descriptor: int, offset: int, whence: int): int = libcResult(linuxSyscall3(8, libcInt(descriptor), offset, libcInt(whence)))
+
+@export("stat")
+trusted fun libcStat(path: int, buffer: int): int = libcResult(linuxSyscall2(4, path, buffer))
+
+@export("stat64")
+trusted fun libcStat64(path: int, buffer: int): int = libcResult(linuxSyscall2(4, path, buffer))
+
+@export("fstat")
+trusted fun libcFstat(descriptor: int, buffer: int): int = libcResult(linuxSyscall2(5, libcInt(descriptor), buffer))
+
+@export("fstat64")
+trusted fun libcFstat64(descriptor: int, buffer: int): int = libcResult(linuxSyscall2(5, libcInt(descriptor), buffer))
+
+@export("lstat")
+trusted fun libcLstat(path: int, buffer: int): int = libcResult(linuxSyscall2(6, path, buffer))
+
+@export("lstat64")
+trusted fun libcLstat64(path: int, buffer: int): int = libcResult(linuxSyscall2(6, path, buffer))
+
+@export("access")
+trusted fun libcAccess(path: int, mode: int): int = libcResult(linuxSyscall2(21, path, libcInt(mode)))
+
+@export("mmap")
+trusted fun libcMmap(address: int, length: int, protection: int, flags: int, descriptor: int, offset: int): int {
+    val result = linuxSyscall6(9, address, length, libcInt(protection), libcInt(flags), libcInt(descriptor), offset)
+    if (result < 0 && result > -4096) {
+        libcSetErrno(0 - result)
+        return -1
+    }
+    result
+}
+
+@export("munmap")
+trusted fun libcMunmap(address: int, length: int): int = libcResult(linuxSyscall2(11, address, length))
+
+@export("mprotect")
+trusted fun libcMprotect(address: int, length: int, protection: int): int = libcResult(linuxSyscall3(10, address, length, libcInt(protection)))
+
+@export("posix_madvise")
+trusted fun libcPosixMadvise(address: int, length: int, advice: int): int {
+    // posix_madvise returns the error number instead of setting errno.
+    val result = linuxSyscall3(28, address, length, libcInt(advice))
+    if (result < 0) 0 - result else 0
+}
+
+@export("getcwd")
+trusted fun libcGetcwd(buffer: int, size: int): int {
+    val result = linuxSyscall2(79, buffer, size)
+    if (result < 0) {
+        libcSetErrno(0 - result)
+        return 0
+    }
+    buffer
+}
+
+@export("chdir")
+trusted fun libcChdir(path: int): int = libcResult(linuxSyscall1(80, path))
+
+@export("mkdir")
+trusted fun libcMkdir(path: int, mode: int): int = libcResult(linuxSyscall2(83, path, mode & 4294967295))
+
+@export("mknod")
+trusted fun libcMknod(path: int, mode: int, device: int): int = libcResult(linuxSyscall3(133, path, mode & 4294967295, device))
+
+@export("unlink")
+trusted fun libcUnlink(path: int): int = libcResult(linuxSyscall1(87, path))
+
+// remove(): unlink, and rmdir when the name is a directory.
+@export("remove")
+trusted fun libcRemove(path: int): int {
+    val result = linuxSyscall1(87, path)
+    if (result == -21) return libcResult(linuxSyscall1(84, path))
+    libcResult(result)
+}
+
+@export("readlink")
+trusted fun libcReadlink(path: int, buffer: int, size: int): int = libcResult(linuxSyscall3(89, path, buffer, size))
+
+@export("fcntl")
+trusted fun libcFcntl(descriptor: int, command: int, argument: int): int = libcResult(linuxSyscall3(72, libcInt(descriptor), libcInt(command), argument))
+
+@export("statfs")
+trusted fun libcStatfs(path: int, buffer: int): int = libcResult(linuxSyscall2(137, path, buffer))
+
+@export("dup2")
+trusted fun libcDup2(old: int, new: int): int = libcResult(linuxSyscall2(33, libcInt(old), libcInt(new)))
+
+@export("isatty")
+trusted fun libcIsatty(descriptor: int): int {
+    // TCGETS: a terminal answers; anything else is ENOTTY.
+    val termios = __ablaRuntimeHostHeapAllocate(64, true)
+    val result = linuxSyscall3(16, libcInt(descriptor), 21505, termios)
+    __ablaRuntimeHostHeapFree(termios)
+    if (result < 0) {
+        libcSetErrno(25)
+        return 0
+    }
+    1
+}
+
+// A directory stream: the descriptor, a 4 KiB buffer of linux_dirent64 records and the read position; struct dirent as the caller reads it
+// (d_name at offset 19) is the kernel record itself, which has the same layout up to d_name.
+@export("opendir")
+trusted fun libcOpendir(path: int): int {
+    val descriptor = linuxSyscall3(2, path, 591872, 0)
+    if (descriptor < 0) {
+        libcSetErrno(0 - descriptor)
+        return 0
+    }
+    val stream = __ablaRuntimeHostHeapAllocate(4128, true)
+    ablaRuntimeStoreI64(stream, descriptor)
+    stream
+}
+
+@export("readdir")
+trusted fun libcReaddir(stream: int): int {
+    val position = ablaRuntimeLoadI64(stream + 8)
+    var length = ablaRuntimeLoadI64(stream + 16)
+    if (position >= length) {
+        length = linuxSyscall3(217, ablaRuntimeLoadI64(stream), stream + 32, 4096)
+        if (length <= 0) {
+            if (length < 0) libcSetErrno(0 - length)
+            return 0
+        }
+        ablaRuntimeStoreI64(stream + 16, length)
+        ablaRuntimeStoreI64(stream + 8, 0)
+    }
+    val record = stream + 32 + ablaRuntimeLoadI64(stream + 8)
+    val size = ablaRuntimeLoadU8(record + 16) | (ablaRuntimeLoadU8(record + 17) << 8)
+    ablaRuntimeStoreI64(stream + 8, ablaRuntimeLoadI64(stream + 8) + size)
+    record
+}
+
+@export("closedir")
+trusted fun libcClosedir(stream: int): int {
+    val result = linuxSyscall1(3, ablaRuntimeLoadI64(stream))
+    __ablaRuntimeHostHeapFree(stream)
+    libcResult(result)
+}
+
+// realpath without symlink resolution: the path made absolute (against the working directory) with `.` and `..` segments folded and
+// repeated slashes dropped. The compiler's callers canonicalise paths they have already read; a symlinked directory in the middle keeps
+// its own name. Returns the buffer (malloc'ed when the caller gave none), or NULL when the path does not exist.
+@export("realpath")
+trusted fun libcRealpath(path: int, resolved: int): int {
+    if (linuxSyscall2(21, path, 0) < 0) {
+        libcSetErrno(2)
+        return 0
+    }
+    val work = __ablaRuntimeHostHeapAllocate(8192, true)
+    var length = 0
+    if (ablaRuntimeLoadU8(path) != 47) {
+        val cwd = linuxSyscall2(79, work, 4096)
+        if (cwd < 0) {
+            __ablaRuntimeHostHeapFree(work)
+            libcSetErrno(0 - cwd)
+            return 0
+        }
+        length = cwd - 1
+    }
+    // Append the path's segments one at a time to the absolute prefix in `work`.
+    var at = 0
+    while (true) {
+        while (ablaRuntimeLoadU8(path + at) == 47) at = at + 1
+        if (ablaRuntimeLoadU8(path + at) == 0) break
+        var end = at
+        while (ablaRuntimeLoadU8(path + end) != 47 && ablaRuntimeLoadU8(path + end) != 0) end = end + 1
+        val size = end - at
+        if (size == 1 && ablaRuntimeLoadU8(path + at) == 46) {
+            // "." adds nothing.
+        } else if (size == 2 && ablaRuntimeLoadU8(path + at) == 46 && ablaRuntimeLoadU8(path + at + 1) == 46) {
+            while (length > 0 && ablaRuntimeLoadU8(work + length - 1) != 47) length = length - 1
+            if (length > 0) length = length - 1
+        } else {
+            ablaRuntimeStoreU8(work + length, 47)
+            length = length + 1
+            var i = 0
+            while (i < size) {
+                ablaRuntimeStoreU8(work + length + i, ablaRuntimeLoadU8(path + at + i))
+                i = i + 1
+            }
+            length = length + size
+        }
+        at = end
+    }
+    if (length == 0) {
+        ablaRuntimeStoreU8(work, 47)
+        length = 1
+    }
+    ablaRuntimeStoreU8(work + length, 0)
+    var out = resolved
+    if (out == 0) out = __ablaRuntimeHostHeapAllocate(length + 1, false)
+    var i = 0
+    while (i <= length) {
+        ablaRuntimeStoreU8(out + i, ablaRuntimeLoadU8(work + i))
+        i = i + 1
+    }
+    __ablaRuntimeHostHeapFree(work)
+    out
+}
+
+@export("__realpath_chk")
+trusted fun libcRealpathChk(path: int, resolved: int, size: int): int = libcRealpath(path, resolved)

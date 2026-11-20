@@ -1,0 +1,222 @@
+// The process, environment and signal functions of the statically linked compiler's C library (#806 step C). Each is the system call (or the
+// runtime's own routine) the C function stands for. Not here: LLVM's crash-signal handlers are not installed (sigaction accepts and ignores
+// them: the compiler has its own stack guard), and posix_spawn/fork/execve helpers of llvm::sys::Execute are stubs (stubs.ab), which no
+// compiler workload reaches (it starts child processes through the runtime's own process code).
+import "abla/runtime/scalar"
+import "abla/unsafe/memory/raw"
+import "abla/sys/linux"
+import "abla/unsafe/native"
+import "abla/sys/linux/process"
+import "./errno.ab"
+import "./fs.ab"
+
+@export("getenv")
+trusted fun libcGetenv(name: int): int = ablaRuntimePointerAddress(__ablaRuntimeHostGetenv(ablaRuntimePointerFromAddress(name)))
+
+@export("secure_getenv")
+trusted fun libcSecureGetenv(name: int): int = libcGetenv(name)
+
+// atexit handlers, run in reverse order by exit() (static destructors of LLVM register through __cxa_atexit).
+var libcExitHandlers: int = 0
+var libcExitCount: int = 0
+var libcExitCapacity: int = 0
+
+trusted fun libcRegisterExit(function: int, argument: int): int {
+    if (libcExitCount == libcExitCapacity) {
+        val capacity = if (libcExitCapacity == 0) 64 else libcExitCapacity * 2
+        val grown = __ablaRuntimeHostHeapAllocate(capacity * 16, true)
+        if (grown == 0) return -1
+        var at = 0
+        while (at < libcExitCount * 2) {
+            ablaRuntimeStoreI64(grown + at * 8, ablaRuntimeLoadI64(libcExitHandlers + at * 8))
+            at = at + 1
+        }
+        if (libcExitHandlers != 0) __ablaRuntimeHostHeapFree(libcExitHandlers)
+        libcExitHandlers = grown
+        libcExitCapacity = capacity
+    }
+    ablaRuntimeStoreI64(libcExitHandlers + libcExitCount * 16, function)
+    ablaRuntimeStoreI64(libcExitHandlers + libcExitCount * 16 + 8, argument)
+    libcExitCount = libcExitCount + 1
+    0
+}
+
+@export("__cxa_atexit")
+trusted fun libcCxaAtexit(function: int, argument: int, handle: int): int = libcRegisterExit(function, argument)
+
+@export("atexit")
+trusted fun libcAtexit(function: int): int = libcRegisterExit(function, 0)
+
+@export("exit")
+trusted fun libcExit(status: int): void {
+    // The registered functions, last first (an __cxa_atexit one takes its argument; an atexit one ignores it, as C's calling convention allows).
+    while (libcExitCount > 0) {
+        libcExitCount = libcExitCount - 1
+        val function = ablaRuntimeLoadI64(libcExitHandlers + libcExitCount * 16)
+        val argument = ablaRuntimeLoadI64(libcExitHandlers + libcExitCount * 16 + 8)
+        ablaUnsafeCallAddressPointer(function, ablaRuntimePointerFromAddress(argument))
+    }
+    linuxSyscall1(231, libcInt(status))
+    return
+}
+
+@export("_exit")
+trusted fun libcUnderscoreExit(status: int): void {
+    linuxSyscall1(231, libcInt(status))
+    return
+}
+
+@export("abort")
+trusted fun libcAbort(): void {
+    // SIGABRT to this process, then, if it was handled or blocked, the end by exit_group.
+    linuxSyscall2(62, linuxSyscall0(39), 6)
+    linuxSyscall1(231, 134)
+    return
+}
+
+@export("getpid")
+trusted fun libcGetpid(): int = linuxSyscall0(39)
+
+@export("getuid")
+trusted fun libcGetuid(): int = linuxSyscall0(102)
+
+@export("uname")
+trusted fun libcUname(buffer: int): int = libcResult(linuxSyscall1(63, buffer))
+
+@export("getrlimit")
+trusted fun libcGetrlimit(which: int, buffer: int): int = libcResult(linuxSyscall2(97, libcInt(which), buffer))
+
+@export("setrlimit")
+trusted fun libcSetrlimit(which: int, buffer: int): int = libcResult(linuxSyscall2(160, libcInt(which), buffer))
+
+@export("getrusage")
+trusted fun libcGetrusage(who: int, buffer: int): int = libcResult(linuxSyscall2(98, libcInt(who), buffer))
+
+@export("sysconf")
+trusted fun libcSysconf(name: int): int {
+    val code = libcInt(name)
+    if (code == 30) return 4096
+    if (code == 84 || code == 83) return 1
+    if (code == 2) return 100
+    libcSetErrno(22)
+    -1
+}
+
+// The auxiliary vector follows the environment vector's NULL.
+@export("getauxval")
+trusted fun libcGetauxval(kind: int): int {
+    var cursor = ablaRuntimePointerAddress(linuxEnvironmentPointer())
+    if (cursor == 0) return 0
+    while (ablaRuntimeLoadI64(cursor) != 0) cursor = cursor + 8
+    cursor = cursor + 8
+    while (ablaRuntimeLoadI64(cursor) != 0) {
+        if (ablaRuntimeLoadI64(cursor) == kind) return ablaRuntimeLoadI64(cursor + 8)
+        cursor = cursor + 16
+    }
+    libcSetErrno(2)
+    0
+}
+
+@export("arc4random")
+trusted fun libcArc4random(): int {
+    val cell = __ablaRuntimeHostHeapAllocate(16, true)
+    linuxSyscall3(318, cell, 4, 0)
+    val value = ablaRuntimeLoadI64(cell) & 4294967295
+    __ablaRuntimeHostHeapFree(cell)
+    value
+}
+
+@export("kill")
+trusted fun libcKill(process: int, signal: int): int = libcResult(linuxSyscall2(62, libcInt(process), libcInt(signal)))
+
+@export("raise")
+trusted fun libcRaise(signal: int): int = libcResult(linuxSyscall3(234, linuxSyscall0(39), linuxSyscall0(186), libcInt(signal)))
+
+@export("alarm")
+trusted fun libcAlarm(seconds: int): int = linuxSyscall1(37, seconds & 4294967295)
+
+@export("wait")
+trusted fun libcWait(status: int): int = libcResult(linuxSyscall4(61, -1, status, 0, 0))
+
+@export("wait4")
+trusted fun libcWait4(process: int, status: int, options: int, usage: int): int =
+    libcResult(linuxSyscall4(61, libcInt(process), status, libcInt(options), usage))
+
+@export("setsid")
+trusted fun libcSetsid(): int = libcResult(linuxSyscall0(112))
+
+// Signal sets are 128 bytes in C; the kernel uses the first 8.
+@export("sigemptyset")
+trusted fun libcSigemptyset(set: int): int {
+    var at = 0
+    while (at < 16) {
+        ablaRuntimeStoreI64(set + at * 8, 0)
+        at = at + 1
+    }
+    0
+}
+
+@export("sigfillset")
+trusted fun libcSigfillset(set: int): int {
+    var at = 0
+    while (at < 16) {
+        ablaRuntimeStoreI64(set + at * 8, -1)
+        at = at + 1
+    }
+    0
+}
+
+@export("sigprocmask")
+trusted fun libcSigprocmask(how: int, set: int, previous: int): int = libcResult(linuxSyscall4(14, libcInt(how), set, previous, 8))
+
+@export("pthread_sigmask")
+trusted fun libcPthreadSigmask(how: int, set: int, previous: int): int {
+    val result = linuxSyscall4(14, libcInt(how), set, previous, 8)
+    if (result < 0) 0 - result else 0
+}
+
+// LLVM's crash-signal handlers are not installed: the compiler has its own stack guard.
+// sigaction, sigaltstack, fork, dlopen and dlsym are declared as C externs with 32-bit types by the compiler's own sources (src/ct_eval.ab,
+// ct_process.ab, ct_native.ab), and an export of the same name must match that signature, which the backend cannot export (a 32-bit
+// result). So these five are exported as abla_libc_* and the generated assembly file defines the C names as jumps to them
+// (src/toolchain.ab, bootstrapStaticLibcData); the C ABI leaves the upper half of a 32-bit result and argument undefined.
+@export("abla_libc_sigaction")
+trusted fun libcSigaction(signal: int, action: int, previous: int): int = 0
+
+@export("abla_libc_sigaltstack")
+trusted fun libcSigaltstack(stack: int, previous: int): int = libcResult(linuxSyscall2(131, stack, previous))
+
+// fork as the bare system call (the compiler forks through the runtime's own code; these are the externs its sources declare).
+@export("abla_libc_fork")
+trusted fun libcFork(): int = libcResult(linuxSyscall0(57))
+
+// dlopen and dlsym: the table behind them is step 6 (the JIT's process symbols); until then they fail loudly.
+@export("abla_libc_dlopen")
+trusted fun libcDlopen(path: int, mode: int): int {
+    linuxSyscall3(1, 2, ablaUnsafeStringAddress("ablac: dlopen is not implemented in Abla's own libc yet (#806)\n"), 62)
+    linuxSyscall1(231, 127)
+    0
+}
+
+@export("abla_libc_dlsym")
+trusted fun libcDlsym(handle: int, name: int): int {
+    linuxSyscall3(1, 2, ablaUnsafeStringAddress("ablac: dlsym is not implemented in Abla's own libc yet (#806)\n"), 61)
+    linuxSyscall1(231, 127)
+    0
+}
+
+@export("syscall")
+trusted fun libcSyscall(number: int, a: int, b: int, c: int, d: int, e: int): int = libcResult(linuxSyscall6(number, a, b, c, d, e, 0))
+
+@export("clock_gettime")
+trusted fun libcClockGettime(clock: int, buffer: int): int = libcResult(linuxSyscall2(228, libcInt(clock), buffer))
+
+@export("gettimeofday")
+trusted fun libcGettimeofday(buffer: int, zone: int): int = libcResult(linuxSyscall2(96, buffer, zone))
+
+@export("time")
+trusted fun libcTime(buffer: int): int {
+    val seconds = linuxSyscall1(201, 0)
+    if (buffer != 0) ablaRuntimeStoreI64(buffer, seconds)
+    seconds
+}

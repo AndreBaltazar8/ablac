@@ -256,6 +256,58 @@ fun bootstrapLibcFreeRuntimeLibrary(): string {
     ""
 }
 
+// Whether an LLVM static archive belongs to a target the compiler does not initialise (it initialises X86, AArch64 and WebAssembly;
+// every other target is a separate process: Xtensa's llc and opt), and so is left out of the static compiler's link.
+fun bootstrapStaticLlvmOtherTarget(archive: string): bool {
+    for (target in ["AMDGPU", "ARC", "ARM", "AVR", "BPF", "CSKY", "DirectX", "Hexagon", "Lanai", "LoongArch", "M68k", "MSP430", "Mips",
+        "NVPTX", "PowerPC", "RISCV", "SPIRV", "Sparc", "SystemZ", "VE", "XCore", "Xtensa"]) {
+        if (archive.startsWith("libLLVM$target")) return true
+    }
+    false
+}
+
+// The data symbols a C library defines and the compiler's libraries reference, as the assembly file the static link adds: `environ`,
+// `__libc_single_threaded`, and `stdin`/`stdout`/`stderr` pointing at FILE objects whose first word is their descriptor (src/static_libc/stdio.ab).
+fun bootstrapStaticLibcData(): string =
+    ".data\n.p2align 3\n" +
+    ".globl environ\n.type environ,@object\n.size environ,8\nenviron:\n.quad 0\n" +
+    ".globl __libc_single_threaded\n.type __libc_single_threaded,@object\n.size __libc_single_threaded,1\n__libc_single_threaded:\n.byte 0\n.p2align 3\n" +
+    ".globl stdin\n.type stdin,@object\n.size stdin,8\nstdin:\n.quad abla_libc_file_in\n" +
+    ".globl stdout\n.type stdout,@object\n.size stdout,8\nstdout:\n.quad abla_libc_file_out\n" +
+    ".globl stderr\n.type stderr,@object\n.size stderr,8\nstderr:\n.quad abla_libc_file_err\n" +
+    ".p2align 3\nabla_libc_file_in:\n.quad 0\n.zero 216\n" +
+    "abla_libc_file_out:\n.quad 1\n.zero 216\n" +
+    "abla_libc_file_err:\n.quad 2\n.zero 216\n" +
+    ".text\n" +
+    bootstrapStaticLibcJump("sigaction") + bootstrapStaticLibcJump("sigaltstack") + bootstrapStaticLibcJump("fork") +
+    bootstrapStaticLibcJump("dlopen") + bootstrapStaticLibcJump("dlsym") +
+    // The variadic printf entry points build the System V va_list (the register save area, then the stack arguments) and call the Abla
+    // formatter (src/static_libc/format.ab). `named` is the number of fixed integer arguments; the rest are read from the va_list.
+    bootstrapStaticLibcVariadic("snprintf", 24, "") +
+    bootstrapStaticLibcVariadic("sprintf", 16, "\tmovq %rsi, %rdx\n\tmovq \$-1, %rsi\n\tleaq 176(%rsp), %rcx\n\tcall vsnprintf\n") +
+    bootstrapStaticLibcVariadic("__printf_chk", 16, "\tmovq %rsi, %rdi\n\tleaq 176(%rsp), %rsi\n\tcall abla_libc_vprintf\n") +
+    bootstrapStaticLibcVariadic("__snprintf_chk", 40, "\tmovq %r8, %rdx\n\tleaq 176(%rsp), %rcx\n\tcall vsnprintf\n") +
+    ".section .note.GNU-stack,\"\",@progbits\n"
+
+// A C name that is a jump to the Abla export abla_libc_<name> (src/static_libc/process.ab says why these five are not exported directly).
+fun bootstrapStaticLibcJump(name: string): string =
+    ".globl ${name}\n.type ${name},@function\n${name}:\n\tjmp abla_libc_${name}\n.size ${name}, .-${name}\n"
+
+// A variadic C function in assembly: the six integer argument registers and the eight vector registers saved at rsp, the va_list at
+// rsp + 176 (gp_offset = `gpOffset`, fp_offset 48, overflow area = the caller's stack arguments, register save area = rsp), then `call`
+// (the default is snprintf's: vsnprintf(buffer, size, format, va_list) with the first three arguments already in place).
+fun bootstrapStaticLibcVariadic(name: string, gpOffset: int, call: string): string =
+    ".globl ${name}\n.type ${name},@function\n${name}:\n" +
+    "\tsubq \$216, %rsp\n" +
+    "\tmovq %rdi, 0(%rsp)\n\tmovq %rsi, 8(%rsp)\n\tmovq %rdx, 16(%rsp)\n\tmovq %rcx, 24(%rsp)\n\tmovq %r8, 32(%rsp)\n\tmovq %r9, 40(%rsp)\n" +
+    "\ttestb %al, %al\n\tje 1f\n" +
+    "\tmovaps %xmm0, 48(%rsp)\n\tmovaps %xmm1, 64(%rsp)\n\tmovaps %xmm2, 80(%rsp)\n\tmovaps %xmm3, 96(%rsp)\n" +
+    "\tmovaps %xmm4, 112(%rsp)\n\tmovaps %xmm5, 128(%rsp)\n\tmovaps %xmm6, 144(%rsp)\n\tmovaps %xmm7, 160(%rsp)\n" +
+    "1:\n" +
+    "\tmovl \$${gpOffset}, 176(%rsp)\n\tmovl \$48, 180(%rsp)\n\tleaq 224(%rsp), %rax\n\tmovq %rax, 184(%rsp)\n\tmovq %rsp, 192(%rsp)\n" +
+    (if (call == "") "\tleaq 176(%rsp), %rcx\n\tcall vsnprintf\n" else call) +
+    "\taddq \$216, %rsp\n\tret\n.size ${name}, .-${name}\n"
+
 // What a failed link of the C library reports missing from the machine's C development
 // files (start files, libc, libgcc), as a list, or "" when it names none.
 fun bootstrapMissingCDevelopmentFiles(report: string): string {
@@ -4589,12 +4641,17 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         // C library only when it brings one: an OpenSSL import, libLLVM, the
         // manifest's nativeLibraries, extern "host" calls, or a C function the
         // libc-free link can't resolve (lld names it; `--verbose` prints why).
+        // The compiler itself (src/orc_main_static.ab) links LLVM's static archives, named by ABLA_STATIC_LLVM_LIB, on Abla's own C library
+        // (src/static_libc, #806 step C): no libLLVM.so and no libc, and a link that fails is an error, not a fallback to the hosted link.
+        val staticLlvmLibrary = if (linkLlvm && !macTarget && bootstrapLlvmTargetIsX8664Linux(target.llvmTriple))
+            linuxEnvironment("ABLA_STATIC_LLVM_LIB").value else ""
+        val staticLlvm = staticLlvmLibrary != ""
         var libcFree = !macTarget && bootstrapLlvmTargetIsX8664Linux(target.llvmTriple) &&
-        !target.libcFree && !linkOpenSsl && !linkLlvm && !hostImports &&
+        !target.libcFree && !linkOpenSsl && (!linkLlvm || staticLlvm) && !hostImports &&
         nativeLibraries.size == 0
         var libcReason = if (macTarget || !bootstrapLlvmTargetIsX8664Linux(target.llvmTriple)) ""
         else if (linkOpenSsl) "it imports OpenSSL (TLS)"
-        else if (linkLlvm) "it links libLLVM"
+        else if (linkLlvm && !staticLlvm) "it links libLLVM"
         else if (nativeLibraries.size > 0) "the manifest names nativeLibraries"
         else if (hostImports) "it calls extern \"host\" functions"
         else ""
@@ -4622,6 +4679,13 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                 link.argument("-Wl,-e,abla_start")
                 link.argument("-Wl,--defsym=pthread_create=abla_clone_create")
                 link.argument("-Wl,--defsym=pthread_join=abla_clone_join")
+                if (staticLlvm) {
+                    // The four the runtime declares itself are exported under other names (src/static_libc/memory.ab).
+                    link.argument("-Wl,--defsym=malloc=abla_libc_malloc")
+                    link.argument("-Wl,--defsym=calloc=abla_libc_calloc")
+                    link.argument("-Wl,--defsym=free=abla_libc_free")
+                    link.argument("-Wl,--defsym=realloc=abla_libc_realloc")
+                }
             } else link.argument("-pthread")
             if (ltoEligible && !linkLlvm && !wholeProgram) {
                 link.argument("-O2")
@@ -4647,7 +4711,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                 link.argument("-Wl,--gc-sections")
                 link.argument("-Wl,--error-limit=0")
             }
-            if (linkLlvm) {
+            if (linkLlvm && !staticLlvm) {
                 link.argument(if (macTarget)
                     "-Wl,-export_dynamic"
                     else
@@ -4673,7 +4737,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                     exportedSymbol = exportedSymbol + 1
                 }
             }
-            if (linkLlvm) {
+            if (linkLlvm && !staticLlvm) {
                 val configuredLlvm = linuxEnvironment("ABLA_MACOS_LLVM_LIB")
                 val llvmConfig = linuxCommand("llvm-config")
                 llvmConfig.argument("--libdir")
@@ -4704,6 +4768,30 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             }
             else link.argument(linkedObject)
             if (macTarget) link.argument(hostPath)
+            if (staticLlvm) {
+                // LLVM's static archives (the three targets the compiler initialises and the core), libstdc++, libz and libgcc, after the
+                // object, in one group so they may refer to one another; the data symbols a C library defines (environ, stdin ...) come
+                // from a generated assembly file.
+                val dataPath = "$publishPath.libc-data.s"
+                Path(dataPath).writeText(bootstrapStaticLibcData())
+                link.argument(dataPath)
+                link.argument("-Wl,--start-group")
+                for (entry in Path(staticLlvmLibrary).entries()) {
+                    val archive = entry.name()
+                    if (archive.size > 8 && archive.slice(0, 7) == "libLLVM" && archive.slice(archive.size - 2, archive.size) == ".a" &&
+                        !bootstrapStaticLlvmOtherTarget(archive)) link.argument(entry.text)
+                }
+                link.argument("-Wl,--end-group")
+                // The C++ library's archive is the C compiler's (gcc's), not the LLVM clang's, which has no GCC installation to look in.
+                val stdcxx = linuxCommand("gcc")
+                stdcxx.argument("-print-file-name=libstdc++.a")
+                link.argument(stdcxx.captureText().trim())
+                val zlibQuery = linuxCommand("gcc")
+                zlibQuery.argument("-print-file-name=libz.a")
+                val zlibPath = zlibQuery.captureText().trim()
+                val configuredZlib = linuxEnvironment("ABLA_STATIC_ZLIB")
+                link.argument(if (zlibPath.size > 0 && zlibPath[0] == 47) zlibPath else "${configuredZlib.value}/libz.a")
+            }
             // OpenSSL is not on Darwin's default library path, whether the graph
             // links it for TLS or the manifest names it.
             val openSslLibraryDirectory = bootstrapMacOpenSslLibraryDirectory(
@@ -4785,7 +4873,12 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                     }
                 }
             }
-            if (libcFree && status != 0) {
+            if (staticLlvm) {
+                // The static compiler has no hosted link to fall back to: a failure is reported whole.
+                if (status != 0) linuxPrintStandardError(Path(failures).readText())
+                Path("$publishPath.libc-data.s").remove()
+                linking = false
+            } else if (libcFree && status != 0) {
                 if (libcReason == "") {
                     val undefined: array<string> = []
                     for (line in Path(failures).readText().split("\n")) {

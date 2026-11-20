@@ -1,0 +1,349 @@
+// printf for the statically linked compiler's C library (#806 step C, the printf family): vsnprintf over the System V x86-64 va_list, and the
+// variadic entry points (snprintf, sprintf, __printf_chk, __snprintf_chk) as assembly that builds the va_list and calls it (src/toolchain.ab,
+// bootstrapStaticLibcData). Conversions: %d %i %u %x %X %o %c %s %p %% with flags - + space # 0, a width and a precision (also *), the
+// length modifiers hh h l ll z j t. Floating-point conversions (%f %e %g) print the shortest decimal that reads back (abla/float/text), cut to
+// the precision for %f and %g; they match C for the values LLVM prints (small decimals) and not digit for digit in general.
+import "abla/runtime/scalar"
+import "abla/float"
+import "abla/bytes"
+import "abla/text"
+import "abla/float/text"
+import "./string.ab"
+import "./stdio.ab"
+
+// The va_list: gp_offset (4 bytes), fp_offset (4), overflow_arg_area (8), reg_save_area (8).
+trusted fun libcVaInt(list: int): int {
+    val offset = ablaRuntimeLoadI32(list) & 4294967295
+    if (offset < 48) {
+        ablaRuntimeStoreI32(list, offset + 8)
+        return ablaRuntimeLoadI64(ablaRuntimeLoadI64(list + 16) + offset)
+    }
+    val area = ablaRuntimeLoadI64(list + 8)
+    ablaRuntimeStoreI64(list + 8, area + 8)
+    ablaRuntimeLoadI64(area)
+}
+
+trusted fun libcVaDouble(list: int): f64 {
+    val offset = ablaRuntimeLoadI32(list + 4) & 4294967295
+    if (offset < 176) {
+        ablaRuntimeStoreI32(list + 4, offset + 16)
+        return f64FromBits(ablaRuntimeLoadI64(ablaRuntimeLoadI64(list + 16) + offset))
+    }
+    val area = ablaRuntimeLoadI64(list + 8)
+    ablaRuntimeStoreI64(list + 8, area + 8)
+    f64FromBits(ablaRuntimeLoadI64(area))
+}
+
+// The output: a buffer of `size` bytes (one is kept for the NUL) and the count that would have been written.
+class LibcOut(val buffer: int, val size: int, var count: int)
+
+trusted fun LibcOut.put(byte: int): void {
+    if (this.count + 1 < this.size) ablaRuntimeStoreU8(this.buffer + this.count, byte)
+    this.count = this.count + 1
+    return
+}
+
+trusted fun LibcOut.padding(count: int, byte: int): void {
+    var done = 0
+    while (done < count) {
+        this.put(byte)
+        done = done + 1
+    }
+    return
+}
+
+trusted fun LibcOut.putText(text: string): void {
+    var at = 0
+    while (at < text.size) {
+        this.put(text[at])
+        at = at + 1
+    }
+    return
+}
+
+fun libcDigits(value: int, base: int, upper: bool): string {
+    if (value == 0) return "0"
+    var text = ""
+    var rest = value
+    // `value` is an unsigned magnitude held in an int: handle the sign bit by working with unsigned division steps.
+    val letters = if (upper) "0123456789ABCDEF" else "0123456789abcdef"
+    while (rest != 0) {
+        val digit = libcUnsignedRemainder(rest, base)
+        text = letters.slice(digit, digit + 1) + text
+        rest = libcUnsignedQuotient(rest, base)
+    }
+    text
+}
+
+// Unsigned division of a 64-bit word by a small divisor (the runtime has no unsigned division operator on int).
+fun libcUnsignedQuotient(value: int, divisor: int): int {
+    if (value >= 0) return value / divisor
+    val half = (value >>> 1) / divisor
+    var quotient = half * 2
+    val remainder = value - quotient * divisor
+    if (remainder >= divisor || remainder < 0) quotient = quotient + 1
+    quotient
+}
+
+fun libcUnsignedRemainder(value: int, divisor: int): int = value - libcUnsignedQuotient(value, divisor) * divisor
+
+trusted fun libcFormat(var out: LibcOut, format: int, list: int): void {
+    var at = 0
+    while (true) {
+        val c = ablaRuntimeLoadU8(format + at)
+        if (c == 0) break
+        at = at + 1
+        if (c != 37) {
+            out.put(c)
+            continue
+        }
+        var left = false
+        var plus = false
+        var space = false
+        var alternate = false
+        var zero = false
+        var flags = true
+        while (flags) {
+            val f = ablaRuntimeLoadU8(format + at)
+            if (f == 45) left = true
+            else if (f == 43) plus = true
+            else if (f == 32) space = true
+            else if (f == 35) alternate = true
+            else if (f == 48) zero = true
+            else flags = false
+            if (flags) at = at + 1
+        }
+        var width = 0
+        if (ablaRuntimeLoadU8(format + at) == 42) {
+            width = libcVaInt(list) & 4294967295
+            if (width >= 2147483648) {
+                width = 4294967296 - width
+                left = true
+            }
+            at = at + 1
+        } else {
+            while (ablaRuntimeLoadU8(format + at) >= 48 && ablaRuntimeLoadU8(format + at) <= 57) {
+                width = width * 10 + ablaRuntimeLoadU8(format + at) - 48
+                at = at + 1
+            }
+        }
+        var precision = -1
+        if (ablaRuntimeLoadU8(format + at) == 46) {
+            at = at + 1
+            precision = 0
+            if (ablaRuntimeLoadU8(format + at) == 42) {
+                precision = libcVaInt(list) & 4294967295
+                if (precision >= 2147483648) precision = -1
+                at = at + 1
+            } else {
+                while (ablaRuntimeLoadU8(format + at) >= 48 && ablaRuntimeLoadU8(format + at) <= 57) {
+                    precision = precision * 10 + ablaRuntimeLoadU8(format + at) - 48
+                    at = at + 1
+                }
+            }
+        }
+        // Length: l ll z j t take the whole word; none, h, hh the low 32, 16, 8 bits.
+        var size = 4
+        var scanning = true
+        while (scanning) {
+            val m = ablaRuntimeLoadU8(format + at)
+            if (m == 108 || m == 122 || m == 106 || m == 116 || m == 76 || m == 113) size = 8
+            else if (m == 104) size = if (size == 2) 1 else 2
+            else scanning = false
+            if (scanning) at = at + 1
+        }
+        val conversion = ablaRuntimeLoadU8(format + at)
+        at = at + 1
+        var body = ""
+        var sign = ""
+        var numeric = false
+        if (conversion == 37) {
+            out.put(37)
+            continue
+        } else if (conversion == 100 || conversion == 105) {
+            var value = libcVaInt(list)
+            if (size == 4) {
+                value = value & 4294967295
+                if (value >= 2147483648) value = value - 4294967296
+            } else if (size == 2) {
+                value = value & 65535
+                if (value >= 32768) value = value - 65536
+            } else if (size == 1) {
+                value = value & 255
+                if (value >= 128) value = value - 256
+            }
+            numeric = true
+            if (value < 0) {
+                sign = "-"
+                // The magnitude of the most negative value is itself as an unsigned word.
+                body = libcDigits(0 - value, 10, false)
+            } else {
+                sign = if (plus) "+" else if (space) " " else ""
+                body = libcDigits(value, 10, false)
+            }
+        } else if (conversion == 117 || conversion == 120 || conversion == 88 || conversion == 111) {
+            var value = libcVaInt(list)
+            if (size == 4) value = value & 4294967295
+            else if (size == 2) value = value & 65535
+            else if (size == 1) value = value & 255
+            numeric = true
+            val base = if (conversion == 117) 10 else if (conversion == 111) 8 else 16
+            body = libcDigits(value, base, conversion == 88)
+            if (alternate && value != 0) {
+                if (conversion == 120) sign = "0x"
+                else if (conversion == 88) sign = "0X"
+                else if (conversion == 111) body = "0" + body
+            }
+        } else if (conversion == 112) {
+            val value = libcVaInt(list)
+            body = if (value == 0) "(nil)" else "0x" + libcDigits(value, 16, false)
+        } else if (conversion == 99) {
+            body = ""
+            out.padding(if (left) 0 else width - 1, 32)
+            out.put(libcVaInt(list) & 255)
+            out.padding(if (left) width - 1 else 0, 32)
+            continue
+        } else if (conversion == 115) {
+            val text = libcVaInt(list)
+            if (text == 0) body = "(null)"
+            else {
+                var length = 0
+                while ((precision < 0 || length < precision) && ablaRuntimeLoadU8(text + length) != 0) length = length + 1
+                var copy = ""
+                var i = 0
+                while (i < length) {
+                    copy = copy + utf8ByteText(ablaRuntimeLoadU8(text + i))
+                    i = i + 1
+                }
+                body = copy
+            }
+            precision = -1
+        } else if (conversion == 102 || conversion == 70 || conversion == 101 || conversion == 69 || conversion == 103 || conversion == 71) {
+            val value = libcVaDouble(list)
+            body = libcFloat(value, conversion, precision, alternate)
+            if (body.size > 0 && body[0] == 45) {
+                sign = "-"
+                body = body.slice(1, body.size)
+            } else sign = if (plus) "+" else if (space) " " else ""
+            numeric = true
+        } else {
+            // An unknown conversion is written as it came.
+            out.put(37)
+            out.put(conversion)
+            continue
+        }
+        if (numeric && precision >= 0 && body.size < precision && (conversion == 100 || conversion == 105 || conversion == 117 ||
+            conversion == 120 || conversion == 88 || conversion == 111)) {
+            var padded = body
+            while (padded.size < precision) padded = "0" + padded
+            body = padded
+        }
+        val total = sign.size + body.size
+        val fill = if (width > total) width - total else 0
+        if (left) {
+            out.putText(sign)
+            out.putText(body)
+            out.padding(fill, 32)
+        } else if (zero && numeric && !(precision >= 0 && (conversion == 100 || conversion == 105 || conversion == 117 || conversion == 120 ||
+            conversion == 88 || conversion == 111))) {
+            out.putText(sign)
+            out.padding(fill, 48)
+            out.putText(body)
+        } else {
+            out.padding(fill, 32)
+            out.putText(sign)
+            out.putText(body)
+        }
+    }
+    return
+}
+
+// One byte as a one-byte string (the C strings here are bytes, not UTF-8 text).
+fun utf8ByteText(byte: int): string = byteEncode(byte)
+
+// The shortest-decimal digits of `value`, laid out as the conversion asks; a cut to the precision rounds half up on the shortest digits.
+fun libcFloat(value: f64, conversion: int, precision: int, alternate: bool): string {
+    val text = f64Text(value)
+    // f64Text gives forms like "1.5", "-0.25", "1e21", "NaN", "Infinity"; nothing else is expected from LLVM's callers.
+    var shown = text
+    if (conversion == 102 || conversion == 70) {
+        val dot = shown.indexOf(".")
+        val wanted = if (precision < 0) 6 else precision
+        if (dot < 0) {
+            var whole = shown
+            if (wanted > 0) {
+                whole = whole + "."
+                var i = 0
+                while (i < wanted) {
+                    whole = whole + "0"
+                    i = i + 1
+                }
+            }
+            return whole
+        }
+        val fraction = shown.slice(dot + 1, shown.size)
+        if (fraction.size <= wanted) {
+            var padded = fraction
+            while (padded.size < wanted) padded = padded + "0"
+            return shown.slice(0, dot) + (if (wanted > 0) "." + padded else "")
+        }
+        // Cut and round half up on the digit after the last kept one.
+        var kept = shown.slice(0, dot) + fraction.slice(0, wanted)
+        val next = fraction[wanted]
+        var digits = kept
+        if (next >= 53) digits = libcIncrementDigits(kept)
+        val negative = digits.size > 0 && digits[0] == 45
+        val integerSize = digits.size - wanted
+        return digits.slice(0, integerSize) + (if (wanted > 0) "." + digits.slice(integerSize, digits.size) else "")
+    }
+    shown
+}
+
+// "-12" -> "-13", "199" -> "200", "-0" -> "-1" as digit strings (the sign kept).
+fun libcIncrementDigits(digits: string): string {
+    var negative = false
+    var body = digits
+    if (body.size > 0 && body[0] == 45) {
+        negative = true
+        body = body.slice(1, body.size)
+    }
+    var out = ""
+    var carry = 1
+    var i = body.size - 1
+    while (i >= 0) {
+        var d = body[i] - 48 + carry
+        if (d == 10) {
+            d = 0
+            carry = 1
+        } else carry = 0
+        out = byteEncode(48 + d) + out
+        i = i - 1
+    }
+    if (carry == 1) out = "1" + out
+    if (negative) "-" + out else out
+}
+
+@export("vsnprintf")
+trusted fun libcVsnprintf(buffer: int, size: int, format: int, list: int): int {
+    val out = LibcOut(buffer, size, 0)
+    libcFormat(out, format, list)
+    if (size > 0) {
+        val end = if (out.count < size - 1) out.count else size - 1
+        ablaRuntimeStoreU8(buffer + end, 0)
+    }
+    out.count
+}
+
+@export("__vsnprintf_chk")
+trusted fun libcVsnprintfChk(buffer: int, size: int, flag: int, objectSize: int, format: int, list: int): int =
+    libcVsnprintf(buffer, size, format, list)
+
+// printf to stdout from the assembly shim __printf_chk: the text goes to descriptor 1 in one write.
+@export("abla_libc_vprintf")
+trusted fun libcVprintf(format: int, list: int): int {
+    val buffer = __ablaRuntimeHostHeapAllocate(4096, false)
+    val count = libcVsnprintf(buffer, 4096, format, list)
+    libcWriteAll(1, buffer, if (count < 4095) count else 4095)
+    __ablaRuntimeHostHeapFree(buffer)
+    count
+}

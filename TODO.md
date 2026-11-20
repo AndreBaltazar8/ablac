@@ -140,6 +140,29 @@ a stdlib area the 11 programs miss (sockets, processes, signals, stm) shows. The
 through `abla/tls/pure`, which takes libssl and libcrypto out of the compiler's 36 imports (step C, André's, listed
 for completeness).
 
+Step C, the compiler (decision #87, 2026-11-20, owner ablac-60): the compiler links LLVM's static archives and Abla's own C library, with no libc
+and no libLLVM.so. Measured on stage 2's own object (14 MB: 309 LLVM C API functions, three libc ones): linked against libLLVM*.a, libstdc++.a, libz.a
+and libgcc.a with no libc it leaves exactly 204 undefined symbols (the same with all LLVM targets or only X86, AArch64 and WebAssembly), which
+`tools/compiler-libc-needs.txt` records and `tools/test-compiler-libc-needs.sh` checks (it needs the static archives: ABLA_STATIC_LLVM_LIB). By family:
+fs/syscalls 32, process/signals/env 39, string/format/glibc-compat 30, math 25, locale/wide characters 41, pthread 14, memory 7, stdio 6, dl/unwinder 5,
+time 4, arc4random 1. Of them about 30 run in a hello-world build (gdb hit counts over six workloads: malloc 1.6M calls, aligned operator new 218k, qsort,
+file and mmap calls, getenv, exit, thread creation); fork/exec, every dl*, sigaction, all locale, strftime and math never ran. LLVM 23.1.3's archives have no
+references to C++ exception machinery (built -fno-exceptions), so the unwinder is abort stubs; libstdc++ is the C++ runtime (the archives use its ABI and
+ostringstream). The JIT (`ablac run`, the compile-time jit tier) finds process symbols through dlopen(NULL)/dlsym, which the own libc answers from a
+table of its functions; dlopen of a real shared object fails, so compile-time `nativeLibraries` are not available in the static compiler (decision #88).
+Alternatives measured and dropped: a static glibc link builds and runs but is still glibc and has no JIT symbols; musl dies before main (LLVM's static
+recursive mutex has glibc's layout). Design: ~/agents-memory/abla/ablac-806-step-c-design.md. The steps, each gated, the dynamic compiler staying the shipped
+one until the last: (1, done) the needs guard; (2, done 2026-11-20) `src/orc_main_static.ab` + `src/static_libc` (memory, files, process, strings, stdio, printf; aborting stubs for the
+rest) + the toolchain's static link (`ABLA_STATIC_LLVM_LIB` set: no libLLVM.so, no libc, `-static-pie`, the archives of the three targets, libstdc++, libz,
+a generated assembly file with the data symbols and the variadic printf entry points), built by `tools/build-static-compiler.sh`, single-threaded: a
+97 MB static-pie with no needed library that builds hello, strings-arrays, files, float-remainder, tasks, threads and jwt-verify byte for byte as the
+ordinary compiler does (`tools/test-static-compiler.sh`; it needs the static archives and skips without them). Found on the way: a C comparator returns
+its int in eax with the upper half undefined, so `qsort` must sign-extend the low 32 bits (the first crash was a corrupt sort inside LLVM); the runtime
+declares malloc/calloc/free/realloc itself, so their exports are abla_libc_* and the link binds the C names by --defsym; the compiler's own externs of
+sigaction, sigaltstack, fork, dlopen and dlsym have 32-bit signatures an export cannot match, so those five are assembly jumps; (3) the remaining families; (4) C locale; (5) threads and
+thread-local storage; (6) the dlsym table and ORC; (7) math; (8) the verification campaign (suite and stage 2 == stage 3 built by the static compiler,
+byte-compare module programs, RSS); (9) the switch (the release job packages the static binary; the `compiler` allowlist of test-libc-imports goes empty).
+
 Step 5, the heap (ablac-87, branch heap-806-step5): the runtime heap's malloc, calloc, realloc and
 free are Abla code over mmap, munmap, mremap and madvise on x86-64 Linux (`__ablaRuntimeHostHeap*`
 in `host.ab`); macOS and AArch64 Linux keep libc's. Blocks have glibc's geometry (a 16-byte aligned

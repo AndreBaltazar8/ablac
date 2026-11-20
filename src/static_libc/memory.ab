@@ -1,0 +1,85 @@
+// #806 step C: Abla's own C library for the statically linked compiler (src/orc_main_static.ab). The memory family: one allocator
+// for the whole process, the Abla heap (stdlib/abla/runtime/platform/host.ab, on mmap), so LLVM and the compiler share its pool
+// (todo #815). Every function is exported under its C name; the arguments and results are the C ABI's words, an `int` parameter
+// of C one masked to its 32 bits.
+import "abla/runtime/scalar"
+import "abla/runtime/memory"
+
+@export("abla_libc_malloc")
+trusted fun libcMalloc(size: int): int = __ablaRuntimeHostHeapAllocate(size, false)
+
+@export("abla_libc_calloc")
+trusted fun libcCalloc(count: int, size: int): int = ablaRuntimePointerAddress(__ablaRuntimeHostHeapCallocate(count, size))
+
+@export("abla_libc_free")
+trusted fun libcFree(address: int): void {
+    if (address == 0) return
+    // An aligned block (posix_memalign) holds the marker and its real address just before the pointer it gave out.
+    val tag = ablaRuntimeLoadI64(address - 8)
+    if (tag == libcAlignedTag) __ablaRuntimeHostHeapFree(ablaRuntimeLoadI64(address - 16))
+    else __ablaRuntimeHostHeapFree(address)
+    return
+}
+
+@export("abla_libc_realloc")
+trusted fun libcRealloc(address: int, size: int): int {
+    if (address == 0) return __ablaRuntimeHostHeapAllocate(size, false)
+    if (ablaRuntimeLoadI64(address - 8) == libcAlignedTag) {
+        // The caller wants a plain block: a new one, the old contents as far as they go, the aligned one freed.
+        val fresh = __ablaRuntimeHostHeapAllocate(size, false)
+        if (fresh == 0) return 0
+        var wanted = ablaRuntimeLoadI64(address - 24)
+        if (wanted > size) wanted = size
+        var at = 0
+        while (at < wanted) {
+            ablaRuntimeStoreU8(fresh + at, ablaRuntimeLoadU8(address + at))
+            at = at + 1
+        }
+        libcFree(address)
+        return fresh
+    }
+    __ablaRuntimeHostHeapResize(address, size)
+}
+
+// A marker no ordinary block can carry in its header word: a size of 2^63 and a quarter.
+val libcAlignedTag = 0x7a11c0dedeadbeef
+
+// Alignments above 16 (the heap's payload alignment, which LLVM's aligned operator new asks for 218000 times to build hello
+// world): a block of size + alignment + 32 from the heap, the aligned pointer inside it, its real address, the requested size and
+// the marker in the three words before it.
+@export("posix_memalign")
+trusted fun libcPosixMemalign(result: int, alignment: int, size: int): int {
+    if (alignment < 8 || (alignment & (alignment - 1)) != 0) return 22
+    if (alignment <= 16) {
+        val plain = __ablaRuntimeHostHeapAllocate(size, false)
+        if (plain == 0) return 12
+        ablaRuntimeStoreI64(result, plain)
+        return 0
+    }
+    val raw = __ablaRuntimeHostHeapAllocate(size + alignment + 32, false)
+    if (raw == 0) return 12
+    val aligned = (raw + 24 + alignment - 1) & (0 - alignment)
+    ablaRuntimeStoreI64(aligned - 24, size)
+    ablaRuntimeStoreI64(aligned - 16, raw)
+    ablaRuntimeStoreI64(aligned - 8, libcAlignedTag)
+    ablaRuntimeStoreI64(result, aligned)
+    0
+}
+
+@export("malloc_trim")
+trusted fun libcMallocTrim(pad: int): int {
+    runtimeMemoryRelease()
+    1
+}
+
+// struct mallinfo2 is ten size_t words returned in memory (the caller's sret pointer arrives in the first argument register); the
+// statistics are not kept: all zero.
+@export("mallinfo2")
+trusted fun libcMallinfo2(destination: int): int {
+    var at = 0
+    while (at < 10) {
+        ablaRuntimeStoreI64(destination + at * 8, 0)
+        at = at + 1
+    }
+    destination
+}
