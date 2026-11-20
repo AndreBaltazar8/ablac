@@ -163,13 +163,15 @@ fi
 # runtime entry and leave, among others). Their thread-local storage must be the running program's, named after
 # its function (abla_thread_local_<function>_<n>): a name LLVM numbered in emission order named some other
 # thread-local of the running program in the reload's module. Every thread-local a reload module has is named so.
+# LLVM prints a thread-local as `thread_local(initialexec)` where the JIT uses initial-exec (Linux) and as plain
+# `thread_local` in the general-dynamic model (macOS, where ORC then emulates it): both forms count.
 modules=$(find "$out" -maxdepth 1 -name 'module-*.ll' | wc -l)
-numbered=$(grep -h 'thread_local(' "$out"/module-*.ll 2> /dev/null | grep -Evc '^@(__abla_unit\.)?abla_thread_local_' || true)
-named=$(grep -h 'thread_local(' "$out"/module-*.ll 2> /dev/null | grep -Ec '^@(__abla_unit\.)?abla_thread_local_' || true)
+numbered=$(grep -hE ' thread_local[ (]' "$out"/module-*.ll 2> /dev/null | grep -Evc '^@(__abla_unit\.)?abla_thread_local_' || true)
+named=$(grep -hE ' thread_local[ (]' "$out"/module-*.ll 2> /dev/null | grep -Ec '^@(__abla_unit\.)?abla_thread_local_' || true)
 if [[ $modules -eq 0 || $named -eq 0 || $numbered -ne 0 ]]; then
     printf 'live jit (thread-locals): %s reload modules, %s thread-locals named after their function, %s not\n' \
         "$modules" "$named" "$numbered" >&2
-    grep -h 'thread_local(' "$out"/module-*.ll 2> /dev/null | grep -Ev '^@(__abla_unit\.)?abla_thread_local_' | head -n 5 >&2
+    grep -hE ' thread_local[ (]' "$out"/module-*.ll 2> /dev/null | grep -Ev '^@(__abla_unit\.)?abla_thread_local_' | head -n 5 >&2
     exit 1
 fi
 rm -f "$out"/module-*.ll
