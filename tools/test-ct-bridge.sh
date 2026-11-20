@@ -159,7 +159,9 @@ for tier in interp bridge; do
         exit 1
     fi
 done
-unrouted=$(cat "$output_directory/loopback/unrouted.txt" 2>/dev/null | wc -l)
+# Every case routed means no unrouted.txt: count it as none (a failing cat would end the script under pipefail).
+unrouted=0
+[[ -f $output_directory/loopback/unrouted.txt ]] && unrouted=$(wc -l < "$output_directory/loopback/unrouted.txt")
 compared=$(( ${#cases[@]} - unrouted ))
 # The routed cases are the ones the loopback is for: a mark that is never written would leave none compared.
 if (( compared < 100 )); then
