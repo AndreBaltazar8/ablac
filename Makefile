@@ -100,6 +100,7 @@ test-serial: ablac
 	tools/test-run-limited.sh
 	tools/test-libc-imports.sh $(COMPILER)
 	LIBC_FREE_TARGETS=x86 tools/test-libc-free-programs.sh $(COMPILER)
+	tools/test-compiler-libc-needs.sh $(COMPILER)
 	tools/test-libsystem-imports.sh $(COMPILER)
 	tools/test-libc-memory-routines.sh $(COMPILER)
 	tools/test-darwin-syscalls.sh $(COMPILER)
