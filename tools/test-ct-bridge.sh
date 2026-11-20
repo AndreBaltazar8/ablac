@@ -104,14 +104,28 @@ compare_case() {
             "$source" "$seconds" "$stopped" >&2
         return 1
     fi
+    for tier in interp bridge; do comparable_err < "$base.$tier.err" > "$base.$tier.cmp"; done
     if [[ $interp_status -ne $bridge_status ]] ||
         ! cmp -s "$base.interp.ll" "$base.bridge.ll" ||
-        ! cmp -s "$base.interp.err" "$base.bridge.err"; then
+        ! cmp -s "$base.interp.cmp" "$base.bridge.cmp"; then
         printf 'loopback mismatch: %s (status %s vs %s)\n' \
             "$source" "$interp_status" "$bridge_status" >&2
-        diff "$base.interp.err" "$base.bridge.err" >&2 || true
+        diff "$base.interp.cmp" "$base.bridge.cmp" >&2 || true
         return 1
     fi
+}
+
+# A tier's diagnostics without what depends on its speed: the note on a `#` site that took five seconds or more (its
+# time, and whether it is there at all), and the place of a time-limit error, which is wherever the interrupt landed
+# (its source[eval] offsets and its --> line). Everything else stays exact.
+comparable_err() {
+    awk '
+        /^note: the `#` site at .* took [0-9.]+ s / { next }
+        /^(error|warning)\[/ { limit = ($0 ~ /^error\[E_CT_TIME_LIMIT\]/) }
+        limit && /^source\[eval\]:/ { sub(/:[0-9]+:[0-9]+$/, ":<at>:<end>") }
+        limit && /^  --> / { sub(/:[0-9]+:[0-9]+/, ":<line>:<column>") }
+        { print }
+    '
 }
 
 # Every case using the compiler API, parser extensions or compile grants. (Not capabilities/ambient.ab: the compile-time clock and
@@ -129,7 +143,7 @@ for long_case in $long_cases; do
     [[ -f $long_case ]] || { echo "tests/cases/ct-bridge/long-loopback.txt names $long_case, which is gone" >&2; exit 1; }
 done
 export compiler project_root output_directory work_template long_cases
-export -f compare_case
+export -f compare_case comparable_err
 mkdir -p "$output_directory/loopback"
 rm -f "$output_directory/loopback/unrouted.txt"
 printf '%s\0' "${cases[@]}" |
