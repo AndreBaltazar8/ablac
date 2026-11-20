@@ -1,47 +1,184 @@
-// The pthread synchronisation functions of the statically linked compiler's C library, for ONE thread (#806 step C, step 2): every lock is
-// free and taken at once, so the compiler must run with a single worker (ABLA_NATIVE_JOBS=1, ABLA_CODEGEN_JOBS=1) until the threads family
-// (clone threads, futex locks, thread-local storage) replaces these. pthread_create and pthread_join are the runtime's abla_clone_create and
-// abla_clone_join by a link --defsym, as for any libc-free program.
+// The pthread synchronisation functions of the statically linked compiler's C library (#806 step C, step 5), over futex words, so the compiler's
+// worker threads (the runtime's own clone threads: pthread_create and pthread_join are its abla_clone_create and abla_clone_join by a link
+// --defsym) lock the LLVM and libstdc++ structures they share. The objects are the glibc layouts the C++ side initialises statically with zeros
+// (std::mutex, shared_mutex, condition_variable) or with PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP (kind 1 at offset 16): a mutex is a lock word
+// at 0 (0 free, 1 held, 2 held with waiters), the recursion count at 4 and the owner thread id at 8; a read-write lock is one word at 0 (0 free,
+// n readers, -1 a writer); a condition variable is a sequence number at 0.
 import "abla/runtime/scalar"
 import "abla/unsafe/native"
 import "abla/sys/linux"
 
-@export("pthread_mutex_lock")
-fun libcMutexLock(mutex: int): int = 0
+trusted fun libcCas(address: int, expected: int, replacement: int): int =
+    i64(ablaUnsafeAtomicCompareExchangeU32(address, u32(expected & 4294967295), u32(replacement & 4294967295)))
 
-@export("pthread_mutex_unlock")
-fun libcMutexUnlock(mutex: int): int = 0
+trusted fun libcFutexWait(address: int, value: int): void {
+    // FUTEX_WAIT_PRIVATE (128), no timeout.
+    linuxSyscall6(202, address, 128, value & 4294967295, 0, 0, 0)
+    return
+}
+
+trusted fun libcFutexWake(address: int, count: int): void {
+    linuxSyscall6(202, address, 129, count, 0, 0, 0)
+    return
+}
+
+trusted fun libcLoad32(address: int): int = ablaRuntimeLoadI32(address) & 4294967295
+
+trusted fun libcStore32(address: int, value: int): void {
+    ablaRuntimeStoreI32(address, value)
+    ablaUnsafeAtomicFence()
+    return
+}
+
+// The three-state futex lock: 0 free, 1 held, 2 held and someone may be waiting.
+trusted fun libcLockWord(word: int): void {
+    var seen = libcCas(word, 0, 1)
+    if (seen == 0) return
+    while (true) {
+        // Announce a waiter (2), then sleep while the word is 2.
+        if (seen == 2 || libcCas(word, 1, 2) != 0) libcFutexWait(word, 2)
+        seen = libcCas(word, 0, 2)
+        if (seen == 0) return
+    }
+    return
+}
+
+trusted fun libcUnlockWord(word: int): void {
+    ablaUnsafeAtomicFence()
+    val previous = libcCas(word, 1, 0)
+    if (previous == 1) return
+    // 2: waiters; free the word and wake one (the woken thread takes it as 2).
+    libcStore32(word, 0)
+    libcFutexWake(word, 1)
+    return
+}
+
+trusted fun libcThreadId(): int = linuxSyscall0(186)
+
+@export("abla_libc_pthread_mutex_lock")
+trusted fun libcMutexLock(mutex: int): int {
+    if (libcLoad32(mutex + 16) == 1) {
+        // Recursive: the owner takes it again.
+        val me = libcThreadId()
+        if (libcLoad32(mutex + 8) == me && libcLoad32(mutex) != 0) {
+            libcStore32(mutex + 4, libcLoad32(mutex + 4) + 1)
+            return 0
+        }
+        libcLockWord(mutex)
+        libcStore32(mutex + 8, me)
+        libcStore32(mutex + 4, 1)
+        return 0
+    }
+    libcLockWord(mutex)
+    0
+}
+
+@export("abla_libc_pthread_mutex_unlock")
+trusted fun libcMutexUnlock(mutex: int): int {
+    if (libcLoad32(mutex + 16) == 1) {
+        val count = libcLoad32(mutex + 4) - 1
+        libcStore32(mutex + 4, count)
+        if (count > 0) return 0
+        libcStore32(mutex + 8, 0)
+    }
+    libcUnlockWord(mutex)
+    0
+}
 
 @export("pthread_rwlock_rdlock")
-fun libcRwlockRead(lock: int): int = 0
+trusted fun libcRwlockRead(lock: int): int {
+    while (true) {
+        val state = libcLoad32(lock)
+        // A writer holds it as 4294967295 (-1 in 32 bits).
+        if (state == 4294967295) {
+            libcFutexWait(lock, state)
+        } else if (libcCas(lock, state, state + 1) == state) return 0
+    }
+    0
+}
 
 @export("pthread_rwlock_wrlock")
-fun libcRwlockWrite(lock: int): int = 0
+trusted fun libcRwlockWrite(lock: int): int {
+    while (true) {
+        val state = libcLoad32(lock)
+        if (state == 0) {
+            if (libcCas(lock, 0, 4294967295) == 0) return 0
+        } else libcFutexWait(lock, state)
+    }
+    0
+}
 
 @export("pthread_rwlock_unlock")
-fun libcRwlockUnlock(lock: int): int = 0
+trusted fun libcRwlockUnlock(lock: int): int {
+    ablaUnsafeAtomicFence()
+    while (true) {
+        val state = libcLoad32(lock)
+        if (state == 4294967295) {
+            libcStore32(lock, 0)
+            libcFutexWake(lock, 2147483647)
+            return 0
+        }
+        if (state == 0) return 1
+        if (libcCas(lock, state, state - 1) == state) {
+            if (state == 1) libcFutexWake(lock, 2147483647)
+            return 0
+        }
+    }
+    0
+}
+
+// Condition variables: waiting reads the sequence, releases the mutex, sleeps while the sequence is unchanged and takes the mutex again; a
+// wake-up that is not a signal is allowed by the standard (callers loop on their predicate).
+@export("pthread_cond_wait")
+trusted fun libcCondWait(condition: int, mutex: int): int {
+    val sequence = libcLoad32(condition)
+    libcMutexUnlock(mutex)
+    libcFutexWait(condition, sequence)
+    libcMutexLock(mutex)
+    0
+}
 
 @export("pthread_cond_signal")
-fun libcCondSignal(condition: int): int = 0
+trusted fun libcCondSignal(condition: int): int {
+    libcStore32(condition, libcLoad32(condition) + 1)
+    libcFutexWake(condition, 1)
+    0
+}
 
 @export("pthread_cond_broadcast")
-fun libcCondBroadcast(condition: int): int = 0
+trusted fun libcCondBroadcast(condition: int): int {
+    libcStore32(condition, libcLoad32(condition) + 1)
+    libcFutexWake(condition, 2147483647)
+    0
+}
 
 @export("pthread_cond_destroy")
 fun libcCondDestroy(condition: int): int = 0
 
-// pthread_once: the control word is 0 until the routine has run, once.
+// A detached thread's resources stay with the runtime until the process ends.
+@export("pthread_detach")
+fun libcDetach(handle: int): int = 0
+
+// pthread_once: the control word is 0 until the routine has run, 1 while it runs, 2 after.
 @export("pthread_once")
 trusted fun libcOnce(control: int, routine: int): int {
-    if (ablaRuntimeLoadI32(control) == 0) {
-        ablaRuntimeStoreI32(control, 1)
-        ablaUnsafeCallAddressI32(routine, 0)
+    while (true) {
+        val state = libcLoad32(control)
+        if (state == 2) return 0
+        if (state == 0) {
+            if (libcCas(control, 0, 1) == 0) {
+                ablaUnsafeCallAddressI32(routine, 0)
+                libcStore32(control, 2)
+                libcFutexWake(control, 2147483647)
+                return 0
+            }
+        } else libcFutexWait(control, state)
     }
     0
 }
 
 // Calls the JIT'd code makes: pause (until a signal), pthread_self (the thread pointer: arch_prctl ARCH_GET_FS), pthread_kill (tgkill of the
-// calling thread: only a thread signalling itself is supported until the threads family).
+// calling thread: only a thread signalling itself is supported).
 @export("pause")
 trusted fun libcPause(): int {
     linuxSyscall0(34)

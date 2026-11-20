@@ -25,7 +25,8 @@ tools/build-static-compiler.sh "$compiler" "$out/ablac-static" > "$out/build.log
 needed=$(readelf -d "$out/ablac-static" | grep -c '(NEEDED)' || true)
 [[ $needed == 0 ]] || { echo "static compiler: $needed needed libraries" >&2; readelf -d "$out/ablac-static" >&2; exit 1; }
 file -b "$out/ablac-static" | grep 'static-pie linked' >/dev/null || { echo 'static compiler: not a static-pie image' >&2; exit 1; }
-export ABLA_NATIVE_JOBS=1 ABLA_CODEGEN_JOBS=1
+# Several workers: the compiler's own threads lock LLVM's shared structures through the library's futex mutexes (src/static_libc/pthread.ab).
+export ABLA_NATIVE_JOBS=4 ABLA_CODEGEN_JOBS=4
 count=0
 for source in tests/cases/libc-imports/hello.ab tests/cases/libc-imports/strings-arrays.ab tests/cases/libc-imports/files.ab \
     tests/cases/libc-imports/float-remainder.ab tests/cases/libc-imports/tasks.ab tests/cases/libc-imports/threads.ab \
