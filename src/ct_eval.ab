@@ -65,6 +65,9 @@ class BootstrapCtSite(
     // output…) or a compile global ("unasked" until the walk is asked). A trial's result, kept in `tried`, is the
     // one lowering takes.
     var noTrial: string = "unasked",
+    // Why a native failure of the site can't be placed by rerunning it in the evaluator ("" when it can: the trials'
+    // rule, any tier; ct_jit.ab, bootstrapCtMarkRerun), "unasked" before the pass is prepared.
+    var rerun: string = "unasked",
     var tried: BootstrapEvalResult? = null,
     // Whether the slice keeps the site's `#` node (in a kept global's initializer or function's body): then the node
     // and the site's entry both call one accessor that runs the site's code once (ct_jit.ab, bootstrapCtOnceSource).
@@ -252,14 +255,64 @@ fun bootstrapCtReportStop(var evaluator: BootstrapEvaluator, site: BootstrapCtSi
         text = "compile-time code stopped: ${bootstrapCtStopWhat(how)}"
     }
     evaluator.errors = evaluator.errors + 1
+    // A failure that runs the same way again (not the time limit, nor a stop beside threads) of a site that can run
+    // again unseen: the evaluator's place and path, inlined functions too, when it fails there the same way.
+    val placed = if (how == 3 || site.rerun != "") ""
+        else bootstrapCtRerunPlace(evaluator, site, "error[$code]: $text")
+    if (how != 3) bootstrapCtNote(
+        if (site.rerun != "") "no rerun at ${bootstrapCtSiteLabel(site)}: ${site.rerun}"
+        else if (placed != "") "rerun at ${bootstrapCtSiteLabel(site)}: the evaluator placed the failure"
+        else "rerun at ${bootstrapCtSiteLabel(site)}: the evaluator didn't fail the same way within its budget")
     evaluator.recordEvaluatorDiagnostic(code, text)
+    if (placed != "") {
+        evaluator.diagnostics = "${evaluator.diagnostics}$placed"
+        return
+    }
     if (site.sourceIdentity != "") {
         evaluator.diagnostics =
             "${evaluator.diagnostics}source[eval-site]:${site.sourceIdentity}:${site.node.begin}:${site.node.end}\n"
     }
-    // The user's functions it was in, innermost first, as the evaluator names them on its way out (eval.ab).
-    evaluator.diagnostics = "${evaluator.diagnostics}${bootstrapCtStopPath()}"
+    // The user's functions it was in, innermost first, as the evaluator names them on its way out: beside the
+    // diagnostics, which the site's report adds after them, past the 8 KiB cut (eval.ab, bootstrapEvalPathRecords).
+    bootstrapEvalPathRecords = "$bootstrapEvalPathRecords${bootstrapCtStopPath()}"
     return
+}
+
+// Reruns a site whose native call failed with `failure` (its error line) in the evaluator, as a trial runs one
+// (ctNativeTrial: it stops before anything with an effect, ct_native.ab), within the trials' default budget (a million
+// steps). When it fails there with the same line, its place and path, as records: the place as source[eval-rerun],
+// which says how it was found (diagnostic_positions.ab). Else "".
+fun bootstrapCtRerunPlace(var evaluator: BootstrapEvaluator, site: BootstrapCtSite, failure: string): string {
+    if (site.sourceIdentity == "") return ""
+    val shared = bootstrapEvalContext(evaluator.declarations)
+    val budget = 1000000
+    val context = BootstrapEvalContext(shared.size, shared.affineTypes, shared.index, shared.check, budget)
+    val outerTrial = ctNativeTrial
+    ctNativeTrial = true
+    bootstrapEvalPathBegin()
+    val result = bootstrapEvaluateWithEffectsIn(context, site.expression, evaluator.declarations,
+        evaluator.allowedCompileEffects, site.sourceIdentity)
+    ctNativeTrial = outerTrial
+    // The functions it was in, which the site's report adds (eval.ab, bootstrapEvalPathRecords) when it matched.
+    val frames = bootstrapEvalPathTake()
+    bootstrapEvalPathBegin()
+    val text = result.diagnostics
+    if (result.errors == 0 || !text.startsWith("$failure\n")) return ""
+    val records = text.slice(failure.size + 1, text.size)
+    // Its first error's place.
+    var lineBegin = 0
+    while (lineBegin < records.size) {
+        var lineEnd = lineBegin
+        while (lineEnd < records.size && records[lineEnd] != 10) lineEnd = lineEnd + 1
+        val line = records.slice(lineBegin, lineEnd)
+        if (line.startsWith("error[")) return ""
+        if (line.startsWith("source[eval]:")) {
+            bootstrapEvalPathRecords = frames
+            return "source[eval-rerun]:${line.slice(13, line.size)}\n"
+        }
+        lineBegin = lineEnd + 1
+    }
+    ""
 }
 
 // The live generation's functions in the order of abla_ct_functions_<g> (ct_jit.ab,

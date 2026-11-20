@@ -1766,6 +1766,24 @@ fun bootstrapCtReachActs(reach: BootstrapCtReach): string {
     ""
 }
 
+// A compiler or parser API call the walk reaches (the environment, a file write, a process, the clock, a staged
+// action…), "" when none: a rerun of the site would make it again (bootstrapCtMarkRerun). Read-only reflection of the
+// program is one too, which costs a rerun at most.
+fun bootstrapCtReachCompilerActs(reach: BootstrapCtReach): string {
+    var item = 0
+    while (item < reach.visited.size) {
+        if (reach.visited[item] && reach.itemMethods[item] < 0) {
+            val declaration = reach.declarations[reach.itemDeclarations[item]]
+            if (declaration.kind == "extern" &&
+                (declaration.externalLibrary == "compiler" || declaration.externalLibrary == "parser")) {
+                return "it reaches the compiler API ${declaration.name}"
+            }
+        }
+        item = item + 1
+    }
+    ""
+}
+
 // ABLA_COMPILE_EVAL_TRIAL_STEPS: the interpreter steps a pass's trials may take together under auto (default
 // 1000000, about a tenth of a second; 0: no trials).
 var bootstrapCtTrialStepsValue: int = -1
@@ -1796,6 +1814,33 @@ fun bootstrapCtTrialSteps(): int {
 // that result for lowering and needs no generation; one it doesn't (out of steps, stopped before an effect, an
 // error) runs natively, as it would have. Returns how many sites finished. A pass whose ready sites all finish
 // builds no generation: the cost auto saves on a program whose compile-time work is small.
+// Which sites a native failure may be placed for by rerunning them in the evaluator (ct_eval.ab, bootstrapCtRerunPlace):
+// the ones a trial could run, by the same rule: not a top-level action, reaching no extern:"c" code, no compile-time
+// provider (the clock, the environment, files, output…), no compile global and no ordinary global compile-time code
+// writes. Running such a site again changes nothing anyone sees, and the evaluator stops it before anything that
+// would (ctNativeTrial).
+fun bootstrapCtMarkRerun(parsed: BootstrapParseResult, state: BootstrapCtStateResult): void {
+    var index = 0
+    while (index < bootstrapCtSites.size) {
+        val site = bootstrapCtSites[index]
+        // (A compiler API call the walk found, bootstrapCtReachCompilerActs, comes first.)
+        val compilerActs = if (site.rerun == "unasked") "" else site.rerun
+        var why = if (site.action) "a top-level action" else if (compilerActs != "") compilerActs else site.noTrial
+        if (why == "unasked") why = "the site wasn't walked"
+        if (why == "") {
+            for (global in state.reached[index]) {
+                if (why == "" && state.writers[global] != "") {
+                    why = "it reaches ${parsed.declarations[global].name}, which compile-time code writes"
+                }
+            }
+        }
+        if (state.edits && why == "") why = "the pass changes declarations"
+        site.rerun = why
+        index = index + 1
+    }
+    return
+}
+
 fun bootstrapCtTrials(parsed: BootstrapParseResult, state: BootstrapCtStateResult): int {
     var left = bootstrapCtTrialSteps()
     if (left <= 0 || state.edits) return 0
@@ -2088,9 +2133,11 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
                 site.long = bootstrapCtMayRunLong(reach, site.expression)
                 anyLong = site.long
             }
-            // Under auto, what decides a trial (bootstrapCtTrials), while the walk is the site's.
-            if (site.reason == "" && auto) {
+            // What decides a trial under auto (bootstrapCtTrials) and a rerun after a native failure in any tier
+            // (bootstrapCtMarkRerun), while the walk is the site's.
+            if (site.reason == "") {
                 site.noTrial = bootstrapCtReachActs(reach)
+                site.rerun = bootstrapCtReachCompilerActs(reach)
                 if (site.noTrial == "" && reached.size > 0) {
                     site.noTrial = "it reaches compile global ${parsed.declarations[reached[0]].name}"
                 }
@@ -2230,6 +2277,7 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
             ready = 0
         }
     }
+    bootstrapCtMarkRerun(parsed, state)
     if (auto && ready > 0) ready = ready - bootstrapCtTrials(parsed, state)
     // The owned globals go back to the interpreter's journal when it next needs them after a native call, as compile
     // globals do (bootstrapCtFetchPending): a later pass, or an interpreted evaluation of this one, reads the one value.

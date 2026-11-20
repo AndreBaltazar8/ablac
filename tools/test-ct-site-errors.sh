@@ -36,11 +36,14 @@ for case in bounds division panic exit deep late denied; do
     site=$(grep -o "^  = note: in \`#[^\`]*\` at $case.ab:[0-9]*:[0-9]*$" "$jit") ||
         fail "$case: no note naming the site" "$jit"
     site_place=${site##* at }
-    grep -q "^  --> $site_place (its \`#\` site: the native tier's code has no line table)$" "$jit" ||
-        fail "$case jit: the place isn't the site, said so" "$jit"
     # The interpreter's place is inside the code the site runs, not the site.
     place=$(grep -o '^  --> [^ ]*' "$interp" | head -1); place=${place#  --> }
     [[ $place == $case.ab:* && $place != "$site_place" ]] || fail "$case interp: the place is '$place'" "$interp"
+    # Native code's place is the site, said so; or, for a site that can run again unseen (tools/test-ct-rerun-place.sh),
+    # the interpreter's, found by rerunning it there.
+    grep -q "^  --> $site_place (its \`#\` site: the native tier's code has no line table)$" "$jit" ||
+        grep -q "^  --> $place (found by rerunning the site in the evaluator)$" "$jit" ||
+        fail "$case jit: the place is neither the site nor the evaluator's" "$jit"
     grep -q '^compile-time evaluation failed: 1 error(s)$' "$jit" || fail "$case: the last line" "$jit"
     # The functions it was in, innermost first, the same in both tiers (the common report above): a run of
     # recursive calls is named once, and the standard library's functions not at all.

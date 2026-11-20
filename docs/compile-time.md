@@ -1275,6 +1275,17 @@ Native code finds the functions from its frames, so it names the ones it didn't 
 `pick` and `table` are `@noinline`; a small function is often inlined, and then only its caller is named). Both tiers
 name a run of recursive calls once, at most eight functions, and none of the standard library's.
 
+A site that can run again without anyone seeing it, one that reaches no compile-time provider (files, the
+environment, the clock, output…), no compiler API, no `extern:"c"` code, no compile global and no global compile-time
+code writes, is run again in the evaluator when its native code fails (but not past the time limit). If it fails
+there the same way within a million steps, the report has the evaluator's place and path, inlined functions too:
+
+```text
+  --> bounds.ab:4:45 (found by rerunning the site in the evaluator)
+```
+
+`ABLA_COMPILE_EVAL_TRACE=1` says for each native failure whether its site was rerun, and if not, why.
+
 The `source[...]` lines are the same places for tools, in byte offsets.
 
 | Code | Meaning |
