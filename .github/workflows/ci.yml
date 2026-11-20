@@ -163,12 +163,7 @@ jobs:
             echo "ABLA_ANDROID_NDK=$RUNNER_TEMP/android/android-ndk-r27c"
             echo "ABLA_BIONIC_ROOT=$RUNNER_TEMP/bionic"
           } >> "$GITHUB_ENV"
-      # The suite builds the x86-64 half of the module programs; this is the AArch64 Linux half (the whole took 25 minutes here).
-      - name: Check the module programs build static for AArch64 Linux
-        if: ${{ !inputs.xtensa_compiler_memory_probe }}
-        run: |
-          ulimit -S -s 8192
-          nix-shell shell.nix --run 'LIBC_FREE_TARGETS=a64 tools/test-libc-free-programs.sh build/ablac' 2>&1 | tee build/ci-logs/linux-libc-free-programs.log
+      # (The suite builds the x86-64 half of the module programs; the AArch64 half is the libc-free-aarch64 job below.)
       - name: Run the Linux suite
         if: ${{ !inputs.xtensa_compiler_memory_probe }}
         run: |
@@ -462,6 +457,55 @@ jobs:
             !driver/build/macos-runtime/${{ matrix.architecture }}/results/cache/
           retention-days: 14
           if-no-files-found: error
+
+  # The AArch64 Linux half of the module-program check (#806): every tests/cases/modules program built for aarch64-linux links no C library.
+  # It was a step of the Linux job, where ABLA_TEST_JOBS=1 ran its 341 builds one at a time (18 minutes on top of the suite, which hit the
+  # job's limit). Its own job runs them at the runner's width, alongside the suite; the x86-64 half stays in the suite (make test).
+  libc-free-aarch64:
+    if: ${{ !inputs.xtensa_companion_routing_probe && !inputs.xtensa_companion_embedded_probe && !inputs.xtensa_companion_install_probe && !inputs.macos_published_rebuild && !inputs.macos_runtime_bench && !inputs.android_pointer_tags_control && !inputs.xtensa_compiler_memory_probe }}
+    name: Linux module programs link no libc (AArch64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      ABLA_TEST_JOBS: '4'
+      ABLA_NATIVE_JOBS: '1'
+      ABLA_CODEGEN_JOBS: '1'
+      ABLA_RELEASE_SELFHOST_BUILD_SECONDS: '1800'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        with:
+          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/6510408d147d8c5e6d76043e899e9251756f6a75.tar.gz
+      - name: Build the current compiler from the checksum-pinned bootstrap
+        env:
+          ABLA_NATIVE_JOBS: '4'
+          ABLA_CODEGEN_JOBS: '4'
+        run: |
+          mkdir -p build/ci-logs
+          nix-shell shell.nix --run 'make ablac' 2>&1 | tee build/ci-logs/libc-free-build.log
+      # What the check judges is the compiler's own code generation, as in the Linux job: the compiler built by itself.
+      - name: Rebuild the compiler with itself
+        env:
+          ABLA_NATIVE_JOBS: '4'
+          ABLA_CODEGEN_JOBS: '4'
+        run: |
+          nix-shell shell.nix --run 'tools/build-self-hosted-release.sh build/ablac.bin build/ci-ablac-stage2 src/orc_main.ab && mv -f build/ci-ablac-stage2 build/ablac.bin' 2>&1 | tee build/ci-logs/libc-free-stage2.log
+      - name: Check the module programs build static for AArch64 Linux
+        run: |
+          ulimit -S -s 8192
+          nix-shell shell.nix --run 'LIBC_FREE_TARGETS=a64 tools/test-libc-free-programs.sh build/ablac' 2>&1 | tee build/ci-logs/linux-libc-free-programs.log
+      - name: Keep failure logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: libc-free-aarch64-logs
+          path: |
+            build/ci-logs/
+            build/libc-free-programs/
+          retention-days: 3
+          if-no-files-found: ignore
 
   android-pointer-tags-control:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.android_pointer_tags_control }}
