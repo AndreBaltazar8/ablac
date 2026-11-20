@@ -1101,6 +1101,23 @@ second or more is noted without the trace too, because the evaluator is often
 note: the `#` site at slow.ab:16:14 ran in the compile-time evaluator for 3.6 s, not as native code: reaches extern:"compiler" fun compilerApplyTransform, which takes a function (not passed through the compiler bridge yet) (ABLA_COMPILE_EVAL_TRACE=1 says why for every site)
 ```
 
+Any site that takes five seconds or more is noted too, in any tier, with the tier it ran on (unless the note above
+already gave its time):
+
+```text
+note: the `#` site at slow.ab:12:14 took 5.2 s (native); ABLA_COMPILE_EVAL_TIMES=1 lists every site's time
+```
+
+`ABLA_COMPILE_EVAL_TIMES=1` lists, at the end of the build, every site's time with its tier, slowest first, then each
+native generation's costs:
+
+```text
+compile-time evaluation times:
+  5.2 s  native  slow.ab:12:14 `#nap()`
+  0.0 s  native  slow.ab:13:13 `#(1 + 1)`
+  generation 1: 845 declarations, 327 functions; preparation 34 ms (with the write analysis), analysis 49 ms, lowering 59 ms, emission 57 ms, code 345 ms
+```
+
 The action journal (`ABLA_ACTION_JOURNAL`) records evaluated actions only:
 when it is on and `ABLA_COMPILE_EVAL` names no tier, the tier is `interp`.
 

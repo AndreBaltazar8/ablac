@@ -1,5 +1,6 @@
 import "ct_global_graph.ab"
 import "diagnostic_positions.ab"
+import "ct_reproducible.ab"
 // Compile-time evaluation as native code: the calls (ABLA_COMPILE_EVAL=jit|auto).
 //
 // ct_jit.ab prepares, per compile pass, one generation of native code with an entry
@@ -432,6 +433,7 @@ trusted fun bootstrapCtTryEvaluate(
     if (tried != null) {
         site.tried = null
         bootstrapCtNote("interpreted at ${expression.begin}: ${site.reason}")
+        bootstrapCtSiteTier = "evaluator, a trial"
         return BootstrapCtOutcome(true, "", tried)
     }
     if (site.reason != "") return bootstrapCtNotTaken(site.reason)
@@ -467,6 +469,7 @@ trusted fun bootstrapCtTryEvaluate(
     bootstrapCtCurrentLive = true
     // Compiler API calls the entry makes (bridge shims) run on this evaluator.
     val bridge = ctBridgeEnter(evaluator, site.expression.begin, site.expression.end)
+    bootstrapCtSiteTier = "native"
     val called = bootstrapCtCall(site.entry, bootstrapCtSitePlace(site))
     evaluator = ctBridgeFrames[ctBridgeTopIndex()].evaluator
     ctBridgeLeave(bridge)
@@ -786,6 +789,7 @@ fun bootstrapCtNoteFallback(expression: BootstrapExpression, reason: string, sta
             if (sources.readable[file] && expression.begin <= sources.contents[file].size)
                 place = bootstrapDiagnosticLineColumn(source, sources.contents[file], expression.begin)
         }
+        bootstrapCtSiteSlowNoted = true
         val tenths = spent / 100
         linuxWriteStandardError(
             "note: the `#` site at $place ran in the compile-time evaluator for ${tenths / 10}.${tenths - tenths / 10 * 10} s, " +
@@ -796,6 +800,49 @@ fun bootstrapCtNoteFallback(expression: BootstrapExpression, reason: string, sta
 }
 
 val BOOTSTRAP_CT_SLOW_FALLBACK_MILLISECONDS = 1000
+
+// Where a build spends its compile-time evaluation (ir.ab times each site): the tier the last site ran on, set where
+// it runs ("evaluator" unless a native call or a trial's result took it), and whether its evaluator time was noted.
+var bootstrapCtSiteTier: string = "evaluator"
+var bootstrapCtSiteSlowNoted: bool = false
+// A site that takes this long is noted under any tier, unless its evaluator time was (above).
+val BOOTSTRAP_CT_SLOW_SITE_MILLISECONDS = 5000
+
+fun bootstrapCtSiteBegin(): void {
+    bootstrapCtSiteTier = "evaluator"
+    bootstrapCtSiteSlowNoted = false
+    return
+}
+
+// The site at `begin`..`end` of `source` took `milliseconds`: noted when slow, kept for the listing when asked.
+fun bootstrapCtSiteEnd(source: string, begin: int, end: int, milliseconds: int): void {
+    val slow = milliseconds >= BOOTSTRAP_CT_SLOW_SITE_MILLISECONDS && !bootstrapCtSiteSlowNoted
+    if (!slow && !bootstrapCtTimes()) return
+    var place = "$source:$begin"
+    var text = ""
+    if (source != "") {
+        var sources = BootstrapDiagnosticSources([], [], [])
+        val file = bootstrapDiagnosticSource(sources, source)
+        if (sources.readable[file] && begin <= sources.contents[file].size) {
+            place = bootstrapDiagnosticLineColumn(source, sources.contents[file], begin)
+            text = bootstrapDiagnosticSiteText(sources.contents[file], begin, end)
+        }
+    }
+    if (slow) {
+        linuxWriteStandardError(
+            "note: the `#` site at $place took ${bootstrapCtSeconds(milliseconds)} ($bootstrapCtSiteTier)" +
+            (if (bootstrapCtTimes()) "\n" else "; ABLA_COMPILE_EVAL_TIMES=1 lists every site's time\n")
+        )
+    }
+    if (bootstrapCtTimes()) {
+        bootstrapCtTimedPlaces.append(place)
+        bootstrapCtTimedTexts.append(text)
+        bootstrapCtTimedTiers.append(bootstrapCtSiteTier)
+        bootstrapCtTimedMilliseconds.append(milliseconds)
+    }
+    return
+}
+
 
 // `source`: the file being lowered, which an interpreted evaluation's failures name.
 // bootstrapCtEvaluate under the program's own compile-effect grants
