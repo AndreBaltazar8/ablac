@@ -141,6 +141,21 @@ for profile in o1 fast; do
         exit 1
     fi
 done
+# The dispatcher's forward to the generation that has a new lambda passes the output as sret, as every
+# dispatcher takes it: AArch64 passes sret in x8, so without it the other dispatcher read the output where its
+# closure belongs and trapped (arm64 Macs, runs 44586994389 to 44654107874). x86-64 passes sret as the first
+# argument, so this reads the IR, which shows it on any host.
+cp tests/cases/live-jit/reload.ab "$reload"
+status=0
+ABLA_LIVE_DUMP_DISPATCHER=1 limited "$compiler" run --o1 --live "$reload" -- "$reload" \
+    > "$out/forward.out" 2> "$out/forward.err" || status=$?
+forward=$(awk '/IR of abla_llvm_call_indirect_live/ { inside = 1 } inside && /^live\.forward:/ { getline; print; exit }' \
+    "$out/forward.err")
+if [[ $status -ne 42 || $forward != *'(ptr sret(%AblaValue) '* ]]; then
+    printf 'live jit (forward): exit status %s; the forward to a new lambda'"'"'s dispatcher is not sret: %s\n' \
+        "$status" "${forward:-(no dispatcher printed)}" >&2
+    exit 1
+fi
 # ABLA_LIVE_JIT_REPEAT=n: the --o1 reload n times more, for a failure that comes now and then (a Mac run trapped
 # in the new lambda's call, run 44586994389); each failure says where, and on macOS a run under lldb follows it
 # (the backtrace, registers and code at the stop).
