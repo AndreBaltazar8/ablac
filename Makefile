@@ -593,6 +593,8 @@ test-serial: ablac
 	tools/test-ownership-precision.sh $(COMPILER)
 	tools/test-ownership-index-assign.sh $(COMPILER)
 	tools/test-ownership-audit.sh $(COMPILER)
+	tools/test-wasm-alloc-limit.sh $(COMPILER)
+	tools/test-hosted-bio-limit.sh $(COMPILER)
 	tools/test-when-subject-owner.sh $(COMPILER)
 	tools/test-elvis-container-loop.sh $(COMPILER)
 	tools/test-elvis-field-owner.sh $(COMPILER)
