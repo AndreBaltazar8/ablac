@@ -175,11 +175,46 @@ trusted fun bootstrapLiveReload(buffer: int, capacity: int): int {
         if (bootstrapLiveTracing()) linuxPrintStandardError("live: generation $generation $body at ${bootstrapLiveHex(found.address)}\n")
     }
     bootstrapLiveNoteGrowth()
-    // The new variables' initializers (live_globals.ab), once: before the table is published, so code that reads
-    // one finds it initialized.
+    val table = bootstrapLiveSession.lookup("abla_live_table")
+    if (table.status != 0 || table.address == 0) {
+        bootstrapLiveReply(buffer, capacity, "E_LIVE_LINK: abla_live_table was not found")
+        return 2
+    }
+    val old = ablaUnsafeLoadI64(nativePointerFromAddress(table.address))
+    var size = bootstrapLiveTableSize
+    for (slot in bootstrapLlvmLiveChangedIndices) if (slot + 1 > size) size = slot + 1
+    val entries = nativePointerAddress(ablaUnsafeAllocate(size * 8))
+    var slot = 0
+    while (slot < size) {
+        ablaUnsafeStoreI64(nativePointerFromAddress(entries + slot * 8),
+            if (slot < bootstrapLiveTableSize) ablaUnsafeLoadI64(nativePointerFromAddress(old +
+                slot * 8)) else 0)
+        slot = slot + 1
+    }
+    var change = 0
+    while (change < addresses.size) {
+        ablaUnsafeStoreI64(nativePointerFromAddress(entries +
+            bootstrapLlvmLiveChangedIndices[change] * 8),
+            addresses[change])
+        change = change + 1
+    }
+    // The new variables' initializers (live_globals.ab), once, before the table is published (so code that reads
+    // one finds it initialized), with the functions this reload adds published first: an initializer may call one
+    // (their slots are past the running table's end, so no running code reaches them), while a redefined function
+    // keeps its running body until the table below.
     if (bootstrapLlvmLiveNewGlobalNames.size > 0) {
+        val provisional = nativePointerAddress(ablaUnsafeAllocate(size * 8))
+        var at = 0
+        while (at < size) {
+            ablaUnsafeStoreI64(nativePointerFromAddress(provisional + at * 8),
+                ablaUnsafeLoadI64(nativePointerFromAddress((if (at < bootstrapLiveTableSize) old else entries) + at * 8)))
+            at = at + 1
+        }
+        ablaUnsafeAtomicFence()
+        ablaUnsafeStoreI64(nativePointerFromAddress(table.address), provisional)
         val initializing = bootstrapLiveSession.lookup(bootstrapLlvmLiveGlobalsEntryName(generation))
         if (initializing.status != 0 || initializing.address == 0) {
+            ablaUnsafeStoreI64(nativePointerFromAddress(table.address), old)
             bootstrapLiveReply(buffer, capacity,
                 "E_LIVE_LINK: the new variables' initializer was not found (status ${initializing.status})")
             return 2
@@ -203,6 +238,7 @@ trusted fun bootstrapLiveReload(buffer: int, capacity: int): int {
                 text = adoptNativeString(address, length)
             }
             panicBuffer.close()
+            ablaUnsafeStoreI64(nativePointerFromAddress(table.address), old)
             added.remove()
             bootstrapLlvmLiveGeneration = generation - 1
             bootstrapLiveReply(buffer, capacity,
@@ -210,29 +246,6 @@ trusted fun bootstrapLiveReload(buffer: int, capacity: int): int {
             return 2
         }
         panicBuffer.close()
-    }
-    val table = bootstrapLiveSession.lookup("abla_live_table")
-    if (table.status != 0 || table.address == 0) {
-        bootstrapLiveReply(buffer, capacity, "E_LIVE_LINK: abla_live_table was not found")
-        return 2
-    }
-    val old = ablaUnsafeLoadI64(nativePointerFromAddress(table.address))
-    var size = bootstrapLiveTableSize
-    for (slot in bootstrapLlvmLiveChangedIndices) if (slot + 1 > size) size = slot + 1
-    val entries = nativePointerAddress(ablaUnsafeAllocate(size * 8))
-    var slot = 0
-    while (slot < size) {
-        ablaUnsafeStoreI64(nativePointerFromAddress(entries + slot * 8),
-            if (slot < bootstrapLiveTableSize) ablaUnsafeLoadI64(nativePointerFromAddress(old +
-                slot * 8)) else 0)
-        slot = slot + 1
-    }
-    var change = 0
-    while (change < addresses.size) {
-        ablaUnsafeStoreI64(nativePointerFromAddress(entries +
-            bootstrapLlvmLiveChangedIndices[change] * 8),
-            addresses[change])
-        change = change + 1
     }
     // Release: the entries are written before the array is published.
     ablaUnsafeAtomicFence()
