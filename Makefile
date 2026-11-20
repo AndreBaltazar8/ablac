@@ -130,6 +130,7 @@ test-serial: ablac
 	tools/test-ct-site-errors.sh $(COMPILER)
 	tools/test-ct-rerun-place.sh $(COMPILER)
 	tools/test-ct-site-times.sh $(COMPILER)
+	tools/test-ct-trial-rule.sh $(COMPILER)
 	tools/test-ct-fallback.sh $(COMPILER)
 	tools/test-ct-nonreproducible.sh $(COMPILER)
 	tools/test-libc-jump-routines.sh $(COMPILER)

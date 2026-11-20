@@ -1079,7 +1079,8 @@ where it can't. `ABLA_COMPILE_EVAL` chooses the tier:
   not a top-level action, reaches no compile global and no ordinary global
   compile-time code writes, and its code calls no `extern:"c"` function and
   no compile-time provider (files, output, the environment, the clock,
-  random numbers). The pass must also change no declaration. Running such a
+  random numbers) and no compiler API (`compilerEnvironment`, `compilerWriteFile`,
+  `compilerFunctions`…). The pass must also change no declaration. Running such a
   site twice is harmless, and the evaluator stops a trial before anything
   that would not be (a provider or C call, a system call, static storage).
   A site whose trial finishes keeps the evaluator's result. One whose trial
