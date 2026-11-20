@@ -1,22 +1,22 @@
 # `ablac run` as a live JIT: redefining functions while the program runs
 
-Status: stages 0 to 2c are built and on master (opt-in, `ablac run --live`); stage 3 and the rest of the
-design are not. The text below the status table is the original design; where it differs from the table,
-the table is what exists. For using it, see "Live run" in [the toolchain interface](../toolchain.md).
+Status: stages 0 to 3 are built and on master, and `ablac run` is live by default on x86-64 Linux and macOS
+(decision #65, `--no-live` opts out); the rest of the design is not built. The text below the status table is the
+original design; where it differs from the table, the table is what exists. For using it, see "Live run" in [the toolchain interface](../toolchain.md).
 
 | Stage | What | State |
 |---|---|---|
 | 0 | Audit of the interprocedural facts a compiled function depends on (section at the end) | done (698cfd8d) |
-| 1 | The program's own functions called through one table of code pointers (`abla_live_table`) | built (6e8300fc), `--live` only |
+| 1 | The program's own functions called through one table of code pointers (`abla_live_table`) | built (6e8300fc); live by default since f3b13016 (x86-64 Linux) and 5cd21cd2 (macOS) |
 | 2a | `liveReload()`: recompile, keep the functions whose IR hash changed, publish a new table | built (6f6d36f0) |
-| 2b | A reload is refused when unchanged code would compile differently, or a signature or class layout changed | built (f9f311f4): `E_LIVE_SIGNATURE`, `E_LIVE_LAYOUT`, `E_LIVE_CALLER`, `E_LIVE_GLOBAL` |
+| 2b | A reload is refused when unchanged code would compile differently, or a signature or class layout changed | built (f9f311f4): `E_LIVE_SIGNATURE`, `E_LIVE_LAYOUT`, `E_LIVE_CALLER`, `E_LIVE_GLOBAL`; a changed signature of a function nothing takes as a value (and not a method) moves to a new entry instead of being refused (see "Changed signatures") |
 | 2c | Only data and the table's functions are shared between generations; a live run is object-cached with the compiler's record beside the object (`<object>.live`) | built (f89ff893) |
-| 3 | Lambdas: a changed or added lambda is refused today (`E_LIVE_LAMBDA`) | not built |
+| 3 | Lambdas: an edited lambda is matched to the running one, so closures made before take its new body; new lambdas reach code that was not redefined through a registry; a change to captures, parameters or result is refused (`E_LIVE_LAMBDA`) | built (8b7e1ee0) |
 | - | `--watch`: a reload when one of the program's own source files changes (inotify, kqueue), printed on stderr; a save the running code cannot take restarts the run | built (`src/live_watch.ab`, `tools/test-live-watch.sh`) |
 | - | `liveDefine(path)`, `E_LIVE_REMOVED`, `E_LIVE_SUMMARY` | not built; what a removed function does has not been defined |
 | - | Platforms | live by default and tested on x86-64 Linux and macOS (arm64, Intel); no ablac is built for AArch64 Linux |
 
-Decision taken for question 1 below: live mode is **opt-in** (`--live`); without it nothing changes and no table is built.
+Decision taken for question 1 below: live mode was first **opt-in** (`--live`); decision #65 made it the default where it is tested, and `--no-live` turns it off (no table is built).
 
 ## What exists today
 
@@ -265,6 +265,28 @@ Mutation-checked, each turned off failing the test on its own check:
 - the drop registry lookup (the Token is not dropped).
 - the id pinning (before it, the collision reload is refused: E_LIVE_CALLER on main);
 - the registry's named functions (only lambdas registered: invalid function reference).
+
+## Changed signatures (built, 2026-11-20)
+
+A function whose parameters or result change compiles under another symbol, which gets a new table entry. The
+running code calls the old entry and keeps calling it: the old body stays, so an old caller (or a thread inside the
+old body) goes on the old way, consistently. New code, the edited callers, calls the new entry. What is not
+consistent is something the running code made that new code reaches with the new types: a function value or a
+closure of the old function, or a call through a class. So `E_LIVE_SIGNATURE` stays for:
+
+- a function the running program takes as a value anywhere (`function.ref` or `closure.create` in any function of
+  any module, a lambda's body included): the compiler records these symbols when the program is loaded and adds a
+  reload's once it applies (`bootstrapLlvmLiveTaken`, kept in the object cache's record, version 3);
+- a method or an extension (a label `Owner.name`): calls through its class.
+
+Any other changed signature applies. A caller whose source did not change but that compiles differently only
+because a callee moved (a renamed parameter: the call names the new symbol) is redefined, not refused as
+`E_LIVE_CALLER`: the old caller still calls the old entry, so nothing it relies on changed. A caller that also
+calls a callee changed in place is still refused. The new signature reaches the program through the callers a reload redefines, so it shows
+once one of them is entered again: a caller that never returns (a `main` loop) keeps running its old body and the
+old entry until the program restarts. Tested by `tests/cases/live-jit/reload.ab` (a parameter added
+while a thread is inside the old body) and `refuse.ab` (a function taken as a value, and one taken only inside a
+lambda of another module).
 
 ## Freeing old generations (design, 2026-11-16; measured, not built, not worth it yet)
 

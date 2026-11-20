@@ -4,7 +4,8 @@
 // - E_LIVE_CALLER: apply() starts keeping its argument, so user()'s closure, which stayed in user()'s
 //   frame because apply()'s parameter did not escape, must now be on the heap: user() did not change
 //   but would compile differently, and is named with apply();
-// - E_LIVE_SIGNATURE: scaled()'s parameter is renamed, which is another signature;
+// - E_LIVE_SIGNATURE: scaled()'s parameter is renamed, which is another signature, and the running code takes
+//   scaled as a value (scaler()); halved() (refuse_other.ab) the same, taken as a value only inside a lambda here;
 // - E_LIVE_LAYOUT: class Box gains a field.
 // After them an ordinary edit still applies. Exits 42 when every "name: ok" line is ok. Every string
 // an edit looks for is spelled in pieces here, so an edit changes only the marked line.
@@ -13,6 +14,7 @@ import "abla/live"
 import "abla/text"
 import "abla/sys/linux/fs"
 import "abla/sys/linux/process"
+import "refuse_other.ab"
 
 var keeper: array<() -> int> = []
 
@@ -28,6 +30,17 @@ fun user(): int {
 fun scaled(x: int): int = x * 2 // scaled-marker
 
 fun useScaled(): int = scaled(3)
+
+// Takes scaled as a value: its signature cannot change while the program runs.
+fun scaler(): (int) -> int = scaled
+
+fun applyTo(f: (int) -> int, x: int): int = f(x)
+
+// Takes halved (the other module's) as a value inside a lambda, the only place anything does.
+fun viaLambda(): int {
+    val run = { applyTo(halved, 8) }
+    run()
+}
 
 class Box(val a: int) // box-marker
 
@@ -55,7 +68,8 @@ fun attempt(path: string, from: string, to: string): LiveResult {
 
 fun main: int {
     val path = linuxArgument(linuxArgumentCount() - 1)
-    check("before", user() == 7 && useScaled() == 6 && boxed() == 4 && plain() == 1, "")
+    check("before", user() == 7 && useScaled() == 6 && scaler()(5) == 10 && viaLambda() == 4 && boxed() == 4 &&
+        plain() == 1, "")
     val caller = attempt(path, "= f() // apply-" + "marker", "{ keeper.append(f); return f() } // apply-" + "marker")
     check("caller refused", caller.refused() && caller.message.contains("E_LIVE_CALLER") &&
         caller.message.contains("user") && caller.message.contains("apply"), caller.message)
@@ -63,8 +77,14 @@ fun main: int {
     val signature = attempt(path, "scaled(x: int): int = x * 2 // scaled-" + "marker",
         "scaled(y: int): int = y * 2 // scaled-" + "marker")
     check("signature refused", signature.refused() && signature.message.contains("E_LIVE_SIGNATURE") &&
-        signature.message.contains("scaled"), signature.message)
+        signature.message.contains("scaled") && signature.message.contains("takes it as a value"), signature.message)
     check("signature kept", useScaled() == 6, "${useScaled()}")
+    val other = Path(path).parent().child("refuse_other.ab").text
+    val lambda = attempt(other, "halved(x: int): int = x / 2 // halved-" + "marker",
+        "halved(y: int): int = y / 2 // halved-" + "marker")
+    check("signature taken in a lambda refused", lambda.refused() && lambda.message.contains("E_LIVE_SIGNATURE") &&
+        lambda.message.contains("halved"), lambda.message)
+    check("signature taken in a lambda kept", viaLambda() == 4, "${viaLambda()}")
     val layout = attempt(path, "class Box(val a: int) // box-" + "marker",
         "class Box(val a: int, val b: int = 0) // box-" + "marker")
     check("layout refused", layout.refused() && layout.message.contains("E_LIVE_LAYOUT") &&

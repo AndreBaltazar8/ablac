@@ -66,6 +66,15 @@ var bootstrapLlvmLiveKept: array<string> = []
 // Every entry's slot and source hash in a reload, recorded as the program's once it is applied.
 var bootstrapLlvmLivePendingSlots: array<int> = []
 var bootstrapLlvmLivePendingSources: array<int> = []
+// The functions the running program takes as values (function.ref, closure.create: any function of any module,
+// a lambda's body among them), by direct symbol: a changed signature applies only to one it never took
+// (bootstrapLlvmLiveSignatureRefusal). A reload's are added once it is applied, with the labels whose
+// function moved to a new symbol.
+var bootstrapLlvmLiveTaken: Map<string, int> = Map()
+var bootstrapLlvmLivePendingTaken: array<string> = []
+var bootstrapLlvmLivePendingMovedLabels: array<string> = []
+var bootstrapLlvmLivePendingMovedSymbols: array<string> = []
+
 
 // A function of the program's own source files: not the standard library's, the runtime's or a
 // naked or sectioned one (those keep their exact code).
@@ -136,6 +145,7 @@ fun bootstrapLlvmLiveReset(): void {
     bootstrapLlvmLiveDefined = Map()
     bootstrapLlvmLiveRuntimeIds = Map()
     bootstrapLlvmLiveRuntimeIdsTaken = Map()
+    bootstrapLlvmLiveTaken = Map()
     return
 }
 
@@ -232,6 +242,24 @@ trusted fun bootstrapLlvmLiveIndirect(
     bootstrapLlvmLiveChangedSymbols = []
     bootstrapLlvmLiveRefusals = []
     bootstrapLlvmLiveKept = []
+    bootstrapLlvmLivePendingTaken = []
+    bootstrapLlvmLivePendingMovedLabels = []
+    bootstrapLlvmLivePendingMovedSymbols = []
+    // What this compile takes as a value: the program's own once loaded, a reload's once applied.
+    val takenNames: array<string> = []
+    for (function in program.functions) takenNames.append(function.name)
+    val taken = bootstrapLlvmAddressTaken(program, bootstrapLlvmNameIndex(takenNames))
+    var takenIndex = 0
+    while (takenIndex < taken.size && takenIndex < identities.symbols.size) {
+        if (taken[takenIndex]) {
+            val takenSymbol = bootstrapLlvmDirectFunctionSymbol(identities.symbols[takenIndex])
+            bootstrapLlvmLivePendingTaken.append(takenSymbol)
+        }
+        takenIndex = takenIndex + 1
+    }
+    // The functions of this reload that moved to a new symbol (a changed signature that applies): callers
+    // that compile differently only for them are not refused (they call the new entry; old code keeps the old).
+    val moved: Map<string, int> = Map()
     // The lambdas' refusals (live_lambdas.ab, before the backend).
     for (refusal in bootstrapLlvmLiveLambdaRefusals) bootstrapLlvmLiveRefusals.append(refusal)
     // The registry of lambdas reloads add (dispatch.ab): the program as loaded always defines it, so a reload
@@ -243,7 +271,11 @@ trusted fun bootstrapLlvmLiveIndirect(
     }
     bootstrapLlvmLivePendingSlots = []
     bootstrapLlvmLivePendingSources = []
-    if (generation == 0) bootstrapLlvmLiveReset()
+    if (generation == 0) {
+        bootstrapLlvmLiveReset()
+        // The program as loaded: what it takes is the running code's from the start.
+        for (symbol in bootstrapLlvmLivePendingTaken) bootstrapLlvmLiveTaken.set(symbol, 1)
+    }
     val root = bootstrapNormalizeModulePath(bootstrapStandardLibraryRoot())
     val stdlibRoot = if (root.endsWith("/")) root else root + "/"
     val originals: array<i64*> = []
@@ -376,12 +408,21 @@ trusted fun bootstrapLlvmLiveIndirect(
             if (!known || bootstrapLlvmLiveSources[slot] !=
                 sources[entry]) edited.set(function.name, 1)
             if (!known) {
-                // A function the program has under another symbol: its parameters or result changed.
+                // A function the program has under another symbol: its parameters or result changed. It
+                // moves to a new entry, and the running code keeps calling the old one, which is consistent
+                // unless something made by the running code reaches the old one from new code.
                 val before = bootstrapLlvmLiveLabels.get(shown)
                 if (before != null && before != symbol && !bootstrapLlvmLiveLambda(function.name)) {
-                    bootstrapLlvmLiveRefusals.append(
-                        "E_LIVE_SIGNATURE: $shown: its parameters or result changed; function values, closures and threads made by the running code still call it the old way"
-                    )
+                    val why = bootstrapLlvmLiveSignatureRefusal(shown, before)
+                    if (why != "") {
+                        bootstrapLlvmLiveRefusals.append(
+                            "E_LIVE_SIGNATURE: $shown: its parameters or result changed; $why"
+                        )
+                    } else {
+                        moved.set(function.name, 1)
+                        bootstrapLlvmLivePendingMovedLabels.append(shown)
+                        bootstrapLlvmLivePendingMovedSymbols.append(symbol)
+                    }
                 }
             }
         }
@@ -415,14 +456,19 @@ trusted fun bootstrapLlvmLiveIndirect(
         val function = program.functions[functions[caller]]
         val shown = if (function.label != "") function.label else function.name
         val names: array<string> = []
+        var inPlace = false
         for (instruction in function.instructions) {
             if (instruction.opcode == "call" && edited.get(instruction.text) != null) {
+                if (moved.get(instruction.text) == null) inPlace = true
                 val callee = bootstrapLlvmLiveLabelOf(program, instruction.text)
                 var listed = false
                 for (name in names) if (name == callee) listed = true
                 if (!listed) names.append(callee)
             }
         }
+        // It calls only callees that moved to new entries: the running code keeps their old ones, so the old
+        // caller relies on nothing that changed, and this one is redefined to call the new entries.
+        if (names.size > 0 && !inPlace) continue
         val because = if (names.size == 0) "after this edit"
             else if (names.size == 1) "it calls ${names[0]}, whose change it depends on"
             else "it calls ${names.join(", ")}, whose changes it depends on"
@@ -621,6 +667,14 @@ trusted fun bootstrapLlvmLiveCut(module: i64*): void {
 // entries' hashes are its.
 fun bootstrapLlvmLiveApplied(): void {
     bootstrapLlvmLiveLambdaApplied()
+    for (symbol in bootstrapLlvmLivePendingTaken) bootstrapLlvmLiveTaken.set(symbol, 1)
+    // A function that moved is known by its new symbol from now on: a later change compares with it.
+    var moving = 0
+    while (moving < bootstrapLlvmLivePendingMovedLabels.size) {
+        bootstrapLlvmLiveLabels.set(bootstrapLlvmLivePendingMovedLabels[moving],
+            bootstrapLlvmLivePendingMovedSymbols[moving])
+        moving = moving + 1
+    }
     var added = 0
     while (added < bootstrapLlvmLiveNewSymbols.size) {
         bootstrapLlvmLiveRuntimeId(bootstrapLlvmLiveNewSymbols[added],
@@ -658,7 +712,7 @@ fun bootstrapLlvmLiveApplied(): void {
 // live run that starts from the object cache can still reload: one line per table entry, named function,
 // definition and class, and the table's size.
 fun bootstrapLlvmLiveRecordText(): string {
-    var text = "abla-live 2\nsize\t$bootstrapLlvmLiveTableSize\n"
+    var text = "abla-live 3\nsize\t$bootstrapLlvmLiveTableSize\n"
     var slot = 0
     while (slot < bootstrapLlvmLiveHashes.size) {
         text = text +
@@ -672,6 +726,7 @@ fun bootstrapLlvmLiveRecordText(): string {
         text = text + "label\t$label\t${bootstrapLlvmLiveLabels.get(label) ?? ""}\n"
     }
     for (name in bootstrapLlvmLiveDefined.keys()) text = text + "defined\t$name\n"
+    for (symbol in bootstrapLlvmLiveTaken.keys()) text = text + "taken\t$symbol\n"
     for (line in bootstrapLlvmLiveClasses.split("\n")) if (line != "") text = text +
         "class\t$line\n"
     for (symbol in bootstrapLlvmLiveRuntimeIds.keys()) {
@@ -683,7 +738,7 @@ fun bootstrapLlvmLiveRecordText(): string {
 // Restores the record from its text; false (and nothing restored) when it is not one.
 fun bootstrapLlvmLiveRecordLoad(text: string): bool {
     val lines = text.split("\n")
-    if (lines.size == 0 || lines[0] != "abla-live 2") return false
+    if (lines.size == 0 || lines[0] != "abla-live 3") return false
     bootstrapLlvmLiveReset()
     bootstrapLlvmLiveLambdaReset()
     var size = -1
@@ -698,6 +753,8 @@ fun bootstrapLlvmLiveRecordLoad(text: string): bool {
             bootstrapLlvmLiveIndices.set(fields[1], fields[2].parseInt() ?? -1)
         } else if (fields.size == 3 && fields[0] == "label") {
             bootstrapLlvmLiveLabels.set(fields[1], fields[2])
+        } else if (fields.size == 2 && fields[0] == "taken") {
+            bootstrapLlvmLiveTaken.set(fields[1], 1)
         } else if (fields.size == 2 && fields[0] == "defined") {
             bootstrapLlvmLiveDefined.set(fields[1], 1)
         } else if (fields.size == 2 && fields[0] == "class") {
@@ -723,3 +780,13 @@ fun bootstrapLlvmLiveRuntimeId(symbol: string, id: int): void {
     bootstrapLlvmLiveRuntimeIdsTaken.set(id, 1)
     return
 }
+
+// Why a function whose parameters or result changed (now under a new symbol) cannot move to a new entry, or "" when
+// it can. The running code keeps calling the old entry, which is consistent; only something the running code made
+// that reaches the old function from new code is not: a function value or closure of it, or a call through a
+// class (a method or an extension, `Owner.name`, whose dispatch the running classes keep).
+fun bootstrapLlvmLiveSignatureRefusal(shown: string, before: string): string =
+    if (shown.contains(".")) "callers through its class still reach it the old way"
+    else if (bootstrapLlvmLiveTaken.get(before) != null)
+        "the running code takes it as a value, and function values, closures and threads it made still call it the old way"
+    else ""

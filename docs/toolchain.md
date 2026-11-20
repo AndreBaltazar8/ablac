@@ -460,9 +460,9 @@ running; the message names the reason:
 
 | Code | Reason |
 |---|---|
-| `E_LIVE_LAMBDA` | a lambda changed or was added |
+| `E_LIVE_LAMBDA` | a lambda's captures, parameters or result changed (an edited or added lambda applies) |
 | `E_LIVE_GLOBAL` | a variable the running program does not have |
-| `E_LIVE_SIGNATURE` | a changed parameter list or result |
+| `E_LIVE_SIGNATURE` | a changed parameter list or result of a function the running code takes as a value (anywhere, a lambda in another module too) or of a method; any other such function moves to a new entry: the running code keeps the old one, new code calls the new one |
 | `E_LIVE_LAYOUT` | a class's name, fields or size changed |
 | `E_LIVE_CALLER` | an unchanged function would compile differently (for example through an escape fact); the message names it and the edited callees |
 | `E_LIVE_BUSY` | another reload is running |

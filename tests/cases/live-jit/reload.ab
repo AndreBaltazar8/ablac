@@ -13,6 +13,8 @@
 //   (the registry of new lambdas), and one whose closure owns a Token is dropped through its drop dispatcher.
 // - a function a reload adds whose runtime id collides with the running program's livetrqwlyjuls: a function value
 //   of livetrqwlyjuls made before the reload still calls it, from new code too.
+// - a function whose parameters change, never taken as a value, moves to a new entry: a thread inside its old body
+//   finishes it the old way, and the edited caller calls the new one.
 // Exits 42 when every check passed. Markers are spelled in two pieces in main, so an edit changes only the
 // marked line.
 import "abla/io"
@@ -52,6 +54,18 @@ fun applyIt(f: () -> int): int = f()
 fun fresh(): int = "${value()}".size - 1 // fresh-marker
 
 var dropped: int by TVar(0)
+
+var gaugeEntered: int by TVar(0)
+var gaugeReleased: int by TVar(0)
+
+// Its signature changes in a reload while a thread is inside it (nothing takes it as a value).
+fun gauge(x: int): int { // gauge-marker
+    atomic { gaugeEntered = 1 }
+    while (atomic { gaugeReleased } == 0) {}
+    x * 2 // gauge-body-marker
+}
+
+fun gauged(): int = gauge(5) // gauged-marker
 
 resource class Token(val id: int) {
     fun drop(): void {
@@ -197,5 +211,20 @@ fun main: int {
     val through = viaNew(collided)
     check("a value made before keeps its body", through == 12 && collided() == 2,
         "$through, ${collided()}")
+    // A changed signature of a function the program never takes as a value applies: gauge() gains a parameter
+    // while a thread is inside its old body, and gauged(), its caller, is edited to pass it.
+    val gauging = thread { gauged() }
+    while (atomic { gaugeEntered } == 0) {}
+    check("edit a signature",
+        edit(path, "fun gauge(x: int): int { // gauge-" + "marker",
+            "fun gauge(x: int, y: int): int { // gauge-" + "marker") &&
+        edit(path, "    x * 2 // gauge-body-" + "marker", "    x * y // gauge-body-" + "marker") &&
+        edit(path, "= gauge(5) // gauged-" + "marker", "= gauge(5, 3) // gauged-" + "marker"), path)
+    val signed = liveReload()
+    check("signature applied", signed.applied() && signed.message.contains("gauge"), signed.message)
+    atomic { gaugeReleased = 1 }
+    val old = await gauging
+    check("a thread in the old body finishes it the old way", old == 10, "$old")
+    check("the new signature from then on", gauged() == 15, "${gauged()}")
     if (failures == 0) 42 else 1
 }

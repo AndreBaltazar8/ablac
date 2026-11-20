@@ -204,6 +204,7 @@ fi
 # The refusals (stage 2b): tests/cases/live-jit/refuse.ab, see its header.
 refuse=$PWD/$out/reload/refuse.ab
 cp tests/cases/live-jit/refuse.ab "$refuse"
+cp tests/cases/live-jit/refuse_other.ab "$(dirname "$refuse")/refuse_other.ab"
 status=0
 limited "$compiler" run --live "$refuse" -- "$refuse" > "$out/refuse.out" 2> "$out/refuse.err" || status=$?
 if [[ $status -ne 42 ]] || grep -q ": FAIL" "$out/refuse.out"; then
