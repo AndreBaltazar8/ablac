@@ -21,6 +21,10 @@ out=$root/build/live-watch
 rm -rf "$out"
 mkdir -p "$out"
 export ABLA_CACHE_DIR=$out/cache
+# The program's main runs on a thread of the compiler's, which the compiler counts as in native code while the
+# program runs: a collection of the compiler's (during a reload's compile) never waits for it in vain. Under
+# ABLA_GC_TRACE=1 a stop that gives up says "stop abandoned"; none may (checked at the end).
+export ABLA_GC_TRACE=1
 
 pid=
 trap '[[ -n $pid ]] && kill "$pid" 2> /dev/null || true' EXIT
@@ -150,4 +154,9 @@ save 's|^fun value(): int = 1 // value-marker|fun value(): i32 = 2 // value-mark
 finish restart
 grep -q '^ablac run --watch: applied: value' "$out/restart/stderr" ||
     { echo 'live watch (restart): the save after the refusal was not applied' >&2; cat "$out/restart/stderr" >&2; exit 1; }
-echo "live watch: a save is applied while the program runs; a broken one keeps it running; a refused one restarts it, once for the same reason"
+if grep -l 'stop abandoned' "$out"/*/stderr > /dev/null 2>&1; then
+    echo 'live watch: a collection of the compiler gave up waiting for the thread that runs the program' >&2
+    grep -h 'stop abandoned' "$out"/*/stderr | head -n 5 >&2
+    exit 1
+fi
+echo "live watch: a save is applied while the program runs; a broken one keeps it running; a refused one restarts it, once for the same reason; the compiler collects meanwhile"
