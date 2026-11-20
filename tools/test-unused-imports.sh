@@ -2,9 +2,10 @@
 # W_UNUSED_IMPORT (module.ab: bootstrapUnusedImportWarnings), behind --warn-unused-imports: an import nothing in the
 # importing file uses gets a warning, an import used only through an extension method, a re-exported class or a
 # `$json` subparser doesn't, nor one of a module with an @export function; a package's entry gets the
-# `export import` line instead, and a module that runs compile code keeps its imports. `ablac fix-imports --prune`
-# removes the warned imports, leaves the entry's, keeps the last import of a file with a #compilerGrant, and the
-# pruned programs still build.
+# `export import` line instead, and a module that runs compile code keeps its imports. Another project's module, a
+# vendored package and a checkout linked in get none, nor does any module after a front end that stopped at an error.
+# `ablac fix-imports --prune` removes the warned imports, leaves the entry's, keeps the abla/compiler import a
+# #compilerGrant uses, refuses a build that fails before every use is known, and the pruned programs still build.
 set -euo pipefail
 
 compiler=${1:-build/ablac}
@@ -101,7 +102,7 @@ grep -qxF 'import "abla/json"' "$work/pkg/lib.ab" || fail "the prune removed the
 grep -qF 'lib.ab: `import "abla/json"` left' "$work/pkg-prune.log" || fail "the entry's import isn't listed" "$work/pkg-prune.log"
 
 (cd "$work/grant" && "$compiler" fix-imports main.ab --prune) > "$work/grant-prune.log" 2>&1 || fail "grant prune failed" "$work/grant-prune.log"
-! grep -qxF 'import "abla/json"' "$work/grant/main.ab" || fail "grant/main.ab still imports abla/json" "$work/grant/main.ab"
-grep -qxF 'import "./value.ab"' "$work/grant/main.ab" || fail "the prune removed the last import of a #compilerGrant file" "$work/grant/main.ab"
-grep -qF 'kept: the last import of a file with a #compilerGrant' "$work/grant-prune.log" || fail "the kept import isn't listed" "$work/grant-prune.log"
-echo "unused-imports: 2 warnings in main.ab (none for uses through an extension, a re-exported class, a subparser or an @export module), the entry's export-import line; the prune removed 2, left the entry's, kept the grant file's last"
+! grep -qE '^import "(abla/json|\./value\.ab)"$' "$work/grant/main.ab" || fail "grant/main.ab still has its unused imports" "$work/grant/main.ab"
+grep -qxF 'import "abla/compiler"' "$work/grant/main.ab" || fail "the prune removed the import the #compilerGrant needs" "$work/grant/main.ab"
+(cd "$work/grant" && "$compiler" build main.ab -o program --fast) > "$work/grant-after.log" 2>&1 || fail "pruned grant/main.ab doesn't build" "$work/grant-after.log"
+echo "unused-imports: 2 warnings in main.ab (none for uses through an extension, a re-exported class, a subparser, an @export module, a module that runs compile code, another project's, a vendored or linked one, or after a front end that stopped); the entry's export-import line; the prune removed 2, left the entry's, kept the import a #compilerGrant needs, and refused a failing build"
