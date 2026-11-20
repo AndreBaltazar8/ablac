@@ -1175,6 +1175,23 @@ unexecuted native staging paths do not make their portable SHA operations target
 dependent. This does not permit a genuinely reentrant
 compile pass to replace its outer pass's JIT state.
 
+`ablaCompileTimeNativeHost()` (`abla/bytes`) is true only in compile-time code
+the native tier runs for the host: false in the evaluator, in a slice built for
+another target, and in compiled code. A standard-library dispatcher can then
+keep its fast native path at compile time on the host and the portable one
+everywhere else:
+
+```abla fragment
+if (ablaCompileTimeNativeHost()) native() else if (ablaAtCompileTime()) portable() else native()
+```
+
+The proof that a cross-target slice is portable skips the `then` of
+`if (ablaCompileTimeNativeHost())`, since it never runs there. So does the
+effect analysis, but only in the standard library's own code: in a program's
+code both arms count, so a `then` can't run C code without the
+`trusted.native` grant. Both arms must give the same results, error texts
+included: under `auto` the same site can run in the evaluator or natively.
+
 JSON in a cross-target site (#795): `jsonParse`, `jsonDocument` and their readers
 (`Json`, `JsonNode`, `JsonCursor`), `JsonLimits` and the error results run natively when every
 declaration they reach passes the same checks as any other code. These keep a site in

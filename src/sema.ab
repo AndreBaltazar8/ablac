@@ -4275,6 +4275,24 @@ fun bootstrapCompileTimeChildEnd(expression: BootstrapExpression): int {
     expression.children.size
 }
 
+/** Whether `if (ablaCompileTimeNativeHost()) a else b` is the expression and `a` the child: the analysis takes the
+ *  test as false, as the evaluator and a cross-target slice see it (abla/bytes), so `a` (native code a host slice
+ *  runs, on the standard library's own raw memory) isn't what compile-time code reaches. */
+//  Only in the standard library's own code (bootstrapCompileEffectsInLibrary): there the native arm uses its own raw
+//  memory and C functions, which no grant is asked for. In a program's code both arms count, or a `then` could run
+//  extern:"c" code in a host slice without the trusted.native grant.
+@inline
+fun bootstrapCompileTimeChildSkipped(expression: BootstrapExpression, child: int): bool =
+    child == 1 && bootstrapCompileEffectsInLibrary && bootstrapCompileTimeNativeHostIf(expression)
+
+// Whether the code the effect analyses walk is the standard library's (set per function they walk).
+var bootstrapCompileEffectsInLibrary: bool = false
+
+fun bootstrapCompileTimeNativeHostIf(expression: BootstrapExpression): bool =
+    expression.kind == "if" && expression.children.size > 2 &&
+        expression.children[0].kind == "call" && expression.children[0].text == "ablaCompileTimeNativeHost" &&
+        expression.children[0].children.size == 0
+
 fun bootstrapExpressionCompileEffects(
     expression: BootstrapExpression,
     summary: BootstrapCompileEffectSummary
@@ -4298,7 +4316,7 @@ fun bootstrapExpressionCompileEffects(
     }
     var child = 0
     while (child < bootstrapCompileTimeChildEnd(expression)) {
-        mask = bootstrapCompileEffectMerge(
+        if (!bootstrapCompileTimeChildSkipped(expression, child)) mask = bootstrapCompileEffectMerge(
             mask,
             bootstrapExpressionCompileEffects(
                 expression.children[child],
@@ -4806,7 +4824,7 @@ fun bootstrapDelegatedCompileEffectsIn(
         if (child == 1 && expression.kind == "for") {
             bound.bind(bootstrapEffectBinderKeys([expression], 1))
         }
-        if (child >= parameters) {
+        if (child >= parameters && !bootstrapCompileTimeChildSkipped(expression, child)) {
             val childMask = bootstrapDelegatedCompileEffectsIn(
                 expression.children[child], summary, delegatedNames, typeMap,
                 scopeNames, scopeTypes, owner, bound
@@ -5102,6 +5120,9 @@ fun bootstrapBuildCompileEffectSummary(
         var grew = false
         if (entryWalked[entry]) {
             bootstrapCompileEffectReading = if (head <= entries) entry else -1
+            // (The native arm of `if (ablaCompileTimeNativeHost())` is left out in the standard library's code only:
+            // bootstrapCompileTimeChildSkipped.)
+            bootstrapCompileEffectsInLibrary = entryClasses[entry] != 0
             val expression = entryExpressions[entry]
             val delegatedNames: array<string> = []
             var globalDelegate = 0
@@ -5189,6 +5210,7 @@ fun bootstrapBuildCompileEffectSummary(
         }
     }
     bootstrapCompileEffectReading = -1
+    bootstrapCompileEffectsInLibrary = false
     bootstrapCompileEffectLastReader = []
     bootstrapCompileEffectEdgeReaders = []
     bootstrapCompileEffectEdgeReads = []
@@ -5310,6 +5332,8 @@ fun bootstrapCompileEffectPathSearch(
                     ) && bootstrapCompileEffectPathVisit(
                         "function:$declaration", depth, visitedKeys, visitedDepths
                     )) {
+                    val outerLibrary = bootstrapCompileEffectsInLibrary
+                    bootstrapCompileEffectsInLibrary = bootstrapCompileDeclarationSourceClass(candidate) != 0
                     val nested = bootstrapCompileEffectPathSearch(
                         candidate.expression,
                         declarations,
@@ -5319,6 +5343,7 @@ fun bootstrapCompileEffectPathSearch(
                         visitedKeys,
                         visitedDepths
                     )
+                    bootstrapCompileEffectsInLibrary = outerLibrary
                     if (nested != "") path = "${candidate.name}->$nested"
                 }
             }
@@ -5403,7 +5428,7 @@ fun bootstrapCompileEffectPathSearch(
     }
     var child = 0
     while (path == "" && child < bootstrapCompileTimeChildEnd(expression)) {
-        path = bootstrapCompileEffectPathSearch(
+        if (!bootstrapCompileTimeChildSkipped(expression, child)) path = bootstrapCompileEffectPathSearch(
             expression.children[child],
             declarations,
             summary,
