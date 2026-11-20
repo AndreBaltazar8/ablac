@@ -236,12 +236,40 @@ fun string.indexOf(needle: string, from: int = 0): int =
     )
 
 // The last position of `needle`, or -1.
-fun string.lastIndexOf(needle: string): int {
-    var position = this.size - needle.size
+fun string.lastIndexOf(needle: string): int =
+    if (ablaAtCompileTime()) lastIndexOfSlow(this, needle) else lastIndexOfNative(this, needle)
+
+// The bytes compared in place, from the last position down: the first byte rules most positions out.
+private trusted fun lastIndexOfNative(text: string, needle: string): int {
+    val size = text.size
+    val width = needle.size
+    var position = size - width
+    if (position < 0) return -1
+    if (width == 0) return size
+    val data = ablaUnsafeStringAddress(text)
+    val pattern = ablaUnsafeStringAddress(needle)
+    val first = ablaUnsafeLoadU8(nativePointerFromAddress(pattern))
+    val last = ablaUnsafeLoadU8(nativePointerFromAddress(pattern + width - 1))
+    while (position >= 0) {
+        // The needle's last byte first, then its first: a repeated prefix rules a position out at once.
+        if (ablaUnsafeLoadU8(nativePointerFromAddress(data + position + width - 1)) == last &&
+            ablaUnsafeLoadU8(nativePointerFromAddress(data + position)) == first) {
+            var k = 1
+            while (k < width && ablaUnsafeLoadU8(nativePointerFromAddress(data + position + k)) ==
+                ablaUnsafeLoadU8(nativePointerFromAddress(pattern + k))) k = k + 1
+            if (k == width) return position
+        }
+        position = position - 1
+    }
+    -1
+}
+
+private fun lastIndexOfSlow(text: string, needle: string): int {
+    var position = text.size - needle.size
     var found = -1
     while (found < 0 && position >= 0) {
         if (ablaTextFindSequence(
-            this, needle, position, position + needle.size
+            text, needle, position, position + needle.size
         ) == position) found = position
         position = position - 1
     }
@@ -437,7 +465,7 @@ private fun percentHexValue(byte: int): int =
 // The text `value` stands for, or null when it is malformed: a `%` not followed by two hexadecimal digits (either
 // case), or a result that is not valid UTF-8 (a stray continuation byte, a truncated, overlong or surrogate sequence,
 // as %C0%80 or %ED%A0%80). Other bytes, including non-ASCII ones, are taken as they are. With `query` set, `+` is a space.
-fun percentDecode(value: string, query: bool = false): string? {
+private fun percentDecodeSlow(value: string, query: bool = false): string? {
     val buffer = byteBuffer()
     var index = 0
     var valid = true
@@ -501,6 +529,48 @@ private trusted fun textAsciiMapCaseNative(text: string, from: int, to: int): st
         ablaUnsafeStoreU8(nativePointerFromAddress(out + i), if (byte >= from && byte < from + 26) byte - from + to else byte)
     }
     buffer.adoptString(size)
+}
+
+fun percentDecode(value: string, query: bool = false): string? =
+    if (ablaAtCompileTime()) percentDecodeSlow(value, query) else percentDecodeNative(value, query)
+
+// Two passes over the bytes in place: the checks and the decoded size, then the bytes into one allocation. A `%` needs
+// two hexadecimal digits after it; the result must be valid UTF-8 (the same answers as percentDecodeSlow).
+private trusted fun percentDecodeNative(value: string, query: bool): string? {
+    val size = value.size
+    if (size == 0) return ""
+    val source = ablaUnsafeStringAddress(value)
+    var decodedSize = 0
+    var at = 0
+    while (at < size) {
+        val byte = ablaUnsafeLoadU8(nativePointerFromAddress(source + at))
+        if (byte == 37) {
+            if (at + 2 > size - 1) return null
+            if (percentHexValue(ablaUnsafeLoadU8(nativePointerFromAddress(source + at + 1))) < 0) return null
+            if (percentHexValue(ablaUnsafeLoadU8(nativePointerFromAddress(source + at + 2))) < 0) return null
+            at = at + 3
+        } else at = at + 1
+        decodedSize = decodedSize + 1
+    }
+    val buffer = nativeByteBuffer(decodedSize + 1)
+    val out = ablaUnsafePointerAddress(buffer.pointerAt(0))
+    at = 0
+    var written = 0
+    while (at < size) {
+        val byte = ablaUnsafeLoadU8(nativePointerFromAddress(source + at))
+        if (byte == 37) {
+            val high = percentHexValue(ablaUnsafeLoadU8(nativePointerFromAddress(source + at + 1)))
+            val low = percentHexValue(ablaUnsafeLoadU8(nativePointerFromAddress(source + at + 2)))
+            ablaUnsafeStoreU8(nativePointerFromAddress(out + written), high * 16 + low)
+            at = at + 3
+        } else {
+            ablaUnsafeStoreU8(nativePointerFromAddress(out + written), if (query && byte == 43) 32 else byte)
+            at = at + 1
+        }
+        written = written + 1
+    }
+    val decoded = buffer.adoptString(decodedSize)
+    if (decoded.isValidUtf8()) decoded else null
 }
 
 fun percentEncode(value: string, query: bool = false): string =

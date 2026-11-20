@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# uppercase, lowercase, codePointCount and percentEncode (abla/text, run-time paths on native memory) against the loops they replaced (tests/cases/text-native: every byte, every length to 40, valid and invalid UTF-8
+# uppercase, lowercase, codePointCount, percentEncode, percentDecode and lastIndexOf (abla/text, run-time paths on native memory) against the loops they replaced (tests/cases/text-native: every byte, every length to 40, valid and invalid UTF-8
 # strings, the query flag, the compile-time evaluator's answers); release and --fast.
 set -euo pipefail
 compiler=${1:-build/ablac}
@@ -16,4 +16,4 @@ for mode in release fast; do
     result=$("$root/tools/run-limited.sh" "$out/test.$mode" | tail -1) || { echo "text-native ($mode) failed" >&2; exit 1; }
     [[ $result == 'text-native ok' ]] || { echo "text-native ($mode): $result" >&2; exit 1; }
 done
-echo "ok   uppercase, lowercase, codePointCount and percentEncode against the previous loops, release and --fast"
+echo "ok   uppercase, lowercase, codePointCount, percentEncode, percentDecode and lastIndexOf against the previous loops, release and --fast"
