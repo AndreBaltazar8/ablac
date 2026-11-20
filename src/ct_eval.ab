@@ -257,7 +257,65 @@ fun bootstrapCtReportStop(var evaluator: BootstrapEvaluator, site: BootstrapCtSi
         evaluator.diagnostics =
             "${evaluator.diagnostics}source[eval-site]:${site.sourceIdentity}:${site.node.begin}:${site.node.end}\n"
     }
+    // The user's functions it was in, innermost first, as the evaluator names them on its way out (eval.ab).
+    evaluator.diagnostics = "${evaluator.diagnostics}${bootstrapCtStopPath()}"
     return
+}
+
+// The live generation's functions in the order of abla_ct_functions_<g> (ct_jit.ab,
+// bootstrapCtInstallFunctionTable): the program's own ones by name and declaration ("" and -1 for the others), and
+// where the generation keeps the table and the stopped call's return addresses (0 without a generation).
+var bootstrapCtFrameNames: array<string> = []
+var bootstrapCtFrameSources: array<string> = []
+var bootstrapCtFrameBegins: array<int> = []
+var bootstrapCtFunctionsAddress: int = 0
+var bootstrapCtPathAddress: int = 0
+var bootstrapCtPathCountAddress: int = 0
+// The return addresses a stop's walk keeps (ct_jit.ab, bootstrapCtBuildWalk).
+val BOOTSTRAP_CT_PATH_ENTRIES = 32
+
+// The stopped call's path as frame records (eval.ab, bootstrapEvalFrameRecord): each return address the walk left
+// is in the function that starts nearest below it; the program's functions are named, at most
+// BOOTSTRAP_EVAL_PATH_FRAMES and a run of recursive calls once, as the evaluator does. Read only after a stop.
+trusted fun bootstrapCtStopPath(): string {
+    if (bootstrapCtFunctionsAddress == 0 || bootstrapCtPathAddress == 0 || bootstrapCtPathCountAddress == 0) return ""
+    var count = ablaUnsafeLoadI64(nativePointerFromAddress(bootstrapCtPathCountAddress))
+    if (count > BOOTSTRAP_CT_PATH_ENTRIES) count = BOOTSTRAP_CT_PATH_ENTRIES
+    val functions = bootstrapCtFrameNames.size
+    val starts: array<int> = []
+    var index = 0
+    while (index < functions) {
+        starts.append(ablaUnsafeLoadI64(nativePointerFromAddress(bootstrapCtFunctionsAddress + index * 8)))
+        index = index + 1
+    }
+    var records = ""
+    var last = ""
+    var frames = 0
+    var entry = 0
+    while (entry < count && frames < BOOTSTRAP_EVAL_PATH_FRAMES) {
+        // A return address is just after its call: one byte back is inside the calling function.
+        val inside = ablaUnsafeLoadI64(nativePointerFromAddress(bootstrapCtPathAddress + entry * 8)) - 1
+        var best = -1
+        var bestStart = 0
+        index = 0
+        while (index < functions) {
+            val start = starts[index]
+            if (start != 0 && start <= inside && (best < 0 || start > bestStart)) {
+                best = index
+                bestStart = start
+            }
+            index = index + 1
+        }
+        if (best >= 0 && bootstrapCtFrameNames[best] != "" && bootstrapEvalUserSource(bootstrapCtFrameSources[best]) &&
+            bootstrapCtFrameNames[best] != last) {
+            records = "$records${bootstrapEvalFrameRecord(bootstrapCtFrameNames[best], bootstrapCtFrameSources[best],
+                bootstrapCtFrameBegins[best], bootstrapCtFrameBegins[best])}"
+            last = bootstrapCtFrameNames[best]
+            frames = frames + 1
+        }
+        entry = entry + 1
+    }
+    records
 }
 
 // The live generation's word that its fault handler writes the faulting address to (ct_jit.ab), 0 without one.
@@ -1008,7 +1066,7 @@ trusted fun bootstrapCtArmAlarm(handler: int, seconds: int): bool {
         action = bootstrapCtZeroed(160)
         ablaRuntimeStoreI64(action, handler)
         ablaRuntimeStoreI64(action + 8, 16 * 4294967296)
-    } else action = bootstrapCtKernelAction(handler, 1073741824)
+    } else action = bootstrapCtKernelAction(handler, 1073741824 + 4)
     val installed = bootstrapCtSigaction(14, action, 0)
     __ablaRuntimeFree(action)
     var armed = false

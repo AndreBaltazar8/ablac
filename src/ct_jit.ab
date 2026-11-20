@@ -2579,7 +2579,8 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
     // symbols as the interpreter's calls find them (ct_native.ab). Else a site calling one failed the
     // generation: "Symbols not found".
     val libraries = bootstrapCtNativeLibraries(parsed)
-    val added = bootstrapCtAddGeneration(context, module, bootstrapCtSlicePasses(program.functions.size), generation)
+    val added = bootstrapCtAddGeneration(context, module, bootstrapCtSlicePasses(program.functions.size), generation,
+        program)
     if (added.status != 0) {
         bootstrapCtFailReady("ORC rejected the slice (status ${added.status})")
         return
@@ -2609,6 +2610,9 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
     bootstrapCtStopSiteAddress = bootstrapCtLookup("abla_ct_stop_site_$generation")
     ctNativeStopDeferredAddress = bootstrapCtLookup("abla_ct_deferred_$generation")
     bootstrapCtFaultAddressCell = bootstrapCtLookup("abla_ct_fault_address_$generation")
+    bootstrapCtFunctionsAddress = bootstrapCtLookup("abla_ct_functions_$generation")
+    bootstrapCtPathAddress = bootstrapCtLookup("abla_ct_path_$generation")
+    bootstrapCtPathCountAddress = bootstrapCtLookup("abla_ct_path_count_$generation")
     bootstrapCtGenerationSpent = ""
     if (bootstrapCtFreeAddress == 0 || bootstrapCtGuardAddress == 0) {
         bootstrapCtFailReady("the slice's support entries are missing")
@@ -2662,15 +2666,14 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
 // 1.4 s. An ordinary build's minimum (150k) would leave the middle on one thread.
 val BOOTSTRAP_CT_UNITS_MINIMUM = 60000
 
-fun bootstrapCtAddGeneration(context: i64*, module: i64*, passes: string, generation: int): LlvmOrcGeneration {
+fun bootstrapCtAddGeneration(context: i64*, module: i64*, passes: string, generation: int,
+    program: BootstrapIrProgram): LlvmOrcGeneration {
     val configured = linuxEnvironment("ABLA_COMPILE_EVAL_UNITS")
     val wanted = !(configured.found && configured.value == "0")
     val size = if (wanted) bootstrapCodegenModuleSize(module) else 0
     val minimum = bootstrapCodegenEnvironmentCount("ABLA_CODEGEN_UNITS_MINIMUM", BOOTSTRAP_CT_UNITS_MINIMUM)
-    if (!wanted || bootstrapCodegenUnitCount() < 2 || size < minimum ||
-        !bootstrapCodegenThreadLocalUsers(module).supported) {
-        return bootstrapCtSessionState.addModule(context, module, passes)
-    }
+    val whole = !wanted || bootstrapCodegenUnitCount() < 2 || size < minimum ||
+        !bootstrapCodegenThreadLocalUsers(module).supported
     val started = linuxMonotonicMilliseconds()
     val nullPointer = nativeNullPointer()
     var status = 0
@@ -2678,6 +2681,13 @@ fun bootstrapCtAddGeneration(context: i64*, module: i64*, passes: string, genera
         val options = LLVMCreatePassBuilderOptions()
         status = llvmConsumeError(LLVMRunPasses(module, passes, nullPointer, options), 129)
         LLVMDisposePassBuilderOptions(options)
+    }
+    // After the passes, so the table holds the functions they kept: built before, it kept every function the slice
+    // defined alive, and code generation took two thirds longer.
+    if (status == 0) bootstrapCtInstallFunctionTable(context, module, generation, program)
+    if (whole) {
+        if (status != 0) return LlvmOrcGeneration(nativeNullPointer(), status, true)
+        return bootstrapCtSessionState.addModule(context, module, "")
     }
     val directory = "${bootstrapCacheDirectory()}/ct-units/${linuxProcessId()}-$generation"
     Path(directory).removeTree()
@@ -2851,6 +2861,10 @@ fun bootstrapCtInstallGuard(context: i64*, module: i64*, generation: int): bool 
     val onGuard = LLVMBuildICmp(builder, llvmIntEqual(), self, owner, "on.guard")
     LLVMBuildCondBr(builder, onGuard, jumpHere, jumpElsewhere)
     LLVMPositionBuilderAtEnd(builder, jumpHere)
+    // The frames the stop leaves, for the report's path through the user's functions (bootstrapCtBuildWalk).
+    val walk = bootstrapCtBuildWalk(context, module, generation)
+    LLVMPositionBuilderAtEnd(builder, jumpHere)
+    LLVMBuildCall2(builder, LLVMGlobalGetValueType(walk), walk, nativeNullPointer(), 0, "")
     val asked = LLVMBuildLoad2(builder, i32Type, pending, "asked")
     val wasAsked = LLVMBuildICmp(builder, llvmIntNotEqual(), asked, LLVMConstInt(i32Type, 0, 0), "was.asked")
     val code = LLVMBuildSelect(builder, wasAsked, asked, LLVMGetParam(longjmp, 1), "code")
@@ -2971,7 +2985,7 @@ fun bootstrapCtInstallGuard(context: i64*, module: i64*, generation: int): bool 
         val fault = handler == 1
         val function = LLVMAddFunction(
             module, if (fault) "abla_ct_fault_$generation" else "abla_ct_alarm_$generation",
-            if (fault) faultType else handlerType
+            faultType
         )
         val handlerEntry = LLVMAppendBasicBlockInContext(context, function, "entry")
         val handlerBack = LLVMAppendBasicBlockInContext(context, function, "back")
@@ -2986,6 +3000,18 @@ fun bootstrapCtInstallGuard(context: i64*, module: i64*, generation: int): bool 
                 offset.pointer(), i32(1), "si.addr")
             offset.drop()
             LLVMBuildStore(builder, LLVMBuildLoad2(builder, i64Type, field, "fault.address"), faultAddress)
+            // The faulting instruction, which no frame returns to, heads the path (bootstrapCtBuildWalk): the
+            // context's RIP on x86-64 Linux (uc_mcontext.gregs[REG_RIP], at 168). Elsewhere the path starts at the
+            // faulting function's caller.
+            if (bootstrapCtTripleFamily(llvmDefaultTargetTriple()) == "x86_64:linux") {
+                val ripOffset = llvmPointerVector(1)
+                ripOffset.set(0, LLVMConstInt(i64Type, 168, 0))
+                val rip = LLVMBuildGEP2(builder, LLVMInt8TypeInContext(context), LLVMGetParam(function, i32(2)),
+                    ripOffset.pointer(), i32(1), "rip")
+                ripOffset.drop()
+                LLVMBuildStore(builder, LLVMBuildLoad2(builder, i64Type, rip, "fault.pc"),
+                    LLVMGetNamedGlobal(module, "abla.ct.first.pc"))
+            }
             LLVMBuildCondBr(builder, handlerArmed, handlerBack, handlerIdle)
         } else {
             // In the compiler's code (a bridge call): the stop waits for its return.
@@ -2993,6 +3019,16 @@ fun bootstrapCtInstallGuard(context: i64*, module: i64*, generation: int): bool 
             val handlerDefer = LLVMAppendBasicBlockInContext(context, function, "defer")
             LLVMBuildCondBr(builder, handlerArmed, handlerCheck, handlerIdle)
             LLVMPositionBuilderAtEnd(builder, handlerCheck)
+            // The interrupted instruction heads the path, as for a fault (above).
+            if (bootstrapCtTripleFamily(llvmDefaultTargetTriple()) == "x86_64:linux") {
+                val ripOffset = llvmPointerVector(1)
+                ripOffset.set(0, LLVMConstInt(i64Type, 168, 0))
+                val rip = LLVMBuildGEP2(builder, LLVMInt8TypeInContext(context), LLVMGetParam(function, i32(2)),
+                    ripOffset.pointer(), i32(1), "rip")
+                ripOffset.drop()
+                LLVMBuildStore(builder, LLVMBuildLoad2(builder, i64Type, rip, "alarm.pc"),
+                    LLVMGetNamedGlobal(module, "abla.ct.first.pc"))
+            }
             val calls = LLVMBuildLoad2(builder, i64Type, inCompiler, "calls")
             val busy = LLVMBuildICmp(builder, llvmIntNotEqual(), calls, LLVMConstInt(i64Type, 0, 0), "busy")
             LLVMBuildCondBr(builder, busy, handlerDefer, handlerBack)
@@ -3052,6 +3088,12 @@ fun bootstrapCtInstallGuard(context: i64*, module: i64*, generation: int): bool 
     LLVMBuildStore(builder, LLVMConstNull(pointer), stopSite)
     LLVMBuildStore(builder, LLVMConstInt(i64Type, 0, 0), inCompiler)
     LLVMBuildStore(builder, LLVMConstInt(i64Type, 0, 0), deferred)
+    // The frames above the guard's are the compiler's: the walk stops below it (bootstrapCtBuildWalk).
+    LLVMBuildStore(builder, LLVMBuildPtrToInt(builder, bootstrapCtFrameAddress(context, module, builder), i64Type,
+        "guard.frame"), LLVMGetNamedGlobal(module, "abla.ct.guard.frame"))
+    LLVMBuildStore(builder, LLVMConstInt(i64Type, 0, 0), LLVMGetNamedGlobal(module, "abla_ct_path_count_$generation"))
+    LLVMBuildStore(builder, LLVMConstInt(i64Type, 0, 0), LLVMGetNamedGlobal(module, "abla.ct.first.pc"))
+    LLVMBuildStore(builder, LLVMConstInt(i1, 0, 0), LLVMGetNamedGlobal(module, "abla.ct.walking"))
     LLVMBuildStore(builder, LLVMConstInt(i1, 1, 0), armed)
     val entryType = LLVMFunctionType(i64Type, nativeNullPointer(), 0, 0)
     val reply = LLVMBuildCall2(
@@ -3071,6 +3113,199 @@ fun bootstrapCtInstallGuard(context: i64*, module: i64*, generation: int): bool 
 
 // Puts a wrapper in the place of each abla_ct_bridge_* entry the slice calls (see the guard's builder): it counts the
 // call in abla.ct.in.compiler, and after the outermost one returns takes the jump a stop deferred meanwhile.
+// llvm.frameaddress(0) at the builder's place: the current function's frame (its frame pointer).
+fun bootstrapCtFrameAddress(context: i64*, module: i64*, builder: i64*): i64* {
+    val pointer = LLVMPointerTypeInContext(context, 0)
+    val i32Type = LLVMInt32TypeInContext(context)
+    var intrinsic = LLVMGetNamedFunction(module, "llvm.frameaddress.p0")
+    if (pointerIsNull(intrinsic)) {
+        val parameters = llvmPointerVector(1)
+        parameters.set(0, i32Type)
+        intrinsic = LLVMAddFunction(module, "llvm.frameaddress.p0",
+            LLVMFunctionType(pointer, parameters.pointer(), 1, 0))
+        parameters.drop()
+    }
+    val arguments = llvmPointerVector(1)
+    arguments.set(0, LLVMConstInt(i32Type, 0, 0))
+    val frame = LLVMBuildCall2(builder, LLVMGlobalGetValueType(intrinsic), intrinsic, arguments.pointer(), 1, "frame")
+    arguments.drop()
+    frame
+}
+
+// The path through the user's functions a stop leaves, which the failure report names (ct_eval.ab):
+// void abla.ct.walk() follows the frame-pointer chain from its own frame (every slice function keeps one,
+// bootstrapCtKeepFramePointers) and records each return address in abla_ct_path_<g> (at most 32, their count in
+// abla_ct_path_count_<g>), after abla.ct.first.pc when a signal handler set it (the interrupted instruction, which no
+// frame returns to). It stops at a null, misaligned or not-rising frame, and below the guard's own frame
+// (abla.ct.guard.frame): above it are the compiler's. A fault while it walks (a frame pointer that wasn't one) comes
+// back through abla.ct.jump, which then doesn't walk again (abla.ct.walking): the path is what was read by then. The
+// compiler maps the addresses to functions (ct_eval.ab, bootstrapCtStopPath).
+fun bootstrapCtBuildWalk(context: i64*, module: i64*, generation: int): i64* {
+    val existing = LLVMGetNamedFunction(module, "abla.ct.walk")
+    if (!pointerIsNull(existing)) return existing
+    val builder = LLVMCreateBuilderInContext(context)
+    val voidType = LLVMVoidTypeInContext(context)
+    val i1 = LLVMInt1TypeInContext(context)
+    val i64Type = LLVMInt64TypeInContext(context)
+    val pointer = LLVMPointerTypeInContext(context, 0)
+    val pathType = LLVMArrayType2(i64Type, BOOTSTRAP_CT_PATH_ENTRIES)
+    val path = LLVMAddGlobal(module, pathType, "abla_ct_path_$generation")
+    LLVMSetInitializer(path, LLVMConstNull(pathType))
+    val count = LLVMAddGlobal(module, i64Type, "abla_ct_path_count_$generation")
+    LLVMSetInitializer(count, LLVMConstInt(i64Type, 0, 0))
+    val guardFrame = LLVMAddGlobal(module, i64Type, "abla.ct.guard.frame")
+    LLVMSetInitializer(guardFrame, LLVMConstInt(i64Type, 0, 0))
+    LLVMSetLinkage(guardFrame, llvmInternalLinkage())
+    val firstPc = LLVMAddGlobal(module, i64Type, "abla.ct.first.pc")
+    LLVMSetInitializer(firstPc, LLVMConstInt(i64Type, 0, 0))
+    LLVMSetLinkage(firstPc, llvmInternalLinkage())
+    val walking = LLVMAddGlobal(module, i1, "abla.ct.walking")
+    LLVMSetInitializer(walking, LLVMConstInt(i1, 0, 0))
+    LLVMSetLinkage(walking, llvmInternalLinkage())
+    val walk = LLVMAddFunction(module, "abla.ct.walk", LLVMFunctionType(voidType, nativeNullPointer(), 0, 0))
+    LLVMSetLinkage(walk, llvmInternalLinkage())
+    val entry = LLVMAppendBasicBlockInContext(context, walk, "entry")
+    val start = LLVMAppendBasicBlockInContext(context, walk, "start")
+    val first = LLVMAppendBasicBlockInContext(context, walk, "first")
+    val loop = LLVMAppendBasicBlockInContext(context, walk, "loop")
+    val check = LLVMAppendBasicBlockInContext(context, walk, "check")
+    val body = LLVMAppendBasicBlockInContext(context, walk, "body")
+    val done = LLVMAppendBasicBlockInContext(context, walk, "done")
+    val leave = LLVMAppendBasicBlockInContext(context, walk, "leave")
+    LLVMPositionBuilderAtEnd(builder, entry)
+    val frameCell = LLVMBuildAlloca(builder, i64Type, "fp")
+    val previousCell = LLVMBuildAlloca(builder, i64Type, "previous")
+    val countCell = LLVMBuildAlloca(builder, i64Type, "count")
+    val again = LLVMBuildLoad2(builder, i1, walking, "again")
+    LLVMBuildCondBr(builder, again, leave, start)
+    LLVMPositionBuilderAtEnd(builder, start)
+    LLVMBuildStore(builder, LLVMConstInt(i1, 1, 0), walking)
+    LLVMBuildStore(builder, LLVMConstInt(i64Type, 0, 0), count)
+    LLVMBuildStore(builder, LLVMBuildPtrToInt(builder, bootstrapCtFrameAddress(context, module, builder), i64Type,
+        "own"), frameCell)
+    LLVMBuildStore(builder, LLVMConstInt(i64Type, 0, 0), previousCell)
+    LLVMBuildStore(builder, LLVMConstInt(i64Type, 0, 0), countCell)
+    val pc = LLVMBuildLoad2(builder, i64Type, firstPc, "first.pc")
+    LLVMBuildCondBr(builder, LLVMBuildICmp(builder, llvmIntNotEqual(), pc, LLVMConstInt(i64Type, 0, 0), "has.first"),
+        first, loop)
+    LLVMPositionBuilderAtEnd(builder, first)
+    LLVMBuildStore(builder, pc, bootstrapCtPathSlot(context, builder, path, pathType, LLVMConstInt(i64Type, 0, 0)))
+    LLVMBuildStore(builder, LLVMConstInt(i64Type, 1, 0), countCell)
+    LLVMBuildBr(builder, loop)
+    // loop: while count < 32, fp != 0, fp % 8 == 0, fp > previous, fp < the guard's frame.
+    LLVMPositionBuilderAtEnd(builder, loop)
+    val fp = LLVMBuildLoad2(builder, i64Type, frameCell, "fp")
+    val previous = LLVMBuildLoad2(builder, i64Type, previousCell, "previous")
+    val taken = LLVMBuildLoad2(builder, i64Type, countCell, "taken")
+    val room = LLVMBuildICmp(builder, llvmIntUnsignedLessThan(), taken,
+        LLVMConstInt(i64Type, BOOTSTRAP_CT_PATH_ENTRIES, 0), "room")
+    val aligned = LLVMBuildICmp(builder, llvmIntEqual(),
+        LLVMBuildAnd(builder, fp, LLVMConstInt(i64Type, 7, 0), "low"), LLVMConstInt(i64Type, 0, 0), "aligned")
+    val rising = LLVMBuildICmp(builder, llvmIntUnsignedGreaterThan(), fp, previous, "rising")
+    val below = LLVMBuildICmp(builder, llvmIntUnsignedLessThan(), fp,
+        LLVMBuildLoad2(builder, i64Type, guardFrame, "guard"), "below")
+    val good = LLVMBuildAnd(builder, LLVMBuildAnd(builder, room, aligned, "a"),
+        LLVMBuildAnd(builder, rising, below, "b"), "good")
+    LLVMBuildCondBr(builder, good, check, done)
+    LLVMPositionBuilderAtEnd(builder, check)
+    LLVMBuildBr(builder, body)
+    LLVMPositionBuilderAtEnd(builder, body)
+    val returnAddress = LLVMBuildLoad2(builder, i64Type,
+        LLVMBuildIntToPtr(builder, LLVMBuildAdd(builder, fp, LLVMConstInt(i64Type, 8, 0), "ra.at"), pointer, "ra.p"),
+        "ra")
+    val next = LLVMBuildLoad2(builder, i64Type, LLVMBuildIntToPtr(builder, fp, pointer, "fp.p"), "next")
+    LLVMBuildStore(builder, returnAddress, bootstrapCtPathSlot(context, builder, path, pathType, taken))
+    LLVMBuildStore(builder, LLVMBuildAdd(builder, taken, LLVMConstInt(i64Type, 1, 0), "taken.1"), countCell)
+    // (The count as it grows, so a fault on the next read leaves the frames read so far.)
+    LLVMBuildStore(builder, LLVMBuildAdd(builder, taken, LLVMConstInt(i64Type, 1, 0), "taken.2"), count)
+    LLVMBuildStore(builder, fp, previousCell)
+    LLVMBuildStore(builder, next, frameCell)
+    LLVMBuildBr(builder, loop)
+    LLVMPositionBuilderAtEnd(builder, done)
+    LLVMBuildStore(builder, LLVMBuildLoad2(builder, i64Type, countCell, "final"), count)
+    LLVMBuildRetVoid(builder)
+    LLVMPositionBuilderAtEnd(builder, leave)
+    LLVMBuildRetVoid(builder)
+    LLVMDisposeBuilder(builder)
+    walk
+}
+
+
+// Every function the slice defines keeps a frame pointer (the walk follows them), and their addresses are in
+// abla_ct_functions_<g>, an array the compiler reads after a stop to tell which function each return address is in.
+// Which of them are the program's own functions, and where each is declared, the compiler keeps beside it
+// (bootstrapCtFrameNames, ...; the slice's names are hashes of the IR functions, bootstrapLlvmFunctionSymbol).
+fun bootstrapCtInstallFunctionTable(context: i64*, module: i64*, generation: int, program: BootstrapIrProgram): void {
+    val pointer = LLVMPointerTypeInContext(context, 0)
+    val readable: Map<string, int> = Map()
+    var index = 0
+    while (index < program.functions.size) {
+        val function = program.functions[index]
+        if (function.position >= 0 && !function.runtimeImplementation && function.label != "" &&
+            !function.label.startsWith("__abla")) {
+            val symbol = bootstrapLlvmFunctionSymbol(function)
+            readable.set(symbol, index)
+            readable.set("${symbol}_direct", index)
+        }
+        index = index + 1
+    }
+    val attribute = LLVMCreateStringAttribute(context, "frame-pointer", 13, "all", 3)
+    val names: array<string> = []
+    val sources: array<string> = []
+    val begins: array<int> = []
+    var defined = 0
+    var function = LLVMGetFirstFunction(module)
+    while (!pointerIsNull(function)) {
+        if (LLVMIsDeclaration(function) == i32(0)) {
+            LLVMAddAttributeAtIndex(function, -1, attribute)
+            defined = defined + 1
+        }
+        function = LLVMGetNextFunction(function)
+    }
+    val entries = llvmPointerVector(if (defined > 0) defined else 1)
+    var slot = 0
+    function = LLVMGetFirstFunction(module)
+    while (!pointerIsNull(function)) {
+        if (LLVMIsDeclaration(function) == i32(0)) {
+            entries.set(slot, function)
+            val found = readable.get(bootstrapLlvmDebugValueName(function))
+            val at = if (found != null) found else -1
+            if (at >= 0) {
+                val position = program.functions[at].position
+                val file = bootstrapIrSourcePositionFile(position)
+                names.append(program.functions[at].label)
+                sources.append(if (file >= 0 && file < bootstrapIrSourceFiles.size) bootstrapIrSourceFiles[file] else "")
+                begins.append(bootstrapIrSourcePositionOffset(position))
+            } else {
+                names.append("")
+                sources.append("")
+                begins.append(-1)
+            }
+            slot = slot + 1
+        }
+        function = LLVMGetNextFunction(function)
+    }
+    val tableType = LLVMArrayType2(pointer, defined)
+    val table = LLVMAddGlobal(module, tableType, "abla_ct_functions_$generation")
+    LLVMSetInitializer(table, LLVMConstArray2(pointer, entries.pointer(), defined))
+    LLVMSetGlobalConstant(table, 1)
+    entries.drop()
+    bootstrapCtFrameNames = names
+    bootstrapCtFrameSources = sources
+    bootstrapCtFrameBegins = begins
+    return
+}
+
+fun bootstrapCtPathSlot(context: i64*, builder: i64*, path: i64*, pathType: i64*, index: i64*): i64* {
+    val i64Type = LLVMInt64TypeInContext(context)
+    val indices = llvmPointerVector(2)
+    indices.set(0, LLVMConstInt(i64Type, 0, 0))
+    indices.set(1, index)
+    val slot = LLVMBuildGEP2(builder, pathType, path, indices.pointer(), i32(2), "slot")
+    indices.drop()
+    slot
+}
+
 trusted fun bootstrapCtWrapBridgeEntries(
     context: i64*,
     module: i64*,
@@ -3249,6 +3484,9 @@ fun bootstrapCtFinishPass(another: bool = true): void {
     bootstrapCtStopSiteAddress = 0
     ctNativeStopDeferredAddress = 0
     bootstrapCtFaultAddressCell = 0
+    bootstrapCtFunctionsAddress = 0
+    bootstrapCtPathAddress = 0
+    bootstrapCtPathCountAddress = 0
     // (No fresh array where there is nothing to drop: inside a region it would not
     // outlive it.)
     if (bootstrapCtSites.size > 0) bootstrapCtSites = []

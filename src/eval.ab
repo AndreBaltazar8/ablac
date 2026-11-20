@@ -8,6 +8,7 @@ import "abla/unsafe/memory/raw"
 import "ct_bridge.ab"
 import "compile_actions.ab"
 import "ct_native.ab"
+import "ct_native_effects.ab"
 import "eval_scalar.ab"
 import "simd_types.ab"
 import "eval_uint256.ab"
@@ -5375,7 +5376,7 @@ class BootstrapEvaluator(
                 }
                 result = if (escaped >= 0) bootstrapEvalInvalid()
                     else bootstrapEvaluateFrom(
-                        invocation, declaration.sourceIdentity, declaration.expression
+                        invocation, declaration.sourceIdentity, declaration.expression, declaration.name, declaration.begin, declaration.end
                     )
                 if (result.kind == "return" && result.elements.size == 1) {
                     result = result.elements[0]
@@ -5640,7 +5641,7 @@ class BootstrapEvaluator(
                 }
                 result = if (escaped >= 0) bootstrapEvalInvalid()
                     else bootstrapEvaluateFrom(
-                        invocation, declaration.sourceIdentity, declaration.expression
+                        invocation, declaration.sourceIdentity, declaration.expression, declaration.name, declaration.begin, declaration.end
                     )
                 if (result.kind == "return" && result.elements.size == 1) {
                     result = result.elements[0]
@@ -5734,7 +5735,7 @@ class BootstrapEvaluator(
                                 invocation,
                                 if (method.sourceIdentity != "") method.sourceIdentity
                                 else declaration.sourceIdentity,
-                                method.expression
+                                method.expression, "${declaration.name}.${method.name}", method.begin, method.end
                             )
                         if (result.kind == "return" &&
                             result.elements.size == 1) {
@@ -5961,7 +5962,7 @@ class BootstrapEvaluator(
             globalGraph = this.globalGraph
         )
         var result = bootstrapEvaluateFrom(
-            invocation, declaration.sourceIdentity, declaration.expression
+            invocation, declaration.sourceIdentity, declaration.expression, declaration.name, declaration.begin, declaration.end
         )
         if (result.kind == "return" && result.elements.size == 1) {
             result = result.elements[0]
@@ -7115,19 +7116,60 @@ fun bootstrapEvalExpressionFailed(
 fun bootstrapEvaluateFrom(
     var evaluator: BootstrapEvaluator,
     source: string,
-    expression: BootstrapExpression
+    expression: BootstrapExpression,
+    // The function (or method) whose body this is, which a failure inside it names on its way out.
+    frameName: string = "",
+    frameBegin: int = -1,
+    frameEnd: int = -1
 ): BootstrapEvalValue {
+    val errorsBefore = evaluator.errors
+    var result = bootstrapEvalInvalid()
     if (source == "" || source == evaluator.sourceIdentity) {
-        return evaluator.evaluateFrame(expression)
+        result = evaluator.evaluateFrame(expression)
+    } else {
+        val previous = evaluator.sourceIdentity
+        evaluator.sourceIdentity = source
+        val previousRawContext = ctNativeEnterSource(source)
+        result = evaluator.evaluateFrame(expression)
+        ctNativeRawContext = previousRawContext
+        evaluator.sourceIdentity = previous
     }
-    val previous = evaluator.sourceIdentity
-    evaluator.sourceIdentity = source
-    val previousRawContext = ctNativeEnterSource(source)
-    val result = evaluator.evaluateFrame(expression)
-    ctNativeRawContext = previousRawContext
-    evaluator.sourceIdentity = previous
+    if (frameName != "" && evaluator.errors > errorsBefore) {
+        bootstrapEvalNoteFrame(evaluator, frameName, if (source == "") evaluator.sourceIdentity else source,
+            frameBegin, frameEnd)
+    }
     result
 }
+
+// The functions a failing `#` site's evaluation was in, innermost first, as records for the report
+// (source[frame:<name>], diagnostic_positions.ab): at most BOOTSTRAP_EVAL_PATH_FRAMES, and a function that calls
+// itself is named once for its run of calls. The native tier names the same frames (ct_eval.ab).
+val BOOTSTRAP_EVAL_PATH_FRAMES = 8
+var bootstrapEvalPathFrames: int = 0
+var bootstrapEvalPathLast: string = ""
+
+fun bootstrapEvalPathBegin(): void {
+    bootstrapEvalPathFrames = 0
+    bootstrapEvalPathLast = ""
+    return
+}
+
+fun bootstrapEvalNoteFrame(var evaluator: BootstrapEvaluator, name: string, source: string, begin: int,
+    end: int): void {
+    if (!bootstrapEvalUserSource(source) || begin < 0 || name == bootstrapEvalPathLast ||
+        bootstrapEvalPathFrames >= BOOTSTRAP_EVAL_PATH_FRAMES) return
+    bootstrapEvalPathLast = name
+    bootstrapEvalPathFrames = bootstrapEvalPathFrames + 1
+    evaluator.diagnostics = "${evaluator.diagnostics}${bootstrapEvalFrameRecord(name, source, begin, end)}"
+    return
+}
+
+// The program's own code, not the standard library's: the path names only its functions.
+fun bootstrapEvalUserSource(source: string): bool =
+    source != "" && !source.startsWith("${bootstrapCompileProviderStandardLibrary()}/")
+
+fun bootstrapEvalFrameRecord(name: string, source: string, begin: int, end: int): string =
+    "source[frame:$name]:$source:$begin:$end\n"
 
 // A program global (`val` / `var`) read by compile-time code: like a `compile val`,
 // one value for the whole compilation, so what compile-time code changes through

@@ -1247,15 +1247,20 @@ a value is no part of any global's heap, whatever it was computed from.
 
 ## Diagnostics
 
-A `#` site that fails is reported the same way in both tiers: the error's code and text, where it failed, the site
-it came from, and a last line that says compile-time evaluation failed:
+A `#` site that fails is reported the same way in both tiers: the error's code and text, where it failed, the
+program's functions it was in (innermost first), the site it came from, and a last line that says compile-time
+evaluation failed (`tests/cases/ct-site-errors/bounds.ab`):
 
 ```text
 error[E_EVAL_OUT_OF_BOUNDS]: index 7 out of bounds for array of size 3
-source[eval]:bounds.ab:131:140
-  --> bounds.ab:2:45
-source[site]:bounds.ab:221:229
-  = note: in `#table()` at bounds.ab:9:13
+source[eval]:bounds.ab:246:255
+  --> bounds.ab:4:45
+source[frame:pick]:bounds.ab:192:255
+  = note: in `pick`, declared at bounds.ab:3:1
+source[frame:table]:bounds.ab:257:332
+  = note: in `table`, declared at bounds.ab:6:1
+source[site]:bounds.ab:346:354
+  = note: in `#table()` at bounds.ab:12:13
 compile-time evaluation failed: 1 error(s)
 ```
 
@@ -1263,8 +1268,12 @@ The place line (`-->`) is the one part that differs. The evaluator knows the exp
 has no line table, so its place is the site, and the line says so:
 
 ```text
-  --> bounds.ab:9:13 (its `#` site: the native tier's code has no line table)
+  --> bounds.ab:12:13 (its `#` site: the native tier's code has no line table)
 ```
+
+Native code finds the functions from its frames, so it names the ones it didn't inline into their callers (here
+`pick` and `table` are `@noinline`; a small function is often inlined, and then only its caller is named). Both tiers
+name a run of recursive calls once, at most eight functions, and none of the standard library's.
 
 The `source[...]` lines are the same places for tools, in byte offsets.
 

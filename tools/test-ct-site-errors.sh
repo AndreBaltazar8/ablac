@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # A failing `#` site is reported the same way in both tiers (tests/cases/ct-site-errors): the same error code and
-# text, then where it failed, then the site it came from ("= note: in `#table()` at file:line:col"), and a last line
+# text, then where it failed, then the user functions it was in, innermost first (native code names the ones it
+# didn't inline; the cases are @noinline), then the site it came from ("= note: in `#table()` at file:line:col"), and a last line
 # that says compile-time evaluation failed. The one part that differs is the place line (`-->`): the interpreter
 # knows the expression it was evaluating; native code has no line table, so its place is the site, and says so.
 # A capability the module didn't grant is refused before anything runs, the same in both.
@@ -14,6 +15,7 @@ cd "$project_root/tests/cases/ct-site-errors"
 fail() { echo "ct site errors: $1" >&2; [[ -z ${2:-} ]] || cat "$2" >&2; exit 1; }
 # The report without the tier's place: record lines and `-->` lines out, the trace's notes out.
 common() { grep -v '^source\[\|^  --> \|^note\[' "$1"; }
+declare -A expected_path=([bounds]="pick table" [division]="ratio table" [panic]=check [exit]=leave [deep]=down [late]=spin)
 for case in bounds division panic exit deep late denied; do
     for mode in interp jit; do
         log=$out/$case-$mode.log
@@ -40,6 +42,10 @@ for case in bounds division panic exit deep late denied; do
     place=$(grep -o '^  --> [^ ]*' "$interp" | head -1); place=${place#  --> }
     [[ $place == $case.ab:* && $place != "$site_place" ]] || fail "$case interp: the place is '$place'" "$interp"
     grep -q '^compile-time evaluation failed: 1 error(s)$' "$jit" || fail "$case: the last line" "$jit"
+    # The functions it was in, innermost first, the same in both tiers (the common report above): a run of
+    # recursive calls is named once, and the standard library's functions not at all.
+    path=$({ grep -o "^  = note: in \`[^\`]*\`, declared at $case.ab" "$jit" || true; } | sed -E "s/^  = note: in \`([^\`]*)\`.*/\1/" | tr "\\n" " ")
+    [[ $path == "${expected_path[$case]} " ]] || fail "$case: the path is '$path', not '${expected_path[$case]}'" "$jit"
     echo "ok   $case: $(grep '^error\[' "$jit" | cut -c1-70); interp at $place, site $site_place"
 done
 echo "ct site errors: a failing site's report has the same code and text in both tiers, the place where it failed and its site"
