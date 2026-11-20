@@ -40,6 +40,27 @@ name_of() { # source
     echo "$(basename "$(dirname "$source")")-$(basename "$source" .ab)"
 }
 
+# A run that is still going after $stuck_after seconds (a plain run takes seconds) gets its threads written next to its output:
+# what each is waiting for (wchan) and the processor time it has used, twice, so a deadlock shows as the same wait and the same
+# time, and a slow run as time that grows. A hang under stress otherwise sits at run-limited's 600 s with nothing to read (#1040).
+stuck_after=${GC_STRESS_IO_STUCK_AFTER:-120}
+stuck_report() { # binary report
+    local binary=$1 report=$2 pass pid task
+    sleep "$stuck_after" > /dev/null 2>&1 < /dev/null   # an orphan of a killed watcher holds no output open
+    : > "$report"
+    for pass in 1 2; do
+        for exe in /proc/[0-9]*/exe; do
+            [[ $(readlink "$exe" 2> /dev/null) == "$binary" ]] || continue
+            pid=${exe#/proc/}; pid=${pid%/exe}
+            echo "still running after ${stuck_after} s: process $pid, pass $pass" >> "$report"
+            for task in /proc/$pid/task/*; do
+                echo "  thread ${task##*/} $(cat "$task/comm" 2> /dev/null) wait=$(cat "$task/wchan" 2> /dev/null) cpu-ticks=$(awk '{print $14 + $15}' "$task/stat" 2> /dev/null)" >> "$report"
+            done
+        done
+        [[ $pass == 2 ]] || sleep 5 > /dev/null 2>&1 < /dev/null
+    done
+}
+
 jobs=${GC_STRESS_IO_JOBS:-4}
 for source in "${cases[@]}"; do
     while (( $(jobs -rp | wc -l) >= jobs )); do wait -n || true; done
@@ -63,11 +84,17 @@ for source in "${cases[@]}"; do
     (cd "$output_directory/run" && "$project_root/tools/run-limited.sh" "$output_directory/$name" \
         > "$output_directory/$name.plain.out" 2>&1 < /dev/null) || plain=$?
     stressed=0
+    rm -f "$output_directory/$name.stuck"
+    stuck_report "$output_directory/$name" "$output_directory/$name.stuck" &
+    watcher=$!
     (cd "$output_directory/run" && ABLA_GC_STRESS=1 "$project_root/tools/run-limited.sh" \
         "$output_directory/$name" > "$output_directory/$name.stress.out" 2>&1 < /dev/null) || stressed=$?
+    kill "$watcher" 2> /dev/null || true
+    wait "$watcher" 2> /dev/null || true
     if [[ $plain != 42 || $stressed != 42 ]]; then
         echo "gc stress io: $source exited $plain, and $stressed under ABLA_GC_STRESS=1 (42 both ways expected)" >&2
         tail -n 5 "$output_directory/$name.stress.out" >&2
+        [[ ! -s $output_directory/$name.stuck ]] || cat "$output_directory/$name.stuck" >&2
         failures=$((failures + 1))
     fi
 done
