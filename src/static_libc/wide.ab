@@ -1,0 +1,295 @@
+// Wide characters, locale objects and collation of the statically linked compiler's C library, in the C locale (#806 step C, step 3): a wchar_t
+// is a 32-bit code unit, characters above 127 are not convertible (EILSEQ, as glibc's "C" locale does), a locale object is an opaque handle,
+// collation is byte order, and nothing is translated.
+import "abla/runtime/scalar"
+import "abla/unsafe/native"
+import "abla/unsafe/memory/raw"
+import "./errno.ab"
+import "./fs.ab"
+import "./memory.ab"
+import "./string.ab"
+import "./locale.ab"
+
+trusted fun libcWide(address: int, index: int): int = ablaRuntimeLoadI32(address + index * 4) & 4294967295
+
+@export("wcslen")
+trusted fun libcWcslen(text: int): int {
+    var at = 0
+    while (libcWide(text, at) != 0) at = at + 1
+    at
+}
+
+@export("wcscmp")
+trusted fun libcWcscmp(left: int, right: int): int {
+    var at = 0
+    while (true) {
+        val a = libcWide(left, at)
+        val b = libcWide(right, at)
+        if (a != b) return if (a < b) -1 else 1
+        if (a == 0) return 0
+        at = at + 1
+    }
+    0
+}
+
+@export("wmemchr")
+trusted fun libcWmemchr(text: int, wanted: int, count: int): int {
+    val target = wanted & 4294967295
+    var at = 0
+    while (at < count) {
+        if (libcWide(text, at) == target) return text + at * 4
+        at = at + 1
+    }
+    0
+}
+
+@export("wmemcpy")
+trusted fun libcWmemcpy(destination: int, source: int, count: int): int {
+    ablaUnsafeCopyMemory(destination, source, count * 4)
+    destination
+}
+
+@export("wmemmove")
+trusted fun libcWmemmove(destination: int, source: int, count: int): int {
+    if (destination <= source) {
+        var at = 0
+        while (at < count) {
+            ablaRuntimeStoreI32(destination + at * 4, ablaRuntimeLoadI32(source + at * 4))
+            at = at + 1
+        }
+    } else {
+        var at = count
+        while (at > 0) {
+            at = at - 1
+            ablaRuntimeStoreI32(destination + at * 4, ablaRuntimeLoadI32(source + at * 4))
+        }
+    }
+    destination
+}
+
+@export("wmemset")
+trusted fun libcWmemset(destination: int, value: int, count: int): int {
+    var at = 0
+    while (at < count) {
+        ablaRuntimeStoreI32(destination + at * 4, value)
+        at = at + 1
+    }
+    destination
+}
+
+// WEOF is 0xffffffff; EOF is -1.
+@export("btowc")
+fun libcBtowc(c: int): int {
+    val x = c & 4294967295
+    if (x < 128) x else 4294967295
+}
+
+@export("wctob")
+fun libcWctob(c: int): int {
+    val x = c & 4294967295
+    if (x < 128) x else -1
+}
+
+// The conversion state is not used: every character is one byte.
+@export("mbrtowc")
+trusted fun libcMbrtowc(destination: int, text: int, count: int, state: int): int {
+    if (text == 0) return 0
+    if (count == 0) return -2
+    val byte = ablaRuntimeLoadU8(text)
+    if (byte >= 128) {
+        libcSetErrno(84)
+        return -1
+    }
+    if (destination != 0) ablaRuntimeStoreI32(destination, byte)
+    if (byte == 0) 0 else 1
+}
+
+@export("wcrtomb")
+trusted fun libcWcrtomb(text: int, c: int, state: int): int {
+    if (text == 0) return 1
+    val x = c & 4294967295
+    if (x >= 128) {
+        libcSetErrno(84)
+        return -1
+    }
+    ablaRuntimeStoreU8(text, x)
+    1
+}
+
+// mbsrtowcs(dst, &src, n, state) and the counted variant: converts up to n characters, stops after the terminator (src set to NULL) or at
+// an unconvertible byte (src left at it, EILSEQ).
+trusted fun libcMbsToWcs(destination: int, source: int, count: int): int {
+    var text = ablaRuntimeLoadI64(source)
+    var done = 0
+    while (done < count) {
+        val byte = ablaRuntimeLoadU8(text)
+        if (byte >= 128) {
+            ablaRuntimeStoreI64(source, text)
+            libcSetErrno(84)
+            return -1
+        }
+        if (destination != 0) ablaRuntimeStoreI32(destination + done * 4, byte)
+        if (byte == 0) {
+            if (destination != 0) ablaRuntimeStoreI64(source, 0)
+            return done
+        }
+        text = text + 1
+        done = done + 1
+    }
+    if (destination != 0) ablaRuntimeStoreI64(source, text)
+    done
+}
+
+@export("mbsrtowcs")
+trusted fun libcMbsrtowcs(destination: int, source: int, count: int, state: int): int =
+    libcMbsToWcs(destination, source, if (destination == 0) 9223372036854775807 else count)
+
+@export("mbsnrtowcs")
+trusted fun libcMbsnrtowcs(destination: int, source: int, bytes: int, count: int, state: int): int {
+    val limit = if (bytes < count || destination == 0) bytes else count
+    libcMbsToWcs(destination, source, limit)
+}
+
+@export("wcsnrtombs")
+trusted fun libcWcsnrtombs(destination: int, source: int, characters: int, count: int, state: int): int {
+    var text = ablaRuntimeLoadI64(source)
+    var done = 0
+    while (done < characters && (destination == 0 || done < count)) {
+        val c = libcWide(text, 0)
+        if (c >= 128) {
+            ablaRuntimeStoreI64(source, text)
+            libcSetErrno(84)
+            return -1
+        }
+        if (destination != 0) ablaRuntimeStoreU8(destination + done, c)
+        if (c == 0) {
+            if (destination != 0) ablaRuntimeStoreI64(source, 0)
+            return done
+        }
+        text = text + 4
+        done = done + 1
+    }
+    if (destination != 0) ablaRuntimeStoreI64(source, text)
+    done
+}
+
+// Wide classification: the class descriptor is the ctype mask itself (the name compares in __wctype_l below).
+@export("__wctype_l")
+trusted fun libcWctype(name: int, locale: int): int {
+    val names = "alnum alpha blank cntrl digit graph lower print punct space upper xdigit"
+    val masks = [8, 1024, 1, 2, 2048, 32768, 512, 16384, 4, 8192, 256, 4096]
+    var index = 0
+    var start = 0
+    while (index < 12) {
+        var end = start
+        while (end < names.size && names[end] != 32) end = end + 1
+        var same = true
+        var at = 0
+        while (start + at < end) {
+            if (ablaRuntimeLoadU8(name + at) != names[start + at]) same = false
+            at = at + 1
+        }
+        if (same && ablaRuntimeLoadU8(name + at) == 0) return masks[index]
+        start = end + 1
+        index = index + 1
+    }
+    0
+}
+
+@export("__iswctype_l")
+fun libcIswctype(c: int, descriptor: int, locale: int): int {
+    val x = c & 4294967295
+    if (x < 128 && (libcCtypeMask(x) & descriptor) != 0) 1 else 0
+}
+
+@export("__towlower_l")
+fun libcTowlower(c: int, locale: int): int {
+    val x = c & 4294967295
+    if (x >= 65 && x <= 90) x + 32 else x
+}
+
+@export("__towupper_l")
+fun libcTowupper(c: int, locale: int): int {
+    val x = c & 4294967295
+    if (x >= 97 && x <= 122) x - 32 else x
+}
+
+// Locale objects: one opaque handle (the C locale); the global locale is -1.
+var libcCurrentLocale: int = -1
+
+@export("__newlocale")
+fun libcNewlocale(mask: int, name: int, base: int): int = if (base != 0) base else 1
+
+@export("__duplocale")
+fun libcDuplocale(locale: int): int = if (locale == -1) 1 else locale
+
+@export("__freelocale")
+fun libcFreelocale(locale: int): void {
+    return
+}
+
+@export("__uselocale")
+fun libcUselocale(locale: int): int {
+    val previous = libcCurrentLocale
+    if (locale != 0) libcCurrentLocale = locale
+    previous
+}
+
+var libcEmptyString: int = 0
+
+@export("__nl_langinfo_l")
+trusted fun libcNlLanginfo(item: int, locale: int): int {
+    if (libcEmptyString == 0) libcEmptyString = __ablaRuntimeHostHeapAllocate(16, true)
+    libcEmptyString
+}
+
+@export("__strcoll_l")
+trusted fun libcStrcollL(left: int, right: int, locale: int): int = libcStrcmp(left, right)
+
+@export("__strxfrm_l")
+trusted fun libcStrxfrmL(destination: int, source: int, count: int, locale: int): int {
+    val length = libcStrlen(source)
+    var at = 0
+    while (at < count && at <= length) {
+        ablaRuntimeStoreU8(destination + at, ablaRuntimeLoadU8(source + at))
+        at = at + 1
+    }
+    length
+}
+
+@export("__wcscoll_l")
+trusted fun libcWcscollL(left: int, right: int, locale: int): int = libcWcscmp(left, right)
+
+@export("__wcsxfrm_l")
+trusted fun libcWcsxfrmL(destination: int, source: int, count: int, locale: int): int {
+    val length = libcWcslen(source)
+    var at = 0
+    while (at < count && at <= length) {
+        ablaRuntimeStoreI32(destination + at * 4, ablaRuntimeLoadI32(source + at * 4))
+        at = at + 1
+    }
+    length
+}
+
+// No message catalogues: the message id is the translation.
+@export("gettext")
+fun libcGettext(message: int): int = message
+
+@export("dgettext")
+fun libcDgettext(domain: int, message: int): int = message
+
+@export("bind_textdomain_codeset")
+fun libcBindTextdomainCodeset(domain: int, codeset: int): int = 0
+
+// The password database is not read: no entry is found (result NULL, success).
+@export("getpwnam_r")
+trusted fun libcGetpwnamR(name: int, entry: int, buffer: int, size: int, result: int): int {
+    ablaRuntimeStoreI64(result, 0)
+    0
+}
+
+@export("getpwuid_r")
+trusted fun libcGetpwuidR(user: int, entry: int, buffer: int, size: int, result: int): int {
+    ablaRuntimeStoreI64(result, 0)
+    0
+}

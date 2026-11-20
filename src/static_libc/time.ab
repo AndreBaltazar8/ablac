@@ -1,0 +1,205 @@
+// Time and number text of the statically linked compiler's C library (#806 step C, step 3): the local time zone is UTC (localtime_r is gmtime),
+// strftime knows the common conversions of the C locale, and strtod reads the C grammar's decimal and inf/nan forms through the standard
+// library's own exact float parser. execve and execv are the system call.
+import "abla/runtime/scalar"
+import "abla/sys/linux"
+import "abla/sys/linux/process"
+import "abla/float"
+import "abla/float/text"
+import "abla/bytes"
+import "./errno.ab"
+import "./fs.ab"
+
+// struct tm (glibc, 56 bytes): sec min hour mday mon year wday yday isdst (ints), gmtoff (long), zone (char*).
+@export("localtime_r")
+trusted fun libcLocaltimeR(timer: int, result: int): int {
+    val seconds = ablaRuntimeLoadI64(timer)
+    var days = seconds / 86400
+    var rest = seconds - days * 86400
+    if (rest < 0) {
+        rest = rest + 86400
+        days = days - 1
+    }
+    // Civil from days (Howard Hinnant): shift the epoch to 0000-03-01.
+    val shifted = days + 719468
+    val era = (if (shifted >= 0) shifted else shifted - 146096) / 146097
+    val dayOfEra = shifted - era * 146097
+    val yearOfEra = (dayOfEra - dayOfEra / 1460 + dayOfEra / 36524 - dayOfEra / 146096) / 365
+    val dayOfYear = dayOfEra - (365 * yearOfEra + yearOfEra / 4 - yearOfEra / 100)
+    val monthIndex = (5 * dayOfYear + 2) / 153
+    val day = dayOfYear - (153 * monthIndex + 2) / 5 + 1
+    val month = if (monthIndex < 10) monthIndex + 3 else monthIndex - 9
+    val year = yearOfEra + era * 400 + (if (month <= 2) 1 else 0)
+    val leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+    // Day of the year, January 1st being 0.
+    val before = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+    val yearDay = before[month - 1] + day - 1 + (if (leap && month > 2) 1 else 0)
+    var weekday = (days + 4) % 7
+    if (weekday < 0) weekday = weekday + 7
+    ablaRuntimeStoreI32(result, rest % 60)
+    ablaRuntimeStoreI32(result + 4, (rest / 60) % 60)
+    ablaRuntimeStoreI32(result + 8, rest / 3600)
+    ablaRuntimeStoreI32(result + 12, day)
+    ablaRuntimeStoreI32(result + 16, month - 1)
+    ablaRuntimeStoreI32(result + 20, year - 1900)
+    ablaRuntimeStoreI32(result + 24, weekday)
+    ablaRuntimeStoreI32(result + 28, yearDay)
+    ablaRuntimeStoreI32(result + 32, 0)
+    ablaRuntimeStoreI64(result + 40, 0)
+    ablaRuntimeStoreI64(result + 48, 0)
+    result
+}
+
+trusted fun libcPad(value: int, width: int, fill: string): string {
+    var text = "${value}"
+    while (text.size < width) text = fill + text
+    text
+}
+
+// strftime: %Y %m %d %e %H %M %S %y %j %a %A %b %B %p %Z %z %F %T %D %% (anything else is copied through its percent sign).
+trusted fun libcFormatTime(format: int, tm: int): string {
+    val days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+    val months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+    val second = ablaRuntimeLoadI32(tm)
+    val minute = ablaRuntimeLoadI32(tm + 4)
+    val hour = ablaRuntimeLoadI32(tm + 8)
+    val day = ablaRuntimeLoadI32(tm + 12)
+    val month = ablaRuntimeLoadI32(tm + 16)
+    val year = ablaRuntimeLoadI32(tm + 20) + 1900
+    val weekday = ablaRuntimeLoadI32(tm + 24)
+    val yearDay = ablaRuntimeLoadI32(tm + 28)
+    var output = ""
+    var at = 0
+    while (ablaRuntimeLoadU8(format + at) != 0) {
+        val c = ablaRuntimeLoadU8(format + at)
+        if (c != 37) {
+            output = output + libcChar(c)
+            at = at + 1
+        } else {
+            val code = ablaRuntimeLoadU8(format + at + 1)
+            at = at + 2
+            if (code == 89) output = output + "${year}"
+            else if (code == 121) output = output + libcPad(year % 100, 2, "0")
+            else if (code == 109) output = output + libcPad(month + 1, 2, "0")
+            else if (code == 100) output = output + libcPad(day, 2, "0")
+            else if (code == 101) output = output + libcPad(day, 2, " ")
+            else if (code == 72) output = output + libcPad(hour, 2, "0")
+            else if (code == 77) output = output + libcPad(minute, 2, "0")
+            else if (code == 83) output = output + libcPad(second, 2, "0")
+            else if (code == 106) output = output + libcPad(yearDay + 1, 3, "0")
+            else if (code == 97) output = output + days[weekday % 7].slice(0, 3)
+            else if (code == 65) output = output + days[weekday % 7]
+            else if (code == 98 || code == 104) output = output + months[month % 12].slice(0, 3)
+            else if (code == 66) output = output + months[month % 12]
+            else if (code == 112) output = output + (if (hour < 12) "AM" else "PM")
+            else if (code == 90) output = output + "UTC"
+            else if (code == 122) output = output + "+0000"
+            else if (code == 70) output = output + "${year}-" + libcPad(month + 1, 2, "0") + "-" + libcPad(day, 2, "0")
+            else if (code == 84) output = output + libcPad(hour, 2, "0") + ":" + libcPad(minute, 2, "0") + ":" + libcPad(second, 2, "0")
+            else if (code == 68) output = output + libcPad(month + 1, 2, "0") + "/" + libcPad(day, 2, "0") + "/" + libcPad(year % 100, 2, "0")
+            else if (code == 37) output = output + "%"
+            else output = output + "%" + libcChar(code)
+        }
+    }
+    output
+}
+
+trusted fun libcChar(byte: int): string = byteEncode(byte)
+
+trusted fun libcStrftimeInto(buffer: int, size: int, format: int, tm: int): int {
+    val text = libcFormatTime(format, tm)
+    if (text.size + 1 > size) return 0
+    var at = 0
+    while (at < text.size) {
+        ablaRuntimeStoreU8(buffer + at, text[at])
+        at = at + 1
+    }
+    ablaRuntimeStoreU8(buffer + at, 0)
+    text.size
+}
+
+@export("strftime")
+trusted fun libcStrftime(buffer: int, size: int, format: int, tm: int): int = libcStrftimeInto(buffer, size, format, tm)
+
+@export("__strftime_l")
+trusted fun libcStrftimeL(buffer: int, size: int, format: int, tm: int, locale: int): int = libcStrftimeInto(buffer, size, format, tm)
+
+// strtod: the longest prefix of [space] [sign] (digits [. digits] | . digits) [e [sign] digits], or inf / infinity / nan.
+trusted fun libcStrtodAt(text: int, end: int): f64 {
+    var at = 0
+    while (ablaRuntimeLoadU8(text + at) == 32 || (ablaRuntimeLoadU8(text + at) >= 9 && ablaRuntimeLoadU8(text + at) <= 13)) at = at + 1
+    val start = at
+    var negative = false
+    if (ablaRuntimeLoadU8(text + at) == 45 || ablaRuntimeLoadU8(text + at) == 43) {
+        negative = ablaRuntimeLoadU8(text + at) == 45
+        at = at + 1
+    }
+    val first = ablaRuntimeLoadU8(text + at) | 32
+    if (first == 105 || first == 110) {
+        // inf, infinity, nan: letters compared without case.
+        val infinity = "infinity"
+        var matched = 0
+        while (matched < 8 && (ablaRuntimeLoadU8(text + at + matched) | 32) == infinity[matched]) matched = matched + 1
+        if (matched >= 3 && first == 105) {
+            if (end != 0) ablaRuntimeStoreI64(end, text + at + (if (matched == 8) 8 else 3))
+            return if (negative) -1.0 / 0.0 else 1.0 / 0.0
+        }
+        if (first == 110 && (ablaRuntimeLoadU8(text + at + 1) | 32) == 97 && (ablaRuntimeLoadU8(text + at + 2) | 32) == 110) {
+            if (end != 0) ablaRuntimeStoreI64(end, text + at + 3)
+            return 0.0 / 0.0
+        }
+    }
+    var digits = 0
+    while (ablaRuntimeLoadU8(text + at) >= 48 && ablaRuntimeLoadU8(text + at) <= 57) {
+        at = at + 1
+        digits = digits + 1
+    }
+    if (ablaRuntimeLoadU8(text + at) == 46) {
+        at = at + 1
+        while (ablaRuntimeLoadU8(text + at) >= 48 && ablaRuntimeLoadU8(text + at) <= 57) {
+            at = at + 1
+            digits = digits + 1
+        }
+    }
+    if (digits == 0) {
+        if (end != 0) ablaRuntimeStoreI64(end, text)
+        return 0.0
+    }
+    if ((ablaRuntimeLoadU8(text + at) | 32) == 101) {
+        var probe = at + 1
+        if (ablaRuntimeLoadU8(text + probe) == 45 || ablaRuntimeLoadU8(text + probe) == 43) probe = probe + 1
+        if (ablaRuntimeLoadU8(text + probe) >= 48 && ablaRuntimeLoadU8(text + probe) <= 57) {
+            while (ablaRuntimeLoadU8(text + probe) >= 48 && ablaRuntimeLoadU8(text + probe) <= 57) probe = probe + 1
+            at = probe
+        }
+    }
+    var literal = ""
+    var index = start
+    while (index < at) {
+        literal = literal + libcChar(ablaRuntimeLoadU8(text + index))
+        index = index + 1
+    }
+    if (end != 0) ablaRuntimeStoreI64(end, text + at)
+    f64Parse(literal)
+}
+
+@export("strtod")
+trusted fun libcStrtod(text: int, end: int): f64 = libcStrtodAt(text, end)
+
+@export("__strtod_l")
+trusted fun libcStrtodL(text: int, end: int, locale: int): f64 = libcStrtodAt(text, end)
+
+// A long double is not used: the value comes back as a double in xmm0 (the compiler's callers never read x87).
+@export("strtold_l")
+trusted fun libcStrtoldL(text: int, end: int, locale: int): f64 = libcStrtodAt(text, end)
+
+@export("__strtof_l")
+trusted fun libcStrtofL(text: int, end: int, locale: int): f32 = ablaConvertF64ToF32(libcStrtodAt(text, end))
+
+// execve and execv: the system call (execv takes the process's environment).
+@export("execve")
+trusted fun libcExecve(path: int, argv: int, envp: int): int = libcResult(linuxSyscall3(59, path, argv, envp))
+
+@export("execv")
+trusted fun libcExecv(path: int, argv: int): int =
+    libcResult(linuxSyscall3(59, path, argv, ablaRuntimePointerAddress(linuxEnvironmentPointer())))
