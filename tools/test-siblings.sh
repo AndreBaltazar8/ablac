@@ -21,7 +21,10 @@
 # the baseline builds and the candidate does not is a regression; its first errors are kept.
 # Tests: the repository's command from siblings.txt, run in its worktree (each in turn), its exit status kept.
 #
-# DIR/summary.txt has one line a repository: programs built / total, regressions, the test status and log. Exit 1 when
+# Unused imports: the candidate's W_UNUSED_IMPORT warnings from both layers (a test file is a root of its own, which
+# `fix-imports --project` never reaches), each warning once, in DIR/unused.txt; files under a build/ directory (generated
+# by a test) are left out.
+# DIR/summary.txt has one line a repository: programs built / total, regressions, unused imports, the test status and log. Exit 1 when
 # a program regressed or a test failed, 0 otherwise. Heavy: run it in a slot (tools/fair-flock), never on every push.
 # The layout's worktrees are removed at the end unless --keep.
 set -euo pipefail
@@ -125,6 +128,7 @@ chmod +x "$out/bin/ablac"
 # Programs.
 programs_file=$out/programs.txt
 : > "$programs_file"
+: > "$out/unused-raw.txt"
 if ((programs)); then
     for name in "${repos[@]}"; do
         (cd "$layout/$name" && grep -rlE --include='*.ab' '^((trusted|inline) )*fun main\b' . 2>/dev/null |
@@ -140,6 +144,7 @@ if ((programs)); then
         local cand=0
         (cd "$layout/$name" && ABLA_MAX_MEMORY_MB=$memory ABLA_SYSROOT=$candidate timeout 600 "$candidate/build/ablac" build "$file" -o "$work/cand" --fast --no-cache) > "$work/cand.log" 2>&1 || cand=$?
         echo "$name $file base=$base cand=$cand"
+        grep -a 'W_UNUSED_IMPORT' "$work/cand.log" | sed "s#^#$name #" >> "$out/unused-raw.txt" || true
         if [[ $cand != 0 && ( $base == 0 || $base == - ) ]]; then
             { echo "### $name $file (base=$base cand=$cand)"; grep -a -m3 -E 'error\[|error:' "$work/cand.log" | cut -c1-240; } > "$work/regression"
             cat "$work/regression" >> "$out/regressions.txt"
@@ -168,13 +173,22 @@ if ((tests)); then
         status=0
         (cd "$layout/$name" && PATH="$out/bin:$PATH" ABLA_DEBUG=0 timeout 2400 bash -c "$command") > "$log" 2>&1 || status=$?
         echo "$name $status" >> "$out/tests.txt"
+        grep -a 'W_UNUSED_IMPORT' "$log" | sed "s#^#$name #" >> "$out/unused-raw.txt" || true
     done
 fi
+
+# Unused imports, once each: "<repository> <file>: <message>", the file relative to the repository.
+while read -r name warning; do
+    warning=${warning#*W_UNUSED_IMPORT]: }
+    warning=${warning#"$layout/$name/"}
+    [[ $warning == build/* || $warning == */build/* ]] && continue
+    echo "$name $warning"
+done < "$out/unused-raw.txt" | sort -u > "$out/unused.txt"
 
 # The summary.
 failed=0
 {
-    printf '%-18s %-14s %-11s %s\n' repository programs regressions tests
+    printf '%-18s %-14s %-11s %-7s %s\n' repository programs regressions unused tests
     for name in "${repos[@]}"; do
         total=$(grep -c "^$name " "$out/programs-result.txt" 2>/dev/null || true)
         built=$(grep "^$name " "$out/programs-result.txt" 2>/dev/null | grep -c ' cand=0$' || true)
@@ -184,7 +198,8 @@ failed=0
         [[ $test_text == 0 ]] && test_text="pass"
         [[ $test_text != pass && $test_text != - ]] && test_text="FAIL ($status, test-$name.log)"
         [[ ${regressed:-0} != 0 || $test_text == FAIL* ]] && failed=1
-        printf '%-18s %-14s %-11s %s\n' "$name" "${built:-0}/${total:-0}" "${regressed:-0}" "$test_text"
+        unused=$(grep -c "^$name " "$out/unused.txt" || true)
+        printf '%-18s %-14s %-11s %-7s %s\n' "$name" "${built:-0}/${total:-0}" "${regressed:-0}" "${unused:-0}" "$test_text"
     done
 } > "$out/summary.txt"
 cat "$out/summary.txt"
