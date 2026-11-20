@@ -135,8 +135,8 @@ Next, in order: (1) NovaKind's signer onto `abla/tls/pure` (branch `tls-pure-822
 `tools/test-libc-free-programs.sh` builds every `tests/cases/modules/*.ab` `--fast` for x86-64 and AArch64 Linux and fails
 on a program that links libc, or stops building, outside `tools/libc-free-programs-allowlist.txt` (a list that only
 shrinks; 17 x86-64 programs link libc: the compiler's own modules, OpenSSL, a user `extern:"c"`), so a regression in
-a stdlib area the 11 programs miss (sockets, processes, signals, stm) shows. The suite runs its x86-64 half; CI the
-whole (22 CPU-minutes, 4 on 8 cores); (3, done) the compiler's own `abla/platform/host/tls`
+a stdlib area the 11 programs miss (sockets, processes, signals, stm) shows. The suite runs its x86-64 half; CI the AArch64 half
+(the whole is 22 CPU-minutes, 4 on 8 cores, and took 25 on a CI runner); (3, done) the compiler's own `abla/platform/host/tls`
 through `abla/tls/pure`, which takes libssl and libcrypto out of the compiler's 36 imports (step C, André's, listed
 for completeness).
 

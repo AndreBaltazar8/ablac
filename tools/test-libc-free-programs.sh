@@ -7,8 +7,8 @@
 #   nobuild-a64 <program>  builds for x86-64 but not for AArch64 Linux (libLLVM and OpenSSL have no AArch64 build here)
 # A line whose program is now static and building fails the test, so the line gets removed; a new libc link or a new build
 # failure fails it too.
-# LIBC_FREE_TARGETS="x86" builds the x86-64 half only (the suite does: the whole is 22 CPU-minutes, 4 minutes on 8 cores, and
-# CI runs it all); the default is "x86 a64".
+# LIBC_FREE_TARGETS="x86" builds the x86-64 half only (the suite does), "a64" the AArch64 half only (CI does: the whole is 22
+# CPU-minutes, 4 minutes on 8 cores, and took 25 on a CI runner); the default is "x86 a64".
 # Usage: tools/test-libc-free-programs.sh [compiler]
 set -euo pipefail
 export LC_ALL=C
@@ -19,7 +19,8 @@ root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
 [[ $(uname -s) == Linux ]] || { echo 'libc free programs: Linux only'; exit 0; }
 targets=${LIBC_FREE_TARGETS:-x86 a64}
-[[ $targets == x86 || $targets == 'x86 a64' ]] || { echo "libc free programs: LIBC_FREE_TARGETS must be x86 or 'x86 a64'" >&2; exit 2; }
+[[ $targets == x86 || $targets == a64 || $targets == 'x86 a64' ]] ||
+    { echo "libc free programs: LIBC_FREE_TARGETS must be x86, a64 or 'x86 a64'" >&2; exit 2; }
 allow=tools/libc-free-programs-allowlist.txt
 [[ -f $allow ]] || { echo "libc free programs: missing $allow" >&2; exit 1; }
 sort -cu "$allow" || { echo "libc free programs: $allow must be sorted and unique" >&2; exit 1; }
@@ -44,25 +45,42 @@ build_one() { # source target -> a line in $out/<name>.<target>.result
 }
 export -f build_one
 export compiler out
+# The programs known not to build for x86-64 (the negative cases and the ones needing a manifest) fail for AArch64 too: the AArch64
+# half alone does not build them again (a third of the programs, and the slowest to fail).
+printf '%s\n' tests/cases/modules/*.ab > "$out/programs.txt"
+{ sed -n 's/^nobuild \(.*\)$/tests\/cases\/modules\/\1.ab/p' "$allow" || true; } | sort > "$out/skip.txt"
 for target in $targets; do
-    printf '%s\n' tests/cases/modules/*.ab | xargs -P "$workers" -I{} bash -c 'build_one {} '"$target"
+    if [[ $target == a64 && $targets == a64 ]]; then
+        grep -vxF -f "$out/skip.txt" "$out/programs.txt" > "$out/programs-a64.txt" || true
+        xargs -P "$workers" -I{} bash -c 'build_one {} a64' < "$out/programs-a64.txt"
+    else
+        xargs -P "$workers" -I{} bash -c 'build_one {} '"$target" < "$out/programs.txt"
+    fi
 done
 cat "$out"/*.result | sort > "$out/results.txt"
 # What happened, as allowlist lines.
 awk '$2 == "x86" && $3 == "libc" { print $1, "x86" }
      $2 == "x86" && $3 == "nobuild" { print "nobuild", $1 }
-     $2 == "x86" { built[$1] = 1 }
      $2 == "a64" && $3 == "nobuild" { failed[$1] = 1 }
      END { for (name in failed) print "nobuild-a64", name }' "$out/results.txt" | sort -u > "$out/actual.txt"
 # An x86-64 build that failed too is not a failure of the AArch64 build only.
-awk '$2 == "x86" && $3 == "nobuild" { bad[$1] = 1 } END { for (name in bad) print name }' "$out/results.txt" | sort > "$out/x86-failed.txt"
+if [[ $targets == a64 ]]; then
+    { sed -n 's/^nobuild \(.*\)$/\1/p' "$allow" || true; } | sort > "$out/x86-failed.txt"
+else
+    awk '$2 == "x86" && $3 == "nobuild" { bad[$1] = 1 } END { for (name in bad) print name }' "$out/results.txt" | sort > "$out/x86-failed.txt"
+fi
 grep -v '^nobuild-a64 ' "$out/actual.txt" > "$out/actual-x86.txt" || true
 { grep '^nobuild-a64 ' "$out/actual.txt" || true; } | while read -r _ name; do
     grep -qx "$name" "$out/x86-failed.txt" || echo "nobuild-a64 $name"
 done | sort > "$out/actual-a64.txt"
 cat "$out/actual-x86.txt" "$out/actual-a64.txt" | sort -u > "$out/actual.txt"
+# The allowlist lines of the targets built.
 expected=$out/expected.txt
-if [[ $targets == x86 ]]; then { grep -v '^nobuild-a64 ' "$allow" || true; } > "$expected"; else cp "$allow" "$expected"; fi
+case $targets in
+    x86) { grep -v '^nobuild-a64 ' "$allow" || true; } > "$expected" ;;
+    a64) { grep '^nobuild-a64 ' "$allow" || true; } > "$expected" ;;
+    *) cp "$allow" "$expected" ;;
+esac
 new=$(comm -13 "$expected" "$out/actual.txt" || true)
 gone=$(comm -23 "$expected" "$out/actual.txt" || true)
 if [[ -n $new ]]; then echo "libc free programs: not on $allow, but linking libc or not building:" >&2; echo "$new" >&2; fi
