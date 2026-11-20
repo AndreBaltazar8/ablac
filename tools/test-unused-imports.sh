@@ -39,6 +39,17 @@ grep -qxF 'warning[W_UNUSED_IMPORT]: lib.ab: `import "abla/json"` is neither use
 (cd "$work/compiled" && "$compiler" build main.ab -o program --fast --warn-unused-imports) > "$work/compiled.log" 2>&1 ||
     fail "compiled/main.ab didn't build" "$work/compiled.log"
 ! grep -q W_UNUSED_IMPORT "$work/compiled.log" || fail "a warning in a module that runs compile code" "$work/compiled.log"
+
+# A package's vendored copy (.abla/packages/, gitignored, so the case keeps it as abla-packages/) is the package's.
+mkdir -p "$work/vendored/.abla"
+mv "$work/vendored/abla-packages" "$work/vendored/.abla/packages"
+(cd "$work/vendored" && "$compiler" build main.ab -o program --fast --warn-unused-imports) > "$work/vendored.log" 2>&1 ||
+    fail "vendored/main.ab didn't build" "$work/vendored.log"
+! grep -q W_UNUSED_IMPORT "$work/vendored.log" || fail "a warning in a vendored package" "$work/vendored.log"
+(cd "$work/vendored" && "$compiler" fix-imports main.ab --prune) > "$work/vendored-prune.log" 2>&1 ||
+    fail "vendored prune failed" "$work/vendored-prune.log"
+grep -qxF 'import "abla/json"' "$work/vendored/.abla/packages/fake/entry.ab" ||
+    fail "the prune changed a vendored package" "$work/vendored/.abla/packages/fake/entry.ab"
 # The prune.
 (cd "$work" && "$compiler" fix-imports main.ab --prune) > "$work/prune.log" 2>&1 || fail "prune failed" "$work/prune.log"
 grep -qxF 'fix-imports: removed 2 unused import(s) in 1 file(s); 0 restored, 0 left' "$work/prune.log" ||
