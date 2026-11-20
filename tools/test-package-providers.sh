@@ -164,9 +164,9 @@ vendored_status=$?
 set -e
 [[ $vendored_status -eq 41 ]] || exit 1
 
-# A single-file build (no --project: nothing is prepared) resolves the provider
-# imports, transitive ones included, from the checked-in vendor tree that
-# abla.lock locks, with no cache and no materialized copy.
+# A single-file build resolves the provider imports, transitive ones included,
+# from the checked-in vendor tree that abla.lock locks, with no cache and no
+# materialized copy (it installs only a locked package that isn't vendored).
 rm -rf -- "$cache" "$application/.abla"
 ABLA_PACKAGE_CACHE="$cache" "$compiler" build "$application/src/main.ab" \
     -o "$test_root/single-file" --fast --no-cache
@@ -195,18 +195,25 @@ set -e
 [[ $stale_status -eq 41 ]] || exit 1
 rm -rf -- "$application/.abla"
 
-# A vendor tree whose markers disagree with the lock is not used.
+# A vendor tree whose markers disagree with the lock is not used: the build installs the locked revision under
+# .abla instead (decision #85), and offline with nothing cached it is refused.
 cp "$application/vendor/provider-dep/.abla-revision" "$test_root/revision"
 printf '%s' "$first_revision" \
     > "$application/vendor/provider-dep/.abla-revision"
-set +e
-mismatch_output=$(ABLA_PACKAGE_CACHE="$cache" "$compiler" build \
+ABLA_PACKAGE_CACHE="$cache" "$compiler" build \
     "$application/src/main.ab" -o "$test_root/single-file-mismatch" \
-    --fast --no-cache 2>&1)
+    --fast --no-cache
+[[ $(cat "$application/.abla/packages/provider-dep/revision") == "$second_revision" ]] || exit 1
+rm -rf -- "$application/.abla"
+set +e
+mismatch_output=$(ABLA_PACKAGE_CACHE="$test_root/empty-cache" "$compiler" build \
+    "$application/src/main.ab" -o "$test_root/single-file-mismatch" \
+    --fast --no-cache --offline 2>&1)
 mismatch_status=$?
 set -e
 [[ $mismatch_status -ne 0 ]] || exit 1
-[[ $mismatch_output == *'E_PACKAGE_IMPORT'* ]] || exit 1
+[[ $mismatch_output == *'E_PACKAGE_OFFLINE_MISS'* ]] || exit 1
+rm -rf -- "$application/.abla"
 cp "$test_root/revision" "$application/vendor/provider-dep/.abla-revision"
 
 github_application="$test_root/github-application"

@@ -318,6 +318,21 @@ fun bootstrapStrictImportsOption(value: string): bool {
     true
 }
 
+/**
+ * The locked packages of the project `source` belongs to (the nearest abla.toml up from it, with an abla.lock beside
+ * it), installed at their locked revisions (package.ab: bootstrapPackageInstallLocked): what `build --project` does
+ * through its prepare, for a single-file build, run or test. Prints the diagnostic and returns false on failure.
+ */
+fun bootstrapOrcInstallLockedFor(source: string, offline: bool): bool {
+    val manifest = bootstrapCompileManifestFor(source)
+    if (manifest == "") return true
+    var root = Path(manifest).parent().text
+    if (root == "") root = "."
+    val installed = bootstrapPackageInstallLocked(root, offline)
+    if (installed.status != 0) linuxPrintStandardError(installed.diagnostic)
+    installed.status == 0
+}
+
 fun bootstrapOrcTest(argumentCount: int): int {
     val arguments: array<string> = []
     var useCache = true
@@ -347,6 +362,14 @@ fun bootstrapOrcTest(argumentCount: int): int {
     }
     val sources = bootstrapTestSources(arguments)
     if (sources.size == 0) return 2
+    // Their projects' locked packages, once per project.
+    val installedRoots: Map<string, bool> = Map()
+    for (source in sources) {
+        val manifest = bootstrapCompileManifestFor(source)
+        if (manifest == "" || installedRoots.has(manifest)) continue
+        installedRoots.set(manifest, true)
+        if (!bootstrapOrcInstallLockedFor(source, false)) return 1
+    }
     // --watch: the same run, again after each change to a file the tests read (test_watch.ab).
     if (watch) return bootstrapTestWatch(forwarded, sources)
     val target = bootstrapTargetDescriptor(bootstrapHostTargetName())
@@ -1095,7 +1118,7 @@ fun bootstrapRepl(): int {
 
 fun bootstrapOrcUsage(): int {
     linuxPrintStandardError(
-        "usage: ablac build [<file.ab> | --project <dir>] [-o output] [--emit executable|object|static-library|shared-library] [--fast | --o1] [-g | --debug | --no-debug] [--no-cache] [--sidecar | --no-sidecar] [--offline] [--strict-imports | --flat-imports | --strict-imports=warn] [--visibility-report <file>] [--warn-unused-imports | --no-warn-unused-imports] [--target <name> | --target-triple <triple> --object-format <elf|macho|coff|wasm>]\n       targets: ${bootstrapSupportedTargets()}\n       --flat-imports sets only packages that do not say visibility: one with visibility = \"imports\" in its abla.toml stays strict\n       ablac package update [--project <dir>]\n       ablac package vendor [--project <dir>] [--offline]\n       ablac test <file.ab>... [--fast] [--no-cache] [--watch] [--strict-imports | --flat-imports | --strict-imports=warn] # build (--o1) and run test programs (abla/test)\n       ablac run [--o1 | --fast] [--built | --release] [--live | --no-live | --watch] [--strict-imports | --flat-imports | --strict-imports=warn] [<file.ab> | --project <dir>] [--offline] [-- <program arguments>] # in-process LLVM ORC (--built: cached build, exec'd; live, its functions redefinable while it runs, by default on x86-64 Linux and macOS: --no-live opts out, --live asks elsewhere; --watch: live, reloaded when a source file changes)\n       ablac repl                                # persistent definitions + expressions\n       ablac serve [<file.ab> | --project <dir>] # watched fast-build service\n       ablac fix-imports [<file.ab> | --project <dir>] [--prune] [--dry-run] # add the imports the program is missing (project modules and the standard library); --prune removes the unused ones\n       ablac fmt [--check] [--width 100] <file.ab|directory|->...\n       ablac analyze --stdio                     # persistent JSON-lines analysis service\n       ablac --emit-llvm <file.ab>\n"
+        "usage: ablac build [<file.ab> | --project <dir>] [-o output] [--emit executable|object|static-library|shared-library] [--fast | --o1] [-g | --debug | --no-debug] [--no-cache] [--sidecar | --no-sidecar] [--offline] [--strict-imports | --flat-imports | --strict-imports=warn] [--visibility-report <file>] [--warn-unused-imports | --no-warn-unused-imports] [--target <name> | --target-triple <triple> --object-format <elf|macho|coff|wasm>]\n       targets: ${bootstrapSupportedTargets()}\n       --flat-imports sets only packages that do not say visibility: one with visibility = \"imports\" in its abla.toml stays strict\n       ablac package update [--project <dir>]\n       ablac package vendor [--project <dir>] [--offline]\n       ablac package install [--project <dir>] [--offline] # the lock's packages at their locked revisions (build, run and test do this themselves)\n       ablac test <file.ab>... [--fast] [--no-cache] [--watch] [--strict-imports | --flat-imports | --strict-imports=warn] # build (--o1) and run test programs (abla/test)\n       ablac run [--o1 | --fast] [--built | --release] [--live | --no-live | --watch] [--strict-imports | --flat-imports | --strict-imports=warn] [<file.ab> | --project <dir>] [--offline] [-- <program arguments>] # in-process LLVM ORC (--built: cached build, exec'd; live, its functions redefinable while it runs, by default on x86-64 Linux and macOS: --no-live opts out, --live asks elsewhere; --watch: live, reloaded when a source file changes)\n       ablac repl                                # persistent definitions + expressions\n       ablac serve [<file.ab> | --project <dir>] # watched fast-build service\n       ablac fix-imports [<file.ab> | --project <dir>] [--prune] [--dry-run] # add the imports the program is missing (project modules and the standard library); --prune removes the unused ones\n       ablac fmt [--check] [--width 100] <file.ab|directory|->...\n       ablac analyze --stdio                     # persistent JSON-lines analysis service\n       ablac --emit-llvm <file.ab>\n"
     )
     2
 }
@@ -1198,14 +1221,14 @@ fun main: int {
         val operation = argument1
         var projectRoot = "."
         var offline = false
-        var valid = operation == "update" || operation == "vendor"
+        var valid = operation == "update" || operation == "vendor" || operation == "install"
         var option = 2
         while (option < argumentCount) {
             val value = linuxArgument(option)
             if (value == "--project" && option + 1 < argumentCount) {
                 projectRoot = linuxArgument(option + 1)
                 option = option + 1
-            } else if (value == "--offline" && operation == "vendor") {
+            } else if (value == "--offline" && (operation == "vendor" || operation == "install")) {
                 offline = true
                 0
             } else {
@@ -1217,6 +1240,13 @@ fun main: int {
         val project = bootstrapProjectDescriptor(projectRoot)
         if (!project.valid) {
             linuxPrintStandardError("${project.diagnostic}\n")
+            valid = false
+        }
+        if (valid && operation == "install") {
+            // The lock's packages at their locked revisions, as a build would install them (never re-resolved).
+            val installed = bootstrapPackageInstallLocked(projectRoot, offline)
+            if (installed.diagnostic != "") linuxPrintStandardError(installed.diagnostic)
+            status = installed.status
             valid = false
         }
         if (valid) {
@@ -1399,6 +1429,8 @@ fun main: int {
                 linuxPrintStandardError("${project.diagnostic}\n")
                 valid = false
             }
+        } else if (valid && projectRoot == "" && !bootstrapOrcInstallLockedFor(sourcePath, offline)) {
+            valid = false
         }
         val rawTarget = targetTriple != "" || targetObjectFormat != ""
         if (artifact == "default") {
@@ -1532,6 +1564,9 @@ fun main: int {
         if (runValid && !bootstrapSourceFound(runSource)) {
             runValid = false
             status = 1
+        }
+        if (runValid && runProject == "" && runSource != "" && !bootstrapOrcInstallLockedFor(runSource, runOffline)) {
+            runValid = false
         }
         if (runValid && runProject != "") {
             val imported = bootstrapDiscoverImportProviders(runSource)

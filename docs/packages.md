@@ -265,7 +265,12 @@ Lock format version 2 records the provider kind, stable identity, selector,
 immutable revision, content-tree digest, and package entry. Git records also
 include their URL and selector kind. Builds never update the lock. Changing a
 branch, remote HEAD, generator, or registry response has no effect until the
-next explicit update.
+next explicit update. Commit `abla.lock`: a build installs what it locks.
+`build`, `run` and `test`, for a project or a single file under one, put each
+locked package under `.abla/packages/<package>` at its locked revision when it
+isn't there (fetched into the cache if needed, never re-resolved), so a fresh
+checkout builds what its lock says. `ablac package install [--project .]
+[--offline]` does the same on its own, for CI.
 
 Resolved content uses `$ABLA_PACKAGE_CACHE` when set, then
 `$XDG_CACHE_HOME/abla`, then `$HOME/.cache/abla`. Git fetches are shallow and
@@ -295,8 +300,10 @@ ablac package vendor --project .
 This publishes `vendor/<package>` with revision/digest markers. Offline builds
 prefer a matching vendor tree when the external cache is unavailable.
 
-A single-file build (`ablac build path/to/program.ab`, no `--project`) prepares
-nothing; it resolves each provider import from the importer's directory upward.
+A single-file build (`ablac build path/to/program.ab`, no `--project`) installs
+the locked packages of the project it is under (the nearest `abla.toml` with an
+`abla.lock` beside it), except one vendored at its locked revision; then it
+resolves each provider import from the importer's directory upward.
 At each directory it uses the prepared copy under `.abla/packages/<package>`,
 unless that directory's `abla.lock` locks the package at another revision (a
 stale copy left behind after the lock moved), and otherwise, where `abla.lock`
