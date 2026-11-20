@@ -41,7 +41,7 @@ grep -q 'W_UNUSED_IMPORT.*"abla/json"' "$work/plain.log" || fail "no warning by 
 cache="$work/cache"
 (cd "$work" && ABLA_CACHE_DIR="$cache" "$compiler" build main.ab -o program --fast) > "$work/cold.log" 2>&1 ||
     fail "cold cached build failed" "$work/cold.log"
-marker=$(find "$cache" -name 'native-*.source' 2>/dev/null | head -1)
+marker=$(find "$cache" -name 'native-*.source' -print -quit 2>/dev/null)
 [ -n "$marker" ] && [ -f "${marker%.source}.unused" ] || fail "the cache entry kept no warnings" "$work/cold.log"
 before=$(stat -c %Y "$marker")
 sleep 1
@@ -130,6 +130,11 @@ grep -qxF 'import "abla/text"' "$work/library/lib.ab" || fail "the library prune
 for kept in ./shape.ab ./box.ab ./pair.ab ./point.ab; do
     grep -qxF "import \"$kept\"" "$work/receiver/ext.ab" || fail "the prune removed $kept from ext.ab" "$work/receiver/ext.ab"
 done
+
+# A module with a runtime hook (`fun __abla...`) matters by being loaded.
+(cd "$work/hook" && "$compiler" build main.ab -o program --fast --warn-unused-imports) > "$work/hook.log" 2>&1 ||
+    fail "hook/main.ab didn't build" "$work/hook.log"
+! grep -q W_UNUSED_IMPORT "$work/hook.log" || fail "a warning for an import of a runtime hook's module" "$work/hook.log"
 # The prune.
 (cd "$work" && "$compiler" fix-imports main.ab --prune) > "$work/prune.log" 2>&1 || fail "prune failed" "$work/prune.log"
 grep -qxF 'fix-imports: removed 2 unused import(s) in 1 file(s); 0 restored, 0 left' "$work/prune.log" ||

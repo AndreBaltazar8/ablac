@@ -389,7 +389,7 @@ an extension method or operator it resolves to, the receiver of an extension the
 registers). The warning is for the project's own modules only: not the standard library, a vendored package
 (`.abla/packages/`), another project's module or a checkout linked into the project. It is never given for an aliased,
 exported or contract-only import, an import of a module that does something by being loaded (an `@export` function or
-a top-level `#` action), an import in a module that runs compile code (what it compiles may read the module), or after
+a top-level `#` action, or a runtime hook `fun __abla...` the backend binds by name), an import in a module that runs compile code (what it compiles may read the module), or after
 a front end that stopped at an error (an IR error such as a library's `E_NO_MAIN`, or a failed link, still gets it). A
 package's entry gets a different line instead: the import is neither used nor passed on, `export import` it if the
 package means to offer it. `--no-warn-unused-imports` or `ABLA_WARN_UNUSED_IMPORTS=0` turns it off;
