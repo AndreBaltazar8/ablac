@@ -1099,8 +1099,8 @@ mmap form) apply there.
   building yet; a run notes once past 256 MB (docs/design/live-jit.md). AArch64 Linux: live mode there needs an
   ablac that runs there, an AArch64 Linux compiler release, which is not built (out of scope until one is).
   Done since: a changed signature of a function nothing takes as a value (and not a method) moves to a new entry
-  instead of being refused (docs/design/live-jit.md, "Changed signatures"). Next: a new global with its initializer
-  run at the reload (E_LIVE_GLOBAL today).
+  instead of being refused (docs/design/live-jit.md, "Changed signatures"), and a new variable of the program's own files
+  is initialized once when the reload applies (docs/design/live-jit.md, "New globals").
 
 - [x] **Transactional memory: clocks beyond the region.** A logged transaction runs the single-clock
   protocol on its first region's clock and keeps a snapshot per clock only once it touches a second region

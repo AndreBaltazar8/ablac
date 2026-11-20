@@ -14,12 +14,14 @@ import "backend/llvm/core.ab"
 import "backend/llvm/bindings.ab"
 import "backend/llvm/debug.ab"
 import "backend/llvm/live.ab"
+import "backend/llvm/live_globals.ab"
 import "toolchain.ab"
 import "module_paths.ab"
 import "abla/text"
 import "abla/sys/linux/process"
 import "abla/sys/linux/io"
 import "sema.ab"
+import "ir.ab"
 
 // The running program's session and how it was built, set by bootstrapRunInProcess for a live run.
 var bootstrapLiveSession = LlvmOrcSession(nativeNullPointer(), nativeNullPointer(), 128, true)
@@ -122,7 +124,9 @@ trusted fun bootstrapLiveReload(buffer: int, capacity: int): int {
     val enclosingLive = bootstrapLlvmLiveRun
     bootstrapLlvmLiveRun = true
     bootstrapLlvmLiveGeneration = generation
+    bootstrapIrLiveReload = true
     val prepared = bootstrapPrepareRun(bootstrapLiveSource, true)
+    bootstrapIrLiveReload = false
     bootstrapLlvmLiveRun = enclosingLive
     if (prepared.status != 0 || pointerIsNull(bootstrapLlvmHeldModule)) {
         bootstrapLlvmLiveGeneration = generation - 1
@@ -171,6 +175,17 @@ trusted fun bootstrapLiveReload(buffer: int, capacity: int): int {
         if (bootstrapLiveTracing()) linuxPrintStandardError("live: generation $generation $body at ${bootstrapLiveHex(found.address)}\n")
     }
     bootstrapLiveNoteGrowth()
+    // The new variables' initializers (live_globals.ab), once: before the table is published, so code that reads
+    // one finds it initialized.
+    if (bootstrapLlvmLiveNewGlobalNames.size > 0) {
+        val initializing = bootstrapLiveSession.lookup(bootstrapLlvmLiveGlobalsEntryName(generation))
+        if (initializing.status != 0 || initializing.address == 0) {
+            bootstrapLiveReply(buffer, capacity,
+                "E_LIVE_LINK: the new variables' initializer was not found (status ${initializing.status})")
+            return 2
+        }
+        ablaUnsafeCallVoid0(initializing.address)
+    }
     val table = bootstrapLiveSession.lookup("abla_live_table")
     if (table.status != 0 || table.address == 0) {
         bootstrapLiveReply(buffer, capacity, "E_LIVE_LINK: abla_live_table was not found")
@@ -248,6 +263,7 @@ trusted fun bootstrapLiveReload(buffer: int, capacity: int): int {
 // Where `ablac run` is live by default (decision #65): an x86-64 Linux host and macOS (arm64 and Intel), where live
 // mode is tested (tools/test-live-jit.sh, tools/test-live-watch.sh; the Macs in CI). Elsewhere `run` is as it was
 // unless --live asks.
+private noescape extern:"intrinsic" fun ablaUnsafeCallVoid0(address: int): void
 private noescape extern:"intrinsic" fun ablaSimdTargetArch(): int
 private noescape extern:"intrinsic" fun ablaHostIsMacOS(): bool
 

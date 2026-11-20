@@ -9,7 +9,7 @@ original design; where it differs from the table, the table is what exists. For 
 | 0 | Audit of the interprocedural facts a compiled function depends on (section at the end) | done (698cfd8d) |
 | 1 | The program's own functions called through one table of code pointers (`abla_live_table`) | built (6e8300fc); live by default since f3b13016 (x86-64 Linux) and 5cd21cd2 (macOS) |
 | 2a | `liveReload()`: recompile, keep the functions whose IR hash changed, publish a new table | built (6f6d36f0) |
-| 2b | A reload is refused when unchanged code would compile differently, or a signature or class layout changed | built (f9f311f4): `E_LIVE_SIGNATURE`, `E_LIVE_LAYOUT`, `E_LIVE_CALLER`, `E_LIVE_GLOBAL`; a changed signature of a function nothing takes as a value (and not a method) moves to a new entry instead of being refused (see "Changed signatures") |
+| 2b | A reload is refused when unchanged code would compile differently, or a signature or class layout changed | built (f9f311f4): `E_LIVE_SIGNATURE`, `E_LIVE_LAYOUT`, `E_LIVE_CALLER`, `E_LIVE_GLOBAL`; a changed signature of a function nothing takes as a value (and not a method) moves to a new entry instead of being refused (see "Changed signatures"); a new variable of the program's own files is initialized when the reload applies (see "New globals") |
 | 2c | Only data and the table's functions are shared between generations; a live run is object-cached with the compiler's record beside the object (`<object>.live`) | built (f89ff893) |
 | 3 | Lambdas: an edited lambda is matched to the running one, so closures made before take its new body; new lambdas reach code that was not redefined through a registry; a change to captures, parameters or result is refused (`E_LIVE_LAMBDA`) | built (8b7e1ee0) |
 | - | `--watch`: a reload when one of the program's own source files changes (inotify, kqueue), printed on stderr; a save the running code cannot take restarts the run | built (`src/live_watch.ab`, `tools/test-live-watch.sh`) |
@@ -289,6 +289,33 @@ old entry until the program restarts. Under `--watch` an applied reload says so,
 while a thread is inside the old body) and `refuse.ab` (a function taken as a value, and one taken only inside a
 lambda of another module).
 
+## New globals (built, 2026-11-20)
+
+A reload whose program has a variable of its own files that the running program does not have initializes it once,
+when the reload applies, instead of refusing it. The running program's initializer (`__bootstrap_globals`) ran at
+start and must not run again, so `src/backend/llvm/live_globals.ab` works before the backend:
+
+- The reload's initializer and the pieces it calls are cut at their stores: a new variable's range is its
+  instructions after the previous store (or piece call) up to its own, in declaration order (#1033). The ranges,
+  renumbered one after another, become `__bootstrap_globals_live`, which the reload's `__bootstrap_globals` calls so
+  the backend emits it and what it calls (the running program's `__bootstrap_globals` is the one that exists; the
+  reload's becomes a declaration of it, so that call never runs).
+- That function enters the runtime first and leaves it last (`__ablaRuntimeLiveEnter`/`Leave`, the bodies of an
+  export's enter and leave, as plain runtime functions: the export bridges exist only in a library): the `--watch`
+  thread was not started by the program, and a program thread inside `liveReload()` is in native code.
+- The backend wraps it in `abla_live_globals_<generation>`, which first publishes the new variables that hold
+  references as collector roots in a static frame that is never popped (at the thread's outermost leave it moves to
+  the registry's chain, as an export's globals do). The compiler calls that entry once the module is linked and
+  before the table is published (`live_reload.ab`), so code that reads a new variable finds it initialized.
+- Static storage a new function allocates (`nativeStaticAllocate`, `abla_static_*`) carries its first bytes in its
+  definition and is kept as well.
+
+Still `E_LIVE_GLOBAL`: a range that reads a value computed before it (it can't run alone), and a new variable of
+the standard library (not the program's to add). A changed initializer of an existing variable is not run again.
+Tested by `tests/cases/live-jit/reload.ab`: a reload adds an int, an array and a string, read through an edited
+function, under collection stress with a collection right after; without the entry call the program reads
+uninitialized storage, and without the root frame the collection frees the array.
+
 ## Freeing old generations (design, 2026-11-16; measured, not built, not worth it yet)
 
 **Measured (2026-11-19), and the decision.** A program that edits one of its functions and reloads 100 times
@@ -321,7 +348,7 @@ generation's tracker frees its code and data at once, so a generation can go onl
    points at G's dispatcher; a closure holding that lambda's id is invisible to an address scan.
 4. **Data.** Constants G defines: a string literal or constant array that is new in G (an unchanged one is the
    base's, shared by name). A string value made from such a literal points into G's read-only data for as long
-   as the value lives. G defines no variables (`E_LIVE_GLOBAL` refuses new ones) and no class descriptors.
+   as the value lives. G defines no class descriptors; the variables it adds (see "New globals") are roots in a frame that is never popped, so freeing G would also have to take those frames off the registry's chain.
 
 So the condition is: no table entry in G, no lambda added by G, and no word on any stack, in any register of a
 stopped thread, or in any live heap object that holds an address inside G's memory.

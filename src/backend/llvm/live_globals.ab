@@ -1,0 +1,252 @@
+import "core.ab"
+import "analysis.ab"
+import "bindings.ab"
+import "functions.ab"
+import "live.ab"
+import "../../ir.ab"
+import "../../module_paths.ab"
+import "abla/text"
+import "abla/unsafe/memory/raw"
+
+// New globals across generations of `ablac run --live` (docs/design/live-jit.md, "New globals"). A reload whose
+// program has a variable the running one does not gets that variable's initializer run once, when the reload
+// applies: the running program's own initializer (__bootstrap_globals) ran long ago and must not run again.
+//
+// Before the backend, the reload's initializer (__bootstrap_globals and the pieces it calls) is cut at its stores:
+// each new global's range is its instructions after the previous store (or piece call) up to its own store, in
+// declaration order (#1033). The ranges, renumbered one after the other, are a function of their own
+// (`__bootstrap_globals_live`) that enters the runtime as an export's caller does (__ablaRuntimeLiveEnter: the
+// --watch thread was never started by the program) and leaves it at the end. The backend wraps it in an entry the
+// compiler calls once the module is linked and before the table is published (bootstrapLlvmLiveGlobalsEntry,
+// live_reload.ab), which first publishes the new non-scalar globals as collector roots in a frame that is never
+// popped (as an export's globals are). A range that reads a value from before it can't run alone: the reload is refused
+// (E_LIVE_GLOBAL, naming the variable).
+
+val bootstrapLlvmLiveGlobalsName = "__bootstrap_globals_live"
+
+fun bootstrapLlvmLiveGlobalShifted(instruction: BootstrapInstruction, values: int,
+    labels: int): BootstrapInstruction {
+    val labelled = instruction.opcode == "label" || instruction.opcode == "jump" ||
+        instruction.opcode == "branch"
+    val operands: array<int> = []
+    for (operand in instruction.operands) operands.append(if (operand >= 0) operand + values else operand)
+    BootstrapInstruction(
+        instruction.opcode,
+        if (instruction.result >= 0) instruction.result + values else instruction.result,
+        if (instruction.left >= 0) instruction.left + values else instruction.left,
+        if (instruction.right >= 0) instruction.right + values else instruction.right,
+        instruction.text,
+        if (labelled && instruction.target >= 0) instruction.target + labels else instruction.target,
+        if (instruction.opcode == "branch" && instruction.alternate >= 0) instruction.alternate + labels
+            else instruction.alternate,
+        operands,
+        instruction.texts,
+        instruction.position
+    )
+}
+
+// Defined by the running program: the symbol as emitted, or as promoted to a hidden external name (live.ab).
+fun bootstrapLlvmLiveGlobalDefined(symbol: string): bool =
+    bootstrapLlvmLiveIsDefined(symbol) || bootstrapLlvmLiveIsDefined("__abla_unit.$symbol")
+
+// A global of the program's own files (its store's position): the standard library's and the runtime's are not
+// the program's to add, and some of them are no LLVM variable at all.
+fun bootstrapLlvmLiveGlobalOwn(instruction: BootstrapInstruction, stdlibRoot: string): bool {
+    val file = bootstrapIrSourcePositionFile(instruction.position)
+    if (file < 0 || file >= bootstrapIrSourceFiles.size) return false
+    val path = bootstrapNormalizeModulePath(bootstrapIrSourceFiles[file])
+    !(stdlibRoot != "" && path.startsWith(stdlibRoot))
+}
+
+fun bootstrapLlvmLiveGlobalsPass(program: BootstrapIrProgram, stdlibRoot: string): BootstrapIrProgram {
+    bootstrapLlvmLiveNewGlobals = Map()
+    bootstrapLlvmLiveNewGlobalNames = []
+    bootstrapLlvmLiveGlobalRefusals = []
+    if (bootstrapLlvmLiveGeneration == 0) return program
+    val fresh: Map<string, int> = Map()
+    var freshCount = 0
+    for (name in program.globalNames) {
+        if (!bootstrapLlvmLiveGlobalDefined(bootstrapLlvmGlobalSymbol(name))) {
+            fresh.set(name, 1)
+            freshCount = freshCount + 1
+        }
+    }
+    if (freshCount == 0) return program
+    // The initializer's pieces first (they run first, in order), then __bootstrap_globals itself.
+    val pieces: array<int> = []
+    var main = -1
+    var index = 0
+    while (index < program.functions.size) {
+        val name = program.functions[index].name
+        if (name == "__bootstrap_globals") main = index
+        else if (bootstrapLlvmModuleInitializer(name) && name != bootstrapLlvmLiveGlobalsName) pieces.append(index)
+        index = index + 1
+    }
+    if (main < 0) return program
+    pieces.append(main)
+    // It enters the runtime as an export does (the --watch thread is not the program's) and leaves it at the end.
+    val body: array<BootstrapInstruction> = [BootstrapInstruction(
+        "call", 0, -1, -1, "__ablaRuntimeLiveEnter", -1, -1, [], [], -1
+    )]
+    var values = 1
+    var labels = 0
+    for (piece in pieces) {
+        val instructions = program.functions[piece].instructions
+        var start = 0
+        var at = 0
+        while (at < instructions.size) {
+            val instruction = instructions[at]
+            if (instruction.opcode == "call" && bootstrapLlvmModuleInitializer(instruction.text)) {
+                start = at + 1
+            } else if (instruction.opcode == "global.store") {
+                if (fresh.get(instruction.text) != null && bootstrapLlvmLiveGlobalOwn(instruction, stdlibRoot)) {
+                    val range: array<BootstrapInstruction> = []
+                    var taken = start
+                    while (taken <= at) {
+                        range.append(bootstrapLlvmLiveGlobalShifted(instructions[taken], 0, 0))
+                        taken = taken + 1
+                    }
+                    val renumbered = bootstrapIrRenumbered(range)
+                    if (renumbered.size == 0) {
+                        bootstrapLlvmLiveGlobalRefusals.append(
+                            "E_LIVE_GLOBAL: a variable the running program does not have (${instruction.text}): its initializer uses a value computed before it, so it can't run alone"
+                        )
+                    } else {
+                        var topValue = -1
+                        var topLabel = -1
+                        for (moved in renumbered) {
+                            val shifted = bootstrapLlvmLiveGlobalShifted(moved, values, labels)
+                            body.append(shifted)
+                            if (moved.result > topValue) topValue = moved.result
+                            if (moved.opcode == "label" && moved.target > topLabel) topLabel = moved.target
+                        }
+                        values = values + topValue + 1
+                        labels = labels + topLabel + 1
+                        val newSymbol = bootstrapLlvmGlobalSymbol(instruction.text)
+                        bootstrapLlvmLiveNewGlobals.set(newSymbol, 1)
+                        bootstrapLlvmLiveNewGlobals.set("__abla_unit.$newSymbol", 1)
+                        bootstrapLlvmLiveNewGlobalNames.append(instruction.text)
+                    }
+                }
+                start = at + 1
+            }
+            at = at + 1
+        }
+    }
+    if (bootstrapLlvmLiveNewGlobalNames.size == 0) return program
+    body.append(BootstrapInstruction("call", values, -1, -1, "__ablaRuntimeLiveLeave", -1, -1, [], [], -1))
+    body.append(BootstrapInstruction("const.void", values + 1, -1, -1, "", -1, -1, [], [], -1))
+    val initializer = bootstrapFinalizeIrFunction(bootstrapLlvmLiveGlobalsName, [], body, values + 1, [], "void")
+    // The reload's __bootstrap_globals calls it, so the backend emits it and what it calls; the running program's
+    // __bootstrap_globals is the one that exists (the reload's becomes a declaration of it), so that call never runs.
+    val functions: array<BootstrapIrFunction> = []
+    index = 0
+    for (function in program.functions) {
+        if (index != main) functions.append(function)
+        else {
+            var top = -1
+            for (instruction in function.instructions) if (instruction.result > top) top = instruction.result
+            val calling: array<BootstrapInstruction> = [BootstrapInstruction(
+                "call", top + 1, -1, -1, bootstrapLlvmLiveGlobalsName, -1, -1, [], [], -1
+            )]
+            for (instruction in function.instructions) calling.append(bootstrapLlvmLiveGlobalShifted(instruction, 0, 0))
+            functions.append(bootstrapFinalizeIrFunction(function.name, function.parameters, calling,
+                function.result, function.parameterTypes, function.resultType))
+        }
+        index = index + 1
+    }
+    functions.append(initializer)
+    BootstrapIrProgram(
+        program.instructions, functions, program.classes, program.natives,
+        program.globalNames, program.globalTypes, program.globalKinds, program.compileInputPaths,
+        program.compileInputContents, program.errors, program.lookup, program.validationFailures,
+        program.extensionFields
+    )
+}
+
+// The entry the compiler calls once a reload with new globals is linked: `abla_live_globals_<generation>`.
+fun bootstrapLlvmLiveGlobalsEntryName(generation: int): string = "abla_live_globals_$generation"
+
+trusted fun bootstrapLlvmLiveGlobalsEntry(backend: BootstrapLlvmBackend, program: BootstrapIrProgram,
+    identities: BootstrapLlvmFunctionIdentities, generation: int): void {
+    if (bootstrapLlvmLiveNewGlobalNames.size == 0) return
+    // Its emitted form: the direct body (or the uniform one), under its symbol or promoted (live.ab).
+    var initializer = nativeNullPointer()
+    var usesOutput = false
+    var index = 0
+    while (index < program.functions.size && index < identities.symbols.size) {
+        if (program.functions[index].name == bootstrapLlvmLiveGlobalsName) {
+            val symbol = identities.symbols[index]
+            val direct = bootstrapLlvmDirectFunctionSymbol(symbol)
+            usesOutput = bootstrapLlvmDirectResultUsesOutput(program.functions[index])
+            for (candidate in [direct, "__abla_unit.$direct", symbol, "__abla_unit.$symbol"]) {
+                if (pointerIsNull(initializer)) initializer = LLVMGetNamedFunction(backend.module, candidate)
+            }
+        }
+        index = index + 1
+    }
+    if (pointerIsNull(initializer)) {
+        bootstrapLlvmLiveRefusals.append(
+            "E_LIVE_GLOBAL: the new variables' initializer was not compiled (${bootstrapLlvmLiveNewGlobalNames.join(", ")})"
+        )
+        return
+    }
+    val name = bootstrapLlvmLiveGlobalsEntryName(generation)
+    val entry = LLVMAddFunction(backend.module, name, LLVMFunctionType(backend.voidType, nativeNullPointer(),
+        i32(0), i32(0)))
+    LLVMSetLinkage(entry, llvmExternalLinkage())
+    LLVMSetVisibility(entry, llvmHiddenVisibility())
+    LLVMPositionBuilderAtEnd(backend.builder, LLVMAppendBasicBlockInContext(backend.context, entry, "entry"))
+    // The new variables that hold references are roots from before their initializers run (a collection may come
+    // in the middle), in a frame never popped: at the thread's outermost leave it moves to the registry's chain.
+    val roots: array<i64*> = []
+    for (global in bootstrapLlvmLiveNewGlobalNames) {
+        if (bootstrapLlvmGlobalScalarType(program, global) == "") {
+            val emitted = bootstrapLlvmGlobalSymbol(global)
+            var symbol = LLVMGetNamedGlobal(backend.module, emitted)
+            if (pointerIsNull(symbol)) symbol = LLVMGetNamedGlobal(backend.module, "__abla_unit.$emitted")
+            if (!pointerIsNull(symbol)) roots.append(symbol)
+        }
+    }
+    if (roots.size > 0) {
+        val values = llvmPointerVector(roots.size)
+        var root = 0
+        while (root < roots.size) {
+            values.set(root, roots[root])
+            root = root + 1
+        }
+        val rootsType = LLVMArrayType2(backend.pointerType, roots.size)
+        val rootsGlobal = LLVMAddGlobal(backend.module, rootsType, "abla.live.globals.roots.$generation")
+        LLVMSetInitializer(rootsGlobal, LLVMConstArray2(backend.pointerType, values.pointer(), roots.size))
+        values.drop()
+        LLVMSetLinkage(rootsGlobal, llvmInternalLinkage())
+        val frame = LLVMAddGlobal(backend.module, backend.rootFrameType, "abla.live.globals.frame.$generation")
+        LLVMSetInitializer(frame, LLVMConstNull(backend.rootFrameType))
+        LLVMSetLinkage(frame, llvmInternalLinkage())
+        val push = bootstrapLlvmDeclare(
+            backend, "abla_runtime_roots_push", backend.voidType,
+            [backend.pointerType, backend.pointerType, backend.i64Type],
+            false, [false, false, false]
+        )
+        bootstrapLlvmCall(backend, push, [frame, rootsGlobal, LLVMConstInt(backend.i64Type, roots.size, 0)],
+            "", false, [false, false, false])
+    }
+    // By the form found: the uniform one (output, arguments, count), the direct one with an output, or none.
+    val parameters = int(LLVMCountParams(initializer))
+    val result = LLVMBuildAlloca(backend.builder, backend.valueType, "live.globals.result")
+    if (parameters == 3) {
+        bootstrapLlvmCall(backend, initializer,
+            [result, LLVMConstNull(backend.pointerType), LLVMConstInt(backend.i64Type, 0, 0)],
+            "", true, [false, false, false])
+    } else if (parameters == 1) {
+        bootstrapLlvmCall(backend, initializer, [result], "", usesOutput, [false])
+    } else if (parameters == 0) {
+        bootstrapLlvmCall(backend, initializer, [], "", false, [])
+    } else {
+        bootstrapLlvmLiveRefusals.append(
+            "E_LIVE_GLOBAL: the new variables' initializer takes $parameters parameters (${bootstrapLlvmLiveNewGlobalNames.join(", ")})"
+        )
+    }
+    LLVMBuildRetVoid(backend.builder)
+    return
+}

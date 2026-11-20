@@ -15,6 +15,8 @@
 //   of livetrqwlyjuls made before the reload still calls it, from new code too.
 // - a function whose parameters change, never taken as a value, moves to a new entry: a thread inside its old body
 //   finishes it the old way, and the edited caller calls the new one.
+// - variables a reload adds (an int, an array, a string) are initialized once when it applies, and stay through a
+//   collection under stress right after (they are roots).
 // Exits 42 when every check passed. Markers are spelled in two pieces in main, so an edit changes only the
 // marked line.
 import "abla/io"
@@ -22,6 +24,7 @@ import "abla/live"
 import "abla/text"
 import "abla/sys/linux/fs"
 import "abla/sys/linux/process"
+import "abla/runtime/memory"
 
 var entered: int by TVar(0)
 var released: int by TVar(0)
@@ -66,6 +69,12 @@ fun gauge(x: int): int { // gauge-marker
 }
 
 fun gauged(): int = gauge(5) // gauged-marker
+
+// A reload adds variables here (new-globals-marker) and has fromGlobals() read them: their initializers run once,
+// when it applies.
+fun fromGlobals(): int = 0 // fromglobals-marker
+
+// new-globals-marker
 
 resource class Token(val id: int) {
     fun drop(): void {
@@ -226,5 +235,29 @@ fun main: int {
     val old = await gauging
     check("a thread in the old body finishes it the old way", old == 10, "$old")
     check("the new signature from then on", gauged() == 15, "${gauged()}")
+    // New variables: an int, an array and a string, read by an edited function. Their initializers run when the
+    // reload applies; under collection stress, with a collection right after, the array and the string survive
+    // (the reload published them as roots).
+    check("add variables",
+        edit(path, "// new-globals-" + "marker", "var counter = 40\nval table: array<int> = [1, 2, 3]\n" +
+            "val word = \"fre\" + \"sh\"\n// new-globals-" + "marker") &&
+        edit(path, "= 0 // fromglobals-" + "marker",
+            "= counter + table.size - 1 + word.size - 5 + table[2] - 3 // fromglobals-" + "marker"), path)
+    val globals = liveReload()
+    check("variables applied", globals.applied() && globals.message.contains("fromGlobals"), globals.message)
+    runtimeMemorySetStress(true)
+    runtimeMemoryCollect()
+    val read = fromGlobals()
+    val churn: array<string> = []
+    var round = 0
+    while (round < 200) {
+        churn.append("round $round")
+        round += 1
+    }
+    runtimeMemoryCollect()
+    val again = fromGlobals()
+    runtimeMemorySetStress(false)
+    check("the new variables initialized, kept by a collection", read == 42 && again == 42 && churn.size == 200,
+        "$read, $again")
     if (failures == 0) 42 else 1
 }
