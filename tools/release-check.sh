@@ -12,6 +12,8 @@
 #   stage2      the Linux binary is byte for byte the local stage 2 (cmp)
 #   convergence a green bootstrap-convergence run exists for the release's source commit (tools/release-convergence.sh);
 #               required: without --source-ref (or the tag) and a run, this check fails
+#   siblings    (with --siblings) the downstream repositories build and pass their tests with the candidate
+#               (tools/test-siblings.sh over tools/siblings.txt)
 #
 # Options:
 #   --repo OWNER/REPO     (default AndreBaltazar8/ablac)
@@ -26,6 +28,11 @@
 #   --convergence-comparison FILE
 #                         a downloaded comparison.json to check instead (with --lineage, no gh is needed)
 #   --lineage TAG         the convergence lineage to expect (default: the highest published release below <tag>)
+#   --siblings TREE       the downstream step: check 6, siblings, runs tools/test-siblings.sh with TREE (the candidate's
+#                         tree, build/ablac built) over tools/siblings.txt; its summary goes to <out>/siblings
+#   --siblings-baseline COMPILER
+#                         the compiler a sibling program must also fail with to be no regression (the previous
+#                         release's); without it every program the candidate can't build counts
 set -uo pipefail
 
 usage() {
@@ -42,6 +49,8 @@ source_ref=
 convergence_run=
 convergence_comparison=
 lineage=
+siblings=
+siblings_baseline=
 positional=()
 while (($#)); do
     case $1 in
@@ -54,6 +63,8 @@ while (($#)); do
         --convergence-run) convergence_run=${2:?}; shift 2 ;;
         --convergence-comparison) convergence_comparison=${2:?}; shift 2 ;;
         --lineage) lineage=${2:?}; shift 2 ;;
+        --siblings) siblings=${2:?}; shift 2 ;;
+        --siblings-baseline) siblings_baseline=${2:?}; shift 2 ;;
         -h | --help) usage ;;
         -*) echo "release-check: unknown option $1" >&2; usage ;;
         *) positional+=("$1"); shift ;;
@@ -250,6 +261,18 @@ if [[ $convergence == PASS* ]]; then
     report PASS convergence "${convergence#PASS  convergence }$source_note"
 else
     report FAIL convergence "${convergence#FAIL  convergence }$source_note"
+fi
+
+# 6. siblings (with --siblings): the downstream repositories against the candidate, one list (tools/siblings.txt).
+if [[ -n $siblings ]]; then
+    sibling_args=("$siblings" --out "$out/siblings")
+    [[ -z $siblings_baseline ]] || sibling_args+=(--baseline "$siblings_baseline")
+    if "$(dirname -- "${BASH_SOURCE[0]}")/test-siblings.sh" "${sibling_args[@]}" > "$out/siblings.log" 2>&1; then
+        report PASS siblings "$(($(wc -l < "$out/siblings/summary.txt") - 1)) repositories, no regression ($out/siblings/summary.txt)"
+    else
+        bad=$(awk 'NR > 1 && ($3 != "0" || $4 == "FAIL") {printf "%s ", $1}' "$out/siblings/summary.txt" 2>/dev/null)
+        report FAIL siblings "${bad:-see $out/siblings.log}"
+    fi
 fi
 
 printf 'release-check %s  run %s  %s\n' "$tag" "$run_id" "$out"
