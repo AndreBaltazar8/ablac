@@ -385,6 +385,7 @@ test-serial: ablac
 	tools/test-device-serial.sh $(COMPILER)
 	tools/test-uuid.sh $(COMPILER)
 	tools/test-regex.sh $(COMPILER)
+	tools/test-regex-diff.sh $(COMPILER)
 	tools/test-native-platform-boundary.sh $(COMPILER)
 	tools/test-math-no-libm.sh $(COMPILER)
 	tools/test-math-fast.sh $(COMPILER)

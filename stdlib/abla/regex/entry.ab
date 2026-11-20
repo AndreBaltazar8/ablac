@@ -9,7 +9,10 @@
 // Text is UTF-8: `.`, classes and literals match whole code points, and every
 // span is a byte offset into the text. A byte that is not part of valid UTF-8
 // reads as U+FFFD, one byte wide. `\d`, `\w`, `\s` and `\b` are ASCII only.
+import "abla/bytes"
 import "abla/text"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
 
 class RegexError(val message: string, val offset: int)
 
@@ -19,7 +22,10 @@ class Regex(
     val pattern: string,
     val groupCount: int,
     val program: array<int>,
-    val classes: array<array<int>>
+    val classes: array<array<int>>,
+    // 256 bytes, one per byte value: 1 when a match can start with that byte (every byte of 128 and over is 1),
+    // or "" when a match can start anywhere (an empty match, an assertion or `.` is reachable at the start).
+    val first: string
 ) {
     /** True when the whole text matches. */
     fun matches(text: string): bool {
@@ -95,13 +101,28 @@ class Regex(
      * exist, is empty; a `$` followed by anything else stays a dollar sign.
      */
     fun replace(text: string, replacement: string): string {
-        var out = ""
+        // A replacement without `$` is the same text for every match: it is not expanded each time.
+        val plain = !replacement.contains("$")
+        val out = byteBuffer()
         var last = 0
-        for (m in this.findAll(text)) {
-            out = out + text.slice(last, m.start()) + regexExpand(m, replacement)
-            last = m.end()
+        var vm = regexVm(this, text)
+        var position = 0
+        var advance = false
+        var more = true
+        while (more && position <= text.size) {
+            val spans = regexRun(this, vm, position, false, false, advance)
+            if (spans.size == 0) {
+                more = false
+            } else {
+                out.appendText(text.slice(last, spans[0]))
+                out.appendText(if (plain) replacement else regexExpand(RegexMatch(text, spans), replacement))
+                last = spans[1]
+                advance = spans[1] == spans[0]
+                position = spans[1]
+            }
         }
-        out + text.slice(last, text.size)
+        out.appendText(text.slice(last, text.size))
+        out.toText()
     }
 }
 
@@ -139,7 +160,7 @@ private val regexMaximumWork = 2000000
 
 private fun regexLeaf(kind: int, a: int, b: int): RegexNode = RegexNode(kind, a, b, 0, regexNoKids)
 
-private fun regexEmptyRegex(pattern: string): Regex = Regex(pattern, 0, [], [])
+private fun regexEmptyRegex(pattern: string): Regex = Regex(pattern, 0, [], [], "")
 
 private fun regexFail(pattern: string, message: string, offset: int): RegexCompileResult =
     RegexCompileResult(regexEmptyRegex(pattern), false, RegexError(message, offset))
@@ -580,8 +601,95 @@ fun regexCompileWithin(pattern: string, maximumInstructions: int): RegexCompileR
         return regexFail(pattern, "the pattern is too large: ${emitter.count()} instructions times ${parser.groups + 1} " +
             "capture groups is more than ${regexMaximumWork / 2}", 0)
     }
-    RegexCompileResult(Regex(pattern, parser.groups, emitter.program, parser.classes), true,
-        RegexError("", 0))
+    RegexCompileResult(Regex(pattern, parser.groups, emitter.program, parser.classes,
+        regexFirstBytes(emitter.program, parser.classes)), true, RegexError("", 0))
+}
+
+// Whether class `index` holds the ASCII byte `c` (the VM's classMatches, on a program).
+private fun regexClassHolds(classes: array<array<int>>, index: int, c: int): bool {
+    val ranges = classes[index]
+    var i = 0
+    while (i < ranges.size) {
+        if (c >= ranges[i] && c <= ranges[i + 1]) return true
+        i += 2
+    }
+    false
+}
+
+// The bytes a match can begin with (see Regex.first). The instructions reachable from the start without consuming
+// text are followed; the match instruction, an assertion or `.` reachable there gives "" (any start).
+private fun regexFirstBytes(program: array<int>, classes: array<array<int>>): string {
+    val n = program.size / 3
+    val seen = filledArray(n, 0)
+    val set = filledArray(256, 0)
+    val stack = filledArray(n + 2, 0)
+    var sp = 1
+    var any = false
+    while (!any && sp > 0) {
+        sp -= 1
+        var pc = stack[sp]
+        var follow = true
+        while (follow && !any) {
+            follow = false
+            if (pc < n && seen[pc] == 0) {
+                seen[pc] = 1
+                val op = program[pc * 3]
+                val x = program[pc * 3 + 1]
+                if (op == 4) {
+                    pc = x
+                    follow = true
+                } else if (op == 3) {
+                    stack[sp] = program[pc * 3 + 2]
+                    sp += 1
+                    pc = x
+                    follow = true
+                } else if (op == 5) {
+                    pc += 1
+                    follow = true
+                } else if (op == 0) {
+                    if (x < 128) set[x] = 1 else for (b in 128 until 256) set[b] = 1
+                } else if (op == 2) {
+                    val negated = program[pc * 3 + 2] == 1
+                    for (b in 0 until 128) if (regexClassHolds(classes, x, b) != negated) set[b] = 1
+                    for (b in 128 until 256) set[b] = 1
+                } else any = true
+            }
+        }
+    }
+    if (any) "" else regexByteTable(set)
+}
+
+private trusted fun regexByteTable(set: array<int>): string {
+    val buffer = nativeByteBuffer(257)
+    val address = nativePointerAddress(buffer.address)
+    var i = 0
+    while (i < 256) {
+        ablaUnsafeStoreU8(nativePointerFromAddress(address + i), set[i])
+        i += 1
+    }
+    buffer.adoptString(256)
+}
+
+// Whether a match can start at `i`: not past the end, and not an ASCII byte outside `first`.
+private trusted fun regexStartsAt(text: string, first: string, i: int, size: int): bool {
+    if (i >= size) return false
+    val byte = ablaUnsafeLoadU8(nativePointerFromAddress(ablaUnsafeStringAddress(text) + i))
+    byte >= 128 || ablaUnsafeLoadU8(nativePointerFromAddress(ablaUnsafeStringAddress(first) + byte)) != 0
+}
+
+// The first position at or after `i` that is not an ASCII byte outside `first`, or `size`. A position after an ASCII
+// byte is a code point boundary, so the search loop may start there as it would have by stepping to it.
+private trusted fun regexSkipTo(text: string, first: string, i: int, size: int): int {
+    var at = i
+    val data = ablaUnsafeStringAddress(text)
+    val table = ablaUnsafeStringAddress(first)
+    var scanning = true
+    while (scanning && at < size) {
+        val byte = ablaUnsafeLoadU8(nativePointerFromAddress(data + at))
+        if (byte < 128 && ablaUnsafeLoadU8(nativePointerFromAddress(table + byte)) == 0) at += 1
+        else scanning = false
+    }
+    at
 }
 
 // ---- The Pike VM ----
@@ -619,7 +727,10 @@ class RegexVm(
     fun copyEntry(from: int, to: int): void {
         val a = from * this.slots
         val b = to * this.slots
-        for (i in 0 until this.slots) this.store[b + i] = this.store[a + i]
+        if (this.slots == 2) {
+            this.store[b] = this.store[a]
+            this.store[b + 1] = this.store[a + 1]
+        } else for (i in 0 until this.slots) this.store[b + i] = this.store[a + i]
     }
 
     // Adds the thread at `pc0` with the captures of entry `source`, and
@@ -715,13 +826,22 @@ private fun regexRun(re: Regex, var vm: RegexVm, from: int, anchored: bool, need
     vm.counts[1] = 0
     var i = from
     var running = true
+    val skipping = !anchored && re.first.size == 256
     while (running) {
-        if (!matched && (!anchored || i == from)) {
+        // Nothing is running and no match is pending: the start positions up to the next byte a match can begin with
+        // add threads that the next step drops, so they are passed over. Past the last byte nothing can match.
+        if (skipping && !matched && vm.counts[current] == 0) {
+            i = regexSkipTo(vm.text, re.first, i, size)
+            if (i >= size) running = false
+        }
+        // A start thread at an ASCII byte outside the first-byte set dies at once and no thread behind it is affected.
+        if (running && !matched && (!anchored || i == from) &&
+            (!skipping || regexStartsAt(vm.text, re.first, i, size))) {
             val start = vm.startEntry()
             for (k in 0 until vm.slots) vm.store[start * vm.slots + k] = -1
             vm.add(current, 0, start, i)
         }
-        if (vm.counts[current] == 0 && (matched || anchored)) {
+        if (!running || (vm.counts[current] == 0 && (matched || anchored))) {
             running = false
         } else {
             val next = 1 - current

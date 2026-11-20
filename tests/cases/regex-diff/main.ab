@@ -1,0 +1,102 @@
+// The regex engine against the one before its first-byte skip and replace rewrite (old-regex.ab): the same compile
+// results, finds, matches, spans and replacements over many patterns and texts, including multi-byte text, bytes that
+// are not UTF-8 and empty matches.
+import "abla/bytes"
+import "abla/io"
+import "abla/regex"
+import "abla/text"
+import "./old-regex.ab" as old
+
+var failures = 0
+var checks = 0
+
+fun same(a: array<int>, b: array<int>): bool {
+    if (a.size != b.size) return false
+    var i = 0
+    while (i < a.size) {
+        if (a[i] != b[i]) return false
+        i += 1
+    }
+    true
+}
+
+fun spansOf(m: RegexMatch?): array<int> = if (m == null) [] else m.spans
+fun oldSpansOf(m: old.RegexMatch?): array<int> = if (m == null) [] else m.spans
+
+fun bad(label: string): void {
+    failures += 1
+    if (failures < 20) println("FAIL $label")
+    return
+}
+
+fun check(pattern: string, text: string): void {
+    val n = regexCompile(pattern)
+    val o = old.regexCompile(pattern)
+    checks += 1
+    if (n.succeeded != o.succeeded) {
+        bad("compile $pattern")
+        return
+    }
+    if (!n.succeeded) return
+    val re = n.regex
+    val ore = o.regex
+    val shown = "pattern '$pattern' text size ${text.size}"
+    if (re.matches(text) != ore.matches(text)) bad("matches $shown")
+    if (!same(spansOf(re.matchFull(text)), oldSpansOf(ore.matchFull(text)))) bad("matchFull $shown")
+    var start = 0
+    while (start <= text.size && start < 40) {
+        if (!same(spansOf(re.find(text, start)), oldSpansOf(ore.find(text, start)))) bad("find@$start $shown")
+        start += 7
+    }
+    val all = re.findAll(text)
+    val oall = ore.findAll(text)
+    if (all.size != oall.size) bad("findAll count $shown")
+    else {
+        var k = 0
+        while (k < all.size) {
+            if (!same(all[k].spans, oall[k].spans)) bad("findAll[$k] $shown")
+            k += 1
+        }
+    }
+    if (re.replace(text, "<>") != ore.replace(text, "<>")) bad("replace plain $shown")
+    if (re.replace(text, "[$0|$1]") != ore.replace(text, "[$0|$1]")) bad("replace groups $shown")
+    if (re.replace(text, "") != ore.replace(text, "")) bad("replace empty $shown")
+    return
+}
+
+fun main: int {
+    val patterns = [
+        "fox|dog", "fox", "a", "a+", "a*", "a?b", "[a-c]+", "[^a-c]+", "[^x]", "\\d+", "\\w+", "\\s+", "\\D", ".", ".*",
+        "^a", "a$", "^$", "\\bfox\\b", "\\Bo", "(a)(b)?", "(fox|dog) (jumps|runs)", "x*|y", "|a", "a|", "(|a)b",
+        "é", "é+", "[é-ü]+", "[^é]+", "日本", "日|本", "\\x{FFFD}", "[\\x{FFFD}]", "[^a]", ".\\.", "a.c", "(a|b)*c",
+        "[a-z0-9]+@[a-z]+\\.com", "the (quick|slow)", "o{2}", "o{1,2}", "ab{0,}c", "(?i)fox", "(?i)é", "z$", "\\.com\\n",
+        "[0-9]+", "[ \\t]+", "\\n", "dog|doge|dogs", "(a+)(a+)", "((a)|(b))+"
+    ]
+    val texts = [
+        "", "a", "b", "ab", "aab", "the quick brown fox jumps over the lazy dog 0123456789 user@example.com\n",
+        "fox dog fox runs dog jumps", "xxxx", "yyyy x", "é", "aéa", "日本語 fox 日本", "ééé", "aÿb",
+        "abcabcabc", "a.c abc a-c", "FOX Fox fox", "z", "dogs doge dog", "\n\n", "  \t x  y ", "aaaa", "bbbb", "xaxbxc"
+    ]
+    var invalid: array<string> = []
+    // Text holding bytes that are not UTF-8: a lone continuation byte, a truncated lead, 0xFF.
+    invalid.append("a${byteEncode(128)}b fox")
+    invalid.append("${byteEncode(255)}fox${byteEncode(195)}")
+    invalid.append("${byteEncode(226)}${byteEncode(130)} dog")
+    invalid.append("${byteEncode(239)}${byteEncode(191)}${byteEncode(189)}x")
+    invalid.append("x${byteEncode(193)}${byteEncode(129)}y")
+    for (p in patterns) {
+        for (t in texts) check(p, t)
+        for (t in invalid) check(p, t)
+    }
+    // Long texts: the skip must find the match anywhere, and nothing past the end.
+    val padding = "q".repeat(5000)
+    for (p in ["fox", "fox|dog", "d.g", "[xyz]+!", "é"]) {
+        check(p, padding)
+        check(p, "$padding fox dog é xyz! $padding")
+        check(p, "fox$padding")
+        check(p, "$padding${padding}dog")
+    }
+    if (failures == 0) println("regex-diff ok ($checks pattern/text pairs)")
+    else println("regex-diff FAILED: $failures")
+    return if (failures == 0) 0 else 1
+}
