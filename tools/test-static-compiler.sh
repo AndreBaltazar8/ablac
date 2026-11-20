@@ -38,4 +38,29 @@ for source in tests/cases/libc-imports/hello.ab tests/cases/libc-imports/strings
     cmp -s "$out/$name.static" "$out/$name.dynamic" || { echo "static compiler: $name differs from the ordinary compiler's" >&2; exit 1; }
     count=$((count + 1))
 done
-echo "static compiler: static-pie, no needed library, $count programs byte-identical to the ordinary compiler's"
+# The JIT: `ablac run` and the compile-time jit tier find the process's symbols through the library's dlsym table (src/static_libc/dl.ab).
+run=$("$out/ablac-static" run tests/cases/libc-imports/hello.ab 2>&1) || { echo "static compiler: ablac run failed: $run" >&2; exit 1; }
+[[ $run == hello ]] || { echo "static compiler: ablac run printed [$run]" >&2; exit 1; }
+cat > "$out/compile-time.ab" <<'AB'
+import "abla/io"
+
+fun fib(n: int): int = if (n < 2) n else fib(n - 1) + fib(n - 2)
+
+val answer = #fib(20)
+
+fun main: int {
+    println("answer $answer")
+    return 0
+}
+AB
+for tier in interp jit auto; do
+    ABLA_COMPILE_EVAL=$tier "$out/ablac-static" build "$out/compile-time.ab" -o "$out/compile-time-$tier" --no-cache > "$out/compile-time-$tier.log" 2>&1 ||
+        { echo "static compiler: the $tier tier failed" >&2; tail -5 "$out/compile-time-$tier.log" >&2; exit 1; }
+    [[ $("$out/compile-time-$tier") == 'answer 6765' ]] || { echo "static compiler: the $tier tier answered wrong" >&2; exit 1; }
+    ! grep -q 'Symbols not found' "$out/compile-time-$tier.log" || { echo "static compiler: the $tier tier lacks symbols" >&2; cat "$out/compile-time-$tier.log" >&2; exit 1; }
+done
+# The table covers every symbol the guard lists.
+for symbol in $(cat tools/compiler-libc-needs.txt); do
+    grep -q "\"$symbol\"" src/static_libc_symbols.ab || { echo "static compiler: $symbol is not in src/static_libc_symbols.ab" >&2; exit 1; }
+done
+echo "static compiler: static-pie, no needed library, $count programs byte-identical to the ordinary compiler's, ablac run and the three compile-time tiers work"
