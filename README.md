@@ -73,7 +73,7 @@ steps:
   - uses: actions/checkout@v6
   - uses: AndreBaltazar8/setup-abla@v1
     with:
-      version: '0.2.62'
+      version: '0.2.63'
   - run: ablac build app.ab -o build/app
 ```
 
