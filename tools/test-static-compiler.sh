@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # #806 step C: the statically linked compiler (src/orc_main_static.ab on LLVM's static archives and Abla's own C library, no libc) is a static-pie executable
 # with no needed library, and it builds programs byte for byte as the ordinary compiler does. Builds build/ablac-static, then builds each program of
-# tests/cases/libc-imports with both and compares the executables. Single-threaded (the C library's pthread family is not threads yet).
+# tests/cases/libc-imports with both and compares the executables. With several workers (the C library's pthread family is futex locks over the runtime's threads).
 # Needs the static archives, which the pinned shell's LLVM does not carry (ABLA_STATIC_LLVM_LIB, and ABLA_STATIC_ZLIB when the C compiler finds no libz.a);
 # without them it says so and passes (CI gets them once the LLVM release publishes them).
 # Usage: tools/test-static-compiler.sh [compiler]
@@ -60,6 +60,24 @@ for tier in interp jit auto; do
     [[ $("$out/compile-time-$tier") == 'answer 6765' ]] || { echo "static compiler: the $tier tier answered wrong" >&2; exit 1; }
     ! grep -q 'Symbols not found' "$out/compile-time-$tier.log" || { echo "static compiler: the $tier tier lacks symbols" >&2; cat "$out/compile-time-$tier.log" >&2; exit 1; }
 done
+# Math the compiler folds or simplifies at compile time comes from the library's own routines (src/static_libc/math.ab): same program bytes as
+# the ordinary compiler's, with constants LLVM folds through the host's functions.
+cat > "$out/math-fold.ab" <<'AB'
+import "abla/io"
+import "abla/math"
+import "abla/float/text"
+
+fun main: int {
+    val x = 0.5 + 1.0
+    println("${sqrt(2.0)} ${floor(x)} ${ceil(x)} ${fabs(0.0 - x)} ${exp(1.0)} ${log(10.0)} ${pow(2.0, 0.5)} ${sin(1.0)} ${cos(1.0)} ${tan(1.0)} ${atan(1.0)} ${atan2(1.0, 2.0)}")
+    return 0
+}
+AB
+"$out/ablac-static" build "$out/math-fold.ab" -o "$out/math-fold.static" --no-cache > "$out/math-fold.static.log" 2>&1 ||
+    { echo 'static compiler: it failed to build the math program' >&2; tail -5 "$out/math-fold.static.log" >&2; exit 1; }
+"$compiler" build "$out/math-fold.ab" -o "$out/math-fold.dynamic" --no-cache > "$out/math-fold.dynamic.log" 2>&1 ||
+    { echo 'static compiler: the ordinary compiler failed to build the math program' >&2; exit 1; }
+cmp -s "$out/math-fold.static" "$out/math-fold.dynamic" || { echo 'static compiler: the math program differs from the ordinary compiler'"'"'s' >&2; exit 1; }
 # The table covers every symbol the guard lists.
 for symbol in $(cat tools/compiler-libc-needs.txt); do
     grep -q "\"$symbol\"" src/static_libc_symbols.ab || { echo "static compiler: $symbol is not in src/static_libc_symbols.ab" >&2; exit 1; }
