@@ -2,8 +2,9 @@
 # W_UNUSED_IMPORT (module.ab: bootstrapUnusedImportWarnings), behind --warn-unused-imports: an import nothing in the
 # importing file uses gets a warning, an import used only through an extension method, a re-exported class or a
 # `$json` subparser doesn't, nor one of a module with an @export function; a package's entry gets the
-# `export import` line instead. `ablac fix-imports --prune` removes the warned imports, leaves the entry's, keeps the
-# last import of a file with a #compilerGrant, and the pruned programs still build.
+# `export import` line instead, and a module that runs compile code keeps its imports. `ablac fix-imports --prune`
+# removes the warned imports, leaves the entry's, keeps the last import of a file with a #compilerGrant, and the
+# pruned programs still build.
 set -euo pipefail
 
 compiler=${1:-build/ablac}
@@ -33,6 +34,11 @@ diff "$work/expected.txt" "$work/warnings.txt" > "$work/warn.diff" || fail "main
 grep -qxF 'warning[W_UNUSED_IMPORT]: lib.ab: `import "abla/json"` is neither used here nor passed on: `export import` it if the package means to offer it (W_UNUSED_IMPORT entry)' "$work/pkg.log" ||
     fail "no entry warning for pkg/lib.ab" "$work/pkg.log"
 
+
+# A module that runs compile code keeps its imports.
+(cd "$work/compiled" && "$compiler" build main.ab -o program --fast --warn-unused-imports) > "$work/compiled.log" 2>&1 ||
+    fail "compiled/main.ab didn't build" "$work/compiled.log"
+! grep -q W_UNUSED_IMPORT "$work/compiled.log" || fail "a warning in a module that runs compile code" "$work/compiled.log"
 # The prune.
 (cd "$work" && "$compiler" fix-imports main.ab --prune) > "$work/prune.log" 2>&1 || fail "prune failed" "$work/prune.log"
 grep -qxF 'fix-imports: removed 2 unused import(s) in 1 file(s); 0 restored, 0 left' "$work/prune.log" ||
