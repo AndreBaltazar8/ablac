@@ -60,6 +60,29 @@ grep -qxF 'import "abla/json"' "$work/vendored/.abla/packages/fake/entry.ab" ||
 grep -qxF 'import "abla/json"' "$work/outside/lib/lib.ab" || fail "the prune changed another project's module" "$work/outside/lib/lib.ab"
 grep -qxF 'fix-imports: removed 0 unused import(s) in 0 file(s); 0 restored, 0 left' "$work/outside-prune.log" ||
     fail "the outside prune listed something" "$work/outside-prune.log"
+
+# A build that stops in the front end (a missing import) knows only some uses: no warnings, and the prune refuses.
+if (cd "$work/broken" && "$compiler" build main.ab -o program --fast --warn-unused-imports) > "$work/broken.log" 2>&1; then
+    fail "broken/main.ab built" "$work/broken.log"
+fi
+grep -q 'E_IMPORT_NOT_FOUND' "$work/broken.log" || fail "broken/main.ab failed for another reason" "$work/broken.log"
+! grep -q W_UNUSED_IMPORT "$work/broken.log" || fail "warnings from a front end that stopped" "$work/broken.log"
+cp "$work/broken/main.ab" "$work/broken/main.ab.before"
+if (cd "$work/broken" && "$compiler" fix-imports main.ab --prune) > "$work/broken-prune.log" 2>&1; then
+    fail "the prune of a failing build succeeded" "$work/broken-prune.log"
+fi
+grep -qF 'error(s) before every use is known; fix those first, nothing pruned' "$work/broken-prune.log" ||
+    fail "the prune didn't say why" "$work/broken-prune.log"
+cmp -s "$work/broken/main.ab" "$work/broken/main.ab.before" || fail "the prune changed a failing build's file" "$work/broken/main.ab"
+
+# Another checkout linked in (engine -> ../other): its path reads as this project's, but it isn't.
+ln -s ../other "$work/linked/app/engine"
+(cd "$work/linked/app" && "$compiler" build main.ab -o program --fast --warn-unused-imports) > "$work/linked.log" 2>&1 ||
+    fail "linked/app didn't build" "$work/linked.log"
+! grep -q W_UNUSED_IMPORT "$work/linked.log" || fail "a warning through a linked checkout" "$work/linked.log"
+(cd "$work/linked/app" && "$compiler" fix-imports main.ab --prune) > "$work/linked-prune.log" 2>&1 ||
+    fail "linked prune failed" "$work/linked-prune.log"
+grep -qxF 'import "abla/json"' "$work/linked/other/lib.ab" || fail "the prune changed a linked checkout's file" "$work/linked/other/lib.ab"
 # The prune.
 (cd "$work" && "$compiler" fix-imports main.ab --prune) > "$work/prune.log" 2>&1 || fail "prune failed" "$work/prune.log"
 grep -qxF 'fix-imports: removed 2 unused import(s) in 1 file(s); 0 restored, 0 left' "$work/prune.log" ||
