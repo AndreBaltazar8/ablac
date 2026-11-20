@@ -60,6 +60,45 @@ grep -qxF 'warning[W_UNUSED_IMPORT]: lib.ab: `import "abla/json"` is neither use
     fail "no entry warning for pkg/lib.ab" "$work/pkg.log"
 
 
+# The editor's analysis (graph-v2 with initialize unusedImports) gives the same two as warnings: severity "warning", the
+# "unnecessary" tag, and a fix that removes the import's line; without the option, or for a program with an error, none.
+editor() { # directory entry option(true|false) out
+    node -e '
+const fs = require("fs");
+const [dir, entry, option, out] = process.argv.slice(1);
+const params = { workspaceRoots: [dir], clientName: "unused-imports", clientVersion: "1", analysisMode: "graph-v2" };
+if (option === "true") params.unusedImports = true;
+const lines = [{ schema: 1, id: 1, method: "initialize", params },
+  { schema: 1, id: 2, method: "analyze", params: { roots: [dir + "/" + entry] } },
+  { schema: 1, id: 3, method: "shutdown", params: {} }];
+fs.writeFileSync(out, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+' "$1" "$2" "$3" "$work/editor.jsonl"
+    "$compiler" analyze --stdio < "$work/editor.jsonl" > "$4" 2> "$work/editor.err" || fail "the editor service failed" "$work/editor.err"
+}
+editor "$work" main.ab true "$work/editor.out"
+node -e '
+const fs = require("fs");
+const answers = fs.readFileSync(process.argv[1], "utf8").trim().split("\n").map(JSON.parse);
+const fail = (message) => { console.error("editor: " + message); process.exit(1); };
+const document = answers.find((a) => a.id === 2).result.documents.find((d) => d.uri.endsWith("/main.ab"));
+const warned = document.diagnostics.filter((d) => d.code === "W_UNUSED_IMPORT");
+if (warned.length !== 2 || document.diagnostics.length !== 2) fail("not exactly the two warnings: " + JSON.stringify(document.diagnostics));
+const bytes = Buffer.from(document.text);
+const removed = [];
+for (const d of warned) {
+  if (d.severity !== "warning" || JSON.stringify(d.tags) !== "[\"unnecessary\"]") fail("severity or tags: " + JSON.stringify(d));
+  const fix = (d.fixes || [])[0];
+  if (!fix || fix.title !== "Remove unused import" || fix.kind !== "remove" || fix.edits.length !== 1 || fix.edits[0].newText !== "") fail("fix: " + JSON.stringify(d.fixes));
+  removed.push(bytes.subarray(fix.edits[0].range.start, fix.edits[0].range.end).toString());
+}
+const want = ["import \"abla/json\"\n", "import \"./helper.ab\"\n"];
+if (JSON.stringify(removed.sort()) !== JSON.stringify(want.sort())) fail("the fixes remove " + JSON.stringify(removed));
+' "$work/editor.out" || fail "the editor's unused-import warnings differ"
+editor "$work" main.ab false "$work/editor-off.out"
+[[ $(node -e 'const lines = require("fs").readFileSync(process.argv[1], "utf8").trim().split("\n").map(JSON.parse); let n = 0; for (const l of lines) for (const d of (l.result && l.result.documents) || []) n += d.diagnostics.filter((x) => x.code === "W_UNUSED_IMPORT").length; process.stdout.write(String(n));' "$work/editor-off.out") == 0 ]] || fail "the editor warned without the option" "$work/editor-off.out"
+editor "$work/broken" main.ab true "$work/editor-broken.out"
+[[ $(node -e 'const lines = require("fs").readFileSync(process.argv[1], "utf8").trim().split("\n").map(JSON.parse); let n = 0; for (const l of lines) for (const d of (l.result && l.result.documents) || []) n += d.diagnostics.filter((x) => x.code === "W_UNUSED_IMPORT").length; process.stdout.write(String(n));' "$work/editor-broken.out") == 0 ]] || fail "the editor warned after a front end that stopped at an error" "$work/editor-broken.out"
+
 # A module that runs compile code keeps its imports.
 (cd "$work/compiled" && "$compiler" build main.ab -o program --fast --warn-unused-imports) > "$work/compiled.log" 2>&1 ||
     fail "compiled/main.ab didn't build" "$work/compiled.log"
@@ -156,4 +195,4 @@ grep -qF 'lib.ab: `import "abla/json"` left' "$work/pkg-prune.log" || fail "the 
 ! grep -qE '^import "(abla/json|\./value\.ab)"$' "$work/grant/main.ab" || fail "grant/main.ab still has its unused imports" "$work/grant/main.ab"
 grep -qxF 'import "abla/compiler"' "$work/grant/main.ab" || fail "the prune removed the import the #compilerGrant needs" "$work/grant/main.ab"
 (cd "$work/grant" && "$compiler" build main.ab -o program --fast) > "$work/grant-after.log" 2>&1 || fail "pruned grant/main.ab doesn't build" "$work/grant-after.log"
-echo "unused-imports: 2 warnings in main.ab (none for uses through an extension, a re-exported class, a subparser, an @export module, a module that runs compile code, another project's, a vendored or linked one, or after a front end that stopped); the entry's export-import line; the prune removed 2, left the entry's, kept the import a #compilerGrant needs, and refused a failing build"
+echo "unused-imports: 2 warnings in main.ab (and in the editor's analysis, with a fix each) (none for uses through an extension, a re-exported class, a subparser, an @export module, a module that runs compile code, another project's, a vendored or linked one, or after a front end that stopped); the entry's export-import line; the prune removed 2, left the entry's, kept the import a #compilerGrant needs, and refused a failing build"

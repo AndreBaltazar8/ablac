@@ -25,7 +25,9 @@ class BootstrapFrontendDiagnostic(
     // The error's `help:` lines, without the prefix.
     val help: array<string> = [],
     // The edits that fix it (optional; a help line states them in words, these state them for a client).
-    val fixes: array<BootstrapFrontendFix> = []
+    val fixes: array<BootstrapFrontendFix> = [],
+    // "warning" for a `warning[...]` (W_UNUSED_IMPORT), else "error".
+    val severity: string = "error"
 )
 
 /** Where a new import line goes: after the last top-level `import` line, else after the file's leading comment lines. */
@@ -114,6 +116,15 @@ fun bootstrapFrontendDiagnosticJson(value: BootstrapFrontendDiagnostic): Json {
     val range = jsonObject(["start", "end"], [jsonInteger(value.begin), jsonInteger(value.end)])
     val names = ["code", "message", "range"]
     val values = [jsonString(value.code), jsonString(value.message), range]
+    if (value.severity != "error") {
+        names.append("severity")
+        values.append(jsonString(value.severity))
+    }
+    // The editor greys the import out (LSP's DiagnosticTag.Unnecessary).
+    if (value.code == "W_UNUSED_IMPORT") {
+        names.append("tags")
+        values.append(jsonArray([jsonString("unnecessary")]))
+    }
     if (value.help.size > 0) {
         val help: array<Json> = []
         for (line in value.help) help.append(jsonString(line))
@@ -139,8 +150,9 @@ fun bootstrapFrontendDiagnosticCode(diagnostics: string): string {
     var begin = -1
     var end = -1
     var index = 0
-    while (begin < 0 && index + 6 < diagnostics.size) {
+    while (begin < 0 && index + 8 < diagnostics.size) {
         if (diagnostics.slice(index, index + 6) == "error[") begin = index + 6
+        else if (diagnostics.slice(index, index + 8) == "warning[") begin = index + 8
         index = index + 1
     }
     if (begin >= 0) {
@@ -167,7 +179,7 @@ fun bootstrapFrontendAppendLocatedDiagnostics(
         while (lineEnd < diagnostics.size &&
             diagnostics[lineEnd] != 10) lineEnd = lineEnd + 1
         val line = diagnostics.slice(lineBegin, lineEnd)
-        if (line.size >= 6 && line.slice(0, 6) == "error[") {
+        if ((line.size >= 6 && line.slice(0, 6) == "error[") || (line.size >= 8 && line.slice(0, 8) == "warning[")) {
             previousError = line
         }
         if (previousError != "" && line.size > prefix.size &&
@@ -196,13 +208,28 @@ fun bootstrapFrontendAppendLocatedDiagnostics(
             if (begin > text.size) begin = text.size
             if (end < begin) end = begin
             if (end > text.size) end = text.size
+            val code = bootstrapFrontendDiagnosticCode(previousError)
+            val removal: array<BootstrapFrontendFix> = []
+            if (code == "W_UNUSED_IMPORT") {
+                // The statement's whole line goes when nothing else stands on it.
+                var from = begin
+                while (from > 0 && (text[from - 1] == 32 || text[from - 1] == 9)) from = from - 1
+                var to = end
+                while (to < text.size && (text[to] == 32 || text[to] == 9)) to = to + 1
+                if ((from == 0 || text[from - 1] == 10) && (to == text.size || text[to] == 10)) {
+                    if (to < text.size) to = to + 1
+                    removal.append(BootstrapFrontendFix("Remove unused import", "remove", from, to, ""))
+                } else {
+                    removal.append(BootstrapFrontendFix("Remove unused import", "remove", begin, end, ""))
+                }
+            }
             values.append(BootstrapFrontendDiagnostic(
-                bootstrapFrontendDiagnosticCode(previousError), previousError,
-                sourceIdentity, begin, end
+                code, previousError, sourceIdentity, begin, end, [], removal,
+                if (previousError.startsWith("warning[")) "warning" else "error"
             ))
             previousError = ""
             helpTarget = values.size - 1
-        } else if (line.size >= 6 && line.slice(0, 6) == "error[") {
+        } else if ((line.size >= 6 && line.slice(0, 6) == "error[") || (line.size >= 8 && line.slice(0, 8) == "warning[")) {
             helpTarget = -1
         } else if (helpTarget >= 0 && line.size > 6 && line.slice(0, 6) == "help: ") {
             // The help lines after an error's location are its own (every occurrence keeps them: the editor shows one

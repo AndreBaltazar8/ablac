@@ -11,6 +11,7 @@ import "source_rewrite.ab"
 import "staged_parser.ab"
 import "abla/json"
 import "abla/sys/linux/fs"
+import "abla/text"
 import "abla/runtime/memory"
 import "abla/sys/linux/process"
 import "abla/sys/linux"
@@ -431,11 +432,14 @@ fun bootstrapAnalysisGraphSemantic(
 
 fun bootstrapAnalysisGraphDiagnostics(
     document: BootstrapAnalysisGraphDocument, project: BootstrapFrontendProject,
-    semanticDiagnostics: string
+    semanticDiagnostics: string,
+    unusedImports: string = ""
 ): Json {
     val values: array<BootstrapFrontendDiagnostic> = []
     for (kind in ["parser", "import", "strict-import", "qualified-import", "semantic"]) {
-        val text = if (kind == "semantic") semanticDiagnostics else project.written.diagnostics
+        val text = if (kind == "semantic") semanticDiagnostics
+            else if (kind == "import") "${project.written.diagnostics}$unusedImports"
+            else project.written.diagnostics
         bootstrapFrontendAppendLocatedDiagnostics(text,
             "source[$kind]:${document.document.path}:", document.document.path,
             document.document.text, values)
@@ -758,6 +762,17 @@ fun BootstrapAnalysisService.graphSnapshot(): Json {
         "ABLA_ANALYSIS_CHECK: the incremental analysis differs from a cold one in ${differing.size} documents", this.graphModeName())
 }
 
+/** How many times `needle` occurs in `text`. */
+fun bootstrapAnalysisCount(text: string, needle: string): int {
+    var count = 0
+    var at = text.indexOf(needle)
+    while (at >= 0) {
+        count = count + 1
+        at = text.indexOf(needle, at + needle.size)
+    }
+    count
+}
+
 fun BootstrapAnalysisService.graphSnapshotRun(): Json {
     val entry = this.graphEntry()
     if (entry == "") return bootstrapAnalysisGraphIncomplete(this.revision,
@@ -778,6 +793,14 @@ fun BootstrapAnalysisService.graphSnapshotRun(): Json {
         .sourceExists(entry)) return bootstrapAnalysisGraphIncomplete(this.revision,
             "project entry does not exist and has no open overlay", this.graphModeName())
     bootstrapSourceRewrites = []
+    if (bootstrapUnusedImportsWanted()) {
+        // W_UNUSED_IMPORT (on by default) is made from what this one front end run recorded: nothing of an earlier run stays, with
+        // the option or without it (the service runs for days).
+        bootstrapImportUses = Map()
+        bootstrapUnusedImportChecked = Map()
+        bootstrapUnusedImportEdges = []
+        bootstrapUnusedImportEntry = ""
+    }
     bootstrapAnalysisSampleMemory("analysis begin")
     val project = bootstrapFrontendLoadHostProject(entry, bootstrapAnalysisGraphModules)
     bootstrapAnalysisSampleMemory("project loaded")
@@ -876,6 +899,7 @@ fun BootstrapAnalysisService.graphSnapshotRun(): Json {
     val fingerprints: Map<string, string> = Map()
     val fingerprintUris: array<string> = []
     var semanticDiagnostics = ""
+    var unusedImports = ""
     if (analyzed != null) {
         for (declaration in analyzed.parsed.declarations) {
             bootstrapAnalysisGraphDeclarationAliases(declaration, documents, aliases, lookup)
@@ -885,6 +909,14 @@ fun BootstrapAnalysisService.graphSnapshotRun(): Json {
         }
         val semantic = bootstrapAnalysisGraphSemantic(analyzed.semantic, documents, names, lookup, aliases, builtinIds)
         semanticDiagnostics = semantic.diagnostics
+        // Only after a front end without errors: one that stopped early never recorded every use (orc_main.ab does the same).
+        // The editor's analysis never runs compile code, so a `$json` subparser is unknown to it (subparser.unknown): that
+        // error doesn't stop the uses being recorded, and the warning pass knows which imports such a module's subparsers keep.
+        if (this.graphUnusedImports && !project.written.diagnostics.contains("error[") &&
+            bootstrapAnalysisCount(semanticDiagnostics, "error[") ==
+            bootstrapAnalysisCount(semanticDiagnostics, "error[E_SEMANTIC]: subparser.unknown:")) {
+            unusedImports = bootstrapUnusedImportWarnings()
+        }
         bootstrapAnalysisSampleMemory("semantic converted")
         val occurrenceIndex = bootstrapAnalysisOccurrenceIndex(analyzed.parsed.declarations,
             semantic, builtinIds)
@@ -895,7 +927,7 @@ fun BootstrapAnalysisService.graphSnapshotRun(): Json {
                 document.parsed, analyzed.parsed.declarations, semantic, aliases, true,
                 occurrenceIndex)
             sets.set(bootstrapAnalysisGraphPath(document.document.uri), set)
-            val diagnostics = bootstrapAnalysisGraphDiagnostics(document, project, semanticDiagnostics)
+            val diagnostics = bootstrapAnalysisGraphDiagnostics(document, project, semanticDiagnostics, unusedImports)
             if (this.graphStableIds) {
                 fingerprints.set(document.document.uri,
                     "${document.document.version}|${document.key}|${bootstrapAnalysisGraphSetHash(set)}|${bootstrapAnalysisGraphHash(jsonStringify(diagnostics))}")
