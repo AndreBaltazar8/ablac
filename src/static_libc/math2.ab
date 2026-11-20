@@ -1,0 +1,206 @@
+// The rest of the math functions the statically linked compiler's C library has to export (#806 step C): hyperbolic, inverse circular, error
+// function and the logarithm family, over the standard library's own routines (abla/math: correctly rounded exp, log, atan2 and the hardware
+// sqrt), so folding a constant needs nothing from a C library. These are not themselves correctly rounded: each result is within a few units
+// in the last place (tests/cases/libc-math-functions checks the bounds), the special cases (zeros, infinities, NaN, domain errors) are the
+// C standard's, and no errno or exception flag is set.
+import "abla/math" as m
+import "abla/float"
+
+val libcInvLn2 = 1.4426950408889634
+val libcLog10Of2 = 0.30102999566398120
+val libcInvLn10 = 0.4342944819032518
+val libcTwoOverSqrtPi = 1.1283791670955126
+
+// exp(x) - 1 without the cancellation near zero: the Taylor series by Horner's rule up to |x| = 1.25 (28 terms, below 1e-24 there), exp beyond.
+fun libcExpm1(x: f64): f64 {
+    if (m.fabs(x) >= 1.25) return m.exp(x) - 1.0
+    var t = 1.0
+    var n = 28
+    while (n >= 2) {
+        t = 1.0 + t * x / f64FromInt(n)
+        n -= 1
+    }
+    x * t
+}
+
+// A value that overflows twice over: e^a / 2 for a up to the largest argument that does not overflow exp itself, then through half the argument.
+fun libcHalfExp(a: f64): f64 {
+    if (a < 709.0) return m.exp(a) / 2.0
+    val h = m.exp(a / 2.0)
+    (h / 2.0) * h
+}
+
+@export("sinh")
+fun libcSinh(x: f64): f64 {
+    val a = m.fabs(x)
+    if (a != a || a == 0.0 || a == 1.0 / 0.0) return x
+    var r = 0.0
+    if (a < 0.5) {
+        // x (1 + x^2/6 (1 + x^2/20 (1 + x^2/42 ...))): the series of sinh.
+        val x2 = a * a
+        var t = 1.0
+        var k = 12
+        while (k >= 1) {
+            t = 1.0 + t * x2 / f64FromInt((2 * k) * (2 * k + 1))
+            k -= 1
+        }
+        r = a * t
+    } else if (a < 22.0) {
+        val em = libcExpm1(a)
+        r = (em + em / (em + 1.0)) / 2.0
+    } else {
+        r = libcHalfExp(a)
+    }
+    if (x < 0.0) 0.0 - r else r
+}
+
+@export("cosh")
+fun libcCosh(x: f64): f64 {
+    val a = m.fabs(x)
+    if (a != a) return x
+    if (a < 0.5) {
+        val em = libcExpm1(a)
+        return 1.0 + em * em / (2.0 * (1.0 + em))
+    }
+    if (a < 22.0) {
+        val t = m.exp(a)
+        return (t + 1.0 / t) / 2.0
+    }
+    libcHalfExp(a)
+}
+
+@export("tanh")
+fun libcTanh(x: f64): f64 {
+    val a = m.fabs(x)
+    if (a != a || a == 0.0) return x
+    var r = 1.0
+    if (a < 22.0) {
+        if (a < 0.000000003725290298461914) return x
+        if (a < 0.6) {
+            val em = libcExpm1(2.0 * a)
+            r = em / (em + 2.0)
+        } else {
+            r = 1.0 - 2.0 / (m.exp(2.0 * a) + 1.0)
+        }
+    }
+    if (x < 0.0) 0.0 - r else r
+}
+
+// The inverse circular functions through atan2, whose argument (1 - x)(1 + x) is exact enough for |x| close to 1 (1 - x is exact there).
+@export("asin")
+fun libcAsin(x: f64): f64 {
+    if (x != x || m.fabs(x) > 1.0) return 0.0 / 0.0
+    if (x == 0.0) return x
+    m.atan2(x, m.sqrt((1.0 - x) * (1.0 + x)))
+}
+
+@export("acos")
+fun libcAcos(x: f64): f64 {
+    if (x != x || m.fabs(x) > 1.0) return 0.0 / 0.0
+    m.atan2(m.sqrt((1.0 - x) * (1.0 + x)), x)
+}
+
+// erf(x) = 2/sqrt(pi) e^(-x^2) x (1 + 2x^2/3 (1 + 2x^2/5 (1 + ...))): every term positive, so no cancellation; 1 from 5.92 on.
+@export("erf")
+fun libcErf(x: f64): f64 {
+    val a = m.fabs(x)
+    if (x != x || a == 0.0) return x
+    if (a >= 5.9215871957945083) return if (x < 0.0) -1.0 else 1.0
+    val x2 = a * a
+    // e^(-x2) with the rounding error of the square folded back in.
+    val low = m.fma(a, a, 0.0 - x2)
+    val gauss = m.exp(0.0 - x2) * (1.0 - low)
+    if (a >= 2.5) {
+        // erfc(x) = e^(-x^2) / (sqrt(pi) (x + (1/2)/(x + 1/(x + (3/2)/(x + ...))))): the continued fraction, evaluated from the tail.
+        var t = a
+        var k = 120
+        while (k >= 1) {
+            t = a + f64FromInt(k) / 2.0 / t
+            k -= 1
+        }
+        val tail = gauss * 0.5641895835477563 / t
+        return if (x < 0.0) tail - 1.0 else 1.0 - tail
+    }
+    val twice = 2.0 * x2
+    var term = 1.0
+    var sum = 1.0
+    var n = 1
+    while (n < 400 && term > 1.0e-18 * sum) {
+        term = term * twice / f64FromInt(2 * n + 1)
+        sum += term
+        n += 1
+    }
+    val r = libcTwoOverSqrtPi * a * gauss * sum
+    if (x < 0.0) 0.0 - r else r
+}
+
+// log(1 + x): when 1 + x rounds, scale log(u) by x / (u - 1), which carries the rounding error of u over (Kahan).
+@export("log1p")
+fun libcLog1p(x: f64): f64 {
+    if (x != x || x == 0.0) return x
+    if (x < -1.0) return 0.0 / 0.0
+    if (x == -1.0) return -1.0 / 0.0
+    val u = 1.0 + x
+    if (u == 1.0) return x
+    if (u - 1.0 == 0.0 || m.fabs(u) > 1.0e308) return m.log(u)
+    m.log(u) * (x / (u - 1.0))
+}
+
+// x = 2^e m with m in [sqrt(1/2), sqrt(2)); the exponent comes back in `libcSplitExponent` and m from this. Subnormals are scaled up first.
+var libcSplitExponent: int = 0
+
+fun libcSplit(x: f64): f64 {
+    var bits = f64ToBits(x)
+    var adjust = 0
+    if (((bits >> 52) & 2047) == 0) {
+        bits = f64ToBits(x * 18014398509481984.0)
+        adjust = 54
+    }
+    var e = ((bits >> 52) & 2047) - 1023 - adjust
+    var mantissa = f64FromBits((bits & 4503599627370495) | 4607182418800017408)
+    if (mantissa > 1.4142135623730951) {
+        mantissa = mantissa / 2.0
+        e += 1
+    }
+    libcSplitExponent = e
+    mantissa
+}
+
+fun libcLog2(x: f64): f64 {
+    if (x != x || x == 0.0 || x < 0.0 || x == 1.0 / 0.0) return if (x == 0.0) -1.0 / 0.0 else if (x < 0.0) 0.0 / 0.0 else x
+    val mantissa = libcSplit(x)
+    f64FromInt(libcSplitExponent) + m.log(mantissa) * libcInvLn2
+}
+
+@export("log2")
+fun libcLog2Export(x: f64): f64 = libcLog2(x)
+
+@export("log2f")
+fun libcLog2f(x: f32): f32 = f64ToF32(libcLog2(f32ToF64(x)))
+
+// log10: a power of ten up to 10^22 is exact in a double and gives its exponent exactly, as a C library's does.
+@export("log10")
+fun libcLog10(x: f64): f64 {
+    if (x != x || x == 0.0 || x < 0.0 || x == 1.0 / 0.0) return if (x == 0.0) -1.0 / 0.0 else if (x < 0.0) 0.0 / 0.0 else x
+    val mantissa = libcSplit(x)
+    val r = f64FromInt(libcSplitExponent) * libcLog10Of2 + m.log(mantissa) * libcInvLn10
+    val k = m.roundEven(r)
+    if (m.fabs(k) <= 22.0 && m.pow(10.0, k) == x) return k
+    r
+}
+
+// logb: the unbiased exponent as a double; zero is -inf, infinity +inf, NaN itself.
+@export("logb")
+fun libcLogb(x: f64): f64 {
+    if (x != x) return x
+    val a = m.fabs(x)
+    if (a == 0.0) return -1.0 / 0.0
+    if (a == 1.0 / 0.0) return a
+    var bits = f64ToBits(a)
+    var adjust = 0
+    if (((bits >> 52) & 2047) == 0) {
+        bits = f64ToBits(a * 18014398509481984.0)
+        adjust = 54
+    }
+    f64FromInt(((bits >> 52) & 2047) - 1023 - adjust)
+}

@@ -1,0 +1,320 @@
+// iconv (#806 step C): character set conversion between UTF-8, UTF-16 and UTF-32 (little and big endian, and the plain names, which write a
+// byte order mark first and read one if present), ASCII and ISO-8859-1, through Unicode scalar values. These are the sets LLVM's
+// convertUTF paths and libstdc++'s codecvt ask for (WCHAR_T is UTF-32LE here). A name may carry //TRANSLIT (a character the target cannot
+// hold becomes '?', counted as irreversible) or //IGNORE (it is dropped); other suffixes are accepted and ignored. Any other set fails
+// iconv_open with EINVAL. A handle is 32 bytes: from, to, flags (1 translit, 2 ignore) and the byte-order state (0 not seen, 1 little, 2 big).
+import "abla/runtime/scalar"
+import "./errno.ab"
+import "./fs.ab"
+import "./memory.ab"
+import "./time.ab"
+
+// Set numbers: 1 UTF-8, 2 ASCII, 3 ISO-8859-1, 4 UTF-16LE, 5 UTF-16BE, 6 UTF-32LE, 7 UTF-32BE, 8 UTF-16, 9 UTF-32.
+trusted fun libcIconvSet(name: int): int {
+    var text = ""
+    var at = 0
+    var stop = false
+    while (!stop && ablaRuntimeLoadU8(name + at) != 0) {
+        var c = ablaRuntimeLoadU8(name + at)
+        if (c == 47) stop = true
+        else {
+            if (c >= 97 && c <= 122) c = c - 32
+            text = text + libcChar(c)
+            at += 1
+        }
+    }
+    if (text == "UTF-8" || text == "UTF8") return 1
+    if (text == "ASCII" || text == "US-ASCII" || text == "ANSI_X3.4-1968" || text == "646") return 2
+    if (text == "ISO-8859-1" || text == "ISO8859-1" || text == "LATIN1" || text == "ISO_8859-1" || text == "L1") return 3
+    if (text == "UTF-16LE" || text == "UCS-2LE") return 4
+    if (text == "UTF-16BE" || text == "UCS-2BE") return 5
+    if (text == "UTF-32LE" || text == "UCS-4LE" || text == "WCHAR_T") return 6
+    if (text == "UTF-32BE" || text == "UCS-4BE") return 7
+    if (text == "UTF-16" || text == "UCS-2") return 8
+    if (text == "UTF-32" || text == "UCS-4") return 9
+    0
+}
+
+// The conversion options after the first "//": 1 for TRANSLIT, 2 for IGNORE (the tail is upper-cased in passing).
+trusted fun libcIconvFlags(name: int): int {
+    var at = 0
+    var flags = 0
+    var text = ""
+    while (ablaRuntimeLoadU8(name + at) != 0) {
+        var c = ablaRuntimeLoadU8(name + at)
+        if (c >= 97 && c <= 122) c = c - 32
+        text = text + libcChar(c)
+        at += 1
+    }
+    if (libcIconvHas(text, "//TRANSLIT")) flags = flags | 1
+    if (libcIconvHas(text, "//IGNORE")) flags = flags | 2
+    flags
+}
+
+@export("iconv_open")
+trusted fun libcIconvOpen(to: int, from: int): int {
+    val toSet = libcIconvSet(to)
+    val fromSet = libcIconvSet(from)
+    if (toSet == 0 || fromSet == 0) {
+        libcSetErrno(22)
+        return -1
+    }
+    val handle = libcMalloc(32)
+    if (handle == 0) {
+        libcSetErrno(12)
+        return -1
+    }
+    ablaRuntimeStoreI64(handle, fromSet)
+    ablaRuntimeStoreI64(handle + 8, toSet)
+    ablaRuntimeStoreI64(handle + 16, libcIconvFlags(to))
+    ablaRuntimeStoreI64(handle + 24, 0)
+    handle
+}
+
+@export("iconv_close")
+trusted fun libcIconvClose(handle: int): int {
+    if (handle == 0 || handle == -1) {
+        libcSetErrno(9)
+        return -1
+    }
+    libcFree(handle)
+    0
+}
+
+trusted fun libcIconvU16(set: int, state: int, at: int): int =
+    if ((set == 5) || (set == 8 && state == 2)) ablaRuntimeLoadU8(at) * 256 + ablaRuntimeLoadU8(at + 1)
+    else ablaRuntimeLoadU8(at) + ablaRuntimeLoadU8(at + 1) * 256
+
+trusted fun libcIconvU32(set: int, state: int, at: int): int =
+    if ((set == 7) || (set == 9 && state == 2))
+        ablaRuntimeLoadU8(at) * 16777216 + ablaRuntimeLoadU8(at + 1) * 65536 + ablaRuntimeLoadU8(at + 2) * 256 + ablaRuntimeLoadU8(at + 3)
+    else ablaRuntimeLoadU8(at) + ablaRuntimeLoadU8(at + 1) * 256 + ablaRuntimeLoadU8(at + 2) * 65536 + ablaRuntimeLoadU8(at + 3) * 16777216
+
+// Decode one scalar value at `at` with `left` bytes remaining: (length << 32) | value, -1 when the input ends inside a character, -2 for an
+// invalid one. `state` is the byte-order state of the handle (for sets 8 and 9, read from a byte order mark by the caller).
+trusted fun libcIconvDecode(set: int, state: int, at: int, left: int): int {
+    val b0 = ablaRuntimeLoadU8(at)
+    if (set == 1) {
+        if (b0 < 128) return (1 << 32) | b0
+        var need = 0
+        var value = 0
+        if (b0 >= 194 && b0 <= 223) { need = 2; value = b0 & 31 }
+        else if (b0 >= 224 && b0 <= 239) { need = 3; value = b0 & 15 }
+        else if (b0 >= 240 && b0 <= 244) { need = 4; value = b0 & 7 }
+        else return -2
+        var i = 1
+        while (i < need) {
+            if (i >= left) return -1
+            val c = ablaRuntimeLoadU8(at + i)
+            if ((c & 192) != 128) return -2
+            value = value * 64 + (c & 63)
+            i += 1
+        }
+        if (need == 3 && (value < 2048 || (value >= 55296 && value <= 57343))) return -2
+        if (need == 4 && (value < 65536 || value > 1114111)) return -2
+        return (need << 32) | value
+    }
+    if (set == 2) return if (b0 < 128) (1 << 32) | b0 else -2
+    if (set == 3) return (1 << 32) | b0
+    if (set == 4 || set == 5 || set == 8) {
+        if (left < 2) return -1
+        val unit = libcIconvU16(set, state, at)
+        if (unit >= 55296 && unit <= 56319) {
+            if (left < 4) return -1
+            val low = libcIconvU16(set, state, at + 2)
+            if (low < 56320 || low > 57343) return -2
+            return (4 << 32) | (65536 + (unit - 55296) * 1024 + (low - 56320))
+        }
+        if (unit >= 56320 && unit <= 57343) return -2
+        return (2 << 32) | unit
+    }
+    if (left < 4) return -1
+    val value = libcIconvU32(set, state, at)
+    if (value > 1114111 || (value >= 55296 && value <= 57343)) return -2
+    (4 << 32) | value
+}
+
+// Encode `value` at `at` with `room` bytes free: the length written, -1 if the set cannot hold it, -2 if there is no room.
+trusted fun libcIconvEncode(set: int, state: int, value: int, at: int, room: int): int {
+    if (set == 1) {
+        if (value < 128) {
+            if (room < 1) return -2
+            ablaRuntimeStoreU8(at, value)
+            return 1
+        }
+        if (value < 2048) {
+            if (room < 2) return -2
+            ablaRuntimeStoreU8(at, 192 | (value >> 6))
+            ablaRuntimeStoreU8(at + 1, 128 | (value & 63))
+            return 2
+        }
+        if (value < 65536) {
+            if (room < 3) return -2
+            ablaRuntimeStoreU8(at, 224 | (value >> 12))
+            ablaRuntimeStoreU8(at + 1, 128 | ((value >> 6) & 63))
+            ablaRuntimeStoreU8(at + 2, 128 | (value & 63))
+            return 3
+        }
+        if (room < 4) return -2
+        ablaRuntimeStoreU8(at, 240 | (value >> 18))
+        ablaRuntimeStoreU8(at + 1, 128 | ((value >> 12) & 63))
+        ablaRuntimeStoreU8(at + 2, 128 | ((value >> 6) & 63))
+        ablaRuntimeStoreU8(at + 3, 128 | (value & 63))
+        return 4
+    }
+    if (set == 2 || set == 3) {
+        if (value >= (if (set == 2) 128 else 256)) return -1
+        if (room < 1) return -2
+        ablaRuntimeStoreU8(at, value)
+        return 1
+    }
+    val big = set == 5 || set == 7 || ((set == 8 || set == 9) && state == 2)
+    if (set == 4 || set == 5 || set == 8) {
+        if (value >= 65536) {
+            if (room < 4) return -2
+            val v = value - 65536
+            val high = 55296 + (v >> 10)
+            val low = 56320 + (v & 1023)
+            libcIconvPut16(big, at, high)
+            libcIconvPut16(big, at + 2, low)
+            return 4
+        }
+        if (room < 2) return -2
+        libcIconvPut16(big, at, value)
+        return 2
+    }
+    if (room < 4) return -2
+    if (big) {
+        ablaRuntimeStoreU8(at, (value >> 24) & 255)
+        ablaRuntimeStoreU8(at + 1, (value >> 16) & 255)
+        ablaRuntimeStoreU8(at + 2, (value >> 8) & 255)
+        ablaRuntimeStoreU8(at + 3, value & 255)
+    } else {
+        ablaRuntimeStoreU8(at, value & 255)
+        ablaRuntimeStoreU8(at + 1, (value >> 8) & 255)
+        ablaRuntimeStoreU8(at + 2, (value >> 16) & 255)
+        ablaRuntimeStoreU8(at + 3, (value >> 24) & 255)
+    }
+    4
+}
+
+trusted fun libcIconvPut16(big: bool, at: int, unit: int): void {
+    if (big) {
+        ablaRuntimeStoreU8(at, (unit >> 8) & 255)
+        ablaRuntimeStoreU8(at + 1, unit & 255)
+    } else {
+        ablaRuntimeStoreU8(at, unit & 255)
+        ablaRuntimeStoreU8(at + 1, (unit >> 8) & 255)
+    }
+    return
+}
+
+// iconv: convert as much as fits. The pointers and counts are advanced past what was converted, also when it stops on an error (EILSEQ 84 for
+// an invalid or unconvertible character, EINVAL 22 for input that ends inside a character, E2BIG 7 for a full output). The result is the
+// number of irreversible conversions (//TRANSLIT replacements). With a NULL input it resets the state, and a plain UTF-16 or UTF-32 target
+// writes its byte order mark again.
+@export("iconv")
+trusted fun libcIconv(handle: int, inPointer: int, inLeft: int, outPointer: int, outLeft: int): int {
+    if (handle == 0 || handle == -1) {
+        libcSetErrno(9)
+        return -1
+    }
+    if (inPointer == 0 || ablaRuntimeLoadI64(inPointer) == 0) {
+        ablaRuntimeStoreI64(handle + 24, 0)
+        return 0
+    }
+    val from = ablaRuntimeLoadI64(handle)
+    val to = ablaRuntimeLoadI64(handle + 8)
+    val flags = ablaRuntimeLoadI64(handle + 16)
+    var state = ablaRuntimeLoadI64(handle + 24)
+    var input = ablaRuntimeLoadI64(inPointer)
+    var left = ablaRuntimeLoadI64(inLeft)
+    var output = ablaRuntimeLoadI64(outPointer)
+    var room = ablaRuntimeLoadI64(outLeft)
+    var irreversible = 0
+    var error = 0
+    // A plain UTF-16/UTF-32 source reads its byte order mark first (little endian without one).
+    var sourceState = state & 3
+    var sourceMarked = (state & 4) != 0
+    var targetMarked = (state & 8) != 0
+    while (error == 0 && left > 0) {
+        if ((from == 8 || from == 9) && !sourceMarked) {
+            val width = if (from == 8) 2 else 4
+            if (left < width) { error = 22; break }
+            if (from == 8) {
+                val first = ablaRuntimeLoadU8(input)
+                val second = ablaRuntimeLoadU8(input + 1)
+                if (first == 255 && second == 254) { sourceState = 1; input += 2; left -= 2 }
+                else if (first == 254 && second == 255) { sourceState = 2; input += 2; left -= 2 }
+                else sourceState = 1
+            } else {
+                val bom = ablaRuntimeLoadU8(input) + ablaRuntimeLoadU8(input + 1) * 256 + ablaRuntimeLoadU8(input + 2) * 65536 + ablaRuntimeLoadU8(input + 3) * 16777216
+                if (bom == 65279) { sourceState = 1; input += 4; left -= 4 }
+                else if (bom == 4294836224) { sourceState = 2; input += 4; left -= 4 }
+                else sourceState = 1
+            }
+            sourceMarked = true
+            continue
+        }
+        val decoded = libcIconvDecode(from, sourceState, input, left)
+        if (decoded == -1) { error = 22; break }
+        if (decoded == -2) {
+            if ((flags & 2) != 0) {
+                input += 1
+                left -= 1
+                continue
+            }
+            error = 84
+            break
+        }
+        val length = decoded >> 32
+        val value = decoded & 4294967295
+        if ((to == 8 || to == 9) && !targetMarked) {
+            val mark = if (to == 8) 2 else 4
+            if (room < mark) { error = 7; break }
+            ablaRuntimeStoreU8(output, 255)
+            ablaRuntimeStoreU8(output + 1, 254)
+            if (to == 9) {
+                ablaRuntimeStoreU8(output + 2, 0)
+                ablaRuntimeStoreU8(output + 3, 0)
+            }
+            output += mark
+            room -= mark
+            targetMarked = true
+        }
+        var written = libcIconvEncode(to, 1, value, output, room)
+        if (written == -1) {
+            if ((flags & 1) != 0) {
+                written = libcIconvEncode(to, 1, 63, output, room)
+                if (written > 0) irreversible += 1
+            } else if ((flags & 2) != 0) {
+                written = 0
+            }
+        }
+        if (written == -2) { error = 7; break }
+        if (written == -1) { error = 84; break }
+        input += length
+        left -= length
+        output += written
+        room -= written
+    }
+    ablaRuntimeStoreI64(handle + 24, sourceState | (if (sourceMarked) 4 else 0) | (if (targetMarked) 8 else 0))
+    ablaRuntimeStoreI64(inPointer, input)
+    ablaRuntimeStoreI64(inLeft, left)
+    ablaRuntimeStoreI64(outPointer, output)
+    ablaRuntimeStoreI64(outLeft, room)
+    if (error != 0) {
+        libcSetErrno(error)
+        return -1
+    }
+    irreversible
+}
+
+trusted fun libcIconvHas(text: string, needle: string): bool {
+    var i = 0
+    while (i + needle.size <= text.size) {
+        if (text.slice(i, i + needle.size) == needle) return true
+        i += 1
+    }
+    false
+}

@@ -1,0 +1,168 @@
+// posix_spawn and its file actions (#806 step C), for LLVM's llvm::sys::ExecuteNoWait (the compiler running a tool such as the linker). The
+// child is made by fork and runs the file actions, then execve; the parent learns of a failure of either through a close-on-exec pipe, as the
+// result of posix_spawn (an error number, not -1), so a program that does not exist is reported to the caller and not as an exit status 127.
+// The child runs only system calls over memory made before the fork (no allocation). The attributes argument is ignored: LLVM passes none.
+//
+// posix_spawn_file_actions_t is 80 bytes in glibc and opaque to callers; here word 0 is the number of actions, word 1 the capacity and word 2
+// the table of 40-byte records: kind (1 open, 2 dup2), descriptor, second descriptor or open flags, mode, a copy of the path.
+import "abla/runtime/scalar"
+import "abla/sys/linux"
+import "./errno.ab"
+import "./fs.ab"
+import "./memory.ab"
+
+@export("posix_spawn_file_actions_init")
+trusted fun libcSpawnActionsInit(actions: int): int {
+    ablaRuntimeStoreI64(actions, 0)
+    ablaRuntimeStoreI64(actions + 8, 0)
+    ablaRuntimeStoreI64(actions + 16, 0)
+    0
+}
+
+@export("posix_spawn_file_actions_destroy")
+trusted fun libcSpawnActionsDestroy(actions: int): int {
+    val count = ablaRuntimeLoadI64(actions)
+    val table = ablaRuntimeLoadI64(actions + 16)
+    var at = 0
+    while (at < count) {
+        libcFree(ablaRuntimeLoadI64(table + at * 40 + 32))
+        at += 1
+    }
+    libcFree(table)
+    ablaRuntimeStoreI64(actions, 0)
+    ablaRuntimeStoreI64(actions + 8, 0)
+    ablaRuntimeStoreI64(actions + 16, 0)
+    0
+}
+
+// The address of a new record, or 0 when memory ran out.
+trusted fun libcSpawnActionsAdd(actions: int): int {
+    val count = ablaRuntimeLoadI64(actions)
+    val capacity = ablaRuntimeLoadI64(actions + 8)
+    if (count == capacity) {
+        val newCapacity = if (capacity == 0) 4 else capacity * 2
+        val table = libcRealloc(ablaRuntimeLoadI64(actions + 16), newCapacity * 40)
+        if (table == 0) return 0
+        ablaRuntimeStoreI64(actions + 8, newCapacity)
+        ablaRuntimeStoreI64(actions + 16, table)
+    }
+    ablaRuntimeStoreI64(actions, count + 1)
+    val record = ablaRuntimeLoadI64(actions + 16) + count * 40
+    ablaRuntimeStoreI64(record + 32, 0)
+    record
+}
+
+@export("posix_spawn_file_actions_addopen")
+trusted fun libcSpawnActionsAddopen(actions: int, descriptor: int, path: int, flags: int, mode: int): int {
+    val fd = libcInt(descriptor)
+    if (fd < 0) return 9
+    var length = 0
+    while (ablaRuntimeLoadU8(path + length) != 0) length += 1
+    val copy = libcMalloc(length + 1)
+    if (copy == 0) return 12
+    var i = 0
+    while (i <= length) {
+        ablaRuntimeStoreU8(copy + i, ablaRuntimeLoadU8(path + i))
+        i += 1
+    }
+    val record = libcSpawnActionsAdd(actions)
+    if (record == 0) {
+        libcFree(copy)
+        return 12
+    }
+    ablaRuntimeStoreI64(record, 1)
+    ablaRuntimeStoreI64(record + 8, fd)
+    ablaRuntimeStoreI64(record + 16, libcInt(flags))
+    ablaRuntimeStoreI64(record + 24, mode & 4294967295)
+    ablaRuntimeStoreI64(record + 32, copy)
+    0
+}
+
+@export("posix_spawn_file_actions_adddup2")
+trusted fun libcSpawnActionsAdddup2(actions: int, descriptor: int, target: int): int {
+    val fd = libcInt(descriptor)
+    val to = libcInt(target)
+    if (fd < 0 || to < 0) return 9
+    val record = libcSpawnActionsAdd(actions)
+    if (record == 0) return 12
+    ablaRuntimeStoreI64(record, 2)
+    ablaRuntimeStoreI64(record + 8, fd)
+    ablaRuntimeStoreI64(record + 16, to)
+    ablaRuntimeStoreI64(record + 24, 0)
+    0
+}
+
+// In the child: write the error number to the pipe and end with status 127.
+trusted fun libcSpawnChildFail(pipe: int, scratch: int, code: int): void {
+    ablaRuntimeStoreI32(scratch, code)
+    linuxSyscall3(1, pipe, scratch, 4)
+    linuxSyscall1(231, 127)
+    return
+}
+
+@export("posix_spawn")
+trusted fun libcPosixSpawn(pidAddress: int, path: int, actions: int, attributes: int, argv: int, envp: int): int {
+    val scratch = libcMalloc(16)
+    if (scratch == 0) return 12
+    // The close-on-exec pipe, its write end moved above any descriptor an action names.
+    var made = linuxSyscall2(293, scratch, 524288)
+    if (made < 0) {
+        libcFree(scratch)
+        return 0 - made
+    }
+    val readEnd = ablaRuntimeLoadI32(scratch)
+    var writeEnd = linuxSyscall3(72, ablaRuntimeLoadI32(scratch + 4), 1030, 1000)
+    linuxSyscall1(3, ablaRuntimeLoadI32(scratch + 4))
+    if (writeEnd < 0) {
+        linuxSyscall1(3, readEnd)
+        libcFree(scratch)
+        return 0 - writeEnd
+    }
+    val count = if (actions == 0) 0 else ablaRuntimeLoadI64(actions)
+    val table = if (actions == 0) 0 else ablaRuntimeLoadI64(actions + 16)
+    val child = linuxSyscall0(57)
+    if (child < 0) {
+        linuxSyscall1(3, readEnd)
+        linuxSyscall1(3, writeEnd)
+        libcFree(scratch)
+        return 0 - child
+    }
+    if (child == 0) {
+        var at = 0
+        while (at < count) {
+            val record = table + at * 40
+            val kind = ablaRuntimeLoadI64(record)
+            val fd = ablaRuntimeLoadI64(record + 8)
+            if (kind == 1) {
+                val opened = linuxSyscall3(2, ablaRuntimeLoadI64(record + 32), ablaRuntimeLoadI64(record + 16), ablaRuntimeLoadI64(record + 24))
+                if (opened < 0) libcSpawnChildFail(writeEnd, scratch, 0 - opened)
+                if (opened != fd) {
+                    val moved = linuxSyscall2(33, opened, fd)
+                    linuxSyscall1(3, opened)
+                    if (moved < 0) libcSpawnChildFail(writeEnd, scratch, 0 - moved)
+                }
+            } else {
+                val to = ablaRuntimeLoadI64(record + 16)
+                val moved = if (fd == to) linuxSyscall3(72, fd, 2, 0) else linuxSyscall2(33, fd, to)
+                if (moved < 0) libcSpawnChildFail(writeEnd, scratch, 0 - moved)
+            }
+            at += 1
+        }
+        val failed = linuxSyscall3(59, path, argv, envp)
+        libcSpawnChildFail(writeEnd, scratch, 0 - failed)
+    }
+    linuxSyscall1(3, writeEnd)
+    // The pipe is closed by the child's exec (nothing to read) or written with the error number (4 bytes).
+    var got = linuxSyscall3(0, readEnd, scratch + 8, 4)
+    while (got == -4) got = linuxSyscall3(0, readEnd, scratch + 8, 4)
+    linuxSyscall1(3, readEnd)
+    if (got == 4) {
+        val code = ablaRuntimeLoadI32(scratch + 8)
+        linuxSyscall4(61, child, 0, 0, 0)
+        libcFree(scratch)
+        return code
+    }
+    libcFree(scratch)
+    if (pidAddress != 0) ablaRuntimeStoreI32(pidAddress, child)
+    0
+}

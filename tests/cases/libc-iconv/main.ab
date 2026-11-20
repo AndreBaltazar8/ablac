@@ -1,0 +1,119 @@
+// iconv of the statically linked compiler's C library (src/static_libc/iconv.ab, #806 step C), called as the ordinary functions they are:
+// UTF-8 to and from UTF-16, UTF-32, ASCII and Latin-1, byte order marks, //TRANSLIT and //IGNORE, and the three errors (EILSEQ, EINVAL,
+// E2BIG) with the pointers left where the conversion stopped. The program exits 42.
+import "abla/io"
+import "abla/runtime/scalar"
+import "../../../src/static_libc/iconv.ab"
+import "../../../src/static_libc/memory.ab"
+import "../../../src/static_libc/errno.ab"
+
+var failures = 0
+
+fun check(what: string, ok: bool) {
+    if (!ok) {
+        failures += 1
+        println("libc-iconv: $what")
+    }
+}
+
+// A C string of the bytes of `values`, and four words for the pointers and counts.
+trusted fun bytesOf(values: array<int>): int {
+    val at = libcMalloc(values.size + 1)
+    var i = 0
+    while (i < values.size) {
+        ablaRuntimeStoreU8(at + i, values[i])
+        i += 1
+    }
+    ablaRuntimeStoreU8(at + values.size, 0)
+    at
+}
+
+trusted fun cstr(text: string): int {
+    val at = libcMalloc(text.size + 1)
+    var i = 0
+    while (i < text.size) {
+        ablaRuntimeStoreU8(at + i, text[i])
+        i += 1
+    }
+    ablaRuntimeStoreU8(at + text.size, 0)
+    at
+}
+
+// Convert `input` from one set to another into `room` bytes; returns the output bytes as an array, with the result, errno, and the bytes left in
+// the input and output at the end in the last four elements.
+trusted fun run(to: string, from: string, input: array<int>, room: int): array<int> {
+    val cd = libcIconvOpen(cstr(to), cstr(from))
+    if (cd == -1) return [-100]
+    val source = bytesOf(input)
+    val target = libcMalloc(room + 1)
+    val cells = libcMalloc(32)
+    ablaRuntimeStoreI64(cells, source)
+    ablaRuntimeStoreI64(cells + 8, input.size)
+    ablaRuntimeStoreI64(cells + 16, target)
+    ablaRuntimeStoreI64(cells + 24, room)
+    libcSetErrno(0)
+    val result = libcIconv(cd, cells, cells + 8, cells + 16, cells + 24)
+    var out: array<int> = []
+    var i = 0
+    val produced = room - ablaRuntimeLoadI64(cells + 24)
+    while (i < produced) {
+        out.append(ablaRuntimeLoadU8(target + i))
+        i += 1
+    }
+    out.append(result)
+    out.append(ablaRuntimeLoadI64(libcErrnoAddress()))
+    out.append(ablaRuntimeLoadI64(cells + 8))
+    out.append(ablaRuntimeLoadI64(cells + 24))
+    libcIconvClose(cd)
+    out
+}
+
+trusted fun main: int {
+    // "aé€😀" in UTF-8: 61 C3 A9 E2 82 AC F0 9F 98 80.
+    val utf8 = [97, 195, 169, 226, 130, 172, 240, 159, 152, 128]
+    check("utf-8 to utf-16le", same(run("UTF-16LE", "UTF-8", utf8, 64), [97, 0, 233, 0, 172, 32, 61, 216, 0, 222, 0, 0, 0, 64 - 10]))
+    check("utf-8 to utf-16be", same(run("UTF-16BE", "UTF-8", utf8, 64), [0, 97, 0, 233, 32, 172, 216, 61, 222, 0, 0, 0, 0, 64 - 10]))
+    check("utf-8 to utf-32le", same(run("UTF-32LE", "UTF-8", utf8, 64), [97, 0, 0, 0, 233, 0, 0, 0, 172, 32, 0, 0, 0, 246, 1, 0, 0, 0, 0, 64 - 16]))
+    check("wchar_t is utf-32le", same(run("WCHAR_T", "UTF-8", [97], 8), [97, 0, 0, 0, 0, 0, 0, 4]))
+    check("utf-16 back to utf-8", same(run("UTF-8", "UTF-16LE", [97, 0, 233, 0, 172, 32, 61, 216, 0, 222], 64), [97, 195, 169, 226, 130, 172, 240, 159, 152, 128, 0, 0, 0, 54]))
+    check("plain utf-16 writes a mark", same(run("UTF-16", "UTF-8", [97], 16), [255, 254, 97, 0, 0, 0, 0, 12]))
+    check("plain utf-16 reads a big endian mark", same(run("UTF-8", "UTF-16", [254, 255, 0, 97], 16), [97, 0, 0, 0, 15]))
+    check("plain utf-32 reads a mark", same(run("UTF-8", "UTF-32", [255, 254, 0, 0, 97, 0, 0, 0], 16), [97, 0, 0, 0, 15]))
+    check("latin-1", same(run("ISO-8859-1", "UTF-8", [97, 195, 169], 8), [97, 233, 0, 0, 0, 6]))
+    check("latin-1 to utf-8", same(run("UTF-8", "LATIN1", [233], 8), [195, 169, 0, 0, 0, 6]))
+    check("ascii to utf-8", same(run("UTF-8", "US-ASCII", [104, 105], 8), [104, 105, 0, 0, 0, 6]))
+    // Errors, and where the conversion stopped.
+    val unencodable = run("ASCII", "UTF-8", [97, 195, 169, 98], 8)
+    check("unencodable: EILSEQ after the first character", same(unencodable, [97, -1, 84, 3, 7]))
+    val truncated = run("UTF-16LE", "UTF-8", [97, 226, 130], 16)
+    check("truncated input: EINVAL", same(truncated, [97, 0, -1, 22, 2, 14]))
+    val invalid = run("UTF-16LE", "UTF-8", [97, 255, 98], 16)
+    check("invalid input: EILSEQ", same(invalid, [97, 0, -1, 84, 2, 14]))
+    val overlong = run("UTF-16LE", "UTF-8", [192, 128], 16)
+    check("overlong input: EILSEQ", same(overlong, [-1, 84, 2, 16]))
+    val surrogate = run("UTF-8", "UTF-8", [237, 160, 128], 16)
+    check("surrogate in utf-8: EILSEQ", same(surrogate, [-1, 84, 3, 16]))
+    val full = run("UTF-8", "UTF-8", [97, 226, 130, 172, 98], 4)
+    check("full output: E2BIG with the third character left", same(full, [97, -1, 7, 4, 1]) || same(full, [97, 226, 130, 172, -1, 7, 1, 0]))
+    check("lone low surrogate in utf-16: EILSEQ", same(run("UTF-8", "UTF-16LE", [0, 220], 8), [-1, 84, 2, 8]))
+    // //TRANSLIT replaces, //IGNORE drops.
+    check("translit", same(run("ASCII//TRANSLIT", "UTF-8", [97, 195, 169, 98], 8), [97, 63, 98, 1, 0, 0, 5]))
+    check("ignore", same(run("ASCII//IGNORE", "UTF-8", [97, 195, 169, 98], 8), [97, 98, 0, 0, 0, 6]))
+    // Unknown sets, and the reset call.
+    check("unknown set", same(run("EBCDIC", "UTF-8", [97], 8), [-100]))
+    val cd = libcIconvOpen(cstr("UTF-16"), cstr("UTF-8"))
+    check("reset", libcIconv(cd, 0, 0, 0, 0) == 0)
+    check("close", libcIconvClose(cd) == 0)
+    if (failures == 0) { println("libc iconv: ok"); return 42 }
+    1
+}
+
+fun same(a: array<int>, b: array<int>): bool {
+    if (a.size != b.size) return false
+    var i = 0
+    while (i < a.size) {
+        if (a[i] != b[i]) return false
+        i += 1
+    }
+    true
+}
