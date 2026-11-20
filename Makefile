@@ -215,6 +215,7 @@ test-serial: ablac
 	tools/test-arrays-dense.sh $(COMPILER)
 	tools/test-json-limits.sh $(COMPILER)
 	tools/test-yaml.sh $(COMPILER)
+	tools/test-yaml-diff.sh $(COMPILER)
 	tools/test-workflow-syntax.sh $(COMPILER)
 	tools/test-gzip-inflate.sh $(COMPILER)
 	tools/test-gzip-stream.sh $(COMPILER)

@@ -20,7 +20,7 @@ class YamlParser(val source: string, val limits: YamlLimits, val keepSource: boo
     val indents: array<int>, val nodes: array<YamlSourceNode>,
     val anchors: Map<string, int>, var anchorCount: int, var aliasCount: int,
     var work: int, var flowIndent: int, var errorCode: string, var errorMessage: string,
-    var errorOffset: int)
+    var errorOffset: int, var lastLine: int)
 fun YamlParser.fail(code: string, message: string, offset: int): void {
     if (this.errorCode == "") {
         this.errorCode = code
@@ -34,12 +34,17 @@ fun YamlParser.tick(amount: int): void {
         "YAML parsing work limit exceeded", this.pos)
 }
 fun YamlParser.lineOf(offset: int): int {
+    // The parser reads forward, so the line asked about last is usually the one asked about again.
+    val hint = this.lastLine
+    if (hint < this.starts.size && this.starts[hint] <= offset &&
+        (hint + 1 == this.starts.size || offset < this.starts[hint + 1])) return hint
     var lo = 0
     var hi = this.starts.size
     while (lo + 1 < hi) {
         val mid = (lo + hi) / 2
         if (this.starts[mid] <= offset) lo = mid else hi = mid
     }
+    this.lastLine = lo
     lo
 }
 fun YamlParser.endLine(): int = this.ends[this.lineOf(this.pos)]
@@ -373,7 +378,10 @@ fun YamlParser.presentationBlank(line: int): bool {
     pos == this.ends[line]
 }
 fun YamlParser.plain(flow: bool, key: bool, parentIndent: int): string {
-    val output = byteBuffer()
+    // A scalar that ends on its first line (nearly all do) is that line's slice: the buffer is made only when a second
+    // piece joins it.
+    var first = ""
+    var output: ByteBuffer? = null
     var done = false
     while (!done && this.errorCode == "") {
         val begin = this.pos
@@ -389,7 +397,8 @@ fun YamlParser.plain(flow: bool, key: bool, parentIndent: int): string {
         var finish = this.pos
         while (finish > begin && yamlSpace(this.source[finish - 1])) finish -= 1
         this.printable(begin, finish)
-        output.appendText(this.source.slice(begin, finish))
+        val piece = this.source.slice(begin, finish)
+        if (output != null) yamlBufferAppend(output, piece) else first = piece
         this.tick(this.pos - begin + 1)
         if ((key && !flow) || this.pos < end || end == this.source.size) done = true
         else {
@@ -403,15 +412,26 @@ fun YamlParser.plain(flow: bool, key: bool, parentIndent: int): string {
                 !(this.documentMarker(this.starts[line]))) {
                 this.pos = this.starts[line] + this.indents[line]
                 this.spaces()
-                if (blanks == 0) output.appendText(" ")
-                else { var i = 0; while (i < blanks) { output.appendText("\n"); i += 1 } }
+                if (output == null) {
+                    val made = byteBuffer()
+                    made.appendText(first)
+                    output = made
+                }
+                if (blanks == 0) yamlBufferAppend(output, " ")
+                else { var i = 0; while (i < blanks) { yamlBufferAppend(output, "\n"); i += 1 } }
             } else done = true
         }
-        if (output.size() > this.limits.maximumScalarBytes) this.fail("limit.scalar",
+        if (yamlBufferSize(output, first.size) > this.limits.maximumScalarBytes) this.fail("limit.scalar",
             "YAML scalar byte limit exceeded", begin)
     }
-    output.toText()
+    yamlBufferText(output, first)
 }
+fun yamlBufferAppend(var buffer: ByteBuffer?, text: string): void {
+    if (buffer != null) buffer.appendText(text)
+    return
+}
+fun yamlBufferSize(buffer: ByteBuffer?, otherwise: int): int = if (buffer != null) buffer.size() else otherwise
+fun yamlBufferText(buffer: ByteBuffer?, otherwise: string): string = if (buffer != null) buffer.toText() else otherwise
 fun YamlParser.blockScalar(parentIndent: int): string {
     val folded = this.byte() == 62
     this.pos += 1
@@ -803,7 +823,7 @@ fun yamlErrorAt(source: string, code: string, message: string, offset: int): Yam
 }
 fun yamlReadSource(source: string, limits: YamlLimits, keepSource: bool): YamlSourceResult {
     val p = YamlParser(source, limits, keepSource, 0, [], [], [], [], [], Map(), 0, 0, 0, -1, "",
-        "", 0)
+        "", 0, 0)
     if (!yamlLimitsValid(limits)) p.fail("limit.invalid", "Invalid YAML limits", 0)
     if (source.size > limits.maximumBytes) p.fail("limit.bytes", "YAML input byte limit exceeded",
         0)
