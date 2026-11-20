@@ -241,7 +241,15 @@ val jsonNoValues: array<Json> = []
 @threadShared
 val jsonNoNumber = JsonNumber("", false, 0, false)
 
-fun jsonNull(): Json = Json(0, "", 0, false, jsonNoKeys, jsonNoValues, jsonNoNumber)
+// The three leaves without a payload, made once: a node never changes, so every null, true and false shares one.
+@threadShared
+val jsonNullNode = Json(0, "", 0, false, jsonNoKeys, jsonNoValues, jsonNoNumber)
+@threadShared
+val jsonTrueNode = Json(3, "", 0, true, jsonNoKeys, jsonNoValues, jsonNoNumber)
+@threadShared
+val jsonFalseNode = Json(3, "", 0, false, jsonNoKeys, jsonNoValues, jsonNoNumber)
+
+fun jsonNull(): Json = jsonNullNode
 
 fun jsonString(value: string): Json {
     if (value.isValidUtf8()) {
@@ -258,6 +266,10 @@ private fun jsonNumberGrammar(text: string): JsonNumberGrammar {
 private fun jsonNumberKind(text: string): int = jsonNumberKindRange(text, 0, text.size)
 
 // jsonNumberKind of the bytes [begin, end) of `text`, read in place.
+// Whether a byte can be part of a number's text: a digit, a sign, a point or an exponent mark.
+private fun jsonNumberByte(next: int): bool = (next >= 48 && next <= 57) || next == 45 ||
+    next == 43 || next == 46 || next == 101 || next == 69
+
 private fun jsonNumberKindRange(text: string, begin: int, end: int): int {
     var offset = begin
     var valid = end > begin
@@ -372,8 +384,7 @@ fun jsonNumberText(value: string): Json {
 fun jsonInteger(value: int): Json =
     Json(2, "", value, false, jsonNoKeys, jsonNoValues, JsonNumber("$value", true, value, true))
 
-fun jsonBoolean(value: bool): Json =
-    Json(3, "", 0, value, jsonNoKeys, jsonNoValues, jsonNoNumber)
+fun jsonBoolean(value: bool): Json = if (value) jsonTrueNode else jsonFalseNode
 
 fun jsonArray(values: array<Json>): Json =
     Json(4, "", 0, false, jsonNoKeys, values, jsonNoNumber)
@@ -984,6 +995,27 @@ private fun jsonParseValue(var state: JsonParserState, depth: int): Json {
     }
     if ((byte >= 48 && byte <= 57) || byte == 45 || byte == 43) {
         val begin = offset
+        // An integer of 1 to 18 digits without a leading zero, ending at a byte no number continues with, is read
+        // here in one pass (its grammar, its value and its fit are known at once); any other number takes the
+        // general path below.
+        val negative = byte == 45
+        var at = if (negative) begin + 1 else begin
+        val digitsBegin = at
+        var accumulated = 0
+        while (at < size && at - digitsBegin < 19) {
+            val digit = source[at] - 48
+            if (digit < 0 || digit > 9) break
+            accumulated = accumulated * 10 + digit
+            at = at + 1
+        }
+        val digitCount = at - digitsBegin
+        if (digitCount >= 1 && digitCount <= 18 && (digitCount == 1 || source[digitsBegin] != 48) &&
+            (at >= size || !jsonNumberByte(source[at]))) {
+            state.offset = at
+            val value = if (negative) -accumulated else accumulated
+            return Json(2, "", value, false, jsonNoKeys, jsonNoValues,
+                JsonNumber(source.slice(begin, at), true, value, true))
+        }
         var scanning = true
         while (scanning && offset < size) {
             val next = source[offset]
