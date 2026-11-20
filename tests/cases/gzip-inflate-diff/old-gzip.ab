@@ -1,0 +1,1171 @@
+// DEFLATE (RFC 1951) and gzip (RFC 1952): an encoder (hash-chain LZ77 with lazy matching, each block the smallest of stored, fixed-code and dynamic-code) and an incremental,
+// bounded decoder. The encoder bounds its work: at most `searchLimit` candidates are compared at each position, so hostile input cannot create unbounded compression work.
+
+import "abla/bytes"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+class DeflateBitWriter(
+    val output: ByteBuffer,
+    var bits: int,
+    var count: int,
+    var memory: int,
+    var length: int
+)
+
+// At run time the bytes go to native memory a 32-bit word at a time (capacity for the worst case, `capacity` bytes of input and a margin for the block headers, is reserved by the
+// caller); the compile-time evaluator keeps the byte buffer.
+private trusted fun deflateBitWriter(capacity: int): DeflateBitWriter {
+    val memory = if (ablaAtCompileTime()) 0 else ablaUnsafePointerAddress(ablaUnsafeAllocate(capacity + capacity / 512 + 512))
+    DeflateBitWriter(byteBuffer(), 0, 0, memory, 0)
+}
+
+/** Appends the low `count` bits of `value` (at most 32), least significant first, as DEFLATE packs them. */
+private trusted fun DeflateBitWriter.append(value: int, count: int): void {
+    this.bits = this.bits | ((value & ((1 << count) - 1)) << this.count)
+    this.count = this.count + count
+    if (this.memory == 0) {
+        while (this.count >= 8) {
+            this.output.appendByteValue(this.bits & 255)
+            this.bits = this.bits >>> 8
+            this.count = this.count - 8
+        }
+    } else if (this.count >= 32) {
+        ablaUnsafeStoreU32(nativePointerFromAddress(this.memory + this.length), this.bits & 4294967295)
+        this.length = this.length + 4
+        this.bits = this.bits >>> 32
+        this.count = this.count - 32
+    }
+    return
+}
+
+/** The bits not yet a whole byte, padded to one (a stored block starts on a byte). */
+private fun DeflateBitWriter.alignBits(): int = this.count & 7
+
+private trusted fun DeflateBitWriter.finish(): string {
+    if (this.memory == 0) {
+        if (this.count > 0) this.output.appendByteValue(this.bits & 255)
+        this.bits = 0
+        this.count = 0
+        return this.output.toText()
+    }
+    while (this.count > 0) {
+        ablaUnsafeStoreU8(nativePointerFromAddress(this.memory + this.length), this.bits & 255)
+        this.length = this.length + 1
+        this.bits = this.bits >>> 8
+        this.count = if (this.count > 8) this.count - 8 else 0
+    }
+    val text = nativeByteBuffer(this.length + 1)
+    ablaUnsafeCopyMemory(ablaUnsafePointerAddress(text.pointerAt(0)), this.memory, this.length)
+    ablaUnsafeFree(nativePointerFromAddress(this.memory))
+    this.memory = 0
+    text.adoptString(this.length)
+}
+
+private fun deflateReverseBits(value: int, count: int): int {
+    var input = value
+    var output = 0
+    var bit = 0
+    while (bit < count) {
+        output = (output << 1) | (input & 1)
+        input = input >>> 1
+        bit = bit + 1
+    }
+    output
+}
+
+// Encoding tables are read-only across compressions and threads.
+private val deflateLengthBases: array<int> = [
+    3, 4, 5, 6, 7, 8, 9, 10,
+    11, 13, 15, 17, 19, 23, 27, 31,
+    35, 43, 51, 59, 67, 83, 99, 115,
+    131, 163, 195, 227, 258
+]
+
+private val deflateLengthExtras: array<int> = [
+    0, 0, 0, 0, 0, 0, 0, 0,
+    1, 1, 1, 1, 2, 2, 2, 2,
+    3, 3, 3, 3, 4, 4, 4, 4,
+    5, 5, 5, 5, 0
+]
+
+private val deflateDistanceBases: array<int> = [
+    1, 2, 3, 4, 5, 7, 9, 13,
+    17, 25, 33, 49, 65, 97, 129, 193,
+    257, 385, 513, 769, 1025, 1537, 2049, 3073,
+    4097, 6145, 8193, 12289, 16385, 24577
+]
+
+private val deflateDistanceExtras: array<int> = [
+    0, 0, 0, 0, 1, 1, 2, 2,
+    3, 3, 4, 4, 5, 5, 6, 6,
+    7, 7, 8, 8, 9, 9, 10, 10,
+    11, 11, 12, 12, 13, 13
+]
+
+// The order the code-length code's own lengths are sent in (RFC 1951 section 3.2.7).
+private val deflateClOrder: array<int> = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+
+/** The distance code of `distance` (1 to 32768): codes 0 to 3 are the distances 1 to 4, then two codes per power of two. */
+private fun deflateDistanceCode(distance: int): int {
+    val dm = distance - 1
+    if (dm < 4) return dm
+    var b = 0
+    var t = dm
+    while (t > 1) {
+        t = t >> 1
+        b = b + 1
+    }
+    2 * b + ((dm >> (b - 1)) & 1)
+}
+
+/** How many extra bits a distance code carries, and the first distance it stands for. */
+private fun deflateDistanceExtraBits(code: int): int = if (code < 4) 0 else (code >> 1) - 1
+private fun deflateDistanceBase(code: int): int =
+    if (code < 4) code + 1 else (1 << ((code >> 1) - 1)) * (2 + (code & 1)) + 1
+
+// A token is a literal (0 to 255) or a match: 8388608 | (length - 3) << 15 | (distance - 1).
+private fun deflateMatchToken(length: int, distance: int): int = 8388608 | ((length - 3) << 15) | (distance - 1)
+
+/** The code lengths (0 for a symbol that does not occur) of a Huffman code for the `count` symbols with the frequencies `freq`, none longer than `limit`: the
+ *  classic tree (the symbols sorted by frequency, then the two lightest nodes joined again and again from the two queues of leaves and of joined nodes), and the
+ *  frequencies halved (but kept above zero) until the tree fits the limit. */
+private fun deflateCodeLengths(freq: array<int>, count: int, limit: int): array<int> {
+    val lengths = filledArray(count, 0)
+    val symbols: array<int> = []
+    for (i in 0 until count) if (freq[i] > 0) symbols.append(i)
+    val used = symbols.size
+    if (used == 0) return lengths
+    if (used == 1) {
+        lengths[symbols[0]] = 1
+        return lengths
+    }
+    val weights = filledArray(count, 0)
+    for (i in 0 until count) weights[i] = freq[i]
+    var fits = false
+    while (!fits) {
+        // The used symbols in order of weight (insertion sort: few symbols, nearly sorted runs).
+        val order: array<int> = []
+        for (symbol in symbols) {
+            var at = order.size
+            order.append(symbol)
+            while (at > 0 && weights[order[at - 1]] > weights[symbol]) {
+                order[at] = order[at - 1]
+                at = at - 1
+            }
+            order[at] = symbol
+        }
+        // Leaves are nodes 0 to used - 1 (in order), joined nodes used and up; parent[node] is the joined node above it.
+        val weight: array<int> = []
+        val parent: array<int> = []
+        for (i in 0 until used) {
+            weight.append(weights[order[i]])
+            parent.append(-1)
+        }
+        var leaf = 0
+        var joined = used
+        var made = 0
+        while (made < used - 1) {
+            var picked = 0
+            var first = -1
+            var second = -1
+            while (picked < 2) {
+                var node = -1
+                if (leaf < used && (joined >= used + made || weight[leaf] <= weight[joined])) {
+                    node = leaf
+                    leaf = leaf + 1
+                } else {
+                    node = joined
+                    joined = joined + 1
+                }
+                if (picked == 0) first = node else second = node
+                picked = picked + 1
+            }
+            weight.append(weight[first] + weight[second])
+            parent.append(-1)
+            parent[first] = weight.size - 1
+            parent[second] = weight.size - 1
+            made = made + 1
+        }
+        // Depths from the root down: a node's parent has a larger index.
+        val depth = filledArray(weight.size, 0)
+        var top = weight.size - 2
+        while (top >= 0) {
+            depth[top] = depth[parent[top]] + 1
+            top = top - 1
+        }
+        fits = true
+        for (i in 0 until used) {
+            lengths[order[i]] = depth[i]
+            if (depth[i] > limit) fits = false
+        }
+        if (!fits) {
+            for (symbol in symbols) weights[symbol] = (weights[symbol] + 1) / 2
+        }
+    }
+    lengths
+}
+
+/** The canonical codes of RFC 1951 section 3.2.2 for `lengths`, each already reversed for the LSB-first bit packing. */
+private fun deflateCodes(lengths: array<int>, count: int): array<int> {
+    val lengthCount = filledArray(16, 0)
+    for (i in 0 until count) lengthCount[lengths[i]] = lengthCount[lengths[i]] + 1
+    lengthCount[0] = 0
+    val next = filledArray(16, 0)
+    var code = 0
+    for (bits in 1 until 16) {
+        code = (code + lengthCount[bits - 1]) << 1
+        next[bits] = code
+    }
+    val codes = filledArray(count, 0)
+    for (i in 0 until count) {
+        if (lengths[i] != 0) {
+            codes[i] = deflateReverseBits(next[lengths[i]], lengths[i])
+            next[lengths[i]] = next[lengths[i]] + 1
+        }
+    }
+    codes
+}
+
+private fun deflateFixedLengths(): array<int> {
+    val lengths = filledArray(288, 8)
+    for (i in 144 until 256) lengths[i] = 9
+    for (i in 256 until 280) lengths[i] = 7
+    lengths
+}
+
+/** One block of the tokens `tokens`, covering the `covered` input bytes that start at `start`, `last` or not: whichever of a stored, a fixed-code and a dynamic-code block
+ *  is the smallest. `lengthCode` maps a length to its code. */
+private trusted fun deflateWriteBlock(var writer: DeflateBitWriter, input: string, start: int, covered: int, tokenBase: int, tokenCount: int, tokens: array<int>, last: bool,
+    lengthCode: array<int>): void {
+    // The frequencies, and the extra bits the tokens carry whatever the codes are.
+    val litFreq = filledArray(286, 0)
+    val distFreq = filledArray(30, 0)
+    var extraBits = 0
+    for (index in 0 until tokenCount) {
+        val token = if (tokenBase != 0) ablaUnsafeLoadU32(nativePointerFromAddress(tokenBase + index * 4)) else tokens[index]
+        if (token < 256) litFreq[token] = litFreq[token] + 1
+        else {
+            val length = ((token >> 15) & 255) + 3
+            val distance = (token & 32767) + 1
+            val lc = lengthCode[length]
+            litFreq[257 + lc] = litFreq[257 + lc] + 1
+            extraBits = extraBits + deflateLengthExtras[lc]
+            val dc = deflateDistanceCode(distance)
+            distFreq[dc] = distFreq[dc] + 1
+            extraBits = extraBits + deflateDistanceExtraBits(dc)
+        }
+    }
+    litFreq[256] = 1
+    val litLengths = deflateCodeLengths(litFreq, 286, 15)
+    var distLengths = deflateCodeLengths(distFreq, 30, 15)
+    var distUsed = 0
+    for (i in 0 until 30) if (distFreq[i] > 0) distUsed = distUsed + 1
+    // At least one distance code is sent: a single code of length one, with the other unused.
+    if (distUsed == 0) distLengths[0] = 1
+    // The size of the symbols under the fixed and the dynamic codes.
+    val fixedLengths = deflateFixedLengths()
+    var fixedBits = 3 + extraBits
+    var dynamicSymbolBits = extraBits
+    for (i in 0 until 286) {
+        fixedBits = fixedBits + litFreq[i] * fixedLengths[i]
+        dynamicSymbolBits = dynamicSymbolBits + litFreq[i] * litLengths[i]
+    }
+    for (i in 0 until 30) {
+        fixedBits = fixedBits + distFreq[i] * 5
+        dynamicSymbolBits = dynamicSymbolBits + distFreq[i] * distLengths[i]
+    }
+    // The header of the dynamic block: HLIT, HDIST and the run-length coded lengths of both codes.
+    var hlit = 286
+    while (hlit > 257 && litLengths[hlit - 1] == 0) hlit = hlit - 1
+    var hdist = 30
+    while (hdist > 1 && distLengths[hdist - 1] == 0) hdist = hdist - 1
+    val sequence: array<int> = []
+    for (i in 0 until hlit) sequence.append(litLengths[i])
+    for (i in 0 until hdist) sequence.append(distLengths[i])
+    // Run-length symbols as (symbol, extra bits value) pairs: 0 to 15 a length, 16 repeats the last 3 to 6 times, 17 and 18 repeat zero 3 to 10 and 11 to 138 times.
+    val clSymbols: array<int> = []
+    val clExtra: array<int> = []
+    var at = 0
+    while (at < sequence.size) {
+        val value = sequence[at]
+        var run = 1
+        while (at + run < sequence.size && sequence[at + run] == value) run = run + 1
+        var left = run
+        if (value == 0) {
+            while (left >= 11) {
+                val take = if (left > 138) 138 else left
+                clSymbols.append(18)
+                clExtra.append(take - 11)
+                left = left - take
+            }
+            if (left >= 3) {
+                clSymbols.append(17)
+                clExtra.append(left - 3)
+                left = 0
+            }
+        } else {
+            clSymbols.append(value)
+            clExtra.append(0)
+            left = left - 1
+            while (left >= 3) {
+                val take = if (left > 6) 6 else left
+                clSymbols.append(16)
+                clExtra.append(take - 3)
+                left = left - take
+            }
+        }
+        while (left > 0) {
+            clSymbols.append(value)
+            clExtra.append(0)
+            left = left - 1
+        }
+        at = at + run
+    }
+    val clFreq = filledArray(19, 0)
+    for (symbol in clSymbols) clFreq[symbol] = clFreq[symbol] + 1
+    val clLengths = deflateCodeLengths(clFreq, 19, 7)
+    var hclen = 19
+    while (hclen > 4 && clLengths[deflateClOrder[hclen - 1]] == 0) hclen = hclen - 1
+    var headerBits = 3 + 5 + 5 + 4 + 3 * hclen
+    for (i in 0 until clSymbols.size) {
+        headerBits = headerBits + clLengths[clSymbols[i]]
+        if (clSymbols[i] == 16) headerBits = headerBits + 2
+        else if (clSymbols[i] == 17) headerBits = headerBits + 3
+        else if (clSymbols[i] == 18) headerBits = headerBits + 7
+    }
+    val dynamicBits = headerBits + dynamicSymbolBits
+    // Stored: 3 header bits, padding to a byte, then (length, complement, bytes) in blocks of up to 65535.
+    val storedBlocks = if (covered == 0) 1 else (covered + 65534) / 65535
+    val storedBits = storedBlocks * (3 + 7 + 32) + covered * 8
+    val lastBit = if (last) 1 else 0
+    if (storedBits < fixedBits && storedBits < dynamicBits) {
+        var offset = 0
+        var remaining = covered
+        var blocks = storedBlocks
+        while (blocks > 0) {
+            val size = if (remaining > 65535) 65535 else remaining
+            blocks = blocks - 1
+            writer.append(if (blocks == 0) lastBit else 0, 1)
+            writer.append(0, 2)
+            if (writer.alignBits() > 0) writer.append(0, 8 - writer.alignBits())
+            writer.append(size, 16)
+            writer.append(65535 - size, 16)
+            for (i in 0 until size) writer.append(input[start + offset + i], 8)
+            offset = offset + size
+            remaining = remaining - size
+        }
+        return
+    }
+    val litCodeLengths = filledArray(288, 0)
+    var litCodes: array<int> = []
+    var distCodes: array<int> = []
+    val distCodeLengths = filledArray(30, 0)
+    if (fixedBits <= dynamicBits) {
+        writer.append(lastBit, 1)
+        writer.append(1, 2)
+        for (i in 0 until 288) litCodeLengths[i] = fixedLengths[i]
+        litCodes = deflateCodes(fixedLengths, 288)
+        val fixedDistance = filledArray(30, 5)
+        for (i in 0 until 30) distCodeLengths[i] = 5
+        distCodes = deflateCodes(fixedDistance, 30)
+        // Under the fixed code the distance codes are 5 bits as given, not canonical codes of a code of 30: they are the code number itself, reversed.
+        for (i in 0 until 30) distCodes[i] = deflateReverseBits(i, 5)
+    } else {
+        writer.append(lastBit, 1)
+        writer.append(2, 2)
+        writer.append(hlit - 257, 5)
+        writer.append(hdist - 1, 5)
+        writer.append(hclen - 4, 4)
+        for (i in 0 until hclen) writer.append(clLengths[deflateClOrder[i]], 3)
+        val clCodes = deflateCodes(clLengths, 19)
+        for (i in 0 until clSymbols.size) {
+            val symbol = clSymbols[i]
+            writer.append(clCodes[symbol], clLengths[symbol])
+            if (symbol == 16) writer.append(clExtra[i], 2)
+            else if (symbol == 17) writer.append(clExtra[i], 3)
+            else if (symbol == 18) writer.append(clExtra[i], 7)
+        }
+        for (i in 0 until 286) litCodeLengths[i] = litLengths[i]
+        for (i in 0 until 30) distCodeLengths[i] = distLengths[i]
+        litCodes = deflateCodes(litLengths, 286)
+        distCodes = deflateCodes(distLengths, 30)
+    }
+    for (index in 0 until tokenCount) {
+        val token = if (tokenBase != 0) ablaUnsafeLoadU32(nativePointerFromAddress(tokenBase + index * 4)) else tokens[index]
+        if (token < 256) writer.append(litCodes[token], litCodeLengths[token])
+        else {
+            val length = ((token >> 15) & 255) + 3
+            val distance = (token & 32767) + 1
+            val lc = lengthCode[length]
+            writer.append(litCodes[257 + lc], litCodeLengths[257 + lc])
+            if (deflateLengthExtras[lc] > 0) writer.append(length - deflateLengthBases[lc], deflateLengthExtras[lc])
+            val dc = deflateDistanceCode(distance)
+            writer.append(distCodes[dc], distCodeLengths[dc])
+            val extra = deflateDistanceExtraBits(dc)
+            if (extra > 0) writer.append(distance - deflateDistanceBase(dc), extra)
+        }
+    }
+    writer.append(litCodes[256], litCodeLengths[256])
+    return
+}
+
+/** The token buffer doubled (the tokens are not flushed while a match is pending, which on data without matches is for ever). */
+private trusted fun deflateGrowTokens(base: int, count: int): int {
+    val grown = ablaUnsafePointerAddress(ablaUnsafeAllocate(count * 2 * 4))
+    ablaUnsafeCopyMemory(grown, base, count * 4)
+    ablaUnsafeFree(nativePointerFromAddress(base))
+    grown
+}
+
+private fun deflateHash(a: int, b: int, c: int, mask: int): int = (((a << 10) ^ (b << 5) ^ c) * 2654435761 >>> 8) & mask
+
+/** DEFLATE of `input`: matches found through chains of positions that share a hash of three bytes (the window is 32 KiB), the next position tried before a match is taken
+ *  (lazy matching: zlib's level 6), and every block of up to 16383 tokens written as the smallest of a stored, a fixed-code and a dynamic-code block. The work is
+ *  bounded: at most `searchLimit` (at most 4096) candidates of a chain are compared at each position, and a match of 128 bytes or more ends the search. */
+private trusted fun deflateCompress(input: string, searchLimit: int): string {
+    val writer = deflateBitWriter(input.size)
+    val size = input.size
+    val lengthCode: array<int> = []
+    for (length in 0 until 259) {
+        var code = 0
+        while (code + 1 < deflateLengthBases.size && length >= deflateLengthBases[code + 1]) code = code + 1
+        lengthCode.append(code)
+    }
+    var hashBits = 8
+    while (hashBits < 15 && (1 << hashBits) < size) hashBits = hashBits + 1
+    val mask = (1 << hashBits) - 1
+    val native = !ablaAtCompileTime()
+    val head: array<int> = []
+    val prev: array<int> = []
+    val headSize = 1 << hashBits
+    var table = 0
+    if (native) {
+        table = ablaUnsafePointerAddress(ablaUnsafeAllocate((headSize + size) * 4))
+        for (i in 0 until headSize + size) ablaUnsafeStoreU32(nativePointerFromAddress(table + i * 4), 0)
+    } else {
+        for (i in 0 until headSize) head.append(-1)
+        for (i in 0 until size) prev.append(-1)
+    }
+    val prevAt = table + headSize * 4
+    val data = if (ablaAtCompileTime()) 0 else ablaUnsafeStringAddress(input)
+    var chainLimit = searchLimit
+    if (chainLimit > 4096) chainLimit = 4096
+    if (chainLimit < 1) chainLimit = 1
+    // At run time the tokens, the hash heads and the chains live in native memory (positions plus one, 0 for none); the compile-time evaluator keeps arrays.
+    var tokens: array<int> = []
+    var tokenCount = 0
+    var tokenBase = if (native) ablaUnsafePointerAddress(ablaUnsafeAllocate(16400 * 4)) else 0
+    var tokenCapacity = 16400
+    var blockStart = 0
+    var position = 0
+    var previousLength = 2
+    var previousDistance = 0
+    var matchAvailable = false
+    var inserted = -1
+    while (position < size) {
+        // Put this position in its chain (a position is inserted once).
+        var candidate = -1
+        if (position + 2 < size && inserted < position) {
+            val a = if (ablaAtCompileTime()) input[position] else ablaUnsafeLoadU8(nativePointerFromAddress(data + position))
+            val b = if (ablaAtCompileTime()) input[position + 1] else ablaUnsafeLoadU8(nativePointerFromAddress(data + position + 1))
+            val c = if (ablaAtCompileTime()) input[position + 2] else ablaUnsafeLoadU8(nativePointerFromAddress(data + position + 2))
+            val h = deflateHash(a, b, c, mask)
+            candidate = if (native) ablaUnsafeLoadU32(nativePointerFromAddress(table + h * 4)) - 1 else head[h]
+            if (native) ablaUnsafeStoreU32(nativePointerFromAddress(prevAt + position * 4), candidate + 1) else prev[position] = candidate
+            if (native) ablaUnsafeStoreU32(nativePointerFromAddress(table + h * 4), position + 1) else head[h] = position
+            inserted = position
+        }
+        var length = 2
+        var distance = 0
+        if (candidate >= 0 && previousLength < 16 && position - candidate <= 32768) {
+            // The longest match among the chain's candidates (a short previous match gets the whole chain, a good one a quarter of it).
+            var maximum = size - position
+            if (maximum > 258) maximum = 258
+            var chain = if (previousLength >= 8) chainLimit / 4 else chainLimit
+            if (chain < 1) chain = 1
+            var steps = 0
+            while (candidate >= 0 && position - candidate <= 32768 && steps < chain && length < maximum) {
+                steps = steps + 1
+                // A candidate that cannot beat the best so far differs at the byte past it.
+                var matched = 0
+                if (ablaAtCompileTime()) {
+                    while (matched < maximum && input[position + matched] == input[candidate + matched]) matched = matched + 1
+                } else {
+                    // Eight bytes at a time while they agree, then byte by byte for the rest (the same length either way).
+                    while (matched + 8 <= maximum && ablaUnsafeLoadI64(nativePointerFromAddress(data + position + matched)) ==
+                        ablaUnsafeLoadI64(nativePointerFromAddress(data + candidate + matched))) matched = matched + 8
+                    while (matched < maximum && ablaUnsafeLoadU8(nativePointerFromAddress(data + position + matched)) ==
+                        ablaUnsafeLoadU8(nativePointerFromAddress(data + candidate + matched))) matched = matched + 1
+                }
+                if (matched > length) {
+                    length = matched
+                    distance = position - candidate
+                    if (matched >= 128) steps = chain
+                }
+                candidate = if (native) ablaUnsafeLoadU32(nativePointerFromAddress(prevAt + candidate * 4)) - 1 else prev[candidate]
+            }
+            // A match of three bytes far away costs more than the three literals.
+            if (length == 3 && distance > 4096) length = 2
+        }
+        if (previousLength >= 3 && length <= previousLength) {
+            // The previous position's match stands: it covers bytes from position - 1.
+            val matchToken = deflateMatchToken(previousLength, previousDistance)
+            if (native && tokenCount >= tokenCapacity) {
+                tokenBase = deflateGrowTokens(tokenBase, tokenCount)
+                tokenCapacity = tokenCapacity * 2
+            }
+            if (native) ablaUnsafeStoreU32(nativePointerFromAddress(tokenBase + tokenCount * 4), matchToken) else tokens.append(matchToken)
+            tokenCount = tokenCount + 1
+            var next = position + 1
+            val stop = position - 1 + previousLength
+            while (next < stop) {
+                if (next + 2 < size && inserted < next) {
+                    val a = if (ablaAtCompileTime()) input[next] else ablaUnsafeLoadU8(nativePointerFromAddress(data + next))
+                    val b = if (ablaAtCompileTime()) input[next + 1] else ablaUnsafeLoadU8(nativePointerFromAddress(data + next + 1))
+                    val c = if (ablaAtCompileTime()) input[next + 2] else ablaUnsafeLoadU8(nativePointerFromAddress(data + next + 2))
+                    val h = deflateHash(a, b, c, mask)
+                    if (native) ablaUnsafeStoreU32(nativePointerFromAddress(prevAt + next * 4), ablaUnsafeLoadU32(nativePointerFromAddress(table + h * 4))) else prev[next] = head[h]
+                    if (native) ablaUnsafeStoreU32(nativePointerFromAddress(table + h * 4), next + 1) else head[h] = next
+                    inserted = next
+                }
+                next = next + 1
+            }
+            position = stop
+            matchAvailable = false
+            previousLength = 2
+        } else if (matchAvailable) {
+            val literal = input[position - 1]
+            if (native && tokenCount >= tokenCapacity) {
+                tokenBase = deflateGrowTokens(tokenBase, tokenCount)
+                tokenCapacity = tokenCapacity * 2
+            }
+            if (native) ablaUnsafeStoreU32(nativePointerFromAddress(tokenBase + tokenCount * 4), literal) else tokens.append(literal)
+            tokenCount = tokenCount + 1
+            position = position + 1
+            previousLength = length
+            previousDistance = distance
+        } else {
+            matchAvailable = true
+            position = position + 1
+            previousLength = length
+            previousDistance = distance
+        }
+        if (tokenCount >= 16383 && !matchAvailable) {
+            deflateWriteBlock(writer, input, blockStart, position - blockStart, tokenBase, tokenCount, tokens, false, lengthCode)
+            blockStart = position
+            tokens = []
+            tokenCount = 0
+        }
+    }
+    if (matchAvailable) {
+        val last = input[size - 1]
+        if (native && tokenCount >= tokenCapacity) {
+            tokenBase = deflateGrowTokens(tokenBase, tokenCount)
+            tokenCapacity = tokenCapacity * 2
+        }
+        if (native) ablaUnsafeStoreU32(nativePointerFromAddress(tokenBase + tokenCount * 4), last) else tokens.append(last)
+        tokenCount = tokenCount + 1
+    }
+    deflateWriteBlock(writer, input, blockStart, size - blockStart, tokenBase, tokenCount, tokens, true, lengthCode)
+    if (native) {
+        ablaUnsafeFree(nativePointerFromAddress(tokenBase))
+        ablaUnsafeFree(nativePointerFromAddress(table))
+    }
+    writer.finish()
+}
+
+private val gzipCrcTable: array<int> = gzipMakeCrcTable()
+
+private fun gzipMakeCrcTable(): array<int> {
+    val table: array<int> = []
+    for (n in 0 until 256) {
+        var c = n
+        for (k in 0 until 8) c = if ((c & 1) != 0) (c >>> 1) ^ 3988292384 else c >>> 1
+        table.append(c)
+    }
+    table
+}
+
+private fun gzipCrc32(input: string): int {
+    val table = gzipCrcTable
+    var crc = 4294967295
+    var index = 0
+    while (index < input.size) {
+        crc = (crc >>> 8) ^ table[(crc ^ input[index]) & 255]
+        index = index + 1
+    }
+    crc ^ 4294967295
+}
+
+private fun gzipAppendU32Little(var output: ByteBuffer, value: int): void {
+    output.appendByteValue(value & 255)
+    output.appendByteValue((value >>> 8) & 255)
+    output.appendByteValue((value >>> 16) & 255)
+    output.appendByteValue((value >>> 24) & 255)
+    return
+}
+
+/** `input` as a gzip member (RFC 1952). `searchLimit` bounds the work of the match search: at most that many (up to 4096) candidates are compared at each position. */
+fun gzipCompress(input: string, searchLimit: int = 128): string {
+    val output = byteBuffer()
+    output.appendByteValue(31)
+    output.appendByteValue(139)
+    output.appendByteValue(8)
+    output.appendByteValue(0)
+    gzipAppendU32Little(output, 0)
+    output.appendByteValue(0)
+    output.appendByteValue(255)
+    output.appendText(deflateCompress(input, searchLimit))
+    gzipAppendU32Little(output, gzipCrc32(input))
+    gzipAppendU32Little(output, input.size)
+    output.toText()
+}
+
+// Exactly one gzip member; `error` is empty, "invalid", or "limit".
+class GzipDecompressResult(val data: string, val error: string)
+
+private resource class GzipStringSource(val input: string, var position: int = 0): GzipSource {
+    fun readChunk(maxBytes: int): GzipInputChunk {
+        val remaining = this.input.size - this.position
+        val count = if (remaining < maxBytes) remaining else maxBytes
+        val data = this.input.slice(this.position, this.position + count)
+        this.position += count
+        GzipInputChunk(data, this.position == this.input.size)
+    }
+}
+
+// Supports exactly one member. Concatenated members and trailing bytes are rejected.
+fun gzipDecompress(input: string, maxOutputBytes: int): GzipDecompressResult {
+    val source = GzipStringSource(input)
+    val stream = gzipStream(source, input.size, maxOutputBytes)
+    val output = byteBuffer()
+    while (true) {
+        val chunk = stream.read(source, 65536)
+        if (chunk.error != "") return GzipDecompressResult("", chunk.error)
+        output.appendText(chunk.data)
+        if (chunk.done) return GzipDecompressResult(output.toText(), "")
+    }
+}
+
+// A source may return data and EOF together. Empty data without EOF is an error;
+// an error from the source is reported as "source" by the decoder.
+class GzipInputChunk(val data: string, val eof: bool, val error: string = "")
+class GzipStreamChunk(val data: string, val done: bool, val error: string)
+
+resource interface GzipSource {
+    fun readChunk(maxBytes: int): GzipInputChunk
+}
+
+private class StreamInflateReader(
+    val maxInputBytes: int,
+    var input: string = "",
+    var pos: int = 0,
+    var total: int = 0,
+    var eof: bool = false,
+    var bits: int = 0,
+    var count: int = 0,
+    var failed: bool = false,
+    var error: string = ""
+)
+
+// -1 is clean EOF; errors are recorded separately.
+private fun StreamInflateReader.byte(var source: GzipSource): int {
+    if (this.failed) return -1
+    if (this.pos == this.input.size) {
+        if (this.eof) return -1
+        val remaining = this.maxInputBytes - this.total
+        val requested = if (remaining <= 0) 1 else if (remaining < 65536) remaining else 65536
+        val chunk = source.readChunk(requested)
+        if (chunk.error != "" || chunk.data.size > requested || (chunk.data.size == 0 &&
+            !chunk.eof)) {
+            this.failed = true
+            this.error = "source"
+            return -1
+        }
+        if (chunk.data.size > remaining) {
+            this.failed = true
+            this.error = "limit"
+            return -1
+        }
+        this.input = chunk.data
+        this.pos = 0
+        this.total += chunk.data.size
+        this.eof = chunk.eof
+        if (this.input.size == 0) return -1
+    }
+    val result = int(this.input[this.pos])
+    this.pos += 1
+    result
+}
+
+private fun StreamInflateReader.read(var source: GzipSource, count: int): int {
+    while (this.count < count) {
+        val value = this.byte(source)
+        if (value < 0) {
+            this.failed = true
+            if (this.error == "") this.error = "invalid"
+            return 0
+        }
+        this.bits = this.bits | (value << this.count)
+        this.count += 8
+    }
+    val value = this.bits & ((1 << count) - 1)
+    this.bits = this.bits >>> count
+    this.count -= count
+    value
+}
+
+private class StreamInflateTree(val counts: array<int>, val symbols: array<int>, val valid: bool,
+    val fast: array<int> = [])
+private fun streamInflateTree(lengths: array<int>, allowEmpty: bool,
+    allowSingle: bool): StreamInflateTree {
+    val counts = filledArray(16, 0)
+    for (length in lengths) {
+        if (length < 0 || length > 15) return StreamInflateTree([], [], false)
+        if (length > 0) counts[length] += 1
+    }
+    var left = 1
+    var bits = 1
+    while (bits <= 15) {
+        left = left * 2 - counts[bits]
+        if (left < 0) return StreamInflateTree([], [], false)
+        bits += 1
+    }
+    var used = 0
+    for (count in counts) used += count
+    if (used == 0) return StreamInflateTree(counts, [], allowEmpty)
+    if (left != 0 && !(allowSingle && used == 1 && counts[1] == 1)) return StreamInflateTree([], [],
+        false)
+    val offsets = filledArray(16, 0)
+    bits = 1
+    while (bits < 15) { offsets[bits + 1] = offsets[bits] + counts[bits]; bits += 1 }
+    val symbols = filledArray(used, 0)
+    var symbol = 0
+    while (symbol < lengths.size) {
+        val length = lengths[symbol]
+        if (length > 0) { symbols[offsets[length]] = symbol; offsets[length] += 1 }
+        symbol += 1
+    }
+    val next = filledArray(16, 0)
+    var code = 0
+    bits = 1
+    while (bits <= 15) {
+        code = (code + counts[bits - 1]) << 1
+        next[bits] = code
+        bits += 1
+    }
+    val fast = filledArray(512, 0)
+    symbol = 0
+    while (symbol < lengths.size) {
+        val length = lengths[symbol]
+        if (length > 0) {
+            val canonical = next[length]
+            next[length] += 1
+            if (length <= 9) {
+                var index = deflateReverseBits(canonical, length)
+                val step = 1 << length
+                while (index < 512) {
+                    fast[index] = (symbol << 4) | length
+                    index += step
+                }
+            }
+        }
+        symbol += 1
+    }
+    StreamInflateTree(counts, symbols, true, fast)
+}
+
+private fun streamInflateSymbol(var reader: StreamInflateReader,
+    var source: GzipSource,
+    tree: StreamInflateTree): int {
+    var code = 0
+    var first = 0
+    var index = 0
+    var length = 1
+    var input = reader.input
+    var pos = reader.pos
+    var bits = reader.bits
+    var available = reader.count
+    var symbol = -1
+    // Peek only within the current source chunk. Consume no more bytes than
+    // this symbol needs, so byte-alignment cannot discard trailer bytes.
+    if (tree.fast.size != 0) {
+        var peek = bits
+        var peekCount = available
+        var peekPos = pos
+        while (peekCount < 9 && peekPos < input.size) {
+            peek = peek | (int(input[peekPos]) << peekCount)
+            peekPos += 1
+            peekCount += 8
+        }
+        if (peekCount >= 9) {
+            val entry = tree.fast[peek & 511]
+            val width = entry & 15
+            if (width != 0) {
+                while (available < width) {
+                    bits = bits | (int(input[pos]) << available)
+                    pos += 1
+                    available += 8
+                }
+                reader.bits = bits >>> width
+                reader.count = available - width
+                reader.pos = pos
+                return entry >>> 4
+            }
+        }
+    }
+    while (length <= 15) {
+        if (available == 0) {
+            var value = 0
+            if (pos < input.size) {
+                value = int(input[pos])
+                pos += 1
+            } else {
+                reader.pos = pos
+                reader.bits = bits
+                reader.count = available
+                value = reader.byte(source)
+                if (value < 0) {
+                    reader.failed = true
+                    if (reader.error == "") reader.error = "invalid"
+                    return -1
+                }
+                input = reader.input
+                pos = reader.pos
+            }
+            bits = value
+            available = 8
+        }
+        code = code | (bits & 1)
+        bits = bits >>> 1
+        available -= 1
+        val count = tree.counts[length]
+        if (code >= first && code - first < count) {
+            symbol = tree.symbols[index + code - first]
+            break
+        }
+        index += count
+        first = (first + count) << 1
+        code = code << 1
+        length += 1
+    }
+    reader.pos = pos
+    reader.bits = bits
+    reader.count = available
+    if (symbol < 0) reader.failed = true
+    symbol
+}
+
+private fun streamInflateFixedLiteral(): StreamInflateTree {
+    val lengths = filledArray(288, 8)
+    var i = 144
+    while (i < 256) { lengths[i] = 9; i += 1 }
+    while (i < 280) { lengths[i] = 7; i += 1 }
+    while (i < 288) { lengths[i] = 8; i += 1 }
+    streamInflateTree(lengths, false, false)
+}
+private fun streamInflateFixedDistance(): StreamInflateTree = streamInflateTree(filledArray(32, 5),
+    false, false)
+private class StreamInflateTrees(val literal: StreamInflateTree, val distance: StreamInflateTree,
+    val valid: bool)
+private fun streamInflateDynamic(var reader: StreamInflateReader,
+    var source: GzipSource): StreamInflateTrees {
+    val empty = StreamInflateTree([], [], false)
+    val nl = reader.read(source, 5) + 257
+    val nd = reader.read(source, 5) + 1
+    val nc = reader.read(source, 4) + 4
+    if (reader.failed || nl > 286 || nd > 32) return StreamInflateTrees(empty, empty, false)
+    val order = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+    val codes = filledArray(19, 0)
+    var i = 0
+    while (i < nc) { codes[order[i]] = reader.read(source, 3); i += 1 }
+    if (reader.failed) return StreamInflateTrees(empty, empty, false)
+    val tree = streamInflateTree(codes, false, false)
+    if (!tree.valid) return StreamInflateTrees(empty, empty, false)
+    val lengths: array<int> = []
+    while (lengths.size < nl + nd && !reader.failed) {
+        val value = streamInflateSymbol(reader, source, tree)
+        if (value < 0) break
+        if (value <= 15) lengths.append(value)
+        else {
+            var repeat = 0
+            var previous = 0
+            if (value == 16) {
+                if (lengths.size == 0) return StreamInflateTrees(empty, empty, false)
+                previous = lengths[lengths.size - 1]
+                repeat = reader.read(source, 2) + 3
+            } else if (value == 17) repeat = reader.read(source, 3) + 3
+            else if (value == 18) repeat = reader.read(source, 7) + 11
+            else return StreamInflateTrees(empty, empty, false)
+            if (reader.failed || repeat > nl + nd - lengths.size) return StreamInflateTrees(empty,
+                empty,
+                false)
+            while (repeat > 0) { lengths.append(previous); repeat -= 1 }
+        }
+    }
+    if (reader.failed || lengths.size != nl + nd || lengths[256] ==
+        0) return StreamInflateTrees(empty,
+            empty, false)
+    val lit: array<int> = []
+    val dist: array<int> = []
+    i = 0
+    while (i < lengths.size) { if (i < nl) lit.append(lengths[i]) else dist.append(lengths[i]); i +=
+            1 }
+    val literal = streamInflateTree(lit, false, true)
+    val distance = streamInflateTree(dist, true, true)
+    StreamInflateTrees(literal, distance, literal.valid && distance.valid)
+}
+
+// A native byte allocation is owned by the window and released with it.
+// The evaluator uses a scalar fallback instead of unsafe-memory intrinsics.
+private class StreamInflateWindow(val storage: NativeByteBuffer?, val address: int,
+    val interpreted: array<int>)
+private trusted fun streamInflateNativeWindow(): StreamInflateWindow {
+    val buffer = nativeByteBuffer(32768)
+    ablaUnsafeSetMemory(buffer.address, 0, 32768)
+    val address = nativePointerAddress(buffer.address)
+    StreamInflateWindow(move(buffer), address, [])
+}
+private fun streamInflateWindow(): StreamInflateWindow = if (ablaAtCompileTime())
+    StreamInflateWindow(null, 0, filledArray(32768, 0)) else streamInflateNativeWindow()
+private trusted fun StreamInflateWindow.set(index: int, value: int): void {
+    if (ablaAtCompileTime()) this.interpreted[index] = value
+    else ablaUnsafeStoreU8(nativePointerFromAddress(this.address + index), value)
+    return
+}
+private trusted fun StreamInflateWindow.get(index: int): int = if (ablaAtCompileTime())
+    this.interpreted[index] else ablaUnsafeLoadU8(nativePointerFromAddress(this.address + index))
+
+// The stream owns its decoder state, and no output is final until done=true.
+// Error is "invalid", "limit", or "source". At most 65536 output bytes are
+// returned per read. Exactly one member is accepted, including its trailer.
+// Pass the same source object to the constructor and every read; the caller
+// keeps ownership of the source and its resources.
+class GzipStream(
+    val reader: StreamInflateReader,
+    val maxOutputBytes: int,
+    val window: StreamInflateWindow,
+    var total: int = 0,
+    var crc: int = 4294967295,
+    var state: int = 0,
+    var finalBlock: bool = false,
+    var remaining: int = 0,
+    var distance: int = 0,
+    var trees: StreamInflateTrees = StreamInflateTrees(StreamInflateTree([], [], false),
+        StreamInflateTree([], [], false),
+        false),
+    var error: string = ""
+)
+
+private fun gzipCrcByte(previous: int, value: int): int {
+    var crc = previous ^ value
+    var bit = 0
+    while (bit < 8) {
+        if ((crc & 1) != 0) crc = (crc >>> 1) ^ 3988292384
+        else crc = crc >>> 1
+        bit += 1
+    }
+    crc
+}
+
+// Validates the header incrementally without retaining untrusted optional fields.
+fun gzipStream(var source: GzipSource, maxInputBytes: int,
+    maxOutputBytes: int): GzipStream {
+    val reader = StreamInflateReader(maxInputBytes)
+    val stream = GzipStream(reader, maxOutputBytes, streamInflateWindow())
+    if (maxInputBytes < 0 || maxOutputBytes < 0) { stream.error = "invalid"; return stream }
+    // A gzip member needs at least ten header bytes and an eight-byte
+    // trailer. Match gzipDecompress's invalid-before-output-limit rule for
+    // shorter inputs without retaining more than one bounded input chunk.
+    val prefix = byteBuffer()
+    while (prefix.size() < 18) {
+        val value = reader.byte(source)
+        if (value < 0) {
+            stream.error = if (reader.error != "") reader.error else "invalid"
+            return stream
+        }
+        prefix.appendByteValue(value)
+    }
+    reader.input = prefix.toText() + reader.input.slice(reader.pos, reader.input.size)
+    reader.pos = 0
+    var headerCrc = 4294967295
+    var flags = 0
+    var i = 0
+    while (i < 10) {
+        val value = reader.read(source, 8)
+        if (reader.failed) { stream.error = reader.error; return stream }
+        if ((i == 0 && value != 31) || (i == 1 && value != 139) ||
+            (i == 2 && value != 8) || (i == 3 && (value & 224) != 0)) {
+            stream.error = "invalid"
+            return stream
+        }
+        if (i == 3) flags = value
+        headerCrc = gzipCrcByte(headerCrc, value)
+        i += 1
+    }
+    if ((flags & 4) != 0) {
+        val low = reader.read(source, 8)
+        val high = reader.read(source, 8)
+        if (reader.failed) { stream.error = reader.error; return stream }
+        headerCrc = gzipCrcByte(gzipCrcByte(headerCrc, low), high)
+        var extra = low + (high << 8)
+        while (extra > 0) {
+            val value = reader.read(source, 8)
+            if (reader.failed) { stream.error = reader.error; return stream }
+            headerCrc = gzipCrcByte(headerCrc, value)
+            extra -= 1
+        }
+    }
+    for (flag in [8, 16]) if ((flags & flag) != 0) {
+        var value = 1
+        while (value != 0) {
+            value = reader.read(source, 8)
+            if (reader.failed) { stream.error = reader.error; return stream }
+            headerCrc = gzipCrcByte(headerCrc, value)
+        }
+    }
+    if ((flags & 2) != 0) {
+        val expected = reader.read(source, 16)
+        if (reader.failed) { stream.error = reader.error; return stream }
+        if (expected != ((headerCrc ^ 4294967295) & 65535)) stream.error = "invalid"
+    }
+    stream
+}
+
+private fun GzipStream.emit(var output: ByteBuffer, value: int): void {
+    this.window.set(this.total & 32767, value)
+    this.total += 1
+    this.crc = gzipCrcByte(this.crc, value)
+    output.appendByteValue(value)
+    return
+}
+
+// A match is at most 258 bytes. Reserve its output once, but advance the
+// history one byte at a time so overlapping copies and window wrap work.
+private trusted fun GzipStream.emitMatch(var output: ByteBuffer, count: int): void {
+    if (ablaAtCompileTime()) {
+        var i = 0
+        while (i < count) {
+            this.emit(output, this.window.get((this.total - this.distance) & 32767))
+            i += 1
+        }
+        return
+    }
+    val destination = output.stageReserve(count)
+    val history = this.window.address
+    var total = this.total
+    var crc = this.crc
+    var i = 0
+    while (i < count) {
+        val value = ablaUnsafeLoadU8(nativePointerFromAddress(history + ((total - this.distance) &
+            32767)))
+        ablaUnsafeStoreU8(nativePointerFromAddress(history + (total & 32767)), value)
+        ablaUnsafeStoreU8(nativePointerFromAddress(destination + i), value)
+        crc = gzipCrcByte(crc, value)
+        total += 1
+        i += 1
+    }
+    output.staged += count
+    output.byteCount += count
+    this.total = total
+    this.crc = crc
+}
+
+private fun GzipStream.fail(): GzipStreamChunk {
+    if (this.error == "") this.error = if (this.reader.error != "") this.reader.error else "invalid"
+    GzipStreamChunk("", false, this.error)
+}
+
+// Bytes produced before done=true are provisional: the trailer and end of
+// source may still fail validation. maxBytes must be positive.
+fun GzipStream.read(var source: GzipSource, maxBytes: int): GzipStreamChunk {
+    if (this.error != "") return GzipStreamChunk("", false, this.error)
+    if (maxBytes <= 0) return GzipStreamChunk("", false, "invalid")
+    if (this.state == 5) return GzipStreamChunk("", true, "")
+    val cap = if (maxBytes < 65536) maxBytes else 65536
+    val output = byteBuffer()
+    while (output.size() < cap) {
+        if (this.state == 0) {
+            this.finalBlock = this.reader.read(source, 1) == 1
+            val kind = this.reader.read(source, 2)
+            if (this.reader.failed || kind == 3) return this.fail()
+            if (kind == 0) {
+                this.reader.bits = 0
+                this.reader.count = 0
+                val length = this.reader.read(source, 16)
+                val inverse = this.reader.read(source, 16)
+                if (this.reader.failed || (length ^ 65535) != inverse) return this.fail()
+                if (length > this.maxOutputBytes - this.total) { this.error =
+                        "limit"; return this.fail() }
+                this.remaining = length
+                this.state = 1
+            } else {
+                this.trees = if (kind == 1) StreamInflateTrees(streamInflateFixedLiteral(),
+                    streamInflateFixedDistance(), true) else streamInflateDynamic(this.reader,
+                        source)
+                if (!this.trees.valid || this.reader.failed) return this.fail()
+                this.state = 2
+            }
+        } else if (this.state == 1) {
+            if (this.remaining == 0) this.state = if (this.finalBlock) 4 else 0
+            else {
+                val value = this.reader.read(source, 8)
+                if (this.reader.failed) return this.fail()
+                this.emit(output, value)
+                this.remaining -= 1
+            }
+        } else if (this.state == 2) {
+            val symbol = streamInflateSymbol(this.reader, source, this.trees.literal)
+            if (this.reader.failed || symbol < 0) return this.fail()
+            if (symbol < 256) {
+                if (this.total >= this.maxOutputBytes) { this.error = "limit"; return this.fail() }
+                this.emit(output, symbol)
+            } else if (symbol == 256) this.state = if (this.finalBlock) 4 else 0
+            else {
+                if (symbol > 285) return this.fail()
+                val index = symbol - 257
+                val length = deflateLengthBases[index] + this.reader.read(source,
+                    deflateLengthExtras[index])
+                if (this.reader.failed || this.trees.distance.symbols.size == 0) return this.fail()
+                val distanceSymbol = streamInflateSymbol(this.reader, source, this.trees.distance)
+                if (this.reader.failed || distanceSymbol < 0 || distanceSymbol >=
+                    30) return this.fail()
+                val distance = deflateDistanceBases[distanceSymbol] + this.reader.read(source,
+                    deflateDistanceExtras[distanceSymbol])
+                if (this.reader.failed || distance > this.total) return this.fail()
+                if (length > this.maxOutputBytes - this.total) { this.error =
+                        "limit"; return this.fail() }
+                this.remaining = length
+                this.distance = distance
+                this.state = 3
+            }
+        } else if (this.state == 3) {
+            if (this.remaining == 0) this.state = 2
+            else {
+                val room = cap - output.size()
+                val count = if (this.remaining < room) this.remaining else room
+                this.emitMatch(output, count)
+                this.remaining -= count
+            }
+        } else if (this.state == 4) {
+            this.reader.bits = 0
+            this.reader.count = 0
+            var expectedCrc = 0
+            var expectedSize = 0
+            var i = 0
+            while (i < 4) { expectedCrc = expectedCrc | (this.reader.read(source,
+                8) << (8 * i)); i += 1 }
+            i = 0
+            while (i < 4) { expectedSize = expectedSize | (this.reader.read(source,
+                8) << (8 * i)); i += 1 }
+            if (this.reader.failed || expectedCrc != (this.crc ^ 4294967295) || expectedSize !=
+                (this.total & 4294967295)) return this.fail()
+            val trailing = this.reader.byte(source)
+            if (this.reader.failed || trailing >= 0) return this.fail()
+            this.state = 5
+            return GzipStreamChunk(output.toText(), true, "")
+        } else return this.fail()
+    }
+    GzipStreamChunk(output.toText(), false, "")
+}

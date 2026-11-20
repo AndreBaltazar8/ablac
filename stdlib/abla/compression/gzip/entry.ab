@@ -958,16 +958,8 @@ class GzipStream(
     var error: string = ""
 )
 
-private fun gzipCrcByte(previous: int, value: int): int {
-    var crc = previous ^ value
-    var bit = 0
-    while (bit < 8) {
-        if ((crc & 1) != 0) crc = (crc >>> 1) ^ 3988292384
-        else crc = crc >>> 1
-        bit += 1
-    }
-    crc
-}
+// One byte of the CRC-32 register `previous` (not inverted): the table's entry for the low byte, as gzipCrc32 uses (the same function as eight shift-and-xor steps).
+private fun gzipCrcByte(previous: int, value: int): int = (previous >>> 8) ^ gzipCrcTable[(previous ^ value) & 255]
 
 // Validates the header incrementally without retaining untrusted optional fields.
 fun gzipStream(var source: GzipSource, maxInputBytes: int,
@@ -1072,6 +1064,104 @@ private trusted fun GzipStream.emitMatch(var output: ByteBuffer, count: int): vo
     this.crc = crc
 }
 
+// The run-time fast path of the symbol loop: while the current input chunk holds enough bytes for a whole symbol with its extra bits (48 bits), the literal/length and the distance symbols
+// come from the 9-bit tables, literals and whole matches are written to the window and the output with the bit state in locals, and anything else (a longer code, the end of the block,
+// the chunk's end, a limit, a match that would pass `cap`, an invalid distance) is left unconsumed for the general path, which also reports every error. The bytes read ahead but not
+// needed are given back to the input so that a byte alignment (a stored block, the trailer) sees what the general path would.
+private trusted fun GzipStream.inflateFast(var output: ByteBuffer, cap: int): void {
+    val crcTable = gzipCrcTable
+    val lengthExtras = deflateLengthExtras
+    val lengthBases = deflateLengthBases
+    val distanceExtras = deflateDistanceExtras
+    val distanceBases = deflateDistanceBases
+    val reader = this.reader
+    val literal = this.trees.literal.fast
+    val distanceTree = this.trees.distance
+    val distanceTable = distanceTree.fast
+    if (literal.size == 0 || distanceTable.size == 0 || distanceTree.symbols.size == 0) return
+    val input = reader.input
+    val size = input.size
+    if (size - reader.pos < 8) return
+    val source = ablaUnsafeStringAddress(input)
+    val room = cap - output.size()
+    if (room < 258) return
+    val destination = output.stageReserve(room)
+    val history = this.window.address
+    val maximum = this.maxOutputBytes
+    var pos = reader.pos
+    var bits = reader.bits
+    var count = reader.count
+    var fetched = 0
+    var total = this.total
+    var crc = this.crc
+    var written = 0
+    while (written + 258 <= room) {
+        while (count <= 48 && pos < size) {
+            bits = bits | (ablaUnsafeLoadU8(nativePointerFromAddress(source + pos)) << count)
+            pos = pos + 1
+            count = count + 8
+            fetched = fetched + 1
+        }
+        if (count < 48) break
+        val entry = literal[bits & 511]
+        val width = entry & 15
+        if (width == 0) break
+        val symbol = entry >>> 4
+        if (symbol < 256) {
+            if (total >= maximum) break
+            ablaUnsafeStoreU8(nativePointerFromAddress(history + (total & 32767)), symbol)
+            ablaUnsafeStoreU8(nativePointerFromAddress(destination + written), symbol)
+            crc = (crc >>> 8) ^ crcTable[(crc ^ symbol) & 255]
+            total = total + 1
+            written = written + 1
+            bits = bits >>> width
+            count = count - width
+        } else {
+            if (symbol == 256 || symbol > 285) break
+            val index = symbol - 257
+            val lengthExtra = lengthExtras[index]
+            var rest = bits >>> width
+            val length = lengthBases[index] + (rest & ((1 << lengthExtra) - 1))
+            rest = rest >>> lengthExtra
+            val distanceEntry = distanceTable[rest & 511]
+            val distanceWidth = distanceEntry & 15
+            if (distanceWidth == 0) break
+            val distanceSymbol = distanceEntry >>> 4
+            if (distanceSymbol >= 30) break
+            rest = rest >>> distanceWidth
+            val distanceExtra = distanceExtras[distanceSymbol]
+            val distance = distanceBases[distanceSymbol] + (rest & ((1 << distanceExtra) - 1))
+            if (distance > total || length > maximum - total) break
+            var copied = 0
+            while (copied < length) {
+                val value = ablaUnsafeLoadU8(nativePointerFromAddress(history + ((total - distance) & 32767)))
+                ablaUnsafeStoreU8(nativePointerFromAddress(history + (total & 32767)), value)
+                ablaUnsafeStoreU8(nativePointerFromAddress(destination + written + copied), value)
+                crc = (crc >>> 8) ^ crcTable[(crc ^ value) & 255]
+                total = total + 1
+                copied = copied + 1
+            }
+            written = written + length
+            val used = width + lengthExtra + distanceWidth + distanceExtra
+            bits = bits >>> used
+            count = count - used
+        }
+    }
+    // Give back the whole bytes read ahead that no symbol took.
+    var giveBack = count / 8
+    if (giveBack > fetched) giveBack = fetched
+    pos = pos - giveBack
+    count = count - giveBack * 8
+    bits = bits & ((1 << count) - 1)
+    this.reader.pos = pos
+    this.reader.bits = bits
+    this.reader.count = count
+    this.total = total
+    this.crc = crc
+    output.staged += written
+    output.byteCount += written
+}
+
 private fun GzipStream.fail(): GzipStreamChunk {
     if (this.error == "") this.error = if (this.reader.error != "") this.reader.error else "invalid"
     GzipStreamChunk("", false, this.error)
@@ -1116,6 +1206,10 @@ fun GzipStream.read(var source: GzipSource, maxBytes: int): GzipStreamChunk {
                 this.remaining -= 1
             }
         } else if (this.state == 2) {
+            if (!ablaAtCompileTime()) {
+                this.inflateFast(output, cap)
+                if (output.size() >= cap) continue
+            }
             val symbol = streamInflateSymbol(this.reader, source, this.trees.literal)
             if (this.reader.failed || symbol < 0) return this.fail()
             if (symbol < 256) {

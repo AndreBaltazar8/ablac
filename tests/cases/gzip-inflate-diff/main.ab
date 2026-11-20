@@ -1,0 +1,121 @@
+// The gzip decoder (abla/compression/gzip: a fast path for symbols inside the input chunk) against the one before it (old-gzip.ab, unchanged): the same data and the same error from
+// gzipDecompress, and the same sequence of chunks from the streaming reader (sizes 1, 77, 4096 and 65536 per read, and an input source that hands out 1, 13 and 4096 bytes at a
+// time), over the gzip files in a directory (made by gzip at several levels from files of several kinds, and by our encoder), and over damaged copies of them: every bit position
+// of the first 200 bytes flipped one at a time, truncated at many lengths, trailing bytes appended, and with output limits below, at and above the size. Prints "gzip-inflate-diff ok N cases".
+import "abla/io"
+import "abla/fs"
+import "abla/bytes"
+import "abla/compression/gzip"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/text"
+import "./old-gzip.ab" as old
+
+var failures = 0
+var cases = 0
+
+fun fail(what: string): void {
+    failures = failures + 1
+    if (failures < 30) println("FAIL $what")
+    return
+}
+
+fun same(what: string, bytes: string, limit: int): void {
+    cases = cases + 1
+    val fresh = gzipDecompress(bytes, limit)
+    val previous = old.gzipDecompress(bytes, limit)
+    if (fresh.error != previous.error || fresh.data != previous.data) fail("$what limit $limit: '${fresh.error}' ${fresh.data.size} / '${previous.error}' ${previous.data.size}")
+    return
+}
+
+resource class Pieces(val input: string, val piece: int, var position: int = 0): GzipSource {
+    fun readChunk(maxBytes: int): GzipInputChunk {
+        val remaining = this.input.size - this.position
+        var count = if (remaining < this.piece) remaining else this.piece
+        if (count > maxBytes) count = maxBytes
+        val data = this.input.slice(this.position, this.position + count)
+        this.position += count
+        GzipInputChunk(data, this.position == this.input.size)
+    }
+}
+
+resource class OldPieces(val input: string, val piece: int, var position: int = 0): old.GzipSource {
+    fun readChunk(maxBytes: int): old.GzipInputChunk {
+        val remaining = this.input.size - this.position
+        var count = if (remaining < this.piece) remaining else this.piece
+        if (count > maxBytes) count = maxBytes
+        val data = this.input.slice(this.position, this.position + count)
+        this.position += count
+        old.GzipInputChunk(data, this.position == this.input.size)
+    }
+}
+
+/** The chunks of the stream reader as a text (sizes, done flags and errors), and the data they carry. */
+fun streamed(bytes: string, piece: int, read: int): string {
+    val source = Pieces(bytes, piece)
+    val stream = gzipStream(source, bytes.size, 100000000)
+    var log = ""
+    var guard = 0
+    while (guard < 100000) {
+        val chunk = stream.read(source, read)
+        log = log + "${chunk.data.size}:${chunk.done}:${chunk.error}:${chunk.data.size} "
+        if (chunk.error != "" || chunk.done) break
+        guard = guard + 1
+    }
+    log
+}
+
+fun streamedOld(bytes: string, piece: int, read: int): string {
+    val source = OldPieces(bytes, piece)
+    val stream = old.gzipStream(source, bytes.size, 100000000)
+    var log = ""
+    var guard = 0
+    while (guard < 100000) {
+        val chunk = stream.read(source, read)
+        log = log + "${chunk.data.size}:${chunk.done}:${chunk.error}:${chunk.data.size} "
+        if (chunk.error != "" || chunk.done) break
+        guard = guard + 1
+    }
+    log
+}
+
+fun flip(bytes: string, bit: int): string {
+    val at = bit / 8
+    bytes.slice(0, at) + byteText(bytes[at] ^ (1 << (bit % 8))) + bytes.slice(at + 1, bytes.size)
+}
+
+fun byteText(value: int): string {
+    val buffer = byteBuffer()
+    buffer.appendByteValue(value)
+    buffer.toText()
+}
+
+fun main: int {
+    val directory = processArgument(0)
+    for (entry in path(directory).entries()) {
+        if (!entry.text.endsWith(".gz")) continue
+        val bytes = linuxReadFile(entry.text, 16777216)
+        same(entry.text, bytes, 100000000)
+        val size = gzipDecompress(bytes, 100000000).data.size
+        for (limit in [0, 1, size / 2, size - 1, size, size + 1]) if (limit >= 0) same("${entry.text}", bytes, limit)
+        for (piece in [1, 13, 4096, 1000000]) {
+            for (read in [1, 77, 4096, 65536]) {
+                if (piece == 1 && read < 4096 && bytes.size > 3000) continue
+                if (streamed(bytes, piece, read) != streamedOld(bytes, piece, read)) fail("${entry.text} stream piece $piece read $read")
+            }
+        }
+        // Damage.
+        val flips = if (bytes.size * 8 < 1600) bytes.size * 8 else 1600
+        for (bit in 0 until flips) same("${entry.text} bit $bit", flip(bytes, bit * (bytes.size * 8 / flips)), 100000000)
+        var cut = 0
+        while (cut < bytes.size) {
+            same("${entry.text} cut $cut", bytes.slice(0, cut), 100000000)
+            cut = cut + (if (cut < 64) 1 else bytes.size / 97 + 1)
+        }
+        same("${entry.text} trailing", bytes + "x", 100000000)
+        same("${entry.text} doubled", bytes + bytes, 100000000)
+    }
+    if (failures > 0) return 1
+    println("gzip-inflate-diff ok $cases cases")
+    0
+}

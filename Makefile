@@ -449,6 +449,7 @@ test-serial: ablac
 	tools/test-p384.sh $(COMPILER)
 	tools/test-sha512-boundaries.sh $(COMPILER)
 	tools/test-hex-native.sh $(COMPILER)
+	tools/test-gzip-inflate-diff.sh $(COMPILER)
 	tools/test-json-encode.sh $(COMPILER)
 	tools/test-utf8-fast.sh $(COMPILER)
 	tools/test-sha3-fast.sh $(COMPILER)
