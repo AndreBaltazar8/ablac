@@ -130,9 +130,13 @@ Inventory 2026-11-15 (master `ede03cd6`, stage 2 of it; `tools/test-libc-imports
 Next, in order: (1) NovaKind's signer onto `abla/tls/pure` (branch `tls-pure-822`, parked by André), then delete
 `abla/tls/hosted`, `abla/crypto/hosted` and `abla/jwt/libcrypto`'s leftovers, keeping OpenSSL only as the test oracle
 (`tests/cases/crypto-pure/against-hosted.ab`, move it to the `openssl` command line); `tls-http` leaves
-`tools/libc-imports-static-pending.txt` with them; (2) the AArch64 static check of `tools/test-aarch64-linux.sh` over
-all 11 `libc-imports` programs (it runs 6) and a representative set of the module cases, so a regression in a stdlib
-area the 11 programs miss (sockets, processes, signals, stm) shows; (3, done) the compiler's own `abla/platform/host/tls`
+`tools/libc-imports-static-pending.txt` with them; (2, done 2026-11-20) `tools/test-aarch64-linux.sh` covers all 11
+`libc-imports` programs (it ran 6 when this was written) and, new,
+`tools/test-libc-free-programs.sh` builds every `tests/cases/modules/*.ab` `--fast` for x86-64 and AArch64 Linux and fails
+on a program that links libc, or stops building, outside `tools/libc-free-programs-allowlist.txt` (a list that only
+shrinks; 17 x86-64 programs link libc: the compiler's own modules, OpenSSL, a user `extern:"c"`), so a regression in
+a stdlib area the 11 programs miss (sockets, processes, signals, stm) shows. The suite runs its x86-64 half; CI the
+whole (22 CPU-minutes, 4 on 8 cores); (3, done) the compiler's own `abla/platform/host/tls`
 through `abla/tls/pure`, which takes libssl and libcrypto out of the compiler's 36 imports (step C, André's, listed
 for completeness).
 
