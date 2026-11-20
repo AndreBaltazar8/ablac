@@ -107,21 +107,39 @@ trusted fun bootstrapProcessCapture(arguments: array<string>, maximum: int,
     if (process == 0) {
         linuxSyscall1(3, output)
         linuxSyscall1(3, error)
-        var ready = input >= 0 && linuxSyscall2(109, 0, 0) == 0
+        // The step that failed and its errno go to the parent (bootstrapProcessLaunchText): step * 4096 + errno.
+        var failed = if (input < 0) 4096 + (0 - input) else 0
+        if (failed == 0) {
+            val grouped = linuxSyscall2(109, 0, 0)
+            if (grouped < 0) failed = 2 * 4096 + (0 - grouped)
+        }
         // Restore an empty signal mask before exec; do not change environment.
-        if (linuxSyscall4(14, 2, setupAddress, 0, 8) < 0) ready = false
+        if (failed == 0) {
+            val masked = linuxSyscall4(14, 2, setupAddress, 0, 8)
+            if (masked < 0) failed = 3 * 4096 + (0 - masked)
+        }
         // dup2(fd, fd) keeps CLOEXEC, which exec would then honour.
-        if (ready && input == 0 && linuxSyscall3(72, 0, 2, 0) < 0) ready = false
-        if (ready && linuxSyscall2(33, input, 0) < 0) ready = false
-        if (ready && linuxSyscall2(33, writer, 1) < 0) ready = false
+        if (failed == 0 && input == 0) {
+            val kept = linuxSyscall3(72, 0, 2, 0)
+            if (kept < 0) failed = 4 * 4096 + (0 - kept)
+        }
+        if (failed == 0) {
+            val moved = linuxSyscall2(33, input, 0)
+            if (moved < 0) failed = 5 * 4096 + (0 - moved)
+        }
+        if (failed == 0) {
+            val moved = linuxSyscall2(33, writer, 1)
+            if (moved < 0) failed = 6 * 4096 + (0 - moved)
+        }
         if (input > 2) linuxSyscall1(3, input)
         if (writer > 2) linuxSyscall1(3, writer)
-        if (ready) {
-            linuxSyscall3(59, executableAddress, vectorAddress, environmentAddress)
+        if (failed == 0) {
+            val executed = linuxSyscall3(59, executableAddress, vectorAddress, environmentAddress)
+            failed = 7 * 4096 + (if (executed < 0) 0 - executed else 0)
         }
         // CLOEXEC closes this pipe on success, distinguishing exec failure from
         // a successfully launched program which itself exits with status 127.
-        setup.storeI64(0, 1)
+        setup.storeI64(0, failed)
         linuxSyscall3(1, errorWriter, setupAddress, 8)
         linuxSyscall1(60, 127)
     }
@@ -135,13 +153,18 @@ trusted fun bootstrapProcessCapture(arguments: array<string>, maximum: int,
         linuxSyscall1(3, output)
         linuxSyscall1(3, error)
         setup.close()
+        bootstrapProcessLaunchReport(executable, 8 * 4096 + (if (process < -1) 0 - process else 0))
         return BootstrapProcessCapture(-1, "", "launch", 0)
     }
     // Also establish the group in the parent, closing the fork/setup race.
     linuxSyscall2(109, process, process)
     var failure = ""
+    var launchCode = 0
     if (linuxSyscall3(72, output, 4, 2048) < 0 ||
-        linuxSyscall3(72, error, 4, 2048) < 0) failure = "launch"
+        linuxSyscall3(72, error, 4, 2048) < 0) {
+        failure = "launch"
+        launchCode = 9 * 4096
+    }
     val buffer = nativeByteBuffer(maximum + 1)
     val polling = nativeByteBuffer(16)
     polling.storeI64(0, output | (1 << 32))
@@ -167,7 +190,10 @@ trusted fun bootstrapProcessCapture(arguments: array<string>, maximum: int,
                 else if (amount != -11 && amount != -4) failure = "read"
             }
             val launch = linuxSyscall3(0, error, nativePointerAddress(setup.address), 8)
-            if (launch > 0) failure = "launch"
+            if (launch > 0) {
+                failure = "launch"
+                launchCode = setup.loadI64(0)
+            }
             else if (launch == 0) polling.storeI64(8, -1)
             else if (launch < 0 && launch != -11 && launch != -4) failure = "read"
             if (!reaped) {
@@ -194,7 +220,10 @@ trusted fun bootstrapProcessCapture(arguments: array<string>, maximum: int,
     // again after observing exit so that race cannot look like a normal 127.
     val launch = if (failure == "")
         linuxSyscall3(0, error, nativePointerAddress(setup.address), 8) else 0
-    if (failure == "" && launch > 0) failure = "launch"
+    if (failure == "" && launch > 0) {
+        failure = "launch"
+        launchCode = setup.loadI64(0)
+    }
     if (failure != "") {
         // Kill even when the leader was already reaped: a descendant may still
         // hold stdout open. SIGKILL leaves no grace period outside the deadline.
@@ -217,5 +246,30 @@ trusted fun bootstrapProcessCapture(arguments: array<string>, maximum: int,
     polling.close()
     val text = if (failure == "") buffer.adoptString(measured) else ""
     buffer.close()
+    if (failure == "launch") bootstrapProcessLaunchReport(executable, launchCode)
     BootstrapProcessCapture(status, text, failure, measured)
+}
+
+// A launch that failed, on standard error (the build's log): which step and its errno (#1041), so a spawn that
+// fails now and then explains itself. `code` is step * 4096 + errno.
+fun bootstrapProcessLaunchText(executable: string, code: int): string {
+    val step = code / 4096
+    val errno = code % 4096
+    val what = if (step == 1) "opening /dev/null"
+        else if (step == 2) "setpgid in the child"
+        else if (step == 3) "clearing the signal mask in the child"
+        else if (step == 4) "keeping standard input"
+        else if (step == 5) "dup2 of standard input"
+        else if (step == 6) "dup2 of standard output"
+        else if (step == 7) "exec"
+        else if (step == 8) "fork"
+        else if (step == 9) "making the pipes nonblocking"
+        else "an unknown step ($code)"
+    "compilerCaptureProcess: $executable did not start: $what failed" +
+        (if (errno != 0) " (errno $errno)" else "")
+}
+
+fun bootstrapProcessLaunchReport(executable: string, code: int): void {
+    linuxPrintStandardError("${bootstrapProcessLaunchText(executable, code)}\n")
+    return
 }

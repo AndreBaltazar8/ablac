@@ -18,7 +18,18 @@ for tier in interp jit bridge; do
         -o "$out/main-$tier" --fast --no-cache > "$out/$tier.log" 2>&1
     status=0
     "$out/main-$tier" > "$out/main-$tier.out" 2>&1 || status=$?
-    [[ $status == 42 ]] || { echo "capture checks failed: $status ($tier): $(cat "$out/main-$tier.out")" >&2; exit 1; }
+    [[ $status == 42 ]] || {
+        echo "capture checks failed: $status ($tier): $(cat "$out/main-$tier.out")" >&2
+        grep 'compilerCaptureProcess:' "$out/$tier.log" >&2 || true
+        exit 1
+    }
+    # A launch that fails says which step and its errno (#1041): check 7's missing executable, exec and ENOENT.
+    grep -q '^compilerCaptureProcess: /abla-capture-nonexistent-executable did not start: exec failed (errno 2)$' \
+        "$out/$tier.log" || {
+        echo "capture ($tier): the failed launch did not say its step and errno" >&2
+        cat "$out/$tier.log" >&2
+        exit 1
+    }
     # Orphaned grandchildren may briefly remain zombies until init reaps them;
     # require they are no longer executing, on both Linux and Darwin.
     for pidfile in "$out/timeout-child.pid" "$out/overflow-child.pid"; do
