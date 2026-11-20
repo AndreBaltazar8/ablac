@@ -84,6 +84,18 @@ ln -s ../other "$work/linked/app/engine"
 (cd "$work/linked/app" && "$compiler" fix-imports main.ab --prune) > "$work/linked-prune.log" 2>&1 ||
     fail "linked prune failed" "$work/linked-prune.log"
 grep -qxF 'import "abla/json"' "$work/linked/other/lib.ab" || fail "the prune changed a linked checkout's file" "$work/linked/other/lib.ab"
+
+# A library has no main: E_NO_MAIN comes after the front end, so its warnings stand and the prune runs.
+if (cd "$work/library" && "$compiler" build lib.ab -o program --fast --warn-unused-imports) > "$work/library.log" 2>&1; then
+    fail "library/lib.ab built without a main" "$work/library.log"
+fi
+grep -q 'E_NO_MAIN' "$work/library.log" || fail "library/lib.ab failed for another reason" "$work/library.log"
+grep -qxF 'warning[W_UNUSED_IMPORT]: lib.ab: nothing `import "abla/json"` declares is used here' "$work/library.log" ||
+    fail "no warning for a library without main" "$work/library.log"
+(cd "$work/library" && "$compiler" fix-imports lib.ab --prune) > "$work/library-prune.log" 2>&1 ||
+    fail "the library prune refused" "$work/library-prune.log"
+! grep -qxF 'import "abla/json"' "$work/library/lib.ab" || fail "the library prune left abla/json" "$work/library/lib.ab"
+grep -qxF 'import "abla/text"' "$work/library/lib.ab" || fail "the library prune removed abla/text" "$work/library/lib.ab"
 # The prune.
 (cd "$work" && "$compiler" fix-imports main.ab --prune) > "$work/prune.log" 2>&1 || fail "prune failed" "$work/prune.log"
 grep -qxF 'fix-imports: removed 2 unused import(s) in 1 file(s); 0 restored, 0 left' "$work/prune.log" ||
