@@ -246,6 +246,7 @@ test-serial: ablac
 	tools/test-jit-object-cache.sh $(COMPILER)
 	tools/test-live-jit.sh $(COMPILER)
 	tools/test-live-watch.sh $(COMPILER)
+	tools/test-test-watch.sh $(COMPILER)
 	tools/test-fs-watch.sh $(COMPILER)
 	tools/test-jit-http.sh $(COMPILER)
 	tools/test-string-helpers.sh $(COMPILER)

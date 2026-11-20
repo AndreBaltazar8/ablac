@@ -31,7 +31,7 @@ ablac build app.ab -o build/app --fast --no-cache
 ablac build app.ab -o build/app -g        # debug information in a release build
 ablac run app.ab -- arguments  # compiled in process (--o1 IR pipeline) and called there, live on x86-64 Linux and macOS (--no-live; --watch reloads on a save)
 ablac run --built app.ab   # built (--o1, cached) and exec'd
-ablac test tests/*.ab      # build and run test programs (abla/test)
+ablac test tests/*.ab      # build and run test programs (abla/test); --watch runs them again on each save
 ablac fmt --check src/     # check layout without writing (formatter.md)
 ablac repl
 ablac serve app.ab
@@ -509,6 +509,13 @@ at most about 3 s) and reloads only when a file's contents changed. Only the fil
 watched, not the standard library, the cache or output directories, and the list follows each reload (an added
 import is watched from then on). `--watch` implies `--live`; it does not go with `--built`, `--release` or
 `--no-live`. `tools/test-live-watch.sh` edits a running program, saves a broken file and changes a result type.
+
+`ablac test --watch <files>` runs the tests, then again each time a file they read changes: each run is a child
+`ablac test` with the same arguments (its output is a plain run's), followed by one line on stderr, `ablac test --watch:
+passed|failed; watching N files`. The files are each test's module graph (import discovery), not the standard
+library's; the wait is `run --watch`'s (inotify or kqueue, a burst of writes settles, only a change of contents runs
+the tests). It runs until stopped. `tools/test-test-watch.sh` breaks and fixes a module a test imports, and saves one it
+does not.
 
 ## Compiler diagnostics
 

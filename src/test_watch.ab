@@ -1,0 +1,71 @@
+// `ablac test --watch` (docs/toolchain.md): the tests run, then again each time one of the files they read changes.
+// Each run is a child `ablac test` with the same arguments (without --watch), so its output is a plain run's and the
+// compiler's tables never outgrow one run; this process only waits. The files are each test's module graph (as
+// import discovery reads it), not the standard library's: abla/fs/watch (inotify on Linux, kqueue on macOS, no
+// libc) wakes it, a burst of writes settles (an editor saves in several steps), and only a file whose contents
+// changed starts a run, as `run --watch` does (live_watch.ab).
+import "abla/fs"
+import "abla/fs/watch"
+import "abla/text"
+import "abla/sys/linux"
+import "abla/sys/linux/io"
+import "abla/sys/linux/process"
+import "module.ab"
+import "module_paths.ab"
+import "toolchain.ab"
+
+val bootstrapTestWatchWaitMilliseconds = 250
+val bootstrapTestWatchQuietMilliseconds = 120
+val bootstrapTestWatchSettleRounds = 25
+
+// The files the tests read: each test's own modules (import discovery), not the standard library's, in order.
+fun bootstrapTestWatchPaths(sources: array<string>): array<string> {
+    val root = bootstrapStandardLibraryRoot()
+    val paths: array<string> = []
+    for (source in sources) {
+        val discovery = BootstrapImportProviderDiscovery(bootstrapModuleState(), [], [], 0, "")
+        discovery.collect(source)
+        for (path in discovery.paths) {
+            var known = false
+            for (seen in paths) if (seen == path) known = true
+            if (!known && (root == "" || !path.startsWith("$root/"))) paths.append(path)
+        }
+        var listed = false
+        for (seen in paths) if (seen == source) listed = true
+        if (!listed) paths.append(source)
+    }
+    paths
+}
+
+// Runs the tests, then again after each change, until the process is stopped. `forwarded` are the arguments after
+// `test`, without --watch; `sources` the test files they name.
+fun bootstrapTestWatch(forwarded: array<string>, sources: array<string>): int {
+    while (true) {
+        val child = linuxCommand("/proc/self/exe")
+        child.argument("test")
+        for (argument in forwarded) child.argument(argument)
+        val status = child.run()
+        val paths = bootstrapTestWatchPaths(sources)
+        linuxPrintStandardError(
+            "ablac test --watch: ${if (status == 0) "passed" else "failed"}; watching ${paths.size} files\n"
+        )
+        val events = fileEvents(paths)
+        val files: array<Path> = []
+        for (path in paths) files.append(Path(path))
+        val contents = watchFiles(files)
+        var changed = false
+        while (!changed) {
+            if (events.wait(bootstrapTestWatchWaitMilliseconds)) {
+                var rounds = 0
+                while (rounds < bootstrapTestWatchSettleRounds && events.wait(bootstrapTestWatchQuietMilliseconds)) {
+                    rounds = rounds + 1
+                }
+            } else if (events.active()) continue
+            // macOS gives no events for a file whose directory could not be opened, and a platform without a watch
+            // only sleeps: comparing the contents now and then still sees a save.
+            changed = contents.changed()
+        }
+        events.close()
+    }
+    0
+}
