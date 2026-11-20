@@ -50,6 +50,16 @@ mv "$work/vendored/abla-packages" "$work/vendored/.abla/packages"
     fail "vendored prune failed" "$work/vendored-prune.log"
 grep -qxF 'import "abla/json"' "$work/vendored/.abla/packages/fake/entry.ab" ||
     fail "the prune changed a vendored package" "$work/vendored/.abla/packages/fake/entry.ab"
+
+# Another project's module (../lib, outside app's abla.toml): not this build's to warn about, nor the prune's.
+(cd "$work/outside/app" && "$compiler" build --project . -o program --fast --warn-unused-imports) > "$work/outside.log" 2>&1 ||
+    fail "outside/app didn't build" "$work/outside.log"
+! grep -q W_UNUSED_IMPORT "$work/outside.log" || fail "a warning outside the project" "$work/outside.log"
+(cd "$work/outside/app" && "$compiler" fix-imports --project . --prune) > "$work/outside-prune.log" 2>&1 ||
+    fail "outside prune failed" "$work/outside-prune.log"
+grep -qxF 'import "abla/json"' "$work/outside/lib/lib.ab" || fail "the prune changed another project's module" "$work/outside/lib/lib.ab"
+grep -qxF 'fix-imports: removed 0 unused import(s) in 0 file(s); 0 restored, 0 left' "$work/outside-prune.log" ||
+    fail "the outside prune listed something" "$work/outside-prune.log"
 # The prune.
 (cd "$work" && "$compiler" fix-imports main.ab --prune) > "$work/prune.log" 2>&1 || fail "prune failed" "$work/prune.log"
 grep -qxF 'fix-imports: removed 2 unused import(s) in 1 file(s); 0 restored, 0 left' "$work/prune.log" ||
