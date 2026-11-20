@@ -16,9 +16,14 @@ class DeflateBitWriter(
 // At run time the bytes go to native memory a 32-bit word at a time (capacity for the worst case, `capacity` bytes of input and a margin for the block headers, is reserved by the
 // caller); the compile-time evaluator keeps the byte buffer.
 private trusted fun deflateBitWriter(capacity: int): DeflateBitWriter {
-    val memory = if (ablaAtCompileTime()) 0 else ablaUnsafePointerAddress(ablaUnsafeAllocate(capacity + capacity / 512 + 512))
+    val memory = if (ablaCompileTimeNativeHost()) deflateMemory(capacity)
+        else if (ablaAtCompileTime()) 0
+        else deflateMemory(capacity)
     DeflateBitWriter(byteBuffer(), 0, 0, memory, 0)
 }
+
+private trusted fun deflateMemory(capacity: int): int =
+    ablaUnsafePointerAddress(ablaUnsafeAllocate(capacity + capacity / 512 + 512))
 
 /** Appends the low `count` bits of `value` (at most 32), least significant first, as DEFLATE packs them. */
 private trusted fun DeflateBitWriter.append(value: int, count: int): void {
@@ -435,7 +440,11 @@ private trusted fun deflateCompress(input: string, searchLimit: int): string {
     var hashBits = 8
     while (hashBits < 15 && (1 << hashBits) < size) hashBits = hashBits + 1
     val mask = (1 << hashBits) - 1
-    val native = !ablaAtCompileTime()
+    // The compile-time evaluator and a slice built for another target keep arrays (portable); native host code and
+    // compiled code use native memory.
+    var portable = false
+    if (ablaCompileTimeNativeHost()) {} else if (ablaAtCompileTime()) portable = true
+    val native = !portable
     val head: array<int> = []
     val prev: array<int> = []
     val headSize = 1 << hashBits
@@ -448,7 +457,7 @@ private trusted fun deflateCompress(input: string, searchLimit: int): string {
         for (i in 0 until size) prev.append(-1)
     }
     val prevAt = table + headSize * 4
-    val data = if (ablaAtCompileTime()) 0 else ablaUnsafeStringAddress(input)
+    val data = if (portable) 0 else ablaUnsafeStringAddress(input)
     var chainLimit = searchLimit
     if (chainLimit > 4096) chainLimit = 4096
     if (chainLimit < 1) chainLimit = 1
@@ -467,9 +476,9 @@ private trusted fun deflateCompress(input: string, searchLimit: int): string {
         // Put this position in its chain (a position is inserted once).
         var candidate = -1
         if (position + 2 < size && inserted < position) {
-            val a = if (ablaAtCompileTime()) input[position] else ablaUnsafeLoadU8(nativePointerFromAddress(data + position))
-            val b = if (ablaAtCompileTime()) input[position + 1] else ablaUnsafeLoadU8(nativePointerFromAddress(data + position + 1))
-            val c = if (ablaAtCompileTime()) input[position + 2] else ablaUnsafeLoadU8(nativePointerFromAddress(data + position + 2))
+            val a = if (portable) input[position] else ablaUnsafeLoadU8(nativePointerFromAddress(data + position))
+            val b = if (portable) input[position + 1] else ablaUnsafeLoadU8(nativePointerFromAddress(data + position + 1))
+            val c = if (portable) input[position + 2] else ablaUnsafeLoadU8(nativePointerFromAddress(data + position + 2))
             val h = deflateHash(a, b, c, mask)
             candidate = if (native) ablaUnsafeLoadU32(nativePointerFromAddress(table + h * 4)) - 1 else head[h]
             if (native) ablaUnsafeStoreU32(nativePointerFromAddress(prevAt + position * 4), candidate + 1) else prev[position] = candidate
@@ -489,7 +498,7 @@ private trusted fun deflateCompress(input: string, searchLimit: int): string {
                 steps = steps + 1
                 // A candidate that cannot beat the best so far differs at the byte past it.
                 var matched = 0
-                if (ablaAtCompileTime()) {
+                if (portable) {
                     while (matched < maximum && input[position + matched] == input[candidate + matched]) matched = matched + 1
                 } else {
                     // Eight bytes at a time while they agree, then byte by byte for the rest (the same length either way).
@@ -521,9 +530,9 @@ private trusted fun deflateCompress(input: string, searchLimit: int): string {
             val stop = position - 1 + previousLength
             while (next < stop) {
                 if (next + 2 < size && inserted < next) {
-                    val a = if (ablaAtCompileTime()) input[next] else ablaUnsafeLoadU8(nativePointerFromAddress(data + next))
-                    val b = if (ablaAtCompileTime()) input[next + 1] else ablaUnsafeLoadU8(nativePointerFromAddress(data + next + 1))
-                    val c = if (ablaAtCompileTime()) input[next + 2] else ablaUnsafeLoadU8(nativePointerFromAddress(data + next + 2))
+                    val a = if (portable) input[next] else ablaUnsafeLoadU8(nativePointerFromAddress(data + next))
+                    val b = if (portable) input[next + 1] else ablaUnsafeLoadU8(nativePointerFromAddress(data + next + 1))
+                    val c = if (portable) input[next + 2] else ablaUnsafeLoadU8(nativePointerFromAddress(data + next + 2))
                     val h = deflateHash(a, b, c, mask)
                     if (native) ablaUnsafeStoreU32(nativePointerFromAddress(prevAt + next * 4), ablaUnsafeLoadU32(nativePointerFromAddress(table + h * 4))) else prev[next] = head[h]
                     if (native) ablaUnsafeStoreU32(nativePointerFromAddress(table + h * 4), next + 1) else head[h] = next
@@ -943,15 +952,20 @@ private trusted fun streamInflateNativeWindow(): StreamInflateWindow {
     val address = nativePointerAddress(buffer.address)
     StreamInflateWindow(move(buffer), address, [])
 }
-private fun streamInflateWindow(): StreamInflateWindow = if (ablaAtCompileTime())
-    StreamInflateWindow(null, 0, filledArray(32768, 0)) else streamInflateNativeWindow()
+private fun streamInflateWindow(): StreamInflateWindow =
+    if (ablaCompileTimeNativeHost()) streamInflateNativeWindow()
+    else if (ablaAtCompileTime()) StreamInflateWindow(null, 0, filledArray(32768, 0))
+    else streamInflateNativeWindow()
 private trusted fun StreamInflateWindow.set(index: int, value: int): void {
-    if (ablaAtCompileTime()) this.interpreted[index] = value
+    if (ablaCompileTimeNativeHost()) ablaUnsafeStoreU8(nativePointerFromAddress(this.address + index), value)
+    else if (ablaAtCompileTime()) this.interpreted[index] = value
     else ablaUnsafeStoreU8(nativePointerFromAddress(this.address + index), value)
     return
 }
-private trusted fun StreamInflateWindow.get(index: int): int = if (ablaAtCompileTime())
-    this.interpreted[index] else ablaUnsafeLoadU8(nativePointerFromAddress(this.address + index))
+private trusted fun StreamInflateWindow.get(index: int): int =
+    if (ablaCompileTimeNativeHost()) ablaUnsafeLoadU8(nativePointerFromAddress(this.address + index))
+    else if (ablaAtCompileTime()) this.interpreted[index]
+    else ablaUnsafeLoadU8(nativePointerFromAddress(this.address + index))
 
 // The stream owns its decoder state, and no output is final until done=true.
 // Error is "invalid", "limit", or "source". At most 65536 output bytes are
@@ -1052,7 +1066,7 @@ private fun GzipStream.emit(var output: ByteBuffer, value: int): void {
 // A match is at most 258 bytes. Reserve its output once, but advance the
 // history one byte at a time so overlapping copies and window wrap work.
 private trusted fun GzipStream.emitMatch(var output: ByteBuffer, count: int): void {
-    if (ablaAtCompileTime()) {
+    if (ablaCompileTimeNativeHost()) {} else if (ablaAtCompileTime()) {
         var i = 0
         while (i < count) {
             this.emit(output, this.window.get((this.total - this.distance) & 32767))
@@ -1251,7 +1265,10 @@ fun GzipStream.read(var source: GzipSource, maxBytes: int): GzipStreamChunk {
                 this.remaining -= 1
             }
         } else if (this.state == 2) {
-            if (!ablaAtCompileTime()) {
+            if (ablaCompileTimeNativeHost()) {
+                this.inflateFast(output, cap)
+                if (output.size() >= cap) continue
+            } else if (!ablaAtCompileTime()) {
                 this.inflateFast(output, cap)
                 if (output.size() >= cap) continue
             }
