@@ -781,6 +781,53 @@ class RegexVm(
         }
     }
 
+    // `add` for a program without capture groups (two slots: the match's start and end). Every thread added from one
+    // source shares its start, and a path's end is set by the one `save 1` before the match instruction, so the
+    // captures are two scalars and the work stack holds only instruction numbers: no entry is copied.
+    fun add2(list: int, pc0: int, start0: int, position: int): void {
+        var sp = 1
+        this.stackPcs[0] = pc0
+        var start = start0
+        while (sp > 0) {
+            sp -= 1
+            var pc = this.stackPcs[sp]
+            var end = -1
+            var follow = true
+            while (follow) {
+                follow = false
+                if (this.seen[pc] != this.generation) {
+                    this.seen[pc] = this.generation
+                    this.work += 1
+                    val op = this.program[pc * 3]
+                    if (op == 4) {
+                        pc = this.program[pc * 3 + 1]
+                        follow = true
+                    } else if (op == 3) {
+                        this.stackPcs[sp] = this.program[pc * 3 + 2]
+                        sp += 1
+                        pc = this.program[pc * 3 + 1]
+                        follow = true
+                    } else if (op == 5) {
+                        if (this.program[pc * 3 + 1] == 0) start = position else end = position
+                        pc += 1
+                        follow = true
+                    } else if (op == 6) {
+                        if (this.assertionHolds(this.program[pc * 3 + 1], position)) {
+                            pc += 1
+                            follow = true
+                        }
+                    } else {
+                        val at = list * this.n + this.counts[list]
+                        this.pcs[at] = pc
+                        this.store[at * 2] = start
+                        this.store[at * 2 + 1] = end
+                        this.counts[list] = this.counts[list] + 1
+                    }
+                }
+            }
+        }
+    }
+
     fun classMatches(index: int, c: int): bool {
         val ranges = this.classes[index]
         var i = 0
@@ -827,6 +874,7 @@ private fun regexRun(re: Regex, var vm: RegexVm, from: int, anchored: bool, need
     var i = from
     var running = true
     val skipping = !anchored && re.first.size == 256
+    val simple = vm.slots == 2
     while (running) {
         // Nothing is running and no match is pending: the start positions up to the next byte a match can begin with
         // add threads that the next step drops, so they are passed over. Past the last byte nothing can match.
@@ -837,9 +885,12 @@ private fun regexRun(re: Regex, var vm: RegexVm, from: int, anchored: bool, need
         // A start thread at an ASCII byte outside the first-byte set dies at once and no thread behind it is affected.
         if (running && !matched && (!anchored || i == from) &&
             (!skipping || regexStartsAt(vm.text, re.first, i, size))) {
-            val start = vm.startEntry()
-            for (k in 0 until vm.slots) vm.store[start * vm.slots + k] = -1
-            vm.add(current, 0, start, i)
+            if (simple) vm.add2(current, 0, -1, i)
+            else {
+                val start = vm.startEntry()
+                for (k in 0 until vm.slots) vm.store[start * vm.slots + k] = -1
+                vm.add(current, 0, start, i)
+            }
         }
         if (!running || (vm.counts[current] == 0 && (matched || anchored))) {
             running = false
@@ -850,8 +901,15 @@ private fun regexRun(re: Regex, var vm: RegexVm, from: int, anchored: bool, need
             var width = 0
             var scalar = -1
             if (i < size) {
-                width = regexWidth(vm.text, i)
-                scalar = regexScalar(vm.text, i, width)
+                val byte = vm.text[i]
+                // An ASCII byte is one code point of one byte; only the others need the UTF-8 walk.
+                if (byte < 128) {
+                    width = 1
+                    scalar = byte
+                } else {
+                    width = regexWidth(vm.text, i)
+                    scalar = regexScalar(vm.text, i, width)
+                }
             }
             var t = 0
             var cut = false
@@ -873,7 +931,10 @@ private fun regexRun(re: Regex, var vm: RegexVm, from: int, anchored: bool, need
                     else if (op == 1) hit = scalar != 10
                     else if (op == 2) hit = vm.classMatches(x,
                         scalar) != (vm.program[pc * 3 + 2] == 1)
-                    if (hit) vm.add(next, pc + 1, entry, i + width)
+                    if (hit) {
+                        if (simple) vm.add2(next, pc + 1, vm.store[entry * 2], i + width)
+                        else vm.add(next, pc + 1, entry, i + width)
+                    }
                 }
                 t += 1
             }
