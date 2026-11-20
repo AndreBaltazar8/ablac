@@ -383,6 +383,21 @@ imports (a module the file already imports, even under an alias, is left alone).
 build strict yet: `ablac build app.ab -o app --flat-imports --visibility-report report.tsv`, then the fixer, then
 `ablac build app.ab -o app`; a new import that makes a name ambiguous needs an alias, which that build reports.
 
+A build warns about each import the importing file doesn't use: `warning[W_UNUSED_IMPORT]: <file>: nothing
+`import "x"` declares is used here`, with the import's place. A use is any name the module declares (a call, a type,
+an extension method or operator it resolves to, the receiver of an extension the file declares, a `$name` subparser it
+registers). The warning is for the project's own modules only: not the standard library, a vendored package
+(`.abla/packages/`), another project's module or a checkout linked into the project. It is never given for an aliased,
+exported or contract-only import, an import of a module that does something by being loaded (an `@export` function or
+a top-level `#` action), an import in a module that runs compile code (what it compiles may read the module), or after
+a front end that stopped at an error (an IR error such as a library's `E_NO_MAIN`, or a failed link, still gets it). A
+package's entry gets a different line instead: the import is neither used nor passed on, `export import` it if the
+package means to offer it. `--no-warn-unused-imports` or `ABLA_WARN_UNUSED_IMPORTS=0` turns it off;
+`--warn-unused-imports` turns it on over the environment. A cache hit prints the lines its entry kept. `ablac
+fix-imports [<file.ab> | --project <dir>] --prune [--dry-run]` removes the warned imports (never an entry's, never the
+last import of a file with a `#compilerGrant`, never one in another project), builds again and puts back any file whose
+build got worse, and refuses a build that stops in the front end.
+
 Compile-time build definitions may register additional program nodes through
 the versioned compiler API. After the root succeeds, `build` drains the bounded
 graph in declaration order; a requested program may add further nodes. This

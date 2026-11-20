@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# W_UNUSED_IMPORT (module.ab: bootstrapUnusedImportWarnings), behind --warn-unused-imports: an import nothing in the
-# importing file uses gets a warning, an import used only through an extension method, a re-exported class or a
+# W_UNUSED_IMPORT (module.ab: bootstrapUnusedImportWarnings), on by default (off with --no-warn-unused-imports or
+# ABLA_WARN_UNUSED_IMPORTS=0, and a cache hit prints what its entry kept): an import nothing in the importing file uses
+# gets a warning, an import used only through an extension method, a re-exported class or a
 # `$json` subparser doesn't, nor one of a module with an @export function; a package's entry gets the
 # `export import` line instead, and a module that runs compile code keeps its imports. Another project's module, a
 # vendored package and a checkout linked in get none, nor does any module after a front end that stopped at an error.
@@ -26,9 +27,32 @@ warning[W_UNUSED_IMPORT]: main.ab: nothing `import "abla/json"` declares is used
 warning[W_UNUSED_IMPORT]: main.ab: nothing `import "./helper.ab"` declares is used here
 TXT
 diff "$work/expected.txt" "$work/warnings.txt" > "$work/warn.diff" || fail "main.ab's warnings differ" "$work/warn.diff"
-# Off without the flag.
-(cd "$work" && "$compiler" build main.ab -o program --fast) > "$work/plain.log" 2>&1 || fail "plain build failed" "$work/plain.log"
-! grep -q W_UNUSED_IMPORT "$work/plain.log" || fail "a warning without --warn-unused-imports" "$work/plain.log"
+# On by default (decision #86); off with --no-warn-unused-imports or ABLA_WARN_UNUSED_IMPORTS=0.
+(cd "$work" && "$compiler" build main.ab -o program --fast --no-cache) > "$work/plain.log" 2>&1 ||
+    fail "plain build failed" "$work/plain.log"
+grep -q 'W_UNUSED_IMPORT.*"abla/json"' "$work/plain.log" || fail "no warning by default" "$work/plain.log"
+(cd "$work" && "$compiler" build main.ab -o program --fast --no-cache --no-warn-unused-imports) > "$work/off.log" 2>&1 ||
+    fail "--no-warn-unused-imports build failed" "$work/off.log"
+! grep -q W_UNUSED_IMPORT "$work/off.log" || fail "a warning with --no-warn-unused-imports" "$work/off.log"
+(cd "$work" && ABLA_WARN_UNUSED_IMPORTS=0 "$compiler" build main.ab -o program --fast --no-cache) > "$work/env-off.log" 2>&1 ||
+    fail "ABLA_WARN_UNUSED_IMPORTS=0 build failed" "$work/env-off.log"
+! grep -q W_UNUSED_IMPORT "$work/env-off.log" || fail "a warning with ABLA_WARN_UNUSED_IMPORTS=0" "$work/env-off.log"
+# A cached rebuild skips the front end and prints the lines its entry kept; turned off, it prints none.
+cache="$work/cache"
+(cd "$work" && ABLA_CACHE_DIR="$cache" "$compiler" build main.ab -o program --fast) > "$work/cold.log" 2>&1 ||
+    fail "cold cached build failed" "$work/cold.log"
+marker=$(find "$cache" -name 'native-*.source' 2>/dev/null | head -1)
+[ -n "$marker" ] && [ -f "${marker%.source}.unused" ] || fail "the cache entry kept no warnings" "$work/cold.log"
+before=$(stat -c %Y "$marker")
+sleep 1
+(cd "$work" && ABLA_CACHE_DIR="$cache" "$compiler" build main.ab -o program --fast) > "$work/warm.log" 2>&1 ||
+    fail "warm cached build failed" "$work/warm.log"
+[ "$(stat -c %Y "$marker")" = "$before" ] || fail "the second build was not a cache hit" "$work/warm.log"
+grep '^warning\[W_UNUSED_IMPORT\]' "$work/warm.log" > "$work/warm-warnings.txt" || true
+diff "$work/expected.txt" "$work/warm-warnings.txt" > "$work/warm.diff" || fail "a cache hit's warnings differ" "$work/warm.diff"
+(cd "$work" && ABLA_CACHE_DIR="$cache" "$compiler" build main.ab -o program --fast --no-warn-unused-imports) > "$work/warm-off.log" 2>&1 ||
+    fail "warm build without warnings failed" "$work/warm-off.log"
+! grep -q W_UNUSED_IMPORT "$work/warm-off.log" || fail "a cache hit warned with --no-warn-unused-imports" "$work/warm-off.log"
 # A package's entry: the export-import line.
 (cd "$work/pkg" && "$compiler" build app.ab -o program --fast --warn-unused-imports) > "$work/pkg.log" 2>&1 ||
     fail "pkg/app.ab didn't build" "$work/pkg.log"
