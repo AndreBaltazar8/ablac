@@ -8,7 +8,6 @@ import "abla/unsafe/memory/raw"
 import "ct_bridge.ab"
 import "compile_actions.ab"
 import "ct_native.ab"
-import "ct_native_effects.ab"
 import "eval_scalar.ab"
 import "simd_types.ab"
 import "eval_uint256.ab"
@@ -1118,15 +1117,18 @@ fun bootstrapTakeDiagnosedLoweringErrors(): int {
     count
 }
 
-fun bootstrapStageDriverDiagnostic(diagnostic: string): void {
+fun bootstrapStageDriverDiagnostic(diagnostic: string, tail: string = ""): void {
     // Past 8 KiB a diagnostic keeps its first whole lines, so its first errors
-    // still say what they are.
+    // still say what they are. `tail` (a failing `#` site's own records, a few
+    // lines) is kept whole after them: the cut used to fall on it, or, once
+    // the path through the program's functions was added, on the last errors.
     var kept = diagnostic
     if (kept.size > 8192) {
         var end = 8192
         while (end > 0 && kept[end - 1] != 10) end = end - 1
         kept = kept.slice(0, end)
     }
+    if (tail.size <= 4096) kept = "$kept$tail"
     if (kept.size > 0 && bootstrapDriverDiagnosticCount < 64) {
         val root = bootstrapDriverDiagnosticRoot()
         if (Path(root).createDirectories() && Path(
@@ -7147,11 +7149,24 @@ fun bootstrapEvaluateFrom(
 val BOOTSTRAP_EVAL_PATH_FRAMES = 8
 var bootstrapEvalPathFrames: int = 0
 var bootstrapEvalPathLast: string = ""
+// The records, kept beside the evaluation's diagnostics rather than in them: written into them while the evaluation
+// ran, they changed what it went on to report (module/lowered-ir-cache's interpreted `#` code lost its two
+// E_EVAL_MEMORY_UNAVAILABLE errors, and its parity row its class). The site's report takes them (ir.ab,
+// bootstrapLowerCompile).
+var bootstrapEvalPathRecords: string = ""
 
 fun bootstrapEvalPathBegin(): void {
     bootstrapEvalPathFrames = 0
     bootstrapEvalPathLast = ""
+    bootstrapEvalPathRecords = ""
     return
+}
+
+// The frames noted since bootstrapEvalPathBegin, once.
+fun bootstrapEvalPathTake(): string {
+    val records = bootstrapEvalPathRecords
+    bootstrapEvalPathRecords = ""
+    records
 }
 
 fun bootstrapEvalNoteFrame(var evaluator: BootstrapEvaluator, name: string, source: string, begin: int,
@@ -7160,13 +7175,9 @@ fun bootstrapEvalNoteFrame(var evaluator: BootstrapEvaluator, name: string, sour
         bootstrapEvalPathFrames >= BOOTSTRAP_EVAL_PATH_FRAMES) return
     bootstrapEvalPathLast = name
     bootstrapEvalPathFrames = bootstrapEvalPathFrames + 1
-    evaluator.diagnostics = "${evaluator.diagnostics}${bootstrapEvalFrameRecord(name, source, begin, end)}"
+    bootstrapEvalPathRecords = "$bootstrapEvalPathRecords${bootstrapEvalFrameRecord(name, source, begin, end)}"
     return
 }
-
-// The program's own code, not the standard library's: the path names only its functions.
-fun bootstrapEvalUserSource(source: string): bool =
-    source != "" && !source.startsWith("${bootstrapCompileProviderStandardLibrary()}/")
 
 fun bootstrapEvalFrameRecord(name: string, source: string, begin: int, end: int): string =
     "source[frame:$name]:$source:$begin:$end\n"
@@ -7410,7 +7421,8 @@ fun bootstrapRuntimeVar(evaluator: BootstrapEvaluator, name: string): int {
 
 // A failed `#` expression of the program: its diagnostics, counted as one error
 // per `error[` line (bootstrapDiagnosedLoweringErrors).
-fun bootstrapStageEvaluationFailure(diagnostics: string): void {
+// `tail`: records kept whole after the 8 KiB cut (the failing site and the functions it was in, ir.ab).
+fun bootstrapStageEvaluationFailure(diagnostics: string, tail: string = ""): void {
     var text = diagnostics
     if (text == "") {
         text = "error[E_EVAL_EXPRESSION]: compile-time evaluation failed\n"
@@ -7426,7 +7438,7 @@ fun bootstrapStageEvaluationFailure(diagnostics: string): void {
         text = "error[E_EVAL_EXPRESSION]: compile-time evaluation failed\n$text"
         lines = 1
     }
-    bootstrapStageDriverDiagnostic(text)
+    bootstrapStageDriverDiagnostic(text, tail)
     bootstrapNoteDiagnosedLoweringErrors(lines)
     bootstrapEvalFailureErrors = bootstrapEvalFailureErrors + lines
     return
