@@ -583,6 +583,7 @@ test-serial: ablac
 	tools/test-extern-export.sh $(COMPILER)
 	tools/test-ownership-precision.sh $(COMPILER)
 	tools/test-ownership-index-assign.sh $(COMPILER)
+	tools/test-ownership-audit.sh $(COMPILER)
 	tools/test-when-subject-owner.sh $(COMPILER)
 	tools/test-elvis-container-loop.sh $(COMPILER)
 	tools/test-elvis-field-owner.sh $(COMPILER)
