@@ -12,6 +12,8 @@
 #   stage2      the Linux binary is byte for byte the local stage 2 (cmp)
 #   convergence a green bootstrap-convergence run exists for the release's source commit (tools/release-convergence.sh);
 #               required: without --source-ref (or the tag) and a run, this check fails
+#   static      (when the run built ablac-static-x86_64-linux, #806 step C) it has no PT_INTERP or DT_NEEDED, prints the version, builds and
+#               runs a smoke program and, with ABLA_STATIC_LLVM_LIB set, reaches the fixpoint (tools/test-static-artifact.sh)
 #   siblings    (with --siblings) the downstream repositories build and pass their tests with the candidate
 #               (tools/test-siblings.sh over tools/siblings.txt)
 #
@@ -152,6 +154,10 @@ actual=$(mktemp)
 # only exists when nothing was given with --artifacts, and also removes the two temporary lists.)
 trap 'rm -f -- "$expected" "$actual"; [[ -z ${source_dir:-} || -n $artifacts ]] || rm -rf -- "$source_dir"' EXIT
 ( cd "$out" && ls ) | sort >"$actual"   # (ls leaves out the .release-check marker)
+# The static compiler (#806 step C) is an optional extra next to the dynamic one: its names are neither expected nor an extra; check 7 judges it.
+static_names=$(grep -E "^ablac-static-x86_64-linux(\.sha256)?\$" "$actual" || true)
+grep -vE "^ablac-static-x86_64-linux(\.sha256)?\$" "$actual" > "$actual.filtered" || true
+mv -f "$actual.filtered" "$actual"
 if [[ -n $assets_from ]]; then
     sort "$assets_from" >"$expected"
     basis="$assets_from"
@@ -170,6 +176,8 @@ else
         basis="(no previous release found)"
     fi
 fi
+grep -vE "^ablac-static-x86_64-linux(\.sha256)?\$" "$expected" > "$expected.filtered" || true
+mv -f "$expected.filtered" "$expected"
 if ((count == 0)); then
     report FAIL assets "no files in the artifacts"
 elif [[ -n $duplicates ]]; then
@@ -272,6 +280,25 @@ if [[ -n $siblings ]]; then
     else
         bad=$(awk 'NR > 1 && ($3 != "0" || $4 == "FAIL") {printf "%s ", $1}' "$out/siblings/summary.txt" 2>/dev/null)
         report FAIL siblings "${bad:-see $out/siblings.log}"
+    fi
+fi
+
+# 7. static: the statically linked compiler, when the run built one (#806 step C; an extra next to the dynamic default).
+if [[ -n $static_names ]]; then
+    static=$out/ablac-static-x86_64-linux
+    if [[ ! -f $static ]]; then
+        report FAIL static "the static compiler's checksum is here but not the compiler"
+    elif [[ $(uname -s)/$(uname -m) != Linux/x86_64 ]]; then
+        report FAIL static "this host cannot run ablac-static-x86_64-linux"
+    else
+        chmod +x "$static"
+        static_args=("$static" "$version")
+        [[ -n ${ABLA_STATIC_LLVM_LIB:-} ]] || static_args+=(--no-fixpoint)
+        if (cd "$(dirname -- "${BASH_SOURCE[0]}")/.." && STATIC_ARTIFACT_OUTPUT="$out/static-check" tools/test-static-artifact.sh "${static_args[@]}") > "$out/static.log" 2>&1; then
+            report PASS static "no PT_INTERP, no DT_NEEDED, smoke compile$([[ -n ${ABLA_STATIC_LLVM_LIB:-} ]] && echo ', fixpoint' || echo ' (no fixpoint: ABLA_STATIC_LLVM_LIB unset)')"
+        else
+            report FAIL static "$(tail -n 1 "$out/static.log") ($out/static.log)"
+        fi
     fi
 fi
 
