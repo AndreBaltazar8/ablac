@@ -133,10 +133,10 @@ if ((programs)); then
         work=$(mktemp -d "$out/program.XXXXXX")
         local base=-
         if [[ -n $baseline ]]; then
-            (cd "$layout/$name" && timeout 600 "$baseline" build "$file" -o "$work/base" --fast --no-cache) > "$work/base.log" 2>&1 && base=0 || base=$?
+            (cd "$layout/$name" && ABLA_MAX_MEMORY_MB=$memory timeout 600 "$baseline" build "$file" -o "$work/base" --fast --no-cache) > "$work/base.log" 2>&1 && base=0 || base=$?
         fi
         local cand=0
-        (cd "$layout/$name" && ABLA_SYSROOT=$candidate timeout 600 "$candidate/build/ablac" build "$file" -o "$work/cand" --fast --no-cache) > "$work/cand.log" 2>&1 || cand=$?
+        (cd "$layout/$name" && ABLA_MAX_MEMORY_MB=$memory ABLA_SYSROOT=$candidate timeout 600 "$candidate/build/ablac" build "$file" -o "$work/cand" --fast --no-cache) > "$work/cand.log" 2>&1 || cand=$?
         echo "$name $file base=$base cand=$cand"
         if [[ $cand != 0 && ( $base == 0 || $base == - ) ]]; then
             { echo "### $name $file (base=$base cand=$cand)"; grep -a -m3 -E 'error\[|error:' "$work/cand.log" | cut -c1-240; } > "$work/regression"
@@ -145,7 +145,10 @@ if ((programs)); then
         rm -rf -- "$work"
     }
     export -f build_one
-    export out layout baseline candidate
+    # One memory cap for both compilers (the launcher's default, 2048 MB of address space, is at the edge for some
+    # generated programs such as abla-graphics' raw_registry, so it failed or passed by allocation pattern).
+    memory=${ABLA_MAX_MEMORY_MB:-4096}
+    export out layout baseline candidate memory
     : > "$out/regressions.txt"
     # `jobs` at a time; each line's output is whole (one echo). (Paths with spaces aren't sibling sources.)
     xargs -P "$jobs" -L 1 bash -c 'build_one "$0" "$1"' < "$programs_file" > "$out/programs-result.txt" 2>&1 || true
