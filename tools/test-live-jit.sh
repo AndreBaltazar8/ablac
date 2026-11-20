@@ -121,7 +121,10 @@ for profile in o1 fast; do
     # its several applied reloads, --o1 under the default (256 MB) never.
     limit=268435456
     [[ $profile == fast ]] && limit=1
-    ABLA_LIVE_NOTE_BYTES=$limit limited "$compiler" run "--$profile" --live "$reload" -- "$reload" \
+    # The --o1 run keeps its reload modules (ABLA_LIVE_DUMP_MODULE), for the thread-local check below.
+    dump=
+    [[ $profile == o1 ]] && dump=$PWD/$out/module
+    ABLA_LIVE_DUMP_MODULE=$dump ABLA_LIVE_NOTE_BYTES=$limit limited "$compiler" run "--$profile" --live "$reload" -- "$reload" \
         > "$out/reload-$profile.out" 2> "$out/reload-$profile.err" || status=$?
     if [[ $status -ne 42 ]] || grep -q ': FAIL' "$out/reload-$profile.out"; then
         printf 'live jit (reload, %s): exit status %s (42 expected)\n' "$profile" "$status" >&2
@@ -156,6 +159,20 @@ if [[ $status -ne 42 || $forward != *'(ptr sret(%AblaValue) '* ]]; then
         "$status" "${forward:-(no dispatcher printed)}" >&2
     exit 1
 fi
+# A reload brings its own copies of runtime functions the running program never emitted (the new variables'
+# runtime entry and leave, among others). Their thread-local storage must be the running program's, named after
+# its function (abla_thread_local_<function>_<n>): a name LLVM numbered in emission order named some other
+# thread-local of the running program in the reload's module. Every thread-local a reload module has is named so.
+modules=$(find "$out" -maxdepth 1 -name 'module-*.ll' | wc -l)
+numbered=$(grep -h 'thread_local(' "$out"/module-*.ll 2> /dev/null | grep -Evc '^@(__abla_unit\.)?abla_thread_local_' || true)
+named=$(grep -h 'thread_local(' "$out"/module-*.ll 2> /dev/null | grep -Ec '^@(__abla_unit\.)?abla_thread_local_' || true)
+if [[ $modules -eq 0 || $named -eq 0 || $numbered -ne 0 ]]; then
+    printf 'live jit (thread-locals): %s reload modules, %s thread-locals named after their function, %s not\n' \
+        "$modules" "$named" "$numbered" >&2
+    grep -h 'thread_local(' "$out"/module-*.ll 2> /dev/null | grep -Ev '^@(__abla_unit\.)?abla_thread_local_' | head -n 5 >&2
+    exit 1
+fi
+rm -f "$out"/module-*.ll
 # ABLA_LIVE_JIT_REPEAT=n: the --o1 reload n times more, for a failure that comes now and then (a Mac run trapped
 # in the new lambda's call, run 44586994389); each failure says where, and on macOS a run under lldb follows it
 # (the backtrace, registers and code at the stop).
