@@ -5,6 +5,7 @@
 # - cached: the same run again starts from the object cache and is reloaded on a save too.
 # - broken: a save that does not compile keeps the program running its code (stderr says so), a file of the same
 #   directory that is not the program's (an output) reloads nothing, and the next good save is applied (exit 42).
+# - moved: renaming label()'s parameter applies (nothing takes it as a value), and a line names its redefined callers.
 # - restart: a save the running code cannot take (tests/cases/live-watch/restart.ab: a result type changes) restarts
 #   the run; the restarted run does not restart again for the same refusal, and the next good save is applied.
 # x86-64 Linux and macOS (an ablac that runs on AArch64 Linux is not built). Usage: tools/test-live-watch.sh [compiler]
@@ -92,6 +93,17 @@ save 's|= 1 // value-marker|= 2 // value-marker|' "$out/edit/program.ab"
 finish edit
 grep -q '^ablac run --watch: applied: value' "$out/edit/stderr" ||
     { echo 'live watch (cached): the save was not applied' >&2; cat "$out/edit/stderr" >&2; exit 1; }
+
+# moved: a changed signature that applies (label's parameter renamed; nothing takes it as a value) says which
+# redefined callers it reaches through: main, which never returns, keeps its old body.
+start moved
+save 's|fun label(x: int): int = x \* 0 // label-marker|fun label(y: int): int = y * 0 // label-marker|' "$out/moved/program.ab"
+wait_lines moved 1
+grep -q "^live: label's signature changed; callers redefined: main (it applies when they are entered again)$" \
+    "$out/moved/stderr" ||
+    { echo 'live watch (moved): no note on the changed signature and its callers' >&2; cat "$out/moved/stderr" >&2; exit 1; }
+save 's|= 1 // value-marker|= 2 // value-marker|' "$out/moved/program.ab"
+finish moved
 
 # broken
 start broken

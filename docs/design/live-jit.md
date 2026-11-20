@@ -284,7 +284,8 @@ because a callee moved (a renamed parameter: the call names the new symbol) is r
 `E_LIVE_CALLER`: the old caller still calls the old entry, so nothing it relies on changed. A caller that also
 calls a callee changed in place is still refused. The new signature reaches the program through the callers a reload redefines, so it shows
 once one of them is entered again: a caller that never returns (a `main` loop) keeps running its old body and the
-old entry until the program restarts. Tested by `tests/cases/live-jit/reload.ab` (a parameter added
+old entry until the program restarts. Under `--watch` an applied reload says so, one line per function that moved:
+`live: <name>'s signature changed; callers redefined: <callers> (it applies when they are entered again)`. Tested by `tests/cases/live-jit/reload.ab` (a parameter added
 while a thread is inside the old body) and `refuse.ab` (a function taken as a value, and one taken only inside a
 lambda of another module).
 

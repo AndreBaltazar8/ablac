@@ -475,8 +475,11 @@ Tested on x86-64 Linux and on both Macs (arm64 and Intel, in CI). What is built 
 `ablac run --watch` is a live run that reloads by itself: when one of the program's own source files changes, the
 same reload runs and its outcome goes to stderr as one line, `ablac run --watch: applied: <functions>`, or
 `E_LIVE_COMPILE` after the diagnostics. A save that does not compile keeps the program running its code, and the
-next good save is applied. A save the running code cannot take (a refusal: a changed signature or layout, a new
-global; or new code that does not link) restarts the run: one line, `ablac run --watch: restarting the program:
+next good save is applied. A changed signature that applies (the function is never taken as a value) adds a line
+per such function, `live: <name>'s signature changed; callers redefined: <callers> (it applies when they are
+entered again)`: a caller that never returns keeps its old body. A save the running code cannot take (a refusal: a
+changed signature of a function taken as a value, a layout, a new global; or new code that does not link) restarts
+the run: one line, `ablac run --watch: restarting the program:
 <code>: <function>: <why>`, then ablac replaces itself (the same process) with a fresh run of the same arguments
 and environment, so the program starts again on the saved sources and its state is lost (its descriptors close: the
 standard library opens them close-on-exec). The restarted run takes its reason out of the environment before the
