@@ -129,7 +129,10 @@ private fun cryptoRotateRight64(value: int, count: int): int =
 
 // SHA-512 and SHA-384, which differ in their start and in how much is kept. Words are
 // whole ints, whose arithmetic wraps at 64 bits.
-private fun cryptoSha2Long(value: string, initial: array<int>, digestBytes: int): string {
+private fun cryptoSha2Long(value: string, initial: array<int>, digestBytes: int): string =
+    if (ablaAtCompileTime()) cryptoSha2LongArray(value, initial, digestBytes) else cryptoSha2LongNative(value, initial, digestBytes)
+
+private fun cryptoSha2LongArray(value: string, initial: array<int>, digestBytes: int): string {
     val input: array<int> = []
     cryptoAppendText(input, value)
     val bitLength = input.size * 8
@@ -219,6 +222,31 @@ private fun cryptoSha2Long(value: string, initial: array<int>, digestBytes: int)
         cryptoAppendU32Big(output, (state[index] >>> 32) & 4294967295)
         cryptoAppendU32Big(output, state[index] & 4294967295)
         index = index + 1
+    }
+    cryptoByteString(output)
+}
+
+// The run-time path: the whole blocks of the message are hashed where they are (no copy of the message into an array, a byte at a time), and only the last one or two, the pending
+// bytes with the padding, are built. The compile-time evaluator keeps the array version above.
+private trusted fun cryptoSha2LongNative(value: string, initial: array<int>, digestBytes: int): string {
+    val state: array<int> = []
+    for (index in 0 until 8) state.append(initial[index])
+    val whole = value.size / 128
+    cryptoSha512RunAt(state, ablaUnsafeStringAddress(value), whole)
+    val rest = value.size - whole * 128
+    val zeros = if (rest <= 111) 111 - rest else 239 - rest
+    val bitLength = value.size * 8
+    val length: array<int> = []
+    cryptoAppendU32Big(length, 0)
+    cryptoAppendU32Big(length, 0)
+    cryptoAppendU32Big(length, (bitLength >>> 32) & 4294967295)
+    cryptoAppendU32Big(length, bitLength & 4294967295)
+    val tail = "${value.slice(whole * 128, value.size)}\x80${(CRYPTO_ZERO_BYTES + CRYPTO_ZERO_BYTES).slice(0, zeros)}${cryptoByteString(length)}"
+    cryptoSha512RunAt(state, ablaUnsafeStringAddress(tail), tail.size / 128)
+    val output: array<int> = []
+    for (index in 0 until digestBytes / 8) {
+        cryptoAppendU32Big(output, (state[index] >>> 32) & 4294967295)
+        cryptoAppendU32Big(output, state[index] & 4294967295)
     }
     cryptoByteString(output)
 }
@@ -575,10 +603,15 @@ private trusted fun cryptoSha256Run(var state: array<int>, input: string, offset
 
 /** SHA-512's core over the padded message `text` (whole 128-byte blocks), on `state`. */
 private trusted fun cryptoSha512Run(var state: array<int>, text: string): void {
+    cryptoSha512RunAt(state, ablaUnsafeStringAddress(text), text.size / 128)
+}
+
+/** SHA-512's core over `blocks` whole 128-byte blocks at `address`, on `state`. */
+private trusted fun cryptoSha512RunAt(var state: array<int>, address: int, blocks: int): void {
     val memory = ablaUnsafeAllocate(704)
     val base = ablaUnsafePointerAddress(memory)
     for (k in 0 until 8) sha2Store64(base + k * 8, secretU64(u64(state[k])))
-    sha512CoreBlocks(base, ablaUnsafeStringAddress(text), text.size / 128, base + 64)
+    sha512CoreBlocks(base, address, blocks, base + 64)
     for (k in 0 until 8) state[k] = int(sha2Load64(base + k * 8).declassify())
     cryptoWipe(base, 704)
     ablaUnsafeFree(memory)
