@@ -291,6 +291,58 @@ fun bootstrapStaticLibcData(): string =
     bootstrapStaticLibcSymbolTable() +
     ".section .note.GNU-stack,\"\",@progbits\n"
 
+// AArch64 Linux's form of bootstrapStaticLibcData: the same data symbols, `b` for the jumps, AAPCS64 variadic entry points, adrp/ldr for the table.
+fun bootstrapStaticLibcDataAarch64(): string =
+    ".data\n.p2align 3\n" +
+    ".globl environ\n.type environ,%object\n.size environ,8\nenviron:\n.quad 0\n" +
+    ".globl __libc_single_threaded\n.type __libc_single_threaded,%object\n.size __libc_single_threaded,1\n__libc_single_threaded:\n.byte 0\n.p2align 3\n" +
+    ".globl stdin\n.type stdin,%object\n.size stdin,8\nstdin:\n.quad abla_libc_file_in\n" +
+    ".globl stdout\n.type stdout,%object\n.size stdout,8\nstdout:\n.quad abla_libc_file_out\n" +
+    ".globl stderr\n.type stderr,%object\n.size stderr,8\nstderr:\n.quad abla_libc_file_err\n" +
+    ".p2align 3\nabla_libc_file_in:\n.quad 0\n.zero 216\n" +
+    "abla_libc_file_out:\n.quad 1\n.zero 216\n" +
+    "abla_libc_file_err:\n.quad 2\n.zero 216\n" +
+    ".text\n.p2align 2\n" +
+    bootstrapStaticLibcJumpAarch64("sigaction") + bootstrapStaticLibcJumpAarch64("sigaltstack") + bootstrapStaticLibcJumpAarch64("fork") +
+    bootstrapStaticLibcJumpAarch64("dlopen") + bootstrapStaticLibcJumpAarch64("dlsym") +
+    bootstrapStaticLibcVariadicAarch64("snprintf", 3, "") +
+    bootstrapStaticLibcVariadicAarch64("sprintf", 2, "\tmov x2, x1\n\tmov x1, #-1\n\tadd x3, sp, #192\n\tbl vsnprintf\n") +
+    bootstrapStaticLibcVariadicAarch64("__printf_chk", 2, "\tmov x0, x1\n\tadd x1, sp, #192\n\tbl abla_libc_vprintf\n") +
+    bootstrapStaticLibcVariadicAarch64("__snprintf_chk", 5, "\tmov x2, x4\n\tadd x3, sp, #192\n\tbl vsnprintf\n") +
+    bootstrapStaticLibcSymbolTableAarch64() +
+    ".section .note.GNU-stack,\"\",%progbits\n"
+
+fun bootstrapStaticLibcJumpAarch64(name: string): string =
+    ".globl ${name}\n.type ${name},%function\n${name}:\n\tb abla_libc_${name}\n.size ${name}, .-${name}\n"
+
+// A variadic C function: x0-x7 saved at sp, q0-q7 at sp + 64, the AAPCS64 va_list at sp + 192 (the stack pointer at entry, the ends of the two
+// save areas, and the offsets from those ends: the named arguments are skipped by starting 8 * `named` bytes into the general area), x30 at
+// sp + 224; then `call` (snprintf's default: vsnprintf(buffer, size, format, va_list) with the first three arguments in place).
+fun bootstrapStaticLibcVariadicAarch64(name: string, named: int, call: string): string =
+    ".globl ${name}\n.type ${name},%function\n${name}:\n" +
+    "\tsub sp, sp, #240\n\tstr x30, [sp, #224]\n" +
+    "\tstp x0, x1, [sp, #0]\n\tstp x2, x3, [sp, #16]\n\tstp x4, x5, [sp, #32]\n\tstp x6, x7, [sp, #48]\n" +
+    "\tstp q0, q1, [sp, #64]\n\tstp q2, q3, [sp, #96]\n\tstp q4, q5, [sp, #128]\n\tstp q6, q7, [sp, #160]\n" +
+    "\tadd x9, sp, #240\n\tstr x9, [sp, #192]\n\tadd x9, sp, #64\n\tstr x9, [sp, #200]\n\tadd x9, sp, #192\n\tstr x9, [sp, #208]\n" +
+    "\tmov w9, #-${64 - 8 * named}\n\tstr w9, [sp, #216]\n\tmov w9, #-128\n\tstr w9, [sp, #220]\n" +
+    (if (call == "") "\tadd x3, sp, #192\n\tbl vsnprintf\n" else call) +
+    "\tldr x30, [sp, #224]\n\tadd sp, sp, #240\n\tret\n.size ${name}, .-${name}\n"
+
+fun bootstrapStaticLibcSymbolTableAarch64(): string {
+    val names = sortedStrings(bootstrapStaticLibcSymbolNames())
+    var strings = ".section .rodata\n"
+    var pairs = ".section .data.rel.ro,\"aw\"\n.p2align 3\n.globl abla_libc_symbols\nabla_libc_symbols:\n"
+    var index = 0
+    for (name in names) {
+        strings = "${strings}abla_libc_name_${index}: .asciz \"${name}\"\n"
+        pairs = "${pairs}\t.quad abla_libc_name_${index}, ${name}\n"
+        index = index + 1
+    }
+    "${strings}${pairs}.p2align 3\nabla_libc_symbol_count: .quad ${index}\n.text\n.p2align 2\n" +
+    ".globl abla_libc_symbols_address\n.type abla_libc_symbols_address,%function\nabla_libc_symbols_address:\n\tadrp x0, abla_libc_symbols\n\tadd x0, x0, :lo12:abla_libc_symbols\n\tret\n" +
+    ".globl abla_libc_symbols_count\n.type abla_libc_symbols_count,%function\nabla_libc_symbols_count:\n\tadrp x0, abla_libc_symbol_count\n\tldr x0, [x0, :lo12:abla_libc_symbol_count]\n\tret\n"
+}
+
 // The table dlsym searches (src/static_libc/dl.ab): the names of src/static_libc_symbols.ab sorted, each with the address of its symbol, as pairs of
 // (pointer to the NUL-terminated name, address), and two functions that return the table's address and length.
 fun bootstrapStaticLibcSymbolTable(): string {
@@ -4667,7 +4719,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         // libc-free link can't resolve (lld names it; `--verbose` prints why).
         // The compiler itself (src/orc_main_static.ab) links LLVM's static archives, named by ABLA_STATIC_LLVM_LIB, on Abla's own C library
         // (src/static_libc, #806 step C): no libLLVM.so and no libc, and a link that fails is an error, not a fallback to the hosted link.
-        val staticLlvmLibrary = if (linkLlvm && !macTarget && bootstrapLlvmTargetIsX8664Linux(target.llvmTriple))
+        val staticLlvmLibrary = if (linkLlvm && !macTarget && (bootstrapLlvmTargetIsX8664Linux(target.llvmTriple) || bootstrapLlvmTargetIsAarch64Linux(target.llvmTriple)))
             linuxEnvironment("ABLA_STATIC_LLVM_LIB").value else ""
         val staticLlvm = staticLlvmLibrary != ""
         var libcFree = !macTarget && bootstrapLlvmTargetIsX8664Linux(target.llvmTriple) &&
@@ -4697,6 +4749,15 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                 link.argument("-Wl,-e,abla_start")
                 link.argument("-Wl,--defsym=pthread_create=abla_clone_create")
                 link.argument("-Wl,--defsym=pthread_join=abla_clone_join")
+                if (staticLlvm) {
+                    // The statically linked compiler for AArch64 Linux (the same C library, src/static_libc): the aliases of the x86-64 link below.
+                    link.argument("-Wl,--defsym=malloc=abla_libc_malloc")
+                    link.argument("-Wl,--defsym=calloc=abla_libc_calloc")
+                    link.argument("-Wl,--defsym=free=abla_libc_free")
+                    link.argument("-Wl,--defsym=realloc=abla_libc_realloc")
+                    link.argument("-Wl,--defsym=pthread_mutex_lock=abla_libc_pthread_mutex_lock")
+                    link.argument("-Wl,--defsym=pthread_mutex_unlock=abla_libc_pthread_mutex_unlock")
+                }
             } else if (libcFree) {
                 link.argument("-nostdlib")
                 link.argument("-static-pie")
@@ -4801,7 +4862,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                 // object, in one group so they may refer to one another; the data symbols a C library defines (environ, stdin ...) come
                 // from a generated assembly file.
                 val dataPath = "$publishPath.libc-data.s"
-                Path(dataPath).writeText(bootstrapStaticLibcData())
+                Path(dataPath).writeText(if (aarch64Linux) bootstrapStaticLibcDataAarch64() else bootstrapStaticLibcData())
                 link.argument(dataPath)
                 link.argument("-Wl,--start-group")
                 for (entry in Path(staticLlvmLibrary).entries()) {
@@ -4810,6 +4871,14 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                         !bootstrapStaticLlvmOtherTarget(archive)) link.argument(entry.text)
                 }
                 link.argument("-Wl,--end-group")
+                if (aarch64Linux) {
+                    // A cross link has no host gcc to ask: ABLA_STATIC_TARGET_LIBS names a directory with the target's libstdc++.a, libz.a
+                    // and libgcc.a (the C++ library's helpers: 128-bit float and the like, which -nostdlib leaves out).
+                    val targetLibraries = linuxEnvironment("ABLA_STATIC_TARGET_LIBS").value
+                    link.argument("$targetLibraries/libstdc++.a")
+                    link.argument("$targetLibraries/libz.a")
+                    link.argument("$targetLibraries/libgcc.a")
+                } else {
                 // The C++ library's archive is the C compiler's (gcc's), not the LLVM clang's, which has no GCC installation to look in.
                 val stdcxx = linuxCommand("gcc")
                 stdcxx.argument("-print-file-name=libstdc++.a")
@@ -4819,6 +4888,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                 val zlibPath = zlibQuery.captureText().trim()
                 val configuredZlib = linuxEnvironment("ABLA_STATIC_ZLIB")
                 link.argument(if (zlibPath.size > 0 && zlibPath[0] == 47) zlibPath else "${configuredZlib.value}/libz.a")
+                }
             }
             // OpenSSL is not on Darwin's default library path, whether the graph
             // links it for TLS or the manifest names it.

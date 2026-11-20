@@ -6,6 +6,7 @@
 # Usage: tools/test-libc-functions.sh [compiler]
 set -euo pipefail
 export LC_ALL=C
+ulimit -c 0   # the abort test must not leave a core file in the tree
 compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -29,3 +30,22 @@ code=0
 [[ $(cat "$out/stack-chk-fail.err") == '*** stack smashing detected ***: terminated' ]] ||
     { echo "libc functions: __stack_chk_fail wrote [$(cat "$out/stack-chk-fail.err")]" >&2; exit 1; }
 echo 'libc functions: math, iconv, posix_spawn, wcsftime and __stack_chk_fail agree'
+# The same modules for AArch64 Linux (#806 step C, the static compiler's second target): the programs that do not run another program are
+# built with --target aarch64-linux and run under qemu-aarch64 (posix_spawn's test starts the host's /bin/sh, which the guest cannot).
+if command -v qemu-aarch64 > /dev/null; then
+    for name in math-functions iconv wcsftime stack-chk-fail; do
+        "$compiler" build "tests/cases/libc-$name/main.ab" -o "$out/$name.aarch64" --target aarch64-linux --no-cache > "$out/$name.aarch64.build.log" 2>&1 ||
+            { echo "libc functions: libc-$name did not build for aarch64-linux" >&2; tail -20 "$out/$name.aarch64.build.log" >&2; exit 1; }
+    done
+    for name in math-functions iconv wcsftime; do
+        code=0
+        qemu-aarch64 "$out/$name.aarch64" > "$out/$name.aarch64.out" 2>&1 < /dev/null || code=$?
+        [[ $code == 42 ]] || { echo "libc functions: libc-$name exited $code under qemu-aarch64" >&2; cat "$out/$name.aarch64.out" >&2; exit 1; }
+    done
+    code=0
+    { qemu-aarch64 "$out/stack-chk-fail.aarch64" > /dev/null 2> "$out/stack-chk-fail.aarch64.err" < /dev/null; } 2> /dev/null || code=$?
+    [[ $code == 134 ]] || { echo "libc functions: __stack_chk_fail ended with status $code under qemu-aarch64" >&2; exit 1; }
+    [[ $(head -n 1 "$out/stack-chk-fail.aarch64.err") == '*** stack smashing detected ***: terminated' ]] ||
+        { echo "libc functions: __stack_chk_fail wrote [$(head -n 1 "$out/stack-chk-fail.aarch64.err")] under qemu-aarch64" >&2; exit 1; }
+    echo 'libc functions: the same four agree for aarch64-linux under qemu'
+fi

@@ -1,6 +1,7 @@
 // The files and system-call wrappers of the statically linked compiler's C library: one system call each (#806 step C). An `int` parameter of C is
 // masked to its 32 bits, a `mode_t` and the like too; pointers and sizes are whole words.
 import "abla/runtime/scalar"
+import "abla/simd/target"
 import "abla/sys/linux"
 import "./errno.ab"
 
@@ -10,8 +11,45 @@ fun libcInt(value: int): int {
     if (low >= 2147483648) low - 4294967296 else low
 }
 
+// The C library's own ABI on AArch64 Linux differs from the x86-64 one the system call layer speaks (src/backend/llvm/aarch64.ab, which takes
+// x86-64 numbers and structures and gives the kernel the AArch64 forms): the callers here are the compiler's archives, built for AArch64, so
+// open flags arrive in AArch64's bits and a struct stat must go back in AArch64's layout. Both are converted at this boundary; on x86-64 both
+// functions are the identity.
+trusted fun libcOpenFlags(flags: int): int {
+    if (simdTargetArch() != SIMD_ARCH_AARCH64) return flags
+    var converted = flags - (flags & (16384 | 32768 | 65536 | 131072))
+    // O_DIRECTORY 0x4000 -> 0x10000, O_NOFOLLOW 0x8000 -> 0x20000, O_DIRECT 0x10000 -> 0x4000; O_LARGEFILE (0x20000) has no x86-64 bit.
+    if ((flags & 16384) != 0) converted = converted | 65536
+    if ((flags & 32768) != 0) converted = converted | 131072
+    if ((flags & 65536) != 0) converted = converted | 16384
+    converted
+}
+
+// struct stat from x86-64's 144 bytes (st_nlink as a word before st_mode) to AArch64's 128 (st_mode, st_nlink, st_uid, st_gid as ints, then
+// st_rdev, a pad word, st_size, st_blksize as an int and a pad int; the rest is at the same offsets), in place.
+trusted fun libcStatResult(buffer: int, result: int): int {
+    if (result < 0 || simdTargetArch() != SIMD_ARCH_AARCH64) return libcResult(result)
+    val nlink = ablaRuntimeLoadI64(buffer + 16)
+    val mode = ablaRuntimeLoadI32(buffer + 24)
+    val uid = ablaRuntimeLoadI32(buffer + 28)
+    val gid = ablaRuntimeLoadI32(buffer + 32)
+    val rdev = ablaRuntimeLoadI64(buffer + 40)
+    val blksize = ablaRuntimeLoadI64(buffer + 56)
+    ablaRuntimeStoreI32(buffer + 16, mode)
+    ablaRuntimeStoreI32(buffer + 20, nlink)
+    ablaRuntimeStoreI32(buffer + 24, uid)
+    ablaRuntimeStoreI32(buffer + 28, gid)
+    ablaRuntimeStoreI64(buffer + 32, rdev)
+    ablaRuntimeStoreI64(buffer + 40, 0)
+    ablaRuntimeStoreI32(buffer + 56, blksize)
+    ablaRuntimeStoreI32(buffer + 60, 0)
+    ablaRuntimeStoreI64(buffer + 120, 0)
+    result
+}
+
 @export("open")
-trusted fun libcOpen(path: int, flags: int, mode: int): int = libcResult(linuxSyscall3(2, path, libcInt(flags), mode & 4294967295))
+trusted fun libcOpen(path: int, flags: int, mode: int): int =
+    libcResult(linuxSyscall3(2, path, libcOpenFlags(libcInt(flags)), mode & 4294967295))
 
 @export("close")
 trusted fun libcClose(descriptor: int): int = libcResult(linuxSyscall1(3, libcInt(descriptor)))
@@ -30,22 +68,22 @@ trusted fun libcPread(descriptor: int, buffer: int, count: int, offset: int): in
 trusted fun libcLseek(descriptor: int, offset: int, whence: int): int = libcResult(linuxSyscall3(8, libcInt(descriptor), offset, libcInt(whence)))
 
 @export("stat")
-trusted fun libcStat(path: int, buffer: int): int = libcResult(linuxSyscall2(4, path, buffer))
+trusted fun libcStat(path: int, buffer: int): int = libcStatResult(buffer, linuxSyscall2(4, path, buffer))
 
 @export("stat64")
-trusted fun libcStat64(path: int, buffer: int): int = libcResult(linuxSyscall2(4, path, buffer))
+trusted fun libcStat64(path: int, buffer: int): int = libcStatResult(buffer, linuxSyscall2(4, path, buffer))
 
 @export("fstat")
-trusted fun libcFstat(descriptor: int, buffer: int): int = libcResult(linuxSyscall2(5, libcInt(descriptor), buffer))
+trusted fun libcFstat(descriptor: int, buffer: int): int = libcStatResult(buffer, linuxSyscall2(5, libcInt(descriptor), buffer))
 
 @export("fstat64")
-trusted fun libcFstat64(descriptor: int, buffer: int): int = libcResult(linuxSyscall2(5, libcInt(descriptor), buffer))
+trusted fun libcFstat64(descriptor: int, buffer: int): int = libcStatResult(buffer, linuxSyscall2(5, libcInt(descriptor), buffer))
 
 @export("lstat")
-trusted fun libcLstat(path: int, buffer: int): int = libcResult(linuxSyscall2(6, path, buffer))
+trusted fun libcLstat(path: int, buffer: int): int = libcStatResult(buffer, linuxSyscall2(6, path, buffer))
 
 @export("lstat64")
-trusted fun libcLstat64(path: int, buffer: int): int = libcResult(linuxSyscall2(6, path, buffer))
+trusted fun libcLstat64(path: int, buffer: int): int = libcStatResult(buffer, linuxSyscall2(6, path, buffer))
 
 @export("access")
 trusted fun libcAccess(path: int, mode: int): int = libcResult(linuxSyscall2(21, path, libcInt(mode)))
