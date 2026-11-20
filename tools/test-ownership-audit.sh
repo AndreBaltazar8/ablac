@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # The ownership audit (todo #1039's kin): a value that has one owner must not get a second one. tests/cases/ownership-audit/refused/*.ab are programs
 # that must not compile, each with the refusal it must give on its `// refused:` line: a loop's element of an array (or of a map's values) stored,
-# bound or returned (it stayed the array's and was dropped twice). drops/*.ab are the
-# accepted forms (reads of the loop element, element and field stores with `move`): each drops its resources exactly once
+# bound or returned (it stayed the array's and was dropped twice) and a local named as the arm of a `when` without `move`. drops/*.ab are the
+# accepted forms (reads of the loop element, `move(x)` in a `when`, element and field stores with `move`): each drops its resources exactly once
 # (release and --fast). The table of every position the audit tried is in TODO.md.
 set -euo pipefail
 compiler=${1:-build/ablac}
