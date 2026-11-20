@@ -8,7 +8,9 @@
 # directory of repositories than the one beside ablac.)
 #
 # <candidate-tree> is an ablac tree with build/ablac built (a worktree at the candidate, or a release candidate's
-# source). The check builds a layout in DIR (default build/siblings): each listed repository as a detached worktree
+# source). Its build/ablac.bin must be the candidate's stage 2 (tools/gate.sh's build/gate/stage2, or a release
+# binary), not one step from an older seed: a stage 1 is other code, and a difference it shows is not the candidate's.
+# The check builds a layout in DIR (default build/siblings): each listed repository as a detached worktree
 # of its default branch head (origin's, or the local branch for one without a remote), never anyone's checkout; an
 # `ablac` that is the candidate tree; every other directory beside ablac as a symlink (repositories built by path
 # reach them), and the symbolic links a repository's own checkout keeps to another project (game-pandatrails' engine)
@@ -145,9 +147,10 @@ if ((programs)); then
         rm -rf -- "$work"
     }
     export -f build_one
-    # One memory cap for both compilers (the launcher's default, 2048 MB of address space, is at the edge for some
-    # generated programs such as abla-graphics' raw_registry, so it failed or passed by allocation pattern).
-    memory=${ABLA_MAX_MEMORY_MB:-4096}
+    # One memory cap for both compilers, above what any sibling program needs: abla-graphics' generated
+    # tests/raw_registry.ab needs more than 4096 MB of address space with v0.2.63 and master alike (at 2048 or 4096
+    # both run out of memory alone, about 965 MB resident; at 6144 it builds), so a lower cap flips it by chance.
+    memory=${ABLA_MAX_MEMORY_MB:-8192}
     export out layout baseline candidate memory
     : > "$out/regressions.txt"
     # `jobs` at a time; each line's output is whole (one echo). (Paths with spaces aren't sibling sources.)
