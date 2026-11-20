@@ -101,7 +101,17 @@ try {
   checked(simctl(["bootstatus", udid, "-b"], { timeout: 240000, stdio: "inherit" }), "bootstatus");
   // A C-only process separates launch-service readiness from Abla startup.
   console.log("iOS Simulator: launch pure C baseline");
-  const base = checked(simctl(["spawn", udid, path.resolve(baseline)], { timeout: 120000, stdio: ["ignore", "pipe", "inherit"] }), "baseline");
+  // A C process that does nothing can still time out while the Simulator's launch services finish starting ("Waiting on
+  // System App": master 1cdcdc60 and one run before it, both green on the next push), so the first failure is retried once
+  // after another bootstatus. Nothing of Abla runs here: a second failure is the Simulator's and fails the step.
+  const spawnBaseline = () => simctl(["spawn", udid, path.resolve(baseline)], { timeout: 120000, stdio: ["ignore", "pipe", "inherit"] });
+  let first = spawnBaseline();
+  if (first.status !== 0) {
+    console.log("iOS Simulator: pure C baseline failed (" + (first.status === null ? first.signal : first.status) + "); waiting for the Simulator and trying once more");
+    checked(simctl(["bootstatus", udid, "-b"], { timeout: 240000, stdio: "inherit" }), "bootstatus after a failed baseline");
+    first = spawnBaseline();
+  }
+  const base = checked(first, "baseline");
   process.stdout.write(base.stdout);
   assert.ok(base.stdout.includes("pure C baseline ready"));
   console.log("iOS Simulator: deliberate execution-deadline control");
