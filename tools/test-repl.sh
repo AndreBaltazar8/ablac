@@ -11,10 +11,16 @@ compiler=$1
 base="$project_root/build/repl-test"
 
 # Feeds standard input to a REPL of its own, with its output in $base.$1.out and .err.
-# The time limits only stop a hung REPL: every line compiles in a child compiler,
-# which a loaded machine (the suite runs scripts in parallel) slows several times.
+# The time limits only stop a hung REPL: a loaded machine (the suite runs scripts in parallel) slows its compiles
+# several times. Where live mode runs (x86-64 Linux, macOS) the REPL is one live program and one compiler for the
+# whole session (src/live_repl.ab), whose address space passes 1 GB within a few lines: 3 GB there; elsewhere each
+# line compiles in a child compiler of its own, 1 GB.
+live=0
+[[ $(uname -s) == Darwin || $(uname -m) == x86_64 ]] && live=1
+memory=1024
+((live)) && memory=3072
 session() { # name seconds
-    ABLA_MAX_MEMORY_MB=1024 ABLA_MAX_SECONDS=$2 \
+    ABLA_MAX_MEMORY_MB=$memory ABLA_MAX_SECONDS=$2 \
         "$project_root/tools/run-limited.sh" "$compiler" repl \
         > "$base.$1.out" 2> "$base.$1.err"
 }
@@ -38,10 +44,8 @@ generations=$!
 # A live session (src/live_repl.ab, where live mode runs): a variable keeps its value across lines, any value
 # prints, a line that panics leaves the session and its state as they were, and a redefinition the running code
 # cannot take is refused with the old one kept.
-live=0
-[[ $(uname -s) == Darwin || $(uname -m) == x86_64 ]] && live=1
 if ((live)); then
-    printf 'var total = 0\ntotal += 5\ntotal\n"ab" + "c"\n1.5 * 3.0\n:quit\n' | session state 300 &
+    printf 'var total = 0\ntotal += 5\ntotal\n"ab" + "c"\n1.5 * 3.0\n[1, 2, 3]\n:quit\n' | session state 300 &
     state=$!
     printf 'val xs = [1, 2]\nxs[5]\nxs.size\n:quit\n' | session panic 300 &
     panicking=$!
@@ -55,7 +59,7 @@ if ((live)); then
     wait "$state"
     wait "$panicking"
     wait "$refused"
-    [[ $(< "$base.state.out") == $'abla> defined\nabla> 5\nabla> 5\nabla> abc\nabla> 4.5\nabla> ' ]] ||
+    [[ $(< "$base.state.out") == $'abla> defined\nabla> 5\nabla> 5\nabla> abc\nabla> 4.5\nabla> <array of size 3>\nabla> ' ]] ||
         { echo 'repl (state): a variable did not keep its value, or a value did not print' >&2; cat "$base.state.out" "$base.state.err" >&2; exit 1; }
     [[ $(< "$base.panic.out") == $'abla> defined\nabla> abla> 2\nabla> ' ]] && grep -q 'E_LIVE_PANIC' "$base.panic.err" ||
         { echo 'repl (panic): a line that panics did not leave the session and its state as they were' >&2; cat "$base.panic.out" "$base.panic.err" >&2; exit 1; }
