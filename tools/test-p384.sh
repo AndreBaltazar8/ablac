@@ -15,7 +15,10 @@ for mode in release fast; do
     flags=(--no-cache)
     [[ $mode == fast ]] && flags+=(--fast)
     "$compiler" build tests/cases/p384/reference.ab -o "$out/reference.$mode" "${flags[@]}"
-    result=$(ABLA_MAX_SECONDS=1200 "$root/tools/run-limited.sh" "$out/reference.$mode") || { echo "p384 reference ($mode): $result" >&2; exit 1; }
+    # The release run takes all 60 random scalars; the --fast one (about thirteen times slower) 20, plus the ten edge scalars: the same code, another code generator.
+    reference_arguments=()
+    [[ $mode == fast ]] && reference_arguments=(20)
+    result=$(ABLA_MAX_SECONDS=1200 "$root/tools/run-limited.sh" "$out/reference.$mode" "${reference_arguments[@]}") || { echo "p384 reference ($mode): $result" >&2; exit 1; }
     [[ $result == 'p384 reference ok' ]] || { echo "p384 reference ($mode): $result" >&2; exit 1; }
 done
 echo "ok   P-384 against the previous implementation: keys, ECDH, signatures, verification"
