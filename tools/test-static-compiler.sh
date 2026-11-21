@@ -88,6 +88,7 @@ cat > "$out/jit-libcalls/main.ab" <<'AB'
 import "abla/io"
 import "abla/math"
 import "abla/float/text"
+import "abla/float"
 import "abla/compiler"
 #compilerGrant("trusted.native")
 import "abla/unsafe/native"
@@ -103,8 +104,9 @@ trusted noescape extern:"c" fun strtol(text: cstring, end: i64*, base: i32): i64
 trusted noescape extern:"c" fun toupper(c: i32): i32
 trusted noescape extern:"c" fun atof(text: cstring): f64
 
+// (cbrt of a cube: glibc's cbrt is not correctly rounded, ours is, so cbrt(10) differs in the last digit between the two compilers.)
 trusted fun viaC(x: f64): string =
-    "${f64Text(exp2(x))} ${f64Text(cbrt(x))} ${f64Text(fmod(x, 3.0))} ${f64Text(trunc(x))} ${f64Text(rint(x))} " +
+    "${f64Text(exp2(x))} ${f64Text(cbrt(x * x * x))} ${f64Text(fmod(x, 3.0))} ${f64Text(trunc(x))} ${f64Text(rint(x))} " +
     "${f64Text(expm1(x / 1000.0))} ${strtol("-0x2a", nativeNullPointer(), 0)} ${toupper(97)} ${f64Text(atof("2.5e3"))}"
 
 // Abla's own pow with a power-of-two base: LLVM turns it into exp2 once the exponent is not constant.
