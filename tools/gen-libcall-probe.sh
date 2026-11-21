@@ -4,8 +4,6 @@
 # memory and string functions, loops the idiom pass turns into memset/memcpy, an frem, wide integer division, float to and from i128.
 # tools/test-libcall-coverage.sh compiles it for x86-64 and AArch64 and checks every undefined symbol is one the static compiler's JIT knows.
 set -euo pipefail
-echo 'target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"'
-echo 'target triple = "x86_64-unknown-linux-gnu"'
 echo
 one=(sqrt sin cos tan exp exp2 exp10 log log2 log10 fabs floor ceil trunc rint nearbyint round roundeven asin acos atan sinh cosh tanh)
 for t in double float; do
