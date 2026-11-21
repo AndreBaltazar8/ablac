@@ -412,6 +412,7 @@ test-serial: ablac
 	tools/test-uuid.sh $(COMPILER)
 	tools/test-regex.sh $(COMPILER)
 	tools/test-regex-literals.sh $(COMPILER)
+	tools/test-regex-named.sh $(COMPILER)
 	tools/test-syntax-compile.sh $(COMPILER)
 	tools/test-regex-diff.sh $(COMPILER)
 	tools/test-native-platform-boundary.sh $(COMPILER)

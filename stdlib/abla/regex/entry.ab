@@ -12,6 +12,8 @@
 import "abla/bytes"
 import "abla/text"
 import "abla/compiler/parser"
+import "abla/compiler"
+import "abla/process/exit"
 import "abla/unsafe/memory"
 import "abla/unsafe/memory/raw"
 
@@ -127,7 +129,40 @@ class Regex(
     }
 }
 
-class RegexCompileResult(val regex: Regex, val succeeded: bool, val error: RegexError)
+class RegexCaptureName(val name: string, val slot: int, val begin: int, val end: int)
+
+class RegexCompileResult(
+    val regex: Regex, val succeeded: bool, val error: RegexError,
+    val captureNames: array<RegexCaptureName> = [], val requiredCaptures: array<bool> = []
+)
+
+/// Matcher for a literal with named captures. The underlying Regex keeps the indexed match API.
+class NamedRegex<Captures>(val regex: Regex, val project: (RegexMatch) -> Captures) {
+    fun matches(text: string): bool = this.regex.matches(text)
+    fun replace(text: string, replacement: string): string = this.regex.replace(text, replacement)
+    fun matchFull(text: string): Captures? {
+        val matched = this.regex.matchFull(text)
+        val project = this.project
+        if (matched != null) project(matched) else null
+    }
+    fun find(text: string, start: int = 0): Captures? {
+        val matched = this.regex.find(text, start)
+        val project = this.project
+        if (matched != null) project(matched) else null
+    }
+    fun findAll(text: string): array<Captures> {
+        val matches = this.regex.findAll(text)
+        val result: array<Captures> = []
+        val project = this.project
+        for (matched in matches) result.append(project(matched))
+        result
+    }
+}
+
+// Used only for generated fields proved to participate on every successful path.
+fun ablaRegexRequiredCapture(matched: RegexMatch, index: int): string =
+    matched.group(index) ?? panic("required regex capture did not participate")
+
 
 class RegexMatch(val text: string, val spans: array<int>) {
     fun start(): int = this.spans[0]
@@ -169,6 +204,20 @@ private fun regexFail(pattern: string, message: string, offset: int): RegexCompi
 private fun regexIsWordByte(c: int): bool =
     (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
 
+private val regexCaptureKeywords: array<string> = [
+    "as", "await", "break", "class", "compile", "continue", "defer", "do", "else",
+    "extern", "false", "for", "fun", "generator", "if", "in", "interface",
+    "import", "null", "noescape", "resource", "return", "task", "thread", "true",
+    "trusted", "until", "val", "var", "when", "while", "yield", "this", "own",
+    "borrow", "move", "_"
+]
+
+private fun regexCaptureIdentifier(name: string): bool {
+    if (name == "" || name.startsWith("__") || (name[0] >= 48 && name[0] <= 57)) return false
+    for (keyword in regexCaptureKeywords) if (name == keyword) return false
+    true
+}
+
 private fun regexHexValue(c: int): int {
     if (c >= 48 && c <= 57) return c - 48
     if (c >= 65 && c <= 70) return c - 55
@@ -204,7 +253,8 @@ class RegexParser(
     var failed: bool,
     var message: string,
     var errorOffset: int,
-    val classes: array<array<int>>
+    val classes: array<array<int>>,
+    val captureNames: array<RegexCaptureName> = []
 ) {
     fun fail(message: string, offset: int): RegexNode {
         if (!this.failed) {
@@ -329,35 +379,59 @@ class RegexParser(
         regexLeaf(1, scalar, 0)
     }
 
+    fun captureSlot(open: int): int {
+        this.groups += 1
+        if (this.groups > regexMaximumGroups) this.fail("too many groups", open)
+        this.groups
+    }
+
+    fun namedCapture(open: int): int {
+        this.pos += 2
+        val begin = this.pos
+        while (regexIsWordByte(this.peek())) this.pos += 1
+        val name = this.src.slice(begin, this.pos)
+        if (this.peek() != 62 || !regexCaptureIdentifier(name)) {
+            this.fail("invalid capture name", begin)
+            return -1
+        }
+        for (existing in this.captureNames) {
+            if (existing.name == name) {
+                this.fail("duplicate capture name '$name'", begin)
+                return -1
+            }
+        }
+        val slot = this.captureSlot(open)
+        this.captureNames.append(RegexCaptureName(name, slot, begin, this.pos))
+        this.pos += 1
+        slot
+    }
+
     fun parseGroup(): RegexNode {
         val open = this.pos
-        this.pos = this.pos + 1
+        this.pos += 1
         var capture = -1
         if (this.peek() == 63) {
             val kind = if (this.pos + 1 < this.src.size) this.src[this.pos + 1] else -1
             if (kind == 58) {
-                this.pos = this.pos + 2
+                this.pos += 2
             } else if (kind == 61 || kind == 33) {
                 return this.fail("lookaround is not supported", open)
             } else if (kind == 60) {
-                // `(?<=` and `(?<!` look behind; `(?<name>` is a named group.
                 val after = if (this.pos + 2 < this.src.size) this.src[this.pos + 2] else -1
-                return this.fail(if (after == 61 || after == 33) "lookaround is not supported" else "named groups are not supported", open)
+                if (after == 61 || after == 33) return this.fail("lookaround is not supported", open)
+                capture = this.namedCapture(open)
             } else {
                 return this.fail("unsupported group syntax", open)
             }
-        } else {
-            this.groups = this.groups + 1
-            if (this.groups > regexMaximumGroups) return this.fail("too many groups", open)
-            capture = this.groups
-        }
+        } else capture = this.captureSlot(open)
+        if (this.failed) return regexLeaf(0, 0, 0)
         if (this.depth >= regexMaximumDepth) return this.fail("groups are nested too deeply", open)
-        this.depth = this.depth + 1
+        this.depth += 1
         val inner = this.parseAlternation()
-        this.depth = this.depth - 1
+        this.depth -= 1
         if (this.failed) return inner
         if (this.peek() != 41) return this.fail("missing )", open)
-        this.pos = this.pos + 1
+        this.pos += 1
         RegexNode(7, capture, 0, 0, [inner])
     }
 
@@ -573,6 +647,20 @@ class RegexEmitter(val program: array<int>, var failed: bool, var groupSlots: in
     }
 }
 
+// A capture slot occurs in one syntactic branch only. The intersection of
+// alternative guarantees is therefore empty. Visit only mandatory paths.
+private fun regexMarkRequired(node: RegexNode, var required: array<bool>): void {
+    if (node.kind == 7) {
+        if (node.a > 0) required[node.a] = true
+        regexMarkRequired(node.kids[0], required)
+    } else if (node.kind == 4) {
+        for (child in node.kids) regexMarkRequired(child, required)
+    } else if (node.kind == 6 && node.a > 0) {
+        regexMarkRequired(node.kids[0], required)
+    }
+    return
+}
+
 /**
  * Compile `pattern`. On failure `error` has the message and its byte offset. A pattern whose program has more than
  * 100,000 instructions is refused ("the pattern is too large"); counted repeats multiply when nested, so
@@ -602,8 +690,14 @@ fun regexCompileWithin(pattern: string, maximumInstructions: int): RegexCompileR
         return regexFail(pattern, "the pattern is too large: ${emitter.count()} instructions times ${parser.groups + 1} " +
             "capture groups is more than ${regexMaximumWork / 2}", 0)
     }
+    val required: array<bool> = []
+    if (parser.captureNames.size > 0) {
+        for (i in 0..parser.groups) required.append(false)
+        regexMarkRequired(tree, required)
+    }
     RegexCompileResult(Regex(pattern, parser.groups, emitter.program, parser.classes,
-        regexFirstBytes(emitter.program, parser.classes)), true, RegexError("", 0))
+        regexFirstBytes(emitter.program, parser.classes)), true, RegexError("", 0),
+        parser.captureNames, required)
 }
 
 // Whether class `index` holds the ASCII byte `c` (the VM's classMatches, on a program).
@@ -1002,6 +1096,56 @@ compile fun ablaRegexSyntaxIntegers(values: array<int>): SyntaxExpression {
     syntaxArray(items)
 }
 
+// Encode module identity and site key separately so no character is lost.
+compile fun ablaRegexNamePart(text: string): string {
+    val hex = "0123456789abcdef"
+    val buffer = byteBuffer()
+    for (byte in text) {
+        val high = byte / 16
+        val low = byte % 16
+        buffer.appendText(hex.slice(high, high + 1))
+        buffer.appendText(hex.slice(low, low + 1))
+    }
+    buffer.toText()
+}
+
+compile fun ablaRegexFinalizeCaptures(source: string, origin: SyntaxExpression): string = source
+
+compile fun ablaRegexNamedMatcher(cursor: ParserCursor, pattern: SyntaxExpression,
+    compiled: RegexCompileResult, constructor: SyntaxExpression): SyntaxExpression {
+    val module = ablaRegexNamePart(parserSourceIdentity(cursor))
+    val site = ablaRegexNamePart(parserSiteKey(cursor))
+    val key = "${module}_$site"
+    val shape = "AblaRegexCaptures_$key"
+    val factory = "ablaRegexMakeNamed_$key"
+    val project = "ablaRegexProject_$key"
+    if (compilerFindClass(shape) >= 0 || compilerFindFunction(project) >= 0 ||
+        compilerFindFunction(factory) >= 0) {
+        parserFail(cursor, "generated regex capture declaration collides with an existing name")
+        return syntaxNull()
+    }
+    val fields = byteBuffer()
+    val projections = byteBuffer()
+    var comma = ""
+    for (capture in compiled.captureNames) {
+        val slot = capture.slot
+        val name = capture.name
+        if (compiled.requiredCaptures[slot]) {
+            fields.appendText("${comma}val $name: string")
+            projections.appendText("${comma}ablaRegexRequiredCapture(matched, $slot)")
+        } else {
+            fields.appendText("${comma}val $name: string?")
+            projections.appendText("${comma}matched.group($slot)")
+        }
+        comma = ", "
+    }
+    val source = "class $shape(${fields.toText()})\n" +
+        "fun $project(matched: RegexMatch): $shape = $shape(${projections.toText()})\n" +
+        "fun $factory(regex: Regex): NamedRegex<$shape> = NamedRegex(regex, $project)\n"
+    compilerRecordExtensionRequest("abla.regex.$key", source, pattern, ablaRegexFinalizeCaptures)
+    syntaxCompile(syntaxCall(factory, [constructor]), pattern)
+}
+
 compile fun ablaRegexParseLiteral(cursor: ParserCursor): SyntaxExpression {
     parserExpect(cursor, "(")
     val pattern = parserParseAblaExpression(cursor)
@@ -1026,7 +1170,9 @@ compile fun ablaRegexParseLiteral(cursor: ParserCursor): SyntaxExpression {
         syntaxString(re.pattern), syntaxInteger(re.groupCount),
         ablaRegexSyntaxIntegers(re.program), syntaxArray(classes), syntaxString(re.first)
     ]
-    syntaxCompile(syntaxCall("Regex", arguments), pattern)
+    val constructor = syntaxCall("Regex", arguments)
+    if (compiled.captureNames.size == 0) syntaxCompile(constructor, pattern)
+    else ablaRegexNamedMatcher(cursor, pattern, compiled, constructor)
 }
 
 #compilerRegisterSubparser("regex", ablaRegexParseLiteral)

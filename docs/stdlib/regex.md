@@ -45,9 +45,8 @@ so write `\\d` for the regex escape `\d`. Interpolation, variables and other
 expressions are rejected. Invalid patterns produce `E_SUBPARSER_FAILURE` at
 the literal site, for example `invalid $regex at pattern byte 0: missing ]`.
 The byte offset refers to the decoded pattern, starting at zero. Pattern
-syntax, size limits and numbered captures are identical to `regexCompile`;
-named captures are not supported. Use `regexCompile` for patterns known only
-at run time. Matching uses the same Pike VM as a previously compiled runtime
+syntax, size limits and numbered capture slots are identical to `regexCompile`.
+Use `regexCompile` for patterns known only at run time. Matching uses the same Pike VM as a previously compiled runtime
 pattern; the literal saves pattern compilation and its allocations. Literal
 compilation also follows the compiler's normal compile-time evaluation limits.
 
@@ -70,6 +69,38 @@ compiler identity and individual timings.
 | `m.group(i)`, `m.groupStart(i)`, `m.groupEnd(i)`, `m.hasGroup(i)`, `m.groupCount()` | group `i` (0 is the whole match); `null`/`-1` when it did not take part |
 
 `regexCompile` returns an error, never a panic, for any invalid pattern.
+
+## Named captures
+
+A literal with `(?<name>...)` returns a typed matcher with one capture
+field per name:
+
+```abla
+val date = $regex("(?<year>\\d{4})-(?<month>\\d{2})(?:-(?<day>\\d{2}))?")
+val match = date.matchFull("2026-11") ?? return
+val year: string = match.year
+val month: string = match.month
+val day: string? = match.day
+```
+
+`find` and `matchFull` return the literal's capture type or null.
+`findAll` returns an array of that type. A capture is `string` when it
+participates on every successful path. It is `string?` when it can be
+skipped, including by an alternative or a repeat with a zero minimum. An
+empty match of a participating group yields an empty string.
+
+A named literal wraps its precompiled `Regex` in a
+`NamedRegex<Captures>`. Use `matches` and `replace` as usual. Use
+`.regex` for numbered matches, byte spans or an API that takes a
+`Regex`. Runtime `regexCompile` accepts named groups and keeps its
+numbered match API. Groups retain their opening-parenthesis order, and
+replacement still uses numbered references.
+
+Names use ASCII identifier characters, start with a letter or underscore,
+and are unique within the pattern. Abla keywords, a lone underscore, and
+names starting with two underscores are reserved. Each literal site has
+its own inferred nominal capture type. The editor can type-check capture
+fields and reject misspellings.
 
 ## Cost
 
@@ -107,7 +138,7 @@ refuses a larger program with the same error (it never allows more than 100,000)
 | `\d \D \w \W \s \S` | ASCII digits, `[A-Za-z0-9_]`, `[ \t\n\r\f\v]` and their negations |
 | `^`, `$` | start and end of the **text** (never of a line; `$` does not match before a final newline) |
 | `\b`, `\B` | ASCII word boundary and its negation |
-| `(…)`, `(?:…)` | capturing and non-capturing group |
+| `(…)`, `(?<name>…)`, `(?:…)` | numbered, named and non-capturing group |
 | `a|b` | alternation (leftmost alternative that leads to a match wins) |
 | `* + ? {m} {m,} {m,n} {,n}` | greedy repetition (`{,n}` is `{0,n}`, as in Python); add `?` (`*?`, `{2,5}?`) for lazy |
 
@@ -117,8 +148,7 @@ than 500 groups or nests groups deeper than 200 levels, is rejected ("too large"
 "too many groups"), which bounds the memory a search needs. A `{` that does not start a valid repeat is a literal.
 
 **Rejected at compile time:** backreferences (`\1`) and octal escapes, lookahead
-and lookbehind (`(?=`, `(?!`, `(?<=`, `(?<!`), every other `(?` form including
-named groups (`(?<n>a)`, `(?P<n>a)`) and inline flags such as `(?i)`, unknown letter escapes, `\b` inside a class, quantifiers with
+and lookbehind (`(?=`, `(?!`, `(?<=`, `(?<!`), other `(?` forms such as Python-style `(?P<n>a)` and inline flags such as `(?i)`, unknown letter escapes, `\b` inside a class, quantifiers with
 nothing to repeat (`*a`, `^*`), stacked quantifiers (`a**`, possessive `a*+`), `{m,n}` with
 `n < m`, a class range that starts at a shorthand (`[\w-z]`), unterminated groups and classes, and patterns that are not valid UTF-8.
 

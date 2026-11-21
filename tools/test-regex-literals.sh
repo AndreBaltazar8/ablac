@@ -18,7 +18,7 @@ for tier in interp jit; do
         fi
         message='expected a plain string literal in $regex'
         [[ $name != invalid-literal ]] || message='invalid $regex at pattern byte 0: missing ]'
-        [[ $name != invalid-literal-named ]] || message='invalid $regex at pattern byte 0: named groups are not supported'
+        [[ $name != invalid-literal-named ]] || message="invalid \$regex at pattern byte 13: duplicate capture name 'name'"
         [[ $name != invalid-literal-escape ]] || message='invalid $regex at pattern byte 2: unknown escape'
         grep -Fx "error[E_SUBPARSER_FAILURE]: $message" "$log" >/dev/null || { cat "$log"; exit 1; }
         grep -F 'E_SUBPARSER_FAILURE' "$log" >/dev/null || { cat "$log"; exit 1; }
