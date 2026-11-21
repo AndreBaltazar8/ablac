@@ -1,0 +1,137 @@
+// `ablac symbolize <program> [<crash text>]`: the stack a program with debug information printed when it crashed
+// (a panic or a fatal signal: docs/debugging.md), with each frame's function and file:line:column, the functions
+// inlined into it included. It reads the text (a file, or standard input) for its return addresses (lines that are
+// one 0x... address) and the program's load address (`load address 0x...`), and asks llvm-symbolizer, the toolchain's,
+// about the program at each address less the load address; on macOS, atos, which takes the load address itself.
+// The program must be the one that printed the stack, built with debug information (`--fast`, or `-g`).
+import "abla/fs"
+import "abla/text"
+import "abla/sys/linux"
+import "abla/sys/linux/io"
+import "abla/sys/linux/process"
+
+class BootstrapCrashStack(val addresses: array<int>, val load: int)
+
+fun bootstrapSymbolizeHex(text: string): int {
+    if (!text.startsWith("0x") || text.size < 3 || text.size > 18) return -1
+    var value = 0
+    for (index in 2 until text.size) {
+        val byte = text[index]
+        val digit = if (byte >= 48 && byte <= 57) byte - 48
+            else if (byte >= 97 && byte <= 102) byte - 87
+            else if (byte >= 65 && byte <= 70) byte - 55
+            else -1
+        if (digit < 0) return -1
+        value = value * 16 + digit
+    }
+    value
+}
+
+// The return addresses (in order, innermost first) and the load address a crash's text names; -1 for no load
+// address.
+fun bootstrapSymbolizeRead(text: string): BootstrapCrashStack {
+    val addresses: array<int> = []
+    var load = -1
+    for (line in text.split("\n")) {
+        val trimmed = line.trim()
+        if (trimmed.startsWith("load address ")) {
+            load = bootstrapSymbolizeHex(trimmed.slice(13, trimmed.size).trim())
+        } else {
+            val address = bootstrapSymbolizeHex(trimmed)
+            if (address > 0) addresses.append(address)
+        }
+    }
+    BootstrapCrashStack(addresses, load)
+}
+
+fun bootstrapSymbolizeHexText(value: int): string {
+    val digits = "0123456789abcdef"
+    var text = ""
+    var rest = value
+    while (rest > 0 || text == "") {
+        text = "${digits.slice(rest % 16, rest % 16 + 1)}$text"
+        rest = rest / 16
+    }
+    "0x$text"
+}
+
+// Whether `path` is a Mach-O image (64-bit, either byte order).
+fun bootstrapSymbolizeMachO(path: string): bool {
+    val head = Path(path).readText()
+    head.size >= 4 && ((head[0] == 207 && head[1] == 250 && head[2] == 237 && head[3] == 254) ||
+        (head[0] == 254 && head[1] == 237 && head[2] == 250 && head[3] == 207))
+}
+
+// Standard input to its end.
+fun bootstrapSymbolizeStandardInput(): string {
+    var text = ""
+    var chunk = LinuxFileDescriptor(0).read(65536)
+    while (chunk.size > 0) {
+        text = "$text$chunk"
+        chunk = LinuxFileDescriptor(0).read(65536)
+    }
+    text
+}
+
+fun bootstrapSymbolizeCommand(): int {
+    val count = linuxArgumentCount()
+    if (count < 2 || count > 3) {
+        linuxPrintStandardError("usage: ablac symbolize <program> [<crash text>]   # the stack it printed, with file:line\n")
+        return 2
+    }
+    val program = linuxArgument(1)
+    if (!Path(program).exists()) {
+        linuxPrintStandardError("ablac symbolize: no such program: $program\n")
+        return 1
+    }
+    val text = if (count == 3) Path(linuxArgument(2)).readText() else bootstrapSymbolizeStandardInput()
+    val stack = bootstrapSymbolizeRead(text)
+    if (stack.addresses.size == 0) {
+        linuxPrintStandardError("ablac symbolize: no stack in the text (a program prints one with debug information: --fast or -g)\n")
+        return 1
+    }
+    val macho = bootstrapSymbolizeMachO(program)
+    val command = if (macho) linuxCommand("atos") else linuxCommand("llvm-symbolizer")
+    if (macho) {
+        command.argument("-o")
+        command.argument(program)
+        command.argument("-i")
+        if (stack.load >= 0) {
+            command.argument("-l")
+            command.argument(bootstrapSymbolizeHexText(stack.load))
+        }
+    } else {
+        command.argument("--obj=$program")
+        command.argument("--inlining")
+        command.argument("--pretty-print")
+    }
+    for (address in stack.addresses) {
+        // A position-independent executable's addresses less where it was loaded are its own (atos does this itself).
+        val own = if (!macho && stack.load >= 0) address - stack.load else address
+        command.argument(bootstrapSymbolizeHexText(own))
+    }
+    val result = command.capture()
+    if (result.status == 127) {
+        linuxPrintStandardError(
+            "ablac symbolize: ${if (macho) "atos" else "llvm-symbolizer"} was not found (the toolchain's LLVM tools)\n")
+        return 1
+    }
+    // One frame a block (llvm-symbolizer: an empty line after each; atos: a line each), numbered.
+    var frame = 0
+    var started = false
+    for (line in result.output.split("\n")) {
+        if (line.trim() == "") {
+            if (started) frame = frame + 1
+            started = false
+        } else {
+            val prefix = if (!started) "#$frame " else "   "
+            linuxPrintStandardOutput("$prefix$line\n")
+            started = true
+            if (macho) {
+                frame = frame + 1
+                started = false
+            }
+        }
+    }
+    if (result.status == 0) 0 else 1
+}

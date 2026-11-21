@@ -546,6 +546,7 @@ test-serial: ablac
 	tools/test-repl.sh $(COMPILER)
 	tools/test-debug-variables.sh $(COMPILER)
 	tools/test-wasm-devtools.sh $(COMPILER)
+	tools/test-symbolize.sh $(COMPILER)
 	tools/test-android-extension.sh $(COMPILER)
 	tools/test-android-link.sh $(COMPILER)
 	tools/test-android-run.sh $(COMPILER)

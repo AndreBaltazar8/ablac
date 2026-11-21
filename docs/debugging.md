@@ -131,13 +131,30 @@ table appear between frames as `<function>.boxed` (`probe.main.lambda.boxed`,
 the entry the table calls) without a line, and `step`/`next` pass through
 them. A release build with `-g` has no variables.
 
-The stack a debug build prints on its own resolves with `atos` (macOS) or
-`addr2line` (Linux):
+The stack a debug build prints on its own resolves with `ablac symbolize`,
+given the program and the text it printed (a file, or standard input): each
+frame's function and file:line:column, with the functions inlined into it
+(llvm-symbolizer on the program; atos on macOS, with the load address the text
+names). The program must be the very one that crashed.
 
 ```sh
-atos -o build/app -l <load address> <address>   # → app.inner (in app) (app.ab:5)
-addr2line -f -e build/app <address>            # Linux: position-independent offsets
+build/app 2> crash.txt
+ablac symbolize build/app crash.txt
 ```
+
+```text
+#2 self.__ablaRuntimePanicArrayIndex at …/stdlib/abla/runtime/self/entry.ab:1912:5
+#3 self.__ablaRuntimeArrayIndex at …/stdlib/abla/runtime/self/entry.ab:2928:37
+    (inlined by) self.__ablaRuntimeArrayGetWordOther at …/entry.ab:3172:19
+#4 self.__ablaRuntimeArrayGetI64 at …/stdlib/abla/runtime/self/entry.ab:3156:12
+    (inlined by) app.inner at app.ab:7:12
+    (inlined by) app.middle at app.ab:10:31
+    (inlined by) app.main at app.ab:13:16
+```
+
+By hand, `atos -o build/app -l <load address> <address>` (macOS) or
+`addr2line -f -i -e build/app <address less the load address>` (Linux) give the
+same.
 
 macOS crash reports (`~/Library/Logs/DiagnosticReports`) show the readable
 names for every frame thanks to the frame-pointer chain.
