@@ -19,12 +19,12 @@ load it. The archive uses the system dynamic loader and bundles LLVM and its oth
 non-glibc dependencies. The release job checks every ELF file of the archive
 (`tools/test-linux-toolchain-portability.sh`) and runs the compiler in Ubuntu 22.04
 and AlmaLinux 9.
-The standalone `ablac-x86_64-linux` release asset is the statically linked compiler
+From v0.2.65, the standalone `ablac-x86_64-linux` release asset is the statically linked compiler
 (src/orc_main_static.ab on LLVM's static archives and Abla's own C library: a static-pie executable with no
 loader and no needed library, checked by tools/test-static-artifact.sh including its fixpoint) and the bootstrap
 compiler (docs/bootstrap.md). It cannot `dlopen`, so compile-time `nativeLibraries` need
 `ablac-dynamic-x86_64-linux`, which ships beside it for one release: that is the compiler built in the Nix shell,
-the byte-reproducible one, and it names a Nix-store dynamic loader and finds libLLVM, libssl and libcrypto through
+the byte-reproducible one, and it names a Nix-store dynamic loader and finds libLLVM and its dependencies through
 Nix-store RUNPATH entries, so it runs only where those store paths exist. Use the toolchain archive (still
 packaged from the dynamic compiler) for an installed toolchain.
 
@@ -65,7 +65,7 @@ are built with the `--o1` profile, as `ablac run`'s: a suite's time is mostly it
 running. `--fast` builds them with the development profile instead, for tests that
 run for less time than their build takes.
 
-Built-in hosted targets are `x86_64-linux`, `x86_64-macos`, and
+Built-in hosted targets are `x86_64-linux`, `aarch64-linux`, `x86_64-macos`, and
 `arm64-macos`. Cross-linking Mach-O on Linux requires `ABLA_MACOS_SDK`; optional
 `ABLA_MACOS_LLVM_LIB` and `ABLA_MACOS_OPENSSL_LIB` select directories holding
 target dylibs or `.tbd` stubs. `tools/build-macos-from-linux.sh` prepares the
@@ -78,6 +78,10 @@ expressions, resolves Git selectors or invokes deferred custom resolvers, and
 transactionally publishes an immutable `abla.lock` plus validated cache
 entries. Project builds prepare the locked graph before module loading without
 invoking custom resolvers; `--offline` forbids Git fetching.
+`ablac package install --project <dir> [--offline]` materializes packages at
+their locked revisions without updating the lock. Builds, runs and tests on a
+project's files do this automatically when its manifest and lock are present.
+Commit `abla.lock`; moving dependencies is a deliberate `package update`.
 `ablac package vendor --project <dir>` publishes the complete locked source
 graph under `vendor/`. The provider and lock contract is specified in
 `docs/packages.md`.
@@ -91,15 +95,23 @@ artifact container; executable remains the default. Libraries without `main`
 must explicitly publish at least one supported foreign adapter through the
 compiler API; internal Abla symbols remain hidden.
 
-An x86-64 Linux executable links no C library. It is a static
+An x86-64 or AArch64 Linux executable without C-library dependencies links no C library. It is a static
 position-independent executable with its own entry point, memory routines,
 system calls and threads, and it imports nothing. The compiler links libc and
 the dynamic loader only when the program brings a C library itself: a TLS
-connection (OpenSSL), the manifest's `nativeLibraries`, `extern "host"` calls,
+connection through `abla/tls/hosted` (OpenSSL), the manifest's `nativeLibraries`, `extern "host"` calls,
 or an `extern:"c"` function that the libc-free link cannot resolve. There is no
 option for it: the program decides. `ablac build --verbose` prints a note
 naming why a build linked libc. macOS executables link libSystem (below), and libraries
 and objects are unchanged.
+
+The default `abla/tls` surface uses pure Abla TLS and does not by itself force
+a libc/OpenSSL link. A libc-free Linux executable links directly with LLD,
+without a clang driver or C development files. A static compiler built with
+`ABLA_STATIC_LLD_LIB` and its header paths embeds LLD through
+`runtime/abla_lld_shim.cpp` on x86-64; otherwise it uses the external linker.
+LLVM remains a dependency even when its archives and LLD are inside one static
+executable. See [the self-hosting boundary](full-self-hosting.md).
 
 A macOS executable is an ordinary dynamic image that names `libSystem.B.dylib`: Apple's linker
 refuses a dynamic image without it, and an arm64 static image is killed by the kernel (CI probes, #811; an
@@ -134,7 +146,7 @@ What stays in libSystem, and why:
 - `fork`: libSystem's fork handlers bring its state over to the child (Mach ports, malloc, locks). The BSD
   `fork` call alone left a child that ran C code broken (an OpenSSL handshake in a forked child failed on both
   Macs, #811), and the runtime cannot tell a child that only execs from one that does not.
-- the compiler itself: libLLVM, OpenSSL, `dlopen`/`dlsym` for compile-time native calls, and its
+- the dynamic compiler itself: libLLVM, dynamic symbol lookup for compile-time native calls, and its
   threads.
 
 What a macOS program imports (`tools/libsystem-imports-allowlist.txt`, release and `--fast`, both Macs):
@@ -405,6 +417,16 @@ fix-imports [<file.ab> | --project <dir>] --prune [--dry-run]` removes the warne
 last import of a file with a `#compilerGrant`, never one in another project), builds again and puts back any file whose
 build got worse, and refuses a build that stops in the front end.
 
+Unused locals, parameters and declarations are separate opt-in checks:
+`--warn-unused-locals` (`W_UNUSED_LOCAL`), `--warn-unused-parameters`
+(`W_UNUSED_PARAMETER`) and `--warn-unused-declarations`
+(`W_UNUSED_DECLARATION`). They bypass the build cache to inspect the current
+front end. Names starting with `_` are intentionally unused. Declaration
+warnings also cover members and fields; they are not a general proof that all
+unreachable code has been found. Editor clients request these checks through
+the corresponding `unusedLocals`, `unusedParameters` and `unusedDeclarations`
+initialize properties.
+
 Compile-time build definitions may register additional program nodes through
 the versioned compiler API. After the root succeeds, `build` drains the bounded
 graph in declaration order; a requested program may add further nodes. This
@@ -431,13 +453,12 @@ code generation today.
 
 ## Run and REPL
 
-`run` executes the same verified IR without compiling through C. The current
-bootstrap milestone executes textual LLVM IR with the Abla-authored ORC binding
-inside the final compiler process, avoiding object emission and native linking.
+`run` executes verified LLVM IR without compiling through C. The Abla-authored
+ORC binding compiles it inside the compiler process and may retain the emitted
+object in the run cache; no standalone executable link is needed for this mode.
 A program that selects a host capability resolves its host functions from the
 compiler process; no adapter library is built for the JIT.
-The bootstrap compiler retains a separate runner until the C bootstrap path is
-retired. `ablac repl` is a live run (`src/live_repl.ab`, where live mode runs: x86-64 Linux and macOS): one
+`ablac repl` is a live run (`src/live_repl.ab`, where live mode runs: x86-64 Linux and macOS): one
 program runs for the whole session and each line is a reload of it. A declaration (`fun`, `val`, `var`,
 `class`, `import`, ...) replaces the one of the same name or is added (`defined`); a variable keeps its value
 from line to line. Any other line is an expression whose value prints (an int, a string, a float; an array,
@@ -536,6 +557,21 @@ passed|failed; watching N files`. The files are each test's module graph (import
 library's; the wait is `run --watch`'s (inotify or kqueue, a burst of writes settles, only a change of contents runs
 the tests). It runs until stopped. `tools/test-test-watch.sh` breaks and fixes a module a test imports, and saves one it
 does not.
+
+## Editor analysis service
+
+`ablac analyze --stdio` is a persistent JSON-lines protocol, distinct from the
+human REPL. `initialize` must specify `analysisMode: "graph-v1"` or `"graph-v2"`;
+the legacy initialize without a mode is removed and returns
+`unsupported_analysis_mode`. Graph mode permits one initialize per session.
+Use the schema and message shapes in `tests/analysis-graph/session.mjs` and
+`tools/test-analysis-service.sh`, rather than sending Abla expressions on stdin.
+
+Graph clients can request `unusedImports`, `unusedLocals`, `unusedParameters`
+and `unusedDeclarations` in initialize. These editor settings are explicit
+client requests; the batch build's default unused-import warning does not
+make all editor warning categories implicit. The service does not evaluate
+compile-time program bodies as the removed legacy analysis path did.
 
 ## Compiler diagnostics
 

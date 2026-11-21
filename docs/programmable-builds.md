@@ -115,7 +115,8 @@ The call adds a node to the current build. After validating
 the root program, the driver drains those nodes in deterministic declaration
 order. A child program may register more programs, enabling an extension-owned
 `build.ab` to construct its graph dynamically. Names and output paths must be
-unique, paths are project-relative, each evaluation may submit at most 32
+unique, paths are build-file-relative and project-contained as described above,
+each evaluation may submit at most 32
 nodes, and the complete recursively expanded graph is capped at 64 nodes.
 Each file a build publishes (an artifact, its ABI/LLVM/object sidecars, a
 compile-time generated file) is written beside its name, as
@@ -149,8 +150,9 @@ Program nodes execute only under `ablac build`. LLVM-only emission, `run`, and
 instead of silently dropping requests or leaving process-private request data.
 
 The built-in hosted Linux target can emit `executable`, `object`,
-`static-library`, and `shared-library` nodes. The raw Linux target remains
-executable-only. Build libraries may also register bounded target descriptors
+`static-library`, and `shared-library` nodes. Libc-free Linux executables are
+selected by their dependencies, not by a separate raw-target CLI alias.
+Build libraries may also register bounded target descriptors
 with `defineTarget`: a name, LLVM triple, object format, linker
 flavor/emulation, and generic hosted/libc-free capabilities. A descriptor with
 linker flavor and emulation `none` can emit objects or static libraries for

@@ -247,6 +247,24 @@ listed in [concurrency.md](concurrency.md#diagnostics).
 | `E_PACKAGE_*` | lockfile, fetch, cache, digest, cycle and capability errors of dependencies ([packages.md](packages.md)) |
 | `E_NATIVE_LIBRARY_MANIFEST` | invalid `nativeLibraries` in `abla.toml` |
 
+## Unused declarations and imports
+
+Warnings do not by themselves refuse a build. These categories are separate:
+
+| Code | Control and scope |
+|---|---|
+| `W_UNUSED_IMPORT` | On for batch builds by default; `--no-warn-unused-imports` or `ABLA_WARN_UNUSED_IMPORTS=0` disables it, `--warn-unused-imports` enables it over the environment; cached builds replay their saved import warnings |
+| `W_UNUSED_LOCAL` | Opt in with `--warn-unused-locals`; an unused local binding in the project's own checked code |
+| `W_UNUSED_PARAMETER` | Opt in with `--warn-unused-parameters`; an unused parameter, with exported/native/protocol cases excluded |
+| `W_UNUSED_DECLARATION` | Opt in with `--warn-unused-declarations`; unused declarations/members/fields, subject to conservative references and exemptions |
+
+The opt-in checks bypass the native build cache. Leading `_` marks deliberately
+unused names. Editor graph clients request their own categories in initialize;
+see [the toolchain warning controls](toolchain.md). These are conservative
+source-use checks, not a proof that every unreachable declaration is reported.
+`@exportLocal` binding/signature failures remain errors, as described above;
+they are not unused-declaration warnings.
+
 ## Builds
 
 | Code | Meaning |

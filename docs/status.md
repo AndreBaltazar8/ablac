@@ -22,8 +22,9 @@ require libc; hosted facilities are optional capabilities.
 - The hosted compiler and ordinary Abla programs build and run natively on
   x86-64 Linux plus Intel and Apple Silicon macOS; the macOS gate covers
   Mach-O emission, ORC, console, filesystem, and child-process behavior.
-- The final-native conformance manifest covers 73 isolated tests. Focused gates cover
-  the raw libc-free target, compiler extensions, programmable builds, Android
+- The final-native conformance manifest is `tests/abla-tests.json`, one part of
+  the larger shell-command suite. Focused gates cover default libc-free Linux
+  links, static compilers, compiler extensions, programmable builds, Android
   cross-builds, and WASM/MVC modules.
 - Compile-time code has bounded effect grants and can inspect resolved types,
   generate validated modules/files, register targets, request recursive program
@@ -43,9 +44,10 @@ require libc; hosted facilities are optional capabilities.
   immutable commit/tree locks, bounded transactional caches, offline mode, and
   a complete vendor fallback. Root manifests retain dependency capability
   authority.
-- A current uncached fast full self-build was measured at 27.162 seconds. The
-  dominant phases are semantic analysis and lowering; unchanged whole-graph
-  builds use the content cache.
+- An earlier uncached fast full self-build measurement was 27.162 seconds;
+  it is a historical observation, not a current timing claim. Unchanged
+  whole-graph builds use the content cache; current performance work belongs
+  in [performance.md](performance.md) with its revision and measurements.
 - Networking now includes affine IPv4/IPv6 TCP and UDP, bounded DNS A/AAAA,
   structured timeout/EOF/error results, raw epoll, hosted epoll/kqueue,
   certificate-verified TLS/HTTPS/WSS transports, and secure random on Linux and

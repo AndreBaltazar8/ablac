@@ -16,14 +16,20 @@ to bypass its safety contract from safe Abla code.
 - A native Abla compiler recompiles itself and emits byte-identical LLVM.
 - `make self-rebuild` performs an uncached rebuild using only the Abla compiler
   implementation and uses the result to build a child program.
-- The final compiler contains no project-C host/platform bridge symbols.
+- The Abla frontend/evaluator/backend do not use a second compiler
+  implementation. Native platform and linker integration has separate
+  boundaries: Darwin's compatibility adapter and the optional static Linux
+  LLD C++ shim are described in [full-self-hosting.md](full-self-hosting.md).
 - A clean build starts from the checksum-pinned Abla release binary. LLVM and
-  Clang/LLD remain external toolchain dependencies.
+  LLD remain native toolchain dependencies; LLVM and LLD may be embedded in
+  the static compiler rather than dynamically loaded or started as tools.
 - AOT, persistent ORC `run`, transactional REPL generations, watched `serve`,
   graceful HTTP reload, raw Linux facilities, watchdog limits, and stackable
   compile-time subparsers have bounded regression gates.
-- Runtime allocation is tracked, but safe user-visible ownership, borrowing,
-  destruction, cycle handling, and concurrency rules are not complete.
+- Runtime allocation, resource ownership/borrowing, deterministic destruction,
+  collection and concurrency have implemented rules and regression gates.
+  Remaining bugs and proof gaps are tracked in TODO.md; passing those gates
+  does not establish complete memory safety for every program.
 
 This is a functional self-hosting fixed point, not yet a complete bootstrap
 trust story or a production memory-safety guarantee.

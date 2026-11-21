@@ -416,7 +416,7 @@ malloc's larger requests nor LLVM can use them. Now each small block is malloc'e
 (lists 8 bytes apart), and the lists hold at most 32 MB between them. Those builds peak at 3.04 GB
 and 1.25 to 1.40 GB, and `tools/test-compiler-memory-peak.sh` holds the second to its record.
 
-| Against the uncapped lists, `tools/bench-compare.py` | Change |
+| Against the uncapped lists (historical benchmark helper, now removed) | Change |
 |---|---:|
 | Release build, instructions | +3.3% |
 | Run instructions (11 programs) | +18.6% |

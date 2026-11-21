@@ -732,7 +732,9 @@ names built from it.
 registers a bounded program node during compile-time execution. The compiler
 driver validates and drains the resulting graph in deterministic declaration
 order; requested programs may themselves register more nodes. Paths are
-project-relative, names and outputs are unique, one evaluation may register at
+resolved against the file containing the `#` call and contained in that file's
+project; see [build paths](programmable-builds.md) for `W_BUILD_PATH_CWD` and
+`ABLA_BUILD_PATH_CWD=error`. Names and outputs are unique, one evaluation may register at
 most 32 nodes, and the recursively expanded graph is capped at 64 nodes.
 
 This is a general compiler-service primitive. Android, WASM, MVC, UI, RPC, and

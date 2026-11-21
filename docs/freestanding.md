@@ -1,35 +1,39 @@
-# Freestanding and raw-kernel profile
+# Libc-free programs and freestanding targets
 
-Direct system calls are useful for small static Linux programs, kernels, and
-embedded targets, but they are not yet a public executable target. The former
-raw Linux target was removed with its project-owned C and assembly startup.
-It will return only when startup, allocation, panic, and process entry are
-expressed by Abla source or compiler intrinsics.
+Linux x86-64 and AArch64 programs use Abla startup, allocation, memory routines,
+system calls, signal/panic paths and threads by default. An executable that
+brings no C-library dependency links as a static PIE without a dynamic loader
+or needed libraries. There is no separate raw-Linux opt-in target. An explicit
+C-library dependency can select a hosted link; `ablac build --verbose` explains
+that selection. Pure Abla TLS does not require OpenSSL.
 
-The intended layering is:
+The built-in Linux targets are `x86_64-linux` and `aarch64-linux`.
+[Target selection](targets.md) describes their scope and the other targets.
+[Toolchain linking](toolchain.md#build) distinguishes the compiler's own
+libraries from those needed by an emitted program. The installed dynamic
+compiler and LLVM tools can have host dependencies while producing a libc-free
+program. The static compiler can embed LLVM and, with its x86-64 LLD bridge,
+link in process; that is not an independent backend or proof of no native
+build-tool dependencies.
 
-```text
-abla/fs, abla/process, abla/net
-        -> platform interfaces
-        -> posix/libc | linux/raw | wasi | embedded target
-        -> kernel or host ABI
-```
+## Without an operating system
 
-The phase-safe `ByteBuffer`/`ByteSlice` API and opt-in native word/pointer cells
-now exist. Linux filesystem, terminal, process, TCP, polling, and graceful
-signal-drain implementations are built on them. The pointer cells provide
-explicit lifetime and LLVM-lowered
-load/store operations for out-parameters, but ownership is not yet enforced by
-the type system. A target-specific kernel intrinsic remains gated on:
+A libc-free Linux process still depends on the Linux kernel. Bare-metal
+microcontrollers, kernels and Wasm modules have different startup, imports,
+linker scripts and runtime hooks. A framework or build library supplies those
+contracts; accepting an LLVM triple alone supplies none of them. Xtensa
+requires the [separate LLVM companion](llvm-xtensa.md). Hostless Wasm can run
+without runtime imports for the operations it supports; modules using the
+host ABI need a host to implement those imports.
 
-- checked pointer provenance, alignment, and ownership rules;
-- `Result<T, Errno>` and non-panicking error propagation;
-- target triple/profile selection;
-- capability rules for compile-time I/O;
-- verified register/clobber lowering in each backend.
+The standard library exposes typed files, sockets, processes and buffers over
+platform implementations. Prefer those public APIs to raw system calls.
+`ByteBuffer`/`ByteSlice` and trusted native-memory APIs provide low-level
+building blocks, but a raw integer address cannot itself establish provenance,
+alignment, allocation lifetime or portability. Native access remains gated by
+trusted declarations and compile-time capabilities.
 
-The target module exposes fixed-arity syscall intrinsics for low-level systems
-work; standard-library code wraps them in typed descriptors, owned buffers,
-and protocol-specific operations. Application code should prefer those typed
-wrappers because a generic syscall call still cannot express pointer
-provenance, buffer length, error type, or target portability.
+The removed historical `x86_64-linux-raw` adapter is not a current target alias.
+Its old C/assembly startup does not describe today's ordinary Linux program
+runtime. See [self-hosting boundaries](full-self-hosting.md) for what the
+compiler's static artifact checks actually prove.

@@ -464,8 +464,15 @@ sockets, whatever the other grants say. A game client run under `#` reaches
 X11, Vulkan, ALSA and libcurl that way, by opening them with `dlopen`, and
 never asks for `network`.
 
-The `compiler*` providers come from `import "abla/compiler"`. File paths are
-relative to the directory the compiler runs in.
+The `compiler*` providers come from `import "abla/compiler"`. Ordinary filesystem
+operations read relative paths against the compiler's working directory.
+Compile-time build calls are different: `compilerBuildProgram`, `buildProgram`,
+`wasmBuildModule` and independent-module `emit` read entries/outputs against
+the file containing the `#` site and keep them inside that file's project.
+The v0.2.65 working-directory fallback emits `W_BUILD_PATH_CWD`, or fails with
+`E_BUILD_PATH_CWD` under `ABLA_BUILD_PATH_CWD=error`.
+See [build paths](programmable-builds.md) for the fallback and project boundary;
+`compilerWriteFile` retains its own project-relative contract below.
 
 Under `#`, the `abla/fs` writes, moves and removals, and `compilerWriteFile`,
 are real writes, as at run time: each one is on disk when the call returns, so

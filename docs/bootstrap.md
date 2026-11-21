@@ -201,11 +201,16 @@ docs/      language and architecture contracts
 There is no generated-C backend or second compiler runtime. The portable
 runtime is Abla source compiled into the same LLVM unit as each program.
 Mach-O artifacts additionally link `runtime/abla_darwin_compat.c`, a narrow
-adapter that translates the standard library's stable Linux-style syscall
-contract to Darwin libc, socket, and kqueue APIs. It contains no Abla value,
+adapter for remaining compatibility paths. Current macOS builds route most
+portable system calls through the Abla BSD-system-call dispatcher; the older
+C implementations remain for iOS and older bootstrap compilers. It contains no Abla value,
 allocation, evaluator, or compiler implementation.
 
-LLVM, Clang, and the platform linker remain native toolchain dependencies.
+LLVM and the platform linkers remain native toolchain dependencies. Libc-free
+Linux program links use LLD directly without clang; the x86-64 static compiler
+can embed LLD through `runtime/abla_lld_shim.cpp` when its archives and headers
+are configured. The dynamic toolchain and other targets retain their own
+native build-tool requirements.
 Linux pins them through Nix, with [a prebuilt LLVM for Xtensa](llvm-xtensa.md);
 macOS uses Homebrew LLVM and the system
 Mach-O linker. Removing those hosted dependencies is a separate freestanding goal described in
@@ -219,8 +224,9 @@ and checksums. Current clean builds start directly from the checksum-pinned
 v0.2.64 stable host binaries. LLVM 23 has been used since v0.2.16.
 
 The v0.2.14 tag preserves the bridge source and its reproducible source chain
-from v0.2.13 in `tools/bootstrap-word0-bridge.sh`. Release tags preserve that
-history; the temporary bridge branch is no longer needed.
+from v0.2.13. The historical `tools/bootstrap-word0-bridge.sh` helper has been
+removed from the current tree; it is not a prerequisite or command for a
+current clean build. Release tags preserve the source history.
 
 ## Strict-imports transition
 

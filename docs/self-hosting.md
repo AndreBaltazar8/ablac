@@ -3,7 +3,9 @@
 The repository is source self-hosted and fixed-point self-hosted:
 
 - every compiler implementation file is Abla source under `src/`;
-- `src/orc_main.ab` is the only production compiler entry graph;
+- `src/orc_main.ab` is the dynamic compiler entry; `src/orc_main_static.ab`
+  adds the Linux static compiler's own C-library compatibility and optional
+  in-process LLD integration;
 - the compiler builds that graph directly through its Abla-authored LLVM
   backend and toolchain driver;
 - a rebuilt compiler emits byte-identical LLVM IR for the same graph;
@@ -20,12 +22,12 @@ make self-rebuild # prove the compiler fixed point
 make check        # both gates
 ```
 
-`make test` prepares `abla-testrunner` at the test-driver vendor path from the
-git submodule or, for source archives, a clone of the locked revision, then
-uses that package to schedule the manifest in `tests/abla-tests.json`. Tests
-are bounded, process-isolated, logged independently, and run with eight jobs
-by default. Set `ABLA_TEST_JOBS` when the host needs a lower concurrency
-limit.
+`make test` runs the recipe of `make test-serial` through `tools/run-tests.sh`,
+with one result/log per command and concurrency controlled by `JOBS` (the CPU
+count by default). Nested runners use `ABLA_TEST_JOBS`/`ABLA_SUITE_JOBS` to
+bound their own work. The conformance manifest in `tests/abla-tests.json` is
+one part of the suite, run by the self-hosted test driver; it is not the whole
+suite's scheduler.
 
 `tools/build-self-hosted-release.sh` splits compiler LLVM emission, object
 generation, and linking into separate bounded processes to keep peak memory
@@ -41,7 +43,9 @@ operations remain Abla functions over compiler-provided value-layout
 intrinsics; dead runtime functions are removed by LTO and section garbage
 collection.
 
-This does not mean the hosted compiler is freestanding. The current production
-backend embeds libLLVM, and native linking uses the pinned Clang/LLD toolchain.
-Removing LLVM, the external linker, and hosted libc from the compiler itself
-remains follow-on work in [full-self-hosting.md](full-self-hosting.md).
+The dynamic backend loads libLLVM; the static Linux compiler embeds LLVM and
+its own C-library compatibility routines. With its LLD archives configured,
+the x86-64 static compiler also links in process through a small C++ bridge.
+Libc-free program links use LLD directly without clang. These checks eliminate
+some dynamic dependencies, not LLVM itself. See the exact
+[native dependency boundaries](full-self-hosting.md).
