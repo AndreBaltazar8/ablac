@@ -236,6 +236,7 @@ compiler needs them before it can evaluate anything:
 |---|---|
 | `#compilerGrant("capability")` | requests a [capability](#capabilities-files-environment-processes-network) for this module |
 | `#compilerRegisterSubparser("name", handler)` | registers a `$name` [subparser](subparsers.md) |
+| `#compilerRegisterSubparser("name", handler, boundary)` | adds raw body isolation for the [brace form](subparsers.md) |
 | `#compilerGenerateModule("namespace", "source")` | adds a generated module to the program |
 | `#compiler.transform(handler)` | runs a [transform](compiler-api.md) over the program |
 

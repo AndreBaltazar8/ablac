@@ -126,6 +126,28 @@ of two ways:
   key alone; a position would move, and rename what it named, which changes
   the program's symbols. Positions are for spans and diagnostics.
 
+For a brace form with its own quoting or comments, register a boundary scanner
+as the third argument to `#compilerRegisterSubparser("name", handler, boundary)`.
+Import the provider or register it in the same module before writing `$name {...}`.
+The scanner starts at the matching form's opening brace and stops just after
+its closing brace. Use the raw cursor operations for the body and call
+`parserParseAblaExpression` immediately after consuming a `${` opener to expose
+a host expression. In the scanner that operation advances to the closing
+brace of the hole and produces a placeholder expression. The handler receives
+the parsed expression during staging.
+
+The compiler runs the boundary scanner during import discovery with compile
+effects disabled. Keep the scanner and its helpers in compile-time functions
+from the provider and its earlier imports. Report grammar validation errors
+from the handler and share the delimiter scanning logic where possible. A
+regular parenthesized form can use the same registration. The boundary scanner
+runs for the brace form.
+
+After discovery, the handler sees the original body bytes in a cursor bounded
+by the scanner. Abla names and nested providers are recognized in delegated
+holes. The rest of the body belongs to the provider. In editor analysis only
+standard-library boundary scanners and handlers can run.
+
 It builds its result with the `syntax*` builders: `syntaxInteger`,
 `syntaxString`, `syntaxBoolean`, `syntaxNull`, `syntaxIdentifier`,
 `syntaxBinary`, `syntaxArray`, `syntaxCall`, `syntaxMember`, `syntaxIndex`,

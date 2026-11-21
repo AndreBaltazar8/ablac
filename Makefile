@@ -610,6 +610,7 @@ test-serial: ablac
 	tools/test-fuzz-abla.sh $(COMPILER)
 	tools/test-subparser-site-key.sh $(COMPILER)
 	tools/test-subparser-named-arguments.sh $(COMPILER)
+	tools/test-subparser-raw-isolation.sh $(COMPILER)
 	tools/test-stable-names.sh $(COMPILER)
 	tools/test-lambda-ordinal.sh $(COMPILER)
 	tools/test-lazy-root-frames.sh $(COMPILER)

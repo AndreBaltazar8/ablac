@@ -1,0 +1,138 @@
+import "abla/array"
+import "abla/bytes"
+import "abla/text"
+import "eval.ab"
+import "lexer.ab"
+import "parser.ab"
+import "source_rewrite.ab"
+import "subparser.ab"
+
+class BootstrapRawBoundaryBinding(
+    val registration: BootstrapSubparserRegistration,
+    val declarations: array<BootstrapDeclaration>,
+    val context: BootstrapEvalContext
+)
+
+class BootstrapRawChunk(val begin: int, val end: int)
+class BootstrapRawSite(val begin: int, val end: int)
+
+// The plan has file offsets. It can also produce the host view after aliases
+// and private names in exposed expressions have been rewritten.
+fun bootstrapRawHostSource(
+    source: string,
+    chunks: array<BootstrapRawChunk>,
+    rewrite: BootstrapSourceRewrite
+): string {
+    if (chunks.size == 0) return source
+    val host = byteBuffer()
+    var previous = 0
+    for (chunk in chunks) {
+        val begin = rewrite.rewritten(chunk.begin)
+        val end = rewrite.rewritten(chunk.end)
+        host.appendText(source.slice(previous, begin))
+        host.appendText(" ".repeat(end - begin))
+        previous = end
+    }
+    host.appendText(source.slice(previous, source.size))
+    host.toText()
+}
+
+class BootstrapRawProviderPlan(
+    val source: string,
+    val binding: (string, int) -> BootstrapRawBoundaryBinding?,
+    val chunks: array<BootstrapRawChunk> = [],
+    val sites: array<BootstrapRawSite> = [],
+    val holes: array<BootstrapRawHoleFrame> = []
+) {
+    fun hide(begin: int, end: int): void {
+        if (end > begin) this.chunks.append(BootstrapRawChunk(begin, end))
+    }
+
+    fun resume(plan: int, begin: int, nameEnd: int): int {
+        var body = nameEnd
+        while (body < this.source.size &&
+            (this.source[body] == 32 || this.source[body] == 9 ||
+             this.source[body] == 10 || this.source[body] == 13)) body += 1
+        if (!bootstrapAt(this.source, body, 123)) return nameEnd
+        val registration = this.binding(this.source.slice(begin + 1, nameEnd), begin)
+        if (registration == null) return nameEnd
+
+        // A brace-form provider keeps its braces and the braces of each hole
+        // in the host view. Its scanner is called once before semantic staging.
+        val source = this.source
+        val startChunk = this.chunks.size
+        val site = this.sites.size
+        // Nested scanners enter a new evaluator, so bound their combined
+        // depth independently of step and call limits in each evaluator.
+        if (this.holes.size >= 64) {
+            this.hide(body + 1, source.size)
+            this.sites.append(BootstrapRawSite(begin, source.size))
+            return source.size
+        }
+        this.sites.append(BootstrapRawSite(begin, -1))
+        this.holes.append(BootstrapRawHoleFrame(body + 1))
+        val seek: (int) -> int = { start -> bootstrapScanRawHole(plan, start) }
+        val cursor = BootstrapSubparserCursor(
+            "", source, [BootstrapToken(BOOTSTRAP_TOKEN_END, source.size, source.size)],
+            [], [], [], 0, body, 0, "", seek
+        )
+        val invocation = bootstrapInvokeSubparserHandlerIn(
+            registration.context, registration.declarations,
+            registration.registration.rawBoundary, cursor, 0
+        )
+        val frame = this.holes.removeLast()
+        val end = cursor.rawPosition
+        if (frame.invalid || end <= body || end > source.size ||
+            (!bootstrapAt(source, end - 1, 125) && end != source.size) ||
+            invocation.stackDepthStopped) {
+            while (this.chunks.size > startChunk) this.chunks.removeLast()
+            while (this.sites.size > site + 1) this.sites.removeLast()
+            // The body is still owned by the provider. With no verified
+            // return point, keep the incomplete body opaque through EOF.
+            this.hide(body + 1, source.size)
+            this.sites[site] = BootstrapRawSite(begin, source.size)
+            return source.size
+        }
+        this.hide(frame.rawBegin, if (bootstrapAt(source, end - 1, 125)) end - 1 else end)
+        this.sites[site] = BootstrapRawSite(begin, end)
+        end
+    }
+}
+
+class BootstrapRawHoleFrame(var rawBegin: int, var invalid: bool = false)
+class BootstrapRawLayout(val chunks: array<BootstrapRawChunk>, val sites: array<BootstrapRawSite>)
+
+// The lexer and evaluator can reenter one another at a delegated hole. A
+// synchronous session owns the plan; callbacks carry only its stack index.
+var bootstrapRawProviderPlans: array<BootstrapRawProviderPlan> = []
+
+fun bootstrapPlanRawSource(
+    source: string,
+    binding: (string, int) -> BootstrapRawBoundaryBinding?,
+    discoverImport: (int) -> void
+): BootstrapRawLayout {
+    val plan = bootstrapRawProviderPlans.size
+    bootstrapRawProviderPlans.append(BootstrapRawProviderPlan(source, binding))
+    val _tape = bootstrapLexWithRawProviders(source, { begin, end ->
+        bootstrapRawProviderPlans[plan].resume(plan, begin, end)
+    }, discoverImport)
+    val complete = bootstrapRawProviderPlans.removeLast()
+    BootstrapRawLayout(complete.chunks, complete.sites)
+}
+
+fun bootstrapScanRawHole(plan: int, start: int): int {
+    val source = bootstrapRawProviderPlans[plan].source
+    val frame = bootstrapRawProviderPlans[plan].holes.size - 1
+    val from = bootstrapRawProviderPlans[plan].holes[frame].rawBegin
+    if (start < from + 2 || !bootstrapAt(source, start - 2, 36) ||
+        !bootstrapAt(source, start - 1, 123)) {
+        bootstrapRawProviderPlans[plan].holes[frame].invalid = true
+        return start
+    }
+    bootstrapRawProviderPlans[plan].hide(from, start - 2)
+    val end = bootstrapLexRawAblaHole(source, start, { begin, nameEnd ->
+        bootstrapRawProviderPlans[plan].resume(plan, begin, nameEnd)
+    })
+    bootstrapRawProviderPlans[plan].holes[frame].rawBegin = end + 1
+    end
+}

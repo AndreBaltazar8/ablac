@@ -8,12 +8,14 @@ import "abla/sys/linux/process"
 import "abla/sys/linux"
 import "abla/runtime/memory"
 import "abla/text"
+import "abla/array"
 import "parser.ab"
 import "discovery_cache.ab"
 import "lexer.ab"
 import "ct_native.ab"
 import "sema.ab"
 import "subparser.ab"
+import "raw_provider.ab"
 import "eval.ab"
 import "generic_types.ab"
 import "import_remap.ab"
@@ -44,13 +46,15 @@ fun bootstrapModuleIndexCheck(): bool {
 /** Whether `path` is a module of the standard library. */
 fun bootstrapPathIsStandardLibrary(path: string): bool {
     val root = bootstrapNormalizeModulePath(bootstrapStandardLibraryRoot())
-    path.startsWith(root)
+    path.startsWith("$root/")
 }
 
 /** Whether `source` writes `$name` (as tokens: a comment or a string naming it does not count) for a subparser of `registry`. */
-fun bootstrapSourceUsesSubparser(source: string, registry: BootstrapSubparserRegistry): bool {
+fun bootstrapSourceUsesSubparser(
+    source: string, registry: BootstrapSubparserRegistry, hostSource: string = ""
+): bool {
     if (registry.registrations.size == 0 || source.indexOf("\$") < 0) return false
-    val tokens = bootstrapLexShared(source)
+    val tokens = if (hostSource == "") bootstrapLexShared(source) else bootstrapRawHostTokens(hostSource)
     for (index in 0 until tokens.size - 1) {
         if (tokens[index].kind == BOOTSTRAP_TOKEN_DOLLAR && tokens[index + 1].kind == BOOTSTRAP_TOKEN_IDENTIFIER) {
             val name = bootstrapTokenText(source, tokens[index + 1])
@@ -152,18 +156,23 @@ fun bootstrapImportAliasValid(alias: string): bool {
 fun bootstrapScanImports(source: string): BootstrapImportScan =
     bootstrapScanImportsWithIdentity(source, "")
 
-fun bootstrapScanImportsWithIdentity(source: string, sourceIdentity: string): BootstrapImportScan {
+fun bootstrapScanImportsWithIdentity(
+    source: string, sourceIdentity: string, isolatedImportBegin: int = -1
+): BootstrapImportScan {
     val edges: array<BootstrapImportEdge> = []
     var errors = 0
     var diagnostics = ""
-    var offset = 0
+    var offset = if (isolatedImportBegin >= 0) isolatedImportBegin else 0
     var lineComment = false
     var blockComment = 0
     var braces = 0
     // Past the last "import" there is nothing to find, and most of a file is past it.
-    var scanned = source.size
-    while (scanned > 0 && !(source[scanned - 1] == 116 && scanned >= 6 &&
-        bootstrapImportWordAt(source, scanned - 6, "import"))) scanned = scanned - 1
+    var scanned = isolatedImportBegin + 1
+    if (isolatedImportBegin < 0) {
+        scanned = source.size
+        while (scanned > 0 && !(source[scanned - 1] == 116 && scanned >= 6 &&
+            bootstrapImportWordAt(source, scanned - 6, "import"))) scanned = scanned - 1
+    }
     while (offset < scanned) {
         if (source[offset] == 10 || source[offset] == 13) lineComment = false
         // A raw literal is opaque to import discovery, even when it contains
@@ -575,9 +584,11 @@ fun bootstrapModuleDiscoveryDeclaration(
 
 fun bootstrapModuleDiscovery(
     source: string,
-    sourceIdentity: string
+    sourceIdentity: string,
+    hostSource: string = ""
 ): BootstrapParseResult {
-    val parsed = bootstrapParseWithIdentity(source, sourceIdentity)
+    val parsed = if (hostSource == "") bootstrapParseWithIdentity(source, sourceIdentity)
+        else bootstrapParseWithTokens(source, sourceIdentity, bootstrapRawHostTokens(hostSource))
     val declarations: array<BootstrapDeclaration> = []
     var declaration = 0
     while (declaration < parsed.declarations.size) {
@@ -621,8 +632,18 @@ class BootstrapModuleSnapshot(
     val revision: int,
     val firstFingerprint: int,
     val secondFingerprint: int,
-    val discovery: BootstrapParseResult
+    val discovery: BootstrapParseResult,
+    val rawChunks: array<BootstrapRawChunk> = [],
+    val hostSource: string = "",
+    val rawSites: array<BootstrapRawSite> = []
 )
+
+fun bootstrapRawHostTokens(source: string): array<BootstrapToken> =
+    bootstrapLexWithRawProviders(source, { _, end -> end })
+
+fun bootstrapModuleTokens(snapshot: BootstrapModuleSnapshot): array<BootstrapToken> =
+    if (snapshot.hostSource == "") bootstrapLexShared(snapshot.source)
+    else bootstrapRawHostTokens(snapshot.hostSource)
 
 class BootstrapModuleFrontendSnapshot(
     val path: string,
@@ -692,7 +713,8 @@ class BootstrapModuleState(
     var discoveryIdentity: string = "",
     var overlays: array<BootstrapModuleOverlay> = [],
     val overlaySnapshots: Map<string, bool> = Map(),
-    var syntaxOnly: bool = false
+    var syntaxOnly: bool = false,
+    val rawDiscoveredIn: Map<string, int> = Map()
 ) {
     fun beginBuild(): void {
         if (this.discoveryPrepared) this.discoveryPrepared = false
@@ -744,7 +766,8 @@ class BootstrapModuleState(
         first: int, second: int
     ): BootstrapParseResult {
         var recordPath = ""
-        if (this.discoveryDirectory != "" && source.size <= 4194304 && importErrors == 0) {
+        if (this.discoveryDirectory != "" && source.size <= 4194304 && importErrors == 0 &&
+            !bootstrapMayUseRawProvider(source)) {
             val identity = bootstrapDiscoveryHashes(modulePath)
             recordPath =
                 "${this.discoveryDirectory}/${source.size}-$first-$second-${identity.first}-${identity.second}.discovery"
@@ -872,6 +895,12 @@ class BootstrapModuleState(
         result
     }
 
+    fun replaceRawSnapshot(snapshot: BootstrapModuleSnapshot): BootstrapModuleSnapshot {
+        val stored = bootstrapModuleSnapshotFrozen(snapshot)
+        this.snapshots[this.indexOf(snapshot.path)] = stored
+        stored
+    }
+
     fun frontendIndex(
         snapshot: BootstrapModuleSnapshot,
         dependencyFingerprint: int
@@ -914,10 +943,12 @@ class BootstrapModuleState(
         // broader-policy result nor publish an incomplete parse into that cache. A module that uses a subparser of the
         // standard library is expanded (the staged parse, no cache); the others are parsed raw.
         if (this.syntaxOnly) {
-            if (!bootstrapSourceUsesSubparser(snapshot.source, registry)) return bootstrapParseWithIdentity(snapshot.source, snapshot.path)
+            if (!bootstrapSourceUsesSubparser(snapshot.source, registry, snapshot.hostSource)) {
+                return bootstrapParseWithTokens(snapshot.source, snapshot.path, bootstrapModuleTokens(snapshot))
+            }
             return bootstrapParseStagedRegistered(
                 snapshot.source, snapshot.path, declarations, currentDeclarationBegin, currentDeclarationCount, registry,
-                allowedCompileEffects
+                allowedCompileEffects, snapshot.hostSource, snapshot.rawSites
             )
         }
         var existing = this.frontendIndex(
@@ -939,7 +970,9 @@ class BootstrapModuleState(
                 currentDeclarationBegin,
                 currentDeclarationCount,
                 registry,
-                allowedCompileEffects
+                allowedCompileEffects,
+                snapshot.hostSource,
+                snapshot.rawSites
             )
             val replacement = BootstrapModuleFrontendSnapshot(
                 snapshot.path,
@@ -1407,8 +1440,13 @@ fun bootstrapProjectDescriptor(root: string): BootstrapProjectDescriptor {
 
 class BootstrapModule(
     val path: string,
-    val source: string
+    val source: string,
+    val hostSource: string = ""
 )
+
+fun bootstrapParseModuleSurface(module: BootstrapModule): BootstrapParseResult =
+    if (module.hostSource == "") bootstrapParseWithIdentity(module.source, module.path)
+    else bootstrapParseWithTokens(module.source, module.path, bootstrapRawHostTokens(module.hostSource))
 
 class BootstrapModuleAlias(
     val importer: string,
@@ -2268,7 +2306,7 @@ fun bootstrapRewriteModuleSource(
         }
     }
     val declarationBounds = if (names.size > 0) {
-        bootstrapDeclarationBoundNames(snapshot.source, snapshot.discovery)
+        bootstrapDeclarationBoundNamesIn(snapshot.source, snapshot.discovery, bootstrapModuleTokens(snapshot))
     } else []
     val localAliases: array<string> = []
     val aliasPrefixes: array<string> = []
@@ -2296,7 +2334,7 @@ fun bootstrapRewriteModuleSource(
     val rewritten = if (names.size == 0 && localAliases.size == 0) {
         snapshot.source
     } else {
-        val tokens = bootstrapLexShared(snapshot.source)
+        val tokens = bootstrapModuleTokens(snapshot)
         var output = ""
         var cursor = 0
         var tokenIndex = 0
@@ -2505,7 +2543,10 @@ fun bootstrapPrepareModuleSnapshot(
     // its already compact discovery record instead of parsing and retaining a
     // second interface AST for the duration of the build.
     if (!contractOnly && source == snapshot.source) return snapshot
-    var discovery = bootstrapModuleDiscovery(source, snapshot.path)
+    val host = if (snapshot.hostSource != "") bootstrapRawHostSource(
+        source, snapshot.rawChunks, bootstrapSourceRewriteOf(snapshot.path)
+    ) else ""
+    var discovery = bootstrapModuleDiscovery(source, snapshot.path, host)
     if (contractOnly) {
         discovery = bootstrapProjectContract(discovery, snapshot.path, typesOnly)
     }
@@ -2522,7 +2563,10 @@ fun bootstrapPrepareModuleSnapshot(
         snapshot.revision,
         bootstrapModuleFingerprint(fingerprintSource, 17, 257, 1000000007),
         bootstrapModuleFingerprint(fingerprintSource, 97, 263, 1000000009),
-        discovery
+        discovery,
+        snapshot.rawChunks,
+        host,
+        snapshot.rawSites
     )
 }
 
@@ -3754,8 +3798,8 @@ fun bootstrapStrictContractTokens(
     snapshot: BootstrapModuleSnapshot,
     typesOnly: bool
 ): array<BootstrapToken> {
-    val parsed = bootstrapParseWithIdentity(snapshot.source, snapshot.path)
-    val tokens = bootstrapLexShared(snapshot.source)
+    val tokens = bootstrapModuleTokens(snapshot)
+    val parsed = bootstrapParseWithTokens(snapshot.source, snapshot.path, tokens)
     val retained: array<BootstrapToken> = []
     var cursor = 0
     for (declaration in parsed.declarations) {
@@ -3853,7 +3897,7 @@ fun bootstrapStrictImportFindings(
         if (declaration.extensionOwner == "") own.add(declaration.name)
     }
     val tokens = if (contractOnly) bootstrapStrictContractTokens(snapshot, typesOnly)
-        else bootstrapLexShared(source)
+        else bootstrapModuleTokens(snapshot)
     // The names a declaration binds locally, found when a candidate first needs them: most
     // modules (the library's, in every build) have none that does.
     var bounds: array<array<string>> = []
@@ -4062,7 +4106,7 @@ fun bootstrapValidateImportAliases(
     while (importerIndex < importerPaths.size) {
         val importer = state.snapshots[state.indexOf(importerPaths[importerIndex])]
         val names = importerNames[importerIndex]
-        val tokens = bootstrapLexShared(importer.source)
+        val tokens = bootstrapModuleTokens(importer)
         var tokenIndex = 0
         var inImport = false
         while (tokenIndex < tokens.size) {
@@ -4164,6 +4208,88 @@ fun bootstrapModuleGraphIndex(): BootstrapModuleGraphIndex =
     BootstrapModuleGraphIndex(Map(), [], [], [], Map(), Map(), 0, "", [], Map(), Map(), Map(),
         Map(), Map(), Map())
 
+fun bootstrapMayUseRawProvider(source: string): bool {
+    var site = source.indexOf("\$")
+    while (site >= 0) {
+        var nameEnd = site + 1
+        while (nameEnd < source.size && bootstrapIsAlphaNumeric(source[nameEnd])) nameEnd += 1
+        if (nameEnd > site + 1) {
+            var body = nameEnd
+            while (body < source.size &&
+                (source[body] == 32 || source[body] == 9 || source[body] == 10 ||
+                    source[body] == 13)) body += 1
+            if (bootstrapAt(source, body, 123)) return true
+        }
+        site = source.indexOf("\$", nameEnd)
+    }
+    false
+}
+
+// Build a preview scope using only import sites the host lexer has reached.
+// Discovery uses compile declarations and never evaluates ordinary handlers.
+class BootstrapRawImportScope(
+    val syntaxOnly: bool,
+    val overlayPaths: array<string>,
+    val overlaySources: array<string>,
+    val bindings: Map<string, BootstrapRawBoundaryBinding> = Map(),
+    val seen: Map<string, bool> = Map(),
+    val declarations: array<BootstrapDeclaration> = [],
+    val pending: array<string> = [],
+    var resolved: int = 0
+) {
+    fun addRegistrations(path: string, discovery: BootstrapParseResult, local: bool): void {
+        if (this.syntaxOnly && !bootstrapPathIsStandardLibrary(path)) return
+        if (!bootstrapActionsRegisterSubparser(discovery.actions)) return
+        val registry = bootstrapBuildSubparserRegistry(discovery)
+        for (registration in registry.registrations) {
+            if (registration.rawBoundary != "" && this.bindings.get(registration.name) == null) {
+                val visible = BootstrapSubparserRegistration(
+                    registration.name, registration.handler,
+                    if (local) registration.availableFrom else -1, registration.rawBoundary
+                )
+                this.bindings.set(registration.name, BootstrapRawBoundaryBinding(
+                    visible, this.declarations, bootstrapEvalContext(this.declarations)
+                ))
+            }
+        }
+    }
+
+    fun collect(path: string): void {
+        if (this.seen.get(path) != null) return
+        this.seen.set(path, true)
+        var source = ""
+        var overlay = this.overlayPaths.size - 1
+        while (overlay >= 0 && this.overlayPaths[overlay] != path) overlay -= 1
+        if (overlay >= 0) source = this.overlaySources[overlay]
+        else if (Path(path).info().isFile()) source = Path(path).readText()
+        if (source == "") return
+        val scan = bootstrapScanImports(source)
+        for (edge in scan.edges) {
+            if (!edge.provider && !edge.contractOnly) {
+                this.collect(bootstrapResolveImport(path, edge.source))
+            }
+        }
+        val discovery = bootstrapModuleDiscovery(source, path)
+        for (declaration in discovery.declarations) {
+            this.declarations.append(declaration)
+        }
+        this.addRegistrations(path, discovery, false)
+    }
+
+    fun lookup(name: string, begin: int): BootstrapRawBoundaryBinding? {
+        while (this.resolved < this.pending.size) {
+            val target = this.pending[this.resolved]
+            this.resolved += 1
+            this.collect(target)
+        }
+        val binding = this.bindings.get(name)
+        if (binding != null && binding.registration.availableFrom <= begin) return binding
+        null
+    }
+}
+
+var bootstrapRawImportScopes: array<BootstrapRawImportScope> = []
+
 class BootstrapModuleGraph(
     val modules: array<BootstrapModule>,
     var errors: int,
@@ -4174,6 +4300,55 @@ class BootstrapModuleGraph(
     val aliases: array<BootstrapModuleAlias>,
     val index: BootstrapModuleGraphIndex
 ) {
+    fun rawSnapshot(snapshot: BootstrapModuleSnapshot): BootstrapModuleSnapshot {
+        if (!bootstrapMayUseRawProvider(snapshot.source)) return snapshot
+        val known = this.state.rawDiscoveredIn.get(snapshot.path)
+        if (known == this.state.build) return snapshot
+        this.state.rawDiscoveredIn.set(snapshot.path, this.state.build)
+        val source = snapshot.source
+        val path = snapshot.path
+        val overlayPaths: array<string> = []
+        val overlaySources: array<string> = []
+        for (overlay in this.state.overlays) {
+            overlayPaths.append(overlay.path)
+            overlaySources.append(overlay.text)
+        }
+        val scope = bootstrapRawImportScopes.size
+        bootstrapRawImportScopes.append(BootstrapRawImportScope(
+            this.state.syntaxOnly, overlayPaths, overlaySources
+        ))
+        bootstrapRawImportScopes[scope].seen.set(path, true)
+        if (bootstrapActionsRegisterSubparser(snapshot.discovery.actions)) {
+            val local = bootstrapModuleDiscovery(source, path)
+            for (declaration in local.declarations) {
+                bootstrapRawImportScopes[scope].declarations.append(declaration)
+            }
+            bootstrapRawImportScopes[scope].addRegistrations(path, local, true)
+        }
+        val plan = bootstrapPlanRawSource(source, { name, begin ->
+            bootstrapRawImportScopes[scope].lookup(name, begin)
+        }, { begin ->
+            val scan = bootstrapScanImportsWithIdentity(source, path, begin)
+            for (edge in scan.edges) {
+                if (!edge.provider && !edge.contractOnly) {
+                    bootstrapRawImportScopes[scope].pending.append(
+                        bootstrapResolveImport(path, edge.source)
+                    )
+                }
+            }
+        })
+        bootstrapRawImportScopes.removeLast()
+        if (plan.sites.size == 0 && snapshot.rawSites.size == 0) return snapshot
+        val host = bootstrapRawHostSource(snapshot.source, plan.chunks, BootstrapSourceRewrite("", [], [], [], []))
+        val imports = bootstrapScanImports(host)
+        val result = BootstrapModuleSnapshot(
+            snapshot.path, snapshot.source, imports.edges, imports.errors, snapshot.exists,
+            snapshot.size, snapshot.revision, snapshot.firstFingerprint, snapshot.secondFingerprint,
+            bootstrapModuleDiscovery(snapshot.source, snapshot.path, host), plan.chunks, host, plan.sites
+        )
+        this.state.replaceRawSnapshot(result)
+    }
+
     fun importerSlot(importerPath: string): int {
         val known = this.index.importers.get(importerPath)
         if (known != null) return known
@@ -4225,7 +4400,7 @@ class BootstrapModuleGraph(
         // preceding imports for every edge.
         var targetDeclarations: array<BootstrapDeclaration> = []
         if (edge.alias == "") {
-            targetDeclarations = this.state.acquire(target).discovery.declarations
+            targetDeclarations = this.rawSnapshot(this.state.acquire(target)).discovery.declarations
         }
         // Only an import that shares a plain name with one of the module's
         // earlier unqualified imports can be ambiguous: the others skip the
@@ -4396,7 +4571,7 @@ class BootstrapModuleGraph(
             this.errors = this.errors + snapshot.importErrors
             if (snapshot.importErrors > 0) {
                 this.diagnostics =
-                    "${this.diagnostics}${bootstrapScanImportsWithIdentity(snapshot.source, snapshot.path).diagnostics}"
+                    "${this.diagnostics}${bootstrapScanImportsWithIdentity(if (snapshot.hostSource == "") snapshot.source else snapshot.hostSource, snapshot.path).diagnostics}"
             }
             this.modules.append(BootstrapModule(identity, ""))
             val recordedDeclarers = bootstrapStringSet()
@@ -4619,14 +4794,14 @@ class BootstrapModuleGraph(
             this.index.fullModules.set(identity, 1)
             if (known) this.dropContractLoad(identity)
             this.checkModuleManifest(identity)
-            val snapshot = this.state.acquire(identity)
+            val snapshot = this.rawSnapshot(this.state.acquire(identity))
             bootstrapFrontendTraceMemory("graph.acquire:$identity")
             this.errors = this.errors + snapshot.importErrors
             if (snapshot.importErrors > 0) {
                 this.diagnostics =
-                    "${this.diagnostics}${bootstrapScanImportsWithIdentity(snapshot.source, snapshot.path).diagnostics}"
+                    "${this.diagnostics}${bootstrapScanImportsWithIdentity(if (snapshot.hostSource == "") snapshot.source else snapshot.hostSource, snapshot.path).diagnostics}"
             }
-            if (!known) this.modules.append(BootstrapModule(identity, snapshot.source))
+            if (!known) this.modules.append(BootstrapModule(identity, snapshot.source, snapshot.hostSource))
             var index = 0
             while (index < snapshot.importEdges.size) {
                 val edge = snapshot.importEdges[index]
@@ -4959,7 +5134,8 @@ class BootstrapModuleGraph(
                         BootstrapSubparserRegistration(
                             registration.name,
                             registration.handler,
-                            -1
+                            -1,
+                            registration.rawBoundary
                         )
                     )
                     0

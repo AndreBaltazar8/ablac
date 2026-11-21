@@ -451,11 +451,74 @@ fun bootstrapLexWithTrivia(
     source: string, var trivia: array<BootstrapTrivia>?
 ): array<BootstrapToken> {
     val tokens: array<BootstrapToken> = []
-    var offset = 0
+    val offset = bootstrapLexInto(source, 0, tokens, trivia, null, false, null)
+    tokens.append(BootstrapToken(BOOTSTRAP_TOKEN_END, offset, offset))
+    tokens
+}
+
+// Only the raw-aware path delegates a provider body. The callback receives the
+// dollar and name-end offsets and returns the first byte back in host syntax.
+// Returning nameEnd keeps ordinary lexing at that site.
+fun bootstrapLexWithRawProviders(
+    source: string,
+    resumeProvider: (int, int) -> int,
+    discoverImport: ((int) -> void)? = null
+): array<BootstrapToken> {
+    val tokens: array<BootstrapToken> = []
+    val discarded: array<BootstrapTrivia>? = null
+    val offset = bootstrapLexInto(source, 0, tokens, discarded, resumeProvider, false, discoverImport)
+    tokens.append(BootstrapToken(BOOTSTRAP_TOKEN_END, offset, offset))
+    tokens
+}
+
+fun bootstrapLexRawAblaHole(
+    source: string, start: int, resumeProvider: (int, int) -> int
+): int {
+    val tokens: array<BootstrapToken> = []
+    val discarded: array<BootstrapTrivia>? = null
+    bootstrapLexInto(source, start, tokens, discarded, resumeProvider, true, null)
+}
+
+fun bootstrapLexInto(
+    source: string,
+    start: int,
+    var tokens: array<BootstrapToken>,
+    var trivia: array<BootstrapTrivia>?,
+    resumeProvider: ((int, int) -> int)?,
+    interpolation: bool,
+    discoverImport: ((int) -> void)?
+): int {
+    var offset = start
+    var braces = 0
     while (offset < source.size) {
         val begin = offset
         val byte = source[offset]
         var handled = false
+
+        if (interpolation || discoverImport != null) {
+            if (byte == 125) {
+                if (braces > 0) braces = braces - 1
+                else if (interpolation) return offset
+            } else if (byte == 123) braces = braces + 1
+        }
+
+        if (byte == 36 && resumeProvider != null &&
+            offset + 1 < source.size && bootstrapIsAlpha(source[offset + 1])) {
+            val nameBegin = offset + 1
+            var nameEnd = nameBegin + 1
+            while (nameEnd < source.size && bootstrapIsAlphaNumeric(source[nameEnd])) {
+                nameEnd = nameEnd + 1
+            }
+            if (bootstrapKeyword(source, nameBegin, nameEnd) == BOOTSTRAP_TOKEN_IDENTIFIER) {
+                val resume = resumeProvider(begin, nameEnd)
+                if (resume > nameEnd && resume <= source.size) {
+                    tokens.append(BootstrapToken(BOOTSTRAP_TOKEN_DOLLAR, begin, nameBegin))
+                    tokens.append(BootstrapToken(BOOTSTRAP_TOKEN_IDENTIFIER, nameBegin, nameEnd))
+                    offset = resume
+                    continue
+                }
+            }
+        }
 
         if (!handled && (byte == 32 || byte == 9 || byte == 12)) {
             offset = offset + 1
@@ -482,6 +545,10 @@ fun bootstrapLexWithTrivia(
                 offset < source.size &&
                 bootstrapIsAlphaNumeric(source[offset])
             ) offset = offset + 1
+            if (discoverImport != null && braces == 0 &&
+                bootstrapRegionEquals(source, begin, offset, "import")) {
+                discoverImport(begin)
+            }
             tokens.append(BootstrapToken(
                 bootstrapKeyword(source, begin, offset),
                 begin,
@@ -612,25 +679,28 @@ fun bootstrapLexWithTrivia(
                     }
                     val interpolation = offset
                     val expressionBegin = offset + 2
-                    val expressionEnd = bootstrapFindInterpolationEnd(
-                        source,
-                        expressionBegin
-                    )
                     tokens.append(BootstrapToken(BOOTSTRAP_TOKEN_INTERPOLATION_START,
                         interpolation,
                         expressionBegin
                     ))
-                    val nested = bootstrapLex(
-                        source.slice(expressionBegin, expressionEnd)
-                    )
-                    var nestedIndex = 0
-                    while (nestedIndex + 1 < nested.size) {
-                        tokens.append(BootstrapToken(
-                            nested[nestedIndex].kind,
-                            expressionBegin + nested[nestedIndex].begin,
-                            expressionBegin + nested[nestedIndex].end
-                        ))
-                        nestedIndex = nestedIndex + 1
+                    var expressionEnd = expressionBegin
+                    if (resumeProvider != null) {
+                        val discarded: array<BootstrapTrivia>? = null
+                        expressionEnd = bootstrapLexInto(
+                            source, expressionBegin, tokens, discarded, resumeProvider, true, null
+                        )
+                    } else {
+                        expressionEnd = bootstrapFindInterpolationEnd(source, expressionBegin)
+                        val nested = bootstrapLex(source.slice(expressionBegin, expressionEnd))
+                        var nestedIndex = 0
+                        while (nestedIndex + 1 < nested.size) {
+                            tokens.append(BootstrapToken(
+                                nested[nestedIndex].kind,
+                                expressionBegin + nested[nestedIndex].begin,
+                                expressionBegin + nested[nestedIndex].end
+                            ))
+                            nestedIndex = nestedIndex + 1
+                        }
                     }
                     if (bootstrapAt(source, expressionEnd, 125)) {
                         tokens.append(BootstrapToken(BOOTSTRAP_TOKEN_INTERPOLATION_END,
@@ -742,6 +812,5 @@ fun bootstrapLexWithTrivia(
             tokens.append(BootstrapToken(kind, begin, offset))
         }
     }
-    tokens.append(BootstrapToken(BOOTSTRAP_TOKEN_END, offset, offset))
-    tokens
+    offset
 }

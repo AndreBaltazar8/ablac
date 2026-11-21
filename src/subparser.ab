@@ -366,7 +366,8 @@ class BootstrapExtensionRequest(
 class BootstrapSubparserRegistration(
     val name: string,
     val handler: string,
-    val availableFrom: int
+    val availableFrom: int,
+    val rawBoundary: string = ""
 )
 
 class BootstrapSubparserRegistry(
@@ -396,14 +397,26 @@ class BootstrapSubparserCursor(
     var rawPosition: int,
     var errors: int,
     // Where the `$name` is, as parserSiteKey spells it (staged_parser.ab).
-    val site: string = ""
+    val site: string = "",
+    // Discovery advances through a delegated Abla hole without expanding or
+    // evaluating the syntax that it contains.
+    val scanAblaHole: ((int) -> int)? = null,
+    val rawLimit: int = -1
 ) {
+    fun rawEndPosition(): int = if (this.rawLimit < 0) this.source.size else this.rawLimit
+
+    fun syncRawFromToken(): void {
+        val begin = this.tokens[this.position].begin
+        this.rawPosition = if (this.rawLimit >= 0 && begin > this.rawLimit)
+            this.rawLimit else begin
+    }
+
     fun skipTokenSeparators() {
         while (this.tokens[this.position].kind == BOOTSTRAP_TOKEN_NEWLINE ||
                this.tokens[this.position].kind == BOOTSTRAP_TOKEN_SEMICOLON) {
             this.position = this.position + 1
         }
-        this.rawPosition = this.tokens[this.position].begin
+        this.syncRawFromToken()
     }
 
     fun tokenKind(expected: string): int {
@@ -414,14 +427,16 @@ class BootstrapSubparserCursor(
 
     fun at(expected: string): bool {
         this.skipTokenSeparators()
-        this.tokens[this.position].kind == this.tokenKind(expected)
+        val kind = if (this.rawLimit >= 0 && this.rawEnd()) BOOTSTRAP_TOKEN_END
+            else this.tokens[this.position].kind
+        kind == this.tokenKind(expected)
     }
 
     fun consume(expected: string): bool {
         val matched = this.at(expected)
         if (matched) {
             this.position = this.position + 1
-            this.rawPosition = this.tokens[this.position].begin
+            this.syncRawFromToken()
         }
         matched
     }
@@ -432,6 +447,7 @@ class BootstrapSubparserCursor(
 
     fun currentText(): string {
         this.skipTokenSeparators()
+        if (this.rawLimit >= 0 && this.rawEnd()) return ""
         this.writtenText(this.tokens[this.position].begin, this.tokens[this.position].end)
     }
 
@@ -453,8 +469,8 @@ class BootstrapSubparserCursor(
                    this.tokens[index].kind == BOOTSTRAP_TOKEN_SEMICOLON) index = index + 1
             remaining = remaining - 1
         }
-        if (remaining < 0) "" else this.writtenText(this.tokens[index].begin,
-            this.tokens[index].end)
+        if (remaining < 0 || (this.rawLimit >= 0 && this.tokens[index].begin >= this.rawLimit))
+            "" else this.writtenText(this.tokens[index].begin, this.tokens[index].end)
     }
 
     fun syncTokensFromRaw() {
@@ -468,10 +484,11 @@ class BootstrapSubparserCursor(
         val rewrite = bootstrapSourceRewriteOf(this.sourceIdentity)
         if (rewrite.rewrittenBegins.size > 0 && this.source.size == rewrite.parsedSize) {
             val at = rewrite.original(this.rawPosition)
-            return at + text.size <= rewrite.originalSource.size &&
+            val limit = if (this.rawLimit < 0) rewrite.originalSource.size else rewrite.originalEnd(this.rawLimit)
+            return at + text.size <= limit &&
                 rewrite.originalSource.slice(at, at + text.size) == text
         }
-        var matched = this.rawPosition + text.size <= this.source.size
+        var matched = this.rawPosition + text.size <= this.rawEndPosition()
         var index = 0
         while (matched && index < text.size) {
             if (this.source[this.rawPosition + index] != text[index]) {
@@ -502,7 +519,8 @@ class BootstrapSubparserCursor(
     fun rawTakeUntil(delimiters: string): string {
         val begin = this.rawPosition
         var found = false
-        while (!found && this.rawPosition < this.source.size) {
+        val limit = this.rawEndPosition()
+        while (!found && this.rawPosition < limit) {
             var delimiter = 0
             while (!found && delimiter < delimiters.size) {
                 if (this.source[this.rawPosition] == delimiters[delimiter]) {
@@ -519,8 +537,9 @@ class BootstrapSubparserCursor(
     fun rawTakeUntilText(delimiter: string): string {
         val begin = this.rawPosition
         var found = delimiter.size == 0
+        val limit = this.rawEndPosition()
         while (!found &&
-               this.rawPosition + delimiter.size <= this.source.size) {
+               this.rawPosition + delimiter.size <= limit) {
             found = true
             var index = 0
             while (found && index < delimiter.size) {
@@ -531,7 +550,7 @@ class BootstrapSubparserCursor(
             if (!found) this.rawPosition = this.rawPosition + 1
         }
         if (!found) {
-            this.rawPosition = this.source.size
+            this.rawPosition = limit
             this.errors = this.errors + 1
         }
         this.syncTokensFromRaw()
@@ -540,7 +559,8 @@ class BootstrapSubparserCursor(
 
     fun rawTakeName(): string {
         val begin = this.rawPosition
-        while (this.rawPosition < this.source.size &&
+        val limit = this.rawEndPosition()
+        while (this.rawPosition < limit &&
                bootstrapIsAlphaNumeric(this.source[this.rawPosition])) {
             this.rawPosition = this.rawPosition + 1
         }
@@ -555,7 +575,8 @@ class BootstrapSubparserCursor(
     // `table$local`, none of which are Abla identifiers.
     fun rawTakeSymbol(): string {
         val begin = this.rawPosition
-        while (this.rawPosition < this.source.size &&
+        val limit = this.rawEndPosition()
+        while (this.rawPosition < limit &&
                (bootstrapIsAlphaNumeric(this.source[this.rawPosition]) ||
                 this.source[this.rawPosition] == 95 ||
                 this.source[this.rawPosition] == 46 ||
@@ -568,7 +589,8 @@ class BootstrapSubparserCursor(
     }
 
     fun rawSkipWhitespace() {
-        while (this.rawPosition < this.source.size &&
+        val limit = this.rawEndPosition()
+        while (this.rawPosition < limit &&
                (this.source[this.rawPosition] == 32 ||
                 this.source[this.rawPosition] == 9 ||
                 this.source[this.rawPosition] == 10 ||
@@ -578,9 +600,16 @@ class BootstrapSubparserCursor(
         this.syncTokensFromRaw()
     }
 
-    fun rawEnd(): bool = this.rawPosition >= this.source.size
+    fun rawEnd(): bool = this.rawPosition >= this.rawEndPosition()
 
     fun parseAblaExpression(): BootstrapExpression {
+        val scan = this.scanAblaHole
+        if (scan != null) {
+            val begin = this.rawPosition
+            val end = scan(begin)
+            this.rawPosition = end
+            return BootstrapExpression("null", "null", begin, end, [])
+        }
         this.syncTokensFromRaw()
         val parser = BootstrapParser(
             this.sourceIdentity,
@@ -607,7 +636,7 @@ class BootstrapSubparserCursor(
         }
         this.position = parser.position
         this.errors = parser.errors
-        this.rawPosition = this.tokens[this.position].begin
+        this.syncRawFromToken()
         expression
     }
 }
@@ -747,15 +776,18 @@ fun bootstrapBuildSubparserRegistry(
         }
         if (expression.kind == "call" &&
             expression.text == "compilerRegisterSubparser") {
-            if (expression.children.size != 2 ||
+            val raw = expression.children.size == 3
+            if ((!raw && expression.children.size != 2) ||
                 expression.children[0].kind != "string" ||
-                expression.children[1].kind != "identifier") {
+                expression.children[1].kind != "identifier" ||
+                (raw && expression.children[2].kind != "identifier")) {
                 errors = errors + 1
                 diagnostics =
                     "${diagnostics}error[E_EXT_SUBPARSER_REGISTRATION]: compilerRegisterSubparser requires a string name and compile-function identifier\n"
             } else {
                 val name = expression.children[0].text
                 val handler = expression.children[1].text
+                val rawBoundary = if (raw) expression.children[2].text else ""
                 var duplicate = false
                 var registration = 0
                 while (registration < registrations.size) {
@@ -765,7 +797,8 @@ fun bootstrapBuildSubparserRegistry(
                     registration = registration + 1
                 }
                 if (name == "" || duplicate ||
-                    !bootstrapIsCompileHandler(parsed.declarations, handler)) {
+                    !bootstrapIsCompileHandler(parsed.declarations, handler) ||
+                    (raw && !bootstrapIsCompileHandler(parsed.declarations, rawBoundary))) {
                     errors = errors + 1
                     diagnostics =
                         "${diagnostics}error[E_EXT_SUBPARSER_REGISTRATION]: invalid or duplicate subparser `$name` with handler `$handler`\n"
@@ -773,7 +806,8 @@ fun bootstrapBuildSubparserRegistry(
                     registrations.append(BootstrapSubparserRegistration(
                         name,
                         handler,
-                        action.end
+                        action.end,
+                        rawBoundary
                     ))
                     errors = errors
                 }

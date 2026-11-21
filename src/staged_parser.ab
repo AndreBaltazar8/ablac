@@ -8,6 +8,7 @@ import "sema.ab"
 import "compile_actions.ab"
 import "lexer.ab"
 import "ct_lift.ab"
+import "raw_provider.ab"
 
 fun bootstrapMergeCompileInputs(
     var paths: array<string>,
@@ -1347,9 +1348,18 @@ fun bootstrapParseStagedRegistered(
     currentDeclarationBegin: int,
     currentDeclarationCount: int,
     registry: BootstrapSubparserRegistry,
-    allowedCompileEffects: int
+    allowedCompileEffects: int,
+    hostSource: string = "",
+    rawSites: array<BootstrapRawSite> = []
 ): BootstrapParseResult {
-    val tokens = bootstrapLexShared(source)
+    val tokens = if (hostSource == "") bootstrapLexShared(source) else
+        bootstrapLexWithRawProviders(hostSource, { _, end -> end })
+    val rawEnds = if (rawSites.size == 0) null else {
+        val ends: Map<int, int> = Map()
+        val rewrite = bootstrapSourceRewriteOf(sourceIdentity)
+        for (site in rawSites) ends.set(rewrite.rewritten(site.begin), rewrite.rewritten(site.end))
+        ends
+    }
     val expansionBegins: array<int> = []
     val expansionEnds: array<int> = []
     val expansionExpressions: array<BootstrapExpression> = []
@@ -1404,6 +1414,8 @@ fun bootstrapParseStagedRegistered(
                     if (position < tokens.size) {
                         rawPosition = tokens[position].begin
                     }
+                    val limit = if (rawEnds == null) -1 else
+                        rawEnds.get(tokens[tokenIndex].begin) ?? -1
                     val cursor = BootstrapSubparserCursor(
                         sourceIdentity,
                         source,
@@ -1418,7 +1430,9 @@ fun bootstrapParseStagedRegistered(
                             handlerDeclarations, currentDeclarationBegin,
                             currentDeclarationCount, sourceIdentity,
                             tokens[tokenIndex].begin
-                        )
+                        ),
+                        null,
+                        limit
                     )
                     evalContext = bootstrapEvalContextFor(evalContext, handlerDeclarations)
                     bootstrapSubparserVisibleNames = visibleNames
@@ -1432,7 +1446,13 @@ fun bootstrapParseStagedRegistered(
                     )
                     bootstrapSubparserVisibleNames = outerVisibleNames
                     bootstrapSubparserVisibleReplacements = outerVisibleReplacements
+                    val boundaryMismatch = limit >= 0 && cursor.rawPosition != limit
                     extensionErrors = extensionErrors + invocation.errors
+                    if (boundaryMismatch && invocation.errors == 0) {
+                        extensionErrors += 1
+                        diagnostics =
+                            "${diagnostics}error[E_SUBPARSER_RAW_BOUNDARY]: raw handler and boundary scanner disagree on the end of `\$$name`\nsource[extension-expression]:$sourceIdentity:${tokens[tokenIndex].begin}:$limit\n"
+                    }
                     if (invocation.diagnostics != "") {
                         diagnostics = "$diagnostics${invocation.diagnostics}"
                         diagnostics =
@@ -1445,12 +1465,13 @@ fun bootstrapParseStagedRegistered(
                         diagnostics =
                         "${diagnostics}source[extension-expression]:$sourceIdentity:${tokens[tokenIndex].begin}:${cursor.rawPosition}\n"
                     }
-                    if (invocation.errors > 0) {
+                    if (invocation.errors > 0 || boundaryMismatch) {
                         // A failed subparser has reported why; its text is skipped
                         // whole, as an unexpanded `$name` would be, so the parse
                         // goes on after it instead of inside it.
                         // What it built so far stands in for it, as before.
-                        val skipped = bootstrapSubparserTextEnd(tokens, position, source.size)
+                        val skipped = if (limit >= 0) limit else
+                            bootstrapSubparserTextEnd(tokens, position, source.size)
                         if (invocation.stackDepthStopped) {
                             val begin = if (tokens[tokenIndex].begin > 0)
                                 tokens[tokenIndex].begin - 1 else 0
@@ -1559,8 +1580,32 @@ fun bootstrapSubparserUsesIn(expression: BootstrapExpression, begin: int, end: i
 }
 
 fun bootstrapParseStaged(source: string): BootstrapParseResult {
-    val discovery = bootstrapParse(source)
-    val registry = bootstrapBuildSubparserRegistry(discovery)
+    var discovery = bootstrapParse(source)
+    var registry = bootstrapBuildSubparserRegistry(discovery)
+    var hostSource = ""
+    var rawSites: array<BootstrapRawSite> = []
+    var hasRaw = false
+    for (registration in registry.registrations) if (registration.rawBoundary != "") hasRaw = true
+    if (hasRaw) {
+        val bindings: Map<string, BootstrapRawBoundaryBinding> = Map()
+        val declarations = discovery.declarations
+        val context = bootstrapEvalContext(declarations)
+        for (registration in registry.registrations) {
+            if (registration.rawBoundary != "") bindings.set(registration.name,
+                BootstrapRawBoundaryBinding(registration, declarations, context))
+        }
+        val plan = bootstrapPlanRawSource(source, { name, begin ->
+            val binding = bindings.get(name)
+            if (binding != null && binding.registration.availableFrom <= begin) binding else null
+        }, { _: int -> return })
+        if (plan.sites.size > 0) {
+            hostSource = bootstrapRawHostSource(source, plan.chunks, BootstrapSourceRewrite("", [], [], [], []))
+            rawSites = plan.sites
+            discovery = bootstrapParseWithTokens(source, "<memory>",
+                bootstrapLexWithRawProviders(hostSource, { _, end -> end }))
+            registry = bootstrapBuildSubparserRegistry(discovery)
+        }
+    }
     val parsed = bootstrapParseStagedRegistered(
         source,
         "<memory>",
@@ -1568,7 +1613,9 @@ fun bootstrapParseStaged(source: string): BootstrapParseResult {
         0,
         discovery.declarations.size,
         registry,
-        0
+        0,
+        hostSource,
+        rawSites
     )
     BootstrapParseResult(
         parsed.declarations,
