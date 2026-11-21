@@ -3,7 +3,8 @@
 # ABLA_WARN_UNUSED_IMPORTS=0, and a cache hit prints what its entry kept): an import nothing in the importing file uses
 # gets a warning, an import used only through an extension method, a re-exported class or a
 # `$json` subparser (also through a module that passes the registering one on), a call a subparser generates, an
-# import line's provider call or an interpolated float doesn't, nor
+# import line's provider call, a name compile code looks up (compilerFindFunction("x")) or an interpolated float
+# doesn't, nor
 # one of a module with an @export function; a package's entry gets the `export import` line instead, and a module that
 # runs compile code or defines syntax (a subparser) keeps its imports. Another project's module, a
 # vendored package and a checkout linked in get none, nor does any module after a front end that stopped at an error.
@@ -222,6 +223,15 @@ grep -qxF 'fix-imports: removed 1 unused import(s) in 1 file(s); 0 restored, 0 l
     fail "the provider prune didn't remove idle.ab's import" "$work/provider-prune.log"
 ! grep -qxF 'import providedSource()' "$work/provider/idle.ab" || fail "idle.ab still imports providedSource()" "$work/provider/idle.ab"
 grep -qxF 'import providedSource()' "$work/provider/main.ab" || fail "the prune removed main.ab's provider import" "$work/provider/main.ab"
+
+# A name compile code looks up (`compilerFindFunction("lookupAnswer")` in finder.ab) uses the import that brings its
+# declaration in: main.ab's ./answer.ab gets no warning and the prune keeps it (without it the program exits 1).
+(cd "$work/lookup" && "$compiler" build main.ab -o program --fast) > "$work/lookup.log" 2>&1 ||
+    fail "lookup/main.ab doesn't build" "$work/lookup.log"
+! grep -q 'W_UNUSED_IMPORT' "$work/lookup.log" || fail "an import a compile-time lookup finds is called unused" "$work/lookup.log"
+(cd "$work/lookup" && "$compiler" fix-imports main.ab --prune) > "$work/lookup-prune.log" 2>&1 ||
+    fail "the lookup prune failed" "$work/lookup-prune.log"
+grep -qxF 'import "./answer.ab"' "$work/lookup/main.ab" || fail "the prune removed the import a lookup finds" "$work/lookup/main.ab"
 
 # A module with a runtime hook (`fun __abla...`) matters by being loaded.
 (cd "$work/hook" && "$compiler" build main.ab -o program --fast --warn-unused-imports) > "$work/hook.log" 2>&1 ||

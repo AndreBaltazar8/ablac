@@ -387,7 +387,8 @@ A build warns about each import the importing file doesn't use: `warning[W_UNUSE
 `import "x"` declares is used here`, with the import's place. A use is any name the module declares (a call, a type,
 an extension method or operator it resolves to, the receiver of an extension the file declares, a `$name` subparser it
 or a module it passes on registers, a call a subparser generates in the file, a compile function an import line calls
-as its provider, abla/float/text's `f64Text` for an interpolated float). The warning is for the project's own modules only: not the standard library, a vendored package
+as its provider, a function or type compile code anywhere in the build looks up by name (`compilerFindFunction("x")`,
+`compilerFindType("x")`), abla/float/text's `f64Text` for an interpolated float). The warning is for the project's own modules only: not the standard library, a vendored package
 (`.abla/packages/`), another project's module or a checkout linked into the project. It is never given for an aliased,
 exported or contract-only import, an import of a module that does something by being loaded (an `@export` function or
 a top-level `#` action, or a runtime hook `fun __abla...` the backend binds by name), an import in a module that runs compile code (what it compiles may read the module) or defines syntax (the code its
