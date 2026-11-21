@@ -984,11 +984,19 @@ async function since() {
 async function subparsers() {
     const json = fixture('subparser-stdlib', { 'main.ab': 'import "abla/io"\nimport "abla/json"\n\nfun main: int {\n    val count = 3\n    val doc = $json {"n": count, "name": "x"}\n    println(doc.get("name").asString())\n    0\n}\n' });
     let s = await start(json, { mode: 'graph-v2' });
-    noErrors(await s.analyze());
+    const used = await s.analyze();
+    noErrors(used);
+    assert.equal(used.complete, true, 'a stdlib subparser use leaves nothing pending: ' + JSON.stringify(used.pending));
     await s.rpc('document/open', { uri: uri(path.join(json, 'main.ab')), version: 1, text: 'import "abla/io"\nimport "abla/json"\n\nfun main: int {\n    val doc = $json {"n": 1}\n    println(doc.get("name").nosuch())\n    0\n}\n' });
     const bad = errors(await s.analyze());
     assert.equal(bad.length, 1, JSON.stringify(bad));
     assert.ok(bad[0][2].includes('method.unknown:Json.nosuch'), bad[0][2]);
+    await s.close();
+    const imported = fixture('subparser-import-only', { 'main.ab': 'import "abla/io"\nimport "abla/json"\n\nfun main: int {\n    println("x")\n    0\n}\n' });
+    s = await start(imported, { mode: 'graph-v2' });
+    const only = await s.analyze();
+    noErrors(only);
+    assert.equal(only.complete, true, 'importing abla/json leaves nothing pending: ' + JSON.stringify(only.pending));
     await s.close();
     const own = fixture('subparser-user', { 'main.ab': [
         'import "abla/io"', 'import "abla/text"', 'import "abla/compiler/parser"', '',
@@ -997,7 +1005,9 @@ async function subparsers() {
         '    syntaxString(text.uppercase() + "!")', '}', '#compilerRegisterSubparser("shout", parseShout)', '',
         'fun main: int {', '    val s = $shout[hello]', '    println(s.size)', '    val t = s.foo.bar(1, 2)[3]', '    println(t)', '    val n: int = s', '    n + 1', '}', ''].join('\n') });
     s = await start(own, { mode: 'graph-v2' });
-    const notes = errors(await s.analyze());
+    const own_result = await s.analyze();
+    const notes = errors(own_result);
+    assert.equal(own_result.complete, true, 'a registration of the program is not a pending evaluation: ' + JSON.stringify(own_result.pending));
     assert.equal(notes.length, 1, JSON.stringify(notes));
     assert.equal(notes[0][1], 'W_SUBPARSER_NOT_EXPANDED');
     await s.close();
