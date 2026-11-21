@@ -19,8 +19,10 @@ emitted. Interrupted processes leave logs and samples; there is no resume mode.
 The runner is shell; the clock/child-process helper is Abla. One helper measures
 monotonic elapsed time around fork/exec/wait, redirecting output directly to files.
 No Python or Node is needed. The helper is built outside compile samples. Each
-compile/run queues independently on the shared fair-flock build slot (`BENCH_SLOT=4`)
-and uses a fixed CPU (`BENCH_CPU=24`). Queue time is outside the clock. The host
+program queues on the shared fair-flock build slot (`BENCH_SLOT=4`), retains its
+lease for that program's builds/runs, and releases it before the next program.
+Each hold is capped at 600 seconds; a cap failure aborts the result instead of
+publishing incomplete ratios. It uses a fixed CPU (`BENCH_CPU=24`). Queue time is outside the clock. The host
 remains shared: there is no isolated-core, fixed-frequency or cold-page-cache claim.
 Do not wrap an entire long run in a shared-slot lease; each operation releases it.
 Run long sessions under a user systemd unit so they survive an agent turn.

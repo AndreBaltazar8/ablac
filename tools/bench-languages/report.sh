@@ -3,7 +3,7 @@ set -euo pipefail
 file=$1
 printf '# Abla language benchmarks\n\n'
 jq -r '"Source `\(.metadata.sourceCommit)`. Smoke: \(.metadata.smoke). CPU \(.metadata.cpu), \(.metadata.rounds) runtime samples and \(.metadata.compileRounds) cold builds per arm. Status: \(.status)."' "$file"
-printf '\nRatios are language / C; smaller is less time/memory/size. Times are process wall seconds including the GNU-time launcher. Startup excludes that launcher and includes fork/exec/wait overhead. These are measurements on a shared machine, not isolated hardware.\n\n'
+printf '\nRatios are language / C; smaller is less time/memory/size. Finite-workload wall seconds include the GNU-time launcher. Startup excludes that launcher and includes fork/exec/wait overhead; HTTP uses oha elapsed time. These are measurements on a shared machine, not isolated hardware.\n\n'
 printf '| Program | Language | Wall s | /C | RSS MiB | /C | Stripped bytes | /C | Compile s | /C |\n|---|---|---:|---:|---:|---:|---:|---:|---:|---:|\n'
 jq -r '.programs|to_entries[]|.key as $p|.value.languages|to_entries[]|[$p,.key,(.value.wallSeconds.median|tostring),(.value.ratiosToC.wallSeconds|tostring),(.value.rssBytes.median/1048576|tostring),(.value.ratiosToC.rssBytes|tostring),(.value.strippedBytes|tostring),(.value.ratiosToC.strippedBytes|tostring),(.value.compileSeconds.median|tostring),(.value.ratiosToC.compileSeconds|tostring)]|"| "+join(" | ")+" |"' "$file"
 printf '\nCPU-workload geometric means (binary-trees, fannkuch, n-body, spectral-norm, mandelbrot, fasta only):\n\n'
