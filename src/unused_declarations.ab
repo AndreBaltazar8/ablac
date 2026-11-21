@@ -51,8 +51,11 @@ fun bootstrapUnusedMentionExpression(expression: BootstrapExpression, owner: int
     return
 }
 
-/** What `declaration` (and its methods) writes of other names: its types, conformances, annotations and bodies (not its own name). */
-fun bootstrapUnusedMentionDeclaration(declaration: BootstrapDeclaration, owner: int, var mentions: Map<string, int>): void {
+/** What `declaration` (and its methods, when `withMethods`) writes of other names: its types, conformances, annotations and bodies
+ *  (not its own name). */
+fun bootstrapUnusedMentionDeclaration(
+    declaration: BootstrapDeclaration, owner: int, var mentions: Map<string, int>, withMethods: bool = true
+): void {
     for (type in declaration.parameterTypes) bootstrapUnusedMention(type, owner, mentions)
     for (type in declaration.conformances) bootstrapUnusedMention(type, owner, mentions)
     for (type in declaration.typeParameters) bootstrapUnusedMention(type, owner, mentions)
@@ -64,8 +67,79 @@ fun bootstrapUnusedMentionDeclaration(declaration: BootstrapDeclaration, owner: 
     // `extend Square : Printable` names the type it extends.
     if (declaration.kind == "extend") bootstrapUnusedMention(declaration.name, owner, mentions)
     bootstrapUnusedMentionExpression(declaration.expression, owner, mentions)
-    for (method in declaration.methods) bootstrapUnusedMentionDeclaration(method, owner, mentions)
+    if (withMethods) for (method in declaration.methods) bootstrapUnusedMentionDeclaration(method, owner, mentions)
     return
+}
+
+/** The method and field names a class's users cannot do without: what an interface declares, and what the language itself calls. */
+fun bootstrapUnusedMemberProtocol(declarations: array<BootstrapDeclaration>): Map<string, bool> {
+    val names: Map<string, bool> = Map()
+    for (name in ["drop", "close", "toString", "equals", "hashCode", "compareTo", "iterator", "hasNext", "next", "get", "set",
+        "getValue", "setValue", "provideDelegate", "invoke", "contains", "init", "call", "copy", "write", "read", "size"]) names.set(name, true)
+    for (declaration in declarations) {
+        if (declaration.kind != "interface") continue
+        for (method in declaration.methods) names.set(method.name, true)
+    }
+    names
+}
+
+/** The members of a class nothing reads. A member is used when anything but itself names it (the name alone: another class's
+ *  member of that name counts too); a method that implements an interface, a name the language calls, an annotated method and a
+ *  field whose initializer calls something are left. Each method is its own mentioner, so a recursive method is not a use of itself. */
+fun bootstrapNoteUnusedMembers(
+    parsed: BootstrapParseResult,
+    hasMain: bool,
+    var found: array<BootstrapUnusedLocal>
+): void {
+    val declarations = parsed.declarations
+    val mentions: Map<string, int> = Map()
+    for (index in 0 until declarations.size) {
+        val declaration = declarations[index]
+        bootstrapUnusedMentionDeclaration(declaration, index * 65536, mentions, false)
+        for (method in 0 until declaration.methods.size) {
+            bootstrapUnusedMentionDeclaration(declaration.methods[method], index * 65536 + method + 1, mentions)
+        }
+    }
+    for (action in parsed.actions) bootstrapUnusedMentionExpression(action, -3, mentions)
+    val protocol = bootstrapUnusedMemberProtocol(declarations)
+    for (index in 0 until declarations.size) {
+        val owner = declarations[index]
+        if (owner.kind != "class" || bootstrapUnusedDeclarationExempt(owner)) continue
+        if (!hasMain && !owner.isPrivate) continue
+        val ownerName = bootstrapUnusedWritten(owner.name)
+        if (ownerName.startsWith("_")) continue
+        val scope = if (owner.isPrivate) "private " else ""
+        for (method in 0 until owner.methods.size) {
+            val member = owner.methods[method]
+            val field = member.kind == "val" || member.kind == "var"
+            if (member.kind != "fun" && !field) continue
+            if (bootstrapUnusedDeclarationExempt(member) || member.name.startsWith("_") || member.name.contains("__")) continue
+            if (protocol.has(member.name)) continue
+            if (field && bootstrapUnusedDeclarationCalls(member.expression)) continue
+            val mentioned = mentions.get(member.name)
+            if (mentioned != null && mentioned != index * 65536 + method + 1) continue
+            found.append(BootstrapUnusedLocal(
+                "abla:${bootstrapSourceKey(member.sourceIdentity)}:${member.begin}:declaration:${owner.name}.${member.name}",
+                "$ownerName.${member.name}", member.sourceIdentity, member.begin, member.end,
+                "$scope${if (field) "field" else "method"}"))
+        }
+        for (parameter in 0 until owner.parameters.size) {
+            val name = owner.parameters[parameter]
+            if (!bootstrapIrIsField(owner, parameter) || name.startsWith("_") || protocol.has(name)) continue
+            if (mentions.has(name)) continue
+            found.append(BootstrapUnusedLocal(
+                "abla:${bootstrapSourceKey(owner.sourceIdentity)}:${owner.begin}:declaration:${owner.name}.${name}",
+                "$ownerName.$name", owner.sourceIdentity, owner.begin, owner.end, "${scope}field"))
+        }
+    }
+    return
+}
+
+/** A declaration's name as written: a private name carries its module's prefix (`__abla_module_<hex of the path>__`). */
+fun bootstrapUnusedWritten(name: string): string {
+    if (!name.startsWith("__abla_module_")) return name
+    val end = name.indexOf("__", 14)
+    if (end >= 0) name.slice(end + 2, name.size) else name
 }
 
 /** Records the unused declarations of `parsed` (see bootstrapUnusedDeclarationList): `shadowed` and `implicitNames` are the
@@ -138,11 +212,7 @@ fun bootstrapNoteUnusedDeclarations(
         if (referenced[index] || bootstrapUnusedDeclarationExempt(declaration)) continue
         // A private name carries its module's prefix (bootstrapAppendPrivateNames): the name as written is what is reported.
         // (`__abla_module_<hex of the path>__`: the hex has no underscore.)
-        var written = declaration.name
-        if (written.startsWith("__abla_module_")) {
-            val end = written.indexOf("__", 14)
-            if (end >= 0) written = written.slice(end + 2, written.size)
-        }
+        val written = bootstrapUnusedWritten(declaration.name)
         if (written.startsWith("_")) continue
         if (!isType && declaration.kind != "fun" && declaration.kind != "val" && declaration.kind != "var") continue
         if (!hasMain && !declaration.isPrivate) continue
@@ -152,5 +222,6 @@ fun bootstrapNoteUnusedDeclarations(
             written, declaration.sourceIdentity, declaration.begin, declaration.end,
             (if (declaration.isPrivate) "private " else "") + (if (declaration.kind == "fun") "function" else if (isType) declaration.kind else "value")))
     }
+    bootstrapNoteUnusedMembers(parsed, hasMain, bootstrapUnusedDeclarationList)
     return
 }
