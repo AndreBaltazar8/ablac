@@ -93,3 +93,8 @@ busy host. `report.md` includes ratios **language/C** (smaller is less time/spac
 with a geometric mean over the six scalar CPU rows only. JSON, regex, startup and
 HTTP never enter that geometric mean. Do not interpret a smoke run as performance
 evidence: it only proves that build, execution, validation and reporting connect.
+
+The first completed local baseline is archived in
+[the c2e0a4b2 report](../../docs/measurements/languages-c2e0a4b2.md), with all raw
+samples and provenance. It predates batch EF and v0.2.65; its locally rebuilt
+compiler reporting 0.2.64 is identified by source commit and binary hash.
