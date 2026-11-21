@@ -1,0 +1,214 @@
+import "module.ab"
+import "module_paths.ab"
+import "package.ab"
+import "package_catalog.ab"
+import "package_info.ab"
+import "abla/sys/linux"
+import "abla/sys/linux/fs"
+import "abla/sys/linux/io"
+import "abla/sys/linux/process"
+import "abla/text"
+
+private class BootstrapPackageAddInfo(
+    val name: string, val revision: string, val manifest: string, val error: string = ""
+)
+
+private fun bootstrapPackageAddError(message: string): int {
+    linuxPrintStandardError("error[E_PACKAGE_ADD]: $message\n")
+    1
+}
+
+private fun bootstrapPackageAddInfo(url: string, tag: string, directory: string): BootstrapPackageAddInfo {
+    val repoDir = "$directory/package.git"
+    if (tag != "") {
+        val check = bootstrapPackageLookupGit(directory)
+        check.argument("check-ref-format")
+        check.argument("refs/tags/$tag")
+        if (!bootstrapPackageStringSafe(tag) || check.run() != 0) {
+            return BootstrapPackageAddInfo("", "", "", "invalid Git tag")
+        }
+    }
+    if (!bootstrapPackageLookupClone(directory, url, repoDir, false)) {
+        return BootstrapPackageAddInfo("", "", "", "could not read the GitHub repository")
+    }
+    var ref = "HEAD"
+    if (tag != "") {
+        val fetch = bootstrapPackageLookupGit(repoDir)
+        fetch.argument("fetch")
+        fetch.argument("--quiet")
+        fetch.argument("--depth=1")
+        fetch.argument("--no-tags")
+        fetch.argument("origin")
+        fetch.argument("refs/tags/$tag")
+        if (fetch.run() != 0) return BootstrapPackageAddInfo("", "", "", "could not fetch tag '$tag'")
+        ref = "FETCH_HEAD"
+    }
+    val revision = bootstrapPackageLookupRevision(repoDir, ref)
+    if (revision == "") return BootstrapPackageAddInfo("", "", "", "could not resolve the selected Git commit")
+    val manifest = bootstrapPackageLookupManifest(repoDir, revision)
+    if (manifest.status != 0) {
+        return BootstrapPackageAddInfo("", "", "", "could not read abla.toml at the selected Git commit")
+    }
+    val name = bootstrapPackageInfoField(manifest.output, "name")
+    if (!bootstrapPackageNameValid(name)) {
+        return BootstrapPackageAddInfo("", "", "", "selected abla.toml has no valid package name")
+    }
+    BootstrapPackageAddInfo(name, revision, manifest.output)
+}
+
+private fun bootstrapPackageAddModule(projectRoot: string, relative: string): string {
+    if (!bootstrapPackageRelativePathValid(relative) || !relative.endsWith(".ab")) return ""
+    val parts = relative.split("/")
+    var path = Path(projectRoot)
+    var index = 0
+    while (index < parts.size) {
+        path = path.child(parts[index])
+        val info = path.linkInfo()
+        if (index + 1 == parts.size) {
+            if (!info.isFile()) return ""
+        } else if (!info.isDirectory()) return ""
+        index = index + 1
+    }
+    path.text
+}
+
+private fun bootstrapPackageAddLine(repository: string, url: string, name: string, tag: string): string {
+    if (tag == "" && repository.split("/")[1] == name) return "import github(\"$repository\")"
+    if (tag == "") return "import gitImportSource(\"$name\", \"$url\", \"head\", \"HEAD\")"
+    val escaped = tag.replace("\$", "\\\$")
+    "import gitImportSource(\"$name\", \"$url\", \"tag\", \"$escaped\")"
+}
+
+private fun bootstrapPackageAddLocked(
+    project: BootstrapProjectDescriptor, relative: string, repository: string, tag: string
+): int {
+    val module = bootstrapPackageAddModule(project.root, relative)
+    if (module == "") return bootstrapPackageAddError("choose an existing .ab file inside the project")
+    val source = Path(module)
+    val old = source.readTextResult()
+    if (!old.succeeded) return bootstrapPackageAddError("could not read '$module'")
+    val lockPath = Path(project.root).child("abla.lock")
+    val lockInfo = lockPath.linkInfo()
+    if (lockInfo.exists() && !lockInfo.isFile()) {
+        return bootstrapPackageAddError("abla.lock must be a regular file")
+    }
+    val lockBefore = lockPath.readText()
+    val lock = if (lockInfo.exists()) bootstrapPackageReadLock(lockPath.text)
+        else BootstrapPackageLock([], true, "")
+    if (!lock.valid) {
+        linuxPrintStandardError(lock.diagnostic)
+        return 1
+    }
+    val before = bootstrapPackageDiscoverImportProviders(project.entry)
+    if (before.errors != 0) {
+        linuxPrintStandardError(before.diagnostic)
+        return 1
+    }
+
+    val directory = bootstrapPackageLookupTemporary()
+    if (directory == "") return bootstrapPackageAddError("could not create a temporary directory")
+    val url = "https://github.com/$repository.git"
+    val info = bootstrapPackageAddInfo(url, tag, directory)
+    bootstrapPackageRemoveTree(directory)
+    if (info.error != "") return bootstrapPackageAddError(info.error)
+    val ref = if (tag == "") "default branch" else "tag $tag"
+    bootstrapPackageInfoPrint(info.name, url, ref, info.revision, info.manifest)
+
+    if (bootstrapPackageLockIndex(lock.packages, info.name) >= 0 ||
+        bootstrapPackageDependencyIndex(before.values, info.name) >= 0) {
+        return bootstrapPackageAddError("'${info.name}' is already a dependency")
+    }
+    val line = bootstrapPackageAddLine(repository, url, info.name, tag)
+    val proposed = "$line\n${old.text}"
+    val after = bootstrapPackageDiscoverImportProviders(project.entry, false, 0, module, proposed)
+    if (after.errors != 0) {
+        linuxPrintStandardError(after.diagnostic)
+        return 1
+    }
+    val index = bootstrapPackageDependencyIndex(after.values, info.name)
+    if (index < 0 || after.values[index].source != url) {
+        return bootstrapPackageAddError("'$relative' is not imported by the project entry")
+    }
+
+    val packages: array<BootstrapLockedPackage> = []
+    for (package in lock.packages) packages.append(package)
+    val resolved = bootstrapPackageResolveOne(after.values[index], packages, [],
+        bootstrapPackageAuthorizedEffects(project.root), info.revision)
+    if (resolved.status != 0) {
+        linuxPrintStandardError(resolved.diagnostic)
+        return 1
+    }
+    val checked = bootstrapPackagePrepareWithLock(project.root, after,
+        BootstrapPackageLock(packages, true, ""), false)
+    if (checked.status != 0) {
+        linuxPrintStandardError(checked.diagnostic)
+        return 1
+    }
+
+    // Resolution can involve network I/O. Detect a user or another tool
+    // changing the inputs before publishing either of the proposed files.
+    if (!source.linkInfo().isFile() || source.readText() != old.text ||
+        lockPath.linkInfo().isFile() != lockInfo.isFile() ||
+        lockPath.linkInfo().exists() != lockInfo.exists() || lockPath.readText() != lockBefore) {
+        return bootstrapPackageAddError("the module or lockfile changed during package add")
+    }
+    if (!source.writeTextAtomic(proposed)) return bootstrapPackageAddError("could not write '$relative'")
+    if (!bootstrapPackageWriteLock(lockPath.text, packages)) {
+        if (!source.writeTextAtomic(old.text)) {
+            return bootstrapPackageAddError("could not write abla.lock or restore '$relative'")
+        }
+        return bootstrapPackageAddError("could not write abla.lock")
+    }
+    linuxPrintStandardOutput("Added to $relative:\n$line\n")
+    0
+}
+
+private fun bootstrapPackageAdd(repository: string, tag: string, root: string, chosen: string): int {
+    val absolute = if (root.startsWith("/")) root else "${currentDirectory().text}/$root"
+    val project = bootstrapProjectDescriptor(bootstrapNormalizeModulePath(absolute))
+    if (!project.valid) return bootstrapPackageAddError(project.diagnostic)
+    var relative = chosen
+    if (relative == "") {
+        val manifest = Path(project.root).child("abla.toml")
+        relative = bootstrapTomlStringField(manifest.text, "entry")
+        if (relative == "") relative = "src/main.ab"
+    }
+    val state = Path(project.root).child(".abla")
+    if (!state.createDirectories()) return bootstrapPackageAddError("could not open project package state")
+    val guard = state.child("package-add.lock").fileLock()
+    if (!guard.tryHold()) {
+        if (guard.descriptor >= 0) LinuxFileDescriptor(guard.descriptor).close()
+        return bootstrapPackageAddError("another package add is running or the project lock is unavailable")
+    }
+    val result = bootstrapPackageAddLocked(project, relative, repository, tag)
+    LinuxFileDescriptor(guard.descriptor).close()
+    result
+}
+
+private fun bootstrapPackageAddUsage(): int {
+    linuxPrintStandardError("usage: ablac package add <owner/repo> [--tag <tag>] [--project <dir>] [--module <file.ab>]\n")
+    2
+}
+
+fun bootstrapPackageAddCommand(): int {
+    val count = linuxArgumentCount()
+    if (count < 3) return bootstrapPackageAddUsage()
+    val repository = linuxArgument(2)
+    if (!packageCatalogRepositoryValid(repository)) return bootstrapPackageAddUsage()
+    var root = ""
+    var tag = ""
+    var module = ""
+    var index = 3
+    while (index < count) {
+        if (index + 1 >= count) return bootstrapPackageAddUsage()
+        val option = linuxArgument(index)
+        val value = linuxArgument(index + 1)
+        if (value == "" || value.startsWith("--")) return bootstrapPackageAddUsage()
+        if (option == "--project" && root == "") root = value
+        else if (option == "--tag" && tag == "") tag = value
+        else if (option == "--module" && module == "") module = value
+        else return bootstrapPackageAddUsage()
+        index = index + 2
+    }
+    bootstrapPackageAdd(repository, tag, if (root == "") "." else root, module)
+}

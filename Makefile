@@ -595,6 +595,7 @@ test-serial: ablac
 	tools/test-emit-reachable.sh $(COMPILER)
 	tools/test-package-subpaths.sh $(COMPILER)
 	tools/test-package-install.sh $(COMPILER)
+	tools/test-package-add.sh $(COMPILER)
 	tools/test-package-info.sh $(COMPILER)
 	tools/test-package-outdated.sh $(COMPILER)
 	tools/test-package-search.sh $(COMPILER)

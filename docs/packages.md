@@ -56,6 +56,14 @@ comes from the manifest at that tag. Non-Git providers are skipped. The
 command reads `abla.lock` and uses temporary Git repositories. It does not
 edit the lock or install packages.
 
+To add a GitHub dependency, run `ablac package add owner/repo` in an
+existing project. The command shows the selected manifest, adds an import
+to the entry module, and pins that revision in `abla.lock` along with any
+new transitive dependencies. Existing pins keep their revisions. Use
+`--tag <tag>` to select a release, `--project <dir>` to select another
+project, or `--module src/example.ab` to put the import in an existing
+module reached by the project entry. Commit the module and lockfile together.
+
 ## The source protocol
 
 The provider-facing structures are:
