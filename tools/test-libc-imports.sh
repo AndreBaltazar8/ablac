@@ -88,6 +88,29 @@ for program in tests/cases/libc-imports/*.ab; do
         fi
     done
 done
+# A coverage build (--coverage-functions) is as libc-free as the program: the runtime's file, string and signal work is system calls and two
+# internal helpers (src/backend/llvm/coverage.ab), not getenv, strstr, snprintf, open, write, rename; and it still writes its report.
+for name in hello tasks; do
+    for mode in release fast; do
+        flags=(--no-cache --coverage-functions)
+        [[ $mode == fast ]] && flags+=(--fast)
+        binary=$out/$name.coverage.$mode
+        if ! "$compiler" build "tests/cases/libc-imports/$name.ab" -o "$binary" "${flags[@]}" >"$binary.log" 2>&1; then
+            echo "libc imports: $name with coverage ($mode) did not build:" >&2
+            tail -n 20 "$binary.log" >&2
+            exit 1
+        fi
+        if readelf -lW "$binary" | grep INTERP >/dev/null || readelf -dW "$binary" 2>/dev/null | grep NEEDED >/dev/null ||
+            [[ -n $("$nm" --undefined-only "$binary" 2>/dev/null) ]]; then
+            echo "libc imports: $name.coverage.$mode links libc (a coverage build should not):" >&2
+            "$nm" --undefined-only "$binary" 2>&1 | head -10 >&2
+            exit 1
+        fi
+        rm -f "$binary.report"
+        ABLA_COVERAGE_OUT="$binary.report" "$binary" >/dev/null 2>&1 || true
+        [[ -s $binary.report ]] || { echo "libc imports: $name.coverage.$mode wrote no coverage report" >&2; exit 1; }
+    done
+done
 # A program that imports abla/http without a TLS connection links no OpenSSL.
 if ! "$compiler" build tests/cases/libc-imports-http/main.ab -o "$out/http-plain" --no-cache >"$out/http-plain.log" 2>&1; then
     echo "libc imports: tests/cases/libc-imports-http did not build:" >&2

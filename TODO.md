@@ -69,8 +69,9 @@ float-remainder, strings-arrays, files, tasks, threads and tls-http.
 | `strlen` | | | yes | argv decoding (`functions.ab:5529`, 7106) |
 
 Link flags: `-pthread` (`src/toolchain.ab:4273`), `-lm` always (4371; LLVM lowers floor, ceil,
-trunc and round to libm without SSE4.1). Coverage builds add `strstr`, `snprintf`, `open` and
-`rename` (`src/backend/llvm/coverage.ab`). Not yet covered by the test: the native `-l` libraries a
+trunc and round to libm without SSE4.1). (That was the 2026-11-12 inventory: a coverage build on x86-64 and AArch64 Linux has used
+system calls and two internal helpers since, `src/backend/llvm/coverage.ab`; `test-libc-imports.sh` now builds hello and tasks with
+`--coverage-functions` release and `--fast`, and fails on an import or a missing report.) Not yet covered by the test: the native `-l` libraries a
 program names, and `abla/crypto/hosted` (libcrypto EVP through the manifest's nativeLibraries).
 
 The compiler no longer links libssl or libcrypto: the compile-time evaluator's TLS (`src/ct_native.ab:28` imports
