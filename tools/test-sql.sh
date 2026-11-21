@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Quoted PostgreSQL subset: runtime bindings, compile-time rejection, and editor expansion.
+# PostgreSQL subset: runtime bindings, compile-time rejection, and editor expansion.
 set -euo pipefail
 compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
@@ -8,7 +8,7 @@ export ABLA_SYSROOT="$root"
 cd "$root"
 out="$root/build/sql-test"
 mkdir -p "$out"
-for name in smoke values grammar bounds stable; do
+for name in smoke values grammar bounds stable brace; do
     "$compiler" build "tests/cases/sql/$name.ab" -o "$out/$name" --fast --no-cache
     "$out/$name"
 done
@@ -111,5 +111,21 @@ compile fun badSqlPart(cursor: ParserCursor): SyntaxExpression {
 #compilerRegisterSubparser("badpart", badSqlPart)
 fun main: int { val bad = $badpart("a${"literal"}b"); 0 }
 ABLA
-printf 'sql: 6 runtime checks, %s rejection checks passed\n' "$rejected"
+reject brace_cast "each SQL value hole needs" <<'ABLA'
+fun main: int { val q = $sql { SELECT ${1} }; 0 }
+ABLA
+reject brace_identifier "SQL at template byte" <<'ABLA'
+fun main: int { val q = $sql { SELECT * FROM ${"table"}::text }; 0 }
+ABLA
+reject brace_manual "manual positional parameters" <<'ABLA'
+fun main: int { val q = $sql { SELECT $1::integer, ${2}::integer }; 0 }
+ABLA
+reject brace_type "ablaSqlBindInteger" <<'ABLA'
+fun main: int { val q = $sql { SELECT ${"wrong"}::integer }; 0 }
+ABLA
+reject brace_unterminated "unterminated SQL brace literal" <<'ABLA'
+val q = $sql { SELECT 1
+ABLA
+
+printf 'sql: 7 runtime checks, %s rejection checks passed\n' "$rejected"
 ANALYSIS_TEST_FILTER=sql node tests/analysis-graph/session.mjs "$compiler"

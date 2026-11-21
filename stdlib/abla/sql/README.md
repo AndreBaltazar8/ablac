@@ -6,6 +6,17 @@ val id = "00000000-0000-0000-0000-000000000001"
 val statement = $sql("SELECT id FROM users WHERE id=${id}::uuid AND active=${true}::boolean")
 ```
 
+The brace form accepts SQL directly, including double quotes and dollar quotes.
+Both forms bind Abla expressions the same way.
+
+```abla
+import "abla/sql"
+val id = "00000000-0000-0000-0000-000000000001"
+val statement = $sql {
+    SELECT "order" FROM users WHERE id = ${id}::uuid
+}
+```
+
 The compiler checks one PostgreSQL statement from the supported subset. Each
 `${expression}` becomes a numbered placeholder and a separate text-format
 parameter. The original Abla string interpolation never runs. Expressions run
@@ -14,9 +25,11 @@ to interpolated literal strings such as `${"hello"}`.
 
 Every value hole requires an immediate `::type` cast (whitespace is permitted).
 Identifiers and SQL syntax must be constant text. Handwritten `$1` parameters
-and holes inside SQL strings, identifiers, dollar quotes or comments fail.
-Use ordinary Abla string escapes for SQL double quotes, newlines and literal
-dollar signs: `$sql("SELECT \$json\${\"n\":1}\$json\$::jsonb")`.
+are rejected. In the quoted form, a host interpolation inside a SQL string,
+identifier, dollar quote or comment is an error. Use Abla escapes for SQL
+double quotes, newlines and literal dollar signs in that form. In the brace
+form, those SQL atoms are opaque. Their contents are preserved verbatim,
+including any dollar signs, braces or interpolation-like text.
 
 | PostgreSQL cast | Accepted Abla values, also nullable |
 | --- | --- |
@@ -55,5 +68,4 @@ certify arbitrary text. Typed rows and schema declarations are deferred.
 
 The provider is pure compile-time Abla. Editor analysis expands it as a trusted
 stdlib provider, reports syntax/type errors and types the resulting statement.
-Compiler-only parser code is removed from runtime programs. Brace-form SQL is
-deferred until generic raw-provider lexical isolation is available.
+Compiler-only parser code is removed from runtime programs.

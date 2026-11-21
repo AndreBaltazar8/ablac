@@ -1025,6 +1025,13 @@ async function sqlSubparsers() {
         text: 'import "abla/sql"\nfun main: int { val q = $sql("SELECT ${true}::uuid"); 0 }\n' });
     notes = errors(await s.analyze());
     assert.ok(notes.length > 0 && !notes.some(n => n[1] === 'W_SUBPARSER_NOT_EXPANDED'), JSON.stringify(notes));
+    await s.rpc('document/change', { uri: uri(path.join(project, 'main.ab')), version: 3,
+        text: 'import "abla/sql"\nfun main: int {\n  val q = $sql { SELECT $json$ } " $json$ AS body, 1::integer }\n  q.parameters.size\n}\n' });
+    noErrors(await s.analyze());
+    await s.rpc('document/change', { uri: uri(path.join(project, 'main.ab')), version: 4,
+        text: 'import "abla/sql"\nfun main: int { val q = $sql { SELECT FROM t }; 0 }\n' });
+    notes = errors(await s.analyze());
+    assert.ok(notes.some(n => n[1] === 'E_SUBPARSER_FAILURE' && n[2].includes('SQL')), JSON.stringify(notes));
     await s.close();
 }
 
