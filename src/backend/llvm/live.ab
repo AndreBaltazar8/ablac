@@ -71,6 +71,8 @@ var bootstrapLlvmLivePendingSources: array<int> = []
 // function moved to a new symbol.
 var bootstrapLlvmLiveTaken: Map<string, int> = Map()
 var bootstrapLlvmLivePendingTaken: array<string> = []
+// A reload's class layouts, the program's once it applies (classes it adds; bootstrapLlvmLiveApplied).
+var bootstrapLlvmLivePendingClasses = ""
 var bootstrapLlvmLivePendingMovedLabels: array<string> = []
 var bootstrapLlvmLivePendingMovedSymbols: array<string> = []
 // What a reload that applies says about each function that moved (live_watch.ab prints them under --watch).
@@ -192,33 +194,34 @@ fun bootstrapLlvmLiveSourceHashes(program: BootstrapIrProgram, functions: array<
     hashes
 }
 
-// The program's classes as one text: each one's name, id, fields, their places and its size, in order.
+// The program's classes as one text: each one's name, fields, their places and its size, a line each. Not its id:
+// that is only its place among this compile's classes (ir.ab), which a class added before it moves; the code and the
+// runtime know a class by its name's stable id and its descriptor (functions.ab, bootstrapLlvmClassDescriptor).
 fun bootstrapLlvmLiveClassLayouts(program: BootstrapIrProgram): string {
     var text = ""
     for (type in program.classes) {
         text = text +
-            "${type.name} ${type.id} ${type.fields.join(",")} ${bootstrapLlvmLiveJoinInts(type.fieldPlaces)} ${type.size}\n"
+            "${type.name} ${type.fields.join(",")} ${bootstrapLlvmLiveJoinInts(type.fieldPlaces)} ${type.size}\n"
     }
     text
 }
 
-// The first class whose layout differs between two class texts, for the refusal.
+// The first class of `before` (the running code's) that `after` lays out otherwise or no longer has, for the
+// refusal; "" when each is as it was. A class only `after` has is new: the running code made none of it.
 fun bootstrapLlvmLiveLayoutChange(before: string, after: string): string {
-    val earlier = before.split("\n")
-    val later = after.split("\n")
-    var line = 0
-    while (line < earlier.size || line < later.size) {
-        val was = if (line < earlier.size) earlier[line] else ""
-        val now = if (line < later.size) later[line] else ""
-        if (was != now) {
-            val name = (if (now != "") now else was).split(" ")[0]
-            return if (was == "") "class $name was added" else if (now ==
-                "") "class ${was.split(" ")[0]} was removed"
-                else "class $name changed"
-        }
-        line = line + 1
+    val now: Map<string, string> = Map()
+    for (line in after.split("\n")) {
+        if (line != "") now.set(line.split(" ")[0], line)
     }
-    "the classes changed"
+    for (line in before.split("\n")) {
+        if (line != "") {
+            val name = line.split(" ")[0]
+            val found = now.get(name)
+            if (found == null) return "class $name was removed"
+            if (found != line) return "class $name changed"
+        }
+    }
+    ""
 }
 
 fun bootstrapLlvmLiveJoinInts(values: array<int>): string {
@@ -250,6 +253,7 @@ trusted fun bootstrapLlvmLiveIndirect(
     bootstrapLlvmLiveRefusals = []
     bootstrapLlvmLiveKept = []
     bootstrapLlvmLivePendingTaken = []
+    bootstrapLlvmLivePendingClasses = ""
     bootstrapLlvmLivePendingMovedLabels = []
     bootstrapLlvmLivePendingMovedSymbols = []
     bootstrapLlvmLivePendingMovedNames = []
@@ -388,9 +392,11 @@ trusted fun bootstrapLlvmLiveIndirect(
     if (generation == 0) {
         bootstrapLlvmLiveClasses = layouts
     } else if (layouts != bootstrapLlvmLiveClasses) {
-        bootstrapLlvmLiveRefusals.append(
-            "E_LIVE_LAYOUT: ${bootstrapLlvmLiveLayoutChange(bootstrapLlvmLiveClasses, layouts)}: instances made by the running code keep the old layout"
-        )
+        val change = bootstrapLlvmLiveLayoutChange(bootstrapLlvmLiveClasses, layouts)
+        if (change != "") {
+            bootstrapLlvmLiveRefusals.append(
+                "E_LIVE_LAYOUT: $change: instances made by the running code keep the old layout")
+        } else bootstrapLlvmLivePendingClasses = layouts
     }
     // A reload's entries whose code changed though their source did not (E_LIVE_CALLER, below), and the
     // functions whose source the edit changed.
@@ -713,6 +719,8 @@ trusted fun bootstrapLlvmLiveCut(module: i64*): void {
 fun bootstrapLlvmLiveApplied(): void {
     bootstrapLlvmLiveLambdaApplied()
     for (symbol in bootstrapLlvmLivePendingTaken) bootstrapLlvmLiveTaken.set(symbol, 1)
+    // The classes it added are the running code's now: a later change of one is refused as any other's.
+    if (bootstrapLlvmLivePendingClasses != "") bootstrapLlvmLiveClasses = bootstrapLlvmLivePendingClasses
     // A function that moved is known by its new symbol from now on: a later change compares with it.
     var moving = 0
     while (moving < bootstrapLlvmLivePendingMovedLabels.size) {
@@ -757,7 +765,7 @@ fun bootstrapLlvmLiveApplied(): void {
 // live run that starts from the object cache can still reload: one line per table entry, named function,
 // definition and class, and the table's size.
 fun bootstrapLlvmLiveRecordText(): string {
-    var text = "abla-live 3\nsize\t$bootstrapLlvmLiveTableSize\n"
+    var text = "abla-live 4\nsize\t$bootstrapLlvmLiveTableSize\n"
     var slot = 0
     while (slot < bootstrapLlvmLiveHashes.size) {
         text = text +
@@ -783,7 +791,7 @@ fun bootstrapLlvmLiveRecordText(): string {
 // Restores the record from its text; false (and nothing restored) when it is not one.
 fun bootstrapLlvmLiveRecordLoad(text: string): bool {
     val lines = text.split("\n")
-    if (lines.size == 0 || lines[0] != "abla-live 3") return false
+    if (lines.size == 0 || lines[0] != "abla-live 4") return false
     bootstrapLlvmLiveReset()
     bootstrapLlvmLiveLambdaReset()
     var size = -1

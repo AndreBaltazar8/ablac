@@ -67,6 +67,11 @@ if ((live)); then
     # :type names an expression's type without running it (the println does not print).
     printf 'val xs = [1, 2]\n:type xs\n:type 1.5 * 2.0\n:type println("ran")\n:type\n:type nope\n:quit\n' | session types 300 &
     types=$!
+    # Classes: one added applies (and a function taking it), a change of its fields is refused with the instance made
+    # before still working, and another class is added after.
+    printf 'class P(val a: int)\nP(4).a\nfun twice(p: P): int = p.a * 2\ntwice(P(5))\nval kept = P(7)\nclass P(val a: int, val b: int = 0)\nkept.a\nclass Q(val name: string)\nQ("q").name\n:quit\n' |
+        session classes 300 &
+    classes=$!
 fi
 wait "$recovery"
 wait "$definitions"
@@ -89,6 +94,10 @@ if ((live)); then
         grep -q '^:type needs an expression' "$base.types.err" && grep -q 'identifier:nope' "$base.types.err" &&
         grep -q '^  --> entry:1:1$' "$base.types.err" && ! grep -q 'generic.cannot-infer' "$base.types.err" ||
         { echo 'repl (types): :type did not name a type, or ran the expression' >&2; cat "$base.types.out" "$base.types.err" >&2; exit 1; }
+    wait "$classes"
+    [[ $(< "$base.classes.out") == $'abla> defined\nabla> 4\nabla> defined\nabla> 10\nabla> defined\nabla> abla> 7\nabla> defined\nabla> q\nabla> ' ]] &&
+        grep -q 'E_LIVE_LAYOUT: class P changed' "$base.classes.err" ||
+        { echo 'repl (classes): a class could not be added, or a changed one was not refused' >&2; cat "$base.classes.out" "$base.classes.err" >&2; exit 1; }
 fi
 
 [[ $(< "$base.recovery.out") == $'abla> abla> 41\nabla> 42\nabla> ' ]] || exit 1
@@ -151,4 +160,4 @@ if script --version 2>/dev/null | grep util-linux >/dev/null; then
     editor=checked
 fi
 
-printf '%s\n' "persistent REPL: retained definitions + recovery + reclaimed JIT generations + entries over several lines + commands + diagnostics placed in the entry + line editor ($editor); live: state across lines, a contained panic, a refused redefinition, :type"
+printf '%s\n' "persistent REPL: retained definitions + recovery + reclaimed JIT generations + entries over several lines + commands + diagnostics placed in the entry + line editor ($editor); live: state across lines, a contained panic, a refused redefinition, :type, classes added (a changed one refused)"
