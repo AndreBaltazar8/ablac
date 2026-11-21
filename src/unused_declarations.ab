@@ -26,6 +26,48 @@ fun bootstrapUnusedDeclarationCalls(expression: BootstrapExpression): bool {
     false
 }
 
+/** Every identifier of `text` is mentioned by declaration `owner` (-3: the program's top-level actions): the first mentioner is
+ *  kept, and -2 once two differ. A type is used when something other than its own declaration mentions its name. */
+fun bootstrapUnusedMention(text: string, owner: int, var mentions: Map<string, int>): void {
+    var index = 0
+    while (index < text.size) {
+        val byte = text[index]
+        if (((byte >= 65 && byte <= 90) || byte == 95 || (byte >= 97 && byte <= 122))) {
+            val begin = index
+            while (index < text.size && ((text[index] >= 48 && text[index] <= 57) || (text[index] >= 65 && text[index] <= 90) ||
+                text[index] == 95 || (text[index] >= 97 && text[index] <= 122))) index = index + 1
+            val name = text.slice(begin, index)
+            val known = mentions.get(name)
+            if (known == null) mentions.set(name, owner)
+            else if (known != owner && known != -2) mentions.set(name, -2)
+        } else index = index + 1
+    }
+    return
+}
+
+fun bootstrapUnusedMentionExpression(expression: BootstrapExpression, owner: int, var mentions: Map<string, int>): void {
+    bootstrapUnusedMention(expression.text, owner, mentions)
+    for (child in expression.children) bootstrapUnusedMentionExpression(child, owner, mentions)
+    return
+}
+
+/** What `declaration` (and its methods) writes of other names: its types, conformances, annotations and bodies (not its own name). */
+fun bootstrapUnusedMentionDeclaration(declaration: BootstrapDeclaration, owner: int, var mentions: Map<string, int>): void {
+    for (type in declaration.parameterTypes) bootstrapUnusedMention(type, owner, mentions)
+    for (type in declaration.conformances) bootstrapUnusedMention(type, owner, mentions)
+    for (type in declaration.typeParameters) bootstrapUnusedMention(type, owner, mentions)
+    for (annotation in declaration.annotations) bootstrapUnusedMention(annotation, owner, mentions)
+    for (argument in declaration.annotationArguments) bootstrapUnusedMentionExpression(argument, owner, mentions)
+    for (fallback in declaration.parameterDefaults) bootstrapUnusedMentionExpression(fallback, owner, mentions)
+    bootstrapUnusedMention(declaration.resultType, owner, mentions)
+    bootstrapUnusedMention(declaration.extensionOwner, owner, mentions)
+    // `extend Square : Printable` names the type it extends.
+    if (declaration.kind == "extend") bootstrapUnusedMention(declaration.name, owner, mentions)
+    bootstrapUnusedMentionExpression(declaration.expression, owner, mentions)
+    for (method in declaration.methods) bootstrapUnusedMentionDeclaration(method, owner, mentions)
+    return
+}
+
 /** Records the unused declarations of `parsed` (see bootstrapUnusedDeclarationList): `shadowed` and `implicitNames` are the
  *  analysis's (locals named like a global; calls lowering inserts). Whether a declaration is public is the module's to say:
  *  in a build with a `main` every declaration nothing refers to is reported (bootstrapUnusedDeclarationWarnings drops the public
@@ -80,9 +122,19 @@ fun bootstrapNoteUnusedDeclarations(
         bootstrapCollectSourceReachability(action, declarations, functions, types, values, methods, scratch, pending, "", shadowed)
     }
     for (reached in pending) referenced[reached] = true
+    // The types: one named by anything but its own declaration (a parameter, result or field type, an `is`, an annotation, a string
+    // naming it to compile-time reflection, an extension) is used.
+    val mentions: Map<string, int> = Map()
+    for (index in 0 until declarations.size) bootstrapUnusedMentionDeclaration(declarations[index], index, mentions)
+    for (action in parsed.actions) bootstrapUnusedMentionExpression(action, -3, mentions)
     bootstrapUnusedDeclarationList = []
     for (index in 0 until declarations.size) {
         val declaration = declarations[index]
+        val isType = declaration.kind == "class" || declaration.kind == "interface" || declaration.kind == "type"
+        if (isType) {
+            val mentioned = mentions.get(declaration.name)
+            referenced[index] = mentioned != null && mentioned != index
+        }
         if (referenced[index] || bootstrapUnusedDeclarationExempt(declaration)) continue
         // A private name carries its module's prefix (bootstrapAppendPrivateNames): the name as written is what is reported.
         // (`__abla_module_<hex of the path>__`: the hex has no underscore.)
@@ -92,13 +144,13 @@ fun bootstrapNoteUnusedDeclarations(
             if (end >= 0) written = written.slice(end + 2, written.size)
         }
         if (written.startsWith("_")) continue
-        if (declaration.kind != "fun" && declaration.kind != "val" && declaration.kind != "var") continue
+        if (!isType && declaration.kind != "fun" && declaration.kind != "val" && declaration.kind != "var") continue
         if (!hasMain && !declaration.isPrivate) continue
-        if (declaration.kind != "fun" && bootstrapUnusedDeclarationCalls(declaration.expression)) continue
+        if (!isType && declaration.kind != "fun" && bootstrapUnusedDeclarationCalls(declaration.expression)) continue
         bootstrapUnusedDeclarationList.append(BootstrapUnusedLocal(
             "abla:${bootstrapSourceKey(declaration.sourceIdentity)}:${declaration.begin}:declaration:${declaration.name}",
             written, declaration.sourceIdentity, declaration.begin, declaration.end,
-            (if (declaration.isPrivate) "private " else "") + (if (declaration.kind == "fun") "function" else "value")))
+            (if (declaration.isPrivate) "private " else "") + (if (declaration.kind == "fun") "function" else if (isType) declaration.kind else "value")))
     }
     return
 }

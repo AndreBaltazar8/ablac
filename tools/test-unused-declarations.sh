@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# W_UNUSED_DECLARATION, opt-in (--warn-unused-declarations; the editor's initialize `unusedDeclarations`): a top-level function or
-# value that nothing in the build names. tests/cases/unused-declarations/main.ab has four (neverCalled, neverRead, onlyItself, and the private hidden; a project that declares a package has only hidden)
-# among declarations that are called, read, passed as a value, run for their effect, `_`-prefixed, `main`, or named by another
-# file of the project (other.ab). Without the flag there is none. The editor gives the same three as warnings with the
-# unnecessary tag.
+# W_UNUSED_DECLARATION, opt-in (--warn-unused-declarations; the editor's initialize `unusedDeclarations`): a top-level function, value,
+# class, interface or type that nothing in the build names. tests/cases/unused-declarations/main.ab has six (neverCalled, neverRead,
+# onlyItself, the private hidden, the class NeverBuilt and the interface NeverImplemented) among declarations that are called, read,
+# passed as a value, run for their effect, built or implemented, `_`-prefixed, `main`, or named by another file of the project
+# (other.ab). Without the flag there is none. The editor gives the same six as warnings with the unnecessary tag. A project that
+# declares a package (abla.toml with a name) has only the private one.
 set -euo pipefail
 
 compiler=${1:-build/ablac}
@@ -18,8 +19,10 @@ fail() { echo "unused-declarations: $1" >&2; [ -n "${2:-}" ] && cat "$2" >&2; ex
 (cd "$work" && "$compiler" build main.ab -o program --fast --warn-unused-declarations) > "$work/warn.log" 2>&1 || fail "main.ab didn't build" "$work/warn.log"
 grep '^warning\[W_UNUSED_DECLARATION\]' "$work/warn.log" | sort > "$work/warnings.txt" || true
 cat > "$work/expected.txt" <<'TXT'
+warning[W_UNUSED_DECLARATION]: main.ab: class `NeverBuilt` is never used
 warning[W_UNUSED_DECLARATION]: main.ab: function `neverCalled` is never used
 warning[W_UNUSED_DECLARATION]: main.ab: function `onlyItself` is never used
+warning[W_UNUSED_DECLARATION]: main.ab: interface `NeverImplemented` is never used
 warning[W_UNUSED_DECLARATION]: main.ab: private function `hidden` is never used
 warning[W_UNUSED_DECLARATION]: main.ab: value `neverRead` is never used
 TXT
@@ -43,17 +46,17 @@ const answers = fs.readFileSync(process.argv[1], "utf8").trim().split("\n").map(
 const fail = (message) => { console.error("editor: " + message); process.exit(1); };
 const document = answers.find((a) => a.id === 2).result.documents.find((d) => d.uri.endsWith("/main.ab"));
 const warned = document.diagnostics.filter((d) => d.code === "W_UNUSED_DECLARATION");
-if (warned.length !== 4) fail("not four warnings: " + JSON.stringify(document.diagnostics));
+if (warned.length !== 6) fail("not six warnings: " + JSON.stringify(document.diagnostics));
 const bytes = Buffer.from(document.text);
 const names = [];
 for (const d of warned) {
   if (d.severity !== "warning" || JSON.stringify(d.tags) !== "[\"unnecessary\"]") fail("severity or tags: " + JSON.stringify(d));
   const text = bytes.subarray(d.range.start, d.range.end).toString();
-  const name = ["neverCalled", "neverRead", "onlyItself", "hidden"].find((n) => text.includes(n));
+  const name = ["neverCalled", "neverRead", "onlyItself", "hidden", "NeverBuilt", "NeverImplemented"].find((n) => text.includes(n));
   if (!name) fail("the range holds " + JSON.stringify(text));
   names.push(name);
 }
-if (names.sort().join() !== "hidden,neverCalled,neverRead,onlyItself") fail("names " + names);
+if (names.sort().join() !== "NeverBuilt,NeverImplemented,hidden,neverCalled,neverRead,onlyItself") fail("names " + names);
 ' "$work/editor.out"
 # A project that declares a package (abla.toml with a name): its public declarations are for its users, only `private` ones count.
 printf 'name = "lib"\nversion = "0.0.1"\nentry = "main.ab"\n' > "$work/abla.toml"
