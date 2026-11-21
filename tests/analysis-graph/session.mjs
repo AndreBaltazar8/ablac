@@ -1003,7 +1003,22 @@ async function subparsers() {
     await s.close();
 }
 
-const tests = { subparsers, documentation: () => documentation('graph-v1'), documentation_v2: () => documentation('graph-v2'), field_assign: () => fieldAssign('graph-v1'), field_assign_v2: () => fieldAssign('graph-v2'), builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
+async function sqlSubparsers() {
+    const project = fixture('sql-stdlib', { 'main.ab': 'import "abla/sql"\nfun main: int { val q = $sql("SELECT ${1}::integer"); q.parameters.size }\n' });
+    const s = await start(project, { mode: 'graph-v2' });
+    noErrors(await s.analyze());
+    await s.rpc('document/open', { uri: uri(path.join(project, 'main.ab')), version: 1,
+        text: 'import "abla/sql"\nfun main: int { val q = $sql("SELECT FROM t"); 0 }\n' });
+    let notes = errors(await s.analyze());
+    assert.ok(notes.some(n => n[1] === 'E_SUBPARSER_FAILURE' && n[2].includes('SQL')), JSON.stringify(notes));
+    await s.rpc('document/change', { uri: uri(path.join(project, 'main.ab')), version: 2,
+        text: 'import "abla/sql"\nfun main: int { val q = $sql("SELECT ${true}::uuid"); 0 }\n' });
+    notes = errors(await s.analyze());
+    assert.ok(notes.length > 0 && !notes.some(n => n[1] === 'W_SUBPARSER_NOT_EXPANDED'), JSON.stringify(notes));
+    await s.close();
+}
+
+const tests = { sql: sqlSubparsers, subparsers, documentation: () => documentation('graph-v1'), documentation_v2: () => documentation('graph-v2'), field_assign: () => fieldAssign('graph-v1'), field_assign_v2: () => fieldAssign('graph-v2'), builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
 const filter = process.env.ANALYSIS_TEST_FILTER ? process.env.ANALYSIS_TEST_FILTER.split(',') : null;
 for (const [name, test] of Object.entries(tests)) {
     if (filter && !filter.includes(name)) continue;

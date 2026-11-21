@@ -126,6 +126,7 @@ Built into the language rather than imported: `string`, arrays, `Map`,
 | `abla/websocket/server/tls` | TLS for `abla/websocket/server`: a certificate and key as `WebSocketServerOptions(tls = ...)`, nonblocking handshakes |
 | `abla/websocket/tls` | certificate-verified WSS client transport |
 | `abla/jwt`, `abla/jwt/remote` | JWS RS256/ES256 verification against a key set, and a cached remote JWKS |
+| `abla/sql` | [compile-time checked PostgreSQL-subset templates and separately typed bound parameters](../stdlib/abla/sql/README.md) |
 | `abla/compiler`, `abla/compiler/parser` | compile-time reflection, transforms, generated code and subparser APIs (compile time only) |
 | `abla/build` | framework-neutral compile-time program and export requests |
 | `abla/android/build` | Android arm64 target, `libabla_app.so` request, and generated JNI/Kotlin/CMake/Gradle integration |

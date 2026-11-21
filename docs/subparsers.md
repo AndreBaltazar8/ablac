@@ -433,3 +433,18 @@ ranges, and reparses the base source with those expressions installed. The
 stage-1/stage-2 gates cover a syntax-building provider, a nested provider stack
 loaded through an import, and the production JSON and HTML providers under
 both `$name` and `#$name`.
+
+### Quoted SQL templates
+
+`import "abla/sql"` registers `$sql("SELECT ... ${value}::type")`. The provider
+checks a bounded PostgreSQL subset and returns a neutral `SqlStatement` with
+separate bound parameters. The [module reference](../stdlib/abla/sql/README.md)
+lists syntax, codecs, limits and the optional abla-postgres adapter.
+
+Providers that inspect interpolated strings must distinguish static text from
+an interpolated string literal. `parserTemplatePartIsText(cursor, template,
+index)` tests whether the indexed child of a parsed `string.template` owns a
+`STRING_TEXT` token. Both forms otherwise have `syntaxKind(child) == "string"`.
+The query does not evaluate an interpolation. It rejects an invalid template or
+part index with `E_STRING_TEMPLATE_PART`. A SQL provider must deconstruct the
+parsed template and keep every value child as a runtime bound expression.

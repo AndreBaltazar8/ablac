@@ -1,0 +1,66 @@
+import "abla/compiler/parser"
+import "abla/text"
+import "runtime.ab"
+import "parser.ab"
+
+compile fun ablaSqlBinding(kind: string, value: SyntaxExpression): SyntaxExpression {
+    if (syntaxKind(value) == "null") return syntaxCall("ablaSqlBindNull", [syntaxString(kind)])
+    val function = if (kind == "text" || kind == "uuid") "ablaSqlBindString"
+        else if (kind == "int8") "ablaSqlBindInt8"
+        else if (kind == "int2" || kind == "int4") "ablaSqlBindInteger"
+        else if (kind == "float4" || kind == "float8") "ablaSqlBindFloat"
+        else if (kind == "bool") "ablaSqlBindBoolean"
+        else "ablaSqlBindJson"
+    syntaxCall(function, [value, syntaxString(kind)])
+}
+
+// Inspect the parsed template; never evaluate its string concatenation.
+compile fun ablaSqlParseLiteral(cursor: ParserCursor): SyntaxExpression {
+    parserExpect(cursor, "(")
+    val literal = parserParseAblaExpression(cursor)
+    val parts: array<string> = []
+    val holes: array<SyntaxExpression> = []
+    val positions: array<int> = []
+    var size = 0
+    if (syntaxKind(literal) == "string") parts.append(syntaxText(literal))
+    else if (syntaxKind(literal) == "string.template") {
+        var index = 0
+        while (index < syntaxChildCount(literal)) {
+            if (size > 65536 || holes.size > 1024) {
+                parserFail(cursor, "SQL literal size or parameter limit exceeded")
+                break
+            }
+            val child = syntaxChild(literal, index)
+            if (parserTemplatePartIsText(cursor, literal, index)) {
+                val text = syntaxText(child)
+                parts.append(text)
+                size += text.size
+            } else {
+                holes.append(child)
+                positions.append(size)
+                val number = holes.size
+                val marker = "\$" + "$number"
+                parts.append(marker)
+                size += marker.size
+            }
+            index += 1
+        }
+    } else parserFail(cursor, "SQL expects a quoted string literal or interpolated string literal")
+    val template = parts.join("")
+    val parameters: array<SyntaxExpression> = []
+    val checked = ablaSqlCheck(template, positions)
+    if (checked.message != "") {
+        val byte = checked.begin
+        parserFail(cursor, "SQL at template byte $byte: " + checked.message)
+    } else {
+        var index = 0
+        while (index < holes.size) {
+            parameters.append(ablaSqlBinding(checked.kinds[index], holes[index]))
+            index += 1
+        }
+    }
+    parserExpect(cursor, ")")
+    syntaxCall("SqlStatement", [syntaxString(template), syntaxArray(parameters)])
+}
+
+#compilerRegisterSubparser("sql", ablaSqlParseLiteral)

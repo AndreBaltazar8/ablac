@@ -27,6 +27,21 @@ run. Reproduce by copying `build/ablac.bin` to `/tmp/ablac-direct` and running
 `RUN_TESTS_FILTER=test-libcall-coverage.sh tools/run-tests.sh /tmp/ablac-direct`.
 Check that the companion exists before choosing it (or use `readlink -e`).
 Owner: ablac-0c (cx6), handling it on the runner track.
+## Raw subparser lexical isolation ($sql, #1064)
+
+Owner: ablac-89. bootstrapParseStagedRegistered discovers expansions from the
+whole-file token stream. An unmatched Abla quote inside a raw provider body
+poisons subsequent tokens even when parserRawTakeUntil consumes it correctly.
+Historical brace-provider repro (cx8-sql build/sql/positive1-grammar.log):
+
+    $sql { SELECT $$raw } ' " text$$ AS body }
+    val next = 1
+
+Also cover a $json$ tag inside a raw SQL body when abla/json is imported: the
+reverse provider scan must keep that text opaque, while permitting delegated
+Abla expressions with nested providers inside value holes. Phase 1 uses
+$sql("...") and leaves brace syntax for generic forward raw isolation.
+Reported to ablac-74 and ablac-89.
 
 ## Remove Python from the suite (#807): done
 

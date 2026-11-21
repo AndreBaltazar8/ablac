@@ -1,0 +1,647 @@
+import "abla/text"
+
+// Compiler-only PostgreSQL subset checker. Tokens retain decoded-template
+// byte spans for diagnostics; the provider owns the Abla source cursor.
+compile class AblaSqlToken(val kind: string, val text: string, val begin: int, val end: int)
+compile class AblaSqlCheck(
+    val kinds: array<string>, val positions: array<int>, var message: string = "",
+    var begin: int = 0, var end: int = 0
+)
+compile class AblaSqlLexer(val source: string, val tokens: array<AblaSqlToken>,
+    val check: AblaSqlCheck, var position: int = 0)
+compile class AblaSqlParser(val tokens: array<AblaSqlToken>, val check: AblaSqlCheck,
+    var position: int = 0, var depth: int = 0)
+
+compile fun ablaSqlSpace(b: int): bool = b == 32 || b == 9 || b == 10 || b == 13 || b == 12
+compile fun ablaSqlDigit(b: int): bool = b >= 48 && b <= 57
+compile fun ablaSqlLetter(b: int): bool =
+    b >= 65 && b <= 90 || b >= 97 && b <= 122 || b == 95 || b >= 128
+compile fun ablaSqlNameByte(b: int): bool = ablaSqlLetter(b) || ablaSqlDigit(b) || b == 36
+
+compile fun ablaSqlOneOf(text: string, choices: array<string>): bool {
+    for (choice in choices) if (choice == text) return true
+    false
+}
+
+compile fun AblaSqlCheck.fail(message: string, begin: int, end: int): void {
+    if (this.message == "") {
+        this.message = message
+        this.begin = begin
+        this.end = end
+    }
+}
+
+compile fun AblaSqlLexer.add(kind: string, begin: int): void {
+    if (this.tokens.size >= 32768) this.check.fail("SQL token limit exceeded", begin, this.position)
+    else {
+        val text = this.source.slice(begin, this.position)
+        this.tokens.append(AblaSqlToken(kind, if (kind == "word") text.lowercase() else text, begin, this.position))
+    }
+}
+
+compile fun AblaSqlLexer.quote(quote: int, escaped: bool, begin: int): void {
+    this.position += 1
+    var closed = false
+    while (this.position < this.source.size && !closed) {
+        val byte = this.source[this.position]
+        if (byte == quote) {
+            this.position += 1
+            if (this.position < this.source.size && this.source[this.position] == quote) this.position += 1
+            else closed = true
+        } else if (escaped && byte == 92) {
+            this.position += 1
+            if (this.position < this.source.size) {
+                val escape = this.source[this.position]
+                if (escape != 39 && escape != 34 && escape != 92 && escape != 98 &&
+                    escape != 102 && escape != 110 && escape != 114 && escape != 116) {
+                    this.check.fail("unsupported SQL E-string escape", this.position - 1, this.position + 1)
+                }
+                this.position += 1
+            }
+        } else this.position += 1
+    }
+    if (!closed) this.check.fail("unterminated SQL quote", begin, this.position)
+    else if (quote == 34 && this.position - begin == 2) this.check.fail("empty SQL identifier", begin, this.position)
+    else this.add(if (quote == 34) "quoted" else "string", begin)
+}
+
+compile fun AblaSqlLexer.number(begin: int): void {
+    while (this.position < this.source.size && ablaSqlDigit(this.source[this.position])) this.position += 1
+    if (this.position < this.source.size && this.source[this.position] == 46) {
+        this.position += 1
+        while (this.position < this.source.size && ablaSqlDigit(this.source[this.position])) this.position += 1
+    }
+    if (this.position < this.source.size &&
+        (this.source[this.position] == 101 || this.source[this.position] == 69)) {
+        this.position += 1
+        if (this.position < this.source.size &&
+            (this.source[this.position] == 43 || this.source[this.position] == 45)) this.position += 1
+        val digits = this.position
+        while (this.position < this.source.size && ablaSqlDigit(this.source[this.position])) this.position += 1
+        if (digits == this.position) this.check.fail("SQL exponent needs digits", begin, this.position)
+    }
+    if (this.position < this.source.size && ablaSqlLetter(this.source[this.position])) {
+        this.check.fail("trailing identifier after SQL number", begin, this.position + 1)
+    }
+    this.add("number", begin)
+}
+
+compile fun AblaSqlLexer.dollar(begin: int): void {
+    this.position += 1
+    if (this.position < this.source.size && ablaSqlDigit(this.source[this.position])) {
+        while (this.position < this.source.size && ablaSqlDigit(this.source[this.position])) this.position += 1
+        this.add("parameter", begin)
+        return
+    }
+    while (this.position < this.source.size &&
+        (ablaSqlLetter(this.source[this.position]) || ablaSqlDigit(this.source[this.position]))) this.position += 1
+    if (this.position >= this.source.size || this.source[this.position] != 36 || this.position - begin > 65) {
+        this.check.fail("unsupported SQL dollar token", begin, this.position)
+        return
+    }
+    this.position += 1
+    val tag = this.source.slice(begin, this.position)
+    var closed = false
+    while (this.position < this.source.size && !closed) {
+        if (this.position + tag.size <= this.source.size &&
+            this.source.slice(this.position, this.position + tag.size) == tag) {
+            this.position += tag.size
+            closed = true
+        } else this.position += 1
+    }
+    if (!closed) this.check.fail("unterminated SQL dollar quote", begin, this.position)
+    else this.add("string", begin)
+}
+
+compile fun ablaSqlLex(source: string, var check: AblaSqlCheck): array<AblaSqlToken> {
+    val tokens: array<AblaSqlToken> = []
+    val lexer = AblaSqlLexer(source, tokens, check)
+    while (lexer.position < source.size && check.message == "") {
+        val begin = lexer.position
+        val byte = source[begin]
+        if (ablaSqlSpace(byte)) lexer.position += 1
+        else if (begin + 1 < source.size && source.slice(begin, begin + 2) == "--") {
+            while (lexer.position < source.size && source[lexer.position] != 10 && source[lexer.position] != 13) lexer.position += 1
+        } else if (begin + 1 < source.size && source.slice(begin, begin + 2) == "/*") {
+            lexer.position += 2
+            var depth = 1
+            while (lexer.position < source.size && depth > 0 && check.message == "") {
+                if (lexer.position + 1 < source.size && source.slice(lexer.position, lexer.position + 2) == "/*") {
+                    depth += 1
+                    lexer.position += 2
+                    if (depth > 64) check.fail("SQL comment nesting limit exceeded", begin, lexer.position)
+                } else if (lexer.position + 1 < source.size && source.slice(lexer.position, lexer.position + 2) == "*/") {
+                    depth -= 1
+                    lexer.position += 2
+                } else lexer.position += 1
+            }
+            if (depth != 0) check.fail("unterminated SQL comment", begin, lexer.position)
+        } else if ((byte == 69 || byte == 101) && begin + 1 < source.size && source[begin + 1] == 39) {
+            lexer.position += 1
+            lexer.quote(39, true, begin)
+        } else if (byte == 39 || byte == 34) lexer.quote(byte, false, begin)
+        else if (byte == 36) lexer.dollar(begin)
+        else if (ablaSqlDigit(byte) || byte == 46 && begin + 1 < source.size && ablaSqlDigit(source[begin + 1])) lexer.number(begin)
+        else if (ablaSqlLetter(byte)) {
+            lexer.position += 1
+            while (lexer.position < source.size && ablaSqlNameByte(source[lexer.position])) lexer.position += 1
+            lexer.add("word", begin)
+        } else {
+            var width = 0
+            for (operator in ["->>", "!~*", "::", "||", "<=", ">=", "<>", "!=", "->", "@>", "<@", "?&", "?|", "~*", "!~", "<<", ">>"]) {
+                if (width == 0 && begin + operator.size <= source.size &&
+                    source.slice(begin, begin + operator.size) == operator) width = operator.size
+            }
+            if (width > 0) lexer.position += width
+            else if ("(),.;[]+-*/%^=<>?~&|#".contains(source.slice(begin, begin + 1))) lexer.position += 1
+            else {
+                lexer.position += 1
+                check.fail("unsupported SQL character", begin, lexer.position)
+            }
+            lexer.add("symbol", begin)
+        }
+    }
+    tokens.append(AblaSqlToken("end", "", source.size, source.size))
+    tokens
+}
+
+compile fun AblaSqlParser.token(): AblaSqlToken {
+    val token = this.tokens[this.position]
+    AblaSqlToken(token.kind, token.text, token.begin, token.end)
+}
+compile fun AblaSqlParser.at(text: string): bool = this.tokens[this.position].text == text
+compile fun AblaSqlParser.nextIs(text: string): bool =
+    this.position + 1 < this.tokens.size && this.tokens[this.position + 1].text == text
+compile fun AblaSqlParser.take(): void {
+    if (this.position + 1 < this.tokens.size) this.position += 1
+}
+compile fun AblaSqlParser.report(message: string): void {
+    val token = this.token()
+    if (this.check.message == "") {
+        this.check.message = message
+        this.check.begin = token.begin
+        this.check.end = token.end
+    }
+}
+compile fun AblaSqlParser.consume(text: string): bool {
+    if (this.at(text)) { this.take(); return true }
+    false
+}
+compile fun AblaSqlParser.expect(text: string): void {
+    if (!this.consume(text)) this.report("expected SQL token " + text)
+}
+
+compile fun ablaSqlReserved(text: string): bool {
+    val words = "|all|analyse|analyze|and|any|array|as|asc|asymmetric|authorization|binary|both|case|cast|check|collate|collation|column|concurrently|constraint|create|cross|current_catalog|current_date|current_role|current_schema|current_time|current_timestamp|current_user|default|deferrable|desc|distinct|do|else|end|except|false|fetch|filter|for|foreign|freeze|from|full|grant|group|having|ilike|in|initially|inner|intersect|into|is|isnull|join|lateral|leading|left|like|limit|localtime|localtimestamp|natural|not|notnull|null|offset|on|only|or|order|outer|over|overlaps|placing|primary|references|returning|right|select|session_user|similar|some|symmetric|system_user|table|tablesample|then|to|trailing|true|union|unique|user|using|variadic|verbose|when|where|window|with|insert|update|delete|values|set|conflict|nothing|"
+    words.contains("|" + text + "|")
+}
+compile fun AblaSqlParser.name(): bool =
+    this.token().kind == "quoted" || this.token().kind == "word" && !ablaSqlReserved(this.token().text)
+compile fun AblaSqlParser.identifier(): void {
+    if (!this.name()) this.report("expected a static SQL identifier; values cannot supply names")
+    else this.take()
+}
+compile fun AblaSqlParser.qualified(): void {
+    this.identifier()
+    while (this.check.message == "" && this.consume(".")) this.identifier()
+}
+compile fun AblaSqlParser.alias(): void {
+    if (this.consume("as")) this.identifier()
+    else if (this.name()) this.take()
+}
+
+compile fun AblaSqlParser.typeName(): string {
+    val begin = this.token()
+    if (begin.kind != "word" && begin.kind != "quoted" || begin.kind == "word" && ablaSqlReserved(begin.text)) {
+        this.report("expected SQL type after cast")
+        return ""
+    }
+    this.take()
+    var type = begin.text
+    while (this.consume(".")) {
+        type = type + "." + this.token().text
+        this.identifier()
+    }
+    if (type == "double" && this.consume("precision")) type = "double precision"
+    else if (type == "character" && this.consume("varying")) type = "character varying"
+    if (this.consume("(")) {
+        if (this.token().kind != "number") this.report("expected SQL type modifier")
+        else this.take()
+        if (this.consume(",")) {
+            if (this.token().kind != "number") this.report("expected SQL type modifier")
+            else this.take()
+        }
+        this.expect(")")
+    }
+    if (this.at("[")) this.report("SQL array types are outside this literal subset")
+    type
+}
+
+compile fun ablaSqlBindKind(type: string): string {
+    if (type == "text" || type == "varchar" || type == "character varying" || type == "char" || type == "character") "text"
+    else if (type == "uuid") "uuid"
+    else if (type == "int2" || type == "smallint") "int2"
+    else if (type == "int4" || type == "integer" || type == "int") "int4"
+    else if (type == "int8" || type == "bigint") "int8"
+    else if (type == "boolean" || type == "bool") "bool"
+    else if (type == "real" || type == "float4") "float4"
+    else if (type == "double precision" || type == "float8") "float8"
+    else if (type == "jsonb") "jsonb"
+    else ""
+}
+
+compile fun AblaSqlParser.parameter(): void {
+    val token = this.token()
+    this.take()
+    var number = 0
+    var index = 1
+    while (index < token.text.size && number <= 1024) {
+        number = number * 10 + token.text[index] - 48
+        index += 1
+    }
+    if (number < 1 || number > this.check.kinds.size || index != token.text.size) {
+        this.check.fail("invalid generated SQL parameter", token.begin, token.end)
+        return
+    }
+    if (this.check.positions[number - 1] != token.begin) {
+        this.check.fail("manual positional parameters are not allowed; use an Abla value hole", token.begin, token.end)
+        return
+    }
+    if (!this.consume("::")) {
+        this.check.fail("each SQL value hole needs an immediate ::type cast", token.begin, token.end)
+        return
+    }
+    val kind = ablaSqlBindKind(this.typeName())
+    if (kind == "") this.check.fail("unsupported SQL parameter type", token.begin, this.token().begin)
+    else this.check.kinds[number - 1] = kind
+}
+
+compile fun AblaSqlParser.arguments(): void {
+    this.expect("(")
+    if (this.consume(")")) return
+    if (this.consume("*")) { this.expect(")"); return }
+    this.expression(0)
+    while (this.check.message == "" && this.consume(",")) this.expression(0)
+    this.expect(")")
+}
+
+compile fun AblaSqlParser.caseValue(): void {
+    this.expect("case")
+    if (!this.at("when")) this.expression(0)
+    if (!this.at("when")) this.report("SQL CASE needs WHEN")
+    while (this.check.message == "" && this.consume("when")) {
+        this.expression(0)
+        this.expect("then")
+        this.expression(0)
+    }
+    if (this.consume("else")) this.expression(0)
+    this.expect("end")
+}
+
+compile fun AblaSqlParser.prefix(star: bool): void {
+    val token = this.token()
+    if (this.consume("+") || this.consume("-")) this.expression(90)
+    else if (this.consume("not")) this.expression(30)
+    else if (this.at("case")) this.caseValue()
+    else if (this.consume("exists")) {
+        this.expect("(")
+        if (!this.at("select")) this.report("EXISTS needs a SELECT")
+        else this.statement()
+        this.expect(")")
+    } else if (this.consume("cast")) {
+        this.expect("(")
+        this.expression(0)
+        this.expect("as")
+        this.typeName()
+        this.expect(")")
+    } else if (this.consume("(")) {
+        if (this.at("select")) this.statement()
+        else {
+            this.expression(0)
+            while (this.check.message == "" && this.consume(",")) this.expression(0)
+        }
+        this.expect(")")
+    } else if (token.kind == "parameter") this.parameter()
+    else if (token.kind == "string" || token.kind == "number" ||
+        this.at("null") || this.at("true") || this.at("false")) this.take()
+    else if (this.at("*")) {
+        if (star) this.take()
+        else this.report("SQL wildcard is allowed only in a projection or function argument")
+    } else if (ablaSqlOneOf(token.text, ["current_date", "current_time", "current_timestamp", "localtime", "localtimestamp",
+        "current_user", "current_role", "session_user", "user", "current_catalog", "current_schema"])) {
+        this.take()
+        if (ablaSqlOneOf(token.text, ["current_time", "current_timestamp", "localtime", "localtimestamp"]) && this.consume("(")) {
+            if (this.token().kind != "number") this.report("expected time precision")
+            else this.take()
+            this.expect(")")
+        }
+    } else if (this.name()) {
+        val special = token.kind == "word" && ablaSqlOneOf(token.text, ["extract", "substring", "trim", "overlay", "position",
+            "treat", "xmlserialize", "xmlelement", "xmlforest", "xmlparse", "xmlroot", "xmlpi", "xmlexists"])
+        if (special) { this.report("special SQL function syntax is outside this subset"); return }
+        this.take()
+        while (this.check.message == "" && this.consume(".")) {
+            if (star && this.consume("*")) return
+            this.identifier()
+        }
+        if (this.at("(")) {
+            if (token.text == "coalesce" || token.text == "greatest" || token.text == "least" || token.text == "nullif") {
+                this.take()
+                this.expression(0)
+                var count = 1
+                while (this.check.message == "" && this.consume(",")) { this.expression(0); count += 1 }
+                if (token.text == "nullif" && count != 2) this.report("NULLIF needs two expressions")
+                this.expect(")")
+            } else this.arguments()
+        }
+    } else this.report("expected a SQL value expression")
+}
+
+compile fun ablaSqlPrecedence(operator: string): int {
+    if (operator == "or") 10
+    else if (operator == "and") 20
+    else if (operator == "is" || operator == "isnull" || operator == "notnull") 35
+    else if (ablaSqlOneOf(operator, ["=", "<", ">", "<=", ">=", "<>", "!="])) 40
+    else if (ablaSqlOneOf(operator, ["in", "between", "like", "ilike"])) 50
+    else if (ablaSqlOneOf(operator, ["||", "->", "->>", "@>", "<@", "?", "?&", "?|", "~", "~*", "!~", "!~*", "&", "|", "#", "<<", ">>"])) 60
+    else if (operator == "+" || operator == "-") 70
+    else if (operator == "*" || operator == "/" || operator == "%") 75
+    else if (operator == "^") 80
+    else 0
+}
+
+compile fun AblaSqlParser.expression(minimum: int, star: bool = false): void {
+    if (this.check.message != "") return
+    this.depth += 1
+    if (this.depth > 64) { this.report("SQL nesting limit exceeded"); this.depth -= 1; return }
+    this.prefix(star)
+    var more = this.check.message == ""
+    var previous = 0
+    while (more) {
+        if (this.consume("::")) this.typeName()
+        else {
+            val negated = this.at("not") && (this.nextIs("in") || this.nextIs("between") ||
+                this.nextIs("like") || this.nextIs("ilike"))
+            val operator = if (negated) this.tokens[this.position + 1].text else this.token().text
+            val precedence = ablaSqlPrecedence(operator)
+            if (precedence == 0 || precedence < minimum) more = false
+            else if (precedence == previous && (precedence == 35 || precedence == 40 || precedence == 50)) {
+                this.report("parenthesize chained SQL comparisons")
+            } else {
+                previous = precedence
+                if (negated) this.take()
+                this.take()
+                if (operator == "isnull" || operator == "notnull") {}
+                else if (operator == "is") {
+                    this.consume("not")
+                    if (this.consume("distinct")) { this.expect("from"); this.expression(precedence + 1) }
+                    else if (this.at("null") || this.at("true") || this.at("false") || this.at("unknown")) this.take()
+                    else this.report("expected NULL, TRUE, FALSE, UNKNOWN or DISTINCT FROM after IS")
+                } else if (operator == "in") {
+                    this.expect("(")
+                    if (this.at("select")) this.statement()
+                    else {
+                        this.expression(0)
+                        while (this.check.message == "" && this.consume(",")) this.expression(0)
+                    }
+                    this.expect(")")
+                } else if (operator == "between") {
+                    if (this.at("symmetric") || this.at("asymmetric")) this.take()
+                    this.expression(precedence + 1)
+                    this.expect("and")
+                    this.expression(precedence + 1)
+                } else {
+                    this.expression(precedence + 1)
+                    if ((operator == "like" || operator == "ilike") && this.consume("escape")) this.expression(precedence + 1)
+                }
+            }
+        }
+        if (this.check.message != "") more = false
+    }
+    this.depth -= 1
+}
+
+compile fun AblaSqlParser.projection(): void {
+    this.expression(0, true)
+    this.alias()
+    while (this.check.message == "" && this.consume(",")) {
+        this.expression(0, true)
+        this.alias()
+    }
+}
+
+compile fun AblaSqlParser.relation(): void {
+    if (this.consume("(")) {
+        if (!this.at("select")) this.report("FROM parentheses need a supported SELECT")
+        else this.statement()
+        this.expect(")")
+    } else {
+        this.qualified()
+        if (this.at("(")) this.arguments()
+    }
+    this.alias()
+    if (this.consume("(")) {
+        this.identifier()
+        while (this.check.message == "" && this.consume(",")) this.identifier()
+        this.expect(")")
+    }
+}
+
+compile fun AblaSqlParser.from(): void {
+    this.relation()
+    var more = this.check.message == ""
+    while (more) {
+        if (this.consume(",")) this.relation()
+        else {
+            val cross = this.consume("cross")
+            var joined = cross
+            if (cross) this.expect("join")
+            else if (this.at("inner") || this.at("left") || this.at("right") || this.at("full")) {
+                val inner = this.at("inner")
+                this.take()
+                if (!inner) this.consume("outer")
+                this.expect("join")
+                joined = true
+            } else joined = this.consume("join")
+            if (!joined) more = false
+            else {
+                this.relation()
+                if (!cross) {
+                    if (this.consume("on")) this.expression(0)
+                    else if (this.consume("using")) {
+                        this.expect("(")
+                        this.identifier()
+                        while (this.check.message == "" && this.consume(",")) this.identifier()
+                        this.expect(")")
+                    } else this.report("JOIN needs ON or USING")
+                }
+            }
+        }
+        if (this.check.message != "") more = false
+    }
+}
+
+compile fun AblaSqlParser.select(): void {
+    this.expect("select")
+    if (this.consume("distinct")) {
+        if (this.consume("on")) {
+            this.expect("(")
+            this.expression(0)
+            while (this.check.message == "" && this.consume(",")) this.expression(0)
+            this.expect(")")
+        }
+    } else this.consume("all")
+    this.projection()
+    if (this.consume("from")) this.from()
+    if (this.consume("where")) this.expression(0)
+    if (this.consume("group")) {
+        this.expect("by")
+        this.expression(0)
+        while (this.check.message == "" && this.consume(",")) this.expression(0)
+    }
+    if (this.consume("having")) this.expression(0)
+    if (this.consume("order")) {
+        this.expect("by")
+        var more = true
+        while (more && this.check.message == "") {
+            this.expression(0)
+            if (this.at("asc") || this.at("desc")) this.take()
+            if (this.consume("nulls")) {
+                if (this.at("first") || this.at("last")) this.take()
+                else this.report("NULLS needs FIRST or LAST")
+            }
+            more = this.consume(",")
+        }
+    }
+    var limit = false
+    var offset = false
+    var paging = true
+    while (paging && this.check.message == "") {
+        if (!limit && this.consume("limit")) {
+            limit = true
+            if (!this.consume("all")) this.expression(0)
+        } else if (!offset && this.consume("offset")) {
+            offset = true
+            this.expression(0)
+        } else paging = false
+    }
+}
+
+compile fun AblaSqlParser.assignments(): void {
+    this.qualified()
+    this.expect("=")
+    this.expression(0)
+    while (this.check.message == "" && this.consume(",")) {
+        this.qualified()
+        this.expect("=")
+        this.expression(0)
+    }
+}
+
+compile fun AblaSqlParser.insert(): void {
+    this.expect("insert")
+    this.expect("into")
+    this.qualified()
+    if (this.consume("as")) this.identifier()
+    var columns = 0
+    if (this.consume("(")) {
+        this.identifier()
+        columns = 1
+        while (this.check.message == "" && this.consume(",")) { this.identifier(); columns += 1 }
+        this.expect(")")
+    }
+    this.expect("values")
+    var more = true
+    var width = -1
+    while (more && this.check.message == "") {
+        this.expect("(")
+        this.expression(0)
+        var count = 1
+        while (this.check.message == "" && this.consume(",")) { this.expression(0); count += 1 }
+        this.expect(")")
+        if (width < 0) width = count
+        if (count != width || columns > 0 && count != columns) this.report("INSERT VALUES column counts differ")
+        more = this.consume(",")
+    }
+    if (this.consume("on")) {
+        this.expect("conflict")
+        if (this.consume("(")) {
+            this.identifier()
+            while (this.check.message == "" && this.consume(",")) this.identifier()
+            this.expect(")")
+            if (this.consume("where")) this.expression(0)
+        } else if (this.consume("on")) { this.expect("constraint"); this.identifier() }
+        this.expect("do")
+        if (!this.consume("nothing")) {
+            this.expect("update")
+            this.expect("set")
+            this.assignments()
+            if (this.consume("where")) this.expression(0)
+        }
+    }
+    if (this.consume("returning")) this.projection()
+}
+
+compile fun AblaSqlParser.update(): void {
+    this.expect("update")
+    this.qualified()
+    this.alias()
+    this.expect("set")
+    this.assignments()
+    if (this.consume("from")) this.from()
+    if (this.consume("where")) this.expression(0)
+    if (this.consume("returning")) this.projection()
+}
+
+compile fun AblaSqlParser.delete(): void {
+    this.expect("delete")
+    this.expect("from")
+    this.qualified()
+    this.alias()
+    if (this.consume("using")) this.from()
+    if (this.consume("where")) this.expression(0)
+    if (this.consume("returning")) this.projection()
+}
+
+compile fun AblaSqlParser.statement(): void {
+    if (this.check.message != "") return
+    this.depth += 1
+    if (this.depth > 64) { this.report("SQL nesting limit exceeded"); this.depth -= 1; return }
+    if (this.at("select")) this.select()
+    else if (this.at("insert")) this.insert()
+    else if (this.at("update")) this.update()
+    else if (this.at("delete")) this.delete()
+    else this.report("expected SELECT, INSERT VALUES, UPDATE or DELETE; this SQL form is outside the subset")
+    this.depth -= 1
+}
+
+compile fun ablaSqlCheck(source: string, positions: array<int>): AblaSqlCheck {
+    val parameters = positions.size
+    val kinds: array<string> = []
+    for (index in 0 until parameters) kinds.append("")
+    val check = AblaSqlCheck(kinds, positions)
+    if (source.size > 65536 || parameters < 0 || parameters > 1024) {
+        check.fail("SQL literal size or parameter limit exceeded", 0, source.size)
+        return check
+    }
+    var byte = 0
+    while (byte < source.size) {
+        if (source[byte] == 0) {
+            check.fail("NUL is not allowed in SQL source", byte, byte + 1)
+            return check
+        }
+        byte += 1
+    }
+    val tokens = ablaSqlLex(source, check)
+    if (check.message != "") return check
+    val parser = AblaSqlParser(tokens, check)
+    parser.statement()
+    parser.consume(";")
+    if (check.message == "" && parser.token().kind != "end") parser.report("unsupported or trailing SQL syntax; only one statement is allowed")
+    var index = 0
+    while (check.message == "" && index < kinds.size) {
+        if (kinds[index] == "") check.fail("SQL value hole was not used as a typed expression", 0, source.size)
+        index += 1
+    }
+    check
+}
