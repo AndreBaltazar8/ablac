@@ -14,6 +14,12 @@ mkdir -p "$out"
 "$compiler" build "$cases/valid.ab" --fast -o "$out/valid"
 "$out/valid"
 
+for case in local transitive/main; do
+    output="$out/${case//\//-}"
+    "$compiler" build "$cases/$case.ab" --fast -o "$output"
+    "$output"
+done
+
 check_failure() {
     local case=$1 expected=$2 log="$out/$1.log"
     if "$compiler" build "$cases/$case.ab" --fast -o "$out/$case" >"$log" 2>&1; then
@@ -30,7 +36,7 @@ check_failure() {
 }
 check_failure malformed 'error[E_SUBPARSER_FAILURE]: invalid raw test literal'
 check_failure unterminated 'error[E_SUBPARSER_FAILURE]: unterminated raw test literal'
-echo 'raw isolation: opaque text, trailing import, nested holes, and bounded recovery'
+echo 'raw isolation: opaque text, local and transitive discovery, nested holes, and bounded recovery'
 
 stdlib="$out/stdlib"
 mkdir -p "$stdlib/abla/raw-isolation-test"

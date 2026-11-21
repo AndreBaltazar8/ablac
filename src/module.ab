@@ -635,7 +635,8 @@ class BootstrapModuleSnapshot(
     val discovery: BootstrapParseResult,
     val rawChunks: array<BootstrapRawChunk> = [],
     val hostSource: string = "",
-    val rawSites: array<BootstrapRawSite> = []
+    val rawSites: array<BootstrapRawSite> = [],
+    val mayUseRawProvider: bool = false
 )
 
 fun bootstrapRawHostTokens(source: string): array<BootstrapToken> =
@@ -763,11 +764,11 @@ class BootstrapModuleState(
 
     fun discover(
         source: string, modulePath: string, importErrors: int,
-        first: int, second: int
+        first: int, second: int, mayUseRawProvider: bool
     ): BootstrapParseResult {
         var recordPath = ""
         if (this.discoveryDirectory != "" && source.size <= 4194304 && importErrors == 0 &&
-            !bootstrapMayUseRawProvider(source)) {
+            !mayUseRawProvider) {
             val identity = bootstrapDiscoveryHashes(modulePath)
             recordPath =
                 "${this.discoveryDirectory}/${source.size}-$first-$second-${identity.first}-${identity.second}.discovery"
@@ -826,10 +827,12 @@ class BootstrapModuleState(
             val scan = bootstrapScanImports(source.text)
             val first = bootstrapModuleFingerprint(source.text, 17, 257, 1000000007)
             val second = bootstrapModuleFingerprint(source.text, 97, 263, 1000000009)
-            val discovery = this.discover(source.text, modulePath, scan.errors, first, second)
+            val mayUseRaw = bootstrapMayUseRawProvider(source.text)
+            val discovery = this.discover(source.text, modulePath, scan.errors, first, second, mayUseRaw)
             val snapshot = bootstrapModuleSnapshotFrozen(BootstrapModuleSnapshot(
                 modulePath, source.text, scan.edges, scan.errors, true,
-                source.text.size, source.version, first, second, discovery
+                source.text.size, source.version, first, second, discovery,
+                [], "", [], mayUseRaw
             ))
             if (existing >= 0) this.snapshots[existing] = snapshot
             else {
@@ -869,7 +872,8 @@ class BootstrapModuleState(
             val scan = bootstrapScanImports(source)
             val first = bootstrapModuleFingerprint(source, 17, 257, 1000000007)
             val second = bootstrapModuleFingerprint(source, 97, 263, 1000000009)
-            val discovery = this.discover(source, modulePath, scan.errors, first, second)
+            val mayUseRaw = bootstrapMayUseRawProvider(source)
+            val discovery = this.discover(source, modulePath, scan.errors, first, second, mayUseRaw)
             result = bootstrapModuleSnapshotFrozen(BootstrapModuleSnapshot(
                 modulePath,
                 source,
@@ -880,7 +884,8 @@ class BootstrapModuleState(
                 info.revision,
                 first,
                 second,
-                discovery
+                discovery,
+                [], "", [], mayUseRaw
             ))
             if (existing >= 0) {
                 this.snapshots[existing] = result
@@ -2566,7 +2571,8 @@ fun bootstrapPrepareModuleSnapshot(
         discovery,
         snapshot.rawChunks,
         host,
-        snapshot.rawSites
+        snapshot.rawSites,
+        snapshot.mayUseRawProvider
     )
 }
 
@@ -4227,6 +4233,16 @@ fun bootstrapMayUseRawProvider(source: string): bool {
 
 // Build a preview scope using only import sites the host lexer has reached.
 // Discovery uses compile declarations and never evaluates ordinary handlers.
+class BootstrapRawImportFrame(
+    val path: string,
+    val source: string,
+    var nextRegistration: int,
+    val pending: array<string> = [],
+    val local: Map<string, BootstrapRawBoundaryBinding> = Map(),
+    val declarations: array<BootstrapDeclaration> = [],
+    var resolved: int = 0
+)
+
 class BootstrapRawImportScope(
     val syntaxOnly: bool,
     val overlayPaths: array<string>,
@@ -4234,27 +4250,33 @@ class BootstrapRawImportScope(
     val bindings: Map<string, BootstrapRawBoundaryBinding> = Map(),
     val seen: Map<string, bool> = Map(),
     val declarations: array<BootstrapDeclaration> = [],
-    val pending: array<string> = [],
-    var resolved: int = 0
+    val frames: array<BootstrapRawImportFrame> = []
 ) {
-    fun addRegistrations(path: string, discovery: BootstrapParseResult, local: bool): void {
+    fun addRegistrations(path: string, discovery: BootstrapParseResult, frame: int): void {
         if (this.syntaxOnly && !bootstrapPathIsStandardLibrary(path)) return
         if (!bootstrapActionsRegisterSubparser(discovery.actions)) return
-        val registry = bootstrapBuildSubparserRegistry(discovery)
+        val declarations = if (frame >= 0) this.frames[frame].declarations else this.declarations
+        val registry = bootstrapBuildSubparserRegistry(BootstrapParseResult(
+            declarations, discovery.actions, discovery.errors, discovery.extensionErrors,
+            [], [], discovery.diagnostics
+        ))
         for (registration in registry.registrations) {
-            if (registration.rawBoundary != "" && this.bindings.get(registration.name) == null) {
+            if (registration.rawBoundary != "" &&
+                (frame >= 0 || this.bindings.get(registration.name) == null)) {
                 val visible = BootstrapSubparserRegistration(
                     registration.name, registration.handler,
-                    if (local) registration.availableFrom else -1, registration.rawBoundary
+                    if (frame >= 0) registration.availableFrom else -1, registration.rawBoundary
                 )
-                this.bindings.set(registration.name, BootstrapRawBoundaryBinding(
-                    visible, this.declarations, bootstrapEvalContext(this.declarations)
-                ))
+                val binding = BootstrapRawBoundaryBinding(
+                    visible, declarations, bootstrapEvalContext(declarations)
+                )
+                if (frame >= 0) this.frames[frame].local.set(registration.name, binding)
+                else this.bindings.set(registration.name, binding)
             }
         }
     }
 
-    fun collect(path: string): void {
+    fun collect(scope: int, path: string): void {
         if (this.seen.get(path) != null) return
         this.seen.set(path, true)
         var source = ""
@@ -4263,32 +4285,78 @@ class BootstrapRawImportScope(
         if (overlay >= 0) source = this.overlaySources[overlay]
         else if (Path(path).info().isFile()) source = Path(path).readText()
         if (source == "") return
-        val scan = bootstrapScanImports(source)
+        val host = if (bootstrapMayUseRawProvider(source)) {
+            val plan = bootstrapRawScanImportFrame(scope, path, source)
+            if (plan.sites.size > 0) bootstrapRawHostSource(
+                source, plan.chunks, BootstrapSourceRewrite("", [], [], [], [])
+            ) else ""
+        } else ""
+        val scan = bootstrapScanImports(if (host == "") source else host)
         for (edge in scan.edges) {
             if (!edge.provider && !edge.contractOnly) {
-                this.collect(bootstrapResolveImport(path, edge.source))
+                this.collect(scope, bootstrapResolveImport(path, edge.source))
             }
         }
-        val discovery = bootstrapModuleDiscovery(source, path)
+        val discovery = bootstrapModuleDiscovery(source, path, host)
         for (declaration in discovery.declarations) {
             this.declarations.append(declaration)
         }
-        this.addRegistrations(path, discovery, false)
+        this.addRegistrations(path, discovery, -1)
     }
 
-    fun lookup(name: string, begin: int): BootstrapRawBoundaryBinding? {
-        while (this.resolved < this.pending.size) {
-            val target = this.pending[this.resolved]
-            this.resolved += 1
-            this.collect(target)
+    fun lookup(scope: int, frame: int, name: string, begin: int): BootstrapRawBoundaryBinding? {
+        while (this.frames[frame].resolved < this.frames[frame].pending.size) {
+            val target = this.frames[frame].pending[this.frames[frame].resolved]
+            this.frames[frame].resolved += 1
+            this.collect(scope, target)
         }
-        val binding = this.bindings.get(name)
-        if (binding != null && binding.registration.availableFrom <= begin) return binding
-        null
+        var next = this.frames[frame].nextRegistration
+        if (next >= 0 && next < begin) {
+            val path = this.frames[frame].path
+            val source = this.frames[frame].source
+            while (next >= 0 && next < begin) {
+                next = source.indexOf("compilerRegisterSubparser", next + 1)
+            }
+            this.frames[frame].nextRegistration = next
+            val discovery = bootstrapModuleDiscovery(bootstrapRawPlanPrefix(begin), path)
+            this.frames[frame].declarations.truncate(0)
+            for (declaration in this.declarations) this.frames[frame].declarations.append(declaration)
+            for (declaration in discovery.declarations) this.frames[frame].declarations.append(declaration)
+            this.addRegistrations(path, discovery, frame)
+        }
+        val imported = this.bindings.get(name)
+        if (imported != null) return imported
+        val local = this.frames[frame].local.get(name)
+        if (local != null && local.registration.availableFrom <= begin) return local
+        return null
+    }
+
+    fun noteImport(frame: int, begin: int): void {
+        val path = this.frames[frame].path
+        val scan = bootstrapScanImportsWithIdentity(this.frames[frame].source, path, begin)
+        for (edge in scan.edges) {
+            if (!edge.provider && !edge.contractOnly) {
+                this.frames[frame].pending.append(bootstrapResolveImport(path, edge.source))
+            }
+        }
     }
 }
 
 var bootstrapRawImportScopes: array<BootstrapRawImportScope> = []
+
+fun bootstrapRawScanImportFrame(scope: int, path: string, source: string): BootstrapRawLayout {
+    val frame = bootstrapRawImportScopes[scope].frames.size
+    bootstrapRawImportScopes[scope].frames.append(BootstrapRawImportFrame(
+        path, source, source.indexOf("compilerRegisterSubparser")
+    ))
+    val layout = bootstrapPlanRawSource(source, { name, begin ->
+        bootstrapRawImportScopes[scope].lookup(scope, frame, name, begin)
+    }, { begin ->
+        bootstrapRawImportScopes[scope].noteImport(frame, begin)
+    })
+    bootstrapRawImportScopes[scope].frames.removeLast()
+    layout
+}
 
 class BootstrapModuleGraph(
     val modules: array<BootstrapModule>,
@@ -4301,7 +4369,7 @@ class BootstrapModuleGraph(
     val index: BootstrapModuleGraphIndex
 ) {
     fun rawSnapshot(snapshot: BootstrapModuleSnapshot): BootstrapModuleSnapshot {
-        if (!bootstrapMayUseRawProvider(snapshot.source)) return snapshot
+        if (!snapshot.mayUseRawProvider) return snapshot
         val known = this.state.rawDiscoveredIn.get(snapshot.path)
         if (known == this.state.build) return snapshot
         this.state.rawDiscoveredIn.set(snapshot.path, this.state.build)
@@ -4318,25 +4386,7 @@ class BootstrapModuleGraph(
             this.state.syntaxOnly, overlayPaths, overlaySources
         ))
         bootstrapRawImportScopes[scope].seen.set(path, true)
-        if (bootstrapActionsRegisterSubparser(snapshot.discovery.actions)) {
-            val local = bootstrapModuleDiscovery(source, path)
-            for (declaration in local.declarations) {
-                bootstrapRawImportScopes[scope].declarations.append(declaration)
-            }
-            bootstrapRawImportScopes[scope].addRegistrations(path, local, true)
-        }
-        val plan = bootstrapPlanRawSource(source, { name, begin ->
-            bootstrapRawImportScopes[scope].lookup(name, begin)
-        }, { begin ->
-            val scan = bootstrapScanImportsWithIdentity(source, path, begin)
-            for (edge in scan.edges) {
-                if (!edge.provider && !edge.contractOnly) {
-                    bootstrapRawImportScopes[scope].pending.append(
-                        bootstrapResolveImport(path, edge.source)
-                    )
-                }
-            }
-        })
+        val plan = bootstrapRawScanImportFrame(scope, path, source)
         bootstrapRawImportScopes.removeLast()
         if (plan.sites.size == 0 && snapshot.rawSites.size == 0) return snapshot
         val host = bootstrapRawHostSource(snapshot.source, plan.chunks, BootstrapSourceRewrite("", [], [], [], []))
@@ -4344,7 +4394,8 @@ class BootstrapModuleGraph(
         val result = BootstrapModuleSnapshot(
             snapshot.path, snapshot.source, imports.edges, imports.errors, snapshot.exists,
             snapshot.size, snapshot.revision, snapshot.firstFingerprint, snapshot.secondFingerprint,
-            bootstrapModuleDiscovery(snapshot.source, snapshot.path, host), plan.chunks, host, plan.sites
+            bootstrapModuleDiscovery(snapshot.source, snapshot.path, host), plan.chunks, host,
+            plan.sites, snapshot.mayUseRawProvider
         )
         this.state.replaceRawSnapshot(result)
     }
@@ -4567,7 +4618,7 @@ class BootstrapModuleGraph(
         if (!typesOnly) this.index.contractRoots.set(identity, 1)
         if (!this.contains(identity)) {
             this.checkModuleManifest(identity)
-            val snapshot = this.state.acquire(identity)
+            val snapshot = this.rawSnapshot(this.state.acquire(identity))
             this.errors = this.errors + snapshot.importErrors
             if (snapshot.importErrors > 0) {
                 this.diagnostics =
