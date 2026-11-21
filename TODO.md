@@ -171,8 +171,10 @@ campaign: the static compiler built by itself is byte-identical; the whole suite
 compiler has no imports: it accepts a compiler with no interpreter and no needed library); all tests/cases/modules programs and --emit-llvm text of float-heavy
 programs are byte-identical from both compilers (same ABLA_SYSROOT and job counts: a bare static binary has no launcher); peak RSS building the compiler 1.67 GB
 against 1.75 GB, hello 164 MB against 242 MB; (9) the switch is André's decision #90 (the release already carries the static compiler as an extra asset; the
-`compiler` allowlist of test-libc-imports goes empty then; the fork's static archives need Xtensa for it). Known gaps: __strtof_l rounds through a double, localtime
-is UTC, a few libm functions are approximations by composition.
+`compiler` allowlist of test-libc-imports goes empty then; no fork archives are needed for Xtensa: the compiler never links Xtensa in process and test-llvm-xtensa
+passes with the static compiler). The static compiler for AArch64 Linux (ablac-60-2) runs under qemu, JIT and the compile-time tiers included, on static archives built locally;
+its CI cache workflow comes with batch DN. strtof rounds once to a float (36,040 strtof cases identical to glibc's). Known gaps: localtime is UTC, a few libm functions are
+approximations by composition.
 
 Step 5, the heap (ablac-87, branch heap-806-step5): the runtime heap's malloc, calloc, realloc and
 free are Abla code over mmap, munmap, mremap and madvise on x86-64 Linux (`__ablaRuntimeHostHeap*`
