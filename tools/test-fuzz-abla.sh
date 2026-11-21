@@ -37,6 +37,17 @@ fi
 [[ $output == *"exited with status 3"* ]] || { echo "fuzz: status control: $output" >&2; exit 1; }
 echo "fuzz: an oracle failure and a non-zero exit are reported through every mode"
 
+# The build-file-relative paths axis (ABLA_FUZZ_BUILD_PATHS=1, tools/fuzz/build-paths.sh): a program built from four directories, the old
+# working-directory reading and four escapes agree with every mode; a planted difference between the builds is reported.
+printf 'import "abla/io"\n\n@export("run")\nfun run(): int {\n    println("c0=1")\n    0\n}\n\nfun main: int = run()\n' > "$controls/paths.ab"
+ABLA_FUZZ_BUILD_PATHS=1 fuzz --program "$controls/paths.ab"
+if output=$(ABLA_FUZZ_BUILD_PATHS=1 ABLA_FUZZ_BUILD_PATHS_PLANT=behaviour fuzz --program "$controls/paths.ab"); then
+    echo "fuzz: a planted build-paths difference was not reported: $output" >&2
+    exit 1
+fi
+[[ $output == *"build-paths"* ]] || { echo "fuzz: build-paths control: $output" >&2; exit 1; }
+echo "fuzz: the build-paths axis agrees with the other modes and reports a planted difference"
+
 fuzz --seeds 100000-100001 --checks 12
 fuzz --replay
 fuzz --control-oracle default_owner_check,ownership_lifetime_check,fresh_select_check,json_check,yaml_check,gzip_check,region_member_check

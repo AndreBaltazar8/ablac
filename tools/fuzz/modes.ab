@@ -5,6 +5,7 @@
 // `timeout`, so a hang ends with status 124. A mode's result is its standard output (bytes, unchanged: a byte slice
 // may cut a UTF-8 sequence) and exit status, or the first lines of its build errors.
 import "abla/text"
+import "abla/integer"
 import "abla/fs"
 import "abla/process/time"
 import "abla/sys/linux/process"
@@ -186,6 +187,23 @@ fun fuzzPruneWarmResult(mode: string, job: FuzzJob, out: string): FuzzResult {
     FuzzResult(mode, true, fuzzReadText("$out.stdout"), job.statuses[3], fuzzFirstLines(fuzzReadText("$out.stderr"), 1))
 }
 
+/** The build-file-relative paths axis (tools/fuzz/build-paths.sh, decision #91 A): the program is the child of a build file in a generated project, built from
+ * four directories, with the old working-directory reading and paths that leave the project checked too. Its result is the artifact's output, or a violation. */
+fun fuzzBuildPathsJob(runner: FuzzRunner, source: string, out: string): FuzzJob {
+    val script = "${runner.root}/tools/fuzz/build-paths.sh"
+    // Eight builds in one step: a longer limit than a single mode's.
+    val step = FuzzStep(["timeout", "-k", "5", "${runner.timeout * 4}", script, runner.compiler, source, out], [], [], "$out.build.out", "$out.build.err", true)
+    FuzzJob([step], 0, 0, [])
+}
+
+fun fuzzBuildPathsResult(mode: string, job: FuzzJob, out: string): FuzzResult {
+    if (job.statuses.size == 0 || job.statuses[0] != 0 || !Path("$out/result.status").exists()) {
+        return FuzzResult(mode, false, "", 0, fuzzFirstLines(fuzzReadText("$out.build.err"), 6))
+    }
+    val status = fuzzReadText("$out/result.status").trim()
+    FuzzResult(mode, true, fuzzReadText("$out/result.out"), status.parseInt() ?? 0, [])
+}
+
 fun fuzzNativeResult(mode: string, job: FuzzJob, out: string): FuzzResult {
     if (job.statuses.size == 0 || job.statuses[0] != 0) {
         return FuzzResult(mode, false, "", 0, fuzzFirstLines(fuzzReadText("$out.build.err"), 6))
@@ -301,6 +319,11 @@ fun FuzzRunner.modesOf(relative: string, plainRelative: string, ctRelative: stri
             axes.append(name)
         }
     }
+    val buildPaths = linuxEnvironment("ABLA_FUZZ_BUILD_PATHS")
+    if (buildPaths.found && buildPaths.value == "1") {
+        jobs.append(fuzzBuildPathsJob(this, plain, "$directory/build-paths"))
+        axes.append("build-paths")
+    }
     this.runJobs(jobs)
     val results: array<FuzzResult> = [
         fuzzNativeResult("fast", jobs[0], "$directory/fast"),
@@ -317,7 +340,9 @@ fun FuzzRunner.modesOf(relative: string, plainRelative: string, ctRelative: stri
     }
     var axis = if (includeWasm) next + 1 else next
     for (name in axes) {
-        results.append(if (name.startsWith("prune-warm")) fuzzPruneWarmResult(name, jobs[axis], "$directory/$name") else fuzzNativeResult(name, jobs[axis], "$directory/$name"))
+        results.append(if (name.startsWith("prune-warm")) fuzzPruneWarmResult(name, jobs[axis], "$directory/$name")
+            else if (name == "build-paths") fuzzBuildPathsResult(name, jobs[axis], "$directory/$name")
+            else fuzzNativeResult(name, jobs[axis], "$directory/$name"))
         axis = axis + 1
     }
     if (includeWasm) fuzzWasmResults(this, jobs[next], directory, results)

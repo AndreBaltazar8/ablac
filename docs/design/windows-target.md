@@ -174,12 +174,14 @@ Recommended order inside step 1: W1g (paths, Linux-only refactor) can start imme
 8. **Antivirus/Defender and the runner**: first-run scans slow newly built `.exe`s and can lock them (`ERROR_SHARING_VIOLATION` on rename/delete of a just-written exe): the retry loop in the file layer is part of the design for this reason.
 9. **Unknown**: `ProcessPrng` and `WaitOnAddress` availability on the Server 2019 baseline are documented; `SetThreadStackGuarantee` behaviour for non-main threads is the one I could not confirm from documentation alone and want to test first on a runner (the first thing W1e does). Windows 11 arm64 runner availability for step 3.
 
-## Decisions needed (for André, through the lead)
+## Decisions (André, #104, 2026-11-21)
 
-1. **Step 2 C++ closure:** link the static MSVC CRT into the first Windows compiler (recommended), or require a CRT-free compiler from the start. Not needed before step 1 is done.
-2. **Exit status of an unhandled panic on Windows:** same numeric status as Linux (recommended) or the Windows convention (an `0xC0000409`-style status).
-3. **Windows baseline:** Windows 10 1809 / Server 2019 and newer (recommended: gives `WaitOnAddress`, `ProcessPrng`, `AF_UNIX`, `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` at 1803+), or Windows 11 only (smaller test matrix, fewer users).
-4. **Console encoding policy:** `SetConsoleOutputCP(CP_UTF8)` at startup (recommended; changes a process-global setting that persists in the parent console after exit unless restored: restore on exit), or per-write `WriteConsoleW`.
+All four were taken as recommended:
+
+1. **Step 2 C++ closure:** the first Windows compiler links the static MSVC CRT. Programs it builds stay CRT-free (the import-allowlist lane enforces it); a CRT-free compiler is a later, separate todo.
+2. **Exit status of an unhandled panic on Windows:** the same numeric status as on Linux.
+3. **Baseline:** Windows 10 1809 / Server 2019 and newer.
+4. **Console encoding:** `SetConsoleOutputCP(CP_UTF8)` (and the input code page) at startup, the previous code pages restored on exit; `WriteConsoleW` only if the code page cannot be set.
 
 ## First tasks, once approved (each its own todo)
 
