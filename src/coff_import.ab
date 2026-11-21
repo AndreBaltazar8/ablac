@@ -1,0 +1,71 @@
+// The import library of a Windows DLL, written without an SDK, `llvm-dlltool` or `llvm-lib` (the Windows target's design,
+// docs/design/windows-target.md): an `ar` archive of short import objects (the PE specification's "Import Library Format"),
+// one per imported function, with the archive's symbol table (the first linker member) naming `__imp_<name>` and `<name>`
+// for each. lld-link reads it as any import library: a reference to `<name>` becomes a call through the import address
+// table, and the DLL is named in the executable's import directory. Only functions (the CODE import type, imported by
+// name) are written: the runtime imports no variables, and an ordinal import is no use to a program that must run on
+// every Windows version of its baseline.
+//
+// Pure functions of their arguments: the same names give the same bytes (the header's time stamp is 0), which the
+// reproducible link of a Windows program relies on.
+import "abla/bytes"
+import "abla/text"
+
+// IMAGE_FILE_MACHINE_AMD64 and IMAGE_FILE_MACHINE_ARM64.
+fun bootstrapCoffMachine(architecture: string): int =
+    if (architecture == "x86_64") 34404 else if (architecture == "aarch64") 43620 else 0
+
+fun bootstrapCoffLittle16(value: int): string = byteEncode(value & 255) + byteEncode((value >> 8) & 255)
+
+fun bootstrapCoffLittle32(value: int): string =
+    bootstrapCoffLittle16(value & 65535) + bootstrapCoffLittle16((value >> 16) & 65535)
+
+fun bootstrapCoffBig32(value: int): string =
+    byteEncode((value >> 24) & 255) + byteEncode((value >> 16) & 255) + byteEncode((value >> 8) & 255) + byteEncode(value & 255)
+
+// One short import object: IMPORT_OBJECT_HEADER (20 bytes), the function's name and the DLL's, each NUL-ended. The type
+// word is 4: import type CODE (0) and name type NAME (1, shifted by 2).
+fun bootstrapCoffImportObject(dll: string, name: string, machine: int): string {
+    val names = name + "\u0000" + dll + "\u0000"
+    bootstrapCoffLittle16(0) + bootstrapCoffLittle16(65535) + bootstrapCoffLittle16(0) + bootstrapCoffLittle16(machine) +
+        bootstrapCoffLittle32(0) + bootstrapCoffLittle32(names.size) + bootstrapCoffLittle16(0) + bootstrapCoffLittle16(4) + names
+}
+
+// An archive member: the 60-byte header (name, date, owner, group, mode, size, end marker), the data, and a newline to
+// reach an even offset.
+fun bootstrapCoffArchiveMember(name: string, data: string): string {
+    val field = (name + "/").padEnd(16, " ")
+    val size = "${data.size}".padEnd(10, " ")
+    val header = field + "0".padEnd(12, " ") + "0".padEnd(6, " ") + "0".padEnd(6, " ") + "0".padEnd(8, " ") + size + "`\n"
+    if (data.size % 2 == 1) header + data + "\n" else header + data
+}
+
+// The archive: "!<arch>\n", the symbol table member, then the import objects in the order of `names`. The symbol table is
+// the first linker member's layout (big-endian count and member offsets, then the NUL-ended names), two symbols per
+// object, each at its object's offset.
+fun bootstrapCoffImportLibrary(dll: string, architecture: string, names: array<string>): string {
+    val machine = bootstrapCoffMachine(architecture)
+    if (machine == 0) return ""
+    val objects: array<string> = []
+    val members: array<string> = []
+    for (name in names) {
+        val data = bootstrapCoffImportObject(dll, name, machine)
+        objects.append(data)
+        members.append(bootstrapCoffArchiveMember("i${objects.size}", data))
+    }
+    var strings = ""
+    for (name in names) strings = strings + "__imp_" + name + "\u0000" + name + "\u0000"
+    val count = names.size * 2
+    val tableSize = 4 + count * 4 + strings.size
+    val tableMember = 60 + tableSize + (if (tableSize % 2 == 1) 1 else 0)
+    var offset = 8 + tableMember
+    var offsets = ""
+    for (member in members) {
+        offsets = offsets + bootstrapCoffBig32(offset) + bootstrapCoffBig32(offset)
+        offset = offset + member.size
+    }
+    val table = bootstrapCoffBig32(count) + offsets + strings
+    var result = "!<arch>\n" + bootstrapCoffArchiveMember("", table)
+    for (member in members) result = result + member
+    result
+}
