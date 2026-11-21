@@ -1,0 +1,228 @@
+// The REPL's own line editor (no readline, no libc): where standard input and output are a terminal, a line is read
+// with the terminal's line mode, echo and signal keys off, so the keys below edit it; the terminal's settings come
+// back before the line is run, so a running entry is interrupted by Ctrl-C as before. Elsewhere (a pipe, a file,
+// TERM=dumb, ABLA_REPL_EDITOR=0) a line is read as it comes, and the output is the same as before.
+//
+// Keys: left and right, Home and End (and Ctrl-A, Ctrl-E), Backspace, Delete, up and down through the session's
+// earlier lines, Ctrl-K (to the end) and Ctrl-U (to the start) cut, Ctrl-C drops the entry, Ctrl-D on an empty line
+// ends the input. A line longer than the terminal's width is redrawn on its last row only.
+import "abla/bytes"
+import "abla/text"
+import "abla/sys/linux"
+import "abla/sys/linux/io"
+import "abla/sys/linux/process"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+private noescape extern:"intrinsic" fun ablaHostIsMacOS(): bool
+
+class BootstrapReplEditorLine(
+    val text: string,
+    // 0 a line, 1 the end of the input, 2 dropped (Ctrl-C)
+    val kind: int
+)
+
+// 0 not decided yet, 1 the editor, 2 lines as they come.
+var bootstrapReplEditorState = 0
+var bootstrapReplEditorHistory: array<string> = []
+// Bytes read and not used yet (an escape sequence arrives in one read).
+var bootstrapReplEditorPending = ""
+
+// The local-flag bits the editor clears: ISIG, ICANON, ECHO and IEXTEN, whose values differ on macOS (where the
+// runtime gives its local flags at Linux's place: stdlib/abla/runtime/platform/darwin/entry.ab, ioctl 16).
+fun bootstrapReplEditorFlags(): int = if (ablaHostIsMacOS()) 128 | 256 | 8 | 1024 else 1 | 2 | 8 | 32768
+
+// The terminal's settings of `descriptor` into `settings` (Linux's struct termios, TCGETS 21505); false when it is no
+// terminal.
+trusted fun bootstrapReplEditorGet(descriptor: int, var settings: NativeByteBuffer): bool =
+    linuxSyscall3(16, descriptor, 21505, nativePointerAddress(settings.address)) == 0
+
+// TCSETS 21506 on standard input.
+trusted fun bootstrapReplEditorSet(var settings: NativeByteBuffer): bool =
+    linuxSyscall3(16, 0, 21506, nativePointerAddress(settings.address)) == 0
+
+// Whether this process's group is the terminal's foreground one (TIOCGPGRP: 21519 on Linux, 0x40047477 on macOS,
+// against getpgid(0)). A background group that changes the terminal's settings is stopped (SIGTTOU): one that runs
+// under `timeout` (tools/run-limited.sh) reads its lines as they come.
+trusted fun bootstrapReplEditorForeground(var scratch: NativeByteBuffer): bool {
+    scratch.storeI64(0, 0)
+    val request = if (ablaHostIsMacOS()) 1074033783 else 21519
+    if (linuxSyscall3(16, 0, request, nativePointerAddress(scratch.address)) != 0) return false
+    val foreground = scratch.loadI64(0) & 4294967295
+    foreground == linuxSyscall1(121, 0)
+}
+
+fun bootstrapReplEditorOn(): bool {
+    if (bootstrapReplEditorState == 0) {
+        val choice = linuxEnvironment("ABLA_REPL_EDITOR")
+        val terminal = linuxEnvironment("TERM")
+        var on = !(choice.found && choice.value == "0") && !(terminal.found && terminal.value == "dumb")
+        if (on) {
+            val settings = nativeByteBuffer(64)
+            on = bootstrapReplEditorGet(0, settings) && bootstrapReplEditorGet(1, settings) &&
+                bootstrapReplEditorForeground(settings)
+            settings.close()
+        }
+        bootstrapReplEditorState = if (on) 1 else 2
+    }
+    bootstrapReplEditorState == 1
+}
+
+// The next byte of the input, or -1 at its end.
+fun bootstrapReplEditorByte(): int {
+    if (bootstrapReplEditorPending.size == 0) {
+        val chunk = LinuxFileDescriptor(0).read(64)
+        if (chunk.size == 0) return -1
+        bootstrapReplEditorPending = chunk
+    }
+    val byte = bootstrapReplEditorPending[0]
+    bootstrapReplEditorPending = bootstrapReplEditorPending.slice(1, bootstrapReplEditorPending.size)
+    byte
+}
+
+// The characters (not bytes: UTF-8 continuation bytes count with their lead) of `text` from `begin` to `end`.
+fun bootstrapReplEditorWidth(text: string, begin: int, end: int): int {
+    var count = 0
+    var index = begin
+    while (index < end) {
+        if ((text[index] & 192) != 128) count = count + 1
+        index = index + 1
+    }
+    count
+}
+
+fun bootstrapReplEditorLeft(text: string, cursor: int): int {
+    var at = cursor
+    if (at > 0) at = at - 1
+    while (at > 0 && (text[at] & 192) == 128) at = at - 1
+    at
+}
+
+fun bootstrapReplEditorRight(text: string, cursor: int): int {
+    var at = cursor
+    if (at < text.size) at = at + 1
+    while (at < text.size && (text[at] & 192) == 128) at = at + 1
+    at
+}
+
+// The line drawn again: the prompt, the text, the rest of the row cleared, the cursor put back.
+fun bootstrapReplEditorDraw(prompt: string, text: string, cursor: int): void {
+    val back = bootstrapReplEditorWidth(text, cursor, text.size)
+    linuxPrintStandardOutput(if (back > 0) "\r$prompt$text\x1b[K\x1b[${back}D" else "\r$prompt$text\x1b[K")
+    return
+}
+
+// One line, read after `prompt` (printed here) with the keys of the file's header.
+trusted fun bootstrapReplEditorRead(prompt: string): BootstrapReplEditorLine {
+    val saved = nativeByteBuffer(64)
+    val raw = nativeByteBuffer(64)
+    bootstrapReplEditorGet(0, saved)
+    bootstrapReplEditorGet(0, raw)
+    // The local flags: a 32-bit word at 12.
+    var flags = 0
+    for (byte in 0 until 4) flags = flags | (raw.load(12 + byte) << (8 * byte))
+    flags = flags & ~bootstrapReplEditorFlags()
+    for (byte in 0 until 4) raw.store(12 + byte, (flags >> (8 * byte)) & 255)
+    // VMIN 1, VTIME 0 (c_cc at 17: VTIME 5, VMIN 6); macOS keeps its own, which are these by default.
+    if (!ablaHostIsMacOS()) {
+        raw.store(22, 0)
+        raw.store(23, 1)
+    }
+    bootstrapReplEditorSet(raw)
+    linuxPrintStandardOutput(prompt)
+    var text = ""
+    var cursor = 0
+    var recalled = bootstrapReplEditorHistory.size
+    var draft = ""
+    var kind = -1
+    while (kind < 0) {
+        val byte = bootstrapReplEditorByte()
+        if (byte < 0) {
+            kind = if (text.size == 0) 1 else 0
+        } else if (byte == 13 || byte == 10) {
+            kind = 0
+        } else if (byte == 3) {
+            kind = 2
+        } else if (byte == 4) {
+            // Ctrl-D: the end of the input on an empty line, else Delete.
+            if (text.size == 0) kind = 1
+            else if (cursor < text.size) {
+                text = "${text.slice(0, cursor)}${text.slice(bootstrapReplEditorRight(text, cursor), text.size)}"
+            }
+        } else if (byte == 127 || byte == 8) {
+            val start = bootstrapReplEditorLeft(text, cursor)
+            text = "${text.slice(0, start)}${text.slice(cursor, text.size)}"
+            cursor = start
+        } else if (byte == 1) {
+            cursor = 0
+        } else if (byte == 5) {
+            cursor = text.size
+        } else if (byte == 11) {
+            text = text.slice(0, cursor)
+        } else if (byte == 21) {
+            text = text.slice(cursor, text.size)
+            cursor = 0
+        } else if (byte == 27) {
+            // ESC [ or ESC O, parameters (digits and ;), and the final byte.
+            val opener = bootstrapReplEditorByte()
+            if (opener == 91 || opener == 79) {
+                var parameter = ""
+                var final = bootstrapReplEditorByte()
+                while (final >= 48 && final <= 59) {
+                    parameter = "$parameter${if (final == 59) ";" else "${final - 48}"}"
+                    final = bootstrapReplEditorByte()
+                }
+                if (final == 68) cursor = bootstrapReplEditorLeft(text, cursor)
+                else if (final == 67) cursor = bootstrapReplEditorRight(text, cursor)
+                else if (final == 72 || (final == 126 && (parameter == "1" || parameter == "7"))) cursor = 0
+                else if (final == 70 || (final == 126 && (parameter == "4" || parameter == "8"))) cursor = text.size
+                else if (final == 126 && parameter == "3" && cursor < text.size) {
+                    text = "${text.slice(0, cursor)}${text.slice(bootstrapReplEditorRight(text, cursor), text.size)}"
+                } else if (final == 65 && recalled > 0) {
+                    if (recalled == bootstrapReplEditorHistory.size) draft = text
+                    recalled = recalled - 1
+                    text = bootstrapReplEditorHistory[recalled]
+                    cursor = text.size
+                } else if (final == 66 && recalled < bootstrapReplEditorHistory.size) {
+                    recalled = recalled + 1
+                    text = if (recalled == bootstrapReplEditorHistory.size) draft else bootstrapReplEditorHistory[recalled]
+                    cursor = text.size
+                }
+            }
+        } else if (byte >= 32) {
+            // A printable byte (a UTF-8 sequence arrives byte by byte, each inserted where the last went).
+            val character = bootstrapReplEditorPendingByte(byte)
+            text = "${text.slice(0, cursor)}$character${text.slice(cursor, text.size)}"
+            cursor = cursor + character.size
+        }
+        if (kind < 0) bootstrapReplEditorDraw(prompt, text, cursor)
+    }
+    linuxPrintStandardOutput(if (kind == 2) "^C\n" else "\n")
+    bootstrapReplEditorSet(saved)
+    saved.close()
+    raw.close()
+    if (kind == 0 && text.trim() != "" &&
+        (bootstrapReplEditorHistory.size == 0 ||
+            bootstrapReplEditorHistory[bootstrapReplEditorHistory.size - 1] != text)) {
+        bootstrapReplEditorHistory.append(text)
+    }
+    BootstrapReplEditorLine(text, kind)
+}
+
+// `byte` as a string, with the continuation bytes of its UTF-8 sequence that follow it in the input.
+fun bootstrapReplEditorPendingByte(byte: int): string {
+    var length = 1
+    if (byte >= 240) length = 4 else if (byte >= 224) length = 3 else if (byte >= 192) length = 2
+    val bytes = byteBuffer()
+    bytes.appendByteValue(byte)
+    var count = 1
+    while (count < length) {
+        val next = bootstrapReplEditorByte()
+        if (next < 0) count = length
+        else {
+            bytes.appendByteValue(next)
+            count = count + 1
+        }
+    }
+    bytes.toText()
+}

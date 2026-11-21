@@ -100,4 +100,47 @@ commands_out=$(< "$base.commands.out")
     { echo 'repl (commands): :help, an unknown command or a spaced :quit was not handled as a command' >&2; cat "$base.commands.out" "$base.commands.err" >&2; exit 1; }
 [[ $(grep -o '42' "$base.generations.out" | wc -l) -eq 32 ]] || exit 1
 
-printf '%s\n' 'persistent REPL: retained definitions + recovery + reclaimed JIT generations + entries over several lines + commands + diagnostics placed in the entry; live: state across lines, a contained panic, a refused redefinition'
+# The line editor (src/repl_editor.ab), on a terminal: util-linux's script gives the REPL one, and the keys go in
+# through a FIFO, each batch only once the REPL has drawn its next prompt (the editor is on only while it reads).
+# Left arrow then an insert (24), up twice to the first line (42 again), Ctrl-C drops "999", Backspace (7), Ctrl-D
+# ends. Where script is not util-linux's (macOS), the rest of this file is the check.
+editor=skipped
+if script --version 2>/dev/null | grep util-linux >/dev/null; then
+    rm -f "$base.editor.in" "$base.editor.out"
+    mkfifo "$base.editor.in"
+    # Not through run-limited.sh (or build/ablac, the launcher around it): its timeout puts the REPL in a process group
+    # of its own, a background one on the terminal, where the editor stays off. The launcher's payload runs instead,
+    # with the standard library the launcher would name; timeout bounds script from outside.
+    payload=$compiler
+    [[ -L $compiler && -x $compiler.bin ]] && payload=$compiler.bin
+    TERM=xterm ABLA_SYSROOT=${ABLA_SYSROOT:-$project_root} timeout 300 \
+        script -qfec "'$payload' repl" "$base.editor.out" < "$base.editor.in" > /dev/null 2>&1 &
+    editor_pid=$!
+    exec 3> "$base.editor.in"
+    # A fresh prompt; a redraw prints it again after a carriage return.
+    prompts() { echo $(($(grep -o 'abla> ' "$base.editor.out" 2>/dev/null | wc -l) - $(grep -o $'\rabla> ' "$base.editor.out" 2>/dev/null | wc -l))); }
+    keys() { # prompts-to-wait-for keys
+        local waited=0
+        until [[ $(prompts) -ge $1 ]]; do
+            sleep 0.2
+            waited=$((waited + 1))
+            ((waited < 1500)) || { echo 'repl (editor): no prompt came' >&2; cat -v "$base.editor.out" >&2; exit 1; }
+        done
+        printf "$2" >&3
+    }
+    keys 1 '20 + 22\r'
+    keys 2 '4\033[D2\r'
+    keys 3 '\033[A\033[A\r'
+    keys 4 '999\003'
+    keys 5 '1\1777\r'
+    keys 6 '\004'
+    exec 3>&-
+    wait "$editor_pid" || { echo 'repl (editor): the session did not end on Ctrl-D' >&2; cat -v "$base.editor.out" >&2; exit 1; }
+    # Each redraw starts with a carriage return: as line breaks, the values are lines of their own.
+    values=$(sed 's/\x1b\[[0-9;]*[A-Za-z]//g' "$base.editor.out" | tr '\r' '\n' | grep -vx '' | grep -v '^abla> \|^Script ')
+    [[ $values == $'42\n24\n42\n7' ]] && grep -q '\^C' "$base.editor.out" ||
+        { echo "repl (editor): the keys did not edit the lines (values: $values)" >&2; cat -v "$base.editor.out" >&2; exit 1; }
+    editor=checked
+fi
+
+printf '%s\n' "persistent REPL: retained definitions + recovery + reclaimed JIT generations + entries over several lines + commands + diagnostics placed in the entry + line editor ($editor); live: state across lines, a contained panic, a refused redefinition"

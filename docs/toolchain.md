@@ -448,8 +448,12 @@ program with nothing defined. Elsewhere `repl` compiles each line on its own in 
 declarations persist. In both, an entry whose bracket (`(`, `[`, `{`), string or `/*` comment is still open
 continues on the next line (`....> `), so a function or class body can span lines; an empty line ends an
 entry still open. `:help` lists the commands, `:quit` (or the end of the input) ends the session, and any other
-entry starting with `:` is an unknown command, refused without a compile. The REPL has no line editor yet: arrow
-keys and history come from a wrapper, `rlwrap ablac repl`.
+entry starting with `:` is an unknown command, refused without a compile. On a terminal the REPL edits a line
+itself (`src/repl_editor.ab`, no readline): left and right, Home and End (Ctrl-A, Ctrl-E), Backspace and Delete, up
+and down through the session's earlier lines, Ctrl-K and Ctrl-U cut to the end and to the start, Ctrl-C drops the
+entry, and Ctrl-D on an empty line ends the session. The terminal's own settings are back while an entry runs, so
+Ctrl-C interrupts it as before. `ABLA_REPL_EDITOR=0` (or `TERM=dumb`, or input that is not a terminal) reads lines as
+they come.
 
 The interpreter is not a second language implementation. Compile-time `#`
 evaluation, `run`, tests, the REPL, and macro/subparser handlers share the same
