@@ -1,0 +1,435 @@
+// Correctly rounded expm1, log1p, log2, log10, asin, acos, sinh, cosh, tanh, erf and erfc for the statically linked compiler's C library
+// (#1045): each is computed with many more bits than a double has (bigfloat.ab) and rounded once, so the result is the double nearest to the
+// exact value for every argument, which is what a correctly rounded libm (and glibc 2.44's sinh, cosh, tanh, erf, erfc) returns.
+// Clean-room: written from the mathematics. Sources followed:
+//   - Brent and Zimmermann, "Modern Computer Arithmetic" (2010), chapter 4: exp by argument reduction x = k ln 2 + r, r / 2^s and the Taylor
+//     series, squaring s times (here as y <- 2y + y^2 on exp - 1, which keeps the relative accuracy of expm1); log by 2 atanh((m - 1)/(m + 1))
+//     on m in [1/sqrt 2, sqrt 2); atan by halving t <- t / (1 + sqrt(1 + t^2)) and the Taylor series; pi by Machin's formula
+//     16 atan(1/5) - 4 atan(1/239).
+//   - Muller, "Elementary Functions", 3rd ed.: Ziv's strategy (compute with extra bits, round only when the interval of the error holds no
+//     rounding boundary, else recompute with more) and the identities asin x = 2 atan(x / (1 + sqrt(1 - x^2))),
+//     acos x = 2 atan(sqrt((1 - x) / (1 + x))), tanh x = expm1(2x) / (expm1(2x) + 2), sinh x = (E + E / (E + 1)) / 2 with E = expm1 |x|.
+//   - Abramowitz and Stegun 7.1.5 for erf: the series erf x = 2/sqrt(pi) e^(-x^2) sum 2^n x^(2n+1) / (1 3 5 ... (2n+1)), whose terms are all
+//     positive (no cancellation); erfc is 1 - erf with the precision raised by the bits the cancellation takes (about 1.45 x^2).
+// The error of one core call is far below the trust window checked by libcBigRound, so a wrong rounding needs an argument whose exact result
+// lies within about 2^-100 of a midpoint between two doubles, which the table maker's dilemma results for these functions exclude (the worst
+// cases need about 2^-60). tools/test-static-libm.sh compares against MPFR.
+import "abla/float"
+import "abla/math" as mth
+import "./bigfloat.ab"
+
+// ---- constants -----------------------------------------------------------------------------------------------------------------------
+
+// ln 2 = 2 atanh(1/3) = 2 sum (1/3)^(2k+1) / (2k + 1)
+fun libcBigLn2(n: int): BigF {
+    val w = n + 1
+    var power = libcBigDivSmall(libcBigFromInt(1), 3, w)
+    var sum = power
+    var k = 1
+    val floor = 0 - 30 * w - 30
+    while (libcBigTop(power) > floor) {
+        power = libcBigDivSmall(power, 9, w)
+        sum = libcBigAdd(sum, libcBigDivSmall(power, 2 * k + 1, w), w)
+        k += 1
+    }
+    libcBigScale(sum, 1)
+}
+
+// atan(1/q) for an integer q > 1: sum (-1)^k / ((2k + 1) q^(2k+1))
+private fun libcBigAtanInv(q: int, n: int): BigF {
+    val w = n + 1
+    var power = libcBigDivSmall(libcBigFromInt(1), q, w)
+    var sum = power
+    var k = 1
+    val q2 = q * q
+    val floor = 0 - 30 * w - 30
+    while (libcBigTop(power) > floor) {
+        power = libcBigDivSmall(power, q2, w)
+        val term = libcBigDivSmall(power, 2 * k + 1, w)
+        sum = if (k % 2 == 1) libcBigSub(sum, term, w) else libcBigAdd(sum, term, w)
+        k += 1
+    }
+    sum
+}
+
+fun libcBigPi(n: int): BigF {
+    val w = n + 1
+    libcBigSub(libcBigMulSmall(libcBigAtanInv(5, w), 16, w), libcBigMulSmall(libcBigAtanInv(239, w), 4, w), w)
+}
+
+// ---- exp family ----------------------------------------------------------------------------------------------------------------------
+
+// y = exp(r) - 1 for small |r| by the Taylor series (no leading 1: the relative accuracy of y is kept)
+private fun libcBigExpm1Series(r: BigF, n: int): BigF {
+    if (r.m.size == 0) return libcBigZero()
+    var term = r
+    var sum = r
+    var i = 2
+    val floor = libcBigTop(r) - 30 * n - 40
+    while (libcBigTop(term) > floor) {
+        term = libcBigDivSmall(libcBigMul(term, r, n), i, n)
+        sum = libcBigAdd(sum, term, n)
+        i += 1
+    }
+    sum
+}
+
+// exp(x) - 1 and the exponent k and exp(x) = 2^k (1 + y): returns y; the caller reads k from `libcBigExpK`
+class BigExp(val y: BigF, val k: int)
+
+private fun libcBigApprox(a: BigF): f64 = libcBigRound(a, 0).value
+
+// x = k ln 2 + r with |r| <= 0.35, y = expm1(r) by r / 2^s, the series and s doublings y <- 2y + y^2
+fun libcBigExpParts(x: BigF, n: int): BigExp {
+    val w = n + 3
+    if (x.m.size == 0) return BigExp(libcBigZero(), 0)
+    val ln2 = libcBigLn2(w)
+    var k = 0
+    var r = x
+    val approx = libcBigApprox(x)
+    if (mth.fabs(approx) >= 0.34) {
+        val kd = mth.roundEven(approx / 0.6931471805599453)
+        k = f64ToInt(kd)
+        r = libcBigSub(x, libcBigMulSmall(ln2, k, w), w)
+    }
+    // reduce r by 2^s so that |r| < 2^-17
+    var s = libcBigTop(r) + 17
+    if (s < 0) s = 0
+    var y = libcBigExpm1Series(libcBigScale(r, 0 - s), w)
+    for (i in 0 until s) y = libcBigAdd(libcBigScale(y, 1), libcBigMul(y, y, w), w)
+    BigExp(y, k)
+}
+
+// exp(x) - 1
+fun libcBigExpm1(x: BigF, n: int): BigF {
+    val parts = libcBigExpParts(x, n)
+    if (parts.k == 0) return parts.y
+    val w = n + 3
+    libcBigSub(libcBigScale(libcBigAdd(libcBigFromInt(1), parts.y, w), parts.k), libcBigFromInt(1), w)
+}
+
+// exp(x)
+fun libcBigExp(x: BigF, n: int): BigF {
+    val parts = libcBigExpParts(x, n)
+    libcBigScale(libcBigAdd(libcBigFromInt(1), parts.y, n + 3), parts.k)
+}
+
+// ---- log family ----------------------------------------------------------------------------------------------------------------------
+
+// 2 atanh(z) = 2 sum z^(2k+1) / (2k + 1) for small |z|
+private fun libcBigTwoAtanh(z: BigF, n: int): BigF {
+    if (z.m.size == 0) return libcBigZero()
+    val z2 = libcBigMul(z, z, n)
+    var power = z
+    var sum = z
+    var k = 1
+    val floor = libcBigTop(z) - 30 * n - 40
+    while (true) {
+        power = libcBigMul(power, z2, n)
+        if (libcBigTop(power) <= floor) break
+        sum = libcBigAdd(sum, libcBigDivSmall(power, 2 * k + 1, n), n)
+        k += 1
+    }
+    libcBigScale(sum, 1)
+}
+
+class BigLog(val frac: BigF, val exp: int)
+
+// x = m 2^E with m in [1/sqrt 2, sqrt 2): ln(x) = ln(m) + E ln 2, returned as ln(m) and E
+fun libcBigLogParts(x: BigF, n: int): BigLog {
+    val w = n + 2
+    var e = libcBigTop(x) - 1
+    var mm = BigF(false, x.m, x.e - e)
+    // m in [1, 2); fold [sqrt 2, 2) down by one binade
+    if (libcBigApprox(mm) > 1.4142135623730951) {
+        mm = libcBigScale(mm, -1)
+        e += 1
+    }
+    val one = libcBigFromInt(1)
+    val z = libcBigDiv(libcBigSub(mm, one, w), libcBigAdd(mm, one, w), w)
+    BigLog(libcBigTwoAtanh(z, w), e)
+}
+
+fun libcBigLog(x: BigF, n: int): BigF {
+    val parts = libcBigLogParts(x, n)
+    if (parts.exp == 0) return parts.frac
+    libcBigAdd(parts.frac, libcBigMulSmall(libcBigLn2(n + 2), parts.exp, n + 2), n + 2)
+}
+
+// ---- atan family ---------------------------------------------------------------------------------------------------------------------
+
+// atan(t) for t >= 0, by t <- t / (1 + sqrt(1 + t^2)) until t < 2^-6 and the alternating series
+fun libcBigAtan(t0: BigF, n: int): BigF {
+    if (t0.m.size == 0) return libcBigZero()
+    val w = n + 2
+    val one = libcBigFromInt(1)
+    var invert = false
+    var t = t0
+    if (libcBigCmp(t, one) > 0) {
+        t = libcBigDiv(one, t, w)
+        invert = true
+    }
+    var s = 0
+    while (libcBigTop(t) > -6) {
+        val root = libcBigSqrt(libcBigAdd(one, libcBigMul(t, t, w), w), w)
+        t = libcBigDiv(t, libcBigAdd(one, root, w), w)
+        s += 1
+    }
+    val t2 = libcBigMul(t, t, w)
+    var power = t
+    var sum = t
+    var k = 1
+    val floor = libcBigTop(t) - 30 * w - 40
+    while (true) {
+        power = libcBigMul(power, t2, w)
+        if (libcBigTop(power) <= floor) break
+        val term = libcBigDivSmall(power, 2 * k + 1, w)
+        sum = if (k % 2 == 1) libcBigSub(sum, term, w) else libcBigAdd(sum, term, w)
+        k += 1
+    }
+    var result = libcBigScale(sum, s)
+    if (invert) result = libcBigSub(libcBigScale(libcBigPi(w), -1), result, w)
+    result
+}
+
+// ---- rounding with Ziv's strategy ----------------------------------------------------------------------------------------------------
+
+// the trust window for n limbs: the core's relative error is below 2^(-30 n + 120); a double's half ulp is 2^-54
+private fun libcTrust(n: int): int = 30 * n - 120 - 54
+
+// ---- the functions -------------------------------------------------------------------------------------------------------------------
+
+private fun libcNaN2(): f64 = f64FromBits(9221120237041090560)
+private fun libcInf2(): f64 = f64FromBits(9218868437227405312)
+private fun libcIsNaN2(x: f64): bool = x != x
+private fun libcIsInf2(x: f64): bool = x - x != 0.0 && x == x
+
+// expm1: exact tiny arguments return themselves; |x| < 2^-54 gives x (the series' first term, the rest below half an ulp); large positive
+// arguments overflow, large negative ones give -1.
+fun libcCrExpm1(x: f64): f64 {
+    if (libcIsNaN2(x)) return x
+    if (x == 0.0) return x
+    if (libcIsInf2(x)) return if (x > 0.0) x else -1.0
+    if (x > 710.0) return libcInf2()
+    if (x < -40.0) return -1.0
+    var n = 8
+    while (true) {
+        val r = libcBigRound(libcBigExpm1(libcBigFromF64(x), n), libcTrust(n))
+        if (!r.ambiguous || n >= 40) return r.value
+        n += 8
+    }
+    0.0
+}
+
+fun libcCrLog1p(x: f64): f64 {
+    if (libcIsNaN2(x)) return x
+    if (x == 0.0) return x
+    if (x == -1.0) return -libcInf2()
+    if (x < -1.0) return libcNaN2()
+    if (libcIsInf2(x)) return x
+    var n = 8
+    while (true) {
+        val xb = libcBigFromF64(x)
+        var y = libcBigZero()
+        if (x >= -0.29 && x <= 0.41) {
+            // 2 atanh(x / (2 + x)) keeps the relative accuracy for tiny x
+            val z = libcBigDiv(xb, libcBigAdd(libcBigFromInt(2), xb, n + 2), n + 2)
+            y = libcBigTwoAtanhPublic(z, n + 2)
+        } else {
+            y = libcBigLog(libcBigAdd(libcBigFromInt(1), xb, n + 4), n)
+        }
+        val r = libcBigRound(y, libcTrust(n))
+        if (!r.ambiguous || n >= 40) return r.value
+        n += 8
+    }
+    0.0
+}
+
+fun libcBigTwoAtanhPublic(z: BigF, n: int): BigF = libcBigTwoAtanh(z, n)
+
+// log2(x) = E + ln(m) / ln 2 for x = m 2^E
+fun libcCrLog2(x: f64): f64 {
+    if (libcIsNaN2(x)) return x
+    if (x == 0.0) return -libcInf2()
+    if (x < 0.0) return libcNaN2()
+    if (libcIsInf2(x)) return x
+    var n = 8
+    while (true) {
+        val parts = libcBigLogParts(libcBigFromF64(x), n)
+        val ln2 = libcBigLn2(n + 2)
+        var y = libcBigDiv(parts.frac, ln2, n + 2)
+        if (parts.exp != 0) y = libcBigAdd(y, libcBigFromInt(parts.exp), n + 2)
+        val r = libcBigRound(y, libcTrust(n))
+        if (!r.ambiguous || n >= 40) return r.value
+        n += 8
+    }
+    0.0
+}
+
+fun libcCrLog10(x: f64): f64 {
+    if (libcIsNaN2(x)) return x
+    if (x == 0.0) return -libcInf2()
+    if (x < 0.0) return libcNaN2()
+    if (libcIsInf2(x)) return x
+    var n = 8
+    while (true) {
+        val y = libcBigDiv(libcBigLog(libcBigFromF64(x), n + 2), libcBigLog(libcBigFromInt(10), n + 2), n + 2)
+        val r = libcBigRound(y, libcTrust(n))
+        if (!r.ambiguous || n >= 40) return r.value
+        n += 8
+    }
+    0.0
+}
+
+// asin(x) = 2 atan(x / (1 + sqrt(1 - x^2))), with 1 - x^2 = (1 - |x|)(1 + |x|) exact in the factors
+fun libcCrAsin(x: f64): f64 {
+    if (libcIsNaN2(x)) return x
+    if (x == 0.0) return x
+    if (mth.fabs(x) > 1.0) return libcNaN2()
+    var n = 8
+    while (true) {
+        val w = n + 2
+        val ax = libcBigFromF64(mth.fabs(x))
+        val one = libcBigFromInt(1)
+        val root = libcBigSqrt(libcBigMul(libcBigSub(one, ax, w), libcBigAdd(one, ax, w), w), w)
+        val t = libcBigDiv(ax, libcBigAdd(one, root, w), w)
+        var y = libcBigScale(libcBigAtan(t, w), 1)
+        if (x < 0.0) y = libcBigNeg(y)
+        val r = libcBigRound(y, libcTrust(n))
+        if (!r.ambiguous || n >= 40) return r.value
+        n += 8
+    }
+    0.0
+}
+
+// acos(x) = 2 atan(sqrt((1 - x) / (1 + x)))
+fun libcCrAcos(x: f64): f64 {
+    if (libcIsNaN2(x)) return x
+    if (mth.fabs(x) > 1.0) return libcNaN2()
+    if (x == 1.0) return 0.0
+    var n = 8
+    while (true) {
+        val w = n + 2
+        var y = libcBigZero()
+        if (x == -1.0) {
+            y = libcBigPi(w)
+        } else {
+            val xb = libcBigFromF64(x)
+            val one = libcBigFromInt(1)
+            val t = libcBigSqrt(libcBigDiv(libcBigSub(one, xb, w), libcBigAdd(one, xb, w), w), w)
+            y = libcBigScale(libcBigAtan(t, w), 1)
+        }
+        val r = libcBigRound(y, libcTrust(n))
+        if (!r.ambiguous || n >= 40) return r.value
+        n += 8
+    }
+    0.0
+}
+
+// sinh(x) = sign (E + E / (E + 1)) / 2 with E = expm1 |x|
+fun libcCrSinh(x: f64): f64 {
+    if (libcIsNaN2(x) || x == 0.0 || libcIsInf2(x)) return x
+    if (mth.fabs(x) > 711.0) return if (x > 0.0) libcInf2() else -libcInf2()
+    var n = 8
+    while (true) {
+        val w = n + 2
+        val e = libcBigExpm1(libcBigFromF64(mth.fabs(x)), w)
+        var y = libcBigScale(libcBigAdd(e, libcBigDiv(e, libcBigAdd(e, libcBigFromInt(1), w), w), w), -1)
+        if (x < 0.0) y = libcBigNeg(y)
+        val r = libcBigRound(y, libcTrust(n))
+        if (!r.ambiguous || n >= 40) return r.value
+        n += 8
+    }
+    0.0
+}
+
+// cosh(x) = (e^|x| + e^-|x|) / 2 = (E + 2 + E/(E+1)) / 2 ... computed as (1 + E + 1 / (1 + E)) / 2 with E = expm1 |x|
+fun libcCrCosh(x: f64): f64 {
+    if (libcIsNaN2(x)) return x
+    if (libcIsInf2(x)) return mth.fabs(x)
+    if (mth.fabs(x) > 711.0) return libcInf2()
+    var n = 8
+    while (true) {
+        val w = n + 2
+        val one = libcBigFromInt(1)
+        val big = libcBigAdd(one, libcBigExpm1(libcBigFromF64(mth.fabs(x)), w), w)
+        val y = libcBigScale(libcBigAdd(big, libcBigDiv(one, big, w), w), -1)
+        val r = libcBigRound(y, libcTrust(n))
+        if (!r.ambiguous || n >= 40) return r.value
+        n += 8
+    }
+    0.0
+}
+
+// tanh(x) = sign E / (E + 2) with E = expm1(2 |x|)
+fun libcCrTanh(x: f64): f64 {
+    if (libcIsNaN2(x) || x == 0.0) return x
+    if (libcIsInf2(x)) return if (x > 0.0) 1.0 else -1.0
+    if (mth.fabs(x) >= 22.0) return if (x > 0.0) 1.0 else -1.0
+    var n = 8
+    while (true) {
+        val w = n + 2
+        val e = libcBigExpm1(libcBigScale(libcBigFromF64(mth.fabs(x)), 1), w)
+        var y = libcBigDiv(e, libcBigAdd(e, libcBigFromInt(2), w), w)
+        if (x < 0.0) y = libcBigNeg(y)
+        val r = libcBigRound(y, libcTrust(n))
+        if (!r.ambiguous || n >= 40) return r.value
+        n += 8
+    }
+    0.0
+}
+
+// 2/sqrt(pi) e^(-x^2) sum 2^k x^(2k+1) / (2k+1)!!, for x >= 0
+private fun libcBigErfSeries(x: BigF, n: int): BigF {
+    val w = n + 2
+    val x2 = libcBigMul(x, x, w)
+    val twoX2 = libcBigScale(x2, 1)
+    var term = x
+    var sum = x
+    var k = 1
+    val floor = libcBigTop(x) - 30 * w - 40
+    // the terms grow while 2 x^2 > 2k + 1, then fall; stop once they are small and past the peak
+    while (true) {
+        term = libcBigDivSmall(libcBigMul(term, twoX2, w), 2 * k + 1, w)
+        sum = libcBigAdd(sum, term, w)
+        k += 1
+        if (libcBigTop(term) <= libcBigTop(sum) - 30 * w - 30) break
+    }
+    val factor = libcBigScale(libcBigDiv(libcBigExp(libcBigNeg(x2), w), libcBigSqrt(libcBigPi(w), w), w), 1)
+    libcBigMul(sum, factor, w)
+}
+
+fun libcCrErf(x: f64): f64 {
+    if (libcIsNaN2(x) || x == 0.0) return x
+    if (libcIsInf2(x)) return if (x > 0.0) 1.0 else -1.0
+    if (mth.fabs(x) >= 6.0) return if (x > 0.0) 1.0 else -1.0
+    var n = 8
+    while (true) {
+        var y = libcBigErfSeries(libcBigFromF64(mth.fabs(x)), n)
+        if (x < 0.0) y = libcBigNeg(y)
+        val r = libcBigRound(y, libcTrust(n))
+        if (!r.ambiguous || n >= 40) return r.value
+        n += 8
+    }
+    0.0
+}
+
+// erfc(x) = 1 - erf(x) for x >= 0 (the precision grows with the cancellation), 1 + erf(|x|) for x < 0
+fun libcCrErfc(x: f64): f64 {
+    if (libcIsNaN2(x)) return x
+    if (libcIsInf2(x)) return if (x > 0.0) 0.0 else 2.0
+    if (x >= 28.0) return 0.0
+    if (x <= -6.0) return 2.0
+    var n = 8
+    val extra = f64ToInt(1.45 * x * x / 30.0) + 2
+    while (true) {
+        val w = n + extra
+        val erf = libcBigErfSeries(libcBigFromF64(mth.fabs(x)), w)
+        val one = libcBigFromInt(1)
+        val y = if (x < 0.0) libcBigAdd(one, erf, w) else libcBigSub(one, erf, w)
+        val r = libcBigRound(y, libcTrust(n))
+        if (!r.ambiguous || n >= 40) return r.value
+        n += 8
+    }
+    0.0
+}

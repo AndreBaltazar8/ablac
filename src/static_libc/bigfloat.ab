@@ -1,0 +1,378 @@
+// Arbitrary-precision binary floating point for the statically linked compiler's C library (#1045): the base of the correctly rounded
+// expm1, log1p, log2, log10, asin, acos, sinh, cosh, tanh, erf and erfc (cr_*.ab). Written from the mathematics, not from any libm source:
+//   - Brent and Zimmermann, "Modern Computer Arithmetic" (2010): chapter 1 (schoolbook multiplication, Newton iteration for the reciprocal
+//     and the reciprocal square root) and chapter 4 (elementary functions: argument reduction, the series for exp and atanh/atan);
+//   - Muller, "Elementary Functions: Algorithms and Implementation" (3rd ed.): the rounding test of Ziv's strategy (a result is rounded
+//     only when an interval around the computed value holds no rounding boundary) and the worst cases for correct rounding;
+//   - Muller et al., "Handbook of Floating-Point Arithmetic" (2nd ed.): chapter 12 (the table maker's dilemma).
+// A BigF is sign, a natural number in base 2^30 (little endian limbs, no zero limb at either end) and a binary exponent: the value is
+// m * 2^e. Every operation takes the working precision `n` in limbs and truncates to it, so the relative error of one operation is below
+// 2^(-30 (n - 1)); the functions built on it run with many more bits than a double's 53 and round once, after checking that the computed
+// value is not within the accumulated error of a rounding boundary (libcBigRound).
+import "abla/float"
+import "abla/math" as mth
+
+val libcBase = 1073741824
+val libcMask = 1073741823
+
+class BigF(val neg: bool, val m: array<int>, val e: int)
+
+// ---- natural numbers: arrays of base 2^30 limbs, little endian -------------------------------------------------------------------------
+
+private fun libcLimbsTrim(a: array<int>): array<int> {
+    var top = a.size
+    while (top > 0 && a[top - 1] == 0) top -= 1
+    val r: array<int> = []
+    for (i in 0 until top) r.append(a[i])
+    r
+}
+
+fun libcLimbsBits(a: array<int>): int {
+    if (a.size == 0) return 0
+    var top = a[a.size - 1]
+    var bits = 0
+    while (top > 0) {
+        bits += 1
+        top = top >> 1
+    }
+    30 * (a.size - 1) + bits
+}
+
+private fun libcLimbsCmp(a: array<int>, b: array<int>): int {
+    if (a.size != b.size) return if (a.size < b.size) -1 else 1
+    var i = a.size - 1
+    while (i >= 0) {
+        if (a[i] != b[i]) return if (a[i] < b[i]) -1 else 1
+        i -= 1
+    }
+    0
+}
+
+private fun libcLimbsAdd(a: array<int>, b: array<int>): array<int> {
+    val r: array<int> = []
+    var carry = 0
+    val n = if (a.size > b.size) a.size else b.size
+    for (i in 0 until n) {
+        val s = (if (i < a.size) a[i] else 0) + (if (i < b.size) b[i] else 0) + carry
+        r.append(s & libcMask)
+        carry = s >> 30
+    }
+    if (carry != 0) r.append(carry)
+    r
+}
+
+// a - b for a >= b
+private fun libcLimbsSub(a: array<int>, b: array<int>): array<int> {
+    val r: array<int> = []
+    var borrow = 0
+    for (i in 0 until a.size) {
+        var d = a[i] - (if (i < b.size) b[i] else 0) - borrow
+        if (d < 0) {
+            d += libcBase
+            borrow = 1
+        } else {
+            borrow = 0
+        }
+        r.append(d)
+    }
+    libcLimbsTrim(r)
+}
+
+private fun libcLimbsMul(a: array<int>, b: array<int>): array<int> {
+    if (a.size == 0 || b.size == 0) return []
+    val r: array<int> = []
+    for (i in 0 until a.size + b.size) r.append(0)
+    for (i in 0 until a.size) {
+        var carry = 0
+        val ai = a[i]
+        for (j in 0 until b.size) {
+            val t = r[i + j] + ai * b[j] + carry
+            r[i + j] = t & libcMask
+            carry = t >> 30
+        }
+        r[i + b.size] = r[i + b.size] + carry
+    }
+    libcLimbsTrim(r)
+}
+
+private fun libcLimbsShl(a: array<int>, bits: int): array<int> {
+    if (a.size == 0) return []
+    val whole = bits / 30
+    val part = bits % 30
+    val r: array<int> = []
+    for (i in 0 until whole) r.append(0)
+    var carry = 0
+    for (i in 0 until a.size) {
+        val t = (a[i] << part) | carry
+        r.append(t & libcMask)
+        carry = t >> 30
+    }
+    if (carry != 0) r.append(carry)
+    r
+}
+
+// the bit at index `index` (0 is the least significant)
+fun libcLimbsBit(a: array<int>, index: int): int = if (index < 0 || index >= 30 * a.size) 0 else (a[index / 30] >> (index % 30)) & 1
+
+// ---- BigF -----------------------------------------------------------------------------------------------------------------------------
+
+// Normal form: no zero limb at the high end, none at the low end (the exponent absorbs it), at most n limbs (the low ones are dropped).
+fun libcBigMake(neg: bool, m0: array<int>, e0: int, n: int): BigF {
+    var m = libcLimbsTrim(m0)
+    var e = e0
+    if (m.size == 0) return BigF(false, [], 0)
+    if (m.size > n) {
+        val drop = m.size - n
+        val r: array<int> = []
+        for (i in drop until m.size) r.append(m[i])
+        m = r
+        e += 30 * drop
+    }
+    var low = 0
+    while (low < m.size && m[low] == 0) low += 1
+    if (low > 0) {
+        val r: array<int> = []
+        for (i in low until m.size) r.append(m[i])
+        m = r
+        e += 30 * low
+    }
+    BigF(neg, m, e)
+}
+
+fun libcBigZero(): BigF = BigF(false, [], 0)
+fun libcBigIsZero(a: BigF): bool = a.m.size == 0
+
+fun libcBigFromInt(v: int): BigF {
+    if (v == 0) return libcBigZero()
+    val neg = v < 0
+    var u = if (neg) 0 - v else v
+    val m: array<int> = []
+    while (u > 0) {
+        m.append(u & libcMask)
+        u = u >> 30
+    }
+    libcBigMake(neg, m, 0, 64)
+}
+
+// a finite double, exactly
+fun libcBigFromF64(x: f64): BigF {
+    val bits = f64ToBits(x)
+    val neg = bits < 0
+    val ex = (bits >> 52) & 2047
+    var frac = bits & 4503599627370495
+    var e = 0
+    if (ex == 0) {
+        e = -1074
+    } else {
+        frac = frac | 4503599627370496
+        e = ex - 1075
+    }
+    if (frac == 0) return libcBigZero()
+    val m: array<int> = [frac & libcMask, (frac >> 30) & libcMask, frac >> 60]
+    libcBigMake(neg, m, e, 64)
+}
+
+// position of the highest bit: the value is in [2^(top - 1), 2^top)
+fun libcBigTop(a: BigF): int = a.e + libcLimbsBits(a.m)
+
+fun libcBigCopy(a: BigF): BigF {
+    val r: array<int> = []
+    for (i in 0 until a.m.size) r.append(a.m[i])
+    BigF(a.neg, r, a.e)
+}
+
+fun libcBigNeg(a: BigF): BigF = if (a.m.size == 0) libcBigCopy(a) else BigF(!a.neg, libcBigCopy(a).m, a.e)
+fun libcBigAbs(a: BigF): BigF = BigF(false, libcBigCopy(a).m, a.e)
+
+// a * 2^k
+fun libcBigScale(a: BigF, k: int): BigF = if (a.m.size == 0) libcBigCopy(a) else BigF(a.neg, libcBigCopy(a).m, a.e + k)
+
+// -1, 0, 1
+fun libcBigCmp(a: BigF, b: BigF): int {
+    if (a.m.size == 0 && b.m.size == 0) return 0
+    if (a.m.size == 0) return if (b.neg) 1 else -1
+    if (b.m.size == 0) return if (a.neg) -1 else 1
+    if (a.neg != b.neg) return if (a.neg) -1 else 1
+    var c = 0
+    val ta = libcBigTop(a)
+    val tb = libcBigTop(b)
+    if (ta != tb) {
+        c = if (ta < tb) -1 else 1
+    } else {
+        val e = if (a.e < b.e) a.e else b.e
+        c = libcLimbsCmp(libcLimbsShl(a.m, a.e - e), libcLimbsShl(b.m, b.e - e))
+    }
+    if (a.neg) 0 - c else c
+}
+
+fun libcBigAdd(a: BigF, b: BigF, n: int): BigF {
+    if (a.m.size == 0) return libcBigCopy(b)
+    if (b.m.size == 0) return libcBigCopy(a)
+    val ta = libcBigTop(a)
+    val tb = libcBigTop(b)
+    // the smaller operand lies far below the last kept limb
+    if (ta - tb > 30 * (n + 2)) return libcBigCopy(a)
+    if (tb - ta > 30 * (n + 2)) return libcBigCopy(b)
+    val e = if (a.e < b.e) a.e else b.e
+    val am = libcLimbsShl(a.m, a.e - e)
+    val bm = libcLimbsShl(b.m, b.e - e)
+    if (a.neg == b.neg) return libcBigMake(a.neg, libcLimbsAdd(am, bm), e, n)
+    val c = libcLimbsCmp(am, bm)
+    if (c == 0) return libcBigZero()
+    if (c > 0) return libcBigMake(a.neg, libcLimbsSub(am, bm), e, n)
+    libcBigMake(b.neg, libcLimbsSub(bm, am), e, n)
+}
+
+fun libcBigSub(a: BigF, b: BigF, n: int): BigF = libcBigAdd(a, libcBigNeg(b), n)
+
+fun libcBigMul(a: BigF, b: BigF, n: int): BigF {
+    if (a.m.size == 0 || b.m.size == 0) return libcBigZero()
+    libcBigMake(a.neg != b.neg, libcLimbsMul(a.m, b.m), a.e + b.e, n)
+}
+
+// a * v for a small integer |v| < 2^30
+fun libcBigMulSmall(a: BigF, v: int, n: int): BigF {
+    if (a.m.size == 0 || v == 0) return libcBigZero()
+    val neg = (v < 0) != a.neg
+    val u = if (v < 0) 0 - v else v
+    val r: array<int> = []
+    var carry = 0
+    for (i in 0 until a.m.size) {
+        val t = a.m[i] * u + carry
+        r.append(t & libcMask)
+        carry = t >> 30
+    }
+    if (carry != 0) r.append(carry)
+    libcBigMake(neg, r, a.e, n)
+}
+
+// a / d for a small integer 0 < |d| < 2^30, to n limbs (the quotient is computed with one more limb of fraction, then truncated)
+fun libcBigDivSmall(a: BigF, d: int, n: int): BigF {
+    if (a.m.size == 0) return libcBigZero()
+    val neg = (d < 0) != a.neg
+    val u = if (d < 0) 0 - d else d
+    // work on m * 2^(30 (n + 1)) so the quotient keeps n + 1 limbs of fraction at least
+    val shifted: array<int> = []
+    for (i in 0 until n + 1) shifted.append(0)
+    for (i in 0 until a.m.size) shifted.append(a.m[i])
+    val q: array<int> = []
+    for (i in 0 until shifted.size) q.append(0)
+    var rem = 0
+    var i = shifted.size - 1
+    while (i >= 0) {
+        val cur = (rem << 30) | shifted[i]
+        q[i] = cur / u
+        rem = cur - q[i] * u
+        i -= 1
+    }
+    libcBigMake(neg, q, a.e - 30 * (n + 1), n)
+}
+
+// double approximation of the magnitude's top bits, with the exponent split off: value = mant * 2^exp2, mant in [1, 2)
+private fun libcBigLead(a: BigF): f64 {
+    val bits = libcLimbsBits(a.m)
+    var top = 0
+    for (j in 0 until 53) top = (top << 1) | libcLimbsBit(a.m, bits - 1 - j)
+    f64FromInt(top) / 4503599627370496.0
+}
+
+// 1 / a by Newton's iteration x <- x (2 - a x), from a 50-bit start, doubling the correct bits each step
+fun libcBigRecip(a: BigF, n: int): BigF {
+    val lead = libcBigLead(a)
+    val bits = libcLimbsBits(a.m)
+    // a = lead * 2^(e + bits - 1); the start is (1 / lead) * 2^-(e + bits - 1)
+    var x = libcBigMake(a.neg, libcBigFromF64(1.0 / lead).m, libcBigFromF64(1.0 / lead).e - (a.e + bits - 1), n)
+    val two = libcBigFromInt(2)
+    var good = 48
+    while (good < 30 * n + 60) {
+        val t = libcBigSub(two, libcBigMul(libcBigAbs(a), libcBigAbs(x), n + 1), n + 1)
+        x = libcBigMul(x, t, n + 1)
+        good = good * 2
+    }
+    x
+}
+
+fun libcBigDiv(a: BigF, b: BigF, n: int): BigF = libcBigMul(a, libcBigRecip(b, n + 1), n)
+
+// the square root of a positive a, by Newton's iteration for 1 / sqrt(a): x <- x (3 - a x^2) / 2
+fun libcBigSqrt(a: BigF, n: int): BigF {
+    if (a.m.size == 0) return libcBigZero()
+    // a = lead * 2^k with k even and lead in [1, 4)
+    val bits = libcLimbsBits(a.m)
+    var k = a.e + bits - 1
+    var lead = libcBigLead(a)
+    if (k % 2 != 0) {
+        lead = lead * 2.0
+        k -= 1
+    }
+    val start = 1.0 / sqrtF64(lead)
+    val three = libcBigFromInt(3)
+    var x = libcBigMake(false, libcBigFromF64(start).m, libcBigFromF64(start).e - k / 2, n + 1)
+    var good = 48
+    while (good < 30 * n + 60) {
+        val ax2 = libcBigMul(a, libcBigMul(x, x, n + 1), n + 1)
+        x = libcBigScale(libcBigMul(x, libcBigSub(three, ax2, n + 1), n + 1), -1)
+        good = good * 2
+    }
+    libcBigMul(a, x, n)
+}
+
+// sqrt of a double through Newton (the bootstrap: abla/math's sqrt is the hardware's, which is exact, and used here)
+private fun sqrtF64(x: f64): f64 = mth.sqrt(x)
+
+// ---- rounding to a double ---------------------------------------------------------------------------------------------------------------
+
+class BigRound(val value: f64, val ambiguous: bool)
+
+// The double nearest to a, ties to even. `ambiguous` says that a is within 2^-trust (relative to the half ulp) of a rounding boundary, so that a
+// value that differs from the exact result by less than that cannot be told from one on the other side: the caller then computes again with more
+// limbs. Overflow gives infinity, underflow a subnormal or a zero.
+fun libcBigRound(a: BigF, trust: int): BigRound {
+    if (a.m.size == 0) return BigRound(0.0, false)
+    val bits = libcLimbsBits(a.m)
+    val topExp = a.e + bits - 1
+    if (topExp > 1023) return BigRound(if (a.neg) f64FromBits(-4503599627370496) else f64FromBits(9218868437227405312), false)
+    var keep = 53
+    if (topExp < -1022) keep = 53 - (-1022 - topExp)
+    if (keep < 0) return BigRound(if (a.neg) -0.0 else 0.0, false)
+    var q = 0
+    for (j in 0 until keep) q = (q << 1) | libcLimbsBit(a.m, bits - 1 - j)
+    val half = libcLimbsBit(a.m, bits - 1 - keep)
+    var restNonzero = false
+    var i = bits - 2 - keep
+    var window = true
+    var windowSame = true
+    var count = 0
+    while (i >= 0) {
+        val bit = libcLimbsBit(a.m, i)
+        if (bit != 0) restNonzero = true
+        if (count < trust && bit != (1 - half)) windowSame = false
+        count += 1
+        if (count >= trust && restNonzero) break
+        i -= 1
+    }
+    // ambiguous: the remainder after the half bit is, within `trust` bits, all ones (half = 0) or all zeros (half = 1) of the other side
+    val ambiguous = windowSame
+    var up = false
+    if (half == 1) {
+        up = restNonzero || (q & 1) == 1
+    }
+    if (up) q += 1
+    var result = 0.0
+    if (keep == 53) {
+        var exponent = topExp
+        if (q == 9007199254740992) {
+            q = 4503599627370496
+            exponent += 1
+        }
+        if (exponent > 1023) {
+            result = f64FromBits(9218868437227405312)
+        } else {
+            result = f64FromBits(((exponent + 1023) << 52) | (q & 4503599627370495))
+        }
+    } else {
+        // subnormal: q counts units of 2^-1074; rounding up may reach the smallest normal, which the same bits also give
+        result = f64FromBits(q)
+    }
+    BigRound(if (a.neg) 0.0 - result else result, ambiguous)
+}
