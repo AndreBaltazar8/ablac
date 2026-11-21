@@ -1,0 +1,104 @@
+// W_UNUSED_DECLARATION (opt-in: --warn-unused-declarations, the editor's initialize `unusedDeclarations`): a top-level `fun` or
+// `val`/`var` that nothing in the build refers to. The references are what lowering's reachability reads (calls, names, a
+// global that holds a function, `findFunction("name")`), taken from every body and not only from the roots, so a cluster of
+// unused functions that call each other is not found (a function's own recursion is not a use of it).
+import "sema.ab"
+import "ir.ab"
+import "parser.ab"
+import "module_paths.ab"
+import "abla/text"
+
+/** The annotations that leave a declaration to the linker, a caller or a test runner: it has uses the source does not show. */
+fun bootstrapUnusedDeclarationExempt(declaration: BootstrapDeclaration): bool {
+    for (annotation in declaration.annotations) {
+        if (annotation != "noinline" && annotation != "inline") return true
+    }
+    declaration.name == "main" || declaration.generatedNamespace != "" ||
+        declaration.extensionOwner != "" || declaration.externalLibrary != ""
+}
+
+/** Whether `expression` calls anything: a global whose initializer does runs for its effect (`val started = startServer()`). */
+fun bootstrapUnusedDeclarationCalls(expression: BootstrapExpression): bool {
+    if (expression.kind == "call" || expression.kind == "member.call") return true
+    for (child in expression.children) {
+        if (bootstrapUnusedDeclarationCalls(child)) return true
+    }
+    false
+}
+
+/** Records the unused declarations of `parsed` (see bootstrapUnusedDeclarationList): `shadowed` and `implicitNames` are the
+ *  analysis's (locals named like a global; calls lowering inserts). Whether a declaration is public is the module's to say:
+ *  in a build with a `main` every declaration nothing refers to is reported (bootstrapUnusedDeclarationWarnings drops the public
+ *  ones of a project that is a package, whose users this build cannot see). */
+fun bootstrapNoteUnusedDeclarations(
+    parsed: BootstrapParseResult,
+    shadowed: BootstrapStringSet,
+    implicitNames: array<string>
+): void {
+    val declarations = parsed.declarations
+    val functions = bootstrapFunctionDeclarationIndex(declarations)
+    val types = bootstrapTypeDeclarationIndex(declarations)
+    val values = bootstrapValueDeclarationIndex(declarations)
+    val methods = bootstrapMethodDeclarationIndex(declarations)
+    val referenced: array<bool> = []
+    val scratch: array<bool> = []
+    var hasMain = false
+    for (declaration in declarations) {
+        referenced.append(false)
+        scratch.append(false)
+        if (declaration.kind == "fun" && declaration.name == "main") hasMain = true
+    }
+    for (name in implicitNames) {
+        val index = functions.find(name)
+        if (index >= 0) referenced[index] = true
+    }
+    // What each declaration's bodies refer to, other than itself; then what the program's top-level actions refer to.
+    for (index in 0 until declarations.size) {
+        val declaration = declarations[index]
+        val pending: array<int> = []
+        bootstrapCollectSourceReachability(declaration.expression, declarations, functions, types, values, methods,
+            scratch, pending, declaration.sourceIdentity, shadowed)
+        for (fallback in declaration.parameterDefaults) {
+            bootstrapCollectSourceReachability(fallback, declarations, functions, types, values, methods,
+                scratch, pending, declaration.sourceIdentity, shadowed)
+        }
+        for (method in declaration.methods) {
+            bootstrapCollectSourceReachability(method.expression, declarations, functions, types, values, methods,
+                scratch, pending, method.sourceIdentity, shadowed)
+            for (fallback in method.parameterDefaults) {
+                bootstrapCollectSourceReachability(fallback, declarations, functions, types, values, methods,
+                    scratch, pending, method.sourceIdentity, shadowed)
+            }
+        }
+        for (reached in pending) {
+            if (reached != index) referenced[reached] = true
+            scratch[reached] = false
+        }
+    }
+    val pending: array<int> = []
+    for (action in parsed.actions) {
+        bootstrapCollectSourceReachability(action, declarations, functions, types, values, methods, scratch, pending, "", shadowed)
+    }
+    for (reached in pending) referenced[reached] = true
+    bootstrapUnusedDeclarationList = []
+    for (index in 0 until declarations.size) {
+        val declaration = declarations[index]
+        if (referenced[index] || bootstrapUnusedDeclarationExempt(declaration)) continue
+        // A private name carries its module's prefix (bootstrapAppendPrivateNames): the name as written is what is reported.
+        // (`__abla_module_<hex of the path>__`: the hex has no underscore.)
+        var written = declaration.name
+        if (written.startsWith("__abla_module_")) {
+            val end = written.indexOf("__", 14)
+            if (end >= 0) written = written.slice(end + 2, written.size)
+        }
+        if (written.startsWith("_")) continue
+        if (declaration.kind != "fun" && declaration.kind != "val" && declaration.kind != "var") continue
+        if (!hasMain && !declaration.isPrivate) continue
+        if (declaration.kind != "fun" && bootstrapUnusedDeclarationCalls(declaration.expression)) continue
+        bootstrapUnusedDeclarationList.append(BootstrapUnusedLocal(
+            "abla:${bootstrapSourceKey(declaration.sourceIdentity)}:${declaration.begin}:declaration:${declaration.name}",
+            written, declaration.sourceIdentity, declaration.begin, declaration.end,
+            (if (declaration.isPrivate) "private " else "") + (if (declaration.kind == "fun") "function" else "value")))
+    }
+    return
+}

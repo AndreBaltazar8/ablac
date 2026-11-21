@@ -2882,6 +2882,91 @@ fun bootstrapUnusedParameterWarnings(): string {
     output
 }
 
+/** The project's .ab files (not hidden or generated directories, no links). */
+fun bootstrapUnusedDeclarationFiles(path: Path, var files: array<string>): void {
+    if (path.isSymbolicLink()) return
+    val info = path.info()
+    if (info.isDirectory()) {
+        for (entry in path.entries()) {
+            val name = entry.name()
+            if (!name.startsWith(".") && name != "build" && name != "node_modules") bootstrapUnusedDeclarationFiles(path.child(name), files)
+        }
+    } else if (info.isFile() && path.extension() == "ab") files.append(path.text)
+    return
+}
+
+fun bootstrapUnusedDeclarationWordByte(byte: int): bool =
+    (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || byte == 95 || (byte >= 97 && byte <= 122)
+
+/** Each identifier the project's .ab files write, with the file that writes it ("*" for more than one): a function that
+ *  another file of the project (a test, another entry, a tool) names is not unused, for this build cannot see that file. */
+fun bootstrapUnusedDeclarationNames(root: string): Map<string, string> {
+    val names: Map<string, string> = Map()
+    val files: array<string> = []
+    // The checkout the project is in (its tests and tools sit beside the manifest's directory, as ablac's do), else the project.
+    var base = root
+    var up = Path(root)
+    var steps = 0
+    while (root != "" && steps < 6 && up.text != "/" && up.text != "") {
+        if (up.child(".git").info().exists()) {
+            base = up.text
+            break
+        }
+        up = up.parent()
+        steps = steps + 1
+    }
+    if (root != "") bootstrapUnusedDeclarationFiles(Path(base), files)
+    for (file in files) {
+        val text = Path(file).readText()
+        var index = 0
+        while (index < text.size) {
+            if (bootstrapUnusedDeclarationWordByte(text[index]) && (text[index] < 48 || text[index] > 57)) {
+                val begin = index
+                while (index < text.size && bootstrapUnusedDeclarationWordByte(text[index])) index = index + 1
+                val name = text.slice(begin, index)
+                val known = names.get(name)
+                if (known == null) names.set(name, file)
+                else if (known != file) names.set(name, "*")
+            } else index = index + 1
+        }
+    }
+    names
+}
+
+/** Whether the project the build is of declares a package (its abla.toml has a `name`): its public declarations are for the
+ *  projects that depend on it, which this build does not see. */
+fun bootstrapUnusedDeclarationIsPackage(): bool {
+    if (bootstrapUnusedImportEntry == "") return false
+    val manifest = bootstrapCompileManifestFor(bootstrapUnusedImportEntry)
+    if (manifest == "") return false
+    for (line in Path(manifest).readText().split("\n")) {
+        val trimmed = line.trim()
+        if (trimmed.startsWith("name") && trimmed.slice(4, trimmed.size).trim().startsWith("=")) return true
+    }
+    false
+}
+
+/** One `warning[W_UNUSED_DECLARATION]` per top-level function or value of the project's own modules that nothing refers to (see
+ *  unused_declarations.ab), except in a module that defines syntax (what its parser generates calls it) and in tests. */
+fun bootstrapUnusedDeclarationWarnings(): string {
+    var output = ""
+    val package = bootstrapUnusedDeclarationIsPackage()
+    val named = bootstrapUnusedDeclarationNames(if (bootstrapUnusedDeclarationList.size > 0) bootstrapUnusedImportProjectRoot() else "")
+    for (declaration in bootstrapUnusedDeclarationList) {
+        val file = bootstrapGenericSourceFile(declaration.source)
+        // What a subparser generates (`<generated:one_remote_0>`) is not the project's own text.
+        if (file.startsWith("<") || !bootstrapUnusedImportInProject(file)) continue
+        if (package && !declaration.function.startsWith("private ")) continue
+        val elsewhere = named.get(declaration.name)
+        if (elsewhere != null && elsewhere != bootstrapUnusedImportAbsolute(file)) continue
+        if (file.endsWith("_test.ab") || file.indexOf("/tests/") >= 0 || file.indexOf("/test/") >= 0 ||
+            bootstrapUnusedImportDefinesSyntax(file)) continue
+        val rewrite = bootstrapSourceRewriteOf(declaration.source)
+        output = "${output}warning[W_UNUSED_DECLARATION]: $file: ${declaration.function} `${declaration.name}` is never used\nsource[declaration]:$file:${rewrite.original(declaration.begin)}:${rewrite.originalEnd(declaration.end)}\n"
+    }
+    output
+}
+
 fun bootstrapUnusedImportAbsolute(path: string): string =
     bootstrapNormalizeModulePath(if (path.startsWith("/")) path else "${currentDirectory().text}/$path")
 
