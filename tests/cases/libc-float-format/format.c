@@ -63,6 +63,42 @@ int main(int argc, char **argv) {
         }
         return 0;
     }
+    if (argc > 1 && strcmp(argv[1], "strtof-gen") == 0) {
+        const char *fixed[] = {"0.1", "1e-46", "1.4e-45", "7e-46", "7.006492321624085e-46", "7.0064923216240854e-46", "3.4028235e38", "3.4028236e38",
+            "3.40282357e38", "3.4028235677973366e38", "3.4028235677973362e38", "1e39", "16777217", "16777216.5", "16777216.50000001", "33554433",
+            "8388608.5", "8388609.5", "1.00000005960464477539", "1.000000059604644775390625", "1.00000005960464477539063", "0.99999997019767761230",
+            "1.17549435e-38", "1.1754942e-38", "1.17549421069244108e-38", "5.8774717541114375e-39", "2.9387358770557188e-39", "-0.0", "-1.5e-45", "123456789",
+            "1e-7", "0x1p-149", "inf", "-inf", "nan", "  12.5abc", "1e", "1e+", ".5", "5.", "0000.0000", "000123.4560e0002"};
+        for (size_t i = 0; i < sizeof fixed / sizeof fixed[0]; i++)
+            if (fixed[i][0] != ' ' && strncmp(fixed[i], "0x", 2) != 0) printf("%s\n", fixed[i]);
+        for (int i = 0; i < 6000; i++) {
+            uint32_t raw = (uint32_t)next();
+            if (((raw >> 23) & 255) == 255) raw &= ~(1u << 23);
+            float a;
+            memcpy(&a, &raw, 4);
+            a = fabsf(a);
+            printf("%.9g\n%.20e\n", (double)a, (double)a);
+            float b = nextafterf(a, INFINITY);
+            if (isinf(b)) continue;
+            double mid = ((double)a + (double)b) / 2;
+            printf("%.120e\n", mid);
+            printf("%.120e\n", nextafter(mid, INFINITY));
+            printf("%.120e\n", nextafter(mid, 0.0));
+            printf("%.40e\n", mid);
+        }
+        return 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "strtof") == 0) {
+        char text[512];
+        while (fgets(text, sizeof text, stdin)) {
+            text[strcspn(text, "\n")] = 0;
+            float value = strtof(text, NULL);
+            uint32_t bits;
+            memcpy(&bits, &value, 4);
+            printf("%u\n", bits);
+        }
+        return 0;
+    }
     char conversion;
     int precision, alternate;
     long long bits;

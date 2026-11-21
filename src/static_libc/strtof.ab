@@ -1,0 +1,115 @@
+// strtof for the statically linked compiler's C library (#806 step C): the decimal text rounded once, straight to a float (24-bit mantissa), as
+// glibc does: rounding to a double first can land on the wrong float when the decimal is within a double's rounding error of the midpoint between two
+// floats. The double read (libcStrtodAt) names the candidate; the exact decimal of the midpoints on either side of it (libcExact, floatfmt.ab) settles
+// it, a tie going to the even float.
+import "abla/runtime/scalar"
+import "abla/float"
+import "./floatfmt.ab"
+import "./time.ab"
+
+// The magnitude of the decimal number at `text` (spaces and a sign skipped) as exact digits; zero has none.
+trusted fun libcParseDecimal(text: int): LibcDecimal {
+    var at = 0
+    while (ablaRuntimeLoadU8(text + at) == 32 || (ablaRuntimeLoadU8(text + at) >= 9 && ablaRuntimeLoadU8(text + at) <= 13)) at = at + 1
+    if (ablaRuntimeLoadU8(text + at) == 45 || ablaRuntimeLoadU8(text + at) == 43) at = at + 1
+    val all: array<int> = []
+    var integerDigits = 0
+    var sawPoint = false
+    var scanning = true
+    while (scanning) {
+        val c = ablaRuntimeLoadU8(text + at)
+        if (c >= 48 && c <= 57) {
+            all.append(c - 48)
+            if (!sawPoint) integerDigits = integerDigits + 1
+            at = at + 1
+        } else if (c == 46 && !sawPoint) {
+            sawPoint = true
+            at = at + 1
+        } else scanning = false
+    }
+    var exponent = 0
+    if ((ablaRuntimeLoadU8(text + at) | 32) == 101) {
+        var probe = at + 1
+        var negative = false
+        if (ablaRuntimeLoadU8(text + probe) == 45 || ablaRuntimeLoadU8(text + probe) == 43) {
+            negative = ablaRuntimeLoadU8(text + probe) == 45
+            probe = probe + 1
+        }
+        if (ablaRuntimeLoadU8(text + probe) >= 48 && ablaRuntimeLoadU8(text + probe) <= 57) {
+            var value = 0
+            while (ablaRuntimeLoadU8(text + probe) >= 48 && ablaRuntimeLoadU8(text + probe) <= 57) {
+                if (value < 100000) value = value * 10 + ablaRuntimeLoadU8(text + probe) - 48
+                probe = probe + 1
+            }
+            exponent = if (negative) 0 - value else value
+        }
+    }
+    var lead = 0
+    while (lead < all.size && all[lead] == 0) lead = lead + 1
+    val digits: array<int> = []
+    if (lead == all.size) return LibcDecimal(digits, 0)
+    var last = all.size
+    while (last > lead && all[last - 1] == 0) last = last - 1
+    for (i in lead until last) digits.append(all[i])
+    LibcDecimal(digits, integerDigits - lead + exponent)
+}
+
+// -1, 0 or 1: a against b (both non-negative).
+fun libcCompareDecimal(a: LibcDecimal, b: LibcDecimal): int {
+    if (a.digits.size == 0 && b.digits.size == 0) return 0
+    if (a.digits.size == 0) return -1
+    if (b.digits.size == 0) return 1
+    if (a.point != b.point) return if (a.point > b.point) 1 else -1
+    val count = if (a.digits.size > b.digits.size) a.digits.size else b.digits.size
+    for (i in 0 until count) {
+        val x = libcDigit(a, i)
+        val y = libcDigit(b, i)
+        if (x != y) return if (x > y) 1 else -1
+    }
+    0
+}
+
+// 2^128: where the float after the largest one would be.
+private fun libcFloatLimit(): f64 = 340282366920938463463374607431768211456.0
+
+private fun libcFloatValue(bits: int): f64 = if (bits >= 2139095040) libcFloatLimit() else ablaConvertF32ToF64(f32FromBits(u32(bits)))
+
+// The midpoint between the floats with these bits and the next, exactly (the sum of two floats with exponents one apart fits a double).
+private fun libcFloatMidpoint(bits: int): f64 = (libcFloatValue(bits) + libcFloatValue(bits + 1)) / 2.0
+
+trusted fun libcStrtofAt(text: int, end: int): f32 {
+    val approximate = libcStrtodAt(text, end)
+    // Not a finite nonzero number (inf, nan, nothing read, zero, an underflow to zero): the plain conversion is exact.
+    if (approximate - approximate != 0.0 || approximate == 0.0) return ablaConvertF64ToF32(approximate)
+    val negative = approximate < 0.0
+    val input = libcParseDecimal(text)
+    var bits = int(f32ToBits(ablaConvertF64ToF32(if (negative) 0.0 - approximate else approximate)))
+    var steps = 0
+    var settled = false
+    while (!settled && steps < 4) {
+        settled = true
+        if (bits < 2139095040) {
+            val up = libcCompareDecimal(input, libcExact(libcFloatMidpoint(bits)))
+            if (up > 0 || (up == 0 && (bits & 1) == 1)) {
+                bits = bits + 1
+                settled = false
+            }
+        }
+        if (settled && bits > 0) {
+            val down = libcCompareDecimal(input, libcExact(libcFloatMidpoint(bits - 1)))
+            if (down < 0 || (down == 0 && (bits & 1) == 1)) {
+                bits = bits - 1
+                settled = false
+            }
+        }
+        steps = steps + 1
+    }
+    val magnitude = f32FromBits(u32(bits))
+    if (negative) 0.0 - magnitude else magnitude
+}
+
+@export("strtof")
+trusted fun libcStrtof(text: int, end: int): f32 = libcStrtofAt(text, end)
+
+@export("__strtof_l")
+trusted fun libcStrtofL(text: int, end: int, locale: int): f32 = libcStrtofAt(text, end)

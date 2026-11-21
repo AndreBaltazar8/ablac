@@ -29,3 +29,17 @@ if ! cmp -s "$out/c.txt" "$out/abla.txt"; then
     exit 1
 fi
 echo "libc float format: $count cases, identical to the host C library's printf"
+# strtof: the text rounded once to a float (halfway cases between two floats, subnormals, the overflow edge), as the host's strtof reads it.
+"$out/format" strtof-gen > "$out/strtof-cases.txt"
+"$out/format" strtof < "$out/strtof-cases.txt" > "$out/strtof-c.txt"
+"$compiler" build tests/cases/libc-float-format/strtof.ab -o "$out/strtof" --no-cache > "$out/strtof-build.log" 2>&1 ||
+    { cat "$out/strtof-build.log" >&2; echo 'libc float format: the strtof test program failed to build' >&2; exit 1; }
+"$out/strtof" < "$out/strtof-cases.txt" > "$out/strtof-abla.txt"
+strtof_count=$(wc -l < "$out/strtof-cases.txt")
+if ! cmp -s "$out/strtof-c.txt" "$out/strtof-abla.txt"; then
+    paste -d'\t' "$out/strtof-cases.txt" "$out/strtof-c.txt" "$out/strtof-abla.txt" |
+        awk -F'\t' '(""$2) != (""$3) { print "text [" $1 "] host bits " $2 " abla bits " $3 }' | head -20 >&2
+    echo "libc float format: $strtof_count strtof cases, they differ from the host C library's strtof" >&2
+    exit 1
+fi
+echo "libc float format: $strtof_count strtof cases, identical to the host C library's strtof"
