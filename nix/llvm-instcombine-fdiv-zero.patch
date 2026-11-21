@@ -1,0 +1,55 @@
+From bcb4e7d061ac22bce4ac65f5158a4746fb0edc0f Mon Sep 17 00:00:00 2001
+From: Justin Lebar <justin.lebar@gmail.com>
+Date: Sat, 18 Jul 2026 14:10:01 -0700
+Subject: [PATCH] [InstCombine] Fix 0.0 / x -> 0 folds when the divisor may be
+ zero (#202482)
+
+SimplifyDemandedUseFPClass folded 0/x to a signed zero, guarded only on
+the divisor being non-NaN. But when x==0, the result is is NaN, not 0!
+
+Require the divisor to be never (logical) zero, unless a NaN result
+isn't demanded.
+---
+ .../InstCombineSimplifyDemanded.cpp           |  17 ++-
+ .../simplify-demanded-fpclass-fdiv.ll         | 105 ++++++++++++++++++
+ 2 files changed, 117 insertions(+), 5 deletions(-)
+
+diff --git a/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp b/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp
+index 26f5fb01a942c6..0a7c0375106f26 100644
+--- a/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp
++++ b/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp
+@@ -2796,12 +2796,22 @@ Value *InstCombinerImpl::SimplifyDemandedUseFPClass(Instruction *I,
+         SimplifyDemandedFPClass(I, 1, RHSDemandedMask, KnownRHS, SQ, Depth + 1))
+       return I;
+ 
++    bool ResultNotNan = (DemandedMask & fcNan) == fcNone;
++    bool ResultNotInf = (DemandedMask & fcInf) == fcNone;
++
++    // Replacing 0/x with a zero is only valid when the divisor can't be
++    // (logical) zero, since 0/0 is NaN -- unless NaN results aren't demanded. A
++    // subnormal divisor can flush to zero under a flushing denormal mode.
++    bool CanIgnoreZeroByZeroNan =
++        ResultNotNan || KnownRHS.isKnownNeverLogicalZero(Mode);
++
+     // nsz [+-]0 / x -> 0
+     if (FMF.noSignedZeros() && KnownLHS.isKnownAlways(fcZero) &&
+-        KnownRHS.isKnownNeverNaN())
++        KnownRHS.isKnownNeverNaN() && CanIgnoreZeroByZeroNan)
+       return ConstantFP::getZero(VTy);
+ 
+-    if (KnownLHS.isKnownAlways(fcPosZero) && KnownRHS.isKnownNeverNaN()) {
++    if (KnownLHS.isKnownAlways(fcPosZero) && KnownRHS.isKnownNeverNaN() &&
++        CanIgnoreZeroByZeroNan) {
+       IRBuilderBase::InsertPointGuard Guard(Builder);
+       Builder.SetInsertPoint(I);
+ 
+@@ -2812,9 +2822,6 @@ Value *InstCombinerImpl::SimplifyDemandedUseFPClass(Instruction *I,
+       return Copysign;
+     }
+ 
+-    bool ResultNotNan = (DemandedMask & fcNan) == fcNone;
+-    bool ResultNotInf = (DemandedMask & fcInf) == fcNone;
+-
+     if (!ResultNotInf &&
+         ((ResultNotNan || (KnownLHS.isKnownNeverNaN() &&
+                            KnownLHS.isKnownNeverLogicalZero(Mode))) &&

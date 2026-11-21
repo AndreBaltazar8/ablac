@@ -1,0 +1,63 @@
+# Builds the AArch64 LLVM static archives with the InstCombine fdiv fix (nix/llvm-instcombine-fdiv-zero.patch) on a native arm64 runner,
+# because nothing caches them and an x86 cross or qemu build takes far longer. Manual, once per LLVM revision. It publishes nothing: the
+# maintainer downloads the artifact (an archive and its sha256) and attaches it to the llvm-project fork's release under a new name.
+name: LLVM AArch64 static archives
+
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: 'Asset revision, the asset is llvm-23.1.3-fdiv-<revision>-aarch64-linux.tar.xz'
+        required: true
+        default: '1'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Patched libLLVM*.a for aarch64-linux
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        with:
+          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/6510408d147d8c5e6d76043e899e9251756f6a75.tar.gz
+      - name: Build LLVM with the patch
+        run: |
+          nix-build --no-out-link --max-jobs 1 --cores 0 nix/llvm-aarch64-static.nix -A lib > build-lib.path
+          nix-build --no-out-link --max-jobs 1 --cores 0 nix/llvm-aarch64-static.nix > build-out.path
+          cat build-lib.path build-out.path
+      - name: The optimizer of this build no longer folds 0.0 / (0.0 * v) to a signed zero
+        run: |
+          cat > fdiv.ll <<'LL'
+          define double @f(i64 %n) {
+            %v = sitofp i64 %n to double
+            %m = fmul double 0.000000e+00, %v
+            %d = fdiv double 0.000000e+00, %m
+            ret double %d
+          }
+          LL
+          "$(cat build-out.path)/bin/opt" -passes=instcombine -S fdiv.ll | tee fdiv.out
+          grep -q 'copysign' fdiv.out && { echo 'the fold is still there'; exit 1; }
+          grep -q 'fdiv' fdiv.out || grep -q '0x7FF8' fdiv.out
+      - name: Pack the archives
+        run: |
+          name="llvm-23.1.3-fdiv-${{ inputs.revision }}-aarch64-linux"
+          lib="$(cat build-lib.path)"
+          mkdir -p "pack/$name/lib"
+          cp -L "$lib"/lib/libLLVM*.a "pack/$name/lib/"
+          { echo "$name"; echo "nixpkgs 6510408d147d8c5e6d76043e899e9251756f6a75, nix/llvm-aarch64-static.nix at ${GITHUB_SHA}"; } > "pack/$name/SOURCE"
+          tar -C pack --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -cf - "$name" | xz -9e -T0 > "$name.tar.xz"
+          sha256sum "$name.tar.xz" | tee "$name.tar.xz.sha256"
+          ls -l "$name.tar.xz"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: llvm-aarch64-static
+          path: |
+            llvm-23.1.3-fdiv-*-aarch64-linux.tar.xz
+            llvm-23.1.3-fdiv-*-aarch64-linux.tar.xz.sha256
+          retention-days: 14
