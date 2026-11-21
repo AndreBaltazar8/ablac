@@ -129,6 +129,7 @@ val BOOTSTRAP_REPL_HELP = """
     Commands:
       :help    this list
       :type e  the type of the expression e, which does not run
+      :load f  the declarations of the file f (nothing runs; its main is loadedMain())
       :reset   forget every declaration and start again
       :quit    end the session (so does the end of the input)
     Any other entry is Abla. A declaration (fun, val, var, class, interface, resource class, import) is added, or
@@ -161,6 +162,98 @@ val BOOTSTRAP_REPL_TYPE_HELPERS = """
 
     """
 
+// The top-level declarations of a file :load reads, each from the line it starts on to the next one's: one starts at
+// a token at the start of a line outside any bracket or string (the lexer's, so a bracket in a string or comment is
+// none). What comes before the first (comments) is left out. A relative `import "x.ab"` is made absolute from
+// `directory` (the session's source is elsewhere), and `fun main` is `fun loadedMain`: the session's program has its
+// own main.
+fun bootstrapReplSplitDeclarations(text: string, directory: string): array<string> {
+    val starts: array<int> = []
+    var depth = 0
+    var strings = 0
+    for (token in bootstrapLex(text)) {
+        val kind = token.kind
+        val closing = kind == BOOTSTRAP_TOKEN_RPAREN || kind == BOOTSTRAP_TOKEN_RBRACKET ||
+            kind == BOOTSTRAP_TOKEN_RBRACE
+        if (depth == 0 && strings == 0 && !closing && token.begin < text.size &&
+            (token.begin == 0 || text[token.begin - 1] == 10)) starts.append(token.begin)
+        if (kind == BOOTSTRAP_TOKEN_LPAREN || kind == BOOTSTRAP_TOKEN_LBRACKET || kind == BOOTSTRAP_TOKEN_LBRACE) {
+            depth = depth + 1
+        } else if (closing) {
+            depth = depth - 1
+        } else if (kind == BOOTSTRAP_TOKEN_STRING_START) {
+            strings = strings + 1
+        } else if (kind == BOOTSTRAP_TOKEN_STRING_END) {
+            strings = strings - 1
+        }
+    }
+    val pieces: array<string> = []
+    for (index in 0 until starts.size) {
+        val end = if (index + 1 < starts.size) starts[index + 1] else text.size
+        var piece = text.slice(starts[index], end).trim()
+        if (piece.startsWith("import \"")) {
+            val close = piece.indexOf("\"", 8)
+            val path = if (close > 8) piece.slice(8, close) else ""
+            if (path.endsWith(".ab") && !path.startsWith("/") && !path.startsWith("abla/")) {
+                piece = "import \"$directory/$path\"${piece.slice(close + 1, piece.size)}"
+            }
+        }
+        if (piece.startsWith("fun main") && piece.size > 8) {
+            val after = piece[8]
+            // ( : = { space
+            if (after == 40 || after == 58 || after == 61 || after == 123 || after == 32) {
+                piece = "fun loadedMain${piece.slice(8, piece.size)}"
+            }
+        }
+        if (piece != "") pieces.append(piece)
+    }
+    pieces
+}
+
+// :load <file>: its declarations added to the session (or replacing those of the same name), in one reload, so a
+// file that does not compile leaves the session as it was. Nothing runs; a loaded main is loadedMain().
+fun bootstrapReplLoad(path: string): void {
+    if (path == "") {
+        linuxPrintStandardError(":load needs a file (:load lib.ab)\n")
+        return
+    }
+    val file = Path(path)
+    if (!file.exists()) {
+        linuxPrintStandardError(":load: no such file: $path\n")
+        return
+    }
+    val absolute = if (path.startsWith("/")) path else "${currentDirectory().text}/$path"
+    val slash = absolute.lastIndexOf("/")
+    val pieces = bootstrapReplSplitDeclarations(file.readText(), if (slash > 0) absolute.slice(0, slash) else "/")
+    val declarations: array<BootstrapReplDeclaration> = []
+    for (declaration in bootstrapReplDeclarations) {
+        declarations.append(BootstrapReplDeclaration(declaration.key, declaration.line))
+    }
+    var renamed = false
+    for (piece in pieces) {
+        if (piece.startsWith("fun loadedMain")) renamed = true
+        // A declaration the REPL knows by kind and name replaces its namesake; any other (an annotated or private
+        // one) is known by its text.
+        val key = if (bootstrapReplDeclaration(piece)) bootstrapReplKey(piece) else "text $piece"
+        var replaced = false
+        for (index in 0 until declarations.size) {
+            if (declarations[index].key == key) {
+                declarations[index] = BootstrapReplDeclaration(key, piece)
+                replaced = true
+            }
+        }
+        if (!replaced) declarations.append(BootstrapReplDeclaration(key, piece))
+    }
+    val status = bootstrapReplReload(declarations, "", false)
+    if (status != 0) {
+        bootstrapReplReport(status)
+        return
+    }
+    bootstrapReplDeclarations = declarations
+    linuxPrintStandardOutput("loaded ${pieces.size} declarations from $path${if (renamed) " (its main is loadedMain())" else ""}\n")
+    return
+}
+
 // The command's argument: what follows its name ("" if nothing).
 fun bootstrapReplCommandArgument(line: string, command: string): string {
     val text = line.trim()
@@ -177,9 +270,11 @@ fun bootstrapReplCommandArgument(line: string, command: string): string {
 fun bootstrapReplSource(declarations: array<BootstrapReplDeclaration>, current: string,
     currentVariable: string = "", entry: string = ""): string {
     var entryBegin = -1
-    var text = "import \"abla/io\"\nimport \"abla/float/text\"\nimport \"abla/sys/linux/process\"\nimport \"abla/compiler\"\n\n"
+    val base = "import \"abla/io\"\nimport \"abla/float/text\"\nimport \"abla/sys/linux/process\"\nimport \"abla/compiler\"\n"
+    var text = "$base\n"
     for (declaration in declarations) {
-        if (declaration.line.startsWith("import ")) {
+        // One the session's program imports already is left out: a module imported twice is an error.
+        if (declaration.line.startsWith("import ") && !base.contains("${declaration.line.trim()}\n")) {
             if (declaration.line == entry) entryBegin = text.size
             text = "$text${declaration.line}\n"
         }
@@ -301,6 +396,10 @@ fun bootstrapReplStep(): void {
         bootstrapReplQuit = false
         bootstrapReplEnd()
         linuxPrintStandardOutput("reset\n")
+        return
+    }
+    if (command == ":load") {
+        bootstrapReplLoad(bootstrapReplCommandArgument(line, command))
         return
     }
     if (command == ":type") {

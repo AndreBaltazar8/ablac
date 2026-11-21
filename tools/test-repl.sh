@@ -72,6 +72,14 @@ if ((live)); then
     printf 'class P(val a: int)\nP(4).a\nfun twice(p: P): int = p.a * 2\ntwice(P(5))\nval kept = P(7)\nclass P(val a: int, val b: int = 0)\nkept.a\nclass Q(val name: string)\nQ("q").name\n:quit\n' |
         session classes 300 &
     classes=$!
+    # :load: a file's declarations (a comment before them left out, its main as loadedMain, which does not run until
+    # called), and a file that does not compile leaves the session as it was.
+    mkdir -p "$base.load"
+    printf '// a library\nimport "abla/io"\nclass Point(val x: int, val y: int)\nfun norm1(p: Point): int =\n    p.x + p.y\nfun main: int {\n    println("main ran")\n    return 0\n}\n' > "$base.load/lib.ab"
+    printf 'fun norm1(p: Point): int = missing\n' > "$base.load/broken.ab"
+    printf ':load %s\nnorm1(Point(2, 3))\nloadedMain()\n:load %s\nnorm1(Point(2, 3))\n:load %s\n:load\n:quit\n' \
+        "$base.load/lib.ab" "$base.load/broken.ab" "$base.load/none.ab" | session load 300 &
+    loading=$!
 fi
 wait "$recovery"
 wait "$definitions"
@@ -98,6 +106,11 @@ if ((live)); then
     [[ $(< "$base.classes.out") == $'abla> defined\nabla> 4\nabla> defined\nabla> 10\nabla> defined\nabla> abla> 7\nabla> defined\nabla> q\nabla> ' ]] &&
         grep -q 'E_LIVE_LAYOUT: class P changed' "$base.classes.err" ||
         { echo 'repl (classes): a class could not be added, or a changed one was not refused' >&2; cat "$base.classes.out" "$base.classes.err" >&2; exit 1; }
+    wait "$loading"
+    [[ $(< "$base.load.out") == "abla> loaded 4 declarations from $base.load/lib.ab (its main is loadedMain())"$'\nabla> 5\nabla> main ran\n0\nabla> abla> 5\nabla> abla> abla> ' ]] &&
+        grep -q 'identifier:missing' "$base.load.err" && grep -q "^:load: no such file: $base.load/none.ab\$" "$base.load.err" &&
+        grep -q '^:load needs a file' "$base.load.err" ||
+        { echo 'repl (load): a file was not loaded as declarations, or a broken one changed the session' >&2; cat "$base.load.out" "$base.load.err" >&2; exit 1; }
 fi
 
 [[ $(< "$base.recovery.out") == $'abla> abla> 41\nabla> 42\nabla> ' ]] || exit 1
@@ -158,4 +171,4 @@ if script --version 2>/dev/null | grep util-linux >/dev/null; then
     editor=checked
 fi
 
-printf '%s\n' "persistent REPL: retained definitions + recovery + reclaimed JIT generations + entries over several lines + commands + diagnostics placed in the entry + line editor ($editor); live: state across lines, a contained panic, a refused redefinition, :type, classes added (a changed one refused)"
+printf '%s\n' "persistent REPL: retained definitions + recovery + reclaimed JIT generations + entries over several lines + commands + diagnostics placed in the entry + line editor ($editor); live: state across lines, a contained panic, a refused redefinition, :type, classes added (a changed one refused), :load"

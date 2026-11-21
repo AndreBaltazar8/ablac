@@ -483,7 +483,9 @@ program with nothing defined. Elsewhere `repl` compiles each line on its own in 
 declarations persist. In both, an entry whose bracket (`(`, `[`, `{`), string or `/*` comment is still open
 continues on the next line (`....> `), so a function or class body can span lines; an empty line ends an
 entry still open. `:help` lists the commands, `:type <expr>` shows the type of an expression without running it
-(the live REPL; the compiler's own inference, through `#compiler.typeName`), `:quit` (or the end of the input) ends
+(the live REPL; the compiler's own inference, through `#compiler.typeName`), `:load <file>` adds the file's
+declarations in one reload (nothing runs; its `main` is `loadedMain()`, since the session's program has its own; a
+file that does not compile leaves the session as it was), `:quit` (or the end of the input) ends
 the session, and any other entry starting with `:` is an unknown command, refused without a compile. On a
 terminal the REPL edits a line itself (`src/repl_editor.ab`, no readline): left and right, Home and End (Ctrl-A,
 Ctrl-E), Backspace and Delete, up and down through the session's earlier lines, Ctrl-K and Ctrl-U cut to the end
